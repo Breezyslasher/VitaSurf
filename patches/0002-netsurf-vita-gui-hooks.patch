@@ -24,12 +24,13 @@ index 5bfc8227b..70fc517ce 100644
  }
  
  static void
-@@ -2196,6 +2204,9 @@ main(int argc, char** argv)
+@@ -2196,6 +2204,10 @@ main(int argc, char** argv)
  		.utf8 = framebuffer_utf8_table,
  		.bitmap = framebuffer_bitmap_table,
  		.layout = framebuffer_layout_table,
 +#ifdef __vita__
 +		.file = vita_file_table,
++		.download = vita_download_table,
 +#endif
  	};
  
