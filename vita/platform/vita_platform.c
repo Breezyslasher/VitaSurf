@@ -13,6 +13,7 @@
 #include <psp2/kernel/sysmem.h>
 #include <psp2/power.h>
 #include <psp2/sysmodule.h>
+#include <psp2/system_param.h>
 
 /* After the SCE headers: <sys/stat.h> defines st_ctime as a macro, which
  * would otherwise mangle the SceIoStat field of the same name. */
@@ -317,6 +318,7 @@ int vita_platform_init(void)
 	SceAppUtilInitParam init_param;
 	SceAppUtilBootParam boot_param;
 	SceCommonDialogConfigParam dialog_config;
+	int lang = 0, enter = 0;
 	int mkdir_ret;
 	int ret;
 
@@ -377,6 +379,10 @@ int vita_platform_init(void)
 			 (unsigned int)ret);
 	}
 	sceCommonDialogConfigParamInit(&dialog_config);
+	sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_LANG, &lang);
+	sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_ENTER_BUTTON, &enter);
+	dialog_config.language = (SceSystemParamLang)lang;
+	dialog_config.enterButtonAssign = (SceSystemParamEnterButtonAssign)enter;
 	ret = sceCommonDialogSetConfigParam(&dialog_config);
 	if (ret < 0) {
 		vita_log("sceCommonDialogSetConfigParam failed: 0x%08x",

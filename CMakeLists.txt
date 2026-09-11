@@ -136,8 +136,12 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--start-group
     css dom hubbub parserutils wapcaplet nsutils nsbmp nsgif svgtiny nspsl nslog utf8proc
     # libcurl pulls in zstd; the mbedTLS package is built with pthread mutexes.
-    curl mbedtls mbedx509 mbedcrypto zstd expat png jpeg z bz2 pthread m
+    curl mbedtls mbedx509 mbedcrypto zstd expat
+    # libvita2d (MIT) puts the page on screen through the GPU so that the
+    # system IME dialog can draw over it.
+    vita2d png jpeg freetype z bz2 pthread m
     -Wl,--end-group
+    SceGxm_stub
     SceDisplay_stub
     SceCtrl_stub
     SceTouch_stub
@@ -150,6 +154,7 @@ target_link_libraries(${PROJECT_NAME}
     SceIme_stub
     SceProcessmgr_stub
     SceSysmem_stub
+    SceAppMgr_stub
 )
 
 # ---------------------------------------------------------------------------

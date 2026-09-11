@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "vita_platform.h"
+#include "vita_surface.h"
 #include "vita_ime.h"
 
 /* IME buffers must outlive the dialog: keep them static. */
@@ -152,6 +153,7 @@ int vita_ime_start(const char *title, const char *initial)
 	}
 
 	ime_running = true;
+	vita_surface_set_dialog(true);
 	vita_log("ime: dialog started");
 	return 0;
 }
@@ -172,6 +174,7 @@ enum vita_ime_status vita_ime_poll(char *out, size_t outlen)
 	if (status == SCE_COMMON_DIALOG_STATUS_NONE) {
 		vita_log("ime: dialog ended unexpectedly");
 		ime_running = false;
+		vita_surface_set_dialog(false);
 		return VITA_IME_CANCELLED;
 	}
 
@@ -180,6 +183,7 @@ enum vita_ime_status vita_ime_poll(char *out, size_t outlen)
 	sceImeDialogGetResult(&result);
 	sceImeDialogTerm();
 	ime_running = false;
+	vita_surface_set_dialog(false);
 
 	if (result.button == SCE_IME_DIALOG_BUTTON_ENTER) {
 		utf16_to_utf8(ime_text, out, outlen);

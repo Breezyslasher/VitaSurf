@@ -2,9 +2,12 @@
  * libnsfb surface for the PlayStation Vita.
  *
  * NetSurf plots into a cached shadow buffer in main memory. Each damaged
- * rectangle reported through nsfb_update() is copied into a CDRAM display
- * buffer that SceDisplay scans out, so the screen is never uploaded whole
- * when nothing changed.
+ * rectangle reported through nsfb_update() is copied into a GPU texture
+ * that covers the screen, and the texture is drawn through libvita2d
+ * whenever something changed. The GPU is involved only so that system
+ * dialogs (the IME keyboard) can composite over the page: they refuse to
+ * start unless GXM is initialised, and they render through the common
+ * dialog update each frame.
  *
  * Input is polled from the controller and the front touch panel. Buttons
  * become libnsfb key events (see vita_surface.h for the codes), the right
@@ -28,11 +31,12 @@
 #include <string.h>
 
 #include <psp2/ctrl.h>
-#include <psp2/display.h>
+#include <psp2/gxm.h>
 #include <psp2/kernel/processmgr.h>
-#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/touch.h>
+
+#include <vita2d.h>
 
 #include "libnsfb.h"
 #include "libnsfb_event.h"
@@ -49,11 +53,10 @@
 
 #define SCREEN_WIDTH   VITASURF_SCREEN_WIDTH
 #define SCREEN_HEIGHT  VITASURF_SCREEN_HEIGHT
-#define SCREEN_STRIDE  960          /* pixels; must be a multiple of 64 */
 #define SCREEN_BPP     32
 
-/* CDRAM allocations are made in 256 KB units. */
-#define CDRAM_ALIGN    (256 * 1024)
+/* During a long redraw, show progress at least this often (microseconds). */
+#define PRESENT_INTERVAL_US 100000
 
 /* Input polling period while waiting for events, in microseconds. */
 #define POLL_INTERVAL_US 8000
@@ -81,8 +84,13 @@
 #define DIAG_BOXES       200
 
 struct vita_surface {
-	SceUID memblock;          /**< CDRAM block holding the display buffer */
-	uint32_t *display;        /**< display buffer base */
+	vita2d_texture *tex;      /**< screen-sized texture the page is copied into */
+	uint32_t *display;        /**< texture pixels */
+	int stride;               /**< texture row length in pixels */
+	bool dirty;               /**< texture changed since the last present */
+	SceUInt64 last_present_us;
+	bool dialog;              /**< a system dialog is on screen */
+	bool resync_buttons;      /**< forget button state after a dialog */
 
 	/* event queue, filled by polling and drained by vita_input() */
 	nsfb_event_t queue[EVENT_QUEUE_LEN];
@@ -250,6 +258,16 @@ static void poll_buttons(struct vita_surface *vs, SceUInt64 now_us)
 	}
 	vs->last_poll_us = now_us;
 
+	if (vs->resync_buttons) {
+		/* the button that closed a dialog must not act on the page */
+		vs->resync_buttons = false;
+		vs->buttons = pad.buttons;
+		vs->repeat_mask = 0;
+		vs->touch_down = false;
+		vs->touch_dragging = false;
+		return;
+	}
+
 	pressed = pad.buttons & ~vs->buttons;
 	released = vs->buttons & ~pad.buttons;
 	vs->buttons = pad.buttons;
@@ -375,6 +393,11 @@ static void poll_input(struct vita_surface *vs)
 {
 	SceUInt64 now_us = sceKernelGetProcessTimeWide();
 
+	/* the dialog owns the controls while it is up */
+	if (vs->dialog) {
+		vs->resync_buttons = true;
+		return;
+	}
 	poll_buttons(vs, now_us);
 	poll_touch(vs);
 }
@@ -402,7 +425,7 @@ static void draw_focus_overlay(struct vita_surface *vs, const nsfb_bbox_t *area)
 		}
 		edge_row = (y < vs->focus.y0 + FOCUS_THICKNESS) ||
 			   (y >= vs->focus.y1 - FOCUS_THICKNESS);
-		row = vs->display + y * SCREEN_STRIDE;
+		row = vs->display + y * vs->stride;
 		for (x = area->x0; x < area->x1; x++) {
 			if (x < vs->focus.x0 || x >= vs->focus.x1) {
 				continue;
@@ -456,16 +479,41 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 	}
 
 	src = nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4;
-	dst = vs->display + area.y0 * SCREEN_STRIDE + area.x0;
+	dst = vs->display + area.y0 * vs->stride + area.x0;
 	for (y = area.y0; y < area.y1; y++) {
 		memcpy(dst, src, (size_t)width * 4);
 		src += nsfb->linelen;
-		dst += SCREEN_STRIDE;
+		dst += vs->stride;
 	}
 
 	if (vs->focus_valid && nsfb_plot_bbox_intersect(&area, &vs->focus)) {
 		draw_focus_overlay(vs, &area);
 	}
+	vs->dirty = true;
+}
+
+/**
+ * Put the texture on screen if it changed, or every frame while a system
+ * dialog is up so the dialog can composite itself over it. Swapping waits
+ * for the vertical blank, so this is only called from the input loop and,
+ * during long redraws, from vita_update() at a limited rate.
+ */
+static void present(struct vita_surface *vs)
+{
+	if (vs->tex == NULL || (!vs->dirty && !vs->dialog)) {
+		return;
+	}
+	vita2d_start_drawing();
+	vita2d_draw_texture(vs->tex, 0.0f, 0.0f);
+	vita2d_end_drawing();
+	if (vs->dialog) {
+		vita2d_common_dialog_update();
+	}
+	vita2d_swap_buffers();
+	/* the GPU reads the texture; do not let NetSurf write it meanwhile */
+	vita2d_wait_rendering_done();
+	vs->dirty = false;
+	vs->last_present_us = sceKernelGetProcessTimeWide();
 }
 
 /* ------------------------------------------------------------------------ */
@@ -510,9 +558,7 @@ static int vita_set_geometry(nsfb_t *nsfb, int width, int height,
 static int vita_initialise(nsfb_t *nsfb)
 {
 	struct vita_surface *vs;
-	SceDisplayFrameBuf fb;
 	SceSize size;
-	void *base = NULL;
 	int ret;
 
 	if (nsfb->surface_priv != NULL) {
@@ -524,52 +570,34 @@ static int vita_initialise(nsfb_t *nsfb)
 		return -1;
 	}
 
-	/* display buffer in CDRAM */
-	size = SCREEN_STRIDE * SCREEN_HEIGHT * (SCREEN_BPP / 8);
-	size = (size + CDRAM_ALIGN - 1) & ~(SceSize)(CDRAM_ALIGN - 1);
-	vs->memblock = sceKernelAllocMemBlock("vitasurf_display",
-					      SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
-					      size, NULL);
-	if (vs->memblock < 0) {
-		vita_log("surface: sceKernelAllocMemBlock failed: 0x%08x",
-			 (unsigned int)vs->memblock);
+	/* GPU: libvita2d owns the display, the page lives in a texture */
+	ret = vita2d_init();
+	if (ret < 0) {
+		vita_log("surface: vita2d_init failed: 0x%08x", (unsigned int)ret);
 		free(vs);
 		return -1;
 	}
-	ret = sceKernelGetMemBlockBase(vs->memblock, &base);
-	if (ret < 0 || base == NULL) {
-		vita_log("surface: sceKernelGetMemBlockBase failed: 0x%08x",
-			 (unsigned int)ret);
-		sceKernelFreeMemBlock(vs->memblock);
+	vita2d_set_clear_color(0xFF000000u);
+	vs->tex = vita2d_create_empty_texture_format(SCREEN_WIDTH, SCREEN_HEIGHT,
+						     SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+	if (vs->tex == NULL) {
+		vita_log("surface: cannot create the %dx%d screen texture",
+			 SCREEN_WIDTH, SCREEN_HEIGHT);
+		vita2d_fini();
 		free(vs);
 		return -1;
 	}
-	vs->display = base;
+	vs->display = vita2d_texture_get_datap(vs->tex);
+	vs->stride = (int)vita2d_texture_get_stride(vs->tex) / 4;
+	size = (SceSize)vs->stride * SCREEN_HEIGHT * (SCREEN_BPP / 8);
 	memset(vs->display, 0, size);
 
 	/* shadow buffer NetSurf plots into */
 	nsfb->linelen = SCREEN_WIDTH * (SCREEN_BPP / 8);
 	nsfb->ptr = calloc((size_t)SCREEN_HEIGHT, (size_t)nsfb->linelen);
 	if (nsfb->ptr == NULL) {
-		sceKernelFreeMemBlock(vs->memblock);
-		free(vs);
-		return -1;
-	}
-
-	memset(&fb, 0, sizeof(fb));
-	fb.size = sizeof(fb);
-	fb.base = vs->display;
-	fb.pitch = SCREEN_STRIDE;
-	fb.pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
-	fb.width = SCREEN_WIDTH;
-	fb.height = SCREEN_HEIGHT;
-	ret = sceDisplaySetFrameBuf(&fb, SCE_DISPLAY_SETBUF_NEXTFRAME);
-	if (ret < 0) {
-		vita_log("surface: sceDisplaySetFrameBuf failed: 0x%08x",
-			 (unsigned int)ret);
-		free(nsfb->ptr);
-		nsfb->ptr = NULL;
-		sceKernelFreeMemBlock(vs->memblock);
+		vita2d_free_texture(vs->tex);
+		vita2d_fini();
 		free(vs);
 		return -1;
 	}
@@ -586,8 +614,12 @@ static int vita_initialise(nsfb_t *nsfb)
 	/* start with the pointer over the page rather than the toolbar */
 	queue_move(vs, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
 
-	vita_log("surface: %dx%d, display buffer %u KB in CDRAM",
-		 SCREEN_WIDTH, SCREEN_HEIGHT, (unsigned int)size / 1024);
+	/* show the cleared screen before NetSurf draws anything */
+	vs->dirty = true;
+	present(vs);
+
+	vita_log("surface: %dx%d, screen texture %u KB, stride %d px",
+		 SCREEN_WIDTH, SCREEN_HEIGHT, (unsigned int)size / 1024, vs->stride);
 
 	return 0;
 }
@@ -606,7 +638,9 @@ static int vita_finalise(nsfb_t *nsfb)
 	free(nsfb->ptr);
 	nsfb->ptr = NULL;
 
-	sceKernelFreeMemBlock(vs->memblock);
+	vita2d_wait_rendering_done();
+	vita2d_free_texture(vs->tex);
+	vita2d_fini();
 	free(vs);
 	nsfb->surface_priv = NULL;
 	the_nsfb = NULL;
@@ -636,6 +670,20 @@ void vita_surface_read_input(struct vita_input_state *out)
 	out->dragging = vs->touch_dragging;
 	vs->drag_dx = 0;
 	vs->drag_dy = 0;
+}
+
+void vita_surface_set_dialog(bool active)
+{
+	struct vita_surface *vs;
+
+	if (the_nsfb == NULL || the_nsfb->surface_priv == NULL) {
+		return;
+	}
+	vs = the_nsfb->surface_priv;
+	if (vs->dialog != active) {
+		vs->dialog = active;
+		vs->dirty = true;
+	}
 }
 
 void vita_surface_set_focus_rect(const nsfb_bbox_t *rect)
@@ -687,6 +735,7 @@ static bool vita_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
 		SceUInt delay_us = POLL_INTERVAL_US;
 
 		poll_input(vs);
+		present(vs);
 
 		if (dequeue_event(vs, event)) {
 			return true;
@@ -739,12 +788,18 @@ static int vita_claim(nsfb_t *nsfb, nsfb_bbox_t *box)
 static int vita_update(nsfb_t *nsfb, nsfb_bbox_t *box)
 {
 	struct nsfb_cursor_s *cursor = nsfb->cursor;
+	struct vita_surface *vs = nsfb->surface_priv;
 
 	if ((cursor != NULL) && (cursor->plotted == false)) {
 		nsfb_cursor_plot(nsfb, cursor);
 	}
 
 	blit_box(nsfb, box);
+
+	if (vs != NULL && !vs->dialog &&
+	    sceKernelGetProcessTimeWide() - vs->last_present_us > PRESENT_INTERVAL_US) {
+		present(vs);
+	}
 
 	return 0;
 }

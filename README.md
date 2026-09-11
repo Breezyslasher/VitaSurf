@@ -25,7 +25,7 @@ Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
 `make`, `pkg-config`, `perl`, `gperf`, `flex`, `bison`, `cmake` and host
 development packages for zlib and libpng (NetSurf builds a few host tools).
 
-    vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat
+    vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d
     git submodule update --init --recursive
     ./scripts/build-deps.sh
     ./scripts/build-netsurf.sh
@@ -108,3 +108,10 @@ Cross. Link focus walks the page's box tree for links and form controls,
 picks the nearest one in the pressed direction, scrolls it into view and
 draws an outline over the display. Text entry uses the system IME dialog,
 falling back to NetSurf's on-screen keyboard if the dialog cannot start.
+
+The display goes through libvita2d (MIT): the page is copied into a
+screen-sized GPU texture and drawn when it changes. System dialogs such
+as the IME keyboard refuse to start unless GXM is initialised and draw
+themselves through the common dialog update each frame, so a plain
+framebuffer cannot show them. Damaged regions are still the only thing
+copied; the GPU draw is one textured quad.

@@ -51,6 +51,13 @@ struct vita_input_state {
 void vita_surface_read_input(struct vita_input_state *out);
 
 /**
+ * Tell the surface a system dialog is on screen. While it is, the surface
+ * presents every frame (dialogs composite through the GPU) and ignores
+ * the controls, which the dialog owns.
+ */
+void vita_surface_set_dialog(bool active);
+
+/**
  * Draw a focus rectangle over the display at screen coordinates, or clear
  * it with NULL. The rectangle is an overlay on the display buffer only:
  * NetSurf's own rendering is never touched, and it is re-applied whenever
