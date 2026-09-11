@@ -64,11 +64,16 @@ add_executable(${PROJECT_NAME}
     vita/platform/vita_platform.c
     # newlib's iconv_open() fails for every charset; this replaces it.
     vita/platform/vita_iconv.c
+    # NetSurf file table: drive prefixes inside file: URLs.
+    vita/platform/vita_file.c
     vita/surface/vita.c
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     vita/platform
+    # vita_file.c uses NetSurf's utils/file.h.
+    ${CMAKE_SOURCE_DIR}/deps/netsurf
+    ${CMAKE_SOURCE_DIR}/deps/netsurf/include
     # The surface is compiled against libnsfb's internal headers.
     ${NETSURF_LIBNSFB_SRC}/include
     ${NETSURF_LIBNSFB_SRC}/src

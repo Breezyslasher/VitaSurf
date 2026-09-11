@@ -1,5 +1,5 @@
 diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
-index 5bfc8227b..ee352c05b 100644
+index 5bfc8227b..70fc517ce 100644
 --- a/frontends/framebuffer/gui.c
 +++ b/frontends/framebuffer/gui.c
 @@ -51,6 +51,10 @@
@@ -24,3 +24,13 @@ index 5bfc8227b..ee352c05b 100644
  }
  
  static void
+@@ -2196,6 +2204,9 @@ main(int argc, char** argv)
+ 		.utf8 = framebuffer_utf8_table,
+ 		.bitmap = framebuffer_bitmap_table,
+ 		.layout = framebuffer_layout_table,
++#ifdef __vita__
++		.file = vita_file_table,
++#endif
+ 	};
+ 
+         ret = netsurf_register(&framebuffer_table);

@@ -55,4 +55,12 @@ void vita_log_memory(const char *what);
 /** True when the user created the verbose flag file in the data directory. */
 int vita_verbose_requested(void);
 
+/**
+ * NetSurf file operation table with Vita path translation (vita_file.c).
+ * Installed into the framebuffer frontend's netsurf_table by
+ * patches/0002-netsurf-vita-gui-hooks.patch.
+ */
+struct gui_file_table;
+extern struct gui_file_table *vita_file_table;
+
 #endif
