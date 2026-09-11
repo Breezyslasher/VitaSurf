@@ -338,8 +338,8 @@ int vita_platform_init(void)
 		return -1;
 	}
 	setvbuf(logf, NULL, _IONBF, 0);
-	vita_log("VitaSurf starting, build %s (%s)", VITASURF_BUILD_ID,
-		 VITASURF_BUILD_SHA);
+	vita_log("VitaSurf starting, build %s (%s), JavaScript engine %s",
+		 VITASURF_BUILD_ID, VITASURF_BUILD_SHA, VITASURF_JS_ENGINE);
 	if (mkdir_ret < 0 && mkdir_ret != (int)0x80010011) {
 		vita_log("sceIoMkdir(%s) returned 0x%08x", VITASURF_DATA_DIR,
 			 (unsigned int)mkdir_ret);

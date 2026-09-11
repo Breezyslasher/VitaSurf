@@ -51,6 +51,15 @@ if(VITASURF_BUILD_SHA STREQUAL "")
     endif()
 endif()
 set(VITASURF_STACK_KB 4096 CACHE STRING "main thread stack size in KB")
+# Must match the VITASURF_JS_ENGINE scripts/build-netsurf.sh was run with:
+# quickjs (default) leaves the js_* symbols for vita/js/qjs.c and
+# libquickjs.a (vdpm quickjs-ng), duktape builds NetSurf's engine into
+# libnetsurf.a, no uses NetSurf's stub engine.
+set(VITASURF_JS_ENGINE "quickjs" CACHE STRING "JavaScript engine: quickjs, duktape or no")
+set_property(CACHE VITASURF_JS_ENGINE PROPERTY STRINGS quickjs duktape no)
+if(NOT VITASURF_JS_ENGINE MATCHES "^(duktape|quickjs|no)$")
+    message(FATAL_ERROR "VITASURF_JS_ENGINE must be duktape, quickjs or no, not '${VITASURF_JS_ENGINE}'")
+endif()
 set(NETSURF_STAGE "${CMAKE_SOURCE_DIR}/out/netsurf" CACHE PATH
     "Output of scripts/build-netsurf.sh (libnetsurf.a and resources/)")
 
@@ -87,6 +96,13 @@ add_executable(${PROJECT_NAME}
     vita/input/vita_ime.c
     vita/input/vita_menu.c
 )
+if(VITASURF_JS_ENGINE STREQUAL "quickjs")
+    if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/quickjs.h")
+        message(FATAL_ERROR "quickjs.h not found: install it with 'vdpm quickjs-ng'")
+    endif()
+    # Hand-written QuickJS bindings implementing NetSurf's js.h.
+    target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c)
+endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     vita/platform
@@ -113,6 +129,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     VITASURF_STACK_KB=${VITASURF_STACK_KB}
     VITASURF_BUILD_ID="${VITASURF_BUILD_ID}"
     VITASURF_BUILD_SHA="${VITASURF_BUILD_SHA}"
+    VITASURF_JS_ENGINE="${VITASURF_JS_ENGINE}"
 )
 if(VITASURF_DEBUG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_DEBUG=1)
@@ -129,6 +146,12 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--gc-sections
 )
 
+set(VITASURF_JS_LIBS)
+if(VITASURF_JS_ENGINE STREQUAL "quickjs")
+    # quickjs-ng (MIT), from vdpm.
+    set(VITASURF_JS_LIBS quickjs)
+endif()
+
 target_link_libraries(${PROJECT_NAME}
     -Wl,--whole-archive
     ${NETSURF_LIB}
@@ -136,6 +159,7 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--no-whole-archive
     -Wl,--start-group
     css dom hubbub parserutils wapcaplet nsutils nsbmp nsgif svgtiny nspsl nslog utf8proc
+    ${VITASURF_JS_LIBS}
     # libcurl pulls in zstd; the mbedTLS package is built with pthread mutexes.
     curl mbedtls mbedx509 mbedcrypto zstd expat
     # libvita2d (MIT) puts the page on screen through the GPU so that the
