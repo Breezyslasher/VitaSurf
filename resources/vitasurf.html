@@ -51,6 +51,13 @@ the file fetcher, CSS and layout all work.</p>
 <li><a href="https://lite.duckduckgo.com/lite/">DuckDuckGo Lite</a> (HTTPS, a form)</li>
 </ul>
 
+<h2>Cloudflare browser checks</h2>
+<p>Pages titled "Just a moment..." are Cloudflare's browser check, which
+this browser cannot pass on its own. Run FlareSolverr on a computer on the
+same network and write its URL (for example http://192.168.1.20:8191/v1)
+into the file ux0:data/VitaSurf/flaresolverr; the check is then handed to
+it and the page reloads.</p>
+
 <h2>JavaScript test pages</h2>
 <ul>
 <li><a href="file:///resources/jstest.html">Bundled script test</a> (DOM, timers, events)</li>

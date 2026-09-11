@@ -35,6 +35,16 @@ where it therefore does real work, and its own allocations stay under
 under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, and
 resume handling that stops stale fetches after a suspend.
 
+Sites behind Cloudflare's browser check ("Just a moment...") cannot be
+passed by the browser itself. If you run
+[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) on a machine
+on the same network, put its URL in `ux0:data/VitaSurf/flaresolverr`
+(one line, for example `http://192.168.1.20:8191/v1`): the check is then
+handed to it, its cookies are stored and the page reloads. The browser
+switches to FlareSolverr's user agent for the rest of the session, since
+Cloudflare ties the clearance to it, and the Vita must share the solver's
+public address. The request blocks the browser while the solver works.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus

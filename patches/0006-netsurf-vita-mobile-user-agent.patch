@@ -1,5 +1,5 @@
 diff --git a/utils/useragent.c b/utils/useragent.c
-index 547999c7c..6fd2ce650 100644
+index 547999c7c..64317a1cb 100644
 --- a/utils/useragent.c
 +++ b/utils/useragent.c
 @@ -52,6 +52,14 @@ user_agent_build_string(void)
@@ -17,3 +17,42 @@ index 547999c7c..6fd2ce650 100644
  
          len = snprintf(NULL, 0, NETSURF_UA_FORMAT_STRING,
                         sysname,
+@@ -74,6 +82,20 @@ user_agent_build_string(void)
+               core_user_agent_string);
+ }
+ 
++#ifdef __vita__
++/* VitaSurf: replace the user agent at runtime (see vita_flaresolverr.c) */
++void
++user_agent_override(const char *ua)
++{
++	char *copy = strdup(ua);
++
++	if (copy == NULL)
++		return;
++	free_user_agent_string();
++	core_user_agent_string = copy;
++}
++#endif
++
+ /* This is a function so that later we can override it trivially */
+ const char *
+ user_agent_string(void)
+diff --git a/utils/useragent.h b/utils/useragent.h
+index 6eb309a62..72c182642 100644
+--- a/utils/useragent.h
++++ b/utils/useragent.h
+@@ -34,4 +34,13 @@ const char * user_agent_string(void);
+  */
+ void free_user_agent_string(void);
+ 
++#ifdef __vita__
++/**
++ * Replace the user agent string for every later fetch (VitaSurf).
++ *
++ * \param ua The new user agent, copied.
++ */
++void user_agent_override(const char *ua);
++#endif
++
+ #endif

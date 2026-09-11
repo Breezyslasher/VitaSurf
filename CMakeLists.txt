@@ -93,6 +93,8 @@ add_executable(${PROJECT_NAME}
     vita/platform/vita_net.c
     # NetSurf download table: files saved under ux0:data/VitaSurf/downloads.
     vita/platform/vita_download.c
+    # Optional FlareSolverr client for Cloudflare browser checks.
+    vita/platform/vita_flaresolverr.c
     vita/surface/vita.c
     vita/input/vita_input.c
     vita/input/vita_ime.c

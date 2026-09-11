@@ -818,6 +818,53 @@ void vita_input_load_started(struct gui_window *gw)
 	}
 }
 
+/* One FlareSolverr attempt per URL per minute, so a failure cannot loop. */
+static char flaresolverr_last[512];
+static uint64_t flaresolverr_last_us;
+
+static bool flaresolverr_should_try(struct gui_window *gw)
+{
+	nsurl *url = NULL;
+	uint64_t now = sceKernelGetProcessTimeWide();
+	bool ok = false;
+
+	if (browser_window_get_url(gw->bw, false, &url) != NSERROR_OK || url == NULL) {
+		return false;
+	}
+	if (strcmp(nsurl_access(url), flaresolverr_last) != 0 ||
+	    now - flaresolverr_last_us > 60000000ull) {
+		strncpy(flaresolverr_last, nsurl_access(url), sizeof(flaresolverr_last) - 1);
+		flaresolverr_last[sizeof(flaresolverr_last) - 1] = '\0';
+		flaresolverr_last_us = now;
+		ok = true;
+	}
+	nsurl_unref(url);
+	return ok;
+}
+
+static void flaresolverr_run(void *p)
+{
+	struct gui_window *gw = p;
+	nsurl *url = NULL;
+
+	if (gw != the_gw || gw->bw == NULL) {
+		return;
+	}
+	if (browser_window_get_url(gw->bw, false, &url) != NSERROR_OK || url == NULL) {
+		return;
+	}
+	if (vita_flaresolverr_solve(url)) {
+		if (guit->window->set_status != NULL) {
+			guit->window->set_status(gw, "Cloudflare check passed by FlareSolverr, reloading");
+		}
+		browser_window_navigate(gw->bw, url, NULL, BW_NAVIGATE_HISTORY,
+					NULL, NULL, NULL);
+	} else if (guit->window->set_status != NULL) {
+		guit->window->set_status(gw, "FlareSolverr could not pass the Cloudflare check (see log)");
+	}
+	nsurl_unref(url);
+}
+
 void vita_input_load_finished(struct gui_window *gw)
 {
 	nsurl *url = NULL;
@@ -839,17 +886,28 @@ void vita_input_load_finished(struct gui_window *gw)
 
 	/*
 	 * Cloudflare's browser check ("Just a moment...") runs a script that
-	 * fingerprints a full desktop browser and never passes here. Say so
-	 * in the status bar rather than leaving a page that looks stuck.
+	 * fingerprints a full desktop browser and never passes here. With a
+	 * FlareSolverr server configured the check is handed to it and the
+	 * page reloaded with its cookies; otherwise say so in the status bar
+	 * rather than leaving a page that looks stuck.
 	 */
 	{
 		const char *title = browser_window_get_title(gw->bw);
 
-		if (title != NULL && strncmp(title, "Just a moment", 13) == 0 &&
-		    guit->window->set_status != NULL) {
-			vita_log("page: Cloudflare browser check; it cannot be passed by this browser");
-			guit->window->set_status(gw,
-				"This site's Cloudflare browser check cannot be passed by VitaSurf");
+		if (title != NULL && strncmp(title, "Just a moment", 13) == 0) {
+			if (vita_flaresolverr_endpoint() != NULL &&
+			    flaresolverr_should_try(gw)) {
+				if (guit->window->set_status != NULL) {
+					guit->window->set_status(gw,
+						"Cloudflare check: asking FlareSolverr, please wait...");
+				}
+				/* let that status reach the screen first */
+				framebuffer_schedule(300, flaresolverr_run, gw);
+			} else if (guit->window->set_status != NULL) {
+				vita_log("page: Cloudflare browser check; it cannot be passed by this browser");
+				guit->window->set_status(gw,
+					"This site's Cloudflare browser check cannot be passed by VitaSurf");
+			}
 		}
 	}
 }
