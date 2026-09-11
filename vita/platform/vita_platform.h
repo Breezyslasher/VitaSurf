@@ -42,10 +42,13 @@
 #define VITASURF_BOOKMARKS_PATH VITASURF_DATA_DIR "/Bookmarks"
 #define VITASURF_BOOKMARKS_PAGE VITASURF_DATA_DIR "/bookmarks.html"
 #define VITASURF_HISTORY_PAGE   VITASURF_DATA_DIR "/history.html"
+#define VITASURF_DOWNLOADS_DIR  VITASURF_DATA_DIR "/downloads"
+#define VITASURF_DOWNLOADS_PAGE VITASURF_DATA_DIR "/downloads.html"
 /* The same files as file: URLs NetSurf can open (the Vita file table maps
  * /ux0:/... back to ux0:/...). */
 #define VITASURF_BOOKMARKS_URL "file:///ux0:/data/VitaSurf/bookmarks.html"
 #define VITASURF_HISTORY_URL   "file:///ux0:/data/VitaSurf/history.html"
+#define VITASURF_DOWNLOADS_URL "file:///ux0:/data/VitaSurf/downloads.html"
 
 /**
  * Initialise the platform: create the data directory, open the log,
@@ -100,5 +103,16 @@ int vita_verbose_requested(void);
  */
 struct gui_file_table;
 extern struct gui_file_table *vita_file_table;
+
+/** NetSurf download table (vita_download.c): saves to the downloads dir. */
+struct gui_download_table;
+extern struct gui_download_table *vita_download_table;
+
+/**
+ * Poll the system event queue (vita_platform.c). Returns 1 once after the
+ * application resumed from suspend, 0 otherwise. Cheap enough to call a
+ * few times a second.
+ */
+int vita_platform_poll_resume(void);
 
 #endif

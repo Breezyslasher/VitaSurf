@@ -30,7 +30,10 @@ default engine. Measured on hardware against Duktape, it runs the modern
 JavaScript that documentation sites, wikis and forums ship, where
 NetSurf's Duktape fails to parse it; it is somewhat slower on pages
 where it therefore does real work, and its own allocations stay under
-1 MB on such pages. Duktape remains selectable for comparison.
+1 MB on such pages. Duktape remains selectable for comparison. Phase 7
+(polish) is in progress: page zoom from the Start menu, downloads saved
+under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, and
+resume handling that stops stale fetches after a suspend.
 
 ## Building
 
