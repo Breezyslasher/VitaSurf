@@ -10,3 +10,19 @@ index 674df65..c0a4298 100644
      NSFB_SURFACE_RAM, /**< RAM surface */
      NSFB_SURFACE_COUNT, /**< The number of surface kinds */
  };
+diff --git a/src/plot.h b/src/plot.h
+index db60ea9..9db18fe 100644
+--- a/src/plot.h
++++ b/src/plot.h
+@@ -45,6 +45,11 @@
+     #else
+         #error "Endian determination failed"
+     #endif
++#elif defined(__vita__)
++    /* VitaSDK newlib has no endian.h; the compiler knows the byte order */
++    #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
++        #define NSFB_BE_BYTE_ORDER
++    #endif
+ #else
+     #include <endian.h>
+     #if defined(__BYTE_ORDER__)
