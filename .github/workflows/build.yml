@@ -51,7 +51,9 @@ jobs:
       - name: Install Vita packages
         run: |
           set -eu
-          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype openssl curl expat
+          # The image ships openssl-1.1.1; plain "openssl" resolves to 1.0.2 and
+          # conflicts with it.
+          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype openssl-1.1.1 curl expat
 
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh

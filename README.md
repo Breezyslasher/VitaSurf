@@ -21,7 +21,7 @@ Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
 `make`, `pkg-config`, `perl`, `gperf`, `flex`, `bison`, `cmake` and host
 development packages for zlib and libpng (NetSurf builds a few host tools).
 
-    vdpm zlib bzip2 libpng libjpeg-turbo freetype openssl curl expat
+    vdpm zlib bzip2 libpng libjpeg-turbo freetype openssl-1.1.1 curl expat
     git submodule update --init --recursive
     ./scripts/build-deps.sh
     ./scripts/build-netsurf.sh
