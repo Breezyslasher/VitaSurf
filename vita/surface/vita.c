@@ -6,10 +6,12 @@
  * buffer that SceDisplay scans out, so the screen is never uploaded whole
  * when nothing changed.
  *
- * Input is polled from the controller and the front touch panel and turned
- * into libnsfb events. The mapping here is the phase 1 minimum needed to
- * scroll, tap and quit; the full control scheme lives in vita/input/ from
- * phase 3 onwards.
+ * Input is polled from the controller and the front touch panel. Buttons
+ * become libnsfb key events (see vita_surface.h for the codes), the right
+ * stick moves the pointer, a touch tap clicks, and the sticks and touch
+ * drags are exposed through vita_surface_read_input() for the input layer
+ * in vita/input/ to turn into smooth scrolling. The input layer also asks
+ * for a focus rectangle to be drawn over the display.
  *
  * This file is compiled by CMake against libnsfb's internal headers; it is
  * not part of the libnsfb build. It registers itself with libnsfb through
@@ -43,6 +45,7 @@
 #include "cursor.h"
 
 #include "vita_platform.h"
+#include "vita_surface.h"
 
 #define SCREEN_WIDTH   VITASURF_SCREEN_WIDTH
 #define SCREEN_HEIGHT  VITASURF_SCREEN_HEIGHT
@@ -59,9 +62,18 @@
 #define REPEAT_DELAY_MS  400
 #define REPEAT_RATE_MS   60
 
-/* Left stick: dead zone out of 0..255 around 128, and scroll step period. */
+/* Analogue sticks: dead zone out of 0..255 around 128. */
 #define STICK_DEADZONE   40
-#define STICK_PERIOD_MS  50
+
+/* Right stick pointer speed at full deflection, pixels per second. */
+#define POINTER_SPEED    700
+
+/* A touch that moves further than this (pixels) is a drag, not a tap. */
+#define DRAG_THRESHOLD   12
+
+/* Focus rectangle overlay: outline thickness and colour (A8B8G8R8). */
+#define FOCUS_THICKNESS  3
+#define FOCUS_COLOUR     0xFFFF862Eu
 
 #define EVENT_QUEUE_LEN  64
 
@@ -81,16 +93,28 @@ struct vita_surface {
 	unsigned int buttons;     /**< buttons held at the last poll */
 	unsigned int repeat_mask; /**< D-pad button currently repeating */
 	SceUInt64 repeat_due_us;  /**< when the next repeat fires */
-	SceUInt64 stick_due_us;   /**< when the next stick scroll step fires */
+	SceUInt64 last_poll_us;   /**< time of the previous poll */
+	int lx, ly, rx, ry;       /**< sticks after the dead zone, -127..127 */
+	int pointer_acc_x;        /**< right stick sub-pixel movement, 16.16 */
+	int pointer_acc_y;
 
 	/* touch state */
 	bool touch_down;
-	int touch_x;
+	bool touch_dragging;
+	int touch_start_x;        /**< where the touch began */
+	int touch_start_y;
+	int touch_x;              /**< last reported position */
 	int touch_y;
+	int drag_dx;              /**< drag movement since the last read */
+	int drag_dy;
 
 	/* last pointer position handed to NetSurf */
 	int pointer_x;
 	int pointer_y;
+
+	/* focus rectangle overlay, screen coordinates, valid when set */
+	bool focus_valid;
+	nsfb_bbox_t focus;
 
 	/* diagnostics: claim and update boxes are logged only when the
 	 * verbose flag file exists, and only the first DIAG_BOXES of each */
@@ -168,23 +192,44 @@ static void queue_control(struct vita_surface *vs, enum nsfb_control_e code)
 /* Input                                                                    */
 
 /*
- * Phase 1 button mapping. The framebuffer frontend scrolls on the arrow
- * and page keys, activates on return and closes with escape.
+ * Buttons become key events. D-pad buttons and the triggers repeat while
+ * held. What each key does is decided in vita/input/vita_input.c.
  */
 static const struct {
 	unsigned int button;
 	enum nsfb_key_code_e key;
 	bool repeats;
 } button_map[] = {
-	{ SCE_CTRL_UP,       NSFB_KEY_UP,       true  },
-	{ SCE_CTRL_DOWN,     NSFB_KEY_DOWN,     true  },
-	{ SCE_CTRL_LEFT,     NSFB_KEY_LEFT,     true  },
-	{ SCE_CTRL_RIGHT,    NSFB_KEY_RIGHT,    true  },
-	{ SCE_CTRL_CROSS,    NSFB_KEY_RETURN,   false },
-	{ SCE_CTRL_CIRCLE,   NSFB_KEY_ESCAPE,   false },
-	{ SCE_CTRL_LTRIGGER, NSFB_KEY_PAGEUP,   true  },
-	{ SCE_CTRL_RTRIGGER, NSFB_KEY_PAGEDOWN, true  },
+	{ SCE_CTRL_UP,       VITA_KEY_UP,       true  },
+	{ SCE_CTRL_DOWN,     VITA_KEY_DOWN,     true  },
+	{ SCE_CTRL_LEFT,     VITA_KEY_LEFT,     true  },
+	{ SCE_CTRL_RIGHT,    VITA_KEY_RIGHT,    true  },
+	{ SCE_CTRL_CROSS,    VITA_KEY_CROSS,    false },
+	{ SCE_CTRL_CIRCLE,   VITA_KEY_CIRCLE,   false },
+	{ SCE_CTRL_TRIANGLE, VITA_KEY_TRIANGLE, false },
+	{ SCE_CTRL_SQUARE,   VITA_KEY_SQUARE,   false },
+	{ SCE_CTRL_LTRIGGER, VITA_KEY_L,        false },
+	{ SCE_CTRL_RTRIGGER, VITA_KEY_R,        false },
+	{ SCE_CTRL_SELECT,   VITA_KEY_SELECT,   false },
+	{ SCE_CTRL_START,    VITA_KEY_START,    false },
 };
+
+/** Map a raw 0..255 stick axis to -127..127 with a dead zone. */
+static int stick_axis(unsigned int raw)
+{
+	int v = (int)raw - 128;
+
+	if (v > -STICK_DEADZONE && v < STICK_DEADZONE) {
+		return 0;
+	}
+	/* rescale so the edge of the dead zone is 0 and full deflection 127 */
+	if (v < 0) {
+		v = (v + STICK_DEADZONE) * 127 / (128 - STICK_DEADZONE);
+		return v < -127 ? -127 : v;
+	}
+	v = (v - STICK_DEADZONE) * 127 / (127 - STICK_DEADZONE);
+	return v > 127 ? 127 : v;
+}
 
 static void poll_buttons(struct vita_surface *vs, SceUInt64 now_us)
 {
@@ -192,17 +237,24 @@ static void poll_buttons(struct vita_surface *vs, SceUInt64 now_us)
 	unsigned int pressed;
 	unsigned int released;
 	unsigned int i;
+	int elapsed_us;
 
 	memset(&pad, 0, sizeof(pad));
 	if (sceCtrlPeekBufferPositive(0, &pad, 1) < 0) {
 		return;
 	}
 
+	elapsed_us = (int)(now_us - vs->last_poll_us);
+	if (vs->last_poll_us == 0 || elapsed_us < 0 || elapsed_us > 100000) {
+		elapsed_us = POLL_INTERVAL_US;
+	}
+	vs->last_poll_us = now_us;
+
 	pressed = pad.buttons & ~vs->buttons;
 	released = vs->buttons & ~pad.buttons;
 	vs->buttons = pad.buttons;
 
-	/* Select and Start together quit; there is no other way out yet. */
+	/* Select and Start together quit. */
 	if ((pad.buttons & (SCE_CTRL_SELECT | SCE_CTRL_START)) ==
 	    (SCE_CTRL_SELECT | SCE_CTRL_START)) {
 		queue_control(vs, NSFB_CONTROL_QUIT);
@@ -225,7 +277,7 @@ static void poll_buttons(struct vita_surface *vs, SceUInt64 now_us)
 		}
 	}
 
-	/* key repeat for the held D-pad button or trigger */
+	/* key repeat for the held D-pad button */
 	if (vs->repeat_mask != 0 && (pad.buttons & vs->repeat_mask) &&
 	    now_us >= vs->repeat_due_us) {
 		for (i = 0; i < sizeof(button_map) / sizeof(button_map[0]); i++) {
@@ -237,26 +289,40 @@ static void poll_buttons(struct vita_surface *vs, SceUInt64 now_us)
 		vs->repeat_due_us = now_us + REPEAT_RATE_MS * 1000;
 	}
 
-	/*
-	 * Left stick scrolls like a mouse wheel. Wheel events are delivered
-	 * to the widget under the pointer, so keep the pointer where the
-	 * page is.
-	 */
-	if (now_us >= vs->stick_due_us) {
-		int dy = (int)pad.ly - 128;
+	/* sticks: the left one is read by the input layer for scrolling */
+	vs->lx = stick_axis(pad.lx);
+	vs->ly = stick_axis(pad.ly);
+	vs->rx = stick_axis(pad.rx);
+	vs->ry = stick_axis(pad.ry);
 
-		if (dy < -STICK_DEADZONE || dy > STICK_DEADZONE) {
-			enum nsfb_key_code_e key =
-				(dy < 0) ? NSFB_KEY_MOUSE_4 : NSFB_KEY_MOUSE_5;
+	/* the right stick moves the pointer, with sub-pixel accumulation */
+	if (vs->rx != 0 || vs->ry != 0) {
+		int dx, dy;
 
-			queue_move(vs, vs->pointer_x, vs->pointer_y);
-			queue_key(vs, NSFB_EVENT_KEY_DOWN, key);
-			queue_key(vs, NSFB_EVENT_KEY_UP, key);
-			vs->stick_due_us = now_us + STICK_PERIOD_MS * 1000;
+		/* 16.16 fixed point pixels: speed * deflection * seconds */
+		vs->pointer_acc_x += (int)((int64_t)vs->rx * POINTER_SPEED *
+					   65536 / 127 * elapsed_us / 1000000);
+		vs->pointer_acc_y += (int)((int64_t)vs->ry * POINTER_SPEED *
+					   65536 / 127 * elapsed_us / 1000000);
+		dx = vs->pointer_acc_x / 65536;
+		dy = vs->pointer_acc_y / 65536;
+		if (dx != 0 || dy != 0) {
+			vs->pointer_acc_x -= dx * 65536;
+			vs->pointer_acc_y -= dy * 65536;
+			queue_move(vs, vs->pointer_x + dx, vs->pointer_y + dy);
 		}
+	} else {
+		vs->pointer_acc_x = 0;
+		vs->pointer_acc_y = 0;
 	}
 }
 
+/*
+ * Touch: a tap (press and release without moving) is a click at the
+ * touch point; moving the finger is a drag that scrolls the page, which
+ * the input layer reads as deltas. Drags never reach NetSurf as mouse
+ * movement, so they do not start text selections.
+ */
 static void poll_touch(struct vita_surface *vs)
 {
 	SceTouchData touch;
@@ -273,18 +339,35 @@ static void poll_touch(struct vita_surface *vs)
 
 		if (!vs->touch_down) {
 			vs->touch_down = true;
+			vs->touch_dragging = false;
+			vs->touch_start_x = x;
+			vs->touch_start_y = y;
 			vs->touch_x = x;
 			vs->touch_y = y;
-			queue_move(vs, x, y);
-			queue_key(vs, NSFB_EVENT_KEY_DOWN, NSFB_KEY_MOUSE_1);
 		} else if (x != vs->touch_x || y != vs->touch_y) {
+			if (!vs->touch_dragging &&
+			    (abs(x - vs->touch_start_x) > DRAG_THRESHOLD ||
+			     abs(y - vs->touch_start_y) > DRAG_THRESHOLD)) {
+				vs->touch_dragging = true;
+				/* include the movement that crossed the threshold */
+				vs->drag_dx += x - vs->touch_start_x;
+				vs->drag_dy += y - vs->touch_start_y;
+			} else if (vs->touch_dragging) {
+				vs->drag_dx += x - vs->touch_x;
+				vs->drag_dy += y - vs->touch_y;
+			}
 			vs->touch_x = x;
 			vs->touch_y = y;
-			queue_move(vs, x, y);
 		}
 	} else if (vs->touch_down) {
 		vs->touch_down = false;
-		queue_key(vs, NSFB_EVENT_KEY_UP, NSFB_KEY_MOUSE_1);
+		if (!vs->touch_dragging) {
+			/* a tap: move the pointer there and click */
+			queue_move(vs, vs->touch_start_x, vs->touch_start_y);
+			queue_key(vs, NSFB_EVENT_KEY_DOWN, NSFB_KEY_MOUSE_1);
+			queue_key(vs, NSFB_EVENT_KEY_UP, NSFB_KEY_MOUSE_1);
+		}
+		vs->touch_dragging = false;
 	}
 }
 
@@ -298,6 +381,40 @@ static void poll_input(struct vita_surface *vs)
 
 /* ------------------------------------------------------------------------ */
 /* Display                                                                  */
+
+/* The one surface instance, for the vita_surface_* entry points. */
+static nsfb_t *the_nsfb;
+
+/**
+ * Draw the part of the focus rectangle outline that falls inside area,
+ * directly into the display buffer. area is already clipped to the screen.
+ */
+static void draw_focus_overlay(struct vita_surface *vs, const nsfb_bbox_t *area)
+{
+	int x, y;
+
+	for (y = area->y0; y < area->y1; y++) {
+		uint32_t *row;
+		bool edge_row;
+
+		if (y < vs->focus.y0 || y >= vs->focus.y1) {
+			continue;
+		}
+		edge_row = (y < vs->focus.y0 + FOCUS_THICKNESS) ||
+			   (y >= vs->focus.y1 - FOCUS_THICKNESS);
+		row = vs->display + y * SCREEN_STRIDE;
+		for (x = area->x0; x < area->x1; x++) {
+			if (x < vs->focus.x0 || x >= vs->focus.x1) {
+				continue;
+			}
+			if (edge_row ||
+			    x < vs->focus.x0 + FOCUS_THICKNESS ||
+			    x >= vs->focus.x1 - FOCUS_THICKNESS) {
+				row[x] = FOCUS_COLOUR;
+			}
+		}
+	}
+}
 
 /** Copy a rectangle of the shadow buffer to the display buffer. */
 static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
@@ -344,6 +461,10 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 		memcpy(dst, src, (size_t)width * 4);
 		src += nsfb->linelen;
 		dst += SCREEN_STRIDE;
+	}
+
+	if (vs->focus_valid && nsfb_plot_bbox_intersect(&area, &vs->focus)) {
+		draw_focus_overlay(vs, &area);
 	}
 }
 
@@ -459,6 +580,7 @@ static int vita_initialise(nsfb_t *nsfb)
 				 SCE_TOUCH_SAMPLING_STATE_START);
 
 	nsfb->surface_priv = vs;
+	the_nsfb = nsfb;
 	vs->verbose = vita_verbose_requested() != 0;
 
 	/* start with the pointer over the page rather than the toolbar */
@@ -487,8 +609,63 @@ static int vita_finalise(nsfb_t *nsfb)
 	sceKernelFreeMemBlock(vs->memblock);
 	free(vs);
 	nsfb->surface_priv = NULL;
+	the_nsfb = NULL;
 
 	return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Entry points for the input layer                                         */
+
+void vita_surface_read_input(struct vita_input_state *out)
+{
+	struct vita_surface *vs;
+
+	memset(out, 0, sizeof(*out));
+	if (the_nsfb == NULL || the_nsfb->surface_priv == NULL) {
+		return;
+	}
+	vs = the_nsfb->surface_priv;
+
+	out->lx = vs->lx;
+	out->ly = vs->ly;
+	out->rx = vs->rx;
+	out->ry = vs->ry;
+	out->drag_dx = vs->drag_dx;
+	out->drag_dy = vs->drag_dy;
+	out->dragging = vs->touch_dragging;
+	vs->drag_dx = 0;
+	vs->drag_dy = 0;
+}
+
+void vita_surface_set_focus_rect(const nsfb_bbox_t *rect)
+{
+	struct vita_surface *vs;
+	nsfb_bbox_t old;
+	bool had_old;
+
+	if (the_nsfb == NULL || the_nsfb->surface_priv == NULL) {
+		return;
+	}
+	vs = the_nsfb->surface_priv;
+
+	had_old = vs->focus_valid;
+	old = vs->focus;
+
+	if (rect == NULL) {
+		vs->focus_valid = false;
+	} else {
+		vs->focus = *rect;
+		vs->focus_valid = true;
+	}
+
+	/* restore what was under the old outline, then draw the new one */
+	if (had_old) {
+		blit_box(the_nsfb, &old);
+	}
+	if (vs->focus_valid) {
+		blit_box(the_nsfb, &vs->focus);
+	}
 }
 
 static bool vita_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)

@@ -6,16 +6,19 @@
  */
 
 #include <psp2/apputil.h>
+#include <psp2/common_dialog.h>
 #include <psp2/io/dirent.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/power.h>
+#include <psp2/sysmodule.h>
 
 /* After the SCE headers: <sys/stat.h> defines st_ctime as a macro, which
  * would otherwise mangle the SceIoStat field of the same name. */
 #include <errno.h>
 #include <iconv.h>
+#include <malloc.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +59,7 @@ void vita_log(const char *fmt, ...)
 void vita_log_memory(const char *what)
 {
 	SceKernelFreeMemorySizeInfo info;
+	struct mallinfo mi;
 
 	memset(&info, 0, sizeof(info));
 	info.size = sizeof(info);
@@ -64,8 +68,15 @@ void vita_log_memory(const char *what)
 		return;
 	}
 
-	vita_log("memory (%s): free user %u KB, cdram %u KB, phycont %u KB",
+	/*
+	 * The newlib heap is one block taken at startup, so the kernel's
+	 * free figure never moves; mallinfo() shows what is used inside it.
+	 */
+	mi = mallinfo();
+	vita_log("memory (%s): heap used %u KB of %u KB, free user %u KB, cdram %u KB, phycont %u KB",
 		 what,
+		 (unsigned int)mi.uordblks / 1024,
+		 (unsigned int)mi.arena / 1024,
 		 (unsigned int)info.size_user / 1024,
 		 (unsigned int)info.size_cdram / 1024,
 		 (unsigned int)info.size_phycont / 1024);
@@ -305,6 +316,7 @@ int vita_platform_init(void)
 {
 	SceAppUtilInitParam init_param;
 	SceAppUtilBootParam boot_param;
+	SceCommonDialogConfigParam dialog_config;
 	int mkdir_ret;
 	int ret;
 
@@ -353,6 +365,22 @@ int vita_platform_init(void)
 	ret = sceAppUtilInit(&init_param, &boot_param);
 	if (ret < 0) {
 		vita_log("sceAppUtilInit failed: 0x%08x", (unsigned int)ret);
+	}
+
+	/*
+	 * Common dialogs (the IME for URL entry) must be configured before
+	 * one is shown; the other Vita apps load the IME module too.
+	 */
+	ret = sceSysmoduleLoadModule(SCE_SYSMODULE_IME);
+	if (ret < 0) {
+		vita_log("sceSysmoduleLoadModule(IME) failed: 0x%08x",
+			 (unsigned int)ret);
+	}
+	sceCommonDialogConfigParamInit(&dialog_config);
+	ret = sceCommonDialogSetConfigParam(&dialog_config);
+	if (ret < 0) {
+		vita_log("sceCommonDialogSetConfigParam failed: 0x%08x",
+			 (unsigned int)ret);
 	}
 
 	/* Layout and CSS are CPU bound; run at the maximum clocks. */

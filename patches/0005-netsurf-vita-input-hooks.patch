@@ -1,0 +1,102 @@
+diff --git a/frontends/framebuffer/fbtk.h b/frontends/framebuffer/fbtk.h
+index 86bdc864b..d18907b5d 100644
+--- a/frontends/framebuffer/fbtk.h
++++ b/frontends/framebuffer/fbtk.h
+@@ -609,4 +609,9 @@ void fbtk_enable_oskb(fbtk_widget_t *widget);
+  */
+ void map_osk(void);
+ 
++/**
++ * hide the osk if it is shown.
++ */
++void unmap_osk(void);
++
+ #endif
+diff --git a/frontends/framebuffer/fbtk/event.c b/frontends/framebuffer/fbtk/event.c
+index 7a580911b..bfd72bf21 100644
+--- a/frontends/framebuffer/fbtk/event.c
++++ b/frontends/framebuffer/fbtk/event.c
+@@ -40,12 +40,23 @@
+ 
+ #include "widget.h"
+ 
++#ifdef __vita__
++#include "vita_input.h"
++#endif
++
+ /* exported function documented in fbtk.h */
+ void
+ fbtk_input(fbtk_widget_t *root, nsfb_event_t *event)
+ {
+ 	fbtk_widget_t *input;
+ 
++#ifdef __vita__
++	/* VitaSurf: buttons that act on the whole browser go first */
++	if (vita_input_global_key(event)) {
++		return;
++	}
++#endif
++
+ 	root = fbtk_get_root_widget(root);
+ 
+ 	/* obtain widget with input focus */
+diff --git a/frontends/framebuffer/fbtk/osk.c b/frontends/framebuffer/fbtk/osk.c
+index 628fe9abd..baceb9ce8 100644
+--- a/frontends/framebuffer/fbtk/osk.c
++++ b/frontends/framebuffer/fbtk/osk.c
+@@ -120,6 +120,15 @@ osk_close(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 	return 0;
+ }
+ 
++/* exported function documented in fbtk.h */
++void
++unmap_osk(void)
++{
++	if (osk != NULL) {
++		fbtk_set_mapping(osk, false);
++	}
++}
++
+ static int
+ osk_click(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ {
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 5bfc8227b..169eca514 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -57,6 +57,10 @@
+ #include "framebuffer/local_history.h"
+ #include "framebuffer/corewindow.h"
+ 
++#ifdef __vita__
++#include "vita_input.h"
++#endif
++
+ 
+ #define NSFB_TOOLBAR_DEFAULT_LAYOUT "blfsrutc"
+ 
+@@ -855,6 +859,13 @@ fb_browser_window_input(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 	static fbtk_modifier_type modifier = FBTK_MOD_CLEAR;
+ 	int ucs4 = -1;
+ 
++#ifdef __vita__
++	/* VitaSurf: D-pad focus and Cross are handled by the input layer */
++	if (vita_input_key(gw, cbi->event)) {
++		return 1;
++	}
++#endif
++
+ 	NSLOG(netsurf, INFO, "got value %d", cbi->event->value.keycode);
+ 
+ 	switch (cbi->event->type) {
+@@ -1839,6 +1850,10 @@ gui_window_create(struct browser_window *bw,
+ 
+ 	create_normal_browser_window(gw, nsoption_int(fb_furniture_size));
+ 
++#ifdef __vita__
++	vita_input_attach(gw);
++#endif
++
+ 	/* map and request redraw of gui window */
+ 	fbtk_set_mapping(gw->window, true);
+ 

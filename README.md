@@ -12,10 +12,12 @@ and the platform notes that every change has to respect.
 
 Phase 1 (boot) is complete and verified on real hardware: the framebuffer
 frontend is linked statically with JavaScript disabled and renders the
-bundled local page from `app0:`. Phase 2 (networking) is in progress:
-SceNet and SceNetCtl are initialised before NetSurf starts, libcurl uses
-mbedTLS with the bundled CA file, and the home page links to test sites.
-HTTP pages load on hardware; HTTPS is being verified. Input, JavaScript, persistence and the rest follow.
+bundled local page from `app0:`. Phase 2 (networking) is complete and
+verified on hardware: SceNet and SceNetCtl are initialised before NetSurf
+starts, libcurl uses mbedTLS with the bundled CA file, and HTTP and HTTPS
+pages load. Phase 3 (input) is in progress: the control scheme below is
+implemented and awaiting hardware testing. JavaScript, persistence and
+the rest follow.
 
 ## Building
 
@@ -80,14 +82,29 @@ fails for every charset, so libparserutils is built with its own codecs and
 `PATH_MAX`, `endian.h` and `sys/mman.h` are missing, handled by
 `vita_compat.h` and two small patches.
 
-## Controls (phase 1)
+## Controls
 
 | Input | Action |
 |---|---|
-| D-pad | Scroll |
-| Left stick | Scroll |
-| L / R | Page up / page down |
-| Front touch | Tap and drag with the pointer |
+| D-pad | Move focus between links and form fields |
+| Cross | Activate the focused element, or click at the pointer |
+| Circle | Stop loading, drop focus, close the keyboard |
+| Left stick | Scroll, speed follows deflection |
+| Right stick | Move the pointer |
+| L / R | Back / forward |
+| Triangle | Enter a web address or search terms |
+| Square | Reload |
+| Select | Toggle pointer mode: the D-pad nudges the pointer instead |
+| Start | Menu (not implemented yet) |
+| Front touch | Tap to click, drag to scroll |
 | Select + Start | Quit |
 
-The full control scheme in CLAUDE.md arrives with phase 3.
+The surface (`vita/surface/vita.c`) turns buttons into libnsfb key events
+and exposes the sticks and touch drags as state. The input layer
+(`vita/input/`) is called from two small hooks in the framebuffer
+frontend: one before the toolkit dispatches a key, for buttons that act
+on the whole browser, and one in the browser widget, for the D-pad and
+Cross. Link focus walks the page's box tree for links and form controls,
+picks the nearest one in the pressed direction, scrolls it into view and
+draws an outline over the display. Text entry uses the system IME dialog,
+falling back to NetSurf's on-screen keyboard if the dialog cannot start.

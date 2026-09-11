@@ -30,7 +30,12 @@ do_not_track:0
 cookie_file:ux0:data/VitaSurf/Cookies
 cookie_jar:ux0:data/VitaSurf/Cookies
 
-# Framebuffer toolkit sizes tuned for a 960x544 screen with touch.
+# Reflowing a large page costs seconds on the Vita, so let images arrive
+# for a while before laying out again (centiseconds).
+min_reflow_period:200
+
+# Framebuffer toolkit sizes tuned for a 960x544 screen with touch. The
+# on-screen keyboard is the fallback when the system IME is unavailable.
 fb_furniture_size:22
 fb_toolbar_size:36
-fb_osk:0
+fb_osk:1

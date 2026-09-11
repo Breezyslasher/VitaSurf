@@ -83,10 +83,18 @@ add_executable(${PROJECT_NAME}
     # SceNet and SceNetCtl bring-up.
     vita/platform/vita_net.c
     vita/surface/vita.c
+    vita/input/vita_input.c
+    vita/input/vita_ime.c
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     vita/platform
+    vita/surface
+    vita/input
+    # vita_input.c uses the framebuffer frontend's headers and NetSurf's
+    # html box tree.
+    ${CMAKE_SOURCE_DIR}/deps/netsurf/frontends
+    ${CMAKE_SOURCE_DIR}/deps/netsurf/include
     # vita_file.c uses NetSurf's utils/file.h.
     ${CMAKE_SOURCE_DIR}/deps/netsurf
     ${CMAKE_SOURCE_DIR}/deps/netsurf/include
