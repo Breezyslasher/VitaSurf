@@ -57,7 +57,7 @@ jobs:
           if vdpm list curl >/dev/null 2>&1; then
             VDPM_NONINTERACTIVE=1 vdpm remove --nodeps --nodeps curl
           fi
-          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat
+          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d
 
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh

@@ -1,0 +1,19 @@
+diff --git a/utils/useragent.c b/utils/useragent.c
+index 547999c7c..6fd2ce650 100644
+--- a/utils/useragent.c
++++ b/utils/useragent.c
+@@ -52,6 +52,14 @@ user_agent_build_string(void)
+                         sysname = "X11; Linux";
+                 }
+         }
++#ifdef __vita__
++        /*
++         * VitaSurf: ask for mobile pages. A 960x544 screen and a slow
++         * CPU are much better served by them, and sites such as Wikipedia
++         * redirect to the desktop version unless the UA says Mobile.
++         */
++        sysname = "PlayStation Vita; Mobile";
++#endif
+ 
+         len = snprintf(NULL, 0, NETSURF_UA_FORMAT_STRING,
+                        sysname,

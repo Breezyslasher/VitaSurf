@@ -8,8 +8,10 @@
 #   out/netsurf/libnetsurf.a
 #   out/netsurf/resources/      Messages, CSS, internal HTML pages
 #
-# Set VITASURF_DEBUG=1 for a build with verbose logging compiled in.
-# Requires scripts/build-deps.sh to have run first.
+# Set VITASURF_DEBUG=1 for a build with verbose logging compiled in, and
+# VITASURF_JS=NO for a build without JavaScript.
+# Requires scripts/build-deps.sh to have run first (it also builds the
+# nsgenbind host tool the JavaScript bindings need).
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/vita-env.sh"
@@ -24,6 +26,9 @@ OBJROOT="build/$NETSURF_HOST-framebuffer"
 # vita/netsurf/ so the submodule stays untouched.
 cp "$VITASURF_ROOT/vita/netsurf/Makefile.config" "$NETSURF/Makefile.config"
 
+# nsgenbind from build-deps.sh
+export PATH="$VITASURF_ROOT/out/host/bin:$PATH"
+
 MAKE_ARGS=(
     TARGET=framebuffer
     "HOST=$NETSURF_HOST"
@@ -32,6 +37,7 @@ MAKE_ARGS=(
     "AR=$TARGET_AR"
     "PKG_CONFIG=$NETSURF_PKG_CONFIG"
     "VITASURF_DEBUG=${VITASURF_DEBUG:-0}"
+    "VITASURF_JS=${VITASURF_JS:-YES}"
     Q=@
 )
 

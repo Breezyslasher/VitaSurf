@@ -22,10 +22,18 @@ the file fetcher, CSS and layout all work.</p>
 
 <table>
 <tr><th>Input</th><th>Action</th></tr>
-<tr><td>D-pad</td><td>Scroll</td></tr>
+<tr><td>D-pad</td><td>Move focus between links and form fields</td></tr>
+<tr><td>Cross</td><td>Activate the focused element, or click at the pointer</td></tr>
+<tr><td>Circle</td><td>Stop loading, drop focus, close the keyboard</td></tr>
 <tr><td>Left stick</td><td>Scroll</td></tr>
-<tr><td>L / R</td><td>Page up / page down</td></tr>
-<tr><td>Front touch</td><td>Tap and drag with the pointer</td></tr>
+<tr><td>Right stick</td><td>Move the pointer</td></tr>
+<tr><td>L / R</td><td>Back / forward</td></tr>
+<tr><td>Triangle</td><td>Enter a web address or search terms</td></tr>
+<tr><td>Tap a text field</td><td>Opens the keyboard for that field</td></tr>
+<tr><td>Square</td><td>Reload</td></tr>
+<tr><td>Select</td><td>Toggle pointer mode (D-pad nudges the pointer)</td></tr>
+<tr><td>Start</td><td>Menu: bookmarks, history, settings, quit</td></tr>
+<tr><td>Front touch</td><td>Tap to click, drag to scroll</td></tr>
 <tr><td>Select + Start</td><td>Quit</td></tr>
 </table>
 
@@ -42,6 +50,15 @@ the file fetcher, CSS and layout all work.</p>
 <li><a href="https://en.m.wikipedia.org/wiki/PlayStation_Vita">Wikipedia: PlayStation Vita</a> (HTTPS, images and tables)</li>
 <li><a href="https://lite.duckduckgo.com/lite/">DuckDuckGo Lite</a> (HTTPS, a form)</li>
 </ul>
+
+<h2>JavaScript test pages</h2>
+<ul>
+<li><a href="file:///resources/jstest.html">Bundled script test</a> (DOM, timers, events)</li>
+<li><a href="https://en.m.wikipedia.org/wiki/PlayStation_Vita">Wikipedia: PlayStation Vita</a> (page scripts)</li>
+<li><a href="https://text.npr.org/">text.npr.org</a> (little or no script)</li>
+<li><a href="https://lite.duckduckgo.com/lite/">DuckDuckGo Lite</a> (search results)</li>
+</ul>
+<p>Each load writes its time and the heap used to the log.</p>
 
 <p class="note">The log is written to ux0:data/VitaSurf/log.txt. Create an
 empty file named verbose in that folder for a detailed log.</p>

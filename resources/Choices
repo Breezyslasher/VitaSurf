@@ -14,10 +14,13 @@ memory_cache_size:4194304
 max_cached_fetch_handles:4
 max_fetchers:8
 max_fetchers_per_host:2
-fb_font_cachesize:512
+# FreeType glyph cache for the bundled DejaVu fonts, in KB.
+fb_font_cachesize:2048
 
-# JavaScript stays off until phase 4.
-enable_javascript:0
+# JavaScript (phase 4): Duktape, an interpreter, so scripts get a short
+# time budget (seconds) before they are stopped.
+enable_javascript:1
+script_timeout:5
 
 # Networking (phase 2). Certificates come from the bundled Mozilla CA file.
 ca_bundle:app0:resources/cacert.pem
@@ -30,7 +33,12 @@ do_not_track:0
 cookie_file:ux0:data/VitaSurf/Cookies
 cookie_jar:ux0:data/VitaSurf/Cookies
 
-# Framebuffer toolkit sizes tuned for a 960x544 screen with touch.
+# Reflowing a large page costs seconds on the Vita, so let images arrive
+# for a while before laying out again (centiseconds).
+min_reflow_period:200
+
+# Framebuffer toolkit sizes tuned for a 960x544 screen with touch. The
+# on-screen keyboard is the fallback when the system IME is unavailable.
 fb_furniture_size:22
 fb_toolbar_size:36
-fb_osk:0
+fb_osk:1

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>VitaSurf script test</title>
+<style>
+body { font-family: sans-serif; margin: 16px; background: #f4f4f4; color: #222; }
+h1 { font-size: 22px; }
+.box { background: #fff; border: 1px solid #ccc; padding: 8px; margin: 8px 0; }
+.ok { color: #1a7f37; }
+.fail { color: #b3261e; }
+button { font-size: 16px; padding: 6px 12px; }
+</style>
+</head>
+<body>
+<h1>VitaSurf script test</h1>
+<p>This page runs a few scripts and reports what worked. With JavaScript
+off, every line below stays "not run".</p>
+
+<div class="box">
+<p id="inline">Inline script: not run</p>
+<p id="dom">DOM update: not run</p>
+<p id="create">Element creation: not run</p>
+<p id="timer">Timer: not run</p>
+<p id="event">Button event: not run (press the button)</p>
+<p id="timing">Script time: not run</p>
+</div>
+
+<p><button id="btn" type="button">Press me</button>
+<span id="count">0</span> presses</p>
+
+<div class="box" id="list"><b>Created items:</b></div>
+
+<p><a href="file:///resources/vitasurf.html">Back to the home page</a></p>
+
+<script>
+(function () {
+	var start = Date.now();
+	var presses = 0;
+
+	function set(id, text, ok) {
+		var el = document.getElementById(id);
+		el.textContent = text;
+		el.className = ok ? "ok" : "fail";
+	}
+
+	set("inline", "Inline script: ran", true);
+
+	try {
+		set("dom", "DOM update: textContent and className changed", true);
+	} catch (e) {
+		set("dom", "DOM update: " + e, false);
+	}
+
+	try {
+		var list = document.getElementById("list");
+		for (var i = 1; i <= 5; i++) {
+			var item = document.createElement("div");
+			item.textContent = "item " + i;
+			list.appendChild(item);
+		}
+		set("create", "Element creation: 5 items appended", true);
+	} catch (e) {
+		set("create", "Element creation: " + e, false);
+	}
+
+	try {
+		var btn = document.getElementById("btn");
+		btn.addEventListener("click", function () {
+			presses++;
+			document.getElementById("count").textContent = String(presses);
+			set("event", "Button event: click received", true);
+		});
+	} catch (e) {
+		set("event", "Button event: " + e, false);
+	}
+
+	try {
+		window.setTimeout(function () {
+			set("timer", "Timer: fired after 500 ms", true);
+		}, 500);
+	} catch (e) {
+		set("timer", "Timer: " + e, false);
+	}
+
+	set("timing", "Script time: " + (Date.now() - start) + " ms", true);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 834d66b3e..af402b9aa 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -42,6 +42,9 @@
+ #include "netsurf/misc.h"
+ #include "netsurf/netsurf.h"
+ #include "netsurf/cookie_db.h"
++#ifdef __vita__
++#include "netsurf/url_db.h"
++#endif
+ #include "content/fetch.h"
+ 
+ #include "framebuffer/gui.h"
+@@ -653,6 +656,9 @@ static void gui_quit(void)
+ 	NSLOG(netsurf, INFO, "gui_quit");
+ 
+ 	urldb_save_cookies(nsoption_charp(cookie_jar));
++#ifdef __vita__
++	urldb_save(VITASURF_URLS_PATH);
++#endif
+ 
+ 	framebuffer_finalise();
+ }
+@@ -2258,6 +2264,10 @@ main(int argc, char** argv)
+ 	options = filepath_find(respaths, "Choices");
+ 	nsoption_read(options, nsoptions);
+ 	free(options);
++#ifdef __vita__
++	/* VitaSurf: settings changed from the menu override the bundled file */
++	nsoption_read(VITASURF_USER_CHOICES, nsoptions);
++#endif
+ 	nsoption_commandline(&argc, argv, nsoptions);
+ 
+ 	/* message init */
+@@ -2294,6 +2304,9 @@ main(int argc, char** argv)
+ 	fbtk_enable_oskb(fbtk);
+ 
+ 	urldb_load_cookies(nsoption_charp(cookie_file));
++#ifdef __vita__
++	urldb_load(VITASURF_URLS_PATH);
++#endif
+ 
+ 	/* create an initial browser window */
+ 

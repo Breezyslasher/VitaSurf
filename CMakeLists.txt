@@ -83,10 +83,19 @@ add_executable(${PROJECT_NAME}
     # SceNet and SceNetCtl bring-up.
     vita/platform/vita_net.c
     vita/surface/vita.c
+    vita/input/vita_input.c
+    vita/input/vita_ime.c
+    vita/input/vita_menu.c
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     vita/platform
+    vita/surface
+    vita/input
+    # vita_input.c uses the framebuffer frontend's headers and NetSurf's
+    # html box tree.
+    ${CMAKE_SOURCE_DIR}/deps/netsurf/frontends
+    ${CMAKE_SOURCE_DIR}/deps/netsurf/include
     # vita_file.c uses NetSurf's utils/file.h.
     ${CMAKE_SOURCE_DIR}/deps/netsurf
     ${CMAKE_SOURCE_DIR}/deps/netsurf/include
@@ -128,8 +137,12 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--start-group
     css dom hubbub parserutils wapcaplet nsutils nsbmp nsgif svgtiny nspsl nslog utf8proc
     # libcurl pulls in zstd; the mbedTLS package is built with pthread mutexes.
-    curl mbedtls mbedx509 mbedcrypto zstd expat png jpeg z bz2 pthread m
+    curl mbedtls mbedx509 mbedcrypto zstd expat
+    # libvita2d (MIT) puts the page on screen through the GPU so that the
+    # system IME dialog can draw over it.
+    vita2d png jpeg freetype z bz2 pthread m
     -Wl,--end-group
+    SceGxm_stub
     SceDisplay_stub
     SceCtrl_stub
     SceTouch_stub
@@ -142,6 +155,7 @@ target_link_libraries(${PROJECT_NAME}
     SceIme_stub
     SceProcessmgr_stub
     SceSysmem_stub
+    SceAppMgr_stub
 )
 
 # ---------------------------------------------------------------------------
@@ -151,6 +165,12 @@ vita_create_self(eboot.bin ${PROJECT_NAME} UNSAFE)
 
 file(GLOB NETSURF_RESOURCE_FILES "${NETSURF_STAGE}/resources/*")
 set(VPK_FILES)
+# Bundled DejaVu fonts (Bitstream Vera licence, see resources/fonts/LICENSE).
+file(GLOB VITASURF_FONT_FILES "${CMAKE_SOURCE_DIR}/resources/fonts/*.ttf")
+foreach(font ${VITASURF_FONT_FILES})
+    get_filename_component(name "${font}" NAME)
+    list(APPEND VPK_FILES FILE "${font}" "resources/fonts/${name}")
+endforeach()
 foreach(res ${NETSURF_RESOURCE_FILES})
     get_filename_component(name "${res}" NAME)
     list(APPEND VPK_FILES FILE "${res}" "resources/${name}")
@@ -168,6 +188,7 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
     # home page are ours, cacert.pem is the Mozilla CA bundle for phase 2.
     FILE resources/Choices                        resources/Choices
     FILE resources/vitasurf.html                  resources/vitasurf.html
+    FILE resources/jstest.html                    resources/jstest.html
     FILE resources/cacert.pem                     resources/cacert.pem
     ${VPK_FILES}
 )

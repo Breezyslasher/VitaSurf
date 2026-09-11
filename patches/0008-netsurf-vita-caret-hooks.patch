@@ -1,0 +1,26 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index c688a72e6..847d7b3f7 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -2120,6 +2120,11 @@ gui_window_place_caret(struct gui_window *g, int x, int y, int height,
+ 	fbtk_set_caret(g->browser, true, x, y, height,
+ 			gui_window_remove_caret_cb);
+ 
++#ifdef __vita__
++	/* VitaSurf: a form field took the caret; maybe open the keyboard */
++	vita_input_caret(g, x, y, height);
++#endif
++
+ 	/* redraw new caret pos */
+ 	fb_queue_redraw(g->browser,
+ 			x - bwidget->scrollx,
+@@ -2137,6 +2142,9 @@ gui_window_remove_caret(struct gui_window *g)
+ 		/* browser window owns the caret, so can remove it */
+ 		fbtk_set_caret(g->browser, false, 0, 0, 0, NULL);
+ 	}
++#ifdef __vita__
++	vita_input_caret_removed(g);
++#endif
+ }
+ 
+ /**

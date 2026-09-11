@@ -5,7 +5,7 @@
 # Usage: ./scripts/build-deps.sh [clean]
 #
 # Requires VITASDK plus these vdpm packages: zlib bzip2 libpng libjpeg-turbo
-# freetype zstd mbedtls curl-mbedtls expat. Set VITASURF_NATIVE=1 to
+# freetype zstd mbedtls curl-mbedtls expat libvita2d. Set VITASURF_NATIVE=1 to
 # build for the host instead (see scripts/vita-env.sh).
 set -euo pipefail
 
@@ -24,6 +24,8 @@ if [ "${1:-}" = "clean" ]; then
         make -C "$VITASURF_ROOT/deps/$lib" "${MAKE_ARGS[@]}" clean
     done
     make -C "$VITASURF_ROOT/deps/utf8proc" clean
+    make -C "$VITASURF_ROOT/deps/nsgenbind" "PREFIX=$VITASURF_ROOT/out/host" \
+        "NSSHARED=$NSSHARED" VARIANT=release Q=@ clean
     exit 0
 fi
 
@@ -61,6 +63,14 @@ make -C "$UTF8PROC" prefix="$PREFIX" libdir="$PREFIX/lib" includedir="$PREFIX/in
 install -m 644 "$UTF8PROC/utf8proc.h" "$PREFIX/include/utf8proc.h"
 install -m 644 "$UTF8PROC/libutf8proc.a" "$PREFIX/lib/libutf8proc.a"
 install -m 644 "$UTF8PROC/libutf8proc.pc" "$PREFIX/lib/pkgconfig/libutf8proc.pc"
+
+# nsgenbind generates the JavaScript bindings at NetSurf build time. It runs
+# on the build machine, so it is always compiled with the host compiler and
+# installed under out/host, which scripts/build-netsurf.sh puts on PATH.
+echo "==== nsgenbind (host tool)"
+mkdir -p "$VITASURF_ROOT/out/host"
+make -C "$VITASURF_ROOT/deps/nsgenbind" "PREFIX=$VITASURF_ROOT/out/host" \
+    "NSSHARED=$NSSHARED" VARIANT=release Q=@ -j"$JOBS" install
 
 echo "==== installed into $PREFIX"
 for pc in libwapcaplet libparserutils libnslog libnsutils libhubbub libdom libcss \

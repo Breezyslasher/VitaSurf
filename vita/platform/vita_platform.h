@@ -35,6 +35,18 @@
 #define VITASURF_VERBOSE_FLAG VITASURF_DATA_DIR "/verbose"
 #define VITASURF_CA_BUNDLE    VITASURF_RES_DIR "/cacert.pem"
 
+/* Persistence (phase 5): everything the user accumulates lives here. */
+#define VITASURF_USER_CHOICES VITASURF_DATA_DIR "/Choices"
+#define VITASURF_URLS_PATH    VITASURF_DATA_DIR "/URLs"
+#define VITASURF_COOKIES_PATH VITASURF_DATA_DIR "/Cookies"
+#define VITASURF_BOOKMARKS_PATH VITASURF_DATA_DIR "/Bookmarks"
+#define VITASURF_BOOKMARKS_PAGE VITASURF_DATA_DIR "/bookmarks.html"
+#define VITASURF_HISTORY_PAGE   VITASURF_DATA_DIR "/history.html"
+/* The same files as file: URLs NetSurf can open (the Vita file table maps
+ * /ux0:/... back to ux0:/...). */
+#define VITASURF_BOOKMARKS_URL "file:///ux0:/data/VitaSurf/bookmarks.html"
+#define VITASURF_HISTORY_URL   "file:///ux0:/data/VitaSurf/history.html"
+
 /**
  * Initialise the platform: create the data directory, open the log,
  * redirect stderr and stdout into it, raise the clocks and initialise
