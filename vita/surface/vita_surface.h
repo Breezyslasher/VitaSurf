@@ -59,6 +59,13 @@ void vita_surface_read_input(struct vita_input_state *out);
  */
 void vita_surface_set_dialog(bool active);
 
+/**
+ * While held, the surface presents only between event polls, never part
+ * way through a redraw. Overlays that repaint themselves (the menu) hold
+ * it so a half-drawn window is never shown.
+ */
+void vita_surface_hold_progress(bool hold);
+
 /** Ask NetSurf to quit, as Select+Start does. */
 void vita_surface_request_quit(void);
 

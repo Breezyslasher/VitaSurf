@@ -602,6 +602,7 @@ void vita_menu_close(void)
 {
 	if (menu_open) {
 		menu_open = false;
+		vita_surface_hold_progress(false);
 		fbtk_set_mapping(menu, false);
 		fbtk_request_redraw(fbtk);
 	}
@@ -619,6 +620,7 @@ void vita_menu_toggle(void)
 	selected = 0;
 	update_labels();
 	menu_open = true;
+	vita_surface_hold_progress(true);
 	fbtk_set_zorder(menu, INT_MIN);
 	fbtk_set_mapping(menu, true);
 }

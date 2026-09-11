@@ -90,6 +90,7 @@ struct vita_surface {
 	bool dirty;               /**< texture changed since the last present */
 	SceUInt64 last_present_us;
 	bool dialog;              /**< a system dialog is on screen */
+	bool hold_progress;       /**< do not present part way through a redraw */
 	bool resync_buttons;      /**< forget button state after a dialog */
 
 	/* event queue, filled by polling and drained by vita_input() */
@@ -687,6 +688,13 @@ void vita_surface_read_input(struct vita_input_state *out)
 	vs->drag_dy = 0;
 }
 
+void vita_surface_hold_progress(bool hold)
+{
+	if (the_nsfb != NULL && the_nsfb->surface_priv != NULL) {
+		((struct vita_surface *)the_nsfb->surface_priv)->hold_progress = hold;
+	}
+}
+
 void vita_surface_request_quit(void)
 {
 	if (the_nsfb != NULL && the_nsfb->surface_priv != NULL) {
@@ -818,7 +826,7 @@ static int vita_update(nsfb_t *nsfb, nsfb_bbox_t *box)
 
 	blit_box(nsfb, box);
 
-	if (vs != NULL && !vs->dialog &&
+	if (vs != NULL && !vs->dialog && !vs->hold_progress &&
 	    sceKernelGetProcessTimeWide() - vs->last_present_us > PRESENT_INTERVAL_US) {
 		present(vs);
 	}

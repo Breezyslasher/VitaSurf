@@ -135,6 +135,58 @@ static uint64_t last_activation_us; /**< last Cross click or pointer click */
 /* ------------------------------------------------------------------------ */
 /* Box tree walk                                                            */
 
+/** The computed style that applies to a box, looking up for text boxes. */
+static const css_computed_style *box_style(struct box *b)
+{
+	while (b != NULL && b->style == NULL) {
+		b = b->parent;
+	}
+	return b != NULL ? b->style : NULL;
+}
+
+/**
+ * Whether an element can actually be seen: not visibility:hidden, not
+ * positioned off the page, and not clipped away by an overflow:hidden
+ * ancestor (collapsed navigation menus are the usual case). Focusing an
+ * invisible link looks like the focus vanished.
+ */
+static bool box_visible(struct box *b, int x, int y, int w, int h)
+{
+	const css_computed_style *style = box_style(b);
+	struct box *a;
+
+	if (x + w <= 0 || y + h <= 0) {
+		return false;
+	}
+	if (style != NULL &&
+	    css_computed_visibility(style) == CSS_VISIBILITY_HIDDEN) {
+		return false;
+	}
+	for (a = b->parent; a != NULL; a = a->parent) {
+		int ax, ay, aw, ah;
+
+		if (a->style == NULL) {
+			continue;
+		}
+		if (css_computed_overflow_x(a->style) != CSS_OVERFLOW_HIDDEN &&
+		    css_computed_overflow_y(a->style) != CSS_OVERFLOW_HIDDEN) {
+			continue;
+		}
+		box_coords(a, &ax, &ay);
+		aw = a->padding[LEFT] + a->width + a->padding[RIGHT];
+		ah = a->padding[TOP] + a->height + a->padding[BOTTOM];
+		if (css_computed_overflow_x(a->style) == CSS_OVERFLOW_HIDDEN &&
+		    (x >= ax + aw || x + w <= ax)) {
+			return false;
+		}
+		if (css_computed_overflow_y(a->style) == CSS_OVERFLOW_HIDDEN &&
+		    (y >= ay + ah || y + h <= ay)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static void add_target(struct box *b, const void *key, struct form_control *gadget)
 {
 	struct target *t;
@@ -146,7 +198,7 @@ static void add_target(struct box *b, const void *key, struct form_control *gadg
 	box_coords(b, &x, &y);
 	w = b->padding[LEFT] + b->width + b->padding[RIGHT];
 	h = b->padding[TOP] + b->height + b->padding[BOTTOM];
-	if (w <= 0 || h <= 0) {
+	if (w <= 0 || h <= 0 || !box_visible(b, x, y, w, h)) {
 		return;
 	}
 	t = &targets[ntargets++];
@@ -812,7 +864,7 @@ static void tick(void *p)
 		static uint64_t last_menu_redraw_us;
 		uint64_t now = sceKernelGetProcessTimeWide();
 
-		if (now - last_menu_redraw_us > 100000) {
+		if (now - last_menu_redraw_us > 250000) {
 			last_menu_redraw_us = now;
 			vita_menu_refresh();
 		}
