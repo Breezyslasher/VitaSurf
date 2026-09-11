@@ -38,6 +38,7 @@
 #include "netsurf/mouse.h"
 #include "content/urldb.h"
 #include "content/handlers/javascript/js.h"
+#include "content/handlers/javascript/content.h"
 
 #include <dom/dom.h>
 #include <dom/bindings/hubbub/parser.h>
@@ -1240,6 +1241,19 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "alert",
 			  JS_NewCFunction(ctx, console_log, "alert", 1));
 	JS_FreeValue(ctx, global);
+
+	/* small shims that are simplest to express in JS */
+	{
+		static const char prelude[] =
+			"function Image(){return document.createElement('img');}\n"
+			"function Option(){return document.createElement('option');}\n";
+		JSValue r = JS_Eval(ctx, prelude, sizeof(prelude) - 1,
+				    "<prelude>", JS_EVAL_TYPE_GLOBAL);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		}
+		JS_FreeValue(ctx, r);
+	}
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1247,7 +1261,16 @@ static void setup_globals(jsthread *thread)
 
 void js_initialise(void)
 {
-	vita_log("qjs: QuickJS engine initialised");
+	nserror err;
+
+	/*
+	 * Register the JavaScript content type. Without this the HTML
+	 * handler finds no handler for text/javascript and silently skips
+	 * every script, which looks like a very fast engine in the log.
+	 */
+	err = javascript_init();
+	vita_log("qjs: QuickJS engine initialised (content handler %s)",
+		 err == NSERROR_OK ? "registered" : "FAILED");
 }
 
 void js_finalise(void)
