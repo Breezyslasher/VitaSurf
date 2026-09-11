@@ -42,7 +42,8 @@ if [ "${1:-}" = "clean" ]; then
 fi
 
 echo "==== netsurf ($OBJROOT)"
-make -C "$NETSURF" "${MAKE_ARGS[@]}" -j"$JOBS" "$OBJROOT/libnetsurf.a"
+# -k keeps compiling after an error so one run reports every broken file.
+make -C "$NETSURF" "${MAKE_ARGS[@]}" -j"$JOBS" -k "$OBJROOT/libnetsurf.a"
 
 echo "==== staging into $OUT"
 rm -rf "$OUT"
