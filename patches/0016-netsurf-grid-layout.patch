@@ -1,0 +1,1884 @@
+diff --git a/content/handlers/css/utils.h b/content/handlers/css/utils.h
+index ee241e2cc..5f8a37757 100644
+--- a/content/handlers/css/utils.h
++++ b/content/handlers/css/utils.h
+@@ -35,17 +35,7 @@ static inline uint8_t ns_computed_display(
+ {
+ 	uint8_t value = css_computed_display(style, root);
+ 
+-	switch (value) {
+-	case CSS_DISPLAY_GRID:
+-		return CSS_DISPLAY_BLOCK;
+-
+-	case CSS_DISPLAY_INLINE_GRID:
+-		return CSS_DISPLAY_INLINE_BLOCK;
+-
+-	default:
+-		break;
+-	}
+-
++	/* VitaSurf lays out grid and inline-grid (layout_grid.c) */
+ 	return value;
+ }
+ 
+@@ -58,17 +48,7 @@ static inline uint8_t ns_computed_display_static(
+ {
+ 	uint8_t value = css_computed_display_static(style);
+ 
+-	switch (value) {
+-	case CSS_DISPLAY_GRID:
+-		return CSS_DISPLAY_BLOCK;
+-
+-	case CSS_DISPLAY_INLINE_GRID:
+-		return CSS_DISPLAY_INLINE_BLOCK;
+-
+-	default:
+-		break;
+-	}
+-
++	/* VitaSurf lays out grid and inline-grid (layout_grid.c) */
+ 	return value;
+ }
+ 
+diff --git a/content/handlers/html/Makefile b/content/handlers/html/Makefile
+index e41cc1d22..f9a4a7aab 100644
+--- a/content/handlers/html/Makefile
++++ b/content/handlers/html/Makefile
+@@ -17,6 +17,7 @@ S_HTML := box_construct.c	\
+ 	interaction.c		\
+ 	layout.c		\
+ 	layout_flex.c		\
++	layout_grid.c		\
+ 	object.c		\
+ 	redraw.c		\
+ 	redraw_border.c		\
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 5ac539a83..13994e24d 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -88,7 +88,8 @@ typedef enum {
+ 	REPLACE_DIM = 1 << 9,	/* replaced element has given dimensions */
+ 	IFRAME      = 1 << 10,	/* box contains an iframe */
+ 	CONVERT_CHILDREN = 1 << 11,  /* wanted children converting */
+-	IS_REPLACED = 1 << 12	/* box is a replaced element */
++	IS_REPLACED = 1 << 12,	/* box is a replaced element */
++	GRID_CONTAINER = 1 << 13 /* flex box laid out as a CSS grid (VitaSurf) */
+ } box_flags;
+ 
+ 
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 640bdff51..0ade83f2a 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -109,8 +109,8 @@ static const box_type box_map[] = {
+ 	BOX_NONE,            /* CSS_DISPLAY_NONE */
+ 	BOX_FLEX,            /* CSS_DISPLAY_FLEX */
+ 	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_FLEX */
+-	BOX_BLOCK,           /* CSS_DISPLAY_GRID */
+-	BOX_INLINE_BLOCK,    /* CSS_DISPLAY_INLINE_GRID */
++	BOX_FLEX,            /* CSS_DISPLAY_GRID (VitaSurf: grid layout) */
++	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_GRID */
+ };
+ 
+ 
+@@ -598,6 +598,13 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		box->type = box_map[ns_computed_display(box->style,
+ 				props.node_is_root)];
+ 
++		if (css_display == CSS_DISPLAY_GRID ||
++		    css_display == CSS_DISPLAY_INLINE_GRID) {
++			/* Grid containers share the flex box types and are
++			 * told apart by this flag (VitaSurf) */
++			box->flags |= GRID_CONTAINER;
++		}
++
+ 		if (props.containing_block->type == BOX_FLEX ||
+ 		    props.containing_block->type == BOX_INLINE_FLEX) {
+ 			/* Blockification */
+@@ -608,6 +615,15 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 			case BOX_INLINE_BLOCK:
+ 				box->type = BOX_BLOCK;
+ 				break;
++			case BOX_INLINE:
++				/* Every child of a grid container is an item
++				 * of its own (VitaSurf); flex keeps NetSurf's
++				 * merging of inline runs into one item. */
++				if (props.containing_block->flags &
++						GRID_CONTAINER) {
++					box->type = BOX_BLOCK;
++				}
++				break;
+ 			default:
+ 				break;
+ 			}
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index d3b6d8f31..f6b3a8727 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1000,7 +1000,14 @@ static void layout_minmax_block(
+ 				continue;
+ 			}
+ 
+-			if (lh__box_is_flex_container(block) &&
++			if (lh__box_is_grid_container(block)) {
++				/* Grid: the widest item sets the minimum,
++				 * the items side by side the maximum */
++				if (min < child->min_width)
++					min = child->min_width;
++				max += child->max_width;
++
++			} else if (lh__box_is_flex_container(block) &&
+ 			    lh__flex_main_is_horizontal(block)) {
+ 				if (block->style != NULL &&
+ 				    css_computed_flex_wrap(block->style) ==
+@@ -1030,7 +1037,8 @@ static void layout_minmax_block(
+ 	}
+ 
+ 	/* fixed width takes priority */
+-	if (block->type != BOX_TABLE_CELL && !lh__box_is_flex_item(block)) {
++	if (block->type != BOX_TABLE_CELL && (!lh__box_is_flex_item(block) ||
++			lh__box_is_grid_item(block))) {
+ 		bool border_box = bs == CSS_BOX_SIZING_BORDER_BOX;
+ 		enum css_max_width_e max_type;
+ 		enum css_min_width_e min_type;
+@@ -1172,8 +1180,11 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 			}
+ 
+ 			/* Check whether box is the box current margin collapses
+-			 * to */
++			 * to. Flex and grid containers establish their own
++			 * formatting context, so margins stop at them
++			 * (VitaSurf). */
+ 			if (box->flags & MAKE_HEIGHT ||
++					box->type == BOX_FLEX ||
+ 					box->border[TOP].width ||
+ 					box->padding[TOP] ||
+ 					(box->style &&
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index bde3c5bd1..8dc1072b3 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -1050,6 +1050,10 @@ bool layout_flex(struct box *flex, int available_width,
+ 	struct flex_ctx *ctx;
+ 	bool success = false;
+ 
++	if (flex->flags & GRID_CONTAINER) {
++		return layout_grid(flex, available_width, content);
++	}
++
+ 	ctx = layout_flex_ctx__create(content, flex);
+ 	if (ctx == NULL) {
+ 		return false;
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+new file mode 100644
+index 000000000..3905e595e
+--- /dev/null
++++ b/content/handlers/html/layout_grid.c
+@@ -0,0 +1,1663 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * CSS Grid layout (VitaSurf).
++ *
++ * A grid container is a flex container box (BOX_FLEX or BOX_INLINE_FLEX)
++ * carrying the GRID_CONTAINER flag; layout_flex() hands it over here.
++ * The implementation covers the parts of CSS Grid Level 1 that ordinary
++ * sites use: explicit tracks (lengths, percentages, fr, auto, min-content,
++ * max-content, minmax(), fit-content(), repeat() including auto-fill and
++ * auto-fit), gaps, explicit placement with line numbers and spans,
++ * sparse and dense auto placement in row or column flow, implicit tracks
++ * sized by grid-auto-rows/columns, stretch alignment of items, and the
++ * content distribution keywords on justify-content and align-content.
++ * Named lines and areas, subgrid and baseline alignment are not
++ * supported (libcss drops named lines while parsing).
++ */
++
++#include <assert.h>
++#include <limits.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "utils/log.h"
++#include "utils/utils.h"
++
++#include "html/box.h"
++#include "html/html.h"
++#include "html/private.h"
++#include "html/box_inspect.h"
++#include "html/layout_internal.h"
++
++/** Unbounded growth limit. */
++#define GRID_INF INT_MAX
++
++/** Hard cap on tracks per axis, so a runaway sheet cannot exhaust memory. */
++#define GRID_MAX_TRACKS 512
++
++/** Track sizing function kinds after resolution against the container. */
++enum grid_sizing {
++	GS_FIXED,	/**< definite length in device pixels */
++	GS_AUTO,
++	GS_MIN_CONTENT,
++	GS_MAX_CONTENT,
++	GS_FIT_CONTENT,	/**< max-content clamped to a length */
++	GS_FR		/**< flexible; only valid as a max sizing function */
++};
++
++struct grid_track {
++	enum grid_sizing min_type;
++	enum grid_sizing max_type;
++	int min_fixed;		/**< GS_FIXED min size */
++	int max_fixed;		/**< GS_FIXED max size or GS_FIT_CONTENT limit */
++	float fr;		/**< flex factor for GS_FR */
++	int base;		/**< base size, becomes the used size */
++	int limit;		/**< growth limit; GRID_INF when unbounded */
++	int pos;		/**< used start position from the padding edge */
++	bool collapsed;		/**< auto-fit track with no items */
++	bool auto_repeat;	/**< came from repeat(auto-fill|auto-fit) */
++	bool inflexible;	/**< fr track pinned at its base size */
++};
++
++struct grid_item {
++	struct box *box;
++	int col;		/**< start column, -1 while auto placed */
++	int row;		/**< start row, -1 while auto placed */
++	int col_span;
++	int row_span;
++	int min_width;
++	int max_width;
++	int min_height;
++	int max_height;
++};
++
++struct grid_ctx {
++	html_content *content;
++	const css_unit_ctx *unit_len_ctx;
++	struct box *grid;
++
++	int avail_w;		/**< content box width */
++	int avail_h;		/**< content box height or AUTO */
++	int col_gap;
++	int row_gap;
++
++	unsigned n_items;
++	struct grid_item *items;
++
++	unsigned n_cols;
++	unsigned n_rows;
++	unsigned n_explicit_cols;
++	unsigned n_explicit_rows;
++	struct grid_track *cols;
++	struct grid_track *rows;
++
++	bool column_flow;
++	bool dense;
++
++	/** occupancy: major axis rows of occ_minor cells */
++	uint8_t *occ;
++	unsigned occ_major;
++	unsigned occ_minor;
++};
++
++/* ------------------------------------------------------------------------ */
++/* Track definitions                                                         */
++
++/**
++ * Resolve one libcss track sizing function into device pixels.
++ */
++static void grid_resolve_sizing(const struct grid_ctx *ctx,
++		uint8_t type, css_fixed value, css_unit unit, int axis_avail,
++		enum grid_sizing *out_type, int *out_fixed, float *out_fr)
++{
++	*out_fixed = 0;
++	*out_fr = 0;
++
++	switch (type) {
++	case CSS_GRID_TRACK_LENGTH:
++		if (unit == CSS_UNIT_PCT) {
++			if (axis_avail == AUTO) {
++				*out_type = GS_AUTO;
++				return;
++			}
++			*out_fixed = FPCT_OF_INT_TOINT(value, axis_avail);
++		} else {
++			*out_fixed = FIXTOINT(css_unit_len2device_px(
++					ctx->grid->style, ctx->unit_len_ctx,
++					value, unit));
++		}
++		if (*out_fixed < 0) {
++			*out_fixed = 0;
++		}
++		*out_type = GS_FIXED;
++		return;
++	case CSS_GRID_TRACK_FR:
++		*out_fr = FIXTOFLT(value);
++		if (*out_fr < 0) {
++			*out_fr = 0;
++		}
++		*out_type = GS_FR;
++		return;
++	case CSS_GRID_TRACK_MIN_CONTENT:
++		*out_type = GS_MIN_CONTENT;
++		return;
++	case CSS_GRID_TRACK_MAX_CONTENT:
++		*out_type = GS_MAX_CONTENT;
++		return;
++	case CSS_GRID_TRACK_FIT_CONTENT:
++		if (unit == CSS_UNIT_PCT) {
++			if (axis_avail == AUTO) {
++				*out_type = GS_MAX_CONTENT;
++				return;
++			}
++			*out_fixed = FPCT_OF_INT_TOINT(value, axis_avail);
++		} else {
++			*out_fixed = FIXTOINT(css_unit_len2device_px(
++					ctx->grid->style, ctx->unit_len_ctx,
++					value, unit));
++		}
++		*out_type = GS_FIT_CONTENT;
++		return;
++	case CSS_GRID_TRACK_AUTO:
++	default:
++		*out_type = GS_AUTO;
++		return;
++	}
++}
++
++/**
++ * Fill a track from a libcss definition, or as `auto` when def is NULL.
++ */
++static void grid_track_init(const struct grid_ctx *ctx,
++		const css_computed_grid_track *def, int axis_avail,
++		struct grid_track *t)
++{
++	float fr;
++
++	memset(t, 0, sizeof(*t));
++	if (def == NULL) {
++		t->min_type = GS_AUTO;
++		t->max_type = GS_AUTO;
++		return;
++	}
++	grid_resolve_sizing(ctx, def->min_type, def->min_value, def->min_unit,
++			axis_avail, &t->min_type, &t->min_fixed, &fr);
++	if (t->min_type == GS_FR) {
++		/* A flexible minimum is treated as auto (spec) */
++		t->min_type = GS_AUTO;
++		t->min_fixed = 0;
++	} else if (t->min_type == GS_FIT_CONTENT) {
++		t->min_type = GS_AUTO;
++	}
++	grid_resolve_sizing(ctx, def->max_type, def->max_value, def->max_unit,
++			axis_avail, &t->max_type, &t->max_fixed, &t->fr);
++	t->auto_repeat = (def->flags & (CSS_GRID_TRACK_FLAG_AUTO_FILL |
++			CSS_GRID_TRACK_FLAG_AUTO_FIT)) != 0;
++}
++
++/**
++ * Definite size of a track definition for auto repeat counting.
++ */
++static int grid_def_fixed_size(const struct grid_ctx *ctx,
++		const css_computed_grid_track *def, int axis_avail)
++{
++	struct grid_track t;
++
++	grid_track_init(ctx, def, axis_avail, &t);
++	if (t.max_type == GS_FIXED) {
++		return t.max_fixed;
++	}
++	if (t.min_type == GS_FIXED) {
++		return t.min_fixed;
++	}
++	return 0;
++}
++
++/**
++ * Build the explicit tracks of one axis from a template, expanding an
++ * auto-fill / auto-fit repeat to as many repetitions as fit.
++ *
++ * \return true on success, false on memory exhaustion
++ */
++static bool grid_build_explicit(const struct grid_ctx *ctx,
++		const css_computed_grid_track *tmpl, int axis_avail, int gap,
++		struct grid_track **tracks_out, unsigned *count_out)
++{
++	unsigned n = 0, group_start = 0, group_len = 0, reps = 1;
++	unsigned i, j, total;
++	struct grid_track *tracks;
++	int group_size = 0;
++
++	*tracks_out = NULL;
++	*count_out = 0;
++
++	if (tmpl == NULL) {
++		return true;
++	}
++
++	for (n = 0; tmpl[n].min_type != CSS_GRID_TRACK_NONE; n++) {
++		if (tmpl[n].flags & (CSS_GRID_TRACK_FLAG_AUTO_FILL |
++				CSS_GRID_TRACK_FLAG_AUTO_FIT)) {
++			if (group_len == 0) {
++				group_start = n;
++			}
++			group_len++;
++			group_size += grid_def_fixed_size(ctx, &tmpl[n],
++					axis_avail);
++		}
++		if (n >= GRID_MAX_TRACKS) {
++			break;
++		}
++	}
++
++	if (group_len > 0 && axis_avail != AUTO && group_size > 0) {
++		int per_rep = group_size + gap * (int) group_len;
++		int space = axis_avail + gap;
++
++		reps = per_rep > 0 ? (unsigned) (space / per_rep) : 1;
++		if (reps < 1) {
++			reps = 1;
++		}
++	}
++
++	total = n - group_len + group_len * reps;
++	if (total > GRID_MAX_TRACKS) {
++		total = GRID_MAX_TRACKS;
++	}
++	if (total == 0) {
++		return true;
++	}
++
++	tracks = calloc(total, sizeof(*tracks));
++	if (tracks == NULL) {
++		return false;
++	}
++
++	j = 0;
++	for (i = 0; i < n && j < total; i++) {
++		if (group_len > 0 && i == group_start) {
++			unsigned r, k;
++
++			for (r = 0; r < reps && j < total; r++) {
++				for (k = 0; k < group_len && j < total; k++) {
++					grid_track_init(ctx, &tmpl[i + k],
++							axis_avail,
++							&tracks[j++]);
++				}
++			}
++			i += group_len - 1;
++			continue;
++		}
++		grid_track_init(ctx, &tmpl[i], axis_avail, &tracks[j++]);
++	}
++
++	*tracks_out = tracks;
++	*count_out = j;
++	return true;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Placement                                                                 */
++
++/**
++ * Convert a grid line number to a 0-based track index.
++ */
++static int grid_line_index(int32_t line, unsigned n_explicit)
++{
++	if (line > 0) {
++		return line - 1;
++	}
++	/* negative lines count back from the end of the explicit grid;
++	 * -1 is the last line, i.e. index n_explicit */
++	if ((int) n_explicit + line + 1 < 0) {
++		return 0;
++	}
++	return (int) n_explicit + line + 1;
++}
++
++/**
++ * Resolve the start/end pair of one axis into a start index and span.
++ * A start of -1 means the item is auto placed in that axis.
++ */
++static void grid_resolve_lines(uint8_t stype, int32_t sval,
++		uint8_t etype, int32_t eval, unsigned n_explicit,
++		int *start, int *span)
++{
++	int s, e;
++
++	*start = -1;
++	*span = 1;
++
++	if (stype == CSS_GRID_LINE_SET && etype == CSS_GRID_LINE_SET) {
++		s = grid_line_index(sval, n_explicit);
++		e = grid_line_index(eval, n_explicit);
++		if (e < s) {
++			int tmp = s;
++			s = e;
++			e = tmp;
++		}
++		if (e == s) {
++			e = s + 1;
++		}
++		*start = s;
++		*span = e - s;
++	} else if (stype == CSS_GRID_LINE_SET) {
++		*start = grid_line_index(sval, n_explicit);
++		if (etype == CSS_GRID_LINE_SPAN && eval > 0) {
++			*span = eval;
++		}
++	} else if (etype == CSS_GRID_LINE_SET) {
++		e = grid_line_index(eval, n_explicit);
++		if (stype == CSS_GRID_LINE_SPAN && sval > 0) {
++			*span = sval;
++		}
++		s = e - *span;
++		if (s < 0) {
++			s = 0;
++			*span = e > 0 ? e : 1;
++		}
++		*start = s;
++	} else if (stype == CSS_GRID_LINE_SPAN && sval > 0) {
++		*span = sval;
++	} else if (etype == CSS_GRID_LINE_SPAN && eval > 0) {
++		*span = eval;
++	}
++
++	if (*span < 1) {
++		*span = 1;
++	}
++	if (*span > GRID_MAX_TRACKS) {
++		*span = GRID_MAX_TRACKS;
++	}
++	if (*start >= 0 && *start + *span > GRID_MAX_TRACKS) {
++		*start = GRID_MAX_TRACKS - *span;
++	}
++}
++
++/* Major/minor axis accessors: in row flow the major axis is rows. */
++
++static inline int item_major(const struct grid_ctx *ctx,
++		const struct grid_item *it)
++{
++	return ctx->column_flow ? it->col : it->row;
++}
++
++static inline int item_minor(const struct grid_ctx *ctx,
++		const struct grid_item *it)
++{
++	return ctx->column_flow ? it->row : it->col;
++}
++
++static inline int item_major_span(const struct grid_ctx *ctx,
++		const struct grid_item *it)
++{
++	return ctx->column_flow ? it->col_span : it->row_span;
++}
++
++static inline int item_minor_span(const struct grid_ctx *ctx,
++		const struct grid_item *it)
++{
++	return ctx->column_flow ? it->row_span : it->col_span;
++}
++
++static inline void item_set(struct grid_ctx *ctx, struct grid_item *it,
++		int major, int minor)
++{
++	if (ctx->column_flow) {
++		it->col = major;
++		it->row = minor;
++	} else {
++		it->row = major;
++		it->col = minor;
++	}
++}
++
++/**
++ * Make sure the occupancy map covers the given extent.
++ */
++static bool occ_ensure(struct grid_ctx *ctx, unsigned major, unsigned minor)
++{
++	uint8_t *occ;
++	unsigned r;
++
++	if (major > GRID_MAX_TRACKS) {
++		major = GRID_MAX_TRACKS;
++	}
++	if (minor > GRID_MAX_TRACKS) {
++		minor = GRID_MAX_TRACKS;
++	}
++	if (major <= ctx->occ_major && minor <= ctx->occ_minor) {
++		return true;
++	}
++	if (major < ctx->occ_major) {
++		major = ctx->occ_major;
++	}
++	if (minor < ctx->occ_minor) {
++		minor = ctx->occ_minor;
++	}
++	/* grow in steps to limit reallocations */
++	if (major < ctx->occ_major * 2) {
++		major = ctx->occ_major * 2;
++	}
++	if (major > GRID_MAX_TRACKS) {
++		major = GRID_MAX_TRACKS;
++	}
++
++	occ = calloc((size_t) major * minor, 1);
++	if (occ == NULL) {
++		return false;
++	}
++	for (r = 0; r < ctx->occ_major; r++) {
++		memcpy(occ + (size_t) r * minor,
++		       ctx->occ + (size_t) r * ctx->occ_minor,
++		       ctx->occ_minor);
++	}
++	free(ctx->occ);
++	ctx->occ = occ;
++	ctx->occ_major = major;
++	ctx->occ_minor = minor;
++	return true;
++}
++
++static bool occ_is_free(const struct grid_ctx *ctx,
++		unsigned major, unsigned minor,
++		unsigned major_span, unsigned minor_span)
++{
++	unsigned r, c;
++
++	for (r = major; r < major + major_span; r++) {
++		if (r >= ctx->occ_major) {
++			return true; /* beyond the map: empty */
++		}
++		for (c = minor; c < minor + minor_span; c++) {
++			if (c >= ctx->occ_minor) {
++				break;
++			}
++			if (ctx->occ[(size_t) r * ctx->occ_minor + c]) {
++				return false;
++			}
++		}
++	}
++	return true;
++}
++
++static bool occ_mark(struct grid_ctx *ctx,
++		unsigned major, unsigned minor,
++		unsigned major_span, unsigned minor_span)
++{
++	unsigned r, c;
++
++	if (!occ_ensure(ctx, major + major_span, minor + minor_span)) {
++		return false;
++	}
++	for (r = major; r < major + major_span && r < ctx->occ_major; r++) {
++		for (c = minor; c < minor + minor_span &&
++				c < ctx->occ_minor; c++) {
++			ctx->occ[(size_t) r * ctx->occ_minor + c] = 1;
++		}
++	}
++	return true;
++}
++
++/**
++ * Place every item on the grid (CSS Grid Level 1, section 8.5).
++ *
++ * \return true on success, false on memory exhaustion
++ */
++static bool grid_place_items(struct grid_ctx *ctx)
++{
++	unsigned n_minor, n_major, i;
++	unsigned cur_major = 0, cur_minor = 0;
++
++	if (ctx->column_flow) {
++		n_minor = ctx->n_explicit_rows;
++		n_major = ctx->n_explicit_cols;
++	} else {
++		n_minor = ctx->n_explicit_cols;
++		n_major = ctx->n_explicit_rows;
++	}
++	if (n_minor == 0) {
++		n_minor = 1;
++	}
++
++	/* items with a definite position in both axes */
++	for (i = 0; i < ctx->n_items; i++) {
++		struct grid_item *it = &ctx->items[i];
++		int maj = item_major(ctx, it), min = item_minor(ctx, it);
++		int mspan = item_major_span(ctx, it);
++		int nspan = item_minor_span(ctx, it);
++
++		if (maj < 0 || min < 0) {
++			if ((unsigned) nspan > n_minor) {
++				n_minor = nspan;
++			}
++			continue;
++		}
++		if ((unsigned) (min + nspan) > n_minor) {
++			n_minor = min + nspan;
++		}
++		if ((unsigned) (maj + mspan) > n_major) {
++			n_major = maj + mspan;
++		}
++		if (!occ_mark(ctx, maj, min, mspan, nspan)) {
++			return false;
++		}
++	}
++	if (n_minor > GRID_MAX_TRACKS) {
++		n_minor = GRID_MAX_TRACKS;
++	}
++
++	/* items locked to a major track: earliest free minor position,
++	 * extending the minor axis when nothing fits */
++	for (i = 0; i < ctx->n_items; i++) {
++		struct grid_item *it = &ctx->items[i];
++		int maj = item_major(ctx, it), min = item_minor(ctx, it);
++		int mspan = item_major_span(ctx, it);
++		int nspan = item_minor_span(ctx, it);
++		unsigned c;
++
++		if (maj < 0 || min >= 0) {
++			continue;
++		}
++		for (c = 0; c + nspan <= n_minor; c++) {
++			if (occ_is_free(ctx, maj, c, mspan, nspan)) {
++				break;
++			}
++		}
++		if (c + nspan > n_minor) {
++			if (c + nspan > GRID_MAX_TRACKS) {
++				c = GRID_MAX_TRACKS - nspan;
++			}
++			n_minor = c + nspan;
++		}
++		item_set(ctx, it, maj, c);
++		if ((unsigned) (maj + mspan) > n_major) {
++			n_major = maj + mspan;
++		}
++		if (!occ_mark(ctx, maj, c, mspan, nspan)) {
++			return false;
++		}
++	}
++
++	/* remaining items: auto placement with a cursor */
++	for (i = 0; i < ctx->n_items; i++) {
++		struct grid_item *it = &ctx->items[i];
++		int maj = item_major(ctx, it), min = item_minor(ctx, it);
++		int mspan = item_major_span(ctx, it);
++		int nspan = item_minor_span(ctx, it);
++		unsigned r, c;
++
++		if (maj >= 0) {
++			continue;
++		}
++		if (ctx->dense) {
++			cur_major = 0;
++			cur_minor = 0;
++		}
++		if (min >= 0) {
++			/* definite minor position: next major track down */
++			c = min;
++			if (!ctx->dense && c < cur_minor) {
++				cur_major++;
++			}
++			for (r = cur_major; r < GRID_MAX_TRACKS; r++) {
++				if (occ_is_free(ctx, r, c, mspan, nspan)) {
++					break;
++				}
++			}
++			if (r >= GRID_MAX_TRACKS) {
++				r = GRID_MAX_TRACKS - 1;
++			}
++		} else {
++			r = cur_major;
++			c = cur_minor;
++			for (;;) {
++				if (c + nspan > n_minor) {
++					r++;
++					c = 0;
++					if (r >= GRID_MAX_TRACKS) {
++						r = GRID_MAX_TRACKS - 1;
++						break;
++					}
++					continue;
++				}
++				if (occ_is_free(ctx, r, c, mspan, nspan)) {
++					break;
++				}
++				c++;
++			}
++		}
++		item_set(ctx, it, r, c);
++		cur_major = r;
++		cur_minor = c + nspan;
++		if ((unsigned) (r + mspan) > n_major) {
++			n_major = r + mspan;
++		}
++		if (!occ_mark(ctx, r, c, mspan, nspan)) {
++			return false;
++		}
++	}
++
++	if (n_major == 0) {
++		n_major = 1;
++	}
++	if (n_major > GRID_MAX_TRACKS) {
++		n_major = GRID_MAX_TRACKS;
++	}
++
++	if (ctx->column_flow) {
++		ctx->n_cols = n_major;
++		ctx->n_rows = n_minor;
++	} else {
++		ctx->n_cols = n_minor;
++		ctx->n_rows = n_major;
++	}
++	return true;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Track sizing                                                              */
++
++static inline bool grid_min_is_intrinsic(const struct grid_track *t)
++{
++	return t->min_type == GS_AUTO || t->min_type == GS_MIN_CONTENT ||
++	       t->min_type == GS_MAX_CONTENT;
++}
++
++static inline bool grid_max_is_intrinsic(const struct grid_track *t)
++{
++	return t->max_type == GS_AUTO || t->max_type == GS_MIN_CONTENT ||
++	       t->max_type == GS_MAX_CONTENT || t->max_type == GS_FIT_CONTENT;
++}
++
++/**
++ * Get an item's min-content and max-content outer contributions.
++ */
++static void grid_item_contribution(const struct grid_item *it,
++		bool horizontal, int *minc, int *maxc)
++{
++	const struct box *b = it->box;
++
++	if (horizontal) {
++		*minc = b->min_width;
++		*maxc = b->max_width;
++		if (*maxc == UNKNOWN_MAX_WIDTH) {
++			*maxc = *minc;
++		}
++		if (*maxc < *minc) {
++			*maxc = *minc;
++		}
++	} else {
++		int h = b->height == AUTO ? 0 : b->height;
++
++		*minc = *maxc = h + lh__delta_outer_height(b);
++	}
++	if (*minc < 0) {
++		*minc = 0;
++	}
++	if (*maxc < 0) {
++		*maxc = 0;
++	}
++}
++
++static inline int grid_gap_count(const struct grid_track *tracks, unsigned n)
++{
++	int visible = 0;
++	unsigned i;
++
++	for (i = 0; i < n; i++) {
++		if (!tracks[i].collapsed) {
++			visible++;
++		}
++	}
++	return visible > 0 ? visible - 1 : 0;
++}
++
++/**
++ * Distribute extra space equally across the selected tracks.
++ *
++ * \param to_limit  grow growth limits instead of base sizes
++ */
++static void grid_distribute(struct grid_track *tracks, unsigned n,
++		const unsigned *idx, unsigned count, int extra, bool to_limit)
++{
++	unsigned i;
++	int share, rem;
++
++	(void) n;
++	if (count == 0 || extra <= 0) {
++		return;
++	}
++	share = extra / (int) count;
++	rem = extra % (int) count;
++	for (i = 0; i < count; i++) {
++		struct grid_track *t = &tracks[idx[i]];
++		int add = share + (rem > 0 ? 1 : 0);
++
++		if (rem > 0) {
++			rem--;
++		}
++		if (to_limit) {
++			if (t->limit == GRID_INF) {
++				t->limit = t->base;
++			}
++			t->limit += add;
++		} else {
++			t->base += add;
++			if (t->limit != GRID_INF && t->limit < t->base) {
++				t->limit = t->base;
++			}
++		}
++	}
++}
++
++/**
++ * Size the tracks of one axis (CSS Grid Level 1, section 12.3 onwards).
++ *
++ * \param horizontal  true for columns, false for rows
++ */
++static bool grid_size_axis(struct grid_ctx *ctx, bool horizontal)
++{
++	struct grid_track *tracks = horizontal ? ctx->cols : ctx->rows;
++	unsigned n = horizontal ? ctx->n_cols : ctx->n_rows;
++	int avail = horizontal ? ctx->avail_w : ctx->avail_h;
++	int gap = horizontal ? ctx->col_gap : ctx->row_gap;
++	unsigned *idx;
++	unsigned i, k, max_span = 1, span;
++	bool has_fr = false;
++	int used;
++
++	idx = malloc(n * sizeof(*idx));
++	if (idx == NULL) {
++		return false;
++	}
++
++	/* 12.4 initialise */
++	for (i = 0; i < n; i++) {
++		struct grid_track *t = &tracks[i];
++
++		t->base = t->min_type == GS_FIXED ? t->min_fixed : 0;
++		t->limit = t->max_type == GS_FIXED ? t->max_fixed : GRID_INF;
++		if (t->limit != GRID_INF && t->limit < t->base) {
++			t->limit = t->base;
++		}
++		if (t->max_type == GS_FR) {
++			has_fr = true;
++		}
++		if (t->collapsed) {
++			t->base = 0;
++			t->limit = 0;
++		}
++	}
++
++	/* 12.5 resolve intrinsic sizes: single-span items first */
++	for (i = 0; i < ctx->n_items; i++) {
++		const struct grid_item *it = &ctx->items[i];
++		int start = horizontal ? it->col : it->row;
++		struct grid_track *t;
++		int minc, maxc, cand;
++
++		span = horizontal ? it->col_span : it->row_span;
++		if (span > max_span) {
++			max_span = span;
++		}
++		if (span != 1 || start < 0 || (unsigned) start >= n) {
++			continue;
++		}
++		t = &tracks[start];
++		if (t->collapsed) {
++			continue;
++		}
++		grid_item_contribution(it, horizontal, &minc, &maxc);
++
++		if (t->min_type == GS_AUTO || t->min_type == GS_MIN_CONTENT) {
++			if (t->base < minc) {
++				t->base = minc;
++			}
++		} else if (t->min_type == GS_MAX_CONTENT) {
++			if (t->base < maxc) {
++				t->base = maxc;
++			}
++		}
++
++		cand = -1;
++		if (t->max_type == GS_MIN_CONTENT) {
++			cand = minc;
++		} else if (t->max_type == GS_AUTO ||
++				t->max_type == GS_MAX_CONTENT) {
++			cand = maxc;
++		} else if (t->max_type == GS_FIT_CONTENT) {
++			cand = maxc < t->max_fixed ? maxc : t->max_fixed;
++			if (cand < minc) {
++				cand = minc;
++			}
++		} else if (t->max_type == GS_FR && avail == AUTO) {
++			/* indefinite container: fr behaves like auto */
++			cand = maxc;
++		}
++		if (cand >= 0) {
++			if (t->limit == GRID_INF || t->limit < cand) {
++				t->limit = cand;
++			}
++		}
++		if (t->limit != GRID_INF && t->limit < t->base) {
++			t->limit = t->base;
++		}
++	}
++
++	/* spanning items, in order of increasing span */
++	for (span = 2; span <= max_span; span++) {
++		for (i = 0; i < ctx->n_items; i++) {
++			const struct grid_item *it = &ctx->items[i];
++			int start = horizontal ? it->col : it->row;
++			unsigned ispan = horizontal ? it->col_span : it->row_span;
++			unsigned count, fr_count;
++			int minc, maxc, sum_base, sum_limit, needed;
++			int gaps;
++
++			if (ispan != span || start < 0 ||
++					(unsigned) start + span > n) {
++				continue;
++			}
++			grid_item_contribution(it, horizontal, &minc, &maxc);
++			gaps = gap * (int) (span - 1);
++
++			/* which spanned tracks may grow */
++			sum_base = 0;
++			sum_limit = 0;
++			count = 0;
++			fr_count = 0;
++			for (k = 0; k < span; k++) {
++				const struct grid_track *t =
++						&tracks[start + k];
++
++				sum_base += t->base;
++				sum_limit += t->limit == GRID_INF ?
++						t->base : t->limit;
++				if (t->max_type == GS_FR) {
++					fr_count++;
++				}
++			}
++
++			if (fr_count > 0 && avail != AUTO) {
++				/* fr tracks absorb the item in step 12.7 */
++				continue;
++			}
++
++			/* base sizes */
++			count = 0;
++			for (k = 0; k < span; k++) {
++				if (grid_min_is_intrinsic(&tracks[start + k]) &&
++						!tracks[start + k].collapsed) {
++					idx[count++] = start + k;
++				}
++			}
++			needed = minc - sum_base - gaps;
++			if (needed > 0 && count > 0) {
++				grid_distribute(tracks, n, idx, count,
++						needed, false);
++			}
++
++			/* growth limits */
++			count = 0;
++			sum_limit = 0;
++			for (k = 0; k < span; k++) {
++				const struct grid_track *t =
++						&tracks[start + k];
++
++				sum_limit += t->limit == GRID_INF ?
++						t->base : t->limit;
++				if (grid_max_is_intrinsic(t) && !t->collapsed) {
++					idx[count++] = start + k;
++				}
++			}
++			needed = maxc - sum_limit - gaps;
++			if (needed > 0 && count > 0) {
++				grid_distribute(tracks, n, idx, count,
++						needed, true);
++			}
++		}
++	}
++
++	/* finish: tracks that are still unbounded stop at their base */
++	for (i = 0; i < n; i++) {
++		struct grid_track *t = &tracks[i];
++
++		if (t->max_type == GS_FIT_CONTENT && t->limit != GRID_INF &&
++				t->limit > t->max_fixed &&
++				t->max_fixed >= t->base) {
++			t->limit = t->max_fixed;
++		}
++		if (t->limit == GRID_INF && !(t->max_type == GS_FR &&
++				avail != AUTO)) {
++			t->limit = t->base;
++		}
++		if (t->limit != GRID_INF && t->limit < t->base) {
++			t->limit = t->base;
++		}
++	}
++
++	used = gap * grid_gap_count(tracks, n);
++	for (i = 0; i < n; i++) {
++		used += tracks[i].base;
++	}
++
++	/* 12.6 maximise tracks */
++	if (avail != AUTO && avail > used) {
++		int free_space = avail - used;
++
++		for (;;) {
++			unsigned count = 0;
++			int share, grown = 0;
++
++			for (i = 0; i < n; i++) {
++				const struct grid_track *t = &tracks[i];
++
++				if (t->max_type != GS_FR && !t->collapsed &&
++						t->limit != GRID_INF &&
++						t->limit > t->base) {
++					idx[count++] = i;
++				}
++			}
++			if (count == 0 || free_space <= 0) {
++				break;
++			}
++			share = free_space / (int) count;
++			if (share == 0) {
++				share = 1;
++			}
++			for (k = 0; k < count && free_space > 0; k++) {
++				struct grid_track *t = &tracks[idx[k]];
++				int add = share;
++
++				if (t->base + add > t->limit) {
++					add = t->limit - t->base;
++				}
++				if (add > free_space) {
++					add = free_space;
++				}
++				t->base += add;
++				free_space -= add;
++				grown += add;
++			}
++			if (grown == 0) {
++				break;
++			}
++		}
++		used = avail - free_space;
++	}
++
++	/* 12.7 expand flexible tracks */
++	if (has_fr && avail != AUTO) {
++		float hyp = 0, sum_fr;
++		int leftover;
++		bool again;
++
++		do {
++			again = false;
++			leftover = avail - gap * grid_gap_count(tracks, n);
++			sum_fr = 0;
++			for (i = 0; i < n; i++) {
++				const struct grid_track *t = &tracks[i];
++
++				if (t->collapsed) {
++					continue;
++				}
++				if (t->max_type == GS_FR && !t->inflexible) {
++					sum_fr += t->fr;
++				} else {
++					leftover -= t->base;
++				}
++			}
++			if (leftover < 0) {
++				leftover = 0;
++			}
++			if (sum_fr < 1) {
++				sum_fr = 1;
++			}
++			hyp = (float) leftover / sum_fr;
++			for (i = 0; i < n; i++) {
++				struct grid_track *t = &tracks[i];
++
++				if (t->max_type == GS_FR && !t->inflexible &&
++						!t->collapsed &&
++						(float) t->base > hyp * t->fr) {
++					t->inflexible = true;
++					again = true;
++				}
++			}
++		} while (again);
++
++		for (i = 0; i < n; i++) {
++			struct grid_track *t = &tracks[i];
++
++			if (t->collapsed) {
++				continue;
++			}
++			if (t->max_type == GS_FR && !t->inflexible) {
++				int size = (int) (hyp * t->fr + 0.5f);
++
++				if (size > t->base) {
++					t->base = size;
++				}
++			}
++			if (t->max_type == GS_FR) {
++				t->limit = t->base;
++			}
++		}
++		used = gap * grid_gap_count(tracks, n);
++		for (i = 0; i < n; i++) {
++			used += tracks[i].base;
++		}
++	}
++
++	/* 12.8 stretch auto tracks */
++	if (avail != AUTO && avail > used && !has_fr) {
++		uint8_t dist = horizontal ?
++				css_computed_justify_content(ctx->grid->style) :
++				css_computed_align_content(ctx->grid->style);
++		bool stretch = horizontal ?
++				(dist == CSS_JUSTIFY_CONTENT_FLEX_START) :
++				(dist == CSS_ALIGN_CONTENT_STRETCH);
++		unsigned count = 0;
++
++		/* justify-content has no stretch keyword in libcss, so its
++		 * initial value (flex-start) stands in for normal */
++		if (stretch) {
++			for (i = 0; i < n; i++) {
++				if (tracks[i].max_type == GS_AUTO &&
++						!tracks[i].collapsed) {
++					idx[count++] = i;
++				}
++			}
++			grid_distribute(tracks, n, idx, count,
++					avail - used, false);
++		}
++	}
++
++	free(idx);
++	return true;
++}
++
++/**
++ * Compute track start positions, applying content distribution.
++ */
++static void grid_position_tracks(struct grid_ctx *ctx, bool horizontal)
++{
++	struct grid_track *tracks = horizontal ? ctx->cols : ctx->rows;
++	unsigned n = horizontal ? ctx->n_cols : ctx->n_rows;
++	int avail = horizontal ? ctx->avail_w : ctx->avail_h;
++	int gap = horizontal ? ctx->col_gap : ctx->row_gap;
++	int pos = ctx->grid->padding[horizontal ? LEFT : TOP];
++	int visible = grid_gap_count(tracks, n) + 1;
++	int used = gap * (visible - 1), free_space = 0, lead = 0, extra = 0;
++	unsigned i;
++	uint8_t dist;
++
++	for (i = 0; i < n; i++) {
++		used += tracks[i].base;
++	}
++	if (avail != AUTO && avail > used) {
++		free_space = avail - used;
++	}
++
++	if (free_space > 0) {
++		if (horizontal) {
++			dist = css_computed_justify_content(ctx->grid->style);
++			switch (dist) {
++			case CSS_JUSTIFY_CONTENT_FLEX_END:
++				lead = free_space;
++				break;
++			case CSS_JUSTIFY_CONTENT_CENTER:
++				lead = free_space / 2;
++				break;
++			case CSS_JUSTIFY_CONTENT_SPACE_BETWEEN:
++				if (visible > 1) {
++					extra = free_space / (visible - 1);
++				}
++				break;
++			case CSS_JUSTIFY_CONTENT_SPACE_AROUND:
++				extra = free_space / visible;
++				lead = extra / 2;
++				break;
++			case CSS_JUSTIFY_CONTENT_SPACE_EVENLY:
++				extra = free_space / (visible + 1);
++				lead = extra;
++				break;
++			default:
++				break;
++			}
++		} else {
++			dist = css_computed_align_content(ctx->grid->style);
++			switch (dist) {
++			case CSS_ALIGN_CONTENT_FLEX_END:
++				lead = free_space;
++				break;
++			case CSS_ALIGN_CONTENT_CENTER:
++				lead = free_space / 2;
++				break;
++			case CSS_ALIGN_CONTENT_SPACE_BETWEEN:
++				if (visible > 1) {
++					extra = free_space / (visible - 1);
++				}
++				break;
++			case CSS_ALIGN_CONTENT_SPACE_AROUND:
++				extra = free_space / visible;
++				lead = extra / 2;
++				break;
++			case CSS_ALIGN_CONTENT_SPACE_EVENLY:
++				extra = free_space / (visible + 1);
++				lead = extra;
++				break;
++			default:
++				break;
++			}
++		}
++	}
++
++	pos += lead;
++	for (i = 0; i < n; i++) {
++		tracks[i].pos = pos;
++		if (!tracks[i].collapsed) {
++			pos += tracks[i].base + gap + extra;
++		}
++	}
++}
++
++/**
++ * Size of the area spanned by tracks [start, start + span).
++ */
++static int grid_span_size(const struct grid_track *tracks, unsigned n,
++		int gap, int start, int span)
++{
++	int size = 0, k, visible = 0;
++
++	for (k = 0; k < span && (unsigned) (start + k) < n; k++) {
++		const struct grid_track *t = &tracks[start + k];
++
++		if (!t->collapsed) {
++			size += t->base;
++			visible++;
++		}
++	}
++	if (visible > 1) {
++		size += gap * (visible - 1);
++	}
++	return size;
++}
++
++/* ------------------------------------------------------------------------ */
++/* Items                                                                     */
++
++/**
++ * Lay out a grid item at the given content width.
++ */
++static bool grid_layout_item(struct grid_ctx *ctx, struct grid_item *it,
++		int area_w)
++{
++	struct box *b = it->box;
++	bool success;
++
++	if (b->width == AUTO) {
++		b->width = area_w - lh__delta_outer_width(b);
++		if (it->max_width >= 0 && b->width > it->max_width) {
++			b->width = it->max_width;
++		}
++		if (it->min_width > 0 && b->width < it->min_width) {
++			b->width = it->min_width;
++		}
++	}
++	if (b->width < 0) {
++		b->width = 0;
++	}
++
++	b->float_container = b->parent;
++	switch (b->type) {
++	case BOX_BLOCK:
++		success = layout_block_context(b, -1, ctx->content);
++		break;
++	case BOX_TABLE:
++		success = layout_table(b, area_w, ctx->content);
++		break;
++	case BOX_FLEX:
++		success = layout_flex(b, area_w, ctx->content);
++		break;
++	default:
++		assert(0 && "Bad grid item box type");
++		success = false;
++		break;
++	}
++	b->float_container = NULL;
++
++	if (!success) {
++		NSLOG(layout, ERROR, "box %p: grid item layout failed", b);
++	}
++	return success;
++}
++
++/**
++ * Collect the grid items and their placement requests.
++ */
++static bool grid_collect_items(struct grid_ctx *ctx)
++{
++	struct box *b;
++	unsigned i = 0;
++
++	ctx->n_items = 0;
++	for (b = ctx->grid->children; b != NULL; b = b->next) {
++		if (b->style == NULL || lh__box_is_absolute(b)) {
++			continue;
++		}
++		ctx->n_items++;
++	}
++	if (ctx->n_items == 0) {
++		return true;
++	}
++	ctx->items = calloc(ctx->n_items, sizeof(*ctx->items));
++	if (ctx->items == NULL) {
++		return false;
++	}
++
++	for (b = ctx->grid->children; b != NULL; b = b->next) {
++		struct grid_item *it;
++		uint8_t stype, etype;
++		int32_t sval = 0, eval = 0;
++
++		if (b->style == NULL || lh__box_is_absolute(b)) {
++			continue;
++		}
++		it = &ctx->items[i++];
++		it->box = b;
++
++		b->float_container = b->parent;
++		layout_find_dimensions(ctx->unit_len_ctx, ctx->avail_w, -1,
++				b, b->style, &b->width, &b->height,
++				&it->max_width, &it->min_width,
++				&it->max_height, &it->min_height,
++				b->margin, b->padding, b->border);
++		b->float_container = NULL;
++
++		stype = css_computed_grid_column_start(b->style, &sval);
++		etype = css_computed_grid_column_end(b->style, &eval);
++		grid_resolve_lines(stype, sval, etype, eval,
++				ctx->n_explicit_cols, &it->col, &it->col_span);
++
++		stype = css_computed_grid_row_start(b->style, &sval);
++		etype = css_computed_grid_row_end(b->style, &eval);
++		grid_resolve_lines(stype, sval, etype, eval,
++				ctx->n_explicit_rows, &it->row, &it->row_span);
++	}
++	return true;
++}
++
++/**
++ * Extend an axis' track array with implicit tracks up to count.
++ */
++static bool grid_extend_tracks(struct grid_ctx *ctx, bool horizontal)
++{
++	struct grid_track **tracks = horizontal ? &ctx->cols : &ctx->rows;
++	unsigned have = horizontal ? ctx->n_explicit_cols : ctx->n_explicit_rows;
++	unsigned want = horizontal ? ctx->n_cols : ctx->n_rows;
++	const css_computed_grid_track *auto_def = NULL;
++	int axis_avail = horizontal ? ctx->avail_w : ctx->avail_h;
++	struct grid_track *grown;
++	unsigned i;
++
++	if (want <= have) {
++		if (want < have) {
++			/* items never reach the trailing explicit tracks;
++			 * they still exist and take up space */
++			if (horizontal) {
++				ctx->n_cols = have;
++			} else {
++				ctx->n_rows = have;
++			}
++		}
++		return true;
++	}
++
++	grown = realloc(*tracks, want * sizeof(**tracks));
++	if (grown == NULL) {
++		return false;
++	}
++	*tracks = grown;
++
++	if (horizontal) {
++		if (css_computed_grid_auto_columns(ctx->grid->style,
++				&auto_def) != CSS_GRID_AUTO_TRACK_SET) {
++			auto_def = NULL;
++		}
++	} else {
++		if (css_computed_grid_auto_rows(ctx->grid->style,
++				&auto_def) != CSS_GRID_AUTO_TRACK_SET) {
++			auto_def = NULL;
++		}
++	}
++	for (i = have; i < want; i++) {
++		grid_track_init(ctx, auto_def, axis_avail, &grown[i]);
++	}
++	return true;
++}
++
++/**
++ * Collapse auto-fit tracks that hold no item.
++ */
++static void grid_collapse_empty(struct grid_ctx *ctx, bool horizontal)
++{
++	struct grid_track *tracks = horizontal ? ctx->cols : ctx->rows;
++	unsigned n = horizontal ? ctx->n_cols : ctx->n_rows;
++	const css_computed_grid_track *tmpl = NULL;
++	unsigned i;
++	bool auto_fit = false;
++
++	if (horizontal) {
++		css_computed_grid_template_columns(ctx->grid->style, &tmpl);
++	} else {
++		css_computed_grid_template_rows(ctx->grid->style, &tmpl);
++	}
++	for (i = 0; tmpl != NULL && tmpl[i].min_type != CSS_GRID_TRACK_NONE;
++			i++) {
++		if (tmpl[i].flags & CSS_GRID_TRACK_FLAG_AUTO_FIT) {
++			auto_fit = true;
++			break;
++		}
++	}
++	if (!auto_fit) {
++		return;
++	}
++
++	for (i = 0; i < n; i++) {
++		unsigned k;
++		bool used = false;
++
++		if (!tracks[i].auto_repeat) {
++			continue;
++		}
++		for (k = 0; k < ctx->n_items; k++) {
++			const struct grid_item *it = &ctx->items[k];
++			int start = horizontal ? it->col : it->row;
++			int span = horizontal ? it->col_span : it->row_span;
++
++			if (start >= 0 && (unsigned) start <= i &&
++					(unsigned) (start + span) > i) {
++				used = true;
++				break;
++			}
++		}
++		if (!used) {
++			tracks[i].collapsed = true;
++		}
++	}
++}
++
++static void grid_ctx_destroy(struct grid_ctx *ctx)
++{
++	free(ctx->items);
++	free(ctx->cols);
++	free(ctx->rows);
++	free(ctx->occ);
++}
++
++/**
++ * Resolve a gap value against the axis size.
++ */
++static int grid_gap(const struct grid_ctx *ctx, uint8_t type,
++		css_fixed length, css_unit unit, int axis_avail)
++{
++	int gap;
++
++	if (type != CSS_COLUMN_GAP_SET) {
++		return 0; /* normal: no gap between grid tracks */
++	}
++	if (unit == CSS_UNIT_PCT) {
++		if (axis_avail == AUTO) {
++			return 0;
++		}
++		gap = FPCT_OF_INT_TOINT(length, axis_avail);
++	} else {
++		gap = FIXTOINT(css_unit_len2device_px(ctx->grid->style,
++				ctx->unit_len_ctx, length, unit));
++	}
++	return gap > 0 ? gap : 0;
++}
++
++/* exported function, documented in html/layout_internal.h */
++bool layout_grid(struct box *grid, int available_width,
++		html_content *content)
++{
++	struct grid_ctx ctx;
++	int max_height, min_height;
++	const css_computed_grid_track *tmpl;
++	css_fixed length = 0;
++	css_unit unit = CSS_UNIT_PX;
++	uint8_t type, flow;
++	unsigned i;
++	bool success = false;
++
++	memset(&ctx, 0, sizeof(ctx));
++	ctx.content = content;
++	ctx.unit_len_ctx = &content->unit_len_ctx;
++	ctx.grid = grid;
++
++	layout_find_dimensions(ctx.unit_len_ctx, available_width, -1,
++			grid, grid->style, NULL, &grid->height,
++			NULL, NULL, &max_height, &min_height,
++			grid->margin, grid->padding, grid->border);
++
++	if (grid->width == AUTO || grid->width == UNKNOWN_WIDTH) {
++		grid->width = available_width - lh__delta_outer_width(grid);
++		if (grid->width < 0) {
++			grid->width = 0;
++		}
++	}
++	ctx.avail_w = grid->width;
++	ctx.avail_h = grid->height;
++
++	NSLOG(layout, DEEPDEBUG, "grid %p: width %i, height %i",
++			grid, ctx.avail_w, ctx.avail_h);
++
++	type = css_computed_column_gap(grid->style, &length, &unit);
++	ctx.col_gap = grid_gap(&ctx, type, length, unit, ctx.avail_w);
++	type = css_computed_row_gap(grid->style, &length, &unit);
++	ctx.row_gap = grid_gap(&ctx, type == CSS_ROW_GAP_SET ?
++			CSS_COLUMN_GAP_SET : CSS_COLUMN_GAP_NORMAL,
++			length, unit, ctx.avail_h);
++
++	flow = css_computed_grid_auto_flow(grid->style);
++	ctx.column_flow = (flow == CSS_GRID_AUTO_FLOW_COLUMN ||
++			flow == CSS_GRID_AUTO_FLOW_COLUMN_DENSE);
++	ctx.dense = (flow == CSS_GRID_AUTO_FLOW_ROW_DENSE ||
++			flow == CSS_GRID_AUTO_FLOW_COLUMN_DENSE);
++
++	/* explicit tracks */
++	tmpl = NULL;
++	if (css_computed_grid_template_columns(grid->style, &tmpl) !=
++			CSS_GRID_TEMPLATE_SET) {
++		tmpl = NULL;
++	}
++	if (!grid_build_explicit(&ctx, tmpl, ctx.avail_w, ctx.col_gap,
++			&ctx.cols, &ctx.n_explicit_cols)) {
++		goto cleanup;
++	}
++	tmpl = NULL;
++	if (css_computed_grid_template_rows(grid->style, &tmpl) !=
++			CSS_GRID_TEMPLATE_SET) {
++		tmpl = NULL;
++	}
++	if (!grid_build_explicit(&ctx, tmpl, ctx.avail_h, ctx.row_gap,
++			&ctx.rows, &ctx.n_explicit_rows)) {
++		goto cleanup;
++	}
++
++	/* items and placement */
++	if (!grid_collect_items(&ctx)) {
++		goto cleanup;
++	}
++	if (!grid_place_items(&ctx)) {
++		goto cleanup;
++	}
++	if (!grid_extend_tracks(&ctx, true) ||
++			!grid_extend_tracks(&ctx, false)) {
++		goto cleanup;
++	}
++	grid_collapse_empty(&ctx, true);
++	grid_collapse_empty(&ctx, false);
++
++	NSLOG(layout, DEEPDEBUG, "grid %p: %u items, %u columns, %u rows",
++			grid, ctx.n_items, ctx.n_cols, ctx.n_rows);
++
++	/* columns from the items' intrinsic widths */
++	if (!grid_size_axis(&ctx, true)) {
++		goto cleanup;
++	}
++	grid_position_tracks(&ctx, true);
++
++	/* lay the items out at their column widths */
++	for (i = 0; i < ctx.n_items; i++) {
++		struct grid_item *it = &ctx.items[i];
++		int area_w = grid_span_size(ctx.cols, ctx.n_cols, ctx.col_gap,
++				it->col, it->col_span);
++
++		if (!grid_layout_item(&ctx, it, area_w)) {
++			goto cleanup;
++		}
++	}
++
++	/* rows from the items' heights */
++	if (!grid_size_axis(&ctx, false)) {
++		goto cleanup;
++	}
++	grid_position_tracks(&ctx, false);
++
++	/* position and align the items in their areas */
++	for (i = 0; i < ctx.n_items; i++) {
++		struct grid_item *it = &ctx.items[i];
++		struct box *b = it->box;
++		int area_w = grid_span_size(ctx.cols, ctx.n_cols, ctx.col_gap,
++				it->col, it->col_span);
++		int area_h = grid_span_size(ctx.rows, ctx.n_rows, ctx.row_gap,
++				it->row, it->row_span);
++		int outer_w, outer_h, free_w, free_h;
++		enum css_align_self_e align;
++
++		if (b->height == AUTO) {
++			b->height = 0;
++		}
++
++		/* horizontal: stretch happened through the width; auto
++		 * margins take up what is left */
++		outer_w = b->width + b->padding[LEFT] + b->padding[RIGHT] +
++				b->border[LEFT].width + b->border[RIGHT].width +
++				lh__non_auto_margin(b, LEFT) +
++				lh__non_auto_margin(b, RIGHT);
++		free_w = area_w - outer_w;
++		if (free_w < 0) {
++			free_w = 0;
++		}
++		if (b->margin[LEFT] == AUTO && b->margin[RIGHT] == AUTO) {
++			b->margin[LEFT] = free_w / 2;
++			b->margin[RIGHT] = free_w - b->margin[LEFT];
++		} else if (b->margin[LEFT] == AUTO) {
++			b->margin[LEFT] = free_w;
++		} else if (b->margin[RIGHT] == AUTO) {
++			b->margin[RIGHT] = free_w;
++		}
++
++		/* vertical: align-self / align-items, stretch by default */
++		align = lh__box_align_self(grid, b);
++		outer_h = b->height + lh__delta_outer_height(b);
++		free_h = area_h - outer_h;
++		if (free_h < 0) {
++			free_h = 0;
++		}
++		if (b->margin[TOP] == AUTO && b->margin[BOTTOM] == AUTO) {
++			b->margin[TOP] = free_h / 2;
++			b->margin[BOTTOM] = free_h - b->margin[TOP];
++			free_h = 0;
++		} else if (b->margin[TOP] == AUTO) {
++			b->margin[TOP] = free_h;
++			free_h = 0;
++		} else if (b->margin[BOTTOM] == AUTO) {
++			b->margin[BOTTOM] = free_h;
++			free_h = 0;
++		}
++
++		b->x = ctx.cols[it->col].pos + b->margin[LEFT] +
++				b->border[LEFT].width;
++		b->y = ctx.rows[it->row].pos + b->margin[TOP] +
++				b->border[TOP].width;
++
++		switch (align) {
++		case CSS_ALIGN_SELF_FLEX_END:
++			b->y += free_h;
++			break;
++		case CSS_ALIGN_SELF_CENTER:
++			b->y += free_h / 2;
++			break;
++		case CSS_ALIGN_SELF_FLEX_START:
++		case CSS_ALIGN_SELF_BASELINE:
++			break;
++		default:
++		case CSS_ALIGN_SELF_STRETCH:
++			if (lh__box_size_cross_is_auto(true, b) && free_h > 0) {
++				int h = b->height + free_h;
++
++				if (it->max_height >= 0 && h > it->max_height) {
++					h = it->max_height;
++				}
++				b->height = h;
++			}
++			break;
++		}
++	}
++
++	/* container height */
++	if (grid->height == AUTO) {
++		int h = 0;
++
++		if (ctx.n_rows > 0) {
++			const struct grid_track *last = &ctx.rows[ctx.n_rows - 1];
++
++			h = last->pos + last->base - grid->padding[TOP];
++			for (i = ctx.n_rows; i > 0 && ctx.rows[i - 1].collapsed;
++					i--) {
++				h = ctx.rows[i - 1].pos - grid->padding[TOP];
++			}
++		}
++		grid->height = h > 0 ? h : 0;
++	}
++	if (max_height >= 0 && grid->height > max_height) {
++		grid->height = max_height;
++	}
++	if (min_height > 0 && grid->height < min_height) {
++		grid->height = min_height;
++	}
++
++	success = true;
++
++cleanup:
++	grid_ctx_destroy(&ctx);
++
++	NSLOG(layout, DEEPDEBUG, "grid %p: %s: w: %i, h: %i", grid,
++			success ? "success" : "failure",
++			grid->width, grid->height);
++	return success;
++}
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index 568c621d2..af5f01397 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -68,6 +68,19 @@ bool layout_flex(
+ 		int available_width,
+ 		html_content *content);
+ 
++/**
++ * Layout a grid container (VitaSurf).
++ *
++ * \param[in] grid             grid container box (flex type, GRID_CONTAINER)
++ * \param[in] available_width  width of containing block
++ * \param[in] content          memory pool for any new boxes
++ * \return  true on success, false on memory exhaustion
++ */
++bool layout_grid(
++		struct box *grid,
++		int available_width,
++		html_content *content);
++
+ typedef uint8_t (*css_len_func)(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+@@ -122,6 +135,19 @@ static inline bool lh__box_is_flex_item(const struct box *b)
+ 	return (b->parent != NULL) && lh__box_is_flex_container(b->parent);
+ }
+ 
++/** Layout helper: Check whether box is a grid container (VitaSurf). */
++static inline bool lh__box_is_grid_container(const struct box *b)
++{
++	return lh__box_is_flex_container(b) &&
++	       (b->flags & GRID_CONTAINER) != 0;
++}
++
++/** Layout helper: Check whether box is a grid item (VitaSurf). */
++static inline bool lh__box_is_grid_item(const struct box *b)
++{
++	return (b->parent != NULL) && lh__box_is_grid_container(b->parent);
++}
++
+ /** Layout helper: Check whether box is inline level. (Includes BR.) */
+ static inline bool lh__box_is_inline_level(const struct box *b)
+ {

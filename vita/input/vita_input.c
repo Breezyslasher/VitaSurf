@@ -818,6 +818,53 @@ void vita_input_load_started(struct gui_window *gw)
 	}
 }
 
+/* One FlareSolverr attempt per URL per minute, so a failure cannot loop. */
+static char flaresolverr_last[512];
+static uint64_t flaresolverr_last_us;
+
+static bool flaresolverr_should_try(struct gui_window *gw)
+{
+	nsurl *url = NULL;
+	uint64_t now = sceKernelGetProcessTimeWide();
+	bool ok = false;
+
+	if (browser_window_get_url(gw->bw, false, &url) != NSERROR_OK || url == NULL) {
+		return false;
+	}
+	if (strcmp(nsurl_access(url), flaresolverr_last) != 0 ||
+	    now - flaresolverr_last_us > 60000000ull) {
+		strncpy(flaresolverr_last, nsurl_access(url), sizeof(flaresolverr_last) - 1);
+		flaresolverr_last[sizeof(flaresolverr_last) - 1] = '\0';
+		flaresolverr_last_us = now;
+		ok = true;
+	}
+	nsurl_unref(url);
+	return ok;
+}
+
+static void flaresolverr_run(void *p)
+{
+	struct gui_window *gw = p;
+	nsurl *url = NULL;
+
+	if (gw != the_gw || gw->bw == NULL) {
+		return;
+	}
+	if (browser_window_get_url(gw->bw, false, &url) != NSERROR_OK || url == NULL) {
+		return;
+	}
+	if (vita_flaresolverr_solve(url)) {
+		if (guit->window->set_status != NULL) {
+			guit->window->set_status(gw, "Cloudflare check passed by FlareSolverr, reloading");
+		}
+		browser_window_navigate(gw->bw, url, NULL, BW_NAVIGATE_HISTORY,
+					NULL, NULL, NULL);
+	} else if (guit->window->set_status != NULL) {
+		guit->window->set_status(gw, "FlareSolverr could not pass the Cloudflare check (see log)");
+	}
+	nsurl_unref(url);
+}
+
 void vita_input_load_finished(struct gui_window *gw)
 {
 	nsurl *url = NULL;
@@ -836,6 +883,62 @@ void vita_input_load_finished(struct gui_window *gw)
 	} else {
 		vita_log("page: loaded in %u ms", ms);
 	}
+
+	/*
+	 * Cloudflare's browser check ("Just a moment...") runs a script that
+	 * fingerprints a full desktop browser and never passes here. With a
+	 * FlareSolverr server configured the check is handed to it and the
+	 * page reloaded with its cookies; otherwise say so in the status bar
+	 * rather than leaving a page that looks stuck.
+	 */
+	{
+		const char *title = browser_window_get_title(gw->bw);
+
+		if (title != NULL && strncmp(title, "Just a moment", 13) == 0) {
+			if (vita_flaresolverr_endpoint() != NULL &&
+			    flaresolverr_should_try(gw)) {
+				if (guit->window->set_status != NULL) {
+					guit->window->set_status(gw,
+						"Cloudflare check: asking FlareSolverr, please wait...");
+				}
+				/* let that status reach the screen first */
+				framebuffer_schedule(300, flaresolverr_run, gw);
+			} else if (guit->window->set_status != NULL) {
+				vita_log("page: Cloudflare browser check; it cannot be passed by this browser");
+				guit->window->set_status(gw,
+					"This site's Cloudflare browser check cannot be passed by VitaSurf");
+			}
+		}
+	}
+}
+
+/*
+ * After a suspend the network connections are gone. Stop the fetches that
+ * were in flight so they fail now instead of waiting for a timeout, and
+ * log the network state; Square reloads the page.
+ */
+static void check_resume(void)
+{
+	static uint64_t last_poll_us;
+	uint64_t now = sceKernelGetProcessTimeWide();
+
+	if (now - last_poll_us < 500000) {
+		return;
+	}
+	last_poll_us = now;
+	if (!vita_platform_poll_resume()) {
+		return;
+	}
+	vita_log("resume: application resumed from suspend");
+	vita_net_log_state();
+	if (the_gw != NULL && the_gw->bw != NULL) {
+		browser_window_stop(the_gw->bw);
+		if (guit->window->set_status != NULL) {
+			guit->window->set_status(the_gw,
+				"Resumed: press Square to reload if the page did not finish");
+		}
+	}
+	vita_log_memory("resume");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -854,6 +957,7 @@ static void tick(void *p)
 	}
 
 	vita_surface_read_input(&st);
+	check_resume();
 
 	/*
 	 * While the menu is open the page must not move under it: scrolling

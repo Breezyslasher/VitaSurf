@@ -1,0 +1,485 @@
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index df2b99d87..5ac539a83 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -434,6 +434,12 @@ struct box {
+ 	 */
+ 	struct hlcache_handle *background;
+ 
++	/**
++	 * CSS mask image for this box, or NULL if none (VitaSurf). A box
++	 * with a mask paints only its background colour through the mask.
++	 */
++	struct hlcache_handle *mask;
++
+ 
+ 	/**
+ 	 * Object in this box (usually an image), or NULL if none.
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 559d207cd..640bdff51 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -477,6 +477,7 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 	struct box *box = NULL, *old_box;
+ 	css_select_results *styles = NULL;
+ 	lwc_string *bgimage_uri;
++	lwc_string *maskimage_uri;
+ 	dom_exception err;
+ 	struct box_construct_props props;
+ 	const css_computed_style *root_style = NULL;
+@@ -709,6 +710,23 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		}
+ 	}
+ 
++	/* Kick off fetch for any CSS mask image (VitaSurf): the box then
++	 * paints its background colour through the image's alpha. */
++	if (css_computed_mask_image(box->style, &maskimage_uri) ==
++			CSS_MASK_IMAGE_IMAGE && maskimage_uri != NULL &&
++			nsoption_bool(background_images) == true) {
++		nsurl *url;
++
++		if (nsurl_create(lwc_string_data(maskimage_uri), &url) ==
++				NSERROR_OK) {
++			if (html_fetch_mask(ctx->content, url, box) == false) {
++				nsurl_unref(url);
++				return false;
++			}
++			nsurl_unref(url);
++		}
++	}
++
+ 	if (*convert_children)
+ 		box->flags |= CONVERT_CHILDREN;
+ 
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index d5e8b7bf9..8c232f5b9 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -148,6 +148,7 @@ box_create(css_select_results *styles,
+ 	box->usemap = NULL;
+ 	box->id = id;
+ 	box->background = NULL;
++	box->mask = NULL;
+ 	box->object = NULL;
+ 	box->object_params = NULL;
+ 	box->iframe = NULL;
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 8d1c77992..7ce4dd128 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -99,6 +99,7 @@ struct content_html_object {
+ 	/** Bitmap of acceptable content types */
+ 	content_type permitted_types;
+ 	bool background;  /**< This object is a background image. */
++	bool mask;        /**< This object is a CSS mask image (VitaSurf). */
+ };
+ 
+ 
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index a1f020bf7..a26ca496f 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -91,10 +91,15 @@ html_object_failed(struct box *box, html_content *content, bool background)
+ static void
+ html_object_done(struct box *box,
+ 		 hlcache_handle *object,
+-		 bool background)
++		 bool background,
++		 bool mask)
+ {
+ 	struct box *b;
+ 
++	if (mask) {
++		box->mask = object;
++		return;
++	}
+ 	if (background) {
+ 		box->background = object;
+ 		return;
+@@ -184,7 +189,7 @@ html_object_callback(hlcache_handle *object,
+ 							box->height : 0);
+ 
+ 			/* Adjust parent content for new object size */
+-			html_object_done(box, object, o->background);
++			html_object_done(box, object, o->background, o->mask);
+ 			if (c->base.status == CONTENT_STATUS_READY ||
+ 					c->base.status == CONTENT_STATUS_DONE)
+ 				content__reformat(&c->base, false,
+@@ -197,7 +202,7 @@ html_object_callback(hlcache_handle *object,
+ 		c->base.active--;
+ 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+ 
+-		html_object_done(box, object, o->background);
++		html_object_done(box, object, o->background, o->mask);
+ 
+ 		if (c->base.status != CONTENT_STATUS_LOADING &&
+ 				box->flags & REPLACE_DIM) {
+@@ -246,7 +251,16 @@ html_object_callback(hlcache_handle *object,
+ 
+ 			box_coords(box, &x, &y);
+ 
+-			if (object == box->background) {
++			if (object == box->mask) {
++				/* Redraw request is for the mask: the whole
++				 * padding box is painted through it */
++				data.redraw.x = x;
++				data.redraw.y = y;
++				data.redraw.width = box->padding[LEFT] +
++						box->width + box->padding[RIGHT];
++				data.redraw.height = box->padding[TOP] +
++						box->height + box->padding[BOTTOM];
++			} else if (object == box->background) {
+ 				/* Redraw request is for background */
+ 				css_fixed hpos = 0, vpos = 0;
+ 				css_unit hunit = CSS_UNIT_PX;
+@@ -705,13 +719,13 @@ nserror html_object_free_objects(html_content *html)
+ }
+ 
+ 
+-/* exported interface documented in html/object.h */
+-bool
+-html_fetch_object(html_content *c,
++static bool
++html_fetch_object_role(html_content *c,
+ 		  nsurl *url,
+ 		  struct box *box,
+ 		  content_type permitted_types,
+-		  bool background)
++		  bool background,
++		  bool mask)
+ {
+ 	struct content_html_object *object;
+ 	hlcache_handle_callback object_callback;
+@@ -742,6 +756,7 @@ html_fetch_object(html_content *c,
+ 	object->box = box;
+ 	object->permitted_types = permitted_types;
+ 	object->background = background;
++	object->mask = mask;
+ 
+ 	error = hlcache_handle_retrieve(url,
+ 					HLCACHE_RETRIEVE_SNIFF_TYPE,
+@@ -769,3 +784,22 @@ html_fetch_object(html_content *c,
+ 
+ 	return true;
+ }
++
++/* exported interface documented in html/object.h */
++bool
++html_fetch_object(html_content *c,
++		  nsurl *url,
++		  struct box *box,
++		  content_type permitted_types,
++		  bool background)
++{
++	return html_fetch_object_role(c, url, box, permitted_types,
++				      background, false);
++}
++
++/* exported interface documented in html/object.h */
++bool
++html_fetch_mask(html_content *c, nsurl *url, struct box *box)
++{
++	return html_fetch_object_role(c, url, box, CONTENT_IMAGE, false, true);
++}
+diff --git a/content/handlers/html/object.h b/content/handlers/html/object.h
+index 67d770c9e..51828d601 100644
+--- a/content/handlers/html/object.h
++++ b/content/handlers/html/object.h
+@@ -45,6 +45,16 @@ struct nsurl;
+  */
+ bool html_fetch_object(struct html_content *c, struct nsurl *url, struct box *box, content_type permitted_types, bool background);
+ 
++/**
++ * Start a fetch for a CSS mask image of a box (VitaSurf).
++ *
++ * \param c     content of type CONTENT_HTML
++ * \param url   URL of the mask image
++ * \param box   box that the mask belongs to
++ * \return true on success, false on memory exhaustion
++ */
++bool html_fetch_mask(struct html_content *c, struct nsurl *url, struct box *box);
++
+ /**
+  * release memory of content objects associated with a HTML content
+  *
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index f770699bb..685134812 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -592,6 +592,89 @@ static bool html_redraw_file(int x, int y, int width, int height,
+  * \return true if successful, false otherwise
+  */
+ 
++/**
++ * Whether a box has a CSS mask image (VitaSurf).
++ */
++static bool html_box_masked(struct box *box)
++{
++	lwc_string *uri = NULL;
++
++	return box->style != NULL &&
++		css_computed_mask_image(box->style, &uri) == CSS_MASK_IMAGE_IMAGE &&
++		uri != NULL;
++}
++
++/**
++ * Paint a masked box: its background colour through the mask image, which
++ * is fitted inside the padding box and centred, as mask-size: contain and
++ * mask-position: center would. Nothing is painted until the mask has
++ * loaded, since a missing mask hides the element entirely.
++ *
++ * \param x, y   padding box origin in device pixels
++ * \param pw, ph padding box size in device pixels
++ */
++static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
++		float scale, const struct rect *clip,
++		const struct redraw_context *ctx)
++{
++	css_color bgcol;
++	struct content_redraw_data data;
++	struct rect r = *clip;
++	int iw, ih, mw, mh;
++
++	if (box->mask == NULL ||
++	    (content_get_status(box->mask) != CONTENT_STATUS_READY &&
++	     content_get_status(box->mask) != CONTENT_STATUS_DONE)) {
++		return true;
++	}
++	css_computed_background_color(box->style, &bgcol);
++	if (nscss_color_is_transparent(bgcol)) {
++		return true;
++	}
++	iw = content_get_width(box->mask);
++	ih = content_get_height(box->mask);
++	if (iw <= 0 || ih <= 0 || pw <= 0 || ph <= 0) {
++		return true;
++	}
++	mw = iw * scale;
++	mh = ih * scale;
++	if (mw > pw || mh > ph) {
++		/* contain */
++		if ((long)mw * ph > (long)mh * pw) {
++			mh = mh * pw / mw;
++			mw = pw;
++		} else {
++			mw = mw * ph / mh;
++			mh = ph;
++		}
++	}
++	if (mw <= 0 || mh <= 0) {
++		return true;
++	}
++	if (r.x0 < x) r.x0 = x;
++	if (r.y0 < y) r.y0 = y;
++	if (r.x1 > x + pw) r.x1 = x + pw;
++	if (r.y1 > y + ph) r.y1 = y + ph;
++	if (r.x0 >= r.x1 || r.y0 >= r.y1) {
++		return true;
++	}
++	if (ctx->plot->clip(ctx, &r) != NSERROR_OK) {
++		return false;
++	}
++	data.x = x + (pw - mw) / 2;
++	data.y = y + (ph - mh) / 2;
++	data.width = mw;
++	data.height = mh;
++	data.background_colour = nscss_color_to_ns(bgcol);
++	data.scale = scale;
++	data.repeat_x = false;
++	data.repeat_y = false;
++	data.mask = true;
++	data.mask_colour = nscss_color_to_ns(bgcol);
++	content_redraw(box->mask, &data, &r, ctx);
++	return ctx->plot->clip(ctx, clip) == NSERROR_OK;
++}
++
+ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 		const struct rect *clip, colour *background_colour,
+ 		struct box *background,
+@@ -789,6 +872,8 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 				bg_data.scale = scale;
+ 				bg_data.repeat_x = repeat_x;
+ 				bg_data.repeat_y = repeat_y;
++				bg_data.mask = false;
++				bg_data.mask_colour = 0;
+ 
+ 				/* We just continue if redraw fails */
+ 				content_redraw(background->background,
+@@ -1464,6 +1549,14 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			return false;
+ 	}
+ 
++	/* A box with a CSS mask paints only its background colour through
++	 * the mask; borders, text and children are masked out (VitaSurf).
++	 * Codex-style icon buttons rely on this. */
++	if (html_box_masked(box)) {
++		return html_redraw_mask(x, y, padding_width, padding_height,
++					box, scale, &r, ctx);
++	}
++
+ 	/* background colour and image for block level content and replaced
+ 	 * inlines */
+ 
+diff --git a/content/handlers/image/image.c b/content/handlers/image/image.c
+index 2bd5f5f8d..38354a2b7 100644
+--- a/content/handlers/image/image.c
++++ b/content/handlers/image/image.c
+@@ -113,6 +113,65 @@ nserror image_init(void)
+ }
+ 
+ 
++/**
++ * Plot a bitmap as a CSS mask (VitaSurf): a temporary copy carries the
++ * source alpha and the mask colour in every pixel.
++ */
++static bool image_bitmap_plot_mask(struct bitmap *bitmap,
++		       struct content_redraw_data *data,
++		       const struct rect *clip,
++		       const struct redraw_context *ctx)
++{
++	int width = guit->bitmap->get_width(bitmap);
++	int height = guit->bitmap->get_height(bitmap);
++	struct bitmap *tinted;
++	const uint8_t *src;
++	uint8_t *dst;
++	size_t src_stride, dst_stride;
++	int x, y;
++	bool ok;
++
++	(void)clip;
++	if (width <= 0 || height <= 0) {
++		return true;
++	}
++	tinted = guit->bitmap->create(width, height, BITMAP_NONE);
++	if (tinted == NULL) {
++		return false;
++	}
++	src = guit->bitmap->get_buffer(bitmap);
++	dst = guit->bitmap->get_buffer(tinted);
++	src_stride = guit->bitmap->get_rowstride(bitmap);
++	dst_stride = guit->bitmap->get_rowstride(tinted);
++	if (src == NULL || dst == NULL) {
++		guit->bitmap->destroy(tinted);
++		return false;
++	}
++	for (y = 0; y < height; y++) {
++		const uint8_t *s = src + y * src_stride;
++		uint8_t *d = dst + y * dst_stride;
++
++		for (x = 0; x < width; x++) {
++			colour c = bitmap_pixel_to_colour(s);
++
++			d[bitmap_layout.r] = (data->mask_colour >> 0) & 0xff;
++			d[bitmap_layout.g] = (data->mask_colour >> 8) & 0xff;
++			d[bitmap_layout.b] = (data->mask_colour >> 16) & 0xff;
++			d[bitmap_layout.a] = (c >> 24) & 0xff;
++			s += 4;
++			d += 4;
++		}
++	}
++	guit->bitmap->set_opaque(tinted, false);
++	guit->bitmap->modified(tinted);
++	ok = (ctx->plot->bitmap(ctx, tinted, data->x, data->y,
++				data->width, data->height,
++				data->background_colour,
++				BITMAPF_NONE) == NSERROR_OK);
++	guit->bitmap->destroy(tinted);
++	return ok;
++}
++
+ bool image_bitmap_plot(struct bitmap *bitmap,
+ 		       struct content_redraw_data *data,
+ 		       const struct rect *clip,
+@@ -126,6 +185,10 @@ bool image_bitmap_plot(struct bitmap *bitmap,
+ 	plot_style_t fill_style;
+ 	struct rect area;
+ 
++	if (data->mask) {
++		return image_bitmap_plot_mask(bitmap, data, clip, ctx);
++	}
++
+ 	width = guit->bitmap->get_width(bitmap);
+ 	if (width == 1) {
+ 		height = guit->bitmap->get_height(bitmap);
+diff --git a/content/handlers/image/svg.c b/content/handlers/image/svg.c
+index d9761530e..1746bb80f 100644
+--- a/content/handlers/image/svg.c
++++ b/content/handlers/image/svg.c
+@@ -166,7 +166,9 @@ svg_redraw_internal(svg_content *svg,
+ 		    const struct rect *clip,
+ 		    const struct redraw_context *ctx,
+ 		    float scale,
+-		    colour background_colour)
++		    colour background_colour,
++		    bool mask,
++		    colour mask_colour)
+ {
+ 	float transform[6];
+ 	struct svgtiny_diagram *diagram = svg->diagram;
+@@ -197,7 +199,8 @@ svg_redraw_internal(svg_content *svg,
+ 				pstyle.stroke_colour = NS_TRANSPARENT;
+ 			} else {
+ 				pstyle.stroke_type = PLOT_OP_TYPE_SOLID;
+-				pstyle.stroke_colour = BGR(diagram->shape[i].stroke);
++				pstyle.stroke_colour = mask ? mask_colour :
++					BGR(diagram->shape[i].stroke);
+ 			}
+ 			pstyle.stroke_width = plot_style_int_to_fixed(
+ 					diagram->shape[i].stroke_width);
+@@ -208,7 +211,8 @@ svg_redraw_internal(svg_content *svg,
+ 				pstyle.fill_colour = NS_TRANSPARENT;
+ 			} else {
+ 				pstyle.fill_type = PLOT_OP_TYPE_SOLID;
+-				pstyle.fill_colour = BGR(diagram->shape[i].fill);
++				pstyle.fill_colour = mask ? mask_colour :
++					BGR(diagram->shape[i].fill);
+ 			}
+ 
+ 			/* draw the path */
+@@ -230,7 +234,7 @@ svg_redraw_internal(svg_content *svg,
+ 				transform[5];
+ 
+ 			fstyle.background = 0xffffff;
+-			fstyle.foreground = 0x000000;
++			fstyle.foreground = mask ? mask_colour : 0x000000;
+ 			fstyle.size = (8 * PLOT_STYLE_SCALE) * scale;
+ 
+ 			res = ctx->plot->text(ctx,
+@@ -283,7 +287,8 @@ svg_redraw_tiled_internal(svg_content *svg,
+ 			if (!svg_redraw_internal(svg, x, y,
+ 						 data->width, data->height,
+ 						 clip, ctx, data->scale,
+-						 data->background_colour)) {
++						 data->background_colour,
++						 data->mask, data->mask_colour)) {
+ 				return false;
+ 			}
+ 		}
+@@ -315,7 +320,8 @@ svg_redraw(struct content *c,
+ 		return svg_redraw_internal(svg, data->x, data->y,
+ 				data->width, data->height,
+ 				clip, ctx, data->scale,
+-				data->background_colour);
++				data->background_colour,
++				data->mask, data->mask_colour);
+ 	}
+ 
+ 	return svg_redraw_tiled_internal(svg, data, clip, ctx);
+diff --git a/include/netsurf/content.h b/include/netsurf/content.h
+index 2729fa7b8..96f044a72 100644
+--- a/include/netsurf/content.h
++++ b/include/netsurf/content.h
+@@ -57,6 +57,13 @@ struct content_redraw_data {
+ 
+ 	bool repeat_x; /**< whether content is tiled in x direction */
+ 	bool repeat_y; /**< whether content is tiled in y direction */
++
++	/**
++	 * Draw the content as a CSS mask: every opaque part is painted in
++	 * mask_colour and its own colours are ignored (VitaSurf).
++	 */
++	bool mask;
++	colour mask_colour;
+ };
+ 
+ /**

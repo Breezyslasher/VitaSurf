@@ -87,6 +87,37 @@ jobs:
             -DVITASURF_BUILD_SHA="$(echo "$GITHUB_SHA" | cut -c1-7)"
           cmake --build build
 
+      - name: Symbol map
+        # Crash dumps give offsets into the text segment. The function map
+        # goes into the job log (gzip, base64) so an offset can be resolved
+        # without downloading the ELF artifact.
+        run: |
+          arm-vita-eabi-readelf -lW build/VitaSurf | sed -n '/Program Headers/,/^$/p'
+          arm-vita-eabi-nm -n --defined-only build/VitaSurf \
+            | awk '$2 ~ /^[tTwW]$/ { print $1, $3 }' > build/VitaSurf.syms
+          wc -l build/VitaSurf.syms
+          echo "::group::VitaSurf.syms.gz base64"
+          gzip -9 -c build/VitaSurf.syms | base64 -w 76
+          echo "::endgroup::"
+          # Resolve the offsets listed in scripts/crash-offsets.txt against
+          # the first PT_LOAD segment, printing the functions around each.
+          base=$(arm-vita-eabi-readelf -lW build/VitaSurf \
+            | awk '$1 == "LOAD" { print $3; exit }')
+          echo "text segment base $base"
+          grep -v '^#' scripts/crash-offsets.txt | grep . | while read -r off; do
+            addr=$(printf '%08x' $((base + off)))
+            echo "== offset $off = 0x$addr"
+            arm-vita-eabi-addr2line -f -i -p -e build/VitaSurf "0x$addr" | sed 's/^/  /'
+            awk -v a="$addr" '$1 <= a' build/VitaSurf.syms | tail -6 | sed 's/^/  /'
+            echo "  -- $addr --"
+            awk -v a="$addr" '$1 > a' build/VitaSurf.syms | head -3 | sed 's/^/  /'
+            echo "::group::disassembly around 0x$addr"
+            arm-vita-eabi-objdump -d -l --no-show-raw-insn \
+              --start-address=$((base + off - 0x60)) \
+              --stop-address=$((base + off + 0x20)) build/VitaSurf | tail -n +7
+            echo "::endgroup::"
+          done
+
       - name: Upload VPK
         uses: actions/upload-artifact@v4
         with:
@@ -97,7 +128,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}-elf-${{ github.run_number }}
-          path: build/VitaSurf
+          path: |
+            build/VitaSurf
+            build/VitaSurf.syms
 
       - name: Rename VPK for the release
         if: startsWith(github.ref, 'refs/tags/v') && matrix.engine != 'quickjs'

@@ -1,0 +1,401 @@
+diff --git a/src/lex/lex.c b/src/lex/lex.c
+index 216b17c..e6cc7f7 100644
+--- a/src/lex/lex.c
++++ b/src/lex/lex.c
+@@ -636,6 +636,13 @@ css_error CDCOrIdentOrFunctionOrNPD(css_lexer *lexer, css_token **token)
+ 			APPEND(lexer, cptr, clen);
+ 
+ 			t->type = CSS_TOKEN_CDC;
++		} else if (startNMChar(c)) {
++			/* "--" followed by a name character is an IDENT:
++			 * a custom property name (CSS Syntax Level 3).
++			 * Both dashes are already in the token. */
++			lexer->state = sIDENT;
++			lexer->substate = 0;
++			return IdentOrFunction(lexer, token);
+ 		} else {
+ 			/* Remove the '-' we read above */
+ 			lexer->bytesReadForToken -= 1;
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 58bd15e..96c9725 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -103,6 +103,312 @@ static css_error parseProperty(css_language *c,
+ 		const css_token *property, const parserutils_vector *vector,
+ 		int32_t *ctx, css_rule *rule);
+ 
++/******************************************************************************
++ * Custom properties (VitaSurf)						      *
++ ******************************************************************************/
++
++/*
++ * libcss compiles declarations to bytecode as it parses, so var() cannot be
++ * resolved during the cascade the way a browser does. This is the practical
++ * subset instead: --name declarations in top-level rules that address the
++ * document root (:root, html, body or *) are kept as token lists for the
++ * rest of the stylesheet, and any later declaration in the same sheet that
++ * uses var() is parsed with those tokens substituted (fallbacks honoured,
++ * nested references resolved to a fixed depth). Sites keep their design
++ * tokens on :root at the top of their sheets, which is what this covers;
++ * per-element custom properties and theme overrides are not resolved.
++ */
++
++struct css_custom_prop {
++	lwc_string *name;
++	css_token *tokens;
++	uint32_t n;
++	struct css_custom_prop *next;
++};
++
++#define CUSTOM_PROP_MAX_DEPTH 16
++
++static bool isCustomPropertyName(lwc_string *s)
++{
++	return s != NULL && lwc_string_length(s) > 2 &&
++		lwc_string_data(s)[0] == '-' && lwc_string_data(s)[1] == '-';
++}
++
++static bool nameIs(lwc_string *s, const char *what)
++{
++	size_t len = strlen(what);
++	size_t i;
++
++	if (s == NULL || lwc_string_length(s) != len)
++		return false;
++	for (i = 0; i < len; i++) {
++		char a = lwc_string_data(s)[i];
++		if ('A' <= a && a <= 'Z')
++			a += 'a' - 'A';
++		if (a != what[i])
++			return false;
++	}
++	return true;
++}
++
++/** True for a top-level rule whose every selector is the document root. */
++static bool ruleIsRootLike(css_rule *rule)
++{
++	css_rule_selector *rs = (css_rule_selector *) rule;
++	uint32_t i;
++
++	if (rule->type != CSS_RULE_SELECTOR ||
++			rule->ptype != CSS_RULE_PARENT_STYLESHEET ||
++			rule->items == 0)
++		return false;
++
++	for (i = 0; i < rule->items; i++) {
++		const css_selector *sel = rs->selectors[i];
++		const css_selector_detail *detail;
++
++		if (sel == NULL || sel->combinator != NULL)
++			return false;
++		detail = &sel->data;
++		if (detail->type != CSS_SELECTOR_ELEMENT || detail->negate)
++			return false;
++		if (!nameIs(detail->qname.name, "*") &&
++				!nameIs(detail->qname.name, "html") &&
++				!nameIs(detail->qname.name, "body"))
++			return false;
++		if (detail->next) {
++			detail++;
++			if (detail->type != CSS_SELECTOR_PSEUDO_CLASS ||
++					detail->negate ||
++					!nameIs(detail->qname.name, "root") ||
++					detail->next)
++				return false;
++		}
++	}
++	return true;
++}
++
++static void freeCustomTokens(css_token *tokens, uint32_t n)
++{
++	uint32_t i;
++
++	for (i = 0; i < n; i++) {
++		if (tokens[i].idata != NULL)
++			lwc_string_unref(tokens[i].idata);
++	}
++	free(tokens);
++}
++
++static void freeCustomProps(css_language *c)
++{
++	struct css_custom_prop *p = c->custom;
++
++	while (p != NULL) {
++		struct css_custom_prop *next = p->next;
++		lwc_string_unref(p->name);
++		freeCustomTokens(p->tokens, p->n);
++		free(p);
++		p = next;
++	}
++	c->custom = NULL;
++}
++
++/** Copy a token so that it outlives the declaration it came from. */
++static void copyToken(css_token *dst, const css_token *src)
++{
++	dst->type = src->type;
++	dst->idata = src->idata != NULL ? lwc_string_ref(src->idata) : NULL;
++	dst->data.data = dst->idata != NULL ?
++		(uint8_t *) lwc_string_data(dst->idata) : NULL;
++	dst->data.len = dst->idata != NULL ? lwc_string_length(dst->idata) : 0;
++	dst->col = src->col;
++	dst->line = src->line;
++}
++
++static struct css_custom_prop *findCustomProp(css_language *c, lwc_string *name)
++{
++	struct css_custom_prop *p;
++
++	for (p = c->custom; p != NULL; p = p->next) {
++		bool match = false;
++		if (lwc_string_isequal(p->name, name, &match) == lwc_error_ok &&
++				match)
++			return p;
++	}
++	return NULL;
++}
++
++/** Keep the value tokens of a --name declaration; a later one replaces it. */
++static css_error storeCustomProperty(css_language *c, lwc_string *name,
++		const parserutils_vector *vector, int32_t ctx)
++{
++	struct css_custom_prop *p;
++	const css_token *token;
++	css_token *tokens;
++	int32_t end = ctx, i;
++	uint32_t n = 0;
++
++	/* extent, without trailing whitespace */
++	while ((token = parserutils_vector_peek(vector, end)) != NULL)
++		end++;
++	while (end > ctx && ((token = parserutils_vector_peek(vector, end - 1)) == NULL ||
++			token->type == CSS_TOKEN_S))
++		end--;
++	n = (uint32_t)(end - ctx);
++
++	tokens = n > 0 ? malloc(n * sizeof(css_token)) : NULL;
++	if (n > 0 && tokens == NULL)
++		return CSS_NOMEM;
++	for (i = 0; i < (int32_t) n; i++)
++		copyToken(&tokens[i], parserutils_vector_peek(vector, ctx + i));
++
++	p = findCustomProp(c, name);
++	if (p != NULL) {
++		freeCustomTokens(p->tokens, p->n);
++	} else {
++		p = malloc(sizeof(*p));
++		if (p == NULL) {
++			freeCustomTokens(tokens, n);
++			return CSS_NOMEM;
++		}
++		p->name = lwc_string_ref(name);
++		p->next = c->custom;
++		c->custom = p;
++	}
++	p->tokens = tokens;
++	p->n = n;
++	return CSS_OK;
++}
++
++static bool tokenIsVar(const css_token *t)
++{
++	return t != NULL && t->type == CSS_TOKEN_FUNCTION && nameIs(t->idata, "var");
++}
++
++static bool vectorHasVar(const parserutils_vector *vector, int32_t ctx)
++{
++	const css_token *t;
++
++	while ((t = parserutils_vector_peek(vector, ctx)) != NULL) {
++		if (tokenIsVar(t))
++			return true;
++		ctx++;
++	}
++	return false;
++}
++
++/**
++ * Append tokens[0..n) to out, replacing var() references.
++ *
++ * \return CSS_OK, CSS_INVALID for an unresolvable reference, CSS_NOMEM
++ */
++static css_error appendSubstituted(css_language *c, const css_token *tokens,
++		uint32_t n, parserutils_vector *out, int depth)
++{
++	uint32_t i;
++
++	if (depth > CUSTOM_PROP_MAX_DEPTH)
++		return CSS_INVALID;
++
++	for (i = 0; i < n; i++) {
++		const css_token *t = &tokens[i];
++		uint32_t j, nest, name_at, fb_from, fb_to;
++		struct css_custom_prop *p;
++		css_error error;
++
++		if (!tokenIsVar(t)) {
++			if (parserutils_vector_append(out, (void *) t) !=
++					PARSERUTILS_OK)
++				return CSS_NOMEM;
++			continue;
++		}
++
++		/* var( ws --name ws [, fallback tokens] ) */
++		j = i + 1;
++		while (j < n && tokens[j].type == CSS_TOKEN_S)
++			j++;
++		if (j >= n || tokens[j].type != CSS_TOKEN_IDENT ||
++				!isCustomPropertyName(tokens[j].idata))
++			return CSS_INVALID;
++		name_at = j++;
++		while (j < n && tokens[j].type == CSS_TOKEN_S)
++			j++;
++		fb_from = fb_to = 0;
++		if (j < n && tokenIsChar(&tokens[j], ',')) {
++			j++;
++			while (j < n && tokens[j].type == CSS_TOKEN_S)
++				j++;
++			fb_from = j;
++			nest = 0;
++			while (j < n) {
++				if (tokens[j].type == CSS_TOKEN_FUNCTION ||
++						tokenIsChar(&tokens[j], '('))
++					nest++;
++				else if (tokenIsChar(&tokens[j], ')')) {
++					if (nest == 0)
++						break;
++					nest--;
++				}
++				j++;
++			}
++			fb_to = j;
++		}
++		if (j >= n || !tokenIsChar(&tokens[j], ')'))
++			return CSS_INVALID;
++		i = j; /* the loop's i++ steps past ')' */
++
++		p = findCustomProp(c, tokens[name_at].idata);
++		if (p != NULL && p->n > 0) {
++			error = appendSubstituted(c, p->tokens, p->n, out,
++					depth + 1);
++		} else if (fb_to > fb_from) {
++			error = appendSubstituted(c, &tokens[fb_from],
++					fb_to - fb_from, out, depth + 1);
++		} else {
++			error = CSS_INVALID;
++		}
++		if (error != CSS_OK)
++			return error;
++	}
++	return CSS_OK;
++}
++
++/** Build the declaration's value tokens with every var() resolved. */
++static css_error substituteVars(css_language *c, const parserutils_vector *vector,
++		int32_t ctx, parserutils_vector **out)
++{
++	parserutils_vector *result;
++	css_token *tokens;
++	const css_token *t;
++	int32_t end = ctx, i;
++	uint32_t n;
++	css_error error;
++
++	while (parserutils_vector_peek(vector, end) != NULL)
++		end++;
++	n = (uint32_t)(end - ctx);
++	tokens = malloc((n + 1) * sizeof(css_token));
++	if (tokens == NULL)
++		return CSS_NOMEM;
++	for (i = 0; i < (int32_t) n; i++) {
++		t = parserutils_vector_peek(vector, ctx + i);
++		tokens[i] = *t;
++	}
++
++	if (parserutils_vector_create(sizeof(css_token), 32, &result) !=
++			PARSERUTILS_OK) {
++		free(tokens);
++		return CSS_NOMEM;
++	}
++	error = appendSubstituted(c, tokens, n, result, 0);
++	free(tokens);
++	if (error != CSS_OK) {
++		parserutils_vector_destroy(result);
++		return error;
++	}
++	*out = result;
++	return CSS_OK;
++}
++
+ /**
+  * Create a CSS language parser
+  *
+@@ -146,6 +452,7 @@ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+ 
+ 	c->sheet = sheet;
+ 	c->state = CHARSET_PERMITTED;
++	c->custom = NULL;
+ 	c->default_namespace = NULL;
+ 	c->namespaces = NULL;
+ 	c->num_namespaces = 0;
+@@ -170,6 +477,7 @@ css_error css__language_destroy(css_language *language)
+ 		return CSS_BADPARM;
+ 
+ 	lwc_string_unref(language->default_namespace);
++	freeCustomProps(language);
+ 
+ 	if (language->namespaces != NULL) {
+ 		for (i = 0; i < language->num_namespaces; i++) {
+@@ -829,6 +1137,22 @@ css_error handleDeclaration(css_language *c, const parserutils_vector *vector)
+ 		css_rule_font_face * ff_rule = (css_rule_font_face *) rule;
+ 		error = css__parse_font_descriptor(
+ 				c, ident, vector, &ctx, ff_rule);
++	} else if (isCustomPropertyName(ident->idata)) {
++		/* --name: kept for var() when declared on the root */
++		if (ruleIsRootLike(rule))
++			return storeCustomProperty(c, ident->idata, vector, ctx);
++		return CSS_OK;
++	} else if (rule->type == CSS_RULE_SELECTOR && vectorHasVar(vector, ctx)) {
++		parserutils_vector *subst = NULL;
++		int32_t sctx = 0;
++
++		error = substituteVars(c, vector, ctx, &subst);
++		if (error == CSS_NOMEM)
++			return error;
++		if (error != CSS_OK)
++			return CSS_INVALID; /* unresolved var(): dropped */
++		error = parseProperty(c, ident, subst, &sctx, rule);
++		parserutils_vector_destroy(subst);
+ 	} else {
+ 		error = parseProperty(c, ident, vector, &ctx, rule);
+ 	}
+diff --git a/src/parse/language.h b/src/parse/language.h
+index 81a096a..b20d9a0 100644
+--- a/src/parse/language.h
++++ b/src/parse/language.h
+@@ -45,6 +45,8 @@ typedef struct css_language {
+ 	/** Interned strings */
+ 	lwc_string **strings;
+ 
++	struct css_custom_prop *custom;	/**< Root custom properties (VitaSurf) */
++
+ 	lwc_string *default_namespace;	/**< Default namespace URI */
+ 	css_namespace *namespaces;	/**< Array of namespace mappings */
+ 	uint32_t num_namespaces;	/**< Number of namespace mappings */
+diff --git a/test/data/lex/tests1.dat b/test/data/lex/tests1.dat
+index 5e575a9..95d0c22 100644
+--- a/test/data/lex/tests1.dat
++++ b/test/data/lex/tests1.dat
+@@ -403,8 +403,7 @@ EOF
+ #data
+ --x
+ #expected
+-CHAR:-
+-IDENT:-x
++IDENT:--x
+ S
+ EOF
+ #reset

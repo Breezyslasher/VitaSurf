@@ -5,6 +5,7 @@
  * Licensed under the GNU General Public License version 2.
  */
 
+#include <psp2/appmgr.h>
 #include <psp2/apputil.h>
 #include <psp2/common_dialog.h>
 #include <psp2/io/dirent.h>
@@ -81,6 +82,20 @@ void vita_log_memory(const char *what)
 		 (unsigned int)info.size_user / 1024,
 		 (unsigned int)info.size_cdram / 1024,
 		 (unsigned int)info.size_phycont / 1024);
+}
+
+int vita_platform_poll_resume(void)
+{
+	SceAppMgrSystemEvent ev;
+	int resumed = 0;
+
+	/* drain the queue; several events can be pending after a long sleep */
+	while (sceAppMgrReceiveSystemEvent(&ev) >= 0) {
+		if (ev.systemEvent == SCE_APPMGR_SYSTEMEVENT_ON_RESUME) {
+			resumed = 1;
+		}
+	}
+	return resumed;
 }
 
 int vita_read_file(const char *path, char **data, size_t *len)

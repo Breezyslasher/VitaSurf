@@ -35,7 +35,10 @@ else()
 endif()
 
 option(VITASURF_DEBUG "Verbose logging and debug symbols" OFF)
-set(VITASURF_HEAP_MB 128 CACHE STRING "newlib heap size in MB (_newlib_heap_size_user)")
+# The app has about 256 MB of user memory (the startup log shows 114 MB
+# free beside a 128 MB heap). 176 MB leaves room for the main thread
+# stack, the GPU contexts and the system dialogs.
+set(VITASURF_HEAP_MB 176 CACHE STRING "newlib heap size in MB (_newlib_heap_size_user)")
 set(VITASURF_BUILD_ID "local" CACHE STRING "Build identifier written to the log (CI run number)")
 set(VITASURF_BUILD_SHA "" CACHE STRING "Short commit hash written to the log")
 if(VITASURF_BUILD_SHA STREQUAL "")
@@ -91,6 +94,10 @@ add_executable(${PROJECT_NAME}
     vita/platform/vita_file.c
     # SceNet and SceNetCtl bring-up.
     vita/platform/vita_net.c
+    # NetSurf download table: files saved under ux0:data/VitaSurf/downloads.
+    vita/platform/vita_download.c
+    # Optional FlareSolverr client for Cloudflare browser checks.
+    vita/platform/vita_flaresolverr.c
     vita/surface/vita.c
     vita/input/vita_input.c
     vita/input/vita_ime.c
@@ -100,8 +107,17 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/quickjs.h")
         message(FATAL_ERROR "quickjs.h not found: install it with 'vdpm quickjs-ng'")
     endif()
-    # Hand-written QuickJS bindings implementing NetSurf's js.h.
+    # Hand-written QuickJS bindings implementing NetSurf's js.h, plus the
+    # JavaScript half of them embedded as a NUL-terminated byte array.
+    set(PRELUDE_JS "${CMAKE_SOURCE_DIR}/vita/js/prelude.js")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PRELUDE_JS}")
+    file(READ "${PRELUDE_JS}" PRELUDE_HEX HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," PRELUDE_BYTES "${PRELUDE_HEX}")
+    file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
+        "/* generated from vita/js/prelude.js */\n"
+        "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n")
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c)
+    target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}/generated")
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -120,8 +136,10 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${NETSURF_LIBNSFB_SRC}/src
 )
 
+# -g keeps line tables in the ELF artifact (they are not loadable, so the
+# VPK does not grow) so crash offsets resolve to file:line in CI.
 target_compile_options(${PROJECT_NAME} PRIVATE
-    -std=gnu99 -Wall -Wextra -Wmissing-prototypes -O2
+    -std=gnu99 -Wall -Wextra -Wmissing-prototypes -O2 -g
     -ffunction-sections -fdata-sections
 )
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -133,17 +151,24 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 )
 if(VITASURF_DEBUG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_DEBUG=1)
-    target_compile_options(${PROJECT_NAME} PRIVATE -g)
 endif()
 
 # NetSurf's main() is reached through __wrap_main (vita/platform/vita_main.c).
 # libnetsurf.a and libnsfb.a are pulled in whole: NetSurf's object files
 # reference each other through operation tables, and libnsfb surfaces
 # register themselves with constructors.
+# vita-elf-create appends the SCE module data right after the text segment
+# and refuses to build when the data segment starts inside that space. The
+# gap the linker leaves depends on the text size modulo 64 KB, so some
+# builds had a few hundred bytes there. The Vita linker script adds
+# __sce_headroom bytes before aligning the data segment ("optional headroom
+# for SCE metadata" in the toolchain's patch); 64 KB makes the gap at least
+# that in every layout.
 target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--wrap=main
     -Wl,-q
     -Wl,--gc-sections
+    -Wl,--defsym,__sce_headroom=0x10000
 )
 
 set(VITASURF_JS_LIBS)

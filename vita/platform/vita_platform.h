@@ -8,6 +8,9 @@
 #ifndef VITASURF_PLATFORM_H
 #define VITASURF_PLATFORM_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 /* Screen geometry. The front touch panel reports 1920x1088 and is halved. */
 #ifndef VITASURF_BUILD_ID
 #define VITASURF_BUILD_ID "local"
@@ -42,10 +45,15 @@
 #define VITASURF_BOOKMARKS_PATH VITASURF_DATA_DIR "/Bookmarks"
 #define VITASURF_BOOKMARKS_PAGE VITASURF_DATA_DIR "/bookmarks.html"
 #define VITASURF_HISTORY_PAGE   VITASURF_DATA_DIR "/history.html"
+#define VITASURF_DOWNLOADS_DIR  VITASURF_DATA_DIR "/downloads"
+#define VITASURF_DOWNLOADS_PAGE VITASURF_DATA_DIR "/downloads.html"
+/* holds the URL of a FlareSolverr server, e.g. http://192.168.1.20:8191/v1 */
+#define VITASURF_FLARESOLVERR_PATH VITASURF_DATA_DIR "/flaresolverr"
 /* The same files as file: URLs NetSurf can open (the Vita file table maps
  * /ux0:/... back to ux0:/...). */
 #define VITASURF_BOOKMARKS_URL "file:///ux0:/data/VitaSurf/bookmarks.html"
 #define VITASURF_HISTORY_URL   "file:///ux0:/data/VitaSurf/history.html"
+#define VITASURF_DOWNLOADS_URL "file:///ux0:/data/VitaSurf/downloads.html"
 
 /**
  * Initialise the platform: create the data directory, open the log,
@@ -100,5 +108,27 @@ int vita_verbose_requested(void);
  */
 struct gui_file_table;
 extern struct gui_file_table *vita_file_table;
+
+/** NetSurf download table (vita_download.c): saves to the downloads dir. */
+struct gui_download_table;
+extern struct gui_download_table *vita_download_table;
+
+/**
+ * Poll the system event queue (vita_platform.c). Returns 1 once after the
+ * application resumed from suspend, 0 otherwise. Cheap enough to call a
+ * few times a second.
+ */
+int vita_platform_poll_resume(void);
+
+/**
+ * FlareSolverr client (vita_flaresolverr.c). The endpoint is NULL unless
+ * the user created the flaresolverr file. vita_flaresolverr_solve() asks
+ * the server to pass the Cloudflare check for url, stores the cookies it
+ * returns and switches to its user agent; it blocks while the solver
+ * works. Returns true when the page can be reloaded.
+ */
+struct nsurl;
+const char *vita_flaresolverr_endpoint(void);
+bool vita_flaresolverr_solve(struct nsurl *url);
 
 #endif

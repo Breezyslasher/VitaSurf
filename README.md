@@ -30,7 +30,68 @@ default engine. Measured on hardware against Duktape, it runs the modern
 JavaScript that documentation sites, wikis and forums ship, where
 NetSurf's Duktape fails to parse it; it is somewhat slower on pages
 where it therefore does real work, and its own allocations stay under
-1 MB on such pages. Duktape remains selectable for comparison.
+1 MB on such pages. Duktape remains selectable for comparison. Phase 7
+(polish) is in progress: page zoom from the Start menu, downloads saved
+under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, and
+resume handling that stops stale fetches after a suspend.
+
+Sites behind Cloudflare's browser check ("Just a moment...") cannot be
+passed by the browser itself. If you run
+[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) on a machine
+on the same network, put its URL in `ux0:data/VitaSurf/flaresolverr`
+(one line, for example `http://192.168.1.20:8191/v1`): the check is then
+handed to it, its cookies are stored and the page reloads. The browser
+switches to FlareSolverr's user agent for the rest of the session, since
+Cloudflare ties the clearance to it, and the Vita must share the solver's
+public address. The request blocks the browser while the solver works.
+
+Phase 8 (web compatibility) is in progress: `XMLHttpRequest`, `fetch`,
+`FormData`, `Headers`, `Response`, `Request` and `AbortController` are
+implemented on NetSurf's fetch layer, so requests carry the browser's
+cookies and go through its CA bundle. Cross-origin responses are only
+handed to scripts when the server allows the page's origin, redirects
+are followed up to five times and bodies are capped at 8 MB. The
+JavaScript half of the bindings now lives in `vita/js/prelude.js`, which
+CMake embeds at configure time and which can be tested under node.
+CSS `mask-image` (and `-webkit-mask-image`) is supported through patches
+0012 (libcss: the property) and 0013 (NetSurf: a masked box paints its
+background colour through the image, SVG or bitmap, fitted and centred in
+its padding box), which is how Wikipedia's mobile skin and other Codex
+based sites draw their icons. Patch 0014 adds CSS custom properties to
+libcss: `--name` declarations on `:root`, `html`, `body` or `*` are kept
+per stylesheet and `var(--name, fallback)` references (nested fallbacks
+included) are substituted while the declaration is parsed, so the
+property is stored as its resolved value and costs nothing at selection
+time. Variables declared on other selectors are not tracked, and a
+declaration whose variable cannot be resolved is dropped, as the
+specification requires.
+
+CSS Grid is supported through patches 0015 (libcss: the grid properties)
+and 0016 (NetSurf: `layout_grid.c`). A grid container is a flex box
+carrying a grid flag, so every place NetSurf already handles flex
+containers handles grids too, and `layout_flex` hands the box over to the
+grid code. Supported: `grid-template-columns` and `-rows` with lengths,
+percentages, `fr`, `auto`, `min-content`, `max-content`, `minmax()`,
+`fit-content()` and `repeat()` including `auto-fill` and `auto-fit`,
+`grid-auto-columns`, `grid-auto-rows`, `grid-auto-flow` (row, column,
+dense), placement by line number and span (`grid-column`, `grid-row`,
+`grid-area`), `gap`, `row-gap`, `column-gap`, `align-items`, `align-self`,
+`justify-content` and `align-content`, and `inline-grid`. Named lines and
+areas, `justify-items`, `justify-self`, subgrid and baseline alignment are
+not supported. Every child element of a grid container becomes an item of
+its own (inline children are blockified), and margins no longer collapse
+through flex or grid containers, which fixed a NetSurf bug that shifted a
+whole page when a flex container was followed by a block with a top
+margin. Verified natively with NetSurf's monkey frontend on a set of test
+pages; not yet checked on hardware.
+
+Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
+image scrolled far past the clip rectangle, the source offset arithmetic
+overflowed 32 bits and the plotter read before the image (a data abort in
+build 62 while scrolling Wikipedia). The products are now taken in 64 bits
+and empty or negative sizes are rejected. The build job prints the
+function map and a disassembly around every offset listed in
+`scripts/crash-offsets.txt`, so a crash dump can be read from the CI log.
 
 ## Building
 

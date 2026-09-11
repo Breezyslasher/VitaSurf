@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include <psp2/kernel/processmgr.h>
 
@@ -41,7 +43,7 @@
 extern fbtk_widget_t *fbtk;
 
 #define MENU_WIDTH       420
-#define MENU_ROW_HEIGHT  34
+#define MENU_ROW_HEIGHT  30
 #define MENU_HEADER      40
 #define MENU_PAD         8
 
@@ -60,7 +62,11 @@ enum item {
 	ITEM_BOOKMARKS,
 	ITEM_TOGGLE_BOOKMARK,
 	ITEM_HISTORY,
+	ITEM_DOWNLOADS,
 	ITEM_HOME,
+	ITEM_ZOOM_IN,
+	ITEM_ZOOM_OUT,
+	ITEM_ZOOM_RESET,
 	ITEM_JAVASCRIPT,
 	ITEM_IMAGES,
 	ITEM_QUIT,
@@ -83,6 +89,7 @@ static bool bookmarks_loaded;
 static uint64_t last_autosave_us;
 
 static void update_labels(void);
+static void save_choices(void);
 
 /* ------------------------------------------------------------------------ */
 /* Bookmarks file                                                           */
@@ -335,6 +342,93 @@ static bool write_history_page(void)
 /* ------------------------------------------------------------------------ */
 /* Actions                                                                  */
 
+/* ------------------------------------------------------------------------ */
+/* Downloads page                                                           */
+
+static bool write_downloads_page(void)
+{
+	FILE *f;
+	DIR *d;
+	struct dirent *e;
+	int n = 0;
+
+	f = fopen(VITASURF_DOWNLOADS_PAGE, "w");
+	if (f == NULL) {
+		vita_log("menu: cannot write %s", VITASURF_DOWNLOADS_PAGE);
+		return false;
+	}
+	page_head(f, "Downloads");
+	fputs("<p>Files saved under <b>ux0:data/VitaSurf/downloads</b>. "
+	      "Copy them off with VitaShell or FTP.</p>\n<ul>\n", f);
+	d = opendir(VITASURF_DOWNLOADS_DIR);
+	if (d != NULL) {
+		while ((e = readdir(d)) != NULL) {
+			char path[300];
+			struct stat st;
+
+			if (e->d_name[0] == '.') {
+				continue;
+			}
+			snprintf(path, sizeof(path), "%s/%s", VITASURF_DOWNLOADS_DIR,
+				 e->d_name);
+			if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+				continue;
+			}
+			fputs("<li>", f);
+			html_escape(f, e->d_name);
+			fprintf(f, " <span class=\"u\">%u KB</span></li>\n",
+				(unsigned)(st.st_size / 1024));
+			n++;
+		}
+		closedir(d);
+	}
+	if (n == 0) {
+		fputs("<li>No downloads yet. Links to files the browser cannot "
+		      "display (archives, PDFs) are saved here.</li>\n", f);
+	}
+	fputs("</ul>\n", f);
+	page_foot(f);
+	fclose(f);
+	return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Zoom                                                                     */
+
+static int zoom_percent(void)
+{
+	struct gui_window *gw = vita_input_window();
+
+	if (gw == NULL) {
+		return nsoption_int(scale);
+	}
+	return (int)(browser_window_get_scale(gw->bw) * 100.0f + 0.5f);
+}
+
+/** Change the page scale by delta percent (0 resets to 100). */
+static void zoom(int delta)
+{
+	struct gui_window *gw = vita_input_window();
+	int pct;
+
+	if (gw == NULL) {
+		return;
+	}
+	if (delta == 0) {
+		browser_window_set_scale(gw->bw, 1.0f, true);
+	} else {
+		pct = zoom_percent() + delta;
+		if (pct < 50) pct = 50;
+		if (pct > 300) pct = 300;
+		browser_window_set_scale(gw->bw, (float)pct / 100.0f, true);
+	}
+	/* new windows and the next start use the same scale */
+	nsoption_set_int(scale, zoom_percent());
+	save_choices();
+	vita_log("menu: zoom %d%%", nsoption_int(scale));
+	update_labels();
+}
+
 static void go(const char *url_text)
 {
 	struct gui_window *gw = vita_input_window();
@@ -434,10 +528,25 @@ static void activate(enum item item)
 			go(VITASURF_HISTORY_URL);
 		}
 		break;
+	case ITEM_DOWNLOADS:
+		vita_menu_close();
+		if (write_downloads_page()) {
+			go(VITASURF_DOWNLOADS_URL);
+		}
+		break;
 	case ITEM_HOME:
 		vita_menu_close();
 		go(nsoption_charp(homepage_url) != NULL ?
 		   nsoption_charp(homepage_url) : "file:///resources/vitasurf.html");
+		break;
+	case ITEM_ZOOM_IN:
+		zoom(10);
+		break;
+	case ITEM_ZOOM_OUT:
+		zoom(-10);
+		break;
+	case ITEM_ZOOM_RESET:
+		zoom(0);
 		break;
 	case ITEM_JAVASCRIPT:
 		nsoption_set_bool(enable_javascript,
@@ -508,8 +617,20 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_HISTORY:
 		snprintf(buf, len, "History");
 		break;
+	case ITEM_DOWNLOADS:
+		snprintf(buf, len, "Downloads");
+		break;
 	case ITEM_HOME:
 		snprintf(buf, len, "Home page");
+		break;
+	case ITEM_ZOOM_IN:
+		snprintf(buf, len, "Zoom in (now %d%%)", zoom_percent());
+		break;
+	case ITEM_ZOOM_OUT:
+		snprintf(buf, len, "Zoom out (now %d%%)", zoom_percent());
+		break;
+	case ITEM_ZOOM_RESET:
+		snprintf(buf, len, "Reset zoom to 100%%");
 		break;
 	case ITEM_JAVASCRIPT:
 		snprintf(buf, len, "JavaScript: %s (new pages)",
