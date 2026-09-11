@@ -45,6 +45,9 @@ void vita_input_caret(struct gui_window *gw, int x, int y, int height);
 /** NetSurf removed the caret from the page. */
 void vita_input_caret_removed(struct gui_window *gw);
 
+/** The browser window the input layer is attached to, or NULL. */
+struct gui_window *vita_input_window(void);
+
 /** The window started loading (throbber on). */
 void vita_input_load_started(struct gui_window *gw);
 

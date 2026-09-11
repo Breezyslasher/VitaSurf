@@ -15,7 +15,7 @@
  *                keyboard for it and types the result into the field
  *   Square       reload
  *   Select       toggle pointer mode
- *   Start        menu (later phase)
+ *   Start        menu: bookmarks, history, settings, quit (vita_menu.c)
  *   Left stick   scroll, speed follows deflection
  *   Right stick  move the pointer (handled in the surface)
  *   Touch        tap to click, drag to scroll
@@ -66,6 +66,7 @@
 #include "vita_surface.h"
 #include "vita_input.h"
 #include "vita_ime.h"
+#include "vita_menu.h"
 
 /* root toolkit widget, defined in the framebuffer frontend's gui.c */
 extern fbtk_widget_t *fbtk;
@@ -775,6 +776,8 @@ void vita_input_load_finished(struct gui_window *gw)
 	}
 	ms = (unsigned int)((sceKernelGetProcessTimeWide() - load_started_us) / 1000);
 	load_started_us = 0;
+	/* a LiveArea close never reaches gui_quit, so save as we go */
+	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
 		nsurl_unref(url);
@@ -855,6 +858,11 @@ static void tick(void *p)
 
 /* ------------------------------------------------------------------------ */
 /* Entry points                                                             */
+
+struct gui_window *vita_input_window(void)
+{
+	return the_gw;
+}
 
 void vita_input_attach(struct gui_window *gw)
 {
@@ -939,6 +947,11 @@ bool vita_input_global_key(const nsfb_event_t *event)
 	key = event->value.keycode;
 	down = event->type == NSFB_EVENT_KEY_DOWN;
 
+	/* the menu takes every button while it is open */
+	if (vita_menu_is_open()) {
+		return vita_menu_key(key, down);
+	}
+
 	switch (key) {
 	case VITA_KEY_L:
 		if (down && browser_window_history_back_available(the_gw->bw)) {
@@ -976,8 +989,9 @@ bool vita_input_global_key(const nsfb_event_t *event)
 		return true;
 
 	case VITA_KEY_START:
-		if (down) {
-			vita_log("input: menu not implemented yet");
+		if (down && !vita_ime_running()) {
+			drop_focus();
+			vita_menu_toggle();
 		}
 		return true;
 

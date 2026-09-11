@@ -59,6 +59,9 @@ void vita_surface_read_input(struct vita_input_state *out);
  */
 void vita_surface_set_dialog(bool active);
 
+/** Ask NetSurf to quit, as Select+Start does. */
+void vita_surface_request_quit(void);
+
 /**
  * Draw a focus rectangle over the display at screen coordinates, or clear
  * it with NULL. The rectangle is an overlay on the display buffer only:

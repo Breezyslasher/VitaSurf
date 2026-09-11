@@ -687,6 +687,13 @@ void vita_surface_read_input(struct vita_input_state *out)
 	vs->drag_dy = 0;
 }
 
+void vita_surface_request_quit(void)
+{
+	if (the_nsfb != NULL && the_nsfb->surface_priv != NULL) {
+		queue_control(the_nsfb->surface_priv, NSFB_CONTROL_QUIT);
+	}
+}
+
 void vita_surface_set_dialog(bool active)
 {
 	struct vita_surface *vs;

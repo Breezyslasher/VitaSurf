@@ -85,6 +85,7 @@ add_executable(${PROJECT_NAME}
     vita/surface/vita.c
     vita/input/vita_input.c
     vita/input/vita_ime.c
+    vita/input/vita_menu.c
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
