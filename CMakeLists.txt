@@ -170,6 +170,12 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--defsym,__sce_headroom=0x10000
 )
 
+set(VITASURF_JS_LIBS)
+if(VITASURF_JS_ENGINE STREQUAL "quickjs")
+    # quickjs-ng (MIT), from vdpm.
+    set(VITASURF_JS_LIBS quickjs)
+endif()
+
 target_link_libraries(${PROJECT_NAME}
     -Wl,--whole-archive
     ${NETSURF_LIB}
