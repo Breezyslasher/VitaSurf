@@ -25,9 +25,12 @@ the URL history are saved under `ux0:data/VitaSurf/` after page loads
 and on exit, bookmarks live in a text file there, settings changed from
 the Start menu are written to a user Choices file read after the bundled
 one, and the menu shows bookmarks and history as generated pages. Phase 6
-(QuickJS) is in progress: a second engine built on quickjs-ng with
-hand-written DOM bindings, kept side by side with Duktape until its memory
-use and page-load times are measured on hardware.
+(QuickJS) is complete: quickjs-ng with hand-written DOM bindings is the
+default engine. Measured on hardware against Duktape, it runs the modern
+JavaScript that documentation sites, wikis and forums ship, where
+NetSurf's Duktape fails to parse it; it is somewhat slower on pages
+where it therefore does real work, and its own allocations stay under
+1 MB on such pages. Duktape remains selectable for comparison.
 
 ## Building
 
@@ -51,10 +54,10 @@ only needs a handful of mutexes. Add `VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging. The JavaScript engine is chosen with
 `VITASURF_JS_ENGINE` in the environment of `build-netsurf.sh` and the
-matching `-DVITASURF_JS_ENGINE=` for CMake: `duktape` (default, NetSurf's
-engine with nsgenbind bindings), `quickjs` (quickjs-ng, MIT, with the
-hand-written bindings in `vita/js/qjs.c`) or `no`. CI builds both engines;
-the QuickJS VPK is the `VitaSurf-quickjs` artifact and the startup line
+matching `-DVITASURF_JS_ENGINE=` for CMake: `quickjs` (default: quickjs-ng,
+MIT, with the hand-written bindings in `vita/js/qjs.c`), `duktape`
+(NetSurf's engine with nsgenbind bindings) or `no`. CI builds both engines;
+the Duktape VPK is the `VitaSurf-duktape` artifact and the startup line
 in the log names the engine. Creating an empty file named `verbose` in
 `ux0:data/VitaSurf/` turns NetSurf's verbose logging on at runtime in any
 build; the log also starts with a self-test of the path and clock

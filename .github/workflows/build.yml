@@ -14,14 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both JavaScript engines are built until QuickJS is clearly better
-        # (CLAUDE.md phase 6). The Duktape VPK keeps the plain artifact name
-        # so existing install instructions still apply.
+        # QuickJS is the default engine since phase 6; the Duktape build is
+        # kept for comparison and carries its engine in the artifact name.
         include:
-          - engine: duktape
-            artifact: VitaSurf
           - engine: quickjs
-            artifact: VitaSurf-quickjs
+            artifact: VitaSurf
+          - engine: duktape
+            artifact: VitaSurf-duktape
     container:
       # Pinned rather than :latest so a rebuilt base image cannot change the
       # package manager or vdpm behaviour underneath the build.
@@ -101,7 +100,7 @@ jobs:
           path: build/VitaSurf
 
       - name: Rename VPK for the release
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.engine != 'duktape'
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.engine != 'quickjs'
         run: cp build/VitaSurf.vpk "build/${{ matrix.artifact }}.vpk"
 
       - name: Attach VPK to release

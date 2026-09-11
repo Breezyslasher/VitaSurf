@@ -52,11 +52,11 @@ if(VITASURF_BUILD_SHA STREQUAL "")
 endif()
 set(VITASURF_STACK_KB 4096 CACHE STRING "main thread stack size in KB")
 # Must match the VITASURF_JS_ENGINE scripts/build-netsurf.sh was run with:
-# duktape builds the engine into libnetsurf.a, quickjs leaves the js_*
-# symbols for vita/js/qjs.c and libquickjs.a (vdpm quickjs-ng), no uses
-# NetSurf's stub engine.
-set(VITASURF_JS_ENGINE "duktape" CACHE STRING "JavaScript engine: duktape, quickjs or no")
-set_property(CACHE VITASURF_JS_ENGINE PROPERTY STRINGS duktape quickjs no)
+# quickjs (default) leaves the js_* symbols for vita/js/qjs.c and
+# libquickjs.a (vdpm quickjs-ng), duktape builds NetSurf's engine into
+# libnetsurf.a, no uses NetSurf's stub engine.
+set(VITASURF_JS_ENGINE "quickjs" CACHE STRING "JavaScript engine: quickjs, duktape or no")
+set_property(CACHE VITASURF_JS_ENGINE PROPERTY STRINGS quickjs duktape no)
 if(NOT VITASURF_JS_ENGINE MATCHES "^(duktape|quickjs|no)$")
     message(FATAL_ERROR "VITASURF_JS_ENGINE must be duktape, quickjs or no, not '${VITASURF_JS_ENGINE}'")
 endif()
