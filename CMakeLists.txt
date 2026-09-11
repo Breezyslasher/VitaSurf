@@ -127,8 +127,8 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--no-whole-archive
     -Wl,--start-group
     css dom hubbub parserutils wapcaplet nsutils nsbmp nsgif svgtiny nspsl nslog utf8proc
-    # libcurl pulls in zstd; OpenSSL 1.1.1's libcrypto uses pthread.
-    curl ssl crypto zstd expat png jpeg z bz2 pthread m
+    # libcurl pulls in zstd; the mbedTLS package is built with pthread mutexes.
+    curl mbedtls mbedx509 mbedcrypto zstd expat png jpeg z bz2 pthread m
     -Wl,--end-group
     SceDisplay_stub
     SceCtrl_stub

@@ -13,9 +13,9 @@ and the platform notes that every change has to respect.
 Phase 1 (boot) is complete and verified on real hardware: the framebuffer
 frontend is linked statically with JavaScript disabled and renders the
 bundled local page from `app0:`. Phase 2 (networking) is in progress:
-SceNet and SceNetCtl are initialised before NetSurf starts, libcurl is
-built against OpenSSL 1.1.1 with the bundled CA file, and the home page
-links to test sites. Input, JavaScript, persistence and the rest follow.
+SceNet and SceNetCtl are initialised before NetSurf starts, libcurl uses
+mbedTLS with the bundled CA file, and the home page links to test sites.
+HTTP pages load on hardware; HTTPS is being verified. Input, JavaScript, persistence and the rest follow.
 
 ## Building
 
@@ -23,16 +23,19 @@ Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
 `make`, `pkg-config`, `perl`, `gperf`, `flex`, `bison`, `cmake` and host
 development packages for zlib and libpng (NetSurf builds a few host tools).
 
-    vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd openssl-1.1.1 curl expat
+    vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat
     git submodule update --init --recursive
-    ./scripts/build-curl.sh
     ./scripts/build-deps.sh
     ./scripts/build-netsurf.sh
     cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake
     cmake --build build
 
-The result is `build/VitaSurf.vpk`. The curl step exists because vdpm's curl package is
-linked against the OpenSSL 1.0.2 API while the toolchain ships 1.1.1. Add `VITASURF_DEBUG=1` to the
+The result is `build/VitaSurf.vpk`. TLS comes from mbedTLS (dual licensed
+Apache-2.0 or GPL-2.0-or-later) through vdpm's `curl-mbedtls` package. The
+OpenSSL 1.1.1 port was tried first: it creates a pthread read-write lock for
+every BIO and X509 object, and on hardware those allocations started failing
+after a few hundred locks, so curl could never load the CA bundle. mbedTLS
+only needs a handful of mutexes. Add `VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging. Creating an empty file named `verbose` in
 `ux0:data/VitaSurf/` turns NetSurf's verbose logging on at runtime in any
@@ -47,7 +50,7 @@ Linux machine.
 ## Layout
 
     CMakeLists.txt        final link, SELF creation, VPK packaging
-    scripts/              build-curl.sh, build-deps.sh, build-netsurf.sh, apply-patches.sh
+    scripts/              build-deps.sh, build-netsurf.sh, apply-patches.sh
     deps/                 NetSurf and its libraries as git submodules
     patches/              every change to upstream code, as patch files
     vita/surface/         libnsfb surface: display buffer and input polling

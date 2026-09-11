@@ -51,20 +51,20 @@ jobs:
       - name: Install Vita packages
         run: |
           set -eu
-          # The image ships openssl-1.1.1; plain "openssl" resolves to 1.0.2 and
-          # conflicts with it.
-          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd openssl-1.1.1 curl expat
-
-      - name: Cache curl source
-        uses: actions/cache@v4
-        with:
-          path: out/curl/curl-8.17.0.tar.xz
-          key: curl-8.17.0
-
-      # The packaged libcurl targets the OpenSSL 1.0.2 API and does not link
-      # against openssl-1.1.1, so rebuild it against the installed OpenSSL.
-      - name: Build libcurl against OpenSSL 1.1.1
-        run: CURL_VERSION=8.17.0 ./scripts/build-curl.sh
+          # curl-mbedtls replaces the OpenSSL-linked curl package. pacman
+          # refuses to swap conflicting packages non-interactively, so drop
+          # a preinstalled curl first.
+          PACMAN="$VITASDK/bin/pacman"
+          if [ -x "$PACMAN" ]; then
+            pm() {
+              "$PACMAN" --config "$VITASDK/etc/pacman.conf" --root "$VITASDK" \
+                --dbpath "$VITASDK/var/lib/pacman" \
+                --cachedir "$VITASDK/var/cache/pacman/pkg" \
+                --logfile "$VITASDK/var/log/pacman.log" --noconfirm "$@"
+            }
+            if pm -Q curl >/dev/null 2>&1; then pm -Rdd curl; fi
+          fi
+          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat
 
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh

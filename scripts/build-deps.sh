@@ -5,9 +5,8 @@
 # Usage: ./scripts/build-deps.sh [clean]
 #
 # Requires VITASDK plus these vdpm packages: zlib bzip2 libpng libjpeg-turbo
-# freetype zstd openssl-1.1.1 curl expat, with libcurl rebuilt by
-# scripts/build-curl.sh. Set VITASURF_NATIVE=1 to build for the host
-# instead (see scripts/vita-env.sh).
+# freetype zstd mbedtls curl-mbedtls expat. Set VITASURF_NATIVE=1 to
+# build for the host instead (see scripts/vita-env.sh).
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/vita-env.sh"

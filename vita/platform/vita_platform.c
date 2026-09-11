@@ -25,10 +25,9 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
-#include <openssl/bio.h>
-#include <openssl/err.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
+#include <mbedtls/error.h>
+#include <mbedtls/version.h>
+#include <mbedtls/x509_crt.h>
 
 #include "vita_platform.h"
 
@@ -190,123 +189,46 @@ static void log_iconv_selftest(void)
 }
 
 /**
- * Parse the bundled CA file through OpenSSL the way libcurl does and log
- * what happens, so a TLS failure can be traced to OpenSSL itself.
+ * Parse the bundled CA file through mbedTLS the way libcurl does and log
+ * the result, so a TLS failure can be traced to the bundle or the library.
  */
-/**
- * Mirror curl's load_cacert_from_memory(): read the bundle with
- * PEM_X509_INFO_read_bio() and add every certificate to a fresh
- * X509_STORE. curl returns CURLE_SSL_CACERT_BADFILE when either step
- * fails, so this shows which one does on the Vita.
- */
-static void log_openssl_store_selftest(const char *pem, size_t len)
-{
-	BIO *bio;
-	STACK_OF(X509_INFO) *infos;
-	X509_STORE *store;
-	int i, n, added = 0, skipped = 0;
-	unsigned long err;
-	char errbuf[256];
-
-	bio = BIO_new_mem_buf(pem, (int)len);
-	if (bio == NULL) {
-		vita_log("selftest: store: BIO_new_mem_buf failed");
-		return;
-	}
-
-	ERR_clear_error();
-	infos = PEM_X509_INFO_read_bio(bio, NULL, NULL, NULL);
-	BIO_free(bio);
-	if (infos == NULL) {
-		err = ERR_peek_last_error();
-		ERR_error_string_n(err, errbuf, sizeof(errbuf));
-		vita_log("selftest: store: PEM_X509_INFO_read_bio failed: %08lx %s",
-			 err, errbuf);
-		ERR_clear_error();
-		return;
-	}
-	n = sk_X509_INFO_num(infos);
-	vita_log("selftest: store: PEM_X509_INFO_read_bio returned %d entries", n);
-
-	store = X509_STORE_new();
-	if (store == NULL) {
-		err = ERR_peek_last_error();
-		ERR_error_string_n(err, errbuf, sizeof(errbuf));
-		vita_log("selftest: store: X509_STORE_new failed: %08lx %s",
-			 err, errbuf);
-		sk_X509_INFO_pop_free(infos, X509_INFO_free);
-		ERR_clear_error();
-		return;
-	}
-
-	for (i = 0; i < n; i++) {
-		X509_INFO *info = sk_X509_INFO_value(infos, i);
-
-		if (info->x509 == NULL) {
-			skipped++;
-			continue;
-		}
-		if (!X509_STORE_add_cert(store, info->x509)) {
-			err = ERR_peek_last_error();
-			ERR_error_string_n(err, errbuf, sizeof(errbuf));
-			vita_log("selftest: store: X509_STORE_add_cert #%d failed: %08lx %s",
-				 i, err, errbuf);
-			ERR_clear_error();
-			break;
-		}
-		added++;
-	}
-	vita_log("selftest: store: added %d certificates (%d entries without a certificate)",
-		 added, skipped);
-
-	X509_STORE_free(store);
-	sk_X509_INFO_pop_free(infos, X509_INFO_free);
-	ERR_clear_error();
-}
-
-static void log_openssl_selftest(void)
+static void log_tls_selftest(void)
 {
 	char *pem = NULL;
 	size_t len = 0;
-	BIO *bio;
-	X509 *cert;
+	mbedtls_x509_crt chain;
+	const mbedtls_x509_crt *c;
+	char version[16];
+	char buf[160];
+	int ret;
 	int count = 0;
-	unsigned long err;
-	char errbuf[256];
 
 	if (vita_read_file(VITASURF_CA_BUNDLE, &pem, &len) != 0) {
 		vita_log("selftest: cannot read %s", VITASURF_CA_BUNDLE);
 		return;
 	}
 
-	bio = BIO_new_mem_buf(pem, (int)len);
-	if (bio == NULL) {
-		vita_log("selftest: BIO_new_mem_buf failed");
-		free(pem);
-		return;
-	}
-
-	ERR_clear_error();
-	while ((cert = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
-		if (count == 0) {
-			char name[128];
-
-			name[0] = '\0';
-			X509_NAME_oneline(X509_get_subject_name(cert), name,
-					  sizeof(name));
-			vita_log("selftest: first certificate: %s", name);
-		}
-		X509_free(cert);
+	mbedtls_version_get_string(version);
+	mbedtls_x509_crt_init(&chain);
+	/* PEM input must include the terminating NUL, which vita_read_file adds */
+	ret = mbedtls_x509_crt_parse(&chain, (const unsigned char *)pem, len + 1);
+	for (c = &chain; c != NULL && c->version != 0; c = c->next) {
 		count++;
 	}
-	err = ERR_peek_last_error();
-	ERR_error_string_n(err, errbuf, sizeof(errbuf));
-	vita_log("selftest: OpenSSL %s parsed %d certificates from the bundle, last error %08lx %s",
-		 OpenSSL_version(OPENSSL_VERSION), count, err, errbuf);
-	ERR_clear_error();
-	BIO_free(bio);
-
-	log_openssl_store_selftest(pem, len);
+	if (ret < 0) {
+		mbedtls_strerror(ret, buf, sizeof(buf));
+		vita_log("selftest: mbedTLS %s failed to parse the CA bundle: -0x%04x %s",
+			 version, (unsigned int)-ret, buf);
+	} else {
+		vita_log("selftest: mbedTLS %s parsed %d certificates from the bundle (%d rejected)",
+			 version, count, ret);
+	}
+	if (count > 0) {
+		buf[0] = '\0';
+		mbedtls_x509_dn_gets(buf, sizeof(buf), &chain.subject);
+		vita_log("selftest: first certificate: %s", buf);
+	}
+	mbedtls_x509_crt_free(&chain);
 	free(pem);
 }
 
@@ -376,7 +298,7 @@ static void log_selftest(void)
 	}
 
 	log_iconv_selftest();
-	log_openssl_selftest();
+	log_tls_selftest();
 }
 
 int vita_platform_init(void)
