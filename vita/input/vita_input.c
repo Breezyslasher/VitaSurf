@@ -150,7 +150,7 @@ static const css_computed_style *box_style(struct box *b)
  * ancestor (collapsed navigation menus are the usual case). Focusing an
  * invisible link looks like the focus vanished.
  */
-static bool box_visible(struct box *b, int x, int y, int w, int h)
+static bool target_visible(struct box *b, int x, int y, int w, int h)
 {
 	const css_computed_style *style = box_style(b);
 	struct box *a;
@@ -198,7 +198,7 @@ static void add_target(struct box *b, const void *key, struct form_control *gadg
 	box_coords(b, &x, &y);
 	w = b->padding[LEFT] + b->width + b->padding[RIGHT];
 	h = b->padding[TOP] + b->height + b->padding[BOTTOM];
-	if (w <= 0 || h <= 0 || !box_visible(b, x, y, w, h)) {
+	if (w <= 0 || h <= 0 || !target_visible(b, x, y, w, h)) {
 		return;
 	}
 	t = &targets[ntargets++];
