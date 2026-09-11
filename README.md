@@ -93,6 +93,17 @@ and empty or negative sizes are rejected. The build job prints the
 function map and a disassembly around every offset listed in
 `scripts/crash-offsets.txt`, so a crash dump can be read from the CI log.
 
+Two rendering fixes came out of comparing the Wikipedia mobile page on
+the Vita with a phone. Patch 0016 also counts a flex item's fixed width
+in its container's minimum and maximum widths when flex-basis is auto;
+NetSurf ignored it, so buttons made of an icon span plus a label came
+out too narrow and the label was clipped. Patch 0018 fixes libsvgtiny's
+path parser: a relative `q` recorded its control point before adding the
+current position, a relative `t` offset an already absolute reflected
+control point, and `s` and arcs stored one coordinate in the wrong slot,
+so any SVG drawn with relative quadratic curves (the Wikipedia wordmark
+among them) drifted larger with each curve.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus

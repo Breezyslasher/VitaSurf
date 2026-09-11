@@ -1,0 +1,52 @@
+diff --git a/src/svgtiny_path.c b/src/svgtiny_path.c
+index e193d0c..8498efe 100644
+--- a/src/svgtiny_path.c
++++ b/src/svgtiny_path.c
+@@ -357,7 +357,7 @@ generate_path_scurveto(struct internal_path_state *state, int relative)
+ 		state->path.p[state->path.used++] =
+ 			state->cubic_x = state->cmd.p[cmdpc + 0];
+ 		state->path.p[state->path.used++] =
+-			state->cubic_x = state->cmd.p[cmdpc + 1];
++			state->cubic_y = state->cmd.p[cmdpc + 1];
+ 		state->path.p[state->path.used++] =
+ 			state->quad_x =
+ 			state->prev_x = state->cmd.p[cmdpc + 2];
+@@ -390,14 +390,16 @@ generate_path_bcurveto(struct internal_path_state *state, int relative)
+ 			return res;
+ 		}
+ 
+-		state->quad_x = state->cmd.p[cmdpc + 0] /* x1 */;
+-		state->quad_y = state->cmd.p[cmdpc + 1] /* y1 */;
+ 		if (relative != 0) {
+ 			state->cmd.p[cmdpc + 0] += state->prev_x; /* x1 */
+ 			state->cmd.p[cmdpc + 1] += state->prev_y; /* y1 */
+ 			state->cmd.p[cmdpc + 2] += state->prev_x; /* x */
+ 			state->cmd.p[cmdpc + 3] += state->prev_y; /* y */
+ 		}
++		/* The control point a following T reflects must be absolute
++		 * (VitaSurf: it was recorded before the relative offset). */
++		state->quad_x = state->cmd.p[cmdpc + 0] /* x1 */;
++		state->quad_y = state->cmd.p[cmdpc + 1] /* y1 */;
+ 
+ 		state->path.p[state->path.used++] = svgtiny_PATH_BEZIER;
+ 		state->path.p[state->path.used++] =
+@@ -453,8 +455,8 @@ generate_path_sbcurveto(struct internal_path_state *state, int relative)
+ 		state->quad_y = y1;
+ 
+ 		if (relative != 0) {
+-			x1 += state->prev_x;
+-			y1 += state->prev_y;
++			/* x1, y1 are already absolute: they are reflected from
++			 * the previous control point (VitaSurf fix) */
+ 			state->cmd.p[cmdpc + 0] += state->prev_x; /* x */
+ 			state->cmd.p[cmdpc + 1] += state->prev_y; /* y */
+ 		}
+@@ -986,7 +988,7 @@ generate_path_ellipticalarc(struct internal_path_state *state, int relative)
+ 				state->path.p[state->path.used++] = bzpoints[bzpnt+2];
+ 				state->path.p[state->path.used++] = bzpoints[bzpnt+3];
+ 				state->path.p[state->path.used++] =
+-					state->cubic_y =
++					state->cubic_x =
+ 					state->quad_x =
+ 					state->prev_x = bzpoints[bzpnt+4];
+ 				state->path.p[state->path.used++] =
