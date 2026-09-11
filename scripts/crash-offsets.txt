@@ -1,0 +1,4 @@
+# Text-segment offsets from crash dumps (VitaSurf@1 + offset), one per
+# line; the CI symbol map step prints the functions around each one.
+# Build 62: data abort after pressing reload on en.wikipedia.org.
+0x6d2ba

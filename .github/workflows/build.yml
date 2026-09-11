@@ -99,6 +99,18 @@ jobs:
           echo "::group::VitaSurf.syms.gz base64"
           gzip -9 -c build/VitaSurf.syms | base64 -w 76
           echo "::endgroup::"
+          # Resolve the offsets listed in scripts/crash-offsets.txt against
+          # the first PT_LOAD segment, printing the functions around each.
+          base=$(arm-vita-eabi-readelf -lW build/VitaSurf \
+            | awk '$1 == "LOAD" { print $3; exit }')
+          echo "text segment base $base"
+          grep -v '^#' scripts/crash-offsets.txt | grep . | while read -r off; do
+            addr=$(printf '%08x' $((base + off)))
+            echo "== offset $off = 0x$addr"
+            awk -v a="$addr" '$1 <= a' build/VitaSurf.syms | tail -12 | sed 's/^/  /'
+            echo "  -- $addr --"
+            awk -v a="$addr" '$1 > a' build/VitaSurf.syms | head -4 | sed 's/^/  /'
+          done
 
       - name: Upload VPK
         uses: actions/upload-artifact@v4
