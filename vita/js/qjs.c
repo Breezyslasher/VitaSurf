@@ -67,6 +67,18 @@ struct jsheap {
 
 struct js_listener;
 
+/*
+ * One JS object per DOM node, so that a node fetched twice compares equal
+ * and expando properties (el.style, el.dataset, handlers) survive. The
+ * cache holds a reference; wrappers are released when the thread dies.
+ */
+#define WRAPPER_BUCKETS 128
+struct js_wrapper {
+	struct dom_node *node;
+	JSValue obj;
+	struct js_wrapper *next;
+};
+
 struct jsthread {
 	jsheap *heap;
 	JSContext *ctx;
@@ -75,6 +87,7 @@ struct jsthread {
 	uint64_t deadline_ms;     /**< when the running script must stop */
 	struct js_listener *listeners; /**< event listeners, freed on close */
 	struct js_timer *timers;       /**< live timers, cancelled on close */
+	struct js_wrapper *wrappers[WRAPPER_BUCKETS];
 	bool closed;
 };
 
@@ -126,8 +139,61 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	return 0;
 }
 
-/** Log a pending exception and clear it. */
-static void qjs_report_exception(JSContext *ctx)
+/**
+ * Log the source around the position the stack trace names, so a log from
+ * hardware shows which call failed without the page source at hand.
+ */
+static void log_source_excerpt(const char *stack, const char *name,
+			       const char *src, size_t len)
+{
+	const char *p;
+	size_t nlen = strlen(name);
+	unsigned long line = 0, col = 0;
+	size_t i, line_start, pos, from, to;
+	char buf[160];
+	size_t n = 0;
+
+	/* first frame that names this script: "(name:line:col)" */
+	for (p = strstr(stack, name); p != NULL; p = strstr(p + 1, name)) {
+		if (p[nlen] == ':' &&
+		    sscanf(p + nlen, ":%lu:%lu", &line, &col) == 2) {
+			break;
+		}
+	}
+	if (p == NULL || line == 0) {
+		return;
+	}
+	line_start = 0;
+	for (i = 0; i < len && line > 1; i++) {
+		if (src[i] == '\n') {
+			line--;
+			line_start = i + 1;
+		}
+	}
+	if (line > 1) {
+		return;
+	}
+	pos = line_start + (col > 0 ? col - 1 : 0);
+	if (pos > len) pos = len;
+	from = pos > 90 ? pos - 90 : 0;
+	if (from < line_start) from = line_start;
+	to = pos + 30 < len ? pos + 30 : len;
+	for (i = from; i < to && n < sizeof(buf) - 1; i++) {
+		char c = src[i];
+		if (c == '\n') break;
+		buf[n++] = (c == '\t') ? ' ' : c;
+	}
+	buf[n] = 0;
+	vita_log("qjs:   source: %s", buf);
+	vita_log("qjs:   %*s^ column %lu", (int)(pos - from) + 8, "", col);
+}
+
+/**
+ * Log a pending exception and clear it. When the script source that ran
+ * is known (name, src, len), the offending source line is logged too.
+ */
+static void qjs_report_exception_src(JSContext *ctx, const char *name,
+				     const char *src, size_t len)
 {
 	JSValue exc = JS_GetException(ctx);
 	const char *msg = JS_ToCString(ctx, exc);
@@ -142,12 +208,20 @@ static void qjs_report_exception(JSContext *ctx)
 			const char *s = JS_ToCString(ctx, stack);
 			if (s != NULL) {
 				vita_log("qjs:   %s", s);
+				if (name != NULL && src != NULL) {
+					log_source_excerpt(s, name, src, len);
+				}
 				JS_FreeCString(ctx, s);
 			}
 		}
 		JS_FreeValue(ctx, stack);
 	}
 	JS_FreeValue(ctx, exc);
+}
+
+static void qjs_report_exception(JSContext *ctx)
+{
+	qjs_report_exception_src(ctx, NULL, NULL, 0);
 }
 
 /** A dom_string from a NUL-terminated C string, or NULL. */
@@ -175,10 +249,21 @@ static dom_string *to_dom_string(const char *s)
 
 static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 {
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct js_wrapper *w;
+	unsigned h;
 	JSValue obj;
 
 	if (node == NULL) {
 		return JS_NULL;
+	}
+	h = (unsigned)(((uintptr_t)node) >> 4) % WRAPPER_BUCKETS;
+	if (thread != NULL) {
+		for (w = thread->wrappers[h]; w != NULL; w = w->next) {
+			if (w->node == node) {
+				return JS_DupValue(ctx, w->obj);
+			}
+		}
 	}
 	obj = JS_NewObjectClass(ctx, node_class_id);
 	if (JS_IsException(obj)) {
@@ -186,7 +271,32 @@ static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 	}
 	dom_node_ref(node);
 	JS_SetOpaque(obj, node);
+	if (thread != NULL) {
+		w = malloc(sizeof(*w));
+		if (w != NULL) {
+			w->node = node;
+			w->obj = JS_DupValue(ctx, obj);
+			w->next = thread->wrappers[h];
+			thread->wrappers[h] = w;
+		}
+	}
 	return obj;
+}
+
+static void free_wrappers(jsthread *thread)
+{
+	unsigned h;
+
+	for (h = 0; h < WRAPPER_BUCKETS; h++) {
+		struct js_wrapper *w = thread->wrappers[h];
+		while (w != NULL) {
+			struct js_wrapper *next = w->next;
+			JS_FreeValue(thread->ctx, w->obj);
+			free(w);
+			w = next;
+		}
+		thread->wrappers[h] = NULL;
+	}
 }
 
 static void node_finalizer(JSRuntime *rt, JSValue val)
@@ -376,6 +486,55 @@ static JSValue node_get_next_sibling(JSContext *ctx, JSValueConst this_val)
 	return r;
 }
 
+static JSValue node_get_last_child(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *c = NULL;
+	JSValue r;
+
+	if (node == NULL) return JS_EXCEPTION;
+	dom_node_get_last_child(node, &c);
+	r = wrap_node(ctx, c);
+	if (c != NULL) dom_node_unref(c);
+	return r;
+}
+
+static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *c = NULL;
+	JSValue r;
+
+	if (node == NULL) return JS_EXCEPTION;
+	dom_node_get_previous_sibling(node, &c);
+	r = wrap_node(ctx, c);
+	if (c != NULL) dom_node_unref(c);
+	return r;
+}
+
+static JSValue nodelist_to_array(JSContext *ctx, struct dom_nodelist *list);
+
+static JSValue node_get_child_nodes(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_nodelist *list = NULL;
+
+	if (node == NULL) return JS_EXCEPTION;
+	dom_node_get_child_nodes(node, &list);
+	return nodelist_to_array(ctx, list);
+}
+
+static JSValue node_get_node_value(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	dom_string *s = NULL;
+
+	if (node == NULL) return JS_EXCEPTION;
+	dom_node_get_node_value(node, &s);
+	if (s == NULL) return JS_NULL;
+	return str_result(ctx, s);
+}
+
 /* --- node methods --- */
 
 static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
@@ -443,6 +602,102 @@ static JSValue node_has_attribute(JSContext *ctx, JSValueConst this_val,
 	}
 	if (name) JS_FreeCString(ctx, name);
 	return JS_NewBool(ctx, has);
+}
+
+static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	const char *name;
+	dom_string *key;
+
+	if (node == NULL || argc < 1) return JS_UNDEFINED;
+	name = JS_ToCString(ctx, argv[0]);
+	key = to_dom_string(name);
+	if (key != NULL) {
+		dom_element_remove_attribute(node, key);
+		dom_string_unref(key);
+	}
+	if (name) JS_FreeCString(ctx, name);
+	return JS_UNDEFINED;
+}
+
+static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *child, *before = NULL, *ref = NULL;
+
+	if (node == NULL || argc < 1) return JS_UNDEFINED;
+	child = JS_GetOpaque(argv[0], node_class_id);
+	if (child == NULL) return JS_UNDEFINED;
+	if (argc >= 2) {
+		before = JS_GetOpaque(argv[1], node_class_id);
+	}
+	if (before == NULL) {
+		if (dom_node_append_child(node, child, &ref) == DOM_NO_ERR &&
+		    ref != NULL) {
+			dom_node_unref(ref);
+		}
+	} else if (dom_node_insert_before(node, child, before, &ref) == DOM_NO_ERR &&
+		   ref != NULL) {
+		dom_node_unref(ref);
+	}
+	return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *child, *old, *ref = NULL;
+
+	if (node == NULL || argc < 2) return JS_UNDEFINED;
+	child = JS_GetOpaque(argv[0], node_class_id);
+	old = JS_GetOpaque(argv[1], node_class_id);
+	if (child == NULL || old == NULL) return JS_UNDEFINED;
+	if (dom_node_replace_child(node, child, old, &ref) == DOM_NO_ERR &&
+	    ref != NULL) {
+		dom_node_unref(ref);
+	}
+	return JS_DupValue(ctx, argv[1]);
+}
+
+static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *copy = NULL;
+	bool deep = false;
+	JSValue r;
+
+	if (node == NULL) return JS_NULL;
+	if (argc >= 1) deep = JS_ToBool(ctx, argv[0]) > 0;
+	if (dom_node_clone_node(node, deep, &copy) != DOM_NO_ERR || copy == NULL) {
+		return JS_NULL;
+	}
+	r = wrap_node(ctx, copy);
+	dom_node_unref(copy);
+	return r;
+}
+
+static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_val,
+					     int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	const char *name;
+	dom_string *key;
+	struct dom_nodelist *list = NULL;
+
+	if (node == NULL || argc < 1) return JS_NewArray(ctx);
+	name = JS_ToCString(ctx, argv[0]);
+	key = to_dom_string(name);
+	if (key != NULL) {
+		dom_element_get_elements_by_tag_name(node, key, &list);
+		dom_string_unref(key);
+	}
+	if (name) JS_FreeCString(ctx, name);
+	return nodelist_to_array(ctx, list);
 }
 
 static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
@@ -567,21 +822,28 @@ static JSValue node_get_inner_html(JSContext *ctx, JSValueConst this_val)
 
 static void listener_trampoline(struct dom_event *evt, void *pw);
 
-static JSValue node_add_event_listener(JSContext *ctx, JSValueConst this_val,
-				       int argc, JSValueConst *argv)
+static struct dom_document *thread_document(jsthread *thread)
 {
-	struct dom_node *node = this_node(ctx, this_val);
+	if (thread == NULL || thread->htmlc == NULL) {
+		return NULL;
+	}
+	return thread->htmlc->document;
+}
+
+/** Register func as a listener for event type on node. */
+static JSValue add_listener(JSContext *ctx, struct dom_node *node,
+			    JSValueConst type_v, JSValueConst func)
+{
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *type;
 	dom_string *type_dom;
 	struct js_listener *l;
 	struct dom_event_listener *dl = NULL;
 
-	if (node == NULL || thread == NULL || argc < 2 ||
-	    !JS_IsFunction(ctx, argv[1])) {
+	if (node == NULL || thread == NULL || !JS_IsFunction(ctx, func)) {
 		return JS_UNDEFINED;
 	}
-	type = JS_ToCString(ctx, argv[0]);
+	type = JS_ToCString(ctx, type_v);
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
 		if (type) JS_FreeCString(ctx, type);
@@ -604,13 +866,42 @@ static JSValue node_add_event_listener(JSContext *ctx, JSValueConst this_val,
 	l->node = node;
 	dom_node_ref(node);
 	l->dom_listener = dl;
-	l->func = JS_DupValue(ctx, argv[1]);
+	l->func = JS_DupValue(ctx, func);
 	l->next = thread->listeners;
 	thread->listeners = l;
 
 	dom_event_target_add_event_listener(node, type_dom, dl, false);
 	dom_string_unref(type_dom);
 	JS_FreeCString(ctx, type);
+	return JS_UNDEFINED;
+}
+
+static JSValue node_add_event_listener(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	if (argc < 2) return JS_UNDEFINED;
+	return add_listener(ctx, this_node(ctx, this_val), argv[0], argv[1]);
+}
+
+/*
+ * window and document listeners live on the document node: DOMContentLoaded
+ * is dispatched there by NetSurf and load bubbles up to it from the body.
+ */
+static JSValue doc_add_event_listener(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	(void)this_val;
+	if (argc < 2) return JS_UNDEFINED;
+	return add_listener(ctx, (struct dom_node *)thread_document(thread),
+			    argv[0], argv[1]);
+}
+
+static JSValue noop(JSContext *ctx, JSValueConst this_val,
+		    int argc, JSValueConst *argv)
+{
+	(void)ctx; (void)this_val; (void)argc; (void)argv;
 	return JS_UNDEFINED;
 }
 
@@ -627,24 +918,26 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CGETSET_DEF("parentNode", node_get_parent, NULL),
 	JS_CGETSET_DEF("firstChild", node_get_first_child, NULL),
 	JS_CGETSET_DEF("nextSibling", node_get_next_sibling, NULL),
+	JS_CGETSET_DEF("lastChild", node_get_last_child, NULL),
+	JS_CGETSET_DEF("previousSibling", node_get_previous_sibling, NULL),
+	JS_CGETSET_DEF("childNodes", node_get_child_nodes, NULL),
+	JS_CGETSET_DEF("nodeValue", node_get_node_value, NULL),
 	JS_CFUNC_DEF("getAttribute", 1, node_get_attribute),
 	JS_CFUNC_DEF("setAttribute", 2, node_set_attribute),
 	JS_CFUNC_DEF("hasAttribute", 1, node_has_attribute),
+	JS_CFUNC_DEF("removeAttribute", 1, node_remove_attribute),
 	JS_CFUNC_DEF("appendChild", 1, node_append_child),
 	JS_CFUNC_DEF("removeChild", 1, node_remove_child),
+	JS_CFUNC_DEF("insertBefore", 2, node_insert_before),
+	JS_CFUNC_DEF("replaceChild", 2, node_replace_child),
+	JS_CFUNC_DEF("cloneNode", 1, node_clone_node),
+	JS_CFUNC_DEF("getElementsByTagName", 1, node_get_elements_by_tag_name),
 	JS_CFUNC_DEF("addEventListener", 2, node_add_event_listener),
+	JS_CFUNC_DEF("removeEventListener", 2, noop),
 };
 
 /* ------------------------------------------------------------------------ */
 /* document                                                                 */
-
-static struct dom_document *thread_document(jsthread *thread)
-{
-	if (thread == NULL || thread->htmlc == NULL) {
-		return NULL;
-	}
-	return thread->htmlc->document;
-}
 
 static JSValue doc_get_element_by_id(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
@@ -767,6 +1060,22 @@ static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+static JSValue doc_create_document_fragment(JSContext *ctx, JSValueConst this_val,
+					    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_document *doc = thread_document(thread);
+	struct dom_document_fragment *frag = NULL;
+	JSValue r;
+
+	(void)this_val; (void)argc; (void)argv;
+	if (doc == NULL) return JS_NULL;
+	dom_document_create_document_fragment(doc, &frag);
+	r = wrap_node(ctx, (struct dom_node *)frag);
+	if (frag != NULL) dom_node_unref((struct dom_node *)frag);
+	return r;
+}
+
 static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
@@ -877,6 +1186,10 @@ static const JSCFunctionListEntry document_proto[] = {
 	JS_CFUNC_DEF("getElementsByTagName", 1, doc_get_elements_by_tag_name),
 	JS_CFUNC_DEF("createElement", 1, doc_create_element),
 	JS_CFUNC_DEF("createTextNode", 1, doc_create_text_node),
+	JS_CFUNC_DEF("createDocumentFragment", 0, doc_create_document_fragment),
+	JS_CFUNC_DEF("addEventListener", 2, doc_add_event_listener),
+	JS_CFUNC_DEF("removeEventListener", 2, noop),
+	JS_PROP_STRING_DEF("readyState", "interactive", 0),
 };
 
 /* ------------------------------------------------------------------------ */
@@ -1122,6 +1435,22 @@ static void timer_callback(void *p)
 /* ------------------------------------------------------------------------ */
 /* Event dispatch                                                           */
 
+static JSValue ev_prevent_default(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	(void)argc; (void)argv;
+	JS_SetPropertyStr(ctx, this_val, "defaultPrevented", JS_NewBool(ctx, true));
+	return JS_UNDEFINED;
+}
+
+static JSValue ev_stop_propagation(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	(void)argc; (void)argv;
+	JS_SetPropertyStr(ctx, this_val, "cancelBubble", JS_NewBool(ctx, true));
+	return JS_UNDEFINED;
+}
+
 static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 {
 	JSValue obj = JS_NewObject(ctx);
@@ -1134,12 +1463,27 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 					dom_string_byte_length(type)));
 		dom_string_unref(type);
 	}
-	if (dom_event_get_current_target(evt, &target) == DOM_NO_ERR &&
+	if (dom_event_get_target(evt, &target) == DOM_NO_ERR &&
 	    target != NULL) {
 		JS_SetPropertyStr(ctx, obj, "target",
 				  wrap_node(ctx, (struct dom_node *)target));
 		dom_node_unref((struct dom_node *)target);
 	}
+	target = NULL;
+	if (dom_event_get_current_target(evt, &target) == DOM_NO_ERR &&
+	    target != NULL) {
+		JS_SetPropertyStr(ctx, obj, "currentTarget",
+				  wrap_node(ctx, (struct dom_node *)target));
+		dom_node_unref((struct dom_node *)target);
+	}
+	JS_SetPropertyStr(ctx, obj, "defaultPrevented", JS_NewBool(ctx, false));
+	JS_SetPropertyStr(ctx, obj, "cancelBubble", JS_NewBool(ctx, false));
+	JS_SetPropertyStr(ctx, obj, "preventDefault",
+			  JS_NewCFunction(ctx, ev_prevent_default, "preventDefault", 0));
+	JS_SetPropertyStr(ctx, obj, "stopPropagation",
+			  JS_NewCFunction(ctx, ev_stop_propagation, "stopPropagation", 0));
+	JS_SetPropertyStr(ctx, obj, "stopImmediatePropagation",
+			  JS_NewCFunction(ctx, ev_stop_propagation, "stopImmediatePropagation", 0));
 	return obj;
 }
 
@@ -1155,7 +1499,8 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	}
 	ctx = thread->ctx;
 	begin_script(thread);
-	global = JS_GetGlobalObject(ctx);
+	/* this is the element the listener was added to */
+	global = wrap_node(ctx, l->node);
 	event_obj = wrap_event(ctx, evt);
 	args[0] = event_obj;
 	ret = JS_Call(ctx, l->func, global, 1, args);
@@ -1170,6 +1515,125 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 
 /* ------------------------------------------------------------------------ */
 /* Global object setup                                                      */
+
+static JSValue node_ctor(JSContext *ctx, JSValueConst new_target,
+			 int argc, JSValueConst *argv)
+{
+	(void)new_target; (void)argc; (void)argv;
+	return JS_ThrowTypeError(ctx, "Illegal constructor");
+}
+
+/*
+ * Bindings that are simplest to express in JS. They run once per page
+ * context; Node is the shared prototype of every wrapped DOM node.
+ */
+static const char prelude_js[] =
+"(function(){\n"
+"var P=Node.prototype;\n"
+"function priv(o,k,make){if(!Object.prototype.hasOwnProperty.call(o,k))"
+"Object.defineProperty(o,k,{value:make(),writable:true});return o[k];}\n"
+"Object.defineProperty(P,'style',{get:function(){return priv(this,'__style',function(){"
+"return {getPropertyValue:function(){return '';},setProperty:function(){},removeProperty:function(){},cssText:''};});}});\n"
+"Object.defineProperty(P,'dataset',{get:function(){return priv(this,'__dataset',function(){return {};});}});\n"
+"Object.defineProperty(P,'classList',{get:function(){var el=this;return {"
+"contains:function(c){return (' '+el.className+' ').indexOf(' '+c+' ')>=0;},"
+"add:function(){for(var i=0;i<arguments.length;i++){if(!this.contains(arguments[i]))el.className=(el.className?el.className+' ':'')+arguments[i];}},"
+"remove:function(){for(var i=0;i<arguments.length;i++){el.className=(' '+el.className+' ').split(' '+arguments[i]+' ').join(' ').trim();}},"
+"toggle:function(c,f){var h=this.contains(c);if(f===undefined)f=!h;if(f&&!h)this.add(c);else if(!f&&h)this.remove(c);return f;},"
+"get length(){return el.className?el.className.split(/\\s+/).length:0;}};}});\n"
+"Object.defineProperty(P,'children',{get:function(){return this.childNodes.filter(function(n){return n.nodeType===1;});}});\n"
+"Object.defineProperty(P,'firstElementChild',{get:function(){var c=this.children;return c.length?c[0]:null;}});\n"
+"Object.defineProperty(P,'lastElementChild',{get:function(){var c=this.children;return c.length?c[c.length-1]:null;}});\n"
+"Object.defineProperty(P,'parentElement',{get:function(){var p=this.parentNode;return p&&p.nodeType===1?p:null;}});\n"
+"Object.defineProperty(P,'innerText',{get:function(){return this.textContent;},set:function(v){this.textContent=v;}});\n"
+"Object.defineProperty(P,'outerHTML',{get:function(){return '';}});\n"
+"Object.defineProperty(P,'ownerDocument',{get:function(){return document;}});\n"
+"['href','src','value','type','name','title','alt','rel','target','action','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){"
+"var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){this.setAttribute(attr,String(v));}});});\n"
+"['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();"
+"Object.defineProperty(P,a,{get:function(){return this.hasAttribute(attr);},set:function(v){if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});\n"
+"['offsetWidth','offsetHeight','offsetTop','offsetLeft','clientWidth','clientHeight','clientTop','clientLeft','scrollWidth','scrollHeight'].forEach(function(a){"
+"Object.defineProperty(P,a,{get:function(){return 0;}});});\n"
+"P.scrollTop=0;P.scrollLeft=0;P.tabIndex=0;\n"
+"['onclick','onchange','onsubmit','oninput','onkeydown','onkeyup','onkeypress','onmousedown','onmouseup','onmouseover','onmouseout','onfocus','onblur','onload','onerror','ontouchstart','ontouchend'].forEach(function(h){"
+"Object.defineProperty(P,h,{get:function(){return this['__'+h]||null;},set:function(f){this['__'+h]=f;if(typeof f==='function')this.addEventListener(h.slice(2),function(e){return f.call(this,e);});}});});\n"
+"P.getBoundingClientRect=function(){return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};};\n"
+"P.getClientRects=function(){return [];};\n"
+"P.focus=P.blur=P.scrollIntoView=P.click=P.select=function(){};\n"
+"P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return false;};\n"
+"P.hasChildNodes=function(){return this.firstChild!==null;};\n"
+"P.remove=function(){var p=this.parentNode;if(p)p.removeChild(this);};\n"
+"P.getElementsByClassName=function(c){return this.querySelectorAll('.'+c);};\n"
+"function parseSimple(sel){var m=sel.match(/^([a-zA-Z][\\w-]*|\\*)?(#[\\w-]+)?((?:\\.[\\w-]+)*)(\\[[^\\]]*\\])?$/);if(!m)return null;"
+"return {tag:m[1]&&m[1]!=='*'?m[1].toUpperCase():null,id:m[2]?m[2].slice(1):null,classes:m[3]?m[3].split('.').slice(1):[],attr:m[4]?m[4].slice(1,-1).split('=')[0].replace(/\"/g,''):null};}\n"
+"function matchSimple(el,q){if(el.nodeType!==1)return false;if(q.tag&&el.tagName.toUpperCase()!==q.tag)return false;if(q.id&&el.id!==q.id)return false;"
+"for(var i=0;i<q.classes.length;i++)if(!el.classList.contains(q.classes[i]))return false;if(q.attr&&!el.hasAttribute(q.attr))return false;return true;}\n"
+"function matchesCompound(el,parts){var i=parts.length-1;if(!matchSimple(el,parts[i]))return false;var n=el.parentNode;i--;"
+"while(i>=0&&n&&n.nodeType===1){if(matchSimple(n,parts[i]))i--;n=n.parentNode;}return i<0;}\n"
+"function compile(selector){return selector.split(',').map(function(s){return s.trim().split(/\\s*>\\s*|\\s+/).map(parseSimple);}).filter(function(p){return p.every(function(x){return x;});});}\n"
+"function collect(root,groups,all,out){var c=root.firstChild;while(c){if(c.nodeType===1){for(var g=0;g<groups.length;g++){if(matchesCompound(c,groups[g])){out.push(c);break;}}"
+"if(!all&&out.length)return out;collect(c,groups,all,out);if(!all&&out.length)return out;}c=c.nextSibling;}return out;}\n"
+"P.querySelectorAll=function(sel){return collect(this,compile(String(sel)),true,[]);};\n"
+"P.querySelector=function(sel){var r=collect(this,compile(String(sel)),false,[]);return r.length?r[0]:null;};\n"
+"P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchesCompound(el,g);});};\n"
+"P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))return n;n=n.parentNode;}return null;};\n"
+"P.dispatchEvent=function(){return true;};\n"
+"var D=document;\n"
+"D.querySelectorAll=function(s){var r=D.documentElement;return r?r.querySelectorAll(s):[];};\n"
+"D.querySelector=function(s){var r=D.documentElement;return r?r.querySelector(s):null;};\n"
+"D.getElementsByClassName=function(c){return D.querySelectorAll('.'+c);};\n"
+"Object.defineProperty(D,'head',{get:function(){var h=D.getElementsByTagName('head');return h.length?h[0]:null;}});\n"
+"Object.defineProperty(D,'forms',{get:function(){return D.getElementsByTagName('form');}});\n"
+"Object.defineProperty(D,'images',{get:function(){return D.getElementsByTagName('img');}});\n"
+"Object.defineProperty(D,'links',{get:function(){return D.getElementsByTagName('a');}});\n"
+"Object.defineProperty(D,'scripts',{get:function(){return D.getElementsByTagName('script');}});\n"
+"D.defaultView=window;D.nodeType=9;D.nodeName='#document';D.documentMode=undefined;D.compatMode='CSS1Compat';D.hidden=false;D.visibilityState='visible';\n"
+"D.createEvent=function(){return new Event('');};D.dispatchEvent=function(){return true;};D.hasFocus=function(){return true;};\n"
+"D.createComment=function(t){return D.createTextNode('');};D.write=D.writeln=function(){};\n"
+"D.getElementsByName=function(n){return D.querySelectorAll('[name='+n+']').filter(function(e){return e.getAttribute('name')===n;});};\n"
+"D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};\n"
+"['onload','onreadystatechange','onclick','onkeydown','onkeyup','onmousemove','ontouchstart'].forEach(function(h){"
+"Object.defineProperty(D,h,{get:function(){return D['__'+h]||null;},set:function(f){D['__'+h]=f;if(typeof f==='function')D.addEventListener(h.slice(2),f);}});});\n"
+"var W=window;\n"
+"['onload','onerror','onresize','onscroll','onhashchange','onpopstate','onunload','onbeforeunload','onmessage','onpageshow','onclick','onkeydown','onkeyup','ontouchstart'].forEach(function(h){"
+"Object.defineProperty(W,h,{get:function(){return W['__'+h]||null;},set:function(f){W['__'+h]=f;if(typeof f==='function'&&h!=='onerror')W.addEventListener(h.slice(2),f);}});});\n"
+"W.dispatchEvent=function(){return true;};\n"
+"W.innerWidth=W.outerWidth=960;W.innerHeight=W.outerHeight=544;W.devicePixelRatio=1;W.scrollX=W.pageXOffset=0;W.scrollY=W.pageYOffset=0;\n"
+"W.screen={width:960,height:544,availWidth:960,availHeight:544,colorDepth:32,pixelDepth:32,orientation:{type:'landscape-primary'}};\n"
+"W.scrollTo=W.scrollBy=W.scroll=W.focus=W.blur=W.stop=W.print=W.close=function(){};W.open=function(){return null;};\n"
+"W.confirm=function(){return false;};W.prompt=function(){return null;};\n"
+"W.requestAnimationFrame=function(f){return setTimeout(function(){f(Date.now());},16);};W.cancelAnimationFrame=function(h){clearTimeout(h);};\n"
+"W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:false,timeRemaining:function(){return 10;}});},50);};W.cancelIdleCallback=function(h){clearTimeout(h);};\n"
+"W.getComputedStyle=function(el){return el&&el.style?el.style:{getPropertyValue:function(){return '';}};};\n"
+"W.matchMedia=function(q){return {matches:false,media:q,addListener:function(){},removeListener:function(){},addEventListener:function(){},removeEventListener:function(){}};};\n"
+"function Storage(){var d={};this.getItem=function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null;};this.setItem=function(k,v){d[k]=String(v);};"
+"this.removeItem=function(k){delete d[k];};this.clear=function(){d={};};this.key=function(i){return Object.keys(d)[i]||null;};Object.defineProperty(this,'length',{get:function(){return Object.keys(d).length;}});}\n"
+"W.localStorage=new Storage();W.sessionStorage=new Storage();\n"
+"W.history={length:1,state:null,pushState:function(){},replaceState:function(){},back:function(){},forward:function(){},go:function(){}};\n"
+"var t0=Date.now();var perf=W.performance||{};W.performance=perf;if(!perf.now)perf.now=function(){return Date.now()-t0;};"
+"perf.timing={navigationStart:t0,fetchStart:t0,domainLookupStart:t0,domainLookupEnd:t0,connectStart:t0,connectEnd:t0,requestStart:t0,responseStart:t0,responseEnd:t0,domLoading:t0,domInteractive:t0,domContentLoadedEventStart:t0,domContentLoadedEventEnd:t0,domComplete:t0,loadEventStart:t0,loadEventEnd:t0};"
+"perf.navigation={type:0,redirectCount:0};perf.mark=perf.measure=perf.clearMarks=perf.clearMeasures=function(){};perf.getEntries=perf.getEntriesByType=perf.getEntriesByName=function(){return [];};\n"
+"navigator.language='en-US';navigator.languages=['en-US','en'];navigator.cookieEnabled=true;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};\n"
+"location.reload=function(){location.href=location.href;};\n"
+"['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{get:function(){"
+"var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\\/\\/(([^\\/:?#]*)(?::(\\d+))?)([^?#]*)(\\?[^#]*)?(#.*)?/i)||[];"
+"return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:(m[1]||'')+'//'+(m[2]||'')}[k];}});});\n"
+"location.toString=function(){return location.href;};\n"
+"function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();}\n"
+"Event.prototype.preventDefault=function(){this.defaultPrevented=true;};Event.prototype.stopPropagation=Event.prototype.stopImmediatePropagation=function(){};"
+"Event.prototype.initEvent=function(t,b,c){this.type=t;this.bubbles=!!b;this.cancelable=!!c;};\n"
+"function CustomEvent(type,init){Event.call(this,type,init);this.detail=init?init.detail:null;}CustomEvent.prototype=Object.create(Event.prototype);\n"
+"W.Event=Event;W.CustomEvent=CustomEvent;W.UIEvent=W.MouseEvent=W.KeyboardEvent=W.FocusEvent=Event;\n"
+"W.HTMLDocument=W.Document=function(){};W.Document.prototype=Object.getPrototypeOf(D);\n"
+"W.NodeList=W.HTMLCollection=Array;W.Text=W.Comment=W.DocumentFragment=W.HTMLAnchorElement=W.HTMLDivElement=W.HTMLInputElement=W.HTMLScriptElement=W.HTMLImageElement=W.HTMLFormElement=W.HTMLBodyElement=W.HTMLTemplateElement=W.HTMLStyleElement=W.HTMLLinkElement=W.HTMLIFrameElement=W.SVGElement=Element;\n"
+"W.MutationObserver=function(){};W.MutationObserver.prototype.observe=W.MutationObserver.prototype.disconnect=function(){};W.MutationObserver.prototype.takeRecords=function(){return [];};\n"
+"W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};"
+"W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;\n"
+"W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};\n"
+"W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};\n"
+"function Image(){return document.createElement('img');}W.Image=Image;\n"
+"function Option(t,v){var o=document.createElement('option');if(t!==undefined)o.textContent=t;if(v!==undefined)o.setAttribute('value',v);return o;}W.Option=Option;\n"
+"})();\n";
 
 static void install_object(JSContext *ctx, JSValue parent, const char *name,
 			   const JSCFunctionListEntry *tab, size_t n)
@@ -1240,17 +1704,31 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_clear_timer, "clearInterval", 1));
 	JS_SetPropertyStr(ctx, global, "alert",
 			  JS_NewCFunction(ctx, console_log, "alert", 1));
+
+	/* window listeners live on the document node (see add_listener) */
+	JS_SetPropertyStr(ctx, global, "addEventListener",
+			  JS_NewCFunction(ctx, doc_add_event_listener, "addEventListener", 2));
+	JS_SetPropertyStr(ctx, global, "removeEventListener",
+			  JS_NewCFunction(ctx, noop, "removeEventListener", 2));
+
+	/* Node, Element and HTMLElement all share the node prototype */
+	{
+		JSValue ctor = JS_NewCFunction2(ctx, node_ctor, "Node", 0,
+						JS_CFUNC_constructor, 0);
+		JS_SetConstructor(ctx, ctor, node_proto_obj);
+		JS_SetPropertyStr(ctx, global, "Node", JS_DupValue(ctx, ctor));
+		JS_SetPropertyStr(ctx, global, "Element", JS_DupValue(ctx, ctor));
+		JS_SetPropertyStr(ctx, global, "HTMLElement", JS_DupValue(ctx, ctor));
+		JS_SetPropertyStr(ctx, global, "EventTarget", ctor);
+	}
 	JS_FreeValue(ctx, global);
 
-	/* small shims that are simplest to express in JS */
 	{
-		static const char prelude[] =
-			"function Image(){return document.createElement('img');}\n"
-			"function Option(){return document.createElement('option');}\n";
-		JSValue r = JS_Eval(ctx, prelude, sizeof(prelude) - 1,
+		JSValue r = JS_Eval(ctx, prelude_js, sizeof(prelude_js) - 1,
 				    "<prelude>", JS_EVAL_TYPE_GLOBAL);
 		if (JS_IsException(r)) {
-			qjs_report_exception(ctx);
+			qjs_report_exception_src(ctx, "<prelude>", prelude_js,
+						 sizeof(prelude_js) - 1);
 		}
 		JS_FreeValue(ctx, r);
 	}
@@ -1291,7 +1769,7 @@ nserror js_newheap(int timeout, jsheap **heap)
 	}
 	ret->timeout = timeout;
 	/* keep a page's scripts within a sensible slice of the heap */
-	JS_SetMemoryLimit(ret->rt, 48 * 1024 * 1024);
+	JS_SetMemoryLimit(ret->rt, 32 * 1024 * 1024);
 	JS_SetMaxStackSize(ret->rt, 512 * 1024);
 	/* register the shared node class once per runtime */
 	JS_NewClassID(ret->rt, &node_class_id);
@@ -1384,6 +1862,7 @@ void js_destroythread(jsthread *thread)
 		free(t);
 		t = next;
 	}
+	free_wrappers(thread);
 	JS_FreeContext(thread->ctx);
 	thread->heap->live_threads--;
 	if (thread->heap->pending_destroy && thread->heap->live_threads == 0) {
@@ -1398,19 +1877,35 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 {
 	JSValue ret;
 	bool ok;
+	char *src;
 
 	if (thread == NULL || thread->closed || txt == NULL || txtlen == 0) {
 		return false;
 	}
+	/*
+	 * QuickJS requires the source to be NUL terminated (the lexer uses
+	 * the terminator as its end sentinel). NetSurf hands over fetched
+	 * script data as a plain buffer, and parsing past its end produced
+	 * random syntax errors that changed from one load to the next.
+	 */
+	src = malloc(txtlen + 1);
+	if (src == NULL) {
+		return false;
+	}
+	memcpy(src, txt, txtlen);
+	src[txtlen] = 0;
+	if (name == NULL) {
+		name = "<script>";
+	}
 	begin_script(thread);
-	ret = JS_Eval(thread->ctx, (const char *)txt, txtlen,
-		      name != NULL ? name : "<script>", JS_EVAL_TYPE_GLOBAL);
+	ret = JS_Eval(thread->ctx, src, txtlen, name, JS_EVAL_TYPE_GLOBAL);
 	ok = !JS_IsException(ret);
 	if (!ok) {
-		qjs_report_exception(thread->ctx);
+		qjs_report_exception_src(thread->ctx, name, src, txtlen);
 	}
 	JS_FreeValue(thread->ctx, ret);
 	end_script(thread);
+	free(src);
 	return ok;
 }
 
@@ -1439,11 +1934,17 @@ bool js_fire_event(jsthread *thread, const char *type,
 	if (target != NULL) {
 		dom_event_target_dispatch_event(target, evt, &success);
 	} else if (doc != NULL) {
-		/* window-targetted events (load) go to the body element */
+		/*
+		 * Window-targetted events (load) go to the body element and
+		 * bubble up to the document node, where window and document
+		 * listeners are registered.
+		 */
 		dom_html_document_get_body(doc, &body);
 		if (body != NULL) {
 			dom_event_target_dispatch_event(body, evt, &success);
 			dom_node_unref((struct dom_node *)body);
+		} else {
+			dom_event_target_dispatch_event(doc, evt, &success);
 		}
 	}
 	dom_event_unref(evt);
@@ -1470,11 +1971,74 @@ bool js_dom_event_add_listener(jsthread *thread,
 	return false;
 }
 
+/*
+ * Register inline handlers (onclick="..." and the like) on a freshly
+ * inserted element: each on* attribute becomes a function taking `event`
+ * and is added as a listener for the event named after the attribute.
+ */
 void js_handle_new_element(jsthread *thread, struct dom_element *node)
 {
-	/* Inline on* attribute handlers are not supported by this engine. */
-	(void)thread;
-	(void)node;
+	struct dom_namednodemap *attrs = NULL;
+	uint32_t n = 0, i;
+	bool has = false;
+	JSContext *ctx;
+
+	if (thread == NULL || thread->closed || node == NULL) {
+		return;
+	}
+	/* called for every inserted element, so leave quickly when nothing to do */
+	if (dom_node_has_attributes(node, &has) != DOM_NO_ERR || !has) {
+		return;
+	}
+	if (dom_node_get_attributes(node, &attrs) != DOM_NO_ERR || attrs == NULL) {
+		return;
+	}
+	ctx = thread->ctx;
+	dom_namednodemap_get_length(attrs, &n);
+	for (i = 0; i < n; i++) {
+		struct dom_node *attr = NULL;
+		dom_string *name = NULL, *value = NULL;
+		const char *aname;
+
+		if (dom_namednodemap_item(attrs, i, &attr) != DOM_NO_ERR ||
+		    attr == NULL) {
+			continue;
+		}
+		dom_attr_get_name(attr, &name);
+		aname = name != NULL ? dom_string_data(name) : NULL;
+		if (aname != NULL && aname[0] == 'o' && aname[1] == 'n' &&
+		    aname[2] != 0) {
+			dom_attr_get_value(attr, &value);
+			if (value != NULL) {
+				size_t vlen = dom_string_byte_length(value);
+				size_t blen = vlen + 48;
+				char *body = malloc(blen);
+				if (body != NULL) {
+					JSValue fn;
+					int len = snprintf(body, blen,
+						"(function(event){%.*s\n})",
+						(int)vlen, dom_string_data(value));
+					fn = JS_Eval(ctx, body, (size_t)len,
+						     "<inline handler>",
+						     JS_EVAL_TYPE_GLOBAL);
+					if (JS_IsException(fn)) {
+						qjs_report_exception(ctx);
+					} else {
+						JSValue type = JS_NewString(ctx, aname + 2);
+						add_listener(ctx, (struct dom_node *)node,
+							     type, fn);
+						JS_FreeValue(ctx, type);
+					}
+					JS_FreeValue(ctx, fn);
+					free(body);
+				}
+				dom_string_unref(value);
+			}
+		}
+		if (name != NULL) dom_string_unref(name);
+		dom_node_unref(attr);
+	}
+	dom_namednodemap_unref(attrs);
 }
 
 void js_event_cleanup(jsthread *thread, struct dom_event *evt)
