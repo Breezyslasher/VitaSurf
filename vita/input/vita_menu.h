@@ -26,6 +26,13 @@ void vita_menu_close(void);
 bool vita_menu_is_open(void);
 
 /**
+ * Redraw the menu. The page underneath repaints on its own schedule and
+ * fbtk does not repaint overlapping siblings, so the input timer calls
+ * this while the menu is open.
+ */
+void vita_menu_refresh(void);
+
+/**
  * Handle a button while the menu is open: D-pad moves the selection,
  * Cross activates it, Circle and Start close the menu. Returns true if
  * the key was consumed.

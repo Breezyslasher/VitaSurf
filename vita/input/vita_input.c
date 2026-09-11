@@ -803,6 +803,23 @@ static void tick(void *p)
 
 	vita_surface_read_input(&st);
 
+	/*
+	 * While the menu is open the page must not move under it: scrolling
+	 * pans the page with a screen copy that would carry the menu away,
+	 * and fbtk never repaints a window over a sibling that redrew.
+	 */
+	if (vita_menu_is_open()) {
+		static uint64_t last_menu_redraw_us;
+		uint64_t now = sceKernelGetProcessTimeWide();
+
+		if (now - last_menu_redraw_us > 100000) {
+			last_menu_redraw_us = now;
+			vita_menu_refresh();
+		}
+		st.lx = st.ly = 0;
+		st.drag_dx = st.drag_dy = 0;
+	}
+
 	/* stick: quadratic response so small deflections crawl */
 	if (st.lx != 0) {
 		dx += st.lx * abs(st.lx) * SCROLL_MAX / (127 * 127);

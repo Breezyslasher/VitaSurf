@@ -575,6 +575,13 @@ bool vita_menu_is_open(void)
 	return menu != NULL;
 }
 
+void vita_menu_refresh(void)
+{
+	if (menu != NULL) {
+		fbtk_request_redraw(menu);
+	}
+}
+
 void vita_menu_close(void)
 {
 	if (menu != NULL) {
