@@ -66,6 +66,25 @@ time. Variables declared on other selectors are not tracked, and a
 declaration whose variable cannot be resolved is dropped, as the
 specification requires.
 
+CSS Grid is supported through patches 0015 (libcss: the grid properties)
+and 0016 (NetSurf: `layout_grid.c`). A grid container is a flex box
+carrying a grid flag, so every place NetSurf already handles flex
+containers handles grids too, and `layout_flex` hands the box over to the
+grid code. Supported: `grid-template-columns` and `-rows` with lengths,
+percentages, `fr`, `auto`, `min-content`, `max-content`, `minmax()`,
+`fit-content()` and `repeat()` including `auto-fill` and `auto-fit`,
+`grid-auto-columns`, `grid-auto-rows`, `grid-auto-flow` (row, column,
+dense), placement by line number and span (`grid-column`, `grid-row`,
+`grid-area`), `gap`, `row-gap`, `column-gap`, `align-items`, `align-self`,
+`justify-content` and `align-content`, and `inline-grid`. Named lines and
+areas, `justify-items`, `justify-self`, subgrid and baseline alignment are
+not supported. Every child element of a grid container becomes an item of
+its own (inline children are blockified), and margins no longer collapse
+through flex or grid containers, which fixed a NetSurf bug that shifted a
+whole page when a flex container was followed by a block with a top
+margin. Verified natively with NetSurf's monkey frontend on a set of test
+pages; not yet checked on hardware.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
