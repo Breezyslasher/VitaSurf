@@ -48,8 +48,6 @@ extern fbtk_widget_t *fbtk;
 #define COLOUR_BG        0xFF303030
 #define COLOUR_ROW       0xFFF0F0F0
 #define COLOUR_ROW_TEXT  0xFF202020
-#define COLOUR_SEL       0xFFFF862E
-#define COLOUR_SEL_TEXT  0xFFFFFFFF
 #define COLOUR_HEAD_TEXT 0xFFFFFFFF
 
 #define MAX_BOOKMARKS    200
@@ -83,6 +81,8 @@ static int nbookmarks;
 static bool bookmarks_loaded;
 
 static uint64_t last_autosave_us;
+
+static void update_labels(void);
 
 /* ------------------------------------------------------------------------ */
 /* Bookmarks file                                                           */
@@ -443,8 +443,7 @@ static void activate(enum item item)
 		nsoption_set_bool(enable_javascript,
 				  !nsoption_bool(enable_javascript));
 		save_choices();
-		vita_menu_close();
-		vita_menu_toggle();
+		update_labels();
 		break;
 	case ITEM_IMAGES:
 		nsoption_set_bool(foreground_images,
@@ -452,8 +451,7 @@ static void activate(enum item item)
 		nsoption_set_bool(background_images,
 				  nsoption_bool(foreground_images));
 		save_choices();
-		vita_menu_close();
-		vita_menu_toggle();
+		update_labels();
 		break;
 	case ITEM_QUIT:
 		vita_menu_close();
@@ -469,6 +467,14 @@ static void activate(enum item item)
 
 /* ------------------------------------------------------------------------ */
 /* Widgets                                                                  */
+
+/*
+ * The widgets are created once and only ever mapped and unmapped, like
+ * NetSurf's on-screen keyboard. fbtk remembers the widget under the
+ * pointer and the one with input focus, so destroying widgets while they
+ * may still be referenced crashes on the next pointer move.
+ */
+static fbtk_widget_t *rows[ITEM_COUNT];
 
 static int row_click(fbtk_widget_t *widget, fbtk_callback_info *cbi)
 {
@@ -523,7 +529,21 @@ static void item_label(enum item item, char *buf, size_t len)
 	}
 }
 
-static void build(void)
+/** Refresh every row's text; the selected row carries a marker. */
+static void update_labels(void)
+{
+	int i;
+	char label[96];
+	char text[104];
+
+	for (i = 0; i < ITEM_COUNT; i++) {
+		item_label((enum item)i, label, sizeof(label));
+		snprintf(text, sizeof(text), "%s %s", (i == selected) ? ">" : " ", label);
+		fbtk_set_text(rows[i], text);
+	}
+}
+
+static bool build(void)
 {
 	int rw = fbtk_get_width(fbtk);
 	int rh = fbtk_get_height(fbtk);
@@ -532,16 +552,14 @@ static void build(void)
 	int y = (rh - height) / 2;
 	fbtk_widget_t *w;
 	int i;
-	char label[96];
 
 	if (menu != NULL) {
-		fbtk_destroy_widget(menu);
-		menu = NULL;
+		return true;
 	}
 
 	menu = fbtk_create_window(fbtk, x, y, MENU_WIDTH, height, COLOUR_BG);
 	if (menu == NULL) {
-		return;
+		return false;
 	}
 
 	w = fbtk_create_text(menu, MENU_PAD, MENU_PAD, MENU_WIDTH - 2 * MENU_PAD,
@@ -550,60 +568,64 @@ static void build(void)
 	fbtk_set_text(w, "VitaSurf   (D-pad, Cross, Circle closes)");
 
 	for (i = 0; i < ITEM_COUNT; i++) {
-		bool sel = (i == selected);
-
-		w = fbtk_create_text_button(menu, MENU_PAD,
-					    MENU_HEADER + i * MENU_ROW_HEIGHT,
-					    MENU_WIDTH - 2 * MENU_PAD,
-					    MENU_ROW_HEIGHT - 4,
-					    sel ? COLOUR_SEL : COLOUR_ROW,
-					    sel ? COLOUR_SEL_TEXT : COLOUR_ROW_TEXT,
-					    row_click, (void *)(intptr_t)i);
-		item_label((enum item)i, label, sizeof(label));
-		fbtk_set_text(w, label);
+		rows[i] = fbtk_create_text_button(menu, MENU_PAD,
+						  MENU_HEADER + i * MENU_ROW_HEIGHT,
+						  MENU_WIDTH - 2 * MENU_PAD,
+						  MENU_ROW_HEIGHT - 4,
+						  COLOUR_ROW, COLOUR_ROW_TEXT,
+						  row_click, (void *)(intptr_t)i);
 	}
 
 	fbtk_set_zorder(menu, INT_MIN);
-	fbtk_set_mapping(menu, true);
+	fbtk_set_mapping(menu, false);
+	return true;
 }
 
 /* ------------------------------------------------------------------------ */
 /* Entry points                                                             */
 
+static bool menu_open;
+
 bool vita_menu_is_open(void)
 {
-	return menu != NULL;
+	return menu_open;
 }
 
 void vita_menu_refresh(void)
 {
-	if (menu != NULL) {
+	if (menu_open && menu != NULL) {
 		fbtk_request_redraw(menu);
 	}
 }
 
 void vita_menu_close(void)
 {
-	if (menu != NULL) {
-		fbtk_destroy_widget(menu);
-		menu = NULL;
+	if (menu_open) {
+		menu_open = false;
+		fbtk_set_mapping(menu, false);
 		fbtk_request_redraw(fbtk);
 	}
 }
 
 void vita_menu_toggle(void)
 {
-	if (menu != NULL) {
+	if (menu_open) {
 		vita_menu_close();
 		return;
 	}
+	if (!build()) {
+		return;
+	}
 	selected = 0;
-	build();
+	update_labels();
+	menu_open = true;
+	fbtk_set_zorder(menu, INT_MIN);
+	fbtk_set_mapping(menu, true);
 }
 
 bool vita_menu_key(enum nsfb_key_code_e key, bool down)
 {
-	if (menu == NULL) {
+	if (!menu_open) {
 		return false;
 	}
 	if (!down) {
@@ -612,11 +634,11 @@ bool vita_menu_key(enum nsfb_key_code_e key, bool down)
 	switch (key) {
 	case VITA_KEY_UP:
 		selected = (selected + ITEM_COUNT - 1) % ITEM_COUNT;
-		build();
+		update_labels();
 		return true;
 	case VITA_KEY_DOWN:
 		selected = (selected + 1) % ITEM_COUNT;
-		build();
+		update_labels();
 		return true;
 	case VITA_KEY_CROSS:
 		activate((enum item)selected);
