@@ -25,6 +25,11 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+
 #include "vita_platform.h"
 
 /* Where vita_log() writes. stderr once it is redirected, else a plain file. */
@@ -185,6 +190,54 @@ static void log_iconv_selftest(void)
 }
 
 /**
+ * Parse the bundled CA file through OpenSSL the way libcurl does and log
+ * what happens, so a TLS failure can be traced to OpenSSL itself.
+ */
+static void log_openssl_selftest(void)
+{
+	char *pem = NULL;
+	size_t len = 0;
+	BIO *bio;
+	X509 *cert;
+	int count = 0;
+	unsigned long err;
+	char errbuf[256];
+
+	if (vita_read_file(VITASURF_CA_BUNDLE, &pem, &len) != 0) {
+		vita_log("selftest: cannot read %s", VITASURF_CA_BUNDLE);
+		return;
+	}
+
+	bio = BIO_new_mem_buf(pem, (int)len);
+	if (bio == NULL) {
+		vita_log("selftest: BIO_new_mem_buf failed");
+		free(pem);
+		return;
+	}
+
+	ERR_clear_error();
+	while ((cert = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+		if (count == 0) {
+			char name[128];
+
+			name[0] = '\0';
+			X509_NAME_oneline(X509_get_subject_name(cert), name,
+					  sizeof(name));
+			vita_log("selftest: first certificate: %s", name);
+		}
+		X509_free(cert);
+		count++;
+	}
+	err = ERR_peek_last_error();
+	ERR_error_string_n(err, errbuf, sizeof(errbuf));
+	vita_log("selftest: OpenSSL %s parsed %d certificates from the bundle, last error %08lx %s",
+		 OpenSSL_version(OPENSSL_VERSION), count, err, errbuf);
+	ERR_clear_error();
+	BIO_free(bio);
+	free(pem);
+}
+
+/**
  * Log whether the assumptions the NetSurf build relies on hold: drive-less
  * paths resolve to app0:, the resources are readable, and the clocks the
  * scheduler and libnsutils use advance.
@@ -250,6 +303,7 @@ static void log_selftest(void)
 	}
 
 	log_iconv_selftest();
+	log_openssl_selftest();
 }
 
 int vita_platform_init(void)
