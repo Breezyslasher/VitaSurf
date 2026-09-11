@@ -53,6 +53,11 @@ handed to scripts when the server allows the page's origin, redirects
 are followed up to five times and bodies are capped at 8 MB. The
 JavaScript half of the bindings now lives in `vita/js/prelude.js`, which
 CMake embeds at configure time and which can be tested under node.
+CSS `mask-image` (and `-webkit-mask-image`) is supported through patches
+0012 (libcss: the property) and 0013 (NetSurf: a masked box paints its
+background colour through the image, SVG or bitmap, fitted and centred in
+its padding box), which is how Wikipedia's mobile skin and other Codex
+based sites draw their icons.
 
 ## Building
 
