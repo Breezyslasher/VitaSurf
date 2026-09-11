@@ -1,0 +1,13 @@
+diff --git a/utils/config.h b/utils/config.h
+index 3914771fd..e3f680477 100644
+--- a/utils/config.h
++++ b/utils/config.h
+@@ -145,7 +145,7 @@ char *realpath(const char *path, char *resolved_path);
+ #endif
+ 
+ #define HAVE_MMAP
+-#if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__))
++#if (defined(_WIN32) || defined(__riscos__) || defined(__HAIKU__) || defined(__BEOS__) || defined(__amigaos4__) || defined(__AMIGA__) || defined(__MINT__) || defined(__vita__))
+ #undef HAVE_MMAP
+ #endif
+ 
