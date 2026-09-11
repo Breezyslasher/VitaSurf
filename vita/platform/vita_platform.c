@@ -6,6 +6,7 @@
  */
 
 #include <psp2/apputil.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
@@ -65,11 +66,50 @@ void vita_log_memory(const char *what)
 
 int vita_verbose_requested(void)
 {
+	static const char *const names[] = {
+		VITASURF_VERBOSE_FLAG,
+		VITASURF_VERBOSE_FLAG ".txt",
+	};
 	SceIoStat st;
+	unsigned int i;
 
-	/* VitaShell tends to append .txt when creating a file, accept both. */
-	return sceIoGetstat(VITASURF_VERBOSE_FLAG, &st) >= 0 ||
-	       sceIoGetstat(VITASURF_VERBOSE_FLAG ".txt", &st) >= 0;
+	/* Accept either name, through the SCE call or the C library. */
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		FILE *f;
+
+		if (sceIoGetstat(names[i], &st) >= 0) {
+			return 1;
+		}
+		f = fopen(names[i], "r");
+		if (f != NULL) {
+			fclose(f);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/** Log the contents of the data directory so flag files can be checked. */
+static void log_data_dir(void)
+{
+	SceUID dfd = sceIoDopen(VITASURF_DATA_DIR);
+	SceIoDirent ent;
+	int count = 0;
+
+	if (dfd < 0) {
+		vita_log("sceIoDopen(%s) failed: 0x%08x", VITASURF_DATA_DIR,
+			 (unsigned int)dfd);
+		return;
+	}
+	memset(&ent, 0, sizeof(ent));
+	while (sceIoDread(dfd, &ent) > 0 && count < 32) {
+		vita_log("data dir: '%s' %s %u bytes", ent.d_name,
+			 SCE_S_ISDIR(ent.d_stat.st_mode) ? "dir" : "file",
+			 (unsigned int)ent.d_stat.st_size);
+		memset(&ent, 0, sizeof(ent));
+		count++;
+	}
+	sceIoDclose(dfd);
 }
 
 /**
@@ -198,6 +238,7 @@ int vita_platform_init(void)
 	scePowerSetGpuXbarClockFrequency(166);
 
 	log_selftest();
+	log_data_dir();
 	vita_log("verbose flag file %s: %s", VITASURF_VERBOSE_FLAG,
 		 vita_verbose_requested() ? "present" : "absent");
 	vita_log_memory("startup");
