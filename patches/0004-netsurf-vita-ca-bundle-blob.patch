@@ -1,0 +1,52 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 4b03b8118..970a11e50 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -61,6 +61,10 @@
+ #include "content/fetchers/curl.h"
+ #include "content/urldb.h"
+ 
++#ifdef __vita__
++#include "vita_platform.h"
++#endif
++
+ /**
+  * maximum number of progress notifications per second
+  */
+@@ -2072,7 +2076,36 @@ nserror fetch_curl_register(void)
+ 	    strcmp(nsoption_charp(ca_bundle), "")) {
+ 		NSLOG(netsurf, INFO, "ca_bundle: '%s'",
+ 		      nsoption_charp(ca_bundle));
++#ifdef __vita__
++		/* VitaSurf: hand the bundle to curl from memory so OpenSSL
++		 * never has to open the file itself. */
++		{
++			struct curl_blob blob;
++			size_t len;
++
++			if (vita_read_file(nsoption_charp(ca_bundle),
++					   (char **)&blob.data, &len) == 0) {
++				blob.len = len;
++				blob.flags = CURL_BLOB_COPY;
++				code = curl_easy_setopt(fetch_blank_curl,
++							CURLOPT_CAINFO_BLOB,
++							&blob);
++				free(blob.data);
++				if (code != CURLE_OK) {
++					NSLOG(netsurf, ERROR,
++					      "attempting curl_easy_setopt(CURLOPT_CAINFO_BLOB, ...)");
++					goto curl_easy_setopt_failed;
++				}
++				NSLOG(netsurf, INFO, "ca_bundle: %u bytes loaded",
++				      (unsigned int)len);
++			} else {
++				NSLOG(netsurf, ERROR, "ca_bundle: cannot read '%s'",
++				      nsoption_charp(ca_bundle));
++			}
++		}
++#else
+ 		SETOPT(CURLOPT_CAINFO, nsoption_charp(ca_bundle));
++#endif
+ 	}
+ 	if (nsoption_charp(ca_path) && strcmp(nsoption_charp(ca_path), "")) {
+ 		NSLOG(netsurf, INFO, "ca_path: '%s'", nsoption_charp(ca_path));

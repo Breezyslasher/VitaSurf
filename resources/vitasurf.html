@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VitaSurf</title>
+<style>
+body { font-family: sans-serif; margin: 24px; color: #222; background: #f4f4f4; }
+h1 { font-size: 28px; margin: 0 0 8px 0; }
+h2 { font-size: 20px; margin: 18px 0 6px 0; }
+p, li { font-size: 16px; line-height: 1.4; }
+table { border-collapse: collapse; margin-top: 12px; }
+td, th { border: 1px solid #999; padding: 4px 10px; text-align: left; font-size: 15px; }
+th { background: #ddd; }
+.note { color: #555; font-size: 14px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<h1>VitaSurf</h1>
+<p>NetSurf running on the PlayStation Vita. This page is loaded from the
+application's read-only storage, which means the framebuffer frontend,
+the file fetcher, CSS and layout all work.</p>
+
+<table>
+<tr><th>Input</th><th>Action</th></tr>
+<tr><td>D-pad</td><td>Scroll</td></tr>
+<tr><td>Left stick</td><td>Scroll</td></tr>
+<tr><td>L / R</td><td>Page up / page down</td></tr>
+<tr><td>Front touch</td><td>Tap and drag with the pointer</td></tr>
+<tr><td>Select + Start</td><td>Quit</td></tr>
+</table>
+
+<p><a href="about:welcome">NetSurf welcome page</a> |
+<a href="about:about">About NetSurf</a> |
+<a href="about:config">Configuration</a></p>
+
+<h2>Network test pages</h2>
+<ul>
+<li><a href="http://neverssl.com/">neverssl.com</a> (plain HTTP)</li>
+<li><a href="http://example.com/">example.com over HTTP</a> (plain HTTP, tiny page)</li>
+<li><a href="https://example.com/">example.com</a> (HTTPS, tiny page)</li>
+<li><a href="https://text.npr.org/">text.npr.org</a> (HTTPS, text news)</li>
+<li><a href="https://en.m.wikipedia.org/wiki/PlayStation_Vita">Wikipedia: PlayStation Vita</a> (HTTPS, images and tables)</li>
+<li><a href="https://lite.duckduckgo.com/lite/">DuckDuckGo Lite</a> (HTTPS, a form)</li>
+</ul>
+
+<p class="note">The log is written to ux0:data/VitaSurf/log.txt. Create an
+empty file named verbose in that folder for a detailed log.</p>
+</body>
+</html>

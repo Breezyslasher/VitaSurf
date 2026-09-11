@@ -1,0 +1,36 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 5bfc8227b..70fc517ce 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -51,6 +51,10 @@
+ #include "framebuffer/findfile.h"
+ #include "framebuffer/image_data.h"
+ #include "framebuffer/font.h"
++
++#ifdef __vita__
++#include "vita_platform.h"
++#endif
+ #include "framebuffer/clipboard.h"
+ #include "framebuffer/fetch.h"
+ #include "framebuffer/bitmap.h"
+@@ -2068,6 +2072,10 @@ gui_window_stop_throbber(struct gui_window *gw)
+ 
+ 	fb_update_back_forward(gw);
+ 
++#ifdef __vita__
++	/* VitaSurf: memory is the main constraint, log it after each load */
++	vita_log_memory("page load finished");
++#endif
+ }
+ 
+ static void
+@@ -2196,6 +2204,9 @@ main(int argc, char** argv)
+ 		.utf8 = framebuffer_utf8_table,
+ 		.bitmap = framebuffer_bitmap_table,
+ 		.layout = framebuffer_layout_table,
++#ifdef __vita__
++		.file = vita_file_table,
++#endif
+ 	};
+ 
+         ret = netsurf_register(&framebuffer_table);

@@ -1,0 +1,98 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  vpk:
+    name: PS Vita VPK
+    runs-on: ubuntu-latest
+    container:
+      # Pinned rather than :latest so a rebuilt base image cannot change the
+      # package manager or vdpm behaviour underneath the build.
+      image: vitasdk/vitasdk:2026.08
+    permissions:
+      contents: write
+    steps:
+      - name: Install build requirements
+        run: |
+          set -eu
+          if command -v apk >/dev/null 2>&1; then
+            apk update
+            apk add bash cmake ninja git make pkgconf perl gperf flex bison \
+                    zlib-dev libpng-dev
+          elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                    bash cmake ninja-build git make pkg-config perl gperf flex bison \
+                    zlib1g-dev libpng-dev
+          elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm bash cmake ninja git make pkgconf perl gperf flex bison zlib libpng
+          else
+            echo "No supported package manager found" >&2
+            exit 1
+          fi
+          for tool in cmake ninja git make pkg-config perl gperf flex bison; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "::error::$tool missing"; exit 1; }
+          done
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Mark workspace safe for git
+        run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Vita packages
+        run: |
+          set -eu
+          # curl-mbedtls conflicts with the image's OpenSSL-linked curl, and
+          # pacman will not swap conflicting packages non-interactively, so
+          # remove curl first (nodeps twice: skip dependency checks entirely).
+          if vdpm list curl >/dev/null 2>&1; then
+            VDPM_NONINTERACTIVE=1 vdpm remove --nodeps --nodeps curl
+          fi
+          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat
+
+      - name: Build NetSurf libraries
+        run: ./scripts/build-deps.sh
+
+      - name: Build NetSurf
+        run: ./scripts/build-netsurf.sh
+
+      - name: Configure and build VPK
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVITASURF_BUILD_ID="${GITHUB_RUN_NUMBER}" \
+            -DVITASURF_BUILD_SHA="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          cmake --build build
+
+      - name: Upload VPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaSurf-${{ github.run_number }}
+          path: build/VitaSurf.vpk
+
+      - name: Upload ELF for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaSurf-elf-${{ github.run_number }}
+          path: build/VitaSurf
+
+      - name: Attach VPK to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/VitaSurf.vpk
+          body: |
+            VitaSurf ${{ github.ref_name }}
+
+            Install VitaSurf.vpk with VitaShell. Logs are written to
+            ux0:data/VitaSurf/log.txt.
