@@ -107,9 +107,15 @@ jobs:
           grep -v '^#' scripts/crash-offsets.txt | grep . | while read -r off; do
             addr=$(printf '%08x' $((base + off)))
             echo "== offset $off = 0x$addr"
-            awk -v a="$addr" '$1 <= a' build/VitaSurf.syms | tail -12 | sed 's/^/  /'
+            arm-vita-eabi-addr2line -f -i -p -e build/VitaSurf "0x$addr" | sed 's/^/  /'
+            awk -v a="$addr" '$1 <= a' build/VitaSurf.syms | tail -6 | sed 's/^/  /'
             echo "  -- $addr --"
-            awk -v a="$addr" '$1 > a' build/VitaSurf.syms | head -4 | sed 's/^/  /'
+            awk -v a="$addr" '$1 > a' build/VitaSurf.syms | head -3 | sed 's/^/  /'
+            echo "::group::disassembly around 0x$addr"
+            arm-vita-eabi-objdump -d -l --no-show-raw-insn \
+              --start-address=$((base + off - 0x60)) \
+              --stop-address=$((base + off + 0x20)) build/VitaSurf | tail -n +7
+            echo "::endgroup::"
           done
 
       - name: Upload VPK

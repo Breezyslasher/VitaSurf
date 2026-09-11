@@ -136,8 +136,10 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${NETSURF_LIBNSFB_SRC}/src
 )
 
+# -g keeps line tables in the ELF artifact (they are not loadable, so the
+# VPK does not grow) so crash offsets resolve to file:line in CI.
 target_compile_options(${PROJECT_NAME} PRIVATE
-    -std=gnu99 -Wall -Wextra -Wmissing-prototypes -O2
+    -std=gnu99 -Wall -Wextra -Wmissing-prototypes -O2 -g
     -ffunction-sections -fdata-sections
 )
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -149,7 +151,6 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 )
 if(VITASURF_DEBUG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_DEBUG=1)
-    target_compile_options(${PROJECT_NAME} PRIVATE -g)
 endif()
 
 # NetSurf's main() is reached through __wrap_main (vita/platform/vita_main.c).

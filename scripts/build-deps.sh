@@ -35,11 +35,17 @@ for lib in $LIBS; do
     echo "==== $lib"
     extra=()
     unset LIB_CFLAGS
+    if [ -n "$NS_HOST" ]; then
+        # Line tables for every library so crash offsets resolve to
+        # file:line in CI. Debug sections are not part of the loadable
+        # segments, so the VPK does not grow. The Makefile appends CFLAGS
+        # from the environment.
+        LIB_CFLAGS="-g"
+    fi
     if [ "$lib" = "libparserutils" ] && [ -n "$NS_HOST" ]; then
         # VitaSDK newlib's iconv_open() fails for every charset, so page
-        # decoding uses libparserutils' own charset codecs instead. The
-        # Makefile appends CFLAGS from the environment.
-        LIB_CFLAGS="-DWITHOUT_ICONV_FILTER"
+        # decoding uses libparserutils' own charset codecs instead.
+        LIB_CFLAGS="${LIB_CFLAGS:-} -DWITHOUT_ICONV_FILTER"
     fi
     if [ "$lib" = "libnsfb" ] && [ -z "$NS_HOST" ]; then
         : # host build keeps whatever surfaces the host offers (SDL for tests)
