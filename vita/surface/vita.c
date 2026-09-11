@@ -88,6 +88,10 @@ struct vita_surface {
 	/* last pointer position handed to NetSurf */
 	int pointer_x;
 	int pointer_y;
+
+	/* diagnostics, only logged when the verbose flag file exists */
+	bool verbose;
+	unsigned int updates;
 };
 
 /* ------------------------------------------------------------------------ */
@@ -318,6 +322,13 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 		return;
 	}
 
+	vs->updates++;
+	if (vs->verbose && vs->updates <= 200) {
+		vita_log("surface: update %u box %d,%d-%d,%d (clipped %d,%d-%d,%d)",
+			 vs->updates, box->x0, box->y0, box->x1, box->y1,
+			 area.x0, area.y0, area.x1, area.y1);
+	}
+
 	src = nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4;
 	dst = vs->display + area.y0 * SCREEN_STRIDE + area.x0;
 	for (y = area.y0; y < area.y1; y++) {
@@ -434,6 +445,7 @@ static int vita_initialise(nsfb_t *nsfb)
 				 SCE_TOUCH_SAMPLING_STATE_START);
 
 	nsfb->surface_priv = vs;
+	vs->verbose = vita_verbose_requested() != 0;
 
 	/* start with the pointer over the page rather than the toolbar */
 	queue_move(vs, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
@@ -515,6 +527,12 @@ static bool vita_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
 static int vita_claim(nsfb_t *nsfb, nsfb_bbox_t *box)
 {
 	struct nsfb_cursor_s *cursor = nsfb->cursor;
+	struct vita_surface *vs = nsfb->surface_priv;
+
+	if (vs != NULL && vs->verbose && vs->updates <= 200) {
+		vita_log("surface: claim %d,%d-%d,%d",
+			 box->x0, box->y0, box->x1, box->y1);
+	}
 
 	if ((cursor != NULL) &&
 	    (cursor->plotted == true) &&
