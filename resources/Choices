@@ -14,7 +14,8 @@ memory_cache_size:4194304
 max_cached_fetch_handles:4
 max_fetchers:8
 max_fetchers_per_host:2
-fb_font_cachesize:512
+# FreeType glyph cache for the bundled DejaVu fonts, in KB.
+fb_font_cachesize:2048
 
 # JavaScript stays off until phase 4.
 enable_javascript:0

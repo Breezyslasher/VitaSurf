@@ -58,7 +58,7 @@ Linux machine.
     vita/surface/         libnsfb surface: display buffer and input polling
     vita/platform/        paths, logging, system initialisation, entry point
     vita/netsurf/         NetSurf Makefile.config for the Vita
-    resources/            default Choices, home page, CA bundle
+    resources/            default Choices, home page, CA bundle, DejaVu fonts
     sce_sys/              LiveArea assets
 
 ## How the pieces fit

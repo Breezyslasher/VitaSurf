@@ -164,6 +164,12 @@ vita_create_self(eboot.bin ${PROJECT_NAME} UNSAFE)
 
 file(GLOB NETSURF_RESOURCE_FILES "${NETSURF_STAGE}/resources/*")
 set(VPK_FILES)
+# Bundled DejaVu fonts (Bitstream Vera licence, see resources/fonts/LICENSE).
+file(GLOB VITASURF_FONT_FILES "${CMAKE_SOURCE_DIR}/resources/fonts/*.ttf")
+foreach(font ${VITASURF_FONT_FILES})
+    get_filename_component(name "${font}" NAME)
+    list(APPEND VPK_FILES FILE "${font}" "resources/fonts/${name}")
+endforeach()
 foreach(res ${NETSURF_RESOURCE_FILES})
     get_filename_component(name "${res}" NAME)
     list(APPEND VPK_FILES FILE "${res}" "resources/${name}")
