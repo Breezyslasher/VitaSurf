@@ -33,6 +33,13 @@ mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
 for lib in $LIBS; do
     echo "==== $lib"
     extra=()
+    unset LIB_CFLAGS
+    if [ "$lib" = "libparserutils" ] && [ -n "$NS_HOST" ]; then
+        # VitaSDK newlib's iconv_open() fails for every charset, so page
+        # decoding uses libparserutils' own charset codecs instead. The
+        # Makefile appends CFLAGS from the environment.
+        LIB_CFLAGS="-DWITHOUT_ICONV_FILTER"
+    fi
     if [ "$lib" = "libnsfb" ] && [ -z "$NS_HOST" ]; then
         : # host build keeps whatever surfaces the host offers (SDL for tests)
     elif [ "$lib" = "libnsfb" ]; then
@@ -42,7 +49,7 @@ for lib in $LIBS; do
         extra=(NSFB_SDL_AVAILABLE=no NSFB_XCB_AVAILABLE=no
                NSFB_VNC_AVAILABLE=no NSFB_WLD_AVAILABLE=no)
     fi
-    make -C "$VITASURF_ROOT/deps/$lib" "${MAKE_ARGS[@]}" "${extra[@]}" -j"$JOBS" install
+    CFLAGS="${LIB_CFLAGS:-}" make -C "$VITASURF_ROOT/deps/$lib" "${MAKE_ARGS[@]}" "${extra[@]}" -j"$JOBS" install
 done
 
 # utf8proc (MIT) has a plain Makefile rather than the NetSurf buildsystem.

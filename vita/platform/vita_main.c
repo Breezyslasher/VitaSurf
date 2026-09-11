@@ -52,14 +52,8 @@ int __wrap_main(int argc, char **argv)
 	 * Option overrides of the form --name=value are also accepted here
 	 * and take precedence over the Choices file.
 	 */
-	static char *args[16] = {
-		"vitasurf",
-		"-f", "vita",
-		"-w", "960",
-		"-h", "544",
-		"-b", "32",
-	};
-	int nargs = 9;
+	static char *args[16];
+	int nargs = 0;
 	int ret;
 	int i;
 
@@ -68,10 +62,13 @@ int __wrap_main(int argc, char **argv)
 
 	vita_platform_init();
 
+	args[nargs++] = "vitasurf";
+
 	/*
 	 * Verbose NetSurf logging: compiled into debug builds, and switched on
 	 * at runtime in any build by creating the flag file
-	 * ux0:data/VitaSurf/verbose. Release builds only carry INFO and above.
+	 * ux0:data/VitaSurf/verbose. NetSurf only recognises -v as the first
+	 * argument. Release builds only carry INFO and above.
 	 */
 #if defined(VITASURF_DEBUG) || defined(VITASURF_ALWAYS_VERBOSE)
 	args[nargs++] = "-v";
@@ -80,6 +77,15 @@ int __wrap_main(int argc, char **argv)
 		args[nargs++] = "-v";
 	}
 #endif
+
+	args[nargs++] = "-f";
+	args[nargs++] = "vita";
+	args[nargs++] = "-w";
+	args[nargs++] = "960";
+	args[nargs++] = "-h";
+	args[nargs++] = "544";
+	args[nargs++] = "-b";
+	args[nargs++] = "32";
 	args[nargs] = NULL;
 
 	vita_log("heap %d MB, main thread stack %d KB",

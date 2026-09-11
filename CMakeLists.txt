@@ -62,6 +62,8 @@ set(NETSURF_LIBNSFB_SRC "${CMAKE_SOURCE_DIR}/deps/libnsfb")
 add_executable(${PROJECT_NAME}
     vita/platform/vita_main.c
     vita/platform/vita_platform.c
+    # newlib's iconv_open() fails for every charset; this replaces it.
+    vita/platform/vita_iconv.c
     vita/surface/vita.c
 )
 
