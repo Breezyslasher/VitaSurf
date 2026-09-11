@@ -2,8 +2,12 @@
 # Apply every patch in patches/ to the matching submodule under deps/.
 #
 # Patch file names are <order>-<submodule>-<description>.patch, for example
-# 0001-libnsfb-vita-surface-type.patch applies to deps/libnsfb. Patches that
-# are already applied are skipped, so this script is safe to run repeatedly.
+# 0001-libnsfb-vita-surface-type.patch applies to deps/libnsfb. Applied
+# patches are recorded in deps/<submodule>/.vitasurf-patched so the script
+# is safe to run repeatedly (the build scripts call it more than once).
+# A patch that is missing from the record but reverse-applies cleanly is
+# treated as already applied, which covers checkouts patched before the
+# record existed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,16 +18,21 @@ for patch in "$ROOT"/patches/*.patch; do
     name="$(basename "$patch" .patch)"
     submodule="$(echo "$name" | cut -d- -f2)"
     dir="$ROOT/deps/$submodule"
+    stamp="$dir/.vitasurf-patched"
     if [ ! -d "$dir" ]; then
         echo "error: $name: no submodule at deps/$submodule" >&2
         status=1
         continue
     fi
-    if git -C "$dir" apply --check --reverse "$patch" >/dev/null 2>&1; then
+    if [ -f "$stamp" ] && grep -qxF "$name" "$stamp"; then
         echo "   PATCH: $name (already applied)"
+    elif git -C "$dir" apply --check --reverse "$patch" >/dev/null 2>&1; then
+        echo "   PATCH: $name (already applied)"
+        echo "$name" >> "$stamp"
     elif git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
         echo "   PATCH: $name"
         git -C "$dir" apply "$patch"
+        echo "$name" >> "$stamp"
     else
         echo "error: $name does not apply cleanly to deps/$submodule" >&2
         git -C "$dir" apply --check "$patch" || true

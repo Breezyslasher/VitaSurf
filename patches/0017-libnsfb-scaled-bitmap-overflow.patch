@@ -1,0 +1,71 @@
+diff --git a/src/plot/common.c b/src/plot/common.c
+index 5f55686..f6e4a91 100644
+--- a/src/plot/common.c
++++ b/src/plot/common.c
+@@ -16,6 +16,8 @@
+ #error PLOT_LINELEN must be a macro to increment a line length
+ #endif
+ 
++#include <stdint.h>
++
+ #include "palette.h"
+ 
+ #define SIGN(x)  ((x<0) ?  -1  :  ((x>0) ? 1 : 0))
+@@ -279,6 +281,16 @@ static bool bitmap_scaled(nsfb_t *nsfb, const nsfb_bbox_t *loc,
+ 		set_dither = true;
+ 	}
+ 
++	/* Nothing sensible can be done with an empty source or target
++	 * (VitaSurf: a negative size used to run the loops below off the
++	 * ends of the source image). */
++	if (width <= 0 || height <= 0 || bmp_width <= 0 || bmp_height <= 0) {
++		if (set_dither) {
++			nsfb_palette_dither_fini(nsfb->palette);
++		}
++		return true;
++	}
++
+ 	/* get veritcal (y) and horizontal (x) scale factors; both integer
+ 	 * part and remainder */
+ 	dx = bmp_width / width;
+@@ -287,21 +299,35 @@ static bool bitmap_scaled(nsfb_t *nsfb, const nsfb_bbox_t *loc,
+ 	dyr = bmp_height % height;
+ 
+ 	/* get start offsets to part of image being scaled, after clipping and
+-	 * set remainder trackers to correct starting value */
++	 * set remainder trackers to correct starting value. The products are
++	 * taken in 64 bits: a large image scrolled far past the clip made
++	 * (clipped.y0 - y) * bmp_height overflow 32 bits, which produced a
++	 * negative source offset and a read before the image (VitaSurf). */
+ 	if (clipped.x0 - x != 0) {
+-		xoffs = ((clipped.x0 - x) * bmp_width) / width;
+-		rxs = ((clipped.x0 - x) * bmp_width) % width;
++		int64_t xo = (int64_t)(clipped.x0 - x) * bmp_width;
++
++		xoffs = (int)(xo / width);
++		rxs = (int)(xo % width);
+ 	} else {
+ 		xoffs = 0;
+ 		rxs = 0;
+ 	}
+ 	if (clipped.y0 - y != 0) {
+-		yoff = (((clipped.y0 - y) * bmp_height) / height) * bmp_stride;
+-		ry = ((clipped.y0 - y) * bmp_height) % height;
++		int64_t yo = (int64_t)(clipped.y0 - y) * bmp_height;
++
++		yoff = (int)(yo / height) * bmp_stride;
++		ry = (int)(yo % height);
+ 	} else {
+ 		yoff = 0;
+ 		ry = 0;
+ 	}
++	if (xoffs < 0 || yoff < 0) {
++		/* the target lies entirely before the image */
++		if (set_dither) {
++			nsfb_palette_dither_fini(nsfb->palette);
++		}
++		return true;
++	}
+ 
+ 	/* plot the image */
+ 	pvideo = get_xy_loc(nsfb, clipped.x0, clipped.y0);

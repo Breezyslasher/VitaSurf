@@ -85,6 +85,14 @@ whole page when a flex container was followed by a block with a top
 margin. Verified natively with NetSurf's monkey frontend on a set of test
 pages; not yet checked on hardware.
 
+Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
+image scrolled far past the clip rectangle, the source offset arithmetic
+overflowed 32 bits and the plotter read before the image (a data abort in
+build 62 while scrolling Wikipedia). The products are now taken in 64 bits
+and empty or negative sizes are rejected. The build job prints the
+function map and a disassembly around every offset listed in
+`scripts/crash-offsets.txt`, so a crash dump can be read from the CI log.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
