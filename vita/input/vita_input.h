@@ -45,4 +45,10 @@ void vita_input_caret(struct gui_window *gw, int x, int y, int height);
 /** NetSurf removed the caret from the page. */
 void vita_input_caret_removed(struct gui_window *gw);
 
+/** The window started loading (throbber on). */
+void vita_input_load_started(struct gui_window *gw);
+
+/** The window finished loading: logs the URL, elapsed time and heap. */
+void vita_input_load_finished(struct gui_window *gw);
+
 #endif

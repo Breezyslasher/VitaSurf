@@ -124,6 +124,8 @@ static nsfb_bbox_t overlay;
 static struct target *targets;
 static int ntargets;
 
+static uint64_t load_started_us;   /**< when the current load began, 0 if idle */
+
 static enum ime_target ime_for = IME_NONE;
 static bool ime_field_multiline;
 static bool caret_active;          /**< a page text field has the caret */
@@ -750,6 +752,34 @@ void vita_input_caret_removed(struct gui_window *gw)
 {
 	if (gw == the_gw) {
 		caret_active = false;
+	}
+}
+
+/* ------------------------------------------------------------------------ */
+/* Page load timing                                                         */
+
+void vita_input_load_started(struct gui_window *gw)
+{
+	if (gw == the_gw) {
+		load_started_us = sceKernelGetProcessTimeWide();
+	}
+}
+
+void vita_input_load_finished(struct gui_window *gw)
+{
+	nsurl *url = NULL;
+	unsigned int ms;
+
+	if (gw != the_gw || load_started_us == 0) {
+		return;
+	}
+	ms = (unsigned int)((sceKernelGetProcessTimeWide() - load_started_us) / 1000);
+	load_started_us = 0;
+	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
+		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
+		nsurl_unref(url);
+	} else {
+		vita_log("page: loaded in %u ms", ms);
 	}
 }
 

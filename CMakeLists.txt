@@ -187,6 +187,7 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
     # home page are ours, cacert.pem is the Mozilla CA bundle for phase 2.
     FILE resources/Choices                        resources/Choices
     FILE resources/vitasurf.html                  resources/vitasurf.html
+    FILE resources/jstest.html                    resources/jstest.html
     FILE resources/cacert.pem                     resources/cacert.pem
     ${VPK_FILES}
 )

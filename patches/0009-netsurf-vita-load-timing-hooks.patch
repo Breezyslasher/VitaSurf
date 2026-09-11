@@ -1,0 +1,22 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 847d7b3f7..834d66b3e 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -2077,11 +2077,17 @@ gui_window_start_throbber(struct gui_window *g)
+ {
+ 	g->throbber_index = 0;
+ 	framebuffer_schedule(100, throbber_advance, g);
++#ifdef __vita__
++	vita_input_load_started(g);
++#endif
+ }
+ 
+ static void
+ gui_window_stop_throbber(struct gui_window *gw)
+ {
++#ifdef __vita__
++	vita_input_load_finished(gw);
++#endif
+ 	gw->throbber_index = -1;
+ 	fbtk_set_bitmap(gw->throbber, &throbber0);
+ 

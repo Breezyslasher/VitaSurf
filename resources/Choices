@@ -17,8 +17,10 @@ max_fetchers_per_host:2
 # FreeType glyph cache for the bundled DejaVu fonts, in KB.
 fb_font_cachesize:2048
 
-# JavaScript stays off until phase 4.
-enable_javascript:0
+# JavaScript (phase 4): Duktape, an interpreter, so scripts get a short
+# time budget (seconds) before they are stopped.
+enable_javascript:1
+script_timeout:5
 
 # Networking (phase 2). Certificates come from the bundled Mozilla CA file.
 ca_bundle:app0:resources/cacert.pem
