@@ -32,7 +32,10 @@ development packages for zlib and libpng (NetSurf builds a few host tools).
 The result is `build/VitaSurf.vpk`. The curl step exists because vdpm's curl package is
 linked against the OpenSSL 1.0.2 API while the toolchain ships 1.1.1. Add `VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
-build with verbose logging.
+build with verbose logging. Creating an empty file named `verbose` in
+`ux0:data/VitaSurf/` turns NetSurf's verbose logging on at runtime in any
+build; the log also starts with a self-test of the path and clock
+assumptions the port relies on.
 
 `VITASURF_NATIVE=1 ./scripts/build-deps.sh` and
 `VITASURF_NATIVE=1 ./scripts/build-netsurf.sh` build the same libraries for

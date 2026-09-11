@@ -5,19 +5,26 @@
  * Licensed under the GNU General Public License version 2.
  */
 
-#include <stdarg.h>
-#include <stdio.h>
-#include <string.h>
-
 #include <psp2/apputil.h>
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/power.h>
 
+/* After the SCE headers: <sys/stat.h> defines st_ctime as a macro, which
+ * would otherwise mangle the SceIoStat field of the same name. */
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+
 #include "vita_platform.h"
 
-static int log_ready = 0;
+/* Where vita_log() writes. stderr once it is redirected, else a plain file. */
+static FILE *logf = NULL;
 static SceUInt64 start_time_us = 0;
 
 void vita_log(const char *fmt, ...)
@@ -26,11 +33,16 @@ void vita_log(const char *fmt, ...)
 	SceUInt64 now = sceKernelGetProcessTimeWide();
 	unsigned int ms = (unsigned int)((now - start_time_us) / 1000);
 
-	fprintf(stderr, "[%6u.%03u] ", ms / 1000, ms % 1000);
+	if (logf == NULL) {
+		return;
+	}
+
+	fprintf(logf, "[%6u.%03u] ", ms / 1000, ms % 1000);
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
+	vfprintf(logf, fmt, ap);
 	va_end(ap);
-	fputc('\n', stderr);
+	fputc('\n', logf);
+	fflush(logf);
 }
 
 void vita_log_memory(const char *what)
@@ -51,31 +63,124 @@ void vita_log_memory(const char *what)
 		 (unsigned int)info.size_phycont / 1024);
 }
 
+int vita_verbose_requested(void)
+{
+	SceIoStat st;
+
+	return sceIoGetstat(VITASURF_VERBOSE_FLAG, &st) >= 0;
+}
+
+/**
+ * Log whether the assumptions the NetSurf build relies on hold: drive-less
+ * paths resolve to app0:, the resources are readable, and the clocks the
+ * scheduler and libnsutils use advance.
+ */
+static void log_selftest(void)
+{
+	static const char *const paths[] = {
+		"/resources/Messages",
+		"app0:resources/Messages",
+		"app0:/resources/Messages",
+		"/resources/vitasurf.html",
+		VITASURF_DATA_DIR,
+	};
+	char cwd[256];
+	struct stat st;
+	struct timeval tv;
+	struct timespec ts;
+	unsigned int i;
+	FILE *f;
+
+	cwd[0] = '\0';
+	if (getcwd(cwd, sizeof(cwd)) == NULL) {
+		strcpy(cwd, "(getcwd failed)");
+	}
+	vita_log("selftest: cwd is '%s'", cwd);
+
+	for (i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		if (stat(paths[i], &st) == 0) {
+			vita_log("selftest: stat '%s' ok, %s, %lu bytes",
+				 paths[i],
+				 S_ISDIR(st.st_mode) ? "directory" : "file",
+				 (unsigned long)st.st_size);
+		} else {
+			vita_log("selftest: stat '%s' failed", paths[i]);
+		}
+	}
+
+	f = fopen("/resources/vitasurf.html", "rb");
+	if (f != NULL) {
+		char buf[64];
+		size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+
+		buf[n] = '\0';
+		fclose(f);
+		vita_log("selftest: fopen '/resources/vitasurf.html' ok, read %u bytes: %.20s",
+			 (unsigned int)n, buf);
+	} else {
+		vita_log("selftest: fopen '/resources/vitasurf.html' failed");
+	}
+
+	if (gettimeofday(&tv, NULL) == 0) {
+		vita_log("selftest: gettimeofday %lu.%06lu",
+			 (unsigned long)tv.tv_sec, (unsigned long)tv.tv_usec);
+	} else {
+		vita_log("selftest: gettimeofday failed");
+	}
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+		vita_log("selftest: clock_gettime(MONOTONIC) %lu.%09lu",
+			 (unsigned long)ts.tv_sec, (unsigned long)ts.tv_nsec);
+	} else {
+		vita_log("selftest: clock_gettime(MONOTONIC) failed");
+	}
+}
+
 int vita_platform_init(void)
 {
 	SceAppUtilInitParam init_param;
 	SceAppUtilBootParam boot_param;
+	int mkdir_ret;
 	int ret;
 
 	start_time_us = sceKernelGetProcessTimeWide();
 
 	/* Writable data directory. 0x80010011 is "already exists". */
-	ret = sceIoMkdir(VITASURF_DATA_DIR, 0777);
-	if (ret < 0 && ret != (int)0x80010011) {
-		return ret;
-	}
+	mkdir_ret = sceIoMkdir(VITASURF_DATA_DIR, 0777);
 
 	/*
-	 * NetSurf logs to stderr and its die() messages go there too. The
-	 * log stream is left unbuffered by the framebuffer frontend, so
-	 * keep logging sparse in release builds.
+	 * Open the log with a plain fopen first so vita_log() works even if
+	 * the stderr redirection below fails. NetSurf logs to stderr, so
+	 * stderr is then pointed at the same file, unbuffered, and vita_log()
+	 * switches to it to keep the two in order.
 	 */
-	if (freopen(VITASURF_LOG_PATH, "w", stderr) != NULL) {
-		log_ready = 1;
+	logf = fopen(VITASURF_LOG_PATH, "w");
+	if (logf == NULL) {
+		return -1;
 	}
-	freopen(VITASURF_DATA_DIR "/stdout.txt", "w", stdout);
-
+	setvbuf(logf, NULL, _IONBF, 0);
 	vita_log("VitaSurf starting");
+	if (mkdir_ret < 0 && mkdir_ret != (int)0x80010011) {
+		vita_log("sceIoMkdir(%s) returned 0x%08x", VITASURF_DATA_DIR,
+			 (unsigned int)mkdir_ret);
+	}
+
+	fclose(logf);
+	logf = NULL;
+	if (freopen(VITASURF_LOG_PATH, "a", stderr) != NULL) {
+		setvbuf(stderr, NULL, _IONBF, 0);
+		logf = stderr;
+		vita_log("stderr redirected to the log");
+	} else {
+		logf = fopen(VITASURF_LOG_PATH, "a");
+		if (logf != NULL) {
+			setvbuf(logf, NULL, _IONBF, 0);
+		}
+		vita_log("freopen(stderr) failed; NetSurf messages are lost");
+	}
+	if (freopen(VITASURF_STDOUT_PATH, "w", stdout) != NULL) {
+		setvbuf(stdout, NULL, _IOLBF, 0);
+	}
 
 	memset(&init_param, 0, sizeof(init_param));
 	memset(&boot_param, 0, sizeof(boot_param));
@@ -90,9 +195,10 @@ int vita_platform_init(void)
 	scePowerSetGpuClockFrequency(222);
 	scePowerSetGpuXbarClockFrequency(166);
 
+	log_selftest();
 	vita_log_memory("startup");
 
-	return log_ready ? 0 : -1;
+	return logf != NULL ? 0 : -1;
 }
 
 void vita_platform_fini(void)

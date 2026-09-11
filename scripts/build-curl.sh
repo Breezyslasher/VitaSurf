@@ -54,7 +54,7 @@ cmake -S "$SRC" -B "$SRC/build-vita" \
     -DENABLE_IPV6=OFF -DCURL_DISABLE_SOCKETPAIR=ON \
     -DHAVE_FCNTL_O_NONBLOCK=OFF -DENABLE_THREADED_RESOLVER=OFF \
     -DBUILD_LIBCURL_DOCS=OFF -DBUILD_MISC_DOCS=OFF -DENABLE_CURL_MANUAL=OFF \
-    -DCURL_CA_BUNDLE="app0:/resources/cacert.pem" -DCURL_USE_LIBPSL=OFF
+    -DCURL_CA_BUNDLE="app0:resources/cacert.pem" -DCURL_USE_LIBPSL=OFF
 # newlib declares pipe2() but does not implement it; the vdpm recipe strips
 # the detected HAVE_PIPE2 the same way.
 sed -i '/HAVE_PIPE2/d' "$SRC/build-vita/lib/curl_config.h"
