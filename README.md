@@ -45,6 +45,15 @@ switches to FlareSolverr's user agent for the rest of the session, since
 Cloudflare ties the clearance to it, and the Vita must share the solver's
 public address. The request blocks the browser while the solver works.
 
+Phase 8 (web compatibility) is in progress: `XMLHttpRequest`, `fetch`,
+`FormData`, `Headers`, `Response`, `Request` and `AbortController` are
+implemented on NetSurf's fetch layer, so requests carry the browser's
+cookies and go through its CA bundle. Cross-origin responses are only
+handed to scripts when the server allows the page's origin, redirects
+are followed up to five times and bodies are capped at 8 MB. The
+JavaScript half of the bindings now lives in `vita/js/prelude.js`, which
+CMake embeds at configure time and which can be tested under node.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus

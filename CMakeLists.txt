@@ -107,8 +107,17 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/quickjs.h")
         message(FATAL_ERROR "quickjs.h not found: install it with 'vdpm quickjs-ng'")
     endif()
-    # Hand-written QuickJS bindings implementing NetSurf's js.h.
+    # Hand-written QuickJS bindings implementing NetSurf's js.h, plus the
+    # JavaScript half of them embedded as a NUL-terminated byte array.
+    set(PRELUDE_JS "${CMAKE_SOURCE_DIR}/vita/js/prelude.js")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PRELUDE_JS}")
+    file(READ "${PRELUDE_JS}" PRELUDE_HEX HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," PRELUDE_BYTES "${PRELUDE_HEX}")
+    file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
+        "/* generated from vita/js/prelude.js */\n"
+        "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n")
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c)
+    target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}/generated")
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE

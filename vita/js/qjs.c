@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <quickjs.h>
 
@@ -37,6 +38,7 @@
 #include "netsurf/misc.h"
 #include "netsurf/mouse.h"
 #include "content/urldb.h"
+#include "content/fetch.h"
 #include "content/handlers/javascript/js.h"
 #include "content/handlers/javascript/content.h"
 
@@ -66,6 +68,7 @@ struct jsheap {
 };
 
 struct js_listener;
+struct js_xhr;
 
 /*
  * One JS object per DOM node, so that a node fetched twice compares equal
@@ -89,6 +92,8 @@ struct jsthread {
 	struct js_listener *listeners; /**< event listeners, freed on close */
 	struct js_timer *timers;       /**< live timers, cancelled on close */
 	struct js_wrapper *wrappers[WRAPPER_BUCKETS];
+	struct js_xhr *xhrs;           /**< requests in flight */
+	int next_xhr_id;
 	bool closed;
 };
 
@@ -1492,6 +1497,459 @@ static void timer_callback(void *p)
 	}
 }
 
+
+/* ------------------------------------------------------------------------ */
+/* XMLHttpRequest transport                                                 */
+
+/*
+ * The JS side (prelude.js) implements XMLHttpRequest and fetch() on top of
+ * __vitaFetch(url, method, headers, body, timeoutMs, callback), which runs
+ * one request through NetSurf's fetch layer (so cookies, the CA bundle and
+ * the user agent are the browser's) and calls back once with
+ * (status, headersText, bodyText, errorOrNull, finalUrl). Cross-origin
+ * responses are only handed over when Access-Control-Allow-Origin allows
+ * the page's origin; redirects are followed up to a limit.
+ */
+
+#define XHR_MAX_BODY      (8 * 1024 * 1024)
+#define XHR_MAX_HEADERS   (64 * 1024)
+#define XHR_MAX_REDIRECTS 5
+
+struct js_xhr {
+	jsthread *thread;
+	int id;
+	JSValue callback;
+	struct fetch *fetch;
+	nsurl *url;
+	nsurl *referer;      /**< the page; also the origin for CORS */
+	char *post;          /**< request body, NULL for GET */
+	char **headers;      /**< NULL-terminated "Name: value" strings */
+	int status;
+	char *rheaders;
+	size_t rheaders_len;
+	char *body;
+	size_t body_len;
+	char *acao;          /**< Access-Control-Allow-Origin, if any */
+	bool cross_origin;
+	int redirects;
+	int timeout_ms;
+	bool timer_set;
+	struct js_xhr *next;
+};
+
+static void xhr_timeout_cb(void *p);
+
+/** scheme://host:port of a URL, malloc'd, or NULL. */
+static char *url_origin(nsurl *url)
+{
+	char *s = NULL;
+	size_t l;
+
+	if (url == NULL ||
+	    nsurl_get(url, NSURL_SCHEME | NSURL_HOST | NSURL_PORT, &s, &l) != NSERROR_OK) {
+		return NULL;
+	}
+	return s;
+}
+
+static bool same_origin(nsurl *a, nsurl *b)
+{
+	char *oa = url_origin(a), *ob = url_origin(b);
+	bool same = (oa != NULL && ob != NULL && strcasecmp(oa, ob) == 0);
+
+	free(oa);
+	free(ob);
+	return same;
+}
+
+static void xhr_unlink(struct js_xhr *x)
+{
+	struct js_xhr **pp;
+
+	if (x->thread == NULL) return;
+	for (pp = &x->thread->xhrs; *pp != NULL; pp = &(*pp)->next) {
+		if (*pp == x) {
+			*pp = x->next;
+			break;
+		}
+	}
+}
+
+static void xhr_free(struct js_xhr *x)
+{
+	int i;
+
+	if (x->timer_set) {
+		guit->misc->schedule(-1, xhr_timeout_cb, x);
+	}
+	if (x->fetch != NULL) {
+		fetch_abort(x->fetch);
+	}
+	if (x->headers != NULL) {
+		for (i = 0; x->headers[i] != NULL; i++) free(x->headers[i]);
+		free(x->headers);
+	}
+	if (x->url) nsurl_unref(x->url);
+	if (x->referer) nsurl_unref(x->referer);
+	free(x->post);
+	free(x->rheaders);
+	free(x->body);
+	free(x->acao);
+	free(x);
+}
+
+/** Deliver the result to the JS callback and free the request. */
+static void xhr_complete(struct js_xhr *x, const char *err)
+{
+	jsthread *thread = x->thread;
+
+	x->fetch = NULL; /* the fetcher frees it after the final message */
+	if (x->timer_set) {
+		guit->misc->schedule(-1, xhr_timeout_cb, x);
+		x->timer_set = false;
+	}
+	if (err == NULL && x->cross_origin) {
+		char *origin = url_origin(x->referer);
+
+		if (x->acao == NULL ||
+		    (strcmp(x->acao, "*") != 0 &&
+		     (origin == NULL || strcasecmp(x->acao, origin) != 0))) {
+			err = "cross-origin response not allowed by the server";
+		}
+		free(origin);
+	}
+	xhr_unlink(x);
+	if (thread != NULL && !thread->closed) {
+		JSContext *ctx = thread->ctx;
+		JSValue args[5], ret;
+		int i;
+
+		if (err != NULL) {
+			vita_log("xhr: %s: %s", nsurl_access(x->url), err);
+		}
+		begin_script(thread);
+		args[0] = JS_NewInt32(ctx, x->status);
+		args[1] = JS_NewStringLen(ctx, x->rheaders != NULL ? x->rheaders : "",
+					  x->rheaders_len);
+		args[2] = err != NULL ? JS_NewString(ctx, "") :
+			JS_NewStringLen(ctx, x->body != NULL ? x->body : "", x->body_len);
+		args[3] = err != NULL ? JS_NewString(ctx, err) : JS_NULL;
+		args[4] = JS_NewString(ctx, nsurl_access(x->url));
+		ret = JS_Call(ctx, x->callback, JS_UNDEFINED, 5, args);
+		if (JS_IsException(ret)) {
+			qjs_report_exception(ctx);
+		}
+		JS_FreeValue(ctx, ret);
+		for (i = 0; i < 5; i++) JS_FreeValue(ctx, args[i]);
+		JS_FreeValue(ctx, x->callback);
+		end_script(thread);
+	}
+	x->thread = NULL;
+	xhr_free(x);
+}
+
+static bool xhr_start(struct js_xhr *x);
+
+static void xhr_fetch_callback(const fetch_msg *msg, void *p)
+{
+	struct js_xhr *x = p;
+
+	switch (msg->type) {
+	case FETCH_HEADER: {
+		const char *h = (const char *)msg->data.header_or_data.buf;
+		size_t len = msg->data.header_or_data.len;
+
+		while (len > 0 && (h[len - 1] == '\r' || h[len - 1] == '\n')) len--;
+		if (len >= 5 && strncasecmp(h, "HTTP/", 5) == 0) {
+			int code = 0;
+			if (sscanf(h, "HTTP/%*[0-9.] %d", &code) == 1) {
+				x->status = code;
+			}
+			/* a new status line (100 Continue, retries) restarts the headers */
+			x->rheaders_len = 0;
+			free(x->acao);
+			x->acao = NULL;
+		} else if (len > 0 && x->rheaders_len + len + 2 <= XHR_MAX_HEADERS) {
+			char *grown = realloc(x->rheaders, x->rheaders_len + len + 2);
+			if (grown != NULL) {
+				x->rheaders = grown;
+				memcpy(x->rheaders + x->rheaders_len, h, len);
+				x->rheaders_len += len;
+				x->rheaders[x->rheaders_len++] = '\n';
+				x->rheaders[x->rheaders_len] = '\0';
+			}
+			if (len > 28 && strncasecmp(h, "Access-Control-Allow-Origin:", 28) == 0) {
+				const char *v = h + 28;
+				size_t vl = len - 28;
+				while (vl > 0 && (*v == ' ' || *v == '\t')) { v++; vl--; }
+				free(x->acao);
+				x->acao = malloc(vl + 1);
+				if (x->acao != NULL) {
+					memcpy(x->acao, v, vl);
+					x->acao[vl] = '\0';
+				}
+			}
+		}
+		break;
+	}
+	case FETCH_DATA: {
+		size_t len = msg->data.header_or_data.len;
+		char *grown;
+
+		if (x->body_len + len > XHR_MAX_BODY) {
+			fetch_abort(x->fetch);
+			x->fetch = NULL;
+			xhr_complete(x, "response larger than 8 MB");
+			break;
+		}
+		grown = realloc(x->body, x->body_len + len + 1);
+		if (grown == NULL) {
+			fetch_abort(x->fetch);
+			x->fetch = NULL;
+			xhr_complete(x, "out of memory");
+			break;
+		}
+		x->body = grown;
+		memcpy(x->body + x->body_len, msg->data.header_or_data.buf, len);
+		x->body_len += len;
+		x->body[x->body_len] = '\0';
+		break;
+	}
+	case FETCH_REDIRECT: {
+		nsurl *next = NULL;
+
+		x->fetch = NULL;
+		if (++x->redirects > XHR_MAX_REDIRECTS) {
+			xhr_complete(x, "too many redirects");
+			break;
+		}
+		if (msg->data.redirect == NULL ||
+		    nsurl_join(x->url, msg->data.redirect, &next) != NSERROR_OK) {
+			xhr_complete(x, "bad redirect");
+			break;
+		}
+		nsurl_unref(x->url);
+		x->url = next;
+		/* redirected requests are re-issued as GET, as browsers do for 30x */
+		free(x->post);
+		x->post = NULL;
+		x->status = 0;
+		x->rheaders_len = 0;
+		x->body_len = 0;
+		free(x->acao);
+		x->acao = NULL;
+		x->cross_origin = !same_origin(x->url, x->referer);
+		if (!xhr_start(x)) {
+			xhr_complete(x, "cannot start fetch");
+		}
+		break;
+	}
+	case FETCH_FINISHED:
+	case FETCH_NOTMODIFIED:
+	case FETCH_AUTH:
+		xhr_complete(x, NULL);
+		break;
+	case FETCH_TIMEDOUT:
+		xhr_complete(x, "timeout");
+		break;
+	case FETCH_CERT_ERR:
+		xhr_complete(x, "certificate error");
+		break;
+	case FETCH_ERROR:
+		xhr_complete(x, msg->data.error != NULL ? msg->data.error : "fetch error");
+		break;
+	default:
+		break;
+	}
+}
+
+static void xhr_timeout_cb(void *p)
+{
+	struct js_xhr *x = p;
+
+	x->timer_set = false;
+	if (x->fetch != NULL) {
+		fetch_abort(x->fetch);
+		x->fetch = NULL;
+	}
+	xhr_complete(x, "timeout");
+}
+
+static bool xhr_start(struct js_xhr *x)
+{
+	const char **hdrs;
+	char *origin_hdr = NULL;
+	int n = 0, i;
+	nserror err;
+
+	while (x->headers != NULL && x->headers[n] != NULL) n++;
+	hdrs = calloc((size_t)n + 2, sizeof(*hdrs));
+	if (hdrs == NULL) {
+		return false;
+	}
+	for (i = 0; i < n; i++) hdrs[i] = x->headers[i];
+	if (x->cross_origin) {
+		char *origin = url_origin(x->referer);
+		if (origin != NULL) {
+			size_t l = strlen(origin) + 9;
+			origin_hdr = malloc(l);
+			if (origin_hdr != NULL) {
+				snprintf(origin_hdr, l, "Origin: %s", origin);
+				hdrs[n++] = origin_hdr;
+			}
+			free(origin);
+		}
+	}
+	hdrs[n] = NULL;
+	err = fetch_start(x->url, x->referer, xhr_fetch_callback, x, false,
+			  x->post, NULL, true, false, hdrs, &x->fetch);
+	free(origin_hdr);
+	free(hdrs);
+	if (err != NSERROR_OK) {
+		x->fetch = NULL;
+		return false;
+	}
+	if (x->timeout_ms > 0 && !x->timer_set) {
+		guit->misc->schedule(x->timeout_ms, xhr_timeout_cb, x);
+		x->timer_set = true;
+	}
+	return true;
+}
+
+/* __vitaFetch(url, method, headers[], body, timeoutMs, callback) -> id */
+static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct js_xhr *x;
+	nsurl *page = NULL, *url = NULL;
+	const char *url_s, *method = NULL, *body = NULL;
+	int32_t timeout = 0;
+	const char *scheme;
+
+	(void)this_val;
+	if (argc < 6 || thread == NULL || thread->closed || thread->win == NULL ||
+	    !JS_IsFunction(ctx, argv[5])) {
+		return JS_NewInt32(ctx, 0);
+	}
+	if (browser_window_get_url(thread->win, false, &page) != NSERROR_OK ||
+	    page == NULL) {
+		return JS_NewInt32(ctx, 0);
+	}
+	url_s = JS_ToCString(ctx, argv[0]);
+	if (url_s == NULL || nsurl_join(page, url_s, &url) != NSERROR_OK) {
+		if (url_s) JS_FreeCString(ctx, url_s);
+		nsurl_unref(page);
+		return JS_NewInt32(ctx, 0);
+	}
+	JS_FreeCString(ctx, url_s);
+	scheme = nsurl_access(url);
+	if (strncasecmp(scheme, "http:", 5) != 0 && strncasecmp(scheme, "https:", 6) != 0) {
+		vita_log("xhr: refusing %s (only http and https)", scheme);
+		nsurl_unref(url);
+		nsurl_unref(page);
+		return JS_NewInt32(ctx, 0);
+	}
+
+	x = calloc(1, sizeof(*x));
+	if (x == NULL) {
+		nsurl_unref(url);
+		nsurl_unref(page);
+		return JS_NewInt32(ctx, 0);
+	}
+	x->thread = thread;
+	x->id = ++thread->next_xhr_id;
+	x->url = url;
+	x->referer = page;
+	x->callback = JS_DupValue(ctx, argv[5]);
+	JS_ToInt32(ctx, &timeout, argv[4]);
+	x->timeout_ms = timeout > 0 ? timeout : 0;
+	x->cross_origin = !same_origin(url, page);
+
+	method = JS_ToCString(ctx, argv[1]);
+	if (!JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) {
+		body = JS_ToCString(ctx, argv[3]);
+	}
+	if (method != NULL && strcasecmp(method, "GET") != 0 &&
+	    strcasecmp(method, "HEAD") != 0) {
+		/* the fetch layer knows GET and POST; other verbs go as POST */
+		x->post = strdup(body != NULL ? body : "");
+		if (strcasecmp(method, "POST") != 0) {
+			vita_log("xhr: %s sent as POST (fetch layer limit)", method);
+		}
+	}
+	if (method) JS_FreeCString(ctx, method);
+	if (body) JS_FreeCString(ctx, body);
+
+	if (JS_IsArray(argv[2])) {
+		JSValue lenv = JS_GetPropertyStr(ctx, argv[2], "length");
+		int32_t n = 0, i, k = 0;
+
+		JS_ToInt32(ctx, &n, lenv);
+		JS_FreeValue(ctx, lenv);
+		if (n > 32) n = 32;
+		x->headers = calloc((size_t)n + 1, sizeof(char *));
+		for (i = 0; x->headers != NULL && i < n; i++) {
+			JSValue hv = JS_GetPropertyUint32(ctx, argv[2], (uint32_t)i);
+			const char *hs = JS_ToCString(ctx, hv);
+			if (hs != NULL && strchr(hs, ':') != NULL &&
+			    strchr(hs, '\n') == NULL && strchr(hs, '\r') == NULL) {
+				x->headers[k++] = strdup(hs);
+			}
+			if (hs) JS_FreeCString(ctx, hs);
+			JS_FreeValue(ctx, hv);
+		}
+	}
+
+	x->next = thread->xhrs;
+	thread->xhrs = x;
+	if (!xhr_start(x)) {
+		xhr_unlink(x);
+		JS_FreeValue(ctx, x->callback);
+		x->thread = NULL;
+		xhr_free(x);
+		return JS_NewInt32(ctx, 0);
+	}
+	return JS_NewInt32(ctx, x->id);
+}
+
+static JSValue win_vita_fetch_abort(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct js_xhr *x;
+	int32_t id = 0;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL) return JS_UNDEFINED;
+	JS_ToInt32(ctx, &id, argv[0]);
+	for (x = thread->xhrs; x != NULL; x = x->next) {
+		if (x->id == id) {
+			xhr_unlink(x);
+			JS_FreeValue(ctx, x->callback);
+			x->thread = NULL;
+			xhr_free(x); /* aborts the fetch; no callback follows */
+			break;
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+/** Abort every request of a closing page. */
+static void xhr_close_all(jsthread *thread)
+{
+	struct js_xhr *x = thread->xhrs;
+
+	thread->xhrs = NULL;
+	while (x != NULL) {
+		struct js_xhr *next = x->next;
+		JS_FreeValue(thread->ctx, x->callback);
+		x->thread = NULL;
+		xhr_free(x);
+		x = next;
+	}
+}
+
 /* ------------------------------------------------------------------------ */
 /* Event dispatch                                                           */
 
@@ -1584,179 +2042,11 @@ static JSValue node_ctor(JSContext *ctx, JSValueConst new_target,
 }
 
 /*
- * Bindings that are simplest to express in JS. They run once per page
- * context; Node is the shared prototype of every wrapped DOM node.
+ * The JavaScript half of the bindings lives in vita/js/prelude.js; CMake
+ * embeds it as a NUL-terminated byte array in prelude_js.h. It runs once
+ * per page context after the C bindings are installed.
  */
-static const char prelude_js[] =
-"(function(){\n"
-"var P=Node.prototype;\n"
-"function priv(o,k,make){if(!Object.prototype.hasOwnProperty.call(o,k))"
-"Object.defineProperty(o,k,{value:make(),writable:true});return o[k];}\n"
-"Object.defineProperty(P,'style',{get:function(){return priv(this,'__style',function(){"
-"return {getPropertyValue:function(){return '';},setProperty:function(){},removeProperty:function(){},cssText:''};});}});\n"
-"Object.defineProperty(P,'dataset',{get:function(){return priv(this,'__dataset',function(){return {};});}});\n"
-"Object.defineProperty(P,'classList',{get:function(){var el=this;return {"
-"contains:function(c){return (' '+el.className+' ').indexOf(' '+c+' ')>=0;},"
-"add:function(){for(var i=0;i<arguments.length;i++){if(!this.contains(arguments[i]))el.className=(el.className?el.className+' ':'')+arguments[i];}},"
-"remove:function(){for(var i=0;i<arguments.length;i++){el.className=(' '+el.className+' ').split(' '+arguments[i]+' ').join(' ').trim();}},"
-"toggle:function(c,f){var h=this.contains(c);if(f===undefined)f=!h;if(f&&!h)this.add(c);else if(!f&&h)this.remove(c);return f;},"
-"get length(){return el.className?el.className.split(/\\s+/).length:0;}};}});\n"
-"Object.defineProperty(P,'children',{get:function(){return this.childNodes.filter(function(n){return n.nodeType===1;});}});\n"
-"Object.defineProperty(P,'firstElementChild',{get:function(){var c=this.children;return c.length?c[0]:null;}});\n"
-"Object.defineProperty(P,'lastElementChild',{get:function(){var c=this.children;return c.length?c[c.length-1]:null;}});\n"
-"Object.defineProperty(P,'parentElement',{get:function(){var p=this.parentNode;return p&&p.nodeType===1?p:null;}});\n"
-"Object.defineProperty(P,'innerText',{get:function(){return this.textContent;},set:function(v){this.textContent=v;}});\n"
-"Object.defineProperty(P,'outerHTML',{get:function(){return '';}});\n"
-"Object.defineProperty(P,'ownerDocument',{get:function(){return document;}});\n"
-"['href','src','value','type','name','title','alt','rel','target','action','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){"
-"var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){this.setAttribute(attr,String(v));}});});\n"
-"['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();"
-"Object.defineProperty(P,a,{get:function(){return this.hasAttribute(attr);},set:function(v){if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});\n"
-"['offsetWidth','offsetHeight','offsetTop','offsetLeft','clientWidth','clientHeight','clientTop','clientLeft','scrollWidth','scrollHeight'].forEach(function(a){"
-"Object.defineProperty(P,a,{get:function(){return 0;}});});\n"
-"P.scrollTop=0;P.scrollLeft=0;P.tabIndex=0;\n"
-"['onclick','onchange','onsubmit','oninput','onkeydown','onkeyup','onkeypress','onmousedown','onmouseup','onmouseover','onmouseout','onfocus','onblur','onload','onerror','ontouchstart','ontouchend'].forEach(function(h){"
-"Object.defineProperty(P,h,{get:function(){return this['__'+h]||null;},set:function(f){this['__'+h]=f;if(typeof f==='function')this.addEventListener(h.slice(2),function(e){return f.call(this,e);});}});});\n"
-"P.getBoundingClientRect=function(){return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};};\n"
-"P.getClientRects=function(){return [];};\n"
-"P.focus=P.blur=P.scrollIntoView=P.click=P.select=function(){};\n"
-"P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return false;};\n"
-"P.hasChildNodes=function(){return this.firstChild!==null;};\n"
-"P.remove=function(){var p=this.parentNode;if(p)p.removeChild(this);};\n"
-"P.getElementsByClassName=function(c){return this.querySelectorAll('.'+c);};\n"
-"function parseSimple(sel){var m=sel.match(/^([a-zA-Z][\\w-]*|\\*)?(#[\\w-]+)?((?:\\.[\\w-]+)*)(\\[[^\\]]*\\])?$/);if(!m)return null;"
-"return {tag:m[1]&&m[1]!=='*'?m[1].toUpperCase():null,id:m[2]?m[2].slice(1):null,classes:m[3]?m[3].split('.').slice(1):[],attr:m[4]?m[4].slice(1,-1).split('=')[0].replace(/\"/g,''):null};}\n"
-"function matchSimple(el,q){if(el.nodeType!==1)return false;if(q.tag&&el.tagName.toUpperCase()!==q.tag)return false;if(q.id&&el.id!==q.id)return false;"
-"for(var i=0;i<q.classes.length;i++)if(!el.classList.contains(q.classes[i]))return false;if(q.attr&&!el.hasAttribute(q.attr))return false;return true;}\n"
-"function matchesCompound(el,parts){var i=parts.length-1;if(!matchSimple(el,parts[i]))return false;var n=el.parentNode;i--;"
-"while(i>=0&&n&&n.nodeType===1){if(matchSimple(n,parts[i]))i--;n=n.parentNode;}return i<0;}\n"
-"function compile(selector){return selector.split(',').map(function(s){return s.trim().split(/\\s*>\\s*|\\s+/).map(parseSimple);}).filter(function(p){return p.every(function(x){return x;});});}\n"
-"function collect(root,groups,all,out){var c=root.firstChild;while(c){if(c.nodeType===1){for(var g=0;g<groups.length;g++){if(matchesCompound(c,groups[g])){out.push(c);break;}}"
-"if(!all&&out.length)return out;collect(c,groups,all,out);if(!all&&out.length)return out;}c=c.nextSibling;}return out;}\n"
-"P.querySelectorAll=function(sel){return collect(this,compile(String(sel)),true,[]);};\n"
-"P.querySelector=function(sel){var r=collect(this,compile(String(sel)),false,[]);return r.length?r[0]:null;};\n"
-"P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchesCompound(el,g);});};\n"
-"P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))return n;n=n.parentNode;}return null;};\n"
-"P.dispatchEvent=function(){return true;};P.getContext=function(){return null;};\n"
-"P.add=function(o,before){this.insertBefore(o,before||null);};\n"
-"Object.defineProperty(P,'options',{get:function(){return this.getElementsByTagName('option');}});\n"
-"Object.defineProperty(P,'selectedIndex',{get:function(){var o=this.options;for(var i=0;i<o.length;i++)if(o[i].hasAttribute('selected'))return i;return o.length?0:-1;},"
-"set:function(i){var o=this.options;for(var j=0;j<o.length;j++){if(j===i)o[j].setAttribute('selected','');else o[j].removeAttribute('selected');}}});\n"
-"Object.defineProperty(P,'selectedOptions',{get:function(){return this.options.filter(function(o){return o.hasAttribute('selected');});}});\n"
-"var D=document;\n"
-"D.querySelectorAll=function(s){var r=D.documentElement;return r?r.querySelectorAll(s):[];};\n"
-"D.querySelector=function(s){var r=D.documentElement;return r?r.querySelector(s):null;};\n"
-"D.getElementsByClassName=function(c){return D.querySelectorAll('.'+c);};\n"
-"Object.defineProperty(D,'head',{get:function(){var h=D.getElementsByTagName('head');return h.length?h[0]:null;}});\n"
-"Object.defineProperty(D,'forms',{get:function(){return D.getElementsByTagName('form');}});\n"
-"Object.defineProperty(D,'images',{get:function(){return D.getElementsByTagName('img');}});\n"
-"Object.defineProperty(D,'links',{get:function(){return D.getElementsByTagName('a');}});\n"
-"Object.defineProperty(D,'scripts',{get:function(){return D.getElementsByTagName('script');}});\n"
-"D.defaultView=window;D.nodeType=9;D.nodeName='#document';D.documentMode=undefined;D.compatMode='CSS1Compat';D.hidden=false;D.visibilityState='visible';\n"
-"D.createEvent=function(t){return /custom/i.test(t)?new CustomEvent(''):new Event('');};D.dispatchEvent=function(){return true;};D.hasFocus=function(){return true;};\n"
-"D.createElementNS=function(ns,t){return D.createElement(t);};D.createAttribute=function(n){return {name:n,value:''};};\n"
-"D.implementation={createHTMLDocument:function(){return D;},createDocument:function(){return D;},hasFeature:function(){return true;}};\n"
-"D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';\n"
-"window.NodeFilter={FILTER_ACCEPT:1,FILTER_REJECT:2,FILTER_SKIP:3,SHOW_ALL:0xFFFFFFFF,SHOW_ELEMENT:1,SHOW_TEXT:4,SHOW_COMMENT:128,SHOW_DOCUMENT:256};\n"
-"D.createTreeWalker=function(root,what,filter){what=what===undefined?0xFFFFFFFF:what;var fn=filter&&(typeof filter==='function'?filter:filter.acceptNode);"
-"function ok(n){if(n.nodeType===9)return false;if(!((1<<(n.nodeType-1))&what))return false;return fn?fn(n)===1:true;}"
-"function next(n){if(n.firstChild)return n.firstChild;while(n&&n!==root){if(n.nextSibling)return n.nextSibling;n=n.parentNode;}return null;}"
-"return {root:root,currentNode:root,nextNode:function(){var n=next(this.currentNode);while(n&&!ok(n))n=next(n);if(n)this.currentNode=n;return n;},"
-"firstChild:function(){var n=this.currentNode.firstChild;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},"
-"nextSibling:function(){var n=this.currentNode.nextSibling;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},"
-"parentNode:function(){var n=this.currentNode.parentNode;if(n&&n!==root&&ok(n)){this.currentNode=n;return n;}return null;}};};\n"
-"D.createNodeIterator=function(root,what,filter){var w=D.createTreeWalker(root,what,filter);return {nextNode:function(){return w.nextNode();},detach:function(){}};};\n"
-"Object.defineProperty(D,'URL',{get:function(){return location.href;}});Object.defineProperty(D,'documentURI',{get:function(){return location.href;}});\n"
-"Object.defineProperty(D,'activeElement',{get:function(){return D.body;}});\n"
-"D.createComment=function(t){return D.createTextNode('');};D.write=D.writeln=function(){};\n"
-"D.getElementsByName=function(n){return D.querySelectorAll('[name='+n+']').filter(function(e){return e.getAttribute('name')===n;});};\n"
-"D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};\n"
-"['onload','onreadystatechange','onclick','onkeydown','onkeyup','onmousemove','ontouchstart'].forEach(function(h){"
-"Object.defineProperty(D,h,{get:function(){return D['__'+h]||null;},set:function(f){D['__'+h]=f;if(typeof f==='function')D.addEventListener(h.slice(2),f);}});});\n"
-"var W=window;\n"
-"['onload','onerror','onresize','onscroll','onhashchange','onpopstate','onunload','onbeforeunload','onmessage','onpageshow','onclick','onkeydown','onkeyup','ontouchstart'].forEach(function(h){"
-"Object.defineProperty(W,h,{get:function(){return W['__'+h]||null;},set:function(f){W['__'+h]=f;if(typeof f==='function'&&h!=='onerror')W.addEventListener(h.slice(2),f);}});});\n"
-"W.dispatchEvent=function(){return true;};\n"
-"W.innerWidth=W.outerWidth=960;W.innerHeight=W.outerHeight=544;W.devicePixelRatio=1;W.scrollX=W.pageXOffset=0;W.scrollY=W.pageYOffset=0;\n"
-"W.screen={width:960,height:544,availWidth:960,availHeight:544,colorDepth:32,pixelDepth:32,orientation:{type:'landscape-primary'}};\n"
-"W.scrollTo=W.scrollBy=W.scroll=W.focus=W.blur=W.stop=W.print=W.close=function(){};W.open=function(){return null;};\n"
-"W.confirm=function(){return false;};W.prompt=function(){return null;};\n"
-"W.requestAnimationFrame=function(f){return setTimeout(function(){f(Date.now());},16);};W.cancelAnimationFrame=function(h){clearTimeout(h);};\n"
-"W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:false,timeRemaining:function(){return 10;}});},50);};W.cancelIdleCallback=function(h){clearTimeout(h);};\n"
-"W.getComputedStyle=function(el){return el&&el.style?el.style:{getPropertyValue:function(){return '';}};};\n"
-"W.matchMedia=function(q){return {matches:false,media:q,addListener:function(){},removeListener:function(){},addEventListener:function(){},removeEventListener:function(){}};};\n"
-"function Storage(){var d={};this.getItem=function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null;};this.setItem=function(k,v){d[k]=String(v);};"
-"this.removeItem=function(k){delete d[k];};this.clear=function(){d={};};this.key=function(i){return Object.keys(d)[i]||null;};Object.defineProperty(this,'length',{get:function(){return Object.keys(d).length;}});}\n"
-"W.localStorage=new Storage();W.sessionStorage=new Storage();\n"
-"W.history={length:1,state:null,pushState:function(){},replaceState:function(){},back:function(){},forward:function(){},go:function(){}};\n"
-"var t0=Date.now();var perf=W.performance||{};W.performance=perf;if(!perf.now)perf.now=function(){return Date.now()-t0;};"
-"perf.timing={navigationStart:t0,fetchStart:t0,domainLookupStart:t0,domainLookupEnd:t0,connectStart:t0,connectEnd:t0,requestStart:t0,responseStart:t0,responseEnd:t0,domLoading:t0,domInteractive:t0,domContentLoadedEventStart:t0,domContentLoadedEventEnd:t0,domComplete:t0,loadEventStart:t0,loadEventEnd:t0};"
-"perf.navigation={type:0,redirectCount:0};perf.mark=perf.measure=perf.clearMarks=perf.clearMeasures=function(){};perf.getEntries=perf.getEntriesByType=perf.getEntriesByName=function(){return [];};\n"
-"navigator.language='en-US';navigator.languages=['en-US','en'];navigator.cookieEnabled=true;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};\n"
-"location.reload=function(){location.href=location.href;};\n"
-"['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{get:function(){"
-"var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\\/\\/(([^\\/:?#]*)(?::(\\d+))?)([^?#]*)(\\?[^#]*)?(#.*)?/i)||[];"
-"return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:(m[1]||'')+'//'+(m[2]||'')}[k];}});});\n"
-"location.toString=function(){return location.href;};\n"
-"function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();}\n"
-"Event.prototype.preventDefault=function(){this.defaultPrevented=true;};Event.prototype.stopPropagation=Event.prototype.stopImmediatePropagation=function(){};"
-"Event.prototype.initEvent=function(t,b,c){this.type=t;this.bubbles=!!b;this.cancelable=!!c;};\n"
-"function CustomEvent(type,init){Event.call(this,type,init);this.detail=init?init.detail:null;}CustomEvent.prototype=Object.create(Event.prototype);\n"
-"CustomEvent.prototype.initCustomEvent=function(t,b,c,d){this.initEvent(t,b,c);this.detail=d;};\n"
-"W.Event=Event;W.CustomEvent=CustomEvent;W.UIEvent=W.MouseEvent=W.KeyboardEvent=W.FocusEvent=Event;\n"
-"W.HTMLDocument=W.Document=function(){};W.Document.prototype=Object.getPrototypeOf(D);\n"
-"W.NodeList=W.HTMLCollection=Array;\n"
-"['CharacterData','Text','Comment','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});\n"
-"W.Window=function(){};W.Window.prototype=Object.getPrototypeOf(W);W.Navigator=W.Location=W.History=W.Screen=W.Storage=Storage;\n"
-"W.MutationObserver=function(){};W.MutationObserver.prototype.observe=W.MutationObserver.prototype.disconnect=function(){};W.MutationObserver.prototype.takeRecords=function(){return [];};\n"
-"W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};"
-"W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;\n"
-"W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};\n"
-"W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};\n"
-"function Image(){return document.createElement('img');}W.Image=Image;\n"
-"function URLSearchParams(init){this._p=[];if(typeof init==='string'){init.replace(/^\\?/,'').split('&').forEach(function(kv){if(!kv)return;var i=kv.indexOf('=');"
-"var k=i<0?kv:kv.slice(0,i),v=i<0?'':kv.slice(i+1);this._p.push([decodeURIComponent(k.replace(/\\+/g,' ')),decodeURIComponent(v.replace(/\\+/g,' '))]);},this);}"
-"else if(init&&typeof init==='object'){var self=this;(init._p?init._p:Object.keys(init).map(function(k){return [k,init[k]];})).forEach(function(kv){self._p.push([String(kv[0]),String(kv[1])]);});}}\n"
-"URLSearchParams.prototype={get:function(k){for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},"
-"getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},has:function(k){return this.get(k)!==null;},"
-"set:function(k,v){var d=false;this._p=this._p.filter(function(p){if(p[0]!==k)return true;if(d)return false;p[1]=String(v);d=true;return true;});if(!d)this._p.push([k,String(v)]);},"
-"append:function(k,v){this._p.push([k,String(v)]);},'delete':function(k){this._p=this._p.filter(function(p){return p[0]!==k;});},"
-"forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},"
-"values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},"
-"toString:function(){return this._p.map(function(p){return encodeURIComponent(p[0])+'='+encodeURIComponent(p[1]);}).join('&');},sort:function(){this._p.sort(function(a,b){return a[0]<b[0]?-1:a[0]>b[0]?1:0;});}};\n"
-"URLSearchParams.prototype[Symbol.iterator]=URLSearchParams.prototype.entries;Object.defineProperty(URLSearchParams.prototype,'size',{get:function(){return this._p.length;}});\n"
-"var URL_RE=/^([a-z][a-z0-9+.-]*:)?(?:\\/\\/(?:([^:@\\/?#]*)(?::([^@\\/?#]*))?@)?([^:\\/?#]*)(?::(\\d+))?)?([^?#]*)(\\?[^#]*)?(#.*)?$/i;\n"
-"function URL(url,base){url=String(url);var m=URL_RE.exec(url);if(!m)throw new TypeError('Invalid URL');"
-"if(!m[1]){if(base===undefined)throw new TypeError('Invalid URL');var b=new URL(String(base));var path=m[6];"
-"if(url.indexOf('//')===0){m[1]=b.protocol;m=URL_RE.exec(b.protocol+url);}else{m[1]=b.protocol;m[2]=b.username;m[3]=b.password;m[4]=b.hostname;m[5]=b.port;"
-"if(path===''){m[6]=b.pathname;if(!m[7])m[7]=b.search;}else if(path.charAt(0)!=='/'){var dir=b.pathname.replace(/[^\\/]*$/,'');m[6]=dir+path;}"
-"var segs=[];m[6].split('/').forEach(function(sg){if(sg==='..')segs.pop();else if(sg!=='.')segs.push(sg);});m[6]=segs.join('/');if(m[6].charAt(0)!=='/')m[6]='/'+m[6];}}"
-"this.protocol=(m[1]||'').toLowerCase();this.username=m[2]||'';this.password=m[3]||'';this.hostname=(m[4]||'').toLowerCase();this.port=m[5]||'';"
-"this.pathname=m[6]||(this.hostname?'/':'');this.search=m[7]&&m[7]!=='?'?m[7]:'';this.hash=m[8]&&m[8]!=='#'?m[8]:'';this.searchParams=new URLSearchParams(this.search);}\n"
-"Object.defineProperties(URL.prototype,{host:{get:function(){return this.hostname+(this.port?':'+this.port:'');}},origin:{get:function(){return this.hostname?this.protocol+'//'+this.host:'null';}},"
-"href:{get:function(){var q=this.searchParams.toString();var s=q?'?'+q:(this.search||'');var auth=this.username?this.username+(this.password?':'+this.password:'')+'@':'';"
-"return this.protocol+(this.hostname||this.protocol==='file:'?'//':'')+auth+this.host+this.pathname+s+this.hash;}}});\n"
-"URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=function(){return 'blob:';};URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};\n"
-"W.URL=URL;W.URLSearchParams=URLSearchParams;\n"
-"W.crypto={getRandomValues:function(a){for(var i=0;i<a.length;i++)a[i]=Math.floor(Math.random()*4294967296);return a;},randomUUID:function(){return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){var r=Math.random()*16|0;return (c==='x'?r:(r&3|8)).toString(16);});},subtle:{}};\n"
-"function pad2(n){return (n<10?'0':'')+n;}\n"
-"W.Intl={DateTimeFormat:function(loc,opt){opt=opt||{};this.format=function(d){d=d instanceof Date?d:new Date(d===undefined?Date.now():d);var s=d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate());"
-"if(opt.hour||opt.minute||opt.timeStyle||opt.second)s=(opt.year||opt.month||opt.day||opt.dateStyle?s+' ':'')+pad2(d.getHours())+':'+pad2(d.getMinutes())+(opt.second||opt.timeStyle?':'+pad2(d.getSeconds()):'');return s;};"
-"this.formatToParts=function(d){return [{type:'literal',value:this.format(d)}];};this.resolvedOptions=function(){return {locale:'en-US',timeZone:opt.timeZone||'UTC',calendar:'gregory',numberingSystem:'latn'};};},"
-"NumberFormat:function(loc,opt){opt=opt||{};this.format=function(n){n=Number(n);var f=opt.maximumFractionDigits!==undefined?opt.maximumFractionDigits:(opt.style==='currency'?2:3);var s=n.toFixed(Math.min(f,20));"
-"if(s.indexOf('.')>=0&&opt.minimumFractionDigits===undefined)s=s.replace(/\\.?0+$/,'');var parts=s.split('.');parts[0]=parts[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');s=parts.join('.');"
-"if(opt.style==='percent')s=(n*100).toFixed(0)+'%';if(opt.style==='currency')s=(opt.currency||'')+' '+s;return s;};this.formatToParts=function(n){return [{type:'integer',value:this.format(n)}];};this.resolvedOptions=function(){return {locale:'en-US'};};},"
-"Collator:function(){this.compare=function(a,b){a=String(a);b=String(b);return a<b?-1:a>b?1:0;};this.resolvedOptions=function(){return {locale:'en-US'};};},"
-"PluralRules:function(){this.select=function(n){return Number(n)===1?'one':'other';};},"
-"RelativeTimeFormat:function(){this.format=function(v,u){v=Number(v);var a=Math.abs(v);u=String(u).replace(/s$/,'');return v<0?a+' '+u+(a===1?'':'s')+' ago':'in '+a+' '+u+(a===1?'':'s');};},"
-"ListFormat:function(){this.format=function(l){return Array.prototype.join.call(l,', ');};},"
-"getCanonicalLocales:function(l){return [].concat(l||[]);},supportedValuesOf:function(){return [];}};\n"
-"['DateTimeFormat','NumberFormat','Collator','PluralRules','RelativeTimeFormat','ListFormat'].forEach(function(k){W.Intl[k].supportedLocalesOf=function(){return ['en-US'];};});\n"
-"Date.prototype.toLocaleDateString=function(){return new Intl.DateTimeFormat(undefined,{year:1,month:1,day:1}).format(this);};"
-"Date.prototype.toLocaleTimeString=function(){return new Intl.DateTimeFormat(undefined,{hour:1,minute:1,second:1}).format(this);};"
-"Date.prototype.toLocaleString=function(){return new Intl.DateTimeFormat(undefined,{year:1,month:1,day:1,hour:1,minute:1,second:1}).format(this);};\n"
-"function Option(t,v){var o=document.createElement('option');if(t!==undefined)o.textContent=t;if(v!==undefined)o.setAttribute('value',v);return o;}W.Option=Option;\n"
-"})();\n";
+#include "prelude_js.h"
 
 static void install_object(JSContext *ctx, JSValue parent, const char *name,
 			   const JSCFunctionListEntry *tab, size_t n)
@@ -1828,6 +2118,12 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "alert",
 			  JS_NewCFunction(ctx, console_log, "alert", 1));
 
+	/* transport for XMLHttpRequest and fetch (prelude.js) */
+	JS_SetPropertyStr(ctx, global, "__vitaFetch",
+			  JS_NewCFunction(ctx, win_vita_fetch, "__vitaFetch", 6));
+	JS_SetPropertyStr(ctx, global, "__vitaFetchAbort",
+			  JS_NewCFunction(ctx, win_vita_fetch_abort, "__vitaFetchAbort", 1));
+
 	/* window listeners live on the document node (see add_listener) */
 	JS_SetPropertyStr(ctx, global, "addEventListener",
 			  JS_NewCFunction(ctx, doc_add_event_listener, "addEventListener", 2));
@@ -1847,11 +2143,11 @@ static void setup_globals(jsthread *thread)
 	JS_FreeValue(ctx, global);
 
 	{
-		JSValue r = JS_Eval(ctx, prelude_js, sizeof(prelude_js) - 1,
-				    "<prelude>", JS_EVAL_TYPE_GLOBAL);
+		const char *src = (const char *)prelude_js;
+		size_t len = sizeof(prelude_js) - 1;
+		JSValue r = JS_Eval(ctx, src, len, "<prelude>", JS_EVAL_TYPE_GLOBAL);
 		if (JS_IsException(r)) {
-			qjs_report_exception_src(ctx, "<prelude>", prelude_js,
-						 sizeof(prelude_js) - 1);
+			qjs_report_exception_src(ctx, "<prelude>", src, len);
 		}
 		JS_FreeValue(ctx, r);
 	}
@@ -1974,6 +2270,7 @@ nserror js_closethread(jsthread *thread)
 		l->func = JS_UNDEFINED;
 		l->thread = NULL;
 	}
+	xhr_close_all(thread);
 	free_wrappers(thread);
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
