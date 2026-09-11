@@ -9,10 +9,21 @@
 #   out/netsurf/resources/      Messages, CSS, internal HTML pages
 #
 # Set VITASURF_DEBUG=1 for a build with verbose logging compiled in, and
-# VITASURF_JS=NO for a build without JavaScript.
+# VITASURF_JS_ENGINE to duktape (default), quickjs or no to pick the
+# JavaScript engine; pass the same choice to CMake as -DVITASURF_JS_ENGINE.
+# VITASURF_JS=NO is still accepted and means VITASURF_JS_ENGINE=no.
 # Requires scripts/build-deps.sh to have run first (it also builds the
-# nsgenbind host tool the JavaScript bindings need).
+# nsgenbind host tool the Duktape bindings need).
 set -euo pipefail
+
+VITASURF_JS_ENGINE="${VITASURF_JS_ENGINE:-duktape}"
+if [ "${VITASURF_JS:-YES}" = "NO" ]; then
+    VITASURF_JS_ENGINE=no
+fi
+case "$VITASURF_JS_ENGINE" in
+    duktape|quickjs|no) ;;
+    *) echo "error: VITASURF_JS_ENGINE must be duktape, quickjs or no" >&2; exit 1 ;;
+esac
 
 . "$(dirname "${BASH_SOURCE[0]}")/vita-env.sh"
 
@@ -37,7 +48,7 @@ MAKE_ARGS=(
     "AR=$TARGET_AR"
     "PKG_CONFIG=$NETSURF_PKG_CONFIG"
     "VITASURF_DEBUG=${VITASURF_DEBUG:-0}"
-    "VITASURF_JS=${VITASURF_JS:-YES}"
+    "VITASURF_JS_ENGINE=$VITASURF_JS_ENGINE"
     Q=@
 )
 
@@ -47,7 +58,7 @@ if [ "${1:-}" = "clean" ]; then
     exit 0
 fi
 
-echo "==== netsurf ($OBJROOT)"
+echo "==== netsurf ($OBJROOT, JavaScript engine: $VITASURF_JS_ENGINE)"
 # -k keeps compiling after an error so one run reports every broken file.
 make -C "$NETSURF" "${MAKE_ARGS[@]}" -j"$JOBS" -k "$OBJROOT/libnetsurf.a"
 

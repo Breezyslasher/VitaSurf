@@ -1,0 +1,15 @@
+diff --git a/content/handlers/javascript/Makefile b/content/handlers/javascript/Makefile
+index 5cd0fc36b..fb54647e8 100644
+--- a/content/handlers/javascript/Makefile
++++ b/content/handlers/javascript/Makefile
+@@ -9,6 +9,10 @@ S_JAVASCRIPT_BINDING:=
+ ifeq ($(NETSURF_USE_DUKTAPE),YES)
+ # Duktape
+ include content/handlers/javascript/duktape/Makefile
++else ifeq ($(NETSURF_USE_QUICKJS),YES)
++# QuickJS: the js.h implementation is compiled outside this tree
++# (VitaSurf vita/js/qjs.c) and linked in at the final link, so no
++# engine source is added here; only the javascript: fetcher below.
+ else
+ # None
+ include content/handlers/javascript/none/Makefile

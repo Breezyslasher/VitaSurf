@@ -9,8 +9,19 @@ on:
 
 jobs:
   vpk:
-    name: PS Vita VPK
+    name: PS Vita VPK (${{ matrix.engine }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both JavaScript engines are built until QuickJS is clearly better
+        # (CLAUDE.md phase 6). The Duktape VPK keeps the plain artifact name
+        # so existing install instructions still apply.
+        include:
+          - engine: duktape
+            artifact: VitaSurf
+          - engine: quickjs
+            artifact: VitaSurf-quickjs
     container:
       # Pinned rather than :latest so a rebuilt base image cannot change the
       # package manager or vdpm behaviour underneath the build.
@@ -57,19 +68,22 @@ jobs:
           if vdpm list curl >/dev/null 2>&1; then
             VDPM_NONINTERACTIVE=1 vdpm remove --nodeps --nodeps curl
           fi
-          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d
+          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d quickjs-ng
 
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh
 
       - name: Build NetSurf
         run: ./scripts/build-netsurf.sh
+        env:
+          VITASURF_JS_ENGINE: ${{ matrix.engine }}
 
       - name: Configure and build VPK
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DVITASURF_JS_ENGINE="${{ matrix.engine }}" \
             -DVITASURF_BUILD_ID="${GITHUB_RUN_NUMBER}" \
             -DVITASURF_BUILD_SHA="$(echo "$GITHUB_SHA" | cut -c1-7)"
           cmake --build build
@@ -77,20 +91,24 @@ jobs:
       - name: Upload VPK
         uses: actions/upload-artifact@v4
         with:
-          name: VitaSurf-${{ github.run_number }}
+          name: ${{ matrix.artifact }}-${{ github.run_number }}
           path: build/VitaSurf.vpk
 
       - name: Upload ELF for debugging
         uses: actions/upload-artifact@v4
         with:
-          name: VitaSurf-elf-${{ github.run_number }}
+          name: ${{ matrix.artifact }}-elf-${{ github.run_number }}
           path: build/VitaSurf
+
+      - name: Rename VPK for the release
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.engine != 'duktape'
+        run: cp build/VitaSurf.vpk "build/${{ matrix.artifact }}.vpk"
 
       - name: Attach VPK to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: build/VitaSurf.vpk
+          files: build/${{ matrix.artifact }}.vpk
           body: |
             VitaSurf ${{ github.ref_name }}
 

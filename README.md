@@ -24,7 +24,10 @@ log for measurement. Phase 5 (persistence) is in progress: cookies and
 the URL history are saved under `ux0:data/VitaSurf/` after page loads
 and on exit, bookmarks live in a text file there, settings changed from
 the Start menu are written to a user Choices file read after the bundled
-one, and the menu shows bookmarks and history as generated pages.
+one, and the menu shows bookmarks and history as generated pages. Phase 6
+(QuickJS) is in progress: a second engine built on quickjs-ng with
+hand-written DOM bindings, kept side by side with Duktape until its memory
+use and page-load times are measured on hardware.
 
 ## Building
 
@@ -32,7 +35,7 @@ Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
 `make`, `pkg-config`, `perl`, `gperf`, `flex`, `bison`, `cmake` and host
 development packages for zlib and libpng (NetSurf builds a few host tools).
 
-    vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d
+    vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d quickjs-ng
     git submodule update --init --recursive
     ./scripts/build-deps.sh
     ./scripts/build-netsurf.sh
@@ -46,8 +49,13 @@ every BIO and X509 object, and on hardware those allocations started failing
 after a few hundred locks, so curl could never load the CA bundle. mbedTLS
 only needs a handful of mutexes. Add `VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
-build with verbose logging, and `VITASURF_JS=NO` to `build-netsurf.sh`
-for a build without JavaScript. Creating an empty file named `verbose` in
+build with verbose logging. The JavaScript engine is chosen with
+`VITASURF_JS_ENGINE` in the environment of `build-netsurf.sh` and the
+matching `-DVITASURF_JS_ENGINE=` for CMake: `duktape` (default, NetSurf's
+engine with nsgenbind bindings), `quickjs` (quickjs-ng, MIT, with the
+hand-written bindings in `vita/js/qjs.c`) or `no`. CI builds both engines;
+the QuickJS VPK is the `VitaSurf-quickjs` artifact and the startup line
+in the log names the engine. Creating an empty file named `verbose` in
 `ux0:data/VitaSurf/` turns NetSurf's verbose logging on at runtime in any
 build; the log also starts with a self-test of the path and clock
 assumptions the port relies on.
