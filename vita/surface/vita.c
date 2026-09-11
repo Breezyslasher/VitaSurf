@@ -371,6 +371,7 @@ static int vita_set_geometry(nsfb_t *nsfb, int width, int height,
 	 * for XRGB because it maps 32 bpp to that; the substitution only
 	 * changes which software plotters libnsfb selects.
 	 */
+	(void)format;
 	if (width != SCREEN_WIDTH || height != SCREEN_HEIGHT) {
 		vita_log("surface: ignoring geometry %dx%d, screen is fixed",
 			 width, height);
