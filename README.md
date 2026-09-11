@@ -57,7 +57,14 @@ CSS `mask-image` (and `-webkit-mask-image`) is supported through patches
 0012 (libcss: the property) and 0013 (NetSurf: a masked box paints its
 background colour through the image, SVG or bitmap, fitted and centred in
 its padding box), which is how Wikipedia's mobile skin and other Codex
-based sites draw their icons.
+based sites draw their icons. Patch 0014 adds CSS custom properties to
+libcss: `--name` declarations on `:root`, `html`, `body` or `*` are kept
+per stylesheet and `var(--name, fallback)` references (nested fallbacks
+included) are substituted while the declaration is parsed, so the
+property is stored as its resolved value and costs nothing at selection
+time. Variables declared on other selectors are not tracked, and a
+declaration whose variable cannot be resolved is dropped, as the
+specification requires.
 
 ## Building
 
