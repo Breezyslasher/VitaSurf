@@ -102,7 +102,10 @@ path parser: a relative `q` recorded its control point before adding the
 current position, a relative `t` offset an already absolute reflected
 control point, and `s` and arcs stored one coordinate in the wrong slot,
 so any SVG drawn with relative quadratic curves (the Wikipedia wordmark
-among them) drifted larger with each curve.
+among them) drifted larger with each curve. Patch 0019 makes NetSurf
+start from a fresh diagram when it reparses an SVG at a new size;
+svgtiny_parse appends to the diagram, so every earlier copy of the shapes
+was kept, drawn on each redraw and leaked.
 
 ## Building
 
