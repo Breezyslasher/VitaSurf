@@ -65,6 +65,12 @@ void vita_net_log_state(void);
 /** Shut networking down. */
 void vita_net_fini(void);
 
+/**
+ * Read a whole file into a malloc()ed buffer with a trailing NUL that is
+ * not counted in len. Returns 0 on success, -1 on failure.
+ */
+int vita_read_file(const char *path, char **data, size_t *len);
+
 /** True when the user created the verbose flag file in the data directory. */
 int vita_verbose_requested(void);
 

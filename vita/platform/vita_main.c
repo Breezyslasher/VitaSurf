@@ -26,6 +26,13 @@
 #endif
 
 /*
+ * Phase 2 bring-up: NetSurf's verbose log (which also enables libcurl's
+ * connection trace) is on in every build until HTTPS pages load on
+ * hardware. Remove this once they do.
+ */
+#define VITASURF_ALWAYS_VERBOSE 1
+
+/*
  * newlib heap and main thread stack. Both are read by the VitaSDK C runtime
  * before main() runs. CSS selection and layout recurse deeply, hence the
  * large stack. The heap size is a CMake option (VITASURF_HEAP_MB).
@@ -64,7 +71,7 @@ int __wrap_main(int argc, char **argv)
 	 * ux0:data/VitaSurf/verbose. NetSurf only recognises -v as the first
 	 * argument. Release builds only carry INFO and above.
 	 */
-#ifdef VITASURF_DEBUG
+#if defined(VITASURF_DEBUG) || defined(VITASURF_ALWAYS_VERBOSE)
 	args[nargs++] = "-v";
 #else
 	if (vita_verbose_requested()) {

@@ -18,6 +18,7 @@
 #include <iconv.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -64,6 +65,37 @@ void vita_log_memory(const char *what)
 		 (unsigned int)info.size_user / 1024,
 		 (unsigned int)info.size_cdram / 1024,
 		 (unsigned int)info.size_phycont / 1024);
+}
+
+int vita_read_file(const char *path, char **data, size_t *len)
+{
+	FILE *f = fopen(path, "rb");
+	long size;
+	char *buf;
+
+	if (f == NULL) {
+		return -1;
+	}
+	if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0 ||
+	    fseek(f, 0, SEEK_SET) != 0) {
+		fclose(f);
+		return -1;
+	}
+	buf = malloc((size_t)size + 1);
+	if (buf == NULL) {
+		fclose(f);
+		return -1;
+	}
+	if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+		free(buf);
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	buf[size] = '\0';
+	*data = buf;
+	*len = (size_t)size;
+	return 0;
 }
 
 int vita_verbose_requested(void)
