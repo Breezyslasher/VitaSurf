@@ -108,7 +108,7 @@ static void utf16_to_utf8(const SceWChar16 *in, char *out, size_t outlen)
 	out[o] = '\0';
 }
 
-int vita_ime_start(const char *title, const char *initial)
+int vita_ime_start(const char *title, const char *initial, bool multiline)
 {
 	SceImeDialogParam param;
 	int ret;
@@ -130,6 +130,9 @@ int vita_ime_start(const char *title, const char *initial)
 	param.languagesForced = SCE_FALSE;
 	param.type = SCE_IME_TYPE_DEFAULT;
 	param.option = SCE_IME_OPTION_NO_AUTO_CAPITALIZATION;
+	if (multiline) {
+		param.option |= SCE_IME_OPTION_MULTILINE;
+	}
 	param.title = ime_title;
 	param.maxTextLength = VITA_IME_MAX_LENGTH;
 	param.initialText = ime_text;

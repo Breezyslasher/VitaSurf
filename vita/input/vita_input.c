@@ -11,6 +11,8 @@
  *   L / R        history back / forward
  *   Triangle     enter a URL or search terms (system IME, or NetSurf's
  *                on-screen keyboard if the IME cannot start)
+ *   text field   tapping or activating a form field opens the system
+ *                keyboard for it and types the result into the field
  *   Square       reload
  *   Select       toggle pointer mode
  *   Start        menu (later phase)
@@ -31,6 +33,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <psp2/kernel/processmgr.h>
 
 #include <libnsfb.h>
 #include <libnsfb_event.h>
@@ -88,11 +92,18 @@ void unmap_osk(void);
 
 enum direction { DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT };
 
+/* A caret placed within this long after a tap or Cross opens the keyboard. */
+#define ACTIVATION_WINDOW_US 500000
+
 /** A focusable element: its bounds in content coordinates and identity. */
 struct target {
 	struct rect r;
 	const void *key;   /**< href or gadget pointer; boxes of one link share it */
+	struct form_control *gadget; /**< set for form controls */
 };
+
+/** What the open IME dialog is for. */
+enum ime_target { IME_NONE, IME_URL, IME_FIELD };
 
 static struct gui_window *the_gw;
 static bool pointer_mode;
@@ -113,10 +124,15 @@ static nsfb_bbox_t overlay;
 static struct target *targets;
 static int ntargets;
 
+static enum ime_target ime_for = IME_NONE;
+static bool ime_field_multiline;
+static bool caret_active;          /**< a page text field has the caret */
+static uint64_t last_activation_us; /**< last Cross click or pointer click */
+
 /* ------------------------------------------------------------------------ */
 /* Box tree walk                                                            */
 
-static void add_target(struct box *b, const void *key)
+static void add_target(struct box *b, const void *key, struct form_control *gadget)
 {
 	struct target *t;
 	int x, y, w, h;
@@ -136,6 +152,7 @@ static void add_target(struct box *b, const void *key)
 	t->r.x1 = x + w;
 	t->r.y1 = y + h;
 	t->key = key;
+	t->gadget = gadget;
 }
 
 /**
@@ -152,10 +169,10 @@ static void collect_targets(struct box *b)
 			continue;
 		}
 		if (b->gadget != NULL && b->gadget->type != GADGET_HIDDEN) {
-			add_target(b, b->gadget);
+			add_target(b, b->gadget, b->gadget);
 		} else if (b->href != NULL &&
 			   (b->children == NULL || b->object != NULL)) {
-			add_target(b, b->href);
+			add_target(b, b->href, NULL);
 		}
 		if (b->children != NULL) {
 			collect_targets(b->children);
@@ -481,6 +498,7 @@ static void activate_focus(void)
 	fbtk_warp_pointer(the_gw->browser,
 			  fbtk_get_absx(the_gw->browser) + cx - sx,
 			  fbtk_get_absy(the_gw->browser) + cy - sy, false);
+	last_activation_us = sceKernelGetProcessTimeWide();
 	browser_window_mouse_click(the_gw->bw, BROWSER_MOUSE_PRESS_1, cx, cy);
 	browser_window_mouse_click(the_gw->bw, BROWSER_MOUSE_CLICK_1, cx, cy);
 }
@@ -493,6 +511,7 @@ static void click_at_pointer(void)
 	memset(&ev, 0, sizeof(ev));
 	ev.value.keycode = NSFB_KEY_MOUSE_1;
 	ev.type = NSFB_EVENT_KEY_DOWN;
+	last_activation_us = sceKernelGetProcessTimeWide();
 	fbtk_click(fbtk, &ev);
 	ev.type = NSFB_EVENT_KEY_UP;
 	fbtk_click(fbtk, &ev);
@@ -585,7 +604,9 @@ static void start_url_entry(void)
 		}
 	}
 
-	if (vita_ime_start("Web address or search", initial) < 0) {
+	if (vita_ime_start("Web address or search", initial, false) == 0) {
+		ime_for = IME_URL;
+	} else {
 		/* NetSurf's own keyboard on the URL bar */
 		vita_log("input: IME unavailable, using the on-screen keyboard");
 		fbtk_set_focus(the_gw->url);
@@ -593,6 +614,142 @@ static void start_url_entry(void)
 	}
 	if (url != NULL) {
 		nsurl_unref(url);
+	}
+}
+
+/* ------------------------------------------------------------------------ */
+/* Form field text entry                                                    */
+
+/** Type text into the focused form field, replacing what it holds. */
+static void type_into_field(const char *text)
+{
+	const unsigned char *p = (const unsigned char *)text;
+
+	if (the_gw == NULL) {
+		return;
+	}
+	browser_window_key_press(the_gw->bw, NS_KEY_SELECT_ALL);
+	if (*p == '\0') {
+		browser_window_key_press(the_gw->bw, NS_KEY_DELETE_LEFT);
+		return;
+	}
+	while (*p != '\0') {
+		uint32_t cp;
+		int extra;
+
+		if (*p < 0x80) {
+			cp = *p;
+			extra = 0;
+		} else if ((*p & 0xE0) == 0xC0) {
+			cp = *p & 0x1F;
+			extra = 1;
+		} else if ((*p & 0xF0) == 0xE0) {
+			cp = *p & 0x0F;
+			extra = 2;
+		} else if ((*p & 0xF8) == 0xF0) {
+			cp = *p & 0x07;
+			extra = 3;
+		} else {
+			p++;
+			continue;
+		}
+		p++;
+		while (extra-- > 0 && (*p & 0xC0) == 0x80) {
+			cp = (cp << 6) | (*p & 0x3F);
+			p++;
+		}
+		if (cp == '\r') {
+			continue;
+		}
+		if (cp == '\n') {
+			cp = ime_field_multiline ? NS_KEY_NL : ' ';
+		}
+		browser_window_key_press(the_gw->bw, cp);
+	}
+}
+
+/** Find the form control whose box contains a content point. */
+static struct form_control *gadget_at(int x, int y)
+{
+	struct hlcache_handle *content = NULL;
+	int i;
+
+	if (!gather_targets(&content)) {
+		return NULL;
+	}
+	for (i = 0; i < ntargets; i++) {
+		if (targets[i].gadget != NULL &&
+		    x >= targets[i].r.x0 && x < targets[i].r.x1 &&
+		    y >= targets[i].r.y0 && y < targets[i].r.y1) {
+			return targets[i].gadget;
+		}
+	}
+	return NULL;
+}
+
+void vita_input_caret(struct gui_window *gw, int x, int y, int height)
+{
+	struct vita_input_state st;
+	struct form_control *gadget;
+	uint64_t now = sceKernelGetProcessTimeWide();
+	bool activated;
+	const char *initial = "";
+	const char *title = "Enter text";
+	float scale;
+
+	(void)height;
+	if (gw != the_gw || vita_ime_running()) {
+		return;
+	}
+
+	/*
+	 * The caret is re-placed on every keystroke and caret move, so only
+	 * a caret that follows a tap or an activation means the user wants
+	 * to type; a field that merely kept focus stays quiet.
+	 */
+	vita_surface_read_input(&st);
+	activated = (now - last_activation_us < ACTIVATION_WINDOW_US) ||
+		    (st.last_tap_us != 0 && now - st.last_tap_us < ACTIVATION_WINDOW_US);
+	if (caret_active && !activated) {
+		return;
+	}
+	caret_active = true;
+	if (!activated) {
+		return;
+	}
+
+	scale = page_scale();
+	gadget = gadget_at((int)(x / scale), (int)(y / scale));
+	ime_field_multiline = false;
+	if (gadget != NULL) {
+		switch (gadget->type) {
+		case GADGET_TEXTAREA:
+			ime_field_multiline = true;
+			break;
+		case GADGET_PASSWORD:
+			title = "Enter password";
+			break;
+		default:
+			break;
+		}
+		if (gadget->value != NULL && gadget->type != GADGET_PASSWORD) {
+			initial = gadget->value;
+		}
+	}
+
+	/* the tap and its caret land in the same poll; consume the tap */
+	last_activation_us = 0;
+	if (vita_ime_start(title, initial, ime_field_multiline) == 0) {
+		ime_for = IME_FIELD;
+	} else {
+		vita_log("input: IME unavailable for the form field");
+	}
+}
+
+void vita_input_caret_removed(struct gui_window *gw)
+{
+	if (gw == the_gw) {
+		caret_active = false;
 	}
 }
 
@@ -642,7 +799,15 @@ static void tick(void *p)
 
 	switch (vita_ime_poll(text, sizeof(text))) {
 	case VITA_IME_DONE:
-		navigate_text(text);
+		if (ime_for == IME_FIELD) {
+			type_into_field(text);
+		} else {
+			navigate_text(text);
+		}
+		ime_for = IME_NONE;
+		break;
+	case VITA_IME_CANCELLED:
+		ime_for = IME_NONE;
 		break;
 	default:
 		break;

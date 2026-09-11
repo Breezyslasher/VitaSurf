@@ -93,6 +93,7 @@ fails for every charset, so libparserutils is built with its own codecs and
 | Right stick | Move the pointer |
 | L / R | Back / forward |
 | Triangle | Enter a web address or search terms |
+| Tap or Cross on a text field | Opens the system keyboard for that field |
 | Square | Reload |
 | Select | Toggle pointer mode: the D-pad nudges the pointer instead |
 | Start | Menu (not implemented yet) |
@@ -108,6 +109,9 @@ Cross. Link focus walks the page's box tree for links and form controls,
 picks the nearest one in the pressed direction, scrolls it into view and
 draws an outline over the display. Text entry uses the system IME dialog,
 falling back to NetSurf's on-screen keyboard if the dialog cannot start.
+When a form field takes the caret right after a tap or an activation, the
+keyboard opens for it with the field's current text and the result is
+typed into the field.
 
 The display goes through libvita2d (MIT): the page is copied into a
 screen-sized GPU texture and drawn when it changes. System dialogs such

@@ -16,6 +16,7 @@
 #define VITASURF_SURFACE_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "libnsfb.h"
 #include "libnsfb_event.h"
@@ -42,6 +43,7 @@ struct vita_input_state {
 	int drag_dx;     /**< touch drag movement since the last read, pixels */
 	int drag_dy;
 	bool dragging;   /**< a touch drag is in progress */
+	uint64_t last_tap_us; /**< process time of the last touch tap, 0 if none */
 };
 
 /**

@@ -35,4 +35,14 @@ bool vita_input_key(struct gui_window *gw, const struct nsfb_event_s *event);
  */
 bool vita_input_global_key(const struct nsfb_event_s *event);
 
+/**
+ * NetSurf placed the text caret in the page (a form field has focus).
+ * x, y are content coordinates. If this follows a tap or an activation,
+ * the system keyboard is opened for that field.
+ */
+void vita_input_caret(struct gui_window *gw, int x, int y, int height);
+
+/** NetSurf removed the caret from the page. */
+void vita_input_caret_removed(struct gui_window *gw);
+
 #endif

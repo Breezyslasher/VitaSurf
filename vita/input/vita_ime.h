@@ -29,7 +29,7 @@ enum vita_ime_status {
  * Show the IME dialog. Returns 0 on success or a negative SCE error, in
  * which case the caller should fall back to another input method.
  */
-int vita_ime_start(const char *title, const char *initial);
+int vita_ime_start(const char *title, const char *initial, bool multiline);
 
 /**
  * Poll the dialog. When it returns VITA_IME_DONE the entered text has been

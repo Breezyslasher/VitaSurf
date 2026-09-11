@@ -120,6 +120,8 @@ struct vita_surface {
 	int pointer_x;
 	int pointer_y;
 
+	SceUInt64 last_tap_us;    /**< when the last tap was queued */
+
 	/* focus rectangle overlay, screen coordinates, valid when set */
 	bool focus_valid;
 	nsfb_bbox_t focus;
@@ -381,6 +383,7 @@ static void poll_touch(struct vita_surface *vs)
 		vs->touch_down = false;
 		if (!vs->touch_dragging) {
 			/* a tap: move the pointer there and click */
+			vs->last_tap_us = sceKernelGetProcessTimeWide();
 			queue_move(vs, vs->touch_start_x, vs->touch_start_y);
 			queue_key(vs, NSFB_EVENT_KEY_DOWN, NSFB_KEY_MOUSE_1);
 			queue_key(vs, NSFB_EVENT_KEY_UP, NSFB_KEY_MOUSE_1);
@@ -679,6 +682,7 @@ void vita_surface_read_input(struct vita_input_state *out)
 	out->drag_dx = vs->drag_dx;
 	out->drag_dy = vs->drag_dy;
 	out->dragging = vs->touch_dragging;
+	out->last_tap_us = vs->last_tap_us;
 	vs->drag_dx = 0;
 	vs->drag_dy = 0;
 }
