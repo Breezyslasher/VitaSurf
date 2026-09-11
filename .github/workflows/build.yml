@@ -51,18 +51,11 @@ jobs:
       - name: Install Vita packages
         run: |
           set -eu
-          # curl-mbedtls replaces the OpenSSL-linked curl package. pacman
-          # refuses to swap conflicting packages non-interactively, so drop
-          # a preinstalled curl first.
-          PACMAN="$VITASDK/bin/pacman"
-          if [ -x "$PACMAN" ]; then
-            pm() {
-              "$PACMAN" --config "$VITASDK/etc/pacman.conf" --root "$VITASDK" \
-                --dbpath "$VITASDK/var/lib/pacman" \
-                --cachedir "$VITASDK/var/cache/pacman/pkg" \
-                --logfile "$VITASDK/var/log/pacman.log" --noconfirm "$@"
-            }
-            if pm -Q curl >/dev/null 2>&1; then pm -Rdd curl; fi
+          # curl-mbedtls conflicts with the image's OpenSSL-linked curl, and
+          # pacman will not swap conflicting packages non-interactively, so
+          # remove curl first (nodeps twice: skip dependency checks entirely).
+          if vdpm list curl >/dev/null 2>&1; then
+            VDPM_NONINTERACTIVE=1 vdpm remove --nodeps --nodeps curl
           fi
           VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat
 
