@@ -1,0 +1,34 @@
+# VitaSurf default options. NetSurf reads this file from app0:/resources.
+# Phase 5 adds a user copy under ux0:/data/VitaSurf that overrides it.
+# Option names are documented in deps/netsurf/docs/netsurf-options.md.
+
+# Home page: a bundled local page, loaded through the file fetcher.
+homepage_url:file:///resources/vitasurf.html
+
+# Screen geometry
+window_width:960
+window_height:544
+
+# Memory is the main constraint: keep every cache small.
+memory_cache_size:4194304
+max_cached_fetch_handles:4
+max_fetchers:8
+max_fetchers_per_host:2
+fb_font_cachesize:512
+
+# JavaScript stays off until phase 4.
+enable_javascript:0
+
+# Networking (phase 2). Certificates come from the bundled Mozilla CA file.
+ca_bundle:app0:/resources/cacert.pem
+send_referer:1
+do_not_track:0
+
+# Persistence (phase 5) writes here.
+cookie_file:ux0:/data/VitaSurf/Cookies
+cookie_jar:ux0:/data/VitaSurf/Cookies
+
+# Framebuffer toolkit sizes tuned for a 960x544 screen with touch.
+fb_furniture_size:22
+fb_toolbar_size:36
+fb_osk:0

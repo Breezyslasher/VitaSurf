@@ -1,0 +1,26 @@
+# Build output
+build/
+build-*/
+out/
+*.o
+*.a
+*.elf
+*.velf
+*.self
+*.vpk
+eboot.bin
+param.sfo
+
+# NetSurf configuration copied into the submodule by the build scripts
+deps/netsurf/Makefile.config
+
+# Editors
+*.swp
+*~
+.vscode/
+.idea/
+
+# Vita crash dumps and logs
+*.psp2dmp
+psp2core-*
+*.log
