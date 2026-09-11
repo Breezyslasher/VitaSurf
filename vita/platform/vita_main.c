@@ -18,7 +18,7 @@
 #include "vita_platform.h"
 
 #ifndef VITASURF_HEAP_MB
-#define VITASURF_HEAP_MB 128
+#define VITASURF_HEAP_MB 176
 #endif
 
 #ifndef VITASURF_STACK_KB

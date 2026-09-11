@@ -35,7 +35,10 @@ else()
 endif()
 
 option(VITASURF_DEBUG "Verbose logging and debug symbols" OFF)
-set(VITASURF_HEAP_MB 128 CACHE STRING "newlib heap size in MB (_newlib_heap_size_user)")
+# The app has about 256 MB of user memory (the startup log shows 114 MB
+# free beside a 128 MB heap). 176 MB leaves room for the main thread
+# stack, the GPU contexts and the system dialogs.
+set(VITASURF_HEAP_MB 176 CACHE STRING "newlib heap size in MB (_newlib_heap_size_user)")
 set(VITASURF_BUILD_ID "local" CACHE STRING "Build identifier written to the log (CI run number)")
 set(VITASURF_BUILD_SHA "" CACHE STRING "Short commit hash written to the log")
 if(VITASURF_BUILD_SHA STREQUAL "")
