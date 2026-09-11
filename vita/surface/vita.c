@@ -478,10 +478,21 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 		vita_log("surface: further updates not logged");
 	}
 
+	/*
+	 * libnsfb leaves the top byte of every pixel zero and vita2d draws
+	 * textures with source-alpha blending, so copy with the alpha byte
+	 * forced opaque or the page never reaches the screen.
+	 */
 	src = nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4;
 	dst = vs->display + area.y0 * vs->stride + area.x0;
 	for (y = area.y0; y < area.y1; y++) {
-		memcpy(dst, src, (size_t)width * 4);
+		const uint32_t *s = (const uint32_t *)(const void *)src;
+		uint32_t *d = dst;
+		int x;
+
+		for (x = 0; x < width; x++) {
+			d[x] = s[x] | 0xFF000000u;
+		}
 		src += nsfb->linelen;
 		dst += vs->stride;
 	}
