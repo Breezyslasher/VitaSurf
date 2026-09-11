@@ -157,26 +157,18 @@ endif()
 # reference each other through operation tables, and libnsfb surfaces
 # register themselves with constructors.
 # vita-elf-create appends the SCE module data right after the text segment
-# and refuses to build when the data segment starts inside that space. With
-# the toolchain's default page sizes (max and common both 64 KB) the gap
-# between the two segments is 64 KB minus the text size modulo 64 KB as
-# soon as the data segment is larger than one page, so it shrank to a few
-# hundred bytes for some builds. A common page size of 1 makes the linker
-# use its other placement rule, which always leaves a full 64 KB (measured
-# with the host linker, which shares the code).
+# and refuses to build when the data segment starts inside that space. The
+# gap the linker leaves depends on the text size modulo 64 KB, so some
+# builds had a few hundred bytes there. The Vita linker script adds
+# __sce_headroom bytes before aligning the data segment ("optional headroom
+# for SCE metadata" in the toolchain's patch); 64 KB makes the gap at least
+# that in every layout.
 target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--wrap=main
     -Wl,-q
     -Wl,--gc-sections
-    -Wl,-z,max-page-size=0x10000
-    -Wl,-z,common-page-size=1
+    -Wl,--defsym,__sce_headroom=0x10000
 )
-
-set(VITASURF_JS_LIBS)
-if(VITASURF_JS_ENGINE STREQUAL "quickjs")
-    # quickjs-ng (MIT), from vdpm.
-    set(VITASURF_JS_LIBS quickjs)
-endif()
 
 target_link_libraries(${PROJECT_NAME}
     -Wl,--whole-archive
