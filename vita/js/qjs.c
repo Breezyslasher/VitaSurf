@@ -139,6 +139,15 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	return 0;
 }
 
+/** QuickJS's own allocation total for the runtime, in KB. */
+static unsigned runtime_kb(JSRuntime *rt)
+{
+	JSMemoryUsage u;
+
+	JS_ComputeMemoryUsage(rt, &u);
+	return (unsigned)(u.malloc_size / 1024);
+}
+
 /**
  * Log the source around the position the stack trace names, so a log from
  * hardware shows which call failed without the page source at hand.
@@ -1578,7 +1587,7 @@ static const char prelude_js[] =
 "P.querySelector=function(sel){var r=collect(this,compile(String(sel)),false,[]);return r.length?r[0]:null;};\n"
 "P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchesCompound(el,g);});};\n"
 "P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))return n;n=n.parentNode;}return null;};\n"
-"P.dispatchEvent=function(){return true;};\n"
+"P.dispatchEvent=function(){return true;};P.getContext=function(){return null;};\n"
 "var D=document;\n"
 "D.querySelectorAll=function(s){var r=D.documentElement;return r?r.querySelectorAll(s):[];};\n"
 "D.querySelector=function(s){var r=D.documentElement;return r?r.querySelector(s):null;};\n"
@@ -1593,6 +1602,15 @@ static const char prelude_js[] =
 "D.createElementNS=function(ns,t){return D.createElement(t);};D.createAttribute=function(n){return {name:n,value:''};};\n"
 "D.implementation={createHTMLDocument:function(){return D;},createDocument:function(){return D;},hasFeature:function(){return true;}};\n"
 "D.currentScript=null;D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';\n"
+"window.NodeFilter={FILTER_ACCEPT:1,FILTER_REJECT:2,FILTER_SKIP:3,SHOW_ALL:0xFFFFFFFF,SHOW_ELEMENT:1,SHOW_TEXT:4,SHOW_COMMENT:128,SHOW_DOCUMENT:256};\n"
+"D.createTreeWalker=function(root,what,filter){what=what===undefined?0xFFFFFFFF:what;var fn=filter&&(typeof filter==='function'?filter:filter.acceptNode);"
+"function ok(n){if(n.nodeType===9)return false;if(!((1<<(n.nodeType-1))&what))return false;return fn?fn(n)===1:true;}"
+"function next(n){if(n.firstChild)return n.firstChild;while(n&&n!==root){if(n.nextSibling)return n.nextSibling;n=n.parentNode;}return null;}"
+"return {root:root,currentNode:root,nextNode:function(){var n=next(this.currentNode);while(n&&!ok(n))n=next(n);if(n)this.currentNode=n;return n;},"
+"firstChild:function(){var n=this.currentNode.firstChild;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},"
+"nextSibling:function(){var n=this.currentNode.nextSibling;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},"
+"parentNode:function(){var n=this.currentNode.parentNode;if(n&&n!==root&&ok(n)){this.currentNode=n;return n;}return null;}};};\n"
+"D.createNodeIterator=function(root,what,filter){var w=D.createTreeWalker(root,what,filter);return {nextNode:function(){return w.nextNode();},detach:function(){}};};\n"
 "Object.defineProperty(D,'URL',{get:function(){return location.href;}});Object.defineProperty(D,'documentURI',{get:function(){return location.href;}});\n"
 "Object.defineProperty(D,'activeElement',{get:function(){return D.body;}});\n"
 "D.createComment=function(t){return D.createTextNode('');};D.write=D.writeln=function(){};\n"
@@ -1864,6 +1882,8 @@ nserror js_closethread(jsthread *thread)
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
 	JS_RunGC(thread->heap->rt);
+	vita_log("qjs: page closed, runtime memory now %u KB",
+		 runtime_kb(thread->heap->rt));
 	return NSERROR_OK;
 }
 
@@ -1903,6 +1923,14 @@ void js_destroythread(jsthread *thread)
 	free(thread);
 }
 
+/*
+ * Scripts above this size are skipped. Application bundles of several
+ * megabytes (YouTube's main bundle is one) take tens of seconds to parse
+ * on the Vita and their bytecode alone can exceed the runtime's memory
+ * limit; the sites this browser targets do not ship them.
+ */
+#define SCRIPT_MAX_BYTES (2 * 1024 * 1024)
+
 bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name)
 {
 	JSValue ret;
@@ -1910,6 +1938,13 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	char *src;
 
 	if (thread == NULL || thread->closed || txt == NULL || txtlen == 0) {
+		return false;
+	}
+	if (txtlen > SCRIPT_MAX_BYTES) {
+		vita_log("qjs: skipping %u KB script (limit %u KB): %s",
+			 (unsigned)(txtlen / 1024),
+			 (unsigned)(SCRIPT_MAX_BYTES / 1024),
+			 name != NULL ? name : "<script>");
 		return false;
 	}
 	/*
@@ -1949,6 +1984,10 @@ bool js_fire_event(jsthread *thread, const char *type,
 
 	if (thread == NULL || thread->closed) {
 		return true;
+	}
+	if (strcmp(type, "load") == 0) {
+		vita_log("qjs: load event, runtime memory %u KB",
+			 runtime_kb(thread->heap->rt));
 	}
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
