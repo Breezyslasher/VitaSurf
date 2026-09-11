@@ -65,6 +65,9 @@
 
 #define EVENT_QUEUE_LEN  64
 
+/* Claims and updates logged unconditionally before going quiet. */
+#define DIAG_BOXES       120
+
 struct vita_surface {
 	SceUID memblock;          /**< CDRAM block holding the display buffer */
 	uint32_t *display;        /**< display buffer base */
@@ -89,9 +92,11 @@ struct vita_surface {
 	int pointer_x;
 	int pointer_y;
 
-	/* diagnostics, only logged when the verbose flag file exists */
+	/* diagnostics: the first claims and updates are always logged, the
+	 * rest only when the verbose flag file exists */
 	bool verbose;
 	unsigned int updates;
+	unsigned int claims;
 };
 
 /* ------------------------------------------------------------------------ */
@@ -323,10 +328,14 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 	}
 
 	vs->updates++;
-	if (vs->verbose && vs->updates <= 200) {
-		vita_log("surface: update %u box %d,%d-%d,%d (clipped %d,%d-%d,%d)",
+	if (vs->updates <= DIAG_BOXES || vs->verbose) {
+		vita_log("surface: update %u box %d,%d-%d,%d (clipped %d,%d-%d,%d) pixel %08x",
 			 vs->updates, box->x0, box->y0, box->x1, box->y1,
-			 area.x0, area.y0, area.x1, area.y1);
+			 area.x0, area.y0, area.x1, area.y1,
+			 (unsigned int)*(const uint32_t *)
+				(nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4));
+	} else if (vs->updates == DIAG_BOXES + 1) {
+		vita_log("surface: further updates not logged");
 	}
 
 	src = nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4;
@@ -356,11 +365,15 @@ static int vita_defaults(nsfb_t *nsfb)
 static int vita_set_geometry(nsfb_t *nsfb, int width, int height,
 			     enum nsfb_format_e format)
 {
-	/* The screen is fixed; other requests are logged and ignored. */
-	if (width != SCREEN_WIDTH || height != SCREEN_HEIGHT ||
-	    (format != NSFB_FMT_XBGR8888 && format != NSFB_FMT_ANY)) {
-		vita_log("surface: ignoring geometry %dx%d format %d",
-			 width, height, (int)format);
+	/*
+	 * The screen is fixed and the display is always XBGR (red in the low
+	 * byte, which is also how NetSurf packs its colours). NetSurf asks
+	 * for XRGB because it maps 32 bpp to that; the substitution only
+	 * changes which software plotters libnsfb selects.
+	 */
+	if (width != SCREEN_WIDTH || height != SCREEN_HEIGHT) {
+		vita_log("surface: ignoring geometry %dx%d, screen is fixed",
+			 width, height);
 	}
 
 	nsfb->width = SCREEN_WIDTH;
@@ -529,9 +542,12 @@ static int vita_claim(nsfb_t *nsfb, nsfb_bbox_t *box)
 	struct nsfb_cursor_s *cursor = nsfb->cursor;
 	struct vita_surface *vs = nsfb->surface_priv;
 
-	if (vs != NULL && vs->verbose && vs->updates <= 200) {
-		vita_log("surface: claim %d,%d-%d,%d",
-			 box->x0, box->y0, box->x1, box->y1);
+	if (vs != NULL) {
+		vs->claims++;
+		if (vs->claims <= DIAG_BOXES || vs->verbose) {
+			vita_log("surface: claim %u box %d,%d-%d,%d",
+				 vs->claims, box->x0, box->y0, box->x1, box->y1);
+		}
 	}
 
 	if ((cursor != NULL) &&

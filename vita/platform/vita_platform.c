@@ -67,7 +67,9 @@ int vita_verbose_requested(void)
 {
 	SceIoStat st;
 
-	return sceIoGetstat(VITASURF_VERBOSE_FLAG, &st) >= 0;
+	/* VitaShell tends to append .txt when creating a file, accept both. */
+	return sceIoGetstat(VITASURF_VERBOSE_FLAG, &st) >= 0 ||
+	       sceIoGetstat(VITASURF_VERBOSE_FLAG ".txt", &st) >= 0;
 }
 
 /**
@@ -196,6 +198,8 @@ int vita_platform_init(void)
 	scePowerSetGpuXbarClockFrequency(166);
 
 	log_selftest();
+	vita_log("verbose flag file %s: %s", VITASURF_VERBOSE_FLAG,
+		 vita_verbose_requested() ? "present" : "absent");
 	vita_log_memory("startup");
 
 	return logf != NULL ? 0 : -1;
