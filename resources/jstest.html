@@ -42,6 +42,8 @@ off, every line below stays "not run".</p>
 		var el = document.getElementById(id);
 		el.textContent = text;
 		el.className = ok ? "ok" : "fail";
+		/* also visible in ux0:data/VitaSurf/log.txt as "console:" lines */
+		console.log("jstest: " + text);
 	}
 
 	set("inline", "Inline script: ran", true);

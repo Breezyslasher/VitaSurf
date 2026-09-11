@@ -1232,6 +1232,7 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 		nsurl_create(href, &url);
 	}
 	if (url != NULL) {
+		vita_log("qjs: script navigates to %s", nsurl_access(url));
 		browser_window_navigate(thread->win, url, NULL,
 					BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
 		nsurl_unref(url);
@@ -1588,7 +1589,12 @@ static const char prelude_js[] =
 "Object.defineProperty(D,'links',{get:function(){return D.getElementsByTagName('a');}});\n"
 "Object.defineProperty(D,'scripts',{get:function(){return D.getElementsByTagName('script');}});\n"
 "D.defaultView=window;D.nodeType=9;D.nodeName='#document';D.documentMode=undefined;D.compatMode='CSS1Compat';D.hidden=false;D.visibilityState='visible';\n"
-"D.createEvent=function(){return new Event('');};D.dispatchEvent=function(){return true;};D.hasFocus=function(){return true;};\n"
+"D.createEvent=function(t){return /custom/i.test(t)?new CustomEvent(''):new Event('');};D.dispatchEvent=function(){return true;};D.hasFocus=function(){return true;};\n"
+"D.createElementNS=function(ns,t){return D.createElement(t);};D.createAttribute=function(n){return {name:n,value:''};};\n"
+"D.implementation={createHTMLDocument:function(){return D;},createDocument:function(){return D;},hasFeature:function(){return true;}};\n"
+"D.currentScript=null;D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';\n"
+"Object.defineProperty(D,'URL',{get:function(){return location.href;}});Object.defineProperty(D,'documentURI',{get:function(){return location.href;}});\n"
+"Object.defineProperty(D,'activeElement',{get:function(){return D.body;}});\n"
 "D.createComment=function(t){return D.createTextNode('');};D.write=D.writeln=function(){};\n"
 "D.getElementsByName=function(n){return D.querySelectorAll('[name='+n+']').filter(function(e){return e.getAttribute('name')===n;});};\n"
 "D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};\n"
@@ -1623,9 +1629,12 @@ static const char prelude_js[] =
 "Event.prototype.preventDefault=function(){this.defaultPrevented=true;};Event.prototype.stopPropagation=Event.prototype.stopImmediatePropagation=function(){};"
 "Event.prototype.initEvent=function(t,b,c){this.type=t;this.bubbles=!!b;this.cancelable=!!c;};\n"
 "function CustomEvent(type,init){Event.call(this,type,init);this.detail=init?init.detail:null;}CustomEvent.prototype=Object.create(Event.prototype);\n"
+"CustomEvent.prototype.initCustomEvent=function(t,b,c,d){this.initEvent(t,b,c);this.detail=d;};\n"
 "W.Event=Event;W.CustomEvent=CustomEvent;W.UIEvent=W.MouseEvent=W.KeyboardEvent=W.FocusEvent=Event;\n"
 "W.HTMLDocument=W.Document=function(){};W.Document.prototype=Object.getPrototypeOf(D);\n"
-"W.NodeList=W.HTMLCollection=Array;W.Text=W.Comment=W.DocumentFragment=W.HTMLAnchorElement=W.HTMLDivElement=W.HTMLInputElement=W.HTMLScriptElement=W.HTMLImageElement=W.HTMLFormElement=W.HTMLBodyElement=W.HTMLTemplateElement=W.HTMLStyleElement=W.HTMLLinkElement=W.HTMLIFrameElement=W.SVGElement=Element;\n"
+"W.NodeList=W.HTMLCollection=Array;\n"
+"['CharacterData','Text','Comment','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});\n"
+"W.Window=function(){};W.Window.prototype=Object.getPrototypeOf(W);W.Navigator=W.Location=W.History=W.Screen=W.Storage=Storage;\n"
 "W.MutationObserver=function(){};W.MutationObserver.prototype.observe=W.MutationObserver.prototype.disconnect=function(){};W.MutationObserver.prototype.takeRecords=function(){return [];};\n"
 "W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};"
 "W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;\n"
@@ -1816,21 +1825,45 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	return NSERROR_OK;
 }
 
+/*
+ * Close a page's scripts. NetSurf keeps the html content (and this thread)
+ * alive in its cache for a while after navigating away, so the JS context
+ * and everything it owns are released here rather than in destroy: a
+ * page's scripts can hold tens of MB and the runtime's memory limit is
+ * shared by every page in the window.
+ */
 nserror js_closethread(jsthread *thread)
 {
 	struct js_timer *t;
+	struct js_listener *l;
 
-	if (thread == NULL) {
+	if (thread == NULL || thread->closed) {
 		return NSERROR_OK;
 	}
+	thread->closed = true;
 	/* cancel timers; the scheduler holds pointers to them */
 	for (t = thread->timers; t != NULL; t = t->next) {
 		if (!t->dead) {
 			t->dead = true;
 			guit->misc->schedule(-1, timer_callback, t);
 		}
+		JS_FreeValue(thread->ctx, t->func);
+		t->func = JS_UNDEFINED;
 	}
-	thread->closed = true;
+	/*
+	 * Listener structs stay allocated: libdom still holds them as the
+	 * private word of registered listeners. With thread cleared the
+	 * trampoline ignores any late event.
+	 */
+	for (l = thread->listeners; l != NULL; l = l->next) {
+		JS_FreeValue(thread->ctx, l->func);
+		l->func = JS_UNDEFINED;
+		l->thread = NULL;
+	}
+	free_wrappers(thread);
+	JS_FreeContext(thread->ctx);
+	thread->ctx = NULL;
+	JS_RunGC(thread->heap->rt);
 	return NSERROR_OK;
 }
 
@@ -1842,6 +1875,7 @@ void js_destroythread(jsthread *thread)
 	if (thread == NULL) {
 		return;
 	}
+	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;
 	while (l != NULL) {
 		struct js_listener *next = l->next;
@@ -1851,19 +1885,15 @@ void js_destroythread(jsthread *thread)
 		if (l->node != NULL) {
 			dom_node_unref(l->node);
 		}
-		JS_FreeValue(thread->ctx, l->func);
 		free(l);
 		l = next;
 	}
 	t = thread->timers;
 	while (t != NULL) {
 		struct js_timer *next = t->next;
-		JS_FreeValue(thread->ctx, t->func);
 		free(t);
 		t = next;
 	}
-	free_wrappers(thread);
-	JS_FreeContext(thread->ctx);
 	thread->heap->live_threads--;
 	if (thread->heap->pending_destroy && thread->heap->live_threads == 0) {
 		jsheap *heap = thread->heap;
