@@ -14,6 +14,8 @@
 
 /* After the SCE headers: <sys/stat.h> defines st_ctime as a macro, which
  * would otherwise mangle the SceIoStat field of the same name. */
+#include <errno.h>
+#include <iconv.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -113,6 +115,44 @@ static void log_data_dir(void)
 }
 
 /**
+ * libparserutils converts every page to UTF-8 through iconv, and NetSurf's
+ * utils/utf8.c does the same for form data and text/plain. Log which
+ * conversions the C library actually offers.
+ */
+static void log_iconv_selftest(void)
+{
+	static const char *const from[] = {
+		"UTF-8", "utf-8", "ISO-8859-1", "WINDOWS-1252", "UTF-16",
+		"UTF-16BE", "UTF-16LE", "US-ASCII",
+	};
+	unsigned int i;
+
+	for (i = 0; i < sizeof(from) / sizeof(from[0]); i++) {
+		iconv_t cd = iconv_open("UTF-8", from[i]);
+
+		if (cd == (iconv_t)-1) {
+			vita_log("selftest: iconv_open(UTF-8 <- %s) failed, errno %d",
+				 from[i], errno);
+			continue;
+		}
+		{
+			char in[] = "Vita";
+			char out[16];
+			char *inp = in;
+			char *outp = out;
+			size_t inleft = 4;
+			size_t outleft = sizeof(out);
+			size_t r = iconv(cd, &inp, &inleft, &outp, &outleft);
+
+			vita_log("selftest: iconv_open(UTF-8 <- %s) ok, convert %s (%u bytes out)",
+				 from[i], r == (size_t)-1 ? "failed" : "ok",
+				 (unsigned int)(sizeof(out) - outleft));
+		}
+		iconv_close(cd);
+	}
+}
+
+/**
  * Log whether the assumptions the NetSurf build relies on hold: drive-less
  * paths resolve to app0:, the resources are readable, and the clocks the
  * scheduler and libnsutils use advance.
@@ -176,6 +216,8 @@ static void log_selftest(void)
 	} else {
 		vita_log("selftest: clock_gettime(MONOTONIC) failed");
 	}
+
+	log_iconv_selftest();
 }
 
 int vita_platform_init(void)

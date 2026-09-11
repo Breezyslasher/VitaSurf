@@ -26,6 +26,12 @@
 #endif
 
 /*
+ * Phase 1 bring-up: NetSurf's verbose log is on in every build until the
+ * first page renders on hardware. Remove this once it does.
+ */
+#define VITASURF_ALWAYS_VERBOSE 1
+
+/*
  * newlib heap and main thread stack. Both are read by the VitaSDK C runtime
  * before main() runs. CSS selection and layout recurse deeply, hence the
  * large stack. The heap size is a CMake option (VITASURF_HEAP_MB).
@@ -67,7 +73,7 @@ int __wrap_main(int argc, char **argv)
 	 * at runtime in any build by creating the flag file
 	 * ux0:data/VitaSurf/verbose. Release builds only carry INFO and above.
 	 */
-#ifdef VITASURF_DEBUG
+#if defined(VITASURF_DEBUG) || defined(VITASURF_ALWAYS_VERBOSE)
 	args[nargs++] = "-v";
 #else
 	if (vita_verbose_requested()) {
