@@ -21,14 +21,16 @@ Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
 `make`, `pkg-config`, `perl`, `gperf`, `flex`, `bison`, `cmake` and host
 development packages for zlib and libpng (NetSurf builds a few host tools).
 
-    vdpm zlib bzip2 libpng libjpeg-turbo freetype openssl-1.1.1 curl expat
+    vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd openssl-1.1.1 curl expat
     git submodule update --init --recursive
+    ./scripts/build-curl.sh
     ./scripts/build-deps.sh
     ./scripts/build-netsurf.sh
     cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake
     cmake --build build
 
-The result is `build/VitaSurf.vpk`. Add `VITASURF_DEBUG=1` to the
+The result is `build/VitaSurf.vpk`. The curl step exists because vdpm's curl package is
+linked against the OpenSSL 1.0.2 API while the toolchain ships 1.1.1. Add `VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging.
 
@@ -40,7 +42,7 @@ Linux machine.
 ## Layout
 
     CMakeLists.txt        final link, SELF creation, VPK packaging
-    scripts/              build-deps.sh, build-netsurf.sh, apply-patches.sh
+    scripts/              build-curl.sh, build-deps.sh, build-netsurf.sh, apply-patches.sh
     deps/                 NetSurf and its libraries as git submodules
     patches/              every change to upstream code, as patch files
     vita/surface/         libnsfb surface: display buffer and input polling

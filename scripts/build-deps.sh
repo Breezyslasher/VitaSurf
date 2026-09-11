@@ -5,7 +5,8 @@
 # Usage: ./scripts/build-deps.sh [clean]
 #
 # Requires VITASDK plus these vdpm packages: zlib bzip2 libpng libjpeg-turbo
-# freetype openssl-1.1.1 curl expat. Set VITASURF_NATIVE=1 to build for the host
+# freetype zstd openssl-1.1.1 curl expat, with libcurl rebuilt by
+# scripts/build-curl.sh. Set VITASURF_NATIVE=1 to build for the host
 # instead (see scripts/vita-env.sh).
 set -euo pipefail
 
@@ -31,7 +32,17 @@ mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
 
 for lib in $LIBS; do
     echo "==== $lib"
-    make -C "$VITASURF_ROOT/deps/$lib" "${MAKE_ARGS[@]}" -j"$JOBS" install
+    extra=()
+    if [ "$lib" = "libnsfb" ] && [ -z "$NS_HOST" ]; then
+        : # host build keeps whatever surfaces the host offers (SDL for tests)
+    elif [ "$lib" = "libnsfb" ]; then
+        # The VitaSDK sysroot ships SDL, which libnsfb would otherwise detect
+        # and build its SDL surface against. Only the RAM surface is wanted;
+        # the Vita surface lives in vita/surface/ and is linked by CMake.
+        extra=(NSFB_SDL_AVAILABLE=no NSFB_XCB_AVAILABLE=no
+               NSFB_VNC_AVAILABLE=no NSFB_WLD_AVAILABLE=no)
+    fi
+    make -C "$VITASURF_ROOT/deps/$lib" "${MAKE_ARGS[@]}" "${extra[@]}" -j"$JOBS" install
 done
 
 # utf8proc (MIT) has a plain Makefile rather than the NetSurf buildsystem.
