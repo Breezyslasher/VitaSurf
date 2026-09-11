@@ -193,6 +193,77 @@ static void log_iconv_selftest(void)
  * Parse the bundled CA file through OpenSSL the way libcurl does and log
  * what happens, so a TLS failure can be traced to OpenSSL itself.
  */
+/**
+ * Mirror curl's load_cacert_from_memory(): read the bundle with
+ * PEM_X509_INFO_read_bio() and add every certificate to a fresh
+ * X509_STORE. curl returns CURLE_SSL_CACERT_BADFILE when either step
+ * fails, so this shows which one does on the Vita.
+ */
+static void log_openssl_store_selftest(const char *pem, size_t len)
+{
+	BIO *bio;
+	STACK_OF(X509_INFO) *infos;
+	X509_STORE *store;
+	int i, n, added = 0, skipped = 0;
+	unsigned long err;
+	char errbuf[256];
+
+	bio = BIO_new_mem_buf(pem, (int)len);
+	if (bio == NULL) {
+		vita_log("selftest: store: BIO_new_mem_buf failed");
+		return;
+	}
+
+	ERR_clear_error();
+	infos = PEM_X509_INFO_read_bio(bio, NULL, NULL, NULL);
+	BIO_free(bio);
+	if (infos == NULL) {
+		err = ERR_peek_last_error();
+		ERR_error_string_n(err, errbuf, sizeof(errbuf));
+		vita_log("selftest: store: PEM_X509_INFO_read_bio failed: %08lx %s",
+			 err, errbuf);
+		ERR_clear_error();
+		return;
+	}
+	n = sk_X509_INFO_num(infos);
+	vita_log("selftest: store: PEM_X509_INFO_read_bio returned %d entries", n);
+
+	store = X509_STORE_new();
+	if (store == NULL) {
+		err = ERR_peek_last_error();
+		ERR_error_string_n(err, errbuf, sizeof(errbuf));
+		vita_log("selftest: store: X509_STORE_new failed: %08lx %s",
+			 err, errbuf);
+		sk_X509_INFO_pop_free(infos, X509_INFO_free);
+		ERR_clear_error();
+		return;
+	}
+
+	for (i = 0; i < n; i++) {
+		X509_INFO *info = sk_X509_INFO_value(infos, i);
+
+		if (info->x509 == NULL) {
+			skipped++;
+			continue;
+		}
+		if (!X509_STORE_add_cert(store, info->x509)) {
+			err = ERR_peek_last_error();
+			ERR_error_string_n(err, errbuf, sizeof(errbuf));
+			vita_log("selftest: store: X509_STORE_add_cert #%d failed: %08lx %s",
+				 i, err, errbuf);
+			ERR_clear_error();
+			break;
+		}
+		added++;
+	}
+	vita_log("selftest: store: added %d certificates (%d entries without a certificate)",
+		 added, skipped);
+
+	X509_STORE_free(store);
+	sk_X509_INFO_pop_free(infos, X509_INFO_free);
+	ERR_clear_error();
+}
+
 static void log_openssl_selftest(void)
 {
 	char *pem = NULL;
@@ -234,6 +305,8 @@ static void log_openssl_selftest(void)
 		 OpenSSL_version(OPENSSL_VERSION), count, err, errbuf);
 	ERR_clear_error();
 	BIO_free(bio);
+
+	log_openssl_store_selftest(pem, len);
 	free(pem);
 }
 
@@ -329,7 +402,8 @@ int vita_platform_init(void)
 		return -1;
 	}
 	setvbuf(logf, NULL, _IONBF, 0);
-	vita_log("VitaSurf starting");
+	vita_log("VitaSurf starting, build %s (%s)", VITASURF_BUILD_ID,
+		 VITASURF_BUILD_SHA);
 	if (mkdir_ret < 0 && mkdir_ret != (int)0x80010011) {
 		vita_log("sceIoMkdir(%s) returned 0x%08x", VITASURF_DATA_DIR,
 			 (unsigned int)mkdir_ret);

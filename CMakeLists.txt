@@ -36,6 +36,20 @@ endif()
 
 option(VITASURF_DEBUG "Verbose logging and debug symbols" OFF)
 set(VITASURF_HEAP_MB 128 CACHE STRING "newlib heap size in MB (_newlib_heap_size_user)")
+set(VITASURF_BUILD_ID "local" CACHE STRING "Build identifier written to the log (CI run number)")
+set(VITASURF_BUILD_SHA "" CACHE STRING "Short commit hash written to the log")
+if(VITASURF_BUILD_SHA STREQUAL "")
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE VITASURF_BUILD_SHA
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(VITASURF_BUILD_SHA STREQUAL "")
+        set(VITASURF_BUILD_SHA "unknown")
+    endif()
+endif()
 set(VITASURF_STACK_KB 4096 CACHE STRING "main thread stack size in KB")
 set(NETSURF_STAGE "${CMAKE_SOURCE_DIR}/out/netsurf" CACHE PATH
     "Output of scripts/build-netsurf.sh (libnetsurf.a and resources/)")
@@ -88,6 +102,8 @@ target_compile_options(${PROJECT_NAME} PRIVATE
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     VITASURF_HEAP_MB=${VITASURF_HEAP_MB}
     VITASURF_STACK_KB=${VITASURF_STACK_KB}
+    VITASURF_BUILD_ID="${VITASURF_BUILD_ID}"
+    VITASURF_BUILD_SHA="${VITASURF_BUILD_SHA}"
 )
 if(VITASURF_DEBUG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_DEBUG=1)

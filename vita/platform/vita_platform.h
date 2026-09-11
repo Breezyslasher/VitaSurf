@@ -9,6 +9,13 @@
 #define VITASURF_PLATFORM_H
 
 /* Screen geometry. The front touch panel reports 1920x1088 and is halved. */
+#ifndef VITASURF_BUILD_ID
+#define VITASURF_BUILD_ID "local"
+#endif
+#ifndef VITASURF_BUILD_SHA
+#define VITASURF_BUILD_SHA "unknown"
+#endif
+
 #define VITASURF_SCREEN_WIDTH  960
 #define VITASURF_SCREEN_HEIGHT 544
 
