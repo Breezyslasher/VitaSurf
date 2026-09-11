@@ -41,12 +41,15 @@ if [ ! -d "$SRC" ]; then
     tar -C "$WORK" -xf "$TARBALL"
 fi
 
+# The sysroot's libcrypto has no console UI (UI_OpenSSL), which curl only
+# needs for OpenSSL engine support; compile that support out.
 echo "==== building curl $CURL_VERSION against $($NS_PKGCONFIG --modversion openssl 2>/dev/null || echo 'unknown') OpenSSL"
 cmake -S "$SRC" -B "$SRC/build-vita" \
     -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCURL_USE_OPENSSL=ON \
+    -DCMAKE_C_FLAGS="-DOPENSSL_NO_ENGINE -DOPENSSL_NO_UI_CONSOLE" \
     -DBUILD_CURL_EXE=OFF -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
     -DENABLE_IPV6=OFF -DCURL_DISABLE_SOCKETPAIR=ON \
     -DHAVE_FCNTL_O_NONBLOCK=OFF -DENABLE_THREADED_RESOLVER=OFF \
