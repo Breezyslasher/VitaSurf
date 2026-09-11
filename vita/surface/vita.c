@@ -65,8 +65,8 @@
 
 #define EVENT_QUEUE_LEN  64
 
-/* Claims and updates logged unconditionally before going quiet. */
-#define DIAG_BOXES       120
+/* Claims and updates logged when verbose, before going quiet. */
+#define DIAG_BOXES       200
 
 struct vita_surface {
 	SceUID memblock;          /**< CDRAM block holding the display buffer */
@@ -92,8 +92,8 @@ struct vita_surface {
 	int pointer_x;
 	int pointer_y;
 
-	/* diagnostics: the first claims and updates are always logged, the
-	 * rest only when the verbose flag file exists */
+	/* diagnostics: claim and update boxes are logged only when the
+	 * verbose flag file exists, and only the first DIAG_BOXES of each */
 	bool verbose;
 	unsigned int updates;
 	unsigned int claims;
@@ -328,13 +328,13 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 	}
 
 	vs->updates++;
-	if (vs->updates <= DIAG_BOXES || vs->verbose) {
+	if (vs->verbose && vs->updates <= DIAG_BOXES) {
 		vita_log("surface: update %u box %d,%d-%d,%d (clipped %d,%d-%d,%d) pixel %08x",
 			 vs->updates, box->x0, box->y0, box->x1, box->y1,
 			 area.x0, area.y0, area.x1, area.y1,
 			 (unsigned int)*(const uint32_t *)
 				(nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4));
-	} else if (vs->updates == DIAG_BOXES + 1) {
+	} else if (vs->verbose && vs->updates == DIAG_BOXES + 1) {
 		vita_log("surface: further updates not logged");
 	}
 
@@ -545,7 +545,7 @@ static int vita_claim(nsfb_t *nsfb, nsfb_bbox_t *box)
 
 	if (vs != NULL) {
 		vs->claims++;
-		if (vs->claims <= DIAG_BOXES || vs->verbose) {
+		if (vs->verbose && vs->claims <= DIAG_BOXES) {
 			vita_log("surface: claim %u box %d,%d-%d,%d",
 				 vs->claims, box->x0, box->y0, box->x1, box->y1);
 		}

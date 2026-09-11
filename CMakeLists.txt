@@ -66,6 +66,8 @@ add_executable(${PROJECT_NAME}
     vita/platform/vita_iconv.c
     # NetSurf file table: drive prefixes inside file: URLs.
     vita/platform/vita_file.c
+    # SceNet and SceNetCtl bring-up.
+    vita/platform/vita_net.c
     vita/surface/vita.c
 )
 

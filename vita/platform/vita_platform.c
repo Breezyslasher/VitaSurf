@@ -279,6 +279,9 @@ int vita_platform_init(void)
 	scePowerSetGpuClockFrequency(222);
 	scePowerSetGpuXbarClockFrequency(166);
 
+	/* Networking must be up before NetSurf registers the curl fetcher. */
+	vita_net_init();
+
 	log_selftest();
 	log_data_dir();
 	vita_log("verbose flag file %s: %s", VITASURF_VERBOSE_FLAG,
@@ -291,6 +294,7 @@ int vita_platform_init(void)
 void vita_platform_fini(void)
 {
 	vita_log_memory("shutdown");
+	vita_net_fini();
 	vita_log("VitaSurf exiting");
 	fflush(stderr);
 	fflush(stdout);

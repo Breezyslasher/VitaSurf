@@ -10,10 +10,12 @@ and the platform notes that every change has to respect.
 
 ## Status
 
-Phase 1 (boot): the framebuffer frontend is linked statically with
-JavaScript disabled and renders a bundled local page from `app0:`.
-Networking, input, JavaScript, persistence and the rest follow in later
-phases. Nothing has been verified on hardware yet.
+Phase 1 (boot) is complete and verified on real hardware: the framebuffer
+frontend is linked statically with JavaScript disabled and renders the
+bundled local page from `app0:`. Phase 2 (networking) is in progress:
+SceNet and SceNetCtl are initialised before NetSurf starts, libcurl is
+built against OpenSSL 1.1.1 with the bundled CA file, and the home page
+links to test sites. Input, JavaScript, persistence and the rest follow.
 
 ## Building
 
@@ -65,8 +67,15 @@ VPK.
 
 Paths: NetSurf is compiled with drive-less resource paths such as
 `/resources`, which VitaSDK's C library resolves against the current drive,
-`app0:`. All writable data goes under `ux0:data/VitaSurf/`, and the log is
-`ux0:data/VitaSurf/log.txt`.
+`app0:`. A Vita file table in `vita/platform/vita_file.c` keeps drive
+prefixes intact when paths pass through file: URLs. All writable data goes
+under `ux0:data/VitaSurf/`, and the log is `ux0:data/VitaSurf/log.txt`.
+
+Two VitaSDK newlib gaps are worked around in `vita/platform/`: `iconv_open`
+fails for every charset, so libparserutils is built with its own codecs and
+`vita_iconv.c` supplies the conversions NetSurf itself needs; and
+`PATH_MAX`, `endian.h` and `sys/mman.h` are missing, handled by
+`vita_compat.h` and two small patches.
 
 ## Controls (phase 1)
 

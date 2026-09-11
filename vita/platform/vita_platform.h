@@ -52,6 +52,19 @@ void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 /** Log free user, CDRAM and physically contiguous memory. */
 void vita_log_memory(const char *what);
 
+/**
+ * Bring up SceNet and SceNetCtl (vita_net.c). Must run before NetSurf
+ * initialises libcurl. Returns 0 on success; failure leaves the browser
+ * usable for local pages only.
+ */
+int vita_net_init(void);
+
+/** Log the connection state and address. */
+void vita_net_log_state(void);
+
+/** Shut networking down. */
+void vita_net_fini(void);
+
 /** True when the user created the verbose flag file in the data directory. */
 int vita_verbose_requested(void);
 
