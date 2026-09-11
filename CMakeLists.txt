@@ -147,10 +147,20 @@ endif()
 # libnetsurf.a and libnsfb.a are pulled in whole: NetSurf's object files
 # reference each other through operation tables, and libnsfb surfaces
 # register themselves with constructors.
+# vita-elf-create appends the SCE module data right after the text segment
+# and refuses to build when the data segment starts inside that space. With
+# the toolchain's default page sizes (max and common both 64 KB) the gap
+# between the two segments is 64 KB minus the text size modulo 64 KB as
+# soon as the data segment is larger than one page, so it shrank to a few
+# hundred bytes for some builds. A common page size of 1 makes the linker
+# use its other placement rule, which always leaves a full 64 KB (measured
+# with the host linker, which shares the code).
 target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--wrap=main
     -Wl,-q
     -Wl,--gc-sections
+    -Wl,-z,max-page-size=0x10000
+    -Wl,-z,common-page-size=1
 )
 
 set(VITASURF_JS_LIBS)
