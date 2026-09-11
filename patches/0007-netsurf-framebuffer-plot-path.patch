@@ -1,0 +1,117 @@
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index 52afdbf5d..adbbdcc6a 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -271,8 +271,110 @@ framebuffer_plot_path(const struct redraw_context *ctx,
+ 		unsigned int n,
+ 		const float transform[6])
+ {
+-	NSLOG(netsurf, INFO, "path unimplemented");
+-	return NSERROR_OK;
++	nsfb_plot_pathop_t *ops;
++	nsfb_plot_pen_t pen;
++	unsigned int i = 0;
++	int count = 0;
++	nsfb_point_t start = { 0, 0 };
++	bool have_start = false;
++	bool res;
++
++	if (n == 0) {
++		return NSERROR_OK;
++	}
++	if (pstyle->fill_type == PLOT_OP_TYPE_NONE &&
++	    pstyle->stroke_type == PLOT_OP_TYPE_NONE) {
++		return NSERROR_OK;
++	}
++
++	/* every element of p becomes at most one path operation */
++	ops = malloc(sizeof(*ops) * n);
++	if (ops == NULL) {
++		return NSERROR_NOMEM;
++	}
++
++	/*
++	 * libnsfb expects a cubic as two control point entries followed by
++	 * the end point marked CUBIC; it flattens the curve itself. Close
++	 * becomes a line back to the start of the current subpath.
++	 */
++#define TX(x, y) ((int)(transform[0] * (x) + transform[2] * (y) + transform[4] + 0.5f))
++#define TY(x, y) ((int)(transform[1] * (x) + transform[3] * (y) + transform[5] + 0.5f))
++	while (i < n) {
++		switch ((int)p[i]) {
++		case PLOTTER_PATH_MOVE:
++			if (i + 2 >= n) goto done;
++			ops[count].operation = NFSB_PLOT_PATHOP_MOVE;
++			ops[count].point.x = TX(p[i + 1], p[i + 2]);
++			ops[count].point.y = TY(p[i + 1], p[i + 2]);
++			start = ops[count].point;
++			have_start = true;
++			count++;
++			i += 3;
++			break;
++		case PLOTTER_PATH_LINE:
++			if (i + 2 >= n) goto done;
++			ops[count].operation = NFSB_PLOT_PATHOP_LINE;
++			ops[count].point.x = TX(p[i + 1], p[i + 2]);
++			ops[count].point.y = TY(p[i + 1], p[i + 2]);
++			count++;
++			i += 3;
++			break;
++		case PLOTTER_PATH_BEZIER:
++			if (i + 6 >= n) goto done;
++			ops[count].operation = NFSB_PLOT_PATHOP_LINE;
++			ops[count].point.x = TX(p[i + 1], p[i + 2]);
++			ops[count].point.y = TY(p[i + 1], p[i + 2]);
++			count++;
++			ops[count].operation = NFSB_PLOT_PATHOP_LINE;
++			ops[count].point.x = TX(p[i + 3], p[i + 4]);
++			ops[count].point.y = TY(p[i + 3], p[i + 4]);
++			count++;
++			ops[count].operation = NFSB_PLOT_PATHOP_CUBIC;
++			ops[count].point.x = TX(p[i + 5], p[i + 6]);
++			ops[count].point.y = TY(p[i + 5], p[i + 6]);
++			count++;
++			i += 7;
++			break;
++		case PLOTTER_PATH_CLOSE:
++			if (have_start) {
++				ops[count].operation = NFSB_PLOT_PATHOP_LINE;
++				ops[count].point = start;
++				count++;
++			}
++			i += 1;
++			break;
++		default:
++			NSLOG(netsurf, INFO, "bad path command %d", (int)p[i]);
++			goto done;
++		}
++	}
++done:
++#undef TX
++#undef TY
++
++	memset(&pen, 0, sizeof(pen));
++	if (pstyle->fill_type != PLOT_OP_TYPE_NONE) {
++		pen.fill_type = NFSB_PLOT_OPTYPE_SOLID;
++		pen.fill_colour = pstyle->fill_colour;
++	} else {
++		pen.fill_type = NFSB_PLOT_OPTYPE_NONE;
++	}
++	if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
++		pen.stroke_type = NFSB_PLOT_OPTYPE_SOLID;
++		pen.stroke_colour = pstyle->stroke_colour;
++		pen.stroke_width = plot_style_fixed_to_int(pstyle->stroke_width);
++		if (pen.stroke_width < 1) {
++			pen.stroke_width = 1;
++		}
++	} else {
++		pen.stroke_type = NFSB_PLOT_OPTYPE_NONE;
++	}
++
++	res = (count < 2) ? true : nsfb_plot_path(nsfb, count, ops, &pen);
++	free(ops);
++
++	return res ? NSERROR_OK : NSERROR_INVALID;
+ }
+ 
+ 
