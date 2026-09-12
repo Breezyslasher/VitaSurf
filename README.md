@@ -213,6 +213,9 @@ previous one, so a relative request went wherever the user had been
 before, which for the first page of a session is a `file:` URL that the
 fetcher then refuses.
 
+Measured load times against the browser Sony shipped are kept in
+`docs/benchmarks.md`, along with what each phase of a load costs.
+
 A page load reports where its time went. When a page finishes, the log
 carries a second line breaking the total into HTML parsing, CSS,
 image decoding, box construction with style selection, and layout, and
