@@ -325,6 +325,31 @@ var WindowProto={};Object.setPrototypeOf(W,WindowProto);
 });
 if(!WindowProto.dispatchEvent)WindowProto.dispatchEvent=function(e){return __vitaDispatch(null,e);};
 W.Window=function(){};W.Window.prototype=WindowProto;W.Navigator=W.Location=W.History=W.Screen=W.Storage=Storage;
+/* MessageChannel, which schedulers use to get a macrotask: React and
+ * YouTube's player both post to a port instead of calling setTimeout(0),
+ * because a real browser clamps nested timeouts and does not clamp this.
+ * A timer is the honest equivalent here -- delivery stays asynchronous
+ * and ordered, which is what the schedulers depend on. */
+function MessagePort(){this._peer=null;this._l=[];this.onmessage=null;}
+MessagePort.prototype.postMessage=function(data){
+ var p=this._peer;if(!p)return;
+ setTimeout(function(){
+  var e={data:data,type:'message',target:p,currentTarget:p,source:null,origin:'',ports:[],
+         preventDefault:function(){},stopPropagation:function(){}};
+  if(typeof p.onmessage==='function'){try{p.onmessage(e);}catch(x){console.error(x);}}
+  p._l.slice().forEach(function(f){try{f.call(p,e);}catch(x){console.error(x);}});
+ },0);
+};
+MessagePort.prototype.addEventListener=function(t,f){if(t==='message'&&typeof f==='function')this._l.push(f);};
+MessagePort.prototype.removeEventListener=function(t,f){this._l=this._l.filter(function(g){return g!==f;});};
+MessagePort.prototype.start=function(){};
+MessagePort.prototype.close=function(){this._peer=null;this._l=[];this.onmessage=null;};
+MessagePort.prototype.dispatchEvent=function(){return true;};
+function MessageChannel(){this.port1=new MessagePort();this.port2=new MessagePort();this.port1._peer=this.port2;this.port2._peer=this.port1;}
+W.MessageChannel=MessageChannel;W.MessagePort=MessagePort;
+W.MessageEvent=W.MessageEvent||Event;
+if(!W.queueMicrotask)W.queueMicrotask=function(f){Promise.resolve().then(f);};
+if(!W.structuredClone)W.structuredClone=function(v){try{return JSON.parse(JSON.stringify(v));}catch(e){return v;}};
 W.MutationObserver=function(){};W.MutationObserver.prototype.observe=W.MutationObserver.prototype.disconnect=function(){};W.MutationObserver.prototype.takeRecords=function(){return [];};
 W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;
 W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};

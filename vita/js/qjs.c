@@ -3309,6 +3309,33 @@ void js_destroythread(jsthread *thread)
 #define SCRIPT_LOG_BYTES (256 * 1024)
 
 /*
+ * A module's import.meta, which QuickJS creates empty and leaves to the
+ * host to fill. Code reads import.meta.url to work out where it was
+ * loaded from: webpack's ES module output decides its public path that
+ * way and throws "Automatic publicPath is not supported in this browser"
+ * when it comes back undefined.
+ */
+static void set_import_meta(JSContext *ctx, JSValueConst func_val,
+			    const char *url)
+{
+	JSModuleDef *m = JS_VALUE_GET_PTR(func_val);
+	JSValue meta;
+
+	if (m == NULL || url == NULL) {
+		return;
+	}
+	meta = JS_GetImportMeta(ctx, m);
+	if (JS_IsException(meta)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return;
+	}
+	JS_DefinePropertyValueStr(ctx, meta, "url",
+				  JS_NewString(ctx, url), JS_PROP_C_W_E);
+	JS_DefinePropertyValueStr(ctx, meta, "main", JS_FALSE, JS_PROP_C_W_E);
+	JS_FreeValue(ctx, meta);
+}
+
+/*
  * Import resolution. A script compiled as a module is registered under its
  * own URL, and QuickJS satisfies an import of a URL it has already
  * compiled from its own module list without asking us, so a page whose
@@ -3384,6 +3411,7 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 					 name);
 				return NULL;
 			}
+			set_import_meta(ctx, fn, name);
 			m = JS_VALUE_GET_PTR(fn);
 			JS_FreeValue(ctx, fn);
 			thread->js_modules++;
@@ -3480,6 +3508,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				JS_FreeValue(thread->ctx, script_err);
 				fn = as_module;
 				module = true;
+				set_import_meta(thread->ctx, fn, name);
 			} else if (thread->js_imports_missed != missed) {
 				/*
 				 * It asked for an import, so it is a module
@@ -3490,6 +3519,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				JS_FreeValue(thread->ctx, script_err);
 				fn = as_module;
 				module = true;
+				set_import_meta(thread->ctx, fn, name);
 			} else {
 				/* Not a module either: the first error is
 				 * the one that describes the source. */
@@ -3540,6 +3570,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 					if (!JS_IsException(m)) {
 						JS_FreeValue(thread->ctx, err);
 						module = true;
+						set_import_meta(thread->ctx, m, name);
 						begin_script(thread);
 						ret = JS_EvalFunction(thread->ctx, m);
 					} else {
