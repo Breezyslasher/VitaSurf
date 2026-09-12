@@ -1,0 +1,166 @@
+diff --git a/src/events/dispatch.c b/src/events/dispatch.c
+index a8b8ad7..6cd2dbb 100644
+--- a/src/events/dispatch.c
++++ b/src/events/dispatch.c
+@@ -31,6 +31,26 @@ dom_exception __dom_dispatch_node_change_event(dom_document *doc,
+ 	dom_string *type = NULL;
+ 	dom_exception err;
+ 
++	/*
++	 * VitaSurf: there is nothing to dispatch without both of these, and
++	 * callers here supply either from a node field that can be empty.
++	 *
++	 * The document is read for the memoised event name, and a node made
++	 * outside any document -- a doctype is one -- has no owner.
++	 *
++	 * The target is worse: dispatching reads its vtable through
++	 * dom_event_target_dispatch_event, which is inlined here, so a null
++	 * one faults inside this function rather than in the call. That is
++	 * the crash a dump pinned to "ldr r3, [r4, #0]" with r4 zero, r4
++	 * being this argument. Callers pass an attribute's element or a
++	 * node's parent, and both are absent for a detached node.
++	 */
++	if (doc == NULL || et == NULL) {
++		if (success != NULL)
++			*success = true;
++		return DOM_NO_ERR;
++	}
++
+ 	err = _dom_mutation_event_create(&evt);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
+@@ -77,6 +97,26 @@ dom_exception __dom_dispatch_node_change_document_event(dom_document *doc,
+ 	dom_string *type = NULL;
+ 	dom_exception err;
+ 
++	/*
++	 * VitaSurf: there is nothing to dispatch without both of these, and
++	 * callers here supply either from a node field that can be empty.
++	 *
++	 * The document is read for the memoised event name, and a node made
++	 * outside any document -- a doctype is one -- has no owner.
++	 *
++	 * The target is worse: dispatching reads its vtable through
++	 * dom_event_target_dispatch_event, which is inlined here, so a null
++	 * one faults inside this function rather than in the call. That is
++	 * the crash a dump pinned to "ldr r3, [r4, #0]" with r4 zero, r4
++	 * being this argument. Callers pass an attribute's element or a
++	 * node's parent, and both are absent for a detached node.
++	 */
++	if (doc == NULL || et == NULL) {
++		if (success != NULL)
++			*success = true;
++		return DOM_NO_ERR;
++	}
++
+ 	err = _dom_mutation_event_create(&evt);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
+@@ -128,6 +168,26 @@ dom_exception __dom_dispatch_attr_modified_event(dom_document *doc,
+ 	dom_string *type = NULL;
+ 	dom_exception err;
+ 
++	/*
++	 * VitaSurf: there is nothing to dispatch without both of these, and
++	 * callers here supply either from a node field that can be empty.
++	 *
++	 * The document is read for the memoised event name, and a node made
++	 * outside any document -- a doctype is one -- has no owner.
++	 *
++	 * The target is worse: dispatching reads its vtable through
++	 * dom_event_target_dispatch_event, which is inlined here, so a null
++	 * one faults inside this function rather than in the call. That is
++	 * the crash a dump pinned to "ldr r3, [r4, #0]" with r4 zero, r4
++	 * being this argument. Callers pass an attribute's element or a
++	 * node's parent, and both are absent for a detached node.
++	 */
++	if (doc == NULL || et == NULL) {
++		if (success != NULL)
++			*success = true;
++		return DOM_NO_ERR;
++	}
++
+ 	err = _dom_mutation_event_create(&evt);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
+@@ -172,6 +232,26 @@ dom_exception __dom_dispatch_characterdata_modified_event(
+ 	dom_string *type = NULL;
+ 	dom_exception err;
+ 
++	/*
++	 * VitaSurf: there is nothing to dispatch without both of these, and
++	 * callers here supply either from a node field that can be empty.
++	 *
++	 * The document is read for the memoised event name, and a node made
++	 * outside any document -- a doctype is one -- has no owner.
++	 *
++	 * The target is worse: dispatching reads its vtable through
++	 * dom_event_target_dispatch_event, which is inlined here, so a null
++	 * one faults inside this function rather than in the call. That is
++	 * the crash a dump pinned to "ldr r3, [r4, #0]" with r4 zero, r4
++	 * being this argument. Callers pass an attribute's element or a
++	 * node's parent, and both are absent for a detached node.
++	 */
++	if (doc == NULL || et == NULL) {
++		if (success != NULL)
++			*success = true;
++		return DOM_NO_ERR;
++	}
++
+ 	err = _dom_mutation_event_create(&evt);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
+@@ -208,6 +288,26 @@ dom_exception __dom_dispatch_subtree_modified_event(dom_document *doc,
+ 	dom_string *type = NULL;
+ 	dom_exception err;
+ 
++	/*
++	 * VitaSurf: there is nothing to dispatch without both of these, and
++	 * callers here supply either from a node field that can be empty.
++	 *
++	 * The document is read for the memoised event name, and a node made
++	 * outside any document -- a doctype is one -- has no owner.
++	 *
++	 * The target is worse: dispatching reads its vtable through
++	 * dom_event_target_dispatch_event, which is inlined here, so a null
++	 * one faults inside this function rather than in the call. That is
++	 * the crash a dump pinned to "ldr r3, [r4, #0]" with r4 zero, r4
++	 * being this argument. Callers pass an attribute's element or a
++	 * node's parent, and both are absent for a detached node.
++	 */
++	if (doc == NULL || et == NULL) {
++		if (success != NULL)
++			*success = true;
++		return DOM_NO_ERR;
++	}
++
+ 	err = _dom_mutation_event_create(&evt);
+ 	if (err != DOM_NO_ERR)
+ 		return err;
+@@ -248,6 +348,26 @@ dom_exception _dom_dispatch_generic_event(dom_document *doc,
+ 	struct dom_event *evt;
+ 	dom_exception err;
+ 
++	/*
++	 * VitaSurf: there is nothing to dispatch without both of these, and
++	 * callers here supply either from a node field that can be empty.
++	 *
++	 * The document is read for the memoised event name, and a node made
++	 * outside any document -- a doctype is one -- has no owner.
++	 *
++	 * The target is worse: dispatching reads its vtable through
++	 * dom_event_target_dispatch_event, which is inlined here, so a null
++	 * one faults inside this function rather than in the call. That is
++	 * the crash a dump pinned to "ldr r3, [r4, #0]" with r4 zero, r4
++	 * being this argument. Callers pass an attribute's element or a
++	 * node's parent, and both are absent for a detached node.
++	 */
++	if (doc == NULL || et == NULL) {
++		if (success != NULL)
++			*success = true;
++		return DOM_NO_ERR;
++	}
++
+ 	UNUSED(doc);
+ 
+ 	err = _dom_event_create(&evt);
