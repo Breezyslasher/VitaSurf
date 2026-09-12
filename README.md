@@ -131,11 +131,16 @@ tree, so the wait between rebuilds grows with how long the last one took,
 up to two seconds, and a script that reads geometry on a document that is
 slow to lay out gets the last known values rather than forcing a rebuild.
 
-The rebuild runs through NetSurf's own conversion, which yields to the
-scheduler as it goes, so a long document does not stall the frame. While
-it runs the content has no box tree, so layout, hit testing and the
-object callbacks check for that and wait. A script that reads geometry
-right after changing the document reads the previous layout rather than
+The rebuild runs to completion in one scheduler callback rather than
+yielding as NetSurf's initial conversion does. A content that has
+finished loading is assumed throughout NetSurf to have a box tree, and
+letting other work run while it briefly has none crashed the browser in
+an assertion in the redraw path, reached by the history thumbnail. It
+does mean a long document freezes the frame for the length of a rebuild,
+so rebuilds are coalesced, batched while the page is still loading, and
+never overlapped. Redraw, hit testing, reformat and the object callbacks
+check for a missing box tree anyway. A script that reads geometry right
+after changing the document reads the previous layout rather than
 forcing a rebuild from under code that holds box pointers.
 
 libdom dispatches its element methods through a vtable that only element

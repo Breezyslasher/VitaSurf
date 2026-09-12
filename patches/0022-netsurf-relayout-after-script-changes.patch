@@ -41,8 +41,116 @@ index c17caadcb..2af10bfd5 100644
 +void nscss_clear_node_data(dom_node *n);
 +
  #endif
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index f36f94cc5..7867f62b8 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -62,6 +62,8 @@ struct box_construct_ctx {
+ 	box_construct_complete_cb cb;	/**< Callback to invoke on completion */
+ 
+ 	int *bctx;			/**< talloc context */
++
++	bool sync;			/**< run to completion without yielding (VitaSurf) */
+ };
+ 
+ /**
+@@ -1363,7 +1365,7 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 			free(ctx);
+ 			return;
+ 		}
+-	} while (++num_processed < max_processed_before_yield);
++	} while (++num_processed < max_processed_before_yield || ctx->sync);
+ 
+ 	/* More work to do: schedule a continuation */
+ 	guit->misc->schedule(0, (void *)convert_xml_to_box, ctx);
+@@ -1399,6 +1401,7 @@ dom_to_box(dom_node *n,
+ 	ctx->root_box = NULL;
+ 	ctx->cb = cb;
+ 	ctx->bctx = c->bctx;
++	ctx->sync = false;
+ 
+ 	*box_conversion_context = ctx;
+ 
+@@ -1406,6 +1409,39 @@ dom_to_box(dom_node *n,
+ }
+ 
+ 
++/* exported function documented in html/box_construct.h */
++nserror
++dom_to_box_sync(dom_node *n, html_content *c, box_construct_complete_cb cb)
++{
++	struct box_construct_ctx *ctx;
++
++	if (c->bctx == NULL) {
++		/* create a context allocation for this box tree */
++		c->bctx = talloc_zero(0, int);
++		if (c->bctx == NULL) {
++			return NSERROR_NOMEM;
++		}
++	}
++
++	ctx = malloc(sizeof(*ctx));
++	if (ctx == NULL) {
++		return NSERROR_NOMEM;
++	}
++
++	ctx->content = c;
++	ctx->n = dom_node_ref(n);
++	ctx->root_box = NULL;
++	ctx->cb = cb;
++	ctx->bctx = c->bctx;
++	ctx->sync = true;
++
++	/* runs the whole conversion, calls cb, and frees ctx */
++	convert_xml_to_box(ctx);
++
++	return NSERROR_OK;
++}
++
++
+ /* exported function documented in html/box_construct.h */
+ nserror cancel_dom_to_box(void *box_conversion_context)
+ {
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index f4bd119b1..8937a4d66 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -83,6 +83,20 @@
+  */
+ nserror dom_to_box(struct dom_node *n, struct html_content *c, box_construct_complete_cb cb, void **box_conversion_context);
+ 
++/**
++ * Construct a box tree from a dom in one go, without returning to the
++ * scheduler (VitaSurf). Used to rebuild the layout after scripts changed
++ * the document: the content is without a box tree until it finishes, and
++ * a great deal of NetSurf assumes a content that is not still loading
++ * has one. The callback runs before this returns.
++ *
++ * \param n  root dom node to make boxes from
++ * \param c  content of the html document
++ * \param cb callback to invoke on completion
++ * \return NSERROR_OK on success or error code on failure
++ */
++nserror dom_to_box_sync(struct dom_node *n, struct html_content *c, box_construct_complete_cb cb);
++
+ 
+ /**
+  * aborts any ongoing box construction
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 16ca1bea8..43854fb6d 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -859,7 +859,7 @@ box_pick_text_box(struct html_content *html,
+ 	int fx, fy;
+ 	int tx, ty;
+ 
+-	if (html == NULL)
++	if (html == NULL || html->layout == NULL)
+ 		return NULL;
+ 
+ 	box = html->layout;
 diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
-index f92985b04..3bab14edd 100644
+index f92985b04..5dd8e7cbb 100644
 --- a/content/handlers/html/html.c
 +++ b/content/handlers/html/html.c
 @@ -50,6 +50,7 @@
@@ -206,7 +314,7 @@ index f92985b04..3bab14edd 100644
  	nsu_getmonotonic_ms(&ms_before);
  
  	htmlc->reflowing = true;
-@@ -1101,6 +1123,178 @@ static void html_reformat(struct content *c, int width, int height)
+@@ -1101,6 +1123,173 @@ static void html_reformat(struct content *c, int width, int height)
  }
  
  
@@ -266,8 +374,6 @@ index f92985b04..3bab14edd 100644
 + */
 +static void html_relayout_done(html_content *c, bool success)
 +{
-+	c->box_conversion_context = NULL;
-+
 +	if (success == false || c->layout == NULL) {
 +		NSLOG(netsurf, ERROR, "box tree rebuild failed (content %p)", c);
 +		content_broadcast_error(&c->base, NSERROR_BOX_CONVERT, NULL);
@@ -370,14 +476,11 @@ index f92985b04..3bab14edd 100644
 +		return NSERROR_NOMEM;
 +	}
 +
-+	/* NetSurf's own conversion, which yields to the scheduler as it
-+	 * goes, so a long document does not stall the frame */
-+	err = dom_to_box(html, htmlc, html_relayout_done,
-+			 &htmlc->box_conversion_context);
++	/* Run to completion here rather than yielding: the content has no
++	 * box tree until this finishes, and redraw, hit testing and the
++	 * rest of NetSurf take one for granted on a loaded page. */
++	err = dom_to_box_sync(html, htmlc, html_relayout_done);
 +	dom_node_unref(html);
-+	if (err != NSERROR_OK) {
-+		htmlc->box_conversion_context = NULL;
-+	}
 +	return err;
 +}
 +
@@ -452,3 +555,24 @@ index 56cd957d5..1a531c3cc 100644
  /* in html/forms.c */
  struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
  struct form_control *html_forms_get_control_for_node(struct form *forms,
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index ead94cc79..c007910d9 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -2047,7 +2047,15 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 	};
+ 
+ 	box = html->layout;
+-	assert(box);
++	if (box == NULL) {
++		/* No box tree: a rebuild from a script-modified document is
++		 * in flight. Paint the background and wait for it; the
++		 * rebuild redraws when it finishes (VitaSurf). */
++		if (data->background_colour != NS_TRANSPARENT) {
++			ctx->plot->rectangle(ctx, &pstyle_fill_bg, clip);
++		}
++		return true;
++	}
+ 
+ 	/* The select menu needs special treating because, when opened, it
+ 	 * reaches beyond its layout box.

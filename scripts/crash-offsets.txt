@@ -12,3 +12,9 @@
 #   call.
 0xc32a2
 0x932e
+# Build 88: SIGABRT on the main thread about a second after a layout
+#   rebuild started. Resolved against build 88's own symbol map: an
+#   assertion in html_redraw, reached through browser_window_history_
+#   update rendering the history thumbnail while the content had no box
+#   tree. The rebuild runs to completion again rather than yielding.
+0x35ff8e
