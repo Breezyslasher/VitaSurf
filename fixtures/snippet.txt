@@ -1,2 +1,4 @@
-url=https://github.githubassets.com/assets/catalyst-86a8f5de995615f8.js
-find=connectedCallback
+url=https://www.youtube.com/s/desktop/e60429bd/jsbin/webcomponents-all-noPatch.vflset/webcomponents-all-noPatch.js
+line=139:0-1400
+line=230:0-900
+line=231:0-900
