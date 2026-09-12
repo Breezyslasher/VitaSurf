@@ -1,20 +1,50 @@
 diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
-index 83a84ac7b..8621f5649 100644
+index 83a84ac7b..3424e0d2f 100644
 --- a/content/handlers/html/dom_event.c
 +++ b/content/handlers/html/dom_event.c
-@@ -168,6 +168,26 @@ static bool html_process_inserted_link(html_content *c, dom_node *node)
+@@ -168,6 +168,56 @@ static bool html_process_inserted_link(html_content *c, dom_node *node)
  	/* Handle stylesheet loading */
  	html_css_process_link(c, (dom_node *)node);
  
-+	/* Handle a preloaded ES module (VitaSurf) */
++	/*
++	 * Fetch a script the page says it will need (VitaSurf).
++	 *
++	 * Two relations mean that: modulepreload, which is always a
++	 * module, and preload with as="script". Both are the page saying
++	 * fetch this now, and the second one matters because a bundler
++	 * announces the chunks it will import that way and then gives up
++	 * on one within a couple of seconds of first asking for it. The
++	 * fetch has to have started well before that.
++	 */
 +	{
-+		dom_string *rel = NULL, *href = NULL;
++		dom_string *rel = NULL, *as = NULL, *href = NULL;
++		bool wanted = false;
 +
 +		if (dom_element_get_attribute(node, corestring_dom_rel,
 +					      &rel) == DOM_NO_ERR &&
 +		    rel != NULL) {
 +			if (strcasestr(dom_string_data(rel),
-+				       "modulepreload") != NULL &&
++				       "modulepreload") != NULL) {
++				wanted = true;
++			} else if (strcasestr(dom_string_data(rel),
++					      "preload") != NULL) {
++				dom_string *key = NULL;
++
++				/* "as" is not in the core string table */
++				if (dom_string_create((const uint8_t *)"as", 2,
++						      &key) == DOM_NO_ERR) {
++					if (dom_element_get_attribute(node, key,
++							&as) == DOM_NO_ERR &&
++					    as != NULL) {
++						wanted = strcasestr(
++							dom_string_data(as),
++							"script") != NULL;
++						dom_string_unref(as);
++					}
++					dom_string_unref(key);
++				}
++			}
++			if (wanted &&
 +			    dom_element_get_attribute(node,
 +					corestring_dom_href,
 +					&href) == DOM_NO_ERR &&
