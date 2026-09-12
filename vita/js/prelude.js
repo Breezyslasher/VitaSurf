@@ -20,7 +20,7 @@ Object.defineProperty(P,'parentElement',{get:function(){var p=this.parentNode;re
 Object.defineProperty(P,'innerText',{get:function(){return this.textContent;},set:function(v){this.textContent=v;}});
 Object.defineProperty(P,'outerHTML',{get:function(){return '';}});
 Object.defineProperty(P,'ownerDocument',{get:function(){return document;}});
-['href','src','value','type','name','title','alt','rel','target','action','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){this.setAttribute(attr,String(v));}});});
+['href','src','value','type','name','title','alt','rel','target','action','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){this.setAttribute(attr,String(v));}});});
 ['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{get:function(){return this.hasAttribute(attr);},set:function(v){if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
 /* Layout geometry. __vitaBox(node) (qjs.c) returns the element's laid-out
    box as [x,y,width,height,clientWidth,clientHeight,clientLeft,clientTop,
@@ -308,4 +308,183 @@ AbortController.prototype.abort=function(reason){var s=this.signal;if(s.aborted)
 W.AbortController=AbortController;W.AbortSignal=AbortSignal;
 W.TextEncoder=function(){this.encoding='utf-8';};W.TextEncoder.prototype.encode=function(s){s=unescape(encodeURIComponent(String(s)));var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;};
 W.TextDecoder=function(){this.encoding='utf-8';};W.TextDecoder.prototype.decode=function(b){if(!b)return '';var v=b instanceof Uint8Array?b:new Uint8Array(b.buffer||b),s='';for(var i=0;i<v.length;i++)s+=String.fromCharCode(v[i]);try{return decodeURIComponent(escape(s));}catch(e){return s;}};
+/* --- custom elements ---------------------------------------------------
+ * A registry, an upgrade path and the four reactions. Component sites
+ * ship their whole UI as custom elements, so without this their script
+ * defines classes that nothing ever instantiates and the page stays as
+ * the server sent it.
+ *
+ * Upgrading works because Node.prototype is the prototype of every node
+ * wrapper and wrappers are cached per DOM node in qjs.c, so an element
+ * keeps its identity and its expandos. A custom element class extends
+ * CEBase below; when its constructor calls super(), CEBase returns the
+ * element being upgraded, which is what the derived constructor binds
+ * `this` to. That is how a real browser's construction stack works.
+ *
+ * Everything here bails out on CEn (the number of definitions) so a page
+ * that defines none pays one integer test per DOM call.
+ */
+var CE={},CEn=0,CEwait={},CEstack=[];
+
+function CEBase(){
+ var e=CEstack.length?CEstack[CEstack.length-1]:undefined;
+ if(e===undefined)throw new TypeError('Illegal constructor');
+ return e;
+}
+CEBase.prototype=P;
+W.HTMLElement=CEBase;
+/* Every HTML*Element alias shares it, so `extends HTMLDivElement` works. */
+Object.keys(W).forEach(function(k){if(k.indexOf('HTML')===0&&k!=='HTMLDocument'&&W[k]===Element)W[k]=CEBase;});
+
+function ceErr(e){try{console.error('custom element: '+(e&&e.stack?e.stack:e));}catch(x){}}
+function ceCall(el,name,args){var f=el[name];if(typeof f!=='function')return;try{f.apply(el,args||[]);}catch(e){ceErr(e);}}
+function ceInDoc(n){var r=D.documentElement;while(n){if(n===r)return true;n=n.parentNode;}return false;}
+
+/* The definition an element would upgrade to, or null. */
+function ceDefOf(el){
+ if(!el||el.nodeType!==1)return null;
+ var t=el.tagName;if(!t)return null;t=t.toLowerCase();
+ if(t.indexOf('-')<0){var is=el.getAttribute('is');if(!is)return null;t=String(is).toLowerCase();}
+ return CE[t]||null;
+}
+
+function ceSet(el,k,v){Object.defineProperty(el,k,{value:v,writable:true,enumerable:false,configurable:true});}
+
+function ceUpgrade(el,inDoc){
+ if(el.__ceState)return;
+ var d=ceDefOf(el);if(!d)return;
+ ceSet(el,'__ceState',1);ceSet(el,'__ceDef',d);
+ try{
+  /* A class that does not extend HTMLElement would otherwise lose every
+   * DOM method the moment its prototype is installed. */
+  if(!P.isPrototypeOf(d.ctor.prototype))Object.setPrototypeOf(d.ctor.prototype,P);
+  Object.setPrototypeOf(el,d.ctor.prototype);
+  CEstack.push(el);
+  try{Reflect.construct(d.ctor,[],d.ctor);}finally{CEstack.pop();}
+ }catch(e){el.__ceState=3;ceErr(e);return;}
+ el.__ceState=2;
+ var o=d.obs;
+ for(var i=0;i<o.length;i++){
+  if(el.hasAttribute(o[i]))ceCall(el,'attributeChangedCallback',[o[i],null,el.getAttribute(o[i]),null]);
+ }
+ if(inDoc===undefined?ceInDoc(el):inDoc){ceSet(el,'__ceConn',true);ceCall(el,'connectedCallback');}
+}
+
+/* Upgrade and connect every custom element in a subtree just inserted. */
+function ceConnectTree(n,inDoc,skipSelf){
+ if(!n)return;
+ if(!skipSelf&&n.nodeType===1){
+  if(!n.__ceState)ceUpgrade(n,inDoc);
+  else if(n.__ceState===2&&!n.__ceConn&&inDoc){ceSet(n,'__ceConn',true);ceCall(n,'connectedCallback');}
+ }
+ var c=n.childNodes;if(!c)return;
+ for(var i=0;i<c.length;i++)ceConnectTree(c[i],inDoc,false);
+}
+
+function ceDisconnectTree(n,skipSelf){
+ if(!n)return;
+ if(!skipSelf&&n.nodeType===1&&n.__ceConn){ceSet(n,'__ceConn',false);ceCall(n,'disconnectedCallback');}
+ var c=n.childNodes;if(!c)return;
+ for(var i=0;i<c.length;i++)ceDisconnectTree(c[i],false);
+}
+
+W.customElements={
+ define:function(name,ctor,opts){
+  name=String(name).toLowerCase();
+  if(typeof ctor!=='function')throw new TypeError('constructor is not a function');
+  if(CE[name])throw new Error("the name \""+name+"\" has already been used");
+  var obs=[];
+  try{var a=ctor.observedAttributes;if(a)for(var i=0;i<a.length;i++)obs.push(String(a[i]).toLowerCase());}catch(e){}
+  CE[name]={ctor:ctor,obs:obs,ext:opts&&opts['extends']?String(opts['extends']).toLowerCase():null};
+  CEn++;
+  /* upgrade what the parser already built */
+  var list=D.getElementsByTagName(CE[name].ext||name);
+  for(var j=0;j<list.length;j++)ceUpgrade(list[j]);
+  var w=CEwait[name];
+  if(w){delete CEwait[name];for(var k=0;k<w.length;k++)w[k](ctor);}
+ },
+ get:function(name){var d=CE[String(name).toLowerCase()];return d?d.ctor:undefined;},
+ getName:function(c){for(var k in CE)if(CE[k].ctor===c)return k;return null;},
+ whenDefined:function(name){
+  name=String(name).toLowerCase();
+  if(CE[name])return Promise.resolve(CE[name].ctor);
+  return new Promise(function(res){(CEwait[name]=CEwait[name]||[]).push(res);});
+ },
+ upgrade:function(root){if(CEn)ceConnectTree(root,ceInDoc(root),false);}
+};
+
+/* Reactions on the DOM calls that move elements in and out of the tree. */
+['appendChild','insertBefore'].forEach(function(m){
+ var orig=P[m];
+ P[m]=function(n){var r=orig.apply(this,arguments);if(CEn&&n)ceConnectTree(n,ceInDoc(this),false);return r;};
+});
+(function(){
+ var orig=P.removeChild;
+ P.removeChild=function(n){var r=orig.apply(this,arguments);if(CEn&&n)ceDisconnectTree(n,false);return r;};
+})();
+(function(){
+ var orig=P.replaceChild;
+ P.replaceChild=function(nw,old){var r=orig.apply(this,arguments);
+  if(CEn){if(old)ceDisconnectTree(old,false);if(nw)ceConnectTree(nw,ceInDoc(this),false);}return r;};
+})();
+(function(){
+ var d=Object.getOwnPropertyDescriptor(P,'innerHTML');
+ Object.defineProperty(P,'innerHTML',{get:d.get,set:function(v){
+  var old=CEn?this.childNodes.slice():null;
+  d.set.call(this,v);
+  if(CEn){for(var i=0;i<old.length;i++)ceDisconnectTree(old[i],false);ceConnectTree(this,ceInDoc(this),true);}
+ }});
+})();
+(function(){
+ var orig=P.setAttribute;
+ P.setAttribute=function(n,v){
+  var d=CEn?this.__ceDef:null;
+  if(!d||d.obs.length===0)return orig.apply(this,arguments);
+  var a=String(n).toLowerCase();
+  if(d.obs.indexOf(a)<0)return orig.apply(this,arguments);
+  var was=this.getAttribute(n),r=orig.apply(this,arguments),now=this.getAttribute(n);
+  if(was!==now)ceCall(this,'attributeChangedCallback',[a,was,now,null]);
+  return r;
+ };
+ var origRm=P.removeAttribute;
+ P.removeAttribute=function(n){
+  var d=CEn?this.__ceDef:null;
+  if(!d||d.obs.length===0)return origRm.apply(this,arguments);
+  var a=String(n).toLowerCase(),was=this.getAttribute(n),r=origRm.apply(this,arguments);
+  if(was!==null&&d.obs.indexOf(a)>=0)ceCall(this,'attributeChangedCallback',[a,was,null,null]);
+  return r;
+ };
+})();
+(function(){
+ var orig=D.createElement;
+ D.createElement=function(t,o){
+  var el=orig.call(D,t);
+  if(CEn&&el&&el.nodeType===1){if(o&&o.is)el.setAttribute('is',o.is);ceUpgrade(el,false);}
+  return el;
+ };
+})();
+/* The parser keeps adding elements after a define, so sweep once the
+ * document is built. Both events reach document listeners (qjs.c). */
+W.addEventListener('DOMContentLoaded',function(){if(CEn)ceConnectTree(D.documentElement,true,false);});
+W.addEventListener('load',function(){if(CEn)ceConnectTree(D.documentElement,true,false);});
+
+/* Shadow DOM, as light DOM. A shadow root is the element itself, so
+ * there is no style or selector scoping, which is the point: content put
+ * in a shadow root still lays out and still renders, where an
+ * unimplemented attachShadow renders nothing at all. shadowRoot stays
+ * null until attachShadow is called, because components test it to find
+ * out whether they have already built themselves. */
+P.attachShadow=function(){Object.defineProperty(this,'__shadow',{value:true,writable:true,enumerable:false});return this;};
+P.getRootNode=function(){var n=this;while(n.parentNode)n=n.parentNode;return n===D.documentElement?D:n;};
+Object.defineProperty(P,'shadowRoot',{get:function(){return this.__shadow?this:null;}});
+Object.defineProperty(P,'host',{get:function(){return this.__shadow?this:undefined;}});
+Object.defineProperty(P,'isConnected',{get:function(){return ceInDoc(this);}});
+/* Same reasoning for <template>: libdom parses its children into the
+ * element, so content is the element. Every other tag keeps the content
+ * attribute property, which <meta> needs. */
+(function(){
+ var d=Object.getOwnPropertyDescriptor(P,'content');
+ Object.defineProperty(P,'content',{get:function(){return this.tagName==='TEMPLATE'?this:d.get.call(this);},set:d.set});
+})();
+W.ShadowRoot=CEBase;
 })();

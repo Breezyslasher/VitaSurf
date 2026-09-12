@@ -297,9 +297,11 @@ static dom_string *to_dom_string(const char *s)
 /* Node wrapper                                                             */
 
 /*
- * Each wrapper owns a reference on its dom_node, dropped in the finalizer.
- * Wrappers are created fresh on demand; identity across accesses is not
- * preserved, which is enough for the scripts this engine targets.
+ * Each wrapper owns a reference on its dom_node, dropped in the finalizer,
+ * and the thread's cache keeps one wrapper per node so a node fetched
+ * twice compares equal. Custom elements depend on that: upgrading swaps an
+ * element's prototype, and the swap has to be visible to every later
+ * reference to the same node.
  */
 
 static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
