@@ -92,11 +92,17 @@ jobs:
           # runtime; also save one bundle with them for offline reading.
           mods = re.search(r'RLPAGEMODULES=\[([^\]]*)\]', text)
           if mods:
-              names = ','.join(x.strip('"\' ') for x in mods.group(1).split(','))
+              # load.php separates module names with '|'; a comma joins
+              # names that share a prefix, so a comma list is one module.
+              names = '|'.join(x.strip('"\' ') for x in mods.group(1).split(','))
               base = urllib.parse.urljoin(url, '/w/load.php')
-              fetch(base + '?lang=en&modules=' + urllib.parse.quote(names, safe=',.') + '&skin=minerva&only=scripts', 'js')
-              fetch(base + '?lang=en&modules=' + urllib.parse.quote(names, safe=',.') + '&skin=minerva&only=styles', 'css')
+              fetch(base + '?lang=en&modules=' + urllib.parse.quote(names, safe='.') + '&skin=minerva&only=scripts', 'js')
+              fetch(base + '?lang=en&modules=' + urllib.parse.quote(names, safe='.') + '&skin=minerva&only=styles', 'css')
               fetch(base + '?lang=en&modules=startup&only=scripts&skin=minerva', 'js')
+              # the usual dependencies of the page modules, so the
+              # skin's code can be read offline
+              deps = 'jquery|mediawiki.base|mediawiki.util|mediawiki.api|mediawiki.router|mediawiki.Title|mediawiki.storage|mediawiki.user|mediawiki.cookie|mobile.startup|mediawiki.template|mediawiki.template.mustache|mediawiki.experiments'
+              fetch(base + '?lang=en&modules=' + urllib.parse.quote(deps, safe='.') + '&skin=minerva&only=scripts', 'js')
           open(os.path.join(out, 'page.html'), 'w').write(text)
           with open(os.path.join(out, 'assets.txt'), 'w') as f:
               for u, n in assets.items():
