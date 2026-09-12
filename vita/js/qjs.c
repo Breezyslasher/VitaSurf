@@ -964,6 +964,23 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	if (dom_node_get_owner_document(node, &doc) != DOM_NO_ERR) {
 		return;
 	}
+	if (doc == NULL) {
+		/*
+		 * libdom reports no owner document for a document node,
+		 * which is what document.innerHTML would hand us. Parsing
+		 * the fragment against a NULL document builds nodes with no
+		 * owner, and libdom's mutation dispatch reads the owner
+		 * without checking it.
+		 */
+		dom_node_type type = DOM_NODE_TYPE_COUNT;
+
+		if (dom_node_get_node_type(node, &type) != DOM_NO_ERR ||
+		    type != DOM_DOCUMENT_NODE) {
+			return;
+		}
+		doc = (struct dom_document *)node;
+		dom_node_ref(node);
+	}
 	memset(&params, 0, sizeof(params));
 	params.enc = "UTF-8";
 	params.fix_enc = true;

@@ -294,6 +294,15 @@ W.NodeList=W.HTMLCollection=Array;
  'DOMPoint','DOMMatrix','Selection','XPathResult','AnimationEvent','TransitionEvent',
  'HTMLAllCollection','RadioNodeList','ValidityState'].forEach(function(n){if(W[n]===undefined)W[n]=function(){};});
 var WindowProto={};Object.setPrototypeOf(W,WindowProto);
+/* The event target calls belong on the prototype, not on window itself.
+ * A polyfill reads an own descriptor off Window.prototype to wrap them,
+ * finds nothing when they sit on the global, and then calls the wrapper
+ * it never made. Moving them keeps window.addEventListener resolving
+ * exactly as before, through the chain. */
+['addEventListener','removeEventListener','dispatchEvent'].forEach(function(k){
+ if(Object.prototype.hasOwnProperty.call(W,k)){WindowProto[k]=W[k];delete W[k];}
+});
+if(!WindowProto.dispatchEvent)WindowProto.dispatchEvent=function(e){return __vitaDispatch(null,e);};
 W.Window=function(){};W.Window.prototype=WindowProto;W.Navigator=W.Location=W.History=W.Screen=W.Storage=Storage;
 W.MutationObserver=function(){};W.MutationObserver.prototype.observe=W.MutationObserver.prototype.disconnect=function(){};W.MutationObserver.prototype.takeRecords=function(){return [];};
 W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;
