@@ -175,6 +175,62 @@ P.insertAdjacentElement=function(where,el){
  return el;
 };
 P.insertAdjacentText=function(where,t){return P.insertAdjacentElement.call(this,where,D.createTextNode(String(t)));};
+/* The rest of the element surface. Every one of these was reached by a
+ * real page: catalyst calls toggleAttribute as the first thing in its
+ * connectedCallback, and a missing method there is not a gap that
+ * degrades, it is a TypeError that stops the component. */
+/* Scrolling an element. There is one scrollable area here, the page, so
+ * scrolling an element that is not the root scrolls what actually
+ * scrolls rather than doing nothing. scrollIntoViewIfNeeded is the old
+ * WebKit spelling of a method we already have. */
+P.scrollTo=P.scroll=function(a,b){window.scrollTo(a,b);};
+P.scrollBy=function(a,b){window.scrollBy(a,b);};
+P.scrollIntoViewIfNeeded=function(centre){return this.scrollIntoView(centre===false?{block:'nearest'}:true);};
+P.toggleAttribute=function(n,force){
+ var has=this.hasAttribute(n);
+ var on=force===undefined?!has:!!force;
+ if(on){if(!has)this.setAttribute(n,'');}else if(has)this.removeAttribute(n);
+ return on;
+};
+P.getAttributeNames=function(){return this.attributes.map(function(a){return a.name;});};
+P.hasChildNodes=function(){return this.childNodes.length>0;};
+P.isSameNode=function(o){return this===o;};
+P.isEqualNode=function(o){
+ if(this===o)return true;
+ if(!o||o.nodeType!==this.nodeType)return false;
+ if(this.nodeType===1)return this.tagName===o.tagName&&this.outerHTML===o.outerHTML;
+ return this.textContent===o.textContent;
+};
+P.lookupPrefix=function(){return null;};
+P.lookupNamespaceURI=function(){return 'http://www.w3.org/1999/xhtml';};
+P.isDefaultNamespace=function(ns){return ns==='http://www.w3.org/1999/xhtml';};
+P.checkVisibility=function(){return this.isConnected&&getComputedStyle(this).display!=='none';};
+/* Pointer capture routes events to one element; ours already go to the
+ * element under the touch, so there is nothing to redirect. */
+P.setPointerCapture=function(){};P.releasePointerCapture=function(){};
+P.hasPointerCapture=function(){return false;};
+P.requestFullscreen=function(){return Promise.resolve();};
+P.computedStyleMap=function(){var cs=getComputedStyle(this);
+ return {get:function(n){return {value:cs.getPropertyValue(n),toString:function(){return cs.getPropertyValue(n);}};},
+         has:function(n){return cs.getPropertyValue(n)!=='';},size:0,forEach:function(){}};};
+/* Animations run to their end state immediately: there is no compositor
+ * here, and code waits on finished before doing the thing that matters. */
+function FinishedAnimation(){
+ var self=this;
+ this.playState='finished';this.currentTime=0;this.startTime=0;this.playbackRate=1;
+ this.onfinish=null;this.oncancel=null;
+ this.finished=Promise.resolve(this);this.ready=Promise.resolve(this);
+ this.play=function(){};this.pause=function(){};this.reverse=function(){};
+ this.cancel=function(){if(typeof self.oncancel==='function')self.oncancel({target:self});};
+ this.finish=function(){};this.updatePlaybackRate=function(){};
+ this.addEventListener=function(t,f){if(t==='finish')setTimeout(function(){f({target:self});},0);};
+ this.removeEventListener=function(){};
+ setTimeout(function(){if(typeof self.onfinish==='function')self.onfinish({target:self});},0);
+}
+P.animate=function(){return new FinishedAnimation();};
+P.getAnimations=function(){return [];};
+window.Animation=FinishedAnimation;
+
 P.insertAdjacentHTML=function(where,html){
  var tmp=D.createElement('div');tmp.innerHTML=String(html);
  var kids=tmp.childNodes.slice();
@@ -196,7 +252,43 @@ Object.defineProperty(D,'links',{configurable:true,get:function(){return D.getEl
 Object.defineProperty(D,'scripts',{configurable:true,get:function(){return D.getElementsByTagName('script');}});
 D.defaultView=window;D.nodeType=9;D.nodeName='#document';D.documentMode=undefined;D.compatMode='CSS1Compat';D.hidden=false;D.visibilityState='visible';
 D.createEvent=function(t){return /custom/i.test(t)?new CustomEvent(''):new Event('');};D.dispatchEvent=function(e){return __vitaDispatch(null,e);};D.hasFocus=function(){return true;};
-D.createElementNS=function(ns,t){return D.createElement(t);};D.createAttribute=function(n){return {name:n,value:''};};
+D.createElementNS=function(ns,t){return D.createElement(t);};
+D.createRange=function(){var r={startContainer:D.body,endContainer:D.body,startOffset:0,endOffset:0,collapsed:true,
+ commonAncestorContainer:D.body,
+ setStart:function(n,o){this.startContainer=n;this.startOffset=o;},setEnd:function(n,o){this.endContainer=n;this.endOffset=o;},
+ setStartBefore:function(n){this.startContainer=n.parentNode;},setStartAfter:function(n){this.startContainer=n.parentNode;},
+ setEndBefore:function(n){this.endContainer=n.parentNode;},setEndAfter:function(n){this.endContainer=n.parentNode;},
+ selectNode:function(n){this.commonAncestorContainer=n;},selectNodeContents:function(n){this.commonAncestorContainer=n;},
+ collapse:function(){this.collapsed=true;},cloneRange:function(){return D.createRange();},detach:function(){},
+ deleteContents:function(){},extractContents:function(){return D.createDocumentFragment();},
+ cloneContents:function(){return D.createDocumentFragment();},
+ insertNode:function(n){if(this.startContainer)this.startContainer.appendChild(n);},
+ surroundContents:function(){},getBoundingClientRect:function(){return {x:0,y:0,top:0,left:0,right:0,bottom:0,width:0,height:0};},
+ getClientRects:function(){return [];},toString:function(){return '';}};
+ return r;};
+D.open=function(){return D;};D.close=function(){};D.writeln=D.writeln||function(){};
+/* No hit testing is exposed here. Null is what a browser returns for a
+ * point with nothing at it, so callers already handle it. */
+D.elementFromPoint=function(){return null;};D.elementsFromPoint=function(){return [];};
+D.importNode=function(n,deep){return n&&n.cloneNode?n.cloneNode(!!deep):n;};
+D.adoptNode=function(n){return n;};
+D.execCommand=function(){return false;};
+function emptySelection(){return {anchorNode:null,focusNode:null,anchorOffset:0,focusOffset:0,isCollapsed:true,rangeCount:0,type:'None',
+ getRangeAt:function(){return D.createRange();},addRange:function(){},removeAllRanges:function(){},removeRange:function(){},
+ collapse:function(){},collapseToStart:function(){},collapseToEnd:function(){},selectAllChildren:function(){},
+ containsNode:function(){return false;},deleteFromDocument:function(){},toString:function(){return '';}};}
+D.getSelection=function(){return emptySelection();};
+window.getSelection=function(){return emptySelection();};
+window.reportError=function(e){try{console.error(e);}catch(x){}};
+/* A page posting to itself is how some code defers work; deliver it as a
+ * message event, asynchronously and in order, like a real one. */
+window.postMessage=function(data){
+ setTimeout(function(){
+  var e=new Event('message');e.data=data;e.origin=location.origin||'';e.source=window;e.ports=[];
+  __vitaDispatch(null,e);
+ },0);
+};
+D.createAttribute=function(n){return {name:n,value:''};};
 function scratchDocument(title){var html=D.createElement('html'),head=D.createElement('head'),body=D.createElement('body');html.appendChild(head);html.appendChild(body);var doc={nodeType:9,nodeName:'#document',documentElement:html,head:head,body:body,title:title||'',defaultView:null,implementation:D.implementation,createElement:function(t){return D.createElement(t);},createElementNS:function(ns,t){return D.createElement(t);},createTextNode:function(t){return D.createTextNode(t);},createDocumentFragment:function(){return D.createDocumentFragment();},createComment:function(){return D.createTextNode('');},getElementsByTagName:function(t){return html.getElementsByTagName(t);},getElementById:function(id){return html.querySelector('#'+id);},querySelector:function(s){return html.querySelector(s);},querySelectorAll:function(s){return html.querySelectorAll(s);},addEventListener:function(){},removeEventListener:function(){},write:function(){},open:function(){},close:function(){}};return doc;}
 D.implementation={createHTMLDocument:function(t){return scratchDocument(t);},createDocument:function(){return scratchDocument('');},hasFeature:function(){return true;}};
 D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';
@@ -341,7 +433,24 @@ function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubb
 Event.prototype.preventDefault=function(){this.defaultPrevented=true;};Event.prototype.stopPropagation=Event.prototype.stopImmediatePropagation=function(){};Event.prototype.initEvent=function(t,b,c){this.type=t;this.bubbles=!!b;this.cancelable=!!c;};
 function CustomEvent(type,init){Event.call(this,type,init);this.detail=init?init.detail:null;}CustomEvent.prototype=Object.create(Event.prototype);
 CustomEvent.prototype.initCustomEvent=function(t,b,c,d){this.initEvent(t,b,c);this.detail=d;};
-W.Event=Event;W.CustomEvent=CustomEvent;W.UIEvent=W.MouseEvent=W.KeyboardEvent=W.FocusEvent=Event;
+W.Event=Event;W.CustomEvent=CustomEvent;
+/* The event interfaces. A page names one to say what kind of event a
+ * handler takes -- YouTube annotates a wheel handler with WheelEvent --
+ * so the name has to exist even where nothing here will ever construct
+ * one. They all behave as Event; what differs between them is fields we
+ * do not produce. */
+['UIEvent','MouseEvent','KeyboardEvent','FocusEvent','WheelEvent','PointerEvent','TouchEvent',
+ 'InputEvent','CompositionEvent','DragEvent','ClipboardEvent','ProgressEvent','ErrorEvent',
+ 'PopStateEvent','HashChangeEvent','PageTransitionEvent','StorageEvent','SubmitEvent',
+ 'BeforeUnloadEvent','MediaQueryListEvent','CloseEvent','MessageEvent','SecurityPolicyViolationEvent',
+ 'PromiseRejectionEvent','DeviceMotionEvent','DeviceOrientationEvent','GamepadEvent',
+ 'FormDataEvent','ToggleEvent','ContentVisibilityAutoStateChangeEvent'].forEach(function(n){W[n]=Event;});
+/* Touch and gesture types a page constructs or tests for. */
+W.Touch=function(init){init=init||{};this.identifier=init.identifier||0;this.target=init.target||null;
+ this.clientX=init.clientX||0;this.clientY=init.clientY||0;this.pageX=init.pageX||0;this.pageY=init.pageY||0;
+ this.screenX=init.screenX||0;this.screenY=init.screenY||0;this.radiusX=0;this.radiusY=0;this.force=1;};
+W.TouchList=Array;W.DataTransfer=function(){this.items=[];this.files=[];this.types=[];
+ this.getData=function(){return '';};this.setData=function(){};this.clearData=function(){};};
 /* document and window need prototypes of their own. Both used to report
  * Object.prototype, because each is a plain object here and that is what
  * it inherits from. A polyfill that patches Document.prototype and

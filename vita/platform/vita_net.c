@@ -19,11 +19,14 @@
 #include "vita_platform.h"
 
 /*
- * SceNet takes its socket and buffer memory from this pool. 2 MB covers
- * NetSurf's default of eight concurrent fetchers with room to spare; the
- * pool is static so it never competes with the newlib heap.
+ * SceNet takes its socket and buffer memory from this pool. It has to
+ * cover every concurrent fetch: vita_options_floor raises the fetchers
+ * to twelve, six of them to one host, because a page that loads its code
+ * in pieces asks for a dozen chunks at once and gives up on them within
+ * seconds. 2 MB was sized for eight. The pool is static, so it never
+ * competes with the newlib heap.
  */
-#define NET_POOL_SIZE (2 * 1024 * 1024)
+#define NET_POOL_SIZE (4 * 1024 * 1024)
 
 static char __attribute__((aligned(64))) net_pool[NET_POOL_SIZE];
 
