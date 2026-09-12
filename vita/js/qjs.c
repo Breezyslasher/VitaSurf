@@ -117,6 +117,9 @@ struct jsthread {
 	unsigned js_run_ms;       /**< time spent running them */
 	unsigned js_modules;      /**< of those, compiled as ES modules */
 	unsigned js_imports_missed; /**< imports that resolved to nothing */
+	JSValue import_map;       /**< parsed <script type="importmap">, or
+				   *   JS_UNINITIALIZED before it is looked
+				   *   up and JS_UNDEFINED if there is none */
 	int event_depth;          /**< DOM event dispatches in progress */
 	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
 	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
@@ -3117,6 +3120,8 @@ void js_finalise(void)
 
 static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 				      void *opaque);
+static char *qjs_module_normalize(JSContext *ctx, const char *base,
+				  const char *name, void *opaque);
 
 nserror js_newheap(int timeout, jsheap **heap)
 {
@@ -3156,7 +3161,8 @@ nserror js_newheap(int timeout, jsheap **heap)
 	 * and layout recursion underneath. Minified bundles nest deeply
 	 * enough that 512 KB aborted them with a stack overflow.
 	 */
-	JS_SetModuleLoaderFunc(ret->rt, NULL, qjs_module_loader, NULL);
+	JS_SetModuleLoaderFunc(ret->rt, qjs_module_normalize,
+			       qjs_module_loader, NULL);
 	JS_SetMemoryLimit(ret->rt, 96 * 1024 * 1024);
 	JS_SetMaxStackSize(ret->rt, 1024 * 1024);
 	/* register the shared node class once per runtime */
@@ -3195,6 +3201,9 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	ret->heap = heap;
 	ret->win = win_priv;
 	ret->htmlc = doc_priv;
+	/* calloc leaves this as a zeroed JSValue, which is not the
+	 * "not looked up yet" marker import_map_of tests for. */
+	ret->import_map = JS_UNINITIALIZED;
 	JS_SetContextOpaque(ret->ctx, ret);
 	JS_SetInterruptHandler(heap->rt, qjs_interrupt, ret);
 	setup_globals(ret);
@@ -3245,6 +3254,10 @@ nserror js_closethread(jsthread *thread)
 	}
 	xhr_close_all(thread);
 	free_wrappers(thread);
+	if (!JS_IsUninitialized(thread->import_map)) {
+		JS_FreeValue(thread->ctx, thread->import_map);
+		thread->import_map = JS_UNINITIALIZED;
+	}
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
 	JS_RunGC(thread->heap->rt);
@@ -3307,6 +3320,270 @@ void js_destroythread(jsthread *thread)
  */
 #define SCRIPT_MAX_BYTES (16 * 1024 * 1024)
 #define SCRIPT_LOG_BYTES (256 * 1024)
+
+/*
+ * An import map: <script type="importmap">, whose JSON says what a bare
+ * specifier such as "react" stands for. NetSurf never runs the element,
+ * because importmap is not a script type it executes, so the text is
+ * read from the DOM here and parsed once per page.
+ */
+static JSValue import_map_of(jsthread *thread)
+{
+	JSContext *ctx = thread->ctx;
+	struct dom_document *doc = thread_document(thread);
+	struct dom_nodelist *list = NULL;
+	uint32_t len = 0, i;
+
+	if (!JS_IsUninitialized(thread->import_map)) {
+		return thread->import_map;
+	}
+	thread->import_map = JS_UNDEFINED;
+	if (doc == NULL) {
+		return thread->import_map;
+	}
+	dom_document_get_elements_by_tag_name(doc, corestring_dom_SCRIPT, &list);
+	if (list == NULL) {
+		return thread->import_map;
+	}
+	dom_nodelist_get_length(list, &len);
+	for (i = 0; i < len; i++) {
+		struct dom_node *n = NULL;
+		dom_string *type = NULL, *text = NULL;
+
+		dom_nodelist_item(list, i, &n);
+		if (n == NULL) continue;
+		dom_element_get_attribute(n, corestring_dom_type, &type);
+		if (type != NULL &&
+		    strcasecmp(dom_string_data(type), "importmap") == 0 &&
+		    dom_node_get_text_content(n, &text) == DOM_NO_ERR &&
+		    text != NULL) {
+			JSValue v = JS_ParseJSON(ctx, dom_string_data(text),
+						 dom_string_byte_length(text),
+						 "<importmap>");
+			if (JS_IsException(v)) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+				vita_log("qjs: import map did not parse");
+			} else {
+				thread->import_map = v;
+				vita_log("qjs: import map loaded (%u bytes)",
+					 (unsigned)dom_string_byte_length(text));
+			}
+		}
+		if (text != NULL) dom_string_unref(text);
+		if (type != NULL) dom_string_unref(type);
+		dom_node_unref(n);
+		if (!JS_IsUndefined(thread->import_map)) break;
+	}
+	dom_nodelist_unref(list);
+	return thread->import_map;
+}
+
+/** A js_malloc'd copy of s, for returning from the normalizer. */
+static char *js_dup_cstr(JSContext *ctx, const char *s)
+{
+	size_t n = strlen(s) + 1;
+	char *out = js_malloc(ctx, n);
+
+	if (out != NULL) memcpy(out, s, n);
+	return out;
+}
+
+/** Resolve rel against base, or against the document if base is not a URL. */
+static char *resolve_against(JSContext *ctx, jsthread *thread,
+			     const char *base, const char *rel)
+{
+	nsurl *nsbase = NULL, *joined = NULL;
+	char *out = NULL;
+
+	if (base != NULL && strchr(base, ':') != NULL) {
+		nsurl_create(base, &nsbase);
+	}
+	if (nsbase == NULL && thread->htmlc != NULL &&
+	    thread->htmlc->base_url != NULL) {
+		nsbase = nsurl_ref(thread->htmlc->base_url);
+	}
+	if (nsbase == NULL) {
+		return js_dup_cstr(ctx, rel);
+	}
+	if (nsurl_join(nsbase, rel, &joined) == NSERROR_OK && joined != NULL) {
+		out = js_dup_cstr(ctx, nsurl_access(joined));
+		nsurl_unref(joined);
+	} else {
+		out = js_dup_cstr(ctx, rel);
+	}
+	nsurl_unref(nsbase);
+	return out;
+}
+
+/**
+ * Look name up in one "imports" object: an exact key first, then the
+ * longest key ending in "/" that starts it, whose remainder is appended.
+ */
+static char *map_lookup(JSContext *ctx, jsthread *thread, JSValueConst imports,
+			const char *name, const char *doc_base)
+{
+	JSPropertyEnum *props = NULL;
+	uint32_t count = 0, i;
+	size_t namelen = strlen(name), bestlen = 0;
+	char *out = NULL;
+	JSValue v;
+
+	if (!JS_IsObject(imports)) {
+		return NULL;
+	}
+	v = JS_GetPropertyStr(ctx, imports, name);
+	if (JS_IsString(v)) {
+		const char *target = JS_ToCString(ctx, v);
+		if (target != NULL) {
+			out = resolve_against(ctx, thread, doc_base, target);
+			JS_FreeCString(ctx, target);
+		}
+		JS_FreeValue(ctx, v);
+		return out;
+	}
+	JS_FreeValue(ctx, v);
+
+	if (JS_GetOwnPropertyNames(ctx, &props, &count, imports,
+				   JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) != 0) {
+		return NULL;
+	}
+	for (i = 0; i < count; i++) {
+		const char *key = JS_AtomToCString(ctx, props[i].atom);
+		size_t klen;
+
+		if (key == NULL) continue;
+		klen = strlen(key);
+		if (klen > bestlen && klen <= namelen && klen > 0 &&
+		    key[klen - 1] == '/' && strncmp(key, name, klen) == 0) {
+			JSValue tv = JS_GetPropertyStr(ctx, imports, key);
+			const char *target = JS_ToCString(ctx, tv);
+
+			if (target != NULL) {
+				char *joined = malloc(strlen(target) +
+						      (namelen - klen) + 1);
+				if (joined != NULL) {
+					strcpy(joined, target);
+					strcat(joined, name + klen);
+					if (out != NULL) js_free(ctx, out);
+					out = resolve_against(ctx, thread,
+							      doc_base, joined);
+					free(joined);
+					bestlen = klen;
+				}
+				JS_FreeCString(ctx, target);
+			}
+			JS_FreeValue(ctx, tv);
+		}
+		JS_FreeCString(ctx, key);
+	}
+	for (i = 0; i < count; i++) {
+		JS_FreeAtom(ctx, props[i].atom);
+	}
+	js_free(ctx, props);
+	return out;
+}
+
+/*
+ * Resolve an import specifier. A relative or absolute URL joins onto the
+ * importing module, which is what the default normalizer would do but
+ * done with nsurl so that "..", queries and fragments come out right. A
+ * bare specifier goes through the import map: the scopes whose prefix
+ * matches the importer first, longest first, then the top level imports.
+ * Anything still unmatched is passed through for the loader to report.
+ */
+static char *qjs_module_normalize(JSContext *ctx, const char *base,
+				  const char *name, void *opaque)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue map, imports, scopes;
+	const char *doc_base = NULL;
+	char *out = NULL;
+
+	(void)opaque;
+	if (thread == NULL || name == NULL) {
+		return js_dup_cstr(ctx, name != NULL ? name : "");
+	}
+	if (name[0] == '.' || name[0] == '/' || strstr(name, "://") != NULL) {
+		return resolve_against(ctx, thread, base, name);
+	}
+
+	map = import_map_of(thread);
+	if (!JS_IsObject(map)) {
+		return js_dup_cstr(ctx, name);
+	}
+	if (thread->htmlc != NULL && thread->htmlc->base_url != NULL) {
+		doc_base = nsurl_access(thread->htmlc->base_url);
+	}
+
+	scopes = JS_GetPropertyStr(ctx, map, "scopes");
+	if (JS_IsObject(scopes) && base != NULL) {
+		JSPropertyEnum *props = NULL;
+		uint32_t count = 0, i;
+		size_t bestlen = 0;
+
+		if (JS_GetOwnPropertyNames(ctx, &props, &count, scopes,
+					   JS_GPN_STRING_MASK |
+					   JS_GPN_ENUM_ONLY) == 0) {
+			for (i = 0; i < count; i++) {
+				const char *key = JS_AtomToCString(ctx,
+								props[i].atom);
+				char *scoped;
+				size_t klen;
+				JSValue sv;
+
+				char *abs;
+
+				if (key == NULL) continue;
+				/*
+				 * A scope key is a URL written relative to
+				 * the document, so it has to be resolved
+				 * before it can be compared with the URL of
+				 * the module doing the importing.
+				 */
+				abs = resolve_against(ctx, thread, doc_base,
+						      key);
+				if (abs == NULL) {
+					JS_FreeCString(ctx, key);
+					continue;
+				}
+				klen = strlen(abs);
+				if (klen <= bestlen ||
+				    strncmp(abs, base, klen) != 0) {
+					js_free(ctx, abs);
+					JS_FreeCString(ctx, key);
+					continue;
+				}
+				js_free(ctx, abs);
+				sv = JS_GetPropertyStr(ctx, scopes, key);
+				scoped = map_lookup(ctx, thread, sv, name,
+						    doc_base);
+				JS_FreeValue(ctx, sv);
+				if (scoped != NULL) {
+					if (out != NULL) js_free(ctx, out);
+					out = scoped;
+					bestlen = klen;
+				}
+				JS_FreeCString(ctx, key);
+			}
+			for (i = 0; i < count; i++) {
+				JS_FreeAtom(ctx, props[i].atom);
+			}
+			js_free(ctx, props);
+		}
+	}
+	JS_FreeValue(ctx, scopes);
+
+	if (out == NULL) {
+		imports = JS_GetPropertyStr(ctx, map, "imports");
+		out = map_lookup(ctx, thread, imports, name, doc_base);
+		JS_FreeValue(ctx, imports);
+	}
+	if (out == NULL) {
+		return js_dup_cstr(ctx, name);
+	}
+	vita_log("qjs: import map resolved '%s' to '%s'", name, out);
+	return out;
+}
 
 /*
  * A module's import.meta, which QuickJS creates empty and leaves to the
