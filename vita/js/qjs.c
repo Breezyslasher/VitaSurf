@@ -1594,6 +1594,7 @@ static void relayout_callback(void *p)
 	jsthread *thread = p;
 	html_content *htmlc;
 	nserror err;
+	uint64_t t0;
 
 	thread->relayout_pending = false;
 	if (thread->closed || !thread->dom_dirty) {
@@ -1615,6 +1616,7 @@ static void relayout_callback(void *p)
 		}
 		return;
 	}
+	t0 = now_ms();
 	err = html_relayout(htmlc);
 	if (err == NSERROR_INVALID) {
 		/* busy, or a rebuild is already running */
@@ -1623,8 +1625,11 @@ static void relayout_callback(void *p)
 		return;
 	}
 	thread->dom_dirty = false;
-	vita_log("qjs: rebuilding the layout after script changes%s",
-		 err == NSERROR_OK ? "" : " (failed to start)");
+	/* the rebuild runs to completion here, so this is also how long
+	 * the page was frozen for */
+	vita_log("qjs: layout rebuilt after script changes in %u ms%s",
+		 (unsigned)(now_ms() - t0),
+		 err == NSERROR_OK ? "" : " (failed)");
 }
 
 /*
