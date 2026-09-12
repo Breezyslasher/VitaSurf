@@ -26,6 +26,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 #include <strings.h>
 
@@ -356,6 +357,47 @@ static struct dom_node *this_node(JSContext *ctx, JSValueConst this_val)
 	return JS_GetOpaque2(ctx, this_val, node_class_id);
 }
 
+/**
+ * Whether a node is an element.
+ *
+ * libdom dispatches the element methods through a vtable that only
+ * element nodes carry. Calling one on a text node, a comment or a
+ * document fragment reads past the end of that node's smaller vtable and
+ * jumps through whatever follows it, so every binding that uses an
+ * element method checks first (VitaSurf).
+ */
+static bool node_is_element(struct dom_node *node)
+{
+	dom_node_type type = DOM_TEXT_NODE;
+
+	return node != NULL &&
+		dom_node_get_node_type(node, &type) == DOM_NO_ERR &&
+		type == DOM_ELEMENT_NODE;
+}
+
+/** The element this is called on, or NULL when it is not an element. */
+static struct dom_node *this_element(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = JS_GetOpaque2(ctx, this_val, node_class_id);
+
+	return node_is_element(node) ? node : NULL;
+}
+
+/*
+ * The right-hand simple selector of a group in a selector list, as
+ * prelude.js compiled it. find_in_subtree() below returns the elements
+ * under a node that match at least one of them.
+ */
+struct find_key {
+	char *tag;        /**< upper case element name, or NULL for any */
+	char *id;         /**< id attribute to match, or NULL */
+	char **classes;   /**< class names that must all be present */
+	int nclasses;
+};
+
+static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
+			       const struct find_key *keys, int nkeys);
+
 /*
  * NetSurf builds its box tree once, after parsing; nothing scripts do to
  * the DOM afterwards reaches the screen on its own. Every binding that
@@ -399,10 +441,11 @@ static JSValue node_get_node_name(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_tag_name(JSContext *ctx, JSValueConst this_val)
 {
-	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *node = this_element(ctx, this_val);
 	dom_string *s = NULL;
 
-	if (node == NULL) return JS_EXCEPTION;
+	/* only elements have a tag name */
+	if (node == NULL) return JS_UNDEFINED;
 	if (dom_element_get_tag_name(node, &s) != DOM_NO_ERR) {
 		return JS_UNDEFINED;
 	}
@@ -450,7 +493,7 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 static JSValue node_get_attr_prop(JSContext *ctx, JSValueConst this_val,
 				  const char *name)
 {
-	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *node = this_element(ctx, this_val);
 	dom_string *key = to_dom_string(name);
 	dom_string *val = NULL;
 
@@ -476,7 +519,7 @@ static JSValue node_get_class_name(JSContext *ctx, JSValueConst this_val)
 static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 				  const char *name, JSValueConst val)
 {
-	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *node = this_element(ctx, this_val);
 	const char *s = JS_ToCString(ctx, val);
 	dom_string *key = to_dom_string(name);
 	dom_string *dv = to_dom_string(s != NULL ? s : "");
@@ -595,7 +638,7 @@ static JSValue node_get_node_value(JSContext *ctx, JSValueConst this_val)
 static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
-	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key, *val = NULL;
 	JSValue r;
@@ -621,7 +664,7 @@ static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
 static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
-	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *node = this_element(ctx, this_val);
 	const char *name, *value;
 	dom_string *key, *val;
 
@@ -644,7 +687,7 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 static JSValue node_has_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
-	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key;
 	bool has = false;
@@ -663,7 +706,7 @@ static JSValue node_has_attribute(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
-	struct dom_node *node = this_node(ctx, this_val);
+	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key;
 
@@ -750,12 +793,38 @@ static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_v
 
 	if (node == NULL || argc < 1) return JS_NewArray(ctx);
 	name = JS_ToCString(ctx, argv[0]);
+	if (name == NULL) return JS_NewArray(ctx);
+
+	if (!node_is_element(node)) {
+		/* a document fragment has no element vtable, so walk it */
+		struct find_key k;
+		size_t i, len = strlen(name);
+		JSValue out;
+
+		memset(&k, 0, sizeof(k));
+		if (strcmp(name, "*") != 0) {
+			k.tag = malloc(len + 1);
+			if (k.tag == NULL) {
+				JS_FreeCString(ctx, name);
+				return JS_NewArray(ctx);
+			}
+			for (i = 0; i < len; i++) {
+				k.tag[i] = (char)toupper((unsigned char)name[i]);
+			}
+			k.tag[len] = 0;
+		}
+		JS_FreeCString(ctx, name);
+		out = find_in_subtree(ctx, node, &k, 1);
+		free(k.tag);
+		return out;
+	}
+
 	key = to_dom_string(name);
 	if (key != NULL) {
 		dom_element_get_elements_by_tag_name(node, key, &list);
 		dom_string_unref(key);
 	}
-	if (name) JS_FreeCString(ctx, name);
+	JS_FreeCString(ctx, name);
 	return nodelist_to_array(ctx, list);
 }
 
@@ -831,7 +900,7 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	}
 	/* migrate fragment's body children into the target */
 	dom_node_get_first_child(fragment, &htmlnode);
-	if (htmlnode == NULL) goto out;
+	if (!node_is_element(htmlnode)) goto out;
 	dom_element_get_elements_by_tag_name(htmlnode, corestring_dom_BODY, &bodies);
 	if (bodies == NULL) goto out;
 	dom_nodelist_item(bodies, 0, &body);
@@ -2195,20 +2264,6 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 /* ------------------------------------------------------------------------ */
 /* Selector candidate search                                                */
 
-/*
- * The right-hand simple selector of each group in a selector list, as
- * prelude.js compiled it. Matching these in C and handing back only the
- * elements that pass keeps the selector engine from wrapping every node
- * in the document: a class lookup over a long article was hundreds of
- * milliseconds per query before this.
- */
-struct find_key {
-	char *tag;        /**< upper case element name, or NULL for any */
-	char *id;         /**< id attribute to match, or NULL */
-	char **classes;   /**< class names that must all be present */
-	int nclasses;
-};
-
 static void free_keys(struct find_key *keys, int n)
 {
 	int i, j;
@@ -2360,10 +2415,9 @@ static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 			     int argc, JSValueConst *argv)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
-	struct dom_node *root = NULL, *n = NULL;
+	struct dom_node *root = NULL;
 	struct find_key *keys;
-	int nkeys = 0, i;
-	uint32_t out_n = 0;
+	int nkeys = 0;
 	JSValue out;
 
 	(void)this_val;
@@ -2383,8 +2437,30 @@ static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 	if (keys == NULL) {
 		return JS_NewArray(ctx);
 	}
+	out = find_in_subtree(ctx, root, keys, nkeys);
+	free_keys(keys, nkeys);
+	return out;
+}
 
-	out = JS_NewArray(ctx);
+/*
+ * Every element under root matching at least one key, in document order.
+ * Matching in C keeps the selector engine from wrapping every node in the
+ * document: a class lookup over a long article cost hundreds of
+ * milliseconds per query when the walk was in JavaScript.
+ */
+static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
+			       const struct find_key *keys, int nkeys)
+{
+	struct dom_node *n = NULL;
+	uint32_t out_n = 0;
+	bool want_id = false, want_cls = false;
+	JSValue out = JS_NewArray(ctx);
+	int i;
+
+	for (i = 0; i < nkeys; i++) {
+		if (keys[i].id != NULL) want_id = true;
+		if (keys[i].nclasses > 0) want_cls = true;
+	}
 	/* iterative pre-order walk; root itself is not a candidate */
 	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
 		n = NULL;
@@ -2396,12 +2472,7 @@ static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
 		    type == DOM_ELEMENT_NODE) {
 			dom_string *tag = NULL, *id = NULL, *cls = NULL;
-			bool want_id = false, want_cls = false;
 
-			for (i = 0; i < nkeys; i++) {
-				if (keys[i].id != NULL) want_id = true;
-				if (keys[i].nclasses > 0) want_cls = true;
-			}
 			dom_element_get_tag_name(n, &tag);
 			if (want_id) {
 				dom_element_get_attribute(n, corestring_dom_id, &id);
@@ -2450,7 +2521,6 @@ static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 		dom_node_unref(n);
 		n = next;
 	}
-	free_keys(keys, nkeys);
 	return out;
 }
 

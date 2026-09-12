@@ -44,6 +44,23 @@ P.focus=P.blur=P.select=function(){};
 P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=viewport(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
 P.click=function(){var e=new MouseEvent('click',{bubbles:true,cancelable:true});return this.dispatchEvent(e);};
 P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return false;};
+/* jQuery sorts selector results with this, so a missing one takes out
+   every script that uses jQuery's own selector engine. */
+P.compareDocumentPosition=function(other){
+ if(other===this)return 0;
+ if(!other||other.nodeType===undefined)return 1;
+ var a=[],b=[],n,i;
+ for(n=this;n;n=n.parentNode)a.unshift(n);
+ for(n=other;n;n=n.parentNode)b.unshift(n);
+ if(a[0]!==b[0])return 1+32;
+ if(a.indexOf(other)>=0)return 8+2;
+ if(b.indexOf(this)>=0)return 16+4;
+ i=0;while(a[i]&&b[i]&&a[i]===b[i])i++;
+ var pa=a[i],pb=b[i];
+ if(!pa)return 16+4;
+ if(!pb)return 8+2;
+ for(n=pa;n;n=n.nextSibling)if(n===pb)return 4;
+ return 2;};
 P.hasChildNodes=function(){return this.firstChild!==null;};
 P.remove=function(){var p=this.parentNode;if(p)p.removeChild(this);};
 P.getElementsByClassName=function(c){return this.querySelectorAll('.'+c);};

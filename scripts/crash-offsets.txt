@@ -1,13 +1,14 @@
-# Offsets into the VitaSurf text segment to resolve in the CI log.
-# Build 86 crash loading Wikipedia: data abort on the main thread,
-# module text base 0x8102f000, r0 = 0 (null pointer).
+# Text-segment offsets from crash dumps (VitaSurf@1 + offset), one per
+# line; the CI symbol map step prints the functions around each one.
+#
+# Build 62: data abort after pressing reload on en.wikipedia.org.
+#   Resolved to libnsfb's scaled bitmap plotter, fixed by patch 0017.
+0x6d2ba
+# Build 86: data abort loading en.wikipedia.org, main thread, r0 = 0.
+#   Resolved against build 86's own symbol map: the link register was in
+#   node_get_elements_by_tag_name and the program counter had jumped
+#   through a bogus pointer read past the end of a non-element node's
+#   vtable. Fixed by checking the node type before every libdom element
+#   call.
 0xc32a2
-0xc3298
-0x9332e
-0x11a176
-0xe841c
-0xeeb58
-0x1073a2
-0xf0d40
-0xe82b0
-0x352e60
+0x932e

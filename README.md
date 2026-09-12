@@ -138,6 +138,15 @@ object callbacks check for that and wait. A script that reads geometry
 right after changing the document reads the previous layout rather than
 forcing a rebuild from under code that holds box pointers.
 
+libdom dispatches its element methods through a vtable that only element
+nodes carry, and the bindings called them on whatever node JavaScript
+handed over. On a text node or a document fragment that reads past the
+end of the node's smaller vtable and calls whatever pointer follows it,
+which is what crashed build 86 when the Wikipedia scripts asked a
+document fragment for its elements. Every binding now checks the node
+type first, and `getElementsByTagName` on a fragment walks the subtree
+instead.
+
 Selector queries are matched from the right: the candidates for the
 right-hand simple selector of every group in the list come from one pass
 through the tree in C, and only those are checked against the rest of the
