@@ -89,20 +89,68 @@ jobs:
                         lambda m: m.group(1) + rewrite(re.match(r'(src)=(["\'])([^"\']*)\2', m.group(0)[len(m.group(1)):]), 'img'), text)
           text = re.sub(r'(?i)\ssrcset=(["\'])[^"\']*\1', '', text)
           # MediaWiki: the page modules are loaded by the startup script at
-          # runtime; also save one bundle with them for offline reading.
+          # runtime. Save the startup script, work out the dependency
+          # closure of the page modules from its registry, fetch those
+          # modules in the loader's own format and write page.local.html,
+          # a copy of the page whose loader reads every batch from the
+          # local modules.js instead of load.php (the file fetcher ignores
+          # query strings). The skin's scripts then run offline.
           mods = re.search(r'RLPAGEMODULES=\[([^\]]*)\]', text)
           if mods:
-              # load.php separates module names with '|'; a comma joins
-              # names that share a prefix, so a comma list is one module.
-              names = '|'.join(x.strip('"\' ') for x in mods.group(1).split(','))
+              page_mods = [x.strip('"\' ') for x in mods.group(1).split(',')]
               base = urllib.parse.urljoin(url, '/w/load.php')
-              fetch(base + '?lang=en&modules=' + urllib.parse.quote(names, safe='.') + '&skin=minerva&only=scripts', 'js')
-              fetch(base + '?lang=en&modules=' + urllib.parse.quote(names, safe='.') + '&skin=minerva&only=styles', 'css')
-              fetch(base + '?lang=en&modules=startup&only=scripts&skin=minerva', 'js')
-              # the usual dependencies of the page modules, so the
-              # skin's code can be read offline
-              deps = 'jquery|mediawiki.base|mediawiki.util|mediawiki.api|mediawiki.router|mediawiki.Title|mediawiki.storage|mediawiki.user|mediawiki.cookie|mobile.startup|mediawiki.template|mediawiki.template.mustache|mediawiki.experiments'
-              fetch(base + '?lang=en&modules=' + urllib.parse.quote(deps, safe='.') + '&skin=minerva&only=scripts', 'js')
+              startup = fetch(base + '?lang=en&modules=startup&only=scripts&skin=minerva', 'js')
+              stext = open(os.path.join(out, startup)).read() if startup else ''
+              reg = re.search(r'mw\.loader\.register\((\[\[.*?\]\])\);', stext)
+              closure = []
+              if reg:
+                  import json
+                  table = json.loads(reg.group(1))
+                  names = [e[0] for e in table]
+                  index = {e[0]: e for e in table}
+                  seen = set()
+                  def visit(n):
+                      if n in seen or n not in index:
+                          return
+                      seen.add(n)
+                      e = index[n]
+                      deps = e[2] if len(e) > 2 and isinstance(e[2], list) else []
+                      for d in deps:
+                          visit(names[d] if isinstance(d, int) else d)
+                      closure.append(n)
+                  for n in ['jquery', 'mediawiki.base'] + page_mods:
+                      visit(n)
+                  # foreign-source modules (metawiki) cannot be served locally
+                  closure = [n for n in closure if len(index[n]) < 5 or index[n][4] in (None, 'local')]
+              print('module closure:', len(closure))
+              parts = []
+              batch = []
+              def flush():
+                  if not batch:
+                      return
+                  q = urllib.parse.quote('|'.join(batch), safe='.')
+                  n = fetch(base + '?lang=en&modules=' + q + '&skin=minerva', 'js')
+                  if n:
+                      parts.append(open(os.path.join(out, n), encoding='utf-8', errors='replace').read())
+                  del batch[:]
+              for n in closure:
+                  batch.append(n)
+                  if len('|'.join(batch)) > 1500:
+                      flush()
+              flush()
+              css_batch = [n for n in closure]
+              q = urllib.parse.quote('|'.join(page_mods), safe='.')
+              fetch(base + '?lang=en&modules=' + q + '&skin=minerva&only=styles', 'css')
+              open(os.path.join(out, 'modules.js'), 'w').write('\n'.join(parts))
+              if startup:
+                  # local loader: batches come from modules.js and a module
+                  # implemented twice (every batch carries them all) is
+                  # ignored instead of throwing
+                  local = re.sub(r'mw\.loader\.addSource\(\{[^}]*\}\)',
+                                 'mw.loader.addSource({"local":"modules.js"})', stext)
+                  local = local.replace("throw new Error('module already implemented: '+name);", 'return;')
+                  open(os.path.join(out, 'startup.local.js'), 'w').write(local)
+                  open(os.path.join(out, 'page.local.html'), 'w').write(text.replace(startup, 'startup.local.js'))
           open(os.path.join(out, 'page.html'), 'w').write(text)
           with open(os.path.join(out, 'assets.txt'), 'w') as f:
               for u, n in assets.items():
