@@ -108,6 +108,10 @@ struct jsthread {
 	bool relayout_off;        /**< document too large to rebuild */
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
 	unsigned relayout_ms;     /**< how long the last rebuild took */
+	unsigned js_scripts;      /**< scripts executed for this page */
+	unsigned js_bytes;        /**< their total size */
+	unsigned js_compile_ms;   /**< time spent compiling them */
+	unsigned js_run_ms;       /**< time spent running them */
 	int event_depth;          /**< DOM event dispatches in progress */
 	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
 	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
@@ -3203,7 +3207,39 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	}
 	begin_script(thread);
 	thread->current_script = name;
-	ret = JS_Eval(thread->ctx, src, txtlen, name, JS_EVAL_TYPE_GLOBAL);
+	{
+		/*
+		 * Compiling and running are separated so a log says which
+		 * of the two a slow page spends its time in; JS_Eval does
+		 * the same two steps internally, so this costs nothing.
+		 */
+		uint64_t t_start = now_ms(), t_compiled, t_done;
+		JSValue fn = JS_Eval(thread->ctx, src, txtlen, name,
+				     JS_EVAL_TYPE_GLOBAL |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+
+		t_compiled = now_ms();
+		if (JS_IsException(fn)) {
+			ret = fn;
+		} else {
+			ret = JS_EvalFunction(thread->ctx, fn);
+		}
+		t_done = now_ms();
+
+		thread->js_scripts++;
+		thread->js_bytes += (unsigned)txtlen;
+		thread->js_compile_ms += (unsigned)(t_compiled - t_start);
+		thread->js_run_ms += (unsigned)(t_done - t_compiled);
+
+		if (vita_verbose_requested()) {
+			vita_log("qjs: script %u KB compiled in %u ms, "
+				 "ran in %u ms: %s",
+				 (unsigned)(txtlen / 1024),
+				 (unsigned)(t_compiled - t_start),
+				 (unsigned)(t_done - t_compiled),
+				 name);
+		}
+	}
 	ok = !JS_IsException(ret);
 	if (!ok) {
 		qjs_report_exception_src(thread->ctx, name, src, txtlen);
@@ -3227,8 +3263,11 @@ bool js_fire_event(jsthread *thread, const char *type,
 		return true;
 	}
 	if (strcmp(type, "load") == 0) {
-		vita_log("qjs: load event, runtime memory %u KB",
-			 runtime_kb(thread->heap->rt));
+		vita_log("qjs: load event, runtime memory %u KB; "
+			 "%u scripts of %u KB compiled in %u ms, ran in %u ms",
+			 runtime_kb(thread->heap->rt),
+			 thread->js_scripts, thread->js_bytes / 1024,
+			 thread->js_compile_ms, thread->js_run_ms);
 	}
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
