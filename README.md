@@ -115,6 +115,30 @@ so pages such as mobile Wikipedia (`html, body { height: 100% }` plus
 scrolled. The root and body boxes now report visible overflow and the
 window's own scrollbars handle the page.
 
+Patch 0021 fixes event dispatch in libdom: a listener registered on the
+node an event is dispatched at fired twice, once for the at-target phase
+and again while the event bubbled back through the same node.
+
+Patches 0022 and the QuickJS bindings make script changes to the document
+show up on screen. NetSurf builds its box tree once, after parsing, so
+anything a script added, removed, restyled or rewrote afterwards was
+invisible: the mobile Wikipedia skin moves its whole article into a new
+structure on load, which left the Vita showing the unstyled original.
+Every binding that changes the DOM now marks the layout stale, and
+`html_relayout()` rebuilds the box tree from the document and lays it out
+again once the running script is finished. A rebuild costs the whole box
+tree, so the wait between rebuilds grows with how long the last one took,
+up to two seconds, and a script that reads geometry on a document that is
+slow to lay out gets the last known values rather than forcing a rebuild.
+
+The bindings also give scripts the real page geometry (`offsetWidth` and
+friends, `getBoundingClientRect`, `scrollWidth`, the window's scroll
+offsets and viewport size), working `scrollTo`, `scrollBy` and
+`scrollIntoView`, `dispatchEvent` through libdom so a synthetic event
+reaches listeners registered anywhere, and a `matchMedia` that evaluates
+media queries against the actual viewport instead of always answering
+false.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus

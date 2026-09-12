@@ -1,0 +1,462 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index c77644b43..a96c08cfd 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -1729,6 +1729,18 @@ css_error ua_default_for_property(void *pw, uint32_t property, css_hint *hint)
+ 	return CSS_OK;
+ }
+ 
++/* exported interface documented in css/select.h */
++void nscss_clear_node_data(dom_node *n)
++{
++	void *old = NULL;
++
++	if (dom_node_set_user_data(n, corestring_dom___ns_key_libcss_node_data,
++			NULL, NULL, &old) == DOM_NO_ERR && old != NULL) {
++		css_libcss_node_data_handler(&selection_handler,
++				CSS_NODE_DELETED, NULL, n, NULL, old);
++	}
++}
++
+ css_error set_libcss_node_data(void *pw, void *node, void *libcss_node_data)
+ {
+ 	dom_node *n = node;
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index c17caadcb..2af10bfd5 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -59,4 +59,15 @@ css_error named_ancestor_node(void *pw, void *node,
+ 
+ css_error node_is_visited(void *pw, void *node, bool *match);
+ 
++/**
++ * Drop the selection data libcss cached on a DOM node (VitaSurf).
++ *
++ * Styles are selected once per node when the box tree is built; before a
++ * rebuild from a script-modified document every node's cache must go, as
++ * css_select_style() refuses to overwrite it.
++ *
++ * \param n the node to clear
++ */
++void nscss_clear_node_data(dom_node *n);
++
+ #endif
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index f36f94cc5..2952f68cb 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -62,6 +62,8 @@ struct box_construct_ctx {
+ 	box_construct_complete_cb cb;	/**< Callback to invoke on completion */
+ 
+ 	int *bctx;			/**< talloc context */
++
++	bool sync;			/**< Run to completion without yielding (VitaSurf) */
+ };
+ 
+ /**
+@@ -1363,7 +1365,7 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 			free(ctx);
+ 			return;
+ 		}
+-	} while (++num_processed < max_processed_before_yield);
++	} while (++num_processed < max_processed_before_yield || ctx->sync);
+ 
+ 	/* More work to do: schedule a continuation */
+ 	guit->misc->schedule(0, (void *)convert_xml_to_box, ctx);
+@@ -1399,6 +1401,7 @@ dom_to_box(dom_node *n,
+ 	ctx->root_box = NULL;
+ 	ctx->cb = cb;
+ 	ctx->bctx = c->bctx;
++	ctx->sync = false;
+ 
+ 	*box_conversion_context = ctx;
+ 
+@@ -1406,6 +1409,41 @@ dom_to_box(dom_node *n,
+ }
+ 
+ 
++/* exported function documented in html/box_construct.h */
++nserror
++dom_to_box_sync(dom_node *n,
++		html_content *c,
++		box_construct_complete_cb cb)
++{
++	struct box_construct_ctx *ctx;
++
++	if (c->bctx == NULL) {
++		/* create a context allocation for this box tree */
++		c->bctx = talloc_zero(0, int);
++		if (c->bctx == NULL) {
++			return NSERROR_NOMEM;
++		}
++	}
++
++	ctx = malloc(sizeof(*ctx));
++	if (ctx == NULL) {
++		return NSERROR_NOMEM;
++	}
++
++	ctx->content = c;
++	ctx->n = dom_node_ref(n);
++	ctx->root_box = NULL;
++	ctx->cb = cb;
++	ctx->bctx = c->bctx;
++	ctx->sync = true;
++
++	/* runs the whole conversion, calls cb and frees ctx */
++	convert_xml_to_box(ctx);
++
++	return NSERROR_OK;
++}
++
++
+ /* exported function documented in html/box_construct.h */
+ nserror cancel_dom_to_box(void *box_conversion_context)
+ {
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index f4bd119b1..2afebc24f 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -83,6 +83,18 @@
+  */
+ nserror dom_to_box(struct dom_node *n, struct html_content *c, box_construct_complete_cb cb, void **box_conversion_context);
+ 
++/**
++ * Construct a box tree from a dom in one go, without yielding to the
++ * scheduler (VitaSurf). Used to rebuild the layout after scripts changed
++ * the document; the callback runs before this returns.
++ *
++ * \param n  root dom node to make boxes from
++ * \param c  content of the html document
++ * \param cb callback to invoke on completion
++ * \return NSERROR_OK on success or error code on failure
++ */
++nserror dom_to_box_sync(struct dom_node *n, struct html_content *c, box_construct_complete_cb cb);
++
+ 
+ /**
+  * aborts any ongoing box construction
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index f92985b04..92dce77b6 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -60,6 +60,7 @@
+ #include "html/html.h"
+ #include "html/private.h"
+ #include "html/dom_event.h"
++#include "css/select.h"
+ #include "html/css.h"
+ #include "html/object.h"
+ #include "html/html_save.h"
+@@ -829,12 +830,70 @@ bool html_can_begin_conversion(html_content *htmlc)
+ 	return true;
+ }
+ 
++/**
++ * Retrieve the forms from the document and make their actions absolute.
++ *
++ * \param htmlc html content
++ * \return true on success, false on error (already broadcast)
++ */
++static bool html_forms_from_dom(html_content *htmlc)
++{
++	struct form *f;
++	nserror ns_error;
++
++	htmlc->forms = html_forms_get_forms(htmlc->encoding,
++			(dom_html_document *) htmlc->document);
++	for (f = htmlc->forms; f != NULL; f = f->prev) {
++		nsurl *action;
++
++		/* Make all actions absolute */
++		if (f->action == NULL || f->action[0] == '\0') {
++			/* HTML5 4.10.22.3 step 9 */
++			nsurl *doc_addr = content_get_url(&htmlc->base);
++			ns_error = nsurl_join(htmlc->base_url,
++					      nsurl_access(doc_addr),
++					      &action);
++		} else {
++			ns_error = nsurl_join(htmlc->base_url,
++					      f->action,
++					      &action);
++		}
++
++		if (ns_error != NSERROR_OK) {
++			content_broadcast_error(&htmlc->base, ns_error, NULL);
++			return false;
++		}
++
++		free(f->action);
++		f->action = strdup(nsurl_access(action));
++		nsurl_unref(action);
++		if (f->action == NULL) {
++			content_broadcast_error(&htmlc->base,
++						NSERROR_NOMEM,
++						NULL);
++			return false;
++		}
++
++		/* Ensure each form has a document encoding */
++		if (f->document_charset == NULL) {
++			f->document_charset = strdup(htmlc->encoding);
++			if (f->document_charset == NULL) {
++				content_broadcast_error(&htmlc->base,
++							NSERROR_NOMEM,
++							NULL);
++				return false;
++			}
++		}
++	}
++
++	return true;
++}
++
++
+ bool
+ html_begin_conversion(html_content *htmlc)
+ {
+ 	dom_node *html;
+-	nserror ns_error;
+-	struct form *f;
+ 	dom_exception exc; /* returned by libdom functions */
+ 	dom_string *node_name = NULL;
+ 	dom_hubbub_error error;
+@@ -941,54 +1000,9 @@ html_begin_conversion(html_content *htmlc)
+ 	dom_string_unref(node_name);
+ 
+ 	/* Retrieve forms from parser */
+-	htmlc->forms = html_forms_get_forms(htmlc->encoding,
+-			(dom_html_document *) htmlc->document);
+-	for (f = htmlc->forms; f != NULL; f = f->prev) {
+-		nsurl *action;
+-
+-		/* Make all actions absolute */
+-		if (f->action == NULL || f->action[0] == '\0') {
+-			/* HTML5 4.10.22.3 step 9 */
+-			nsurl *doc_addr = content_get_url(&htmlc->base);
+-			ns_error = nsurl_join(htmlc->base_url,
+-					      nsurl_access(doc_addr),
+-					      &action);
+-		} else {
+-			ns_error = nsurl_join(htmlc->base_url,
+-					      f->action,
+-					      &action);
+-		}
+-
+-		if (ns_error != NSERROR_OK) {
+-			content_broadcast_error(&htmlc->base, ns_error, NULL);
+-
+-			dom_node_unref(html);
+-			return false;
+-		}
+-
+-		free(f->action);
+-		f->action = strdup(nsurl_access(action));
+-		nsurl_unref(action);
+-		if (f->action == NULL) {
+-			content_broadcast_error(&htmlc->base,
+-						NSERROR_NOMEM,
+-						NULL);
+-
+-			dom_node_unref(html);
+-			return false;
+-		}
+-
+-		/* Ensure each form has a document encoding */
+-		if (f->document_charset == NULL) {
+-			f->document_charset = strdup(htmlc->encoding);
+-			if (f->document_charset == NULL) {
+-				content_broadcast_error(&htmlc->base,
+-							NSERROR_NOMEM,
+-							NULL);
+-				dom_node_unref(html);
+-				return false;
+-			}
+-		}
++	if (html_forms_from_dom(htmlc) == false) {
++		dom_node_unref(html);
++		return false;
+ 	}
+ 
+ 	dom_node_unref(html);
+@@ -1101,6 +1115,157 @@ static void html_reformat(struct content *c, int width, int height)
+ }
+ 
+ 
++/**
++ * Forget the boxes and cached styles the last conversion attached to the
++ * DOM nodes (VitaSurf). A node that gets no box this time round (display:
++ * none now) would otherwise keep a dangling pointer for box_for_node(),
++ * and libcss will not select a style for a node that still carries one.
++ */
++static void html_clear_node_boxes(dom_node *root)
++{
++	dom_node *n = dom_node_ref(root);
++
++	while (n != NULL) {
++		dom_node *next = NULL;
++		void *old = NULL;
++
++		dom_node_set_user_data(n, corestring_dom___ns_key_box_node_data,
++				NULL, NULL, &old);
++		nscss_clear_node_data(n);
++
++		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
++			next = NULL;
++		}
++		if (next == NULL) {
++			/* climb until a next sibling exists, stop at root */
++			dom_node *cur = dom_node_ref(n);
++
++			while (cur != NULL) {
++				dom_node *sib = NULL, *parent = NULL;
++
++				if (cur == root) {
++					dom_node_unref(cur);
++					break;
++				}
++				if (dom_node_get_next_sibling(cur, &sib) == DOM_NO_ERR &&
++						sib != NULL) {
++					next = sib;
++					dom_node_unref(cur);
++					break;
++				}
++				if (dom_node_get_parent_node(cur, &parent) != DOM_NO_ERR) {
++					parent = NULL;
++				}
++				dom_node_unref(cur);
++				cur = parent;
++			}
++		}
++		dom_node_unref(n);
++		n = next;
++	}
++}
++
++
++/**
++ * Second half of html_relayout(): lay the new box tree out (VitaSurf).
++ */
++static void html_relayout_done(html_content *c, bool success)
++{
++	if (success == false || c->layout == NULL) {
++		NSLOG(netsurf, ERROR, "box tree rebuild failed (content %p)", c);
++		content_broadcast_error(&c->base, NSERROR_BOX_CONVERT, NULL);
++		content_set_error(&c->base);
++		return;
++	}
++
++	if (imagemap_extract(c) != NSERROR_OK) {
++		NSLOG(netsurf, WARNING, "imagemap extraction failed");
++	}
++
++	content__reformat(&c->base, false,
++			  c->base.available_width, c->base.available_height);
++}
++
++
++/* exported interface documented in html/private.h */
++nserror html_relayout(html_content *htmlc)
++{
++	dom_node *html = NULL;
++	dom_exception exc;
++	struct form *f, *g;
++	struct content_html_object *o;
++	nserror err;
++
++	if (htmlc->layout == NULL || htmlc->bctx == NULL ||
++	    htmlc->box_conversion_context != NULL ||
++	    htmlc->reflowing || htmlc->base.locked ||
++	    htmlc->had_initial_layout == false ||
++	    htmlc->frameset != NULL ||
++	    htmlc->drag_type != HTML_DRAG_NONE ||
++	    htmlc->focus_type == HTML_FOCUS_TEXTAREA ||
++	    (htmlc->base.status != CONTENT_STATUS_READY &&
++	     htmlc->base.status != CONTENT_STATUS_DONE)) {
++		return NSERROR_INVALID;
++	}
++
++	exc = dom_document_get_document_element(htmlc->document, (void *) &html);
++	if ((exc != DOM_NO_ERR) || (html == NULL)) {
++		return NSERROR_DOM;
++	}
++
++	NSLOG(netsurf, INFO, "rebuilding layout (content %p)", htmlc);
++
++	/* input state that points into the old box tree */
++	htmlc->drag_type = HTML_DRAG_NONE;
++	htmlc->drag_owner.no_owner = true;
++	htmlc->selection_type = HTML_SELECTION_NONE;
++	htmlc->selection_owner.none = true;
++	htmlc->focus_type = HTML_FOCUS_SELF;
++	htmlc->focus_owner.self = true;
++	htmlc->visible_select_menu = NULL;
++	if (htmlc->sel != NULL) {
++		selection_clear(htmlc->sel, false);
++	}
++
++	/* objects: the fetches the new tree starts count afresh */
++	for (o = htmlc->object_list; o != NULL; o = o->next) {
++		if (o->content != NULL &&
++		    content_get_status(o->content) != CONTENT_STATUS_DONE &&
++		    htmlc->base.active > 0) {
++			htmlc->base.active--;
++		}
++	}
++	html_object_free_objects(htmlc);
++	htmlc->num_objects = 0;
++
++	for (f = htmlc->forms; f != NULL; f = g) {
++		g = f->prev;
++		form_free(f);
++	}
++	htmlc->forms = NULL;
++
++	imagemap_destroy(htmlc);
++	htmlc->imagemaps = NULL;
++
++	html_clear_node_boxes(html);
++
++	/* iframes and framesets live in the box tree's talloc context */
++	talloc_free(htmlc->bctx);
++	htmlc->bctx = NULL;
++	htmlc->layout = NULL;
++	htmlc->iframe = NULL;
++
++	if (html_forms_from_dom(htmlc) == false) {
++		dom_node_unref(html);
++		return NSERROR_NOMEM;
++	}
++
++	err = dom_to_box_sync(html, htmlc, html_relayout_done);
++	dom_node_unref(html);
++	return err;
++}
++
++
+ /**
+  * Redraw a box.
+  *
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 56cd957d5..1a531c3cc 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -314,6 +314,18 @@ bool html_redraw_inline_borders(struct box *box, struct rect b,
+ dom_hubbub_error html_process_script(void *ctx, dom_node *node);
+ 
+ 
++/**
++ * Rebuild the box tree from the (script-modified) document and lay it
++ * out again (VitaSurf).
++ *
++ * \param htmlc html content whose layout is stale
++ * \return NSERROR_OK if the layout was rebuilt, NSERROR_INVALID if the
++ *         content is not in a state where that is possible right now
++ *         (still converting, being dragged, typed into) and the caller
++ *         should try again later.
++ */
++nserror html_relayout(html_content *htmlc);
++
+ /* in html/forms.c */
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
+ struct form_control *html_forms_get_control_for_node(struct form *forms,

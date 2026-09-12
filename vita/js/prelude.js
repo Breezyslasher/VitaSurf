@@ -22,12 +22,26 @@ Object.defineProperty(P,'outerHTML',{get:function(){return '';}});
 Object.defineProperty(P,'ownerDocument',{get:function(){return document;}});
 ['href','src','value','type','name','title','alt','rel','target','action','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){this.setAttribute(attr,String(v));}});});
 ['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{get:function(){return this.hasAttribute(attr);},set:function(v){if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
-['offsetWidth','offsetHeight','offsetTop','offsetLeft','clientWidth','clientHeight','clientTop','clientLeft','scrollWidth','scrollHeight'].forEach(function(a){Object.defineProperty(P,a,{get:function(){return 0;}});});
-P.scrollTop=0;P.scrollLeft=0;P.tabIndex=0;
+/* Layout geometry. __vitaBox(node) (qjs.c) returns the element's laid-out
+   box as [x,y,width,height,clientWidth,clientHeight,clientLeft,clientTop,
+   scrollWidth,scrollHeight,scrollLeft,scrollTop] in CSS px, document
+   coordinates, border box; null when the element has no box. __vitaScroll()
+   returns [scrollX,scrollY,viewportWidth,viewportHeight]. */
+function boxOf(el){var b=__vitaBox(el);return b||[0,0,0,0,0,0,0,0,0,0,0,0];}
+function isViewportEl(el){return el===D.documentElement;}
+var BOXIDX={offsetWidth:2,offsetHeight:3,clientLeft:6,clientTop:7,scrollWidth:8,scrollHeight:9};
+Object.keys(BOXIDX).forEach(function(a){var i=BOXIDX[a];Object.defineProperty(P,a,{get:function(){return boxOf(this)[i];}});});
+['clientWidth','clientHeight'].forEach(function(a,n){Object.defineProperty(P,a,{get:function(){if(isViewportEl(this)){return __vitaScroll()[2+n];}return boxOf(this)[4+n];}});});
+Object.defineProperty(P,'offsetParent',{get:function(){var n=this.parentNode;while(n&&n.nodeType===1&&n!==D.body&&n!==D.documentElement)n=n.parentNode;return n&&n.nodeType===1?n:null;}});
+['offsetTop','offsetLeft'].forEach(function(a,n){Object.defineProperty(P,a,{get:function(){var b=__vitaBox(this);if(!b)return 0;var p=this.offsetParent,pb=p?__vitaBox(p):null;return b[1-n]-(pb?pb[1-n]:0);}});});
+['scrollTop','scrollLeft'].forEach(function(a,n){Object.defineProperty(P,a,{get:function(){if(isViewportEl(this)||this===D.body){return __vitaScroll()[1-n];}return boxOf(this)[11-n];},set:function(v){if(isViewportEl(this)||this===D.body){var s=__vitaScroll();__vitaScrollTo(n===1?Number(v)||0:s[0],n===1?s[1]:Number(v)||0);}}});});
+P.tabIndex=0;
 ['onclick','onchange','onsubmit','oninput','onkeydown','onkeyup','onkeypress','onmousedown','onmouseup','onmouseover','onmouseout','onfocus','onblur','onload','onerror','ontouchstart','ontouchend'].forEach(function(h){Object.defineProperty(P,h,{get:function(){return this['__'+h]||null;},set:function(f){this['__'+h]=f;if(typeof f==='function')this.addEventListener(h.slice(2),function(e){return f.call(this,e);});}});});
-P.getBoundingClientRect=function(){return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};};
-P.getClientRects=function(){return [];};
-P.focus=P.blur=P.scrollIntoView=P.click=P.select=function(){};
+P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};var s=__vitaScroll(),x=b[0]-s[0],y=b[1]-s[1];return {x:x,y:y,left:x,top:y,width:b[2],height:b[3],right:x+b[2],bottom:y+b[3]};};
+P.getClientRects=function(){var r=this.getBoundingClientRect();return r.width||r.height?[r]:[];};
+P.focus=P.blur=P.select=function(){};
+P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=__vitaScroll(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
+P.click=function(){var e=new MouseEvent('click',{bubbles:true,cancelable:true});return this.dispatchEvent(e);};
 P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return false;};
 P.hasChildNodes=function(){return this.firstChild!==null;};
 P.remove=function(){var p=this.parentNode;if(p)p.removeChild(this);};
@@ -41,7 +55,7 @@ P.querySelectorAll=function(sel){return collect(this,compile(String(sel)),true,[
 P.querySelector=function(sel){var r=collect(this,compile(String(sel)),false,[]);return r.length?r[0]:null;};
 P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchesCompound(el,g);});};
 P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))return n;n=n.parentNode;}return null;};
-P.dispatchEvent=function(){return true;};P.getContext=function(){return null;};
+P.dispatchEvent=function(e){return __vitaDispatch(this,e);};P.getContext=function(){return null;};
 P.add=function(o,before){this.insertBefore(o,before||null);};
 Object.defineProperty(P,'options',{get:function(){return this.getElementsByTagName('option');}});
 Object.defineProperty(P,'selectedIndex',{get:function(){var o=this.options;for(var i=0;i<o.length;i++)if(o[i].hasAttribute('selected'))return i;return o.length?0:-1;},set:function(i){var o=this.options;for(var j=0;j<o.length;j++){if(j===i)o[j].setAttribute('selected','');else o[j].removeAttribute('selected');}}});
@@ -56,9 +70,10 @@ Object.defineProperty(D,'images',{get:function(){return D.getElementsByTagName('
 Object.defineProperty(D,'links',{get:function(){return D.getElementsByTagName('a');}});
 Object.defineProperty(D,'scripts',{get:function(){return D.getElementsByTagName('script');}});
 D.defaultView=window;D.nodeType=9;D.nodeName='#document';D.documentMode=undefined;D.compatMode='CSS1Compat';D.hidden=false;D.visibilityState='visible';
-D.createEvent=function(t){return /custom/i.test(t)?new CustomEvent(''):new Event('');};D.dispatchEvent=function(){return true;};D.hasFocus=function(){return true;};
+D.createEvent=function(t){return /custom/i.test(t)?new CustomEvent(''):new Event('');};D.dispatchEvent=function(e){return __vitaDispatch(null,e);};D.hasFocus=function(){return true;};
 D.createElementNS=function(ns,t){return D.createElement(t);};D.createAttribute=function(n){return {name:n,value:''};};
-D.implementation={createHTMLDocument:function(){return D;},createDocument:function(){return D;},hasFeature:function(){return true;}};
+function scratchDocument(title){var html=D.createElement('html'),head=D.createElement('head'),body=D.createElement('body');html.appendChild(head);html.appendChild(body);var doc={nodeType:9,nodeName:'#document',documentElement:html,head:head,body:body,title:title||'',defaultView:null,implementation:D.implementation,createElement:function(t){return D.createElement(t);},createElementNS:function(ns,t){return D.createElement(t);},createTextNode:function(t){return D.createTextNode(t);},createDocumentFragment:function(){return D.createDocumentFragment();},createComment:function(){return D.createTextNode('');},getElementsByTagName:function(t){return html.getElementsByTagName(t);},getElementById:function(id){return html.querySelector('#'+id);},querySelector:function(s){return html.querySelector(s);},querySelectorAll:function(s){return html.querySelectorAll(s);},addEventListener:function(){},removeEventListener:function(){},write:function(){},open:function(){},close:function(){}};return doc;}
+D.implementation={createHTMLDocument:function(t){return scratchDocument(t);},createDocument:function(){return scratchDocument('');},hasFeature:function(){return true;}};
 D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';
 window.NodeFilter={FILTER_ACCEPT:1,FILTER_REJECT:2,FILTER_SKIP:3,SHOW_ALL:0xFFFFFFFF,SHOW_ELEMENT:1,SHOW_TEXT:4,SHOW_COMMENT:128,SHOW_DOCUMENT:256};
 D.createTreeWalker=function(root,what,filter){what=what===undefined?0xFFFFFFFF:what;var fn=filter&&(typeof filter==='function'?filter:filter.acceptNode);function ok(n){if(n.nodeType===9)return false;if(!((1<<(n.nodeType-1))&what))return false;return fn?fn(n)===1:true;}function next(n){if(n.firstChild)return n.firstChild;while(n&&n!==root){if(n.nextSibling)return n.nextSibling;n=n.parentNode;}return null;}return {root:root,currentNode:root,nextNode:function(){var n=next(this.currentNode);while(n&&!ok(n))n=next(n);if(n)this.currentNode=n;return n;},firstChild:function(){var n=this.currentNode.firstChild;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},nextSibling:function(){var n=this.currentNode.nextSibling;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},parentNode:function(){var n=this.currentNode.parentNode;if(n&&n!==root&&ok(n)){this.currentNode=n;return n;}return null;}};};
@@ -71,15 +86,61 @@ D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};
 ['onload','onreadystatechange','onclick','onkeydown','onkeyup','onmousemove','ontouchstart'].forEach(function(h){Object.defineProperty(D,h,{get:function(){return D['__'+h]||null;},set:function(f){D['__'+h]=f;if(typeof f==='function')D.addEventListener(h.slice(2),f);}});});
 var W=window;
 ['onload','onerror','onresize','onscroll','onhashchange','onpopstate','onunload','onbeforeunload','onmessage','onpageshow','onclick','onkeydown','onkeyup','ontouchstart'].forEach(function(h){Object.defineProperty(W,h,{get:function(){return W['__'+h]||null;},set:function(f){W['__'+h]=f;if(typeof f==='function'&&h!=='onerror')W.addEventListener(h.slice(2),f);}});});
-W.dispatchEvent=function(){return true;};
-W.innerWidth=W.outerWidth=960;W.innerHeight=W.outerHeight=544;W.devicePixelRatio=1;W.scrollX=W.pageXOffset=0;W.scrollY=W.pageYOffset=0;
+W.dispatchEvent=function(e){return __vitaDispatch(null,e);};
+/* Viewport and scroll position come from the window itself, so a script
+   that measures the page sees what is really on screen. */
+[['innerWidth',2],['outerWidth',2],['innerHeight',3],['outerHeight',3],['scrollX',0],['pageXOffset',0],['scrollY',1],['pageYOffset',1]].forEach(function(e){Object.defineProperty(W,e[0],{get:function(){return __vitaScroll()[e[1]];}});});
+W.devicePixelRatio=1;
 W.screen={width:960,height:544,availWidth:960,availHeight:544,colorDepth:32,pixelDepth:32,orientation:{type:'landscape-primary'}};
-W.scrollTo=W.scrollBy=W.scroll=W.focus=W.blur=W.stop=W.print=W.close=function(){};W.open=function(){return null;};
+W.focus=W.blur=W.stop=W.print=W.close=function(){};W.open=function(){return null;};
+function scrollArgs(a,b){if(a&&typeof a==='object')return [Number(a.left)||0,Number(a.top)||0];return [Number(a)||0,Number(b)||0];}
+W.scrollTo=W.scroll=function(a,b){var p=scrollArgs(a,b);__vitaScrollTo(p[0],p[1]);};
+W.scrollBy=function(a,b){var p=scrollArgs(a,b),s=__vitaScroll();__vitaScrollTo(s[0]+p[0],s[1]+p[1]);};
 W.confirm=function(){return false;};W.prompt=function(){return null;};
 W.requestAnimationFrame=function(f){return setTimeout(function(){f(Date.now());},16);};W.cancelAnimationFrame=function(h){clearTimeout(h);};
 W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:false,timeRemaining:function(){return 10;}});},50);};W.cancelIdleCallback=function(h){clearTimeout(h);};
 W.getComputedStyle=function(el){return el&&el.style?el.style:{getPropertyValue:function(){return '';}};};
-W.matchMedia=function(q){return {matches:false,media:q,addListener:function(){},removeListener:function(){},addEventListener:function(){},removeEventListener:function(){}};};
+/* A media query evaluator over the real viewport. Handles the features
+   responsive sites actually branch on; anything else is false. */
+function mediaFeature(name,value){var s=__vitaScroll(),w=s[2],h=s[3],n=parseFloat(value);
+ if(/em$/.test(value))n*=16;
+ switch(name){
+ case 'width':return w===n;case 'min-width':return w>=n;case 'max-width':return w<=n;
+ case 'height':return h===n;case 'min-height':return h>=n;case 'max-height':return h<=n;
+ case 'aspect-ratio':case 'min-aspect-ratio':case 'max-aspect-ratio':{var p=String(value).split('/'),r=parseFloat(p[0])/(parseFloat(p[1])||1),a=w/(h||1);return name==='min-aspect-ratio'?a>=r:name==='max-aspect-ratio'?a<=r:Math.abs(a-r)<0.001;}
+ case 'orientation':return value===(w>=h?'landscape':'portrait');
+ case 'prefers-color-scheme':return value==='light'||value==='no-preference';
+ case 'prefers-reduced-motion':return value==='reduce'||value==='no-preference';
+ case 'prefers-contrast':case 'forced-colors':case 'inverted-colors':return value==='no-preference'||value==='none';
+ case 'pointer':case 'any-pointer':return value==='coarse';
+ case 'hover':case 'any-hover':return value==='none';
+ case 'display-mode':return value==='fullscreen'||value==='browser';
+ case 'resolution':case 'min-resolution':return name==='min-resolution'?1>=n:n===1;
+ case 'max-resolution':return 1<=n;
+ case 'color':return true;case 'monochrome':return false;case 'grid':return false;
+ case 'scripting':return value==='enabled';
+ default:return false;}}
+function mediaTerm(t){t=t.replace(/^\s+|\s+$/g,'');
+ if(!t)return true;
+ if(/^not\s/i.test(t))return !mediaTerm(t.slice(4));
+ if(t.charAt(0)==='('){var m=/^\(\s*([\w-]+)\s*(?::\s*([^)]*?))?\s*\)$/.exec(t);if(!m)return false;
+  if(m[2]===undefined)return mediaFeature('min-'+m[1],'1')||m[1]==='color';
+  return mediaFeature(m[1].toLowerCase(),String(m[2]).replace(/^\s+|\s+$/g,''));}
+ var type=t.toLowerCase();return type==='all'||type==='screen';}
+function mediaMatches(q){q=String(q||'');if(!q)return true;
+ return q.split(',').some(function(one){
+  var neg=false;one=one.replace(/^\s+|\s+$/g,'');
+  if(/^not\s/i.test(one)){neg=true;one=one.slice(4);}
+  if(/^only\s/i.test(one))one=one.slice(5);
+  var ok=one.split(/\s+and\s+/i).every(function(t){return mediaTerm(t);});
+  return neg?!ok:ok;});}
+W.matchMedia=function(q){var mql={media:String(q),onchange:null,_l:[],
+ addListener:function(f){this._l.push(f);},removeListener:function(f){this._l=this._l.filter(function(g){return g!==f;});},
+ addEventListener:function(t,f){if(t==='change')this.addListener(f);},removeEventListener:function(t,f){this.removeListener(f);},
+ dispatchEvent:function(){return true;}};
+ Object.defineProperty(mql,'matches',{get:function(){return mediaMatches(q);}});
+ return mql;};
+W.__vitaMediaMatches=mediaMatches;
 function Storage(){var d={};this.getItem=function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null;};this.setItem=function(k,v){d[k]=String(v);};this.removeItem=function(k){delete d[k];};this.clear=function(){d={};};this.key=function(i){return Object.keys(d)[i]||null;};Object.defineProperty(this,'length',{get:function(){return Object.keys(d).length;}});}
 W.localStorage=new Storage();W.sessionStorage=new Storage();
 W.history={length:1,state:null,pushState:function(){},replaceState:function(){},back:function(){},forward:function(){},go:function(){}};

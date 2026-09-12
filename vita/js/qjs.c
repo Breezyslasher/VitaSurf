@@ -37,6 +37,7 @@
 #include "netsurf/browser_window.h"
 #include "netsurf/misc.h"
 #include "netsurf/mouse.h"
+#include "netsurf/window.h"
 #include "content/urldb.h"
 #include "content/fetch.h"
 #include "content/handlers/javascript/js.h"
@@ -56,6 +57,11 @@
 
 /* html_content, for the document node and browser window. */
 #include "content/handlers/html/private.h"
+#include "content/handlers/html/box.h"
+#include "content/handlers/html/box_construct.h"
+#include "content/handlers/html/box_inspect.h"
+#include "desktop/browser_private.h"
+#include "desktop/scrollbar.h"
 
 /* ------------------------------------------------------------------------ */
 /* Heap and thread                                                          */
@@ -95,6 +101,19 @@ struct jsthread {
 	struct js_xhr *xhrs;           /**< requests in flight */
 	int next_xhr_id;
 	bool closed;
+	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
+	bool relayout_pending;    /**< relayout_callback is scheduled */
+	unsigned relayout_ms;     /**< how long the last rebuild took */
+	int event_depth;          /**< DOM event dispatches in progress */
+	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
+	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
+};
+
+/* A JS-created event being dispatched through libdom (dispatchEvent). */
+struct js_dispatch {
+	struct js_dispatch *next;
+	struct dom_event *evt;
+	JSValue obj;
 };
 
 /* A DOM event listener that calls a JS function. */
@@ -118,6 +137,11 @@ struct js_timer {
 
 static JSClassID node_class_id;
 static int next_timer_handle = 1;
+
+#define RELAYOUT_DELAY_MS 40    /**< coalesce a burst of handlers into one */
+#define RELAYOUT_RETRY_MS 500   /**< page busy (dragging, typing): try later */
+#define RELAYOUT_MAX_DELAY_MS 2000 /**< longest wait a slow page earns */
+#define RELAYOUT_SYNC_LIMIT_MS 250 /**< above this, reads take stale geometry */
 
 /* ------------------------------------------------------------------------ */
 /* Small helpers                                                            */
@@ -334,6 +358,22 @@ static struct dom_node *this_node(JSContext *ctx, JSValueConst this_val)
 	return JS_GetOpaque2(ctx, this_val, node_class_id);
 }
 
+/*
+ * NetSurf builds its box tree once, after parsing; nothing scripts do to
+ * the DOM afterwards reaches the screen on its own. Every binding that
+ * changes the document marks the layout stale, and once the running
+ * script (or handler, or timer) is done the box tree is rebuilt from the
+ * DOM and laid out again (html_relayout, VitaSurf patch).
+ */
+static void mark_dirty(JSContext *ctx)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	if (thread != NULL) {
+		thread->dom_dirty = true;
+	}
+}
+
 /** Return a dom_string property as a JS string, or "" . */
 static JSValue str_result(JSContext *ctx, dom_string *s)
 {
@@ -403,6 +443,7 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 	if (d != NULL) {
 		dom_node_set_text_content(node, d);
 		dom_string_unref(d);
+		mark_dirty(ctx);
 	}
 	if (s != NULL) JS_FreeCString(ctx, s);
 	return JS_UNDEFINED;
@@ -444,6 +485,7 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 
 	if (node != NULL && key != NULL && dv != NULL) {
 		dom_element_set_attribute(node, key, dv);
+		mark_dirty(ctx);
 	}
 	if (key != NULL) dom_string_unref(key);
 	if (dv != NULL) dom_string_unref(dv);
@@ -592,6 +634,7 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 	val = to_dom_string(value != NULL ? value : "");
 	if (node != NULL && key != NULL && val != NULL) {
 		dom_element_set_attribute(node, key, val);
+		mark_dirty(ctx);
 	}
 	if (key) dom_string_unref(key);
 	if (val) dom_string_unref(val);
@@ -631,6 +674,7 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 	key = to_dom_string(name);
 	if (key != NULL) {
 		dom_element_remove_attribute(node, key);
+		mark_dirty(ctx);
 		dom_string_unref(key);
 	}
 	if (name) JS_FreeCString(ctx, name);
@@ -646,6 +690,7 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
+	mark_dirty(ctx);
 	if (argc >= 2) {
 		before = JS_GetOpaque(argv[1], node_class_id);
 	}
@@ -671,6 +716,7 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 	child = JS_GetOpaque(argv[0], node_class_id);
 	old = JS_GetOpaque(argv[1], node_class_id);
 	if (child == NULL || old == NULL) return JS_UNDEFINED;
+	mark_dirty(ctx);
 	if (dom_node_replace_child(node, child, old, &ref) == DOM_NO_ERR &&
 	    ref != NULL) {
 		dom_node_unref(ref);
@@ -724,6 +770,7 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
+	mark_dirty(ctx);
 	if (dom_node_append_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
 	}
@@ -739,6 +786,7 @@ static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
+	mark_dirty(ctx);
 	if (dom_node_remove_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
 	}
@@ -822,6 +870,7 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 	if (s != NULL) {
 		set_inner_html(node, s, len);
 		JS_FreeCString(ctx, s);
+		mark_dirty(ctx);
 	}
 	return JS_UNDEFINED;
 }
@@ -1449,6 +1498,8 @@ static void begin_script(jsthread *thread)
 	}
 }
 
+static void schedule_relayout(jsthread *thread, int ms);
+
 static void end_script(jsthread *thread)
 {
 	thread->deadline_ms = 0;
@@ -1463,6 +1514,104 @@ static void end_script(jsthread *thread)
 			break;
 		}
 	}
+	if (thread->dom_dirty) {
+		schedule_relayout(thread, RELAYOUT_DELAY_MS);
+	}
+}
+
+/* ------------------------------------------------------------------------ */
+/* Layout after DOM changes                                                 */
+
+static void relayout_callback(void *p)
+{
+	jsthread *thread = p;
+	html_content *htmlc;
+	nserror err;
+	uint64_t t0, t1;
+
+	thread->relayout_pending = false;
+	if (thread->closed || !thread->dom_dirty) {
+		return;
+	}
+	htmlc = thread->htmlc;
+	if (htmlc == NULL) {
+		thread->dom_dirty = false;
+		return;
+	}
+	if (htmlc->layout == NULL) {
+		if (htmlc->box_conversion_context != NULL) {
+			/* being built from a document that just changed */
+			guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
+			thread->relayout_pending = true;
+		} else {
+			/* the first conversion has not run yet; it will see the changes */
+			thread->dom_dirty = false;
+		}
+		return;
+	}
+	t0 = now_ms();
+	err = html_relayout(htmlc);
+	if (err == NSERROR_INVALID) {
+		guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
+		thread->relayout_pending = true;
+		return;
+	}
+	thread->dom_dirty = false;
+	t1 = now_ms();
+	thread->relayout_ms = (unsigned)(t1 - t0);
+	vita_log("qjs: layout rebuilt after script changes in %u ms%s",
+		 thread->relayout_ms, err == NSERROR_OK ? "" : " (failed)");
+}
+
+/*
+ * A rebuild costs the whole box tree, which on a long document is tens of
+ * milliseconds here and considerably more on the Vita. A page that keeps
+ * touching the DOM therefore waits longer between rebuilds the slower its
+ * last one was, rather than spending the whole frame budget on layout.
+ */
+static void schedule_relayout(jsthread *thread, int ms)
+{
+	int floor_ms;
+
+	if (thread->relayout_pending || thread->closed) {
+		return;
+	}
+	floor_ms = (int)thread->relayout_ms * 4;
+	if (floor_ms > RELAYOUT_MAX_DELAY_MS) {
+		floor_ms = RELAYOUT_MAX_DELAY_MS;
+	}
+	if (ms < floor_ms) {
+		ms = floor_ms;
+	}
+	if (guit->misc->schedule(ms, relayout_callback, thread) == NSERROR_OK) {
+		thread->relayout_pending = true;
+	}
+}
+
+/*
+ * Make the layout reflect the DOM before a script reads geometry. Only
+ * safe when no NetSurf code holding box pointers is on the stack, which
+ * is the case unless a DOM event NetSurf itself dispatched (a click from
+ * the input layer) is being handled.
+ */
+static bool layout_current(jsthread *thread)
+{
+	html_content *htmlc = thread->htmlc;
+
+	if (htmlc == NULL) {
+		return false;
+	}
+	if (thread->dom_dirty && htmlc->layout != NULL &&
+	    thread->event_depth == thread->js_dispatch_depth &&
+	    thread->relayout_ms <= RELAYOUT_SYNC_LIMIT_MS) {
+		uint64_t t0 = now_ms();
+
+		if (html_relayout(htmlc) == NSERROR_OK) {
+			thread->dom_dirty = false;
+			thread->relayout_ms = (unsigned)(now_ms() - t0);
+		}
+	}
+	return htmlc->layout != NULL;
 }
 
 static void timer_callback(void *p)
@@ -2010,25 +2159,251 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	struct js_listener *l = pw;
 	jsthread *thread = l->thread;
 	JSContext *ctx;
-	JSValue global, event_obj, ret, args[1];
+	JSValue global, event_obj, ret, args[1], flag;
+	struct js_dispatch *d;
 
 	if (thread == NULL || thread->closed) {
 		return;
 	}
 	ctx = thread->ctx;
+	thread->event_depth++;
 	begin_script(thread);
 	/* this is the element the listener was added to */
 	global = wrap_node(ctx, l->node);
-	event_obj = wrap_event(ctx, evt);
+	/* an event dispatchEvent created keeps its JS object (detail etc) */
+	for (d = thread->dispatches; d != NULL; d = d->next) {
+		if (d->evt == evt) {
+			break;
+		}
+	}
+	if (d != NULL) {
+		struct dom_event_target *target = NULL;
+
+		event_obj = JS_DupValue(ctx, d->obj);
+		if (dom_event_get_target(evt, &target) == DOM_NO_ERR &&
+		    target != NULL) {
+			JS_SetPropertyStr(ctx, event_obj, "target",
+					  wrap_node(ctx, (struct dom_node *)target));
+			dom_node_unref((struct dom_node *)target);
+		}
+		JS_SetPropertyStr(ctx, event_obj, "currentTarget",
+				  JS_DupValue(ctx, global));
+	} else {
+		event_obj = wrap_event(ctx, evt);
+	}
 	args[0] = event_obj;
 	ret = JS_Call(ctx, l->func, global, 1, args);
 	if (JS_IsException(ret)) {
 		qjs_report_exception(ctx);
 	}
 	JS_FreeValue(ctx, ret);
+	/* carry the listener's decisions back into the DOM dispatch */
+	flag = JS_GetPropertyStr(ctx, event_obj, "defaultPrevented");
+	if (JS_ToBool(ctx, flag) == 1) {
+		dom_event_prevent_default(evt);
+	}
+	JS_FreeValue(ctx, flag);
+	flag = JS_GetPropertyStr(ctx, event_obj, "cancelBubble");
+	if (JS_ToBool(ctx, flag) == 1) {
+		dom_event_stop_propagation(evt);
+	}
+	JS_FreeValue(ctx, flag);
 	JS_FreeValue(ctx, event_obj);
 	JS_FreeValue(ctx, global);
 	end_script(thread);
+	thread->event_depth--;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Geometry, scrolling and event dispatch                                   */
+
+static void set_index(JSContext *ctx, JSValue arr, int i, int v)
+{
+	JS_SetPropertyUint32(ctx, arr, (uint32_t)i, JS_NewInt32(ctx, v));
+}
+
+/*
+ * __vitaBox(node): the laid-out box of an element as
+ * [x, y, width, height, clientWidth, clientHeight, borderLeft, borderTop,
+ *  scrollWidth, scrollHeight, scrollLeft, scrollTop] in CSS px, document
+ * coordinates, border box; null when the element has no box.
+ */
+static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct box *box;
+	int x, y, cw, ch, sw, sh;
+	JSValue arr;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !layout_current(thread)) {
+		return JS_NULL;
+	}
+	box = box_for_node(node);
+	if (box == NULL) {
+		return JS_NULL;
+	}
+	box_coords(box, &x, &y);
+	cw = box->padding[LEFT] + box->width + box->padding[RIGHT];
+	ch = box->padding[TOP] + box->height + box->padding[BOTTOM];
+	sw = box->descendant_x1 > cw ? box->descendant_x1 : cw;
+	sh = box->descendant_y1 > ch ? box->descendant_y1 : ch;
+	arr = JS_NewArray(ctx);
+	set_index(ctx, arr, 0, x - box->border[LEFT].width);
+	set_index(ctx, arr, 1, y - box->border[TOP].width);
+	set_index(ctx, arr, 2, cw + box->border[LEFT].width + box->border[RIGHT].width);
+	set_index(ctx, arr, 3, ch + box->border[TOP].width + box->border[BOTTOM].width);
+	set_index(ctx, arr, 4, cw);
+	set_index(ctx, arr, 5, ch);
+	set_index(ctx, arr, 6, box->border[LEFT].width);
+	set_index(ctx, arr, 7, box->border[TOP].width);
+	set_index(ctx, arr, 8, sw);
+	set_index(ctx, arr, 9, sh);
+	set_index(ctx, arr, 10, box->scroll_x != NULL ? scrollbar_get_offset(box->scroll_x) : 0);
+	set_index(ctx, arr, 11, box->scroll_y != NULL ? scrollbar_get_offset(box->scroll_y) : 0);
+	return arr;
+}
+
+static struct gui_window *thread_gui_window(jsthread *thread)
+{
+	if (thread == NULL || thread->win == NULL) {
+		return NULL;
+	}
+	return thread->win->window;
+}
+
+/* __vitaScroll(): [scrollX, scrollY, viewportWidth, viewportHeight] in CSS px */
+static JSValue win_vita_scroll(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct gui_window *gw = thread_gui_window(thread);
+	int sx = 0, sy = 0, vw = 0, vh = 0;
+	float scale;
+	JSValue arr;
+
+	(void)this_val; (void)argc; (void)argv;
+	if (gw == NULL) {
+		return JS_NULL;
+	}
+	guit->window->get_scroll(gw, &sx, &sy);
+	guit->window->get_dimensions(gw, &vw, &vh);
+	scale = browser_window_get_scale(thread->win);
+	if (scale <= 0.0f) {
+		scale = 1.0f;
+	}
+	arr = JS_NewArray(ctx);
+	set_index(ctx, arr, 0, (int)(sx / scale));
+	set_index(ctx, arr, 1, (int)(sy / scale));
+	set_index(ctx, arr, 2, (int)(vw / scale));
+	set_index(ctx, arr, 3, (int)(vh / scale));
+	return arr;
+}
+
+/* __vitaScrollTo(x, y): scroll the window, CSS px */
+static JSValue win_vita_scroll_to(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct gui_window *gw = thread_gui_window(thread);
+	double x = 0, y = 0;
+	float scale;
+	struct rect r;
+
+	(void)this_val;
+	if (gw == NULL || argc < 2) {
+		return JS_UNDEFINED;
+	}
+	JS_ToFloat64(ctx, &x, argv[0]);
+	JS_ToFloat64(ctx, &y, argv[1]);
+	if (x < 0 || x != x) x = 0;
+	if (y < 0 || y != y) y = 0;
+	scale = browser_window_get_scale(thread->win);
+	if (scale <= 0.0f) {
+		scale = 1.0f;
+	}
+	r.x0 = r.x1 = (int)(x * scale);
+	r.y0 = r.y1 = (int)(y * scale);
+	guit->window->set_scroll(gw, &r);
+	return JS_UNDEFINED;
+}
+
+/*
+ * __vitaDispatch(node or null, event): deliver a JS-created Event through
+ * libdom to node (the document for null), so listeners registered from
+ * NetSurf and from other scripts see it. Returns false when a listener
+ * called preventDefault().
+ */
+static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node = NULL;
+	struct dom_event *evt = NULL;
+	dom_string *type_dom;
+	const char *type;
+	JSValue v;
+	bool bubbles, cancelable, success = false, prevented;
+	struct js_dispatch d;
+
+	(void)this_val;
+	if (thread == NULL || argc < 2 || !JS_IsObject(argv[1])) {
+		return JS_TRUE;
+	}
+	if (JS_IsObject(argv[0])) {
+		node = JS_GetOpaque(argv[0], node_class_id);
+	}
+	if (node == NULL) {
+		node = (struct dom_node *)thread_document(thread);
+	}
+	if (node == NULL) {
+		return JS_TRUE;
+	}
+	v = JS_GetPropertyStr(ctx, argv[1], "type");
+	type = JS_ToCString(ctx, v);
+	JS_FreeValue(ctx, v);
+	if (type == NULL) {
+		return JS_TRUE;
+	}
+	type_dom = to_dom_string(type);
+	JS_FreeCString(ctx, type);
+	if (type_dom == NULL) {
+		return JS_TRUE;
+	}
+	v = JS_GetPropertyStr(ctx, argv[1], "bubbles");
+	bubbles = JS_ToBool(ctx, v) == 1;
+	JS_FreeValue(ctx, v);
+	v = JS_GetPropertyStr(ctx, argv[1], "cancelable");
+	cancelable = JS_ToBool(ctx, v) == 1;
+	JS_FreeValue(ctx, v);
+	if (dom_event_create(&evt) != DOM_NO_ERR) {
+		dom_string_unref(type_dom);
+		return JS_TRUE;
+	}
+	dom_event_init(evt, type_dom, bubbles, cancelable);
+	dom_string_unref(type_dom);
+
+	d.evt = evt;
+	d.obj = JS_DupValue(ctx, argv[1]);
+	d.next = thread->dispatches;
+	thread->dispatches = &d;
+	thread->js_dispatch_depth++;
+	dom_event_target_dispatch_event(node, evt, &success);
+	thread->js_dispatch_depth--;
+	thread->dispatches = d.next;
+	JS_FreeValue(ctx, d.obj);
+	dom_event_unref(evt);
+
+	v = JS_GetPropertyStr(ctx, argv[1], "defaultPrevented");
+	prevented = JS_ToBool(ctx, v) == 1;
+	JS_FreeValue(ctx, v);
+	return JS_NewBool(ctx, !prevented);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2047,15 +2422,6 @@ static JSValue node_ctor(JSContext *ctx, JSValueConst new_target,
  * per page context after the C bindings are installed.
  */
 #include "prelude_js.h"
-
-static void install_object(JSContext *ctx, JSValue parent, const char *name,
-			   const JSCFunctionListEntry *tab, size_t n)
-{
-	JSValue obj = JS_NewObject(ctx);
-
-	JS_SetPropertyFunctionList(ctx, obj, tab, (int)n);
-	JS_SetPropertyStr(ctx, parent, name, obj);
-}
 
 static void setup_globals(jsthread *thread)
 {
@@ -2123,6 +2489,16 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_fetch, "__vitaFetch", 6));
 	JS_SetPropertyStr(ctx, global, "__vitaFetchAbort",
 			  JS_NewCFunction(ctx, win_vita_fetch_abort, "__vitaFetchAbort", 1));
+
+	/* layout geometry, scrolling and event dispatch (prelude.js) */
+	JS_SetPropertyStr(ctx, global, "__vitaBox",
+			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaScroll",
+			  JS_NewCFunction(ctx, win_vita_scroll, "__vitaScroll", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaScrollTo",
+			  JS_NewCFunction(ctx, win_vita_scroll_to, "__vitaScrollTo", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaDispatch",
+			  JS_NewCFunction(ctx, win_vita_dispatch, "__vitaDispatch", 2));
 
 	/* window listeners live on the document node (see add_listener) */
 	JS_SetPropertyStr(ctx, global, "addEventListener",
@@ -2251,6 +2627,10 @@ nserror js_closethread(jsthread *thread)
 		return NSERROR_OK;
 	}
 	thread->closed = true;
+	if (thread->relayout_pending) {
+		guit->misc->schedule(-1, relayout_callback, thread);
+		thread->relayout_pending = false;
+	}
 	/* cancel timers; the scheduler holds pointers to them */
 	for (t = thread->timers; t != NULL; t = t->next) {
 		if (!t->dead) {

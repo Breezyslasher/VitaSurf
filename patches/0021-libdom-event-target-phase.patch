@@ -1,0 +1,24 @@
+diff --git a/src/events/event_target.c b/src/events/event_target.c
+index 4592fee..e741381 100644
+--- a/src/events/event_target.c
++++ b/src/events/event_target.c
+@@ -227,10 +227,16 @@ dom_exception _dom_event_target_dispatch(dom_event_target *et,
+ 			if (dom_string_isequal(le->type, evt->type)) {
+ 				assert(le->listener->handler != NULL);
+ 
+-				if ((le->capture && 
+-						phase == DOM_CAPTURING_PHASE) ||
++				/* A listener on the target itself belongs to
++				 * the at-target phase only: firing it in the
++				 * capture or bubble phase as well called it
++				 * twice for one event (VitaSurf). */
++				if ((le->capture &&
++						phase == DOM_CAPTURING_PHASE &&
++						evt->target != evt->current) ||
+ 				    (le->capture == false && 
+-						phase == DOM_BUBBLING_PHASE) ||
++						phase == DOM_BUBBLING_PHASE &&
++						evt->target != evt->current) ||
+ 				    (evt->target == evt->current && 
+ 						phase == DOM_AT_TARGET)) {
+ 					le->listener->handler(evt, 
