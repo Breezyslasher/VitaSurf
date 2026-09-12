@@ -145,8 +145,28 @@ has finished loading, only runs for the page actually on screen, never
 overlaps another, earns a quiet period in proportion to what the last
 one cost, and is skipped above `RELAYOUT_MAX_ELEMENTS` elements. The
 duration and element count are logged so the limit can be tuned from a
-hardware log; measurements so far run from 16 ms for 87 elements to
-536 ms for 1999. Wikipedia is over it and keeps
+hardware log.
+
+The limit is set from measurement rather than caution. Profiling a
+rebuild of a Wikipedia article natively puts 62 per cent of it in CSS
+selection, 12 per cent in layout and the rest in building boxes and
+tearing the old tree down, and the cost is close to linear in the number
+of elements: 9 ms at 932 elements, 30 ms at 2857 and 78 ms at 5460 with
+the same stylesheet. Hardware runs about 25 times slower than that, which
+matches the figures the device reports, so six thousand elements is
+roughly two seconds and that is what the limit is worth.
+
+libcss can share one element's computed style with a like sibling, which
+would cut the selection cost, and it is worth knowing why that does not
+help here. Every one of the 22120 sharing candidates in a rebuild of that
+article is rejected, all of them because the candidate was matched by a
+rule carrying an attribute selector or a pseudo class, which Minerva's
+stylesheet uses throughout. A first attempt also found that 87 per cent
+of candidates were rejected earlier still, for carrying an id, since
+Wikipedia's parser puts a generated id on nearly every element; teaching
+libcss to ignore an id that no stylesheet mentions cleared that but
+changed nothing, because the taint check rejects them anyway. Neither
+was kept. Wikipedia is over it and keeps
 its parsed layout; it still renders and scrolls the full article,
 because that depended on the viewport overflow fix rather than on the
 rebuild. The objects a page has already loaded are held across a

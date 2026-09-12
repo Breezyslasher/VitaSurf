@@ -153,7 +153,7 @@ static int next_timer_handle = 1;
  * page than the one the rebuild would have improved. Documents above
  * this size therefore keep the layout they were parsed with.
  */
-#define RELAYOUT_MAX_ELEMENTS 4000
+#define RELAYOUT_MAX_ELEMENTS 6000
 
 /* ------------------------------------------------------------------------ */
 /* Small helpers                                                            */
