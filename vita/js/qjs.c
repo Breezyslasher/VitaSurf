@@ -281,6 +281,21 @@ static void qjs_report_exception(JSContext *ctx)
 	qjs_report_exception_src(ctx, NULL, NULL, 0);
 }
 
+/** True if err stringifies to something containing needle. */
+static bool qjs_error_mentions(JSContext *ctx, JSValueConst err,
+			       const char *needle)
+{
+	const char *msg = JS_ToCString(ctx, err);
+	bool found;
+
+	if (msg == NULL) {
+		return false;
+	}
+	found = strstr(msg, needle) != NULL;
+	JS_FreeCString(ctx, msg);
+	return found;
+}
+
 /** A dom_string from a NUL-terminated C string, or NULL. */
 static dom_string *to_dom_string(const char *s)
 {
@@ -3413,6 +3428,44 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			 */
 			begin_script(thread);
 			ret = JS_EvalFunction(thread->ctx, fn);
+			/*
+			 * QuickJS checks a global let or const against the
+			 * bindings other scripts already made when the
+			 * script runs, not when it compiles, so a bundle
+			 * that is really a module but happens to contain no
+			 * import or export reaches this far and then dies on
+			 * "redeclaration of e" against the last module that
+			 * declared the same minified name. Nothing has run
+			 * at that point -- the declarations are instantiated
+			 * before the body -- so compiling it again as a
+			 * module, where its declarations are its own, costs
+			 * only the parse.
+			 */
+			if (!module && JS_IsException(ret)) {
+				JSValue err = JS_GetException(thread->ctx);
+
+				if (qjs_error_mentions(thread->ctx, err,
+						       "redeclaration")) {
+					JSValue m = JS_Eval(thread->ctx, src,
+							    txtlen, name,
+							    JS_EVAL_TYPE_MODULE |
+							    JS_EVAL_FLAG_COMPILE_ONLY);
+
+					if (!JS_IsException(m)) {
+						JS_FreeValue(thread->ctx, err);
+						module = true;
+						begin_script(thread);
+						ret = JS_EvalFunction(thread->ctx, m);
+					} else {
+						JS_FreeValue(thread->ctx,
+							     JS_GetException(thread->ctx));
+						JS_FreeValue(thread->ctx, m);
+						ret = JS_Throw(thread->ctx, err);
+					}
+				} else {
+					ret = JS_Throw(thread->ctx, err);
+				}
+			}
 			/*
 			 * Evaluating a module yields a promise. It settles
 			 * synchronously unless the module awaits at its top
