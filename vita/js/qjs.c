@@ -59,6 +59,9 @@
 
 /* html_content, for the document node and browser window. */
 #include "content/handlers/html/private.h"
+/* struct html_script, to find a module the page already fetched. */
+#include "content/handlers/html/html.h"
+#include "netsurf/content.h"
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_construct.h"
 #include "content/handlers/html/box_inspect.h"
@@ -3270,33 +3273,6 @@ void js_destroythread(jsthread *thread)
 }
 
 /*
- * Import resolution. A script compiled as a module is registered under its
- * own URL, and QuickJS satisfies an import of a URL it has already
- * compiled from its own module list without asking us, so a page whose
- * modules import each other by path links without any fetching here.
- *
- * Anything else -- a bare specifier resolved through an import map, or a
- * module the page never loaded through a script element -- would need a
- * fetch, and the fetcher is asynchronous while import resolution is not.
- * Those are named in the log and the import fails, which leaves the
- * importing module unevaluated rather than the whole page dead.
- */
-static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
-				      void *opaque)
-{
-	jsthread *thread = JS_GetContextOpaque(ctx);
-
-	(void)opaque;
-	if (thread != NULL) {
-		thread->js_imports_missed++;
-	}
-	vita_log("qjs: no module for import '%s'", name != NULL ? name : "?");
-	JS_ThrowReferenceError(ctx, "could not load module '%s'",
-			       name != NULL ? name : "?");
-	return NULL;
-}
-
-/*
  * Scripts above this size are skipped. Compiling costs roughly 2 ms per KB
  * on hardware, so the limit is what a page is allowed to spend before the
  * script is judged not worth waiting for. It is deliberately high enough
@@ -3314,6 +3290,99 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
  */
 #define SCRIPT_MAX_BYTES (16 * 1024 * 1024)
 #define SCRIPT_LOG_BYTES (256 * 1024)
+
+/*
+ * Import resolution. A script compiled as a module is registered under its
+ * own URL, and QuickJS satisfies an import of a URL it has already
+ * compiled from its own module list without asking us, so a page whose
+ * modules import each other by path links without any fetching here.
+ *
+ * Anything else -- a bare specifier resolved through an import map, or a
+ * module the page never loaded through a script element -- would need a
+ * fetch, and the fetcher is asynchronous while import resolution is not.
+ * Those are named in the log and the import fails, which leaves the
+ * importing module unevaluated rather than the whole page dead.
+ */
+static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
+				      void *opaque)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	unsigned int i, fetched = 0;
+	bool unready = false;
+
+	(void)opaque;
+	if (thread == NULL || name == NULL) {
+		JS_ThrowReferenceError(ctx, "could not load module");
+		return NULL;
+	}
+
+	/*
+	 * The page may already have the module's source: a
+	 * <link rel="modulepreload"> fetches one without running it, for
+	 * exactly this moment. Compile it here, which is when a module's
+	 * body is meant to run anyway, rather than at whatever point in
+	 * the document the link happened to sit.
+	 */
+	if (thread->htmlc != NULL) {
+		for (i = 0; i < thread->htmlc->scripts_count; i++) {
+			struct html_script *sc = &thread->htmlc->scripts[i];
+			const uint8_t *data;
+			size_t size = 0;
+			char *src;
+			JSValue fn;
+			JSModuleDef *m;
+
+			if (sc->type == HTML_SCRIPT_INLINE ||
+			    sc->data.handle == NULL) {
+				continue;
+			}
+			fetched++;
+			if (strcmp(nsurl_access(hlcache_handle_get_url(
+					sc->data.handle)), name) != 0) {
+				continue;
+			}
+			if (content_get_status(sc->data.handle) !=
+					CONTENT_STATUS_DONE) {
+				/* Named by the page but still arriving. */
+				unready = true;
+				continue;
+			}
+			data = content_get_source_data(sc->data.handle, &size);
+			if (data == NULL || size == 0 ||
+			    size > SCRIPT_MAX_BYTES) {
+				break;
+			}
+			src = malloc(size + 1);
+			if (src == NULL) {
+				break;
+			}
+			memcpy(src, data, size);
+			src[size] = 0;
+			fn = JS_Eval(ctx, src, size, name,
+				     JS_EVAL_TYPE_MODULE |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+			free(src);
+			if (JS_IsException(fn)) {
+				vita_log("qjs: module '%s' did not compile",
+					 name);
+				return NULL;
+			}
+			m = JS_VALUE_GET_PTR(fn);
+			JS_FreeValue(ctx, fn);
+			thread->js_modules++;
+			vita_log("qjs: compiled module for import '%s' "
+				 "(%u KB)", name, (unsigned)(size / 1024));
+			return m;
+		}
+	}
+
+	thread->js_imports_missed++;
+	vita_log("qjs: no module for import '%s' (%u fetched scripts%s)",
+		 name, fetched, unready ? ", one still arriving" : "");
+	JS_ThrowReferenceError(ctx, "could not load module '%s'", name);
+	return NULL;
+}
+
 
 bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name)
 {

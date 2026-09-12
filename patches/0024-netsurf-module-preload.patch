@@ -1,0 +1,215 @@
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index 83a84ac7b..80d280c00 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -168,6 +168,28 @@ static bool html_process_inserted_link(html_content *c, dom_node *node)
+ 	/* Handle stylesheet loading */
+ 	html_css_process_link(c, (dom_node *)node);
+ 
++#ifdef __vita__
++	/* Handle a preloaded ES module */
++	{
++		dom_string *rel = NULL, *href = NULL;
++
++		if (dom_element_get_attribute(node, corestring_dom_rel,
++					      &rel) == DOM_NO_ERR &&
++		    rel != NULL) {
++			if (strcasestr(dom_string_data(rel),
++				       "modulepreload") != NULL &&
++			    dom_element_get_attribute(node,
++					corestring_dom_href,
++					&href) == DOM_NO_ERR &&
++			    href != NULL) {
++				html_process_module_preload(c, href);
++				dom_string_unref(href);
++			}
++			dom_string_unref(rel);
++		}
++	}
++#endif
++
+ 	/* try Generic link handling */
+ 
+ 	memset(&link, 0, sizeof(struct content_rfc5988_link));
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 7ce4dd128..73e4e2aa4 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -71,7 +71,20 @@ struct html_script {
+ 	enum html_script_type { HTML_SCRIPT_INLINE,
+ 				HTML_SCRIPT_SYNC,
+ 				HTML_SCRIPT_DEFER,
+-				HTML_SCRIPT_ASYNC } type;
++				HTML_SCRIPT_ASYNC
++#ifdef __vita__
++				,
++				/**
++				 * An ES module named by
++				 * <link rel="modulepreload">. It is fetched
++				 * like a script but never run on its own:
++				 * the JavaScript engine compiles it when
++				 * something imports it, which is the point
++				 * at which a module's body is meant to run.
++				 */
++				HTML_SCRIPT_PRELOAD
++#endif
++	} type;
+ 	union {
+ 		struct hlcache_handle *handle;
+ 		struct dom_string *string;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 1a531c3cc..8f4f80f2b 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -313,6 +313,17 @@ bool html_redraw_inline_borders(struct box *box, struct rect b,
+ /* in html/script.c */
+ dom_hubbub_error html_process_script(void *ctx, dom_node *node);
+ 
++#ifdef __vita__
++/**
++ * Fetch and run a module named by <link rel="modulepreload">.
++ *
++ * \param c The html content the link belongs to.
++ * \param href The link's href attribute.
++ * \return true if a fetch was started.
++ */
++bool html_process_module_preload(html_content *c, dom_string *href);
++#endif
++
+ 
+ /**
+  * Rebuild the box tree from the (script-modified) document and lay it
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 554fc4f70..099a5bb38 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -557,6 +557,118 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ }
+ 
+ 
++#ifdef __vita__
++/**
++ * Callback for a preloaded module.
++ *
++ * Nothing runs here. The fetch exists so the source is in hand when
++ * something imports the module; all this has to do is keep the active
++ * fetch count straight and let the conversion proceed once it reaches
++ * zero, exactly as the deferred callback does.
++ */
++static nserror
++convert_script_preload_cb(hlcache_handle *script,
++			  const hlcache_event *event,
++			  void *pw)
++{
++	html_content *parent = pw;
++	unsigned int i;
++	struct html_script *s;
++
++	for (i = 0, s = parent->scripts; i != parent->scripts_count; i++, s++) {
++		if (s->type == HTML_SCRIPT_PRELOAD && s->data.handle == script)
++			break;
++	}
++	if (i == parent->scripts_count) {
++		return NSERROR_OK;
++	}
++
++	switch (event->type) {
++	case CONTENT_MSG_DONE:
++		NSLOG(netsurf, INFO, "modulepreload %d done '%s'", i,
++		      nsurl_access(hlcache_handle_get_url(script)));
++		parent->base.active--;
++		break;
++
++	case CONTENT_MSG_ERROR:
++		NSLOG(netsurf, INFO, "modulepreload %s failed: %s",
++		      nsurl_access(hlcache_handle_get_url(script)),
++		      event->data.errordata.errormsg);
++		hlcache_handle_release(script);
++		s->data.handle = NULL;
++		parent->base.active--;
++		break;
++
++	default:
++		break;
++	}
++
++	if (html_can_begin_conversion(parent)) {
++		html_begin_conversion(parent);
++	}
++
++	return NSERROR_OK;
++}
++
++/* exported internal interface documented in html/private.h */
++bool html_process_module_preload(html_content *c, dom_string *href)
++{
++	nserror ns_error;
++	nsurl *joined;
++	hlcache_child_context child;
++	struct html_script *nscript;
++
++	/*
++	 * A module named only by <link rel="modulepreload"> is never
++	 * fetched as a script, so nothing ever compiles it and every
++	 * import of it fails. Fetch it here so the source is in hand,
++	 * and leave it at that: the engine compiles it when something
++	 * imports it, which is both the right moment for a module body
++	 * to run and the only one that does not depend on where in the
++	 * document the link happened to sit.
++	 */
++	if (c->jsthread == NULL) {
++		union content_msg_data msg_data;
++
++		msg_data.jsthread = &c->jsthread;
++		content_broadcast(&c->base, CONTENT_MSG_GETTHREAD, &msg_data);
++		if (c->jsthread == NULL) {
++			return false;
++		}
++	}
++
++	ns_error = nsurl_join(c->base_url, dom_string_data(href), &joined);
++	if (ns_error != NSERROR_OK) {
++		return false;
++	}
++
++	NSLOG(netsurf, INFO, "modulepreload '%s'", nsurl_access(joined));
++
++	nscript = html_process_new_script(c, corestring_dom_text_javascript,
++					  HTML_SCRIPT_PRELOAD);
++	if (nscript == NULL) {
++		nsurl_unref(joined);
++		return false;
++	}
++
++	child.charset = c->encoding;
++	child.quirks = c->base.quirks;
++
++	ns_error = hlcache_handle_retrieve(joined, 0,
++					   content_get_url(&c->base), NULL,
++					   convert_script_preload_cb, c, &child,
++					   CONTENT_SCRIPT, &nscript->data.handle);
++	nsurl_unref(joined);
++
++	if (ns_error != NSERROR_OK) {
++		nscript->already_started = true;
++		return false;
++	}
++	c->base.active++;
++	return true;
++}
++#endif
++
+ /**
+  * process script node parser callback
+  *
+@@ -652,6 +764,10 @@ nserror html_script_free(html_content *html)
+ 			/* fallthrough */
+ 		case HTML_SCRIPT_ASYNC:
+ 			/* fallthrough */
++#ifdef __vita__
++		case HTML_SCRIPT_PRELOAD:
++			/* fallthrough */
++#endif
+ 		case HTML_SCRIPT_DEFER:
+ 			if (html->scripts[i].data.handle != NULL) {
+ 				hlcache_handle_release(html->scripts[i].data.handle);
