@@ -107,6 +107,14 @@ start from a fresh diagram when it reparses an SVG at a new size;
 svgtiny_parse appends to the diagram, so every earlier copy of the shapes
 was kept, drawn on each redraw and leaked.
 
+Patch 0020 propagates the overflow of the html and body elements to the
+viewport, as CSS 2.1 section 11.1.1 requires. NetSurf used to make the body
+a scroll container whenever a stylesheet set `overflow-y: scroll` on it,
+so pages such as mobile Wikipedia (`html, body { height: 100% }` plus
+`body { overflow-y: scroll }`) laid out as one 544 px tall box that never
+scrolled. The root and body boxes now report visible overflow and the
+window's own scrollbars handle the page.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
