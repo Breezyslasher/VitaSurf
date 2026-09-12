@@ -1,0 +1,66 @@
+name: Disassemble a crash offset
+
+# Resolves a crash offset against the ELF a past build uploaded, and prints
+# the instructions around it to the job log. A dump only gives an offset
+# into the text segment, and the offsets move between builds, so the answer
+# has to come from the binary that actually crashed. Artifacts cannot be
+# downloaded from a development machine here; a runner can.
+#
+# Edit fixtures/disasm.txt and push to run it.
+
+on:
+  push:
+    paths:
+      - fixtures/disasm.txt
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  disasm:
+    runs-on: ubuntu-latest
+    container: vitasdk/vitasdk:latest
+    steps:
+      - name: Install git
+        run: |
+          set -eu
+          if command -v apk >/dev/null 2>&1; then apk add --no-cache git; fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Read the request
+        id: req
+        run: |
+          set -eu
+          # fixtures/disasm.txt: run=<run id>, artifact=<name>, then offset=0x... lines
+          echo "run=$(sed -n 's/^run=//p' fixtures/disasm.txt | head -1)" >> "$GITHUB_OUTPUT"
+          echo "artifact=$(sed -n 's/^artifact=//p' fixtures/disasm.txt | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Download that build's ELF
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.req.outputs.artifact }}
+          run-id: ${{ steps.req.outputs.run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: elf
+
+      - name: Disassemble around each offset
+        run: |
+          set -eu
+          ELF=elf/VitaSurf
+          ls -la elf
+          arm-vita-eabi-readelf -lW "$ELF" | sed -n '1,20p'
+          for off in $(sed -n 's/^offset=//p' fixtures/disasm.txt); do
+            addr=$(python3 -c "print(hex(0x81000000 + $off))")
+            echo "=================================================="
+            echo "offset $off  ->  $addr"
+            arm-vita-eabi-addr2line -f -i -e "$ELF" "$addr" || true
+            start=$(python3 -c "print(hex(0x81000000 + $off - 0x60))")
+            stop=$(python3 -c "print(hex(0x81000000 + $off + 0x20))")
+            arm-vita-eabi-objdump -d --start-address="$start" --stop-address="$stop" \
+              -C "$ELF" | tail -n 60
+          done

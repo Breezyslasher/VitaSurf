@@ -20,7 +20,18 @@ Object.defineProperty(P,'parentElement',{get:function(){var p=this.parentNode;re
 Object.defineProperty(P,'innerText',{get:function(){return this.textContent;},set:function(v){this.textContent=v;}});
 Object.defineProperty(P,'outerHTML',{get:function(){return '';}});
 Object.defineProperty(P,'ownerDocument',{get:function(){return document;}});
-['href','src','value','type','name','title','alt','rel','target','action','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){this.setAttribute(attr,String(v));}});});
+['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){this.setAttribute(attr,String(v));}});});
+/* The URL-valued attributes reflect as resolved absolute URLs, not as
+ * written. getAttribute still gives what the document said. Code tests
+ * these against a scheme -- webpack decides its public path by matching
+ * a script's src against /^https?:/ -- and a relative one fails that
+ * test where the browser it was written for would have passed. */
+['href','src','action','formaction','poster','cite','data','background','longdesc'].forEach(function(a){
+ Object.defineProperty(P,a,{configurable:true,get:function(){
+  var v=this.getAttribute(a);
+  if(v===null||v==='')return '';
+  try{return new URL(v,D.baseURI).href;}catch(e){return v;}
+ },set:function(v){this.setAttribute(a,String(v));}});});
 ['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{get:function(){return this.hasAttribute(attr);},set:function(v){if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
 /* Layout geometry. __vitaBox(node) (qjs.c) returns the element's laid-out
    box as [x,y,width,height,clientWidth,clientHeight,clientLeft,clientTop,
@@ -192,6 +203,16 @@ D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';
 window.NodeFilter={FILTER_ACCEPT:1,FILTER_REJECT:2,FILTER_SKIP:3,SHOW_ALL:0xFFFFFFFF,SHOW_ELEMENT:1,SHOW_TEXT:4,SHOW_COMMENT:128,SHOW_DOCUMENT:256};
 D.createTreeWalker=function(root,what,filter){what=what===undefined?0xFFFFFFFF:what;var fn=filter&&(typeof filter==='function'?filter:filter.acceptNode);function ok(n){if(n.nodeType===9)return false;if(!((1<<(n.nodeType-1))&what))return false;return fn?fn(n)===1:true;}function next(n){if(n.firstChild)return n.firstChild;while(n&&n!==root){if(n.nextSibling)return n.nextSibling;n=n.parentNode;}return null;}return {root:root,currentNode:root,nextNode:function(){var n=next(this.currentNode);while(n&&!ok(n))n=next(n);if(n)this.currentNode=n;return n;},firstChild:function(){var n=this.currentNode.firstChild;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},nextSibling:function(){var n=this.currentNode.nextSibling;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},parentNode:function(){var n=this.currentNode.parentNode;if(n&&n!==root&&ok(n)){this.currentNode=n;return n;}return null;}};};
 D.createNodeIterator=function(root,what,filter){var w=D.createTreeWalker(root,what,filter);return {nextNode:function(){return w.nextNode();},detach:function(){}};};
+/* The base every relative URL in the document resolves against: the
+ * first <base href>, or the document's own address. Read with
+ * getAttribute, never through the href property, which resolves against
+ * this and would call straight back into it. */
+Object.defineProperty(D,'baseURI',{configurable:true,get:function(){
+ var b=D.getElementsByTagName('base');
+ for(var i=0;i<b.length;i++){var h=b[i].getAttribute('href');
+  if(h){try{return new URL(h,location.href).href;}catch(e){}}}
+ return location.href;
+}});
 Object.defineProperty(D,'URL',{get:function(){return location.href;}});Object.defineProperty(D,'documentURI',{get:function(){return location.href;}});
 Object.defineProperty(D,'activeElement',{get:function(){return D.body;}});
 D.createComment=function(t){return D.createTextNode('');};D.write=D.writeln=function(){};
