@@ -1,5 +1,5 @@
 diff --git a/content/content.c b/content/content.c
-index 448cf2369..229fad007 100644
+index 448cf2369..e9615b7d4 100644
 --- a/content/content.c
 +++ b/content/content.c
 @@ -28,6 +28,7 @@
@@ -10,12 +10,25 @@ index 448cf2369..229fad007 100644
  #include "utils/messages.h"
  #include "utils/corestrings.h"
  #include "netsurf/browser_window.h"
-@@ -80,10 +81,50 @@ static void content_convert(struct content *c)
+@@ -80,10 +81,68 @@ static void content_convert(struct content *c)
  	      nsurl_access_log(llcache_handle_get_url(c->llcache)), c);
  
  	if (c->handler->data_complete != NULL) {
-+		uint64_t t0 = 0, t1 = 0;
++		uint64_t t0 = 0, t1 = 0, total, self, outer;
 +		content_type type = c->handler->type();
++
++		/*
++		 * Self time, not elapsed time. A conversion runs other
++		 * conversions inside itself: the last stylesheet of a page
++		 * to arrive finishes the page from inside its own convert,
++		 * so it ran the scripts, built the boxes and laid the page
++		 * out. Measured as elapsed, a 16 KB stylesheet came out at
++		 * seventeen seconds, which said nothing about the
++		 * stylesheet. Each conversion hands its total up to the one
++		 * that contains it, which subtracts it.
++		 */
++		outer = vitasurf_ms_nested;
++		vitasurf_ms_nested = 0;
 +
  		c->locked = true;
 +		nsu_getmonotonic_ms(&t0);
@@ -23,19 +36,24 @@ index 448cf2369..229fad007 100644
  			content_set_error(c);
  		}
 +		nsu_getmonotonic_ms(&t1);
++
++		total = t1 - t0;
++		self = total > vitasurf_ms_nested ?
++			total - vitasurf_ms_nested : 0;
++		vitasurf_ms_nested = outer + total;
++
 +		/* where the time went, for the load profile (VitaSurf) */
 +		if (type == CONTENT_CSS) {
-+			vitasurf_ms_css += (unsigned int)(t1 - t0);
++			vitasurf_ms_css += (unsigned int)self;
 +		} else if (type & CONTENT_IMAGE) {
-+			vitasurf_ms_image += (unsigned int)(t1 - t0);
++			vitasurf_ms_image += (unsigned int)self;
 +		}
 +		/*
 +		 * Name anything that took a noticeable slice of a load.
 +		 * A total is enough to say a phase is slow and useless for
-+		 * saying which document made it slow, and one stylesheet
-+		 * has been taking seventeen seconds without saying so.
++		 * saying which document made it slow.
 +		 */
-+		if (t1 - t0 >= 500) {
++		if (self >= 500) {
 +			const char *url;
 +			char tail[112];
 +			size_t size = 0, len;
@@ -55,7 +73,7 @@ index 448cf2369..229fad007 100644
 +				url = tail;
 +			}
 +			vita_log("slow convert: %u ms for %u KB of %s",
-+				 (unsigned int)(t1 - t0),
++				 (unsigned int)self,
 +				 (unsigned int)(size / 1024), url);
 +		}
  		/* Conversion to the READY state will unlock the content */
@@ -176,10 +194,10 @@ index 8baf33870..cfb154c9d 100644
  	return ret;
  }
 diff --git a/utils/utils.c b/utils/utils.c
-index c64718531..e69c1dc44 100644
+index c64718531..8a3ecc194 100644
 --- a/utils/utils.c
 +++ b/utils/utils.c
-@@ -571,3 +571,20 @@ void regfree(regex_t *preg)
+@@ -571,3 +571,22 @@ void regfree(regex_t *preg)
  }
  
  #endif
@@ -187,6 +205,7 @@ index c64718531..e69c1dc44 100644
 +/* exported interface documented in utils/utils.h */
 +unsigned int vitasurf_ms_html_parse;
 +unsigned int vitasurf_ms_css;
++uint64_t vitasurf_ms_nested;
 +unsigned int vitasurf_ms_image;
 +unsigned int vitasurf_ms_boxes;
 +unsigned int vitasurf_ms_layout;
@@ -199,12 +218,21 @@ index c64718531..e69c1dc44 100644
 +	vitasurf_ms_image = 0;
 +	vitasurf_ms_boxes = 0;
 +	vitasurf_ms_layout = 0;
++	vitasurf_ms_nested = 0;
 +}
 diff --git a/utils/utils.h b/utils/utils.h
-index 8a051633c..0855cbe1e 100644
+index 8a051633c..e44dda3be 100644
 --- a/utils/utils.h
 +++ b/utils/utils.h
-@@ -120,4 +120,31 @@ bool is_dir(const char *path);
+@@ -27,6 +27,7 @@
+ #define NETSURF_UTILS_UTILS_H
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ 
+ #ifndef NOF_ELEMENTS
+ #define NOF_ELEMENTS(array) (sizeof(array)/sizeof(*(array)))
+@@ -120,4 +121,36 @@ bool is_dir(const char *path);
  #endif
  
  
@@ -221,6 +249,11 @@ index 8a051633c..0855cbe1e 100644
 +extern unsigned int vitasurf_ms_image;
 +extern unsigned int vitasurf_ms_boxes;
 +extern unsigned int vitasurf_ms_layout;
++/**
++ * Milliseconds the conversion now returning spent, handed up so the
++ * conversion that contains it can subtract its own nested work.
++ */
++extern uint64_t vitasurf_ms_nested;
 +
 +/** Zero the load profile counters, at the start of a navigation. */
 +void vitasurf_profile_reset(void);

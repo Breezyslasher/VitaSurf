@@ -3145,11 +3145,25 @@ static void setup_globals(jsthread *thread)
 	{
 		const char *src = (const char *)prelude_js;
 		size_t len = sizeof(prelude_js) - 1;
-		JSValue r = JS_Eval(ctx, src, len, "<prelude>", JS_EVAL_TYPE_GLOBAL);
+		uint64_t t0 = 0, t1 = 0;
+		JSValue r;
+
+		/*
+		 * The prelude runs once per page, so its own cost is part
+		 * of every load. It is worth a line when it grows: the
+		 * shims it carries are the whole DOM surface, and the
+		 * alternative to knowing what they cost is guessing.
+		 */
+		nsu_getmonotonic_ms(&t0);
+		r = JS_Eval(ctx, src, len, "<prelude>", JS_EVAL_TYPE_GLOBAL);
+		nsu_getmonotonic_ms(&t1);
 		if (JS_IsException(r)) {
 			qjs_report_exception_src(ctx, "<prelude>", src, len);
 		}
 		JS_FreeValue(ctx, r);
+		vita_log("qjs: prelude %u KB ran in %u ms",
+			 (unsigned int)(len / 1024),
+			 (unsigned int)(t1 - t0));
 	}
 }
 
