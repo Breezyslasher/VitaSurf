@@ -1,0 +1,4 @@
+url=https://www.youtube.com/s/desktop/e60429bd/jsbin/webcomponents-all-noPatch.vflset/webcomponents-all-noPatch.js
+line=143:0-1200
+find=function qd(
+find=c.configurable=!0
