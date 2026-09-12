@@ -213,6 +213,15 @@ previous one, so a relative request went wherever the user had been
 before, which for the first page of a session is a `file:` URL that the
 fetcher then refuses.
 
+A page load reports where its time went. When a page finishes, the log
+carries a second line breaking the total into HTML parsing, CSS,
+image decoding, box construction with style selection, and layout, and
+the load event line says how many scripts ran, their size, and how long
+went into compiling them against running them. Patch 0023 adds the
+counters. Sony's own browser loads the desktop PlayStation Vita article
+on the same device in 13 seconds against our 30, so there is a real
+target to measure against rather than a feeling.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus

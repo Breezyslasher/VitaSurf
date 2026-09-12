@@ -44,6 +44,7 @@
 #include <dom/dom.h>
 
 #include "utils/errors.h"
+#include "utils/utils.h"
 #include "utils/nsurl.h"
 #include "netsurf/types.h"
 #include "netsurf/browser_window.h"
@@ -815,6 +816,7 @@ void vita_input_load_started(struct gui_window *gw)
 {
 	if (gw == the_gw) {
 		load_started_us = sceKernelGetProcessTimeWide();
+		vitasurf_profile_reset();
 	}
 }
 
@@ -879,6 +881,11 @@ void vita_input_load_finished(struct gui_window *gw)
 	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
+		vita_log("page: of that, html parse %u ms, css %u ms, "
+			 "images %u ms, boxes and styles %u ms, layout %u ms",
+			 vitasurf_ms_html_parse, vitasurf_ms_css,
+			 vitasurf_ms_image, vitasurf_ms_boxes,
+			 vitasurf_ms_layout);
 		nsurl_unref(url);
 	} else {
 		vita_log("page: loaded in %u ms", ms);

@@ -1,0 +1,199 @@
+diff --git a/content/content.c b/content/content.c
+index 448cf2369..c0455fc70 100644
+--- a/content/content.c
++++ b/content/content.c
+@@ -28,6 +28,7 @@
+ 
+ #include "netsurf/inttypes.h"
+ #include "utils/log.h"
++#include "utils/utils.h"
+ #include "utils/messages.h"
+ #include "utils/corestrings.h"
+ #include "netsurf/browser_window.h"
+@@ -80,10 +81,21 @@ static void content_convert(struct content *c)
+ 	      nsurl_access_log(llcache_handle_get_url(c->llcache)), c);
+ 
+ 	if (c->handler->data_complete != NULL) {
++		uint64_t t0 = 0, t1 = 0;
++		content_type type = c->handler->type();
++
+ 		c->locked = true;
++		nsu_getmonotonic_ms(&t0);
+ 		if (c->handler->data_complete(c) == false) {
+ 			content_set_error(c);
+ 		}
++		nsu_getmonotonic_ms(&t1);
++		/* where the time went, for the load profile (VitaSurf) */
++		if (type == CONTENT_CSS) {
++			vitasurf_ms_css += (unsigned int)(t1 - t0);
++		} else if (type & CONTENT_IMAGE) {
++			vitasurf_ms_image += (unsigned int)(t1 - t0);
++		}
+ 		/* Conversion to the READY state will unlock the content */
+ 	} else {
+ 		content_set_ready(c);
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 7867f62b8..1f66b4062 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -28,6 +28,8 @@
+ #include <string.h>
+ #include <dom/dom.h>
+ 
++#include <nsutils/time.h>
++
+ #include "utils/errors.h"
+ #include "utils/nsoption.h"
+ #include "utils/corestrings.h"
+@@ -1294,6 +1296,9 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 	bool convert_children;
+ 	uint32_t num_processed = 0;
+ 	const uint32_t max_processed_before_yield = 10;
++	uint64_t vs_t0 = 0, vs_t1 = 0;
++
++	nsu_getmonotonic_ms(&vs_t0);
+ 
+ 	do {
+ 		convert_children = true;
+@@ -1304,6 +1309,8 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 			ctx->cb(ctx->content, false);
+ 			dom_node_unref(ctx->n);
+ 			free(ctx);
++			nsu_getmonotonic_ms(&vs_t1);
++			vitasurf_ms_boxes += (unsigned int)(vs_t1 - vs_t0);
+ 			return;
+ 		}
+ 
+@@ -1318,6 +1325,8 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 				ctx->cb(ctx->content, false);
+ 				dom_node_unref(next);
+ 				free(ctx);
++				nsu_getmonotonic_ms(&vs_t1);
++				vitasurf_ms_boxes += (unsigned int)(vs_t1 - vs_t0);
+ 				return;
+ 			}
+ 
+@@ -1363,10 +1372,14 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 			assert(ctx->n == NULL);
+ 
+ 			free(ctx);
++			nsu_getmonotonic_ms(&vs_t1);
++			vitasurf_ms_boxes += (unsigned int)(vs_t1 - vs_t0);
+ 			return;
+ 		}
+ 	} while (++num_processed < max_processed_before_yield || ctx->sync);
+ 
++	nsu_getmonotonic_ms(&vs_t1);
++	vitasurf_ms_boxes += (unsigned int)(vs_t1 - vs_t0);
+ 	/* More work to do: schedule a continuation */
+ 	guit->misc->schedule(0, (void *)convert_xml_to_box, ctx);
+ }
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index d977a2048..cf9f1ed20 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -740,10 +740,14 @@ html_process_data(struct content *c, const char *data, unsigned int size)
+ 	html_content *html = (html_content *) c;
+ 	dom_hubbub_error dom_ret;
+ 	nserror err = NSERROR_OK; /* assume its all going to be ok */
++	uint64_t t0 = 0, t1 = 0;
+ 
++	nsu_getmonotonic_ms(&t0);
+ 	dom_ret = dom_hubbub_parser_parse_chunk(html->parser,
+ 					      (const uint8_t *) data,
+ 					      size);
++	nsu_getmonotonic_ms(&t1);
++	vitasurf_ms_html_parse += (unsigned int)(t1 - t0);
+ 
+ 	err = libdom_hubbub_error_to_nserror(dom_ret);
+ 
+@@ -1084,6 +1088,7 @@ static void html_reformat(struct content *c, int width, int height)
+ 
+ 	htmlc->reflowing = true;
+ 
++
+ 	htmlc->unit_len_ctx.viewport_width = css_unit_device2css_px(
+ 			INTTOFIX(width), htmlc->unit_len_ctx.device_dpi);
+ 	htmlc->unit_len_ctx.viewport_height = css_unit_device2css_px(
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 8baf33870..cfb154c9d 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -43,6 +43,8 @@
+ #include <math.h>
+ #include <dom/dom.h>
+ 
++#include <nsutils/time.h>
++
+ #include "utils/log.h"
+ #include "utils/talloc.h"
+ #include "utils/utils.h"
+@@ -5413,6 +5415,9 @@ bool layout_document(html_content *content, int width, int height)
+ 	bool ret;
+ 	struct box *doc = content->layout;
+ 	const struct gui_layout_table *font_func = content->font_func;
++	uint64_t vs_t0 = 0, vs_t1 = 0;
++
++	nsu_getmonotonic_ms(&vs_t0);
+ 
+ 	NSLOG(layout, DEBUG, "Doing layout to %ix%i of %s",
+ 			width, height, nsurl_access(content_get_url(
+@@ -5458,5 +5463,7 @@ bool layout_document(html_content *content, int width, int height)
+ 
+ 	layout_calculate_descendant_bboxes(&content->unit_len_ctx, doc);
+ 
++	nsu_getmonotonic_ms(&vs_t1);
++	vitasurf_ms_layout += (unsigned int)(vs_t1 - vs_t0);
+ 	return ret;
+ }
+diff --git a/utils/utils.c b/utils/utils.c
+index c64718531..e69c1dc44 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -571,3 +571,20 @@ void regfree(regex_t *preg)
+ }
+ 
+ #endif
++
++/* exported interface documented in utils/utils.h */
++unsigned int vitasurf_ms_html_parse;
++unsigned int vitasurf_ms_css;
++unsigned int vitasurf_ms_image;
++unsigned int vitasurf_ms_boxes;
++unsigned int vitasurf_ms_layout;
++
++/* exported interface documented in utils/utils.h */
++void vitasurf_profile_reset(void)
++{
++	vitasurf_ms_html_parse = 0;
++	vitasurf_ms_css = 0;
++	vitasurf_ms_image = 0;
++	vitasurf_ms_boxes = 0;
++	vitasurf_ms_layout = 0;
++}
+diff --git a/utils/utils.h b/utils/utils.h
+index 8a051633c..feefae910 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -120,4 +120,21 @@ bool is_dir(const char *path);
+ #endif
+ 
+ 
++
++/**
++ * Where a page load spent its time, in milliseconds (VitaSurf).
++ *
++ * Accumulated across one navigation and reported when the page
++ * finishes, so a log from the device says which stage a slow load is
++ * actually in rather than leaving it to guesswork.
++ */
++extern unsigned int vitasurf_ms_html_parse;
++extern unsigned int vitasurf_ms_css;
++extern unsigned int vitasurf_ms_image;
++extern unsigned int vitasurf_ms_boxes;
++extern unsigned int vitasurf_ms_layout;
++
++/** Zero the load profile counters, at the start of a navigation. */
++void vitasurf_profile_reset(void);
++
+ #endif
