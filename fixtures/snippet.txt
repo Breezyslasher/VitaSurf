@@ -1,3 +1,2 @@
-url=https://www.youtube.com/s/desktop/e60429bd/jsbin/webcomponents-all-noPatch.vflset/webcomponents-all-noPatch.js
-find=__shady_native_
-find=var Q={
+url=https://github.githubassets.com/assets/catalyst-86a8f5de995615f8.js
+find=connectedCallback
