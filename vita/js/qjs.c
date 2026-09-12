@@ -3063,7 +3063,7 @@ nserror js_newheap(int timeout, jsheap **heap)
 	 * and layout recursion underneath. Minified bundles nest deeply
 	 * enough that 512 KB aborted them with a stack overflow.
 	 */
-	JS_SetMemoryLimit(ret->rt, 64 * 1024 * 1024);
+	JS_SetMemoryLimit(ret->rt, 96 * 1024 * 1024);
 	JS_SetMaxStackSize(ret->rt, 1024 * 1024);
 	/* register the shared node class once per runtime */
 	JS_NewClassID(ret->rt, &node_class_id);
@@ -3204,9 +3204,14 @@ void js_destroythread(jsthread *thread)
  *
  * Scripts at the top of this range take tens of seconds. SCRIPT_LOG_BYTES
  * is the size above which a script is logged whether or not verbose
- * logging is on, so a slow load says which script it waited for.
+ * logging is on, so a slow load says which script it waited for, and
+ * above which the heap is logged either side of it, because a bundle
+ * this size is the largest single allocation a page makes.
+ *
+ * YouTube's desktop application bundle measured 10509 KB, which is what
+ * put the ceiling where it is.
  */
-#define SCRIPT_MAX_BYTES (8 * 1024 * 1024)
+#define SCRIPT_MAX_BYTES (16 * 1024 * 1024)
 #define SCRIPT_LOG_BYTES (256 * 1024)
 
 bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name)
@@ -3277,11 +3282,15 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 
 		if (txtlen > SCRIPT_LOG_BYTES || vita_verbose_requested()) {
 			vita_log("qjs: script %u KB compiled in %u ms, "
-				 "ran in %u ms: %s",
+				 "ran in %u ms, runtime memory now %u KB: %s",
 				 (unsigned)(txtlen / 1024),
 				 (unsigned)(t_compiled - t_start),
 				 (unsigned)(t_done - t_compiled),
+				 runtime_kb(thread->heap->rt),
 				 name);
+		}
+		if (txtlen > SCRIPT_LOG_BYTES) {
+			vita_log_memory("after a large script");
 		}
 	}
 	ok = !JS_IsException(ret);
