@@ -1572,6 +1572,9 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 /* ------------------------------------------------------------------------ */
 /* Deadline management around calls into script                             */
 
+/* Lower bound on script_timeout, in seconds. See js_newheap(). */
+#define SCRIPT_TIMEOUT_MIN 20
+
 static void begin_script(jsthread *thread)
 {
 	if (thread->heap->timeout > 0) {
@@ -3032,10 +3035,34 @@ nserror js_newheap(int timeout, jsheap **heap)
 		free(ret);
 		return NSERROR_NOMEM;
 	}
+	/*
+	 * The timeout is NetSurf's script_timeout option, in seconds, and 0
+	 * means no limit. The Vita runs script roughly 25 times slower than
+	 * a desktop, so a budget short enough to be useful there stops work
+	 * a page legitimately needs here; raise anything below the floor.
+	 * A Choices file written by an earlier build is read after the
+	 * bundled one, so the floor rather than the option default is what
+	 * actually takes effect on a device that has been used.
+	 */
+	if (timeout > 0 && timeout < SCRIPT_TIMEOUT_MIN) {
+		timeout = SCRIPT_TIMEOUT_MIN;
+	}
 	ret->timeout = timeout;
-	/* keep a page's scripts within a sensible slice of the heap */
-	JS_SetMemoryLimit(ret->rt, 32 * 1024 * 1024);
-	JS_SetMaxStackSize(ret->rt, 512 * 1024);
+	/*
+	 * Keep a page's scripts within a sensible slice of the heap. The
+	 * newlib heap is 176 MB (VITASURF_HEAP_MB) and the rest of it holds
+	 * the document, the box tree and the image cache, so scripts get a
+	 * third of it. Large application bundles need most of this for
+	 * their bytecode alone.
+	 *
+	 * The stack limit is QuickJS's own recursion guard, measured against
+	 * the C stack. The main thread has 4 MB (VITASURF_STACK_KB) and
+	 * script runs on it, so 1 MB still leaves room for the CSS selection
+	 * and layout recursion underneath. Minified bundles nest deeply
+	 * enough that 512 KB aborted them with a stack overflow.
+	 */
+	JS_SetMemoryLimit(ret->rt, 64 * 1024 * 1024);
+	JS_SetMaxStackSize(ret->rt, 1024 * 1024);
 	/* register the shared node class once per runtime */
 	JS_NewClassID(ret->rt, &node_class_id);
 	JS_NewClass(ret->rt, node_class_id, &node_class);
@@ -3167,12 +3194,18 @@ void js_destroythread(jsthread *thread)
 }
 
 /*
- * Scripts above this size are skipped. Application bundles of several
- * megabytes (YouTube's main bundle is one) take tens of seconds to parse
- * on the Vita and their bytecode alone can exceed the runtime's memory
- * limit; the sites this browser targets do not ship them.
+ * Scripts above this size are skipped. Compiling costs roughly 2 ms per KB
+ * on hardware, so the limit is what a page is allowed to spend before the
+ * script is judged not worth waiting for. It is deliberately high enough
+ * for the application bundles large sites ship: skipping one of those
+ * leaves a blank page, which is worse than a slow one.
+ *
+ * Scripts at the top of this range take tens of seconds. SCRIPT_LOG_BYTES
+ * is the size above which a script is logged whether or not verbose
+ * logging is on, so a slow load says which script it waited for.
  */
-#define SCRIPT_MAX_BYTES (2 * 1024 * 1024)
+#define SCRIPT_MAX_BYTES (8 * 1024 * 1024)
+#define SCRIPT_LOG_BYTES (256 * 1024)
 
 bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name)
 {
@@ -3222,6 +3255,15 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		if (JS_IsException(fn)) {
 			ret = fn;
 		} else {
+			/*
+			 * Re-arm the deadline so the compile does not eat the
+			 * run budget. QuickJS's parser never calls the
+			 * interrupt handler, so the deadline could not have
+			 * stopped the compile anyway; without this a bundle
+			 * that took longer to compile than script_timeout was
+			 * aborted at its first statement.
+			 */
+			begin_script(thread);
 			ret = JS_EvalFunction(thread->ctx, fn);
 		}
 		t_done = now_ms();
@@ -3231,7 +3273,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		thread->js_compile_ms += (unsigned)(t_compiled - t_start);
 		thread->js_run_ms += (unsigned)(t_done - t_compiled);
 
-		if (vita_verbose_requested()) {
+		if (txtlen > SCRIPT_LOG_BYTES || vita_verbose_requested()) {
 			vita_log("qjs: script %u KB compiled in %u ms, "
 				 "ran in %u ms: %s",
 				 (unsigned)(txtlen / 1024),

@@ -10,7 +10,7 @@ read `ux0:data/VitaSurf/log.txt` for the breakdown VitaSurf reports.
 
 | Page | Sony's browser | VitaSurf | VitaSurf build |
 |---|---|---|---|
-| `en.wikipedia.org/wiki/PlayStation_Vita` | 13 s | 30 s | 93 |
+| `en.wikipedia.org/wiki/PlayStation_Vita` | 13 s | 27 s | 101 |
 | `m.youtube.com` search results | 20 s | not measured | |
 
 Notes on the two pages above.
@@ -21,13 +21,36 @@ is not winning by rendering something simpler. The gap is speed, not
 capability.
 
 YouTube is a single page application, which `CLAUDE.md` lists as a
-non-goal, and VitaSurf currently declines to run any script over
-`SCRIPT_MAX_BYTES`, naming YouTube's bundle as the reason. That limit
-was set before there was any measurement of what compiling costs.
-Compiling runs at about 0.086 ms per KB natively, so roughly 2.2 ms per
-KB on the device, which puts a two megabyte bundle near four and a half
-seconds. Whether that is affordable, and what YouTube actually ships,
-wants a log rather than an opinion: the skip is logged with the size.
+non-goal. VitaSurf used to decline any script over `SCRIPT_MAX_BYTES`,
+which was two megabytes, naming YouTube's bundle as the reason. That
+limit was set before there was any measurement of what compiling costs.
+The Wikipedia load measures it: 1054 KB of script compiled in 1925 ms,
+so 1.8 ms per KB on the device. At that rate the limit was rejecting
+bundles that would have compiled in a handful of seconds, on a load
+already taking twenty seven, and a skipped bundle leaves a blank page.
+The limit is now eight megabytes, which is about fifteen seconds of
+compiling at the worst case, and any script over 256 KB is logged with
+its size and compile time whether or not verbose logging is on.
+
+## Where a Wikipedia load goes (build 101, hardware)
+
+```
+page: https://en.wikipedia.org/wiki/PlayStation_Vita loaded in 27011 ms
+page: of that, html parse 1665 ms, css 222 ms, images 558 ms,
+      boxes and styles 8053 ms, layout 6462 ms
+qjs: load event, 8 scripts of 1054 KB compiled in 1925 ms, ran in 145 ms
+```
+
+Building the box tree and selecting styles is 8.1 s and layout is 6.5 s:
+between them 54 percent of the load. Script is 2.1 s, under 8 percent,
+and nearly all of that is compiling rather than running. Parsing, CSS
+and images together are 2.4 s. The 8.5 s the total exceeds the sum is
+network and scheduler.
+
+This overturns the earlier guess that most of the load was network
+time. Box construction and layout are where the load is, so that is
+where a faster load has to come from; a JavaScript bytecode cache would
+be spending effort on the smallest of the three.
 
 ## What a load reports
 
