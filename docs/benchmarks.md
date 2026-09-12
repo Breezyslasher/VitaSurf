@@ -52,6 +52,31 @@ time. Box construction and layout are where the load is, so that is
 where a faster load has to come from; a JavaScript bytecode cache would
 be spending effort on the smallest of the three.
 
+## Two more pages, measured on hardware (build 103)
+
+```
+page: https://www.youtube.com/ loaded in 42918 ms
+page: of that, html parse 801 ms, css 39 ms, images 0 ms,
+      boxes and styles 80 ms, layout 20 ms
+qjs: skipping 10509 KB script (limit 8192 KB): .../kevlar_base_module...
+qjs: 42 scripts of 1073 KB compiled in 943 ms, ran in 61 ms
+
+page: https://github.com/ loaded in 20903 ms
+page: of that, html parse 144 ms, css 738 ms, images 221 ms,
+      boxes and styles 3578 ms, layout 2086 ms
+qjs: 8 scripts of 2209 KB compiled in 5 ms, ran in 2 ms
+```
+
+Neither is limited by the same thing as Wikipedia. YouTube spends almost
+nothing on boxes and layout because without its application bundle there
+is nearly nothing to lay out, and the 43 seconds is fetching 42 scripts
+over the network. Its desktop bundle is 10509 KB, which is where the
+sixteen megabyte script ceiling comes from.
+
+GitHub compiled 2209 KB in 5 ms because almost none of it compiled at
+all: its scripts are ES modules, and export and import are syntax errors
+in a classic script. Those five milliseconds are five failed parses.
+
 ## What a load reports
 
 A finished page logs its total, then where the time went:

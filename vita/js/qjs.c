@@ -112,6 +112,8 @@ struct jsthread {
 	unsigned js_bytes;        /**< their total size */
 	unsigned js_compile_ms;   /**< time spent compiling them */
 	unsigned js_run_ms;       /**< time spent running them */
+	unsigned js_modules;      /**< of those, compiled as ES modules */
+	unsigned js_imports_missed; /**< imports that resolved to nothing */
 	int event_depth;          /**< DOM event dispatches in progress */
 	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
 	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
@@ -3025,6 +3027,9 @@ void js_finalise(void)
 {
 }
 
+static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
+				      void *opaque);
+
 nserror js_newheap(int timeout, jsheap **heap)
 {
 	jsheap *ret = calloc(1, sizeof(*ret));
@@ -3063,6 +3068,7 @@ nserror js_newheap(int timeout, jsheap **heap)
 	 * and layout recursion underneath. Minified bundles nest deeply
 	 * enough that 512 KB aborted them with a stack overflow.
 	 */
+	JS_SetModuleLoaderFunc(ret->rt, NULL, qjs_module_loader, NULL);
 	JS_SetMemoryLimit(ret->rt, 96 * 1024 * 1024);
 	JS_SetMaxStackSize(ret->rt, 1024 * 1024);
 	/* register the shared node class once per runtime */
@@ -3196,6 +3202,33 @@ void js_destroythread(jsthread *thread)
 }
 
 /*
+ * Import resolution. A script compiled as a module is registered under its
+ * own URL, and QuickJS satisfies an import of a URL it has already
+ * compiled from its own module list without asking us, so a page whose
+ * modules import each other by path links without any fetching here.
+ *
+ * Anything else -- a bare specifier resolved through an import map, or a
+ * module the page never loaded through a script element -- would need a
+ * fetch, and the fetcher is asynchronous while import resolution is not.
+ * Those are named in the log and the import fails, which leaves the
+ * importing module unevaluated rather than the whole page dead.
+ */
+static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
+				      void *opaque)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	(void)opaque;
+	if (thread != NULL) {
+		thread->js_imports_missed++;
+	}
+	vita_log("qjs: no module for import '%s'", name != NULL ? name : "?");
+	JS_ThrowReferenceError(ctx, "could not load module '%s'",
+			       name != NULL ? name : "?");
+	return NULL;
+}
+
+/*
  * Scripts above this size are skipped. Compiling costs roughly 2 ms per KB
  * on hardware, so the limit is what a page is allowed to spend before the
  * script is judged not worth waiting for. It is deliberately high enough
@@ -3254,9 +3287,64 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * the same two steps internally, so this costs nothing.
 		 */
 		uint64_t t_start = now_ms(), t_compiled, t_done;
-		JSValue fn = JS_Eval(thread->ctx, src, txtlen, name,
-				     JS_EVAL_TYPE_GLOBAL |
-				     JS_EVAL_FLAG_COMPILE_ONLY);
+		bool module = false;
+		JSValue fn;
+
+		/*
+		 * Sites serve their own code as ES modules, which are not
+		 * valid global scripts: export and import are syntax errors
+		 * there, and a module's top level declarations share no
+		 * scope with any other script, so a page whose modules each
+		 * declare the same name also collides when they are
+		 * compiled globally.
+		 *
+		 * NetSurf does not pass the script element's type down, and
+		 * QuickJS's JS_DetectModule answers yes for ordinary
+		 * scripts too, since nearly all of them also parse as
+		 * modules. Compiling a classic script as a module would be
+		 * the worse mistake: module code is strict, and its top
+		 * level declarations never reach the global object, so
+		 * anything a later script or an inline handler looks up by
+		 * name would be gone.
+		 *
+		 * So compile as a script first and only reach for a module
+		 * when that fails. A script that compiles keeps script
+		 * semantics, and the retry costs a parse only on source
+		 * that was not going to run at all.
+		 */
+		fn = JS_Eval(thread->ctx, src, txtlen, name,
+			     JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+		if (JS_IsException(fn)) {
+			JSValue script_err = JS_GetException(thread->ctx);
+			unsigned missed = thread->js_imports_missed;
+			JSValue as_module =
+				JS_Eval(thread->ctx, src, txtlen, name,
+					JS_EVAL_TYPE_MODULE |
+					JS_EVAL_FLAG_COMPILE_ONLY);
+
+			if (!JS_IsException(as_module)) {
+				JS_FreeValue(thread->ctx, script_err);
+				fn = as_module;
+				module = true;
+			} else if (thread->js_imports_missed != missed) {
+				/*
+				 * It asked for an import, so it is a module
+				 * and failed for want of one. That is the
+				 * error worth printing; the script parse
+				 * only ever said "unexpected import".
+				 */
+				JS_FreeValue(thread->ctx, script_err);
+				fn = as_module;
+				module = true;
+			} else {
+				/* Not a module either: the first error is
+				 * the one that describes the source. */
+				JS_FreeValue(thread->ctx,
+					     JS_GetException(thread->ctx));
+				JS_FreeValue(thread->ctx, as_module);
+				fn = JS_Throw(thread->ctx, script_err);
+			}
+		}
 
 		t_compiled = now_ms();
 		if (JS_IsException(fn)) {
@@ -3272,9 +3360,42 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			 */
 			begin_script(thread);
 			ret = JS_EvalFunction(thread->ctx, fn);
+			/*
+			 * Evaluating a module yields a promise. It settles
+			 * synchronously unless the module awaits at its top
+			 * level, so drain the job queue and then read it:
+			 * otherwise a module that threw would be recorded as
+			 * having run cleanly.
+			 */
+			if (JS_IsPromise(ret)) {
+				JSPromiseStateEnum st;
+
+				for (;;) {
+					JSContext *c = NULL;
+					int r = JS_ExecutePendingJob(thread->heap->rt, &c);
+					if (r <= 0) {
+						if (r < 0 && c != NULL) {
+							qjs_report_exception(c);
+						}
+						break;
+					}
+				}
+				st = JS_PromiseState(thread->ctx, ret);
+				if (st == JS_PROMISE_REJECTED) {
+					JSValue err = JS_PromiseResult(thread->ctx, ret);
+					JS_FreeValue(thread->ctx, ret);
+					ret = JS_Throw(thread->ctx, err);
+				} else if (st == JS_PROMISE_PENDING) {
+					vita_log("qjs: module still pending: %s",
+						 name);
+				}
+			}
 		}
 		t_done = now_ms();
 
+		if (module) {
+			thread->js_modules++;
+		}
 		thread->js_scripts++;
 		thread->js_bytes += (unsigned)txtlen;
 		thread->js_compile_ms += (unsigned)(t_compiled - t_start);
@@ -3317,10 +3438,12 @@ bool js_fire_event(jsthread *thread, const char *type,
 	}
 	if (strcmp(type, "load") == 0) {
 		vita_log("qjs: load event, runtime memory %u KB; "
-			 "%u scripts of %u KB compiled in %u ms, ran in %u ms",
+			 "%u scripts of %u KB compiled in %u ms, ran in %u ms"
+			 "; %u modules, %u imports unresolved",
 			 runtime_kb(thread->heap->rt),
 			 thread->js_scripts, thread->js_bytes / 1024,
-			 thread->js_compile_ms, thread->js_run_ms);
+			 thread->js_compile_ms, thread->js_run_ms,
+			 thread->js_modules, thread->js_imports_missed);
 	}
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
