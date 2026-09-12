@@ -84,6 +84,26 @@ jobs:
                             r'(?!attribute|constructor|iterable|maplike|setlike|const|readonly)'
                             r'[\w<>?\s,\[\]]+?\s(\w+)\s*\(', re.M)
 
+          # The regexes also catch IDL keywords and type names from the
+          # special member forms -- "getter Element (...)", "setter
+          # undefined (...)". No real member name starts with a capital
+          # or is a keyword, so drop those rather than report a browser
+          # as missing a member called "attribute".
+          KEYWORDS = {
+              'attribute', 'undefined', 'object', 'getter', 'setter',
+              'deleter', 'optional', 'constructor', 'static', 'readonly',
+              'required', 'sequence', 'record', 'unrestricted', 'unsigned',
+              'long', 'short', 'boolean', 'byte', 'octet', 'float',
+              'double', 'any', 'void', 'iterable', 'maplike', 'setlike',
+              'includes', 'partial', 'interface', 'dictionary', 'namespace',
+              'typedef', 'enum', 'callback', 'or', 'true', 'false', 'null',
+              'inherit', 'stringifier', 'mixin',
+          }
+
+          def clean(names):
+              return {n for n in names
+                      if n[:1].islower() and n not in KEYWORDS}
+
           def members(name, seen=None):
               seen = seen or set()
               if name in seen:
@@ -91,8 +111,8 @@ jobs:
               seen.add(name)
               attrs, meths = set(), set()
               for body in blocks.get(name, []):
-                  attrs |= set(ATTR.findall(body))
-                  meths |= set(METH.findall(body))
+                  attrs |= clean(ATTR.findall(body))
+                  meths |= clean(METH.findall(body))
               for mixin in includes.get(name, []):
                   a, m = members(mixin, seen)
                   attrs |= a

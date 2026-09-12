@@ -8,8 +8,7 @@ var SURFACE = {
 "signal"
 ],
 "methods": [
-"abort",
-"constructor"
+"abort"
 ]
 },
 "AbortSignal": {
@@ -19,7 +18,6 @@ var SURFACE = {
 "reason"
 ],
 "methods": [
-"_any",
 "abort",
 "throwIfAborted",
 "timeout"
@@ -45,8 +43,7 @@ var SURFACE = {
 "attributes": [],
 "methods": [
 "animate",
-"getAnimations",
-"optional"
+"getAnimations"
 ]
 },
 "Animation": {
@@ -67,7 +64,6 @@ var SURFACE = {
 "methods": [
 "cancel",
 "commitStyles",
-"constructor",
 "finish",
 "pause",
 "persist",
@@ -121,7 +117,6 @@ var SURFACE = {
 "onremovetrack"
 ],
 "methods": [
-"AudioTrack",
 "getTrackById"
 ]
 },
@@ -145,7 +140,6 @@ var SURFACE = {
 "methods": [
 "arrayBuffer",
 "bytes",
-"constructor",
 "slice",
 "stream",
 "text",
@@ -175,7 +169,6 @@ var SURFACE = {
 ],
 "methods": [
 "close",
-"constructor",
 "postMessage"
 ]
 },
@@ -185,9 +178,7 @@ var SURFACE = {
 "channels",
 "colorSpace"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSGroupingRule": {
 "attributes": [
@@ -205,9 +196,7 @@ var SURFACE = {
 "l",
 "s"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSHWB": {
 "attributes": [
@@ -216,9 +205,7 @@ var SURFACE = {
 "h",
 "w"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSImportRule": {
 "attributes": [
@@ -234,9 +221,7 @@ var SURFACE = {
 "attributes": [
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSLCH": {
 "attributes": [
@@ -245,9 +230,7 @@ var SURFACE = {
 "h",
 "l"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSLab": {
 "attributes": [
@@ -256,9 +239,7 @@ var SURFACE = {
 "b",
 "l"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSMarginRule": {
 "attributes": [
@@ -273,57 +254,43 @@ var SURFACE = {
 "upper",
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSMathInvert": {
 "attributes": [
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSMathMax": {
 "attributes": [
 "values"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSMathMin": {
 "attributes": [
 "values"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSMathNegate": {
 "attributes": [
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSMathProduct": {
 "attributes": [
 "values"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSMathSum": {
 "attributes": [
 "values"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSMathValue": {
 "attributes": [
@@ -335,9 +302,7 @@ var SURFACE = {
 "attributes": [
 "matrix"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSNamespaceRule": {
 "attributes": [
@@ -350,9 +315,7 @@ var SURFACE = {
 "attributes": [
 "length"
 ],
-"methods": [
-"CSSNumericValue"
-]
+"methods": []
 },
 "CSSNumericValue": {
 "attributes": [],
@@ -377,9 +340,7 @@ var SURFACE = {
 "h",
 "l"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSOKLab": {
 "attributes": [
@@ -388,9 +349,7 @@ var SURFACE = {
 "b",
 "l"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSPageDescriptors": {
 "attributes": [
@@ -417,9 +376,7 @@ var SURFACE = {
 "attributes": [
 "length"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSRGB": {
 "attributes": [
@@ -428,9 +385,7 @@ var SURFACE = {
 "g",
 "r"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSRotate": {
 "attributes": [
@@ -439,9 +394,7 @@ var SURFACE = {
 "y",
 "z"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSRule": {
 "attributes": [
@@ -466,34 +419,26 @@ var SURFACE = {
 "y",
 "z"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSSkew": {
 "attributes": [
 "ax",
 "ay"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSSkewX": {
 "attributes": [
 "ax"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSSkewY": {
 "attributes": [
 "ay"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSStyleDeclaration": {
 "attributes": [
@@ -531,7 +476,6 @@ var SURFACE = {
 ],
 "methods": [
 "addRule",
-"constructor",
 "deleteRule",
 "insertRule",
 "removeRule",
@@ -560,10 +504,7 @@ var SURFACE = {
 "length"
 ],
 "methods": [
-"CSSTransformComponent",
-"constructor",
-"toMatrix",
-"undefined"
+"toMatrix"
 ]
 },
 "CSSTranslate": {
@@ -572,37 +513,27 @@ var SURFACE = {
 "y",
 "z"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSUnitValue": {
 "attributes": [
 "unit",
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CSSUnparsedValue": {
 "attributes": [
 "length"
 ],
-"methods": [
-"CSSUnparsedSegment",
-"constructor",
-"undefined"
-]
+"methods": []
 },
 "CSSVariableReferenceValue": {
 "attributes": [
 "fallback",
 "variable"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CanvasCompositing": {
 "attributes": [
@@ -631,7 +562,6 @@ var SURFACE = {
 "CanvasFillStrokeStyles": {
 "attributes": [],
 "methods": [
-"attribute",
 "createConicGradient",
 "createLinearGradient",
 "createPattern",
@@ -739,7 +669,6 @@ var SURFACE = {
 "methods": [
 "arc",
 "arcTo",
-"attribute",
 "beginPath",
 "bezierCurveTo",
 "clearRect",
@@ -895,7 +824,6 @@ var SURFACE = {
 ],
 "methods": [
 "close",
-"constructor",
 "destroy",
 "requestClose"
 ]
@@ -905,29 +833,23 @@ var SURFACE = {
 "command",
 "source"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "Comment": {
 "attributes": [],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "CompositionEvent": {
 "attributes": [
 "data"
 ],
 "methods": [
-"constructor",
 "initCompositionEvent"
 ]
 },
 "CustomElementRegistry": {
 "attributes": [],
 "methods": [
-"constructor",
 "define",
 "getName",
 "initialize",
@@ -940,7 +862,6 @@ var SURFACE = {
 "detail"
 ],
 "methods": [
-"constructor",
 "initCustomEvent"
 ]
 },
@@ -956,7 +877,6 @@ var SURFACE = {
 "DOMParser": {
 "attributes": [],
 "methods": [
-"constructor",
 "parseFromString"
 ]
 },
@@ -971,10 +891,7 @@ var SURFACE = {
 },
 "DOMStringMap": {
 "attributes": [],
-"methods": [
-"DOMString",
-"undefined"
-]
+"methods": []
 },
 "DOMTokenList": {
 "attributes": [
@@ -1001,7 +918,6 @@ var SURFACE = {
 ],
 "methods": [
 "clearData",
-"constructor",
 "getData",
 "setData",
 "setDragImage"
@@ -1022,7 +938,6 @@ var SURFACE = {
 "length"
 ],
 "methods": [
-"DataTransferItem",
 "add",
 "clear",
 "remove"
@@ -1043,7 +958,6 @@ var SURFACE = {
 },
 "Document": {
 "attributes": [
-"URL",
 "activeElement",
 "adoptedStyleSheets",
 "alinkColor",
@@ -1195,7 +1109,6 @@ var SURFACE = {
 "caretPositionFromPoint",
 "clear",
 "close",
-"constructor",
 "convertPointFromNode",
 "convertQuadFromNode",
 "convertRectFromNode",
@@ -1229,7 +1142,6 @@ var SURFACE = {
 "hasFocus",
 "importNode",
 "moveBefore",
-"object",
 "open",
 "parseHTML",
 "parseHTMLUnsafe",
@@ -1256,7 +1168,6 @@ var SURFACE = {
 ],
 "methods": [
 "append",
-"constructor",
 "getElementById",
 "moveBefore",
 "prepend",
@@ -1278,9 +1189,7 @@ var SURFACE = {
 },
 "DocumentTimeline": {
 "attributes": [],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "DocumentType": {
 "attributes": [
@@ -1299,9 +1208,7 @@ var SURFACE = {
 "attributes": [
 "dataTransfer"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "Element": {
 "attributes": [
@@ -1338,7 +1245,6 @@ var SURFACE = {
 "animate",
 "append",
 "attachShadow",
-"attribute",
 "before",
 "checkVisibility",
 "closest",
@@ -1368,7 +1274,6 @@ var SURFACE = {
 "insertAdjacentText",
 "matches",
 "moveBefore",
-"optional",
 "prepend",
 "querySelector",
 "querySelectorAll",
@@ -1422,7 +1327,6 @@ var SURFACE = {
 ],
 "methods": [
 "checkValidity",
-"optional",
 "reportValidity",
 "setFormValue",
 "setValidity"
@@ -1436,9 +1340,7 @@ var SURFACE = {
 "lineno",
 "message"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "Event": {
 "attributes": [
@@ -1458,7 +1360,6 @@ var SURFACE = {
 ],
 "methods": [
 "composedPath",
-"constructor",
 "initEvent",
 "preventDefault",
 "stopImmediatePropagation",
@@ -1481,25 +1382,20 @@ var SURFACE = {
 "withCredentials"
 ],
 "methods": [
-"close",
-"constructor"
+"close"
 ]
 },
 "EventTarget": {
 "attributes": [],
 "methods": [
 "addEventListener",
-"constructor",
 "dispatchEvent",
 "removeEventListener"
 ]
 },
 "External": {
 "attributes": [],
-"methods": [
-"AddSearchProvider",
-"IsSearchProviderInstalled"
-]
+"methods": []
 },
 "FetchLaterResult": {
 "attributes": [
@@ -1512,9 +1408,7 @@ var SURFACE = {
 "lastModified",
 "name"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "FileList": {
 "attributes": [
@@ -1537,8 +1431,6 @@ var SURFACE = {
 ],
 "methods": [
 "abort",
-"attribute",
-"constructor",
 "readAsArrayBuffer",
 "readAsBinaryString",
 "readAsDataURL",
@@ -1548,7 +1440,6 @@ var SURFACE = {
 "FileReaderSync": {
 "attributes": [],
 "methods": [
-"constructor",
 "readAsArrayBuffer",
 "readAsBinaryString",
 "readAsDataURL",
@@ -1559,15 +1450,12 @@ var SURFACE = {
 "attributes": [
 "relatedTarget"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "FormData": {
 "attributes": [],
 "methods": [
 "append",
-"constructor",
 "delete",
 "get",
 "getAll",
@@ -1579,9 +1467,7 @@ var SURFACE = {
 "attributes": [
 "formData"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "GeometryUtils": {
 "attributes": [],
@@ -1694,10 +1580,7 @@ var SURFACE = {
 "attributes": [
 "length"
 ],
-"methods": [
-"Element",
-"getter"
-]
+"methods": []
 },
 "HTMLAnchorElement": {
 "attributes": [
@@ -1727,9 +1610,7 @@ var SURFACE = {
 "type",
 "username"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLAreaElement": {
 "attributes": [
@@ -1757,32 +1638,24 @@ var SURFACE = {
 "type",
 "username"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLAudioElement": {
 "attributes": [],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLBRElement": {
 "attributes": [
 "clear"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLBaseElement": {
 "attributes": [
 "href",
 "target"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLBodyElement": {
 "attributes": [
@@ -1811,9 +1684,7 @@ var SURFACE = {
 "text",
 "vLink"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLButtonElement": {
 "attributes": [
@@ -1838,7 +1709,6 @@ var SURFACE = {
 ],
 "methods": [
 "checkValidity",
-"constructor",
 "reportValidity",
 "setCustomValidity"
 ]
@@ -1849,7 +1719,6 @@ var SURFACE = {
 "width"
 ],
 "methods": [
-"constructor",
 "getContext",
 "toBlob",
 "toDataURL",
@@ -1869,34 +1738,26 @@ var SURFACE = {
 "attributes": [
 "compact"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLDataElement": {
 "attributes": [
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLDataListElement": {
 "attributes": [
 "options"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLDetailsElement": {
 "attributes": [
 "name",
 "open"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLDialogElement": {
 "attributes": [
@@ -1906,7 +1767,6 @@ var SURFACE = {
 ],
 "methods": [
 "close",
-"constructor",
 "requestClose",
 "show",
 "showModal"
@@ -1916,17 +1776,13 @@ var SURFACE = {
 "attributes": [
 "compact"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLDivElement": {
 "attributes": [
 "align"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLElement": {
 "attributes": [
@@ -2059,10 +1915,8 @@ var SURFACE = {
 ],
 "methods": [
 "attachInternals",
-"attribute",
 "blur",
 "click",
-"constructor",
 "focus",
 "hidePopover",
 "showPopover",
@@ -2079,7 +1933,6 @@ var SURFACE = {
 "width"
 ],
 "methods": [
-"constructor",
 "getSVGDocument"
 ]
 },
@@ -2096,7 +1949,6 @@ var SURFACE = {
 ],
 "methods": [
 "checkValidity",
-"constructor",
 "reportValidity",
 "setCustomValidity"
 ]
@@ -2107,15 +1959,11 @@ var SURFACE = {
 "face",
 "size"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLFormControlsCollection": {
 "attributes": [],
-"methods": [
-"getter"
-]
+"methods": []
 },
 "HTMLFormElement": {
 "attributes": [
@@ -2134,10 +1982,7 @@ var SURFACE = {
 "target"
 ],
 "methods": [
-"Element",
 "checkValidity",
-"constructor",
-"getter",
 "reportValidity",
 "requestSubmit",
 "reset",
@@ -2157,9 +2002,7 @@ var SURFACE = {
 "scrolling",
 "src"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLFrameSetElement": {
 "attributes": [
@@ -2184,9 +2027,7 @@ var SURFACE = {
 "onunload",
 "rows"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLHRElement": {
 "attributes": [
@@ -2196,31 +2037,23 @@ var SURFACE = {
 "size",
 "width"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLHeadElement": {
 "attributes": [],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLHeadingElement": {
 "attributes": [
 "align"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLHtmlElement": {
 "attributes": [
 "version"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLHyperlinkElementUtils": {
 "attributes": [
@@ -2250,8 +2083,6 @@ var SURFACE = {
 "width"
 ],
 "methods": [
-"attribute",
-"constructor",
 "getSVGDocument"
 ]
 },
@@ -2286,7 +2117,6 @@ var SURFACE = {
 "y"
 ],
 "methods": [
-"constructor",
 "decode"
 ]
 },
@@ -2325,7 +2155,6 @@ var SURFACE = {
 "popoverTargetAction",
 "popoverTargetElement",
 "readOnly",
-"required",
 "selectionDirection",
 "selectionEnd",
 "selectionStart",
@@ -2344,7 +2173,6 @@ var SURFACE = {
 ],
 "methods": [
 "checkValidity",
-"constructor",
 "reportValidity",
 "select",
 "setCustomValidity",
@@ -2360,9 +2188,7 @@ var SURFACE = {
 "type",
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLLabelElement": {
 "attributes": [
@@ -2370,18 +2196,14 @@ var SURFACE = {
 "form",
 "htmlFor"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLLegendElement": {
 "attributes": [
 "align",
 "form"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLLinkElement": {
 "attributes": [
@@ -2406,18 +2228,14 @@ var SURFACE = {
 "target",
 "type"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLMapElement": {
 "attributes": [
 "areas",
 "name"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLMarqueeElement": {
 "attributes": [
@@ -2434,7 +2252,6 @@ var SURFACE = {
 "width"
 ],
 "methods": [
-"constructor",
 "start",
 "stop"
 ]
@@ -2485,9 +2302,7 @@ var SURFACE = {
 "attributes": [
 "compact"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLMetaElement": {
 "attributes": [
@@ -2497,9 +2312,7 @@ var SURFACE = {
 "name",
 "scheme"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLMeterElement": {
 "attributes": [
@@ -2511,18 +2324,14 @@ var SURFACE = {
 "optimum",
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLModElement": {
 "attributes": [
 "cite",
 "dateTime"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLOListElement": {
 "attributes": [
@@ -2531,9 +2340,7 @@ var SURFACE = {
 "start",
 "type"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLObjectElement": {
 "attributes": [
@@ -2562,7 +2369,6 @@ var SURFACE = {
 ],
 "methods": [
 "checkValidity",
-"constructor",
 "getSVGDocument",
 "reportValidity",
 "setCustomValidity"
@@ -2573,9 +2379,7 @@ var SURFACE = {
 "disabled",
 "label"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLOptionElement": {
 "attributes": [
@@ -2588,9 +2392,7 @@ var SURFACE = {
 "text",
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLOptionsCollection": {
 "attributes": [
@@ -2599,8 +2401,7 @@ var SURFACE = {
 ],
 "methods": [
 "add",
-"remove",
-"undefined"
+"remove"
 ]
 },
 "HTMLOrSVGOrMathMLElement": {
@@ -2630,7 +2431,6 @@ var SURFACE = {
 ],
 "methods": [
 "checkValidity",
-"constructor",
 "reportValidity",
 "setCustomValidity"
 ]
@@ -2639,9 +2439,7 @@ var SURFACE = {
 "attributes": [
 "align"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLParamElement": {
 "attributes": [
@@ -2650,23 +2448,17 @@ var SURFACE = {
 "value",
 "valueType"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLPictureElement": {
 "attributes": [],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLPreElement": {
 "attributes": [
 "width"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLProgressElement": {
 "attributes": [
@@ -2675,17 +2467,13 @@ var SURFACE = {
 "position",
 "value"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLQuoteElement": {
 "attributes": [
 "cite"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLScriptElement": {
 "attributes": [
@@ -2705,7 +2493,6 @@ var SURFACE = {
 "type"
 ],
 "methods": [
-"constructor",
 "supports"
 ]
 },
@@ -2719,7 +2506,6 @@ var SURFACE = {
 "multiple",
 "name",
 "options",
-"required",
 "selectedIndex",
 "selectedOptions",
 "size",
@@ -2732,21 +2518,17 @@ var SURFACE = {
 "methods": [
 "add",
 "checkValidity",
-"constructor",
 "item",
 "namedItem",
 "remove",
 "reportValidity",
 "setCustomValidity",
-"showPicker",
-"undefined"
+"showPicker"
 ]
 },
 "HTMLSelectedContentElement": {
 "attributes": [],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLSlotElement": {
 "attributes": [
@@ -2755,8 +2537,7 @@ var SURFACE = {
 "methods": [
 "assign",
 "assignedElements",
-"assignedNodes",
-"constructor"
+"assignedNodes"
 ]
 },
 "HTMLSourceElement": {
@@ -2769,15 +2550,11 @@ var SURFACE = {
 "type",
 "width"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLSpanElement": {
 "attributes": [],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLStyleElement": {
 "attributes": [
@@ -2787,17 +2564,13 @@ var SURFACE = {
 "sheet",
 "type"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLTableCaptionElement": {
 "attributes": [
 "align"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLTableCellElement": {
 "attributes": [
@@ -2817,9 +2590,7 @@ var SURFACE = {
 "vAlign",
 "width"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLTableColElement": {
 "attributes": [
@@ -2830,9 +2601,7 @@ var SURFACE = {
 "vAlign",
 "width"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLTableElement": {
 "attributes": [
@@ -2852,7 +2621,6 @@ var SURFACE = {
 "width"
 ],
 "methods": [
-"constructor",
 "createCaption",
 "createTBody",
 "createTFoot",
@@ -2876,7 +2644,6 @@ var SURFACE = {
 "vAlign"
 ],
 "methods": [
-"constructor",
 "deleteCell",
 "insertCell"
 ]
@@ -2890,7 +2657,6 @@ var SURFACE = {
 "vAlign"
 ],
 "methods": [
-"constructor",
 "deleteRow",
 "insertRow"
 ]
@@ -2906,9 +2672,7 @@ var SURFACE = {
 "shadowRootSerializable",
 "shadowRootSlotAssignment"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLTextAreaElement": {
 "attributes": [
@@ -2924,7 +2688,6 @@ var SURFACE = {
 "name",
 "placeholder",
 "readOnly",
-"required",
 "rows",
 "selectionDirection",
 "selectionEnd",
@@ -2939,7 +2702,6 @@ var SURFACE = {
 ],
 "methods": [
 "checkValidity",
-"constructor",
 "reportValidity",
 "select",
 "setCustomValidity",
@@ -2951,17 +2713,13 @@ var SURFACE = {
 "attributes": [
 "dateTime"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLTitleElement": {
 "attributes": [
 "text"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLTrackElement": {
 "attributes": [
@@ -2973,18 +2731,14 @@ var SURFACE = {
 "srclang",
 "track"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLUListElement": {
 "attributes": [
 "compact",
 "type"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HTMLVideoElement": {
 "attributes": [
@@ -2995,24 +2749,19 @@ var SURFACE = {
 "videoWidth",
 "width"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "HashChangeEvent": {
 "attributes": [
 "newURL",
 "oldURL"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "Headers": {
 "attributes": [],
 "methods": [
 "append",
-"constructor",
 "delete",
 "get",
 "getSetCookie",
@@ -3063,7 +2812,6 @@ var SURFACE = {
 "ImageBitmapRenderingContext": {
 "attributes": [],
 "methods": [
-"attribute",
 "transferFromImageBitmap"
 ]
 },
@@ -3075,9 +2823,7 @@ var SURFACE = {
 "pixelFormat",
 "width"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "InputEvent": {
 "attributes": [
@@ -3085,9 +2831,7 @@ var SURFACE = {
 "inputType",
 "isComposing"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "IntersectionObserver": {
 "attributes": [
@@ -3098,8 +2842,6 @@ var SURFACE = {
 "trackVisibility"
 ],
 "methods": [
-"attribute",
-"constructor",
 "disconnect",
 "observe",
 "takeRecords",
@@ -3117,9 +2859,7 @@ var SURFACE = {
 "target",
 "time"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "KeyboardEvent": {
 "attributes": [
@@ -3136,7 +2876,6 @@ var SURFACE = {
 "shiftKey"
 ],
 "methods": [
-"constructor",
 "getModifierState",
 "initKeyboardEvent"
 ]
@@ -3148,9 +2887,7 @@ var SURFACE = {
 "target"
 ],
 "methods": [
-"constructor",
 "getKeyframes",
-"optional",
 "setKeyframes"
 ]
 },
@@ -3213,18 +2950,14 @@ var SURFACE = {
 "matches",
 "media"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "MessageChannel": {
 "attributes": [
 "port1",
 "port2"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "MessageEvent": {
 "attributes": [
@@ -3235,7 +2968,6 @@ var SURFACE = {
 "source"
 ],
 "methods": [
-"constructor",
 "initMessageEvent"
 ]
 },
@@ -3299,7 +3031,6 @@ var SURFACE = {
 "y"
 ],
 "methods": [
-"constructor",
 "getModifierState",
 "initMouseEvent"
 ]
@@ -3307,7 +3038,6 @@ var SURFACE = {
 "MutationObserver": {
 "attributes": [],
 "methods": [
-"constructor",
 "disconnect",
 "observe",
 "takeRecords"
@@ -3356,7 +3086,6 @@ var SURFACE = {
 "userInitiated"
 ],
 "methods": [
-"constructor",
 "intercept",
 "scroll"
 ]
@@ -3396,9 +3125,7 @@ var SURFACE = {
 "from",
 "navigationType"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "NavigationDestination": {
 "attributes": [
@@ -3655,7 +3382,6 @@ var SURFACE = {
 ],
 "methods": [
 "close",
-"constructor",
 "requestPermission"
 ]
 },
@@ -3664,9 +3390,7 @@ var SURFACE = {
 "action",
 "notification"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "OffscreenCanvas": {
 "attributes": [
@@ -3676,7 +3400,6 @@ var SURFACE = {
 "width"
 ],
 "methods": [
-"constructor",
 "convertToBlob",
 "getContext",
 "transferToImageBitmap"
@@ -3714,7 +3437,6 @@ var SURFACE = {
 "methods": [
 "arc",
 "arcTo",
-"attribute",
 "beginPath",
 "bezierCurveTo",
 "clearRect",
@@ -3764,7 +3486,6 @@ var SURFACE = {
 "opaque"
 ],
 "methods": [
-"constructor",
 "from",
 "isSameOrigin",
 "isSameSite"
@@ -3774,26 +3495,20 @@ var SURFACE = {
 "attributes": [
 "viewTransition"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "PageSwapEvent": {
 "attributes": [
 "activation",
 "viewTransition"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "PageTransitionEvent": {
 "attributes": [
 "persisted"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "ParentNode": {
 "attributes": [
@@ -3819,7 +3534,6 @@ var SURFACE = {
 "arcTo",
 "bezierCurveTo",
 "closePath",
-"constructor",
 "ellipse",
 "lineTo",
 "moveTo",
@@ -3944,7 +3658,6 @@ var SURFACE = {
 "width"
 ],
 "methods": [
-"constructor",
 "getCoalescedEvents",
 "getPredictedEvents"
 ]
@@ -3954,9 +3667,7 @@ var SURFACE = {
 "hasUAVisualTransition",
 "state"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "PopoverTargetAttributes": {
 "attributes": [
@@ -3971,7 +3682,6 @@ var SURFACE = {
 "target"
 ],
 "methods": [
-"constructor",
 "getAttribute",
 "getAttributeNames",
 "hasAttribute",
@@ -3987,18 +3697,14 @@ var SURFACE = {
 "loaded",
 "total"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "PromiseRejectionEvent": {
 "attributes": [
 "promise",
 "reason"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "RadioNodeList": {
 "attributes": [
@@ -4016,7 +3722,6 @@ var SURFACE = {
 "collapse",
 "compareBoundaryPoints",
 "comparePoint",
-"constructor",
 "createContextualFragment",
 "deleteContents",
 "detach",
@@ -4063,7 +3768,6 @@ var SURFACE = {
 "blob",
 "bytes",
 "clone",
-"constructor",
 "formData",
 "json",
 "text",
@@ -4073,7 +3777,6 @@ var SURFACE = {
 "ResizeObserver": {
 "attributes": [],
 "methods": [
-"constructor",
 "disconnect",
 "observe",
 "unobserve"
@@ -4113,7 +3816,6 @@ var SURFACE = {
 "blob",
 "bytes",
 "clone",
-"constructor",
 "error",
 "formData",
 "json",
@@ -4128,7 +3830,6 @@ var SURFACE = {
 "allowAttribute",
 "allowElement",
 "allowProcessingInstruction",
-"constructor",
 "get",
 "removeAttribute",
 "removeElement",
@@ -4209,7 +3910,6 @@ var SURFACE = {
 "styleSheets"
 ],
 "methods": [
-"attribute",
 "getAnimations",
 "getHTML",
 "setHTML",
@@ -4221,9 +3921,7 @@ var SURFACE = {
 "onerror",
 "port"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "SharedWorkerGlobalScope": {
 "attributes": [
@@ -4242,9 +3940,7 @@ var SURFACE = {
 },
 "StaticRange": {
 "attributes": [],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "Storage": {
 "attributes": [
@@ -4267,7 +3963,6 @@ var SURFACE = {
 "url"
 ],
 "methods": [
-"constructor",
 "initStorageEvent"
 ]
 },
@@ -4298,9 +3993,7 @@ var SURFACE = {
 "title",
 "type"
 ],
-"methods": [
-"attribute"
-]
+"methods": []
 },
 "StyleSheetList": {
 "attributes": [
@@ -4314,9 +4007,7 @@ var SURFACE = {
 "attributes": [
 "submitter"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "Text": {
 "attributes": [
@@ -4324,7 +4015,6 @@ var SURFACE = {
 "wholeText"
 ],
 "methods": [
-"constructor",
 "convertPointFromNode",
 "convertQuadFromNode",
 "convertRectFromNode",
@@ -4339,7 +4029,6 @@ var SURFACE = {
 "ignoreBOM"
 ],
 "methods": [
-"constructor",
 "decode"
 ]
 },
@@ -4357,16 +4046,13 @@ var SURFACE = {
 "fatal",
 "ignoreBOM"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "TextEncoder": {
 "attributes": [
 "encoding"
 ],
 "methods": [
-"constructor",
 "encode",
 "encodeInto"
 ]
@@ -4381,9 +4067,7 @@ var SURFACE = {
 "attributes": [
 "encoding"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "TextEvent": {
 "attributes": [
@@ -4444,7 +4128,6 @@ var SURFACE = {
 "length"
 ],
 "methods": [
-"TextTrackCue",
 "getCueById"
 ]
 },
@@ -4456,7 +4139,6 @@ var SURFACE = {
 "onremovetrack"
 ],
 "methods": [
-"TextTrack",
 "getTrackById"
 ]
 },
@@ -4475,9 +4157,7 @@ var SURFACE = {
 "oldState",
 "source"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "Touch": {
 "attributes": [
@@ -4497,9 +4177,7 @@ var SURFACE = {
 "target",
 "touchType"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "TouchEvent": {
 "attributes": [
@@ -4512,7 +4190,6 @@ var SURFACE = {
 "touches"
 ],
 "methods": [
-"constructor",
 "getModifierState"
 ]
 },
@@ -4526,10 +4203,7 @@ var SURFACE = {
 },
 "TrackEvent": {
 "attributes": [],
-"methods": [
-"attribute",
-"constructor"
-]
+"methods": []
 },
 "TreeWalker": {
 "attributes": [
@@ -4555,7 +4229,6 @@ var SURFACE = {
 "which"
 ],
 "methods": [
-"constructor",
 "initUIEvent"
 ]
 },
@@ -4576,7 +4249,6 @@ var SURFACE = {
 ],
 "methods": [
 "canParse",
-"constructor",
 "createObjectURL",
 "parse",
 "revokeObjectURL",
@@ -4589,7 +4261,6 @@ var SURFACE = {
 ],
 "methods": [
 "append",
-"constructor",
 "delete",
 "get",
 "getAll",
@@ -4640,7 +4311,6 @@ var SURFACE = {
 "selectedIndex"
 ],
 "methods": [
-"VideoTrack",
 "getTrackById"
 ]
 },
@@ -4676,9 +4346,7 @@ var SURFACE = {
 "deltaZ",
 "momentum"
 ],
-"methods": [
-"constructor"
-]
+"methods": []
 },
 "Window": {
 "attributes": [
@@ -4844,7 +4512,6 @@ var SURFACE = {
 "methods": [
 "alert",
 "atob",
-"attribute",
 "blur",
 "btoa",
 "cancelAnimationFrame",
@@ -4862,7 +4529,6 @@ var SURFACE = {
 "matchMedia",
 "moveBy",
 "moveTo",
-"object",
 "open",
 "postMessage",
 "print",
@@ -4945,7 +4611,6 @@ var SURFACE = {
 "onmessageerror"
 ],
 "methods": [
-"constructor",
 "postMessage",
 "terminate"
 ]
@@ -5034,7 +4699,6 @@ var SURFACE = {
 ],
 "methods": [
 "abort",
-"constructor",
 "getAllResponseHeaders",
 "getResponseHeader",
 "open",
@@ -5058,14 +4722,12 @@ var SURFACE = {
 "XMLSerializer": {
 "attributes": [],
 "methods": [
-"constructor",
 "serializeToString"
 ]
 },
 "XPathEvaluator": {
 "attributes": [],
 "methods": [
-"constructor",
 "createExpression",
 "createNSResolver",
 "evaluate"
@@ -5110,7 +4772,6 @@ var SURFACE = {
 "attributes": [],
 "methods": [
 "clearParameters",
-"constructor",
 "getParameter",
 "importStylesheet",
 "removeParameter",
