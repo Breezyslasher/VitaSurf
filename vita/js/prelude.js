@@ -273,7 +273,16 @@ Event.prototype.preventDefault=function(){this.defaultPrevented=true;};Event.pro
 function CustomEvent(type,init){Event.call(this,type,init);this.detail=init?init.detail:null;}CustomEvent.prototype=Object.create(Event.prototype);
 CustomEvent.prototype.initCustomEvent=function(t,b,c,d){this.initEvent(t,b,c);this.detail=d;};
 W.Event=Event;W.CustomEvent=CustomEvent;W.UIEvent=W.MouseEvent=W.KeyboardEvent=W.FocusEvent=Event;
-W.HTMLDocument=W.Document=function(){};W.Document.prototype=Object.getPrototypeOf(D);
+/* document and window need prototypes of their own. Both used to report
+ * Object.prototype, because each is a plain object here and that is what
+ * it inherits from. A polyfill that patches Document.prototype and
+ * Window.prototype then writes its enumerable accessors straight onto
+ * Object.prototype, after which every for..in on the page -- including
+ * the polyfill's own walk over its descriptor tables -- yields those
+ * names, reads undefined through an inherited getter, and dies on it.
+ * Give each one an empty prototype in the chain instead. */
+var DocumentProto={};Object.setPrototypeOf(D,DocumentProto);
+W.HTMLDocument=W.Document=function(){};W.Document.prototype=DocumentProto;
 W.NodeList=W.HTMLCollection=Array;
 ['CharacterData','Text','Comment','CDATASection','ProcessingInstruction','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});
 /* Interfaces that polyfills enumerate and read .prototype from. They
@@ -284,7 +293,8 @@ W.NodeList=W.HTMLCollection=Array;
  'XMLDocument','DOMImplementation','DOMStringMap','MutationRecord','DOMRect','DOMRectReadOnly',
  'DOMPoint','DOMMatrix','Selection','XPathResult','AnimationEvent','TransitionEvent',
  'HTMLAllCollection','RadioNodeList','ValidityState'].forEach(function(n){if(W[n]===undefined)W[n]=function(){};});
-W.Window=function(){};W.Window.prototype=Object.getPrototypeOf(W);W.Navigator=W.Location=W.History=W.Screen=W.Storage=Storage;
+var WindowProto={};Object.setPrototypeOf(W,WindowProto);
+W.Window=function(){};W.Window.prototype=WindowProto;W.Navigator=W.Location=W.History=W.Screen=W.Storage=Storage;
 W.MutationObserver=function(){};W.MutationObserver.prototype.observe=W.MutationObserver.prototype.disconnect=function(){};W.MutationObserver.prototype.takeRecords=function(){return [];};
 W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;
 W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};
