@@ -116,6 +116,51 @@ P.querySelectorAll=function(sel){return select(this,sel,true);};
 P.querySelector=function(sel){var r=select(this,sel,false);return r.length?r[0]:null;};
 P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchesCompound(el,g);});};
 P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))return n;n=n.parentNode;}return null;};
+/* The rest of the modern node surface. Polyfills walk these names and
+ * read a descriptor for each, so a missing one is not a shim gap to fill
+ * later: it throws where the polyfill patches, and takes the page with
+ * it. They are ordinary DOM besides. */
+Object.defineProperty(P,'nextElementSibling',{configurable:true,get:function(){var n=this.nextSibling;while(n&&n.nodeType!==1)n=n.nextSibling;return n||null;}});
+Object.defineProperty(P,'previousElementSibling',{configurable:true,get:function(){var n=this.previousSibling;while(n&&n.nodeType!==1)n=n.previousSibling;return n||null;}});
+Object.defineProperty(P,'childElementCount',{configurable:true,get:function(){return this.children.length;}});
+Object.defineProperty(P,'localName',{configurable:true,get:function(){var t=this.tagName;return t?t.toLowerCase():'';}});
+Object.defineProperty(P,'namespaceURI',{configurable:true,get:function(){return 'http://www.w3.org/1999/xhtml';}});
+Object.defineProperty(P,'prefix',{configurable:true,get:function(){return null;}});
+Object.defineProperty(P,'baseURI',{configurable:true,get:function(){return location.href;}});
+Object.defineProperty(P,'assignedSlot',{configurable:true,get:function(){return null;}});
+Object.defineProperty(P,'slot',{configurable:true,get:function(){var v=this.getAttribute('slot');return v===null?'':v;},set:function(v){this.setAttribute('slot',String(v));}});
+/* Turn each argument into a node: a string becomes a text node. */
+function toNodes(args){var out=[];for(var i=0;i<args.length;i++){var a=args[i];out.push(a&&a.nodeType?a:D.createTextNode(String(a)));}return out;}
+P.append=function(){var n=toNodes(arguments);for(var i=0;i<n.length;i++)this.appendChild(n[i]);};
+P.prepend=function(){var n=toNodes(arguments),f=this.firstChild;for(var i=0;i<n.length;i++){if(f)this.insertBefore(n[i],f);else this.appendChild(n[i]);}};
+P.replaceChildren=function(){var c=this.childNodes.slice();for(var i=0;i<c.length;i++)this.removeChild(c[i]);P.append.apply(this,arguments);};
+P.remove=function(){var p=this.parentNode;if(p)p.removeChild(this);};
+P.before=function(){var p=this.parentNode;if(!p)return;var n=toNodes(arguments);for(var i=0;i<n.length;i++)p.insertBefore(n[i],this);};
+P.after=function(){var p=this.parentNode;if(!p)return;var n=toNodes(arguments),ref=this.nextSibling;for(var i=0;i<n.length;i++){if(ref)p.insertBefore(n[i],ref);else p.appendChild(n[i]);}};
+P.replaceWith=function(){P.before.apply(this,arguments);this.remove();};
+P.normalize=function(){};
+P.hasAttributes=function(){return this.attributes.length>0;};
+P.getAttributeNode=function(n){var v=this.getAttribute(n);return v===null?null:{name:String(n),value:v,specified:true};};
+P.getAttributeNS=function(ns,n){return this.getAttribute(n);};
+P.setAttributeNS=function(ns,n,v){return this.setAttribute(n,v);};
+P.removeAttributeNS=function(ns,n){return this.removeAttribute(n);};
+P.hasAttributeNS=function(ns,n){return this.hasAttribute(n);};
+P.getElementsByTagNameNS=function(ns,t){return this.getElementsByTagName(t);};
+P.insertAdjacentElement=function(where,el){
+ switch(String(where).toLowerCase()){
+  case 'beforebegin':P.before.call(this,el);break;
+  case 'afterbegin':P.prepend.call(this,el);break;
+  case 'beforeend':this.appendChild(el);break;
+  case 'afterend':P.after.call(this,el);break;
+ }
+ return el;
+};
+P.insertAdjacentText=function(where,t){return P.insertAdjacentElement.call(this,where,D.createTextNode(String(t)));};
+P.insertAdjacentHTML=function(where,html){
+ var tmp=D.createElement('div');tmp.innerHTML=String(html);
+ var kids=tmp.childNodes.slice();
+ for(var i=0;i<kids.length;i++)P.insertAdjacentElement.call(this,where,kids[i]);
+};
 P.dispatchEvent=function(e){return __vitaDispatch(this,e);};P.getContext=function(){return null;};
 P.add=function(o,before){this.insertBefore(o,before||null);};
 Object.defineProperty(P,'options',{get:function(){return this.getElementsByTagName('option');}});
