@@ -47,13 +47,56 @@ P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return f
 P.hasChildNodes=function(){return this.firstChild!==null;};
 P.remove=function(){var p=this.parentNode;if(p)p.removeChild(this);};
 P.getElementsByClassName=function(c){return this.querySelectorAll('.'+c);};
-function parseSimple(sel){var m=sel.match(/^([a-zA-Z][\w-]*|\*)?(#[\w-]+)?((?:\.[\w-]+)*)(\[[^\]]*\])?$/);if(!m)return null;return {tag:m[1]&&m[1]!=='*'?m[1].toUpperCase():null,id:m[2]?m[2].slice(1):null,classes:m[3]?m[3].split('.').slice(1):[],attr:m[4]?m[4].slice(1,-1).split('=')[0].replace(/"/g,''):null};}
-function matchSimple(el,q){if(el.nodeType!==1)return false;if(q.tag&&el.tagName.toUpperCase()!==q.tag)return false;if(q.id&&el.id!==q.id)return false;for(var i=0;i<q.classes.length;i++)if(!el.classList.contains(q.classes[i]))return false;if(q.attr&&!el.hasAttribute(q.attr))return false;return true;}
-function matchesCompound(el,parts){var i=parts.length-1;if(!matchSimple(el,parts[i]))return false;var n=el.parentNode;i--;while(i>=0&&n&&n.nodeType===1){if(matchSimple(n,parts[i]))i--;n=n.parentNode;}return i<0;}
-function compile(selector){return selector.split(',').map(function(s){return s.trim().split(/\s*>\s*|\s+/).map(parseSimple);}).filter(function(p){return p.every(function(x){return x;});});}
-function collect(root,groups,all,out){var c=root.firstChild;while(c){if(c.nodeType===1){for(var g=0;g<groups.length;g++){if(matchesCompound(c,groups[g])){out.push(c);break;}}if(!all&&out.length)return out;collect(c,groups,all,out);if(!all&&out.length)return out;}c=c.nextSibling;}return out;}
-P.querySelectorAll=function(sel){return collect(this,compile(String(sel)),true,[]);};
-P.querySelector=function(sel){var r=collect(this,compile(String(sel)),false,[]);return r.length?r[0]:null;};
+/* Selector engine. Matching walks upwards from a candidate rather than
+   down from the root, and the candidates come from getElementsByTagName,
+   which is a single call into libdom. A tree walk in JavaScript over a
+   document the size of a Wikipedia article costs seconds on the Vita. */
+var SIMPLE_RE=/^([a-zA-Z][\w-]*|\*)?(#[\w-]+)?((?:\.[\w-]+)*)((?:\[[^\]]*\])*)(?::[\w-]+(?:\([^)]*\))?)*$/;
+var ATTR_RE=/\[\s*([\w-]+)\s*(?:([~^$*|]?=)\s*("[^"]*"|'[^']*'|[^\]]*?)\s*)?\]/g;
+function parseSimple(sel){var m=SIMPLE_RE.exec(sel);if(!m)return null;
+ var attrs=[],a;ATTR_RE.lastIndex=0;
+ while(m[4]&&(a=ATTR_RE.exec(m[4]))){attrs.push({name:a[1],op:a[2]||null,val:a[3]===undefined?null:String(a[3]).replace(/^["']|["']$/g,'')});}
+ return {tag:m[1]&&m[1]!=='*'?m[1].toUpperCase():null,id:m[2]?m[2].slice(1):null,
+  classes:m[3]?m[3].split('.').slice(1):[],attrs:attrs};}
+function attrOk(el,q){var v=el.getAttribute(q.name);if(v===null)return false;if(!q.op)return true;
+ switch(q.op){case '=':return v===q.val;case '^=':return v.indexOf(q.val)===0;
+ case '$=':return q.val.length<=v.length&&v.indexOf(q.val,v.length-q.val.length)>=0;
+ case '*=':return v.indexOf(q.val)>=0;
+ case '~=':return (' '+v+' ').indexOf(' '+q.val+' ')>=0;
+ case '|=':return v===q.val||v.indexOf(q.val+'-')===0;default:return false;}}
+function matchSimple(el,q){if(el.nodeType!==1)return false;
+ if(q.tag&&el.tagName!==q.tag)return false;
+ if(q.id&&el.id!==q.id)return false;
+ if(q.classes.length){var cn=el.className;if(!cn)return false;cn=' '+cn+' ';
+  for(var i=0;i<q.classes.length;i++)if(cn.indexOf(' '+q.classes[i]+' ')<0)return false;}
+ for(var j=0;j<q.attrs.length;j++)if(!attrOk(el,q.attrs[j]))return false;
+ return true;}
+function matchesCompound(el,parts){var i=parts.length-1;if(!matchSimple(el,parts[i]))return false;
+ var n=el.parentNode;i--;
+ while(i>=0&&n&&n.nodeType===1){if(matchSimple(n,parts[i]))i--;n=n.parentNode;}
+ return i<0;}
+function compile(selector){return selector.split(',').map(function(s){
+ return s.replace(/^\s+|\s+$/g,'').split(/\s*>\s*|\s+/).map(parseSimple);})
+ .filter(function(p){return p.length&&p.every(function(x){return x;});});}
+function isInside(root,el){if(root.nodeType===9)return true;var n=el.parentNode;while(n){if(n===root)return true;n=n.parentNode;}return false;}
+function select(root,sel,all){
+ var groups=compile(String(sel)),out=[];
+ if(!groups.length)return out;
+ /* one group ending in an id: ask the document directly */
+ if(groups.length===1){var key=groups[0][groups[0].length-1];
+  if(key.id&&!key.classes.length){var el=document.getElementById(key.id);
+   if(el&&isInside(root,el)&&matchesCompound(el,groups[0]))out.push(el);
+   return out;}}
+ /* candidates for the right-hand simple selector of every group, found
+    in one pass through the tree in C (qjs.c) */
+ var keys=groups.map(function(g){return g[g.length-1];});
+ var cand=__vitaFind(root.nodeType===9?null:root,keys);
+ for(var i=0;i<cand.length;i++){var c=cand[i];
+  for(var g=0;g<groups.length;g++){if(matchesCompound(c,groups[g])){out.push(c);break;}}
+  if(!all&&out.length)return out;}
+ return out;}
+P.querySelectorAll=function(sel){return select(this,sel,true);};
+P.querySelector=function(sel){var r=select(this,sel,false);return r.length?r[0]:null;};
 P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchesCompound(el,g);});};
 P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))return n;n=n.parentNode;}return null;};
 P.dispatchEvent=function(e){return __vitaDispatch(this,e);};P.getContext=function(){return null;};

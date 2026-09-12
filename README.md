@@ -131,6 +131,20 @@ tree, so the wait between rebuilds grows with how long the last one took,
 up to two seconds, and a script that reads geometry on a document that is
 slow to lay out gets the last known values rather than forcing a rebuild.
 
+The rebuild runs through NetSurf's own conversion, which yields to the
+scheduler as it goes, so a long document does not stall the frame. While
+it runs the content has no box tree, so layout, hit testing and the
+object callbacks check for that and wait. A script that reads geometry
+right after changing the document reads the previous layout rather than
+forcing a rebuild from under code that holds box pointers.
+
+Selector queries are matched from the right: the candidates for the
+right-hand simple selector of every group in the list come from one pass
+through the tree in C, and only those are checked against the rest of the
+selector. Walking the tree in JavaScript instead, and wrapping every node
+on the way, cost around 300 ms per class lookup on a Wikipedia article
+here and blew the script time budget on the Vita.
+
 The bindings also give scripts the real page geometry (`offsetWidth` and
 friends, `getBoundingClientRect`, `scrollWidth`, the window's scroll
 offsets and viewport size), working `scrollTo`, `scrollBy` and

@@ -103,7 +103,6 @@ struct jsthread {
 	bool closed;
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
-	unsigned relayout_ms;     /**< how long the last rebuild took */
 	int event_depth;          /**< DOM event dispatches in progress */
 	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
 	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
@@ -141,7 +140,6 @@ static int next_timer_handle = 1;
 #define RELAYOUT_DELAY_MS 40    /**< coalesce a burst of handlers into one */
 #define RELAYOUT_RETRY_MS 500   /**< page busy (dragging, typing): try later */
 #define RELAYOUT_MAX_DELAY_MS 2000 /**< longest wait a slow page earns */
-#define RELAYOUT_SYNC_LIMIT_MS 250 /**< above this, reads take stale geometry */
 
 /* ------------------------------------------------------------------------ */
 /* Small helpers                                                            */
@@ -1527,7 +1525,6 @@ static void relayout_callback(void *p)
 	jsthread *thread = p;
 	html_content *htmlc;
 	nserror err;
-	uint64_t t0, t1;
 
 	thread->relayout_pending = false;
 	if (thread->closed || !thread->dom_dirty) {
@@ -1549,43 +1546,32 @@ static void relayout_callback(void *p)
 		}
 		return;
 	}
-	t0 = now_ms();
 	err = html_relayout(htmlc);
 	if (err == NSERROR_INVALID) {
+		/* busy, or a rebuild is already running */
 		guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
 		thread->relayout_pending = true;
 		return;
 	}
 	thread->dom_dirty = false;
-	t1 = now_ms();
-	thread->relayout_ms = (unsigned)(t1 - t0);
-	vita_log("qjs: layout rebuilt after script changes in %u ms%s",
-		 thread->relayout_ms, err == NSERROR_OK ? "" : " (failed)");
+	vita_log("qjs: rebuilding the layout after script changes%s",
+		 err == NSERROR_OK ? "" : " (failed to start)");
 }
 
 /*
- * A rebuild costs the whole box tree, which on a long document is tens of
- * milliseconds here and considerably more on the Vita. A page that keeps
- * touching the DOM therefore waits longer between rebuilds the slower its
- * last one was, rather than spending the whole frame budget on layout.
+ * A rebuild costs the whole box tree, so changes are coalesced. While the
+ * page is still loading more are certain to come, and a rebuild already
+ * running makes html_relayout() ask to be called back later, so at most
+ * one runs at a time.
  */
 static void schedule_relayout(jsthread *thread, int ms)
 {
-	int floor_ms;
-
 	if (thread->relayout_pending || thread->closed) {
 		return;
 	}
-	floor_ms = (int)thread->relayout_ms * 4;
-	if (thread->htmlc != NULL && thread->htmlc->base.active > 0) {
-		/* still loading: more changes are coming, so batch them */
-		floor_ms = RELAYOUT_MAX_DELAY_MS;
-	}
-	if (floor_ms > RELAYOUT_MAX_DELAY_MS) {
-		floor_ms = RELAYOUT_MAX_DELAY_MS;
-	}
-	if (ms < floor_ms) {
-		ms = floor_ms;
+	if (thread->htmlc != NULL && thread->htmlc->base.active > 0 &&
+	    ms < RELAYOUT_MAX_DELAY_MS) {
+		ms = RELAYOUT_MAX_DELAY_MS;
 	}
 	if (guit->misc->schedule(ms, relayout_callback, thread) == NSERROR_OK) {
 		thread->relayout_pending = true;
@@ -1593,29 +1579,17 @@ static void schedule_relayout(jsthread *thread, int ms)
 }
 
 /*
- * Make the layout reflect the DOM before a script reads geometry. Only
- * safe when no NetSurf code holding box pointers is on the stack, which
- * is the case unless a DOM event NetSurf itself dispatched (a click from
- * the input layer) is being handled.
+ * Whether there is a layout to read geometry from. A rebuild after a DOM
+ * change runs from the scheduler, not from here: NetSurf's conversion
+ * yields as it goes and code holding box pointers can be on the stack, so
+ * a script that measures right after changing the document reads the
+ * previous layout rather than forcing one.
  */
 static bool layout_current(jsthread *thread)
 {
 	html_content *htmlc = thread->htmlc;
 
-	if (htmlc == NULL) {
-		return false;
-	}
-	if (thread->dom_dirty && htmlc->layout != NULL &&
-	    thread->event_depth == thread->js_dispatch_depth &&
-	    thread->relayout_ms <= RELAYOUT_SYNC_LIMIT_MS) {
-		uint64_t t0 = now_ms();
-
-		if (html_relayout(htmlc) == NSERROR_OK) {
-			thread->dom_dirty = false;
-			thread->relayout_ms = (unsigned)(now_ms() - t0);
-		}
-	}
-	return htmlc->layout != NULL;
+	return htmlc != NULL && htmlc->layout != NULL;
 }
 
 static void timer_callback(void *p)
@@ -2219,6 +2193,268 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Selector candidate search                                                */
+
+/*
+ * The right-hand simple selector of each group in a selector list, as
+ * prelude.js compiled it. Matching these in C and handing back only the
+ * elements that pass keeps the selector engine from wrapping every node
+ * in the document: a class lookup over a long article was hundreds of
+ * milliseconds per query before this.
+ */
+struct find_key {
+	char *tag;        /**< upper case element name, or NULL for any */
+	char *id;         /**< id attribute to match, or NULL */
+	char **classes;   /**< class names that must all be present */
+	int nclasses;
+};
+
+static void free_keys(struct find_key *keys, int n)
+{
+	int i, j;
+
+	for (i = 0; i < n; i++) {
+		free(keys[i].tag);
+		free(keys[i].id);
+		for (j = 0; j < keys[i].nclasses; j++) {
+			free(keys[i].classes[j]);
+		}
+		free(keys[i].classes);
+	}
+	free(keys);
+}
+
+/** strdup of a JS string property, or NULL when absent. */
+static char *key_string(JSContext *ctx, JSValueConst obj, const char *name)
+{
+	JSValue v = JS_GetPropertyStr(ctx, obj, name);
+	const char *cs;
+	char *out = NULL;
+
+	if (!JS_IsString(v)) {
+		JS_FreeValue(ctx, v);
+		return NULL;
+	}
+	cs = JS_ToCString(ctx, v);
+	if (cs != NULL) {
+		out = strdup(cs);
+		JS_FreeCString(ctx, cs);
+	}
+	JS_FreeValue(ctx, v);
+	return out;
+}
+
+static struct find_key *build_keys(JSContext *ctx, JSValueConst arr, int *count)
+{
+	struct find_key *keys;
+	uint32_t n = 0, i;
+	JSValue len = JS_GetPropertyStr(ctx, arr, "length");
+
+	JS_ToUint32(ctx, &n, len);
+	JS_FreeValue(ctx, len);
+	if (n == 0 || n > 64) {
+		return NULL;
+	}
+	keys = calloc(n, sizeof(*keys));
+	if (keys == NULL) {
+		return NULL;
+	}
+	for (i = 0; i < n; i++) {
+		JSValue k = JS_GetPropertyUint32(ctx, arr, i);
+		JSValue cls, clen;
+		uint32_t c = 0, j;
+
+		keys[i].tag = key_string(ctx, k, "tag");
+		keys[i].id = key_string(ctx, k, "id");
+		cls = JS_GetPropertyStr(ctx, k, "classes");
+		clen = JS_GetPropertyStr(ctx, cls, "length");
+		JS_ToUint32(ctx, &c, clen);
+		JS_FreeValue(ctx, clen);
+		if (c > 0 && c <= 16) {
+			keys[i].classes = calloc(c, sizeof(char *));
+			if (keys[i].classes != NULL) {
+				for (j = 0; j < c; j++) {
+					JSValue cv = JS_GetPropertyUint32(ctx, cls, j);
+					const char *cs = JS_ToCString(ctx, cv);
+
+					if (cs != NULL) {
+						keys[i].classes[keys[i].nclasses++] = strdup(cs);
+						JS_FreeCString(ctx, cs);
+					}
+					JS_FreeValue(ctx, cv);
+				}
+			}
+		}
+		JS_FreeValue(ctx, cls);
+		JS_FreeValue(ctx, k);
+	}
+	*count = (int)n;
+	return keys;
+}
+
+/** Whether a class attribute contains name as a whole word. */
+static bool class_present(const char *list, size_t len, const char *name)
+{
+	size_t nlen = strlen(name);
+	size_t i = 0;
+
+	while (i < len) {
+		size_t start;
+
+		while (i < len && (list[i] == ' ' || list[i] == '\t' ||
+				   list[i] == '\n' || list[i] == '\r' ||
+				   list[i] == '\f')) {
+			i++;
+		}
+		start = i;
+		while (i < len && !(list[i] == ' ' || list[i] == '\t' ||
+				    list[i] == '\n' || list[i] == '\r' ||
+				    list[i] == '\f')) {
+			i++;
+		}
+		if (i - start == nlen && memcmp(list + start, name, nlen) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool key_matches(struct dom_node *n, const struct find_key *k,
+			dom_string *tag, dom_string *id, dom_string *cls)
+{
+	int i;
+
+	(void)n;
+	if (k->tag != NULL) {
+		size_t tl = strlen(k->tag);
+
+		if (tag == NULL || dom_string_byte_length(tag) != tl ||
+		    strncasecmp(dom_string_data(tag), k->tag, tl) != 0) {
+			return false;
+		}
+	}
+	if (k->id != NULL) {
+		size_t il = strlen(k->id);
+
+		if (id == NULL || dom_string_byte_length(id) != il ||
+		    memcmp(dom_string_data(id), k->id, il) != 0) {
+			return false;
+		}
+	}
+	for (i = 0; i < k->nclasses; i++) {
+		if (cls == NULL ||
+		    !class_present(dom_string_data(cls),
+				   dom_string_byte_length(cls),
+				   k->classes[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * __vitaFind(root, keys): every element under root matching at least one
+ * key, in document order. root may be a node or null for the document.
+ */
+static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *root = NULL, *n = NULL;
+	struct find_key *keys;
+	int nkeys = 0, i;
+	uint32_t out_n = 0;
+	JSValue out;
+
+	(void)this_val;
+	if (argc < 2 || thread == NULL) {
+		return JS_NewArray(ctx);
+	}
+	if (JS_IsObject(argv[0])) {
+		root = JS_GetOpaque(argv[0], node_class_id);
+	}
+	if (root == NULL) {
+		root = (struct dom_node *)thread_document(thread);
+	}
+	if (root == NULL) {
+		return JS_NewArray(ctx);
+	}
+	keys = build_keys(ctx, argv[1], &nkeys);
+	if (keys == NULL) {
+		return JS_NewArray(ctx);
+	}
+
+	out = JS_NewArray(ctx);
+	/* iterative pre-order walk; root itself is not a candidate */
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+		dom_node_type type = DOM_ELEMENT_NODE;
+
+		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_string *tag = NULL, *id = NULL, *cls = NULL;
+			bool want_id = false, want_cls = false;
+
+			for (i = 0; i < nkeys; i++) {
+				if (keys[i].id != NULL) want_id = true;
+				if (keys[i].nclasses > 0) want_cls = true;
+			}
+			dom_element_get_tag_name(n, &tag);
+			if (want_id) {
+				dom_element_get_attribute(n, corestring_dom_id, &id);
+			}
+			if (want_cls) {
+				dom_element_get_attribute(n, corestring_dom_class, &cls);
+			}
+			for (i = 0; i < nkeys; i++) {
+				if (key_matches(n, &keys[i], tag, id, cls)) {
+					JS_SetPropertyUint32(ctx, out, out_n++,
+							     wrap_node(ctx, n));
+					break;
+				}
+			}
+			if (tag != NULL) dom_string_unref(tag);
+			if (id != NULL) dom_string_unref(id);
+			if (cls != NULL) dom_string_unref(cls);
+		}
+
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) == DOM_NO_ERR &&
+				    sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) != DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	free_keys(keys, nkeys);
+	return out;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Geometry, scrolling and event dispatch                                   */
 
 static void set_index(JSContext *ctx, JSValue arr, int i, int v)
@@ -2508,6 +2744,8 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_fetch_abort, "__vitaFetchAbort", 1));
 
 	/* layout geometry, scrolling and event dispatch (prelude.js) */
+	JS_SetPropertyStr(ctx, global, "__vitaFind",
+			  JS_NewCFunction(ctx, win_vita_find, "__vitaFind", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaScroll",

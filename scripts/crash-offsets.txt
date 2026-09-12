@@ -1,4 +1,13 @@
-# Text-segment offsets from crash dumps (VitaSurf@1 + offset), one per
-# line; the CI symbol map step prints the functions around each one.
-# Build 62: data abort after pressing reload on en.wikipedia.org.
-0x6d2ba
+# Offsets into the VitaSurf text segment to resolve in the CI log.
+# Build 86 crash loading Wikipedia: data abort on the main thread,
+# module text base 0x8102f000, r0 = 0 (null pointer).
+0xc32a2
+0xc3298
+0x9332e
+0x11a176
+0xe841c
+0xeeb58
+0x1073a2
+0xf0d40
+0xe82b0
+0x352e60

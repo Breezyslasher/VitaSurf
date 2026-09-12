@@ -41,103 +41,8 @@ index c17caadcb..2af10bfd5 100644
 +void nscss_clear_node_data(dom_node *n);
 +
  #endif
-diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
-index f36f94cc5..2952f68cb 100644
---- a/content/handlers/html/box_construct.c
-+++ b/content/handlers/html/box_construct.c
-@@ -62,6 +62,8 @@ struct box_construct_ctx {
- 	box_construct_complete_cb cb;	/**< Callback to invoke on completion */
- 
- 	int *bctx;			/**< talloc context */
-+
-+	bool sync;			/**< Run to completion without yielding (VitaSurf) */
- };
- 
- /**
-@@ -1363,7 +1365,7 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
- 			free(ctx);
- 			return;
- 		}
--	} while (++num_processed < max_processed_before_yield);
-+	} while (++num_processed < max_processed_before_yield || ctx->sync);
- 
- 	/* More work to do: schedule a continuation */
- 	guit->misc->schedule(0, (void *)convert_xml_to_box, ctx);
-@@ -1399,6 +1401,7 @@ dom_to_box(dom_node *n,
- 	ctx->root_box = NULL;
- 	ctx->cb = cb;
- 	ctx->bctx = c->bctx;
-+	ctx->sync = false;
- 
- 	*box_conversion_context = ctx;
- 
-@@ -1406,6 +1409,41 @@ dom_to_box(dom_node *n,
- }
- 
- 
-+/* exported function documented in html/box_construct.h */
-+nserror
-+dom_to_box_sync(dom_node *n,
-+		html_content *c,
-+		box_construct_complete_cb cb)
-+{
-+	struct box_construct_ctx *ctx;
-+
-+	if (c->bctx == NULL) {
-+		/* create a context allocation for this box tree */
-+		c->bctx = talloc_zero(0, int);
-+		if (c->bctx == NULL) {
-+			return NSERROR_NOMEM;
-+		}
-+	}
-+
-+	ctx = malloc(sizeof(*ctx));
-+	if (ctx == NULL) {
-+		return NSERROR_NOMEM;
-+	}
-+
-+	ctx->content = c;
-+	ctx->n = dom_node_ref(n);
-+	ctx->root_box = NULL;
-+	ctx->cb = cb;
-+	ctx->bctx = c->bctx;
-+	ctx->sync = true;
-+
-+	/* runs the whole conversion, calls cb and frees ctx */
-+	convert_xml_to_box(ctx);
-+
-+	return NSERROR_OK;
-+}
-+
-+
- /* exported function documented in html/box_construct.h */
- nserror cancel_dom_to_box(void *box_conversion_context)
- {
-diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
-index f4bd119b1..2afebc24f 100644
---- a/content/handlers/html/box_construct.h
-+++ b/content/handlers/html/box_construct.h
-@@ -83,6 +83,18 @@
-  */
- nserror dom_to_box(struct dom_node *n, struct html_content *c, box_construct_complete_cb cb, void **box_conversion_context);
- 
-+/**
-+ * Construct a box tree from a dom in one go, without yielding to the
-+ * scheduler (VitaSurf). Used to rebuild the layout after scripts changed
-+ * the document; the callback runs before this returns.
-+ *
-+ * \param n  root dom node to make boxes from
-+ * \param c  content of the html document
-+ * \param cb callback to invoke on completion
-+ * \return NSERROR_OK on success or error code on failure
-+ */
-+nserror dom_to_box_sync(struct dom_node *n, struct html_content *c, box_construct_complete_cb cb);
-+
- 
- /**
-  * aborts any ongoing box construction
 diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
-index f92985b04..03cc0916f 100644
+index f92985b04..3bab14edd 100644
 --- a/content/handlers/html/html.c
 +++ b/content/handlers/html/html.c
 @@ -50,6 +50,7 @@
@@ -287,7 +192,21 @@ index f92985b04..03cc0916f 100644
  	}
  
  	dom_node_unref(html);
-@@ -1101,6 +1116,170 @@ static void html_reformat(struct content *c, int width, int height)
+@@ -1058,6 +1073,13 @@ static void html_reformat(struct content *c, int width, int height)
+ 	uint64_t ms_after;
+ 	uint64_t ms_interval;
+ 
++	if (htmlc->layout == NULL) {
++		/* A rebuild from a script-modified document is in flight
++		 * and the old tree is gone; the rebuild lays out when it
++		 * finishes (VitaSurf). */
++		return;
++	}
++
+ 	nsu_getmonotonic_ms(&ms_before);
+ 
+ 	htmlc->reflowing = true;
+@@ -1101,6 +1123,178 @@ static void html_reformat(struct content *c, int width, int height)
  }
  
  
@@ -347,6 +266,8 @@ index f92985b04..03cc0916f 100644
 + */
 +static void html_relayout_done(html_content *c, bool success)
 +{
++	c->box_conversion_context = NULL;
++
 +	if (success == false || c->layout == NULL) {
 +		NSLOG(netsurf, ERROR, "box tree rebuild failed (content %p)", c);
 +		content_broadcast_error(&c->base, NSERROR_BOX_CONVERT, NULL);
@@ -449,8 +370,14 @@ index f92985b04..03cc0916f 100644
 +		return NSERROR_NOMEM;
 +	}
 +
-+	err = dom_to_box_sync(html, htmlc, html_relayout_done);
++	/* NetSurf's own conversion, which yields to the scheduler as it
++	 * goes, so a long document does not stall the frame */
++	err = dom_to_box(html, htmlc, html_relayout_done,
++			 &htmlc->box_conversion_context);
 +	dom_node_unref(html);
++	if (err != NSERROR_OK) {
++		htmlc->box_conversion_context = NULL;
++	}
 +	return err;
 +}
 +
@@ -458,6 +385,50 @@ index f92985b04..03cc0916f 100644
  /**
   * Redraw a box.
   *
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 8e0dd1c8a..e37556b45 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -681,6 +681,13 @@ get_mouse_action_node(html_content *html,
+ 
+ 	/* initialise the mouse action state data */
+ 	memset(man, 0, sizeof(struct mouse_action_state));
++
++	if (html->layout == NULL) {
++		/* the box tree is being rebuilt from a script-modified
++		 * document; there is nothing under the pointer (VitaSurf) */
++		return NSERROR_INVALID;
++	}
++
+ 	man->node = html->layout->node; /* Default dom node to the <HTML> */
+ 	man->result.pointer = BROWSER_POINTER_DEFAULT;
+ 
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index a26ca496f..2e45e28fb 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -190,8 +190,9 @@ html_object_callback(hlcache_handle *object,
+ 
+ 			/* Adjust parent content for new object size */
+ 			html_object_done(box, object, o->background, o->mask);
+-			if (c->base.status == CONTENT_STATUS_READY ||
+-					c->base.status == CONTENT_STATUS_DONE)
++			if (c->layout != NULL &&
++					(c->base.status == CONTENT_STATUS_READY ||
++					c->base.status == CONTENT_STATUS_DONE))
+ 				content__reformat(&c->base, false,
+ 						c->base.available_width,
+ 						c->base.available_height);
+@@ -208,7 +209,8 @@ html_object_callback(hlcache_handle *object,
+ 				box->flags & REPLACE_DIM) {
+ 			union content_msg_data data;
+ 
+-			if (c->had_initial_layout == false) {
++			if (c->had_initial_layout == false ||
++					c->layout == NULL) {
+ 				break;
+ 			}
+ 
 diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
 index 56cd957d5..1a531c3cc 100644
 --- a/content/handlers/html/private.h
