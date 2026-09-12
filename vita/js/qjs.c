@@ -3624,18 +3624,44 @@ static void set_import_meta(JSContext *ctx, JSValueConst func_val,
  * Those are named in the log and the import fails, which leaves the
  * importing module unevaluated rather than the whole page dead.
  */
+/*
+ * The same module, without the cache-busting parameter a bundler adds
+ * when it retries a chunk that failed to load. webpack appends "?&r=1",
+ * then "?&r=2", to the same file, and matching those literally against
+ * what the page fetched would miss every time.
+ */
+static const char *without_retry_suffix(const char *url, char *buf, size_t len)
+{
+	const char *q = strstr(url, "?&r=");
+	size_t n;
+
+	if (q == NULL) {
+		return url;
+	}
+	n = (size_t)(q - url);
+	if (n >= len) {
+		return url;
+	}
+	memcpy(buf, url, n);
+	buf[n] = 0;
+	return buf;
+}
+
 static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 				      void *opaque)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	unsigned int i, fetched = 0;
 	bool unready = false;
+	char stripped[1024];
+	const char *want;
 
 	(void)opaque;
 	if (thread == NULL || name == NULL) {
 		JS_ThrowReferenceError(ctx, "could not load module");
 		return NULL;
 	}
+	want = without_retry_suffix(name, stripped, sizeof(stripped));
 
 	/*
 	 * The page may already have the module's source: a
@@ -3659,7 +3685,7 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 			}
 			fetched++;
 			if (strcmp(nsurl_access(hlcache_handle_get_url(
-					sc->data.handle)), name) != 0) {
+					sc->data.handle)), want) != 0) {
 				continue;
 			}
 			if (content_get_status(sc->data.handle) !=
@@ -3695,6 +3721,25 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 			vita_log("qjs: compiled module for import '%s' "
 				 "(%u KB)", name, (unsigned)(size / 1024));
 			return m;
+		}
+	}
+
+	/*
+	 * Nothing has it. Start a fetch anyway: a bundler that splits its
+	 * code imports a chunk it never named in the document, and then
+	 * retries the same chunk a few times a second apart when the
+	 * import fails. This one fails too, but the retry can find it.
+	 */
+	if (!unready && thread->htmlc != NULL &&
+	    strstr(want, "://") != NULL) {
+		dom_string *href = to_dom_string(want);
+
+		if (href != NULL) {
+			if (html_process_module_preload(thread->htmlc, href)) {
+				vita_log("qjs: fetching '%s' for a retry",
+					 want);
+			}
+			dom_string_unref(href);
 		}
 	}
 

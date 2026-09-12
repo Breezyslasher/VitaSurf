@@ -1,13 +1,12 @@
 diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
-index 83a84ac7b..80d280c00 100644
+index 83a84ac7b..8621f5649 100644
 --- a/content/handlers/html/dom_event.c
 +++ b/content/handlers/html/dom_event.c
-@@ -168,6 +168,28 @@ static bool html_process_inserted_link(html_content *c, dom_node *node)
+@@ -168,6 +168,26 @@ static bool html_process_inserted_link(html_content *c, dom_node *node)
  	/* Handle stylesheet loading */
  	html_css_process_link(c, (dom_node *)node);
  
-+#ifdef __vita__
-+	/* Handle a preloaded ES module */
++	/* Handle a preloaded ES module (VitaSurf) */
 +	{
 +		dom_string *rel = NULL, *href = NULL;
 +
@@ -26,23 +25,20 @@ index 83a84ac7b..80d280c00 100644
 +			dom_string_unref(rel);
 +		}
 +	}
-+#endif
 +
  	/* try Generic link handling */
  
  	memset(&link, 0, sizeof(struct content_rfc5988_link));
 diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
-index 7ce4dd128..73e4e2aa4 100644
+index 7ce4dd128..1cd83a212 100644
 --- a/content/handlers/html/html.h
 +++ b/content/handlers/html/html.h
-@@ -71,7 +71,20 @@ struct html_script {
+@@ -71,7 +71,17 @@ struct html_script {
  	enum html_script_type { HTML_SCRIPT_INLINE,
  				HTML_SCRIPT_SYNC,
  				HTML_SCRIPT_DEFER,
 -				HTML_SCRIPT_ASYNC } type;
-+				HTML_SCRIPT_ASYNC
-+#ifdef __vita__
-+				,
++				HTML_SCRIPT_ASYNC,
 +				/**
 +				 * An ES module named by
 +				 * <link rel="modulepreload">. It is fetched
@@ -52,44 +48,40 @@ index 7ce4dd128..73e4e2aa4 100644
 +				 * at which a module's body is meant to run.
 +				 */
 +				HTML_SCRIPT_PRELOAD
-+#endif
 +	} type;
  	union {
  		struct hlcache_handle *handle;
  		struct dom_string *string;
 diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
-index 1a531c3cc..8f4f80f2b 100644
+index 1a531c3cc..2bbffedb9 100644
 --- a/content/handlers/html/private.h
 +++ b/content/handlers/html/private.h
-@@ -313,6 +313,17 @@ bool html_redraw_inline_borders(struct box *box, struct rect b,
+@@ -313,6 +313,15 @@ bool html_redraw_inline_borders(struct box *box, struct rect b,
  /* in html/script.c */
  dom_hubbub_error html_process_script(void *ctx, dom_node *node);
  
-+#ifdef __vita__
 +/**
-+ * Fetch and run a module named by <link rel="modulepreload">.
++ * Fetch a module named by <link rel="modulepreload"> (VitaSurf).
 + *
 + * \param c The html content the link belongs to.
 + * \param href The link's href attribute.
 + * \return true if a fetch was started.
 + */
 +bool html_process_module_preload(html_content *c, dom_string *href);
-+#endif
 +
  
  /**
   * Rebuild the box tree from the (script-modified) document and lay it
 diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
-index 554fc4f70..099a5bb38 100644
+index 554fc4f70..13904aa7d 100644
 --- a/content/handlers/html/script.c
 +++ b/content/handlers/html/script.c
-@@ -557,6 +557,118 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+@@ -557,6 +557,136 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
  }
  
  
-+#ifdef __vita__
 +/**
-+ * Callback for a preloaded module.
++ * Callback for a preloaded module (VitaSurf).
 + *
 + * Nothing runs here. The fetch exists so the source is in hand when
 + * something imports the module; all this has to do is keep the active
@@ -133,7 +125,8 @@ index 554fc4f70..099a5bb38 100644
 +		break;
 +	}
 +
-+	if (html_can_begin_conversion(parent)) {
++	if (parent->base.status != CONTENT_STATUS_DONE &&
++	    html_can_begin_conversion(parent)) {
 +		html_begin_conversion(parent);
 +	}
 +
@@ -172,6 +165,25 @@ index 554fc4f70..099a5bb38 100644
 +		return false;
 +	}
 +
++	/*
++	 * A module can be asked for more than once -- a bundler retries a
++	 * chunk whose import failed -- and one fetch of it is enough.
++	 */
++	{
++		unsigned int i;
++
++		for (i = 0; i != c->scripts_count; i++) {
++			if (c->scripts[i].type != HTML_SCRIPT_INLINE &&
++			    c->scripts[i].data.handle != NULL &&
++			    nsurl_compare(hlcache_handle_get_url(
++						c->scripts[i].data.handle),
++					  joined, NSURL_COMPLETE)) {
++				nsurl_unref(joined);
++				return false;
++			}
++		}
++	}
++
 +	NSLOG(netsurf, INFO, "modulepreload '%s'", nsurl_access(joined));
 +
 +	nscript = html_process_new_script(c, corestring_dom_text_javascript,
@@ -197,19 +209,16 @@ index 554fc4f70..099a5bb38 100644
 +	c->base.active++;
 +	return true;
 +}
-+#endif
 +
  /**
   * process script node parser callback
   *
-@@ -652,6 +764,10 @@ nserror html_script_free(html_content *html)
+@@ -652,6 +782,8 @@ nserror html_script_free(html_content *html)
  			/* fallthrough */
  		case HTML_SCRIPT_ASYNC:
  			/* fallthrough */
-+#ifdef __vita__
 +		case HTML_SCRIPT_PRELOAD:
 +			/* fallthrough */
-+#endif
  		case HTML_SCRIPT_DEFER:
  			if (html->scripts[i].data.handle != NULL) {
  				hlcache_handle_release(html->scripts[i].data.handle);

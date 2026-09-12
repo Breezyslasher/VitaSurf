@@ -462,7 +462,9 @@ W.HTMLElement=CEBase;
 /* Every HTML*Element alias shares it, so `extends HTMLDivElement` works. */
 Object.keys(W).forEach(function(k){if(k.indexOf('HTML')===0&&k!=='HTMLDocument'&&W[k]===Element)W[k]=CEBase;});
 
-function ceErr(e){try{console.error('custom element: '+(e&&e.stack?e.stack:e));}catch(x){}}
+/* QuickJS puts only the frames in e.stack, so printing that alone loses
+ * the error's type and message, which is the half worth reading. */
+function ceErr(e){try{console.error('custom element: '+String(e)+(e&&e.stack?'\n'+e.stack:''));}catch(x){}}
 function ceCall(el,name,args){var f=el[name];if(typeof f!=='function')return;try{f.apply(el,args||[]);}catch(e){ceErr(e);}}
 function ceInDoc(n){var r=D.documentElement;while(n){if(n===r)return true;n=n.parentNode;}return false;}
 
