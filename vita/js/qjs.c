@@ -104,6 +104,8 @@ struct jsthread {
 	bool closed;
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
+	bool relayout_off;        /**< document too large to rebuild */
+	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
 	int event_depth;          /**< DOM event dispatches in progress */
 	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
 	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
@@ -141,6 +143,15 @@ static int next_timer_handle = 1;
 #define RELAYOUT_DELAY_MS 40    /**< coalesce a burst of handlers into one */
 #define RELAYOUT_RETRY_MS 500   /**< page busy (dragging, typing): try later */
 #define RELAYOUT_MAX_DELAY_MS 2000 /**< longest wait a slow page earns */
+/*
+ * A rebuild costs a full box construction and style selection for the
+ * whole document, and it runs in one go. On a Wikipedia article, which
+ * is about five and a half thousand elements, that is tens of seconds on
+ * the Vita and the browser is frozen for all of it, which is a far worse
+ * page than the one the rebuild would have improved. Documents above
+ * this size therefore keep the layout they were parsed with.
+ */
+#define RELAYOUT_MAX_ELEMENTS 3000
 
 /* ------------------------------------------------------------------------ */
 /* Small helpers                                                            */
@@ -1589,6 +1600,55 @@ static void end_script(jsthread *thread)
 /* ------------------------------------------------------------------------ */
 /* Layout after DOM changes                                                 */
 
+/** Number of element nodes under root, for the rebuild size budget. */
+static unsigned count_elements(struct dom_node *root)
+{
+	struct dom_node *n = NULL;
+	unsigned count = 0;
+
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		return 0;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+		dom_node_type type = DOM_TEXT_NODE;
+
+		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			count++;
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) == DOM_NO_ERR &&
+				    sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) != DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	return count;
+}
+
 static void relayout_callback(void *p)
 {
 	jsthread *thread = p;
@@ -1597,7 +1657,7 @@ static void relayout_callback(void *p)
 	uint64_t t0;
 
 	thread->relayout_pending = false;
-	if (thread->closed || !thread->dom_dirty) {
+	if (thread->closed || !thread->dom_dirty || thread->relayout_off) {
 		return;
 	}
 	htmlc = thread->htmlc;
@@ -1616,6 +1676,35 @@ static void relayout_callback(void *p)
 		}
 		return;
 	}
+	/*
+	 * Wait for the page to finish loading. A rebuild in the middle of
+	 * one throws away work still arriving and holds up everything the
+	 * user is waiting for.
+	 */
+	if (htmlc->base.status != CONTENT_STATUS_DONE ||
+	    htmlc->base.active > 0) {
+		guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
+		thread->relayout_pending = true;
+		return;
+	}
+
+	if (thread->dom_elements == 0) {
+		struct dom_document *doc = thread_document(thread);
+
+		if (doc != NULL) {
+			thread->dom_elements = count_elements((struct dom_node *)doc);
+		}
+	}
+	if (thread->dom_elements > RELAYOUT_MAX_ELEMENTS) {
+		vita_log("qjs: not rebuilding the layout, %u elements is over "
+			 "the %u the Vita can rebuild in reasonable time",
+			 thread->dom_elements,
+			 (unsigned)RELAYOUT_MAX_ELEMENTS);
+		thread->relayout_off = true;
+		thread->dom_dirty = false;
+		return;
+	}
+
 	t0 = now_ms();
 	err = html_relayout(htmlc);
 	if (err == NSERROR_INVALID) {
@@ -1627,8 +1716,9 @@ static void relayout_callback(void *p)
 	thread->dom_dirty = false;
 	/* the rebuild runs to completion here, so this is also how long
 	 * the page was frozen for */
-	vita_log("qjs: layout rebuilt after script changes in %u ms%s",
-		 (unsigned)(now_ms() - t0),
+	vita_log("qjs: layout rebuilt after script changes in %u ms "
+		 "(%u elements)%s",
+		 (unsigned)(now_ms() - t0), thread->dom_elements,
 		 err == NSERROR_OK ? "" : " (failed)");
 }
 

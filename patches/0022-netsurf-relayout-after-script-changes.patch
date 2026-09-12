@@ -150,7 +150,7 @@ index 16ca1bea8..43854fb6d 100644
  
  	box = html->layout;
 diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
-index f92985b04..5dd8e7cbb 100644
+index f92985b04..d977a2048 100644
 --- a/content/handlers/html/html.c
 +++ b/content/handlers/html/html.c
 @@ -50,6 +50,7 @@
@@ -314,7 +314,7 @@ index f92985b04..5dd8e7cbb 100644
  	nsu_getmonotonic_ms(&ms_before);
  
  	htmlc->reflowing = true;
-@@ -1101,6 +1123,173 @@ static void html_reformat(struct content *c, int width, int height)
+@@ -1101,6 +1123,178 @@ static void html_reformat(struct content *c, int width, int height)
  }
  
  
@@ -401,7 +401,7 @@ index f92985b04..5dd8e7cbb 100644
 +	dom_node *html = NULL;
 +	dom_exception exc;
 +	struct form *f, *g;
-+	struct content_html_object *o;
++	struct content_html_object *old_objects;
 +	nserror err;
 +
 +	if (htmlc->layout == NULL || htmlc->bctx == NULL ||
@@ -438,15 +438,16 @@ index f92985b04..5dd8e7cbb 100644
 +		selection_clear(htmlc->sel, false);
 +	}
 +
-+	/* objects: the fetches the new tree starts count afresh */
-+	for (o = htmlc->object_list; o != NULL; o = o->next) {
-+		if (o->content != NULL &&
-+		    content_get_status(o->content) != CONTENT_STATUS_DONE &&
-+		    htmlc->base.active > 0) {
-+			htmlc->base.active--;
-+		}
-+	}
-+	html_object_free_objects(htmlc);
++	/*
++	 * Set the objects aside rather than releasing them. The new tree
++	 * asks for the same images, and dropping the last user of each
++	 * first lets them fall out of the cache, so every one is fetched
++	 * and decoded again. Holding them until the new tree has asked
++	 * keeps them in the cache and the new requests are satisfied from
++	 * it (VitaSurf).
++	 */
++	old_objects = htmlc->object_list;
++	htmlc->object_list = NULL;
 +	htmlc->num_objects = 0;
 +
 +	for (f = htmlc->forms; f != NULL; f = g) {
@@ -481,6 +482,10 @@ index f92985b04..5dd8e7cbb 100644
 +	 * rest of NetSurf take one for granted on a loaded page. */
 +	err = dom_to_box_sync(html, htmlc, html_relayout_done);
 +	dom_node_unref(html);
++
++	/* the new tree now holds its own references, so let these go */
++	html_object_free_list(htmlc, old_objects);
++
 +	return err;
 +}
 +
@@ -507,7 +512,7 @@ index 8e0dd1c8a..e37556b45 100644
  	man->result.pointer = BROWSER_POINTER_DEFAULT;
  
 diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
-index a26ca496f..2e45e28fb 100644
+index a26ca496f..119e87439 100644
 --- a/content/handlers/html/object.c
 +++ b/content/handlers/html/object.c
 @@ -190,8 +190,9 @@ html_object_callback(hlcache_handle *object,
@@ -532,6 +537,64 @@ index a26ca496f..2e45e28fb 100644
  				break;
  			}
  
+@@ -697,6 +699,35 @@ nserror html_object_close_objects(html_content *html)
+ }
+ 
+ 
++/* exported interface documented in html/object.h */
++nserror html_object_free_list(html_content *html,
++			      struct content_html_object *objects)
++{
++	while (objects != NULL) {
++		struct content_html_object *victim = objects;
++
++		objects = victim->next;
++
++		if (victim->content != NULL) {
++			if (content_get_type(victim->content) == CONTENT_HTML) {
++				guit->misc->schedule(-1, html_object_refresh,
++						     victim);
++			}
++			if (content_get_status(victim->content) !=
++					CONTENT_STATUS_DONE &&
++			    html->base.active > 0) {
++				/* no callback will arrive for it now */
++				html->base.active--;
++			}
++			hlcache_handle_release(victim->content);
++		}
++		free(victim);
++	}
++
++	return NSERROR_OK;
++}
++
++
+ /* exported interface documented in html/object.h */
+ nserror html_object_free_objects(html_content *html)
+ {
+diff --git a/content/handlers/html/object.h b/content/handlers/html/object.h
+index 51828d601..9da3bd67a 100644
+--- a/content/handlers/html/object.h
++++ b/content/handlers/html/object.h
+@@ -66,6 +66,17 @@ bool html_fetch_mask(struct html_content *c, struct nsurl *url, struct box *box)
+  */
+ nserror html_object_free_objects(struct html_content *html);
+ 
++/**
++ * Release a list of objects that was set aside by a layout rebuild
++ * (VitaSurf).
++ *
++ * \param html    html content the objects belonged to
++ * \param objects head of the saved list, which this consumes
++ * \return NSERROR_OK
++ */
++nserror html_object_free_list(struct html_content *html,
++			      struct content_html_object *objects);
++
+ /**
+  * close content of content objects associated with a HTML content
+  *
 diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
 index 56cd957d5..1a531c3cc 100644
 --- a/content/handlers/html/private.h
