@@ -239,7 +239,55 @@ W.scrollBy=function(a,b){var p=scrollArgs(a,b),s=viewport();__vitaScrollTo(s[0]+
 W.confirm=function(){return false;};W.prompt=function(){return null;};
 W.requestAnimationFrame=function(f){return setTimeout(function(){f(Date.now());},16);};W.cancelAnimationFrame=function(h){clearTimeout(h);};
 W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:false,timeRemaining:function(){return 10;}});},50);};W.cancelIdleCallback=function(h){clearTimeout(h);};
-W.getComputedStyle=function(el){return el&&el.style?el.style:{getPropertyValue:function(){return '';}};};
+/* getComputedStyle. The values are mostly defaults -- there is no style
+ * resolution exposed here beyond what __vitaStyle reports and what the
+ * box geometry says -- but the shape is the point: a real declaration
+ * answers every CSS property with a string, and ours used to answer
+ * undefined for all but a handful. Reading one and calling a string
+ * method on it, which is what a page doing its own rem arithmetic does,
+ * threw instead of getting a wrong-but-harmless number. */
+/* Indexed by the libcss enum, which starts its values at 1. */
+var CS_DISPLAY=['','inline','block','list-item','run-in','inline-block','table','inline-table',
+ 'table-row-group','table-header-group','table-footer-group','table-row','table-column-group',
+ 'table-column','table-cell','table-caption','none','flex','inline-flex','grid','inline-grid'];
+var CS_VIS=['','visible','hidden','collapse'];
+var CS_DEFAULTS={
+ display:'block',visibility:'visible',opacity:'1',position:'static',float:'none',clear:'none',
+ direction:'ltr',fontSize:'16px',fontFamily:'sans-serif',fontStyle:'normal',fontWeight:'400',
+ fontVariant:'normal',lineHeight:'normal',color:'rgb(0, 0, 0)',backgroundColor:'rgba(0, 0, 0, 0)',
+ backgroundImage:'none',textAlign:'start',textDecoration:'none',textTransform:'none',
+ whiteSpace:'normal',overflow:'visible',overflowX:'visible',overflowY:'visible',
+ boxSizing:'content-box',zIndex:'auto',transform:'none',transition:'all 0s ease 0s',
+ animationName:'none',cursor:'auto',pointerEvents:'auto',borderStyle:'none',borderCollapse:'separate',
+ listStyleType:'disc',verticalAlign:'baseline',tableLayout:'auto',resize:'none',
+ top:'auto',right:'auto',bottom:'auto',left:'auto'};
+['margin','padding','border'].forEach(function(b){
+ ['Top','Right','Bottom','Left'].forEach(function(e){
+  CS_DEFAULTS[b+e+(b==='border'?'Width':'')]='0px';});
+ if(b!=='border')CS_DEFAULTS[b]='0px';});
+function dashToCamel(n){return String(n).replace(/-([a-z])/g,function(m,c){return c.toUpperCase();});}
+function computedStyle(el){
+ var st=(el&&el.nodeType===1&&typeof __vitaStyle==='function')?__vitaStyle(el):null;
+ var box=(el&&el.nodeType===1&&typeof __vitaBox==='function')?__vitaBox(el):null;
+ var cs={};
+ for(var k in CS_DEFAULTS)cs[k]=CS_DEFAULTS[k];
+ if(st){
+  cs.fontSize=st[0]+'px';
+  if(CS_DISPLAY[st[1]])cs.display=CS_DISPLAY[st[1]];
+  if(CS_VIS[st[2]])cs.visibility=CS_VIS[st[2]];
+ }
+ if(box){cs.width=box[4]+'px';cs.height=box[5]+'px';}
+ else{cs.width='auto';cs.height='auto';}
+ cs.getPropertyValue=function(n){var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};
+ cs.getPropertyPriority=function(){return '';};
+ cs.setProperty=function(n,v){this[dashToCamel(n)]=String(v);};
+ cs.removeProperty=function(n){var c=dashToCamel(n),v=this[c];delete this[c];return v===undefined?'':String(v);};
+ cs.item=function(i){return Object.keys(CS_DEFAULTS)[i]||'';};
+ Object.defineProperty(cs,'length',{configurable:true,get:function(){return Object.keys(CS_DEFAULTS).length;}});
+ cs.cssText='';
+ return cs;
+}
+W.getComputedStyle=function(el){return computedStyle(el);};
 /* A media query evaluator over the real viewport. Handles the features
    responsive sites actually branch on; anything else is false. */
 function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(value);

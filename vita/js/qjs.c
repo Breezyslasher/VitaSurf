@@ -2781,6 +2781,60 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
  *  scrollWidth, scrollHeight, scrollLeft, scrollTop] in CSS px, document
  * coordinates, border box; null when the element has no box.
  */
+/*
+ * __vitaStyle(node): the computed values a page is most likely to read
+ * back, as [fontSize px, display, visibility, opacity]. Everything else
+ * getComputedStyle reports comes from the prelude's defaults; these four
+ * are the ones that actually vary and that code branches on. A page
+ * doing its own rem arithmetic reads the root font size, which is what
+ * sent YouTube into "cannot read property 'replace' of undefined".
+ */
+static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct box *box;
+	css_fixed len = 0;
+	css_unit unit = CSS_UNIT_PX;
+	JSValue arr;
+	int px;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL || thread->htmlc == NULL) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !layout_current(thread)) {
+		return JS_NULL;
+	}
+	box = box_for_node(node);
+	if (box == NULL || box->style == NULL) {
+		/*
+		 * Laid out, but this element got no box. That is what
+		 * display:none looks like from here, and reporting it
+		 * matters: code hides things by setting display and then
+		 * asks whether they are hidden.
+		 */
+		arr = JS_NewArray(ctx);
+		set_index(ctx, arr, 0, 16);
+		set_index(ctx, arr, 1, (int)CSS_DISPLAY_NONE);
+		set_index(ctx, arr, 2, (int)CSS_VISIBILITY_VISIBLE);
+		return arr;
+	}
+	css_computed_font_size(box->style, &len, &unit);
+	px = FIXTOINT(css_unit_len2device_px(box->style,
+					     &thread->htmlc->unit_len_ctx,
+					     len, unit));
+	if (px <= 0) px = 16;
+
+	arr = JS_NewArray(ctx);
+	set_index(ctx, arr, 0, px);
+	set_index(ctx, arr, 1, (int)css_computed_display_static(box->style));
+	set_index(ctx, arr, 2, (int)css_computed_visibility(box->style));
+	return arr;
+}
+
 static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
@@ -3061,6 +3115,8 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_find, "__vitaFind", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaStyle",
+			  JS_NewCFunction(ctx, win_vita_style, "__vitaStyle", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaScroll",
 			  JS_NewCFunction(ctx, win_vita_scroll, "__vitaScroll", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaScrollTo",
