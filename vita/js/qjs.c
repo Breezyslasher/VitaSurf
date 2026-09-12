@@ -2289,11 +2289,24 @@ static JSValue win_vita_scroll(JSContext *ctx, JSValueConst this_val,
 	JSValue arr;
 
 	(void)this_val; (void)argc; (void)argv;
-	if (gw == NULL) {
+	if (thread == NULL || thread->win == NULL) {
 		return JS_NULL;
 	}
-	guit->window->get_scroll(gw, &sx, &sy);
-	guit->window->get_dimensions(gw, &vw, &vh);
+	if (gw != NULL) {
+		guit->window->get_scroll(gw, &sx, &sy);
+		guit->window->get_dimensions(gw, &vw, &vh);
+	} else {
+		/* an iframe has no window of its own: its browser window
+		 * carries the size and the scroll offsets instead */
+		vw = thread->win->width;
+		vh = thread->win->height;
+		if (thread->win->scroll_x != NULL) {
+			sx = scrollbar_get_offset(thread->win->scroll_x);
+		}
+		if (thread->win->scroll_y != NULL) {
+			sy = scrollbar_get_offset(thread->win->scroll_y);
+		}
+	}
 	scale = browser_window_get_scale(thread->win);
 	if (scale <= 0.0f) {
 		scale = 1.0f;

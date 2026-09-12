@@ -137,10 +137,18 @@ index f4bd119b1..2afebc24f 100644
  /**
   * aborts any ongoing box construction
 diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
-index f92985b04..92dce77b6 100644
+index f92985b04..03cc0916f 100644
 --- a/content/handlers/html/html.c
 +++ b/content/handlers/html/html.c
-@@ -60,6 +60,7 @@
+@@ -50,6 +50,7 @@
+ #include "content/hlcache.h"
+ #include "content/content_factory.h"
+ #include "content/textsearch.h"
++#include "desktop/frames.h"
+ #include "desktop/selection.h"
+ #include "desktop/scrollbar.h"
+ #include "desktop/textarea.h"
+@@ -60,6 +61,7 @@
  #include "html/html.h"
  #include "html/private.h"
  #include "html/dom_event.h"
@@ -148,7 +156,7 @@ index f92985b04..92dce77b6 100644
  #include "html/css.h"
  #include "html/object.h"
  #include "html/html_save.h"
-@@ -829,12 +830,70 @@ bool html_can_begin_conversion(html_content *htmlc)
+@@ -829,12 +831,70 @@ bool html_can_begin_conversion(html_content *htmlc)
  	return true;
  }
  
@@ -221,7 +229,7 @@ index f92985b04..92dce77b6 100644
  	dom_exception exc; /* returned by libdom functions */
  	dom_string *node_name = NULL;
  	dom_hubbub_error error;
-@@ -941,54 +1000,9 @@ html_begin_conversion(html_content *htmlc)
+@@ -941,54 +1001,9 @@ html_begin_conversion(html_content *htmlc)
  	dom_string_unref(node_name);
  
  	/* Retrieve forms from parser */
@@ -279,7 +287,7 @@ index f92985b04..92dce77b6 100644
  	}
  
  	dom_node_unref(html);
-@@ -1101,6 +1115,157 @@ static void html_reformat(struct content *c, int width, int height)
+@@ -1101,6 +1116,170 @@ static void html_reformat(struct content *c, int width, int height)
  }
  
  
@@ -352,6 +360,11 @@ index f92985b04..92dce77b6 100644
 +
 +	content__reformat(&c->base, false,
 +			  c->base.available_width, c->base.available_height);
++
++	/* the iframe boxes the window knew about went with the old tree */
++	if (c->bw != NULL && c->page == NULL) {
++		browser_window_create_iframes(c->bw);
++	}
 +}
 +
 +
@@ -371,8 +384,11 @@ index f92985b04..92dce77b6 100644
 +	    htmlc->frameset != NULL ||
 +	    htmlc->drag_type != HTML_DRAG_NONE ||
 +	    htmlc->focus_type == HTML_FOCUS_TEXTAREA ||
++	    htmlc->base.textsearch.context != NULL ||
 +	    (htmlc->base.status != CONTENT_STATUS_READY &&
 +	     htmlc->base.status != CONTENT_STATUS_DONE)) {
++		/* Still being built, busy with the user, or something
++		 * outside holds pointers into the box tree. Try later. */
 +		return NSERROR_INVALID;
 +	}
 +
@@ -414,6 +430,11 @@ index f92985b04..92dce77b6 100644
 +
 +	imagemap_destroy(htmlc);
 +	htmlc->imagemaps = NULL;
++
++	/* child windows point at iframe boxes in the tree about to go */
++	if (htmlc->bw != NULL && htmlc->page == NULL) {
++		browser_window_destroy_iframes(htmlc->bw);
++	}
 +
 +	html_clear_node_boxes(html);
 +

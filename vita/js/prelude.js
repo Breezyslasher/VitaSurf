@@ -25,22 +25,23 @@ Object.defineProperty(P,'ownerDocument',{get:function(){return document;}});
 /* Layout geometry. __vitaBox(node) (qjs.c) returns the element's laid-out
    box as [x,y,width,height,clientWidth,clientHeight,clientLeft,clientTop,
    scrollWidth,scrollHeight,scrollLeft,scrollTop] in CSS px, document
-   coordinates, border box; null when the element has no box. __vitaScroll()
+   coordinates, border box; null when the element has no box. viewport()
    returns [scrollX,scrollY,viewportWidth,viewportHeight]. */
 function boxOf(el){var b=__vitaBox(el);return b||[0,0,0,0,0,0,0,0,0,0,0,0];}
+function viewport(){return __vitaScroll()||[0,0,960,544];}
 function isViewportEl(el){return el===D.documentElement;}
 var BOXIDX={offsetWidth:2,offsetHeight:3,clientLeft:6,clientTop:7,scrollWidth:8,scrollHeight:9};
 Object.keys(BOXIDX).forEach(function(a){var i=BOXIDX[a];Object.defineProperty(P,a,{get:function(){return boxOf(this)[i];}});});
-['clientWidth','clientHeight'].forEach(function(a,n){Object.defineProperty(P,a,{get:function(){if(isViewportEl(this)){return __vitaScroll()[2+n];}return boxOf(this)[4+n];}});});
+['clientWidth','clientHeight'].forEach(function(a,n){Object.defineProperty(P,a,{get:function(){if(isViewportEl(this)){return viewport()[2+n];}return boxOf(this)[4+n];}});});
 Object.defineProperty(P,'offsetParent',{get:function(){var n=this.parentNode;while(n&&n.nodeType===1&&n!==D.body&&n!==D.documentElement)n=n.parentNode;return n&&n.nodeType===1?n:null;}});
 ['offsetTop','offsetLeft'].forEach(function(a,n){Object.defineProperty(P,a,{get:function(){var b=__vitaBox(this);if(!b)return 0;var p=this.offsetParent,pb=p?__vitaBox(p):null;return b[1-n]-(pb?pb[1-n]:0);}});});
-['scrollTop','scrollLeft'].forEach(function(a,n){Object.defineProperty(P,a,{get:function(){if(isViewportEl(this)||this===D.body){return __vitaScroll()[1-n];}return boxOf(this)[11-n];},set:function(v){if(isViewportEl(this)||this===D.body){var s=__vitaScroll();__vitaScrollTo(n===1?Number(v)||0:s[0],n===1?s[1]:Number(v)||0);}}});});
+['scrollTop','scrollLeft'].forEach(function(a,n){Object.defineProperty(P,a,{get:function(){if(isViewportEl(this)||this===D.body){return viewport()[1-n];}return boxOf(this)[11-n];},set:function(v){if(isViewportEl(this)||this===D.body){var s=viewport();__vitaScrollTo(n===1?Number(v)||0:s[0],n===1?s[1]:Number(v)||0);}}});});
 P.tabIndex=0;
 ['onclick','onchange','onsubmit','oninput','onkeydown','onkeyup','onkeypress','onmousedown','onmouseup','onmouseover','onmouseout','onfocus','onblur','onload','onerror','ontouchstart','ontouchend'].forEach(function(h){Object.defineProperty(P,h,{get:function(){return this['__'+h]||null;},set:function(f){this['__'+h]=f;if(typeof f==='function')this.addEventListener(h.slice(2),function(e){return f.call(this,e);});}});});
-P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};var s=__vitaScroll(),x=b[0]-s[0],y=b[1]-s[1];return {x:x,y:y,left:x,top:y,width:b[2],height:b[3],right:x+b[2],bottom:y+b[3]};};
+P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};var s=viewport(),x=b[0]-s[0],y=b[1]-s[1];return {x:x,y:y,left:x,top:y,width:b[2],height:b[3],right:x+b[2],bottom:y+b[3]};};
 P.getClientRects=function(){var r=this.getBoundingClientRect();return r.width||r.height?[r]:[];};
 P.focus=P.blur=P.select=function(){};
-P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=__vitaScroll(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
+P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=viewport(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
 P.click=function(){var e=new MouseEvent('click',{bubbles:true,cancelable:true});return this.dispatchEvent(e);};
 P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return false;};
 P.hasChildNodes=function(){return this.firstChild!==null;};
@@ -89,20 +90,20 @@ var W=window;
 W.dispatchEvent=function(e){return __vitaDispatch(null,e);};
 /* Viewport and scroll position come from the window itself, so a script
    that measures the page sees what is really on screen. */
-[['innerWidth',2],['outerWidth',2],['innerHeight',3],['outerHeight',3],['scrollX',0],['pageXOffset',0],['scrollY',1],['pageYOffset',1]].forEach(function(e){Object.defineProperty(W,e[0],{get:function(){return __vitaScroll()[e[1]];}});});
+[['innerWidth',2],['outerWidth',2],['innerHeight',3],['outerHeight',3],['scrollX',0],['pageXOffset',0],['scrollY',1],['pageYOffset',1]].forEach(function(e){Object.defineProperty(W,e[0],{get:function(){return viewport()[e[1]];}});});
 W.devicePixelRatio=1;
 W.screen={width:960,height:544,availWidth:960,availHeight:544,colorDepth:32,pixelDepth:32,orientation:{type:'landscape-primary'}};
 W.focus=W.blur=W.stop=W.print=W.close=function(){};W.open=function(){return null;};
 function scrollArgs(a,b){if(a&&typeof a==='object')return [Number(a.left)||0,Number(a.top)||0];return [Number(a)||0,Number(b)||0];}
 W.scrollTo=W.scroll=function(a,b){var p=scrollArgs(a,b);__vitaScrollTo(p[0],p[1]);};
-W.scrollBy=function(a,b){var p=scrollArgs(a,b),s=__vitaScroll();__vitaScrollTo(s[0]+p[0],s[1]+p[1]);};
+W.scrollBy=function(a,b){var p=scrollArgs(a,b),s=viewport();__vitaScrollTo(s[0]+p[0],s[1]+p[1]);};
 W.confirm=function(){return false;};W.prompt=function(){return null;};
 W.requestAnimationFrame=function(f){return setTimeout(function(){f(Date.now());},16);};W.cancelAnimationFrame=function(h){clearTimeout(h);};
 W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:false,timeRemaining:function(){return 10;}});},50);};W.cancelIdleCallback=function(h){clearTimeout(h);};
 W.getComputedStyle=function(el){return el&&el.style?el.style:{getPropertyValue:function(){return '';}};};
 /* A media query evaluator over the real viewport. Handles the features
    responsive sites actually branch on; anything else is false. */
-function mediaFeature(name,value){var s=__vitaScroll(),w=s[2],h=s[3],n=parseFloat(value);
+function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(value);
  if(/em$/.test(value))n*=16;
  switch(name){
  case 'width':return w===n;case 'min-width':return w>=n;case 'max-width':return w<=n;
