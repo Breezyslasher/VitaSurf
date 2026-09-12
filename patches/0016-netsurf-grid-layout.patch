@@ -112,7 +112,7 @@ index 640bdff51..0ade83f2a 100644
  				break;
  			}
 diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
-index d3b6d8f31..f6b3a8727 100644
+index d3b6d8f31..eb18b87f3 100644
 --- a/content/handlers/html/layout.c
 +++ b/content/handlers/html/layout.c
 @@ -1000,7 +1000,14 @@ static void layout_minmax_block(
@@ -131,17 +131,23 @@ index d3b6d8f31..f6b3a8727 100644
  			    lh__flex_main_is_horizontal(block)) {
  				if (block->style != NULL &&
  				    css_computed_flex_wrap(block->style) ==
-@@ -1030,7 +1037,8 @@ static void layout_minmax_block(
+@@ -1029,8 +1036,13 @@ static void layout_minmax_block(
+ 		assert(0);
  	}
  
- 	/* fixed width takes priority */
+-	/* fixed width takes priority */
 -	if (block->type != BOX_TABLE_CELL && !lh__box_is_flex_item(block)) {
++	/* fixed width takes priority. A flex item's width only counts when
++	 * its flex-basis is auto, since the basis replaces it otherwise
++	 * (VitaSurf: upstream skipped every flex item, so a fixed-width
++	 * item such as an icon span made its container too narrow). */
 +	if (block->type != BOX_TABLE_CELL && (!lh__box_is_flex_item(block) ||
-+			lh__box_is_grid_item(block))) {
++			lh__box_is_grid_item(block) ||
++			lh__flex_item_basis_is_auto(block))) {
  		bool border_box = bs == CSS_BOX_SIZING_BORDER_BOX;
  		enum css_max_width_e max_type;
  		enum css_min_width_e min_type;
-@@ -1172,8 +1180,11 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+@@ -1172,8 +1184,11 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
  			}
  
  			/* Check whether box is the box current margin collapses
@@ -1839,7 +1845,7 @@ index 000000000..3905e595e
 +	return success;
 +}
 diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
-index 568c621d2..af5f01397 100644
+index 568c621d2..a7da79310 100644
 --- a/content/handlers/html/layout_internal.h
 +++ b/content/handlers/html/layout_internal.h
 @@ -68,6 +68,19 @@ bool layout_flex(
@@ -1862,10 +1868,21 @@ index 568c621d2..af5f01397 100644
  typedef uint8_t (*css_len_func)(
  		const css_computed_style *style,
  		css_fixed *length, css_unit *unit);
-@@ -122,6 +135,19 @@ static inline bool lh__box_is_flex_item(const struct box *b)
+@@ -122,6 +135,30 @@ static inline bool lh__box_is_flex_item(const struct box *b)
  	return (b->parent != NULL) && lh__box_is_flex_container(b->parent);
  }
  
++/** Layout helper: Check whether a flex item's flex-basis is auto. */
++static inline bool lh__flex_item_basis_is_auto(const struct box *b)
++{
++	css_fixed length = 0;
++	css_unit unit = CSS_UNIT_PX;
++
++	return b->style == NULL ||
++	       css_computed_flex_basis(b->style, &length, &unit) ==
++			CSS_FLEX_BASIS_AUTO;
++}
++
 +/** Layout helper: Check whether box is a grid container (VitaSurf). */
 +static inline bool lh__box_is_grid_container(const struct box *b)
 +{

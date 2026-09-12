@@ -93,6 +93,28 @@ and empty or negative sizes are rejected. The build job prints the
 function map and a disassembly around every offset listed in
 `scripts/crash-offsets.txt`, so a crash dump can be read from the CI log.
 
+Two rendering fixes came out of comparing the Wikipedia mobile page on
+the Vita with a phone. Patch 0016 also counts a flex item's fixed width
+in its container's minimum and maximum widths when flex-basis is auto;
+NetSurf ignored it, so buttons made of an icon span plus a label came
+out too narrow and the label was clipped. Patch 0018 fixes libsvgtiny's
+path parser: a relative `q` recorded its control point before adding the
+current position, a relative `t` offset an already absolute reflected
+control point, and `s` and arcs stored one coordinate in the wrong slot,
+so any SVG drawn with relative quadratic curves (the Wikipedia wordmark
+among them) drifted larger with each curve. Patch 0019 makes NetSurf
+start from a fresh diagram when it reparses an SVG at a new size;
+svgtiny_parse appends to the diagram, so every earlier copy of the shapes
+was kept, drawn on each redraw and leaked.
+
+Patch 0020 propagates the overflow of the html and body elements to the
+viewport, as CSS 2.1 section 11.1.1 requires. NetSurf used to make the body
+a scroll container whenever a stylesheet set `overflow-y: scroll` on it,
+so pages such as mobile Wikipedia (`html, body { height: 100% }` plus
+`body { overflow-y: scroll }`) laid out as one 544 px tall box that never
+scrolled. The root and body boxes now report visible overflow and the
+window's own scrollbars handle the page.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
