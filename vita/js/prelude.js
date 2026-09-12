@@ -140,6 +140,14 @@ P.after=function(){var p=this.parentNode;if(!p)return;var n=toNodes(arguments),r
 P.replaceWith=function(){P.before.apply(this,arguments);this.remove();};
 P.normalize=function(){};
 P.hasAttributes=function(){return this.attributes.length>0;};
+/* attributes, and every node list here, is a plain array from qjs.c, so
+ * the NamedNodeMap and NodeList calls go on the array prototype. They
+ * must be non-enumerable: an enumerable one would appear in every
+ * for..in over an array on the page. */
+[['item',function(i){return this[i]===undefined?null:this[i];}],
+ ['getNamedItem',function(n){n=String(n).toLowerCase();for(var i=0;i<this.length;i++)if(this[i]&&String(this[i].name).toLowerCase()===n)return this[i];return null;}],
+ ['namedItem',function(n){n=String(n);for(var i=0;i<this.length;i++){var e=this[i];if(e&&(e.id===n||e.name===n))return e;}return null;}]
+].forEach(function(p){if(!(p[0] in Array.prototype))Object.defineProperty(Array.prototype,p[0],{value:p[1],writable:true,configurable:true,enumerable:false});});
 P.getAttributeNode=function(n){var v=this.getAttribute(n);return v===null?null:{name:String(n),value:v,specified:true};};
 P.getAttributeNS=function(ns,n){return this.getAttribute(n);};
 P.setAttributeNS=function(ns,n,v){return this.setAttribute(n,v);};

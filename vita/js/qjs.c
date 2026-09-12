@@ -682,6 +682,58 @@ static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+/*
+ * element.attributes, as an array of {name, value} with the item() and
+ * getNamedItem() a NamedNodeMap answers to. Pages read it to copy an
+ * element's attributes, and polyfills walk the name looking for a
+ * descriptor, so its absence threw where they patch.
+ */
+static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_element(ctx, this_val);
+	struct dom_namednodemap *map = NULL;
+	JSValue arr = JS_NewArray(ctx);
+	uint32_t len = 0, i, out = 0;
+
+	if (node == NULL) {
+		return arr;
+	}
+	if (dom_node_get_attributes(node, &map) != DOM_NO_ERR || map == NULL) {
+		return arr;
+	}
+	dom_namednodemap_get_length(map, &len);
+	for (i = 0; i < len; i++) {
+		struct dom_node *attr = NULL;
+		dom_string *name = NULL, *val = NULL;
+		JSValue entry;
+
+		if (dom_namednodemap_item(map, i, &attr) != DOM_NO_ERR ||
+		    attr == NULL) {
+			continue;
+		}
+		dom_node_get_node_name(attr, &name);
+		dom_node_get_node_value(attr, &val);
+		entry = JS_NewObject(ctx);
+		JS_SetPropertyStr(ctx, entry, "name",
+				  name != NULL ?
+				  JS_NewStringLen(ctx, dom_string_data(name),
+						  dom_string_byte_length(name)) :
+				  JS_NewString(ctx, ""));
+		JS_SetPropertyStr(ctx, entry, "value",
+				  val != NULL ?
+				  JS_NewStringLen(ctx, dom_string_data(val),
+						  dom_string_byte_length(val)) :
+				  JS_NewString(ctx, ""));
+		JS_SetPropertyStr(ctx, entry, "specified", JS_TRUE);
+		if (name != NULL) dom_string_unref(name);
+		if (val != NULL) dom_string_unref(val);
+		dom_node_unref(attr);
+		JS_SetPropertyUint32(ctx, arr, out++, entry);
+	}
+	dom_namednodemap_unref(map);
+	return arr;
+}
+
 static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
@@ -1074,6 +1126,7 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CGETSET_DEF("previousSibling", node_get_previous_sibling, NULL),
 	JS_CGETSET_DEF("childNodes", node_get_child_nodes, NULL),
 	JS_CGETSET_DEF("nodeValue", node_get_node_value, NULL),
+	JS_CGETSET_DEF("attributes", node_get_attributes, NULL),
 	JS_CFUNC_DEF("getAttribute", 1, node_get_attribute),
 	JS_CFUNC_DEF("setAttribute", 2, node_set_attribute),
 	JS_CFUNC_DEF("hasAttribute", 1, node_has_attribute),
