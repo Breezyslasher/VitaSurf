@@ -33,23 +33,77 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "fetching $url as fixtures/$name"
 
-      - name: Download the page and its requisites
+      - name: Download the page, its stylesheets and scripts
         run: |
           set -u
           mkdir -p /tmp/fixture
-          cd /tmp/fixture
-          UA='Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
-          # -p page requisites, -k convert links for offline use, -E add
-          # .html, -H span hosts (CDN assets), -nd flat directory. wget
-          # returns 8 when some requisite gave an error; that is fine.
-          wget -q -e robots=off -U "$UA" -p -k -E -H -nd -P . \
-            --no-check-certificate --timeout=30 --tries=2 \
-            "${{ steps.req.outputs.url }}" || true
-          # Also keep the raw HTML and the script/style URLs the page names.
-          curl -sS -L -A "$UA" -o page.raw.html "${{ steps.req.outputs.url }}" || true
-          grep -o 'src="[^"]*"\|href="[^"]*"' page.raw.html | sort -u > links.txt || true
-          ls -la | head -50
-          du -sh .
+          python3 - "${{ steps.req.outputs.url }}" /tmp/fixture <<'PY'
+          import re, sys, os, hashlib, urllib.request, urllib.parse
+          url, out = sys.argv[1], sys.argv[2]
+          UA = 'Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
+          def get(u):
+              req = urllib.request.Request(u, headers={'User-Agent': UA,
+                      'Accept': '*/*', 'Accept-Language': 'en'})
+              with urllib.request.urlopen(req, timeout=40) as r:
+                  return r.read(), r.headers.get('Content-Type', '')
+          html, ctype = get(url)
+          text = html.decode('utf-8', 'replace')
+          open(os.path.join(out, 'page.raw.html'), 'wb').write(html)
+          assets = {}
+          def local_name(u, kind):
+              h = hashlib.sha1(u.encode()).hexdigest()[:10]
+              ext = {'css': '.css', 'js': '.js'}.get(kind, '')
+              if kind == 'img':
+                  ext = os.path.splitext(urllib.parse.urlparse(u).path)[1][:6] or '.bin'
+              return kind + '_' + h + ext
+          def fetch(u, kind):
+              absu = urllib.parse.urljoin(url, u)
+              if absu in assets:
+                  return assets[absu]
+              name = local_name(absu, kind)
+              try:
+                  data, _ = get(absu)
+                  open(os.path.join(out, name), 'wb').write(data)
+                  assets[absu] = name
+                  print('ok  ', kind, len(data), absu[:120])
+              except Exception as e:
+                  print('FAIL', kind, absu[:120], e)
+                  assets[absu] = None
+              return assets[absu]
+          def rewrite(m, kind):
+              attr, quote, u = m.group(1), m.group(2), m.group(3)
+              if u.startswith('data:') or u.startswith('#'):
+                  return m.group(0)
+              name = fetch(u, kind)
+              return '%s=%s%s%s' % (attr, quote, name or u, quote)
+          # stylesheets
+          text = re.sub(r'(?i)(href)=(["\'])([^"\']*)\2(?=[^>]*rel=["\']?stylesheet)',
+                        lambda m: rewrite(m, 'css'), text)
+          text = re.sub(r'(?i)(?<=rel="stylesheet")([^>]*?)(href)=(["\'])([^"\']*)\3',
+                        lambda m: m.group(1) + rewrite(re.match(r'(href)=(["\'])([^"\']*)\2', m.group(0)[len(m.group(1)):]), 'css'), text)
+          # scripts
+          text = re.sub(r'(?i)(<script[^>]*\s)(src)=(["\'])([^"\']*)\3',
+                        lambda m: m.group(1) + rewrite(re.match(r'(src)=(["\'])([^"\']*)\2', m.group(0)[len(m.group(1)):]), 'js'), text)
+          # images (src and srcset first candidate)
+          text = re.sub(r'(?i)(<img[^>]*\s)(src)=(["\'])([^"\']*)\3',
+                        lambda m: m.group(1) + rewrite(re.match(r'(src)=(["\'])([^"\']*)\2', m.group(0)[len(m.group(1)):]), 'img'), text)
+          text = re.sub(r'(?i)\ssrcset=(["\'])[^"\']*\1', '', text)
+          # MediaWiki: the page modules are loaded by the startup script at
+          # runtime; also save one bundle with them for offline reading.
+          mods = re.search(r'RLPAGEMODULES=\[([^\]]*)\]', text)
+          if mods:
+              names = ','.join(x.strip('"\' ') for x in mods.group(1).split(','))
+              base = urllib.parse.urljoin(url, '/w/load.php')
+              fetch(base + '?lang=en&modules=' + urllib.parse.quote(names, safe=',.') + '&skin=minerva&only=scripts', 'js')
+              fetch(base + '?lang=en&modules=' + urllib.parse.quote(names, safe=',.') + '&skin=minerva&only=styles', 'css')
+              fetch(base + '?lang=en&modules=startup&only=scripts&skin=minerva', 'js')
+          open(os.path.join(out, 'page.html'), 'w').write(text)
+          with open(os.path.join(out, 'assets.txt'), 'w') as f:
+              for u, n in assets.items():
+                  f.write('%s\t%s\n' % (n, u))
+          PY
+          ls -la /tmp/fixture | head -60
+          du -sh /tmp/fixture
 
       - name: Push to the fixtures branch
         run: |
