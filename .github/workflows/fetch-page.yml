@@ -3,19 +3,13 @@ name: Fetch page fixture
 # Downloads a web page with its CSS, scripts and images as the Vita would
 # see it (mobile user agent) and pushes the result to a fixtures/<name>
 # branch, so the page can be studied offline with NetSurf's monkey
-# frontend. Run it from the Actions tab.
+# frontend. Edit fixtures/request.txt and push to run it.
 
 on:
+  push:
+    paths:
+      - fixtures/request.txt
   workflow_dispatch:
-    inputs:
-      url:
-        description: Page URL
-        required: true
-        default: https://en.m.wikipedia.org/wiki/PlayStation_Vita
-      name:
-        description: Fixture name (branch fixtures/<name>)
-        required: true
-        default: wikipedia-mobile
 
 permissions:
   contents: write
@@ -24,20 +18,35 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Read the request
+        id: req
+        run: |
+          set -eu
+          # fixtures/request.txt: two lines, url=... and name=...
+          url=$(sed -n 's/^url=//p' fixtures/request.txt | head -1)
+          name=$(sed -n 's/^name=//p' fixtures/request.txt | head -1)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "fetching $url as fixtures/$name"
+
       - name: Download the page and its requisites
         run: |
           set -u
-          mkdir -p fixture
-          cd fixture
-          UA='Mozilla/5.0 (Linux; Android 10; PlayStation Vita) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36 VitaSurf'
+          mkdir -p /tmp/fixture
+          cd /tmp/fixture
+          UA='Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
           # -p page requisites, -k convert links for offline use, -E add
           # .html, -H span hosts (CDN assets), -nd flat directory. wget
           # returns 8 when some requisite gave an error; that is fine.
           wget -q -e robots=off -U "$UA" -p -k -E -H -nd -P . \
             --no-check-certificate --timeout=30 --tries=2 \
-            "${{ github.event.inputs.url }}" || true
+            "${{ steps.req.outputs.url }}" || true
           # Also keep the raw HTML and the script/style URLs the page names.
-          curl -sS -L -A "$UA" -o page.raw.html "${{ github.event.inputs.url }}" || true
+          curl -sS -L -A "$UA" -o page.raw.html "${{ steps.req.outputs.url }}" || true
           grep -o 'src="[^"]*"\|href="[^"]*"' page.raw.html | sort -u > links.txt || true
           ls -la | head -50
           du -sh .
@@ -45,13 +54,13 @@ jobs:
       - name: Push to the fixtures branch
         run: |
           set -eu
-          cd fixture
+          cd /tmp/fixture
           git init -q
           git config user.name "fixture-bot"
           git config user.email "fixture-bot@users.noreply.github.com"
-          git checkout -q -b "fixtures/${{ github.event.inputs.name }}"
+          git checkout -q -b "fixtures/${{ steps.req.outputs.name }}"
           git add -A
-          git commit -q -m "Fixture: ${{ github.event.inputs.url }}"
+          git commit -q -m "Fixture: ${{ steps.req.outputs.url }}"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          git push -q --force origin "fixtures/${{ github.event.inputs.name }}"
-          echo "pushed fixtures/${{ github.event.inputs.name }}"
+          git push -q --force origin "fixtures/${{ steps.req.outputs.name }}"
+          echo "pushed fixtures/${{ steps.req.outputs.name }}"
