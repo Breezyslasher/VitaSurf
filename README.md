@@ -136,10 +136,21 @@ yielding as NetSurf's initial conversion does. A content that has
 finished loading is assumed throughout NetSurf to have a box tree, and
 letting other work run while it briefly has none crashed the browser in
 an assertion in the redraw path, reached by the history thumbnail. It
-does mean a long document freezes the frame for the length of a rebuild,
-so rebuilds are coalesced, batched while the page is still loading, and
-never overlapped. Redraw, hit testing, reformat and the object callbacks
-check for a missing box tree anyway. A script that reads geometry right
+does mean a long document freezes the frame for the length of a rebuild.
+On hardware a Wikipedia article, about five and a half thousand
+elements, took roughly fifty seconds and turned a twenty seven second
+page load into an eighty second one, which is a far worse page than the
+one the rebuild would have improved. So a rebuild waits until the page
+has finished loading, never overlaps another, and is skipped above
+`RELAYOUT_MAX_ELEMENTS` elements, which is logged with the count so the
+limit can be tuned from a hardware log. Wikipedia is over it and keeps
+its parsed layout; it still renders and scrolls the full article,
+because that depended on the viewport overflow fix rather than on the
+rebuild. The objects a page has already loaded are held across a
+rebuild rather than released before the new tree asks for them, since
+dropping the last user of each lets them fall out of the cache and the
+Vita then decodes every image again. Redraw, hit testing, reformat and
+the object callbacks check for a missing box tree anyway. A script that reads geometry right
 after changing the document reads the previous layout rather than
 forcing a rebuild from under code that holds box pointers.
 
