@@ -1577,6 +1577,10 @@ static void schedule_relayout(jsthread *thread, int ms)
 		return;
 	}
 	floor_ms = (int)thread->relayout_ms * 4;
+	if (thread->htmlc != NULL && thread->htmlc->base.active > 0) {
+		/* still loading: more changes are coming, so batch them */
+		floor_ms = RELAYOUT_MAX_DELAY_MS;
+	}
 	if (floor_ms > RELAYOUT_MAX_DELAY_MS) {
 		floor_ms = RELAYOUT_MAX_DELAY_MS;
 	}
