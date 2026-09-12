@@ -2123,8 +2123,18 @@ static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 	    !JS_IsFunction(ctx, argv[5])) {
 		return JS_NewInt32(ctx, 0);
 	}
-	if (browser_window_get_url(thread->win, false, &page) != NSERROR_OK ||
-	    page == NULL) {
+	/*
+	 * Resolve against the document's own base, not the window's URL.
+	 * While a page is loading the window still reports the previous
+	 * one, so a relative request went to whatever was on screen
+	 * before, which for the first page of a session is a file: URL.
+	 */
+	if (thread->htmlc != NULL && thread->htmlc->base_url != NULL) {
+		page = nsurl_ref(thread->htmlc->base_url);
+	} else if (browser_window_get_url(thread->win, false, &page) != NSERROR_OK) {
+		page = NULL;
+	}
+	if (page == NULL) {
 		return JS_NewInt32(ctx, 0);
 	}
 	url_s = JS_ToCString(ctx, argv[0]);

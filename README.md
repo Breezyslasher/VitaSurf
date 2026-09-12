@@ -184,6 +184,12 @@ without this `git status` reports five modified submodules at all times
 and buries anything that matters. A submodule checked out at the wrong
 commit, which is a real problem, is still reported.
 
+Requests from scripts resolve against the document's own base URL rather
+than the window's. While a page is loading the window still reports the
+previous one, so a relative request went wherever the user had been
+before, which for the first page of a session is a `file:` URL that the
+fetcher then refuses.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
