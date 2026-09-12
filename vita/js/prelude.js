@@ -152,6 +152,11 @@ W.dispatchEvent=function(e){return __vitaDispatch(null,e);};
    that measures the page sees what is really on screen. */
 [['innerWidth',2],['outerWidth',2],['innerHeight',3],['outerHeight',3],['scrollX',0],['pageXOffset',0],['scrollY',1],['pageYOffset',1]].forEach(function(e){Object.defineProperty(W,e[0],{get:function(){return viewport()[e[1]];}});});
 W.devicePixelRatio=1;
+/* Frame relationships. Scripts test self !== top to find out whether they
+   are framed, and a missing top is a ReferenceError that takes the script
+   out: Google's page header does exactly that. */
+W.top=W.parent=W.frames=W;W.opener=null;
+try{Object.defineProperty(W,'length',{get:function(){return D.getElementsByTagName('iframe').length;},configurable:true});}catch(e){}
 W.screen={width:960,height:544,availWidth:960,availHeight:544,colorDepth:32,pixelDepth:32,orientation:{type:'landscape-primary'}};
 W.focus=W.blur=W.stop=W.print=W.close=function(){};W.open=function(){return null;};
 function scrollArgs(a,b){if(a&&typeof a==='object')return [Number(a.left)||0,Number(a.top)||0];return [Number(a)||0,Number(b)||0];}
