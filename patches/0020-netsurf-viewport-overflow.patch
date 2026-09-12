@@ -75,7 +75,7 @@ index a218326d8..be288a6b9 100644
  #ifndef NETSURF_HTML_BOX_INSPECT_H
  #define NETSURF_HTML_BOX_INSPECT_H
  
-+#include "html/box.h"
++#include "content/handlers/html/box.h"
 +
 +/**
 + * Used overflow of a box (VitaSurf).
