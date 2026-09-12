@@ -38,7 +38,7 @@ jobs:
           set -u
           mkdir -p /tmp/fixture
           python3 - "${{ steps.req.outputs.url }}" /tmp/fixture <<'PY'
-          import re, sys, os, hashlib, urllib.request, urllib.parse
+          import re, sys, os, hashlib, urllib.request, urllib.parse, html as htmlmod
           url, out = sys.argv[1], sys.argv[2]
           UA = 'Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
           def get(u):
@@ -57,7 +57,7 @@ jobs:
                   ext = os.path.splitext(urllib.parse.urlparse(u).path)[1][:6] or '.bin'
               return kind + '_' + h + ext
           def fetch(u, kind):
-              absu = urllib.parse.urljoin(url, u)
+              absu = urllib.parse.urljoin(url, htmlmod.unescape(u))
               if absu in assets:
                   return assets[absu]
               name = local_name(absu, kind)
