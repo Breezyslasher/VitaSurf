@@ -30,6 +30,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "utils/nsoption.h"
+
 #include <mbedtls/error.h>
 #include <mbedtls/version.h>
 #include <mbedtls/x509_crt.h>
@@ -56,6 +58,29 @@ void vita_log(const char *fmt, ...)
 	va_end(ap);
 	fputc('\n', logf);
 	fflush(logf);
+}
+
+/* exported interface documented in vita_platform.h */
+void vita_options_floor(void)
+{
+	/*
+	 * Two fetches per host was set to keep memory down, before there
+	 * was anything to measure it against. It is far too few for a page
+	 * that loads its code in pieces: GitHub asks for thirteen chunks
+	 * at once and a bundler gives up on one after about two seconds,
+	 * which two at a time cannot meet. Six matches what a browser
+	 * uses, and the fetchers themselves are small next to the
+	 * documents they fetch.
+	 */
+	if (nsoption_int(max_fetchers_per_host) < 6) {
+		nsoption_set_int(max_fetchers_per_host, 6);
+	}
+	if (nsoption_int(max_fetchers) < 12) {
+		nsoption_set_int(max_fetchers, 12);
+	}
+	vita_log("options: %d fetchers, %d per host",
+		 nsoption_int(max_fetchers),
+		 nsoption_int(max_fetchers_per_host));
 }
 
 void vita_log_memory(const char *what)

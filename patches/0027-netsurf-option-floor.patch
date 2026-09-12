@@ -1,0 +1,12 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 87784a142..b4ba5780d 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -2268,6 +2268,7 @@ main(int argc, char** argv)
+ #ifdef __vita__
+ 	/* VitaSurf: settings changed from the menu override the bundled file */
+ 	nsoption_read(VITASURF_USER_CHOICES, nsoptions);
++	vita_options_floor();
+ #endif
+ 	nsoption_commandline(&argc, argv, nsoptions);
+ 

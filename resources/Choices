@@ -12,8 +12,14 @@ window_height:544
 # Memory is the main constraint: keep every cache small.
 memory_cache_size:4194304
 max_cached_fetch_handles:4
-max_fetchers:8
-max_fetchers_per_host:2
+# A page that loads its code in pieces asks for a dozen at once and a
+# bundler gives up on one after a couple of seconds, so these have to be
+# closer to what a browser uses than to what saves the most memory. The
+# fetchers are small next to the documents they fetch. vita_options_floor
+# raises anything lower, because a Choices file written by an earlier
+# build is read after this one.
+max_fetchers:12
+max_fetchers_per_host:6
 # FreeType glyph cache for the bundled DejaVu fonts, in KB.
 fb_font_cachesize:2048
 

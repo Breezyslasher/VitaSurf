@@ -40,6 +40,16 @@
 
 /* Persistence (phase 5): everything the user accumulates lives here. */
 #define VITASURF_USER_CHOICES VITASURF_DATA_DIR "/Choices"
+
+/**
+ * Raise options that are too low to work, after both Choices files.
+ *
+ * A Choices file written by an earlier build is read after the bundled
+ * one, so a value corrected in the bundle never reaches a device that
+ * has been used. These are the ones where the old value stops a page
+ * working rather than merely tuning it.
+ */
+void vita_options_floor(void);
 #define VITASURF_URLS_PATH    VITASURF_DATA_DIR "/URLs"
 #define VITASURF_COOKIES_PATH VITASURF_DATA_DIR "/Cookies"
 #define VITASURF_BOOKMARKS_PATH VITASURF_DATA_DIR "/Bookmarks"
