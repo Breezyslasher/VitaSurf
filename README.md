@@ -141,9 +141,12 @@ On hardware a Wikipedia article, about five and a half thousand
 elements, took roughly fifty seconds and turned a twenty seven second
 page load into an eighty second one, which is a far worse page than the
 one the rebuild would have improved. So a rebuild waits until the page
-has finished loading, never overlaps another, and is skipped above
-`RELAYOUT_MAX_ELEMENTS` elements, which is logged with the count so the
-limit can be tuned from a hardware log. Wikipedia is over it and keeps
+has finished loading, only runs for the page actually on screen, never
+overlaps another, earns a quiet period in proportion to what the last
+one cost, and is skipped above `RELAYOUT_MAX_ELEMENTS` elements. The
+duration and element count are logged so the limit can be tuned from a
+hardware log; measurements so far run from 16 ms for 87 elements to
+536 ms for 1999. Wikipedia is over it and keeps
 its parsed layout; it still renders and scrolls the full article,
 because that depended on the viewport overflow fix rather than on the
 rebuild. The objects a page has already loaded are held across a

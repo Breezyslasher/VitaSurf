@@ -41,6 +41,7 @@
 #include "netsurf/window.h"
 #include "content/urldb.h"
 #include "content/fetch.h"
+#include "content/hlcache.h"
 #include "content/handlers/javascript/js.h"
 #include "content/handlers/javascript/content.h"
 
@@ -106,6 +107,7 @@ struct jsthread {
 	bool relayout_pending;    /**< relayout_callback is scheduled */
 	bool relayout_off;        /**< document too large to rebuild */
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
+	unsigned relayout_ms;     /**< how long the last rebuild took */
 	int event_depth;          /**< DOM event dispatches in progress */
 	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
 	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
@@ -142,7 +144,7 @@ static int next_timer_handle = 1;
 
 #define RELAYOUT_DELAY_MS 40    /**< coalesce a burst of handlers into one */
 #define RELAYOUT_RETRY_MS 500   /**< page busy (dragging, typing): try later */
-#define RELAYOUT_MAX_DELAY_MS 2000 /**< longest wait a slow page earns */
+#define RELAYOUT_MAX_DELAY_MS 8000 /**< longest wait a slow page earns */
 /*
  * A rebuild costs a full box construction and style selection for the
  * whole document, and it runs in one go. On a Wikipedia article, which
@@ -151,7 +153,7 @@ static int next_timer_handle = 1;
  * page than the one the rebuild would have improved. Documents above
  * this size therefore keep the layout they were parsed with.
  */
-#define RELAYOUT_MAX_ELEMENTS 3000
+#define RELAYOUT_MAX_ELEMENTS 4000
 
 /* ------------------------------------------------------------------------ */
 /* Small helpers                                                            */
@@ -1677,6 +1679,23 @@ static void relayout_callback(void *p)
 		return;
 	}
 	/*
+	 * Only the page on screen is worth rebuilding. NetSurf keeps a
+	 * content and its scripts alive for a while after the user has
+	 * moved on, and rebuilding one of those spends the freeze on a
+	 * page nobody is looking at, while the page they are waiting for
+	 * loads behind it.
+	 */
+	if (thread->win != NULL) {
+		struct hlcache_handle *h = browser_window_get_content(thread->win);
+
+		if (h == NULL ||
+		    hlcache_handle_get_content(h) != (struct content *)htmlc) {
+			thread->dom_dirty = false;
+			return;
+		}
+	}
+
+	/*
 	 * Wait for the page to finish loading. A rebuild in the middle of
 	 * one throws away work still arriving and holds up everything the
 	 * user is waiting for.
@@ -1716,9 +1735,10 @@ static void relayout_callback(void *p)
 	thread->dom_dirty = false;
 	/* the rebuild runs to completion here, so this is also how long
 	 * the page was frozen for */
+	thread->relayout_ms = (unsigned)(now_ms() - t0);
 	vita_log("qjs: layout rebuilt after script changes in %u ms "
 		 "(%u elements)%s",
-		 (unsigned)(now_ms() - t0), thread->dom_elements,
+		 thread->relayout_ms, thread->dom_elements,
 		 err == NSERROR_OK ? "" : " (failed)");
 }
 
@@ -1736,6 +1756,22 @@ static void schedule_relayout(jsthread *thread, int ms)
 	if (thread->htmlc != NULL && thread->htmlc->base.active > 0 &&
 	    ms < RELAYOUT_MAX_DELAY_MS) {
 		ms = RELAYOUT_MAX_DELAY_MS;
+	}
+	/*
+	 * Earn quiet in proportion to what the last rebuild cost. A page
+	 * that keeps touching the DOM would otherwise spend most of its
+	 * time frozen, and one measured at four and a half seconds should
+	 * not be asked again a moment later.
+	 */
+	if (thread->relayout_ms > 0) {
+		unsigned floor_ms = thread->relayout_ms * 4;
+
+		if (floor_ms > RELAYOUT_MAX_DELAY_MS) {
+			floor_ms = RELAYOUT_MAX_DELAY_MS;
+		}
+		if ((unsigned)ms < floor_ms) {
+			ms = (int)floor_ms;
+		}
 	}
 	if (guit->misc->schedule(ms, relayout_callback, thread) == NSERROR_OK) {
 		thread->relayout_pending = true;
