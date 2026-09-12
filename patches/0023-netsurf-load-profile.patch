@@ -1,5 +1,5 @@
 diff --git a/content/content.c b/content/content.c
-index 448cf2369..c0455fc70 100644
+index 448cf2369..229fad007 100644
 --- a/content/content.c
 +++ b/content/content.c
 @@ -28,6 +28,7 @@
@@ -10,7 +10,7 @@ index 448cf2369..c0455fc70 100644
  #include "utils/messages.h"
  #include "utils/corestrings.h"
  #include "netsurf/browser_window.h"
-@@ -80,10 +81,21 @@ static void content_convert(struct content *c)
+@@ -80,10 +81,50 @@ static void content_convert(struct content *c)
  	      nsurl_access_log(llcache_handle_get_url(c->llcache)), c);
  
  	if (c->handler->data_complete != NULL) {
@@ -28,6 +28,35 @@ index 448cf2369..c0455fc70 100644
 +			vitasurf_ms_css += (unsigned int)(t1 - t0);
 +		} else if (type & CONTENT_IMAGE) {
 +			vitasurf_ms_image += (unsigned int)(t1 - t0);
++		}
++		/*
++		 * Name anything that took a noticeable slice of a load.
++		 * A total is enough to say a phase is slow and useless for
++		 * saying which document made it slow, and one stylesheet
++		 * has been taking seventeen seconds without saying so.
++		 */
++		if (t1 - t0 >= 500) {
++			const char *url;
++			char tail[112];
++			size_t size = 0, len;
++
++			content__get_source_data(c, &size);
++			url = nsurl_access(llcache_handle_get_url(c->llcache));
++			/*
++			 * A bundler's URL carries its whole module list, so
++			 * keep the end of a long one: the file name is what
++			 * identifies it and it is at the front, but the
++			 * query is what makes it long.
++			 */
++			len = strlen(url);
++			if (len > sizeof(tail) - 1) {
++				snprintf(tail, sizeof(tail), "%.*s...",
++					 (int)(sizeof(tail) - 4), url);
++				url = tail;
++			}
++			vita_log("slow convert: %u ms for %u KB of %s",
++				 (unsigned int)(t1 - t0),
++				 (unsigned int)(size / 1024), url);
 +		}
  		/* Conversion to the READY state will unlock the content */
  	} else {
@@ -172,10 +201,10 @@ index c64718531..e69c1dc44 100644
 +	vitasurf_ms_layout = 0;
 +}
 diff --git a/utils/utils.h b/utils/utils.h
-index 8a051633c..feefae910 100644
+index 8a051633c..0855cbe1e 100644
 --- a/utils/utils.h
 +++ b/utils/utils.h
-@@ -120,4 +120,21 @@ bool is_dir(const char *path);
+@@ -120,4 +120,31 @@ bool is_dir(const char *path);
  #endif
  
  
@@ -195,5 +224,15 @@ index 8a051633c..feefae910 100644
 +
 +/** Zero the load profile counters, at the start of a navigation. */
 +void vitasurf_profile_reset(void);
++
++/**
++ * Write a line to the VitaSurf log (vita/platform/vita_platform.c).
++ *
++ * NSLOG goes through a filter that a release build sets to warnings
++ * only, and the frontend's own log is the one a hardware report
++ * actually contains, so anything meant to be read from a device has to
++ * go here.
++ */
++void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 +
  #endif
