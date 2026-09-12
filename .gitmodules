@@ -1,48 +1,64 @@
 [submodule "deps/buildsystem"]
 	path = deps/buildsystem
 	url = https://github.com/netsurf-browser/buildsystem.git
+	ignore = dirty
 [submodule "deps/libwapcaplet"]
 	path = deps/libwapcaplet
 	url = https://github.com/netsurf-browser/libwapcaplet.git
+	ignore = dirty
 [submodule "deps/libparserutils"]
 	path = deps/libparserutils
 	url = https://github.com/netsurf-browser/libparserutils.git
+	ignore = dirty
 [submodule "deps/libnslog"]
 	path = deps/libnslog
 	url = https://github.com/netsurf-browser/libnslog.git
+	ignore = dirty
 [submodule "deps/libnsutils"]
 	path = deps/libnsutils
 	url = https://github.com/netsurf-browser/libnsutils.git
+	ignore = dirty
 [submodule "deps/libhubbub"]
 	path = deps/libhubbub
 	url = https://github.com/netsurf-browser/libhubbub.git
+	ignore = dirty
 [submodule "deps/libdom"]
 	path = deps/libdom
 	url = https://github.com/netsurf-browser/libdom.git
+	ignore = dirty
 [submodule "deps/libcss"]
 	path = deps/libcss
 	url = https://github.com/netsurf-browser/libcss.git
+	ignore = dirty
 [submodule "deps/libnsbmp"]
 	path = deps/libnsbmp
 	url = https://github.com/netsurf-browser/libnsbmp.git
+	ignore = dirty
 [submodule "deps/libnsgif"]
 	path = deps/libnsgif
 	url = https://github.com/netsurf-browser/libnsgif.git
+	ignore = dirty
 [submodule "deps/libsvgtiny"]
 	path = deps/libsvgtiny
 	url = https://github.com/netsurf-browser/libsvgtiny.git
+	ignore = dirty
 [submodule "deps/libnspsl"]
 	path = deps/libnspsl
 	url = https://github.com/netsurf-browser/libnspsl.git
+	ignore = dirty
 [submodule "deps/libnsfb"]
 	path = deps/libnsfb
 	url = https://github.com/netsurf-browser/libnsfb.git
+	ignore = dirty
 [submodule "deps/nsgenbind"]
 	path = deps/nsgenbind
 	url = https://github.com/netsurf-browser/nsgenbind.git
+	ignore = dirty
 [submodule "deps/netsurf"]
 	path = deps/netsurf
 	url = https://github.com/netsurf-browser/netsurf.git
+	ignore = dirty
 [submodule "deps/utf8proc"]
 	path = deps/utf8proc
 	url = https://github.com/JuliaStrings/utf8proc.git
+	ignore = dirty

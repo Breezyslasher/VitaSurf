@@ -162,6 +162,12 @@ reaches listeners registered anywhere, and a `matchMedia` that evaluates
 media queries against the actual viewport instead of always answering
 false.
 
+Every submodule is marked `ignore = dirty` in `.gitmodules`. Applying the
+patch series leaves each one with a modified working tree by design, so
+without this `git status` reports five modified submodules at all times
+and buries anything that matters. A submodule checked out at the wrong
+commit, which is a real problem, is still reported.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus
