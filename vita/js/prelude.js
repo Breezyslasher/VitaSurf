@@ -439,7 +439,7 @@ W.Event=Event;W.CustomEvent=CustomEvent;
  * so the name has to exist even where nothing here will ever construct
  * one. They all behave as Event; what differs between them is fields we
  * do not produce. */
-['UIEvent','MouseEvent','KeyboardEvent','FocusEvent','WheelEvent','PointerEvent','TouchEvent',
+['FocusEvent','WheelEvent','PointerEvent','TouchEvent',
  'InputEvent','CompositionEvent','DragEvent','ClipboardEvent','ProgressEvent','ErrorEvent',
  'PopStateEvent','HashChangeEvent','PageTransitionEvent','StorageEvent','SubmitEvent',
  'BeforeUnloadEvent','MediaQueryListEvent','CloseEvent','MessageEvent','SecurityPolicyViolationEvent',
@@ -482,6 +482,92 @@ var WindowProto={};Object.setPrototypeOf(W,WindowProto);
 });
 if(!WindowProto.dispatchEvent)WindowProto.dispatchEvent=function(e){return __vitaDispatch(null,e);};
 W.Window=function(){};W.Window.prototype=WindowProto;W.Navigator=W.Location=W.History=W.Screen=W.Storage=Storage;
+/* --- event handler properties -------------------------------------------
+ * el.onclick = fn is how a great deal of code registers a handler, and
+ * none of these existed. The names come from the WebIDL the specs are
+ * written in, by way of the conformance page, rather than from whichever
+ * one a site happened to use.
+ *
+ * Assignment cannot be implemented by adding and removing listeners,
+ * because removeEventListener does not remove anything here. Register one
+ * listener per name the first time and let it call whatever the property
+ * currently holds, so reassigning swaps the target and assigning null
+ * stops it. */
+var EVENT_HANDLERS=('abort auxclick beforeinput beforematch beforetoggle blur cancel canplay '+
+'canplaythrough change click close command contextlost contextmenu contextrestored copy cuechange '+
+'cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied '+
+'ended error focus formdata gotpointercapture input invalid keydown keypress keyup load '+
+'loadeddata loadedmetadata loadstart lostpointercapture mousedown mouseenter mouseleave mousemove '+
+'mouseout mouseover mouseup paste pause play playing pointercancel pointerdown pointerenter '+
+'pointerleave pointermove pointerout pointerover pointerrawupdate pointerup progress ratechange '+
+'reset resize scroll scrollend securitypolicyviolation seeked seeking select selectionchange '+
+'selectstart slotchange stalled submit suspend timeupdate toggle touchcancel touchend touchmove '+
+'touchstart volumechange waiting wheel').split(' ');
+var WINDOW_HANDLERS=('afterprint beforeprint beforeunload hashchange languagechange message '+
+'messageerror offline online pagehide pagereveal pageshow pageswap popstate rejectionhandled '+
+'storage unhandledrejection unload').split(' ');
+var DOCUMENT_HANDLERS=['readystatechange','visibilitychange'];
+function defineHandler(obj,type){
+ var prop='on'+type, slot='__on_'+type, wrapped='__onw_'+type;
+ Object.defineProperty(obj,prop,{configurable:true,
+  get:function(){return this[slot]||null;},
+  set:function(f){
+   var self=this;
+   if(!Object.prototype.hasOwnProperty.call(this,wrapped)){
+    var w=function(e){var h=self[slot];if(typeof h==='function')return h.call(self,e);};
+    Object.defineProperty(this,wrapped,{value:w,writable:true,enumerable:false,configurable:true});
+    if(typeof this.addEventListener==='function')this.addEventListener(type,w);
+   }
+   Object.defineProperty(this,slot,
+    {value:(typeof f==='function'?f:null),writable:true,enumerable:false,configurable:true});
+  }});
+}
+EVENT_HANDLERS.forEach(function(t){defineHandler(P,t);defineHandler(D,t);defineHandler(W,t);});
+WINDOW_HANDLERS.forEach(function(t){defineHandler(W,t);defineHandler(P,t);});
+DOCUMENT_HANDLERS.forEach(function(t){defineHandler(D,t);});
+
+/* --- the event interfaces, with the fields handlers read ---------------- */
+function UIEventC(type,init){Event.call(this,type,init);init=init||{};
+ this.detail=init.detail||0;this.view=init.view||W;this.which=init.which||0;}
+UIEventC.prototype=Object.create(Event.prototype);
+UIEventC.prototype.initUIEvent=function(t,b,c,v,d){this.initEvent(t,b,c);this.view=v;this.detail=d;};
+function MouseEventC(type,init){UIEventC.call(this,type,init);init=init||{};
+ ['screenX','screenY','clientX','clientY','movementX','movementY'].forEach(function(k){
+  this[k]=init[k]||0;},this);
+ this.pageX=this.clientX;this.pageY=this.clientY;
+ this.offsetX=this.clientX;this.offsetY=this.clientY;
+ this.layerX=this.clientX;this.layerY=this.clientY;
+ this.x=this.clientX;this.y=this.clientY;
+ this.button=init.button||0;this.buttons=init.buttons||0;
+ this.ctrlKey=!!init.ctrlKey;this.shiftKey=!!init.shiftKey;
+ this.altKey=!!init.altKey;this.metaKey=!!init.metaKey;
+ this.relatedTarget=init.relatedTarget||null;}
+MouseEventC.prototype=Object.create(UIEventC.prototype);
+MouseEventC.prototype.getModifierState=function(k){
+ return k==='Control'?this.ctrlKey:k==='Shift'?this.shiftKey:
+        k==='Alt'?this.altKey:k==='Meta'?this.metaKey:false;};
+MouseEventC.prototype.initMouseEvent=function(t,b,c){this.initEvent(t,b,c);};
+function KeyboardEventC(type,init){UIEventC.call(this,type,init);init=init||{};
+ this.key=init.key||'';this.code=init.code||'';
+ this.keyCode=init.keyCode||0;this.charCode=init.charCode||0;
+ this.location=init.location||0;this.repeat=!!init.repeat;this.isComposing=!!init.isComposing;
+ this.ctrlKey=!!init.ctrlKey;this.shiftKey=!!init.shiftKey;
+ this.altKey=!!init.altKey;this.metaKey=!!init.metaKey;}
+KeyboardEventC.prototype=Object.create(UIEventC.prototype);
+KeyboardEventC.prototype.getModifierState=MouseEventC.prototype.getModifierState;
+KeyboardEventC.prototype.initKeyboardEvent=function(t,b,c){this.initEvent(t,b,c);};
+/* Event itself: the members a handler reads that were not there. */
+Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,get:function(){return 2;}});
+Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,get:function(){return false;}});
+Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){return false;}});
+Object.defineProperty(Event.prototype,'srcElement',{configurable:true,get:function(){return this.target;}});
+Object.defineProperty(Event.prototype,'returnValue',{configurable:true,
+ get:function(){return !this.defaultPrevented;},set:function(v){if(!v)this.preventDefault();}});
+Object.defineProperty(Event.prototype,'cancelBubble',{configurable:true,
+ get:function(){return false;},set:function(){}});
+Event.prototype.composedPath=function(){
+ var out=[],n=this.target;while(n){out.push(n);n=n.parentNode;}out.push(D);out.push(W);return out;};
+
 /* MessageChannel, which schedulers use to get a macrotask: React and
  * YouTube's player both post to a port instead of calling setTimeout(0),
  * because a real browser clamps nested timeouts and does not clamp this.
@@ -505,6 +591,11 @@ MessagePort.prototype.dispatchEvent=function(){return true;};
 function MessageChannel(){this.port1=new MessagePort();this.port2=new MessagePort();this.port1._peer=this.port2;this.port2._peer=this.port1;}
 W.MessageChannel=MessageChannel;W.MessagePort=MessagePort;
 W.MessageEvent=W.MessageEvent||Event;
+/* The three with real fields; the aliases above stay plain Events. */
+W.UIEvent=UIEventC;W.MouseEvent=MouseEventC;W.KeyboardEvent=KeyboardEventC;
+/* These carry a mouse's or a key's fields, so give them those. */
+W.WheelEvent=W.PointerEvent=W.DragEvent=MouseEventC;
+W.FocusEvent=UIEventC;W.InputEvent=UIEventC;
 if(!W.queueMicrotask)W.queueMicrotask=function(f){Promise.resolve().then(f);};
 if(!W.structuredClone)W.structuredClone=function(v){try{return JSON.parse(JSON.stringify(v));}catch(e){return v;}};
 W.MutationObserver=function(){};W.MutationObserver.prototype.observe=W.MutationObserver.prototype.disconnect=function(){};W.MutationObserver.prototype.takeRecords=function(){return [];};
