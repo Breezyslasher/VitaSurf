@@ -3408,4 +3408,86 @@ P.replaceData=function(offset,count,data){
    return d.get.call(this);},
   set:function(v){d.set.call(this,(v===null||v===undefined)?'':v);}});})();
 D.textContent=null;
+
+/* --- a doctype that is a node -------------------------------------------
+ * createDocumentType handed back a plain object with a name on it, so
+ * everything a doctype is asked for -- nodeName, nodeType, its owner --
+ * was undefined.
+ */
+function DocumentType(name,publicId,systemId){
+ this.name=String(name);
+ this.publicId=publicId===undefined?'':String(publicId);
+ this.systemId=systemId===undefined?'':String(systemId);
+ this.nodeName=this.name;
+ this.nodeType=10;
+ this.nodeValue=null;
+ this.textContent=null;
+ this.childNodes=[];
+ this.parentNode=null;
+ this.ownerDocument=D;}
+DocumentType.prototype.before=DocumentType.prototype.after=
+ DocumentType.prototype.replaceWith=DocumentType.prototype.remove=function(){};
+DocumentType.prototype.cloneNode=function(){
+ return new DocumentType(this.name,this.publicId,this.systemId);};
+DocumentType.prototype.isEqualNode=function(o){
+ return !!o&&o.nodeType===10&&o.name===this.name&&
+  o.publicId===this.publicId&&o.systemId===this.systemId;};
+W.DocumentType=DocumentType;
+Object.defineProperty(D,'doctype',{configurable:true,
+ get:function(){return priv(D,'__doctype',function(){
+  return new DocumentType('html','','');});}});
+/* What the name may contain. Browsers are far looser here than the XML
+   Name production reads: 1foo, @foo, ~ and } are all accepted, and only
+   a character that could never appear in markup -- a space, an angle
+   bracket, a quote -- is refused. The tests are the authority for this,
+   not my reading of the grammar. */
+var BAD_NAME=/[\s<>&"'\/=\u0000]/;
+D.implementation.createDocumentType=function(qualifiedName,publicId,systemId){
+ needArgs(arguments.length,3,'createDocumentType');
+ var n=String(qualifiedName);
+ if(n===''||BAD_NAME.test(n))throw new DOMException(
+  'The string contains invalid characters.','InvalidCharacterError');
+ var parts=n.split(':');
+ if(parts.length>2||(parts.length===2&&(parts[0]===''||parts[1]==='')))
+  throw new DOMException(
+   'The qualified name provided has an invalid prefix.','NamespaceError');
+ return new DocumentType(n,publicId,systemId);};
+
+/* --- where before(), after() and replaceWith() put things ---------------
+ * The reference point is the first sibling that is not itself one of the
+ * nodes being inserted. Using the immediate sibling put an element that
+ * was already there in the wrong place, because it was the reference and
+ * the reference was about to move.
+ */
+function viableNext(node,nodes){
+ var n=node.nextSibling;
+ while(n&&nodes.indexOf(n)>=0)n=n.nextSibling;
+ return n;}
+function viablePrev(node,nodes){
+ var n=node.previousSibling;
+ while(n&&nodes.indexOf(n)>=0)n=n.previousSibling;
+ return n;}
+P.before=function(){
+ var p=this.parentNode;
+ if(!p)return;
+ var n=toNodes(arguments),prev=viablePrev(this,n),f=D.createDocumentFragment(),i;
+ /* into a fragment first: moving them out is what makes the reference
+    point settle, and inserting one at a time against a reference that is
+    itself moving put them in the wrong order. */
+ for(i=0;i<n.length;i++)f.appendChild(n[i]);
+ var ref=prev?prev.nextSibling:p.firstChild;
+ if(ref)p.insertBefore(f,ref);else p.appendChild(f);};
+P.after=function(){
+ var p=this.parentNode;
+ if(!p)return;
+ var n=toNodes(arguments),ref=viableNext(this,n),f=D.createDocumentFragment(),i;
+ for(i=0;i<n.length;i++)f.appendChild(n[i]);
+ if(ref)p.insertBefore(f,ref);else p.appendChild(f);};
+P.replaceWith=function(){
+ var p=this.parentNode;
+ if(!p)return;
+ var n=toNodes(arguments),ref=viableNext(this,n),f=D.createDocumentFragment(),i;
+ for(i=0;i<n.length;i++)f.appendChild(n[i]);
+ if(this.parentNode===p)p.removeChild(this);
+ if(ref)p.insertBefore(f,ref);else p.appendChild(f);};
 })();
