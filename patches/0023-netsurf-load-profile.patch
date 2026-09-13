@@ -136,7 +136,7 @@ index 7867f62b8..1f66b4062 100644
  	guit->misc->schedule(0, (void *)convert_xml_to_box, ctx);
  }
 diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
-index d977a2048..cf9f1ed20 100644
+index d977a2048..ae532c12c 100644
 --- a/content/handlers/html/html.c
 +++ b/content/handlers/html/html.c
 @@ -740,10 +740,14 @@ html_process_data(struct content *c, const char *data, unsigned int size)
@@ -154,7 +154,41 @@ index d977a2048..cf9f1ed20 100644
  
  	err = libdom_hubbub_error_to_nserror(dom_ret);
  
-@@ -1084,6 +1088,7 @@ static void html_reformat(struct content *c, int width, int height)
+@@ -891,8 +895,33 @@ static bool html_forms_from_dom(html_content *htmlc)
+ }
+ 
+ 
++static bool html_begin_conversion_inner(html_content *htmlc);
++
++/* exported interface documented in html/private.h */
+ bool
+ html_begin_conversion(html_content *htmlc)
++{
++	uint64_t t0 = 0, t1 = 0;
++	bool ret;
++
++	/*
++	 * Everything the page has left to do happens in here: the deferred
++	 * scripts run, the boxes are built and the page is laid out. It is
++	 * reached from inside the content conversion of whatever the page
++	 * was last waiting for, usually the last stylesheet to arrive, so
++	 * hand the time up for that conversion to subtract. Without this a
++	 * 6 KB stylesheet reports sixteen seconds that were never its own,
++	 * which is what the load profile has been saying. (VitaSurf)
++	 */
++	nsu_getmonotonic_ms(&t0);
++	ret = html_begin_conversion_inner(htmlc);
++	nsu_getmonotonic_ms(&t1);
++	vitasurf_ms_nested += t1 - t0;
++	return ret;
++}
++
++static bool
++html_begin_conversion_inner(html_content *htmlc)
+ {
+ 	dom_node *html;
+ 	dom_exception exc; /* returned by libdom functions */
+@@ -1084,6 +1113,7 @@ static void html_reformat(struct content *c, int width, int height)
  
  	htmlc->reflowing = true;
  
