@@ -406,9 +406,37 @@ P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))re
 Object.defineProperty(P,'nextElementSibling',{configurable:true,get:function(){var n=this.nextSibling;while(n&&n.nodeType!==1)n=n.nextSibling;return n||null;}});
 Object.defineProperty(P,'previousElementSibling',{configurable:true,get:function(){var n=this.previousSibling;while(n&&n.nodeType!==1)n=n.previousSibling;return n||null;}});
 Object.defineProperty(P,'childElementCount',{configurable:true,get:function(){return this.children.length;}});
-Object.defineProperty(P,'localName',{configurable:true,get:function(){var t=this.tagName;return t?t.toLowerCase():'';}});
-Object.defineProperty(P,'namespaceURI',{configurable:true,get:function(){return 'http://www.w3.org/1999/xhtml';}});
-Object.defineProperty(P,'prefix',{configurable:true,get:function(){return null;}});
+/* localName, prefix and namespaceURI come from libdom now (qjs.c). An
+   SVG clipPath keeps its capital P and an element made with a prefix
+   keeps it, neither of which can be guessed from the tag name. These
+   stand in only if the C side has no answer -- a node type that has no
+   local name at all. */
+/* HTML lower-cases ASCII letters and leaves everything else alone, so
+   toLowerCase is too much: createElement("\u00c4") keeps its capital. */
+function asciiLower(t){
+ return String(t).replace(/[A-Z]/g,function(c){
+  return String.fromCharCode(c.charCodeAt(0)+32);});}
+(function(){
+ ['prefix','namespaceURI'].forEach(function(k){
+  var d=Object.getOwnPropertyDescriptor(P,k);
+  if(!d||!d.get)return;
+  Object.defineProperty(P,k,{configurable:true,get:function(){
+   var v=d.get.call(this);
+   if(v!==undefined&&v!==null)return v;
+   if(k==='namespaceURI')
+    return this.nodeType===1?'http://www.w3.org/1999/xhtml':null;
+   return null;}});});
+ /* The local name comes from libdom, which strips a prefix correctly
+    but holds every element name upper-cased -- an SVG clipPath is
+    stored as CLIPPATH and its capital P cannot be recovered here. Take
+    the prefix stripping and lower-case the rest. */
+ var dl=Object.getOwnPropertyDescriptor(P,'localName');
+ Object.defineProperty(P,'localName',{configurable:true,get:function(){
+  var v=(dl&&dl.get)?dl.get.call(this):null;
+  if(v===undefined||v===null){
+   var t=this.tagName;
+   return t?asciiLower(t):'';}
+  return this.nodeType===1?asciiLower(v):v;}});})();
 Object.defineProperty(P,'baseURI',{configurable:true,get:function(){return location.href;}});
 Object.defineProperty(P,'assignedSlot',{configurable:true,get:function(){return null;}});
 Object.defineProperty(P,'slot',{configurable:true,get:function(){var v=this.getAttribute('slot');return v===null?'':v;},set:function(v){this.setAttribute('slot',String(v));}});
@@ -617,13 +645,40 @@ Object.defineProperty(D,'images',{configurable:true,get:function(){return D.getE
    have an href, not every a. */
 Object.defineProperty(D,'scripts',{configurable:true,get:function(){return D.getElementsByTagName('script');}});
 D.defaultView=window;D.nodeType=9;D.nodeName='#document';D.documentMode=undefined;D.compatMode='CSS1Compat';D.hidden=false;D.visibilityState='visible';
-D.createEvent=function(t){return /custom/i.test(t)?new CustomEvent(''):new Event('');};D.dispatchEvent=function(e){return __vitaDispatch(null,e);};D.hasFocus=function(){return true;};
+/* createEvent takes a fixed set of legacy names, case insensitively, and
+   refuses everything else. It used to answer every name with a plain
+   Event, so a page that made a MouseEvent this way and then called
+   initMouseEvent on it stopped there. */
+var EVENT_ALIASES={
+ beforeunloadevent:'BeforeUnloadEvent',compositionevent:'CompositionEvent',
+ customevent:'CustomEvent',devicemotionevent:'DeviceMotionEvent',
+ deviceorientationevent:'DeviceOrientationEvent',dragevent:'DragEvent',
+ event:'Event',events:'Event',focusevent:'FocusEvent',
+ hashchangeevent:'HashChangeEvent',htmlevents:'Event',
+ keyboardevent:'KeyboardEvent',messageevent:'MessageEvent',
+ mouseevent:'MouseEvent',mouseevents:'MouseEvent',
+ storageevent:'StorageEvent',svgevents:'Event',textevent:'TextEvent',
+ touchevent:'TouchEvent',uievent:'UIEvent',uievents:'UIEvent'};
+D.createEvent=function(t){
+ needArgs(arguments.length,1,'createEvent');
+ var iface=EVENT_ALIASES[String(t).toLowerCase()],C=iface?W[iface]:null,ev;
+ if(typeof C!=='function')throw new DOMException(
+  "The provided event type ('"+String(t)+"') is invalid.",'NotSupportedError');
+ ev=new C('');
+ /* an event made this way is uninitialised until initEvent is called */
+ ev.type='';ev.target=null;ev.currentTarget=null;ev.eventPhase=0;
+ ev.bubbles=false;ev.cancelable=false;ev.defaultPrevented=false;
+ ev.isTrusted=false;
+ return ev;};D.dispatchEvent=function(e){return __vitaDispatch(null,e);};D.hasFocus=function(){return true;};
 /* The qualified name has to satisfy the same namespace rules as an
    attribute's before an element is made from it. */
-D.createElementNS=function(ns,t){
- needArgs(arguments.length,2,'createElementNS');
- nsExtract(ns,t,'createElementNS');
- return D.createElement(t);};
+(function(){
+ var real=D.createElementNS;
+ D.createElementNS=function(ns,t){
+  needArgs(arguments.length,2,'createElementNS');
+  nsExtract(ns,t,'createElementNS');
+  var el=typeof real==='function'?real.call(D,ns,t):null;
+  return el||D.createElement(t);};})();
 D.createRange=function(){var r={startContainer:D.body,endContainer:D.body,startOffset:0,endOffset:0,collapsed:true,
  commonAncestorContainer:D.body,
  setStart:function(n,o){this.startContainer=n;this.startOffset=o;},setEnd:function(n,o){this.endContainer=n;this.endOffset=o;},
@@ -1036,7 +1091,11 @@ KeyboardEventC.prototype=Object.create(UIEventC.prototype);
 KeyboardEventC.prototype.getModifierState=MouseEventC.prototype.getModifierState;
 KeyboardEventC.prototype.initKeyboardEvent=function(t,b,c){this.initEvent(t,b,c);};
 /* Event itself: the members a handler reads that were not there. */
-Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,get:function(){return 2;}});
+/* NONE until a dispatch puts the event in a phase. It used to read
+   AT_TARGET always, so an untouched event claimed to be mid-dispatch. */
+Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,
+ get:function(){return this._phase===undefined?0:this._phase;},
+ set:function(v){shadowProp(this,'_phase',v|0);}});
 Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,get:function(){return false;}});
 Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){return false;}});
 Object.defineProperty(Event.prototype,'srcElement',{configurable:true,get:function(){return this.target;}});
@@ -2619,6 +2678,13 @@ eventClass('SecurityPolicyViolationEvent',{documentURI:'',referrer:'',blockedURI
  violatedDirective:'',effectiveDirective:'',originalPolicy:'',disposition:'enforce',
  sourceFile:'',statusCode:0,lineNumber:0,columnNumber:0,sample:''});
 eventClass('AnimationEvent',{animationName:'',elapsedTime:0,pseudoElement:''});
+/* createEvent names them, so they need interfaces of their own rather
+   than sharing Event's. */
+eventClass('DeviceMotionEvent',{acceleration:null,
+ accelerationIncludingGravity:null,rotationRate:null,interval:0});
+eventClass('DeviceOrientationEvent',{alpha:null,beta:null,gamma:null,
+ absolute:false});
+eventClass('TextEvent',{data:''},W.UIEvent);
 eventClass('TransitionEvent',{propertyName:'',elapsedTime:0,pseudoElement:''});
 eventClass('FocusEvent',{relatedTarget:null},W.UIEvent);
 eventClass('TouchEvent',{touches:[],targetTouches:[],changedTouches:[],

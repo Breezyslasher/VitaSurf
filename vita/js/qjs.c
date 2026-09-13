@@ -1206,6 +1206,45 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
  *
  * __vitaCreateIn(doc, kind, name): kind is the node type wanted.
  */
+/* A node's local name and prefix as libdom holds them, rather than
+ * guessed from the tag name: an SVG clipPath keeps its capital P, and
+ * an element made with a prefix keeps it. */
+static JSValue node_get_local_name(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	dom_string *s = NULL;
+
+	if (node == NULL) return JS_UNDEFINED;
+	if (dom_node_get_local_name(node, &s) != DOM_NO_ERR || s == NULL) {
+		return JS_NULL;
+	}
+	return str_result(ctx, s);
+}
+
+static JSValue node_get_prefix(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	dom_string *s = NULL;
+
+	if (node == NULL) return JS_NULL;
+	if (dom_node_get_prefix(node, &s) != DOM_NO_ERR || s == NULL) {
+		return JS_NULL;
+	}
+	return str_result(ctx, s);
+}
+
+static JSValue node_get_namespace_uri(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	dom_string *s = NULL;
+
+	if (node == NULL) return JS_NULL;
+	if (dom_node_get_namespace(node, &s) != DOM_NO_ERR || s == NULL) {
+		return JS_NULL;
+	}
+	return str_result(ctx, s);
+}
+
 static JSValue win_vita_create_in(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
@@ -1903,6 +1942,9 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CFUNC_DEF("setAttributeNS", 3, node_set_attribute_ns),
 	JS_CFUNC_DEF("hasAttributeNS", 2, node_has_attribute_ns),
 	JS_CFUNC_DEF("removeAttributeNS", 2, node_remove_attribute_ns),
+	JS_CGETSET_DEF("localName", node_get_local_name, NULL),
+	JS_CGETSET_DEF("prefix", node_get_prefix, NULL),
+	JS_CGETSET_DEF("namespaceURI", node_get_namespace_uri, NULL),
 	JS_CFUNC_DEF("appendChild", 1, node_append_child),
 	JS_CFUNC_DEF("removeChild", 1, node_remove_child),
 	JS_CFUNC_DEF("insertBefore", 2, node_insert_before),
@@ -2037,6 +2079,40 @@ static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 	if (text) JS_FreeCString(ctx, text);
 	r = wrap_node(ctx, (struct dom_node *)node);
 	if (node != NULL) dom_node_unref((struct dom_node *)node);
+	return r;
+}
+
+/*
+ * An element in a namespace, keeping its prefix and the case of its
+ * local name. createElementNS used to drop to createElement, which
+ * lowercases and has no namespace, so createElementNS(svg, "clipPath")
+ * became a clippath element in the HTML namespace.
+ */
+static JSValue doc_create_element_ns(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_document *doc = thread_document(thread);
+	const char *nsheld = NULL, *qname;
+	dom_string *ns, *q;
+	struct dom_element *el = NULL;
+	JSValue r;
+
+	(void)this_val;
+	if (doc == NULL || argc < 2) return JS_NULL;
+	ns = ns_arg(ctx, argv[0], &nsheld);
+	qname = JS_ToCString(ctx, argv[1]);
+	q = to_dom_string(qname);
+	if (q != NULL) {
+		dom_document_create_element_ns(doc, ns, q, &el);
+		dom_string_unref(q);
+	}
+	if (ns != NULL) dom_string_unref(ns);
+	if (nsheld) JS_FreeCString(ctx, nsheld);
+	if (qname) JS_FreeCString(ctx, qname);
+	if (el == NULL) return JS_NULL;
+	r = wrap_node(ctx, (struct dom_node *)el);
+	dom_node_unref((struct dom_node *)el);
 	return r;
 }
 
@@ -2247,6 +2323,7 @@ static const JSCFunctionListEntry document_proto[] = {
 	JS_CFUNC_DEF("getElementById", 1, doc_get_element_by_id),
 	JS_CFUNC_DEF("getElementsByTagName", 1, doc_get_elements_by_tag_name),
 	JS_CFUNC_DEF("createElement", 1, doc_create_element),
+	JS_CFUNC_DEF("createElementNS", 2, doc_create_element_ns),
 	JS_CFUNC_DEF("createTextNode", 1, doc_create_text_node),
 	JS_CFUNC_DEF("createComment", 1, doc_create_comment),
 	JS_CFUNC_DEF("createDocumentFragment", 0, doc_create_document_fragment),
@@ -3255,6 +3332,16 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 				  JS_DupValue(ctx, global));
 	} else {
 		event_obj = wrap_event(ctx, evt);
+	}
+	/* which phase the listener is being called in, which an event out
+	 * of dispatch does not have at all */
+	{
+		dom_event_flow_phase phase = DOM_AT_TARGET;
+
+		if (dom_event_get_event_phase(evt, &phase) == DOM_NO_ERR) {
+			JS_SetPropertyStr(ctx, event_obj, "eventPhase",
+					  JS_NewInt32(ctx, (int)phase));
+		}
 	}
 	args[0] = event_obj;
 	ret = JS_Call(ctx, l->func, global, 1, args);
