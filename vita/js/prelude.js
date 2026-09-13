@@ -1209,8 +1209,15 @@ DOCUMENT_HANDLERS.forEach(function(t){defineHandler(D,t);});
 
 /* --- the event interfaces, with the fields handlers read ---------------- */
 function UIEventC(type,init){Event.call(this,type,init);init=init||{};
- this.detail=init.detail||0;this.view=init.view||W;this.which=init.which||0;}
+ this.detail=init.detail||0;
+ /* the default view is null, not the window: a UIEvent nobody gave a
+    view to has none */
+ this.view=init.view!==undefined&&init.view!==null?init.view:null;
+ this.which=init.which||0;}
 UIEventC.prototype=Object.create(Event.prototype);
+/* The fields these declare, so an interface built on one inherits them
+   -- a FocusEvent has view and detail, and had neither. */
+UIEventC.__vitaFields={view:null,detail:0,which:0};
 UIEventC.prototype.initUIEvent=function(t,b,c,v,d){this.initEvent(t,b,c);this.view=v;this.detail=d;};
 function MouseEventC(type,init){UIEventC.call(this,type,init);init=init||{};
  ['screenX','screenY','clientX','clientY','movementX','movementY'].forEach(function(k){
@@ -1224,6 +1231,10 @@ function MouseEventC(type,init){UIEventC.call(this,type,init);init=init||{};
  this.altKey=!!init.altKey;this.metaKey=!!init.metaKey;
  this.relatedTarget=init.relatedTarget||null;}
 MouseEventC.prototype=Object.create(UIEventC.prototype);
+MouseEventC.__vitaFields={view:null,detail:0,which:0,
+ screenX:0,screenY:0,clientX:0,clientY:0,movementX:0,movementY:0,
+ button:0,buttons:0,relatedTarget:null,
+ ctrlKey:false,shiftKey:false,altKey:false,metaKey:false};
 MouseEventC.prototype.getModifierState=function(k){
  return k==='Control'?this.ctrlKey:k==='Shift'?this.shiftKey:
         k==='Alt'?this.altKey:k==='Meta'?this.metaKey:false;};
@@ -1235,6 +1246,10 @@ function KeyboardEventC(type,init){UIEventC.call(this,type,init);init=init||{};
  this.ctrlKey=!!init.ctrlKey;this.shiftKey=!!init.shiftKey;
  this.altKey=!!init.altKey;this.metaKey=!!init.metaKey;}
 KeyboardEventC.prototype=Object.create(UIEventC.prototype);
+KeyboardEventC.__vitaFields={view:null,detail:0,which:0,
+ key:'',code:'',keyCode:0,charCode:0,location:0,repeat:false,
+ isComposing:false,
+ ctrlKey:false,shiftKey:false,altKey:false,metaKey:false};
 KeyboardEventC.prototype.getModifierState=MouseEventC.prototype.getModifierState;
 KeyboardEventC.prototype.initKeyboardEvent=function(t,b,c){this.initEvent(t,b,c);};
 /* Event itself: the members a handler reads that were not there. */
@@ -2951,16 +2966,27 @@ W.NamedNodeMap=NamedNodeMap;
  * A handler that reads e.deltaY, e.touches or e.data off an event that
  * has none of them throws inside the page's own listener.
  */
+/* The fields an interface declares, and every one its parents declare:
+   a FocusEvent has relatedTarget of its own and view and detail from
+   UIEvent, and code that reads e.detail on one used to get undefined.
+   The dictionary is flattened once, when the class is made. */
+var EVENT_FIELDS={};
 function eventClass(name,fields,base){
+ var all={},k;
+ if(base&&base.__vitaFields)
+  for(k in base.__vitaFields)all[k]=base.__vitaFields[k];
+ for(k in fields)all[k]=fields[k];
  var C=function(type,init){
-  init=init||{};
+  init=(init===undefined||init===null)?{}:init;
   this.type=String(type);
   this.bubbles=!!init.bubbles;this.cancelable=!!init.cancelable;this.composed=!!init.composed;
   this.defaultPrevented=false;this.target=init.target||null;this.currentTarget=null;
-  Object.keys(fields).forEach(function(k){
-   this[k]=init[k]!==undefined?init[k]:fields[k];},this);};
+  Object.keys(all).forEach(function(kk){
+   this[kk]=init[kk]!==undefined?init[kk]:all[kk];},this);};
  C.prototype=Object.create((base||Event).prototype);
  C.prototype.constructor=C;
+ C.__vitaFields=all;
+ EVENT_FIELDS[name]=all;
  W[name]=C;
  return C;}
 eventClass('ErrorEvent',{message:'',filename:'',lineno:0,colno:0,error:null});
