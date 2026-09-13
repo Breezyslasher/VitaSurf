@@ -291,6 +291,34 @@ static void qjs_report_exception_src(JSContext *ctx, const char *name,
 		}
 		JS_FreeValue(ctx, stack);
 	}
+	/*
+	 * Tell the page. window.onerror and the error event never fired
+	 * here, so a script that installs a handler to fall back when
+	 * something throws -- which is what onerror is for -- never heard
+	 * about it, and neither did anything reporting errors.
+	 */
+	{
+		JSValue global = JS_GetGlobalObject(ctx);
+		JSValue fn = JS_GetPropertyStr(ctx, global, "__vitaReportError");
+
+		if (JS_IsFunction(ctx, fn)) {
+			JSValue args[2], r;
+
+			args[0] = JS_DupValue(ctx, exc);
+			args[1] = name != NULL ? JS_NewString(ctx, name)
+					       : JS_NULL;
+			r = JS_Call(ctx, fn, global, 2, args);
+			/* A throwing handler must not re-enter this. */
+			if (JS_IsException(r)) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+			}
+			JS_FreeValue(ctx, r);
+			JS_FreeValue(ctx, args[0]);
+			JS_FreeValue(ctx, args[1]);
+		}
+		JS_FreeValue(ctx, fn);
+		JS_FreeValue(ctx, global);
+	}
 	JS_FreeValue(ctx, exc);
 }
 
@@ -3497,6 +3525,40 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 static char *qjs_module_normalize(JSContext *ctx, const char *base,
 				  const char *name, void *opaque);
 
+/*
+ * A promise rejected with nobody to catch it. QuickJS calls this when the
+ * rejection happens and again if a handler turns up late; only the first
+ * is worth telling the page about.
+ */
+static void qjs_rejection_tracker(JSContext *ctx, JSValueConst promise,
+				  JSValueConst reason, bool is_handled,
+				  void *opaque)
+{
+	JSValue global, fn;
+
+	(void)opaque;
+	if (is_handled || ctx == NULL) {
+		return;
+	}
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaReportRejection");
+	if (JS_IsFunction(ctx, fn)) {
+		JSValue args[2], r;
+
+		args[0] = JS_DupValue(ctx, reason);
+		args[1] = JS_DupValue(ctx, promise);
+		r = JS_Call(ctx, fn, global, 2, args);
+		if (JS_IsException(r)) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+		}
+		JS_FreeValue(ctx, r);
+		JS_FreeValue(ctx, args[0]);
+		JS_FreeValue(ctx, args[1]);
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+}
+
 nserror js_newheap(int timeout, jsheap **heap)
 {
 	jsheap *ret = calloc(1, sizeof(*ret));
@@ -3537,6 +3599,7 @@ nserror js_newheap(int timeout, jsheap **heap)
 	 */
 	JS_SetModuleLoaderFunc(ret->rt, qjs_module_normalize,
 			       qjs_module_loader, NULL);
+	JS_SetHostPromiseRejectionTracker(ret->rt, qjs_rejection_tracker, NULL);
 	JS_SetMemoryLimit(ret->rt, 96 * 1024 * 1024);
 	JS_SetMaxStackSize(ret->rt, 1024 * 1024);
 	/* register the shared node class once per runtime */

@@ -1,0 +1,24 @@
+<!DOCTYPE html><html><head><title>errors</title>
+<script>
+window.__seen=[];
+window.addEventListener('error',function(e){
+  window.__seen.push('event:'+(e.message||'').slice(0,40));});
+window.onerror=function(m){window.__seen.push('onerror:'+String(m).slice(0,40));return false;};
+window.addEventListener('unhandledrejection',function(e){
+  window.__seen.push('rejection:'+String(e.reason).slice(0,40));});
+</script>
+</head><body>
+<pre id="out"></pre>
+<script>throw new Error('thrown from a classic script');</script>
+<script>Promise.reject(new Error('never handled'));</script>
+<script src="_probe.js"></script>
+<script>
+setTimeout(function(){
+  var s=window.__seen;
+  T('any error reported', s.length>0);
+  T('error event fired', s.some(function(x){return x.indexOf('event:')===0;}));
+  T('onerror fired', s.some(function(x){return x.indexOf('onerror:')===0;}));
+  T('rejection reported', s.some(function(x){return x.indexOf('rejection:')===0;}));
+  T('mentions the message', s.join('|').indexOf('thrown from a classic')>=0);
+},300);
+</script></body></html>

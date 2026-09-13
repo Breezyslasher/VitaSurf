@@ -24,7 +24,37 @@ probe="$dir/$base.probe.html"
 cleanup(){ rm -f "$probe"; }
 trap cleanup EXIT
 
-cp "$page" "$probe"
+# An early script, before the page's own, so it sees every error the page
+# raises. Without it the errors that matter -- the ones during startup --
+# have already happened by the time the summary runs.
+python3 - "$page" "$probe" <<'EARLY'
+import sys, re
+src = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+early = '''<script>
+window.__vitaErrors = [];
+window.addEventListener('error', function (e) {
+  window.__vitaErrors.push((e.message || String(e.error || 'error')) +
+    (e.filename ? ' @ ' + String(e.filename).replace(/^.*\\//, '') : '') +
+    (e.lineno ? ':' + e.lineno : ''));
+});
+window.addEventListener('unhandledrejection', function (e) {
+  window.__vitaErrors.push('unhandled rejection: ' + String(e.reason));
+});
+(function (real) {
+  console.error = function () {
+    window.__vitaErrors.push('console.error: ' +
+      Array.prototype.join.call(arguments, ' '));
+    try { real.apply(console, arguments); } catch (x) {}
+  };
+})(console.error);
+</script>'''
+m = re.search(r'<head[^>]*>', src, re.I)
+if m:
+    src = src[:m.end()] + early + src[m.end():]
+else:
+    src = early + src
+open(sys.argv[2], 'w', encoding='utf-8').write(src)
+EARLY
 cat >> "$probe" <<'PROBE'
 <pre id="out" style="display:none"></pre>
 <script>
@@ -60,6 +90,16 @@ cat >> "$probe" <<'PROBE'
     T('scripts', document.scripts.length);
     T('stylesheets', document.styleSheets.length);
     T('readyState', document.readyState);
+    /* What the page's own code tripped over. This is the answer to
+       "what is left for this site": the errors it raises here and not
+       in the browser. */
+    var errs=(window.__vitaErrors||[]);
+    T('errors', errs.length);
+    /* One line each, deduplicated, so the diff names them. */
+    var seen={},uniq=[];
+    errs.forEach(function(e){var k=String(e).slice(0,140);
+      if(!seen[k]){seen[k]=1;uniq.push(k);}});
+    uniq.slice(0,25).forEach(function(e,i){T('error '+(i+1), e);});
   }
   /* On a timer, not on load: a page whose assets never all arrive never
      fires load, and the point is to see what it built regardless. */

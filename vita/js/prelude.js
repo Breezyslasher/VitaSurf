@@ -987,6 +987,21 @@ send:function(body){var self=this;if(this.readyState!==1)return;var data=this._b
  var done=function(status,headers,text,err,url){self._id=0;self._rh=headers||'';self.responseURL=url||self._u;
   if(err){self.status=0;self.statusText='';self.responseText='';self.response=null;self._set(4);self._emit(err==='timeout'?'timeout':'error');self._emit('loadend');return;}
   self.status=status;self.statusText=status===200?'OK':status===204?'No Content':status===404?'Not Found':'';self._set(2);self._set(3);self.responseText=text;
+  /* A JSON body whose first character is not ASCII has not arrived as
+     JSON. GitHub has been reporting "Unexpected token '\u00fd' in JSON"
+     on every load and the cause is unknown; say what actually came back
+     so the next log answers it. Compressed bodies and mis-decoded
+     encodings both look like this, and the headers tell them apart. */
+  if(text&&text.length&&text.charCodeAt(0)>127&&
+     /json/i.test(self._rh||'')){
+   var hex='',n=Math.min(16,text.length),ci;
+   for(ci=0;ci<n;ci++){var c=(text.charCodeAt(ci)&255).toString(16);
+    hex+=(c.length<2?'0':'')+c+' ';}
+   var enc=/content-encoding:\s*([^\r\n]*)/i.exec(self._rh||'');
+   var ctype=/content-type:\s*([^\r\n]*)/i.exec(self._rh||'');
+   console.log('xhr: json body starts '+hex+'(len '+text.length+
+    ', encoding '+(enc?enc[1]:'none')+', type '+(ctype?ctype[1]:'?')+
+    ') from '+String(self.responseURL).slice(0,96));}
   var rt=self.responseType;if(rt==='json'){try{self.response=JSON.parse(text);}catch(e){self.response=null;}}
   else if(rt==='arraybuffer'){var b=new ArrayBuffer(text.length),v=new Uint8Array(b);for(var i=0;i<text.length;i++)v[i]=text.charCodeAt(i)&255;self.response=b;}
   else if(rt==='document'){self.response=null;}else self.response=text;
@@ -2970,4 +2985,45 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
     this.__defaultValue:dv.get.call(this);},
   set:dv.set});
 })();
+
+/* --- reporting an error to the page -------------------------------------
+ * qjs.c calls this for every uncaught exception. window.onerror and the
+ * error event never fired, so a script that installs a handler to fall
+ * back when something throws heard nothing at all.
+ */
+W.__vitaReportError=function(err,where){
+ var msg='';
+ try{msg=(err&&err.message)?String(err.message):String(err);}catch(e){msg='Script error.';}
+ var file=where?String(where):String(location.href),line=0,col=0;
+ /* QuickJS puts "  at f (url:line:col)" in the stack; the first frame
+    with a position is the one the page wants. */
+ try{
+  var m=/\((.*):(\d+):(\d+)\)/.exec(String(err&&err.stack||''));
+  if(m){file=m[1];line=Number(m[2])||0;col=Number(m[3])||0;}
+ }catch(e2){}
+ var ev;
+ try{ev=new W.ErrorEvent('error',{message:msg,filename:file,lineno:line,
+  colno:col,error:err,bubbles:false,cancelable:true});}
+ catch(e3){ev={type:'error',message:msg,filename:file,lineno:line,colno:col,
+  error:err,defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
+ var handled=false;
+ try{
+  if(typeof W.onerror==='function'){
+   /* onerror takes the pieces, not the event, and returning true means
+      the page has dealt with it. */
+   if(W.onerror(msg,file,line,col,err)===true)handled=true;}
+ }catch(e4){}
+ try{__vitaDispatch(null,ev);}catch(e5){}
+ return handled;};
+/* An unhandled promise rejection, reported the same way. QuickJS hands
+ * these to the tracker qjs.c installs. */
+W.__vitaReportRejection=function(reason,promise){
+ var ev;
+ try{ev=new W.PromiseRejectionEvent('unhandledrejection',
+  {reason:reason,promise:promise,cancelable:true});}
+ catch(e){ev={type:'unhandledrejection',reason:reason,promise:promise,
+  defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
+ try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
+ try{__vitaDispatch(null,ev);}catch(e3){}
+ return !!ev.defaultPrevented;};
 })();
