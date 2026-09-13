@@ -53,8 +53,26 @@ total=0; ours=0; theirs=0; regress=0
 
 while IFS= read -r test; do
     case "$test" in */resources/*) continue;; esac
+    # file:// needs an absolute path, and find may have been given a
+    # relative one.
+    test="$(cd "$(dirname "$test")" && pwd)/$(basename "$test")"
     probe="${test%.html}.vitaprobe.html"
-    cat "$test" "$work/report.html" > "$probe"
+    # The tests load /resources/testharness.js by absolute path, which a
+    # file URL cannot resolve. Point it at the vendored copy, by depth.
+    python3 - "$test" "$work/report.html" "$probe" "$ROOT/tests/wpt" <<'FIX'
+import os, re, sys
+test, report, out, wptroot = sys.argv[1:5]
+depth = os.path.relpath(os.path.dirname(test), wptroot).count(os.sep) + 1
+if os.path.relpath(os.path.dirname(test), wptroot) == '.':
+    depth = 0
+up = '../' * depth
+src = open(test, encoding='utf-8', errors='replace').read()
+# the tests write these attributes both quoted and bare
+src = re.sub(r'\b(src|href)=(["\']?)/resources/',
+             lambda m: m.group(1) + '=' + m.group(2) + up + 'resources/', src)
+open(out, 'w', encoding='utf-8').write(
+    src + open(report, encoding='utf-8').read())
+FIX
 
     "$CHROME" --headless --no-sandbox --disable-gpu --disable-dev-shm-usage \
         --virtual-time-budget=$((WAIT * 1000)) --dump-dom "file://$probe" 2>/dev/null |

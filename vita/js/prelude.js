@@ -987,21 +987,7 @@ send:function(body){var self=this;if(this.readyState!==1)return;var data=this._b
  var done=function(status,headers,text,err,url){self._id=0;self._rh=headers||'';self.responseURL=url||self._u;
   if(err){self.status=0;self.statusText='';self.responseText='';self.response=null;self._set(4);self._emit(err==='timeout'?'timeout':'error');self._emit('loadend');return;}
   self.status=status;self.statusText=status===200?'OK':status===204?'No Content':status===404?'Not Found':'';self._set(2);self._set(3);self.responseText=text;
-  /* A JSON body whose first character is not ASCII has not arrived as
-     JSON. GitHub has been reporting "Unexpected token '\u00fd' in JSON"
-     on every load and the cause is unknown; say what actually came back
-     so the next log answers it. Compressed bodies and mis-decoded
-     encodings both look like this, and the headers tell them apart. */
-  if(text&&text.length&&text.charCodeAt(0)>127&&
-     /json/i.test(self._rh||'')){
-   var hex='',n=Math.min(16,text.length),ci;
-   for(ci=0;ci<n;ci++){var c=(text.charCodeAt(ci)&255).toString(16);
-    hex+=(c.length<2?'0':'')+c+' ';}
-   var enc=/content-encoding:\s*([^\r\n]*)/i.exec(self._rh||'');
-   var ctype=/content-type:\s*([^\r\n]*)/i.exec(self._rh||'');
-   console.log('xhr: json body starts '+hex+'(len '+text.length+
-    ', encoding '+(enc?enc[1]:'none')+', type '+(ctype?ctype[1]:'?')+
-    ') from '+String(self.responseURL).slice(0,96));}
+
   var rt=self.responseType;if(rt==='json'){try{self.response=JSON.parse(text);}catch(e){self.response=null;}}
   else if(rt==='arraybuffer'){var b=new ArrayBuffer(text.length),v=new Uint8Array(b);for(var i=0;i<text.length;i++)v[i]=text.charCodeAt(i)&255;self.response=b;}
   else if(rt==='document'){self.response=null;}else self.response=text;
@@ -2991,6 +2977,28 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
  * error event never fired, so a script that installs a handler to fall
  * back when something throws heard nothing at all.
  */
+/* A diagnostic, not a shim. GitHub has reported "Unexpected token 'y'
+ * in JSON" on every load for many builds and I do not know why. The
+ * first byte was not the problem -- a check on it never fired -- so say
+ * where the first byte that cannot be in JSON actually is, with the
+ * bytes around it. Costs nothing until a parse fails. */
+(function(){
+ var real=JSON.parse;
+ JSON.parse=function(text,reviver){
+  try{return real(text,reviver);}
+  catch(e){
+   try{
+    var s=String(text),i,bad=-1;
+    for(i=0;i<s.length;i++)if(s.charCodeAt(i)>127){bad=i;break;}
+    var at=bad<0?0:Math.max(0,bad-8),hex='',c;
+    for(i=at;i<Math.min(s.length,at+24);i++){
+     c=(s.charCodeAt(i)&0xffff).toString(16);
+     hex+=(c.length<2?'0':'')+c+' ';}
+    console.log('json parse failed: '+String(e).slice(0,60)+
+     '; length '+s.length+', first byte over 127 at '+bad+
+     ', bytes '+hex+', text '+JSON.stringify(s.slice(at,at+40)));
+   }catch(x){}
+   throw e;}};})();
 W.__vitaReportError=function(err,where){
  var msg='';
  try{msg=(err&&err.message)?String(err.message):String(err);}catch(e){msg='Script error.';}
