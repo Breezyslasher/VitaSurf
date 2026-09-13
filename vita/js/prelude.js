@@ -847,10 +847,13 @@ D.implementation={
    String(t===undefined?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;')+
    '</title></head><body></body></html>'):null;
   return d||scratchDocument(t);},
- createDocument:function(){
-  var d=W.__vitaParseDocument?W.__vitaParseDocument(''):null;
-  if(d){var de=d.documentElement;if(de)d.removeChild(de);return d;}
-  return scratchDocument('');},
+ createDocument:function(ns,qname,doctype){
+  if(qname!==undefined&&qname!==null&&String(qname)!==''){
+   checkElementName(qname);
+   nsExtract(ns,qname,'createDocument');}
+  var d=D.__vitaCreateDocument?
+   D.__vitaCreateDocument(ns,qname,doctype||null):null;
+  return d||scratchDocument('');},
  hasFeature:function(){return true;}};
 D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';
 window.NodeFilter={FILTER_ACCEPT:1,FILTER_REJECT:2,FILTER_SKIP:3,SHOW_ALL:0xFFFFFFFF,SHOW_ELEMENT:1,SHOW_TEXT:4,SHOW_COMMENT:128,SHOW_DOCUMENT:256};
@@ -3047,8 +3050,20 @@ P.importNode=function(n,deep){
  var c=n&&n.cloneNode?n.cloneNode(!!deep):null;
  return c;};
 P.adoptNode=function(n){return n;};
+/* Each document has its own implementation: what it creates belongs to
+   it, and the tests check exactly that. */
 Object.defineProperty(P,'implementation',{configurable:true,
- get:function(){return D.implementation;}});
+ get:function(){
+  if(!isDoc(this))return D.implementation;
+  var owner=this;
+  if(!Object.prototype.hasOwnProperty.call(this,'__vitaImpl'))
+   Object.defineProperty(this,'__vitaImpl',{configurable:true,value:{
+    createHTMLDocument:function(t){return D.implementation.createHTMLDocument(t);},
+    createDocument:function(a,b,c){return D.implementation.createDocument(a,b,c);},
+    createDocumentType:function(n,p,sy){
+     return D.implementation.createDocumentType.call(owner,n,p,sy);},
+    hasFeature:function(){return true;}}});
+  return this.__vitaImpl;}});
 Object.defineProperty(P,'defaultView',{configurable:true,
  get:function(){return isDoc(this)?null:undefined;}});
 Object.defineProperty(P,'contentType',{configurable:true,
@@ -4173,7 +4188,15 @@ D.implementation.createDocumentType=function(qualifiedName,publicId,systemId){
  if(parts.length>2||(parts.length===2&&(parts[0]===''||parts[1]==='')))
   throw new DOMException(
    'The qualified name provided has an invalid prefix.','NamespaceError');
- return new DocumentType(n,publicId,systemId);};
+ /* a real node, so a document can hold it and the tree methods work */
+ var d=D.__vitaCreateDoctype?D.__vitaCreateDoctype(n,publicId,systemId):null;
+ if(!d)return new DocumentType(n,publicId,systemId);
+ /* it belongs to the document whose implementation made it; libdom's
+    maker takes no document, so say so on the node itself */
+ var owner=isDoc(this)?this:D;
+ Object.defineProperty(d,'ownerDocument',{configurable:true,
+  get:function(){return owner;}});
+ return d;};
 
 /* --- where before(), after() and replaceWith() put things ---------------
  * The reference point is the first sibling that is not itself one of the

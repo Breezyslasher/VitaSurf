@@ -1318,6 +1318,43 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
  *
  * __vitaCreateIn(doc, kind, name): kind is the node type wanted.
  */
+/* A doctype's publicId and systemId, which libdom holds on the node. */
+static JSValue node_get_public_id(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	dom_string *s = NULL;
+	dom_node_type t = DOM_ELEMENT_NODE;
+
+	if (node == NULL) return JS_UNDEFINED;
+	if (dom_node_get_node_type(node, &t) != DOM_NO_ERR ||
+	    t != DOM_DOCUMENT_TYPE_NODE) {
+		return JS_UNDEFINED;
+	}
+	if (dom_document_type_get_public_id((dom_document_type *)node, &s) !=
+	    DOM_NO_ERR || s == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	return str_result(ctx, s);
+}
+
+static JSValue node_get_system_id(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	dom_string *s = NULL;
+	dom_node_type t = DOM_ELEMENT_NODE;
+
+	if (node == NULL) return JS_UNDEFINED;
+	if (dom_node_get_node_type(node, &t) != DOM_NO_ERR ||
+	    t != DOM_DOCUMENT_TYPE_NODE) {
+		return JS_UNDEFINED;
+	}
+	if (dom_document_type_get_system_id((dom_document_type *)node, &s) !=
+	    DOM_NO_ERR || s == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	return str_result(ctx, s);
+}
+
 /* A node's local name and prefix as libdom holds them, rather than
  * guessed from the tag name: an SVG clipPath keeps its capital P, and
  * an element made with a prefix keeps it. */
@@ -2140,6 +2177,8 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CGETSET_DEF("localName", node_get_local_name, NULL),
 	JS_CGETSET_DEF("prefix", node_get_prefix, NULL),
 	JS_CGETSET_DEF("namespaceURI", node_get_namespace_uri, NULL),
+	JS_CGETSET_DEF("publicId", node_get_public_id, NULL),
+	JS_CGETSET_DEF("systemId", node_get_system_id, NULL),
 	JS_CFUNC_DEF("appendChild", 1, node_append_child),
 	JS_CFUNC_DEF("removeChild", 1, node_remove_child),
 	JS_CFUNC_DEF("insertBefore", 2, node_insert_before),
@@ -2308,6 +2347,88 @@ static JSValue doc_create_element_ns(JSContext *ctx, JSValueConst this_val,
 	if (el == NULL) return JS_NULL;
 	r = wrap_node(ctx, (struct dom_node *)el);
 	dom_node_unref((struct dom_node *)el);
+	return r;
+}
+
+/*
+ * An empty document, the way createDocument means it: no html, head or
+ * body, with only the doctype and root element the caller asked for.
+ * Parsing an empty string and taking the children out again does not
+ * work -- libdom will not remove a document's own element.
+ */
+static JSValue doc_create_document(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	const char *ns = NULL, *qname = NULL;
+	struct dom_document_type *dt = NULL;
+	struct dom_document *doc = NULL;
+	JSValue r;
+
+	(void)this_val;
+	if (argc > 0 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+		ns = JS_ToCString(ctx, argv[0]);
+		if (ns != NULL && ns[0] == '\0') {
+			JS_FreeCString(ctx, ns);
+			ns = NULL;
+		}
+	}
+	if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+		qname = JS_ToCString(ctx, argv[1]);
+		if (qname != NULL && qname[0] == '\0') {
+			JS_FreeCString(ctx, qname);
+			qname = NULL;
+		}
+	}
+	if (argc > 2) {
+		dt = JS_GetOpaque(argv[2], node_class_id);
+	}
+	if (dom_implementation_create_document(DOM_IMPLEMENTATION_CORE, ns,
+					       qname, dt, NULL, NULL,
+					       &doc) != DOM_NO_ERR) {
+		doc = NULL;
+	}
+	if (ns) JS_FreeCString(ctx, ns);
+	if (qname) JS_FreeCString(ctx, qname);
+	if (doc == NULL) return JS_NULL;
+	r = wrap_node(ctx, (struct dom_node *)doc);
+	dom_node_unref((struct dom_node *)doc);
+	return r;
+}
+
+/*
+ * A real doctype node. createDocumentType used to hand back a plain
+ * object with a nodeType on it, so it had no tree methods at all and a
+ * document could not actually hold one: inserting it threw a TypeError
+ * rather than doing the insertion or refusing it properly.
+ */
+static JSValue doc_create_doctype(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	const char *qname = NULL, *pub = NULL, *sys = NULL;
+	struct dom_document_type *dt = NULL;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) return JS_NULL;
+	qname = JS_ToCString(ctx, argv[0]);
+	if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+		pub = JS_ToCString(ctx, argv[1]);
+	}
+	if (argc > 2 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+		sys = JS_ToCString(ctx, argv[2]);
+	}
+	if (dom_implementation_create_document_type(qname,
+						    pub != NULL ? pub : "",
+						    sys != NULL ? sys : "",
+						    &dt) != DOM_NO_ERR) {
+		dt = NULL;
+	}
+	if (qname) JS_FreeCString(ctx, qname);
+	if (pub) JS_FreeCString(ctx, pub);
+	if (sys) JS_FreeCString(ctx, sys);
+	if (dt == NULL) return JS_NULL;
+	r = wrap_node(ctx, (struct dom_node *)dt);
+	dom_node_unref((struct dom_node *)dt);
 	return r;
 }
 
@@ -2519,6 +2640,8 @@ static const JSCFunctionListEntry document_proto[] = {
 	JS_CFUNC_DEF("getElementsByTagName", 1, doc_get_elements_by_tag_name),
 	JS_CFUNC_DEF("createElement", 1, doc_create_element),
 	JS_CFUNC_DEF("createElementNS", 2, doc_create_element_ns),
+	JS_CFUNC_DEF("__vitaCreateDoctype", 3, doc_create_doctype),
+	JS_CFUNC_DEF("__vitaCreateDocument", 3, doc_create_document),
 	JS_CFUNC_DEF("createTextNode", 1, doc_create_text_node),
 	JS_CFUNC_DEF("createComment", 1, doc_create_comment),
 	JS_CFUNC_DEF("createDocumentFragment", 0, doc_create_document_fragment),
