@@ -133,7 +133,38 @@ P.getElementsByClassName=function(c){return this.querySelectorAll('.'+c);};
    parentheses inside a repeated group backtracks exponentially, and
    p:not(.y) was enough to exhaust the regexp engine. The compound is cut
    at its first pseudo below, and the pseudos are read separately. */
-var SIMPLE_RE=/^([a-zA-Z][\w-]*|\*)?(#[\w-]+)?((?:\.[\w-]+)*)((?:\[[^\]]*\])*)$/;
+/* An identifier may carry CSS escapes: a backslash and up to six hex
+   digits for a code point, or a backslash and any one character taken
+   literally. Tailwind's own class names need this -- md:w-1/2 is written
+   .md\:w-1\/2 in a selector -- and without it the whole compound failed
+   to parse and matched nothing. */
+/* Anything above ASCII is an identifier character in CSS with no escape
+   needed, which is how a class name in another script is written. */
+var ICH='(?:[\\w-]|[^\\x00-\\x7f]|'+
+ '\\\\[0-9a-fA-F]{1,6}(?:\\r\\n|[ \\t\\r\\n\\f])?|\\\\[^\\n])';
+/* How many characters the escape starting at i occupies. A hex escape
+   swallows one whitespace character after its digits, and that space is
+   part of the escape rather than a separator -- reading it as one split
+   #\\30 nextIsWhiteSpace in half. */
+function escLen(t,i){
+ var j=i+1,n=0;
+ while(j<t.length&&n<6&&/[0-9a-fA-F]/.test(t.charAt(j))){j++;n++;}
+ if(n===0)return 2;
+ if(j<t.length&&/[ \t\r\n\f]/.test(t.charAt(j))){
+  if(t.charAt(j)==='\r'&&t.charAt(j+1)==='\n')j++;
+  j++;}
+ return j-i;}
+var SIMPLE_RE=new RegExp('^([a-zA-Z]'+ICH+'*|\\*)?(#'+ICH+'+)?((?:\\.'+
+ ICH+'+)*)((?:\\[[^\\]]*\\])*)$');
+function unescapeIdent(t){
+ if(String(t).indexOf('\\')<0)return String(t);
+ return String(t).replace(
+  /\\([0-9a-fA-F]{1,6})(?:\r\n|[ \t\r\n\f])?|\\([^\n])/g,
+  function(m,hex,ch){
+   if(hex===undefined)return ch;
+   var cp=parseInt(hex,16);
+   if(cp===0||cp>0x10FFFF||(cp>=0xD800&&cp<=0xDFFF))return '�';
+   return String.fromCodePoint?String.fromCodePoint(cp):String.fromCharCode(cp);});}
 var ATTR_RE=/\[\s*([\w-]+)\s*(?:([~^$*|]?=)\s*("[^"]*"|'[^']*'|[^\]]*?)\s*)?\]/g;
 /* The argument is matched as a run without parentheses rather than as an
    alternation inside a star: the nested form backtracks exponentially and
@@ -150,6 +181,7 @@ function pseudoStart(sel){
  var depth=0,quote=null,i,ch;
  for(i=0;i<sel.length;i++){
   ch=sel.charAt(i);
+  if(ch==='\\'){i+=escLen(sel,i)-1;continue;}
   if(quote!==null){if(ch===quote)quote=null;continue;}
   if(ch==='"'||ch==="'"){quote=ch;continue;}
   if(ch==='['||ch==='(')depth++;
@@ -162,7 +194,8 @@ function parseSimple(sel){
  var tail=cut<0?'':sel.slice(cut);
  var m=SIMPLE_RE.exec(head);if(!m)return null;
  var attrs=[],a;ATTR_RE.lastIndex=0;
- while(m[4]&&(a=ATTR_RE.exec(m[4]))){attrs.push({name:a[1],op:a[2]||null,val:a[3]===undefined?null:String(a[3]).replace(/^["']|["']$/g,'')});}
+ while(m[4]&&(a=ATTR_RE.exec(m[4]))){attrs.push({name:unescapeIdent(a[1]),op:a[2]||null,
+  val:a[3]===undefined?null:unescapeIdent(String(a[3]).replace(/^["']|["']$/g,''))});}
  /* Read every pseudo out first, then compile the ones that take a
     selector. PSEUDO_RE is shared and global, so recursing into compile
     from inside its own exec loop resets lastIndex and the loop never
@@ -176,14 +209,32 @@ function parseSimple(sel){
    sub=compile(arg||'');}
   pseudos.push({name:name,arg:arg,sub:sub,
    element:r[0]==='::'||PSEUDO_ELEMENTS.indexOf(' '+name+' ')>=0});});
- return {tag:m[1]&&m[1]!=='*'?m[1].toUpperCase():null,id:m[2]?m[2].slice(1):null,
-  classes:m[3]?m[3].split('.').slice(1):[],attrs:attrs,pseudos:pseudos};}
+ /* the class list is split on unescaped dots only */
+ var classes=[];
+ if(m[3]){
+  var buf='',k,c;
+  for(k=0;k<m[3].length;k++){
+   c=m[3].charAt(k);
+   if(c==='\\'){buf+=c+m[3].charAt(++k);continue;}
+   if(c==='.'){if(buf!=='')classes.push(unescapeIdent(buf));buf='';continue;}
+   buf+=c;}
+  if(buf!=='')classes.push(unescapeIdent(buf));}
+ return {tag:m[1]&&m[1]!=='*'?unescapeIdent(m[1]).toUpperCase():null,
+  id:m[2]?unescapeIdent(m[2].slice(1)):null,
+  classes:classes,attrs:attrs,pseudos:pseudos};}
 function attrOk(el,q){var v=el.getAttribute(q.name);if(v===null)return false;if(!q.op)return true;
  switch(q.op){case '=':return v===q.val;case '^=':return v.indexOf(q.val)===0;
  case '$=':return q.val.length<=v.length&&v.indexOf(q.val,v.length-q.val.length)>=0;
  case '*=':return v.indexOf(q.val)>=0;
  case '~=':return (' '+v+' ').indexOf(' '+q.val+' ')>=0;
  case '|=':return v===q.val||v.indexOf(q.val+'-')===0;default:return false;}}
+/* A class attribute is split on ASCII whitespace, not on the space
+   character alone: a tab or a newline between two names separates them
+   too. */
+var CLASS_WS=/[ \t\r\n\f]+/;
+function classSet(el){
+ var cn=el.getAttribute?el.getAttribute('class'):null;
+ return cn?String(cn).split(CLASS_WS).filter(function(x){return x!=='';}):[];}
 function prevEl(n){for(n=n.previousSibling;n;n=n.previousSibling)if(n.nodeType===1)return n;return null;}
 function nextEl(n){for(n=n.nextSibling;n;n=n.nextSibling)if(n.nodeType===1)return n;return null;}
 function elIndex(el){var i=1,n=prevEl(el);while(n){i++;n=prevEl(n);}return i;}
@@ -254,8 +305,10 @@ function pseudoOk(el,p){
 function matchSimple(el,q){if(el.nodeType!==1)return false;
  if(q.tag&&el.tagName!==q.tag)return false;
  if(q.id&&el.id!==q.id)return false;
- if(q.classes.length){var cn=el.className;if(!cn)return false;cn=' '+cn+' ';
-  for(var i=0;i<q.classes.length;i++)if(cn.indexOf(' '+q.classes[i]+' ')<0)return false;}
+ if(q.classes.length){
+  var set=classSet(el);
+  if(!set.length)return false;
+  for(var i=0;i<q.classes.length;i++)if(set.indexOf(q.classes[i])<0)return false;}
  for(var j=0;j<q.attrs.length;j++)if(!attrOk(el,q.attrs[j]))return false;
  for(var k=0;k<q.pseudos.length;k++)if(!pseudoOk(el,q.pseudos[k]))return false;
  return true;}
@@ -283,6 +336,7 @@ function splitTop(s,chars,keep){
  var out=[],buf='',depth=0,quote=null,i,ch;
  for(i=0;i<s.length;i++){
   ch=s.charAt(i);
+  if(ch==='\\'){var el=escLen(s,i);buf+=s.substr(i,el);i+=el-1;continue;}
   if(quote!==null){buf+=ch;if(ch===quote)quote=null;continue;}
   if(ch==='"'||ch==="'"){quote=ch;buf+=ch;continue;}
   if(ch==='['||ch==='('){depth++;buf+=ch;continue;}
@@ -1505,7 +1559,7 @@ TokenList.prototype.replace=function(a,b){
 /* Nothing here has a token list with a defined set of valid tokens, and
    the specification says to throw for one that has none. */
 TokenList.prototype.supports=function(){
- throw new DOMException('supports() is not supported for this attribute.','TypeError');};
+ throw new TypeError('supports() is not supported for this attribute.');};
 TokenList.prototype.forEach=function(f,th){this._t().forEach(function(v,i){f.call(th,v,i,this);},this);};
 TokenList.prototype.keys=function(){return this._t().map(function(_,i){return i;})[Symbol.iterator]();};
 TokenList.prototype.values=function(){return this._t()[Symbol.iterator]();};
@@ -3155,8 +3209,8 @@ W.MutationRecord=MutationRecord;
 
 var MOlist=[],MOqueued=false;
 function MutationObserver(cb){
- if(typeof cb!=='function')throw new DOMException(
-  'The callback provided as parameter 1 is not a function.','TypeError');
+ if(typeof cb!=='function')throw new TypeError(
+  'The callback provided as parameter 1 is not a function.');
  this._cb=cb;this._records=[];this._watch=[];}
 /* Does this observer want to hear about a change to target? */
 MutationObserver.prototype._wants=function(kind,target,name){
@@ -3177,8 +3231,8 @@ MutationObserver.prototype._wants=function(kind,target,name){
  return null;};
 MutationObserver.prototype.observe=function(target,options){
  options=options||{};
- if(!target||target.nodeType===undefined)throw new DOMException(
-  'parameter 1 is not of type Node.','TypeError');
+ if(!target||target.nodeType===undefined)throw new TypeError(
+  'parameter 1 is not of type Node.');
  /* The specification's own order: asking for old values or a filter
     turns the category on when it was not mentioned, and contradicts it
     when it was turned off explicitly. */
@@ -3189,21 +3243,21 @@ MutationObserver.prototype.observe=function(target,options){
  if(cdata===undefined&&options.characterDataOldValue!==undefined)
   cdata=true;
  if(!options.childList&&!attrs&&!cdata)
-  throw new DOMException(
+  throw new TypeError(
    "The options object must set at least one of 'attributes', "+
-   "'characterData', or 'childList' to true.",'TypeError');
+   "'characterData', or 'childList' to true.");
  if(options.attributeOldValue&&!attrs)
-  throw new DOMException(
+  throw new TypeError(
    "The options object may only set 'attributeOldValue' to true when "+
-   "'attributes' is true or not present.",'TypeError');
+   "'attributes' is true or not present.");
  if(options.attributeFilter!==undefined&&!attrs)
-  throw new DOMException(
+  throw new TypeError(
    "The options object may only set 'attributeFilter' when 'attributes' "+
-   "is true or not present.",'TypeError');
+   "is true or not present.");
  if(options.characterDataOldValue&&!cdata)
-  throw new DOMException(
+  throw new TypeError(
    "The options object may only set 'characterDataOldValue' to true when "+
-   "'characterData' is true or not present.",'TypeError');
+   "'characterData' is true or not present.");
  var w={target:target,subtree:!!options.subtree,
   childList:!!options.childList,
   attributes:!!attrs,
@@ -3273,4 +3327,85 @@ W.__vitaMutation=function(kind,target,a,b){
     if(!rec.addedNodes.length&&!rec.removedNodes.length)continue;}
   }
   MOqueue(o,rec);}};
+
+/* --- what the web platform tests found ---------------------------------- */
+/* A class attribute is split on ASCII whitespace, not on the space
+ * character: a tab or a newline between two class names is a separator
+ * too, and getElementsByClassName found nothing for either. */
+function byClassName(root,names){
+ var want=String(names).split(CLASS_WS).filter(function(x){return x!=='';});
+ var out=[];
+ if(!want.length)return out;
+ var all=root.getElementsByTagName('*'),i,j,set,ok;
+ for(i=0;i<all.length;i++){
+  set=classSet(all[i]);
+  if(!set.length)continue;
+  ok=true;
+  for(j=0;j<want.length;j++)if(set.indexOf(want[j])<0){ok=false;break;}
+  if(ok)out.push(all[i]);}
+ return out;}
+P.getElementsByClassName=function(n){return byClassName(this,n);};
+D.getElementsByClassName=function(n){
+ var r=D.documentElement;return r?byClassName(r,n):[];};
+
+/* --- character data, by the specification's index rules ------------------
+ * The methods took whatever number they were given and let String do the
+ * rest, so a negative offset counted from the end instead of throwing and
+ * a count past the end came back short.
+ */
+function toULong(v){
+ v=Number(v);
+ if(!isFinite(v))v=0;
+ v=v<0?Math.ceil(v):Math.floor(v);
+ v=v%4294967296;
+ if(v<0)v+=4294967296;
+ return v;}
+function cdText(n){return String(n.textContent===null||n.textContent===undefined?'':n.textContent);}
+function cdCheck(n,o){
+ if(o>cdText(n).length)throw new DOMException(
+  'The index is not in the allowed range.','IndexSizeError');}
+function needArgs(got,want,name){
+ /* A real TypeError: code catches these by constructor, and a
+    DOMException that merely calls itself TypeError is not one. */
+ if(got<want)throw new TypeError(
+  "Failed to execute '"+name+"': "+want+" arguments required, but only "+
+  got+' present.');}
+P.substringData=function(offset,count){
+ needArgs(arguments.length,2,'substringData');
+ var t=cdText(this),o=toULong(offset),c=toULong(count);
+ cdCheck(this,o);
+ return t.slice(o,(o+c>t.length)?t.length:o+c);};
+P.appendData=function(data){
+ needArgs(arguments.length,1,'appendData');
+ this.textContent=cdText(this)+String(data);};
+P.insertData=function(offset,data){
+ needArgs(arguments.length,2,'insertData');
+ var t=cdText(this),o=toULong(offset);
+ cdCheck(this,o);
+ this.textContent=t.slice(0,o)+String(data)+t.slice(o);};
+P.deleteData=function(offset,count){
+ needArgs(arguments.length,2,'deleteData');
+ var t=cdText(this),o=toULong(offset),c=toULong(count);
+ cdCheck(this,o);
+ if(o+c>t.length)c=t.length-o;
+ this.textContent=t.slice(0,o)+t.slice(o+c);};
+P.replaceData=function(offset,count,data){
+ needArgs(arguments.length,3,'replaceData');
+ var t=cdText(this),o=toULong(offset),c=toULong(count);
+ cdCheck(this,o);
+ if(o+c>t.length)c=t.length-o;
+ this.textContent=t.slice(0,o)+String(data)+t.slice(o+c);};
+
+/* textContent is null on a document and on a doctype, and setting it to
+ * null or leaving it out means the empty string, not the word "null". */
+(function(){
+ var d=Object.getOwnPropertyDescriptor(P,'textContent');
+ if(!d||!d.get)return;
+ Object.defineProperty(P,'textContent',{configurable:true,
+  get:function(){
+   var t=this.nodeType;
+   if(t===9||t===10)return null;
+   return d.get.call(this);},
+  set:function(v){d.set.call(this,(v===null||v===undefined)?'':v);}});})();
+D.textContent=null;
 })();
