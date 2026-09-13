@@ -363,6 +363,21 @@ static dom_string *to_dom_string(const char *s)
 	return out;
 }
 
+/* The same, for text whose length is known: a page may put a NUL in the
+ * middle of a string and strlen would cut it there. */
+static dom_string *to_dom_string_len(const char *s, size_t len)
+{
+	dom_string *out = NULL;
+
+	if (s == NULL) {
+		return NULL;
+	}
+	if (dom_string_create((const uint8_t *)s, len, &out) != DOM_NO_ERR) {
+		return NULL;
+	}
+	return out;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Node wrapper                                                             */
 
@@ -646,11 +661,16 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 				     JSValueConst val)
 {
 	struct dom_node *node = this_node(ctx, this_val);
-	const char *s = JS_ToCString(ctx, val);
+	/* textContent is a nullable string, so null and undefined both mean
+	 * "no text", which empties the node rather than writing "null". */
+	bool empty = JS_IsNull(val) || JS_IsUndefined(val);
+	size_t len = 0;
+	const char *s = empty ? NULL : JS_ToCStringLen(ctx, &len, val);
 	dom_string *d;
 
 	if (node == NULL) return JS_EXCEPTION;
-	d = to_dom_string(s != NULL ? s : "");
+	if (s != NULL && len == 0) empty = true;
+	d = empty ? to_dom_string("") : to_dom_string_len(s, len);
 	if (d != NULL) {
 		dom_node_type type = DOM_ELEMENT_NODE;
 
@@ -666,6 +686,24 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
 		    type == DOM_CDATA_SECTION_NODE) {
 			dom_characterdata_set_data((dom_characterdata *)node, d);
+		} else if (empty) {
+			/* An empty string leaves the node with no children at
+			 * all; libdom's setter would leave an empty text node
+			 * behind, which childNodes and firstChild then see. */
+			struct dom_node *child = NULL, *gone = NULL;
+
+			while (dom_node_get_first_child(node, &child) ==
+			       DOM_NO_ERR && child != NULL) {
+				if (dom_node_remove_child(node, child,
+							  &gone) != DOM_NO_ERR) {
+					dom_node_unref(child);
+					break;
+				}
+				if (gone != NULL) dom_node_unref(gone);
+				dom_node_unref(child);
+				child = NULL;
+				gone = NULL;
+			}
 		} else {
 			dom_node_set_text_content(node, d);
 		}
@@ -1148,6 +1186,136 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 	if (nsheld) JS_FreeCString(ctx, nsheld);
 	if (local) JS_FreeCString(ctx, local);
 	return JS_UNDEFINED;
+}
+
+/*
+ * A whole document of its own, parsed from markup.
+ *
+ * DOMParser used to hand back a div with the markup inside it, so
+ * documentElement, head, body and every document method were missing on
+ * something a page had every reason to treat as a document -- and
+ * createHTMLDocument had the same stub behind it. This parses into a
+ * real libdom document with the same parser the browser uses for a
+ * page, scripting off, and wraps the document node.
+ */
+/*
+ * Make a node inside another document. libdom ties every node to the
+ * document it was created in and refuses to insert one that belongs
+ * somewhere else, so a document parsed by DOMParser needs its own
+ * createElement rather than the page's.
+ *
+ * __vitaCreateIn(doc, kind, name): kind is the node type wanted.
+ */
+static JSValue win_vita_create_in(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	struct dom_node *host, *made = NULL;
+	struct dom_document *doc;
+	const char *name = NULL;
+	dom_string *d = NULL;
+	int kind = 1;
+	JSValue r;
+
+	if (argc < 2) return JS_NULL;
+	host = JS_GetOpaque(argv[0], node_class_id);
+	if (host == NULL) return JS_NULL;
+	if (JS_ToInt32(ctx, &kind, argv[1]) != 0) return JS_NULL;
+	if (argc > 2 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+		name = JS_ToCString(ctx, argv[2]);
+	}
+	d = to_dom_string(name != NULL ? name : "");
+	/* the document a node belongs to, which for a document is itself */
+	{
+		dom_node_type t = DOM_ELEMENT_NODE;
+
+		dom_node_get_node_type(host, &t);
+		if (t == DOM_DOCUMENT_NODE) {
+			doc = (struct dom_document *)host;
+		} else if (dom_node_get_owner_document(host, &doc) !=
+			   DOM_NO_ERR || doc == NULL) {
+			if (d != NULL) dom_string_unref(d);
+			if (name != NULL) JS_FreeCString(ctx, name);
+			return JS_NULL;
+		}
+	}
+	switch (kind) {
+	case 1:
+		if (d != NULL)
+			dom_document_create_element(doc, d,
+						    (struct dom_element **)&made);
+		break;
+	case 3:
+		if (d != NULL)
+			dom_document_create_text_node(doc, d,
+						      (struct dom_text **)&made);
+		break;
+	case 8:
+		if (d != NULL)
+			dom_document_create_comment(doc, d,
+						    (struct dom_comment **)&made);
+		break;
+	case 11:
+		dom_document_create_document_fragment(doc,
+			(struct dom_document_fragment **)&made);
+		break;
+	default:
+		break;
+	}
+	if (d != NULL) dom_string_unref(d);
+	if (name != NULL) JS_FreeCString(ctx, name);
+	if (made == NULL) return JS_NULL;
+	r = wrap_node(ctx, made);
+	dom_node_unref(made);
+	return r;
+}
+
+static JSValue win_vita_parse_document(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	dom_hubbub_parser_params params;
+	dom_hubbub_parser *parser = NULL;
+	struct dom_document *doc = NULL;
+	const char *html;
+	size_t len = 0;
+	dom_hubbub_error err;
+	JSValue r;
+
+	if (argc < 1) return JS_NULL;
+	html = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (html == NULL) return JS_NULL;
+
+	memset(&params, 0, sizeof(params));
+	params.enc = "UTF-8";
+	params.fix_enc = true;
+	params.enable_script = false;
+	params.msg = NULL;
+	params.script = NULL;
+	params.ctx = NULL;
+	params.daf = NULL;
+
+	err = dom_hubbub_parser_create(&params, &parser, &doc);
+	if (err != DOM_HUBBUB_OK) {
+		JS_FreeCString(ctx, html);
+		return JS_NULL;
+	}
+	if (len > 0) {
+		err = dom_hubbub_parser_parse_chunk(parser,
+						    (const uint8_t *)html, len);
+	}
+	JS_FreeCString(ctx, html);
+	if (err == DOM_HUBBUB_OK) {
+		err = dom_hubbub_parser_completed(parser);
+	}
+	dom_hubbub_parser_destroy(parser);
+	if (err != DOM_HUBBUB_OK && err != DOM_HUBBUB_HUBBUB_ERR) {
+		if (doc != NULL) dom_node_unref(doc);
+		return JS_NULL;
+	}
+	if (doc == NULL) return JS_NULL;
+	r = wrap_node(ctx, (struct dom_node *)doc);
+	/* wrap_node takes its own reference */
+	dom_node_unref(doc);
+	return r;
 }
 
 static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
@@ -3722,6 +3890,12 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaWatchMutations",
 			  JS_NewCFunction(ctx, win_vita_watch_mutations,
 					  "__vitaWatchMutations", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaParseDocument",
+			  JS_NewCFunction(ctx, win_vita_parse_document,
+					  "__vitaParseDocument", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCreateIn",
+			  JS_NewCFunction(ctx, win_vita_create_in,
+					  "__vitaCreateIn", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaScrollTo",
 			  JS_NewCFunction(ctx, win_vita_scroll_to, "__vitaScrollTo", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaDispatch",

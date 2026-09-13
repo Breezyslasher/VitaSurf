@@ -365,14 +365,21 @@ function isInside(root,el){if(root.nodeType===9)return true;var n=el.parentNode;
    C-side tree walk both search the document, so a detached subtree -- a
    template's content, a fragment a component is building -- has to be
    walked here instead, or querySelector on it finds nothing. */
-function inDocument(n){while(n){if(n.nodeType===9||n===D.documentElement)return true;n=n.parentNode;}return false;}
+function isPageRoot(n){
+ return n===D||(!!n&&n.nodeType===9&&n.documentElement===D.documentElement);}
+function inDocument(n){
+ while(n){
+  if(n===D.documentElement)return true;
+  if(n.nodeType===9)return isPageRoot(n);
+  n=n.parentNode;}
+ return false;}
 function walkElements(root,out){var c=root.childNodes,i;
  for(i=0;i<c.length;i++){if(c[i].nodeType===1){out.push(c[i]);walkElements(c[i],out);}}
  return out;}
 function select(root,sel,all){
  var groups=compile(String(sel)),out=[];
  if(!groups.length)return out;
- var live=root.nodeType===9||inDocument(root);
+ var live=isPageRoot(root)||inDocument(root);
  /* one group ending in an id: ask the document directly */
  if(live&&groups.length===1){var key=groups[0][groups[0].length-1].sel;
   if(key.id&&!key.classes.length&&!key.pseudos.length){
@@ -574,7 +581,18 @@ window.postMessage=function(data){
 };
 D.createAttribute=function(n){return new Attr(null,String(n).toLowerCase(),'');};
 function scratchDocument(title){var html=D.createElement('html'),head=D.createElement('head'),body=D.createElement('body');html.appendChild(head);html.appendChild(body);var doc={nodeType:9,nodeName:'#document',documentElement:html,head:head,body:body,title:title||'',defaultView:null,implementation:D.implementation,createElement:function(t){return D.createElement(t);},createElementNS:function(ns,t){return D.createElement(t);},createTextNode:function(t){return D.createTextNode(t);},createDocumentFragment:function(){return D.createDocumentFragment();},createComment:function(){return D.createTextNode('');},getElementsByTagName:function(t){return html.getElementsByTagName(t);},getElementById:function(id){return html.querySelector('#'+id);},querySelector:function(s){return html.querySelector(s);},querySelectorAll:function(s){return html.querySelectorAll(s);},addEventListener:function(){},removeEventListener:function(){},write:function(){},open:function(){},close:function(){}};return doc;}
-D.implementation={createHTMLDocument:function(t){return scratchDocument(t);},createDocument:function(){return scratchDocument('');},hasFeature:function(){return true;}};
+D.implementation={
+ createHTMLDocument:function(t){
+  var d=W.__vitaParseDocument?W.__vitaParseDocument(
+   '<!DOCTYPE html><html><head><title>'+
+   String(t===undefined?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;')+
+   '</title></head><body></body></html>'):null;
+  return d||scratchDocument(t);},
+ createDocument:function(){
+  var d=W.__vitaParseDocument?W.__vitaParseDocument(''):null;
+  if(d){var de=d.documentElement;if(de)d.removeChild(de);return d;}
+  return scratchDocument('');},
+ hasFeature:function(){return true;}};
 D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';
 window.NodeFilter={FILTER_ACCEPT:1,FILTER_REJECT:2,FILTER_SKIP:3,SHOW_ALL:0xFFFFFFFF,SHOW_ELEMENT:1,SHOW_TEXT:4,SHOW_COMMENT:128,SHOW_DOCUMENT:256};
 D.createTreeWalker=function(root,what,filter){
@@ -2623,15 +2641,122 @@ D.getBoxQuads=function(){return [];};
 D.queryCommandValue=function(){return '';};
 Object.defineProperty(D,'customElementRegistry',{configurable:true,get:function(){return W.customElements;}});
 Object.defineProperty(P,'customElementRegistry',{configurable:true,get:function(){return W.customElements;}});
-D.implementation={createHTMLDocument:function(){return D;},createDocument:function(){return D;},
- createDocumentType:function(n,p,s){return {name:n,publicId:p||'',systemId:s||'',nodeType:10};},
- hasFeature:function(){return true;}};
+/* This used to hand the page's own document back for both of these,
+   so anything a page built here was the page. The real ones are set up
+   further down, once the parser global is known to exist; only the
+   doctype maker belongs here. */
+D.implementation.createDocumentType=function(n,p,s){
+ return {name:n,publicId:p||'',systemId:s||'',nodeType:10};};
+D.implementation.hasFeature=function(){return true;};
 W.DOMImplementation=function(){};
+/* --- documents of their own ---------------------------------------------
+ * DOMParser handed back a div with the markup inside it, so
+ * documentElement, head, body and every document method were missing
+ * from something a page had every reason to treat as a document.
+ * __vitaParseDocument parses into a real libdom document with the same
+ * parser the browser uses for a page; what is left is the part of the
+ * Document interface that a node does not already answer to, added to
+ * the shared prototype and guarded on being a document. */
+function isDoc(n){return !!n&&n.nodeType===9;}
+function docElement(d){
+ var c=d.childNodes,i;
+ for(i=0;i<c.length;i++)if(c[i].nodeType===1)return c[i];
+ return null;}
+function docChild(d,tag){
+ var de=docElement(d),c,i;
+ if(!de)return null;
+ c=de.childNodes;
+ for(i=0;i<c.length;i++)if(c[i].nodeType===1&&c[i].tagName===tag)return c[i];
+ return null;}
+function docOverride(name,get,set){
+ var d=Object.getOwnPropertyDescriptor(P,name);
+ Object.defineProperty(P,name,{configurable:true,
+  get:function(){
+   if(isDoc(this))return get.call(this);
+   return d&&d.get?d.get.call(this):(d?d.value:undefined);},
+  set:function(v){
+   if(isDoc(this)){if(set)set.call(this,v);return;}
+   if(d&&d.set)d.set.call(this,v);
+   else if(d&&!d.get)Object.defineProperty(this,name,
+    {configurable:true,writable:true,enumerable:true,value:v});}});}
+docOverride('documentElement',function(){return docElement(this);});
+docOverride('head',function(){return docChild(this,'HEAD');});
+docOverride('body',function(){
+ return docChild(this,'BODY')||docChild(this,'FRAMESET');});
+docOverride('title',function(){
+ var t=docChild(this,'HEAD');
+ t=t&&t.querySelector?t.querySelector('title'):null;
+ return t?String(t.textContent):'';},
+ function(v){
+  var h=docChild(this,'HEAD'),t=h&&h.querySelector?h.querySelector('title'):null;
+  if(!t&&h){t=D.createElement('title');h.appendChild(t);}
+  if(t)t.textContent=String(v);});
+/* A document delegates the search methods to its element, which is what
+   the document's own tree amounts to. */
+['querySelector','querySelectorAll','getElementsByTagName',
+ 'getElementsByClassName','getElementsByName'].forEach(function(m){
+ var orig=P[m];
+ if(typeof orig!=='function')return;
+ P[m]=function(){
+  if(!isDoc(this))return orig.apply(this,arguments);
+  var de=docElement(this);
+  if(!de)return m==='querySelector'?null:[];
+  /* the document element is in the document's own search, but not in
+     its own subtree search */
+  if(m==='querySelector'&&de.matches&&arguments[0]){
+   try{if(de.matches(arguments[0]))return de;}catch(e){}}
+  return orig.apply(de,arguments);};});
+function docById(root,id){
+ var want=String(id),found=null;
+ (function walk(n){
+  var c=n.childNodes,i;
+  for(i=0;i<c.length&&!found;i++){
+   if(c[i].nodeType!==1)continue;
+   if(c[i].getAttribute('id')===want){found=c[i];return;}
+   walk(c[i]);}})(root);
+ return found;}
+/* Creating a node for another document: libdom ties a node to the
+   document it was made in, so make it there. */
+var DOC_MAKE={createElement:1,createTextNode:3,createComment:8,
+ createDocumentFragment:11};
+Object.keys(DOC_MAKE).forEach(function(m){
+ P[m]=function(a){
+  if(!isDoc(this))throw new TypeError(m+' is not a function');
+  var n=W.__vitaCreateIn?W.__vitaCreateIn(this,DOC_MAKE[m],
+   a===undefined?'':String(a)):null;
+  return n||D[m](a);};});
+P.createElementNS=function(ns,t){return this.createElement(t);};
+P.importNode=function(n,deep){
+ var c=n&&n.cloneNode?n.cloneNode(!!deep):null;
+ return c;};
+P.adoptNode=function(n){return n;};
+Object.defineProperty(P,'implementation',{configurable:true,
+ get:function(){return D.implementation;}});
+Object.defineProperty(P,'defaultView',{configurable:true,
+ get:function(){return isDoc(this)?null:undefined;}});
+Object.defineProperty(P,'contentType',{configurable:true,
+ get:function(){return isDoc(this)?'text/html':undefined;}});
+Object.defineProperty(P,'name',{configurable:true,
+ get:function(){
+  if(this.nodeType===10)return String(this.nodeName);
+  var v=this.getAttribute?this.getAttribute('name'):null;
+  return v===null||v===undefined?'':v;},
+ set:function(v){if(this.setAttribute)this.setAttribute('name',String(v));}});
+Object.defineProperty(P,'doctype',{configurable:true,
+ get:function(){
+  if(!isDoc(this))return undefined;
+  var c=this.childNodes,i;
+  for(i=0;i<c.length;i++)if(c[i].nodeType===10)return c[i];
+  return null;}});
+
 W.DOMParser=W.DOMParser||function(){};
 W.DOMParser.prototype.parseFromString=function(str,type){
- var d=D.createElement('div');d.innerHTML=String(str);return d;};
+ var d=W.__vitaParseDocument?W.__vitaParseDocument(String(str)):null;
+ if(d)return d;
+ /* the parser is not there: at least give back something with a body */
+ var f=D.createElement('div');f.innerHTML=String(str);return f;};
 W.Document.parseHTML=W.Document.parseHTMLUnsafe=function(str){
- var d=D.createElement('div');d.innerHTML=String(str);return d;};
+ return new W.DOMParser().parseFromString(String(str),'text/html');};
 
 /* --- character data ----------------------------------------------------- */
 P.substringData=function(o,c){return String(this.textContent||'').substr(o,c);};
@@ -3011,12 +3136,14 @@ Object.defineProperty(P,'track',{configurable:true,get:function(){
   cues:[],activeCues:[],addCue:function(){},removeCue:function(){},
   addEventListener:function(){},removeEventListener:function(){}};}});
 P.stop=function(){};
-/* DocumentFragment.getElementById. It answers only for a fragment: code
- * tells a document from an element by asking whether it has one. */
+/* DocumentFragment.getElementById, and a document of its own, which
+ * has to walk its tree rather than ask the page's index. An element
+ * has no getElementById at all: code tells a document from an element
+ * by asking whether it has one. */
 P.getElementById=function(id){
+ if(this.nodeType===9)return docById(this,id);
  if(this.nodeType!==11)return null;
- var r=this.querySelectorAll('[id="'+String(id).replace(/"/g,'')+'"]');
- return r.length?r[0]:null;};
+ return docById(this,id);};
 
 /* --- the interfaces a feature-patching loop reads ----------------------- */
 W.XMLSerializer=function(){};
@@ -3769,7 +3896,7 @@ function containsNode(parent,node){
  for(var n=parent;n;n=n.parentNode)if(n===node)return true;
  return false;}
 var CAN_HAVE_CHILDREN={1:true,9:true,11:true};
-function preInsert(parent,node,child,fn){
+function preInsert(parent,node,child,fn,replacing){
  needNode(node,fn,1);
  if(!CAN_HAVE_CHILDREN[parent.nodeType])
   throw hierarchy('This node type does not support this method.');
@@ -3779,11 +3906,61 @@ function preInsert(parent,node,child,fn){
   throw new DOMException(
    'The node before which the new node is to be inserted is not a child '+
    'of this node.','NotFoundError');
- /* a document takes one element and no text */
  if(node.nodeType===3&&parent.nodeType===9)
   throw hierarchy('Nodes of type Text may not be inserted inside a Document.');
  if(node.nodeType===9)
-  throw hierarchy('Nodes of type Document may not be inserted.');}
+  throw hierarchy('Nodes of type Document may not be inserted.');
+ if(node.nodeType===10&&parent.nodeType!==9)
+  throw hierarchy('Nodes of type DocumentType may only be inserted inside '+
+                  'a Document.');
+ if(parent.nodeType===9)documentRules(parent,node,child,replacing);}
+/* What a document will hold: one element and one doctype, the doctype
+   first. A fragment counts as the children it is about to contribute,
+   and a node being replaced does not count against its own replacement. */
+function countKids(parent,type,skip){
+ var c=parent.childNodes,n=0,i;
+ for(i=0;i<c.length;i++)if(c[i]!==skip&&c[i].nodeType===type)n++;
+ return n;}
+function firstKid(parent,type,skip){
+ var c=parent.childNodes,i;
+ for(i=0;i<c.length;i++)if(c[i]!==skip&&c[i].nodeType===type)return c[i];
+ return null;}
+function indexOfKid(parent,node){
+ var c=parent.childNodes,i;
+ for(i=0;i<c.length;i++)if(c[i]===node)return i;
+ return -1;}
+function documentRules(parent,node,child,replacing){
+ var skip=replacing||null,ref=replacing||child||null,
+     elements=countKids(parent,1,skip),doctype=countKids(parent,10,skip),
+     kids,i,e=0,t=0,at,de;
+ if(node.nodeType===11){
+  kids=node.childNodes;
+  for(i=0;i<kids.length;i++){
+   if(kids[i].nodeType===1)e++;
+   else if(kids[i].nodeType===3)t++;}
+  if(t>0||e>1)
+   throw hierarchy('A document may hold one element and no text.');
+  if(e===0)return;}
+ else if(node.nodeType!==1&&node.nodeType!==10)return;
+ if(node.nodeType===10){
+  if(doctype>0)
+   throw hierarchy('A document may hold only one doctype.');
+  /* the doctype must come before the document element */
+  at=ref?indexOfKid(parent,ref):parent.childNodes.length;
+  de=firstKid(parent,1,skip);
+  if(de&&(at<0||indexOfKid(parent,de)<at))
+   throw hierarchy('A doctype may not follow the document element.');
+  return;}
+ /* an element, or a fragment holding exactly one */
+ if(elements>0)
+  throw hierarchy('A document may hold only one element.');
+ if(child!==null&&child!==undefined&&child.nodeType===10)
+  throw hierarchy('An element may not be inserted before the doctype.');
+ if(ref){
+  at=indexOfKid(parent,ref);
+  de=firstKid(parent,10,skip);
+  if(de&&at>=0&&indexOfKid(parent,de)>at)
+   throw hierarchy('An element may not be inserted before the doctype.');}}
 (function(){
  var append=P.appendChild,insert=P.insertBefore,replace=P.replaceChild,
      removeC=P.removeChild;
@@ -3798,7 +3975,7 @@ function preInsert(parent,node,child,fn){
   needNode(child,'replaceChild',2);
   if(child.parentNode!==this)throw new DOMException(
    'The node to be replaced is not a child of this node.','NotFoundError');
-  preInsert(this,node,null,'replaceChild');
+  preInsert(this,node,null,'replaceChild',child);
   return replace.call(this,node,child);};
  P.removeChild=function(child){
   needNode(child,'removeChild',1);
