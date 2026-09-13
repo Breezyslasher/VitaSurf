@@ -18,6 +18,10 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# How long to let a page run before reading its facts. A probe settles at
+# once; a real page needs longer, and on the monkey frontend longer again.
+WAIT="${WAIT:-4}"
+
 CHROME="${CHROME:-/opt/pw-browsers/chromium-1194/chrome-linux/chrome}"
 NSMONKEY="${NSMONKEY:-$ROOT/deps/netsurf/nsmonkey}"
 
@@ -47,11 +51,11 @@ trap 'rm -rf "$work"' EXIT
 run_browser() {
     # the pre spans lines, so pull it out whole
     "$CHROME" --headless --no-sandbox --disable-gpu --disable-dev-shm-usage \
-        --virtual-time-budget=4000 --dump-dom "file://$1" 2>/dev/null |
+        --virtual-time-budget=$((WAIT * 1000 + 2000)) --dump-dom "file://$1" 2>/dev/null |
     python3 -c '
 import sys, re, html
 d = sys.stdin.read()
-m = re.search(r"<pre id=\"out\">(.*?)</pre>", d, re.S)
+m = re.search(r"<pre id=\"out\"[^>]*>(.*?)</pre>", d, re.S)
 print(html.unescape(m.group(1)).strip() if m else "")'
 }
 
@@ -59,9 +63,9 @@ run_vita() {
     (
         echo "WINDOW NEW"
         echo "WINDOW GO 0 file://$1"
-        sleep 4
+        sleep "$WAIT"
         echo "QUIT"
-    ) | ( cd "$(dirname "$NSMONKEY")" && timeout 90 "$NSMONKEY" --enable_javascript=1 ) 2>&1 |
+    ) | ( cd "$(dirname "$NSMONKEY")" && timeout $((WAIT * 6 + 60)) "$NSMONKEY" --enable_javascript=1 ) 2>&1 |
     sed -n 's/^.*console: \(XX .*\)$/\1/p'
 }
 

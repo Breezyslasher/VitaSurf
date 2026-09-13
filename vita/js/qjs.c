@@ -4137,6 +4137,27 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	if (thread == NULL || thread->closed || txt == NULL || txtlen == 0) {
 		return false;
 	}
+	/*
+	 * Give the prelude a moment before each script. It uses this to
+	 * empty any <template> the parser has read since the last one:
+	 * libdom parses a template's children into the element, and until
+	 * they are moved into its content fragment they are still in the
+	 * document, where a script's own querySelectorAll finds them.
+	 */
+	{
+		JSValue global = JS_GetGlobalObject(thread->ctx);
+		JSValue fn = JS_GetPropertyStr(thread->ctx, global,
+					       "__vitaBeforeScript");
+		if (JS_IsFunction(thread->ctx, fn)) {
+			JSValue r = JS_Call(thread->ctx, fn, global, 0, NULL);
+			if (JS_IsException(r)) {
+				qjs_report_exception(thread->ctx);
+			}
+			JS_FreeValue(thread->ctx, r);
+		}
+		JS_FreeValue(thread->ctx, fn);
+		JS_FreeValue(thread->ctx, global);
+	}
 	if (txtlen > SCRIPT_MAX_BYTES) {
 		vita_log("qjs: skipping %u KB script (limit %u KB): %s",
 			 (unsigned)(txtlen / 1024),

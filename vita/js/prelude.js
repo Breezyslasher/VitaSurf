@@ -1191,8 +1191,30 @@ W.customElements={
 })();
 /* The parser keeps adding elements after a define, so sweep once the
  * document is built. Both events reach document listeners (qjs.c). */
-W.addEventListener('DOMContentLoaded',function(){if(CEn)ceConnectTree(D.documentElement,true,false);});
-W.addEventListener('load',function(){if(CEn)ceConnectTree(D.documentElement,true,false);});
+/*
+ * A template's children are never in the document: they belong to its
+ * content fragment from the moment the parser reads them. Here libdom
+ * parses them into the template element and they move out the first time
+ * content is read, so until some script asked, everything inside every
+ * template was still in the page -- querySelectorAll('form') on GitHub's
+ * saved front page found 43 forms where a browser finds 31, and the same
+ * for the inputs and buttons inside them. Empty them once the parser is
+ * done, and again at load for the ones added since.
+ */
+function sweepTemplates(){
+ var t=D.getElementsByTagName('template'),i;
+ for(i=0;i<t.length;i++)void t[i].content;}
+/* qjs.c calls this before each script, because a script's first act is
+   usually to query the document and the parser may have read a template
+   since the last one. Touching content a second time costs nothing: the
+   fragment is already there. */
+W.__vitaBeforeScript=sweepTemplates;
+W.addEventListener('DOMContentLoaded',function(){
+ sweepTemplates();
+ if(CEn)ceConnectTree(D.documentElement,true,false);});
+W.addEventListener('load',function(){
+ sweepTemplates();
+ if(CEn)ceConnectTree(D.documentElement,true,false);});
 
 /* Shadow DOM, as light DOM. A shadow root is the element itself, so
  * there is no style or selector scoping, which is the point: content put
