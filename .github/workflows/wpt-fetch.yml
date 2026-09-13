@@ -63,7 +63,11 @@ jobs:
           SKIP = re.compile(
               r'(\.any\.|\.window\.|\.worker\.|\.serviceworker\.|'
               r'-manual\.|/support/|\.tentative\.)')
-          WANT = re.compile(r'\.html$')
+          # The tests include sibling helper scripts -- attributes.js,
+          # productions.js, pre-insertion-validation-*.js -- and without
+          # them a test reports its own helpers as undefined, which looks
+          # like our failure and is not.
+          WANT = re.compile(r'\.(html|js)$')
 
           if os.path.isdir(DST):
               shutil.rmtree(DST)
@@ -79,6 +83,8 @@ jobs:
                   if rel.startswith('resources/'):
                       pass
                   elif not WANT.search(f) or SKIP.search('/' + rel):
+                      continue
+                  elif f.endswith('.js') and re.search(r'\.(any|window|worker)\.js$', f):
                       continue
                   out = os.path.join(DST, rel)
                   os.makedirs(os.path.dirname(out), exist_ok=True)
