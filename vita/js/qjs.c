@@ -157,6 +157,7 @@ struct js_listener {
 	dom_string *type;	/**< kept, to match a remove against */
 	bool capture;
 	bool once;
+	bool passive;		/**< preventDefault from it is ignored */
 	bool dead;		/**< removed while its own call was running */
 };
 
@@ -1790,12 +1791,60 @@ static struct dom_document *thread_document(jsthread *thread)
  * The third argument of addEventListener and removeEventListener: a
  * boolean is the capture flag, an object carries capture and once.
  */
+/*
+ * The scroll-blocking event types. A listener for one of these added to
+ * the window, the document, the root element or the body is passive
+ * unless the page says otherwise, so preventDefault from inside it does
+ * nothing -- which is what lets the page keep scrolling while the
+ * listener runs.
+ */
+static bool scroll_blocking(const char *type)
+{
+	return type != NULL &&
+		(strcmp(type, "touchstart") == 0 ||
+		 strcmp(type, "touchmove") == 0 ||
+		 strcmp(type, "wheel") == 0 ||
+		 strcmp(type, "mousewheel") == 0);
+}
+
+static bool passive_by_default(JSContext *ctx, struct dom_node *node,
+			       const char *type)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_document *doc;
+	dom_node_type t = DOM_ELEMENT_NODE;
+	dom_string *name = NULL;
+	bool root = false;
+
+	if (!scroll_blocking(type)) return false;
+	if (node == NULL) return true;	/* the window */
+	doc = thread_document(thread);
+	if ((struct dom_node *)doc == node) return true;
+	if (dom_node_get_node_type(node, &t) != DOM_NO_ERR ||
+	    t != DOM_ELEMENT_NODE) {
+		return false;
+	}
+	if (dom_node_get_node_name(node, &name) == DOM_NO_ERR && name != NULL) {
+		const char *n = dom_string_data(name);
+		size_t len = dom_string_byte_length(name);
+
+		root = (len == 4 && strncasecmp(n, "HTML", 4) == 0) ||
+		       (len == 4 && strncasecmp(n, "BODY", 4) == 0);
+		dom_string_unref(name);
+	}
+	return root;
+}
+
 static void listener_options(JSContext *ctx, JSValueConst opts,
-			     bool *capture, bool *once)
+			     bool *capture, bool *once, bool *passive,
+			     bool dflt)
 {
 	*capture = false;
 	if (once != NULL) {
 		*once = false;
+	}
+	if (passive != NULL) {
+		*passive = dflt;
 	}
 	if (JS_IsUndefined(opts) || JS_IsNull(opts)) {
 		return;
@@ -1807,6 +1856,14 @@ static void listener_options(JSContext *ctx, JSValueConst opts,
 		if (once != NULL) {
 			v = JS_GetPropertyStr(ctx, opts, "once");
 			*once = JS_ToBool(ctx, v) == 1;
+			JS_FreeValue(ctx, v);
+		}
+		if (passive != NULL) {
+			v = JS_GetPropertyStr(ctx, opts, "passive");
+			/* absent leaves the default; present decides */
+			if (!JS_IsUndefined(v)) {
+				*passive = JS_ToBool(ctx, v) == 1;
+			}
 			JS_FreeValue(ctx, v);
 		}
 		return;
@@ -1879,14 +1936,15 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	dom_string *type_dom;
 	struct js_listener *l;
 	struct dom_event_listener *dl = NULL;
-	bool capture = false, once = false;
+	bool capture = false, once = false, passive = false;
 
 	if (node == NULL || thread == NULL || !JS_IsFunction(ctx, func)) {
 		return JS_UNDEFINED;
 	}
 	sweep_dead_listeners(thread);
-	listener_options(ctx, opts, &capture, &once);
 	type = JS_ToCString(ctx, type_v);
+	listener_options(ctx, opts, &capture, &once, &passive,
+			 passive_by_default(ctx, node, type));
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
 		if (type) JS_FreeCString(ctx, type);
@@ -1926,6 +1984,7 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	l->type = dom_string_ref(type_dom);
 	l->capture = capture;
 	l->once = once;
+	l->passive = passive;
 	l->next = thread->listeners;
 	thread->listeners = l;
 
@@ -1950,7 +2009,7 @@ static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 		return JS_UNDEFINED;
 	}
 	sweep_dead_listeners(thread);
-	listener_options(ctx, opts, &capture, NULL);
+	listener_options(ctx, opts, &capture, NULL, NULL, false);
 	type = JS_ToCString(ctx, type_v);
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
@@ -3480,7 +3539,14 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		}
 	}
 	args[0] = event_obj;
+	/* while a passive listener runs, the event refuses to be cancelled */
+	if (l->passive) {
+		JS_SetPropertyStr(ctx, event_obj, "__vitaPassive", JS_TRUE);
+	}
 	ret = JS_Call(ctx, l->func, global, 1, args);
+	if (l->passive) {
+		JS_SetPropertyStr(ctx, event_obj, "__vitaPassive", JS_FALSE);
+	}
 	if (JS_IsException(ret)) {
 		qjs_report_exception(ctx);
 	}
@@ -3488,7 +3554,14 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	/* carry the listener's decisions back into the DOM dispatch */
 	flag = JS_GetPropertyStr(ctx, event_obj, "defaultPrevented");
 	if (JS_ToBool(ctx, flag) == 1) {
-		dom_event_prevent_default(evt);
+		if (l->passive) {
+			/* a passive listener does not get to cancel: put
+			 * the flag back so the page keeps scrolling */
+			JS_SetPropertyStr(ctx, event_obj, "defaultPrevented",
+					  JS_FALSE);
+		} else {
+			dom_event_prevent_default(evt);
+		}
 	}
 	JS_FreeValue(ctx, flag);
 	flag = JS_GetPropertyStr(ctx, event_obj, "cancelBubble");

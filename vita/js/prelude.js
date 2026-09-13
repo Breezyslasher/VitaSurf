@@ -1084,7 +1084,13 @@ location.reload=function(){location.href=location.href;};
 ['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:(m[1]||'')+'//'+(m[2]||'')}[k];}});});
 location.toString=function(){return location.href;};
 function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();}
-Event.prototype.preventDefault=function(){this.defaultPrevented=true;};/* The C side reads cancelBubble back after a listener returns and stops
+/* A passive listener cannot cancel: preventDefault from inside one does
+   nothing at all, so defaultPrevented stays false even while it runs.
+   The dispatch marks the event while a passive listener is on it. */
+Event.prototype.preventDefault=function(){
+ if(this.__vitaPassive)return;
+ if(this.cancelable===false)return;
+ this.defaultPrevented=true;};/* The C side reads cancelBubble back after a listener returns and stops
  * libdom's propagation with it, so this is what makes stopPropagation
  * stop anything. */
 Event.prototype.stopPropagation=function(){this.cancelBubble=true;};
@@ -1118,7 +1124,12 @@ W.TouchList=Array;W.DataTransfer=function(){this.items=[];this.files=[];this.typ
  * names, reads undefined through an inherited getter, and dies on it.
  * Give each one an empty prototype in the chain instead. */
 var DocumentProto={};Object.setPrototypeOf(D,DocumentProto);
-W.HTMLDocument=W.Document=function(){};W.Document.prototype=DocumentProto;
+function Document(){throw new TypeError('Illegal constructor');}
+function HTMLDocument(){throw new TypeError('Illegal constructor');}
+W.Document=Document;W.HTMLDocument=HTMLDocument;
+Document.prototype=DocumentProto;HTMLDocument.prototype=DocumentProto;
+Object.defineProperty(DocumentProto,'constructor',
+ {configurable:true,writable:true,value:HTMLDocument});
 W.NodeList=W.HTMLCollection=Array;
 ['CharacterData','Text','Comment','CDATASection','ProcessingInstruction','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});
 /* Interfaces that polyfills enumerate and read .prototype from. They
@@ -1130,6 +1141,13 @@ W.NodeList=W.HTMLCollection=Array;
  'DOMPoint','DOMMatrix','Selection','XPathResult','AnimationEvent','TransitionEvent',
  'HTMLAllCollection','RadioNodeList','ValidityState'].forEach(function(n){if(W[n]===undefined)W[n]=function(){};});
 var WindowProto={};Object.setPrototypeOf(W,WindowProto);
+/* window.constructor.name is Window, which code reads to tell a window
+   from a worker or an iframe's global. */
+function Window(){throw new TypeError('Illegal constructor');}
+Window.prototype=WindowProto;
+Object.defineProperty(WindowProto,'constructor',
+ {configurable:true,writable:true,value:Window});
+W.Window=Window;
 /* The event target calls belong on the prototype, not on window itself.
  * A polyfill reads an own descriptor off Window.prototype to wrap them,
  * finds nothing when they sit on the global, and then calls the wrapper
@@ -1456,6 +1474,9 @@ function CEBase(){
  return e;
 }
 CEBase.prototype=P;
+/* It is HTMLElement to the page, whatever it is called here. */
+try{Object.defineProperty(CEBase,'name',
+ {configurable:true,value:'HTMLElement'});}catch(e){}
 W.HTMLElement=CEBase;
 /* Every HTML*Element alias shares it, so `extends HTMLDivElement` works. */
 Object.keys(W).forEach(function(k){if(k.indexOf('HTML')===0&&k!=='HTMLDocument'&&W[k]===Element)W[k]=CEBase;});
@@ -4364,9 +4385,12 @@ stampConsts(P);
    var d=W.__vitaParseDocument?W.__vitaParseDocument(''):null;
    if(d){var de=d.documentElement;if(de)d.removeChild(de);return d;}
    return D.createDocumentFragment();}};
- function iface(test,from,make){
+ function iface(name,test,from,make){
   var F=make?function(a){return make(a);}
             :function(){return CEBase.apply(this,arguments);};
+  /* the interface's own name: code reads constructor.name, and an
+     anonymous function reports the empty string */
+  try{Object.defineProperty(F,'name',{configurable:true,value:name});}catch(e){}
   F.prototype=P;
   /* keep whatever the old constructor carried -- Node.ELEMENT_NODE and
      the rest of the node type constants live there, and code reads
@@ -4432,13 +4456,35 @@ stampConsts(P);
   stampConsts(W.Document);}catch(e){}
  var k;
  for(k in byType)if(W[k]===WAS||W[k]===CEBase)
-  W[k]=iface(ofType(byType[k]),W[k],MAKE[k]);
+  W[k]=iface(k,ofType(byType[k]),W[k],MAKE[k]);
  for(k in byTag)if(W[k]===WAS||W[k]===CEBase)
-  W[k]=iface(ofTag(byTag[k]),W[k]);
+  W[k]=iface(k,ofTag(byTag[k]),W[k]);
+ /* Which interface a node reports as its constructor. Every element
+    shares one prototype here, so constructor came back the same for all
+    of them -- code that reads el.constructor.name to tell a div from an
+    input got one answer for both. Build the tag-to-interface map from
+    the same table the instanceof tests use. */
+ var BY_TAG={};
+ for(k in byTag){
+  if(k==='SVGElement'||k==='SVGSVGElement')continue;
+  byTag[k].split(/\s+/).forEach(function(tag){
+   if(tag&&!BY_TAG[tag])BY_TAG[tag]=k;});}
+ var BY_TYPE={2:'Attr',3:'Text',4:'CDATASection',7:'ProcessingInstruction',
+  8:'Comment',9:'HTMLDocument',10:'DocumentType',11:'DocumentFragment'};
+ Object.defineProperty(P,'constructor',{configurable:true,
+  get:function(){
+   var t=this.nodeType,n;
+   if(t===1){
+    n=BY_TAG[this.tagName];
+    if(!n)n=HTML_TAGS.indexOf(' '+this.tagName+' ')>=0?'HTMLElement'
+                                                      :'HTMLUnknownElement';
+   }else n=BY_TYPE[t];
+   return (n&&W[n])||W.Node;},
+  set:function(v){shadowProp(this,'constructor',v);}});
  /* An unknown element is one whose tag is not in the HTML vocabulary at
     all -- <section> and <strong> are plain HTMLElements, not unknown. */
  if(W.HTMLUnknownElement===WAS||W.HTMLUnknownElement===CEBase){
-  W.HTMLUnknownElement=iface(function(v){
+  W.HTMLUnknownElement=iface('HTMLUnknownElement',function(v){
    return !!v&&typeof v==='object'&&v.nodeType===1&&
     HTML_TAGS.indexOf(' '+v.tagName+' ')<0&&
     byTag.SVGElement.indexOf(' '+v.tagName+' ')<0;},W.HTMLUnknownElement);}
