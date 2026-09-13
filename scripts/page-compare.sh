@@ -103,12 +103,12 @@ cat >> "$probe" <<'PROBE'
   }
   /* On a timer, not on load: a page whose assets never all arrive never
      fires load, and the point is to see what it built regardless. */
-  setTimeout(report, (window.__vitaPageWait || 6) * 1000);
+  setTimeout(report, (window.__vitaPageWait || 15) * 1000);
 })();
 </script>
 PROBE
 
-WAIT="${WAIT:-20}" \
+WAIT="${WAIT:-45}" \
 CHROME="${CHROME:-/opt/pw-browsers/chromium-1194/chrome-linux/chrome}" \
 NSMONKEY="${NSMONKEY:-$ROOT/deps/netsurf/nsmonkey}" \
     "$ROOT/scripts/dom-compare.sh" "$probe"
