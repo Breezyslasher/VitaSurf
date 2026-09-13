@@ -10,6 +10,22 @@
 (function(){
 var P=Node.prototype;
 function priv(o,k,make){if(!Object.prototype.hasOwnProperty.call(o,k))Object.defineProperty(o,k,{value:make(),writable:true});return o[k];}
+/*
+ * Every property below is on Node.prototype, because every node here
+ * shares one prototype. A component that keeps its own state in a
+ * property whose name happens to match an HTML attribute -- data, list,
+ * label, index, mode, clear -- would have that state stringified into an
+ * attribute and read back as a string, and then fail somewhere else
+ * entirely when it called what it had stored. So a reflected property
+ * that is handed a function or an object stops reflecting on that node
+ * and becomes an ordinary own property, which is what the component
+ * meant. Strings, numbers and booleans still reflect, which is every use
+ * the attribute itself has.
+ */
+function shadowProp(o,k,v){
+ Object.defineProperty(o,k,{configurable:true,writable:true,enumerable:true,value:v});
+ return v;}
+function isOwnState(v){return typeof v==='function'||(v!==null&&typeof v==='object');}
 Object.defineProperty(P,'style',{configurable:true,get:function(){return priv(this,'__style',function(){return {getPropertyValue:function(){return '';},setProperty:function(){},removeProperty:function(){},cssText:''};});}});
 Object.defineProperty(P,'dataset',{configurable:true,get:function(){return priv(this,'__dataset',function(){return {};});}});
 Object.defineProperty(P,'classList',{configurable:true,get:function(){var el=this;return {contains:function(c){return (' '+el.className+' ').indexOf(' '+c+' ')>=0;},add:function(){for(var i=0;i<arguments.length;i++){if(!this.contains(arguments[i]))el.className=(el.className?el.className+' ':'')+arguments[i];}},remove:function(){for(var i=0;i<arguments.length;i++){el.className=(' '+el.className+' ').split(' '+arguments[i]+' ').join(' ').trim();}},toggle:function(c,f){var h=this.contains(c);if(f===undefined)f=!h;if(f&&!h)this.add(c);else if(!f&&h)this.remove(c);return f;},get length(){return el.className?el.className.split(/\s+/).length:0;}};}});
@@ -20,7 +36,7 @@ Object.defineProperty(P,'parentElement',{configurable:true,get:function(){var p=
 Object.defineProperty(P,'innerText',{configurable:true,get:function(){return this.textContent;},set:function(v){this.textContent=v;}});
 Object.defineProperty(P,'outerHTML',{configurable:true,get:function(){return '';}});
 Object.defineProperty(P,'ownerDocument',{configurable:true,get:function(){return document;}});
-['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){this.setAttribute(attr,String(v));}});});
+['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){if(isOwnState(v))return shadowProp(this,a,v);this.setAttribute(attr,String(v));}});});
 /* The URL-valued attributes reflect as resolved absolute URLs, not as
  * written. getAttribute still gives what the document said. Code tests
  * these against a scheme -- webpack decides its public path by matching
@@ -31,8 +47,8 @@ Object.defineProperty(P,'ownerDocument',{configurable:true,get:function(){return
   var v=this.getAttribute(a);
   if(v===null||v==='')return '';
   try{return new URL(v,D.baseURI).href;}catch(e){return v;}
- },set:function(v){this.setAttribute(a,String(v));}});});
-['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{configurable:true,get:function(){return this.hasAttribute(attr);},set:function(v){if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
+ },set:function(v){if(isOwnState(v))return shadowProp(this,a,v);this.setAttribute(a,String(v));}});});
+['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{configurable:true,get:function(){return this.hasAttribute(attr);},set:function(v){if(isOwnState(v))return shadowProp(this,a,v);if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
 /* Layout geometry. __vitaBox(node) (qjs.c) returns the element's laid-out
    box as [x,y,width,height,clientWidth,clientHeight,clientLeft,clientTop,
    scrollWidth,scrollHeight,scrollLeft,scrollTop] in CSS px, document
@@ -904,19 +920,23 @@ function attrName(p){return p.replace(/[A-Z]/g,function(c){return c.toLowerCase(
 function each(list,f){list.forEach(function(e){var p=typeof e==='string'?e:e[0];f(p,(typeof e==='string'?attrName(p):e[1]),e);});}
 function reflectString(list){each(list,function(p,a){defProp(p,{configurable:true,
  get:function(){var v=this.getAttribute(a);return v===null?'':v;},
- set:function(v){this.setAttribute(a,String(v));}});});}
+ set:function(v){if(isOwnState(v))return shadowProp(this,p,v);
+  this.setAttribute(a,String(v));}});});}
 function reflectBool(list){each(list,function(p,a){defProp(p,{configurable:true,
  get:function(){return this.hasAttribute(a);},
- set:function(v){if(v)this.setAttribute(a,'');else this.removeAttribute(a);}});});}
+ set:function(v){if(isOwnState(v))return shadowProp(this,p,v);
+  if(v)this.setAttribute(a,'');else this.removeAttribute(a);}});});}
 /* [property, attribute, default] */
 function reflectLong(list){list.forEach(function(e){var p=e[0],a=e[1],d=e[2];defProp(p,{configurable:true,
  get:function(){var v=this.getAttribute(a);if(v===null||v==='')return d;v=parseInt(v,10);return isNaN(v)?d:v;},
- set:function(v){this.setAttribute(a,String(parseInt(v,10)||0));}});});}
+ set:function(v){if(isOwnState(v))return shadowProp(this,p,v);
+  this.setAttribute(a,String(parseInt(v,10)||0));}});});}
 /* [property, attribute, keywords, default]. An absent or unrecognised
  * value reports the default, which is what the keyword tables say. */
 function reflectEnum(list){list.forEach(function(e){var p=e[0],a=e[1],k=e[2],d=e[3];defProp(p,{configurable:true,
  get:function(){var v=this.getAttribute(a);if(v===null)return d;v=String(v).toLowerCase();return k.indexOf(v)>=0?v:d;},
- set:function(v){this.setAttribute(a,String(v));}});});}
+ set:function(v){if(isOwnState(v))return shadowProp(this,p,v);
+  this.setAttribute(a,String(v));}});});}
 
 reflectString(['accessKey','autocapitalize','autocorrect','nonce','popover','slot',
  ['enterKeyHint','enterkeyhint'],['inputMode','inputmode'],['writingSuggestions','writingsuggestions'],
@@ -991,10 +1011,12 @@ P.togglePopover=function(force){var open=force===undefined?!this.__popopen:!!for
  if(open)this.showPopover();else this.hidePopover();return open;};
 Object.defineProperty(P,'popoverTargetElement',{configurable:true,
  get:function(){var id=this.getAttribute('popovertarget');return id?D.getElementById(id):null;},
- set:function(v){if(v&&v.id)this.setAttribute('popovertarget',v.id);}});
+ set:function(v){if(v&&v.id)this.setAttribute('popovertarget',v.id);
+  else shadowProp(this,'popoverTargetElement',v);}});
 Object.defineProperty(P,'commandForElement',{configurable:true,
  get:function(){var id=this.getAttribute('commandfor');return id?D.getElementById(id):null;},
- set:function(v){if(v&&v.id)this.setAttribute('commandfor',v.id);}});
+ set:function(v){if(v&&v.id)this.setAttribute('commandfor',v.id);
+  else shadowProp(this,'commandForElement',v);}});
 
 /* --- DOMTokenList -------------------------------------------------------
  * classList was an object literal with four methods. A real token list
@@ -1046,17 +1068,27 @@ Object.defineProperty(P,'classList',{configurable:true,get:function(){return new
  */
 function isURLEl(el){var t=el.tagName;return t==='A'||t==='AREA';}
 function urlOf(el){try{return new URL(el.getAttribute('href')||'',D.baseURI);}catch(e){return null;}}
+/* On anything that is not a link these are the page's own property to
+ * use, so an assignment keeps what it was given rather than vanishing. */
 ['protocol','username','password','hostname','port','pathname','search','hash'].forEach(function(k){
  Object.defineProperty(P,k,{configurable:true,
   get:function(){if(!isURLEl(this))return '';var u=urlOf(this);return u?u[k]:'';},
-  set:function(v){if(!isURLEl(this))return;var u=urlOf(this);if(!u)return;u[k]=v;this.setAttribute('href',u.href);}});});
+  set:function(v){
+   if(!isURLEl(this))return shadowProp(this,k,v);
+   var u=urlOf(this);
+   if(!u)return shadowProp(this,k,v);
+   u[k]=v;this.setAttribute('href',u.href);}});});
 Object.defineProperty(P,'origin',{configurable:true,get:function(){
  if(!isURLEl(this))return '';var u=urlOf(this);return u?u.origin:'';}});
 /* host doubles as the shadow root's host, which wins when there is one. */
 Object.defineProperty(P,'host',{configurable:true,
  get:function(){if(this.__shadow)return this;if(!isURLEl(this))return undefined;
   var u=urlOf(this);return u?u.host:'';},
- set:function(v){if(!isURLEl(this))return;var u=urlOf(this);if(!u)return;u.host=v;this.setAttribute('href',u.href);}});
+ set:function(v){
+  if(!isURLEl(this))return shadowProp(this,'host',v);
+  var u=urlOf(this);
+  if(!u)return shadowProp(this,'host',v);
+  u.host=v;this.setAttribute('href',u.href);}});
 /* a.text is the link's text; every other tag keeps the text attribute. */
 (function(){var d=Object.getOwnPropertyDescriptor(P,'text');
  Object.defineProperty(P,'text',{configurable:true,
@@ -1172,7 +1204,9 @@ Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){
  if(this.tagName==='OPTION')return this.parentNode?this.parentNode.selectedIndex:-1;
  var o=this.options||[];for(var i=0;i<o.length;i++)if(o[i].selected)return i;
  return o.length?0:-1;},
- set:function(v){var o=this.options||[];for(var i=0;i<o.length;i++)o[i].selected=(i===Number(v));}});
+ set:function(v){var o=this.options;
+  if(!o)return shadowProp(this,'selectedIndex',v);
+  for(var i=0;i<o.length;i++)o[i].selected=(i===Number(v));}});
 Object.defineProperty(P,'index',{configurable:true,get:function(){
  if(this.tagName!=='OPTION')return undefined;
  var p=this.parentNode;while(p&&p.tagName==='OPTGROUP')p=p.parentNode;
@@ -2436,5 +2470,32 @@ Blob.prototype.textStream=function(){return null;};
  P.getHTML=function(){return this.innerHTML;};
  W.XMLSerializer.prototype.serializeToString=function(n){
   return n&&n.nodeType!==undefined?ser(n):String(n);};
+})();
+
+/* --- assignment to a read-only property --------------------------------
+ * The same problem from the other side. A getter with no setter drops
+ * what it is given without a word, so a component that keeps state in
+ * form, list, index, mode, position, label or error finds its own value
+ * gone the next time it looks. Give every one of them a setter that
+ * shadows the accessor on that node, which is what assigning to a plain
+ * object does. The few the custom element machinery and the tree walk
+ * depend on keep their own meaning.
+ */
+(function(){
+ /*
+  * Only the tree itself is held back. shadowRoot and host in particular
+  * are assigned to: a shadow DOM polyfill builds its own root object and
+  * writes the host onto it, and that write being dropped is why
+  * YouTube's ShadyDOM read __shady off undefined.
+  */
+ var KEEP=' isConnected children parentElement firstElementChild '+
+  'lastElementChild childNodes parentNode firstChild lastChild nextSibling '+
+  'previousSibling nodeType nodeName tagName attributes classList ownerDocument ';
+ Object.getOwnPropertyNames(P).forEach(function(k){
+  if(KEEP.indexOf(' '+k+' ')>=0)return;
+  var d=Object.getOwnPropertyDescriptor(P,k);
+  if(!d||!d.get||d.set||!d.configurable)return;
+  Object.defineProperty(P,k,{configurable:true,enumerable:d.enumerable,get:d.get,
+   set:function(v){shadowProp(this,k,v);}});});
 })();
 })();
