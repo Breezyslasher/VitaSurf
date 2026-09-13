@@ -1,2 +1,2 @@
 url=https://www.youtube.com/s/_/ytmainappweb/_/js/k=ytmainappweb.kevlar_base.en_US.wDCKWufap4w.es5.O/am=AAAAAAQAEAASBQ/d=1/rs=AGKMywESBSjRHZgSDBzYetLIaJOggMZKow/m=kevlar_base_module,kevlar_main_module,kevlar_base_sync_mod_chunk
-line=40290:0-700
+find=guideInnerContent
