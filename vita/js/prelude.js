@@ -618,7 +618,12 @@ Object.defineProperty(D,'images',{configurable:true,get:function(){return D.getE
 Object.defineProperty(D,'scripts',{configurable:true,get:function(){return D.getElementsByTagName('script');}});
 D.defaultView=window;D.nodeType=9;D.nodeName='#document';D.documentMode=undefined;D.compatMode='CSS1Compat';D.hidden=false;D.visibilityState='visible';
 D.createEvent=function(t){return /custom/i.test(t)?new CustomEvent(''):new Event('');};D.dispatchEvent=function(e){return __vitaDispatch(null,e);};D.hasFocus=function(){return true;};
-D.createElementNS=function(ns,t){return D.createElement(t);};
+/* The qualified name has to satisfy the same namespace rules as an
+   attribute's before an element is made from it. */
+D.createElementNS=function(ns,t){
+ needArgs(arguments.length,2,'createElementNS');
+ nsExtract(ns,t,'createElementNS');
+ return D.createElement(t);};
 D.createRange=function(){var r={startContainer:D.body,endContainer:D.body,startOffset:0,endOffset:0,collapsed:true,
  commonAncestorContainer:D.body,
  setStart:function(n,o){this.startContainer=n;this.startOffset=o;},setEnd:function(n,o){this.endContainer=n;this.endOffset=o;},
@@ -1358,11 +1363,15 @@ W.customElements={
 });
 (function(){
  var orig=P.removeChild;
- P.removeChild=function(n){var r=orig.apply(this,arguments);if(CEn&&n)ceDisconnectTree(n,false);return r;};
+ P.removeChild=function(n){
+  noteEdges(n);
+  var r=orig.apply(this,arguments);if(CEn&&n)ceDisconnectTree(n,false);return r;};
 })();
 (function(){
  var orig=P.replaceChild;
- P.replaceChild=function(nw,old){var r=orig.apply(this,arguments);
+ P.replaceChild=function(nw,old){
+  noteEdges(old);
+  var r=orig.apply(this,arguments);
   if(CEn){if(old)ceDisconnectTree(old,false);if(nw)ceConnectTree(nw,ceInDoc(this),false);}return r;};
 })();
 (function(){
@@ -3747,6 +3756,35 @@ function MOqueue(o,rec){
 /* Called from qjs.c for each mutation. a and b carry different things
    per kind: the added and removed node for childList, the attribute name
    and its old value for attributes. */
+/* previousSibling and nextSibling on a childList record are the nodes
+   that bracket the change, taken from whichever list still holds it:
+   the new children for an addition, the old ones for a removal. */
+function edgeOf(list,nodes,rec){
+ var first=nodes[0],last=nodes[nodes.length-1],i,at=-1,end=-1;
+ for(i=0;i<list.length;i++){
+  if(list[i]===first&&at<0)at=i;
+  if(list[i]===last)end=i;}
+ if(at<0)return false;
+ if(end<at)end=at;
+ rec.previousSibling=at>0?list[at-1]:null;
+ rec.nextSibling=end+1<list.length?list[end+1]:null;
+ return true;}
+/* A node about to be removed still knows its siblings; once it is out
+   they are gone, and the before-and-after snapshots do not always carry
+   them, so note them on the way past. */
+var MOedges=null;
+function noteEdges(n){
+ MOedges=n&&n.parentNode?
+  {node:n,prev:n.previousSibling||null,next:n.nextSibling||null}:null;}
+function siblingsOf(rec,target,after,before){
+ var now=target.childNodes?[].slice.call(target.childNodes):[];
+ if(rec.addedNodes.length&&edgeOf(now,rec.addedNodes,rec))return;
+ if(!rec.removedNodes.length)return;
+ if(before&&before.length!==undefined&&
+    edgeOf([].slice.call(before),rec.removedNodes,rec))return;
+ if(MOedges&&rec.removedNodes.indexOf(MOedges.node)>=0){
+  rec.previousSibling=MOedges.prev;
+  rec.nextSibling=MOedges.next;}}
 W.__vitaMutation=function(kind,target,a,b){
  if(!MOlist.length||!target)return;
  var i,o,w,rec;
@@ -3772,6 +3810,9 @@ W.__vitaMutation=function(kind,target,a,b){
     rec.removedNodes=gone.filter(function(n){return came.indexOf(n)<0;});
     rec.addedNodes=came.filter(function(n){return gone.indexOf(n)<0;});
     if(!rec.addedNodes.length&&!rec.removedNodes.length)continue;}
+   /* the siblings the change sat between, which is how an observer
+      works out where in the list something happened */
+   siblingsOf(rec,target,a,b);
   }
   MOqueue(o,rec);}};
 
@@ -4099,8 +4140,20 @@ stampConsts(P);
  /* Element is a global, and this loop replaces it, so hold the original
     to compare against or every name after the first is skipped. */
  var WAS=W.Element;
- function iface(test,from){
-  var F=function(){return CEBase.apply(this,arguments);};
+ /* The ones a page can construct directly. Everything else falls back
+    to the custom element base, which refuses. */
+ var MAKE={
+  Text:function(d){return D.createTextNode(d===undefined?'':String(d));},
+  Comment:function(d){return D.createComment(d===undefined?'':String(d));},
+  CDATASection:function(d){return D.createTextNode(d===undefined?'':String(d));},
+  DocumentFragment:function(){return D.createDocumentFragment();},
+  Document:function(){
+   var d=W.__vitaParseDocument?W.__vitaParseDocument(''):null;
+   if(d){var de=d.documentElement;if(de)d.removeChild(de);return d;}
+   return D.createDocumentFragment();}};
+ function iface(test,from,make){
+  var F=make?function(a){return make(a);}
+            :function(){return CEBase.apply(this,arguments);};
   F.prototype=P;
   /* keep whatever the old constructor carried -- Node.ELEMENT_NODE and
      the rest of the node type constants live there, and code reads
@@ -4159,9 +4212,14 @@ stampConsts(P);
   HTMLTimeElement:'TIME',HTMLTitleElement:'TITLE',HTMLTrackElement:'TRACK',
   HTMLUListElement:'UL',HTMLVideoElement:'VIDEO'};
  stampConsts(CEBase);
+ /* Document keeps its own prototype, which polyfills patch, so it is
+    not replaced -- but it can still answer instanceof honestly. */
+ try{Object.defineProperty(W.Document,Symbol.hasInstance,
+  {configurable:true,value:ofType([9])});
+  stampConsts(W.Document);}catch(e){}
  var k;
  for(k in byType)if(W[k]===WAS||W[k]===CEBase)
-  W[k]=iface(ofType(byType[k]),W[k]);
+  W[k]=iface(ofType(byType[k]),W[k],MAKE[k]);
  for(k in byTag)if(W[k]===WAS||W[k]===CEBase)
   W[k]=iface(ofTag(byTag[k]),W[k]);
  /* An unknown element is one whose tag is not in the HTML vocabulary at

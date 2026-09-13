@@ -18,7 +18,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHROME="${CHROME:-/opt/pw-browsers/chromium-1194/chrome-linux/chrome}"
 NSMONKEY="${NSMONKEY:-$ROOT/deps/netsurf/nsmonkey}"
-WAIT="${WAIT:-4}"
+WAIT="${WAIT:-6}"
 
 if [ ! -d "$ROOT/tests/wpt" ] || [ -z "$(find "$ROOT/tests/wpt" -name '*.html' -print -quit 2>/dev/null)" ]; then
     echo "no tests in tests/wpt -- run the wpt-fetch workflow first" >&2
@@ -70,6 +70,16 @@ src = open(test, encoding='utf-8', errors='replace').read()
 # the tests write these attributes both quoted and bare
 src = re.sub(r'\b(src|href)=(["\']?)/resources/',
              lambda m: m.group(1) + '=' + m.group(2) + up + 'resources/', src)
+# One async test that never finishes -- typically one waiting on an
+# iframe's load event -- stops testharness reporting ANY result for the
+# file, and the whole file then reads as zero passes. The browser rides
+# it out on testharness's own ten second timeout; this run cannot wait
+# that long, so shorten the timeout instead of losing the file. It has
+# to be set before any test is declared, so it goes straight after the
+# harness include.
+src = re.sub(r'(<script[^>]*testharnessreport\.js[^>]*>\s*</script>)',
+             r'\1<script>setup({timeout_multiplier: 0.25});</script>',
+             src, count=1)
 open(out, 'w', encoding='utf-8').write(
     src + open(report, encoding='utf-8').read())
 FIX

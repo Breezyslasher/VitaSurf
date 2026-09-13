@@ -2017,14 +2017,17 @@ static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *text;
+	size_t len = 0;
 	dom_string *d;
 	struct dom_text *node = NULL;
 	JSValue r;
 
 	(void)this_val;
 	if (doc == NULL || argc < 1) return JS_NULL;
-	text = JS_ToCString(ctx, argv[0]);
-	d = to_dom_string(text != NULL ? text : "");
+	/* by length: a page may put a NUL inside the text, and strlen
+	 * would cut the node short there */
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	d = to_dom_string_len(text != NULL ? text : "", text != NULL ? len : 0);
 	if (d == NULL) {
 		if (text) JS_FreeCString(ctx, text);
 		return JS_NULL;
@@ -2049,14 +2052,15 @@ static JSValue doc_create_comment(JSContext *ctx, JSValueConst this_val,
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *text;
+	size_t len = 0;
 	dom_string *d;
 	struct dom_comment *node = NULL;
 	JSValue r;
 
 	(void)this_val;
 	if (doc == NULL) return JS_NULL;
-	text = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
-	d = to_dom_string(text != NULL ? text : "");
+	text = argc > 0 ? JS_ToCStringLen(ctx, &len, argv[0]) : NULL;
+	d = to_dom_string_len(text != NULL ? text : "", text != NULL ? len : 0);
 	if (d == NULL) {
 		if (text) JS_FreeCString(ctx, text);
 		return JS_NULL;
