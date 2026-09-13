@@ -1393,38 +1393,136 @@ Object.defineProperty(P,'commandForElement',{configurable:true,
  * is indexable, iterable and has replace and value, all of which code
  * uses, and relList, sandbox and part need the same thing.
  */
+/* DOMException. There was none at all, so every call that the
+ * specification says must throw returned quietly instead, and code that
+ * branches on the name of what it caught never saw one. The web platform
+ * tests for classList alone check this 405 times. */
+function DOMException(message,name){
+ var e=new Error(message===undefined?'':String(message));
+ e.name=name===undefined?'Error':String(name);
+ e.code=DOMException.CODES[e.name]||0;
+ Object.setPrototypeOf(e,DOMException.prototype);
+ return e;}
+DOMException.prototype=Object.create(Error.prototype);
+DOMException.prototype.constructor=DOMException;
+DOMException.prototype.name='Error';
+DOMException.prototype.message='';
+DOMException.CODES={IndexSizeError:1,HierarchyRequestError:3,WrongDocumentError:4,
+ InvalidCharacterError:5,NoModificationAllowedError:7,NotFoundError:8,
+ NotSupportedError:9,InUseAttributeError:10,InvalidStateError:11,SyntaxError:12,
+ InvalidModificationError:13,NamespaceError:14,InvalidAccessError:15,
+ TypeMismatchError:17,SecurityError:18,NetworkError:19,AbortError:20,
+ URLMismatchError:21,QuotaExceededError:22,TimeoutError:23,
+ InvalidNodeTypeError:24,DataCloneError:25};
+(function(){
+ var names={INDEX_SIZE_ERR:1,DOMSTRING_SIZE_ERR:2,HIERARCHY_REQUEST_ERR:3,
+  WRONG_DOCUMENT_ERR:4,INVALID_CHARACTER_ERR:5,NO_DATA_ALLOWED_ERR:6,
+  NO_MODIFICATION_ALLOWED_ERR:7,NOT_FOUND_ERR:8,NOT_SUPPORTED_ERR:9,
+  INUSE_ATTRIBUTE_ERR:10,INVALID_STATE_ERR:11,SYNTAX_ERR:12,
+  INVALID_MODIFICATION_ERR:13,NAMESPACE_ERR:14,INVALID_ACCESS_ERR:15,
+  VALIDATION_ERR:16,TYPE_MISMATCH_ERR:17,SECURITY_ERR:18,NETWORK_ERR:19,
+  ABORT_ERR:20,URL_MISMATCH_ERR:21,QUOTA_EXCEEDED_ERR:22,TIMEOUT_ERR:23,
+  INVALID_NODE_TYPE_ERR:24,DATA_CLONE_ERR:25};
+ Object.keys(names).forEach(function(k){
+  DOMException[k]=names[k];DOMException.prototype[k]=names[k];});})();
+W.DOMException=DOMException;
+
+/* --- DOMTokenList -------------------------------------------------------
+ * An ordered set of tokens over an attribute. It used to split on
+ * whitespace and write back whatever it was given: an empty token or one
+ * containing a space went in as-is where the specification says to throw,
+ * duplicates survived, and the attribute was rewritten even when nothing
+ * had changed.
+ */
+var WS_RE=/[ \t\r\n\f]/;
+function tokenCheck(t){
+ t=String(t);
+ if(t==='')throw new DOMException('The token provided must not be empty.','SyntaxError');
+ if(WS_RE.test(t))throw new DOMException(
+  'The token provided contains HTML space characters, which are not valid in tokens.',
+  'InvalidCharacterError');
+ return t;}
 function TokenList(el,attr){this._e=el;this._a=attr;
  var t=this._t();for(var i=0;i<t.length;i++)this[i]=t[i];
  Object.defineProperty(this,'length',{configurable:true,value:t.length,writable:true});}
-TokenList.prototype._t=function(){if(!this._e)return [];
+/* The attribute as an ordered set: split on whitespace, first occurrence
+   of each token wins. */
+TokenList.prototype._t=function(){
+ if(!this._e)return this._own||(this._own=[]);
  var v=this._e.getAttribute(this._a);
- return v?String(v).split(/\s+/).filter(function(s){return s;}):[];};
-TokenList.prototype._w=function(t){if(this._e)this._e.setAttribute(this._a,t.join(' '));
- for(var i=0;i<Math.max(t.length,this.length);i++){if(i<t.length)this[i]=t[i];else delete this[i];}
+ var out=[],seen={},parts=v?String(v).split(/[ \t\r\n\f]+/):[],i;
+ for(i=0;i<parts.length;i++){
+  if(parts[i]===''||Object.prototype.hasOwnProperty.call(seen,parts[i]))continue;
+  seen[parts[i]]=1;out.push(parts[i]);}
+ return out;};
+/* Only write when something changed: a write is a mutation, and code
+   watching the attribute is entitled to see one exactly when there was. */
+TokenList.prototype._w=function(t,force){
+ var next=t.join(' ');
+ if(this._e){
+  var had=this._e.getAttribute(this._a);
+  /* An element with no such attribute and nothing to put in one does not
+     get an empty attribute out of it. */
+  if(had===null&&next==='')return;
+  if(force||next!==(had||''))this._e.setAttribute(this._a,next);}
+ else this._own=t;
+ for(var i=0;i<Math.max(t.length,this.length||0);i++){
+  if(i<t.length)this[i]=t[i];else delete this[i];}
  this.length=t.length;};
-TokenList.prototype.item=function(i){return this._t()[i]===undefined?null:this._t()[i];};
+TokenList.prototype.item=function(i){
+ var t=this._t();i=Number(i)||0;return t[i]===undefined?null:t[i];};
 TokenList.prototype.contains=function(c){return this._t().indexOf(String(c))>=0;};
-TokenList.prototype.add=function(){var t=this._t();
- for(var i=0;i<arguments.length;i++){var c=String(arguments[i]);if(t.indexOf(c)<0)t.push(c);}
+TokenList.prototype.add=function(){
+ var i,t;
+ for(i=0;i<arguments.length;i++)tokenCheck(arguments[i]);
+ t=this._t();
+ for(i=0;i<arguments.length;i++){
+  var c=String(arguments[i]);
+  if(t.indexOf(c)<0)t.push(c);}
  this._w(t);};
-TokenList.prototype.remove=function(){var t=this._t(),drop=[].slice.call(arguments).map(String);
- this._w(t.filter(function(c){return drop.indexOf(c)<0;}));};
-TokenList.prototype.toggle=function(c,f){var has=this.contains(c);if(f===undefined)f=!has;
- if(f&&!has)this.add(c);else if(!f&&has)this.remove(c);return !!f;};
-TokenList.prototype.replace=function(a,b){var t=this._t(),i=t.indexOf(String(a));
- if(i<0)return false;t[i]=String(b);this._w(t);return true;};
-TokenList.prototype.supports=function(){return true;};
+TokenList.prototype.remove=function(){
+ var drop=[],i;
+ for(i=0;i<arguments.length;i++)drop.push(tokenCheck(arguments[i]));
+ this._w(this._t().filter(function(c){return drop.indexOf(c)<0;}),true);};
+TokenList.prototype.toggle=function(c,force){
+ c=tokenCheck(c);
+ var has=this.contains(c);
+ if(has){
+  if(force===undefined||force===false){this.remove(c);return false;}
+  return true;}
+ if(force===undefined||force===true){this.add(c);return true;}
+ return false;};
+TokenList.prototype.replace=function(a,b){
+ a=tokenCheck(a);b=tokenCheck(b);
+ var t=this._t(),i=t.indexOf(a);
+ if(i<0)return false;
+ var j=t.indexOf(b);
+ if(j>=0&&j!==i){t.splice(i,1,b);t=t.filter(function(x,k){return x!==b||k===t.indexOf(b);});}
+ else t[i]=b;
+ this._w(t);
+ return true;};
+/* Nothing here has a token list with a defined set of valid tokens, and
+   the specification says to throw for one that has none. */
+TokenList.prototype.supports=function(){
+ throw new DOMException('supports() is not supported for this attribute.','TypeError');};
 TokenList.prototype.forEach=function(f,th){this._t().forEach(function(v,i){f.call(th,v,i,this);},this);};
 TokenList.prototype.keys=function(){return this._t().map(function(_,i){return i;})[Symbol.iterator]();};
 TokenList.prototype.values=function(){return this._t()[Symbol.iterator]();};
 TokenList.prototype.entries=function(){return this._t().map(function(v,i){return [i,v];})[Symbol.iterator]();};
 TokenList.prototype[Symbol.iterator]=TokenList.prototype.values;
-TokenList.prototype.toString=function(){return this._t().join(' ');};
+TokenList.prototype.toString=function(){return this.value;};
 Object.defineProperty(TokenList.prototype,'value',{configurable:true,
- get:function(){return this._e?(this._e.getAttribute(this._a)||''):'';},
- set:function(v){if(this._e)this._e.setAttribute(this._a,String(v));}});
+ get:function(){return this._e?(this._e.getAttribute(this._a)||''):this._t().join(' ');},
+ set:function(v){if(this._e)this._e.setAttribute(this._a,String(v));
+  else this._own=String(v).split(/[ \t\r\n\f]+/).filter(function(x){return x;});}});
 W.DOMTokenList=TokenList;
-Object.defineProperty(P,'classList',{configurable:true,get:function(){return new TokenList(this,'class');}});
+/* A fresh list per read. A browser hands back the same object every time
+   and code occasionally compares them, but caching it here means the
+   indices go stale when the attribute is changed from elsewhere, and
+   wrong contents are worse than a wrong identity. */
+Object.defineProperty(P,'classList',{configurable:true,
+ get:function(){return new TokenList(this,'class');},
+ set:function(v){this.setAttribute('class',String(v));}});
 /* label.htmlFor stays a string: the specification only makes output's a
  * list, and every page that reads it means the label's. */
 [['relList','rel'],['sandbox','sandbox'],['part','part'],['blocking','blocking']]
