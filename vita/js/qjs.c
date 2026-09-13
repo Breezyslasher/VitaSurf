@@ -3043,6 +3043,14 @@ static JSValue node_ctor(JSContext *ctx, JSValueConst new_target,
  */
 #include "prelude_js.h"
 
+/*
+ * The prelude compiled once, kept for the life of the process. Freed
+ * nowhere on purpose: it is wanted until the browser exits, and the
+ * runtime that produced it may be gone long before that.
+ */
+static uint8_t *prelude_bc;
+static size_t prelude_bc_len;
+
 static void setup_globals(jsthread *thread)
 {
 	JSContext *ctx = thread->ctx;
@@ -3146,24 +3154,54 @@ static void setup_globals(jsthread *thread)
 		const char *src = (const char *)prelude_js;
 		size_t len = sizeof(prelude_js) - 1;
 		uint64_t t0 = 0, t1 = 0;
-		JSValue r;
+		JSValue fn, r;
+		bool cached = prelude_bc != NULL;
 
 		/*
 		 * The prelude runs once per page, so its own cost is part
-		 * of every load. It is worth a line when it grows: the
-		 * shims it carries are the whole DOM surface, and the
-		 * alternative to knowing what they cost is guessing.
+		 * of every load, and on the device parsing it was 374 ms of
+		 * every one. Parse it once for the life of the process and
+		 * keep the bytecode: QuickJS bytecode is portable between
+		 * runtimes, which is how qjsc precompiles a script, so each
+		 * later page reads the same buffer back instead of parsing
+		 * 172 KB of source again.
 		 */
 		nsu_getmonotonic_ms(&t0);
-		r = JS_Eval(ctx, src, len, "<prelude>", JS_EVAL_TYPE_GLOBAL);
-		nsu_getmonotonic_ms(&t1);
-		if (JS_IsException(r)) {
-			qjs_report_exception_src(ctx, "<prelude>", src, len);
+		if (prelude_bc == NULL) {
+			fn = JS_Eval(ctx, src, len, "<prelude>",
+				     JS_EVAL_TYPE_GLOBAL |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+			if (!JS_IsException(fn)) {
+				uint8_t *out;
+				size_t out_len = 0;
+
+				out = JS_WriteObject(ctx, &out_len, fn,
+						     JS_WRITE_OBJ_BYTECODE);
+				if (out != NULL) {
+					prelude_bc = out;
+					prelude_bc_len = out_len;
+				}
+			}
+		} else {
+			fn = JS_ReadObject(ctx, prelude_bc, prelude_bc_len,
+					   JS_READ_OBJ_BYTECODE);
 		}
-		JS_FreeValue(ctx, r);
-		vita_log("qjs: prelude %u KB ran in %u ms",
+		if (JS_IsException(fn)) {
+			qjs_report_exception_src(ctx, "<prelude>", src, len);
+			JS_FreeValue(ctx, fn);
+		} else {
+			r = JS_EvalFunction(ctx, fn);
+			if (JS_IsException(r)) {
+				qjs_report_exception_src(ctx, "<prelude>",
+							 src, len);
+			}
+			JS_FreeValue(ctx, r);
+		}
+		nsu_getmonotonic_ms(&t1);
+		vita_log("qjs: prelude %u KB ran in %u ms (%s)",
 			 (unsigned int)(len / 1024),
-			 (unsigned int)(t1 - t0));
+			 (unsigned int)(t1 - t0),
+			 cached ? "bytecode" : "source");
 	}
 }
 
