@@ -26,6 +26,39 @@ function shadowProp(o,k,v){
  Object.defineProperty(o,k,{configurable:true,writable:true,enumerable:true,value:v});
  return v;}
 function isOwnState(v){return typeof v==='function'||(v!==null&&typeof v==='object');}
+/*
+ * The other half of the same problem. A reflected property belongs to
+ * the elements the specification gives it to, and a custom element is
+ * not one of them: <x-thing>.label is the component's own property, and
+ * a browser makes it an ordinary one. Here every property sits on the
+ * one shared prototype, so label on a custom element was writing an
+ * attribute and reading a string back -- and a framework that rescues
+ * the properties set before its definition loaded found nothing to
+ * rescue, because hasOwnProperty said the value was never there.
+ *
+ * So the reflected properties apply on the HTML elements that have them
+ * and behave as ordinary properties everywhere else. The global
+ * attributes -- the ones HTMLElement itself defines -- keep applying
+ * everywhere, custom elements included, because that is where the
+ * specification puts them too.
+ */
+var HTML_TAGS=(' A ABBR ACRONYM ADDRESS APPLET AREA ARTICLE ASIDE AUDIO B BASE '+
+ 'BASEFONT BDI BDO BIG BLOCKQUOTE BODY BR BUTTON CANVAS CAPTION CENTER CITE '+
+ 'CODE COL COLGROUP DATA DATALIST DD DEL DETAILS DFN DIALOG DIR DIV DL DT EM '+
+ 'EMBED FIELDSET FIGCAPTION FIGURE FONT FOOTER FORM FRAME FRAMESET H1 H2 H3 H4 '+
+ 'H5 H6 HEAD HEADER HGROUP HR HTML I IFRAME IMG INPUT INS ISINDEX KBD KEYGEN '+
+ 'LABEL LEGEND LI LINK MAIN MAP MARK MARQUEE MENU META METER NAV NOBR NOFRAMES '+
+ 'NOSCRIPT OBJECT OL OPTGROUP OPTION OUTPUT P PARAM PICTURE PLAINTEXT PRE '+
+ 'PROGRESS Q RP RT RUBY S SAMP SCRIPT SEARCH SECTION SELECT SLOT SMALL SOURCE '+
+ 'SPAN STRIKE STRONG STYLE SUB SUMMARY SUP TABLE TBODY TD TEMPLATE TEXTAREA '+
+ 'TFOOT TH THEAD TIME TITLE TR TRACK TT U UL VAR VIDEO WBR XMP ');
+var GLOBAL_ATTRS=(' accessKey autocapitalize autocorrect autofocus contentEditable '+
+ 'dir draggable enterKeyHint hidden inert inputMode lang nonce popover slot '+
+ 'spellcheck tabIndex title translate writingSuggestions itemScope ');
+function reflectsOn(el,prop){
+ if(GLOBAL_ATTRS.indexOf(' '+prop+' ')>=0)return true;
+ var t=el.tagName;
+ return t!==undefined&&HTML_TAGS.indexOf(' '+t+' ')>=0;}
 Object.defineProperty(P,'style',{configurable:true,get:function(){return priv(this,'__style',function(){return {getPropertyValue:function(){return '';},setProperty:function(){},removeProperty:function(){},cssText:''};});}});
 Object.defineProperty(P,'dataset',{configurable:true,get:function(){return priv(this,'__dataset',function(){return {};});}});
 Object.defineProperty(P,'classList',{configurable:true,get:function(){var el=this;return {contains:function(c){return (' '+el.className+' ').indexOf(' '+c+' ')>=0;},add:function(){for(var i=0;i<arguments.length;i++){if(!this.contains(arguments[i]))el.className=(el.className?el.className+' ':'')+arguments[i];}},remove:function(){for(var i=0;i<arguments.length;i++){el.className=(' '+el.className+' ').split(' '+arguments[i]+' ').join(' ').trim();}},toggle:function(c,f){var h=this.contains(c);if(f===undefined)f=!h;if(f&&!h)this.add(c);else if(!f&&h)this.remove(c);return f;},get length(){return el.className?el.className.split(/\s+/).length:0;}};}});
@@ -36,7 +69,7 @@ Object.defineProperty(P,'parentElement',{configurable:true,get:function(){var p=
 Object.defineProperty(P,'innerText',{configurable:true,get:function(){return this.textContent;},set:function(v){this.textContent=v;}});
 Object.defineProperty(P,'outerHTML',{configurable:true,get:function(){return '';}});
 Object.defineProperty(P,'ownerDocument',{configurable:true,get:function(){return document;}});
-['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){if(isOwnState(v))return shadowProp(this,a,v);this.setAttribute(attr,String(v));}});});
+['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){if(!reflectsOn(this,a))return undefined;var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(attr,String(v));}});});
 /* The URL-valued attributes reflect as resolved absolute URLs, not as
  * written. getAttribute still gives what the document said. Code tests
  * these against a scheme -- webpack decides its public path by matching
@@ -44,11 +77,12 @@ Object.defineProperty(P,'ownerDocument',{configurable:true,get:function(){return
  * test where the browser it was written for would have passed. */
 ['href','src','action','formaction','poster','cite','data','background','longdesc'].forEach(function(a){
  Object.defineProperty(P,a,{configurable:true,get:function(){
+  if(!reflectsOn(this,a))return undefined;
   var v=this.getAttribute(a);
   if(v===null||v==='')return '';
   try{return new URL(v,D.baseURI).href;}catch(e){return v;}
- },set:function(v){if(isOwnState(v))return shadowProp(this,a,v);this.setAttribute(a,String(v));}});});
-['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{configurable:true,get:function(){return this.hasAttribute(attr);},set:function(v){if(isOwnState(v))return shadowProp(this,a,v);if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
+ },set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(a,String(v));}});});
+['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{configurable:true,get:function(){if(!reflectsOn(this,a))return undefined;return this.hasAttribute(attr);},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
 /* Layout geometry. __vitaBox(node) (qjs.c) returns the element's laid-out
    box as [x,y,width,height,clientWidth,clientHeight,clientLeft,clientTop,
    scrollWidth,scrollHeight,scrollLeft,scrollTop] in CSS px, document
@@ -1022,23 +1056,27 @@ function defProp(n,d){if(!Object.prototype.hasOwnProperty.call(P,n))Object.defin
 function attrName(p){return p.replace(/[A-Z]/g,function(c){return c.toLowerCase();});}
 function each(list,f){list.forEach(function(e){var p=typeof e==='string'?e:e[0];f(p,(typeof e==='string'?attrName(p):e[1]),e);});}
 function reflectString(list){each(list,function(p,a){defProp(p,{configurable:true,
- get:function(){var v=this.getAttribute(a);return v===null?'':v;},
- set:function(v){if(isOwnState(v))return shadowProp(this,p,v);
+ get:function(){if(!reflectsOn(this,p))return undefined;
+  var v=this.getAttribute(a);return v===null?'':v;},
+ set:function(v){if(isOwnState(v)||!reflectsOn(this,p))return shadowProp(this,p,v);
   this.setAttribute(a,String(v));}});});}
 function reflectBool(list){each(list,function(p,a){defProp(p,{configurable:true,
- get:function(){return this.hasAttribute(a);},
- set:function(v){if(isOwnState(v))return shadowProp(this,p,v);
+ get:function(){if(!reflectsOn(this,p))return undefined;
+  return this.hasAttribute(a);},
+ set:function(v){if(isOwnState(v)||!reflectsOn(this,p))return shadowProp(this,p,v);
   if(v)this.setAttribute(a,'');else this.removeAttribute(a);}});});}
 /* [property, attribute, default] */
 function reflectLong(list){list.forEach(function(e){var p=e[0],a=e[1],d=e[2];defProp(p,{configurable:true,
- get:function(){var v=this.getAttribute(a);if(v===null||v==='')return d;v=parseInt(v,10);return isNaN(v)?d:v;},
- set:function(v){if(isOwnState(v))return shadowProp(this,p,v);
+ get:function(){if(!reflectsOn(this,p))return undefined;
+  var v=this.getAttribute(a);if(v===null||v==='')return d;v=parseInt(v,10);return isNaN(v)?d:v;},
+ set:function(v){if(isOwnState(v)||!reflectsOn(this,p))return shadowProp(this,p,v);
   this.setAttribute(a,String(parseInt(v,10)||0));}});});}
 /* [property, attribute, keywords, default]. An absent or unrecognised
  * value reports the default, which is what the keyword tables say. */
 function reflectEnum(list){list.forEach(function(e){var p=e[0],a=e[1],k=e[2],d=e[3];defProp(p,{configurable:true,
- get:function(){var v=this.getAttribute(a);if(v===null)return d;v=String(v).toLowerCase();return k.indexOf(v)>=0?v:d;},
- set:function(v){if(isOwnState(v))return shadowProp(this,p,v);
+ get:function(){if(!reflectsOn(this,p))return undefined;
+  var v=this.getAttribute(a);if(v===null)return d;v=String(v).toLowerCase();return k.indexOf(v)>=0?v:d;},
+ set:function(v){if(isOwnState(v)||!reflectsOn(this,p))return shadowProp(this,p,v);
   this.setAttribute(a,String(v));}});});}
 
 reflectString(['accessKey','autocapitalize','autocorrect','nonce','popover','slot',

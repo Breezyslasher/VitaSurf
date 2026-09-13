@@ -1,0 +1,67 @@
+<!DOCTYPE html><html><head><title>component2</title></head><body>
+<pre id="out"></pre>
+<div id="host"></div>
+<x-early id="early" tag="a">light</x-early>
+<script src="_probe.js"></script>
+<script>
+var log=[];
+/* A property set on an element before its definition exists. A framework
+   rescues it in the constructor: delete the own property, then assign it
+   through the accessor the class defines. */
+var early=document.getElementById('early');
+early.label='set before upgrade';
+
+class XEarly extends HTMLElement {
+  static get observedAttributes(){ return ['tag']; }
+  constructor(){
+    super();
+    log.push('ctor');
+    this._props={};
+    var self=this;
+    ['label'].forEach(function(k){
+      if (Object.prototype.hasOwnProperty.call(self,k)) {
+        var v=self[k];
+        delete self[k];
+        self[k]=v;
+      }
+    });
+  }
+  get label(){ return this._props ? this._props.label : undefined; }
+  set label(v){ if(!this._props) this._props={}; this._props.label=v; }
+  attributeChangedCallback(n,o,v){ log.push('attr:'+n+'='+v); }
+  connectedCallback(){
+    log.push('connected');
+    var root=this.attachShadow({mode:'open'});
+    var t=document.createElement('template');
+    t.innerHTML='<b id="b"><slot></slot></b>';
+    root.appendChild(t.content.cloneNode(true));
+    this.$={};
+    var all=root.querySelectorAll('[id]');
+    for(var i=0;i<all.length;i++) this.$[all[i].id]=all[i];
+  }
+}
+customElements.define('x-early', XEarly);
+
+T('upgraded instance', early instanceof XEarly);
+T('rescued property', early.label);
+T('own property gone', Object.prototype.hasOwnProperty.call(early,'label'));
+T('accessor on prototype', typeof Object.getOwnPropertyDescriptor(XEarly.prototype,'label').get);
+T('callback log', log.join('>'));
+T('$ b found', early.$ && early.$.b ? early.$.b.tagName : 'undefined');
+T('shadowRoot set', !!early.shadowRoot);
+T('slot in root', early.shadowRoot ? !!early.shadowRoot.querySelector('slot') : false);
+T('light text kept', early.textContent.indexOf('light')>=0);
+
+/* super() and prototype chain */
+class XSub extends XEarly { constructor(){ super(); log.push('sub'); } }
+customElements.define('x-sub', XSub);
+var s=document.createElement('x-sub');
+T('subclass instance', s instanceof XSub && s instanceof XEarly && s instanceof HTMLElement);
+T('subclass tagName', s.tagName);
+s.label='v';
+T('subclass accessor', s.label);
+document.getElementById('host').appendChild(s);
+T('subclass $ after connect', s.$ && s.$.b ? 'found' : 'missing');
+T('upgrade method', typeof customElements.upgrade);
+T('constructor name reachable', XEarly.prototype.constructor === XEarly);
+</script></body></html>
