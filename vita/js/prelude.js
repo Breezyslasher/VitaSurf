@@ -174,7 +174,21 @@ P.remove=function(){var p=this.parentNode;if(p)p.removeChild(this);};
 P.before=function(){var p=this.parentNode;if(!p)return;var n=toNodes(arguments);for(var i=0;i<n.length;i++)p.insertBefore(n[i],this);};
 P.after=function(){var p=this.parentNode;if(!p)return;var n=toNodes(arguments),ref=this.nextSibling;for(var i=0;i<n.length;i++){if(ref)p.insertBefore(n[i],ref);else p.appendChild(n[i]);}};
 P.replaceWith=function(){P.before.apply(this,arguments);this.remove();};
-P.normalize=function(){};
+/* Merge adjacent text nodes and drop empty ones. Code that walks text
+ * nodes after building a subtree expects one node per run of text, and a
+ * no-op here left it with as many nodes as there were appends. */
+P.normalize=function(){
+ var c=this.childNodes.slice(),i,n,prev=null;
+ for(i=0;i<c.length;i++){
+  n=c[i];
+  if(n.nodeType===3){
+   if(String(n.textContent)===''){n.remove();continue;}
+   if(prev){prev.textContent=String(prev.textContent)+String(n.textContent);
+    n.remove();continue;}
+   prev=n;continue;}
+  prev=null;
+  if(n.nodeType===1)n.normalize();
+ }};
 P.hasAttributes=function(){return this.attributes.length>0;};
 /* attributes, and every node list here, is a plain array from qjs.c, so
  * the NamedNodeMap and NodeList calls go on the array prototype. They
@@ -464,7 +478,11 @@ location.reload=function(){location.href=location.href;};
 ['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:(m[1]||'')+'//'+(m[2]||'')}[k];}});});
 location.toString=function(){return location.href;};
 function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();}
-Event.prototype.preventDefault=function(){this.defaultPrevented=true;};Event.prototype.stopPropagation=Event.prototype.stopImmediatePropagation=function(){};Event.prototype.initEvent=function(t,b,c){this.type=t;this.bubbles=!!b;this.cancelable=!!c;};
+Event.prototype.preventDefault=function(){this.defaultPrevented=true;};/* The C side reads cancelBubble back after a listener returns and stops
+ * libdom's propagation with it, so this is what makes stopPropagation
+ * stop anything. */
+Event.prototype.stopPropagation=function(){this.cancelBubble=true;};
+Event.prototype.stopImmediatePropagation=function(){this.cancelBubble=true;this.__stopNow=true;};Event.prototype.initEvent=function(t,b,c){this.type=t;this.bubbles=!!b;this.cancelable=!!c;};
 function CustomEvent(type,init){Event.call(this,type,init);this.detail=init?init.detail:null;}CustomEvent.prototype=Object.create(Event.prototype);
 CustomEvent.prototype.initCustomEvent=function(t,b,c,d){this.initEvent(t,b,c);this.detail=d;};
 W.Event=Event;W.CustomEvent=CustomEvent;
@@ -597,8 +615,13 @@ Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function
 Object.defineProperty(Event.prototype,'srcElement',{configurable:true,get:function(){return this.target;}});
 Object.defineProperty(Event.prototype,'returnValue',{configurable:true,
  get:function(){return !this.defaultPrevented;},set:function(v){if(!v)this.preventDefault();}});
+/* A real flag, not a constant false: the C side reads it back after each
+ * listener and stops libdom's propagation with it, so a stub here is
+ * what made stopPropagation do nothing. Setting it false does not
+ * restart propagation, which is what the specification says. */
 Object.defineProperty(Event.prototype,'cancelBubble',{configurable:true,
- get:function(){return false;},set:function(){}});
+ get:function(){return !!this.__cancelBubble;},
+ set:function(v){if(v)this.__cancelBubble=true;}});
 Event.prototype.composedPath=function(){
  var out=[],n=this.target;while(n){out.push(n);n=n.parentNode;}out.push(D);out.push(W);return out;};
 
@@ -654,7 +677,11 @@ Object.defineProperties(URL.prototype,{
   set:function(v){v=String(v);var i=v.indexOf(':');
    if(i<0){this.hostname=v.toLowerCase();this.port='';}
    else{this.hostname=v.slice(0,i).toLowerCase();this.port=v.slice(i+1);}}},
- origin:{configurable:true,get:function(){return this.hostname?this.protocol+'//'+this.host:'null';}},
+ /* A file URL has no host, and its origin serialises as the scheme
+  * alone rather than as null. */
+ origin:{configurable:true,get:function(){
+  if(this.hostname)return this.protocol+'//'+this.host;
+  return this.protocol==='file:'?'file://':'null';}},
  href:{configurable:true,
   get:function(){var auth=this.username?this.username+(this.password?':'+this.password:'')+'@':'';
    return this.protocol+(this.hostname||this.protocol==='file:'?'//':'')+auth+this.host+this.pathname+this.search+this.hash;},
@@ -2543,4 +2570,48 @@ Blob.prototype.textStream=function(){return null;};
   Object.defineProperty(P,k,{configurable:true,enumerable:d.enumerable,get:d.get,
    set:function(v){shadowProp(this,k,v);}});});
 })();
+
+/* --- what the browser comparison found ---------------------------------
+ * tests/dom, run against Chromium by scripts/dom-compare.sh.
+ */
+/* dataset was an empty object that never saw an attribute, so every
+ * el.dataset.foo read undefined and every write went nowhere. It is a
+ * live view of the data-* attributes. */
+function dataAttr(k){return 'data-'+String(k).replace(/[A-Z]/g,function(c){return '-'+c.toLowerCase();});}
+function dataName(n){return n.slice(5).replace(/-([a-z])/g,function(_,c){return c.toUpperCase();});}
+function dataKeys(el){return el.attributes.filter(function(a){
+ return a.name.indexOf('data-')===0;}).map(function(a){return dataName(a.name);});}
+Object.defineProperty(P,'dataset',{configurable:true,get:function(){
+ var el=this;
+ return priv(this,'__dataset',function(){
+  if(typeof Proxy!=='function'){
+   var o={};dataKeys(el).forEach(function(k){o[k]=el.getAttribute(dataAttr(k));});
+   return o;}
+  return new Proxy({},{
+   get:function(t,k){if(typeof k!=='string')return undefined;
+    var v=el.getAttribute(dataAttr(k));return v===null?undefined:v;},
+   set:function(t,k,v){el.setAttribute(dataAttr(k),String(v));return true;},
+   has:function(t,k){return typeof k==='string'&&el.hasAttribute(dataAttr(k));},
+   deleteProperty:function(t,k){el.removeAttribute(dataAttr(k));return true;},
+   ownKeys:function(){return dataKeys(el);},
+   getOwnPropertyDescriptor:function(t,k){
+    if(typeof k!=='string'||!el.hasAttribute(dataAttr(k)))return undefined;
+    return {configurable:true,enumerable:true,writable:true,
+     value:el.getAttribute(dataAttr(k))};}});});}});
+/* tabIndex answered 0 for everything, so every element looked focusable
+ * to code that tests it. Without the attribute it is 0 only for what the
+ * specification makes focusable by default, and -1 otherwise. */
+var TAB_DEFAULT_0=' BUTTON INPUT SELECT TEXTAREA IFRAME SUMMARY ';
+Object.defineProperty(P,'tabIndex',{configurable:true,
+ get:function(){
+  var v=this.getAttribute('tabindex');
+  if(v!==null&&v!==''){v=parseInt(v,10);if(!isNaN(v))return v;}
+  var t=this.tagName;
+  if(TAB_DEFAULT_0.indexOf(' '+t+' ')>=0)return 0;
+  if((t==='A'||t==='AREA')&&this.hasAttribute('href'))return 0;
+  if(this.isContentEditable)return 0;
+  return -1;},
+ set:function(v){
+  if(isOwnState(v))return shadowProp(this,'tabIndex',v);
+  this.setAttribute('tabindex',String(parseInt(v,10)||0));}});
 })();

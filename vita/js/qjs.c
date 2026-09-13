@@ -139,6 +139,10 @@ struct js_listener {
 	struct dom_node *node;
 	struct dom_event_listener *dom_listener;
 	JSValue func;
+	dom_string *type;	/**< kept, to match a remove against */
+	bool capture;
+	bool once;
+	bool dead;		/**< removed while its own call was running */
 };
 
 /* A scheduled setTimeout/setInterval callback. */
@@ -1072,24 +1076,124 @@ static struct dom_document *thread_document(jsthread *thread)
 	return thread->htmlc->document;
 }
 
+/*
+ * The third argument of addEventListener and removeEventListener: a
+ * boolean is the capture flag, an object carries capture and once.
+ */
+static void listener_options(JSContext *ctx, JSValueConst opts,
+			     bool *capture, bool *once)
+{
+	*capture = false;
+	if (once != NULL) {
+		*once = false;
+	}
+	if (JS_IsUndefined(opts) || JS_IsNull(opts)) {
+		return;
+	}
+	if (JS_IsObject(opts)) {
+		JSValue v = JS_GetPropertyStr(ctx, opts, "capture");
+		*capture = JS_ToBool(ctx, v) == 1;
+		JS_FreeValue(ctx, v);
+		if (once != NULL) {
+			v = JS_GetPropertyStr(ctx, opts, "once");
+			*once = JS_ToBool(ctx, v) == 1;
+			JS_FreeValue(ctx, v);
+		}
+		return;
+	}
+	*capture = JS_ToBool(ctx, opts) == 1;
+}
+
+/** Whether l is the listener (type, func, capture) on node. */
+static bool listener_matches(JSContext *ctx, struct js_listener *l,
+			     struct dom_node *node, dom_string *type,
+			     JSValueConst func, bool capture)
+{
+	return l->dead == false &&
+		l->node == node &&
+		l->capture == capture &&
+		l->type != NULL &&
+		dom_string_isequal(l->type, type) &&
+		JS_IsStrictEqual(ctx, l->func, func);
+}
+
+/** Take l out of the thread's list, off the node, and free it. */
+static void drop_listener(jsthread *thread, struct js_listener *l)
+{
+	struct js_listener **pp;
+
+	if (l->node != NULL && l->type != NULL && l->dom_listener != NULL) {
+		dom_event_target_remove_event_listener(l->node, l->type,
+						       l->dom_listener,
+						       l->capture);
+	}
+	for (pp = &thread->listeners; *pp != NULL; pp = &(*pp)->next) {
+		if (*pp == l) {
+			*pp = l->next;
+			break;
+		}
+	}
+	if (l->dom_listener != NULL) dom_event_listener_unref(l->dom_listener);
+	if (l->type != NULL) dom_string_unref(l->type);
+	if (l->node != NULL) dom_node_unref(l->node);
+	JS_FreeValue(thread->ctx, l->func);
+	free(l);
+}
+
+/*
+ * Free the listeners marked inert during a dispatch. Only safe with no
+ * dispatch running, which is why they were only marked.
+ */
+static void sweep_dead_listeners(jsthread *thread)
+{
+	struct js_listener *l, *next;
+
+	if (thread->event_depth > 0 || thread->closed) {
+		return;
+	}
+	for (l = thread->listeners; l != NULL; l = next) {
+		next = l->next;
+		if (l->dead) {
+			drop_listener(thread, l);
+		}
+	}
+}
+
 /** Register func as a listener for event type on node. */
 static JSValue add_listener(JSContext *ctx, struct dom_node *node,
-			    JSValueConst type_v, JSValueConst func)
+			    JSValueConst type_v, JSValueConst func,
+			    JSValueConst opts)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *type;
 	dom_string *type_dom;
 	struct js_listener *l;
 	struct dom_event_listener *dl = NULL;
+	bool capture = false, once = false;
 
 	if (node == NULL || thread == NULL || !JS_IsFunction(ctx, func)) {
 		return JS_UNDEFINED;
 	}
+	sweep_dead_listeners(thread);
+	listener_options(ctx, opts, &capture, &once);
 	type = JS_ToCString(ctx, type_v);
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
 		if (type) JS_FreeCString(ctx, type);
 		return JS_UNDEFINED;
+	}
+
+	/*
+	 * The same function added twice for the same type and phase is one
+	 * listener, not two. Pages re-register on every render, and without
+	 * this each one ran as many times as it had been added.
+	 */
+	for (l = thread->listeners; l != NULL; l = l->next) {
+		if (listener_matches(ctx, l, node, type_dom, func, capture)) {
+			dom_string_unref(type_dom);
+			JS_FreeCString(ctx, type);
+			return JS_UNDEFINED;
+		}
 	}
 
 	l = calloc(1, sizeof(*l));
@@ -1109,10 +1213,55 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	dom_node_ref(node);
 	l->dom_listener = dl;
 	l->func = JS_DupValue(ctx, func);
+	l->type = dom_string_ref(type_dom);
+	l->capture = capture;
+	l->once = once;
 	l->next = thread->listeners;
 	thread->listeners = l;
 
-	dom_event_target_add_event_listener(node, type_dom, dl, false);
+	dom_event_target_add_event_listener(node, type_dom, dl, capture);
+	dom_string_unref(type_dom);
+	JS_FreeCString(ctx, type);
+	return JS_UNDEFINED;
+}
+
+/** removeEventListener: take off the one that matches, if it is there. */
+static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
+			       JSValueConst type_v, JSValueConst func,
+			       JSValueConst opts)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *type;
+	dom_string *type_dom;
+	struct js_listener *l;
+	bool capture = false;
+
+	if (node == NULL || thread == NULL || !JS_IsFunction(ctx, func)) {
+		return JS_UNDEFINED;
+	}
+	sweep_dead_listeners(thread);
+	listener_options(ctx, opts, &capture, NULL);
+	type = JS_ToCString(ctx, type_v);
+	type_dom = to_dom_string(type);
+	if (type_dom == NULL) {
+		if (type) JS_FreeCString(ctx, type);
+		return JS_UNDEFINED;
+	}
+	for (l = thread->listeners; l != NULL; l = l->next) {
+		if (listener_matches(ctx, l, node, type_dom, func, capture)) {
+			/*
+			 * A listener can remove itself from inside its own
+			 * call, and libdom is walking the list it is in, so
+			 * mark it and let the trampoline free it.
+			 */
+			if (thread->event_depth > 0) {
+				l->dead = true;
+			} else {
+				drop_listener(thread, l);
+			}
+			break;
+		}
+	}
 	dom_string_unref(type_dom);
 	JS_FreeCString(ctx, type);
 	return JS_UNDEFINED;
@@ -1122,7 +1271,16 @@ static JSValue node_add_event_listener(JSContext *ctx, JSValueConst this_val,
 				       int argc, JSValueConst *argv)
 {
 	if (argc < 2) return JS_UNDEFINED;
-	return add_listener(ctx, this_node(ctx, this_val), argv[0], argv[1]);
+	return add_listener(ctx, this_node(ctx, this_val), argv[0], argv[1],
+			    argc > 2 ? argv[2] : JS_UNDEFINED);
+}
+
+static JSValue node_remove_event_listener(JSContext *ctx, JSValueConst this_val,
+					  int argc, JSValueConst *argv)
+{
+	if (argc < 2) return JS_UNDEFINED;
+	return remove_listener(ctx, this_node(ctx, this_val), argv[0], argv[1],
+			       argc > 2 ? argv[2] : JS_UNDEFINED);
 }
 
 /*
@@ -1137,7 +1295,21 @@ static JSValue doc_add_event_listener(JSContext *ctx, JSValueConst this_val,
 	(void)this_val;
 	if (argc < 2) return JS_UNDEFINED;
 	return add_listener(ctx, (struct dom_node *)thread_document(thread),
-			    argv[0], argv[1]);
+			    argv[0], argv[1],
+			    argc > 2 ? argv[2] : JS_UNDEFINED);
+}
+
+/* The matching remove for the document's and window's listeners. */
+static JSValue doc_remove_event_listener(JSContext *ctx, JSValueConst this_val,
+					 int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	(void)this_val;
+	if (argc < 2) return JS_UNDEFINED;
+	return remove_listener(ctx, (struct dom_node *)thread_document(thread),
+			       argv[0], argv[1],
+			       argc > 2 ? argv[2] : JS_UNDEFINED);
 }
 
 static JSValue noop(JSContext *ctx, JSValueConst this_val,
@@ -1176,7 +1348,7 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CFUNC_DEF("cloneNode", 1, node_clone_node),
 	JS_CFUNC_DEF("getElementsByTagName", 1, node_get_elements_by_tag_name),
 	JS_CFUNC_DEF("addEventListener", 2, node_add_event_listener),
-	JS_CFUNC_DEF("removeEventListener", 2, noop),
+	JS_CFUNC_DEF("removeEventListener", 2, node_remove_event_listener),
 };
 
 /* ------------------------------------------------------------------------ */
@@ -1480,7 +1652,7 @@ static const JSCFunctionListEntry document_proto[] = {
 	JS_CFUNC_DEF("createTextNode", 1, doc_create_text_node),
 	JS_CFUNC_DEF("createDocumentFragment", 0, doc_create_document_fragment),
 	JS_CFUNC_DEF("addEventListener", 2, doc_add_event_listener),
-	JS_CFUNC_DEF("removeEventListener", 2, noop),
+	JS_CFUNC_DEF("removeEventListener", 2, doc_remove_event_listener),
 	JS_PROP_STRING_DEF("readyState", "interactive", 0),
 };
 
@@ -2455,6 +2627,10 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	if (thread == NULL || thread->closed) {
 		return;
 	}
+	/* spent, or removed while a dispatch was walking the list */
+	if (l->dead) {
+		return;
+	}
 	ctx = thread->ctx;
 	thread->event_depth++;
 	begin_script(thread);
@@ -2502,6 +2678,15 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	JS_FreeValue(ctx, global);
 	end_script(thread);
 	thread->event_depth--;
+	/*
+	 * A once listener is spent. It cannot be freed here: libdom is
+	 * still inside the dispatch that is walking the list it is in, and
+	 * taking it off underneath that walk corrupts it. Mark it inert
+	 * and let the next add or remove, outside any dispatch, free it.
+	 */
+	if (l->once) {
+		l->dead = true;
+	}
 }
 
 /* ------------------------------------------------------------------------ */
@@ -3136,7 +3321,8 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "addEventListener",
 			  JS_NewCFunction(ctx, doc_add_event_listener, "addEventListener", 2));
 	JS_SetPropertyStr(ctx, global, "removeEventListener",
-			  JS_NewCFunction(ctx, noop, "removeEventListener", 2));
+			  JS_NewCFunction(ctx, doc_remove_event_listener,
+					  "removeEventListener", 2));
 
 	/* Node, Element and HTMLElement all share the node prototype */
 	{
@@ -3388,6 +3574,9 @@ void js_destroythread(jsthread *thread)
 		struct js_listener *next = l->next;
 		if (l->dom_listener != NULL) {
 			dom_event_listener_unref(l->dom_listener);
+		}
+		if (l->type != NULL) {
+			dom_string_unref(l->type);
 		}
 		if (l->node != NULL) {
 			dom_node_unref(l->node);
@@ -4204,7 +4393,7 @@ void js_handle_new_element(jsthread *thread, struct dom_element *node)
 					} else {
 						JSValue type = JS_NewString(ctx, aname + 2);
 						add_listener(ctx, (struct dom_node *)node,
-							     type, fn);
+							     type, fn, JS_UNDEFINED);
 						JS_FreeValue(ctx, type);
 					}
 					JS_FreeValue(ctx, fn);

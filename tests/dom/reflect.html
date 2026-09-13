@@ -1,0 +1,38 @@
+<!DOCTYPE html><html><head><title>reflect</title></head><body>
+<pre id="out"></pre>
+<a id="a" href="x/y?q=1#f">link</a>
+<input id="i" value="v" maxlength="5">
+<script src="_probe.js"></script>
+<script>
+var a=document.getElementById('a'),i=document.getElementById('i');
+T('href is absolute', a.href.indexOf('file:///')===0);
+T('href ends with', a.href.slice(-12));
+T('getAttribute href', a.getAttribute('href'));
+T('protocol', a.protocol); T('hostname', a.hostname);
+T('pathname', a.pathname); T('search', a.search); T('hash', a.hash);
+T('origin', a.origin); T('host', a.host); T('port', '['+a.port+']');
+T('text', a.text);
+a.hash='#z'; T('hash write', a.getAttribute('href'));
+T('maxLength', i.maxLength);
+T('maxLength default', document.createElement('input').maxLength);
+T('tabIndex default', document.createElement('div').tabIndex);
+T('tabIndex on a', a.tabIndex);
+T('value', i.value);
+T('id empty', '['+document.createElement('div').id+']');
+T('className empty', '['+document.createElement('div').className+']');
+T('title empty', '['+document.createElement('div').title+']');
+T('hidden default', document.createElement('div').hidden);
+T('draggable default', document.createElement('div').draggable);
+T('spellcheck default', document.createElement('div').spellcheck);
+T('translate default', document.createElement('div').translate);
+T('contentEditable default', document.createElement('div').contentEditable);
+T('crossOrigin default', String(document.createElement('img').crossOrigin));
+T('dir default', '['+document.createElement('div').dir+']');
+T('rel list', (function(){var e=document.createElement('a');
+  e.setAttribute('rel','a b');return e.relList.length+':'+e.relList.value;})());
+T('classList ops', (function(){var e=document.createElement('div');
+  e.classList.add('x','y');e.classList.replace('x','z');
+  e.classList.toggle('y');return e.className+'|'+e.classList.length;})());
+T('dataset', (function(){var e=document.createElement('div');
+  e.setAttribute('data-foo-bar','1');return e.dataset.fooBar;})());
+</script></body></html>

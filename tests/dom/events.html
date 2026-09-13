@@ -1,0 +1,69 @@
+<!DOCTYPE html><html><head><title>events</title></head><body>
+<pre id="out"></pre>
+<div id="outer"><div id="inner"><b id="leaf">x</b></div></div>
+<script src="_probe.js"></script>
+<script>
+var log=[];
+var outer=document.getElementById('outer'),inner=document.getElementById('inner'),
+    leaf=document.getElementById('leaf');
+function mark(s){return function(){log.push(s);};}
+outer.addEventListener('t',mark('outer-bubble'));
+outer.addEventListener('t',mark('outer-capture'),true);
+inner.addEventListener('t',mark('inner-bubble'));
+leaf.addEventListener('t',mark('leaf'));
+leaf.dispatchEvent(new Event('t',{bubbles:true}));
+T('order', log.join('>'));
+
+log=[];
+var f=mark('once-a');
+leaf.addEventListener('u',f);
+leaf.addEventListener('u',mark('once-b'));
+leaf.removeEventListener('u',f);
+leaf.dispatchEvent(new Event('u'));
+T('after remove', log.join('>')||'(none)');
+
+log=[];
+var g=mark('dup');
+leaf.addEventListener('v',g);
+leaf.addEventListener('v',g);
+leaf.dispatchEvent(new Event('v'));
+T('duplicate listener runs once', log.length);
+
+log=[];
+leaf.addEventListener('w',mark('w1'),{once:true});
+leaf.dispatchEvent(new Event('w'));
+leaf.dispatchEvent(new Event('w'));
+T('once option', log.length);
+
+var e=new Event('p',{bubbles:true,cancelable:true});
+var got=leaf.dispatchEvent(e);
+T('dispatch returns true', got);
+var e2=new Event('p2',{bubbles:true,cancelable:true});
+leaf.addEventListener('p2',function(ev){ev.preventDefault();});
+T('dispatch returns false', leaf.dispatchEvent(e2));
+T('defaultPrevented', e2.defaultPrevented);
+
+log=[];
+inner.addEventListener('s',function(ev){ev.stopPropagation();log.push('inner');});
+outer.addEventListener('s',mark('outer'));
+leaf.dispatchEvent(new Event('s',{bubbles:true}));
+T('stopPropagation', log.join('>'));
+
+var seen={};
+leaf.addEventListener('q',function(ev){
+  seen.type=ev.type; seen.target=ev.target.id; seen.ct=this.id;
+  seen.bubbles=ev.bubbles; seen.phase=ev.eventPhase;
+});
+leaf.dispatchEvent(new Event('q',{bubbles:true}));
+T('event fields', seen.type+','+seen.target+','+seen.ct+','+seen.bubbles);
+
+log=[];
+leaf.onclick=mark('prop1');
+leaf.onclick=mark('prop2');
+leaf.dispatchEvent(new Event('click'));
+T('handler property replaced', log.join('>'));
+log=[];
+leaf.onclick=null;
+leaf.dispatchEvent(new Event('click'));
+T('handler property cleared', log.join('>')||'(none)');
+</script></body></html>

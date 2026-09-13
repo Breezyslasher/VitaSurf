@@ -1,0 +1,36 @@
+<!DOCTYPE html><html><head><title>parse</title></head><body>
+<pre id="out"></pre>
+<div id="ws">  <b>a</b>  <i>b</i>  </div>
+<table id="tbl"><tr><td>c</td></tr></table>
+<template id="tpl">
+  <div id="tin"><span>s</span></div>
+</template>
+<p id="p1">one<p id="p2">two
+<ul id="ul"><li>x<li>y</ul>
+<script src="_probe.js"></script>
+<script>
+T('whitespace shape', shape(document.getElementById('ws')));
+T('table implies tbody', shape(document.getElementById('tbl')));
+T('table row parent', document.querySelector('#tbl td').parentNode.parentNode.tagName);
+T('unclosed p siblings', document.getElementById('p1').nextElementSibling.id);
+T('unclosed p is empty', document.getElementById('p1').childNodes.length);
+T('unclosed li count', document.getElementById('ul').children.length);
+T('template content shape', shape(document.getElementById('tpl').content));
+T('template element empty', document.getElementById('tpl').childNodes.length);
+T('template content type', document.getElementById('tpl').content.nodeType);
+T('comment node', (function(){var d=document.createElement('div');
+  d.innerHTML='a<!--c-->b';return shape(d);})());
+T('entity', (function(){var d=document.createElement('div');
+  d.innerHTML='&amp;&lt;&gt;&nbsp;';return d.textContent.length;})());
+T('attr case', (function(){var d=document.createElement('div');
+  d.innerHTML='<span DATA-X="1" Id="q">t</span>';
+  var s=d.firstChild;return s.getAttribute('data-x')+','+s.id;})());
+T('boolean attr value', (function(){var d=document.createElement('div');
+  d.innerHTML='<input disabled>';return d.firstChild.getAttribute('disabled');})());
+T('self closing', (function(){var d=document.createElement('div');
+  d.innerHTML='<br/><img src="x">';return shape(d);})());
+T('script not run', (function(){var d=document.createElement('div');
+  d.innerHTML='<script>window.__ran=1;<\/script>';return String(window.__ran);})());
+T('nested form text', (function(){var d=document.createElement('div');
+  d.innerHTML='<p>a<span>b</span>c</p>';return d.firstChild.childNodes.length;})());
+</script></body></html>
