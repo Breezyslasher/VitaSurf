@@ -1990,11 +1990,31 @@ P.setAttributeNodeNS=P.setAttributeNode;
 P.removeAttributeNode=function(a){this.removeAttribute(a.name);return a;};
 /* An attribute node, which getAttributeNode used to fake with an object
  * literal. Sanitizers walk these and read ownerElement off them. */
-function Attr(el,name,value){this._e=el;this.name=String(name);this.localName=this.name;
- this.prefix=null;this.namespaceURI=null;this.specified=true;this.value=value;
- this.nodeType=2;this.nodeName=this.name;this.nodeValue=value;}
+function Attr(el,name,value){
+ this._e=el;this._v=value===undefined?'':String(value);
+ this.name=String(name);this.localName=this.name;
+ this.prefix=null;this.namespaceURI=null;this.specified=true;
+ this.nodeType=2;this.nodeName=this.name;
+ this.childNodes=[];this.parentNode=null;}
+/* Live, like the thing it stands for: reading gives what the element
+   says now and writing puts it back, rather than a copy taken once. */
+(function(){
+ function get(){
+  if(!this._e)return this._v;
+  var v=this._e.getAttribute(this.name);
+  return v===null?this._v:v;}
+ function set(v){
+  this._v=String(v);
+  if(this._e)this._e.setAttribute(this.name,this._v);}
+ ['value','nodeValue','textContent'].forEach(function(k){
+  Object.defineProperty(Attr.prototype,k,{configurable:true,enumerable:true,
+   get:get,set:set});});})();
 Object.defineProperty(Attr.prototype,'ownerElement',{configurable:true,
  get:function(){return this._e||null;}});
+Object.defineProperty(Attr.prototype,'ownerDocument',{configurable:true,
+ get:function(){return D;}});
+Attr.prototype.isEqualNode=function(o){
+ return !!o&&o.nodeType===2&&o.name===this.name&&o.value===this.value;};
 W.Attr=Attr;
 P.getAttributeNode=function(n){var v=this.getAttribute(n);return v===null?null:new Attr(this,n,v);};
 /* The collection interfaces. Every list here is a plain array, so these
@@ -2227,7 +2247,10 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){
  var d=Object.getOwnPropertyDescriptor(P,'attributes');
  if(!d||!d.get)return;
  Object.defineProperty(P,'attributes',{configurable:true,get:function(){
-  var el=this,list=d.get.call(this);
+  var el=this,raw=d.get.call(this),list=[],i;
+  /* The C side hands back plain name-and-value pairs; an attribute is a
+     node, and code reads nodeValue, ownerElement and localName off one. */
+  for(i=0;i<raw.length;i++)list.push(new Attr(el,raw[i].name,raw[i].value));
   list.getNamedItem=function(n){return el.getAttributeNode(n);};
   list.getNamedItemNS=function(ns,n){return el.getAttributeNode(n);};
   list.setNamedItem=function(a){el.setAttribute(a.name,a.value);return null;};
@@ -3490,4 +3513,59 @@ P.replaceWith=function(){
  for(i=0;i<n.length;i++)f.appendChild(n[i]);
  if(this.parentNode===p)p.removeChild(this);
  if(ref)p.insertBefore(f,ref);else p.appendChild(f);};
+
+/* --- what may go where ---------------------------------------------------
+ * appendChild, insertBefore and replaceChild took anything they were
+ * given. Inserting a node into its own descendant built a cycle the tree
+ * walk then ran round for ever, and passing something that is not a node
+ * at all did nothing quietly where a browser throws. The checks are the
+ * specification's pre-insertion validity steps.
+ */
+function hierarchy(msg){return new DOMException(msg,'HierarchyRequestError');}
+function isNode(v){return !!v&&typeof v==='object'&&typeof v.nodeType==='number';}
+function needNode(v,fn,which){
+ if(!isNode(v))throw new TypeError(
+  "Failed to execute '"+fn+"': parameter "+which+" is not of type 'Node'.");}
+/* A node cannot contain itself or anything it is inside. */
+function containsNode(parent,node){
+ for(var n=parent;n;n=n.parentNode)if(n===node)return true;
+ return false;}
+var CAN_HAVE_CHILDREN={1:true,9:true,11:true};
+function preInsert(parent,node,child,fn){
+ needNode(node,fn,1);
+ if(!CAN_HAVE_CHILDREN[parent.nodeType])
+  throw hierarchy('This node type does not support this method.');
+ if(containsNode(parent,node))
+  throw hierarchy('The new child element contains the parent.');
+ if(child!==null&&child!==undefined&&child.parentNode!==parent)
+  throw new DOMException(
+   'The node before which the new node is to be inserted is not a child '+
+   'of this node.','NotFoundError');
+ /* a document takes one element and no text */
+ if(node.nodeType===3&&parent.nodeType===9)
+  throw hierarchy('Nodes of type Text may not be inserted inside a Document.');
+ if(node.nodeType===9)
+  throw hierarchy('Nodes of type Document may not be inserted.');}
+(function(){
+ var append=P.appendChild,insert=P.insertBefore,replace=P.replaceChild,
+     removeC=P.removeChild;
+ P.appendChild=function(node){
+  preInsert(this,node,null,'appendChild');
+  return append.call(this,node);};
+ P.insertBefore=function(node,child){
+  preInsert(this,node,child===undefined?null:child,'insertBefore');
+  return insert.call(this,node,child);};
+ P.replaceChild=function(node,child){
+  needNode(node,'replaceChild',1);
+  needNode(child,'replaceChild',2);
+  if(child.parentNode!==this)throw new DOMException(
+   'The node to be replaced is not a child of this node.','NotFoundError');
+  preInsert(this,node,null,'replaceChild');
+  return replace.call(this,node,child);};
+ P.removeChild=function(child){
+  needNode(child,'removeChild',1);
+  if(child.parentNode!==this)throw new DOMException(
+   'The node to be removed is not a child of this node.','NotFoundError');
+  return removeC.call(this,child);};
+})();
 })();
