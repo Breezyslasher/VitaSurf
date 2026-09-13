@@ -1,0 +1,60 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>binary buffers and text decoding</title>
+<pre id="out"></pre>
+<script src="_probe.js"></script>
+<script>
+/* three.js reads the JSON chunk out of a .glb through a Uint8Array
+   window and a TextDecoder, so a decoder that ignores the window, or
+   hands back Latin-1 for bytes that are not UTF-8, turns a model into a
+   JSON syntax error. These are the facts that path depends on. */
+var buf = new ArrayBuffer(32), all = new Uint8Array(buf), i;
+for (i = 0; i < 32; i++) all[i] = 65 + i;
+
+T('view length', new Uint8Array(buf, 4, 8).length);
+T('view byteOffset', new Uint8Array(buf, 4, 8).byteOffset);
+T('decode view', new TextDecoder().decode(new Uint8Array(buf, 4, 8)));
+T('decode dataview', new TextDecoder().decode(new DataView(buf, 4, 8)));
+T('decode whole buffer length', new TextDecoder().decode(buf).length);
+T('decode utf8', new TextDecoder().decode(
+  new Uint8Array([0xc3, 0xa9, 0xe2, 0x82, 0xac, 0xf0, 0x9f, 0x98, 0x80])));
+T('decode invalid', JSON.stringify(new TextDecoder().decode(
+  new Uint8Array([0x41, 0xfd, 0xfd, 0x42]))));
+T('decode truncated', JSON.stringify(new TextDecoder().decode(
+  new Uint8Array([0x41, 0xe2, 0x82]))));
+T('decode overlong', JSON.stringify(new TextDecoder().decode(
+  new Uint8Array([0xc0, 0xaf]))));
+T('decode surrogate', JSON.stringify(new TextDecoder().decode(
+  new Uint8Array([0xed, 0xa0, 0x80]))));
+T('decode bom', new TextDecoder().decode(
+  new Uint8Array([0xef, 0xbb, 0xbf, 0x61, 0x62])));
+T('decode utf16le', new TextDecoder('utf-16le').decode(
+  new Uint8Array([0x61, 0x00, 0x62, 0x00])));
+T('decoder encoding', new TextDecoder().encoding);
+T('dataview getUint32 le', new DataView(buf).getUint32(0, true));
+T('dataview getUint32 be', new DataView(buf).getUint32(0, false));
+T('slice byteLength', buf.slice(4, 12).byteLength);
+T('encoder', (function () {
+  try { return Array.prototype.join.call(new TextEncoder().encode('é'), ','); }
+  catch (e) { return 'threw'; }
+})());
+
+/* the glTF container itself: a JSON chunk padded with spaces, then a
+   BIN chunk, which is where the length has to be respected exactly */
+var glb = new ArrayBuffer(12 + 8 + 12 + 8 + 4);
+var dv = new DataView(glb), json = '{"a":1}     ', j;
+dv.setUint32(0, 0x46546c67, true); dv.setUint32(4, 2, true);
+dv.setUint32(8, glb.byteLength, true);
+dv.setUint32(12, json.length, true); dv.setUint32(16, 0x4e4f534a, true);
+for (j = 0; j < json.length; j++) dv.setUint8(20 + j, json.charCodeAt(j));
+dv.setUint32(32, 4, true); dv.setUint32(36, 0x004e4942, true);
+dv.setUint32(40, 0xfdfdfdfd, true);
+T('glb magic', new TextDecoder().decode(new Uint8Array(glb, 0, 4)));
+T('glb json length', dv.getUint32(12, true));
+var text = new TextDecoder().decode(new Uint8Array(glb, 20, dv.getUint32(12, true)));
+T('glb json text', JSON.stringify(text));
+T('glb json parsed', (function () {
+  try { return JSON.stringify(JSON.parse(text)); }
+  catch (e) { return e.name; }
+})());
+</script>

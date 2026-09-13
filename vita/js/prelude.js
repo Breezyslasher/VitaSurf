@@ -1091,7 +1091,66 @@ function AbortController(){this.signal=new AbortSignal();}
 AbortController.prototype.abort=function(reason){var s=this.signal;if(s.aborted)return;s.aborted=true;s.reason=reason===undefined?new Error('aborted'):reason;var e={type:'abort',target:s};s._l.forEach(function(f){f(e);});if(typeof s.onabort==='function')s.onabort(e);};
 W.AbortController=AbortController;W.AbortSignal=AbortSignal;
 W.TextEncoder=function(){this.encoding='utf-8';};W.TextEncoder.prototype.encode=function(s){s=unescape(encodeURIComponent(String(s)));var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;};
-W.TextDecoder=function(){this.encoding='utf-8';};W.TextDecoder.prototype.decode=function(b){if(!b)return '';var v=b instanceof Uint8Array?b:new Uint8Array(b.buffer||b),s='';for(var i=0;i<v.length;i++)s+=String.fromCharCode(v[i]);try{return decodeURIComponent(escape(s));}catch(e){return s;}};
+/* A real UTF-8 decoder. The old one built the string a character at a
+ * time, wrapped the whole buffer whenever it was handed anything but a
+ * Uint8Array -- a DataView or an Int8Array lost its byteOffset and
+ * length, so the caller got the rest of the file as well -- and on
+ * invalid input returned the bytes as Latin-1 instead of substituting
+ * U+FFFD. three.js reads the JSON chunk of a .glb through this. */
+W.TextDecoder=function(label){
+ this.encoding=String(label===undefined?'utf-8':label).toLowerCase();
+ this.fatal=false;this.ignoreBOM=false;};
+W.TextDecoder.prototype.decode=function(b){
+ if(b===undefined||b===null)return '';
+ var v,out=[],i=0,n,c,cp,need;
+ if(b instanceof Uint8Array)v=b;
+ else if(b&&b.buffer instanceof ArrayBuffer)
+  /* any other view: keep the window it describes */
+  v=new Uint8Array(b.buffer,b.byteOffset,b.byteLength);
+ else if(b instanceof ArrayBuffer)v=new Uint8Array(b);
+ else return String(b);
+ n=v.length;
+ if(this.encoding==='utf-16le'||this.encoding==='utf-16'){
+  for(;i+1<n;i+=2)out.push(v[i]|(v[i+1]<<8));
+  return joinCodes(out);}
+ if(this.encoding==='utf-16be'){
+  for(;i+1<n;i+=2)out.push((v[i]<<8)|v[i+1]);
+  return joinCodes(out);}
+ if(this.encoding==='iso-8859-1'||this.encoding==='latin1'||
+    this.encoding==='windows-1252'){
+  for(;i<n;i++)out.push(v[i]);
+  return joinCodes(out);}
+ /* utf-8, with a leading byte order mark dropped */
+ if(n>=3&&v[0]===0xef&&v[1]===0xbb&&v[2]===0xbf)i=3;
+ /* One U+FFFD per maximal subpart, as the encoding standard puts it:
+    a sequence that goes wrong at its second byte gives one for the
+    lead and then reconsiders the rest, rather than swallowing them.
+    The bounds on the first continuation byte are what rule out an
+    overlong form and a surrogate. */
+ var lo,hi,j;
+ for(;i<n;i++){
+  c=v[i];
+  if(c<0x80){out.push(c);continue;}
+  if(c>=0xc2&&c<=0xdf){cp=c&0x1f;need=1;lo=0x80;hi=0xbf;}
+  else if(c>=0xe0&&c<=0xef){cp=c&0x0f;need=2;
+   lo=c===0xe0?0xa0:0x80;hi=c===0xed?0x9f:0xbf;}
+  else if(c>=0xf0&&c<=0xf4){cp=c&0x07;need=3;
+   lo=c===0xf0?0x90:0x80;hi=c===0xf4?0x8f:0xbf;}
+  else{out.push(0xfffd);continue;}
+  for(j=1;j<=need;j++){
+   if(i+j>=n||v[i+j]<(j===1?lo:0x80)||v[i+j]>(j===1?hi:0xbf))break;
+   cp=(cp<<6)|(v[i+j]&0x3f);}
+  if(j<=need){out.push(0xfffd);i+=j-1;continue;}
+  i+=need;
+  if(cp>0xffff){cp-=0x10000;out.push(0xd800|(cp>>10),0xdc00|(cp&0x3ff));}
+  else out.push(cp);}
+ return joinCodes(out);};
+/* fromCharCode takes the whole array, but not a million arguments at
+   once: hand it blocks. */
+function joinCodes(codes){
+ var s='',i,n=codes.length,F=String.fromCharCode;
+ for(i=0;i<n;i+=8192)s+=F.apply(null,codes.slice(i,i+8192));
+ return s;}
 /* --- custom elements ---------------------------------------------------
  * A registry, an upgrade path and the four reactions. Component sites
  * ship their whole UI as custom elements, so without this their script
@@ -3009,7 +3068,7 @@ W.TextEncoder.prototype.encodeInto=function(s,dest){
  var a=this.encode(s),n=Math.min(a.length,dest.length);
  for(var i=0;i<n;i++)dest[i]=a[i];
  return {read:s.length,written:n};};
-W.TextDecoder.prototype.fatal=false;W.TextDecoder.prototype.ignoreBOM=false;
+
 Object.defineProperty(W.XMLHttpRequest.prototype,'responseXML',{configurable:true,
  get:function(){if(!this.responseText)return null;
   var d=D.createElement('div');d.innerHTML=this.responseText;return d;}});
