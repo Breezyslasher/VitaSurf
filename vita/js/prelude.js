@@ -1757,16 +1757,18 @@ TokenList.prototype._t=function(){
   if(parts[i]===''||Object.prototype.hasOwnProperty.call(seen,parts[i]))continue;
   seen[parts[i]]=1;out.push(parts[i]);}
  return out;};
-/* Only write when something changed: a write is a mutation, and code
-   watching the attribute is entitled to see one exactly when there was. */
-TokenList.prototype._w=function(t,force){
+/* The update steps write the attribute whether or not the set changed,
+   and an observer sees a record for each write. The one case that
+   writes nothing is an element that has no such attribute and no tokens
+   to put in one. Not writing when the value happened to match was the
+   wrong reading: toggle with a force argument is the only operation
+   that returns without updating. */
+TokenList.prototype._w=function(t){
  var next=t.join(' ');
  if(this._e){
   var had=this._e.getAttribute(this._a);
-  /* An element with no such attribute and nothing to put in one does not
-     get an empty attribute out of it. */
   if(had===null&&next==='')return;
-  if(force||next!==(had||''))this._e.setAttribute(this._a,next);}
+  this._e.setAttribute(this._a,next);}
  else this._own=t;
  for(var i=0;i<Math.max(t.length,this.length||0);i++){
   if(i<t.length)this[i]=t[i];else delete this[i];}
@@ -1785,7 +1787,7 @@ TokenList.prototype.add=function(){
 TokenList.prototype.remove=function(){
  var drop=[],i;
  for(i=0;i<arguments.length;i++)drop.push(tokenCheck(arguments[i]));
- this._w(this._t().filter(function(c){return drop.indexOf(c)<0;}),true);};
+ this._w(this._t().filter(function(c){return drop.indexOf(c)<0;}));};
 TokenList.prototype.toggle=function(c,force){
  c=tokenCheck(c);
  var has=this.contains(c);
@@ -3889,7 +3891,7 @@ function siblingsOf(rec,target,after,before){
  if(MOedges&&rec.removedNodes.indexOf(MOedges.node)>=0){
   rec.previousSibling=MOedges.prev;
   rec.nextSibling=MOedges.next;}}
-W.__vitaMutation=function(kind,target,a,b){
+W.__vitaMutation=function(kind,target,a,b,ns){
  if(!MOlist.length||!target)return;
  var i,o,w,rec;
  for(i=0;i<MOlist.length;i++){
@@ -3899,6 +3901,7 @@ W.__vitaMutation=function(kind,target,a,b){
   rec=new MutationRecord(kind,target);
   if(kind==='attributes'){
    rec.attributeName=String(a);
+   rec.attributeNamespace=(ns===undefined||ns===null)?null:String(ns);
    if(w.attributeOldValue)rec.oldValue=b===null?null:String(b);
   }else if(kind==='characterData'){
    if(w.characterDataOldValue)rec.oldValue=b===null?null:String(b);

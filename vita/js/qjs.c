@@ -581,9 +581,9 @@ static JSValue node_get_text_content(JSContext *ctx, JSValueConst this_val)
  * "childList", "attributes" or "characterData"; the two extra values
  * mean different things per kind and the prelude sorts them out.
  */
-static void notify_mutation(JSContext *ctx, const char *kind,
-			    struct dom_node *target,
-			    JSValue a, JSValue b)
+static void notify_mutation_ns(JSContext *ctx, const char *kind,
+			       struct dom_node *target,
+			       JSValue a, JSValue b, JSValue extra)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	JSValue global, fn;
@@ -592,18 +592,20 @@ static void notify_mutation(JSContext *ctx, const char *kind,
 	    thread->closed) {
 		JS_FreeValue(ctx, a);
 		JS_FreeValue(ctx, b);
+		JS_FreeValue(ctx, extra);
 		return;
 	}
 	global = JS_GetGlobalObject(ctx);
 	fn = JS_GetPropertyStr(ctx, global, "__vitaMutation");
 	if (JS_IsFunction(ctx, fn)) {
-		JSValue args[4], r;
+		JSValue args[5], r;
 
 		args[0] = JS_NewString(ctx, kind);
 		args[1] = wrap_node(ctx, target);
 		args[2] = a;
 		args[3] = b;
-		r = JS_Call(ctx, fn, global, 4, args);
+		args[4] = extra;
+		r = JS_Call(ctx, fn, global, 5, args);
 		if (JS_IsException(r)) {
 			JS_FreeValue(ctx, JS_GetException(ctx));
 		}
@@ -613,9 +615,42 @@ static void notify_mutation(JSContext *ctx, const char *kind,
 	} else {
 		JS_FreeValue(ctx, a);
 		JS_FreeValue(ctx, b);
+		JS_FreeValue(ctx, extra);
 	}
 	JS_FreeValue(ctx, fn);
 	JS_FreeValue(ctx, global);
+}
+
+static void notify_mutation(JSContext *ctx, const char *kind,
+			    struct dom_node *target, JSValue a, JSValue b)
+{
+	notify_mutation_ns(ctx, kind, target, a, b, JS_NULL);
+}
+
+/*
+ * A node that moves leaves its old parent, and an observer watching
+ * that parent has to see it go. Only the arrival was reported, so a
+ * move looked like an addition out of nowhere.
+ */
+static void notify_left_parent(JSContext *ctx, struct dom_node *node,
+			       struct dom_node *newparent)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *old = NULL;
+	JSValue gone;
+
+	if (thread == NULL || thread->watch_mutations == false || node == NULL) {
+		return;
+	}
+	if (dom_node_get_parent_node(node, &old) != DOM_NO_ERR || old == NULL) {
+		return;
+	}
+	if (old != newparent) {
+		gone = JS_NewArray(ctx);
+		JS_SetPropertyUint32(ctx, gone, 0, wrap_node(ctx, node));
+		notify_mutation(ctx, "childList", old, JS_NULL, gone);
+	}
+	dom_node_unref(old);
 }
 
 /** The node's children as a JS array, for a before-and-after record. */
@@ -673,10 +708,28 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 	d = empty ? to_dom_string("") : to_dom_string_len(s, len);
 	if (d != NULL) {
 		dom_node_type type = DOM_ELEMENT_NODE;
+		JSValue olddata = JS_NULL;
 
 		JSValue before = children_snapshot(ctx, node);
 
 		dom_node_get_node_type(node, &type);
+		/* what the text said before, which a characterData record
+		 * carries when the observer asked for it */
+		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
+		    type == DOM_CDATA_SECTION_NODE) {
+			jsthread *th = JS_GetContextOpaque(ctx);
+			dom_string *was = NULL;
+
+			if (th != NULL && th->watch_mutations &&
+			    dom_characterdata_get_data((dom_characterdata *)node,
+						       &was) == DOM_NO_ERR &&
+			    was != NULL) {
+				olddata = JS_NewStringLen(ctx,
+					dom_string_data(was),
+					dom_string_byte_length(was));
+				dom_string_unref(was);
+			}
+		}
 		/*
 		 * libdom's generic setter empties the node and appends a
 		 * text node as a child, and a text node cannot have one:
@@ -713,11 +766,13 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		    type == DOM_CDATA_SECTION_NODE) {
 			JS_FreeValue(ctx, before);
 			notify_mutation(ctx, "characterData", node,
-					JS_NULL, JS_NULL);
+					JS_NULL, olddata);
+			olddata = JS_NULL;
 		} else {
 			notify_mutation(ctx, "childList", node,
 					children_snapshot(ctx, node), before);
 		}
+		if (!JS_IsNull(olddata)) JS_FreeValue(ctx, olddata);
 	}
 	if (s != NULL) JS_FreeCString(ctx, s);
 	return JS_UNDEFINED;
@@ -758,8 +813,25 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 	dom_string *dv = to_dom_string(s != NULL ? s : "");
 
 	if (node != NULL && key != NULL && dv != NULL) {
+		dom_string *old = NULL;
+		jsthread *th = JS_GetContextOpaque(ctx);
+
+		if (th != NULL && th->watch_mutations) {
+			dom_element_get_attribute(node, key, &old);
+		}
 		dom_element_set_attribute(node, key, dv);
 		mark_dirty(ctx);
+		/* className and id are the same attribute write as
+		 * setAttribute, and an observer watching class has to see
+		 * one: this path reported nothing at all, so a component
+		 * that sets className missed every change. */
+		notify_mutation(ctx, "attributes", node,
+				JS_NewString(ctx, name),
+				old != NULL ?
+				JS_NewStringLen(ctx, dom_string_data(old),
+						dom_string_byte_length(old)) :
+				JS_NULL);
+		if (old != NULL) dom_string_unref(old);
 	}
 	if (key != NULL) dom_string_unref(key);
 	if (dv != NULL) dom_string_unref(dv);
@@ -1040,17 +1112,24 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 		dom_string *old = NULL;
 		jsthread *th = JS_GetContextOpaque(ctx);
 
+		bool had = false;
+
+		dom_element_has_attribute(node, key, &had);
 		if (th != NULL && th->watch_mutations) {
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_remove_attribute(node, key);
 		mark_dirty(ctx);
-		notify_mutation(ctx, "attributes", node,
-				JS_NewString(ctx, name != NULL ? name : ""),
-				old != NULL ?
-				JS_NewStringLen(ctx, dom_string_data(old),
-						dom_string_byte_length(old)) :
-				JS_NULL);
+		/* removing an attribute that was not there changes nothing,
+		 * and nothing is what an observer should see */
+		if (had) {
+			notify_mutation(ctx, "attributes", node,
+					JS_NewString(ctx, name != NULL ? name : ""),
+					old != NULL ?
+					JS_NewStringLen(ctx, dom_string_data(old),
+							dom_string_byte_length(old)) :
+					JS_NULL);
+		}
 		if (old != NULL) dom_string_unref(old);
 		dom_string_unref(key);
 	}
@@ -1126,11 +1205,30 @@ static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
 	key = to_dom_string(qname);
 	val = to_dom_string(value != NULL ? value : "");
 	if (key != NULL && val != NULL) {
+		dom_string *old = NULL;
+		jsthread *th = JS_GetContextOpaque(ctx);
+		const char *local = qname != NULL ? strchr(qname, ':') : NULL;
+
+		local = local != NULL ? local + 1 : qname;
+		if (th != NULL && th->watch_mutations) {
+			dom_string *lk = to_dom_string(local);
+
+			if (lk != NULL) {
+				dom_element_get_attribute_ns(node, ns, lk, &old);
+				dom_string_unref(lk);
+			}
+		}
 		dom_element_set_attribute_ns(node, ns, key, val);
 		mark_dirty(ctx);
-		notify_mutation(ctx, "attributes", node,
-				JS_NewString(ctx, qname != NULL ? qname : ""),
-				JS_NULL);
+		notify_mutation_ns(ctx, "attributes", node,
+				   JS_NewString(ctx, local != NULL ? local : ""),
+				   old != NULL ?
+				   JS_NewStringLen(ctx, dom_string_data(old),
+						   dom_string_byte_length(old)) :
+				   JS_NULL,
+				   nsheld != NULL ? JS_NewString(ctx, nsheld)
+						  : JS_NULL);
+		if (old != NULL) dom_string_unref(old);
 	}
 	if (key) dom_string_unref(key);
 	if (val) dom_string_unref(val);
@@ -1175,11 +1273,24 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 	local = JS_ToCString(ctx, argv[1]);
 	key = to_dom_string(local);
 	if (key != NULL) {
+		dom_string *old = NULL;
+		bool had = false;
+
+		dom_element_has_attribute_ns(node, ns, key, &had);
+		dom_element_get_attribute_ns(node, ns, key, &old);
 		dom_element_remove_attribute_ns(node, ns, key);
 		mark_dirty(ctx);
-		notify_mutation(ctx, "attributes", node,
-				JS_NewString(ctx, local != NULL ? local : ""),
-				JS_NULL);
+		if (had) {
+			notify_mutation_ns(ctx, "attributes", node,
+					   JS_NewString(ctx, local != NULL ? local : ""),
+					   old != NULL ?
+					   JS_NewStringLen(ctx, dom_string_data(old),
+							   dom_string_byte_length(old)) :
+					   JS_NULL,
+					   nsheld != NULL ? JS_NewString(ctx, nsheld)
+							  : JS_NULL);
+		}
+		if (old != NULL) dom_string_unref(old);
 		dom_string_unref(key);
 	}
 	if (ns != NULL) dom_string_unref(ns);
@@ -1357,16 +1468,37 @@ static JSValue win_vita_parse_document(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+/*
+ * What an insertion actually adds. Inserting a DocumentFragment inserts
+ * its children and leaves the fragment empty, so a record naming the
+ * fragment tells an observer nothing: take the children first.
+ */
+static JSValue inserted_nodes(JSContext *ctx, struct dom_node *child,
+			      JSValueConst asgiven)
+{
+	dom_node_type t = DOM_ELEMENT_NODE;
+
+	if (child != NULL &&
+	    dom_node_get_node_type(child, &t) == DOM_NO_ERR &&
+	    t == DOM_DOCUMENT_FRAGMENT_NODE) {
+		return children_snapshot(ctx, child);
+	}
+	return JS_DupValue(ctx, asgiven);
+}
+
 static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *before = NULL, *ref = NULL;
+	JSValue added;
 
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
 	mark_dirty(ctx);
+	notify_left_parent(ctx, child, node);
+	added = inserted_nodes(ctx, child, argv[0]);
 	if (argc >= 2) {
 		before = JS_GetOpaque(argv[1], node_class_id);
 	}
@@ -1379,8 +1511,7 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 		   ref != NULL) {
 		dom_node_unref(ref);
 	}
-	notify_mutation(ctx, "childList", node,
-			JS_DupValue(ctx, argv[0]), JS_NULL);
+	notify_mutation(ctx, "childList", node, added, JS_NULL);
 	return JS_DupValue(ctx, argv[0]);
 }
 
@@ -1389,18 +1520,21 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 {
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *old, *ref = NULL;
+	JSValue added;
 
 	if (node == NULL || argc < 2) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	old = JS_GetOpaque(argv[1], node_class_id);
 	if (child == NULL || old == NULL) return JS_UNDEFINED;
 	mark_dirty(ctx);
+	notify_left_parent(ctx, child, node);
+	added = inserted_nodes(ctx, child, argv[0]);
 	if (dom_node_replace_child(node, child, old, &ref) == DOM_NO_ERR &&
 	    ref != NULL) {
 		dom_node_unref(ref);
 	}
-	notify_mutation(ctx, "childList", node,
-			JS_DupValue(ctx, argv[0]), JS_DupValue(ctx, argv[1]));
+	notify_mutation(ctx, "childList", node, added,
+			JS_DupValue(ctx, argv[1]));
 	return JS_DupValue(ctx, argv[1]);
 }
 
@@ -1472,16 +1606,18 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 {
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *ref = NULL;
+	JSValue added;
 
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
 	mark_dirty(ctx);
+	notify_left_parent(ctx, child, node);
+	added = inserted_nodes(ctx, child, argv[0]);
 	if (dom_node_append_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
 	}
-	notify_mutation(ctx, "childList", node,
-			JS_DupValue(ctx, argv[0]), JS_NULL);
+	notify_mutation(ctx, "childList", node, added, JS_NULL);
 	return JS_DupValue(ctx, argv[0]);
 }
 
