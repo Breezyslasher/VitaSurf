@@ -1,0 +1,33 @@
+<!DOCTYPE html><html><head><title>style</title></head><body>
+<pre id="out"></pre>
+<div id="d">x</div><span id="s">y</span><b id="b">z</b>
+<div id="h" style="display:none">hidden</div>
+<script src="_probe.js"></script>
+<script>
+var d=document.getElementById('d');
+d.style.display='none';
+T('set display', d.style.display);
+T('style attribute', d.getAttribute('style'));
+T('computed display', getComputedStyle(d).display);
+d.style.removeProperty('display');
+T('after remove', '['+d.style.display+']');
+d.style.cssText='color: red; margin-top: 2px';
+T('cssText read', d.style.cssText);
+T('cssText property', d.style.color+'|'+d.style.marginTop);
+T('length', d.style.length);
+T('item', d.style.item(0));
+d.style.setProperty('z-index','3','important');
+T('priority', d.style.getPropertyPriority('z-index'));
+T('getPropertyValue dashed', d.style.getPropertyValue('margin-top'));
+T('unset property', '['+d.style.width+']');
+T('computed div display', getComputedStyle(document.createElement('div')).display||'(empty)');
+T('computed of attribute', getComputedStyle(document.getElementById('h')).display);
+T('computed span display', getComputedStyle(document.getElementById('s')).display);
+T('computed visibility', getComputedStyle(document.getElementById('b')).visibility);
+T('camel to dashed', (function(){var e=document.createElement('i');
+  e.style.backgroundColor='red';return e.getAttribute('style');})());
+T('number coerced', (function(){var e=document.createElement('i');
+  e.style.opacity=0.5;return e.style.opacity;})());
+T('invalid ignored by attr', (function(){var e=document.createElement('i');
+  e.style.cssText='color:red;;bogus;margin:1px';return e.style.color+'|'+e.style.margin;})());
+</script></body></html>

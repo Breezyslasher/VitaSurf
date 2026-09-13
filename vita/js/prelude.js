@@ -397,11 +397,42 @@ var CS_DEFAULTS={
   CS_DEFAULTS[b+e+(b==='border'?'Width':'')]='0px';});
  if(b!=='border')CS_DEFAULTS[b]='0px';});
 function dashToCamel(n){return String(n).replace(/-([a-z])/g,function(m,c){return c.toUpperCase();});}
+/* What the user agent stylesheet says an element is, for when libcss has
+   no computed style to give -- a detached element, or one with no box.
+   Reporting block for everything told code that an inline element was a
+   block, which is the kind of thing a layout script branches on. */
+var UA_DISPLAY={SPAN:'inline',A:'inline',B:'inline',I:'inline',EM:'inline',
+ STRONG:'inline',SMALL:'inline',BIG:'inline',CODE:'inline',KBD:'inline',
+ SAMP:'inline',VAR:'inline',CITE:'inline',ABBR:'inline',DFN:'inline',
+ Q:'inline',S:'inline',U:'inline',SUB:'inline',SUP:'inline',MARK:'inline',
+ TIME:'inline',LABEL:'inline',IMG:'inline',BR:'inline',WBR:'inline',
+ OBJECT:'inline',IFRAME:'inline',EMBED:'inline',CANVAS:'inline',
+ VIDEO:'inline',AUDIO:'inline',FONT:'inline',TT:'inline',
+ INPUT:'inline-block',BUTTON:'inline-block',SELECT:'inline-block',
+ TEXTAREA:'inline-block',METER:'inline-block',PROGRESS:'inline-block',
+ LI:'list-item',TABLE:'table',THEAD:'table-header-group',
+ TBODY:'table-row-group',TFOOT:'table-footer-group',TR:'table-row',
+ TD:'table-cell',TH:'table-cell',CAPTION:'table-caption',
+ COL:'table-column',COLGROUP:'table-column-group',
+ HEAD:'none',SCRIPT:'none',STYLE:'none',TITLE:'none',META:'none',
+ LINK:'none',TEMPLATE:'none',BASE:'none',PARAM:'none',SOURCE:'none',
+ TRACK:'none',AREA:'none',DATALIST:'none',DIALOG:'none'};
 function computedStyle(el){
+ /* A browser reports nothing for an element that is not in the document,
+    and code tests the value it gets back. */
+ if(el&&el.nodeType===1&&el.isConnected===false){
+  var empty={getPropertyValue:function(){return '';},
+   getPropertyPriority:function(){return '';},
+   setProperty:function(){},removeProperty:function(){return '';},
+   item:function(){return '';},length:0,cssText:''};
+  for(var k in CS_DEFAULTS)empty[k]='';
+  empty.width='';empty.height='';
+  return empty;}
  var st=(el&&el.nodeType===1&&typeof __vitaStyle==='function')?__vitaStyle(el):null;
  var box=(el&&el.nodeType===1&&typeof __vitaBox==='function')?__vitaBox(el):null;
  var cs={};
  for(var k in CS_DEFAULTS)cs[k]=CS_DEFAULTS[k];
+ if(el&&el.nodeType===1&&UA_DISPLAY[el.tagName])cs.display=UA_DISPLAY[el.tagName];
  if(st){
   cs.fontSize=st[0]+'px';
   if(CS_DISPLAY[st[1]])cs.display=CS_DISPLAY[st[1]];
@@ -2614,4 +2645,44 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
  set:function(v){
   if(isOwnState(v))return shadowProp(this,'tabIndex',v);
   this.setAttribute('tabindex',String(parseInt(v,10)||0));}});
+
+/* --- the defaults a control reports ------------------------------------
+ * type was the attribute or nothing, and an input with no type attribute
+ * is a text input; code switches on it.
+ */
+(function(){
+ var d=Object.getOwnPropertyDescriptor(P,'type');
+ Object.defineProperty(P,'type',{configurable:true,
+  get:function(){
+   var v=this.getAttribute('type');
+   if(v!==null&&v!=='')return this.tagName==='INPUT'?String(v).toLowerCase():v;
+   if(this.tagName==='INPUT')return 'text';
+   if(this.tagName==='BUTTON')return 'submit';
+   if(this.tagName==='OL')return '1';
+   return '';},
+  set:d.set});
+})();
+/* value on a control is the current value; the attribute is the default
+ * the form resets to. Writing the attribute is what makes the new value
+ * render here, so keep doing that, and remember the default the first
+ * time it is overwritten so defaultValue and reset still mean something.
+ */
+(function(){
+ var d=Object.getOwnPropertyDescriptor(P,'value');
+ Object.defineProperty(P,'value',{configurable:true,get:d.get,
+  set:function(v){
+   if(!isOwnState(v)&&(this.tagName==='INPUT'||this.tagName==='TEXTAREA')&&
+      !Object.prototype.hasOwnProperty.call(this,'__defaultValue')){
+    Object.defineProperty(this,'__defaultValue',{configurable:true,
+     writable:true,value:this.tagName==='TEXTAREA'?
+      String(this.textContent||''):(this.getAttribute('value')||'')});
+   }
+   d.set.call(this,v);}});
+ var dv=Object.getOwnPropertyDescriptor(P,'defaultValue');
+ Object.defineProperty(P,'defaultValue',{configurable:true,
+  get:function(){
+   return Object.prototype.hasOwnProperty.call(this,'__defaultValue')?
+    this.__defaultValue:dv.get.call(this);},
+  set:dv.set});
+})();
 })();

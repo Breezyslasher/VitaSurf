@@ -1,0 +1,7 @@
+# Facts where this port deliberately does not match the browser, and why.
+# Format: probe file | fact name | reason
+#
+# Anything not listed here must match. A difference that is really a bug
+# does not belong in this file.
+
+forms.html | input value write | A control's value property is its current value and the value attribute is the default it resets to. Here the renderer draws the control from the attribute, so writing the property has to write the attribute or the user never sees what a script typed into the field. defaultValue and reset still return the original, which is remembered the first time the value is overwritten.

@@ -48,23 +48,46 @@ run_vita() {
     sed -n 's/^.*console: \(XX .*\)$/\1/p'
 }
 
+# Facts this port deliberately does not match, with the reason. Filtered
+# out of both sides and listed at the end, so a deliberate divergence is
+# recorded rather than either hidden or mistaken for a bug.
+known="$ROOT/tests/dom/known-differences.txt"
+
 status=0
 pages=("$@")
 if [ ${#pages[@]} -eq 0 ]; then pages=("$ROOT"/tests/dom/*.html); fi
 
 for page in "${pages[@]}"; do
     abs="$(cd "$(dirname "$page")" && pwd)/$(basename "$page")"
-    run_browser "$abs" > "$work/browser.txt"
-    run_vita "$abs" > "$work/vita.txt"
+    run_browser "$abs" > "$work/browser.raw"
+    run_vita "$abs" > "$work/vita.raw"
     name="$(basename "$page")"
+    # drop the facts listed as deliberate for this probe
+    : > "$work/skip"
+    if [ -f "$known" ]; then
+        awk -F'|' -v p="$name" '$1 !~ /^#/ && $1 ~ /[^ ]/ {
+            gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2)
+            if ($1 == p) print $2 }' "$known" > "$work/skip"
+    fi
+    for f in browser vita; do
+        if [ -s "$work/skip" ]; then
+            grep -v -F -f <(sed 's/^/XX /;s/$/: /' "$work/skip") \
+                "$work/$f.raw" > "$work/$f.txt" || true
+        else
+            cp "$work/$f.raw" "$work/$f.txt"
+        fi
+    done
     # A probe that printed nothing is a broken probe, not a passing one.
-    if [ ! -s "$work/browser.txt" ] || [ ! -s "$work/vita.txt" ]; then
-        echo "== $name: no facts from $([ -s "$work/browser.txt" ] || echo -n 'the browser')$([ -s "$work/browser.txt" ] || [ -s "$work/vita.txt" ] || echo -n ' and ')$([ -s "$work/vita.txt" ] || echo -n 'vitasurf') -- the probe did not run"
+    if [ ! -s "$work/browser.raw" ] || [ ! -s "$work/vita.raw" ]; then
+        echo "== $name: no facts from $([ -s "$work/browser.raw" ] || echo -n 'the browser')$([ -s "$work/browser.raw" ] || [ -s "$work/vita.raw" ] || echo -n ' and ')$([ -s "$work/vita.raw" ] || echo -n 'vitasurf') -- the probe did not run"
         status=1
         continue
     fi
+    skipped=$(wc -l < "$work/skip")
+    note=""
+    [ "$skipped" -gt 0 ] && note=", $skipped deliberate"
     if diff -q "$work/browser.txt" "$work/vita.txt" >/dev/null; then
-        echo "== $name: same as the browser ($(wc -l < "$work/browser.txt") facts)"
+        echo "== $name: same as the browser ($(wc -l < "$work/browser.txt") facts$note)"
     else
         n=$(diff "$work/browser.txt" "$work/vita.txt" | grep -c '^[<>]')
         echo "== $name: $n lines differ"
