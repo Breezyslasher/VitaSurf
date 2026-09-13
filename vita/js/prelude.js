@@ -722,7 +722,7 @@ P.dispatchEvent=function(e){
 P.add=function(o,before){this.insertBefore(o,before||null);};
 Object.defineProperty(P,'options',{configurable:true,get:function(){return this.getElementsByTagName('option');}});
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){var o=this.options;for(var i=0;i<o.length;i++)if(o[i].hasAttribute('selected'))return i;return o.length?0:-1;},set:function(i){var o=this.options;for(var j=0;j<o.length;j++){if(j===i)o[j].setAttribute('selected','');else o[j].removeAttribute('selected');}}});
-Object.defineProperty(P,'selectedOptions',{configurable:true,get:function(){return this.options.filter(function(o){return o.hasAttribute('selected');});}});
+Object.defineProperty(P,'selectedOptions',{configurable:true,get:function(){return listOf(this.options).filter(function(o){return o.hasAttribute('selected');});}});
 var D=document;
 /* A search from the document includes the document element itself,
    which a search from inside it does not: document.querySelector('html')
@@ -1133,6 +1133,8 @@ W.Document=Document;W.HTMLDocument=HTMLDocument;
 Document.prototype=DocumentProto;HTMLDocument.prototype=DocumentProto;
 Object.defineProperty(DocumentProto,'constructor',
  {configurable:true,writable:true,value:HTMLDocument});
+/* Set once the real ones are defined, further down. Anything that runs
+   before that sees the array, which is what it used to be. */
 W.NodeList=W.HTMLCollection=Array;
 ['CharacterData','Text','Comment','CDATASection','ProcessingInstruction','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});
 /* Interfaces that polyfills enumerate and read .prototype from. They
@@ -2029,7 +2031,7 @@ Object.defineProperty(P,'validationMessage',{configurable:true,get:function(){
 P.setCustomValidity=function(m){Object.defineProperty(this,'__customError',
  {configurable:true,writable:true,enumerable:false,value:String(m||'')});};
 P.checkValidity=function(){
- if(this.tagName==='FORM')return this.elements.every(function(c){return c.checkValidity();});
+ if(this.tagName==='FORM')return listOf(this.elements).every(function(c){return c.checkValidity();});
  if(!this.willValidate)return true;
  if(this.validity.valid)return true;
  this.dispatchEvent(new Event('invalid',{bubbles:false,cancelable:true}));
@@ -2078,11 +2080,13 @@ Object.defineProperty(P,'colorSpace',{configurable:true,get:function(){return 'l
  */
 Object.defineProperty(P,'elements',{configurable:true,get:function(){
  if(this.tagName!=='FORM'&&this.tagName!=='FIELDSET')return [];
- var l=this.querySelectorAll('input,select,textarea,button,fieldset,object,output');
- l.namedItem=function(n){for(var i=0;i<this.length;i++)
-  if(this[i].name===n||this[i].id===n)return this[i];return null;};
- l.item=function(i){return this[i]||null;};
- return l;}});
+ /* live, and it answers to a control's name, which is how a page
+    reaches form.elements.username */
+ var self=this;
+ return liveCollection(function(){
+  return listOf(self.querySelectorAll(
+   'input,select,textarea,button,fieldset,object,output'));},
+  FormControls.prototype);}});
 Object.defineProperty(P,'length',{configurable:true,get:function(){
  /* On character data it is the number of characters, which is what code
     walking text reads before it slices. */
@@ -2093,13 +2097,12 @@ Object.defineProperty(P,'length',{configurable:true,get:function(){
  return undefined;}});
 Object.defineProperty(P,'options',{configurable:true,get:function(){
  if(this.tagName!=='SELECT'&&this.tagName!=='DATALIST')return undefined;
- var l=this.getElementsByTagName('option');
- l.namedItem=function(n){for(var i=0;i<this.length;i++)
-  if(this[i].name===n||this[i].id===n)return this[i];return null;};
- l.item=function(i){return this[i]||null;};
- return l;}});
+ /* the collection already answers to item and namedItem; attaching
+    them here shadowed the real ones with a version that read the
+    proxy's target and found nothing */
+ return this.getElementsByTagName('option');}});
 Object.defineProperty(P,'selectedOptions',{configurable:true,get:function(){
- return (this.options||[]).filter(function(o){return o.selected;});}});
+ return listOf(this.options).filter(function(o){return o.selected;});}});
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){
  if(this.tagName==='OPTION')return this.parentNode?this.parentNode.selectedIndex:-1;
  var o=this.options||[];for(var i=0;i<o.length;i++)if(o[i].selected)return i;
@@ -2110,7 +2113,7 @@ Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){
 Object.defineProperty(P,'index',{configurable:true,get:function(){
  if(this.tagName!=='OPTION')return undefined;
  var p=this.parentNode;while(p&&p.tagName==='OPTGROUP')p=p.parentNode;
- return p&&p.options?p.options.indexOf(this):0;}});
+ return p&&p.options?listOf(p.options).indexOf(this):0;}});
 /* item and namedItem stay off the element prototype on purpose: code
  * tests for them to tell a collection from an element, and an element
  * that answers to both gets iterated as a collection. The collections
@@ -2137,7 +2140,7 @@ P.submit=function(){
  var action=this.action||D.baseURI;
  if(method!=='get')return;   /* a navigation cannot carry a body here */
  var q=new URLSearchParams('');
- this.elements.forEach(function(c){
+ listOf(this.elements).forEach(function(c){
   var n=c.name;if(!n||c.disabled)return;
   var t=String(c.type||'').toLowerCase();
   if(t==='submit'||t==='button'||t==='reset'||t==='file')return;
@@ -2152,7 +2155,7 @@ P.submit=function(){
 P.reset=function(){
  if(this.tagName!=='FORM')return;
  if(!this.dispatchEvent(new Event('reset',{bubbles:true,cancelable:true})))return;
- this.elements.forEach(function(c){
+ listOf(this.elements).forEach(function(c){
   if(c.tagName==='SELECT'){c.selectedIndex=0;return;}
   if(c.type==='checkbox'||c.type==='radio'){c.checked=c.defaultChecked;return;}
   c.value=c.defaultValue;});};
@@ -2534,18 +2537,154 @@ P.removeAttributeNode=function(a){
  P.removeAttributeNS=function(ns,n){
   detachAttr(this,(ns===''||ns===undefined)?null:ns,String(n));
   return origRmNS.apply(this,arguments);};})();
-/* The collection interfaces. Every list here is a plain array, so these
- * exist to be enumerated and subclassed, not to be constructed. */
-function HTMLCollection(){}
-HTMLCollection.prototype.item=function(i){return this[i]||null;};
+/* --- live collections ---------------------------------------------------
+ * getElementsByTagName and friends return a collection that reflects the
+ * document as it is now, not as it was when the call was made. Ours were
+ * plain arrays taken once, so a page that kept document.forms, or
+ * element.children, and looked at it again after changing the tree saw
+ * the old answer. The specification is explicit about which are live:
+ * getElementsBy*, children, forms, options and the rest are, and
+ * querySelectorAll is not.
+ *
+ * A collection also answers to the id and the name of what it holds, so
+ * document.forms.login is the form with that name. Those are properties
+ * of the collection, and they come and go with the elements.
+ */
+function HTMLCollection(){throw new TypeError('Illegal constructor');}
+Object.defineProperty(HTMLCollection.prototype,'length',{configurable:true,
+ get:function(){return this.__vitaItems().length;}});
+HTMLCollection.prototype.item=function(i){
+ var a=this.__vitaItems();i=i>>>0;
+ return i<a.length?a[i]:null;};
 HTMLCollection.prototype.namedItem=function(n){
- for(var i=0;i<(this.length||0);i++)if(this[i].name===n||this[i].id===n)return this[i];
+ var a=this.__vitaItems(),i,name=String(n);
+ if(name==='')return null;
+ for(i=0;i<a.length;i++)if(a[i].getAttribute&&a[i].getAttribute('id')===name)
+  return a[i];
+ for(i=0;i<a.length;i++)
+  if(a[i].getAttribute&&NAMED_TAGS.indexOf(' '+a[i].tagName+' ')>=0&&
+     a[i].getAttribute('name')===name)return a[i];
  return null;};
-HTMLCollection.prototype.add=function(){};HTMLCollection.prototype.remove=function(){};
-Object.defineProperty(HTMLCollection.prototype,'length',{configurable:true,get:function(){return 0;}});
-Object.defineProperty(HTMLCollection.prototype,'selectedIndex',{configurable:true,
- get:function(){return -1;},set:function(){}});
-W.HTMLCollection=HTMLCollection;W.HTMLOptionsCollection=HTMLCollection;
+HTMLCollection.prototype[Symbol.iterator]=function(){
+ var a=this.__vitaItems(),i=0;
+ return {next:function(){
+  return i<a.length?{value:a[i++],done:false}:{value:undefined,done:true};}};};
+/* Only these tags answer to their name attribute in a collection. */
+var NAMED_TAGS=(' A APPLET AREA EMBED FORM FRAME FRAMESET IFRAME IMG '+
+ 'OBJECT ');
+function indexKey(k){
+ if(typeof k!=='string')return -1;
+ if(k==='0')return 0;
+ if(!/^[1-9][0-9]*$/.test(k))return -1;
+ var n=+k;
+ return n<=0xfffffffe?n:-1;}
+/* The collection is a proxy so that an index or a name is resolved when
+   it is read, which is what makes it live. */
+function liveCollection(items,proto){
+ var base=Object.create(proto||HTMLCollection.prototype);
+ Object.defineProperty(base,'__vitaItems',{value:items,configurable:true});
+ return new Proxy(base,{
+  get:function(t,k,r){
+   var i=indexKey(k),a;
+   if(i>=0){a=t.__vitaItems();return i<a.length?a[i]:undefined;}
+   if(typeof k==='string'&&!(k in t)&&k!=='__vitaItems'){
+    var n=t.namedItem?t.namedItem(k):null;
+    if(n)return n;}
+   return Reflect.get(t,k,r);},
+  has:function(t,k){
+   var i=indexKey(k);
+   if(i>=0)return i<t.__vitaItems().length;
+   if(typeof k==='string'&&t.namedItem&&t.namedItem(k))return true;
+   return Reflect.has(t,k);},
+  set:function(t,k,v,r){
+   /* an index, or a name the collection answers to, is not writable */
+   if(indexKey(k)>=0)return false;
+   if(typeof k==='string'&&t.namedItem&&t.namedItem(k))return false;
+   return Reflect.set(t,k,v,r);},
+  deleteProperty:function(t,k){
+   if(indexKey(k)>=0)return false;
+   if(typeof k==='string'&&t.namedItem&&t.namedItem(k))return false;
+   return Reflect.deleteProperty(t,k);},
+  defineProperty:function(t,k,d){
+   if(indexKey(k)>=0)return false;
+   return Reflect.defineProperty(t,k,d);},
+  ownKeys:function(t){
+   var a=t.__vitaItems(),out=[],seen={},i,n;
+   for(i=0;i<a.length;i++)out.push(String(i));
+   for(i=0;i<a.length;i++){
+    if(!a[i].getAttribute)continue;
+    n=a[i].getAttribute('id');
+    if(n&&!seen[n]&&indexKey(n)<0){seen[n]=1;out.push(n);}
+    if(NAMED_TAGS.indexOf(' '+a[i].tagName+' ')>=0){
+     n=a[i].getAttribute('name');
+     if(n&&!seen[n]&&indexKey(n)<0){seen[n]=1;out.push(n);}}}
+   Reflect.ownKeys(t).forEach(function(k){
+    if(typeof k==='string'&&out.indexOf(k)<0&&k!=='__vitaItems')out.push(k);});
+   return out;},
+  getOwnPropertyDescriptor:function(t,k){
+   var i=indexKey(k),a;
+   if(i>=0){
+    a=t.__vitaItems();
+    if(i>=a.length)return undefined;
+    return {value:a[i],writable:false,enumerable:true,configurable:true};}
+   if(typeof k==='string'&&t.namedItem){
+    var n=t.namedItem(k);
+    if(n)return {value:n,writable:false,enumerable:false,configurable:true};}
+   return Reflect.getOwnPropertyDescriptor(t,k);}});}
+/* A NodeList holds anything, answers to no name, and has the iteration
+   helpers a collection does not. */
+function NodeList(){throw new TypeError('Illegal constructor');}
+Object.defineProperty(NodeList.prototype,'length',{configurable:true,
+ get:function(){return this.__vitaItems().length;}});
+NodeList.prototype.item=function(i){
+ var a=this.__vitaItems();i=i>>>0;
+ return i<a.length?a[i]:null;};
+NodeList.prototype.forEach=function(f,t){
+ var a=this.__vitaItems(),i;
+ for(i=0;i<a.length;i++)f.call(t,a[i],i,this);};
+NodeList.prototype.keys=function(){
+ var a=this.__vitaItems(),i=0;
+ return {next:function(){return i<a.length?{value:i++,done:false}
+                                          :{value:undefined,done:true};},
+  __proto__:null};};
+NodeList.prototype.values=function(){return this[Symbol.iterator]();};
+NodeList.prototype.entries=function(){
+ var a=this.__vitaItems(),i=0;
+ return {next:function(){
+  return i<a.length?{value:[i,a[i++]],done:false}:{value:undefined,done:true};}};};
+NodeList.prototype[Symbol.iterator]=function(){
+ var a=this.__vitaItems(),i=0;
+ return {next:function(){
+  return i<a.length?{value:a[i++],done:false}:{value:undefined,done:true};}};};
+/* A form's controls answer to the name of any of them, not only the
+   tags a plain collection names. */
+function FormControls(){throw new TypeError('Illegal constructor');}
+FormControls.prototype=Object.create(HTMLCollection.prototype);
+FormControls.prototype.constructor=FormControls;
+FormControls.prototype.namedItem=function(n){
+ var a=this.__vitaItems(),i,name=String(n);
+ if(name==='')return null;
+ for(i=0;i<a.length;i++)if(a[i].getAttribute&&a[i].getAttribute('id')===name)
+  return a[i];
+ for(i=0;i<a.length;i++)if(a[i].getAttribute&&a[i].getAttribute('name')===name)
+  return a[i];
+ return null;};
+function liveNodeList(items){return liveCollection(items,NodeList.prototype);}
+/* A collection the code here wants to walk as an array. */
+function listOf(c){
+ var a=[],i,n;
+ if(!c)return a;
+ if(Array.isArray(c))return c.slice();
+ n=c.length||0;
+ for(i=0;i<n;i++)a.push(c[i]);
+ return a;}
+
+
+/* The other collection names. The real one is defined above; these used
+   to be a stub whose length was always zero, and it was clobbering it. */
+HTMLCollection.prototype.add=function(){};
+HTMLCollection.prototype.remove=function(){};
+W.HTMLOptionsCollection=HTMLCollection;
 W.HTMLFormControlsCollection=HTMLCollection;W.HTMLAllCollection=HTMLCollection;
 
 W.closed=false;
@@ -3121,14 +3260,14 @@ function rowsOf(el){return el.getElementsByTagName('tr');}
   set:function(v){d.set.call(this,v);}});})();
 Object.defineProperty(P,'cells',{configurable:true,get:function(){
  if(this.tagName!=='TR')return undefined;
- return this.children.filter(function(c){return c.tagName==='TD'||c.tagName==='TH';});}});
+ return listOf(this.children).filter(function(c){return c.tagName==='TD'||c.tagName==='TH';});}});
 Object.defineProperty(P,'rowIndex',{configurable:true,get:function(){
  if(this.tagName!=='TR')return -1;
  var t=this;while(t&&t.tagName!=='TABLE')t=t.parentNode;
- return t?rowsOf(t).indexOf(this):-1;}});
+ return t?listOf(rowsOf(t)).indexOf(this):-1;}});
 Object.defineProperty(P,'sectionRowIndex',{configurable:true,get:function(){
  if(this.tagName!=='TR')return -1;
- var s=this.parentNode;return s?rowsOf(s).indexOf(this):-1;}});
+ var s=this.parentNode;return s?listOf(rowsOf(s)).indexOf(this):-1;}});
 ['tHead','tFoot','caption'].forEach(function(k){
  var tag=k==='caption'?'CAPTION':k.toUpperCase();
  Object.defineProperty(P,k,{configurable:true,get:function(){
@@ -3136,9 +3275,9 @@ Object.defineProperty(P,'sectionRowIndex',{configurable:true,get:function(){
   var c=this.children;for(var i=0;i<c.length;i++)if(c[i].tagName===tag)return c[i];
   return null;}});});
 Object.defineProperty(P,'tBodies',{configurable:true,get:function(){
- return this.tagName==='TABLE'?this.children.filter(function(c){return c.tagName==='TBODY';}):[];}});
+ return this.tagName==='TABLE'?listOf(this.children).filter(function(c){return c.tagName==='TBODY';}):[];}});
 function tableSection(el,tag,make){
- var e=el.children.filter(function(c){return c.tagName===tag;})[0];
+ var e=listOf(el.children).filter(function(c){return c.tagName===tag;})[0];
  if(!e&&make){e=D.createElement(tag.toLowerCase());
   if(tag==='TFOOT')el.appendChild(e);else el.insertBefore(e,el.firstChild);}
  return e||null;}
@@ -4511,5 +4650,30 @@ stampConsts(P);
    return !!v&&typeof v==='object'&&v.nodeType===1&&
     HTML_TAGS.indexOf(' '+v.tagName+' ')<0&&
     byTag.SVGElement.indexOf(' '+v.tagName+' ')<0;},W.HTMLUnknownElement);}
+})();
+
+W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
+
+/* getElementsByTagName and friends, made live. The C side does the tree
+   walk; the collection calls it again whenever it is read. */
+(function(){
+ function live(get){
+  return function(){
+   var self=this,args=[].slice.call(arguments);
+   return liveCollection(function(){
+    return listOf(get.apply(self,args));});};}
+ ['getElementsByTagName','getElementsByClassName','getElementsByName',
+  'getElementsByTagNameNS'].forEach(function(m){
+  if(typeof P[m]==='function')P[m]=live(P[m]);
+  if(typeof D[m]==='function')D[m]=live(D[m]);});
+ var kids=Object.getOwnPropertyDescriptor(P,'children');
+ if(kids&&kids.get)Object.defineProperty(P,'children',{configurable:true,
+  get:function(){
+   var self=this;
+   return liveCollection(function(){return listOf(kids.get.call(self));});}});
+ var dkids=Object.getOwnPropertyDescriptor(D,'children');
+ if(dkids&&dkids.get)Object.defineProperty(D,'children',{configurable:true,
+  get:function(){
+   return liveCollection(function(){return listOf(dkids.get.call(D));});}});
 })();
 })();
