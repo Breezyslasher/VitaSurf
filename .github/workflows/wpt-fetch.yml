@@ -38,6 +38,7 @@ jobs:
               /resources/testharness.js \
               /resources/testharnessreport.js \
               /resources/idlharness.js \
+              /common \
               /dom/nodes \
               /dom/events \
               /dom/traversal \
@@ -68,6 +69,11 @@ jobs:
           # them a test reports its own helpers as undefined, which looks
           # like our failure and is not.
           WANT = re.compile(r'\.(html|js)$')
+          # Several tests load a fixture document into an iframe --
+          # /common/dummy.xml and /common/dummy.xhtml among them -- and
+          # without it both engines measure something other than the
+          # test. Those live under common/ and are not .html or .js.
+          FIXTURES = re.compile(r'^common/.*\.(xml|xhtml|svg|txt|css|json)$')
 
           if os.path.isdir(DST):
               shutil.rmtree(DST)
@@ -81,6 +87,8 @@ jobs:
                   p = os.path.join(root, f)
                   rel = os.path.relpath(p, SRC)
                   if rel.startswith('resources/'):
+                      pass
+                  elif FIXTURES.match(rel):
                       pass
                   elif not WANT.search(f) or SKIP.search('/' + rel):
                       continue
