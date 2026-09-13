@@ -123,18 +123,27 @@ function compile(selector){return selector.split(',').map(function(s){
  return s.replace(/^\s+|\s+$/g,'').split(/\s*>\s*|\s+/).map(parseSimple);})
  .filter(function(p){return p.length&&p.every(function(x){return x;});});}
 function isInside(root,el){if(root.nodeType===9)return true;var n=el.parentNode;while(n){if(n===root)return true;n=n.parentNode;}return false;}
+/* Whether the tree under root is the document's. getElementById and the
+   C-side tree walk both search the document, so a detached subtree -- a
+   template's content, a fragment a component is building -- has to be
+   walked here instead, or querySelector on it finds nothing. */
+function inDocument(n){while(n){if(n.nodeType===9||n===D.documentElement)return true;n=n.parentNode;}return false;}
+function walkElements(root,out){var c=root.childNodes,i;
+ for(i=0;i<c.length;i++){if(c[i].nodeType===1){out.push(c[i]);walkElements(c[i],out);}}
+ return out;}
 function select(root,sel,all){
  var groups=compile(String(sel)),out=[];
  if(!groups.length)return out;
+ var live=root.nodeType===9||inDocument(root);
  /* one group ending in an id: ask the document directly */
- if(groups.length===1){var key=groups[0][groups[0].length-1];
+ if(live&&groups.length===1){var key=groups[0][groups[0].length-1];
   if(key.id&&!key.classes.length){var el=document.getElementById(key.id);
    if(el&&isInside(root,el)&&matchesCompound(el,groups[0]))out.push(el);
    return out;}}
  /* candidates for the right-hand simple selector of every group, found
     in one pass through the tree in C (qjs.c) */
  var keys=groups.map(function(g){return g[g.length-1];});
- var cand=__vitaFind(root.nodeType===9?null:root,keys);
+ var cand=live?__vitaFind(root.nodeType===9?null:root,keys):walkElements(root,[]);
  for(var i=0;i<cand.length;i++){var c=cand[i];
   for(var g=0;g<groups.length;g++){if(matchesCompound(c,groups[g])){out.push(c);break;}}
   if(!all&&out.length)return out;}
@@ -898,12 +907,48 @@ P.getRootNode=function(){var n=this;while(n.parentNode)n=n.parentNode;return n==
 Object.defineProperty(P,'shadowRoot',{configurable:true,get:function(){return this.__shadow?this:null;}});
 Object.defineProperty(P,'host',{configurable:true,get:function(){return this.__shadow?this:undefined;}});
 Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return ceInDoc(this);}});
-/* Same reasoning for <template>: libdom parses its children into the
- * element, so content is the element. Every other tag keeps the content
- * attribute property, which <meta> needs. */
+/* <template>. libdom parses the children into the template element, so
+ * content used to be the element itself -- and stamping a template then
+ * put a <template> into the page instead of its children. Every Polymer
+ * or lit component that stamps its own template rendered nothing and its
+ * node lookups came back undefined, which is what YouTube's
+ * this.guide.addEventListener was failing on.
+ *
+ * Move the children into a real fragment the first time content is read
+ * and keep that fragment on the element: a component prepares its
+ * template once, mutates the content, and stamps the same fragment over
+ * and over, so handing back a fresh copy each time would lose the
+ * preparation. Every other tag keeps the content attribute property,
+ * which <meta> needs. */
 (function(){
  var d=Object.getOwnPropertyDescriptor(P,'content');
- Object.defineProperty(P,'content',{configurable:true,get:function(){return this.tagName==='TEMPLATE'?this:d.get.call(this);},set:d.set});
+ Object.defineProperty(P,'content',{configurable:true,
+  get:function(){
+   if(this.tagName!=='TEMPLATE')return d.get.call(this);
+   if(!Object.prototype.hasOwnProperty.call(this,'__content')){
+    var f=D.createDocumentFragment(),c=this.childNodes.slice(),i;
+    for(i=0;i<c.length;i++)f.appendChild(c[i]);
+    Object.defineProperty(this,'__content',
+     {configurable:true,writable:true,value:f});
+   }
+   return this.__content;},
+  set:function(v){if(this.tagName!=='TEMPLATE')d.set.call(this,v);}});
+})();
+/* A template cloned before its content was read carries its children
+ * with it, and after, it does not; give the clone the same fragment
+ * treatment either way. */
+(function(){
+ var clone=P.cloneNode;
+ P.cloneNode=function(deep){
+  var c=clone.call(this,deep);
+  if(this.tagName==='TEMPLATE'&&deep&&
+     Object.prototype.hasOwnProperty.call(this,'__content')){
+   var f=D.createDocumentFragment(),src=this.__content.childNodes,i;
+   for(i=0;i<src.length;i++)f.appendChild(src[i].cloneNode(true));
+   Object.defineProperty(c,'__content',
+    {configurable:true,writable:true,value:f});
+  }
+  return c;};
 })();
 W.ShadowRoot=CEBase;
 
