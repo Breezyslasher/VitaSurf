@@ -3684,9 +3684,27 @@ P.replaceWith=function(){
  */
 function hierarchy(msg){return new DOMException(msg,'HierarchyRequestError');}
 function isNode(v){return !!v&&typeof v==='object'&&typeof v.nodeType==='number';}
+/* The message says what was passed as well as what was wanted: the
+   value that reaches this from a minified bundle is the whole question,
+   and a log that only says "not a Node" cannot answer it. */
+function describe(v){
+ var d;
+ try{
+  if(v===null)return 'null';
+  if(v===undefined)return 'undefined';
+  d=typeof v;
+  if(d!=='object'&&d!=='function')return d+' '+String(v).slice(0,20);
+  d='object';
+  try{if(v.constructor&&v.constructor.name)d=String(v.constructor.name);}catch(e){}
+  d+=' nodeType='+(typeof v.nodeType)+':'+v.nodeType;
+  if(v.tagName!==undefined)d+=' tag='+v.tagName;
+  if(v.nodeName!==undefined)d+=' name='+v.nodeName;
+ }catch(e2){d='<unreadable>';}
+ return d;}
 function needNode(v,fn,which){
  if(!isNode(v))throw new TypeError(
-  "Failed to execute '"+fn+"': parameter "+which+" is not of type 'Node'.");}
+  "Failed to execute '"+fn+"': parameter "+which+
+  " is not of type 'Node'. Got "+describe(v)+".");}
 /* A node cannot contain itself or anything it is inside. */
 function containsNode(parent,node){
  for(var n=parent;n;n=n.parentNode)if(n===node)return true;
@@ -3728,5 +3746,86 @@ function preInsert(parent,node,child,fn){
   if(child.parentNode!==this)throw new DOMException(
    'The node to be removed is not a child of this node.','NotFoundError');
   return removeC.call(this,child);};
+})();
+
+/* --- instanceof, told apart ----------------------------------------------
+ * Every interface name was the same constructor, so an anchor was an
+ * HTMLInputElement and a DocumentFragment at the same time and nothing
+ * that branches on instanceof could get the right answer. YouTube's
+ * custom element polyfill takes a different path for a fragment than for
+ * an element, and took the fragment one for everything.
+ *
+ * Each name gets its own function, still with Node.prototype as its
+ * prototype -- a polyfill that patches HTMLAnchorElement.prototype is
+ * still patching the one shared prototype, which is what the rest of
+ * this file depends on -- and a hasInstance that asks what the node
+ * actually is. HTMLElement itself stays CEBase, because a custom
+ * element class extends it and would inherit any test put there.
+ */
+(function(){
+ var NODE_TYPES=[1,2,3,4,7,8,9,10,11];
+ /* Element is a global, and this loop replaces it, so hold the original
+    to compare against or every name after the first is skipped. */
+ var WAS=W.Element;
+ function iface(test){
+  var F=function(){return CEBase.apply(this,arguments);};
+  F.prototype=P;
+  try{Object.defineProperty(F,Symbol.hasInstance,
+   {configurable:true,value:test});}catch(e){}
+  return F;}
+ function ofType(types){
+  return function(v){
+   return !!v&&typeof v==='object'&&types.indexOf(v.nodeType)>=0;};}
+ function ofTag(tags){
+  tags=' '+tags+' ';
+  return function(v){
+   return !!v&&typeof v==='object'&&v.nodeType===1&&
+    tags.indexOf(' '+v.tagName+' ')>=0;};}
+ var byType={
+  Node:NODE_TYPES,Element:[1],
+  CharacterData:[3,4,7,8],Text:[3],Comment:[8],CDATASection:[4],
+  ProcessingInstruction:[7],DocumentFragment:[11]};
+ var byTag={
+  SVGElement:' SVG CIRCLE CLIPPATH DEFS ELLIPSE FOREIGNOBJECT G IMAGE LINE '+
+   'LINEARGRADIENT MARKER MASK PATH PATTERN POLYGON POLYLINE RADIALGRADIENT '+
+   'RECT STOP SYMBOL TEXTPATH TSPAN USE ',
+  SVGSVGElement:'SVG',
+  HTMLAnchorElement:'A',HTMLAreaElement:'AREA',HTMLAudioElement:'AUDIO',
+  HTMLBaseElement:'BASE',HTMLBodyElement:'BODY',HTMLBRElement:'BR',
+  HTMLButtonElement:'BUTTON',HTMLCanvasElement:'CANVAS',HTMLDataElement:'DATA',
+  HTMLDataListElement:'DATALIST',HTMLDetailsElement:'DETAILS',
+  HTMLDialogElement:'DIALOG',HTMLDivElement:'DIV',HTMLDListElement:'DL',
+  HTMLEmbedElement:'EMBED',HTMLFieldSetElement:'FIELDSET',
+  HTMLFontElement:'FONT',HTMLFormElement:'FORM',HTMLFrameElement:'FRAME',
+  HTMLFrameSetElement:'FRAMESET',HTMLHeadElement:'HEAD',
+  HTMLHeadingElement:'H1 H2 H3 H4 H5 H6',HTMLHRElement:'HR',
+  HTMLHtmlElement:'HTML',HTMLIFrameElement:'IFRAME',HTMLImageElement:'IMG',
+  HTMLInputElement:'INPUT',HTMLLabelElement:'LABEL',HTMLLegendElement:'LEGEND',
+  HTMLLIElement:'LI',HTMLLinkElement:'LINK',HTMLMapElement:'MAP',
+  HTMLMarqueeElement:'MARQUEE',HTMLMediaElement:'AUDIO VIDEO',
+  HTMLMenuElement:'MENU',HTMLMetaElement:'META',HTMLMeterElement:'METER',
+  HTMLModElement:'DEL INS',HTMLObjectElement:'OBJECT',HTMLOListElement:'OL',
+  HTMLOptGroupElement:'OPTGROUP',HTMLOptionElement:'OPTION',
+  HTMLOutputElement:'OUTPUT',HTMLParagraphElement:'P',HTMLParamElement:'PARAM',
+  HTMLPictureElement:'PICTURE',HTMLPreElement:'PRE LISTING XMP',
+  HTMLProgressElement:'PROGRESS',HTMLQuoteElement:'BLOCKQUOTE Q',
+  HTMLScriptElement:'SCRIPT',HTMLSelectElement:'SELECT',HTMLSlotElement:'SLOT',
+  HTMLSourceElement:'SOURCE',HTMLSpanElement:'SPAN',HTMLStyleElement:'STYLE',
+  HTMLTableCaptionElement:'CAPTION',HTMLTableCellElement:'TD TH',
+  HTMLTableColElement:'COL COLGROUP',HTMLTableElement:'TABLE',
+  HTMLTableRowElement:'TR',HTMLTableSectionElement:'TBODY TFOOT THEAD',
+  HTMLTemplateElement:'TEMPLATE',HTMLTextAreaElement:'TEXTAREA',
+  HTMLTimeElement:'TIME',HTMLTitleElement:'TITLE',HTMLTrackElement:'TRACK',
+  HTMLUListElement:'UL',HTMLVideoElement:'VIDEO'};
+ var k;
+ for(k in byType)if(W[k]===WAS||W[k]===CEBase)W[k]=iface(ofType(byType[k]));
+ for(k in byTag)if(W[k]===WAS||W[k]===CEBase)W[k]=iface(ofTag(byTag[k]));
+ /* An unknown element is one whose tag is not in the HTML vocabulary at
+    all -- <section> and <strong> are plain HTMLElements, not unknown. */
+ if(W.HTMLUnknownElement===WAS||W.HTMLUnknownElement===CEBase){
+  W.HTMLUnknownElement=iface(function(v){
+   return !!v&&typeof v==='object'&&v.nodeType===1&&
+    HTML_TAGS.indexOf(' '+v.tagName+' ')<0&&
+    byTag.SVGElement.indexOf(' '+v.tagName+' ')<0;});}
 })();
 })();
