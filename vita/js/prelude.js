@@ -519,8 +519,61 @@ function scratchDocument(title){var html=D.createElement('html'),head=D.createEl
 D.implementation={createHTMLDocument:function(t){return scratchDocument(t);},createDocument:function(){return scratchDocument('');},hasFeature:function(){return true;}};
 D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';
 window.NodeFilter={FILTER_ACCEPT:1,FILTER_REJECT:2,FILTER_SKIP:3,SHOW_ALL:0xFFFFFFFF,SHOW_ELEMENT:1,SHOW_TEXT:4,SHOW_COMMENT:128,SHOW_DOCUMENT:256};
-D.createTreeWalker=function(root,what,filter){what=what===undefined?0xFFFFFFFF:what;var fn=filter&&(typeof filter==='function'?filter:filter.acceptNode);function ok(n){if(n.nodeType===9)return false;if(!((1<<(n.nodeType-1))&what))return false;return fn?fn(n)===1:true;}function next(n){if(n.firstChild)return n.firstChild;while(n&&n!==root){if(n.nextSibling)return n.nextSibling;n=n.parentNode;}return null;}return {root:root,currentNode:root,nextNode:function(){var n=next(this.currentNode);while(n&&!ok(n))n=next(n);if(n)this.currentNode=n;return n;},firstChild:function(){var n=this.currentNode.firstChild;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},nextSibling:function(){var n=this.currentNode.nextSibling;while(n&&!ok(n))n=n.nextSibling;if(n)this.currentNode=n;return n;},parentNode:function(){var n=this.currentNode.parentNode;if(n&&n!==root&&ok(n)){this.currentNode=n;return n;}return null;}};};
-D.createNodeIterator=function(root,what,filter){var w=D.createTreeWalker(root,what,filter);return {nextNode:function(){return w.nextNode();},detach:function(){}};};
+D.createTreeWalker=function(root,what,filter){
+ what=what===undefined?0xFFFFFFFF:what;
+ var fn=filter&&(typeof filter==='function'?filter:filter.acceptNode);
+ /* 1 accept, 2 reject the node and everything under it, 3 skip the node
+    but keep walking into it. Rejecting used to skip only the node, so a
+    filter written to prune a subtree saw all of it anyway. */
+ function verdict(n){
+  if(n.nodeType===9)return 2;
+  if(!((1<<(n.nodeType-1))&what))return 3;
+  if(!fn)return 1;
+  var v=fn(n);
+  return v===2?2:(v===3?3:1);}
+ function next(n,skipKids){
+  if(!skipKids&&n.firstChild)return n.firstChild;
+  while(n&&n!==root){
+   if(n.nextSibling)return n.nextSibling;
+   n=n.parentNode;}
+  return null;}
+ return {root:root,currentNode:root,whatToShow:what,filter:filter||null,
+  nextNode:function(){
+   var n=this.currentNode,v;
+   for(;;){
+    n=next(n,false);
+    if(!n)return null;
+    v=verdict(n);
+    if(v===1){this.currentNode=n;return n;}
+    if(v===2){n=next(n,true);if(!n)return null;
+     v=verdict(n);
+     if(v===1){this.currentNode=n;return n;}}}},
+  previousNode:function(){
+   var n=this.currentNode.previousSibling||this.currentNode.parentNode;
+   if(!n||n===this.root.parentNode)return null;
+   this.currentNode=n;return n;},
+  firstChild:function(){
+   var n=this.currentNode.firstChild;
+   while(n&&verdict(n)!==1)n=n.nextSibling;
+   if(n)this.currentNode=n;return n||null;},
+  lastChild:function(){
+   var n=this.currentNode.lastChild;
+   while(n&&verdict(n)!==1)n=n.previousSibling;
+   if(n)this.currentNode=n;return n||null;},
+  nextSibling:function(){
+   var n=this.currentNode.nextSibling;
+   while(n&&verdict(n)!==1)n=n.nextSibling;
+   if(n)this.currentNode=n;return n||null;},
+  previousSibling:function(){
+   var n=this.currentNode.previousSibling;
+   while(n&&verdict(n)!==1)n=n.previousSibling;
+   if(n)this.currentNode=n;return n||null;},
+  parentNode:function(){
+   var n=this.currentNode.parentNode;
+   if(n&&n!==root&&verdict(n)===1){this.currentNode=n;return n;}
+   return null;}};};
+/* createNodeIterator is defined further down, with the filter and the
+   starting position the specification gives it. */
 /* The base every relative URL in the document resolves against: the
  * first <base href>, or the document's own address. Read with
  * getAttribute, never through the href property, which resolves against
@@ -533,7 +586,7 @@ Object.defineProperty(D,'baseURI',{configurable:true,get:function(){
 }});
 Object.defineProperty(D,'URL',{configurable:true,get:function(){return location.href;}});Object.defineProperty(D,'documentURI',{configurable:true,get:function(){return location.href;}});
 Object.defineProperty(D,'activeElement',{configurable:true,get:function(){return D.body;}});
-D.createComment=function(t){return D.createTextNode('');};D.write=D.writeln=function(){};
+/* createComment is a real comment node from qjs.c now. */D.write=D.writeln=function(){};
 D.getElementsByName=function(n){return D.querySelectorAll('[name='+n+']').filter(function(e){return e.getAttribute('name')===n;});};
 D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};
 ['onload','onreadystatechange','onclick','onkeydown','onkeyup','onmousemove','ontouchstart'].forEach(function(h){Object.defineProperty(D,h,{configurable:true,get:function(){return D['__'+h]||null;},set:function(f){D['__'+h]=f;if(typeof f==='function')D.addEventListener(h.slice(2),f);}});});
@@ -1481,6 +1534,9 @@ Object.defineProperty(P,'elements',{configurable:true,get:function(){
  l.item=function(i){return this[i]||null;};
  return l;}});
 Object.defineProperty(P,'length',{configurable:true,get:function(){
+ /* On character data it is the number of characters, which is what code
+    walking text reads before it slices. */
+ if(this.nodeType===3||this.nodeType===8)return String(this.textContent||'').length;
  var t=this.tagName;
  if(t==='FORM')return this.elements.length;
  if(t==='SELECT')return this.options.length;
@@ -2079,11 +2135,23 @@ W.PointerEvent.prototype.getPredictedEvents=function(){return [];};
   w.previousNode=function(){var n=this.currentNode.previousSibling||this.currentNode.parentNode;
    if(n&&n!==this.root.parentNode)this.currentNode=n;else return null;return n;};
   return w;};
+ /* An iterator starts before the root, so its first nextNode is the root
+    itself when the filter takes it -- a walker's first is the root's
+    first child, and delegating skipped it. */
  D.createNodeIterator=function(root,what,filter){
   var w=D.createTreeWalker(root,what,filter);
+  var started=false;
+  what=what===undefined?0xFFFFFFFF:what;
+  var fn=filter&&(typeof filter==='function'?filter:filter.acceptNode);
+  function takes(n){
+   if(!((1<<(n.nodeType-1))&what))return false;
+   return fn?fn(n)===1:true;}
   return {root:root,whatToShow:w.whatToShow,filter:filter||null,
    referenceNode:root,pointerBeforeReferenceNode:true,
-   nextNode:function(){var n=w.nextNode();if(n)this.referenceNode=n;return n;},
+   nextNode:function(){
+    if(!started){started=true;this.pointerBeforeReferenceNode=false;
+     if(takes(root)){this.referenceNode=root;return root;}}
+    var n=w.nextNode();if(n)this.referenceNode=n;return n;},
    previousNode:function(){var n=w.previousNode();if(n)this.referenceNode=n;return n;},
    detach:function(){}};};
 })();

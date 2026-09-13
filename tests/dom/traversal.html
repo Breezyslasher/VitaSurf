@@ -1,0 +1,35 @@
+<!DOCTYPE html><html><head><title>traversal</title></head><body>
+<pre id="out"></pre>
+<div id="r"><a>1</a>t<b><i>2</i></b></div>
+<script src="_probe.js"></script>
+<script>
+var r=document.getElementById('r');
+var w=document.createTreeWalker(r, NodeFilter.SHOW_ELEMENT);
+T('root', w.root===r);
+T('whatToShow', w.whatToShow);
+T('currentNode is root', w.currentNode===r);
+var seen=[];var n;
+while((n=w.nextNode()))seen.push(n.tagName);
+T('nextNode order', seen.join(','));
+T('currentNode after walk', w.currentNode.tagName);
+var w2=document.createTreeWalker(r, NodeFilter.SHOW_TEXT);
+var texts=[];while((n=w2.nextNode()))texts.push(n.data);
+T('text walk', texts.join('|'));
+var w3=document.createTreeWalker(r, NodeFilter.SHOW_ALL);
+var all=0;while(w3.nextNode())all++;
+T('show all count', all);
+var w4=document.createTreeWalker(r, NodeFilter.SHOW_ELEMENT, function(nd){
+  return nd.tagName==='B' ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;});
+var f=[];while((n=w4.nextNode()))f.push(n.tagName);
+T('filtered', f.join(','));
+T('SHOW_ELEMENT', NodeFilter.SHOW_ELEMENT);
+T('SHOW_TEXT', NodeFilter.SHOW_TEXT);
+T('SHOW_COMMENT', NodeFilter.SHOW_COMMENT);
+T('FILTER_ACCEPT', NodeFilter.FILTER_ACCEPT);
+var it=document.createNodeIterator(r, NodeFilter.SHOW_ELEMENT);
+var i1=it.nextNode();
+T('iterator first', i1===r ? 'root' : i1.tagName);
+var iseen=[];while((n=it.nextNode()))iseen.push(n.tagName);
+T('iterator rest', iseen.join(','));
+T('iterator root', it.root===r);
+</script></body></html>

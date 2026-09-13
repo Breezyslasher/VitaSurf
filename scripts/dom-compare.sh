@@ -24,6 +24,23 @@ NSMONKEY="${NSMONKEY:-$ROOT/deps/netsurf/nsmonkey}"
 if [ ! -x "$CHROME" ]; then echo "no browser at $CHROME" >&2; exit 2; fi
 if [ ! -x "$NSMONKEY" ]; then echo "no monkey frontend at $NSMONKEY" >&2; exit 2; fi
 
+# A library built before the patch that is meant to be in it makes the
+# harness test something the device does not run. That happened: a text
+# node crash reproduced here and nowhere else, because libdom.a predated
+# the patch that fixes it. Say so rather than report the difference.
+for d in "$ROOT"/deps/lib*; do
+    lib="$ROOT/out/native/lib/$(basename "$d").a"
+    [ -f "$lib" ] || continue
+    newest=$(cd "$d" && git diff --name-only 2>/dev/null |
+        while read -r f; do [ -f "$f" ] && stat -c %Y "$f"; done |
+        sort -rn | head -1)
+    [ -n "$newest" ] || continue
+    if [ "$newest" -gt "$(stat -c %Y "$lib")" ]; then
+        echo "warning: $(basename "$d") has patched sources newer than" \
+             "$lib -- rebuild it or this compares against the wrong code" >&2
+    fi
+done
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 

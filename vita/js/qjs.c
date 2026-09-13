@@ -536,7 +536,21 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL) return JS_EXCEPTION;
 	d = to_dom_string(s != NULL ? s : "");
 	if (d != NULL) {
-		dom_node_set_text_content(node, d);
+		dom_node_type type = DOM_ELEMENT_NODE;
+
+		dom_node_get_node_type(node, &type);
+		/*
+		 * libdom's generic setter empties the node and appends a
+		 * text node as a child, and a text node cannot have one:
+		 * textContent = x on one aborted the browser outright.
+		 * Character data takes its value directly.
+		 */
+		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
+		    type == DOM_CDATA_SECTION_NODE) {
+			dom_characterdata_set_data((dom_characterdata *)node, d);
+		} else {
+			dom_node_set_text_content(node, d);
+		}
 		dom_string_unref(d);
 		mark_dirty(ctx);
 	}
@@ -1506,6 +1520,38 @@ static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+/*
+ * A real comment node. The prelude used to hand back an empty text node,
+ * and every framework that marks an insertion point with a comment --
+ * React, Vue and lit all do -- was writing its markers into the text of
+ * the page instead of into a node it could find again.
+ */
+static JSValue doc_create_comment(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_document *doc = thread_document(thread);
+	const char *text;
+	dom_string *d;
+	struct dom_comment *node = NULL;
+	JSValue r;
+
+	(void)this_val;
+	if (doc == NULL) return JS_NULL;
+	text = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+	d = to_dom_string(text != NULL ? text : "");
+	if (d == NULL) {
+		if (text) JS_FreeCString(ctx, text);
+		return JS_NULL;
+	}
+	dom_document_create_comment(doc, d, &node);
+	dom_string_unref(d);
+	if (text) JS_FreeCString(ctx, text);
+	r = wrap_node(ctx, (struct dom_node *)node);
+	if (node != NULL) dom_node_unref((struct dom_node *)node);
+	return r;
+}
+
 static JSValue doc_create_document_fragment(JSContext *ctx, JSValueConst this_val,
 					    int argc, JSValueConst *argv)
 {
@@ -1681,6 +1727,7 @@ static const JSCFunctionListEntry document_proto[] = {
 	JS_CFUNC_DEF("getElementsByTagName", 1, doc_get_elements_by_tag_name),
 	JS_CFUNC_DEF("createElement", 1, doc_create_element),
 	JS_CFUNC_DEF("createTextNode", 1, doc_create_text_node),
+	JS_CFUNC_DEF("createComment", 1, doc_create_comment),
 	JS_CFUNC_DEF("createDocumentFragment", 0, doc_create_document_fragment),
 	JS_CFUNC_DEF("addEventListener", 2, doc_add_event_listener),
 	JS_CFUNC_DEF("removeEventListener", 2, doc_remove_event_listener),
