@@ -672,13 +672,36 @@ D.createEvent=function(t){
  return ev;};D.dispatchEvent=function(e){return __vitaDispatch(null,e);};D.hasFocus=function(){return true;};
 /* The qualified name has to satisfy the same namespace rules as an
    attribute's before an element is made from it. */
+/* createElement takes a Name, in which a colon is an ordinary name
+   character: "f:o:o" and "foo:" are element names, not qualified ones.
+   createElementNS takes a QName and splits on the colon first. */
+function badName(){
+ return new DOMException('The string contains invalid characters.',
+                         'InvalidCharacterError');}
+function checkLocalName(q){
+ q=String(q);
+ if(q===''||!(nameStartOk(q.charCodeAt(0))||q.charCodeAt(0)===0x3a))
+  throw badName();
+ for(var i=1;i<q.length;i++)
+  if(!(namePartOk(q.charCodeAt(i))||q.charCodeAt(i)===0x3a))throw badName();}
+function checkElementName(q){
+ var parts=String(q).split(':');
+ if(parts.length===1){
+  if(!nameOk(parts[0]))throw badName();
+  return;}
+ if(parts.length>2||!nameOk(parts[0])||!nameOk(parts[1]))throw badName();}
 (function(){
- var real=D.createElementNS;
+ var real=D.createElementNS,plain=D.createElement;
  D.createElementNS=function(ns,t){
   needArgs(arguments.length,2,'createElementNS');
+  checkElementName(t);
   nsExtract(ns,t,'createElementNS');
   var el=typeof real==='function'?real.call(D,ns,t):null;
-  return el||D.createElement(t);};})();
+  return el||plain.call(D,t);};
+ D.createElement=function(t,o){
+  needArgs(arguments.length,1,'createElement');
+  checkLocalName(t);
+  return plain.apply(D,arguments);};})();
 D.createRange=function(){var r={startContainer:D.body,endContainer:D.body,startOffset:0,endOffset:0,collapsed:true,
  commonAncestorContainer:D.body,
  setStart:function(n,o){this.startContainer=n;this.startOffset=o;},setEnd:function(n,o){this.endContainer=n;this.endOffset=o;},
@@ -2301,6 +2324,21 @@ function checkAttrName(n){
    prefix could be used with none. */
 var XML_NS='http://www.w3.org/XML/1998/namespace',
     XMLNS_NS='http://www.w3.org/2000/xmlns/';
+/* The XML Name production, relaxed the way browsers relax it: below
+   U+00C0 only a letter or an underscore may start a name and only a
+   letter, digit, hyphen, stop or underscore may continue it; from
+   U+00C0 up everything is allowed. That is what makes "1foo", "-foo",
+   ".foo" and "fo o" invalid and "\u0BC6foo" valid. A colon is handled
+   by the caller, which splits the prefix off first. */
+function nameStartOk(c){
+ return (c>=0x61&&c<=0x7a)||(c>=0x41&&c<=0x5a)||c===0x5f||c>=0xc0;}
+function namePartOk(c){
+ return nameStartOk(c)||(c>=0x30&&c<=0x39)||c===0x2d||c===0x2e||c===0xb7;}
+function nameOk(n){
+ if(n==='')return false;
+ if(!nameStartOk(n.charCodeAt(0)))return false;
+ for(var i=1;i<n.length;i++)if(!namePartOk(n.charCodeAt(i)))return false;
+ return true;}
 function nsExtract(ns,qname,what){
  qname=String(qname);
  ns=(ns===''||ns===null||ns===undefined)?null:String(ns);

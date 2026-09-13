@@ -68,8 +68,11 @@ if os.path.relpath(os.path.dirname(test), wptroot) == '.':
 up = '../' * depth
 src = open(test, encoding='utf-8', errors='replace').read()
 # the tests write these attributes both quoted and bare
-src = re.sub(r'\b(src|href)=(["\']?)/resources/',
-             lambda m: m.group(1) + '=' + m.group(2) + up + 'resources/', src)
+# Absolute paths into the vendored tree: /resources/ for the harness and
+# /common/ for the fixture documents tests point an iframe at.
+src = re.sub(r'\b(src|href)=(["\']?)/(resources|common)/',
+             lambda m: m.group(1) + '=' + m.group(2) + up + m.group(3) + '/',
+             src)
 # One async test that never finishes -- typically one waiting on an
 # iframe's load event -- stops testharness reporting ANY result for the
 # file, and the whole file then reads as zero passes. The browser rides
