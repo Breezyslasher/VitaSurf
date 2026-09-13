@@ -1519,23 +1519,39 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 		child = NULL;
 		dom_node_get_first_child(node, &child);
 	}
-	/* migrate fragment's body children into the target */
+	/*
+	 * Move what was parsed into the target, from the head as well as
+	 * the body. The fragment parser has no context element, so it
+	 * parses as a whole page: a leading script, and any style, link,
+	 * meta or title, land in the head. Taking only the body's children
+	 * dropped them, so el.innerHTML = "<style>..</style><p>" lost the
+	 * style and insertAdjacentHTML lost a leading script entirely.
+	 */
 	dom_node_get_first_child(fragment, &htmlnode);
 	if (!node_is_element(htmlnode)) goto out;
-	dom_element_get_elements_by_tag_name(htmlnode, corestring_dom_BODY, &bodies);
-	if (bodies == NULL) goto out;
-	dom_nodelist_item(bodies, 0, &body);
-	if (body == NULL) goto out;
-	dom_node_get_first_child(body, &child);
-	while (child != NULL) {
-		struct dom_node *cref = NULL;
-		dom_node_remove_child(body, child, &cref);
-		if (cref) dom_node_unref(cref);
-		dom_node_append_child(node, child, &cref);
-		if (cref) dom_node_unref(cref);
-		dom_node_unref(child);
-		child = NULL;
-		dom_node_get_first_child(body, &child);
+	{
+		struct dom_node *section = NULL;
+
+		dom_node_get_first_child(htmlnode, &section);
+		while (section != NULL) {
+			struct dom_node *next = NULL;
+
+			dom_node_get_first_child(section, &child);
+			while (child != NULL) {
+				struct dom_node *cref = NULL;
+
+				dom_node_remove_child(section, child, &cref);
+				if (cref) dom_node_unref(cref);
+				dom_node_append_child(node, child, &cref);
+				if (cref) dom_node_unref(cref);
+				dom_node_unref(child);
+				child = NULL;
+				dom_node_get_first_child(section, &child);
+			}
+			dom_node_get_next_sibling(section, &next);
+			dom_node_unref(section);
+			section = next;
+		}
 	}
 out:
 	if (parser) dom_hubbub_parser_destroy(parser);
@@ -1557,7 +1573,13 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 
 	if (node == NULL) return JS_EXCEPTION;
 	before = children_snapshot(ctx, node);
-	s = JS_ToCStringLen(ctx, &len, val);
+	/* innerHTML is [LegacyNullToEmptyString]: null empties the element
+	 * rather than writing the four letters of "null" into it. */
+	if (JS_IsNull(val)) {
+		s = JS_ToCStringLen(ctx, &len, JS_NewString(ctx, ""));
+	} else {
+		s = JS_ToCStringLen(ctx, &len, val);
+	}
 	if (s != NULL) {
 		set_inner_html(node, s, len);
 		JS_FreeCString(ctx, s);

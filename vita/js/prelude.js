@@ -455,15 +455,26 @@ P.getAttributeNode=function(n){var v=this.getAttribute(n);return v===null?null:{
    side now, which asks libdom for the namespace it was given. */
 P.getElementsByTagNameNS=function(ns,t){return this.getElementsByTagName(t);};
 P.insertAdjacentElement=function(where,el){
- switch(String(where).toLowerCase()){
-  case 'beforebegin':P.before.call(this,el);break;
-  case 'afterbegin':P.prepend.call(this,el);break;
-  case 'beforeend':this.appendChild(el);break;
-  case 'afterend':P.after.call(this,el);break;
- }
+ needArgs(arguments.length,2,'insertAdjacentElement');
+ var w=String(where).toLowerCase(),parent=this.parentNode;
+ if(w!=='beforebegin'&&w!=='afterbegin'&&w!=='beforeend'&&w!=='afterend')
+  throw new DOMException("The value provided ('"+String(where)+
+   "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or "+
+   "'afterEnd'.",'SyntaxError');
+ if(w==='beforebegin'||w==='afterend'){
+  /* with no parent there is nowhere to put it, and the answer is null
+     rather than an error */
+  if(parent===null||parent===undefined)return null;
+  if(w==='beforebegin')parent.insertBefore(el,this);
+  else parent.insertBefore(el,this.nextSibling);
+  return el;}
+ if(w==='afterbegin')this.insertBefore(el,this.firstChild);
+ else this.appendChild(el);
  return el;
 };
-P.insertAdjacentText=function(where,t){return P.insertAdjacentElement.call(this,where,D.createTextNode(String(t)));};
+P.insertAdjacentText=function(where,t){
+ needArgs(arguments.length,2,'insertAdjacentText');
+ P.insertAdjacentElement.call(this,where,D.createTextNode(String(t)));};
 /* The rest of the element surface. Every one of these was reached by a
  * real page: catalyst calls toggleAttribute as the first thing in its
  * connectedCallback, and a missing method there is not a gap that
@@ -521,10 +532,62 @@ P.animate=function(){return new FinishedAnimation();};
 P.getAnimations=function(){return [];};
 window.Animation=FinishedAnimation;
 
+/* Parse in the context that will hold the markup, and insert the whole
+ * fragment at once. Inserting the parsed children one at a time through
+ * prepend or after put them in backwards, and parsing everything inside
+ * a div lost a table row: <tr> outside a table is dropped by the HTML
+ * parser. */
+function parseInContext(host,html){
+ var tag=host&&host.tagName,tmp,f,wrap=null;
+ if(tag==='TABLE')wrap='table';
+ else if(tag==='TBODY'||tag==='THEAD'||tag==='TFOOT')wrap='tbody';
+ else if(tag==='TR')wrap='tr';
+ else if(tag==='SELECT'||tag==='OPTGROUP')wrap='select';
+ else if(tag==='COLGROUP')wrap='colgroup';
+ f=D.createDocumentFragment();
+ if(wrap===null){
+  tmp=D.createElement(tag&&tag!=='HTML'?tag:'div');
+  tmp.innerHTML=String(html);
+ }else{
+  /* the parser only keeps a row or a cell inside the table it belongs
+     to, so build the table and dig back down to the same depth */
+  var outer=D.createElement('div'),path;
+  if(wrap==='table'){outer.innerHTML='<table>'+String(html)+'</table>';path=['TABLE'];}
+  else if(wrap==='tbody'){outer.innerHTML='<table><tbody>'+String(html)+
+   '</tbody></table>';path=['TABLE','TBODY'];}
+  else if(wrap==='tr'){outer.innerHTML='<table><tbody><tr>'+String(html)+
+   '</tr></tbody></table>';path=['TABLE','TBODY','TR'];}
+  else if(wrap==='colgroup'){outer.innerHTML='<table><colgroup>'+String(html)+
+   '</colgroup></table>';path=['TABLE','COLGROUP'];}
+  else{outer.innerHTML='<select>'+String(html)+'</select>';path=['SELECT'];}
+  tmp=outer;
+  for(var pi=0;pi<path.length;pi++){
+   var next=null,cc=tmp.childNodes,ci;
+   for(ci=0;ci<cc.length;ci++)
+    if(cc[ci].nodeType===1&&cc[ci].tagName===path[pi]){next=cc[ci];break;}
+   if(!next)break;
+   tmp=next;}
+ }
+ while(tmp.firstChild)f.appendChild(tmp.firstChild);
+ return f;}
 P.insertAdjacentHTML=function(where,html){
- var tmp=D.createElement('div');tmp.innerHTML=String(html);
- var kids=tmp.childNodes.slice();
- for(var i=0;i<kids.length;i++)P.insertAdjacentElement.call(this,where,kids[i]);
+ needArgs(arguments.length,2,'insertAdjacentHTML');
+ var w=String(where).toLowerCase(),parent=this.parentNode,f;
+ if(w!=='beforebegin'&&w!=='afterbegin'&&w!=='beforeend'&&w!=='afterend')
+  throw new DOMException("The value provided ('"+String(where)+
+   "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or "+
+   "'afterEnd'.",'SyntaxError');
+ if(w==='beforebegin'||w==='afterend'){
+  if(parent===null||parent===undefined||parent.nodeType===9)
+   throw new DOMException(
+    'The element has no parent.','NoModificationAllowedError');
+  f=parseInContext(parent,html);
+  if(w==='beforebegin')parent.insertBefore(f,this);
+  else parent.insertBefore(f,this.nextSibling);
+  return;}
+ f=parseInContext(this,html);
+ if(w==='afterbegin')this.insertBefore(f,this.firstChild);
+ else this.appendChild(f);
 };
 P.dispatchEvent=function(e){return __vitaDispatch(this,e);};P.getContext=function(){return null;};
 P.add=function(o,before){this.insertBefore(o,before||null);};
@@ -532,8 +595,20 @@ Object.defineProperty(P,'options',{configurable:true,get:function(){return this.
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){var o=this.options;for(var i=0;i<o.length;i++)if(o[i].hasAttribute('selected'))return i;return o.length?0:-1;},set:function(i){var o=this.options;for(var j=0;j<o.length;j++){if(j===i)o[j].setAttribute('selected','');else o[j].removeAttribute('selected');}}});
 Object.defineProperty(P,'selectedOptions',{configurable:true,get:function(){return this.options.filter(function(o){return o.hasAttribute('selected');});}});
 var D=document;
-D.querySelectorAll=function(s){var r=D.documentElement;return r?r.querySelectorAll(s):[];};
-D.querySelector=function(s){var r=D.documentElement;return r?r.querySelector(s):null;};
+/* A search from the document includes the document element itself,
+   which a search from inside it does not: document.querySelector('html')
+   was null. */
+D.querySelectorAll=function(s){
+ var r=D.documentElement,out;
+ if(!r)return [];
+ out=r.querySelectorAll(s);
+ try{if(r.matches(s))out=[r].concat(out);}catch(e){}
+ return out;};
+D.querySelector=function(s){
+ var r=D.documentElement;
+ if(!r)return null;
+ try{if(r.matches(s))return r;}catch(e){}
+ return r.querySelector(s);};
 D.getElementsByClassName=function(c){return D.querySelectorAll('.'+c);};
 Object.defineProperty(D,'head',{configurable:true,get:function(){var h=D.getElementsByTagName('head');return h.length?h[0]:null;}});
 Object.defineProperty(D,'forms',{configurable:true,get:function(){return D.getElementsByTagName('form');}});
@@ -3373,11 +3448,13 @@ Blob.prototype.textStream=function(){return null;};
   get:function(){return ser(this);},
   set:function(h){
    var p=this.parentNode;
-   if(!p)return;
-   var tmp=D.createElement('div');
-   tmp.innerHTML=String(h);
-   var kids=tmp.childNodes.slice();
-   for(var i=0;i<kids.length;i++)p.insertBefore(kids[i],this);
+   if(p===null||p===undefined)throw new DOMException(
+    'The element has no parent.','NoModificationAllowedError');
+   if(p.nodeType===9)throw hierarchy(
+    'The element is the document element.');
+   /* null means the empty string here, not the word */
+   var f=parseInContext(p,h===null?'':String(h));
+   p.insertBefore(f,this);
    p.removeChild(this);}});
  P.getHTML=function(){return this.innerHTML;};
  W.XMLSerializer.prototype.serializeToString=function(n){
@@ -3998,16 +4075,44 @@ function documentRules(parent,node,child,replacing){
  * actually is. HTMLElement itself stays CEBase, because a custom
  * element class extends it and would inherit any test put there.
  */
+/* The node type and document position constants, which were missing
+   from Node and from every node. Tests and pages alike write
+   Node.TEXT_NODE rather than 3. */
+var NODE_CONSTS={
+ ELEMENT_NODE:1,ATTRIBUTE_NODE:2,TEXT_NODE:3,CDATA_SECTION_NODE:4,
+ ENTITY_REFERENCE_NODE:5,ENTITY_NODE:6,PROCESSING_INSTRUCTION_NODE:7,
+ COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,
+ DOCUMENT_FRAGMENT_NODE:11,NOTATION_NODE:12,
+ DOCUMENT_POSITION_DISCONNECTED:1,DOCUMENT_POSITION_PRECEDING:2,
+ DOCUMENT_POSITION_FOLLOWING:4,DOCUMENT_POSITION_CONTAINS:8,
+ DOCUMENT_POSITION_CONTAINED_BY:16,
+ DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC:32};
+function stampConsts(o){
+ if(!o)return o;
+ Object.keys(NODE_CONSTS).forEach(function(k){
+  try{Object.defineProperty(o,k,{configurable:true,enumerable:true,
+   value:NODE_CONSTS[k]});}catch(e){}});
+ return o;}
+stampConsts(P);
 (function(){
  var NODE_TYPES=[1,2,3,4,7,8,9,10,11];
  /* Element is a global, and this loop replaces it, so hold the original
     to compare against or every name after the first is skipped. */
  var WAS=W.Element;
- function iface(test){
+ function iface(test,from){
   var F=function(){return CEBase.apply(this,arguments);};
   F.prototype=P;
+  /* keep whatever the old constructor carried -- Node.ELEMENT_NODE and
+     the rest of the node type constants live there, and code reads
+     them by name */
+  if(from)Object.getOwnPropertyNames(from).forEach(function(k){
+   if(k==='prototype'||k==='length'||k==='name'||k==='caller'||
+      k==='arguments')return;
+   try{Object.defineProperty(F,k,
+    Object.getOwnPropertyDescriptor(from,k));}catch(e){}});
   try{Object.defineProperty(F,Symbol.hasInstance,
    {configurable:true,value:test});}catch(e){}
+  stampConsts(F);
   return F;}
  function ofType(types){
   return function(v){
@@ -4053,15 +4158,18 @@ function documentRules(parent,node,child,replacing){
   HTMLTemplateElement:'TEMPLATE',HTMLTextAreaElement:'TEXTAREA',
   HTMLTimeElement:'TIME',HTMLTitleElement:'TITLE',HTMLTrackElement:'TRACK',
   HTMLUListElement:'UL',HTMLVideoElement:'VIDEO'};
+ stampConsts(CEBase);
  var k;
- for(k in byType)if(W[k]===WAS||W[k]===CEBase)W[k]=iface(ofType(byType[k]));
- for(k in byTag)if(W[k]===WAS||W[k]===CEBase)W[k]=iface(ofTag(byTag[k]));
+ for(k in byType)if(W[k]===WAS||W[k]===CEBase)
+  W[k]=iface(ofType(byType[k]),W[k]);
+ for(k in byTag)if(W[k]===WAS||W[k]===CEBase)
+  W[k]=iface(ofTag(byTag[k]),W[k]);
  /* An unknown element is one whose tag is not in the HTML vocabulary at
     all -- <section> and <strong> are plain HTMLElements, not unknown. */
  if(W.HTMLUnknownElement===WAS||W.HTMLUnknownElement===CEBase){
   W.HTMLUnknownElement=iface(function(v){
    return !!v&&typeof v==='object'&&v.nodeType===1&&
     HTML_TAGS.indexOf(' '+v.tagName+' ')<0&&
-    byTag.SVGElement.indexOf(' '+v.tagName+' ')<0;});}
+    byTag.SVGElement.indexOf(' '+v.tagName+' ')<0;},W.HTMLUnknownElement);}
 })();
 })();
