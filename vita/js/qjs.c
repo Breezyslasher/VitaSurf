@@ -101,6 +101,14 @@ struct jsthread {
 	uint64_t deadline_ms;     /**< when the running script must stop */
 	const char *current_script; /**< URL of the script js_exec is running */
 	struct js_listener *listeners; /**< event listeners, freed on close */
+	/**
+	 * document.readyState. It was the fixed string "interactive", and
+	 * the usual guard is
+	 *   if (document.readyState === 'loading') wait for DOMContentLoaded
+	 *   else run now
+	 * so a page's setup ran against a document still being parsed.
+	 */
+	const char *ready_state;
 	struct js_timer *timers;       /**< live timers, cancelled on close */
 	struct js_wrapper *wrappers[WRAPPER_BUCKETS];
 	struct js_xhr *xhrs;           /**< requests in flight */
@@ -1287,6 +1295,29 @@ static JSValue node_remove_event_listener(JSContext *ctx, JSValueConst this_val,
  * window and document listeners live on the document node: DOMContentLoaded
  * is dispatched there by NetSurf and load bubbles up to it from the body.
  */
+/* The same encoding, reachable from the prelude as a global. */
+static JSValue win_vita_encoding(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *enc = NULL;
+
+	(void)this_val; (void)argc; (void)argv;
+	if (thread != NULL && thread->htmlc != NULL) {
+		enc = thread->htmlc->encoding;
+	}
+	return enc != NULL ? JS_NewString(ctx, enc) : JS_NULL;
+}
+
+static JSValue doc_get_ready_state(JSContext *ctx, JSValueConst this_val)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	(void)this_val;
+	return JS_NewString(ctx, (thread != NULL && thread->ready_state != NULL)
+			    ? thread->ready_state : "loading");
+}
+
 static JSValue doc_add_event_listener(JSContext *ctx, JSValueConst this_val,
 				      int argc, JSValueConst *argv)
 {
@@ -1653,7 +1684,7 @@ static const JSCFunctionListEntry document_proto[] = {
 	JS_CFUNC_DEF("createDocumentFragment", 0, doc_create_document_fragment),
 	JS_CFUNC_DEF("addEventListener", 2, doc_add_event_listener),
 	JS_CFUNC_DEF("removeEventListener", 2, doc_remove_event_listener),
-	JS_PROP_STRING_DEF("readyState", "interactive", 0),
+	JS_CGETSET_DEF("readyState", doc_get_ready_state, NULL),
 };
 
 /* ------------------------------------------------------------------------ */
@@ -3312,6 +3343,8 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_style, "__vitaStyle", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaScroll",
 			  JS_NewCFunction(ctx, win_vita_scroll, "__vitaScroll", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaEncoding",
+			  JS_NewCFunction(ctx, win_vita_encoding, "__vitaEncoding", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaScrollTo",
 			  JS_NewCFunction(ctx, win_vita_scroll_to, "__vitaScrollTo", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaDispatch",
@@ -4277,6 +4310,11 @@ bool js_fire_event(jsthread *thread, const char *type,
 
 	if (thread == NULL || thread->closed) {
 		return true;
+	}
+	if (strcmp(type, "DOMContentLoaded") == 0) {
+		thread->ready_state = "interactive";
+	} else if (strcmp(type, "load") == 0) {
+		thread->ready_state = "complete";
 	}
 	if (strcmp(type, "load") == 0) {
 		vita_log("qjs: load event, runtime memory %u KB; "

@@ -5,3 +5,5 @@
 # does not belong in this file.
 
 forms.html | input value write | A control's value property is its current value and the value attribute is the default it resets to. Here the renderer draws the control from the attribute, so writing the property has to write the attribute or the user never sees what a script typed into the field. defaultValue and reset still return the original, which is remembered the first time the value is overwritten.
+
+collections.html | characterSet | A document that declares no encoding is decoded as UTF-8 here and as windows-1252 by the browser, which falls back by locale. That is the parser's default, not a binding: characterSet now reports whatever NetSurf actually decoded with, which is the honest answer either way.

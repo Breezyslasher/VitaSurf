@@ -129,33 +129,183 @@ P.getElementsByClassName=function(c){return this.querySelectorAll('.'+c);};
    down from the root, and the candidates come from getElementsByTagName,
    which is a single call into libdom. A tree walk in JavaScript over a
    document the size of a Wikipedia article costs seconds on the Vita. */
-var SIMPLE_RE=/^([a-zA-Z][\w-]*|\*)?(#[\w-]+)?((?:\.[\w-]+)*)((?:\[[^\]]*\])*)(?::[\w-]+(?:\([^)]*\))?)*$/;
+/* No pseudo part here on purpose. Matching a pseudo's optional nested
+   parentheses inside a repeated group backtracks exponentially, and
+   p:not(.y) was enough to exhaust the regexp engine. The compound is cut
+   at its first pseudo below, and the pseudos are read separately. */
+var SIMPLE_RE=/^([a-zA-Z][\w-]*|\*)?(#[\w-]+)?((?:\.[\w-]+)*)((?:\[[^\]]*\])*)$/;
 var ATTR_RE=/\[\s*([\w-]+)\s*(?:([~^$*|]?=)\s*("[^"]*"|'[^']*'|[^\]]*?)\s*)?\]/g;
-function parseSimple(sel){var m=SIMPLE_RE.exec(sel);if(!m)return null;
+/* The argument is matched as a run without parentheses rather than as an
+   alternation inside a star: the nested form backtracks exponentially and
+   took the regexp engine out on :not(.y). A pseudo whose argument itself
+   carries parentheses is left to the default below. */
+var PSEUDO_RE=/(::?)([\w-]+)(?:\(([^()]*)\))?/g;
+/* A pseudo-element selects no element, so a selector carrying one matches
+   nothing, which is what a browser returns for it. */
+var PSEUDO_ELEMENTS=' before after marker placeholder selection backdrop '+
+ 'first-line first-letter file-selector-button ';
+/* Where the pseudos start: the first colon outside brackets, parentheses
+   and quotes, so [href="a:b"] and :not(:first-child) both survive. */
+function pseudoStart(sel){
+ var depth=0,quote=null,i,ch;
+ for(i=0;i<sel.length;i++){
+  ch=sel.charAt(i);
+  if(quote!==null){if(ch===quote)quote=null;continue;}
+  if(ch==='"'||ch==="'"){quote=ch;continue;}
+  if(ch==='['||ch==='(')depth++;
+  else if(ch===']'||ch===')')depth--;
+  else if(ch===':'&&depth===0)return i;}
+ return -1;}
+function parseSimple(sel){
+ var cut=pseudoStart(sel);
+ var head=cut<0?sel:sel.slice(0,cut);
+ var tail=cut<0?'':sel.slice(cut);
+ var m=SIMPLE_RE.exec(head);if(!m)return null;
  var attrs=[],a;ATTR_RE.lastIndex=0;
  while(m[4]&&(a=ATTR_RE.exec(m[4]))){attrs.push({name:a[1],op:a[2]||null,val:a[3]===undefined?null:String(a[3]).replace(/^["']|["']$/g,'')});}
+ /* Read every pseudo out first, then compile the ones that take a
+    selector. PSEUDO_RE is shared and global, so recursing into compile
+    from inside its own exec loop resets lastIndex and the loop never
+    ends -- which is what :not(.y) did. */
+ var pseudos=[],raw=[],pm;PSEUDO_RE.lastIndex=0;
+ while(tail&&(pm=PSEUDO_RE.exec(tail))){
+  raw.push([pm[1],pm[2].toLowerCase(),pm[3]===undefined?null:pm[3]]);}
+ raw.forEach(function(r){
+  var name=r[1],arg=r[2],sub=null;
+  if(name==='not'||name==='is'||name==='matches'||name==='where'||name==='has'){
+   sub=compile(arg||'');}
+  pseudos.push({name:name,arg:arg,sub:sub,
+   element:r[0]==='::'||PSEUDO_ELEMENTS.indexOf(' '+name+' ')>=0});});
  return {tag:m[1]&&m[1]!=='*'?m[1].toUpperCase():null,id:m[2]?m[2].slice(1):null,
-  classes:m[3]?m[3].split('.').slice(1):[],attrs:attrs};}
+  classes:m[3]?m[3].split('.').slice(1):[],attrs:attrs,pseudos:pseudos};}
 function attrOk(el,q){var v=el.getAttribute(q.name);if(v===null)return false;if(!q.op)return true;
  switch(q.op){case '=':return v===q.val;case '^=':return v.indexOf(q.val)===0;
  case '$=':return q.val.length<=v.length&&v.indexOf(q.val,v.length-q.val.length)>=0;
  case '*=':return v.indexOf(q.val)>=0;
  case '~=':return (' '+v+' ').indexOf(' '+q.val+' ')>=0;
  case '|=':return v===q.val||v.indexOf(q.val+'-')===0;default:return false;}}
+function prevEl(n){for(n=n.previousSibling;n;n=n.previousSibling)if(n.nodeType===1)return n;return null;}
+function nextEl(n){for(n=n.nextSibling;n;n=n.nextSibling)if(n.nodeType===1)return n;return null;}
+function elIndex(el){var i=1,n=prevEl(el);while(n){i++;n=prevEl(n);}return i;}
+function elIndexEnd(el){var i=1,n=nextEl(el);while(n){i++;n=nextEl(n);}return i;}
+function typeIndex(el,back){var i=1,n=back?nextEl(el):prevEl(el);
+ while(n){if(n.tagName===el.tagName)i++;n=back?nextEl(n):prevEl(n);}return i;}
+/* an+b, and the odd and even that stand for 2n+1 and 2n. */
+function nthOk(arg,i){
+ arg=String(arg===null||arg===undefined?'':arg).replace(/\s+/g,'').toLowerCase();
+ if(arg==='odd')return i%2===1;
+ if(arg==='even')return i%2===0;
+ var m=/^([+-]?\d*)n([+-]\d+)?$/.exec(arg);
+ if(m){
+  var a=(m[1]===''||m[1]==='+')?1:(m[1]==='-'?-1:parseInt(m[1],10));
+  var b=m[2]?parseInt(m[2],10):0;
+  if(a===0)return i===b;
+  var k=(i-b)/a;
+  return k>=0&&k===Math.floor(k);}
+ var n=parseInt(arg,10);
+ return !isNaN(n)&&i===n;}
+function anyGroup(el,groups){
+ for(var i=0;i<groups.length;i++)if(matchAt(el,groups[i],groups[i].length-1))return true;
+ return false;}
+function hasDescendant(el,groups){
+ var c=el.childNodes,i;
+ for(i=0;i<c.length;i++){
+  if(c[i].nodeType!==1)continue;
+  if(anyGroup(c[i],groups)||hasDescendant(c[i],groups))return true;}
+ return false;}
+function pseudoOk(el,p){
+ if(p.element)return false;
+ switch(p.name){
+ case 'not':return !anyGroup(el,p.sub);
+ case 'is':case 'matches':case 'where':return anyGroup(el,p.sub);
+ case 'has':return hasDescendant(el,p.sub);
+ case 'first-child':return prevEl(el)===null;
+ case 'last-child':return nextEl(el)===null;
+ case 'only-child':return prevEl(el)===null&&nextEl(el)===null;
+ case 'first-of-type':return typeIndex(el)===1;
+ case 'last-of-type':return typeIndex(el,true)===1;
+ case 'only-of-type':return typeIndex(el)===1&&typeIndex(el,true)===1;
+ case 'nth-child':return nthOk(p.arg,elIndex(el));
+ case 'nth-last-child':return nthOk(p.arg,elIndexEnd(el));
+ case 'nth-of-type':return nthOk(p.arg,typeIndex(el));
+ case 'nth-last-of-type':return nthOk(p.arg,typeIndex(el,true));
+ case 'empty':
+  for(var i=0,c=el.childNodes;i<c.length;i++){
+   if(c[i].nodeType===1)return false;
+   if(c[i].nodeType===3&&String(c[i].textContent)!=='')return false;}
+  return true;
+ case 'root':return el===D.documentElement;
+ case 'checked':return el.hasAttribute('checked')||el.hasAttribute('selected');
+ case 'disabled':return el.hasAttribute('disabled');
+ case 'enabled':return !el.hasAttribute('disabled');
+ case 'required':return el.hasAttribute('required');
+ case 'optional':return !el.hasAttribute('required');
+ case 'read-only':return el.hasAttribute('readonly')||el.hasAttribute('disabled');
+ case 'read-write':return !el.hasAttribute('readonly')&&!el.hasAttribute('disabled');
+ case 'link':case 'any-link':
+  return (el.tagName==='A'||el.tagName==='AREA')&&el.hasAttribute('href');
+ case 'defined':return true;
+ case 'scope':return true;
+ /* Nothing here has a pointer, a focus ring or a history. */
+ case 'hover':case 'focus':case 'focus-within':case 'focus-visible':
+ case 'active':case 'visited':case 'target':case 'indeterminate':
+  return false;
+ default:return true;}}
 function matchSimple(el,q){if(el.nodeType!==1)return false;
  if(q.tag&&el.tagName!==q.tag)return false;
  if(q.id&&el.id!==q.id)return false;
  if(q.classes.length){var cn=el.className;if(!cn)return false;cn=' '+cn+' ';
   for(var i=0;i<q.classes.length;i++)if(cn.indexOf(' '+q.classes[i]+' ')<0)return false;}
  for(var j=0;j<q.attrs.length;j++)if(!attrOk(el,q.attrs[j]))return false;
+ for(var k=0;k<q.pseudos.length;k++)if(!pseudoOk(el,q.pseudos[k]))return false;
  return true;}
-function matchesCompound(el,parts){var i=parts.length-1;if(!matchSimple(el,parts[i]))return false;
- var n=el.parentNode;i--;
- while(i>=0&&n&&n.nodeType===1){if(matchSimple(n,parts[i]))i--;n=n.parentNode;}
- return i<0;}
-function compile(selector){return selector.split(',').map(function(s){
- return s.replace(/^\s+|\s+$/g,'').split(/\s*>\s*|\s+/).map(parseSimple);})
- .filter(function(p){return p.length&&p.every(function(x){return x;});});}
+/* Does el match parts[0..i], with parts[i] applying to el? The walk goes
+   right to left and backtracks, because a descendant or sibling step that
+   matches the nearest candidate is not always the one that lets the rest
+   of the selector match. */
+function matchAt(el,parts,i){
+ if(!matchSimple(el,parts[i].sel))return false;
+ if(i===0)return true;
+ var comb=parts[i].comb,n;
+ if(comb==='>'){n=el.parentNode;return !!n&&n.nodeType===1&&matchAt(n,parts,i-1);}
+ if(comb==='+'){n=prevEl(el);return !!n&&matchAt(n,parts,i-1);}
+ if(comb==='~'){for(n=prevEl(el);n;n=prevEl(n))if(matchAt(n,parts,i-1))return true;return false;}
+ for(n=el.parentNode;n&&n.nodeType===1;n=n.parentNode)if(matchAt(n,parts,i-1))return true;
+ return false;}
+/* A selector becomes a list of groups, each a list of compounds carrying
+   the combinator that joins it to the one before. The combinator used to
+   be split out and thrown away, so a child selector matched any
+   descendant and a sibling selector matched nothing at all. */
+/* Split on a character only where it is not inside brackets, parentheses
+   or quotes: a regex split breaks [rel~="b"] at the ~ and :not(a,b) at
+   the comma, and both are ordinary selectors. */
+function splitTop(s,chars,keep){
+ var out=[],buf='',depth=0,quote=null,i,ch;
+ for(i=0;i<s.length;i++){
+  ch=s.charAt(i);
+  if(quote!==null){buf+=ch;if(ch===quote)quote=null;continue;}
+  if(ch==='"'||ch==="'"){quote=ch;buf+=ch;continue;}
+  if(ch==='['||ch==='('){depth++;buf+=ch;continue;}
+  if(ch===']'||ch===')'){depth--;buf+=ch;continue;}
+  if(depth===0&&chars.indexOf(ch)>=0){
+   if(buf.replace(/^\s+|\s+$/g,'')!=='')out.push(buf.replace(/^\s+|\s+$/g,''));
+   if(keep&&ch!==' '&&ch!=='\t'&&ch!=='\n'&&ch!=='\r'&&ch!=='\f')out.push(ch);
+   buf='';continue;}
+  buf+=ch;}
+ if(buf.replace(/^\s+|\s+$/g,'')!=='')out.push(buf.replace(/^\s+|\s+$/g,''));
+ return out;}
+function compile(selector){
+ var out=[];
+ splitTop(String(selector),',',false).forEach(function(s){
+  var toks=splitTop(s,'>+~ \t\n\r\f',true),parts=[],comb=null,ok=true;
+  toks.forEach(function(t){
+   if(t==='>'||t==='+'||t==='~'){comb=t;return;}
+   var q=parseSimple(t);
+   if(q===null){ok=false;return;}
+   parts.push({sel:q,comb:comb});
+   comb=null;});
+  if(ok&&parts.length)out.push(parts);});
+ return out;}
 function isInside(root,el){if(root.nodeType===9)return true;var n=el.parentNode;while(n){if(n===root)return true;n=n.parentNode;}return false;}
 /* Whether the tree under root is the document's. getElementById and the
    C-side tree walk both search the document, so a detached subtree -- a
@@ -170,21 +320,23 @@ function select(root,sel,all){
  if(!groups.length)return out;
  var live=root.nodeType===9||inDocument(root);
  /* one group ending in an id: ask the document directly */
- if(live&&groups.length===1){var key=groups[0][groups[0].length-1];
-  if(key.id&&!key.classes.length){var el=document.getElementById(key.id);
-   if(el&&isInside(root,el)&&matchesCompound(el,groups[0]))out.push(el);
+ if(live&&groups.length===1){var key=groups[0][groups[0].length-1].sel;
+  if(key.id&&!key.classes.length&&!key.pseudos.length){
+   var el=document.getElementById(key.id);
+   if(el&&isInside(root,el)&&matchAt(el,groups[0],groups[0].length-1))out.push(el);
    return out;}}
  /* candidates for the right-hand simple selector of every group, found
     in one pass through the tree in C (qjs.c) */
- var keys=groups.map(function(g){return g[g.length-1];});
+ var keys=groups.map(function(g){return g[g.length-1].sel;});
  var cand=live?__vitaFind(root.nodeType===9?null:root,keys):walkElements(root,[]);
  for(var i=0;i<cand.length;i++){var c=cand[i];
-  for(var g=0;g<groups.length;g++){if(matchesCompound(c,groups[g])){out.push(c);break;}}
+  for(var g=0;g<groups.length;g++){
+   if(matchAt(c,groups[g],groups[g].length-1)){out.push(c);break;}}
   if(!all&&out.length)return out;}
  return out;}
 P.querySelectorAll=function(sel){return select(this,sel,true);};
 P.querySelector=function(sel){var r=select(this,sel,false);return r.length?r[0]:null;};
-P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchesCompound(el,g);});};
+P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchAt(el,g,g.length-1);});};
 P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))return n;n=n.parentNode;}return null;};
 /* The rest of the modern node surface. Polyfills walk these names and
  * read a descriptor for each, so a missing one is not a shim gap to fill
@@ -321,7 +473,8 @@ D.getElementsByClassName=function(c){return D.querySelectorAll('.'+c);};
 Object.defineProperty(D,'head',{configurable:true,get:function(){var h=D.getElementsByTagName('head');return h.length?h[0]:null;}});
 Object.defineProperty(D,'forms',{configurable:true,get:function(){return D.getElementsByTagName('form');}});
 Object.defineProperty(D,'images',{configurable:true,get:function(){return D.getElementsByTagName('img');}});
-Object.defineProperty(D,'links',{configurable:true,get:function(){return D.getElementsByTagName('a');}});
+/* links is defined further down: it is the a and area elements that
+   have an href, not every a. */
 Object.defineProperty(D,'scripts',{configurable:true,get:function(){return D.getElementsByTagName('script');}});
 D.defaultView=window;D.nodeType=9;D.nodeName='#document';D.documentMode=undefined;D.compatMode='CSS1Compat';D.hidden=false;D.visibilityState='visible';
 D.createEvent=function(t){return /custom/i.test(t)?new CustomEvent(''):new Event('');};D.dispatchEvent=function(e){return __vitaDispatch(null,e);};D.hasFocus=function(){return true;};
@@ -1564,8 +1717,12 @@ Object.defineProperty(D,'doctype',{configurable:true,get:function(){
  return {name:'html',publicId:'',systemId:'',nodeType:10};}});
 Object.defineProperty(D,'scrollingElement',{configurable:true,get:function(){return D.documentElement;}});
 Object.defineProperty(D,'lastModified',{configurable:true,get:function(){return new Date().toString();}});
+/* The document's encoding, as the parser settled it. __vitaEncoding is
+   the one NetSurf actually decoded with; a page with no declaration is
+   not UTF-8 just because we would like it to be. */
 ['characterSet','charset','inputEncoding'].forEach(function(k){
- Object.defineProperty(D,k,{configurable:true,get:function(){return 'UTF-8';}});});
+ Object.defineProperty(D,k,{configurable:true,get:function(){
+  return (typeof __vitaEncoding==='function'&&__vitaEncoding())||'UTF-8';}});});
 D.designMode='off';
 D.dir='';
 ['anchors','applets','embeds','plugins','scripts','forms','images','links'].forEach(function(k){
