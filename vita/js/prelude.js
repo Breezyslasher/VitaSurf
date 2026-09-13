@@ -926,7 +926,8 @@ W.WheelEvent=W.PointerEvent=W.DragEvent=MouseEventC;
 W.FocusEvent=UIEventC;W.InputEvent=UIEventC;
 if(!W.queueMicrotask)W.queueMicrotask=function(f){Promise.resolve().then(f);};
 if(!W.structuredClone)W.structuredClone=function(v){try{return JSON.parse(JSON.stringify(v));}catch(e){return v;}};
-W.MutationObserver=function(){};W.MutationObserver.prototype.observe=W.MutationObserver.prototype.disconnect=function(){};W.MutationObserver.prototype.takeRecords=function(){return [];};
+/* MutationObserver is implemented further down, against the mutations
+   qjs.c reports. */
 W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;
 W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};
 W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
@@ -3132,4 +3133,144 @@ W.__vitaReportRejection=function(reason,promise){
  try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
  try{__vitaDispatch(null,ev);}catch(e3){}
  return !!ev.defaultPrevented;};
+
+/* --- MutationObserver ---------------------------------------------------
+ * It was a constructor whose observe() did nothing, so every framework
+ * that waits to be told the DOM changed -- Polymer and ShadyDOM for slot
+ * and light-DOM changes, React and lit for their own trees -- waited for
+ * ever. qjs.c reports each mutation here, and only once a page has asked
+ * for one: a page that never uses an observer pays nothing.
+ *
+ * What it sees is the mutations made through the bindings, which is every
+ * mutation a script makes. It does not see the parser building the page,
+ * so an observer set up to wait for markup still streaming in will not
+ * fire for it. That is written down rather than papered over.
+ */
+function MutationRecord(type,target){
+ this.type=type;this.target=target;
+ this.addedNodes=[];this.removedNodes=[];
+ this.previousSibling=null;this.nextSibling=null;
+ this.attributeName=null;this.attributeNamespace=null;this.oldValue=null;}
+W.MutationRecord=MutationRecord;
+
+var MOlist=[],MOqueued=false;
+function MutationObserver(cb){
+ if(typeof cb!=='function')throw new DOMException(
+  'The callback provided as parameter 1 is not a function.','TypeError');
+ this._cb=cb;this._records=[];this._watch=[];}
+/* Does this observer want to hear about a change to target? */
+MutationObserver.prototype._wants=function(kind,target,name){
+ var i,w,n,depth;
+ for(i=0;i<this._watch.length;i++){
+  w=this._watch[i];
+  depth=0;
+  for(n=target;n;n=n.parentNode){
+   if(n===w.target){
+    if(depth>0&&!w.subtree)break;
+    if(kind==='childList'&&!w.childList)break;
+    if(kind==='attributes'){
+     if(!w.attributes)break;
+     if(w.filter&&w.filter.indexOf(String(name).toLowerCase())<0)break;}
+    if(kind==='characterData'&&!w.characterData)break;
+    return w;}
+   depth++;}}
+ return null;};
+MutationObserver.prototype.observe=function(target,options){
+ options=options||{};
+ if(!target||target.nodeType===undefined)throw new DOMException(
+  'parameter 1 is not of type Node.','TypeError');
+ /* The specification's own order: asking for old values or a filter
+    turns the category on when it was not mentioned, and contradicts it
+    when it was turned off explicitly. */
+ var attrs=options.attributes,cdata=options.characterData;
+ if(attrs===undefined&&
+    (options.attributeOldValue!==undefined||options.attributeFilter!==undefined))
+  attrs=true;
+ if(cdata===undefined&&options.characterDataOldValue!==undefined)
+  cdata=true;
+ if(!options.childList&&!attrs&&!cdata)
+  throw new DOMException(
+   "The options object must set at least one of 'attributes', "+
+   "'characterData', or 'childList' to true.",'TypeError');
+ if(options.attributeOldValue&&!attrs)
+  throw new DOMException(
+   "The options object may only set 'attributeOldValue' to true when "+
+   "'attributes' is true or not present.",'TypeError');
+ if(options.attributeFilter!==undefined&&!attrs)
+  throw new DOMException(
+   "The options object may only set 'attributeFilter' when 'attributes' "+
+   "is true or not present.",'TypeError');
+ if(options.characterDataOldValue&&!cdata)
+  throw new DOMException(
+   "The options object may only set 'characterDataOldValue' to true when "+
+   "'characterData' is true or not present.",'TypeError');
+ var w={target:target,subtree:!!options.subtree,
+  childList:!!options.childList,
+  attributes:!!attrs,
+  characterData:!!cdata,
+  attributeOldValue:!!options.attributeOldValue,
+  characterDataOldValue:!!options.characterDataOldValue,
+  filter:options.attributeFilter?
+   [].map.call(options.attributeFilter,function(x){return String(x).toLowerCase();}):null};
+ /* observing the same node twice replaces the first */
+ this._watch=this._watch.filter(function(o){return o.target!==target;});
+ this._watch.push(w);
+ if(MOlist.indexOf(this)<0)MOlist.push(this);
+ if(typeof __vitaWatchMutations==='function')__vitaWatchMutations(true);};
+MutationObserver.prototype.disconnect=function(){
+ this._watch=[];this._records=[];
+ MOlist=MOlist.filter(function(o){return o!==this;},this);
+ if(!MOlist.length&&typeof __vitaWatchMutations==='function')
+  __vitaWatchMutations(false);};
+MutationObserver.prototype.takeRecords=function(){
+ var r=this._records;this._records=[];return r;};
+W.MutationObserver=MutationObserver;
+W.WebKitMutationObserver=MutationObserver;
+
+/* Deliver every observer's queue, once, after the current task. */
+function MOdeliver(){
+ MOqueued=false;
+ var list=MOlist.slice(),i,o,recs;
+ for(i=0;i<list.length;i++){
+  o=list[i];
+  if(!o._records.length)continue;
+  recs=o._records;o._records=[];
+  try{o._cb(recs,o);}catch(e){
+   if(typeof W.__vitaReportError==='function')W.__vitaReportError(e);}}}
+function MOqueue(o,rec){
+ o._records.push(rec);
+ if(!MOqueued){MOqueued=true;
+  if(typeof queueMicrotask==='function')queueMicrotask(MOdeliver);
+  else Promise.resolve().then(MOdeliver);}}
+
+/* Called from qjs.c for each mutation. a and b carry different things
+   per kind: the added and removed node for childList, the attribute name
+   and its old value for attributes. */
+W.__vitaMutation=function(kind,target,a,b){
+ if(!MOlist.length||!target)return;
+ var i,o,w,rec;
+ for(i=0;i<MOlist.length;i++){
+  o=MOlist[i];
+  w=o._wants(kind,target,kind==='attributes'?a:null);
+  if(!w)continue;
+  rec=new MutationRecord(kind,target);
+  if(kind==='attributes'){
+   rec.attributeName=String(a);
+   if(w.attributeOldValue)rec.oldValue=b===null?null:String(b);
+  }else if(kind==='characterData'){
+   if(w.characterDataOldValue)rec.oldValue=b===null?null:String(b);
+  }else{
+   /* a and b are either single nodes or before-and-after child arrays */
+   if(a&&a.nodeType!==undefined)rec.addedNodes=[a];
+   else if(a&&a.length!==undefined)rec.addedNodes=[].slice.call(a);
+   if(b&&b.nodeType!==undefined)rec.removedNodes=[b];
+   else if(b&&b.length!==undefined)rec.removedNodes=[].slice.call(b);
+   /* a replaced set is reported as what went and what came, not both */
+   if(rec.addedNodes.length&&rec.removedNodes.length){
+    var gone=rec.removedNodes,came=rec.addedNodes;
+    rec.removedNodes=gone.filter(function(n){return came.indexOf(n)<0;});
+    rec.addedNodes=came.filter(function(n){return gone.indexOf(n)<0;});
+    if(!rec.addedNodes.length&&!rec.removedNodes.length)continue;}
+  }
+  MOqueue(o,rec);}};
 })();

@@ -109,6 +109,13 @@ struct jsthread {
 	 * so a page's setup ran against a document still being parsed.
 	 */
 	const char *ready_state;
+	/**
+	 * Whether a MutationObserver is watching. Reporting every mutation
+	 * to JavaScript costs a call per change, so nothing is reported
+	 * until a page asks for it, and a page that never uses one pays
+	 * nothing at all.
+	 */
+	bool watch_mutations;
 	struct js_timer *timers;       /**< live timers, cancelled on close */
 	struct js_wrapper *wrappers[WRAPPER_BUCKETS];
 	struct js_xhr *xhrs;           /**< requests in flight */
@@ -554,6 +561,87 @@ static JSValue node_get_text_content(JSContext *ctx, JSValueConst this_val)
 	return str_result(ctx, s);
 }
 
+/*
+ * Tell the page's MutationObservers what just changed. kind is
+ * "childList", "attributes" or "characterData"; the two extra values
+ * mean different things per kind and the prelude sorts them out.
+ */
+static void notify_mutation(JSContext *ctx, const char *kind,
+			    struct dom_node *target,
+			    JSValue a, JSValue b)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue global, fn;
+
+	if (thread == NULL || thread->watch_mutations == false ||
+	    thread->closed) {
+		JS_FreeValue(ctx, a);
+		JS_FreeValue(ctx, b);
+		return;
+	}
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaMutation");
+	if (JS_IsFunction(ctx, fn)) {
+		JSValue args[4], r;
+
+		args[0] = JS_NewString(ctx, kind);
+		args[1] = wrap_node(ctx, target);
+		args[2] = a;
+		args[3] = b;
+		r = JS_Call(ctx, fn, global, 4, args);
+		if (JS_IsException(r)) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+		}
+		JS_FreeValue(ctx, r);
+		JS_FreeValue(ctx, args[0]);
+		JS_FreeValue(ctx, args[1]);
+	} else {
+		JS_FreeValue(ctx, a);
+		JS_FreeValue(ctx, b);
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+}
+
+/** The node's children as a JS array, for a before-and-after record. */
+static JSValue children_snapshot(JSContext *ctx, struct dom_node *node)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue arr;
+	struct dom_node *child = NULL;
+	uint32_t i = 0;
+
+	if (thread == NULL || thread->watch_mutations == false) {
+		return JS_UNDEFINED;
+	}
+	arr = JS_NewArray(ctx);
+	if (dom_node_get_first_child(node, &child) != DOM_NO_ERR) {
+		return arr;
+	}
+	while (child != NULL) {
+		struct dom_node *next = NULL;
+
+		JS_SetPropertyUint32(ctx, arr, i++, wrap_node(ctx, child));
+		dom_node_get_next_sibling(child, &next);
+		dom_node_unref(child);
+		child = next;
+	}
+	return arr;
+}
+
+/** Turn on mutation reporting; the prelude calls this from observe(). */
+static JSValue win_vita_watch_mutations(JSContext *ctx, JSValueConst this_val,
+					int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	(void)this_val;
+	if (thread != NULL && argc > 0) {
+		thread->watch_mutations = JS_ToBool(ctx, argv[0]) == 1;
+	}
+	return JS_UNDEFINED;
+}
+
 static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 				     JSValueConst val)
 {
@@ -565,6 +653,8 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 	d = to_dom_string(s != NULL ? s : "");
 	if (d != NULL) {
 		dom_node_type type = DOM_ELEMENT_NODE;
+
+		JSValue before = children_snapshot(ctx, node);
 
 		dom_node_get_node_type(node, &type);
 		/*
@@ -581,6 +671,15 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		}
 		dom_string_unref(d);
 		mark_dirty(ctx);
+		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
+		    type == DOM_CDATA_SECTION_NODE) {
+			JS_FreeValue(ctx, before);
+			notify_mutation(ctx, "characterData", node,
+					JS_NULL, JS_NULL);
+		} else {
+			notify_mutation(ctx, "childList", node,
+					children_snapshot(ctx, node), before);
+		}
 	}
 	if (s != NULL) JS_FreeCString(ctx, s);
 	return JS_UNDEFINED;
@@ -822,8 +921,21 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 	key = to_dom_string(name);
 	val = to_dom_string(value != NULL ? value : "");
 	if (node != NULL && key != NULL && val != NULL) {
+		dom_string *old = NULL;
+		jsthread *th = JS_GetContextOpaque(ctx);
+
+		if (th != NULL && th->watch_mutations) {
+			dom_element_get_attribute(node, key, &old);
+		}
 		dom_element_set_attribute(node, key, val);
 		mark_dirty(ctx);
+		notify_mutation(ctx, "attributes", node,
+				JS_NewString(ctx, name != NULL ? name : ""),
+				old != NULL ?
+				JS_NewStringLen(ctx, dom_string_data(old),
+						dom_string_byte_length(old)) :
+				JS_NULL);
+		if (old != NULL) dom_string_unref(old);
 	}
 	if (key) dom_string_unref(key);
 	if (val) dom_string_unref(val);
@@ -862,8 +974,21 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 	name = JS_ToCString(ctx, argv[0]);
 	key = to_dom_string(name);
 	if (key != NULL) {
+		dom_string *old = NULL;
+		jsthread *th = JS_GetContextOpaque(ctx);
+
+		if (th != NULL && th->watch_mutations) {
+			dom_element_get_attribute(node, key, &old);
+		}
 		dom_element_remove_attribute(node, key);
 		mark_dirty(ctx);
+		notify_mutation(ctx, "attributes", node,
+				JS_NewString(ctx, name != NULL ? name : ""),
+				old != NULL ?
+				JS_NewStringLen(ctx, dom_string_data(old),
+						dom_string_byte_length(old)) :
+				JS_NULL);
+		if (old != NULL) dom_string_unref(old);
 		dom_string_unref(key);
 	}
 	if (name) JS_FreeCString(ctx, name);
@@ -892,6 +1017,8 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 		   ref != NULL) {
 		dom_node_unref(ref);
 	}
+	notify_mutation(ctx, "childList", node,
+			JS_DupValue(ctx, argv[0]), JS_NULL);
 	return JS_DupValue(ctx, argv[0]);
 }
 
@@ -910,6 +1037,8 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 	    ref != NULL) {
 		dom_node_unref(ref);
 	}
+	notify_mutation(ctx, "childList", node,
+			JS_DupValue(ctx, argv[0]), JS_DupValue(ctx, argv[1]));
 	return JS_DupValue(ctx, argv[1]);
 }
 
@@ -989,6 +1118,8 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 	if (dom_node_append_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
 	}
+	notify_mutation(ctx, "childList", node,
+			JS_DupValue(ctx, argv[0]), JS_NULL);
 	return JS_DupValue(ctx, argv[0]);
 }
 
@@ -1005,6 +1136,8 @@ static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 	if (dom_node_remove_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
 	}
+	notify_mutation(ctx, "childList", node,
+			JS_NULL, JS_DupValue(ctx, argv[0]));
 	return JS_DupValue(ctx, argv[0]);
 }
 
@@ -1097,13 +1230,20 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 	size_t len = 0;
 	const char *s;
 
+	JSValue before;
+
 	if (node == NULL) return JS_EXCEPTION;
+	before = children_snapshot(ctx, node);
 	s = JS_ToCStringLen(ctx, &len, val);
 	if (s != NULL) {
 		set_inner_html(node, s, len);
 		JS_FreeCString(ctx, s);
 		mark_dirty(ctx);
+		notify_mutation(ctx, "childList", node,
+				children_snapshot(ctx, node), before);
+		before = JS_UNDEFINED;
 	}
+	JS_FreeValue(ctx, before);
 	return JS_UNDEFINED;
 }
 
@@ -3420,6 +3560,9 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_scroll, "__vitaScroll", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaEncoding",
 			  JS_NewCFunction(ctx, win_vita_encoding, "__vitaEncoding", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaWatchMutations",
+			  JS_NewCFunction(ctx, win_vita_watch_mutations,
+					  "__vitaWatchMutations", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaScrollTo",
 			  JS_NewCFunction(ctx, win_vita_scroll_to, "__vitaScrollTo", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaDispatch",
