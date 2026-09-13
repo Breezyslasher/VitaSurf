@@ -429,6 +429,11 @@ P.normalize=function(){
   prev=null;
   if(n.nodeType===1)n.normalize();
  }};
+function attrList(el){
+ var m=el&&el.attributes,a=[],i;
+ if(!m)return a;
+ for(i=0;i<m.length;i++)a.push(m[i]);
+ return a;}
 P.hasAttributes=function(){return this.attributes.length>0;};
 /* attributes, and every node list here, is a plain array from qjs.c, so
  * the NamedNodeMap and NodeList calls go on the array prototype. They
@@ -439,10 +444,8 @@ P.hasAttributes=function(){return this.attributes.length>0;};
  ['namedItem',function(n){n=String(n);for(var i=0;i<this.length;i++){var e=this[i];if(e&&(e.id===n||e.name===n))return e;}return null;}]
 ].forEach(function(p){if(!(p[0] in Array.prototype))Object.defineProperty(Array.prototype,p[0],{value:p[1],writable:true,configurable:true,enumerable:false});});
 P.getAttributeNode=function(n){var v=this.getAttribute(n);return v===null?null:{name:String(n),value:v,specified:true};};
-P.getAttributeNS=function(ns,n){return this.getAttribute(n);};
-P.setAttributeNS=function(ns,n,v){return this.setAttribute(n,v);};
-P.removeAttributeNS=function(ns,n){return this.removeAttribute(n);};
-P.hasAttributeNS=function(ns,n){return this.hasAttribute(n);};
+/* getAttributeNS and the rest of the namespaced set come from the C
+   side now, which asks libdom for the namespace it was given. */
 P.getElementsByTagNameNS=function(ns,t){return this.getElementsByTagName(t);};
 P.insertAdjacentElement=function(where,el){
  switch(String(where).toLowerCase()){
@@ -466,12 +469,13 @@ P.scrollTo=P.scroll=function(a,b){window.scrollTo(a,b);};
 P.scrollBy=function(a,b){window.scrollBy(a,b);};
 P.scrollIntoViewIfNeeded=function(centre){return this.scrollIntoView(centre===false?{block:'nearest'}:true);};
 P.toggleAttribute=function(n,force){
+ checkAttrName(n);
  var has=this.hasAttribute(n);
  var on=force===undefined?!has:!!force;
  if(on){if(!has)this.setAttribute(n,'');}else if(has)this.removeAttribute(n);
  return on;
 };
-P.getAttributeNames=function(){return this.attributes.map(function(a){return a.name;});};
+P.getAttributeNames=function(){return attrList(this).map(function(a){return a.name;});};
 P.hasChildNodes=function(){return this.childNodes.length>0;};
 P.isSameNode=function(o){return this===o;};
 P.isEqualNode=function(o){
@@ -568,7 +572,7 @@ window.postMessage=function(data){
   __vitaDispatch(null,e);
  },0);
 };
-D.createAttribute=function(n){return {name:n,value:''};};
+D.createAttribute=function(n){return new Attr(null,String(n).toLowerCase(),'');};
 function scratchDocument(title){var html=D.createElement('html'),head=D.createElement('head'),body=D.createElement('body');html.appendChild(head);html.appendChild(body);var doc={nodeType:9,nodeName:'#document',documentElement:html,head:head,body:body,title:title||'',defaultView:null,implementation:D.implementation,createElement:function(t){return D.createElement(t);},createElementNS:function(ns,t){return D.createElement(t);},createTextNode:function(t){return D.createTextNode(t);},createDocumentFragment:function(){return D.createDocumentFragment();},createComment:function(){return D.createTextNode('');},getElementsByTagName:function(t){return html.getElementsByTagName(t);},getElementById:function(id){return html.querySelector('#'+id);},querySelector:function(s){return html.querySelector(s);},querySelectorAll:function(s){return html.querySelectorAll(s);},addEventListener:function(){},removeEventListener:function(){},write:function(){},open:function(){},close:function(){}};return doc;}
 D.implementation={createHTMLDocument:function(t){return scratchDocument(t);},createDocument:function(){return scratchDocument('');},hasFeature:function(){return true;}};
 D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';
@@ -1984,10 +1988,6 @@ P.getBoxQuads=function(){return [this.getBoundingClientRect()];};
 P.getHTML=function(){return this.innerHTML;};
 P.setHTML=P.setHTMLUnsafe=function(h){this.innerHTML=String(h);};
 P.moveBefore=function(n,ref){return this.insertBefore(n,ref||null);};
-P.getAttributeNodeNS=function(ns,n){return this.getAttributeNode(n);};
-P.setAttributeNode=function(a){this.setAttribute(a.name,a.value);return null;};
-P.setAttributeNodeNS=P.setAttributeNode;
-P.removeAttributeNode=function(a){this.removeAttribute(a.name);return a;};
 /* An attribute node, which getAttributeNode used to fake with an object
  * literal. Sanitizers walk these and read ownerElement off them. */
 function Attr(el,name,value){
@@ -2001,11 +2001,15 @@ function Attr(el,name,value){
 (function(){
  function get(){
   if(!this._e)return this._v;
-  var v=this._e.getAttribute(this.name);
+  var v=this.namespaceURI
+   ?this._e.getAttributeNS(this.namespaceURI,this.localName)
+   :this._e.getAttribute(this.name);
   return v===null?this._v:v;}
  function set(v){
   this._v=String(v);
-  if(this._e)this._e.setAttribute(this.name,this._v);}
+  if(!this._e)return;
+  if(this.namespaceURI)this._e.setAttributeNS(this.namespaceURI,this.name,this._v);
+  else this._e.setAttribute(this.name,this._v);}
  ['value','nodeValue','textContent'].forEach(function(k){
   Object.defineProperty(Attr.prototype,k,{configurable:true,enumerable:true,
    get:get,set:set});});})();
@@ -2016,7 +2020,130 @@ Object.defineProperty(Attr.prototype,'ownerDocument',{configurable:true,
 Attr.prototype.isEqualNode=function(o){
  return !!o&&o.nodeType===2&&o.name===this.name&&o.value===this.value;};
 W.Attr=Attr;
-P.getAttributeNode=function(n){var v=this.getAttribute(n);return v===null?null:new Attr(this,n,v);};
+/* One attribute node per element, namespace and local name, kept so
+   identity holds: el.attributes[0], el.getAttributeNode(n) and
+   getAttributeNodeNS all have to be the same object, and code compares
+   them. */
+var rawAttrs=null;
+function attrMap(el){
+ var m=el.__vitaAttrs;
+ if(!m){m=Object.create(null);
+  Object.defineProperty(el,'__vitaAttrs',{value:m,configurable:true});}
+ return m;}
+function attrKeyOf(ns,local){return (ns===null||ns===undefined?'':ns)+'|'+local;}
+function attrNodeFor(el,raw){
+ var m=attrMap(el),k=attrKeyOf(raw.namespace,raw.localName||raw.name),a=m[k];
+ if(!a||a._e!==el){
+  a=new Attr(el,raw.name,raw.value);
+  a.namespaceURI=raw.namespace===undefined?null:raw.namespace;
+  a.localName=raw.localName||raw.name;
+  a.prefix=raw.prefix===undefined?null:raw.prefix;
+  m[k]=a;}
+ return a;}
+/* Removing the attribute leaves the node behind with the value it had
+   and no owner, which is what the node's own removal means. */
+function detachAttr(el,ns,local){
+ var m=el.__vitaAttrs,k=attrKeyOf(ns,local),a=m&&m[k];
+ if(a&&a._e===el){a._v=a.value;a._e=null;delete m[k];}}
+/* An HTML element's attribute names are lower case however they were
+   written, so the node for Foo and for foo is the one node. */
+function attrKey(el,n){
+ n=String(n);
+ return el.namespaceURI&&el.namespaceURI!=='http://www.w3.org/1999/xhtml'
+  ?n:n.toLowerCase();}
+function rawAttrList(el){return rawAttrs?rawAttrs.call(el):[];}
+function rawByName(el,n){
+ var name=attrKey(el,n),raw=rawAttrList(el),i;
+ for(i=0;i<raw.length;i++)if(raw[i].name===name)return raw[i];
+ return null;}
+function rawByNS(el,ns,local){
+ var raw=rawAttrList(el),i,want=(ns===''||ns===undefined)?null:ns;
+ local=String(local);
+ for(i=0;i<raw.length;i++)
+  if((raw[i].namespace||null)===want&&(raw[i].localName||raw[i].name)===local)
+   return raw[i];
+ return null;}
+/* The one name browsers actually refuse: the empty string. Everything
+   else the tests list -- ":", "0:a", "invalid^Name", a backslash -- is
+   accepted, so a stricter reading of the Name production would be wrong
+   here. */
+function checkAttrName(n){
+ if(String(n)==='')throw new DOMException(
+  'The string contains invalid characters.','InvalidCharacterError');}
+(function(){
+ var orig=P.setAttribute;
+ P.setAttribute=function(n,v){
+  needArgs(arguments.length,2,'setAttribute');
+  checkAttrName(n);
+  return orig.apply(this,arguments);};})();
+/* The namespace rules a qualified name has to satisfy before it can be
+   set. Without them xmlns:x could be put in any namespace at all, and a
+   prefix could be used with none. */
+var XML_NS='http://www.w3.org/XML/1998/namespace',
+    XMLNS_NS='http://www.w3.org/2000/xmlns/';
+function nsExtract(ns,qname,what){
+ qname=String(qname);
+ ns=(ns===''||ns===null||ns===undefined)?null:String(ns);
+ if(qname===''||BAD_NAME.test(qname))throw new DOMException(
+  'The string contains invalid characters.','InvalidCharacterError');
+ var c=qname.indexOf(':'),prefix=null,local=qname;
+ if(c>=0){
+  prefix=qname.slice(0,c);local=qname.slice(c+1);
+  if(prefix===''||local===''||local.indexOf(':')>=0)throw new DOMException(
+   'The string contains invalid characters.','InvalidCharacterError');}
+ if(prefix!==null&&ns===null)throw new DOMException(
+  'A prefix needs a namespace.','NamespaceError');
+ if(prefix==='xml'&&ns!==XML_NS)throw new DOMException(
+  'The xml prefix belongs to the XML namespace.','NamespaceError');
+ if((qname==='xmlns'||prefix==='xmlns')&&ns!==XMLNS_NS)throw new DOMException(
+  'xmlns belongs to the XMLNS namespace.','NamespaceError');
+ if(ns===XMLNS_NS&&qname!=='xmlns'&&prefix!=='xmlns')throw new DOMException(
+  'The XMLNS namespace needs the xmlns prefix.','NamespaceError');
+ return {ns:ns,prefix:prefix,localName:local,qname:qname};}
+(function(){
+ var orig=P.setAttributeNS;
+ P.setAttributeNS=function(ns,qname,value){
+  needArgs(arguments.length,3,'setAttributeNS');
+  nsExtract(ns,qname,'setAttributeNS');
+  return orig.call(this,ns,qname,value);};})();
+P.getAttributeNode=function(n){
+ var raw=rawByName(this,n);
+ return raw?attrNodeFor(this,raw):null;};
+P.getAttributeNodeNS=function(ns,n){
+ var raw=rawByNS(this,ns,n);
+ return raw?attrNodeFor(this,raw):null;};
+P.setAttributeNode=function(a){
+ if(!a||a.nodeType!==2)throw new TypeError('not an attribute');
+ if(a._e&&a._e!==this)
+  throw new DOMException('attribute is in use on another element',
+                         'InUseAttributeError');
+ var ns=a.namespaceURI||null,local=a.localName||a.name,
+     raw=rawByNS(this,ns,local),
+     old=raw?attrNodeFor(this,raw):null,value=a.value;
+ if(old&&old!==a)detachAttr(this,ns,local);
+ if(ns===null)this.setAttribute(a.name,value);
+ else this.setAttributeNS(ns,a.name,value);
+ a._e=this;attrMap(this)[attrKeyOf(ns,local)]=a;
+ return old||null;};
+P.setAttributeNodeNS=P.setAttributeNode;
+P.removeAttributeNode=function(a){
+ if(!a||a.nodeType!==2||a._e!==this)
+  throw new DOMException('the attribute is not on this element',
+                         'NotFoundError');
+ var ns=a.namespaceURI||null,local=a.localName||a.name;
+ detachAttr(this,ns,local);
+ if(ns===null)this.removeAttribute(a.name);
+ else this.removeAttributeNS(ns,local);
+ return a;};
+(function(){
+ var origRm=P.removeAttribute,origRmNS=P.removeAttributeNS;
+ P.removeAttribute=function(n){
+  var raw=rawByName(this,n);
+  if(raw)detachAttr(this,raw.namespace||null,raw.localName||raw.name);
+  return origRm.apply(this,arguments);};
+ P.removeAttributeNS=function(ns,n){
+  detachAttr(this,(ns===''||ns===undefined)?null:ns,String(n));
+  return origRmNS.apply(this,arguments);};})();
 /* The collection interfaces. Every list here is a plain array, so these
  * exist to be enumerated and subclassed, not to be constructed. */
 function HTMLCollection(){}
@@ -2243,24 +2370,53 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){
  var t=this.tagName;return (t==='STYLE'||t==='LINK')?new CSSStyleSheet(this):null;}});
 
 /* --- attributes as a NamedNodeMap --------------------------------------- */
+/* Not an array: the map's own properties are the indices and the
+   attribute names, and nothing else, which is what code that walks it
+   with getOwnPropertyNames expects to see. */
+var NNM_OWNER=Symbol('ownerElement');
+function NamedNodeMap(el){
+ /* under a symbol: getOwnPropertyNames must show the indices and the
+    attribute names and nothing else */
+ this[NNM_OWNER]=el;}
+Object.defineProperty(NamedNodeMap.prototype,'length',{configurable:true,
+ get:function(){var n=0;while(Object.prototype.hasOwnProperty.call(this,n))n++;
+  return n;}});
+NamedNodeMap.prototype.item=function(i){
+ i=i>>>0;return Object.prototype.hasOwnProperty.call(this,i)?this[i]:null;};
+NamedNodeMap.prototype.getNamedItem=function(n){
+ var el=this[NNM_OWNER];return el?el.getAttributeNode(n):null;};
+NamedNodeMap.prototype.getNamedItemNS=function(ns,n){
+ return this.getNamedItem(n);};
+NamedNodeMap.prototype.setNamedItem=function(a){
+ var el=this[NNM_OWNER];return el?el.setAttributeNode(a):null;};
+NamedNodeMap.prototype.setNamedItemNS=NamedNodeMap.prototype.setNamedItem;
+NamedNodeMap.prototype.removeNamedItem=function(n){
+ var a=this.getNamedItem(n);
+ if(!a)throw new DOMException('no such attribute','NotFoundError');
+ return this[NNM_OWNER].removeAttributeNode(a);};
+NamedNodeMap.prototype.removeNamedItemNS=function(ns,n){
+ return this.removeNamedItem(n);};
+NamedNodeMap.prototype[Symbol.iterator]=function(){
+ var i=0,m=this;
+ return {next:function(){return i<m.length?{value:m[i++],done:false}
+                                          :{value:undefined,done:true};}};};
+W.NamedNodeMap=NamedNodeMap;
 (function(){
  var d=Object.getOwnPropertyDescriptor(P,'attributes');
  if(!d||!d.get)return;
+ rawAttrs=d.get;
  Object.defineProperty(P,'attributes',{configurable:true,get:function(){
-  var el=this,raw=d.get.call(this),list=[],i;
+  var el=this,raw=d.get.call(this),map=new NamedNodeMap(el),i,a;
   /* The C side hands back plain name-and-value pairs; an attribute is a
      node, and code reads nodeValue, ownerElement and localName off one. */
-  for(i=0;i<raw.length;i++)list.push(new Attr(el,raw[i].name,raw[i].value));
-  list.getNamedItem=function(n){return el.getAttributeNode(n);};
-  list.getNamedItemNS=function(ns,n){return el.getAttributeNode(n);};
-  list.setNamedItem=function(a){el.setAttribute(a.name,a.value);return null;};
-  list.setNamedItemNS=list.setNamedItem;
-  list.removeNamedItem=function(n){var a=el.getAttributeNode(n);el.removeAttribute(n);return a;};
-  list.removeNamedItemNS=function(ns,n){return list.removeNamedItem(n);};
-  list.item=function(i){return this[i]||null;};
-  return list;}});
+  for(i=0;i<raw.length;i++){
+   a=attrNodeFor(el,raw[i]);
+   Object.defineProperty(map,i,{value:a,enumerable:true,configurable:true});
+   if(!Object.prototype.hasOwnProperty.call(map,a.name))
+    Object.defineProperty(map,a.name,
+     {value:a,enumerable:false,configurable:true});}
+  return map;}});
 })();
-W.NamedNodeMap=function(){};
 
 /* --- the event interfaces, with the fields their handlers read ----------
  * A handler that reads e.deltaY, e.touches or e.data off an event that
@@ -2391,7 +2547,12 @@ W.XPathEvaluator=function(){};
 W.XPathEvaluator.prototype.evaluate=function(e,c,r,t){return D.evaluate(e,c,r,t);};
 W.XPathEvaluator.prototype.createExpression=function(e){return D.createExpression(e);};
 W.XPathEvaluator.prototype.createNSResolver=function(n){return D.createNSResolver(n);};
-D.createAttributeNS=function(ns,n){return D.createAttribute(n);};
+D.createAttributeNS=function(ns,n){
+ var a=new Attr(null,String(n),''),q=String(n),c=q.indexOf(':');
+ a.namespaceURI=(ns===''||ns===null||ns===undefined)?null:String(ns);
+ a.prefix=c>0?q.slice(0,c):null;
+ a.localName=c>0?q.slice(c+1):q;
+ return a;};
 D.createCDATASection=function(t){return D.createTextNode(t);};
 D.createProcessingInstruction=function(t,d){return D.createComment('');};
 D.getElementsByTagNameNS=function(ns,t){return D.getElementsByTagName(t);};
@@ -3015,7 +3176,7 @@ Blob.prototype.textStream=function(){return null;};
   if(t===8)return '<!--'+String(n.textContent||'')+'-->';
   if(t!==1)return inner(n);
   var tag=String(n.tagName||'').toLowerCase(),s='<'+tag;
-  (n.attributes||[]).forEach(function(a){s+=' '+a.name+'="'+escAttr(a.value)+'"';});
+  attrList(n).forEach(function(a){s+=' '+a.name+'="'+escAttr(a.value)+'"';});
   s+='>';
   if(VOID.indexOf(' '+tag+' ')>=0)return s;
   return s+inner(n)+'</'+tag+'>';}
@@ -3072,7 +3233,7 @@ Blob.prototype.textStream=function(){return null;};
  * live view of the data-* attributes. */
 function dataAttr(k){return 'data-'+String(k).replace(/[A-Z]/g,function(c){return '-'+c.toLowerCase();});}
 function dataName(n){return n.slice(5).replace(/-([a-z])/g,function(_,c){return c.toUpperCase();});}
-function dataKeys(el){return el.attributes.filter(function(a){
+function dataKeys(el){return attrList(el).filter(function(a){
  return a.name.indexOf('data-')===0;}).map(function(a){return dataName(a.name);});}
 Object.defineProperty(P,'dataset',{configurable:true,get:function(){
  var el=this;

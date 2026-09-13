@@ -899,6 +899,31 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 						  dom_string_byte_length(val)) :
 				  JS_NewString(ctx, ""));
 		JS_SetPropertyStr(ctx, entry, "specified", JS_TRUE);
+		{
+			dom_string *ns = NULL, *local = NULL, *prefix = NULL;
+
+			dom_node_get_namespace(attr, &ns);
+			dom_node_get_local_name(attr, &local);
+			dom_node_get_prefix(attr, &prefix);
+			JS_SetPropertyStr(ctx, entry, "namespace",
+					  ns != NULL ?
+					  JS_NewStringLen(ctx, dom_string_data(ns),
+							  dom_string_byte_length(ns)) :
+					  JS_NULL);
+			JS_SetPropertyStr(ctx, entry, "localName",
+					  local != NULL ?
+					  JS_NewStringLen(ctx, dom_string_data(local),
+							  dom_string_byte_length(local)) :
+					  JS_NULL);
+			JS_SetPropertyStr(ctx, entry, "prefix",
+					  prefix != NULL ?
+					  JS_NewStringLen(ctx, dom_string_data(prefix),
+							  dom_string_byte_length(prefix)) :
+					  JS_NULL);
+			if (ns != NULL) dom_string_unref(ns);
+			if (local != NULL) dom_string_unref(local);
+			if (prefix != NULL) dom_string_unref(prefix);
+		}
 		if (name != NULL) dom_string_unref(name);
 		if (val != NULL) dom_string_unref(val);
 		dom_node_unref(attr);
@@ -992,6 +1017,136 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 		dom_string_unref(key);
 	}
 	if (name) JS_FreeCString(ctx, name);
+	return JS_UNDEFINED;
+}
+
+/*
+ * The namespaced half of the attribute interface. Without it every
+ * setAttributeNS landed in the null namespace, so an SVG use element's
+ * xlink:href and a document's xmlns were indistinguishable from any
+ * other attribute, and removing one removed the wrong one.
+ *
+ * An empty namespace argument means the null namespace, which is what
+ * the specification says and not what an empty dom_string would mean.
+ */
+static dom_string *ns_arg(JSContext *ctx, JSValueConst v, const char **held)
+{
+	const char *s;
+
+	*held = NULL;
+	if (JS_IsNull(v) || JS_IsUndefined(v)) {
+		return NULL;
+	}
+	s = JS_ToCString(ctx, v);
+	if (s == NULL) {
+		return NULL;
+	}
+	if (s[0] == '\0') {
+		JS_FreeCString(ctx, s);
+		return NULL;
+	}
+	*held = s;
+	return to_dom_string(s);
+}
+
+static JSValue node_get_attribute_ns(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_element(ctx, this_val);
+	const char *nsheld = NULL, *local;
+	dom_string *ns, *key, *val = NULL;
+	JSValue r;
+
+	if (node == NULL || argc < 2) return JS_NULL;
+	ns = ns_arg(ctx, argv[0], &nsheld);
+	local = JS_ToCString(ctx, argv[1]);
+	key = to_dom_string(local);
+	if (key != NULL) {
+		dom_element_get_attribute_ns(node, ns, key, &val);
+		dom_string_unref(key);
+	}
+	if (ns != NULL) dom_string_unref(ns);
+	if (nsheld) JS_FreeCString(ctx, nsheld);
+	if (local) JS_FreeCString(ctx, local);
+	if (val == NULL) return JS_NULL;
+	r = JS_NewStringLen(ctx, dom_string_data(val), dom_string_byte_length(val));
+	dom_string_unref(val);
+	return r;
+}
+
+static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_element(ctx, this_val);
+	const char *nsheld = NULL, *qname, *value;
+	dom_string *ns, *key, *val;
+
+	if (node == NULL || argc < 3) return JS_UNDEFINED;
+	ns = ns_arg(ctx, argv[0], &nsheld);
+	qname = JS_ToCString(ctx, argv[1]);
+	value = JS_ToCString(ctx, argv[2]);
+	key = to_dom_string(qname);
+	val = to_dom_string(value != NULL ? value : "");
+	if (key != NULL && val != NULL) {
+		dom_element_set_attribute_ns(node, ns, key, val);
+		mark_dirty(ctx);
+		notify_mutation(ctx, "attributes", node,
+				JS_NewString(ctx, qname != NULL ? qname : ""),
+				JS_NULL);
+	}
+	if (key) dom_string_unref(key);
+	if (val) dom_string_unref(val);
+	if (ns != NULL) dom_string_unref(ns);
+	if (nsheld) JS_FreeCString(ctx, nsheld);
+	if (qname) JS_FreeCString(ctx, qname);
+	if (value) JS_FreeCString(ctx, value);
+	return JS_UNDEFINED;
+}
+
+static JSValue node_has_attribute_ns(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_element(ctx, this_val);
+	const char *nsheld = NULL, *local;
+	dom_string *ns, *key;
+	bool has = false;
+
+	if (node == NULL || argc < 2) return JS_NewBool(ctx, false);
+	ns = ns_arg(ctx, argv[0], &nsheld);
+	local = JS_ToCString(ctx, argv[1]);
+	key = to_dom_string(local);
+	if (key != NULL) {
+		dom_element_has_attribute_ns(node, ns, key, &has);
+		dom_string_unref(key);
+	}
+	if (ns != NULL) dom_string_unref(ns);
+	if (nsheld) JS_FreeCString(ctx, nsheld);
+	if (local) JS_FreeCString(ctx, local);
+	return JS_NewBool(ctx, has);
+}
+
+static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
+					int argc, JSValueConst *argv)
+{
+	struct dom_node *node = this_element(ctx, this_val);
+	const char *nsheld = NULL, *local;
+	dom_string *ns, *key;
+
+	if (node == NULL || argc < 2) return JS_UNDEFINED;
+	ns = ns_arg(ctx, argv[0], &nsheld);
+	local = JS_ToCString(ctx, argv[1]);
+	key = to_dom_string(local);
+	if (key != NULL) {
+		dom_element_remove_attribute_ns(node, ns, key);
+		mark_dirty(ctx);
+		notify_mutation(ctx, "attributes", node,
+				JS_NewString(ctx, local != NULL ? local : ""),
+				JS_NULL);
+		dom_string_unref(key);
+	}
+	if (ns != NULL) dom_string_unref(ns);
+	if (nsheld) JS_FreeCString(ctx, nsheld);
+	if (local) JS_FreeCString(ctx, local);
 	return JS_UNDEFINED;
 }
 
@@ -1554,6 +1709,10 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CFUNC_DEF("setAttribute", 2, node_set_attribute),
 	JS_CFUNC_DEF("hasAttribute", 1, node_has_attribute),
 	JS_CFUNC_DEF("removeAttribute", 1, node_remove_attribute),
+	JS_CFUNC_DEF("getAttributeNS", 2, node_get_attribute_ns),
+	JS_CFUNC_DEF("setAttributeNS", 3, node_set_attribute_ns),
+	JS_CFUNC_DEF("hasAttributeNS", 2, node_has_attribute_ns),
+	JS_CFUNC_DEF("removeAttributeNS", 2, node_remove_attribute_ns),
 	JS_CFUNC_DEF("appendChild", 1, node_append_child),
 	JS_CFUNC_DEF("removeChild", 1, node_remove_child),
 	JS_CFUNC_DEF("insertBefore", 2, node_insert_before),
