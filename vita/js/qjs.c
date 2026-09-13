@@ -5272,12 +5272,22 @@ void js_handle_new_element(jsthread *thread, struct dom_element *node)
 			dom_attr_get_value(attr, &value);
 			if (value != NULL) {
 				size_t vlen = dom_string_byte_length(value);
-				size_t blen = vlen + 48;
+				size_t blen = vlen + 208;
 				char *body = malloc(blen);
 				if (body != NULL) {
 					JSValue fn;
+					/* an inline handler that returns
+					 * false cancels the event: a form
+					 * with onsubmit="...; return false"
+					 * submitted anyway without this */
 					int len = snprintf(body, blen,
-						"(function(event){%.*s\n})",
+						"(function(event){var __r="
+						"(function(event){%.*s\n})"
+						".call(this,event);"
+						"if(__r===false&&event&&"
+						"event.preventDefault)"
+						"event.preventDefault();"
+						"return __r;})",
 						(int)vlen, dom_string_data(value));
 					fn = JS_Eval(ctx, body, (size_t)len,
 						     "<inline handler>",

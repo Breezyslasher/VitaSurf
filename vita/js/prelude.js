@@ -103,7 +103,9 @@ P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,lef
 P.getClientRects=function(){var r=this.getBoundingClientRect();return r.width||r.height?[r]:[];};
 P.focus=P.blur=P.select=function(){};
 P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=viewport(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
-P.click=function(){var e=new MouseEvent('click',{bubbles:true,cancelable:true});return this.dispatchEvent(e);};
+P.click=function(){
+ var e=new MouseEvent('click',{bubbles:true,cancelable:true,composed:true});
+ return this.dispatchEvent(e);};
 P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return false;};
 /* jQuery sorts selector results with this, so a missing one takes out
    every script that uses jQuery's own selector engine. */
@@ -617,7 +619,106 @@ P.insertAdjacentHTML=function(where,html){
  if(w==='afterbegin')this.insertBefore(f,this.firstChild);
  else this.appendChild(f);
 };
-P.dispatchEvent=function(e){return __vitaDispatch(this,e);};P.getContext=function(){return null;};
+/* --- what a click does to a form control ---------------------------------
+ * A click on a checkbox toggles it and then fires input and change; on
+ * a radio it checks that one and clears the rest of its group. None of
+ * that happened here, so element.click() on a checkbox left it exactly
+ * as it was and no listener heard anything.
+ *
+ * This runs for a click dispatched from script. A click from the user
+ * goes through NetSurf's own form handling, which already does it, and
+ * doing it here as well would toggle twice.
+ */
+function radioGroup(el){
+ var name=el.getAttribute('name'),root=el.form||D,all,out=[],i;
+ if(!name)return [el];
+ all=root.getElementsByTagName?root.getElementsByTagName('input'):[];
+ for(i=0;i<all.length;i++)
+  if(String(all[i].type||'').toLowerCase()==='radio'&&
+     all[i].getAttribute('name')===name&&all[i].form===el.form)out.push(all[i]);
+ return out.length?out:[el];}
+function preActivate(el){
+ var t;
+ if(!el||el.nodeType!==1||el.tagName!=='INPUT')return null;
+ t=String(el.type||'').toLowerCase();
+ if(t==='checkbox'){
+  var was={kind:'checkbox',el:el,checked:!!el.checked,
+           indeterminate:!!el.indeterminate};
+  el.indeterminate=false;
+  el.checked=!was.checked;
+  return was;}
+ if(t==='radio'){
+  var group=radioGroup(el),before=[],i;
+  for(i=0;i<group.length;i++)before.push(!!group[i].checked);
+  if(el.checked)return {kind:'radio',el:el,group:group,before:before,
+                        fired:false};
+  for(i=0;i<group.length;i++)group[i].checked=group[i]===el;
+  return {kind:'radio',el:el,group:group,before:before,fired:true};}
+ return null;}
+/* The rest of the activation behaviours: a submit or reset button acts
+   on its form, and a summary opens and closes the details it heads.
+   Only the innermost element being clicked has one run, which is what
+   dispatching on that element already gives. */
+function otherActivation(el){
+ var tag,t,form,n;
+ if(!el||el.nodeType!==1)return null;
+ tag=el.tagName;
+ if(tag==='INPUT'||tag==='BUTTON'){
+  t=String(el.type||'').toLowerCase();
+  if(tag==='BUTTON'&&t==='')t='submit';
+  form=el.form;
+  if(!form)return null;
+  if(t==='submit'||t==='image')
+   return {kind:'submit',form:form,submitter:el};
+  if(t==='reset')return {kind:'reset',form:form};
+  return null;}
+ if(tag==='SUMMARY'){
+  n=el.parentNode;
+  if(n&&n.tagName==='DETAILS'&&n.firstElementChild===el)
+   return {kind:'details',el:n};
+  return null;}
+ return null;}
+function runActivation(a){
+ if(!a)return;
+ if(a.kind==='submit'){
+  if(a.form.requestSubmit)a.form.requestSubmit(a.submitter);
+  return;}
+ if(a.kind==='reset'){if(a.form.reset)a.form.reset();return;}
+ if(a.kind==='details'){
+  var open=!a.el.hasAttribute('open');
+  if(open)a.el.setAttribute('open','');else a.el.removeAttribute('open');
+  fireSimple(a.el,'toggle');}}
+function cancelActivate(was){
+ var i;
+ if(!was)return;
+ if(was.kind==='checkbox'){
+  was.el.checked=was.checked;was.el.indeterminate=was.indeterminate;return;}
+ for(i=0;i<was.group.length;i++)was.group[i].checked=was.before[i];}
+function fireAfterActivate(was){
+ if(!was)return;
+ if(was.kind==='radio'&&!was.fired)return;
+ fireSimple(was.el,'input');
+ fireSimple(was.el,'change');}
+function fireSimple(el,type){
+ var e=new Event(type,{bubbles:true,cancelable:false});
+ try{el.dispatchEvent(e);}catch(err){}}
+P.dispatchEvent=function(e){
+ var was=null,other=null,r;
+ if(e&&String(e.type)==='click'&&!e.__vitaActivated){
+  shadowProp(e,'__vitaActivated',true);
+  was=preActivate(this);
+  if(!was)other=otherActivation(this);}
+ r=__vitaDispatch(this,e);
+ /* dispatchEvent answers false when the event was cancelled, which is
+    how requestSubmit and every other caller learns it was. */
+ if(e&&e.cancelable&&e.defaultPrevented)r=false;
+ if(was){
+  /* a cancelled click puts the control back, which is what the
+     specification calls legacy-canceled-activation behaviour */
+  if(e.defaultPrevented)cancelActivate(was);
+  else fireAfterActivate(was);}
+ else if(other&&!e.defaultPrevented)runActivation(other);
+ return r;};P.getContext=function(){return null;};
 P.add=function(o,before){this.insertBefore(o,before||null);};
 Object.defineProperty(P,'options',{configurable:true,get:function(){return this.getElementsByTagName('option');}});
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){var o=this.options;for(var i=0;i<o.length;i++)if(o[i].hasAttribute('selected'))return i;return o.length?0:-1;},set:function(i){var o=this.options;for(var j=0;j<o.length;j++){if(j===i)o[j].setAttribute('selected','');else o[j].removeAttribute('selected');}}});
@@ -2018,7 +2119,12 @@ P.submit=function(){
   if(t==='submit'||t==='button'||t==='reset'||t==='file')return;
   if((t==='checkbox'||t==='radio')&&!c.checked)return;
   q.append(n,c.value===undefined?'':c.value);});
- try{var u=new URL(action,D.baseURI);u.searchParams=q;location.href=u.href;}catch(e){}};
+ /* Navigating in the middle of a dispatch tears down the page the
+    dispatch is walking; let the current task finish first. */
+ try{var u=new URL(action,D.baseURI);u.searchParams=q;
+  var href=u.href;
+  setTimeout(function(){try{location.href=href;}catch(e){}},0);
+ }catch(e){}};
 P.reset=function(){
  if(this.tagName!=='FORM')return;
  if(!this.dispatchEvent(new Event('reset',{bubbles:true,cancelable:true})))return;
