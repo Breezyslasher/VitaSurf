@@ -94,7 +94,7 @@ struct js_deferred {
 	size_t len;
 	char *name;
 	int tries;
-	unsigned modules;   /**< js_modules when it last failed */
+	unsigned progress;  /**< the progress count when it last failed */
 };
 
 /*
@@ -148,6 +148,7 @@ struct jsthread {
 	unsigned js_run_ms;       /**< time spent running them */
 	unsigned js_modules;      /**< of those, compiled as ES modules */
 	unsigned js_imports_missed; /**< imports that resolved to nothing */
+	unsigned js_import_fetches; /**< chunks the loader went and fetched */
 	struct js_deferred *deferred; /**< module scripts waiting on imports */
 	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
@@ -1658,6 +1659,47 @@ static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_v
 	return nodelist_to_array(ctx, list);
 }
 
+/*
+ * node.ownerDocument. It used to answer "the page" for every node, so a
+ * node that came from DOMParser or createHTMLDocument claimed to belong
+ * to a document it was not in. Anything that then built a fragment or an
+ * element for it built one in the wrong document, and libdom refuses to
+ * insert across documents, so the work vanished without an error: a
+ * template parsed that way handed back empty content.
+ *
+ * The page's document is the plain object bound as the `document`
+ * global, not a wrapped node, so that one is fetched by name to keep
+ * node.ownerDocument === document true.
+ */
+static struct dom_document *thread_document(jsthread *thread);
+
+static JSValue node_get_owner_document(JSContext *ctx, JSValueConst this_val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_document *doc = NULL;
+	JSValue r;
+
+	if (node == NULL) return JS_NULL;
+	if (dom_node_get_owner_document(node, &doc) != DOM_NO_ERR) {
+		return JS_NULL;
+	}
+	if (doc == NULL) {
+		/* a document node's own ownerDocument is null */
+		return JS_NULL;
+	}
+	if (thread != NULL && doc == thread_document(thread)) {
+		JSValue global = JS_GetGlobalObject(ctx);
+
+		r = JS_GetPropertyStr(ctx, global, "document");
+		JS_FreeValue(ctx, global);
+	} else {
+		r = wrap_node(ctx, (struct dom_node *)doc);
+	}
+	dom_node_unref(doc);
+	return r;
+}
+
 static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
@@ -2173,6 +2215,7 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CGETSET_DEF("nodeName", node_get_node_name, NULL),
 	JS_CGETSET_DEF("tagName", node_get_tag_name, NULL),
 	JS_CGETSET_DEF("nodeType", node_get_node_type, NULL),
+	JS_CGETSET_DEF("ownerDocument", node_get_owner_document, NULL),
 	JS_CGETSET_DEF("textContent", node_get_text_content, node_set_text_content),
 	JS_CGETSET_DEF("innerHTML", node_get_inner_html, node_set_inner_html),
 	JS_CGETSET_DEF("id", node_get_id, node_set_id),
@@ -5130,6 +5173,7 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 
 		if (href != NULL) {
 			if (html_process_module_preload(thread->htmlc, href)) {
+				thread->js_import_fetches++;
 				vita_log("qjs: fetching '%s' for a retry",
 					 want);
 			}
@@ -5244,6 +5288,7 @@ static void module_retry_callback(void *p)
 {
 	jsthread *thread = p;
 	struct js_deferred *d, **link;
+	unsigned progress;
 	bool again = false;
 
 	if (thread == NULL || thread->closed) return;
@@ -5284,12 +5329,17 @@ static void module_retry_callback(void *p)
 		end_script(thread);
 		/*
 		 * A graph several chunks deep needs one round per chunk, so
-		 * a round that compiled something is progress however long
-		 * the graph turns out to be: only stalled rounds count
-		 * against the limit. GitHub reaches ninety modules.
+		 * a round that got anywhere is progress however long the
+		 * graph turns out to be: only stalled rounds count against
+		 * the limit. GitHub reaches ninety modules. Compiling a
+		 * module is not the only kind of progress -- a chain
+		 * resolves one link at a time and the deepest link fails to
+		 * compile every round until the last -- so reaching for a
+		 * chunk that was not asked for before counts too.
 		 */
-		if (thread->js_modules != d->modules) {
-			d->modules = thread->js_modules;
+		progress = thread->js_modules + thread->js_import_fetches;
+		if (progress != d->progress) {
+			d->progress = progress;
 			d->tries = 0;
 		}
 		d->tries++;

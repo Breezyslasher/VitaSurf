@@ -1,0 +1,46 @@
+<!DOCTYPE html><html><head><title>tokens</title></head><body>
+<pre id="out"></pre>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function sup(tag,prop,token){
+ var l=document.createElement(tag)[prop];
+ if(!l)return 'no list';
+ if(typeof l.supports!=='function')return 'no supports';
+ try{return String(l.supports(token));}catch(e){return 'throws '+e.name;}}
+
+/* A bundler's preload helper asks this before it decides how to load a
+   chunk, so getting it wrong stops a whole application from starting. */
+T('link rel modulepreload', sup('link','relList','modulepreload'));
+T('link rel preload', sup('link','relList','preload'));
+T('link rel stylesheet', sup('link','relList','stylesheet'));
+T('link rel prefetch', sup('link','relList','prefetch'));
+T('link rel preconnect', sup('link','relList','preconnect'));
+T('link rel icon', sup('link','relList','icon'));
+T('link rel manifest', sup('link','relList','manifest'));
+T('link rel alternate', sup('link','relList','alternate'));
+T('link rel nonsense', sup('link','relList','nonsense'));
+T('link rel uppercase', sup('link','relList','MODULEPRELOAD'));
+T('link rel noopener', sup('link','relList','noopener'));
+
+T('a rel noopener', sup('a','relList','noopener'));
+T('a rel noreferrer', sup('a','relList','noreferrer'));
+T('a rel opener', sup('a','relList','opener'));
+T('a rel stylesheet', sup('a','relList','stylesheet'));
+T('area rel noopener', sup('area','relList','noopener'));
+T('form rel noopener', sup('form','relList','noopener'));
+
+T('iframe sandbox allow-scripts', sup('iframe','sandbox','allow-scripts'));
+T('iframe sandbox allow-same-origin', sup('iframe','sandbox','allow-same-origin'));
+T('iframe sandbox allow-downloads', sup('iframe','sandbox','allow-downloads'));
+T('iframe sandbox nonsense', sup('iframe','sandbox','nonsense'));
+
+/* A list with no defined token set throws, and that part was right. */
+T('div classList', sup('div','classList','anything'));
+T('output htmlFor', sup('output','htmlFor','anything'));
+
+/* supports takes an argument. */
+var l=document.createElement('link').relList;
+try{l.supports();T('supports with no argument','no throw');}
+catch(e){T('supports with no argument', e.name);}
+</script></body></html>

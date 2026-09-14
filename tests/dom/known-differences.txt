@@ -30,3 +30,24 @@ SVG element names are upper-cased
   lower-cases what libdom gives, which is right for HTML and no worse
   than before for SVG. Fixing it means patching libdom's element
   creation, which NetSurf's own code compares against.
+
+A template's content belongs to the template's own document
+  The specification gives every document a separate, inert "template
+  contents owner" document, and a template's content fragment belongs to
+  that one rather than to the document the template is in. Here the
+  fragment is made in the template's own document, so
+  template.content.ownerDocument is the document the template came from
+  where a browser reports the inert one. Nothing a page does with the
+  content differs; building the second document per document would cost
+  memory for a value almost nothing reads.
+  Affects: tests/dom/template.html ("parsed content ownerDocument").
+
+Inserting a node from another document does not adopt it
+  The current specification has no WRONG_DOCUMENT_ERR: inserting a node
+  adopts it into the parent's document first. libdom still refuses the
+  insert, and its own adoptNode duplicates the node rather than re-owning
+  it, so a node cannot be moved between documents here. Use importNode,
+  which pages already do. ownerDocument now reports the real document, so
+  anything built for a foreign node is built in the right place and the
+  case that used to fail silently -- a template parsed by DOMParser
+  handing back empty content -- works.

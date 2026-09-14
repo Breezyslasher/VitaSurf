@@ -68,7 +68,6 @@ Object.defineProperty(P,'lastElementChild',{configurable:true,get:function(){var
 Object.defineProperty(P,'parentElement',{configurable:true,get:function(){var p=this.parentNode;return p&&p.nodeType===1?p:null;}});
 Object.defineProperty(P,'innerText',{configurable:true,get:function(){return this.textContent;},set:function(v){this.textContent=v;}});
 Object.defineProperty(P,'outerHTML',{configurable:true,get:function(){return '';}});
-Object.defineProperty(P,'ownerDocument',{configurable:true,get:function(){return document;}});
 ['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){if(!reflectsOn(this,a))return undefined;var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(attr,String(v));}});});
 /* The URL-valued attributes reflect as resolved absolute URLs, not as
  * written. getAttribute still gives what the document said. Code tests
@@ -576,20 +575,23 @@ window.Animation=FinishedAnimation;
  * a div lost a table row: <tr> outside a table is dropped by the HTML
  * parser. */
 function parseInContext(host,html){
- var tag=host&&host.tagName,tmp,f,wrap=null;
+ /* Parse into the host's own document: a fragment built here and filled
+  * with nodes from the page document cannot be inserted into a document
+  * that DOMParser or createHTMLDocument made. */
+ var tag=host&&host.tagName,tmp,f,wrap=null,HD=(host&&host.ownerDocument)||D;
  if(tag==='TABLE')wrap='table';
  else if(tag==='TBODY'||tag==='THEAD'||tag==='TFOOT')wrap='tbody';
  else if(tag==='TR')wrap='tr';
  else if(tag==='SELECT'||tag==='OPTGROUP')wrap='select';
  else if(tag==='COLGROUP')wrap='colgroup';
- f=D.createDocumentFragment();
+ f=HD.createDocumentFragment();
  if(wrap===null){
-  tmp=D.createElement(tag&&tag!=='HTML'?tag:'div');
+  tmp=HD.createElement(tag&&tag!=='HTML'?tag:'div');
   tmp.innerHTML=String(html);
  }else{
   /* the parser only keeps a row or a cell inside the table it belongs
      to, so build the table and dig back down to the same depth */
-  var outer=D.createElement('div'),path;
+  var outer=HD.createElement('div'),path;
   if(wrap==='table'){outer.innerHTML='<table>'+String(html)+'</table>';path=['TABLE'];}
   else if(wrap==='tbody'){outer.innerHTML='<table><tbody>'+String(html)+
    '</tbody></table>';path=['TABLE','TBODY'];}
@@ -1915,7 +1917,13 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   get:function(){
    if(this.tagName!=='TEMPLATE')return d.get.call(this);
    if(!Object.prototype.hasOwnProperty.call(this,'__content')){
-    var f=D.createDocumentFragment(),c=this.childNodes.slice(),i;
+    /* The template's own document, not the page's: a template that came
+     * out of DOMParser or createHTMLDocument belongs to another
+     * document, and its children cannot move into a fragment made
+     * here. Polymer parses its templates that way, so every node
+     * lookup came back undefined. */
+    var f=(this.ownerDocument||D).createDocumentFragment(),
+     c=this.childNodes.slice(),i;
     for(i=0;i<c.length;i++)f.appendChild(c[i]);
     Object.defineProperty(this,'__content',
      {configurable:true,writable:true,value:f});
@@ -1932,7 +1940,8 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   var c=clone.call(this,deep);
   if(this.tagName==='TEMPLATE'&&deep&&
      Object.prototype.hasOwnProperty.call(this,'__content')){
-   var f=D.createDocumentFragment(),src=this.__content.childNodes,i;
+   var f=(c.ownerDocument||D).createDocumentFragment(),
+    src=this.__content.childNodes,i;
    for(i=0;i<src.length;i++)f.appendChild(src[i].cloneNode(true));
    Object.defineProperty(c,'__content',
     {configurable:true,writable:true,value:f});
@@ -2171,10 +2180,35 @@ TokenList.prototype.replace=function(a,b){
  else t[i]=b;
  this._w(t);
  return true;};
-/* Nothing here has a token list with a defined set of valid tokens, and
-   the specification says to throw for one that has none. */
-TokenList.prototype.supports=function(){
- throw new TypeError('supports() is not supported for this attribute.');};
+/* Three attributes have a defined set of valid tokens; every other token
+   list has none and the specification says to throw for those. Throwing
+   for all of them broke module loading outright: a bundler's preload
+   helper asks link.relList whether it supports 'modulepreload' to choose
+   between modulepreload and preload, and its `relList.supports &&` guard
+   does not save it from a supports() that exists and throws. That threw
+   out of the entry module, so claude.ai finished loading every one of its
+   chunks and then mounted nothing. The sets below are the ones a browser
+   reports, which is what a feature test is written against. */
+var REL_TOKENS={
+ LINK:('alternate canonical dns-prefetch icon apple-touch-icon manifest '+
+  'modulepreload next preconnect prefetch preload prerender stylesheet')
+  .split(' '),
+ A:['noopener','noreferrer','opener'],
+ AREA:['noopener','noreferrer','opener'],
+ FORM:['noopener','noreferrer','opener']};
+var SANDBOX_TOKENS=('allow-downloads allow-forms allow-modals '+
+ 'allow-orientation-lock allow-pointer-lock allow-popups '+
+ 'allow-popups-to-escape-sandbox allow-presentation allow-same-origin '+
+ 'allow-scripts allow-storage-access-by-user-activation '+
+ 'allow-top-navigation allow-top-navigation-by-user-activation').split(' ');
+TokenList.prototype.supports=function(token){
+ needArgs(arguments.length,1,'supports');
+ var tag=this._e?String(this._e.tagName||'').toUpperCase():'',set=null;
+ if(this._a==='rel')set=REL_TOKENS[tag]||null;
+ else if(this._a==='sandbox'&&tag==='IFRAME')set=SANDBOX_TOKENS;
+ if(set===null)throw new TypeError(
+  'supports() is not supported for this attribute.');
+ return set.indexOf(String(token).toLowerCase())>=0;};
 TokenList.prototype.forEach=function(f,th){this._t().forEach(function(v,i){f.call(th,v,i,this);},this);};
 TokenList.prototype.keys=function(){return this._t().map(function(_,i){return i;})[Symbol.iterator]();};
 TokenList.prototype.values=function(){return this._t()[Symbol.iterator]();};
@@ -2193,8 +2227,18 @@ W.DOMTokenList=TokenList;
 Object.defineProperty(P,'classList',{configurable:true,
  get:function(){return new TokenList(this,'class');},
  set:function(v){this.setAttribute('class',String(v));}});
-/* label.htmlFor stays a string: the specification only makes output's a
- * list, and every page that reads it means the label's. */
+/* output.htmlFor is a token list; label.htmlFor is a string. Only
+ * output's gets the list, which is what the specification says and what
+ * a browser does -- a page that reads htmlFor almost always means the
+ * label's. */
+(function(){
+ var d=Object.getOwnPropertyDescriptor(P,'htmlFor');
+ Object.defineProperty(P,'htmlFor',{configurable:true,
+  get:function(){
+   if(this.tagName==='OUTPUT')return new TokenList(this,'for');
+   return d.get.call(this);},
+  set:function(v){d.set.call(this,v);}});
+})();
 [['relList','rel'],['sandbox','sandbox'],['part','part'],['blocking','blocking']]
  .forEach(function(e){var a=e[1];
   Object.defineProperty(P,e[0],{configurable:true,get:function(){return new TokenList(this,a);}});});
@@ -4118,9 +4162,23 @@ Blob.prototype.textStream=function(){return null;};
   s+='>';
   if(VOID.indexOf(' '+tag+' ')>=0)return s;
   return s+inner(n)+'</'+tag+'>';}
+ /* A template's innerHTML is its content's, not its own: the children
+  * were moved into the content fragment, so serialising the element
+  * gave the empty string and assigning to it left the content alone. */
+ function isTemplate(n){return n&&n.tagName==='TEMPLATE';}
  Object.defineProperty(P,'innerHTML',{configurable:true,
-  get:function(){var v=(d&&d.get)?d.get.call(this):'';return v?v:inner(this);},
-  set:(d&&d.set)?d.set:function(){}});
+  get:function(){
+   if(isTemplate(this))return inner(this.content);
+   var v=(d&&d.get)?d.get.call(this):'';return v?v:inner(this);},
+  set:function(v){
+   if(isTemplate(this)&&
+      Object.prototype.hasOwnProperty.call(this,'__content')){
+    var f=this.content,g;
+    while(f.firstChild)f.removeChild(f.firstChild);
+    g=parseInContext(this,v===null?'':String(v));
+    while(g.firstChild)f.appendChild(g.firstChild);
+    return;}
+   if(d&&d.set)d.set.call(this,v);}});
  Object.defineProperty(P,'outerHTML',{configurable:true,
   get:function(){return ser(this);},
   set:function(h){
