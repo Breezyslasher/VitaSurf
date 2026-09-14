@@ -53,6 +53,11 @@
 
 #include "vita_platform.h"
 
+/* JavaScript's share of the C stack: see js_newheap. */
+#define JS_STACK_DEFAULT (1024 * 1024)
+#define JS_STACK_MAX     (2 * 1024 * 1024)
+#define JS_STACK_MIN     (96 * 1024)
+
 /* guit->misc->schedule lives behind the core's gui table. */
 #include "desktop/gui_internal.h"
 #include "netsurf/misc.h"
@@ -4632,7 +4637,33 @@ nserror js_newheap(int timeout, jsheap **heap)
 			       qjs_module_loader, NULL);
 	JS_SetHostPromiseRejectionTracker(ret->rt, qjs_rejection_tracker, NULL);
 	JS_SetMemoryLimit(ret->rt, 96 * 1024 * 1024);
-	JS_SetMaxStackSize(ret->rt, 1024 * 1024);
+	{
+		/*
+		 * Measured against the stack the thread actually got, never
+		 * against the one that was asked for: a guard larger than
+		 * the stack it guards never fires, and the overflow then
+		 * arrives as a data abort rather than a catchable error.
+		 * That is what happened when --gc-sections dropped the
+		 * stack size request and left the runtime's 256 KB default
+		 * behind while this was set to a megabyte.
+		 *
+		 * Half the stack, so the CSS selection and layout recursion
+		 * underneath still have room, and capped so a large stack
+		 * does not let a runaway script recurse for seconds before
+		 * the guard notices.
+		 */
+		size_t js_stack = JS_STACK_DEFAULT;
+
+		if (vita_main_stack_bytes > 0) {
+			js_stack = vita_main_stack_bytes / 2;
+			if (js_stack > JS_STACK_MAX) js_stack = JS_STACK_MAX;
+			if (js_stack < JS_STACK_MIN) js_stack = JS_STACK_MIN;
+		}
+		JS_SetMaxStackSize(ret->rt, js_stack);
+		vita_log("qjs: recursion guard %u KB of a %u KB stack",
+			 (unsigned int)(js_stack / 1024),
+			 (unsigned int)(vita_main_stack_bytes / 1024));
+	}
 	/* register the shared node class once per runtime */
 	JS_NewClassID(ret->rt, &node_class_id);
 	JS_NewClass(ret->rt, node_class_id, &node_class);

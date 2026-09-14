@@ -168,6 +168,12 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--wrap=main
     -Wl,-q
     -Wl,--gc-sections
+    # The C runtime reads these two weakly, so --gc-sections is entitled
+    # to drop the definitions and leave its own defaults behind. Naming
+    # them as link roots keeps them: without this the main thread ran on
+    # the 256 KB default stack instead of VITASURF_STACK_KB.
+    -Wl,--undefined=sceUserMainThreadStackSize
+    -Wl,--undefined=_newlib_heap_size_user
     -Wl,--defsym,__sce_headroom=0x10000
 )
 

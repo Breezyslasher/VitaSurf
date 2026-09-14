@@ -112,6 +112,14 @@ int vita_read_file(const char *path, char **data, size_t *len);
 int vita_verbose_requested(void);
 
 /**
+ * The main thread's stack size in bytes, as the kernel reports it, or 0
+ * before it has been measured. Not what was requested: --gc-sections can
+ * drop the request and leave the runtime's own default behind, so
+ * anything sized against the stack must use this.
+ */
+extern unsigned int vita_main_stack_bytes;
+
+/**
  * NetSurf file operation table with Vita path translation (vita_file.c).
  * Installed into the framebuffer frontend's netsurf_table by
  * patches/0002-netsurf-vita-gui-hooks.patch.
