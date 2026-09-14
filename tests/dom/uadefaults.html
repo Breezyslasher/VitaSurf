@@ -1,0 +1,27 @@
+<!DOCTYPE html><html><head><title>uadefaults</title></head><body>
+<pre id="out"></pre>
+<p id="plain">x</p>
+<p id="hid" hidden>x</p>
+<div id="hidanc" hidden><p id="hidkid">x</p></div>
+<dialog id="dlgclosed"><p>x</p></dialog>
+<dialog id="dlgopen" open><p>x</p></dialog>
+<datalist id="dl"><option>x</option></datalist>
+<p id="untilfound" hidden="until-found">x</p>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+/* The rendering rules in the HTML specification are a stylesheet a
+   browser applies before the page's own. The hidden attribute matters
+   most: it is how a page keeps markup in the document but out of the
+   way, and without it every collapsed menu and every error partial a
+   site ships is drawn. */
+function boxed(id){var e=document.getElementById(id);
+ if(!e)return 'missing';
+ var r=e.getBoundingClientRect();
+ return (r.width===0&&r.height===0)?'no box':'has a box';}
+function report(){
+ ['plain','hid','hidanc','hidkid','dlgclosed','dlgopen','dl','untilfound']
+  .forEach(function(id){ T(id, boxed(id)); });
+}
+window.addEventListener('load', function(){ setTimeout(report, 300); });
+</script></body></html>
