@@ -686,7 +686,96 @@ function otherActivation(el){
   if(n&&n.tagName==='DETAILS'&&n.firstElementChild===el)
    return {kind:'details',el:n};
   return null;}
+ if(tag==='LABEL'){
+  n=labelControl(el);
+  return n?{kind:'label',el:el,control:n}:null;}
+ if((tag==='A'||tag==='AREA')&&el.hasAttribute('href'))
+  return {kind:'link',el:el};
  return null;}
+/* The control a label is for: the one it names, or the first one it
+   contains. */
+function labelControl(label){
+ var id=label.getAttribute('for'),c,all,i;
+ if(id!==null&&id!==''){
+  c=D.getElementById(id);
+  return c&&LABELABLE.indexOf(' '+c.tagName+' ')>=0?c:null;}
+ all=label.getElementsByTagName('*');
+ for(i=0;i<all.length;i++)
+  if(LABELABLE.indexOf(' '+all[i].tagName+' ')>=0)return all[i];
+ return null;}
+var LABELABLE=' BUTTON INPUT METER OUTPUT PROGRESS SELECT TEXTAREA ';
+/* The element whose activation behaviour a click runs: the nearest one
+   from the target upwards that has one. A click on a span inside a
+   label activates the label; a click on a button inside that label
+   activates the button and not the label, which is why this walks up
+   rather than looking only at what was clicked. */
+function activationTarget(target){
+ var n=target,a;
+ while(n&&n.nodeType===1){
+  a=otherActivation(n);
+  if(a)return a;
+  a=preActivate(n);
+  if(a)return a;
+  n=n.parentNode;}
+ return null;}
+/* Following a link. A href that differs from where we are only in its
+   fragment is a same-document navigation: the page does not reload, the
+   hash changes, hashchange fires and the target is scrolled to. Anything
+   else is a real navigation, deferred like a form submission so it does
+   not tear the page down inside its own dispatch. */
+function sameDocFragment(from,to){
+ var i=from.indexOf('#'),j=to.indexOf('#');
+ var a=i<0?from:from.slice(0,i),b=j<0?to:to.slice(0,j);
+ return a===b&&j>=0;}
+function goTo(url){
+ var here,target;
+ if(url===null||url===undefined)return;
+ url=String(url);
+ /* a javascript: link runs its script where it is; it is not a place to
+    go to, and navigating to one tore the page down */
+ if(/^\s*javascript:/i.test(url)){
+  var src=url.replace(/^\s*javascript:/i,'');
+  try{src=decodeURIComponent(src);}catch(e){}
+  setTimeout(function(){
+   try{(0,eval)(src);}catch(err){
+    if(W.__vitaReportError)W.__vitaReportError(err,location.href);}},0);
+  return;}
+ try{here=location.href;}catch(e){return;}
+ var abs;
+ try{abs=new URL(String(url),D.baseURI||here).href;}catch(e){return;}
+ if(sameDocFragment(here,abs)){
+  var oldURL=here,hash=abs.slice(abs.indexOf('#'));
+  W.__vitaHref=abs;
+  try{target=hash.length>1?
+   (D.getElementById(decodeURIComponent(hash.slice(1)))||null):null;}catch(e){}
+  if(target&&target.scrollIntoView)try{target.scrollIntoView();}catch(e){}
+  setTimeout(function(){
+   var ev=new W.HashChangeEvent('hashchange',
+    {bubbles:false,cancelable:false});
+   ev.oldURL=oldURL;ev.newURL=abs;
+   try{W.dispatchEvent?W.dispatchEvent(ev):__vitaDispatch(null,ev);}catch(e){}
+  },0);
+  return;}
+ setTimeout(function(){try{location.href=abs;}catch(e){}},0);}
+/* location.href reads back what a same-document navigation left. */
+(function(){
+ var d=Object.getOwnPropertyDescriptor(location,'href');
+ if(!d||!d.get)d=Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(location)||{},'href');
+ if(!d||!d.get||!d.set)return;
+ Object.defineProperty(location,'href',{configurable:true,
+  get:function(){return W.__vitaHref||d.get.call(location);},
+  set:function(v){
+   var abs;
+   try{abs=new URL(String(v),W.__vitaHref||d.get.call(location)).href;}
+   catch(e){abs=String(v);}
+   if(sameDocFragment(W.__vitaHref||d.get.call(location),abs)){goTo(abs);return;}
+   W.__vitaHref=null;d.set.call(location,v);}});
+ Object.defineProperty(location,'hash',{configurable:true,
+  get:function(){var h=location.href,i=h.indexOf('#');return i<0?'':h.slice(i);},
+  set:function(v){
+   v=String(v);
+   goTo(v.charAt(0)==='#'?v:'#'+v);}});})();
 function runActivation(a){
  if(!a)return;
  if(a.kind==='submit'){
@@ -703,7 +792,11 @@ function runActivation(a){
  if(a.kind==='details'){
   var open=!a.el.hasAttribute('open');
   if(open)a.el.setAttribute('open','');else a.el.removeAttribute('open');
-  fireSimple(a.el,'toggle');}}
+  fireSimple(a.el,'toggle');return;}
+ if(a.kind==='label'){
+  /* the label passes the click on to the control it names */
+  if(a.control&&a.control.click)a.control.click();return;}
+ if(a.kind==='link')goTo(a.el.getAttribute('href'));}
 function cancelActivate(was){
  var i;
  if(!was)return;
@@ -719,21 +812,20 @@ function fireSimple(el,type){
  var e=new Event(type,{bubbles:true,cancelable:false});
  try{el.dispatchEvent(e);}catch(err){}}
 P.dispatchEvent=function(e){
- var was=null,other=null,r;
+ var act=null,r;
  if(e&&String(e.type)==='click'&&!e.__vitaActivated){
   shadowProp(e,'__vitaActivated',true);
-  was=preActivate(this);
-  if(!was)other=otherActivation(this);}
+  act=activationTarget(this);}
  r=__vitaDispatch(this,e);
  /* dispatchEvent answers false when the event was cancelled, which is
     how requestSubmit and every other caller learns it was. */
  if(e&&e.cancelable&&e.defaultPrevented)r=false;
- if(was){
+ if(act&&(act.kind==='checkbox'||act.kind==='radio')){
   /* a cancelled click puts the control back, which is what the
      specification calls legacy-canceled-activation behaviour */
-  if(e.defaultPrevented)cancelActivate(was);
-  else fireAfterActivate(was);}
- else if(other&&!e.defaultPrevented)runActivation(other);
+  if(e.defaultPrevented)cancelActivate(act);
+  else fireAfterActivate(act);}
+ else if(act&&!e.defaultPrevented)runActivation(act);
  return r;};P.getContext=function(){return null;};
 P.add=function(o,before){this.insertBefore(o,before||null);};
 Object.defineProperty(P,'options',{configurable:true,get:function(){return this.getElementsByTagName('option');}});
