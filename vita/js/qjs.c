@@ -94,6 +94,7 @@ struct js_deferred {
 	size_t len;
 	char *name;
 	int tries;
+	unsigned modules;   /**< js_modules when it last failed */
 };
 
 /*
@@ -5144,6 +5145,44 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 }
 
 
+/*
+ * Evaluating a module yields a promise. It settles synchronously unless
+ * the module awaits at its top level, so drain the job queue and then
+ * read it: otherwise a module that threw would be recorded as having run
+ * cleanly, and a page whose entry module failed would look like a page
+ * whose scripts all succeeded and simply drew nothing.
+ */
+static JSValue settle_module(jsthread *thread, JSValue ret, const char *name)
+{
+	JSPromiseStateEnum st;
+
+	if (!JS_IsPromise(ret)) {
+		return ret;
+	}
+	for (;;) {
+		JSContext *c = NULL;
+		int r = JS_ExecutePendingJob(thread->heap->rt, &c);
+
+		if (r <= 0) {
+			if (r < 0 && c != NULL) {
+				qjs_report_exception(c);
+			}
+			break;
+		}
+	}
+	st = JS_PromiseState(thread->ctx, ret);
+	if (st == JS_PROMISE_REJECTED) {
+		JSValue err = JS_PromiseResult(thread->ctx, ret);
+
+		JS_FreeValue(thread->ctx, ret);
+		return JS_Throw(thread->ctx, err);
+	}
+	if (st == JS_PROMISE_PENDING) {
+		vita_log("qjs: module still pending: %s", name);
+	}
+	return ret;
+}
+
 #define MODULE_RETRY_MS    300
 #define MODULE_RETRY_TRIES 20
 
@@ -5225,7 +5264,9 @@ static void module_retry_callback(void *p)
 			vita_log("qjs: module '%s' ready after %d tries",
 				 d->name, d->tries + 1);
 			begin_script(thread);
-			ret = JS_EvalFunction(thread->ctx, fn);
+			ret = settle_module(thread,
+					    JS_EvalFunction(thread->ctx, fn),
+					    d->name);
 			if (JS_IsException(ret)) {
 				qjs_report_exception_src(thread->ctx, d->name,
 							 NULL, 0);
@@ -5241,6 +5282,16 @@ static void module_retry_callback(void *p)
 		JS_FreeValue(thread->ctx, fn);
 		thread->current_script = NULL;
 		end_script(thread);
+		/*
+		 * A graph several chunks deep needs one round per chunk, so
+		 * a round that compiled something is progress however long
+		 * the graph turns out to be: only stalled rounds count
+		 * against the limit. GitHub reaches ninety modules.
+		 */
+		if (thread->js_modules != d->modules) {
+			d->modules = thread->js_modules;
+			d->tries = 0;
+		}
 		d->tries++;
 		if (d->tries >= MODULE_RETRY_TRIES ||
 		    thread->js_imports_missed == missed) {
@@ -5446,36 +5497,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 					ret = JS_Throw(thread->ctx, err);
 				}
 			}
-			/*
-			 * Evaluating a module yields a promise. It settles
-			 * synchronously unless the module awaits at its top
-			 * level, so drain the job queue and then read it:
-			 * otherwise a module that threw would be recorded as
-			 * having run cleanly.
-			 */
-			if (JS_IsPromise(ret)) {
-				JSPromiseStateEnum st;
-
-				for (;;) {
-					JSContext *c = NULL;
-					int r = JS_ExecutePendingJob(thread->heap->rt, &c);
-					if (r <= 0) {
-						if (r < 0 && c != NULL) {
-							qjs_report_exception(c);
-						}
-						break;
-					}
-				}
-				st = JS_PromiseState(thread->ctx, ret);
-				if (st == JS_PROMISE_REJECTED) {
-					JSValue err = JS_PromiseResult(thread->ctx, ret);
-					JS_FreeValue(thread->ctx, ret);
-					ret = JS_Throw(thread->ctx, err);
-				} else if (st == JS_PROMISE_PENDING) {
-					vita_log("qjs: module still pending: %s",
-						 name);
-				}
-			}
+			ret = settle_module(thread, ret, name);
 		}
 		t_done = now_ms();
 
@@ -5530,7 +5552,7 @@ bool js_fire_event(jsthread *thread, const char *type,
 	if (strcmp(type, "load") == 0) {
 		vita_log("qjs: load event, runtime memory %u KB; "
 			 "%u scripts of %u KB compiled in %u ms, ran in %u ms"
-			 "; %u modules, %u imports unresolved",
+			 "; %u modules, %u import misses",
 			 runtime_kb(thread->heap->rt),
 			 thread->js_scripts, thread->js_bytes / 1024,
 			 thread->js_compile_ms, thread->js_run_ms,
