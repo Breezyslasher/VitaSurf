@@ -1,5 +1,5 @@
 diff --git a/src/parse/language.c b/src/parse/language.c
-index 96c9725..891cc19 100644
+index 96c9725..85baafb 100644
 --- a/src/parse/language.c
 +++ b/src/parse/language.c
 @@ -98,6 +98,17 @@ static css_error parseSelector(css_language *c,
@@ -138,7 +138,7 @@ index 96c9725..891cc19 100644
  		/* Rule is now owned by the sheet,
  		 * so no need to destroy it */
  
-@@ -1831,6 +1934,139 @@ css_error parseSpecific(css_language *c,
+@@ -1831,6 +1934,186 @@ css_error parseSpecific(css_language *c,
  	return CSS_OK;
  }
  
@@ -212,6 +212,53 @@ index 96c9725..891cc19 100644
 +	if (token == NULL)
 +		return CSS_INVALID;
 +
++	/*
++	 * :is() and :where() with nothing in them match nothing -- and
++	 * GitHub's stylesheet ships a literal ":is(){...}". Appending no
++	 * details at all would leave the bare universal selector behind,
++	 * so the rule would match every element instead of none: that one
++	 * rule sets width, height and position on everything and takes the
++	 * whole page with it. Append "not *" instead, which matches
++	 * nothing and needs no new machinery.
++	 */
++	if (tokenIsChar(token, ')')) {
++		css_selector_detail_value value;
++		css_selector_detail detail;
++		css_qname qname;
++		lwc_string *never = NULL;
++
++		/* "not *": the universal selector, negated */
++		if (lwc_intern_string("*", 1, &never) != lwc_error_ok)
++			return CSS_NOMEM;
++		if (never->insensitive == NULL &&
++				lwc__intern_caseless_string(never) !=
++				lwc_error_ok) {
++			lwc_string_unref(never);
++			return CSS_NOMEM;
++		}
++		qname.ns = NULL;
++		qname.name = never;
++		value.string = NULL;
++		error = css__stylesheet_selector_detail_init(c->sheet,
++				CSS_SELECTOR_ELEMENT, &qname, value,
++				CSS_SELECTOR_DETAIL_VALUE_STRING, true,
++				&detail);
++		if (error == CSS_OK) {
++			error = css__stylesheet_selector_append_specific(
++					c->sheet, parent, &detail);
++		}
++		lwc_string_unref(never);
++		if (error != CSS_OK)
++			return error;
++
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL || tokenIsChar(token, ')') == false)
++			return CSS_INVALID;
++		if (which == WHERE_FN)
++			(*parent)->specificity = before;
++		return CSS_OK;
++	}
++
 +	/* an argument may open with a type selector */
 +	if (token->type == CSS_TOKEN_IDENT || tokenIsChar(token, '*') ||
 +			tokenIsChar(token, '|')) {
@@ -278,7 +325,7 @@ index 96c9725..891cc19 100644
  css_error parseAppendSpecific(css_language *c,
  		const parserutils_vector *vector, int32_t *ctx,
  		css_selector **parent)
-@@ -1838,6 +2074,12 @@ css_error parseAppendSpecific(css_language *c,
+@@ -1838,6 +2121,12 @@ css_error parseAppendSpecific(css_language *c,
  	css_error error;
  	css_selector_detail specific;
  
@@ -291,7 +338,7 @@ index 96c9725..891cc19 100644
  	error = parseSpecific(c, vector, ctx, false, &specific);
  	if (error != CSS_OK)
  		return error;
-@@ -2101,44 +2343,125 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+@@ -2101,44 +2390,125 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
  	return CSS_OK;
  }
  
@@ -430,20 +477,20 @@ index 96c9725..891cc19 100644
 +		c->alt_choice[i] = 0;
 +		c->alt_count[i] = 1;
 +	}
- 
--		selector = NULL;
++
 +	do {
 +		css_selector *selector = NULL;
 +		int32_t local = start;
  
--		error = parseSelector(c, vector, &ctx, &selector);
+-		selector = NULL;
 +		c->alt_seen = 0;
-+
+ 
+-		error = parseSelector(c, vector, &ctx, &selector);
 +		error = parseSelector(c, vector, &local, &selector);
  		if (error != CSS_OK) {
  			if (selector != NULL) {
  				css__stylesheet_selector_destroy(c->sheet,
-@@ -2146,8 +2469,8 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
+@@ -2146,8 +2516,8 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
  			}
  			return error;
  		}
@@ -453,7 +500,7 @@ index 96c9725..891cc19 100644
  
  		error = css__stylesheet_rule_add_selector(c->sheet, rule,
  				selector);
-@@ -2155,6 +2478,39 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
+@@ -2155,6 +2525,39 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
  			css__stylesheet_selector_destroy(c->sheet, selector);
  			return error;
  		}
@@ -556,3 +603,33 @@ index b0a1785..b808a17 100644
  
  	/* Media types */
  	AURAL, BRAILLE, EMBOSSED, HANDHELD, PRINT, PROJECTION,
+diff --git a/src/select/select.c b/src/select/select.c
+index faea445..59bfbfb 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -2500,13 +2500,18 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 
+ 	switch (detail->type) {
+ 	case CSS_SELECTOR_ELEMENT:
+-		if (detail->negate != 0) {
+-			/* Only need to test this inside not(), since
+-			 * it will have been considered as a named node
+-			 * otherwise. */
+-			error = state->handler->node_has_name(state->pw, node,
+-					&detail->qname, match);
+-		}
++		/*
++		 * match_details skips the first detail -- the type
++		 * selector, already matched by the hash bucket -- so an
++		 * element detail arriving here is an extra one, written
++		 * inside :not(), :is() or :where(). Both directions have
++		 * to be tested. Only the negated one was, which left
++		 * :is(div.c) matching any .c whatever its tag, and an
++		 * empty :is(), which matches nothing, matching everything
++		 * (VitaSurf).
++		 */
++		error = state->handler->node_has_name(state->pw, node,
++				&detail->qname, match);
+ 		break;
+ 	case CSS_SELECTOR_CLASS:
+ 		error = state->handler->node_has_class(state->pw, node,

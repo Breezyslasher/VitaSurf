@@ -27,6 +27,15 @@ p:is(.compound) { display: none; }
 :is(.outer .inner) { display: none; }
 :is(.btn.primary) { display: none; }
 :is(div#istype) { display: none; }
+
+/* An empty :is() matches nothing. GitHub's stylesheet ships a literal
+   ":is(){...}" that sets width, height and position; taken as the
+   universal selector it applies to every element on the page. */
+:is() { display: none; }
+/* The type selector inside the argument has to be tested too, or
+   :is(div.x) matches any .x whatever its tag. */
+:is(div.tagged) { display: none; }
+:is(p.tagged2) { display: none; }
 :is(.grpA, .grpB.grpC) { display: none; }
 
 /* Custom properties defined inside a transparent at-rule. A stylesheet
@@ -62,6 +71,9 @@ p:is(.compound) { display: none; }
 <div class="outer" id="outerdiv"><p id="inner2" class="inner">x</p></div>
 <p id="btn" class="btn primary">x</p>
 <div id="istype">x</div>
+<p id="emptyis">x</p>
+<p id="wrongtag" class="tagged">x</p>
+<p id="righttag" class="tagged2">x</p>
 <p id="grp1" class="grpA">x</p><p id="grp2" class="grpB grpC">x</p>
 <p id="grp3" class="grpB">x</p>
 <p id="isdescend"><span id="isdescendkid">x</span></p>
@@ -84,7 +96,8 @@ function report(){
   'inwhere','inis','inhas','innest','incontainer','afterlayer',
   'layerlist','afterlayerlist','control',
   'islistA','islistB','wherelist','compound','inner2','outerdiv',
-  'btn','istype','grp1','grp2','grp3','isdescendkid',
+  'btn','istype','emptyis','wrongtag','righttag','grp1','grp2','grp3',
+  'isdescendkid',
   'specwhere','speciscls','vartop','varlayer','varsupports',
   'varfallback'].forEach(function(id){
    T(id, hidden(id));});}
