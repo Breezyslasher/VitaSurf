@@ -183,6 +183,38 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     set(VITASURF_JS_LIBS quickjs)
 endif()
 
+# Image decoders that are only in libnetsurf.a when the toolchain had
+# them (see vita/netsurf/Makefile.config). The NetSurf build decides
+# with pkg-config and links nothing itself -- the final link is here --
+# so the same question is asked again, of the sysroot, and asked of the
+# pkg-config file rather than the library, because that is what the
+# NetSurf build looked at. Anything else risks linking a library whose
+# handler is not there, or worse, the other way round.
+set(VITASURF_IMAGE_LIBS "")
+if(EXISTS "${SYSROOT}/lib/pkgconfig/libwebp.pc")
+    list(APPEND VITASURF_IMAGE_LIBS webp)
+    # Split out of libwebp in 1.3; older versions have no such library.
+    if(EXISTS "${SYSROOT}/lib/libsharpyuv.a")
+        list(APPEND VITASURF_IMAGE_LIBS sharpyuv)
+    endif()
+endif()
+if(EXISTS "${SYSROOT}/lib/pkgconfig/libjxl.pc")
+    list(APPEND VITASURF_IMAGE_LIBS jxl)
+    if(EXISTS "${SYSROOT}/lib/libhwy.a")
+        list(APPEND VITASURF_IMAGE_LIBS hwy)
+    endif()
+    if(EXISTS "${SYSROOT}/lib/libbrotlidec.a")
+        list(APPEND VITASURF_IMAGE_LIBS brotlidec brotlicommon)
+    endif()
+    # libjxl is C++; nothing else here is.
+    list(APPEND VITASURF_IMAGE_LIBS stdc++)
+endif()
+if(VITASURF_IMAGE_LIBS)
+    message(STATUS "extra image decoders: ${VITASURF_IMAGE_LIBS}")
+else()
+    message(STATUS "extra image decoders: none (png, jpeg, gif, bmp and svg only)")
+endif()
+
 target_link_libraries(${PROJECT_NAME}
     -Wl,--whole-archive
     ${NETSURF_LIB}
@@ -196,6 +228,7 @@ target_link_libraries(${PROJECT_NAME}
     # libvita2d (MIT) puts the page on screen through the GPU so that the
     # system IME dialog can draw over it.
     vita2d png jpeg freetype z bz2 pthread m
+    ${VITASURF_IMAGE_LIBS}
     -Wl,--end-group
     SceGxm_stub
     SceDisplay_stub
