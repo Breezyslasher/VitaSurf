@@ -1,0 +1,205 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 96c9725..1b38f2a 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -876,6 +876,65 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+ 			return error;
+ 		}
+ 
++		/* Rule is now owned by the sheet,
++		 * so no need to destroy it */
++
++		c->state = HAD_RULE;
++	} else if (((lwc_string_caseless_isequal(atkeyword->idata,
++			c->strings[LAYER], &match) == lwc_error_ok && match) ||
++		    (lwc_string_caseless_isequal(atkeyword->idata,
++			c->strings[SUPPORTS], &match) == lwc_error_ok &&
++			match))) {
++		css_mq_query *media;
++
++		/*
++		 * @layer and @supports, treated as transparent: whatever
++		 * their prelude says, the rules inside are taken as though
++		 * they had been written here. An at-rule this parser does
++		 * not know is skipped along with its whole block, and
++		 * modern stylesheets put nearly everything inside these
++		 * two -- GitHub's is built on @layer -- so the alternative
++		 * is a page with almost no style at all.
++		 *
++		 * What this gives up is their real meaning. A layer's
++		 * rules lose to any unlayered rule in a browser, and here
++		 * they take part in the cascade like everything else, so
++		 * where a sheet relies on that a rule can win that should
++		 * have lost. @supports is not evaluated at all, so a block
++		 * guarded on a feature is applied whether or not the
++		 * feature is here. Both are closer to the intended page
++		 * than dropping the rules.
++		 *
++		 * They are carried as a media rule whose query always
++		 * matches -- "not (no media type)" -- because nesting,
++		 * selection and the cascade already handle that shape.
++		 */
++		media = malloc(sizeof(*media));
++		if (media == NULL)
++			return CSS_NOMEM;
++		memset(media, 0, sizeof(*media));
++		media->negate_type = 1;
++
++		error = css__stylesheet_rule_create(c->sheet,
++				CSS_RULE_MEDIA, &rule);
++		if (error != CSS_OK) {
++			css__mq_query_destroy(media);
++			return error;
++		}
++
++		error = css__stylesheet_rule_set_media(c->sheet, rule, media);
++		if (error != CSS_OK) {
++			css__stylesheet_rule_destroy(c->sheet, rule);
++			css__mq_query_destroy(media);
++			return error;
++		}
++
++		error = css__stylesheet_add_rule(c->sheet, rule, NULL);
++		if (error != CSS_OK) {
++			css__stylesheet_rule_destroy(c->sheet, rule);
++			return error;
++		}
++
+ 		/* Rule is now owned by the sheet,
+ 		 * so no need to destroy it */
+ 
+@@ -1630,6 +1689,8 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 		{ DISABLED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ CHECKED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ NOT, CSS_SELECTOR_PSEUDO_CLASS },
++		{ IS_FN, CSS_SELECTOR_PSEUDO_CLASS },
++		{ WHERE_FN, CSS_SELECTOR_PSEUDO_CLASS },
+ 
+ 		{ FIRST_LINE, CSS_SELECTOR_PSEUDO_ELEMENT },
+ 		{ FIRST_LETTER, CSS_SELECTOR_PSEUDO_ELEMENT },
+@@ -1690,9 +1751,14 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 	if (require_element && type != CSS_SELECTOR_PSEUDO_ELEMENT)
+ 		return CSS_INVALID;
+ 
+-	/* :not() and pseudo elements are not permitted in :not() */
++	/* :not() and pseudo elements are not permitted in :not(); :is()
++	 * and :where() are not nested inside one another either, since
++	 * each produces a single detail and there is nowhere to put a
++	 * second (VitaSurf) */
+ 	if (in_not && (type == CSS_SELECTOR_PSEUDO_ELEMENT ||
+-			pseudo_lut[lut_idx].index == NOT))
++			pseudo_lut[lut_idx].index == NOT ||
++			pseudo_lut[lut_idx].index == IS_FN ||
++			pseudo_lut[lut_idx].index == WHERE_FN))
+ 		return CSS_INVALID;
+ 
+ 	if (token->type == CSS_TOKEN_FUNCTION) {
+@@ -1720,7 +1786,22 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 				return error;
+ 
+ 			value_type = CSS_SELECTOR_DETAIL_VALUE_NTH;
+-		} else if (fun_type == NOT) {
++		} else if (fun_type == NOT || fun_type == IS_FN ||
++				fun_type == WHERE_FN) {
++			/*
++			 * :not(), :is() and :where() all take a selector
++			 * and match against it; :not() inverts the answer
++			 * and the other two do not. Only a single argument
++			 * is understood here, so :is(a, b) is still
++			 * rejected and takes its rule with it -- but the
++			 * single-argument form is what a stylesheet uses to
++			 * hold a rule's specificity down, and that form now
++			 * works rather than losing the rule.
++			 *
++			 * :where() contributes nothing to specificity. The
++			 * flag is read by parseAppendSpecific, which undoes
++			 * what appending the detail added.
++			 */
+ 			/* type_selector | specific */
+ 			token = parserutils_vector_peek(vector, *ctx);
+ 			if (token == NULL)
+@@ -1761,7 +1842,9 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 				value_type = det.value_type;
+ 			}
+ 
+-			negate = true;
++			negate = (fun_type == NOT);
++			if (fun_type == WHERE_FN)
++				c->zero_specificity = true;
+ 
+ 			consumeWhitespace(vector, ctx);
+ 		}
+@@ -1838,12 +1921,24 @@ css_error parseAppendSpecific(css_language *c,
+ 	css_error error;
+ 	css_selector_detail specific;
+ 
++	uint32_t before = (*parent)->specificity;
++
++	c->zero_specificity = false;
++
+ 	error = parseSpecific(c, vector, ctx, false, &specific);
+-	if (error != CSS_OK)
++	if (error != CSS_OK) {
++		c->zero_specificity = false;
+ 		return error;
++	}
+ 
+-	return css__stylesheet_selector_append_specific(c->sheet, parent,
++	error = css__stylesheet_selector_append_specific(c->sheet, parent,
+ 			&specific);
++	/* :where()'s argument matches but counts for nothing */
++	if (error == CSS_OK && c->zero_specificity)
++		(*parent)->specificity = before;
++	c->zero_specificity = false;
++
++	return error;
+ }
+ 
+ css_error parseSelectorSpecifics(css_language *c,
+diff --git a/src/parse/language.h b/src/parse/language.h
+index b20d9a0..ad29c5e 100644
+--- a/src/parse/language.h
++++ b/src/parse/language.h
+@@ -50,6 +50,12 @@ typedef struct css_language {
+ 	lwc_string *default_namespace;	/**< Default namespace URI */
+ 	css_namespace *namespaces;	/**< Array of namespace mappings */
+ 	uint32_t num_namespaces;	/**< Number of namespace mappings */
++
++	/**
++	 * Set when the detail just parsed came out of :where(), whose
++	 * arguments add nothing to a selector's specificity (VitaSurf).
++	 */
++	bool zero_specificity;
+ } css_language;
+ 
+ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index 8c2ccf4..d8857c2 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -43,6 +43,10 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("namespace"),
+ 	SMAP("font-face"),
+ 	SMAP("page"),
++	SMAP("layer"),
++	SMAP("supports"),
++	SMAP("is"),
++	SMAP("where"),
+ 
+ 	SMAP("aural"),
+ 	SMAP("braille"),
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index b0a1785..b808a17 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -20,6 +20,10 @@ enum {
+ 
+ 	/* At-rules */
+ 	CHARSET, LIBCSS_IMPORT, MEDIA, NAMESPACE, FONT_FACE, PAGE,
++	LAYER, SUPPORTS,
++
++	/* Functional pseudo-classes (VitaSurf) */
++	IS_FN, WHERE_FN,
+ 
+ 	/* Media types */
+ 	AURAL, BRAILLE, EMBOSSED, HANDHELD, PRINT, PROJECTION,

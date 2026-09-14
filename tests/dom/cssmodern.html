@@ -15,6 +15,20 @@
 #nest { color: red; & #innest { display: none; } }
 @container (min-width: 1px) { #incontainer { display: none; } }
 #afterlayer { display: none; }
+
+/* the list form, and the shapes an argument can take */
+:is(#islistA, #islistB) { display: none; }
+:where(#wherelist, #nothinghere) { display: none; }
+p:is(.compound) { display: none; }
+:is(.outer .inner) { display: none; }
+:is(#isdescend) span { display: none; }
+
+/* specificity: :where() adds nothing, :is() adds what its argument does.
+   The later rule here is the one that should win in each pair. */
+#specwhere { display: none; }
+:where(#specwhere) { display: block; }
+.speciscls { display: block; }
+:is(.speciscls) { display: none; }
 </style>
 <style>@layer a, b;
 @layer a { #layerlist { display: none; } }
@@ -28,6 +42,11 @@
 <p id="inhas"><span>x</span></p>
 <p id="nest"><span id="innest">x</span></p>
 <p id="incontainer">x</p><p id="afterlayer">x</p>
+<p id="islistA">x</p><p id="islistB">x</p><p id="wherelist">x</p>
+<p id="compound" class="compound">x</p>
+<div class="outer"><p id="inner2" class="inner">x</p></div>
+<p id="isdescend"><span id="isdescendkid">x</span></p>
+<p id="specwhere">x</p><p id="speciscls" class="speciscls">x</p>
 <p id="layerlist">x</p><p id="afterlayerlist">x</p>
 <p id="control">x</p>
 <script>
@@ -42,7 +61,9 @@ function hidden(id){var e=document.getElementById(id);
 function report(){
  ['plain','inmedia','inlayer','anonlayer','insupports','insupportsnot',
   'inwhere','inis','inhas','innest','incontainer','afterlayer',
-  'layerlist','afterlayerlist','control'].forEach(function(id){
+  'layerlist','afterlayerlist','control',
+  'islistA','islistB','wherelist','compound','inner2','isdescendkid',
+  'specwhere','speciscls'].forEach(function(id){
    T(id, hidden(id));});}
 window.addEventListener('load', function(){ setTimeout(report, 300); });
 </script></body></html>
