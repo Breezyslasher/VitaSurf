@@ -21,6 +21,9 @@
 :where(#wherelist, #nothinghere) { display: none; }
 p:is(.compound) { display: none; }
 :is(.outer .inner) { display: none; }
+:is(.btn.primary) { display: none; }
+:is(div#istype) { display: none; }
+:is(.grpA, .grpB.grpC) { display: none; }
 :is(#isdescend) span { display: none; }
 
 /* specificity: :where() adds nothing, :is() adds what its argument does.
@@ -44,7 +47,11 @@ p:is(.compound) { display: none; }
 <p id="incontainer">x</p><p id="afterlayer">x</p>
 <p id="islistA">x</p><p id="islistB">x</p><p id="wherelist">x</p>
 <p id="compound" class="compound">x</p>
-<div class="outer"><p id="inner2" class="inner">x</p></div>
+<div class="outer" id="outerdiv"><p id="inner2" class="inner">x</p></div>
+<p id="btn" class="btn primary">x</p>
+<div id="istype">x</div>
+<p id="grp1" class="grpA">x</p><p id="grp2" class="grpB grpC">x</p>
+<p id="grp3" class="grpB">x</p>
 <p id="isdescend"><span id="isdescendkid">x</span></p>
 <p id="specwhere">x</p><p id="speciscls" class="speciscls">x</p>
 <p id="layerlist">x</p><p id="afterlayerlist">x</p>
@@ -62,7 +69,8 @@ function report(){
  ['plain','inmedia','inlayer','anonlayer','insupports','insupportsnot',
   'inwhere','inis','inhas','innest','incontainer','afterlayer',
   'layerlist','afterlayerlist','control',
-  'islistA','islistB','wherelist','compound','inner2','isdescendkid',
+  'islistA','islistB','wherelist','compound','inner2','outerdiv',
+  'btn','istype','grp1','grp2','grp3','isdescendkid',
   'specwhere','speciscls'].forEach(function(id){
    T(id, hidden(id));});}
 window.addEventListener('load', function(){ setTimeout(report, 300); });

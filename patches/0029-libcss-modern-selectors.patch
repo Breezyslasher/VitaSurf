@@ -1,8 +1,26 @@
 diff --git a/src/parse/language.c b/src/parse/language.c
-index 96c9725..1b38f2a 100644
+index 96c9725..0f35427 100644
 --- a/src/parse/language.c
 +++ b/src/parse/language.c
-@@ -876,6 +876,65 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+@@ -98,6 +98,17 @@ static css_error parseSelector(css_language *c,
+ static css_error parseSelectorList(css_language *c,
+ 		const parserutils_vector *vector, css_rule *rule);
+ 
++/* :is()/:where() argument lists (VitaSurf) */
++static int findAlternative(const parserutils_vector *vector, int32_t *ctx,
++		int want);
++static void skipToCloseParen(const parserutils_vector *vector, int32_t *ctx);
++static bool nextCombination(css_language *c);
++static bool isFunctionalGroup(css_language *c,
++		const parserutils_vector *vector, int32_t ctx, int *which);
++static css_error parseAppendGroup(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_selector **parent, int which);
++
+ /* Declaration parsing */
+ static css_error parseProperty(css_language *c,
+ 		const css_token *property, const parserutils_vector *vector,
+@@ -876,6 +887,65 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
  			return error;
  		}
  
@@ -68,99 +86,366 @@ index 96c9725..1b38f2a 100644
  		/* Rule is now owned by the sheet,
  		 * so no need to destroy it */
  
-@@ -1630,6 +1689,8 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
- 		{ DISABLED, CSS_SELECTOR_PSEUDO_CLASS },
- 		{ CHECKED, CSS_SELECTOR_PSEUDO_CLASS },
- 		{ NOT, CSS_SELECTOR_PSEUDO_CLASS },
-+		{ IS_FN, CSS_SELECTOR_PSEUDO_CLASS },
-+		{ WHERE_FN, CSS_SELECTOR_PSEUDO_CLASS },
+@@ -1831,6 +1901,139 @@ css_error parseSpecific(css_language *c,
+ 	return CSS_OK;
+ }
  
- 		{ FIRST_LINE, CSS_SELECTOR_PSEUDO_ELEMENT },
- 		{ FIRST_LETTER, CSS_SELECTOR_PSEUDO_ELEMENT },
-@@ -1690,9 +1751,14 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
- 	if (require_element && type != CSS_SELECTOR_PSEUDO_ELEMENT)
- 		return CSS_INVALID;
- 
--	/* :not() and pseudo elements are not permitted in :not() */
-+	/* :not() and pseudo elements are not permitted in :not(); :is()
-+	 * and :where() are not nested inside one another either, since
-+	 * each produces a single detail and there is nowhere to put a
-+	 * second (VitaSurf) */
- 	if (in_not && (type == CSS_SELECTOR_PSEUDO_ELEMENT ||
--			pseudo_lut[lut_idx].index == NOT))
-+			pseudo_lut[lut_idx].index == NOT ||
-+			pseudo_lut[lut_idx].index == IS_FN ||
-+			pseudo_lut[lut_idx].index == WHERE_FN))
- 		return CSS_INVALID;
- 
- 	if (token->type == CSS_TOKEN_FUNCTION) {
-@@ -1720,7 +1786,22 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
- 				return error;
- 
- 			value_type = CSS_SELECTOR_DETAIL_VALUE_NTH;
--		} else if (fun_type == NOT) {
-+		} else if (fun_type == NOT || fun_type == IS_FN ||
-+				fun_type == WHERE_FN) {
-+			/*
-+			 * :not(), :is() and :where() all take a selector
-+			 * and match against it; :not() inverts the answer
-+			 * and the other two do not. Only a single argument
-+			 * is understood here, so :is(a, b) is still
-+			 * rejected and takes its rule with it -- but the
-+			 * single-argument form is what a stylesheet uses to
-+			 * hold a rule's specificity down, and that form now
-+			 * works rather than losing the rule.
-+			 *
-+			 * :where() contributes nothing to specificity. The
-+			 * flag is read by parseAppendSpecific, which undoes
-+			 * what appending the detail added.
-+			 */
- 			/* type_selector | specific */
- 			token = parserutils_vector_peek(vector, *ctx);
- 			if (token == NULL)
-@@ -1761,7 +1842,9 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
- 				value_type = det.value_type;
- 			}
- 
--			negate = true;
-+			negate = (fun_type == NOT);
-+			if (fun_type == WHERE_FN)
-+				c->zero_specificity = true;
- 
- 			consumeWhitespace(vector, ctx);
- 		}
-@@ -1838,12 +1921,24 @@ css_error parseAppendSpecific(css_language *c,
++/**
++ * Is the token at ctx the start of :is( or :where()? (VitaSurf)
++ */
++static bool isFunctionalGroup(css_language *c,
++		const parserutils_vector *vector, int32_t ctx, int *which)
++{
++	const css_token *t = parserutils_vector_peek(vector, ctx);
++	bool match = false;
++
++	if (tokenIsChar(t, ':') == false)
++		return false;
++	t = parserutils_vector_peek(vector, ctx + 1);
++	if (t == NULL || t->type != CSS_TOKEN_FUNCTION)
++		return false;
++	if (lwc_string_caseless_isequal(t->idata, c->strings[IS_FN],
++			&match) == lwc_error_ok && match) {
++		*which = IS_FN;
++		return true;
++	}
++	if (lwc_string_caseless_isequal(t->idata, c->strings[WHERE_FN],
++			&match) == lwc_error_ok && match) {
++		*which = WHERE_FN;
++		return true;
++	}
++	return false;
++}
++
++/**
++ * Append the compound inside :is() or :where() to the selector being
++ * built (VitaSurf).
++ *
++ * The argument is appended as details of the enclosing compound, which
++ * is what :is(.a.b) and :is(div.c) mean, so it is handled here rather
++ * than in parsePseudo -- a pseudo-class yields one detail and a compound
++ * needs several. Which argument of the list this pass takes is decided
++ * by parseSelectorExpanded, which parses the selector once per
++ * combination.
++ *
++ * An argument containing a combinator -- :is(.a .b) -- is refused. One
++ * chain of details cannot express it, and matching only its first part
++ * would apply the rule to elements it was never meant for, which is
++ * worse than dropping it.
++ */
++static css_error parseAppendGroup(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_selector **parent, int which)
++{
++	uint32_t before = (*parent)->specificity;
++	int slot = c->alt_seen;
++	int want = (slot < CSS_ALT_MAX) ? c->alt_choice[slot] : 0;
++	const css_token *token;
++	css_error error;
++	int n;
++
++	parserutils_vector_iterate(vector, ctx);	/* ':' */
++	parserutils_vector_iterate(vector, ctx);	/* FUNCTION */
++	consumeWhitespace(vector, ctx);
++
++	n = findAlternative(vector, ctx, want);
++	if (n < 0)
++		return CSS_INVALID;
++	if (slot < CSS_ALT_MAX)
++		c->alt_count[slot] = n;
++	c->alt_seen++;
++	consumeWhitespace(vector, ctx);
++
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL)
++		return CSS_INVALID;
++
++	/* an argument may open with a type selector */
++	if (token->type == CSS_TOKEN_IDENT || tokenIsChar(token, '*') ||
++			tokenIsChar(token, '|')) {
++		css_selector_detail_value value;
++		css_selector_detail detail;
++		css_qname qname;
++
++		error = parseTypeSelector(c, vector, ctx, &qname);
++		if (error != CSS_OK)
++			return error;
++		if (qname.name->insensitive == NULL &&
++				lwc__intern_caseless_string(qname.name) !=
++				lwc_error_ok)
++			return CSS_NOMEM;
++		value.string = NULL;
++		error = css__stylesheet_selector_detail_init(c->sheet,
++				CSS_SELECTOR_ELEMENT, &qname, value,
++				CSS_SELECTOR_DETAIL_VALUE_STRING, false,
++				&detail);
++		if (error != CSS_OK)
++			return error;
++		error = css__stylesheet_selector_append_specific(c->sheet,
++				parent, &detail);
++		if (error != CSS_OK)
++			return error;
++	}
++
++	/* and then any number of classes, ids, attributes and pseudos */
++	while ((token = parserutils_vector_peek(vector, *ctx)) != NULL &&
++			token->type != CSS_TOKEN_S &&
++			tokenIsChar(token, ',') == false &&
++			tokenIsChar(token, ')') == false) {
++		css_selector_detail detail;
++
++		error = parseSpecific(c, vector, ctx, false, &detail);
++		if (error != CSS_OK)
++			return error;
++		error = css__stylesheet_selector_append_specific(c->sheet,
++				parent, &detail);
++		if (error != CSS_OK)
++			return error;
++	}
++
++	consumeWhitespace(vector, ctx);
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL)
++		return CSS_INVALID;
++	if (tokenIsChar(token, ',') == false && tokenIsChar(token, ')') == false)
++		return CSS_INVALID;	/* a combinator: see above */
++
++	/* the other arguments belong to the other combinations */
++	skipToCloseParen(vector, ctx);
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL || tokenIsChar(token, ')') == false)
++		return CSS_INVALID;
++
++	/* :where() matches, and counts for nothing */
++	if (which == WHERE_FN)
++		(*parent)->specificity = before;
++
++	return CSS_OK;
++}
++
+ css_error parseAppendSpecific(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_selector **parent)
+@@ -1838,6 +2041,12 @@ css_error parseAppendSpecific(css_language *c,
  	css_error error;
  	css_selector_detail specific;
  
-+	uint32_t before = (*parent)->specificity;
++	int which;
 +
-+	c->zero_specificity = false;
++	/* :is() and :where() append a whole compound, not one detail */
++	if (isFunctionalGroup(c, vector, *ctx, &which))
++		return parseAppendGroup(c, vector, ctx, parent, which);
 +
  	error = parseSpecific(c, vector, ctx, false, &specific);
--	if (error != CSS_OK)
-+	if (error != CSS_OK) {
-+		c->zero_specificity = false;
+ 	if (error != CSS_OK)
  		return error;
-+	}
- 
--	return css__stylesheet_selector_append_specific(c->sheet, parent,
-+	error = css__stylesheet_selector_append_specific(c->sheet, parent,
- 			&specific);
-+	/* :where()'s argument matches but counts for nothing */
-+	if (error == CSS_OK && c->zero_specificity)
-+		(*parent)->specificity = before;
-+	c->zero_specificity = false;
-+
-+	return error;
+@@ -2101,44 +2310,125 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+ 	return CSS_OK;
  }
  
- css_error parseSelectorSpecifics(css_language *c,
+-css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
+-		css_rule *rule)
++/******************************************************************************
++ * :is() and :where() argument lists (VitaSurf)                               *
++ ******************************************************************************/
++
++/**
++ * Count the top-level arguments of a functional selector whose argument
++ * list starts at *ctx, and leave *ctx at the start of argument `want`.
++ *
++ * \return the number of arguments, or -1 if the list is malformed.
++ */
++static int findAlternative(const parserutils_vector *vector, int32_t *ctx,
++		int want)
+ {
+-	css_error error;
+-	const css_token *token = NULL;
+-	css_selector *selector = NULL;
+-	int32_t ctx = 0;
++	int32_t i = *ctx;
++	int32_t starts[CSS_ALT_MAX];
++	int depth = 0, n = 0;
++	const css_token *t;
+ 
+-	/* Strip any leading whitespace (can happen if in nested block) */
+-	consumeWhitespace(vector, &ctx);
++	starts[0] = i;
++	n = 1;
++	while ((t = parserutils_vector_peek(vector, i)) != NULL) {
++		if (tokenIsChar(t, '(') || tokenIsChar(t, '[')) {
++			depth++;
++		} else if (tokenIsChar(t, ']')) {
++			if (depth > 0) depth--;
++		} else if (tokenIsChar(t, ')')) {
++			if (depth == 0)
++				break;
++			depth--;
++		} else if (depth == 0 && tokenIsChar(t, ',')) {
++			if (n < CSS_ALT_MAX)
++				starts[n] = i + 1;
++			n++;
++		}
++		i++;
++	}
++	if (t == NULL)
++		return -1;	/* ran out before the ')' */
++	if (n > CSS_ALT_MAX)
++		return -1;	/* more arguments than we expand */
++	if (want >= n)
++		want = n - 1;
++	*ctx = starts[want];
++	return n;
++}
+ 
+-	/* selector_list   -> selector [ ',' ws selector ]* */
++/** Leave *ctx at the ')' that closes the argument list. */
++static void skipToCloseParen(const parserutils_vector *vector, int32_t *ctx)
++{
++	int32_t i = *ctx;
++	int depth = 0;
++	const css_token *t;
+ 
+-	error = parseSelector(c, vector, &ctx, &selector);
+-	if (error != CSS_OK) {
+-		if (selector != NULL)
+-			css__stylesheet_selector_destroy(c->sheet, selector);
+-		return error;
++	while ((t = parserutils_vector_peek(vector, i)) != NULL) {
++		if (tokenIsChar(t, '(') || tokenIsChar(t, '[')) {
++			depth++;
++		} else if (tokenIsChar(t, ']')) {
++			if (depth > 0) depth--;
++		} else if (tokenIsChar(t, ')')) {
++			if (depth == 0)
++				break;
++			depth--;
++		}
++		i++;
+ 	}
++	*ctx = i;
++}
+ 
+-	assert(selector != NULL);
++/**
++ * Step the argument choices on by one, like an odometer over the counts
++ * the last parse recorded.
++ *
++ * \return true while there is another combination to parse.
++ */
++static bool nextCombination(css_language *c)
++{
++	int i;
+ 
+-	error = css__stylesheet_rule_add_selector(c->sheet, rule, selector);
+-	if (error != CSS_OK) {
+-		css__stylesheet_selector_destroy(c->sheet, selector);
+-		return error;
++	for (i = c->alt_seen - 1; i >= 0; i--) {
++		if (i >= CSS_ALT_MAX)
++			continue;
++		c->alt_choice[i]++;
++		if (c->alt_choice[i] < c->alt_count[i])
++			return true;
++		c->alt_choice[i] = 0;
+ 	}
++	return false;
++}
+ 
+-	while (parserutils_vector_peek(vector, ctx) != NULL) {
+-		token = parserutils_vector_iterate(vector, &ctx);
+-		if (tokenIsChar(token, ',') == false)
+-			return CSS_INVALID;
++/**
++ * Parse one selector and add it to the rule, once for every combination
++ * of :is()/:where() arguments it contains (VitaSurf).
++ *
++ * A selector holds one chain of details and no way to say "or", so
++ * :is(a, b) c becomes the two selectors a c and b c -- which is what the
++ * construct means. The parse is repeated rather than the tokens being
++ * rewritten: the stream is the same every time, only the argument chosen
++ * inside each :is() differs, so every pass ends at the same token.
++ */
++static css_error parseSelectorExpanded(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_rule *rule)
++{
++	int32_t start = *ctx, after = *ctx;
++	int made = 0, i;
++	css_error error;
+ 
+-		consumeWhitespace(vector, &ctx);
++	for (i = 0; i < CSS_ALT_MAX; i++) {
++		c->alt_choice[i] = 0;
++		c->alt_count[i] = 1;
++	}
++
++	do {
++		css_selector *selector = NULL;
++		int32_t local = start;
+ 
+-		selector = NULL;
++		c->alt_seen = 0;
+ 
+-		error = parseSelector(c, vector, &ctx, &selector);
++		error = parseSelector(c, vector, &local, &selector);
+ 		if (error != CSS_OK) {
+ 			if (selector != NULL) {
+ 				css__stylesheet_selector_destroy(c->sheet,
+@@ -2146,8 +2436,8 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
+ 			}
+ 			return error;
+ 		}
+-
+ 		assert(selector != NULL);
++		after = local;
+ 
+ 		error = css__stylesheet_rule_add_selector(c->sheet, rule,
+ 				selector);
+@@ -2155,6 +2445,39 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
+ 			css__stylesheet_selector_destroy(c->sheet, selector);
+ 			return error;
+ 		}
++		made++;
++	} while (made < CSS_ALT_COMBINATIONS_MAX && nextCombination(c));
++
++	*ctx = after;
++	return CSS_OK;
++}
++
++css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
++		css_rule *rule)
++{
++	css_error error;
++	const css_token *token = NULL;
++	int32_t ctx = 0;
++
++	/* Strip any leading whitespace (can happen if in nested block) */
++	consumeWhitespace(vector, &ctx);
++
++	/* selector_list   -> selector [ ',' ws selector ]* */
++
++	error = parseSelectorExpanded(c, vector, &ctx, rule);
++	if (error != CSS_OK)
++		return error;
++
++	while (parserutils_vector_peek(vector, ctx) != NULL) {
++		token = parserutils_vector_iterate(vector, &ctx);
++		if (tokenIsChar(token, ',') == false)
++			return CSS_INVALID;
++
++		consumeWhitespace(vector, &ctx);
++
++		error = parseSelectorExpanded(c, vector, &ctx, rule);
++		if (error != CSS_OK)
++			return error;
+ 	}
+ 
+ 	return CSS_OK;
 diff --git a/src/parse/language.h b/src/parse/language.h
-index b20d9a0..ad29c5e 100644
+index b20d9a0..8fd3b1a 100644
 --- a/src/parse/language.h
 +++ b/src/parse/language.h
-@@ -50,6 +50,12 @@ typedef struct css_language {
+@@ -50,6 +50,28 @@ typedef struct css_language {
  	lwc_string *default_namespace;	/**< Default namespace URI */
  	css_namespace *namespaces;	/**< Array of namespace mappings */
  	uint32_t num_namespaces;	/**< Number of namespace mappings */
@@ -170,6 +455,22 @@ index b20d9a0..ad29c5e 100644
 +	 * arguments add nothing to a selector's specificity (VitaSurf).
 +	 */
 +	bool zero_specificity;
++
++	/**
++	 * :is() and :where() with a list of arguments (VitaSurf).
++	 *
++	 * A selector holds one chain of details with no way to say "or",
++	 * so a list is expanded instead: the selector is parsed once per
++	 * combination of arguments, and each parse is told which argument
++	 * to take at each :is() it meets. alt_count records how many
++	 * arguments each one turned out to have, which the caller uses to
++	 * step through the combinations.
++	 */
++#define CSS_ALT_MAX 8
++#define CSS_ALT_COMBINATIONS_MAX 64
++	int alt_count[CSS_ALT_MAX];
++	int alt_choice[CSS_ALT_MAX];
++	int alt_seen;
  } css_language;
  
  css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
