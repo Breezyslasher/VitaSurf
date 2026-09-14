@@ -4127,6 +4127,61 @@ CanvasRenderingContext2D.prototype.lang='inherit';
 CanvasRenderingContext2D.prototype.isContextLost=function(){return false;};
 ImageData.prototype.pixelFormat='rgba-unorm8';
 Blob.prototype.textStream=function(){return null;};
+/* The rest of the console. Only log, warn, error, info and debug came
+ * from the bindings, and a page that calls one of the others got
+ * "not a function" -- claude.ai opens its entry chunk with
+ * console.assert("__process_polyfill__"), so the whole application threw
+ * on its first statement and mounted nothing. None of these needs to do
+ * anything clever; they need to exist and to print what they are given. */
+(function(){
+ var C=W.console;
+ if(!C)return;
+ function out(kind,args){
+  try{(C[kind]||C.log).apply(C,args);}catch(e){}}
+ function def(n,f){if(typeof C[n]!=='function')C[n]=f;}
+ def('assert',function(ok){
+  if(ok)return;
+  var a=Array.prototype.slice.call(arguments,1);
+  a.unshift('Assertion failed:');
+  out('error',a);});
+ def('trace',function(){
+  var a=Array.prototype.slice.call(arguments);
+  a.unshift('console.trace');
+  try{a.push('\n'+(new Error()).stack);}catch(e){}
+  out('log',a);});
+ var groups=0;
+ function group(){
+  out('log',Array.prototype.slice.call(arguments));
+  groups++;}
+ def('group',group);
+ def('groupCollapsed',group);
+ def('groupEnd',function(){if(groups>0)groups--;});
+ def('dir',function(v){out('log',[v]);});
+ def('dirxml',function(v){out('log',[v]);});
+ def('table',function(v){out('log',[v]);});
+ var timers={};
+ def('time',function(label){timers[String(label===undefined?'default':label)]=Date.now();});
+ def('timeLog',function(label){
+  var k=String(label===undefined?'default':label);
+  if(!(k in timers))return;
+  out('log',[k+': '+(Date.now()-timers[k])+'ms']);});
+ def('timeEnd',function(label){
+  var k=String(label===undefined?'default':label);
+  if(!(k in timers))return;
+  out('log',[k+': '+(Date.now()-timers[k])+'ms']);
+  delete timers[k];});
+ var counts={};
+ def('count',function(label){
+  var k=String(label===undefined?'default':label);
+  counts[k]=(counts[k]||0)+1;
+  out('log',[k+': '+counts[k]]);});
+ def('countReset',function(label){
+  delete counts[String(label===undefined?'default':label)];});
+ def('clear',function(){});
+ def('timeStamp',function(){});
+ def('profile',function(){});
+ def('profileEnd',function(){});
+})();
 (function(){var N=W.Notification;if(!N)return;var p=N.prototype;
  p.actions=[];p.badge='';p.dir='auto';p.image='';p.lang='';p.navigate='';
  p.renotify=false;p.requireInteraction=false;p.silent=null;p.timestamp=0;p.vibrate=[];})();
