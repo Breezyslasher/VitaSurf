@@ -4101,11 +4101,19 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
  */
 /*
  * __vitaStyle(node): the computed values a page is most likely to read
- * back, as [fontSize px, display, visibility, opacity]. Everything else
- * getComputedStyle reports comes from the prelude's defaults; these four
- * are the ones that actually vary and that code branches on. A page
- * doing its own rem arithmetic reads the root font size, which is what
- * sent YouTube into "cannot read property 'replace' of undefined".
+ * back, as [fontSize px, display, visibility, colour, background
+ * colour]. Everything else getComputedStyle reports comes from the
+ * prelude's defaults; these are the ones that actually vary and that
+ * code branches on. A page doing its own rem arithmetic reads the root
+ * font size, which is what sent YouTube into "cannot read property
+ * 'replace' of undefined".
+ *
+ * The two colours are libcss's RGB with the alpha byte carried
+ * separately in slots 5 and 6, or -1 where the property is not a colour
+ * (background-color's default, transparent). They are here because a
+ * page that themes itself reads a colour back to decide what it is
+ * showing, and answering with the stylesheet's default said every page
+ * was black on transparent.
  */
 static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
@@ -4115,6 +4123,7 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	struct box *box;
 	css_fixed len = 0;
 	css_unit unit = CSS_UNIT_PX;
+	css_color colour = 0;
 	JSValue arr;
 	int px;
 
@@ -4138,6 +4147,10 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		set_index(ctx, arr, 0, 16);
 		set_index(ctx, arr, 1, (int)CSS_DISPLAY_NONE);
 		set_index(ctx, arr, 2, (int)CSS_VISIBILITY_VISIBLE);
+		set_index(ctx, arr, 3, -1);
+		set_index(ctx, arr, 4, -1);
+		set_index(ctx, arr, 5, -1);
+		set_index(ctx, arr, 6, -1);
 		return arr;
 	}
 	css_computed_font_size(box->style, &len, &unit);
@@ -4150,6 +4163,28 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	set_index(ctx, arr, 0, px);
 	set_index(ctx, arr, 1, (int)css_computed_display_static(box->style));
 	set_index(ctx, arr, 2, (int)css_computed_visibility(box->style));
+
+	/*
+	 * set_index takes an int, and a colour with the alpha byte set
+	 * does not fit one on a 32-bit target, so the alpha is split off
+	 * and the prelude puts the two back together.
+	 */
+	if (css_computed_color(box->style, &colour) == CSS_COLOR_COLOR) {
+		set_index(ctx, arr, 3, (int)(colour & 0xffffff));
+		set_index(ctx, arr, 5, (int)((colour >> 24) & 0xff));
+	} else {
+		set_index(ctx, arr, 3, -1);
+		set_index(ctx, arr, 5, -1);
+	}
+	colour = 0;
+	if (css_computed_background_color(box->style, &colour) ==
+			CSS_BACKGROUND_COLOR_COLOR) {
+		set_index(ctx, arr, 4, (int)(colour & 0xffffff));
+		set_index(ctx, arr, 6, (int)((colour >> 24) & 0xff));
+	} else {
+		set_index(ctx, arr, 4, -1);
+		set_index(ctx, arr, 6, -1);
+	}
 	return arr;
 }
 

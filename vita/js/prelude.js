@@ -1116,6 +1116,25 @@ var UA_DISPLAY={SPAN:'inline',A:'inline',B:'inline',I:'inline',EM:'inline',
  HEAD:'none',SCRIPT:'none',STYLE:'none',TITLE:'none',META:'none',
  LINK:'none',TEMPLATE:'none',BASE:'none',PARAM:'none',SOURCE:'none',
  TRACK:'none',AREA:'none',DATALIST:'none',DIALOG:'none'};
+/* A colour from __vitaStyle: the RGB and its alpha arrive apart, because
+   0xff000000 does not fit the int the binding hands back on a 32-bit
+   target. A browser answers rgb() when the colour is opaque and rgba()
+   when it is not, and code compares the string it gets. */
+/* Properties __vitaStyle resolves, so the style attribute must not
+   overwrite them with the author's own spelling. */
+var RESOLVED={fontSize:1,display:1,visibility:1,color:1,backgroundColor:1};
+function cssColour(rgb,a){
+ if(typeof rgb!=='number'||rgb<0||typeof a!=='number'||a<0)return '';
+ var r=(rgb>>16)&255,g=(rgb>>8)&255,b=rgb&255;
+ if(a>=255)return 'rgb('+r+', '+g+', '+b+')';
+ /* Alpha reads as the shortest fraction that comes back to the same
+    byte: rgba(255,0,0,0.5) stores 128, and 128/255 printed plainly is
+    0.498, which is not the string the page wrote or the one a browser
+    reports. Two places first, three only if two do not round-trip. */
+ var f=Math.round(a/255*100)/100;
+ if(Math.round(f*255)!==a)f=Math.round(a/255*1000)/1000;
+ return 'rgba('+r+', '+g+', '+b+', '+f+')';
+}
 function computedStyle(el){
  /* A browser reports nothing for an element that is not in the document,
     and code tests the value it gets back. */
@@ -1136,17 +1155,25 @@ function computedStyle(el){
   cs.fontSize=st[0]+'px';
   if(CS_DISPLAY[st[1]])cs.display=CS_DISPLAY[st[1]];
   if(CS_VIS[st[2]])cs.visibility=CS_VIS[st[2]];
+  var c=cssColour(st[3],st[5]);if(c)cs.color=c;
+  var b=cssColour(st[4],st[6]);if(b)cs.backgroundColor=b;
  }
  if(box){cs.width=box[4]+'px';cs.height=box[5]+'px';}
  else{cs.width='auto';cs.height='auto';}
- /* Whatever the element says inline wins over the defaults. libcss
-    reports three properties here, and a declaration the page wrote on
-    the element itself is the one other value that is certain -- code
-    that sets a style and reads it back through getComputedStyle used to
-    get the default instead of what it had just written. */
+ /* Whatever the element says inline wins over the defaults, for the
+    properties nothing else here can answer: a declaration the page
+    wrote on the element itself is the one value that is certain, and
+    code that sets a style and reads it back through getComputedStyle
+    used to get the default instead of what it had just written.
+    Properties libcss did answer are left alone -- the cascade has
+    already taken the inline declaration into account, and it reports a
+    resolved value where the attribute is whatever the author typed. */
  if(el&&el.nodeType===1&&typeof el.getAttribute==='function'){
   var inline=el.getAttribute('style');
-  if(inline)parseDecl(inline).forEach(function(d){cs[dashToCamel(d[0])]=d[1];});
+  if(inline)parseDecl(inline).forEach(function(d){
+   var k=dashToCamel(d[0]);
+   if(st&&RESOLVED[k])return;
+   cs[k]=d[1];});
  }
  cs.getPropertyValue=function(n){var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};
  cs.getPropertyPriority=function(){return '';};
