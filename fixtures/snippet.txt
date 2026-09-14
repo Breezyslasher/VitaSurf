@@ -1,3 +1,2 @@
-url=https://assets-proxy.anthropic.com/claude-ai/v2/assets/v1/shared-common-mcp-5-DvJI9NNG.js
-line=2:5500-6600
-line=2:4400-5600
+url=https://assets-proxy.anthropic.com/claude-ai/v2/assets/v1/index-gEI3Boxg.js
+line=2:4300-5400
