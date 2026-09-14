@@ -1,5 +1,5 @@
 diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
-index 119e87439..8348f57cc 100644
+index 119e87439..0824a0b2e 100644
 --- a/content/handlers/html/object.c
 +++ b/content/handlers/html/object.c
 @@ -32,6 +32,7 @@
@@ -31,17 +31,17 @@ index 119e87439..8348f57cc 100644
  		html_object_failed(box, c, o->background);
  
  		break;
-@@ -575,6 +583,10 @@ static bool html_replace_object(struct content_html_object *object, nsurl *url)
- 	if (error != NSERROR_OK)
- 		return false;
+@@ -803,6 +811,10 @@ html_fetch_object_role(html_content *c,
+ 		return error != NSERROR_NOMEM;
+ 	}
  
 +	/* for the load profile (VitaSurf) */
 +	if (object->permitted_types & CONTENT_IMAGE)
 +		vitasurf_images_asked++;
 +
- 	for (page = c; page != NULL; page = page->page) {
- 		page->base.active++;
- 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+ 	/* add to content object list */
+ 	object->next = c->object_list;
+ 	c->object_list = object;
 diff --git a/utils/utils.c b/utils/utils.c
 index 8a3ecc194..2737c98d1 100644
 --- a/utils/utils.c

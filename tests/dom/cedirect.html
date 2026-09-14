@@ -1,0 +1,45 @@
+<!DOCTYPE html><html><head><title>cedirect</title></head><body>
+<pre id="out"></pre>
+<div id="host"></div>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+var built = [], connected = [];
+class Widget extends HTMLElement {
+  constructor(){ super(); built.push(this); this.marked = 'yes'; }
+  connectedCallback(){ connected.push(this); }
+  greet(){ return 'hello'; }
+}
+customElements.define('x-widget', Widget);
+
+class Unregistered extends HTMLElement { constructor(){ super(); } }
+
+function report(){
+  /* Direct construction is legal for a registered element. */
+  var made = null, err = '';
+  try { made = new Widget(); } catch(e) { err = e.name; }
+  T('new on a registered class throws', err ? err : 'no');
+  T('made an element', made && made.nodeType === 1 ? 'yes' : 'no');
+  T('tag name', made ? made.tagName.toLowerCase() : '-');
+  T('class method reachable', made && typeof made.greet === 'function' ? 'yes' : 'no');
+  T('dom method reachable', made && typeof made.setAttribute === 'function' ? 'yes' : 'no');
+  T('constructor ran once', String(built.length));
+  T('field set by constructor', made ? String(made.marked) : '-');
+  /* Inserting must connect it, and must not construct it again. */
+  if (made) document.getElementById('host').appendChild(made);
+  setTimeout(function(){
+    T('connected on insert', connected.length === 1 ? 'yes' : 'no ('+connected.length+')');
+    T('constructor still ran once', String(built.length));
+    T('in the document', made && made.isConnected ? 'yes' : 'no');
+    /* An unregistered class must still throw. */
+    var e2 = '';
+    try { new Unregistered(); } catch(e) { e2 = e.name; }
+    T('new on an unregistered class throws', e2 || 'no');
+    /* And bare HTMLElement must throw. */
+    var e3 = '';
+    try { new HTMLElement(); } catch(e) { e3 = e.name; }
+    T('new HTMLElement throws', e3 || 'no');
+  }, 100);
+}
+window.addEventListener('load', function(){ setTimeout(report, 200); });
+</script></body></html>

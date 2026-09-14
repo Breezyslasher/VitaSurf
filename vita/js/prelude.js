@@ -1740,11 +1740,41 @@ function joinCodes(codes){
  * that defines none pays one integer test per DOM call.
  */
 var CE={},CEn=0,CEwait={},CEstack=[];
+/* createElement without the upgrade step, for direct construction. */
+var ceRawCreate=null;
 
 function CEBase(){
  var e=CEstack.length?CEstack[CEstack.length-1]:undefined;
- if(e===undefined)throw new TypeError('Illegal constructor');
- return e;
+ if(e!==undefined)return e;
+ /*
+  * Direct construction: "new MyElement()" rather than the parser
+  * upgrading a tag it met. The specification says to find the
+  * definition whose constructor is new.target and make an element with
+  * that definition's name; this used to throw for every case, and
+  * github.com's header constructs its components that way, so the
+  * component threw "Illegal constructor" and React drew its own error
+  * box over the page.
+  */
+ var nt;
+ try{nt=new.target;}catch(x){nt=undefined;}
+ if(nt){
+  for(var n in CE){
+   var d=CE[n];
+   if(!d||d.ctor!==nt)continue;
+   var el=ceRawCreate?ceRawCreate.call(D,d.ext||n):D.createElement(d.ext||n);
+   /* A customised built-in is the tag plus is="", as the parser writes it. */
+   if(d.ext&&d.ext!==n)el.setAttribute('is',n);
+   /* A class that does not extend HTMLElement would otherwise lose
+    * every DOM method the moment its prototype is installed. */
+   try{if(!P.isPrototypeOf(nt.prototype))Object.setPrototypeOf(nt.prototype,P);
+       Object.setPrototypeOf(el,nt.prototype);}catch(x2){}
+   /* Constructed, so inserting it must not run the constructor again --
+    * but connectedCallback still has to fire, which state 2 allows. */
+   ceSet(el,'__ceState',2);ceSet(el,'__ceDef',d);
+   return el;
+  }
+ }
+ throw new TypeError('Illegal constructor');
 }
 CEBase.prototype=P;
 /* It is HTMLElement to the page, whatever it is called here. */
@@ -1881,6 +1911,10 @@ W.customElements={
 })();
 (function(){
  var orig=D.createElement;
+ /* CEBase needs this one: creating the element for "new MyElement()"
+  * through the wrapper below would upgrade it, running the very
+  * constructor that is already running. */
+ ceRawCreate=orig;
  D.createElement=function(t,o){
   var el=orig.call(D,t);
   if(CEn&&el&&el.nodeType===1){if(o&&o.is)el.setAttribute('is',o.is);ceUpgrade(el,false);}
