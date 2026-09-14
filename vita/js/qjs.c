@@ -1801,31 +1801,69 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	 * dropped them, so el.innerHTML = "<style>..</style><p>" lost the
 	 * style and insertAdjacentHTML lost a leading script entirely.
 	 */
+	/*
+	 * A comment before the markup is a sibling of the <html> element,
+	 * not inside it, so the fragment's first child is the comment. The
+	 * code here used to require an element there and give up when it
+	 * found anything else -- after emptying the target -- so assigning
+	 * markup that opened with a comment wiped the element and put
+	 * nothing back. Build stamps are written exactly that way, and it
+	 * is how every one of YouTube's components lost its markup: the
+	 * template was empty, so the named nodes a component reads out of
+	 * it were all undefined.
+	 *
+	 * So walk the fragment's children: take an <html> element apart
+	 * section by section, and move anything else across as it stands.
+	 */
 	dom_node_get_first_child(fragment, &htmlnode);
-	if (!node_is_element(htmlnode)) goto out;
-	{
-		struct dom_node *section = NULL;
+	while (htmlnode != NULL) {
+		struct dom_node *after = NULL, *cref = NULL;
 
-		dom_node_get_first_child(htmlnode, &section);
-		while (section != NULL) {
-			struct dom_node *next = NULL;
+		dom_node_get_next_sibling(htmlnode, &after);
+		if (node_is_element(htmlnode)) {
+			struct dom_node *section = NULL;
 
-			dom_node_get_first_child(section, &child);
-			while (child != NULL) {
-				struct dom_node *cref = NULL;
+			dom_node_get_first_child(htmlnode, &section);
+			while (section != NULL) {
+				struct dom_node *next = NULL;
 
-				dom_node_remove_child(section, child, &cref);
-				if (cref) dom_node_unref(cref);
-				dom_node_append_child(node, child, &cref);
-				if (cref) dom_node_unref(cref);
-				dom_node_unref(child);
-				child = NULL;
 				dom_node_get_first_child(section, &child);
+				while (child != NULL) {
+					cref = NULL;
+					dom_node_remove_child(section, child,
+							      &cref);
+					if (cref) dom_node_unref(cref);
+					cref = NULL;
+					dom_node_append_child(node, child,
+							      &cref);
+					if (cref) dom_node_unref(cref);
+					dom_node_unref(child);
+					child = NULL;
+					dom_node_get_first_child(section,
+								 &child);
+				}
+				dom_node_get_next_sibling(section, &next);
+				dom_node_unref(section);
+				section = next;
 			}
-			dom_node_get_next_sibling(section, &next);
-			dom_node_unref(section);
-			section = next;
+		} else {
+			dom_node_type t = DOM_NODE_TYPE_COUNT;
+
+			/* A doctype is not a node an element can hold, and
+			 * fragment parsing ignores one anyway. */
+			dom_node_get_node_type(htmlnode, &t);
+			if (t != DOM_DOCUMENT_TYPE_NODE) {
+				cref = NULL;
+				dom_node_remove_child(fragment, htmlnode,
+						      &cref);
+				if (cref) dom_node_unref(cref);
+				cref = NULL;
+				dom_node_append_child(node, htmlnode, &cref);
+				if (cref) dom_node_unref(cref);
+			}
 		}
+		dom_node_unref(htmlnode);
+		htmlnode = after;
 	}
 out:
 	if (parser) dom_hubbub_parser_destroy(parser);

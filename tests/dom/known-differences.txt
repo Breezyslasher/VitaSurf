@@ -51,3 +51,13 @@ Inserting a node from another document does not adopt it
   anything built for a foreign node is built in the right place and the
   case that used to fail silently -- a template parsed by DOMParser
   handing back empty content -- works.
+
+A DOCTYPE inside assigned markup
+  el.innerHTML = "<!DOCTYPE html><p>x</p>" keeps the element's existing
+  children where a browser replaces them with the p. Fragment parsing is
+  meant to ignore a DOCTYPE token; hubbub's fragment parser is given no
+  context element here, so it treats the markup as a whole page and the
+  parse does not complete. The element is only emptied after a parse
+  completes, so nothing is lost -- it simply does not change. No page
+  assigns a doctype through innerHTML.
+  Affects: tests/dom/parse.html ("doctype in markup").

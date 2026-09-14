@@ -33,4 +33,29 @@ T('script not run', (function(){var d=document.createElement('div');
   d.innerHTML='<script>window.__ran=1;<\/script>';return String(window.__ran);})());
 T('nested form text', (function(){var d=document.createElement('div');
   d.innerHTML='<p>a<span>b</span>c</p>';return d.firstChild.childNodes.length;})());
+
+/* Markup that opens with a comment. A comment before any element is a
+   sibling of the html element the fragment parser builds, not a child of
+   it, and build tools stamp their markup exactly that way. */
+T('leading comment shape', (function(){var d=document.createElement('div');
+  d.innerHTML='<!--c--><div id="a">x</div>';return shape(d);})());
+T('leading comment text', (function(){var d=document.createElement('div');
+  d.innerHTML='<!--c--><div id="a">x</div>';
+  return d.firstChild.nodeType+','+d.firstChild.data;})());
+T('two leading comments', (function(){var d=document.createElement('div');
+  d.innerHTML='<!--c--><!--d--><p>x</p>';return shape(d);})());
+T('leading comment keeps the element', (function(){var d=document.createElement('div');
+  d.innerHTML='<!--c--><div id="a">x</div>';
+  return d.querySelector('#a')?d.querySelector('#a').textContent:'gone';})());
+T('leading comment into a template', (function(){var t=document.createElement('template');
+  t.innerHTML='<!--css-build:shady--><div id="scrim"></div><div id="box"><slot></slot></div>';
+  return (t.content.querySelector('#scrim')?'scrim ':'')+
+         (t.content.querySelector('#box')?'box ':'')+
+         (t.content.querySelector('slot')?'slot':'');})());
+T('doctype in markup', (function(){var d=document.createElement('div');
+  d.innerHTML='<!DOCTYPE html><p>x</p>';return shape(d);})());
+T('trailing comment', (function(){var d=document.createElement('div');
+  d.innerHTML='<p>x</p><!--after-->';return shape(d);})());
+T('only a comment', (function(){var d=document.createElement('div');
+  d.innerHTML='<!--just-->';return shape(d)+'/'+d.childNodes.length;})());
 </script></body></html>
