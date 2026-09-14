@@ -2119,7 +2119,12 @@ function tokenCheck(t){
   'The token provided contains HTML space characters, which are not valid in tokens.',
   'InvalidCharacterError');
  return t;}
-function TokenList(el,attr){this._e=el;this._a=attr;
+/* The private fields are hidden: a page that walks an object and calls
+ * what it finds would otherwise call the helpers. */
+function hide(o,k,v){try{Object.defineProperty(o,k,
+ {value:v,writable:true,configurable:true,enumerable:false});}
+ catch(e){o[k]=v;}}
+function TokenList(el,attr){hide(this,'_e',el);hide(this,'_a',attr);
  var t=this._t();for(var i=0;i<t.length;i++)this[i]=t[i];
  Object.defineProperty(this,'length',{configurable:true,value:t.length,writable:true});}
 /* The attribute as an ordered set: split on whitespace, first occurrence
@@ -2215,6 +2220,8 @@ TokenList.prototype.values=function(){return this._t()[Symbol.iterator]();};
 TokenList.prototype.entries=function(){return this._t().map(function(v,i){return [i,v];})[Symbol.iterator]();};
 TokenList.prototype[Symbol.iterator]=TokenList.prototype.values;
 TokenList.prototype.toString=function(){return this.value;};
+hide(TokenList.prototype,'_t',TokenList.prototype._t);
+hide(TokenList.prototype,'_w',TokenList.prototype._w);
 Object.defineProperty(TokenList.prototype,'value',{configurable:true,
  get:function(){return this._e?(this._e.getAttribute(this._a)||''):this._t().join(' ');},
  set:function(v){if(this._e)this._e.setAttribute(this._a,String(v));
@@ -2383,9 +2390,26 @@ Object.defineProperty(P,'options',{configurable:true,get:function(){
  /* the collection already answers to item and namedItem; attaching
     them here shadowed the real ones with a version that read the
     proxy's target and found nothing */
- return this.getElementsByTagName('option');}});
+ var c=this.getElementsByTagName('option');
+ /* HTMLOptionsCollection's selectedIndex is the select's, so the
+    collection has to know which select it came from */
+ if(c&&this.tagName==='SELECT'){
+  try{Object.defineProperty(c,'__vitaOwner',
+   {value:this,configurable:true});}catch(e){}
+  try{Object.setPrototypeOf(c,W.HTMLOptionsCollection.prototype);}catch(e){}}
+ return c;}});
 Object.defineProperty(P,'selectedOptions',{configurable:true,get:function(){
  return listOf(this.options).filter(function(o){return o.selected;});}});
+/* A select is itself an indexed collection of its options. */
+P.item=function(i){
+ if(this.tagName!=='SELECT')return shadowProp(this,'item',undefined);
+ var o=this.options;i=Number(i)>>>0;return o&&i<o.length?o[i]:null;};
+P.namedItem=function(n){
+ if(this.tagName!=='SELECT')return shadowProp(this,'namedItem',undefined);
+ var o=this.options,i;n=String(n);
+ for(i=0;o&&i<o.length;i++){
+  if(o[i].id===n||o[i].getAttribute('name')===n)return o[i];}
+ return null;};
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){
  if(this.tagName==='OPTION')return this.parentNode?this.parentNode.selectedIndex:-1;
  var o=this.options||[];for(var i=0;i<o.length;i++)if(o[i].selected)return i;
@@ -2530,6 +2554,7 @@ Range.prototype._nodes=function(){
  return out;};
 Range.prototype.extractContents=function(){var f=D.createDocumentFragment();
  this._nodes().forEach(function(n){f.appendChild(n);});this.collapse(true);return f;};
+hide(Range.prototype,'_nodes',Range.prototype._nodes);
 Range.prototype.deleteContents=function(){this._nodes().forEach(function(n){n.remove();});
  this.collapse(true);};
 Range.prototype.cloneContents=function(){var f=D.createDocumentFragment();
@@ -2967,7 +2992,16 @@ function listOf(c){
    to be a stub whose length was always zero, and it was clobbering it. */
 HTMLCollection.prototype.add=function(){};
 HTMLCollection.prototype.remove=function(){};
-W.HTMLOptionsCollection=HTMLCollection;
+/* HTMLOptionsCollection is the one that is not just another name for
+   HTMLCollection: it carries selectedIndex, which belongs to the select
+   the collection came from and not to collections in general. */
+W.HTMLOptionsCollection=function HTMLOptionsCollection(){};
+W.HTMLOptionsCollection.prototype=Object.create(HTMLCollection.prototype);
+W.HTMLOptionsCollection.prototype.constructor=W.HTMLOptionsCollection;
+Object.defineProperty(W.HTMLOptionsCollection.prototype,'selectedIndex',{
+ configurable:true,
+ get:function(){var o=this.__vitaOwner;return o?o.selectedIndex:-1;},
+ set:function(v){var o=this.__vitaOwner;if(o)o.selectedIndex=v;}});
 W.HTMLFormControlsCollection=HTMLCollection;W.HTMLAllCollection=HTMLCollection;
 
 W.closed=false;

@@ -1,0 +1,66 @@
+<!DOCTYPE html><html><head><title>methods</title></head><body>
+<pre id="out"></pre>
+<form id="f"><select id="sel"><option id="o1" value="a">A</option><option value="b">B</option></select>
+<input id="inp" type="text"></form>
+<a id="lnk" href="/x" rel="noopener">link</a>
+<div id="host"><span id="kid">k</span></div>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+
+/* A member that exists but throws is invisible to a check that only asks
+   whether it exists, and that is the shape of bug that has cost the most
+   here: relList.supports() existed and threw, and a bundler's feature
+   test took the whole application down with it. Each case below is a
+   call a browser completes; anything but "ok" is a difference that a
+   page can trip over. Calls are named one by one rather than swept off
+   the prototype, because every element here shares one prototype and a
+   swept list would differ for that reason alone. */
+function ok(name, fn){
+ var r;
+ try { r = fn(); } catch (e) { T(name, (e && e.name ? e.name : 'error')); return; }
+ T(name, 'ok' + (r === undefined ? '' : ' ' + String(r).slice(0, 40)));
+}
+
+var lnk = document.getElementById('lnk');
+var sel = document.getElementById('sel');
+var host = document.getElementById('host');
+
+ok('relList.supports rel', function(){ return lnk.relList.supports('noopener'); });
+ok('relList.contains', function(){ return lnk.relList.contains('noopener'); });
+ok('relList.item', function(){ return String(lnk.relList.item(0)); });
+ok('relList.toString', function(){ return lnk.relList.toString(); });
+ok('classList.toggle', function(){ return host.classList.toggle('x'); });
+
+ok('select.item', function(){ var o = sel.item(0); return o && o.value; });
+ok('select.namedItem', function(){ return String(sel.namedItem('nope')); });
+ok('options.selectedIndex', function(){ return sel.options.selectedIndex; });
+ok('options.item', function(){ var o = sel.options.item(1); return o && o.value; });
+
+/* A fresh range is collapsed at the start of the document and every one
+   of these is meaningful on it. */
+ok('range.toString', function(){ return document.createRange().toString().length; });
+ok('range.cloneContents', function(){
+ return document.createRange().cloneContents().childNodes.length; });
+ok('range.extractContents', function(){
+ return document.createRange().extractContents().childNodes.length; });
+ok('range.deleteContents', function(){ document.createRange().deleteContents(); });
+ok('range.cloneRange', function(){ return document.createRange().cloneRange().collapsed; });
+ok('range on a node', function(){
+ var r = document.createRange(); r.selectNodeContents(host);
+ return r.toString(); });
+
+ok('searchParams.get', function(){
+ return String(new URL('https://e.org/?a=1').searchParams.get('a')); });
+ok('headers.get', function(){ return String(new Headers().get('x')); });
+ok('formdata.get', function(){ return String(new FormData().get('x')); });
+ok('url.toString', function(){ return new URL('https://e.org/a').toString(); });
+
+/* Internal helpers must not be visible: a page that walks an object and
+   calls what it finds will call them. */
+function leaks(o){ var k, out = []; for (k in o) { if (k.charAt(0) === '_') out.push(k); }
+ return out.length ? out.sort().join(' ') : 'none'; }
+T('relList internals', leaks(lnk.relList));
+T('range internals', leaks(document.createRange()));
+T('classList internals', leaks(host.classList));
+</script></body></html>
