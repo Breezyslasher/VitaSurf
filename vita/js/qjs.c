@@ -82,6 +82,21 @@ struct js_listener;
 struct js_xhr;
 
 /*
+ * A module script that named an import nothing had yet. The import
+ * starts a fetch; the script waits here and is compiled again once it
+ * arrives, which is what a browser does with a module graph. Without
+ * this the first miss was fatal and the page never started: a bundler
+ * that splits its code imports a chunk the document never declared.
+ */
+struct js_deferred {
+	struct js_deferred *next;
+	char *src;
+	size_t len;
+	char *name;
+	int tries;
+};
+
+/*
  * One JS object per DOM node, so that a node fetched twice compares equal
  * and expando properties (el.style, el.dataset, handlers) survive. The
  * cache holds a reference; wrappers are released when the thread dies.
@@ -132,6 +147,8 @@ struct jsthread {
 	unsigned js_run_ms;       /**< time spent running them */
 	unsigned js_modules;      /**< of those, compiled as ES modules */
 	unsigned js_imports_missed; /**< imports that resolved to nothing */
+	struct js_deferred *deferred; /**< module scripts waiting on imports */
+	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
 				   *   JS_UNINITIALIZED before it is looked
 				   *   up and JS_UNDEFINED if there is none */
@@ -275,6 +292,7 @@ static void log_source_excerpt(const char *stack, const char *name,
  * Log a pending exception and clear it. When the script source that ran
  * is known (name, src, len), the offending source line is logged too.
  */
+static void js_free_deferred(jsthread *thread);
 static void qjs_report_exception_src(JSContext *ctx, const char *name,
 				     const char *src, size_t len)
 {
@@ -4601,6 +4619,9 @@ nserror js_closethread(jsthread *thread)
 		guit->misc->schedule(-1, relayout_callback, thread);
 		thread->relayout_pending = false;
 	}
+	/* drop module scripts still waiting on an import, and the
+	 * scheduler entry that would have retried them */
+	js_free_deferred(thread);
 	/* cancel timers; the scheduler holds pointers to them */
 	for (t = thread->timers; t != NULL; t = t->next) {
 		if (!t->dead) {
@@ -4642,6 +4663,7 @@ void js_destroythread(jsthread *thread)
 	if (thread == NULL) {
 		return;
 	}
+	js_free_deferred(thread);
 	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;
 	while (l != NULL) {
@@ -5122,6 +5144,124 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 }
 
 
+#define MODULE_RETRY_MS    300
+#define MODULE_RETRY_TRIES 20
+
+static void module_retry_callback(void *p);
+
+static void free_deferred(struct js_deferred *d)
+{
+	free(d->src);
+	free(d->name);
+	free(d);
+}
+
+static void js_free_deferred(jsthread *thread)
+{
+	struct js_deferred *d = thread->deferred, *next;
+
+	while (d != NULL) {
+		next = d->next;
+		free_deferred(d);
+		d = next;
+	}
+	thread->deferred = NULL;
+	if (thread->deferred_scheduled) {
+		guit->misc->schedule(-1, module_retry_callback, thread);
+		thread->deferred_scheduled = false;
+	}
+}
+
+/* Keep a module script that is short of an import, to try again. */
+static void defer_module(jsthread *thread, const char *src, size_t len,
+			 const char *name)
+{
+	struct js_deferred *d = calloc(1, sizeof(*d));
+
+	if (d == NULL) return;
+	d->src = malloc(len + 1);
+	if (d->src == NULL) { free(d); return; }
+	memcpy(d->src, src, len);
+	d->src[len] = 0;
+	d->len = len;
+	d->name = strdup(name != NULL ? name : "<script>");
+	d->next = thread->deferred;
+	thread->deferred = d;
+	if (!thread->deferred_scheduled) {
+		thread->deferred_scheduled = true;
+		guit->misc->schedule(MODULE_RETRY_MS, module_retry_callback,
+				     thread);
+	}
+	vita_log("qjs: module '%s' waits for an import", d->name);
+}
+
+/*
+ * Try the waiting module scripts again. Each attempt re-runs the loader,
+ * which finds anything that has arrived since; a graph several chunks
+ * deep needs one pass per chunk, so this keeps going for a while before
+ * giving up on one.
+ */
+static void module_retry_callback(void *p)
+{
+	jsthread *thread = p;
+	struct js_deferred *d, **link;
+	bool again = false;
+
+	if (thread == NULL || thread->closed) return;
+	thread->deferred_scheduled = false;
+	link = &thread->deferred;
+	while ((d = *link) != NULL) {
+		unsigned missed = thread->js_imports_missed;
+		JSValue fn;
+
+		begin_script(thread);
+		thread->current_script = d->name;
+		fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
+			     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+		if (!JS_IsException(fn)) {
+			JSValue ret;
+
+			set_import_meta(thread->ctx, fn, d->name);
+			vita_log("qjs: module '%s' ready after %d tries",
+				 d->name, d->tries + 1);
+			begin_script(thread);
+			ret = JS_EvalFunction(thread->ctx, fn);
+			if (JS_IsException(ret)) {
+				qjs_report_exception_src(thread->ctx, d->name,
+							 NULL, 0);
+			}
+			JS_FreeValue(thread->ctx, ret);
+			thread->current_script = NULL;
+			end_script(thread);
+			*link = d->next;
+			free_deferred(d);
+			continue;
+		}
+		JS_FreeValue(thread->ctx, JS_GetException(thread->ctx));
+		JS_FreeValue(thread->ctx, fn);
+		thread->current_script = NULL;
+		end_script(thread);
+		d->tries++;
+		if (d->tries >= MODULE_RETRY_TRIES ||
+		    thread->js_imports_missed == missed) {
+			/* out of patience, or it failed for some other
+			 * reason than a missing import */
+			vita_log("qjs: module '%s' gave up after %d tries",
+				 d->name, d->tries);
+			*link = d->next;
+			free_deferred(d);
+			continue;
+		}
+		again = true;
+		link = &d->next;
+	}
+	if (again && !thread->closed) {
+		thread->deferred_scheduled = true;
+		guit->misc->schedule(MODULE_RETRY_MS, module_retry_callback,
+				     thread);
+	}
+}
+
 bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *name)
 {
 	JSValue ret;
@@ -5225,15 +5365,24 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				set_import_meta(thread->ctx, fn, name);
 			} else if (thread->js_imports_missed != missed) {
 				/*
-				 * It asked for an import, so it is a module
-				 * and failed for want of one. That is the
-				 * error worth printing; the script parse
-				 * only ever said "unexpected import".
+				 * It asked for an import and nothing had it
+				 * yet. The loader has started a fetch, so
+				 * put the script aside and compile it again
+				 * when that lands rather than failing here:
+				 * a bundler that splits its code imports a
+				 * chunk the document never declared, and one
+				 * miss used to end the page.
 				 */
 				JS_FreeValue(thread->ctx, script_err);
-				fn = as_module;
-				module = true;
-				set_import_meta(thread->ctx, fn, name);
+				JS_FreeValue(thread->ctx,
+					     JS_GetException(thread->ctx));
+				JS_FreeValue(thread->ctx, as_module);
+				free(src);
+				defer_module(thread, (const char *)txt, txtlen,
+					     name);
+				thread->current_script = NULL;
+				end_script(thread);
+				return true;
 			} else {
 				/* Not a module either: the first error is
 				 * the one that describes the source. */
