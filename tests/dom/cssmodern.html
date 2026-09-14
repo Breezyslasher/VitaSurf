@@ -32,6 +32,13 @@ p:is(.subjA .subjB) { display: none; }
 :is(.altA .altX, .altB .altY) { display: none; }
 .pre :is(.postA .postB) { display: none; }
 :where(.wA .wB) { display: none; }
+/* The argument's last compound with more than one detail: these are the
+   ones that used to corrupt the selector, because a detail copied out of
+   another chain still said another followed it. */
+:is(.mdA .mdB.mdC) { display: none; }
+:is(.mdD p.mdE) { display: none; }
+:is(.mdF .mdG[data-x=y]) { display: none; }
+:is(.mdH .mdI:first-child) { display: none; }
 :is(.btn.primary) { display: none; }
 :is(div#istype) { display: none; }
 
@@ -84,6 +91,10 @@ p:is(.subjA .subjB) { display: none; }
 <div class="pre"><div class="postA"><p id="post2" class="postB">x</p></div></div>
 <div class="postA"><p id="postnopre" class="postB">x</p></div>
 <div class="wA"><p id="w2" class="wB">x</p></div>
+<div class="mdA"><p id="md1" class="mdB mdC">x</p><p id="md1b" class="mdB">x</p></div>
+<div class="mdD"><p id="md2" class="mdE">x</p><div id="md2b" class="mdE">x</div></div>
+<div class="mdF"><p id="md3" class="mdG" data-x="y">x</p><p id="md3b" class="mdG" data-x="z">x</p></div>
+<div class="mdH"><p id="md4" class="mdI">x</p><p id="md4b" class="mdI">x</p></div>
 <p id="btn" class="btn primary">x</p>
 <div id="istype">x</div>
 <p id="emptyis">x</p>
@@ -112,6 +123,7 @@ function report(){
   'layerlist','afterlayerlist','control',
   'islistA','islistB','wherelist','compound','inner2','outerdiv',
   'chain3','kid2','kidfar','subjP','subjD','alt2','post2','postnopre','w2',
+  'md1','md1b','md2','md2b','md3','md3b','md4','md4b',
   'btn','istype','emptyis','wrongtag','righttag','grp1','grp2','grp3',
   'isdescendkid',
   'specwhere','speciscls','vartop','varlayer','varsupports',

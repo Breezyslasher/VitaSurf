@@ -1,5 +1,5 @@
 diff --git a/src/parse/language.c b/src/parse/language.c
-index a66b0c1..756904d 100644
+index a66b0c1..beacd56 100644
 --- a/src/parse/language.c
 +++ b/src/parse/language.c
 @@ -108,6 +108,14 @@ static bool isFunctionalGroup(css_language *c,
@@ -25,7 +25,7 @@ index a66b0c1..756904d 100644
  	c->default_namespace = NULL;
  	c->namespaces = NULL;
  	c->num_namespaces = 0;
-@@ -2240,6 +2249,216 @@ static bool isFunctionalGroup(css_language *c,
+@@ -2240,6 +2249,232 @@ static bool isFunctionalGroup(css_language *c,
  	return false;
  }
  
@@ -220,13 +220,29 @@ index a66b0c1..756904d 100644
 +	 */
 +	for (det = &last->data; det != NULL;
 +			det = (det->next != 0) ? det + 1 : NULL) {
++		css_selector_detail one;
++
 +		if (det == &last->data &&
 +				det->type == CSS_SELECTOR_ELEMENT &&
 +				det->negate == 0 &&
 +				nameIs(det->qname.name, "*"))
 +			continue;
++
++		/*
++		 * Copied with its "next" bit cleared. Everywhere else in
++		 * this file appends a detail straight from
++		 * css__stylesheet_selector_detail_init(), which leaves
++		 * that bit zero; these come out of another selector's
++		 * chain, and appending one that still says a detail
++		 * follows leaves the compound claiming a successor that
++		 * was never written. Every later walk of that chain --
++		 * the next append, the selector hash, the destructor --
++		 * then runs off the end of the allocation.
++		 */
++		one = *det;
++		one.next = 0;
 +		error = css__stylesheet_selector_append_specific(c->sheet,
-+				parent, det);
++				parent, &one);
 +		if (error != CSS_OK) {
 +			css__stylesheet_selector_destroy(c->sheet, last);
 +			dropPrefixChain(c);
@@ -242,7 +258,7 @@ index a66b0c1..756904d 100644
  /**
   * Append the compound inside :is() or :where() to the selector being
   * built (VitaSurf).
-@@ -2251,10 +2470,10 @@ static bool isFunctionalGroup(css_language *c,
+@@ -2251,10 +2486,10 @@ static bool isFunctionalGroup(css_language *c,
   * by parseSelectorExpanded, which parses the selector once per
   * combination.
   *
@@ -257,7 +273,7 @@ index a66b0c1..756904d 100644
   */
  static css_error parseAppendGroup(css_language *c,
  		const parserutils_vector *vector, int32_t *ctx,
-@@ -2283,6 +2502,23 @@ static css_error parseAppendGroup(css_language *c,
+@@ -2283,6 +2518,23 @@ static css_error parseAppendGroup(css_language *c,
  	if (token == NULL)
  		return CSS_INVALID;
  
@@ -281,7 +297,7 @@ index a66b0c1..756904d 100644
  	/*
  	 * :is() and :where() with nothing in them match nothing -- and
  	 * GitHub's stylesheet ships a literal ":is(){...}". Appending no
-@@ -2421,12 +2657,22 @@ css_error parseSelectorSpecifics(css_language *c,
+@@ -2421,12 +2673,22 @@ css_error parseSelectorSpecifics(css_language *c,
  	css_error error;
  	const css_token *token;
  
@@ -305,7 +321,7 @@ index a66b0c1..756904d 100644
  			tokenIsChar(token, ',') == false) {
  		error = parseAppendSpecific(c, vector, ctx, parent);
  		if (error != CSS_OK)
-@@ -2620,9 +2866,27 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+@@ -2620,9 +2882,27 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
  	 * selector.
  	 */
  
@@ -334,7 +350,7 @@ index a66b0c1..756904d 100644
  
  	while ((token = parserutils_vector_peek(vector, *ctx)) != NULL &&
  			tokenIsChar(token, ',') == false) {
-@@ -2649,12 +2913,12 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+@@ -2649,12 +2929,12 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
  
  		error = parseSimpleSelector(c, vector, ctx, &other);
  		if (error != CSS_OK) {
