@@ -1,0 +1,71 @@
+<!DOCTYPE html><html><head><title>template</title></head><body>
+<pre id="out"></pre>
+<dom-module id="m"><template id="inmod"><div id="inmodDiv">a</div></template></dom-module>
+<template id="outer"><template id="inner"><b id="deep">d</b></template></template>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function id(n){return n?(n.id||n.nodeName):'none';}
+
+/* A template's children belong to its content fragment, not to the
+   element. Every component framework finds its named nodes through it. */
+var t=document.getElementById('inmod');
+T('content nodeType', t.content.nodeType);
+T('content is a fragment', t.content.nodeName);
+T('element has no children', t.childNodes.length);
+T('content finds the div', id(t.content.querySelector('#inmodDiv')));
+T('content is the same object twice', t.content===t.content);
+
+/* innerHTML reads and writes the content, not the element. */
+var s=document.createElement('template');
+s.innerHTML='<p id="one">1</p>';
+T('set innerHTML: content', id(s.content.querySelector('#one')));
+T('set innerHTML: no children', s.childNodes.length);
+T('get innerHTML', s.innerHTML);
+s.innerHTML='<p id="two">2</p>';
+T('reassign innerHTML: content', id(s.content.querySelector('#two')));
+T('reassign innerHTML: old gone', s.content.querySelector('#one')===null);
+T('reassign innerHTML: one child', s.content.childNodes.length);
+T('get innerHTML again', s.innerHTML);
+
+/* Cloning and importing carry the content with them. */
+var c=t.cloneNode(true);
+T('clone content finds the div', id(c.content.querySelector('#inmodDiv')));
+var imported=document.importNode(t.content,true);
+T('importNode nodeType', imported.nodeType);
+T('importNode finds the div', id(imported.querySelector('#inmodDiv')));
+
+/* A template inside another template's content is a template too. */
+var o=document.getElementById('outer');
+var inner=o.content.querySelector('template');
+T('nested template found', id(inner));
+T('nested content finds the b', id(inner&&inner.content.querySelector('#deep')));
+
+/* A template that belongs to another document: this is how a component
+   library ships its markup, and its content has to work the same way. */
+var pd=new DOMParser().parseFromString(
+  '<body><template id="pt"><i id="pi">i</i></template></body>','text/html');
+var pt=pd.getElementById('pt');
+T('parsed template exists', id(pt));
+T('parsed content finds the i', id(pt&&pt.content.querySelector('#pi')));
+T('parsed content child count', pt?pt.content.childNodes.length:-1);
+T('parsed element has no children', pt?pt.childNodes.length:-1);
+T('parsed content ownerDocument is that document',
+  pt?(pt.content.ownerDocument===pd):'none');
+
+var hd=document.implementation.createHTMLDocument('h');
+hd.body.innerHTML='<template id="ht"><u id="hu">u</u></template>';
+var ht=hd.getElementById('ht');
+T('created-document template exists', id(ht));
+T('created-document content finds the u', id(ht&&ht.content.querySelector('#hu')));
+
+/* Adopting one into this document keeps its content. */
+if(pt){var ad=document.adoptNode(pt);
+ T('adopted content finds the i', id(ad.content.querySelector('#pi')));}
+
+/* Stamping into a shadow root, which is what the frameworks do. */
+var host=document.createElement('div');document.body.appendChild(host);
+var sr=host.attachShadow({mode:'open'});
+sr.appendChild(document.importNode(t.content,true));
+T('stamped into shadow root', id(sr.querySelector('#inmodDiv')));
+</script></body></html>

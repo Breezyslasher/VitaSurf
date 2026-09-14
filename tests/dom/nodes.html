@@ -1,0 +1,53 @@
+<!DOCTYPE html><html><head><title>nodes</title></head><body>
+<pre id="out"></pre>
+<div id="d"><a id="k1">1</a><a id="k2">2</a><a id="k3">3</a></div>
+<script src="_probe.js"></script>
+<script>
+function ids(n){return Array.prototype.map.call(n.children,function(c){return c.id;}).join(',');}
+var d=document.getElementById('d');
+T('children', ids(d));
+d.insertBefore(d.children[2],d.children[0]);
+T('insertBefore moves', ids(d));
+d.appendChild(d.children[0]);
+T('appendChild moves', ids(d));
+var rep=document.createElement('a');rep.id='r';
+d.replaceChild(rep,d.children[1]);
+T('replaceChild', ids(d));
+T('removeChild returns', d.removeChild(rep).id);
+T('after remove', ids(d));
+var c=d.cloneNode(true);
+T('clone deep', ids(c)+'|'+(c===d)+'|'+(c.parentNode===null));
+T('clone shallow', document.getElementById('d').cloneNode(false).children.length);
+T('textContent', d.textContent);
+d.textContent='z';
+T('textContent set shape', shape(d));
+var e=document.createElement('div');
+e.appendChild(document.createTextNode('a'));
+e.appendChild(document.createTextNode('b'));
+T('two text nodes', shape(e));
+e.normalize();
+T('after normalize', shape(e));
+T('contains self', d.contains(d));
+T('contains child', document.body.contains(d));
+T('contains detached', d.contains(document.createElement('i')));
+var p1=document.createElement('p'),p2=document.createElement('p');
+p1.innerHTML='<b>x</b>';p2.innerHTML='<b>x</b>';
+T('isEqualNode', p1.isEqualNode(p2));
+p2.innerHTML='<b>y</b>';
+T('isEqualNode differs', p1.isEqualNode(p2));
+T('compare following', document.getElementById('d').compareDocumentPosition(document.getElementById('out')));
+T('nodeType doc', document.nodeType);
+T('ownerDocument', document.createElement('i').ownerDocument===document);
+T('isConnected attached', document.body.isConnected);
+T('isConnected detached', document.createElement('i').isConnected);
+T('firstElementChild null', String(document.createElement('i').firstElementChild));
+T('append text', (function(){var x=document.createElement('div');
+  x.append('a',document.createElement('b'),'c');return shape(x);})());
+T('prepend', (function(){var x=document.createElement('div');
+  x.innerHTML='<i></i>';x.prepend('t');return shape(x);})());
+T('replaceWith', (function(){var x=document.createElement('div');
+  x.innerHTML='<i id="g"></i>';x.querySelector('#g').replaceWith('t');return shape(x);})());
+T('insertAdjacentHTML', (function(){var x=document.createElement('div');
+  x.innerHTML='<i></i>';x.querySelector('i').insertAdjacentHTML('afterend','<b></b>');
+  return shape(x);})());
+</script></body></html>

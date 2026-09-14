@@ -1,0 +1,46 @@
+<!DOCTYPE html><html><head><title>forms</title></head><body>
+<pre id="out"></pre>
+<form id="f" action="/go" method="get">
+  <input id="t" name="t" value="v">
+  <input id="c" name="c" type="checkbox" checked>
+  <input id="r" name="r" required>
+  <select id="s" name="s"><option value="1">a</option><option value="2" selected>b</option></select>
+  <textarea id="a" name="a">body</textarea>
+  <button id="btn" type="submit">go</button>
+</form>
+<label id="lab" for="t">L</label>
+<script src="_probe.js"></script>
+<script>
+var f=document.getElementById('f');
+T('elements length', f.elements.length);
+T('form length', f.length);
+T('named element', f.elements.namedItem('t').id);
+T('control form', document.getElementById('t').form===f);
+T('labels', document.getElementById('t').labels.length);
+T('label control', document.getElementById('lab').control.id);
+T('input value', document.getElementById('t').value);
+T('input defaultValue', document.getElementById('t').defaultValue);
+T('checkbox checked', document.getElementById('c').checked);
+T('checkbox defaultChecked', document.getElementById('c').defaultChecked);
+T('select value', document.getElementById('s').value);
+T('select selectedIndex', document.getElementById('s').selectedIndex);
+T('select length', document.getElementById('s').length);
+T('select options', document.getElementById('s').options.length);
+T('option index', document.getElementById('s').options[1].index);
+T('option text', document.getElementById('s').options[0].text);
+T('textarea value', document.getElementById('a').value);
+T('textarea defaultValue', document.getElementById('a').defaultValue);
+T('required willValidate', document.getElementById('r').willValidate);
+T('required validity', document.getElementById('r').validity.valueMissing);
+T('required checkValidity', document.getElementById('r').checkValidity());
+T('filled validity', document.getElementById('t').validity.valid);
+T('form checkValidity', f.checkValidity());
+T('button type', document.getElementById('btn').type);
+T('input type default', document.createElement('input').type);
+T('setCustomValidity', (function(){var e=document.createElement('input');
+  e.setCustomValidity('no');return e.validationMessage+'|'+e.validity.customError;})());
+document.getElementById('s').value='1';
+T('select value write', document.getElementById('s').selectedIndex);
+document.getElementById('t').value='w';
+T('input value write', document.getElementById('t').value+'|'+document.getElementById('t').getAttribute('value'));
+</script></body></html>

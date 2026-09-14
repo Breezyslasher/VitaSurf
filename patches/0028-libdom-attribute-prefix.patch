@@ -1,0 +1,132 @@
+Keep an attribute's namespace prefix.
+
+libdom threw the prefix away: set_attribute_ns split a qualified name
+and created the attribute from the local name alone, so xlink:href on
+an SVG use element came back as href and serialised as href, which an
+SVG 1.1 renderer does not resolve. The hubbub binding has the same
+gap in the other direction -- the tokeniser hands back the namespace
+and the local name separately, per the HTML parsing rules, and the
+binding passed the bare local name where a qualified name was wanted.
+
+Thread the prefix through set_attr, and rebuild the qualified name in
+the parser binding for the three namespaces the HTML parser produces.
+
+diff --git a/bindings/hubbub/parser.c b/bindings/hubbub/parser.c
+index a84a951..432bd54 100644
+--- a/bindings/hubbub/parser.c
++++ b/bindings/hubbub/parser.c
+@@ -55,6 +55,32 @@ struct dom_hubbub_parser {
+ };
+ 
+ /* Forward declaration to break reference loop */
++/* prefix + ":" + local, for an attribute the tokeniser split apart */
++static bool name_is(dom_string *s, const char *want)
++{
++	size_t len = strlen(want);
++
++	return dom_string_byte_length(s) == len &&
++		memcmp(dom_string_data(s), want, len) == 0;
++}
++
++static dom_string *qualify_name(const char *prefix, dom_string *local)
++{
++	size_t plen = strlen(prefix), llen = dom_string_byte_length(local);
++	uint8_t buf[128];
++	dom_string *out = NULL;
++
++	if (plen + llen >= sizeof(buf)) {
++		return NULL;
++	}
++	memcpy(buf, prefix, plen);
++	memcpy(buf + plen, dom_string_data(local), llen);
++	if (dom_string_create(buf, plen + llen, &out) != DOM_NO_ERR) {
++		return NULL;
++	}
++	return out;
++}
++
+ static hubbub_error add_attributes(void *parser, void *node,
+ 		const hubbub_attribute *attributes, uint32_t n_attributes);
+ 
+@@ -597,10 +623,28 @@ static hubbub_error add_attributes(void *parser, void *node,
+ 						"Can't add attribute");
+ 			}
+ 		} else {
++			/* The tokeniser has already split xlink:href into
++			 * the xlink namespace and the local name href, so
++			 * put the prefix back: set_attribute_ns takes a
++			 * qualified name, and without one the attribute
++			 * serialises as plain href and stops resolving in
++			 * an SVG 1.1 renderer. */
++			dom_string *qname = NULL;
++
++			if (attributes[i].ns == HUBBUB_NS_XLINK) {
++				qname = qualify_name("xlink:", name);
++			} else if (attributes[i].ns == HUBBUB_NS_XML) {
++				qname = qualify_name("xml:", name);
++			} else if (attributes[i].ns == HUBBUB_NS_XMLNS &&
++				   !name_is(name, "xmlns")) {
++				qname = qualify_name("xmlns:", name);
++			}
+ 			err = dom_element_set_attribute_ns(
+ 					(struct dom_element *) node,
+-					dom_namespaces[attributes[i].ns], name,
++					dom_namespaces[attributes[i].ns],
++					qname != NULL ? qname : name,
+ 					value);
++			if (qname != NULL) dom_string_unref(qname);
+ 			dom_string_unref(name);
+ 			dom_string_unref(value);
+ 			if (err != DOM_NO_ERR) {
+diff --git a/src/core/element.c b/src/core/element.c
+index 70f743a..6ceeae3 100644
+--- a/src/core/element.c
++++ b/src/core/element.c
+@@ -468,7 +468,8 @@ static dom_attr_list *_dom_element_attr_list_clone(dom_attr_list *list,
+ static dom_exception _dom_element_get_attr(struct dom_element *element,
+ 		dom_string *namespace, dom_string *name, dom_string **value);
+ static dom_exception _dom_element_set_attr(struct dom_element *element,
+-		dom_string *namespace, dom_string *name, dom_string *value);
++		dom_string *namespace, dom_string *prefix, dom_string *name,
++		dom_string *value);
+ static dom_exception _dom_element_remove_attr(struct dom_element *element,
+ 		dom_string *namespace, dom_string *name);
+ 
+@@ -702,7 +703,7 @@ dom_exception _dom_element_get_attribute(struct dom_element *element,
+ dom_exception _dom_element_set_attribute(struct dom_element *element,
+ 		dom_string *name, dom_string *value)
+ {
+-	return _dom_element_set_attr(element, NULL, name, value);
++	return _dom_element_set_attr(element, NULL, NULL, name, value);
+ }
+ 
+ /**
+@@ -889,7 +890,8 @@ dom_exception _dom_element_set_attribute_ns(struct dom_element *element,
+ 		return DOM_NAMESPACE_ERR;
+ 	}
+ 
+-	err = _dom_element_set_attr(element, namespace, localname, value);
++	err = _dom_element_set_attr(element, namespace, prefix, localname,
++			value);
+ 
+ 	dom_string_unref(prefix);
+ 	dom_string_unref(localname);
+@@ -1636,7 +1638,8 @@ dom_exception _dom_element_get_attr(struct dom_element *element,
+  * \return DOM_NO_ERR on success, appropriate dom_exception on failure.
+  */
+ dom_exception _dom_element_set_attr(struct dom_element *element,
+-		dom_string *namespace, dom_string *name, dom_string *value)
++		dom_string *namespace, dom_string *prefix, dom_string *name,
++		dom_string *value)
+ {
+ 	dom_attr_list *match;
+ 	dom_node_internal *e = (dom_node_internal *) element;
+@@ -1688,7 +1691,7 @@ dom_exception _dom_element_set_attr(struct dom_element *element,
+ 		struct dom_document *doc;
+ 		bool success = true;
+ 
+-		err = _dom_attr_create(e->owner, name, namespace, NULL,
++		err = _dom_attr_create(e->owner, name, namespace, prefix,
+ 				true, &attr);
+ 		if (err != DOM_NO_ERR)
+ 			return err;

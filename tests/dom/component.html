@@ -1,0 +1,62 @@
+<!DOCTYPE html><html><head><title>component</title></head><body>
+<pre id="out"></pre>
+<div id="host"></div>
+<script src="_probe.js"></script>
+<script>
+var order=[];
+/* What a component framework does: define an element, give it a
+   template, stamp the template into its root on connect, then find its
+   own nodes by id the way Polymer builds this.$. */
+var tpl=document.createElement('template');
+tpl.innerHTML='<div id="wrap"><span id="label">n</span><button id="go">b</button></div>';
+
+function stampInto(root, template){
+  var frag=document.importNode(template.content,true);
+  root.appendChild(frag);
+}
+function nodeMap(root){
+  var m={},all=root.querySelectorAll('[id]');
+  for(var i=0;i<all.length;i++)m[all[i].id]=all[i];
+  return m;
+}
+
+if (typeof customElements !== 'undefined') {
+  var Base = (typeof HTMLElement === 'function') ? HTMLElement : function(){};
+  function XThing(){ return Reflect.construct(Base, [], XThing); }
+  XThing.prototype = Object.create(Base.prototype);
+  XThing.prototype.constructor = XThing;
+  XThing.prototype.connectedCallback = function(){
+    order.push('connected');
+    var root = this.attachShadow ? this.attachShadow({mode:'open'}) : this;
+    stampInto(root, tpl);
+    this.$ = nodeMap(root);
+    this.ready();
+  };
+  XThing.prototype.attributeChangedCallback = function(n){ order.push('attr:'+n); };
+  XThing.prototype.disconnectedCallback = function(){ order.push('disconnected'); };
+  Object.defineProperty(XThing, 'observedAttributes', {get:function(){return ['tag'];}});
+  XThing.prototype.ready = function(){
+    order.push('ready');
+    T('$ has wrap', !!this.$.wrap);
+    T('$ has label', !!this.$.label);
+    T('$ has go', !!this.$.go);
+    T('label is an element', this.$.label ? this.$.label.tagName : 'undefined');
+    T('label addEventListener', this.$.label ? typeof this.$.label.addEventListener : 'undefined');
+    T('root child count', this.shadowRoot ? this.shadowRoot.children.length : -1);
+    T('host tag', this.tagName);
+  };
+  customElements.define('x-thing', XThing);
+
+  var el = document.createElement('x-thing');
+  el.setAttribute('tag','t');
+  document.getElementById('host').appendChild(el);
+  T('upgraded', el instanceof XThing);
+  T('callback order', order.join('>'));
+  T('whenDefined', typeof customElements.whenDefined('x-thing').then);
+  T('get', customElements.get('x-thing') === XThing);
+  el.remove();
+  T('after remove', order.join('>'));
+} else {
+  T('customElements', 'missing');
+}
+</script></body></html>

@@ -1,0 +1,52 @@
+<!DOCTYPE html><html><head><title>selectors</title></head><body>
+<pre id="out"></pre>
+<div id="root" class="a b">
+  <p class="x" data-k="v1" title="t">one</p>
+  <p class="x y" data-k="v2">two</p>
+  <span class="y">three</span>
+  <section><p class="x">deep</p></section>
+  <input type="text" name="n" disabled>
+  <a href="#h" rel="a b">link</a>
+</div>
+<script src="_probe.js"></script>
+<script>
+var r=document.getElementById('root');
+function n(sel,ctx){try{return (ctx||r).querySelectorAll(sel).length;}catch(e){return 'throw';}}
+function one(sel,ctx){try{var e=(ctx||r).querySelector(sel);return e?(e.tagName+'.'+e.className):'null';}catch(e){return 'throw';}}
+T('tag', n('p'));
+T('class', n('.x'));
+T('two classes', n('.x.y'));
+T('id', n('#root',document));
+T('descendant', n('section p'));
+T('child', n('#root > p',document));
+T('group', n('span, section'));
+T('universal', n('*'));
+T('attr present', n('[data-k]'));
+T('attr equals', n('[data-k="v2"]'));
+T('attr prefix', n('[data-k^="v"]'));
+T('attr suffix', n('[data-k$="1"]'));
+T('attr contains', n('[data-k*="1"]'));
+T('attr whitespace', n('[rel~="b"]'));
+T('attr dash', n('[data-k|="v1"]'));
+T('tag and class', n('p.x'));
+T('first match', one('p'));
+T('no match', one('.nope'));
+T('adjacent sibling', n('p + p'));
+T('general sibling', n('p ~ span'));
+T('not', n('p:not(.y)'));
+T('first-child', n('p:first-child'));
+T('last-child', n('span:last-child'));
+T('nth-child', n('p:nth-child(2)'));
+T('matches self', r.matches('#root'));
+T('matches class', r.matches('.a'));
+T('matches negative', r.matches('.zz'));
+T('closest', (function(){var d=r.querySelector('section p');
+  var c=d.closest('section');return c?c.tagName:'null';})());
+T('closest self', r.closest('#root').id);
+T('closest none', String(r.closest('.zz')));
+T('getElementsByTagName', r.getElementsByTagName('p').length);
+T('getElementsByClassName', r.getElementsByClassName('x').length);
+T('querySelector on detached', (function(){var d=document.createElement('div');
+  d.innerHTML='<i class="q"></i>';return d.querySelector('.q')?'found':'missing';})());
+T('escaped id', (function(){try{return document.querySelectorAll('#root').length;}catch(e){return 'throw';}})());
+</script></body></html>

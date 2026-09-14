@@ -1,0 +1,86 @@
+name: Page size report
+
+# Fetches each URL in fixtures/candidates.txt with the Vita user agent
+# and prints how many elements its document has, so pages can be chosen
+# for hardware testing against the layout rebuild size limit.
+
+on:
+  push:
+    paths:
+      - 'fixtures/candidates.txt'
+      - '.github/workflows/page-size.yml'
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Measure each candidate
+        run: |
+          python3 - <<'PY'
+          import re, sys, urllib.request, html.parser
+
+          UA = 'Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
+
+          class Counter(html.parser.HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.elements = 0
+                  self.scripts = 0
+                  self.inline_scripts = 0
+              def handle_starttag(self, tag, attrs):
+                  self.elements += 1
+                  if tag == 'script':
+                      if any(k == 'src' for k, _ in attrs):
+                          self.scripts += 1
+                      else:
+                          self.inline_scripts += 1
+
+          urls = []
+          for line in open('fixtures/candidates.txt'):
+              line = line.strip()
+              if line and not line.startswith('#'):
+                  urls.append(line)
+
+          LIMIT = 3000
+          rows = []
+          for url in urls:
+              try:
+                  req = urllib.request.Request(url, headers={
+                      'User-Agent': UA, 'Accept': '*/*',
+                      'Accept-Language': 'en'})
+                  with urllib.request.urlopen(req, timeout=40) as r:
+                      body = r.read()
+                      final = r.geturl()
+                  text = body.decode('utf-8', 'replace')
+                  c = Counter()
+                  c.feed(text)
+                  rows.append((url, final, len(body), c.elements,
+                               c.scripts, c.inline_scripts, None))
+              except Exception as e:
+                  rows.append((url, url, 0, 0, 0, 0, str(e)[:60]))
+
+          w = max(len(r[0]) for r in rows) + 2
+          print()
+          print('%-*s %9s %9s %8s %8s  %s' % (
+              w, 'URL', 'bytes', 'elements', 'ext js', 'inline', 'verdict'))
+          print('-' * (w + 50))
+          for url, final, size, els, js, ijs, err in rows:
+              if err:
+                  verdict = 'FAILED: ' + err
+              elif els > LIMIT:
+                  verdict = 'over the %d limit, keeps parsed layout' % LIMIT
+              elif js + ijs == 0:
+                  verdict = 'under the limit but no scripts, will not rebuild'
+              else:
+                  verdict = 'GOOD: under the limit and scripted'
+              print('%-*s %9d %9d %8d %8d  %s' % (
+                  w, url, size, els, js, ijs, verdict))
+          print()
+          print('Element counts are of the document as served, before any')
+          print('script runs, so the Vita figure will be somewhat higher.')
+          PY

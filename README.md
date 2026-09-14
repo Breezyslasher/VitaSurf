@@ -115,6 +115,116 @@ so pages such as mobile Wikipedia (`html, body { height: 100% }` plus
 scrolled. The root and body boxes now report visible overflow and the
 window's own scrollbars handle the page.
 
+Patch 0021 fixes event dispatch in libdom: a listener registered on the
+node an event is dispatched at fired twice, once for the at-target phase
+and again while the event bubbled back through the same node.
+
+Patches 0022 and the QuickJS bindings make script changes to the document
+show up on screen. NetSurf builds its box tree once, after parsing, so
+anything a script added, removed, restyled or rewrote afterwards was
+invisible: the mobile Wikipedia skin moves its whole article into a new
+structure on load, which left the Vita showing the unstyled original.
+Every binding that changes the DOM now marks the layout stale, and
+`html_relayout()` rebuilds the box tree from the document and lays it out
+again once the running script is finished. A rebuild costs the whole box
+tree, so the wait between rebuilds grows with how long the last one took,
+up to two seconds, and a script that reads geometry on a document that is
+slow to lay out gets the last known values rather than forcing a rebuild.
+
+The rebuild runs to completion in one scheduler callback rather than
+yielding as NetSurf's initial conversion does. A content that has
+finished loading is assumed throughout NetSurf to have a box tree, and
+letting other work run while it briefly has none crashed the browser in
+an assertion in the redraw path, reached by the history thumbnail. It
+does mean a long document freezes the frame for the length of a rebuild.
+On hardware a Wikipedia article, about five and a half thousand
+elements, took roughly fifty seconds and turned a twenty seven second
+page load into an eighty second one, which is a far worse page than the
+one the rebuild would have improved. So a rebuild waits until the page
+has finished loading, only runs for the page actually on screen, never
+overlaps another, earns a quiet period in proportion to what the last
+one cost, and is skipped above `RELAYOUT_MAX_ELEMENTS` elements. The
+duration and element count are logged so the limit can be tuned from a
+hardware log.
+
+The limit is set from measurement rather than caution. Profiling a
+rebuild of a Wikipedia article natively puts 62 per cent of it in CSS
+selection, 12 per cent in layout and the rest in building boxes and
+tearing the old tree down, and the cost is close to linear in the number
+of elements: 9 ms at 932 elements, 30 ms at 2857 and 78 ms at 5460 with
+the same stylesheet. Hardware runs about 25 times slower than that, which
+matches the figures the device reports, so six thousand elements is
+roughly two seconds and that is what the limit is worth.
+
+libcss can share one element's computed style with a like sibling, which
+would cut the selection cost, and it is worth knowing why that does not
+help here. Every one of the 22120 sharing candidates in a rebuild of that
+article is rejected, all of them because the candidate was matched by a
+rule carrying an attribute selector or a pseudo class, which Minerva's
+stylesheet uses throughout. A first attempt also found that 87 per cent
+of candidates were rejected earlier still, for carrying an id, since
+Wikipedia's parser puts a generated id on nearly every element; teaching
+libcss to ignore an id that no stylesheet mentions cleared that but
+changed nothing, because the taint check rejects them anyway. Neither
+was kept. Wikipedia is over it and keeps
+its parsed layout; it still renders and scrolls the full article,
+because that depended on the viewport overflow fix rather than on the
+rebuild. The objects a page has already loaded are held across a
+rebuild rather than released before the new tree asks for them, since
+dropping the last user of each lets them fall out of the cache and the
+Vita then decodes every image again. Redraw, hit testing, reformat and
+the object callbacks check for a missing box tree anyway. A script that reads geometry right
+after changing the document reads the previous layout rather than
+forcing a rebuild from under code that holds box pointers.
+
+libdom dispatches its element methods through a vtable that only element
+nodes carry, and the bindings called them on whatever node JavaScript
+handed over. On a text node or a document fragment that reads past the
+end of the node's smaller vtable and calls whatever pointer follows it,
+which is what crashed build 86 when the Wikipedia scripts asked a
+document fragment for its elements. Every binding now checks the node
+type first, and `getElementsByTagName` on a fragment walks the subtree
+instead.
+
+Selector queries are matched from the right: the candidates for the
+right-hand simple selector of every group in the list come from one pass
+through the tree in C, and only those are checked against the rest of the
+selector. Walking the tree in JavaScript instead, and wrapping every node
+on the way, cost around 300 ms per class lookup on a Wikipedia article
+here and blew the script time budget on the Vita.
+
+The bindings also give scripts the real page geometry (`offsetWidth` and
+friends, `getBoundingClientRect`, `scrollWidth`, the window's scroll
+offsets and viewport size), working `scrollTo`, `scrollBy` and
+`scrollIntoView`, `dispatchEvent` through libdom so a synthetic event
+reaches listeners registered anywhere, and a `matchMedia` that evaluates
+media queries against the actual viewport instead of always answering
+false.
+
+Every submodule is marked `ignore = dirty` in `.gitmodules`. Applying the
+patch series leaves each one with a modified working tree by design, so
+without this `git status` reports five modified submodules at all times
+and buries anything that matters. A submodule checked out at the wrong
+commit, which is a real problem, is still reported.
+
+Requests from scripts resolve against the document's own base URL rather
+than the window's. While a page is loading the window still reports the
+previous one, so a relative request went wherever the user had been
+before, which for the first page of a session is a `file:` URL that the
+fetcher then refuses.
+
+Measured load times against the browser Sony shipped are kept in
+`docs/benchmarks.md`, along with what each phase of a load costs.
+
+A page load reports where its time went. When a page finishes, the log
+carries a second line breaking the total into HTML parsing, CSS,
+image decoding, box construction with style selection, and layout, and
+the load event line says how many scripts ran, their size, and how long
+went into compiling them against running them. Patch 0023 adds the
+counters. Sony's own browser loads the desktop PlayStation Vita article
+on the same device in 13 seconds against our 30, so there is a real
+target to measure against rather than a feeling.
+
 ## Building
 
 Requirements: [VitaSDK](https://vitasdk.org/) with `VITASDK` set, plus

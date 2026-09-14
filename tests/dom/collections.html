@@ -1,0 +1,35 @@
+<!DOCTYPE html><html><head><title>collections</title></head><body>
+<pre id="out"></pre>
+<form id="f1"></form><form id="f2"></form>
+<img id="i1" src="a.png"><img id="i2" src="b.png">
+<a id="a1" href="#x">a</a><a id="a2">no href</a>
+<a id="a3" name="anchor">named</a>
+<script src="_probe.js"></script>
+<script>
+T('forms', document.forms.length);
+T('forms item', document.forms[0].id);
+T('images', document.images.length);
+T('links', document.links.length);
+T('anchors', document.anchors.length);
+T('scripts at least', document.scripts.length>=1);
+T('body tag', document.body.tagName);
+T('head tag', document.head.tagName);
+T('documentElement', document.documentElement.tagName);
+T('doc children', document.children.length);
+T('doc childElementCount', document.childElementCount);
+T('doc firstElementChild', document.firstElementChild.tagName);
+T('getElementsByName', document.getElementsByName('anchor').length);
+T('getElementById missing', String(document.getElementById('nope')));
+T('doctype name', document.doctype ? document.doctype.name : 'null');
+T('compatMode', document.compatMode);
+T('contentType', document.contentType);
+T('characterSet', document.characterSet);
+T('readyState', document.readyState);
+T('title empty', '['+document.title+']');
+T('nodeType', document.nodeType);
+T('body isConnected', document.body.isConnected);
+T('children live-ish', (function(){var d=document.createElement('div');
+  d.innerHTML='<i></i><b></b>';return d.children.length;})());
+T('childNodes length', (function(){var d=document.createElement('div');
+  d.innerHTML='a<i></i>b';return d.childNodes.length;})());
+</script></body></html>

@@ -1,0 +1,19 @@
+# Candidate pages for testing the layout rebuild on hardware.
+# The size report workflow fetches each with the Vita user agent and
+# prints its element count, so pages under RELAYOUT_MAX_ELEMENTS can be
+# picked deliberately. One URL per line, # starts a comment.
+
+# Short Wikipedia articles: the same mobile skin that rewrites the
+# document after load, but far fewer elements than a long article.
+https://en.m.wikipedia.org/wiki/PlayStation_Vita
+https://en.m.wikipedia.org/wiki/Vita
+https://en.m.wikipedia.org/wiki/PocketStation
+https://en.m.wikipedia.org/wiki/Sega_Nomad
+https://en.m.wikipedia.org/wiki/Special:Random
+
+# Other small scripted pages worth having working on a handheld.
+https://news.ycombinator.com/
+https://lobste.rs/
+https://lite.duckduckgo.com/lite/
+https://text.npr.org/
+https://example.com/

@@ -1,0 +1,38 @@
+diff --git a/frontends/framebuffer/schedule.c b/frontends/framebuffer/schedule.c
+index 6d1711236..0df64606c 100644
+--- a/frontends/framebuffer/schedule.c
++++ b/frontends/framebuffer/schedule.c
+@@ -117,9 +117,33 @@ nserror framebuffer_schedule(int tival, void (*callback)(void *p), void *p)
+ 	nscb->callback = callback;
+ 	nscb->p = p;
+ 
++#ifdef __vita__
++	/*
++	 * VitaSurf: add to the back of the list. The runner walks it from
++	 * the front, so adding at the front ran callbacks that came due
++	 * together in the reverse of the order they were asked for, and
++	 * setTimeout is required to keep that order. Schedulers depend on
++	 * it: posting three messages through a MessageChannel delivered
++	 * them third, second, first.
++	 */
++	{
++		struct nscallback *tail = schedule_list;
++
++		nscb->next = NULL;
++		if (tail == NULL) {
++			schedule_list = nscb;
++		} else {
++			while (tail->next != NULL) {
++				tail = tail->next;
++			}
++			tail->next = nscb;
++		}
++	}
++#else
+         /* add to list front */
+         nscb->next = schedule_list;
+         schedule_list = nscb;
++#endif
+ 
+ 	return NSERROR_OK;
+ }

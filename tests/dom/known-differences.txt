@@ -1,0 +1,53 @@
+# Facts where this port deliberately does not match the browser, and why.
+# Format: probe file | fact name | reason
+#
+# Anything not listed here must match. A difference that is really a bug
+# does not belong in this file.
+
+forms.html | input value write | A control's value property is its current value and the value attribute is the default it resets to. Here the renderer draws the control from the attribute, so writing the property has to write the attribute or the user never sees what a script typed into the field. defaultValue and reset still return the original, which is remembered the first time the value is overwritten.
+
+collections.html | characterSet | A document that declares no encoding is decoded as UTF-8 here and as windows-1252 by the browser, which falls back by locale. That is the parser's default, not a binding: characterSet now reports whatever NetSurf actually decoded with, which is the honest answer either way.
+
+text.html | comment data | innerHTML that is nothing but a comment parses to no child here. A comment anywhere else in the markup comes through as a comment node, and document.createComment makes a real one, so this is hubbub's handling of a fragment whose entire content is a comment, not the bindings.
+
+One prototype for every node
+  Every node here shares Node.prototype: there is no separate
+  HTMLDivElement.prototype, Text.prototype or XMLDocument.prototype for
+  a prototype chain to walk. instanceof and constructor answer the right
+  interface, but a test that compares Object.getPrototypeOf(node) with a
+  named interface's prototype cannot pass, and one that walks the chain
+  Text -> CharacterData -> Node finds one link where a browser finds
+  three. That is the shape of these bindings, not an oversight: a single
+  prototype is what lets a page patch one place and have every node see
+  it, which is what the polyfills on real pages do.
+  Affects, among others: DOMImplementation-createDocument (most of it
+  is gated on XMLDocument.prototype), Text-constructor and
+  Comment-constructor ("prototype chain").
+
+SVG element names are upper-cased
+  libdom stores every element name upper-cased, so an SVG clipPath is
+  held as CLIPPATH and the capital P cannot be recovered. localName
+  lower-cases what libdom gives, which is right for HTML and no worse
+  than before for SVG. Fixing it means patching libdom's element
+  creation, which NetSurf's own code compares against.
+
+A template's content belongs to the template's own document
+  The specification gives every document a separate, inert "template
+  contents owner" document, and a template's content fragment belongs to
+  that one rather than to the document the template is in. Here the
+  fragment is made in the template's own document, so
+  template.content.ownerDocument is the document the template came from
+  where a browser reports the inert one. Nothing a page does with the
+  content differs; building the second document per document would cost
+  memory for a value almost nothing reads.
+  Affects: tests/dom/template.html ("parsed content ownerDocument").
+
+Inserting a node from another document does not adopt it
+  The current specification has no WRONG_DOCUMENT_ERR: inserting a node
+  adopts it into the parent's document first. libdom still refuses the
+  insert, and its own adoptNode duplicates the node rather than re-owning
+  it, so a node cannot be moved between documents here. Use importNode,
+  which pages already do. ownerDocument now reports the real document, so
+  anything built for a foreign node is built in the right place and the
+  case that used to fail silently -- a template parsed by DOMParser
+  handing back empty content -- works.

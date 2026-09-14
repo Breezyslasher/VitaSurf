@@ -1,0 +1,22 @@
+<!DOCTYPE html><html><head><title>base</title>
+<base href="https://example.org/dir/p.html">
+</head><body>
+<pre id="out"></pre>
+<a id="a" href="y?q=1#f">rel</a>
+<a id="b" href="/abs">abs</a>
+<a id="c" href="//other.example/z">scheme relative</a>
+<a id="d" href="../up">up</a>
+<script>
+/* inline, because an external script would resolve against the base */
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+T('baseURI', document.baseURI);
+T('relative', document.getElementById('a').href);
+T('absolute path', document.getElementById('b').href);
+T('scheme relative', document.getElementById('c').href);
+T('dot dot', document.getElementById('d').href);
+T('new URL', new URL('y', document.baseURI).href);
+T('new URL dotdot', new URL('../q', 'https://example.org/a/b/c').href);
+T('new URL query only', new URL('?x=1', 'https://example.org/a/b?y=2#z').href);
+T('new URL hash only', new URL('#h', 'https://example.org/a/b?y=2#z').href);
+</script></body></html>

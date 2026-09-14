@@ -24,15 +24,21 @@ for patch in "$ROOT"/patches/*.patch; do
         status=1
         continue
     fi
-    if [ -f "$stamp" ] && grep -qxF "$name" "$stamp"; then
+    # Ask the source, not the record: a checkout or a reset can undo a
+    # patch and leave the record behind, and then the build silently uses
+    # unpatched code. The record is only a fallback for a patch that
+    # cannot be reverse-checked.
+    if git -C "$dir" apply --check --reverse "$patch" >/dev/null 2>&1; then
         echo "   PATCH: $name (already applied)"
-    elif git -C "$dir" apply --check --reverse "$patch" >/dev/null 2>&1; then
-        echo "   PATCH: $name (already applied)"
-        echo "$name" >> "$stamp"
+        grep -qxF "$name" "$stamp" 2>/dev/null || echo "$name" >> "$stamp"
     elif git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
         echo "   PATCH: $name"
         git -C "$dir" apply "$patch"
         echo "$name" >> "$stamp"
+    elif [ -f "$stamp" ] && grep -qxF "$name" "$stamp"; then
+        # neither direction applies and the record says it is in: the
+        # source has moved on, which is fine, but say so
+        echo "   PATCH: $name (recorded, cannot verify)"
     else
         echo "error: $name does not apply cleanly to deps/$submodule" >&2
         git -C "$dir" apply --check "$patch" || true

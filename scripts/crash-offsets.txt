@@ -1,4 +1,37 @@
 # Text-segment offsets from crash dumps (VitaSurf@1 + offset), one per
 # line; the CI symbol map step prints the functions around each one.
+#
 # Build 62: data abort after pressing reload on en.wikipedia.org.
+#   Resolved to libnsfb's scaled bitmap plotter, fixed by patch 0017.
 0x6d2ba
+# Build 86: data abort loading en.wikipedia.org, main thread, r0 = 0.
+#   Resolved against build 86's own symbol map: the link register was in
+#   node_get_elements_by_tag_name and the program counter had jumped
+#   through a bogus pointer read past the end of a non-element node's
+#   vtable. Fixed by checking the node type before every libdom element
+#   call.
+0xc32a2
+0x932e
+# Build 88: SIGABRT on the main thread about a second after a layout
+#   rebuild started. Resolved against build 88's own symbol map: an
+#   assertion in html_redraw, reached through browser_window_history_
+#   update rendering the history thumbnail while the content had no box
+#   tree. The rebuild runs to completion again rather than yielding.
+0x35ff8e
+# Build 110: data abort loading www.youtube.com, main thread, r0 = 0.
+#   Module base was 0x81016000, so pc 0x810cdc9e is +0xb7c9e. Resolved
+#   against build 110's own symbol map to __dom_dispatch_subtree_modified_
+#   event + 0x42, whose only dereference of its first argument is
+#   doc->_memo_domsubtreemodified, and r0 held that argument. libdom's
+#   callers pass node->owner without checking it and a node created
+#   outside any document has none. That guard was the wrong pointer: see
+#   build 112.
+0xb7c9e
+# Build 112: the same crash again, with the build 110 guard in place, at
+#   __dom_dispatch_subtree_modified_event + 0x46. Disassembled against
+#   build 112's own ELF (the disasm workflow) rather than guessed at: the
+#   faulting instruction is "ldr r3, [r4, #0]", the inlined vtable load
+#   of dom_event_target_dispatch_event, and r4 -- the event target -- was
+#   zero in the dump. It is the target that is null, not the document.
+#   Fixed by guarding both in patch 0025.
+0xb80aa

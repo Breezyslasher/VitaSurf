@@ -1,0 +1,121 @@
+name: Fetch the web platform tests
+
+# The probes in tests/dom are only as good as what I thought to test, and
+# a saved page only finds the bugs that page happens to hit. The web
+# platform tests are the suite every browser is measured against, written
+# by the people who wrote the specifications, so they cover the surface
+# without any guessing from us.
+#
+# The whole suite is gigabytes; this takes the directories that matter for
+# a DOM implementation and commits them. Edit fixtures/wpt-request.txt and
+# push to run it.
+
+on:
+  push:
+    paths:
+      - fixtures/wpt-request.txt
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Take the directories we can run
+        run: |
+          set -eu
+          # A shallow, filtered clone: the suite is far too big otherwise.
+          git clone --depth 1 --filter=blob:none --sparse \
+              https://github.com/web-platform-tests/wpt.git /tmp/wpt
+          cd /tmp/wpt
+          git sparse-checkout set --no-cone \
+              /resources/testharness.js \
+              /resources/testharnessreport.js \
+              /resources/idlharness.js \
+              /common \
+              /dom/nodes \
+              /dom/events \
+              /dom/traversal \
+              /dom/collections \
+              /dom/ranges \
+              /html/dom \
+              /html/semantics/forms \
+              /css/cssom \
+              /url \
+              /domparsing
+          echo "revision $(git rev-parse HEAD)"
+
+      - name: Copy in what runs from a file, and nothing else
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import os, shutil, re
+
+          SRC = '/tmp/wpt'
+          DST = 'tests/wpt'
+          # A test that needs a server, a worker, or a second window cannot
+          # run from a file:// URL in this harness. Take the ones that can.
+          SKIP = re.compile(
+              r'(\.any\.|\.window\.|\.worker\.|\.serviceworker\.|'
+              r'-manual\.|/support/|\.tentative\.)')
+          # The tests include sibling helper scripts -- attributes.js,
+          # productions.js, pre-insertion-validation-*.js -- and without
+          # them a test reports its own helpers as undefined, which looks
+          # like our failure and is not.
+          WANT = re.compile(r'\.(html|js)$')
+          # Several tests load a fixture document into an iframe --
+          # /common/dummy.xml and /common/dummy.xhtml among them -- and
+          # without it both engines measure something other than the
+          # test. Those live under common/ and are not .html or .js.
+          FIXTURES = re.compile(r'^common/.*\.(xml|xhtml|svg|txt|css|json)$')
+
+          if os.path.isdir(DST):
+              shutil.rmtree(DST)
+          os.makedirs(DST)
+
+          kept = 0
+          for root, dirs, files in os.walk(SRC):
+              if '.git' in root:
+                  continue
+              for f in files:
+                  p = os.path.join(root, f)
+                  rel = os.path.relpath(p, SRC)
+                  if rel.startswith('resources/'):
+                      pass
+                  elif FIXTURES.match(rel):
+                      pass
+                  elif not WANT.search(f) or SKIP.search('/' + rel):
+                      continue
+                  elif f.endswith('.js') and re.search(r'\.(any|window|worker)\.js$', f):
+                      continue
+                  out = os.path.join(DST, rel)
+                  os.makedirs(os.path.dirname(out), exist_ok=True)
+                  shutil.copyfile(p, out)
+                  kept += 1
+          print('kept', kept, 'files')
+          PY
+          du -sh tests/wpt
+          find tests/wpt -name '*.html' | wc -l
+
+      - name: Commit them
+        run: |
+          set -eu
+          git config user.name 'Breezyslasher'
+          git config user.email '167659924+Breezyslasher@users.noreply.github.com'
+          git add tests/wpt
+          if git diff --cached --quiet; then
+            echo "no change"
+          else
+            git commit -m "Vendor the web platform tests we can run
+
+          Fetched by .github/workflows/wpt-fetch.yml from
+          web-platform-tests, which is under a permissive licence (the
+          3-clause BSD and W3C dual licence in its LICENSE.md)."
+            git push
+          fi

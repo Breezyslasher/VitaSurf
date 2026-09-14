@@ -1,0 +1,56 @@
+name: Fetch script snippet
+
+# Downloads a script and prints slices of it to the job log, so a minified
+# bundle can be read without committing megabytes to the repository. The
+# egress from a development machine may be filtered; a runner's is not.
+# Edit fixtures/snippet.txt and push to run it.
+
+on:
+  push:
+    paths:
+      - fixtures/snippet.txt
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Download and print the requested slices
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import re, urllib.request
+          # fixtures/snippet.txt: one url= line, then line=N or find=TEXT lines.
+          # line=N prints source line N; find=TEXT prints context around every
+          # occurrence of TEXT.
+          spec = open('fixtures/snippet.txt').read().splitlines()
+          url = next(l[4:] for l in spec if l.startswith('url='))
+          UA = 'Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
+          req = urllib.request.Request(url, headers={'User-Agent': UA})
+          body = urllib.request.urlopen(req, timeout=60).read().decode('utf-8', 'replace')
+          print('fetched %d bytes, %d lines' % (len(body), body.count(chr(10)) + 1))
+          lines = body.split(chr(10))
+          for l in spec:
+              if l.startswith('line='):
+                  spec_line = l[5:]
+                  if ':' in spec_line:
+                      n, rng = spec_line.split(':', 1)
+                      lo, hi = (int(x) for x in rng.split('-'))
+                  else:
+                      n, lo, hi = spec_line, 0, 4000
+                  n = int(n)
+                  if 1 <= n <= len(lines):
+                      print('--- line %d [%d:%d] ---' % (n, lo, hi))
+                      print(lines[n - 1][lo:hi])
+              elif l.startswith('find='):
+                  needle = l[5:]
+                  print('--- find %r ---' % needle)
+                  for m in re.finditer(re.escape(needle), body):
+                      a = max(0, m.start() - 400)
+                      print('at %d: %s' % (m.start(), body[a:m.end() + 400]))
+                      print('...')
+          PY

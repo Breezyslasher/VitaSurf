@@ -1,0 +1,23 @@
+<!DOCTYPE html><html><head><title>serialize</title></head><body>
+<pre id="out"></pre>
+<div id="d"><span class="c" data-k="v">t</span> tail</div>
+<script src="_probe.js"></script>
+<script>
+var d=document.getElementById('d');
+T('innerHTML', d.innerHTML);
+T('outerHTML', d.outerHTML);
+T('span outerHTML', d.firstChild.outerHTML);
+T('text node escape', (function(){var e=document.createElement('div');
+  e.textContent='a<b>&c';return e.innerHTML;})());
+T('attr escape', (function(){var e=document.createElement('div');
+  e.setAttribute('t','a"b&c');return e.outerHTML;})());
+T('void element', (function(){var e=document.createElement('div');
+  e.innerHTML='<br><img src="x">';return e.innerHTML;})());
+T('roundtrip', (function(){var e=document.createElement('div');
+  e.innerHTML='<p><b>x</b>y</p>';var h=e.innerHTML;
+  var f=document.createElement('div');f.innerHTML=h;return f.innerHTML===h;})());
+T('empty element', (function(){var e=document.createElement('div');
+  return e.innerHTML+'|'+e.outerHTML;})());
+T('style attr serialised', (function(){var e=document.createElement('div');
+  e.style.color='red';return e.getAttribute('style');})());
+</script></body></html>

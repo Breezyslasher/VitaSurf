@@ -26,6 +26,17 @@ off, every line below stays "not run".</p>
 <p id="timing">Script time: not run</p>
 </div>
 
+<div class="box">
+<p id="ce-def">Custom element: not run</p>
+<p id="ce-attr">Custom element attribute: not run</p>
+<p id="ce-insert">Custom element insertion: not run</p>
+<p id="ce-shadow">Shadow root: not run</p>
+</div>
+
+<div class="box"><b>Custom element renders:</b>
+<vita-badge label="hello"></vita-badge>
+</div>
+
 <p><button id="btn" type="button">Press me</button>
 <span id="count">0</span> presses</p>
 
@@ -86,6 +97,58 @@ off, every line below stays "not run".</p>
 	}
 
 	set("timing", "Script time: " + (Date.now() - start) + " ms", true);
+})();
+</script>
+
+<script>
+(function () {
+	function set(id, text, ok) {
+		var el = document.getElementById(id);
+		if (el) {
+			el.textContent = text;
+			el.className = ok ? "ok" : "fail";
+		}
+	}
+
+	if (typeof window.customElements === "undefined") {
+		set("ce-def", "Custom element: customElements missing", false);
+		return;
+	}
+
+	try {
+		var attrSeen = null, connected = 0;
+
+		class VitaBadge extends HTMLElement {
+			static get observedAttributes() { return ["label"]; }
+			attributeChangedCallback(name, old, now) { attrSeen = name + "=" + now; }
+			connectedCallback() {
+				connected++;
+				this.textContent = "[" + this.getAttribute("label") + "]";
+			}
+		}
+		window.customElements.define("vita-badge", VitaBadge);
+
+		var first = document.getElementsByTagName("vita-badge")[0];
+		set("ce-def", "Custom element: upgraded, instanceof " +
+			(first instanceof VitaBadge) + ", rendered " + first.textContent, true);
+		set("ce-attr", "Custom element attribute: " +
+			(attrSeen === "label=hello" ? "callback ran (" + attrSeen + ")"
+			 : "callback did not run"), attrSeen === "label=hello");
+
+		var added = document.createElement("vita-badge");
+		added.setAttribute("label", "added");
+		document.getElementById("list").appendChild(added);
+		set("ce-insert", "Custom element insertion: " + connected +
+			" connected, second reads " + added.textContent, connected === 2);
+
+		var host = document.createElement("div");
+		var root = host.attachShadow({ mode: "open" });
+		set("ce-shadow", "Shadow root: " +
+			(host.shadowRoot === root ? "attached (light DOM)" : "not attached"),
+			host.shadowRoot === root);
+	} catch (e) {
+		set("ce-def", "Custom element: " + e, false);
+	}
 })();
 </script>
 </body>

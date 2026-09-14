@@ -24,3 +24,9 @@ deps/netsurf/Makefile.config
 *.psp2dmp
 psp2core-*
 *.log
+
+# Transient copies the test harnesses make next to a test or a saved page,
+# so the relative paths to its resources still resolve. Deleted after each
+# run; listed here so an interrupted run leaves nothing to commit.
+*.vitaprobe.html
+*.probe.html
