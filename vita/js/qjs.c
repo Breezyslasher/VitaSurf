@@ -5491,10 +5491,29 @@ void js_handle_new_element(jsthread *thread, struct dom_element *node)
 					if (JS_IsException(fn)) {
 						qjs_report_exception(ctx);
 					} else {
-						JSValue type = JS_NewString(ctx, aname + 2);
-						add_listener(ctx, (struct dom_node *)node,
-							     type, fn, JS_UNDEFINED);
-						JS_FreeValue(ctx, type);
+						/*
+						 * Set the handler property
+						 * rather than adding a
+						 * listener of our own. The
+						 * prelude owns these: it
+						 * installs one listener per
+						 * property and replaces it
+						 * when the attribute is set
+						 * again. Adding one here as
+						 * well meant an element whose
+						 * attribute was set from
+						 * script ran its handler
+						 * twice.
+						 */
+						JSValue obj = wrap_node(ctx,
+							(struct dom_node *)node);
+
+						if (!JS_IsNull(obj)) {
+							JS_SetPropertyStr(ctx, obj,
+								aname,
+								JS_DupValue(ctx, fn));
+						}
+						JS_FreeValue(ctx, obj);
 					}
 					JS_FreeValue(ctx, fn);
 					free(body);

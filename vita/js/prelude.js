@@ -741,8 +741,18 @@ function goTo(url){
     if(W.__vitaReportError)W.__vitaReportError(err,location.href);}},0);
   return;}
  try{here=location.href;}catch(e){return;}
- var abs;
- try{abs=new URL(String(url),D.baseURI||here).href;}catch(e){return;}
+ var abs,i;
+ /* a fragment is resolved by hand: URL drops an empty one, so setting
+    the hash to "" came out as a different document and navigated */
+ if(url.charAt(0)==='#'){
+  i=here.indexOf('#');
+  abs=(i<0?here:here.slice(0,i))+url;
+ }else{
+  try{abs=new URL(url,D.baseURI||here).href;}catch(e){return;}}
+ /* going where we already are changes nothing and fires nothing: a
+    hashchange for a hash that did not change had the page's own
+    handler set it again, and round it went */
+ if(abs===here)return;
  if(sameDocFragment(here,abs)){
   var oldURL=here,hash=abs.slice(abs.indexOf('#'));
   W.__vitaHref=abs;
@@ -776,6 +786,7 @@ function goTo(url){
   set:function(v){
    v=String(v);
    goTo(v.charAt(0)==='#'?v:'#'+v);}});})();
+
 function runActivation(a){
  if(!a)return;
  if(a.kind==='submit'){
@@ -1337,6 +1348,23 @@ function makeHandler(src){
    'if(__r===false&&event&&event.preventDefault)event.preventDefault();'+
    'return __r;');
  }catch(e){return null;}}
+/* A clone carries its on-something attributes but not the handlers they
+   stand for: those are wired when the page is parsed, and a copy is not
+   parsed. A form cloned out of a template kept its onsubmit attribute
+   and had no handler, so it submitted and the page navigated away. */
+function wireHandlers(node){
+ if(!node||node.nodeType!==1&&node.nodeType!==11)return node;
+ var all=node.nodeType===1?[node]:[],kids,i,j,names,f;
+ kids=node.getElementsByTagName?node.getElementsByTagName('*'):[];
+ for(i=0;i<kids.length;i++)all.push(kids[i]);
+ for(i=0;i<all.length;i++){
+  if(!all[i].getAttributeNames)continue;
+  names=all[i].getAttributeNames();
+  for(j=0;j<names.length;j++){
+   if(!HANDLER_NAMES[names[j]])continue;
+   f=makeHandler(String(all[i].getAttribute(names[j])));
+   if(f)all[i][names[j]]=f;}}
+ return node;}
 (function(){
  var setA=P.setAttribute,rmA=P.removeAttribute;
  P.setAttribute=function(n,v){
