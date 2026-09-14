@@ -1,0 +1,234 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index e5ae23843..9dabff2eb 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -65,6 +65,7 @@ struct content_css_data
+ 	uint32_t next_to_register;	/**< Index of next import to register */
+ 	nscss_done_callback done;	/**< Completion callback */
+ 	void *pw;			/**< Client data */
++	uint32_t root_hints;		/**< Root hints the parse used, or 0 */
+ };
+ 
+ /**
+@@ -210,6 +211,7 @@ static nserror nscss_create_css_data(struct content_css_data *c,
+ 	c->next_to_register = (uint32_t) -1;
+ 	c->import_count = 0;
+ 	c->imports = NULL;
++	c->root_hints = 0;
+ 	if (charset != NULL)
+ 		c->charset = strdup(charset);
+ 	else
+@@ -308,6 +310,16 @@ static css_error nscss_convert_css_data(struct content_css_data *c)
+ 
+ 	error = css_stylesheet_data_done(c->sheet);
+ 
++	/*
++	 * A sheet that resolved its custom properties against the root
++	 * element's attributes -- a site's colour tokens, in practice --
++	 * is only correct for a document with those attributes, so record
++	 * what it was parsed against. nscss_matches_quirks() refuses to
++	 * share it with anything else. Sheets that never asked report
++	 * zero and stay shareable, which is nearly all of them.
++	 */
++	css_stylesheet_used_root_hints(c->sheet, &c->root_hints);
++
+ 	/* Process pending imports */
+ 	if (error == CSS_IMPORTS_PENDING) {
+ 		/* We must not have registered any imports yet */
+@@ -428,7 +440,17 @@ nserror nscss_clone(const struct content *old, struct content **newc)
+ 
+ bool nscss_matches_quirks(const struct content *c, bool quirks)
+ {
+-	return c->quirks == quirks;
++	const nscss_content *css = (const nscss_content *) c;
++
++	if (c->quirks != quirks)
++		return false;
++
++	/* See nscss_convert_css_data(). */
++	if (css->data.root_hints != 0 &&
++	    css->data.root_hints != css_root_hints_signature())
++		return false;
++
++	return true;
+ }
+ 
+ /* exported interface documented in netsurf/css.h */
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 0bc38844f..de0f1d99d 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -199,6 +199,101 @@ html_stylesheet_from_domnode(html_content *c,
+ }
+ 
+ 
++/*
++ * Tell libcss about the document's root element (VitaSurf).
++ *
++ * Custom properties are substituted as a sheet is parsed, so the parser
++ * has to decide there and then whether a --name declaration belongs to
++ * the root. A site does not write its palette on a bare :root: it hangs
++ * it off an attribute on <html> and switches theme by changing that.
++ * github.com ships sixteen mutually exclusive blocks of 959 colours
++ * each, every one of them scoped to data-color-mode and a theme name,
++ * and no unconditional fallback -- so with nothing to match against,
++ * every colour on the page resolves to nothing and the page renders
++ * white. This hands libcss the attributes it needs to pick the block
++ * that applies.
++ *
++ * Called before any sheet of this document is created or reparsed.
++ */
++#define HTML_ROOT_HINT_MAX 32
++
++static void html_css_set_root_hints(html_content *c)
++{
++	css_root_hint_attr attrs[HTML_ROOT_HINT_MAX];
++	char *owned[HTML_ROOT_HINT_MAX * 2];
++	char *element = NULL;
++	unsigned int n_attrs = 0;
++	unsigned int n_owned = 0;
++	unsigned int i;
++	dom_element *root = NULL;
++	dom_namednodemap *map = NULL;
++	dom_string *name = NULL;
++	uint32_t len = 0;
++
++	if (c->document == NULL)
++		return;
++	if (dom_document_get_document_element(c->document, &root) !=
++			DOM_NO_ERR || root == NULL)
++		return;
++
++	if (dom_node_get_node_name(root, &name) == DOM_NO_ERR &&
++			name != NULL) {
++		element = strndup(dom_string_data(name),
++				dom_string_byte_length(name));
++		dom_string_unref(name);
++	}
++	if (element == NULL)
++		goto out;
++
++	if (dom_node_get_attributes(root, &map) == DOM_NO_ERR && map != NULL &&
++	    dom_namednodemap_get_length(map, &len) == DOM_NO_ERR) {
++		for (i = 0; i < len && n_attrs < HTML_ROOT_HINT_MAX; i++) {
++			dom_node *attr = NULL;
++			dom_string *aname = NULL, *avalue = NULL;
++			char *cn = NULL, *cv = NULL;
++
++			if (dom_namednodemap_item(map, i, &attr) !=
++					DOM_NO_ERR || attr == NULL)
++				continue;
++			if (dom_node_get_node_name(attr, &aname) == DOM_NO_ERR &&
++					aname != NULL) {
++				cn = strndup(dom_string_data(aname),
++						dom_string_byte_length(aname));
++				dom_string_unref(aname);
++			}
++			if (dom_node_get_node_value(attr, &avalue) ==
++					DOM_NO_ERR && avalue != NULL) {
++				cv = strndup(dom_string_data(avalue),
++						dom_string_byte_length(avalue));
++				dom_string_unref(avalue);
++			}
++			dom_node_unref(attr);
++
++			if (cn == NULL || cv == NULL) {
++				free(cn);
++				free(cv);
++				continue;
++			}
++			owned[n_owned++] = cn;
++			owned[n_owned++] = cv;
++			attrs[n_attrs].name = cn;
++			attrs[n_attrs].value = cv;
++			n_attrs++;
++		}
++	}
++
++	css_set_root_hints(element, attrs, n_attrs);
++
++out:
++	for (i = 0; i < n_owned; i++)
++		free(owned[i]);
++	free(element);
++	if (map != NULL)
++		dom_namednodemap_unref(map);
++	dom_node_unref(root);
++}
++
++
+ /**
+  * Process an inline stylesheet in the document.
+  *
+@@ -213,6 +308,8 @@ html_create_style_element(html_content *c, dom_node *style)
+ 	dom_exception exc;
+ 	struct html_stylesheet *stylesheets;
+ 
++	html_css_set_root_hints(c);
++
+ 	/* type='text/css', or not present (invalid but common) */
+ 	exc = dom_element_get_attribute(style, corestring_dom_type, &val);
+ 	if (exc == DOM_NO_ERR && val != NULL) {
+@@ -264,6 +361,8 @@ html_css_process_modified_style(html_content *c, struct html_stylesheet *s)
+ 	hlcache_handle *sheet = NULL;
+ 	nserror error;
+ 
++	html_css_set_root_hints(c);
++
+ 	error = html_stylesheet_from_domnode(c, s->node, &sheet);
+ 	if (error != NSERROR_OK) {
+ 		NSLOG(netsurf, INFO, "Failed to update sheet");
+@@ -391,6 +490,8 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	nserror ns_error;
+ 	hlcache_child_context child;
+ 
++	html_css_set_root_hints(htmlc);
++
+ 	/* rel=<space separated list, including 'stylesheet'> */
+ 	exc = dom_element_get_attribute(node, corestring_dom_rel, &rel);
+ 	if (exc != DOM_NO_ERR || rel == NULL)
+diff --git a/content/llcache.c b/content/llcache.c
+index 2ec39e8c8..e60b62c77 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -3728,15 +3728,39 @@ static void llcache_catch_up_all_users(void *ignored)
+ 	 */
+ 	llcache->all_caught_up = true;
+ 
+-	/* Catch new users up with state of objects */
++	/*
++	 * Catch new users up with state of objects, oldest object first
++	 * (VitaSurf).
++	 *
++	 * Both lists are built by inserting at the head, so walking them
++	 * forwards hands the page its resources in the reverse of the
++	 * order it asked for them: the last stylesheet in the document
++	 * parses first, the last image decodes first. For stylesheets
++	 * that is not merely untidy -- a sheet's custom properties are
++	 * substituted as it parses, so a sheet that spends a colour
++	 * token parsed before the theme sheet that defines it loses
++	 * every colour it asked for.
++	 */
+ 	for (object = llcache->cached_objects; object != NULL;
+ 			object = object->next) {
++		if (object->next == NULL)
++			break;
++	}
++	while (object != NULL) {
++		llcache_object *prev = object->prev;
+ 		llcache_object_notify_users(object);
++		object = prev;
+ 	}
+ 
+ 	for (object = llcache->uncached_objects; object != NULL;
+ 			object = object->next) {
++		if (object->next == NULL)
++			break;
++	}
++	while (object != NULL) {
++		llcache_object *prev = object->prev;
+ 		llcache_object_notify_users(object);
++		object = prev;
+ 	}
+ }
+ 

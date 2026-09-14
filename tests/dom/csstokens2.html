@@ -1,0 +1,22 @@
+<!DOCTYPE html><html data-color-mode="dark" data-dark-theme="dark">
+<head><title>csstokens2</title>
+<link rel="stylesheet" href="csstokens-theme.css">
+<link rel="stylesheet" href="csstokens-use.css">
+</head><body>
+<pre id="out"></pre>
+<div id="themed">x</div><div id="plain">x</div><div id="control">x</div>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function w(id){return Math.round(
+ document.getElementById(id).getBoundingClientRect().width);}
+function report(){
+ /* 40 means the token was substituted, 111 means the fallback was taken. */
+ T('themed token across sheets', w('themed')===40 ? 'resolved' :
+   (w('themed')===111 ? 'fallback' : 'other ' + w('themed')));
+ T('plain token across sheets', w('plain')===40 ? 'resolved' :
+   (w('plain')===111 ? 'fallback' : 'other ' + w('plain')));
+ T('control', w('control')===40 ? 'sheet applied' : 'sheet missing');
+}
+window.addEventListener('load', function(){ setTimeout(report, 400); });
+</script></body></html>

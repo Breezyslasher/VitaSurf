@@ -1,0 +1,4 @@
+/* The consumer sheet. Neither token is declared here. */
+#themed { width: var(--themed, 111px); }
+#plain { width: var(--plain, 111px); }
+#control { width: 40px; }

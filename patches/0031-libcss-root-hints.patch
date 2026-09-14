@@ -1,0 +1,756 @@
+diff --git a/include/libcss/stylesheet.h b/include/libcss/stylesheet.h
+index 542f199..2de8dd6 100644
+--- a/include/libcss/stylesheet.h
++++ b/include/libcss/stylesheet.h
+@@ -160,6 +160,60 @@ css_error css_stylesheet_set_disabled(css_stylesheet *sheet, bool disabled);
+ 
+ css_error css_stylesheet_size(css_stylesheet *sheet, size_t *size);
+ 
++/**
++ * One attribute of the document's root element (VitaSurf).
++ *
++ * class and id count as attributes here, spelled exactly that way.
++ */
++typedef struct css_root_hint_attr {
++	const char *name;		/**< Attribute name, ASCII */
++	const char *value;		/**< Attribute value, ASCII */
++} css_root_hint_attr;
++
++/**
++ * Tell the parser about the document's root element (VitaSurf).
++ *
++ * Custom properties are substituted as the sheet is parsed, long before
++ * any element exists, so a --name declaration is only collected when its
++ * selector can be recognised as addressing the root. Sites do not write
++ * their palettes on a bare :root: they hang them off an attribute or a
++ * class on <html> and switch theme by changing it, and github.com ships
++ * sixteen mutually exclusive blocks of 959 colours each, with no
++ * unconditional fallback. Without knowing which one applies, every
++ * colour on the page resolves to nothing.
++ *
++ * These hints are global to the library and describe whichever document
++ * is being laid out. Pass NULL to clear them, which restores the
++ * behaviour of collecting only unconditional root declarations.
++ *
++ * \param element  Root element name (normally "html"), or NULL to clear
++ * \param attrs    Its attributes, or NULL
++ * \param n_attrs  Number of entries in attrs
++ * 
++eturn CSS_OK on success, CSS_NOMEM on memory exhaustion.
++ */
++css_error css_set_root_hints(const char *element,
++		const css_root_hint_attr *attrs, uint32_t n_attrs);
++
++/**
++ * A value identifying the hints currently set (VitaSurf).
++ *
++ * Equal signatures mean equal hints, so a sheet parsed under one can be
++ * reused under the other. Zero means no hints are set.
++ */
++uint32_t css_root_hints_signature(void);
++
++/**
++ * The root hints this sheet's parse depended on (VitaSurf).
++ *
++ * Zero means it never consulted them, so the sheet parses the same for
++ * any document and a cache is free to hand it to another one. Anything
++ * else must be compared with css_root_hints_signature() before reuse:
++ * the same sheet under a different theme is a different sheet.
++ */
++css_error css_stylesheet_used_root_hints(css_stylesheet *sheet,
++		uint32_t *sig);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 85baafb..a66b0c1 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -134,11 +134,37 @@ struct css_custom_prop {
+ 	lwc_string *name;
+ 	css_token *tokens;
+ 	uint32_t n;
+-	struct css_custom_prop *next;
++	struct css_custom_prop *next;		/**< Next in the sheet */
++	struct css_custom_prop *hnext;		/**< Next in the same bucket */
+ };
+ 
+ #define CUSTOM_PROP_MAX_DEPTH 16
+ 
++/*
++ * A sheet that hangs its palette off the root can define a great many
++ * properties -- github.com's is 959 colours -- and every var() in the
++ * rest of the sheet looks one up, so a list walk is O(n*m) over numbers
++ * that are both in the thousands. Bucket them by interned name instead.
++ * The count is capped as well: the table lives as long as the sheet, and
++ * a sheet is not allowed to make the browser spend without limit.
++ */
++#define CUSTOM_PROP_BUCKETS 256
++#define CUSTOM_PROP_MAX 8192
++
++/*
++ * The table is per document, not per stylesheet.
++ *
++ * A site splits its CSS: the theme sheet defines the colour tokens and
++ * the component sheets spend them, so github.com has six sheets using
++ * --bgColor-default and none of them declares it. Keeping the table on
++ * the sheet meant every one of those uses failed. css_set_root_hints()
++ * empties it when the document changes, which is the only notion of
++ * "a new document" this library has.
++ */
++static struct css_custom_prop *custom_list;
++static struct css_custom_prop **custom_buckets;
++static uint32_t n_custom;
++
+ static bool isCustomPropertyName(lwc_string *s)
+ {
+ 	return s != NULL && lwc_string_length(s) > 2 &&
+@@ -180,16 +206,224 @@ static bool ruleIsTransparent(const css_rule *rule)
+ 			m->media->type == 0 && m->media->cond == NULL;
+ }
+ 
+-/** True for a top-level rule whose every selector is the document root. */
+-static bool ruleIsRootLike(css_rule *rule)
++/** Whitespace as the HTML attribute grammar counts it. */
++static bool isSpace(char c)
++{
++	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
++}
++
++/** Interned string equality, without the out-parameter dance. */
++static bool strEq(lwc_string *a, lwc_string *b)
++{
++	bool match = false;
++
++	if (a == NULL || b == NULL)
++		return false;
++	return lwc_string_isequal(a, b, &match) == lwc_error_ok && match;
++}
++
++/** The value of a root attribute named by the hints, or NULL. */
++static lwc_string *rootHintValue(lwc_string *name)
++{
++	uint32_t i;
++
++	if (name == NULL)
++		return NULL;
++	for (i = 0; i < css__n_root_hints; i++) {
++		if (strEq(css__root_hints[i].name, name))
++			return css__root_hints[i].value;
++	}
++	return NULL;
++}
++
++/** The same, for an attribute this file names itself. */
++static lwc_string *rootHintNamed(const char *what)
++{
++	uint32_t i;
++
++	for (i = 0; i < css__n_root_hints; i++) {
++		if (nameIs(css__root_hints[i].name, what))
++			return css__root_hints[i].value;
++	}
++	return NULL;
++}
++
++/** Case-sensitive substring search, as attribute selectors do it. */
++static bool haveSubstring(lwc_string *haystack, lwc_string *needle,
++		bool at_start, bool at_end)
++{
++	const char *h, *n;
++	size_t hlen, nlen, i;
++
++	if (haystack == NULL || needle == NULL)
++		return false;
++	h = lwc_string_data(haystack);
++	n = lwc_string_data(needle);
++	hlen = lwc_string_length(haystack);
++	nlen = lwc_string_length(needle);
++
++	/* [attr*=""], [attr^=""] and [attr$=""] match nothing. */
++	if (nlen == 0 || nlen > hlen)
++		return false;
++	if (at_start)
++		return memcmp(h, n, nlen) == 0;
++	if (at_end)
++		return memcmp(h + hlen - nlen, n, nlen) == 0;
++	for (i = 0; i + nlen <= hlen; i++) {
++		if (memcmp(h + i, n, nlen) == 0)
++			return true;
++	}
++	return false;
++}
++
++/** True if word appears in a whitespace-separated list. */
++static bool haveWord(lwc_string *list, lwc_string *word)
++{
++	const char *l, *w;
++	size_t llen, wlen, i = 0;
++
++	if (list == NULL || word == NULL)
++		return false;
++	l = lwc_string_data(list);
++	w = lwc_string_data(word);
++	llen = lwc_string_length(list);
++	wlen = lwc_string_length(word);
++	if (wlen == 0)
++		return false;
++
++	while (i < llen) {
++		size_t start;
++		while (i < llen && isSpace(l[i]))
++			i++;
++		start = i;
++		while (i < llen && !isSpace(l[i]))
++			i++;
++		if (i - start == wlen && memcmp(l + start, w, wlen) == 0)
++			return true;
++	}
++	return false;
++}
++
++/** True if value is word, or begins with word followed by '-'. */
++static bool haveDashMatch(lwc_string *value, lwc_string *word)
++{
++	const char *v, *w;
++	size_t vlen, wlen;
++
++	if (value == NULL || word == NULL)
++		return false;
++	v = lwc_string_data(value);
++	w = lwc_string_data(word);
++	vlen = lwc_string_length(value);
++	wlen = lwc_string_length(word);
++	if (wlen == 0 || wlen > vlen)
++		return false;
++	if (memcmp(v, w, wlen) != 0)
++		return false;
++	return vlen == wlen || v[wlen] == '-';
++}
++
++/**
++ * Can this selector detail be decided against the root element alone,
++ * and if so does it hold? (VitaSurf)
++ *
++ * Anything this does not understand is refused rather than guessed at:
++ * collecting a block that does not apply would paint a light page in a
++ * dark theme's colours, which is worse than the colours being missing.
++ *
++ * \param detail  The detail to test
++ * \param ok      Set false if the detail is not decidable here
++ * \return Whether the detail holds for the root element
++ */
++static bool detailMatchesRoot(css_language *c,
++		const css_selector_detail *detail, bool *ok)
++{
++	bool match = false;
++
++	/*
++	 * Everything below this line except :root reads the hints, so
++	 * from here the sheet's parse depends on which document it was
++	 * parsed for, and a cache must not hand it to another one.
++	 */
++	if (detail->type != CSS_SELECTOR_PSEUDO_CLASS) {
++		c->used_root_hints = css__root_hints_sig;
++		c->sheet->used_root_hints = css__root_hints_sig;
++	}
++
++	switch (detail->type) {
++	case CSS_SELECTOR_PSEUDO_CLASS:
++		/* :root is the only one that is a property of being root. */
++		if (!nameIs(detail->qname.name, "root")) {
++			*ok = false;
++			return false;
++		}
++		match = true;
++		break;
++	case CSS_SELECTOR_CLASS:
++		match = haveWord(rootHintNamed("class"), detail->qname.name);
++		break;
++	case CSS_SELECTOR_ID:
++		match = strEq(rootHintNamed("id"), detail->qname.name);
++		break;
++	case CSS_SELECTOR_ATTRIBUTE:
++		match = rootHintValue(detail->qname.name) != NULL;
++		break;
++	case CSS_SELECTOR_ATTRIBUTE_EQUAL:
++		match = strEq(rootHintValue(detail->qname.name),
++				detail->value.string);
++		break;
++	case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
++		match = haveDashMatch(rootHintValue(detail->qname.name),
++				detail->value.string);
++		break;
++	case CSS_SELECTOR_ATTRIBUTE_INCLUDES:
++		match = haveWord(rootHintValue(detail->qname.name),
++				detail->value.string);
++		break;
++	case CSS_SELECTOR_ATTRIBUTE_PREFIX:
++		match = haveSubstring(rootHintValue(detail->qname.name),
++				detail->value.string, true, false);
++		break;
++	case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
++		match = haveSubstring(rootHintValue(detail->qname.name),
++				detail->value.string, false, true);
++		break;
++	case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
++		match = haveSubstring(rootHintValue(detail->qname.name),
++				detail->value.string, false, false);
++		break;
++	default:
++		*ok = false;
++		return false;
++	}
++
++	return detail->negate ? !match : match;
++}
++
++/**
++ * True for a top-level rule that addresses the document root.
++ *
++ * Every selector has to be one that can only reach the root, and at
++ * least one of them has to actually hold. A theme is written as a list
++ * of alternatives -- github.com's dark block is
++ * "[data-color-mode=dark][data-dark-theme=dark],
++ *  [data-color-mode=auto][data-light-theme=dark]" -- so requiring all
++ * of them to hold would reject every theme the page ships.
++ */
++static bool ruleIsRootLike(css_language *c, css_rule *rule)
+ {
+ 	css_rule_selector *rs = (css_rule_selector *) rule;
+ 	const css_rule *up = rule;
++	bool any = false;
+ 	uint32_t i;
+ 
+ 	if (rule->type != CSS_RULE_SELECTOR || rule->items == 0)
+ 		return false;
+ 
++	/* A style="" attribute belongs to its element, not the document. */
++	if (c->sheet == NULL || c->sheet->inline_style)
++		return false;
++
+ 	/*
+ 	 * Reach the stylesheet through nothing but @layer and @supports.
+ 	 * A stylesheet that defines its design tokens in
+@@ -209,6 +443,8 @@ static bool ruleIsRootLike(css_rule *rule)
+ 	for (i = 0; i < rule->items; i++) {
+ 		const css_selector *sel = rs->selectors[i];
+ 		const css_selector_detail *detail;
++		bool ok = true;
++		bool holds = true;
+ 
+ 		if (sel == NULL || sel->combinator != NULL)
+ 			return false;
+@@ -219,16 +455,19 @@ static bool ruleIsRootLike(css_rule *rule)
+ 				!nameIs(detail->qname.name, "html") &&
+ 				!nameIs(detail->qname.name, "body"))
+ 			return false;
+-		if (detail->next) {
++
++		while (detail->next) {
+ 			detail++;
+-			if (detail->type != CSS_SELECTOR_PSEUDO_CLASS ||
+-					detail->negate ||
+-					!nameIs(detail->qname.name, "root") ||
+-					detail->next)
++			if (!detailMatchesRoot(c, detail, &ok))
++				holds = false;
++			if (!ok)
+ 				return false;
+ 		}
++		if (holds)
++			any = true;
+ 	}
+-	return true;
++
++	return any;
+ }
+ 
+ static void freeCustomTokens(css_token *tokens, uint32_t n)
+@@ -242,9 +481,9 @@ static void freeCustomTokens(css_token *tokens, uint32_t n)
+ 	free(tokens);
+ }
+ 
+-static void freeCustomProps(css_language *c)
++void css__free_custom_props(void)
+ {
+-	struct css_custom_prop *p = c->custom;
++	struct css_custom_prop *p = custom_list;
+ 
+ 	while (p != NULL) {
+ 		struct css_custom_prop *next = p->next;
+@@ -253,7 +492,10 @@ static void freeCustomProps(css_language *c)
+ 		free(p);
+ 		p = next;
+ 	}
+-	c->custom = NULL;
++	custom_list = NULL;
++	free(custom_buckets);
++	custom_buckets = NULL;
++	n_custom = 0;
+ }
+ 
+ /** Copy a token so that it outlives the declaration it came from. */
+@@ -268,11 +510,26 @@ static void copyToken(css_token *dst, const css_token *src)
+ 	dst->line = src->line;
+ }
+ 
+-static struct css_custom_prop *findCustomProp(css_language *c, lwc_string *name)
++/*
++ * Bucket for an interned name. libwapcaplet interns, so two equal names
++ * are the same pointer and the pointer is all the hash needs.
++ */
++static unsigned int customPropBucket(lwc_string *name)
++{
++	uintptr_t v = (uintptr_t) name;
++
++	return (unsigned int) ((v >> 4) ^ (v >> 12)) & (CUSTOM_PROP_BUCKETS - 1);
++}
++
++static struct css_custom_prop *findCustomProp(lwc_string *name)
+ {
+ 	struct css_custom_prop *p;
+ 
+-	for (p = c->custom; p != NULL; p = p->next) {
++	if (custom_buckets == NULL)
++		return NULL;
++
++	for (p = custom_buckets[customPropBucket(name)]; p != NULL;
++			p = p->hnext) {
+ 		bool match = false;
+ 		if (lwc_string_isequal(p->name, name, &match) == lwc_error_ok &&
+ 				match)
+@@ -282,7 +539,7 @@ static struct css_custom_prop *findCustomProp(css_language *c, lwc_string *name)
+ }
+ 
+ /** Keep the value tokens of a --name declaration; a later one replaces it. */
+-static css_error storeCustomProperty(css_language *c, lwc_string *name,
++static css_error storeCustomProperty(lwc_string *name,
+ 		const parserutils_vector *vector, int32_t ctx)
+ {
+ 	struct css_custom_prop *p;
+@@ -305,18 +562,33 @@ static css_error storeCustomProperty(css_language *c, lwc_string *name,
+ 	for (i = 0; i < (int32_t) n; i++)
+ 		copyToken(&tokens[i], parserutils_vector_peek(vector, ctx + i));
+ 
+-	p = findCustomProp(c, name);
++	p = findCustomProp(name);
+ 	if (p != NULL) {
+ 		freeCustomTokens(p->tokens, p->n);
+ 	} else {
++		if (n_custom >= CUSTOM_PROP_MAX) {
++			freeCustomTokens(tokens, n);
++			return CSS_OK; /* silently dropped, see the cap */
++		}
++		if (custom_buckets == NULL) {
++			custom_buckets = calloc(CUSTOM_PROP_BUCKETS,
++					sizeof(*custom_buckets));
++			if (custom_buckets == NULL) {
++				freeCustomTokens(tokens, n);
++				return CSS_NOMEM;
++			}
++		}
+ 		p = malloc(sizeof(*p));
+ 		if (p == NULL) {
+ 			freeCustomTokens(tokens, n);
+ 			return CSS_NOMEM;
+ 		}
+ 		p->name = lwc_string_ref(name);
+-		p->next = c->custom;
+-		c->custom = p;
++		p->next = custom_list;
++		custom_list = p;
++		p->hnext = custom_buckets[customPropBucket(name)];
++		custom_buckets[customPropBucket(name)] = p;
++		n_custom++;
+ 	}
+ 	p->tokens = tokens;
+ 	p->n = n;
+@@ -400,8 +672,16 @@ static css_error appendSubstituted(css_language *c, const css_token *tokens,
+ 			return CSS_INVALID;
+ 		i = j; /* the loop's i++ steps past ')' */
+ 
+-		p = findCustomProp(c, tokens[name_at].idata);
++		p = findCustomProp(tokens[name_at].idata);
+ 		if (p != NULL && p->n > 0) {
++			/*
++			 * The value came from the document's table, so
++			 * this sheet now reads differently under another
++			 * document and must not be shared with one.
++			 */
++			c->used_root_hints = css__root_hints_sig;
++			c->sheet->used_root_hints = css__root_hints_sig;
++
+ 			error = appendSubstituted(c, p->tokens, p->n, out,
+ 					depth + 1);
+ 		} else if (fb_to > fb_from) {
+@@ -496,7 +776,7 @@ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+ 
+ 	c->sheet = sheet;
+ 	c->state = CHARSET_PERMITTED;
+-	c->custom = NULL;
++	c->used_root_hints = 0;
+ 	c->default_namespace = NULL;
+ 	c->namespaces = NULL;
+ 	c->num_namespaces = 0;
+@@ -521,7 +801,6 @@ css_error css__language_destroy(css_language *language)
+ 		return CSS_BADPARM;
+ 
+ 	lwc_string_unref(language->default_namespace);
+-	freeCustomProps(language);
+ 
+ 	if (language->namespaces != NULL) {
+ 		for (i = 0; i < language->num_namespaces; i++) {
+@@ -1242,8 +1521,8 @@ css_error handleDeclaration(css_language *c, const parserutils_vector *vector)
+ 				c, ident, vector, &ctx, ff_rule);
+ 	} else if (isCustomPropertyName(ident->idata)) {
+ 		/* --name: kept for var() when declared on the root */
+-		if (ruleIsRootLike(rule))
+-			return storeCustomProperty(c, ident->idata, vector, ctx);
++		if (ruleIsRootLike(c, rule))
++			return storeCustomProperty(ident->idata, vector, ctx);
+ 		return CSS_OK;
+ 	} else if (rule->type == CSS_RULE_SELECTOR && vectorHasVar(vector, ctx)) {
+ 		parserutils_vector *subst = NULL;
+diff --git a/src/parse/language.h b/src/parse/language.h
+index 8fd3b1a..a85c318 100644
+--- a/src/parse/language.h
++++ b/src/parse/language.h
+@@ -45,7 +45,7 @@ typedef struct css_language {
+ 	/** Interned strings */
+ 	lwc_string **strings;
+ 
+-	struct css_custom_prop *custom;	/**< Root custom properties (VitaSurf) */
++	uint32_t used_root_hints;	/**< Root hints this parse asked for */
+ 
+ 	lwc_string *default_namespace;	/**< Default namespace URI */
+ 	css_namespace *namespaces;	/**< Array of namespace mappings */
+@@ -76,6 +76,13 @@ typedef struct css_language {
+ 
+ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+ 		void **language);
++
++/**
++ * Empty the document-wide custom property table (VitaSurf).
++ *
++ * Called when the document changes; see css_set_root_hints().
++ */
++void css__free_custom_props(void);
+ css_error css__language_destroy(css_language *language);
+ 
+ /******************************************************************************
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index b17f1dd..e7b7998 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <stdarg.h>
+ 
+@@ -619,6 +620,159 @@ css_error css_stylesheet_size(css_stylesheet *sheet, size_t *size)
+ 	return CSS_OK;
+ }
+ 
++/*
++ * Document root hints (VitaSurf). See css_set_root_hints() in the public
++ * header for why the parser needs them at all.
++ */
++lwc_string *css__root_hint_element;
++css_root_hint *css__root_hints;
++uint32_t css__n_root_hints;
++uint32_t css__root_hints_sig;
++
++static void css__clear_root_hints(void)
++{
++	uint32_t i;
++
++	for (i = 0; i < css__n_root_hints; i++) {
++		lwc_string_unref(css__root_hints[i].name);
++		lwc_string_unref(css__root_hints[i].value);
++	}
++	free(css__root_hints);
++	css__root_hints = NULL;
++	css__n_root_hints = 0;
++	if (css__root_hint_element != NULL) {
++		lwc_string_unref(css__root_hint_element);
++		css__root_hint_element = NULL;
++	}
++	css__root_hints_sig = 0;
++}
++
++/** FNV-1a over one string, folded into a running signature. */
++static uint32_t css__hint_hash(uint32_t h, const char *s)
++{
++	while (*s != '\0') {
++		h ^= (uint32_t) (unsigned char) *s++;
++		h *= 0x01000193u;
++	}
++	/* A separator, so ("ab","c") and ("a","bc") differ. */
++	h ^= 0xffu;
++	h *= 0x01000193u;
++	return h;
++}
++
++/** Intern a string, lowercasing ASCII letters if asked. */
++static lwc_string *css__intern_hint(const char *s, bool lower)
++{
++	lwc_string *out = NULL;
++	size_t len = strlen(s);
++	char *buf;
++	size_t i;
++
++	/* Hints are set once per document, so a copy costs nothing here. */
++	if (lower == false || len == 0) {
++		if (lwc_intern_string(s, len, &out) != lwc_error_ok)
++			return NULL;
++		return out;
++	}
++
++	buf = malloc(len);
++	if (buf == NULL)
++		return NULL;
++	for (i = 0; i < len; i++) {
++		char c = s[i];
++		buf[i] = ('A' <= c && c <= 'Z') ? (char) (c + 'a' - 'A') : c;
++	}
++	if (lwc_intern_string(buf, len, &out) != lwc_error_ok)
++		out = NULL;
++	free(buf);
++	return out;
++}
++
++/* exported interface documented in libcss/stylesheet.h */
++css_error css_set_root_hints(const char *element,
++		const css_root_hint_attr *attrs, uint32_t n_attrs)
++{
++	uint32_t sig = 0x811c9dc5u;
++	uint32_t old_sig;
++	uint32_t i;
++
++	/*
++	 * The custom property table belongs to the document these hints
++	 * describe, so it goes when they do. Setting the same hints
++	 * again -- which happens on every <link> of a page -- must not
++	 * throw away what earlier sheets of that page put there, so the
++	 * table is only emptied when the signature actually changes.
++	 */
++	old_sig = css__root_hints_sig;
++
++	css__clear_root_hints();
++
++	if (element == NULL) {
++		css__free_custom_props();
++		return CSS_OK;
++	}
++
++	css__root_hint_element = css__intern_hint(element, true);
++	if (css__root_hint_element == NULL)
++		return CSS_NOMEM;
++	sig = css__hint_hash(sig, element);
++
++	if (n_attrs > 0) {
++		css__root_hints = calloc(n_attrs, sizeof(*css__root_hints));
++		if (css__root_hints == NULL) {
++			css__clear_root_hints();
++			return CSS_NOMEM;
++		}
++	}
++	for (i = 0; i < n_attrs; i++) {
++		if (attrs[i].name == NULL || attrs[i].value == NULL)
++			continue;
++		css__root_hints[css__n_root_hints].name =
++				css__intern_hint(attrs[i].name, true);
++		css__root_hints[css__n_root_hints].value =
++				css__intern_hint(attrs[i].value, false);
++		if (css__root_hints[css__n_root_hints].name == NULL ||
++		    css__root_hints[css__n_root_hints].value == NULL) {
++			if (css__root_hints[css__n_root_hints].name != NULL)
++				lwc_string_unref(css__root_hints[
++						css__n_root_hints].name);
++			if (css__root_hints[css__n_root_hints].value != NULL)
++				lwc_string_unref(css__root_hints[
++						css__n_root_hints].value);
++			css__clear_root_hints();
++			return CSS_NOMEM;
++		}
++		css__n_root_hints++;
++		sig = css__hint_hash(sig, attrs[i].name);
++		sig = css__hint_hash(sig, attrs[i].value);
++	}
++
++	/* Zero means "no hints", so never let a real set land on it. */
++	css__root_hints_sig = sig != 0 ? sig : 1;
++
++	if (css__root_hints_sig != old_sig)
++		css__free_custom_props();
++
++	return CSS_OK;
++}
++
++/* exported interface documented in libcss/stylesheet.h */
++uint32_t css_root_hints_signature(void)
++{
++	return css__root_hints_sig;
++}
++
++/* exported interface documented in libcss/stylesheet.h */
++css_error css_stylesheet_used_root_hints(css_stylesheet *sheet, uint32_t *sig)
++{
++	if (sheet == NULL || sig == NULL)
++		return CSS_BADPARM;
++
++	*sig = sheet->used_root_hints;
++
++	return CSS_OK;
++}
++
+ /******************************************************************************
+  * Library-private API below here					      *
+  ******************************************************************************/
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 673bc95..cd15e91 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -188,6 +188,14 @@ struct css_stylesheet {
+ 	bool quirks_allowed;			/**< Quirks permitted */
+ 	bool quirks_used;			/**< Quirks actually used */
+ 
++	/**
++	 * The root hints this sheet's parse depended on (VitaSurf).
++	 *
++	 * Zero if it never asked, which is the usual case and means the
++	 * sheet is the same whatever document it is used in.
++	 */
++	uint32_t used_root_hints;
++
+ 	bool uses_revert;			/**< Uses 'revert' property value */
+ 
+ 	bool inline_style;			/**< Is an inline style */
+@@ -329,5 +337,22 @@ css_error css__stylesheet_string_get(css_stylesheet *sheet,
+ css_error css__stylesheet_string_add(css_stylesheet *sheet,
+ 		lwc_string *string, uint32_t *string_number);
+ 
++/**
++ * The document root hints set by css_set_root_hints() (VitaSurf).
++ *
++ * Global to the library: they describe whichever document is being laid
++ * out, and the parser reads them while deciding whether a rule's
++ * --name declarations belong to the root. See the public header.
++ */
++typedef struct css_root_hint {
++	lwc_string *name;		/**< Attribute name, lowercased */
++	lwc_string *value;		/**< Attribute value, as written */
++} css_root_hint;
++
++extern lwc_string *css__root_hint_element;
++extern css_root_hint *css__root_hints;
++extern uint32_t css__n_root_hints;
++extern uint32_t css__root_hints_sig;
++
+ #endif
+ 
