@@ -4608,15 +4608,24 @@ static void qjs_rejection_tracker(JSContext *ctx, JSValueConst promise,
 	JSValue global, fn;
 
 	(void)opaque;
-	if (is_handled || ctx == NULL) {
+	if (ctx == NULL) {
 		return;
 	}
+	/*
+	 * A handler attached after the rejection cancels the report: the
+	 * prelude holds it for a turn so a .catch() added later in the
+	 * same tick -- which is how frameworks write it -- takes it off
+	 * the list rather than being called an error.
+	 */
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global, "__vitaReportRejection");
+	fn = JS_GetPropertyStr(ctx, global,
+			       is_handled ? "__vitaRejectionHandled"
+					  : "__vitaReportRejection");
 	if (JS_IsFunction(ctx, fn)) {
 		JSValue args[2], r;
 
-		args[0] = JS_DupValue(ctx, reason);
+		args[0] = is_handled ? JS_DupValue(ctx, promise)
+				     : JS_DupValue(ctx, reason);
 		args[1] = JS_DupValue(ctx, promise);
 		r = JS_Call(ctx, fn, global, 2, args);
 		if (JS_IsException(r)) {

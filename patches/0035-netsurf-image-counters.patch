@@ -1,0 +1,89 @@
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 119e87439..8348f57cc 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -32,6 +32,7 @@
+ #include "utils/corestrings.h"
+ #include "utils/config.h"
+ #include "utils/log.h"
++#include "utils/utils.h"
+ #include "utils/nsoption.h"
+ #include "netsurf/content.h"
+ #include "netsurf/misc.h"
+@@ -203,6 +204,10 @@ html_object_callback(hlcache_handle *object,
+ 		c->base.active--;
+ 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+ 
++		/* for the load profile (VitaSurf) */
++		if (content_get_type(object) == CONTENT_IMAGE)
++			vitasurf_images_done++;
++
+ 		html_object_done(box, object, o->background, o->mask);
+ 
+ 		if (c->base.status != CONTENT_STATUS_LOADING &&
+@@ -236,6 +241,9 @@ html_object_callback(hlcache_handle *object,
+ 		c->base.active--;
+ 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+ 
++		/* for the load profile (VitaSurf) */
++		vitasurf_images_failed++;
++
+ 		html_object_failed(box, c, o->background);
+ 
+ 		break;
+@@ -575,6 +583,10 @@ static bool html_replace_object(struct content_html_object *object, nsurl *url)
+ 	if (error != NSERROR_OK)
+ 		return false;
+ 
++	/* for the load profile (VitaSurf) */
++	if (object->permitted_types & CONTENT_IMAGE)
++		vitasurf_images_asked++;
++
+ 	for (page = c; page != NULL; page = page->page) {
+ 		page->base.active++;
+ 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+diff --git a/utils/utils.c b/utils/utils.c
+index 8a3ecc194..2737c98d1 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -577,6 +577,9 @@ unsigned int vitasurf_ms_html_parse;
+ unsigned int vitasurf_ms_css;
+ uint64_t vitasurf_ms_nested;
+ unsigned int vitasurf_ms_image;
++unsigned int vitasurf_images_asked;
++unsigned int vitasurf_images_done;
++unsigned int vitasurf_images_failed;
+ unsigned int vitasurf_ms_boxes;
+ unsigned int vitasurf_ms_layout;
+ 
+@@ -586,6 +589,9 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_html_parse = 0;
+ 	vitasurf_ms_css = 0;
+ 	vitasurf_ms_image = 0;
++	vitasurf_images_asked = 0;
++	vitasurf_images_done = 0;
++	vitasurf_images_failed = 0;
+ 	vitasurf_ms_boxes = 0;
+ 	vitasurf_ms_layout = 0;
+ 	vitasurf_ms_nested = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index e44dda3be..22e157bbd 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -132,6 +132,16 @@ bool is_dir(const char *path);
+ extern unsigned int vitasurf_ms_html_parse;
+ extern unsigned int vitasurf_ms_css;
+ extern unsigned int vitasurf_ms_image;
++/**
++ * Images the page asked for, decoded, and failed (VitaSurf).
++ *
++ * "images 0 ms" on a page full of pictures says nothing about whether
++ * any were fetched: an image that never arrives costs no decode time
++ * and neither does one the build cannot decode. These three do say it.
++ */
++extern unsigned int vitasurf_images_asked;
++extern unsigned int vitasurf_images_done;
++extern unsigned int vitasurf_images_failed;
+ extern unsigned int vitasurf_ms_boxes;
+ extern unsigned int vitasurf_ms_layout;
+ /**

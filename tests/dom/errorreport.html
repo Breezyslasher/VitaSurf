@@ -1,0 +1,27 @@
+<!DOCTYPE html><html><head><title>errorreport</title></head><body>
+<pre id="out"></pre>
+<script>
+var seen = [];
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+window.addEventListener('unhandledrejection', function(e){
+  seen.push('rejection:' + (e.reason && e.reason.message ? e.reason.message : String(e.reason)));
+  e.preventDefault();
+});
+window.addEventListener('error', function(e){
+  seen.push('error:' + e.message);
+});
+/* Rejected with nothing attached: the page should hear about this one. */
+Promise.reject(new TypeError('lonely'));
+/* Rejected and caught in the same tick: the page should NOT hear about it. */
+var p = Promise.reject(new Error('caught'));
+p.catch(function(){});
+/* A throw from a timer reaches window.onerror. */
+setTimeout(function(){ null.boom; }, 20);
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('lonely rejection reported', seen.indexOf('rejection:lonely') >= 0 ? 'yes' : 'no');
+  T('caught rejection reported', seen.indexOf('rejection:caught') >= 0 ? 'yes' : 'no');
+  T('timer throw reported', seen.some(function(s){return s.indexOf('error:')===0;}) ? 'yes' : 'no');
+  T('rejection count', String(seen.filter(function(s){return s.indexOf('rejection:')===0;}).length));
+}, 300); });
+</script></body></html>

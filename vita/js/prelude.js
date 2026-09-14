@@ -4616,6 +4616,24 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
      ', bytes '+hex+', text '+JSON.stringify(s.slice(at,at+40)));
    }catch(x){}
    throw e;}};})();
+/* What was thrown, in one line: a message and the first stack frame.
+   String(err) on a plain object is "[object Object]", which says
+   nothing, so the name and message are pulled out by hand. */
+function describeThrown(v){
+ var out;
+ try{
+  if(v===null||v===undefined)return String(v);
+  if(typeof v==='object'){
+   var name=v.name?String(v.name):'',msg=v.message?String(v.message):'';
+   out=(name&&msg)?name+': '+msg:(name||msg);
+   if(!out){try{out=JSON.stringify(v).slice(0,200);}catch(e){out=String(v);}}
+   if(v.stack){
+    var f=String(v.stack).split('\n')[1];
+    if(f)out+=' | '+f.replace(/^\s+/,'').slice(0,160);}
+   return out;}
+  return String(v);
+ }catch(e2){return '(unprintable)';}
+}
 W.__vitaReportError=function(err,where){
  var msg='';
  try{msg=(err&&err.message)?String(err.message):String(err);}catch(e){msg='Script error.';}
@@ -4639,18 +4657,48 @@ W.__vitaReportError=function(err,where){
    if(W.onerror(msg,file,line,col,err)===true)handled=true;}
  }catch(e4){}
  try{__vitaDispatch(null,ev);}catch(e5){}
+ if(!handled&&!ev.defaultPrevented){
+  try{console.error('uncaught: '+describeThrown(err)+
+   (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}}
  return handled;};
 /* An unhandled promise rejection, reported the same way. QuickJS hands
- * these to the tracker qjs.c installs. */
+ * these to the tracker qjs.c installs.
+ *
+ * Reported one turn later, not at once: a rejection with no handler yet
+ * is not an unhandled rejection, it is a promise whose .catch() has not
+ * been attached. Frameworks reject first and attach in the same tick all
+ * the time, and reporting on the spot called every one of them an error.
+ * qjs.c calls __vitaRejectionHandled() when a handler does turn up,
+ * which takes it off the list before the list is read. */
+var vitaPendingRejections=[];
+function flushRejections(){
+ var list=vitaPendingRejections;
+ vitaPendingRejections=[];
+ list.forEach(function(entry){
+  var ev;
+  try{ev=new W.PromiseRejectionEvent('unhandledrejection',
+   {reason:entry.r,promise:entry.p,cancelable:true});}
+  catch(e){ev={type:'unhandledrejection',reason:entry.r,promise:entry.p,
+   defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
+  try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
+  try{__vitaDispatch(null,ev);}catch(e3){}
+  /* Say so, as a browser does. A page whose async work fails and whose
+     framework swallows the rejection into an error boundary showed
+     nothing at all in the log: the screen said something went wrong and
+     the device had no idea what. */
+  if(!ev.defaultPrevented){
+   try{console.error('unhandled rejection: '+describeThrown(entry.r));}catch(e4){}}
+ });
+}
 W.__vitaReportRejection=function(reason,promise){
- var ev;
- try{ev=new W.PromiseRejectionEvent('unhandledrejection',
-  {reason:reason,promise:promise,cancelable:true});}
- catch(e){ev={type:'unhandledrejection',reason:reason,promise:promise,
-  defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
- try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
- try{__vitaDispatch(null,ev);}catch(e3){}
- return !!ev.defaultPrevented;};
+ vitaPendingRejections.push({p:promise,r:reason});
+ if(vitaPendingRejections.length===1)setTimeout(flushRejections,0);
+ return false;};
+W.__vitaRejectionHandled=function(promise){
+ for(var i=0;i<vitaPendingRejections.length;i++){
+  if(vitaPendingRejections[i].p===promise){
+   vitaPendingRejections.splice(i,1);
+   return;}}};
 
 /* --- MutationObserver ---------------------------------------------------
  * It was a constructor whose observe() did nothing, so every framework

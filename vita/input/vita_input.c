@@ -886,6 +886,9 @@ void vita_input_load_finished(struct gui_window *gw)
 			 vitasurf_ms_html_parse, vitasurf_ms_css,
 			 vitasurf_ms_image, vitasurf_ms_boxes,
 			 vitasurf_ms_layout);
+		vita_log("page: images %u asked for, %u decoded, %u failed",
+			 vitasurf_images_asked, vitasurf_images_done,
+			 vitasurf_images_failed);
 		nsurl_unref(url);
 	} else {
 		vita_log("page: loaded in %u ms", ms);
