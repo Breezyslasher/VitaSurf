@@ -1,5 +1,5 @@
 diff --git a/src/parse/language.c b/src/parse/language.c
-index 96c9725..0f35427 100644
+index 96c9725..891cc19 100644
 --- a/src/parse/language.c
 +++ b/src/parse/language.c
 @@ -98,6 +98,17 @@ static css_error parseSelector(css_language *c,
@@ -20,7 +20,59 @@ index 96c9725..0f35427 100644
  /* Declaration parsing */
  static css_error parseProperty(css_language *c,
  		const css_token *property, const parserutils_vector *vector,
-@@ -876,6 +887,65 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+@@ -151,15 +162,48 @@ static bool nameIs(lwc_string *s, const char *what)
+ 	return true;
+ }
+ 
++/**
++ * True for the always-matching media rule that @layer and @supports are
++ * carried as (VitaSurf). Their contents are meant to read as though they
++ * had been written where the at-rule was, so a rule inside one is still
++ * a top-level rule for the purposes below. A real @media is not: what it
++ * holds depends on the query, and taking it unconditionally would apply
++ * a dark theme's colours to a light page.
++ */
++static bool ruleIsTransparent(const css_rule *rule)
++{
++	const css_rule_media *m = (const css_rule_media *) rule;
++
++	if (rule == NULL || rule->type != CSS_RULE_MEDIA || m->media == NULL)
++		return false;
++	return m->media->next == NULL && m->media->negate_type == 1 &&
++			m->media->type == 0 && m->media->cond == NULL;
++}
++
+ /** True for a top-level rule whose every selector is the document root. */
+ static bool ruleIsRootLike(css_rule *rule)
+ {
+ 	css_rule_selector *rs = (css_rule_selector *) rule;
++	const css_rule *up = rule;
+ 	uint32_t i;
+ 
+-	if (rule->type != CSS_RULE_SELECTOR ||
+-			rule->ptype != CSS_RULE_PARENT_STYLESHEET ||
+-			rule->items == 0)
++	if (rule->type != CSS_RULE_SELECTOR || rule->items == 0)
++		return false;
++
++	/*
++	 * Reach the stylesheet through nothing but @layer and @supports.
++	 * A stylesheet that defines its design tokens in
++	 * "@layer base { :root { --fg: ... } }" -- which is how GitHub's
++	 * is written -- would otherwise have its variables ignored while
++	 * every var() that uses them is read, and the page comes out
++	 * with no colours at all.
++	 */
++	while (up->ptype == CSS_RULE_PARENT_RULE) {
++		if (!ruleIsTransparent((const css_rule *) up->parent))
++			return false;
++		up = (const css_rule *) up->parent;
++	}
++	if (up->ptype != CSS_RULE_PARENT_STYLESHEET)
+ 		return false;
+ 
+ 	for (i = 0; i < rule->items; i++) {
+@@ -876,6 +920,65 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
  			return error;
  		}
  
@@ -86,7 +138,7 @@ index 96c9725..0f35427 100644
  		/* Rule is now owned by the sheet,
  		 * so no need to destroy it */
  
-@@ -1831,6 +1901,139 @@ css_error parseSpecific(css_language *c,
+@@ -1831,6 +1934,139 @@ css_error parseSpecific(css_language *c,
  	return CSS_OK;
  }
  
@@ -226,7 +278,7 @@ index 96c9725..0f35427 100644
  css_error parseAppendSpecific(css_language *c,
  		const parserutils_vector *vector, int32_t *ctx,
  		css_selector **parent)
-@@ -1838,6 +2041,12 @@ css_error parseAppendSpecific(css_language *c,
+@@ -1838,6 +2074,12 @@ css_error parseAppendSpecific(css_language *c,
  	css_error error;
  	css_selector_detail specific;
  
@@ -239,7 +291,7 @@ index 96c9725..0f35427 100644
  	error = parseSpecific(c, vector, ctx, false, &specific);
  	if (error != CSS_OK)
  		return error;
-@@ -2101,44 +2310,125 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+@@ -2101,44 +2343,125 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
  	return CSS_OK;
  }
  
@@ -378,20 +430,20 @@ index 96c9725..0f35427 100644
 +		c->alt_choice[i] = 0;
 +		c->alt_count[i] = 1;
 +	}
-+
+ 
+-		selector = NULL;
 +	do {
 +		css_selector *selector = NULL;
 +		int32_t local = start;
  
--		selector = NULL;
-+		c->alt_seen = 0;
- 
 -		error = parseSelector(c, vector, &ctx, &selector);
++		c->alt_seen = 0;
++
 +		error = parseSelector(c, vector, &local, &selector);
  		if (error != CSS_OK) {
  			if (selector != NULL) {
  				css__stylesheet_selector_destroy(c->sheet,
-@@ -2146,8 +2436,8 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
+@@ -2146,8 +2469,8 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
  			}
  			return error;
  		}
@@ -401,7 +453,7 @@ index 96c9725..0f35427 100644
  
  		error = css__stylesheet_rule_add_selector(c->sheet, rule,
  				selector);
-@@ -2155,6 +2445,39 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
+@@ -2155,6 +2478,39 @@ css_error parseSelectorList(css_language *c, const parserutils_vector *vector,
  			css__stylesheet_selector_destroy(c->sheet, selector);
  			return error;
  		}

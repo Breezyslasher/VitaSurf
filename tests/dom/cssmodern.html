@@ -5,9 +5,13 @@
    around its rule was not understood. */
 #plain { display: none; }
 @media (min-width: 1px) { #inmedia { display: none; } }
-@layer base { #inlayer { display: none; } }
+@layer base { #inlayer { display: none; }
+              :root { --layervar: none; } }
+#varlayer { display: var(--layervar); }
 @layer { #anonlayer { display: none; } }
-@supports (display: block) { #insupports { display: none; } }
+@supports (display: block) { #insupports { display: none; }
+                            :root { --supvar: none; } }
+#varsupports { display: var(--supvar); }
 @supports not (definitely-not-a-property: 1) { #insupportsnot { display: none; } }
 :where(#inwhere) { display: none; }
 :is(#inis) { display: none; }
@@ -24,6 +28,14 @@ p:is(.compound) { display: none; }
 :is(.btn.primary) { display: none; }
 :is(div#istype) { display: none; }
 :is(.grpA, .grpB.grpC) { display: none; }
+
+/* Custom properties defined inside a transparent at-rule. A stylesheet
+   that keeps its design tokens in @layer base { :root { ... } } -- which
+   is how GitHub's is written -- needs them read, or every var() that
+   uses one resolves to nothing and the page comes out with no colours. */
+:root { --topvar: none; }
+#vartop { display: var(--topvar); }
+#varfallback { display: var(--nosuchvariable, none); }
 :is(#isdescend) span { display: none; }
 
 /* specificity: :where() adds nothing, :is() adds what its argument does.
@@ -54,6 +66,8 @@ p:is(.compound) { display: none; }
 <p id="grp3" class="grpB">x</p>
 <p id="isdescend"><span id="isdescendkid">x</span></p>
 <p id="specwhere">x</p><p id="speciscls" class="speciscls">x</p>
+<p id="vartop">x</p><p id="varlayer">x</p><p id="varsupports">x</p>
+<p id="varfallback">x</p>
 <p id="layerlist">x</p><p id="afterlayerlist">x</p>
 <p id="control">x</p>
 <script>
@@ -71,7 +85,8 @@ function report(){
   'layerlist','afterlayerlist','control',
   'islistA','islistB','wherelist','compound','inner2','outerdiv',
   'btn','istype','grp1','grp2','grp3','isdescendkid',
-  'specwhere','speciscls'].forEach(function(id){
+  'specwhere','speciscls','vartop','varlayer','varsupports',
+  'varfallback'].forEach(function(id){
    T(id, hidden(id));});}
 window.addEventListener('load', function(){ setTimeout(report, 300); });
 </script></body></html>
