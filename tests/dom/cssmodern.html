@@ -1,0 +1,48 @@
+<!DOCTYPE html><html><head><title>cssmodern</title><style>
+/* Each rule hides one marker. Whether the marker has a box is something
+   both engines agree how to report, so this asks the layout rather than
+   the stylesheet: a marker that still has height means the construct
+   around its rule was not understood. */
+#plain { display: none; }
+@media (min-width: 1px) { #inmedia { display: none; } }
+@layer base { #inlayer { display: none; } }
+@layer { #anonlayer { display: none; } }
+@supports (display: block) { #insupports { display: none; } }
+@supports not (definitely-not-a-property: 1) { #insupportsnot { display: none; } }
+:where(#inwhere) { display: none; }
+:is(#inis) { display: none; }
+#inhas:has(span) { display: none; }
+#nest { color: red; & #innest { display: none; } }
+@container (min-width: 1px) { #incontainer { display: none; } }
+#afterlayer { display: none; }
+</style>
+<style>@layer a, b;
+@layer a { #layerlist { display: none; } }
+#afterlayerlist { display: none; }
+</style>
+</head><body>
+<pre id="out"></pre>
+<p id="plain">x</p><p id="inmedia">x</p><p id="inlayer">x</p>
+<p id="anonlayer">x</p><p id="insupports">x</p><p id="insupportsnot">x</p>
+<p id="inwhere">x</p><p id="inis">x</p>
+<p id="inhas"><span>x</span></p>
+<p id="nest"><span id="innest">x</span></p>
+<p id="incontainer">x</p><p id="afterlayer">x</p>
+<p id="layerlist">x</p><p id="afterlayerlist">x</p>
+<p id="control">x</p>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function hidden(id){var e=document.getElementById(id);
+ if(!e)return 'missing';
+ var r=e.getBoundingClientRect();
+ return (r.width===0&&r.height===0)?'hidden':'shown';}
+/* After layout: a box has no geometry until the page has been laid out,
+   and asking during parse reports every element as having none. */
+function report(){
+ ['plain','inmedia','inlayer','anonlayer','insupports','insupportsnot',
+  'inwhere','inis','inhas','innest','incontainer','afterlayer',
+  'layerlist','afterlayerlist','control'].forEach(function(id){
+   T(id, hidden(id));});}
+window.addEventListener('load', function(){ setTimeout(report, 300); });
+</script></body></html>

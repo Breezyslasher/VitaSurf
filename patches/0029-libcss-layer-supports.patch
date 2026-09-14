@@ -1,0 +1,95 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 96c9725..748e761 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -876,6 +876,65 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+ 			return error;
+ 		}
+ 
++		/* Rule is now owned by the sheet,
++		 * so no need to destroy it */
++
++		c->state = HAD_RULE;
++	} else if (((lwc_string_caseless_isequal(atkeyword->idata,
++			c->strings[LAYER], &match) == lwc_error_ok && match) ||
++		    (lwc_string_caseless_isequal(atkeyword->idata,
++			c->strings[SUPPORTS], &match) == lwc_error_ok &&
++			match))) {
++		css_mq_query *media;
++
++		/*
++		 * @layer and @supports, treated as transparent: whatever
++		 * their prelude says, the rules inside are taken as though
++		 * they had been written here. An at-rule this parser does
++		 * not know is skipped along with its whole block, and
++		 * modern stylesheets put nearly everything inside these
++		 * two -- GitHub's is built on @layer -- so the alternative
++		 * is a page with almost no style at all.
++		 *
++		 * What this gives up is their real meaning. A layer's
++		 * rules lose to any unlayered rule in a browser, and here
++		 * they take part in the cascade like everything else, so
++		 * where a sheet relies on that a rule can win that should
++		 * have lost. @supports is not evaluated at all, so a block
++		 * guarded on a feature is applied whether or not the
++		 * feature is here. Both are closer to the intended page
++		 * than dropping the rules.
++		 *
++		 * They are carried as a media rule whose query always
++		 * matches -- "not (no media type)" -- because nesting,
++		 * selection and the cascade already handle that shape.
++		 */
++		media = malloc(sizeof(*media));
++		if (media == NULL)
++			return CSS_NOMEM;
++		memset(media, 0, sizeof(*media));
++		media->negate_type = 1;
++
++		error = css__stylesheet_rule_create(c->sheet,
++				CSS_RULE_MEDIA, &rule);
++		if (error != CSS_OK) {
++			css__mq_query_destroy(media);
++			return error;
++		}
++
++		error = css__stylesheet_rule_set_media(c->sheet, rule, media);
++		if (error != CSS_OK) {
++			css__stylesheet_rule_destroy(c->sheet, rule);
++			css__mq_query_destroy(media);
++			return error;
++		}
++
++		error = css__stylesheet_add_rule(c->sheet, rule, NULL);
++		if (error != CSS_OK) {
++			css__stylesheet_rule_destroy(c->sheet, rule);
++			return error;
++		}
++
+ 		/* Rule is now owned by the sheet,
+ 		 * so no need to destroy it */
+ 
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index 8c2ccf4..b6a1947 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -43,6 +43,8 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("namespace"),
+ 	SMAP("font-face"),
+ 	SMAP("page"),
++	SMAP("layer"),
++	SMAP("supports"),
+ 
+ 	SMAP("aural"),
+ 	SMAP("braille"),
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index b0a1785..e1b92b7 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -20,6 +20,7 @@ enum {
+ 
+ 	/* At-rules */
+ 	CHARSET, LIBCSS_IMPORT, MEDIA, NAMESPACE, FONT_FACE, PAGE,
++	LAYER, SUPPORTS,
+ 
+ 	/* Media types */
+ 	AURAL, BRAILLE, EMBOSSED, HANDHELD, PRINT, PROJECTION,
