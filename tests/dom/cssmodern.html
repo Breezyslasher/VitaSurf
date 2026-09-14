@@ -25,6 +25,13 @@
 :where(#wherelist, #nothinghere) { display: none; }
 p:is(.compound) { display: none; }
 :is(.outer .inner) { display: none; }
+/* the shapes a real stylesheet writes: github.com's has 187 of these */
+:is(.chainA .chainB .chainC) { display: none; }
+:is(.kidA > .kidB) { display: none; }
+p:is(.subjA .subjB) { display: none; }
+:is(.altA .altX, .altB .altY) { display: none; }
+.pre :is(.postA .postB) { display: none; }
+:where(.wA .wB) { display: none; }
 :is(.btn.primary) { display: none; }
 :is(div#istype) { display: none; }
 
@@ -69,6 +76,14 @@ p:is(.compound) { display: none; }
 <p id="islistA">x</p><p id="islistB">x</p><p id="wherelist">x</p>
 <p id="compound" class="compound">x</p>
 <div class="outer" id="outerdiv"><p id="inner2" class="inner">x</p></div>
+<div class="chainA"><div class="chainB"><p id="chain3" class="chainC">x</p></div></div>
+<div class="kidA"><p id="kid2" class="kidB">x</p></div>
+<div class="kidA"><div><p id="kidfar" class="kidB">x</p></div></div>
+<div class="subjA"><p id="subjP" class="subjB">x</p><div id="subjD" class="subjB">x</div></div>
+<div class="altB"><p id="alt2" class="altY">x</p></div>
+<div class="pre"><div class="postA"><p id="post2" class="postB">x</p></div></div>
+<div class="postA"><p id="postnopre" class="postB">x</p></div>
+<div class="wA"><p id="w2" class="wB">x</p></div>
 <p id="btn" class="btn primary">x</p>
 <div id="istype">x</div>
 <p id="emptyis">x</p>
@@ -96,6 +111,7 @@ function report(){
   'inwhere','inis','inhas','innest','incontainer','afterlayer',
   'layerlist','afterlayerlist','control',
   'islistA','islistB','wherelist','compound','inner2','outerdiv',
+  'chain3','kid2','kidfar','subjP','subjD','alt2','post2','postnopre','w2',
   'btn','istype','emptyis','wrongtag','righttag','grp1','grp2','grp3',
   'isdescendkid',
   'specwhere','speciscls','vartop','varlayer','varsupports',

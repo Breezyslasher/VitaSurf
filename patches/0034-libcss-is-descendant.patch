@@ -1,0 +1,393 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index a66b0c1..756904d 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -108,6 +108,14 @@ static bool isFunctionalGroup(css_language *c,
+ static css_error parseAppendGroup(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_selector **parent, int which);
++static bool groupArgHasCombinator(const parserutils_vector *vector,
++		int32_t ctx);
++static css_error parseGroupChain(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_selector **parent);
++static void dropPrefixChain(css_language *c);
++static css_error splicePrefixChain(css_language *c, css_selector *before,
++		css_combinator comb, css_selector *subject);
+ 
+ /* Declaration parsing */
+ static css_error parseProperty(css_language *c,
+@@ -777,6 +785,7 @@ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+ 	c->sheet = sheet;
+ 	c->state = CHARSET_PERMITTED;
+ 	c->used_root_hints = 0;
++	c->prefix_n = 0;
+ 	c->default_namespace = NULL;
+ 	c->namespaces = NULL;
+ 	c->num_namespaces = 0;
+@@ -2240,6 +2249,216 @@ static bool isFunctionalGroup(css_language *c,
+ 	return false;
+ }
+ 
++/**
++ * Join a pending :is()/:where() prefix chain into the selector
++ * (VitaSurf).
++ *
++ * "before" is what the chain attaches to on its left -- the compound
++ * already parsed, or NULL when the chain starts the selector -- and
++ * "comb" is the combinator that was written between them. The chain
++ * itself, then the subject, follow.
++ *
++ * Combining is left to right so that each selector picks up the
++ * specificity of everything ahead of it, which is what
++ * css__stylesheet_selector_combine() does one link at a time.
++ *
++ * With no chain pending this is just the combine parseSelector() would
++ * have done itself, so it is safe to call every time.
++ */
++static css_error splicePrefixChain(css_language *c, css_selector *before,
++		css_combinator comb, css_selector *subject)
++{
++	css_combinator next = comb;
++	css_error error;
++	int i;
++
++	for (i = 0; i < c->prefix_n; i++) {
++		if (before != NULL) {
++			error = css__stylesheet_selector_combine(c->sheet,
++					next, before, c->prefix[i]);
++			if (error != CSS_OK) {
++				dropPrefixChain(c);
++				return error;
++			}
++		}
++		before = c->prefix[i];
++		next = (css_combinator) c->prefix_comb[i];
++		c->prefix[i] = NULL;
++	}
++	c->prefix_n = 0;
++
++	if (before == NULL)
++		return CSS_OK;	/* nothing to the left of the subject */
++
++	return css__stylesheet_selector_combine(c->sheet, next, before,
++			subject);
++}
++
++/**
++ * Does this :is() or :where() argument contain a combinator? (VitaSurf)
++ *
++ * Scans from the argument's first token to the ',' or ')' that ends it,
++ * at bracket depth zero. Whitespace counts only when something other
++ * than the end follows it, because the whitespace before ')' is not a
++ * descendant combinator.
++ */
++static bool groupArgHasCombinator(const parserutils_vector *vector,
++		int32_t ctx)
++{
++	int32_t i = ctx;
++	int depth = 0;
++	const css_token *t;
++
++	while ((t = parserutils_vector_peek(vector, i)) != NULL) {
++		if (tokenIsChar(t, '(') || tokenIsChar(t, '[')) {
++			depth++;
++		} else if (tokenIsChar(t, ']')) {
++			if (depth > 0) depth--;
++		} else if (tokenIsChar(t, ')')) {
++			if (depth == 0)
++				break;
++			depth--;
++		} else if (depth == 0) {
++			if (tokenIsChar(t, ','))
++				break;
++			if (tokenIsChar(t, '>') || tokenIsChar(t, '+') ||
++					tokenIsChar(t, '~'))
++				return true;
++			if (t->type == CSS_TOKEN_S) {
++				const css_token *n =
++					parserutils_vector_peek(vector, i + 1);
++				if (n != NULL && !tokenIsChar(n, ')') &&
++						!tokenIsChar(n, ',') &&
++						!tokenIsChar(n, '>') &&
++						!tokenIsChar(n, '+') &&
++						!tokenIsChar(n, '~'))
++					return true;
++			}
++		}
++		i++;
++	}
++	return false;
++}
++
++/** Release a prefix chain that will not be used. */
++static void dropPrefixChain(css_language *c)
++{
++	int i;
++
++	for (i = 0; i < c->prefix_n; i++) {
++		if (c->prefix[i] != NULL) {
++			css__stylesheet_selector_destroy(c->sheet,
++					c->prefix[i]);
++			c->prefix[i] = NULL;
++		}
++	}
++	c->prefix_n = 0;
++}
++
++/**
++ * Parse an :is() or :where() argument that has combinators in it
++ * (VitaSurf).
++ *
++ * ":is(.a .b)" is ".a .b" with the enclosing compound's own details on
++ * the .b. So every compound but the last is parsed as a selector of its
++ * own and left in c->prefix for parseSelector() to join in front, and
++ * the last one's details are merged into the compound being built, the
++ * same as an argument with no combinator.
++ *
++ * Specificity comes out right because nothing is combined here:
++ * css__stylesheet_selector_combine() propagates as it goes, so the
++ * combining has to happen strictly left to right, which only
++ * parseSelector() is in a position to do.
++ */
++static css_error parseGroupChain(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_selector **parent)
++{
++	css_selector *last = NULL;
++	const css_selector_detail *det;
++	const css_token *token;
++	css_error error;
++
++	/* One pending chain at a time: ":is(.a .b):is(.c .d)" would need
++	 * two, and getting it wrong matches elements the page never
++	 * meant. */
++	if (c->prefix_n != 0)
++		return CSS_INVALID;
++
++	for (;;) {
++		css_selector *cur = NULL;
++		css_combinator comb = CSS_COMBINATOR_NONE;
++
++		error = parseSimpleSelector(c, vector, ctx, &cur);
++		if (error != CSS_OK) {
++			dropPrefixChain(c);
++			return error;
++		}
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL) {
++			css__stylesheet_selector_destroy(c->sheet, cur);
++			dropPrefixChain(c);
++			return CSS_INVALID;
++		}
++		if (tokenIsChar(token, ')') || tokenIsChar(token, ',')) {
++			last = cur;
++			break;
++		}
++
++		if (tokenIsChar(token, '>')) {
++			comb = CSS_COMBINATOR_PARENT;
++		} else if (tokenIsChar(token, '+')) {
++			comb = CSS_COMBINATOR_SIBLING;
++		} else if (tokenIsChar(token, '~')) {
++			comb = CSS_COMBINATOR_GENERIC_SIBLING;
++		} else {
++			/* consumeWhitespace ate it, so this is a descendant */
++			comb = CSS_COMBINATOR_ANCESTOR;
++		}
++		if (comb != CSS_COMBINATOR_ANCESTOR) {
++			parserutils_vector_iterate(vector, ctx);
++			consumeWhitespace(vector, ctx);
++		}
++
++		if (c->prefix_n >= CSS_GROUP_PREFIX_MAX) {
++			css__stylesheet_selector_destroy(c->sheet, cur);
++			dropPrefixChain(c);
++			return CSS_INVALID;
++		}
++		c->prefix[c->prefix_n] = cur;
++		c->prefix_comb[c->prefix_n] = (int) comb;
++		c->prefix_n++;
++	}
++
++	/*
++	 * Merge the last compound's details into the compound being
++	 * built. parseSimpleSelector() writes a universal element detail
++	 * when the argument named no element, and appending that would
++	 * only cost a comparison that is always true, so it is skipped.
++	 */
++	for (det = &last->data; det != NULL;
++			det = (det->next != 0) ? det + 1 : NULL) {
++		if (det == &last->data &&
++				det->type == CSS_SELECTOR_ELEMENT &&
++				det->negate == 0 &&
++				nameIs(det->qname.name, "*"))
++			continue;
++		error = css__stylesheet_selector_append_specific(c->sheet,
++				parent, det);
++		if (error != CSS_OK) {
++			css__stylesheet_selector_destroy(c->sheet, last);
++			dropPrefixChain(c);
++			return error;
++		}
++	}
++	(*parent)->specificity += last->specificity;
++	css__stylesheet_selector_destroy(c->sheet, last);
++
++	return CSS_OK;
++}
++
+ /**
+  * Append the compound inside :is() or :where() to the selector being
+  * built (VitaSurf).
+@@ -2251,10 +2470,10 @@ static bool isFunctionalGroup(css_language *c,
+  * by parseSelectorExpanded, which parses the selector once per
+  * combination.
+  *
+- * An argument containing a combinator -- :is(.a .b) -- is refused. One
+- * chain of details cannot express it, and matching only its first part
+- * would apply the rule to elements it was never meant for, which is
+- * worse than dropping it.
++ * An argument containing a combinator -- :is(.a .b) -- needs more than
++ * one chain of details, so parseGroupChain() takes it: the last
++ * compound merges in here as usual and the rest is handed to
++ * parseSelector() to put in front.
+  */
+ static css_error parseAppendGroup(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+@@ -2283,6 +2502,23 @@ static css_error parseAppendGroup(css_language *c,
+ 	if (token == NULL)
+ 		return CSS_INVALID;
+ 
++	/* ":is(.a .b)": more than one compound, so not a detail chain */
++	if (groupArgHasCombinator(vector, *ctx)) {
++		error = parseGroupChain(c, vector, ctx, parent);
++		if (error != CSS_OK)
++			return error;
++
++		skipToCloseParen(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL || tokenIsChar(token, ')') == false) {
++			dropPrefixChain(c);
++			return CSS_INVALID;
++		}
++		if (which == WHERE_FN)
++			(*parent)->specificity = before;
++		return CSS_OK;
++	}
++
+ 	/*
+ 	 * :is() and :where() with nothing in them match nothing -- and
+ 	 * GitHub's stylesheet ships a literal ":is(){...}". Appending no
+@@ -2421,12 +2657,22 @@ css_error parseSelectorSpecifics(css_language *c,
+ 	css_error error;
+ 	const css_token *token;
+ 
+-	/* specifics -> specific* */
++	/* specifics -> specific*
++	 *
++	 * A ')' ends the compound too (VitaSurf). Every function a
++	 * specific can be -- :not(), :nth-child(), an attribute's
++	 * brackets -- consumes its own closing paren, so the only ')'
++	 * that reaches here closes an enclosing :is() or :where(), and
++	 * without this the compound inside one runs off the end and the
++	 * whole selector is dropped. At the top level a stray ')' is
++	 * still rejected, one step later, by the combinator parser.
++	 */
+ 	while ((token = parserutils_vector_peek(vector, *ctx)) != NULL &&
+ 			token->type != CSS_TOKEN_S &&
+ 			tokenIsChar(token, '+') == false &&
+ 			tokenIsChar(token, '>') == false &&
+ 			tokenIsChar(token, '~') == false &&
++			tokenIsChar(token, ')') == false &&
+ 			tokenIsChar(token, ',') == false) {
+ 		error = parseAppendSpecific(c, vector, ctx, parent);
+ 		if (error != CSS_OK)
+@@ -2620,9 +2866,27 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+ 	 * selector.
+ 	 */
+ 
++	c->prefix_n = 0;
++
+ 	error = parseSimpleSelector(c, vector, ctx, &selector);
+-	if (error != CSS_OK)
++	if (error != CSS_OK) {
++		dropPrefixChain(c);
+ 		return error;
++	}
++
++	/*
++	 * An :is() or :where() argument with combinators in it left its
++	 * ancestors behind (VitaSurf); they go in front of the compound
++	 * it was written on. Nothing was joined up when they were parsed,
++	 * because css__stylesheet_selector_combine() adds the ancestor's
++	 * specificity to the descendant as it goes and so has to be
++	 * called from the left.
++	 */
++	error = splicePrefixChain(c, NULL, CSS_COMBINATOR_NONE, selector);
++	if (error != CSS_OK) {
++		css__stylesheet_selector_destroy(c->sheet, selector);
++		return error;
++	}
+ 
+ 	while ((token = parserutils_vector_peek(vector, *ctx)) != NULL &&
+ 			tokenIsChar(token, ',') == false) {
+@@ -2649,12 +2913,12 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+ 
+ 		error = parseSimpleSelector(c, vector, ctx, &other);
+ 		if (error != CSS_OK) {
++			dropPrefixChain(c);
+ 			css__stylesheet_selector_destroy(c->sheet, selector);
+ 			return error;
+ 		}
+ 
+-		error = css__stylesheet_selector_combine(c->sheet,
+-				comb, selector, other);
++		error = splicePrefixChain(c, selector, comb, other);
+ 		if (error != CSS_OK) {
+ 			css__stylesheet_selector_destroy(c->sheet, selector);
+ 			css__stylesheet_selector_destroy(c->sheet, other);
+diff --git a/src/parse/language.h b/src/parse/language.h
+index a85c318..96a7aa3 100644
+--- a/src/parse/language.h
++++ b/src/parse/language.h
+@@ -18,6 +18,8 @@
+ #include "parse/parse.h"
+ #include "parse/propstrings.h"
+ 
++struct css_selector;
++
+ /**
+  * CSS namespace mapping
+  */
+@@ -72,6 +74,28 @@ typedef struct css_language {
+ 	int alt_count[CSS_ALT_MAX];
+ 	int alt_choice[CSS_ALT_MAX];
+ 	int alt_seen;
++
++	/**
++	 * The ancestors an :is() or :where() argument brought with it
++	 * (VitaSurf).
++	 *
++	 * ":is(.a .b)" says the element matches .b and has a .a
++	 * ancestor, which is two compounds and a combinator -- more than
++	 * the one chain of details a compound is. The argument's last
++	 * compound merges into the compound being parsed, as an
++	 * argument without a combinator does, and everything to its left
++	 * is left here for parseSelector() to put in front of it. In
++	 * document order: prefix[i] is joined to prefix[i+1], and the
++	 * last is joined to the compound itself, by comb[i].
++	 *
++	 * github.com's stylesheet has 187 of these.
++	 */
++#define CSS_GROUP_PREFIX_MAX 8
++	struct css_selector *prefix[CSS_GROUP_PREFIX_MAX];
++	/* css_combinator, which this header cannot see: stylesheet.h
++	 * includes this one. */
++	int prefix_comb[CSS_GROUP_PREFIX_MAX];
++	int prefix_n;
+ } css_language;
+ 
+ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
