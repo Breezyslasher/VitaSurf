@@ -1550,16 +1550,21 @@ _body:function(b){if(b===undefined||b===null)return null;if(typeof b==='string')
  if(b instanceof ArrayBuffer||ArrayBuffer.isView(b)){var v=new Uint8Array(b.buffer||b),s='';for(var i=0;i<v.length;i++)s+=String.fromCharCode(v[i]);return s;}return String(b);},
 send:function(body){var self=this;if(this.readyState!==1)return;var data=this._body(body);var hs=[];for(var k in this._h)hs.push(k+': '+this._h[k]);
  this._emit('loadstart');
- var done=function(status,headers,text,err,url){self._id=0;self._rh=headers||'';self.responseURL=url||self._u;
-  if(err){self.status=0;self.statusText='';self.responseText='';self.response=null;self._set(4);self._emit(err==='timeout'?'timeout':'error');self._emit('loadend');return;}
-  self.status=status;self.statusText=status===200?'OK':status===204?'No Content':status===404?'Not Found':'';self._set(2);self._set(3);self.responseText=text;
-
+ /* the body arrives as bytes; text is a decode of them, and a
+    response that is not text keeps every byte it was sent */
+ var done=function(status,headers,bytes,err,url){self._id=0;self._rh=headers||'';self.responseURL=url||self._u;
+  if(err){self.status=0;self.statusText='';self.responseText='';self.response=null;self._bytes=null;self._set(4);self._emit(err==='timeout'?'timeout':'error');self._emit('loadend');return;}
+  self.status=status;self.statusText=status===200?'OK':status===204?'No Content':status===404?'Not Found':'';self._set(2);self._set(3);
+  self._bytes=bytes instanceof ArrayBuffer?bytes:new ArrayBuffer(0);
+  var text=new TextDecoder().decode(self._bytes);
+  self.responseText=text;
   var rt=self.responseType;if(rt==='json'){try{self.response=JSON.parse(text);}catch(e){self.response=null;}}
-  else if(rt==='arraybuffer'){var b=new ArrayBuffer(text.length),v=new Uint8Array(b);for(var i=0;i<text.length;i++)v[i]=text.charCodeAt(i)&255;self.response=b;}
+  else if(rt==='arraybuffer'){self.response=self._bytes;}
+  else if(rt==='blob'){self.response=new Blob([self._bytes]);}
   else if(rt==='document'){self.response=null;}else self.response=text;
   self._set(4);self._emit('load');self._emit('loadend');};
  this._id=__vitaFetch(this._u,this._m,hs,data,this.timeout|0,done);
- if(!this._id)setTimeout(function(){done(0,'','','request refused','');},0);},
+ if(!this._id)setTimeout(function(){done(0,'',new ArrayBuffer(0),'request refused','');},0);},
 abort:function(){if(this._id){__vitaFetchAbort(this._id);this._id=0;}if(this.readyState!==0&&this.readyState!==4){this.readyState=4;this.status=0;this._emit('readystatechange');this._emit('abort');this._emit('loadend');}this.readyState=0;},
 getResponseHeader:function(n){var lines=this._rh.split('\n'),p=String(n).toLowerCase()+':';for(var i=0;i<lines.length;i++){if(lines[i].toLowerCase().indexOf(p)===0)return lines[i].slice(p.length).trim();}return null;},
 getAllResponseHeaders:function(){return this._rh?this._rh.replace(/\n/g,'\r\n'):'';},
@@ -1576,17 +1581,48 @@ Headers.prototype={append:function(k,v){k=String(k).toLowerCase();this._m[k]=(k 
 has:function(k){return String(k).toLowerCase() in this._m;},'delete':function(k){delete this._m[String(k).toLowerCase()];},forEach:function(f,t){for(var k in this._m)f.call(t,this._m[k],k,this);},
 keys:function(){return Object.keys(this._m)[Symbol.iterator]();},values:function(){var m=this._m;return Object.keys(m).map(function(k){return m[k];})[Symbol.iterator]();},entries:function(){var m=this._m;return Object.keys(m).map(function(k){return [k,m[k]];})[Symbol.iterator]();}};
 Headers.prototype[Symbol.iterator]=Headers.prototype.entries;
-function Response(body,init){init=init||{};this.status=init.status===undefined?200:init.status;this.ok=this.status>=200&&this.status<300;this.statusText=init.statusText||'';this.headers=new Headers(init.headers);this.url=init.url||'';this.type='basic';this.redirected=false;this.bodyUsed=false;this._b=body===undefined||body===null?'':String(body);}
-Response.prototype={text:function(){this.bodyUsed=true;return Promise.resolve(this._b);},json:function(){var b=this._b;this.bodyUsed=true;return new Promise(function(res,rej){try{res(JSON.parse(b));}catch(e){rej(e);}});},
-arrayBuffer:function(){var t=this._b;this.bodyUsed=true;var b=new ArrayBuffer(t.length),v=new Uint8Array(b);for(var i=0;i<t.length;i++)v[i]=t.charCodeAt(i)&255;return Promise.resolve(b);},
-blob:function(){var t=this._b;this.bodyUsed=true;return Promise.resolve({size:t.length,type:this.headers.get('content-type')||'',text:function(){return Promise.resolve(t);}});},
-formData:function(){var t=this._b;this.bodyUsed=true;var f=new FormData();new URLSearchParams(t).forEach(function(v,k){f.append(k,v);});return Promise.resolve(f);},
-clone:function(){return new Response(this._b,{status:this.status,statusText:this.statusText,headers:this.headers,url:this.url});}};
+function Response(body,init){init=init||{};this.status=init.status===undefined?200:init.status;this.ok=this.status>=200&&this.status<300;this.statusText=init.statusText||'';this.headers=new Headers(init.headers);this.url=init.url||'';this.type='basic';this.redirected=false;this.bodyUsed=false;
+ /* bytes when we were given bytes: text() decodes them, and anything
+    that is not text keeps every byte it was sent */
+ if(body instanceof ArrayBuffer){this._ab=body;this._b=null;}
+ else if(ArrayBuffer.isView&&ArrayBuffer.isView(body)){
+  this._ab=body.buffer.slice(body.byteOffset,body.byteOffset+body.byteLength);
+  this._b=null;}
+ else{this._ab=null;this._b=body===undefined||body===null?'':String(body);}}
+Response.prototype._text=function(){
+ if(this._b===null||this._b===undefined)
+  this._b=new TextDecoder().decode(this._ab||new ArrayBuffer(0));
+ return this._b;};
+Response.prototype._buffer=function(){
+ if(this._ab)return this._ab;
+ var e=new TextEncoder().encode(this._b||'');
+ return e.buffer.slice(e.byteOffset,e.byteOffset+e.byteLength);};
+(function(){
+ var proto={
+  text:function(){this.bodyUsed=true;return Promise.resolve(this._text());},
+  json:function(){var b=this._text();this.bodyUsed=true;
+   return new Promise(function(res,rej){
+    try{res(JSON.parse(b));}catch(e){rej(e);}});},
+  arrayBuffer:function(){this.bodyUsed=true;
+   return Promise.resolve(this._buffer());},
+  bytes:function(){this.bodyUsed=true;
+   return Promise.resolve(new Uint8Array(this._buffer()));},
+  blob:function(){var b=this._buffer(),ct=this.headers.get('content-type')||'';
+   this.bodyUsed=true;return Promise.resolve(new Blob([b],{type:ct}));},
+  formData:function(){var t=this._text();this.bodyUsed=true;
+   var f=new FormData();
+   new URLSearchParams(t).forEach(function(v,k){f.append(k,v);});
+   return Promise.resolve(f);},
+  clone:function(){
+   return new Response(this._ab||this._b,
+    {status:this.status,statusText:this.statusText,headers:this.headers,
+     url:this.url});}};
+ Object.keys(proto).forEach(function(k){Response.prototype[k]=proto[k];});})();
 Response.error=function(){var r=new Response('',{status:0});r.type='error';return r;};Response.json=function(o,init){var r=new Response(JSON.stringify(o),init);if(!r.headers.has('content-type'))r.headers.set('content-type','application/json');return r;};
 function Request(input,init){init=init||{};var from=input instanceof Request?input:null;this.url=from?from.url:String(input);this.method=String(init.method||(from?from.method:'GET')).toUpperCase();this.headers=new Headers(init.headers||(from?from.headers:undefined));this._body=init.body!==undefined?init.body:(from?from._body:null);this.credentials=init.credentials||'same-origin';this.mode=init.mode||'cors';this.cache=init.cache||'default';this.redirect=init.redirect||'follow';this.signal=init.signal||null;this.bodyUsed=false;}
 Request.prototype={clone:function(){return new Request(this);},text:function(){return Promise.resolve(this._body==null?'':String(this._body));},json:function(){return this.text().then(JSON.parse);}};
 W.fetch=function(input,init){var req=new Request(input,init);return new Promise(function(resolve,reject){var x=new XMLHttpRequest();x.open(req.method,req.url);req.headers.forEach(function(v,k){x.setRequestHeader(k,v);});
- x.onload=function(){var h=new Headers();x.getAllResponseHeaders().split('\r\n').forEach(function(l){var i=l.indexOf(':');if(i>0)h.append(l.slice(0,i),l.slice(i+1).trim());});var r=new Response(x.responseText,{status:x.status,statusText:x.statusText,headers:h,url:x.responseURL});r.redirected=x.responseURL!==req.url;resolve(r);};
+ x.onload=function(){var h=new Headers();x.getAllResponseHeaders().split('\r\n').forEach(function(l){var i=l.indexOf(':');if(i>0)h.append(l.slice(0,i),l.slice(i+1).trim());});var r=new Response(x._bytes||x.responseText,{status:x.status,statusText:x.statusText,headers:h,url:x.responseURL});r.redirected=x.responseURL!==req.url;resolve(r);};
  x.onerror=function(){reject(new TypeError('Failed to fetch'));};x.ontimeout=x.onerror;x.onabort=function(){var e=new Error('The operation was aborted');e.name='AbortError';reject(e);};
  if(req.signal){if(req.signal.aborted){x.onabort();return;}req.signal.addEventListener('abort',function(){x.abort();});}
  x.send(req._body);});};
@@ -3727,18 +3763,38 @@ W.OffscreenCanvas=function(w,h){this.width=w|0;this.height=h|0;
  * with a blob: scheme it cannot handle.
  */
 var blobURLs={},blobSeq=0;
+/* A blob holds bytes. It used to hold a string, so a blob made from a
+   buffer was decoded as text on the way in and re-encoded on the way
+   out, which does not survive anything that is not text. */
 function Blob(parts,opts){
  opts=opts||{};
- var t='';
+ var chunks=[],total=0;
  [].forEach.call(parts||[],function(p){
-  t+=(p&&p._t!==undefined)?p._t:
-     (p&&p.buffer!==undefined||p instanceof Uint8Array)?new TextDecoder().decode(p):String(p);});
- this._t=t;this.type=String(opts.type||'');
- Object.defineProperty(this,'size',{configurable:true,value:t.length});}
+  var u;
+  if(p&&p._u instanceof Uint8Array)u=p._u;
+  else if(p instanceof ArrayBuffer)u=new Uint8Array(p);
+  else if(ArrayBuffer.isView&&ArrayBuffer.isView(p))
+   u=new Uint8Array(p.buffer,p.byteOffset,p.byteLength);
+  else u=new TextEncoder().encode(String(p));
+  chunks.push(u);total+=u.length;});
+ var all=new Uint8Array(total),at=0,i;
+ for(i=0;i<chunks.length;i++){all.set(chunks[i],at);at+=chunks[i].length;}
+ this._u=all;this.type=String(opts.type||'');
+ Object.defineProperty(this,'size',{configurable:true,value:total});}
+Object.defineProperty(Blob.prototype,'_t',{configurable:true,
+ get:function(){return new TextDecoder().decode(this._u);}});
 Blob.prototype.text=function(){return Promise.resolve(this._t);};
-Blob.prototype.arrayBuffer=function(){return Promise.resolve(new TextEncoder().encode(this._t).buffer);};
-Blob.prototype.bytes=function(){return Promise.resolve(new TextEncoder().encode(this._t));};
-Blob.prototype.slice=function(a,b,type){var n=new Blob([this._t.slice(a,b)],{type:type||this.type});return n;};
+Blob.prototype.arrayBuffer=function(){
+ var u=this._u;
+ return Promise.resolve(u.buffer.slice(u.byteOffset,u.byteOffset+u.length));};
+Blob.prototype.bytes=function(){return Promise.resolve(new Uint8Array(this._u));};
+Blob.prototype.slice=function(a,b,type){
+ /* bytes, not characters: slicing the decoded text cut multi-byte
+    sequences in half and made nonsense of anything binary */
+ var u=this._u,n=u.length;
+ a=a===undefined?0:(a<0?Math.max(n+a,0):Math.min(a,n));
+ b=b===undefined?n:(b<0?Math.max(n+b,0):Math.min(b,n));
+ return new Blob([u.subarray(a,Math.max(a,b))],{type:type||''});};
 Blob.prototype.stream=function(){return null;};
 W.Blob=Blob;
 function File(parts,name,opts){Blob.call(this,parts,opts);
@@ -3761,14 +3817,25 @@ FileReader.prototype._fire=function(t){var e={type:t,target:this};
  (this._l[t]||[]).forEach(function(f){f(e);});};
 FileReader.prototype._read=function(blob,make){
  var self=this;self.readyState=1;self._fire('loadstart');
- setTimeout(function(){self.result=make(blob?blob._t||'':'');self.readyState=2;
+ setTimeout(function(){
+  self.result=make(blob&&blob._u?blob._u:new Uint8Array(0));
+  self.readyState=2;
   self._fire('load');self._fire('loadend');},0);};
-FileReader.prototype.readAsText=function(b){this._read(b,function(t){return t;});};
+FileReader.prototype.readAsText=function(b){
+ this._read(b,function(u){return new TextDecoder().decode(u);});};
 FileReader.prototype.readAsDataURL=function(b){var type=(b&&b.type)||'application/octet-stream';
- this._read(b,function(t){return 'data:'+type+';base64,'+W.btoa(t);});};
+ this._read(b,function(u){
+  var s='',i;
+  for(i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);
+  return 'data:'+type+';base64,'+W.btoa(s);});};
 FileReader.prototype.readAsArrayBuffer=function(b){
- this._read(b,function(t){return new TextEncoder().encode(t).buffer;});};
-FileReader.prototype.readAsBinaryString=function(b){this._read(b,function(t){return t;});};
+ this._read(b,function(u){
+  return u.buffer.slice(u.byteOffset,u.byteOffset+u.length);});};
+FileReader.prototype.readAsBinaryString=function(b){
+ this._read(b,function(u){
+  var s='',i;
+  for(i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);
+  return s;});};
 FileReader.prototype.abort=function(){this.readyState=2;this._fire('abort');};
 W.FileReader=FileReader;
 W.FileReaderSync=function(){};

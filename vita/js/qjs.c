@@ -3226,8 +3226,18 @@ static void xhr_complete(struct js_xhr *x, const char *err)
 		args[0] = JS_NewInt32(ctx, x->status);
 		args[1] = JS_NewStringLen(ctx, x->rheaders != NULL ? x->rheaders : "",
 					  x->rheaders_len);
-		args[2] = err != NULL ? JS_NewString(ctx, "") :
-			JS_NewStringLen(ctx, x->body != NULL ? x->body : "", x->body_len);
+		/*
+		 * The body as bytes, not as a string. JS_NewStringLen takes
+		 * UTF-8 and rewrites anything that is not, so a response that
+		 * is not text -- a font, a wasm module, a glTF model -- came
+		 * across shorter than it went in and with its bytes changed.
+		 * The caller decodes it when it wants text.
+		 */
+		args[2] = err != NULL ?
+			JS_NewArrayBufferCopy(ctx, (const uint8_t *)"", 0) :
+			JS_NewArrayBufferCopy(ctx,
+				(const uint8_t *)(x->body != NULL ? x->body : ""),
+				x->body != NULL ? x->body_len : 0);
 		args[3] = err != NULL ? JS_NewString(ctx, err) : JS_NULL;
 		args[4] = JS_NewString(ctx, nsurl_access(x->url));
 		ret = JS_Call(ctx, x->callback, JS_UNDEFINED, 5, args);
