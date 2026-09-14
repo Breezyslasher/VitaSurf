@@ -4216,6 +4216,172 @@ Blob.prototype.textStream=function(){return null;};
  def('profile',function(){});
  def('profileEnd',function(){});
 })();
+/* --- font loading, fullscreen, storage (VitaSurf) ------------------------
+ * The first batch of what the spec surface list says is missing. None of
+ * these can do what a browser does here -- there is no font loader to
+ * wait for, no fullscreen to enter and no database to write to -- but
+ * each has to exist and settle, because a page that awaits
+ * document.fonts.ready or opens a database and waits for a callback
+ * stops where it stands if the object is not there at all.
+ */
+(function(){
+ /* FontFaceSet. Fonts are whatever FreeType already has, so the set is
+    empty and ready at once; a page gates its first paint on this. */
+ function FontFace(family,source,desc){
+  this.family=String(family);this.style='normal';this.weight='normal';
+  this.stretch='normal';this.unicodeRange='U+0-10FFFF';this.variant='normal';
+  this.featureSettings='normal';this.variationSettings='normal';
+  this.display='auto';this.ascentOverride='normal';
+  this.features='normal';this.palettes='normal';this.variations='normal';
+  this.descentOverride='normal';this.lineGapOverride='normal';
+  this.status='loaded';
+  if(desc)Object.keys(desc).forEach(function(k){this[k]=desc[k];},this);
+  this.loaded=Promise.resolve(this);}
+ FontFace.prototype.load=function(){return Promise.resolve(this);};
+ W.FontFace=FontFace;
+ var faces=[];
+ var fontSet={
+  onloading:null,onloadingdone:null,onloadingerror:null,
+  status:'loaded',
+  ready:Promise.resolve(undefined),
+  add:function(f){if(faces.indexOf(f)<0)faces.push(f);return this;},
+  delete:function(f){var i=faces.indexOf(f);if(i<0)return false;
+   faces.splice(i,1);return true;},
+  clear:function(){faces.length=0;},
+  check:function(){return true;},
+  load:function(){return Promise.resolve([]);},
+  forEach:function(f,t){faces.slice().forEach(function(v){f.call(t,v,v,this);},this);},
+  keys:function(){return faces.slice()[Symbol.iterator]();},
+  values:function(){return faces.slice()[Symbol.iterator]();},
+  entries:function(){return faces.map(function(v){return [v,v];})[Symbol.iterator]();},
+  addEventListener:function(){},removeEventListener:function(){},
+  dispatchEvent:function(){return true;}};
+ Object.defineProperty(fontSet,'size',{configurable:true,
+  get:function(){return faces.length;}});
+ fontSet[Symbol.iterator]=fontSet.values;
+ Object.defineProperty(D,'fonts',{configurable:true,
+  get:function(){return fontSet;}});
+ fontSet.ready.then(function(){});
+})();
+
+(function(){
+ /* Fullscreen. Nothing can enter it, so the state is simply "not in it"
+    and the request rejects rather than hanging. */
+ function notAllowed(){
+  return Promise.reject(new DOMException(
+   'Fullscreen is not available.','NotAllowedError'));}
+ Object.defineProperty(D,'fullscreenEnabled',{configurable:true,
+  get:function(){return false;}});
+ Object.defineProperty(D,'fullscreenElement',{configurable:true,
+  get:function(){return null;}});
+ Object.defineProperty(D,'fullscreen',{configurable:true,
+  get:function(){return false;}});
+ if(typeof D.exitFullscreen!=='function')D.exitFullscreen=notAllowed;
+ D.onfullscreenchange=null;D.onfullscreenerror=null;
+ if(!('onfullscreenchange' in P))P.onfullscreenchange=null;
+ if(!('onfullscreenerror' in P))P.onfullscreenerror=null;
+ if(W.ShadowRoot&&W.ShadowRoot.prototype&&
+    !('fullscreenElement' in W.ShadowRoot.prototype)){
+  try{Object.defineProperty(W.ShadowRoot.prototype,'fullscreenElement',
+   {configurable:true,get:function(){return null;}});}catch(e){}}
+})();
+
+(function(){
+ /* IndexedDB. There is no store behind this, so every request fails --
+    but it fails the way a request fails, asynchronously and through
+    onerror, so a page that opens a database and waits is told no
+    instead of waiting for ever. Pages that keep their state here fall
+    back to memory, which is what claude.ai already reports doing. */
+ function Request(){
+  this.readyState='pending';this.result=undefined;
+  this.error=new DOMException('IndexedDB is not available here.',
+   'UnknownError');
+  this.source=null;this.transaction=null;
+  this.onsuccess=null;this.onerror=null;this.onblocked=null;
+  this.onupgradeneeded=null;
+  var self=this;
+  setTimeout(function(){
+   self.readyState='done';
+   var e={type:'error',target:self,currentTarget:self,
+    preventDefault:function(){},stopPropagation:function(){}};
+   if(typeof self.onerror==='function'){try{self.onerror(e);}catch(x){}}
+  },0);}
+ Request.prototype.addEventListener=function(t,f){
+  if(t==='error')this.onerror=f;
+  else if(t==='success')this.onsuccess=f;};
+ Request.prototype.removeEventListener=function(){};
+ Request.prototype.dispatchEvent=function(){return true;};
+ function IDBFactory(){}
+ IDBFactory.prototype.open=function(){return new Request();};
+ IDBFactory.prototype.deleteDatabase=function(){return new Request();};
+ IDBFactory.prototype.databases=function(){return Promise.resolve([]);};
+ IDBFactory.prototype.cmp=function(a,b){return a<b?-1:a>b?1:0;};
+ W.IDBFactory=IDBFactory;
+ W.IDBRequest=Request;
+ W.indexedDB=new IDBFactory();
+})();
+
+(function(){
+ var n=W.navigator;
+ if(!n)return;
+ /* StorageManager: an estimate a page can read, and no persistence. */
+ if(!n.storage)n.storage={
+  estimate:function(){return Promise.resolve({quota:0,usage:0,
+   usageDetails:{}});},
+  persist:function(){return Promise.resolve(false);},
+  persisted:function(){return Promise.resolve(false);},
+  getDirectory:function(){return Promise.reject(new DOMException(
+   'No origin private file system here.','SecurityError'));}};
+ /* Clipboard: there is no clipboard to reach, so it refuses rather
+    than pretending to have copied something. */
+ if(!n.clipboard)n.clipboard={
+  read:function(){return Promise.reject(new DOMException(
+   'The clipboard is not available.','NotAllowedError'));},
+  readText:function(){return Promise.reject(new DOMException(
+   'The clipboard is not available.','NotAllowedError'));},
+  write:function(){return Promise.reject(new DOMException(
+   'The clipboard is not available.','NotAllowedError'));},
+  writeText:function(){return Promise.reject(new DOMException(
+   'The clipboard is not available.','NotAllowedError'));},
+  addEventListener:function(){},removeEventListener:function(){},
+  dispatchEvent:function(){return true;}};
+})();
+/* --- gamepads, battery, vibration, entry types (VitaSurf) ---------------
+ * The second batch. The Vita has buttons and a battery, but neither is
+ * wired to the web platform here: the buttons drive the browser itself
+ * (see vita/input) and exposing them as a Gamepad would let a page take
+ * them over. So these report "nothing connected" and "cannot vibrate",
+ * which is what the specification says to report when there is nothing
+ * to report, and a page that feature-tests them takes its other path.
+ */
+(function(){
+ var n=W.navigator;
+ if(n&&typeof n.getGamepads!=='function')
+  n.getGamepads=function(){return [];};
+ if(n&&typeof n.vibrate!=='function')
+  n.vibrate=function(){return false;};
+ if(n&&typeof n.getBattery!=='function'){
+  n.getBattery=function(){return Promise.resolve({
+   charging:true,chargingTime:0,dischargingTime:Infinity,level:1,
+   onchargingchange:null,onchargingtimechange:null,
+   ondischargingtimechange:null,onlevelchange:null,
+   addEventListener:function(){},removeEventListener:function(){},
+   dispatchEvent:function(){return true;}});};}
+ ['ongamepadconnected','ongamepaddisconnected'].forEach(function(k){
+  if(!(k in W))W[k]=null;
+  if(!(k in P))P[k]=null;});
+ if(W.GamepadEvent&&W.GamepadEvent.prototype&&
+    !('gamepad' in W.GamepadEvent.prototype)){
+  try{Object.defineProperty(W.GamepadEvent.prototype,'gamepad',
+   {configurable:true,get:function(){return this.__vitaGamepad||null;}});}
+  catch(e){}}
+ if(W.PerformanceObserver&&
+    !('supportedEntryTypes' in W.PerformanceObserver)){
+  try{Object.defineProperty(W.PerformanceObserver,'supportedEntryTypes',
+   {configurable:true,
+    get:function(){return ['mark','measure','navigation','resource'];}});}
+  catch(e){}}
+})();
 (function(){var N=W.Notification;if(!N)return;var p=N.prototype;
  p.actions=[];p.badge='';p.dir='auto';p.image='';p.lang='';p.navigate='';
  p.renotify=false;p.requireInteraction=false;p.silent=null;p.timestamp=0;p.vibrate=[];})();
