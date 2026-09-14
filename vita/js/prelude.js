@@ -103,7 +103,15 @@ P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,lef
 P.getClientRects=function(){var r=this.getBoundingClientRect();return r.width||r.height?[r]:[];};
 P.focus=P.blur=P.select=function(){};
 P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=viewport(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
+/* A disabled form control is not clickable: click() on one dispatches
+   nothing at all. Dispatching a click at it explicitly still works,
+   which is the difference the tests turn on. */
+var FORM_CONTROLS=' BUTTON INPUT SELECT TEXTAREA FIELDSET OPTGROUP OPTION ';
+function isDisabledControl(el){
+ return !!el&&el.nodeType===1&&
+  FORM_CONTROLS.indexOf(' '+el.tagName+' ')>=0&&!!el.disabled;}
 P.click=function(){
+ if(isDisabledControl(this))return true;
  var e=new MouseEvent('click',{bubbles:true,cancelable:true,composed:true});
  return this.dispatchEvent(e);};
 P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return false;};
@@ -664,13 +672,14 @@ function otherActivation(el){
  if(!el||el.nodeType!==1)return null;
  tag=el.tagName;
  if(tag==='INPUT'||tag==='BUTTON'){
+  if(el.disabled)return null;
   t=String(el.type||'').toLowerCase();
   if(tag==='BUTTON'&&t==='')t='submit';
   form=el.form;
   if(!form)return null;
   if(t==='submit'||t==='image')
    return {kind:'submit',form:form,submitter:el};
-  if(t==='reset')return {kind:'reset',form:form};
+  if(t==='reset')return {kind:'reset',form:form,submitter:el};
   return null;}
  if(tag==='SUMMARY'){
   n=el.parentNode;
@@ -681,9 +690,16 @@ function otherActivation(el){
 function runActivation(a){
  if(!a)return;
  if(a.kind==='submit'){
+  /* the state is read again here, after the listeners have run: one of
+     them may have disabled the button or changed what it is, and a form
+     that is not in a document does not submit at all */
+  if(a.submitter&&a.submitter.disabled)return;
+  if(!inDocument(a.form))return;
   if(a.form.requestSubmit)a.form.requestSubmit(a.submitter);
   return;}
- if(a.kind==='reset'){if(a.form.reset)a.form.reset();return;}
+ if(a.kind==='reset'){
+  if(a.submitter&&a.submitter.disabled)return;
+  if(a.form.reset)a.form.reset();return;}
  if(a.kind==='details'){
   var open=!a.el.hasAttribute('open');
   if(open)a.el.setAttribute('open','');else a.el.removeAttribute('open');
@@ -1188,14 +1204,26 @@ var WINDOW_HANDLERS=('afterprint beforeprint beforeunload hashchange languagecha
 'messageerror offline online pagehide pagereveal pageshow pageswap popstate rejectionhandled '+
 'storage unhandledrejection unload').split(' ');
 var DOCUMENT_HANDLERS=['readystatechange','visibilitychange'];
+var HANDLER_NAMES={};
 function defineHandler(obj,type){
+ HANDLER_NAMES['on'+type]=true;
  var prop='on'+type, slot='__on_'+type, wrapped='__onw_'+type;
- Object.defineProperty(obj,prop,{configurable:true,
+ /* enumerable, as an IDL attribute is: code walks an element with
+    for..in to find the event surface, and these were invisible to it */
+ Object.defineProperty(obj,prop,{configurable:true,enumerable:true,
   get:function(){return this[slot]||null;},
   set:function(f){
    var self=this;
    if(!Object.prototype.hasOwnProperty.call(this,wrapped)){
-    var w=function(e){var h=self[slot];if(typeof h==='function')return h.call(self,e);};
+    var w=function(e){
+     var h=self[slot];
+     if(typeof h!=='function')return;
+     var r=h.call(self,e);
+     /* a handler property that returns false cancels the event, the
+        same as an inline handler that does: form.onsubmit = () => false
+        submitted anyway without this */
+     if(r===false&&e&&e.preventDefault)e.preventDefault();
+     return r;};
     Object.defineProperty(this,wrapped,{value:w,writable:true,enumerable:false,configurable:true});
     if(typeof this.addEventListener==='function')this.addEventListener(type,w);
    }
@@ -1206,6 +1234,46 @@ function defineHandler(obj,type){
 EVENT_HANDLERS.forEach(function(t){defineHandler(P,t);defineHandler(D,t);defineHandler(W,t);});
 WINDOW_HANDLERS.forEach(function(t){defineHandler(W,t);defineHandler(P,t);});
 DOCUMENT_HANDLERS.forEach(function(t){defineHandler(D,t);});
+/* An on-something content attribute set after parsing compiles into a
+   handler too. Only the ones present at parse time were wired up, so
+   el.setAttribute('onclick', '...') set a string and nothing else, and
+   removing the attribute left the handler behind. */
+function makeHandler(src){
+ try{
+  return new Function('event',
+   'var __r=(function(event){'+src+'\n}).call(this,event);'+
+   'if(__r===false&&event&&event.preventDefault)event.preventDefault();'+
+   'return __r;');
+ }catch(e){return null;}}
+(function(){
+ var setA=P.setAttribute,rmA=P.removeAttribute;
+ P.setAttribute=function(n,v){
+  var r=setA.apply(this,arguments),name=String(n).toLowerCase();
+  if(HANDLER_NAMES[name]){
+   var f=makeHandler(String(v));
+   if(f)this[name]=f;}
+  return r;};
+ P.removeAttribute=function(n){
+  var name=String(n).toLowerCase();
+  if(HANDLER_NAMES[name])this[name]=null;
+  return rmA.apply(this,arguments);};})();
+/* The body's window-reflecting handlers are the window's: body.onload =
+   f installs on the window, which is how a lot of pages register one,
+   and reading it back gives what the window has. Only body and frameset
+   forward; on any other element the property is its own. */
+var FORWARDED=('blur error focus load resize scroll afterprint beforeprint '+
+ 'beforeunload hashchange languagechange message messageerror offline '+
+ 'online pagehide pageshow popstate rejectionhandled storage '+
+ 'unhandledrejection unload').split(' ');
+FORWARDED.forEach(function(type){
+ var prop='on'+type,d=Object.getOwnPropertyDescriptor(P,prop);
+ if(!d||!d.get)return;
+ function forwards(el){
+  var t=el&&el.tagName;
+  return t==='BODY'||t==='FRAMESET';}
+ Object.defineProperty(P,prop,{configurable:true,enumerable:true,
+  get:function(){return forwards(this)?W[prop]:d.get.call(this);},
+  set:function(f){if(forwards(this))W[prop]=f;else d.set.call(this,f);}});});
 
 /* --- the event interfaces, with the fields handlers read ---------------- */
 function UIEventC(type,init){Event.call(this,type,init);init=init||{};
