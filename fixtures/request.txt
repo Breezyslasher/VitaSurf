@@ -1,2 +1,2 @@
 url=https://github.com/
-name=github-now
+name=github-live2
