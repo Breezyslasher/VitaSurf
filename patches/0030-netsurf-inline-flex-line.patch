@@ -1,0 +1,31 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index cfb154c9d..1228ac48d 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -3358,7 +3358,8 @@ layout_line(struct box *first,
+ 	for (d = first; d != b; d = d->next) {
+ 		d->flags &= ~NEW_LINE;
+ 
+-		if (d->type == BOX_INLINE_BLOCK &&
++		if ((d->type == BOX_INLINE_BLOCK ||
++				d->type == BOX_INLINE_FLEX) &&
+ 				(css_computed_position(d->style) ==
+ 						CSS_POSITION_ABSOLUTE ||
+ 				 css_computed_position(d->style) ==
+@@ -3383,8 +3384,14 @@ layout_line(struct box *first,
+ 				used_height = d->height;
+ 			}
+ 		} else if ((d->type == BOX_INLINE) ||
+-				d->type == BOX_INLINE_BLOCK) {
+-			/* replaced inlines and inline-blocks */
++				d->type == BOX_INLINE_BLOCK ||
++				d->type == BOX_INLINE_FLEX) {
++			/* replaced inlines, inline-blocks and inline flex
++			 * and grid containers. Without BOX_INLINE_FLEX here
++			 * such a box never had its line position set and
++			 * never gave the line its height, so the line was
++			 * as tall as its text and whatever followed was
++			 * drawn on top of it (VitaSurf) */
+ 			d->x += x0;
+ 			d->y = *y + d->border[TOP].width + d->margin[TOP];
+ 			h = d->margin[TOP] + d->border[TOP].width +
