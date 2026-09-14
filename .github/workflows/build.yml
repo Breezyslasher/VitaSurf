@@ -68,6 +68,19 @@ jobs:
             VDPM_NONINTERACTIVE=1 vdpm remove --nodeps --nodeps curl
           fi
           VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d quickjs-ng
+          # Extra image decoders. NetSurf detects these with pkg-config
+          # and builds without them if they are absent, so a toolchain
+          # that has no package for one must not fail the build here.
+          for opt in libwebp libjxl; do
+            VDPM_NONINTERACTIVE=1 vdpm "$opt" || echo "note: vdpm has no $opt; that format stays off"
+          done
+          for lib in libwebp libjxl; do
+            if PKG_CONFIG_PATH="$VITASDK/arm-vita-eabi/lib/pkgconfig" pkg-config --exists "$lib" 2>/dev/null; then
+              echo "image decoder available: $lib"
+            else
+              echo "image decoder NOT available: $lib"
+            fi
+          done
 
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh

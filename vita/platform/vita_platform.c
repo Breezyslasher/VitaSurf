@@ -31,6 +31,8 @@
 #include <sys/time.h>
 
 #include "utils/nsoption.h"
+#include "content/content_factory.h"
+#include "netsurf/content_type.h"
 
 #include <mbedtls/error.h>
 #include <mbedtls/version.h>
@@ -81,6 +83,68 @@ void vita_options_floor(void)
 	vita_log("options: %d fetchers, %d per host",
 		 nsoption_int(max_fetchers),
 		 nsoption_int(max_fetchers_per_host));
+}
+
+/*
+ * Which image formats this build can actually decode.
+ *
+ * The answer is not a compile-time constant here: the WebP and JPEG XL
+ * handlers are built only if pkg-config finds libwebp and libjxl in the
+ * toolchain, and the flags that decide it belong to NetSurf's build, not
+ * to this file's. So ask the content factory, which knows what actually
+ * registered, and log it once at startup. A page that arrives as a grey
+ * box is then one line away from an explanation.
+ */
+void vita_log_image_decoders(void)
+{
+	static const struct {
+		const char *mime;
+		const char *name;
+	} types[] = {
+		{ "image/png",		"png" },
+		{ "image/jpeg",		"jpeg" },
+		{ "image/gif",		"gif" },
+		{ "image/bmp",		"bmp" },
+		{ "image/x-icon",	"ico" },
+		{ "image/svg+xml",	"svg" },
+		{ "image/webp",		"webp" },
+		{ "image/jxl",		"jxl" },
+	};
+	char have[256];
+	char missing[256];
+	unsigned int nhave = 0;
+	unsigned int nmissing = 0;
+	unsigned int i;
+
+	have[0] = '\0';
+	missing[0] = '\0';
+
+	for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+		lwc_string *mime;
+		content_type type = CONTENT_NONE;
+
+		if (lwc_intern_string(types[i].mime, strlen(types[i].mime),
+				      &mime) != lwc_error_ok) {
+			continue;
+		}
+		type = content_factory_type_from_mime_type(mime);
+		lwc_string_unref(mime);
+
+		if (type != CONTENT_NONE) {
+			snprintf(have + strlen(have),
+				 sizeof(have) - strlen(have),
+				 "%s%s", nhave++ ? " " : "", types[i].name);
+		} else {
+			snprintf(missing + strlen(missing),
+				 sizeof(missing) - strlen(missing),
+				 "%s%s", nmissing++ ? " " : "", types[i].name);
+		}
+	}
+
+	vita_log("image decoders: %s", nhave ? have : "none");
+	if (nmissing > 0) {
+		vita_log("image decoders missing: %s", missing);
+	}
 }
 
 void vita_log_memory(const char *what)

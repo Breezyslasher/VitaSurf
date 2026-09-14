@@ -90,6 +90,12 @@ void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vita_log_memory(const char *what);
 
 /**
+ * Log which image formats registered a content handler. Call after
+ * netsurf_init(), which is what registers them.
+ */
+void vita_log_image_decoders(void);
+
+/**
  * Bring up SceNet and SceNetCtl (vita_net.c). Must run before NetSurf
  * initialises libcurl. Returns 0 on success; failure leaves the browser
  * usable for local pages only.

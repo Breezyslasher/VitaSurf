@@ -1,0 +1,37 @@
+<!DOCTYPE html><html data-color-mode="light" data-light-theme="light" class="theme-x">
+<head><title>csstokens</title><style>
+/* Custom properties are substituted at parse time here (patch 0014),
+   before any element exists, so a definition is only collected when its
+   selector can be recognised as addressing the document root by name.
+   Themes are not written that way: a site scopes its tokens to an
+   attribute or a class on <html> and switches theme by changing it. */
+:root { --plain: none; }
+[data-color-mode=light][data-light-theme=light] { --attrtok: none; }
+html.theme-x { --classtok: none; }
+html[data-color-mode] { --htmlattr: none; }
+:root, [data-color-mode=light][data-light-theme=light] { --listtok: none; }
+#a { display: var(--plain); }
+#b { display: var(--attrtok); }
+#c { display: var(--classtok); }
+#d { display: var(--htmlattr); }
+#e { display: var(--listtok); }
+</style></head><body>
+<pre id="out"></pre>
+<p id="a">x</p><p id="b">x</p><p id="c">x</p><p id="d">x</p><p id="e">x</p>
+<p id="f">x</p>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function boxed(id){var e=document.getElementById(id);
+ var r=e.getBoundingClientRect();
+ return (r.width===0&&r.height===0)?'resolved':'unresolved';}
+function report(){
+ T('root selector', boxed('a'));
+ T('attribute scoped', boxed('b'));
+ T('class scoped', boxed('c'));
+ T('html with attribute', boxed('d'));
+ T('root in a selector list', boxed('e'));
+ T('control has no rule', boxed('f'));
+}
+window.addEventListener('load', function(){ setTimeout(report, 300); });
+</script></body></html>
