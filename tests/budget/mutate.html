@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html><body><div id="host">t</div>
+<script>
+/* A runaway that mutates the DOM under an observer on every pass, the
+   shape YouTube's bootstrap had. No allocation: the point is the abort,
+   not memory. */
+var host = document.getElementById('host');
+var seen = 0;
+new MutationObserver(function(recs){ seen += recs.length; }).observe(host, {attributes:true});
+var start = Date.now(), passes = 0;
+try {
+  for (;;) {
+    host.setAttribute('data-n', passes & 1);
+    passes++;
+    if ((passes & 1023) === 0 && Date.now() - start > 90000) break;  /* backstop */
+  }
+} catch (e) {
+  console.log('runaway caught: ' + e);
+}
+console.log('runaway left the loop after ' + passes + ' passes, ' +
+            (Date.now() - start) + ' ms, ' + seen + ' mutations seen');
+</script>
+</body></html>

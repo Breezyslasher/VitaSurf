@@ -4637,16 +4637,16 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
  * error event never fired, so a script that installs a handler to fall
  * back when something throws heard nothing at all.
  */
-/* A diagnostic, not a shim. GitHub has reported "Unexpected token 'y'
- * in JSON" on every load for many builds and I do not know why. The
- * first byte was not the problem -- a check on it never fired -- so say
- * where the first byte that cannot be in JSON actually is, with the
- * bytes around it. Costs nothing until a parse fails.
+/* A diagnostic, not a shim, for one specific fault: a JSON body that
+ * arrived with its bytes mangled. It says where the first byte that
+ * cannot be in JSON is, with the bytes around it. Costs nothing until a
+ * parse fails.
  *
- * Capped, because a failed parse is not always a fault: Polymer decides
- * whether an attribute holds JSON by parsing it and catching, so every
- * "[[binding]]" in a template fails by design. YouTube produced forty
- * of these in a load, each one flushed to the memory card. */
+ * Only mangled text is reported. A failed parse on its own is not a
+ * fault: Polymer decides whether an attribute holds JSON by parsing it
+ * and catching, so every "[[binding]]" in a template fails by design.
+ * YouTube produced forty of those in a load, each one a line flushed to
+ * the memory card, and none of them a problem. */
 (function(){
  var real=JSON.parse,said=0;
  JSON.parse=function(text,reviver){
@@ -4655,14 +4655,14 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
    try{
     var s=String(text),i,bad=-1;
     for(i=0;i<s.length;i++)if(s.charCodeAt(i)>127){bad=i;break;}
-    var at=bad<0?0:Math.max(0,bad-8),hex='',c;
-    for(i=at;i<Math.min(s.length,at+24);i++){
-     c=(s.charCodeAt(i)&0xffff).toString(16);
-     hex+=(c.length<2?'0':'')+c+' ';}
-    if(said<3){
+    if(bad>=0&&said<3){
+     var at=Math.max(0,bad-8),hex='',c;
+     for(i=at;i<Math.min(s.length,at+24);i++){
+      c=(s.charCodeAt(i)&0xffff).toString(16);
+      hex+=(c.length<2?'0':'')+c+' ';}
      said++;
-     console.log('json parse failed: '+String(e).slice(0,60)+
-      '; length '+s.length+', first byte over 127 at '+bad+
+     console.log('json parse failed on text with a byte over 127: '+
+      String(e).slice(0,60)+'; length '+s.length+', byte at '+bad+
       ', bytes '+hex+', text '+JSON.stringify(s.slice(at,at+40))+
       (said===3?' (further ones not logged)':''));}
    }catch(x){}

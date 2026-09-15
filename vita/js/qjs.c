@@ -136,6 +136,8 @@ struct jsthread {
 	 * YouTube did that for eighteen minutes and wrote eighteen
 	 * thousand identical lines, each one flushed to the memory card.
 	 */
+	unsigned script_depth;    /**< nested entries from C into script */
+	bool aborting;            /**< the budget is unwinding a script */
 	unsigned overrun_count;   /**< interrupts past the deadline */
 	uint64_t overrun_said_ms; /**< when that was last logged */
 	const char *current_script; /**< URL of the script js_exec is running */
@@ -252,23 +254,42 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 		uint64_t now = now_ms();
 
 		thread->overrun_count++;
-		/* The first one, then at most one line every 30 seconds:
-		 * a script that keeps catching the abort is worth saying
-		 * out loud, but only as often as it takes to see it. */
+		/* The first one, then at most one line every 30 seconds.
+		 * The abort is uncatchable, so a second interrupt means
+		 * the script resumed some other way -- a fresh call in
+		 * from C, or a callback whose exception was dropped --
+		 * and that is worth saying out loud, but only as often
+		 * as it takes to see it. */
 		if (thread->overrun_count == 1) {
 			vita_log("qjs: script exceeded its time budget: %s",
 				 thread->current_script != NULL ?
 				 thread->current_script : "?");
 			thread->overrun_said_ms = now;
 		} else if (now - thread->overrun_said_ms >= 30000) {
-			vita_log("qjs: script still over budget after %u "
-				 "interrupts, and still catching them",
+			vita_log("qjs: script still over budget, aborted %u "
+				 "times and resumed every time",
 				 thread->overrun_count);
 			thread->overrun_said_ms = now;
 		}
+		thread->aborting = true;
 		return 1; /* abort */
 	}
 	return 0;
+}
+
+/*
+ * True while the time budget is unwinding a script on this context.
+ *
+ * The value QuickJS throws for an interrupt is null, not an Error, so
+ * there is nothing in the exception itself to recognise it by -- and
+ * merely fetching it with JS_GetException clears the flag that makes it
+ * uncatchable. C code asks here instead, and leaves the exception alone.
+ */
+static bool qjs_budget_abort(JSContext *ctx)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	return thread != NULL && thread->aborting;
 }
 
 /** QuickJS's own allocation total for the runtime, in KB. */
@@ -337,8 +358,22 @@ static void js_free_deferred(jsthread *thread);
 static void qjs_report_exception_src(JSContext *ctx, const char *name,
 				     const char *src, size_t len)
 {
-	JSValue exc = JS_GetException(ctx);
-	const char *msg = JS_ToCString(ctx, exc);
+	JSValue exc;
+	const char *msg;
+
+	/*
+	 * The time-budget abort is not the page's error to hear about. It
+	 * is already logged where it was raised, and fetching it here to
+	 * report it would clear it -- which is how a script that overran
+	 * inside a callback used to carry on. Leave it pending and let it
+	 * keep unwinding; end_script drops it once the outermost call into
+	 * script is over.
+	 */
+	if (qjs_budget_abort(ctx)) {
+		return;
+	}
+	exc = JS_GetException(ctx);
+	msg = JS_ToCString(ctx, exc);
 
 	vita_log("qjs: uncaught %s", msg != NULL ? msg : "(error)");
 	if (msg != NULL) {
@@ -407,6 +442,30 @@ static bool qjs_error_mentions(JSContext *ctx, JSValueConst err,
 	found = strstr(msg, needle) != NULL;
 	JS_FreeCString(ctx, msg);
 	return found;
+}
+
+/**
+ * Deal with an exception from a JS call made under a running script.
+ *
+ * QuickJS marks the time-budget abort uncatchable on purpose, so that
+ * nothing can swallow it and let a runaway script carry on. C code that
+ * clears the pending exception defeats exactly that. A mutation
+ * notification is called from inside whatever script did the mutating,
+ * so clearing there meant the budget could never stop a script that
+ * touches the DOM: YouTube's bootstrap ran four minutes past its
+ * twenty seconds, aborted thirty-three times a second and resumed every
+ * time, because each abort landed on a mutation callback and stopped
+ * here.
+ *
+ * An ordinary error in a callback is still contained. Only the abort
+ * goes back up, to reach the script it was meant for.
+ */
+static void qjs_absorb_or_rethrow(JSContext *ctx)
+{
+	if (qjs_budget_abort(ctx)) {
+		return;		/* leave it pending, and uncatchable */
+	}
+	JS_FreeValue(ctx, JS_GetException(ctx));
 }
 
 /** A dom_string from a NUL-terminated C string, or NULL. */
@@ -667,7 +726,7 @@ static void notify_mutation_ns(JSContext *ctx, const char *kind,
 		args[4] = extra;
 		r = JS_Call(ctx, fn, global, 5, args);
 		if (JS_IsException(r)) {
-			JS_FreeValue(ctx, JS_GetException(ctx));
+			qjs_absorb_or_rethrow(ctx);
 		}
 		JS_FreeValue(ctx, r);
 		JS_FreeValue(ctx, args[0]);
@@ -2975,8 +3034,15 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 /* Lower bound on script_timeout, in seconds. See js_newheap(). */
 #define SCRIPT_TIMEOUT_MIN 20
 
-static void begin_script(jsthread *thread)
+/*
+ * Arm the deadline afresh without opening a nesting level. Compiling is
+ * not interruptible -- QuickJS's parser never calls the interrupt
+ * handler -- so a bundle that takes longer to compile than the whole
+ * budget must not have that time charged against its run.
+ */
+static void rearm_deadline(jsthread *thread)
 {
+	thread->aborting = false;
 	thread->overrun_count = 0;
 	thread->overrun_said_ms = 0;
 	if (thread->heap->timeout > 0) {
@@ -2987,16 +3053,48 @@ static void begin_script(jsthread *thread)
 	}
 }
 
+/*
+ * These nest. Script reaches back into C and C calls into script again
+ * all the time -- a listener run from dispatchEvent(), a module settled
+ * inside the script that imported it -- and each of those is part of the
+ * work the outer script is doing, not a new piece of work with a budget
+ * of its own. Without the depth count an inner call re-armed the
+ * deadline, handing the outer script another twenty seconds every time
+ * it fired an event, and its end_script then cleared the deadline
+ * outright, leaving the rest of that script with no budget at all.
+ * Draining microtasks belongs to the outermost call for the same
+ * reason: that is where a script actually finishes.
+ */
+static void begin_script(jsthread *thread)
+{
+	if (thread->script_depth++ > 0) {
+		return;
+	}
+	rearm_deadline(thread);
+}
+
 static void schedule_relayout(jsthread *thread, int ms);
 
 static void end_script(jsthread *thread)
 {
+	if (thread->script_depth > 0 && --thread->script_depth > 0) {
+		return;
+	}
+	thread->script_depth = 0;
 	if (thread->overrun_count > 1) {
 		vita_log("qjs: that script was interrupted %u times before "
 			 "it stopped", thread->overrun_count);
 	}
 	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
+	thread->aborting = false;
+	/* The outermost call is over, so nothing is still unwinding. An
+	 * exception left pending here is one that was reported already, or
+	 * the budget abort on its way out; either way the jobs below must
+	 * not start with it hanging over them. */
+	if (JS_HasException(thread->ctx)) {
+		JS_FreeValue(thread->ctx, JS_GetException(thread->ctx));
+	}
 	/* run microtasks (promise jobs) the script queued */
 	for (;;) {
 		JSContext *c = NULL;
@@ -4670,7 +4768,7 @@ static void qjs_rejection_tracker(JSContext *ctx, JSValueConst promise,
 		args[1] = JS_DupValue(ctx, promise);
 		r = JS_Call(ctx, fn, global, 2, args);
 		if (JS_IsException(r)) {
-			JS_FreeValue(ctx, JS_GetException(ctx));
+			qjs_absorb_or_rethrow(ctx);
 		}
 		JS_FreeValue(ctx, r);
 		JS_FreeValue(ctx, args[0]);
@@ -5467,7 +5565,7 @@ static void module_retry_callback(void *p)
 			set_import_meta(thread->ctx, fn, d->name);
 			vita_log("qjs: module '%s' ready after %d tries",
 				 d->name, d->tries + 1);
-			begin_script(thread);
+			rearm_deadline(thread);
 			ret = settle_module(thread,
 					    JS_EvalFunction(thread->ctx, fn),
 					    d->name);
@@ -5665,7 +5763,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			 * that took longer to compile than script_timeout was
 			 * aborted at its first statement.
 			 */
-			begin_script(thread);
+			rearm_deadline(thread);
 			ret = JS_EvalFunction(thread->ctx, fn);
 			/*
 			 * QuickJS checks a global let or const against the
@@ -5694,7 +5792,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 						JS_FreeValue(thread->ctx, err);
 						module = true;
 						set_import_meta(thread->ctx, m, name);
-						begin_script(thread);
+						rearm_deadline(thread);
 						ret = JS_EvalFunction(thread->ctx, m);
 					} else {
 						JS_FreeValue(thread->ctx,
