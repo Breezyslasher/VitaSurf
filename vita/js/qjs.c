@@ -356,6 +356,11 @@ static void log_source_excerpt(const char *stack, const char *name,
  * is known (name, src, len), the offending source line is logged too.
  */
 static void js_free_deferred(jsthread *thread);
+/* Persistent storage, defined with the rest of the on-disk code below. */
+static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv);
+static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv);
 static void qjs_report_exception_src(JSContext *ctx, const char *name,
 				     const char *src, size_t len)
 {
@@ -4648,6 +4653,12 @@ static void setup_globals(jsthread *thread)
 					  "__vitaCreateIn", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaScrollTo",
 			  JS_NewCFunction(ctx, win_vita_scroll_to, "__vitaScrollTo", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaStoreLoad",
+			  JS_NewCFunction(ctx, win_vita_store_load,
+					  "__vitaStoreLoad", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaStoreSave",
+			  JS_NewCFunction(ctx, win_vita_store_save,
+					  "__vitaStoreSave", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaDispatch",
 			  JS_NewCFunction(ctx, win_vita_dispatch, "__vitaDispatch", 2));
 
@@ -4718,6 +4729,12 @@ static void setup_globals(jsthread *thread)
 			JS_FreeValue(ctx, r);
 		}
 		nsu_getmonotonic_ms(&t1);
+		/*
+		 * Once per page, before a line of the page's own script.
+		 * A quarter of a second of every load on the device, and
+		 * it was in none of the buckets.
+		 */
+		vitasurf_ms_prelude += (unsigned int)(t1 - t0);
 		vita_log("qjs: prelude %u KB ran in %u ms (%s)",
 			 (unsigned int)(len / 1024),
 			 (unsigned int)(t1 - t0),
@@ -5382,6 +5399,297 @@ static void bc_store(JSContext *ctx, const char *url,
 	bc_index_save();
 	vita_log("qjs: cached %u KB of bytecode for %u KB of source",
 		 (unsigned)(out_len / 1024), (unsigned)(srclen / 1024));
+}
+
+/* ------------------------------------------------------------------------ */
+/* Persistent storage                                                       */
+
+/*
+ * One file per origin under ux0:data/VitaSurf/storage, holding everything
+ * that origin has stored: localStorage and IndexedDB both sit on this.
+ *
+ * Neither had anywhere to go before. localStorage was a plain object that
+ * went with the page, shared by every site, and IndexedDB was missing, so
+ * claude.ai reported no storage for its session and read its persisted
+ * state back as a rejection on every load.
+ *
+ * The origin is worked out here from the document's own URL, not passed
+ * in from script: these functions sit on the global object where a page
+ * can reach them, and a page that could name its own origin could read
+ * another site's storage.
+ *
+ * The whole origin is read and written at once. That is the wrong shape
+ * for a database and the right one for a memory card, where the cost is
+ * per file rather than per byte, and the writing is deferred so a burst
+ * of puts is one write.
+ */
+
+#define STORE_MAX_ORIGIN (4u * 1024 * 1024)	/* one site */
+#define STORE_BUDGET     (32u * 1024 * 1024)	/* all of them */
+#define STORE_MAX_FILES  64
+
+/** scheme://host:port for a URL, or NULL for one with no host. */
+static char *origin_of(nsurl *url)
+{
+	lwc_string *scheme = NULL, *host = NULL;
+	char *out = NULL;
+
+	if (url == NULL) {
+		return NULL;
+	}
+	scheme = nsurl_get_component(url, NSURL_SCHEME);
+	host = nsurl_get_component(url, NSURL_HOST);
+	if (scheme != NULL && host != NULL) {
+		lwc_string *port = nsurl_get_component(url, NSURL_PORT);
+		size_t n = lwc_string_length(scheme) + lwc_string_length(host) +
+			(port != NULL ? lwc_string_length(port) : 0) + 8;
+
+		out = malloc(n);
+		if (out != NULL) {
+			snprintf(out, n, "%.*s://%.*s%s%.*s",
+				 (int)lwc_string_length(scheme),
+				 lwc_string_data(scheme),
+				 (int)lwc_string_length(host),
+				 lwc_string_data(host),
+				 port != NULL ? ":" : "",
+				 port != NULL ? (int)lwc_string_length(port) : 0,
+				 port != NULL ? lwc_string_data(port) : "");
+		}
+		if (port != NULL) lwc_string_unref(port);
+	} else if (scheme != NULL) {
+		/*
+		 * file: has no host. Every local page shares one store,
+		 * which is what a browser does with file: URLs too.
+		 */
+		out = strdup("file://");
+	}
+	if (scheme != NULL) lwc_string_unref(scheme);
+	if (host != NULL) lwc_string_unref(host);
+	return out;
+}
+
+static void store_path(char *buf, size_t n, const char *origin)
+{
+	uint64_t h = bc_hash(origin, strlen(origin));
+
+	snprintf(buf, n, "%s/%08x%08x.kv", VITASURF_STORAGE_DIR,
+		 (unsigned)(h >> 32), (unsigned)(h & 0xffffffffu));
+}
+
+/*
+ * The index, as for compiled scripts: the names and sizes of the files
+ * written, so the oldest can go when the budget is reached without
+ * reading the directory.
+ */
+static struct bc_entry store_index[STORE_MAX_FILES];
+static unsigned store_index_n;
+static uint32_t store_stamp;
+static bool store_index_read;
+
+static void store_index_load(void)
+{
+	char path[256];
+	FILE *f;
+
+	if (store_index_read) {
+		return;
+	}
+	store_index_read = true;
+	snprintf(path, sizeof(path), "%s/index", VITASURF_STORAGE_DIR);
+	f = fopen(path, "rb");
+	if (f == NULL) {
+		return;
+	}
+	while (store_index_n < STORE_MAX_FILES) {
+		struct bc_entry *e = &store_index[store_index_n];
+		unsigned bytes = 0, stamp = 0;
+
+		if (fscanf(f, "%23s %u %u", e->name, &bytes, &stamp) != 3) {
+			break;
+		}
+		e->bytes = bytes;
+		e->stamp = stamp;
+		if (stamp > store_stamp) {
+			store_stamp = stamp;
+		}
+		store_index_n++;
+	}
+	fclose(f);
+}
+
+static void store_index_save(void)
+{
+	char path[256];
+	FILE *f;
+	unsigned i;
+
+	snprintf(path, sizeof(path), "%s/index", VITASURF_STORAGE_DIR);
+	f = fopen(path, "wb");
+	if (f == NULL) {
+		return;
+	}
+	for (i = 0; i < store_index_n; i++) {
+		fprintf(f, "%s %u %u\n", store_index[i].name,
+			(unsigned)store_index[i].bytes,
+			(unsigned)store_index[i].stamp);
+	}
+	fclose(f);
+}
+
+/** Note this file at this size, dropping the least recently used first. */
+static void store_index_note(const char *name, uint32_t bytes)
+{
+	unsigned i;
+
+	store_index_load();
+	for (i = 0; i < store_index_n; i++) {
+		if (strcmp(store_index[i].name, name) == 0) {
+			store_index[i].bytes = bytes;
+			store_index[i].stamp = ++store_stamp;
+			store_index_save();
+			return;
+		}
+	}
+	for (;;) {
+		uint64_t total = bytes;
+		unsigned oldest = 0;
+
+		for (i = 0; i < store_index_n; i++) {
+			total += store_index[i].bytes;
+			if (store_index[i].stamp < store_index[oldest].stamp) {
+				oldest = i;
+			}
+		}
+		if (store_index_n == 0 ||
+		    (total <= STORE_BUDGET && store_index_n < STORE_MAX_FILES)) {
+			break;
+		}
+		{
+			char path[256];
+
+			snprintf(path, sizeof(path), "%s/%s",
+				 VITASURF_STORAGE_DIR, store_index[oldest].name);
+			remove(path);
+			vita_log("storage: full, dropping %s (%u KB)",
+				 store_index[oldest].name,
+				 (unsigned)(store_index[oldest].bytes / 1024));
+			memmove(&store_index[oldest], &store_index[oldest + 1],
+				(store_index_n - oldest - 1) *
+				sizeof(store_index[0]));
+			store_index_n--;
+		}
+	}
+	if (store_index_n < STORE_MAX_FILES) {
+		snprintf(store_index[store_index_n].name,
+			 sizeof(store_index[0].name), "%s", name);
+		store_index[store_index_n].bytes = bytes;
+		store_index[store_index_n].stamp = ++store_stamp;
+		store_index_n++;
+	}
+	store_index_save();
+}
+
+/** __vitaStoreLoad(): everything this origin has stored, or null. */
+static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	char path[256], *origin, *buf;
+	long len;
+	FILE *f;
+	JSValue out;
+
+	(void)this_val; (void)argc; (void)argv;
+	if (thread == NULL || thread->htmlc == NULL) {
+		return JS_NULL;
+	}
+	origin = origin_of(thread->htmlc->base_url);
+	if (origin == NULL) {
+		return JS_NULL;
+	}
+	store_path(path, sizeof(path), origin);
+	free(origin);
+	f = fopen(path, "rb");
+	if (f == NULL) {
+		return JS_NULL;
+	}
+	fseek(f, 0, SEEK_END);
+	len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (len <= 0 || (unsigned long)len > STORE_MAX_ORIGIN) {
+		fclose(f);
+		return JS_NULL;
+	}
+	buf = malloc((size_t)len + 1);
+	if (buf == NULL) {
+		fclose(f);
+		return JS_NULL;
+	}
+	if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
+		free(buf);
+		fclose(f);
+		return JS_NULL;
+	}
+	fclose(f);
+	buf[len] = 0;
+	out = JS_NewStringLen(ctx, buf, (size_t)len);
+	free(buf);
+	return out;
+}
+
+/** __vitaStoreSave(text): replace everything this origin has stored. */
+static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	char path[256], tmp[264], *origin;
+	const char *text;
+	size_t len = 0;
+	FILE *f;
+	bool ok = false;
+
+	(void)this_val;
+	if (thread == NULL || thread->htmlc == NULL || argc < 1) {
+		return JS_FALSE;
+	}
+	origin = origin_of(thread->htmlc->base_url);
+	if (origin == NULL) {
+		return JS_FALSE;
+	}
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (text == NULL) {
+		free(origin);
+		return JS_FALSE;
+	}
+	if (len > STORE_MAX_ORIGIN) {
+		vita_log("storage: %s wanted %u KB, over the %u KB a site gets",
+			 origin, (unsigned)(len / 1024),
+			 (unsigned)(STORE_MAX_ORIGIN / 1024));
+		JS_FreeCString(ctx, text);
+		free(origin);
+		return JS_FALSE;
+	}
+	store_path(path, sizeof(path), origin);
+	free(origin);
+	/* beside its own name and renamed over it, as for the script cache */
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	f = fopen(tmp, "wb");
+	if (f != NULL) {
+		ok = fwrite(text, 1, len, f) == len;
+		fclose(f);
+		if (ok) {
+			remove(path);
+			ok = rename(tmp, path) == 0;
+		}
+		if (!ok) {
+			remove(tmp);
+		}
+	}
+	if (ok) {
+		store_index_note(strrchr(path, '/') + 1, (uint32_t)len);
+	}
+	JS_FreeCString(ctx, text);
+	return ok ? JS_TRUE : JS_FALSE;
 }
 
 /*

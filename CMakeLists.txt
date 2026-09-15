@@ -117,7 +117,8 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     set(PRELUDE_PARTS
         vita/js/prelude.js
         vita/js/streams.js
-        vita/js/performance.js)
+        vita/js/performance.js
+        vita/js/storage.js)
     set(PRELUDE_BYTES "")
     foreach(part ${PRELUDE_PARTS})
         set(full "${CMAKE_SOURCE_DIR}/${part}")

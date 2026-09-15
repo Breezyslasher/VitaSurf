@@ -437,6 +437,7 @@ int vita_platform_init(void)
 	 * missing the cache misses, which costs speed and nothing else.
 	 */
 	sceIoMkdir(VITASURF_JSCACHE_DIR, 0777);
+	sceIoMkdir(VITASURF_STORAGE_DIR, 0777);
 
 	/*
 	 * Open the log with a plain fopen first so vita_log() works even if

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>indexeddb</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function say(n, v){ out.push('XX ' + n + ': ' + v); }
+function done(){
+  var o = document.getElementById('out');
+  out.forEach(function(l){ o.textContent += l + '\n';
+    try { console.log(l); } catch (e) {} });
+}
+function fail(where, e){ say('THREW at ' + where, (e && e.name) || e); done(); }
+
+say('has indexedDB', typeof indexedDB);
+say('has IDBKeyRange', typeof IDBKeyRange);
+
+/* key ordering is observable through cmp, and everything else depends on it */
+say('cmp number before string', indexedDB.cmp(1, 'a'));
+say('cmp string before array', indexedDB.cmp('a', ['a']));
+say('cmp equal numbers', indexedDB.cmp(5, 5));
+say('cmp arrays elementwise', indexedDB.cmp([1, 2], [1, 3]));
+say('cmp date before string', indexedDB.cmp(new Date(0), 'a'));
+
+var range = IDBKeyRange.bound(2, 5, false, true);
+say('range includes lower', range.includes(2));
+say('range excludes open upper', range.includes(5));
+say('range middle', range.includes(4));
+say('only range', IDBKeyRange.only(3).includes(3));
+say('lowerBound open', IDBKeyRange.lowerBound(3, true).includes(3));
+
+var DB = 'vitasurf-probe-' + Math.floor(Math.random() * 1e9);
+
+function step1(){
+  var req = indexedDB.open(DB, 1);
+  req.onupgradeneeded = function(e){
+    say('upgradeneeded oldVersion', e.oldVersion);
+    say('upgradeneeded newVersion', e.newVersion);
+    var db = e.target.result;
+    var s = db.createObjectStore('people', { keyPath: 'id' });
+    s.createIndex('byName', 'name', { unique: false });
+    s.createIndex('byEmail', 'email', { unique: true });
+    db.createObjectStore('auto', { autoIncrement: true });
+    say('store names after create', Array.prototype.slice.call(db.objectStoreNames).join(','));
+  };
+  req.onerror = function(){ fail('open', req.error); };
+  req.onsuccess = function(){
+    var db = req.result;
+    say('db name', db.name);
+    say('db version', db.version);
+    say('store names', Array.prototype.slice.call(db.objectStoreNames).join(','));
+    step2(db);
+  };
+}
+
+function step2(db){
+  var tx = db.transaction(['people', 'auto'], 'readwrite');
+  say('transaction mode', tx.mode);
+  say('transaction store names', Array.prototype.slice.call(tx.objectStoreNames).join(','));
+  var s = tx.objectStore('people');
+  say('keyPath', s.keyPath);
+  say('autoIncrement', s.autoIncrement);
+  say('index names', Array.prototype.slice.call(s.indexNames).join(','));
+  s.put({ id: 3, name: 'Carol', email: 'c@x', when: new Date(86400000) });
+  s.put({ id: 1, name: 'Alice', email: 'a@x', tags: ['x', 'y'] });
+  s.put({ id: 2, name: 'Bob', email: 'b@x' });
+  var a = tx.objectStore('auto');
+  a.add('first'); a.add('second');
+  var dup = s.add({ id: 1, name: 'Again', email: 'z@x' });
+  dup.onsuccess = function(){ say('duplicate add', 'succeeded'); };
+  dup.onerror = function(e){
+    say('duplicate add', dup.error.name);
+    e.preventDefault && e.preventDefault();
+    dup._handled = true;
+  };
+  tx.oncomplete = function(){ say('write transaction', 'complete'); step3(db); };
+  tx.onabort = function(){ fail('write tx aborted', tx.error); };
+}
+
+function step3(db){
+  var tx = db.transaction(['people', 'auto'], 'readonly');
+  var s = tx.objectStore('people');
+  s.get(2).onsuccess = function(e){ say('get by key', e.target.result.name); };
+  s.get(99).onsuccess = function(e){ say('get missing', String(e.target.result)); };
+  s.count().onsuccess = function(e){ say('count', e.target.result); };
+  s.getAllKeys().onsuccess = function(e){
+    say('all keys in order', e.target.result.join(','));
+  };
+  s.getAll().onsuccess = function(e){
+    say('all names in key order', e.target.result.map(function(r){ return r.name; }).join(','));
+  };
+  s.getAll(IDBKeyRange.bound(2, 3)).onsuccess = function(e){
+    say('range getAll', e.target.result.map(function(r){ return r.name; }).join(','));
+  };
+  s.get(3).onsuccess = function(e){
+    var r = e.target.result;
+    say('Date survives the round trip', r.when instanceof Date);
+    say('Date value', r.when.getTime());
+  };
+  s.get(1).onsuccess = function(e){
+    say('array survives', Array.isArray(e.target.result.tags));
+    say('array contents', e.target.result.tags.join(','));
+  };
+  var idx = s.index('byName');
+  idx.get('Bob').onsuccess = function(e){ say('index get', e.target.result.id); };
+  idx.getAllKeys().onsuccess = function(e){
+    say('index keys by name order', e.target.result.join(','));
+  };
+  var seen = [];
+  s.openCursor().onsuccess = function(e){
+    var c = e.target.result;
+    if (c) { seen.push(c.key + ':' + c.value.name); c.continue(); }
+    else say('cursor walked', seen.join(' '));
+  };
+  var back = [];
+  s.openCursor(null, 'prev').onsuccess = function(e){
+    var c = e.target.result;
+    if (c) { back.push(c.key); c.continue(); }
+    else say('reverse cursor', back.join(','));
+  };
+  var auto = tx.objectStore('auto');
+  auto.getAllKeys().onsuccess = function(e){ say('auto keys', e.target.result.join(',')); };
+  auto.getAll().onsuccess = function(e){ say('auto values', e.target.result.join(',')); };
+  tx.oncomplete = function(){ say('read transaction', 'complete'); step4(db); };
+}
+
+function step4(db){
+  /* update and delete through a cursor, then abort a transaction */
+  var tx = db.transaction('people', 'readwrite');
+  var s = tx.objectStore('people');
+  s.openCursor(IDBKeyRange.only(2)).onsuccess = function(e){
+    var c = e.target.result;
+    if (c) { c.update({ id: 2, name: 'Bobby', email: 'b@x' }); }
+  };
+  tx.oncomplete = function(){
+    var t2 = db.transaction('people', 'readonly');
+    t2.objectStore('people').get(2).onsuccess = function(e){
+      say('cursor update took', e.target.result.name);
+    };
+    t2.oncomplete = function(){ step5(db); };
+  };
+}
+
+function step5(db){
+  var tx = db.transaction('people', 'readwrite');
+  tx.objectStore('people').delete(3);
+  tx.abort();
+  tx.onabort = function(){
+    say('abort fired', 'yes');
+    var t2 = db.transaction('people', 'readonly');
+    t2.objectStore('people').count().onsuccess = function(e){
+      say('count after abort', e.target.result);
+    };
+    t2.oncomplete = function(){ step6(db); };
+  };
+}
+
+function step6(db){
+  db.close();
+  var req = indexedDB.open(DB, 2);
+  req.onupgradeneeded = function(e){
+    say('second upgrade from', e.oldVersion);
+    e.target.result.createObjectStore('extra');
+  };
+  req.onsuccess = function(){
+    say('version after upgrade', req.result.version);
+    say('stores after upgrade', Array.prototype.slice.call(req.result.objectStoreNames).join(','));
+    req.result.close();
+    var del = indexedDB.deleteDatabase(DB);
+    del.onsuccess = function(){ say('deleteDatabase', 'done'); done(); };
+    del.onerror = function(){ say('deleteDatabase', 'failed'); done(); };
+  };
+  req.onerror = function(){ fail('reopen', req.error); };
+}
+
+try { step1(); } catch (e) { fail('start', e); }
+/* Report whatever was reached. An earlier version of this only printed
+   on a short list, so a stall near the end printed nothing at all. */
+var reported = false;
+var realDone = done;
+done = function(){ if (reported) return; reported = true; realDone(); };
+setTimeout(function(){ if (!reported) { say('STOPPED after', out.length); done(); } }, 4000);
+</script>
+</body></html>
