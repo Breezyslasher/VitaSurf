@@ -1,0 +1,100 @@
+name: Probe what a user agent is served
+
+# How big a page is depends on who the server thinks is asking. The Vita
+# says "Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11", which no
+# site has a rule for, so several of them serve their full desktop
+# application: YouTube sent 10.5 MB of JavaScript that took 26 seconds
+# just to compile on the device.
+#
+# This fetches a page with several user agents and reports what each one
+# is actually given, so the choice is made on measurements rather than on
+# what the string looks like it ought to do.
+#
+# Edit fixtures/ua-request.txt (url=...) and push to run it.
+
+on:
+  push:
+    paths:
+      - fixtures/ua-request.txt
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Fetch with each user agent
+        run: |
+          set -u
+          python3 - <<'PY'
+          import re, sys, urllib.request, urllib.parse, gzip, io
+
+          urls = [l.split('=',1)[1].strip()
+                  for l in open('fixtures/ua-request.txt')
+                  if l.startswith('url=')]
+
+          AGENTS = [
+            ('what we send now',
+             'Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'),
+            ('the Vita\'s own browser',
+             'Mozilla/5.0 (PlayStation Vita 3.73) AppleWebKit/536.26 '
+             '(KHTML, like Gecko) Silk/3.2 Safari/536.26'),
+            ('an old mobile Safari',
+             'Mozilla/5.0 (iPhone; CPU iPhone OS 9_3 like Mac OS X) '
+             'AppleWebKit/601.1 (KHTML, like Gecko) Version/9.0 '
+             'Mobile/13E238 Safari/601.1'),
+            ('a current mobile Safari',
+             'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+             'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 '
+             'Mobile/15E148 Safari/604.1'),
+            ('an old Android',
+             'Mozilla/5.0 (Linux; Android 4.4; Nexus 5) AppleWebKit/537.36 '
+             '(KHTML, like Gecko) Version/4.0 Chrome/33.0 Mobile Safari/537.36'),
+          ]
+
+          def get(u, ua, timeout=45):
+              req = urllib.request.Request(u, headers={
+                  'User-Agent': ua, 'Accept':
+                  'text/html,application/xhtml+xml,*/*',
+                  'Accept-Language': 'en', 'Accept-Encoding': 'gzip'})
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  data = r.read()
+                  if r.headers.get('Content-Encoding') == 'gzip':
+                      data = gzip.decompress(data)
+                  return data, r.geturl()
+
+          for url in urls:
+              print('=' * 70)
+              print(url)
+              print('=' * 70)
+              print('%-26s %9s %9s %6s %10s  %s' %
+                    ('user agent', 'html', 'inline js', 'files', 'their size',
+                     'landed on'))
+              for label, ua in AGENTS:
+                  try:
+                      html, final = get(url, ua)
+                  except Exception as e:
+                      print('%-26s  failed: %s' % (label, e))
+                      continue
+                  text = html.decode('utf-8', 'replace')
+                  inline = sum(len(m) for m in
+                               re.findall(r'<script(?![^>]*\ssrc=)[^>]*>(.*?)</script>',
+                                          text, re.S | re.I))
+                  srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']',
+                                    text, re.I)
+                  total = 0
+                  for s in srcs[:40]:
+                      try:
+                          js, _ = get(urllib.parse.urljoin(final, s), ua, 30)
+                          total += len(js)
+                      except Exception:
+                          pass
+                  host = urllib.parse.urlparse(final).netloc
+                  print('%-26s %8dK %8dK %6d %9dK  %s' %
+                        (label, len(html)//1024, inline//1024, len(srcs),
+                         total//1024, host))
+              print()
+          PY
