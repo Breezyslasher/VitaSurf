@@ -35,3 +35,17 @@
 #   zero in the dump. It is the target that is null, not the document.
 #   Fixed by guarding both in patch 0025.
 0xb80aa
+
+# Build 179: data abort opening youtube.com, main thread. Resolved
+#   against build 179's own symbol map: the program counter was in
+#   JS_CallInternal's frame setup, reached from js_function_apply, and
+#   the core dump's thread record gave the answer -- a 256 KB stack of
+#   which 0x3ffac was used. --gc-sections had dropped the
+#   sceUserMainThreadStackSize definition, so the thread ran on the
+#   runtime's default stack while the log printed the 4096 KB that had
+#   been requested, and QuickJS's recursion guard was set to a megabyte,
+#   larger than the whole stack, so it could never fire. Fixed by keeping
+#   both runtime variables as link roots, measuring the stack the thread
+#   actually got, and sizing the guard from that.
+0xec8a8
+0x133672

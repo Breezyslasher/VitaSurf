@@ -1,0 +1,76 @@
+<!DOCTYPE html><html><head><title>platform</title></head><body>
+<pre id="out"></pre>
+<script>
+var results = {}, order = [];
+function T(n,v){ results[n]=v; if(order.indexOf(n)<0) order.push(n); }
+function flush(){
+ var o=document.getElementById('out'), i, n;
+ for(i=0;i<order.length;i++){ n=order[i];
+  o.textContent+='XX '+n+': '+results[n]+'\n';
+  try{console.log('XX '+n+': '+results[n]);}catch(e){} }}
+
+/* These APIs cannot do here what they do in a browser -- there is no
+   font loader, no fullscreen, no database, no clipboard, no gamepad.
+   What matters is that each one settles: a page that awaits
+   document.fonts.ready, or opens a database and waits for a callback,
+   stops where it stands if the answer never comes. So the facts below
+   are about settling, not about the values, which differ by design.
+   Everything is reported in one fixed order at the end, because the
+   order they settle in is not the same twice. */
+function settles(name, make){
+ T(name, 'NEVER SETTLED');
+ var p;
+ try { p = make(); } catch (e) { T(name, 'threw ' + e.name); return; }
+ if (!p || typeof p.then !== 'function') { T(name, 'not a promise'); return; }
+ p.then(function(){ T(name, 'resolved'); },
+        function(e){ T(name, 'rejected'); });
+}
+
+T('document.fonts exists', typeof document.fonts);
+T('fonts.check', document.fonts.check('12px sans-serif'));
+T('fonts.status', document.fonts.status);
+T('fonts.size', document.fonts.size);
+T('fullscreenElement', String(document.fullscreenElement));
+T('indexedDB exists', typeof window.indexedDB);
+T('navigator.storage exists', typeof navigator.storage);
+T('navigator.clipboard exists', typeof navigator.clipboard);
+T('getGamepads is a function', typeof navigator.getGamepads);
+T('vibrate returns', navigator.vibrate(0));
+T('PerformanceObserver.supportedEntryTypes is a list',
+  Array.isArray(PerformanceObserver.supportedEntryTypes));
+
+settles('fonts.ready', function(){ return document.fonts.ready; });
+settles('fonts.load', function(){ return document.fonts.load('12px sans-serif'); });
+settles('storage.estimate', function(){ return navigator.storage.estimate(); });
+settles('storage.persisted', function(){ return navigator.storage.persisted(); });
+settles('getBattery', function(){ return navigator.getBattery(); });
+
+/* An open request must reach one of its callbacks rather than hanging. */
+T('indexedDB.open', 'NEVER SETTLED');
+(function(){
+ var req;
+ try { req = indexedDB.open('vitasurf-probe'); }
+ catch (e) { T('indexedDB.open', 'threw ' + e.name); return; }
+ req.onsuccess = function(){ T('indexedDB.open', 'answered'); };
+ req.onerror = function(){ T('indexedDB.open', 'answered'); };
+})();
+
+/* Reported as one fact. Each of these is a promise or a callback that a
+   real browser answers from a backing store; headless Chromium on a file
+   URL has none, so which of them answer there varies from run to run and
+   comparing them one by one is not a stable test. What is worth
+   asserting is that none of them is left hanging here. */
+var ASYNC = ['fonts.ready', 'fonts.load', 'storage.estimate',
+             'storage.persisted', 'getBattery', 'indexedDB.open'];
+function summarise(){
+ var stuck = [], i;
+ for (i = 0; i < ASYNC.length; i++)
+  if (results[ASYNC[i]] === 'NEVER SETTLED') stuck.push(ASYNC[i]);
+ for (i = 0; i < ASYNC.length; i++) delete results[ASYNC[i]];
+ order = order.filter(function(n){ return ASYNC.indexOf(n) < 0; });
+ T('everything settles', stuck.length ? stuck.sort().join(' ') : 'yes');
+}
+
+window.addEventListener('load', function(){
+ setTimeout(function(){ summarise(); flush(); }, 800); });
+</script></body></html>

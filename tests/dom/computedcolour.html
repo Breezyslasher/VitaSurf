@@ -1,0 +1,37 @@
+<!DOCTYPE html><html><head><title>computedcolour</title><style>
+#sheet { color: #e6edf3; background-color: #0d1117; }
+#alpha { color: rgba(255, 0, 0, 0.5); }
+#inherit { color: #123456; }
+#child { background-color: transparent; }
+#named { color: rebeccapurple; background-color: white; }
+#pct { color: rgb(50%, 0%, 100%); background-color: rgba(0%, 50%, 0%, 50%); }
+#hsl { color: hsl(120, 100%, 50%); background-color: hsla(0, 100%, 50%, 0.5); }
+</style></head><body>
+<pre id="out"></pre>
+<p id="sheet">a</p>
+<p id="alpha">b</p>
+<p id="inherit"><span id="child">c</span></p>
+<p id="named">d</p>
+<p id="attr" style="color:#0d1117">e</p>
+<p id="pct">f</p>
+<p id="hsl">g</p>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function g(id,p){return getComputedStyle(document.getElementById(id))[p];}
+function report(){
+ T('stylesheet colour', g('sheet','color'));
+ T('stylesheet background', g('sheet','backgroundColor'));
+ T('alpha colour', g('alpha','color'));
+ T('inherited colour', g('child','color'));
+ T('transparent background', g('child','backgroundColor'));
+ T('named colour', g('named','color'));
+ T('named background', g('named','backgroundColor'));
+ T('style attribute colour', g('attr','color'));
+ T('percentage colour', g('pct','color'));
+ T('percentage alpha', g('pct','backgroundColor'));
+ T('hsl colour', g('hsl','color'));
+ T('hsl alpha', g('hsl','backgroundColor'));
+}
+window.addEventListener('load', function(){ setTimeout(report, 300); });
+</script></body></html>

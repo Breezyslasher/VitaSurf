@@ -1,0 +1,29 @@
+<!DOCTYPE html><html><head><title>legacyctor</title></head><body>
+<pre id="out"></pre>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function report(){
+  var a = null, err = '';
+  try { a = new Audio(); } catch(e) { err = e.name; }
+  T('new Audio throws', err || 'no');
+  T('Audio tag', a ? a.tagName.toLowerCase() : '-');
+  T('Audio is an element', a && a.nodeType === 1 ? 'yes' : 'no');
+  T('Audio not in document', a && !a.isConnected ? 'yes' : 'no');
+  var b = new Audio('sound.ogg');
+  T('Audio src attribute', b.getAttribute('src'));
+  T('Audio has play', typeof b.play === 'function' ? 'yes' : 'no');
+  var i = new Image();
+  T('Image tag', i.tagName.toLowerCase());
+  var o = new Option('label', 'val');
+  T('Option tag', o.tagName.toLowerCase());
+  T('Option text', o.textContent);
+  T('Option value attribute', o.getAttribute('value'));
+  /* JSON.parse must still throw on bad input, and return on good. */
+  var threw = '';
+  try { JSON.parse('[[binding]]'); } catch(e) { threw = e.name; }
+  T('JSON.parse still throws', threw);
+  T('JSON.parse still works', String(JSON.parse('{"a":2}').a));
+}
+window.addEventListener('load', function(){ setTimeout(report, 200); });
+</script></body></html>

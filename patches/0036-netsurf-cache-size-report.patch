@@ -1,0 +1,76 @@
+diff --git a/content/hlcache.c b/content/hlcache.c
+index 545b28e87..08f1cabc6 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -160,6 +160,40 @@ static void hlcache_clean(void *force_clean_flag)
+ 	guit->misc->schedule(hlcache->params.bg_clean_time, hlcache_clean, NULL);
+ }
+ 
++/* exported interface documented in content/hlcache.h */
++void hlcache_size_report(struct hlcache_size_report *r)
++{
++	hlcache_entry *entry;
++
++	memset(r, 0, sizeof(*r));
++	if (hlcache == NULL) {
++		return;
++	}
++	for (entry = hlcache->content_list; entry != NULL; entry = entry->next) {
++		unsigned int sz;
++		content_type type;
++
++		if (entry->content == NULL) {
++			continue;
++		}
++		sz = entry->content->size;
++		type = entry->content->handler->type();
++		r->total_bytes += sz;
++		r->count++;
++		if (content_count_users(entry->content) == 0) {
++			r->unused_bytes += sz;
++			r->unused_count++;
++		}
++		switch (type) {
++		case CONTENT_CSS:	r->css_bytes += sz; r->css_count++; break;
++		case CONTENT_HTML:	r->html_bytes += sz; r->html_count++; break;
++		case CONTENT_IMAGE:	r->image_bytes += sz; r->image_count++; break;
++		default:		r->other_bytes += sz; r->other_count++; break;
++		}
++	}
++}
++
++
+ /**
+  * Determine if the specified MIME type is acceptable
+  *
+diff --git a/content/hlcache.h b/content/hlcache.h
+index 986bdd3f4..cea697e49 100644
+--- a/content/hlcache.h
++++ b/content/hlcache.h
+@@ -45,6 +45,26 @@ typedef struct hlcache_event {
+ 	union content_msg_data data;	/**< Event data */
+ } hlcache_event;
+ 
++/**
++ * What the high-level cache is holding, by content type (VitaSurf).
++ *
++ * memory_cache_size bounds the low-level cache's source data, not the
++ * parsed representations the high-level cache keeps -- a page's parsed
++ * stylesheets outweigh their source several times over. Reporting both
++ * the total and the part with no users left says whether memory that
++ * stayed behind after a navigation is still in use or merely uncollected.
++ */
++struct hlcache_size_report {
++	unsigned int total_bytes, count;
++	unsigned int unused_bytes, unused_count;
++	unsigned int css_bytes, css_count;
++	unsigned int html_bytes, html_count;
++	unsigned int image_bytes, image_count;
++	unsigned int other_bytes, other_count;
++};
++
++void hlcache_size_report(struct hlcache_size_report *r);
++
+ struct hlcache_parameters {
+ 	/** How frequently the background cache clean process is run (ms) */
+ 	unsigned int bg_clean_time;

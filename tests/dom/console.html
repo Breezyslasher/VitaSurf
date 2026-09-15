@@ -1,0 +1,29 @@
+<!DOCTYPE html><html><head><title>console</title></head><body>
+<pre id="out"></pre>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+
+/* A bundler's entry chunk opens with console.assert, so a console method
+   that is missing takes the whole application down on its first line. */
+['log','warn','error','info','debug','assert','trace','group',
+ 'groupCollapsed','groupEnd','dir','dirxml','table','time','timeLog',
+ 'timeEnd','count','countReset','clear','timeStamp'].forEach(function(n){
+  T('typeof '+n, typeof console[n]);});
+
+/* A truthy assertion says nothing and, above all, does not throw. */
+var threw='no';
+try{console.assert('__process_polyfill__');}catch(e){threw=e.name;}
+T('assert truthy throws', threw);
+threw='no';
+try{console.assert(false,'expected');}catch(e){threw=e.name;}
+T('assert falsy throws', threw);
+threw='no';
+try{console.count('c');console.countReset('c');
+    console.time('t');console.timeEnd('t');
+    console.group('g');console.groupEnd();
+    console.trace();console.dir({a:1});console.table([1]);
+    console.clear();}catch(e){threw=e.name+': '+e.message;}
+T('the rest throw', threw);
+T('assert returns', String(console.assert(true)));
+</script></body></html>

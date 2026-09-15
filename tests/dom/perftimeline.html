@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>performance timeline</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function say(n, v){ out.push('XX ' + n + ': ' + v); }
+function done(){
+  var o = document.getElementById('out');
+  out.forEach(function(l){ o.textContent += l + '\n';
+    try { console.log(l); } catch (e) {} });
+}
+
+say('has PerformanceObserver', typeof PerformanceObserver);
+say('has PerformanceEntry', typeof PerformanceEntry);
+
+performance.clearMarks(); performance.clearMeasures();
+
+var m = performance.mark('start');
+say('mark returns an entry', m instanceof PerformanceEntry);
+say('mark entryType', m.entryType);
+say('mark name', m.name);
+say('mark duration', m.duration);
+say('mark startTime is a number', typeof m.startTime === 'number');
+
+performance.mark('middle', { startTime: 100, detail: { n: 1 } });
+var mm = performance.getEntriesByName('middle')[0];
+say('explicit startTime kept', mm.startTime);
+say('detail kept', mm.detail.n);
+
+performance.mark('end', { startTime: 250 });
+var ms = performance.measure('span', 'middle', 'end');
+say('measure entryType', ms.entryType);
+say('measure startTime', ms.startTime);
+say('measure duration', ms.duration);
+
+performance.measure('opts', { start: 10, end: 40 });
+say('measure from options', performance.getEntriesByName('opts')[0].duration);
+performance.measure('dur', { start: 5, duration: 20 });
+say('measure from duration', performance.getEntriesByName('dur')[0].duration);
+
+say('marks counted', performance.getEntriesByType('mark').length);
+say('measures counted', performance.getEntriesByType('measure').length);
+say('getEntries has both types',
+    performance.getEntries().filter(function(e){
+      return e.entryType === 'mark' || e.entryType === 'measure'; }).length);
+say('name+type filter', performance.getEntriesByName('span', 'measure').length);
+say('wrong type filters out', performance.getEntriesByName('span', 'mark').length);
+
+try { performance.measure('bad', 'nosuchmark'); say('missing mark', 'allowed'); }
+catch (e) { say('missing mark', e.name); }
+
+performance.clearMarks('middle');
+say('after clearing one mark', performance.getEntriesByName('middle').length);
+performance.clearMarks();
+say('after clearing all marks', performance.getEntriesByType('mark').length);
+say('measures survive clearMarks', performance.getEntriesByType('measure').length > 0);
+
+var seen = [];
+var obs = new PerformanceObserver(function(list){
+  list.getEntries().forEach(function(e){ seen.push(e.entryType + ':' + e.name); });
+});
+obs.observe({ entryTypes: ['mark', 'measure'] });
+performance.mark('observed');
+performance.measure('observedspan', { start: 0, end: 1 });
+setTimeout(function(){
+  say('observer saw', seen.join(','));
+  obs.disconnect();
+  performance.mark('afterdisconnect');
+  setTimeout(function(){
+    say('nothing after disconnect', seen.length);
+    say('supportedEntryTypes has mark',
+        PerformanceObserver.supportedEntryTypes.indexOf('mark') >= 0);
+    say('toJSON name', performance.getEntriesByType('measure')[0].toJSON().name);
+    /* the navigation entry: compare its shape, not its clock */
+    var nav = performance.getEntriesByType('navigation')[0];
+    say('navigation entry exists', !!nav);
+    if (nav) {
+      say('navigation entryType', nav.entryType);
+      say('navigation type', nav.type);
+      say('navigation is a PerformanceEntry', nav instanceof PerformanceEntry);
+      say('navigation startTime', nav.startTime);
+      say('domComplete is a number', typeof nav.domComplete === 'number');
+      say('loadEventEnd is a number', typeof nav.loadEventEnd === 'number');
+      say('fetchStart not after responseEnd', nav.fetchStart <= nav.responseEnd);
+      say('redirectCount', nav.redirectCount);
+      say('notRestoredReasons', String(nav.notRestoredReasons));
+    }
+    done();
+  }, 10);
+}, 10);
+</script>
+</body></html>

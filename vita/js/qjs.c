@@ -33,6 +33,7 @@
 #include <quickjs.h>
 
 #include "utils/errors.h"
+#include "utils/utils.h"
 #include "utils/nsurl.h"
 #include "utils/corestrings.h"
 #include "netsurf/browser_window.h"
@@ -52,6 +53,11 @@
 #include "utils/useragent.h"
 
 #include "vita_platform.h"
+
+/* JavaScript's share of the C stack: see js_newheap. */
+#define JS_STACK_DEFAULT (1024 * 1024)
+#define JS_STACK_MAX     (2 * 1024 * 1024)
+#define JS_STACK_MIN     (96 * 1024)
 
 /* guit->misc->schedule lives behind the core's gui table. */
 #include "desktop/gui_internal.h"
@@ -76,6 +82,14 @@ struct jsheap {
 	int timeout;          /**< script time budget, seconds */
 	bool pending_destroy;
 	int live_threads;
+	/*
+	 * The thread the runtime's interrupt handler was last pointed at.
+	 * The runtime outlives any one page, and the handler reads the
+	 * thread's deadline on every call, so a thread that is freed
+	 * without clearing this leaves the handler reading freed memory
+	 * until the next page installs its own.
+	 */
+	struct jsthread *interrupt_thread;
 };
 
 struct js_listener;
@@ -115,6 +129,18 @@ struct jsthread {
 	struct browser_window *win;
 	html_content *htmlc;
 	uint64_t deadline_ms;     /**< when the running script must stop */
+	/*
+	 * How the running script's overrun has been reported. QuickJS
+	 * raises an ordinary exception when the interrupt handler says
+	 * stop, and a page wrapped in try/catch swallows it and carries
+	 * on, so the handler fires again a moment later and keeps firing.
+	 * YouTube did that for eighteen minutes and wrote eighteen
+	 * thousand identical lines, each one flushed to the memory card.
+	 */
+	unsigned script_depth;    /**< nested entries from C into script */
+	bool aborting;            /**< the budget is unwinding a script */
+	unsigned overrun_count;   /**< interrupts past the deadline */
+	uint64_t overrun_said_ms; /**< when that was last logged */
 	const char *current_script; /**< URL of the script js_exec is running */
 	struct js_listener *listeners; /**< event listeners, freed on close */
 	/**
@@ -226,10 +252,45 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 		return 0;
 	}
 	if (now_ms() > thread->deadline_ms) {
-		vita_log("qjs: script exceeded its time budget");
+		uint64_t now = now_ms();
+
+		thread->overrun_count++;
+		/* The first one, then at most one line every 30 seconds.
+		 * The abort is uncatchable, so a second interrupt means
+		 * the script resumed some other way -- a fresh call in
+		 * from C, or a callback whose exception was dropped --
+		 * and that is worth saying out loud, but only as often
+		 * as it takes to see it. */
+		if (thread->overrun_count == 1) {
+			vita_log("qjs: script exceeded its time budget: %s",
+				 thread->current_script != NULL ?
+				 thread->current_script : "?");
+			thread->overrun_said_ms = now;
+		} else if (now - thread->overrun_said_ms >= 30000) {
+			vita_log("qjs: script still over budget, aborted %u "
+				 "times and resumed every time",
+				 thread->overrun_count);
+			thread->overrun_said_ms = now;
+		}
+		thread->aborting = true;
 		return 1; /* abort */
 	}
 	return 0;
+}
+
+/*
+ * True while the time budget is unwinding a script on this context.
+ *
+ * The value QuickJS throws for an interrupt is null, not an Error, so
+ * there is nothing in the exception itself to recognise it by -- and
+ * merely fetching it with JS_GetException clears the flag that makes it
+ * uncatchable. C code asks here instead, and leaves the exception alone.
+ */
+static bool qjs_budget_abort(JSContext *ctx)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	return thread != NULL && thread->aborting;
 }
 
 /** QuickJS's own allocation total for the runtime, in KB. */
@@ -295,11 +356,30 @@ static void log_source_excerpt(const char *stack, const char *name,
  * is known (name, src, len), the offending source line is logged too.
  */
 static void js_free_deferred(jsthread *thread);
+/* Persistent storage, defined with the rest of the on-disk code below. */
+static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv);
+static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv);
 static void qjs_report_exception_src(JSContext *ctx, const char *name,
 				     const char *src, size_t len)
 {
-	JSValue exc = JS_GetException(ctx);
-	const char *msg = JS_ToCString(ctx, exc);
+	JSValue exc;
+	const char *msg;
+
+	/*
+	 * The time-budget abort is not the page's error to hear about. It
+	 * is already logged where it was raised, and fetching it here to
+	 * report it would clear it -- which is how a script that overran
+	 * inside a callback used to carry on. Leave it pending and let it
+	 * keep unwinding; end_script drops it once the outermost call into
+	 * script is over.
+	 */
+	if (qjs_budget_abort(ctx)) {
+		return;
+	}
+	exc = JS_GetException(ctx);
+	msg = JS_ToCString(ctx, exc);
 
 	vita_log("qjs: uncaught %s", msg != NULL ? msg : "(error)");
 	if (msg != NULL) {
@@ -368,6 +448,30 @@ static bool qjs_error_mentions(JSContext *ctx, JSValueConst err,
 	found = strstr(msg, needle) != NULL;
 	JS_FreeCString(ctx, msg);
 	return found;
+}
+
+/**
+ * Deal with an exception from a JS call made under a running script.
+ *
+ * QuickJS marks the time-budget abort uncatchable on purpose, so that
+ * nothing can swallow it and let a runaway script carry on. C code that
+ * clears the pending exception defeats exactly that. A mutation
+ * notification is called from inside whatever script did the mutating,
+ * so clearing there meant the budget could never stop a script that
+ * touches the DOM: YouTube's bootstrap ran four minutes past its
+ * twenty seconds, aborted thirty-three times a second and resumed every
+ * time, because each abort landed on a mutation callback and stopped
+ * here.
+ *
+ * An ordinary error in a callback is still contained. Only the abort
+ * goes back up, to reach the script it was meant for.
+ */
+static void qjs_absorb_or_rethrow(JSContext *ctx)
+{
+	if (qjs_budget_abort(ctx)) {
+		return;		/* leave it pending, and uncatchable */
+	}
+	JS_FreeValue(ctx, JS_GetException(ctx));
 }
 
 /** A dom_string from a NUL-terminated C string, or NULL. */
@@ -628,7 +732,7 @@ static void notify_mutation_ns(JSContext *ctx, const char *kind,
 		args[4] = extra;
 		r = JS_Call(ctx, fn, global, 5, args);
 		if (JS_IsException(r)) {
-			JS_FreeValue(ctx, JS_GetException(ctx));
+			qjs_absorb_or_rethrow(ctx);
 		}
 		JS_FreeValue(ctx, r);
 		JS_FreeValue(ctx, args[0]);
@@ -1801,31 +1905,69 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	 * dropped them, so el.innerHTML = "<style>..</style><p>" lost the
 	 * style and insertAdjacentHTML lost a leading script entirely.
 	 */
+	/*
+	 * A comment before the markup is a sibling of the <html> element,
+	 * not inside it, so the fragment's first child is the comment. The
+	 * code here used to require an element there and give up when it
+	 * found anything else -- after emptying the target -- so assigning
+	 * markup that opened with a comment wiped the element and put
+	 * nothing back. Build stamps are written exactly that way, and it
+	 * is how every one of YouTube's components lost its markup: the
+	 * template was empty, so the named nodes a component reads out of
+	 * it were all undefined.
+	 *
+	 * So walk the fragment's children: take an <html> element apart
+	 * section by section, and move anything else across as it stands.
+	 */
 	dom_node_get_first_child(fragment, &htmlnode);
-	if (!node_is_element(htmlnode)) goto out;
-	{
-		struct dom_node *section = NULL;
+	while (htmlnode != NULL) {
+		struct dom_node *after = NULL, *cref = NULL;
 
-		dom_node_get_first_child(htmlnode, &section);
-		while (section != NULL) {
-			struct dom_node *next = NULL;
+		dom_node_get_next_sibling(htmlnode, &after);
+		if (node_is_element(htmlnode)) {
+			struct dom_node *section = NULL;
 
-			dom_node_get_first_child(section, &child);
-			while (child != NULL) {
-				struct dom_node *cref = NULL;
+			dom_node_get_first_child(htmlnode, &section);
+			while (section != NULL) {
+				struct dom_node *next = NULL;
 
-				dom_node_remove_child(section, child, &cref);
-				if (cref) dom_node_unref(cref);
-				dom_node_append_child(node, child, &cref);
-				if (cref) dom_node_unref(cref);
-				dom_node_unref(child);
-				child = NULL;
 				dom_node_get_first_child(section, &child);
+				while (child != NULL) {
+					cref = NULL;
+					dom_node_remove_child(section, child,
+							      &cref);
+					if (cref) dom_node_unref(cref);
+					cref = NULL;
+					dom_node_append_child(node, child,
+							      &cref);
+					if (cref) dom_node_unref(cref);
+					dom_node_unref(child);
+					child = NULL;
+					dom_node_get_first_child(section,
+								 &child);
+				}
+				dom_node_get_next_sibling(section, &next);
+				dom_node_unref(section);
+				section = next;
 			}
-			dom_node_get_next_sibling(section, &next);
-			dom_node_unref(section);
-			section = next;
+		} else {
+			dom_node_type t = DOM_NODE_TYPE_COUNT;
+
+			/* A doctype is not a node an element can hold, and
+			 * fragment parsing ignores one anyway. */
+			dom_node_get_node_type(htmlnode, &t);
+			if (t != DOM_DOCUMENT_TYPE_NODE) {
+				cref = NULL;
+				dom_node_remove_child(fragment, htmlnode,
+						      &cref);
+				if (cref) dom_node_unref(cref);
+				cref = NULL;
+				dom_node_append_child(node, htmlnode, &cref);
+				if (cref) dom_node_unref(cref);
+			}
 		}
+		dom_node_unref(htmlnode);
+		htmlnode = after;
 	}
 out:
 	if (parser) dom_hubbub_parser_destroy(parser);
@@ -2898,8 +3040,17 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 /* Lower bound on script_timeout, in seconds. See js_newheap(). */
 #define SCRIPT_TIMEOUT_MIN 20
 
-static void begin_script(jsthread *thread)
+/*
+ * Arm the deadline afresh without opening a nesting level. Compiling is
+ * not interruptible -- QuickJS's parser never calls the interrupt
+ * handler -- so a bundle that takes longer to compile than the whole
+ * budget must not have that time charged against its run.
+ */
+static void rearm_deadline(jsthread *thread)
 {
+	thread->aborting = false;
+	thread->overrun_count = 0;
+	thread->overrun_said_ms = 0;
 	if (thread->heap->timeout > 0) {
 		thread->deadline_ms = now_ms() +
 			(uint64_t)thread->heap->timeout * 1000;
@@ -2908,11 +3059,63 @@ static void begin_script(jsthread *thread)
 	}
 }
 
+/*
+ * These nest. Script reaches back into C and C calls into script again
+ * all the time -- a listener run from dispatchEvent(), a module settled
+ * inside the script that imported it -- and each of those is part of the
+ * work the outer script is doing, not a new piece of work with a budget
+ * of its own. Without the depth count an inner call re-armed the
+ * deadline, handing the outer script another twenty seconds every time
+ * it fired an event, and its end_script then cleared the deadline
+ * outright, leaving the rest of that script with no budget at all.
+ * Draining microtasks belongs to the outermost call for the same
+ * reason: that is where a script actually finishes.
+ */
+/*
+ * Wall time inside script, from the outermost entry only, so that a
+ * listener called from a script is not counted twice. The page profile
+ * reads it: without this the only script time recorded was what a
+ * <script> element ran during the parse, and a page that does its work
+ * from timers and events -- which is most of them now -- showed a load
+ * of a minute and a half with five hundred milliseconds accounted for.
+ */
+static uint64_t script_entered_ms;
+
+static void begin_script(jsthread *thread)
+{
+	if (thread->script_depth++ > 0) {
+		return;
+	}
+	script_entered_ms = now_ms();
+	rearm_deadline(thread);
+}
+
 static void schedule_relayout(jsthread *thread, int ms);
 
 static void end_script(jsthread *thread)
 {
+	if (thread->script_depth > 0 && --thread->script_depth > 0) {
+		return;
+	}
+	thread->script_depth = 0;
+	if (script_entered_ms != 0) {
+		vitasurf_ms_script += (unsigned)(now_ms() - script_entered_ms);
+		script_entered_ms = 0;
+	}
+	if (thread->overrun_count > 1) {
+		vita_log("qjs: that script was interrupted %u times before "
+			 "it stopped", thread->overrun_count);
+	}
+	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
+	thread->aborting = false;
+	/* The outermost call is over, so nothing is still unwinding. An
+	 * exception left pending here is one that was reported already, or
+	 * the budget abort on its way out; either way the jobs below must
+	 * not start with it hanging over them. */
+	if (JS_HasException(thread->ctx)) {
+		JS_FreeValue(thread->ctx, JS_GetException(thread->ctx));
+	}
 	/* run microtasks (promise jobs) the script queued */
 	for (;;) {
 		JSContext *c = NULL;
@@ -4058,11 +4261,19 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
  */
 /*
  * __vitaStyle(node): the computed values a page is most likely to read
- * back, as [fontSize px, display, visibility, opacity]. Everything else
- * getComputedStyle reports comes from the prelude's defaults; these four
- * are the ones that actually vary and that code branches on. A page
- * doing its own rem arithmetic reads the root font size, which is what
- * sent YouTube into "cannot read property 'replace' of undefined".
+ * back, as [fontSize px, display, visibility, colour, background
+ * colour]. Everything else getComputedStyle reports comes from the
+ * prelude's defaults; these are the ones that actually vary and that
+ * code branches on. A page doing its own rem arithmetic reads the root
+ * font size, which is what sent YouTube into "cannot read property
+ * 'replace' of undefined".
+ *
+ * The two colours are libcss's RGB with the alpha byte carried
+ * separately in slots 5 and 6, or -1 where the property is not a colour
+ * (background-color's default, transparent). They are here because a
+ * page that themes itself reads a colour back to decide what it is
+ * showing, and answering with the stylesheet's default said every page
+ * was black on transparent.
  */
 static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
@@ -4072,6 +4283,7 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	struct box *box;
 	css_fixed len = 0;
 	css_unit unit = CSS_UNIT_PX;
+	css_color colour = 0;
 	JSValue arr;
 	int px;
 
@@ -4095,6 +4307,10 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		set_index(ctx, arr, 0, 16);
 		set_index(ctx, arr, 1, (int)CSS_DISPLAY_NONE);
 		set_index(ctx, arr, 2, (int)CSS_VISIBILITY_VISIBLE);
+		set_index(ctx, arr, 3, -1);
+		set_index(ctx, arr, 4, -1);
+		set_index(ctx, arr, 5, -1);
+		set_index(ctx, arr, 6, -1);
 		return arr;
 	}
 	css_computed_font_size(box->style, &len, &unit);
@@ -4107,6 +4323,28 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	set_index(ctx, arr, 0, px);
 	set_index(ctx, arr, 1, (int)css_computed_display_static(box->style));
 	set_index(ctx, arr, 2, (int)css_computed_visibility(box->style));
+
+	/*
+	 * set_index takes an int, and a colour with the alpha byte set
+	 * does not fit one on a 32-bit target, so the alpha is split off
+	 * and the prelude puts the two back together.
+	 */
+	if (css_computed_color(box->style, &colour) == CSS_COLOR_COLOR) {
+		set_index(ctx, arr, 3, (int)(colour & 0xffffff));
+		set_index(ctx, arr, 5, (int)((colour >> 24) & 0xff));
+	} else {
+		set_index(ctx, arr, 3, -1);
+		set_index(ctx, arr, 5, -1);
+	}
+	colour = 0;
+	if (css_computed_background_color(box->style, &colour) ==
+			CSS_BACKGROUND_COLOR_COLOR) {
+		set_index(ctx, arr, 4, (int)(colour & 0xffffff));
+		set_index(ctx, arr, 6, (int)((colour >> 24) & 0xff));
+	} else {
+		set_index(ctx, arr, 4, -1);
+		set_index(ctx, arr, 6, -1);
+	}
 	return arr;
 }
 
@@ -4415,6 +4653,12 @@ static void setup_globals(jsthread *thread)
 					  "__vitaCreateIn", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaScrollTo",
 			  JS_NewCFunction(ctx, win_vita_scroll_to, "__vitaScrollTo", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaStoreLoad",
+			  JS_NewCFunction(ctx, win_vita_store_load,
+					  "__vitaStoreLoad", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaStoreSave",
+			  JS_NewCFunction(ctx, win_vita_store_save,
+					  "__vitaStoreSave", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaDispatch",
 			  JS_NewCFunction(ctx, win_vita_dispatch, "__vitaDispatch", 2));
 
@@ -4485,6 +4729,12 @@ static void setup_globals(jsthread *thread)
 			JS_FreeValue(ctx, r);
 		}
 		nsu_getmonotonic_ms(&t1);
+		/*
+		 * Once per page, before a line of the page's own script.
+		 * A quarter of a second of every load on the device, and
+		 * it was in none of the buckets.
+		 */
+		vitasurf_ms_prelude += (unsigned int)(t1 - t0);
 		vita_log("qjs: prelude %u KB ran in %u ms (%s)",
 			 (unsigned int)(len / 1024),
 			 (unsigned int)(t1 - t0),
@@ -4530,19 +4780,28 @@ static void qjs_rejection_tracker(JSContext *ctx, JSValueConst promise,
 	JSValue global, fn;
 
 	(void)opaque;
-	if (is_handled || ctx == NULL) {
+	if (ctx == NULL) {
 		return;
 	}
+	/*
+	 * A handler attached after the rejection cancels the report: the
+	 * prelude holds it for a turn so a .catch() added later in the
+	 * same tick -- which is how frameworks write it -- takes it off
+	 * the list rather than being called an error.
+	 */
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global, "__vitaReportRejection");
+	fn = JS_GetPropertyStr(ctx, global,
+			       is_handled ? "__vitaRejectionHandled"
+					  : "__vitaReportRejection");
 	if (JS_IsFunction(ctx, fn)) {
 		JSValue args[2], r;
 
-		args[0] = JS_DupValue(ctx, reason);
+		args[0] = is_handled ? JS_DupValue(ctx, promise)
+				     : JS_DupValue(ctx, reason);
 		args[1] = JS_DupValue(ctx, promise);
 		r = JS_Call(ctx, fn, global, 2, args);
 		if (JS_IsException(r)) {
-			JS_FreeValue(ctx, JS_GetException(ctx));
+			qjs_absorb_or_rethrow(ctx);
 		}
 		JS_FreeValue(ctx, r);
 		JS_FreeValue(ctx, args[0]);
@@ -4594,7 +4853,33 @@ nserror js_newheap(int timeout, jsheap **heap)
 			       qjs_module_loader, NULL);
 	JS_SetHostPromiseRejectionTracker(ret->rt, qjs_rejection_tracker, NULL);
 	JS_SetMemoryLimit(ret->rt, 96 * 1024 * 1024);
-	JS_SetMaxStackSize(ret->rt, 1024 * 1024);
+	{
+		/*
+		 * Measured against the stack the thread actually got, never
+		 * against the one that was asked for: a guard larger than
+		 * the stack it guards never fires, and the overflow then
+		 * arrives as a data abort rather than a catchable error.
+		 * That is what happened when --gc-sections dropped the
+		 * stack size request and left the runtime's 256 KB default
+		 * behind while this was set to a megabyte.
+		 *
+		 * Half the stack, so the CSS selection and layout recursion
+		 * underneath still have room, and capped so a large stack
+		 * does not let a runaway script recurse for seconds before
+		 * the guard notices.
+		 */
+		size_t js_stack = JS_STACK_DEFAULT;
+
+		if (vita_main_stack_bytes > 0) {
+			js_stack = vita_main_stack_bytes / 2;
+			if (js_stack > JS_STACK_MAX) js_stack = JS_STACK_MAX;
+			if (js_stack < JS_STACK_MIN) js_stack = JS_STACK_MIN;
+		}
+		JS_SetMaxStackSize(ret->rt, js_stack);
+		vita_log("qjs: recursion guard %u KB of a %u KB stack",
+			 (unsigned int)(js_stack / 1024),
+			 (unsigned int)(vita_main_stack_bytes / 1024));
+	}
 	/* register the shared node class once per runtime */
 	JS_NewClassID(ret->rt, &node_class_id);
 	JS_NewClass(ret->rt, node_class_id, &node_class);
@@ -4636,6 +4921,7 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	ret->import_map = JS_UNINITIALIZED;
 	JS_SetContextOpaque(ret->ctx, ret);
 	JS_SetInterruptHandler(heap->rt, qjs_interrupt, ret);
+	heap->interrupt_thread = ret;
 	setup_globals(ret);
 	heap->live_threads++;
 	*thread = ret;
@@ -4654,10 +4940,19 @@ nserror js_closethread(jsthread *thread)
 {
 	struct js_timer *t;
 	struct js_listener *l;
+	uint64_t t0 = 0, t1 = 0;
 
 	if (thread == NULL || thread->closed) {
 		return NSERROR_OK;
 	}
+	/*
+	 * Freeing the last page's context and collecting what it left
+	 * behind happens while the next page is loading, so the wait lands
+	 * on that page. Count it against that page: one whose own work
+	 * came to a third of a second still took nearly three, and this is
+	 * one of the places the rest could be.
+	 */
+	t0 = now_ms();
 	thread->closed = true;
 	if (thread->relayout_pending) {
 		guit->misc->schedule(-1, relayout_callback, thread);
@@ -4694,8 +4989,10 @@ nserror js_closethread(jsthread *thread)
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
 	JS_RunGC(thread->heap->rt);
-	vita_log("qjs: page closed, runtime memory now %u KB",
-		 runtime_kb(thread->heap->rt));
+	t1 = now_ms();
+	vitasurf_ms_teardown += (unsigned)(t1 - t0);
+	vita_log("qjs: page closed in %u ms, runtime memory now %u KB",
+		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt));
 	return NSERROR_OK;
 }
 
@@ -4703,10 +5000,12 @@ void js_destroythread(jsthread *thread)
 {
 	struct js_listener *l;
 	struct js_timer *t;
+	uint64_t t0 = 0, t1 = 0;
 
 	if (thread == NULL) {
 		return;
 	}
+	t0 = now_ms();		/* the rest of the teardown; see above */
 	js_free_deferred(thread);
 	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;
@@ -4730,6 +5029,10 @@ void js_destroythread(jsthread *thread)
 		free(t);
 		t = next;
 	}
+	if (thread->heap->interrupt_thread == thread) {
+		JS_SetInterruptHandler(thread->heap->rt, NULL, NULL);
+		thread->heap->interrupt_thread = NULL;
+	}
 	thread->heap->live_threads--;
 	if (thread->heap->pending_destroy && thread->heap->live_threads == 0) {
 		jsheap *heap = thread->heap;
@@ -4737,6 +5040,8 @@ void js_destroythread(jsthread *thread)
 		free(heap);
 	}
 	free(thread);
+	t1 = now_ms();
+	vitasurf_ms_teardown += (unsigned)(t1 - t0);
 }
 
 /*
@@ -4757,6 +5062,635 @@ void js_destroythread(jsthread *thread)
  */
 #define SCRIPT_MAX_BYTES (16 * 1024 * 1024)
 #define SCRIPT_LOG_BYTES (256 * 1024)
+
+/* ------------------------------------------------------------------------ */
+/* Compiled script cache                                                    */
+
+/*
+ * Compiling is the single most expensive thing a page makes us do.
+ * YouTube's bundle is 10.5 MB of JavaScript and took 17.6 seconds to
+ * compile on the device, against 9.3 to run: most of a minute and a half
+ * of page load, repeated in full every single visit.
+ *
+ * QuickJS can serialise a compiled function and read it back, which is
+ * how qjsc precompiles a script and how the prelude avoids being parsed
+ * once per page. The same thing works across runs if the bytecode is
+ * kept on the memory card. Measured on a 2.5 MB bundle, reading it back
+ * took 22 ms against 244 ms to compile, and evaluating the result
+ * behaved identically -- same values, same errors, same peak memory.
+ *
+ * Only classic scripts are cached. A module's imports are resolved while
+ * it is compiled, and a miss there sends the script down the deferred
+ * retry path; keeping that behaviour identical matters more than the
+ * saving, so modules are left alone.
+ */
+
+#define BC_MAGIC      0x43425356u        /* 'VSBC' */
+#define BC_FORMAT     1u
+/* Below this, compiling is quicker than finding the file on the card. */
+#define BC_MIN_SRC    (128 * 1024)
+/* One entry. Bytecode runs three to five times the size of its source. */
+#define BC_MAX_ENTRY  (48u * 1024 * 1024)
+/* The whole directory. An unbounded cache is a bug (see CLAUDE.md). */
+#define BC_BUDGET     (96u * 1024 * 1024)
+#define BC_MAX_ENTRIES 48
+
+struct bc_header {
+	uint32_t magic;
+	uint32_t format;
+	uint32_t src_len;
+	uint32_t src_hash_lo;
+	uint32_t src_hash_hi;
+	uint32_t bc_len;
+};
+
+/** FNV-1a over a buffer. Used to name an entry and to check its source. */
+static uint64_t bc_hash(const void *p, size_t len)
+{
+	const uint8_t *b = p;
+	uint64_t h = 1469598103934665603ull;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		h ^= b[i];
+		h *= 1099511628211ull;
+	}
+	return h;
+}
+
+/** Path of the entry for a URL, into buf. */
+static void bc_path(char *buf, size_t n, const char *url)
+{
+	uint64_t h = bc_hash(url, strlen(url));
+
+	snprintf(buf, n, "%s/%08x%08x.bc", VITASURF_JSCACHE_DIR,
+		 (unsigned)(h >> 32), (unsigned)(h & 0xffffffffu));
+}
+
+/*
+ * The index. Eviction needs to know what is in the directory and how big
+ * each entry is, and reading a directory is the one file operation whose
+ * behaviour on the device I have not verified. A list the cache writes
+ * itself needs nothing but fopen, and doubles as the use order.
+ *
+ * Losing it costs the cache, not correctness: a stale name is a file that
+ * gets overwritten, and a missing one is a miss.
+ */
+struct bc_entry {
+	char name[24];
+	uint32_t bytes;
+	uint32_t stamp;		/* use order; a counter, not a clock */
+};
+
+static struct bc_entry bc_index[BC_MAX_ENTRIES];
+static unsigned bc_index_n;
+static uint32_t bc_stamp;
+static bool bc_index_read;
+
+static void bc_index_load(void)
+{
+	char path[256];
+	FILE *f;
+
+	if (bc_index_read) {
+		return;
+	}
+	bc_index_read = true;
+	snprintf(path, sizeof(path), "%s/index", VITASURF_JSCACHE_DIR);
+	f = fopen(path, "rb");
+	if (f == NULL) {
+		return;
+	}
+	while (bc_index_n < BC_MAX_ENTRIES) {
+		struct bc_entry *e = &bc_index[bc_index_n];
+		unsigned bytes = 0, stamp = 0;
+
+		if (fscanf(f, "%23s %u %u", e->name, &bytes, &stamp) != 3) {
+			break;
+		}
+		e->bytes = bytes;
+		e->stamp = stamp;
+		if (stamp > bc_stamp) {
+			bc_stamp = stamp;
+		}
+		bc_index_n++;
+	}
+	fclose(f);
+}
+
+static void bc_index_save(void)
+{
+	char path[256];
+	FILE *f;
+	unsigned i;
+
+	snprintf(path, sizeof(path), "%s/index", VITASURF_JSCACHE_DIR);
+	f = fopen(path, "wb");
+	if (f == NULL) {
+		return;
+	}
+	for (i = 0; i < bc_index_n; i++) {
+		fprintf(f, "%s %u %u\n", bc_index[i].name,
+			(unsigned)bc_index[i].bytes,
+			(unsigned)bc_index[i].stamp);
+	}
+	fclose(f);
+}
+
+static struct bc_entry *bc_index_find(const char *name)
+{
+	unsigned i;
+
+	for (i = 0; i < bc_index_n; i++) {
+		if (strcmp(bc_index[i].name, name) == 0) {
+			return &bc_index[i];
+		}
+	}
+	return NULL;
+}
+
+static void bc_index_drop(unsigned i)
+{
+	char path[256];
+
+	snprintf(path, sizeof(path), "%s/%s", VITASURF_JSCACHE_DIR,
+		 bc_index[i].name);
+	remove(path);
+	memmove(&bc_index[i], &bc_index[i + 1],
+		(bc_index_n - i - 1) * sizeof(bc_index[0]));
+	bc_index_n--;
+}
+
+/** Make room for one more entry of this size, oldest use first. */
+static void bc_index_make_room(uint32_t bytes)
+{
+	for (;;) {
+		uint64_t total = bytes;
+		unsigned i, oldest = 0;
+
+		for (i = 0; i < bc_index_n; i++) {
+			total += bc_index[i].bytes;
+			if (bc_index[i].stamp < bc_index[oldest].stamp) {
+				oldest = i;
+			}
+		}
+		if (bc_index_n == 0) {
+			return;
+		}
+		if (total <= BC_BUDGET && bc_index_n < BC_MAX_ENTRIES) {
+			return;
+		}
+		vita_log("qjs: cache full, dropping %s (%u KB)",
+			 bc_index[oldest].name,
+			 (unsigned)(bc_index[oldest].bytes / 1024));
+		bc_index_drop(oldest);
+	}
+}
+
+/**
+ * The compiled form of this source, or JS_UNDEFINED if it is not cached.
+ *
+ * The file is named after the URL and carries the length and hash of the
+ * source it was built from, so a bundle that changed behind the same URL
+ * is a miss rather than the wrong code.
+ */
+static JSValue bc_load(JSContext *ctx, const char *url,
+		       const char *src, size_t srclen)
+{
+	char path[256];
+	struct bc_header h;
+	FILE *f;
+	uint8_t *buf;
+	JSValue fn;
+	uint64_t hash;
+
+	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<') {
+		return JS_UNDEFINED;
+	}
+	bc_path(path, sizeof(path), url);
+	f = fopen(path, "rb");
+	if (f == NULL) {
+		return JS_UNDEFINED;
+	}
+	if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
+	    h.magic != BC_MAGIC || h.format != BC_FORMAT ||
+	    h.src_len != (uint32_t)srclen ||
+	    h.bc_len == 0 || h.bc_len > BC_MAX_ENTRY) {
+		fclose(f);
+		return JS_UNDEFINED;
+	}
+	hash = bc_hash(src, srclen);
+	if (h.src_hash_lo != (uint32_t)(hash & 0xffffffffu) ||
+	    h.src_hash_hi != (uint32_t)(hash >> 32)) {
+		fclose(f);		/* same URL, different bundle */
+		return JS_UNDEFINED;
+	}
+	buf = malloc(h.bc_len);
+	if (buf == NULL) {
+		fclose(f);
+		return JS_UNDEFINED;
+	}
+	if (fread(buf, 1, h.bc_len, f) != h.bc_len) {
+		free(buf);
+		fclose(f);
+		return JS_UNDEFINED;
+	}
+	fclose(f);
+	/*
+	 * QuickJS stamps its own bytecode version into the stream and
+	 * refuses a stream it did not write, so an entry left behind by an
+	 * older engine comes back as an exception here rather than as
+	 * something that runs. Treat it as a miss and compile.
+	 */
+	fn = JS_ReadObject(ctx, buf, h.bc_len, JS_READ_OBJ_BYTECODE);
+	free(buf);
+	if (JS_IsException(fn)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		remove(path);
+		return JS_UNDEFINED;
+	}
+	{
+		char nm[24];
+		struct bc_entry *e;
+
+		snprintf(nm, sizeof(nm), "%s", strrchr(path, '/') + 1);
+		bc_index_load();
+		e = bc_index_find(nm);
+		if (e != NULL) {
+			e->stamp = ++bc_stamp;
+			bc_index_save();
+		}
+	}
+	return fn;
+}
+
+/** Keep the compiled form of this source for the next visit. */
+static void bc_store(JSContext *ctx, const char *url,
+		     const char *src, size_t srclen, JSValueConst fn)
+{
+	char path[256], tmp[264], nm[24];
+	struct bc_header h;
+	uint8_t *out;
+	size_t out_len = 0;
+	FILE *f;
+	uint64_t hash;
+	struct bc_entry *e;
+
+	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<') {
+		return;
+	}
+	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE);
+	if (out == NULL) {
+		return;
+	}
+	if (out_len == 0 || out_len > BC_MAX_ENTRY) {
+		js_free(ctx, out);
+		return;
+	}
+	bc_path(path, sizeof(path), url);
+	snprintf(nm, sizeof(nm), "%s", strrchr(path, '/') + 1);
+	bc_index_load();
+	e = bc_index_find(nm);
+	if (e != NULL) {			/* replacing our own entry */
+		unsigned i = (unsigned)(e - bc_index);
+		bc_index_drop(i);
+	}
+	bc_index_make_room((uint32_t)out_len);
+	if (bc_index_n >= BC_MAX_ENTRIES) {
+		js_free(ctx, out);
+		return;
+	}
+	hash = bc_hash(src, srclen);
+	h.magic = BC_MAGIC;
+	h.format = BC_FORMAT;
+	h.src_len = (uint32_t)srclen;
+	h.src_hash_lo = (uint32_t)(hash & 0xffffffffu);
+	h.src_hash_hi = (uint32_t)(hash >> 32);
+	h.bc_len = (uint32_t)out_len;
+	/*
+	 * Written beside the entry and renamed over it, so a battery that
+	 * runs out mid-write leaves the old entry or no entry, never half
+	 * of one under a name that claims to be whole.
+	 */
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	f = fopen(tmp, "wb");
+	if (f == NULL) {
+		js_free(ctx, out);
+		return;
+	}
+	if (fwrite(&h, 1, sizeof(h), f) != sizeof(h) ||
+	    fwrite(out, 1, out_len, f) != out_len) {
+		fclose(f);
+		remove(tmp);
+		js_free(ctx, out);
+		return;
+	}
+	fclose(f);
+	js_free(ctx, out);
+	remove(path);
+	if (rename(tmp, path) != 0) {
+		remove(tmp);
+		return;
+	}
+	snprintf(bc_index[bc_index_n].name, sizeof(bc_index[0].name), "%s", nm);
+	bc_index[bc_index_n].bytes = (uint32_t)out_len;
+	bc_index[bc_index_n].stamp = ++bc_stamp;
+	bc_index_n++;
+	bc_index_save();
+	vita_log("qjs: cached %u KB of bytecode for %u KB of source",
+		 (unsigned)(out_len / 1024), (unsigned)(srclen / 1024));
+}
+
+/* ------------------------------------------------------------------------ */
+/* Persistent storage                                                       */
+
+/*
+ * One file per origin under ux0:data/VitaSurf/storage, holding everything
+ * that origin has stored: localStorage and IndexedDB both sit on this.
+ *
+ * Neither had anywhere to go before. localStorage was a plain object that
+ * went with the page, shared by every site, and IndexedDB was missing, so
+ * claude.ai reported no storage for its session and read its persisted
+ * state back as a rejection on every load.
+ *
+ * The origin is worked out here from the document's own URL, not passed
+ * in from script: these functions sit on the global object where a page
+ * can reach them, and a page that could name its own origin could read
+ * another site's storage.
+ *
+ * The whole origin is read and written at once. That is the wrong shape
+ * for a database and the right one for a memory card, where the cost is
+ * per file rather than per byte, and the writing is deferred so a burst
+ * of puts is one write.
+ */
+
+#define STORE_MAX_ORIGIN (4u * 1024 * 1024)	/* one site */
+#define STORE_BUDGET     (32u * 1024 * 1024)	/* all of them */
+#define STORE_MAX_FILES  64
+
+/** scheme://host:port for a URL, or NULL for one with no host. */
+static char *origin_of(nsurl *url)
+{
+	lwc_string *scheme = NULL, *host = NULL;
+	char *out = NULL;
+
+	if (url == NULL) {
+		return NULL;
+	}
+	scheme = nsurl_get_component(url, NSURL_SCHEME);
+	host = nsurl_get_component(url, NSURL_HOST);
+	if (scheme != NULL && host != NULL) {
+		lwc_string *port = nsurl_get_component(url, NSURL_PORT);
+		size_t n = lwc_string_length(scheme) + lwc_string_length(host) +
+			(port != NULL ? lwc_string_length(port) : 0) + 8;
+
+		out = malloc(n);
+		if (out != NULL) {
+			snprintf(out, n, "%.*s://%.*s%s%.*s",
+				 (int)lwc_string_length(scheme),
+				 lwc_string_data(scheme),
+				 (int)lwc_string_length(host),
+				 lwc_string_data(host),
+				 port != NULL ? ":" : "",
+				 port != NULL ? (int)lwc_string_length(port) : 0,
+				 port != NULL ? lwc_string_data(port) : "");
+		}
+		if (port != NULL) lwc_string_unref(port);
+	} else if (scheme != NULL) {
+		/*
+		 * file: has no host. Every local page shares one store,
+		 * which is what a browser does with file: URLs too.
+		 */
+		out = strdup("file://");
+	}
+	if (scheme != NULL) lwc_string_unref(scheme);
+	if (host != NULL) lwc_string_unref(host);
+	return out;
+}
+
+static void store_path(char *buf, size_t n, const char *origin)
+{
+	uint64_t h = bc_hash(origin, strlen(origin));
+
+	snprintf(buf, n, "%s/%08x%08x.kv", VITASURF_STORAGE_DIR,
+		 (unsigned)(h >> 32), (unsigned)(h & 0xffffffffu));
+}
+
+/*
+ * The index, as for compiled scripts: the names and sizes of the files
+ * written, so the oldest can go when the budget is reached without
+ * reading the directory.
+ */
+static struct bc_entry store_index[STORE_MAX_FILES];
+static unsigned store_index_n;
+static uint32_t store_stamp;
+static bool store_index_read;
+
+static void store_index_load(void)
+{
+	char path[256];
+	FILE *f;
+
+	if (store_index_read) {
+		return;
+	}
+	store_index_read = true;
+	snprintf(path, sizeof(path), "%s/index", VITASURF_STORAGE_DIR);
+	f = fopen(path, "rb");
+	if (f == NULL) {
+		return;
+	}
+	while (store_index_n < STORE_MAX_FILES) {
+		struct bc_entry *e = &store_index[store_index_n];
+		unsigned bytes = 0, stamp = 0;
+
+		if (fscanf(f, "%23s %u %u", e->name, &bytes, &stamp) != 3) {
+			break;
+		}
+		e->bytes = bytes;
+		e->stamp = stamp;
+		if (stamp > store_stamp) {
+			store_stamp = stamp;
+		}
+		store_index_n++;
+	}
+	fclose(f);
+}
+
+static void store_index_save(void)
+{
+	char path[256];
+	FILE *f;
+	unsigned i;
+
+	snprintf(path, sizeof(path), "%s/index", VITASURF_STORAGE_DIR);
+	f = fopen(path, "wb");
+	if (f == NULL) {
+		return;
+	}
+	for (i = 0; i < store_index_n; i++) {
+		fprintf(f, "%s %u %u\n", store_index[i].name,
+			(unsigned)store_index[i].bytes,
+			(unsigned)store_index[i].stamp);
+	}
+	fclose(f);
+}
+
+/** Note this file at this size, dropping the least recently used first. */
+static void store_index_note(const char *name, uint32_t bytes)
+{
+	unsigned i;
+
+	store_index_load();
+	for (i = 0; i < store_index_n; i++) {
+		if (strcmp(store_index[i].name, name) == 0) {
+			store_index[i].bytes = bytes;
+			store_index[i].stamp = ++store_stamp;
+			store_index_save();
+			return;
+		}
+	}
+	for (;;) {
+		uint64_t total = bytes;
+		unsigned oldest = 0;
+
+		for (i = 0; i < store_index_n; i++) {
+			total += store_index[i].bytes;
+			if (store_index[i].stamp < store_index[oldest].stamp) {
+				oldest = i;
+			}
+		}
+		if (store_index_n == 0 ||
+		    (total <= STORE_BUDGET && store_index_n < STORE_MAX_FILES)) {
+			break;
+		}
+		{
+			char path[256];
+
+			snprintf(path, sizeof(path), "%s/%s",
+				 VITASURF_STORAGE_DIR, store_index[oldest].name);
+			remove(path);
+			vita_log("storage: full, dropping %s (%u KB)",
+				 store_index[oldest].name,
+				 (unsigned)(store_index[oldest].bytes / 1024));
+			memmove(&store_index[oldest], &store_index[oldest + 1],
+				(store_index_n - oldest - 1) *
+				sizeof(store_index[0]));
+			store_index_n--;
+		}
+	}
+	if (store_index_n < STORE_MAX_FILES) {
+		snprintf(store_index[store_index_n].name,
+			 sizeof(store_index[0].name), "%s", name);
+		store_index[store_index_n].bytes = bytes;
+		store_index[store_index_n].stamp = ++store_stamp;
+		store_index_n++;
+	}
+	store_index_save();
+}
+
+/** __vitaStoreLoad(): everything this origin has stored, or null. */
+static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	char path[256], *origin, *buf;
+	long len;
+	FILE *f;
+	JSValue out;
+
+	(void)this_val; (void)argc; (void)argv;
+	if (thread == NULL || thread->htmlc == NULL) {
+		return JS_NULL;
+	}
+	origin = origin_of(thread->htmlc->base_url);
+	if (origin == NULL) {
+		return JS_NULL;
+	}
+	store_path(path, sizeof(path), origin);
+	free(origin);
+	f = fopen(path, "rb");
+	if (f == NULL) {
+		return JS_NULL;
+	}
+	fseek(f, 0, SEEK_END);
+	len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (len <= 0 || (unsigned long)len > STORE_MAX_ORIGIN) {
+		fclose(f);
+		return JS_NULL;
+	}
+	buf = malloc((size_t)len + 1);
+	if (buf == NULL) {
+		fclose(f);
+		return JS_NULL;
+	}
+	if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
+		free(buf);
+		fclose(f);
+		return JS_NULL;
+	}
+	fclose(f);
+	buf[len] = 0;
+	out = JS_NewStringLen(ctx, buf, (size_t)len);
+	free(buf);
+	return out;
+}
+
+/** __vitaStoreSave(text): replace everything this origin has stored. */
+static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	char path[256], tmp[264], *origin;
+	const char *text;
+	size_t len = 0;
+	FILE *f;
+	bool ok = false;
+
+	(void)this_val;
+	if (thread == NULL || thread->htmlc == NULL || argc < 1) {
+		return JS_FALSE;
+	}
+	origin = origin_of(thread->htmlc->base_url);
+	if (origin == NULL) {
+		return JS_FALSE;
+	}
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (text == NULL) {
+		free(origin);
+		return JS_FALSE;
+	}
+	if (len > STORE_MAX_ORIGIN) {
+		vita_log("storage: %s wanted %u KB, over the %u KB a site gets",
+			 origin, (unsigned)(len / 1024),
+			 (unsigned)(STORE_MAX_ORIGIN / 1024));
+		JS_FreeCString(ctx, text);
+		free(origin);
+		return JS_FALSE;
+	}
+	store_path(path, sizeof(path), origin);
+	free(origin);
+	/* beside its own name and renamed over it, as for the script cache */
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	f = fopen(tmp, "wb");
+	if (f != NULL) {
+		ok = fwrite(text, 1, len, f) == len;
+		fclose(f);
+		if (ok) {
+			remove(path);
+			ok = rename(tmp, path) == 0;
+		}
+		if (!ok) {
+			remove(tmp);
+		}
+	}
+	if (ok) {
+		store_index_note(strrchr(path, '/') + 1, (uint32_t)len);
+	}
+	JS_FreeCString(ctx, text);
+	return ok ? JS_TRUE : JS_FALSE;
+}
 
 /*
  * An import map: <script type="importmap">, whose JSON says what a bare
@@ -5308,7 +6242,7 @@ static void module_retry_callback(void *p)
 			set_import_meta(thread->ctx, fn, d->name);
 			vita_log("qjs: module '%s' ready after %d tries",
 				 d->name, d->tries + 1);
-			begin_script(thread);
+			rearm_deadline(thread);
 			ret = settle_module(thread,
 					    JS_EvalFunction(thread->ctx, fn),
 					    d->name);
@@ -5424,7 +6358,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * the same two steps internally, so this costs nothing.
 		 */
 		uint64_t t_start = now_ms(), t_compiled, t_done;
-		bool module = false;
+		bool module = false, cached = false;
 		JSValue fn;
 
 		/*
@@ -5449,8 +6383,16 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * semantics, and the retry costs a parse only on source
 		 * that was not going to run at all.
 		 */
+		fn = bc_load(thread->ctx, name, src, txtlen);
+		if (!JS_IsUndefined(fn)) {
+			cached = true;
+			goto compiled;
+		}
 		fn = JS_Eval(thread->ctx, src, txtlen, name,
 			     JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+		if (!JS_IsException(fn)) {
+			bc_store(thread->ctx, name, src, txtlen, fn);
+		}
 		if (JS_IsException(fn)) {
 			JSValue script_err = JS_GetException(thread->ctx);
 			unsigned missed = thread->js_imports_missed;
@@ -5494,6 +6436,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			}
 		}
 
+	compiled:
 		t_compiled = now_ms();
 		if (JS_IsException(fn)) {
 			ret = fn;
@@ -5506,7 +6449,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			 * that took longer to compile than script_timeout was
 			 * aborted at its first statement.
 			 */
-			begin_script(thread);
+			rearm_deadline(thread);
 			ret = JS_EvalFunction(thread->ctx, fn);
 			/*
 			 * QuickJS checks a global let or const against the
@@ -5535,7 +6478,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 						JS_FreeValue(thread->ctx, err);
 						module = true;
 						set_import_meta(thread->ctx, m, name);
-						begin_script(thread);
+						rearm_deadline(thread);
 						ret = JS_EvalFunction(thread->ctx, m);
 					} else {
 						JS_FreeValue(thread->ctx,
@@ -5560,9 +6503,10 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		thread->js_run_ms += (unsigned)(t_done - t_compiled);
 
 		if (txtlen > SCRIPT_LOG_BYTES || vita_verbose_requested()) {
-			vita_log("qjs: script %u KB compiled in %u ms, "
+			vita_log("qjs: script %u KB %s in %u ms, "
 				 "ran in %u ms, runtime memory now %u KB: %s",
 				 (unsigned)(txtlen / 1024),
+				 cached ? "read from cache" : "compiled",
 				 (unsigned)(t_compiled - t_start),
 				 (unsigned)(t_done - t_compiled),
 				 runtime_kb(thread->heap->rt),

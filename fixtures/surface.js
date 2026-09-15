@@ -126,6 +126,19 @@ var SURFACE = {
 ],
 "methods": []
 },
+"BatteryManager": {
+"attributes": [
+"charging",
+"chargingTime",
+"dischargingTime",
+"level",
+"onchargingchange",
+"onchargingtimechange",
+"ondischargingtimechange",
+"onlevelchange"
+],
+"methods": []
+},
 "BeforeUnloadEvent": {
 "attributes": [
 "returnValue"
@@ -170,6 +183,82 @@ var SURFACE = {
 "methods": [
 "close",
 "postMessage"
+]
+},
+"ByteLengthQueuingStrategy": {
+"attributes": [
+"highWaterMark",
+"size"
+],
+"methods": []
+},
+"CSS": {
+"attributes": [
+"highlights"
+],
+"methods": [
+"cap",
+"ch",
+"cm",
+"cqb",
+"cqh",
+"cqi",
+"cqmax",
+"cqmin",
+"cqw",
+"deg",
+"dpcm",
+"dpi",
+"dppx",
+"dvb",
+"dvh",
+"dvi",
+"dvmax",
+"dvmin",
+"dvw",
+"em",
+"escape",
+"ex",
+"fr",
+"grad",
+"ic",
+"in",
+"kHz",
+"lh",
+"lvb",
+"lvh",
+"lvi",
+"lvmax",
+"lvmin",
+"lvw",
+"mm",
+"ms",
+"number",
+"pc",
+"percent",
+"pt",
+"px",
+"rad",
+"rcap",
+"rch",
+"rem",
+"rex",
+"ric",
+"rlh",
+"s",
+"svb",
+"svh",
+"svi",
+"svmax",
+"svmin",
+"svw",
+"turn",
+"vb",
+"vh",
+"vi",
+"vmax",
+"vmin",
+"vw"
 ]
 },
 "CSSColor": {
@@ -817,6 +906,46 @@ var SURFACE = {
 "replaceWith"
 ]
 },
+"Clipboard": {
+"attributes": [],
+"methods": [
+"read",
+"readText",
+"write",
+"writeText"
+]
+},
+"ClipboardChangeEvent": {
+"attributes": [
+"changeId",
+"types"
+],
+"methods": []
+},
+"ClipboardEvent": {
+"attributes": [
+"clipboardData"
+],
+"methods": []
+},
+"ClipboardItem": {
+"attributes": [
+"presentationStyle",
+"types"
+],
+"methods": [
+"getType",
+"supports"
+]
+},
+"CloseEvent": {
+"attributes": [
+"code",
+"reason",
+"wasClean"
+],
+"methods": []
+},
 "CloseWatcher": {
 "attributes": [
 "oncancel",
@@ -835,10 +964,6 @@ var SURFACE = {
 ],
 "methods": []
 },
-"Comment": {
-"attributes": [],
-"methods": []
-},
 "CompositionEvent": {
 "attributes": [
 "data"
@@ -846,6 +971,20 @@ var SURFACE = {
 "methods": [
 "initCompositionEvent"
 ]
+},
+"CompressionStream": {
+"attributes": [
+"readable",
+"writable"
+],
+"methods": []
+},
+"CountQueuingStrategy": {
+"attributes": [
+"highWaterMark",
+"size"
+],
+"methods": []
 },
 "CustomElementRegistry": {
 "attributes": [],
@@ -864,6 +1003,14 @@ var SURFACE = {
 "methods": [
 "initCustomEvent"
 ]
+},
+"DOMException": {
+"attributes": [
+"code",
+"message",
+"name"
+],
+"methods": []
 },
 "DOMImplementation": {
 "attributes": [],
@@ -888,10 +1035,6 @@ var SURFACE = {
 "contains",
 "item"
 ]
-},
-"DOMStringMap": {
-"attributes": [],
-"methods": []
 },
 "DOMTokenList": {
 "attributes": [
@@ -943,6 +1086,13 @@ var SURFACE = {
 "remove"
 ]
 },
+"DecompressionStream": {
+"attributes": [
+"readable",
+"writable"
+],
+"methods": []
+},
 "DedicatedWorkerGlobalScope": {
 "attributes": [
 "name",
@@ -985,7 +1135,11 @@ var SURFACE = {
 "embeds",
 "fgColor",
 "firstElementChild",
+"fonts",
 "forms",
+"fullscreen",
+"fullscreenElement",
+"fullscreenEnabled",
 "head",
 "hidden",
 "images",
@@ -1029,6 +1183,8 @@ var SURFACE = {
 "onerror",
 "onfocus",
 "onformdata",
+"onfullscreenchange",
+"onfullscreenerror",
 "ongotpointercapture",
 "oninput",
 "oninvalid",
@@ -1131,6 +1287,7 @@ var SURFACE = {
 "elementsFromPoint",
 "evaluate",
 "execCommand",
+"exitFullscreen",
 "getAnimations",
 "getBoxQuads",
 "getElementById",
@@ -1181,15 +1338,12 @@ var SURFACE = {
 "activeElement",
 "adoptedStyleSheets",
 "customElementRegistry",
+"fullscreenElement",
 "styleSheets"
 ],
 "methods": [
 "getAnimations"
 ]
-},
-"DocumentTimeline": {
-"attributes": [],
-"methods": []
 },
 "DocumentType": {
 "attributes": [
@@ -1230,6 +1384,8 @@ var SURFACE = {
 "localName",
 "namespaceURI",
 "nextElementSibling",
+"onfullscreenchange",
+"onfullscreenerror",
 "prefix",
 "previousElementSibling",
 "scrollHeight",
@@ -1284,6 +1440,7 @@ var SURFACE = {
 "removeAttributeNode",
 "replaceChildren",
 "replaceWith",
+"requestFullscreen",
 "scroll",
 "scrollBy",
 "scrollIntoView",
@@ -1393,10 +1550,6 @@ var SURFACE = {
 "removeEventListener"
 ]
 },
-"External": {
-"attributes": [],
-"methods": []
-},
 "FetchLaterResult": {
 "attributes": [
 "activated"
@@ -1452,6 +1605,81 @@ var SURFACE = {
 ],
 "methods": []
 },
+"FontFace": {
+"attributes": [
+"ascentOverride",
+"descentOverride",
+"display",
+"family",
+"featureSettings",
+"features",
+"lineGapOverride",
+"loaded",
+"palettes",
+"status",
+"stretch",
+"style",
+"unicodeRange",
+"variationSettings",
+"variations",
+"weight"
+],
+"methods": [
+"load"
+]
+},
+"FontFacePalette": {
+"attributes": [
+"length",
+"usableWithDarkBackground",
+"usableWithLightBackground"
+],
+"methods": []
+},
+"FontFacePalettes": {
+"attributes": [
+"length"
+],
+"methods": []
+},
+"FontFaceSet": {
+"attributes": [
+"onloading",
+"onloadingdone",
+"onloadingerror",
+"ready",
+"status"
+],
+"methods": [
+"add",
+"check",
+"clear",
+"delete",
+"load"
+]
+},
+"FontFaceSetLoadEvent": {
+"attributes": [
+"fontfaces"
+],
+"methods": []
+},
+"FontFaceSource": {
+"attributes": [
+"fonts"
+],
+"methods": []
+},
+"FontFaceVariationAxis": {
+"attributes": [
+"axisTag",
+"defaultValue",
+"maximumValue",
+"minimumValue",
+"name"
+],
+"methods": []
+},
 "FormData": {
 "attributes": [],
 "methods": [
@@ -1466,6 +1694,50 @@ var SURFACE = {
 "FormDataEvent": {
 "attributes": [
 "formData"
+],
+"methods": []
+},
+"Gamepad": {
+"attributes": [
+"axes",
+"buttons",
+"connected",
+"id",
+"index",
+"mapping",
+"timestamp",
+"touches",
+"vibrationActuator"
+],
+"methods": []
+},
+"GamepadButton": {
+"attributes": [
+"pressed",
+"touched",
+"value"
+],
+"methods": []
+},
+"GamepadEvent": {
+"attributes": [
+"gamepad"
+],
+"methods": []
+},
+"GamepadHapticActuator": {
+"attributes": [
+"effects"
+],
+"methods": [
+"playEffect",
+"reset"
+]
+},
+"GenericTransformStream": {
+"attributes": [
+"readable",
+"writable"
 ],
 "methods": []
 },
@@ -1640,10 +1912,6 @@ var SURFACE = {
 ],
 "methods": []
 },
-"HTMLAudioElement": {
-"attributes": [],
-"methods": []
-},
 "HTMLBRElement": {
 "attributes": [
 "clear"
@@ -1666,6 +1934,8 @@ var SURFACE = {
 "onafterprint",
 "onbeforeprint",
 "onbeforeunload",
+"ongamepadconnected",
+"ongamepaddisconnected",
 "onhashchange",
 "onlanguagechange",
 "onmessage",
@@ -1961,10 +2231,6 @@ var SURFACE = {
 ],
 "methods": []
 },
-"HTMLFormControlsCollection": {
-"attributes": [],
-"methods": []
-},
 "HTMLFormElement": {
 "attributes": [
 "acceptCharset",
@@ -2010,6 +2276,8 @@ var SURFACE = {
 "onafterprint",
 "onbeforeprint",
 "onbeforeunload",
+"ongamepadconnected",
+"ongamepaddisconnected",
 "onhashchange",
 "onlanguagechange",
 "onmessage",
@@ -2037,10 +2305,6 @@ var SURFACE = {
 "size",
 "width"
 ],
-"methods": []
-},
-"HTMLHeadElement": {
-"attributes": [],
 "methods": []
 },
 "HTMLHeadingElement": {
@@ -2450,10 +2714,6 @@ var SURFACE = {
 ],
 "methods": []
 },
-"HTMLPictureElement": {
-"attributes": [],
-"methods": []
-},
 "HTMLPreElement": {
 "attributes": [
 "width"
@@ -2526,10 +2786,6 @@ var SURFACE = {
 "showPicker"
 ]
 },
-"HTMLSelectedContentElement": {
-"attributes": [],
-"methods": []
-},
 "HTMLSlotElement": {
 "attributes": [
 "name"
@@ -2550,10 +2806,6 @@ var SURFACE = {
 "type",
 "width"
 ],
-"methods": []
-},
-"HTMLSpanElement": {
-"attributes": [],
 "methods": []
 },
 "HTMLStyleElement": {
@@ -2769,6 +3021,19 @@ var SURFACE = {
 "set"
 ]
 },
+"Highlight": {
+"attributes": [
+"priority",
+"type"
+],
+"methods": []
+},
+"HighlightRegistry": {
+"attributes": [],
+"methods": [
+"highlightsFromPoint"
+]
+},
 "History": {
 "attributes": [
 "length",
@@ -2799,6 +3064,170 @@ var SURFACE = {
 "username"
 ],
 "methods": []
+},
+"IDBCursor": {
+"attributes": [
+"direction",
+"key",
+"primaryKey",
+"request"
+],
+"methods": [
+"advance",
+"continue",
+"continuePrimaryKey",
+"delete",
+"update"
+]
+},
+"IDBCursorWithValue": {
+"attributes": [
+"value"
+],
+"methods": []
+},
+"IDBDatabase": {
+"attributes": [
+"name",
+"objectStoreNames",
+"onabort",
+"onclose",
+"onerror",
+"onversionchange",
+"version"
+],
+"methods": [
+"close",
+"createObjectStore",
+"deleteObjectStore",
+"transaction"
+]
+},
+"IDBFactory": {
+"attributes": [],
+"methods": [
+"cmp",
+"databases",
+"deleteDatabase",
+"open"
+]
+},
+"IDBIndex": {
+"attributes": [
+"keyPath",
+"multiEntry",
+"name",
+"objectStore",
+"unique"
+],
+"methods": [
+"count",
+"get",
+"getAll",
+"getAllKeys",
+"getAllRecords",
+"getKey",
+"openCursor",
+"openKeyCursor"
+]
+},
+"IDBKeyRange": {
+"attributes": [
+"lower",
+"lowerOpen",
+"upper",
+"upperOpen"
+],
+"methods": [
+"bound",
+"lowerBound",
+"only",
+"upperBound"
+]
+},
+"IDBObjectStore": {
+"attributes": [
+"autoIncrement",
+"indexNames",
+"keyPath",
+"name",
+"transaction"
+],
+"methods": [
+"add",
+"clear",
+"count",
+"createIndex",
+"delete",
+"deleteIndex",
+"get",
+"getAll",
+"getAllKeys",
+"getAllRecords",
+"getKey",
+"index",
+"openCursor",
+"openKeyCursor",
+"put"
+]
+},
+"IDBOpenDBRequest": {
+"attributes": [
+"onblocked",
+"onupgradeneeded"
+],
+"methods": []
+},
+"IDBRecord": {
+"attributes": [
+"key",
+"primaryKey",
+"value"
+],
+"methods": []
+},
+"IDBRequest": {
+"attributes": [
+"error",
+"onerror",
+"onsuccess",
+"readyState",
+"result",
+"transaction"
+],
+"methods": []
+},
+"IDBTransaction": {
+"attributes": [
+"db",
+"durability",
+"error",
+"mode",
+"objectStoreNames",
+"onabort",
+"oncomplete",
+"onerror"
+],
+"methods": [
+"abort",
+"commit",
+"objectStore"
+]
+},
+"IDBVersionChangeEvent": {
+"attributes": [
+"newVersion",
+"oldVersion"
+],
+"methods": []
+},
+"IdleDeadline": {
+"attributes": [
+"didTimeout"
+],
+"methods": [
+"timeRemaining"
+]
 },
 "ImageBitmap": {
 "attributes": [
@@ -3174,6 +3603,7 @@ var SURFACE = {
 "appCodeName",
 "appName",
 "appVersion",
+"clipboard",
 "cookieEnabled",
 "hardwareConcurrency",
 "language",
@@ -3187,16 +3617,20 @@ var SURFACE = {
 "plugins",
 "product",
 "productSub",
+"storage",
 "userActivation",
 "userAgent",
 "vendor",
 "vendorSub"
 ],
 "methods": [
+"getBattery",
+"getGamepads",
 "javaEnabled",
 "registerProtocolHandler",
 "taintEnabled",
-"unregisterProtocolHandler"
+"unregisterProtocolHandler",
+"vibrate"
 ]
 },
 "NavigatorConcurrentHardware": {
@@ -3257,6 +3691,12 @@ var SURFACE = {
 "methods": [
 "javaEnabled"
 ]
+},
+"NavigatorStorage": {
+"attributes": [
+"storage"
+],
+"methods": []
 },
 "Node": {
 "attributes": [
@@ -3549,9 +3989,41 @@ var SURFACE = {
 "timing"
 ],
 "methods": [
+"clearMarks",
+"clearMeasures",
+"getEntries",
+"getEntriesByName",
+"getEntriesByType",
+"mark",
+"measure",
 "now",
 "toJSON"
 ]
+},
+"PerformanceEntry": {
+"attributes": [
+"duration",
+"entryType",
+"id",
+"name",
+"navigationId",
+"startTime"
+],
+"methods": [
+"toJSON"
+]
+},
+"PerformanceMark": {
+"attributes": [
+"detail"
+],
+"methods": []
+},
+"PerformanceMeasure": {
+"attributes": [
+"detail"
+],
+"methods": []
 },
 "PerformanceNavigation": {
 "attributes": [
@@ -3580,6 +4052,24 @@ var SURFACE = {
 ],
 "methods": [
 "toJSON"
+]
+},
+"PerformanceObserver": {
+"attributes": [
+"supportedEntryTypes"
+],
+"methods": [
+"disconnect",
+"observe",
+"takeRecords"
+]
+},
+"PerformanceObserverEntryList": {
+"attributes": [],
+"methods": [
+"getEntries",
+"getEntriesByName",
+"getEntriesByType"
 ]
 },
 "PerformanceTiming": {
@@ -3706,6 +4196,13 @@ var SURFACE = {
 ],
 "methods": []
 },
+"QuotaExceededError": {
+"attributes": [
+"quota",
+"requested"
+],
+"methods": []
+},
 "RadioNodeList": {
 "attributes": [
 "value"
@@ -3740,6 +4237,77 @@ var SURFACE = {
 "setStartAfter",
 "setStartBefore",
 "surroundContents"
+]
+},
+"ReadableByteStreamController": {
+"attributes": [
+"byobRequest",
+"desiredSize"
+],
+"methods": [
+"close",
+"enqueue",
+"error"
+]
+},
+"ReadableStream": {
+"attributes": [
+"locked"
+],
+"methods": [
+"cancel",
+"from",
+"getReader",
+"pipeThrough",
+"pipeTo",
+"tee"
+]
+},
+"ReadableStreamBYOBReader": {
+"attributes": [
+"closed"
+],
+"methods": [
+"cancel",
+"read",
+"releaseLock"
+]
+},
+"ReadableStreamBYOBRequest": {
+"attributes": [
+"view"
+],
+"methods": [
+"respond",
+"respondWithNewView"
+]
+},
+"ReadableStreamDefaultController": {
+"attributes": [
+"desiredSize"
+],
+"methods": [
+"close",
+"enqueue",
+"error"
+]
+},
+"ReadableStreamDefaultReader": {
+"attributes": [
+"closed"
+],
+"methods": [
+"cancel",
+"read",
+"releaseLock"
+]
+},
+"ReadableStreamGenericReader": {
+"attributes": [
+"closed"
+],
+"methods": [
+"cancel"
 ]
 },
 "Request": {
@@ -3846,10 +4414,22 @@ var SURFACE = {
 "availWidth",
 "colorDepth",
 "height",
+"orientation",
 "pixelDepth",
 "width"
 ],
 "methods": []
+},
+"ScreenOrientation": {
+"attributes": [
+"angle",
+"onchange",
+"type"
+],
+"methods": [
+"lock",
+"unlock"
+]
 },
 "Selection": {
 "attributes": [
@@ -3902,6 +4482,7 @@ var SURFACE = {
 "clonable",
 "customElementRegistry",
 "delegatesFocus",
+"fullscreenElement",
 "host",
 "mode",
 "onslotchange",
@@ -3938,10 +4519,6 @@ var SURFACE = {
 ],
 "methods": []
 },
-"StaticRange": {
-"attributes": [],
-"methods": []
-},
 "Storage": {
 "attributes": [
 "length"
@@ -3964,6 +4541,14 @@ var SURFACE = {
 ],
 "methods": [
 "initStorageEvent"
+]
+},
+"StorageManager": {
+"attributes": [],
+"methods": [
+"estimate",
+"persist",
+"persisted"
 ]
 },
 "StylePropertyMap": {
@@ -4044,7 +4629,9 @@ var SURFACE = {
 "attributes": [
 "encoding",
 "fatal",
-"ignoreBOM"
+"ignoreBOM",
+"readable",
+"writable"
 ],
 "methods": []
 },
@@ -4065,7 +4652,9 @@ var SURFACE = {
 },
 "TextEncoderStream": {
 "attributes": [
-"encoding"
+"encoding",
+"readable",
+"writable"
 ],
 "methods": []
 },
@@ -4201,9 +4790,22 @@ var SURFACE = {
 "item"
 ]
 },
-"TrackEvent": {
-"attributes": [],
+"TransformStream": {
+"attributes": [
+"readable",
+"writable"
+],
 "methods": []
+},
+"TransformStreamDefaultController": {
+"attributes": [
+"desiredSize"
+],
+"methods": [
+"enqueue",
+"error",
+"terminate"
+]
 },
 "TreeWalker": {
 "attributes": [
@@ -4253,6 +4855,23 @@ var SURFACE = {
 "parse",
 "revokeObjectURL",
 "toJSON"
+]
+},
+"URLPattern": {
+"attributes": [
+"hasRegExpGroups",
+"hash",
+"hostname",
+"password",
+"pathname",
+"port",
+"protocol",
+"search",
+"username"
+],
+"methods": [
+"exec",
+"test"
 ]
 },
 "URLSearchParams": {
@@ -4338,6 +4957,24 @@ var SURFACE = {
 ],
 "methods": []
 },
+"WebSocket": {
+"attributes": [
+"binaryType",
+"bufferedAmount",
+"extensions",
+"onclose",
+"onerror",
+"onmessage",
+"onopen",
+"protocol",
+"readyState",
+"url"
+],
+"methods": [
+"close",
+"send"
+]
+},
 "WheelEvent": {
 "attributes": [
 "deltaMode",
@@ -4360,6 +4997,7 @@ var SURFACE = {
 "frameElement",
 "frames",
 "history",
+"indexedDB",
 "innerHeight",
 "innerWidth",
 "isSecureContext",
@@ -4407,6 +5045,8 @@ var SURFACE = {
 "onerror",
 "onfocus",
 "onformdata",
+"ongamepadconnected",
+"ongamepaddisconnected",
 "ongotpointercapture",
 "onhashchange",
 "oninput",
@@ -4515,6 +5155,7 @@ var SURFACE = {
 "blur",
 "btoa",
 "cancelAnimationFrame",
+"cancelIdleCallback",
 "captureEvents",
 "clearInterval",
 "clearTimeout",
@@ -4537,6 +5178,7 @@ var SURFACE = {
 "releaseEvents",
 "reportError",
 "requestAnimationFrame",
+"requestIdleCallback",
 "resizeBy",
 "resizeTo",
 "scroll",
@@ -4553,6 +5195,8 @@ var SURFACE = {
 "onafterprint",
 "onbeforeprint",
 "onbeforeunload",
+"ongamepadconnected",
+"ongamepaddisconnected",
 "onhashchange",
 "onlanguagechange",
 "onmessage",
@@ -4580,6 +5224,7 @@ var SURFACE = {
 "WindowOrWorkerGlobalScope": {
 "attributes": [
 "crossOriginIsolated",
+"indexedDB",
 "isSecureContext",
 "origin",
 "performance"
@@ -4618,6 +5263,8 @@ var SURFACE = {
 "WorkerGlobalScope": {
 "attributes": [
 "crossOriginIsolated",
+"fonts",
+"indexedDB",
 "isSecureContext",
 "location",
 "navigator",
@@ -4668,6 +5315,7 @@ var SURFACE = {
 "productSub",
 "protocol",
 "search",
+"storage",
 "userAgent",
 "vendor",
 "vendorSub"
@@ -4680,6 +5328,37 @@ var SURFACE = {
 "attributes": [],
 "methods": [
 "addModule"
+]
+},
+"WritableStream": {
+"attributes": [
+"locked"
+],
+"methods": [
+"abort",
+"close",
+"getWriter"
+]
+},
+"WritableStreamDefaultController": {
+"attributes": [
+"signal"
+],
+"methods": [
+"error"
+]
+},
+"WritableStreamDefaultWriter": {
+"attributes": [
+"closed",
+"desiredSize",
+"ready"
+],
+"methods": [
+"abort",
+"close",
+"releaseLock",
+"write"
 ]
 },
 "XMLHttpRequest": {
@@ -4779,6 +5458,30 @@ var SURFACE = {
 "setParameter",
 "transformToDocument",
 "transformToFragment"
+]
+},
+"console": {
+"attributes": [],
+"methods": [
+"assert",
+"clear",
+"count",
+"countReset",
+"debug",
+"dir",
+"dirxml",
+"error",
+"group",
+"groupCollapsed",
+"groupEnd",
+"info",
+"log",
+"table",
+"time",
+"timeEnd",
+"timeLog",
+"trace",
+"warn"
 ]
 }
 };

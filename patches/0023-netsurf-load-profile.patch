@@ -1,5 +1,5 @@
 diff --git a/content/content.c b/content/content.c
-index 448cf2369..e9615b7d4 100644
+index 448cf2369..78c9bfb00 100644
 --- a/content/content.c
 +++ b/content/content.c
 @@ -28,6 +28,7 @@
@@ -10,7 +10,7 @@ index 448cf2369..e9615b7d4 100644
  #include "utils/messages.h"
  #include "utils/corestrings.h"
  #include "netsurf/browser_window.h"
-@@ -80,10 +81,68 @@ static void content_convert(struct content *c)
+@@ -80,10 +81,78 @@ static void content_convert(struct content *c)
  	      nsurl_access_log(llcache_handle_get_url(c->llcache)), c);
  
  	if (c->handler->data_complete != NULL) {
@@ -72,7 +72,17 @@ index 448cf2369..e9615b7d4 100644
 +					 (int)(sizeof(tail) - 4), url);
 +				url = tail;
 +			}
-+			vita_log("slow convert: %u ms for %u KB of %s",
++			/*
++			 * A script's conversion does nothing but set the
++			 * content done, which is what runs the script -- so
++			 * for CONTENT_JS this time is the compile and the
++			 * run, already reported line by line by the engine.
++			 * Saying "convert" for it sent me looking for a
++			 * charset loop that does not exist.
++			 */
++			vita_log("slow %s: %u ms for %u KB of %s",
++				 type == CONTENT_JS ? "script (compile+run)"
++						    : "convert",
 +				 (unsigned int)self,
 +				 (unsigned int)(size / 1024), url);
 +		}
@@ -227,11 +237,52 @@ index 8baf33870..cfb154c9d 100644
 +	vitasurf_ms_layout += (unsigned int)(vs_t1 - vs_t0);
  	return ret;
  }
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index d040f4528..c701a1919 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -32,6 +32,7 @@
+ #include "utils/utils.h"
+ #include "utils/nsoption.h"
+ #include "utils/filepath.h"
++#include <nsutils/time.h>
+ #include "utils/log.h"
+ #include "utils/messages.h"
+ #include "netsurf/browser_window.h"
+@@ -388,10 +389,24 @@ fb_redraw(fbtk_widget_t *widget,
+ 	clip.x1 = bwidget->redraw_box.x1;
+ 	clip.y1 = bwidget->redraw_box.y1;
+ 
+-	browser_window_redraw(bw,
+-			x - bwidget->scrollx,
+-			y - bwidget->scrolly,
+-			&clip, &ctx);
++	{
++		/*
++		 * Drawing, as opposed to laying out (VitaSurf). This is
++		 * where glyphs are rasterised and pixels are written, and
++		 * it was never counted: a page whose layout had dropped to
++		 * five milliseconds still took the best part of three
++		 * seconds, with nothing in the profile to say where.
++		 */
++		uint64_t vs_t0 = 0, vs_t1 = 0;
++
++		nsu_getmonotonic_ms(&vs_t0);
++		browser_window_redraw(bw,
++				x - bwidget->scrollx,
++				y - bwidget->scrolly,
++				&clip, &ctx);
++		nsu_getmonotonic_ms(&vs_t1);
++		vitasurf_ms_draw += (unsigned int)(vs_t1 - vs_t0);
++	}
+ 
+ 	if (fbtk_get_caret(widget, &caret_x, &caret_y, &caret_h)) {
+ 		/* This widget has caret, so render it */
 diff --git a/utils/utils.c b/utils/utils.c
-index c64718531..8a3ecc194 100644
+index c64718531..fc4c433a8 100644
 --- a/utils/utils.c
 +++ b/utils/utils.c
-@@ -571,3 +571,22 @@ void regfree(regex_t *preg)
+@@ -571,3 +571,30 @@ void regfree(regex_t *preg)
  }
  
  #endif
@@ -243,6 +294,10 @@ index c64718531..8a3ecc194 100644
 +unsigned int vitasurf_ms_image;
 +unsigned int vitasurf_ms_boxes;
 +unsigned int vitasurf_ms_layout;
++unsigned int vitasurf_ms_script;
++unsigned int vitasurf_ms_draw;
++unsigned int vitasurf_ms_teardown;
++unsigned int vitasurf_ms_prelude;
 +
 +/* exported interface documented in utils/utils.h */
 +void vitasurf_profile_reset(void)
@@ -252,10 +307,14 @@ index c64718531..8a3ecc194 100644
 +	vitasurf_ms_image = 0;
 +	vitasurf_ms_boxes = 0;
 +	vitasurf_ms_layout = 0;
++	vitasurf_ms_script = 0;
++	vitasurf_ms_draw = 0;
++	vitasurf_ms_teardown = 0;
++	vitasurf_ms_prelude = 0;
 +	vitasurf_ms_nested = 0;
 +}
 diff --git a/utils/utils.h b/utils/utils.h
-index 8a051633c..e44dda3be 100644
+index 8a051633c..c4329261c 100644
 --- a/utils/utils.h
 +++ b/utils/utils.h
 @@ -27,6 +27,7 @@
@@ -266,7 +325,7 @@ index 8a051633c..e44dda3be 100644
  
  #ifndef NOF_ELEMENTS
  #define NOF_ELEMENTS(array) (sizeof(array)/sizeof(*(array)))
-@@ -120,4 +121,36 @@ bool is_dir(const char *path);
+@@ -120,4 +121,59 @@ bool is_dir(const char *path);
  #endif
  
  
@@ -283,6 +342,29 @@ index 8a051633c..e44dda3be 100644
 +extern unsigned int vitasurf_ms_image;
 +extern unsigned int vitasurf_ms_boxes;
 +extern unsigned int vitasurf_ms_layout;
++/**
++ * Milliseconds spent inside script, however it was entered: a
++ * <script>, a timer, an event listener. The other counters cover
++ * only what a content conversion does, and on a page that works
++ * through timers that is a small part of the load.
++ */
++extern unsigned int vitasurf_ms_script;
++/**
++ * Milliseconds spent drawing the page, which is where glyphs are
++ * rasterised and pixels reach the screen. Laying out and drawing
++ * are separate passes and only the first was ever counted.
++ */
++extern unsigned int vitasurf_ms_draw;
++/**
++ * Milliseconds spent tearing the previous page's script down. It
++ * happens inside the next page's load, so it is that page's wait.
++ */
++extern unsigned int vitasurf_ms_teardown;
++/**
++ * Milliseconds spent running the bindings' own JavaScript, which
++ * happens once per page before any of the page's own script.
++ */
++extern unsigned int vitasurf_ms_prelude;
 +/**
 + * Milliseconds the conversion now returning spent, handed up so the
 + * conversion that contains it can subtract its own nested work.

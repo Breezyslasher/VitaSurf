@@ -53,7 +53,15 @@ jobs:
                   'selection-api', 'pointerevents', 'touch-events',
                   'css-typed-om', 'intersection-observer', 'resize-observer',
                   'referrer-policy', 'navigation-timing', 'hr-time',
-                  'console', 'encoding', 'FileAPI', 'notifications']
+                  'console', 'encoding', 'FileAPI', 'notifications',
+                  # second batch: the rest of what a page reaches for
+                  'streams', 'IndexedDB', 'WebCryptoAPI', 'websockets',
+                  'performance-timeline', 'user-timing', 'webidl',
+                  'fullscreen', 'page-visibility', 'css-font-loading',
+                  'clipboard-apis', 'storage', 'mediaqueries',
+                  'requestidlecallback', 'screen-orientation',
+                  'battery-status', 'gamepad', 'vibration',
+                  'compression', 'urlpattern', 'css-highlight-api']
 
           src = {}
           for path in glob.glob('/tmp/idl/package/*.idl'):
@@ -71,6 +79,14 @@ jobs:
           blocks = {}
           for m in re.finditer(
                   r'(?:partial\s+)?interface\s+(?:mixin\s+)?(\w+)[^{;]*\{(.*?)\n\};',
+                  text, re.S):
+              blocks.setdefault(m.group(1), []).append(m.group(2))
+
+          # namespaces too. console is one, not an interface, which is why
+          # console.assert was missing from this list while a page that
+          # called it died on the spot.
+          for m in re.finditer(
+                  r'(?:partial\s+)?namespace\s+(\w+)[^{;]*\{(.*?)\n\};',
                   text, re.S):
               blocks.setdefault(m.group(1), []).append(m.group(2))
 

@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html><body><div id="host">t</div>
+<script>
+/* A runaway that dispatches an event on every pass. Each listener used
+   to re-arm the budget on the way in and clear it on the way out, so
+   the loop had no deadline at all after the first dispatch. */
+var host = document.getElementById('host');
+var hits = 0;
+host.addEventListener('ping', function(){ hits++; });
+var start = Date.now(), passes = 0;
+try {
+  for (;;) {
+    host.dispatchEvent(new Event('ping'));
+    passes++;
+    if ((passes & 255) === 0 && Date.now() - start > 90000) break;
+  }
+} catch (e) { console.log('runaway2 caught: ' + e); }
+console.log('runaway2 left the loop after ' + passes + ' passes, ' +
+            (Date.now() - start) + ' ms, ' + hits + ' listener calls');
+</script>
+</body></html>

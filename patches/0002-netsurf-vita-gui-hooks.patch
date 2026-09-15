@@ -1,8 +1,8 @@
 diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
-index 5bfc8227b..70fc517ce 100644
+index f54dd6034..c38da02ee 100644
 --- a/frontends/framebuffer/gui.c
 +++ b/frontends/framebuffer/gui.c
-@@ -51,6 +51,10 @@
+@@ -54,6 +54,10 @@
  #include "framebuffer/findfile.h"
  #include "framebuffer/image_data.h"
  #include "framebuffer/font.h"
@@ -13,7 +13,7 @@ index 5bfc8227b..70fc517ce 100644
  #include "framebuffer/clipboard.h"
  #include "framebuffer/fetch.h"
  #include "framebuffer/bitmap.h"
-@@ -2068,6 +2072,10 @@ gui_window_stop_throbber(struct gui_window *gw)
+@@ -2095,6 +2099,10 @@ gui_window_stop_throbber(struct gui_window *gw)
  
  	fb_update_back_forward(gw);
  
@@ -24,7 +24,7 @@ index 5bfc8227b..70fc517ce 100644
  }
  
  static void
-@@ -2196,6 +2204,10 @@ main(int argc, char** argv)
+@@ -2231,6 +2239,10 @@ main(int argc, char** argv)
  		.utf8 = framebuffer_utf8_table,
  		.bitmap = framebuffer_bitmap_table,
  		.layout = framebuffer_layout_table,
@@ -35,3 +35,15 @@ index 5bfc8227b..70fc517ce 100644
  	};
  
          ret = netsurf_register(&framebuffer_table);
+@@ -2274,6 +2286,11 @@ main(int argc, char** argv)
+ 		die("NetSurf failed to initialise");
+ 	}
+ 
++#ifdef __vita__
++	/* VitaSurf: the image handlers have registered by now */
++	vita_log_image_decoders();
++#endif
++
+ 	/* Override, since we have no support for non-core SELECT menu */
+ 	nsoption_set_bool(core_select_menu, true);
+ 

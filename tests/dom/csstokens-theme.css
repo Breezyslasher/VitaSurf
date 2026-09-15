@@ -1,0 +1,5 @@
+/* Half of tests/dom/csstokens2.html: the theme sheet, which defines the
+   tokens. The page's other sheet spends them, which is how every large
+   site splits its CSS. */
+[data-color-mode=dark][data-dark-theme=dark] { --themed: 40px; }
+:root { --plain: 40px; }

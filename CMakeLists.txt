@@ -109,12 +109,28 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     endif()
     # Hand-written QuickJS bindings implementing NetSurf's js.h, plus the
     # JavaScript half of them embedded as a NUL-terminated byte array.
-    set(PRELUDE_JS "${CMAKE_SOURCE_DIR}/vita/js/prelude.js")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PRELUDE_JS}")
-    file(READ "${PRELUDE_JS}" PRELUDE_HEX HEX)
-    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," PRELUDE_BYTES "${PRELUDE_HEX}")
+    # The prelude is several files concatenated in this order. It grew past
+    # 300 KB as one, which is more than anyone can hold in their head; a
+    # self-contained area of the platform belongs in its own file. Order
+    # matters only where one file runs code at load time that another
+    # defines, so keep prelude.js first.
+    set(PRELUDE_PARTS
+        vita/js/prelude.js
+        vita/js/streams.js
+        vita/js/performance.js
+        vita/js/storage.js)
+    set(PRELUDE_BYTES "")
+    foreach(part ${PRELUDE_PARTS})
+        set(full "${CMAKE_SOURCE_DIR}/${part}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${full}")
+        file(READ "${full}" part_hex HEX)
+        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," part_bytes "${part_hex}")
+        # a newline between parts, so a file that ends in a comment cannot
+        # swallow the first line of the next one
+        set(PRELUDE_BYTES "${PRELUDE_BYTES}${part_bytes}0x0a,")
+    endforeach()
     file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
-        "/* generated from vita/js/prelude.js */\n"
+        "/* generated from ${PRELUDE_PARTS} */\n"
         "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n")
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c)
     target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}/generated")
@@ -168,6 +184,12 @@ target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--wrap=main
     -Wl,-q
     -Wl,--gc-sections
+    # The C runtime reads these two weakly, so --gc-sections is entitled
+    # to drop the definitions and leave its own defaults behind. Naming
+    # them as link roots keeps them: without this the main thread ran on
+    # the 256 KB default stack instead of VITASURF_STACK_KB.
+    -Wl,--undefined=sceUserMainThreadStackSize
+    -Wl,--undefined=_newlib_heap_size_user
     -Wl,--defsym,__sce_headroom=0x10000
 )
 
@@ -175,6 +197,38 @@ set(VITASURF_JS_LIBS)
 if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # quickjs-ng (MIT), from vdpm.
     set(VITASURF_JS_LIBS quickjs)
+endif()
+
+# Image decoders that are only in libnetsurf.a when the toolchain had
+# them (see vita/netsurf/Makefile.config). The NetSurf build decides
+# with pkg-config and links nothing itself -- the final link is here --
+# so the same question is asked again, of the sysroot, and asked of the
+# pkg-config file rather than the library, because that is what the
+# NetSurf build looked at. Anything else risks linking a library whose
+# handler is not there, or worse, the other way round.
+set(VITASURF_IMAGE_LIBS "")
+if(EXISTS "${SYSROOT}/lib/pkgconfig/libwebp.pc")
+    list(APPEND VITASURF_IMAGE_LIBS webp)
+    # Split out of libwebp in 1.3; older versions have no such library.
+    if(EXISTS "${SYSROOT}/lib/libsharpyuv.a")
+        list(APPEND VITASURF_IMAGE_LIBS sharpyuv)
+    endif()
+endif()
+if(EXISTS "${SYSROOT}/lib/pkgconfig/libjxl.pc")
+    list(APPEND VITASURF_IMAGE_LIBS jxl)
+    if(EXISTS "${SYSROOT}/lib/libhwy.a")
+        list(APPEND VITASURF_IMAGE_LIBS hwy)
+    endif()
+    if(EXISTS "${SYSROOT}/lib/libbrotlidec.a")
+        list(APPEND VITASURF_IMAGE_LIBS brotlidec brotlicommon)
+    endif()
+    # libjxl is C++; nothing else here is.
+    list(APPEND VITASURF_IMAGE_LIBS stdc++)
+endif()
+if(VITASURF_IMAGE_LIBS)
+    message(STATUS "extra image decoders: ${VITASURF_IMAGE_LIBS}")
+else()
+    message(STATUS "extra image decoders: none (png, jpeg, gif, bmp and svg only)")
 endif()
 
 target_link_libraries(${PROJECT_NAME}
@@ -190,6 +244,7 @@ target_link_libraries(${PROJECT_NAME}
     # libvita2d (MIT) puts the page on screen through the GPU so that the
     # system IME dialog can draw over it.
     vita2d png jpeg freetype z bz2 pthread m
+    ${VITASURF_IMAGE_LIBS}
     -Wl,--end-group
     SceGxm_stub
     SceDisplay_stub

@@ -1116,6 +1116,25 @@ var UA_DISPLAY={SPAN:'inline',A:'inline',B:'inline',I:'inline',EM:'inline',
  HEAD:'none',SCRIPT:'none',STYLE:'none',TITLE:'none',META:'none',
  LINK:'none',TEMPLATE:'none',BASE:'none',PARAM:'none',SOURCE:'none',
  TRACK:'none',AREA:'none',DATALIST:'none',DIALOG:'none'};
+/* A colour from __vitaStyle: the RGB and its alpha arrive apart, because
+   0xff000000 does not fit the int the binding hands back on a 32-bit
+   target. A browser answers rgb() when the colour is opaque and rgba()
+   when it is not, and code compares the string it gets. */
+/* Properties __vitaStyle resolves, so the style attribute must not
+   overwrite them with the author's own spelling. */
+var RESOLVED={fontSize:1,display:1,visibility:1,color:1,backgroundColor:1};
+function cssColour(rgb,a){
+ if(typeof rgb!=='number'||rgb<0||typeof a!=='number'||a<0)return '';
+ var r=(rgb>>16)&255,g=(rgb>>8)&255,b=rgb&255;
+ if(a>=255)return 'rgb('+r+', '+g+', '+b+')';
+ /* Alpha reads as the shortest fraction that comes back to the same
+    byte: rgba(255,0,0,0.5) stores 128, and 128/255 printed plainly is
+    0.498, which is not the string the page wrote or the one a browser
+    reports. Two places first, three only if two do not round-trip. */
+ var f=Math.round(a/255*100)/100;
+ if(Math.round(f*255)!==a)f=Math.round(a/255*1000)/1000;
+ return 'rgba('+r+', '+g+', '+b+', '+f+')';
+}
 function computedStyle(el){
  /* A browser reports nothing for an element that is not in the document,
     and code tests the value it gets back. */
@@ -1136,17 +1155,25 @@ function computedStyle(el){
   cs.fontSize=st[0]+'px';
   if(CS_DISPLAY[st[1]])cs.display=CS_DISPLAY[st[1]];
   if(CS_VIS[st[2]])cs.visibility=CS_VIS[st[2]];
+  var c=cssColour(st[3],st[5]);if(c)cs.color=c;
+  var b=cssColour(st[4],st[6]);if(b)cs.backgroundColor=b;
  }
  if(box){cs.width=box[4]+'px';cs.height=box[5]+'px';}
  else{cs.width='auto';cs.height='auto';}
- /* Whatever the element says inline wins over the defaults. libcss
-    reports three properties here, and a declaration the page wrote on
-    the element itself is the one other value that is certain -- code
-    that sets a style and reads it back through getComputedStyle used to
-    get the default instead of what it had just written. */
+ /* Whatever the element says inline wins over the defaults, for the
+    properties nothing else here can answer: a declaration the page
+    wrote on the element itself is the one value that is certain, and
+    code that sets a style and reads it back through getComputedStyle
+    used to get the default instead of what it had just written.
+    Properties libcss did answer are left alone -- the cascade has
+    already taken the inline declaration into account, and it reports a
+    resolved value where the attribute is whatever the author typed. */
  if(el&&el.nodeType===1&&typeof el.getAttribute==='function'){
   var inline=el.getAttribute('style');
-  if(inline)parseDecl(inline).forEach(function(d){cs[dashToCamel(d[0])]=d[1];});
+  if(inline)parseDecl(inline).forEach(function(d){
+   var k=dashToCamel(d[0]);
+   if(st&&RESOLVED[k])return;
+   cs[k]=d[1];});
  }
  cs.getPropertyValue=function(n){var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};
  cs.getPropertyPriority=function(){return '';};
@@ -1499,6 +1526,15 @@ W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.Int
 W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};
 W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
 function Image(){return document.createElement('img');}W.Image=Image;
+/* The other two legacy element constructors. new Audio() is how a page
+   makes a sound without markup, and a page that calls it and gets a
+   ReferenceError stops there: YouTube's player set-up did, so nothing
+   after it ran. The argument is a source URL, as for <audio src>. */
+function Audio(src){var a=document.createElement('audio');
+ a.preload='auto';
+ if(src!==undefined&&src!==null)a.setAttribute('src',String(src));
+ return a;}
+W.Audio=Audio;
 function URLSearchParams(init){this._p=[];if(typeof init==='string'){init.replace(/^\?/,'').split('&').forEach(function(kv){if(!kv)return;var i=kv.indexOf('=');var k=i<0?kv:kv.slice(0,i),v=i<0?'':kv.slice(i+1);this._p.push([decodeURIComponent(k.replace(/\+/g,' ')),decodeURIComponent(v.replace(/\+/g,' '))]);},this);}else if(init&&typeof init==='object'){var self=this;(init._p?init._p:Object.keys(init).map(function(k){return [k,init[k]];})).forEach(function(kv){self._p.push([String(kv[0]),String(kv[1])]);});}}
 URLSearchParams.prototype={get:function(k){for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},has:function(k){return this.get(k)!==null;},set:function(k,v){var d=false;this._p=this._p.filter(function(p){if(p[0]!==k)return true;if(d)return false;p[1]=String(v);d=true;return true;});if(!d)this._p.push([k,String(v)]);},append:function(k,v){this._p.push([k,String(v)]);},'delete':function(k){this._p=this._p.filter(function(p){return p[0]!==k;});},forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},toString:function(){return this._p.map(function(p){return encodeURIComponent(p[0])+'='+encodeURIComponent(p[1]);}).join('&');},sort:function(){this._p.sort(function(a,b){return a[0]<b[0]?-1:a[0]>b[0]?1:0;});}};
 URLSearchParams.prototype[Symbol.iterator]=URLSearchParams.prototype.entries;Object.defineProperty(URLSearchParams.prototype,'size',{get:function(){return this._p.length;}});
@@ -1713,11 +1749,41 @@ function joinCodes(codes){
  * that defines none pays one integer test per DOM call.
  */
 var CE={},CEn=0,CEwait={},CEstack=[];
+/* createElement without the upgrade step, for direct construction. */
+var ceRawCreate=null;
 
 function CEBase(){
  var e=CEstack.length?CEstack[CEstack.length-1]:undefined;
- if(e===undefined)throw new TypeError('Illegal constructor');
- return e;
+ if(e!==undefined)return e;
+ /*
+  * Direct construction: "new MyElement()" rather than the parser
+  * upgrading a tag it met. The specification says to find the
+  * definition whose constructor is new.target and make an element with
+  * that definition's name; this used to throw for every case, and
+  * github.com's header constructs its components that way, so the
+  * component threw "Illegal constructor" and React drew its own error
+  * box over the page.
+  */
+ var nt;
+ try{nt=new.target;}catch(x){nt=undefined;}
+ if(nt){
+  for(var n in CE){
+   var d=CE[n];
+   if(!d||d.ctor!==nt)continue;
+   var el=ceRawCreate?ceRawCreate.call(D,d.ext||n):D.createElement(d.ext||n);
+   /* A customised built-in is the tag plus is="", as the parser writes it. */
+   if(d.ext&&d.ext!==n)el.setAttribute('is',n);
+   /* A class that does not extend HTMLElement would otherwise lose
+    * every DOM method the moment its prototype is installed. */
+   try{if(!P.isPrototypeOf(nt.prototype))Object.setPrototypeOf(nt.prototype,P);
+       Object.setPrototypeOf(el,nt.prototype);}catch(x2){}
+   /* Constructed, so inserting it must not run the constructor again --
+    * but connectedCallback still has to fire, which state 2 allows. */
+   ceSet(el,'__ceState',2);ceSet(el,'__ceDef',d);
+   return el;
+  }
+ }
+ throw new TypeError('Illegal constructor');
 }
 CEBase.prototype=P;
 /* It is HTMLElement to the page, whatever it is called here. */
@@ -1854,6 +1920,10 @@ W.customElements={
 })();
 (function(){
  var orig=D.createElement;
+ /* CEBase needs this one: creating the element for "new MyElement()"
+  * through the wrapper below would upgrade it, running the very
+  * constructor that is already running. */
+ ceRawCreate=orig;
  D.createElement=function(t,o){
   var el=orig.call(D,t);
   if(CEn&&el&&el.nodeType===1){if(o&&o.is)el.setAttribute('is',o.is);ceUpgrade(el,false);}
@@ -2119,7 +2189,12 @@ function tokenCheck(t){
   'The token provided contains HTML space characters, which are not valid in tokens.',
   'InvalidCharacterError');
  return t;}
-function TokenList(el,attr){this._e=el;this._a=attr;
+/* The private fields are hidden: a page that walks an object and calls
+ * what it finds would otherwise call the helpers. */
+function hide(o,k,v){try{Object.defineProperty(o,k,
+ {value:v,writable:true,configurable:true,enumerable:false});}
+ catch(e){o[k]=v;}}
+function TokenList(el,attr){hide(this,'_e',el);hide(this,'_a',attr);
  var t=this._t();for(var i=0;i<t.length;i++)this[i]=t[i];
  Object.defineProperty(this,'length',{configurable:true,value:t.length,writable:true});}
 /* The attribute as an ordered set: split on whitespace, first occurrence
@@ -2215,6 +2290,8 @@ TokenList.prototype.values=function(){return this._t()[Symbol.iterator]();};
 TokenList.prototype.entries=function(){return this._t().map(function(v,i){return [i,v];})[Symbol.iterator]();};
 TokenList.prototype[Symbol.iterator]=TokenList.prototype.values;
 TokenList.prototype.toString=function(){return this.value;};
+hide(TokenList.prototype,'_t',TokenList.prototype._t);
+hide(TokenList.prototype,'_w',TokenList.prototype._w);
 Object.defineProperty(TokenList.prototype,'value',{configurable:true,
  get:function(){return this._e?(this._e.getAttribute(this._a)||''):this._t().join(' ');},
  set:function(v){if(this._e)this._e.setAttribute(this._a,String(v));
@@ -2383,9 +2460,26 @@ Object.defineProperty(P,'options',{configurable:true,get:function(){
  /* the collection already answers to item and namedItem; attaching
     them here shadowed the real ones with a version that read the
     proxy's target and found nothing */
- return this.getElementsByTagName('option');}});
+ var c=this.getElementsByTagName('option');
+ /* HTMLOptionsCollection's selectedIndex is the select's, so the
+    collection has to know which select it came from */
+ if(c&&this.tagName==='SELECT'){
+  try{Object.defineProperty(c,'__vitaOwner',
+   {value:this,configurable:true});}catch(e){}
+  try{Object.setPrototypeOf(c,W.HTMLOptionsCollection.prototype);}catch(e){}}
+ return c;}});
 Object.defineProperty(P,'selectedOptions',{configurable:true,get:function(){
  return listOf(this.options).filter(function(o){return o.selected;});}});
+/* A select is itself an indexed collection of its options. */
+P.item=function(i){
+ if(this.tagName!=='SELECT')return shadowProp(this,'item',undefined);
+ var o=this.options;i=Number(i)>>>0;return o&&i<o.length?o[i]:null;};
+P.namedItem=function(n){
+ if(this.tagName!=='SELECT')return shadowProp(this,'namedItem',undefined);
+ var o=this.options,i;n=String(n);
+ for(i=0;o&&i<o.length;i++){
+  if(o[i].id===n||o[i].getAttribute('name')===n)return o[i];}
+ return null;};
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){
  if(this.tagName==='OPTION')return this.parentNode?this.parentNode.selectedIndex:-1;
  var o=this.options||[];for(var i=0;i<o.length;i++)if(o[i].selected)return i;
@@ -2530,6 +2624,7 @@ Range.prototype._nodes=function(){
  return out;};
 Range.prototype.extractContents=function(){var f=D.createDocumentFragment();
  this._nodes().forEach(function(n){f.appendChild(n);});this.collapse(true);return f;};
+hide(Range.prototype,'_nodes',Range.prototype._nodes);
 Range.prototype.deleteContents=function(){this._nodes().forEach(function(n){n.remove();});
  this.collapse(true);};
 Range.prototype.cloneContents=function(){var f=D.createDocumentFragment();
@@ -2967,7 +3062,16 @@ function listOf(c){
    to be a stub whose length was always zero, and it was clobbering it. */
 HTMLCollection.prototype.add=function(){};
 HTMLCollection.prototype.remove=function(){};
-W.HTMLOptionsCollection=HTMLCollection;
+/* HTMLOptionsCollection is the one that is not just another name for
+   HTMLCollection: it carries selectedIndex, which belongs to the select
+   the collection came from and not to collections in general. */
+W.HTMLOptionsCollection=function HTMLOptionsCollection(){};
+W.HTMLOptionsCollection.prototype=Object.create(HTMLCollection.prototype);
+W.HTMLOptionsCollection.prototype.constructor=W.HTMLOptionsCollection;
+Object.defineProperty(W.HTMLOptionsCollection.prototype,'selectedIndex',{
+ configurable:true,
+ get:function(){var o=this.__vitaOwner;return o?o.selectedIndex:-1;},
+ set:function(v){var o=this.__vitaOwner;if(o)o.selectedIndex=v;}});
 W.HTMLFormControlsCollection=HTMLCollection;W.HTMLAllCollection=HTMLCollection;
 
 W.closed=false;
@@ -3703,9 +3807,10 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   Object.keys(bodies).forEach(function(k){var f=bodies[k];
    if(!C.prototype[k])C.prototype[k]=function(){
     var self=this;return this.text().then(function(t){self._b=t;return f.call(self);});};});
-  if(!('body' in C.prototype))Object.defineProperty(C.prototype,'body',{configurable:true,
-   get:function(){return null;}});
-  if(!C.prototype.textStream)C.prototype.textStream=function(){return null;};});
+  /* body and textStream used to be defined here as getters returning
+     null, which is worse than leaving them out: a page that tests for
+     response.body stops taking its fallback and then calls getReader()
+     on null. streams.js gives Response a real ReadableStream. */});
  if(W.Request){var rp=W.Request.prototype;
   ['destination','referrer','referrerPolicy','integrity','duplex'].forEach(function(k){
    if(!(k in rp))rp[k]='';});
@@ -3839,7 +3944,7 @@ Blob.prototype.slice=function(a,b,type){
  a=a===undefined?0:(a<0?Math.max(n+a,0):Math.min(a,n));
  b=b===undefined?n:(b<0?Math.max(n+b,0):Math.min(b,n));
  return new Blob([u.subarray(a,Math.max(a,b))],{type:type||''});};
-Blob.prototype.stream=function(){return null;};
+/* Blob.prototype.stream is a real ReadableStream; see streams.js. */
 W.Blob=Blob;
 function File(parts,name,opts){Blob.call(this,parts,opts);
  this.name=String(name);this.lastModified=(opts&&opts.lastModified)||Date.now();
@@ -4126,7 +4231,228 @@ if(W.OffscreenCanvas){W.OffscreenCanvas.prototype.oncontextlost=null;
 CanvasRenderingContext2D.prototype.lang='inherit';
 CanvasRenderingContext2D.prototype.isContextLost=function(){return false;};
 ImageData.prototype.pixelFormat='rgba-unorm8';
-Blob.prototype.textStream=function(){return null;};
+/* Blob.prototype.textStream is a real ReadableStream; see streams.js. */
+/* The rest of the console. Only log, warn, error, info and debug came
+ * from the bindings, and a page that calls one of the others got
+ * "not a function" -- claude.ai opens its entry chunk with
+ * console.assert("__process_polyfill__"), so the whole application threw
+ * on its first statement and mounted nothing. None of these needs to do
+ * anything clever; they need to exist and to print what they are given. */
+(function(){
+ var C=W.console;
+ if(!C)return;
+ function out(kind,args){
+  try{(C[kind]||C.log).apply(C,args);}catch(e){}}
+ function def(n,f){if(typeof C[n]!=='function')C[n]=f;}
+ def('assert',function(ok){
+  if(ok)return;
+  var a=Array.prototype.slice.call(arguments,1);
+  a.unshift('Assertion failed:');
+  out('error',a);});
+ def('trace',function(){
+  var a=Array.prototype.slice.call(arguments);
+  a.unshift('console.trace');
+  try{a.push('\n'+(new Error()).stack);}catch(e){}
+  out('log',a);});
+ var groups=0;
+ function group(){
+  out('log',Array.prototype.slice.call(arguments));
+  groups++;}
+ def('group',group);
+ def('groupCollapsed',group);
+ def('groupEnd',function(){if(groups>0)groups--;});
+ def('dir',function(v){out('log',[v]);});
+ def('dirxml',function(v){out('log',[v]);});
+ def('table',function(v){out('log',[v]);});
+ var timers={};
+ def('time',function(label){timers[String(label===undefined?'default':label)]=Date.now();});
+ def('timeLog',function(label){
+  var k=String(label===undefined?'default':label);
+  if(!(k in timers))return;
+  out('log',[k+': '+(Date.now()-timers[k])+'ms']);});
+ def('timeEnd',function(label){
+  var k=String(label===undefined?'default':label);
+  if(!(k in timers))return;
+  out('log',[k+': '+(Date.now()-timers[k])+'ms']);
+  delete timers[k];});
+ var counts={};
+ def('count',function(label){
+  var k=String(label===undefined?'default':label);
+  counts[k]=(counts[k]||0)+1;
+  out('log',[k+': '+counts[k]]);});
+ def('countReset',function(label){
+  delete counts[String(label===undefined?'default':label)];});
+ def('clear',function(){});
+ def('timeStamp',function(){});
+ def('profile',function(){});
+ def('profileEnd',function(){});
+})();
+/* --- font loading, fullscreen, storage (VitaSurf) ------------------------
+ * The first batch of what the spec surface list says is missing. None of
+ * these can do what a browser does here -- there is no font loader to
+ * wait for, no fullscreen to enter and no database to write to -- but
+ * each has to exist and settle, because a page that awaits
+ * document.fonts.ready or opens a database and waits for a callback
+ * stops where it stands if the object is not there at all.
+ */
+(function(){
+ /* FontFaceSet. Fonts are whatever FreeType already has, so the set is
+    empty and ready at once; a page gates its first paint on this. */
+ function FontFace(family,source,desc){
+  this.family=String(family);this.style='normal';this.weight='normal';
+  this.stretch='normal';this.unicodeRange='U+0-10FFFF';this.variant='normal';
+  this.featureSettings='normal';this.variationSettings='normal';
+  this.display='auto';this.ascentOverride='normal';
+  this.features='normal';this.palettes='normal';this.variations='normal';
+  this.descentOverride='normal';this.lineGapOverride='normal';
+  this.status='loaded';
+  if(desc)Object.keys(desc).forEach(function(k){this[k]=desc[k];},this);
+  this.loaded=Promise.resolve(this);}
+ FontFace.prototype.load=function(){return Promise.resolve(this);};
+ W.FontFace=FontFace;
+ var faces=[];
+ var fontSet={
+  onloading:null,onloadingdone:null,onloadingerror:null,
+  status:'loaded',
+  ready:Promise.resolve(undefined),
+  add:function(f){if(faces.indexOf(f)<0)faces.push(f);return this;},
+  delete:function(f){var i=faces.indexOf(f);if(i<0)return false;
+   faces.splice(i,1);return true;},
+  clear:function(){faces.length=0;},
+  check:function(){return true;},
+  load:function(){return Promise.resolve([]);},
+  forEach:function(f,t){faces.slice().forEach(function(v){f.call(t,v,v,this);},this);},
+  keys:function(){return faces.slice()[Symbol.iterator]();},
+  values:function(){return faces.slice()[Symbol.iterator]();},
+  entries:function(){return faces.map(function(v){return [v,v];})[Symbol.iterator]();},
+  addEventListener:function(){},removeEventListener:function(){},
+  dispatchEvent:function(){return true;}};
+ Object.defineProperty(fontSet,'size',{configurable:true,
+  get:function(){return faces.length;}});
+ fontSet[Symbol.iterator]=fontSet.values;
+ Object.defineProperty(D,'fonts',{configurable:true,
+  get:function(){return fontSet;}});
+ fontSet.ready.then(function(){});
+})();
+
+(function(){
+ /* Fullscreen. Nothing can enter it, so the state is simply "not in it"
+    and the request rejects rather than hanging. */
+ function notAllowed(){
+  return Promise.reject(new DOMException(
+   'Fullscreen is not available.','NotAllowedError'));}
+ Object.defineProperty(D,'fullscreenEnabled',{configurable:true,
+  get:function(){return false;}});
+ Object.defineProperty(D,'fullscreenElement',{configurable:true,
+  get:function(){return null;}});
+ Object.defineProperty(D,'fullscreen',{configurable:true,
+  get:function(){return false;}});
+ if(typeof D.exitFullscreen!=='function')D.exitFullscreen=notAllowed;
+ D.onfullscreenchange=null;D.onfullscreenerror=null;
+ if(!('onfullscreenchange' in P))P.onfullscreenchange=null;
+ if(!('onfullscreenerror' in P))P.onfullscreenerror=null;
+ if(W.ShadowRoot&&W.ShadowRoot.prototype&&
+    !('fullscreenElement' in W.ShadowRoot.prototype)){
+  try{Object.defineProperty(W.ShadowRoot.prototype,'fullscreenElement',
+   {configurable:true,get:function(){return null;}});}catch(e){}}
+})();
+
+(function(){
+ /* IndexedDB. There is no store behind this, so every request fails --
+    but it fails the way a request fails, asynchronously and through
+    onerror, so a page that opens a database and waits is told no
+    instead of waiting for ever. Pages that keep their state here fall
+    back to memory, which is what claude.ai already reports doing. */
+ function Request(){
+  this.readyState='pending';this.result=undefined;
+  this.error=new DOMException('IndexedDB is not available here.',
+   'UnknownError');
+  this.source=null;this.transaction=null;
+  this.onsuccess=null;this.onerror=null;this.onblocked=null;
+  this.onupgradeneeded=null;
+  var self=this;
+  setTimeout(function(){
+   self.readyState='done';
+   var e={type:'error',target:self,currentTarget:self,
+    preventDefault:function(){},stopPropagation:function(){}};
+   if(typeof self.onerror==='function'){try{self.onerror(e);}catch(x){}}
+  },0);}
+ Request.prototype.addEventListener=function(t,f){
+  if(t==='error')this.onerror=f;
+  else if(t==='success')this.onsuccess=f;};
+ Request.prototype.removeEventListener=function(){};
+ Request.prototype.dispatchEvent=function(){return true;};
+ function IDBFactory(){}
+ IDBFactory.prototype.open=function(){return new Request();};
+ IDBFactory.prototype.deleteDatabase=function(){return new Request();};
+ IDBFactory.prototype.databases=function(){return Promise.resolve([]);};
+ IDBFactory.prototype.cmp=function(a,b){return a<b?-1:a>b?1:0;};
+ W.IDBFactory=IDBFactory;
+ W.IDBRequest=Request;
+ W.indexedDB=new IDBFactory();
+})();
+
+(function(){
+ var n=W.navigator;
+ if(!n)return;
+ /* StorageManager: an estimate a page can read, and no persistence. */
+ if(!n.storage)n.storage={
+  estimate:function(){return Promise.resolve({quota:0,usage:0,
+   usageDetails:{}});},
+  persist:function(){return Promise.resolve(false);},
+  persisted:function(){return Promise.resolve(false);},
+  getDirectory:function(){return Promise.reject(new DOMException(
+   'No origin private file system here.','SecurityError'));}};
+ /* Clipboard: there is no clipboard to reach, so it refuses rather
+    than pretending to have copied something. */
+ if(!n.clipboard)n.clipboard={
+  read:function(){return Promise.reject(new DOMException(
+   'The clipboard is not available.','NotAllowedError'));},
+  readText:function(){return Promise.reject(new DOMException(
+   'The clipboard is not available.','NotAllowedError'));},
+  write:function(){return Promise.reject(new DOMException(
+   'The clipboard is not available.','NotAllowedError'));},
+  writeText:function(){return Promise.reject(new DOMException(
+   'The clipboard is not available.','NotAllowedError'));},
+  addEventListener:function(){},removeEventListener:function(){},
+  dispatchEvent:function(){return true;}};
+})();
+/* --- gamepads, battery, vibration, entry types (VitaSurf) ---------------
+ * The second batch. The Vita has buttons and a battery, but neither is
+ * wired to the web platform here: the buttons drive the browser itself
+ * (see vita/input) and exposing them as a Gamepad would let a page take
+ * them over. So these report "nothing connected" and "cannot vibrate",
+ * which is what the specification says to report when there is nothing
+ * to report, and a page that feature-tests them takes its other path.
+ */
+(function(){
+ var n=W.navigator;
+ if(n&&typeof n.getGamepads!=='function')
+  n.getGamepads=function(){return [];};
+ if(n&&typeof n.vibrate!=='function')
+  n.vibrate=function(){return false;};
+ if(n&&typeof n.getBattery!=='function'){
+  n.getBattery=function(){return Promise.resolve({
+   charging:true,chargingTime:0,dischargingTime:Infinity,level:1,
+   onchargingchange:null,onchargingtimechange:null,
+   ondischargingtimechange:null,onlevelchange:null,
+   addEventListener:function(){},removeEventListener:function(){},
+   dispatchEvent:function(){return true;}});};}
+ ['ongamepadconnected','ongamepaddisconnected'].forEach(function(k){
+  if(!(k in W))W[k]=null;
+  if(!(k in P))P[k]=null;});
+ if(W.GamepadEvent&&W.GamepadEvent.prototype&&
+    !('gamepad' in W.GamepadEvent.prototype)){
+  try{Object.defineProperty(W.GamepadEvent.prototype,'gamepad',
+   {configurable:true,get:function(){return this.__vitaGamepad||null;}});}
+  catch(e){}}
+ if(W.PerformanceObserver&&
+    !('supportedEntryTypes' in W.PerformanceObserver)){
+  try{Object.defineProperty(W.PerformanceObserver,'supportedEntryTypes',
+   {configurable:true,
+    get:function(){return ['mark','measure','navigation','resource'];}});}
+  catch(e){}}
+})();
 (function(){var N=W.Notification;if(!N)return;var p=N.prototype;
  p.actions=[];p.badge='';p.dir='auto';p.image='';p.lang='';p.navigate='';
  p.renotify=false;p.requireInteraction=false;p.silent=null;p.timestamp=0;p.vibrate=[];})();
@@ -4312,28 +4638,54 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
  * error event never fired, so a script that installs a handler to fall
  * back when something throws heard nothing at all.
  */
-/* A diagnostic, not a shim. GitHub has reported "Unexpected token 'y'
- * in JSON" on every load for many builds and I do not know why. The
- * first byte was not the problem -- a check on it never fired -- so say
- * where the first byte that cannot be in JSON actually is, with the
- * bytes around it. Costs nothing until a parse fails. */
+/* A diagnostic, not a shim, for one specific fault: a JSON body that
+ * arrived with its bytes mangled. It says where the first byte that
+ * cannot be in JSON is, with the bytes around it. Costs nothing until a
+ * parse fails.
+ *
+ * Only mangled text is reported. A failed parse on its own is not a
+ * fault: Polymer decides whether an attribute holds JSON by parsing it
+ * and catching, so every "[[binding]]" in a template fails by design.
+ * YouTube produced forty of those in a load, each one a line flushed to
+ * the memory card, and none of them a problem. */
 (function(){
- var real=JSON.parse;
+ var real=JSON.parse,said=0;
  JSON.parse=function(text,reviver){
   try{return real(text,reviver);}
   catch(e){
    try{
     var s=String(text),i,bad=-1;
     for(i=0;i<s.length;i++)if(s.charCodeAt(i)>127){bad=i;break;}
-    var at=bad<0?0:Math.max(0,bad-8),hex='',c;
-    for(i=at;i<Math.min(s.length,at+24);i++){
-     c=(s.charCodeAt(i)&0xffff).toString(16);
-     hex+=(c.length<2?'0':'')+c+' ';}
-    console.log('json parse failed: '+String(e).slice(0,60)+
-     '; length '+s.length+', first byte over 127 at '+bad+
-     ', bytes '+hex+', text '+JSON.stringify(s.slice(at,at+40)));
+    if(bad>=0&&said<3){
+     var at=Math.max(0,bad-8),hex='',c;
+     for(i=at;i<Math.min(s.length,at+24);i++){
+      c=(s.charCodeAt(i)&0xffff).toString(16);
+      hex+=(c.length<2?'0':'')+c+' ';}
+     said++;
+     console.log('json parse failed on text with a byte over 127: '+
+      String(e).slice(0,60)+'; length '+s.length+', byte at '+bad+
+      ', bytes '+hex+', text '+JSON.stringify(s.slice(at,at+40))+
+      (said===3?' (further ones not logged)':''));}
    }catch(x){}
    throw e;}};})();
+/* What was thrown, in one line: a message and the first stack frame.
+   String(err) on a plain object is "[object Object]", which says
+   nothing, so the name and message are pulled out by hand. */
+function describeThrown(v){
+ var out;
+ try{
+  if(v===null||v===undefined)return String(v);
+  if(typeof v==='object'){
+   var name=v.name?String(v.name):'',msg=v.message?String(v.message):'';
+   out=(name&&msg)?name+': '+msg:(name||msg);
+   if(!out){try{out=JSON.stringify(v).slice(0,200);}catch(e){out=String(v);}}
+   if(v.stack){
+    var f=String(v.stack).split('\n')[1];
+    if(f)out+=' | '+f.replace(/^\s+/,'').slice(0,160);}
+   return out;}
+  return String(v);
+ }catch(e2){return '(unprintable)';}
+}
 W.__vitaReportError=function(err,where){
  var msg='';
  try{msg=(err&&err.message)?String(err.message):String(err);}catch(e){msg='Script error.';}
@@ -4357,18 +4709,48 @@ W.__vitaReportError=function(err,where){
    if(W.onerror(msg,file,line,col,err)===true)handled=true;}
  }catch(e4){}
  try{__vitaDispatch(null,ev);}catch(e5){}
+ if(!handled&&!ev.defaultPrevented){
+  try{console.error('uncaught: '+describeThrown(err)+
+   (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}}
  return handled;};
 /* An unhandled promise rejection, reported the same way. QuickJS hands
- * these to the tracker qjs.c installs. */
+ * these to the tracker qjs.c installs.
+ *
+ * Reported one turn later, not at once: a rejection with no handler yet
+ * is not an unhandled rejection, it is a promise whose .catch() has not
+ * been attached. Frameworks reject first and attach in the same tick all
+ * the time, and reporting on the spot called every one of them an error.
+ * qjs.c calls __vitaRejectionHandled() when a handler does turn up,
+ * which takes it off the list before the list is read. */
+var vitaPendingRejections=[];
+function flushRejections(){
+ var list=vitaPendingRejections;
+ vitaPendingRejections=[];
+ list.forEach(function(entry){
+  var ev;
+  try{ev=new W.PromiseRejectionEvent('unhandledrejection',
+   {reason:entry.r,promise:entry.p,cancelable:true});}
+  catch(e){ev={type:'unhandledrejection',reason:entry.r,promise:entry.p,
+   defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
+  try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
+  try{__vitaDispatch(null,ev);}catch(e3){}
+  /* Say so, as a browser does. A page whose async work fails and whose
+     framework swallows the rejection into an error boundary showed
+     nothing at all in the log: the screen said something went wrong and
+     the device had no idea what. */
+  if(!ev.defaultPrevented){
+   try{console.error('unhandled rejection: '+describeThrown(entry.r));}catch(e4){}}
+ });
+}
 W.__vitaReportRejection=function(reason,promise){
- var ev;
- try{ev=new W.PromiseRejectionEvent('unhandledrejection',
-  {reason:reason,promise:promise,cancelable:true});}
- catch(e){ev={type:'unhandledrejection',reason:reason,promise:promise,
-  defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
- try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
- try{__vitaDispatch(null,ev);}catch(e3){}
- return !!ev.defaultPrevented;};
+ vitaPendingRejections.push({p:promise,r:reason});
+ if(vitaPendingRejections.length===1)setTimeout(flushRejections,0);
+ return false;};
+W.__vitaRejectionHandled=function(promise){
+ for(var i=0;i<vitaPendingRejections.length;i++){
+  if(vitaPendingRejections[i].p===promise){
+   vitaPendingRejections.splice(i,1);
+   return;}}};
 
 /* --- MutationObserver ---------------------------------------------------
  * It was a constructor whose observe() did nothing, so every framework

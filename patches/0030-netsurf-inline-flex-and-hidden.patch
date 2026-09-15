@@ -1,0 +1,55 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index cfb154c9d..1228ac48d 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -3358,7 +3358,8 @@ layout_line(struct box *first,
+ 	for (d = first; d != b; d = d->next) {
+ 		d->flags &= ~NEW_LINE;
+ 
+-		if (d->type == BOX_INLINE_BLOCK &&
++		if ((d->type == BOX_INLINE_BLOCK ||
++				d->type == BOX_INLINE_FLEX) &&
+ 				(css_computed_position(d->style) ==
+ 						CSS_POSITION_ABSOLUTE ||
+ 				 css_computed_position(d->style) ==
+@@ -3383,8 +3384,14 @@ layout_line(struct box *first,
+ 				used_height = d->height;
+ 			}
+ 		} else if ((d->type == BOX_INLINE) ||
+-				d->type == BOX_INLINE_BLOCK) {
+-			/* replaced inlines and inline-blocks */
++				d->type == BOX_INLINE_BLOCK ||
++				d->type == BOX_INLINE_FLEX) {
++			/* replaced inlines, inline-blocks and inline flex
++			 * and grid containers. Without BOX_INLINE_FLEX here
++			 * such a box never had its line position set and
++			 * never gave the line its height, so the line was
++			 * as tall as its text and whatever followed was
++			 * drawn on top of it (VitaSurf) */
+ 			d->x += x0;
+ 			d->y = *y + d->border[TOP].width + d->margin[TOP];
+ 			h = d->margin[TOP] + d->border[TOP].width +
+diff --git a/resources/default.css b/resources/default.css
+index fa47c76ff..059fdbc5e 100644
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -152,3 +152,19 @@ mark {
+ 	background: yellow;
+ 	color: black;
+ }
++
++/* Things the HTML rendering rules hide that were not here (VitaSurf).
++ *
++ * The hidden attribute above all: it is how a page keeps markup in the
++ * document but out of the way, and without this rule every collapsed
++ * menu, every error partial and every dialog a site ships closed was
++ * drawn. GitHub's home page showed its own "Looks like something went
++ * wrong" template that way.
++ *
++ * hidden="until-found" is meant to keep the box and hide the content,
++ * through content-visibility, which is not implemented; hiding it
++ * outright is closer to what the page intends than showing it. */
++[hidden] { display: none; }
++dialog:not([open]) { display: none; }
++datalist { display: none; }
++input[type=hidden] { display: none; }

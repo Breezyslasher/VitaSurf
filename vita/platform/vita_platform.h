@@ -55,6 +55,10 @@ void vita_options_floor(void);
 #define VITASURF_BOOKMARKS_PATH VITASURF_DATA_DIR "/Bookmarks"
 #define VITASURF_BOOKMARKS_PAGE VITASURF_DATA_DIR "/bookmarks.html"
 #define VITASURF_HISTORY_PAGE   VITASURF_DATA_DIR "/history.html"
+/* Compiled JavaScript, kept between runs. See bc_load() in vita/js/qjs.c. */
+#define VITASURF_JSCACHE_DIR    VITASURF_DATA_DIR "/jscache"
+/* What sites store: localStorage and IndexedDB, one file per origin. */
+#define VITASURF_STORAGE_DIR    VITASURF_DATA_DIR "/storage"
 #define VITASURF_DOWNLOADS_DIR  VITASURF_DATA_DIR "/downloads"
 #define VITASURF_DOWNLOADS_PAGE VITASURF_DATA_DIR "/downloads.html"
 /* holds the URL of a FlareSolverr server, e.g. http://192.168.1.20:8191/v1 */
@@ -90,6 +94,12 @@ void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vita_log_memory(const char *what);
 
 /**
+ * Log which image formats registered a content handler. Call after
+ * netsurf_init(), which is what registers them.
+ */
+void vita_log_image_decoders(void);
+
+/**
  * Bring up SceNet and SceNetCtl (vita_net.c). Must run before NetSurf
  * initialises libcurl. Returns 0 on success; failure leaves the browser
  * usable for local pages only.
@@ -110,6 +120,14 @@ int vita_read_file(const char *path, char **data, size_t *len);
 
 /** True when the user created the verbose flag file in the data directory. */
 int vita_verbose_requested(void);
+
+/**
+ * The main thread's stack size in bytes, as the kernel reports it, or 0
+ * before it has been measured. Not what was requested: --gc-sections can
+ * drop the request and leave the runtime's own default behind, so
+ * anything sized against the stack must use this.
+ */
+extern unsigned int vita_main_stack_bytes;
 
 /**
  * NetSurf file operation table with Vita path translation (vita_file.c).

@@ -1,0 +1,269 @@
+diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
+index 1528ed3..07eb00a 100644
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdint.h>
+ #include <string.h>
+ #include <strings.h>
+ 
+@@ -420,6 +421,29 @@ static void HWB_to_RGB(
+  * \param result  Pointer to location to receive result (AARRGGBB)
+  * \return true on success, false on error.
+  */
++/**
++ * Round a fixed point value to the nearest integer (VitaSurf).
++ *
++ * FIXTOINT truncates, and for a colour channel that is wrong: an alpha
++ * of 0.5 is 127.5 of 255 and truncates to 127, which reads back out of
++ * getComputedStyle as 0.498. A page that writes an alpha and compares
++ * what it is given back never matches.
++ *
++ * The rounding is done here rather than with FADD(v, F_0_5) because
++ * css_add_fixed's overflow check mis-fires when the two operands have
++ * different signs: it saturates -25.5 + 0.5 to INT_MAX, and a negative
++ * percentage that should clamp to 0 clamps to 255 instead.
++ */
++static int32_t fixed_round(css_fixed v)
++{
++	const int32_t half = 1 << (CSS_RADIX_POINT - 1);
++
++	if (v > INT32_MAX - half)
++		return INT32_MAX >> CSS_RADIX_POINT;
++
++	return (int32_t) ((v + half) >> CSS_RADIX_POINT);
++}
++
+ static bool parse_rgb(
+ 		css_language *c,
+ 		const parserutils_vector *vector,
+@@ -482,14 +506,24 @@ static bool parse_rgb(
+ 
+ 			if (valid == CSS_TOKEN_NUMBER) {
+ 				if (i == 3) {
+-					/* alpha channel */
+-					intval = FIXTOINT(FMUL(num, F_255));
++					/*
++					 * Alpha channel, rounded rather
++					 * than truncated (VitaSurf): 0.5
++					 * is 127.5 of 255, and truncating
++					 * stores 127, which reads back as
++					 * 0.498. A page that writes an
++					 * alpha and compares what
++					 * getComputedStyle gives it back
++					 * then never matches.
++					 */
++					intval = fixed_round(
++						FMUL(num, F_255));
+ 				} else {
+ 					/* colour channels */
+ 					intval = FIXTOINT(num);
+ 				}
+ 			} else {
+-				intval = FIXTOINT(
++				intval = fixed_round(
+ 					FDIV(FMUL(num, F_255), F_100));
+ 			}
+ 
+@@ -710,10 +744,16 @@ static bool parse_hsl(
+ 			return false;
+ 		}
+ 
++		/*
++		 * Rounded, not truncated (VitaSurf): 0.5 is 127.5 of 255,
++		 * and truncating stores 127, which reads back as 0.498.
++		 * A page that writes an alpha and compares what
++		 * getComputedStyle gives it back then never matches.
++		 */
+ 		if (token->type == CSS_TOKEN_NUMBER) {
+-			alpha = FIXTOINT(FMUL(alpha, F_255));
++			alpha = fixed_round(FMUL(alpha, F_255));
+ 		} else {
+-			alpha = FIXTOINT(FDIV(FMUL(alpha, F_255), F_100));
++			alpha = fixed_round(FDIV(FMUL(alpha, F_255), F_100));
+ 		}
+ 
+ 		consumeWhitespace(vector, ctx);
+@@ -890,10 +930,16 @@ static bool parse_hwb(
+ 			return false;
+ 		}
+ 
++		/*
++		 * Rounded, not truncated (VitaSurf): 0.5 is 127.5 of 255,
++		 * and truncating stores 127, which reads back as 0.498.
++		 * A page that writes an alpha and compares what
++		 * getComputedStyle gives it back then never matches.
++		 */
+ 		if (token->type == CSS_TOKEN_NUMBER) {
+-			alpha = FIXTOINT(FMUL(alpha, F_255));
++			alpha = fixed_round(FMUL(alpha, F_255));
+ 		} else {
+-			alpha = FIXTOINT(FDIV(FMUL(alpha, F_255), F_100));
++			alpha = fixed_round(FDIV(FMUL(alpha, F_255), F_100));
+ 		}
+ 
+ 		consumeWhitespace(vector, ctx);
+@@ -1187,6 +1233,7 @@ css_error css__parse_named_colour(css_language *c, lwc_string *data,
+ 		0xffdda0dd, /* PLUM */
+ 		0xffb0e0e6, /* POWDERBLUE */
+ 		0xff800080, /* PURPLE */
++		0xff663399, /* REBECCAPURPLE */
+ 		0xffff0000, /* RED */
+ 		0xffbc8f8f, /* ROSYBROWN */
+ 		0xff4169e1, /* ROYALBLUE */
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index d8857c2..3625929 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -646,6 +646,7 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("plum"),
+ 	SMAP("powderblue"),
+ 	SMAP("purple"),
++	SMAP("rebeccapurple"),
+ 	SMAP("red"),
+ 	SMAP("rosybrown"),
+ 	SMAP("royalblue"),
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index b808a17..193e15b 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -146,7 +146,8 @@ enum {
+ 	MEDIUMVIOLETRED, MIDNIGHTBLUE, MINTCREAM, MISTYROSE, MOCCASIN,
+ 	NAVAJOWHITE, NAVY, OLDLACE, OLIVE, OLIVEDRAB, ORANGE, ORANGERED,
+ 	ORCHID, PALEGOLDENROD, PALEGREEN, PALETURQUOISE, PALEVIOLETRED,
+-	PAPAYAWHIP, PEACHPUFF, PERU, PINK, PLUM, POWDERBLUE, PURPLE, RED,
++	PAPAYAWHIP, PEACHPUFF, PERU, PINK, PLUM, POWDERBLUE, PURPLE,
++	REBECCAPURPLE, RED,
+ 	ROSYBROWN, ROYALBLUE, SADDLEBROWN, SALMON, SANDYBROWN, SEAGREEN,
+ 	SEASHELL, SIENNA, SILVER, SKYBLUE, SLATEBLUE, SLATEGRAY, SLATEGREY,
+ 	SNOW, SPRINGGREEN, STEELBLUE, TAN, TEAL, THISTLE, TOMATO, TURQUOISE,
+diff --git a/test/data/parse/colours-hsl.dat b/test/data/parse/colours-hsl.dat
+index b6e9223..b1c1ca8 100644
+--- a/test/data/parse/colours-hsl.dat
++++ b/test/data/parse/colours-hsl.dat
+@@ -30,7 +30,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7fff0000
++|   0x02000018 0x80ff0000
+ #reset
+ 
+ #data
+@@ -38,7 +38,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7fff0000
++|   0x02000018 0x80ff0000
+ #reset
+ 
+ #data
+@@ -46,7 +46,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7fff0000
++|   0x02000018 0x80ff0000
+ #reset
+ 
+ #data
+@@ -54,7 +54,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7fff0000
++|   0x02000018 0x80ff0000
+ #reset
+ 
+ #data
+@@ -62,7 +62,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7fff0000
++|   0x02000018 0x80ff0000
+ #reset
+ 
+ #data
+diff --git a/test/data/parse/colours-hwb.dat b/test/data/parse/colours-hwb.dat
+index 2dac90d..383be76 100644
+--- a/test/data/parse/colours-hwb.dat
++++ b/test/data/parse/colours-hwb.dat
+@@ -56,7 +56,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7faaaaaa
++|   0x02000018 0x80aaaaaa
+ #reset
+ 
+ #data
+@@ -64,7 +64,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7faaaaaa
++|   0x02000018 0x80aaaaaa
+ #reset
+ 
+ #data
+@@ -116,7 +116,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7f483066
++|   0x02000018 0x80483066
+ #reset
+ 
+ #data
+@@ -124,7 +124,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7f483066
++|   0x02000018 0x80483066
+ #reset
+ 
+ #data
+@@ -132,5 +132,5 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7f483066
++|   0x02000018 0x80483066
+ #reset
+diff --git a/test/data/parse/colours.dat b/test/data/parse/colours.dat
+index 15dae8b..1f01f18 100644
+--- a/test/data/parse/colours.dat
++++ b/test/data/parse/colours.dat
+@@ -77,7 +77,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7f0000ff
++|   0x02000018 0x800000ff
+ #reset
+ 
+ #data
+@@ -85,7 +85,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7f0000ff
++|   0x02000018 0x800000ff
+ #reset
+ 
+ #data
+@@ -242,7 +242,7 @@
+ #errors
+ #expected
+ | 1 *
+-|   0x02000018 0x7fff0000
++|   0x02000018 0x80ff0000
+ #reset
+ 
+ #data

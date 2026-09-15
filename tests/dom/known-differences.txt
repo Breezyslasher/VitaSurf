@@ -51,3 +51,21 @@ Inserting a node from another document does not adopt it
   anything built for a foreign node is built in the right place and the
   case that used to fail silently -- a template parsed by DOMParser
   handing back empty content -- works.
+
+A DOCTYPE inside assigned markup
+  el.innerHTML = "<!DOCTYPE html><p>x</p>" keeps the element's existing
+  children where a browser replaces them with the p. Fragment parsing is
+  meant to ignore a DOCTYPE token; hubbub's fragment parser is given no
+  context element here, so it treats the markup as a whole page and the
+  parse does not complete. The element is only emptied after a parse
+  completes, so nothing is lost -- it simply does not change. No page
+  assigns a doctype through innerHTML.
+  Affects: tests/dom/parse.html ("doctype in markup").
+
+platform.html | everything settles | Font loading, storage, battery and an IndexedDB open are promises and callbacks a browser answers from a backing store. Headless Chromium on a file URL has none, so which of them answer there varies from run to run. The fact asserts only that none is left hanging here, which is what a page depends on: one that awaits document.fonts.ready or opens a database and waits stops where it stands if the answer never comes.
+
+uadefaults.html | untilfound | hidden="until-found" is meant to keep the element's box and hide only its content, through content-visibility, which NetSurf does not implement. The box is removed instead. Hiding it outright is closer to what the page intends than showing content it asked to keep out of the way until a find-in-page reveals it.
+
+streams.html | has textStream | textStream is in the current WebIDL for Blob, Request and Response and Chromium has not shipped it yet, so here the comparison runs the other way round: ours has it. It is stream() piped through a TextDecoderStream, which is what a caller writes by hand today.
+
+streams.html | textStream decoded to | Only runs where textStream exists. See above.

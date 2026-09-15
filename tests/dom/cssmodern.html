@@ -1,0 +1,133 @@
+<!DOCTYPE html><html><head><title>cssmodern</title><style>
+/* Each rule hides one marker. Whether the marker has a box is something
+   both engines agree how to report, so this asks the layout rather than
+   the stylesheet: a marker that still has height means the construct
+   around its rule was not understood. */
+#plain { display: none; }
+@media (min-width: 1px) { #inmedia { display: none; } }
+@layer base { #inlayer { display: none; }
+              :root { --layervar: none; } }
+#varlayer { display: var(--layervar); }
+@layer { #anonlayer { display: none; } }
+@supports (display: block) { #insupports { display: none; }
+                            :root { --supvar: none; } }
+#varsupports { display: var(--supvar); }
+@supports not (definitely-not-a-property: 1) { #insupportsnot { display: none; } }
+:where(#inwhere) { display: none; }
+:is(#inis) { display: none; }
+#inhas:has(span) { display: none; }
+#nest { color: red; & #innest { display: none; } }
+@container (min-width: 1px) { #incontainer { display: none; } }
+#afterlayer { display: none; }
+
+/* the list form, and the shapes an argument can take */
+:is(#islistA, #islistB) { display: none; }
+:where(#wherelist, #nothinghere) { display: none; }
+p:is(.compound) { display: none; }
+:is(.outer .inner) { display: none; }
+/* the shapes a real stylesheet writes: github.com's has 187 of these */
+:is(.chainA .chainB .chainC) { display: none; }
+:is(.kidA > .kidB) { display: none; }
+p:is(.subjA .subjB) { display: none; }
+:is(.altA .altX, .altB .altY) { display: none; }
+.pre :is(.postA .postB) { display: none; }
+:where(.wA .wB) { display: none; }
+/* The argument's last compound with more than one detail: these are the
+   ones that used to corrupt the selector, because a detail copied out of
+   another chain still said another followed it. */
+:is(.mdA .mdB.mdC) { display: none; }
+:is(.mdD p.mdE) { display: none; }
+:is(.mdF .mdG[data-x=y]) { display: none; }
+:is(.mdH .mdI:first-child) { display: none; }
+:is(.btn.primary) { display: none; }
+:is(div#istype) { display: none; }
+
+/* An empty :is() matches nothing. GitHub's stylesheet ships a literal
+   ":is(){...}" that sets width, height and position; taken as the
+   universal selector it applies to every element on the page. */
+:is() { display: none; }
+/* The type selector inside the argument has to be tested too, or
+   :is(div.x) matches any .x whatever its tag. */
+:is(div.tagged) { display: none; }
+:is(p.tagged2) { display: none; }
+:is(.grpA, .grpB.grpC) { display: none; }
+
+/* Custom properties defined inside a transparent at-rule. A stylesheet
+   that keeps its design tokens in @layer base { :root { ... } } -- which
+   is how GitHub's is written -- needs them read, or every var() that
+   uses one resolves to nothing and the page comes out with no colours. */
+:root { --topvar: none; }
+#vartop { display: var(--topvar); }
+#varfallback { display: var(--nosuchvariable, none); }
+:is(#isdescend) span { display: none; }
+
+/* specificity: :where() adds nothing, :is() adds what its argument does.
+   The later rule here is the one that should win in each pair. */
+#specwhere { display: none; }
+:where(#specwhere) { display: block; }
+.speciscls { display: block; }
+:is(.speciscls) { display: none; }
+</style>
+<style>@layer a, b;
+@layer a { #layerlist { display: none; } }
+#afterlayerlist { display: none; }
+</style>
+</head><body>
+<pre id="out"></pre>
+<p id="plain">x</p><p id="inmedia">x</p><p id="inlayer">x</p>
+<p id="anonlayer">x</p><p id="insupports">x</p><p id="insupportsnot">x</p>
+<p id="inwhere">x</p><p id="inis">x</p>
+<p id="inhas"><span>x</span></p>
+<p id="nest"><span id="innest">x</span></p>
+<p id="incontainer">x</p><p id="afterlayer">x</p>
+<p id="islistA">x</p><p id="islistB">x</p><p id="wherelist">x</p>
+<p id="compound" class="compound">x</p>
+<div class="outer" id="outerdiv"><p id="inner2" class="inner">x</p></div>
+<div class="chainA"><div class="chainB"><p id="chain3" class="chainC">x</p></div></div>
+<div class="kidA"><p id="kid2" class="kidB">x</p></div>
+<div class="kidA"><div><p id="kidfar" class="kidB">x</p></div></div>
+<div class="subjA"><p id="subjP" class="subjB">x</p><div id="subjD" class="subjB">x</div></div>
+<div class="altB"><p id="alt2" class="altY">x</p></div>
+<div class="pre"><div class="postA"><p id="post2" class="postB">x</p></div></div>
+<div class="postA"><p id="postnopre" class="postB">x</p></div>
+<div class="wA"><p id="w2" class="wB">x</p></div>
+<div class="mdA"><p id="md1" class="mdB mdC">x</p><p id="md1b" class="mdB">x</p></div>
+<div class="mdD"><p id="md2" class="mdE">x</p><div id="md2b" class="mdE">x</div></div>
+<div class="mdF"><p id="md3" class="mdG" data-x="y">x</p><p id="md3b" class="mdG" data-x="z">x</p></div>
+<div class="mdH"><p id="md4" class="mdI">x</p><p id="md4b" class="mdI">x</p></div>
+<p id="btn" class="btn primary">x</p>
+<div id="istype">x</div>
+<p id="emptyis">x</p>
+<p id="wrongtag" class="tagged">x</p>
+<p id="righttag" class="tagged2">x</p>
+<p id="grp1" class="grpA">x</p><p id="grp2" class="grpB grpC">x</p>
+<p id="grp3" class="grpB">x</p>
+<p id="isdescend"><span id="isdescendkid">x</span></p>
+<p id="specwhere">x</p><p id="speciscls" class="speciscls">x</p>
+<p id="vartop">x</p><p id="varlayer">x</p><p id="varsupports">x</p>
+<p id="varfallback">x</p>
+<p id="layerlist">x</p><p id="afterlayerlist">x</p>
+<p id="control">x</p>
+<script>
+function T(n,v){var o=document.getElementById('out');
+ o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function hidden(id){var e=document.getElementById(id);
+ if(!e)return 'missing';
+ var r=e.getBoundingClientRect();
+ return (r.width===0&&r.height===0)?'hidden':'shown';}
+/* After layout: a box has no geometry until the page has been laid out,
+   and asking during parse reports every element as having none. */
+function report(){
+ ['plain','inmedia','inlayer','anonlayer','insupports','insupportsnot',
+  'inwhere','inis','inhas','innest','incontainer','afterlayer',
+  'layerlist','afterlayerlist','control',
+  'islistA','islistB','wherelist','compound','inner2','outerdiv',
+  'chain3','kid2','kidfar','subjP','subjD','alt2','post2','postnopre','w2',
+  'md1','md1b','md2','md2b','md3','md3b','md4','md4b',
+  'btn','istype','emptyis','wrongtag','righttag','grp1','grp2','grp3',
+  'isdescendkid',
+  'specwhere','speciscls','vartop','varlayer','varsupports',
+  'varfallback'].forEach(function(id){
+   T(id, hidden(id));});}
+window.addEventListener('load', function(){ setTimeout(report, 300); });
+</script></body></html>

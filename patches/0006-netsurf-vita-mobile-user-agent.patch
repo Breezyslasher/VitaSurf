@@ -1,23 +1,50 @@
 diff --git a/utils/useragent.c b/utils/useragent.c
-index 547999c7c..64317a1cb 100644
+index 547999c7c..ef9c2ac8e 100644
 --- a/utils/useragent.c
 +++ b/utils/useragent.c
-@@ -52,6 +52,14 @@ user_agent_build_string(void)
+@@ -52,6 +52,41 @@ user_agent_build_string(void)
                          sysname = "X11; Linux";
                  }
          }
 +#ifdef __vita__
 +        /*
-+         * VitaSurf: ask for mobile pages. A 960x544 screen and a slow
-+         * CPU are much better served by them, and sites such as Wikipedia
-+         * redirect to the desktop version unless the UA says Mobile.
++         * VitaSurf: the string this device's own browser sends.
++         *
++         * A site that decides what to serve by reading this had no rule
++         * for "PlayStation Vita; Mobile", which is a string nobody has
++         * ever seen, so several of them fell back to their full desktop
++         * application. Measured against YouTube: the old string was
++         * served www.youtube.com with 10.8 MB of script files, and this
++         * one is served m.youtube.com with 1.8 MB. The device spent
++         * twenty-six seconds compiling the difference. Wikipedia serves
++         * the same bytes either way, so this is about being recognised,
++         * not about any one site.
++         *
++         * It claims AppleWebKit and Safari, which we are not, as every
++         * browser's does; what makes it the right string rather than a
++         * convenient one is that it is what this hardware sends, so the
++         * pages it asks for are pages meant for this screen and this
++         * processor. An old WebKit also means conservative JavaScript,
++         * which suits an interpreter with no JIT.
 +         */
-+        sysname = "PlayStation Vita; Mobile";
++        {
++                static const char vita_ua[] =
++                        "Mozilla/5.0 (PlayStation Vita 3.73) "
++                        "AppleWebKit/536.26 (KHTML, like Gecko) "
++                        "Silk/3.2 Safari/536.26";
++                char *copy = strdup(vita_ua);
++
++                if (copy != NULL) {
++                        core_user_agent_string = copy;
++                        return;
++                }
++                /* out of memory: fall through and build the usual one */
++        }
 +#endif
  
          len = snprintf(NULL, 0, NETSURF_UA_FORMAT_STRING,
                         sysname,
-@@ -74,6 +82,20 @@ user_agent_build_string(void)
+@@ -74,6 +109,20 @@ user_agent_build_string(void)
                core_user_agent_string);
  }
  
