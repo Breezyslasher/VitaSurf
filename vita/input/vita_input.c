@@ -882,11 +882,42 @@ void vita_input_load_finished(struct gui_window *gw)
 	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
-		vita_log("page: of that, html parse %u ms, css %u ms, "
-			 "images %u ms, boxes and styles %u ms, layout %u ms",
-			 vitasurf_ms_html_parse, vitasurf_ms_css,
-			 vitasurf_ms_image, vitasurf_ms_boxes,
-			 vitasurf_ms_layout);
+		{
+			/*
+			 * Say what is left over as well as what was
+			 * measured. A load of ninety-six seconds once
+			 * reported half a second of work, all of it in
+			 * the parse and the layout, and there was no way
+			 * to tell from the log whether the rest went on
+			 * the network, on script run from a timer, or
+			 * somewhere nobody had thought to look. An
+			 * unaccounted figure cannot hide.
+			 *
+			 * The figures overlap: a script run by a <script>
+			 * element runs during the parse and is counted in
+			 * both, so what is left over is a floor, not an
+			 * exact number.
+			 */
+			unsigned int seen = vitasurf_ms_html_parse +
+				vitasurf_ms_css + vitasurf_ms_image +
+				vitasurf_ms_boxes + vitasurf_ms_layout +
+				vitasurf_ms_script;
+
+			vita_log("page: of that, html parse %u ms, css %u ms, "
+				 "images %u ms, boxes and styles %u ms, "
+				 "layout %u ms, script %u ms",
+				 vitasurf_ms_html_parse, vitasurf_ms_css,
+				 vitasurf_ms_image, vitasurf_ms_boxes,
+				 vitasurf_ms_layout, vitasurf_ms_script);
+			if (seen > ms) {
+				vita_log("page: the figures above overlap, so "
+					 "nothing is left to account for");
+			} else {
+				vita_log("page: at least %u ms unaccounted "
+					 "(network waits, and work nothing "
+					 "measures yet)", ms - seen);
+			}
+		}
 		vita_log("page: images %u asked for, %u decoded, %u failed",
 			 vitasurf_images_asked, vitasurf_images_done,
 			 vitasurf_images_failed);

@@ -1,5 +1,5 @@
 diff --git a/content/content.c b/content/content.c
-index 448cf2369..e9615b7d4 100644
+index 448cf2369..78c9bfb00 100644
 --- a/content/content.c
 +++ b/content/content.c
 @@ -28,6 +28,7 @@
@@ -10,7 +10,7 @@ index 448cf2369..e9615b7d4 100644
  #include "utils/messages.h"
  #include "utils/corestrings.h"
  #include "netsurf/browser_window.h"
-@@ -80,10 +81,78 @@
+@@ -80,10 +81,78 @@ static void content_convert(struct content *c)
  	      nsurl_access_log(llcache_handle_get_url(c->llcache)), c);
  
  	if (c->handler->data_complete != NULL) {
@@ -89,6 +89,8 @@ index 448cf2369..e9615b7d4 100644
  		/* Conversion to the READY state will unlock the content */
  	} else {
  		content_set_ready(c);
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 7867f62b8..1f66b4062 100644
 --- a/content/handlers/html/box_construct.c
 +++ b/content/handlers/html/box_construct.c
 @@ -28,6 +28,8 @@
@@ -236,10 +238,10 @@ index 8baf33870..cfb154c9d 100644
  	return ret;
  }
 diff --git a/utils/utils.c b/utils/utils.c
-index c64718531..8a3ecc194 100644
+index c64718531..0b14e603b 100644
 --- a/utils/utils.c
 +++ b/utils/utils.c
-@@ -571,3 +571,22 @@ void regfree(regex_t *preg)
+@@ -571,3 +571,24 @@ void regfree(regex_t *preg)
  }
  
  #endif
@@ -251,6 +253,7 @@ index c64718531..8a3ecc194 100644
 +unsigned int vitasurf_ms_image;
 +unsigned int vitasurf_ms_boxes;
 +unsigned int vitasurf_ms_layout;
++unsigned int vitasurf_ms_script;
 +
 +/* exported interface documented in utils/utils.h */
 +void vitasurf_profile_reset(void)
@@ -260,10 +263,11 @@ index c64718531..8a3ecc194 100644
 +	vitasurf_ms_image = 0;
 +	vitasurf_ms_boxes = 0;
 +	vitasurf_ms_layout = 0;
++	vitasurf_ms_script = 0;
 +	vitasurf_ms_nested = 0;
 +}
 diff --git a/utils/utils.h b/utils/utils.h
-index 8a051633c..e44dda3be 100644
+index 8a051633c..8c9a91ed9 100644
 --- a/utils/utils.h
 +++ b/utils/utils.h
 @@ -27,6 +27,7 @@
@@ -274,7 +278,7 @@ index 8a051633c..e44dda3be 100644
  
  #ifndef NOF_ELEMENTS
  #define NOF_ELEMENTS(array) (sizeof(array)/sizeof(*(array)))
-@@ -120,4 +121,36 @@ bool is_dir(const char *path);
+@@ -120,4 +121,43 @@ bool is_dir(const char *path);
  #endif
  
  
@@ -291,6 +295,13 @@ index 8a051633c..e44dda3be 100644
 +extern unsigned int vitasurf_ms_image;
 +extern unsigned int vitasurf_ms_boxes;
 +extern unsigned int vitasurf_ms_layout;
++/**
++ * Milliseconds spent inside script, however it was entered: a
++ * <script>, a timer, an event listener. The other counters cover
++ * only what a content conversion does, and on a page that works
++ * through timers that is a small part of the load.
++ */
++extern unsigned int vitasurf_ms_script;
 +/**
 + * Milliseconds the conversion now returning spent, handed up so the
 + * conversion that contains it can subtract its own nested work.

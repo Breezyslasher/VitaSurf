@@ -33,6 +33,7 @@
 #include <quickjs.h>
 
 #include "utils/errors.h"
+#include "utils/utils.h"
 #include "utils/nsurl.h"
 #include "utils/corestrings.h"
 #include "netsurf/browser_window.h"
@@ -3065,11 +3066,22 @@ static void rearm_deadline(jsthread *thread)
  * Draining microtasks belongs to the outermost call for the same
  * reason: that is where a script actually finishes.
  */
+/*
+ * Wall time inside script, from the outermost entry only, so that a
+ * listener called from a script is not counted twice. The page profile
+ * reads it: without this the only script time recorded was what a
+ * <script> element ran during the parse, and a page that does its work
+ * from timers and events -- which is most of them now -- showed a load
+ * of a minute and a half with five hundred milliseconds accounted for.
+ */
+static uint64_t script_entered_ms;
+
 static void begin_script(jsthread *thread)
 {
 	if (thread->script_depth++ > 0) {
 		return;
 	}
+	script_entered_ms = now_ms();
 	rearm_deadline(thread);
 }
 
@@ -3081,6 +3093,10 @@ static void end_script(jsthread *thread)
 		return;
 	}
 	thread->script_depth = 0;
+	if (script_entered_ms != 0) {
+		vitasurf_ms_script += (unsigned)(now_ms() - script_entered_ms);
+		script_entered_ms = 0;
+	}
 	if (thread->overrun_count > 1) {
 		vita_log("qjs: that script was interrupted %u times before "
 			 "it stopped", thread->overrun_count);
