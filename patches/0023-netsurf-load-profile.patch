@@ -279,10 +279,10 @@ index d040f4528..c701a1919 100644
  	if (fbtk_get_caret(widget, &caret_x, &caret_y, &caret_h)) {
  		/* This widget has caret, so render it */
 diff --git a/utils/utils.c b/utils/utils.c
-index c64718531..4bc2613e1 100644
+index c64718531..fc4c433a8 100644
 --- a/utils/utils.c
 +++ b/utils/utils.c
-@@ -571,3 +571,28 @@ void regfree(regex_t *preg)
+@@ -571,3 +571,30 @@ void regfree(regex_t *preg)
  }
  
  #endif
@@ -297,6 +297,7 @@ index c64718531..4bc2613e1 100644
 +unsigned int vitasurf_ms_script;
 +unsigned int vitasurf_ms_draw;
 +unsigned int vitasurf_ms_teardown;
++unsigned int vitasurf_ms_prelude;
 +
 +/* exported interface documented in utils/utils.h */
 +void vitasurf_profile_reset(void)
@@ -309,10 +310,11 @@ index c64718531..4bc2613e1 100644
 +	vitasurf_ms_script = 0;
 +	vitasurf_ms_draw = 0;
 +	vitasurf_ms_teardown = 0;
++	vitasurf_ms_prelude = 0;
 +	vitasurf_ms_nested = 0;
 +}
 diff --git a/utils/utils.h b/utils/utils.h
-index 8a051633c..df4a5c4b5 100644
+index 8a051633c..c4329261c 100644
 --- a/utils/utils.h
 +++ b/utils/utils.h
 @@ -27,6 +27,7 @@
@@ -323,7 +325,7 @@ index 8a051633c..df4a5c4b5 100644
  
  #ifndef NOF_ELEMENTS
  #define NOF_ELEMENTS(array) (sizeof(array)/sizeof(*(array)))
-@@ -120,4 +121,54 @@ bool is_dir(const char *path);
+@@ -120,4 +121,59 @@ bool is_dir(const char *path);
  #endif
  
  
@@ -358,6 +360,11 @@ index 8a051633c..df4a5c4b5 100644
 + * happens inside the next page's load, so it is that page's wait.
 + */
 +extern unsigned int vitasurf_ms_teardown;
++/**
++ * Milliseconds spent running the bindings' own JavaScript, which
++ * happens once per page before any of the page's own script.
++ */
++extern unsigned int vitasurf_ms_prelude;
 +/**
 + * Milliseconds the conversion now returning spent, handed up so the
 + * conversion that contains it can subtract its own nested work.
