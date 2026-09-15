@@ -81,6 +81,14 @@ struct jsheap {
 	int timeout;          /**< script time budget, seconds */
 	bool pending_destroy;
 	int live_threads;
+	/*
+	 * The thread the runtime's interrupt handler was last pointed at.
+	 * The runtime outlives any one page, and the handler reads the
+	 * thread's deadline on every call, so a thread that is freed
+	 * without clearing this leaves the handler reading freed memory
+	 * until the next page installs its own.
+	 */
+	struct jsthread *interrupt_thread;
 };
 
 struct js_listener;
@@ -120,6 +128,16 @@ struct jsthread {
 	struct browser_window *win;
 	html_content *htmlc;
 	uint64_t deadline_ms;     /**< when the running script must stop */
+	/*
+	 * How the running script's overrun has been reported. QuickJS
+	 * raises an ordinary exception when the interrupt handler says
+	 * stop, and a page wrapped in try/catch swallows it and carries
+	 * on, so the handler fires again a moment later and keeps firing.
+	 * YouTube did that for eighteen minutes and wrote eighteen
+	 * thousand identical lines, each one flushed to the memory card.
+	 */
+	unsigned overrun_count;   /**< interrupts past the deadline */
+	uint64_t overrun_said_ms; /**< when that was last logged */
 	const char *current_script; /**< URL of the script js_exec is running */
 	struct js_listener *listeners; /**< event listeners, freed on close */
 	/**
@@ -231,7 +249,23 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 		return 0;
 	}
 	if (now_ms() > thread->deadline_ms) {
-		vita_log("qjs: script exceeded its time budget");
+		uint64_t now = now_ms();
+
+		thread->overrun_count++;
+		/* The first one, then at most one line every 30 seconds:
+		 * a script that keeps catching the abort is worth saying
+		 * out loud, but only as often as it takes to see it. */
+		if (thread->overrun_count == 1) {
+			vita_log("qjs: script exceeded its time budget: %s",
+				 thread->current_script != NULL ?
+				 thread->current_script : "?");
+			thread->overrun_said_ms = now;
+		} else if (now - thread->overrun_said_ms >= 30000) {
+			vita_log("qjs: script still over budget after %u "
+				 "interrupts, and still catching them",
+				 thread->overrun_count);
+			thread->overrun_said_ms = now;
+		}
 		return 1; /* abort */
 	}
 	return 0;
@@ -2943,6 +2977,8 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 
 static void begin_script(jsthread *thread)
 {
+	thread->overrun_count = 0;
+	thread->overrun_said_ms = 0;
 	if (thread->heap->timeout > 0) {
 		thread->deadline_ms = now_ms() +
 			(uint64_t)thread->heap->timeout * 1000;
@@ -2955,6 +2991,11 @@ static void schedule_relayout(jsthread *thread, int ms);
 
 static void end_script(jsthread *thread)
 {
+	if (thread->overrun_count > 1) {
+		vita_log("qjs: that script was interrupted %u times before "
+			 "it stopped", thread->overrun_count);
+	}
+	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
 	/* run microtasks (promise jobs) the script queued */
 	for (;;) {
@@ -4749,6 +4790,7 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	ret->import_map = JS_UNINITIALIZED;
 	JS_SetContextOpaque(ret->ctx, ret);
 	JS_SetInterruptHandler(heap->rt, qjs_interrupt, ret);
+	heap->interrupt_thread = ret;
 	setup_globals(ret);
 	heap->live_threads++;
 	*thread = ret;
@@ -4842,6 +4884,10 @@ void js_destroythread(jsthread *thread)
 		struct js_timer *next = t->next;
 		free(t);
 		t = next;
+	}
+	if (thread->heap->interrupt_thread == thread) {
+		JS_SetInterruptHandler(thread->heap->rt, NULL, NULL);
+		thread->heap->interrupt_thread = NULL;
 	}
 	thread->heap->live_threads--;
 	if (thread->heap->pending_destroy && thread->heap->live_threads == 0) {
