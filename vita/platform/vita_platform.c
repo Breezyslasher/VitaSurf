@@ -430,6 +430,13 @@ int vita_platform_init(void)
 
 	/* Writable data directory. 0x80010011 is "already exists". */
 	mkdir_ret = sceIoMkdir(VITASURF_DATA_DIR, 0777);
+	/*
+	 * Made here rather than on first use: the JavaScript glue is built
+	 * for the native test harness too and has no Sce calls in it, so it
+	 * only ever opens files inside this directory. If the directory is
+	 * missing the cache misses, which costs speed and nothing else.
+	 */
+	sceIoMkdir(VITASURF_JSCACHE_DIR, 0777);
 
 	/*
 	 * Open the log with a plain fopen first so vita_log() works even if

@@ -10,7 +10,7 @@ index 448cf2369..e9615b7d4 100644
  #include "utils/messages.h"
  #include "utils/corestrings.h"
  #include "netsurf/browser_window.h"
-@@ -80,10 +81,68 @@ static void content_convert(struct content *c)
+@@ -80,10 +81,78 @@
  	      nsurl_access_log(llcache_handle_get_url(c->llcache)), c);
  
  	if (c->handler->data_complete != NULL) {
@@ -72,15 +72,23 @@ index 448cf2369..e9615b7d4 100644
 +					 (int)(sizeof(tail) - 4), url);
 +				url = tail;
 +			}
-+			vita_log("slow convert: %u ms for %u KB of %s",
++			/*
++			 * A script's conversion does nothing but set the
++			 * content done, which is what runs the script -- so
++			 * for CONTENT_JS this time is the compile and the
++			 * run, already reported line by line by the engine.
++			 * Saying "convert" for it sent me looking for a
++			 * charset loop that does not exist.
++			 */
++			vita_log("slow %s: %u ms for %u KB of %s",
++				 type == CONTENT_JS ? "script (compile+run)"
++						    : "convert",
 +				 (unsigned int)self,
 +				 (unsigned int)(size / 1024), url);
 +		}
  		/* Conversion to the READY state will unlock the content */
  	} else {
  		content_set_ready(c);
-diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
-index 7867f62b8..1f66b4062 100644
 --- a/content/handlers/html/box_construct.c
 +++ b/content/handlers/html/box_construct.c
 @@ -28,6 +28,8 @@

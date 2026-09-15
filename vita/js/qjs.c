@@ -5015,6 +5015,344 @@ void js_destroythread(jsthread *thread)
 #define SCRIPT_MAX_BYTES (16 * 1024 * 1024)
 #define SCRIPT_LOG_BYTES (256 * 1024)
 
+/* ------------------------------------------------------------------------ */
+/* Compiled script cache                                                    */
+
+/*
+ * Compiling is the single most expensive thing a page makes us do.
+ * YouTube's bundle is 10.5 MB of JavaScript and took 17.6 seconds to
+ * compile on the device, against 9.3 to run: most of a minute and a half
+ * of page load, repeated in full every single visit.
+ *
+ * QuickJS can serialise a compiled function and read it back, which is
+ * how qjsc precompiles a script and how the prelude avoids being parsed
+ * once per page. The same thing works across runs if the bytecode is
+ * kept on the memory card. Measured on a 2.5 MB bundle, reading it back
+ * took 22 ms against 244 ms to compile, and evaluating the result
+ * behaved identically -- same values, same errors, same peak memory.
+ *
+ * Only classic scripts are cached. A module's imports are resolved while
+ * it is compiled, and a miss there sends the script down the deferred
+ * retry path; keeping that behaviour identical matters more than the
+ * saving, so modules are left alone.
+ */
+
+#define BC_MAGIC      0x43425356u        /* 'VSBC' */
+#define BC_FORMAT     1u
+/* Below this, compiling is quicker than finding the file on the card. */
+#define BC_MIN_SRC    (128 * 1024)
+/* One entry. Bytecode runs three to five times the size of its source. */
+#define BC_MAX_ENTRY  (48u * 1024 * 1024)
+/* The whole directory. An unbounded cache is a bug (see CLAUDE.md). */
+#define BC_BUDGET     (96u * 1024 * 1024)
+#define BC_MAX_ENTRIES 48
+
+struct bc_header {
+	uint32_t magic;
+	uint32_t format;
+	uint32_t src_len;
+	uint32_t src_hash_lo;
+	uint32_t src_hash_hi;
+	uint32_t bc_len;
+};
+
+/** FNV-1a over a buffer. Used to name an entry and to check its source. */
+static uint64_t bc_hash(const void *p, size_t len)
+{
+	const uint8_t *b = p;
+	uint64_t h = 1469598103934665603ull;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		h ^= b[i];
+		h *= 1099511628211ull;
+	}
+	return h;
+}
+
+/** Path of the entry for a URL, into buf. */
+static void bc_path(char *buf, size_t n, const char *url)
+{
+	uint64_t h = bc_hash(url, strlen(url));
+
+	snprintf(buf, n, "%s/%08x%08x.bc", VITASURF_JSCACHE_DIR,
+		 (unsigned)(h >> 32), (unsigned)(h & 0xffffffffu));
+}
+
+/*
+ * The index. Eviction needs to know what is in the directory and how big
+ * each entry is, and reading a directory is the one file operation whose
+ * behaviour on the device I have not verified. A list the cache writes
+ * itself needs nothing but fopen, and doubles as the use order.
+ *
+ * Losing it costs the cache, not correctness: a stale name is a file that
+ * gets overwritten, and a missing one is a miss.
+ */
+struct bc_entry {
+	char name[24];
+	uint32_t bytes;
+	uint32_t stamp;		/* use order; a counter, not a clock */
+};
+
+static struct bc_entry bc_index[BC_MAX_ENTRIES];
+static unsigned bc_index_n;
+static uint32_t bc_stamp;
+static bool bc_index_read;
+
+static void bc_index_load(void)
+{
+	char path[256];
+	FILE *f;
+
+	if (bc_index_read) {
+		return;
+	}
+	bc_index_read = true;
+	snprintf(path, sizeof(path), "%s/index", VITASURF_JSCACHE_DIR);
+	f = fopen(path, "rb");
+	if (f == NULL) {
+		return;
+	}
+	while (bc_index_n < BC_MAX_ENTRIES) {
+		struct bc_entry *e = &bc_index[bc_index_n];
+		unsigned bytes = 0, stamp = 0;
+
+		if (fscanf(f, "%23s %u %u", e->name, &bytes, &stamp) != 3) {
+			break;
+		}
+		e->bytes = bytes;
+		e->stamp = stamp;
+		if (stamp > bc_stamp) {
+			bc_stamp = stamp;
+		}
+		bc_index_n++;
+	}
+	fclose(f);
+}
+
+static void bc_index_save(void)
+{
+	char path[256];
+	FILE *f;
+	unsigned i;
+
+	snprintf(path, sizeof(path), "%s/index", VITASURF_JSCACHE_DIR);
+	f = fopen(path, "wb");
+	if (f == NULL) {
+		return;
+	}
+	for (i = 0; i < bc_index_n; i++) {
+		fprintf(f, "%s %u %u\n", bc_index[i].name,
+			(unsigned)bc_index[i].bytes,
+			(unsigned)bc_index[i].stamp);
+	}
+	fclose(f);
+}
+
+static struct bc_entry *bc_index_find(const char *name)
+{
+	unsigned i;
+
+	for (i = 0; i < bc_index_n; i++) {
+		if (strcmp(bc_index[i].name, name) == 0) {
+			return &bc_index[i];
+		}
+	}
+	return NULL;
+}
+
+static void bc_index_drop(unsigned i)
+{
+	char path[256];
+
+	snprintf(path, sizeof(path), "%s/%s", VITASURF_JSCACHE_DIR,
+		 bc_index[i].name);
+	remove(path);
+	memmove(&bc_index[i], &bc_index[i + 1],
+		(bc_index_n - i - 1) * sizeof(bc_index[0]));
+	bc_index_n--;
+}
+
+/** Make room for one more entry of this size, oldest use first. */
+static void bc_index_make_room(uint32_t bytes)
+{
+	for (;;) {
+		uint64_t total = bytes;
+		unsigned i, oldest = 0;
+
+		for (i = 0; i < bc_index_n; i++) {
+			total += bc_index[i].bytes;
+			if (bc_index[i].stamp < bc_index[oldest].stamp) {
+				oldest = i;
+			}
+		}
+		if (bc_index_n == 0) {
+			return;
+		}
+		if (total <= BC_BUDGET && bc_index_n < BC_MAX_ENTRIES) {
+			return;
+		}
+		vita_log("qjs: cache full, dropping %s (%u KB)",
+			 bc_index[oldest].name,
+			 (unsigned)(bc_index[oldest].bytes / 1024));
+		bc_index_drop(oldest);
+	}
+}
+
+/**
+ * The compiled form of this source, or JS_UNDEFINED if it is not cached.
+ *
+ * The file is named after the URL and carries the length and hash of the
+ * source it was built from, so a bundle that changed behind the same URL
+ * is a miss rather than the wrong code.
+ */
+static JSValue bc_load(JSContext *ctx, const char *url,
+		       const char *src, size_t srclen)
+{
+	char path[256];
+	struct bc_header h;
+	FILE *f;
+	uint8_t *buf;
+	JSValue fn;
+	uint64_t hash;
+
+	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<') {
+		return JS_UNDEFINED;
+	}
+	bc_path(path, sizeof(path), url);
+	f = fopen(path, "rb");
+	if (f == NULL) {
+		return JS_UNDEFINED;
+	}
+	if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
+	    h.magic != BC_MAGIC || h.format != BC_FORMAT ||
+	    h.src_len != (uint32_t)srclen ||
+	    h.bc_len == 0 || h.bc_len > BC_MAX_ENTRY) {
+		fclose(f);
+		return JS_UNDEFINED;
+	}
+	hash = bc_hash(src, srclen);
+	if (h.src_hash_lo != (uint32_t)(hash & 0xffffffffu) ||
+	    h.src_hash_hi != (uint32_t)(hash >> 32)) {
+		fclose(f);		/* same URL, different bundle */
+		return JS_UNDEFINED;
+	}
+	buf = malloc(h.bc_len);
+	if (buf == NULL) {
+		fclose(f);
+		return JS_UNDEFINED;
+	}
+	if (fread(buf, 1, h.bc_len, f) != h.bc_len) {
+		free(buf);
+		fclose(f);
+		return JS_UNDEFINED;
+	}
+	fclose(f);
+	/*
+	 * QuickJS stamps its own bytecode version into the stream and
+	 * refuses a stream it did not write, so an entry left behind by an
+	 * older engine comes back as an exception here rather than as
+	 * something that runs. Treat it as a miss and compile.
+	 */
+	fn = JS_ReadObject(ctx, buf, h.bc_len, JS_READ_OBJ_BYTECODE);
+	free(buf);
+	if (JS_IsException(fn)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		remove(path);
+		return JS_UNDEFINED;
+	}
+	{
+		char nm[24];
+		struct bc_entry *e;
+
+		snprintf(nm, sizeof(nm), "%s", strrchr(path, '/') + 1);
+		bc_index_load();
+		e = bc_index_find(nm);
+		if (e != NULL) {
+			e->stamp = ++bc_stamp;
+			bc_index_save();
+		}
+	}
+	return fn;
+}
+
+/** Keep the compiled form of this source for the next visit. */
+static void bc_store(JSContext *ctx, const char *url,
+		     const char *src, size_t srclen, JSValueConst fn)
+{
+	char path[256], tmp[264], nm[24];
+	struct bc_header h;
+	uint8_t *out;
+	size_t out_len = 0;
+	FILE *f;
+	uint64_t hash;
+	struct bc_entry *e;
+
+	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<') {
+		return;
+	}
+	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE);
+	if (out == NULL) {
+		return;
+	}
+	if (out_len == 0 || out_len > BC_MAX_ENTRY) {
+		js_free(ctx, out);
+		return;
+	}
+	bc_path(path, sizeof(path), url);
+	snprintf(nm, sizeof(nm), "%s", strrchr(path, '/') + 1);
+	bc_index_load();
+	e = bc_index_find(nm);
+	if (e != NULL) {			/* replacing our own entry */
+		unsigned i = (unsigned)(e - bc_index);
+		bc_index_drop(i);
+	}
+	bc_index_make_room((uint32_t)out_len);
+	if (bc_index_n >= BC_MAX_ENTRIES) {
+		js_free(ctx, out);
+		return;
+	}
+	hash = bc_hash(src, srclen);
+	h.magic = BC_MAGIC;
+	h.format = BC_FORMAT;
+	h.src_len = (uint32_t)srclen;
+	h.src_hash_lo = (uint32_t)(hash & 0xffffffffu);
+	h.src_hash_hi = (uint32_t)(hash >> 32);
+	h.bc_len = (uint32_t)out_len;
+	/*
+	 * Written beside the entry and renamed over it, so a battery that
+	 * runs out mid-write leaves the old entry or no entry, never half
+	 * of one under a name that claims to be whole.
+	 */
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	f = fopen(tmp, "wb");
+	if (f == NULL) {
+		js_free(ctx, out);
+		return;
+	}
+	if (fwrite(&h, 1, sizeof(h), f) != sizeof(h) ||
+	    fwrite(out, 1, out_len, f) != out_len) {
+		fclose(f);
+		remove(tmp);
+		js_free(ctx, out);
+		return;
+	}
+	fclose(f);
+	js_free(ctx, out);
+	remove(path);
+	if (rename(tmp, path) != 0) {
+		remove(tmp);
+		return;
+	}
+	snprintf(bc_index[bc_index_n].name, sizeof(bc_index[0].name), "%s", nm);
+	bc_index[bc_index_n].bytes = (uint32_t)out_len;
+	bc_index[bc_index_n].stamp = ++bc_stamp;
+	bc_index_n++;
+	bc_index_save();
+	vita_log("qjs: cached %u KB of bytecode for %u KB of source",
+		 (unsigned)(out_len / 1024), (unsigned)(srclen / 1024));
+}
+
 /*
  * An import map: <script type="importmap">, whose JSON says what a bare
  * specifier such as "react" stands for. NetSurf never runs the element,
@@ -5681,7 +6019,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * the same two steps internally, so this costs nothing.
 		 */
 		uint64_t t_start = now_ms(), t_compiled, t_done;
-		bool module = false;
+		bool module = false, cached = false;
 		JSValue fn;
 
 		/*
@@ -5706,8 +6044,16 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * semantics, and the retry costs a parse only on source
 		 * that was not going to run at all.
 		 */
+		fn = bc_load(thread->ctx, name, src, txtlen);
+		if (!JS_IsUndefined(fn)) {
+			cached = true;
+			goto compiled;
+		}
 		fn = JS_Eval(thread->ctx, src, txtlen, name,
 			     JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+		if (!JS_IsException(fn)) {
+			bc_store(thread->ctx, name, src, txtlen, fn);
+		}
 		if (JS_IsException(fn)) {
 			JSValue script_err = JS_GetException(thread->ctx);
 			unsigned missed = thread->js_imports_missed;
@@ -5751,6 +6097,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			}
 		}
 
+	compiled:
 		t_compiled = now_ms();
 		if (JS_IsException(fn)) {
 			ret = fn;
@@ -5817,9 +6164,10 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		thread->js_run_ms += (unsigned)(t_done - t_compiled);
 
 		if (txtlen > SCRIPT_LOG_BYTES || vita_verbose_requested()) {
-			vita_log("qjs: script %u KB compiled in %u ms, "
+			vita_log("qjs: script %u KB %s in %u ms, "
 				 "ran in %u ms, runtime memory now %u KB: %s",
 				 (unsigned)(txtlen / 1024),
+				 cached ? "read from cache" : "compiled",
 				 (unsigned)(t_compiled - t_start),
 				 (unsigned)(t_done - t_compiled),
 				 runtime_kb(thread->heap->rt),

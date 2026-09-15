@@ -55,6 +55,8 @@ void vita_options_floor(void);
 #define VITASURF_BOOKMARKS_PATH VITASURF_DATA_DIR "/Bookmarks"
 #define VITASURF_BOOKMARKS_PAGE VITASURF_DATA_DIR "/bookmarks.html"
 #define VITASURF_HISTORY_PAGE   VITASURF_DATA_DIR "/history.html"
+/* Compiled JavaScript, kept between runs. See bc_load() in vita/js/qjs.c. */
+#define VITASURF_JSCACHE_DIR    VITASURF_DATA_DIR "/jscache"
 #define VITASURF_DOWNLOADS_DIR  VITASURF_DATA_DIR "/downloads"
 #define VITASURF_DOWNLOADS_PAGE VITASURF_DATA_DIR "/downloads.html"
 /* holds the URL of a FlareSolverr server, e.g. http://192.168.1.20:8191/v1 */
