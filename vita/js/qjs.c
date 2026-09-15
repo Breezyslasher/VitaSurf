@@ -139,6 +139,7 @@ struct jsthread {
 	 */
 	unsigned script_depth;    /**< nested entries from C into script */
 	bool aborting;            /**< the budget is unwinding a script */
+	unsigned scripts_killed;  /**< scripts the budget stopped, this page */
 	unsigned overrun_count;   /**< interrupts past the deadline */
 	uint64_t overrun_said_ms; /**< when that was last logged */
 	const char *current_script; /**< URL of the script js_exec is running */
@@ -3052,8 +3053,31 @@ static void rearm_deadline(jsthread *thread)
 	thread->overrun_count = 0;
 	thread->overrun_said_ms = 0;
 	if (thread->heap->timeout > 0) {
-		thread->deadline_ms = now_ms() +
-			(uint64_t)thread->heap->timeout * 1000;
+		/*
+		 * Less each time this page has had a script stopped.
+		 *
+		 * Twenty seconds is a long time to let a script run, and
+		 * it is meant to be generous enough that a page doing real
+		 * work on a slow processor is never cut off. A page that
+		 * has already had a script stopped is not that page: on
+		 * YouTube two scripts each ran the full twenty seconds and
+		 * were killed, forty seconds of a hundred-and-six second
+		 * load that produced nothing, and the page rendered anyway.
+		 * So halve it after each one, down to five seconds, which
+		 * bounds what a runaway costs without touching a page that
+		 * never overruns -- and almost none do.
+		 */
+		unsigned secs = (unsigned)thread->heap->timeout;
+		unsigned halvings = thread->scripts_killed;
+
+		if (halvings > 2) {
+			halvings = 2;
+		}
+		secs >>= halvings;
+		if (secs < 5) {
+			secs = 5;
+		}
+		thread->deadline_ms = now_ms() + (uint64_t)secs * 1000;
 	} else {
 		thread->deadline_ms = 0;
 	}
@@ -3102,9 +3126,13 @@ static void end_script(jsthread *thread)
 		vitasurf_ms_script += (unsigned)(now_ms() - script_entered_ms);
 		script_entered_ms = 0;
 	}
-	if (thread->overrun_count > 1) {
-		vita_log("qjs: that script was interrupted %u times before "
-			 "it stopped", thread->overrun_count);
+	if (thread->overrun_count > 0) {
+		thread->scripts_killed++;
+		vita_log("qjs: that script was stopped by the budget "
+			 "(%u on this page; the next gets %u seconds)",
+			 thread->scripts_killed,
+			 thread->scripts_killed >= 2 ? 5u :
+			 (unsigned)thread->heap->timeout / 2);
 	}
 	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
