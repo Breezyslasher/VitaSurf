@@ -4241,6 +4241,49 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
 (function(){
  var C=W.console;
  if(!C)return;
+ /* What an argument says, rather than what String() makes of it.
+    An object goes to the log as "[object Object]", which is how
+    claude.ai's "IndexedDB state read rejected [object Object]" told us
+    nothing at all about which error it had caught. A browser shows the
+    contents; this shows enough of them to name the fault. */
+ function describe(v,depth){
+  var t=typeof v;
+  if(v===null||v===undefined||t==='string'||t==='number'||t==='boolean')
+   return String(v);
+  if(t==='function')return 'function '+(v.name||'');
+  if(t==='symbol')return String(v);
+  try{
+   if(v instanceof Error||
+      (v.name!==undefined&&v.message!==undefined&&typeof v.stack==='string')){
+    var head=(v.name||'Error')+': '+(v.message||'');
+    if(v.stack){var f=String(v.stack).split('\n')[1];
+     if(f)head+=' | at'+f.replace(/^\s*at/,'');}
+    return head;}
+   if(v.name!==undefined&&v.message!==undefined)
+    return String(v.name)+': '+String(v.message);
+  }catch(e){}
+  if(depth>2)return Array.isArray(v)?'[...]':'{...}';
+  try{
+   if(Array.isArray(v)){
+    var parts=v.slice(0,8).map(function(x){return describe(x,depth+1);});
+    if(v.length>8)parts.push('... '+v.length+' in all');
+    return '['+parts.join(', ')+']';}
+   if(v instanceof Date)return v.toISOString();
+   var keys=Object.keys(v),body=keys.slice(0,8).map(function(k){
+    return k+': '+describe(v[k],depth+1);});
+   if(keys.length>8)body.push('... '+keys.length+' keys');
+   var str=String(v);
+   if(str!=='[object Object]'&&body.length===0)return str;
+   return '{'+body.join(', ')+'}';
+  }catch(e){return '[object]';}
+ }
+ ['log','warn','error','info','debug'].forEach(function(k){
+  var real=C[k];
+  if(typeof real!=='function')return;
+  C[k]=function(){
+   var a=Array.prototype.map.call(arguments,function(v){
+    return typeof v==='string'?v:describe(v,0);});
+   return real.apply(C,a);};});
  function out(kind,args){
   try{(C[kind]||C.log).apply(C,args);}catch(e){}}
  function def(n,f){if(typeof C[n]!=='function')C[n]=f;}

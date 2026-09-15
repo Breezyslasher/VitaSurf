@@ -176,6 +176,7 @@ struct jsthread {
 	unsigned js_modules;      /**< of those, compiled as ES modules */
 	unsigned js_imports_missed; /**< imports that resolved to nothing */
 	unsigned js_import_fetches; /**< chunks the loader went and fetched */
+	unsigned retry_delay_ms;  /**< how long before the next retry round */
 	struct js_deferred *deferred; /**< module scripts waiting on imports */
 	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
@@ -2866,6 +2867,9 @@ static JSValue console_log(JSContext *ctx, JSValueConst this_val,
 	size_t pos = 0;
 
 	(void)this_val;
+	/* console.log() with nothing to say still reaches vita_log, which
+	 * read whatever was on the stack. */
+	line[0] = 0;
 	for (i = 0; i < argc; i++) {
 		const char *s = JS_ToCString(ctx, argv[i]);
 		if (s != NULL) {
@@ -6190,6 +6194,8 @@ static JSValue settle_module(jsthread *thread, JSValue ret, const char *name)
 }
 
 #define MODULE_RETRY_MS    300
+/* A round that gets nowhere waits longer before the next one. */
+#define MODULE_RETRY_MAX_MS 4800
 #define MODULE_RETRY_TRIES 20
 
 static void module_retry_callback(void *p);
@@ -6251,7 +6257,7 @@ static void module_retry_callback(void *p)
 	jsthread *thread = p;
 	struct js_deferred *d, **link;
 	unsigned progress;
-	bool again = false;
+	bool again = false, moved = false;
 
 	if (thread == NULL || thread->closed) return;
 	thread->deferred_scheduled = false;
@@ -6303,6 +6309,7 @@ static void module_retry_callback(void *p)
 		if (progress != d->progress) {
 			d->progress = progress;
 			d->tries = 0;
+			moved = true;
 		}
 		d->tries++;
 		if (d->tries >= MODULE_RETRY_TRIES ||
@@ -6319,9 +6326,29 @@ static void module_retry_callback(void *p)
 		link = &d->next;
 	}
 	if (again && !thread->closed) {
+		/*
+		 * Back off while nothing is arriving.
+		 *
+		 * A round recompiles every deferred module, and one of
+		 * claude.ai's chunks is four hundred kilobytes, which is
+		 * about a second of compiling on the device. Retrying
+		 * every three hundred milliseconds started the next round
+		 * long before the last had finished and recompiled the
+		 * same two modules eight times over seventeen seconds, all
+		 * of it failing at the same import that had not arrived
+		 * yet. A round that resolves something keeps the short
+		 * interval, because a chain wants one round per link.
+		 */
+		if (moved) {
+			thread->retry_delay_ms = MODULE_RETRY_MS;
+		} else if (thread->retry_delay_ms < MODULE_RETRY_MS) {
+			thread->retry_delay_ms = MODULE_RETRY_MS;
+		} else if (thread->retry_delay_ms < MODULE_RETRY_MAX_MS) {
+			thread->retry_delay_ms *= 2;
+		}
 		thread->deferred_scheduled = true;
-		guit->misc->schedule(MODULE_RETRY_MS, module_retry_callback,
-				     thread);
+		guit->misc->schedule((int)thread->retry_delay_ms,
+				     module_retry_callback, thread);
 	}
 }
 
