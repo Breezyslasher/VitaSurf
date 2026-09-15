@@ -1526,6 +1526,15 @@ W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.Int
 W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};
 W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
 function Image(){return document.createElement('img');}W.Image=Image;
+/* The other two legacy element constructors. new Audio() is how a page
+   makes a sound without markup, and a page that calls it and gets a
+   ReferenceError stops there: YouTube's player set-up did, so nothing
+   after it ran. The argument is a source URL, as for <audio src>. */
+function Audio(src){var a=document.createElement('audio');
+ a.preload='auto';
+ if(src!==undefined&&src!==null)a.setAttribute('src',String(src));
+ return a;}
+W.Audio=Audio;
 function URLSearchParams(init){this._p=[];if(typeof init==='string'){init.replace(/^\?/,'').split('&').forEach(function(kv){if(!kv)return;var i=kv.indexOf('=');var k=i<0?kv:kv.slice(0,i),v=i<0?'':kv.slice(i+1);this._p.push([decodeURIComponent(k.replace(/\+/g,' ')),decodeURIComponent(v.replace(/\+/g,' '))]);},this);}else if(init&&typeof init==='object'){var self=this;(init._p?init._p:Object.keys(init).map(function(k){return [k,init[k]];})).forEach(function(kv){self._p.push([String(kv[0]),String(kv[1])]);});}}
 URLSearchParams.prototype={get:function(k){for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},has:function(k){return this.get(k)!==null;},set:function(k,v){var d=false;this._p=this._p.filter(function(p){if(p[0]!==k)return true;if(d)return false;p[1]=String(v);d=true;return true;});if(!d)this._p.push([k,String(v)]);},append:function(k,v){this._p.push([k,String(v)]);},'delete':function(k){this._p=this._p.filter(function(p){return p[0]!==k;});},forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},toString:function(){return this._p.map(function(p){return encodeURIComponent(p[0])+'='+encodeURIComponent(p[1]);}).join('&');},sort:function(){this._p.sort(function(a,b){return a[0]<b[0]?-1:a[0]>b[0]?1:0;});}};
 URLSearchParams.prototype[Symbol.iterator]=URLSearchParams.prototype.entries;Object.defineProperty(URLSearchParams.prototype,'size',{get:function(){return this._p.length;}});
@@ -4632,9 +4641,14 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
  * in JSON" on every load for many builds and I do not know why. The
  * first byte was not the problem -- a check on it never fired -- so say
  * where the first byte that cannot be in JSON actually is, with the
- * bytes around it. Costs nothing until a parse fails. */
+ * bytes around it. Costs nothing until a parse fails.
+ *
+ * Capped, because a failed parse is not always a fault: Polymer decides
+ * whether an attribute holds JSON by parsing it and catching, so every
+ * "[[binding]]" in a template fails by design. YouTube produced forty
+ * of these in a load, each one flushed to the memory card. */
 (function(){
- var real=JSON.parse;
+ var real=JSON.parse,said=0;
  JSON.parse=function(text,reviver){
   try{return real(text,reviver);}
   catch(e){
@@ -4645,9 +4659,12 @@ Object.defineProperty(P,'tabIndex',{configurable:true,
     for(i=at;i<Math.min(s.length,at+24);i++){
      c=(s.charCodeAt(i)&0xffff).toString(16);
      hex+=(c.length<2?'0':'')+c+' ';}
-    console.log('json parse failed: '+String(e).slice(0,60)+
-     '; length '+s.length+', first byte over 127 at '+bad+
-     ', bytes '+hex+', text '+JSON.stringify(s.slice(at,at+40)));
+    if(said<3){
+     said++;
+     console.log('json parse failed: '+String(e).slice(0,60)+
+      '; length '+s.length+', first byte over 127 at '+bad+
+      ', bytes '+hex+', text '+JSON.stringify(s.slice(at,at+40))+
+      (said===3?' (further ones not logged)':''));}
    }catch(x){}
    throw e;}};})();
 /* What was thrown, in one line: a message and the first stack frame.
