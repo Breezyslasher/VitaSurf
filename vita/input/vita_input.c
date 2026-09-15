@@ -45,6 +45,7 @@
 
 #include "utils/errors.h"
 #include "utils/utils.h"
+#include "content/hlcache.h"
 #include "utils/nsurl.h"
 #include "netsurf/types.h"
 #include "netsurf/browser_window.h"
@@ -889,6 +890,20 @@ void vita_input_load_finished(struct gui_window *gw)
 		vita_log("page: images %u asked for, %u decoded, %u failed",
 			 vitasurf_images_asked, vitasurf_images_done,
 			 vitasurf_images_failed);
+		{
+			struct hlcache_size_report r;
+
+			hlcache_size_report(&r);
+			vita_log("cache: %u contents, %u KB (css %u in %u, "
+				 "html %u in %u, image %u in %u, other %u in %u)",
+				 r.count, r.total_bytes / 1024,
+				 r.css_bytes / 1024, r.css_count,
+				 r.html_bytes / 1024, r.html_count,
+				 r.image_bytes / 1024, r.image_count,
+				 r.other_bytes / 1024, r.other_count);
+			vita_log("cache: %u of those have no users, %u KB",
+				 r.unused_count, r.unused_bytes / 1024);
+		}
 		nsurl_unref(url);
 	} else {
 		vita_log("page: loaded in %u ms", ms);
