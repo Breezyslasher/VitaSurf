@@ -901,7 +901,8 @@ void vita_input_load_finished(struct gui_window *gw)
 			unsigned int seen = vitasurf_ms_html_parse +
 				vitasurf_ms_css + vitasurf_ms_image +
 				vitasurf_ms_boxes + vitasurf_ms_layout +
-				vitasurf_ms_script;
+				vitasurf_ms_script + vitasurf_ms_draw +
+				vitasurf_ms_teardown;
 
 			vita_log("page: of that, html parse %u ms, css %u ms, "
 				 "images %u ms, boxes and styles %u ms, "
@@ -909,6 +910,9 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_html_parse, vitasurf_ms_css,
 				 vitasurf_ms_image, vitasurf_ms_boxes,
 				 vitasurf_ms_layout, vitasurf_ms_script);
+			vita_log("page: and drawing %u ms, tearing the last "
+				 "page's script down %u ms",
+				 vitasurf_ms_draw, vitasurf_ms_teardown);
 			if (seen > ms) {
 				vita_log("page: the figures above overlap, so "
 					 "nothing is left to account for");

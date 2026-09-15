@@ -4923,10 +4923,19 @@ nserror js_closethread(jsthread *thread)
 {
 	struct js_timer *t;
 	struct js_listener *l;
+	uint64_t t0 = 0, t1 = 0;
 
 	if (thread == NULL || thread->closed) {
 		return NSERROR_OK;
 	}
+	/*
+	 * Freeing the last page's context and collecting what it left
+	 * behind happens while the next page is loading, so the wait lands
+	 * on that page. Count it against that page: one whose own work
+	 * came to a third of a second still took nearly three, and this is
+	 * one of the places the rest could be.
+	 */
+	t0 = now_ms();
 	thread->closed = true;
 	if (thread->relayout_pending) {
 		guit->misc->schedule(-1, relayout_callback, thread);
@@ -4963,8 +4972,10 @@ nserror js_closethread(jsthread *thread)
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
 	JS_RunGC(thread->heap->rt);
-	vita_log("qjs: page closed, runtime memory now %u KB",
-		 runtime_kb(thread->heap->rt));
+	t1 = now_ms();
+	vitasurf_ms_teardown += (unsigned)(t1 - t0);
+	vita_log("qjs: page closed in %u ms, runtime memory now %u KB",
+		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt));
 	return NSERROR_OK;
 }
 
@@ -4972,10 +4983,12 @@ void js_destroythread(jsthread *thread)
 {
 	struct js_listener *l;
 	struct js_timer *t;
+	uint64_t t0 = 0, t1 = 0;
 
 	if (thread == NULL) {
 		return;
 	}
+	t0 = now_ms();		/* the rest of the teardown; see above */
 	js_free_deferred(thread);
 	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;
@@ -5010,6 +5023,8 @@ void js_destroythread(jsthread *thread)
 		free(heap);
 	}
 	free(thread);
+	t1 = now_ms();
+	vitasurf_ms_teardown += (unsigned)(t1 - t0);
 }
 
 /*

@@ -237,11 +237,52 @@ index 8baf33870..cfb154c9d 100644
 +	vitasurf_ms_layout += (unsigned int)(vs_t1 - vs_t0);
  	return ret;
  }
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index d040f4528..c701a1919 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -32,6 +32,7 @@
+ #include "utils/utils.h"
+ #include "utils/nsoption.h"
+ #include "utils/filepath.h"
++#include <nsutils/time.h>
+ #include "utils/log.h"
+ #include "utils/messages.h"
+ #include "netsurf/browser_window.h"
+@@ -388,10 +389,24 @@ fb_redraw(fbtk_widget_t *widget,
+ 	clip.x1 = bwidget->redraw_box.x1;
+ 	clip.y1 = bwidget->redraw_box.y1;
+ 
+-	browser_window_redraw(bw,
+-			x - bwidget->scrollx,
+-			y - bwidget->scrolly,
+-			&clip, &ctx);
++	{
++		/*
++		 * Drawing, as opposed to laying out (VitaSurf). This is
++		 * where glyphs are rasterised and pixels are written, and
++		 * it was never counted: a page whose layout had dropped to
++		 * five milliseconds still took the best part of three
++		 * seconds, with nothing in the profile to say where.
++		 */
++		uint64_t vs_t0 = 0, vs_t1 = 0;
++
++		nsu_getmonotonic_ms(&vs_t0);
++		browser_window_redraw(bw,
++				x - bwidget->scrollx,
++				y - bwidget->scrolly,
++				&clip, &ctx);
++		nsu_getmonotonic_ms(&vs_t1);
++		vitasurf_ms_draw += (unsigned int)(vs_t1 - vs_t0);
++	}
+ 
+ 	if (fbtk_get_caret(widget, &caret_x, &caret_y, &caret_h)) {
+ 		/* This widget has caret, so render it */
 diff --git a/utils/utils.c b/utils/utils.c
-index c64718531..0b14e603b 100644
+index c64718531..4bc2613e1 100644
 --- a/utils/utils.c
 +++ b/utils/utils.c
-@@ -571,3 +571,24 @@ void regfree(regex_t *preg)
+@@ -571,3 +571,28 @@ void regfree(regex_t *preg)
  }
  
  #endif
@@ -254,6 +295,8 @@ index c64718531..0b14e603b 100644
 +unsigned int vitasurf_ms_boxes;
 +unsigned int vitasurf_ms_layout;
 +unsigned int vitasurf_ms_script;
++unsigned int vitasurf_ms_draw;
++unsigned int vitasurf_ms_teardown;
 +
 +/* exported interface documented in utils/utils.h */
 +void vitasurf_profile_reset(void)
@@ -264,10 +307,12 @@ index c64718531..0b14e603b 100644
 +	vitasurf_ms_boxes = 0;
 +	vitasurf_ms_layout = 0;
 +	vitasurf_ms_script = 0;
++	vitasurf_ms_draw = 0;
++	vitasurf_ms_teardown = 0;
 +	vitasurf_ms_nested = 0;
 +}
 diff --git a/utils/utils.h b/utils/utils.h
-index 8a051633c..8c9a91ed9 100644
+index 8a051633c..df4a5c4b5 100644
 --- a/utils/utils.h
 +++ b/utils/utils.h
 @@ -27,6 +27,7 @@
@@ -278,7 +323,7 @@ index 8a051633c..8c9a91ed9 100644
  
  #ifndef NOF_ELEMENTS
  #define NOF_ELEMENTS(array) (sizeof(array)/sizeof(*(array)))
-@@ -120,4 +121,43 @@ bool is_dir(const char *path);
+@@ -120,4 +121,54 @@ bool is_dir(const char *path);
  #endif
  
  
@@ -302,6 +347,17 @@ index 8a051633c..8c9a91ed9 100644
 + * through timers that is a small part of the load.
 + */
 +extern unsigned int vitasurf_ms_script;
++/**
++ * Milliseconds spent drawing the page, which is where glyphs are
++ * rasterised and pixels reach the screen. Laying out and drawing
++ * are separate passes and only the first was ever counted.
++ */
++extern unsigned int vitasurf_ms_draw;
++/**
++ * Milliseconds spent tearing the previous page's script down. It
++ * happens inside the next page's load, so it is that page's wait.
++ */
++extern unsigned int vitasurf_ms_teardown;
 +/**
 + * Milliseconds the conversion now returning spent, handed up so the
 + * conversion that contains it can subtract its own nested work.
