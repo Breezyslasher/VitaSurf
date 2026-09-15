@@ -53,6 +53,13 @@ jobs:
             ('an old Android',
              'Mozilla/5.0 (Linux; Android 4.4; Nexus 5) AppleWebKit/537.36 '
              '(KHTML, like Gecko) Version/4.0 Chrome/33.0 Mobile Safari/537.36'),
+            # The device's own string names no token that the usual
+            # mobile-detection rules look for -- no Mobile, no iPhone, no
+            # Android -- so it only wins where a site knows the Vita.
+            # This one keeps the device and adds the token.
+            ('the Vita plus a Mobile token',
+             'Mozilla/5.0 (PlayStation Vita 3.73; Mobile) AppleWebKit/536.26 '
+             '(KHTML, like Gecko) Silk/3.2 Mobile Safari/536.26'),
           ]
 
           def get(u, ua, timeout=45):
