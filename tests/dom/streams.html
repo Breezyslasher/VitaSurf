@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>streams</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+/* Facts printed as "XX name: value" and compared against a real browser
+   by scripts/dom-compare.sh. Every one of these is behaviour a page can
+   see: backpressure, locking, ordering, cancellation, error paths. */
+var out = [];
+function say(n, v){ out.push('XX ' + n + ': ' + v); }
+function done(){
+  var o = document.getElementById('out');
+  out.forEach(function(l){ o.textContent += l + '\n';
+    try { console.log(l); } catch (e) {} });
+}
+
+say('has ReadableStream', typeof ReadableStream);
+say('has WritableStream', typeof WritableStream);
+say('has TransformStream', typeof TransformStream);
+say('has TextDecoderStream', typeof TextDecoderStream);
+
+/* construction and desiredSize from the strategy */
+var ctrl = null;
+var rs = new ReadableStream({ start: function(c){ ctrl = c; } },
+                            { highWaterMark: 3 });
+say('locked before reader', rs.locked);
+say('desiredSize at rest', ctrl.desiredSize);
+ctrl.enqueue('a');
+say('desiredSize after one enqueue', ctrl.desiredSize);
+var reader = rs.getReader();
+say('locked with reader', rs.locked);
+try { rs.getReader(); say('second reader', 'allowed'); }
+catch (e) { say('second reader', e.name); }
+
+var steps = [];
+reader.read().then(function(r){
+  say('read 1 value', r.value); say('read 1 done', r.done);
+  ctrl.enqueue('b'); ctrl.close();
+  return reader.read();
+}).then(function(r){
+  say('read 2 value', r.value); say('read 2 done', r.done);
+  return reader.read();
+}).then(function(r){
+  say('read after close value', String(r.value)); say('read after close done', r.done);
+  return reader.closed;
+}).then(function(){
+  say('closed promise', 'resolved');
+
+  /* pull is called only while there is room, and stops when full */
+  var pulls = 0;
+  var s2 = new ReadableStream({
+    pull: function(c){ pulls++; c.enqueue(pulls); }
+  }, { highWaterMark: 2 });
+  return Promise.resolve().then(function(){}).then(function(){}).then(function(){
+    say('pulls stopped at highWaterMark', pulls <= 3);
+    return s2.getReader().read();
+  });
+}).then(function(r){
+  say('backpressured stream still reads', r.value);
+
+  /* tee gives two independent branches over the same data */
+  var s3 = new ReadableStream({ start: function(c){
+    c.enqueue('x'); c.enqueue('y'); c.close(); } });
+  var pair = s3.tee();
+  say('tee returns two', pair.length);
+  say('tee locks the source', s3.locked);
+  var a = pair[0].getReader(), b = pair[1].getReader();
+  return Promise.all([a.read(), b.read()]).then(function(rr){
+    say('tee branch 1 first', rr[0].value);
+    say('tee branch 2 first', rr[1].value);
+  });
+}).then(function(){
+  /* a transform, piped */
+  var upper = new TransformStream({
+    transform: function(chunk, c){ c.enqueue(String(chunk).toUpperCase()); }
+  });
+  var src = new ReadableStream({ start: function(c){
+    c.enqueue('one'); c.enqueue('two'); c.close(); } });
+  var got = [];
+  var sink = new WritableStream({ write: function(chunk){ got.push(chunk); } });
+  return src.pipeThrough(upper).pipeTo(sink).then(function(){
+    say('piped through transform', got.join(','));
+  });
+}).then(function(){
+  /* write ordering and desiredSize on the writable side */
+  var wrote = [];
+  var ws = new WritableStream({
+    write: function(c){ return new Promise(function(res){
+      wrote.push(c); res(); }); }
+  }, { highWaterMark: 1 });
+  var w = ws.getWriter();
+  say('writer desiredSize', w.desiredSize);
+  return Promise.all([w.write('1'), w.write('2'), w.write('3')]).then(function(){
+    say('writes arrived in order', wrote.join(','));
+    return w.close();
+  }).then(function(){ return w.closed; }).then(function(){
+    say('writable closed', 'yes');
+  });
+}).then(function(){
+  /* errors reach the reader */
+  var s = new ReadableStream({ start: function(c){ c.error(new TypeError('bad')); } });
+  return s.getReader().read().then(function(){ say('errored read', 'resolved'); },
+                                   function(e){ say('errored read', e.name); });
+}).then(function(){
+  /* cancel runs the source's cancel with the reason */
+  var seen = null;
+  var s = new ReadableStream({ cancel: function(r){ seen = r; } });
+  return s.cancel('because').then(function(){
+    say('cancel reason reached the source', seen);
+  });
+}).then(function(){
+  /* decoding a byte stream to text */
+  var bytes = new TextEncoder().encode('hello streams');
+  var s = new ReadableStream({ start: function(c){
+    c.enqueue(bytes.subarray(0, 5)); c.enqueue(bytes.subarray(5)); c.close(); } });
+  var r = s.pipeThrough(new TextDecoderStream()).getReader();
+  var text = '';
+  function loop(){
+    return r.read().then(function(res){
+      if (res.done) return text;
+      text += res.value; return loop();
+    });
+  }
+  return loop().then(function(t){ say('decoded through the stream', t); });
+}).then(function(){
+  /* async iteration */
+  var s = new ReadableStream({ start: function(c){
+    c.enqueue(1); c.enqueue(2); c.enqueue(3); c.close(); } });
+  var sum = 0;
+  var it = s[Symbol.asyncIterator]();
+  function step(){
+    return it.next().then(function(r){
+      if (r.done) return sum;
+      sum += r.value; return step();
+    });
+  }
+  return step().then(function(n){ say('async iteration total', n); });
+}).then(function(){
+  /* the strategies */
+  var cq = new CountQueuingStrategy({ highWaterMark: 4 });
+  say('count strategy hwm', cq.highWaterMark);
+  say('count strategy size', cq.size('anything'));
+  var bq = new ByteLengthQueuingStrategy({ highWaterMark: 8 });
+  say('bytelength strategy size', bq.size(new Uint8Array(7)));
+
+  /* a byte stream read through a default reader, the common shape */
+  var s = new ReadableStream({ type: 'bytes', start: function(c){
+    c.enqueue(new Uint8Array([1,2,3])); c.close(); } });
+  return s.getReader().read().then(function(r){
+    say('byte stream chunk length', r.value.byteLength);
+    say('byte stream chunk first', r.value[0]);
+  });
+}).then(function(){
+  /* fetch's response body, the reason any of this matters */
+  var r = new Response('body text');
+  var rd = r.body.getReader();
+  var acc = [];
+  function loop(){
+    return rd.read().then(function(res){
+      if (res.done) return acc;
+      acc.push(res.value); return loop();
+    });
+  }
+  return loop().then(function(chunks){
+    var total = 0;
+    chunks.forEach(function(c){ total += c.byteLength; });
+    say('response.body is a stream', r.body instanceof ReadableStream);
+    say('response.body byte total', total);
+    var joined = new Uint8Array(total), at = 0;
+    chunks.forEach(function(c){ joined.set(c, at); at += c.byteLength; });
+    say('response.body decodes to', new TextDecoder().decode(joined));
+  });
+}).then(function(){
+  /* textStream: the same bytes, decoded, as a stream of strings. It is
+     in the current WebIDL but Chromium has not shipped it, so the
+     comparison records only whether it is there; the behaviour below
+     runs wherever it is. */
+  var r = new Response('through textStream');
+  say('has textStream', typeof r.textStream);
+  if (typeof r.textStream !== 'function') return undefined;
+  var rd = r.textStream().getReader();
+  var text = '';
+  function loop(){
+    return rd.read().then(function(res){
+      if (res.done) return text;
+      text += res.value; return loop();
+    });
+  }
+  return loop().then(function(t){
+    say('textStream decoded to', t);
+  });
+}).then(function(){
+  /* a Blob is a stream too */
+  var b = new Blob(['blob bytes']);
+  say('blob.stream is a ReadableStream', b.stream() instanceof ReadableStream);
+  return b.stream().getReader().read().then(function(r){
+    say('blob stream chunk length', r.done ? 0 : r.value.byteLength);
+  });
+}).then(function(){
+  /* a Request made with a body has one too */
+  var q = new Request('http://example.invalid/', { method: 'POST', body: 'hi' });
+  say('request.body is a stream', q.body instanceof ReadableStream);
+  var g = new Request('http://example.invalid/');
+  say('request without a body', String(g.body));
+}).then(done, function(e){ say('THREW', e && e.stack ? e.stack : e); done(); });
+</script>
+</body></html>

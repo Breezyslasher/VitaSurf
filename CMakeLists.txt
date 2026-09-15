@@ -109,12 +109,27 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     endif()
     # Hand-written QuickJS bindings implementing NetSurf's js.h, plus the
     # JavaScript half of them embedded as a NUL-terminated byte array.
-    set(PRELUDE_JS "${CMAKE_SOURCE_DIR}/vita/js/prelude.js")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PRELUDE_JS}")
-    file(READ "${PRELUDE_JS}" PRELUDE_HEX HEX)
-    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," PRELUDE_BYTES "${PRELUDE_HEX}")
+    # The prelude is several files concatenated in this order. It grew past
+    # 300 KB as one, which is more than anyone can hold in their head; a
+    # self-contained area of the platform belongs in its own file. Order
+    # matters only where one file runs code at load time that another
+    # defines, so keep prelude.js first.
+    set(PRELUDE_PARTS
+        vita/js/prelude.js
+        vita/js/streams.js
+        vita/js/performance.js)
+    set(PRELUDE_BYTES "")
+    foreach(part ${PRELUDE_PARTS})
+        set(full "${CMAKE_SOURCE_DIR}/${part}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${full}")
+        file(READ "${full}" part_hex HEX)
+        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," part_bytes "${part_hex}")
+        # a newline between parts, so a file that ends in a comment cannot
+        # swallow the first line of the next one
+        set(PRELUDE_BYTES "${PRELUDE_BYTES}${part_bytes}0x0a,")
+    endforeach()
     file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
-        "/* generated from vita/js/prelude.js */\n"
+        "/* generated from ${PRELUDE_PARTS} */\n"
         "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n")
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c)
     target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}/generated")

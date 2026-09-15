@@ -65,3 +65,7 @@ A DOCTYPE inside assigned markup
 platform.html | everything settles | Font loading, storage, battery and an IndexedDB open are promises and callbacks a browser answers from a backing store. Headless Chromium on a file URL has none, so which of them answer there varies from run to run. The fact asserts only that none is left hanging here, which is what a page depends on: one that awaits document.fonts.ready or opens a database and waits stops where it stands if the answer never comes.
 
 uadefaults.html | untilfound | hidden="until-found" is meant to keep the element's box and hide only its content, through content-visibility, which NetSurf does not implement. The box is removed instead. Hiding it outright is closer to what the page intends than showing content it asked to keep out of the way until a find-in-page reveals it.
+
+streams.html | has textStream | textStream is in the current WebIDL for Blob, Request and Response and Chromium has not shipped it yet, so here the comparison runs the other way round: ours has it. It is stream() piped through a TextDecoderStream, which is what a caller writes by hand today.
+
+streams.html | textStream decoded to | Only runs where textStream exists. See above.

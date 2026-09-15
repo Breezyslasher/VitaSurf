@@ -3807,9 +3807,10 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   Object.keys(bodies).forEach(function(k){var f=bodies[k];
    if(!C.prototype[k])C.prototype[k]=function(){
     var self=this;return this.text().then(function(t){self._b=t;return f.call(self);});};});
-  if(!('body' in C.prototype))Object.defineProperty(C.prototype,'body',{configurable:true,
-   get:function(){return null;}});
-  if(!C.prototype.textStream)C.prototype.textStream=function(){return null;};});
+  /* body and textStream used to be defined here as getters returning
+     null, which is worse than leaving them out: a page that tests for
+     response.body stops taking its fallback and then calls getReader()
+     on null. streams.js gives Response a real ReadableStream. */});
  if(W.Request){var rp=W.Request.prototype;
   ['destination','referrer','referrerPolicy','integrity','duplex'].forEach(function(k){
    if(!(k in rp))rp[k]='';});
@@ -3943,7 +3944,7 @@ Blob.prototype.slice=function(a,b,type){
  a=a===undefined?0:(a<0?Math.max(n+a,0):Math.min(a,n));
  b=b===undefined?n:(b<0?Math.max(n+b,0):Math.min(b,n));
  return new Blob([u.subarray(a,Math.max(a,b))],{type:type||''});};
-Blob.prototype.stream=function(){return null;};
+/* Blob.prototype.stream is a real ReadableStream; see streams.js. */
 W.Blob=Blob;
 function File(parts,name,opts){Blob.call(this,parts,opts);
  this.name=String(name);this.lastModified=(opts&&opts.lastModified)||Date.now();
@@ -4230,7 +4231,7 @@ if(W.OffscreenCanvas){W.OffscreenCanvas.prototype.oncontextlost=null;
 CanvasRenderingContext2D.prototype.lang='inherit';
 CanvasRenderingContext2D.prototype.isContextLost=function(){return false;};
 ImageData.prototype.pixelFormat='rgba-unorm8';
-Blob.prototype.textStream=function(){return null;};
+/* Blob.prototype.textStream is a real ReadableStream; see streams.js. */
 /* The rest of the console. Only log, warn, error, info and debug came
  * from the bindings, and a page that calls one of the others got
  * "not a function" -- claude.ai opens its entry chunk with
