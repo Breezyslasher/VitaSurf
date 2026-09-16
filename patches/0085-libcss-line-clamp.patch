@@ -1,0 +1,1551 @@
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index 1edb46a..767cf2f 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -392,6 +392,9 @@ uint8_t css_computed_clip_path(const css_computed_style *style,
+ 		css_fixed *bottom, css_unit *bunit,
+ 		css_fixed *left, css_unit *lunit);
+ 
++uint8_t css_computed_line_clamp(const css_computed_style *style,
++		int32_t *count);
++
+ uint8_t css_computed_transform(
+ 		const css_computed_style *style,
+ 		css_fixed *hlength, css_unit *hunit,
+diff --git a/include/libcss/properties.h b/include/libcss/properties.h
+index 8a05ae1..c0ae714 100644
+--- a/include/libcss/properties.h
++++ b/include/libcss/properties.h
+@@ -179,6 +179,7 @@ enum css_properties_e {
+ 	/* The shadow a box casts (VitaSurf) */
+ 	CSS_PROP_BOX_SHADOW			= 0x09b,
+ 	CSS_PROP_CLIP_PATH			= 0x09c,
++	CSS_PROP_LINE_CLAMP			= 0x09d,
+ 
+ 	CSS_N_PROPERTIES
+ };
+@@ -384,6 +385,16 @@ enum css_clip_path_e {
+ 	CSS_CLIP_PATH_SHAPE			= 0x3
+ };
+ 
++/**
++ * line-clamp and -webkit-line-clamp (VitaSurf): how many lines of a
++ * block's text are shown, the rest hidden by its overflow.
++ */
++enum css_line_clamp_e {
++	CSS_LINE_CLAMP_INHERIT			= 0x0,
++	CSS_LINE_CLAMP_NONE			= 0x1,
++	CSS_LINE_CLAMP_SET			= 0x2
++};
++
+ enum css_transform_e {
+ 	CSS_TRANSFORM_INHERIT			= 0x0,
+ 	CSS_TRANSFORM_NONE			= 0x1,
+diff --git a/src/bytecode/opcodes.h b/src/bytecode/opcodes.h
+index a508dad..db274af 100644
+--- a/src/bytecode/opcodes.h
++++ b/src/bytecode/opcodes.h
+@@ -1084,6 +1084,11 @@ enum op_clip_path {
+ 	CLIP_PATH_SHAPE			= 0x0002
+ };
+ 
++enum op_line_clamp {
++	LINE_CLAMP_NONE			= 0x0000,
++	LINE_CLAMP_SET			= 0x0001
++};
++
+ enum op_transform {
+ 	TRANSFORM_NONE			= 0x0000,
+ 	TRANSFORM_SET			= 0x0001
+diff --git a/src/parse/important.c b/src/parse/important.c
+index 645f66d..8972aba 100644
+--- a/src/parse/important.c
++++ b/src/parse/important.c
+@@ -162,6 +162,11 @@ void css__make_style_important(css_style *style)
+ 					offset += 8; /* 4 length+unit */
+ 				break;
+ 
++			case CSS_PROP_LINE_CLAMP:
++				if (value == LINE_CLAMP_SET)
++					offset++; /* value */
++				break;
++
+ 			case CSS_PROP_BORDER_SPACING:
+ 				if (value == BORDER_SPACING_SET)
+ 					offset += 4; /* two length + units */
+diff --git a/src/parse/properties/properties.c b/src/parse/properties/properties.c
+index fb30863..1b94e36 100644
+--- a/src/parse/properties/properties.c
++++ b/src/parse/properties/properties.c
+@@ -269,7 +269,7 @@ const css_prop_handler property_handlers[LAST_PROP + 1 - FIRST_PROP] =
+ 	/* The rectangle a box is cut to (VitaSurf) */
+ 	css__parse_clip_path,
+ 	/* Accepted and ignored (VitaSurf), one entry per name in
+-	 * propstrings.h */
++	 * propstrings.h; then -webkit-line-clamp and line-clamp */
+ 	css__parse_ignored,
+ 	css__parse_ignored,
+ 	css__parse_ignored,
+@@ -311,7 +311,9 @@ const css_prop_handler property_handlers[LAST_PROP + 1 - FIRST_PROP] =
+ 	css__parse_ignored,
+ 	css__parse_ignored,
+ 	css__parse_ignored,
+-	css__parse_ignored
++	css__parse_ignored,
++	css__parse_line_clamp,
++	css__parse_line_clamp
+ };
+ 
+ /** Mapping from property bytecode index to bytecode unit class mask. */
+@@ -440,6 +442,7 @@ const uint32_t property_unit_mask[CSS_N_PROPERTIES] = {
+ 	[CSS_PROP_BACKGROUND_CLIP]       = UNIT_MASK_BACKGROUND_CLIP,
+ 	[CSS_PROP_BOX_SHADOW]            = UNIT_MASK_BOX_SHADOW,
+ 	[CSS_PROP_CLIP_PATH]             = UNIT_MASK_CLIP_PATH,
++	[CSS_PROP_LINE_CLAMP]            = UNIT_MASK_LINE_CLAMP,
+ 	[CSS_PROP_BACKGROUND_SIZE]       = UNIT_MASK_BACKGROUND_SIZE,
+ 	[CSS_PROP_BREAK_AFTER]           = UNIT_MASK_BREAK_AFTER,
+ 	[CSS_PROP_BREAK_BEFORE]          = UNIT_MASK_BREAK_BEFORE,
+diff --git a/src/parse/properties/properties.gen b/src/parse/properties/properties.gen
+index fd8cea5..0aae060 100644
+--- a/src/parse/properties/properties.gen
++++ b/src/parse/properties/properties.gen
+@@ -23,7 +23,7 @@ cue_before:CSS_PROP_CUE_BEFORE IDENT:( INHERIT: INITIAL: REVERT: UNSET: NONE:0,C
+ 
+ direction:CSS_PROP_DIRECTION IDENT:( INHERIT: INITIAL: REVERT: UNSET: LTR:0,DIRECTION_LTR RTL:0,DIRECTION_RTL IDENT:)
+ 
+-display:CSS_PROP_DISPLAY IDENT:( INHERIT: INITIAL: REVERT: UNSET: INLINE:0,DISPLAY_INLINE BLOCK:0,DISPLAY_BLOCK LIST_ITEM:0,DISPLAY_LIST_ITEM RUN_IN:0,DISPLAY_RUN_IN INLINE_BLOCK:0,DISPLAY_INLINE_BLOCK TABLE:0,DISPLAY_TABLE INLINE_TABLE:0,DISPLAY_INLINE_TABLE TABLE_ROW_GROUP:0,DISPLAY_TABLE_ROW_GROUP TABLE_HEADER_GROUP:0,DISPLAY_TABLE_HEADER_GROUP TABLE_FOOTER_GROUP:0,DISPLAY_TABLE_FOOTER_GROUP TABLE_ROW:0,DISPLAY_TABLE_ROW TABLE_COLUMN_GROUP:0,DISPLAY_TABLE_COLUMN_GROUP TABLE_COLUMN:0,DISPLAY_TABLE_COLUMN TABLE_CELL:0,DISPLAY_TABLE_CELL TABLE_CAPTION:0,DISPLAY_TABLE_CAPTION NONE:0,DISPLAY_NONE FLEX:0,DISPLAY_FLEX INLINE_FLEX:0,DISPLAY_INLINE_FLEX GRID:0,DISPLAY_GRID INLINE_GRID:0,DISPLAY_INLINE_GRID IDENT:)
++display:CSS_PROP_DISPLAY IDENT:( INHERIT: INITIAL: REVERT: UNSET: INLINE:0,DISPLAY_INLINE BLOCK:0,DISPLAY_BLOCK LIST_ITEM:0,DISPLAY_LIST_ITEM RUN_IN:0,DISPLAY_RUN_IN INLINE_BLOCK:0,DISPLAY_INLINE_BLOCK TABLE:0,DISPLAY_TABLE INLINE_TABLE:0,DISPLAY_INLINE_TABLE TABLE_ROW_GROUP:0,DISPLAY_TABLE_ROW_GROUP TABLE_HEADER_GROUP:0,DISPLAY_TABLE_HEADER_GROUP TABLE_FOOTER_GROUP:0,DISPLAY_TABLE_FOOTER_GROUP TABLE_ROW:0,DISPLAY_TABLE_ROW TABLE_COLUMN_GROUP:0,DISPLAY_TABLE_COLUMN_GROUP TABLE_COLUMN:0,DISPLAY_TABLE_COLUMN TABLE_CELL:0,DISPLAY_TABLE_CELL TABLE_CAPTION:0,DISPLAY_TABLE_CAPTION NONE:0,DISPLAY_NONE FLEX:0,DISPLAY_FLEX INLINE_FLEX:0,DISPLAY_INLINE_FLEX GRID:0,DISPLAY_GRID INLINE_GRID:0,DISPLAY_INLINE_GRID WEBKIT_BOX:0,DISPLAY_BLOCK WEBKIT_INLINE_BOX:0,DISPLAY_INLINE_BLOCK IDENT:)
+ 
+ empty_cells:CSS_PROP_EMPTY_CELLS IDENT:( INHERIT: INITIAL: REVERT: UNSET: SHOW:0,EMPTY_CELLS_SHOW HIDE:0,EMPTY_CELLS_HIDE IDENT:)
+ 
+@@ -249,3 +249,4 @@ flex_wrap:CSS_PROP_FLEX_WRAP IDENT:( INHERIT: INITIAL: REVERT: UNSET: NOWRAP:0,F
+ justify_content:CSS_PROP_JUSTIFY_CONTENT IDENT:( INHERIT: INITIAL: REVERT: UNSET: FLEX_START:0,JUSTIFY_CONTENT_FLEX_START FLEX_END:0,JUSTIFY_CONTENT_FLEX_END CENTER:0,JUSTIFY_CONTENT_CENTER SPACE_BETWEEN:0,JUSTIFY_CONTENT_SPACE_BETWEEN SPACE_AROUND:0,JUSTIFY_CONTENT_SPACE_AROUND SPACE_EVENLY:0,JUSTIFY_CONTENT_SPACE_EVENLY IDENT:)
+ 
+ order:CSS_PROP_ORDER IDENT:( INHERIT: INITIAL: REVERT: UNSET: IDENT:) NUMBER:( true:ORDER_SET NUMBER:) CALC:( NUMBER:ORDER_CALC CALC:)
++line_clamp:CSS_PROP_LINE_CLAMP IDENT:( INHERIT: INITIAL: REVERT: UNSET: NONE:0,LINE_CLAMP_NONE IDENT:) NUMBER:( true:LINE_CLAMP_SET RANGE:num<0 NUMBER:)
+diff --git a/src/parse/properties/properties.h b/src/parse/properties/properties.h
+index 0a88a29..481858c 100644
+--- a/src/parse/properties/properties.h
++++ b/src/parse/properties/properties.h
+@@ -131,6 +131,9 @@ css_error css__parse_clip_path(css_language *c,
+ css_error css__parse_ignored(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
++css_error css__parse_line_clamp(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
+ /**
+  * Read a gradient function into the "gradient:" string the renderer
+  * paints (VitaSurf). \a *ctx is unchanged and CSS_INVALID returned
+@@ -924,5 +927,6 @@ extern const uint32_t property_unit_mask[CSS_N_PROPERTIES];
+ #define UNIT_MASK_JUSTIFY_CONTENT       (0)
+ #define UNIT_MASK_ORDER                 (0)
+ #define UNIT_MASK_CLIP_PATH             (UNIT_LENGTH | UNIT_PCT)
++#define UNIT_MASK_LINE_CLAMP            (0)
+ 
+ #endif
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index a9ed09a..1649c1b 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -390,6 +390,8 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("scroll-padding"),
+ 	SMAP("scroll-snap-type"),
+ 	SMAP("scroll-snap-align"),
++	SMAP("-webkit-line-clamp"),
++	SMAP("line-clamp"),
+ 
+ 	SMAP("inherit"),
+ 	SMAP("unset"),
+@@ -896,7 +898,9 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("host-context"),
+ 	SMAP("slotted"),
+ 	SMAP("has"),
+-	SMAP("round")
++	SMAP("round"),
++	SMAP("-webkit-box"),
++	SMAP("-webkit-inline-box")
+ };
+ 
+ 
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index 4609b24..19ea6f6 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -162,7 +162,13 @@ enum {
+ 	TEXT_RENDERING, CONTAIN_PROP, SCROLL_MARGIN,
+ 	SCROLL_PADDING, SCROLL_SNAP_TYPE, SCROLL_SNAP_ALIGN,
+ 
+-	LAST_PROP = SCROLL_SNAP_ALIGN,
++
++	/* How many lines of a block are shown (VitaSurf): the -webkit-
++	 * spelling is the one every site writes, the plain one its
++	 * standard name */
++	WEBKIT_LINE_CLAMP, LINE_CLAMP,
++
++	LAST_PROP = LINE_CLAMP,
+ 
+ 	/* Other keywords */
+ 	INHERIT, UNSET, IMPORTANT, NONE, BOTH, FIXED, SCROLL, TRANSPARENT,
+@@ -281,6 +287,10 @@ enum {
+ 	/* The corner radii of an inset() clip (VitaSurf) */
+ 	ROUND,
+ 
++	/* The old flexbox display values line-clamp is written with
++	 * (VitaSurf) */
++	WEBKIT_BOX, WEBKIT_INLINE_BOX,
++
+ 	LAST_KNOWN
+ };
+ 
+diff --git a/src/select/autogenerated_computed.h b/src/select/autogenerated_computed.h
+index f96ea8d..cc5234e 100644
+--- a/src/select/autogenerated_computed.h
++++ b/src/select/autogenerated_computed.h
+@@ -95,6 +95,7 @@ struct css_computed_style_i {
+  * justify_content                  3             
+  * left                             2 + 5           4
+  * letter_spacing                   2 + 5           4
++ * line_clamp                       2               4
+  * line_height                      2 + 5           4
+  * list_style_image                 1             sizeof(ptr)
+  * list_style_position              2             
+@@ -199,9 +200,9 @@ struct css_computed_style_i {
+  * quotes                           1             sizeof(ptr)
+  * 
+  * ---                            ---             ---
+- *                                631 bits        360 + 14sizeof(ptr) bytes
++ *                                633 bits        364 + 14sizeof(ptr) bytes
+  *                                ===================
+- *                                439 + 14sizeof(ptr) bytes
++ *                                444 + 14sizeof(ptr) bytes
+  * 
+  * Bit allocations:
+  * 
+@@ -248,16 +249,16 @@ struct css_computed_style_i {
+  * animation_fill_mode; align_self; align_items; align_content; visibility;
+  * unicode_bidi; text_overflow; table_layout
+  * 
+- * 13 ssppaaoouullggrriiddccmmttnnffyy
++ * 13 ssppaaoouulliiggrrddwwccmmttnnff
+  * stroke; pointer_events; page_break_inside; overflow_wrap; outline_color;
+- * list_style_position; grid_template_rows; grid_template_columns;
++ * list_style_position; line_clamp; grid_template_rows; grid_template_columns;
+  * grid_row_start; grid_row_end; grid_column_start; grid_column_end;
+- * grid_auto_rows; grid_auto_columns; font_variant; font_style
++ * grid_auto_rows; grid_auto_columns; font_variant
+  * 
+- * 14 fflliieeddccoouummnnaabbrrggttpp
+- * float; flex_wrap; fill; empty_cells; direction; content; column_span;
+- * column_rule_color; column_fill; column_count; caption_side; box_sizing;
+- * border_top_color; border_right_color; border_left_color; border_collapse
++ * 14 fflleeiimmddccoouunnttaabbrrggBB
++ * font_style; float; flex_wrap; fill; empty_cells; direction; content;
++ * column_span; column_rule_color; column_fill; column_count; caption_side;
++ * box_sizing; border_top_color; border_right_color; border_left_color
+  * 
+  * 15 ccccccccccccccccccccccvvvvvvvvvw
+  * clip_path; vertical_align; widows
+@@ -273,11 +274,12 @@ struct css_computed_style_i {
+  * overflow_y; overflow_x; object_fit; justify_content; grid_auto_flow;
+  * font_family; orphans
+  * 
+- * 19 bbaaccssnniiopmlfeturCk.........
+- * border_bottom_color; background_color; background_attachment; aspect_ratio;
+- * animation_name; animation_iteration_count; order; opacity; mask_image;
+- * list_style_image; flex_shrink; flex_grow; fill_opacity; counter_reset;
+- * counter_increment; color; background_image
++ * 19 bbooaaccssnniirpmlfetuCOk.......
++ * border_collapse; border_bottom_color; background_color;
++ * background_attachment; aspect_ratio; animation_name;
++ * animation_iteration_count; order; opacity; mask_image; list_style_image;
++ * flex_shrink; flex_grow; fill_opacity; counter_reset; counter_increment;
++ * color; background_image
+  */
+ 	uint32_t bits[20];
+ 
+@@ -342,6 +344,7 @@ struct css_computed_style_i {
+ 	css_fixed_or_calc height;
+ 	css_fixed_or_calc left;
+ 	css_fixed_or_calc letter_spacing;
++	int32_t line_clamp;
+ 	css_fixed_or_calc line_height;
+ 	lwc_string *list_style_image;
+ 	css_fixed_or_calc margin_bottom;
+diff --git a/src/select/autogenerated_destroy.inc b/src/select/autogenerated_destroy.inc
+index 3b1c4f5..aaf1ba0 100644
+--- a/src/select/autogenerated_destroy.inc
++++ b/src/select/autogenerated_destroy.inc
+@@ -90,6 +90,7 @@ set_height(style, 0, (css_fixed_or_calc)0, CSS_UNIT_PX);
+ /* set_justify_content(style, 0, 0, CSS_UNIT_PX); */
+ set_left(style, 0, (css_fixed_or_calc)0, CSS_UNIT_PX);
+ set_letter_spacing(style, 0, (css_fixed_or_calc)0, CSS_UNIT_PX);
++/* set_line_clamp(style, 0, 0, CSS_UNIT_PX); */
+ set_line_height(style, 0, (css_fixed_or_calc)0, CSS_UNIT_PX);
+ /* set_list_style_image(style, 0, 0, CSS_UNIT_PX); */
+ /* set_list_style_position(style, 0, 0, CSS_UNIT_PX); */
+diff --git a/src/select/autogenerated_propget.h b/src/select/autogenerated_propget.h
+index 18d4e81..a3ca112 100644
+--- a/src/select/autogenerated_propget.h
++++ b/src/select/autogenerated_propget.h
+@@ -86,8 +86,8 @@ static inline uint8_t get_animation_fill_mode(const css_computed_style *style)
+ #undef ANIMATION_FILL_MODE_MASK
+ 
+ #define ANIMATION_ITERATION_COUNT_INDEX 19
+-#define ANIMATION_ITERATION_COUNT_SHIFT 20
+-#define ANIMATION_ITERATION_COUNT_MASK 0x300000
++#define ANIMATION_ITERATION_COUNT_SHIFT 18
++#define ANIMATION_ITERATION_COUNT_MASK 0xc0000
+ static inline uint8_t get_animation_iteration_count(const css_computed_style
+ 		*style, css_fixed *fixed)
+ {
+@@ -109,8 +109,8 @@ static inline uint8_t get_animation_iteration_count(const css_computed_style
+ #undef ANIMATION_ITERATION_COUNT_MASK
+ 
+ #define ANIMATION_NAME_INDEX 19
+-#define ANIMATION_NAME_SHIFT 22
+-#define ANIMATION_NAME_MASK 0xc00000
++#define ANIMATION_NAME_SHIFT 20
++#define ANIMATION_NAME_MASK 0x300000
+ static inline uint8_t get_animation_name(const css_computed_style *style,
+ 		lwc_string **string)
+ {
+@@ -130,8 +130,8 @@ static inline uint8_t get_animation_name(const css_computed_style *style,
+ #undef ANIMATION_NAME_MASK
+ 
+ #define ASPECT_RATIO_INDEX 19
+-#define ASPECT_RATIO_SHIFT 24
+-#define ASPECT_RATIO_MASK 0x3000000
++#define ASPECT_RATIO_SHIFT 22
++#define ASPECT_RATIO_MASK 0xc00000
+ static inline uint8_t get_aspect_ratio(const css_computed_style *style,
+ 		css_fixed *fixed_a, css_fixed *fixed_b)
+ {
+@@ -154,8 +154,8 @@ static inline uint8_t get_aspect_ratio(const css_computed_style *style,
+ #undef ASPECT_RATIO_MASK
+ 
+ #define BACKGROUND_ATTACHMENT_INDEX 19
+-#define BACKGROUND_ATTACHMENT_SHIFT 26
+-#define BACKGROUND_ATTACHMENT_MASK 0xc000000
++#define BACKGROUND_ATTACHMENT_SHIFT 24
++#define BACKGROUND_ATTACHMENT_MASK 0x3000000
+ static inline uint8_t get_background_attachment(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -192,8 +192,8 @@ static inline uint8_t get_background_clip(const css_computed_style *style)
+ #undef BACKGROUND_CLIP_MASK
+ 
+ #define BACKGROUND_COLOR_INDEX 19
+-#define BACKGROUND_COLOR_SHIFT 28
+-#define BACKGROUND_COLOR_MASK 0x30000000
++#define BACKGROUND_COLOR_SHIFT 26
++#define BACKGROUND_COLOR_MASK 0xc000000
+ static inline uint8_t get_background_color(const css_computed_style *style,
+ 		css_color *color)
+ {
+@@ -213,8 +213,8 @@ static inline uint8_t get_background_color(const css_computed_style *style,
+ #undef BACKGROUND_COLOR_MASK
+ 
+ #define BACKGROUND_IMAGE_INDEX 19
+-#define BACKGROUND_IMAGE_SHIFT 9
+-#define BACKGROUND_IMAGE_MASK 0x200
++#define BACKGROUND_IMAGE_SHIFT 7
++#define BACKGROUND_IMAGE_MASK 0x80
+ static inline uint8_t get_background_image(const css_computed_style *style,
+ 		lwc_string **string)
+ {
+@@ -307,8 +307,8 @@ static inline uint8_t get_background_size(const css_computed_style *style,
+ #undef BACKGROUND_SIZE_MASK
+ 
+ #define BORDER_BOTTOM_COLOR_INDEX 19
+-#define BORDER_BOTTOM_COLOR_SHIFT 30
+-#define BORDER_BOTTOM_COLOR_MASK 0xc0000000
++#define BORDER_BOTTOM_COLOR_SHIFT 28
++#define BORDER_BOTTOM_COLOR_MASK 0x30000000
+ static inline uint8_t get_border_bottom_color(const css_computed_style *style,
+ 		css_color *color)
+ {
+@@ -424,9 +424,9 @@ static inline uint8_t get_border_bottom_width(const css_computed_style *style,
+ #undef BORDER_BOTTOM_WIDTH_SHIFT
+ #undef BORDER_BOTTOM_WIDTH_MASK
+ 
+-#define BORDER_COLLAPSE_INDEX 14
+-#define BORDER_COLLAPSE_SHIFT 0
+-#define BORDER_COLLAPSE_MASK 0x3
++#define BORDER_COLLAPSE_INDEX 19
++#define BORDER_COLLAPSE_SHIFT 30
++#define BORDER_COLLAPSE_MASK 0xc0000000
+ static inline uint8_t get_border_collapse(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -444,8 +444,8 @@ static inline uint8_t get_border_collapse(const css_computed_style *style)
+ #undef BORDER_COLLAPSE_MASK
+ 
+ #define BORDER_LEFT_COLOR_INDEX 14
+-#define BORDER_LEFT_COLOR_SHIFT 2
+-#define BORDER_LEFT_COLOR_MASK 0xc
++#define BORDER_LEFT_COLOR_SHIFT 0
++#define BORDER_LEFT_COLOR_MASK 0x3
+ static inline uint8_t get_border_left_color(const css_computed_style *style,
+ 		css_color *color)
+ {
+@@ -508,8 +508,8 @@ static inline uint8_t get_border_left_width(const css_computed_style *style,
+ #undef BORDER_LEFT_WIDTH_MASK
+ 
+ #define BORDER_RIGHT_COLOR_INDEX 14
+-#define BORDER_RIGHT_COLOR_SHIFT 4
+-#define BORDER_RIGHT_COLOR_MASK 0x30
++#define BORDER_RIGHT_COLOR_SHIFT 2
++#define BORDER_RIGHT_COLOR_MASK 0xc
+ static inline uint8_t get_border_right_color(const css_computed_style *style,
+ 		css_color *color)
+ {
+@@ -599,8 +599,8 @@ static inline uint8_t get_border_spacing(const css_computed_style *style,
+ #undef BORDER_SPACING_MASK
+ 
+ #define BORDER_TOP_COLOR_INDEX 14
+-#define BORDER_TOP_COLOR_SHIFT 6
+-#define BORDER_TOP_COLOR_MASK 0xc0
++#define BORDER_TOP_COLOR_SHIFT 4
++#define BORDER_TOP_COLOR_MASK 0x30
+ static inline uint8_t get_border_top_color(const css_computed_style *style,
+ 		css_color *color)
+ {
+@@ -773,8 +773,8 @@ static inline uint8_t get_box_shadow(const css_computed_style *style, css_fixed
+ #undef BOX_SHADOW_MASK
+ 
+ #define BOX_SIZING_INDEX 14
+-#define BOX_SIZING_SHIFT 8
+-#define BOX_SIZING_MASK 0x300
++#define BOX_SIZING_SHIFT 6
++#define BOX_SIZING_MASK 0xc0
+ static inline uint8_t get_box_sizing(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -849,8 +849,8 @@ static inline uint8_t get_break_inside(const css_computed_style *style)
+ #undef BREAK_INSIDE_MASK
+ 
+ #define CAPTION_SIDE_INDEX 14
+-#define CAPTION_SIDE_SHIFT 10
+-#define CAPTION_SIDE_MASK 0xc00
++#define CAPTION_SIDE_SHIFT 8
++#define CAPTION_SIDE_MASK 0x300
+ static inline uint8_t get_caption_side(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -962,8 +962,8 @@ static inline uint8_t get_clip_path(const css_computed_style *style, css_fixed
+ #undef CLIP_PATH_MASK
+ 
+ #define COLOR_INDEX 19
+-#define COLOR_SHIFT 10
+-#define COLOR_MASK 0x400
++#define COLOR_SHIFT 8
++#define COLOR_MASK 0x100
+ static inline uint8_t get_color(const css_computed_style *style, css_color
+ 		*color)
+ {
+@@ -983,8 +983,8 @@ static inline uint8_t get_color(const css_computed_style *style, css_color
+ #undef COLOR_MASK
+ 
+ #define COLUMN_COUNT_INDEX 14
+-#define COLUMN_COUNT_SHIFT 12
+-#define COLUMN_COUNT_MASK 0x3000
++#define COLUMN_COUNT_SHIFT 10
++#define COLUMN_COUNT_MASK 0xc00
+ static inline uint8_t get_column_count(const css_computed_style *style, int32_t
+ 		*integer)
+ {
+@@ -1004,8 +1004,8 @@ static inline uint8_t get_column_count(const css_computed_style *style, int32_t
+ #undef COLUMN_COUNT_MASK
+ 
+ #define COLUMN_FILL_INDEX 14
+-#define COLUMN_FILL_SHIFT 14
+-#define COLUMN_FILL_MASK 0xc000
++#define COLUMN_FILL_SHIFT 12
++#define COLUMN_FILL_MASK 0x3000
+ static inline uint8_t get_column_fill(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -1047,8 +1047,8 @@ static inline uint8_t get_column_gap(const css_computed_style *style,
+ #undef COLUMN_GAP_MASK
+ 
+ #define COLUMN_RULE_COLOR_INDEX 14
+-#define COLUMN_RULE_COLOR_SHIFT 16
+-#define COLUMN_RULE_COLOR_MASK 0x30000
++#define COLUMN_RULE_COLOR_SHIFT 14
++#define COLUMN_RULE_COLOR_MASK 0xc000
+ static inline uint8_t get_column_rule_color(const css_computed_style *style,
+ 		css_color *color)
+ {
+@@ -1111,8 +1111,8 @@ static inline uint8_t get_column_rule_width(const css_computed_style *style,
+ #undef COLUMN_RULE_WIDTH_MASK
+ 
+ #define COLUMN_SPAN_INDEX 14
+-#define COLUMN_SPAN_SHIFT 18
+-#define COLUMN_SPAN_MASK 0xc0000
++#define COLUMN_SPAN_SHIFT 16
++#define COLUMN_SPAN_MASK 0x30000
+ static inline uint8_t get_column_span(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -1154,8 +1154,8 @@ static inline uint8_t get_column_width(const css_computed_style *style,
+ #undef COLUMN_WIDTH_MASK
+ 
+ #define CONTENT_INDEX 14
+-#define CONTENT_SHIFT 20
+-#define CONTENT_MASK 0x300000
++#define CONTENT_SHIFT 18
++#define CONTENT_MASK 0xc0000
+ static inline uint8_t get_content(const css_computed_style *style, const
+ 		css_computed_content_item **content_item)
+ {
+@@ -1177,8 +1177,8 @@ static inline uint8_t get_content(const css_computed_style *style, const
+ #undef CONTENT_MASK
+ 
+ #define COUNTER_INCREMENT_INDEX 19
+-#define COUNTER_INCREMENT_SHIFT 11
+-#define COUNTER_INCREMENT_MASK 0x800
++#define COUNTER_INCREMENT_SHIFT 9
++#define COUNTER_INCREMENT_MASK 0x200
+ static inline uint8_t get_counter_increment(const css_computed_style *style,
+ 		const css_computed_counter **counter_arr)
+ {
+@@ -1198,8 +1198,8 @@ static inline uint8_t get_counter_increment(const css_computed_style *style,
+ #undef COUNTER_INCREMENT_MASK
+ 
+ #define COUNTER_RESET_INDEX 19
+-#define COUNTER_RESET_SHIFT 12
+-#define COUNTER_RESET_MASK 0x1000
++#define COUNTER_RESET_SHIFT 10
++#define COUNTER_RESET_MASK 0x400
+ static inline uint8_t get_counter_reset(const css_computed_style *style, const
+ 		css_computed_counter **counter_arr)
+ {
+@@ -1240,8 +1240,8 @@ static inline uint8_t get_cursor(const css_computed_style *style, lwc_string
+ #undef CURSOR_MASK
+ 
+ #define DIRECTION_INDEX 14
+-#define DIRECTION_SHIFT 22
+-#define DIRECTION_MASK 0xc00000
++#define DIRECTION_SHIFT 20
++#define DIRECTION_MASK 0x300000
+ static inline uint8_t get_direction(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -1278,8 +1278,8 @@ static inline uint8_t get_display(const css_computed_style *style)
+ #undef DISPLAY_MASK
+ 
+ #define EMPTY_CELLS_INDEX 14
+-#define EMPTY_CELLS_SHIFT 24
+-#define EMPTY_CELLS_MASK 0x3000000
++#define EMPTY_CELLS_SHIFT 22
++#define EMPTY_CELLS_MASK 0xc00000
+ static inline uint8_t get_empty_cells(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -1297,8 +1297,8 @@ static inline uint8_t get_empty_cells(const css_computed_style *style)
+ #undef EMPTY_CELLS_MASK
+ 
+ #define FILL_INDEX 14
+-#define FILL_SHIFT 26
+-#define FILL_MASK 0xc000000
++#define FILL_SHIFT 24
++#define FILL_MASK 0x3000000
+ static inline uint8_t get_fill(const css_computed_style *style, css_color
+ 		*color)
+ {
+@@ -1318,8 +1318,8 @@ static inline uint8_t get_fill(const css_computed_style *style, css_color
+ #undef FILL_MASK
+ 
+ #define FILL_OPACITY_INDEX 19
+-#define FILL_OPACITY_SHIFT 13
+-#define FILL_OPACITY_MASK 0x2000
++#define FILL_OPACITY_SHIFT 11
++#define FILL_OPACITY_MASK 0x800
+ static inline uint8_t get_fill_opacity(const css_computed_style *style,
+ 		css_fixed *fixed)
+ {
+@@ -1384,8 +1384,8 @@ static inline uint8_t get_flex_direction(const css_computed_style *style)
+ #undef FLEX_DIRECTION_MASK
+ 
+ #define FLEX_GROW_INDEX 19
+-#define FLEX_GROW_SHIFT 14
+-#define FLEX_GROW_MASK 0x4000
++#define FLEX_GROW_SHIFT 12
++#define FLEX_GROW_MASK 0x1000
+ static inline uint8_t get_flex_grow(const css_computed_style *style, css_fixed
+ 		*fixed)
+ {
+@@ -1407,8 +1407,8 @@ static inline uint8_t get_flex_grow(const css_computed_style *style, css_fixed
+ #undef FLEX_GROW_MASK
+ 
+ #define FLEX_SHRINK_INDEX 19
+-#define FLEX_SHRINK_SHIFT 15
+-#define FLEX_SHRINK_MASK 0x8000
++#define FLEX_SHRINK_SHIFT 13
++#define FLEX_SHRINK_MASK 0x2000
+ static inline uint8_t get_flex_shrink(const css_computed_style *style,
+ 		css_fixed *fixed)
+ {
+@@ -1430,8 +1430,8 @@ static inline uint8_t get_flex_shrink(const css_computed_style *style,
+ #undef FLEX_SHRINK_MASK
+ 
+ #define FLEX_WRAP_INDEX 14
+-#define FLEX_WRAP_SHIFT 28
+-#define FLEX_WRAP_MASK 0x30000000
++#define FLEX_WRAP_SHIFT 26
++#define FLEX_WRAP_MASK 0xc000000
+ static inline uint8_t get_flex_wrap(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -1449,8 +1449,8 @@ static inline uint8_t get_flex_wrap(const css_computed_style *style)
+ #undef FLEX_WRAP_MASK
+ 
+ #define FLOAT_INDEX 14
+-#define FLOAT_SHIFT 30
+-#define FLOAT_MASK 0xc0000000
++#define FLOAT_SHIFT 28
++#define FLOAT_MASK 0x30000000
+ static inline uint8_t get_float(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -1512,9 +1512,9 @@ static inline uint8_t get_font_size(const css_computed_style *style,
+ #undef FONT_SIZE_SHIFT
+ #undef FONT_SIZE_MASK
+ 
+-#define FONT_STYLE_INDEX 13
+-#define FONT_STYLE_SHIFT 0
+-#define FONT_STYLE_MASK 0x3
++#define FONT_STYLE_INDEX 14
++#define FONT_STYLE_SHIFT 30
++#define FONT_STYLE_MASK 0xc0000000
+ static inline uint8_t get_font_style(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -1532,8 +1532,8 @@ static inline uint8_t get_font_style(const css_computed_style *style)
+ #undef FONT_STYLE_MASK
+ 
+ #define FONT_VARIANT_INDEX 13
+-#define FONT_VARIANT_SHIFT 2
+-#define FONT_VARIANT_MASK 0xc
++#define FONT_VARIANT_SHIFT 0
++#define FONT_VARIANT_MASK 0x3
+ static inline uint8_t get_font_variant(const css_computed_style *style)
+ {
+ 	uint8_t type;
+@@ -1570,8 +1570,8 @@ static inline uint8_t get_font_weight(const css_computed_style *style)
+ #undef FONT_WEIGHT_MASK
+ 
+ #define GRID_AUTO_COLUMNS_INDEX 13
+-#define GRID_AUTO_COLUMNS_SHIFT 4
+-#define GRID_AUTO_COLUMNS_MASK 0x30
++#define GRID_AUTO_COLUMNS_SHIFT 2
++#define GRID_AUTO_COLUMNS_MASK 0xc
+ static inline uint8_t get_grid_auto_columns(const css_computed_style *style,
+ 		const css_computed_grid_track **grid_track)
+ {
+@@ -1612,8 +1612,8 @@ static inline uint8_t get_grid_auto_flow(const css_computed_style *style)
+ #undef GRID_AUTO_FLOW_MASK
+ 
+ #define GRID_AUTO_ROWS_INDEX 13
+-#define GRID_AUTO_ROWS_SHIFT 6
+-#define GRID_AUTO_ROWS_MASK 0xc0
++#define GRID_AUTO_ROWS_SHIFT 4
++#define GRID_AUTO_ROWS_MASK 0x30
+ static inline uint8_t get_grid_auto_rows(const css_computed_style *style, const
+ 		css_computed_grid_track **grid_track)
+ {
+@@ -1635,8 +1635,8 @@ static inline uint8_t get_grid_auto_rows(const css_computed_style *style, const
+ #undef GRID_AUTO_ROWS_MASK
+ 
+ #define GRID_COLUMN_END_INDEX 13
+-#define GRID_COLUMN_END_SHIFT 8
+-#define GRID_COLUMN_END_MASK 0x300
++#define GRID_COLUMN_END_SHIFT 6
++#define GRID_COLUMN_END_MASK 0xc0
+ static inline uint8_t get_grid_column_end(const css_computed_style *style,
+ 		int32_t *integer)
+ {
+@@ -1656,8 +1656,8 @@ static inline uint8_t get_grid_column_end(const css_computed_style *style,
+ #undef GRID_COLUMN_END_MASK
+ 
+ #define GRID_COLUMN_START_INDEX 13
+-#define GRID_COLUMN_START_SHIFT 10
+-#define GRID_COLUMN_START_MASK 0xc00
++#define GRID_COLUMN_START_SHIFT 8
++#define GRID_COLUMN_START_MASK 0x300
+ static inline uint8_t get_grid_column_start(const css_computed_style *style,
+ 		int32_t *integer)
+ {
+@@ -1677,8 +1677,8 @@ static inline uint8_t get_grid_column_start(const css_computed_style *style,
+ #undef GRID_COLUMN_START_MASK
+ 
+ #define GRID_ROW_END_INDEX 13
+-#define GRID_ROW_END_SHIFT 12
+-#define GRID_ROW_END_MASK 0x3000
++#define GRID_ROW_END_SHIFT 10
++#define GRID_ROW_END_MASK 0xc00
+ static inline uint8_t get_grid_row_end(const css_computed_style *style, int32_t
+ 		*integer)
+ {
+@@ -1698,8 +1698,8 @@ static inline uint8_t get_grid_row_end(const css_computed_style *style, int32_t
+ #undef GRID_ROW_END_MASK
+ 
+ #define GRID_ROW_START_INDEX 13
+-#define GRID_ROW_START_SHIFT 14
+-#define GRID_ROW_START_MASK 0xc000
++#define GRID_ROW_START_SHIFT 12
++#define GRID_ROW_START_MASK 0x3000
+ static inline uint8_t get_grid_row_start(const css_computed_style *style,
+ 		int32_t *integer)
+ {
+@@ -1719,8 +1719,8 @@ static inline uint8_t get_grid_row_start(const css_computed_style *style,
+ #undef GRID_ROW_START_MASK
+ 
+ #define GRID_TEMPLATE_COLUMNS_INDEX 13
+-#define GRID_TEMPLATE_COLUMNS_SHIFT 16
+-#define GRID_TEMPLATE_COLUMNS_MASK 0x30000
++#define GRID_TEMPLATE_COLUMNS_SHIFT 14
++#define GRID_TEMPLATE_COLUMNS_MASK 0xc000
+ static inline uint8_t get_grid_template_columns(const css_computed_style
+ 		*style, const css_computed_grid_track **grid_track)
+ {
+@@ -1742,8 +1742,8 @@ static inline uint8_t get_grid_template_columns(const css_computed_style
+ #undef GRID_TEMPLATE_COLUMNS_MASK
+ 
+ #define GRID_TEMPLATE_ROWS_INDEX 13
+-#define GRID_TEMPLATE_ROWS_SHIFT 18
+-#define GRID_TEMPLATE_ROWS_MASK 0xc0000
++#define GRID_TEMPLATE_ROWS_SHIFT 16
++#define GRID_TEMPLATE_ROWS_MASK 0x30000
+ static inline uint8_t get_grid_template_rows(const css_computed_style *style,
+ 		const css_computed_grid_track **grid_track)
+ {
+@@ -1855,6 +1855,27 @@ static inline uint8_t get_letter_spacing(const css_computed_style *style,
+ #undef LETTER_SPACING_SHIFT
+ #undef LETTER_SPACING_MASK
+ 
++#define LINE_CLAMP_INDEX 13
++#define LINE_CLAMP_SHIFT 18
++#define LINE_CLAMP_MASK 0xc0000
++static inline uint8_t get_line_clamp(const css_computed_style *style, int32_t
++		*integer)
++{
++	uint8_t type;
++	uint32_t bits = style->i.bits[LINE_CLAMP_INDEX];
++	bits &= LINE_CLAMP_MASK;
++	bits >>= LINE_CLAMP_SHIFT;
++
++	/* 2bits: tt : type */
++	type = bits & 0x3;
++	*integer = style->i.line_clamp;
++
++	return type;
++}
++#undef LINE_CLAMP_INDEX
++#undef LINE_CLAMP_SHIFT
++#undef LINE_CLAMP_MASK
++
+ #define LINE_HEIGHT_INDEX 5
+ #define LINE_HEIGHT_SHIFT 4
+ #define LINE_HEIGHT_MASK 0x7f0
+@@ -1883,8 +1904,8 @@ static inline uint8_t get_line_height(
+ #undef LINE_HEIGHT_MASK
+ 
+ #define LIST_STYLE_IMAGE_INDEX 19
+-#define LIST_STYLE_IMAGE_SHIFT 16
+-#define LIST_STYLE_IMAGE_MASK 0x10000
++#define LIST_STYLE_IMAGE_SHIFT 14
++#define LIST_STYLE_IMAGE_MASK 0x4000
+ static inline uint8_t get_list_style_image(const css_computed_style *style,
+ 		lwc_string **string)
+ {
+@@ -2038,8 +2059,8 @@ static inline uint8_t get_margin_top(const css_computed_style *style,
+ #undef MARGIN_TOP_MASK
+ 
+ #define MASK_IMAGE_INDEX 19
+-#define MASK_IMAGE_SHIFT 17
+-#define MASK_IMAGE_MASK 0x20000
++#define MASK_IMAGE_SHIFT 15
++#define MASK_IMAGE_MASK 0x8000
+ static inline uint8_t get_mask_image(const css_computed_style *style,
+ 		lwc_string **string)
+ {
+@@ -2174,8 +2195,8 @@ static inline uint8_t get_object_fit(const css_computed_style *style)
+ #undef OBJECT_FIT_MASK
+ 
+ #define OPACITY_INDEX 19
+-#define OPACITY_SHIFT 18
+-#define OPACITY_MASK 0x40000
++#define OPACITY_SHIFT 16
++#define OPACITY_MASK 0x10000
+ static inline uint8_t get_opacity(const css_computed_style *style, css_fixed
+ 		*fixed)
+ {
+@@ -2197,8 +2218,8 @@ static inline uint8_t get_opacity(const css_computed_style *style, css_fixed
+ #undef OPACITY_MASK
+ 
+ #define ORDER_INDEX 19
+-#define ORDER_SHIFT 19
+-#define ORDER_MASK 0x80000
++#define ORDER_SHIFT 17
++#define ORDER_MASK 0x20000
+ static inline uint8_t get_order(const css_computed_style *style, int32_t
+ 		*integer)
+ {
+diff --git a/src/select/autogenerated_propset.h b/src/select/autogenerated_propset.h
+index 4f0794b..7b83a14 100644
+--- a/src/select/autogenerated_propset.h
++++ b/src/select/autogenerated_propset.h
+@@ -86,8 +86,8 @@ static inline css_error set_animation_fill_mode(css_computed_style *style,
+ #undef ANIMATION_FILL_MODE_MASK
+ 
+ #define ANIMATION_ITERATION_COUNT_INDEX 19
+-#define ANIMATION_ITERATION_COUNT_SHIFT 20
+-#define ANIMATION_ITERATION_COUNT_MASK 0x300000
++#define ANIMATION_ITERATION_COUNT_SHIFT 18
++#define ANIMATION_ITERATION_COUNT_MASK 0xc0000
+ 
+ static inline css_error set_animation_iteration_count(css_computed_style
+ 		*style, uint8_t type, css_fixed fixed)
+@@ -107,8 +107,8 @@ static inline css_error set_animation_iteration_count(css_computed_style
+ #undef ANIMATION_ITERATION_COUNT_MASK
+ 
+ #define ANIMATION_NAME_INDEX 19
+-#define ANIMATION_NAME_SHIFT 22
+-#define ANIMATION_NAME_MASK 0xc00000
++#define ANIMATION_NAME_SHIFT 20
++#define ANIMATION_NAME_MASK 0x300000
+ 
+ static inline css_error set_animation_name(css_computed_style *style, uint8_t
+ 		type, lwc_string *string)
+@@ -136,8 +136,8 @@ static inline css_error set_animation_name(css_computed_style *style, uint8_t
+ #undef ANIMATION_NAME_MASK
+ 
+ #define ASPECT_RATIO_INDEX 19
+-#define ASPECT_RATIO_SHIFT 24
+-#define ASPECT_RATIO_MASK 0x3000000
++#define ASPECT_RATIO_SHIFT 22
++#define ASPECT_RATIO_MASK 0xc00000
+ 
+ static inline css_error set_aspect_ratio(css_computed_style *style, uint8_t
+ 		type, css_fixed fixed_a, css_fixed fixed_b)
+@@ -159,8 +159,8 @@ static inline css_error set_aspect_ratio(css_computed_style *style, uint8_t
+ #undef ASPECT_RATIO_MASK
+ 
+ #define BACKGROUND_ATTACHMENT_INDEX 19
+-#define BACKGROUND_ATTACHMENT_SHIFT 26
+-#define BACKGROUND_ATTACHMENT_MASK 0xc000000
++#define BACKGROUND_ATTACHMENT_SHIFT 24
++#define BACKGROUND_ATTACHMENT_MASK 0x3000000
+ 
+ static inline css_error set_background_attachment(css_computed_style *style,
+ 		uint8_t type)
+@@ -197,8 +197,8 @@ static inline css_error set_background_clip(css_computed_style *style, uint8_t
+ #undef BACKGROUND_CLIP_MASK
+ 
+ #define BACKGROUND_COLOR_INDEX 19
+-#define BACKGROUND_COLOR_SHIFT 28
+-#define BACKGROUND_COLOR_MASK 0x30000000
++#define BACKGROUND_COLOR_SHIFT 26
++#define BACKGROUND_COLOR_MASK 0xc000000
+ 
+ static inline css_error set_background_color(css_computed_style *style, uint8_t
+ 		type, css_color color)
+@@ -218,8 +218,8 @@ static inline css_error set_background_color(css_computed_style *style, uint8_t
+ #undef BACKGROUND_COLOR_MASK
+ 
+ #define BACKGROUND_IMAGE_INDEX 19
+-#define BACKGROUND_IMAGE_SHIFT 9
+-#define BACKGROUND_IMAGE_MASK 0x200
++#define BACKGROUND_IMAGE_SHIFT 7
++#define BACKGROUND_IMAGE_MASK 0x80
+ 
+ static inline css_error set_background_image(css_computed_style *style, uint8_t
+ 		type, lwc_string *string)
+@@ -315,8 +315,8 @@ static inline css_error set_background_size(css_computed_style *style, uint8_t
+ #undef BACKGROUND_SIZE_MASK
+ 
+ #define BORDER_BOTTOM_COLOR_INDEX 19
+-#define BORDER_BOTTOM_COLOR_SHIFT 30
+-#define BORDER_BOTTOM_COLOR_MASK 0xc0000000
++#define BORDER_BOTTOM_COLOR_SHIFT 28
++#define BORDER_BOTTOM_COLOR_MASK 0x30000000
+ 
+ static inline css_error set_border_bottom_color(css_computed_style *style,
+ 		uint8_t type, css_color color)
+@@ -439,9 +439,9 @@ static inline css_error set_border_bottom_width(css_computed_style *style,
+ #undef BORDER_BOTTOM_WIDTH_SHIFT
+ #undef BORDER_BOTTOM_WIDTH_MASK
+ 
+-#define BORDER_COLLAPSE_INDEX 14
+-#define BORDER_COLLAPSE_SHIFT 0
+-#define BORDER_COLLAPSE_MASK 0x3
++#define BORDER_COLLAPSE_INDEX 19
++#define BORDER_COLLAPSE_SHIFT 30
++#define BORDER_COLLAPSE_MASK 0xc0000000
+ 
+ static inline css_error set_border_collapse(css_computed_style *style, uint8_t
+ 		type)
+@@ -459,8 +459,8 @@ static inline css_error set_border_collapse(css_computed_style *style, uint8_t
+ #undef BORDER_COLLAPSE_MASK
+ 
+ #define BORDER_LEFT_COLOR_INDEX 14
+-#define BORDER_LEFT_COLOR_SHIFT 2
+-#define BORDER_LEFT_COLOR_MASK 0xc
++#define BORDER_LEFT_COLOR_SHIFT 0
++#define BORDER_LEFT_COLOR_MASK 0x3
+ 
+ static inline css_error set_border_left_color(css_computed_style *style,
+ 		uint8_t type, css_color color)
+@@ -534,8 +534,8 @@ static inline css_error set_border_left_width(css_computed_style *style,
+ #undef BORDER_LEFT_WIDTH_MASK
+ 
+ #define BORDER_RIGHT_COLOR_INDEX 14
+-#define BORDER_RIGHT_COLOR_SHIFT 4
+-#define BORDER_RIGHT_COLOR_MASK 0x30
++#define BORDER_RIGHT_COLOR_SHIFT 2
++#define BORDER_RIGHT_COLOR_MASK 0xc
+ 
+ static inline css_error set_border_right_color(css_computed_style *style,
+ 		uint8_t type, css_color color)
+@@ -633,8 +633,8 @@ static inline css_error set_border_spacing(css_computed_style *style, uint8_t
+ #undef BORDER_SPACING_MASK
+ 
+ #define BORDER_TOP_COLOR_INDEX 14
+-#define BORDER_TOP_COLOR_SHIFT 6
+-#define BORDER_TOP_COLOR_MASK 0xc0
++#define BORDER_TOP_COLOR_SHIFT 4
++#define BORDER_TOP_COLOR_MASK 0x30
+ 
+ static inline css_error set_border_top_color(css_computed_style *style, uint8_t
+ 		type, css_color color)
+@@ -826,8 +826,8 @@ static inline css_error set_box_shadow(css_computed_style *style, uint8_t type,
+ #undef BOX_SHADOW_MASK
+ 
+ #define BOX_SIZING_INDEX 14
+-#define BOX_SIZING_SHIFT 8
+-#define BOX_SIZING_MASK 0x300
++#define BOX_SIZING_SHIFT 6
++#define BOX_SIZING_MASK 0xc0
+ 
+ static inline css_error set_box_sizing(css_computed_style *style, uint8_t type)
+ {
+@@ -900,8 +900,8 @@ static inline css_error set_break_inside(css_computed_style *style, uint8_t
+ #undef BREAK_INSIDE_MASK
+ 
+ #define CAPTION_SIDE_INDEX 14
+-#define CAPTION_SIDE_SHIFT 10
+-#define CAPTION_SIDE_MASK 0xc00
++#define CAPTION_SIDE_SHIFT 8
++#define CAPTION_SIDE_MASK 0x300
+ 
+ static inline css_error set_caption_side(css_computed_style *style, uint8_t
+ 		type)
+@@ -1010,8 +1010,8 @@ static inline css_error set_clip_path(css_computed_style *style, uint8_t type,
+ #undef CLIP_PATH_MASK
+ 
+ #define COLOR_INDEX 19
+-#define COLOR_SHIFT 10
+-#define COLOR_MASK 0x400
++#define COLOR_SHIFT 8
++#define COLOR_MASK 0x100
+ 
+ static inline css_error set_color(css_computed_style *style, uint8_t type,
+ 		css_color color)
+@@ -1030,8 +1030,8 @@ static inline css_error set_color(css_computed_style *style, uint8_t type,
+ #undef COLOR_MASK
+ 
+ #define COLUMN_COUNT_INDEX 14
+-#define COLUMN_COUNT_SHIFT 12
+-#define COLUMN_COUNT_MASK 0x3000
++#define COLUMN_COUNT_SHIFT 10
++#define COLUMN_COUNT_MASK 0xc00
+ 
+ static inline css_error set_column_count(css_computed_style *style, uint8_t
+ 		type, int32_t integer)
+@@ -1051,8 +1051,8 @@ static inline css_error set_column_count(css_computed_style *style, uint8_t
+ #undef COLUMN_COUNT_MASK
+ 
+ #define COLUMN_FILL_INDEX 14
+-#define COLUMN_FILL_SHIFT 14
+-#define COLUMN_FILL_MASK 0xc000
++#define COLUMN_FILL_SHIFT 12
++#define COLUMN_FILL_MASK 0x3000
+ 
+ static inline css_error set_column_fill(css_computed_style *style, uint8_t type)
+ {
+@@ -1104,8 +1104,8 @@ static inline css_error set_column_gap(css_computed_style *style, uint8_t type,
+ #undef COLUMN_GAP_MASK
+ 
+ #define COLUMN_RULE_COLOR_INDEX 14
+-#define COLUMN_RULE_COLOR_SHIFT 16
+-#define COLUMN_RULE_COLOR_MASK 0x30000
++#define COLUMN_RULE_COLOR_SHIFT 14
++#define COLUMN_RULE_COLOR_MASK 0xc000
+ 
+ static inline css_error set_column_rule_color(css_computed_style *style,
+ 		uint8_t type, css_color color)
+@@ -1179,8 +1179,8 @@ static inline css_error set_column_rule_width(css_computed_style *style,
+ #undef COLUMN_RULE_WIDTH_MASK
+ 
+ #define COLUMN_SPAN_INDEX 14
+-#define COLUMN_SPAN_SHIFT 18
+-#define COLUMN_SPAN_MASK 0xc0000
++#define COLUMN_SPAN_SHIFT 16
++#define COLUMN_SPAN_MASK 0x30000
+ 
+ static inline css_error set_column_span(css_computed_style *style, uint8_t type)
+ {
+@@ -1232,8 +1232,8 @@ static inline css_error set_column_width(css_computed_style *style, uint8_t
+ #undef COLUMN_WIDTH_MASK
+ 
+ #define CONTENT_INDEX 14
+-#define CONTENT_SHIFT 20
+-#define CONTENT_MASK 0x300000
++#define CONTENT_SHIFT 18
++#define CONTENT_MASK 0xc0000
+ static inline css_error set_content(
+ 		css_computed_style *style, uint8_t type,
+ 		css_computed_content_item *content)
+@@ -1315,8 +1315,8 @@ static inline css_error set_content(
+ #undef CONTENT_MASK
+ 
+ #define COUNTER_INCREMENT_INDEX 19
+-#define COUNTER_INCREMENT_SHIFT 11
+-#define COUNTER_INCREMENT_MASK 0x800
++#define COUNTER_INCREMENT_SHIFT 9
++#define COUNTER_INCREMENT_MASK 0x200
+ 
+ static inline css_error set_counter_increment(css_computed_style *style,
+ 		uint8_t type, css_computed_counter *counter_arr)
+@@ -1351,8 +1351,8 @@ static inline css_error set_counter_increment(css_computed_style *style,
+ #undef COUNTER_INCREMENT_MASK
+ 
+ #define COUNTER_RESET_INDEX 19
+-#define COUNTER_RESET_SHIFT 12
+-#define COUNTER_RESET_MASK 0x1000
++#define COUNTER_RESET_SHIFT 10
++#define COUNTER_RESET_MASK 0x400
+ 
+ static inline css_error set_counter_reset(css_computed_style *style, uint8_t
+ 		type, css_computed_counter *counter_arr)
+@@ -1423,8 +1423,8 @@ static inline css_error set_cursor(css_computed_style *style, uint8_t type,
+ #undef CURSOR_MASK
+ 
+ #define DIRECTION_INDEX 14
+-#define DIRECTION_SHIFT 22
+-#define DIRECTION_MASK 0xc00000
++#define DIRECTION_SHIFT 20
++#define DIRECTION_MASK 0x300000
+ 
+ static inline css_error set_direction(css_computed_style *style, uint8_t type)
+ {
+@@ -1459,8 +1459,8 @@ static inline css_error set_display(css_computed_style *style, uint8_t type)
+ #undef DISPLAY_MASK
+ 
+ #define EMPTY_CELLS_INDEX 14
+-#define EMPTY_CELLS_SHIFT 24
+-#define EMPTY_CELLS_MASK 0x3000000
++#define EMPTY_CELLS_SHIFT 22
++#define EMPTY_CELLS_MASK 0xc00000
+ 
+ static inline css_error set_empty_cells(css_computed_style *style, uint8_t type)
+ {
+@@ -1477,8 +1477,8 @@ static inline css_error set_empty_cells(css_computed_style *style, uint8_t type)
+ #undef EMPTY_CELLS_MASK
+ 
+ #define FILL_INDEX 14
+-#define FILL_SHIFT 26
+-#define FILL_MASK 0xc000000
++#define FILL_SHIFT 24
++#define FILL_MASK 0x3000000
+ 
+ static inline css_error set_fill(css_computed_style *style, uint8_t type,
+ 		css_color color)
+@@ -1497,8 +1497,8 @@ static inline css_error set_fill(css_computed_style *style, uint8_t type,
+ #undef FILL_MASK
+ 
+ #define FILL_OPACITY_INDEX 19
+-#define FILL_OPACITY_SHIFT 13
+-#define FILL_OPACITY_MASK 0x2000
++#define FILL_OPACITY_SHIFT 11
++#define FILL_OPACITY_MASK 0x800
+ 
+ static inline css_error set_fill_opacity(css_computed_style *style, uint8_t
+ 		type, css_fixed fixed)
+@@ -1572,8 +1572,8 @@ static inline css_error set_flex_direction(css_computed_style *style, uint8_t
+ #undef FLEX_DIRECTION_MASK
+ 
+ #define FLEX_GROW_INDEX 19
+-#define FLEX_GROW_SHIFT 14
+-#define FLEX_GROW_MASK 0x4000
++#define FLEX_GROW_SHIFT 12
++#define FLEX_GROW_MASK 0x1000
+ 
+ static inline css_error set_flex_grow(css_computed_style *style, uint8_t type,
+ 		css_fixed fixed)
+@@ -1593,8 +1593,8 @@ static inline css_error set_flex_grow(css_computed_style *style, uint8_t type,
+ #undef FLEX_GROW_MASK
+ 
+ #define FLEX_SHRINK_INDEX 19
+-#define FLEX_SHRINK_SHIFT 15
+-#define FLEX_SHRINK_MASK 0x8000
++#define FLEX_SHRINK_SHIFT 13
++#define FLEX_SHRINK_MASK 0x2000
+ 
+ static inline css_error set_flex_shrink(css_computed_style *style, uint8_t
+ 		type, css_fixed fixed)
+@@ -1614,8 +1614,8 @@ static inline css_error set_flex_shrink(css_computed_style *style, uint8_t
+ #undef FLEX_SHRINK_MASK
+ 
+ #define FLEX_WRAP_INDEX 14
+-#define FLEX_WRAP_SHIFT 28
+-#define FLEX_WRAP_MASK 0x30000000
++#define FLEX_WRAP_SHIFT 26
++#define FLEX_WRAP_MASK 0xc000000
+ 
+ static inline css_error set_flex_wrap(css_computed_style *style, uint8_t type)
+ {
+@@ -1632,8 +1632,8 @@ static inline css_error set_flex_wrap(css_computed_style *style, uint8_t type)
+ #undef FLEX_WRAP_MASK
+ 
+ #define FLOAT_INDEX 14
+-#define FLOAT_SHIFT 30
+-#define FLOAT_MASK 0xc0000000
++#define FLOAT_SHIFT 28
++#define FLOAT_MASK 0x30000000
+ 
+ static inline css_error set_float(css_computed_style *style, uint8_t type)
+ {
+@@ -1719,9 +1719,9 @@ static inline css_error set_font_size(css_computed_style *style, uint8_t type,
+ #undef FONT_SIZE_SHIFT
+ #undef FONT_SIZE_MASK
+ 
+-#define FONT_STYLE_INDEX 13
+-#define FONT_STYLE_SHIFT 0
+-#define FONT_STYLE_MASK 0x3
++#define FONT_STYLE_INDEX 14
++#define FONT_STYLE_SHIFT 30
++#define FONT_STYLE_MASK 0xc0000000
+ 
+ static inline css_error set_font_style(css_computed_style *style, uint8_t type)
+ {
+@@ -1738,8 +1738,8 @@ static inline css_error set_font_style(css_computed_style *style, uint8_t type)
+ #undef FONT_STYLE_MASK
+ 
+ #define FONT_VARIANT_INDEX 13
+-#define FONT_VARIANT_SHIFT 2
+-#define FONT_VARIANT_MASK 0xc
++#define FONT_VARIANT_SHIFT 0
++#define FONT_VARIANT_MASK 0x3
+ 
+ static inline css_error set_font_variant(css_computed_style *style, uint8_t
+ 		type)
+@@ -1775,8 +1775,8 @@ static inline css_error set_font_weight(css_computed_style *style, uint8_t type)
+ #undef FONT_WEIGHT_MASK
+ 
+ #define GRID_AUTO_COLUMNS_INDEX 13
+-#define GRID_AUTO_COLUMNS_SHIFT 4
+-#define GRID_AUTO_COLUMNS_MASK 0x30
++#define GRID_AUTO_COLUMNS_SHIFT 2
++#define GRID_AUTO_COLUMNS_MASK 0xc
+ 
+ static inline css_error set_grid_auto_columns(css_computed_style *style,
+ 		uint8_t type, css_computed_grid_track *grid_track)
+@@ -1821,8 +1821,8 @@ static inline css_error set_grid_auto_flow(css_computed_style *style, uint8_t
+ #undef GRID_AUTO_FLOW_MASK
+ 
+ #define GRID_AUTO_ROWS_INDEX 13
+-#define GRID_AUTO_ROWS_SHIFT 6
+-#define GRID_AUTO_ROWS_MASK 0xc0
++#define GRID_AUTO_ROWS_SHIFT 4
++#define GRID_AUTO_ROWS_MASK 0x30
+ 
+ static inline css_error set_grid_auto_rows(css_computed_style *style, uint8_t
+ 		type, css_computed_grid_track *grid_track)
+@@ -1848,8 +1848,8 @@ static inline css_error set_grid_auto_rows(css_computed_style *style, uint8_t
+ #undef GRID_AUTO_ROWS_MASK
+ 
+ #define GRID_COLUMN_END_INDEX 13
+-#define GRID_COLUMN_END_SHIFT 8
+-#define GRID_COLUMN_END_MASK 0x300
++#define GRID_COLUMN_END_SHIFT 6
++#define GRID_COLUMN_END_MASK 0xc0
+ 
+ static inline css_error set_grid_column_end(css_computed_style *style, uint8_t
+ 		type, int32_t integer)
+@@ -1869,8 +1869,8 @@ static inline css_error set_grid_column_end(css_computed_style *style, uint8_t
+ #undef GRID_COLUMN_END_MASK
+ 
+ #define GRID_COLUMN_START_INDEX 13
+-#define GRID_COLUMN_START_SHIFT 10
+-#define GRID_COLUMN_START_MASK 0xc00
++#define GRID_COLUMN_START_SHIFT 8
++#define GRID_COLUMN_START_MASK 0x300
+ 
+ static inline css_error set_grid_column_start(css_computed_style *style,
+ 		uint8_t type, int32_t integer)
+@@ -1890,8 +1890,8 @@ static inline css_error set_grid_column_start(css_computed_style *style,
+ #undef GRID_COLUMN_START_MASK
+ 
+ #define GRID_ROW_END_INDEX 13
+-#define GRID_ROW_END_SHIFT 12
+-#define GRID_ROW_END_MASK 0x3000
++#define GRID_ROW_END_SHIFT 10
++#define GRID_ROW_END_MASK 0xc00
+ 
+ static inline css_error set_grid_row_end(css_computed_style *style, uint8_t
+ 		type, int32_t integer)
+@@ -1911,8 +1911,8 @@ static inline css_error set_grid_row_end(css_computed_style *style, uint8_t
+ #undef GRID_ROW_END_MASK
+ 
+ #define GRID_ROW_START_INDEX 13
+-#define GRID_ROW_START_SHIFT 14
+-#define GRID_ROW_START_MASK 0xc000
++#define GRID_ROW_START_SHIFT 12
++#define GRID_ROW_START_MASK 0x3000
+ 
+ static inline css_error set_grid_row_start(css_computed_style *style, uint8_t
+ 		type, int32_t integer)
+@@ -1932,8 +1932,8 @@ static inline css_error set_grid_row_start(css_computed_style *style, uint8_t
+ #undef GRID_ROW_START_MASK
+ 
+ #define GRID_TEMPLATE_COLUMNS_INDEX 13
+-#define GRID_TEMPLATE_COLUMNS_SHIFT 16
+-#define GRID_TEMPLATE_COLUMNS_MASK 0x30000
++#define GRID_TEMPLATE_COLUMNS_SHIFT 14
++#define GRID_TEMPLATE_COLUMNS_MASK 0xc000
+ 
+ static inline css_error set_grid_template_columns(css_computed_style *style,
+ 		uint8_t type, css_computed_grid_track *grid_track)
+@@ -1959,8 +1959,8 @@ static inline css_error set_grid_template_columns(css_computed_style *style,
+ #undef GRID_TEMPLATE_COLUMNS_MASK
+ 
+ #define GRID_TEMPLATE_ROWS_INDEX 13
+-#define GRID_TEMPLATE_ROWS_SHIFT 18
+-#define GRID_TEMPLATE_ROWS_MASK 0xc0000
++#define GRID_TEMPLATE_ROWS_SHIFT 16
++#define GRID_TEMPLATE_ROWS_MASK 0x30000
+ 
+ static inline css_error set_grid_template_rows(css_computed_style *style,
+ 		uint8_t type, css_computed_grid_track *grid_track)
+@@ -2109,6 +2109,27 @@ static inline css_error set_letter_spacing(css_computed_style *style, uint8_t
+ #undef LETTER_SPACING_SHIFT
+ #undef LETTER_SPACING_MASK
+ 
++#define LINE_CLAMP_INDEX 13
++#define LINE_CLAMP_SHIFT 18
++#define LINE_CLAMP_MASK 0xc0000
++
++static inline css_error set_line_clamp(css_computed_style *style, uint8_t type,
++		int32_t integer)
++{
++	uint32_t *bits = &style->i.bits[LINE_CLAMP_INDEX];
++
++	/* 2bits: tt : type */
++	*bits = (*bits & ~LINE_CLAMP_MASK) | (((uint32_t)type & 0x3) <<
++			LINE_CLAMP_SHIFT);
++
++	style->i.line_clamp = integer;
++
++	return CSS_OK;
++}
++#undef LINE_CLAMP_INDEX
++#undef LINE_CLAMP_SHIFT
++#undef LINE_CLAMP_MASK
++
+ #define LINE_HEIGHT_INDEX 5
+ #define LINE_HEIGHT_SHIFT 4
+ #define LINE_HEIGHT_MASK 0x7f0
+@@ -2143,8 +2164,8 @@ static inline css_error set_line_height(css_computed_style *style, uint8_t
+ #undef LINE_HEIGHT_MASK
+ 
+ #define LIST_STYLE_IMAGE_INDEX 19
+-#define LIST_STYLE_IMAGE_SHIFT 16
+-#define LIST_STYLE_IMAGE_MASK 0x10000
++#define LIST_STYLE_IMAGE_SHIFT 14
++#define LIST_STYLE_IMAGE_MASK 0x4000
+ 
+ static inline css_error set_list_style_image(css_computed_style *style, uint8_t
+ 		type, lwc_string *string)
+@@ -2350,8 +2371,8 @@ static inline css_error set_margin_top(css_computed_style *style, uint8_t type,
+ #undef MARGIN_TOP_MASK
+ 
+ #define MASK_IMAGE_INDEX 19
+-#define MASK_IMAGE_SHIFT 17
+-#define MASK_IMAGE_MASK 0x20000
++#define MASK_IMAGE_SHIFT 15
++#define MASK_IMAGE_MASK 0x8000
+ 
+ static inline css_error set_mask_image(css_computed_style *style, uint8_t type,
+ 		lwc_string *string)
+@@ -2537,8 +2558,8 @@ static inline css_error set_object_fit(css_computed_style *style, uint8_t type)
+ #undef OBJECT_FIT_MASK
+ 
+ #define OPACITY_INDEX 19
+-#define OPACITY_SHIFT 18
+-#define OPACITY_MASK 0x40000
++#define OPACITY_SHIFT 16
++#define OPACITY_MASK 0x10000
+ 
+ static inline css_error set_opacity(css_computed_style *style, uint8_t type,
+ 		css_fixed fixed)
+@@ -2558,8 +2579,8 @@ static inline css_error set_opacity(css_computed_style *style, uint8_t type,
+ #undef OPACITY_MASK
+ 
+ #define ORDER_INDEX 19
+-#define ORDER_SHIFT 19
+-#define ORDER_MASK 0x80000
++#define ORDER_SHIFT 17
++#define ORDER_MASK 0x20000
+ 
+ static inline css_error set_order(css_computed_style *style, uint8_t type,
+ 		int32_t integer)
+diff --git a/src/select/computed.c b/src/select/computed.c
+index e45a3d4..e411e86 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -939,6 +939,12 @@ uint8_t css_computed_clip_path(const css_computed_style *style,
+ 			bottom, bunit, left, lunit);
+ }
+ 
++uint8_t css_computed_line_clamp(const css_computed_style *style,
++		int32_t *count)
++{
++	return get_line_clamp(style, count);
++}
++
+ uint8_t css_computed_transform(const css_computed_style *style,
+ 		css_fixed *hlength, css_unit *hunit,
+ 		css_fixed *vlength, css_unit *vunit)
+diff --git a/src/select/dispatch.c b/src/select/dispatch.c
+index 73cb91a..5f706ae 100644
+--- a/src/select/dispatch.c
++++ b/src/select/dispatch.c
+@@ -648,4 +648,8 @@ struct prop_table prop_dispatch[CSS_N_PROPERTIES] = {
+ 		PROPERTY_FUNCS(clip_path),
+ 		0,
+ 	},
++	{
++		PROPERTY_FUNCS(line_clamp),
++		0,
++	},
+ };
+diff --git a/src/select/properties/Makefile b/src/select/properties/Makefile
+index 0ea1ae5..bd2cd0c 100644
+--- a/src/select/properties/Makefile
++++ b/src/select/properties/Makefile
+@@ -89,7 +89,7 @@ row_gap.c \
+ 	word_break.c overflow_wrap.c text_overflow.c pointer_events.c \
+ 	object_fit.c background_size.c aspect_ratio.c paint.c \
+ 	transform.c animation_name.c animation_fill_mode.c \
+-	animation_iteration_count.c background_clip.c box_shadow.c clip_path.c \
++	animation_iteration_count.c background_clip.c box_shadow.c clip_path.c line_clamp.c \
+ margin_top.c \
+ max_height.c \
+ max_width.c \
+@@ -112,7 +112,7 @@ row_gap.c \
+ 	word_break.c overflow_wrap.c text_overflow.c pointer_events.c \
+ 	object_fit.c background_size.c aspect_ratio.c paint.c \
+ 	transform.c animation_name.c animation_fill_mode.c \
+-	animation_iteration_count.c background_clip.c box_shadow.c clip_path.c \
++	animation_iteration_count.c background_clip.c box_shadow.c clip_path.c line_clamp.c \
+ padding_top.c \
+ page_break_after.c \
+ page_break_before.c \
+@@ -132,7 +132,7 @@ row_gap.c \
+ 	word_break.c overflow_wrap.c text_overflow.c pointer_events.c \
+ 	object_fit.c background_size.c aspect_ratio.c paint.c \
+ 	transform.c animation_name.c animation_fill_mode.c \
+-	animation_iteration_count.c background_clip.c box_shadow.c clip_path.c \
++	animation_iteration_count.c background_clip.c box_shadow.c clip_path.c line_clamp.c \
+ speech_rate.c \
+ speak.c \
+ speak_header.c \
+diff --git a/src/select/properties/line_clamp.c b/src/select/properties/line_clamp.c
+new file mode 100644
+index 0000000..d03674a
+--- /dev/null
++++ b/src/select/properties/line_clamp.c
+@@ -0,0 +1,79 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 VitaSurf contributors
++ */
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++css_error css__cascade_line_clamp(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	uint16_t value = CSS_LINE_CLAMP_INHERIT;
++	css_fixed count = 0;
++
++	if (hasFlagValue(opv) == false) {
++		switch (getValue(opv)) {
++		case LINE_CLAMP_SET:
++			value = CSS_LINE_CLAMP_SET;
++			count = *((css_fixed *) style->bytecode);
++			advance_bytecode(style, sizeof(count));
++			break;
++		case LINE_CLAMP_NONE:
++			value = CSS_LINE_CLAMP_NONE;
++			break;
++		}
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		return set_line_clamp(state->computed, value, count);
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_line_clamp_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	return set_line_clamp(style, hint->status, hint->data.integer);
++}
++
++css_error css__initial_line_clamp(css_select_state *state)
++{
++	return set_line_clamp(state->computed, CSS_LINE_CLAMP_NONE, 0);
++}
++
++css_error css__copy_line_clamp(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	int32_t count = 0;
++	uint8_t type = get_line_clamp(from, &count);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_line_clamp(to, type, count);
++}
++
++css_error css__compose_line_clamp(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	int32_t count = 0;
++	uint8_t type = get_line_clamp(child, &count);
++
++	return css__copy_line_clamp(
++			type == CSS_LINE_CLAMP_INHERIT ? parent : child,
++			result);
++}
+diff --git a/src/select/properties/properties.h b/src/select/properties/properties.h
+index d79471f..8f8a56b 100644
+--- a/src/select/properties/properties.h
++++ b/src/select/properties/properties.h
+@@ -176,6 +176,7 @@ PROPERTY_FUNCS(animation_iteration_count);
+ PROPERTY_FUNCS(background_clip);
+ PROPERTY_FUNCS(box_shadow);
+ PROPERTY_FUNCS(clip_path);
++PROPERTY_FUNCS(line_clamp);
+ PROPERTY_FUNCS(transform);
+ PROPERTY_FUNCS(width);
+ PROPERTY_FUNCS(word_spacing);
+diff --git a/src/select/select_config.py b/src/select/select_config.py
+index 5e5be45..b9eb202 100644
+--- a/src/select/select_config.py
++++ b/src/select/select_config.py
+@@ -66,6 +66,8 @@ style = {
+     # right, bottom and left edges of the border box.
+     ('clip_path', 2, (('length',), ('length',), ('length',), ('length',)),
+         'CSS_CLIP_PATH_INSET', 'CSS_CLIP_PATH_NONE'),
++    # Lines shown of a block (VitaSurf)
++    ('line_clamp', 2, 'integer', None, 'CSS_LINE_CLAMP_NONE'),
+     ('box_sizing', 2),
+     ('caption_side', 2),
+     ('clear', 3),
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index 78c288c..78cef0c 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -46,3 +46,4 @@ has.dat			:has() selectors (VitaSurf)
+ nested-at.dat			At-rules nested inside @media (VitaSurf)
+ clip-path.dat			clip-path, ignored properties, light-dark() (VitaSurf)
+ gradient.dat			Gradient images (VitaSurf)
++line-clamp.dat			line-clamp and -webkit-box (VitaSurf)
+diff --git a/test/data/parse2/line-clamp.dat b/test/data/parse2/line-clamp.dat
+new file mode 100644
+index 0000000..e8998fa
+--- /dev/null
++++ b/test/data/parse2/line-clamp.dat
+@@ -0,0 +1,28 @@
++#data
++div { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; line-clamp: 3 }
++#errors
++#expected
++| div
++|  display: block
++|  line-clamp: 2
++|  overflow-x: hidden
++|  overflow-y: hidden
++|  line-clamp: 3
++#reset
++
++#data
++span { display: -webkit-inline-box; line-clamp: none }
++#errors
++#expected
++| span
++|  display: inline-block
++|  line-clamp: none
++#reset
++
++#data
++div { line-clamp: -1; color: red }
++#errors
++#expected
++| div
++|  color: #ffff0000
++#reset
+diff --git a/test/dump.h b/test/dump.h
+index 8341da3..2721771 100644
+--- a/test/dump.h
++++ b/test/dump.h
+@@ -581,6 +581,7 @@ static const char *opcode_names[] = {
+ 	"background-clip",
+ 	"box-shadow",
+ 	"clip-path",
++	"line-clamp",
+ };
+ 
+ static void dump_css_fixed(css_fixed f, char **ptr)
+@@ -1546,6 +1547,20 @@ void dump_bytecode(css_style *style, char **ptr, uint32_t depth)
+ 					break;
+ 				}
+ 				break;
++			case CSS_PROP_LINE_CLAMP:
++				switch (value) {
++				case LINE_CLAMP_SET:
++				{
++					css_fixed val = *((css_fixed *) bytecode);
++					ADVANCE(sizeof(val));
++					dump_number(val, ptr);
++				}
++					break;
++				case LINE_CLAMP_NONE:
++					*ptr += sprintf(*ptr, "none");
++					break;
++				}
++				break;
+ 			case CSS_PROP_CLIP_PATH:
+ 				switch (value) {
+ 				case CLIP_PATH_NONE:
