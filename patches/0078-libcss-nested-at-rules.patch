@@ -1,0 +1,272 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 5dd165f..dbd72d3 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -1303,10 +1303,27 @@ css_error handleEndRuleset(css_language *c, const parserutils_vector *vector)
+ 	return CSS_OK;
+ }
+ 
+-css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
++/**
++ * Start an at-rule, at the top level or inside @media (VitaSurf).
++ *
++ * \param c           Parsing context
++ * \param vector      ATKEYWORD ws any0
++ * \param parent      The enclosing @media rule, or NULL at the top level
++ * \param entry_type  Context entry to push for the rule's block
++ *
++ * A conditional at-rule -- @media, @supports, @layer, @container --
++ * inside @media is added as a child of it, so the outer query keeps
++ * applying to everything inside: mq_rule_good_for_media() walks every
++ * ancestor. @keyframes, @font-face and @page go to the top level
++ * wherever they were written, because that is the only place the
++ * lookups for them look, and an animation defined inside a media block
++ * is better found unconditionally than not at all.
++ */
++static css_error startAtRule(css_language *c, const parserutils_vector *vector,
++		css_rule *parent, css_parser_event entry_type)
+ {
+ 	parserutils_error perror;
+-	context_entry entry = { CSS_PARSER_START_ATRULE, NULL };
++	context_entry entry = { entry_type, NULL };
+ 	const css_token *token = NULL;
+ 	const css_token *atkeyword = NULL;
+ 	int32_t ctx = 0;
+@@ -1314,10 +1331,13 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+ 	css_rule *rule;
+ 	css_error error;
+ 
+-	/* vector contains: ATKEYWORD ws any0 */
++	/* vector contains: ATKEYWORD ws any0 -- with leading whitespace
++	 * when it came through handleBlockContent, which gets the tokens
++	 * as the parser gathered them */
+ 
+ 	assert(c != NULL);
+ 
++	consumeWhitespace(vector, &ctx);
+ 	atkeyword = parserutils_vector_iterate(vector, &ctx);
+ 
+ 	consumeWhitespace(vector, &ctx);
+@@ -1519,7 +1539,7 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+ 			return error;
+ 		}
+ 
+-		error = css__stylesheet_add_rule(c->sheet, rule, NULL);
++		error = css__stylesheet_add_rule(c->sheet, rule, parent);
+ 		if (error != CSS_OK) {
+ 			css__stylesheet_rule_destroy(c->sheet, rule);
+ 			return error;
+@@ -1578,7 +1598,7 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+ 			return error;
+ 		}
+ 
+-		error = css__stylesheet_add_rule(c->sheet, rule, NULL);
++		error = css__stylesheet_add_rule(c->sheet, rule, parent);
+ 		if (error != CSS_OK) {
+ 			css__stylesheet_rule_destroy(c->sheet, rule);
+ 			return error;
+@@ -1638,7 +1658,7 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+ 			return error;
+ 		}
+ 
+-		error = css__stylesheet_add_rule(c->sheet, rule, NULL);
++		error = css__stylesheet_add_rule(c->sheet, rule, parent);
+ 		if (error != CSS_OK) {
+ 			css__stylesheet_rule_destroy(c->sheet, rule);
+ 			return error;
+@@ -1754,6 +1774,11 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+ 	return CSS_OK;
+ }
+ 
++css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
++{
++	return startAtRule(c, vector, NULL, CSS_PARSER_START_ATRULE);
++}
++
+ css_error handleEndAtRule(css_language *c, const parserutils_vector *vector)
+ {
+ 	parserutils_error perror;
+@@ -1823,6 +1848,20 @@ css_error handleEndBlock(css_language *c, const parserutils_vector *vector)
+ 			return handleEndRuleset(c, vector);
+ 	}
+ 
++	/*
++	 * An at-rule inside @media reaches the language as block content
++	 * rather than as a START_ATRULE event, and no END_ATRULE follows
++	 * its block, so its entry -- pushed by handleBlockContent with the
++	 * BLOCK_CONTENT type to say so -- is popped here (VitaSurf).
++	 */
++	entry = parserutils_stack_get_current(c->context);
++	if (entry != NULL && entry->type == CSS_PARSER_BLOCK_CONTENT) {
++		perror = parserutils_stack_pop(c->context, NULL);
++		if (perror != PARSERUTILS_OK) {
++			return css_error_from_parserutils_error(perror);
++		}
++	}
++
+ 	return CSS_OK;
+ }
+ 
+@@ -1848,7 +1887,24 @@ css_error handleBlockContent(css_language *c, const parserutils_vector *vector)
+ 		return CSS_INVALID;
+ 
+ 	if (rule->type == CSS_RULE_MEDIA) {
+-		/* Expect rulesets */
++		const css_token *token;
++		int32_t ctx = 0;
++
++		/*
++		 * Expect rulesets -- or an at-rule (VitaSurf). The parser's
++		 * block-content grammar folds "@supports (...)" into the
++		 * tokens of the next block, so it arrives here rather than
++		 * as an at-rule event, and parsing it as a selector list
++		 * dropped the block with everything inside. Sites nest
++		 * @supports and @media inside @media as a matter of
++		 * course.
++		 */
++		consumeWhitespace(vector, &ctx);
++		token = parserutils_vector_peek(vector, ctx);
++		if (token != NULL && token->type == CSS_TOKEN_ATKEYWORD) {
++			return startAtRule(c, vector, rule,
++					CSS_PARSER_BLOCK_CONTENT);
++		}
+ 		return handleStartRuleset(c, vector);
+ 	} else if (rule->type == CSS_RULE_KEYFRAMES) {
+ 		/* Expect keyframe blocks (VitaSurf) */
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index 7b9edbc..b851492 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -43,3 +43,4 @@ animation.dat			animation, keyframes and background-clip tests
+ boxshadow.dat			box-shadow tests
+ container.dat			container query tests
+ has.dat			:has() selectors (VitaSurf)
++nested-at.dat			At-rules nested inside @media (VitaSurf)
+diff --git a/test/data/parse2/nested-at.dat b/test/data/parse2/nested-at.dat
+new file mode 100644
+index 0000000..f640d4b
+--- /dev/null
++++ b/test/data/parse2/nested-at.dat
+@@ -0,0 +1,58 @@
++#data
++@media screen { @supports (display: grid) { div { color: red } } p { color: blue } }
++#errors
++#expected
++| @media 040
++|  @media not 000
++|   div
++|    color: #ffff0000
++|  p
++|   color: #ff0000ff
++#reset
++
++#data
++@media screen { @keyframes k { from { top: 0 } to { top: 1px } } p { color: blue } }
++#errors
++#expected
++| @media 040
++|  p
++|   color: #ff0000ff
++| @keyframes k
++|  top: 1px
++#reset
++
++#data
++@media screen { @media (min-width: 10px) { div { color: red } } p { color: blue } }
++#errors
++#expected
++| @media 040
++|  @media 3ff
++|   div
++|    color: #ffff0000
++|  p
++|   color: #ff0000ff
++#reset
++
++#data
++@media screen { @layer base { div { color: red } } } p { color: blue }
++#errors
++#expected
++| @media 040
++|  @media not 000
++|   div
++|    color: #ffff0000
++| p
++|  color: #ff0000ff
++#reset
++
++#data
++@supports (display: grid) { @media screen { div { color: red } } } p { color: blue }
++#errors
++#expected
++| @media not 000
++|  @media 040
++|   div
++|    color: #ffff0000
++| p
++|  color: #ff0000ff
++#reset
+diff --git a/test/dump.h b/test/dump.h
+index 6937034..509a307 100644
+--- a/test/dump.h
++++ b/test/dump.h
+@@ -17,7 +17,8 @@ static void dump_rule_selector(css_rule_selector *s, char **buf,
+ 		size_t *buflen, uint32_t depth);
+ static void dump_rule_charset(css_rule_charset *s, char **buf, size_t *buflen);
+ static void dump_rule_import(css_rule_import *s, char **buf, size_t *buflen);
+-static void dump_rule_media(css_rule_media *s, char **buf, size_t *buflen);
++static void dump_rule_media(css_rule_media *s, char **buf, size_t *buflen,
++		uint32_t depth);
+ static void dump_rule_page(css_rule_page *s, char **buf, size_t *buflen);
+ static void dump_rule_font_face(css_rule_font_face *s,
+ 		char **buf, size_t *buflen);
+@@ -48,7 +49,7 @@ void dump_sheet(css_stylesheet *sheet, char *buf, size_t *buflen)
+ 			break;
+ 		case CSS_RULE_MEDIA:
+ 			dump_rule_media((css_rule_media *) rule,
+-				&buf, buflen);
++				&buf, buflen, 1);
+ 			break;
+ 		case CSS_RULE_PAGE:
+ 			dump_rule_page((css_rule_page *) rule,
+@@ -141,12 +142,18 @@ void dump_rule_import(css_rule_import *s, char **buf, size_t *buflen)
+ 	*buf = ptr;
+ }
+ 
+-void dump_rule_media(css_rule_media *s, char **buf, size_t *buflen)
++void dump_rule_media(css_rule_media *s, char **buf, size_t *buflen,
++		uint32_t depth)
+ {
+ 	char *ptr = *buf;
+ 	css_rule *rule;
++	uint32_t i;
++
++	*ptr++ = '|';
++	for (i = 0; i < depth; i++)
++		*ptr++ = ' ';
+ 
+-	ptr += sprintf(ptr, "| @media %s%03" PRIx64,
++	ptr += sprintf(ptr, "@media %s%03" PRIx64,
+ 			s->media->negate_type ? "not " : "",
+ 			s->media->type);
+ 
+@@ -154,10 +161,18 @@ void dump_rule_media(css_rule_media *s, char **buf, size_t *buflen)
+ 
+ 	*ptr++ = '\n';
+ 
++	/* A media rule inside a media rule (VitaSurf) is dumped one
++	 * level in, the same as the selector rules beside it. */
+ 	for (rule = s->first_child; rule != NULL; rule = rule->next) {
+ 		size_t len = *buflen - (ptr - *buf);
+ 
+-		dump_rule_selector((css_rule_selector *) rule, &ptr, &len, 2);
++		if (rule->type == CSS_RULE_MEDIA) {
++			dump_rule_media((css_rule_media *) rule, &ptr, &len,
++					depth + 1);
++		} else {
++			dump_rule_selector((css_rule_selector *) rule, &ptr,
++					&len, depth + 1);
++		}
+ 	}
+ 
+ 	*buflen -= ptr - *buf;
