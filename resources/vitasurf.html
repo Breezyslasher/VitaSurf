@@ -12,6 +12,19 @@ table { border-collapse: collapse; margin-top: 12px; }
 td, th { border: 1px solid #999; padding: 4px 10px; text-align: left; font-size: 15px; }
 th { background: #ddd; }
 .note { color: #555; font-size: 14px; margin-top: 16px; }
+
+/* Follows the Start menu's dark mode setting, so this page says
+   which colour scheme the browser is asking sites for. */
+@media (prefers-color-scheme: dark) {
+  body { color: #e8e8e8; background: #1b1b1b; }
+  td, th { border-color: #555; }
+  th { background: #333; }
+  .note { color: #aaa; }
+  #scheme::after { content: "dark"; }
+}
+@media (prefers-color-scheme: light) {
+  #scheme::after { content: "light"; }
+}
 </style>
 </head>
 <body>
@@ -36,6 +49,11 @@ the file fetcher, CSS and layout all work.</p>
 <tr><td>Front touch</td><td>Tap to click, drag to scroll</td></tr>
 <tr><td>Select + Start</td><td>Quit</td></tr>
 </table>
+
+<p class="note">Colour scheme asked of sites: <span id="scheme"></span>.
+Change it with Start, then Dark mode, and reload this page. A site that
+follows the setting will follow it too; many, YouTube among them, pick
+their own theme regardless.</p>
 
 <p><a href="about:welcome">NetSurf welcome page</a> |
 <a href="about:about">About NetSurf</a> |

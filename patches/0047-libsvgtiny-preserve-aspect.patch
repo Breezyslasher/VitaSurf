@@ -1,0 +1,163 @@
+diff --git a/include/svgtiny.h b/include/svgtiny.h
+index 85f146f..3f37653 100644
+--- a/include/svgtiny.h
++++ b/include/svgtiny.h
+@@ -8,6 +8,8 @@
+ #ifndef SVGTINY_H
+ #define SVGTINY_H
+ 
++#include <stdbool.h>
++
+ typedef int svgtiny_colour;
+ #define svgtiny_TRANSPARENT 0x1000000
+ #ifdef __riscos__
+@@ -40,6 +42,13 @@ struct svgtiny_diagram {
+ 
+ 	unsigned short error_line;
+ 	const char *error_message;
++	/**
++	 * Whether the graphic keeps its shape when drawn into a box of
++	 * a different shape (VitaSurf). True unless it asked for
++	 * preserveAspectRatio="none"; a caller that scales the diagram
++	 * into a box should scale both axes alike and centre it.
++	 */
++	bool preserve_aspect;
+ };
+ 
+ typedef enum {
+diff --git a/src/svgtiny.c b/src/svgtiny.c
+index ab49f8f..510ed28 100644
+--- a/src/svgtiny.c
++++ b/src/svgtiny.c
+@@ -965,6 +965,39 @@ svgtiny_parse_use(dom_element *use, struct svgtiny_parse_state state)
+ /**
+  * Parse a <svg> or <g> element node.
+  */
++/**
++ * Does this element keep its shape when scaled? (VitaSurf)
++ *
++ * preserveAspectRatio="none" is the one value asking for the axes to
++ * be scaled separately; everything else, including saying nothing at
++ * all, keeps the shape.
++ */
++static bool svgtiny_wants_aspect(dom_element *svg,
++				 struct svgtiny_parse_state *state)
++{
++	dom_string *par = NULL;
++	bool preserve = true;
++
++	if (dom_element_get_attribute(svg, state->interned_preserveAspectRatio,
++			&par) == DOM_NO_ERR && par != NULL) {
++		const char *d = dom_string_data(par);
++		size_t len = dom_string_byte_length(par);
++
++		while (len > 0 && (*d == ' ' || *d == '\t' ||
++				*d == '\n' || *d == '\r')) {
++			d++;
++			len--;
++		}
++		if (len >= 4 && strncmp(d, "none", 4) == 0) {
++			preserve = false;
++		}
++		dom_string_unref(par);
++	}
++
++	return preserve;
++}
++
++
+ static svgtiny_code
+ svgtiny_parse_svg(dom_element *svg, struct svgtiny_parse_state state)
+ {
+@@ -987,10 +1020,13 @@ svgtiny_parse_svg(dom_element *svg, struct svgtiny_parse_state state)
+ 	}
+ 
+ 	if (view_box) {
++		bool preserve = svgtiny_wants_aspect(svg, &state);
++
+ 		svgtiny_parse_viewbox(dom_string_data(view_box),
+ 				      dom_string_byte_length(view_box),
+ 				      state.viewport_width,
+ 				      state.viewport_height,
++				      preserve,
+ 				      &state.ctm);
+ 		dom_string_unref(view_box);
+ 	}
+@@ -1108,6 +1144,7 @@ initialise_parse_state(struct svgtiny_parse_state *state,
+ 	svgtiny_parse_position_attributes(svg, *state, &x, &y, &width, &height);
+ 	diagram->width = width;
+ 	diagram->height = height;
++	diagram->preserve_aspect = svgtiny_wants_aspect(svg, state);
+ 
+ 	/* set up parsing state */
+ 	state->viewport_width = width;
+diff --git a/src/svgtiny_internal.h b/src/svgtiny_internal.h
+index 2b2b257..cec47c4 100644
+--- a/src/svgtiny_internal.h
++++ b/src/svgtiny_internal.h
+@@ -115,7 +115,8 @@ svgtiny_code svgtiny_parse_color(const char *text, size_t textlen,
+ 		svgtiny_colour *c);
+ svgtiny_code svgtiny_parse_viewbox(const char *text, size_t textlen,
+ 		float viewport_width, float viewport_height,
+-		struct svgtiny_transformation_matrix *tm);
++		bool preserve_aspect,
++				   struct svgtiny_transformation_matrix *tm);
+ svgtiny_code svgtiny_parse_none(const char *cursor, const char *textend);
+ svgtiny_code svgtiny_parse_number(const char *text, const char **textend,
+ 		float *value);
+diff --git a/src/svgtiny_parse.c b/src/svgtiny_parse.c
+index af7b228..f984b25 100644
+--- a/src/svgtiny_parse.c
++++ b/src/svgtiny_parse.c
+@@ -1444,6 +1444,7 @@ svgtiny_parse_viewbox(const char *text,
+ 		      size_t textlen,
+ 		      float viewport_width,
+ 		      float viewport_height,
++		      bool preserve_aspect,
+ 		      struct svgtiny_transformation_matrix *tm)
+ {
+ 	const char *cursor = text; /* text cursor */
+@@ -1480,8 +1481,31 @@ svgtiny_parse_viewbox(const char *text,
+ 		return svgtiny_SVG_ERROR;
+ 	}
+ 
++	if (paramv[2] <= 0 || paramv[3] <= 0) {
++		/* a zero or negative extent disables rendering */
++		return svgtiny_SVG_ERROR;
++	}
++
+ 	tm->a = (float)viewport_width / paramv[2];
+ 	tm->d = (float)viewport_height / paramv[3];
++
++	if (preserve_aspect) {
++		/*
++		 * The default is to scale both axes alike and centre
++		 * what is left over, which is what preserveAspectRatio
++		 * means when nobody writes it down. Scaling the axes
++		 * separately, as this did, squashes any graphic whose
++		 * box is not the shape of its viewBox: YouTube's
++		 * wordmark came out crushed into a third of its width.
++		 */
++		float scale = (tm->a < tm->d) ? tm->a : tm->d;
++
++		tm->e += ((float)viewport_width - paramv[2] * scale) / 2;
++		tm->f += ((float)viewport_height - paramv[3] * scale) / 2;
++		tm->a = scale;
++		tm->d = scale;
++	}
++
+ 	tm->e += -paramv[0] * tm->a;
+ 	tm->f += -paramv[1] * tm->d;
+ 
+diff --git a/src/svgtiny_strings.h b/src/svgtiny_strings.h
+index c40755a..914ea49 100644
+--- a/src/svgtiny_strings.h
++++ b/src/svgtiny_strings.h
+@@ -12,6 +12,7 @@
+ 
+ SVGTINY_STRING_ACTION(svg)
+ SVGTINY_STRING_ACTION(viewBox)
++SVGTINY_STRING_ACTION(preserveAspectRatio)
+ SVGTINY_STRING_ACTION(a)
+ SVGTINY_STRING_ACTION(d)
+ SVGTINY_STRING_ACTION(g)
