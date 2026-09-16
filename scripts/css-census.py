@@ -119,8 +119,12 @@ def declarations(css, into):
             prelude = text.strip()
             body = ''.join(t + s for t, s in chunks[i + 1:j - 1])
             body += chunks[j - 1][0] if j - 1 < len(chunks) else ''
-            if not prelude.startswith('@font-face') and \
-               not prelude.startswith('@counter-style'):
+            # An at-rule whose body holds descriptors rather than
+            # declarations: syntax, inherits, src and the rest are not
+            # properties and counting them as missing ones is noise.
+            if not prelude.startswith(('@font-face', '@counter-style',
+                                       '@property', '@font-palette-values',
+                                       '@page', '@viewport')):
                 declarations(body, into)
             i = j
             continue
