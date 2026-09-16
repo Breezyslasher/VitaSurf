@@ -1,0 +1,21 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 92dbb74..b1e37e4 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -964,16 +964,6 @@ css_error css__language_compile_deferred(css_language *c,
+ 		return error;
+ 	}
+ 
+-	{
+-		int32_t k = 0; const css_token *tk;
+-		while ((tk = parserutils_vector_peek(subst, k)) != NULL) {
+-			fprintf(stderr, " [%d:%s]", (int) tk->type,
+-				tk->idata ? lwc_string_data(tk->idata) : "");
+-			k++;
+-		}
+-		fprintf(stderr, "\n");
+-	}
+-
+ 	error = css__stylesheet_style_create(c->sheet, &style);
+ 	if (error != CSS_OK) {
+ 		parserutils_vector_destroy(subst);

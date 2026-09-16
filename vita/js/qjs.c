@@ -3181,17 +3181,32 @@ static void end_script(jsthread *thread)
 			 thread->scripts_killed >= 2 ? 5u :
 			 (unsigned)thread->heap->timeout / 2);
 	}
-	thread->overrun_count = 0;
-	thread->deadline_ms = 0;
-	thread->aborting = false;
 	/* The outermost call is over, so nothing is still unwinding. An
 	 * exception left pending here is one that was reported already, or
 	 * the budget abort on its way out; either way the jobs below must
 	 * not start with it hanging over them. */
+	thread->overrun_count = 0;
+	thread->aborting = false;
 	if (JS_HasException(thread->ctx)) {
 		JS_FreeValue(thread->ctx, JS_GetException(thread->ctx));
 	}
-	/* run microtasks (promise jobs) the script queued */
+
+	/*
+	 * Microtasks are the same piece of work as the script that queued
+	 * them, so they answer to the same budget -- and a page does most
+	 * of its work in promise chains now, so this is where the time
+	 * goes. The deadline used to be cleared before this loop, which
+	 * left every promise job on every page running with no budget at
+	 * all: a chain that re-queues itself, Promise.resolve().then(again),
+	 * drained here forever with nothing able to stop it, and the only
+	 * mark it leaves on a log is a long gap with no lines in it.
+	 *
+	 * The deadline is armed afresh rather than carried over, because
+	 * the script's own run has already been accounted for above and a
+	 * deadline that has passed would stop the first job on a page that
+	 * did nothing wrong.
+	 */
+	rearm_deadline(thread);
 	for (;;) {
 		JSContext *c = NULL;
 		int r = JS_ExecutePendingJob(thread->heap->rt, &c);
@@ -3202,6 +3217,17 @@ static void end_script(jsthread *thread)
 			break;
 		}
 	}
+	if (thread->overrun_count > 0) {
+		thread->scripts_killed++;
+		vita_log("qjs: promise jobs stopped by the budget "
+			 "(%u on this page; the next gets %u seconds)",
+			 thread->scripts_killed,
+			 thread->scripts_killed >= 2 ? 5u :
+			 (unsigned)thread->heap->timeout / 2);
+	}
+	thread->overrun_count = 0;
+	thread->deadline_ms = 0;
+	thread->aborting = false;
 	if (thread->dom_dirty) {
 		schedule_relayout(thread, RELAYOUT_DELAY_MS);
 	}
