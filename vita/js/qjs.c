@@ -4423,6 +4423,65 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	return arr;
 }
 
+/*
+ * __vitaElementFromPoint(x, y): the element at a point in the page, in
+ * CSS pixels from the top left of the document.
+ *
+ * This answered null for every point, which is not "nothing is there"
+ * but "the question was never asked". It goes through the same hit
+ * test as a tap, so a sheet marked pointer-events: none is seen
+ * through here exactly as a finger would see through it.
+ */
+static JSValue win_vita_element_from_point(JSContext *ctx,
+					   JSValueConst this_val,
+					   int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct box *box, *found;
+	struct dom_node *node = NULL;
+	int32_t x = 0, y = 0;
+	int bx = 0, by = 0;
+
+	(void)this_val;
+	if (argc < 2 || thread == NULL || thread->htmlc == NULL) {
+		return JS_NULL;
+	}
+	if (JS_ToInt32(ctx, &x, argv[0]) != 0 ||
+	    JS_ToInt32(ctx, &y, argv[1]) != 0) {
+		return JS_NULL;
+	}
+	if (!layout_current(thread)) {
+		return JS_NULL;
+	}
+
+	box = thread->htmlc->layout;
+	if (box == NULL) {
+		return JS_NULL;
+	}
+
+	/*
+	 * Each call descends one level, so the deepest box that contains
+	 * the point is the last one returned -- which is what the click
+	 * path does too.
+	 */
+	found = box;
+	while ((box = box_at_point(&thread->htmlc->unit_len_ctx, box,
+			(int) x, (int) y, &bx, &by)) != NULL) {
+		found = box;
+	}
+
+	/* the nearest ancestor that is an element, as the spec asks */
+	while (found != NULL && found->node == NULL) {
+		found = found->parent;
+	}
+	if (found == NULL) {
+		return JS_NULL;
+	}
+	node = found->node;
+
+	return wrap_node(ctx, node);
+}
+
 static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
@@ -4711,6 +4770,9 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_find, "__vitaFind", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaElementFromPoint",
+			  JS_NewCFunction(ctx, win_vita_element_from_point,
+					  "__vitaElementFromPoint", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaStyle",
 			  JS_NewCFunction(ctx, win_vita_style, "__vitaStyle", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaScroll",

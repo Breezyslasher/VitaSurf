@@ -948,7 +948,14 @@ D.createRange=function(){var r={startContainer:D.body,endContainer:D.body,startO
 D.open=function(){return D;};D.close=function(){};D.writeln=D.writeln||function(){};
 /* No hit testing is exposed here. Null is what a browser returns for a
  * point with nothing at it, so callers already handle it. */
-D.elementFromPoint=function(){return null;};D.elementsFromPoint=function(){return [];};
+/* The hit test a tap uses, so a sheet marked pointer-events: none is
+   seen through here as a finger would see through it. The point is
+   given in client coordinates, so the scroll offset goes back on. */
+D.elementFromPoint=function(x,y){
+ if(!W.__vitaElementFromPoint)return null;
+ var s=viewport();
+ return W.__vitaElementFromPoint(Math.round(x)+s[0],Math.round(y)+s[1])||null;};
+D.elementsFromPoint=function(x,y){var e=D.elementFromPoint(x,y);return e?[e]:[];};
 D.importNode=function(n,deep){return n&&n.cloneNode?n.cloneNode(!!deep):n;};
 D.adoptNode=function(n){return n;};
 D.execCommand=function(){return false;};
