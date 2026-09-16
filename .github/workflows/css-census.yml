@@ -16,21 +16,23 @@ jobs:
   census:
     runs-on: ubuntu-latest
     steps:
+      # Only libcss is wanted here, and checking out all sixteen
+      # submodules puts a hundred lines of bookkeeping after the report.
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: false
 
-      - name: Apply the patch series
-        # The properties this project adds to libcss are in patches/, not
-        # in the pinned submodule, so without this the census counts them
-        # all as missing.
+      - name: Fetch and patch libcss
+        # The properties this project adds to libcss live in patches/,
+        # not in the pinned submodule, so without this the census counts
+        # every one of them as missing.
         run: |
           set -eu
-          scripts/apply-patches.sh > /tmp/patches.log || {
-            cat /tmp/patches.log
-            exit 1
-          }
-          echo "applied $(grep -c PATCH /tmp/patches.log) patches"
+          git submodule update --init --depth 1 deps/libcss
+          for patch in patches/*-libcss-*.patch; do
+            git -C deps/libcss apply "$patch"
+          done
+          echo "applied $(ls patches/*-libcss-*.patch | wc -l) libcss patches"
 
       - name: Count what is understood and what is dropped
         run: python3 scripts/css-census.py fixtures/css-census.txt
