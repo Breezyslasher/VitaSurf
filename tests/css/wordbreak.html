@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>word breaking</title><style>
+ body { margin: 0; font: 16px sans-serif; }
+ div { width: 100px; border: 0; }
+ #plain { }
+ #wrap  { overflow-wrap: break-word; }
+ #all   { word-break: break-all; }
+</style></head>
+<body>
+<div id="plain">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+<div id="wrap">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+<div id="all">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+<pre id="out"></pre>
+<script>
+/* A word wider than its box runs out of the box unless the style says
+   it may be broken. Neither property existed, so it always ran out. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function lines(id){
+  var e = document.getElementById(id);
+  return Math.round(e.getBoundingClientRect().height / 19) > 1;
+}
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('a long word stays on one line by default', !lines('plain'));
+  T('overflow-wrap breaks it', lines('wrap'));
+  T('word-break breaks it', lines('all'));
+}, 200); });
+</script></body></html>
