@@ -1194,7 +1194,13 @@ function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(va
  case 'height':return h===n;case 'min-height':return h>=n;case 'max-height':return h<=n;
  case 'aspect-ratio':case 'min-aspect-ratio':case 'max-aspect-ratio':{var p=String(value).split('/'),r=parseFloat(p[0])/(parseFloat(p[1])||1),a=w/(h||1);return name==='min-aspect-ratio'?a>=r:name==='max-aspect-ratio'?a<=r:Math.abs(a-r)<0.001;}
  case 'orientation':return value===(w>=h?'landscape':'portrait');
- case 'prefers-color-scheme':return value==='light'||value==='no-preference';
+ /* the same answer the stylesheets get: qjs.c sets __vitaDarkMode from
+    the option the Start menu toggles, so matchMedia and the CSS
+    cannot disagree about which theme a site should use */
+ case 'prefers-color-scheme':
+  if(value===''||value===undefined)return true;
+  return W.__vitaDarkMode?value==='dark':
+   (value==='light'||value==='no-preference');
  case 'prefers-reduced-motion':return value==='reduce'||value==='no-preference';
  case 'prefers-contrast':case 'forced-colors':case 'inverted-colors':return value==='no-preference'||value==='none';
  case 'pointer':case 'any-pointer':return value==='coarse';

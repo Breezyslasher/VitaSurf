@@ -69,6 +69,7 @@ enum item {
 	ITEM_ZOOM_RESET,
 	ITEM_JAVASCRIPT,
 	ITEM_IMAGES,
+	ITEM_DARK_MODE,
 	ITEM_QUIT,
 	ITEM_CLOSE,
 	ITEM_COUNT
@@ -562,6 +563,18 @@ static void activate(enum item item)
 		save_choices();
 		update_labels();
 		break;
+	case ITEM_DARK_MODE:
+		/*
+		 * What prefers-color-scheme answers, to the stylesheets
+		 * and to matchMedia alike. Both read it when a page is
+		 * created, so it takes effect on the next page rather
+		 * than on this one.
+		 */
+		nsoption_set_bool(prefer_dark_mode,
+				  !nsoption_bool(prefer_dark_mode));
+		save_choices();
+		update_labels();
+		break;
 	case ITEM_QUIT:
 		vita_menu_close();
 		vita_menu_autosave(true);
@@ -639,6 +652,10 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_IMAGES:
 		snprintf(buf, len, "Images: %s (new pages)",
 			 nsoption_bool(foreground_images) ? "on" : "off");
+		break;
+	case ITEM_DARK_MODE:
+		snprintf(buf, len, "Dark mode: %s (new pages)",
+			 nsoption_bool(prefer_dark_mode) ? "on" : "off");
 		break;
 	case ITEM_QUIT:
 		snprintf(buf, len, "Quit VitaSurf");

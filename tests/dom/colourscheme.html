@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>colour scheme</title><style>
+  #box   { width: 100px; height: 20px; background: red; }
+  #plain { width: 100px; height: 20px; background: red; }
+  @media (prefers-color-scheme: light) { #box { background: rgb(0,128,0); } }
+  @media (prefers-color-scheme: dark)  { #box { background: rgb(0,0,255); } }
+  /* a bare feature query: true when the browser has any preference */
+  @media (prefers-color-scheme) { #plain { background: rgb(0,128,0); } }
+</style></head>
+<body><pre id="out"></pre><div id="box"></div><div id="plain"></div>
+<script>
+/* One of the two blocks must win, and the same one matchMedia names.
+   The browser runs light unless the Start menu turns dark mode on, so
+   that is what the comparison browser is matched against; run nsmonkey
+   with --prefer_dark_mode=1 to see the other block win instead. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function bg(id){ return getComputedStyle(document.getElementById(id)).backgroundColor; }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('a colour scheme block matched', bg('box') !== 'rgb(255, 0, 0)');
+  T('the bare feature matched', bg('plain') !== 'rgb(255, 0, 0)');
+  T('light and dark disagree',
+    matchMedia('(prefers-color-scheme: light)').matches !==
+    matchMedia('(prefers-color-scheme: dark)').matches);
+  T('the colour scheme in force',
+    matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+  T('the block that won', bg('box'));
+  T('the CSS agrees with matchMedia',
+    (bg('box') === 'rgb(0, 128, 0)') ===
+    matchMedia('(prefers-color-scheme: light)').matches);
+}, 200); });
+</script></body></html>

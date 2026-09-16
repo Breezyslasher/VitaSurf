@@ -34,6 +34,7 @@
 
 #include "utils/errors.h"
 #include "utils/utils.h"
+#include "utils/nsoption.h"
 #include "utils/nsurl.h"
 #include "utils/corestrings.h"
 #include "netsurf/browser_window.h"
@@ -4685,6 +4686,10 @@ static void setup_globals(jsthread *thread)
 					  "__vitaCreateIn", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaScrollTo",
 			  JS_NewCFunction(ctx, win_vita_scroll_to, "__vitaScrollTo", 2));
+	/* what prefers-color-scheme answers, so matchMedia and the
+	 * stylesheets cannot disagree */
+	JS_SetPropertyStr(ctx, global, "__vitaDarkMode",
+			  nsoption_bool(prefer_dark_mode) ? JS_TRUE : JS_FALSE);
 	JS_SetPropertyStr(ctx, global, "__vitaStoreLoad",
 			  JS_NewCFunction(ctx, win_vita_store_load,
 					  "__vitaStoreLoad", 0));
