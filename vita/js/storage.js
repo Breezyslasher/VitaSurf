@@ -401,11 +401,11 @@ Target.prototype = {
   var on = this['on' + e.type];
   if (typeof on === 'function') {
    try { on.call(this, e); }
-   catch (err) { if (!first) first = err; report(err); }
+   catch (err) { if (!first) first = err; report(err, 'on' + e.type); }
   }
   (this._l[e.type] || []).slice().forEach(function(f){
    try { f.call(self, e); }
-   catch (err) { if (!first) first = err; report(err); }
+   catch (err) { if (!first) first = err; report(err, e.type + ' listener'); }
   });
   /* An upgrade handler that throws must take the transaction with it,
      as it does in a browser. Swallowed, it left a database registered
@@ -417,9 +417,17 @@ Target.prototype = {
   return true;
  }
 };
-function report(err){
- if (W.__vitaReportError) W.__vitaReportError(err);
- else if (W.console && console.error) console.error(err);
+/*
+ * Say where it came from. An error thrown by one of these handlers went
+ * to the page's error reporter with no indication that it came from a
+ * database event, and claude.ai's "TypeError: not a function" was
+ * indistinguishable from an error in its own script. The second
+ * argument is the script name the reporter shows.
+ */
+function report(err, where){
+ var label = 'indexedDB ' + (where || 'event handler');
+ if (W.__vitaReportError) W.__vitaReportError(err, label);
+ else if (W.console && console.error) console.error(label, err);
 }
 function mkEvent(type){
  var e;

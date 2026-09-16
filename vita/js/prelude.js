@@ -4753,7 +4753,15 @@ W.__vitaReportError=function(err,where){
  }catch(e4){}
  try{__vitaDispatch(null,ev);}catch(e5){}
  if(!handled&&!ev.defaultPrevented){
-  try{console.error('uncaught: '+describeThrown(err)+
+  /* Where the caller said it came from, when that is a description
+     rather than a URL. The stack frame below overwrites `file', so a
+     caller that named a subsystem -- a database event handler, say --
+     had its label thrown away and the error looked like any other. */
+  var from='';
+  try{var w=where?String(where):'';
+   if(w&&w.indexOf('://')<0&&w.charAt(0)!=='/'&&w!==String(location.href))from=w;
+  }catch(e7){}
+  try{console.error('uncaught'+(from?' in '+from:'')+': '+describeThrown(err)+
    (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}}
  return handled;};
 /* An unhandled promise rejection, reported the same way. QuickJS hands
