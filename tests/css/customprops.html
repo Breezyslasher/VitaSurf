@@ -26,8 +26,7 @@ window.addEventListener('load',function(){setTimeout(function(){
 </script></body></html>
 
 <!--
-  Custom properties are collected from document level :root, html, body
-  and * rules into one table, so a variable an element declares for
-  itself, or one built from another, does not resolve. Two facts here
-  differ from a browser for that reason.
+  A variable an element declares for itself, and one built from another,
+  both resolve: they are gathered during the cascade rather than when
+  the sheet is read.
 -->

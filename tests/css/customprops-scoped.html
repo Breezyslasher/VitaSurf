@@ -18,8 +18,7 @@ window.addEventListener('load',function(){setTimeout(function(){
 </script></body></html>
 
 <!--
-  A variable a component declares for its own subtree does not resolve,
-  which is how YouTube themes its search bar: the page level variables
-  work and the component ones do not, so its chrome comes out as dark
-  boxes on a light page. The second fact here differs for that reason.
+  A variable a component declares for its own subtree reaches its
+  children, which is how a modern site themes a component; YouTube's
+  search bar is built this way.
 -->
