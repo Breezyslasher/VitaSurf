@@ -30,7 +30,7 @@ jobs:
           set -eu
           git submodule update --init --depth 1 deps/libcss
           for patch in patches/*-libcss-*.patch; do
-            git -C deps/libcss apply "$patch"
+            git -C deps/libcss apply "$PWD/$patch"
           done
           echo "applied $(ls patches/*-libcss-*.patch | wc -l) libcss patches"
 
