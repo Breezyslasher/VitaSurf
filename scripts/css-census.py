@@ -99,8 +99,14 @@ def split_top(text):
 
 PROP = re.compile(r'^(--[\w-]+|-?[A-Za-z_][\w-]*)$')
 
+# Every function called in a value. A property libcss knows is still
+# dropped when its value is written in a syntax libcss does not, and
+# counting only property names cannot see that: oklch() hid there for
+# months, taking every colour on a Tailwind 4 site with it.
+FUNC = re.compile(r'(?<![\w-])(-?[A-Za-z_][\w-]*)\(')
 
-def declarations(css, into):
+
+def declarations(css, into, funcs):
     """Walk a stylesheet, counting every property name it declares."""
     stack, chunks = [], split_top(strip_comments(css))
     i = 0
@@ -125,16 +131,18 @@ def declarations(css, into):
             if not prelude.startswith(('@font-face', '@counter-style',
                                        '@property', '@font-palette-values',
                                        '@page', '@viewport')):
-                declarations(body, into)
+                declarations(body, into, funcs)
             i = j
             continue
         if sep == '}':
             i += 1
             continue
-        head, _, _rest = text.partition(':')
+        head, _, value = text.partition(':')
         name = head.strip().lower()
         if PROP.match(name):
             into[name] = into.get(name, 0) + 1
+            for fn in FUNC.findall(value.lower()):
+                funcs[fn] = funcs.get(fn, 0) + 1
         i += 1
     return into
 
@@ -183,7 +191,7 @@ def main(argv):
     known = known_properties()
     print('libcss knows %d properties\n' % len(known))
 
-    total, sites = {}, {}
+    total, sites, functions = {}, {}, {}
     for url in urls:
         print('== %s' % url)
         try:
@@ -191,9 +199,11 @@ def main(argv):
         except (urllib.error.URLError, OSError, ValueError) as e:
             print('  ! %s' % e)
             continue
-        here = {}
+        here, here_fn = {}, {}
         for name, css in sheets:
-            declarations(css, here)
+            declarations(css, here, here_fn)
+        for fn, count in here_fn.items():
+            functions[fn] = functions.get(fn, 0) + count
         n = sum(here.values())
         miss = {p: c for p, c in here.items()
                 if p not in known and not p.startswith('--')}
@@ -222,6 +232,22 @@ def main(argv):
                            % (len(ranked) - len(shown), cutoff)))
     print('%8d %6s  %s' % (sum(c for p, c in total.items() if vendor(p)), '-',
                            'in vendor prefixed properties, not counted above'))
+
+    # The functions libcss's value parsers understand. A name that is not
+    # here is one to look at: either the value is dropped, or the
+    # function is one this list has not been told about yet.
+    KNOWN = {
+        'rgb', 'rgba', 'hsl', 'hsla', 'hwb', 'oklch', 'oklab', 'lab',
+        'lch', 'color-mix', 'url', 'var', 'calc', 'attr', 'counter',
+        'counters', 'format', 'local', 'rect', 'minmax', 'repeat',
+        'fit-content', 'linear-gradient', 'radial-gradient',
+    }
+    print('\n== functions called in values, ones libcss knows marked')
+    print('%8s  %s' % ('uses', 'function'))
+    for fn, count in sorted(functions.items(), key=lambda kv: -kv[1]):
+        if count < cutoff:
+            continue
+        print('%8d  %-24s %s' % (count, fn, 'known' if fn in KNOWN else ''))
     return 0
 
 
