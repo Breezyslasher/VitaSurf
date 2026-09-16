@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fill and stroke from a stylesheet</title>
+<style>
+  body { margin: 0; background: #ffffff; }
+  .current { color: #ff0000; fill: currentColor; }
+  .named   { fill: #00ff00; }
+  .gone    { fill: none; }
+  svg { display: block; width: 20px; height: 20px; }
+</style>
+
+<!-- 1: fill follows the text colour -->
+<svg class="current" viewBox="0 0 10 10"><rect x="0" y="0" width="10" height="10"/></svg>
+
+<!-- 2: fill named outright -->
+<svg class="named" viewBox="0 0 10 10"><rect x="0" y="0" width="10" height="10"/></svg>
+
+<!-- 3: the graphic's own attribute, no stylesheet -->
+<svg viewBox="0 0 10 10"><rect x="0" y="0" width="10" height="10" fill="#0000ff"/></svg>
+
+<!-- 4: a shape that says its own colour beats the stylesheet's -->
+<svg class="named" viewBox="0 0 10 10"><rect x="0" y="0" width="10" height="10" fill="#ff00ff"/></svg>
+
+<!-- 5: a stylesheet that asks for nothing to be painted -->
+<svg class="gone" viewBox="0 0 10 10"><rect x="0" y="0" width="10" height="10"/></svg>
+
+<!-- 6: stroke from the stylesheet, nothing filled -->
+<svg class="gone" style="stroke: #123456" viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8"/></svg>
