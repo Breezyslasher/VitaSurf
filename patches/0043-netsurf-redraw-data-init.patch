@@ -1,0 +1,83 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 3329a6fbf..4648df1f0 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -877,7 +877,7 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 			}
+ 			/* valid clipping rectangles only */
+ 			if ((r.x0 < r.x1) && (r.y0 < r.y1)) {
+-				struct content_redraw_data bg_data;
++				struct content_redraw_data bg_data = { 0 };
+ 
+ 				res = ctx->plot->clip(ctx, &r);
+ 				if (res != NSERROR_OK) {
+@@ -1039,7 +1039,7 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 		}
+ 		/* valid clipping rectangles only */
+ 		if ((r.x0 < r.x1) && (r.y0 < r.y1)) {
+-			struct content_redraw_data bg_data;
++			struct content_redraw_data bg_data = { 0 };
+ 
+ 			res = ctx->plot->clip(ctx, &r);
+ 			if (res != NSERROR_OK) {
+@@ -1877,7 +1877,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	}
+ 
+ 	if (box->object && width != 0 && height != 0) {
+-		struct content_redraw_data obj_data;
++		struct content_redraw_data obj_data = { 0 };
+ 
+ 		x_scrolled = x - scrollbar_get_offset(box->scroll_x) * scale;
+ 		y_scrolled = y - scrollbar_get_offset(box->scroll_y) * scale;
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 226741be5..6d791fbe4 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -2588,7 +2588,7 @@ browser_window_redraw(struct browser_window *bw,
+ 	int height = 0;
+ 	bool plot_ok = true;
+ 	content_type content_type;
+-	struct content_redraw_data data;
++	struct content_redraw_data data = { 0 };
+ 	struct rect content_clip;
+ 	nserror res;
+ 
+diff --git a/desktop/print.c b/desktop/print.c
+index e90e322ac..cf1e599cb 100644
+--- a/desktop/print.c
++++ b/desktop/print.c
+@@ -177,7 +177,7 @@ bool print_draw_next_page(const struct printer *printer,
+ 		struct print_settings *settings)
+ {
+ 	struct rect clip;
+-	struct content_redraw_data data;
++	struct content_redraw_data data = { 0 };
+ 	struct redraw_context ctx = {
+ 		.interactive = false,
+ 		.background_images = !nsoption_bool(remove_backgrounds),
+diff --git a/desktop/treeview.c b/desktop/treeview.c
+index 5a9c1389f..057440c21 100644
+--- a/desktop/treeview.c
++++ b/desktop/treeview.c
+@@ -3003,7 +3003,7 @@ treeview_redraw(treeview *tree,
+ 		const struct redraw_context *ctx)
+ {
+ 	struct redraw_context new_ctx = *ctx;
+-	struct content_redraw_data data;
++	struct content_redraw_data data = { 0 };
+ 	struct rect r;
+ 	struct rect rect;
+ 	int render_y = y;
+diff --git a/content/content.c b/content/content.c
+index 78c9bfb00..e95af4ff4 100644
+--- a/content/content.c
++++ b/content/content.c
+@@ -656,7 +656,7 @@ content_scaled_redraw(struct hlcache_handle *h,
+ 	struct content *c = hlcache_handle_get_content(h);
+ 	struct redraw_context new_ctx = *ctx;
+ 	struct rect clip;
+-	struct content_redraw_data data;
++	struct content_redraw_data data = { 0 };
+ 	bool plot_ok = true;
+ 
+ 	assert(c != NULL);

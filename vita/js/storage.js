@@ -394,23 +394,40 @@ Target.prototype = {
   if (!this._l[t]) return;
   this._l[t] = this._l[t].filter(function(g){ return g !== f; });
  },
- dispatchEvent: function(e){
-  var self = this;
+ dispatchEvent: function(e, rethrow){
+  var self = this, first = null;
   e.target = e.target || this;
   e.currentTarget = this;
   var on = this['on' + e.type];
   if (typeof on === 'function') {
-   try { on.call(this, e); } catch (err) { report(err); }
+   try { on.call(this, e); }
+   catch (err) { if (!first) first = err; report(err, 'on' + e.type); }
   }
   (this._l[e.type] || []).slice().forEach(function(f){
-   try { f.call(self, e); } catch (err) { report(err); }
+   try { f.call(self, e); }
+   catch (err) { if (!first) first = err; report(err, e.type + ' listener'); }
   });
+  /* An upgrade handler that throws must take the transaction with it,
+     as it does in a browser. Swallowed, it left a database registered
+     with none of the stores it was about to make, and every later open
+     saw a database that existed and skipped the upgrade: claude.ai got
+     "NotFoundError: no store keyval" on six databases, on every load,
+     for good. */
+  if (rethrow && first) throw first;
   return true;
  }
 };
-function report(err){
- if (W.__vitaReportError) W.__vitaReportError(err);
- else if (W.console && console.error) console.error(err);
+/*
+ * Say where it came from. An error thrown by one of these handlers went
+ * to the page's error reporter with no indication that it came from a
+ * database event, and claude.ai's "TypeError: not a function" was
+ * indistinguishable from an error in its own script. The second
+ * argument is the script name the reporter shows.
+ */
+function report(err, where){
+ var label = 'indexedDB ' + (where || 'event handler');
+ if (W.__vitaReportError) W.__vitaReportError(err, label);
+ else if (W.console && console.error) console.error(label, err);
 }
 function mkEvent(type){
  var e;
@@ -1005,14 +1022,14 @@ IDBDatabase.prototype.createObjectStore = function(name, options){
   this._upgradeTx.objectStoreNames.push(name);
   this._upgradeTx.objectStoreNames.sort();
  }
- touch();
+ /* not written here: the upgrade transaction completing is what makes
+    any of this real, and an upgrade that fails should leave nothing */
  return this._upgradeTx.objectStore(name);
 };
 IDBDatabase.prototype.deleteObjectStore = function(name){
  if (!this._upgradeTx) throw DOMEx('InvalidStateError', 'stores are removed while upgrading');
  delete this._data.stores[String(name)];
  this.objectStoreNames = Object.keys(this._data.stores).sort();
- touch();
 };
 
 /* ---- the factory ---- */
@@ -1042,10 +1059,21 @@ IDBFactory.prototype = {
   Promise.resolve().then(function(){
    var data = all[name];
    var existed = !!data;
+   /*
+    * A database with no object stores at all is one whose upgrade never
+    * finished. A browser would not have created it; this did, and wrote
+    * it to the card, so every later open found it, skipped the upgrade
+    * and failed on the store that was never made. Treat it as absent so
+    * the upgrade runs again -- which also recovers the cards already
+    * carrying one.
+    */
+   if (existed && version === undefined &&
+       Object.keys(data.stores).length === 0) {
+    existed = false;
+   }
    var oldVersion = existed ? data.version : 0;
    if (!existed) {
     data = { version: version === undefined ? 1 : version, stores: {} };
-    all[name] = data;
    }
    var want = version === undefined ? data.version : version;
    if (want < oldVersion) {
@@ -1065,21 +1093,32 @@ IDBFactory.prototype = {
     ev.target = req;
     req.result = db;
     req.transaction = tx;
-    req.dispatchEvent(ev);
+    /* in the store while the upgrade runs, so that a second open of the
+       same name shares it, but not written to the card until it works */
+    all[name] = data;
+    try {
+     req.dispatchEvent(ev, true);
+    } catch (err) {
+     if (!existed) delete all[name];
+     db._upgradeTx = null;
+     req.transaction = null;
+     fail(req, err);
+     return;
+    }
     tx.addEventListener('complete', function(){
      db._upgradeTx = null;
      req.transaction = null;
-     touch();
+     touch();			/* only a finished upgrade is written */
      succeed(req, db);
     });
     tx.addEventListener('abort', function(){
+     if (!existed) delete all[name];
      db._upgradeTx = null;
      fail(req, tx.error);
     });
     tx._drain();
     return;
    }
-   touch();
    succeed(req, db);
   });
   return req;

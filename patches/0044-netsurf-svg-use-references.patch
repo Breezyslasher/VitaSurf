@@ -1,0 +1,379 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 8fcce971b..659768f83 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -2017,6 +2017,9 @@ static dom_string *svg_qualified_name(dom_node *node)
+ 
+ 
+ static void svg_serialise_node(struct svg_buf *b, dom_node *node, bool root);
++static void svg_serialise_open(struct svg_buf *b, dom_node *node);
++static void svg_serialise_children(struct svg_buf *b, dom_node *node);
++static void svg_serialise_close(struct svg_buf *b, dom_node *node);
+ 
+ /** Write the attributes of an element, and the root's namespaces. */
+ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+@@ -2133,6 +2136,7 @@ static void svg_serialise_node(struct svg_buf *b, dom_node *node, bool root)
+ 		       dom_string_byte_length(name));
+ 	svg_serialise_attributes(b, node, root);
+ 	svg_buf_lit(b, ">");
++	dom_string_unref(name);
+ 
+ 	exc = dom_node_get_first_child(node, &child);
+ 	if (exc == DOM_NO_ERR) {
+@@ -2149,15 +2153,317 @@ static void svg_serialise_node(struct svg_buf *b, dom_node *node, bool root)
+ 		}
+ 	}
+ 
+-	/* always a closing tag: shorter than deciding when one is safe */
+-	svg_buf_lit(b, "</");
++	svg_serialise_close(b, node);
++}
++
++/** Write an element's opening tag, with its namespaces if it is the root. */
++static void svg_serialise_open(struct svg_buf *b, dom_node *node)
++{
++	dom_string *name = svg_qualified_name(node);
++
++	if (name == NULL) {
++		return;
++	}
++	svg_buf_lit(b, "<");
+ 	svg_buf_append(b, dom_string_data(name),
+ 		       dom_string_byte_length(name));
++	svg_serialise_attributes(b, node, true);
+ 	svg_buf_lit(b, ">");
++	dom_string_unref(name);
++}
++
++/** Write an element's children, but not the element itself. */
++static void svg_serialise_children(struct svg_buf *b, dom_node *node)
++{
++	dom_node *child;
+ 
++	if (dom_node_get_first_child(node, &child) != DOM_NO_ERR) {
++		return;
++	}
++	while (child != NULL) {
++		dom_node *next = NULL;
++
++		svg_serialise_node(b, child, false);
++		if (dom_node_get_next_sibling(child, &next) != DOM_NO_ERR) {
++			dom_node_unref(child);
++			return;
++		}
++		dom_node_unref(child);
++		child = next;
++	}
++}
++
++/** Write an element's closing tag. Always one: deciding is not worth it. */
++static void svg_serialise_close(struct svg_buf *b, dom_node *node)
++{
++	dom_string *name = svg_qualified_name(node);
++
++	if (name == NULL) {
++		return;
++	}
++	svg_buf_lit(b, "</");
++	svg_buf_append(b, dom_string_data(name),
++		       dom_string_byte_length(name));
++	svg_buf_lit(b, ">");
+ 	dom_string_unref(name);
+ }
+ 
++
++/**
++ * Does this subtree contain anything that would be painted?
++ *
++ * A page that keeps its icons in one hidden <svg><defs> gets an element
++ * that draws nothing, and turning each of those into an image costs a
++ * copy of every icon in the sprite for no pixels at all. YouTube ships
++ * several (VitaSurf).
++ */
++static bool svg_paints_something(dom_node *node, unsigned int depth)
++{
++	dom_node *child;
++	bool found = false;
++
++	if (depth > 8) {
++		return true; /* too deep to tell: assume it does */
++	}
++
++	if (dom_node_get_first_child(node, &child) != DOM_NO_ERR) {
++		return false;
++	}
++
++	while (child != NULL && found == false) {
++		dom_node *next = NULL;
++		dom_node_type type = DOM_ELEMENT_NODE;
++		dom_string *name;
++
++		if (dom_node_get_node_type(child, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE) {
++			name = svg_qualified_name(child);
++			if (name != NULL) {
++				const char *n = dom_string_data(name);
++				size_t len = dom_string_byte_length(name);
++
++				if ((len == SLEN("defs") &&
++				     strncmp(n, "defs", len) == 0) ||
++				    (len == SLEN("symbol") &&
++				     strncmp(n, "symbol", len) == 0) ||
++				    (len == SLEN("title") &&
++				     strncmp(n, "title", len) == 0) ||
++				    (len == SLEN("desc") &&
++				     strncmp(n, "desc", len) == 0) ||
++				    (len == SLEN("metadata") &&
++				     strncmp(n, "metadata", len) == 0) ||
++				    (len == SLEN("style") &&
++				     strncmp(n, "style", len) == 0) ||
++				    (len == SLEN("script") &&
++				     strncmp(n, "script", len) == 0)) {
++					/* never painted where it stands */
++				} else if (len == SLEN("g") &&
++					   strncmp(n, "g", len) == 0) {
++					found = svg_paints_something(child,
++							depth + 1);
++				} else {
++					found = true;
++				}
++				dom_string_unref(name);
++			}
++		}
++
++		if (dom_node_get_next_sibling(child, &next) != DOM_NO_ERR) {
++			dom_node_unref(child);
++			return found;
++		}
++		dom_node_unref(child);
++		child = next;
++	}
++
++	return found;
++}
++
++
++/*
++ * A <use> may point at a shape defined somewhere else in the page.
++ *
++ * Sites keep one hidden <svg> holding a <defs> of every icon and then
++ * refer to them by id, which is how YouTube draws its Home, Shorts and
++ * Library icons. Copying only the element's own subtree left those
++ * references pointing at nothing, so the icons came out blank. The
++ * referenced elements are gathered and written into the markup that is
++ * handed on, where the reference resolves again.
++ */
++
++#define SVG_MAX_REFS 64
++
++struct svg_refs {
++	dom_node *root;			/**< the element being written out */
++	dom_node *node[SVG_MAX_REFS];
++	unsigned int count;
++	bool full;
++};
++
++/** Is \a node inside \a root, or root itself? */
++static bool svg_node_contains(dom_node *root, dom_node *node)
++{
++	dom_node *walk = node;
++	unsigned int guard = 0;
++
++	if (root == NULL || node == NULL) {
++		return false;
++	}
++
++	dom_node_ref(walk);
++	while (walk != NULL && guard++ < 64) {
++		dom_node *parent = NULL;
++
++		if (walk == root) {
++			dom_node_unref(walk);
++			return true;
++		}
++		if (dom_node_get_parent_node(walk, &parent) != DOM_NO_ERR) {
++			dom_node_unref(walk);
++			return false;
++		}
++		dom_node_unref(walk);
++		walk = parent;
++	}
++	if (walk != NULL) {
++		dom_node_unref(walk);
++	}
++	return false;
++}
++
++static void svg_refs_collect(struct svg_refs *refs, dom_document *doc,
++			     dom_node *node, unsigned int depth);
++
++/** Note one id, unless it is already known. */
++static void svg_refs_add(struct svg_refs *refs, dom_document *doc,
++			 dom_string *id, unsigned int depth)
++{
++	dom_element *target = NULL;
++	unsigned int i;
++
++	if (refs->full || doc == NULL || id == NULL ||
++	    dom_string_byte_length(id) < 2 ||
++	    dom_string_data(id)[0] != '#') {
++		return;
++	}
++
++	/* the id itself, without the leading hash */
++	{
++		dom_string *bare = NULL;
++
++		if (dom_string_substr(id, 1, dom_string_length(id),
++				      &bare) != DOM_NO_ERR || bare == NULL) {
++			return;
++		}
++		if (dom_document_get_element_by_id(doc, bare,
++				&target) != DOM_NO_ERR) {
++			target = NULL;
++		}
++		dom_string_unref(bare);
++	}
++
++	if (target == NULL) {
++		return;
++	}
++
++	for (i = 0; i < refs->count; i++) {
++		if (refs->node[i] == (dom_node *) target) {
++			dom_node_unref(target);
++			return;
++		}
++	}
++
++	/*
++	 * Something the element already contains needs no copy, and
++	 * copying it would define the same id twice.
++	 */
++	if (svg_node_contains(refs->root, (dom_node *) target)) {
++		dom_node_unref(target);
++		return;
++	}
++
++	if (refs->count == SVG_MAX_REFS) {
++		refs->full = true;
++		dom_node_unref(target);
++		return;
++	}
++
++	refs->node[refs->count++] = (dom_node *) target;
++
++	/* what it refers to may refer on in turn */
++	svg_refs_collect(refs, doc, (dom_node *) target, depth + 1);
++}
++
++/** Walk a subtree noting every id a <use> refers to. */
++static void svg_refs_collect(struct svg_refs *refs, dom_document *doc,
++			     dom_node *node, unsigned int depth)
++{
++	dom_node *child;
++	dom_string *href = NULL;
++	dom_node_type type = DOM_ELEMENT_NODE;
++
++	if (refs->full || depth > 8) {
++		return;
++	}
++	if (dom_node_get_node_type(node, &type) != DOM_NO_ERR ||
++	    type != DOM_ELEMENT_NODE) {
++		return;
++	}
++
++	/*
++	 * Either spelling. xlink:href is the older one and still the
++	 * commoner in the wild, and it is a namespaced attribute, so it
++	 * has to be asked for by namespace rather than by the name it
++	 * was written under.
++	 */
++	if (dom_element_get_attribute(node, corestring_dom_href,
++			&href) == DOM_NO_ERR && href != NULL) {
++		svg_refs_add(refs, doc, href, depth);
++		dom_string_unref(href);
++	} else {
++		dom_string *ns = NULL;
++
++		if (dom_string_create(
++				(const uint8_t *) "http://www.w3.org/1999/xlink",
++				SLEN("http://www.w3.org/1999/xlink"),
++				&ns) == DOM_NO_ERR) {
++			if (dom_element_get_attribute_ns(node, ns,
++					corestring_dom_href,
++					&href) == DOM_NO_ERR && href != NULL) {
++				svg_refs_add(refs, doc, href, depth);
++				dom_string_unref(href);
++			}
++			dom_string_unref(ns);
++		}
++	}
++
++	if (dom_node_get_first_child(node, &child) != DOM_NO_ERR) {
++		return;
++	}
++	while (child != NULL) {
++		dom_node *next = NULL;
++
++		svg_refs_collect(refs, doc, child, depth);
++		if (dom_node_get_next_sibling(child, &next) != DOM_NO_ERR) {
++			dom_node_unref(child);
++			return;
++		}
++		dom_node_unref(child);
++		child = next;
++	}
++}
++
++static void svg_refs_free(struct svg_refs *refs)
++{
++	unsigned int i;
++
++	for (i = 0; i < refs->count; i++) {
++		dom_node_unref(refs->node[i]);
++	}
++	refs->count = 0;
++}
++
++
+ /**
+  * Special case: an <svg> element written inline in the page.
+  */
+@@ -2192,7 +2498,35 @@ box_svg(dom_node *n,
+ 		return true;
+ 	}
+ 
+-	svg_serialise_node(&buf, n, true);
++	if (svg_paints_something(n, 0) == false) {
++		return true;
++	}
++
++	{
++		/*
++		 * Anything a <use> in here points at is written into the
++		 * markup too, inside a <defs> of its own, so the
++		 * reference still resolves once the element stands
++		 * alone.
++		 */
++		struct svg_refs refs = { n, { NULL }, 0, false };
++		unsigned int i;
++
++		svg_refs_collect(&refs, content->document, n, 0);
++
++		svg_serialise_open(&buf, n);
++		if (refs.count > 0) {
++			svg_buf_lit(&buf, "<defs>");
++			for (i = 0; i < refs.count; i++) {
++				svg_serialise_node(&buf, refs.node[i], false);
++			}
++			svg_buf_lit(&buf, "</defs>");
++		}
++		svg_serialise_children(&buf, n);
++		svg_serialise_close(&buf, n);
++
++		svg_refs_free(&refs);
++	}
+ 	if (buf.oom || buf.data == NULL) {
+ 		free(buf.data);
+ 		return !buf.oom;

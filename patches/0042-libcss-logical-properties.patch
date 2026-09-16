@@ -1,0 +1,503 @@
+diff --git a/src/parse/properties/Makefile b/src/parse/properties/Makefile
+index d2068e9..e1947e2 100644
+--- a/src/parse/properties/Makefile
++++ b/src/parse/properties/Makefile
+@@ -54,6 +54,7 @@ DIR_SOURCES :=				\
+ 	font_family.c			\
+ 	font_weight.c			\
+ 	grid.c				\
++	logical.c			\
+ 	list_style.c			\
+ 	list_style_type.c		\
+ 	margin.c			\
+diff --git a/src/parse/properties/logical.c b/src/parse/properties/logical.c
+new file mode 100644
+index 0000000..8e3bc2b
+--- /dev/null
++++ b/src/parse/properties/logical.c
+@@ -0,0 +1,208 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2025 The NetSurf Project
++ */
++
++#include <assert.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++
++/*
++ * Logical properties (VitaSurf).
++ *
++ * padding-inline-start and its relatives name a side by the direction
++ * text runs rather than by the edge of the screen. They are written as
++ * often as the physical ones now, and every one of them was thrown
++ * away: about 1600 declarations of real spacing across the stylesheets
++ * measured here, which is why pages sat flush against the screen edge.
++ *
++ * Each is parsed as the physical property it corresponds to. That
++ * mapping is the one for horizontal writing with text running left to
++ * right, which is what this browser lays out; a right-to-left page gets
++ * its inline-start and inline-end the wrong way round, which is still
++ * better than losing the padding altogether. Resolving them properly
++ * means carrying them to the computed style and choosing there, once
++ * direction and writing-mode are known.
++ */
++
++/** Parse one value as the named physical property. */
++static css_error parse_as(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result, enum css_properties_e prop)
++{
++	switch (prop) {
++	case CSS_PROP_PADDING_TOP:
++	case CSS_PROP_PADDING_RIGHT:
++	case CSS_PROP_PADDING_BOTTOM:
++	case CSS_PROP_PADDING_LEFT:
++		return css__parse_padding_side(c, vector, ctx, result, prop);
++	case CSS_PROP_MARGIN_TOP:
++	case CSS_PROP_MARGIN_RIGHT:
++	case CSS_PROP_MARGIN_BOTTOM:
++	case CSS_PROP_MARGIN_LEFT:
++		return css__parse_margin_side(c, vector, ctx, result, prop);
++	default:
++		return css__parse_side(c, vector, ctx, result, prop);
++	}
++}
++
++/**
++ * Parse a pair shorthand: one value for both sides, or one each.
++ */
++static css_error parse_pair(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result,
++		enum css_properties_e first, enum css_properties_e second)
++{
++	int32_t orig_ctx = *ctx;
++	int32_t after_first;
++	const css_token *token;
++	css_error error;
++
++	error = parse_as(c, vector, ctx, result, first);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++
++	after_first = *ctx;
++	consumeWhitespace(vector, ctx);
++
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token != NULL && tokenIsChar(token, '!') == false) {
++		int32_t before_second = *ctx;
++
++		error = parse_as(c, vector, ctx, result, second);
++		if (error == CSS_OK) {
++			return CSS_OK;
++		}
++		*ctx = before_second;
++	}
++
++	/* only one value, so it serves for both sides */
++	*ctx = orig_ctx;
++	error = parse_as(c, vector, ctx, result, second);
++	*ctx = after_first;
++
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++	}
++
++	return error;
++}
++
++#define ALIAS(name, phys)						\
++	css_error css__parse_##name(css_language *c,			\
++			const parserutils_vector *vector, int32_t *ctx,	\
++			css_style *result)				\
++	{								\
++		return parse_as(c, vector, ctx, result, phys);		\
++	}
++
++#define PAIR(name, a, b)						\
++	css_error css__parse_##name(css_language *c,			\
++			const parserutils_vector *vector, int32_t *ctx,	\
++			css_style *result)				\
++	{								\
++		return parse_pair(c, vector, ctx, result, a, b);	\
++	}
++
++ALIAS(padding_block_start, CSS_PROP_PADDING_TOP)
++ALIAS(padding_block_end, CSS_PROP_PADDING_BOTTOM)
++ALIAS(padding_inline_start, CSS_PROP_PADDING_LEFT)
++ALIAS(padding_inline_end, CSS_PROP_PADDING_RIGHT)
++PAIR(padding_block, CSS_PROP_PADDING_TOP, CSS_PROP_PADDING_BOTTOM)
++PAIR(padding_inline, CSS_PROP_PADDING_LEFT, CSS_PROP_PADDING_RIGHT)
++
++ALIAS(margin_block_start, CSS_PROP_MARGIN_TOP)
++ALIAS(margin_block_end, CSS_PROP_MARGIN_BOTTOM)
++ALIAS(margin_inline_start, CSS_PROP_MARGIN_LEFT)
++ALIAS(margin_inline_end, CSS_PROP_MARGIN_RIGHT)
++PAIR(margin_block, CSS_PROP_MARGIN_TOP, CSS_PROP_MARGIN_BOTTOM)
++PAIR(margin_inline, CSS_PROP_MARGIN_LEFT, CSS_PROP_MARGIN_RIGHT)
++
++ALIAS(inset_block_start, CSS_PROP_TOP)
++ALIAS(inset_block_end, CSS_PROP_BOTTOM)
++ALIAS(inset_inline_start, CSS_PROP_LEFT)
++ALIAS(inset_inline_end, CSS_PROP_RIGHT)
++PAIR(inset_block, CSS_PROP_TOP, CSS_PROP_BOTTOM)
++PAIR(inset_inline, CSS_PROP_LEFT, CSS_PROP_RIGHT)
++
++#undef ALIAS
++#undef PAIR
++
++/**
++ * Parse inset: <'top'>{1,4}
++ *
++ * The values run clockwise from the top, as every other four-sided
++ * shorthand does.
++ */
++css_error css__parse_inset(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	static const enum css_properties_e sides[4] = {
++		CSS_PROP_TOP, CSS_PROP_RIGHT,
++		CSS_PROP_BOTTOM, CSS_PROP_LEFT
++	};
++	int32_t orig_ctx = *ctx;
++	int32_t start[4];
++	int32_t after[4];
++	const css_token *token;
++	css_error error;
++	int n = 0, i;
++
++	/* read as many values as the author wrote, up to four */
++	while (n < 4) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL || tokenIsChar(token, '!')) {
++			break;
++		}
++
++		start[n] = *ctx;
++		error = parse_as(c, vector, ctx, result, sides[n]);
++		if (error != CSS_OK) {
++			if (n == 0) {
++				*ctx = orig_ctx;
++				return error;
++			}
++			*ctx = start[n];
++			break;
++		}
++		after[n] = *ctx;
++		n++;
++	}
++
++	if (n == 0) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	/*
++	 * Fill in the sides the author left out by parsing the value
++	 * that stands for them a second time, under the other property.
++	 */
++	for (i = n; i < 4; i++) {
++		int32_t from = (i == 3 && n > 1) ? start[1] : start[i % n];
++		int32_t resume = *ctx;
++
++		*ctx = from;
++		error = parse_as(c, vector, ctx, result, sides[i]);
++		*ctx = resume;
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++	}
++
++	*ctx = after[n - 1];
++
++	return CSS_OK;
++}
+diff --git a/src/parse/properties/properties.c b/src/parse/properties/properties.c
+index 3880980..269c827 100644
+--- a/src/parse/properties/properties.c
++++ b/src/parse/properties/properties.c
+@@ -182,7 +182,27 @@ const css_prop_handler property_handlers[LAST_PROP + 1 - FIRST_PROP] =
+ 	css__parse_width,
+ 	css__parse_word_spacing,
+ 	css__parse_writing_mode,
+-	css__parse_z_index
++	css__parse_z_index,
++	/* Logical properties (VitaSurf) */
++	css__parse_padding_block,
++	css__parse_padding_block_start,
++	css__parse_padding_block_end,
++	css__parse_padding_inline,
++	css__parse_padding_inline_start,
++	css__parse_padding_inline_end,
++	css__parse_margin_block,
++	css__parse_margin_block_start,
++	css__parse_margin_block_end,
++	css__parse_margin_inline,
++	css__parse_margin_inline_start,
++	css__parse_margin_inline_end,
++	css__parse_inset,
++	css__parse_inset_block,
++	css__parse_inset_block_start,
++	css__parse_inset_block_end,
++	css__parse_inset_inline,
++	css__parse_inset_inline_start,
++	css__parse_inset_inline_end
+ };
+ 
+ /** Mapping from property bytecode index to bytecode unit class mask. */
+diff --git a/src/parse/properties/properties.h b/src/parse/properties/properties.h
+index 264516e..514293c 100644
+--- a/src/parse/properties/properties.h
++++ b/src/parse/properties/properties.h
+@@ -103,6 +103,66 @@ css_error css__parse_border_right_style(css_language *c,
+ css_error css__parse_border_right_width(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
++
++/* Logical properties (VitaSurf) */
++css_error css__parse_padding_block(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_padding_block_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_padding_block_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_padding_inline(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_padding_inline_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_padding_inline_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_margin_block(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_margin_block_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_margin_block_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_margin_inline(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_margin_inline_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_margin_inline_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_inset(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_inset_block(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_inset_block_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_inset_block_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_inset_inline(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_inset_inline_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_inset_inline_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++
+ css_error css__parse_border_radius(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index 2167488..3ad670f 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -261,6 +261,26 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("word-spacing"),
+ 	SMAP("writing-mode"),
+ 	SMAP("z-index"),
++	/* Logical properties (VitaSurf) */
++	SMAP("padding-block"),
++	SMAP("padding-block-start"),
++	SMAP("padding-block-end"),
++	SMAP("padding-inline"),
++	SMAP("padding-inline-start"),
++	SMAP("padding-inline-end"),
++	SMAP("margin-block"),
++	SMAP("margin-block-start"),
++	SMAP("margin-block-end"),
++	SMAP("margin-inline"),
++	SMAP("margin-inline-start"),
++	SMAP("margin-inline-end"),
++	SMAP("inset"),
++	SMAP("inset-block"),
++	SMAP("inset-block-start"),
++	SMAP("inset-block-end"),
++	SMAP("inset-inline"),
++	SMAP("inset-inline-start"),
++	SMAP("inset-inline-end"),
+ 
+ 	SMAP("inherit"),
+ 	SMAP("unset"),
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index 13009c9..8f91fd1 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -82,7 +82,20 @@ enum {
+ 	VERTICAL_ALIGN, VISIBILITY, VOICE_FAMILY, VOLUME, WHITE_SPACE, WIDOWS,
+ 	WIDTH, WORD_SPACING, WRITING_MODE, Z_INDEX,
+ 
+-	LAST_PROP = Z_INDEX,
++	/*
++	 * Logical properties (VitaSurf). The lookup is a linear scan, so
++	 * these sit at the end rather than in their alphabetical places;
++	 * only the order of this list and the string table need agree.
++	 */
++	PADDING_BLOCK, PADDING_BLOCK_START, PADDING_BLOCK_END,
++	PADDING_INLINE, PADDING_INLINE_START, PADDING_INLINE_END,
++	MARGIN_BLOCK, MARGIN_BLOCK_START, MARGIN_BLOCK_END,
++	MARGIN_INLINE, MARGIN_INLINE_START, MARGIN_INLINE_END,
++	LIBCSS_INSET, INSET_BLOCK, INSET_BLOCK_START,
++	INSET_BLOCK_END, INSET_INLINE, INSET_INLINE_START,
++	INSET_INLINE_END,
++
++	LAST_PROP = INSET_INLINE_END,
+ 
+ 	/* Other keywords */
+ 	INHERIT, UNSET, IMPORTANT, NONE, BOTH, FIXED, SCROLL, TRANSPARENT,
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index 8ad7db9..802f481 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -28,3 +28,4 @@ svg.dat				SVG property tests
+ calc.dat			calc() tests
+ grid.dat			Grid property tests
+ borderradius.dat		Rounded corner property tests
++logical.dat			Logical property tests
+diff --git a/test/data/parse2/logical.dat b/test/data/parse2/logical.dat
+new file mode 100644
+index 0000000..65761c3
+--- /dev/null
++++ b/test/data/parse2/logical.dat
+@@ -0,0 +1,101 @@
++#data
++* { padding-inline-start: 10px; }
++#errors
++#expected
++| *
++|  padding-left: 10px
++#reset
++
++#data
++* { padding-inline: 4px 8px; }
++#errors
++#expected
++| *
++|  padding-left: 4px
++|  padding-right: 8px
++#reset
++
++#data
++* { padding-inline: 6px; }
++#errors
++#expected
++| *
++|  padding-left: 6px
++|  padding-right: 6px
++#reset
++
++#data
++* { padding-block: 1px 2px; }
++#errors
++#expected
++| *
++|  padding-top: 1px
++|  padding-bottom: 2px
++#reset
++
++#data
++* { margin-inline: auto; }
++#errors
++#expected
++| *
++|  margin-left: auto
++|  margin-right: auto
++#reset
++
++#data
++* { margin-block-start: 3em; }
++#errors
++#expected
++| *
++|  margin-top: 3em
++#reset
++
++#data
++* { inset: 0; }
++#errors
++#expected
++| *
++|  top: 0px
++|  right: 0px
++|  bottom: 0px
++|  left: 0px
++#reset
++
++#data
++* { inset: 1px 2px; }
++#errors
++#expected
++| *
++|  top: 1px
++|  right: 2px
++|  bottom: 1px
++|  left: 2px
++#reset
++
++#data
++* { inset: 1px 2px 3px 4px; }
++#errors
++#expected
++| *
++|  top: 1px
++|  right: 2px
++|  bottom: 3px
++|  left: 4px
++#reset
++
++#data
++* { inset-inline-end: 5px; }
++#errors
++#expected
++| *
++|  right: 5px
++#reset
++
++#data
++* { inset-block: 7px; }
++#errors
++#expected
++| *
++|  top: 7px
++|  bottom: 7px
++#reset

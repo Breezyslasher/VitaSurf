@@ -1,0 +1,84 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 1228ac48d..470673d4f 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2362,6 +2362,40 @@ static void add_float_to_container(struct box *cont, struct box *b)
+  * A new box is created and inserted into the box tree after split_box,
+  * containing the text after new_length excluding the initial space character.
+  */
++/**
++ * May a word in this box be broken in the middle? (VitaSurf)
++ *
++ * A word longer than its container otherwise runs out of the box and
++ * over whatever is beside it, which is what sites ask to avoid with
++ * overflow-wrap and word-break. break-all allows a break anywhere;
++ * keep-all forbids one; overflow-wrap only matters once the word has
++ * been found not to fit, which is the only place this is asked.
++ */
++static bool layout_may_break_word(const struct box *box)
++{
++	if (box->style == NULL || box->text == NULL || box->length < 2) {
++		return false;
++	}
++
++	switch (css_computed_word_break(box->style)) {
++	case CSS_WORD_BREAK_BREAK_ALL:
++		return true;
++	case CSS_WORD_BREAK_KEEP_ALL:
++		return false;
++	default:
++		break;
++	}
++
++	switch (css_computed_overflow_wrap(box->style)) {
++	case CSS_OVERFLOW_WRAP_BREAK_WORD:
++	case CSS_OVERFLOW_WRAP_ANYWHERE:
++		return true;
++	default:
++		return false;
++	}
++}
++
++
+ static bool
+ layout_text_box_split(html_content *content,
+ 		      plot_font_style_t *fstyle,
+@@ -3254,6 +3288,38 @@ layout_line(struct box *first,
+ 			if (split == 0 || split == split_box->length) {
+ 				/* only one word in this box, or not text
+ 				 * or white-space:nowrap */
++				size_t chr = 0;
++				int fits = 0;
++				int avail = x1 - x0 - x - space_before;
++
++				/*
++				 * The word is wider than the line. If the
++				 * style allows it, break inside the word
++				 * rather than letting it run out of the
++				 * box (VitaSurf).
++				 */
++				if (avail > 0 && !no_wrap &&
++				    layout_may_break_word(split_box)) {
++					font_plot_style_from_css(
++						&content->unit_len_ctx,
++						split_box->style, &fstyle);
++					if (font_func->position(&fstyle,
++							split_box->text,
++							split_box->length,
++							avail, &chr,
++							&fits) != NSERROR_OK) {
++						chr = 0;
++					}
++				}
++
++				if (chr > 0 && chr < split_box->length) {
++					if (!layout_text_box_split(content,
++							&fstyle, split_box,
++							chr, fits))
++						return false;
++					w = fits;
++				}
++
+ 				b = split_box->next;
+ 			} else {
+ 				/* cut off first word for this line */

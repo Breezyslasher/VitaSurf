@@ -1,0 +1,470 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index bf32ea2b9..8fcce971b 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -28,7 +28,12 @@
+ 
+ #include <string.h>
+ #include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
+ #include <dom/dom.h>
++#include <nsutils/base64.h>
++
++#include "utils/utils.h"
+ 
+ #include "utils/nsoption.h"
+ #include "utils/corestrings.h"
+@@ -1849,6 +1854,390 @@ static bool box_textarea(dom_node *n,
+ 
+ 
+ /* exported interface documented in html/box_special.h */
++
++/* ------------------------------------------------------------------ */
++/* Inline SVG (VitaSurf)                                              */
++
++/*
++ * An <svg> written inline in an HTML page is a foreign element, so it
++ * never reached the switch below and its <path> and <circle> children
++ * became ordinary inline boxes, which draw nothing. NetSurf could only
++ * show SVG fetched as its own resource, through <img src="...svg">.
++ *
++ * Rather than teach layout and redraw about a second kind of replaced
++ * content, the element is serialised back to SVG markup and handed to
++ * the image machinery as a data: URL. It then is an <img> in every way
++ * that matters: the existing content handler parses it, layout asks it
++ * for its intrinsic size, and redraw plots it. The cost is one extra
++ * copy of the markup and a second parse, which for the icon-sized
++ * graphics that sites actually write inline is a few hundred bytes.
++ */
++
++struct svg_buf {
++	char *data;
++	size_t len;
++	size_t alloc;
++	bool oom;
++};
++
++static void svg_buf_append(struct svg_buf *b, const char *s, size_t n)
++{
++	if (b->oom) {
++		return;
++	}
++	if (b->len + n + 1 > b->alloc) {
++		size_t want = (b->alloc != 0) ? b->alloc : 512;
++		char *grown;
++
++		while (want < b->len + n + 1) {
++			if (want > SIZE_MAX / 2) {
++				b->oom = true;
++				return;
++			}
++			want *= 2;
++		}
++		grown = realloc(b->data, want);
++		if (grown == NULL) {
++			b->oom = true;
++			return;
++		}
++		b->data = grown;
++		b->alloc = want;
++	}
++	memcpy(b->data + b->len, s, n);
++	b->len += n;
++	b->data[b->len] = '\0';
++}
++
++static void svg_buf_lit(struct svg_buf *b, const char *s)
++{
++	svg_buf_append(b, s, strlen(s));
++}
++
++/** Append text with the five XML metacharacters escaped. */
++static void svg_buf_escaped(struct svg_buf *b, const char *s, size_t n)
++{
++	size_t i, run = 0;
++
++	for (i = 0; i < n; i++) {
++		const char *rep;
++
++		switch (s[i]) {
++		case '&':  rep = "&amp;";  break;
++		case '<':  rep = "&lt;";   break;
++		case '>':  rep = "&gt;";   break;
++		case '"':  rep = "&quot;"; break;
++		case '\'': rep = "&apos;"; break;
++		default:
++			run++;
++			continue;
++		}
++		svg_buf_append(b, s + i - run, run);
++		run = 0;
++		svg_buf_lit(b, rep);
++	}
++	svg_buf_append(b, s + n - run, run);
++}
++
++/**
++ * Is this a name an XML parser will accept?
++ *
++ * The markup is about to be re-parsed, and one malformed name would
++ * throw away the whole graphic rather than the one attribute, so
++ * anything unusual is dropped instead.
++ */
++static bool svg_name_ok(const char *s, size_t n)
++{
++	size_t i;
++
++	if (n == 0 || (s[0] >= '0' && s[0] <= '9') || s[0] == '-' ||
++	    s[0] == '.') {
++		return false;
++	}
++	for (i = 0; i < n; i++) {
++		char c = s[i];
++
++		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++		    (c >= '0' && c <= '9') ||
++		    c == '_' || c == '-' || c == '.' || c == ':') {
++			continue;
++		}
++		return false;
++	}
++	return true;
++}
++
++/**
++ * The name to write for an element or attribute.
++ *
++ * nodeName is the HTML tag name, which the parser upper-cases, and SVG
++ * is case sensitive: <PATH> and viewbox mean nothing to an SVG parser,
++ * while linearGradient and clipPath have to survive exactly as written.
++ * The local name is stored as the parser saw it, so it is used instead,
++ * with the prefix put back for the likes of xlink:href.
++ */
++static dom_string *svg_qualified_name(dom_node *node)
++{
++	dom_string *local = NULL, *prefix = NULL, *colon = NULL;
++	dom_string *joined = NULL, *result = NULL;
++
++	if (dom_node_get_local_name(node, &local) != DOM_NO_ERR ||
++	    local == NULL) {
++		/* no local name: the node was not namespace aware */
++		if (dom_node_get_node_name(node, &local) != DOM_NO_ERR) {
++			return NULL;
++		}
++		return local;
++	}
++
++	if (dom_node_get_prefix(node, &prefix) != DOM_NO_ERR ||
++	    prefix == NULL) {
++		return local;
++	}
++
++	if (dom_string_create((const uint8_t *) ":", 1, &colon) == DOM_NO_ERR) {
++		if (dom_string_concat(prefix, colon, &joined) == DOM_NO_ERR) {
++			if (dom_string_concat(joined, local, &result) !=
++					DOM_NO_ERR) {
++				result = NULL;
++			}
++			dom_string_unref(joined);
++		}
++		dom_string_unref(colon);
++	}
++
++	dom_string_unref(prefix);
++
++	if (result == NULL) {
++		return local;
++	}
++	dom_string_unref(local);
++	return result;
++}
++
++
++static void svg_serialise_node(struct svg_buf *b, dom_node *node, bool root);
++
++/** Write the attributes of an element, and the root's namespaces. */
++static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
++				     bool root)
++{
++	dom_namednodemap *attrs;
++	dom_exception exc;
++	uint32_t i, n = 0;
++
++	if (root) {
++		/*
++		 * Inline SVG inherits its namespace from the HTML parser
++		 * and usually carries no xmlns attribute, but the markup
++		 * is about to go through an XML parser, which needs both
++		 * declared. They are written first and any the element
++		 * already has are then skipped, so neither can appear
++		 * twice.
++		 */
++		svg_buf_lit(b, " xmlns=\"http://www.w3.org/2000/svg\""
++			       " xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
++	}
++
++	exc = dom_node_get_attributes(node, &attrs);
++	if (exc != DOM_NO_ERR || attrs == NULL) {
++		return;
++	}
++	exc = dom_namednodemap_get_length(attrs, &n);
++	if (exc != DOM_NO_ERR) {
++		dom_namednodemap_unref(attrs);
++		return;
++	}
++
++	for (i = 0; i < n; i++) {
++		dom_node *attr = NULL;
++		dom_string *name = NULL, *value = NULL;
++
++		if (dom_namednodemap_item(attrs, i, &attr) != DOM_NO_ERR ||
++		    attr == NULL) {
++			continue;
++		}
++		name = svg_qualified_name(attr);
++		if (name != NULL) {
++			const char *nd = dom_string_data(name);
++			size_t nl = dom_string_byte_length(name);
++
++			if (svg_name_ok(nd, nl) &&
++			    !(nl >= 5 && strncmp(nd, "xmlns", 5) == 0)) {
++				svg_buf_lit(b, " ");
++				svg_buf_append(b, nd, nl);
++				svg_buf_lit(b, "=\"");
++				if (dom_node_get_node_value(attr, &value) ==
++						DOM_NO_ERR && value != NULL) {
++					svg_buf_escaped(b,
++						dom_string_data(value),
++						dom_string_byte_length(value));
++					dom_string_unref(value);
++				}
++				svg_buf_lit(b, "\"");
++			}
++			dom_string_unref(name);
++		}
++		dom_node_unref(attr);
++	}
++
++	dom_namednodemap_unref(attrs);
++}
++
++/** Write one node and everything under it as XML. */
++static void svg_serialise_node(struct svg_buf *b, dom_node *node, bool root)
++{
++	dom_node_type type = DOM_ELEMENT_NODE;
++	dom_node *child;
++	dom_string *name = NULL;
++	dom_exception exc;
++
++	if (b->oom) {
++		return;
++	}
++
++	exc = dom_node_get_node_type(node, &type);
++	if (exc != DOM_NO_ERR) {
++		return;
++	}
++
++	if (type == DOM_TEXT_NODE || type == DOM_CDATA_SECTION_NODE) {
++		dom_string *text = NULL;
++
++		if (dom_node_get_node_value(node, &text) == DOM_NO_ERR &&
++		    text != NULL) {
++			svg_buf_escaped(b, dom_string_data(text),
++					dom_string_byte_length(text));
++			dom_string_unref(text);
++		}
++		return;
++	}
++
++	/* comments, processing instructions and the rest draw nothing */
++	if (type != DOM_ELEMENT_NODE) {
++		return;
++	}
++
++	name = svg_qualified_name(node);
++	if (name == NULL) {
++		return;
++	}
++	if (!svg_name_ok(dom_string_data(name),
++			 dom_string_byte_length(name))) {
++		dom_string_unref(name);
++		return;
++	}
++
++	svg_buf_lit(b, "<");
++	svg_buf_append(b, dom_string_data(name),
++		       dom_string_byte_length(name));
++	svg_serialise_attributes(b, node, root);
++	svg_buf_lit(b, ">");
++
++	exc = dom_node_get_first_child(node, &child);
++	if (exc == DOM_NO_ERR) {
++		while (child != NULL) {
++			dom_node *next = NULL;
++
++			svg_serialise_node(b, child, false);
++			exc = dom_node_get_next_sibling(child, &next);
++			dom_node_unref(child);
++			if (exc != DOM_NO_ERR) {
++				break;
++			}
++			child = next;
++		}
++	}
++
++	/* always a closing tag: shorter than deciding when one is safe */
++	svg_buf_lit(b, "</");
++	svg_buf_append(b, dom_string_data(name),
++		       dom_string_byte_length(name));
++	svg_buf_lit(b, ">");
++
++	dom_string_unref(name);
++}
++
++/**
++ * Special case: an <svg> element written inline in the page.
++ */
++static bool
++box_svg(dom_node *n,
++	html_content *content,
++	struct box *box,
++	bool *convert_children)
++{
++	struct svg_buf buf = { NULL, 0, 0, false };
++	enum css_width_e wtype;
++	enum css_height_e htype;
++	css_fixed value = 0;
++	css_unit wunit = CSS_UNIT_PX;
++	css_unit hunit = CSS_UNIT_PX;
++	uint8_t *encoded = NULL;
++	size_t encoded_len = 0;
++	char *urlstr = NULL;
++	nsurl *url = NULL;
++	nserror err;
++	bool ok;
++
++	/* the shapes are drawn from the markup, not laid out as boxes */
++	*convert_children = false;
++
++	if (box->style != NULL && ns_computed_display(box->style,
++			box_is_root(n)) == CSS_DISPLAY_NONE) {
++		return true;
++	}
++
++	if (nsoption_bool(foreground_images) == false) {
++		return true;
++	}
++
++	svg_serialise_node(&buf, n, true);
++	if (buf.oom || buf.data == NULL) {
++		free(buf.data);
++		return !buf.oom;
++	}
++
++	if (nsu_base64_encode_alloc((const uint8_t *)buf.data, buf.len,
++				    &encoded, &encoded_len) != NSUERROR_OK) {
++		free(buf.data);
++		return false;
++	}
++	free(buf.data);
++
++	urlstr = malloc(SLEN("data:image/svg+xml;base64,") + encoded_len + 1);
++	if (urlstr == NULL) {
++		free(encoded);
++		return false;
++	}
++	memcpy(urlstr, "data:image/svg+xml;base64,",
++	       SLEN("data:image/svg+xml;base64,"));
++	memcpy(urlstr + SLEN("data:image/svg+xml;base64,"),
++	       encoded, encoded_len);
++	urlstr[SLEN("data:image/svg+xml;base64,") + encoded_len] = '\0';
++	free(encoded);
++
++	err = nsurl_create(urlstr, &url);
++	free(urlstr);
++	if (err != NSERROR_OK) {
++		return false;
++	}
++
++	box->flags |= IS_REPLACED;
++	ok = html_fetch_object(content, url, box, image_types, false);
++	nsurl_unref(url);
++
++	wtype = css_computed_width(box->style, &value, &wunit);
++	htype = css_computed_height(box->style, &value, &hunit);
++
++	if (wtype == CSS_WIDTH_SET && wunit != CSS_UNIT_PCT &&
++	    htype == CSS_HEIGHT_SET && hunit != CSS_UNIT_PCT) {
++		box->flags |= REPLACE_DIM;
++	}
++
++	return ok;
++}
++
+ bool
+ convert_special_elements(dom_node *node,
+ 			 html_content *content,
+@@ -1857,8 +2246,40 @@ convert_special_elements(dom_node *node,
+ {
+ 	dom_exception exc;
+ 	dom_html_element_type tag_type;
++	dom_string *namespace = NULL;
+ 	bool res;
+ 
++	/*
++	 * <svg> is a foreign element, so it has no HTML tag type and
++	 * would fall out of the switch below untouched (VitaSurf). Ask
++	 * the namespace instead, before the tag type is consulted at
++	 * all: an <svg> and an HTML element that happened to share its
++	 * name must not be confused for one another.
++	 */
++	exc = dom_node_get_namespace(node, &namespace);
++	if (exc == DOM_NO_ERR && namespace != NULL) {
++		bool is_svg = dom_string_isequal(namespace,
++				corestring_dom_svg_namespace);
++		dom_string_unref(namespace);
++
++		if (is_svg) {
++			dom_string *name = NULL;
++
++			exc = dom_node_get_node_name(node, &name);
++			if (exc == DOM_NO_ERR && name != NULL) {
++				bool root = dom_string_caseless_lwc_isequal(
++						name, corestring_lwc_svg);
++				dom_string_unref(name);
++				if (root) {
++					return box_svg(node, content, box,
++						       convert_children);
++				}
++			}
++			/* a descendant of an <svg> that was not converted */
++			return true;
++		}
++	}
++
+ 	exc = dom_html_element_get_tag_type(node, &tag_type);
+ 	if (exc != DOM_NO_ERR) {
+ 		tag_type = DOM_HTML_ELEMENT_TYPE__UNKNOWN;
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index 5cdbb3af7..8a60626af 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -119,6 +119,7 @@ CORESTRING_LWC_STRING(search);
+ CORESTRING_LWC_STRING(select);
+ CORESTRING_LWC_STRING(src);
+ CORESTRING_LWC_STRING(style);
++CORESTRING_LWC_STRING(svg);
+ CORESTRING_LWC_STRING(submit);
+ CORESTRING_LWC_STRING(table);
+ CORESTRING_LWC_STRING(tbody);
+@@ -375,6 +376,8 @@ CORESTRING_DOM_STRING(__ns_key_canvas_node_data);
+ CORESTRING_DOM_VALUE(text_javascript, "text/javascript");
+ CORESTRING_DOM_VALUE(http_equiv, "http-equiv");
+ CORESTRING_DOM_VALUE(html_namespace, "http://www.w3.org/1999/xhtml");
++/* inline <svg> is told apart by its namespace, not a tag type (VitaSurf) */
++CORESTRING_DOM_VALUE(svg_namespace, "http://www.w3.org/2000/svg");
+ 
+ CORESTRING_NSURL(about_blank, "about:blank");
+ CORESTRING_NSURL(about_query_ssl, "about:query/ssl");

@@ -228,9 +228,14 @@ function parseSimple(sel){
    if(c==='.'){if(buf!=='')classes.push(unescapeIdent(buf));buf='';continue;}
    buf+=c;}
   if(buf!=='')classes.push(unescapeIdent(buf));}
- return {tag:m[1]&&m[1]!=='*'?unescapeIdent(m[1]).toUpperCase():null,
+ /* A type selector is case insensitive only for HTML elements, so both
+    spellings are kept: tagName is upper case for HTML and as written for
+    foreign elements such as those inside an inline <svg>. */
+ return {tag:m[1]&&m[1]!=='*'?unescapeIdent(m[1]):null,
+  tagUpper:m[1]&&m[1]!=='*'?unescapeIdent(m[1]).toUpperCase():null,
   id:m[2]?unescapeIdent(m[2].slice(1)):null,
   classes:classes,attrs:attrs,pseudos:pseudos};}
+var HTML_NS='http://www.w3.org/1999/xhtml';
 function attrOk(el,q){var v=el.getAttribute(q.name);if(v===null)return false;if(!q.op)return true;
  switch(q.op){case '=':return v===q.val;case '^=':return v.indexOf(q.val)===0;
  case '$=':return q.val.length<=v.length&&v.indexOf(q.val,v.length-q.val.length)>=0;
@@ -312,7 +317,10 @@ function pseudoOk(el,p){
   return false;
  default:return true;}}
 function matchSimple(el,q){if(el.nodeType!==1)return false;
- if(q.tag&&el.tagName!==q.tag)return false;
+ if(q.tag){var ns=el.namespaceURI;
+  if(ns===null||ns===undefined||ns===HTML_NS){
+   if(el.tagName!==q.tagUpper)return false;
+  }else if(el.tagName!==q.tag){return false;}}
  if(q.id&&el.id!==q.id)return false;
  if(q.classes.length){
   var set=classSet(el);
@@ -1194,7 +1202,13 @@ function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(va
  case 'height':return h===n;case 'min-height':return h>=n;case 'max-height':return h<=n;
  case 'aspect-ratio':case 'min-aspect-ratio':case 'max-aspect-ratio':{var p=String(value).split('/'),r=parseFloat(p[0])/(parseFloat(p[1])||1),a=w/(h||1);return name==='min-aspect-ratio'?a>=r:name==='max-aspect-ratio'?a<=r:Math.abs(a-r)<0.001;}
  case 'orientation':return value===(w>=h?'landscape':'portrait');
- case 'prefers-color-scheme':return value==='light'||value==='no-preference';
+ /* the same answer the stylesheets get: qjs.c sets __vitaDarkMode from
+    the option the Start menu toggles, so matchMedia and the CSS
+    cannot disagree about which theme a site should use */
+ case 'prefers-color-scheme':
+  if(value===''||value===undefined)return true;
+  return W.__vitaDarkMode?value==='dark':
+   (value==='light'||value==='no-preference');
  case 'prefers-reduced-motion':return value==='reduce'||value==='no-preference';
  case 'prefers-contrast':case 'forced-colors':case 'inverted-colors':return value==='no-preference'||value==='none';
  case 'pointer':case 'any-pointer':return value==='coarse';
@@ -1205,11 +1219,43 @@ function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(va
  case 'color':return true;case 'monochrome':return false;case 'grid':return false;
  case 'scripting':return value==='enabled';
  default:return false;}}
+/* A feature written with no value asks whether it has a value at all:
+   (hover) is true unless hover is none, (monochrome) unless it is zero.
+   This used to be answered by asking for min-<feature>: 1, which means
+   nothing for a feature that is not a range and so said no to all of
+   them. YouTube gates its whole device theme on (prefers-color-scheme)
+   matching before it ever asks for dark, so dark mode did nothing
+   there however the browser was set. */
+function mediaFeatureBool(name){
+ switch(name){
+ /* there is always one scheme or the other */
+ case 'prefers-color-scheme':return true;
+ /* reported as no-preference or none, so the bare query is false */
+ case 'prefers-reduced-motion':case 'prefers-reduced-transparency':
+ case 'prefers-contrast':case 'forced-colors':case 'inverted-colors':
+  return false;
+ case 'pointer':case 'any-pointer':return true;   /* coarse */
+ case 'hover':case 'any-hover':return false;      /* none */
+ case 'monochrome':return false;                  /* a colour screen */
+ /* the size of a colour lookup table, which a true colour screen
+    does not have */
+ case 'color-index':return false;
+ case 'grid':return false;                        /* not a grid device */
+ case 'color':case 'orientation':case 'display-mode':
+ case 'scripting':case 'update':case 'width':case 'height':
+ case 'aspect-ratio':case 'resolution':case 'device-width':
+ case 'device-height':case 'device-aspect-ratio':
+  return true;
+ default:return undefined;
+ }
+}
 function mediaTerm(t){t=t.replace(/^\s+|\s+$/g,'');
  if(!t)return true;
  if(/^not\s/i.test(t))return !mediaTerm(t.slice(4));
  if(t.charAt(0)==='('){var m=/^\(\s*([\w-]+)\s*(?::\s*([^)]*?))?\s*\)$/.exec(t);if(!m)return false;
-  if(m[2]===undefined)return mediaFeature('min-'+m[1],'1')||m[1]==='color';
+  if(m[2]===undefined){var bare=mediaFeatureBool(m[1].toLowerCase());
+   if(bare!==undefined)return bare;
+   return mediaFeature('min-'+m[1],'1')||m[1]==='color';}
   return mediaFeature(m[1].toLowerCase(),String(m[2]).replace(/^\s+|\s+$/g,''));}
  var type=t.toLowerCase();return type==='all'||type==='screen';}
 function mediaMatches(q){q=String(q||'');if(!q)return true;
@@ -4241,6 +4287,49 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
 (function(){
  var C=W.console;
  if(!C)return;
+ /* What an argument says, rather than what String() makes of it.
+    An object goes to the log as "[object Object]", which is how
+    claude.ai's "IndexedDB state read rejected [object Object]" told us
+    nothing at all about which error it had caught. A browser shows the
+    contents; this shows enough of them to name the fault. */
+ function describe(v,depth){
+  var t=typeof v;
+  if(v===null||v===undefined||t==='string'||t==='number'||t==='boolean')
+   return String(v);
+  if(t==='function')return 'function '+(v.name||'');
+  if(t==='symbol')return String(v);
+  try{
+   if(v instanceof Error||
+      (v.name!==undefined&&v.message!==undefined&&typeof v.stack==='string')){
+    var head=(v.name||'Error')+': '+(v.message||'');
+    if(v.stack){var f=String(v.stack).split('\n')[1];
+     if(f)head+=' | at'+f.replace(/^\s*at/,'');}
+    return head;}
+   if(v.name!==undefined&&v.message!==undefined)
+    return String(v.name)+': '+String(v.message);
+  }catch(e){}
+  if(depth>2)return Array.isArray(v)?'[...]':'{...}';
+  try{
+   if(Array.isArray(v)){
+    var parts=v.slice(0,8).map(function(x){return describe(x,depth+1);});
+    if(v.length>8)parts.push('... '+v.length+' in all');
+    return '['+parts.join(', ')+']';}
+   if(v instanceof Date)return v.toISOString();
+   var keys=Object.keys(v),body=keys.slice(0,8).map(function(k){
+    return k+': '+describe(v[k],depth+1);});
+   if(keys.length>8)body.push('... '+keys.length+' keys');
+   var str=String(v);
+   if(str!=='[object Object]'&&body.length===0)return str;
+   return '{'+body.join(', ')+'}';
+  }catch(e){return '[object]';}
+ }
+ ['log','warn','error','info','debug'].forEach(function(k){
+  var real=C[k];
+  if(typeof real!=='function')return;
+  C[k]=function(){
+   var a=Array.prototype.map.call(arguments,function(v){
+    return typeof v==='string'?v:describe(v,0);});
+   return real.apply(C,a);};});
  function out(kind,args){
   try{(C[kind]||C.log).apply(C,args);}catch(e){}}
  function def(n,f){if(typeof C[n]!=='function')C[n]=f;}
@@ -4710,7 +4799,15 @@ W.__vitaReportError=function(err,where){
  }catch(e4){}
  try{__vitaDispatch(null,ev);}catch(e5){}
  if(!handled&&!ev.defaultPrevented){
-  try{console.error('uncaught: '+describeThrown(err)+
+  /* Where the caller said it came from, when that is a description
+     rather than a URL. The stack frame below overwrites `file', so a
+     caller that named a subsystem -- a database event handler, say --
+     had its label thrown away and the error looked like any other. */
+  var from='';
+  try{var w=where?String(where):'';
+   if(w&&w.indexOf('://')<0&&w.charAt(0)!=='/'&&w!==String(location.href))from=w;
+  }catch(e7){}
+  try{console.error('uncaught'+(from?' in '+from:'')+': '+describeThrown(err)+
    (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}}
  return handled;};
 /* An unhandled promise rejection, reported the same way. QuickJS hands

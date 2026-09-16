@@ -1,0 +1,458 @@
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 2bbffedb9..49924681b 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -27,6 +27,7 @@
+ #include <dom/bindings/hubbub/parser.h>
+ 
+ #include "netsurf/types.h"
++#include "netsurf/plot_style.h"
+ #include "content/content_protected.h"
+ #include "content/handlers/css/utils.h"
+ 
+@@ -300,8 +301,30 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 
+ 
+ /* in html/redraw_border.c */
++/* Rounded corners (VitaSurf) */
++struct html_corner_radii {
++	int tl_h, tl_v;
++	int tr_h, tr_v;
++	int br_h, br_v;
++	int bl_h, bl_v;
++};
++
++bool html_box_corner_radii(const struct box *box,
++		const struct rect *border_box,
++		const css_unit_ctx *unit_len_ctx, float scale,
++		struct html_corner_radii *radii);
++
++nserror html_plot_rounded_fill(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const struct rect *border_box,
++		const struct html_corner_radii *radii);
++
++nserror html_plot_rounded_stroke(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const struct rect *rect,
++		const struct html_corner_radii *radii);
++
+ bool html_redraw_borders(struct box *box, int x_parent, int y_parent,
+ 		int p_width, int p_height, const struct rect *clip, float scale,
++		const css_unit_ctx *unit_len_ctx,
+ 		const struct redraw_context *ctx);
+ 
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index c007910d9..3329a6fbf 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -678,9 +678,18 @@ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 		const struct rect *clip, colour *background_colour,
+ 		struct box *background,
++		const struct rect *border_box,
+ 		const css_unit_ctx *unit_len_ctx,
+ 		const struct redraw_context *ctx)
+ {
++	/*
++	 * A rounded shape follows the border box, not the clipped
++	 * rectangle the colour is painted into, so both are needed
++	 * (VitaSurf).
++	 */
++	struct html_corner_radii radii;
++	bool rounded = (border_box != NULL) && html_box_corner_radii(
++			background, border_box, unit_len_ctx, scale, &radii);
+ 	bool repeat_x = false;
+ 	bool repeat_y = false;
+ 	bool plot_colour = true;
+@@ -831,7 +840,18 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 			*background_colour = nscss_color_to_ns(bgcol);
+ 			pstyle_fill_bg.fill_colour = *background_colour;
+ 			if (plot_colour) {
+-				res = ctx->plot->rectangle(ctx, &pstyle_fill_bg, &r);
++				if (rounded) {
++					if (ctx->plot->clip(ctx, &r) !=
++							NSERROR_OK) {
++						return false;
++					}
++					res = html_plot_rounded_fill(ctx,
++							&pstyle_fill_bg,
++							border_box, &radii);
++				} else {
++					res = ctx->plot->rectangle(ctx,
++							&pstyle_fill_bg, &r);
++				}
+ 				if (res != NSERROR_OK) {
+ 					return false;
+ 				}
+@@ -1577,6 +1597,13 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			bg_box->gadget->type == GADGET_PASSWORD)))) {
+ 		/* find intersection of clip box and border edge */
+ 		struct rect p;
++		/* the border edge itself, which rounded corners follow */
++		struct rect border_box = {
++			.x0 = x - border_left,
++			.y0 = y - border_top,
++			.x1 = x + padding_width + border_right,
++			.y1 = y + padding_height + border_bottom
++		};
+ 		p.x0 = x - border_left < r.x0 ? r.x0 : x - border_left;
+ 		p.y0 = y - border_top < r.y0 ? r.y0 : y - border_top;
+ 		p.x1 = x + padding_width + border_right < r.x1 ?
+@@ -1608,6 +1635,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			/* plot background */
+ 			if (!html_redraw_background(x, y, box, scale, &p,
+ 					&current_background_color, bg_box,
++					&border_box,
+ 					&html->unit_len_ctx, ctx))
+ 				return false;
+ 			/* restore previous graphics window */
+@@ -1629,7 +1657,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	    (border_top || border_right || border_bottom || border_left)) {
+ 		if (!html_redraw_borders(box, x_parent, y_parent,
+ 				padding_width, padding_height, &r,
+-				scale, ctx))
++				scale, &html->unit_len_ctx, ctx))
+ 			return false;
+ 	}
+ 
+diff --git a/content/handlers/html/redraw_border.c b/content/handlers/html/redraw_border.c
+index 3a1f6f308..79e55aa33 100644
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -448,6 +448,7 @@ html_redraw_borders(struct box *box,
+ 		    int p_height,
+ 		    const struct rect *clip,
+ 		    float scale,
++		    const css_unit_ctx *unit_len_ctx,
+ 		    const struct redraw_context *ctx)
+ {
+ 	unsigned int sides[] = { LEFT, RIGHT, TOP, BOTTOM };
+@@ -466,6 +467,84 @@ html_redraw_borders(struct box *box,
+ 	x = x_parent + box->x;
+ 	y = y_parent + box->y;
+ 
++	/*
++	 * A rounded border is drawn as one stroked outline rather than
++	 * four polygons (VitaSurf). That only holds while every side is
++	 * the same, which is what a rounded box normally is; anything
++	 * else keeps the square mitred corners, which is wrong but is
++	 * what was drawn before, rather than nothing at all.
++	 */
++	if (unit_len_ctx != NULL &&
++	    top == right && right == bottom && bottom == left && top > 0 &&
++	    box->border[TOP].style == box->border[RIGHT].style &&
++	    box->border[TOP].style == box->border[BOTTOM].style &&
++	    box->border[TOP].style == box->border[LEFT].style &&
++	    box->border[TOP].style != CSS_BORDER_STYLE_DOUBLE &&
++	    box->border[TOP].c == box->border[RIGHT].c &&
++	    box->border[TOP].c == box->border[BOTTOM].c &&
++	    box->border[TOP].c == box->border[LEFT].c &&
++	    nscss_color_is_transparent(box->border[TOP].c) == false) {
++		struct html_corner_radii radii;
++		struct rect border_box;
++		int sx = x, sy = y;
++		int stop = top, sright = right, sbottom = bottom, sleft = left;
++
++		if (scale != 1.0) {
++			stop *= scale;
++			sright *= scale;
++			sbottom *= scale;
++			sleft *= scale;
++			sx *= scale;
++			sy *= scale;
++		}
++
++		border_box.x0 = sx - sleft;
++		border_box.y0 = sy - stop;
++		border_box.x1 = sx + p_width + sright;
++		border_box.y1 = sy + p_height + sbottom;
++
++		if (html_box_corner_radii(box, &border_box, unit_len_ctx,
++				scale, &radii)) {
++			plot_style_t pstyle = {
++				.stroke_type = PLOT_OP_TYPE_SOLID,
++				.stroke_colour =
++					nscss_color_to_ns(box->border[TOP].c),
++				.stroke_width = plot_style_int_to_fixed(stop),
++				.fill_type = PLOT_OP_TYPE_NONE
++			};
++			struct rect centre;
++
++			/*
++			 * A stroke straddles the line it follows, so the
++			 * outline is taken through the middle of the
++			 * border rather than along its outer edge.
++			 */
++			centre.x0 = border_box.x0 + stop / 2;
++			centre.y0 = border_box.y0 + stop / 2;
++			centre.x1 = border_box.x1 - stop / 2;
++			centre.y1 = border_box.y1 - stop / 2;
++
++			radii.tl_h -= stop / 2;	radii.tl_v -= stop / 2;
++			radii.tr_h -= stop / 2;	radii.tr_v -= stop / 2;
++			radii.br_h -= stop / 2;	radii.br_v -= stop / 2;
++			radii.bl_h -= stop / 2;	radii.bl_v -= stop / 2;
++			if (radii.tl_h < 0) radii.tl_h = 0;
++			if (radii.tl_v < 0) radii.tl_v = 0;
++			if (radii.tr_h < 0) radii.tr_h = 0;
++			if (radii.tr_v < 0) radii.tr_v = 0;
++			if (radii.br_h < 0) radii.br_h = 0;
++			if (radii.br_v < 0) radii.br_v = 0;
++			if (radii.bl_h < 0) radii.bl_h = 0;
++			if (radii.bl_v < 0) radii.bl_v = 0;
++
++			if (ctx->plot->clip(ctx, clip) != NSERROR_OK) {
++				return false;
++			}
++			return html_plot_rounded_stroke(ctx, &pstyle,
++					&centre, &radii) == NSERROR_OK;
++		}
++	}
++
+ 	if (scale != 1.0) {
+ 		top *= scale;
+ 		right *= scale;
+@@ -927,3 +1006,243 @@ html_redraw_inline_borders(struct box *box,
+ 
+ 	return true;
+ }
++
++
++/* ------------------------------------------------------------------ */
++/* Rounded corners (VitaSurf)                                         */
++
++/*
++ * border-radius reaches here as four pairs of computed lengths, one
++ * pair per corner: a horizontal radius and a vertical one. Nothing in
++ * layout changes; only the shapes drawn for the background and the
++ * border do, which is why this lives beside the border plotters.
++ */
++
++/** A quarter ellipse as a cubic: control points this far along each axis. */
++#define RADIUS_KAPPA 0.5522847498f
++
++/** Resolve one radius to device pixels. */
++static int
++radius_device_px(const struct box *box,
++		 const css_unit_ctx *unit_len_ctx,
++		 css_fixed value,
++		 css_unit unit,
++		 int percent_basis,
++		 float scale)
++{
++	if (unit == CSS_UNIT_PCT) {
++		/* already device pixels, so no further scaling */
++		return (int) (percent_basis * FIXTOFLT(value) / 100.0);
++	}
++
++	return (int) (FIXTOFLT(css_unit_len2device_px(box->style,
++			unit_len_ctx, value, unit)) * scale);
++}
++
++/**
++ * Work out a box's corner radii in device pixels.
++ *
++ * \return true if any corner is actually rounded.
++ */
++bool
++html_box_corner_radii(const struct box *box,
++		      const struct rect *border_box,
++		      const css_unit_ctx *unit_len_ctx,
++		      float scale,
++		      struct html_corner_radii *radii)
++{
++	css_fixed h = 0, v = 0;
++	css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
++	int width = border_box->x1 - border_box->x0;
++	int height = border_box->y1 - border_box->y0;
++	float f = 1.0f;
++	int sum;
++
++	if (box->style == NULL || width <= 0 || height <= 0) {
++		return false;
++	}
++
++	css_computed_border_top_left_radius(box->style, &h, &hu, &v, &vu);
++	radii->tl_h = radius_device_px(box, unit_len_ctx, h, hu, width, scale);
++	radii->tl_v = radius_device_px(box, unit_len_ctx, v, vu, height, scale);
++
++	css_computed_border_top_right_radius(box->style, &h, &hu, &v, &vu);
++	radii->tr_h = radius_device_px(box, unit_len_ctx, h, hu, width, scale);
++	radii->tr_v = radius_device_px(box, unit_len_ctx, v, vu, height, scale);
++
++	css_computed_border_bottom_right_radius(box->style, &h, &hu, &v, &vu);
++	radii->br_h = radius_device_px(box, unit_len_ctx, h, hu, width, scale);
++	radii->br_v = radius_device_px(box, unit_len_ctx, v, vu, height, scale);
++
++	css_computed_border_bottom_left_radius(box->style, &h, &hu, &v, &vu);
++	radii->bl_h = radius_device_px(box, unit_len_ctx, h, hu, width, scale);
++	radii->bl_v = radius_device_px(box, unit_len_ctx, v, vu, height, scale);
++
++	if (radii->tl_h <= 0 && radii->tl_v <= 0 &&
++	    radii->tr_h <= 0 && radii->tr_v <= 0 &&
++	    radii->br_h <= 0 && radii->br_v <= 0 &&
++	    radii->bl_h <= 0 && radii->bl_v <= 0) {
++		return false;
++	}
++
++	/*
++	 * Two radii sharing a side may together ask for more room than
++	 * the side has. CSS says to shrink every radius by the same
++	 * factor until they all fit, which is what keeps a pill shape a
++	 * pill rather than letting one end swallow the other.
++	 */
++	sum = radii->tl_h + radii->tr_h;
++	if (sum > width && sum > 0) {
++		f = min(f, (float) width / sum);
++	}
++	sum = radii->bl_h + radii->br_h;
++	if (sum > width && sum > 0) {
++		f = min(f, (float) width / sum);
++	}
++	sum = radii->tl_v + radii->bl_v;
++	if (sum > height && sum > 0) {
++		f = min(f, (float) height / sum);
++	}
++	sum = radii->tr_v + radii->br_v;
++	if (sum > height && sum > 0) {
++		f = min(f, (float) height / sum);
++	}
++
++	if (f < 1.0f) {
++		radii->tl_h *= f;	radii->tl_v *= f;
++		radii->tr_h *= f;	radii->tr_v *= f;
++		radii->br_h *= f;	radii->br_v *= f;
++		radii->bl_h *= f;	radii->bl_v *= f;
++	}
++
++	if (radii->tl_h < 0) radii->tl_h = 0;
++	if (radii->tl_v < 0) radii->tl_v = 0;
++	if (radii->tr_h < 0) radii->tr_h = 0;
++	if (radii->tr_v < 0) radii->tr_v = 0;
++	if (radii->br_h < 0) radii->br_h = 0;
++	if (radii->br_v < 0) radii->br_v = 0;
++	if (radii->bl_h < 0) radii->bl_h = 0;
++	if (radii->bl_v < 0) radii->bl_v = 0;
++
++	return true;
++}
++
++/** Append one path element, guarding the buffer. */
++#define PUSH(...) do {							\
++		float vals[] = { __VA_ARGS__ };				\
++		size_t nvals = sizeof(vals) / sizeof(vals[0]);		\
++		size_t k;						\
++		if (n + nvals > max) {					\
++			return 0;					\
++		}							\
++		for (k = 0; k < nvals; k++) {				\
++			p[n++] = vals[k];				\
++		}							\
++	} while (0)
++
++/**
++ * Build the outline of a rounded rectangle as a path.
++ *
++ * \return the number of floats written, or 0 if they would not fit.
++ */
++static unsigned int
++rounded_rect_path(float *p,
++		  unsigned int max,
++		  const struct rect *r,
++		  const struct html_corner_radii *radii)
++{
++	unsigned int n = 0;
++	float x0 = r->x0, y0 = r->y0, x1 = r->x1, y1 = r->y1;
++	float k = RADIUS_KAPPA;
++
++	PUSH(PLOTTER_PATH_MOVE, x0 + radii->tl_h, y0);
++
++	PUSH(PLOTTER_PATH_LINE, x1 - radii->tr_h, y0);
++	if (radii->tr_h > 0 || radii->tr_v > 0) {
++		PUSH(PLOTTER_PATH_BEZIER,
++		     x1 - radii->tr_h + radii->tr_h * k, y0,
++		     x1, y0 + radii->tr_v - radii->tr_v * k,
++		     x1, y0 + radii->tr_v);
++	}
++
++	PUSH(PLOTTER_PATH_LINE, x1, y1 - radii->br_v);
++	if (radii->br_h > 0 || radii->br_v > 0) {
++		PUSH(PLOTTER_PATH_BEZIER,
++		     x1, y1 - radii->br_v + radii->br_v * k,
++		     x1 - radii->br_h + radii->br_h * k, y1,
++		     x1 - radii->br_h, y1);
++	}
++
++	PUSH(PLOTTER_PATH_LINE, x0 + radii->bl_h, y1);
++	if (radii->bl_h > 0 || radii->bl_v > 0) {
++		PUSH(PLOTTER_PATH_BEZIER,
++		     x0 + radii->bl_h - radii->bl_h * k, y1,
++		     x0, y1 - radii->bl_v + radii->bl_v * k,
++		     x0, y1 - radii->bl_v);
++	}
++
++	PUSH(PLOTTER_PATH_LINE, x0, y0 + radii->tl_v);
++	if (radii->tl_h > 0 || radii->tl_v > 0) {
++		PUSH(PLOTTER_PATH_BEZIER,
++		     x0, y0 + radii->tl_v - radii->tl_v * k,
++		     x0 + radii->tl_h - radii->tl_h * k, y0,
++		     x0 + radii->tl_h, y0);
++	}
++
++	PUSH(PLOTTER_PATH_CLOSE);
++
++	return n;
++}
++
++#undef PUSH
++
++/** The identity, which is what the path plotters want for an unrotated box. */
++static const float rounded_transform[6] = { 1, 0, 0, 1, 0, 0 };
++
++/**
++ * Fill a rounded rectangle.
++ */
++nserror
++html_plot_rounded_fill(const struct redraw_context *ctx,
++		       const plot_style_t *pstyle,
++		       const struct rect *border_box,
++		       const struct html_corner_radii *radii)
++{
++	float path[64];
++	unsigned int n;
++	plot_style_t style = *pstyle;
++
++	n = rounded_rect_path(path, sizeof(path) / sizeof(path[0]),
++			      border_box, radii);
++	if (n == 0) {
++		return ctx->plot->rectangle(ctx, pstyle, border_box);
++	}
++
++	style.stroke_type = PLOT_OP_TYPE_NONE;
++
++	return ctx->plot->path(ctx, &style, path, n, rounded_transform);
++}
++
++/**
++ * Stroke a rounded rectangle, for a border that is the same all round.
++ */
++nserror
++html_plot_rounded_stroke(const struct redraw_context *ctx,
++			 const plot_style_t *pstyle,
++			 const struct rect *rect,
++			 const struct html_corner_radii *radii)
++{
++	float path[64];
++	unsigned int n;
++	plot_style_t style = *pstyle;
++
++	n = rounded_rect_path(path, sizeof(path) / sizeof(path[0]),
++			      rect, radii);
++	if (n == 0) {
++		return NSERROR_OK;
++	}
++
++	style.fill_type = PLOT_OP_TYPE_NONE;
++
++	return ctx->plot->path(ctx, &style, path, n, rounded_transform);
++}

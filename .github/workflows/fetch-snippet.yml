@@ -29,7 +29,8 @@ jobs:
           # occurrence of TEXT.
           spec = open('fixtures/snippet.txt').read().splitlines()
           url = next(l[4:] for l in spec if l.startswith('url='))
-          UA = 'Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
+          UA = ('Mozilla/5.0 (PlayStation Vita 3.73; Mobile) AppleWebKit/536.26 '
+                '(KHTML, like Gecko) Silk/3.2 Mobile Safari/536.26')
           req = urllib.request.Request(url, headers={'User-Agent': UA})
           body = urllib.request.urlopen(req, timeout=60).read().decode('utf-8', 'replace')
           print('fetched %d bytes, %d lines' % (len(body), body.count(chr(10)) + 1))
@@ -46,6 +47,26 @@ jobs:
                   if 1 <= n <= len(lines):
                       print('--- line %d [%d:%d] ---' % (n, lo, hi))
                       print(lines[n - 1][lo:hi])
+              elif l.startswith('inline='):
+                  # inline=N:lo-hi prints a column range of the Nth inline
+                  # <script> in an HTML page. An error reported against
+                  # "?inline script?" is at a column of one of these, and
+                  # there is no file to ask for.
+                  spec_line = l[7:]
+                  if ':' in spec_line:
+                      n, rng = spec_line.split(':', 1)
+                      lo, hi = (int(x) for x in rng.split('-'))
+                  else:
+                      n, lo, hi = spec_line, 0, 4000
+                  n = int(n)
+                  scripts = re.findall(
+                      r'<script(?![^>]*\ssrc=)[^>]*>(.*?)</script>',
+                      body, re.S | re.I)
+                  print('--- %d inline scripts; lengths %s ---'
+                        % (len(scripts), [len(x) for x in scripts[:12]]))
+                  if 1 <= n <= len(scripts):
+                      print('--- inline script %d [%d:%d] ---' % (n, lo, hi))
+                      print(scripts[n - 1][lo:hi])
               elif l.startswith('find='):
                   needle = l[5:]
                   print('--- find %r ---' % needle)

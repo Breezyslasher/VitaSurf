@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>logical properties</title><style>
+ body { margin: 0; }
+ .box { width: 200px; background: #eee; }
+ #a { padding-inline: 20px 40px; padding-block: 10px 30px; }
+ #b { margin-inline-start: 50px; }
+ #c { position: relative; }
+ #d { position: absolute; inset: 5px 15px; width: auto; height: 20px; }
+</style></head>
+<body><div class="box" id="a"><div id="ai" style="height:10px"></div></div>
+<div class="box" id="b">y</div>
+<div class="box" id="c" style="height:60px"><div id="d"></div></div>
+<pre id="out"></pre>
+<script>
+/* Logical properties name a side by the direction text runs. They were
+   dropped entirely, so this spacing simply vanished. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function cs(id, p){ return getComputedStyle(document.getElementById(id))[p]; }
+window.addEventListener('load', function(){ setTimeout(function(){
+  var ai = document.getElementById('ai').getBoundingClientRect();
+  var a = document.getElementById('a').getBoundingClientRect();
+  T('padding-inline start applied', Math.round(ai.left - a.left));
+  T('padding-block start applied', Math.round(ai.top - a.top));
+  T('padding-block adds to the height', Math.round(a.height));
+  var b = document.getElementById('b').getBoundingClientRect();
+  T('margin-inline-start applied', Math.round(b.left));
+  var c = document.getElementById('c').getBoundingClientRect();
+  var d = document.getElementById('d').getBoundingClientRect();
+  T('inset left', Math.round(d.left - c.left));
+  T('inset top', Math.round(d.top - c.top));
+  T('inset width', Math.round(d.width));
+}, 200); });
+</script></body></html>

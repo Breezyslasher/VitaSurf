@@ -125,7 +125,41 @@ case "$two" in *"visits=1"*) echo "   ok: localStorage survived";;
 case "$two" in *"notes=1"*) echo "   ok: the database survived";;
     *) echo "   FAIL: the database did not survive"; fail=1;; esac
 
-echo "3. another origin cannot see it"
+echo "3. an upgrade that fails leaves no database behind"
+cat > "$WORK/docs/fragile.html" <<'PAGE'
+<!DOCTYPE html><html><body><script>
+function L(m){ try{console.log('T ' + m);}catch(e){} }
+var first = indexedDB.open('fragile', 1);
+first.onupgradeneeded = function(){
+  first.result.createObjectStore('keyval');
+  throw new Error('the handler fell over');
+};
+first.onsuccess = function(){ L('first=succeeded'); next(); };
+first.onerror = function(){ L('first=failed'); next(); };
+function next(){
+  var again = indexedDB.open('fragile');
+  again.onupgradeneeded = function(){ again.result.createObjectStore('keyval'); };
+  again.onsuccess = function(){
+    var db = again.result;
+    try {
+      var tx = db.transaction('keyval', 'readwrite');
+      tx.objectStore('keyval').put('value', 'k');
+      tx.oncomplete = function(){ L('second=usable'); };
+      tx.onabort = function(){ L('second=aborted'); };
+    } catch (e) { L('second=' + e.name); }
+  };
+  again.onerror = function(){ L('second=openfailed'); };
+}
+</script></body></html>
+PAGE
+frag=$(vita "http://127.0.0.1:$PORT_A/fragile.html" 4 | { grep -oE 'T (first|second)=[a-zA-Z]*' || true; } | tr '\n' ' ')
+echo "   $frag"
+case "$frag" in *"first=failed"*) echo "   ok: the failed upgrade was reported";;
+    *) echo "   FAIL: a throwing upgrade handler was swallowed"; fail=1;; esac
+case "$frag" in *"second=usable"*) echo "   ok: the next open made the store properly";;
+    *) echo "   FAIL: the database was left half made"; fail=1;; esac
+
+echo "4. another origin cannot see it"
 vita "http://127.0.0.1:$PORT_A/origin.html" 3 >/dev/null
 other=$(vita "http://127.0.0.1:$PORT_B/origin.html" 3 | { grep -oE 'O secret=[^ ]*' || true; })
 mine=$(vita "http://127.0.0.1:$PORT_A/origin.html" 3 | { grep -oE 'O secret=[^ ]*' || true; })

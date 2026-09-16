@@ -1,0 +1,38 @@
+diff --git a/content/handlers/image/svg.c b/content/handlers/image/svg.c
+index 83beed9de..55c54b213 100644
+--- a/content/handlers/image/svg.c
++++ b/content/handlers/image/svg.c
+@@ -192,6 +192,13 @@ svg_redraw_internal(svg_content *svg,
+ 
+ 	assert(diagram);
+ 
++	/*
++	 * Scale both axes alike and centre what is left over, unless the
++	 * graphic asked not to (VitaSurf). Scaling them separately, as
++	 * this did, squashes anything drawn into a box that is not the
++	 * shape of the graphic: YouTube's wordmark came out crushed to a
++	 * third of its width.
++	 */
+ 	transform[0] = (float) width / (float) svg->base.width;
+ 	transform[1] = 0;
+ 	transform[2] = 0;
+@@ -199,6 +206,19 @@ svg_redraw_internal(svg_content *svg,
+ 	transform[4] = x;
+ 	transform[5] = y;
+ 
++	if (diagram->preserve_aspect &&
++	    svg->base.width > 0 && svg->base.height > 0) {
++		float scale = (transform[0] < transform[3]) ?
++				transform[0] : transform[3];
++
++		transform[4] += ((float) width -
++				 svg->base.width * scale) / 2;
++		transform[5] += ((float) height -
++				 svg->base.height * scale) / 2;
++		transform[0] = scale;
++		transform[3] = scale;
++	}
++
+ #define BGR(c) (((svgtiny_RED((c))) |					\
+ 		 (svgtiny_GREEN((c)) << 8) |				\
+ 		 (svgtiny_BLUE((c)) << 16)))

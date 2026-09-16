@@ -1,2 +1,3 @@
-url=https://assets-proxy.anthropic.com/claude-ai/v2/assets/v1/index-gEI3Boxg.js
-line=2:4300-5400
+url=https://claude.ai/login
+inline=1:900-1700
+inline=2:900-1700

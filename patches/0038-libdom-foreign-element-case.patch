@@ -1,0 +1,130 @@
+diff --git a/src/html/html_document.c b/src/html/html_document.c
+index 71b693a..22a6151 100644
+--- a/src/html/html_document.c
++++ b/src/html/html_document.c
+@@ -10,6 +10,8 @@
+ 
+ #include <dom/html/html_elements.h>
+ 
++#include <dom/dom.h>
++
+ #include "html/html_document.h"
+ #include "html/html_element.h"
+ #include "html/html_collection.h"
+@@ -557,9 +559,23 @@ _dom_html_document_create_element_internal(
+ 	if (dom_string_length(in_tag_name) == 0)
+ 		return DOM_INVALID_CHARACTER_ERR;
+ 
+-	exc = dom_string_toupper(in_tag_name, true, &params.name);
+-	if (exc != DOM_NO_ERR)
+-		return exc;
++	/*
++	 * Only HTML is case insensitive (VitaSurf).
++	 *
++	 * Upper-casing every name this document creates also renamed the
++	 * foreign elements, so an inline <svg> held <PATH> and
++	 * <LINEARGRADIENT>. SVG is case sensitive, so the names no
++	 * longer matched anything, in this DOM or in any markup written
++	 * back out from it.
++	 */
++	if (namespace == NULL ||
++	    dom_string_isequal(namespace, dom_namespaces[DOM_NAMESPACE_HTML])) {
++		exc = dom_string_toupper(in_tag_name, true, &params.name);
++		if (exc != DOM_NO_ERR)
++			return exc;
++	} else {
++		params.name = dom_string_ref(in_tag_name);
++	}
+ 
+ 	params.type = _dom_html_document_get_element_type(html, params.name);
+ 	params.doc = html;
+diff --git a/src/html/html_element.c b/src/html/html_element.c
+index c110455..8671ca9 100644
+--- a/src/html/html_element.c
++++ b/src/html/html_element.c
+@@ -6,6 +6,9 @@
+  */
+ 
+ #include <assert.h>
++#include <stdbool.h>
++
++#include <dom/dom.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
+@@ -174,6 +177,31 @@ SIMPLE_GET_SET(lang,lang)
+ SIMPLE_GET_SET(dir,dir)
+ SIMPLE_GET_SET(class_name,class)
+ 
++/**
++ * Should this element's attribute names be folded to lower case?
++ *
++ * Only HTML is case insensitive (VitaSurf). Folding every name also
++ * renamed the attributes of foreign elements, so an inline <svg> was
++ * left holding viewbox and gradientunits, which mean nothing to an SVG
++ * parser and left every such graphic unscaled.
++ */
++static bool html_element_folds_case(struct dom_element *element)
++{
++	dom_string *namespace = NULL;
++	bool folds = true;
++
++	if (dom_node_get_namespace(element, &namespace) != DOM_NO_ERR) {
++		return true;
++	}
++	if (namespace != NULL) {
++		folds = dom_string_isequal(namespace,
++				dom_namespaces[DOM_NAMESPACE_HTML]);
++		dom_string_unref(namespace);
++	}
++	return folds;
++}
++
++
+ dom_exception _dom_html_element_get_attribute(
+ 		struct dom_element *element,
+ 		dom_string *name, dom_string **value)
+@@ -181,6 +209,10 @@ dom_exception _dom_html_element_get_attribute(
+ 	dom_exception exc;
+ 	dom_string *lower_case_name;
+ 
++	if (html_element_folds_case(element) == false) {
++		return _dom_element_get_attribute(element, name, value);
++	}
++
+ 	exc = dom_string_tolower(name, true, &lower_case_name);
+ 	if (exc != DOM_NO_ERR) {
+ 		return exc;
+@@ -199,6 +231,10 @@ dom_exception _dom_html_element_set_attribute(
+ 	dom_exception exc;
+ 	dom_string *lower_case_name;
+ 
++	if (html_element_folds_case(element) == false) {
++		return _dom_element_set_attribute(element, name, value);
++	}
++
+ 	exc = dom_string_tolower(name, true, &lower_case_name);
+ 	if (exc != DOM_NO_ERR) {
+ 		return exc;
+@@ -217,6 +253,10 @@ dom_exception _dom_html_element_remove_attribute(
+ 	dom_exception exc;
+ 	dom_string *lower_case_name;
+ 
++	if (html_element_folds_case(element) == false) {
++		return _dom_element_remove_attribute(element, name);
++	}
++
+ 	exc = dom_string_tolower(name, true, &lower_case_name);
+ 	if (exc != DOM_NO_ERR) {
+ 		return exc;
+@@ -235,6 +275,10 @@ dom_exception _dom_html_element_has_attribute(
+ 	dom_exception exc;
+ 	dom_string *lower_case_name;
+ 
++	if (html_element_folds_case(element) == false) {
++		return _dom_element_has_attribute(element, name, result);
++	}
++
+ 	exc = dom_string_tolower(name, true, &lower_case_name);
+ 	if (exc != DOM_NO_ERR) {
+ 		return exc;
