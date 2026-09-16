@@ -241,6 +241,11 @@ def main(argv):
         'lch', 'color-mix', 'url', 'var', 'calc', 'attr', 'counter',
         'counters', 'format', 'local', 'rect', 'minmax', 'repeat',
         'fit-content', 'linear-gradient', 'radial-gradient',
+        # math functions, in calc's own grammar
+        'min', 'max', 'clamp',
+        # the transform functions whose translation is kept; the rest
+        # of a transform value is stepped over, not understood
+        'translate', 'translatex', 'translatey', 'translate3d', 'matrix',
     }
     print('\n== functions called in values, ones libcss knows marked')
     print('%8s  %s' % ('uses', 'function'))

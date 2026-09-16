@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>flex gap and justify-content</title><style>
+ body { margin: 0; }
+ .row { display: flex; width: 300px; }
+ .row div, .col div, .wrap div { width: 50px; height: 20px; background: #ddd; }
+ .col { display: flex; flex-direction: column; width: 100px; }
+ .wrap { display: flex; flex-wrap: wrap; width: 120px; }
+ #gap { gap: 20px; }
+ #between { justify-content: space-between; }
+ #center { justify-content: center; }
+ #end { justify-content: flex-end; }
+ #around { justify-content: space-around; }
+ #evenly { justify-content: space-evenly; }
+ #both { gap: 10px; justify-content: center; }
+ #rev { flex-direction: row-reverse; gap: 20px; }
+ #colgap { gap: 20px; }
+ #wrapgap { gap: 10px 20px; }
+ #automargin { justify-content: center; } #automargin div:first-child { margin-right: auto; }
+</style></head>
+<body>
+<div class="row" id="gap"><div id="g1"></div><div id="g2"></div><div id="g3"></div></div>
+<div class="row" id="between"><div id="b1"></div><div id="b2"></div><div id="b3"></div></div>
+<div class="row" id="center"><div id="c1"></div><div id="c2"></div><div id="c3"></div></div>
+<div class="row" id="end"><div id="e1"></div><div id="e2"></div><div id="e3"></div></div>
+<div class="row" id="around"><div id="a1"></div><div id="a2"></div><div id="a3"></div></div>
+<div class="row" id="evenly"><div id="v1"></div><div id="v2"></div><div id="v3"></div></div>
+<div class="row" id="both"><div id="o1"></div><div id="o2"></div><div id="o3"></div></div>
+<div class="row" id="rev"><div id="r1"></div><div id="r2"></div><div id="r3"></div></div>
+<div class="col" id="colgap"><div id="k1"></div><div id="k2"></div><div id="k3"></div></div>
+<div class="wrap" id="wrapgap"><div id="w1"></div><div id="w2"></div><div id="w3"></div></div>
+<div class="row" id="automargin"><div id="m1"></div><div id="m2"></div></div>
+<pre id="out"></pre>
+<script>
+/* Flex layout had neither gap nor justify-content: items always sat
+   flush against each other at the start of the line. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function L(id){ return Math.round(document.getElementById(id).getBoundingClientRect().left); }
+function Y(id){ var e = document.getElementById(id); return Math.round(e.getBoundingClientRect().top - e.parentNode.getBoundingClientRect().top); }
+function lefts(ids){ return ids.map(L).join(' '); }
+function tops(ids){ return ids.map(Y).join(' '); }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('gap 20px', lefts(['g1','g2','g3']));
+  T('space-between', lefts(['b1','b2','b3']));
+  T('center', lefts(['c1','c2','c3']));
+  T('flex-end', lefts(['e1','e2','e3']));
+  T('space-around', lefts(['a1','a2','a3']));
+  T('space-evenly', lefts(['v1','v2','v3']));
+  T('gap 10px and center', lefts(['o1','o2','o3']));
+  T('row-reverse with gap', lefts(['r1','r2','r3']));
+  T('column gap 20px', tops(['k1','k2','k3']));
+  T('wrap with row gap 10 column gap 20', lefts(['w1','w2','w3']) + ' / ' + tops(['w1','w2','w3']));
+  T('an auto margin beats justify-content', lefts(['m1','m2']));
+}, 200); });
+</script></body></html>

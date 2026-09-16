@@ -1,0 +1,213 @@
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 6e17cbebc..a6bc97a1e 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -102,6 +102,11 @@ struct flex_ctx {
+ 	bool main_reversed;
+ 	enum css_flex_wrap_e wrap;
+ 
++	/* gap between items along the main axis, and between lines
++	 * (VitaSurf) */
++	int main_gap;
++	int cross_gap;
++
+ 	struct flex_items {
+ 		size_t count;
+ 		struct flex_item_data *data;
+@@ -169,6 +174,25 @@ static struct flex_ctx *layout_flex_ctx__create(
+ 	ctx->horizontal = lh__flex_main_is_horizontal(flex);
+ 	ctx->main_reversed = lh__flex_direction_reversed(flex);
+ 
++	/*
++	 * gap (VitaSurf). column-gap runs between items in a row and
++	 * between the columns of a column container, row-gap the other
++	 * way about. A percentage would need the container's size, which
++	 * is not settled yet; it reads as no gap.
++	 */
++	{
++		int col = 0, row = 0;
++
++		css_computed_column_gap_px(flex->style, ctx->unit_len_ctx,
++				-1, &col);
++		css_computed_row_gap_px(flex->style, ctx->unit_len_ctx,
++				-1, &row);
++		ctx->main_gap = ctx->horizontal ? col : row;
++		ctx->cross_gap = ctx->horizontal ? row : col;
++		if (ctx->main_gap < 0) ctx->main_gap = 0;
++		if (ctx->cross_gap < 0) ctx->cross_gap = 0;
++	}
++
+ 	return ctx;
+ }
+ 
+@@ -439,6 +463,7 @@ static struct flex_line_data *layout_flex__build_line(struct flex_ctx *ctx,
+ 	enum box_side end_side = layout_flex__main_end_side(ctx);
+ 	struct flex_line_data *line;
+ 	int used_main = 0;
++	int placed = 0; /* items in flow on this line, for the gaps */
+ 
+ 	if (!layout_flex_ctx__ensure_line(ctx)) {
+ 		return NULL;
+@@ -455,19 +480,24 @@ static struct flex_line_data *layout_flex__build_line(struct flex_ctx *ctx,
+ 		struct box *b = item->box;
+ 		int pos_main;
+ 
++		int gap_before = (placed > 0 &&
++				lh__box_is_absolute(item->box) == false) ?
++				ctx->main_gap : 0;
++
+ 		pos_main = ctx->horizontal ?
+ 				item->main_size :
+ 				b->height + lh__delta_outer_main(ctx->flex, b);
+ 
+ 		if (ctx->wrap == CSS_FLEX_WRAP_NOWRAP ||
+-		    pos_main + used_main <= ctx->available_main ||
++		    pos_main + gap_before + used_main <= ctx->available_main ||
+ 		    lh__box_is_absolute(item->box) ||
+ 		    ctx->available_main == AUTO ||
+ 		    line->count == 0 ||
+ 		    pos_main == 0) {
+ 			if (lh__box_is_absolute(item->box) == false) {
+-				line->main_size += item->main_size;
+-				used_main += pos_main;
++				line->main_size += item->main_size + gap_before;
++				used_main += pos_main + gap_before;
++				placed++;
+ 
+ 				if (b->margin[start_side] == AUTO) {
+ 					line->main_auto_margin_count++;
+@@ -736,6 +766,18 @@ static bool layout_flex__resolve_line(
+ 
+ 	if (available_main == AUTO) {
+ 		available_main = INT_MAX;
++	} else {
++		/* the gaps between the items in flow are spoken for */
++		int in_flow = 0;
++
++		for (size_t i = line->first; i < item_count; i++) {
++			if (!lh__box_is_absolute(ctx->item.data[i].box)) {
++				in_flow++;
++			}
++		}
++		if (in_flow > 1) {
++			available_main -= ctx->main_gap * (in_flow - 1);
++		}
+ 	}
+ 
+ 	grow = (line->main_size < available_main);
+@@ -831,23 +873,75 @@ static bool layout_flex__place_line_items_main(
+ 	int main_pos = ctx->flex->padding[layout_flex__main_start_side(ctx)];
+ 	int post_multiplier = ctx->main_reversed ? 0 : 1;
+ 	int pre_multiplier = ctx->main_reversed ? -1 : 0;
++	int dir = ctx->main_reversed ? -1 : 1;
+ 	size_t item_count = line->first + line->count;
+ 	int extra_remainder = 0;
+ 	int extra = 0;
++	int in_flow = 0;
++	int free_main = 0;
++	int between = 0;	/* space added before each item but the first */
++	int placed = 0;
+ 
+ 	if (ctx->main_reversed) {
+ 		main_pos = lh__box_size_main(ctx->horizontal, ctx->flex) -
+ 				main_pos;
+ 	}
+ 
++	for (size_t i = line->first; i < item_count; i++) {
++		if (!lh__box_is_absolute(ctx->item.data[i].box)) {
++			in_flow++;
++		}
++	}
++
+ 	if (ctx->available_main != AUTO &&
+-	    ctx->available_main != UNKNOWN_WIDTH &&
+-	    ctx->available_main > line->used_main_size) {
+-		if (line->main_auto_margin_count > 0) {
+-			extra = ctx->available_main - line->used_main_size;
++	    ctx->available_main != UNKNOWN_WIDTH) {
++		free_main = ctx->available_main - line->used_main_size;
++		if (in_flow > 1) {
++			free_main -= ctx->main_gap * (in_flow - 1);
++		}
++		if (free_main < 0) {
++			free_main = 0;
++		}
++	}
+ 
+-			extra_remainder = extra % line->main_auto_margin_count;
+-			extra /= line->main_auto_margin_count;
++	if (free_main > 0 && line->main_auto_margin_count > 0) {
++		/* auto margins take all of it, and outrank justify-content */
++		extra = free_main;
++		extra_remainder = extra % line->main_auto_margin_count;
++		extra /= line->main_auto_margin_count;
++	} else if (free_main > 0) {
++		/*
++		 * justify-content (VitaSurf). Nothing read it before, so a
++		 * line's items always sat at its start. What is left after
++		 * the items and the gaps is placed as the container asks:
++		 * at the end, around the middle, or shared out between,
++		 * around or evenly about the items.
++		 */
++		switch (css_computed_justify_content(ctx->flex->style)) {
++		default:
++		case CSS_JUSTIFY_CONTENT_FLEX_START:
++			break;
++		case CSS_JUSTIFY_CONTENT_FLEX_END:
++			main_pos += dir * free_main;
++			break;
++		case CSS_JUSTIFY_CONTENT_CENTER:
++			main_pos += dir * (free_main / 2);
++			break;
++		case CSS_JUSTIFY_CONTENT_SPACE_BETWEEN:
++			if (in_flow > 1) {
++				between = free_main / (in_flow - 1);
++			}
++			break;
++		case CSS_JUSTIFY_CONTENT_SPACE_AROUND:
++			if (in_flow > 0) {
++				between = free_main / in_flow;
++				main_pos += dir * (between / 2);
++			}
++			break;
++		case CSS_JUSTIFY_CONTENT_SPACE_EVENLY:
++			between = free_main / (in_flow + 1);
++			main_pos += dir * between;
++			break;
+ 		}
+ 	}
+ 
+@@ -875,6 +969,13 @@ static bool layout_flex__place_line_items_main(
+ 		box_pos_main = ctx->horizontal ? &b->x : &b->y;
+ 
+ 		if (!lh__box_is_absolute(b)) {
++			/* the gap, and whatever justify-content shares out,
++			 * sits before every item in flow but the first */
++			if (placed > 0) {
++				main_pos += dir * (ctx->main_gap + between);
++			}
++			placed++;
++
+ 			if (b->margin[main_start] == AUTO) {
+ 				extra_pre = extra + extra_remainder;
+ 			}
+@@ -945,6 +1046,9 @@ static bool layout_flex__collect_items_into_lines(
+ 			return false;
+ 		}
+ 
++		if (ctx->line.count > 1) {
++			ctx->cross_size += ctx->cross_gap;
++		}
+ 		ctx->cross_size += line->cross_size;
+ 		if (ctx->main_size < line->main_size) {
+ 			ctx->main_size = line->main_size;
+@@ -1043,6 +1147,9 @@ static void layout_flex__place_lines(struct flex_ctx *ctx)
+ 	for (size_t i = 0; i < ctx->line.count; i++) {
+ 		struct flex_line_data *line = &ctx->line.data[i];
+ 
++		if (i > 0) {
++			line_pos += (reversed ? -1 : 1) * ctx->cross_gap;
++		}
+ 		line_pos += pre_multiplier * line->cross_size;
+ 		line->pos = line_pos;
+ 		line_pos += post_multiplier * line->cross_size +
