@@ -1,0 +1,89 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index d603a7a2a..5a5bb903f 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1368,6 +1368,84 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 		}
+ 	}
+ 
++	/*
++	 * text-overflow: ellipsis (VitaSurf). libcss has computed it all
++	 * along and nothing read it, so a title too long for its card was
++	 * cut mid-glyph. The property sits on the block whose overflow
++	 * hides the rest, so that block is found first, and this run only
++	 * matters if it crosses the block's content edge. What fits is
++	 * asked of the font, less the width of the ellipsis, and the run
++	 * is painted as that much followed by U+2026. A run that starts
++	 * beyond the edge is already clipped away by the block.
++	 */
++	{
++		struct box *block = box->parent;
++		int offset = 0;
++
++		while (block != NULL && (block->style == NULL ||
++				block->type == BOX_INLINE_CONTAINER ||
++				block->type == BOX_INLINE ||
++				block->type == BOX_INLINE_END ||
++				block->type == BOX_TEXT)) {
++			block = block->parent;
++		}
++
++		if (block != NULL && box->length > 0 &&
++				css_computed_text_overflow(block->style) ==
++					CSS_TEXT_OVERFLOW_ELLIPSIS &&
++				box_overflow_x(block) != CSS_OVERFLOW_VISIBLE) {
++			static const char ellipsis[] = "\xe2\x80\xa6";
++			struct box *b;
++			int content_right, available, ell_width = 0;
++			size_t fit = 0;
++			int fit_x = 0;
++			plot_font_style_t measure = fstyle;
++
++			/* the block's edge, in the painter's coordinates */
++			for (b = box; b != NULL && b != block; b = b->parent) {
++				offset += b->x;
++			}
++			content_right = x - offset * scale +
++					(block->padding[LEFT] + block->width) *
++					scale;
++			available = content_right - x;
++
++			if (x + box->width * scale > content_right &&
++					available > 0) {
++				if (scale != 1.0) {
++					measure.size = fstyle.size * scale;
++				}
++				guit->layout->width(&measure, ellipsis,
++						sizeof(ellipsis) - 1,
++						&ell_width);
++				if (available > ell_width) {
++					guit->layout->position(&measure,
++							box->text, box->length,
++							available - ell_width,
++							&fit, &fit_x);
++				}
++
++				if (fit > 0 && !text_redraw(box->text, fit,
++						box->byte_offset, 0, &fstyle,
++						x, y, clip, box->height, scale,
++						excluded, (struct content *)html,
++						html->sel, ctx))
++					return false;
++
++				if (available >= ell_width &&
++						!text_redraw(ellipsis,
++						sizeof(ellipsis) - 1, 0, 0,
++						&fstyle, x + fit_x, y, clip,
++						box->height, scale, true,
++						(struct content *)html,
++						html->sel, ctx))
++					return false;
++
++				return true;
++			}
++		}
++	}
++
+ 	if (!text_redraw(box->text,
+ 			 box->length,
+ 			 box->byte_offset,
