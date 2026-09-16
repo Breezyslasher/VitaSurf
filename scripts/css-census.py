@@ -233,6 +233,18 @@ def main(argv):
     print('%8d %6s  %s' % (sum(c for p, c in total.items() if vendor(p)), '-',
                            'in vendor prefixed properties, not counted above'))
 
+    # Most prefixed properties are the unprefixed one spelled for an old
+    # browser, and dropping them costs nothing. A few never got an
+    # unprefixed form that sites use -- -webkit-line-clamp is the one
+    # that truncates every card title -- so the biggest are listed too.
+    prefixed = sorted(((c, p) for p, c in total.items() if vendor(p)),
+                      reverse=True)[:12]
+    if prefixed:
+        print('\n== vendor prefixed, most declarations first')
+        print('%8s %6s  %s' % ('decls', 'sites', 'property'))
+        for count, prop in prefixed:
+            print('%8d %6d  %s' % (count, len(sites[prop]), prop))
+
     # The functions libcss's value parsers understand. A name that is not
     # here is one to look at: either the value is dropped, or the
     # function is one this list has not been told about yet.
