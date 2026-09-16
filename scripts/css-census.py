@@ -252,7 +252,9 @@ def main(argv):
         'rgb', 'rgba', 'hsl', 'hsla', 'hwb', 'oklch', 'oklab', 'lab',
         'lch', 'color-mix', 'url', 'var', 'calc', 'attr', 'counter',
         'counters', 'format', 'local', 'rect', 'minmax', 'repeat',
-        'fit-content', 'linear-gradient', 'radial-gradient',
+        'fit-content', 'linear-gradient', 'radial-gradient', 'conic-gradient',
+        'repeating-linear-gradient', '-webkit-linear-gradient',
+        '-webkit-gradient', 'light-dark', 'inset',
         # math functions, in calc's own grammar
         'min', 'max', 'clamp',
         # the transform functions whose translation is kept; the rest
