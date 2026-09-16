@@ -1,0 +1,478 @@
+diff --git a/src/bytecode/bytecode.h b/src/bytecode/bytecode.h
+index d799194..6f6d335 100644
+--- a/src/bytecode/bytecode.h
++++ b/src/bytecode/bytecode.h
+@@ -43,6 +43,9 @@ enum calc_opcodes {
+ 	CALC_SUBTRACT    = '-',
+ 	CALC_MULTIPLY    = '*',
+ 	CALC_DIVIDE      = '/',
++	/* min() and max(); clamp() is built out of the two (VitaSurf) */
++	CALC_MIN         = 'm',
++	CALC_MAX         = 'M',
+ 	CALC_FINISH      = '=',
+ };
+ 
+diff --git a/src/parse/properties/css_property_parser_gen.c b/src/parse/properties/css_property_parser_gen.c
+index fe1962d..3c5c6dd 100644
+--- a/src/parse/properties/css_property_parser_gen.c
++++ b/src/parse/properties/css_property_parser_gen.c
+@@ -336,7 +336,7 @@ void output_calc(FILE *outputf, struct keyval *parseid, struct keyval_list *kvli
+ 
+ 	fprintf(outputf,
+ 		"if ((token->type == CSS_TOKEN_FUNCTION) && "
+-		"(lwc_string_caseless_isequal(token->idata, c->strings[CALC], &match) == lwc_error_ok && match))"
++		"css__is_math_function(token->idata))"
+ 		" {\n"
+ 		"\t\terror = css__parse_calc(c, vector, ctx, result, buildOPV(%s, 0, %s), %s);\n"
+ 		"\t} else ",
+diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
+index ff3bea2..d91fff4 100644
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -993,7 +993,7 @@ static bool parse_hwb(
+ #define COLOUR_PI 3.14159265358979323846
+ 
+ /** Is this function called \a name? */
+-static bool colour_fn_is(lwc_string *s, const char *name, size_t len)
++static bool fn_name_is(lwc_string *s, const char *name, size_t len)
+ {
+ 	return lwc_string_length(s) == len &&
+ 		strncasecmp(lwc_string_data(s), name, len) == 0;
+@@ -1304,7 +1304,7 @@ static bool parse_color_mix(css_language *c,
+ 	/* "in <colorspace>" */
+ 	token = parserutils_vector_iterate(vector, ctx);
+ 	if (token == NULL || token->type != CSS_TOKEN_IDENT ||
+-			!colour_fn_is(token->idata, "in", 2)) {
++			!fn_name_is(token->idata, "in", 2)) {
+ 		return false;
+ 	}
+ 
+@@ -1313,8 +1313,8 @@ static bool parse_color_mix(css_language *c,
+ 	if (token == NULL || token->type != CSS_TOKEN_IDENT) {
+ 		return false;
+ 	}
+-	if (colour_fn_is(token->idata, "srgb", 4) ||
+-	    colour_fn_is(token->idata, "srgb-linear", 11)) {
++	if (fn_name_is(token->idata, "srgb", 4) ||
++	    fn_name_is(token->idata, "srgb-linear", 11)) {
+ 		perceptual = false;
+ 	}
+ 
+@@ -1544,23 +1544,23 @@ css_error css__parse_colour_specifier(css_language *c,
+ 				goto invalid;
+ 			}
+ 		/* The colour spaces a stylesheet uses now (VitaSurf) */
+-		} else if (colour_fn_is(token->idata, "oklch", 5)) {
++		} else if (fn_name_is(token->idata, "oklch", 5)) {
+ 			if (!parse_lab_like(vector, ctx, result, true, false)) {
+ 				goto invalid;
+ 			}
+-		} else if (colour_fn_is(token->idata, "oklab", 5)) {
++		} else if (fn_name_is(token->idata, "oklab", 5)) {
+ 			if (!parse_lab_like(vector, ctx, result, false, false)) {
+ 				goto invalid;
+ 			}
+-		} else if (colour_fn_is(token->idata, "lch", 3)) {
++		} else if (fn_name_is(token->idata, "lch", 3)) {
+ 			if (!parse_lab_like(vector, ctx, result, true, true)) {
+ 				goto invalid;
+ 			}
+-		} else if (colour_fn_is(token->idata, "lab", 3)) {
++		} else if (fn_name_is(token->idata, "lab", 3)) {
+ 			if (!parse_lab_like(vector, ctx, result, false, true)) {
+ 				goto invalid;
+ 			}
+-		} else if (colour_fn_is(token->idata, "color-mix", 9)) {
++		} else if (fn_name_is(token->idata, "color-mix", 9)) {
+ 			if (!parse_color_mix(c, vector, ctx, result)) {
+ 				goto invalid;
+ 			}
+@@ -2381,6 +2381,133 @@ css__parse_calc_number(
+ 	);
+ }
+ 
++/*
++ * min(), max() and clamp() (VitaSurf).
++ *
++ * These are math functions like calc(), usable anywhere calc() is, and
++ * sites reach for them constantly now: min() and max() alone account for
++ * 390 uses across the stylesheets measured here, in width, padding,
++ * font-size and gap -- the properties that decide how big a box is. An
++ * unparsed one takes its whole declaration with it, so a page written
++ * with them lays out at the wrong size rather than merely looking wrong.
++ *
++ * They compile to the same stack machine calc() does, with two new
++ * operations that pop two values and push the smaller or the larger.
++ * clamp(lo, val, hi) is min() and max() in sequence: the three values go
++ * on the stack, MIN leaves min(val, hi), and MAX leaves the answer.
++ */
++enum math_fn {
++	MATH_FN_NONE,
++	MATH_FN_CALC,
++	MATH_FN_MIN,
++	MATH_FN_MAX,
++	MATH_FN_CLAMP
++};
++
++/** Which math function is this, if any? */
++static enum math_fn math_fn_of(lwc_string *name)
++{
++	if (name == NULL) {
++		return MATH_FN_NONE;
++	}
++	if (fn_name_is(name, "calc", 4)) {
++		return MATH_FN_CALC;
++	}
++	if (fn_name_is(name, "min", 3)) {
++		return MATH_FN_MIN;
++	}
++	if (fn_name_is(name, "max", 3)) {
++		return MATH_FN_MAX;
++	}
++	if (fn_name_is(name, "clamp", 5)) {
++		return MATH_FN_CLAMP;
++	}
++	return MATH_FN_NONE;
++}
++
++/* exported interface documented in parse/properties/utils.h */
++bool css__is_math_function(lwc_string *name)
++{
++	return math_fn_of(name) != MATH_FN_NONE;
++}
++
++static css_error css__parse_calc_sum(css_language *c,
++		enum css_properties_e property,
++		const parserutils_vector *vector, int *ctx,
++		parserutils_buffer *result);
++
++/**
++ * Parse the arguments of a math function, the name already consumed.
++ *
++ * Stops on the closing bracket without consuming it, as the calc parsers
++ * around it do.
++ */
++static css_error css__parse_math_args(css_language *c,
++		enum css_properties_e property,
++		const parserutils_vector *vector, int *ctx,
++		parserutils_buffer *result, enum math_fn fn)
++{
++	css_code_t op = (fn == MATH_FN_MAX) ? CALC_MAX : CALC_MIN;
++	const css_token *token;
++	css_error error;
++	int args = 0;
++
++	for (;;) {
++		consumeWhitespace(vector, ctx);
++
++		error = css__parse_calc_sum(c, property, vector, ctx, result);
++		if (error != CSS_OK) {
++			return error;
++		}
++		args++;
++
++		/*
++		 * clamp() takes its three values first and folds them
++		 * afterwards; min() and max() fold as they go, so any
++		 * number of values works and the stack never grows.
++		 */
++		if (fn != MATH_FN_CLAMP && args > 1) {
++			error = css_error_from_parserutils_error(
++				parserutils_buffer_append(result,
++					(const uint8_t *)&op, sizeof(op)));
++			if (error != CSS_OK) {
++				return error;
++			}
++		}
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (!tokenIsChar(token, ',')) {
++			break;
++		}
++		parserutils_vector_iterate(vector, ctx);
++	}
++
++	if (fn == MATH_FN_CLAMP) {
++		css_code_t mn = CALC_MIN, mx = CALC_MAX;
++
++		if (args != 3) {
++			return CSS_INVALID;
++		}
++		error = css_error_from_parserutils_error(
++			parserutils_buffer_append(result,
++				(const uint8_t *)&mn, sizeof(mn)));
++		if (error != CSS_OK) {
++			return error;
++		}
++		error = css_error_from_parserutils_error(
++			parserutils_buffer_append(result,
++				(const uint8_t *)&mx, sizeof(mx)));
++		if (error != CSS_OK) {
++			return error;
++		}
++	} else if (args < 1) {
++		return CSS_INVALID;
++	}
++
++	return CSS_OK;
++}
++
+ static css_error
+ css__parse_calc_value(css_language *c,
+ 		enum css_properties_e property,
+@@ -2411,6 +2538,31 @@ css__parse_calc_value(css_language *c,
+ 		}
+ 		/* Consume the close-paren to complete this value */
+ 		parserutils_vector_iterate(vector, ctx);
++	} else if (token->type == CSS_TOKEN_FUNCTION &&
++			math_fn_of(token->idata) != MATH_FN_NONE) {
++		/* a math function nested inside another one (VitaSurf) */
++		enum math_fn fn = math_fn_of(token->idata);
++
++		parserutils_vector_iterate(vector, ctx);
++
++		if (fn == MATH_FN_CALC) {
++			consumeWhitespace(vector, ctx);
++			error = css__parse_calc_sum(c, property, vector, ctx,
++						    result);
++		} else {
++			error = css__parse_math_args(c, property, vector, ctx,
++						     result, fn);
++		}
++		if (error != CSS_OK) {
++			return error;
++		}
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (!tokenIsChar(token, ')')) {
++			return CSS_INVALID;
++		}
++		parserutils_vector_iterate(vector, ctx);
+ 	} else switch (token->type) {
+ 	case CSS_TOKEN_NUMBER:
+ 		error = css__parse_calc_number(vector, ctx, result);
+@@ -2486,6 +2638,9 @@ css__parse_calc_product(css_language *c,
+ 			break;
+ 		} else if (
+ 				tokenIsChar(token, ')') ||
++				/* one argument of a math function ends
++				 * here too (VitaSurf) */
++				tokenIsChar(token, ',') ||
+ 				tokenIsChar(token, '+') ||
+ 				tokenIsChar(token, '-'))
+ 			break;
+@@ -2546,6 +2701,14 @@ css__parse_calc_sum(css_language *c,
+ 			break;
+ 		} else if (tokenIsChar(token, ')'))
+ 			break;
++		else if (tokenIsChar(token, ','))
++			/*
++			 * The end of one argument of a math function
++			 * (VitaSurf). calc() itself takes no commas, and
++			 * its caller still insists on the close bracket,
++			 * so calc(1px, 2px) is rejected as before.
++			 */
++			break;
+ 		else if (tokenIsChar(token, '+'))
+ 			operator = CALC_ADD;
+ 		else if (tokenIsChar(token, '-'))
+@@ -2615,7 +2778,26 @@ css_error css__parse_calc(css_language *c,
+ 	if (error != CSS_OK)
+ 		goto cleanup;
+ 
+-	error = css__parse_calc_sum(c, property, vector, ctx, calc_buffer);
++	/*
++	 * The function's own token was consumed by the caller, so it is
++	 * the one just behind us; which one it was decides how the
++	 * arguments read (VitaSurf).
++	 */
++	{
++		const css_token *fn_token =
++			parserutils_vector_peek(vector, orig_ctx - 1);
++		enum math_fn fn = (fn_token != NULL &&
++				fn_token->type == CSS_TOKEN_FUNCTION) ?
++				math_fn_of(fn_token->idata) : MATH_FN_CALC;
++
++		if (fn == MATH_FN_NONE || fn == MATH_FN_CALC) {
++			error = css__parse_calc_sum(c, property, vector, ctx,
++						    calc_buffer);
++		} else {
++			error = css__parse_math_args(c, property, vector, ctx,
++						     calc_buffer, fn);
++		}
++	}
+ 	if (error != CSS_OK)
+ 		goto cleanup;
+ 
+diff --git a/src/parse/properties/utils.h b/src/parse/properties/utils.h
+index a079f35..39a70f3 100644
+--- a/src/parse/properties/utils.h
++++ b/src/parse/properties/utils.h
+@@ -65,6 +65,14 @@ enum border_side_e { BORDER_SIDE_TOP = 0, BORDER_SIDE_RIGHT = 1, BORDER_SIDE_BOT
+  * Post condition: \a *ctx is updated with the next token to process
+  *		   If the input is invalid, then \a *ctx remains unchanged.
+  */
++/**
++ * Is \a name one of the math functions -- calc, min, max or clamp?
++ *
++ * They are interchangeable wherever a math function is allowed, so the
++ * property parsers ask this rather than testing for calc alone.
++ */
++bool css__is_math_function(lwc_string *name);
++
+ css_error css__parse_border_side(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result, enum border_side_e side);
+diff --git a/src/select/calc.c b/src/select/calc.c
+index 387188e..8b1994a 100644
+--- a/src/select/calc.c
++++ b/src/select/calc.c
+@@ -268,6 +268,38 @@ css_error css_calculator_calculate(css_calculator *calc,
+ 			CALC_PUSH(u_left, v_left);
+ 			break;
+ 		}
++		case CALC_MIN: /* fallthrough */
++		case CALC_MAX: {
++			/*
++			 * min() and max() (VitaSurf). Both sides are
++			 * normalised to absolute units by the time they
++			 * reach the stack, so they compare directly; a
++			 * plain number cannot be compared with a length,
++			 * which is what the spec says too.
++			 */
++			unit u_left, u_right;
++			css_fixed v_left, v_right;
++			bool take_right;
++
++			CALC_POP(u_right, v_right);
++			CALC_POP(u_left, v_left);
++
++			if ((u_left == UNIT_CALC_NUMBER) !=
++					(u_right == UNIT_CALC_NUMBER)) {
++				return CSS_INVALID;
++			}
++
++			take_right = (op == CALC_MIN) ?
++					(v_right < v_left) :
++					(v_right > v_left);
++
++			if (take_right) {
++				CALC_PUSH(u_right, v_right);
++			} else {
++				CALC_PUSH(u_left, v_left);
++			}
++			break;
++		}
+ 		case CALC_FINISH: /* Should not happen */
+ 		default:
+ 			return CSS_INVALID;
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index 3e559a4..4daceb2 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -35,3 +35,4 @@ picturesize.dat			Picture sizing tests
+ logicalborder.dat		Logical border, size and gap tests
+ paint.dat			fill and stroke tests
+ colourfns.dat			oklch, oklab, lab and color-mix tests
++mathfns.dat			min, max and clamp tests
+diff --git a/test/data/parse2/mathfns.dat b/test/data/parse2/mathfns.dat
+new file mode 100644
+index 0000000..913de77
+--- /dev/null
++++ b/test/data/parse2/mathfns.dat
+@@ -0,0 +1,76 @@
++#data
++* { width: min(1px, 2px); }
++#errors
++#expected
++| *
++|  width: /* -> 0px */ calc(1px 2px min =)
++#reset
++
++#data
++* { width: max(50px, 10%); }
++#errors
++#expected
++| *
++|  width: /* -> 0px */ calc(50px 10% max =)
++#reset
++
++#data
++* { width: clamp(10px, 50%, 100px); }
++#errors
++#expected
++| *
++|  width: /* -> 0px */ calc(10px 50% 100px min max =)
++#reset
++
++#data
++* { width: min(1px, 2px, 3px); }
++#errors
++#expected
++| *
++|  width: /* -> 0px */ calc(1px 2px min 3px min =)
++#reset
++
++#data
++* { width: calc(100% - min(10px, 5%)); }
++#errors
++#expected
++| *
++|  width: /* -> 0px */ calc(100% 10px 5% min - =)
++#reset
++
++#data
++* { width: max(0px, calc(100% - 10px)); }
++#errors
++#expected
++| *
++|  width: /* -> 0px */ calc(0px 100% 10px - max =)
++#reset
++
++#data
++* { width: min(10px); }
++#errors
++#expected
++| *
++|  width: /* -> 0px */ calc(10px =)
++#reset
++
++#data
++* { width: clamp(1px, 2px); }
++#errors
++#expected
++| *
++#reset
++
++#data
++* { width: calc(1px, 2px); }
++#errors
++#expected
++| *
++#reset
++
++#data
++* { width: min(1px, 2px; }
++#errors
++#expected
++| *
++#reset
+diff --git a/test/dump.h b/test/dump.h
+index 46c8593..72a4c65 100644
+--- a/test/dump.h
++++ b/test/dump.h
+@@ -958,6 +958,12 @@ void dump_bytecode(css_style *style, char **ptr, uint32_t depth)
+ 				case CALC_DIVIDE:
+ 					*ptr += sprintf(*ptr, "/ ");
+ 					break;
++				case CALC_MIN:
++					*ptr += sprintf(*ptr, "min ");
++					break;
++				case CALC_MAX:
++					*ptr += sprintf(*ptr, "max ");
++					break;
+ 				case CALC_PUSH_VALUE: {
+ 					css_fixed num = *((css_fixed *)(void *)codeptr);
+ 					codeptr += sizeof(num);
