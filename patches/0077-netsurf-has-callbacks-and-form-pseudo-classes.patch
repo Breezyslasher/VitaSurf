@@ -1,0 +1,259 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 0e2169f7c..84bd7f266 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -44,6 +44,8 @@ static css_error named_generic_sibling_node(void *pw, void *node,
+ 		const css_qname *qname, void **sibling);
+ static css_error parent_node(void *pw, void *node, void **parent);
+ static css_error sibling_node(void *pw, void *node, void **sibling);
++static css_error first_child_node(void *pw, void *node, void **child);
++static css_error next_sibling_node(void *pw, void *node, void **sibling);
+ static css_error node_has_name(void *pw, void *node,
+ 		const css_qname *qname, bool *match);
+ static css_error node_has_class(void *pw, void *node,
+@@ -133,6 +135,9 @@ static css_select_handler selection_handler = {
+ 	ua_default_for_property,
+ 	set_libcss_node_data,
+ 	get_libcss_node_data,
++
++	first_child_node,
++	next_sibling_node,
+ };
+ 
+ /**
+@@ -710,6 +715,109 @@ css_error sibling_node(void *pw, void *node, void **sibling)
+ 	return CSS_OK;
+ }
+ 
++/**
++ * Find the first child element of a node (VitaSurf, for :has()).
++ *
++ * \param pw       Pointer to client-specific data (unused)
++ * \param node     DOM node
++ * \param child    Pointer to location to receive the child, or NULL
++ * \return CSS_OK.
++ *
++ * The reference is dropped straight away, the same as sibling_node:
++ * the document keeps every node alive for as long as selection runs.
++ */
++css_error first_child_node(void *pw, void *node, void **child)
++{
++	dom_node *n;
++	dom_exception err;
++
++	*child = NULL;
++
++	err = dom_node_get_first_child(node, &n);
++	if (err != DOM_NO_ERR || n == NULL)
++		return CSS_OK;
++
++	while (n != NULL) {
++		dom_node_type type;
++		dom_node *next;
++
++		err = dom_node_get_node_type(n, &type);
++		if (err != DOM_NO_ERR) {
++			dom_node_unref(n);
++			return CSS_OK;
++		}
++
++		if (type == DOM_ELEMENT_NODE)
++			break;
++
++		err = dom_node_get_next_sibling(n, &next);
++		if (err != DOM_NO_ERR) {
++			dom_node_unref(n);
++			return CSS_OK;
++		}
++
++		dom_node_unref(n);
++		n = next;
++	}
++
++	if (n != NULL) {
++		dom_node_unref(n);
++		*child = n;
++	}
++
++	return CSS_OK;
++}
++
++/**
++ * Find the next sibling element of a node (VitaSurf, for :has()).
++ *
++ * \param pw       Pointer to client-specific data (unused)
++ * \param node     DOM node
++ * \param sibling  Pointer to location to receive the sibling, or NULL
++ * \return CSS_OK.
++ */
++css_error next_sibling_node(void *pw, void *node, void **sibling)
++{
++	dom_node *n;
++	dom_exception err;
++
++	*sibling = NULL;
++
++	err = dom_node_get_next_sibling(node, &n);
++	if (err != DOM_NO_ERR || n == NULL)
++		return CSS_OK;
++
++	while (n != NULL) {
++		dom_node_type type;
++		dom_node *next;
++
++		err = dom_node_get_node_type(n, &type);
++		if (err != DOM_NO_ERR) {
++			dom_node_unref(n);
++			return CSS_OK;
++		}
++
++		if (type == DOM_ELEMENT_NODE)
++			break;
++
++		err = dom_node_get_next_sibling(n, &next);
++		if (err != DOM_NO_ERR) {
++			dom_node_unref(n);
++			return CSS_OK;
++		}
++
++		dom_node_unref(n);
++		n = next;
++	}
++
++	if (n != NULL) {
++		dom_node_unref(n);
++		*sibling = n;
++	}
++
++	return CSS_OK;
++}
++
+ /**
+  * Callback to determine if a node has the given name.
+  *
+@@ -1600,11 +1708,54 @@ css_error node_is_focus(void *pw, void *node, bool *match)
+  *
+  * \post \a match with contain true if the node is enabled and false otherwise.
+  */
+-css_error node_is_enabled(void *pw, void *node, bool *match)
++/**
++ * Whether a node is a form control that can carry the disabled
++ * attribute (VitaSurf).
++ */
++static bool node_is_form_control(dom_node *n)
+ {
+-	/** \todo Support enabled nodes */
++	dom_string *name;
++	dom_exception err;
++	bool is;
+ 
+-	*match = false;
++	err = dom_node_get_node_name(n, &name);
++	if (err != DOM_NO_ERR || name == NULL)
++		return false;
++
++	is = dom_string_caseless_isequal(name, corestring_dom_input) ||
++		dom_string_caseless_isequal(name, corestring_dom_button) ||
++		dom_string_caseless_isequal(name, corestring_dom_select) ||
++		dom_string_caseless_isequal(name, corestring_dom_textarea) ||
++		dom_string_caseless_isequal(name, corestring_dom_option) ||
++		dom_string_caseless_isequal(name, corestring_dom_optgroup) ||
++		dom_string_caseless_isequal(name, corestring_dom_fieldset);
++
++	dom_string_unref(name);
++
++	return is;
++}
++
++/**
++ * Whether a form control carries the disabled attribute (VitaSurf).
++ * A control inside a disabled fieldset is not looked for.
++ */
++static bool node_has_disabled_attribute(dom_node *n)
++{
++	bool has = false;
++
++	if (dom_element_has_attribute(n, corestring_dom_disabled, &has) !=
++			DOM_NO_ERR)
++		return false;
++
++	return has;
++}
++
++css_error node_is_enabled(void *pw, void *node, bool *match)
++{
++	/* :enabled is a form control without the disabled attribute
++	 * (VitaSurf: was a stub that never matched) */
++	*match = node_is_form_control(node) &&
++			node_has_disabled_attribute(node) == false;
+ 
+ 	return CSS_OK;
+ }
+@@ -1621,9 +1772,9 @@ css_error node_is_enabled(void *pw, void *node, bool *match)
+  */
+ css_error node_is_disabled(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support disabled nodes */
+-
+-	*match = false;
++	/* VitaSurf: was a stub that never matched */
++	*match = node_is_form_control(node) &&
++			node_has_disabled_attribute(node);
+ 
+ 	return CSS_OK;
+ }
+@@ -1640,10 +1791,34 @@ css_error node_is_disabled(void *pw, void *node, bool *match)
+  */
+ css_error node_is_checked(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support checked nodes */
++	/*
++	 * The checked attribute on an input, or selected on an option
++	 * (VitaSurf: was a stub that never matched). This is the
++	 * markup's state, not the form gadget's: toggling a box does
++	 * not restyle its label yet.
++	 */
++	dom_node *n = node;
++	dom_string *name;
++	dom_exception err;
+ 
+ 	*match = false;
+ 
++	err = dom_node_get_node_name(n, &name);
++	if (err != DOM_NO_ERR || name == NULL)
++		return CSS_OK;
++
++	if (dom_string_caseless_isequal(name, corestring_dom_input)) {
++		if (dom_element_has_attribute(n, corestring_dom_checked,
++				match) != DOM_NO_ERR)
++			*match = false;
++	} else if (dom_string_caseless_isequal(name, corestring_dom_option)) {
++		if (dom_element_has_attribute(n, corestring_dom_selected,
++				match) != DOM_NO_ERR)
++			*match = false;
++	}
++
++	dom_string_unref(name);
++
+ 	return CSS_OK;
+ }
+ 
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index 8a60626af..d5a2aa782 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -340,6 +340,14 @@ CORESTRING_DOM_STRING(TITLE);
+ CORESTRING_DOM_STRING(BODY);
+ CORESTRING_DOM_STRING(HEAD);
+ CORESTRING_DOM_STRING(SCRIPT);
++/* Form control names and attributes for :checked and :disabled
++ * (VitaSurf, content/handlers/css/select.c) */
++CORESTRING_DOM_STRING(checked);
++CORESTRING_DOM_STRING(disabled);
++CORESTRING_DOM_STRING(option);
++CORESTRING_DOM_STRING(optgroup);
++CORESTRING_DOM_STRING(textarea);
++CORESTRING_DOM_STRING(fieldset);
+ /* DOM input types, not really CSS */
+ CORESTRING_DOM_STRING(button);
+ CORESTRING_DOM_STRING(image);

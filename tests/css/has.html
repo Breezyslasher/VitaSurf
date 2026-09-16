@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>:has() selector matching</title>
+<style>
+.box { width: 100px; height: 12px; background: #ccc; margin: 2px 0; }
+/* a: descendant */
+.a:has(img) { width: 60px; }
+/* b: descendant, none present: stays 100 */
+.b:has(img) { width: 60px; }
+/* c: child combinator, image is a grandchild so no match */
+.c:has(> img) { width: 60px; }
+/* d: child combinator, direct child */
+.d:has(> img) { width: 60px; }
+/* e: next sibling */
+.e:has(+ .after) { width: 60px; }
+/* f: later sibling, not adjacent */
+.f:has(~ .later) { width: 60px; }
+/* g: list of arguments, second one matches */
+.g:has(> .nope, > .yes) { width: 60px; }
+/* h: argument with pseudo-class */
+.h:has(input:checked) { width: 60px; }
+/* i: :not(:has()) */
+.i:not(:has(img)) { width: 60px; }
+/* j: attribute argument, deep descendant */
+.j:has([data-x]) { width: 60px; }
+/* k: specificity: :has(.yes) (0,1,0) + .k (0,1,0) beats .k.k2? no: .k.k2 is (0,2,0) equal, later wins */
+.k.k2 { width: 100px; }
+.k:has(.yes) { width: 60px; }
+/* l: :has(#id) should have id specificity and beat .l.l2 */
+.l.l2 { width: 100px; }
+.l:has(#deep) { width: 60px; }
+</style>
+</head>
+<body>
+<div class="box a"><span><img alt=""></span></div>
+<div class="box b"><span>no image</span></div>
+<div class="box c"><span><img alt=""></span></div>
+<div class="box d"><img alt=""></div>
+<div class="box e"></div><div class="after"></div>
+<div class="box f"></div><div class="mid"></div><div class="later"></div>
+<div class="box g"><span class="yes"></span></div>
+<div class="box h"><label><input type="checkbox" checked></label></div>
+<div class="box i"><span>no image</span></div>
+<div class="box j"><p><em><b data-x="1"></b></em></p></div>
+<div class="box k k2"><span class="yes"></span></div>
+<div class="box l l2"><span><i id="deep"></i></span></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function W(sel){ return Math.round(document.querySelector(sel).getBoundingClientRect().width); }
+var cases = [
+  ['descendant img present', '.a', 60],
+  ['descendant img absent', '.b', 100],
+  ['child img is a grandchild', '.c', 100],
+  ['child img direct', '.d', 60],
+  ['next sibling', '.e', 60],
+  ['later sibling', '.f', 60],
+  ['argument list', '.g', 60],
+  ['pseudo-class in argument', '.h', 60],
+  ['not(has())', '.i', 60],
+  ['attribute deep descendant', '.j', 60],
+  ['class specificity ties, later wins', '.k', 60],
+  ['id specificity from the argument', '.l', 60]
+];
+window.addEventListener('load', function(){ setTimeout(function(){
+  for (var i = 0; i < cases.length; i++) {
+    var got = W(cases[i][1]);
+    T(cases[i][0], got + (got == cases[i][2] ? '' : ' (expected ' + cases[i][2] + ')'));
+  }
+}, 200); });
+</script>
+</body>
+</html>
