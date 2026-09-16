@@ -1,0 +1,24 @@
+name: CSS census
+
+# Counts the CSS declarations real pages send and prints the ones libcss
+# drops, so a batch of properties is chosen from what sites write rather
+# than from what seems likely. Edit fixtures/css-census.txt and push.
+
+on:
+  push:
+    paths:
+      - fixtures/css-census.txt
+      - scripts/css-census.py
+      - .github/workflows/css-census.yml
+  workflow_dispatch:
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Count what is understood and what is dropped
+        run: python3 scripts/css-census.py fixtures/css-census.txt
