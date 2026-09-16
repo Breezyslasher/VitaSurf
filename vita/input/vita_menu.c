@@ -64,6 +64,7 @@ enum item {
 	ITEM_HISTORY,
 	ITEM_DOWNLOADS,
 	ITEM_HOME,
+	ITEM_WIFI_LOGIN,
 	ITEM_ZOOM_IN,
 	ITEM_ZOOM_OUT,
 	ITEM_ZOOM_RESET,
@@ -550,6 +551,18 @@ static void activate(enum item item)
 		go(nsoption_charp(homepage_url) != NULL ?
 		   nsoption_charp(homepage_url) : "file:///resources/vitasurf.html");
 		break;
+	case ITEM_WIFI_LOGIN:
+		/*
+		 * A captive portal can only take over a plain HTTP page:
+		 * an HTTPS one fails its certificate check instead, which
+		 * is what every https:// home page does on a hotel
+		 * network until the sign-in is done. This page is fetched
+		 * over HTTP and answers "Success" when the network is
+		 * open, so the portal's redirect, if any, lands here.
+		 */
+		vita_menu_close();
+		go("http://captive.apple.com/hotspot-detect.html");
+		break;
 	case ITEM_ZOOM_IN:
 		zoom(10);
 		break;
@@ -645,6 +658,9 @@ static void item_label(enum item item, char *buf, size_t len)
 		break;
 	case ITEM_HOME:
 		snprintf(buf, len, "Home page");
+		break;
+	case ITEM_WIFI_LOGIN:
+		snprintf(buf, len, "Sign in to Wi-Fi (hotel, cafe)");
 		break;
 	case ITEM_ZOOM_IN:
 		snprintf(buf, len, "Zoom in (now %d%%)", zoom_percent());

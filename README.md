@@ -85,6 +85,31 @@ whole page when a flex container was followed by a block with a top
 margin. Verified natively with NetSurf's monkey frontend on a set of test
 pages; not yet checked on hardware.
 
+CSS coverage was then widened by what a census of real stylesheets
+(`scripts/css-census.py`, run by the `CSS census` workflow) said sites
+actually send. Patches 0075 to 0084 add, in order: media query range
+syntax (`(width >= 40rem)`, which Tailwind v4 writes for every
+breakpoint and which libcss had evaluated wrongly) and `@container`
+evaluated against the viewport; the `:has()` selector, with NetSurf's
+`:checked`, `:enabled` and `:disabled` made real; at-rules nested inside
+`@media` (`@supports`, `@layer`, `@media` and `@keyframes` in a media
+block used to take the block with them); `clip-path: inset()`, the
+visually-hidden pattern, and `light-dark()`; forty-two properties that
+have no effect on a static page (transitions, `user-select`,
+`appearance`, scroll steering, font variation axes) accepted rather than
+dropped; `position: sticky` and `position: fixed` pinned to the viewport
+at redraw, painted above the content they overlap, with the framebuffer
+frontend redrawing instead of panning on such pages; and gradient
+backgrounds (`linear-gradient()`, the `-webkit-` forms, `radial-` and
+`conic-` as their average colour) painted as alpha-blended strips, with
+the knockout renderer taught that a translucent fill does not hide what
+is under it. After this the census counts one to four percent of
+declarations dropped on GitHub, MDN, Bootstrap and Tailwind's own pages;
+what remains is mostly `filter`, `mask-size`, rotation and scaling
+transforms, and vendor prefixed properties. Each patch has a page under
+`tests/css/` that the monkey frontend checks; none of this batch has
+been verified on hardware yet.
+
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic
 overflowed 32 bits and the plotter read before the image (a data abort in
@@ -309,7 +334,7 @@ fails for every charset, so libparserutils is built with its own codecs and
 | Tap or Cross on a text field | Opens the system keyboard for that field |
 | Square | Reload |
 | Select | Toggle pointer mode: the D-pad nudges the pointer instead |
-| Start | Menu: bookmarks, history, home, JavaScript and image toggles, quit |
+| Start | Menu: bookmarks, history, downloads, home, Wi-Fi sign-in, zoom, JavaScript, image and dark mode toggles, quit |
 | Front touch | Tap to click, drag to scroll |
 | Select + Start | Quit |
 
