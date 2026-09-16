@@ -52,10 +52,18 @@
 # Build 233: undefined instruction on the main thread after leaving
 #   m.youtube.com for the history page and following a link back to it.
 #   The log stops immediately after YouTube's 1.7 MB player script ran.
-#   r3 and r12 both held 0xdeadbeef and the program counter was even
-#   while the code around it is Thumb, which is what calling through a
-#   corrupted function pointer looks like: the core has the module at
-#   0x81006000, so pc 0x813a494e is +0x39e94e and the link register
-#   +0x39e91b, both inside one function.
+#   Resolved against build 233's own ELF (the disasm workflow): both
+#   offsets are inside newlib's _kill_r, the program counter on its
+#   closing "udf #255" and the link register on the instruction after
+#   its call to sceKernelGetProcessId. _kill_r turns SIGINT and SIGTERM
+#   into an exit, ignores two more, and traps on every other signal, so
+#   landing there means raise() was called with something else -- which
+#   is abort(), and on this build abort() is reached from a failed
+#   assert(). It is not a corrupted function pointer: a Thumb
+#   instruction sits at an even address, so an even program counter
+#   says nothing, and the first reading of this dump was wrong.
+#
+#   Which assertion it was the dump cannot say, so the build now names
+#   the failing expression, file and line in the log before it aborts.
 0x39e94e
 0x39e91b
