@@ -1219,11 +1219,43 @@ function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(va
  case 'color':return true;case 'monochrome':return false;case 'grid':return false;
  case 'scripting':return value==='enabled';
  default:return false;}}
+/* A feature written with no value asks whether it has a value at all:
+   (hover) is true unless hover is none, (monochrome) unless it is zero.
+   This used to be answered by asking for min-<feature>: 1, which means
+   nothing for a feature that is not a range and so said no to all of
+   them. YouTube gates its whole device theme on (prefers-color-scheme)
+   matching before it ever asks for dark, so dark mode did nothing
+   there however the browser was set. */
+function mediaFeatureBool(name){
+ switch(name){
+ /* there is always one scheme or the other */
+ case 'prefers-color-scheme':return true;
+ /* reported as no-preference or none, so the bare query is false */
+ case 'prefers-reduced-motion':case 'prefers-reduced-transparency':
+ case 'prefers-contrast':case 'forced-colors':case 'inverted-colors':
+  return false;
+ case 'pointer':case 'any-pointer':return true;   /* coarse */
+ case 'hover':case 'any-hover':return false;      /* none */
+ case 'monochrome':return false;                  /* a colour screen */
+ /* the size of a colour lookup table, which a true colour screen
+    does not have */
+ case 'color-index':return false;
+ case 'grid':return false;                        /* not a grid device */
+ case 'color':case 'orientation':case 'display-mode':
+ case 'scripting':case 'update':case 'width':case 'height':
+ case 'aspect-ratio':case 'resolution':case 'device-width':
+ case 'device-height':case 'device-aspect-ratio':
+  return true;
+ default:return undefined;
+ }
+}
 function mediaTerm(t){t=t.replace(/^\s+|\s+$/g,'');
  if(!t)return true;
  if(/^not\s/i.test(t))return !mediaTerm(t.slice(4));
  if(t.charAt(0)==='('){var m=/^\(\s*([\w-]+)\s*(?::\s*([^)]*?))?\s*\)$/.exec(t);if(!m)return false;
-  if(m[2]===undefined)return mediaFeature('min-'+m[1],'1')||m[1]==='color';
+  if(m[2]===undefined){var bare=mediaFeatureBool(m[1].toLowerCase());
+   if(bare!==undefined)return bare;
+   return mediaFeature('min-'+m[1],'1')||m[1]==='color';}
   return mediaFeature(m[1].toLowerCase(),String(m[2]).replace(/^\s+|\s+$/g,''));}
  var type=t.toLowerCase();return type==='all'||type==='screen';}
 function mediaMatches(q){q=String(q||'');if(!q)return true;

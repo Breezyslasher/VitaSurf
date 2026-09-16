@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>bare media features</title></head>
+<body><pre id="out"></pre>
+<script>
+/* A media feature written with no value asks whether it has a value at
+   all. Answering no to all of them is how YouTube decided this browser
+   had no colour scheme preference: it gates its device theme on
+   (prefers-color-scheme) matching before it ever asks for dark. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function bare(f){ return matchMedia('(' + f + ')').matches; }
+window.addEventListener('load', function(){ setTimeout(function(){
+  ['prefers-color-scheme', 'prefers-reduced-motion', 'forced-colors',
+   'inverted-colors', 'monochrome', 'grid', 'color', 'color-index',
+   'orientation', 'display-mode', 'width', 'height', 'aspect-ratio',
+   'resolution'].forEach(function(f){ T(f, bare(f)); });
+  T('the gate YouTube checks',
+    matchMedia('(prefers-color-scheme)').matches &&
+    typeof matchMedia('(prefers-color-scheme: dark)').matches === 'boolean');
+}, 200); });
+</script></body></html>
