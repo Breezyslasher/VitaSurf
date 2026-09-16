@@ -1,0 +1,106 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index b85e22fca..1f2b8ef14 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5168,6 +5168,62 @@ static void layout_compute_relative_offset(
+ }
+ 
+ 
++/**
++ * Find how far a transform moves a box (VitaSurf).
++ *
++ * Only the translation is honoured; see enum css_transform_e. A
++ * percentage is a fraction of the box's own border box, which is why
++ * this waits until layout has settled the box's size.
++ *
++ * \param  unit_len_ctx  Length conversion context
++ * \param  box  box to inspect
++ * \param  x    updated to the horizontal offset
++ * \param  y    updated to the vertical offset
++ */
++static void layout_compute_transform_offset(
++		const css_unit_ctx *unit_len_ctx,
++		struct box *box,
++		int *x,
++		int *y)
++{
++	css_fixed hlength = 0, vlength = 0;
++	css_unit hunit = CSS_UNIT_PX, vunit = CSS_UNIT_PX;
++	int border_width, border_height;
++
++	*x = *y = 0;
++
++	if (box->style == NULL ||
++			css_computed_transform(box->style, &hlength, &hunit,
++					&vlength, &vunit) !=
++					CSS_TRANSFORM_SET) {
++		return;
++	}
++
++	/* FPCT_OF_INT_TOINT does not bracket its arguments, so the size
++	 * has to be worked out before it is handed over. */
++	border_width = box->border[LEFT].width + box->padding[LEFT] +
++			box->width + box->padding[RIGHT] +
++			box->border[RIGHT].width;
++	border_height = box->border[TOP].width + box->padding[TOP] +
++			box->height + box->padding[BOTTOM] +
++			box->border[BOTTOM].width;
++
++	if (hunit == CSS_UNIT_PCT) {
++		*x = FPCT_OF_INT_TOINT(hlength, border_width);
++	} else {
++		*x = FIXTOINT(css_unit_len2device_px(box->style, unit_len_ctx,
++				hlength, hunit));
++	}
++
++	if (vunit == CSS_UNIT_PCT) {
++		*y = FPCT_OF_INT_TOINT(vlength, border_height);
++	} else {
++		*y = FIXTOINT(css_unit_len2device_px(box->style, unit_len_ctx,
++				vlength, vunit));
++	}
++}
++
++
+ /**
+  * Adjust positions of relatively positioned boxes.
+  *
+@@ -5217,6 +5273,23 @@ layout_position_relative(
+ 		else
+ 			x = y = 0;
+ 
++		/*
++		 * A transform that only moves the box is the same kind of
++		 * adjustment as position: relative, so it is applied in the
++		 * same walk (VitaSurf). Doing it here rather than at paint
++		 * time means hit testing, the descendant bounding boxes and
++		 * the scrollable extent all see it, because this runs before
++		 * layout_calculate_descendant_bboxes().
++		 */
++		if (box->style != NULL) {
++			int tx, ty;
++
++			layout_compute_transform_offset(unit_len_ctx, box,
++					&tx, &ty);
++			x += tx;
++			y += ty;
++		}
++
+ 		/* Adjust float coordinates.
+ 		 * (note float x and y are relative to their block formatting
+ 		 * context box and not their parent) */
+@@ -5251,10 +5324,10 @@ layout_position_relative(
+ 		/* recurse first */
+ 		layout_position_relative(unit_len_ctx, box, fn, fnx, fny);
+ 
+-		/* Ignore things we're not interested in. */
+-		if (!box->style || (box->style &&
+-				css_computed_position(box->style) !=
+-				CSS_POSITION_RELATIVE))
++		/* Ignore things we're not interested in. A transformed box
++		 * is moved whatever its position property says, so the test
++		 * is on the offset rather than on being relative. */
++		if (x == 0 && y == 0)
+ 			continue;
+ 
+ 		box->x += x;

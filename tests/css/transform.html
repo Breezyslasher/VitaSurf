@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>transform translate</title><style>
+ body { margin: 0; }
+ #wrap { width: 400px; position: relative; }
+ div.b { width: 100px; height: 20px; background: #ddd; }
+ #plain  { }
+ #tx     { transform: translateX(30px); }
+ #ty     { transform: translateY(15px); }
+ #txy    { transform: translate(10px, 5px); }
+ #tpc    { transform: translate(50%, 50%); }
+ #trot   { transform: rotate(45deg); }
+ #tmix   { transform: translateX(20px) rotate(45deg) translateY(10px); }
+ #tmat   { transform: matrix(1, 0, 0, 1, 25, 12); }
+ #tprop  { translate: 40px 8px; }
+ #tnone  { transform: none; }
+ /* the box a tap has to land on after it has been moved */
+ #hit    { transform: translate(120px, 0); }
+</style></head>
+<body>
+<div id="wrap">
+ <div class="b" id="plain"></div>
+ <div class="b" id="tx"></div>
+ <div class="b" id="ty"></div>
+ <div class="b" id="txy"></div>
+ <div class="b" id="tpc"></div>
+ <div class="b" id="trot"></div>
+ <div class="b" id="tmix"></div>
+ <div class="b" id="tmat"></div>
+ <div class="b" id="tprop"></div>
+ <div class="b" id="tnone"></div>
+ <div class="b" id="hit"></div>
+</div>
+<pre id="out"></pre>
+<script>
+/* transform is the most used property this browser did not understand.
+   Only the translation is applied, so a box that is only rotated or
+   scaled has to stay exactly where it was. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function R(id){ return document.getElementById(id).getBoundingClientRect(); }
+function dx(id){ return Math.round(R(id).left - R('plain').left); }
+function dy(id){ return Math.round(R(id).top - R('plain').top -
+    (document.getElementById(id).offsetTop - document.getElementById('plain').offsetTop)); }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('translateX(30px) moves it right', dx('tx'));
+  T('translateY(15px) does not move it sideways', dx('ty'));
+  T('translate(10px, 5px) moves it right', dx('txy'));
+  T('translate(50%) of a 100px box', dx('tpc'));
+  T('rotate alone leaves it where it was', dx('trot'));
+  T('a translate either side of a rotate', dx('tmix'));
+  T('matrix takes its last two numbers', dx('tmat'));
+  T('the translate property', dx('tprop'));
+  T('none leaves it where it was', dx('tnone'));
+
+  /* A tap has to land on the box where it ended up, not where it was
+     laid out, so hit testing has to see the same offset painting does.
+     elementFromPoint walks the same box tree the touchscreen does. */
+  var r = R('hit');
+  var mid = Math.round(r.top + r.height / 2);
+  var inside = document.elementFromPoint(Math.round(r.left + 10), mid);
+  var vacated = document.elementFromPoint(10, mid);
+  T('a tap where the box now is finds it', inside ? inside.id : 'nothing');
+  T('a tap where it was laid out does not', vacated ? vacated.id : 'nothing');
+}, 200); });
+</script></body></html>
