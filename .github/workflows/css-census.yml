@@ -22,3 +22,5 @@ jobs:
 
       - name: Count what is understood and what is dropped
         run: python3 scripts/css-census.py fixtures/css-census.txt
+        env:
+          CENSUS_CUTOFF: "20"

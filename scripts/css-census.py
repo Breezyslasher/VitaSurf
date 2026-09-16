@@ -167,6 +167,7 @@ def main(argv):
                      if l.strip() and not l.startswith('#')]
         else:
             urls.append(arg)
+    cutoff = int(os.environ.get('CENSUS_CUTOFF', '20'))
     known = known_properties()
     print('libcss knows %d properties\n' % len(known))
 
@@ -191,12 +192,24 @@ def main(argv):
             total[prop] = total.get(prop, 0) + count
             sites.setdefault(prop, set()).add(url)
 
-    print('\n== dropped, most declarations first')
+    # A vendor prefixed property is the same property spelled for one
+    # browser, and a browser that does not answer to the prefix is meant
+    # to ignore it, so those are counted but not listed.
+    def vendor(p):
+        return p.startswith(('-webkit-', '-moz-', '-ms-', '-o-'))
+
+    ranked = sorted(((c, prop) for prop, c in total.items() if not vendor(prop)),
+                    reverse=True)
+    shown = [(c, p) for c, p in ranked if c >= cutoff]
+    print('\n== dropped, most declarations first (%d or more)' % cutoff)
     print('%8s %6s  %s' % ('decls', 'sites', 'property'))
-    for prop, count in sorted(total.items(), key=lambda kv: -kv[1]):
-        vendor = prop.startswith(('-webkit-', '-moz-', '-ms-', '-o-'))
-        print('%8d %6d  %s%s' % (count, len(sites[prop]), prop,
-                                 '   (vendor)' if vendor else ''))
+    for count, prop in shown:
+        print('%8d %6d  %s' % (count, len(sites[prop]), prop))
+    rest = sum(c for c, _ in ranked[len(shown):])
+    print('%8d %6s  %s' % (rest, '-', 'in %d further properties under %d'
+                           % (len(ranked) - len(shown), cutoff)))
+    print('%8d %6s  %s' % (sum(c for p, c in total.items() if vendor(p)), '-',
+                           'in vendor prefixed properties, not counted above'))
     return 0
 
 
