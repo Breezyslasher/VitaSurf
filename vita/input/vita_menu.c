@@ -193,11 +193,21 @@ static void html_escape(FILE *f, const char *s)
 
 static void page_head(FILE *f, const char *title)
 {
+	/*
+	 * The bookmarks, history and downloads pages are written by the
+	 * browser, so they follow its own dark mode setting rather than
+	 * waiting for a site to be asked (VitaSurf). They stayed light
+	 * when everything else went dark.
+	 */
 	fprintf(f, "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n"
 		"<title>%s</title>\n<style>\n"
 		"body{font-family:sans-serif;margin:16px;background:#f4f4f4;color:#222}\n"
 		"h1{font-size:22px}\nli{margin:6px 0}\n"
 		".u{color:#777;font-size:13px}\n.t{color:#777;font-size:13px}\n"
+		"@media (prefers-color-scheme: dark){\n"
+		"body{background:#1b1b1b;color:#e8e8e8}\n"
+		"a{color:#79b8ff}\na:visited{color:#c8a2ff}\n"
+		".u,.t{color:#a0a0a0}\n}\n"
 		"</style></head><body>\n<h1>%s</h1>\n", title, title);
 }
 

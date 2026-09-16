@@ -1,0 +1,32 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>location</title>
+<script>
+/* Read location the moment the parser reaches this script, which is
+   what a single page app does to work out its own address. */
+window.__early = { href: location.href, protocol: location.protocol,
+                   host: location.host, origin: location.origin };
+</script></head>
+<body><pre id="out"></pre>
+<script>
+var o=document.getElementById('out');
+function T(n,v){o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+window.addEventListener('load',function(){setTimeout(function(){
+ var e=window.__early;
+ T('early protocol', e.protocol);
+ T('early host is the server', e.host.indexOf(':') > 0);
+ T('early href starts with http', e.href.indexOf('http') === 0);
+ T('early matches late protocol', e.protocol === location.protocol);
+ /* exactly what Home Assistant does: capture the address early,
+    then build its login redirect from it */
+ T('a redirect built from the early address reaches the server',
+   new URL('/authorize', e.href).href.indexOf('http') === 0);
+ T('the early origin is not file', e.origin.indexOf('file') !== 0);
+},200);});
+</script></body></html>
+<!--
+  Served over HTTP after a file: page, this checks that a script reading
+  its address while the page is still parsing is told where it is, not
+  where the browser was. Home Assistant reads it that early and was sent
+  to file:///authorize.
+
+  scripts/nav-test.sh runs it.
+-->

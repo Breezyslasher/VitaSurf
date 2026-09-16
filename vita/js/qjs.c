@@ -2885,6 +2885,36 @@ static JSValue console_log(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+/**
+ * The URL of the document a script belongs to (VitaSurf).
+ *
+ * The browser window's URL is the page the window is showing, which
+ * during a load is still the previous one: the window commits the new
+ * address when the load finishes, long after the page's own scripts
+ * have run. So a script reading location while its page was parsing
+ * was told where the browser had been, not where it is.
+ *
+ * Home Assistant reads it that early to work out its own address, and
+ * so decided it was served from file:, sending the login to
+ * file:///authorize with a hassUrl of "file:/" in its state.
+ */
+static nsurl *script_page_url(jsthread *thread)
+{
+	nsurl *url;
+
+	if (thread == NULL) {
+		return NULL;
+	}
+	if (thread->htmlc != NULL) {
+		url = content_get_url((struct content *) thread->htmlc);
+		if (url != NULL) {
+			return url;
+		}
+	}
+	return NULL;
+}
+
+
 static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 {
 	nsurl *cur = NULL, *url = NULL;
@@ -2892,8 +2922,15 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 	if (thread == NULL || thread->win == NULL || href == NULL) {
 		return JS_UNDEFINED;
 	}
-	if (browser_window_get_url(thread->win, false, &cur) == NSERROR_OK &&
-	    cur != NULL) {
+	/*
+	 * Relative to the page's own base, not the window's address: a
+	 * script that navigates before its page has finished loading
+	 * would otherwise be resolved against the page before it.
+	 */
+	if (thread->htmlc != NULL && thread->htmlc->base_url != NULL) {
+		nsurl_join(thread->htmlc->base_url, href, &url);
+	} else if (browser_window_get_url(thread->win, false, &cur) ==
+			NSERROR_OK && cur != NULL) {
 		nsurl_join(cur, href, &url);
 		nsurl_unref(cur);
 	} else {
@@ -2912,10 +2949,15 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
+	nsurl *page = script_page_url(thread);
 	nsurl *url = NULL;
 	JSValue r;
 
 	(void)this_val;
+	if (page != NULL) {
+		return JS_NewString(ctx, nsurl_access(page));
+	}
+
 	if (thread == NULL || thread->win == NULL) return JS_NewString(ctx, "");
 	if (browser_window_get_url(thread->win, false, &url) != NSERROR_OK ||
 	    url == NULL) {

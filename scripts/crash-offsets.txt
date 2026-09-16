@@ -49,3 +49,13 @@
 #   actually got, and sizing the guard from that.
 0xec8a8
 0x133672
+# Build 233: undefined instruction on the main thread after leaving
+#   m.youtube.com for the history page and following a link back to it.
+#   The log stops immediately after YouTube's 1.7 MB player script ran.
+#   r3 and r12 both held 0xdeadbeef and the program counter was even
+#   while the code around it is Thumb, which is what calling through a
+#   corrupted function pointer looks like: the core has the module at
+#   0x81006000, so pc 0x813a494e is +0x39e94e and the link register
+#   +0x39e91b, both inside one function.
+0x39e94e
+0x39e91b
