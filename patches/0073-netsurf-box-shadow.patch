@@ -1,0 +1,239 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 1f2b8ef14..9cb90bf60 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5372,6 +5372,39 @@ layout_get_box_bbox(
+ 	*desc_y1 = box->padding[TOP] + box->height + box->padding[BOTTOM] +
+ 			box->border[BOTTOM].width;
+ 
++	/* A shadow lies outside the border box, and a redraw of the region
++	 * a box covers has to include it or a scroll leaves it behind
++	 * (VitaSurf). */
++	if (box->style != NULL) {
++		css_fixed len[4] = { 0, 0, 0, 0 };
++		css_unit unit[4] = { CSS_UNIT_PX, CSS_UNIT_PX, CSS_UNIT_PX,
++				CSS_UNIT_PX };
++		css_color colour = 0;
++
++		if (css_computed_box_shadow(box->style, &len[0], &unit[0],
++				&len[1], &unit[1], &len[2], &unit[2],
++				&len[3], &unit[3], &colour) ==
++				CSS_BOX_SHADOW_SET) {
++			int ox = FIXTOINT(css_unit_len2device_px(box->style,
++					unit_len_ctx, len[0], unit[0]));
++			int oy = FIXTOINT(css_unit_len2device_px(box->style,
++					unit_len_ctx, len[1], unit[1]));
++			int reach = FIXTOINT(css_unit_len2device_px(box->style,
++					unit_len_ctx, len[2], unit[2])) / 2 +
++				FIXTOINT(css_unit_len2device_px(box->style,
++					unit_len_ctx, len[3], unit[3]));
++
++			if (*desc_x0 > -box->border[LEFT].width + ox - reach)
++				*desc_x0 = -box->border[LEFT].width + ox - reach;
++			if (*desc_y0 > -box->border[TOP].width + oy - reach)
++				*desc_y0 = -box->border[TOP].width + oy - reach;
++			if (*desc_x1 < *desc_x1 + ox + reach)
++				*desc_x1 = *desc_x1 + ox + reach;
++			if (*desc_y1 < *desc_y1 + oy + reach)
++				*desc_y1 = *desc_y1 + oy + reach;
++		}
++	}
++
+ 	/* To stop the top of text getting clipped when css line-height is
+ 	 * reduced, we increase the top of the descendant bbox. */
+ 	if (box->type == BOX_BLOCK && box->style != NULL &&
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 5a5bb903f..7e5c137ae 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1533,6 +1533,140 @@ static bool html_redraw_box_children(const html_content *html, struct box *box,
+  * x, y, clip_[xy][01] are in target coordinates.
+  */
+ 
++/**
++ * Paint the shadow a box casts (VitaSurf).
++ *
++ * The plotter has no blur, so the blur is approximated: the band the
++ * blur would fade across, from half the radius inside the shadow's edge
++ * to half outside, is painted as a few concentric rings of falling
++ * alpha, each ring being four strips. That is a handful of small blended
++ * fills per box rather than a pass over every pixel, which is what the
++ * Vita can afford. Without blur the shadow is one rectangle. The box's
++ * own background is painted afterwards and covers whatever fell inside
++ * its border box, which is where the specification says a shadow does
++ * not show; a box with no background shows a little of the inner half
++ * of the blur, which is the approximation's one visible seam.
++ *
++ * Inset shadows are stored and not drawn.
++ *
++ * \param html      The html content
++ * \param box       The box
++ * \param bx0       Left edge of the border box, in painter coordinates
++ * \param by0       Top edge
++ * \param bx1       Right edge
++ * \param by1       Bottom edge
++ * \param scale     Scale
++ * \param ctx       Redraw context
++ * \return true on success, false otherwise
++ */
++static bool html_redraw_box_shadow(const html_content *html,
++		struct box *box, int bx0, int by0, int bx1, int by1,
++		float scale, const struct redraw_context *ctx)
++{
++	css_fixed len[4] = { 0, 0, 0, 0 };
++	css_unit unit[4] = { CSS_UNIT_PX, CSS_UNIT_PX, CSS_UNIT_PX,
++			CSS_UNIT_PX };
++	css_color colour = 0;
++	int px[4], i, ox, oy, blur, spread, alpha, bands;
++	plot_style_t pstyle = { .fill_type = PLOT_OP_TYPE_SOLID,
++			.stroke_type = PLOT_OP_TYPE_NONE };
++
++	if (css_computed_box_shadow(box->style, &len[0], &unit[0],
++			&len[1], &unit[1], &len[2], &unit[2],
++			&len[3], &unit[3], &colour) != CSS_BOX_SHADOW_SET) {
++		return true;
++	}
++
++	if (colour == 0x00000001) {
++		/* no colour written: the element's own */
++		css_computed_color(box->style, &colour);
++	}
++	alpha = colour >> 24;
++	if (alpha == 0) {
++		return true;
++	}
++
++	for (i = 0; i < 4; i++) {
++		px[i] = FIXTOINT(css_unit_len2device_px(box->style,
++				&html->unit_len_ctx, len[i], unit[i]));
++		if (scale != 1.0) {
++			px[i] = px[i] * scale;
++		}
++	}
++	ox = px[0];
++	oy = px[1];
++	blur = px[2] < 0 ? 0 : px[2];
++	spread = px[3];
++
++	bands = blur > 0 ? 4 : 1;
++
++	for (i = 0; i < bands; i++) {
++		/* this ring's inner and outer expansion of the shadow's
++		 * edge, and how much of the colour it carries */
++		int inner, outer, band_alpha;
++		struct rect o, in;
++		css_color c;
++
++		if (blur > 0) {
++			inner = -blur / 2 + (i * blur) / bands;
++			outer = -blur / 2 + ((i + 1) * blur) / bands;
++			band_alpha = alpha * (2 * (bands - i) - 1) /
++					(2 * bands);
++		} else {
++			inner = 0;
++			outer = 0;
++			band_alpha = alpha;
++		}
++		if (band_alpha <= 0) {
++			continue;
++		}
++
++		o.x0 = bx0 + ox - spread - outer;
++		o.y0 = by0 + oy - spread - outer;
++		o.x1 = bx1 + ox + spread + outer;
++		o.y1 = by1 + oy + spread + outer;
++		if (o.x1 <= o.x0 || o.y1 <= o.y0) {
++			continue;
++		}
++
++		c = (colour & 0x00ffffff) | ((css_color) band_alpha << 24);
++		pstyle.fill_colour = nscss_color_to_ns(c);
++
++		if (blur == 0) {
++			if (ctx->plot->rectangle(ctx, &pstyle, &o) != NSERROR_OK)
++				return false;
++			continue;
++		}
++
++		in.x0 = bx0 + ox - spread - inner;
++		in.y0 = by0 + oy - spread - inner;
++		in.x1 = bx1 + ox + spread + inner;
++		in.y1 = by1 + oy + spread + inner;
++
++		/* four strips make the ring between the two rectangles */
++		{
++			struct rect strip[4] = {
++				{ o.x0, o.y0, o.x1, in.y0 },	/* top */
++				{ o.x0, in.y1, o.x1, o.y1 },	/* bottom */
++				{ o.x0, in.y0, in.x0, in.y1 },	/* left */
++				{ in.x1, in.y0, o.x1, in.y1 },	/* right */
++			};
++			int k;
++
++			for (k = 0; k < 4; k++) {
++				if (strip[k].x1 <= strip[k].x0 ||
++						strip[k].y1 <= strip[k].y0)
++					continue;
++				if (ctx->plot->rectangle(ctx, &pstyle,
++						&strip[k]) != NSERROR_OK)
++					return false;
++			}
++		}
++	}
++
++	return true;
++}
++
+ bool html_redraw_box(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+@@ -1780,6 +1914,19 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	/* background colour and image for block level content and replaced
+ 	 * inlines */
+ 
++	/* the shadow goes under the background (VitaSurf) */
++	if (box->style != NULL && box->type != BOX_TEXT &&
++			box->type != BOX_INLINE &&
++			box->type != BOX_INLINE_END &&
++			box->type != BOX_INLINE_CONTAINER &&
++			box->type != BOX_BR &&
++			!html_redraw_box_shadow(html, box,
++					x - border_left, y - border_top,
++					x + padding_width + border_right,
++					y + padding_height + border_bottom,
++					scale, ctx))
++		return false;
++
+ 	bg_box = html_redraw_find_bg_box(box);
+ 
+ 	/*
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index adbbdcc6a..53ba0a9ea 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -204,7 +204,24 @@ framebuffer_plot_rectangle(const struct redraw_context *ctx,
+ 	rect.y1 = nsrect->y1;
+ 
+ 	if (style->fill_type != PLOT_OP_TYPE_NONE) {
+-		nsfb_plot_rectangle_fill(nsfb, &rect, style->fill_colour);
++		/*
++		 * NetSurf keeps a colour's alpha inverted in its top byte:
++		 * 0x00 is opaque and 0xff transparent, with NS_TRANSPARENT a
++		 * sentinel. Anything in between used to be painted solid,
++		 * which is wrong for an rgba() overlay and useless for a
++		 * box-shadow, so it now goes to the blending fill with the
++		 * alpha the right way up (VitaSurf).
++		 */
++		if ((style->fill_colour & 0xff000000) == 0 ||
++				style->fill_colour == NS_TRANSPARENT) {
++			nsfb_plot_rectangle_fill(nsfb, &rect,
++					style->fill_colour);
++		} else {
++			nsfb_colour_t c = (style->fill_colour & 0x00ffffff) |
++				((0xffu - (style->fill_colour >> 24)) << 24);
++
++			nsfb_plot_rectangle_fill_alpha(nsfb, &rect, c);
++		}
+ 	}
+ 
+ 	if (style->stroke_type != PLOT_OP_TYPE_NONE) {

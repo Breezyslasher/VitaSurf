@@ -1,0 +1,149 @@
+diff --git a/include/libnsfb_plot.h b/include/libnsfb_plot.h
+index a563e2c..8ef7861 100644
+--- a/include/libnsfb_plot.h
++++ b/include/libnsfb_plot.h
+@@ -88,6 +88,17 @@ bool nsfb_plot_rectangle(nsfb_t *nsfb, nsfb_bbox_t *rect, int line_width, nsfb_c
+  */
+ bool nsfb_plot_rectangle_fill(nsfb_t *nsfb, nsfb_bbox_t *rect, nsfb_colour_t c);
+ 
++/** Plots a filled rectangle, blending the colour into what is there by
++ * the alpha in its top byte, 0xff being opaque (VitaSurf). A surface
++ * without a blending fill paints it opaque instead.
++ *
++ * \param nsfb The framebuffer.
++ * \param rect The rectangle to fill.
++ * \param c The colour, 0xAABBGGRR.
++ * \return true on success else false.
++ */
++bool nsfb_plot_rectangle_fill_alpha(nsfb_t *nsfb, nsfb_bbox_t *rect, nsfb_colour_t c);
++
+ /** Plots a line.
+  *
+  * Draw a line from (x0,y0) to (x1,y1). Coordinates are at centre of line
+diff --git a/src/plot.h b/src/plot.h
+index 9db18fe..10b66cd 100644
+--- a/src/plot.h
++++ b/src/plot.h
+@@ -94,6 +94,8 @@ typedef	bool (nsfb_plotfn_polygon_t)(nsfb_t *nsfb, const int *p, unsigned int n,
+  *		  but (x1,y1) is below and to the right. See diagram below.
+  */
+ typedef	bool (nsfb_plotfn_fill_t)(nsfb_t *nsfb, nsfb_bbox_t *rect, nsfb_colour_t c);
++/** Fill a rectangle, blending the colour by its alpha (VitaSurf). */
++typedef	bool (nsfb_plotfn_fill_alpha_t)(nsfb_t *nsfb, nsfb_bbox_t *rect, nsfb_colour_t c);
+ 
+ /** Clipping operations.
+  */
+@@ -191,6 +193,7 @@ typedef struct nsfb_plotter_fns_s {
+     nsfb_plotfn_cubic_bezier_t *cubic;
+     nsfb_plotfn_path_t *path;
+     nsfb_plotfn_polylines_t *polylines;
++    nsfb_plotfn_fill_alpha_t *fill_alpha; /**< may be NULL: fill is used */
+ } nsfb_plotter_fns_t;
+ 
+ 
+diff --git a/src/plot/32bpp-common.c b/src/plot/32bpp-common.c
+index 9626acf..7d8e304 100644
+--- a/src/plot/32bpp-common.c
++++ b/src/plot/32bpp-common.c
+@@ -56,6 +56,47 @@ static bool fill(nsfb_t *nsfb, nsfb_bbox_t *rect, nsfb_colour_t c)
+         return true;
+ }
+ 
++/**
++ * Fill a rectangle, blending the colour by its alpha (VitaSurf).
++ *
++ * A box-shadow is a low-alpha colour laid over whatever is there, and so
++ * is an rgba() background; the opaque fill above paints both solid. The
++ * blend is nsfb_plot_ablend, the one the bitmap plotter already uses, so
++ * the arithmetic and the 0xAABBGGRR convention are the same as for an
++ * image with an alpha channel.
++ */
++static bool fill_alpha(nsfb_t *nsfb, nsfb_bbox_t *rect, nsfb_colour_t c)
++{
++        int w;
++        uint32_t *pvid;
++        uint32_t llen;
++        uint32_t width;
++        uint32_t height;
++
++        if (!nsfb_plot_clip_ctx(nsfb, rect))
++                return true; /* fill lies outside current clipping region */
++
++        width = rect->x1 - rect->x0;
++        height = rect->y1 - rect->y0;
++        llen = (nsfb->linelen >> 2) - width;
++
++        pvid = get_xy_loc(nsfb, rect->x0, rect->y0);
++
++        while (height-- > 0) {
++                w = width;
++                while (w > 0) {
++                        *pvid = colour_to_pixel(nsfb,
++                                nsfb_plot_ablend(c,
++                                        pixel_to_colour(nsfb, *pvid)));
++                        pvid++;
++                        w--;
++                }
++                pvid += llen;
++        }
++
++        return true;
++}
++
+ /*
+  * Local Variables:
+  * c-basic-offset:8
+diff --git a/src/plot/32bpp-xbgr8888.c b/src/plot/32bpp-xbgr8888.c
+index 2492054..e5a0162 100644
+--- a/src/plot/32bpp-xbgr8888.c
++++ b/src/plot/32bpp-xbgr8888.c
+@@ -92,6 +92,7 @@ static inline uint32_t colour_to_pixel(UNUSED nsfb_t *nsfb, nsfb_colour_t c)
+ const nsfb_plotter_fns_t _nsfb_32bpp_xbgr8888_plotters = {
+         .line = line,
+         .fill = fill,
++        .fill_alpha = fill_alpha,
+         .point = point,
+         .bitmap = bitmap,
+         .bitmap_tiles = bitmap_tiles,
+diff --git a/src/plot/32bpp-xrgb8888.c b/src/plot/32bpp-xrgb8888.c
+index 28e6673..b2177ea 100644
+--- a/src/plot/32bpp-xrgb8888.c
++++ b/src/plot/32bpp-xrgb8888.c
+@@ -92,6 +92,7 @@ static inline uint32_t colour_to_pixel(UNUSED nsfb_t *nsfb, nsfb_colour_t c)
+ const nsfb_plotter_fns_t _nsfb_32bpp_xrgb8888_plotters = {
+         .line = line,
+         .fill = fill,
++        .fill_alpha = fill_alpha,
+         .point = point,
+         .bitmap = bitmap,
+         .bitmap_tiles = bitmap_tiles,
+diff --git a/src/plot/api.c b/src/plot/api.c
+index 1746d2e..c0c51f0 100644
+--- a/src/plot/api.c
++++ b/src/plot/api.c
+@@ -1,5 +1,6 @@
+ /* public plotter interface */
+ 
++#include <stddef.h>
+ #include <stdbool.h>
+ 
+ #include "libnsfb.h"
+@@ -59,6 +60,18 @@ bool nsfb_plot_rectangle_fill(nsfb_t *nsfb, nsfb_bbox_t *rect, nsfb_colour_t c)
+     return nsfb->plotter_fns->fill(nsfb, rect, c);
+ }
+ 
++/* exported interface documented in libnsfb_plot.h */
++bool nsfb_plot_rectangle_fill_alpha(nsfb_t *nsfb, nsfb_bbox_t *rect, nsfb_colour_t c)
++{
++    if ((c >> 24) == 0) {
++        return true; /* nothing to see */
++    }
++    if ((c >> 24) == 0xff || nsfb->plotter_fns->fill_alpha == NULL) {
++        return nsfb->plotter_fns->fill(nsfb, rect, c);
++    }
++    return nsfb->plotter_fns->fill_alpha(nsfb, rect, c);
++}
++
+ /** Plots a line.
+  *
+  * Draw a line from (x0,y0) to (x1,y1). Coordinates are at centre of line
