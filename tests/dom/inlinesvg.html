@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>inline svg</title><style>
+ .ico { width: 24px; height: 24px; }
+</style></head>
+<body><pre id="out"></pre>
+<p>x<svg class="ico" viewBox="0 0 24 24"><path d="M4 4h16v16H4z" fill="#f00"/></svg>y
+<svg width="32" height="32" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="#00f"/></svg>z
+<svg width="20" height="20"><linearGradient id="g"><stop offset="0" stop-color="#0f0"/></linearGradient><rect width="20" height="20" fill="url(#g)"/></svg></p>
+<script>
+/* An <svg> written in the page is a foreign element: it keeps the case it
+   was written in, unlike HTML, and it is a replaced element, so width and
+   height apply to it. Both were wrong, and the graphics drew nothing. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function sz(el){ var r = el.getBoundingClientRect();
+  return Math.round(r.width) + 'x' + Math.round(r.height); }
+window.addEventListener('load', function(){ setTimeout(function(){
+  var s = document.querySelectorAll('svg');
+  T('svg elements', s.length);
+  T('sized by css', sz(s[0]));
+  T('sized by attributes', sz(s[1]));
+  T('tag name keeps its case', s[0].tagName);
+  T('child tag name keeps its case', s[0].firstChild.tagName);
+  T('a camel case tag survives',
+    document.querySelector('#g') ? document.querySelector('#g').tagName : 'missing');
+  T('a camel case attribute survives', s[0].getAttribute('viewBox'));
+  T('the lower case spelling is a different attribute',
+    s[0].getAttribute('viewbox'));
+  T('the shapes are still in the dom',
+    document.querySelectorAll('svg path, svg circle, svg rect').length);
+  T('an html tag name is still upper case', document.body.tagName);
+  T('an html attribute is still case insensitive',
+    document.querySelector('p').getAttribute('ID') === null);
+}, 200); });
+</script></body></html>

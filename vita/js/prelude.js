@@ -228,9 +228,14 @@ function parseSimple(sel){
    if(c==='.'){if(buf!=='')classes.push(unescapeIdent(buf));buf='';continue;}
    buf+=c;}
   if(buf!=='')classes.push(unescapeIdent(buf));}
- return {tag:m[1]&&m[1]!=='*'?unescapeIdent(m[1]).toUpperCase():null,
+ /* A type selector is case insensitive only for HTML elements, so both
+    spellings are kept: tagName is upper case for HTML and as written for
+    foreign elements such as those inside an inline <svg>. */
+ return {tag:m[1]&&m[1]!=='*'?unescapeIdent(m[1]):null,
+  tagUpper:m[1]&&m[1]!=='*'?unescapeIdent(m[1]).toUpperCase():null,
   id:m[2]?unescapeIdent(m[2].slice(1)):null,
   classes:classes,attrs:attrs,pseudos:pseudos};}
+var HTML_NS='http://www.w3.org/1999/xhtml';
 function attrOk(el,q){var v=el.getAttribute(q.name);if(v===null)return false;if(!q.op)return true;
  switch(q.op){case '=':return v===q.val;case '^=':return v.indexOf(q.val)===0;
  case '$=':return q.val.length<=v.length&&v.indexOf(q.val,v.length-q.val.length)>=0;
@@ -312,7 +317,10 @@ function pseudoOk(el,p){
   return false;
  default:return true;}}
 function matchSimple(el,q){if(el.nodeType!==1)return false;
- if(q.tag&&el.tagName!==q.tag)return false;
+ if(q.tag){var ns=el.namespaceURI;
+  if(ns===null||ns===undefined||ns===HTML_NS){
+   if(el.tagName!==q.tagUpper)return false;
+  }else if(el.tagName!==q.tag){return false;}}
  if(q.id&&el.id!==q.id)return false;
  if(q.classes.length){
   var set=classSet(el);
