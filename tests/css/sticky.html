@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>position: sticky</title>
+<style>
+body { margin: 0; }
+.spacer { height: 100px; }
+.wrap { height: 1000px; background: #eee; }
+.head { position: sticky; top: 0; height: 40px; background: #ff0000; }
+.short { height: 200px; background: #ddd; }
+.pin { position: sticky; top: 0; height: 40px; background: #00ff00; }
+.foot { position: sticky; bottom: 0; height: 30px; background: #0000ff; }
+.tail { height: 2000px; }
+</style>
+</head>
+<body>
+<div class="spacer"></div>
+<div class="wrap"><div class="head"></div>
+<p>text under the heading</p></div>
+<div class="short"><div class="pin"></div></div>
+<div class="foot"></div>
+<div class="tail"></div>
+<pre id="out"></pre>
+<script>
+/* The monkey plots at content y plus the scroll offset, in a 600px
+   viewport. Before any scroll the blue footer (laid out at 1300,
+   bottom: 0) is held at 570. After scrolling to 400 the red heading,
+   laid out at 100, is drawn at 400 (viewport top) and the green box,
+   laid out at 1100, stays put. At 1250 the heading is clamped to the
+   bottom of its 1000px container (1060) and the green box is stuck at
+   1250, inside its container that ends at 1300. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+window.addEventListener('load', function(){
+  setTimeout(function(){ T('scrolling to', 400); window.scrollTo(0, 400); }, 1500);
+  setTimeout(function(){ T('scrolling to', 1250); window.scrollTo(0, 1250); }, 3500);
+});
+</script>
+</body>
+</html>
