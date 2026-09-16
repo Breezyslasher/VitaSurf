@@ -1,0 +1,1130 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 25317e5..2b7e850 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -218,6 +218,16 @@ css_error css_select_ctx_get_sheet(css_select_ctx *ctx, uint32_t index,
+ css_error css_select_default_style(css_select_ctx *ctx,
+ 		css_select_handler *handler, void *pw,
+ 		css_computed_style **style);
++/**
++ * Say what variables the parent element was given (VitaSurf).
++ *
++ * A custom property is inherited, and a child's var() has to be
++ * resolved while the child is being selected, so the caller names the
++ * parent's style before selecting each element. Pass NULL at the root.
++ */
++css_error css_select_ctx_set_parent(css_select_ctx *ctx,
++		const css_computed_style *parent);
++
+ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		const css_unit_ctx *unit_ctx,
+ 		const css_media *media, const css_stylesheet *inline_style,
+diff --git a/src/parse/language.c b/src/parse/language.c
+index beacd56..92dbb74 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -7,6 +7,7 @@
+ 
+ #include <assert.h>
+ #include <string.h>
++#include <stdio.h>
+ 
+ #include <parserutils/utils/stack.h>
+ 
+@@ -19,6 +20,7 @@
+ #include "parse/parse.h"
+ #include "parse/propstrings.h"
+ #include "parse/properties/properties.h"
++#include "select/custom.h"
+ #include "parse/properties/utils.h"
+ 
+ #include "utils/parserutilserror.h"
+@@ -546,6 +548,106 @@ static struct css_custom_prop *findCustomProp(lwc_string *name)
+ 	return NULL;
+ }
+ 
++
++/**
++ * Hold a declaration over for the cascade (VitaSurf).
++ *
++ * A variable belongs to whichever elements its rule matches, and a
++ * declaration that spends one cannot be compiled until the element is
++ * known, so both are kept as tokens on the rule and resolved while the
++ * cascade runs. The value is stored without its trailing !important,
++ * which is recorded separately.
++ */
++static css_error deferDeclaration(css_rule *rule, lwc_string *property,
++		lwc_string *custom, const parserutils_vector *vector,
++		int32_t ctx)
++{
++	css_rule_selector *rs = (css_rule_selector *) rule;
++	css_deferred_decl *grown, *d;
++	const css_token *token;
++	int32_t end = ctx, i;
++	bool important = false;
++	uint32_t n;
++
++	if (rule == NULL || rule->type != CSS_RULE_SELECTOR) {
++		return CSS_OK;
++	}
++
++	while (parserutils_vector_peek(vector, end) != NULL) {
++		end++;
++	}
++	while (end > ctx && ((token = parserutils_vector_peek(vector,
++			end - 1)) == NULL || token->type == CSS_TOKEN_S)) {
++		end--;
++	}
++
++	/* a trailing "!important", however it was spaced */
++	if (end - ctx >= 2) {
++		int32_t j = end - 1;
++		const css_token *word = parserutils_vector_peek(vector, j);
++
++		if (word != NULL && word->type == CSS_TOKEN_IDENT &&
++		    word->idata != NULL &&
++		    lwc_string_length(word->idata) == 9 &&
++		    strncasecmp((const char *) lwc_string_data(word->idata),
++				"important", 9) == 0) {
++			j--;
++			while (j > ctx && (token = parserutils_vector_peek(
++					vector, j)) != NULL &&
++					token->type == CSS_TOKEN_S) {
++				j--;
++			}
++			token = parserutils_vector_peek(vector, j);
++			if (token != NULL && tokenIsChar(token, '!')) {
++				important = true;
++				end = j;
++				while (end > ctx && (token =
++					parserutils_vector_peek(vector,
++						end - 1)) != NULL &&
++						token->type == CSS_TOKEN_S) {
++					end--;
++				}
++			}
++		}
++	}
++
++	n = (uint32_t) (end - ctx);
++	if (n == 0) {
++		return CSS_OK;
++	}
++
++	grown = realloc(rs->deferred,
++			(rs->n_deferred + 1) * sizeof(*rs->deferred));
++	if (grown == NULL) {
++		return CSS_NOMEM;
++	}
++	rs->deferred = grown;
++
++	d = &rs->deferred[rs->n_deferred];
++	d->property = (property != NULL) ? lwc_string_ref(property) : NULL;
++	d->custom = (custom != NULL) ? lwc_string_ref(custom) : NULL;
++	d->important = important;
++	d->n_tokens = n;
++	d->tokens = malloc(n * sizeof(css_token));
++	if (d->tokens == NULL) {
++		if (d->property != NULL)
++			lwc_string_unref(d->property);
++		if (d->custom != NULL)
++			lwc_string_unref(d->custom);
++		return CSS_NOMEM;
++	}
++	for (i = 0; i < (int32_t) n; i++) {
++		copyToken(&d->tokens[i], parserutils_vector_peek(vector,
++				ctx + i));
++	}
++
++	rs->n_deferred++;
++
++
++	return CSS_OK;
++}
++
++
+ /** Keep the value tokens of a --name declaration; a later one replaces it. */
+ static css_error storeCustomProperty(lwc_string *name,
+ 		const parserutils_vector *vector, int32_t ctx)
+@@ -626,7 +728,8 @@ static bool vectorHasVar(const parserutils_vector *vector, int32_t ctx)
+  * \return CSS_OK, CSS_INVALID for an unresolvable reference, CSS_NOMEM
+  */
+ static css_error appendSubstituted(css_language *c, const css_token *tokens,
+-		uint32_t n, parserutils_vector *out, int depth)
++		uint32_t n, parserutils_vector *out, int depth,
++		const css_custom_map *map)
+ {
+ 	uint32_t i;
+ 
+@@ -636,6 +739,7 @@ static css_error appendSubstituted(css_language *c, const css_token *tokens,
+ 	for (i = 0; i < n; i++) {
+ 		const css_token *t = &tokens[i];
+ 		uint32_t j, nest, name_at, fb_from, fb_to;
++		const css_custom_entry *ent;
+ 		struct css_custom_prop *p;
+ 		css_error error;
+ 
+@@ -680,7 +784,13 @@ static css_error appendSubstituted(css_language *c, const css_token *tokens,
+ 			return CSS_INVALID;
+ 		i = j; /* the loop's i++ steps past ')' */
+ 
+-		p = findCustomProp(tokens[name_at].idata);
++		/*
++		 * What the element itself was given first, and only then
++		 * what the document root declared (VitaSurf).
++		 */
++		ent = css__custom_map_get(map, tokens[name_at].idata);
++		p = (ent == NULL) ?
++			findCustomProp(tokens[name_at].idata) : NULL;
+ 		if (p != NULL && p->n > 0) {
+ 			/*
+ 			 * The value came from the document's table, so
+@@ -691,10 +801,13 @@ static css_error appendSubstituted(css_language *c, const css_token *tokens,
+ 			c->sheet->used_root_hints = css__root_hints_sig;
+ 
+ 			error = appendSubstituted(c, p->tokens, p->n, out,
+-					depth + 1);
++					depth + 1, map);
++		} else if (ent != NULL) {
++			error = appendSubstituted(c, ent->tokens,
++					ent->n_tokens, out, depth + 1, map);
+ 		} else if (fb_to > fb_from) {
+ 			error = appendSubstituted(c, &tokens[fb_from],
+-					fb_to - fb_from, out, depth + 1);
++					fb_to - fb_from, out, depth + 1, map);
+ 		} else {
+ 			error = CSS_INVALID;
+ 		}
+@@ -731,7 +844,7 @@ static css_error substituteVars(css_language *c, const parserutils_vector *vecto
+ 		free(tokens);
+ 		return CSS_NOMEM;
+ 	}
+-	error = appendSubstituted(c, tokens, n, result, 0);
++	error = appendSubstituted(c, tokens, n, result, 0, NULL);
+ 	free(tokens);
+ 	if (error != CSS_OK) {
+ 		parserutils_vector_destroy(result);
+@@ -802,6 +915,96 @@ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+  * \param language  The parser to destroy
+  * \return CSS_OK on success, appropriate error otherwise
+  */
++
++/**
++ * Compile a declaration that was held over, for one element (VitaSurf).
++ *
++ * The value is substituted against the variables that element was
++ * given, falling back to the document root's table, and then compiled
++ * the way it would have been had it been resolvable when it was read.
++ * The style is the caller's to cascade and destroy.
++ */
++css_error css__language_compile_deferred(css_language *c,
++		const css_custom_map *map, const css_deferred_decl *decl,
++		css_style **out)
++{
++	parserutils_vector *subst = NULL;
++	css_prop_handler handler = NULL;
++	css_style *style = NULL;
++	css_error error;
++	int32_t sctx = 0;
++	int i;
++
++	if (c == NULL || decl == NULL || decl->property == NULL ||
++			out == NULL) {
++		return CSS_BADPARM;
++	}
++
++	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
++		bool match = false;
++
++		if (lwc_string_caseless_isequal(decl->property, c->strings[i],
++				&match) == lwc_error_ok && match) {
++			break;
++		}
++	}
++	if (i == LAST_PROP + 1) {
++		return CSS_INVALID;
++	}
++	handler = property_handlers[i - FIRST_PROP];
++
++	if (parserutils_vector_create(sizeof(css_token), 32, &subst) !=
++			PARSERUTILS_OK) {
++		return CSS_NOMEM;
++	}
++	error = appendSubstituted(c, decl->tokens, decl->n_tokens, subst, 0,
++			map);
++	if (error != CSS_OK) {
++		parserutils_vector_destroy(subst);
++		return error;
++	}
++
++	{
++		int32_t k = 0; const css_token *tk;
++		while ((tk = parserutils_vector_peek(subst, k)) != NULL) {
++			fprintf(stderr, " [%d:%s]", (int) tk->type,
++				tk->idata ? lwc_string_data(tk->idata) : "");
++			k++;
++		}
++		fprintf(stderr, "\n");
++	}
++
++	error = css__stylesheet_style_create(c->sheet, &style);
++	if (error != CSS_OK) {
++		parserutils_vector_destroy(subst);
++		return error;
++	}
++
++	error = handler(c, subst, &sctx, style);
++	if (error == CSS_OK) {
++		/* the whole value must have been consumed */
++		consumeWhitespace(subst, &sctx);
++		if (parserutils_vector_iterate(subst, &sctx) != NULL) {
++			error = CSS_INVALID;
++		}
++	}
++	parserutils_vector_destroy(subst);
++
++	if (error != CSS_OK) {
++		css__stylesheet_style_destroy(style);
++		return error;
++	}
++
++	if (decl->important) {
++		css__make_style_important(style);
++	}
++
++	*out = style;
++
++	return CSS_OK;
++}
++
++
+ css_error css__language_destroy(css_language *language)
+ {
+ 	uint32_t i;
+@@ -1529,7 +1732,17 @@ css_error handleDeclaration(css_language *c, const parserutils_vector *vector)
+ 		error = css__parse_font_descriptor(
+ 				c, ident, vector, &ctx, ff_rule);
+ 	} else if (isCustomPropertyName(ident->idata)) {
+-		/* --name: kept for var() when declared on the root */
++		/*
++		 * A variable belongs to the elements its rule matches, so
++		 * it is held over for the cascade. The root table is kept
++		 * as well, because it still answers a var() that could be
++		 * resolved when it was read, which is the fallback if the
++		 * cascade cannot place one (VitaSurf).
++		 */
++		error = deferDeclaration(rule, NULL, ident->idata,
++				vector, ctx);
++		if (error != CSS_OK)
++			return error;
+ 		if (ruleIsRootLike(c, rule))
+ 			return storeCustomProperty(ident->idata, vector, ctx);
+ 		return CSS_OK;
+@@ -1537,13 +1750,25 @@ css_error handleDeclaration(css_language *c, const parserutils_vector *vector)
+ 		parserutils_vector *subst = NULL;
+ 		int32_t sctx = 0;
+ 
++		/*
++		 * Held over so the element's own variables can be used;
++		 * also compiled here against the root table, which stands
++		 * if the cascade finds nothing better (VitaSurf).
++		 */
++		error = deferDeclaration(rule, ident->idata, NULL,
++				vector, ctx);
++		if (error != CSS_OK)
++			return error;
++
+ 		error = substituteVars(c, vector, ctx, &subst);
+ 		if (error == CSS_NOMEM)
+ 			return error;
+ 		if (error != CSS_OK)
+-			return CSS_INVALID; /* unresolved var(): dropped */
++			return CSS_OK; /* the cascade may still resolve it */
+ 		error = parseProperty(c, ident, subst, &sctx, rule);
+ 		parserutils_vector_destroy(subst);
++		if (error != CSS_OK)
++			return CSS_OK;
+ 	} else {
+ 		error = parseProperty(c, ident, vector, &ctx, rule);
+ 	}
+diff --git a/src/parse/language.h b/src/parse/language.h
+index 96a7aa3..3a34983 100644
+--- a/src/parse/language.h
++++ b/src/parse/language.h
+@@ -107,6 +107,20 @@ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+  * Called when the document changes; see css_set_root_hints().
+  */
+ void css__free_custom_props(void);
++/**
++ * Compile a declaration held over for the cascade (VitaSurf).
++ *
++ * See the note on custom properties in language.c. The style returned
++ * belongs to the caller.
++ */
++struct css_custom_map;
++struct css_deferred_decl;
++struct css_style;
++
++css_error css__language_compile_deferred(css_language *c,
++		const struct css_custom_map *map,
++		const struct css_deferred_decl *decl, struct css_style **out);
++
+ css_error css__language_destroy(css_language *language);
+ 
+ /******************************************************************************
+diff --git a/src/select/Makefile b/src/select/Makefile
+index 1c61909..46237b9 100644
+--- a/src/select/Makefile
++++ b/src/select/Makefile
+@@ -3,6 +3,6 @@
+ select_generator:
+ 	python3 src/select/select_generator.py
+ 
+-DIR_SOURCES := arena.c calc.c computed.c dispatch.c hash.c select.c strings.c font_face.c format_list_style.c unit.c
++DIR_SOURCES := arena.c calc.c computed.c custom.c dispatch.c hash.c select.c strings.c font_face.c format_list_style.c unit.c
+ 
+ include $(NSBUILD)/Makefile.subdir
+diff --git a/src/select/arena.c b/src/select/arena.c
+index 14d824c..e9ff033 100644
+--- a/src/select/arena.c
++++ b/src/select/arena.c
+@@ -135,6 +135,17 @@ static inline bool css__arena_style_is_equal(
+ 		return false;
+ 	}
+ 
++	/*
++	 * Two elements given different variables are not the same style,
++	 * even where every computed value happens to agree, because a
++	 * child of one would inherit different values (VitaSurf). Most
++	 * elements declare none and simply hold their parent's map, so
++	 * this is a pointer comparison nearly every time.
++	 */
++	if (a->custom != b->custom) {
++		return false;
++	}
++
+ 	if (!arena__compare_string_list(
+ 			a->font_family,
+ 			b->font_family)) {
+diff --git a/src/select/autogenerated_computed.h b/src/select/autogenerated_computed.h
+index 1eef38e..0a18880 100644
+--- a/src/select/autogenerated_computed.h
++++ b/src/select/autogenerated_computed.h
+@@ -350,6 +350,9 @@ struct css_computed_style {
+ 	css_computed_grid_track *grid_template_rows;
+ 	lwc_string **quotes;
+ 
++	/* the variables in force on this element (VitaSurf) */
++	struct css_custom_map *custom;
++
+ 	struct css_computed_style *next;
+ 	uint32_t count;
+ 	uint32_t bin;
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 162c43e..09eba15 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -10,6 +10,7 @@
+ #include "select/arena.h"
+ #include "select/calc.h"
+ #include "select/computed.h"
++#include "select/custom.h"
+ #include "select/dispatch.h"
+ #include "select/propget.h"
+ #include "select/propset.h"
+@@ -111,6 +112,10 @@ css_error css_computed_style_destroy(css_computed_style *style)
+ 		css__arena_remove_style(style);
+ 	}
+ 
++	/* the variables this element was given (VitaSurf) */
++	css__custom_map_unref(style->custom);
++	style->custom = NULL;
++
+ 	if (style->counter_increment != NULL) {
+ 		css_computed_counter *c;
+ 
+@@ -272,6 +277,9 @@ css_error css__computed_style_clone(
+ 		return error;
+ 	}
+ 
++	/* the variables come with it (VitaSurf) */
++	clone->custom = css__custom_map_ref(orig->custom);
++
+ 	for (size_t i = 0; i < CSS_N_PROPERTIES; i++) {
+ 		error = prop_dispatch[i].copy(orig, clone);
+ 		if (error != CSS_OK) {
+@@ -317,6 +325,16 @@ css_error css_computed_style_compose(
+ 		return error;
+ 	}
+ 
++	/*
++	 * The variables come through with everything else, so an
++	 * element's children see what it was given (VitaSurf). The
++	 * child's own map already holds what it inherited, because that
++	 * is where the cascade started it.
++	 */
++	composed->custom = css__custom_map_ref(
++			(child->custom != NULL) ? child->custom :
++			(parent != NULL ? parent->custom : NULL));
++
+ 	/* Iterate through the properties */
+ 	for (i = 0; i < CSS_N_PROPERTIES; i++) {
+ 		/* Compose the property */
+diff --git a/src/select/custom.c b/src/select/custom.c
+new file mode 100644
+index 0000000..438d92d
+--- /dev/null
++++ b/src/select/custom.c
+@@ -0,0 +1,178 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2025 The NetSurf Project
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "select/custom.h"
++
++/* Rounded corners of the cascade: see custom.h (VitaSurf). */
++
++/*
++ * A page can declare a great many variables -- github.com's palette is
++ * 959 colours -- but one element rarely sees more than a few dozen once
++ * they are gathered per element rather than per document. A list is
++ * kept, and capped, because a stylesheet is not allowed to make the
++ * browser spend without limit.
++ */
++#define CUSTOM_MAP_MAX 512
++
++css_custom_map *css__custom_map_ref(css_custom_map *map)
++{
++	if (map != NULL) {
++		map->refcount++;
++	}
++	return map;
++}
++
++static void entry_free(css_custom_entry *e)
++{
++	lwc_string_unref(e->name);
++	free(e);
++}
++
++void css__custom_map_unref(css_custom_map *map)
++{
++	css_custom_entry *e;
++
++	if (map == NULL || --map->refcount > 0) {
++		return;
++	}
++
++	e = map->entries;
++	while (e != NULL) {
++		css_custom_entry *next = e->next;
++		entry_free(e);
++		e = next;
++	}
++	free(map);
++}
++
++const css_custom_entry *css__custom_map_get(const css_custom_map *map,
++		lwc_string *name)
++{
++	const css_custom_entry *e;
++	bool match;
++
++	if (map == NULL || name == NULL) {
++		return NULL;
++	}
++
++	for (e = map->entries; e != NULL; e = e->next) {
++		if (lwc_string_isequal(e->name, name, &match) ==
++				lwc_error_ok && match) {
++			return e;
++		}
++	}
++
++	return NULL;
++}
++
++css_error css__custom_map_own(css_custom_map **map)
++{
++	css_custom_map *copy;
++	const css_custom_entry *e;
++	css_custom_entry **tail;
++
++	if (map == NULL) {
++		return CSS_BADPARM;
++	}
++	if (*map != NULL && (*map)->refcount == 1) {
++		return CSS_OK;	/* already ours alone */
++	}
++
++	copy = calloc(1, sizeof(*copy));
++	if (copy == NULL) {
++		return CSS_NOMEM;
++	}
++	copy->refcount = 1;
++	tail = &copy->entries;
++
++	for (e = (*map != NULL) ? (*map)->entries : NULL; e != NULL;
++			e = e->next) {
++		css_custom_entry *n = malloc(sizeof(*n));
++
++		if (n == NULL) {
++			css__custom_map_unref(copy);
++			return CSS_NOMEM;
++		}
++		*n = *e;
++		n->name = lwc_string_ref(e->name);
++		n->next = NULL;
++		*tail = n;
++		tail = &n->next;
++		copy->count++;
++	}
++
++	css__custom_map_unref(*map);
++	*map = copy;
++
++	return CSS_OK;
++}
++
++css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
++		css_token *tokens, uint32_t n_tokens,
++		uint32_t specificity, bool important)
++{
++	css_custom_entry *e;
++	css_error error;
++	bool match;
++
++	if (map == NULL || name == NULL) {
++		return CSS_BADPARM;
++	}
++
++	/*
++	 * Rules arrive in increasing specificity, so a later declaration
++	 * of the same name normally wins. An important one is only given
++	 * up to another important one.
++	 */
++	e = (*map != NULL) ? (*map)->entries : NULL;
++	for (; e != NULL; e = e->next) {
++		if (lwc_string_isequal(e->name, name, &match) ==
++				lwc_error_ok && match) {
++			if (e->important && !important) {
++				return CSS_OK;
++			}
++			break;
++		}
++	}
++
++	error = css__custom_map_own(map);
++	if (error != CSS_OK) {
++		return error;
++	}
++
++	/* the copy has its own entries, so find it again */
++	for (e = (*map)->entries; e != NULL; e = e->next) {
++		if (lwc_string_isequal(e->name, name, &match) ==
++				lwc_error_ok && match) {
++			break;
++		}
++	}
++
++	if (e == NULL) {
++		if ((*map)->count >= CUSTOM_MAP_MAX) {
++			return CSS_OK;	/* silently dropped, see the cap */
++		}
++		e = malloc(sizeof(*e));
++		if (e == NULL) {
++			return CSS_NOMEM;
++		}
++		e->name = lwc_string_ref(name);
++		e->next = (*map)->entries;
++		(*map)->entries = e;
++		(*map)->count++;
++	}
++
++	e->tokens = tokens;
++	e->n_tokens = n_tokens;
++	e->specificity = specificity;
++	e->important = important;
++
++	return CSS_OK;
++}
+diff --git a/src/select/custom.h b/src/select/custom.h
+new file mode 100644
+index 0000000..d636d81
+--- /dev/null
++++ b/src/select/custom.h
+@@ -0,0 +1,72 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2025 The NetSurf Project
++ */
++
++#ifndef css_select_custom_h_
++#define css_select_custom_h_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include <libwapcaplet/libwapcaplet.h>
++
++#include "stylesheet.h"
++
++/*
++ * The custom properties in force on one element (VitaSurf).
++ *
++ * A variable is an ordinary inherited property: an element sees the
++ * ones its own rules declare and, failing that, the ones its ancestors
++ * declared. They used to be gathered from :root and its like into a
++ * single table for the whole document, which meant a variable a
++ * component declared for its own subtree was never seen at all. That is
++ * how YouTube themes its search bar, so its chrome came out as dark
++ * boxes on a light page.
++ *
++ * A map is shared and counted rather than copied. Most elements declare
++ * no variables of their own and simply hold their parent's map, so a
++ * document with one theme has one map, and two styles can still be
++ * shared when their maps are the same pointer.
++ */
++typedef struct css_custom_entry {
++	lwc_string *name;
++	css_token *tokens;		/**< the declared value */
++	uint32_t n_tokens;
++	uint32_t specificity;		/**< of the rule that declared it */
++	bool important;
++	struct css_custom_entry *next;
++} css_custom_entry;
++
++typedef struct css_custom_map {
++	uint32_t refcount;
++	uint32_t count;
++	css_custom_entry *entries;
++} css_custom_map;
++
++css_custom_map *css__custom_map_ref(css_custom_map *map);
++void css__custom_map_unref(css_custom_map *map);
++
++/**
++ * Note a variable, unless something stronger already said otherwise.
++ *
++ * \param map          the map to write into, created if *map is NULL
++ * \param name         the --name being declared
++ * \param tokens       its value, borrowed for the lifetime of the sheet
++ * \param specificity  of the rule that declared it
++ * \param important    whether it was declared !important
++ */
++css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
++		css_token *tokens, uint32_t n_tokens,
++		uint32_t specificity, bool important);
++
++/** The value of a variable, or NULL if nothing declared one. */
++const css_custom_entry *css__custom_map_get(const css_custom_map *map,
++		lwc_string *name);
++
++/** Take a private copy before writing, so a parent's map is not altered. */
++css_error css__custom_map_own(css_custom_map **map);
++
++#endif
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 12e82aa..f04434e 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -78,9 +78,16 @@ static css_error _iterate_universal(
+ 
+ 
+ /* No bytecode if rule body is empty or wholly invalid --
+- * Only interested in rules with bytecode */
++ * Only interested in rules with bytecode.
++ *
++ * A rule whose every declaration was held over for the cascade has no
++ * bytecode either, and skipping it here is how a component's own
++ * variables were lost: the rule that declared them never matched
++ * anything (VitaSurf).
++ */
+ #define RULE_HAS_BYTECODE(r) \
+-	(((css_rule_selector *)(r->sel->rule))->style != NULL)
++	(((css_rule_selector *)(r->sel->rule))->style != NULL || \
++	 ((css_rule_selector *)(r->sel->rule))->n_deferred > 0)
+ 
+ 
+ /**
+diff --git a/src/select/select.c b/src/select/select.c
+index 59bfbfb..bd6c2de 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -24,6 +24,7 @@
+ #include "select/propset.h"
+ #include "select/font_face.h"
+ #include "select/select.h"
++#include "parse/language.h"
+ #include "select/strings.h"
+ #include "select/unit.h"
+ #include "utils/parserutilserror.h"
+@@ -62,6 +63,14 @@ struct css_select_ctx {
+ 
+ 	/* Interned default style */
+ 	css_computed_style *default_style;
++
++	/*
++	 * The variables the parent element was given (VitaSurf). A
++	 * variable is inherited, and a child's var() has to be resolved
++	 * while the child is being selected, so the caller says what the
++	 * parent had before each element; see css_select_ctx_set_parent.
++	 */
++	const css_custom_map *parent_custom;
+ };
+ 
+ /**
+@@ -124,7 +133,118 @@ static css_error match_details(css_select_ctx *ctx, void *node,
+ static css_error match_detail(css_select_ctx *ctx, void *node,
+ 		const css_selector_detail *detail, css_select_state *state,
+ 		bool *match, css_pseudo_element *pseudo_element);
+-static css_error cascade_style(const css_style *style, css_select_state *state);
++static css_error cascade_style(const css_style *style,
++		css_select_state *state);
++
++/**
++ * Note a rule's held-over declarations for this element (VitaSurf).
++ *
++ * They cannot be acted on yet: a variable declared by a more specific
++ * rule further down has to be in hand before any var() is resolved, so
++ * they are gathered and dealt with once matching is done.
++ */
++static css_error record_deferred(css_select_state *state,
++		const css_rule_selector *rs, css_pseudo_element pseudo)
++{
++	uint32_t i;
++
++	for (i = 0; i < rs->n_deferred; i++) {
++		css_deferred_match *m;
++
++		if (state->n_deferred == state->deferred_alloc) {
++			uint32_t want = (state->deferred_alloc == 0) ?
++					16 : state->deferred_alloc * 2;
++			css_deferred_match *grown = realloc(state->deferred,
++					want * sizeof(*grown));
++
++			if (grown == NULL) {
++				return CSS_NOMEM;
++			}
++			state->deferred = grown;
++			state->deferred_alloc = want;
++		}
++
++		m = &state->deferred[state->n_deferred++];
++		m->decl = &rs->deferred[i];
++		m->sheet = state->sheet;
++		m->specificity = state->current_specificity;
++		m->origin = state->current_origin;
++		m->pseudo = pseudo;
++	}
++
++	return CSS_OK;
++}
++
++/**
++ * Act on the declarations held over for this element (VitaSurf).
++ *
++ * Every variable the element was given is gathered first, so that a
++ * var() sees the value that won wherever it was declared, and only then
++ * are the declarations that spend them compiled and cascaded.
++ *
++ * They are cascaded after everything else, so one that spends a
++ * variable beats an ordinary declaration of the same specificity that
++ * came later in the sheet. That is the wrong way round, and it is the
++ * price of not being able to compile the value until the element is
++ * known; a themed declaration is usually the only one for its property.
++ */
++static css_error apply_deferred(css_select_state *state)
++{
++	uint32_t i;
++
++	for (i = 0; i < state->n_deferred; i++) {
++		const css_deferred_match *m = &state->deferred[i];
++		css_error error;
++
++		if (m->decl->custom == NULL) {
++			continue;
++		}
++		error = css__custom_map_set(&state->custom, m->decl->custom,
++				m->decl->tokens, m->decl->n_tokens,
++				m->specificity, m->decl->important);
++		if (error != CSS_OK) {
++			return error;
++		}
++	}
++
++	for (i = 0; i < state->n_deferred; i++) {
++		const css_deferred_match *m = &state->deferred[i];
++		css_style *style = NULL;
++		css_error error;
++
++		if (m->decl->property == NULL) {
++			continue;
++		}
++		if (m->sheet == NULL || m->sheet->parser_frontend == NULL) {
++			continue;
++		}
++		if (state->results->styles[m->pseudo] == NULL) {
++			continue;
++		}
++
++		error = css__language_compile_deferred(
++				m->sheet->parser_frontend, state->custom,
++				m->decl, &style);
++		if (error != CSS_OK) {
++			continue;	/* still unresolved: leave it out */
++		}
++
++		state->current_specificity = m->specificity;
++		state->current_origin = m->origin;
++		state->current_pseudo = m->pseudo;
++		state->computed = state->results->styles[m->pseudo];
++
++		error = cascade_style(style, state);
++		css__stylesheet_style_destroy(style);
++		if (error != CSS_OK) {
++			return error;
++		}
++	}
++
++	return CSS_OK;
++}
++
++
+ 
+ static css_error select_font_faces_from_sheet(
+ 		const css_stylesheet *sheet,
+@@ -1017,6 +1137,14 @@ printf("      \t%s\tno share: inline style\n");
+ static void css_select__finalise_selection_state(
+ 		css_select_state *state)
+ {
++	/* declarations held over for the cascade (VitaSurf) */
++	free(state->deferred);
++	state->deferred = NULL;
++	state->n_deferred = 0;
++	state->deferred_alloc = 0;
++	css__custom_map_unref(state->custom);
++	state->custom = NULL;
++
+ 	if (state->results != NULL) {
+ 		css_select_results_destroy(state->results);
+ 	}
+@@ -1252,6 +1380,21 @@ static css_error css__select_revert_property(
+  * the client to store the partially computed style and efficiently
+  * update the fully computed style for a node when layout changes.
+  */
++
++/* exported interface documented in include/libcss/select.h */
++css_error css_select_ctx_set_parent(css_select_ctx *ctx,
++		const css_computed_style *parent)
++{
++	if (ctx == NULL) {
++		return CSS_BADPARM;
++	}
++
++	ctx->parent_custom = (parent != NULL) ? parent->custom : NULL;
++
++	return CSS_OK;
++}
++
++
+ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		const css_unit_ctx *unit_ctx,
+ 		const css_media *media, const css_stylesheet *inline_style,
+@@ -1279,6 +1422,14 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	if (error != CSS_OK)
+ 		return error;
+ 
++	/*
++	 * A variable is inherited, so the element starts with whatever
++	 * its parent was given and adds its own (VitaSurf). The map is
++	 * shared until something is written into it, so an element that
++	 * declares none of its own costs nothing.
++	 */
++	state.custom = css__custom_map_ref((css_custom_map *) ctx->parent_custom);
++
+ 	/* Fetch presentational hints */
+ 	error = handler->node_presentational_hint(pw, node, &nhints, &hints);
+ 	if (error != CSS_OK)
+@@ -1405,6 +1556,19 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		}
+ 	}
+ 
++	/* Declarations that were waiting on the variables (VitaSurf) */
++	error = apply_deferred(&state);
++	if (error != CSS_OK)
++		goto cleanup;
++
++	/* and hand them on, so this element's children inherit them */
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		if (state.results->styles[i] != NULL) {
++			state.results->styles[i]->custom =
++					css__custom_map_ref(state.custom);
++		}
++	}
++
+ 	/* Fix up any remaining unset properties. */
+ 
+ 	/* Base element */
+@@ -2245,6 +2409,14 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 	state->current_pseudo = pseudo;
+ 	state->computed = state->results->styles[pseudo];
+ 
++	error = record_deferred(state,
++			(css_rule_selector *) selector->rule, pseudo);
++	if (error != CSS_OK)
++		return error;
++
++	if (((css_rule_selector *) selector->rule)->style == NULL)
++		return CSS_OK;
++
+ 	return cascade_style(((css_rule_selector *) selector->rule)->style,
+ 			state);
+ }
+diff --git a/src/select/select.h b/src/select/select.h
+index 5170e58..d77bb11 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -14,6 +14,7 @@
+ #include <libcss/select.h>
+ 
+ #include "stylesheet.h"
++#include "select/custom.h"
+ 
+ /**
+  * Item in the reject cache (only class and id types are valid)
+@@ -96,9 +97,28 @@ typedef struct css_select_state {
+ 
+ 	struct css_node_data *node_data;	/* Data we'll store on node */
+ 
++	/*
++	 * Declarations held over for the cascade (VitaSurf). Variables
++	 * this element was given, and the declarations that spend them,
++	 * which cannot be compiled until every variable is known.
++	 */
++	css_custom_map *custom;
++	struct css_deferred_match *deferred;
++	uint32_t n_deferred;
++	uint32_t deferred_alloc;
++
+ 	prop_state props[CSS_N_PROPERTIES][CSS_PSEUDO_ELEMENT_COUNT];
+ } css_select_state;
+ 
++/** One matched declaration waiting for the variables to settle. */
++typedef struct css_deferred_match {
++	const css_deferred_decl *decl;
++	const css_stylesheet *sheet;
++	uint32_t specificity;
++	css_origin origin;
++	css_pseudo_element pseudo;
++} css_deferred_match;
++
+ static inline void advance_bytecode(css_style *style, uint32_t n_bytes)
+ {
+ 	style->used -= (n_bytes / sizeof(css_code_t));
+diff --git a/src/select/select_generator.py b/src/select/select_generator.py
+index 19e2da1..1cf4678 100644
+--- a/src/select/select_generator.py
++++ b/src/select/select_generator.py
+@@ -504,6 +504,9 @@ class CSSGroup:
+         t.append(self.make_value_declaration(for_commented=True))
+         t.append()
+ 
++        t.append('/* the variables in force on this element (VitaSurf) */')
++        t.append('struct css_custom_map *custom;')
++        t.append()
+         t.append('struct css_computed_style *next;')
+         t.append('uint32_t count;')
+         t.append('uint32_t bin;')
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index e7b7998..4c64a92 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -347,11 +347,15 @@ css_error css_stylesheet_data_done(css_stylesheet *sheet)
+ 	if (error != CSS_OK)
+ 		return error;
+ 
+-	/* Destroy the parser, as it's no longer needed */
+-	css__language_destroy(sheet->parser_frontend);
++	/*
++	 * Destroy the parser, as it's no longer needed. The frontend
++	 * stays: a declaration that spends a variable is compiled during
++	 * the cascade, once the element is known, and that needs the
++	 * interned property names it holds (VitaSurf). It does not touch
++	 * the parser, and goes with the sheet.
++	 */
+ 	css__parser_destroy(sheet->parser);
+ 
+-	sheet->parser_frontend = NULL;
+ 	sheet->parser = NULL;
+ 
+ 	/* If we have a cached style, drop it as we're done parsing. */
+@@ -1294,6 +1298,23 @@ css_error css__stylesheet_rule_destroy(css_stylesheet *sheet, css_rule *rule)
+ 
+ 		if (s->style != NULL)
+ 			css__stylesheet_style_destroy(s->style);
++
++		/* declarations held over for the cascade (VitaSurf) */
++		for (i = 0; i < s->n_deferred; i++) {
++			css_deferred_decl *d = &s->deferred[i];
++			uint32_t t;
++
++			if (d->property != NULL)
++				lwc_string_unref(d->property);
++			if (d->custom != NULL)
++				lwc_string_unref(d->custom);
++			for (t = 0; t < d->n_tokens; t++) {
++				if (d->tokens[t].idata != NULL)
++					lwc_string_unref(d->tokens[t].idata);
++			}
++			free(d->tokens);
++		}
++		free(s->deferred);
+ 	}
+ 		break;
+ 	case CSS_RULE_CHARSET:
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index cd15e91..6e18972 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -123,11 +123,32 @@ struct css_rule {
+ 	uint8_t ptype;  /**< css_rule_parent_type */
+ } _ALIGNED;
+ 
++/**
++ * A declaration kept as tokens because it could not be compiled when it
++ * was read (VitaSurf).
++ *
++ * Either it declares a variable, which belongs to whichever elements
++ * the rule matches, or it spends one through var(), whose value is not
++ * known until an element is in hand. Both are resolved during the
++ * cascade instead.
++ */
++typedef struct css_deferred_decl {
++	lwc_string *property;	/**< the property, or NULL for a variable */
++	lwc_string *custom;	/**< the --name, when one is declared */
++	css_token *tokens;	/**< the value as written */
++	uint32_t n_tokens;
++	bool important;
++} css_deferred_decl;
++
+ typedef struct css_rule_selector {
+ 	css_rule base;
+ 
+ 	css_selector **selectors;
+ 	css_style *style;
++
++	/** Declarations held over for the cascade (VitaSurf) */
++	css_deferred_decl *deferred;
++	uint32_t n_deferred;
+ } css_rule_selector;
+ 
+ typedef struct css_rule_media {
