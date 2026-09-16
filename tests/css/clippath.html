@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>clip-path inset and ignored properties</title>
+<style>
+.box { width: 100px; height: 12px; background: #ccc; margin: 2px 0; }
+/* a: a rule with clip-path: inset() keeps its other declarations */
+.a { clip-path: inset(50%); width: 60px; }
+/* b: a rule with a polygon keeps its other declarations */
+.b { clip-path: polygon(0 0, 100% 0, 100% 100%); width: 60px; }
+/* c: accepted-and-ignored properties do not take the rule down */
+.c { transition: all .2s ease-in-out; user-select: none; will-change: transform; width: 60px; }
+/* d: light-dark() gives the light colour, and the rule survives */
+.d { color: light-dark(#123456, #fff); width: 60px; }
+/* e: an ignored property with !important, then a real one */
+.e { scroll-behavior: smooth !important; width: 60px; }
+/* f: the sr-only pattern: clipped to nothing, so no fill is painted */
+.f { clip-path: inset(50%); background: #ff0000; }
+/* g: a partial inset paints a smaller fill */
+.g { clip-path: inset(0 25%); background: #00ff00; }
+</style>
+</head>
+<body>
+<div class="box a"></div>
+<div class="box b"></div>
+<div class="box c"></div>
+<div class="box d"></div>
+<div class="box e"></div>
+<div class="box f"></div>
+<div class="box g"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function W(sel){ return Math.round(document.querySelector(sel).getBoundingClientRect().width); }
+var cases = [
+  ['inset rule keeps its width', '.a', 60],
+  ['polygon rule keeps its width', '.b', 60],
+  ['ignored properties keep the rule', '.c', 60],
+  ['light-dark keeps the rule', '.d', 60],
+  ['ignored !important keeps the rule', '.e', 60]
+];
+window.addEventListener('load', function(){ setTimeout(function(){
+  for (var i = 0; i < cases.length; i++) {
+    var got = W(cases[i][1]);
+    T(cases[i][0], got + (got == cases[i][2] ? '' : ' (expected ' + cases[i][2] + ')'));
+  }
+  T('light-dark colour', getComputedStyle(document.querySelector('.d')).color);
+}, 200); });
+</script>
+</body>
+</html>

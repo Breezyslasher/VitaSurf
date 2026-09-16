@@ -1,0 +1,58 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 7e5c137ae..98e58ff65 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1903,6 +1903,53 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			return false;
+ 	}
+ 
++	/* clip-path: inset() cuts the box, and everything in it, to a
++	 * rectangle inside its border box (VitaSurf). "inset(50%)" is
++	 * the visually-hidden pattern: the rectangle is empty and the
++	 * box paints nothing, which is what keeps screen-reader text off
++	 * the page. Percentages are of the border box's own size. */
++	if (box->style != NULL) {
++		css_fixed in[4];
++		css_unit inu[4];
++
++		if (css_computed_clip_path(box->style,
++				&in[0], &inu[0], &in[1], &inu[1],
++				&in[2], &inu[2], &in[3], &inu[3]) ==
++				CSS_CLIP_PATH_INSET) {
++			int bw = border_left + padding_width + border_right;
++			int bh = border_top + padding_height + border_bottom;
++			int px[4];
++			int i;
++
++			for (i = 0; i < 4; i++) {
++				if (inu[i] == CSS_UNIT_PCT) {
++					px[i] = FIXTOINT(FMUL(in[i],
++						INTTOFIX((i & 1) ? bw : bh)))
++						/ 100;
++				} else {
++					px[i] = FIXTOINT(css_unit_len2device_px(
++						box->style,
++						&html->unit_len_ctx,
++						in[i], inu[i])) * scale;
++				}
++			}
++			if (r.x0 < x - border_left + px[3])
++				r.x0 = x - border_left + px[3];
++			if (r.y0 < y - border_top + px[0])
++				r.y0 = y - border_top + px[0];
++			if (r.x1 > x + padding_width + border_right - px[1])
++				r.x1 = x + padding_width + border_right - px[1];
++			if (r.y1 > y + padding_height + border_bottom - px[2])
++				r.y1 = y + padding_height + border_bottom - px[2];
++			if (r.x0 >= r.x1 || r.y0 >= r.y1)
++				return ((!ctx->plot->group_end) ||
++					(ctx->plot->group_end(ctx) ==
++							NSERROR_OK));
++			if (ctx->plot->clip(ctx, &r) != NSERROR_OK)
++				return false;
++		}
++	}
++
+ 	/* A box with a CSS mask paints only its background colour through
+ 	 * the mask; borders, text and children are masked out (VitaSurf).
+ 	 * Codex-style icon buttons rely on this. */
