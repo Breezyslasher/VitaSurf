@@ -1,0 +1,164 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index b1e37e4..bf8dc9a 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -2237,6 +2237,19 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 		{ CHECKED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ NOT, CSS_SELECTOR_PSEUDO_CLASS },
+ 
++		/*
++		 * Shadow tree selectors (VitaSurf). Nothing here has a
++		 * shadow tree, so none of them ever matches -- but an
++		 * unknown pseudo class makes the whole selector list
++		 * invalid, and Tailwind 4 writes ":root, :host { ... }"
++		 * around every custom property it defines. Not knowing
++		 * :host threw away ninety-eight of them in one stylesheet
++		 * measured here, which is its entire palette.
++		 */
++		{ HOST, CSS_SELECTOR_PSEUDO_CLASS },
++		{ HOST_CONTEXT, CSS_SELECTOR_PSEUDO_CLASS },
++
++		{ SLOTTED, CSS_SELECTOR_PSEUDO_ELEMENT },
+ 		{ FIRST_LINE, CSS_SELECTOR_PSEUDO_ELEMENT },
+ 		{ FIRST_LETTER, CSS_SELECTOR_PSEUDO_ELEMENT },
+ 		{ BEFORE, CSS_SELECTOR_PSEUDO_ELEMENT },
+@@ -2372,9 +2385,36 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 			consumeWhitespace(vector, ctx);
+ 		}
+ 
+-		token = parserutils_vector_iterate(vector, ctx);
+-		if (token == NULL || tokenIsChar(token, ')') == false)
+-			return CSS_INVALID;
++		if (fun_type == HOST || fun_type == HOST_CONTEXT ||
++				fun_type == SLOTTED) {
++			/*
++			 * Whatever is in the brackets selects inside a
++			 * shadow tree, so it cannot match here. Step over
++			 * it, counting brackets, and let the selector
++			 * stand rather than losing the rule it is in.
++			 */
++			int nesting = 0;
++
++			for (;;) {
++				token = parserutils_vector_iterate(vector,
++								   ctx);
++				if (token == NULL) {
++					return CSS_INVALID;
++				}
++				if (tokenIsChar(token, '(')) {
++					nesting++;
++				} else if (tokenIsChar(token, ')')) {
++					if (nesting == 0) {
++						break;
++					}
++					nesting--;
++				}
++			}
++		} else {
++			token = parserutils_vector_iterate(vector, ctx);
++			if (token == NULL || tokenIsChar(token, ')') == false)
++				return CSS_INVALID;
++		}
+ 	}
+ 
+ 	return css__stylesheet_selector_detail_init(c->sheet,
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index 683c0e9..401b6d9 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -811,7 +811,12 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("cover"),
+ 	SMAP("contain"),
+ 	SMAP("fill"),
+-	SMAP("scale-down")
++	SMAP("scale-down"),
++
++	/* Shadow tree selectors (VitaSurf) */
++	SMAP("host"),
++	SMAP("host-context"),
++	SMAP("slotted")
+ };
+ 
+ 
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index 954026f..a086dd6 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -227,6 +227,9 @@ enum {
+ 	/* Keywords for sizing pictures (VitaSurf) */
+ 	COVER, CONTAIN, LIBCSS_FILL, SCALE_DOWN,
+ 
++	/* Shadow tree selectors (VitaSurf) */
++	HOST, HOST_CONTEXT, SLOTTED,
++
+ 	LAST_KNOWN
+ };
+ 
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index fff2c56..0c6b192 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -37,3 +37,4 @@ paint.dat			fill and stroke tests
+ colourfns.dat			oklch, oklab, lab and color-mix tests
+ mathfns.dat			min, max and clamp tests
+ nesting.dat			CSS nesting tests
++shadowsel.dat			Shadow tree selector tests
+diff --git a/test/data/parse2/shadowsel.dat b/test/data/parse2/shadowsel.dat
+new file mode 100644
+index 0000000..e72c6b7
+--- /dev/null
++++ b/test/data/parse2/shadowsel.dat
+@@ -0,0 +1,53 @@
++#data
++:root, :host { color: red; }
++#errors
++#expected
++| :root, :host
++|  color: #ffff0000
++#reset
++
++#data
++:host { color: red; }
++#errors
++#expected
++| :host
++|  color: #ffff0000
++#reset
++
++#data
++:host(.dark) { color: red; }
++#errors
++#expected
++| :host
++|  color: #ffff0000
++#reset
++
++#data
++::slotted(p) { color: red; }
++#errors
++#expected
++| :slotted
++|  color: #ffff0000
++#reset
++
++#data
++:host-context(.x) .y { color: red; }
++#errors
++#expected
++| :host-context .y
++|  color: #ffff0000
++#reset
++
++#data
++:nonsense { color: red; }
++#errors
++#expected
++
++#reset
++
++#data
++:root, :nonsense { color: red; }
++#errors
++#expected
++
++#reset
