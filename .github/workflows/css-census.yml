@@ -20,7 +20,19 @@ jobs:
         with:
           submodules: true
 
+      - name: Apply the patch series
+        # The properties this project adds to libcss are in patches/, not
+        # in the pinned submodule, so without this the census counts them
+        # all as missing.
+        run: |
+          set -eu
+          scripts/apply-patches.sh > /tmp/patches.log || {
+            cat /tmp/patches.log
+            exit 1
+          }
+          echo "applied $(grep -c PATCH /tmp/patches.log) patches"
+
       - name: Count what is understood and what is dropped
         run: python3 scripts/css-census.py fixtures/css-census.txt
         env:
-          CENSUS_CUTOFF: "115"
+          CENSUS_CUTOFF: "60"

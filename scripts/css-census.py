@@ -46,7 +46,15 @@ def known_properties():
     if last >= len(strings):
         sys.exit('propstrings.c has %d entries, enum wants %d' %
                  (len(strings), last + 1))
-    return set(strings[first:last + 1])
+    known = set(strings[first:last + 1])
+    # The submodule is pinned to upstream libcss and the properties this
+    # project adds live in patches/, so a checkout that has not been
+    # patched knows none of them and every batch already done counts as
+    # missing. That reads as a plausible report rather than an error,
+    # which is the dangerous kind of wrong, so refuse to produce it.
+    if 'padding-inline-start' not in known:
+        sys.exit('deps/libcss is unpatched: run scripts/apply-patches.sh')
+    return known
 
 
 # --- pulling declarations out of a stylesheet ------------------------------
