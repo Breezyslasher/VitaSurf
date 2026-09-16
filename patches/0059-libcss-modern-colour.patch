@@ -16,7 +16,7 @@ index 43e9a80..8ed97fc 100644
  
  # Extra installation rules
 diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
-index 07eb00a..1d790b5 100644
+index 07eb00a..ff3bea2 100644
 --- a/src/parse/properties/utils.c
 +++ b/src/parse/properties/utils.c
 @@ -6,7 +6,9 @@
@@ -29,7 +29,7 @@ index 07eb00a..1d790b5 100644
  #include <string.h>
  #include <strings.h>
  
-@@ -966,6 +968,456 @@ static bool parse_hwb(
+@@ -966,6 +968,462 @@ static bool parse_hwb(
  	return true;
  }
  
@@ -50,6 +50,12 @@ index 07eb00a..1d790b5 100644
 + * bits per channel that come out the other end are worth, and this runs
 + * while parsing a stylesheet, not while drawing.
 + */
++
++/*
++ * Not COLOUR_PI: newlib hides the BSD maths constants behind __STRICT_ANSI__,
++ * which -std=c99 defines, so it is not there to be used on the Vita.
++ */
++#define COLOUR_PI 3.14159265358979323846
 +
 +/** Is this function called \a name? */
 +static bool colour_fn_is(lwc_string *s, const char *name, size_t len)
@@ -297,7 +303,7 @@ index 07eb00a..1d790b5 100644
 +			}
 +			switch (unit) {
 +			case UNIT_DEG:				break;
-+			case UNIT_RAD:  c2 = c2 * 180.0 / M_PI;	break;
++			case UNIT_RAD:  c2 = c2 * 180.0 / COLOUR_PI;	break;
 +			case UNIT_GRAD: c2 = c2 * 0.9;		break;
 +			case UNIT_TURN: c2 = c2 * 360.0;	break;
 +			default:
@@ -315,7 +321,7 @@ index 07eb00a..1d790b5 100644
 +	}
 +
 +	if (polar) {
-+		double h = c2 * M_PI / 180.0;
++		double h = c2 * COLOUR_PI / 180.0;
 +		double chroma = c1;
 +
 +		c1 = chroma * cos(h);
@@ -486,7 +492,7 @@ index 07eb00a..1d790b5 100644
  /**
   * Parse a colour specifier
   *
-@@ -1085,6 +1537,27 @@ css_error css__parse_colour_specifier(css_language *c,
+@@ -1085,6 +1543,27 @@ css_error css__parse_colour_specifier(css_language *c,
  			if (!parse_hwb(vector, ctx, result)) {
  				goto invalid;
  			}
