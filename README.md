@@ -103,12 +103,18 @@ frontend redrawing instead of panning on such pages; and gradient
 backgrounds (`linear-gradient()`, the `-webkit-` forms, `radial-` and
 `conic-` as their average colour) painted as alpha-blended strips, with
 the knockout renderer taught that a translucent fill does not hide what
-is under it. After this the census counts one to four percent of
-declarations dropped on GitHub, MDN, Bootstrap and Tailwind's own pages;
-what remains is mostly `filter`, `mask-size`, rotation and scaling
-transforms, and vendor prefixed properties. Each patch has a page under
-`tests/css/` that the monkey frontend checks; none of this batch has
-been verified on hardware yet.
+is under it. Patches 0085 to 0090 add `-webkit-line-clamp`, `filter`
+(`blur`, `brightness`, `contrast`, `grayscale`, `invert`, `opacity`,
+`saturate`, `sepia` and `drop-shadow`, applied when the box is painted),
+`mask-size`, `mask-position` and the `mask` shorthand, and the
+`-webkit-` and `-moz-` spellings of flexbox, transforms, border radius,
+box shadow, background size and opacity as aliases of the unprefixed
+properties, with the old `-webkit-box-*` and other prefixed leftovers
+accepted and ignored. After this the census counts one to four percent
+of declarations dropped on GitHub, MDN, Bootstrap and Tailwind's own
+pages; what remains is mostly rotation and scaling transforms. Each
+patch has a page under `tests/css/` that the monkey frontend checks;
+none of this batch has been verified on hardware yet.
 
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic
