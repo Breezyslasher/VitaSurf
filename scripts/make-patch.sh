@@ -38,14 +38,38 @@ git -C "$work/base" add -A
 git -C "$work/base" -c user.email=vitasurf@invalid -c user.name=VitaSurf \
         commit --quiet -m "base plus the patches before $num"
 
-# Which files a patch may touch: everything upstream tracks, plus the files
+# Which files a patch may touch: everything upstream tracks, the files
 # earlier patches added (which the submodule itself never tracks, since the
-# series is applied to the working tree). A submodule's build output is in
-# neither list and so never lands in a patch.
+# series is applied to the working tree), and the files this patch is
+# adding, which are untracked and not ignored. Build output is ignored by
+# the submodule and so never lands in a patch. Two untracked files are
+# not source and are left out: the apply stamp, and any ELF binary, which
+# is a test harness that was built in place.
 #
 # -P so a tracked symlink is copied as a link rather than followed.
-{ git -C "$dir" ls-files -z; git -C "$work/base" ls-files -z; } |
-        sort -zu > "$work/files"
+{ git -C "$dir" ls-files -z
+  git -C "$work/base" ls-files -z
+  git -C "$dir" ls-files -z --others --exclude-standard |
+        while IFS= read -r -d '' f; do
+            case "$f" in .vitasurf-patched) continue ;; esac
+            if [ -f "$dir/$f" ] &&
+               [ "$(head -c 4 "$dir/$f" | tr -d '\0')" = "$(printf '\177ELF')" ]; then
+                continue
+            fi
+            # When an older patch is being regenerated, the live tree also
+            # holds the files that later patches created; those belong to
+            # the patch that introduced them, not to this one.
+            if grep -lq -- "^+++ b/$f\$" "$ROOT"/patches/*-"$sub"-*.patch 2>/dev/null; then
+                later=0
+                for lp in "$ROOT"/patches/*-"$sub"-*.patch; do
+                    [ "$(basename "$lp")" \> "$num-$sub-$desc.patch" ] || continue
+                    grep -q -- "^+++ b/$f\$" "$lp" && grep -q -- "^--- /dev/null" "$lp" && later=1
+                done
+                [ "$later" = 0 ] || continue
+            fi
+            printf '%s\0' "$f"
+        done
+} | sort -zu > "$work/files"
 
 while IFS= read -r -d '' f; do
     if [ -e "$dir/$f" ] || [ -L "$dir/$f" ]; then

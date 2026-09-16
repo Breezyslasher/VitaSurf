@@ -3107,3 +3107,1032 @@ index 9aae5c2..8e13648 100644
  			case CSS_PROP_TRANSFORM:
  				switch (value) {
  				case TRANSFORM_NONE:
+diff --git a/src/parse/properties/animation.c b/src/parse/properties/animation.c
+new file mode 100644
+index 0000000..1746e51
+--- /dev/null
++++ b/src/parse/properties/animation.c
+@@ -0,0 +1,503 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The NetSurf Project
++ */
++
++#include <assert.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++#include "utils/utils.h"
++
++/*
++ * Where an animation comes to rest (VitaSurf).
++ *
++ * This browser runs no animations: there is no clock in the style
++ * system and the framebuffer has no spare frames to spend. What it does
++ * need to know is where an animation ends up, because the common way to
++ * fade something in is
++ *
++ *	.card { opacity: 0; animation: fadeIn .3s ease forwards; }
++ *	@keyframes fadeIn { to { opacity: 1; } }
++ *
++ * and a browser that ignores the animation leaves the card invisible
++ * for ever. So the name, the fill mode and the iteration count are
++ * kept, and the cascade applies the last keyframe of an animation that
++ * would rest there. The duration, delay, timing function, direction
++ * and play state say how it gets there, which is nothing here; the
++ * shorthand steps over them.
++ */
++
++/**
++ * Emit animation-name, either none or a string.
++ */
++static css_error emit_name(css_language *c, css_style *result,
++		lwc_string *name)
++{
++	css_error error;
++	uint32_t snumber;
++
++	if (name == NULL) {
++		return css__stylesheet_style_appendOPV(result,
++				CSS_PROP_ANIMATION_NAME, 0,
++				ANIMATION_NAME_NONE);
++	}
++
++	error = css__stylesheet_string_add(c->sheet, lwc_string_ref(name),
++			&snumber);
++	if (error != CSS_OK)
++		return error;
++
++	error = css__stylesheet_style_appendOPV(result,
++			CSS_PROP_ANIMATION_NAME, 0, ANIMATION_NAME_SET);
++	if (error != CSS_OK)
++		return error;
++
++	return css__stylesheet_style_append(result, snumber);
++}
++
++static css_error emit_count(css_style *result, bool infinite,
++		css_fixed count)
++{
++	css_error error;
++
++	if (infinite) {
++		return css__stylesheet_style_appendOPV(result,
++				CSS_PROP_ANIMATION_ITERATION_COUNT, 0,
++				ANIMATION_ITERATION_COUNT_INFINITE);
++	}
++
++	error = css__stylesheet_style_appendOPV(result,
++			CSS_PROP_ANIMATION_ITERATION_COUNT, 0,
++			ANIMATION_ITERATION_COUNT_SET);
++	if (error != CSS_OK)
++		return error;
++
++	return css__stylesheet_style_append(result, count);
++}
++
++/**
++ * Match a fill-mode keyword, returning its opcode value or -1.
++ */
++static int fill_mode_value(css_language *c, const css_token *token)
++{
++	bool match;
++
++	if (token->type != CSS_TOKEN_IDENT)
++		return -1;
++	if (lwc_string_caseless_isequal(token->idata, c->strings[NONE],
++			&match) == lwc_error_ok && match)
++		return ANIMATION_FILL_MODE_NONE;
++	if (lwc_string_caseless_isequal(token->idata, c->strings[FORWARDS],
++			&match) == lwc_error_ok && match)
++		return ANIMATION_FILL_MODE_FORWARDS;
++	if (lwc_string_caseless_isequal(token->idata, c->strings[BACKWARDS],
++			&match) == lwc_error_ok && match)
++		return ANIMATION_FILL_MODE_BACKWARDS;
++	if (lwc_string_caseless_isequal(token->idata, c->strings[BOTH],
++			&match) == lwc_error_ok && match)
++		return ANIMATION_FILL_MODE_BOTH;
++	return -1;
++}
++
++/**
++ * Is this identifier one of the shorthand's keywords that say how an
++ * animation runs rather than what it is called?
++ */
++static bool is_run_keyword(css_language *c, const css_token *token)
++{
++	static const int words[] = { NORMAL, REVERSE, ALTERNATE,
++			ALTERNATE_REVERSE, PAUSED, RUNNING, INFINITE,
++			EASE, EASE_IN, EASE_OUT, EASE_IN_OUT, LINEAR,
++			STEP_START, STEP_END };
++	bool match;
++	size_t i;
++
++	for (i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
++		if (lwc_string_caseless_isequal(token->idata,
++				c->strings[words[i]], &match) ==
++				lwc_error_ok && match)
++			return true;
++	}
++	return false;
++}
++
++/**
++ * Step over a function's arguments, from after its opening bracket.
++ */
++static bool skip_function(const parserutils_vector *vector, int32_t *ctx)
++{
++	const css_token *token;
++	int depth = 1;
++
++	while (depth > 0) {
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL)
++			return false;
++		if (token->type == CSS_TOKEN_FUNCTION || tokenIsChar(token, '('))
++			depth++;
++		else if (tokenIsChar(token, ')'))
++			depth--;
++	}
++	return true;
++}
++
++/**
++ * Parse animation-name: none | <ident> | <string>
++ *
++ * A list names several animations; the first is the one kept.
++ */
++css_error css__parse_animation_name(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	int32_t orig_ctx = *ctx;
++	const css_token *token;
++	enum flag_value flag_value;
++	css_error error;
++	bool match;
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	flag_value = get_css_flag_value(c, token);
++	if (flag_value != FLAG_VALUE__NONE) {
++		return css_stylesheet_style_flag_value(result, flag_value,
++				CSS_PROP_ANIMATION_NAME);
++	}
++
++	if (token->type == CSS_TOKEN_IDENT &&
++	    lwc_string_caseless_isequal(token->idata, c->strings[NONE],
++			&match) == lwc_error_ok && match) {
++		error = emit_name(c, result, NULL);
++	} else if (token->type == CSS_TOKEN_IDENT ||
++			token->type == CSS_TOKEN_STRING) {
++		error = emit_name(c, result, token->idata);
++	} else {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++
++	/* the rest of a list */
++	consumeWhitespace(vector, ctx);
++	token = parserutils_vector_peek(vector, *ctx);
++	while (token != NULL && tokenIsChar(token, ',')) {
++		parserutils_vector_iterate(vector, ctx);
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL || (token->type != CSS_TOKEN_IDENT &&
++				token->type != CSS_TOKEN_STRING)) {
++			*ctx = orig_ctx;
++			return CSS_INVALID;
++		}
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++	}
++
++	return CSS_OK;
++}
++
++/**
++ * Parse animation-fill-mode: none | forwards | backwards | both
++ */
++css_error css__parse_animation_fill_mode(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	int32_t orig_ctx = *ctx;
++	const css_token *token;
++	enum flag_value flag_value;
++	int value;
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	flag_value = get_css_flag_value(c, token);
++	if (flag_value != FLAG_VALUE__NONE) {
++		return css_stylesheet_style_flag_value(result, flag_value,
++				CSS_PROP_ANIMATION_FILL_MODE);
++	}
++
++	value = fill_mode_value(c, token);
++	if (value < 0) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	return css__stylesheet_style_appendOPV(result,
++			CSS_PROP_ANIMATION_FILL_MODE, 0, value);
++}
++
++/**
++ * Parse animation-iteration-count: infinite | <number>
++ */
++css_error css__parse_animation_iteration_count(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	int32_t orig_ctx = *ctx;
++	const css_token *token;
++	enum flag_value flag_value;
++	size_t consumed = 0;
++	css_fixed count;
++	bool match;
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	flag_value = get_css_flag_value(c, token);
++	if (flag_value != FLAG_VALUE__NONE) {
++		return css_stylesheet_style_flag_value(result, flag_value,
++				CSS_PROP_ANIMATION_ITERATION_COUNT);
++	}
++
++	if (token->type == CSS_TOKEN_IDENT &&
++	    lwc_string_caseless_isequal(token->idata, c->strings[INFINITE],
++			&match) == lwc_error_ok && match) {
++		return emit_count(result, true, 0);
++	}
++
++	if (token->type != CSS_TOKEN_NUMBER) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	count = css__number_from_lwc_string(token->idata, false, &consumed);
++	if (consumed != lwc_string_length(token->idata) || count < 0) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	return emit_count(result, false, count);
++}
++
++/**
++ * Parse the animation shorthand.
++ *
++ * Its grammar is a bag of values in any order: two times (duration then
++ * delay), a timing function, a count, a direction, a fill mode, a play
++ * state and a name. Only the last three of those matter here. The name
++ * is whatever identifier is not one of the keywords; the specification
++ * says the same, which is why an animation cannot be called "forwards".
++ * A comma starts a second animation, which is not kept.
++ */
++css_error css__parse_animation(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	int32_t orig_ctx = *ctx;
++	const css_token *token;
++	enum flag_value flag_value;
++	lwc_string *name = NULL;
++	int fill_mode = ANIMATION_FILL_MODE_NONE;
++	bool infinite = false;
++	css_fixed count = INTTOFIX(1);
++	bool seen_count = false;
++	bool anything = false;
++	css_error error;
++	bool match;
++
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	flag_value = get_css_flag_value(c, token);
++	if (flag_value != FLAG_VALUE__NONE) {
++		parserutils_vector_iterate(vector, ctx);
++		error = css_stylesheet_style_flag_value(result, flag_value,
++				CSS_PROP_ANIMATION_NAME);
++		if (error != CSS_OK)
++			return error;
++		error = css_stylesheet_style_flag_value(result, flag_value,
++				CSS_PROP_ANIMATION_FILL_MODE);
++		if (error != CSS_OK)
++			return error;
++		return css_stylesheet_style_flag_value(result, flag_value,
++				CSS_PROP_ANIMATION_ITERATION_COUNT);
++	}
++
++	while (1) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL || token->type == CSS_TOKEN_EOF ||
++				tokenIsChar(token, '!') ||
++				tokenIsChar(token, ';')) {
++			break;
++		}
++		if (tokenIsChar(token, ',')) {
++			/* a second animation: step over it whole */
++			parserutils_vector_iterate(vector, ctx);
++			while ((token = parserutils_vector_peek(vector, *ctx))
++					!= NULL &&
++					token->type != CSS_TOKEN_EOF &&
++					!tokenIsChar(token, '!') &&
++					!tokenIsChar(token, ';')) {
++				parserutils_vector_iterate(vector, ctx);
++				if (token->type == CSS_TOKEN_FUNCTION &&
++						skip_function(vector, ctx) ==
++						false) {
++					*ctx = orig_ctx;
++					return CSS_INVALID;
++				}
++			}
++			break;
++		}
++		parserutils_vector_iterate(vector, ctx);
++		anything = true;
++
++		switch (token->type) {
++		case CSS_TOKEN_DIMENSION:
++			/* a time: the duration or the delay */
++			break;
++		case CSS_TOKEN_NUMBER: {
++			size_t consumed = 0;
++			css_fixed n = css__number_from_lwc_string(token->idata,
++					false, &consumed);
++			if (consumed != lwc_string_length(token->idata) ||
++					n < 0) {
++				*ctx = orig_ctx;
++				return CSS_INVALID;
++			}
++			if (seen_count == false) {
++				count = n;
++				seen_count = true;
++			}
++			break;
++		}
++		case CSS_TOKEN_FUNCTION:
++			/* cubic-bezier(), steps(): how it gets there */
++			if (skip_function(vector, ctx) == false) {
++				*ctx = orig_ctx;
++				return CSS_INVALID;
++			}
++			break;
++		case CSS_TOKEN_STRING:
++			if (name == NULL)
++				name = token->idata;
++			break;
++		case CSS_TOKEN_IDENT: {
++			int fm = fill_mode_value(c, token);
++
++			if (lwc_string_caseless_isequal(token->idata,
++					c->strings[INFINITE], &match) ==
++					lwc_error_ok && match) {
++				infinite = true;
++				seen_count = true;
++			} else if (fm >= 0 && !(fm == ANIMATION_FILL_MODE_NONE
++					&& name == NULL && false)) {
++				/* "none" here means no fill mode, or no
++				 * animation at all; either way the name
++				 * stays none. */
++				fill_mode = fm;
++			} else if (is_run_keyword(c, token)) {
++				/* how it runs, which is nothing here */
++			} else if (name == NULL) {
++				name = token->idata;
++			}
++			break;
++		}
++		default:
++			*ctx = orig_ctx;
++			return CSS_INVALID;
++		}
++	}
++
++	if (anything == false) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	error = emit_name(c, result, name);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++	error = css__stylesheet_style_appendOPV(result,
++			CSS_PROP_ANIMATION_FILL_MODE, 0, fill_mode);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++	error = emit_count(result, infinite, count);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++	}
++	return error;
++}
++
++/**
++ * Parse background-clip: border-box | padding-box | content-box | text
++ *
++ * The prefixed -webkit-background-clip is the same property: text is
++ * what sites still write it for, a heading cut out of a gradient, and
++ * they write the prefixed name.
++ */
++css_error css__parse_background_clip(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	int32_t orig_ctx = *ctx;
++	const css_token *token;
++	enum flag_value flag_value;
++	int value = -1;
++	bool match;
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	flag_value = get_css_flag_value(c, token);
++	if (flag_value != FLAG_VALUE__NONE) {
++		return css_stylesheet_style_flag_value(result, flag_value,
++				CSS_PROP_BACKGROUND_CLIP);
++	}
++
++	if (token->type == CSS_TOKEN_IDENT) {
++		if (lwc_string_caseless_isequal(token->idata,
++				c->strings[BORDER_BOX], &match) ==
++				lwc_error_ok && match)
++			value = BACKGROUND_CLIP_BORDER_BOX;
++		else if (lwc_string_caseless_isequal(token->idata,
++				c->strings[PADDING_BOX], &match) ==
++				lwc_error_ok && match)
++			value = BACKGROUND_CLIP_PADDING_BOX;
++		else if (lwc_string_caseless_isequal(token->idata,
++				c->strings[CONTENT_BOX], &match) ==
++				lwc_error_ok && match)
++			value = BACKGROUND_CLIP_CONTENT_BOX;
++		else if (lwc_string_caseless_isequal(token->idata,
++				c->strings[LIBCSS_TEXT], &match) ==
++				lwc_error_ok && match)
++			value = BACKGROUND_CLIP_TEXT;
++	}
++
++	if (value < 0) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	return css__stylesheet_style_appendOPV(result,
++			CSS_PROP_BACKGROUND_CLIP, 0, value);
++}
+diff --git a/src/select/properties/animation_name.c b/src/select/properties/animation_name.c
+new file mode 100644
+index 0000000..f4720dc
+--- /dev/null
++++ b/src/select/properties/animation_name.c
+@@ -0,0 +1,89 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The NetSurf Project
++ */
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++css_error css__cascade_animation_name(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	uint16_t value = CSS_ANIMATION_NAME_INHERIT;
++	lwc_string *name = NULL;
++
++	if (hasFlagValue(opv) == false) {
++		switch (getValue(opv)) {
++		case ANIMATION_NAME_NONE:
++			value = CSS_ANIMATION_NAME_NONE;
++			break;
++		case ANIMATION_NAME_SET:
++			value = CSS_ANIMATION_NAME_SET;
++			css__stylesheet_string_get(style->sheet,
++					*((css_code_t *) style->bytecode),
++					&name);
++			advance_bytecode(style, sizeof(css_code_t));
++			break;
++		}
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		return set_animation_name(state->computed, value, name);
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_animation_name_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	css_error error;
++
++	error = set_animation_name(style, hint->status, hint->data.string);
++
++	if (hint->data.string != NULL)
++		lwc_string_unref(hint->data.string);
++
++	return error;
++}
++
++css_error css__initial_animation_name(css_select_state *state)
++{
++	return set_animation_name(state->computed, CSS_ANIMATION_NAME_NONE,
++			NULL);
++}
++
++css_error css__copy_animation_name(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	lwc_string *name;
++	uint8_t type = get_animation_name(from, &name);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_animation_name(to, type, name);
++}
++
++css_error css__compose_animation_name(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	lwc_string *name;
++	uint8_t type = get_animation_name(child, &name);
++
++	return css__copy_animation_name(
++			type == CSS_ANIMATION_NAME_INHERIT ? parent : child,
++			result);
++}
+diff --git a/src/select/properties/animation_fill_mode.c b/src/select/properties/animation_fill_mode.c
+new file mode 100644
+index 0000000..bb56965
+--- /dev/null
++++ b/src/select/properties/animation_fill_mode.c
+@@ -0,0 +1,82 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The NetSurf Project
++ */
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++css_error css__cascade_animation_fill_mode(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	uint16_t value = CSS_ANIMATION_FILL_MODE_INHERIT;
++
++	UNUSED(style);
++
++	if (hasFlagValue(opv) == false) {
++		switch (getValue(opv)) {
++		case ANIMATION_FILL_MODE_NONE:
++			value = CSS_ANIMATION_FILL_MODE_NONE;
++			break;
++		case ANIMATION_FILL_MODE_FORWARDS:
++			value = CSS_ANIMATION_FILL_MODE_FORWARDS;
++			break;
++		case ANIMATION_FILL_MODE_BACKWARDS:
++			value = CSS_ANIMATION_FILL_MODE_BACKWARDS;
++			break;
++		case ANIMATION_FILL_MODE_BOTH:
++			value = CSS_ANIMATION_FILL_MODE_BOTH;
++			break;
++		}
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		return set_animation_fill_mode(state->computed, value);
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_animation_fill_mode_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	return set_animation_fill_mode(style, hint->status);
++}
++
++css_error css__initial_animation_fill_mode(css_select_state *state)
++{
++	return set_animation_fill_mode(state->computed, CSS_ANIMATION_FILL_MODE_NONE);
++}
++
++css_error css__copy_animation_fill_mode(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	uint8_t type = get_animation_fill_mode(from);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_animation_fill_mode(to, type);
++}
++
++css_error css__compose_animation_fill_mode(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	uint8_t type = get_animation_fill_mode(child);
++
++	return css__copy_animation_fill_mode(
++			type == CSS_ANIMATION_FILL_MODE_INHERIT ? parent : child,
++			result);
++}
+diff --git a/src/select/properties/animation_iteration_count.c b/src/select/properties/animation_iteration_count.c
+new file mode 100644
+index 0000000..9d0faf3
+--- /dev/null
++++ b/src/select/properties/animation_iteration_count.c
+@@ -0,0 +1,84 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The NetSurf Project
++ */
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++css_error css__cascade_animation_iteration_count(uint32_t opv,
++		css_style *style, css_select_state *state)
++{
++	uint16_t value = CSS_ANIMATION_ITERATION_COUNT_INHERIT;
++	css_fixed count = 0;
++
++	if (hasFlagValue(opv) == false) {
++		switch (getValue(opv)) {
++		case ANIMATION_ITERATION_COUNT_SET:
++			value = CSS_ANIMATION_ITERATION_COUNT_SET;
++			count = *((css_fixed *) style->bytecode);
++			advance_bytecode(style, sizeof(count));
++			break;
++		case ANIMATION_ITERATION_COUNT_INFINITE:
++			value = CSS_ANIMATION_ITERATION_COUNT_INFINITE;
++			break;
++		}
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		return set_animation_iteration_count(state->computed, value,
++				count);
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_animation_iteration_count_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	return set_animation_iteration_count(style, hint->status,
++			hint->data.fixed);
++}
++
++css_error css__initial_animation_iteration_count(css_select_state *state)
++{
++	return set_animation_iteration_count(state->computed,
++			CSS_ANIMATION_ITERATION_COUNT_SET, INTTOFIX(1));
++}
++
++css_error css__copy_animation_iteration_count(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	css_fixed count = 0;
++	uint8_t type = get_animation_iteration_count(from, &count);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_animation_iteration_count(to, type, count);
++}
++
++css_error css__compose_animation_iteration_count(
++		const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	css_fixed count = 0;
++	uint8_t type = get_animation_iteration_count(child, &count);
++
++	return css__copy_animation_iteration_count(
++			type == CSS_ANIMATION_ITERATION_COUNT_INHERIT ?
++					parent : child,
++			result);
++}
+diff --git a/src/select/properties/background_clip.c b/src/select/properties/background_clip.c
+new file mode 100644
+index 0000000..8348d07
+--- /dev/null
++++ b/src/select/properties/background_clip.c
+@@ -0,0 +1,82 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The NetSurf Project
++ */
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "select/propset.h"
++#include "select/propget.h"
++#include "utils/utils.h"
++
++#include "select/properties/properties.h"
++#include "select/properties/helpers.h"
++
++css_error css__cascade_background_clip(uint32_t opv, css_style *style,
++		css_select_state *state)
++{
++	uint16_t value = CSS_BACKGROUND_CLIP_INHERIT;
++
++	UNUSED(style);
++
++	if (hasFlagValue(opv) == false) {
++		switch (getValue(opv)) {
++		case BACKGROUND_CLIP_BORDER_BOX:
++			value = CSS_BACKGROUND_CLIP_BORDER_BOX;
++			break;
++		case BACKGROUND_CLIP_PADDING_BOX:
++			value = CSS_BACKGROUND_CLIP_PADDING_BOX;
++			break;
++		case BACKGROUND_CLIP_CONTENT_BOX:
++			value = CSS_BACKGROUND_CLIP_CONTENT_BOX;
++			break;
++		case BACKGROUND_CLIP_TEXT:
++			value = CSS_BACKGROUND_CLIP_TEXT;
++			break;
++		}
++	}
++
++	if (css__outranks_existing(getOpcode(opv), isImportant(opv), state,
++			getFlagValue(opv))) {
++		return set_background_clip(state->computed, value);
++	}
++
++	return CSS_OK;
++}
++
++css_error css__set_background_clip_from_hint(const css_hint *hint,
++		css_computed_style *style)
++{
++	return set_background_clip(style, hint->status);
++}
++
++css_error css__initial_background_clip(css_select_state *state)
++{
++	return set_background_clip(state->computed, CSS_BACKGROUND_CLIP_BORDER_BOX);
++}
++
++css_error css__copy_background_clip(
++		const css_computed_style *from,
++		css_computed_style *to)
++{
++	uint8_t type = get_background_clip(from);
++
++	if (from == to) {
++		return CSS_OK;
++	}
++
++	return set_background_clip(to, type);
++}
++
++css_error css__compose_background_clip(const css_computed_style *parent,
++		const css_computed_style *child,
++		css_computed_style *result)
++{
++	uint8_t type = get_background_clip(child);
++
++	return css__copy_background_clip(
++			type == CSS_BACKGROUND_CLIP_INHERIT ? parent : child,
++			result);
++}
+diff --git a/test/data/parse2/animation.dat b/test/data/parse2/animation.dat
+new file mode 100644
+index 0000000..ad4d77d
+--- /dev/null
++++ b/test/data/parse2/animation.dat
+@@ -0,0 +1,153 @@
++#data
++* { animation-name: fadeIn; }
++#errors
++#expected
++| *
++|  animation-name: fadeIn
++#reset
++
++#data
++* { animation-name: none; }
++#errors
++#expected
++| *
++|  animation-name: none
++#reset
++
++#data
++* { animation-fill-mode: forwards; }
++#errors
++#expected
++| *
++|  animation-fill-mode: forwards
++#reset
++
++#data
++* { animation-iteration-count: infinite; }
++#errors
++#expected
++| *
++|  animation-iteration-count: infinite
++#reset
++
++#data
++* { animation-iteration-count: 3; }
++#errors
++#expected
++| *
++|  animation-iteration-count: 3
++#reset
++
++#data
++* { animation: fadeIn .3s ease forwards; }
++#errors
++#expected
++| *
++|  animation-name: fadeIn
++|  animation-fill-mode: forwards
++|  animation-iteration-count: 1
++#reset
++
++#data
++* { animation: 2s cubic-bezier(.4, 0, .2, 1) 1s infinite alternate spin; }
++#errors
++#expected
++| *
++|  animation-name: spin
++|  animation-fill-mode: none
++|  animation-iteration-count: infinite
++#reset
++
++#data
++* { animation: slide-up 400ms both 2; }
++#errors
++#expected
++| *
++|  animation-name: slide-up
++|  animation-fill-mode: both
++|  animation-iteration-count: 2
++#reset
++
++#data
++* { animation: none; }
++#errors
++#expected
++| *
++|  animation-name: none
++|  animation-fill-mode: none
++|  animation-iteration-count: 1
++#reset
++
++#data
++* { animation: a 1s, b 2s forwards; }
++#errors
++#expected
++| *
++|  animation-name: a
++|  animation-fill-mode: none
++|  animation-iteration-count: 1
++#reset
++
++#data
++* { background-clip: text; }
++#errors
++#expected
++| *
++|  background-clip: text
++#reset
++
++#data
++* { -webkit-background-clip: text; }
++#errors
++#expected
++| *
++|  background-clip: text
++#reset
++
++#data
++* { background-clip: padding-box; }
++#errors
++#expected
++| *
++|  background-clip: padding-box
++#reset
++
++#data
++@keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
++* { animation: fadeIn 1s forwards; }
++#errors
++#expected
++| @keyframes fadeIn
++|  opacity: 1
++| *
++|  animation-name: fadeIn
++|  animation-fill-mode: forwards
++|  animation-iteration-count: 1
++#reset
++
++#data
++@-webkit-keyframes pop { 0%, 100% { opacity: 1 } 50% { opacity: .5 } }
++div { color: red; }
++#errors
++#expected
++| @keyframes pop
++|  opacity: 1
++| div
++|  color: #ffff0000
++#reset
++
++#data
++@keyframes two { to { opacity: .25 } 100% { width: 60px } }
++#errors
++#expected
++| @keyframes two
++|  opacity: 0.250
++|  width: 60px
++#reset
++
++#data
++@keyframes nowhere { from { opacity: 0 } 50% { opacity: .5 } }
++#errors
++#expected
++| @keyframes nowhere
++#reset
