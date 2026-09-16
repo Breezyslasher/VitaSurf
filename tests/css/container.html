@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>container queries</title><style>
+ body { margin: 0; }
+ .wrap { container-type: inline-size; width: 300px; }
+ div.b { width: 100px; height: 20px; background: #ddd; }
+ @container (width >= 24rem) { #a { width: 60px; } }
+ @container (width >= 100rem) { #b { width: 60px; } }
+ @container card (min-width: 400px) { #c { width: 60px; } }
+ @container (inline-size > 10px) { #d { width: 60px; } }
+ @container not (width < 10px) { #e { width: 60px; } }
+</style></head>
+<body>
+<div class="wrap">
+ <div class="b" id="a"></div>
+ <div class="b" id="b"></div>
+ <div class="b" id="c"></div>
+ <div class="b" id="d"></div>
+ <div class="b" id="e"></div>
+</div>
+<pre id="out"></pre>
+<script>
+/* @container is evaluated against the viewport, the one size the
+   cascade has: the harness window is 800px wide. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function W(id){ return Math.round(document.getElementById(id).getBoundingClientRect().width); }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('width >= 24rem applies at 800px', W('a'));
+  T('width >= 100rem does not', W('b'));
+  T('a named container is the same query', W('c'));
+  T('inline-size means width', W('d'));
+  T('not (width < 10px) applies', W('e'));
+}, 200); });
+</script></body></html>

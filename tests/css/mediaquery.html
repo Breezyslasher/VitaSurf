@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>media query ranges</title><style>
+ body { margin: 0; }
+ div { width: 100px; height: 10px; background: #ddd; }
+ @media (width >= 24rem) { #a { width: 60px; } }
+ @media (24rem <= width) { #b { width: 60px; } }
+ @media (min-width: 24rem) { #c { width: 60px; } }
+ @media (width > 100px) { #d { width: 60px; } }
+ @media (width < 100px) { #e { width: 60px; } }
+ @media (width <= 2000px) { #f { width: 60px; } }
+ @media (100px < width < 2000px) { #g { width: 60px; } }
+ @media (2000px > width > 100px) { #h { width: 60px; } }
+ @media (width >= 100rem) { #i { width: 60px; } }
+ @media (max-width: 100px) { #j { width: 60px; } }
+ @media screen and (width >= 24rem) { #k { width: 60px; } }
+</style></head>
+<body>
+<div id="a"></div><div id="b"></div><div id="c"></div><div id="d"></div><div id="e"></div>
+<div id="f"></div><div id="g"></div><div id="h"></div><div id="i"></div><div id="j"></div><div id="k"></div>
+<pre id="out"></pre>
+<script>
+/* Range syntax is how Tailwind v4 writes every breakpoint. A name-first
+   range never evaluated true in upstream libcss: the value was taken
+   from the name token and the operator was negated instead of mirrored.
+   The harness window is 800px wide. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function on(id){ return document.getElementById(id).getBoundingClientRect().width < 100 ? 'applies' : 'no'; }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('(width >= 24rem)', on('a'));
+  T('(24rem <= width)', on('b'));
+  T('(min-width: 24rem)', on('c'));
+  T('(width > 100px)', on('d'));
+  T('(width < 100px)', on('e'));
+  T('(width <= 2000px)', on('f'));
+  T('(100px < width < 2000px)', on('g'));
+  T('(2000px > width > 100px)', on('h'));
+  T('(width >= 100rem)', on('i'));
+  T('(max-width: 100px)', on('j'));
+  T('screen and (width >= 24rem)', on('k'));
+}, 200); });
+</script></body></html>
