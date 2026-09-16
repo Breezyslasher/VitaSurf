@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>filter and opacity</title>
+<style>
+body { margin: 0; }
+.box { width: 96px; height: 48px; margin: 0 0 4px 0; background: #ff0000; }
+/* a: opacity 0 paints nothing */
+.a { opacity: 0; }
+/* b: opacity .5 paints a half-transparent red */
+.b { opacity: 0.5; }
+/* c: invert turns red into cyan */
+.c { filter: invert(1); }
+/* d: grayscale of red is 54 grey */
+.d { filter: grayscale(1); }
+/* e: brightness halves it */
+.e { filter: brightness(0.5); }
+/* f: drop shadow, blue, offset 10px right and down, no blur */
+.f { filter: drop-shadow(10px 10px 0 #0000ff); }
+/* g: nested opacity multiplies */
+.g { opacity: 0.5; } .g .in { width: 96px; height: 48px; background: #00ff00; opacity: 0.5; }
+/* h: text inside a filtered box takes the filter */
+.h { filter: invert(1); color: #000000; background: #ffffff; }
+/* i: a rule with blur keeps its other declarations */
+.i { filter: blur(4px); width: 60px; }
+/* j: -webkit-filter alias */
+.j { -webkit-filter: opacity(0.25); }
+</style>
+</head>
+<body>
+<div class="box a"></div>
+<div class="box b"></div>
+<div class="box c"></div>
+<div class="box d"></div>
+<div class="box e"></div>
+<div class="box f"></div>
+<div class="box g"><div class="in"></div></div>
+<div class="box h">inverted text</div>
+<div class="box i"></div>
+<div class="box j"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+window.addEventListener('load', function(){ setTimeout(function(){
+  var w = Math.round(document.querySelector('.i').getBoundingClientRect().width);
+  T('blur rule keeps its width', w + (w == 60 ? '' : ' (expected 60)'));
+}, 200); });
+</script>
+</body>
+</html>

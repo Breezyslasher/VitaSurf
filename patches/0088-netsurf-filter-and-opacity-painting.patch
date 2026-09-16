@@ -1,0 +1,637 @@
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 85d5a9e70..2154f9947 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -75,6 +75,22 @@ typedef enum {
+ /**
+  * Flags for a struct box.
+  */
++/**
++ * A CSS filter as the painter applies it (VitaSurf). libcss folds the
++ * function list into this: a colour matrix in 1/4096ths, an alpha
++ * multiplier in 1/256ths, and at most one drop shadow.
++ */
++struct html_paint_filter {
++	int alpha;		/**< 0..256 */
++	bool colour;		/**< m is not the identity */
++	int32_t m[12];		/**< rows of (r g b offset), 1/4096 */
++	bool shadow;
++	int shadow_x;		/**< CSS px */
++	int shadow_y;
++	int shadow_blur;
++	css_color shadow_colour;
++};
++
+ typedef enum {
+ 	NEW_LINE    = 1 << 0,	/* first inline on a new line */
+ 	STYLE_OWNED = 1 << 1,	/* style is owned by this box */
+@@ -294,6 +310,12 @@ struct box {
+ 	 */
+ 	int sticky_dy;
+ 
++	/**
++	 * The box's CSS filter, read from the style when the box is
++	 * built (VitaSurf); NULL when there is none. Owned by the box.
++	 */
++	struct html_paint_filter *filter;
++
+ 	/**
+ 	 * Width of content box (excluding padding etc.).
+ 	 */
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index d648a9034..d91ea0d87 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -472,6 +472,74 @@ static inline bool box__containing_block_is_flex(
+  * \param convert_children  Whether to convert children
+  * \return  true on success, false on memory exhaustion
+  */
++/**
++ * Read the filter string libcss folded a filter list into (VitaSurf).
++ *
++ * See libcss parse/properties/filter.c for the form. The result is
++ * owned by the box.
++ */
++static struct html_paint_filter *box_parse_filter(struct box *box,
++		const char *spec)
++{
++	struct html_paint_filter *f = talloc_zero(box, struct html_paint_filter);
++	const char *p = spec;
++	char *end;
++	int i;
++
++	if (f == NULL)
++		return NULL;
++	f->alpha = 256;
++	f->m[0] = f->m[5] = f->m[10] = 4096;
++
++	while (*p != '\0') {
++		if (p[0] == 'a' && p[1] == '=') {
++			long a = strtol(p + 2, &end, 10);
++
++			f->alpha = (int) ((a < 0 ? 0 : a > 4096 ? 4096 : a) /
++					16);
++			p = end;
++		} else if (p[0] == 'm' && p[1] == '=') {
++			p += 2;
++			for (i = 0; i < 12; i++) {
++				f->m[i] = (int32_t) strtol(p, &end, 10);
++				if (end == p)
++					break;
++				p = end;
++				if (*p == ',')
++					p++;
++			}
++			f->colour = (i == 12);
++		} else if (p[0] == 's' && p[1] == '=') {
++			p += 2;
++			f->shadow_x = (int) strtol(p, &end, 10); p = end;
++			if (*p == ',') p++;
++			f->shadow_y = (int) strtol(p, &end, 10); p = end;
++			if (*p == ',') p++;
++			f->shadow_blur = (int) strtol(p, &end, 10); p = end;
++			if (*p == ',') p++;
++			f->shadow_colour = (css_color) strtoul(p, &end, 16);
++			f->shadow = (end != p);
++			p = end;
++		} else if (p[0] == 'b' && p[1] == '=') {
++			/* blur: noted by libcss, not drawn */
++			strtol(p + 2, &end, 10);
++			p = end;
++		} else {
++			break;
++		}
++		if (*p == ';')
++			p++;
++		else
++			break;
++	}
++
++	if (f->alpha == 256 && !f->colour && !f->shadow) {
++		talloc_free(f);
++		return NULL;
++	}
++	return f;
++}
++
+ static bool
+ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ {
+@@ -607,6 +675,17 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 			css_computed_position(box->style) == CSS_POSITION_FIXED)
+ 		ctx->content->pinned_boxes++;
+ 
++	/* the filter the box is painted through (VitaSurf) */
++	{
++		lwc_string *spec = NULL;
++
++		if (css_computed_filter(box->style, &spec) == CSS_FILTER_SET &&
++				spec != NULL) {
++			box->filter = box_parse_filter(box,
++					lwc_string_data(spec));
++		}
++	}
++
+ 	/* Set box type from computed display */
+ 	if ((css_computed_position(box->style) == CSS_POSITION_ABSOLUTE ||
+ 	     css_computed_position(box->style) == CSS_POSITION_FIXED) &&
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index b19b02a03..e06293afe 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -113,6 +113,7 @@ box_create(css_select_results *styles,
+ 	box->style = style;
+ 	box->x = box->y = 0;
+ 	box->sticky_dy = 0;
++	box->filter = NULL;
+ 	box->width = UNKNOWN_WIDTH;
+ 	box->height = 0;
+ 	box->descendant_x0 = box->descendant_y0 = 0;
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 421e9e3fe..be3663115 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -55,6 +55,7 @@
+ #include "desktop/scrollbar.h"
+ #include "desktop/textarea.h"
+ #include "desktop/gui_internal.h"
++#include "desktop/bitmap.h"
+ 
+ #include "html/box.h"
+ #include "html/box_inspect.h"
+@@ -1833,6 +1834,10 @@ static int html_sticky_offset(const html_content *html, struct box *box,
+  * \param ctx       Redraw context
+  * \return true on success, false otherwise
+  */
++static bool html_redraw_shadow_rings(int bx0, int by0, int bx1, int by1,
++		int ox, int oy, int blur, int spread, css_color colour,
++		const struct redraw_context *ctx);
++
+ static bool html_redraw_box_shadow(const html_content *html,
+ 		struct box *box, int bx0, int by0, int bx1, int by1,
+ 		float scale, const struct redraw_context *ctx)
+@@ -1841,9 +1846,7 @@ static bool html_redraw_box_shadow(const html_content *html,
+ 	css_unit unit[4] = { CSS_UNIT_PX, CSS_UNIT_PX, CSS_UNIT_PX,
+ 			CSS_UNIT_PX };
+ 	css_color colour = 0;
+-	int px[4], i, ox, oy, blur, spread, alpha, bands;
+-	plot_style_t pstyle = { .fill_type = PLOT_OP_TYPE_SOLID,
+-			.stroke_type = PLOT_OP_TYPE_NONE };
++	int px[4], i, ox, oy, blur, spread, alpha;
+ 
+ 	if (css_computed_box_shadow(box->style, &len[0], &unit[0],
+ 			&len[1], &unit[1], &len[2], &unit[2],
+@@ -1872,6 +1875,27 @@ static bool html_redraw_box_shadow(const html_content *html,
+ 	blur = px[2] < 0 ? 0 : px[2];
+ 	spread = px[3];
+ 
++	return html_redraw_shadow_rings(bx0, by0, bx1, by1, ox, oy, blur,
++			spread, colour, ctx);
++}
++
++/**
++ * Draw one shadow as bands of translucent rings (VitaSurf): the
++ * rectangle offset by (ox, oy) and grown by the spread, softened over
++ * the blur radius by drawing it in four bands of falling alpha.
++ */
++static bool html_redraw_shadow_rings(int bx0, int by0, int bx1, int by1,
++		int ox, int oy, int blur, int spread, css_color colour,
++		const struct redraw_context *ctx)
++{
++	plot_style_t pstyle = { .fill_type = PLOT_OP_TYPE_SOLID,
++			.stroke_type = PLOT_OP_TYPE_NONE };
++	int alpha = colour >> 24;
++	int bands, i;
++
++	if (alpha == 0)
++		return true;
++
+ 	bands = blur > 0 ? 4 : 1;
+ 
+ 	for (i = 0; i < bands; i++) {
+@@ -1941,11 +1965,402 @@ static bool html_redraw_box_shadow(const html_content *html,
+ 	return true;
+ }
+ 
++/*
++ * Painting through a filter (VitaSurf).
++ *
++ * A box with a CSS filter or an opacity below one, and everything in it,
++ * is painted through a plotter table that stands in front of the real
++ * one: every colour a call carries is put through the box's colour
++ * matrix and alpha, and a bitmap is copied and transformed pixel by
++ * pixel before it is drawn. Fills keep their alpha, since the plotters
++ * blend those; a text or stroke colour, which they do not blend, is
++ * mixed towards the colour under the box instead. Nested filters stack:
++ * each level's calls forward to the table below it, so an inner box is
++ * transformed by its own filter and then by every enclosing one.
++ */
++#define HTML_FILTER_DEPTH 8
++
++struct html_filter_level {
++	const struct plotter_table *real;
++	int alpha;			/**< 0..256 */
++	const int32_t *m;		/**< NULL for the identity */
++	colour bg;			/**< what a mixed colour fades to */
++};
++
++static struct html_filter_level html_filter_stack[HTML_FILTER_DEPTH];
++static int html_filter_depth;
++
++static inline int html_filter_clamp(int v)
++{
++	return v < 0 ? 0 : v > 255 ? 255 : v;
++}
++
++/** The matrix and alpha applied to a NetSurf colour, alpha kept. */
++static colour html_filter_colour(const struct html_filter_level *lv,
++		colour c)
++{
++	int r = c & 0xff, g = (c >> 8) & 0xff, b = (c >> 16) & 0xff;
++	int a = 0xff - (c >> 24);
++
++	if (lv->m != NULL) {
++		const int32_t *m = lv->m;
++		int nr = (m[0] * r + m[1] * g + m[2] * b) / 4096 +
++				m[3] * 255 / 4096;
++		int ng = (m[4] * r + m[5] * g + m[6] * b) / 4096 +
++				m[7] * 255 / 4096;
++		int nb = (m[8] * r + m[9] * g + m[10] * b) / 4096 +
++				m[11] * 255 / 4096;
++
++		r = html_filter_clamp(nr);
++		g = html_filter_clamp(ng);
++		b = html_filter_clamp(nb);
++	}
++	a = a * lv->alpha / 256;
++
++	return ((0xff - a) << 24) | (b << 16) | (g << 8) | r;
++}
++
++/** As above, then mixed towards the background for a sink without alpha. */
++static colour html_filter_opaque(const struct html_filter_level *lv,
++		colour c)
++{
++	colour t = html_filter_colour(lv, c);
++	int a = 0xff - (t >> 24);
++	int r, g, b;
++
++	if (a >= 0xff)
++		return t & 0x00ffffff;
++	r = ((t & 0xff) * a + (lv->bg & 0xff) * (0xff - a)) / 0xff;
++	g = (((t >> 8) & 0xff) * a + ((lv->bg >> 8) & 0xff) * (0xff - a)) /
++			0xff;
++	b = (((t >> 16) & 0xff) * a + ((lv->bg >> 16) & 0xff) * (0xff - a)) /
++			0xff;
++	return (b << 16) | (g << 8) | r;
++}
++
++/* Each wrapper pops its level while it forwards, so that a level below
++ * sees itself on top. */
++#define HTML_FILTER_FORWARD(lvvar, ctxvar, call)			\
++	do {								\
++		struct redraw_context rctx_ = *(ctxvar);		\
++		html_filter_depth--;					\
++		rctx_.plot = (lvvar)->real;				\
++		res = (call);						\
++		html_filter_depth++;					\
++	} while (0)
++
++static nserror html_filter_clip(const struct redraw_context *ctx,
++		const struct rect *clip)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	nserror res;
++
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->clip(&rctx_, clip));
++	return res;
++}
++
++static nserror html_filter_arc(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, int x, int y, int radius,
++		int angle1, int angle2)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	plot_style_t st = *pstyle;
++	nserror res;
++
++	st.fill_colour = html_filter_opaque(lv, pstyle->fill_colour);
++	st.stroke_colour = html_filter_opaque(lv, pstyle->stroke_colour);
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->arc(&rctx_, &st, x, y,
++			radius, angle1, angle2));
++	return res;
++}
++
++static nserror html_filter_disc(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, int x, int y, int radius)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	plot_style_t st = *pstyle;
++	nserror res;
++
++	st.fill_colour = html_filter_opaque(lv, pstyle->fill_colour);
++	st.stroke_colour = html_filter_opaque(lv, pstyle->stroke_colour);
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->disc(&rctx_, &st, x, y,
++			radius));
++	return res;
++}
++
++static nserror html_filter_line(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const struct rect *line)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	plot_style_t st = *pstyle;
++	nserror res;
++
++	st.stroke_colour = html_filter_opaque(lv, pstyle->stroke_colour);
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->line(&rctx_, &st, line));
++	return res;
++}
++
++static nserror html_filter_rectangle(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const struct rect *rectangle)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	plot_style_t st = *pstyle;
++	nserror res;
++
++	st.fill_colour = html_filter_colour(lv, pstyle->fill_colour);
++	st.stroke_colour = html_filter_opaque(lv, pstyle->stroke_colour);
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->rectangle(&rctx_, &st,
++			rectangle));
++	return res;
++}
++
++static nserror html_filter_polygon(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const int *p, unsigned int n)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	plot_style_t st = *pstyle;
++	nserror res;
++
++	st.fill_colour = html_filter_opaque(lv, pstyle->fill_colour);
++	st.stroke_colour = html_filter_opaque(lv, pstyle->stroke_colour);
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->polygon(&rctx_, &st, p, n));
++	return res;
++}
++
++static nserror html_filter_path(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const float *p, unsigned int n,
++		const float transform[6])
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	plot_style_t st = *pstyle;
++	nserror res;
++
++	st.fill_colour = html_filter_opaque(lv, pstyle->fill_colour);
++	st.stroke_colour = html_filter_opaque(lv, pstyle->stroke_colour);
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->path(&rctx_, &st, p, n,
++			transform));
++	return res;
++}
++
++static nserror html_filter_bitmap(const struct redraw_context *ctx,
++		struct bitmap *bitmap, int x, int y, int width, int height,
++		colour bg, bitmap_flags_t flags)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	struct bitmap *copy = NULL;
++	nserror res;
++
++	bg = html_filter_opaque(lv, bg);
++
++	if (lv->m != NULL || lv->alpha < 256) {
++		int bw = guit->bitmap->get_width(bitmap);
++		int bh = guit->bitmap->get_height(bitmap);
++		const uint8_t *src;
++		uint8_t *dst;
++		size_t ss, ds;
++		int px, py;
++
++		copy = guit->bitmap->create(bw, bh, BITMAP_NONE);
++		if (copy != NULL) {
++			src = guit->bitmap->get_buffer(bitmap);
++			dst = guit->bitmap->get_buffer(copy);
++			ss = guit->bitmap->get_rowstride(bitmap);
++			ds = guit->bitmap->get_rowstride(copy);
++			if (src == NULL || dst == NULL) {
++				guit->bitmap->destroy(copy);
++				copy = NULL;
++			}
++		}
++		if (copy != NULL) {
++			bool opaque = guit->bitmap->get_opaque(bitmap);
++
++			for (py = 0; py < bh; py++) {
++				const uint8_t *sp = src + py * ss;
++				uint8_t *dp = dst + py * ds;
++
++				for (px = 0; px < bw; px++) {
++					colour c = bitmap_pixel_to_colour(sp);
++					colour t;
++
++					if (opaque)
++						c &= 0x00ffffff;
++					/* pixel alpha is stored straight,
++					 * not inverted as in a colour */
++					c ^= 0xff000000;
++					t = html_filter_colour(lv, c);
++					t ^= 0xff000000;
++					dp[bitmap_layout.r] = t & 0xff;
++					dp[bitmap_layout.g] = (t >> 8) & 0xff;
++					dp[bitmap_layout.b] = (t >> 16) & 0xff;
++					dp[bitmap_layout.a] = (t >> 24) & 0xff;
++					sp += 4;
++					dp += 4;
++				}
++			}
++			guit->bitmap->set_opaque(copy,
++					opaque && lv->alpha == 256);
++			guit->bitmap->modified(copy);
++			bitmap = copy;
++		}
++	}
++
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->bitmap(&rctx_, bitmap, x, y,
++			width, height, bg, flags));
++	if (copy != NULL)
++		guit->bitmap->destroy(copy);
++	return res;
++}
++
++static nserror html_filter_text(const struct redraw_context *ctx,
++		const plot_font_style_t *fstyle, int x, int y,
++		const char *text, size_t length)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	plot_font_style_t st = *fstyle;
++	nserror res;
++
++	st.foreground = html_filter_opaque(lv, fstyle->foreground);
++	st.background = html_filter_opaque(lv, fstyle->background);
++	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->text(&rctx_, &st, x, y, text,
++			length));
++	return res;
++}
++
++static nserror html_filter_group_start(const struct redraw_context *ctx,
++		const char *name)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	nserror res = NSERROR_OK;
++
++	if (lv->real->group_start != NULL)
++		HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->group_start(&rctx_,
++				name));
++	return res;
++}
++
++static nserror html_filter_group_end(const struct redraw_context *ctx)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	nserror res = NSERROR_OK;
++
++	if (lv->real->group_end != NULL)
++		HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->group_end(&rctx_));
++	return res;
++}
++
++static nserror html_filter_flush(const struct redraw_context *ctx)
++{
++	struct html_filter_level *lv =
++			&html_filter_stack[html_filter_depth - 1];
++	nserror res = NSERROR_OK;
++
++	if (lv->real->flush != NULL)
++		HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->flush(&rctx_));
++	return res;
++}
++
++static const struct plotter_table html_filter_plotters = {
++	.clip = html_filter_clip,
++	.arc = html_filter_arc,
++	.disc = html_filter_disc,
++	.line = html_filter_line,
++	.rectangle = html_filter_rectangle,
++	.polygon = html_filter_polygon,
++	.path = html_filter_path,
++	.bitmap = html_filter_bitmap,
++	.text = html_filter_text,
++	.group_start = html_filter_group_start,
++	.group_end = html_filter_group_end,
++	.flush = html_filter_flush,
++	.option_knockout = false,
++};
++
++static bool html_redraw_box_inner(const html_content *html, struct box *box,
++		int x_parent, int y_parent,
++		const struct rect *clip, const float scale,
++		colour current_background_color,
++		const struct redraw_context *ctx);
++
++/**
++ * Recursively draw a box.
++ *
++ * The box's opacity and filter, if any, are put in front of the
++ * plotters for the box and its descendants (VitaSurf); a box with no
++ * opacity at all paints nothing. The drawing itself is
++ * html_redraw_box_inner().
++ */
+ bool html_redraw_box(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+ 		colour current_background_color,
+ 		const struct redraw_context *ctx)
++{
++	struct redraw_context fctx;
++	int alpha = 256;
++	const int32_t *m = NULL;
++	bool pushed = false;
++	bool ok;
++
++	if (box->style != NULL) {
++		css_fixed op = INTTOFIX(1);
++
++		if (css_computed_opacity(box->style, &op) == CSS_OPACITY_SET) {
++			alpha = FIXTOINT(FMUL(op, INTTOFIX(256)));
++			if (alpha < 0)
++				alpha = 0;
++			if (alpha > 256)
++				alpha = 256;
++		}
++		if (box->filter != NULL) {
++			alpha = alpha * box->filter->alpha / 256;
++			if (box->filter->colour)
++				m = box->filter->m;
++		}
++	}
++
++	if (alpha <= 0)
++		return true;
++
++	if ((alpha < 256 || m != NULL) &&
++			html_filter_depth < HTML_FILTER_DEPTH) {
++		struct html_filter_level *lv =
++				&html_filter_stack[html_filter_depth++];
++
++		lv->real = ctx->plot;
++		lv->alpha = alpha;
++		lv->m = m;
++		lv->bg = current_background_color;
++		fctx = *ctx;
++		fctx.plot = &html_filter_plotters;
++		ctx = &fctx;
++		pushed = true;
++	}
++
++	ok = html_redraw_box_inner(html, box, x_parent, y_parent, clip, scale,
++			current_background_color, ctx);
++
++	if (pushed)
++		html_filter_depth--;
++
++	return ok;
++}
++
++static bool html_redraw_box_inner(const html_content *html, struct box *box,
++		int x_parent, int y_parent,
++		const struct rect *clip, const float scale,
++		colour current_background_color,
++		const struct redraw_context *ctx)
+ {
+ 	const struct plotter_table *plot = ctx->plot;
+ 	int x, y;
+@@ -2276,6 +2691,22 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 					scale, ctx))
+ 		return false;
+ 
++	/* filter: drop-shadow(), the same rings under the border box
++	 * (VitaSurf); an image's outline is not followed */
++	if (box->filter != NULL && box->filter->shadow &&
++			box->type != BOX_TEXT && box->type != BOX_INLINE &&
++			box->type != BOX_INLINE_END &&
++			box->type != BOX_INLINE_CONTAINER &&
++			box->type != BOX_BR &&
++			!html_redraw_shadow_rings(x - border_left, y - border_top,
++					x + padding_width + border_right,
++					y + padding_height + border_bottom,
++					box->filter->shadow_x * scale,
++					box->filter->shadow_y * scale,
++					box->filter->shadow_blur * scale, 0,
++					box->filter->shadow_colour, ctx))
++		return false;
++
+ 	bg_box = html_redraw_find_bg_box(box);
+ 
+ 	/*
