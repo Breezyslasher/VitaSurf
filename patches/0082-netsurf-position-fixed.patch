@@ -1,0 +1,268 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 1f66b4062..2cf7d9931 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -602,6 +602,11 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 
+ 	css_display = ns_computed_display_static(box->style);
+ 
++	/* a box the viewport holds in place (VitaSurf) */
++	if (css_computed_position(box->style) == CSS_POSITION_STICKY ||
++			css_computed_position(box->style) == CSS_POSITION_FIXED)
++		ctx->content->pinned_boxes++;
++
+ 	/* Set box type from computed display */
+ 	if ((css_computed_position(box->style) == CSS_POSITION_ABSOLUTE ||
+ 	     css_computed_position(box->style) == CSS_POSITION_FIXED) &&
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index ae532c12c..0d0436f04 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -403,6 +403,7 @@ void html_finish_conversion(html_content *htmlc)
+ 
+ 	html_get_dimensions(htmlc);
+ 
++	htmlc->pinned_boxes = 0;
+ 	error = dom_to_box(html, htmlc, html_box_convert_done, &htmlc->box_conversion_context);
+ 	if (error != NSERROR_OK) {
+ 		NSLOG(netsurf, INFO, "box conversion failed");
+@@ -1120,6 +1121,10 @@ static void html_reformat(struct content *c, int width, int height)
+ 			INTTOFIX(height), htmlc->unit_len_ctx.device_dpi);
+ 	htmlc->unit_len_ctx.root_style = htmlc->layout->style;
+ 
++	/* the containing block of position: fixed (VitaSurf) */
++	htmlc->viewport_w = width;
++	htmlc->viewport_h = height;
++
+ 	layout_document(htmlc, width, height);
+ 	layout = htmlc->layout;
+ 
+@@ -1305,6 +1310,7 @@ nserror html_relayout(html_content *htmlc)
+ 	talloc_free(htmlc->bctx);
+ 	htmlc->bctx = NULL;
+ 	htmlc->layout = NULL;
++	htmlc->pinned_boxes = 0;
+ 	htmlc->iframe = NULL;
+ 
+ 	if (html_forms_from_dom(htmlc) == false) {
+@@ -2284,6 +2290,20 @@ const char *html_get_base_target(hlcache_handle *h)
+ }
+ 
+ 
++/* exported interface documented in html/html.h */
++bool html_pins_to_viewport(hlcache_handle *h)
++{
++	html_content *c;
++
++	if (h == NULL || content_get_type(h) != CONTENT_HTML)
++		return false;
++
++	c = (html_content *) hlcache_handle_get_content(h);
++
++	return c != NULL && c->pinned_boxes > 0;
++}
++
++
+ /**
+  * Retrieve layout coordinates of box with given id
+  *
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 1cd83a212..cdb78deb0 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -197,6 +197,16 @@ struct content_html_iframe *html_get_iframe(struct hlcache_handle *h);
+  */
+ const char *html_get_base_target(struct hlcache_handle *h);
+ 
++/**
++ * Whether the document has boxes pinned to the viewport (VitaSurf):
++ * position: sticky or fixed. Such a page cannot be scrolled by moving
++ * what is already on screen; it has to be drawn again.
++ *
++ * \param h  Content handle, of any type or NULL
++ * \return true if it is an HTML document with pinned boxes
++ */
++bool html_pins_to_viewport(struct hlcache_handle *h);
++
+ /**
+  * set filename on a file gadget
+  *
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 9cb90bf60..f0f4828ff 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5051,8 +5051,27 @@ layout_position_absolute(struct box *box,
+ 						CSS_POSITION_ABSOLUTE ||
+ 				 css_computed_position(c->style) ==
+ 						CSS_POSITION_FIXED)) {
+-			if (!layout_absolute(c, containing_block,
+-					cx, cy, content))
++			struct box *cb = containing_block;
++			struct box viewport;
++
++			/*
++			 * A fixed box is positioned against the viewport,
++			 * not the document (VitaSurf): "bottom: 0" is the
++			 * bottom of the screen, not of the page. The
++			 * viewport stands in as a block the size of the
++			 * window at the document's origin; the painter
++			 * moves the box along with the scroll.
++			 */
++			if (css_computed_position(c->style) ==
++					CSS_POSITION_FIXED &&
++					content->viewport_h > 0) {
++				memset(&viewport, 0, sizeof(viewport));
++				viewport.type = BOX_BLOCK;
++				viewport.width = content->viewport_w;
++				viewport.height = content->viewport_h;
++				cb = &viewport;
++			}
++			if (!layout_absolute(c, cb, cx, cy, content))
+ 				return false;
+ 			if (!layout_position_absolute(c, c, 0, 0, content))
+ 				return false;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index e901b1efb..0e7b3d057 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -170,6 +170,28 @@ typedef struct html_content {
+ 	/** Where the content's origin was plotted at that redraw: the
+ 	 * y_parent the painter carries is content y plus this. */
+ 	int view_origin_y;
++
++	/** The viewport the document was last laid out for, in px
++	 * (VitaSurf): the containing block of position: fixed. */
++	int viewport_w;
++	int viewport_h;
++
++	/** How many boxes in the tree are sticky or fixed (VitaSurf).
++	 * A frontend that pans the framebuffer on scroll must redraw
++	 * instead while this is non-zero. */
++	int pinned_boxes;
++
++	/**
++	 * Fixed boxes met during a redraw, drawn after everything else
++	 * so nothing paints over them (VitaSurf). Beyond the list's
++	 * capacity they are drawn in place.
++	 */
++#define HTML_FIXED_DEFER_MAX 16
++	struct box *fixed_box[HTML_FIXED_DEFER_MAX];
++	int fixed_x[HTML_FIXED_DEFER_MAX];
++	int fixed_y[HTML_FIXED_DEFER_MAX];
++	int n_fixed;
++	bool drawing_fixed;
+ 	/**< Universal selector */
+ 	lwc_string *universal;
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index d25c0029c..1dbe56217 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1505,8 +1505,10 @@ static bool html_redraw_box_children(const html_content *html, struct box *box,
+ 	for (pass = 0; pass < 2; pass++) {
+ 		for (c = box->children; c; c = c->next) {
+ 			bool sticky = c->style != NULL &&
+-					css_computed_position(c->style) ==
+-							CSS_POSITION_STICKY;
++					(css_computed_position(c->style) ==
++							CSS_POSITION_STICKY ||
++					 css_computed_position(c->style) ==
++							CSS_POSITION_FIXED);
+ 
+ 			if (sticky != (pass == 1))
+ 				continue;
+@@ -1799,12 +1801,32 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	}
+ 
+ 	/* avoid trivial FP maths */
+-	/* a sticky box is drawn where the scroll holds it (VitaSurf) */
++	/* a sticky box is drawn where the scroll holds it, a fixed one
++	 * where the viewport is (VitaSurf) */
+ 	box->sticky_dy = 0;
+-	if (box->style != NULL && html->view_h > 0 &&
+-			css_computed_position(box->style) ==
+-					CSS_POSITION_STICKY)
+-		box->sticky_dy = html_sticky_offset(html, box, y_parent);
++	if (box->style != NULL && html->view_h > 0) {
++		uint8_t position = css_computed_position(box->style);
++
++		if (position == CSS_POSITION_STICKY) {
++			box->sticky_dy = html_sticky_offset(html, box,
++					y_parent);
++		} else if (position == CSS_POSITION_FIXED) {
++			html_content *mh = (html_content *) html;
++
++			/* drawn after the rest of the document, so that
++			 * nothing laid out later paints over it; the
++			 * list is per-redraw state of the content */
++			if (!mh->drawing_fixed &&
++					mh->n_fixed < HTML_FIXED_DEFER_MAX) {
++				mh->fixed_box[mh->n_fixed] = box;
++				mh->fixed_x[mh->n_fixed] = x_parent;
++				mh->fixed_y[mh->n_fixed] = y_parent;
++				mh->n_fixed++;
++				return true;
++			}
++			box->sticky_dy = html->view_y;
++		}
++	}
+ 	y_parent += box->sticky_dy;
+ 
+ 	if (scale == 1.0) {
+@@ -2683,8 +2705,29 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 
+ 		result &= (ctx->plot->rectangle(ctx, &pstyle_fill_bg, clip) == NSERROR_OK);
+ 
++		html->n_fixed = 0;
++		html->drawing_fixed = false;
+ 		result &= html_redraw_box(html, box, data->x, data->y, clip,
+ 				data->scale, pstyle_fill_bg.fill_colour, ctx);
++
++		/* the fixed boxes set aside above, on top of everything
++		 * (VitaSurf) */
++		html->drawing_fixed = true;
++		{
++			int i;
++
++			for (i = 0; i < html->n_fixed; i++) {
++				result &= html_redraw_box(html,
++						html->fixed_box[i],
++						html->fixed_x[i],
++						html->fixed_y[i], clip,
++						data->scale,
++						pstyle_fill_bg.fill_colour,
++						ctx);
++			}
++		}
++		html->drawing_fixed = false;
++		html->n_fixed = 0;
+ 	}
+ 
+ 	if (select) {
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 7dfe2c8d7..b0536779d 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -46,6 +46,7 @@
+ #include "netsurf/url_db.h"
+ #endif
+ #include "content/fetch.h"
++#include "html/html.h"
+ 
+ #include "framebuffer/gui.h"
+ #include "framebuffer/fbtk.h"
+@@ -256,8 +257,13 @@ fb_pan(fbtk_widget_t *widget,
+ 	y = fbtk_get_absy(widget);
+ 
+ 	/* if the pan exceeds the viewport size just redraw the whole area */
++	/* A pan moves what is on screen and draws only the strip that
++	 * was uncovered. A sticky or fixed box has to stay where it is
++	 * while the rest moves, so such a page is drawn whole instead
++	 * (VitaSurf). */
+ 	if (bwidget->pany >= height || bwidget->pany <= -height ||
+-	    bwidget->panx >= width || bwidget->panx <= -width) {
++	    bwidget->panx >= width || bwidget->panx <= -width ||
++	    html_pins_to_viewport(browser_window_get_content(bw))) {
+ 
+ 		bwidget->scrolly += bwidget->pany;
+ 		bwidget->scrollx += bwidget->panx;

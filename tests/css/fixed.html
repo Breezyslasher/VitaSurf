@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>position: fixed</title>
+<style>
+body { margin: 0; }
+.head { position: fixed; top: 0; left: 0; right: 0; height: 40px; background: #ff0000; }
+.foot { position: fixed; bottom: 0; left: 0; right: 0; height: 30px; background: #0000ff; }
+.tail { height: 3000px; }
+p { margin: 0; height: 20px; }
+</style>
+</head>
+<body>
+<div class="head"></div>
+<div class="tail"><p>first line of content</p></div>
+<div class="foot"></div>
+<pre id="out"></pre>
+<script>
+/* The monkey plots at content y plus the scroll offset. In the 600px
+   viewport at scroll 0 the red header is drawn at 0 and the blue
+   footer, laid out against the viewport, at 570. After scrolling to
+   400 the header is drawn at 400, on top of the content. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+window.addEventListener('load', function(){
+  setTimeout(function(){ T('scrolling to', 400); window.scrollTo(0, 400); }, 1500);
+});
+</script>
+</body>
+</html>
