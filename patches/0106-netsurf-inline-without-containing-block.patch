@@ -1,0 +1,33 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index ce49f4cdd..0d6fc7c73 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -948,6 +948,28 @@ static void box_construct_element_after(dom_node *n, html_content *content)
+ 		}
+ 
+ 		if (props.inline_container == NULL) {
++			/*
++			 * An inline whose ancestors give it no containing
++			 * block: m.youtube.com's watch page reached this on
++			 * a rebuild and box_add_child asserted on the NULL
++			 * (VitaSurf, build 294). Which element it was, the
++			 * dump could not say, so it is logged and the inline
++			 * end is left out rather than the browser.
++			 */
++			if (props.containing_block == NULL) {
++				dom_string *name = NULL;
++
++				if (dom_node_get_node_name(n, &name) ==
++						DOM_NO_ERR && name != NULL) {
++					vita_log("box: inline <%s> with no "
++						 "containing block; its end "
++						 "is skipped",
++						 dom_string_data(name));
++					dom_string_unref(name);
++				}
++				return;
++			}
++
+ 			/* Create inline container if we don't have one */
+ 			props.inline_container = box_create(NULL, NULL, false,
+ 					NULL, NULL, NULL, NULL, content->bctx);

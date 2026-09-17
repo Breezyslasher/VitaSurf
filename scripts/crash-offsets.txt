@@ -91,3 +91,16 @@
 #   Roboto was the first. Fixed by patch 0103.
 0x69c34
 0x6a031
+# Build 294: assertion "parent" in box_add_child on the main thread,
+#   about a second and a half after m.youtube.com's player script ran on
+#   a second page. Resolved against build 294's ELF (the disasm
+#   workflow): box_construct.c:959 in box_construct_element_after,
+#   reached from next_node's climb back up the tree during a box
+#   rebuild after script changes. An inline element with converted
+#   children had no containing block: every ancestor with a box was
+#   inline, or had none. Which element, the dump cannot say and the
+#   snapshot of the watch page does not reach that state offline, so
+#   patch 0106 logs the element's name and leaves its inline end out
+#   rather than aborting.
+0x1ed33
+0x1ef5f
