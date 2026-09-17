@@ -1,0 +1,15 @@
+diff --git a/frontends/framebuffer/fbtk/text.c b/frontends/framebuffer/fbtk/text.c
+index 9c96dcef4..7e81249d1 100644
+--- a/frontends/framebuffer/fbtk/text.c
++++ b/frontends/framebuffer/fbtk/text.c
+@@ -76,6 +76,10 @@ fb_text_font_style(fbtk_widget_t *widget, int *font_height, int *padding,
+ 	font_style->flags = FONTF_NONE;
+ 	font_style->background = widget->bg;
+ 	font_style->foreground = widget->fg;
++	/* No CSS family list: the font engine consults it for web fonts
++	 * (VitaSurf), and a stack garbage pointer there is a crash the
++	 * first time a page registers one. */
++	font_style->families = NULL;
+ }
+ 
+ /** Text redraw callback.

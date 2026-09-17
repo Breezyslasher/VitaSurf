@@ -67,3 +67,27 @@
 #   the failing expression, file and line in the log before it aborts.
 0x39e94e
 0x39e91b
+# Build 286: data abort on the main thread while github.com's stylesheets
+#   were converting. Resolved against build 286's own symbol map and the
+#   disasm workflow: the program counter was in newlib's _free_r and the
+#   caller css__stylesheet_selector_destroy, reached from parseSelector's
+#   error path, and the pointer being freed lay in the data segment --
+#   which is where a freed chunk's list link points, so the block had
+#   been freed already. The native monkey under valgrind on the saved
+#   GitHub sheets named it: parseGroupChain copies the details of an
+#   :is() argument's last compound into the enclosing selector and then
+#   destroys that compound, and a :has() detail's argument chain is a
+#   pointer, not a reference, so ":is(.a .b:has(.c))" freed the chain
+#   twice. Fixed by patch 0102, which hands the chain over.
+0x3b3e12
+0x8409f
+0x89317
+# Build 286: data abort on the main thread a few seconds into
+#   m.youtube.com, r0 = 0. Resolved against the same symbol map: the
+#   program counter was in fb_fill_scalar, called from fb_font_width
+#   for the toolbar's status text. fbtk builds its font styles on the
+#   stack and never set the families pointer, which the web font lookup
+#   of patch 0096 reads once a page has registered a face -- YouTube's
+#   Roboto was the first. Fixed by patch 0103.
+0x69c34
+0x6a031
