@@ -1,0 +1,781 @@
+diff --git a/content/handlers/html/Makefile b/content/handlers/html/Makefile
+index f9a4a7aab..ed690c358 100644
+--- a/content/handlers/html/Makefile
++++ b/content/handlers/html/Makefile
+@@ -5,6 +5,7 @@ S_HTML := box_construct.c	\
+ 	box_manipulate.c	\
+ 	box_normalise.c		\
+ 	box_special.c		\
++	webfont.c		\
+ 	box_textarea.c		\
+ 	css.c			\
+ 	css_fetcher.c		\
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 60bf2ff54..2566254d9 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -48,6 +48,7 @@
+ #include "html/box_manipulate.h"
+ #include "html/box_construct.h"
+ #include "html/box_special.h"
++#include "html/webfont.h"
+ #include "html/box_normalise.h"
+ #include "html/form_internal.h"
+ 
+@@ -575,6 +576,11 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 	if (styles == NULL)
+ 		return false;
+ 
++	/* the faces its font-family names, if @font-face has them
++	 * (VitaSurf) */
++	html_webfont_request(ctx->content,
++			styles->styles[CSS_PSEUDO_ELEMENT_NONE]);
++
+ 	/* Extract title attribute, if present */
+ 	err = dom_element_get_attribute(ctx->n, corestring_dom_title, &title0);
+ 	if (err != DOM_NO_ERR)
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 0d0436f04..7f373fb05 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -60,6 +60,7 @@
+ 
+ #include "html/html.h"
+ #include "html/private.h"
++#include "html/webfont.h"
+ #include "html/dom_event.h"
+ #include "css/select.h"
+ #include "html/css.h"
+@@ -1436,6 +1437,9 @@ static void html_destroy(struct content *c)
+ 
+ 	NSLOG(netsurf, INFO, "content %p", c);
+ 
++	/* a web font still on its way must not lay this content out */
++	html_webfont_forget(html);
++
+ 	/* If we're still converting a layout, cancel it */
+ 	if (html->box_conversion_context != NULL) {
+ 		if (cancel_dom_to_box(html->box_conversion_context) != NSERROR_OK) {
+diff --git a/content/handlers/html/webfont.c b/content/handlers/html/webfont.c
+new file mode 100644
+index 000000000..a33356844
+--- /dev/null
++++ b/content/handlers/html/webfont.c
+@@ -0,0 +1,455 @@
++/*
++ * Copyright 2026 The NetSurf Project
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Web fonts (VitaSurf).
++ *
++ * Nothing in NetSurf fetched what @font-face named, so every page was
++ * set in the bundled faces and an icon font drew nothing at all. Here,
++ * when an element's style is worked out, each family its font-family
++ * list names is looked up among the sheet's @font-face rules through
++ * libcss, and the regular, bold, italic and bold italic faces of a
++ * family not seen before are fetched through the low-level cache, one
++ * source each. A face that arrives is handed to the frontend, which
++ * keeps it by family name, weight and slant and picks it when a text
++ * run's family list names it; the page is then laid out again.
++ *
++ * The registry is global rather than per page: a face named the same
++ * on two pages is fetched once and kept for both. Faces are never
++ * dropped, so the total held is capped; beyond it a page falls back to
++ * the bundled faces, as it did before.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++#include <libcss/libcss.h>
++
++#include "utils/errors.h"
++#include "utils/log.h"
++#include "utils/nsurl.h"
++#include "netsurf/content.h"
++#include "netsurf/layout.h"
++#include "content/content_protected.h"
++#include "content/llcache.h"
++#include "desktop/gui_internal.h"
++
++#include "html/private.h"
++#include "html/webfont.h"
++
++/** The most bytes held across every face; the Vita has little to spare. */
++#define WEBFONT_BYTES_MAX (2 * 1024 * 1024)
++/** The most one face may be; icon fonts and text faces sit well under. */
++#define WEBFONT_FACE_MAX (700 * 1024)
++
++enum webfont_state {
++	WEBFONT_LOADING,
++	WEBFONT_LOADED,
++	WEBFONT_FAILED
++};
++
++struct webfont {
++	char *family;			/**< lower case */
++	int weight;			/**< 100..900 */
++	bool italic;
++	enum webfont_state state;
++	llcache_handle *fetch;
++	uint8_t *data;
++	size_t len, cap;
++	struct html_content *owner;	/**< the page to lay out again */
++	struct webfont *next;
++};
++
++static struct webfont *webfonts;
++static size_t webfont_bytes;
++
++/** Whether a family name is one of the generic ones, which no @font-face
++ * describes. */
++static bool webfont_generic(const char *name)
++{
++	static const char *const generic[] = {
++		"serif", "sans-serif", "monospace", "cursive", "fantasy",
++		"system-ui", "ui-sans-serif", "ui-serif", "ui-monospace",
++		"inherit", "initial", NULL
++	};
++	int i;
++
++	for (i = 0; generic[i] != NULL; i++) {
++		if (strcasecmp(name, generic[i]) == 0)
++			return true;
++	}
++	return false;
++}
++
++static struct webfont *webfont_find(const char *family, int weight, bool italic)
++{
++	struct webfont *wf;
++
++	for (wf = webfonts; wf != NULL; wf = wf->next) {
++		if (wf->weight == weight && wf->italic == italic &&
++				strcasecmp(wf->family, family) == 0)
++			return wf;
++	}
++	return NULL;
++}
++
++static bool webfont_family_known(const char *family)
++{
++	struct webfont *wf;
++
++	for (wf = webfonts; wf != NULL; wf = wf->next) {
++		if (strcasecmp(wf->family, family) == 0)
++			return true;
++	}
++	return false;
++}
++
++/** A libcss font weight as a number. */
++static int webfont_weight(uint8_t w)
++{
++	switch (w) {
++	case CSS_FONT_WEIGHT_BOLD:
++	case CSS_FONT_WEIGHT_BOLDER:
++	case CSS_FONT_WEIGHT_700:
++		return 700;
++	case CSS_FONT_WEIGHT_100: return 100;
++	case CSS_FONT_WEIGHT_200: return 200;
++	case CSS_FONT_WEIGHT_300: return 300;
++	case CSS_FONT_WEIGHT_500: return 500;
++	case CSS_FONT_WEIGHT_600: return 600;
++	case CSS_FONT_WEIGHT_800: return 800;
++	case CSS_FONT_WEIGHT_900: return 900;
++	case CSS_FONT_WEIGHT_LIGHTER:
++	case CSS_FONT_WEIGHT_NORMAL:
++	case CSS_FONT_WEIGHT_400:
++	default:
++		return 400;
++	}
++}
++
++/**
++ * How good a source is: TrueType and OpenType first, then WOFF, which
++ * FreeType unpacks with zlib; WOFF2 last, since it needs brotli and the
++ * frontend will say if it cannot take it. EOT and SVG fonts are of no
++ * use. A source the format hint does not name is judged by its suffix.
++ */
++static int webfont_src_rank(const css_font_face_src *src, const char *url)
++{
++	size_t n = strlen(url);
++	css_font_face_format fmt = css_font_face_src_format(src);
++
++	if (css_font_face_src_location_type(src) !=
++			CSS_FONT_FACE_LOCATION_TYPE_URI)
++		return 0;
++
++	switch (fmt) {
++	case CSS_FONT_FACE_FORMAT_OPENTYPE:
++		return 3;
++	case CSS_FONT_FACE_FORMAT_WOFF:
++		return 2;
++	case CSS_FONT_FACE_FORMAT_EMBEDDED_OPENTYPE:
++	case CSS_FONT_FACE_FORMAT_SVG:
++		return 0;
++	default:
++		break;
++	}
++
++	/* the suffix, before any query */
++	{
++		const char *q = strchr(url, '?');
++
++		if (q != NULL)
++			n = (size_t) (q - url);
++	}
++	if (n > 4 && (strncasecmp(url + n - 4, ".ttf", 4) == 0 ||
++			strncasecmp(url + n - 4, ".otf", 4) == 0))
++		return 3;
++	if (n > 5 && strncasecmp(url + n - 5, ".woff", 5) == 0)
++		return 2;
++	if (n > 6 && strncasecmp(url + n - 6, ".woff2", 6) == 0)
++		return 1;
++	if (n > 4 && (strncasecmp(url + n - 4, ".eot", 4) == 0 ||
++			strncasecmp(url + n - 4, ".svg", 4) == 0))
++		return 0;
++	if (fmt == CSS_FONT_FACE_FORMAT_UNKNOWN)
++		return 1;	/* format("woff2"), most likely */
++	return 1;
++}
++
++static void webfont_reformat(struct webfont *wf)
++{
++	struct html_content *html = wf->owner;
++
++	if (html == NULL)
++		return;
++	if (html->base.status != CONTENT_STATUS_READY &&
++			html->base.status != CONTENT_STATUS_DONE)
++		return;
++	content__reformat(&html->base, false, html->base.available_width,
++			html->base.available_height);
++}
++
++static nserror webfont_callback(llcache_handle *handle,
++		const llcache_event *event, void *pw)
++{
++	struct webfont *wf = pw;
++
++	switch (event->type) {
++	case LLCACHE_EVENT_HAD_DATA:
++		if (wf->len + event->data.data.len > WEBFONT_FACE_MAX ||
++				webfont_bytes + event->data.data.len >
++					WEBFONT_BYTES_MAX) {
++			NSLOG(netsurf, INFO, "web font %s too large, dropped",
++					wf->family);
++			wf->state = WEBFONT_FAILED;
++			free(wf->data);
++			wf->data = NULL;
++			webfont_bytes -= wf->len;
++			wf->len = wf->cap = 0;
++			llcache_handle_abort(handle);
++			llcache_handle_release(handle);
++			wf->fetch = NULL;
++			return NSERROR_OK;
++		}
++		if (wf->len + event->data.data.len > wf->cap) {
++			size_t ncap = wf->cap == 0 ? 32 * 1024 : wf->cap * 2;
++			uint8_t *n;
++
++			while (ncap < wf->len + event->data.data.len)
++				ncap *= 2;
++			n = realloc(wf->data, ncap);
++			if (n == NULL) {
++				wf->state = WEBFONT_FAILED;
++				llcache_handle_abort(handle);
++				llcache_handle_release(handle);
++				wf->fetch = NULL;
++				return NSERROR_OK;
++			}
++			wf->data = n;
++			wf->cap = ncap;
++		}
++		memcpy(wf->data + wf->len, event->data.data.buf,
++				event->data.data.len);
++		wf->len += event->data.data.len;
++		webfont_bytes += event->data.data.len;
++		break;
++
++	case LLCACHE_EVENT_DONE:
++		llcache_handle_release(handle);
++		wf->fetch = NULL;
++		if (wf->len == 0 || guit->layout->add_face == NULL ||
++				guit->layout->add_face(wf->family, wf->weight,
++					wf->italic, wf->data, wf->len) !=
++					NSERROR_OK) {
++			NSLOG(netsurf, INFO, "web font %s %d%s rejected",
++					wf->family, wf->weight,
++					wf->italic ? " italic" : "");
++			wf->state = WEBFONT_FAILED;
++			free(wf->data);
++			wf->data = NULL;
++			webfont_bytes -= wf->len;
++			wf->len = wf->cap = 0;
++			break;
++		}
++		/* the frontend owns the bytes now */
++		wf->data = NULL;
++		wf->state = WEBFONT_LOADED;
++		NSLOG(netsurf, INFO, "web font %s %d%s: %u bytes",
++				wf->family, wf->weight,
++				wf->italic ? " italic" : "",
++				(unsigned) wf->len);
++		webfont_reformat(wf);
++		break;
++
++	case LLCACHE_EVENT_ERROR:
++		NSLOG(netsurf, INFO, "web font %s: %s", wf->family,
++				event->data.error.msg);
++		llcache_handle_release(handle);
++		wf->fetch = NULL;
++		wf->state = WEBFONT_FAILED;
++		free(wf->data);
++		wf->data = NULL;
++		webfont_bytes -= wf->len;
++		wf->len = wf->cap = 0;
++		break;
++
++	case LLCACHE_EVENT_REDIRECT:
++	case LLCACHE_EVENT_HAD_HEADERS:
++	case LLCACHE_EVENT_PROGRESS:
++	case LLCACHE_EVENT_GOT_CERTS:
++	default:
++		break;
++	}
++
++	return NSERROR_OK;
++}
++
++/** Start fetching one face, unless one of that family, weight and slant
++ * is already known. */
++static void webfont_fetch(struct html_content *html, const char *family,
++		int weight, bool italic, const char *url)
++{
++	struct webfont *wf;
++	nsurl *nurl;
++	nserror err;
++
++	if (webfont_find(family, weight, italic) != NULL)
++		return;
++
++	if (nsurl_create(url, &nurl) != NSERROR_OK)
++		return;
++
++	wf = calloc(1, sizeof(*wf));
++	if (wf == NULL) {
++		nsurl_unref(nurl);
++		return;
++	}
++	wf->family = strdup(family);
++	if (wf->family == NULL) {
++		free(wf);
++		nsurl_unref(nurl);
++		return;
++	}
++	wf->weight = weight;
++	wf->italic = italic;
++	wf->state = WEBFONT_LOADING;
++	wf->owner = html;
++	wf->next = webfonts;
++	webfonts = wf;
++
++	err = llcache_handle_retrieve(nurl, 0, content_get_url(&html->base),
++			NULL, webfont_callback, wf, &wf->fetch);
++	nsurl_unref(nurl);
++	if (err != NSERROR_OK) {
++		wf->state = WEBFONT_FAILED;
++		wf->fetch = NULL;
++		NSLOG(netsurf, INFO, "web font %s: fetch not started (%d)",
++				family, (int) err);
++	}
++}
++
++/**
++ * Look one family up among the @font-face rules and fetch its faces.
++ */
++static void webfont_request_family(struct html_content *html,
++		lwc_string *family)
++{
++	css_select_font_faces_results *faces = NULL;
++	const char *name = lwc_string_data(family);
++	uint32_t i;
++	int fetched = 0;
++
++	if (webfont_generic(name) || webfont_family_known(name))
++		return;
++
++	if (css_select_font_faces(html->select_ctx, &html->media,
++			&html->unit_len_ctx, family, &faces) != CSS_OK ||
++			faces == NULL)
++		return;
++
++	for (i = 0; i < faces->n_font_faces && fetched < 4; i++) {
++		const css_font_face *face = faces->font_faces[i];
++		const css_font_face_src *best = NULL;
++		int best_rank = 0;
++		uint32_t n = 0, j;
++		lwc_string *loc = NULL;
++		int weight;
++		bool italic;
++
++		weight = webfont_weight(css_font_face_font_weight(face));
++		italic = css_font_face_font_style(face) ==
++				CSS_FONT_STYLE_ITALIC ||
++				css_font_face_font_style(face) ==
++				CSS_FONT_STYLE_OBLIQUE;
++		/* only the four the frontend picks between */
++		weight = weight >= 600 ? 700 : 400;
++
++		if (css_font_face_count_srcs(face, &n) != CSS_OK)
++			continue;
++		for (j = 0; j < n; j++) {
++			const css_font_face_src *src;
++			int rank;
++
++			if (css_font_face_get_src(face, j, &src) != CSS_OK ||
++					css_font_face_src_get_location(src,
++						&loc) != CSS_OK || loc == NULL)
++				continue;
++			rank = webfont_src_rank(src, lwc_string_data(loc));
++			if (rank > best_rank) {
++				best_rank = rank;
++				best = src;
++			}
++		}
++		if (best == NULL ||
++				css_font_face_src_get_location(best, &loc) !=
++					CSS_OK)
++			continue;
++		webfont_fetch(html, name, weight, italic,
++				lwc_string_data(loc));
++		fetched++;
++	}
++
++	if (fetched == 0 && faces->n_font_faces > 0) {
++		/* remembered as tried, so the rules are not walked again
++		 * for every element */
++		struct webfont *wf = calloc(1, sizeof(*wf));
++
++		if (wf != NULL && (wf->family = strdup(name)) != NULL) {
++			wf->weight = 400;
++			wf->state = WEBFONT_FAILED;
++			wf->next = webfonts;
++			webfonts = wf;
++		} else {
++			free(wf);
++		}
++	}
++
++	css_select_font_faces_results_destroy(faces);
++}
++
++/* exported interface documented in html/webfont.h */
++void html_webfont_request(struct html_content *html,
++		const css_computed_style *style)
++{
++	lwc_string **families = NULL;
++	int i;
++
++	if (style == NULL || html->select_ctx == NULL ||
++			guit->layout->add_face == NULL)
++		return;
++
++	css_computed_font_family(style, &families);
++	if (families == NULL)
++		return;
++
++	for (i = 0; families[i] != NULL && i < 8; i++)
++		webfont_request_family(html, families[i]);
++}
++
++/* exported interface documented in html/webfont.h */
++void html_webfont_forget(struct html_content *html)
++{
++	struct webfont *wf;
++
++	for (wf = webfonts; wf != NULL; wf = wf->next) {
++		if (wf->owner == html)
++			wf->owner = NULL;
++	}
++}
+diff --git a/content/handlers/html/webfont.h b/content/handlers/html/webfont.h
+new file mode 100644
+index 000000000..8229e65b6
+--- /dev/null
++++ b/content/handlers/html/webfont.h
+@@ -0,0 +1,47 @@
++/*
++ * Copyright 2026 The NetSurf Project
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Web fonts: fetching what @font-face names (VitaSurf).
++ */
++
++#ifndef NETSURF_HTML_WEBFONT_H
++#define NETSURF_HTML_WEBFONT_H
++
++struct html_content;
++struct css_computed_style;
++
++/**
++ * Ask for the faces an element's font-family list names.
++ *
++ * Each family that @font-face rules describe, and that no fetch has
++ * been started for, has its regular, bold, italic and bold italic
++ * faces fetched, at most one source each. Does nothing when the
++ * frontend cannot take a face.
++ */
++void html_webfont_request(struct html_content *html,
++		const struct css_computed_style *style);
++
++/**
++ * The content is going away: fetches it started keep running for the
++ * face registry, but must not reformat it when they land.
++ */
++void html_webfont_forget(struct html_content *html);
++
++#endif
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index 2878df65e..d61ab3bb7 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -18,6 +18,9 @@
+  */
+ 
+ #include <assert.h>
++#include <stdlib.h>
++#include <strings.h>
++#include <string.h>
+ #include <stdint.h>
+ 
+ #include <ft2build.h>
+@@ -54,8 +57,26 @@ typedef struct fb_faceid_s {
+         char *fontfile; /* path to font */
+         int index; /* index of font */
+         int cidx; /* character map index for unicode */
++	uint8_t *data; /* a web font's bytes, in place of a file (VitaSurf) */
++	size_t len;
+ } fb_faceid_t;
+ 
++/**
++ * A face a page brought with it (VitaSurf): kept by the family name
++ * its @font-face gave, its weight and slant, for as long as the
++ * browser runs. A text run whose family list names the family is set
++ * in the closest of these before the bundled faces are considered.
++ */
++struct fb_webface {
++	char *family;
++	int weight;
++	bool italic;
++	fb_faceid_t *face;
++	struct fb_webface *next;
++};
++
++static struct fb_webface *fb_webfaces;
++
+ 
+ enum fb_face_e {
+ 	FB_FACE_SANS_SERIF = 0,
+@@ -89,7 +110,13 @@ ft_face_requester(FTC_FaceID face_id,
+         fb_faceid_t *fb_face = (fb_faceid_t *)face_id;
+         int cidx;
+ 
+-        error = FT_New_Face(library, fb_face->fontfile, fb_face->index, face); 
++	if (fb_face->data != NULL) {
++		error = FT_New_Memory_Face(library, fb_face->data,
++				(FT_Long) fb_face->len, fb_face->index, face);
++	} else {
++		error = FT_New_Face(library, fb_face->fontfile,
++				fb_face->index, face);
++	}
+         if (error) {
+                 NSLOG(netsurf, INFO, "Could not find font (code %d)", error);
+         } else {
+@@ -107,11 +134,98 @@ ft_face_requester(FTC_FaceID face_id,
+                         }
+                 }
+         }
+-        NSLOG(netsurf, INFO, "Loaded face from %s", fb_face->fontfile);
++        NSLOG(netsurf, INFO, "Loaded face from %s",
++	      fb_face->fontfile != NULL ? fb_face->fontfile : "memory");
+ 
+         return error;
+ }
+ 
++/**
++ * Take a web font face (VitaSurf). See gui_layout_table.add_face.
++ */
++static nserror fb_font_add_face(const char *family, int weight, bool italic,
++		uint8_t *data, size_t len)
++{
++	struct fb_webface *wf;
++	fb_faceid_t *newf;
++	FT_Face aface;
++	FT_Error error;
++
++	newf = calloc(1, sizeof(fb_faceid_t));
++	if (newf == NULL) {
++		free(data);
++		return NSERROR_NOMEM;
++	}
++	newf->data = data;
++	newf->len = len;
++
++	/* load it now, so a file FreeType cannot read is refused here */
++	error = FTC_Manager_LookupFace(ft_cmanager, (FTC_FaceID) newf, &aface);
++	if (error) {
++		NSLOG(netsurf, INFO, "web font %s not usable (code %d)",
++		      family, error);
++		free(newf);
++		free(data);
++		return NSERROR_INVALID;
++	}
++
++	wf = calloc(1, sizeof(*wf));
++	if (wf == NULL || (wf->family = strdup(family)) == NULL) {
++		free(wf);
++		FTC_Manager_RemoveFaceID(ft_cmanager, (FTC_FaceID) newf);
++		free(newf);
++		free(data);
++		return NSERROR_NOMEM;
++	}
++	wf->weight = weight;
++	wf->italic = italic;
++	wf->face = newf;
++	wf->next = fb_webfaces;
++	fb_webfaces = wf;
++
++	NSLOG(netsurf, INFO, "web font %s %d%s taken (%u bytes)", family,
++	      weight, italic ? " italic" : "", (unsigned) len);
++	return NSERROR_OK;
++}
++
++/**
++ * The web face a style's family list names, if any (VitaSurf): the
++ * first family with a face, and of its faces the one closest in weight
++ * and slant.
++ */
++static fb_faceid_t *fb_web_face_for(const plot_font_style_t *fstyle)
++{
++	bool want_bold = fstyle->weight >= BOLD_WEIGHT;
++	bool want_italic = (fstyle->flags & (FONTF_ITALIC | FONTF_OBLIQUE)) != 0;
++	int i;
++
++	if (fb_webfaces == NULL || fstyle->families == NULL)
++		return NULL;
++
++	for (i = 0; fstyle->families[i] != NULL && i < 8; i++) {
++		const char *name = lwc_string_data(fstyle->families[i]);
++		struct fb_webface *wf, *best = NULL;
++		int best_score = -1;
++
++		for (wf = fb_webfaces; wf != NULL; wf = wf->next) {
++			int score;
++
++			if (strcasecmp(wf->family, name) != 0)
++				continue;
++			score = ((wf->weight >= 600) == want_bold ? 2 : 0) +
++					(wf->italic == want_italic ? 1 : 0);
++			if (score > best_score) {
++				best_score = score;
++				best = wf;
++			}
++		}
++		if (best != NULL)
++			return best->face;
++	}
++
++	return NULL;
++}
++
+ /**
+  * create new framebuffer face and cause it to be loaded to check its ok
+  */
+@@ -346,6 +460,16 @@ bool fb_font_finalise(void)
+ static void fb_fill_scalar(const plot_font_style_t *fstyle, FTC_Scaler srec)
+ {
+         int selected_face = FB_FACE_DEFAULT;
++	fb_faceid_t *web = fb_web_face_for(fstyle);
++
++	if (web != NULL) {
++		srec->face_id = (FTC_FaceID) web;
++		srec->width = srec->height =
++				(fstyle->size * 64) / PLOT_STYLE_SCALE;
++		srec->pixel = 0;
++		srec->x_res = srec->y_res = browser_get_dpi();
++		return;
++	}
+ 
+ 	switch (fstyle->family) {
+                                 
+@@ -717,6 +841,7 @@ static struct gui_layout_table layout_table = {
+ 	.width = fb_font_width,
+ 	.position = fb_font_position,
+ 	.split = fb_font_split,
++	.add_face = fb_font_add_face,
+ };
+ 
+ struct gui_layout_table *framebuffer_layout_table = &layout_table;
+diff --git a/include/netsurf/layout.h b/include/netsurf/layout.h
+index 266de4091..cc6429d20 100644
+--- a/include/netsurf/layout.h
++++ b/include/netsurf/layout.h
+@@ -86,6 +86,23 @@ struct gui_layout_table
+ 	 * Returning char_offset == length means no split possible
+ 	 */
+ 	nserror (*split)(const struct plot_font_style *fstyle, const char *string, size_t length, int x, size_t *char_offset, int *actual_x);
++
++	/**
++	 * Take a web font face (VitaSurf). Optional.
++	 *
++	 * The bytes are the frontend's to keep for as long as it uses
++	 * the face, and to free when it does not take it. A text run
++	 * whose family list names the family is set in it.
++	 *
++	 * \param[in] family  the family name @font-face gave
++	 * \param[in] weight  400 or 700
++	 * \param[in] italic  whether the face is the italic one
++	 * \param[in] data    the font file
++	 * \param[in] len     its length
++	 * \return NSERROR_OK if the face was taken.
++	 */
++	nserror (*add_face)(const char *family, int weight, bool italic,
++			uint8_t *data, size_t len);
+ };
+ 
+ #endif

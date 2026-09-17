@@ -140,9 +140,19 @@ weight; `object-position` for fitted pictures; `stroke-width` on inline
 SVG; `all`; `env()` as its fallback or zero; a `polygon()` clip as the
 box around its points; and forty-odd names accepted and ignored. After
 this the census counts under two percent of declarations dropped on
-every fixture site. Each patch has a page under `tests/css/` that the
-monkey frontend checks; none of this batch has been verified on
-hardware yet.
+every fixture site. Patch 0096 fetches web fonts: the families an
+element's `font-family` names are looked up among the sheet's
+`@font-face` rules, the regular, bold, italic and bold italic faces of
+each are fetched once (TrueType and OpenType first, then WOFF, then
+WOFF2, which needs a FreeType built with brotli), handed to the
+framebuffer font engine as memory faces kept by family name for the
+life of the browser, and the page is laid out again when one lands.
+Faces are capped at 700 KB each and 2 MB in all; beyond that the
+bundled DejaVu faces stand in, as they did before. Each patch has a
+page under `tests/css/` that the monkey frontend checks; none of this
+batch has been verified on hardware yet, and the web font path in
+particular only has its fetch and selection checked there, since the
+monkey has no FreeType.
 
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic
