@@ -1,0 +1,211 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 5b933f769..2879c1b67 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -303,6 +303,150 @@ box_get_style(html_content *c,
+ }
+ 
+ 
++static void box_text_transform(char *s, unsigned int len,
++		enum css_text_transform_e tt);
++
++
++/**
++ * The text a pseudo element's content property asks for (VitaSurf).
++ *
++ * A box was made for a pseudo element and left empty, so every
++ * ::before and ::after on a page drew nothing: a quotation mark, a
++ * separator, the glyph of an icon font, the label a list writes before
++ * its item. Strings and attr() are read; a counter, a URL and the
++ * quote keywords, which need state this does not keep, are left out,
++ * except that open-quote and close-quote give a plain double quote.
++ *
++ * \param n     The element the pseudo element belongs to
++ * \param item  First content item
++ * \param bctx  Talloc context for the result
++ * \return the text, allocated in bctx, or NULL for none
++ */
++static char *
++box_generated_text(dom_node *n,
++		   const css_computed_content_item *item,
++		   void *bctx)
++{
++	char *text = talloc_strdup(bctx, "");
++
++	if (text == NULL) {
++		return NULL;
++	}
++
++	for (; item != NULL &&
++	       item->type != CSS_COMPUTED_CONTENT_NONE; item++) {
++		const char *add = NULL;
++		dom_string *value = NULL;
++
++		switch (item->type) {
++		case CSS_COMPUTED_CONTENT_STRING:
++			add = lwc_string_data(item->data.string);
++			break;
++
++		case CSS_COMPUTED_CONTENT_ATTR:
++		{
++			dom_string *name;
++
++			if (dom_string_create_interned(
++					(const uint8_t *) lwc_string_data(
++						item->data.attr),
++					lwc_string_length(item->data.attr),
++					&name) != DOM_NO_ERR) {
++				break;
++			}
++			if (dom_element_get_attribute(n, name, &value) ==
++					DOM_NO_ERR && value != NULL) {
++				add = dom_string_data(value);
++			}
++			dom_string_unref(name);
++			break;
++		}
++
++		case CSS_COMPUTED_CONTENT_OPEN_QUOTE:
++		case CSS_COMPUTED_CONTENT_CLOSE_QUOTE:
++			add = "\"";
++			break;
++
++		default:
++			break;
++		}
++
++		if (add != NULL) {
++			char *joined = talloc_asprintf(bctx, "%s%s", text, add);
++
++			if (joined != NULL) {
++				talloc_free(text);
++				text = joined;
++			}
++		}
++		if (value != NULL) {
++			dom_string_unref(value);
++		}
++	}
++
++	if (text[0] == '\0') {
++		talloc_free(text);
++		return NULL;
++	}
++	return text;
++}
++
++
++/**
++ * Put a pseudo element's text in an inline box inside its own box.
++ */
++static void
++box_generated_add_text(dom_node *n,
++		       html_content *content,
++		       struct box *parent,
++		       const css_computed_style *style,
++		       const css_computed_content_item *item)
++{
++	struct box *container;
++	struct box *text_box;
++	char *text;
++
++	text = box_generated_text(n, item, content->bctx);
++	if (text == NULL) {
++		return;
++	}
++
++	/*
++	 * ::after text belongs on the last line of the element rather
++	 * than on a line of its own, so it joins the run of inline
++	 * content already there; ::before runs before the element has
++	 * any children and starts a run.
++	 */
++	container = parent->last;
++	if (container == NULL || container->type != BOX_INLINE_CONTAINER) {
++		container = box_create(NULL, NULL, false, NULL, NULL, NULL,
++				NULL, content->bctx);
++		if (container == NULL) {
++			return;
++		}
++		container->type = BOX_INLINE_CONTAINER;
++		box_add_child(parent, container);
++	}
++
++	/** \todo Not wise to drop const from the computed style */
++	text_box = box_create(NULL, (css_computed_style *) style, false,
++			NULL, NULL, NULL, NULL, content->bctx);
++	if (text_box == NULL) {
++		return;
++	}
++	text_box->type = BOX_TEXT;
++	text_box->text = text;
++	text_box->length = strlen(text);
++
++	if (css_computed_text_transform(style) != CSS_TEXT_TRANSFORM_NONE) {
++		box_text_transform(text_box->text, text_box->length,
++				css_computed_text_transform(style));
++	}
++
++	box_add_child(container, text_box);
++}
++
++
+ /**
+  * Construct the box required for a generated element.
+  *
+@@ -310,9 +454,6 @@ box_get_style(html_content *c,
+  * \param content  Content of type CONTENT_HTML that is being processed
+  * \param box      Box which may have generated content
+  * \param style    Complete computed style for pseudo element, or NULL
+- *
+- * \todo This is currently incomplete. It just does enough to support
+- * the clearfix hack. (http://www.positioniseverything.net/easyclearing.html )
+  */
+ static void
+ box_construct_generate(dom_node *n,
+@@ -324,9 +465,15 @@ box_construct_generate(dom_node *n,
+ 	enum css_display_e computed_display;
+ 	const css_computed_content_item *c_item;
+ 
+-	/* Nothing to generate if the parent box is not a block */
+-	if (box->type != BOX_BLOCK)
++	/* Nothing to generate if the parent box holds block level
++	 * children of its own */
++	if (box->type != BOX_BLOCK &&
++	    box->type != BOX_INLINE_BLOCK &&
++	    box->type != BOX_TABLE_CELL &&
++	    box->type != BOX_FLEX &&
++	    box->type != BOX_INLINE_FLEX) {
+ 		return;
++	}
+ 
+ 	/* To determine if an element has a pseudo element, we select
+ 	 * for it and test to see if the returned style's content
+@@ -340,9 +487,12 @@ box_construct_generate(dom_node *n,
+ 
+ 	/* create box for this element */
+ 	computed_display = ns_computed_display(style, box_is_root(n));
++	if (computed_display == CSS_DISPLAY_NONE) {
++		return;
++	}
+ 	if (computed_display == CSS_DISPLAY_BLOCK ||
+ 			computed_display == CSS_DISPLAY_TABLE) {
+-		/* currently only support block level boxes */
++		/* a block level pseudo element gets a box of its own */
+ 
+ 		/** \todo Not wise to drop const from the computed style */
+ 		gen = box_create(NULL, (css_computed_style *) style,
+@@ -356,7 +506,13 @@ box_construct_generate(dom_node *n,
+ 				style, box_is_root(n))];
+ 
+ 		box_add_child(box, gen);
++
++		box_generated_add_text(n, content, gen, style, c_item);
++		return;
+ 	}
++
++	/* anything else lays out as inline content of the element */
++	box_generated_add_text(n, content, box, style, c_item);
+ }
+ 
+ 

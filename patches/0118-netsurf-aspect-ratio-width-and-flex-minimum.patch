@@ -1,0 +1,118 @@
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index a6bc97a1e..cd514964e 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -597,6 +597,36 @@ static inline int layout_flex__remaining_free_main(
+ 	return remaining_free_main;
+ }
+ 
++/**
++ * Whether a flex item's content is the smallest it may be (VitaSurf).
++ *
++ * Flexbox 4.5: an item is kept as wide as its content only while its
++ * minimum size on the main axis is auto and it does not hide what
++ * overflows. Writing min-width: 0, or overflow: hidden, is how a page
++ * lets a long line shrink and be cut off, and this floored it at the
++ * width of the longest word instead, which pushed everything beside it
++ * off the screen.
++ *
++ * \param[in] ctx   Flex layout context
++ * \param[in] b     Flex item box
++ * \return true if the item may be no smaller than its content
++ */
++static inline bool layout_flex__auto_minimum(
++		const struct flex_ctx *ctx,
++		const struct box *b)
++{
++	if (ctx->horizontal) {
++		return css_computed_min_width_is_auto(b->style) &&
++				css_computed_overflow_x(b->style) ==
++						CSS_OVERFLOW_VISIBLE;
++	}
++
++	return css_computed_min_height_is_auto(b->style) &&
++			css_computed_overflow_y(b->style) ==
++					CSS_OVERFLOW_VISIBLE;
++}
++
++
+ /**
+  * Clamp flex item target main size and get min/max violations
+  *
+@@ -638,7 +668,8 @@ static inline int layout_flex__get_min_max_violations(
+ 					item->min_main);
+ 		}
+ 
+-		if (target_main_size < item->box->min_width) {
++		if (layout_flex__auto_minimum(ctx, item->box) &&
++		    target_main_size < item->box->min_width) {
+ 			target_main_size = item->box->min_width;
+ 			item->min_violation = true;
+ 			NSLOG(flex, DEEPDEBUG, "Violation: box min_width: %i",
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index f354531f4..b506e36d9 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -509,6 +509,31 @@ static inline void layout_handle_box_sizing(
+  * \param  padding          filled with paddings, may be NULL
+  * \param  border           filled with border widths, may be NULL
+  */
++/**
++ * Whether a box with width auto takes the width of its content rather
++ * than of its containing block (VitaSurf).
++ *
++ * CSS Sizing 4: an aspect ratio resolves an automatic width only for
++ * such a box. A block-level box in normal flow fills its containing
++ * block instead, whatever ratio it names.
++ */
++static inline bool layout_shrink_to_fit_width(
++		const struct box *box,
++		const css_computed_style *style)
++{
++	if (css_computed_position(style) == CSS_POSITION_ABSOLUTE ||
++	    css_computed_position(style) == CSS_POSITION_FIXED) {
++		return true;
++	}
++	if (css_computed_float(style) == CSS_FLOAT_LEFT ||
++	    css_computed_float(style) == CSS_FLOAT_RIGHT) {
++		return true;
++	}
++	return box->type == BOX_INLINE_BLOCK ||
++	       box->type == BOX_INLINE_FLEX;
++}
++
++
+ static inline void layout_find_dimensions(
+ 		const css_unit_ctx *unit_len_ctx,
+ 		int available_width,
+@@ -623,6 +648,30 @@ static inline void layout_find_dimensions(
+ 			}
+ 		}
+ 
++		/*
++		 * The ratio works the other way too, for a box whose
++		 * width is its content's rather than its container's: an
++		 * inline block, a float or an absolutely positioned box
++		 * with a height and aspect-ratio and nothing in it had no
++		 * width at all (VitaSurf). A block in normal flow keeps
++		 * the width of its containing block, as CSS Sizing 4
++		 * says, so the ratio gives it only its height.
++		 */
++		if (*height != AUTO && width != NULL && *width == AUTO &&
++				layout_shrink_to_fit_width(box, style)) {
++			css_fixed ar_w = 0, ar_h = 0;
++
++			if (css_computed_aspect_ratio(style, &ar_w, &ar_h) ==
++					CSS_ASPECT_RATIO_SET &&
++					ar_w > 0 && ar_h > 0) {
++				*width = (int) (*height *
++						FIXTOFLT(ar_w) /
++						FIXTOFLT(ar_h));
++				layout_handle_box_sizing(unit_len_ctx, box,
++						available_width, true, width);
++			}
++		}
++
+ 		if (*height != AUTO) {
+ 			layout_handle_box_sizing(unit_len_ctx, box,
+ 					available_width, false, height);

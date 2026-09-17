@@ -1,0 +1,86 @@
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index a9e7c2e..d760ae0 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -742,6 +742,18 @@ uint8_t css_computed_min_width(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+ 
++/**
++ * Whether a minimum size is the automatic one (VitaSurf).
++ *
++ * The two accessors above answer SET with a length of zero for an
++ * automatic minimum unless the element is itself a flex container. A
++ * caller that knows the element is a flex item, as flex layout does,
++ * asks here, and can then tell a page that wrote min-width: 0 from one
++ * that wrote nothing at all.
++ */
++bool css_computed_min_width_is_auto(const css_computed_style *style);
++bool css_computed_min_height_is_auto(const css_computed_style *style);
++
+ uint8_t css_computed_background_repeat(
+ 		const css_computed_style *style);
+ 
+diff --git a/src/select/computed.c b/src/select/computed.c
+index f39c197..f535507 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -1455,6 +1455,35 @@ uint8_t css_computed_min_height(const css_computed_style *style,
+ 	return min_height;
+ }
+ 
++/*
++ * Whether the minimum size is the automatic one (VitaSurf).
++ *
++ * The accessors below answer SET with a length of zero for an
++ * automatic minimum unless the element is itself a flex container,
++ * which is a guess at Flexbox 4.5: the rule is about a flex *item*,
++ * which is an element whose parent is a flex container, and the
++ * computed style cannot see the parent. A caller that does know, as
++ * flex layout does, asks here instead, and can then tell a page that
++ * wrote min-width: 0 from one that wrote nothing at all.
++ */
++bool css_computed_min_width_is_auto(const css_computed_style *style)
++{
++	css_fixed length = 0;
++	css_unit unit = CSS_UNIT_PX;
++
++	return get_min_width_fixed(style, &length, &unit) ==
++			CSS_MIN_WIDTH_AUTO;
++}
++
++bool css_computed_min_height_is_auto(const css_computed_style *style)
++{
++	css_fixed length = 0;
++	css_unit unit = CSS_UNIT_PX;
++
++	return get_min_height_fixed(style, &length, &unit) ==
++			CSS_MIN_HEIGHT_AUTO;
++}
++
+ uint8_t css_computed_min_width(const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit)
+ {
+diff --git a/src/select/unit.c b/src/select/unit.c
+index abe0bfa..d0dd72b 100644
+--- a/src/select/unit.c
++++ b/src/select/unit.c
+@@ -271,11 +271,16 @@ static inline css_fixed css_unit__px_per_unit(
+ 				viewport_height,
+ 				viewport_width);
+ 
++	/* vh is a hundredth of the viewport's height and vw of its
++	 * width. These two had each other's, so 100vw was as wide as
++	 * the screen is tall: a page that sizes a panel in vw came out
++	 * the wrong shape, and on the Vita, whose screen is much wider
++	 * than it is tall, wildly so (VitaSurf). */
+ 	case CSS_UNIT_VH:
+-		return FDIV(viewport_width, F_100);
++		return FDIV(viewport_height, F_100);
+ 
+ 	case CSS_UNIT_VW:
+-		return FDIV(viewport_height, F_100);
++		return FDIV(viewport_width, F_100);
+ 
+ 	default:
+ 		return 0;

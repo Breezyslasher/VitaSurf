@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!-- A flex item was never allowed to be narrower than its longest word,
+     whatever the page asked for. Flexbox 4.5 keeps an item that wide
+     only while its min-width is auto and it does not hide its overflow,
+     which is why min-width: 0 and overflow: hidden are how a page lets a
+     long line be cut off. Without this, one long word pushed everything
+     beside it off the screen.
+     Expected: four grey bars, each 100 wide, each holding one clipped
+     line of text, and below them a fifth that its own long word makes
+     wider than the 100 wide box around it. -->
+<html><head><style>
+body { margin: 0; width: 400px; font: 16px/1 sans-serif }
+.c { display: flex; width: 100px; background: #eee; margin-bottom: 4px }
+.c > div { background: #ccd; overflow: hidden; white-space: nowrap }
+.a > div { flex: 1; min-width: 0 }
+.b > div { flex: 1 1 0px; min-width: 0 }
+.d > div { flex: 1 }
+.e > div { flex: 1; min-width: 0; text-overflow: ellipsis }
+/* the automatic minimum still holds where nothing turns it off */
+.keep { display: flex; width: 100px; background: #eee }
+.keep > div { flex: 1; white-space: nowrap; background: #dcc }
+</style></head><body>
+<div class="c a"><div>averyveryverylongwordthatoverflows</div></div>
+<div class="c b"><div>averyveryverylongwordthatoverflows</div></div>
+<div class="c d"><div>averyveryverylongwordthatoverflows</div></div>
+<div class="c e"><div>averyveryverylongwordthatoverflows</div></div>
+<div class="keep"><div>averyveryverylongwordthatoverflows</div></div>
+<script>
+setTimeout(function(){
+ function item(c){return Math.round(document.querySelector('.'+c+' > div').getBoundingClientRect().width);}
+ var w = ['a','b','d','e','keep'].map(item);
+ var ok = w[0]==100 && w[1]==100 && w[2]==100 && w[3]==100 && w[4]>100;
+ console.log((ok?'PASS':'FAIL')+' flex automatic minimum '+w.join(' '));
+},500);
+</script></body></html>
