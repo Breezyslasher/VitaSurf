@@ -637,13 +637,34 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
  * script (or handler, or timer) is done the box tree is rebuilt from the
  * DOM and laid out again (html_relayout, VitaSurf patch).
  */
+/*
+ * A count of the times the tree has changed, for the live collections
+ * in prelude.js. getElementsByTagName and its relatives are live, and
+ * the prelude made them so by running the query again on every read --
+ * each .length, each [i] -- so a loop over one was a whole-document walk
+ * per step, and one getElementsByClassName over Wikipedia's seven
+ * thousand elements was fourteen thousand walks. A collection now keeps
+ * its answer until this changes. Every C entry point that alters the
+ * tree or an attribute bumps it, and so does the start of each script,
+ * since the parser adds nodes between scripts.
+ */
+static uint32_t vita_dom_gen;
+
 static void mark_dirty(JSContext *ctx)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
+	vita_dom_gen++;
 	if (thread != NULL) {
 		thread->dom_dirty = true;
 	}
+}
+
+static JSValue win_vita_dom_gen(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	(void)this_val; (void)argc; (void)argv;
+	return JS_NewUint32(ctx, vita_dom_gen);
 }
 
 /** Return a dom_string property as a JS string, or "" . */
@@ -935,6 +956,7 @@ static JSValue node_get_class_name(JSContext *ctx, JSValueConst this_val)
 static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 				  const char *name, JSValueConst val)
 {
+	vita_dom_gen++;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *s = JS_ToCString(ctx, val);
 	dom_string *key = to_dom_string(name);
@@ -1043,16 +1065,37 @@ static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
 	return r;
 }
 
-static JSValue nodelist_to_array(JSContext *ctx, struct dom_nodelist *list);
-
+/*
+ * libdom's NodeList is a query, not an array: item(i) walks from the
+ * root counting matches until it reaches i, and length() walks the whole
+ * thing, so reading a list of n nodes one item at a time costs n*n node
+ * visits. Wikipedia's mobile page has seven thousand elements and jQuery
+ * reaches for getElementsByTagName on every selector, and one such read
+ * was minutes on the Vita. The lists are walked once here instead.
+ */
 static JSValue node_get_child_nodes(JSContext *ctx, JSValueConst this_val)
 {
 	struct dom_node *node = this_node(ctx, this_val);
-	struct dom_nodelist *list = NULL;
+	struct dom_node *c = NULL;
+	JSValue arr;
+	uint32_t i = 0;
 
 	if (node == NULL) return JS_EXCEPTION;
-	dom_node_get_child_nodes(node, &list);
-	return nodelist_to_array(ctx, list);
+	arr = JS_NewArray(ctx);
+	if (dom_node_get_first_child(node, &c) != DOM_NO_ERR) {
+		c = NULL;
+	}
+	while (c != NULL) {
+		struct dom_node *next = NULL;
+
+		JS_SetPropertyUint32(ctx, arr, i++, wrap_node(ctx, c));
+		if (dom_node_get_next_sibling(c, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		dom_node_unref(c);
+		c = next;
+	}
+	return arr;
 }
 
 static JSValue node_get_node_value(JSContext *ctx, JSValueConst this_val)
@@ -1726,15 +1769,14 @@ static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_v
 {
 	struct dom_node *node = this_node(ctx, this_val);
 	const char *name;
-	dom_string *key;
-	struct dom_nodelist *list = NULL;
 
 	if (node == NULL || argc < 1) return JS_NewArray(ctx);
 	name = JS_ToCString(ctx, argv[0]);
 	if (name == NULL) return JS_NewArray(ctx);
 
-	if (!node_is_element(node)) {
-		/* a document fragment has no element vtable, so walk it */
+	/* Walked, never read out of a libdom NodeList: see childNodes. A
+	 * document fragment has no element vtable either way. */
+	{
 		struct find_key k;
 		size_t i, len = strlen(name);
 		JSValue out;
@@ -1756,14 +1798,6 @@ static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_v
 		free(k.tag);
 		return out;
 	}
-
-	key = to_dom_string(name);
-	if (key != NULL) {
-		dom_element_get_elements_by_tag_name(node, key, &list);
-		dom_string_unref(key);
-	}
-	JS_FreeCString(ctx, name);
-	return nodelist_to_array(ctx, list);
 }
 
 /*
@@ -2425,47 +2459,39 @@ static JSValue doc_get_element_by_id(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
-/* Return a plain array of elements for a tag or class name query. */
-static JSValue nodelist_to_array(JSContext *ctx, struct dom_nodelist *list)
-{
-	JSValue arr = JS_NewArray(ctx);
-	uint32_t len = 0, i;
-
-	if (list == NULL) {
-		return arr;
-	}
-	dom_nodelist_get_length(list, &len);
-	for (i = 0; i < len; i++) {
-		struct dom_node *n = NULL;
-		dom_nodelist_item(list, i, &n);
-		if (n != NULL) {
-			JS_SetPropertyUint32(ctx, arr, i, wrap_node(ctx, n));
-			dom_node_unref(n);
-		}
-	}
-	dom_nodelist_unref(list);
-	return arr;
-}
-
 static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_val,
 					    int argc, JSValueConst *argv)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *name;
-	dom_string *key;
-	struct dom_nodelist *list = NULL;
+	struct find_key k;
+	size_t i, len;
+	JSValue out;
 
 	(void)this_val;
 	if (doc == NULL || argc < 1) return JS_NewArray(ctx);
 	name = JS_ToCString(ctx, argv[0]);
-	key = to_dom_string(name);
-	if (key != NULL) {
-		dom_document_get_elements_by_tag_name(doc, key, &list);
-		dom_string_unref(key);
+	if (name == NULL) return JS_NewArray(ctx);
+
+	/* Walked, never read out of a libdom NodeList: see childNodes. */
+	memset(&k, 0, sizeof(k));
+	len = strlen(name);
+	if (strcmp(name, "*") != 0) {
+		k.tag = malloc(len + 1);
+		if (k.tag == NULL) {
+			JS_FreeCString(ctx, name);
+			return JS_NewArray(ctx);
+		}
+		for (i = 0; i < len; i++) {
+			k.tag[i] = (char)toupper((unsigned char)name[i]);
+		}
+		k.tag[len] = 0;
 	}
-	if (name) JS_FreeCString(ctx, name);
-	return nodelist_to_array(ctx, list);
+	JS_FreeCString(ctx, name);
+	out = find_in_subtree(ctx, (struct dom_node *)doc, &k, 1);
+	free(k.tag);
+	return out;
 }
 
 static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
@@ -3157,6 +3183,7 @@ static void begin_script(jsthread *thread)
 	if (thread->script_depth++ > 0) {
 		return;
 	}
+	vita_dom_gen++;	/* the parser may have added nodes since */
 	script_entered_ms = now_ms();
 	rearm_deadline(thread);
 }
@@ -4794,6 +4821,8 @@ static void setup_globals(jsthread *thread)
 	/* layout geometry, scrolling and event dispatch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFind",
 			  JS_NewCFunction(ctx, win_vita_find, "__vitaFind", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaDomGen",
+			  JS_NewCFunction(ctx, win_vita_dom_gen, "__vitaDomGen", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaElementFromPoint",

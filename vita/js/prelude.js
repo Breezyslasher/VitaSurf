@@ -3012,8 +3012,16 @@ function indexKey(k){
 /* The collection is a proxy so that an index or a name is resolved when
    it is read, which is what makes it live. */
 function liveCollection(items,proto){
- var base=Object.create(proto||HTMLCollection.prototype);
- Object.defineProperty(base,'__vitaItems',{value:items,configurable:true});
+ var base=Object.create(proto||HTMLCollection.prototype),cache=null,gen=-1;
+ /* Live, but not by asking again on every read: the answer is kept
+    until the C side says the tree changed. A loop over a collection
+    reads .length and [i] each step, and each read was a whole-document
+    walk before this. */
+ function cached(){
+  var g=W.__vitaDomGen?W.__vitaDomGen():-1;
+  if(cache===null||g<0||g!==gen){cache=items();gen=g;}
+  return cache;}
+ Object.defineProperty(base,'__vitaItems',{value:cached,configurable:true});
  return new Proxy(base,{
   get:function(t,k,r){
    var i=indexKey(k),a;
@@ -5035,16 +5043,10 @@ W.__vitaMutation=function(kind,target,a,b,ns){
  * too, and getElementsByClassName found nothing for either. */
 function byClassName(root,names){
  var want=String(names).split(CLASS_WS).filter(function(x){return x!=='';});
- var out=[];
- if(!want.length)return out;
- var all=root.getElementsByTagName('*'),i,j,set,ok;
- for(i=0;i<all.length;i++){
-  set=classSet(all[i]);
-  if(!set.length)continue;
-  ok=true;
-  for(j=0;j<want.length;j++)if(set.indexOf(want[j])<0){ok=false;break;}
-  if(ok)out.push(all[i]);}
- return out;}
+ if(!want.length)return [];
+ /* matched in C: the walk in JavaScript over a live '*' collection was
+    two whole-document walks per element */
+ return W.__vitaFind(root,[{classes:want}]);}
 P.getElementsByClassName=function(n){return byClassName(this,n);};
 D.getElementsByClassName=function(n){
  var r=D.documentElement;return r?byClassName(r,n):[];};
