@@ -129,11 +129,20 @@ copy with a transparent margin, a filled path takes the soft rectangle
 of its bounding box, and text and strokes fade towards the colour under
 the box by an amount that grows with the radius. `backdrop-filter`
 stays accepted and ignored, since it would need what is already on the
-screen. After this the census counts under four percent of declarations
-dropped on GitHub, MDN, Bootstrap and Tailwind's own pages, with no
-single property dropped sixty times or more. Each patch has a page
-under `tests/css/` that the monkey frontend checks; none of this batch
-has been verified on hardware yet.
+screen. Patches 0094 and 0095 take the tail of the census: the box
+alignment keywords (`start`, `end`, `self-start`, `normal`, `left`,
+`right`, a leading `safe`), `justify-items` and `justify-self` with the
+`place-*` shorthands, applied to grid items; `text-shadow`, painted as
+a second pass under the text; `text-decoration-color`, `-thickness`,
+`-style` and `text-underline-offset`, with the shorthand reading all of
+them, drawn as dotted, dashed or double lines of the given colour and
+weight; `object-position` for fitted pictures; `stroke-width` on inline
+SVG; `all`; `env()` as its fallback or zero; a `polygon()` clip as the
+box around its points; and forty-odd names accepted and ignored. After
+this the census counts under two percent of declarations dropped on
+every fixture site. Each patch has a page under `tests/css/` that the
+monkey frontend checks; none of this batch has been verified on
+hardware yet.
 
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic

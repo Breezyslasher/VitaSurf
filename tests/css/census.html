@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>census tail: alignment, text-shadow, decoration, object-position</title>
+<style>
+body { margin: 0; font-size: 16px; }
+/* a: a grid item 40px wide in a 200px column, justify-self: end: x = 160 */
+.grid { display: grid; grid-template-columns: 200px; width: 200px; }
+.a { width: 40px; height: 20px; background: #ff0000; justify-self: end; }
+/* b: place-items: center on the grid: x = 80 */
+.grid2 { display: grid; grid-template-columns: 200px; width: 200px; place-items: center; }
+.b { width: 40px; height: 20px; background: #00ff00; }
+/* c: text-shadow 2px 3px red: the text is painted twice, the shadow first at +2,+3 in red */
+.c { text-shadow: 2px 3px #ff0000; color: #000000; }
+/* d: underline, dotted, blue, 3px thick, 4px below: one DOT line, stroke blue, width 3 */
+.d { text-decoration: underline dotted #0000ff 3px; text-underline-offset: 4px; }
+/* e: double underline: two lines */
+.e { text-decoration: underline double; }
+/* f: env() with a fallback: padding-top: 20px */
+.f { padding-top: env(safe-area-inset-top, 20px); height: 10px; background: #0000ff; }
+</style>
+</head>
+<body>
+<div class="grid"><div class="a"></div></div>
+<div class="grid2"><div class="b"></div></div>
+<div class="c">shadow</div>
+<div class="d">dotted</div>
+<div class="e">double</div>
+<div class="f"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+window.addEventListener('load', function(){ setTimeout(function(){
+  var a = document.querySelector('.a').getBoundingClientRect();
+  T('justify-self end x', Math.round(a.left) + (Math.round(a.left) == 160 ? '' : ' (expected 160)'));
+  var b = document.querySelector('.b').getBoundingClientRect();
+  T('place-items center x', Math.round(b.left) + (Math.round(b.left) == 80 ? '' : ' (expected 80)'));
+  var f = document.querySelector('.f').getBoundingClientRect();
+  T('env fallback height', Math.round(f.height) + (Math.round(f.height) == 30 ? '' : ' (expected 30)'));
+}, 200); });
+</script>
+</body>
+</html>

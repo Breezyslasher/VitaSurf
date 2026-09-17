@@ -262,6 +262,15 @@ def main(argv):
         'translate', 'translatex', 'translatey', 'translate3d', 'matrix',
         'matrix3d', 'rotate', 'rotatez', 'scale', 'scalex', 'scaley',
         'scale3d', 'skew', 'skewx', 'skewy',
+        # filter functions, folded into a colour matrix, a shadow and a
+        # blur radius
+        'blur', 'brightness', 'contrast', 'drop-shadow', 'grayscale',
+        'hue-rotate', 'invert', 'opacity', 'saturate', 'sepia',
+        # a polygon() clip is read as the box around its points; env()
+        # reads as its fallback or zero; the -webkit- radial form is
+        # read like the standard one
+        'polygon', 'env', '-webkit-radial-gradient',
+        'repeating-linear-gradient', 'repeating-radial-gradient',
     }
     print('\n== functions called in values, ones libcss knows marked')
     print('%8s  %s' % ('uses', 'function'))
