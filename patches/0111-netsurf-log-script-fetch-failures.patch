@@ -1,0 +1,62 @@
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 13904aa7d..36613f833 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -33,6 +33,7 @@
+ #include "utils/corestrings.h"
+ #include "utils/log.h"
+ #include "utils/messages.h"
++#include "utils/utils.h"
+ #include "netsurf/content.h"
+ #include "javascript/js.h"
+ #include "content/content_protected.h"
+@@ -191,6 +192,12 @@ convert_script_async_cb(hlcache_handle *script,
+ 		NSLOG(netsurf, INFO, "script %s failed: %s",
+ 		      nsurl_access(hlcache_handle_get_url(script)),
+ 		      event->data.errordata.errormsg);
++		/* a page whose script never arrives is a blank page, and the
++		 * log said nothing about why (VitaSurf) */
++		vita_log("script: %s failed: %s",
++			 nsurl_access(hlcache_handle_get_url(script)),
++			 event->data.errordata.errormsg != NULL ?
++			 event->data.errordata.errormsg : "no reason given");
+ 
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+@@ -254,6 +261,12 @@ convert_script_defer_cb(hlcache_handle *script,
+ 		NSLOG(netsurf, INFO, "script %s failed: %s",
+ 		      nsurl_access(hlcache_handle_get_url(script)),
+ 		      event->data.errordata.errormsg);
++		/* a page whose script never arrives is a blank page, and the
++		 * log said nothing about why (VitaSurf) */
++		vita_log("script: %s failed: %s",
++			 nsurl_access(hlcache_handle_get_url(script)),
++			 event->data.errordata.errormsg != NULL ?
++			 event->data.errordata.errormsg : "no reason given");
+ 
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+@@ -341,6 +354,12 @@ convert_script_sync_cb(hlcache_handle *script,
+ 		NSLOG(netsurf, INFO, "script %s failed: %s",
+ 		      nsurl_access(hlcache_handle_get_url(script)),
+ 		      event->data.errordata.errormsg);
++		/* a page whose script never arrives is a blank page, and the
++		 * log said nothing about why (VitaSurf) */
++		vita_log("script: %s failed: %s",
++			 nsurl_access(hlcache_handle_get_url(script)),
++			 event->data.errordata.errormsg != NULL ?
++			 event->data.errordata.errormsg : "no reason given");
+ 
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+@@ -477,6 +496,10 @@ exec_src_script(html_content *c,
+ 					   CONTENT_SCRIPT,
+ 					   &nscript->data.handle);
+ 
++	if (ns_error != NSERROR_OK) {
++		vita_log("script: %s not fetched (%d)", nsurl_access(joined),
++			 (int) ns_error);
++	}
+ 
+ 	nsurl_unref(joined);
+ 
