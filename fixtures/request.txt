@@ -1,2 +1,2 @@
-url=https://github.githubassets.com/assets/chunk-3m-a5bd6eb6538dbb98.js
-name=gh-chunk-3m
+url=https://yamtrack.breezys.us/
+name=yamtrack
