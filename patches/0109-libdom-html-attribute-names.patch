@@ -1,0 +1,85 @@
+diff --git a/src/core/document.c b/src/core/document.c
+index 3bad248..e8cbdd4 100644
+--- a/src/core/document.c
++++ b/src/core/document.c
+@@ -608,7 +608,7 @@ dom_exception _dom_document_create_processing_instruction(
+ dom_exception _dom_document_create_attribute(dom_document *doc,
+ 		dom_string *name, dom_attr **result)
+ {
+-	if (_dom_validate_name(name) == false)
++	if (_dom_validate_attr_name(name) == false)
+ 		return DOM_INVALID_CHARACTER_ERR;
+ 
+ 	return _dom_attr_create(doc, name, NULL, NULL, true, result);
+diff --git a/src/core/element.c b/src/core/element.c
+index 6ceeae3..4285867 100644
+--- a/src/core/element.c
++++ b/src/core/element.c
+@@ -1645,7 +1645,7 @@ dom_exception _dom_element_set_attr(struct dom_element *element,
+ 	dom_node_internal *e = (dom_node_internal *) element;
+ 	dom_exception err;
+ 
+-	if (_dom_validate_name(name) == false)
++	if (_dom_validate_attr_name(name) == false)
+ 		return DOM_INVALID_CHARACTER_ERR;
+ 
+ 	/* Ensure element can be written */
+diff --git a/src/utils/validate.c b/src/utils/validate.c
+index 4fd7d6d..aeee4f3 100644
+--- a/src/utils/validate.c
++++ b/src/utils/validate.c
+@@ -195,3 +195,42 @@ bool _dom_validate_ncname(dom_string *name)
+ 	return true;
+ }
+ 
++/**
++ * Test whether the name is a valid attribute name for an HTML document.
++ *
++ * The DOM Standard no longer holds attribute names to the XML Name
++ * production: a name is valid when it is not empty and has no ASCII
++ * whitespace, NUL, '/', '=' or '>', which is exactly what the HTML
++ * tokeniser accepts. Lit writes attributes such as ".prop$lit$" and
++ * "lit$123$0" into a template, and every one of them was refused here,
++ * so the parts of every Lit template were bound one value out of step
++ * (VitaSurf).
++ *
++ * \param name  The name need to be tested
++ * \return true if ::name is valid, false otherwise.
++ */
++bool _dom_validate_attr_name(dom_string *name)
++{
++	const uint8_t *s;
++	size_t slen, i;
++
++	if (name == NULL)
++		return false;
++
++	s = (const uint8_t *) dom_string_data(name);
++	slen = dom_string_byte_length(name);
++	if (slen == 0)
++		return false;
++
++	for (i = 0; i < slen; i++) {
++		switch (s[i]) {
++		case 0x00: case 0x09: case 0x0A: case 0x0C: case 0x0D:
++		case ' ': case '/': case '=': case '>':
++			return false;
++		default:
++			break;
++		}
++	}
++
++	return true;
++}
+diff --git a/src/utils/validate.h b/src/utils/validate.h
+index 7318653..8230d20 100644
+--- a/src/utils/validate.h
++++ b/src/utils/validate.h
+@@ -19,6 +19,7 @@
+ #include <dom/core/string.h>
+ 
+ bool _dom_validate_name(dom_string *name);
++bool _dom_validate_attr_name(dom_string *name);
+ bool _dom_validate_ncname(dom_string *name);
+ 
+ #endif

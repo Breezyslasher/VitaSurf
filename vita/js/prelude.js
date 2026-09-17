@@ -1965,9 +1965,22 @@ W.customElements={
 };
 
 /* Reactions on the DOM calls that move elements in and out of the tree. */
+/* A fragment hands its children over and is empty once inserted, so
+ * they are noted first: everything Lit renders arrives in one, and no
+ * custom element in it was ever upgraded. */
+function ceInserted(parent,n){
+ var kids=n.nodeType===11?n.childNodes.slice():null;
+ return function(){
+  var inDoc=ceInDoc(parent),i;
+  if(kids){for(i=0;i<kids.length;i++)ceConnectTree(kids[i],inDoc,false);}
+  else ceConnectTree(n,inDoc,false);
+ };
+}
 ['appendChild','insertBefore'].forEach(function(m){
  var orig=P[m];
- P[m]=function(n){var r=orig.apply(this,arguments);if(CEn&&n)ceConnectTree(n,ceInDoc(this),false);return r;};
+ P[m]=function(n){
+  var after=(CEn&&n)?ceInserted(this,n):null;
+  var r=orig.apply(this,arguments);if(after)after();return r;};
 });
 (function(){
  var orig=P.removeChild;
@@ -1979,8 +1992,9 @@ W.customElements={
  var orig=P.replaceChild;
  P.replaceChild=function(nw,old){
   noteEdges(old);
+  var after=(CEn&&nw)?ceInserted(this,nw):null;
   var r=orig.apply(this,arguments);
-  if(CEn){if(old)ceDisconnectTree(old,false);if(nw)ceConnectTree(nw,ceInDoc(this),false);}return r;};
+  if(CEn){if(old)ceDisconnectTree(old,false);if(after)after();}return r;};
 })();
 (function(){
  var d=Object.getOwnPropertyDescriptor(P,'innerHTML');
@@ -2108,6 +2122,11 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    Object.defineProperty(c,'__content',
     {configurable:true,writable:true,value:f});
   }
+  /* A copy of a defined custom element is upgraded as it is made, as
+   * the specification has it, so a property set on it before it is
+   * inserted (Lit binds its template's values that way) reaches the
+   * class's accessor. It is connected later, when it is inserted. */
+  if(CEn&&c)ceConnectTree(c,false,false);
   return c;};
 })();
 W.ShadowRoot=CEBase;

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!-- Custom elements inside a DocumentFragment must be upgraded when the
+     fragment is inserted, and a clone of a defined element is upgraded as
+     it is made. Expected console output: four lines ending in "ok". -->
+<html><body><div id="host"></div>
+<template id="t"><x-a data-k="1"></x-a><p><x-a></x-a></p></template>
+<script>
+var log=[];
+class XA extends HTMLElement{
+  constructor(){super();this.made=true;}
+  connectedCallback(){log.push("connected");}
+  hello(){return "hi";}
+}
+customElements.define("x-a",XA);
+var host=document.getElementById("host");
+var f=document.createDocumentFragment();
+var a=document.createElement("x-a"); f.appendChild(a);
+var wrap=document.createElement("div"); wrap.appendChild(document.createElement("x-a")); f.appendChild(wrap);
+host.appendChild(f);
+var all=host.querySelectorAll("x-a");
+console.log("fragment append:", all.length===2 && typeof all[0].hello==="function" && typeof all[1].hello==="function" && log.length===2 ? "ok" : "FAIL "+all.length+" "+typeof all[0].hello+" "+log.length);
+var t=document.getElementById("t");
+var c=document.importNode(t.content,true);
+var first=c.firstChild;
+console.log("clone upgraded before insert:", first.made===true && typeof first.hello==="function" && log.length===2 ? "ok" : "FAIL "+first.made+" "+typeof first.hello+" "+log.length);
+first.value="set before insert";
+host.insertBefore(c,null);
+console.log("clone connected on insert:", log.length===4 && first.value==="set before insert" ? "ok" : "FAIL "+log.length);
+var r=document.createElement("x-a"); host.replaceChild(r, host.firstChild);
+var g=document.createDocumentFragment(); g.appendChild(document.createElement("x-a"));
+host.replaceChild(g, host.firstChild);
+console.log("replaceChild:", log.length===6 && typeof host.firstChild.hello==="function" ? "ok" : "FAIL "+log.length);
+</script></body></html>

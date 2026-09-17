@@ -104,3 +104,12 @@
 #   rather than aborting.
 0x1ed33
 0x1ef5f
+
+build 294 (7ae254f), Home Assistant /auth/authorize, dump 394540e5:
+  _free_r+0x11e (0x3b44f6) <- Curl_freeset+0x67 (0x1be85b) <- Curl_close
+  <- curl_easy_cleanup <- fetch_curl_stop <- fetch_curl_poll <- fetcher_poll
+  <- schedule_run. Faulting instruction is "str r2, [r0, #8]" with r0 = 0x100:
+  r0 was loaded from [r1 + 12], the bk link of a free chunk (r1 = 0x84af6430)
+  already on the small bin list. So a block freed earlier had bytes 8..11
+  overwritten with 0x100 after it was freed: a use-after-free write by
+  whoever held that block, not a double free of the curl string being freed.
