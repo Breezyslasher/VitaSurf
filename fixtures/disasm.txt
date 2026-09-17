@@ -1,4 +1,7 @@
-run=35048008467
-artifact=VitaSurf-elf-233
-offset=0x39e94e
-offset=0x39e91b
+run=35185731447
+artifact=VitaSurf-elf-286
+offset=0x3b3e12
+offset=0x8409f
+offset=0x84127
+offset=0x89317
+offset=0x89e7d
