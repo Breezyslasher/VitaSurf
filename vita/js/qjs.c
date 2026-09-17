@@ -4032,6 +4032,29 @@ static JSValue ev_stop_propagation(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+/**
+ * Whether an event is one of the keyboard events.
+ *
+ * libdom has no way to ask an event what kind it is, so this goes by
+ * the name, which is what decides the shape of the object a page
+ * expects anyway.
+ */
+static bool event_is_keyboard(struct dom_event *evt)
+{
+	dom_string *type = NULL;
+	bool is_key = false;
+
+	if (dom_event_get_type(evt, &type) != DOM_NO_ERR || type == NULL) {
+		return false;
+	}
+	is_key = dom_string_isequal(type, corestring_dom_keydown) ||
+		 dom_string_isequal(type, corestring_dom_keypress) ||
+		 dom_string_isequal(type, corestring_dom_keyup);
+	dom_string_unref(type);
+	return is_key;
+}
+
+
 static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 {
 	JSValue obj = JS_NewObject(ctx);
@@ -4057,6 +4080,64 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 				  wrap_node(ctx, (struct dom_node *)target));
 		dom_node_unref((struct dom_node *)target);
 	}
+	/*
+	 * A key event carries which key it was, which is how a page
+	 * tells Enter from Escape from a letter. Without these a
+	 * listener saw undefined and every "if (e.key === 'Enter')"
+	 * was false, so a form never submitted and a dialog never
+	 * closed.
+	 */
+	if (event_is_keyboard(evt)) {
+		dom_keyboard_event *kevt = (dom_keyboard_event *) evt;
+		dom_string *key = NULL;
+		bool flag = false;
+		uint32_t code = 0;
+
+		if (dom_keyboard_event_get_key(kevt, &key) == DOM_NO_ERR &&
+		    key != NULL) {
+			const char *data = dom_string_data(key);
+			size_t len = dom_string_byte_length(key);
+
+			JS_SetPropertyStr(ctx, obj, "key",
+					  JS_NewStringLen(ctx, data, len));
+			/* the legacy numbers a page may still read */
+			if (len == 1) {
+				code = (uint32_t) (unsigned char) data[0];
+				if (code >= 'a' && code <= 'z') {
+					code -= 32;
+				}
+			}
+			dom_string_unref(key);
+			key = NULL;
+		}
+		if (dom_keyboard_event_get_code(kevt, &key) == DOM_NO_ERR &&
+		    key != NULL) {
+			JS_SetPropertyStr(ctx, obj, "code",
+					  JS_NewStringLen(ctx,
+						dom_string_data(key),
+						dom_string_byte_length(key)));
+			dom_string_unref(key);
+		}
+		JS_SetPropertyStr(ctx, obj, "keyCode", JS_NewInt32(ctx, (int) code));
+		JS_SetPropertyStr(ctx, obj, "which", JS_NewInt32(ctx, (int) code));
+		JS_SetPropertyStr(ctx, obj, "charCode", JS_NewInt32(ctx, 0));
+		if (dom_keyboard_event_get_ctrl_key(kevt, &flag) != DOM_NO_ERR) {
+			flag = false;
+		}
+		JS_SetPropertyStr(ctx, obj, "ctrlKey", JS_NewBool(ctx, flag));
+		if (dom_keyboard_event_get_shift_key(kevt, &flag) != DOM_NO_ERR) {
+			flag = false;
+		}
+		JS_SetPropertyStr(ctx, obj, "shiftKey", JS_NewBool(ctx, flag));
+		if (dom_keyboard_event_get_alt_key(kevt, &flag) != DOM_NO_ERR) {
+			flag = false;
+		}
+		JS_SetPropertyStr(ctx, obj, "altKey", JS_NewBool(ctx, flag));
+		JS_SetPropertyStr(ctx, obj, "metaKey", JS_NewBool(ctx, false));
+		JS_SetPropertyStr(ctx, obj, "repeat", JS_NewBool(ctx, false));
+		JS_SetPropertyStr(ctx, obj, "isComposing", JS_NewBool(ctx, false));
+	}
+
 	JS_SetPropertyStr(ctx, obj, "defaultPrevented", JS_NewBool(ctx, false));
 	JS_SetPropertyStr(ctx, obj, "cancelBubble", JS_NewBool(ctx, false));
 	JS_SetPropertyStr(ctx, obj, "preventDefault",
@@ -6819,6 +6900,19 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		}
 		JS_FreeValue(thread->ctx, fn);
 		JS_FreeValue(thread->ctx, global);
+	}
+	/*
+	 * A caller may count the terminator in the length it gives, and
+	 * a NUL in the middle of the source is where QuickJS's lexer
+	 * stops, so every such script failed to parse with a message
+	 * about a missing semicolon. NetSurf's own javascript: URLs and
+	 * the monkey harness both do this (VitaSurf).
+	 */
+	while (txtlen > 0 && txt[txtlen - 1] == '\0') {
+		txtlen--;
+	}
+	if (txtlen == 0) {
+		return false;
 	}
 	if (txtlen > SCRIPT_MAX_BYTES) {
 		vita_log("qjs: skipping %u KB script (limit %u KB): %s",

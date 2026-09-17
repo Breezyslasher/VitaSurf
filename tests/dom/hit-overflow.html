@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<!-- A tap was only ever offered to a box that held the point, and then
+     to its children, so anything drawn outside its parent took no taps
+     at all. With overflow visible a child is painted outside its parent
+     and must still be clickable: a form field wider than the box a flex
+     or grid parent measured for it, a dropdown hanging below its menu,
+     a badge sitting outside a card.
+     Expected: three rows. The first has a blue block hanging below its
+     grey parent, the second the same in a parent that hides its
+     overflow, the third an unclipped one again with a link in it. -->
+<html><head><style>
+body { margin: 0; font: 16px/1 sans-serif }
+.parent { width: 300px; height: 10px; background: #ddd; margin-bottom: 60px }
+.clip { overflow: hidden }
+.child { width: 200px; height: 40px; background: #99f }
+a { display: block }
+</style></head><body>
+<div class="parent" id="p1"><div class="child" id="c1"></div></div>
+<div class="parent clip" id="p2"><div class="child" id="c2"></div></div>
+<div class="parent" id="p3"><div class="child" id="c3"><a href="#x" id="a3">link</a></div></div>
+<script>
+setTimeout(function(){
+ function at(x, y){ var e = document.elementFromPoint(x, y); return e ? (e.id || e.tagName) : 'none'; }
+ function mid(id){ var r = document.getElementById(id).getBoundingClientRect(); return [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)]; }
+ var m1 = mid('c1'), m2 = mid('c2'), m3 = mid('a3');
+ var a = at(m1[0], m1[1]), b = at(m2[0], m2[1]), c = at(m3[0], m3[1]);
+ /* the clipped one shows nothing there, so anything but its child is right */
+ var ok = a === 'c1' && b !== 'c2' && (c === 'a3' || c === 'c3');
+ console.log((ok ? 'PASS' : 'FAIL') + ' hit testing past the parent ' + [a, b, c].join(' '));
+},600);
+</script></body></html>

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!-- Key events went to the root element and carried no key name, so a
+     listener on a field, which is where a page puts one, heard nothing,
+     and every test of event.key was false: a search box that filters as
+     you type, a form that submits on Enter and a dialog that closes on
+     Escape all did nothing. They go to whatever has the focus now, in
+     the order keydown, keypress, input, keyup, and carry the key, its
+     code and the modifier flags.
+
+     This page needs typing, which only a person or a harness can do, so
+     it reports what it saw rather than passing on its own: focus the
+     field, type "hi", and it prints the events. The engine is driven
+     from the monkey harness in the notes for this test. -->
+<html><head><style>body { margin: 0; font: 16px/1 sans-serif }</style></head>
+<body>
+<input id="t" style="width:200px;height:24px">
+<div id="out">click the field and type</div>
+<script>
+var seen = [];
+var t = document.getElementById('t');
+['focus','blur','keydown','keypress','keyup','input'].forEach(function(ty){
+ t.addEventListener(ty, function(e){
+  seen.push(ty + (e.key ? ':' + e.key : '') + '=' + t.value);
+  document.getElementById('out').textContent = seen.join(' ');
+ });
+});
+document.addEventListener('keydown', function(e){ seen.push('doc:' + e.key); });
+window.report = function(){
+ /* the order the events must arrive in for one key */
+ var i = seen.indexOf('keydown:h=');
+ var ok = seen[0] === 'focus=' && i > 0 &&
+          seen[i + 1] === 'doc:h' &&
+          seen[i + 2] === 'keypress:h=' &&
+          seen[i + 3] === 'input=h' &&
+          seen[i + 4] === 'keyup:h=h' && t.value === 'hi';
+ console.log((ok ? 'PASS' : 'FAIL') + ' key events ' + JSON.stringify(seen));
+};
+setTimeout(function(){ if (seen.length > 0) window.report(); }, 5000);
+</script></body></html>

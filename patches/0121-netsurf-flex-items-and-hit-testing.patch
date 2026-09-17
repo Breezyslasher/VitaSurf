@@ -1,0 +1,145 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 2879c1b67..a468e6262 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -897,13 +897,20 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 				box->type = BOX_BLOCK;
+ 				break;
+ 			case BOX_INLINE:
+-				/* Every child of a grid container is an item
+-				 * of its own (VitaSurf); flex keeps NetSurf's
+-				 * merging of inline runs into one item. */
+-				if (props.containing_block->flags &
+-						GRID_CONTAINER) {
+-					box->type = BOX_BLOCK;
+-				}
++				/*
++				 * Every element child of a flex or grid
++				 * container is an item of its own, and is
++				 * blockified (Flexbox 4, Grid 6); only a
++				 * run of text between them is wrapped in an
++				 * item of its own. NetSurf merged the
++				 * inline children into one item, so a form
++				 * control in a flex row was laid out inside
++				 * an anonymous box that knew nothing of the
++				 * width the page gave it: every text field
++				 * in a modern login form came out a few
++				 * pixels wide (VitaSurf).
++				 */
++				box->type = BOX_BLOCK;
+ 				break;
+ 			default:
+ 				break;
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index b97efa0c7..7000e6829 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -581,6 +581,33 @@ void box_bounds(struct box *box, struct rect *r)
+ 
+ 
+ /* Exported function documented in html/box.h */
++/**
++ * Whether anything inside a box may hold a point the box itself does not.
++ *
++ * Only where the box does not clip: a scroll box, or one that hides
++ * what overflows, shows nothing outside itself and so takes nothing
++ * outside itself either.
++ *
++ * \param box  The box to look inside
++ * \param x    Point x, relative to the box
++ * \param y    Point y, relative to the box
++ * \return true if a descendant may hold the point
++ */
++static bool box_descendants_hold_point(const struct box *box, int x, int y)
++{
++	if (box->style != NULL &&
++	    (css_computed_overflow_x(box->style) != CSS_OVERFLOW_VISIBLE ||
++	     css_computed_overflow_y(box->style) != CSS_OVERFLOW_VISIBLE)) {
++		return false;
++	}
++	if (box->children == NULL && box->float_children == NULL) {
++		return false;
++	}
++	return x >= box->descendant_x0 && x < box->descendant_x1 &&
++	       y >= box->descendant_y0 && y < box->descendant_y1;
++}
++
++
+ struct box *
+ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 	     struct box *box,
+@@ -641,7 +668,17 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 
+ 			skip_children = false;
+ 		} else {
+-			skip_children = true;
++			/*
++			 * A box that does not hold the point may still
++			 * have a child that does: with overflow visible
++			 * a child is drawn, and so can be tapped, outside
++			 * its parent. Skipping the subtree meant a form
++			 * field wider than the box around it, which is
++			 * what a page gets when a flex or grid parent
++			 * mis-measures, took no taps at all (VitaSurf).
++			 */
++			skip_children = !box_descendants_hold_point(box,
++					x - *box_x, y - *box_y);
+ 		}
+ 	}
+ 
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 18f4c0e67..a3ac4f929 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -574,7 +574,17 @@ box_input_text(html_content *html, struct box *box, struct dom_node *node)
+ 		box->type = BOX_BLOCK;
+ 		break;
+ 	default:
+-		box->type = BOX_INLINE_BLOCK;
++	/*
++	 * A control that was blockified because it is the child of a
++	 * flex or grid container keeps that: the sizing of an item
++	 * belongs to the item's own box, and putting the control back
++	 * inline meant an anonymous block became the item instead and
++	 * the width the page gave the control was never used
++	 * (VitaSurf).
++	 */
++		if (box->type != BOX_BLOCK) {
++			box->type = BOX_INLINE_BLOCK;
++		}
+ 		break;
+ 	}
+ 
+@@ -815,7 +825,9 @@ box_button(dom_node *n,
+ 	box->flags |= IS_REPLACED;
+ 	gadget->box = box;
+ 
+-	box->type = BOX_INLINE_BLOCK;
++	if (box->type != BOX_BLOCK) {
++		box->type = BOX_INLINE_BLOCK;
++	}
+ 
+ 	/* Just render the contents */
+ 
+@@ -1272,7 +1284,9 @@ box_input(dom_node *n,
+ 			goto no_memory;
+ 
+ 	} else if (dom_string_caseless_lwc_isequal(type, corestring_lwc_file)) {
+-		box->type = BOX_INLINE_BLOCK;
++		if (box->type != BOX_BLOCK) {
++			box->type = BOX_INLINE_BLOCK;
++		}
+ 
+ 	} else if (dom_string_caseless_lwc_isequal(type,
+ 			corestring_lwc_hidden)) {
+@@ -1774,7 +1788,9 @@ box_select(dom_node *n,
+ 		return true;
+ 	}
+ 
+-	box->type = BOX_INLINE_BLOCK;
++	if (box->type != BOX_BLOCK) {
++		box->type = BOX_INLINE_BLOCK;
++	}
+ 	box->gadget = gadget;
+ 	box->flags |= IS_REPLACED;
+ 	gadget->box = box;

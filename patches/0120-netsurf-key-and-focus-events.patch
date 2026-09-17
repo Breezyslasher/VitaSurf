@@ -1,0 +1,313 @@
+diff --git a/content/handlers/html/box_textarea.c b/content/handlers/html/box_textarea.c
+index b831c2b0a..a2f25d37c 100644
+--- a/content/handlers/html/box_textarea.c
++++ b/content/handlers/html/box_textarea.c
+@@ -41,6 +41,11 @@
+ #include "javascript/js.h"
+ 
+ 
++/* set while a control is given the text it starts with, which is not
++ * the user typing (VitaSurf) */
++static bool box_textarea_filling = false;
++
++
+ nserror box_textarea_keypress(html_content *html, struct box *box, uint32_t key)
+ {
+ 	struct form_control *gadget = box->gadget;
+@@ -255,9 +260,12 @@ static void box_textarea_callback(void *data, struct textarea_msg *msg)
+ 		 * field into its own state (Svelte's bind:value, React's
+ 		 * controlled inputs) never saw the text, and wrote its
+ 		 * own empty value back over it at the next render
+-		 * (VitaSurf).
++		 * (VitaSurf). The widget says the same when it is first
++		 * given the field's own text, which is not the user
++		 * typing and must stay quiet.
+ 		 */
+-		if (html->jsthread != NULL && gadget->node != NULL) {
++		if (box_textarea_filling == false &&
++		    html->jsthread != NULL && gadget->node != NULL) {
+ 			js_fire_event(html->jsthread, "input",
+ 				      html->document,
+ 				      (struct dom_node *) gadget->node);
+@@ -378,8 +386,12 @@ bool box_textarea_create_textarea(html_content *html,
+ 		return false;
+ 	}
+ 
+-	if (!textarea_set_text(gadget->data.text.ta, text))
++	box_textarea_filling = true;
++	if (!textarea_set_text(gadget->data.text.ta, text)) {
++		box_textarea_filling = false;
+ 		return false;
++	}
++	box_textarea_filling = false;
+ 
+ 	return true;
+ }
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index ce4ce60be..eb5461434 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -147,6 +147,18 @@ bool fire_dom_keyboard_event(dom_string *type, dom_node *target,
+ 		case NS_KEY_ESCAPE:
+ 			dom_key = dom_string_ref(corestring_dom_Escape);
+ 			break;
++		/* the keys a page acts on most, which had no name at all
++		 * and so never matched anything (VitaSurf) */
++		case NS_KEY_NL:
++		case NS_KEY_CR:
++			dom_key = dom_string_ref(corestring_dom_Enter);
++			break;
++		case NS_KEY_TAB:
++			dom_key = dom_string_ref(corestring_dom_Tab);
++			break;
++		case NS_KEY_DELETE_LEFT:
++			dom_key = dom_string_ref(corestring_dom_Backspace);
++			break;
+ 		case NS_KEY_LEFT:
+ 			dom_key = dom_string_ref(corestring_dom_ArrowLeft);
+ 			break;
+@@ -171,6 +183,9 @@ bool fire_dom_keyboard_event(dom_string *type, dom_node *target,
+ 		case NS_KEY_TEXT_END:
+ 			dom_key = dom_string_ref(corestring_dom_End);
+ 			break;
++		case NS_KEY_DELETE_RIGHT:
++			dom_key = dom_string_ref(corestring_dom_Delete);
++			break;
+ 		default:
+ 			dom_key = NULL;
+ 			break;
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index e37556b45..532e83719 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1534,10 +1534,89 @@ html_mouse_action(struct content *c,
+  * \param  key	The UCS4 character codepoint
+  * \return true if key handled, false otherwise
+  */
++static bool html_keypress_default(html_content *html, uint32_t key);
++
++
++/**
++ * Whether a key value stands for an editing command rather than a key
++ * (VitaSurf).
++ */
++static bool html_key_is_command(uint32_t key)
++{
++	switch (key) {
++	case NS_KEY_SELECT_ALL:
++	case NS_KEY_COPY_SELECTION:
++	case NS_KEY_DELETE_LINE:
++	case NS_KEY_PASTE:
++	case NS_KEY_CUT_SELECTION:
++	case NS_KEY_CLEAR_SELECTION:
++	case NS_KEY_WORD_LEFT:
++	case NS_KEY_DELETE_WORD_LEFT:
++	case NS_KEY_WORD_RIGHT:
++	case NS_KEY_DELETE_WORD_RIGHT:
++	case NS_KEY_DELETE_LINE_END:
++	case NS_KEY_DELETE_LINE_START:
++	case NS_KEY_UNDO:
++	case NS_KEY_REDO:
++		return true;
++	default:
++		return false;
++	}
++}
++
++
++/**
++ * Whether a key is one the browser itself moves about with (VitaSurf).
++ */
++static bool html_key_is_navigation(uint32_t key)
++{
++	switch (key) {
++	case NS_KEY_LEFT:
++	case NS_KEY_RIGHT:
++	case NS_KEY_UP:
++	case NS_KEY_DOWN:
++	case NS_KEY_PAGE_UP:
++	case NS_KEY_PAGE_DOWN:
++	case NS_KEY_TEXT_START:
++	case NS_KEY_TEXT_END:
++	case NS_KEY_LINE_START:
++	case NS_KEY_LINE_END:
++		return true;
++	default:
++		return false;
++	}
++}
++
++
++/* Exported interface, documented in html/private.h */
++dom_node *html_focused_node(html_content *html)
++{
++	switch (html->focus_type) {
++	case HTML_FOCUS_TEXTAREA:
++		if (html->focus_owner.textarea != NULL &&
++		    html->focus_owner.textarea->gadget != NULL) {
++			return (dom_node *)
++				html->focus_owner.textarea->gadget->node;
++		}
++		return NULL;
++
++	case HTML_FOCUS_CONTENT:
++		if (html->focus_owner.content != NULL) {
++			return html->focus_owner.content->node;
++		}
++		return NULL;
++
++	default:
++		return NULL;
++	}
++}
++
++
+ bool html_keypress(struct content *c, uint32_t key)
+ {
+ 	html_content *html = (html_content *) c;
+-	struct selection *sel = html->sel;
++	dom_node *target;
++	bool handled;
+ 
+ 	/** \todo
+ 	 * At the moment, the front end interface for keypress only gives
+@@ -1570,10 +1649,64 @@ bool html_keypress(struct content *c, uint32_t key)
+ 	 * `event.preventDefault()` then we won't handle the event when
+ 	 * we're not supposed to.
+ 	 */
+-	if (html->layout != NULL && html->layout->node != NULL) {
+-		fire_dom_keyboard_event(corestring_dom_keydown,
+-				html->layout->node, true, true, key);
++	/*
++	 * The key events go to whatever has the focus, as they do in
++	 * any browser, and only to the root element when nothing does
++	 * (VitaSurf). They used to go to the root always, so a listener
++	 * on a text field, which is where a page puts one, never heard
++	 * a key at all: a search box that filters as you type, a form
++	 * that submits on Enter and a dialog that closes on Escape all
++	 * did nothing. keyup follows the default action, as the spec
++	 * orders them; keypress goes with keydown for the printable
++	 * keys that still have one.
++	 */
++	target = html_focused_node(html);
++	if (target == NULL && html->layout != NULL) {
++		target = html->layout->node;
+ 	}
++	if (html_key_is_command(key)) {
++		/* a clipboard or editing command a front end sends as a
++		 * key value of its own; no key on a keyboard says this,
++		 * so the page hears nothing (VitaSurf) */
++		target = NULL;
++	}
++
++	if (target != NULL) {
++		if (fire_dom_keyboard_event(corestring_dom_keydown,
++				target, true, true, key) == false &&
++		    html_key_is_navigation(key) == false) {
++			/*
++			 * The page handled it itself. The keys that move
++			 * about the page are the exception: the Vita has
++			 * only a D-pad to move the focus with, and a page
++			 * that takes the arrow keys for itself would
++			 * leave nothing to browse with (VitaSurf).
++			 */
++			return true;
++		}
++		if (key >= 0x0020 && key != 0x007F) {
++			fire_dom_keyboard_event(corestring_dom_keypress,
++					target, true, true, key);
++		}
++	}
++
++	handled = html_keypress_default(html, key);
++
++	if (target != NULL) {
++		fire_dom_keyboard_event(corestring_dom_keyup,
++				target, true, false, key);
++	}
++
++	return handled;
++}
++
++
++/**
++ * What a key does when the page has not handled it itself.
++ */
++static bool html_keypress_default(html_content *html, uint32_t key)
++{
++	struct selection *sel = html->sel;
+ 
+ 	switch (html->focus_type) {
+ 	case HTML_FOCUS_CONTENT:
+@@ -1730,8 +1863,31 @@ void html_set_focus(html_content *html, html_focus_type focus_type,
+ 		break;
+ 	}
+ 
+-	html->focus_type = focus_type;
+-	html->focus_owner = focus_owner;
++	{
++		/*
++		 * Tell the page which of its elements has the focus, as
++		 * a browser does: a field that styles itself while it is
++		 * being typed into, or a menu that closes when the focus
++		 * leaves it, waits for these (VitaSurf).
++		 */
++		dom_node *was = html_focused_node(html);
++		dom_node *now;
++
++		html->focus_type = focus_type;
++		html->focus_owner = focus_owner;
++
++		now = html_focused_node(html);
++		if (was != now) {
++			if (was != NULL) {
++				fire_generic_dom_event(corestring_dom_blur,
++						was, false, false);
++			}
++			if (now != NULL) {
++				fire_generic_dom_event(corestring_dom_focus,
++						now, false, false);
++			}
++		}
++	}
+ 
+ 	if (textarea_lost_focus) {
+ 		msg_data.caret.type = CONTENT_CARET_REMOVE;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 1ecfe409f..519edf8de 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -380,6 +380,17 @@ dom_hubbub_error html_process_script(void *ctx, dom_node *node);
+  */
+ dom_node *html_script_running(void);
+ 
++/**
++ * The element the page's input goes to, or NULL (VitaSurf).
++ *
++ * This is what document.activeElement answers with, and where the key
++ * events are fired.
++ *
++ * \param html The html content
++ * \return the focused element's node, or NULL for none
++ */
++dom_node *html_focused_node(html_content *html);
++
+ /**
+  * Fetch a module named by <link rel="modulepreload"> (VitaSurf).
+  *
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index d5a2aa782..30a168721 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -193,6 +193,11 @@ CORESTRING_DOM_STRING(afterprint);
+ CORESTRING_DOM_STRING(align);
+ CORESTRING_DOM_STRING(alt);
+ CORESTRING_DOM_STRING(area);
++/* the key names of the keys that are not a character (VitaSurf) */
++CORESTRING_DOM_STRING(Enter);
++CORESTRING_DOM_STRING(Tab);
++CORESTRING_DOM_STRING(Backspace);
++CORESTRING_DOM_STRING(Delete);
+ CORESTRING_DOM_STRING(ArrowDown);
+ CORESTRING_DOM_STRING(ArrowLeft);
+ CORESTRING_DOM_STRING(ArrowRight);
