@@ -169,8 +169,13 @@ drawn under the first, outer or inset; `::first-letter` gets a box of
 its own holding the leading punctuation and first character in the
 pseudo element's style, floated when the style floats it and inline
 otherwise; and `position: sticky` pins horizontally against `left`
-and `right` as it did vertically. `::first-line` remains unread, since
-a line is not known until layout.
+and `right` as it did vertically. Patch 0101 reads `::first-line`: a
+line is not known until it is laid out, so a block's first line is
+laid out once to find which text runs it holds, each of those is given
+the first-line style composed over its own, and the line is laid out
+again in that; a run that no longer fits goes back to its own style
+on the line after. `text-transform` in a first-line style is not
+applied, since the text was shaped at construction.
 
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic

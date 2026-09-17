@@ -1,0 +1,200 @@
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index dd919b60e..7bfb60494 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -109,8 +109,10 @@ typedef enum {
+ 	GRID_CONTAINER = 1 << 13, /* flex box laid out as a CSS grid (VitaSurf) */
+ 	CLAMP_ELLIPSIS = 1 << 15, /* last text run of a line-clamped block:
+ 				   * painted with an ellipsis (VitaSurf) */
+-	OVERFLOW_VIEWPORT = 1 << 14 /* overflow propagates to the viewport, so
++	OVERFLOW_VIEWPORT = 1 << 14, /* overflow propagates to the viewport, so
+ 				      * the box itself is visible (VitaSurf) */
++	FIRST_LINE = 1 << 16	/* text on its block's first line, set in
++				 * first_line_style (VitaSurf) */
+ } box_flags;
+ 
+ 
+@@ -312,6 +314,13 @@ struct box {
+ 	int sticky_dy;
+ 	int sticky_dx;		/**< the same across, for left and right */
+ 
++	/**
++	 * The box's style composed with its block's ::first-line style
++	 * (VitaSurf), made when the box first lands on that line and kept;
++	 * used while the FIRST_LINE flag is set.
++	 */
++	css_computed_style *first_line_style;
++
+ 	/**
+ 	 * The box's CSS filter, read from the style when the box is
+ 	 * built (VitaSurf); NULL when there is none. Owned by the box.
+@@ -494,5 +503,18 @@ struct box {
+ 
+ };
+ 
++/**
++ * The style a text box is measured and painted with (VitaSurf): its
++ * block's ::first-line style composed over its own while it sits on
++ * that line, its own otherwise.
++ */
++static inline const css_computed_style *box_text_style(const struct box *b)
++{
++	if ((b->flags & FIRST_LINE) && b->first_line_style != NULL)
++		return b->first_line_style;
++	return b->style;
++}
++
++
+ 
+ #endif
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index 7fb64b1db..312e6fb95 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -114,6 +114,7 @@ box_create(css_select_results *styles,
+ 	box->x = box->y = 0;
+ 	box->sticky_dy = 0;
+ 	box->sticky_dx = 0;
++	box->first_line_style = NULL;
+ 	box->filter = NULL;
+ 	box->width = UNKNOWN_WIDTH;
+ 	box->height = 0;
+@@ -245,6 +246,8 @@ void box_free_box(struct box *box)
+ 			scrollbar_destroy(box->scroll_y);
+ 		if (box->styles != NULL)
+ 			css_select_results_destroy(box->styles);
++		if (box->first_line_style != NULL)
++			css_computed_style_destroy(box->first_line_style);
+ 	}
+ 
+ 	talloc_free(box);
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 1321428f3..88e91c204 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2851,7 +2851,8 @@ layout_line(struct box *first,
+ 			continue;
+ 
+ 		assert(b->style != NULL);
+-		font_plot_style_from_css(&content->unit_len_ctx, b->style, &fstyle);
++		font_plot_style_from_css(&content->unit_len_ctx,
++				box_text_style(b), &fstyle);
+ 
+ 		x += space_after;
+ 
+@@ -3103,7 +3104,8 @@ layout_line(struct box *first,
+ 				if (b->space == UNKNOWN_WIDTH) {
+ 					font_plot_style_from_css(
+ 							&content->unit_len_ctx,
+-							b->style, &fstyle);
++							box_text_style(b),
++							&fstyle);
+ 					/** \todo handle errors */
+ 					font_func->width(&fstyle, " ", 1,
+ 							 &b->space);
+@@ -3257,7 +3259,7 @@ layout_line(struct box *first,
+ 		    !split_box->gadget && split_box->text) {
+ 
+ 			font_plot_style_from_css(&content->unit_len_ctx,
+-					split_box->style, &fstyle);
++					box_text_style(split_box), &fstyle);
+ 			/** \todo handle errors */
+ 			font_func->split(&fstyle,
+ 					 split_box->text,
+@@ -3306,7 +3308,8 @@ layout_line(struct box *first,
+ 				    layout_may_break_word(split_box)) {
+ 					font_plot_style_from_css(
+ 						&content->unit_len_ctx,
+-						split_box->style, &fstyle);
++						box_text_style(split_box),
++						&fstyle);
+ 					if (font_func->position(&fstyle,
+ 							split_box->text,
+ 							split_box->length,
+@@ -3542,6 +3545,7 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ 	struct box *c, *next;
+ 	int y = 0;
+ 	int curwidth,maxwidth = width;
++	const css_computed_style *first_line_style = NULL;
+ 
+ 	assert(inline_container->type == BOX_INLINE_CONTAINER);
+ 
+@@ -3602,6 +3606,16 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ 			clamp = FIXTOINT(clamp);
+ 	}
+ 
++	/* the block's ::first-line style, raw, if it has one (VitaSurf) */
++	{
++		struct box *owner = inline_container->parent;
++
++		if (owner != NULL && owner->styles != NULL &&
++				owner->children == inline_container)
++			first_line_style = owner->styles->styles[
++					CSS_PSEUDO_ELEMENT_FIRST_LINE];
++	}
++
+ 	for (c = inline_container->children; c; ) {
+ 
+ 		NSLOG(layout, DEBUG, "c %p", c);
+@@ -3610,6 +3624,47 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ 		if (!layout_line(c, &curwidth, &y, cx, cy + y, cont, first_line,
+ 				has_text_children, content, &next))
+ 			return false;
++
++		/*
++		 * ::first-line (VitaSurf): a line is not known until it is
++		 * laid out, so the first line is laid out once to find
++		 * which boxes it holds, those are given the first-line
++		 * style over their own, and it is laid out again in that.
++		 * A box that no longer fits after the change goes back to
++		 * its own style on the line after.
++		 */
++		if (first_line && first_line_style != NULL) {
++			struct box *b;
++			int y0 = 0;
++
++			for (b = c; b != NULL && b != next; b = b->next) {
++				if (b->type != BOX_TEXT || b->style == NULL)
++					continue;
++				if (b->first_line_style == NULL &&
++						css_computed_style_compose(
++							b->style,
++							first_line_style,
++							&content->unit_len_ctx,
++							&b->first_line_style)
++						!= CSS_OK)
++					b->first_line_style = NULL;
++				if (b->first_line_style == NULL)
++					continue;
++				b->flags |= FIRST_LINE;
++				b->flags &= ~MEASURED;
++			}
++			curwidth = inline_container->width;
++			if (!layout_line(c, &curwidth, &y0, cx, cy, cont,
++					true, has_text_children, content,
++					&next))
++				return false;
++			y = y0;
++			for (b = next; b != NULL; b = b->next) {
++				if (b->flags & FIRST_LINE) {
++					b->flags &= ~(FIRST_LINE | MEASURED);
++				}
++			}
++		}
+ 		maxwidth = max(maxwidth,curwidth);
+ 		lines++;
+ 		if (clamp > 0 && lines == clamp) {
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index dc0cb70bd..8fc2b971d 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1700,7 +1700,8 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 	bool excluded = (box->object != NULL);
+ 	plot_font_style_t fstyle;
+ 
+-	font_plot_style_from_css(&html->unit_len_ctx, box->style, &fstyle);
++	font_plot_style_from_css(&html->unit_len_ctx, box_text_style(box),
++			&fstyle);
+ 	fstyle.background = current_background_color;
+ 
+ 	/*
