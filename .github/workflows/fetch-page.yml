@@ -45,7 +45,10 @@ jobs:
           import re, sys, os, hashlib, urllib.request, urllib.parse, html as htmlmod
           url, out = sys.argv[1], sys.argv[2]
           cookie = sys.argv[3] if len(sys.argv) > 3 else ''
-          UA = 'Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
+          # the string the Vita build sends (utils/useragent.c), so a
+          # site's device detection makes the same choice it makes there
+          UA = ('Mozilla/5.0 (PlayStation Vita 3.73; Mobile) '
+                'AppleWebKit/536.26 (KHTML, like Gecko) Silk/3.2 Mobile Safari/536.26')
           def get(u):
               headers = {'User-Agent': UA, 'Accept': '*/*', 'Accept-Language': 'en'}
               if cookie:
