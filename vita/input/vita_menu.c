@@ -51,6 +51,11 @@ extern fbtk_widget_t *fbtk;
 #define COLOUR_ROW       0xFFF0F0F0
 #define COLOUR_ROW_TEXT  0xFF202020
 #define COLOUR_HEAD_TEXT 0xFFFFFFFF
+/* the same menu with the dark mode option on: it stayed light rows on
+ * a grey window when every page had gone dark */
+#define COLOUR_DARK_BG       0xFF1B1B1B
+#define COLOUR_DARK_ROW      0xFF2C2C2C
+#define COLOUR_DARK_ROW_TEXT 0xFFE8E8E8
 
 #define MAX_BOOKMARKS    200
 #define MAX_HISTORY      300
@@ -91,6 +96,7 @@ static bool bookmarks_loaded;
 static uint64_t last_autosave_us;
 
 static void update_labels(void);
+static bool build(void);
 static void save_choices(void);
 
 /* ------------------------------------------------------------------------ */
@@ -596,6 +602,14 @@ static void activate(enum item item)
 		nsoption_set_bool(prefer_dark_mode,
 				  !nsoption_bool(prefer_dark_mode));
 		save_choices();
+		/* the menu itself follows the option: rebuilt in the new
+		 * colours, and shown again where it was */
+		fbtk_destroy_widget(menu);
+		menu = NULL;
+		if (build()) {
+			fbtk_set_mapping(menu, true);
+			fbtk_request_redraw(fbtk);
+		}
 		update_labels();
 		break;
 	case ITEM_QUIT:
@@ -721,13 +735,18 @@ static bool build(void)
 		return true;
 	}
 
-	menu = fbtk_create_window(fbtk, x, y, MENU_WIDTH, height, COLOUR_BG);
+	bool dark = nsoption_bool(prefer_dark_mode);
+	colour bg = dark ? COLOUR_DARK_BG : COLOUR_BG;
+	colour row = dark ? COLOUR_DARK_ROW : COLOUR_ROW;
+	colour row_text = dark ? COLOUR_DARK_ROW_TEXT : COLOUR_ROW_TEXT;
+
+	menu = fbtk_create_window(fbtk, x, y, MENU_WIDTH, height, bg);
 	if (menu == NULL) {
 		return false;
 	}
 
 	w = fbtk_create_text(menu, MENU_PAD, MENU_PAD, MENU_WIDTH - 2 * MENU_PAD,
-			     MENU_HEADER - MENU_PAD, COLOUR_BG, COLOUR_HEAD_TEXT,
+			     MENU_HEADER - MENU_PAD, bg, COLOUR_HEAD_TEXT,
 			     false);
 	fbtk_set_text(w, "VitaSurf   (D-pad, Cross, Circle closes)");
 
@@ -736,7 +755,7 @@ static bool build(void)
 						  MENU_HEADER + i * MENU_ROW_HEIGHT,
 						  MENU_WIDTH - 2 * MENU_PAD,
 						  MENU_ROW_HEIGHT - 4,
-						  COLOUR_ROW, COLOUR_ROW_TEXT,
+						  row, row_text,
 						  row_click, (void *)(intptr_t)i);
 	}
 

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!-- Stylesheets a script adds after the page has loaded: a <link>
+     appended to the head, a <style> appended with its text already set,
+     and a <style> whose text is changed. Each square should turn from
+     grey to a colour within a second: the first to dark blue, the
+     second to orange, the third to green. -->
+<html><head><style>.sq{width:60px;height:60px;margin:8px;background:#ccc}
+#s3{}</style><style id="s3">#c{background:#ccc}</style></head><body>
+<div id="a" class="sq"></div><div id="b" class="sq"></div><div id="c" class="sq"></div>
+<script>
+setTimeout(function(){
+ var l=document.createElement('link');l.rel='stylesheet';l.href='dynsheet.css';document.head.appendChild(l);
+ var s=document.createElement('style');s.textContent='#b{background:#f80}';document.head.appendChild(s);
+ document.getElementById('s3').textContent='#c{background:#0a0}';
+},300);
+</script></body></html>

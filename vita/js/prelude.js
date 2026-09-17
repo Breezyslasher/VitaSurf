@@ -1302,6 +1302,45 @@ Event.prototype.stopImmediatePropagation=function(){this.cancelBubble=true;this.
 function CustomEvent(type,init){Event.call(this,type,init);this.detail=init?init.detail:null;}CustomEvent.prototype=Object.create(Event.prototype);
 CustomEvent.prototype.initCustomEvent=function(t,b,c,d){this.initEvent(t,b,c);this.detail=d;};
 W.Event=Event;W.CustomEvent=CustomEvent;
+/*
+ * A constructible EventTarget. The C side had aliased the name to the
+ * Node constructor, which refuses "new", so a page that builds a plain
+ * event emitter -- github.com's performance timeline keeps one as a
+ * class field -- rejected with "Illegal constructor". Nodes keep their
+ * own listener methods on Node.prototype; this is the base under it,
+ * so a node is still an instanceof EventTarget.
+ */
+function EventTarget(){}
+function etOpts(o){return {cap:!!(o&&typeof o==='object'?o.capture:o),
+ once:!!(o&&typeof o==='object'&&o.once)};}
+EventTarget.prototype.addEventListener=function(type,fn,opts){
+ if(fn===null||fn===undefined)return;
+ var m=priv(this,'__etl',function(){return {};}),o=etOpts(opts),
+  l=m[type]||(m[type]=[]),i;
+ for(i=0;i<l.length;i++)if(l[i].fn===fn&&l[i].cap===o.cap)return;
+ l.push({fn:fn,cap:o.cap,once:o.once});};
+EventTarget.prototype.removeEventListener=function(type,fn,opts){
+ var m=this.__etl,o=etOpts(opts);
+ if(!m||!m[type])return;
+ m[type]=m[type].filter(function(x){return !(x.fn===fn&&x.cap===o.cap);});};
+EventTarget.prototype.dispatchEvent=function(e){
+ if(!e||typeof e.type!=='string')
+  throw new TypeError('EventTarget.dispatchEvent: argument is not an Event');
+ var m=this.__etl,l=m&&m[e.type]?m[e.type].slice():[],i,x,self=this;
+ try{e.target=this;}catch(x1){}
+ try{e.currentTarget=this;}catch(x2){}
+ for(i=0;i<l.length;i++){
+  x=l[i];
+  if(x.once)self.removeEventListener(e.type,x.fn,x.cap);
+  try{
+   if(typeof x.fn==='function')x.fn.call(self,e);
+   else if(x.fn&&typeof x.fn.handleEvent==='function')x.fn.handleEvent(e);
+  }catch(err){try{console.log('uncaught in listener: '+err);}catch(x3){}}
+  if(e.__stopNow)break;}
+ try{e.currentTarget=null;}catch(x4){}
+ return !(e.cancelable&&e.defaultPrevented);};
+try{Object.setPrototypeOf(P,EventTarget.prototype);}catch(e){}
+W.EventTarget=EventTarget;
 /* The event interfaces. A page names one to say what kind of event a
  * handler takes -- YouTube annotates a wheel handler with WheelEvent --
  * so the name has to exist even where nothing here will ever construct
