@@ -1,0 +1,90 @@
+diff --git a/content/handlers/html/box_textarea.c b/content/handlers/html/box_textarea.c
+index d08660030..b831c2b0a 100644
+--- a/content/handlers/html/box_textarea.c
++++ b/content/handlers/html/box_textarea.c
+@@ -38,6 +38,7 @@
+ #include "html/box_textarea.h"
+ #include "html/font.h"
+ #include "html/form_internal.h"
++#include "javascript/js.h"
+ 
+ 
+ nserror box_textarea_keypress(html_content *html, struct box *box, uint32_t key)
+@@ -248,6 +249,19 @@ static void box_textarea_callback(void *data, struct textarea_msg *msg)
+ 		form_gadget_update_value(gadget,
+ 					 strndup(msg->data.modified.text,
+ 						 msg->data.modified.len));
++		/*
++		 * The page hears about typing through an input event, as
++		 * in any browser. Without it a framework that mirrors the
++		 * field into its own state (Svelte's bind:value, React's
++		 * controlled inputs) never saw the text, and wrote its
++		 * own empty value back over it at the next render
++		 * (VitaSurf).
++		 */
++		if (html->jsthread != NULL && gadget->node != NULL) {
++			js_fire_event(html->jsthread, "input",
++				      html->document,
++				      (struct dom_node *) gadget->node);
++		}
+ 		break;
+ 	}
+ }
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 69952b934..f1cf8b7cb 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -153,6 +153,23 @@ html_process_new_script(html_content *c,
+ 	return nscript;
+ }
+ 
++
++/*
++ * A script fetch that finishes after the page was laid out was the last
++ * thing the page was waiting for (VitaSurf). The callbacks below only
++ * knew to begin the conversion, so a fetch a running page started -- a
++ * module a dynamic import went and got, a chunk a script appended --
++ * left it READY with nothing active for good, and a layout rebuild
++ * waits for DONE: every change the scripts made after that stayed off
++ * the screen.
++ */
++static void script_fetch_settled(html_content *c)
++{
++	if (c->base.status == CONTENT_STATUS_READY && c->base.active == 0) {
++		html_proceed_to_done(c);
++	}
++}
++
+ /**
+  * Callback for asyncronous scripts
+  */
+@@ -221,8 +238,12 @@ convert_script_async_cb(hlcache_handle *script,
+ 	 * scripts as they come in.
+ 	 */
+ 	else if (parent->conversion_begun) {
+-		return html_script_exec(parent, false);
++		nserror err = html_script_exec(parent, false);
++
++		script_fetch_settled(parent);
++		return err;
+ 	}
++	script_fetch_settled(parent);
+ 
+ 	return NSERROR_OK;
+ }
+@@ -285,6 +306,7 @@ convert_script_defer_cb(hlcache_handle *script,
+ 	if (html_can_begin_conversion(parent)) {
+ 		html_begin_conversion(parent);
+ 	}
++	script_fetch_settled(parent);
+ 
+ 	return NSERROR_OK;
+ }
+@@ -644,6 +666,7 @@ convert_script_preload_cb(hlcache_handle *script,
+ 	    html_can_begin_conversion(parent)) {
+ 		html_begin_conversion(parent);
+ 	}
++	script_fetch_settled(parent);
+ 
+ 	return NSERROR_OK;
+ }

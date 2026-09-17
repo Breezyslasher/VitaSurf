@@ -1,0 +1,471 @@
+diff --git a/src/parse/properties/margin.c b/src/parse/properties/margin.c
+index 1ee56f7..05c4805 100644
+--- a/src/parse/properties/margin.c
++++ b/src/parse/properties/margin.c
+@@ -31,18 +31,28 @@ css_error css__parse_margin(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result)
+ {
+-	int32_t orig_ctx = *ctx;
+-	int prev_ctx;
++	/*
++	 * Each value is parsed by the longhand's own parser, so whatever
++	 * it takes -- a calc(), which the old unit-specifier loop refused,
++	 * so that Tailwind's p-8 and m-4 (a calc() of --spacing) set
++	 * nothing -- the shorthand takes too. A first pass over a scratch
++	 * style counts the values, then each side is parsed again into
++	 * the result from the value that is its own (VitaSurf).
++	 */
++	static const enum css_properties_e side[4] = {
++		CSS_PROP_MARGIN_TOP, CSS_PROP_MARGIN_RIGHT, CSS_PROP_MARGIN_BOTTOM, CSS_PROP_MARGIN_LEFT
++	};
++	static const uint8_t pick[5][4] = {
++		{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}
++	};
++	int32_t orig_ctx = *ctx, end, at[4];
++	uint32_t n = 0, i;
+ 	const css_token *token;
+-	uint16_t side_val[4];
+-	css_fixed side_length[4];
+-	uint32_t side_unit[4];
+-	uint32_t side_count = 0;
+-	bool match;
+-	css_error error;
++	css_style *scratch = NULL;
+ 	enum flag_value flag_value;
++	css_error error;
+ 
+-	/* Firstly, handle inherit */
++	/* Firstly, handle inherit and the other keywords */
+ 	token = parserutils_vector_peek(vector, *ctx);
+ 	if (token == NULL)
+ 		return CSS_INVALID;
+@@ -50,116 +60,54 @@ css_error css__parse_margin(css_language *c,
+ 	flag_value = get_css_flag_value(c, token);
+ 
+ 	if (flag_value != FLAG_VALUE__NONE) {
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_MARGIN_TOP);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_MARGIN_RIGHT);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_MARGIN_BOTTOM);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_MARGIN_LEFT);
+-		if (error == CSS_OK)
+-			parserutils_vector_iterate(vector, ctx);
+-
+-		return error;
++		for (i = 0; i < 4; i++) {
++			error = css_stylesheet_style_flag_value(result,
++					flag_value, side[i]);
++			if (error != CSS_OK)
++				return error;
++		}
++		parserutils_vector_iterate(vector, ctx);
++		return CSS_OK;
+ 	}
+ 
+-	/* Attempt to parse up to 4 widths */
+-	do {
+-		prev_ctx = *ctx;
+-
+-		flag_value = get_css_flag_value(c, token);
++	error = css__stylesheet_style_create(c->sheet, &scratch);
++	if (error != CSS_OK)
++		return error;
+ 
+-		if ((token != NULL) && flag_value != FLAG_VALUE__NONE) {
++	/* Count the values, up to four */
++	while (n < 4) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL || tokenIsChar(token, '!'))
++			break;
++		if (is_css_inherit(c, token)) {
++			css__stylesheet_style_destroy(scratch);
+ 			*ctx = orig_ctx;
+ 			return CSS_INVALID;
+ 		}
+-
+-		if ((token->type == CSS_TOKEN_IDENT) && (lwc_string_caseless_isequal(token->idata, c->strings[AUTO], &match) == lwc_error_ok && match)) {
+-			side_val[side_count] =  MARGIN_AUTO;
+-			parserutils_vector_iterate(vector, ctx);
+-			error = CSS_OK;
+-		} else {
+-			side_val[side_count] = MARGIN_SET;
+-
+-			error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX, &side_length[side_count], &side_unit[side_count]);
+-			if (error == CSS_OK) {
+-				if (side_unit[side_count] & UNIT_ANGLE||
+-				    side_unit[side_count] & UNIT_TIME||
+-				    side_unit[side_count] & UNIT_FREQ) {
+-					*ctx = orig_ctx;
+-					return CSS_INVALID;
+-				}
+-			}
+-		}
+-
+-		if (error == CSS_OK) {
+-			side_count++;
+-
+-			consumeWhitespace(vector, ctx);
+-
+-			token = parserutils_vector_peek(vector, *ctx);
+-		} else {
+-			/* Forcibly cause loop to exit */
+-			token = NULL;
+-		}
+-	} while ((*ctx != prev_ctx) && (token != NULL) && (side_count < 4));
+-
+-
+-#define SIDE_APPEND(OP,NUM)								\
+-	error = css__stylesheet_style_appendOPV(result, (OP), 0, side_val[(NUM)]);	\
+-	if (error != CSS_OK)								\
+-		break;									\
+-	if (side_val[(NUM)] == MARGIN_SET) {						\
+-		error = css__stylesheet_style_append(result, side_length[(NUM)]);	\
+-		if (error != CSS_OK)							\
+-			break;								\
+-		error = css__stylesheet_style_append(result, side_unit[(NUM)]);		\
+-		if (error != CSS_OK)							\
+-			break;								\
++		at[n] = *ctx;
++		if (css__parse_margin_side(c, vector, ctx, scratch, side[0]) != CSS_OK)
++			break;
++		n++;
+ 	}
++	css__stylesheet_style_destroy(scratch);
+ 
+-	switch (side_count) {
+-	case 1:
+-		SIDE_APPEND(CSS_PROP_MARGIN_TOP, 0);
+-		SIDE_APPEND(CSS_PROP_MARGIN_RIGHT, 0);
+-		SIDE_APPEND(CSS_PROP_MARGIN_BOTTOM, 0);
+-		SIDE_APPEND(CSS_PROP_MARGIN_LEFT, 0);
+-		break;
+-	case 2:
+-		SIDE_APPEND(CSS_PROP_MARGIN_TOP, 0);
+-		SIDE_APPEND(CSS_PROP_MARGIN_RIGHT, 1);
+-		SIDE_APPEND(CSS_PROP_MARGIN_BOTTOM, 0);
+-		SIDE_APPEND(CSS_PROP_MARGIN_LEFT, 1);
+-		break;
+-	case 3:
+-		SIDE_APPEND(CSS_PROP_MARGIN_TOP, 0);
+-		SIDE_APPEND(CSS_PROP_MARGIN_RIGHT, 1);
+-		SIDE_APPEND(CSS_PROP_MARGIN_BOTTOM, 2);
+-		SIDE_APPEND(CSS_PROP_MARGIN_LEFT, 1);
+-		break;
+-	case 4:
+-		SIDE_APPEND(CSS_PROP_MARGIN_TOP, 0);
+-		SIDE_APPEND(CSS_PROP_MARGIN_RIGHT, 1);
+-		SIDE_APPEND(CSS_PROP_MARGIN_BOTTOM, 2);
+-		SIDE_APPEND(CSS_PROP_MARGIN_LEFT, 3);
+-		break;
+-	default:
+-		error = CSS_INVALID;
++	if (n == 0) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
+ 	}
++	end = *ctx;
+ 
+-	if (error != CSS_OK)
+-		*ctx = orig_ctx;
++	for (i = 0; i < 4; i++) {
++		*ctx = at[pick[n][i]];
++		error = css__parse_margin_side(c, vector, ctx, result, side[i]);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++	}
++	*ctx = end;
+ 
+-	return error;
++	return CSS_OK;
+ }
+ 
+diff --git a/src/parse/properties/padding.c b/src/parse/properties/padding.c
+index a87ffa5..761abf8 100644
+--- a/src/parse/properties/padding.c
++++ b/src/parse/properties/padding.c
+@@ -31,16 +31,28 @@ css_error css__parse_padding(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result)
+ {
+-	int32_t orig_ctx = *ctx;
+-	int prev_ctx;
++	/*
++	 * Each value is parsed by the longhand's own parser, so whatever
++	 * it takes -- a calc(), which the old unit-specifier loop refused,
++	 * so that Tailwind's p-8 and m-4 (a calc() of --spacing) set
++	 * nothing -- the shorthand takes too. A first pass over a scratch
++	 * style counts the values, then each side is parsed again into
++	 * the result from the value that is its own (VitaSurf).
++	 */
++	static const enum css_properties_e side[4] = {
++		CSS_PROP_PADDING_TOP, CSS_PROP_PADDING_RIGHT, CSS_PROP_PADDING_BOTTOM, CSS_PROP_PADDING_LEFT
++	};
++	static const uint8_t pick[5][4] = {
++		{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}
++	};
++	int32_t orig_ctx = *ctx, end, at[4];
++	uint32_t n = 0, i;
+ 	const css_token *token;
+-	css_fixed side_length[4];
+-	uint32_t side_unit[4];
+-	uint32_t side_count = 0;
++	css_style *scratch = NULL;
+ 	enum flag_value flag_value;
+ 	css_error error;
+ 
+-	/* Firstly, handle inherit */
++	/* Firstly, handle inherit and the other keywords */
+ 	token = parserutils_vector_peek(vector, *ctx);
+ 	if (token == NULL)
+ 		return CSS_INVALID;
+@@ -48,107 +60,54 @@ css_error css__parse_padding(css_language *c,
+ 	flag_value = get_css_flag_value(c, token);
+ 
+ 	if (flag_value != FLAG_VALUE__NONE) {
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_PADDING_TOP);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_PADDING_RIGHT);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_PADDING_BOTTOM);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_PADDING_LEFT);
+-		if (error == CSS_OK)
+-			parserutils_vector_iterate(vector, ctx);
+-
+-		return error;
++		for (i = 0; i < 4; i++) {
++			error = css_stylesheet_style_flag_value(result,
++					flag_value, side[i]);
++			if (error != CSS_OK)
++				return error;
++		}
++		parserutils_vector_iterate(vector, ctx);
++		return CSS_OK;
+ 	}
+ 
+-	/* Attempt to parse up to 4 widths */
+-	do {
+-		prev_ctx = *ctx;
++	error = css__stylesheet_style_create(c->sheet, &scratch);
++	if (error != CSS_OK)
++		return error;
+ 
+-		if ((token != NULL) && is_css_inherit(c, token)) {
++	/* Count the values, up to four */
++	while (n < 4) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL || tokenIsChar(token, '!'))
++			break;
++		if (is_css_inherit(c, token)) {
++			css__stylesheet_style_destroy(scratch);
+ 			*ctx = orig_ctx;
+ 			return CSS_INVALID;
+ 		}
++		at[n] = *ctx;
++		if (css__parse_padding_side(c, vector, ctx, scratch, side[0]) != CSS_OK)
++			break;
++		n++;
++	}
++	css__stylesheet_style_destroy(scratch);
+ 
+-		error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX, &side_length[side_count], &side_unit[side_count]);
+-		if (error == CSS_OK) {
+-			if (side_unit[side_count] & UNIT_ANGLE ||
+-			    side_unit[side_count] & UNIT_TIME ||
+-			    side_unit[side_count] & UNIT_FREQ) {
+-				*ctx = orig_ctx;
+-				return CSS_INVALID;
+-			}
+-
+-			if (side_length[side_count] < 0) {
+-				*ctx = orig_ctx;
+-				return CSS_INVALID;
+-			}
+-
+-			side_count++;
+-
+-			consumeWhitespace(vector, ctx);
++	if (n == 0) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++	end = *ctx;
+ 
+-			token = parserutils_vector_peek(vector, *ctx);
+-		} else {
+-			/* Forcibly cause loop to exit */
+-			token = NULL;
++	for (i = 0; i < 4; i++) {
++		*ctx = at[pick[n][i]];
++		error = css__parse_padding_side(c, vector, ctx, result, side[i]);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
+ 		}
+-	} while ((*ctx != prev_ctx) && (token != NULL) && (side_count < 4));
+-
+-#define SIDE_APPEND(OP,NUM)							\
+-	error = css__stylesheet_style_appendOPV(result, (OP), 0, PADDING_SET);	\
+-	if (error != CSS_OK)							\
+-		break;								\
+-	error = css__stylesheet_style_append(result, side_length[(NUM)]);	\
+-	if (error != CSS_OK)							\
+-		break;								\
+-	error = css__stylesheet_style_append(result, side_unit[(NUM)]);		\
+-	if (error != CSS_OK)							\
+-		break;
+-
+-	switch (side_count) {
+-	case 1:
+-		SIDE_APPEND(CSS_PROP_PADDING_TOP, 0);
+-		SIDE_APPEND(CSS_PROP_PADDING_RIGHT, 0);
+-		SIDE_APPEND(CSS_PROP_PADDING_BOTTOM, 0);
+-		SIDE_APPEND(CSS_PROP_PADDING_LEFT, 0);
+-		break;
+-	case 2:
+-		SIDE_APPEND(CSS_PROP_PADDING_TOP, 0);
+-		SIDE_APPEND(CSS_PROP_PADDING_RIGHT, 1);
+-		SIDE_APPEND(CSS_PROP_PADDING_BOTTOM, 0);
+-		SIDE_APPEND(CSS_PROP_PADDING_LEFT, 1);
+-		break;
+-	case 3:
+-		SIDE_APPEND(CSS_PROP_PADDING_TOP, 0);
+-		SIDE_APPEND(CSS_PROP_PADDING_RIGHT, 1);
+-		SIDE_APPEND(CSS_PROP_PADDING_BOTTOM, 2);
+-		SIDE_APPEND(CSS_PROP_PADDING_LEFT, 1);
+-		break;
+-	case 4:
+-		SIDE_APPEND(CSS_PROP_PADDING_TOP, 0);
+-		SIDE_APPEND(CSS_PROP_PADDING_RIGHT, 1);
+-		SIDE_APPEND(CSS_PROP_PADDING_BOTTOM, 2);
+-		SIDE_APPEND(CSS_PROP_PADDING_LEFT, 3);
+-		break;
+-	default:
+-		error = CSS_INVALID;
+-		break;
+ 	}
++	*ctx = end;
+ 
+-	if (error != CSS_OK)
+-		*ctx = orig_ctx;
+-
+-	return error;
++	return CSS_OK;
+ }
+ 
+diff --git a/src/select/calc.c b/src/select/calc.c
+index 25ff0b6..b427222 100644
+--- a/src/select/calc.c
++++ b/src/select/calc.c
+@@ -322,7 +322,16 @@ css_error css_calculator_calculate(css_calculator *calc,
+ 		return CSS_INVALID;
+ 	}
+ 
+-	*unit_out = css__to_css_unit(calc->stack[0].unit);
++	/* A plain number has no unit to report. It was handed back as
++	 * CSS_UNIT_PX, which is what the mapping gives anything unknown, so
++	 * line-height: calc(1.75 / 1.125) became a line a pixel and a half
++	 * tall. It is marked instead, and the caller decides what a number
++	 * means for its property (VitaSurf). */
++	if (calc->stack[0].unit == UNIT_CALC_NUMBER) {
++		*unit_out = CSS_UNIT_CALC;
++	} else {
++		*unit_out = css__to_css_unit(calc->stack[0].unit);
++	}
+ 	*value_out = calc->stack[0].value;
+ 
+ 	return CSS_OK;
+diff --git a/src/select/computed.c b/src/select/computed.c
+index bb3ac24..01b76b7 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -1183,8 +1183,10 @@ static bool css__length_to_px(
+ 		}
+ 		/* The calculator normalises every length to CSS pixels,
+ 		 * whatever the units in the expression, so one last
+-		 * conversion puts the answer in device pixels. */
+-		if (unit == CSS_UNIT_PX) {
++		 * conversion puts the answer in device pixels. A plain
++		 * number (CSS_UNIT_CALC) is not a length at all; where one
++		 * is not meaningful it is read as pixels. */
++		if (unit == CSS_UNIT_PX || unit == CSS_UNIT_CALC) {
+ 			value.value = css_unit_len2device_px(style, unit_ctx,
+ 					value.value, CSS_UNIT_PX);
+ 		}
+@@ -1283,7 +1285,48 @@ COMPUTED_LENGTH_PX_ZERO(min_width, CSS_MIN_WIDTH_SET)
+ COMPUTED_LENGTH_PX_ZERO(min_height, CSS_MIN_HEIGHT_SET)
+ COMPUTED_LENGTH_PX_ZERO(text_indent, CSS_TEXT_INDENT_SET)
+ COMPUTED_LENGTH_PX_ZERO(vertical_align, CSS_VERTICAL_ALIGN_SET)
+-COMPUTED_LENGTH_PX_ZERO(line_height, CSS_LINE_HEIGHT_DIMENSION)
++/*
++ * line-height is the one length whose calc() may come out as a plain
++ * number, which means that many times the font size, as the keyword-free
++ * form does: Tailwind writes every text size's line height as
++ * calc(1.75 / 1.125) and the like (VitaSurf).
++ */
++uint8_t css_computed_line_height_px(
++		const css_computed_style *style,
++		const css_unit_ctx *unit_ctx,
++		int available_px,
++		int *px_out)
++{
++	css_fixed_or_calc value = { .value = 0 };
++	css_unit unit = CSS_UNIT_PX;
++	uint8_t type = get_line_height(style, &value, &unit);
++
++	*px_out = 0;
++	if (type == CSS_LINE_HEIGHT_DIMENSION && unit == CSS_UNIT_CALC) {
++		css_unit u = unit;
++		css_fixed v = 0;
++
++		if (css_calculator_calculate(style->calc, unit_ctx,
++				available_px, value.calc, style,
++				&u, &v) != CSS_OK) {
++			return type;
++		}
++		if (u == CSS_UNIT_CALC) {
++			v = css_unit_len2device_px(style, unit_ctx, v,
++					CSS_UNIT_EM);
++		} else if (u == CSS_UNIT_PX) {
++			v = css_unit_len2device_px(style, unit_ctx, v,
++					CSS_UNIT_PX);
++		}
++		*px_out = FIXTOINT(v);
++		return type;
++	}
++	if (type == CSS_LINE_HEIGHT_DIMENSION && css__length_to_px(style,
++			unit_ctx, available_px, value, unit, px_out) == false) {
++		*px_out = 0;
++	}
++	return type;
++}
+ COMPUTED_LENGTH_PX_ZERO(border_top_width, CSS_BORDER_WIDTH_WIDTH)
+ COMPUTED_LENGTH_PX_ZERO(border_right_width, CSS_BORDER_WIDTH_WIDTH)
+ COMPUTED_LENGTH_PX_ZERO(border_bottom_width, CSS_BORDER_WIDTH_WIDTH)
