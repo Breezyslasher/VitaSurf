@@ -1,0 +1,329 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 7f373fb05..a5483834a 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -328,6 +328,8 @@ static void html_get_dimensions(html_content *htmlc)
+ 
+ 	htmlc->media.width  = w;
+ 	htmlc->media.height = h;
++	htmlc->media.orientation = (h > w) ? CSS_MEDIA_ORIENTATION_PORTRAIT :
++			CSS_MEDIA_ORIENTATION_LANDSCAPE;
+ 	htmlc->unit_len_ctx.viewport_width  = w;
+ 	htmlc->unit_len_ctx.viewport_height = h;
+ 	htmlc->unit_len_ctx.device_dpi = device_dpi;
+@@ -484,6 +486,20 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 	c->stylesheets = NULL;
+ 	c->select_ctx = NULL;
+ 	c->media.type = CSS_MEDIA_SCREEN;
++	/* what the media features say about this screen (VitaSurf): a
++	 * touch screen with no hover, a colour display drawn at one
++	 * device pixel per CSS pixel, scripts on */
++	c->media.orientation = CSS_MEDIA_ORIENTATION_LANDSCAPE;
++	c->media.pointer = CSS_MEDIA_POINTER_COARSE;
++	c->media.any_pointer = CSS_MEDIA_POINTER_COARSE;
++	c->media.hover = CSS_MEDIA_HOVER_NONE;
++	c->media.any_hover = CSS_MEDIA_HOVER_NONE;
++	c->media.color = INTTOFIX(8);
++	c->media.scripting = CSS_MEDIA_SCRIPTING_ENABLED;
++	c->media.update = CSS_MEDIA_UPDATE_FREQUENCY_NORMAL;
++	/* dots per inch; css_unit has no resolution unit to name it */
++	c->media.resolution.value = INTTOFIX(96);
++	c->media.resolution.unit = CSS_UNIT_PX;
+ 	c->universal = NULL;
+ 	c->num_objects = 0;
+ 	c->object_list = NULL;
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 7ae2045ff..76d0df295 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -883,6 +883,66 @@ static bool html_redraw_gradient(const char *spec, const struct rect *area,
+ 	if (n < 2)
+ 		return true;
+ 
++	if (kind == 'R') {
++		/*
++		 * A radial gradient as concentric discs (VitaSurf): the
++		 * largest first, at the colour of its outer edge, each
++		 * smaller one painted over it, so what shows of a disc
++		 * is the ring between it and the next. The shape is a
++		 * circle to the farthest corner; an ellipse is drawn as
++		 * that circle.
++		 */
++		int cx = (area->x0 + area->x1) / 2;
++		int cy = (area->y0 + area->y1) / 2;
++		int hw = (area->x1 - area->x0) / 2, hh = (area->y1 - area->y0) / 2;
++		int radius = (int) (sqrtf((float) hw * hw + (float) hh * hh) +
++				0.5f);
++		int discs = radius < 48 ? radius : 48;
++
++		if (radius <= 0)
++			return true;
++		if (ctx->plot->clip(ctx, clip) != NSERROR_OK)
++			return false;
++
++		for (i = discs - 1; i >= 0; i--) {
++			int t = ((2 * i + 1) * 500) / discs;
++			int rad = radius * (i + 1) / discs;
++			int k;
++			unsigned a, r, g, b;
++
++			for (k = 0; k < n - 1 && pos[k + 1] < t; k++)
++				;
++			if (t <= pos[k] || k == n - 1 || pos[k + 1] == pos[k]) {
++				uint32_t c = t <= pos[k] ? colour[k] :
++						colour[k + 1 < n ? k + 1 : k];
++
++				a = c >> 24;
++				r = (c >> 16) & 0xff;
++				g = (c >> 8) & 0xff;
++				b = c & 0xff;
++			} else {
++				int span = pos[k + 1] - pos[k];
++				int w1 = t - pos[k], w0 = span - w1;
++				uint32_t c0 = colour[k], c1 = colour[k + 1];
++
++				a = ((c0 >> 24) * w0 + (c1 >> 24) * w1) / span;
++				r = (((c0 >> 16) & 0xff) * w0 +
++						((c1 >> 16) & 0xff) * w1) / span;
++				g = (((c0 >> 8) & 0xff) * w0 +
++						((c1 >> 8) & 0xff) * w1) / span;
++				b = ((c0 & 0xff) * w0 + (c1 & 0xff) * w1) / span;
++			}
++			if (a == 0)
++				continue;
++			style.fill_colour = ((0xff - a) << 24) | (b << 16) |
++					(g << 8) | r;
++			if (ctx->plot->disc(ctx, &style, cx, cy, rad) !=
++					NSERROR_OK)
++				return false;
++		}
++		return true;
++	}
++
+ 	if (kind != 'L') {
+ 		/* the average, with as much alpha as the stops have */
+ 		unsigned a = 0, r = 0, g = 0, b = 0;
+@@ -2037,7 +2097,101 @@ static int html_sticky_offset(const html_content *html, struct box *box,
+  */
+ static bool html_redraw_shadow_rings(int bx0, int by0, int bx1, int by1,
+ 		int ox, int oy, int blur, int spread, css_color colour,
+-		const struct redraw_context *ctx);
++		bool inward, const struct redraw_context *ctx);
++
++/**
++ * Draw an inset box-shadow (VitaSurf): the padding box is the hole,
++ * shifted by the offset and shrunk by the spread; the shadow is what
++ * lies between the padding edge and that hole, with the blur's rings
++ * across the hole's edge, all clipped to the padding box.
++ */
++static bool html_redraw_inset_shadow(const html_content *html,
++		struct box *box, int px0, int py0, int px1, int py1,
++		float scale, const struct rect *clip,
++		const struct redraw_context *ctx)
++{
++	css_fixed len[4] = { 0, 0, 0, 0 };
++	css_unit unit[4] = { CSS_UNIT_PX, CSS_UNIT_PX, CSS_UNIT_PX,
++			CSS_UNIT_PX };
++	css_color colour = 0;
++	int px[4], i, ox, oy, blur, spread, alpha;
++	struct rect hole, c;
++	plot_style_t pstyle = { .fill_type = PLOT_OP_TYPE_SOLID,
++			.stroke_type = PLOT_OP_TYPE_NONE };
++
++	if (css_computed_box_shadow(box->style, &len[0], &unit[0],
++			&len[1], &unit[1], &len[2], &unit[2],
++			&len[3], &unit[3], &colour) != CSS_BOX_SHADOW_INSET)
++		return true;
++
++	if (colour == 0x00000001)
++		css_computed_color(box->style, &colour);
++	alpha = colour >> 24;
++	if (alpha == 0)
++		return true;
++
++	for (i = 0; i < 4; i++) {
++		px[i] = FIXTOINT(css_unit_len2device_px(box->style,
++				&html->unit_len_ctx, len[i], unit[i]));
++		if (scale != 1.0)
++			px[i] = px[i] * scale;
++	}
++	ox = px[0];
++	oy = px[1];
++	blur = px[2] < 0 ? 0 : px[2];
++	spread = px[3];
++
++	c = *clip;
++	if (c.x0 < px0) c.x0 = px0;
++	if (c.y0 < py0) c.y0 = py0;
++	if (c.x1 > px1) c.x1 = px1;
++	if (c.y1 > py1) c.y1 = py1;
++	if (c.x0 >= c.x1 || c.y0 >= c.y1)
++		return true;
++	if (ctx->plot->clip(ctx, &c) != NSERROR_OK)
++		return false;
++
++	hole.x0 = px0 + ox + spread;
++	hole.y0 = py0 + oy + spread;
++	hole.x1 = px1 + ox - spread;
++	hole.y1 = py1 + oy - spread;
++
++	/* the solid part: between the padding edge and the hole */
++	{
++		struct rect strip[4] = {
++			{ px0, py0, px1, hole.y0 },
++			{ px0, hole.y1, px1, py1 },
++			{ px0, hole.y0, hole.x0, hole.y1 },
++			{ hole.x1, hole.y0, px1, hole.y1 },
++		};
++		int k;
++
++		pstyle.fill_colour = nscss_color_to_ns(colour);
++		for (k = 0; k < 4; k++) {
++			if (strip[k].x1 <= strip[k].x0 ||
++					strip[k].y1 <= strip[k].y0)
++				continue;
++			if (ctx->plot->rectangle(ctx, &pstyle, &strip[k]) !=
++					NSERROR_OK)
++				return false;
++		}
++	}
++
++	if (blur > 0 && hole.x1 > hole.x0 && hole.y1 > hole.y0) {
++		/* the blur: rings from the hole's edge inward by the
++		 * radius, strongest at the edge. The ring painter centres
++		 * its band on the rectangle it is given, so it is given
++		 * the hole shrunk by half the radius. */
++		int reach = blur / 2;
++
++		if (!html_redraw_shadow_rings(hole.x0 + reach, hole.y0 + reach,
++				hole.x1 - reach, hole.y1 - reach, 0, 0, blur,
++				0, colour, true, ctx))
++			return false;
++	}
++
++	return true;
++}
+ 
+ static bool html_redraw_box_shadow(const html_content *html,
+ 		struct box *box, int bx0, int by0, int bx1, int by1,
+@@ -2077,7 +2231,7 @@ static bool html_redraw_box_shadow(const html_content *html,
+ 	spread = px[3];
+ 
+ 	return html_redraw_shadow_rings(bx0, by0, bx1, by1, ox, oy, blur,
+-			spread, colour, ctx);
++			spread, colour, false, ctx);
+ }
+ 
+ /**
+@@ -2087,7 +2241,7 @@ static bool html_redraw_box_shadow(const html_content *html,
+  */
+ static bool html_redraw_shadow_rings(int bx0, int by0, int bx1, int by1,
+ 		int ox, int oy, int blur, int spread, css_color colour,
+-		const struct redraw_context *ctx)
++		bool inward, const struct redraw_context *ctx)
+ {
+ 	plot_style_t pstyle = { .fill_type = PLOT_OP_TYPE_SOLID,
+ 			.stroke_type = PLOT_OP_TYPE_NONE };
+@@ -2110,7 +2264,11 @@ static bool html_redraw_shadow_rings(int bx0, int by0, int bx1, int by1,
+ 		if (blur > 0) {
+ 			inner = -blur / 2 + (i * blur) / bands;
+ 			outer = -blur / 2 + ((i + 1) * blur) / bands;
+-			band_alpha = alpha * (2 * (bands - i) - 1) /
++			/* falling outward for a shadow the box casts,
++			 * inward for one cast into it (VitaSurf) */
++			band_alpha = inward ?
++					alpha * (2 * i + 1) / (2 * bands) :
++					alpha * (2 * (bands - i) - 1) /
+ 					(2 * bands);
+ 		} else {
+ 			inner = 0;
+@@ -2331,7 +2489,7 @@ static nserror html_filter_soft_rect(const struct html_filter_level *lv,
+ 		/* the rings run from blur inside the edge to blur outside:
+ 		 * the painter's band is half its blur argument each side */
+ 		if (!html_redraw_shadow_rings(r->x0, r->y0, r->x1, r->y1,
+-				0, 0, 2 * blur, 0, css, &rctx))
++				0, 0, 2 * blur, 0, css, false, &rctx))
+ 			res = NSERROR_UNKNOWN;
+ 	}
+ 
+@@ -3853,7 +4011,7 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 					box->filter->shadow_x * scale,
+ 					box->filter->shadow_y * scale,
+ 					box->filter->shadow_blur * scale, 0,
+-					box->filter->shadow_colour, ctx))
++					box->filter->shadow_colour, false, ctx))
+ 		return false;
+ 
+ 	bg_box = html_redraw_find_bg_box(box);
+@@ -3929,6 +4087,14 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 					&border_box,
+ 					&html->unit_len_ctx, ctx))
+ 				return false;
++			/* an inset shadow lies on the background, inside
++			 * the padding box (VitaSurf) */
++			if (box->style != NULL &&
++					!html_redraw_inset_shadow(html, box,
++						x, y, x + padding_width,
++						y + padding_height, scale,
++						&p, ctx))
++				return false;
+ 			/* restore previous graphics window */
+ 			if (ctx->plot->clip(ctx, &r) != NSERROR_OK)
+ 				return false;
+@@ -3952,6 +4118,56 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			return false;
+ 	}
+ 
++	/*
++	 * The outline (VitaSurf): a ring outside the border box, drawn
++	 * solid whatever its style says, since it is nearly always a
++	 * focus ring or a one pixel edge. outline-offset is not read.
++	 */
++	if (box->style != NULL && box->type != BOX_TEXT &&
++			box->type != BOX_INLINE && box->type != BOX_INLINE_END &&
++			box->type != BOX_INLINE_CONTAINER &&
++			css_computed_outline_style(box->style) !=
++					CSS_OUTLINE_STYLE_NONE &&
++			css_computed_outline_style(box->style) !=
++					CSS_OUTLINE_STYLE_INHERIT) {
++		css_fixed olen = 0;
++		css_unit ounit = CSS_UNIT_PX;
++		css_color ocol = 0;
++		int ow;
++
++		css_computed_outline_width(box->style, &olen, &ounit);
++		ow = FIXTOINT(css_unit_len2device_px(box->style,
++				&html->unit_len_ctx, olen, ounit)) * scale;
++		if (css_computed_outline_color(box->style, &ocol) !=
++				CSS_OUTLINE_COLOR_COLOR) {
++			css_computed_color(box->style, &ocol);
++		}
++		if (ow > 0 && !nscss_color_is_transparent(ocol)) {
++			plot_style_t ostyle = {
++				.fill_type = PLOT_OP_TYPE_SOLID,
++				.fill_colour = nscss_color_to_ns(ocol),
++				.stroke_type = PLOT_OP_TYPE_NONE,
++			};
++			int ox0 = x - border_left - ow;
++			int oy0 = y - border_top - ow;
++			int ox1 = x + padding_width + border_right + ow;
++			int oy1 = y + padding_height + border_bottom + ow;
++			struct rect ring[4] = {
++				{ ox0, oy0, ox1, oy0 + ow },
++				{ ox0, oy1 - ow, ox1, oy1 },
++				{ ox0, oy0 + ow, ox0 + ow, oy1 - ow },
++				{ ox1 - ow, oy0 + ow, ox1, oy1 - ow },
++			};
++			int k;
++
++			for (k = 0; k < 4; k++) {
++				if (ctx->plot->rectangle(ctx, &ostyle,
++						&ring[k]) != NSERROR_OK)
++					return false;
++			}
++		}
++	}
++
+ 	/* backgrounds and borders for non-replaced inlines */
+ 	if (box->style && box->type == BOX_INLINE && box->inline_end &&
+ 			(html_redraw_box_has_background(box) ||

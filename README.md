@@ -152,7 +152,19 @@ bundled DejaVu faces stand in, as they did before. Each patch has a
 page under `tests/css/` that the monkey frontend checks; none of this
 batch has been verified on hardware yet, and the web font path in
 particular only has its fetch and selection checked there, since the
-monkey has no FreeType.
+monkey has no FreeType. Patches 0097 and 0098 evaluate `@supports`
+at parse time (a declaration test holds when the property is known
+and its value parses, `selector()` holds, `not`, `and` and `or`
+combine, and a block whose condition fails is dropped so its fallback
+applies), answer the media features a page asks about besides its
+size (orientation, hover and pointer as a touch screen with no hover,
+prefers-reduced-motion and its relatives as no preference, resolution
+as one device pixel per CSS pixel, colour, scripting, display-mode),
+paint `outline` as a ring outside the border box, draw inset box
+shadows on the background with their blur fading inward, and paint
+radial gradients as concentric discs instead of their average colour.
+Still not done from that list: `::first-letter` and `::first-line`
+boxes, a second box shadow, and horizontal `position: sticky`.
 
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic

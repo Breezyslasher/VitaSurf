@@ -1,0 +1,688 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 5ab3ded..eda2fa8 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -1364,6 +1364,189 @@ css_error handleEndRuleset(css_language *c, const parserutils_vector *vector)
+  * lookups for them look, and an animation defined inside a media block
+  * is better found unconditionally than not at all.
+  */
++/*
++ * @supports (VitaSurf). The condition is evaluated here, at parse
++ * time, so a block guarded on a feature this browser lacks is dropped
++ * and a fallback written for it applies. "(property: value)" holds
++ * when the property is known and the value parses; "selector(...)"
++ * holds; any other function does not. not, and and or combine as the
++ * specification says, and a general-enclosed thing nobody understands
++ * is false.
++ */
++static css_error supportsCondition(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx, int depth,
++		bool *result);
++
++/** Step past a balanced group, the opening token already consumed. */
++static void supportsSkipGroup(const parserutils_vector *vector, int32_t *ctx)
++{
++	const css_token *t;
++	int depth = 1;
++
++	while (depth > 0 && (t = parserutils_vector_iterate(vector, ctx)) !=
++			NULL) {
++		if (t->type == CSS_TOKEN_FUNCTION || tokenIsChar(t, '('))
++			depth++;
++		else if (tokenIsChar(t, ')'))
++			depth--;
++	}
++}
++
++/** Whether "property: value", read up to the closing bracket, parses. */
++static bool supportsDeclaration(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx)
++{
++	const css_token *ident, *t;
++	css_prop_handler handler = NULL;
++	css_style *style = NULL;
++	int32_t inner;
++	int i;
++	bool ok = false;
++
++	consumeWhitespace(vector, ctx);
++	ident = parserutils_vector_iterate(vector, ctx);
++	if (ident == NULL || ident->type != CSS_TOKEN_IDENT)
++		return false;
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_iterate(vector, ctx);
++	if (t == NULL || !tokenIsChar(t, ':'))
++		return false;
++	consumeWhitespace(vector, ctx);
++
++	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
++		bool match = false;
++
++		if (lwc_string_caseless_isequal(ident->idata, c->strings[i],
++				&match) == lwc_error_ok && match)
++			break;
++	}
++	if (i > LAST_PROP)
++		return false;
++	handler = property_handlers[i - FIRST_PROP];
++
++	if (css__stylesheet_style_create(c->sheet, &style) != CSS_OK)
++		return false;
++	inner = *ctx;
++	if (handler(c, vector, &inner, style) == CSS_OK) {
++		consumeWhitespace(vector, &inner);
++		t = parserutils_vector_peek(vector, inner);
++		ok = t != NULL && tokenIsChar(t, ')');
++	}
++	css__stylesheet_style_destroy(style);
++	return ok;
++}
++
++/** One operand: a bracketed condition or declaration, or a function. */
++static css_error supportsInParens(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx, int depth,
++		bool *result)
++{
++	const css_token *t;
++	int32_t save;
++
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_iterate(vector, ctx);
++	if (t == NULL)
++		return CSS_INVALID;
++
++	if (t->type == CSS_TOKEN_FUNCTION) {
++		bool match;
++
++		/* selector() is taken as supported; font-tech(),
++		 * font-format() and the rest are not */
++		*result = lwc_string_caseless_isequal(t->idata,
++				c->strings[SELECTOR_FN], &match) ==
++				lwc_error_ok && match;
++		supportsSkipGroup(vector, ctx);
++		return CSS_OK;
++	}
++
++	if (!tokenIsChar(t, '('))
++		return CSS_INVALID;
++
++	/* a nested condition, or a declaration */
++	save = *ctx;
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_peek(vector, *ctx);
++	if (t != NULL && (tokenIsChar(t, '(') ||
++			t->type == CSS_TOKEN_FUNCTION ||
++			(t->type == CSS_TOKEN_IDENT &&
++			 nameIs(t->idata, "not")))) {
++		css_error error = supportsCondition(c, vector, ctx,
++				depth + 1, result);
++
++		if (error != CSS_OK)
++			return error;
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_iterate(vector, ctx);
++		if (t == NULL || !tokenIsChar(t, ')'))
++			return CSS_INVALID;
++		return CSS_OK;
++	}
++
++	*ctx = save;
++	*result = supportsDeclaration(c, vector, ctx);
++	/* to the bracket that closes it, whatever was in between */
++	supportsSkipGroup(vector, ctx);
++	return CSS_OK;
++}
++
++static css_error supportsCondition(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx, int depth,
++		bool *result)
++{
++	const css_token *t;
++	bool value;
++	css_error error;
++
++	if (depth > 16)
++		return CSS_INVALID;
++
++	consumeWhitespace(vector, ctx);
++	t = parserutils_vector_peek(vector, *ctx);
++	if (t != NULL && t->type == CSS_TOKEN_IDENT && nameIs(t->idata, "not")) {
++		parserutils_vector_iterate(vector, ctx);
++		error = supportsInParens(c, vector, ctx, depth, &value);
++		if (error != CSS_OK)
++			return error;
++		*result = !value;
++		return CSS_OK;
++	}
++
++	error = supportsInParens(c, vector, ctx, depth, &value);
++	if (error != CSS_OK)
++		return error;
++
++	for (;;) {
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_peek(vector, *ctx);
++		if (t == NULL || t->type != CSS_TOKEN_IDENT)
++			break;
++		if (nameIs(t->idata, "and")) {
++			bool next;
++
++			parserutils_vector_iterate(vector, ctx);
++			error = supportsInParens(c, vector, ctx, depth, &next);
++			if (error != CSS_OK)
++				return error;
++			value = value && next;
++		} else if (nameIs(t->idata, "or")) {
++			bool next;
++
++			parserutils_vector_iterate(vector, ctx);
++			error = supportsInParens(c, vector, ctx, depth, &next);
++			if (error != CSS_OK)
++				return error;
++			value = value || next;
++		} else {
++			break;
++		}
++	}
++
++	*result = value;
++	return CSS_OK;
++}
++
+ static css_error startAtRule(css_language *c, const parserutils_vector *vector,
+ 		css_rule *parent, css_parser_event entry_type)
+ {
+@@ -1629,6 +1812,22 @@ static css_error startAtRule(css_language *c, const parserutils_vector *vector,
+ 		memset(media, 0, sizeof(*media));
+ 		media->negate_type = 1;
+ 
++		if (lwc_string_caseless_isequal(atkeyword->idata,
++				c->strings[SUPPORTS], &match) ==
++				lwc_error_ok && match) {
++			bool supported = true;
++			int32_t sctx = ctx;
++
++			/* a condition that does not hold, or does not
++			 * parse, drops the block: "no media type, not
++			 * negated" is a query nothing matches */
++			if (supportsCondition(c, vector, &sctx, 0,
++					&supported) != CSS_OK ||
++					supported == false) {
++				media->negate_type = 0;
++			}
++		}
++
+ 		error = css__stylesheet_rule_create(c->sheet,
+ 				CSS_RULE_MEDIA, &rule);
+ 		if (error != CSS_OK) {
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index f80b368..28a9385 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -1127,7 +1127,8 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("wavy"),
+ 	SMAP("from-font"),
+ 	SMAP("legacy"),
+-	SMAP("polygon")
++	SMAP("polygon"),
++	SMAP("selector")
+ };
+ 
+ 
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index 853b7f5..8d1b17b 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -383,9 +383,10 @@ enum {
+ 	SKEW_FN, SKEW_X, SKEW_Y,
+ 
+ 	/* box alignment and text decoration keywords, the polygon()
+-	 * clip (VitaSurf) */
++	 * clip, the selector() test of @supports (VitaSurf) */
+ 	SELF_START, SELF_END, SAFE, UNSAFE,
+ 	WAVY, FROM_FONT, LEGACY, POLYGON_FN,
++	SELECTOR_FN,
+ 
+ 	LAST_KNOWN
+ };
+diff --git a/src/select/mq.h b/src/select/mq.h
+index 5a8de6e..ba3d005 100644
+--- a/src/select/mq.h
++++ b/src/select/mq.h
+@@ -160,7 +160,196 @@ static inline bool mq_match_feature(
+ 		return false;
+ 	}
+ 
+-	/* TODO: Look at other feature names. */
++	/*
++	 * The features a page asks about beyond its size (VitaSurf).
++	 * Each reads the media description the client filled in; a
++	 * boolean query holds when the feature is not none or zero.
++	 */
++#define MQ_NAME(field) (lwc_string_isequal(feat->name, str->field, \
++		&match) == lwc_error_ok && match)
++#define MQ_IS(field) (feat->op == CSS_MQ_FEATURE_OP_EQ && \
++		mq_match_feature_eq_ident_op1(feat->op, &feat->value, \
++				str->field))
++
++	if (MQ_NAME(orientation)) {
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return true;
++		if (MQ_IS(portrait))
++			return media->orientation ==
++					CSS_MEDIA_ORIENTATION_PORTRAIT;
++		if (MQ_IS(landscape))
++			return media->orientation ==
++					CSS_MEDIA_ORIENTATION_LANDSCAPE;
++		return false;
++	}
++
++	if (MQ_NAME(hover) || MQ_NAME(any_hover)) {
++		css_media_hover h = MQ_NAME(hover) ? media->hover :
++				media->any_hover;
++
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return h == CSS_MEDIA_HOVER_HOVER;
++		if (MQ_IS(hover))
++			return h == CSS_MEDIA_HOVER_HOVER;
++		if (MQ_IS(none))
++			return h == CSS_MEDIA_HOVER_NONE;
++		return false;
++	}
++
++	if (MQ_NAME(pointer) || MQ_NAME(any_pointer)) {
++		css_media_pointer p = MQ_NAME(pointer) ? media->pointer :
++				media->any_pointer;
++
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return p != CSS_MEDIA_POINTER_NONE;
++		if (MQ_IS(coarse))
++			return p == CSS_MEDIA_POINTER_COARSE;
++		if (MQ_IS(fine))
++			return p == CSS_MEDIA_POINTER_FINE;
++		if (MQ_IS(none))
++			return p == CSS_MEDIA_POINTER_NONE;
++		return false;
++	}
++
++	if (MQ_NAME(prefers_reduced_motion) ||
++			MQ_NAME(prefers_reduced_transparency) ||
++			MQ_NAME(prefers_contrast)) {
++		/* no preference is expressed */
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return false;
++		return MQ_IS(no_preference);
++	}
++
++	if (MQ_NAME(forced_colors) || MQ_NAME(inverted_colors)) {
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return false;
++		return MQ_IS(none);
++	}
++
++	if (MQ_NAME(display_mode)) {
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return true;
++		return MQ_IS(browser);
++	}
++
++	if (MQ_NAME(color_gamut)) {
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return true;
++		return MQ_IS(srgb);
++	}
++
++	if (MQ_NAME(dynamic_range)) {
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return true;
++		return MQ_IS(standard);
++	}
++
++	if (MQ_NAME(scripting)) {
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return media->scripting != CSS_MEDIA_SCRIPTING_NONE;
++		if (MQ_IS(enabled))
++			return media->scripting == CSS_MEDIA_SCRIPTING_ENABLED;
++		if (MQ_IS(none))
++			return media->scripting == CSS_MEDIA_SCRIPTING_NONE;
++		return false;
++	}
++
++	if (MQ_NAME(update)) {
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return media->update != CSS_MEDIA_UPDATE_FREQUENCY_NONE;
++		if (MQ_IS(fast))
++			return media->update ==
++					CSS_MEDIA_UPDATE_FREQUENCY_NORMAL;
++		if (MQ_IS(none))
++			return media->update == CSS_MEDIA_UPDATE_FREQUENCY_NONE;
++		return false;
++	}
++
++	if (MQ_NAME(grid) || MQ_NAME(monochrome)) {
++		/* a bitmap colour screen: both are zero */
++		css_fixed v = MQ_NAME(grid) ? media->grid : media->monochrome;
++
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return v != 0;
++		if (feat->value.type != CSS_MQ_VALUE_TYPE_NUM)
++			return false;
++		return feat->value.data.num_or_ratio == v;
++	}
++
++	if (MQ_NAME(color) || MQ_NAME(min_color)) {
++		css_fixed v = feat->value.data.num_or_ratio;
++
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return media->color != 0;
++		if (feat->value.type != CSS_MQ_VALUE_TYPE_NUM)
++			return false;
++		switch (feat->op) {
++		case CSS_MQ_FEATURE_OP_LT:  return v <  media->color;
++		case CSS_MQ_FEATURE_OP_LTE: return v <= media->color;
++		case CSS_MQ_FEATURE_OP_EQ:  return v == media->color;
++		case CSS_MQ_FEATURE_OP_GTE: return v >= media->color;
++		case CSS_MQ_FEATURE_OP_GT:  return v >  media->color;
++		default: return false;
++		}
++	}
++
++	if (MQ_NAME(resolution) || MQ_NAME(min_resolution) ||
++			MQ_NAME(max_resolution)) {
++		/* both sides in dots per inch: the client's value is read
++		 * as dpi whatever unit it carries, since css_unit has no
++		 * resolution units, and nothing means 96 */
++		css_fixed have = media->resolution.value;
++		css_fixed want;
++		css_mq_feature_op op = feat->op;
++
++		if (have == 0)
++			have = INTTOFIX(96);
++
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return true;
++		if (feat->value.type != CSS_MQ_VALUE_TYPE_DIM)
++			return false;
++		want = feat->value.data.dim.len;
++		switch (feat->value.data.dim.unit) {
++		case UNIT_DPPX: want = FMUL(want, INTTOFIX(96)); break;
++		case UNIT_DPCM: want = FMUL(want, FLTTOFIX(2.54f)); break;
++		case UNIT_DPI: break;
++		default: return false;
++		}
++		switch (op) {
++		case CSS_MQ_FEATURE_OP_LT:  return want <  have;
++		case CSS_MQ_FEATURE_OP_LTE: return want <= have;
++		case CSS_MQ_FEATURE_OP_EQ:  return want == have;
++		case CSS_MQ_FEATURE_OP_GTE: return want >= have;
++		case CSS_MQ_FEATURE_OP_GT:  return want >  have;
++		default: return false;
++		}
++	}
++
++	if (MQ_NAME(aspect_ratio) || MQ_NAME(min_aspect_ratio) ||
++			MQ_NAME(max_aspect_ratio)) {
++		css_fixed have, want;
++
++		if (media->height == 0)
++			return false;
++		have = FDIV(media->width, media->height);
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return true;
++		if (feat->value.type != CSS_MQ_VALUE_TYPE_RATIO &&
++				feat->value.type != CSS_MQ_VALUE_TYPE_NUM)
++			return false;
++		want = feat->value.data.num_or_ratio;
++		switch (feat->op) {
++		case CSS_MQ_FEATURE_OP_LT:  return want <  have;
++		case CSS_MQ_FEATURE_OP_LTE: return want <= have;
++		case CSS_MQ_FEATURE_OP_EQ:  return want == have;
++		case CSS_MQ_FEATURE_OP_GTE: return want >= have;
++		case CSS_MQ_FEATURE_OP_GT:  return want >  have;
++		default: return false;
++		}
++	}
++#undef MQ_NAME
++#undef MQ_IS
+ 
+ 	return false;
+ }
+diff --git a/src/select/strings.c b/src/select/strings.c
+index 9b5fa6b..e2e2f2b 100644
+--- a/src/select/strings.c
++++ b/src/select/strings.c
+@@ -213,6 +213,146 @@ css_error css_select_strings_intern(css_select_strings *str)
+ 	if (error != lwc_error_ok)
+ 		return css_error_from_lwc_error(error);
+ 
++	error = lwc_intern_string("orientation", SLEN("orientation"), &str->orientation);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("portrait", SLEN("portrait"), &str->portrait);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("landscape", SLEN("landscape"), &str->landscape);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("resolution", SLEN("resolution"), &str->resolution);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("min-resolution", SLEN("min-resolution"), &str->min_resolution);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("max-resolution", SLEN("max-resolution"), &str->max_resolution);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("prefers-reduced-motion", SLEN("prefers-reduced-motion"), &str->prefers_reduced_motion);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("prefers-reduced-transparency", SLEN("prefers-reduced-transparency"), &str->prefers_reduced_transparency);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("prefers-contrast", SLEN("prefers-contrast"), &str->prefers_contrast);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("forced-colors", SLEN("forced-colors"), &str->forced_colors);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("no-preference", SLEN("no-preference"), &str->no_preference);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("reduce", SLEN("reduce"), &str->reduce);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("none", SLEN("none"), &str->none);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("pointer", SLEN("pointer"), &str->pointer);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("any-pointer", SLEN("any-pointer"), &str->any_pointer);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("any-hover", SLEN("any-hover"), &str->any_hover);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("coarse", SLEN("coarse"), &str->coarse);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("fine", SLEN("fine"), &str->fine);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("display-mode", SLEN("display-mode"), &str->display_mode);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("browser", SLEN("browser"), &str->browser);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("color", SLEN("color"), &str->color);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("min-color", SLEN("min-color"), &str->min_color);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("color-gamut", SLEN("color-gamut"), &str->color_gamut);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("srgb", SLEN("srgb"), &str->srgb);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("monochrome", SLEN("monochrome"), &str->monochrome);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("scripting", SLEN("scripting"), &str->scripting);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("update", SLEN("update"), &str->update);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("fast", SLEN("fast"), &str->fast);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("dynamic-range", SLEN("dynamic-range"), &str->dynamic_range);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("standard", SLEN("standard"), &str->standard);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("inverted-colors", SLEN("inverted-colors"), &str->inverted_colors);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("grid", SLEN("grid"), &str->grid);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("aspect-ratio", SLEN("aspect-ratio"), &str->aspect_ratio);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("min-aspect-ratio", SLEN("min-aspect-ratio"), &str->min_aspect_ratio);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string("max-aspect-ratio", SLEN("max-aspect-ratio"), &str->max_aspect_ratio);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
+ 	return CSS_OK;
+ }
+ 
+@@ -252,4 +392,39 @@ void css_select_strings_unref(css_select_strings *str)
+ 	lwc_string_unref(str->inline_size);
+ 	lwc_string_unref(str->block_size);
+ 	lwc_string_unref(str->prefers_color_scheme);
++	lwc_string_unref(str->orientation);
++	lwc_string_unref(str->portrait);
++	lwc_string_unref(str->landscape);
++	lwc_string_unref(str->resolution);
++	lwc_string_unref(str->min_resolution);
++	lwc_string_unref(str->max_resolution);
++	lwc_string_unref(str->prefers_reduced_motion);
++	lwc_string_unref(str->prefers_reduced_transparency);
++	lwc_string_unref(str->prefers_contrast);
++	lwc_string_unref(str->forced_colors);
++	lwc_string_unref(str->no_preference);
++	lwc_string_unref(str->reduce);
++	lwc_string_unref(str->none);
++	lwc_string_unref(str->pointer);
++	lwc_string_unref(str->any_pointer);
++	lwc_string_unref(str->any_hover);
++	lwc_string_unref(str->coarse);
++	lwc_string_unref(str->fine);
++	lwc_string_unref(str->display_mode);
++	lwc_string_unref(str->browser);
++	lwc_string_unref(str->color);
++	lwc_string_unref(str->min_color);
++	lwc_string_unref(str->color_gamut);
++	lwc_string_unref(str->srgb);
++	lwc_string_unref(str->monochrome);
++	lwc_string_unref(str->scripting);
++	lwc_string_unref(str->update);
++	lwc_string_unref(str->fast);
++	lwc_string_unref(str->dynamic_range);
++	lwc_string_unref(str->standard);
++	lwc_string_unref(str->inverted_colors);
++	lwc_string_unref(str->grid);
++	lwc_string_unref(str->aspect_ratio);
++	lwc_string_unref(str->min_aspect_ratio);
++	lwc_string_unref(str->max_aspect_ratio);
+ }
+diff --git a/src/select/strings.h b/src/select/strings.h
+index 2caeb50..ce030bb 100644
+--- a/src/select/strings.h
++++ b/src/select/strings.h
+@@ -48,6 +48,43 @@ typedef struct {
+ 	lwc_string *inline_size;
+ 	lwc_string *block_size;
+ 	lwc_string *prefers_color_scheme;
++	/* The media features a page asks about besides its size, and
++	 * the keywords they take (VitaSurf) */
++	lwc_string *orientation;
++	lwc_string *portrait;
++	lwc_string *landscape;
++	lwc_string *resolution;
++	lwc_string *min_resolution;
++	lwc_string *max_resolution;
++	lwc_string *prefers_reduced_motion;
++	lwc_string *prefers_reduced_transparency;
++	lwc_string *prefers_contrast;
++	lwc_string *forced_colors;
++	lwc_string *no_preference;
++	lwc_string *reduce;
++	lwc_string *none;
++	lwc_string *pointer;
++	lwc_string *any_pointer;
++	lwc_string *any_hover;
++	lwc_string *coarse;
++	lwc_string *fine;
++	lwc_string *display_mode;
++	lwc_string *browser;
++	lwc_string *color;
++	lwc_string *min_color;
++	lwc_string *color_gamut;
++	lwc_string *srgb;
++	lwc_string *monochrome;
++	lwc_string *scripting;
++	lwc_string *update;
++	lwc_string *fast;
++	lwc_string *dynamic_range;
++	lwc_string *standard;
++	lwc_string *inverted_colors;
++	lwc_string *grid;
++	lwc_string *aspect_ratio;
++	lwc_string *min_aspect_ratio;
++	lwc_string *max_aspect_ratio;
+ } css_select_strings;
+ 
+ css_error css_select_strings_intern(css_select_strings *str);
