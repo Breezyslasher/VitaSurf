@@ -1,3 +1,2 @@
-url=https://m.youtube.com/
-name=ytm-dark2
-cookie=PREF=f6=400
+url=https://github.githubassets.com/assets/chunk-3m-a5bd6eb6538dbb98.js
+name=gh-chunk-3m
