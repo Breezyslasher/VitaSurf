@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<!-- An empty @font-face rule, and one made only of descriptors libcss
+     does not parse, must not crash font lookup for a family no rule
+     names. Expected: two lines of text in the default font. -->
+<html><head><style>
+@font-face {}
+@font-face { font-display: swap; unicode-range: U+0000-00FF; }
+@font-face { font-family: "Real"; src: url(nope.woff2); }
+p { font-family: "Nope", sans-serif }
+q { font-family: "Real" }
+</style></head><body><p>first line</p><p><q>second line</q></p></body></html>

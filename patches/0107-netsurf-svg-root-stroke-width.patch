@@ -1,0 +1,100 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 97e9496bd..18f4c0e67 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -2082,7 +2082,8 @@ static bool svg_paint_value(uint8_t type, css_color colour,
+ /** Write fill and stroke from the style, and say which ones it wrote. */
+ static void svg_paint_attributes(struct svg_buf *b,
+ 				 const css_computed_style *style,
+-				 bool *wrote_fill, bool *wrote_stroke)
++				 bool *wrote_fill, bool *wrote_stroke,
++				 bool *wrote_stroke_width)
+ {
+ 	css_color colour = 0;
+ 	char value[8];
+@@ -2090,6 +2091,7 @@ static void svg_paint_attributes(struct svg_buf *b,
+ 
+ 	*wrote_fill = false;
+ 	*wrote_stroke = false;
++	*wrote_stroke_width = false;
+ 
+ 	if (style == NULL) {
+ 		return;
+@@ -2111,26 +2113,45 @@ static void svg_paint_attributes(struct svg_buf *b,
+ 
+ 	colour = 0;
+ 	type = css_computed_stroke(style, &colour);
+-	if (svg_paint_value(type, colour, style, value)) {
++	/*
++	 * "none" is stroke's initial value, so a style that never
++	 * mentioned stroke reads the same as one that turned it off, and
++	 * writing it here put stroke="none" on the root ahead of the
++	 * markup's own stroke, which was then skipped as already written:
++	 * every icon drawn as an outline -- Lucide's, Feather's, the
++	 * eye on a password field -- vanished (VitaSurf). The markup's
++	 * attribute stands unless the stylesheet names a colour.
++	 */
++	if (type != CSS_STROKE_NONE &&
++	    svg_paint_value(type, colour, style, value)) {
+ 		svg_buf_lit(b, " stroke=\"");
+ 		svg_buf_lit(b, value);
+ 		svg_buf_lit(b, "\"");
+ 		*wrote_stroke = true;
+ 	}
+ 
+-	/* stroke-width from the stylesheet, in user units (VitaSurf) */
++	/*
++	 * stroke-width from the stylesheet, in user units (VitaSurf).
++	 * Its initial value, 1px, is skipped like fill's black: a style
++	 * that never mentioned it reads the same as one that asked for
++	 * it, and writing it put a second stroke-width on a root whose
++	 * markup carried its own, which no XML parser accepts, so the
++	 * whole icon was dropped.
++	 */
+ 	{
+ 		css_fixed width = 0;
+ 		css_unit unit = CSS_UNIT_PX;
+ 
+ 		if (css_computed_stroke_width(style, &width, &unit) ==
+-				CSS_STROKE_WIDTH_SET && unit != CSS_UNIT_PCT) {
++				CSS_STROKE_WIDTH_SET && unit != CSS_UNIT_PCT &&
++		    !(width == INTTOFIX(1) && unit == CSS_UNIT_PX)) {
+ 			char w[48];
+ 
+ 			snprintf(w, sizeof(w), " stroke-width=\"%d.%03d\"",
+ 					FIXTOINT(width),
+ 					(int) ((width & 0x3ff) * 1000 / 1024));
+ 			svg_buf_lit(b, w);
++			*wrote_stroke_width = true;
+ 		}
+ 	}
+ }
+@@ -2166,6 +2187,7 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 	dom_exception exc;
+ 	uint32_t i, n = 0;
+ 	bool wrote_fill = false, wrote_stroke = false;
++	bool wrote_stroke_width = false;
+ 
+ 	if (root) {
+ 		/*
+@@ -2178,7 +2200,8 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 		 */
+ 		svg_buf_lit(b, " xmlns=\"http://www.w3.org/2000/svg\""
+ 			       " xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+-		svg_paint_attributes(b, style, &wrote_fill, &wrote_stroke);
++		svg_paint_attributes(b, style, &wrote_fill, &wrote_stroke,
++				     &wrote_stroke_width);
+ 	}
+ 
+ 	exc = dom_node_get_attributes(node, &attrs);
+@@ -2209,7 +2232,9 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 			    !(wrote_fill && nl == 4 &&
+ 			      strncmp(nd, "fill", 4) == 0) &&
+ 			    !(wrote_stroke && nl == 6 &&
+-			      strncmp(nd, "stroke", 6) == 0)) {
++			      strncmp(nd, "stroke", 6) == 0) &&
++			    !(wrote_stroke_width && nl == 12 &&
++			      strncmp(nd, "stroke-width", 12) == 0)) {
+ 				svg_buf_lit(b, " ");
+ 				svg_buf_append(b, nd, nl);
+ 				svg_buf_lit(b, "=\"");

@@ -1,0 +1,20 @@
+diff --git a/src/select/select.c b/src/select/select.c
+index 1adb9de..458adda 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -2042,6 +2042,15 @@ static css_error _select_font_face_from_rule(
+ 		css_select_font_faces_state *state,
+ 		const css_select_strings *str)
+ {
++	/*
++	 * The descriptor block is only made when the first descriptor is
++	 * parsed, so "@font-face {}" and a rule made only of descriptors
++	 * this parser does not know have none, and named no family
++	 * anyway (VitaSurf).
++	 */
++	if (rule->font_face == NULL)
++		return CSS_OK;
++
+ 	if (mq_rule_good_for_media((const css_rule *) rule,
+ 			state->unit_ctx, state->media, str)) {
+ 		bool correct_family = false;

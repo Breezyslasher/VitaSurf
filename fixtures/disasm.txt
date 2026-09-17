@@ -1,7 +1,8 @@
 run=35196497294
 artifact=VitaSurf-elf-294
-offset=0x1ed33
-offset=0x1ef5f
-offset=0x24e57
-offset=0x1f41d
-offset=0xa54f
+offset=0x3b44f6
+offset=0x3b43e9
+offset=0x1be85b
+offset=0x1bea43
+offset=0x19a1ab
+offset=0x1a5a9b
