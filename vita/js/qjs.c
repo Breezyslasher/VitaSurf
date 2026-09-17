@@ -168,6 +168,7 @@ struct jsthread {
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
 	bool relayout_off;        /**< document too large to rebuild */
+	unsigned relayout_waits;  /**< retries spent waiting on fetches */
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
 	unsigned relayout_ms;     /**< how long the last rebuild took */
 	unsigned js_scripts;      /**< scripts executed for this page */
@@ -660,6 +661,9 @@ static void mark_dirty(JSContext *ctx)
 	}
 }
 
+static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv);
+
 static JSValue win_vita_dom_gen(JSContext *ctx, JSValueConst this_val,
 				int argc, JSValueConst *argv)
 {
@@ -1107,6 +1111,29 @@ static JSValue node_get_node_value(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_node_value(node, &s);
 	if (s == NULL) return JS_NULL;
 	return str_result(ctx, s);
+}
+
+/*
+ * nodeValue = x on a text or comment node is the same as data = x; on
+ * anything else it does nothing. There was no setter at all, so the
+ * value went into a plain property that shadowed the getter and the
+ * node kept its old text: Svelte 5 writes every text node this way,
+ * and Immich's login page came up with no words on it.
+ */
+static JSValue node_set_node_value(JSContext *ctx, JSValueConst this_val,
+				   JSValueConst val)
+{
+	struct dom_node *node = this_node(ctx, this_val);
+	dom_node_type type = DOM_ELEMENT_NODE;
+
+	if (node == NULL) return JS_EXCEPTION;
+	dom_node_get_node_type(node, &type);
+	if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
+	    type == DOM_CDATA_SECTION_NODE ||
+	    type == DOM_PROCESSING_INSTRUCTION_NODE) {
+		return node_set_text_content(ctx, this_val, val);
+	}
+	return JS_UNDEFINED;
 }
 
 /* --- node methods --- */
@@ -1917,6 +1944,20 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 					      &fragment) != DOM_HUBBUB_OK) {
 		goto out;
 	}
+	/*
+	 * The fragment parser has no context element and starts as if at
+	 * the top of a page, where whitespace is thrown away until the
+	 * body opens: "<!> <!> <!>" came back as three comments with no
+	 * text between them, and Svelte, which walks a template's nodes
+	 * by count, stepped off the end. An element's markup is what goes
+	 * inside a body, so open one first. (Chromium's fragment parser
+	 * starts in the same "in body" mode for a div.)
+	 */
+	if (node != (struct dom_node *)doc &&
+	    dom_hubbub_parser_parse_chunk(parser, (const uint8_t *)"<body>",
+					  6) != DOM_HUBBUB_OK) {
+		goto out;
+	}
 	if (dom_hubbub_parser_parse_chunk(parser, (const uint8_t *)html,
 					  len) != DOM_HUBBUB_OK) {
 		goto out;
@@ -2405,7 +2446,7 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CGETSET_DEF("lastChild", node_get_last_child, NULL),
 	JS_CGETSET_DEF("previousSibling", node_get_previous_sibling, NULL),
 	JS_CGETSET_DEF("childNodes", node_get_child_nodes, NULL),
-	JS_CGETSET_DEF("nodeValue", node_get_node_value, NULL),
+	JS_CGETSET_DEF("nodeValue", node_get_node_value, node_set_node_value),
 	JS_CGETSET_DEF("attributes", node_get_attributes, NULL),
 	JS_CFUNC_DEF("getAttribute", 1, node_get_attribute),
 	JS_CFUNC_DEF("setAttribute", 2, node_set_attribute),
@@ -2715,8 +2756,9 @@ static JSValue doc_create_document_fragment(JSContext *ctx, JSValueConst this_va
 }
 
 /*
- * document.currentScript: the <script src> whose URL matches the script
- * being executed. Inline scripts cannot be told apart, so they read null.
+ * document.currentScript: the inline script element NetSurf is running,
+ * or the <script src> whose URL matches the script being executed.
+ * SvelteKit's bootstrap reads its parent element from it.
  */
 static JSValue doc_get_current_script(JSContext *ctx, JSValueConst this_val)
 {
@@ -2727,6 +2769,10 @@ static JSValue doc_get_current_script(JSContext *ctx, JSValueConst this_val)
 	JSValue r = JS_NULL;
 
 	(void)this_val;
+	/* an inline script: NetSurf keeps the element while it runs */
+	if (html_script_running() != NULL) {
+		return wrap_node(ctx, html_script_running());
+	}
 	if (doc == NULL || thread->current_script == NULL ||
 	    thread->htmlc->base_url == NULL ||
 	    strchr(thread->current_script, ':') == NULL) {
@@ -3363,10 +3409,19 @@ static void relayout_callback(void *p)
 	 */
 	if (htmlc->base.status != CONTENT_STATUS_DONE ||
 	    htmlc->base.active > 0) {
+		/* a fetch that never ends would hold the rebuild off for
+		 * good, and the page would look blank with nothing said */
+		if (++thread->relayout_waits == 20) {
+			vita_log("qjs: layout rebuild waiting on the page: "
+				 "status %d, %d fetches active",
+				 (int)htmlc->base.status,
+				 (int)htmlc->base.active);
+		}
 		guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
 		thread->relayout_pending = true;
 		return;
 	}
+	thread->relayout_waits = 0;
 
 	if (thread->dom_elements == 0) {
 		struct dom_document *doc = thread_document(thread);
@@ -4828,6 +4883,9 @@ static void setup_globals(jsthread *thread)
 	/* layout geometry, scrolling and event dispatch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFind",
 			  JS_NewCFunction(ctx, win_vita_find, "__vitaFind", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaModuleState",
+			  JS_NewCFunction(ctx, win_vita_module_state,
+					  "__vitaModuleState", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaDomGen",
 			  JS_NewCFunction(ctx, win_vita_dom_gen, "__vitaDomGen", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
@@ -6221,6 +6279,192 @@ static const char *without_retry_suffix(const char *url, char *buf, size_t len)
 	return buf;
 }
 
+/*
+ * A dynamic import() in page code is rewritten to __vitaImport(base, spec)
+ * before the source is compiled. QuickJS asks its loader for the module
+ * synchronously, and the loader can only hand over source the page has
+ * already received: a module still on its way (SvelteKit's bootstrap
+ * imports two the head is preloading) failed on the spot, and nothing
+ * retried it. The helper in the prelude asks __vitaModuleState until the
+ * module has arrived and only then does the real import.
+ */
+static bool is_ident_char(unsigned char c)
+{
+	return isalnum(c) || c == '_' || c == '$' || c >= 0x80;
+}
+
+/*
+ * Find the next "import (" that is code: not part of a longer name, and
+ * not inside a string, a template or a comment. A regular expression
+ * literal holding the word is not told apart, and is not expected.
+ * Returns the offset of "import", with *paren the offset of the "(",
+ * or len when there is none.
+ */
+static size_t next_dynamic_import(const char *src, size_t len, size_t from,
+				  size_t *paren)
+{
+	size_t i = from;
+
+	while (i < len) {
+		char c = src[i];
+
+		if (c == '"' || c == '\'' || c == '`') {
+			char q = c;
+
+			for (i++; i < len && src[i] != q; i++) {
+				if (src[i] == '\\') i++;
+			}
+			i++;
+		} else if (c == '/' && i + 1 < len && src[i + 1] == '/') {
+			while (i < len && src[i] != '\n') i++;
+		} else if (c == '/' && i + 1 < len && src[i + 1] == '*') {
+			const char *e = memmem(src + i + 2, len - i - 2, "*/", 2);
+
+			i = e != NULL ? (size_t)(e - src) + 2 : len;
+		} else if (c == 'i' && len - i >= 6 &&
+			   memcmp(src + i, "import", 6) == 0 &&
+			   (i == 0 || !is_ident_char((unsigned char)src[i - 1])) &&
+			   !(len - i > 6 && is_ident_char((unsigned char)src[i + 6]))) {
+			size_t q = i + 6;
+
+			while (q < len && (src[q] == ' ' || src[q] == '\t' ||
+					   src[q] == '\n' || src[q] == '\r')) {
+				q++;
+			}
+			if (q < len && src[q] == '(') {
+				*paren = q;
+				return i;
+			}
+			i = q;
+		} else {
+			i++;
+		}
+	}
+	return len;
+}
+
+static char *rewrite_dynamic_imports(const char *src, size_t len,
+				     const char *name, size_t *outlen)
+{
+	size_t count = 0, namelen, extra, o = 0, i, at, paren;
+	char *out, *ename;
+
+	/* count first, so the copy is made in one piece */
+	for (at = next_dynamic_import(src, len, 0, &paren); at < len;
+	     at = next_dynamic_import(src, len, paren + 1, &paren)) {
+		count++;
+	}
+	if (count == 0) {
+		return NULL;
+	}
+	/* the base name, as a JS string literal */
+	namelen = strlen(name);
+	ename = malloc(namelen * 2 + 1);
+	if (ename == NULL) {
+		return NULL;
+	}
+	for (i = 0; i < namelen; i++) {
+		unsigned char c = (unsigned char)name[i];
+
+		if (c == '"' || c == '\\') {
+			ename[o++] = '\\';
+			ename[o++] = c;
+		} else if (c < 0x20) {
+			ename[o++] = ' ';
+		} else {
+			ename[o++] = c;
+		}
+	}
+	ename[o] = 0;
+	/* "import(" -> "__vitaImport("<name>"," */
+	extra = strlen("__vitaImport(\"\",") + o;
+	out = malloc(len + count * extra + 1);
+	if (out == NULL) {
+		free(ename);
+		return NULL;
+	}
+	o = 0;
+	i = 0;
+	for (at = next_dynamic_import(src, len, 0, &paren); at < len;
+	     at = next_dynamic_import(src, len, paren + 1, &paren)) {
+		memcpy(out + o, src + i, at - i);
+		o += at - i;
+		o += (size_t)sprintf(out + o, "__vitaImport(\"%s\",", ename);
+		i = paren + 1;
+	}
+	memcpy(out + o, src + i, len - i);
+	o += len - i;
+	out[o] = 0;
+	*outlen = o;
+	free(ename);
+	return out;
+}
+
+/*
+ * __vitaModuleState(base, specifier) -> {url, state}: whether the module
+ * a dynamic import names is "done" (its source is here), "arriving" (a
+ * fetch is under way, started here if nothing had it), or "none" (it
+ * cannot be fetched, so the import may as well fail now).
+ */
+static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *base = NULL, *spec = NULL, *state = "none";
+	char *url = NULL;
+	JSValue r;
+	unsigned int i;
+
+	(void)this_val;
+	if (argc < 2 || thread == NULL || thread->closed) {
+		return JS_ThrowTypeError(ctx, "__vitaModuleState(base, spec)");
+	}
+	base = JS_ToCString(ctx, argv[0]);
+	spec = JS_ToCString(ctx, argv[1]);
+	if (base != NULL && spec != NULL) {
+		url = qjs_module_normalize(ctx, base, spec, NULL);
+	}
+	r = JS_NewObject(ctx);
+	JS_SetPropertyStr(ctx, r, "url",
+			  JS_NewString(ctx, url != NULL ? url :
+				       spec != NULL ? spec : ""));
+	if (url != NULL && thread->htmlc != NULL) {
+		bool found = false;
+
+		for (i = 0; i < thread->htmlc->scripts_count; i++) {
+			struct html_script *sc = &thread->htmlc->scripts[i];
+
+			if (sc->type == HTML_SCRIPT_INLINE ||
+			    sc->data.handle == NULL ||
+			    strcmp(nsurl_access(hlcache_handle_get_url(
+					sc->data.handle)), url) != 0) {
+				continue;
+			}
+			found = true;
+			state = content_get_status(sc->data.handle) ==
+				CONTENT_STATUS_DONE ? "done" : "arriving";
+			break;
+		}
+		if (!found && strstr(url, "://") != NULL) {
+			dom_string *href = to_dom_string(url);
+
+			if (href != NULL) {
+				if (html_process_module_preload(thread->htmlc,
+								href)) {
+					thread->js_import_fetches++;
+					state = "arriving";
+				}
+				dom_string_unref(href);
+			}
+		}
+	}
+	JS_SetPropertyStr(ctx, r, "state", JS_NewString(ctx, state));
+	if (url != NULL) js_free(ctx, url);
+	if (base != NULL) JS_FreeCString(ctx, base);
+	if (spec != NULL) JS_FreeCString(ctx, spec);
+	return r;
+}
+
 static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 				      void *opaque)
 {
@@ -6279,14 +6523,33 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 			}
 			memcpy(src, data, size);
 			src[size] = 0;
-			fn = JS_Eval(ctx, src, size, name,
-				     JS_EVAL_TYPE_MODULE |
-				     JS_EVAL_FLAG_COMPILE_ONLY);
-			free(src);
-			if (JS_IsException(fn)) {
-				vita_log("qjs: module '%s' did not compile",
-					 name);
-				return NULL;
+			{
+				size_t rwlen = 0;
+				char *rw = rewrite_dynamic_imports(src, size,
+								   name, &rwlen);
+
+				if (rw != NULL) {
+					free(src);
+					src = rw;
+					size = rwlen;
+				}
+			}
+			{
+				unsigned missed = thread->js_imports_missed;
+
+				fn = JS_Eval(ctx, src, size, name,
+					     JS_EVAL_TYPE_MODULE |
+					     JS_EVAL_FLAG_COMPILE_ONLY);
+				free(src);
+				if (JS_IsException(fn)) {
+					/* a static import of its own that is
+					 * not here yet was already logged */
+					if (thread->js_imports_missed == missed) {
+						vita_log("qjs: module '%s' did "
+							 "not compile", name);
+					}
+					return NULL;
+				}
 			}
 			set_import_meta(ctx, fn, name);
 			m = JS_VALUE_GET_PTR(fn);
@@ -6574,6 +6837,16 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	src[txtlen] = 0;
 	if (name == NULL) {
 		name = "<script>";
+	}
+	{
+		size_t rwlen = 0;
+		char *rw = rewrite_dynamic_imports(src, txtlen, name, &rwlen);
+
+		if (rw != NULL) {
+			free(src);
+			src = rw;
+			txtlen = rwlen;
+		}
 	}
 	begin_script(thread);
 	thread->current_script = name;

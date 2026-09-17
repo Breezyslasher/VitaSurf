@@ -1657,10 +1657,53 @@ Object.defineProperties(URL.prototype,{
    this.searchParams=u.searchParams;}}});
 URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=function(){return 'blob:';};URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};URL.parse=function(u,b){try{return new URL(u,b);}catch(e){return null;}};
 W.URL=URL;W.URLSearchParams=URLSearchParams;
+/* A dynamic import() in page code arrives here (qjs.c rewrites the call
+ * with the importing script's name as base). QuickJS loads modules
+ * synchronously and can only compile source that has arrived, so wait
+ * for the module first, then import it for real. */
+W.__vitaImport=function(base,spec){
+ return new Promise(function(res,rej){
+  var t0=Date.now();
+  function waitFor(b,sp,then){
+   (function poll(){
+    var st;
+    try{st=W.__vitaModuleState(String(b),String(sp));}catch(e){rej(e);return;}
+    if(st.state!=='arriving'){then(st.url);return;}
+    if(Date.now()-t0>120000){rej(new TypeError('import of '+st.url+' timed out'));return;}
+    setTimeout(poll,60);
+   })();
+  }
+  waitFor(base,spec,function attempt(url){
+   import(url).then(res,function(e){
+    /* the module is here but one it imports is not: wait for that one
+     * and try again, until the loader names nothing more */
+    var m=/could not load module '([^']+)'/.exec(String(e&&e.message));
+    if(m&&m[1]!==url&&Date.now()-t0<120000)waitFor(m[1],m[1],function(){attempt(url);});
+    else rej(e);
+   });
+  });
+ });
+};
 W.crypto={getRandomValues:function(a){for(var i=0;i<a.length;i++)a[i]=Math.floor(Math.random()*4294967296);return a;},randomUUID:function(){return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){var r=Math.random()*16|0;return (c==='x'?r:(r&3|8)).toString(16);});},subtle:{}};
 function pad2(n){return (n<10?'0':'')+n;}
 W.Intl={DateTimeFormat:function(loc,opt){opt=opt||{};this.format=function(d){d=d instanceof Date?d:new Date(d===undefined?Date.now():d);var s=d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate());if(opt.hour||opt.minute||opt.timeStyle||opt.second)s=(opt.year||opt.month||opt.day||opt.dateStyle?s+' ':'')+pad2(d.getHours())+':'+pad2(d.getMinutes())+(opt.second||opt.timeStyle?':'+pad2(d.getSeconds()):'');return s;};this.formatToParts=function(d){return [{type:'literal',value:this.format(d)}];};this.resolvedOptions=function(){return {locale:'en-US',timeZone:opt.timeZone||'UTC',calendar:'gregory',numberingSystem:'latn'};};},NumberFormat:function(loc,opt){opt=opt||{};this.format=function(n){n=Number(n);var f=opt.maximumFractionDigits!==undefined?opt.maximumFractionDigits:(opt.style==='currency'?2:3);var s=n.toFixed(Math.min(f,20));if(s.indexOf('.')>=0&&opt.minimumFractionDigits===undefined)s=s.replace(/\.?0+$/,'');var parts=s.split('.');parts[0]=parts[0].replace(/\B(?=(\d{3})+(?!\d))/g,',');s=parts.join('.');if(opt.style==='percent')s=(n*100).toFixed(0)+'%';if(opt.style==='currency')s=(opt.currency||'')+' '+s;return s;};this.formatToParts=function(n){return [{type:'integer',value:this.format(n)}];};this.resolvedOptions=function(){return {locale:'en-US'};};},Collator:function(){this.compare=function(a,b){a=String(a);b=String(b);return a<b?-1:a>b?1:0;};this.resolvedOptions=function(){return {locale:'en-US'};};},PluralRules:function(){this.select=function(n){return Number(n)===1?'one':'other';};},RelativeTimeFormat:function(){this.format=function(v,u){v=Number(v);var a=Math.abs(v);u=String(u).replace(/s$/,'');return v<0?a+' '+u+(a===1?'':'s')+' ago':'in '+a+' '+u+(a===1?'':'s');};},ListFormat:function(){this.format=function(l){return Array.prototype.join.call(l,', ');};},getCanonicalLocales:function(l){return [].concat(l||[]);},supportedValuesOf:function(){return [];}};
-['DateTimeFormat','NumberFormat','Collator','PluralRules','RelativeTimeFormat','ListFormat'].forEach(function(k){W.Intl[k].supportedLocalesOf=function(){return ['en-US'];};});
+/* Immich's language picker names every locale through DisplayNames at
+ * module load, and its layout builds a Locale; without them the whole
+ * page was a rejected promise. English names for the common codes, the
+ * code itself for the rest. */
+var LANG_NAMES={af:'Afrikaans',ar:'Arabic',bg:'Bulgarian',bn:'Bengali',bs:'Bosnian',ca:'Catalan',cs:'Czech',cy:'Welsh',da:'Danish',de:'German',el:'Greek',en:'English',eo:'Esperanto',es:'Spanish',et:'Estonian',eu:'Basque',fa:'Persian',fi:'Finnish',fr:'French',fy:'Western Frisian',ga:'Irish',gl:'Galician',he:'Hebrew',hi:'Hindi',hr:'Croatian',hu:'Hungarian',hy:'Armenian',id:'Indonesian',is:'Icelandic',it:'Italian',ja:'Japanese',ka:'Georgian',kk:'Kazakh',km:'Khmer',ko:'Korean',lb:'Luxembourgish',lt:'Lithuanian',lv:'Latvian',mk:'Macedonian',ml:'Malayalam',mn:'Mongolian',mr:'Marathi',ms:'Malay',nb:'Norwegian Bokmål',ne:'Nepali',nl:'Dutch',nn:'Norwegian Nynorsk',no:'Norwegian',pl:'Polish',pt:'Portuguese',ro:'Romanian',ru:'Russian',si:'Sinhala',sk:'Slovak',sl:'Slovenian',sq:'Albanian',sr:'Serbian',sv:'Swedish',ta:'Tamil',te:'Telugu',th:'Thai',tr:'Turkish',uk:'Ukrainian',ur:'Urdu',vi:'Vietnamese',zh:'Chinese'};
+var REGION_NAMES={US:'United States',GB:'United Kingdom',DE:'Germany',FR:'France',ES:'Spain',IT:'Italy',BR:'Brazil',PT:'Portugal',CN:'China',TW:'Taiwan',HK:'Hong Kong',JP:'Japan',KR:'South Korea',RU:'Russia',IN:'India',CA:'Canada',AU:'Australia',NL:'Netherlands',SE:'Sweden',NO:'Norway',DK:'Denmark',FI:'Finland',PL:'Poland',CZ:'Czechia',AT:'Austria',CH:'Switzerland',BE:'Belgium',MX:'Mexico',AR:'Argentina',TR:'Türkiye',UA:'Ukraine',GR:'Greece',IL:'Israel',IR:'Iran',SA:'Saudi Arabia',EG:'Egypt',ZA:'South Africa',NZ:'New Zealand',IE:'Ireland',HU:'Hungary',RO:'Romania',BG:'Bulgaria',HR:'Croatia',RS:'Serbia',SK:'Slovakia',SI:'Slovenia',LT:'Lithuania',LV:'Latvia',EE:'Estonia',ID:'Indonesia',MY:'Malaysia',TH:'Thailand',VN:'Vietnam',PH:'Philippines',SG:'Singapore',PK:'Pakistan',BD:'Bangladesh',NP:'Nepal',LK:'Sri Lanka',KH:'Cambodia',MN:'Mongolia',KZ:'Kazakhstan',GE:'Georgia',AM:'Armenia',IS:'Iceland',LU:'Luxembourg'};
+W.Intl.DisplayNames=function(loc,opt){opt=opt||{};var type=opt.type||'language',fb=opt.fallback||'code';
+ this.of=function(code){code=String(code);var out;
+  if(type==='language'){var m=/^([A-Za-z]+)(?:[-_]([A-Za-z]{4}))?(?:[-_]([A-Za-z0-9]{2,3}))?/.exec(code);var l=m?m[1].toLowerCase():code.toLowerCase();out=LANG_NAMES[l];if(out&&m&&m[3]){var r=REGION_NAMES[m[3].toUpperCase()];out=out+' ('+(r||m[3].toUpperCase())+')';}else if(out&&m&&m[2]){out=out+' ('+(m[2]==='Hans'?'Simplified':m[2]==='Hant'?'Traditional':m[2])+')';}}
+  else if(type==='region')out=REGION_NAMES[code.toUpperCase()];
+  else if(type==='script')out={Latn:'Latin',Cyrl:'Cyrillic',Hans:'Simplified Han',Hant:'Traditional Han',Arab:'Arabic'}[code];
+  else if(type==='currency')out={USD:'US Dollar',EUR:'Euro',GBP:'British Pound',JPY:'Japanese Yen'}[code.toUpperCase()];
+  if(out===undefined)return fb==='none'?undefined:code;return out;};
+ this.resolvedOptions=function(){return {locale:'en-US',style:opt.style||'long',type:type,fallback:fb};};};
+W.Intl.Locale=function(tag,opt){tag=String(tag).replace(/_/g,'-');opt=opt||{};var p=tag.split('-');this.language=(opt.language||p[0]||'en').toLowerCase();var i=1;this.script=opt.script;this.region=opt.region;if(p[i]&&p[i].length===4){this.script=this.script||p[i];i++;}if(p[i]&&(p[i].length===2||p[i].length===3)){this.region=this.region||p[i].toUpperCase();i++;}this.baseName=this.language+(this.script?'-'+this.script:'')+(this.region?'-'+this.region:'');this.calendar=opt.calendar;this.numberingSystem=opt.numberingSystem;this.hourCycle=opt.hourCycle;this.toString=function(){return this.baseName;};this.maximize=function(){return this;};this.minimize=function(){return this;};this.getTextInfo=function(){return {direction:/^(ar|he|fa|ur|yi)$/.test(this.language)?'rtl':'ltr'};};this.getWeekInfo=function(){return {firstDay:1,weekend:[6,7],minimalDays:1};};};
+W.Intl.Segmenter=function(loc,opt){var gran=(opt&&opt.granularity)||'grapheme';this.segment=function(str){str=String(str);var segs=[],i=0,re=gran==='word'?/(\s+|[^\s]+)/g:gran==='sentence'?/[^.!?]+[.!?]*\s*/g:/[\s\S]/gu;var m;while((m=re.exec(str))!==null){segs.push({segment:m[0],index:m.index,input:str,isWordLike:gran==='word'?!/^\s+$/.test(m[0]):undefined});if(m[0]==='')re.lastIndex++;}segs.containing=function(ix){for(var k=0;k<segs.length;k++)if(ix>=segs[k].index&&ix<segs[k].index+segs[k].segment.length)return segs[k];return undefined;};return segs;};this.resolvedOptions=function(){return {locale:'en-US',granularity:gran};};};
+['DateTimeFormat','NumberFormat','Collator','PluralRules','RelativeTimeFormat','ListFormat','DisplayNames','Segmenter'].forEach(function(k){W.Intl[k].supportedLocalesOf=function(){return ['en-US'];};});
 Date.prototype.toLocaleDateString=function(){return new Intl.DateTimeFormat(undefined,{year:1,month:1,day:1}).format(this);};Date.prototype.toLocaleTimeString=function(){return new Intl.DateTimeFormat(undefined,{hour:1,minute:1,second:1}).format(this);};Date.prototype.toLocaleString=function(){return new Intl.DateTimeFormat(undefined,{year:1,month:1,day:1,hour:1,minute:1,second:1}).format(this);};
 function Option(t,v){var o=document.createElement('option');if(t!==undefined)o.textContent=t;if(v!==undefined)o.setAttribute('value',v);return o;}W.Option=Option;
 
@@ -2129,7 +2172,13 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   if(CEn&&c)ceConnectTree(c,false,false);
   return c;};
 })();
-W.ShadowRoot=CEBase;
+/* No shadow tree exists here (attachShadow hands the host back), so
+ * nothing may be an instance of ShadowRoot. When it was the base of every
+ * element, Alpine's tree walk, which asks each node whether it is one and
+ * then visits only its children, descended through the whole page without
+ * processing a single directive. */
+W.ShadowRoot=function ShadowRoot(){throw new TypeError('Illegal constructor');};
+W.ShadowRoot.prototype=Object.create(P);
 
 /* --- reflected content attributes ---------------------------------------
  * Most element properties in the HTML specification are nothing but a
@@ -4842,8 +4891,9 @@ function describeThrown(v){
    out=(name&&msg)?name+': '+msg:(name||msg);
    if(!out){try{out=JSON.stringify(v).slice(0,200);}catch(e){out=String(v);}}
    if(v.stack){
-    var f=String(v.stack).split('\n')[1];
-    if(f)out+=' | '+f.replace(/^\s+/,'').slice(0,160);}
+    /* the first frames: one alone often names only a helper */
+    var fr=String(v.stack).split('\n').slice(1,5).filter(function(f){return f.trim();});
+    if(fr.length)out+=' | '+fr.map(function(f){return f.replace(/^\s+/,'').slice(0,160);}).join(' | ');}
    return out;}
   return String(v);
  }catch(e2){return '(unprintable)';}
