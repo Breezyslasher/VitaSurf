@@ -1,0 +1,341 @@
+diff --git a/content/content.c b/content/content.c
+index e95af4ff4..e9bd6ff04 100644
+--- a/content/content.c
++++ b/content/content.c
+@@ -1232,6 +1232,15 @@ int content__get_width(struct content *c)
+ }
+ 
+ 
++/* exported interface documented in netsurf/content.h */
++bool content_get_ratio_only(hlcache_handle *h)
++{
++	struct content *c = hlcache_handle_get_content(h);
++
++	return c != NULL && c->ratio_only;
++}
++
++
+ /* exported interface documented in content/content.h */
+ int content_get_height(hlcache_handle *h)
+ {
+diff --git a/content/content_protected.h b/content/content_protected.h
+index fd0924d64..da846cae4 100644
+--- a/content/content_protected.h
++++ b/content/content_protected.h
+@@ -206,6 +206,11 @@ struct content {
+ 	 * Height dimension, if applicable.
+ 	 */
+ 	int height;
++	/**
++	 * The width and height are only an aspect ratio, not a size
++	 * (VitaSurf): an SVG with a viewBox and no width or height.
++	 */
++	bool ratio_only;
+ 	/**
+ 	 * Viewport width.
+ 	 */
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index a18fcbed5..475bb8191 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -156,14 +156,42 @@ static void layout_minmax_block(
+  * \param  max_width  Box's max width, as given by layout_find_dimensions.
+  * \param  min_height  Box's min height, as given by layout_find_dimensions.
+  * \param  max_height  Box's max height, as given by layout_find_dimensions.
++ * \param  available_width  Width in px for an object that has only an
++ *                          aspect ratio and no size of its own, or -1
++ *                          where there is none to give.
+  *
+  * See CSS 2.1 sections 10.3 and 10.6.
+  */
++/**
++ * The width a replaced element with no size of its own takes (VitaSurf).
++ *
++ * CSS 2.1 10.3.2 suggests the constraint equation for a block-level
++ * element, so the margins, borders and padding come off the containing
++ * block's width. Only callers that have just filled those in may ask.
++ */
++static int layout_ratio_only_width(struct box *box, int available_width)
++{
++	int side[2] = { LEFT, RIGHT };
++	int width = available_width;
++	int i;
++
++	for (i = 0; i != 2; i++) {
++		if (box->margin[side[i]] != AUTO) {
++			width -= box->margin[side[i]];
++		}
++		width -= box->padding[side[i]];
++		width -= box->border[side[i]].width;
++	}
++	return width < 0 ? 0 : width;
++}
++
++
+ static void
+ layout_get_object_dimensions(struct box *box,
+ 			     int *width, int *height,
+ 			     int min_width, int max_width,
+-			     int min_height, int max_height)
++			     int min_height, int max_height,
++			     int available_width)
+ {
+ 	assert(box->object != NULL);
+ 	assert(width != NULL && height != NULL);
+@@ -175,6 +203,23 @@ layout_get_object_dimensions(struct box *box,
+ 		int intrinsic_width = content_get_width(box->object);
+ 		int intrinsic_height = content_get_height(box->object);
+ 
++		if (available_width >= 0 && intrinsic_width > 0 &&
++		    intrinsic_height > 0 &&
++		    content_get_ratio_only(box->object)) {
++			/*
++			 * An aspect ratio but no size, as an SVG with
++			 * only a viewBox. CSS 2.1 10.3.2 leaves the
++			 * width undefined and suggests the constraint
++			 * equation for a block-level element in its
++			 * place, which is what the callers work out and
++			 * pass in; the ratio then gives the height
++			 * (VitaSurf).
++			 */
++			intrinsic_height = (int) ((long long) available_width *
++					intrinsic_height / intrinsic_width);
++			intrinsic_width = available_width;
++		}
++
+ 		/* use intrinsic dimensions */
+ 		*width = intrinsic_width;
+ 		*height = intrinsic_height;
+@@ -729,7 +774,7 @@ layout_minmax_line(struct box *first,
+ 				layout_get_object_dimensions(b,
+ 						&width, &temp_height,
+ 						INT_MIN, INT_MAX,
+-						INT_MIN, INT_MAX);
++						INT_MIN, INT_MAX, -1);
+ 			}
+ 
+ 			fixed = frac = 0;
+@@ -1541,7 +1586,8 @@ layout_block_find_dimensions(const css_unit_ctx *unit_len_ctx,
+ 			content_get_type(box->object) != CONTENT_HTML) {
+ 		/* block-level replaced element, see 10.3.4 and 10.6.2 */
+ 		layout_get_object_dimensions(box, &width, &height,
+-				min_width, max_width, min_height, max_height);
++				min_width, max_width, min_height, max_height,
++				layout_ratio_only_width(box, available_width));
+ 	}
+ 
+ 	box->width = layout_solve_width(box, available_width, width, lm, rm,
+@@ -2517,7 +2563,8 @@ layout_float_find_dimensions(
+ 		/* Floating replaced element, with intrinsic width or height.
+ 		 * See 10.3.6 and 10.6.2 */
+ 		layout_get_object_dimensions(box, &width, &height,
+-				min_width, max_width, min_height, max_height);
++				min_width, max_width, min_height, max_height,
++				layout_ratio_only_width(box, available_width));
+ 	} else if (box->gadget && (box->gadget->type == GADGET_TEXTBOX ||
+ 			box->gadget->type == GADGET_PASSWORD ||
+ 			box->gadget->type == GADGET_FILE ||
+@@ -3000,7 +3047,7 @@ layout_line(struct box *first,
+ 		if (b->object && !(b->flags & REPLACE_DIM)) {
+ 			layout_get_object_dimensions(b, &b->width, &b->height,
+ 					min_width, max_width,
+-					min_height, max_height);
++					min_height, max_height, *width);
+ 		} else if (b->flags & IFRAME) {
+ 			/* TODO: should we look at the content dimensions? */
+ 			if (b->width == AUTO)
+@@ -3737,7 +3784,7 @@ bool layout_block_context(
+ 			return false;
+ 		layout_get_object_dimensions(block, &temp_width,
+ 				&block->height, INT_MIN, INT_MAX,
+-				INT_MIN, INT_MAX);
++				INT_MIN, INT_MAX, -1);
+ 		return true;
+ 	} else if (block->flags & REPLACE_DIM) {
+ 		return true;
+diff --git a/content/handlers/image/svg.c b/content/handlers/image/svg.c
+index 55c54b213..bdbdc2d69 100644
+--- a/content/handlers/image/svg.c
++++ b/content/handlers/image/svg.c
+@@ -106,13 +106,64 @@ static nserror svg_create(const content_handler *handler,
+  * Convert a CONTENT_SVG for display.
+  */
+ 
++/**
++ * Parse the graphic for a viewport (VitaSurf).
++ *
++ * The parse is what sizes a graphic with no width and height of its
++ * own, so it is redone for each viewport it is drawn into; the shapes
++ * of the last parse are dropped first, since svgtiny_parse appends to
++ * its diagram and the stale copies were drawn on every redraw and
++ * leaked memory.
++ */
++static bool svg_parse_at(svg_content *svg, int width, int height)
++{
++	struct content *c = &svg->base;
++	struct svgtiny_diagram *fresh;
++	const uint8_t *source_data;
++	size_t source_size;
++
++	fresh = svgtiny_create();
++	if (fresh == NULL) {
++		return false;
++	}
++	svgtiny_free(svg->diagram);
++	svg->diagram = fresh;
++
++	source_data = content__get_source_data(c, &source_size);
++
++	svgtiny_parse(svg->diagram,
++		      (const char *)source_data,
++		      source_size,
++		      nsurl_access(content_get_url(c)),
++		      width,
++		      height);
++
++	svg->current_width = width;
++	svg->current_height = height;
++	return true;
++}
++
++
+ static bool svg_convert(struct content *c)
+ {
++	svg_content *svg = (svg_content *) c;
++
+ 	/*c->title = malloc(100);
+ 	if (c->title)
+ 		snprintf(c->title, 100, messages_get("svgTitle"),
+ 				width, height, c->source_size);*/
+ 	//c->size += ?;
++
++	/* The graphic's own size, which layout takes as the intrinsic
++	 * size of an <img> of it, comes from a parse with no viewport
++	 * (VitaSurf). It used to be whatever the last reformat parsed
++	 * at, so an <img> with only a height took its width from the
++	 * width of the box it had before the graphic arrived. */
++	svg_parse_at(svg, 0, 0);
++	c->width = svg->diagram->width;
++	c->height = svg->diagram->height;
++	c->ratio_only = svg->diagram->ratio_only;
++
+ 	content_set_ready(c);
+ 	content_set_done(c);
+ 	/* Done: update status bar */
+@@ -128,40 +179,30 @@ static bool svg_convert(struct content *c)
+ static void svg_reformat(struct content *c, int width, int height)
+ {
+ 	svg_content *svg = (svg_content *) c;
+-	const uint8_t *source_data;
+-	size_t source_size;
+ 
+ 	assert(svg->diagram);
+ 
+ 	/* Avoid reformats to same width/height as we already reformatted to */
+-	if (width != svg->current_width || height != svg->current_height) {
+-		struct svgtiny_diagram *fresh;
+-
+-		/* svgtiny_parse appends to the diagram, so parsing again at
+-		 * a new size kept every earlier shape (VitaSurf): the stale
+-		 * copies were drawn on every redraw and leaked memory. */
+-		fresh = svgtiny_create();
+-		if (fresh == NULL) {
+-			return;
+-		}
+-		svgtiny_free(svg->diagram);
+-		svg->diagram = fresh;
+-
+-		source_data = content__get_source_data(c, &source_size);
+-
+-		svgtiny_parse(svg->diagram,
+-			      (const char *)source_data,
+-			      source_size,
+-			      nsurl_access(content_get_url(c)),
+-			      width,
+-			      height);
++	if (width == svg->current_width && height == svg->current_height) {
++		return;
++	}
+ 
++	/*
++	 * The sizing parse drew the graphic at the size it asked for, so
++	 * a box of exactly that size is already what is in hand: an icon
++	 * laid out at its own width and height needs no second parse
++	 * (VitaSurf). A graphic with only a ratio was drawn for no
++	 * viewport at all, so it always parses again.
++	 */
++	if (svg->diagram != NULL && !svg->diagram->ratio_only &&
++	    width == svg->diagram->width &&
++	    height == svg->diagram->height) {
+ 		svg->current_width = width;
+ 		svg->current_height = height;
++		return;
+ 	}
+ 
+-	c->width = svg->diagram->width;
+-	c->height = svg->diagram->height;
++	svg_parse_at(svg, width, height);
+ }
+ 
+ 
+@@ -199,22 +240,30 @@ svg_redraw_internal(svg_content *svg,
+ 	 * shape of the graphic: YouTube's wordmark came out crushed to a
+ 	 * third of its width.
+ 	 */
+-	transform[0] = (float) width / (float) svg->base.width;
++	if (diagram->width <= 0 || diagram->height <= 0) {
++		/* nothing to scale from: a graphic sized by a viewport
++		 * it was never given */
++		return true;
++	}
++
++	/* the diagram's size is that of the last parse, which for a
++	 * graphic with no size of its own is the viewport it was parsed
++	 * for; the content's width and height stay its intrinsic size */
++	transform[0] = (float) width / (float) diagram->width;
+ 	transform[1] = 0;
+ 	transform[2] = 0;
+-	transform[3] = (float) height / (float) svg->base.height;
++	transform[3] = (float) height / (float) diagram->height;
+ 	transform[4] = x;
+ 	transform[5] = y;
+ 
+-	if (diagram->preserve_aspect &&
+-	    svg->base.width > 0 && svg->base.height > 0) {
++	if (diagram->preserve_aspect) {
+ 		float scale = (transform[0] < transform[3]) ?
+ 				transform[0] : transform[3];
+ 
+ 		transform[4] += ((float) width -
+-				 svg->base.width * scale) / 2;
++				 diagram->width * scale) / 2;
+ 		transform[5] += ((float) height -
+-				 svg->base.height * scale) / 2;
++				 diagram->height * scale) / 2;
+ 		transform[0] = scale;
+ 		transform[3] = scale;
+ 	}
+diff --git a/include/netsurf/content.h b/include/netsurf/content.h
+index 33fa7fb2b..413997f2e 100644
+--- a/include/netsurf/content.h
++++ b/include/netsurf/content.h
+@@ -149,6 +149,19 @@ int content_get_width(struct hlcache_handle *h);
+  */
+ int content_get_height(struct hlcache_handle *h);
+ 
++/**
++ * Whether a content's width and height are only an aspect ratio
++ * (VitaSurf).
++ *
++ * An SVG with a viewBox and no width or height has no size of its own,
++ * only a shape: CSS 2.1 10.3.2 sizes such an image from its containing
++ * block rather than from the ratio's numbers.
++ *
++ * \param h Content handle
++ * \return true if the content has an aspect ratio but no intrinsic size
++ */
++bool content_get_ratio_only(struct hlcache_handle *h);
++
+ 
+ /**
+  * Invalidate content reuse data.

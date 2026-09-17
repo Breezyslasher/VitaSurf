@@ -1,5 +1,23 @@
+diff --git a/include/svgtiny.h b/include/svgtiny.h
+index 3f37653..ad4e60a 100644
+--- a/include/svgtiny.h
++++ b/include/svgtiny.h
+@@ -49,6 +49,13 @@ struct svgtiny_diagram {
+ 	 * into a box should scale both axes alike and centre it.
+ 	 */
+ 	bool preserve_aspect;
++	/**
++	 * Whether width and height came from the viewBox because the
++	 * root named no size of its own (VitaSurf): they are then only
++	 * an aspect ratio, and a caller sizing an image from them should
++	 * treat them as such.
++	 */
++	bool ratio_only;
+ };
+ 
+ typedef enum {
 diff --git a/src/svgtiny.c b/src/svgtiny.c
-index 510ed28..8d20982 100644
+index 510ed28..8668583 100644
 --- a/src/svgtiny.c
 +++ b/src/svgtiny.c
 @@ -235,6 +235,7 @@ svgtiny_parse_paint_attributes(dom_element *node,
@@ -10,7 +28,7 @@ index 510ed28..8d20982 100644
  	svgtiny_parse_inline_style(node, state, ops);
  }
  
-@@ -1113,6 +1114,108 @@ parse_element(dom_element *element, struct svgtiny_parse_state *state)
+@@ -1113,6 +1114,129 @@ parse_element(dom_element *element, struct svgtiny_parse_state *state)
  }
  
  
@@ -56,6 +74,28 @@ index 510ed28..8d20982 100644
 +
 +
 +/**
++ * Whether an attribute names an absolute length (VitaSurf).
++ *
++ * A percentage is relative to a viewport the graphic may not have, so
++ * for sizing it counts as no length at all, as in a browser.
++ */
++static bool has_absolute_length(dom_element *svg, dom_string *name)
++{
++	dom_string *attr;
++	bool absolute;
++
++	if (dom_element_get_attribute(svg, name, &attr) != DOM_NO_ERR ||
++	    attr == NULL) {
++		return false;
++	}
++	absolute = memchr(dom_string_data(attr), '%',
++			  dom_string_byte_length(attr)) == NULL;
++	dom_string_unref(attr);
++	return absolute;
++}
++
++
++/**
 + * Size a root element that has a viewBox but no width or height
 + * (VitaSurf).
 + *
@@ -73,18 +113,16 @@ index 510ed28..8d20982 100644
 +		  float *width,
 +		  float *height)
 +{
-+	bool has_width = false, has_height = false;
++	bool has_width, has_height;
 +	dom_string *view_box;
 +	float vb_width, vb_height;
 +
 +	if (viewport_width > 0 && viewport_height > 0) {
 +		return;
 +	}
-+	if (dom_element_has_attribute(svg, state->interned_width,
-+				      &has_width) != DOM_NO_ERR ||
-+	    dom_element_has_attribute(svg, state->interned_height,
-+				      &has_height) != DOM_NO_ERR ||
-+	    (has_width && has_height)) {
++	has_width = has_absolute_length(svg, state->interned_width);
++	has_height = has_absolute_length(svg, state->interned_height);
++	if (has_width && has_height) {
 +		return;
 +	}
 +	if (dom_element_get_attribute(svg, state->interned_viewBox,
@@ -106,6 +144,7 @@ index 510ed28..8d20982 100644
 +		} else if (viewport_width <= 0 && viewport_height <= 0) {
 +			*width = vb_width;
 +			*height = vb_height;
++			state->diagram->ratio_only = true;
 +		} else if (viewport_width <= 0) {
 +			*width = *height * vb_width / vb_height;
 +		} else {
@@ -119,7 +158,7 @@ index 510ed28..8d20982 100644
  static svgtiny_code
  initialise_parse_state(struct svgtiny_parse_state *state,
  		       struct svgtiny_diagram *diagram,
-@@ -1138,10 +1241,19 @@ initialise_parse_state(struct svgtiny_parse_state *state,
+@@ -1138,10 +1262,19 @@ initialise_parse_state(struct svgtiny_parse_state *state,
  #include "svgtiny_strings.h"
  #undef SVGTINY_STRING_ACTION2
  
@@ -139,7 +178,7 @@ index 510ed28..8d20982 100644
  	diagram->width = width;
  	diagram->height = height;
  	diagram->preserve_aspect = svgtiny_wants_aspect(svg, state);
-@@ -1168,6 +1280,9 @@ static svgtiny_code finalise_parse_state(struct svgtiny_parse_state *state)
+@@ -1168,6 +1301,9 @@ static svgtiny_code finalise_parse_state(struct svgtiny_parse_state *state)
  {
  	svgtiny_cleanup_state_local(state);
  
@@ -150,10 +189,10 @@ index 510ed28..8d20982 100644
  	if (state->interned_##s != NULL)			\
  		dom_string_unref(state->interned_##s);
 diff --git a/src/svgtiny_internal.h b/src/svgtiny_internal.h
-index cec47c4..a27482b 100644
+index cec47c4..36bfecc 100644
 --- a/src/svgtiny_internal.h
 +++ b/src/svgtiny_internal.h
-@@ -43,10 +43,29 @@ struct svgtiny_parse_state_gradient {
+@@ -43,10 +43,30 @@ struct svgtiny_parse_state_gradient {
  };
  
  
@@ -164,6 +203,7 @@ index cec47c4..a27482b 100644
 +struct svgtiny_style_rule {
 +	char *selector;
 +	char *declarations;
++	unsigned int specificity;
 +};
 +
 +struct svgtiny_stylesheet {
@@ -183,7 +223,7 @@ index cec47c4..a27482b 100644
  	float viewport_width;
  	float viewport_height;
  
-@@ -117,6 +136,18 @@ svgtiny_code svgtiny_parse_viewbox(const char *text, size_t textlen,
+@@ -117,6 +137,18 @@ svgtiny_code svgtiny_parse_viewbox(const char *text, size_t textlen,
  		float viewport_width, float viewport_height,
  		bool preserve_aspect,
  				   struct svgtiny_transformation_matrix *tm);
@@ -203,7 +243,7 @@ index cec47c4..a27482b 100644
  svgtiny_code svgtiny_parse_number(const char *text, const char **textend,
  		float *value);
 diff --git a/src/svgtiny_parse.c b/src/svgtiny_parse.c
-index f984b25..aa86944 100644
+index f984b25..56944cb 100644
 --- a/src/svgtiny_parse.c
 +++ b/src/svgtiny_parse.c
 @@ -9,6 +9,9 @@
@@ -216,7 +256,31 @@ index f984b25..aa86944 100644
  
  
  #include "svgtiny.h"
-@@ -1439,18 +1442,15 @@ svgtiny_parse_color(const char *text, size_t textlen, svgtiny_colour *c)
+@@ -1038,17 +1041,21 @@ dispatch_op(const char *value,
+ 		res = svgtiny_parse_color(value, value_len, styleop->value);
+ 		break;
+ 
++	/* The parameter of a length is the viewport extent it is a
++	 * percentage of, and every one is a float in the parse state;
++	 * reading it as an int, as this did, made width="100%" a billion
++	 * pixels wide (VitaSurf). */
+ 	case SVGTIOP_LENGTH:
+ 		res = svgtiny_parse_length(value,
+ 				     value_len,
+-				     *((int *)styleop->param),
++				     (int) *((float *)styleop->param),
+ 				     styleop->value);
+ 		break;
+ 
+ 	case SVGTIOP_INTLENGTH:
+ 		res = svgtiny_parse_length(value,
+ 				     value_len,
+-				     *((int *)styleop->param),
++				     (int) *((float *)styleop->param),
+ 				     &parse_len);
+ 		*((int *)styleop->value) = parse_len;
+ 		break;
+@@ -1439,18 +1446,15 @@ svgtiny_parse_color(const char *text, size_t textlen, svgtiny_colour *c)
   *
   * <min-x>,? <min-y>,? <width>,? <height>
   */
@@ -240,7 +304,7 @@ index f984b25..aa86944 100644
  	int paramidx = 0;
  	svgtiny_code res;
  
-@@ -1486,6 +1486,52 @@ svgtiny_parse_viewbox(const char *text,
+@@ -1486,6 +1490,52 @@ svgtiny_parse_viewbox(const char *text,
  		return svgtiny_SVG_ERROR;
  	}
  
@@ -293,7 +357,7 @@ index f984b25..aa86944 100644
  	tm->a = (float)viewport_width / paramv[2];
  	tm->d = (float)viewport_height / paramv[3];
  
-@@ -1517,13 +1563,37 @@ svgtiny_parse_viewbox(const char *text,
+@@ -1517,13 +1567,37 @@ svgtiny_parse_viewbox(const char *text,
   * parse an inline style
   */
  svgtiny_code
@@ -334,7 +398,7 @@ index f984b25..aa86944 100644
  	dom_string *attr;
  	dom_exception exc;
  
-@@ -1536,23 +1606,382 @@ svgtiny_parse_inline_style(dom_element *node,
+@@ -1536,23 +1610,430 @@ svgtiny_parse_inline_style(dom_element *node,
  		/* no style attribute */
  		return svgtiny_OK;
  	}
@@ -436,6 +500,28 @@ index f984b25..aa86944 100644
 +}
 +
 +
++/**
++ * a selector's specificity: ids, then classes, then the type
++ */
++static unsigned int selector_specificity(const char *sel, const char *end)
++{
++	unsigned int ids = 0, classes = 0, types = 0;
++	const char *c = sel;
++
++	if (c < end && *c != '.' && *c != '#' && *c != '*') {
++		types = 1;
++	}
++	for (; c < end; c++) {
++		if (*c == '#') {
++			ids++;
++		} else if (*c == '.') {
++			classes++;
++		}
++	}
++	return (ids << 16) | (classes << 8) | types;
++}
++
++
 +static svgtiny_code
 +stylesheet_add_rule(struct svgtiny_stylesheet *sheet,
 +		    const char *sel, const char *selend,
@@ -460,8 +546,33 @@ index f984b25..aa86944 100644
 +		free(rule->declarations);
 +		return svgtiny_OUT_OF_MEMORY;
 +	}
++	rule->specificity = selector_specificity(sel, selend);
 +	sheet->count++;
 +	return svgtiny_OK;
++}
++
++
++/**
++ * order the rules so that a more specific selector applies last
++ *
++ * An insertion sort, since it keeps the order of rules that tie,
++ * which is their order in the sheet.
++ */
++static void stylesheet_sort(struct svgtiny_stylesheet *sheet)
++{
++	unsigned int i;
++
++	for (i = 1; i < sheet->count; i++) {
++		struct svgtiny_style_rule rule = sheet->rule[i];
++		unsigned int j = i;
++
++		while (j > 0 &&
++		       sheet->rule[j - 1].specificity > rule.specificity) {
++			sheet->rule[j] = sheet->rule[j - 1];
++			j--;
++		}
++		sheet->rule[j] = rule;
++	}
 +}
 +
 +
@@ -577,6 +688,7 @@ index f984b25..aa86944 100644
 +		}
  	}
 -	dom_string_unref(attr);
++	stylesheet_sort(sheet);
 +	return svgtiny_OK;
 +}
 +
