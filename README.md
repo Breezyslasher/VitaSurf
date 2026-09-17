@@ -110,11 +110,21 @@ is under it. Patches 0085 to 0090 add `-webkit-line-clamp`, `filter`
 `-webkit-` and `-moz-` spellings of flexbox, transforms, border radius,
 box shadow, background size and opacity as aliases of the unprefixed
 properties, with the old `-webkit-box-*` and other prefixed leftovers
-accepted and ignored. After this the census counts one to four percent
-of declarations dropped on GitHub, MDN, Bootstrap and Tailwind's own
-pages; what remains is mostly rotation and scaling transforms. Each
-patch has a page under `tests/css/` that the monkey frontend checks;
-none of this batch has been verified on hardware yet.
+accepted and ignored. Patches 0091 and 0092 finish `transform`: a
+value is folded into one matrix, so `rotate()`, `scale()`, `skew()`,
+`matrix()` and their variants compose in order with the translation,
+`transform-origin` and the `rotate` and `scale` properties are read,
+and a box with such a transform is painted through a plotter layer
+that maps every call about its origin (a turned rectangle becomes a
+polygon, text is placed at its mapped anchor with its size scaled, a
+bitmap is resampled, and a box scaled to nothing paints nothing and
+takes no tap). The same batch reads Internet Explorer's `-ms-flex-*`
+spellings, with their `start`, `end`, `justify` and `distribute`
+keywords, as the standard properties. After this the census counts
+under four percent of declarations dropped on GitHub, MDN, Bootstrap
+and Tailwind's own pages, with no single property dropped sixty times
+or more. Each patch has a page under `tests/css/` that the monkey
+frontend checks; none of this batch has been verified on hardware yet.
 
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic

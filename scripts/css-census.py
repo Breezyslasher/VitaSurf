@@ -257,9 +257,11 @@ def main(argv):
         '-webkit-gradient', 'light-dark', 'inset',
         # math functions, in calc's own grammar
         'min', 'max', 'clamp',
-        # the transform functions whose translation is kept; the rest
-        # of a transform value is stepped over, not understood
+        # the transform functions folded into the box's matrix; the 3d
+        # ones (rotatex, rotatey, perspective) are stepped over
         'translate', 'translatex', 'translatey', 'translate3d', 'matrix',
+        'matrix3d', 'rotate', 'rotatez', 'scale', 'scalex', 'scaley',
+        'scale3d', 'skew', 'skewx', 'skewy',
     }
     print('\n== functions called in values, ones libcss knows marked')
     print('%8s  %s' % ('uses', 'function'))

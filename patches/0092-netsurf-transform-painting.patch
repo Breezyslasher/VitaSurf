@@ -1,0 +1,892 @@
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 816aceb9a..7658bef4b 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -615,6 +615,26 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 				continue;
+ 			}
+ 
++			/*
++			 * A box scaled to nothing paints nothing, and takes
++			 * no tap either (VitaSurf): scale(0) is how sites
++			 * park a menu that is not open.
++			 */
++			if (box->style != NULL) {
++				float m[4];
++				int ox, oy;
++
++				if (box_transform(unit_len_ctx, box, m,
++						&ox, &oy)) {
++					float det = m[0] * m[3] - m[1] * m[2];
++
++					if (det > -0.0001f && det < 0.0001f) {
++						skip_children = true;
++						continue;
++					}
++				}
++			}
++
+ 			if (physically)
+ 				return box;
+ 
+@@ -650,6 +670,68 @@ struct box *box_find_by_id(struct box *box, lwc_string *id)
+ }
+ 
+ 
++/* Exported function documented in html/box_inspect.h */
++bool box_transform(const css_unit_ctx *unit_len_ctx, const struct box *box,
++		float m[4], int *ox, int *oy)
++{
++	css_fixed a, b, c, d;
++	css_fixed hl = 0, vl = 0;
++	css_unit hu = CSS_UNIT_PCT, vu = CSS_UNIT_PCT;
++	int bw, bh;
++
++	if (box->style == NULL)
++		return false;
++
++	/* a text box shares its element's style, and a transform does not
++	 * apply to an inline box; the element's block handles it */
++	if (box->type == BOX_TEXT || box->type == BOX_INLINE ||
++			box->type == BOX_INLINE_END ||
++			box->type == BOX_INLINE_CONTAINER ||
++			box->type == BOX_BR)
++		return false;
++
++	if (css_computed_transform_matrix(box->style, &a, &b, &c, &d) !=
++			CSS_TRANSFORM_SET)
++		return false;
++
++	if (a == INTTOFIX(1) && b == 0 && c == 0 && d == INTTOFIX(1))
++		return false;
++
++	m[0] = FIXTOFLT(a);
++	m[1] = FIXTOFLT(b);
++	m[2] = FIXTOFLT(c);
++	m[3] = FIXTOFLT(d);
++
++	/* FPCT_OF_INT_TOINT does not bracket its arguments, so the size
++	 * has to be worked out before it is handed over. */
++	bw = box->border[LEFT].width + box->padding[LEFT] + box->width +
++			box->padding[RIGHT] + box->border[RIGHT].width;
++	bh = box->border[TOP].width + box->padding[TOP] + box->height +
++			box->padding[BOTTOM] + box->border[BOTTOM].width;
++
++	if (css_computed_transform_origin(box->style, &hl, &hu, &vl, &vu) !=
++			CSS_TRANSFORM_ORIGIN_SET) {
++		hl = INTTOFIX(50);
++		vl = INTTOFIX(50);
++		hu = vu = CSS_UNIT_PCT;
++	}
++
++	if (hu == CSS_UNIT_PCT)
++		*ox = FPCT_OF_INT_TOINT(hl, bw);
++	else
++		*ox = FIXTOINT(css_unit_len2device_px(box->style, unit_len_ctx,
++				hl, hu));
++
++	if (vu == CSS_UNIT_PCT)
++		*oy = FPCT_OF_INT_TOINT(vl, bh);
++	else
++		*oy = FIXTOINT(css_unit_len2device_px(box->style, unit_len_ctx,
++				vl, vu));
++
++	return true;
++}
++
++
+ /* Exported function documented in html/box.h */
+ bool box_visible(struct box *box)
+ {
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+index 92b1f46e9..4f900f9f9 100644
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -114,6 +114,25 @@ struct box *box_find_by_id(struct box *box, lwc_string *id);
+  */
+ bool box_visible(struct box *box);
+ 
++/**
++ * The matrix a box is painted through and the point it turns about
++ * (VitaSurf).
++ *
++ * The translation part of a transform is applied at layout, so what is
++ * left is the rotation, scale and skew: x' = m[0] x + m[2] y, y' =
++ * m[1] x + m[3] y, taken about the transform-origin, which is given in
++ * CSS pixels from the top left of the border box.
++ *
++ * \param unit_len_ctx  Length conversion context
++ * \param box  box to inspect
++ * \param m    updated to the matrix, a b c d as matrix() writes them
++ * \param ox   updated to the origin's x, from the border edge
++ * \param oy   updated to the origin's y, from the border edge
++ * \return true if the box has a transform beyond a translation
++ */
++bool box_transform(const css_unit_ctx *unit_len_ctx, const struct box *box,
++		float m[4], int *ox, int *oy);
++
+ 
+ /**
+  * Print a box tree to a file.
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index c3771fa8f..cd825586a 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5483,6 +5483,57 @@ layout_get_box_bbox(
+ }
+ 
+ 
++/**
++ * Grow a bounding box, given relative to a box's padding edge, to cover
++ * where the box's transform paints it (VitaSurf).
++ *
++ * The matrix is applied about the transform-origin when the box is
++ * painted, so a rotated or enlarged box reaches outside where it was
++ * laid out; the redraw region and the clip its ancestors set have to
++ * include that or a scroll leaves pieces behind.
++ */
++static void
++layout_transform_bbox(
++		const css_unit_ctx *unit_len_ctx,
++		struct box *box,
++		int *x0, int *y0, int *x1, int *y1)
++{
++	float m[4];
++	int ox, oy;
++	float cx, cy, minx, miny, maxx, maxy;
++	int i;
++
++	if (box->style == NULL ||
++			box_transform(unit_len_ctx, box, m, &ox, &oy) == false)
++		return;
++
++	/* the origin is from the border edge; the bbox is from the
++	 * padding edge */
++	cx = ox - box->border[LEFT].width;
++	cy = oy - box->border[TOP].width;
++
++	minx = miny = 1e9f;
++	maxx = maxy = -1e9f;
++	for (i = 0; i < 4; i++) {
++		float px = (i & 1) ? *x1 : *x0;
++		float py = (i & 2) ? *y1 : *y0;
++		float dx = px - cx, dy = py - cy;
++		float tx = cx + m[0] * dx + m[2] * dy;
++		float ty = cy + m[1] * dx + m[3] * dy;
++
++		if (tx < minx) minx = tx;
++		if (tx > maxx) maxx = tx;
++		if (ty < miny) miny = ty;
++		if (ty > maxy) maxy = ty;
++	}
++
++	*x0 = (int) floorf(minx);
++	*y0 = (int) floorf(miny);
++	*x1 = (int) ceilf(maxx);
++	*y1 = (int) ceilf(maxy);
++}
++
++
+ /**
+  * Apply changes to box descendant_[xy][01] values due to given child.
+  *
+@@ -5535,6 +5586,16 @@ layout_update_descendant_bbox(
+ 		child_desc_y1 = child->descendant_y1;
+ 	}
+ 
++	/* a descendant bbox already covers the child's transform; a
++	 * clipped child's border box does not yet (VitaSurf) */
++	if (overflow_x != CSS_OVERFLOW_VISIBLE ||
++			overflow_y != CSS_OVERFLOW_VISIBLE ||
++			html_object) {
++		layout_transform_bbox(unit_len_ctx, child,
++				&child_desc_x0, &child_desc_y0,
++				&child_desc_x1, &child_desc_y1);
++	}
++
+ 	child_desc_x0 += child_x;
+ 	child_desc_y0 += child_y;
+ 	child_desc_x1 += child_x;
+@@ -5559,9 +5620,36 @@ layout_update_descendant_bbox(
+  * \param  unit_len_ctx  Length conversion context
+  * \param  box      tree of boxes to update
+  */
++static void layout_calculate_descendant_bboxes_inner(
++		const css_unit_ctx *unit_len_ctx,
++		struct box *box);
++
++/**
++ * Recursively calculate the descendant_[xy][01] values for a laid-out box tree
++ * and inform iframe browser windows of their size and position.
++ *
++ * Once the box and everything in it is covered, the box's own transform
++ * is applied to the result (VitaSurf).
++ *
++ * \param  unit_len_ctx  Length conversion context
++ * \param  box      tree of boxes to update
++ */
+ static void layout_calculate_descendant_bboxes(
+ 		const css_unit_ctx *unit_len_ctx,
+ 		struct box *box)
++{
++	layout_calculate_descendant_bboxes_inner(unit_len_ctx, box);
++
++	if (box->style != NULL) {
++		layout_transform_bbox(unit_len_ctx, box,
++				&box->descendant_x0, &box->descendant_y0,
++				&box->descendant_x1, &box->descendant_y1);
++	}
++}
++
++static void layout_calculate_descendant_bboxes_inner(
++		const css_unit_ctx *unit_len_ctx,
++		struct box *box)
+ {
+ 	struct box *child;
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index b6fed97b9..880db3674 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -2359,6 +2359,551 @@ static const struct plotter_table html_filter_plotters = {
+ 	.option_knockout = false,
+ };
+ 
++/*
++ * Painting through a transform (VitaSurf).
++ *
++ * The translation part of a transform is applied at layout, where hit
++ * testing and scrolling see it. What is left -- the rotation, scale and
++ * skew -- is applied here: a box with such a transform, and everything
++ * in it, is painted through a plotter table that stands in front of the
++ * real one and maps every coordinate through the box's matrix about its
++ * transform-origin. A rectangle that stays a rectangle is passed on as
++ * one; a turned one becomes a polygon, or four lines for its edge. Text
++ * is placed at its mapped anchor with its size scaled, since the
++ * plotters cannot turn glyphs. A bitmap is resampled into a copy that
++ * covers where it lands, so an icon flipped with scaleX(-1) or a turned
++ * picture comes out as the author meant. The clip is mapped to the box
++ * around where it lands, which is exact for a scale and generous for a
++ * turn. Levels nest, and stack with the filter levels above.
++ */
++#define HTML_TRANSFORM_DEPTH 8
++
++struct html_transform_level {
++	const struct plotter_table *real;
++	float m[4];		/**< a b c d */
++	float inv[4];		/**< the inverse, for bitmaps and the clip */
++	float ox, oy;		/**< the origin, in device coordinates */
++	struct rect outer;	/**< the clip in force outside the level */
++	bool axis;		/**< true when rectangles stay rectangles */
++	float sy;		/**< what a text size is multiplied by */
++};
++
++static struct html_transform_level html_transform_stack[HTML_TRANSFORM_DEPTH];
++static int html_transform_depth;
++
++/** The level html_redraw_box pushed for the box about to be painted. */
++static struct html_transform_level *html_transform_box_level;
++
++static inline void html_transform_point(
++		const struct html_transform_level *lv,
++		float x, float y, float *rx, float *ry)
++{
++	float dx = x - lv->ox, dy = y - lv->oy;
++
++	*rx = lv->ox + lv->m[0] * dx + lv->m[2] * dy;
++	*ry = lv->oy + lv->m[1] * dx + lv->m[3] * dy;
++}
++
++static inline void html_transform_unpoint(
++		const struct html_transform_level *lv,
++		float x, float y, float *rx, float *ry)
++{
++	float dx = x - lv->ox, dy = y - lv->oy;
++
++	*rx = lv->ox + lv->inv[0] * dx + lv->inv[2] * dy;
++	*ry = lv->oy + lv->inv[1] * dx + lv->inv[3] * dy;
++}
++
++/** The box around where a rectangle lands. */
++static void html_transform_rect(const struct html_transform_level *lv,
++		const struct rect *r, struct rect *out, bool inverse)
++{
++	float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		float px = (i & 1) ? r->x1 : r->x0;
++		float py = (i & 2) ? r->y1 : r->y0;
++		float tx, ty;
++
++		if (inverse)
++			html_transform_unpoint(lv, px, py, &tx, &ty);
++		else
++			html_transform_point(lv, px, py, &tx, &ty);
++		if (tx < minx) minx = tx;
++		if (tx > maxx) maxx = tx;
++		if (ty < miny) miny = ty;
++		if (ty > maxy) maxy = ty;
++	}
++
++	out->x0 = (int) floorf(minx);
++	out->y0 = (int) floorf(miny);
++	out->x1 = (int) ceilf(maxx);
++	out->y1 = (int) ceilf(maxy);
++}
++
++#define HTML_TRANSFORM_FORWARD(lvvar, ctxvar, call)			\
++	do {								\
++		struct redraw_context rctx_ = *(ctxvar);		\
++		html_transform_depth--;					\
++		rctx_.plot = (lvvar)->real;				\
++		res = (call);						\
++		html_transform_depth++;					\
++	} while (0)
++
++static nserror html_transform_clip(const struct redraw_context *ctx,
++		const struct rect *clip)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	struct rect r;
++	nserror res;
++
++	html_transform_rect(lv, clip, &r, false);
++	if (r.x0 < lv->outer.x0) r.x0 = lv->outer.x0;
++	if (r.y0 < lv->outer.y0) r.y0 = lv->outer.y0;
++	if (r.x1 > lv->outer.x1) r.x1 = lv->outer.x1;
++	if (r.y1 > lv->outer.y1) r.y1 = lv->outer.y1;
++	if (r.x1 < r.x0) r.x1 = r.x0;
++	if (r.y1 < r.y0) r.y1 = r.y0;
++	HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->clip(&rctx_, &r));
++	return res;
++}
++
++static int html_transform_radius(const struct html_transform_level *lv,
++		int radius)
++{
++	float det = lv->m[0] * lv->m[3] - lv->m[1] * lv->m[2];
++
++	if (det < 0)
++		det = -det;
++	return (int) (radius * sqrtf(det) + 0.5f);
++}
++
++static nserror html_transform_arc(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, int x, int y, int radius,
++		int angle1, int angle2)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	float tx, ty;
++	nserror res;
++
++	html_transform_point(lv, x, y, &tx, &ty);
++	HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->arc(&rctx_, pstyle,
++			(int) (tx + 0.5f), (int) (ty + 0.5f),
++			html_transform_radius(lv, radius), angle1, angle2));
++	return res;
++}
++
++static nserror html_transform_disc(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, int x, int y, int radius)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	float tx, ty;
++	nserror res;
++
++	html_transform_point(lv, x, y, &tx, &ty);
++	HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->disc(&rctx_, pstyle,
++			(int) (tx + 0.5f), (int) (ty + 0.5f),
++			html_transform_radius(lv, radius)));
++	return res;
++}
++
++static nserror html_transform_line(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const struct rect *line)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	struct rect l;
++	float x0, y0, x1, y1;
++	nserror res;
++
++	html_transform_point(lv, line->x0, line->y0, &x0, &y0);
++	html_transform_point(lv, line->x1, line->y1, &x1, &y1);
++	l.x0 = (int) (x0 + 0.5f);
++	l.y0 = (int) (y0 + 0.5f);
++	l.x1 = (int) (x1 + 0.5f);
++	l.y1 = (int) (y1 + 0.5f);
++	HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->line(&rctx_, pstyle, &l));
++	return res;
++}
++
++static nserror html_transform_rectangle(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const struct rect *rectangle)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	nserror res = NSERROR_OK;
++
++	if (lv->axis) {
++		struct rect r;
++
++		html_transform_rect(lv, rectangle, &r, false);
++		HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->rectangle(&rctx_,
++				pstyle, &r));
++		return res;
++	}
++
++	/* turned: the fill as a polygon, the edge as four lines */
++	{
++		int p[8];
++		int i;
++
++		for (i = 0; i < 4; i++) {
++			/* corners in order round the rectangle */
++			float px = (i == 1 || i == 2) ? rectangle->x1 :
++					rectangle->x0;
++			float py = (i >= 2) ? rectangle->y1 : rectangle->y0;
++			float tx, ty;
++
++			html_transform_point(lv, px, py, &tx, &ty);
++			p[i * 2] = (int) (tx + 0.5f);
++			p[i * 2 + 1] = (int) (ty + 0.5f);
++		}
++
++		if (pstyle->fill_type != PLOT_OP_TYPE_NONE) {
++			plot_style_t st = *pstyle;
++
++			st.stroke_type = PLOT_OP_TYPE_NONE;
++			HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->polygon(
++					&rctx_, &st, p, 4));
++			if (res != NSERROR_OK)
++				return res;
++		}
++
++		if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
++			plot_style_t st = *pstyle;
++
++			st.fill_type = PLOT_OP_TYPE_NONE;
++			for (i = 0; i < 4; i++) {
++				struct rect l;
++				int j = (i + 1) & 3;
++
++				l.x0 = p[i * 2];
++				l.y0 = p[i * 2 + 1];
++				l.x1 = p[j * 2];
++				l.y1 = p[j * 2 + 1];
++				HTML_TRANSFORM_FORWARD(lv, ctx,
++						rctx_.plot->line(&rctx_, &st,
++								&l));
++				if (res != NSERROR_OK)
++					return res;
++			}
++		}
++	}
++
++	return res;
++}
++
++static nserror html_transform_polygon(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const int *p, unsigned int n)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	int *q;
++	unsigned int i;
++	nserror res;
++
++	q = malloc(sizeof(int) * 2 * (n == 0 ? 1 : n));
++	if (q == NULL)
++		return NSERROR_NOMEM;
++
++	for (i = 0; i < n; i++) {
++		float tx, ty;
++
++		html_transform_point(lv, p[i * 2], p[i * 2 + 1], &tx, &ty);
++		q[i * 2] = (int) (tx + 0.5f);
++		q[i * 2 + 1] = (int) (ty + 0.5f);
++	}
++
++	HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->polygon(&rctx_, pstyle,
++			q, n));
++	free(q);
++	return res;
++}
++
++static nserror html_transform_path(const struct redraw_context *ctx,
++		const plot_style_t *pstyle, const float *p, unsigned int n,
++		const float transform[6])
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	float t[6];
++	const float *m = lv->m;
++	nserror res;
++
++	/* ours after theirs: M T p + (O - M O) */
++	t[0] = m[0] * transform[0] + m[2] * transform[1];
++	t[1] = m[1] * transform[0] + m[3] * transform[1];
++	t[2] = m[0] * transform[2] + m[2] * transform[3];
++	t[3] = m[1] * transform[2] + m[3] * transform[3];
++	t[4] = m[0] * transform[4] + m[2] * transform[5] +
++			lv->ox - (m[0] * lv->ox + m[2] * lv->oy);
++	t[5] = m[1] * transform[4] + m[3] * transform[5] +
++			lv->oy - (m[1] * lv->ox + m[3] * lv->oy);
++
++	HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->path(&rctx_, pstyle, p, n,
++			t));
++	return res;
++}
++
++/** The most pixels a resampled bitmap may hold; beyond it, the
++ * picture is drawn unturned in the box it would cover. */
++#define HTML_TRANSFORM_BITMAP_MAX (512 * 512)
++
++/**
++ * Resample a bitmap through the level's matrix into a copy that covers
++ * the box around where the picture lands.
++ *
++ * \return the copy, or NULL if it could not be made
++ */
++static struct bitmap *html_transform_resample(
++		const struct html_transform_level *lv,
++		struct bitmap *bitmap, int x, int y, int width, int height,
++		const struct rect *dest)
++{
++	int bw = guit->bitmap->get_width(bitmap);
++	int bh = guit->bitmap->get_height(bitmap);
++	int dw = dest->x1 - dest->x0, dh = dest->y1 - dest->y0;
++	const uint8_t *src;
++	uint8_t *dst;
++	size_t ss, ds;
++	struct bitmap *copy;
++	bool opaque;
++	int px, py;
++
++	if (bw <= 0 || bh <= 0 || width <= 0 || height <= 0 ||
++			dw <= 0 || dh <= 0 || dw * dh > HTML_TRANSFORM_BITMAP_MAX)
++		return NULL;
++
++	copy = guit->bitmap->create(dw, dh, BITMAP_NONE);
++	if (copy == NULL)
++		return NULL;
++
++	src = guit->bitmap->get_buffer(bitmap);
++	dst = guit->bitmap->get_buffer(copy);
++	ss = guit->bitmap->get_rowstride(bitmap);
++	ds = guit->bitmap->get_rowstride(copy);
++	if (src == NULL || dst == NULL) {
++		guit->bitmap->destroy(copy);
++		return NULL;
++	}
++	opaque = guit->bitmap->get_opaque(bitmap);
++
++	for (py = 0; py < dh; py++) {
++		uint8_t *dp = dst + py * ds;
++
++		for (px = 0; px < dw; px++, dp += 4) {
++			float ux, uy;
++			int sx, sy;
++
++			/* where this device pixel's centre came from */
++			html_transform_unpoint(lv, dest->x0 + px + 0.5f,
++					dest->y0 + py + 0.5f, &ux, &uy);
++			sx = (int) ((ux - x) * bw / width);
++			sy = (int) ((uy - y) * bh / height);
++			if (ux < x || uy < y || sx < 0 || sy < 0 ||
++					sx >= bw || sy >= bh) {
++				dp[bitmap_layout.r] = 0;
++				dp[bitmap_layout.g] = 0;
++				dp[bitmap_layout.b] = 0;
++				dp[bitmap_layout.a] = 0;
++			} else {
++				const uint8_t *sp = src + sy * ss + sx * 4;
++
++				dp[0] = sp[0];
++				dp[1] = sp[1];
++				dp[2] = sp[2];
++				dp[3] = sp[3];
++				if (opaque)
++					dp[bitmap_layout.a] = 0xff;
++			}
++		}
++	}
++
++	guit->bitmap->set_opaque(copy, false);
++	guit->bitmap->modified(copy);
++	return copy;
++}
++
++static nserror html_transform_bitmap(const struct redraw_context *ctx,
++		struct bitmap *bitmap, int x, int y, int width, int height,
++		colour bg, bitmap_flags_t flags)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	struct rect src, dest;
++	struct bitmap *copy = NULL;
++	nserror res;
++
++	src.x0 = x;
++	src.y0 = y;
++	src.x1 = x + width;
++	src.y1 = y + height;
++	html_transform_rect(lv, &src, &dest, false);
++
++	/* a tiled background cannot be tiled through a turn; the first
++	 * tile is drawn where it lands */
++	flags &= ~(BITMAPF_REPEAT_X | BITMAPF_REPEAT_Y);
++
++	if (lv->axis == false || lv->m[0] < 0 || lv->m[3] < 0) {
++		copy = html_transform_resample(lv, bitmap, x, y, width,
++				height, &dest);
++		if (copy != NULL) {
++			HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->bitmap(
++					&rctx_, copy, dest.x0, dest.y0,
++					dest.x1 - dest.x0, dest.y1 - dest.y0,
++					bg, flags));
++			guit->bitmap->destroy(copy);
++			return res;
++		}
++	}
++
++	HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->bitmap(&rctx_, bitmap,
++			dest.x0, dest.y0, dest.x1 - dest.x0,
++			dest.y1 - dest.y0, bg, flags));
++	return res;
++}
++
++static nserror html_transform_text(const struct redraw_context *ctx,
++		const plot_font_style_t *fstyle, int x, int y,
++		const char *text, size_t length)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	plot_font_style_t st = *fstyle;
++	float tx, ty;
++	nserror res = NSERROR_OK;
++
++	st.size = (plot_style_fixed) (fstyle->size * lv->sy + 0.5f);
++	if (st.size <= 0)
++		return NSERROR_OK;
++
++	html_transform_point(lv, x, y, &tx, &ty);
++	HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->text(&rctx_, &st,
++			(int) (tx + 0.5f), (int) (ty + 0.5f), text, length));
++	return res;
++}
++
++static nserror html_transform_group_start(const struct redraw_context *ctx,
++		const char *name)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	nserror res = NSERROR_OK;
++
++	if (lv->real->group_start != NULL)
++		HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->group_start(&rctx_,
++				name));
++	return res;
++}
++
++static nserror html_transform_group_end(const struct redraw_context *ctx)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	nserror res = NSERROR_OK;
++
++	if (lv->real->group_end != NULL)
++		HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->group_end(&rctx_));
++	return res;
++}
++
++static nserror html_transform_flush(const struct redraw_context *ctx)
++{
++	struct html_transform_level *lv =
++			&html_transform_stack[html_transform_depth - 1];
++	nserror res = NSERROR_OK;
++
++	if (lv->real->flush != NULL)
++		HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->flush(&rctx_));
++	return res;
++}
++
++static const struct plotter_table html_transform_plotters = {
++	.clip = html_transform_clip,
++	.arc = html_transform_arc,
++	.disc = html_transform_disc,
++	.line = html_transform_line,
++	.rectangle = html_transform_rectangle,
++	.polygon = html_transform_polygon,
++	.path = html_transform_path,
++	.bitmap = html_transform_bitmap,
++	.text = html_transform_text,
++	.group_start = html_transform_group_start,
++	.group_end = html_transform_group_end,
++	.flush = html_transform_flush,
++	.option_knockout = false,
++};
++
++/**
++ * Put a box's transform in front of the plotters (VitaSurf).
++ *
++ * \param html   the content
++ * \param box    the box about to be painted
++ * \param x_parent, y_parent  where its parent is, in content coordinates
++ * \param scale  the page scale
++ * \param clip   the clip in force, in device coordinates
++ * \param ctx    the redraw context; updated to draw through the level
++ * \param fctx   storage for the new context
++ * \param bclip  updated to the clip the box should see, in its own
++ *               untransformed coordinates
++ * \return 1 if a level was pushed, 0 if the box has no transform,
++ *         -1 if it is scaled to nothing and paints nothing
++ */
++static int html_transform_push(const html_content *html, struct box *box,
++		int x_parent, int y_parent, float scale,
++		const struct rect *clip, const struct redraw_context **ctx,
++		struct redraw_context *fctx, struct rect *bclip)
++{
++	struct html_transform_level *lv;
++	float m[4], det;
++	int ox, oy;
++
++	if (box->style == NULL ||
++			box_transform(&html->unit_len_ctx, box, m, &ox, &oy) ==
++					false)
++		return 0;
++
++	det = m[0] * m[3] - m[1] * m[2];
++	if (det > -0.0001f && det < 0.0001f)
++		return -1;
++
++	if (html_transform_depth >= HTML_TRANSFORM_DEPTH)
++		return 0;
++
++	lv = &html_transform_stack[html_transform_depth++];
++	lv->real = (*ctx)->plot;
++	memcpy(lv->m, m, sizeof(m));
++	lv->inv[0] = m[3] / det;
++	lv->inv[1] = -m[1] / det;
++	lv->inv[2] = -m[2] / det;
++	lv->inv[3] = m[0] / det;
++	lv->ox = (x_parent + box->x - box->border[LEFT].width + ox) * scale;
++	lv->oy = (y_parent + box->y - box->border[TOP].width + oy) * scale;
++	lv->outer = *clip;
++	lv->axis = (m[1] > -0.0001f && m[1] < 0.0001f &&
++			m[2] > -0.0001f && m[2] < 0.0001f);
++	lv->sy = sqrtf(m[2] * m[2] + m[3] * m[3]);
++
++	/* the clip the box should test itself and its children against,
++	 * in the coordinates it paints in; a pixel each way for rounding */
++	html_transform_rect(lv, clip, bclip, true);
++	bclip->x0--;
++	bclip->y0--;
++	bclip->x1++;
++	bclip->y1++;
++
++	*fctx = **ctx;
++	fctx->plot = &html_transform_plotters;
++	*ctx = fctx;
++	html_transform_box_level = lv;
++
++	return 1;
++}
++
+ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+@@ -2379,10 +2924,12 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		colour current_background_color,
+ 		const struct redraw_context *ctx)
+ {
+-	struct redraw_context fctx;
++	struct redraw_context fctx, tctx;
++	struct rect tclip;
+ 	int alpha = 256;
+ 	const int32_t *m = NULL;
+ 	bool pushed = false;
++	int transformed;
+ 	bool ok;
+ 
+ 	if (box->style != NULL) {
+@@ -2420,9 +2967,25 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		pushed = true;
+ 	}
+ 
++	/* the box's rotation or scale, if any, goes in front of that */
++	transformed = html_transform_push(html, box, x_parent, y_parent,
++			scale, clip, &ctx, &tctx, &tclip);
++	if (transformed < 0) {
++		/* scaled to nothing */
++		if (pushed)
++			html_filter_depth--;
++		return true;
++	}
++	if (transformed > 0)
++		clip = &tclip;
++
+ 	ok = html_redraw_box_inner(html, box, x_parent, y_parent, clip, scale,
+ 			current_background_color, ctx);
+ 
++	if (transformed > 0)
++		html_transform_depth--;
++	html_transform_box_level = NULL;
++
+ 	if (pushed)
+ 		html_filter_depth--;
+ 
+@@ -2449,6 +3012,7 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	enum css_overflow_e overflow_y = CSS_OVERFLOW_VISIBLE;
+ 	dom_exception exc;
+ 	dom_html_element_type tag_type;
++	bool transformed = (html_transform_box_level != NULL);
+ 
+ 
+ 	if (html_redraw_printing && (box->flags & PRINTED))
+@@ -2488,6 +3052,13 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	}
+ 	y_parent += box->sticky_dy;
+ 
++	/* the transform level was set up before the sticky offset was
++	 * known; its origin moves with the box (VitaSurf) */
++	if (transformed) {
++		html_transform_box_level->oy += box->sticky_dy * scale;
++		html_transform_box_level = NULL;
++	}
++
+ 	if (scale == 1.0) {
+ 		x = x_parent + box->x;
+ 		y = y_parent + box->y;
+@@ -2591,6 +3162,27 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		}
+ 	}
+ 
++	/*
++	 * A box painted through its own transform paints in its own,
++	 * untransformed coordinates, while its descendant bbox was grown
++	 * at layout to cover where the transform puts it; the two do not
++	 * line up, so the box takes the clip its level worked out for it
++	 * instead (VitaSurf). An overflow clip above is the border box,
++	 * which is in the right coordinates already.
++	 */
++	if (transformed) {
++		if (!(box->style && overflow_x != CSS_OVERFLOW_VISIBLE &&
++				box->parent != NULL)) {
++			r.x0 = clip->x0;
++			r.x1 = clip->x1;
++		}
++		if (!(box->style && overflow_y != CSS_OVERFLOW_VISIBLE &&
++				box->parent != NULL)) {
++			r.y0 = clip->y0;
++			r.y1 = clip->y1;
++		}
++	}
++
+ 	/* return if the rectangle is completely outside the clip rectangle */
+ 	if (clip->y1 < r.y0 || r.y1 < clip->y0 ||
+ 			clip->x1 < r.x0 || r.x1 < clip->x0)
