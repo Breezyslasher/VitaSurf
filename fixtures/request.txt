@@ -1,2 +1,3 @@
-url=https://github.com/
-name=github-live2
+url=https://m.youtube.com/
+name=ytm-dark
+cookie=PREF=f6=400

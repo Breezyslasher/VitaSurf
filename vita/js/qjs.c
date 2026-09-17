@@ -4322,7 +4322,14 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
 		    type == DOM_ELEMENT_NODE) {
 			dom_string *tag = NULL, *id = NULL, *cls = NULL;
 
-			dom_element_get_tag_name(n, &tag);
+			/* The local name, as libdom's own tag lookup matched
+			 * it: getElementsByTagNameNS("ns", "body") finds the
+			 * element made as createElementNS("ns", "te:body"),
+			 * and comparing the qualified name lost that. */
+			dom_node_get_local_name(n, &tag);
+			if (tag == NULL) {
+				dom_element_get_tag_name(n, &tag);
+			}
 			if (want_id) {
 				dom_element_get_attribute(n, corestring_dom_id, &id);
 			}

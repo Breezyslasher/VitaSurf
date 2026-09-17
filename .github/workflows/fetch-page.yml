@@ -29,21 +29,28 @@ jobs:
           # fixtures/request.txt: two lines, url=... and name=...
           url=$(sed -n 's/^url=//p' fixtures/request.txt | head -1)
           name=$(sed -n 's/^name=//p' fixtures/request.txt | head -1)
+          # optional: cookie=... sent with every request, for a site
+          # whose theme or layout lives in a preference cookie
+          cookie=$(sed -n 's/^cookie=//p' fixtures/request.txt | head -1)
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "cookie=$cookie" >> "$GITHUB_OUTPUT"
           echo "fetching $url as fixtures/$name"
 
       - name: Download the page, its stylesheets and scripts
         run: |
           set -u
           mkdir -p /tmp/fixture
-          python3 - "${{ steps.req.outputs.url }}" /tmp/fixture <<'PY'
+          python3 - "${{ steps.req.outputs.url }}" /tmp/fixture "${{ steps.req.outputs.cookie }}" <<'PY'
           import re, sys, os, hashlib, urllib.request, urllib.parse, html as htmlmod
           url, out = sys.argv[1], sys.argv[2]
+          cookie = sys.argv[3] if len(sys.argv) > 3 else ''
           UA = 'Mozilla/5.0 (PlayStation Vita; Mobile) NetSurf/3.11'
           def get(u):
-              req = urllib.request.Request(u, headers={'User-Agent': UA,
-                      'Accept': '*/*', 'Accept-Language': 'en'})
+              headers = {'User-Agent': UA, 'Accept': '*/*', 'Accept-Language': 'en'}
+              if cookie:
+                  headers['Cookie'] = cookie
+              req = urllib.request.Request(u, headers=headers)
               with urllib.request.urlopen(req, timeout=40) as r:
                   return r.read(), r.headers.get('Content-Type', '')
           html, ctype = get(url)
