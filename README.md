@@ -163,8 +163,14 @@ as one device pixel per CSS pixel, colour, scripting, display-mode),
 paint `outline` as a ring outside the border box, draw inset box
 shadows on the background with their blur fading inward, and paint
 radial gradients as concentric discs instead of their average colour.
-Still not done from that list: `::first-letter` and `::first-line`
-boxes, a second box shadow, and horizontal `position: sticky`.
+Patches 0099 and 0100 take the three that were left: the second
+shadow of a `box-shadow` list is kept as a property of its own and
+drawn under the first, outer or inset; `::first-letter` gets a box of
+its own holding the leading punctuation and first character in the
+pseudo element's style, floated when the style floats it and inline
+otherwise; and `position: sticky` pins horizontally against `left`
+and `right` as it did vertically. `::first-line` remains unread, since
+a line is not known until layout.
 
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic

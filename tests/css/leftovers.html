@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>second shadow and first-letter</title>
+<style>
+body { margin: 0; font-size: 16px; }
+/* a: at 20,20: two outer shadows, the second (green, 6px spread) drawn
+   first and the first (red, 2px spread) over it */
+.a { width: 100px; height: 50px; margin: 20px; background: #0000ff;
+     box-shadow: 0 0 0 2px #ff0000, 0 0 0 6px #00ff00; }
+/* b: an inline first letter, twice the size and red: two text runs, the
+   first one character at 24pt in red */
+.b { margin: 20px; }
+.b::first-letter { font-size: 32px; color: #ff0000; }
+/* c: a floated first letter: the letter box at x 20, the rest at x 44 on
+   the same line */
+.c { margin: 20px; }
+.c::first-letter { float: left; font-size: 32px; }
+/* d: a quotation mark goes with the letter */
+.d { margin: 20px; }
+.d::first-letter { font-size: 32px; }
+</style>
+</head>
+<body>
+<div class="a"></div>
+<p class="b">Word next</p>
+<p class="c">Word next</p>
+<p class="d">"Quoted" text</p>
+</body>
+</html>

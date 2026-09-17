@@ -1,0 +1,585 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 84bd7f266..81abc137e 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -303,10 +303,10 @@ css_select_results *nscss_get_style(nscss_select_ctx *ctx, dom_node *n,
+ 			pseudo_element < CSS_PSEUDO_ELEMENT_COUNT;
+ 			pseudo_element++) {
+ 
+-		if (pseudo_element == CSS_PSEUDO_ELEMENT_FIRST_LETTER ||
+-				pseudo_element == CSS_PSEUDO_ELEMENT_FIRST_LINE)
+-			/* TODO: Handle first-line and first-letter pseudo
+-			 *       element computed style completion */
++		if (pseudo_element == CSS_PSEUDO_ELEMENT_FIRST_LINE)
++			/* TODO: Handle first-line pseudo element computed
++			 *       style completion. first-letter is completed
++			 *       like before and after (VitaSurf). */
+ 			continue;
+ 
+ 		if (styles->styles[pseudo_element] == NULL)
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 7f09e5647..dd919b60e 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -310,6 +310,7 @@ struct box {
+ 	 * the box where it was drawn.
+ 	 */
+ 	int sticky_dy;
++	int sticky_dx;		/**< the same across, for left and right */
+ 
+ 	/**
+ 	 * The box's CSS filter, read from the style when the box is
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 2566254d9..ce49f4cdd 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1142,6 +1142,106 @@ box_text_transform(char *s, unsigned int len, enum css_text_transform_e tt)
+  * \param  ctx  Tree construction context
+  * \return  true on success, false on memory exhaustion
+  */
++/**
++ * How many bytes of a text run its ::first-letter takes (VitaSurf):
++ * the leading punctuation and the first character after it.
++ *
++ * \param text  the run, without a leading space
++ * \return the byte count, or 0 if there is no letter to take
++ */
++static size_t box_first_letter_len(const char *text)
++{
++	size_t i = 0;
++	unsigned char c;
++
++	/* punctuation that opens a quotation or a bracket belongs with
++	 * the letter */
++	while ((c = (unsigned char) text[i]) != 0 &&
++			(c == '"' || c == '\'' || c == '(' || c == '[' ||
++			 c == '{' || (c == 0xe2 && text[i + 1] != 0 &&
++				 (unsigned char) text[i + 1] == 0x80)))
++		i += (c == 0xe2) ? 3 : 1;
++
++	c = (unsigned char) text[i];
++	if (c == 0 || c == ' ')
++		return 0;
++	if (c < 0x80)
++		return i + 1;
++	if ((c & 0xe0) == 0xc0)
++		return i + 2;
++	if ((c & 0xf0) == 0xe0)
++		return i + 3;
++	return i + 4;
++}
++
++/**
++ * Build the boxes for a block's ::first-letter (VitaSurf): the letter
++ * in a box of its own with the pseudo element's style, floated when
++ * the style floats it, as an inline otherwise.
++ *
++ * \return true on success, false on memory exhaustion
++ */
++static bool box_construct_first_letter(struct box_construct_ctx *ctx,
++		struct box_construct_props *props, css_computed_style *fl_style,
++		const char *letter, size_t len, bool space_after)
++{
++	struct box *txt, *holder, *inline_end;
++	bool floated = css_computed_float(fl_style) == CSS_FLOAT_LEFT ||
++			css_computed_float(fl_style) == CSS_FLOAT_RIGHT;
++
++	txt = box_create(NULL, fl_style, false, NULL, NULL, NULL, NULL,
++			ctx->bctx);
++	if (txt == NULL)
++		return false;
++	txt->type = BOX_TEXT;
++	txt->text = talloc_strndup(ctx->bctx, letter, len);
++	if (txt->text == NULL)
++		return false;
++	txt->length = len;
++	if (css_computed_text_transform(fl_style) != CSS_TEXT_TRANSFORM_NONE)
++		box_text_transform(txt->text, txt->length,
++				css_computed_text_transform(fl_style));
++
++	if (floated) {
++		struct box *flt, *blk, *ic;
++
++		flt = box_create(NULL, NULL, false, NULL, NULL, NULL, NULL,
++				ctx->bctx);
++		blk = box_create(NULL, fl_style, false, NULL, NULL, NULL, NULL,
++				ctx->bctx);
++		ic = box_create(NULL, NULL, false, NULL, NULL, NULL, NULL,
++				ctx->bctx);
++		if (flt == NULL || blk == NULL || ic == NULL)
++			return false;
++		flt->type = css_computed_float(fl_style) == CSS_FLOAT_LEFT ?
++				BOX_FLOAT_LEFT : BOX_FLOAT_RIGHT;
++		blk->type = BOX_BLOCK;
++		ic->type = BOX_INLINE_CONTAINER;
++		box_add_child(props->inline_container, flt);
++		box_add_child(flt, blk);
++		box_add_child(blk, ic);
++		box_add_child(ic, txt);
++		return true;
++	}
++
++	holder = box_create(NULL, fl_style, false, NULL, NULL, NULL, NULL,
++			ctx->bctx);
++	inline_end = box_create(NULL, fl_style, false, NULL, NULL, NULL, NULL,
++			ctx->bctx);
++	if (holder == NULL || inline_end == NULL)
++		return false;
++	holder->type = BOX_INLINE;
++	inline_end->type = BOX_INLINE_END;
++	holder->inline_end = inline_end;
++	inline_end->inline_end = holder;
++	if (space_after)
++		txt->space = UNKNOWN_WIDTH;
++	box_add_child(props->inline_container, holder);
++	box_add_child(props->inline_container, txt);
++	box_add_child(props->inline_container, inline_end);
++	return true;
++}
++
+ static bool box_construct_text(struct box_construct_ctx *ctx)
+ {
+ 	struct box_construct_props props;
+@@ -1188,9 +1288,21 @@ static bool box_construct_text(struct box_construct_ctx *ctx)
+ 		}
+ 
+ 		if (props.inline_container == NULL) {
++			css_computed_style *fl_style = NULL;
++
+ 			/* Child of a block without a current container
+ 			 * (i.e. this box is the first child of its parent, or
+ 			 * was preceded by block-level siblings) */
++			if (props.containing_block->children == NULL &&
++					props.containing_block->styles != NULL &&
++					(props.containing_block->type == BOX_BLOCK ||
++					 props.containing_block->type ==
++						BOX_INLINE_BLOCK ||
++					 props.containing_block->type ==
++						BOX_TABLE_CELL))
++				fl_style = props.containing_block->styles->
++						styles[CSS_PSEUDO_ELEMENT_FIRST_LETTER];
++
+ 			props.inline_container = box_create(NULL, NULL, false,
+ 					NULL, NULL, NULL, NULL, ctx->bctx);
+ 			if (props.inline_container == NULL) {
+@@ -1202,6 +1314,36 @@ static bool box_construct_text(struct box_construct_ctx *ctx)
+ 
+ 			box_add_child(props.containing_block,
+ 					props.inline_container);
++
++			/* the first letter of the block's first text goes in
++			 * a box of its own (VitaSurf) */
++			if (fl_style != NULL) {
++				const char *start = text[0] == ' ' ? text + 1 :
++						text;
++				size_t len = box_first_letter_len(start);
++
++				if (len > 0) {
++					bool space_after = start[len] == ' ';
++
++					if (!box_construct_first_letter(ctx,
++							&props, fl_style, start,
++							len, space_after)) {
++						free(text);
++						return false;
++					}
++					/* the rest, with the space the
++					 * letter's box now carries */
++					memmove(text, start + len +
++							(space_after ? 1 : 0),
++							strlen(start + len +
++							(space_after ? 1 : 0)) +
++							1);
++					if (text[0] == '\0') {
++						free(text);
++						return true;
++					}
++				}
++			}
+ 		}
+ 
+ 		/** \todo Dropping const here is not clever */
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 7658bef4b..b97efa0c7 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -207,7 +207,7 @@ box_move_xy(struct box *b, enum box_walk_dir dir, int *x, int *y)
+ 		b = b->children;
+ 		if (b == NULL)
+ 			break;
+-		*x += b->x;
++		*x += b->x + b->sticky_dx;
+ 		*y += b->y + b->sticky_dy;
+ 		if (!box_is_float(b)) {
+ 			rb = b;
+@@ -217,19 +217,19 @@ box_move_xy(struct box *b, enum box_walk_dir dir, int *x, int *y)
+ 
+ 	case BOX_WALK_NEXT_SIBLING:
+ 		do {
+-			*x -= b->x;
++			*x -= b->x + b->sticky_dx;
+ 			*y -= b->y + b->sticky_dy;
+ 			b = b->next;
+ 			if (b == NULL)
+ 				break;
+-			*x += b->x;
++			*x += b->x + b->sticky_dx;
+ 			*y += b->y + b->sticky_dy;
+ 		} while (box_is_float(b));
+ 		rb = b;
+ 		break;
+ 
+ 	case BOX_WALK_PARENT:
+-		*x -= b->x;
++		*x -= b->x + b->sticky_dx;
+ 		*y -= b->y + b->sticky_dy;
+ 		rb = b->parent;
+ 		break;
+@@ -238,24 +238,24 @@ box_move_xy(struct box *b, enum box_walk_dir dir, int *x, int *y)
+ 		b = b->float_children;
+ 		if (b == NULL)
+ 			break;
+-		*x += b->x;
++		*x += b->x + b->sticky_dx;
+ 		*y += b->y + b->sticky_dy;
+ 		rb = b;
+ 		break;
+ 
+ 	case BOX_WALK_NEXT_FLOAT_SIBLING:
+-		*x -= b->x;
++		*x -= b->x + b->sticky_dx;
+ 		*y -= b->y + b->sticky_dy;
+ 		b = b->next_float;
+ 		if (b == NULL)
+ 			break;
+-		*x += b->x;
++		*x += b->x + b->sticky_dx;
+ 		*y += b->y + b->sticky_dy;
+ 		rb = b;
+ 		break;
+ 
+ 	case BOX_WALK_FLOAT_CONTAINER:
+-		*x -= b->x;
++		*x -= b->x + b->sticky_dx;
+ 		*y -= b->y + b->sticky_dy;
+ 		rb = b->float_container;
+ 		break;
+@@ -548,7 +548,7 @@ box_nearest_text_box(struct box *box,
+ /* Exported function documented in html/box.h */
+ void box_coords(struct box *box, int *x, int *y)
+ {
+-	*x = box->x;
++	*x = box->x + box->sticky_dx;
+ 	*y = box->y + box->sticky_dy;
+ 	while (box->parent) {
+ 		if (box_is_float(box)) {
+@@ -557,7 +557,8 @@ void box_coords(struct box *box, int *x, int *y)
+ 		} else {
+ 			box = box->parent;
+ 		}
+-		*x += box->x - scrollbar_get_offset(box->scroll_x);
++		*x += box->x + box->sticky_dx -
++				scrollbar_get_offset(box->scroll_x);
+ 		*y += box->y + box->sticky_dy -
+ 				scrollbar_get_offset(box->scroll_y);
+ 	}
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index e06293afe..7fb64b1db 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -113,6 +113,7 @@ box_create(css_select_results *styles,
+ 	box->style = style;
+ 	box->x = box->y = 0;
+ 	box->sticky_dy = 0;
++	box->sticky_dx = 0;
+ 	box->filter = NULL;
+ 	box->width = UNKNOWN_WIDTH;
+ 	box->height = 0;
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 733a98413..1321428f3 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5439,16 +5439,32 @@ layout_get_box_bbox(
+ 		css_unit unit[4] = { CSS_UNIT_PX, CSS_UNIT_PX, CSS_UNIT_PX,
+ 				CSS_UNIT_PX };
+ 		css_color colour = 0;
++		int bx1 = *desc_x1, by1 = *desc_y1;
++		int which;
++
++		/* both shadows of a list reach outside (VitaSurf) */
++		for (which = 0; which < 2; which++) {
++			uint8_t type;
++			int ox, oy, reach;
++
++			if (which == 0)
++				type = css_computed_box_shadow(box->style,
++					&len[0], &unit[0], &len[1], &unit[1],
++					&len[2], &unit[2], &len[3], &unit[3],
++					&colour);
++			else
++				type = css_computed_box_shadow_2(box->style,
++					&len[0], &unit[0], &len[1], &unit[1],
++					&len[2], &unit[2], &len[3], &unit[3],
++					&colour);
++			if (type != CSS_BOX_SHADOW_SET)
++				continue;
+ 
+-		if (css_computed_box_shadow(box->style, &len[0], &unit[0],
+-				&len[1], &unit[1], &len[2], &unit[2],
+-				&len[3], &unit[3], &colour) ==
+-				CSS_BOX_SHADOW_SET) {
+-			int ox = FIXTOINT(css_unit_len2device_px(box->style,
++			ox = FIXTOINT(css_unit_len2device_px(box->style,
+ 					unit_len_ctx, len[0], unit[0]));
+-			int oy = FIXTOINT(css_unit_len2device_px(box->style,
++			oy = FIXTOINT(css_unit_len2device_px(box->style,
+ 					unit_len_ctx, len[1], unit[1]));
+-			int reach = FIXTOINT(css_unit_len2device_px(box->style,
++			reach = FIXTOINT(css_unit_len2device_px(box->style,
+ 					unit_len_ctx, len[2], unit[2])) / 2 +
+ 				FIXTOINT(css_unit_len2device_px(box->style,
+ 					unit_len_ctx, len[3], unit[3]));
+@@ -5457,10 +5473,10 @@ layout_get_box_bbox(
+ 				*desc_x0 = -box->border[LEFT].width + ox - reach;
+ 			if (*desc_y0 > -box->border[TOP].width + oy - reach)
+ 				*desc_y0 = -box->border[TOP].width + oy - reach;
+-			if (*desc_x1 < *desc_x1 + ox + reach)
+-				*desc_x1 = *desc_x1 + ox + reach;
+-			if (*desc_y1 < *desc_y1 + oy + reach)
+-				*desc_y1 = *desc_y1 + oy + reach;
++			if (*desc_x1 < bx1 + ox + reach)
++				*desc_x1 = bx1 + ox + reach;
++			if (*desc_y1 < by1 + oy + reach)
++				*desc_y1 = by1 + oy + reach;
+ 		}
+ 
+ 		/* a blur softens the box's edge outwards by its radius
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 0e7b3d057..5e65303df 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -167,9 +167,12 @@ typedef struct html_content {
+ 	 * position: sticky (VitaSurf); view_h is 0 when unknown. */
+ 	int view_y;
+ 	int view_h;
++	int view_x;
++	int view_w;
+ 	/** Where the content's origin was plotted at that redraw: the
+ 	 * y_parent the painter carries is content y plus this. */
+ 	int view_origin_y;
++	int view_origin_x;
+ 
+ 	/** The viewport the document was last laid out for, in px
+ 	 * (VitaSurf): the containing block of position: fixed. */
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 76d0df295..dc0cb70bd 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -2105,9 +2105,9 @@ static bool html_redraw_shadow_rings(int bx0, int by0, int bx1, int by1,
+  * lies between the padding edge and that hole, with the blur's rings
+  * across the hole's edge, all clipped to the padding box.
+  */
+-static bool html_redraw_inset_shadow(const html_content *html,
++static bool html_redraw_inset_shadow_one(const html_content *html,
+ 		struct box *box, int px0, int py0, int px1, int py1,
+-		float scale, const struct rect *clip,
++		float scale, const struct rect *clip, bool second,
+ 		const struct redraw_context *ctx)
+ {
+ 	css_fixed len[4] = { 0, 0, 0, 0 };
+@@ -2118,10 +2118,18 @@ static bool html_redraw_inset_shadow(const html_content *html,
+ 	struct rect hole, c;
+ 	plot_style_t pstyle = { .fill_type = PLOT_OP_TYPE_SOLID,
+ 			.stroke_type = PLOT_OP_TYPE_NONE };
++	uint8_t type;
+ 
+-	if (css_computed_box_shadow(box->style, &len[0], &unit[0],
+-			&len[1], &unit[1], &len[2], &unit[2],
+-			&len[3], &unit[3], &colour) != CSS_BOX_SHADOW_INSET)
++	if (second) {
++		type = css_computed_box_shadow_2(box->style, &len[0], &unit[0],
++				&len[1], &unit[1], &len[2], &unit[2],
++				&len[3], &unit[3], &colour);
++	} else {
++		type = css_computed_box_shadow(box->style, &len[0], &unit[0],
++				&len[1], &unit[1], &len[2], &unit[2],
++				&len[3], &unit[3], &colour);
++	}
++	if (type != CSS_BOX_SHADOW_INSET)
+ 		return true;
+ 
+ 	if (colour == 0x00000001)
+@@ -2193,19 +2201,38 @@ static bool html_redraw_inset_shadow(const html_content *html,
+ 	return true;
+ }
+ 
+-static bool html_redraw_box_shadow(const html_content *html,
++static bool html_redraw_inset_shadow(const html_content *html,
++		struct box *box, int px0, int py0, int px1, int py1,
++		float scale, const struct rect *clip,
++		const struct redraw_context *ctx)
++{
++	return html_redraw_inset_shadow_one(html, box, px0, py0, px1, py1,
++				scale, clip, true, ctx) &&
++		html_redraw_inset_shadow_one(html, box, px0, py0, px1, py1,
++				scale, clip, false, ctx);
++}
++
++static bool html_redraw_box_shadow_one(const html_content *html,
+ 		struct box *box, int bx0, int by0, int bx1, int by1,
+-		float scale, const struct redraw_context *ctx)
++		float scale, bool second, const struct redraw_context *ctx)
+ {
+ 	css_fixed len[4] = { 0, 0, 0, 0 };
+ 	css_unit unit[4] = { CSS_UNIT_PX, CSS_UNIT_PX, CSS_UNIT_PX,
+ 			CSS_UNIT_PX };
+ 	css_color colour = 0;
+ 	int px[4], i, ox, oy, blur, spread, alpha;
++	uint8_t type;
+ 
+-	if (css_computed_box_shadow(box->style, &len[0], &unit[0],
+-			&len[1], &unit[1], &len[2], &unit[2],
+-			&len[3], &unit[3], &colour) != CSS_BOX_SHADOW_SET) {
++	if (second) {
++		type = css_computed_box_shadow_2(box->style, &len[0], &unit[0],
++				&len[1], &unit[1], &len[2], &unit[2],
++				&len[3], &unit[3], &colour);
++	} else {
++		type = css_computed_box_shadow(box->style, &len[0], &unit[0],
++				&len[1], &unit[1], &len[2], &unit[2],
++				&len[3], &unit[3], &colour);
++	}
++	if (type != CSS_BOX_SHADOW_SET) {
+ 		return true;
+ 	}
+ 
+@@ -2234,6 +2261,20 @@ static bool html_redraw_box_shadow(const html_content *html,
+ 			spread, colour, false, ctx);
+ }
+ 
++/**
++ * Draw a box's outer shadows: the second of a list first, so the first
++ * lies on top of it, as the specification orders them (VitaSurf).
++ */
++static bool html_redraw_box_shadow(const html_content *html,
++		struct box *box, int bx0, int by0, int bx1, int by1,
++		float scale, const struct redraw_context *ctx)
++{
++	return html_redraw_box_shadow_one(html, box, bx0, by0, bx1, by1,
++				scale, true, ctx) &&
++		html_redraw_box_shadow_one(html, box, bx0, by0, bx1, by1,
++				scale, false, ctx);
++}
++
+ /**
+  * Draw one shadow as bands of translucent rings (VitaSurf): the
+  * rectangle offset by (ox, oy) and grown by the spread, softened over
+@@ -3547,6 +3588,64 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		colour current_background_color,
+ 		const struct redraw_context *ctx);
+ 
++/**
++ * The same across (VitaSurf): how far a sticky box is moved so that
++ * its left or right holds against the viewport's edge.
++ */
++static int html_sticky_offset_x(const html_content *html, struct box *box,
++		int x_parent)
++{
++	struct box *parent = box->parent;
++	int left_px = 0, right_px = 0;
++	int box_left, box_right, dx = 0;
++
++	if (html->view_w <= 0 || parent == NULL)
++		return 0;
++
++	x_parent -= html->view_origin_x;
++
++	box_left = x_parent + box->x - box->border[LEFT].width;
++	box_right = x_parent + box->x + box->padding[LEFT] + box->width +
++			box->padding[RIGHT] + box->border[RIGHT].width;
++
++	if (css_computed_left_px(box->style, &html->unit_len_ctx,
++			html->view_w, &left_px) == CSS_LEFT_SET) {
++		int want = html->view_x + left_px;
++
++		if (box_left < want)
++			dx = want - box_left;
++	}
++	if (dx == 0 && css_computed_right_px(box->style,
++			&html->unit_len_ctx, html->view_w, &right_px) ==
++			CSS_RIGHT_SET) {
++		int want = html->view_x + html->view_w - right_px;
++
++		if (box_right > want)
++			dx = want - box_right;
++	}
++
++	if (dx > 0) {
++		int cb_right = x_parent + parent->padding[LEFT] +
++				parent->width;
++		int room = cb_right - (box_right + box->margin[RIGHT]);
++
++		if (room < 0)
++			room = 0;
++		if (dx > room)
++			dx = room;
++	} else if (dx < 0) {
++		int cb_left = x_parent + parent->padding[LEFT];
++		int room = cb_left - (box_left - box->margin[LEFT]);
++
++		if (room > 0)
++			room = 0;
++		if (dx < room)
++			dx = room;
++	}
++
++	return dx;
++}
++
+ /**
+  * Recursively draw a box.
+  *
+@@ -3668,12 +3767,15 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	/* a sticky box is drawn where the scroll holds it, a fixed one
+ 	 * where the viewport is (VitaSurf) */
+ 	box->sticky_dy = 0;
++	box->sticky_dx = 0;
+ 	if (box->style != NULL && html->view_h > 0) {
+ 		uint8_t position = css_computed_position(box->style);
+ 
+ 		if (position == CSS_POSITION_STICKY) {
+ 			box->sticky_dy = html_sticky_offset(html, box,
+ 					y_parent);
++			box->sticky_dx = html_sticky_offset_x(html, box,
++					x_parent);
+ 		} else if (position == CSS_POSITION_FIXED) {
+ 			html_content *mh = (html_content *) html;
+ 
+@@ -3689,14 +3791,17 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				return true;
+ 			}
+ 			box->sticky_dy = html->view_y;
++			box->sticky_dx = html->view_x;
+ 		}
+ 	}
+ 	y_parent += box->sticky_dy;
++	x_parent += box->sticky_dx;
+ 
+ 	/* the transform level was set up before the sticky offset was
+ 	 * known; its origin moves with the box (VitaSurf) */
+ 	if (transformed) {
+ 		html_transform_box_level->oy += box->sticky_dy * scale;
++		html_transform_box_level->ox += box->sticky_dx * scale;
+ 		html_transform_box_level = NULL;
+ 	}
+ 
+@@ -4669,6 +4774,9 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 	html->view_y = data->view_y;
+ 	html->view_h = data->view_h;
+ 	html->view_origin_y = data->y;
++	html->view_x = data->view_x;
++	html->view_w = data->view_w;
++	html->view_origin_x = data->x;
+ 
+ 	box = html->layout;
+ 	if (box == NULL) {
