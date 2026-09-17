@@ -11,6 +11,11 @@ on:
       - scripts/css-census.py
       - .github/workflows/css-census.yml
   workflow_dispatch:
+    inputs:
+      cutoff:
+        description: List properties dropped at least this many times
+        default: "60"
+        required: false
 
 jobs:
   census:
@@ -37,4 +42,4 @@ jobs:
       - name: Count what is understood and what is dropped
         run: python3 scripts/css-census.py fixtures/css-census.txt
         env:
-          CENSUS_CUTOFF: "60"
+          CENSUS_CUTOFF: ${{ inputs.cutoff || '60' }}
