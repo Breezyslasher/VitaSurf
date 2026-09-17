@@ -6318,9 +6318,13 @@ static size_t next_dynamic_import(const char *src, size_t len, size_t from,
 		} else if (c == '/' && i + 1 < len && src[i + 1] == '/') {
 			while (i < len && src[i] != '\n') i++;
 		} else if (c == '/' && i + 1 < len && src[i + 1] == '*') {
-			const char *e = memmem(src + i + 2, len - i - 2, "*/", 2);
-
-			i = e != NULL ? (size_t)(e - src) + 2 : len;
+			/* newlib has no memmem */
+			for (i += 2; i + 1 < len; i++) {
+				if (src[i] == '*' && src[i + 1] == '/') {
+					break;
+				}
+			}
+			i = i + 1 < len ? i + 2 : len;
 		} else if (c == 'i' && len - i >= 6 &&
 			   memcmp(src + i, "import", 6) == 0 &&
 			   (i == 0 || !is_ident_char((unsigned char)src[i - 1])) &&
