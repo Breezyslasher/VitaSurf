@@ -26,6 +26,11 @@ body { margin: 0; }
 .i { filter: blur(4px); width: 60px; }
 /* j: -webkit-filter alias */
 .j { -webkit-filter: opacity(0.25); }
+/* k: blur(4px) on a solid box: a solid core inset 4px and rings from 4px
+   inside the edge to 4px outside, alpha 7/8, 5/8, 3/8, 1/8 */
+.k { filter: blur(4px); }
+/* l: blurred text fades towards the background: black over white by 4/(4+4) */
+.l { filter: blur(4px); color: #000000; background: #ffffff; }
 </style>
 </head>
 <body>
@@ -39,6 +44,8 @@ body { margin: 0; }
 <div class="box h">inverted text</div>
 <div class="box i"></div>
 <div class="box j"></div>
+<div class="box k"></div>
+<div class="box l">smudge</div>
 <pre id="out"></pre>
 <script>
 var o = document.getElementById('out');

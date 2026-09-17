@@ -120,11 +120,20 @@ polygon, text is placed at its mapped anchor with its size scaled, a
 bitmap is resampled, and a box scaled to nothing paints nothing and
 takes no tap). The same batch reads Internet Explorer's `-ms-flex-*`
 spellings, with their `start`, `end`, `justify` and `distribute`
-keywords, as the standard properties. After this the census counts
-under four percent of declarations dropped on GitHub, MDN, Bootstrap
-and Tailwind's own pages, with no single property dropped sixty times
-or more. Each patch has a page under `tests/css/` that the monkey
-frontend checks; none of this batch has been verified on hardware yet.
+keywords, as the standard properties. Patch 0093 draws `blur()`, the
+one filter function that was read and not drawn: the plotters cannot
+blur what they have painted, so each shape is softened on its own. A
+filled rectangle gets a solid core and rings of falling alpha across
+the radius each side of its edge, a bitmap is box-blurred twice in a
+copy with a transparent margin, a filled path takes the soft rectangle
+of its bounding box, and text and strokes fade towards the colour under
+the box by an amount that grows with the radius. `backdrop-filter`
+stays accepted and ignored, since it would need what is already on the
+screen. After this the census counts under four percent of declarations
+dropped on GitHub, MDN, Bootstrap and Tailwind's own pages, with no
+single property dropped sixty times or more. Each patch has a page
+under `tests/css/` that the monkey frontend checks; none of this batch
+has been verified on hardware yet.
 
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic
