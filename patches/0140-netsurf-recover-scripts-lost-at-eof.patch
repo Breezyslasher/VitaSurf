@@ -103,10 +103,18 @@ index a8763458b..25c79518a 100644
  /* in html/redraw.c */
  bool html_redraw(struct content *c, struct content_redraw_data *data,
 diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
-index b99a6739e..534c1cf9d 100644
+index b99a6739e..c3036714a 100644
 --- a/content/handlers/html/script.c
 +++ b/content/handlers/html/script.c
-@@ -310,6 +310,134 @@ void html_report_scripts(html_content *c)
+@@ -37,6 +37,7 @@
+ #include "netsurf/content.h"
+ #include "javascript/js.h"
+ #include "content/content_protected.h"
++#include "content/llcache.h"
+ #include "content/content_factory.h"
+ #include "content/fetch.h"
+ #include "content/hlcache.h"
+@@ -310,6 +311,154 @@ void html_report_scripts(html_content *c)
  }
  
  
@@ -235,13 +243,33 @@ index b99a6739e..534c1cf9d 100644
 +	}
 +	dom_nodelist_unref(list);
 +
++	/*
++	 * The document ended somewhere it should not have. Say how much of
++	 * it arrived and how much the server said it was sending, because
++	 * that is what tells a short response apart from bytes lost on the
++	 * way in (VitaSurf).
++	 */
++	if (recovered > 0) {
++		const uint8_t *src;
++		size_t len = 0;
++		const char *declared;
++
++		src = content__get_source_data(&c->base, &len);
++		declared = llcache_handle_get_header(c->base.llcache,
++						     "Content-Length");
++		vita_log("parse: the document ended inside an element; "
++			 "%u bytes of it arrived and the server said it was "
++			 "sending %s", (unsigned) (src != NULL ? len : 0),
++			 declared != NULL ? declared : "no length");
++	}
++
 +	return recovered;
 +}
 +
  /**
   * Callback for asyncronous scripts
   */
-@@ -993,6 +1121,8 @@ html_process_script(void *ctx, dom_node *node)
+@@ -993,6 +1142,8 @@ html_process_script(void *ctx, dom_node *node)
  	NSLOG(netsurf, INFO, "content %p parser %p node %p", c, c->parser,
  	      node);
  
