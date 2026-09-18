@@ -4871,6 +4871,98 @@ static void inline_border_box(struct box *box, int *px, int *py,
 }
 
 /* ------------------------------------------------------------------------ */
+/* What a page asked for that is not there                                   */
+
+/*
+ * A page calls something the engine only pretends to have -- a canvas
+ * it cannot draw into, a codec, a storage API -- and nothing was said
+ * about it, so a page that came out wrong gave no clue what it wanted
+ * (VitaSurf). Each name is logged the first time a page uses it and
+ * counted, and the counts are reported when the page is closed.
+ */
+#define GAP_MAX 64
+
+struct js_gap {
+	char name[48];
+	unsigned int count;
+};
+
+static struct js_gap js_gaps[GAP_MAX];
+static unsigned int js_gap_count;
+static unsigned int js_gap_dropped;
+
+static void gap_reset(void)
+{
+	memset(js_gaps, 0, sizeof(js_gaps));
+	js_gap_count = 0;
+	js_gap_dropped = 0;
+}
+
+static void gap_report(void)
+{
+	char line[256];
+	unsigned int i, at = 0;
+
+	if (js_gap_count == 0) {
+		return;
+	}
+
+	line[0] = '\0';
+	for (i = 0; i < js_gap_count; i++) {
+		int n = snprintf(line + at, sizeof(line) - at, "%s%s x%u",
+				 at == 0 ? "" : ", ", js_gaps[i].name,
+				 js_gaps[i].count);
+
+		if (n < 0 || (unsigned int) n >= sizeof(line) - at) {
+			break;
+		}
+		at += (unsigned int) n;
+	}
+	vita_log("gap: the page used %u thing%s this build does not do%s: %s",
+		 js_gap_count, js_gap_count == 1 ? "" : "s",
+		 js_gap_dropped > 0 ? " (and more)" : "", line);
+}
+
+/** __vitaGap(name): the page used something that is not implemented. */
+static JSValue win_vita_gap(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv)
+{
+	const char *name;
+	unsigned int i;
+
+	(void) this_val;
+	if (argc < 1) {
+		return JS_UNDEFINED;
+	}
+	name = JS_ToCString(ctx, argv[0]);
+	if (name == NULL) {
+		return JS_UNDEFINED;
+	}
+
+	for (i = 0; i < js_gap_count; i++) {
+		if (strcmp(js_gaps[i].name, name) == 0) {
+			js_gaps[i].count++;
+			JS_FreeCString(ctx, name);
+			return JS_UNDEFINED;
+		}
+	}
+
+	if (js_gap_count < GAP_MAX) {
+		snprintf(js_gaps[js_gap_count].name,
+			 sizeof(js_gaps[js_gap_count].name), "%s", name);
+		js_gaps[js_gap_count].count = 1;
+		js_gap_count++;
+		vita_log("gap: not implemented, first use: %s", name);
+	} else {
+		js_gap_dropped++;
+	}
+	JS_FreeCString(ctx, name);
+
+	return JS_UNDEFINED;
+}
+
+
+/* ------------------------------------------------------------------------ */
 /* Canvas                                                                    */
 
 /**
@@ -5019,6 +5111,82 @@ static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
 	free(counts);
 
 	return JS_UNDEFINED;
+}
+
+
+/**
+ * __vitaCanvasText(node, x, y, text, colour, sizePx, family, weight,
+ *                  italic, align, baseline)
+ */
+static JSValue win_vita_canvas_text(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	const char *text;
+	size_t len = 0;
+	double x = 0, y = 0, size_px = 10;
+	uint32_t colour = 0;
+	int32_t family = 0, weight = 400, italic = 0, align = 0, baseline = 0;
+
+	(void) this_val;
+	if (argc < 6) {
+		return JS_UNDEFINED;
+	}
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_UNDEFINED;
+	}
+
+	JS_ToFloat64(ctx, &x, argv[1]);
+	JS_ToFloat64(ctx, &y, argv[2]);
+	text = JS_ToCStringLen(ctx, &len, argv[3]);
+	if (text == NULL) {
+		return JS_UNDEFINED;
+	}
+	JS_ToUint32(ctx, &colour, argv[4]);
+	JS_ToFloat64(ctx, &size_px, argv[5]);
+	if (argc > 6) JS_ToInt32(ctx, &family, argv[6]);
+	if (argc > 7) JS_ToInt32(ctx, &weight, argv[7]);
+	if (argc > 8) JS_ToInt32(ctx, &italic, argv[8]);
+	if (argc > 9) JS_ToInt32(ctx, &align, argv[9]);
+	if (argc > 10) JS_ToInt32(ctx, &baseline, argv[10]);
+
+	vita_canvas_text(canvas, x, y, text, (unsigned int) len, size_px,
+			 family, weight, italic != 0, colour, align, baseline);
+	vita_canvas_finish(canvas);
+	JS_FreeCString(ctx, text);
+
+	return JS_UNDEFINED;
+}
+
+
+/** __vitaCanvasMeasure(text, sizePx, family, weight, italic) */
+static JSValue win_vita_canvas_measure(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	const char *text;
+	size_t len = 0;
+	double size_px = 10, width;
+	int32_t family = 0, weight = 400, italic = 0;
+
+	(void) this_val;
+	if (argc < 2) {
+		return JS_NewFloat64(ctx, 0);
+	}
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (text == NULL) {
+		return JS_NewFloat64(ctx, 0);
+	}
+	JS_ToFloat64(ctx, &size_px, argv[1]);
+	if (argc > 2) JS_ToInt32(ctx, &family, argv[2]);
+	if (argc > 3) JS_ToInt32(ctx, &weight, argv[3]);
+	if (argc > 4) JS_ToInt32(ctx, &italic, argv[4]);
+
+	width = vita_canvas_text_width(text, (unsigned int) len, size_px,
+				       family, weight, italic != 0);
+	JS_FreeCString(ctx, text);
+
+	return JS_NewFloat64(ctx, width);
 }
 
 
@@ -5360,6 +5528,14 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaCanvasClear",
 			  JS_NewCFunction(ctx, win_vita_canvas_clear,
 					  "__vitaCanvasClear", 5));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasText",
+			  JS_NewCFunction(ctx, win_vita_canvas_text,
+					  "__vitaCanvasText", 11));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasMeasure",
+			  JS_NewCFunction(ctx, win_vita_canvas_measure,
+					  "__vitaCanvasMeasure", 5));
+	JS_SetPropertyStr(ctx, global, "__vitaGap",
+			  JS_NewCFunction(ctx, win_vita_gap, "__vitaGap", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaElementFromPoint",
 			  JS_NewCFunction(ctx, win_vita_element_from_point,
 					  "__vitaElementFromPoint", 2));
@@ -5722,6 +5898,8 @@ nserror js_closethread(jsthread *thread)
 	JS_RunGC(thread->heap->rt);
 	t1 = now_ms();
 	vitasurf_ms_teardown += (unsigned)(t1 - t0);
+	gap_report();
+	gap_reset();
 	vita_log("qjs: page closed in %u ms, runtime memory now %u KB",
 		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt));
 	return NSERROR_OK;

@@ -55,6 +55,12 @@ var HTML_TAGS=(' A ABBR ACRONYM ADDRESS APPLET AREA ARTICLE ASIDE AUDIO B BASE '
 var GLOBAL_ATTRS=(' accessKey autocapitalize autocorrect autofocus contentEditable '+
  'dir draggable enterKeyHint hidden inert inputMode lang nonce popover slot '+
  'spellcheck tabIndex title translate writingSuggestions itemScope ');
+/* A call the engine only pretends to answer is counted and named in the
+   log, so a page that comes out wrong says what it wanted rather than
+   leaving it to be guessed at. */
+function GAP(name,fn){return function(){
+ try{if(typeof __vitaGap==='function')__vitaGap(name);}catch(e){}
+ return fn?fn.apply(this,arguments):undefined;};}
 function reflectsOn(el,prop){
  if(GLOBAL_ATTRS.indexOf(' '+prop+' ')>=0)return true;
  var t=el.tagName;
@@ -1635,7 +1641,8 @@ if(!W.queueMicrotask)W.queueMicrotask=function(f){Promise.resolve().then(f);};
 if(!W.structuredClone)W.structuredClone=function(v){try{return JSON.parse(JSON.stringify(v));}catch(e){return v;}};
 /* MutationObserver is implemented further down, against the mutations
    qjs.c reports. */
-W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;
+W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=GAP('IntersectionObserver.observe');
+W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;
 W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};
 W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
 function Image(){return document.createElement('img');}W.Image=Image;
@@ -1676,7 +1683,7 @@ Object.defineProperties(URL.prototype,{
   set:function(v){var u=new URL(String(v));var self=this;
    ['protocol','username','password','hostname','port','pathname','hash'].forEach(function(k){self[k]=u[k];});
    this.searchParams=u.searchParams;}}});
-URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=function(){return 'blob:';};URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};URL.parse=function(u,b){try{return new URL(u,b);}catch(e){return null;}};
+URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=GAP('URL.createObjectURL',function(){return 'blob:';});URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};URL.parse=function(u,b){try{return new URL(u,b);}catch(e){return null;}};
 W.URL=URL;W.URLSearchParams=URLSearchParams;
 /* A dynamic import() in page code arrives here (qjs.c rewrites the call
  * with the importing script's name as base). QuickJS loads modules
@@ -2592,7 +2599,7 @@ P.setRangeText=function(rep,s,e){var v=String(this.value||'');
  if(s===undefined){s=this.selectionStart;e=this.selectionEnd;}
  this.value=v.slice(0,s)+String(rep)+v.slice(e);};
 P.select=function(){this.setSelectionRange(0,String(this.value||'').length);};
-P.showPicker=function(){};
+P.showPicker=GAP('input.showPicker');
 P.stepUp=function(n){this.value=(Number(this.value)||0)+(n===undefined?1:Number(n));};
 P.stepDown=function(n){this.stepUp(-(n===undefined?1:Number(n)));};
 Object.defineProperty(P,'valueAsNumber',{configurable:true,
@@ -2872,7 +2879,7 @@ Selection.prototype.selectAllChildren=function(n){var r=new Range();r.selectNode
 Selection.prototype.containsNode=function(n){return this._r.some(function(r){return r.intersectsNode(n);});};
 Selection.prototype.deleteFromDocument=function(){this._r.forEach(function(r){r.deleteContents();});};
 Selection.prototype.getComposedRanges=function(){return this._r.slice();};
-Selection.prototype.modify=function(){};
+Selection.prototype.modify=GAP('Selection.modify');
 Selection.prototype.toString=function(){return this._r.map(String).join('');};
 W.Selection=Selection;
 var theSelection=new Selection();
@@ -3307,7 +3314,7 @@ navigator.mimeTypes=(function(){var l=[];l.item=function(i){return this[i]||null
 navigator.plugins=(function(){var l=[];l.item=function(i){return this[i]||null;};
  l.namedItem=function(){return null;};l.refresh=function(){};return l;})();
 navigator.userActivation={hasBeenActive:true,isActive:false};
-navigator.registerProtocolHandler=navigator.unregisterProtocolHandler=function(){};
+navigator.registerProtocolHandler=navigator.unregisterProtocolHandler=GAP('navigator.registerProtocolHandler');
 navigator.taintEnabled=function(){return false;};
 
 /* --- odds and ends the specifications list ------------------------------- */
@@ -3463,7 +3470,7 @@ CSSStyleSheet.prototype.deleteRule=function(){};
 CSSStyleSheet.prototype.addRule=function(){return -1;};
 CSSStyleSheet.prototype.removeRule=function(){};
 CSSStyleSheet.prototype.replace=function(){return Promise.resolve(this);};
-CSSStyleSheet.prototype.replaceSync=function(){};
+CSSStyleSheet.prototype.replaceSync=GAP('CSSStyleSheet.replaceSync');
 W.CSSRule=CSSRule;W.CSSStyleRule=CSSRule;W.MediaList=MediaList;
 W.StyleSheet=W.CSSStyleSheet=CSSStyleSheet;
 Object.defineProperty(D,'styleSheets',{configurable:true,get:function(){
@@ -4189,7 +4196,6 @@ function CanvasRenderingContext2D(canvas){
    mode===2?Math.abs(c.lineWidth*scaleOf(c)):0);}
  C.fill=function(rule){draw(this,String(rule)==='evenodd'?1:0);};
  C.stroke=function(){draw(this,2);};
- C.clip=function(){};
  C.clearRect=function(x,y,w,h){
   if(!this.canvas||typeof __vitaCanvasClear!=='function')return;
   var a=tx(this,x,y),b=tx(this,x+w,y+h);
@@ -4204,19 +4210,60 @@ function CanvasRenderingContext2D(canvas){
  C.reset=function(){this.__m=[1,0,0,1,0,0];this.beginPath();
   if(this.canvas&&typeof __vitaCanvasClear==='function')
    __vitaCanvasClear(this.canvas,0,0,this.canvas.width||300,this.canvas.height||150);};
- ('drawFocusIfNeeded scrollPathIntoView fillText strokeText drawImage putImageData '+
-  'setLineDash createImageBitmap').split(' ').forEach(function(k){C[k]=function(){};});
+ /* the font shorthand, as much of it as a chart uses: an optional
+    style and weight, then the size, then the families */
+ function fontOf(c){
+  var f=String(c.font||'10px sans-serif');
+  var size=parseFloat(f)||10;
+  if(/\d(pt)\b/.test(f))size=size*96/72;
+  if(/\dem\b/.test(f))size=size*16;
+  var weight=/\b(bold|bolder|[6-9]00)\b/i.test(f)?700:400;
+  var m=/\b([1-9]00)\b/.exec(f);if(m)weight=parseInt(m[1],10);
+  var italic=/\b(italic|oblique)\b/i.test(f);
+  var fam=0;
+  if(/monospace|courier|consolas|menlo/i.test(f))fam=2;
+  else if(/serif/i.test(f)&&!/sans-serif/i.test(f))fam=1;
+  else if(/cursive/i.test(f))fam=3;
+  else if(/fantasy/i.test(f))fam=4;
+  return {size:size,weight:weight,italic:italic,family:fam};}
+ function alignOf(c){var a=String(c.textAlign||'start');
+  if(a==='center')return 1;
+  if(a==='right'||a==='end')return 2;
+  return 0;}
+ function baselineOf(c){var b=String(c.textBaseline||'alphabetic');
+  if(b==='top'||b==='hanging')return 1;
+  if(b==='middle')return 2;
+  if(b==='bottom'||b==='ideographic')return 3;
+  return 0;}
+ function text(c,str,x,y,colour){
+  if(!c.canvas||typeof __vitaCanvasText!=='function')return;
+  var f=fontOf(c),p=tx(c,x,y),sc=scaleOf(c);
+  __vitaCanvasText(c.canvas,p[0],p[1],String(str),colour,f.size*sc,
+   f.family,f.weight,f.italic?1:0,alignOf(c),baselineOf(c));}
+ C.fillText=function(str,x,y){text(this,str,x,y,
+  canvasColour(this.fillStyle,this.globalAlpha));};
+ C.strokeText=function(str,x,y){text(this,str,x,y,
+  canvasColour(this.strokeStyle,this.globalAlpha));};
+ ('drawFocusIfNeeded scrollPathIntoView drawImage putImageData '+
+  'setLineDash createImageBitmap').split(' ').forEach(function(k){
+   C[k]=GAP('canvas.'+k);});
+ C.clip=GAP('canvas.clip');
+ C.getImageData=GAP('canvas.getImageData',function(x,y,w,h){
+  return new ImageData(w,h);});
  C.isPointInPath=C.isPointInStroke=function(){return false;};
  C.getLineDash=function(){return [];};
- /* Enough of a width for code that centres text or sizes a box by it. */
- C.measureText=function(t){var px=parseFloat(this.font)||10;
-  return new TextMetrics(String(t).length*px*0.5);};
+ /* the width the glyphs actually take, so text a page centres or
+    boxes it sizes by measuring lands where it should */
+ C.measureText=function(t){var f=fontOf(this);
+  if(typeof __vitaCanvasMeasure==='function'){
+   return new TextMetrics(__vitaCanvasMeasure(String(t),f.size,f.family,
+    f.weight,f.italic?1:0));}
+  return new TextMetrics(String(t).length*f.size*0.5);};
  C.createLinearGradient=C.createRadialGradient=C.createConicGradient=
   function(){return new CanvasGradient();};
  C.createPattern=function(){return new CanvasPattern();};
  C.createImageData=function(w,h){return typeof w==='object'?
   new ImageData(w.width,w.height):new ImageData(w,h);};
- C.getImageData=function(x,y,w,h){return new ImageData(w,h);};
  C.getContextAttributes=function(){return {alpha:true,desynchronized:false,
   colorSpace:'srgb',willReadFrequently:false};};})();
 W.CanvasRenderingContext2D=CanvasRenderingContext2D;
@@ -4232,7 +4279,9 @@ P.getContext=function(kind){
  /* No WebGL: a page that asks for it must take its fallback path, and a
     context that answers every call while drawing nothing would keep it
     from ever doing that. */
- if(kind.indexOf('webgl')===0||kind==='webgpu')return null;
+ if(kind.indexOf('webgl')===0||kind==='webgpu'){
+  if(typeof __vitaGap==='function')__vitaGap('canvas.getContext('+kind+')');
+  return null;}
  if(!this.__ctx2d)Object.defineProperty(this,'__ctx2d',
   {configurable:true,writable:true,value:new CanvasRenderingContext2D(this)});
  return this.__ctx2d;};

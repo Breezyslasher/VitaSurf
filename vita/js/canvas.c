@@ -24,12 +24,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_GLYPH_H
+
 #include <dom/dom.h>
 
 #include "utils/corestrings.h"
 #include "utils/errors.h"
-#include "utils/log.h"
+#include "utils/utils.h"
 #include "netsurf/bitmap.h"
+#include "netsurf/browser.h"
+#include "netsurf/plot_style.h"
+#include "utils/utf8.h"
 #include "desktop/gui_internal.h"
 #include "desktop/bitmap.h"
 
@@ -150,9 +157,8 @@ struct vita_canvas *vita_canvas_get(struct dom_node *node,
 	if (bitmap == NULL) {
 		bytes = (unsigned int) (width * height * 4);
 		if (canvas_bytes + bytes > CANVAS_BYTES_MAX) {
-			NSLOG(netsurf, INFO,
-			      "canvas %dx%d refused, %u KB already taken",
-			      width, height, canvas_bytes / 1024);
+			vita_log("canvas %dx%d refused, %u KB already taken",
+				 width, height, canvas_bytes / 1024);
 			return NULL;
 		}
 
@@ -656,4 +662,187 @@ done:
 	/* the quads overlap at every joint, and the nonzero rule paints
 	 * the overlap once rather than darkening it */
 	canvas_fill_edges(c, &edges, rgba, false);
+}
+
+
+/*
+ * Text is drawn with the glyphs the frontend's font engine has, so a
+ * chart's labels look like the rest of the page. A build with no such
+ * engine -- the test harness is one -- leaves the symbol undefined and
+ * simply draws no text.
+ */
+extern FT_Glyph fb_getglyph(const plot_font_style_t *fstyle, uint32_t ucs4)
+		__attribute__((weak));
+
+
+/**
+ * The style the frontend's font engine wants for a canvas font.
+ */
+static void canvas_font_style(plot_font_style_t *fstyle, double size_px,
+			      int family, int weight, bool italic)
+{
+	int dpi = browser_get_dpi();
+
+	if (dpi <= 0) {
+		dpi = 90;
+	}
+	if (size_px < 1) {
+		size_px = 1;
+	}
+	if (size_px > 400) {
+		size_px = 400;
+	}
+
+	memset(fstyle, 0, sizeof(*fstyle));
+	fstyle->family = (plot_font_generic_family_t) family;
+	/* the engine takes a size in points at the screen's resolution */
+	fstyle->size = (plot_style_fixed) (size_px * 72.0 * PLOT_STYLE_SCALE /
+			dpi);
+	fstyle->weight = weight < 100 ? 400 : weight;
+	fstyle->flags = italic ? FONTF_ITALIC : FONTF_NONE;
+	fstyle->foreground = 0;
+	fstyle->background = 0xffffff;
+}
+
+
+/* exported function documented in canvas.h */
+double vita_canvas_text_width(const char *utf8, unsigned int len,
+			      double size_px, int family, int weight,
+			      bool italic)
+{
+	plot_font_style_t fstyle;
+	size_t at = 0;
+	double width = 0;
+
+	if (utf8 == NULL || len == 0) {
+		return 0;
+	}
+	if (fb_getglyph == NULL) {
+		/* no font engine: half an em a character is the guess the
+		 * engine used to make on its own */
+		return (double) len * size_px * 0.5;
+	}
+
+	canvas_font_style(&fstyle, size_px, family, weight, italic);
+
+	while (at < len) {
+		uint32_t ucs4 = utf8_to_ucs4(utf8 + at, len - at);
+		FT_Glyph glyph;
+
+		at = utf8_next(utf8, len, at);
+		glyph = fb_getglyph(&fstyle, ucs4);
+		if (glyph != NULL) {
+			width += (double) (glyph->advance.x >> 16);
+		}
+	}
+
+	return width;
+}
+
+
+/* exported function documented in canvas.h */
+void vita_canvas_text(struct vita_canvas *c, double x, double y,
+		      const char *utf8, unsigned int len, double size_px,
+		      int family, int weight, bool italic, uint32_t rgba,
+		      int align, int baseline)
+{
+	plot_font_style_t fstyle;
+	size_t at = 0;
+	double pen;
+	int ro = 0, go = 1, bo = 2, ao = 3;
+
+	if (c == NULL || utf8 == NULL || len == 0 || fb_getglyph == NULL) {
+		return;
+	}
+
+	canvas_font_style(&fstyle, size_px, family, weight, italic);
+	canvas_channel_shifts(&ro, &go, &bo, &ao);
+
+	switch (align) {
+	case 1:
+		x -= vita_canvas_text_width(utf8, len, size_px, family,
+					    weight, italic) / 2;
+		break;
+	case 2:
+		x -= vita_canvas_text_width(utf8, len, size_px, family,
+					    weight, italic);
+		break;
+	default:
+		break;
+	}
+
+	/* the engine draws from the baseline; the other baselines are
+	 * taken from the size, which is what a font's own metrics come to
+	 * within a pixel or two at the sizes a chart uses */
+	switch (baseline) {
+	case 1:
+		y += size_px * 0.8;
+		break;
+	case 2:
+		y += size_px * 0.3;
+		break;
+	case 3:
+		y -= size_px * 0.2;
+		break;
+	default:
+		break;
+	}
+
+	pen = x;
+	while (at < len) {
+		uint32_t ucs4 = utf8_to_ucs4(utf8 + at, len - at);
+		FT_BitmapGlyph bg;
+		FT_Glyph glyph;
+		int gx, gy, row, col;
+
+		at = utf8_next(utf8, len, at);
+		glyph = fb_getglyph(&fstyle, ucs4);
+		if (glyph == NULL) {
+			continue;
+		}
+		if (glyph->format != FT_GLYPH_FORMAT_BITMAP) {
+			pen += (double) (glyph->advance.x >> 16);
+			continue;
+		}
+
+		bg = (FT_BitmapGlyph) glyph;
+		gx = (int) lround(pen) + bg->left;
+		gy = (int) lround(y) - bg->top;
+
+		for (row = 0; row < (int) bg->bitmap.rows; row++) {
+			int py = gy + row;
+
+			if (py < 0 || py >= c->height) {
+				continue;
+			}
+			for (col = 0; col < (int) bg->bitmap.width; col++) {
+				int px = gx + col;
+				unsigned int cov;
+
+				if (px < 0 || px >= c->width) {
+					continue;
+				}
+				if (bg->bitmap.pixel_mode ==
+						FT_PIXEL_MODE_MONO) {
+					unsigned char byte = bg->bitmap.buffer[
+						row * bg->bitmap.pitch +
+						col / 8];
+
+					cov = (byte & (0x80 >> (col % 8))) ?
+							255 : 0;
+				} else {
+					cov = bg->bitmap.buffer[
+						row * bg->bitmap.pitch + col];
+				}
+				if (cov == 0) {
+					continue;
+				}
+				canvas_blend(c->pixels + py * c->stride +
+						px * 4, rgba, cov,
+					     ro, go, bo, ao);
+			}
+		}
+
+		pen += (double) (glyph->advance.x >> 16);
+	}
 }

@@ -69,6 +69,36 @@ void vita_canvas_stroke_path(struct vita_canvas *c, const double *pts,
 			     const int *counts, int nsub, uint32_t rgba,
 			     double line_width);
 
+/**
+ * Draw a run of text, as fillText does.
+ *
+ * The glyphs come from the frontend's own font engine, so a canvas and
+ * the page around it are drawn in the same typefaces.
+ *
+ * \param x, y      where the text goes, before alignment is applied
+ * \param utf8, len the text
+ * \param size_px   the font size in pixels
+ * \param family    a plot_font_generic_family_t
+ * \param weight    100 to 900, as CSS counts it
+ * \param italic    true for an italic or oblique face
+ * \param rgba      the colour, 0xRRGGBBAA
+ * \param align     0 left, 1 centre, 2 right
+ * \param baseline  0 alphabetic, 1 top, 2 middle, 3 bottom
+ */
+void vita_canvas_text(struct vita_canvas *c, double x, double y,
+		      const char *utf8, unsigned int len, double size_px,
+		      int family, int weight, bool italic, uint32_t rgba,
+		      int align, int baseline);
+
+/**
+ * How wide that run of text would be, in canvas pixels.
+ *
+ * Returns a rough guess when there is no font engine to ask.
+ */
+double vita_canvas_text_width(const char *utf8, unsigned int len,
+			      double size_px, int family, int weight,
+			      bool italic);
+
 /** Tell the renderer the bitmap changed. */
 void vita_canvas_finish(struct vita_canvas *c);
 
