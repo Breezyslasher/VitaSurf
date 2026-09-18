@@ -68,7 +68,7 @@ index 519edf8de..a8763458b 100644
  /* in html/redraw.c */
  bool html_redraw(struct content *c, struct content_redraw_data *data,
 diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
-index 3328165e3..1275d357b 100644
+index 3328165e3..b99a6739e 100644
 --- a/content/handlers/html/script.c
 +++ b/content/handlers/html/script.c
 @@ -185,6 +185,131 @@ static void script_fetch_settled(html_content *c)
@@ -299,7 +299,63 @@ index 3328165e3..1275d357b 100644
  			break;
  
  		case HTML_SCRIPT_ASYNC:
-@@ -814,6 +987,11 @@ html_process_script(void *ctx, dom_node *node)
+@@ -675,7 +848,6 @@ convert_script_preload_cb(hlcache_handle *script,
+ 	case CONTENT_MSG_DONE:
+ 		NSLOG(netsurf, INFO, "modulepreload %d done '%s'", i,
+ 		      nsurl_access(hlcache_handle_get_url(script)));
+-		parent->base.active--;
+ 		break;
+ 
+ 	case CONTENT_MSG_ERROR:
+@@ -684,19 +856,17 @@ convert_script_preload_cb(hlcache_handle *script,
+ 		      event->data.errordata.errormsg);
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+-		parent->base.active--;
+ 		break;
+ 
+ 	default:
+ 		break;
+ 	}
+ 
+-	if (parent->base.status != CONTENT_STATUS_DONE &&
+-	    html_can_begin_conversion(parent)) {
+-		html_begin_conversion(parent);
+-	}
+-	script_fetch_settled(parent);
+-
++	/*
++	 * Nothing is driven from here. The fetch was never counted among
++	 * the ones the conversion waits on, so it has no business ending
++	 * the parse: see the comment where it is started.
++	 */
+ 	return NSERROR_OK;
+ }
+ 
+@@ -773,7 +943,21 @@ bool html_process_module_preload(html_content *c, dom_string *href)
+ 		nscript->already_started = true;
+ 		return false;
+ 	}
+-	c->base.active++;
++
++	/*
++	 * A preload is a hint, not something the page's conversion waits
++	 * on, so it is deliberately not counted among the active fetches.
++	 *
++	 * It used to be, and that is what stopped Audiobookshelf. The
++	 * count reaching zero is what ends the parse, and a preload
++	 * finishing in the window after a sync script has run and before
++	 * the parser has read the rest of the document took it to zero
++	 * there. The parse was then completed underneath a tokeniser that
++	 * was still inside a script element, and hubbub closes a script
++	 * out at end of input without telling anyone about it -- so the
++	 * fourth bundle, the one that mounts the app, landed in the
++	 * document and was never fetched or run (VitaSurf).
++	 */
+ 	return true;
+ }
+ 
+@@ -814,6 +998,11 @@ html_process_script(void *ctx, dom_node *node)
  		mimetype = dom_string_ref(corestring_dom_text_javascript);
  	}
  
