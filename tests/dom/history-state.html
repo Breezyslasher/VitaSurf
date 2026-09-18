@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<!-- history was a set of empty functions, so a page that routes on its own
+     pushed a url, read the location back, and saw the old one. That is how
+     a single page app logs you in and then shows you the login page again.
+     Expected: PASS lines in the log. -->
+<html><head></head><body>
+<p>history</p>
+<script>
+(function(){
+ function report(ok, what, got, want) {
+  console.log((ok ? 'PASS ' : 'FAIL ') + what +
+              (ok ? '' : ' got ' + got + ', wanted ' + want));
+ }
+ var start = location.pathname;
+ var pops = [];
+ window.addEventListener('popstate', function(e){ pops.push(e.state); });
+
+ history.pushState({page: 1}, '', 'one.html');
+ report(/one\.html$/.test(location.pathname),
+        'pushState moves the path', location.pathname, 'one.html');
+ report(history.state && history.state.page === 1,
+        'pushState keeps the state', JSON.stringify(history.state), '{page:1}');
+
+ history.pushState({page: 2}, '', 'two.html');
+ report(history.length >= 3, 'the stack grows',
+        String(history.length), 'at least 3');
+
+ history.replaceState({page: 22}, '', 'two-b.html');
+ report(/two-b\.html$/.test(location.pathname),
+        'replaceState moves the path without growing the stack',
+        location.pathname, 'two-b.html');
+ report(history.state && history.state.page === 22,
+        'replaceState keeps the state',
+        JSON.stringify(history.state), '{page:22}');
+
+ history.back();
+ setTimeout(function(){
+  report(/one\.html$/.test(location.pathname),
+         'back returns to the previous entry', location.pathname, 'one.html');
+  report(history.state && history.state.page === 1,
+         'back restores that entry state',
+         JSON.stringify(history.state), '{page:1}');
+  report(pops.length === 1 && pops[0] && pops[0].page === 1,
+         'back fires popstate with the state',
+         pops.length + ' events', 'one carrying {page:1}');
+
+  history.forward();
+  setTimeout(function(){
+   report(/two-b\.html$/.test(location.pathname),
+          'forward goes back down the stack',
+          location.pathname, 'two-b.html');
+   /* a relative url resolves against the document, not the root */
+   report(location.pathname !== start || start === '/',
+          'the path actually changed from where it started',
+          location.pathname, 'not ' + start);
+  }, 120);
+ }, 120);
+})();
+</script>
+</body></html>
