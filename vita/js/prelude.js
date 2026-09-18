@@ -55,6 +55,12 @@ var HTML_TAGS=(' A ABBR ACRONYM ADDRESS APPLET AREA ARTICLE ASIDE AUDIO B BASE '
 var GLOBAL_ATTRS=(' accessKey autocapitalize autocorrect autofocus contentEditable '+
  'dir draggable enterKeyHint hidden inert inputMode lang nonce popover slot '+
  'spellcheck tabIndex title translate writingSuggestions itemScope ');
+/* A call the engine only pretends to answer is counted and named in the
+   log, so a page that comes out wrong says what it wanted rather than
+   leaving it to be guessed at. */
+function GAP(name,fn){return function(){
+ try{if(typeof __vitaGap==='function')__vitaGap(name);}catch(e){}
+ return fn?fn.apply(this,arguments):undefined;};}
 function reflectsOn(el,prop){
  if(GLOBAL_ATTRS.indexOf(' '+prop+' ')>=0)return true;
  var t=el.tagName;
@@ -68,7 +74,28 @@ Object.defineProperty(P,'lastElementChild',{configurable:true,get:function(){var
 Object.defineProperty(P,'parentElement',{configurable:true,get:function(){var p=this.parentNode;return p&&p.nodeType===1?p:null;}});
 Object.defineProperty(P,'innerText',{configurable:true,get:function(){return this.textContent;},set:function(v){this.textContent=v;}});
 Object.defineProperty(P,'outerHTML',{configurable:true,get:function(){return '';}});
-['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){if(!reflectsOn(this,a))return undefined;var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(attr,String(v));}});});
+/* A canvas, an image and a video report width and height as numbers,
+   and a charting library does arithmetic with them: as strings every
+   size it worked out came out as text joined together (VitaSurf). */
+var NUMERIC_SIZE=' CANVAS IMG VIDEO ';
+['width','height'].forEach(function(a){Object.defineProperty(P,a,{configurable:true,
+ get:function(){if(NUMERIC_SIZE.indexOf(' '+this.tagName+' ')<0)return undefined;
+  var v=this.getAttribute(a);
+  if(v===null||v==='')return this.tagName==='CANVAS'?(a==='width'?300:150):0;
+  var n=parseInt(v,10);return isNaN(n)?0:n;},
+ set:function(v){if(NUMERIC_SIZE.indexOf(' '+this.tagName+' ')<0)
+   return shadowProp(this,a,v);
+  this.setAttribute(a,String(Math.max(0,Math.round(Number(v))||0)));}});});
+['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;
+ /* width and height on a canvas, an image or a video are numbers, and
+    the accessors above already answer for those elements */
+ var numeric=(a==='width'||a==='height');
+ Object.defineProperty(P,a,{configurable:true,get:function(){
+  if(numeric&&NUMERIC_SIZE.indexOf(' '+this.tagName+' ')>=0){
+   var nv=this.getAttribute(a);
+   if(nv===null||nv==='')return this.tagName==='CANVAS'?(a==='width'?300:150):0;
+   var nn=parseInt(nv,10);return isNaN(nn)?0:nn;}
+  if(!reflectsOn(this,a))return undefined;var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(attr,String(v));}});});
 /* The URL-valued attributes reflect as resolved absolute URLs, not as
  * written. getAttribute still gives what the document said. Code tests
  * these against a scheme -- webpack decides its public path by matching
@@ -1614,7 +1641,12 @@ if(!W.queueMicrotask)W.queueMicrotask=function(f){Promise.resolve().then(f);};
 if(!W.structuredClone)W.structuredClone=function(v){try{return JSON.parse(JSON.stringify(v));}catch(e){return v;}};
 /* MutationObserver is implemented further down, against the mutations
    qjs.c reports. */
-W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;
+W.ResizeObserver=W.PerformanceObserver=function(){};
+W.ResizeObserver.prototype.observe=W.ResizeObserver.prototype.unobserve=
+ W.ResizeObserver.prototype.disconnect=function(){};
+W.PerformanceObserver.prototype=W.ResizeObserver.prototype;
+/* IntersectionObserver is implemented further down, against the page's
+   own geometry; it decides whether a lazily built list ever appears. */
 W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};
 W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
 function Image(){return document.createElement('img');}W.Image=Image;
@@ -1655,7 +1687,7 @@ Object.defineProperties(URL.prototype,{
   set:function(v){var u=new URL(String(v));var self=this;
    ['protocol','username','password','hostname','port','pathname','hash'].forEach(function(k){self[k]=u[k];});
    this.searchParams=u.searchParams;}}});
-URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=function(){return 'blob:';};URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};URL.parse=function(u,b){try{return new URL(u,b);}catch(e){return null;}};
+URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=GAP('URL.createObjectURL',function(){return 'blob:';});URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};URL.parse=function(u,b){try{return new URL(u,b);}catch(e){return null;}};
 W.URL=URL;W.URLSearchParams=URLSearchParams;
 /* A dynamic import() in page code arrives here (qjs.c rewrites the call
  * with the importing script's name as base). QuickJS loads modules
@@ -2571,7 +2603,7 @@ P.setRangeText=function(rep,s,e){var v=String(this.value||'');
  if(s===undefined){s=this.selectionStart;e=this.selectionEnd;}
  this.value=v.slice(0,s)+String(rep)+v.slice(e);};
 P.select=function(){this.setSelectionRange(0,String(this.value||'').length);};
-P.showPicker=function(){};
+P.showPicker=GAP('input.showPicker');
 P.stepUp=function(n){this.value=(Number(this.value)||0)+(n===undefined?1:Number(n));};
 P.stepDown=function(n){this.stepUp(-(n===undefined?1:Number(n)));};
 Object.defineProperty(P,'valueAsNumber',{configurable:true,
@@ -2851,7 +2883,7 @@ Selection.prototype.selectAllChildren=function(n){var r=new Range();r.selectNode
 Selection.prototype.containsNode=function(n){return this._r.some(function(r){return r.intersectsNode(n);});};
 Selection.prototype.deleteFromDocument=function(){this._r.forEach(function(r){r.deleteContents();});};
 Selection.prototype.getComposedRanges=function(){return this._r.slice();};
-Selection.prototype.modify=function(){};
+Selection.prototype.modify=GAP('Selection.modify');
 Selection.prototype.toString=function(){return this._r.map(String).join('');};
 W.Selection=Selection;
 var theSelection=new Selection();
@@ -3286,7 +3318,7 @@ navigator.mimeTypes=(function(){var l=[];l.item=function(i){return this[i]||null
 navigator.plugins=(function(){var l=[];l.item=function(i){return this[i]||null;};
  l.namedItem=function(){return null;};l.refresh=function(){};return l;})();
 navigator.userActivation={hasBeenActive:true,isActive:false};
-navigator.registerProtocolHandler=navigator.unregisterProtocolHandler=function(){};
+navigator.registerProtocolHandler=navigator.unregisterProtocolHandler=GAP('navigator.registerProtocolHandler');
 navigator.taintEnabled=function(){return false;};
 
 /* --- odds and ends the specifications list ------------------------------- */
@@ -3442,7 +3474,7 @@ CSSStyleSheet.prototype.deleteRule=function(){};
 CSSStyleSheet.prototype.addRule=function(){return -1;};
 CSSStyleSheet.prototype.removeRule=function(){};
 CSSStyleSheet.prototype.replace=function(){return Promise.resolve(this);};
-CSSStyleSheet.prototype.replaceSync=function(){};
+CSSStyleSheet.prototype.replaceSync=GAP('CSSStyleSheet.replaceSync');
 W.CSSRule=CSSRule;W.CSSStyleRule=CSSRule;W.MediaList=MediaList;
 W.StyleSheet=W.CSSStyleSheet=CSSStyleSheet;
 Object.defineProperty(D,'styleSheets',{configurable:true,get:function(){
@@ -3951,10 +3983,151 @@ reflectBool([['shadowRootDelegatesFocus','shadowrootdelegatesfocus'],
  ['shadowRootClonable','shadowrootclonable'],['shadowRootSerializable','shadowrootserializable']]);
 Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
  get:function(){return W.customElements;}});
-(function(){var I=W.IntersectionObserver;if(!I)return;
- I.prototype.rootMargin='0px';I.prototype.scrollMargin='0px';I.prototype.thresholds=[0];
- I.prototype.delay=0;I.prototype.trackVisibility=false;I.prototype.root=null;
- I.prototype.takeRecords=function(){return [];};})();
+/* --- IntersectionObserver ------------------------------------------------
+   A stub here meant a page built around "render it when it scrolls into
+   view" rendered nothing: openmediavault's dashboard widgets and
+   Audiobookshelf's shelves both wait on this, and both came up empty.
+   It is answered from the same geometry the rest of the bindings use --
+   the element's box against the viewport -- and re-checked when the
+   page scrolls, when it is resized, and when its DOM changes, which
+   between them cover every reason an element's visibility can change
+   without a poll running all the time. */
+(function(){
+ var observers=[],timer=null,lastScroll='',lastGen=-1;
+
+ function parseMargin(m){
+  /* one to four lengths, as the CSS margin shorthand is written; a
+     percentage is of the root's own size, which is the viewport */
+  var parts=String(m==null?'0px':m).trim().split(/\s+/),v=[],i;
+  for(i=0;i<4;i++)v.push(parts[Math.min(i,parts.length-1)]);
+  if(parts.length===2)v=[parts[0],parts[1],parts[0],parts[1]];
+  else if(parts.length===3)v=[parts[0],parts[1],parts[2],parts[1]];
+  return v;}
+
+ function marginPx(val,of){
+  var n=parseFloat(val)||0;
+  return /%/.test(val)?n*of/100:n;}
+
+ function rootRect(o){
+  var s=viewport();
+  if(o.root&&o.root.nodeType===1){
+   var b=__vitaBox(o.root);
+   if(b)return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
+  return {left:0,top:0,width:s[2],height:s[3]};}
+
+ function rectOf(el){
+  var b=__vitaBox(el);
+  if(!b)return null;
+  var s=viewport();
+  return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
+
+ function box(r){
+  return {x:r.left,y:r.top,left:r.left,top:r.top,width:r.width,
+   height:r.height,right:r.left+r.width,bottom:r.top+r.height,
+   toJSON:function(){return this;}};}
+
+ function check(o,force){
+  var root=rootRect(o),m=o.__margin,i,records=[];
+  var rl=root.left-marginPx(m[3],root.width);
+  var rt=root.top-marginPx(m[0],root.height);
+  var rr=root.left+root.width+marginPx(m[1],root.width);
+  var rb=root.top+root.height+marginPx(m[2],root.height);
+  var bounds={left:rl,top:rt,width:rr-rl,height:rb-rt};
+
+  for(i=0;i<o.__targets.length;i++){
+   var t=o.__targets[i],r=rectOf(t.el);
+   if(!r){ r={left:0,top:0,width:0,height:0}; }
+   var ix=Math.max(r.left,rl),iy=Math.max(r.top,rt);
+   var ax=Math.min(r.left+r.width,rr),ay=Math.min(r.top+r.height,rb);
+   var iw=Math.max(0,ax-ix),ih=Math.max(0,ay-iy);
+   var area=r.width*r.height;
+   var ratio=area>0?(iw*ih)/area:(iw>0&&ih>0?1:0);
+   var hit=iw>0&&ih>0;
+   /* report only when a threshold has actually been crossed, so a
+      scroll does not call the page back on every frame */
+   var step=0,k;
+   for(k=0;k<o.thresholds.length;k++){
+    if(ratio>=o.thresholds[k])step=k+1;}
+   if(!force&&t.step===step&&t.hit===hit)continue;
+   t.step=step;t.hit=hit;
+   records.push({target:t.el,time:(W.performance&&performance.now)?
+     performance.now():Date.now(),
+    rootBounds:box(bounds),boundingClientRect:box(r),
+    intersectionRect:box({left:hit?ix:0,top:hit?iy:0,
+     width:iw,height:ih}),
+    intersectionRatio:ratio,isIntersecting:hit});}
+
+  if(records.length===0)return;
+  o.__queue=o.__queue.concat(records);
+  try{o.__cb.call(o,records,o);}catch(e){
+   if(W.console&&console.error)console.error('IntersectionObserver: '+e);}
+  o.__queue=[];}
+
+ function checkAll(force){
+  for(var i=0;i<observers.length;i++){
+   if(observers[i].__targets.length)check(observers[i],force);}}
+
+ function tick(){
+  var s=viewport(),key=s[0]+','+s[1]+','+s[2]+','+s[3];
+  var g=W.__vitaDomGen?W.__vitaDomGen():-1;
+  var live=0,i;
+
+  for(i=0;i<observers.length;i++)live+=observers[i].__targets.length;
+  if(live===0){ if(timer!==null){clearInterval(timer);timer=null;} return; }
+  /* nothing that could move anything has happened */
+  if(key===lastScroll&&g===lastGen)return;
+  lastScroll=key;lastGen=g;
+  checkAll(false);}
+
+ function wake(){
+  if(timer===null)timer=setInterval(tick,250);}
+
+ function IntersectionObserver(cb,opts){
+  if(typeof cb!=='function')
+   throw new TypeError('IntersectionObserver needs a callback');
+  opts=opts||{};
+  var th=opts.threshold;
+  if(th==null)th=[0];
+  if(typeof th==='number')th=[th];
+  th=Array.prototype.slice.call(th).map(Number).filter(function(n){
+   return n>=0&&n<=1;}).sort(function(a,b){return a-b;});
+  if(th.length===0)th=[0];
+  this.root=opts.root||null;
+  this.rootMargin=String(opts.rootMargin==null?'0px':opts.rootMargin);
+  this.scrollMargin=String(opts.scrollMargin==null?'0px':opts.scrollMargin);
+  this.thresholds=th;
+  this.delay=Number(opts.delay)||0;
+  this.trackVisibility=!!opts.trackVisibility;
+  this.__cb=cb;this.__targets=[];this.__queue=[];
+  this.__margin=parseMargin(this.rootMargin);
+  observers.push(this);}
+
+ IntersectionObserver.prototype.observe=function(el){
+  if(!el||el.nodeType!==1)return;
+  for(var i=0;i<this.__targets.length;i++)
+   if(this.__targets[i].el===el)return;
+  this.__targets.push({el:el,step:-1,hit:null});
+  wake();
+  /* the specification delivers a first record for a new target without
+     waiting for anything to move, and a page that builds its list from
+     that first call depends on it */
+  var self=this;
+  setTimeout(function(){ check(self,false); },0);};
+
+ IntersectionObserver.prototype.unobserve=function(el){
+  for(var i=0;i<this.__targets.length;i++){
+   if(this.__targets[i].el===el){this.__targets.splice(i,1);return;}}};
+
+ IntersectionObserver.prototype.disconnect=function(){
+  this.__targets.length=0;};
+
+ IntersectionObserver.prototype.takeRecords=function(){
+  var q=this.__queue;this.__queue=[];return q;};
+
+ W.IntersectionObserver=IntersectionObserver;
+ W.addEventListener('scroll',function(){tick();},true);
+ W.addEventListener('resize',function(){lastScroll='';tick();});
+})();
 
 /* --- screen, fetch bodies and the rest ---------------------------------- */
 (function(){var s=W.screen||{};W.screen=s;
@@ -4007,13 +4180,64 @@ function ImageData(w,h){
  if(typeof w==='object'){this.data=w;this.width=h||0;this.height=arguments[2]||0;}
  else{this.width=w|0;this.height=h|0;this.data=new Uint8ClampedArray(this.width*this.height*4);}
  this.colorSpace='srgb';}
-function CanvasGradient(){}
-CanvasGradient.prototype.addColorStop=function(){};
+/* A gradient carries its geometry in the user space of the context that
+   made it, and its stops in source order; the rasteriser mixes them
+   across the shape being filled. kind 1 is linear, 2 radial, 3 conic. */
+function CanvasGradient(kind,g){this.__kind=kind;this.__g=g;this.__stops=[];}
+CanvasGradient.prototype.addColorStop=function(o,c){
+ o=parseFloat(o); if(!(o>=0))o=0; if(o>1)o=1;
+ this.__stops.push([o,c]);
+ this.__stops.sort(function(a,b){return a[0]-b[0];});};
 function CanvasPattern(){}
 CanvasPattern.prototype.setTransform=function(){};
 function Path2D(){}
 ['addPath','closePath','moveTo','lineTo','bezierCurveTo','quadraticCurveTo','arc','arcTo',
  'ellipse','rect','roundRect'].forEach(function(k){Path2D.prototype[k]=function(){};});
+/* The 2D context draws for real: it keeps the state a page sets, turns
+   curves into line segments, applies its own transform, and hands the
+   points to the rasteriser behind __vitaCanvasPath, which fills the
+   bitmap the renderer paints for the element. Text, images and clipping
+   are not drawn yet. */
+var CANVAS_NAMES={black:0x000000,silver:0xc0c0c0,gray:0x808080,grey:0x808080,
+ white:0xffffff,maroon:0x800000,red:0xff0000,purple:0x800080,fuchsia:0xff00ff,
+ magenta:0xff00ff,green:0x008000,lime:0x00ff00,olive:0x808000,yellow:0xffff00,
+ navy:0x000080,blue:0x0000ff,teal:0x008080,aqua:0x00ffff,cyan:0x00ffff,
+ orange:0xffa500,pink:0xffc0cb,brown:0xa52a2a,gold:0xffd700,
+ lightgray:0xd3d3d3,lightgrey:0xd3d3d3,darkgray:0xa9a9a9,darkgrey:0xa9a9a9,
+ lightblue:0xadd8e6,darkblue:0x00008b,lightgreen:0x90ee90,darkgreen:0x006400,
+ dimgray:0x696969,dimgrey:0x696969,whitesmoke:0xf5f5f5,gainsboro:0xdcdcdc};
+function canvasColour(v,alpha){
+ /* to 0xRRGGBBAA, the form the rasteriser takes */
+ if(v&&typeof v==='object'){
+  var st=v.__stops;
+  v=(st&&st.length)?st[st.length-1][1]:'#000000';
+ }
+ var s=String(v==null?'#000000':v).trim();
+ var r=0,g=0,b=0,a=1,m;
+ if(s.charAt(0)==='#'){
+  if(s.length===4||s.length===5){
+   r=parseInt(s.charAt(1)+s.charAt(1),16);g=parseInt(s.charAt(2)+s.charAt(2),16);
+   b=parseInt(s.charAt(3)+s.charAt(3),16);
+   if(s.length===5)a=parseInt(s.charAt(4)+s.charAt(4),16)/255;
+  }else if(s.length>=7){
+   r=parseInt(s.substr(1,2),16);g=parseInt(s.substr(3,2),16);b=parseInt(s.substr(5,2),16);
+   if(s.length>=9)a=parseInt(s.substr(7,2),16)/255;
+  }
+ }else if((m=/^rgba?\(([^)]*)\)$/i.exec(s))){
+  var p=m[1].split(/[,\/\s]+/).filter(function(x){return x!=='';});
+  r=parseFloat(p[0]);g=parseFloat(p[1]);b=parseFloat(p[2]);
+  if(p.length>3)a=p[3].indexOf('%')>=0?parseFloat(p[3])/100:parseFloat(p[3]);
+  if(String(p[0]).indexOf('%')>=0){r=r*255/100;g=g*255/100;b=b*255/100;}
+ }else if(/^transparent$/i.test(s)){a=0;}
+ else{var nc=CANVAS_NAMES[s.toLowerCase()];
+  if(nc!=null){r=(nc>>16)&255;g=(nc>>8)&255;b=nc&255;}}
+ if(!(a>=0))a=1;if(a>1)a=1;
+ a*=(alpha==null?1:alpha);
+ r=Math.max(0,Math.min(255,Math.round(r)));
+ g=Math.max(0,Math.min(255,Math.round(g)));
+ b=Math.max(0,Math.min(255,Math.round(b)));
+ return ((r<<24)>>>0)+(g<<16)+(b<<8)+Math.round(Math.max(0,Math.min(255,a*255)));
+}
 function CanvasRenderingContext2D(canvas){
  this.canvas=canvas;this.fillStyle='#000000';this.strokeStyle='#000000';
  this.lineWidth=1;this.lineCap='butt';this.lineJoin='miter';this.miterLimit=10;
@@ -4023,25 +4247,233 @@ function CanvasRenderingContext2D(canvas){
  this.fontVariantCaps='normal';this.textRendering='auto';
  this.globalAlpha=1;this.globalCompositeOperation='source-over';this.filter='none';
  this.imageSmoothingEnabled=true;this.imageSmoothingQuality='low';
- this.shadowBlur=0;this.shadowColor='rgba(0, 0, 0, 0)';this.shadowOffsetX=0;this.shadowOffsetY=0;}
+ this.shadowBlur=0;this.shadowColor='rgba(0, 0, 0, 0)';this.shadowOffsetX=0;this.shadowOffsetY=0;
+ this.__m=[1,0,0,1,0,0];      /* the current transform */
+ this.__stack=[];             /* what save() put by */
+ this.__subs=[];              /* the path, subpath by subpath */
+ this.__cur=null;             /* the subpath being added to */
+ this.__start=null;           /* where the current subpath began */
+}
 (function(){var C=CanvasRenderingContext2D.prototype;
- ('save restore scale rotate translate transform setTransform resetTransform reset '+
-  'clearRect fillRect strokeRect beginPath closePath moveTo lineTo bezierCurveTo '+
-  'quadraticCurveTo arc arcTo ellipse rect roundRect fill stroke clip drawFocusIfNeeded '+
-  'scrollPathIntoView fillText strokeText drawImage putImageData setLineDash '+
-  'createImageBitmap').split(' ').forEach(function(k){C[k]=function(){};});
+ /* a point through the current transform */
+ function tx(c,x,y){var m=c.__m;return [m[0]*x+m[2]*y+m[4],m[1]*x+m[3]*y+m[5]];}
+ /* roughly how much the transform scales lengths */
+ function scaleOf(c){var m=c.__m;
+  return Math.sqrt(Math.abs(m[0]*m[3]-m[1]*m[2]))||1;}
+ function push(c,x,y){var p=tx(c,x,y);
+  if(c.__cur===null){c.__cur=[];c.__subs.push(c.__cur);}
+  c.__cur.push(p[0],p[1]);}
+ C.save=function(){this.__stack.push({m:this.__m.slice(),fill:this.fillStyle,
+  stroke:this.strokeStyle,lw:this.lineWidth,ga:this.globalAlpha,font:this.font,
+  align:this.textAlign,base:this.textBaseline,cap:this.lineCap,join:this.lineJoin});
+  if(this.__stack.length>64)this.__stack.shift();};
+ C.restore=function(){var s=this.__stack.pop();if(!s)return;
+  this.__m=s.m;this.fillStyle=s.fill;this.strokeStyle=s.stroke;this.lineWidth=s.lw;
+  this.globalAlpha=s.ga;this.font=s.font;this.textAlign=s.align;
+  this.textBaseline=s.base;this.lineCap=s.cap;this.lineJoin=s.join;};
+ C.setTransform=function(a,b,c,d,e,f){
+  if(a&&typeof a==='object'){this.__m=[a.a||0,a.b||0,a.c||0,a.d||0,a.e||0,a.f||0];}
+  else this.__m=[a,b,c,d,e,f];};
+ C.resetTransform=function(){this.__m=[1,0,0,1,0,0];};
+ C.transform=function(a,b,c,d,e,f){var m=this.__m;
+  this.__m=[m[0]*a+m[2]*b,m[1]*a+m[3]*b,m[0]*c+m[2]*d,m[1]*c+m[3]*d,
+            m[0]*e+m[2]*f+m[4],m[1]*e+m[3]*f+m[5]];};
+ C.translate=function(x,y){this.transform(1,0,0,1,x,y);};
+ C.scale=function(x,y){this.transform(x,0,0,y,0,0);};
+ C.rotate=function(r){var c=Math.cos(r),s=Math.sin(r);this.transform(c,s,-s,c,0,0);};
+ C.getTransform=function(){var m=this.__m;
+  return {a:m[0],b:m[1],c:m[2],d:m[3],e:m[4],f:m[5],is2D:true,
+   isIdentity:m[0]===1&&m[1]===0&&m[2]===0&&m[3]===1&&m[4]===0&&m[5]===0};};
+ C.beginPath=function(){this.__subs=[];this.__cur=null;this.__start=null;};
+ C.moveTo=function(x,y){this.__cur=null;this.__start=[x,y];push(this,x,y);};
+ C.lineTo=function(x,y){if(this.__cur===null&&this.__start===null)this.__start=[x,y];
+  push(this,x,y);};
+ C.closePath=function(){if(this.__cur&&this.__start)push(this,this.__start[0],this.__start[1]);
+  this.__cur=null;};
+ C.bezierCurveTo=function(x1,y1,x2,y2,x,y){
+  var p=this.__cur?null:0,last=this.__cur&&this.__cur.length>=2?
+   this.__cur.slice(this.__cur.length-2):null;
+  /* the start of the curve is where the path is now, in user space:
+     it is easier to keep the user-space cursor than to invert */
+  var sx=this.__ux==null?0:this.__ux, sy=this.__uy==null?0:this.__uy;
+  var n=16,i,t,mt;
+  for(i=1;i<=n;i++){t=i/n;mt=1-t;
+   push(this,mt*mt*mt*sx+3*mt*mt*t*x1+3*mt*t*t*x2+t*t*t*x,
+             mt*mt*mt*sy+3*mt*mt*t*y1+3*mt*t*t*y2+t*t*t*y);}
+  this.__ux=x;this.__uy=y;};
+ C.quadraticCurveTo=function(cx,cy,x,y){
+  var sx=this.__ux==null?0:this.__ux, sy=this.__uy==null?0:this.__uy;
+  var n=12,i,t,mt;
+  for(i=1;i<=n;i++){t=i/n;mt=1-t;
+   push(this,mt*mt*sx+2*mt*t*cx+t*t*x, mt*mt*sy+2*mt*t*cy+t*t*y);}
+  this.__ux=x;this.__uy=y;};
+ C.arc=function(x,y,r,a0,a1,ccw){
+  if(!(r>0))r=0;
+  var span=a1-a0,i,n,step;
+  if(ccw){ if(span>0)span-=Math.ceil(span/(2*Math.PI))*2*Math.PI;
+   if(span<=-2*Math.PI)span=-2*Math.PI; }
+  else { if(span<0)span+=Math.ceil(-span/(2*Math.PI))*2*Math.PI;
+   if(span>=2*Math.PI)span=2*Math.PI; }
+  n=Math.max(4,Math.ceil(Math.abs(span)*Math.max(4,Math.min(48,r*scaleOf(this)/2))/1.5));
+  if(n>256)n=256;
+  step=span/n;
+  for(i=0;i<=n;i++)push(this,x+r*Math.cos(a0+step*i),y+r*Math.sin(a0+step*i));
+  this.__ux=x+r*Math.cos(a1);this.__uy=y+r*Math.sin(a1);};
+ C.ellipse=function(x,y,rx,ry,rot,a0,a1,ccw){
+  var span=a1-a0,i,n,t,cx,cy,co=Math.cos(rot||0),si=Math.sin(rot||0);
+  if(ccw&&span>0)span-=2*Math.PI; if(!ccw&&span<0)span+=2*Math.PI;
+  n=Math.max(8,Math.min(128,Math.ceil(Math.abs(span)*12)));
+  for(i=0;i<=n;i++){t=a0+span*i/n;cx=rx*Math.cos(t);cy=ry*Math.sin(t);
+   push(this,x+cx*co-cy*si,y+cx*si+cy*co);}};
+ C.arcTo=function(x1,y1,x2,y2,r){ this.lineTo(x1,y1); this.lineTo(x2,y2); };
+ C.rect=function(x,y,w,h){this.__cur=null;this.__start=[x,y];
+  push(this,x,y);push(this,x+w,y);push(this,x+w,y+h);push(this,x,y+h);
+  push(this,x,y);this.__cur=null;this.__ux=x;this.__uy=y;};
+ C.roundRect=function(x,y,w,h,r){this.rect(x,y,w,h);};
+ function flatten(c){
+  var subs=c.__subs,counts=[],total=0,i,j;
+  for(i=0;i<subs.length;i++){if(subs[i].length>=4){counts.push(subs[i].length/2);
+   total+=subs[i].length;}}
+  if(counts.length===0)return null;
+  var pts=new Float64Array(total),at=0;
+  for(i=0;i<subs.length;i++){if(subs[i].length<4)continue;
+   for(j=0;j<subs[i].length;j++)pts[at++]=subs[i][j];}
+  return {pts:pts,counts:counts};}
+ /* What the rasteriser is asked to lay down: a colour, or a gradient
+    flattened to [kind,x0,y0,r0,x1,y1,r1,angle, offset,colour, ...] with
+    its geometry put through the current transform, because a gradient
+    is defined in the user space of the fill that uses it. A radius
+    takes the transform's average scale, so a circle under a stretched
+    transform stays a circle rather than becoming the ellipse it should
+    be; charts scale evenly and do not notice. */
+ function paintOf(c,style,alpha){
+  if(!style||typeof style!=='object'||!style.__g)
+   return canvasColour(style,alpha);
+  var g=style.__g,sc=scaleOf(c),m=c.__m,i;
+  var a=tx(c,g[0],g[1]),b=tx(c,g[3],g[4]);
+  var out=[style.__kind,a[0],a[1],g[2]*sc,b[0],b[1],g[5]*sc,
+           (g[6]||0)+Math.atan2(m[1],m[0])];
+  for(i=0;i<style.__stops.length;i++){
+   out.push(style.__stops[i][0],canvasColour(style.__stops[i][1],alpha));}
+  return out;}
+ function draw(c,mode){
+  if(!c.canvas||typeof __vitaCanvasPath!=='function')return;
+  var f=flatten(c);if(!f)return;
+  var paint=paintOf(c,mode===2?c.strokeStyle:c.fillStyle,c.globalAlpha);
+  __vitaCanvasPath(c.canvas,f.pts,f.counts,paint,mode,
+   mode===2?Math.abs(c.lineWidth*scaleOf(c)):0);}
+ C.fill=function(rule){draw(this,String(rule)==='evenodd'?1:0);};
+ C.stroke=function(){draw(this,2);};
+ C.clearRect=function(x,y,w,h){
+  if(!this.canvas||typeof __vitaCanvasClear!=='function')return;
+  var a=tx(this,x,y),b=tx(this,x+w,y+h);
+  __vitaCanvasClear(this.canvas,Math.min(a[0],b[0]),Math.min(a[1],b[1]),
+   Math.abs(b[0]-a[0]),Math.abs(b[1]-a[1]));};
+ C.fillRect=function(x,y,w,h){var keep=this.__subs,kc=this.__cur,ks=this.__start;
+  this.__subs=[];this.__cur=null;this.rect(x,y,w,h);draw(this,0);
+  this.__subs=keep;this.__cur=kc;this.__start=ks;};
+ C.strokeRect=function(x,y,w,h){var keep=this.__subs,kc=this.__cur,ks=this.__start;
+  this.__subs=[];this.__cur=null;this.rect(x,y,w,h);draw(this,2);
+  this.__subs=keep;this.__cur=kc;this.__start=ks;};
+ C.reset=function(){this.__m=[1,0,0,1,0,0];this.beginPath();
+  if(this.canvas&&typeof __vitaCanvasClear==='function')
+   __vitaCanvasClear(this.canvas,0,0,this.canvas.width||300,this.canvas.height||150);};
+ /* the font shorthand, as much of it as a chart uses: an optional
+    style and weight, then the size, then the families */
+ function fontOf(c){
+  var f=String(c.font||'10px sans-serif');
+  var size=parseFloat(f)||10;
+  if(/\d(pt)\b/.test(f))size=size*96/72;
+  if(/\dem\b/.test(f))size=size*16;
+  var weight=/\b(bold|bolder|[6-9]00)\b/i.test(f)?700:400;
+  var m=/\b([1-9]00)\b/.exec(f);if(m)weight=parseInt(m[1],10);
+  var italic=/\b(italic|oblique)\b/i.test(f);
+  var fam=0;
+  if(/monospace|courier|consolas|menlo/i.test(f))fam=2;
+  else if(/serif/i.test(f)&&!/sans-serif/i.test(f))fam=1;
+  else if(/cursive/i.test(f))fam=3;
+  else if(/fantasy/i.test(f))fam=4;
+  return {size:size,weight:weight,italic:italic,family:fam};}
+ function alignOf(c){var a=String(c.textAlign||'start');
+  if(a==='center')return 1;
+  if(a==='right'||a==='end')return 2;
+  return 0;}
+ function baselineOf(c){var b=String(c.textBaseline||'alphabetic');
+  if(b==='top'||b==='hanging')return 1;
+  if(b==='middle')return 2;
+  if(b==='bottom'||b==='ideographic')return 3;
+  return 0;}
+ function text(c,str,x,y,colour){
+  if(!c.canvas||typeof __vitaCanvasText!=='function')return;
+  var f=fontOf(c),p=tx(c,x,y),sc=scaleOf(c);
+  __vitaCanvasText(c.canvas,p[0],p[1],String(str),colour,f.size*sc,
+   f.family,f.weight,f.italic?1:0,alignOf(c),baselineOf(c));}
+ C.fillText=function(str,x,y){text(this,str,x,y,
+  paintOf(this,this.fillStyle,this.globalAlpha));};
+ C.strokeText=function(str,x,y){text(this,str,x,y,
+  paintOf(this,this.strokeStyle,this.globalAlpha));};
+ ('drawFocusIfNeeded scrollPathIntoView '+
+  'setLineDash createImageBitmap').split(' ').forEach(function(k){
+   C[k]=GAP('canvas.'+k);});
+ C.clip=GAP('canvas.clip');
+ /* drawImage(src, [sx, sy, sw, sh,] dx, dy [, dw, dh]): the source is
+    another canvas, or an image the page has already loaded. The unit
+    square of the destination is handed over as one matrix, so a
+    rotated or scaled context draws a rotated or scaled image. */
+ C.drawImage=function(src,a,b,c,d,e,f,g,h){
+  if(!this.canvas||!src||typeof __vitaCanvasImage!=='function')return;
+  if(typeof __vitaCanvasImageSize!=='function')return;
+  var size=__vitaCanvasImageSize(src);
+  if(!size)return;
+  var sx=0,sy=0,sw=size[0],sh=size[1],dx,dy,dw,dh;
+  if(arguments.length>=9){sx=+a;sy=+b;sw=+c;sh=+d;dx=+e;dy=+f;dw=+g;dh=+h;}
+  else if(arguments.length>=5){dx=+a;dy=+b;dw=+c;dh=+d;}
+  else {dx=+a;dy=+b;dw=sw;dh=sh;}
+  if(!(sw>0)||!(sh>0)||!(dw!==0)||!(dh!==0))return;
+  var m=this.__m;
+  /* the context transform with translate(dx,dy) and scale(dw,dh)
+     folded in, which is exactly the unit square the rasteriser wants */
+  var mm=[m[0]*dw,m[1]*dw,m[2]*dh,m[3]*dh,
+          m[0]*dx+m[2]*dy+m[4],m[1]*dx+m[3]*dy+m[5]];
+  __vitaCanvasImage(this.canvas,src,sx,sy,sw,sh,mm,this.globalAlpha,
+   this.imageSmoothingEnabled?1:0);};
+ C.getImageData=function(x,y,w,h){
+  x=Math.floor(+x||0);y=Math.floor(+y||0);
+  w=Math.floor(+w||0);h=Math.floor(+h||0);
+  if(w<0){x+=w;w=-w;} if(h<0){y+=h;h=-h;}
+  var d=new ImageData(w,h);
+  if(!this.canvas||w===0||h===0||typeof __vitaCanvasRead!=='function')return d;
+  var buf=__vitaCanvasRead(this.canvas,x,y,w,h);
+  if(buf)d.data=new Uint8ClampedArray(buf);
+  return d;};
+ C.putImageData=function(d,dx,dy,sx,sy,sw,sh){
+  if(!this.canvas||!d||!d.data||typeof __vitaCanvasWrite!=='function')return;
+  dx=Math.floor(+dx||0);dy=Math.floor(+dy||0);
+  if(arguments.length<7){sx=0;sy=0;sw=d.width;sh=d.height;}
+  else{sx=Math.floor(+sx||0);sy=Math.floor(+sy||0);
+   sw=Math.floor(+sw||0);sh=Math.floor(+sh||0);
+   if(sw<0){sx+=sw;sw=-sw;} if(sh<0){sy+=sh;sh=-sh;}}
+  __vitaCanvasWrite(this.canvas,d.data,d.width,d.height,
+   sx,sy,sw,sh,dx+sx,dy+sy);};
  C.isPointInPath=C.isPointInStroke=function(){return false;};
- C.getTransform=function(){return {a:1,b:0,c:0,d:1,e:0,f:0,is2D:true,isIdentity:true};};
  C.getLineDash=function(){return [];};
- /* Enough of a width for code that centres text or sizes a box by it. */
- C.measureText=function(t){var px=parseFloat(this.font)||10;
-  return new TextMetrics(String(t).length*px*0.5);};
- C.createLinearGradient=C.createRadialGradient=C.createConicGradient=
-  function(){return new CanvasGradient();};
+ /* the width the glyphs actually take, so text a page centres or
+    boxes it sizes by measuring lands where it should */
+ C.measureText=function(t){var f=fontOf(this);
+  if(typeof __vitaCanvasMeasure==='function'){
+   return new TextMetrics(__vitaCanvasMeasure(String(t),f.size,f.family,
+    f.weight,f.italic?1:0));}
+  return new TextMetrics(String(t).length*f.size*0.5);};
+ C.createLinearGradient=function(x0,y0,x1,y1){
+  return new CanvasGradient(1,[+x0||0,+y0||0,0,+x1||0,+y1||0,0,0]);};
+ C.createRadialGradient=function(x0,y0,r0,x1,y1,r1){
+  return new CanvasGradient(2,[+x0||0,+y0||0,Math.max(0,+r0||0),
+   +x1||0,+y1||0,Math.max(0,+r1||0),0]);};
+ C.createConicGradient=function(a,x,y){
+  return new CanvasGradient(3,[+x||0,+y||0,0,+x||0,+y||0,0,+a||0]);};
  C.createPattern=function(){return new CanvasPattern();};
  C.createImageData=function(w,h){return typeof w==='object'?
   new ImageData(w.width,w.height):new ImageData(w,h);};
- C.getImageData=function(x,y,w,h){return new ImageData(w,h);};
  C.getContextAttributes=function(){return {alpha:true,desynchronized:false,
   colorSpace:'srgb',willReadFrequently:false};};})();
 W.CanvasRenderingContext2D=CanvasRenderingContext2D;
@@ -4057,7 +4489,9 @@ P.getContext=function(kind){
  /* No WebGL: a page that asks for it must take its fallback path, and a
     context that answers every call while drawing nothing would keep it
     from ever doing that. */
- if(kind.indexOf('webgl')===0||kind==='webgpu')return null;
+ if(kind.indexOf('webgl')===0||kind==='webgpu'){
+  if(typeof __vitaGap==='function')__vitaGap('canvas.getContext('+kind+')');
+  return null;}
  if(!this.__ctx2d)Object.defineProperty(this,'__ctx2d',
   {configurable:true,writable:true,value:new CanvasRenderingContext2D(this)});
  return this.__ctx2d;};

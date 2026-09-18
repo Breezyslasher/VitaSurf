@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<!-- drawImage was a stub, so a page that puts a logo, a sprite or a
+     tile into a canvas drew nothing. It now takes the pixels from an
+     image the page has loaded as well as from another canvas, and goes
+     through the context's transform, so a rotated or scaled draw lands
+     where it should. Smoothing off takes the nearest pixel, which is
+     what a sprite sheet needs.
+     Expected: four coloured quarters blown up, a rotated copy, and PASS
+     lines in the log. -->
+<html><head><style>body { margin: 0; background: #fff }</style></head><body>
+<img id="i" src="quads4x4.png" width="4" height="4">
+<canvas id="c" width="160" height="80"></canvas>
+<script>
+setTimeout(function(){
+ var c = document.getElementById('c'), x = c.getContext('2d');
+ var img = document.getElementById('i');
+ function px(xx, yy) {
+  var d = x.getImageData(xx, yy, 1, 1).data;
+  return [d[0], d[1], d[2], d[3]];
+ }
+ function show(p) { return p.join(','); }
+ function report(ok, what, got, want) {
+  console.log((ok ? 'PASS ' : 'FAIL ') + what +
+              (ok ? '' : ' got ' + got + ', wanted ' + want));
+ }
+
+ /* nearest sampling, so each source pixel is a clean 20 by 20 block */
+ x.imageSmoothingEnabled = false;
+ x.drawImage(img, 0, 0, 80, 80);
+ var tl = px(10, 10), tr = px(70, 10), bl = px(10, 70), br = px(70, 70);
+ var ok = tl[0] === 255 && tl[3] === 255 &&
+          tr[1] === 255 && tr[3] === 255 &&
+          bl[2] === 255 && bl[3] === 255 &&
+          br[3] === 0;
+ report(ok, 'drawImage from an img',
+        show(tl) + ' / ' + show(tr) + ' / ' + show(bl) + ' / ' + show(br),
+        'red, green, blue, nothing');
+
+ /* one source pixel, blown up: taking a part of the image works */
+ x.drawImage(img, 0, 0, 2, 2, 100, 0, 40, 40);
+ var part = px(120, 20);
+ report(part[0] === 255 && part[1] === 0 && part[3] === 255,
+        'drawImage source rectangle', show(part), 'red');
+
+ /* turned a quarter turn about (140, 60): the square now runs left and
+    down from there, and the image's top right quarter, which is green,
+    ends up at the bottom of it */
+ x.save();
+ x.translate(140, 60); x.rotate(Math.PI / 2);
+ x.drawImage(img, 0, 0, 20, 20);
+ x.restore();
+ var start = px(138, 62), green = px(135, 75), outside = px(148, 65);
+ report(start[0] === 255 && start[3] === 255 && green[1] === 255 &&
+        green[3] === 255 && outside[3] === 0, 'rotated drawImage',
+        show(start) + ' / ' + show(green) + ' / ' + show(outside),
+        'red, green, nothing');
+}, 800);
+</script></body></html>

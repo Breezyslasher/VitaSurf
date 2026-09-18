@@ -1,0 +1,63 @@
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 42e7f8f20..a69df2cf0 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -90,6 +90,8 @@ struct html_script {
+ 	struct dom_string *mimetype;
+ 	struct dom_string *encoding;
+ 	bool already_started;
++	/** whether the log has said this one was dropped (VitaSurf) */
++	bool reported;
+ 	bool parser_inserted;
+ 	bool force_async;
+ 	bool ready_exec;
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index f1cf8b7cb..3328165e3 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -87,8 +87,23 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 			/* ensure script handler for content type */
+ 			script_handler = select_script_handler(
+ 					content_get_type(s->data.handle));
+-			if (script_handler == NULL)
++			if (script_handler == NULL) {
++				/* dropped without a word, as above */
++				if (content_get_status(s->data.handle) ==
++						CONTENT_STATUS_DONE &&
++						s->reported == false) {
++					s->reported = true;
++					vita_log("script: %s arrived but "
++						 "nothing handles its type "
++						 "(content type %d)",
++						 nsurl_access(
++							hlcache_handle_get_url(
++							s->data.handle)),
++						 (int) content_get_type(
++							s->data.handle));
++				}
+ 				continue; /* unsupported type */
++			}
+ 
+ 			if (content_get_status(s->data.handle) ==
+ 					CONTENT_STATUS_DONE) {
+@@ -360,6 +375,20 @@ convert_script_sync_cb(hlcache_handle *script,
+ 			data = content_get_source_data(s->data.handle, &size );
+ 			script_handler(parent->jsthread, data, size,
+ 				       nsurl_access(hlcache_handle_get_url(s->data.handle)));
++		} else {
++			/*
++			 * It arrived and was then dropped, without a word:
++			 * a page whose last bundle is the one that mounts
++			 * the app looks exactly like a page still loading.
++			 * Audiobookshelf is that page (VitaSurf).
++			 */
++			vita_log("script: %s arrived but was not run "
++				 "(%s, content type %d)",
++				 nsurl_access(hlcache_handle_get_url(script)),
++				 script_handler == NULL ?
++					"nothing handles its type" :
++					"no JavaScript thread",
++				 (int) content_get_type(s->data.handle));
+ 		}
+ 
+ 		/* continue parse */

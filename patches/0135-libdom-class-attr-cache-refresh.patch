@@ -1,0 +1,27 @@
+diff --git a/src/core/element.c b/src/core/element.c
+index 4285867..26f5a62 100644
+--- a/src/core/element.c
++++ b/src/core/element.c
+@@ -1679,6 +1679,22 @@ dom_exception _dom_element_set_attr(struct dom_element *element,
+ 		if (err != DOM_NO_ERR)
+ 			return err;
+ 
++		/*
++		 * The element keeps its classes ready-separated, and only
++		 * the code that adds an attribute built that list: writing
++		 * a new value over an existing class attribute left the old
++		 * classes behind, so a selector naming a class a script had
++		 * added never matched (VitaSurf). Angular Material's form
++		 * fields lost their underline that way.
++		 */
++		if (namespace == NULL && value != NULL &&
++		    dom_string_isequal(name, e->owner->class_string)) {
++			err = _dom_element_create_classes(element,
++					dom_string_data(value));
++			if (err != DOM_NO_ERR)
++				return err;
++		}
++
+ 		success = true;
+ 		err = _dom_dispatch_subtree_modified_event(doc,
+ 				(dom_event_target *) e, &success);

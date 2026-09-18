@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!-- This document ends inside a script element, which is what a page
+     looks like when its last bytes go missing. Hubbub closes the element
+     out at end of input without telling anyone, so the script sat in the
+     tree, never fetched and never run, and a page whose last bundle
+     mounts its app stayed on its loading screen. Audiobookshelf is that
+     page.
+     Expected: a PASS line in the log. -->
+<html><head></head><body>
+<p>script at end of input</p>
+<script>
+window.__eof_script_ran = false;
+setTimeout(function(){
+ var ok = window.__eof_script_ran === true;
+ console.log((ok ? 'PASS ' : 'FAIL ') + 'script at end of input' +
+             (ok ? '' : ' got not run, wanted run'));
+}, 600);
+</script>
+<script src="script-at-eof.js">

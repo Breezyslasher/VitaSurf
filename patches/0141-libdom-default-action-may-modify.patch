@@ -1,0 +1,30 @@
+diff --git a/src/core/node.c b/src/core/node.c
+index 76c7931..33ef6f3 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -2630,7 +2630,25 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 		dom_default_action_callback cb = dei->actions(
+ 				evt->type, phase, &pw);
+ 		if (cb != NULL) {
++			/* The semaphore above is there to stop a mutation
++			 * event *handler* mutating the tree underneath the
++			 * walk this dispatch is in the middle of. A default
++			 * action is not one of those: it is the client's own
++			 * code, it runs once every phase is over, and
++			 * dealing with the node that was just inserted is
++			 * the whole of its job. Leaving the semaphore up for
++			 * it makes every insertion it attempts fail with
++			 * NO_MODIFICATION_ALLOWED_ERR and say nothing, so a
++			 * script a page adds to the document can be run and
++			 * then quietly forbidden to build anything.
++			 * (VitaSurf) */
++			bool mutation = _event_is_mutation(doc, evt);
++
++			if (mutation)
++				doc->dispatching_mutation--;
+ 			cb(evt, pw);
++			if (mutation)
++				doc->dispatching_mutation++;
+ 		}
+ 	}
+ 

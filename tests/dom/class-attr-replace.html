@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!-- libdom keeps an element's class list in a parsed cache beside the
+     class attribute. Setting class for the first time filled the cache,
+     but replacing the value of a class attribute that already existed
+     only wrote the attribute and left the old cache in place, so every
+     selector naming a script-added class stopped matching. Angular
+     Material writes the whole class attribute on each change, which is
+     how openmediavault's login form lost the 1 px underline under its
+     username and password fields.
+     Expected: PASS lines in the log, and the last row underlined. -->
+<html><head><style>
+body { margin: 0; font: 16px/20px monospace }
+.on { background-color: rgb(0, 128, 0); height: 12px }
+.tall .line { height: 3px; background-color: rgb(0, 0, 255) }
+.line { height: 0 }
+</style></head><body>
+<div id="a" class="off">setAttribute</div>
+<div id="b" class="off">className</div>
+<div id="c" class="off">classList</div>
+<div id="d" class="wrap"><div id="e" class="line"></div></div>
+<script>
+setTimeout(function(){
+ function g(id){ return document.getElementById(id); }
+ function h(id){ return getComputedStyle(g(id)).height; }
+ /* the three ways a page rewrites an attribute that is already there */
+ g('a').setAttribute('class', 'on');
+ g('b').className = 'on';
+ g('c').classList.add('on');
+ /* and a class added to an ancestor, which decides a descendant rule */
+ g('d').setAttribute('class', 'wrap tall');
+ setTimeout(function(){
+  function report(ok, what, got, want) {
+   console.log((ok ? 'PASS ' : 'FAIL ') + what +
+               (ok ? '' : ' got ' + got + ', wanted ' + want));
+  }
+  var r = [['setAttribute', h('a')], ['className', h('b')],
+           ['classList', h('c')]];
+  for (var i = 0; i < r.length; i++) {
+   report(r[i][1] === '12px', r[i][0] + ' class height', r[i][1], '12px');
+  }
+  report(h('e') === '3px', 'ancestor class height', h('e'), '3px');
+ }, 200);
+}, 200);
+</script>
+</body></html>

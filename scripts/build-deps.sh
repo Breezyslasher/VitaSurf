@@ -42,9 +42,17 @@ for lib in $LIBS; do
         # from the environment.
         LIB_CFLAGS="-g"
     fi
-    if [ "$lib" = "libparserutils" ] && [ -n "$NS_HOST" ]; then
+    if [ "$lib" = "libparserutils" ]; then
         # VitaSDK newlib's iconv_open() fails for every charset, so page
         # decoding uses libparserutils' own charset codecs instead.
+        #
+        # The host build takes the same flag on purpose. The two paths
+        # are not equivalent -- the internal one keeps decoded characters
+        # in a pivot buffer when the output fills, and a bug there cost
+        # Audiobookshelf the last forty bytes of its document while every
+        # test here passed, because the tests were running through iconv
+        # and the Vita was not. The harness is only worth having if it
+        # reads a page the same way the device does.
         LIB_CFLAGS="${LIB_CFLAGS:-} -DWITHOUT_ICONV_FILTER"
     fi
     if [ "$lib" = "libnsfb" ] && [ -z "$NS_HOST" ]; then

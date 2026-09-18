@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<!-- IntersectionObserver took an observe() and never called back, so a
+     page that renders a list only when it scrolls into view rendered
+     nothing: openmediavault's dashboard widgets and Audiobookshelf's
+     shelves both wait on it, and both came up empty. It answers from
+     the page's own geometry now, and re-checks when the page scrolls,
+     is resized, or changes.
+     Expected: three boxes, the first two reported as on screen and the
+     far one only after a scroll, and PASS lines in the log. -->
+<html><head><style>
+body { margin: 0; font: 16px/20px sans-serif }
+.b { height: 120px; background: #cde; margin: 8px }
+#spacer { height: 2000px }
+</style></head><body>
+<div class="b" id="one">one</div>
+<div class="b" id="two">two</div>
+<div id="spacer"></div>
+<div class="b" id="far">far</div>
+<script>
+var seen = {}, calls = 0;
+function report(ok, what, got, want) {
+ console.log((ok ? 'PASS ' : 'FAIL ') + what +
+             (ok ? '' : ' got ' + got + ', wanted ' + want));
+}
+var io = new IntersectionObserver(function(entries){
+ calls++;
+ for (var i = 0; i < entries.length; i++) {
+  var e = entries[i];
+  seen[e.target.id] = e.isIntersecting;
+  if (e.target.id === 'one' && !seen.oneShape) {
+   seen.oneShape = (e.intersectionRatio > 0.9 &&
+                    e.boundingClientRect.height === 120 &&
+                    e.rootBounds !== null &&
+                    typeof e.time === 'number');
+  }
+ }
+}, { threshold: [0, 0.5, 1] });
+
+io.observe(document.getElementById('one'));
+io.observe(document.getElementById('two'));
+io.observe(document.getElementById('far'));
+
+setTimeout(function(){
+ report(calls > 0, 'the callback runs at all', calls + ' calls', 'at least one');
+ report(seen.one === true, 'a box on screen is reported as intersecting',
+        String(seen.one), 'true');
+ report(seen.far === false, 'a box far below is reported as not',
+        String(seen.far), 'false');
+ report(seen.oneShape === true, 'the entry carries a rect, a ratio and a time',
+        String(seen.oneShape), 'true');
+
+ /* scrolling it into view must report it without another observe */
+ document.getElementById('far').scrollIntoView();
+ setTimeout(function(){
+  report(seen.far === true, 'scrolling a box into view reports it',
+         String(seen.far), 'true');
+  io.disconnect();
+  report(io.takeRecords().length === 0, 'takeRecords is empty once delivered',
+         io.takeRecords().length, 0);
+ }, 700);
+}, 400);
+</script>
+</body></html>

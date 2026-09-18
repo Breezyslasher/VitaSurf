@@ -1,0 +1,33 @@
+diff --git a/src/plot/generic.c b/src/plot/generic.c
+index e343390..fe0a968 100644
+--- a/src/plot/generic.c
++++ b/src/plot/generic.c
+@@ -335,8 +335,26 @@ static bool polygon(nsfb_t *nsfb, const int *p, unsigned int n, nsfb_colour_t c)
+ 			fline.x1 = x1;
+ 			fline.y1 = y;
+ 
+-			/* draw this filled span on current row */
+-			nsfb->plotter_fns->line(nsfb, 1, &fline, &pen);
++			/*
++			 * A translucent fill is blended span by span
++			 * (VitaSurf). The line plotter paints solid, so a
++			 * rounded card with an rgba() background -- which
++			 * is a path, not a rectangle, once it has corners
++			 * -- came out opaque black over the page.
++			 */
++			if ((c >> 24) != 0xff &&
++			    nsfb->plotter_fns->fill_alpha != NULL) {
++				nsfb_bbox_t span;
++
++				span.x0 = x0;
++				span.y0 = y;
++				span.x1 = x1 + 1;
++				span.y1 = y + 1;
++				nsfb->plotter_fns->fill_alpha(nsfb, &span, c);
++			} else {
++				/* draw this filled span on current row */
++				nsfb->plotter_fns->line(nsfb, 1, &fline, &pen);
++			}
+ 
+ 			/* don't look for more spans if already at end of clip
+ 			 * region or polygon */

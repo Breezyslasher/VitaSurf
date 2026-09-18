@@ -1,0 +1,92 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index c5a1ca61a..3ded9d2e0 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -935,6 +935,37 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		}
+ 	}
+ 
++	/*
++	 * An element whose content property is a url() is replaced by that
++	 * image (CSS Content 3). It is how a page puts a picture behind
++	 * itself without an <img>: openmediavault's login page is one, and
++	 * without this its photograph never appeared (VitaSurf).
++	 */
++	if ((box->flags & IS_REPLACED) == 0 && box->style != NULL &&
++			nsoption_bool(foreground_images) == true) {
++		const css_computed_content_item *item = NULL;
++
++		if (css_computed_content(box->style, &item) ==
++				CSS_CONTENT_SET && item != NULL &&
++		    item->type == CSS_COMPUTED_CONTENT_URI &&
++		    item->data.uri != NULL) {
++			nsurl *url = NULL;
++
++			if (nsurl_join(ctx->content->base_url,
++					lwc_string_data(item->data.uri),
++					&url) == NSERROR_OK) {
++				box->flags |= IS_REPLACED;
++				if (html_fetch_object(ctx->content, url, box,
++						image_types, false) == false) {
++					nsurl_unref(url);
++					return false;
++				}
++				nsurl_unref(url);
++				*convert_children = false;
++			}
++		}
++	}
++
+ 	if (convert_special_elements(ctx->n,
+ 				     ctx->content,
+ 				     box,
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index 53ba0a9ea..da9c2c47f 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -268,6 +268,22 @@ framebuffer_plot_polygon(const struct redraw_context *ctx,
+ }
+ 
+ 
++/**
++ * A NetSurf colour in libnsfb's convention (VitaSurf).
++ *
++ * NetSurf keeps a colour's alpha inverted in its top byte, 0x00 being
++ * opaque; libnsfb reads that byte as the opacity.
++ */
++static nsfb_colour_t fb_colour(colour c)
++{
++	if (c == NS_TRANSPARENT) {
++		return 0;
++	}
++
++	return (nsfb_colour_t) ((c & 0x00ffffff) |
++			((0xffu - ((c >> 24) & 0xff)) << 24));
++}
++
+ /**
+  * Plots a path.
+  *
+@@ -373,13 +389,20 @@ done:
+ 	memset(&pen, 0, sizeof(pen));
+ 	if (pstyle->fill_type != PLOT_OP_TYPE_NONE) {
+ 		pen.fill_type = NFSB_PLOT_OPTYPE_SOLID;
+-		pen.fill_colour = pstyle->fill_colour;
++		/*
++		 * libnsfb wants the alpha the other way up, as the
++		 * rectangle plot above hands it over: a rounded box is
++		 * filled through this path, and passing NetSurf's own
++		 * colour straight through painted every rgba() card
++		 * solid (VitaSurf).
++		 */
++		pen.fill_colour = fb_colour(pstyle->fill_colour);
+ 	} else {
+ 		pen.fill_type = NFSB_PLOT_OPTYPE_NONE;
+ 	}
+ 	if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
+ 		pen.stroke_type = NFSB_PLOT_OPTYPE_SOLID;
+-		pen.stroke_colour = pstyle->stroke_colour;
++		pen.stroke_colour = fb_colour(pstyle->stroke_colour);
+ 		pen.stroke_width = plot_style_fixed_to_int(pstyle->stroke_width);
+ 		if (pen.stroke_width < 1) {
+ 			pen.stroke_width = 1;

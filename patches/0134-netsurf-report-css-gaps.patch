@@ -1,0 +1,69 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index 9dabff2eb..f44eb1713 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -490,6 +490,55 @@ content_type nscss_content_type(void)
+  * Object completion                                                         *
+  *****************************************************************************/
+ 
++/**
++ * Say what a sheet asked for and did not get (VitaSurf).
++ *
++ * A page that renders wrongly because a property is missing said
++ * nothing about it, and the only way to find out was to read the page's
++ * CSS by hand. libcss counts what it threw away; this reports it.
++ */
++static void nscss_report_gaps(struct content *c, css_stylesheet *sheet)
++{
++	uint32_t gaps = css_stylesheet_gap_count(sheet);
++	char line[256];
++	unsigned int at = 0;
++	uint32_t i;
++
++	if (gaps == 0) {
++		return;
++	}
++
++	line[0] = '\0';
++	for (i = 0; i < gaps; i++) {
++		lwc_string *name = NULL;
++		uint32_t count = 0;
++		uint32_t kind = 0;
++		int n;
++
++		if (css_stylesheet_get_gap(sheet, i, &name, &count,
++				&kind) != CSS_OK) {
++			continue;
++		}
++		n = snprintf(line + at, sizeof(line) - at, "%s%.*s%s x%u",
++			     at == 0 ? "" : ", ",
++			     (int) lwc_string_length(name),
++			     lwc_string_data(name),
++			     kind == 1 ? " (value)" :
++			     kind == 2 ? " (no effect)" : "",
++			     (unsigned int) count);
++		if (n < 0 || (unsigned int) n >= sizeof(line) - at) {
++			break;
++		}
++		at += (unsigned int) n;
++	}
++
++	if (at > 0) {
++		vita_log("gap: css dropped: %s", line);
++	}
++	(void) c;
++}
++
++
+ /**
+  * Handle notification that a CSS object is done
+  *
+@@ -524,6 +573,8 @@ void nscss_content_done(struct content_css_data *css, void *pw)
+ 		}
+ 	}
+ 
++	nscss_report_gaps(c, css->sheet);
++
+ 	/* Finally, catch the content's users up with reality */
+ 	content_set_ready(c);
+ 	content_set_done(c);

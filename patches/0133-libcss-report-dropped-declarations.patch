@@ -1,0 +1,216 @@
+diff --git a/include/libcss/stylesheet.h b/include/libcss/stylesheet.h
+index 2de8dd6..a63851f 100644
+--- a/include/libcss/stylesheet.h
++++ b/include/libcss/stylesheet.h
+@@ -160,6 +160,30 @@ css_error css_stylesheet_set_disabled(css_stylesheet *sheet, bool disabled);
+ 
+ css_error css_stylesheet_size(css_stylesheet *sheet, size_t *size);
+ 
++/**
++ * How many kinds of declaration this sheet lost (VitaSurf).
++ *
++ * A property libcss does not know, or a value it could not parse, is
++ * dropped; a client that reports these can say why a page came out
++ * wrong instead of leaving it to be guessed at.
++ */
++uint32_t css_stylesheet_gap_count(const css_stylesheet *sheet);
++
++/**
++ * Read one of those (VitaSurf).
++ *
++ * \param sheet       The stylesheet
++ * \param index       Which one, below css_stylesheet_gap_count()
++ * \param name        Updated to the property's name, owned by the sheet
++ * \param count       Updated to how many declarations it lost
++ * \param kind        Updated to 0 when the property itself is unknown, 1
++ *                    when its value was not understood, and 2 when it
++ *                    parsed but has no effect on what is drawn
++ * \return CSS_OK on success, CSS_BADPARM otherwise
++ */
++css_error css_stylesheet_get_gap(const css_stylesheet *sheet, uint32_t index,
++		lwc_string **name, uint32_t *count, uint32_t *kind);
++
+ /**
+  * One attribute of the document's root element (VitaSurf).
+  *
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 830e43b..3dabfea 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -4045,13 +4045,23 @@ css_error parseProperty(css_language *c, const css_token *property,
+ 				&match) == lwc_error_ok && match)
+ 			break;
+ 	}
+-	if (i == LAST_PROP + 1)
++	if (i == LAST_PROP + 1) {
++		/* a property this build does not know: remembered so the
++		 * client can say what the page wanted (VitaSurf) */
++		css__stylesheet_note_gap(c->sheet, property->idata, 0);
+ 		return CSS_INVALID;
++	}
+ 
+ 	/* Get handler */
+ 	handler = property_handlers[i - FIRST_PROP];
+ 	assert(handler != NULL);
+ 
++	/* a property that parses and changes nothing is still a gap the
++	 * page can be told about (VitaSurf) */
++	if (handler == css__parse_ignored) {
++		css__stylesheet_note_gap(c->sheet, c->strings[i], 2);
++	}
++
+ 	/* allocate style */
+ 	error = css__stylesheet_style_create(c->sheet, &style);
+ 	if (error != CSS_OK)
+@@ -4062,6 +4072,8 @@ css_error parseProperty(css_language *c, const css_token *property,
+ 	/* Call the handler */
+ 	error = handler(c, vector, ctx, style);
+ 	if (error != CSS_OK) {
++		/* the property is known and the value was not (VitaSurf) */
++		css__stylesheet_note_gap(c->sheet, c->strings[i], 1);
+ 		css__stylesheet_style_destroy(style);
+ 		return error;
+ 	}
+@@ -4078,6 +4090,7 @@ css_error parseProperty(css_language *c, const css_token *property,
+ 	token = parserutils_vector_iterate(vector, ctx);
+ 	if (token != NULL) {
+ 		/* Trailing junk, so discard declaration */
++		css__stylesheet_note_gap(c->sheet, c->strings[i], 1);
+                 css__stylesheet_style_destroy(style);
+ 		return CSS_INVALID;
+ 	}
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 19201e7..59e3239 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -256,12 +256,17 @@ css_error css_stylesheet_create(const css_stylesheet_params *params,
+  */
+ css_error css_stylesheet_destroy(css_stylesheet *sheet)
+ {
++	uint32_t gap;
+ 	uint32_t index;
+ 	css_rule *r, *s;
+ 
+ 	if (sheet == NULL)
+ 		return CSS_BADPARM;
+ 
++	for (gap = 0; gap < sheet->n_gaps; gap++) {
++		lwc_string_unref(sheet->gaps[gap].name);
++	}
++
+ 	if (sheet->title != NULL)
+ 		free(sheet->title);
+ 
+@@ -853,6 +858,72 @@ css_error css_stylesheet_used_root_hints(css_stylesheet *sheet, uint32_t *sig)
+  *	   CSS_BADPARM on bad parameters,
+  *	   CSS_NOMEM on memory exhaustion
+  */
++/**
++ * Note that a declaration was thrown away (VitaSurf).
++ *
++ * A page whose rules are dropped renders wrongly with nothing said
++ * about it, so each property is remembered, with a count, for the
++ * client to report once the sheet is parsed.
++ *
++ * \param sheet       The stylesheet
++ * \param name        The property's name
++ * \param kind  0 unknown, 1 value not understood, 2 of no effect
++ */
++void css__stylesheet_note_gap(css_stylesheet *sheet, lwc_string *name,
++		uint32_t kind)
++{
++	uint32_t i;
++
++	if (sheet == NULL || name == NULL) {
++		return;
++	}
++
++	for (i = 0; i < sheet->n_gaps; i++) {
++		bool match = false;
++
++		if (lwc_string_caseless_isequal(sheet->gaps[i].name, name,
++				&match) == lwc_error_ok && match &&
++		    sheet->gaps[i].kind == kind) {
++			sheet->gaps[i].count++;
++			return;
++		}
++	}
++
++	if (sheet->n_gaps == CSS_STYLESHEET_GAPS) {
++		return;
++	}
++
++	sheet->gaps[sheet->n_gaps].name = lwc_string_ref(name);
++	sheet->gaps[sheet->n_gaps].count = 1;
++	sheet->gaps[sheet->n_gaps].kind = kind;
++	sheet->n_gaps++;
++}
++
++
++/* exported function documented in libcss/stylesheet.h */
++uint32_t css_stylesheet_gap_count(const css_stylesheet *sheet)
++{
++	return sheet == NULL ? 0 : sheet->n_gaps;
++}
++
++
++/* exported function documented in libcss/stylesheet.h */
++css_error css_stylesheet_get_gap(const css_stylesheet *sheet, uint32_t index,
++		lwc_string **name, uint32_t *count, uint32_t *kind)
++{
++	if (sheet == NULL || index >= sheet->n_gaps || name == NULL ||
++			count == NULL || kind == NULL) {
++		return CSS_BADPARM;
++	}
++
++	*name = sheet->gaps[index].name;
++	*count = sheet->gaps[index].count;
++	*kind = sheet->gaps[index].kind;
++
++	return CSS_OK;
++}
++
++
+ css_error css__stylesheet_style_create(css_stylesheet *sheet, css_style **style)
+ {
+ 	css_style *s;
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 48768ec..c476c73 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -217,9 +217,25 @@ typedef struct css_rule_charset {
+ 	lwc_string *encoding;	/** \todo use MIB enum? */
+ } css_rule_charset;
+ 
++/** One thing a sheet asked for that libcss does not do (VitaSurf). */
++typedef struct css_stylesheet_gap {
++	lwc_string *name;	/**< the property's name */
++	uint32_t count;		/**< how many declarations it lost */
++	uint32_t kind;		/**< 0 unknown, 1 value not understood,
++				 * 2 parsed but of no effect */
++} css_stylesheet_gap;
++
++/** How many kinds of gap one sheet reports. */
++#define CSS_STYLESHEET_GAPS 32
++
+ struct css_stylesheet {
+ 	css_selector_hash *selectors;		/**< Hashtable of selectors */
+ 
++	/* what this sheet wanted and did not get, so a page that comes
++	 * out wrong can say what it was missing (VitaSurf) */
++	css_stylesheet_gap gaps[CSS_STYLESHEET_GAPS];
++	uint32_t n_gaps;
++
+ 	uint32_t rule_count;			/**< Number of rules in sheet */
+ 	css_rule *rule_list;			/**< List of rules in sheet */
+ 	css_rule *last_rule;			/**< Last rule in list */
+@@ -286,6 +302,9 @@ struct css_stylesheet {
+ 						 * vector entries used */
+ };
+ 
++void css__stylesheet_note_gap(css_stylesheet *sheet, lwc_string *name,
++		uint32_t kind);
++
+ css_error css__stylesheet_style_create(css_stylesheet *sheet,
+ 		css_style **style);
+ css_error css__stylesheet_style_append(css_style *style, css_code_t code);

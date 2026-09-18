@@ -1,0 +1,400 @@
+diff --git a/content/llcache.c b/content/llcache.c
+index e60b62c77..218e6cab9 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -119,6 +119,13 @@ typedef struct {
+ 	bool tried_with_tls_downgrade;	/**< Whether we've tried TLS 1.2 */
+ 
+ 	bool tainted_tls;		/**< Whether the TLS transport is tainted */
++
++	/**
++	 * Where this fetch is recorded in the load timeline, or -1 if it
++	 * is not being followed. The Log screen draws its waterfall from
++	 * that timeline (VitaSurf).
++	 */
++	int timeline_slot;
+ } llcache_fetch_ctx;
+ 
+ /**
+@@ -429,6 +436,8 @@ static nserror llcache_object_new(nsurl *url, llcache_object **result)
+ 	NSLOG(llcache, DEBUG, "Created object %p (%s)", obj, nsurl_access(url));
+ 
+ 	obj->url = nsurl_ref(url);
++	/* not followed until a fetch actually starts (VitaSurf) */
++	obj->fetch.timeline_slot = -1;
+ 
+ 	*result = obj;
+ 
+@@ -976,6 +985,10 @@ static nserror llcache_object_refetch(llcache_object *object)
+ 	/* Reset fetch state */
+ 	object->fetch.state = LLCACHE_FETCH_INIT;
+ 
++	/* what the Log screen's waterfall is drawn from (VitaSurf) */
++	object->fetch.timeline_slot =
++			vitasurf_timeline_start(nsurl_access(object->url));
++
+ 	NSLOG(llcache, DEBUG, "Re-fetching %p", object);
+ 
+ 	/* Kick off fetch */
+@@ -1075,6 +1088,8 @@ static nserror llcache_object_destroy(llcache_object *object)
+ 	nsurl_unref(object->url);
+ 
+ 	if (object->fetch.fetch != NULL) {
++		vitasurf_timeline_end(object->fetch.timeline_slot,
++				VITASURF_FETCH_ABORTED);
+ 		fetch_abort(object->fetch.fetch);
+ 		object->fetch.fetch = NULL;
+ 	}
+@@ -3111,6 +3126,10 @@ static void llcache_fetch_callback(const fetch_msg *msg, void *p)
+ 		/* Received a fetch header */
+ 		object->fetch.state = LLCACHE_FETCH_HEADERS;
+ 
++		vitasurf_timeline_header(object->fetch.timeline_slot,
++				object->fetch.fetch != NULL ?
++				(int) fetch_http_code(object->fetch.fetch) : 0);
++
+ 		error = llcache_fetch_process_header(object,
+ 				msg->data.header_or_data.buf,
+ 				msg->data.header_or_data.len);
+@@ -3144,6 +3163,9 @@ static void llcache_fetch_callback(const fetch_msg *msg, void *p)
+ 	/* Normal 2xx state machine */
+ 	case FETCH_DATA:
+ 		/* Received some data */
++		vitasurf_timeline_data(object->fetch.timeline_slot,
++				(unsigned int) msg->data.header_or_data.len);
++
+ 		error = llcache_fetch_process_data(object,
+ 				msg->data.header_or_data.buf,
+ 				msg->data.header_or_data.len);
+@@ -3155,6 +3177,11 @@ static void llcache_fetch_callback(const fetch_msg *msg, void *p)
+ 		uint8_t *temp;
+ 
+ 		object->fetch.state = LLCACHE_FETCH_COMPLETE;
++		vitasurf_timeline_header(object->fetch.timeline_slot,
++				object->fetch.fetch != NULL ?
++				(int) fetch_http_code(object->fetch.fetch) : 0);
++		vitasurf_timeline_end(object->fetch.timeline_slot,
++				VITASURF_FETCH_DONE);
+ 		object->fetch.fetch = NULL;
+ 
+ 		/* Shrink source buffer to required size */
+@@ -3187,6 +3214,8 @@ static void llcache_fetch_callback(const fetch_msg *msg, void *p)
+ 		/* An error occurred while fetching */
+ 		/* The fetch has has already been cleaned up by the fetcher */
+ 		object->fetch.state = LLCACHE_FETCH_COMPLETE;
++		vitasurf_timeline_end(object->fetch.timeline_slot,
++				VITASURF_FETCH_ERROR);
+ 		object->fetch.fetch = NULL;
+ 
+ 		/* Release candidate, if any */
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 459190b30..3a64fe4da 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -33,6 +33,7 @@
+ 
+ #include "utils/errors.h"
+ #include "utils/log.h"
++#include "utils/utils.h"
+ #include "utils/corestrings.h"
+ #include "utils/messages.h"
+ #include "utils/nsoption.h"
+@@ -3336,6 +3337,17 @@ browser_window_navigate(struct browser_window *bw,
+ 
+ 	NSLOG(netsurf, INFO, "bw %p, url %s", bw, nsurl_access(url));
+ 
++	/*
++	 * Start the load timeline here, where the navigation does, not
++	 * when the throbber starts: the document's own fetch is under way
++	 * by then, so the row the waterfall most needs -- the one that
++	 * shows a redirect, or a document that took ten seconds -- was
++	 * the one being thrown away (VitaSurf).
++	 */
++	if (bw->parent == NULL) {
++		vitasurf_timeline_reset();
++	}
++
+ 	/*
+ 	 * determine if navigation is internal url, if so, we do not
+ 	 * do certain things during the load.
+diff --git a/utils/utils.c b/utils/utils.c
+index 4d03f55a7..fc33bb1ba 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -23,6 +23,7 @@
+ #include <assert.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <time.h>
+ #include <strings.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+@@ -604,3 +605,196 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_prelude = 0;
+ 	vitasurf_ms_nested = 0;
+ }
++
++
++/*
++ * The fetches of the page being loaded (VitaSurf).
++ *
++ * A hardware report says a page took twelve seconds and nothing about
++ * where they went. These are what the Log screen draws its waterfall
++ * from, so a slow load can be read as "one request took nine seconds"
++ * rather than guessed at. It is a fixed array because the Vita has no
++ * room to grow one per page, and a page that asks for more than it
++ * holds has the overflow counted but not timed.
++ */
++static struct vitasurf_fetch vitasurf_fetches[VITASURF_TIMELINE_MAX];
++static unsigned int vitasurf_fetch_count;
++static unsigned int vitasurf_fetch_seen;
++static uint64_t vitasurf_load_start;
++
++/**
++ * Milliseconds since the machine started, for the timeline only.
++ *
++ * nsu_getmonotonic_ms() is what the rest of the build uses, but utils.c
++ * is below libnsutils in the link order on some targets, so the clock is
++ * read directly here.
++ */
++static uint64_t vitasurf_now_ms(void)
++{
++	struct timespec ts;
++
++	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
++		return 0;
++	}
++
++	return (uint64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++
++/** Milliseconds since this page load began. */
++static unsigned int vitasurf_since_start(void)
++{
++	uint64_t now = vitasurf_now_ms();
++
++	if (vitasurf_load_start == 0 || now < vitasurf_load_start) {
++		return 0;
++	}
++
++	return (unsigned int) (now - vitasurf_load_start);
++}
++
++
++/* exported interface documented in utils/utils.h */
++void vitasurf_timeline_reset(void)
++{
++	vitasurf_fetch_count = 0;
++	vitasurf_fetch_seen = 0;
++	vitasurf_load_start = vitasurf_now_ms();
++}
++
++
++/* exported interface documented in utils/utils.h */
++int vitasurf_timeline_start(const char *url)
++{
++	struct vitasurf_fetch *f;
++	size_t len;
++
++	vitasurf_fetch_seen++;
++	if (url == NULL || vitasurf_fetch_count >= VITASURF_TIMELINE_MAX) {
++		return -1;
++	}
++	if (vitasurf_load_start == 0) {
++		vitasurf_load_start = vitasurf_now_ms();
++	}
++
++	f = &vitasurf_fetches[vitasurf_fetch_count];
++	memset(f, 0, sizeof(*f));
++
++	len = strlen(url);
++	if (len < sizeof(f->url)) {
++		memcpy(f->url, url, len + 1);
++	} else {
++		/*
++		 * The head names the host and the tail names the file;
++		 * the middle of a long url is the part worth dropping.
++		 */
++		const size_t head = 12, gap = 3;
++		size_t tail = sizeof(f->url) - 1 - head - gap;
++
++		memcpy(f->url, url, head);
++		memcpy(f->url + head, "...", gap);
++		memcpy(f->url + head + gap, url + len - tail, tail + 1);
++	}
++
++	f->start_ms = vitasurf_since_start();
++	f->state = VITASURF_FETCH_RUNNING;
++
++	return (int) vitasurf_fetch_count++;
++}
++
++
++/** The slot, or NULL if it is not one the timeline is following. */
++static struct vitasurf_fetch *vitasurf_slot(int slot)
++{
++	if (slot < 0 || (unsigned int) slot >= vitasurf_fetch_count) {
++		return NULL;
++	}
++
++	return &vitasurf_fetches[slot];
++}
++
++
++/* exported interface documented in utils/utils.h */
++void vitasurf_timeline_header(int slot, int status)
++{
++	struct vitasurf_fetch *f = vitasurf_slot(slot);
++
++	if (f == NULL) {
++		return;
++	}
++	if (!f->had_header) {
++		f->header_ms = vitasurf_since_start();
++		f->had_header = true;
++	}
++	if (status > 0) {
++		f->status = status;
++	}
++}
++
++
++/* exported interface documented in utils/utils.h */
++void vitasurf_timeline_data(int slot, unsigned int bytes)
++{
++	struct vitasurf_fetch *f = vitasurf_slot(slot);
++
++	if (f != NULL) {
++		f->bytes += bytes;
++	}
++}
++
++
++/* exported interface documented in utils/utils.h */
++void vitasurf_timeline_end(int slot, enum vitasurf_fetch_state state)
++{
++	struct vitasurf_fetch *f = vitasurf_slot(slot);
++
++	if (f == NULL || f->state != VITASURF_FETCH_RUNNING) {
++		return;
++	}
++	f->end_ms = vitasurf_since_start();
++	f->state = state;
++}
++
++
++/* exported interface documented in utils/utils.h */
++unsigned int vitasurf_timeline_count(void)
++{
++	return vitasurf_fetch_count;
++}
++
++
++/* exported interface documented in utils/utils.h */
++const struct vitasurf_fetch *vitasurf_timeline_get(unsigned int i)
++{
++	if (i >= vitasurf_fetch_count) {
++		return NULL;
++	}
++
++	return &vitasurf_fetches[i];
++}
++
++
++/* exported interface documented in utils/utils.h */
++unsigned int vitasurf_timeline_span(void)
++{
++	unsigned int i, span = 0;
++
++	for (i = 0; i < vitasurf_fetch_count; i++) {
++		const struct vitasurf_fetch *f = &vitasurf_fetches[i];
++		unsigned int end = f->state != VITASURF_FETCH_RUNNING ?
++				f->end_ms : f->start_ms;
++
++		if (end > span) {
++			span = end;
++		}
++	}
++
++	return span;
++}
++
++
++/* exported interface documented in utils/utils.h */
++unsigned int vitasurf_timeline_seen(void)
++{
++	return vitasurf_fetch_seen;
++}
+diff --git a/utils/utils.h b/utils/utils.h
+index 48eebc5e0..597407500 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -176,6 +176,67 @@ extern uint64_t vitasurf_ms_nested;
+ /** Zero the load profile counters, at the start of a navigation. */
+ void vitasurf_profile_reset(void);
+ 
++/** How many fetches of one page load the timeline remembers. */
++#define VITASURF_TIMELINE_MAX 160
++
++/** What a fetch ended as. */
++enum vitasurf_fetch_state {
++	VITASURF_FETCH_RUNNING = 0,
++	VITASURF_FETCH_DONE,
++	VITASURF_FETCH_ERROR,
++	VITASURF_FETCH_ABORTED
++};
++
++/**
++ * One fetch of the page being loaded.
++ *
++ * The times are milliseconds since the navigation began, so a waterfall
++ * drawn from these shows what the load actually waited on. The url is
++ * copied because the object it came from does not outlive the page.
++ */
++struct vitasurf_fetch {
++	char url[128];
++	unsigned int start_ms;
++	unsigned int header_ms;	/**< when the first header arrived */
++	unsigned int end_ms;	/**< when it stopped */
++	unsigned int bytes;
++	int status;		/**< HTTP response code, 0 if unknown */
++	bool had_header;	/**< whether header_ms means anything */
++	enum vitasurf_fetch_state state;
++};
++
++/** Forget the fetches of the last page, at the start of a navigation. */
++void vitasurf_timeline_reset(void);
++
++/**
++ * Note that a fetch has started.
++ *
++ * \return its slot, to pass to the calls below, or -1 if the timeline
++ *         is full and this fetch is not being followed.
++ */
++int vitasurf_timeline_start(const char *url);
++
++/** Note the first header of a fetch, and the response code with it. */
++void vitasurf_timeline_header(int slot, int status);
++
++/** Add to what a fetch has delivered. */
++void vitasurf_timeline_data(int slot, unsigned int bytes);
++
++/** Note that a fetch has stopped, however it stopped. */
++void vitasurf_timeline_end(int slot, enum vitasurf_fetch_state state);
++
++/** How many fetches the timeline holds. */
++unsigned int vitasurf_timeline_count(void);
++
++/** One of them, oldest first, or NULL past the end. */
++const struct vitasurf_fetch *vitasurf_timeline_get(unsigned int i);
++
++/** How long the whole load took, in milliseconds. */
++unsigned int vitasurf_timeline_span(void);
++
++/** How many fetches there were, including any the timeline dropped. */
++unsigned int vitasurf_timeline_seen(void);
++
+ /**
+  * Write a line to the VitaSurf log (vita/platform/vita_platform.c).
+  *

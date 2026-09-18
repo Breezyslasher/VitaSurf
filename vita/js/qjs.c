@@ -55,6 +55,7 @@
 
 #include "vita_platform.h"
 #include "vita_input.h"
+#include "canvas.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -3550,11 +3551,21 @@ static void relayout_callback(void *p)
 	}
 	thread->relayout_waits = 0;
 
-	if (thread->dom_elements == 0) {
+	/*
+	 * Count them again every time. The count was taken once and kept,
+	 * so it was whatever the document held when the first rebuild ran
+	 * -- on openmediavault the 124 elements of the shell, logged over
+	 * and over while the dashboard the page went on to build was many
+	 * times that. The limit below is meant to catch a document that
+	 * has grown too big to rebuild, and it cannot do that from a
+	 * number taken before it grew.
+	 */
+	{
 		struct dom_document *doc = thread_document(thread);
 
 		if (doc != NULL) {
-			thread->dom_elements = count_elements((struct dom_node *)doc);
+			thread->dom_elements =
+				count_elements((struct dom_node *)doc);
 		}
 	}
 	if (thread->dom_elements > RELAYOUT_MAX_ELEMENTS) {
@@ -4869,6 +4880,705 @@ static void inline_border_box(struct box *box, int *px, int *py,
 	*ph = y1 - y0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* What a page asked for that is not there                                   */
+
+/*
+ * A page calls something the engine only pretends to have -- a canvas
+ * it cannot draw into, a codec, a storage API -- and nothing was said
+ * about it, so a page that came out wrong gave no clue what it wanted
+ * (VitaSurf). Each name is logged the first time a page uses it and
+ * counted, and the counts are reported when the page is closed.
+ */
+#define GAP_MAX 64
+
+struct js_gap {
+	char name[48];
+	unsigned int count;
+};
+
+static struct js_gap js_gaps[GAP_MAX];
+static unsigned int js_gap_count;
+static unsigned int js_gap_dropped;
+
+static void gap_report(void);
+
+static void gap_reset(void)
+{
+	memset(js_gaps, 0, sizeof(js_gaps));
+	js_gap_count = 0;
+	js_gap_dropped = 0;
+}
+
+/*
+ * The tally is printed when the page closes, which is too late for a
+ * page that is stuck: the one worth asking about cannot be navigated
+ * away from without losing what it had to say. The Start menu's layout
+ * dump calls this to print it where it stands (VitaSurf).
+ */
+void vita_js_report_gaps(void)
+{
+	gap_report();
+}
+
+
+static void gap_report(void)
+{
+	char line[256];
+	unsigned int i, at = 0;
+
+	if (js_gap_count == 0) {
+		return;
+	}
+
+	line[0] = '\0';
+	for (i = 0; i < js_gap_count; i++) {
+		int n = snprintf(line + at, sizeof(line) - at, "%s%s x%u",
+				 at == 0 ? "" : ", ", js_gaps[i].name,
+				 js_gaps[i].count);
+
+		if (n < 0 || (unsigned int) n >= sizeof(line) - at) {
+			break;
+		}
+		at += (unsigned int) n;
+	}
+	vita_log("gap: the page used %u thing%s this build does not do%s: %s",
+		 js_gap_count, js_gap_count == 1 ? "" : "s",
+		 js_gap_dropped > 0 ? " (and more)" : "", line);
+}
+
+/** __vitaGap(name): the page used something that is not implemented. */
+static JSValue win_vita_gap(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv)
+{
+	const char *name;
+	unsigned int i;
+
+	(void) this_val;
+	if (argc < 1) {
+		return JS_UNDEFINED;
+	}
+	name = JS_ToCString(ctx, argv[0]);
+	if (name == NULL) {
+		return JS_UNDEFINED;
+	}
+
+	for (i = 0; i < js_gap_count; i++) {
+		if (strcmp(js_gaps[i].name, name) == 0) {
+			js_gaps[i].count++;
+			JS_FreeCString(ctx, name);
+			return JS_UNDEFINED;
+		}
+	}
+
+	if (js_gap_count < GAP_MAX) {
+		snprintf(js_gaps[js_gap_count].name,
+			 sizeof(js_gaps[js_gap_count].name), "%s", name);
+		js_gaps[js_gap_count].count = 1;
+		js_gap_count++;
+		vita_log("gap: not implemented, first use: %s", name);
+	} else {
+		js_gap_dropped++;
+	}
+	JS_FreeCString(ctx, name);
+
+	return JS_UNDEFINED;
+}
+
+
+/* ------------------------------------------------------------------------ */
+/* Canvas                                                                    */
+
+/**
+ * The drawing surface of the canvas element in argv[0] (VitaSurf).
+ *
+ * Its size is the width and height attributes, which is what the page
+ * draws in, whatever size CSS gives the element on the screen.
+ */
+static struct vita_canvas *canvas_of(JSContext *ctx, JSValueConst v)
+{
+	struct dom_node *node = JS_GetOpaque(v, node_class_id);
+	dom_string *attr = NULL;
+	long width = 300, height = 150;
+
+	(void) ctx;
+	if (node == NULL) {
+		return NULL;
+	}
+
+	if (dom_element_get_attribute(node, corestring_dom_width, &attr) ==
+			DOM_NO_ERR && attr != NULL) {
+		width = strtol(dom_string_data(attr), NULL, 10);
+		dom_string_unref(attr);
+	}
+	attr = NULL;
+	if (dom_element_get_attribute(node, corestring_dom_height, &attr) ==
+			DOM_NO_ERR && attr != NULL) {
+		height = strtol(dom_string_data(attr), NULL, 10);
+		dom_string_unref(attr);
+	}
+
+	return vita_canvas_get(node, (int) width, (int) height);
+}
+
+
+/**
+ * Read the points of a path out of a Float64Array.
+ *
+ * The context flattens curves and applies its transform before it gets
+ * here, so a path is only ever points and the counts that say where one
+ * subpath ends and the next starts.
+ */
+static double *canvas_points(JSContext *ctx, JSValueConst v, int *n_out)
+{
+	size_t byte_offset = 0, byte_length = 0, bytes_per = 0;
+	JSValue buffer;
+	uint8_t *bytes;
+	size_t size = 0;
+
+	buffer = JS_GetTypedArrayBuffer(ctx, v, &byte_offset, &byte_length,
+					&bytes_per);
+	if (JS_IsException(buffer)) {
+		return NULL;
+	}
+	bytes = JS_GetArrayBuffer(ctx, &size, buffer);
+	JS_FreeValue(ctx, buffer);
+	if (bytes == NULL || bytes_per != sizeof(double)) {
+		return NULL;
+	}
+
+	*n_out = (int) (byte_length / sizeof(double));
+
+	return (double *) (bytes + byte_offset);
+}
+
+
+/**
+ * Read what a fill or a stroke should lay down.
+ *
+ * A plain number is one colour. A gradient arrives as an array the
+ * context has already put through its transform:
+ *
+ *   [kind, x0, y0, r0, x1, y1, r1, angle, offset, colour, ...]
+ *
+ * The stops are allocated here and belong to the caller.
+ */
+static bool canvas_paint_of(JSContext *ctx, JSValueConst v,
+			    struct vita_canvas_paint *paint,
+			    struct vita_canvas_stop **stops_out)
+{
+	uint32_t length = 0, i;
+	int32_t kind = 0;
+	struct vita_canvas_stop *stops;
+	int n_stops;
+
+	memset(paint, 0, sizeof(*paint));
+	*stops_out = NULL;
+
+	if (JS_IsArray(v) == false) {
+		uint32_t colour = 0;
+
+		if (JS_ToUint32(ctx, &colour, v) != 0) {
+			return false;
+		}
+		paint->kind = CANVAS_PAINT_SOLID;
+		paint->rgba = colour;
+		return true;
+	}
+
+	{
+		JSValue len = JS_GetPropertyStr(ctx, v, "length");
+
+		if (JS_ToUint32(ctx, &length, len) != 0) {
+			length = 0;
+		}
+		JS_FreeValue(ctx, len);
+	}
+	/* eight numbers of geometry, then a pair for each stop */
+	if (length < 8 || (length - 8) % 2 != 0 || length > 8 + 2 * 256) {
+		return false;
+	}
+
+	{
+		JSValue item = JS_GetPropertyUint32(ctx, v, 0);
+
+		JS_ToInt32(ctx, &kind, item);
+		JS_FreeValue(ctx, item);
+	}
+	if (kind < CANVAS_PAINT_LINEAR || kind > CANVAS_PAINT_CONIC) {
+		return false;
+	}
+	paint->kind = (enum vita_canvas_paint_kind) kind;
+
+	{
+		double *slot[7];
+		int k;
+
+		slot[0] = &paint->x0; slot[1] = &paint->y0;
+		slot[2] = &paint->r0; slot[3] = &paint->x1;
+		slot[4] = &paint->y1; slot[5] = &paint->r1;
+		slot[6] = &paint->angle;
+		for (k = 0; k < 7; k++) {
+			JSValue item = JS_GetPropertyUint32(ctx, v,
+							    (uint32_t) k + 1);
+
+			JS_ToFloat64(ctx, slot[k], item);
+			JS_FreeValue(ctx, item);
+		}
+	}
+
+	n_stops = (int) ((length - 8) / 2);
+	if (n_stops == 0) {
+		/* a gradient with no stops paints nothing at all */
+		paint->kind = CANVAS_PAINT_SOLID;
+		paint->rgba = 0;
+		return true;
+	}
+
+	stops = malloc((size_t) n_stops * sizeof(*stops));
+	if (stops == NULL) {
+		return false;
+	}
+	for (i = 0; i < (uint32_t) n_stops; i++) {
+		JSValue off = JS_GetPropertyUint32(ctx, v, 8 + i * 2);
+		JSValue col = JS_GetPropertyUint32(ctx, v, 9 + i * 2);
+		uint32_t rgba = 0;
+		double offset = 0;
+
+		JS_ToFloat64(ctx, &offset, off);
+		JS_ToUint32(ctx, &rgba, col);
+		JS_FreeValue(ctx, off);
+		JS_FreeValue(ctx, col);
+		stops[i].offset = offset;
+		stops[i].rgba = rgba;
+	}
+
+	paint->stops = stops;
+	paint->n_stops = n_stops;
+	*stops_out = stops;
+
+	return true;
+}
+
+
+/**
+ * The pixels of a node a page wants to draw from.
+ *
+ * A canvas gives up its own bitmap; anything else -- an image, and that
+ * is what a page draws -- gives up the bitmap its layout box holds, so
+ * only an image that has finished loading can be drawn.
+ */
+static bool canvas_image_of(JSContext *ctx, JSValueConst v,
+			    struct vita_canvas_image *img)
+{
+	struct dom_node *node = JS_GetOpaque(v, node_class_id);
+	struct vita_canvas *canvas;
+	struct bitmap *bitmap;
+	struct box *box;
+	dom_string *name = NULL;
+	bool is_canvas = false;
+
+	if (node == NULL) {
+		return false;
+	}
+
+	if (dom_node_get_node_name(node, &name) == DOM_NO_ERR &&
+			name != NULL) {
+		is_canvas = strcasecmp(dom_string_data(name), "canvas") == 0;
+		dom_string_unref(name);
+	}
+
+	if (is_canvas) {
+		canvas = canvas_of(ctx, v);
+		return canvas != NULL && vita_canvas_as_image(canvas, img);
+	}
+
+	box = box_for_node(node);
+	if (box == NULL || box->object == NULL) {
+		return false;
+	}
+	bitmap = content_get_bitmap(box->object);
+	if (bitmap == NULL) {
+		return false;
+	}
+
+	return vita_canvas_image_of_bitmap(bitmap, img);
+}
+
+
+
+/**
+ * __vitaCanvasPath(node, points, counts, colour, mode, lineWidth)
+ *
+ * mode 0 fills by the nonzero rule, 1 by even-odd, 2 strokes.
+ */
+static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	struct vita_canvas_paint paint;
+	struct vita_canvas_stop *stops = NULL;
+	double *points;
+	int *counts = NULL;
+	int32_t mode = 0;
+	double line_width = 1;
+	int n_points = 0;
+	uint32_t n_sub = 0, i;
+	int total = 0;
+
+	(void) this_val;
+	if (argc < 5) {
+		return JS_UNDEFINED;
+	}
+
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_UNDEFINED;
+	}
+
+	points = canvas_points(ctx, argv[1], &n_points);
+	if (points == NULL || n_points < 4) {
+		return JS_UNDEFINED;
+	}
+
+	if (canvas_paint_of(ctx, argv[3], &paint, &stops) == false ||
+	    JS_ToInt32(ctx, &mode, argv[4]) != 0) {
+		free(stops);
+		return JS_UNDEFINED;
+	}
+	if (argc > 5) {
+		JS_ToFloat64(ctx, &line_width, argv[5]);
+	}
+
+	{
+		JSValue len = JS_GetPropertyStr(ctx, argv[2], "length");
+
+		if (JS_ToUint32(ctx, &n_sub, len) != 0) {
+			n_sub = 0;
+		}
+		JS_FreeValue(ctx, len);
+	}
+	if (n_sub == 0 || n_sub > 4096) {
+		free(stops);
+		return JS_UNDEFINED;
+	}
+
+	counts = malloc(n_sub * sizeof(*counts));
+	if (counts == NULL) {
+		free(stops);
+		return JS_UNDEFINED;
+	}
+	for (i = 0; i < n_sub; i++) {
+		JSValue item = JS_GetPropertyUint32(ctx, argv[2], i);
+		int32_t count = 0;
+
+		JS_ToInt32(ctx, &count, item);
+		JS_FreeValue(ctx, item);
+		counts[i] = count;
+		total += count;
+	}
+	if (total * 2 > n_points) {
+		free(counts);
+		free(stops);
+		return JS_UNDEFINED;
+	}
+
+	if (mode == 2) {
+		vita_canvas_stroke_path(canvas, points, counts, (int) n_sub,
+					&paint, line_width);
+	} else {
+		vita_canvas_fill_path(canvas, points, counts, (int) n_sub,
+				      &paint, mode == 1);
+	}
+	vita_canvas_finish(canvas);
+	free(counts);
+	free(stops);
+
+	return JS_UNDEFINED;
+}
+
+
+/**
+ * __vitaCanvasText(node, x, y, text, colour, sizePx, family, weight,
+ *                  italic, align, baseline)
+ */
+static JSValue win_vita_canvas_text(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	struct vita_canvas_paint paint;
+	struct vita_canvas_stop *stops = NULL;
+	const char *text;
+	size_t len = 0;
+	double x = 0, y = 0, size_px = 10;
+	int32_t family = 0, weight = 400, italic = 0, align = 0, baseline = 0;
+
+	(void) this_val;
+	if (argc < 6) {
+		return JS_UNDEFINED;
+	}
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_UNDEFINED;
+	}
+
+	JS_ToFloat64(ctx, &x, argv[1]);
+	JS_ToFloat64(ctx, &y, argv[2]);
+	text = JS_ToCStringLen(ctx, &len, argv[3]);
+	if (text == NULL) {
+		return JS_UNDEFINED;
+	}
+	if (canvas_paint_of(ctx, argv[4], &paint, &stops) == false) {
+		JS_FreeCString(ctx, text);
+		return JS_UNDEFINED;
+	}
+	JS_ToFloat64(ctx, &size_px, argv[5]);
+	if (argc > 6) JS_ToInt32(ctx, &family, argv[6]);
+	if (argc > 7) JS_ToInt32(ctx, &weight, argv[7]);
+	if (argc > 8) JS_ToInt32(ctx, &italic, argv[8]);
+	if (argc > 9) JS_ToInt32(ctx, &align, argv[9]);
+	if (argc > 10) JS_ToInt32(ctx, &baseline, argv[10]);
+
+	vita_canvas_text(canvas, x, y, text, (unsigned int) len, size_px,
+			 family, weight, italic != 0, &paint, align, baseline);
+	vita_canvas_finish(canvas);
+	JS_FreeCString(ctx, text);
+	free(stops);
+
+	return JS_UNDEFINED;
+}
+
+
+/** __vitaCanvasMeasure(text, sizePx, family, weight, italic) */
+static JSValue win_vita_canvas_measure(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	const char *text;
+	size_t len = 0;
+	double size_px = 10, width;
+	int32_t family = 0, weight = 400, italic = 0;
+
+	(void) this_val;
+	if (argc < 2) {
+		return JS_NewFloat64(ctx, 0);
+	}
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (text == NULL) {
+		return JS_NewFloat64(ctx, 0);
+	}
+	JS_ToFloat64(ctx, &size_px, argv[1]);
+	if (argc > 2) JS_ToInt32(ctx, &family, argv[2]);
+	if (argc > 3) JS_ToInt32(ctx, &weight, argv[3]);
+	if (argc > 4) JS_ToInt32(ctx, &italic, argv[4]);
+
+	width = vita_canvas_text_width(text, (unsigned int) len, size_px,
+				       family, weight, italic != 0);
+	JS_FreeCString(ctx, text);
+
+	return JS_NewFloat64(ctx, width);
+}
+
+
+/** __vitaCanvasClear(node, x, y, w, h) */
+static JSValue win_vita_canvas_clear(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	double v[4] = { 0, 0, 0, 0 };
+	int i;
+
+	(void) this_val;
+	if (argc < 5) {
+		return JS_UNDEFINED;
+	}
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_UNDEFINED;
+	}
+	for (i = 0; i < 4; i++) {
+		JS_ToFloat64(ctx, &v[i], argv[i + 1]);
+	}
+	vita_canvas_clear_rect(canvas, v[0], v[1], v[2], v[3]);
+	vita_canvas_finish(canvas);
+
+	return JS_UNDEFINED;
+}
+
+
+/**
+ * __vitaCanvasImageSize(node): [width, height] of what a page would
+ * draw from that node, or null if there is nothing to draw yet.
+ */
+static JSValue win_vita_canvas_image_size(JSContext *ctx,
+					  JSValueConst this_val,
+					  int argc, JSValueConst *argv)
+{
+	struct vita_canvas_image img;
+	JSValue arr;
+
+	(void) this_val;
+	if (argc < 1 || canvas_image_of(ctx, argv[0], &img) == false) {
+		return JS_NULL;
+	}
+
+	arr = JS_NewArray(ctx);
+	set_index(ctx, arr, 0, img.width);
+	set_index(ctx, arr, 1, img.height);
+
+	return arr;
+}
+
+
+/**
+ * __vitaCanvasImage(dst, src, sx, sy, sw, sh, m, alpha, smooth)
+ *
+ * m is the six numbers that map the unit square onto where the image
+ * goes, so the context's rotation and scale come along with it.
+ */
+static JSValue win_vita_canvas_image(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	struct vita_canvas_image img;
+	double s[4] = { 0, 0, 0, 0 };
+	double m[6] = { 1, 0, 0, 1, 0, 0 };
+	double alpha = 1;
+	int32_t smooth = 1;
+	int i;
+
+	(void) this_val;
+	if (argc < 7) {
+		return JS_UNDEFINED;
+	}
+	/*
+	 * The source is read first: one canvas surface is described at a
+	 * time, and asking for the destination would forget the source.
+	 * The image keeps its own pointers, so it survives that.
+	 */
+	if (canvas_image_of(ctx, argv[1], &img) == false) {
+		return JS_UNDEFINED;
+	}
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_UNDEFINED;
+	}
+
+	for (i = 0; i < 4; i++) {
+		JS_ToFloat64(ctx, &s[i], argv[i + 2]);
+	}
+	for (i = 0; i < 6; i++) {
+		JSValue item = JS_GetPropertyUint32(ctx, argv[6],
+						    (uint32_t) i);
+
+		JS_ToFloat64(ctx, &m[i], item);
+		JS_FreeValue(ctx, item);
+	}
+	if (argc > 7) JS_ToFloat64(ctx, &alpha, argv[7]);
+	if (argc > 8) JS_ToInt32(ctx, &smooth, argv[8]);
+
+	vita_canvas_draw_image(canvas, &img, s[0], s[1], s[2], s[3], m,
+			       alpha, smooth != 0);
+	vita_canvas_finish(canvas);
+
+	return JS_UNDEFINED;
+}
+
+
+/**
+ * __vitaCanvasRead(node, x, y, w, h): the pixels, as getImageData wants
+ * them, in an ArrayBuffer the caller wraps.
+ */
+static JSValue win_vita_canvas_read(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	unsigned char *pixels;
+	int32_t v[4] = { 0, 0, 0, 0 };
+	JSValue buffer;
+	int i;
+
+	(void) this_val;
+	if (argc < 5) {
+		return JS_NULL;
+	}
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_NULL;
+	}
+	for (i = 0; i < 4; i++) {
+		JS_ToInt32(ctx, &v[i], argv[i + 1]);
+	}
+	/*
+	 * The buffer is made twice over, once here and once as the array
+	 * the script gets, so a read is capped at a megapixel: four
+	 * megabytes of the Vita's heap is already more than a page has
+	 * any business asking for in one call.
+	 */
+	if (v[2] <= 0 || v[3] <= 0 ||
+	    (long) v[2] * (long) v[3] > 1024L * 1024L) {
+		return JS_NULL;
+	}
+
+	pixels = malloc((size_t) v[2] * (size_t) v[3] * 4);
+	if (pixels == NULL) {
+		return JS_NULL;
+	}
+	vita_canvas_read_pixels(canvas, v[0], v[1], v[2], v[3], pixels);
+
+	buffer = JS_NewArrayBufferCopy(ctx, pixels,
+				       (size_t) v[2] * (size_t) v[3] * 4);
+	free(pixels);
+
+	return buffer;
+}
+
+
+/**
+ * __vitaCanvasWrite(node, bytes, inW, inH, sx, sy, sw, sh, dx, dy)
+ */
+static JSValue win_vita_canvas_write(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	size_t byte_offset = 0, byte_length = 0, bytes_per = 0;
+	int32_t v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+	JSValue buffer;
+	uint8_t *bytes;
+	size_t size = 0;
+	int i;
+
+	(void) this_val;
+	if (argc < 10) {
+		return JS_UNDEFINED;
+	}
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_UNDEFINED;
+	}
+	for (i = 0; i < 8; i++) {
+		JS_ToInt32(ctx, &v[i], argv[i + 2]);
+	}
+
+	buffer = JS_GetTypedArrayBuffer(ctx, argv[1], &byte_offset,
+					&byte_length, &bytes_per);
+	if (JS_IsException(buffer)) {
+		return JS_UNDEFINED;
+	}
+	bytes = JS_GetArrayBuffer(ctx, &size, buffer);
+	JS_FreeValue(ctx, buffer);
+	if (bytes == NULL || bytes_per != 1 || v[0] <= 0 || v[1] <= 0 ||
+	    byte_length < (size_t) v[0] * (size_t) v[1] * 4) {
+		return JS_UNDEFINED;
+	}
+
+	vita_canvas_write_pixels(canvas, bytes + byte_offset, v[0], v[1],
+				 v[2], v[3], v[4], v[5], v[6], v[7]);
+	vita_canvas_finish(canvas);
+
+	return JS_UNDEFINED;
+}
+
+
 static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
@@ -5175,6 +5885,32 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_dom_gen, "__vitaDomGen", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasPath",
+			  JS_NewCFunction(ctx, win_vita_canvas_path,
+					  "__vitaCanvasPath", 6));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasImage",
+			  JS_NewCFunction(ctx, win_vita_canvas_image,
+					  "__vitaCanvasImage", 9));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasImageSize",
+			  JS_NewCFunction(ctx, win_vita_canvas_image_size,
+					  "__vitaCanvasImageSize", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasRead",
+			  JS_NewCFunction(ctx, win_vita_canvas_read,
+					  "__vitaCanvasRead", 5));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasWrite",
+			  JS_NewCFunction(ctx, win_vita_canvas_write,
+					  "__vitaCanvasWrite", 10));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasClear",
+			  JS_NewCFunction(ctx, win_vita_canvas_clear,
+					  "__vitaCanvasClear", 5));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasText",
+			  JS_NewCFunction(ctx, win_vita_canvas_text,
+					  "__vitaCanvasText", 11));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasMeasure",
+			  JS_NewCFunction(ctx, win_vita_canvas_measure,
+					  "__vitaCanvasMeasure", 5));
+	JS_SetPropertyStr(ctx, global, "__vitaGap",
+			  JS_NewCFunction(ctx, win_vita_gap, "__vitaGap", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaElementFromPoint",
 			  JS_NewCFunction(ctx, win_vita_element_from_point,
 					  "__vitaElementFromPoint", 2));
@@ -5537,6 +6273,8 @@ nserror js_closethread(jsthread *thread)
 	JS_RunGC(thread->heap->rt);
 	t1 = now_ms();
 	vitasurf_ms_teardown += (unsigned)(t1 - t0);
+	gap_report();
+	gap_reset();
 	vita_log("qjs: page closed in %u ms, runtime memory now %u KB",
 		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt));
 	return NSERROR_OK;
@@ -7084,7 +7822,19 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	bool ok;
 	char *src;
 
-	if (thread == NULL || thread->closed || txt == NULL || txtlen == 0) {
+	if (thread == NULL || txt == NULL || txtlen == 0) {
+		return false;
+	}
+	if (thread->closed) {
+		/*
+		 * The page's engine has already been torn down, so this
+		 * script will never run and nothing said so: a bundle
+		 * that mounts an app leaves the page on its loading
+		 * screen for good (VitaSurf).
+		 */
+		vita_log("script: %s handed over after the page's "
+			 "JavaScript was closed, so it did not run",
+			 name != NULL ? name : "<script>");
 		return false;
 	}
 	/*
@@ -7119,6 +7869,8 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		txtlen--;
 	}
 	if (txtlen == 0) {
+		vita_log("script: %s is empty, so nothing ran",
+			 name != NULL ? name : "<script>");
 		return false;
 	}
 	if (txtlen > SCRIPT_MAX_BYTES) {

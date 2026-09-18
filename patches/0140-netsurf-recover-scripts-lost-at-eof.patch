@@ -1,0 +1,280 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index c11aded57..e1033a248 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -759,6 +759,7 @@ html_process_encoding_change(struct content *c,
+ 	error = dom_hubbub_parser_parse_chunk(html->parser,
+ 					      source_data,
+ 					      source_size);
++	html->bytes_parsed = source_size;
+ 
+ 	return libdom_hubbub_error_to_nserror(error);
+ }
+@@ -783,6 +784,8 @@ html_process_data(struct content *c, const char *data, unsigned int size)
+ 	nsu_getmonotonic_ms(&t1);
+ 	vitasurf_ms_html_parse += (unsigned int)(t1 - t0);
+ 
++	html->bytes_parsed += size;
++
+ 	err = libdom_hubbub_error_to_nserror(dom_ret);
+ 
+ 	/* deal with encoding change */
+@@ -974,6 +977,30 @@ html_begin_conversion_inner(html_content *htmlc)
+ 	 * complete to avoid repeating the completion pointlessly.
+ 	 */
+ 	if (htmlc->parse_completed == false) {
++		const uint8_t *source_data;
++		size_t source_size = 0;
++
++		/*
++		 * Hand the parser anything of the document it has not
++		 * been given. Telling it the document has ended while
++		 * bytes are still owed lands that end of input in the
++		 * middle of the page, and hubbub closes whatever element
++		 * it is inside without a word (VitaSurf).
++		 */
++		source_data = content__get_source_data(&htmlc->base,
++						       &source_size);
++		if (source_data != NULL && source_size > htmlc->bytes_parsed) {
++			size_t owed = source_size - htmlc->bytes_parsed;
++
++			vita_log("parse: the parser was %u bytes short of the "
++				 "document; handing them over before the end",
++				 (unsigned) owed);
++			dom_hubbub_parser_parse_chunk(htmlc->parser,
++					source_data + htmlc->bytes_parsed,
++					owed);
++			htmlc->bytes_parsed = source_size;
++		}
++
+ 		NSLOG(netsurf, INFO, "Completing parse (%p)", htmlc);
+ 		/* complete parsing */
+ 		error = dom_hubbub_parser_completed(htmlc->parser);
+@@ -994,6 +1021,15 @@ html_begin_conversion_inner(html_content *htmlc)
+ 			return false;
+ 		}
+ 		htmlc->parse_completed = true;
++
++		/*
++		 * A document that ends inside a script element leaves it
++		 * in the tree, never fetched and never run, because that
++		 * is all hubbub does at end of input. Pick those up now,
++		 * or a page whose last bundle mounts its app sits on its
++		 * loading screen for ever (VitaSurf).
++		 */
++		(void) html_recover_dropped_scripts(htmlc);
+ 	}
+ 
+ 	if (html_can_begin_conversion(htmlc) == false) {
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index a8763458b..25c79518a 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -150,6 +150,16 @@ typedef struct html_content {
+ 	/** Scripts */
+ 	/** whether the log has already named this page's unrun scripts */
+ 	bool scripts_reported;
++	/** whether the scripts the parse dropped have been picked up */
++	bool scripts_recovered;
++	/**
++	 * How many bytes of the document the parser has been given.
++	 *
++	 * The parse is told the document has ended once nothing is left
++	 * active. If any of the document never reached the parser, that
++	 * end of input lands in the middle of the page (VitaSurf).
++	 */
++	size_t bytes_parsed;
+ 	/**
+ 	 * How deep the parser is inside running a script (VitaSurf).
+ 	 *
+@@ -348,6 +358,14 @@ nserror html_proceed_to_done(html_content *html);
+  */
+ void html_report_scripts(html_content *c);
+ 
++/**
++ * Hand over the scripts the parse dropped (VitaSurf).
++ *
++ * \param c  the html content whose parse has just finished
++ * \return the number of scripts handed over
++ */
++unsigned int html_recover_dropped_scripts(html_content *c);
++
+ 
+ /* in html/redraw.c */
+ bool html_redraw(struct content *c, struct content_redraw_data *data,
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index b99a6739e..c3036714a 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -37,6 +37,7 @@
+ #include "netsurf/content.h"
+ #include "javascript/js.h"
+ #include "content/content_protected.h"
++#include "content/llcache.h"
+ #include "content/content_factory.h"
+ #include "content/fetch.h"
+ #include "content/hlcache.h"
+@@ -310,6 +311,154 @@ void html_report_scripts(html_content *c)
+ }
+ 
+ 
++
++/**
++ * Hand over the scripts the parse dropped (VitaSurf).
++ *
++ * Hubbub closes a script element out at end of input without telling
++ * anyone about it, so a document whose last bytes go missing leaves its
++ * final <script src> sitting in the tree, never fetched and never run.
++ * Audiobookshelf is that page: its fourth bundle is the one that mounts
++ * the app, and without it the browser sits on the loading spinner for
++ * ever with nothing in the log to say why.
++ *
++ * Once the parse is over, anything in the document with a src and no
++ * entry of its own was dropped that way. Hand it to the usual path.
++ *
++ * \param c  the html content whose parse has just finished
++ * \return the number of scripts handed over
++ */
++/**
++ * The key a script element is marked with once it has been handed over.
++ *
++ * Matching by url is not enough: a preload holds the same url, and a
++ * script whose fetch failed has let its handle go. The element itself is
++ * the only thing that says whether this script was ever dealt with.
++ */
++static dom_string *script_seen_key(void)
++{
++	static dom_string *key = NULL;
++
++	if (key == NULL) {
++		if (dom_string_create((const uint8_t *) "__vitasurf_script",
++				      17, &key) != DOM_NO_ERR) {
++			return NULL;
++		}
++	}
++	return key;
++}
++
++
++/**
++ * Note that a script element has been handed to the client (VitaSurf).
++ */
++static void script_mark_seen(dom_node *node)
++{
++	dom_string *key = script_seen_key();
++	void *old = NULL;
++
++	if (key != NULL) {
++		dom_node_set_user_data(node, key, (void *) 1, NULL, &old);
++	}
++}
++
++
++/**
++ * Whether a script element has already been handed over (VitaSurf).
++ */
++static bool script_was_seen(dom_node *node)
++{
++	dom_string *key = script_seen_key();
++	void *data = NULL;
++
++	if (key == NULL) {
++		return false;
++	}
++	if (dom_node_get_user_data(node, key, &data) != DOM_NO_ERR) {
++		return false;
++	}
++	return data != NULL;
++}
++
++
++unsigned int html_recover_dropped_scripts(html_content *c)
++{
++	dom_nodelist *list = NULL;
++	dom_string *name = NULL;
++	uint32_t n = 0, k;
++	unsigned int recovered = 0;
++
++	if (c == NULL || c->document == NULL || c->scripts_recovered ||
++			c->enable_scripting == false) {
++		return 0;
++	}
++	c->scripts_recovered = true;
++
++	if (dom_string_create((const uint8_t *) "script", 6,
++			      &name) != DOM_NO_ERR) {
++		return 0;
++	}
++	if (dom_document_get_elements_by_tag_name(c->document, name, &list) !=
++			DOM_NO_ERR || list == NULL) {
++		dom_string_unref(name);
++		return 0;
++	}
++	dom_string_unref(name);
++
++	dom_nodelist_get_length(list, &n);
++	for (k = 0; k < n; k++) {
++		dom_node *node = NULL;
++		dom_string *src = NULL;
++
++		if (dom_nodelist_item(list, k, &node) != DOM_NO_ERR ||
++				node == NULL) {
++			continue;
++		}
++		if (script_was_seen(node)) {
++			dom_node_unref(node);
++			continue;
++		}
++		if (dom_element_get_attribute((dom_element *) node,
++				corestring_dom_src, &src) != DOM_NO_ERR ||
++				src == NULL) {
++			/* an inline script the parse never closed has no
++			 * body to run */
++			dom_node_unref(node);
++			continue;
++		}
++
++		vita_log("script: the parse dropped %s, picking it up",
++			 dom_string_data(src));
++		dom_string_unref(src);
++		html_process_script(c, node);
++		recovered++;
++		dom_node_unref(node);
++	}
++	dom_nodelist_unref(list);
++
++	/*
++	 * The document ended somewhere it should not have. Say how much of
++	 * it arrived and how much the server said it was sending, because
++	 * that is what tells a short response apart from bytes lost on the
++	 * way in (VitaSurf).
++	 */
++	if (recovered > 0) {
++		const uint8_t *src;
++		size_t len = 0;
++		const char *declared;
++
++		src = content__get_source_data(&c->base, &len);
++		declared = llcache_handle_get_header(c->base.llcache,
++						     "Content-Length");
++		vita_log("parse: the document ended inside an element; "
++			 "%u bytes of it arrived and the server said it was "
++			 "sending %s", (unsigned) (src != NULL ? len : 0),
++			 declared != NULL ? declared : "no length");
++	}
++
++	return recovered;
++}
++
+ /**
+  * Callback for asyncronous scripts
+  */
+@@ -993,6 +1142,8 @@ html_process_script(void *ctx, dom_node *node)
+ 	NSLOG(netsurf, INFO, "content %p parser %p node %p", c, c->parser,
+ 	      node);
+ 
++	script_mark_seen(node);
++
+ 	exc = dom_element_get_attribute(node, corestring_dom_type, &mimetype);
+ 	if (exc != DOM_NO_ERR || mimetype == NULL) {
+ 		mimetype = dom_string_ref(corestring_dom_text_javascript);
