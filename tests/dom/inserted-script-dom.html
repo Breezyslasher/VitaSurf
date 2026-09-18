@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!-- A script a page adds to the document runs from inside libdom's
+     DOMNodeInserted default action, and libdom holds the document
+     read-only for the whole of a mutation event dispatch. Everything
+     such a script appended was refused, silently: openmediavault's
+     language menu had nowhere to put its overlay and so did nothing at
+     all when the globe was pressed.
+     Expected: PASS lines in the log. -->
+<html><head></head><body>
+<div id="host"></div>
+<script>
+setTimeout(function(){
+ var s = document.createElement('script');
+ s.textContent =
+  "var d = document.createElement('span');" +
+  "d.id = 'made'; d.textContent = 'x';" +
+  "document.getElementById('host').appendChild(d);" +
+  "var e = document.createElement('i'), f = document.createElement('b');" +
+  "e.appendChild(f); window.__detached = (f.parentNode !== null);";
+ document.body.appendChild(s);
+ setTimeout(function(){
+  function report(ok, what, got, want) {
+   console.log((ok ? 'PASS ' : 'FAIL ') + what +
+               (ok ? '' : ' got ' + got + ', wanted ' + want));
+  }
+  var made = document.getElementById('made');
+  report(made !== null, 'an inserted script can append to the document',
+         'nothing appended', 'a span');
+  report(made !== null && made.parentNode &&
+         made.parentNode.id === 'host',
+         'the appended node lands under the right parent',
+         made && made.parentNode ? made.parentNode.id : 'no parent', 'host');
+  report(window.__detached === true,
+         'an inserted script can build a detached tree',
+         String(window.__detached), 'true');
+ }, 300);
+}, 200);
+</script>
+</body></html>
