@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!-- A graphic with no width, no height and no viewBox has no intrinsic
+     size, and CSS Images 3 says such a replaced element is laid out at
+     the default object size, 300x150. It used to come out 0x0 and
+     never appear.
+     Expected: a green square in a 300x150 box, and a PASS line. -->
+<html><head><style>body { margin: 0 } img { background: #eee }</style></head>
+<body>
+<img id="i" src="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Crect%20width%3D%2240%22%20height%3D%2240%22%20fill%3D%22green%22%2F%3E%3C%2Fsvg%3E">
+<script>
+setTimeout(function(){
+ var i = document.getElementById('i');
+ var r = i.getBoundingClientRect();
+ var ok = Math.round(r.width) === 300 && Math.round(r.height) === 150;
+ console.log((ok ? 'PASS' : 'FAIL') + ' default object size ' +
+	     Math.round(r.width) + 'x' + Math.round(r.height) +
+	     ' natural ' + i.naturalWidth + 'x' + i.naturalHeight);
+},600);
+</script></body></html>

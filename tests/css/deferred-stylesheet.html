@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<!-- A build that inlines its critical CSS ships the rest as
+     <link media="print" onload="this.media='all'"> so the first paint
+     does not wait for it. The sheet was never fetched, so the load
+     event never came, so the media stayed "print" and the stylesheet
+     never applied: openmediavault's login page lost the whole of
+     Angular Material's CSS and drew its fields zero pixels wide.
+     Expected: a green 300px box, a blue 250px box, a yellow 275px
+     box, and PASS lines. -->
+<html><head>
+<style>body { margin: 0 } #target { width: 100px; background: #fcc }
+#late { width: 100px; background: #fcc }
+#pre { width: 100px; background: #fcc }</style>
+<link rel="stylesheet" href="deferred.css" media="print" onload="this.media='all'">
+<link id="l2" rel="stylesheet" href="deferred2.css" media="print">
+<link rel="preload" as="style" href="deferred3.css" onload="this.rel='stylesheet'">
+</head><body>
+<div id="target">deferred</div>
+<div id="late">late</div>
+<div id="pre">preloaded</div>
+<script>
+setTimeout(function(){
+ var l = document.querySelector('link[rel=stylesheet]');
+ var w = Math.round(document.getElementById('target').getBoundingClientRect().width);
+ console.log((w === 300 ? 'PASS' : 'FAIL') + ' deferred stylesheet applied, width ' +
+	     w + ', media now ' + l.media);
+ /* the same again, but changed once the page has been laid out */
+ document.getElementById('l2').media = 'all';
+ setTimeout(function(){
+  var lw = Math.round(document.getElementById('late').getBoundingClientRect().width);
+  console.log((lw === 250 ? 'PASS' : 'FAIL') +
+	      ' stylesheet widened after layout, width ' + lw);
+  var pw = Math.round(document.getElementById('pre').getBoundingClientRect().width);
+  console.log((pw === 275 ? 'PASS' : 'FAIL') +
+	      ' preloaded stylesheet promoted, width ' + pw);
+ }, 500);
+},700);
+</script></body></html>

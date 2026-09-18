@@ -4682,6 +4682,64 @@ static JSValue win_vita_element_from_point(JSContext *ctx,
 	return wrap_node(ctx, node);
 }
 
+/*
+ * The border box of an inline element, which is the union of its
+ * fragments.
+ *
+ * NetSurf does not nest the content of an inline element inside its
+ * box: the pieces sit between the BOX_INLINE box and its BOX_INLINE_END
+ * as siblings of both, and the BOX_INLINE itself is zero wide. Reading
+ * the box on its own therefore said every <span> and <a> was 0 px wide,
+ * and a page that measures a link to place something next to it put it
+ * at the left edge.
+ */
+static void inline_border_box(struct box *box, int *px, int *py,
+			      int *pw, int *ph)
+{
+	struct box *b;
+	int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+	bool first = true;
+
+	for (b = box; b != NULL; b = b->next) {
+		int bx, by, l, t, r, bot;
+
+		/* floats in the middle of an inline are not part of it,
+		 * as the renderer's own walk over these boxes says */
+		if (b->type == BOX_FLOAT_LEFT || b->type == BOX_FLOAT_RIGHT) {
+			continue;
+		}
+
+		/*
+		 * A box's position is its padding edge, so the border box
+		 * is that less the border on one side and the padding plus
+		 * the border on the other. This is the same arithmetic the
+		 * renderer does to draw an inline's background.
+		 */
+		box_coords(b, &bx, &by);
+		l = bx - b->border[LEFT].width;
+		t = by - b->border[TOP].width;
+		r = bx + b->padding[LEFT] + b->width + b->padding[RIGHT] +
+				b->border[RIGHT].width;
+		bot = by + b->padding[TOP] + b->height + b->padding[BOTTOM] +
+				b->border[BOTTOM].width;
+
+		if (first || l < x0) x0 = l;
+		if (first || t < y0) y0 = t;
+		if (first || r > x1) x1 = r;
+		if (first || bot > y1) y1 = bot;
+		first = false;
+
+		if (b == box->inline_end) {
+			break;
+		}
+	}
+
+	*px = x0;
+	*py = y0;
+	*pw = x1 - x0;
+	*ph = y1 - y0;
+}
+
 static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
@@ -4709,12 +4767,25 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 	sw = box->descendant_x1 > cw ? box->descendant_x1 : cw;
 	sh = box->descendant_y1 > ch ? box->descendant_y1 : ch;
 	arr = JS_NewArray(ctx);
-	set_index(ctx, arr, 0, x - box->border[LEFT].width);
-	set_index(ctx, arr, 1, y - box->border[TOP].width);
-	set_index(ctx, arr, 2, cw + box->border[LEFT].width + box->border[RIGHT].width);
-	set_index(ctx, arr, 3, ch + box->border[TOP].width + box->border[BOTTOM].width);
-	set_index(ctx, arr, 4, cw);
-	set_index(ctx, arr, 5, ch);
+	if (box->type == BOX_INLINE && box->inline_end != NULL) {
+		int ix, iy, iw, ih;
+
+		inline_border_box(box, &ix, &iy, &iw, &ih);
+		set_index(ctx, arr, 0, ix);
+		set_index(ctx, arr, 1, iy);
+		set_index(ctx, arr, 2, iw);
+		set_index(ctx, arr, 3, ih);
+		/* CSSOM View: a non-replaced inline has no client box */
+		set_index(ctx, arr, 4, 0);
+		set_index(ctx, arr, 5, 0);
+	} else {
+		set_index(ctx, arr, 0, x - box->border[LEFT].width);
+		set_index(ctx, arr, 1, y - box->border[TOP].width);
+		set_index(ctx, arr, 2, cw + box->border[LEFT].width + box->border[RIGHT].width);
+		set_index(ctx, arr, 3, ch + box->border[TOP].width + box->border[BOTTOM].width);
+		set_index(ctx, arr, 4, cw);
+		set_index(ctx, arr, 5, ch);
+	}
 	set_index(ctx, arr, 6, box->border[LEFT].width);
 	set_index(ctx, arr, 7, box->border[TOP].width);
 	set_index(ctx, arr, 8, sw);

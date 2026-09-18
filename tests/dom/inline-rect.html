@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!-- NetSurf does not nest the content of an inline element inside its
+     box: the pieces sit between the element's box and its inline end
+     marker as siblings of both, and the box itself is zero wide. So
+     getBoundingClientRect() and offsetWidth said every <span> and <a>
+     was 0 px wide, and a page that measures a link to place a menu
+     beside it put the menu at the left edge.
+     Expected: a monospace line of text, a padded span with a red
+     border, and PASS lines in the log. -->
+<html><head><style>
+body { margin: 0; font: 16px/20px monospace }
+#p { padding: 10px; border: 2px solid red }
+</style></head><body>
+<div id="d" style="width:400px">before <span id="s">hello world</span> after</div>
+<div style="width:200px">wrap <span id="w">one two three four five six seven</span> end</div>
+<div><span id="p">pad</span></div>
+<div><span id="c" style="display:inline-block">0123456789</span></div>
+<script>
+setTimeout(function(){
+ function box(id){ return document.getElementById(id).getBoundingClientRect(); }
+ /* one character, from an inline-block, whose width layout has
+    always reported */
+ var c = box('c').width / 10;
+ var s = box('s'), w = box('w'), p = box('p');
+ function near(a, b){ return Math.abs(a - b) <= 2; }
+ /* the span covers its eleven characters, and starts after the seven
+    that precede it */
+ var one = near(s.width, 11 * c) && near(s.left, 7 * c) && near(s.height, 20);
+ /* wrapped over three lines: as wide as the widest line, three tall */
+ var two = w.height > 40 && w.width > 100;
+ /* padding and border count, in both directions, and the padding
+    hangs outside the line rather than growing it */
+ var three = near(p.width, 3 * c + 24) && near(p.height, 44);
+ var off = document.getElementById('s').offsetWidth;
+ var four = near(off, s.width);
+ console.log((one ? 'PASS' : 'FAIL') + ' inline rect ' +
+	     Math.round(s.left) + ',' + Math.round(s.top) + ' ' +
+	     Math.round(s.width) + 'x' + Math.round(s.height));
+ console.log((two ? 'PASS' : 'FAIL') + ' wrapped inline rect ' +
+	     Math.round(w.width) + 'x' + Math.round(w.height));
+ console.log((three ? 'PASS' : 'FAIL') + ' padded inline rect ' +
+	     Math.round(p.width) + 'x' + Math.round(p.height));
+ console.log((four ? 'PASS' : 'FAIL') + ' inline offsetWidth ' + off);
+},600);
+</script></body></html>
