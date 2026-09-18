@@ -140,6 +140,18 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/canvas.c)
     target_include_directories(${PROJECT_NAME} PRIVATE
         "${CMAKE_BINARY_DIR}/generated" vita/js)
+    # canvas.c draws text with the glyphs the framebuffer frontend's font
+    # engine has, so it needs FreeType's headers. NetSurf asks pkg-config
+    # for them; here the sysroot is searched directly, because which of
+    # the two places they sit in depends on the FreeType build.
+    find_path(VITASURF_FREETYPE_INCLUDE ft2build.h
+        PATHS "${SYSROOT}/include/freetype2" "${SYSROOT}/include"
+        NO_DEFAULT_PATH)
+    if(NOT VITASURF_FREETYPE_INCLUDE)
+        message(FATAL_ERROR "ft2build.h not found under ${SYSROOT}: install freetype with vdpm")
+    endif()
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        "${VITASURF_FREETYPE_INCLUDE}")
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
