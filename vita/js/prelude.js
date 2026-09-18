@@ -5570,7 +5570,11 @@ stampConsts(P);
   8:'Comment',9:'HTMLDocument',10:'DocumentType',11:'DocumentFragment'};
  Object.defineProperty(P,'constructor',{configurable:true,
   get:function(){
-   var t=this.nodeType,n;
+   var t,n;
+   /* the prototype object itself is not a node, and reading its
+      constructor must answer rather than throw (VitaSurf) */
+   try{t=this.nodeType;}catch(e){return W.HTMLElement||W.Node;}
+   if(t===undefined)return W.HTMLElement||W.Node;
    if(t===1){
     n=BY_TAG[this.tagName];
     if(!n)n=HTML_TAGS.indexOf(' '+this.tagName+' ')>=0?'HTMLElement'
@@ -5601,6 +5605,68 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   'getElementsByTagNameNS'].forEach(function(m){
   if(typeof P[m]==='function')P[m]=live(P[m]);
   if(typeof D[m]==='function')D[m]=live(D[m]);});
+ /*
+ * A DOM prototype chain with the shapes a framework looks for
+ * (VitaSurf).
+ *
+ * Every interface here shares one prototype, so an element's immediate
+ * prototype was Element.prototype itself. Svelte reads which properties
+ * an element has a setter for by walking from the element up to
+ * Element.prototype, and that walk ended before it saw anything: with
+ * no setter found for disabled it fell back to setAttribute('disabled',
+ * false), and a boolean attribute is true whatever its value, so every
+ * field on an Immich login form was disabled and refused to be typed
+ * into. The shared prototype is now the HTMLElement level, with an
+ * Element, a Node and an EventTarget prototype above it, as a browser
+ * has. The upper ones carry copies of the methods that belong to them,
+ * so code that tests for a method on Element.prototype still finds it;
+ * the copies are shadowed by the originals and nothing calls them.
+ */
+(function(){
+ var ELEMENT_LEVEL=('setAttribute getAttribute removeAttribute hasAttribute '+
+  'setAttributeNS getAttributeNS removeAttributeNS hasAttributeNS '+
+  'getAttributeNames toggleAttribute matches closest querySelector '+
+  'querySelectorAll getElementsByTagName getElementsByClassName '+
+  'getBoundingClientRect getClientRects scrollIntoView attachShadow '+
+  'insertAdjacentHTML insertAdjacentElement insertAdjacentText '+
+  'requestFullscreen animate replaceChildren append prepend before '+
+  'after remove '+
+  'id className classList tagName attributes innerHTML outerHTML '+
+  'children firstElementChild lastElementChild nextElementSibling '+
+  'previousElementSibling childElementCount clientWidth clientHeight '+
+  'clientTop clientLeft scrollTop scrollLeft scrollWidth scrollHeight '+
+  'slot part shadowRoot namespaceURI localName prefix').split(' ');
+ var NODE_LEVEL=('appendChild removeChild insertBefore replaceChild '+
+  'cloneNode contains compareDocumentPosition hasChildNodes '+
+  'normalize isEqualNode isSameNode lookupPrefix lookupNamespaceURI '+
+  'getRootNode '+
+  /* the properties too: Svelte reads the firstChild and nextSibling
+     getters off Node.prototype and calls them on every node it walks */
+  'firstChild lastChild nextSibling previousSibling parentNode '+
+  'parentElement childNodes nodeType nodeName nodeValue textContent '+
+  'ownerDocument isConnected baseURI').split(' ');
+ var EVENT_LEVEL='addEventListener removeEventListener dispatchEvent'.split(' ');
+ function level(names){
+  var o=Object.create(null);
+  o=Object.create(Object.prototype);
+  names.forEach(function(k){
+   var d=Object.getOwnPropertyDescriptor(P,k);
+   if(d)try{Object.defineProperty(o,k,d);}catch(e){}});
+  return o;}
+ try{
+  var T=level(EVENT_LEVEL);
+  var N=level(NODE_LEVEL);
+  var E=level(ELEMENT_LEVEL);
+  Object.setPrototypeOf(N,T);
+  Object.setPrototypeOf(E,N);
+  Object.setPrototypeOf(P,E);
+  if(W.EventTarget)W.EventTarget.prototype=T;
+  if(W.Node)W.Node.prototype=N;
+  if(W.Element)W.Element.prototype=E;
+  if(W.CharacterData)W.CharacterData.prototype=N;
+ }catch(e){}
+})();
+
  var kids=Object.getOwnPropertyDescriptor(P,'children');
  if(kids&&kids.get)Object.defineProperty(P,'children',{configurable:true,
   get:function(){

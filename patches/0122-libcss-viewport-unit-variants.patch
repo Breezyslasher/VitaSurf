@@ -1,0 +1,64 @@
+diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
+index 801026a..db6e191 100644
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -2001,8 +2001,59 @@ css_error css__parse_unit_specifier(css_language *c,
+  * \return CSS_OK      on success,
+  *         CSS_INVALID on encountering an unknown keyword
+  */
++/**
++ * Read a small, large or dynamic viewport unit (VitaSurf).
++ *
++ * CSS Values 4 gives the viewport three sizes, for a browser whose
++ * toolbars come and go. Nothing here comes and goes, so the three are
++ * the same size, and svh, lvh and dvh all mean what vh means. Tailwind
++ * writes min-h-dvh and h-svh everywhere, and a page built on one of
++ * those had no height at all.
++ *
++ * \param ptr   Keyword, after its s, l or d
++ * \param len   Length of the rest
++ * \param unit  Updated with the unit on a match
++ * \return true if the rest names a viewport unit
++ */
++static bool css__parse_viewport_unit(const char *ptr, size_t len,
++		uint32_t *unit)
++{
++	if (len == 2) {
++		if (strncasecmp(ptr, "vh", 2) == 0) {
++			*unit = UNIT_VH;
++		} else if (strncasecmp(ptr, "vw", 2) == 0) {
++			*unit = UNIT_VW;
++		} else if (strncasecmp(ptr, "vi", 2) == 0) {
++			*unit = UNIT_VI;
++		} else if (strncasecmp(ptr, "vb", 2) == 0) {
++			*unit = UNIT_VB;
++		} else {
++			return false;
++		}
++		return true;
++	}
++	if (len == 4) {
++		if (strncasecmp(ptr, "vmin", 4) == 0) {
++			*unit = UNIT_VMIN;
++		} else if (strncasecmp(ptr, "vmax", 4) == 0) {
++			*unit = UNIT_VMAX;
++		} else {
++			return false;
++		}
++		return true;
++	}
++	return false;
++}
++
+ css_error css__parse_unit_keyword(const char *ptr, size_t len, uint32_t *unit)
+ {
++	if (len > 2 && (*ptr == 's' || *ptr == 'S' ||
++			*ptr == 'l' || *ptr == 'L' ||
++			*ptr == 'd' || *ptr == 'D') &&
++	    css__parse_viewport_unit(ptr + 1, len - 1, unit)) {
++		return CSS_OK;
++	}
++
+ 	if (len == 4) {
+ 		if (strncasecmp(ptr, "grad", 4) == 0)
+ 			*unit = UNIT_GRAD;

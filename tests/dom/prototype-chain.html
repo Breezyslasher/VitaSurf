@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!-- Every DOM interface here shares one prototype, so an element's own
+     prototype was Element.prototype itself. Svelte works out which
+     properties an element has a setter for by walking from the element
+     up to Element.prototype, and that walk ended before it saw
+     anything: with no setter found for disabled it fell back to
+     setAttribute('disabled', false), and a boolean attribute is true
+     whatever its value, so every field on an Immich login form was
+     disabled and refused to be typed into. The shared prototype is the
+     HTMLElement level now, with Element, Node and EventTarget above it.
+     Expected: nothing to look at; the page prints its result. -->
+<html><body>
+<input id="i">
+<script>
+setTimeout(function(){
+ var i = document.getElementById('i');
+ var proto = Object.getPrototypeOf(i);
+ /* the walk a framework does to find an element's setters */
+ var setters = [], p = i, stop = window.Element.prototype, guard = 0;
+ while (p && p !== stop && guard++ < 10) {
+  var d = Object.getOwnPropertyDescriptors(p);
+  for (var k in d) { if (d[k].set) setters.push(k); }
+  p = Object.getPrototypeOf(p);
+ }
+ /* Svelte also reads these two getters off Node.prototype */
+ var nodeProto = window.Node.prototype;
+ var first = Object.getOwnPropertyDescriptor(nodeProto, 'firstChild');
+ var next = Object.getOwnPropertyDescriptor(nodeProto, 'nextSibling');
+ var walked = first && first.get ? first.get.call(document.body) : null;
+ var ok = proto !== stop &&
+          setters.indexOf('disabled') >= 0 && setters.indexOf('value') >= 0 &&
+          first && first.get && next && next.get &&
+          walked === document.body.firstChild &&
+          window.Element.prototype !== window.Node.prototype &&
+          i instanceof window.Element && i instanceof window.Node;
+ console.log((ok ? 'PASS' : 'FAIL') + ' prototype chain setters=' + setters.length +
+   ' ownProtoIsElement=' + (proto === stop) +
+   ' firstChildGetter=' + !!(first && first.get));
+},500);
+</script></body></html>
