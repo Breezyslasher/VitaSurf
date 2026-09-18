@@ -1,3 +1,2 @@
-url=https://m.youtube.com/watch?v=dQw4w9WgXcQ
-name=ytm-watch
-cookie=PREF=f6=400
+url=https://abs.breezys.us/audiobookshelf/
+name=abs-live
