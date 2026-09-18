@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- CSS Content 3: an element whose content property is a url() is
+     replaced by that image. It is how a page puts a picture behind
+     itself without an <img>, and openmediavault's login page does
+     exactly that: without this its photograph never appeared and the
+     card sat on a flat colour.
+     Expected: a green 200x120 panel above a white strip, and a PASS. -->
+<html><head><style>
+body { margin: 0; background: #5dacdf }
+#bg { width: 200px; height: 120px; object-fit: cover;
+	content: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGPQmGYDRwzEcQCVQw+hQvbY6QAAAABJRU5ErkJggg==) }
+#after { width: 200px; height: 40px; background: #fff }
+</style></head><body>
+<div id="bg">this text is replaced by the image</div>
+<div id="after">after</div>
+<script>
+setTimeout(function(){
+ var bg = document.getElementById('bg');
+ var r = bg.getBoundingClientRect();
+ var a = document.getElementById('after').getBoundingClientRect();
+ /* the box keeps the size the page gave it, the text inside is gone,
+    and what follows starts right below it */
+ var ok = Math.round(r.width) === 200 && Math.round(r.height) === 120 &&
+	  Math.round(a.top) === 120;
+ console.log((ok ? 'PASS' : 'FAIL') + ' content url replaces the element ' +
+	     Math.round(r.width) + 'x' + Math.round(r.height) +
+	     ' next at ' + Math.round(a.top));
+},600);
+</script></body></html>
