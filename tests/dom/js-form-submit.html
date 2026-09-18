@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!-- A page that builds its login form in JavaScript, which is how every
+     framework does it now. Two things used to go wrong: libdom fills in a
+     control's form pointer only while the parser is building the tree, so
+     a button a script put inside a form belonged to no form at all and
+     NetSurf answered "form can not be submitted"; and a click submitted
+     the form without telling the page, so a form with no action and a
+     submit listener of its own -- Audiobookshelf's login -- navigated to
+     nowhere instead of signing in.
+     Expected: PASS lines in the log. -->
+<html><head></head><body>
+<div id="app"></div>
+<script>
+setTimeout(function(){
+ var f = document.createElement('form');
+ f.setAttribute('method', 'post');
+ var i = document.createElement('input');
+ i.setAttribute('type', 'text'); i.setAttribute('name', 'user');
+ var b = document.createElement('button');
+ b.setAttribute('type', 'submit'); b.textContent = 'Submit';
+ f.appendChild(i); f.appendChild(b);
+ document.getElementById('app').appendChild(f);
+
+ var seen = 0, cancelled = false;
+ f.addEventListener('submit', function(e){ seen++; e.preventDefault(); });
+
+ setTimeout(function(){
+  function report(ok, what, got, want) {
+   console.log((ok ? 'PASS ' : 'FAIL ') + what +
+               (ok ? '' : ' got ' + got + ', wanted ' + want));
+  }
+  report(b.form === f, 'a script-built control finds its form',
+         String(b.form && b.form.tagName), 'the form');
+  report(i.form === f, 'so does a script-built input',
+         String(i.form && i.form.tagName), 'the form');
+
+  if (typeof f.requestSubmit === 'function') {
+   f.requestSubmit();
+  } else {
+   f.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+  }
+  report(seen === 1, 'submitting fires one submit event at the form',
+         String(seen), '1');
+
+  var e2 = new Event('submit', {bubbles: true, cancelable: true});
+  f.dispatchEvent(e2);
+  report(e2.defaultPrevented === true,
+         'the page can cancel the submission',
+         String(e2.defaultPrevented), 'true');
+ }, 300);
+}, 200);
+</script>
+</body></html>

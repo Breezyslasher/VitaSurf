@@ -1,0 +1,168 @@
+diff --git a/src/html/html_button_element.c b/src/html/html_button_element.c
+index 52a3607..e2b8bef 100644
+--- a/src/html/html_button_element.c
++++ b/src/html/html_button_element.c
+@@ -13,6 +13,7 @@
+ #include "html/html_document.h"
+ #include "html/html_button_element.h"
+ 
++#include "html/html_element.h"
+ #include "core/node.h"
+ #include "core/attr.h"
+ #include "utils/utils.h"
+@@ -244,6 +245,13 @@ dom_exception dom_html_button_element_get_form(
+ 	dom_html_button_element *button, dom_html_form_element **form)
+ {
+ 	*form = button->form;
++
++	/* the parser fills this in; a control a script made and put
++	 * inside a form has none, so look for the owner (VitaSurf) */
++	if (*form == NULL) {
++		*form = _dom_html_element_find_form_owner(button);
++		return DOM_NO_ERR;
++	}
+ 	
+ 	if (*form != NULL)
+ 		dom_node_ref(*form);
+diff --git a/src/html/html_element.c b/src/html/html_element.c
+index 8671ca9..d4d3917 100644
+--- a/src/html/html_element.c
++++ b/src/html/html_element.c
+@@ -668,3 +668,45 @@ cleanup:
+ fail:
+ 	return err;
+ }
++
++/**
++ * Find the form a control belongs to (VitaSurf).
++ *
++ * The form pointer on a control is filled in by the parser as it builds
++ * the tree, so a control a script created and put inside a form has none
++ * and the client is told it belongs to no form at all. Every page that
++ * builds its login form in JavaScript is that case: the submit button
++ * looks like a button with nowhere to send anything.
++ *
++ * Fall back to what the specification calls the form owner: the nearest
++ * form element up the tree. The form attribute, which can name a form
++ * elsewhere in the document, is not handled here.
++ *
++ * \param node  The control to find the form for
++ * \return the form element, referenced, or NULL if there is none
++ */
++dom_html_form_element *_dom_html_element_find_form_owner(void *node)
++{
++	dom_node_internal *n = (dom_node_internal *) node;
++
++	if (n == NULL)
++		return NULL;
++
++	for (n = n->parent; n != NULL; n = n->parent) {
++		dom_html_element_type type = DOM_HTML_ELEMENT_TYPE__COUNT;
++
++		if (n->type != DOM_ELEMENT_NODE)
++			continue;
++
++		if (_dom_html_element_get_tag_type((dom_html_element *) n,
++				&type) != DOM_NO_ERR)
++			continue;
++
++		if (type == DOM_HTML_ELEMENT_TYPE_FORM) {
++			dom_node_ref(n);
++			return (dom_html_form_element *) n;
++		}
++	}
++
++	return NULL;
++}
+diff --git a/src/html/html_element.h b/src/html/html_element.h
+index 87e1bbb..d0f5d6d 100644
+--- a/src/html/html_element.h
++++ b/src/html/html_element.h
+@@ -124,6 +124,9 @@ dom_exception _dom_html_element_get_class_name(dom_html_element *element,
+                                        dom_string **class_name);
+ dom_exception _dom_html_element_set_class_name(dom_html_element *element,
+                                        dom_string *class_name);
++struct dom_html_form_element;
++struct dom_html_form_element *_dom_html_element_find_form_owner(void *node);
++
+ dom_exception _dom_html_element_get_tag_type(const dom_html_element *element,
+                                        dom_html_element_type *type);
+ 
+diff --git a/src/html/html_input_element.c b/src/html/html_input_element.c
+index 025ef5d..07cdcc8 100644
+--- a/src/html/html_input_element.c
++++ b/src/html/html_input_element.c
+@@ -13,6 +13,7 @@
+ #include "html/html_document.h"
+ #include "html/html_input_element.h"
+ 
++#include "html/html_element.h"
+ #include "core/node.h"
+ #include "core/attr.h"
+ #include "utils/utils.h"
+@@ -446,6 +447,13 @@ dom_exception dom_html_input_element_get_form(
+ {
+ 	*form = input->form;
+ 
++	/* the parser fills this in; a control a script made and put
++	 * inside a form has none, so look for the owner (VitaSurf) */
++	if (*form == NULL) {
++		*form = _dom_html_element_find_form_owner(input);
++		return DOM_NO_ERR;
++	}
++
+ 	if (*form != NULL)
+ 		dom_node_ref(*form);
+ 
+diff --git a/src/html/html_select_element.c b/src/html/html_select_element.c
+index 8ba78f1..ab82cb8 100644
+--- a/src/html/html_select_element.c
++++ b/src/html/html_select_element.c
+@@ -14,6 +14,7 @@
+ #include "html/html_document.h"
+ #include "html/html_select_element.h"
+ 
++#include "html/html_element.h"
+ #include "core/node.h"
+ #include "utils/utils.h"
+ 
+@@ -467,6 +468,13 @@ dom_exception dom_html_select_element_get_form(
+ {
+ 	*form = select->form;
+ 
++	/* the parser fills this in; a control a script made and put
++	 * inside a form has none, so look for the owner (VitaSurf) */
++	if (*form == NULL) {
++		*form = _dom_html_element_find_form_owner(select);
++		return DOM_NO_ERR;
++	}
++
+ 	if (*form != NULL)
+ 		dom_node_ref(*form);
+ 
+diff --git a/src/html/html_text_area_element.c b/src/html/html_text_area_element.c
+index db351bc..60c0feb 100644
+--- a/src/html/html_text_area_element.c
++++ b/src/html/html_text_area_element.c
+@@ -13,6 +13,7 @@
+ #include "html/html_document.h"
+ #include "html/html_text_area_element.h"
+ 
++#include "html/html_element.h"
+ #include "core/node.h"
+ #include "core/attr.h"
+ #include "utils/utils.h"
+@@ -447,6 +448,13 @@ dom_exception dom_html_text_area_element_get_form(
+ {
+ 	*form = text_area->form;
+ 
++	/* the parser fills this in; a control a script made and put
++	 * inside a form has none, so look for the owner (VitaSurf) */
++	if (*form == NULL) {
++		*form = _dom_html_element_find_form_owner(text_area);
++		return DOM_NO_ERR;
++	}
++
+ 	if (*form != NULL)
+ 		dom_node_ref(*form);
+ 

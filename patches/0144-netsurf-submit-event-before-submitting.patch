@@ -1,0 +1,27 @@
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 532e83719..c6d094a12 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1416,6 +1416,22 @@ mouse_action_drag_none(html_content *html,
+ 	 */
+ 	switch (mas.result.action) {
+ 	case ACTION_SUBMIT:
++		/*
++		 * A page is allowed to handle its own submission, and a
++		 * great many now do: the form carries no action at all and
++		 * a listener sends the request itself. Submitting without
++		 * telling the page first ran right past that and navigated
++		 * to nowhere, which is what Audiobookshelf's login did.
++		 * (VitaSurf)
++		 */
++		if (mas.gadget.control->form != NULL &&
++		    mas.gadget.control->form->node != NULL &&
++		    fire_generic_dom_event(corestring_dom_submit,
++					   mas.gadget.control->form->node,
++					   true, true) == false) {
++			/* the page cancelled it and is dealing with it */
++			break;
++		}
+ 		res = form_submit(content_get_url(c),
+ 				  browser_window_find_target(bw,
+ 							     mas.gadget.target,
