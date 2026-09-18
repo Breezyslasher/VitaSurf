@@ -534,6 +534,9 @@ int vita_platform_init(void)
 	log_data_dir();
 	vita_log("verbose flag file %s: %s", VITASURF_VERBOSE_FLAG,
 		 vita_verbose_requested() ? "present" : "absent");
+	vita_log("layout dump flag file %s: %s (the Start menu dumps "
+		 "a page's layout without it)", VITASURF_LAYOUT_FLAG,
+		 vita_layout_dump_requested() ? "present" : "absent");
 	vita_log_memory("startup");
 
 	return logf != NULL ? 0 : -1;

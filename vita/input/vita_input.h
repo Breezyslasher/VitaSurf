@@ -63,4 +63,12 @@ void vita_input_load_finished(struct gui_window *gw);
  */
 void vita_input_dump_layout(void);
 
+/**
+ * Write the boxes of the page on screen to the log, flag or not (VitaSurf).
+ *
+ * What the Start menu's entry calls, so a page that comes out wrong can
+ * be reported without creating a file on the memory card first.
+ */
+void vita_input_dump_layout_now(void);
+
 #endif

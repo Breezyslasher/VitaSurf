@@ -956,13 +956,16 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 /**
  * Log the boxes of the page in the window, if the flag file asks.
  */
-static void dump_layout(struct gui_window *gw)
+static void dump_layout(struct gui_window *gw, bool force)
 {
 	struct hlcache_handle *h;
 	struct box *root;
 	unsigned int left = 400;
 
-	if (gw == NULL || vita_layout_dump_requested() == 0) {
+	if (gw == NULL) {
+		return;
+	}
+	if (force == false && vita_layout_dump_requested() == 0) {
 		return;
 	}
 	h = browser_window_get_content(gw->bw);
@@ -985,7 +988,15 @@ static void dump_layout(struct gui_window *gw)
  * the boxes worth reading are the ones the rebuild leaves behind. */
 void vita_input_dump_layout(void)
 {
-	dump_layout(the_gw);
+	dump_layout(the_gw, false);
+}
+
+
+/* Exported: the same dump on demand, from the menu, with no flag file
+ * to create first. */
+void vita_input_dump_layout_now(void)
+{
+	dump_layout(the_gw, true);
 }
 
 
@@ -1003,7 +1014,7 @@ void vita_input_load_finished(struct gui_window *gw)
 	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
-		dump_layout(gw);
+		dump_layout(gw, false);
 		{
 			/*
 			 * Say what is left over as well as what was

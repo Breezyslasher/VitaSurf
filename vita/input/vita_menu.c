@@ -76,6 +76,7 @@ enum item {
 	ITEM_JAVASCRIPT,
 	ITEM_IMAGES,
 	ITEM_DARK_MODE,
+	ITEM_DUMP_LAYOUT,
 	ITEM_QUIT,
 	ITEM_CLOSE,
 	ITEM_COUNT
@@ -612,6 +613,13 @@ static void activate(enum item item)
 		}
 		update_labels();
 		break;
+	case ITEM_DUMP_LAYOUT:
+		/* the log is the only way a page that comes out wrong on
+		 * the device can be read here, so close first and let the
+		 * dump describe the page rather than the menu over it */
+		vita_menu_close();
+		vita_input_dump_layout_now();
+		break;
 	case ITEM_QUIT:
 		vita_menu_close();
 		vita_menu_autosave(true);
@@ -696,6 +704,9 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_DARK_MODE:
 		snprintf(buf, len, "Dark mode: %s (new pages)",
 			 nsoption_bool(prefer_dark_mode) ? "on" : "off");
+		break;
+	case ITEM_DUMP_LAYOUT:
+		snprintf(buf, len, "Write this page's layout to the log");
 		break;
 	case ITEM_QUIT:
 		snprintf(buf, len, "Quit VitaSurf");
