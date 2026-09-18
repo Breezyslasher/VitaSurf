@@ -35,8 +35,11 @@ for patch in "$ROOT"/patches/*-"$sub"-*.patch; do
 done
 
 git -C "$work/base" add -A
+# --allow-empty so the first patch for a submodule can be made: there are
+# no earlier patches to apply, so the base is upstream unchanged and git
+# would otherwise refuse the commit.
 git -C "$work/base" -c user.email=vitasurf@invalid -c user.name=VitaSurf \
-        commit --quiet -m "base plus the patches before $num"
+        commit --quiet --allow-empty -m "base plus the patches before $num"
 
 # Which files a patch may touch: everything upstream tracks, the files
 # earlier patches added (which the submodule itself never tracks, since the

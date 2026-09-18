@@ -1,0 +1,99 @@
+diff --git a/src/input/filter.c b/src/input/filter.c
+index 00ee7eb..8a84715 100644
+--- a/src/input/filter.c
++++ b/src/input/filter.c
+@@ -292,6 +292,31 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
+ #endif
+ }
+ 
++/**
++ * Whether the filter still holds data it has not been able to write out.
++ *
++ * The internal codec path decodes up to a pivot buffer's worth of
++ * characters at a time and then writes them to the output. When the
++ * output fills, the characters that did not fit stay in the pivot and
++ * the input they came from has already been consumed. The stream above
++ * only asks whether the raw buffer still holds anything, so without this
++ * those characters are never asked for again: the last few dozen bytes
++ * of a document are decoded, dropped, and then reported as end of input
++ * in the middle of whatever tag they fell in. (VitaSurf)
++ *
++ * \param input  The input filter to query
++ * \return true if a further call would produce more output
++ */
++bool parserutils__filter_has_pending(parserutils_filter *input)
++{
++#ifdef WITHOUT_ICONV_FILTER
++	return input != NULL && input->leftover && input->pivot_len > 0;
++#else
++	(void) input;
++	return false;
++#endif
++}
++
+ /**
+  * Reset an input filter's state
+  *
+diff --git a/src/input/filter.h b/src/input/filter.h
+index 7f4c309..ad73396 100644
+--- a/src/input/filter.h
++++ b/src/input/filter.h
+@@ -9,6 +9,7 @@
+ #define parserutils_input_filter_h_
+ 
+ #include <inttypes.h>
++#include <stdbool.h>
+ 
+ #include <parserutils/errors.h>
+ #include <parserutils/functypes.h>
+@@ -53,5 +54,8 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
+ /* Reset an input filter's state */
+ parserutils_error parserutils__filter_reset(parserutils_filter *input);
+ 
++/* Whether the filter is still holding data it has not written out */
++bool parserutils__filter_has_pending(parserutils_filter *input);
++
+ #endif
+ 
+diff --git a/src/input/inputstream.c b/src/input/inputstream.c
+index 120ae88..ac1eee1 100644
+--- a/src/input/inputstream.c
++++ b/src/input/inputstream.c
+@@ -241,8 +241,13 @@ parserutils_error parserutils_inputstream_peek_slow(
+ 	if (stream == NULL || ptr == NULL || length == NULL)
+ 		return PARSERUTILS_BADPARM;
+ 
+-	/* There's insufficient data in the buffer, so read some more */
+-	if (s->raw->length == 0) {
++	/* There's insufficient data in the buffer, so read some more.
++	 * The raw buffer running dry does not mean the filter has nothing
++	 * left: it may be holding characters it decoded but could not fit
++	 * into the last output buffer, and those are all that is left of
++	 * the end of the document. (VitaSurf) */
++	if (s->raw->length == 0 &&
++			parserutils__filter_has_pending(s->input) == false) {
+ 		/* No more data to be had */
+ 		return s->public.had_eof ? PARSERUTILS_EOF
+ 					 : PARSERUTILS_NEEDDATA;
+@@ -471,11 +476,16 @@ parserutils_error parserutils_inputstream_refill_buffer(
+ 	if (error != PARSERUTILS_OK && error != PARSERUTILS_NOMEM)
+ 		return error;
+ 
+-	/* Remove the raw data we've processed from the raw buffer */
+-	error = parserutils_buffer_discard(stream->raw, 0, 
+-			stream->raw->length - raw_length);
+-	if (error != PARSERUTILS_OK)
+-		return error;
++	/* Remove the raw data we've processed from the raw buffer.
++	 * A refill that only flushed what the filter was still holding
++	 * consumes nothing, and discarding nothing is not a request the
++	 * buffer accepts. (VitaSurf) */
++	if (stream->raw->length != raw_length) {
++		error = parserutils_buffer_discard(stream->raw, 0,
++				stream->raw->length - raw_length);
++		if (error != PARSERUTILS_OK)
++			return error;
++	}
+ 
+ 	/* Fix up the utf8 buffer information */
+ 	stream->public.utf8->length = 
