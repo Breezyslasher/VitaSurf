@@ -29,14 +29,16 @@ setTimeout(function(){
  /* and a class added to an ancestor, which decides a descendant rule */
  g('d').setAttribute('class', 'wrap tall');
  setTimeout(function(){
+  function report(ok, what, got, want) {
+   console.log((ok ? 'PASS ' : 'FAIL ') + what +
+               (ok ? '' : ' got ' + got + ', wanted ' + want));
+  }
   var r = [['setAttribute', h('a')], ['className', h('b')],
            ['classList', h('c')]];
   for (var i = 0; i < r.length; i++) {
-   console.log((r[i][1] === '12px' ? 'PASS ' : 'FAIL ') + r[i][0] +
-               ' height ' + r[i][1] + ' (expected 12px)');
+   report(r[i][1] === '12px', r[i][0] + ' class height', r[i][1], '12px');
   }
-  console.log((h('e') === '3px' ? 'PASS ' : 'FAIL ') +
-              'ancestor class height ' + h('e') + ' (expected 3px)');
+  report(h('e') === '3px', 'ancestor class height', h('e'), '3px');
  }, 200);
 }, 200);
 </script>

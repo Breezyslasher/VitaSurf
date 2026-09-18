@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<!-- A gradient fill drew one flat colour, drawImage and putImageData
+     did nothing at all, and getImageData handed back a blank buffer, so
+     a chart with a shaded area under its line was a solid block and a
+     page that composites through a scratch canvas lost the picture.
+     The rasteriser now mixes the stops across the shape, samples an
+     image through the context's transform, and reads and writes the
+     canvas pixels.
+     Expected: a red-to-blue bar, a ring fading outwards, a copy of the
+     bar drawn half size, a green square, and PASS lines in the log. -->
+<html><head><style>body { margin: 0; background: #fff }</style></head><body>
+<canvas id="a" width="200" height="60"></canvas>
+<canvas id="b" width="200" height="60"></canvas>
+<script>
+var a = document.getElementById('a'), ca = a.getContext('2d');
+var b = document.getElementById('b'), cb = b.getContext('2d');
+
+var lin = ca.createLinearGradient(0, 0, 200, 0);
+lin.addColorStop(0, '#ff0000');
+lin.addColorStop(1, '#0000ff');
+ca.fillStyle = lin;
+ca.fillRect(0, 0, 200, 30);
+
+var rad = ca.createRadialGradient(100, 45, 0, 100, 45, 15);
+rad.addColorStop(0, 'rgb(0,255,0)');
+rad.addColorStop(1, 'rgb(0,0,0)');
+ca.fillStyle = rad;
+ca.fillRect(0, 30, 200, 30);
+
+setTimeout(function(){
+ function px(ctx, x, y) {
+  var d = ctx.getImageData(x, y, 1, 1).data;
+  return [d[0], d[1], d[2], d[3]];
+ }
+ function near(v, want, slack) { return Math.abs(v - want) <= (slack || 6); }
+ function show(p) { return p.join(','); }
+ function report(ok, what, got, want) {
+  console.log((ok ? 'PASS ' : 'FAIL ') + what +
+              (ok ? '' : ' got ' + got + ', wanted ' + want));
+ }
+
+ /* the linear gradient runs across the bar rather than sitting on one
+    colour: red at the left, halfway at the middle, blue at the right */
+ var left = px(ca, 2, 10), mid = px(ca, 100, 10), right = px(ca, 197, 10);
+ var linear = near(left[0], 252) && near(left[2], 2) &&
+              near(mid[0], 127, 10) && near(mid[2], 127, 10) &&
+              near(right[0], 3) && near(right[2], 251) &&
+              left[3] === 255;
+ report(linear, 'linear gradient',
+        show(left) + ' / ' + show(mid) + ' / ' + show(right),
+        'red, half, blue');
+
+ /* the radial gradient is brightest at its centre and dark at the rim */
+ var centre = px(ca, 100, 45), edge = px(ca, 113, 45);
+ var radial = centre[1] > 240 && edge[1] < 60 && centre[0] < 12;
+ report(radial, 'radial gradient', show(centre) + ' / ' + show(edge),
+        'a bright centre and a dark rim');
+
+ /* one canvas drawn into another, scaled: the bar's left half lands in
+    the first quarter of the copy */
+ cb.drawImage(a, 0, 0, 200, 30, 0, 0, 100, 15);
+ var copy = px(cb, 2, 5), copy_end = px(cb, 97, 5), empty = px(cb, 150, 5);
+ var drawn = near(copy[0], 252, 10) && near(copy[2], 2, 10) &&
+             near(copy_end[2], 251, 12) && empty[3] === 0;
+ report(drawn, 'drawImage between canvases',
+        show(copy) + ' / ' + show(copy_end) + ' / ' + show(empty),
+        'red, blue, nothing');
+
+ /* pixels written straight in, and read straight back */
+ var d = cb.createImageData(20, 20), i;
+ for (i = 0; i < d.data.length; i += 4) {
+  d.data[i] = 0; d.data[i + 1] = 200; d.data[i + 2] = 0; d.data[i + 3] = 255;
+ }
+ cb.putImageData(d, 120, 20);
+ var put = px(cb, 130, 30), outside = px(cb, 119, 30);
+ report(put[1] === 200 && put[0] === 0 && put[3] === 255 &&
+        outside[3] === 0, 'putImageData',
+        show(put) + ' / ' + show(outside), 'green, nothing');
+
+ /* a gradient strokes as well as it fills */
+ var con = cb.createConicGradient(0, 40, 40);
+ con.addColorStop(0, 'rgb(255,0,0)');
+ con.addColorStop(0.5, 'rgb(0,0,255)');
+ con.addColorStop(1, 'rgb(255,0,0)');
+ cb.fillStyle = con;
+ cb.fillRect(20, 20, 40, 40);
+ var east = px(cb, 58, 41), west = px(cb, 22, 41);
+ report(east[0] > 200 && east[2] < 60 && west[2] > 200 && west[0] < 60,
+        'conic gradient', show(east) + ' / ' + show(west),
+        'red on one side, blue on the other');
+
+ var sg = cb.createLinearGradient(0, 0, 200, 0);
+ sg.addColorStop(0, 'rgb(255,0,0)');
+ sg.addColorStop(1, 'rgb(0,0,255)');
+ cb.strokeStyle = sg; cb.lineWidth = 6;
+ cb.beginPath(); cb.moveTo(0, 55); cb.lineTo(200, 55); cb.stroke();
+ var s_left = px(cb, 3, 55), s_right = px(cb, 196, 55);
+ report(s_left[0] > 200 && s_left[2] < 60 && s_right[2] > 200 &&
+        s_right[0] < 60, 'gradient stroke',
+        show(s_left) + ' / ' + show(s_right), 'red then blue');
+
+ /* smoothing on mixes neighbouring pixels rather than stepping */
+ var sm = document.createElement('canvas');
+ sm.width = 40; sm.height = 4;
+ var cs = sm.getContext('2d');
+ cs.imageSmoothingEnabled = true;
+ cs.drawImage(a, 0, 0, 200, 4, 0, 0, 40, 4);
+ var smoothed = cs.getImageData(20, 2, 1, 1).data;
+ report(smoothed[0] > 100 && smoothed[0] < 160 &&
+        smoothed[2] > 100 && smoothed[2] < 160, 'smoothed downscale',
+        smoothed[0] + ',' + smoothed[1] + ',' + smoothed[2],
+        'a mix, not an end colour');
+
+ var back = cb.getImageData(0, 0, 4, 4);
+ report(back.width === 4 && back.height === 4 &&
+        back.data.length === 64, 'getImageData shape',
+        back.width + 'x' + back.height + ' len ' + back.data.length,
+        '4x4 len 64');
+}, 600);
+</script></body></html>

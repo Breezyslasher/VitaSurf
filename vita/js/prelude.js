@@ -4035,11 +4035,14 @@ function ImageData(w,h){
  if(typeof w==='object'){this.data=w;this.width=h||0;this.height=arguments[2]||0;}
  else{this.width=w|0;this.height=h|0;this.data=new Uint8ClampedArray(this.width*this.height*4);}
  this.colorSpace='srgb';}
-function CanvasGradient(){this.__stops=[];}
-/* the stops are kept so a fill with a gradient draws the colour it ends
-   up closest to rather than black; there is no gradient fill yet */
-CanvasGradient.prototype.addColorStop=function(o,c){this.__stops.push(c);
- this.__middle=this.__stops[Math.floor(this.__stops.length/2)]||c;};
+/* A gradient carries its geometry in the user space of the context that
+   made it, and its stops in source order; the rasteriser mixes them
+   across the shape being filled. kind 1 is linear, 2 radial, 3 conic. */
+function CanvasGradient(kind,g){this.__kind=kind;this.__g=g;this.__stops=[];}
+CanvasGradient.prototype.addColorStop=function(o,c){
+ o=parseFloat(o); if(!(o>=0))o=0; if(o>1)o=1;
+ this.__stops.push([o,c]);
+ this.__stops.sort(function(a,b){return a[0]-b[0];});};
 function CanvasPattern(){}
 CanvasPattern.prototype.setTransform=function(){};
 function Path2D(){}
@@ -4060,7 +4063,10 @@ var CANVAS_NAMES={black:0x000000,silver:0xc0c0c0,gray:0x808080,grey:0x808080,
  dimgray:0x696969,dimgrey:0x696969,whitesmoke:0xf5f5f5,gainsboro:0xdcdcdc};
 function canvasColour(v,alpha){
  /* to 0xRRGGBBAA, the form the rasteriser takes */
- if(v&&typeof v==='object'){ v=v.__middle||'#000000'; }
+ if(v&&typeof v==='object'){
+  var st=v.__stops;
+  v=(st&&st.length)?st[st.length-1][1]:'#000000';
+ }
  var s=String(v==null?'#000000':v).trim();
  var r=0,g=0,b=0,a=1,m;
  if(s.charAt(0)==='#'){
@@ -4188,11 +4194,28 @@ function CanvasRenderingContext2D(canvas){
   for(i=0;i<subs.length;i++){if(subs[i].length<4)continue;
    for(j=0;j<subs[i].length;j++)pts[at++]=subs[i][j];}
   return {pts:pts,counts:counts};}
+ /* What the rasteriser is asked to lay down: a colour, or a gradient
+    flattened to [kind,x0,y0,r0,x1,y1,r1,angle, offset,colour, ...] with
+    its geometry put through the current transform, because a gradient
+    is defined in the user space of the fill that uses it. A radius
+    takes the transform's average scale, so a circle under a stretched
+    transform stays a circle rather than becoming the ellipse it should
+    be; charts scale evenly and do not notice. */
+ function paintOf(c,style,alpha){
+  if(!style||typeof style!=='object'||!style.__g)
+   return canvasColour(style,alpha);
+  var g=style.__g,sc=scaleOf(c),m=c.__m,i;
+  var a=tx(c,g[0],g[1]),b=tx(c,g[3],g[4]);
+  var out=[style.__kind,a[0],a[1],g[2]*sc,b[0],b[1],g[5]*sc,
+           (g[6]||0)+Math.atan2(m[1],m[0])];
+  for(i=0;i<style.__stops.length;i++){
+   out.push(style.__stops[i][0],canvasColour(style.__stops[i][1],alpha));}
+  return out;}
  function draw(c,mode){
   if(!c.canvas||typeof __vitaCanvasPath!=='function')return;
   var f=flatten(c);if(!f)return;
-  var colour=canvasColour(mode===2?c.strokeStyle:c.fillStyle,c.globalAlpha);
-  __vitaCanvasPath(c.canvas,f.pts,f.counts,colour,mode,
+  var paint=paintOf(c,mode===2?c.strokeStyle:c.fillStyle,c.globalAlpha);
+  __vitaCanvasPath(c.canvas,f.pts,f.counts,paint,mode,
    mode===2?Math.abs(c.lineWidth*scaleOf(c)):0);}
  C.fill=function(rule){draw(this,String(rule)==='evenodd'?1:0);};
  C.stroke=function(){draw(this,2);};
@@ -4241,15 +4264,52 @@ function CanvasRenderingContext2D(canvas){
   __vitaCanvasText(c.canvas,p[0],p[1],String(str),colour,f.size*sc,
    f.family,f.weight,f.italic?1:0,alignOf(c),baselineOf(c));}
  C.fillText=function(str,x,y){text(this,str,x,y,
-  canvasColour(this.fillStyle,this.globalAlpha));};
+  paintOf(this,this.fillStyle,this.globalAlpha));};
  C.strokeText=function(str,x,y){text(this,str,x,y,
-  canvasColour(this.strokeStyle,this.globalAlpha));};
- ('drawFocusIfNeeded scrollPathIntoView drawImage putImageData '+
+  paintOf(this,this.strokeStyle,this.globalAlpha));};
+ ('drawFocusIfNeeded scrollPathIntoView '+
   'setLineDash createImageBitmap').split(' ').forEach(function(k){
    C[k]=GAP('canvas.'+k);});
  C.clip=GAP('canvas.clip');
- C.getImageData=GAP('canvas.getImageData',function(x,y,w,h){
-  return new ImageData(w,h);});
+ /* drawImage(src, [sx, sy, sw, sh,] dx, dy [, dw, dh]): the source is
+    another canvas, or an image the page has already loaded. The unit
+    square of the destination is handed over as one matrix, so a
+    rotated or scaled context draws a rotated or scaled image. */
+ C.drawImage=function(src,a,b,c,d,e,f,g,h){
+  if(!this.canvas||!src||typeof __vitaCanvasImage!=='function')return;
+  if(typeof __vitaCanvasImageSize!=='function')return;
+  var size=__vitaCanvasImageSize(src);
+  if(!size)return;
+  var sx=0,sy=0,sw=size[0],sh=size[1],dx,dy,dw,dh;
+  if(arguments.length>=9){sx=+a;sy=+b;sw=+c;sh=+d;dx=+e;dy=+f;dw=+g;dh=+h;}
+  else if(arguments.length>=5){dx=+a;dy=+b;dw=+c;dh=+d;}
+  else {dx=+a;dy=+b;dw=sw;dh=sh;}
+  if(!(sw>0)||!(sh>0)||!(dw!==0)||!(dh!==0))return;
+  var m=this.__m;
+  /* the context transform with translate(dx,dy) and scale(dw,dh)
+     folded in, which is exactly the unit square the rasteriser wants */
+  var mm=[m[0]*dw,m[1]*dw,m[2]*dh,m[3]*dh,
+          m[0]*dx+m[2]*dy+m[4],m[1]*dx+m[3]*dy+m[5]];
+  __vitaCanvasImage(this.canvas,src,sx,sy,sw,sh,mm,this.globalAlpha,
+   this.imageSmoothingEnabled?1:0);};
+ C.getImageData=function(x,y,w,h){
+  x=Math.floor(+x||0);y=Math.floor(+y||0);
+  w=Math.floor(+w||0);h=Math.floor(+h||0);
+  if(w<0){x+=w;w=-w;} if(h<0){y+=h;h=-h;}
+  var d=new ImageData(w,h);
+  if(!this.canvas||w===0||h===0||typeof __vitaCanvasRead!=='function')return d;
+  var buf=__vitaCanvasRead(this.canvas,x,y,w,h);
+  if(buf)d.data=new Uint8ClampedArray(buf);
+  return d;};
+ C.putImageData=function(d,dx,dy,sx,sy,sw,sh){
+  if(!this.canvas||!d||!d.data||typeof __vitaCanvasWrite!=='function')return;
+  dx=Math.floor(+dx||0);dy=Math.floor(+dy||0);
+  if(arguments.length<7){sx=0;sy=0;sw=d.width;sh=d.height;}
+  else{sx=Math.floor(+sx||0);sy=Math.floor(+sy||0);
+   sw=Math.floor(+sw||0);sh=Math.floor(+sh||0);
+   if(sw<0){sx+=sw;sw=-sw;} if(sh<0){sy+=sh;sh=-sh;}}
+  __vitaCanvasWrite(this.canvas,d.data,d.width,d.height,
+   sx,sy,sw,sh,dx+sx,dy+sy);};
  C.isPointInPath=C.isPointInStroke=function(){return false;};
  C.getLineDash=function(){return [];};
  /* the width the glyphs actually take, so text a page centres or
@@ -4259,8 +4319,13 @@ function CanvasRenderingContext2D(canvas){
    return new TextMetrics(__vitaCanvasMeasure(String(t),f.size,f.family,
     f.weight,f.italic?1:0));}
   return new TextMetrics(String(t).length*f.size*0.5);};
- C.createLinearGradient=C.createRadialGradient=C.createConicGradient=
-  function(){return new CanvasGradient();};
+ C.createLinearGradient=function(x0,y0,x1,y1){
+  return new CanvasGradient(1,[+x0||0,+y0||0,0,+x1||0,+y1||0,0,0]);};
+ C.createRadialGradient=function(x0,y0,r0,x1,y1,r1){
+  return new CanvasGradient(2,[+x0||0,+y0||0,Math.max(0,+r0||0),
+   +x1||0,+y1||0,Math.max(0,+r1||0),0]);};
+ C.createConicGradient=function(a,x,y){
+  return new CanvasGradient(3,[+x||0,+y||0,0,+x||0,+y||0,0,+a||0]);};
  C.createPattern=function(){return new CanvasPattern();};
  C.createImageData=function(w,h){return typeof w==='object'?
   new ImageData(w.width,w.height):new ImageData(w,h);};

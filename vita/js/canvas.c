@@ -22,6 +22,11 @@
 
 #include <math.h>
 #include <stdlib.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #include <string.h>
 
 #include <ft2build.h>
@@ -278,6 +283,166 @@ static inline void canvas_blend(unsigned char *px, uint32_t rgba,
 }
 
 
+/**
+ * The colour a gradient shows at a position along it.
+ *
+ * Before the first stop and after the last one a gradient holds that
+ * stop's colour, and between two stops it mixes them evenly, which is
+ * what the specification asks for and what a gauge's arc needs.
+ */
+static uint32_t canvas_stop_colour(const struct vita_canvas_paint *paint,
+				   double t)
+{
+	const struct vita_canvas_stop *a, *b;
+	unsigned int ca[4], cb[4], out[4];
+	double span, f;
+	int i;
+
+	if (paint->n_stops == 0) {
+		return 0;
+	}
+	if (t <= paint->stops[0].offset || paint->n_stops == 1) {
+		return paint->stops[0].rgba;
+	}
+	if (t >= paint->stops[paint->n_stops - 1].offset) {
+		return paint->stops[paint->n_stops - 1].rgba;
+	}
+
+	for (i = 1; i < paint->n_stops; i++) {
+		if (t <= paint->stops[i].offset) {
+			break;
+		}
+	}
+	if (i >= paint->n_stops) {
+		i = paint->n_stops - 1;
+	}
+	a = &paint->stops[i - 1];
+	b = &paint->stops[i];
+
+	span = b->offset - a->offset;
+	f = span <= 0 ? 1.0 : (t - a->offset) / span;
+
+	for (i = 0; i < 4; i++) {
+		int shift = 24 - i * 8;
+
+		ca[i] = (a->rgba >> shift) & 0xff;
+		cb[i] = (b->rgba >> shift) & 0xff;
+		out[i] = (unsigned int) (ca[i] + (cb[i] - (double) ca[i]) * f);
+		if (out[i] > 255) {
+			out[i] = 255;
+		}
+	}
+
+	return ((uint32_t) out[0] << 24) | ((uint32_t) out[1] << 16) |
+	       ((uint32_t) out[2] << 8) | (uint32_t) out[3];
+}
+
+
+/**
+ * How far along a radial gradient a point is.
+ *
+ * A radial gradient is a cone of circles between the two the page gave,
+ * so the position is the largest t whose circle still has a radius and
+ * passes through the point. Outside the cone there is no colour at all,
+ * which is the transparent the caller gets back as false.
+ */
+static bool canvas_radial_at(const struct vita_canvas_paint *paint,
+			     double px, double py, double *t_out)
+{
+	double cdx = paint->x1 - paint->x0;
+	double cdy = paint->y1 - paint->y0;
+	double dr = paint->r1 - paint->r0;
+	double pdx = px - paint->x0;
+	double pdy = py - paint->y0;
+	double a = cdx * cdx + cdy * cdy - dr * dr;
+	double b = 2 * (pdx * cdx + pdy * cdy + paint->r0 * dr);
+	double c = pdx * pdx + pdy * pdy - paint->r0 * paint->r0;
+	double t;
+
+	if (fabs(a) < 1e-9) {
+		if (fabs(b) < 1e-9) {
+			return false;
+		}
+		t = c / b;
+		if (paint->r0 + t * dr < 0) {
+			return false;
+		}
+	} else {
+		double disc = b * b - 4 * a * c;
+		double root, t1, t2;
+
+		if (disc < 0) {
+			return false;
+		}
+		root = sqrt(disc);
+		t1 = (b + root) / (2 * a);
+		t2 = (b - root) / (2 * a);
+		t = t1 > t2 ? t1 : t2;
+		if (paint->r0 + t * dr < 0) {
+			t = t1 > t2 ? t2 : t1;
+			if (paint->r0 + t * dr < 0) {
+				return false;
+			}
+		}
+	}
+
+	*t_out = t;
+
+	return true;
+}
+
+
+/**
+ * The colour a paint puts at one pixel, taken at its centre.
+ */
+static uint32_t canvas_paint_at(const struct vita_canvas_paint *paint,
+				int x, int y)
+{
+	double px = x + 0.5, py = y + 0.5;
+	double t = 0;
+
+	switch (paint->kind) {
+	case CANVAS_PAINT_LINEAR: {
+		double dx = paint->x1 - paint->x0;
+		double dy = paint->y1 - paint->y0;
+		double len2 = dx * dx + dy * dy;
+
+		if (len2 < 1e-9) {
+			/* zero length: the whole shape is the last stop */
+			return paint->n_stops == 0 ? 0 :
+				paint->stops[paint->n_stops - 1].rgba;
+		}
+		t = ((px - paint->x0) * dx + (py - paint->y0) * dy) / len2;
+		break;
+	}
+
+	case CANVAS_PAINT_RADIAL:
+		if (canvas_radial_at(paint, px, py, &t) == false) {
+			return 0;
+		}
+		break;
+
+	case CANVAS_PAINT_CONIC: {
+		double ang = atan2(py - paint->y0, px - paint->x0) -
+				paint->angle;
+
+		t = ang / (2 * M_PI);
+		t = t - floor(t);
+		break;
+	}
+
+	case CANVAS_PAINT_SOLID:
+	default:
+		return paint->rgba;
+	}
+
+	if (t < 0) t = 0;
+	if (t > 1) t = 1;
+
+	return canvas_stop_colour(paint, t);
+}
+
+
 /* exported function documented in canvas.h */
 void vita_canvas_clear_rect(struct vita_canvas *c,
 			    double x, double y, double w, double h)
@@ -374,7 +539,8 @@ static int canvas_cross_cmp(const void *a, const void *b)
  * Fill the edges gathered so far, and let them go.
  */
 static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
-			      uint32_t rgba, bool evenodd)
+			      const struct vita_canvas_paint *paint,
+			      bool evenodd)
 {
 	struct canvas_cross *crossings = NULL;
 	unsigned int *coverage = NULL;
@@ -469,8 +635,11 @@ static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
 					if (part <= 0) {
 						continue;
 					}
+					/* in 1/65535ths, because 255/4 a
+					 * sub-scanline truncates to 63 and
+					 * leaves a solid fill at 252 */
 					coverage[px] += (unsigned int)
-						(part * 255.0 / CANVAS_SUBS);
+						(part * 65535.0 / CANVAS_SUBS);
 					any = true;
 				}
 			}
@@ -486,11 +655,18 @@ static void canvas_fill_edges(struct vita_canvas *c, struct canvas_edges *edges,
 			if (cov == 0) {
 				continue;
 			}
+			cov = (cov * 255 + 32767) / 65535;
 			if (cov > 255) {
 				cov = 255;
 			}
+			if (cov == 0) {
+				continue;
+			}
 			canvas_blend(c->pixels + row * c->stride + i * 4,
-				     rgba, cov, ro, go, bo, ao);
+				     paint->kind == CANVAS_PAINT_SOLID ?
+					paint->rgba :
+					canvas_paint_at(paint, (int) i, row),
+				     cov, ro, go, bo, ao);
 		}
 	}
 
@@ -505,13 +681,15 @@ out:
 
 /* exported function documented in canvas.h */
 void vita_canvas_fill_path(struct vita_canvas *c, const double *pts,
-			   const int *counts, int nsub, uint32_t rgba,
+			   const int *counts, int nsub,
+			   const struct vita_canvas_paint *paint,
 			   bool evenodd)
 {
 	struct canvas_edges edges = { NULL, 0, 0 };
 	int sub, i, at = 0;
 
-	if (c == NULL || pts == NULL || counts == NULL || nsub <= 0) {
+	if (c == NULL || pts == NULL || counts == NULL || nsub <= 0 ||
+			paint == NULL) {
 		return;
 	}
 
@@ -544,7 +722,7 @@ void vita_canvas_fill_path(struct vita_canvas *c, const double *pts,
 	}
 
 done:
-	canvas_fill_edges(c, &edges, rgba, evenodd);
+	canvas_fill_edges(c, &edges, paint, evenodd);
 }
 
 
@@ -619,14 +797,16 @@ static bool canvas_stroke_joint(struct canvas_edges *edges, double x,
 
 /* exported function documented in canvas.h */
 void vita_canvas_stroke_path(struct vita_canvas *c, const double *pts,
-			     const int *counts, int nsub, uint32_t rgba,
+			     const int *counts, int nsub,
+			     const struct vita_canvas_paint *paint,
 			     double line_width)
 {
 	struct canvas_edges edges = { NULL, 0, 0 };
 	double half = line_width / 2;
 	int sub, i, at = 0;
 
-	if (c == NULL || pts == NULL || counts == NULL || nsub <= 0) {
+	if (c == NULL || pts == NULL || counts == NULL || nsub <= 0 ||
+			paint == NULL) {
 		return;
 	}
 	if (half < 0.35) {
@@ -661,7 +841,7 @@ void vita_canvas_stroke_path(struct vita_canvas *c, const double *pts,
 done:
 	/* the quads overlap at every joint, and the nonzero rule paints
 	 * the overlap once rather than darkening it */
-	canvas_fill_edges(c, &edges, rgba, false);
+	canvas_fill_edges(c, &edges, paint, false);
 }
 
 
@@ -743,7 +923,8 @@ double vita_canvas_text_width(const char *utf8, unsigned int len,
 /* exported function documented in canvas.h */
 void vita_canvas_text(struct vita_canvas *c, double x, double y,
 		      const char *utf8, unsigned int len, double size_px,
-		      int family, int weight, bool italic, uint32_t rgba,
+		      int family, int weight, bool italic,
+		      const struct vita_canvas_paint *paint,
 		      int align, int baseline)
 {
 	plot_font_style_t fstyle;
@@ -751,7 +932,8 @@ void vita_canvas_text(struct vita_canvas *c, double x, double y,
 	double pen;
 	int ro = 0, go = 1, bo = 2, ao = 3;
 
-	if (c == NULL || utf8 == NULL || len == 0 || fb_getglyph == NULL) {
+	if (c == NULL || utf8 == NULL || len == 0 || paint == NULL ||
+			fb_getglyph == NULL) {
 		return;
 	}
 
@@ -838,11 +1020,301 @@ void vita_canvas_text(struct vita_canvas *c, double x, double y,
 					continue;
 				}
 				canvas_blend(c->pixels + py * c->stride +
-						px * 4, rgba, cov,
-					     ro, go, bo, ao);
+						px * 4,
+					     paint->kind ==
+							CANVAS_PAINT_SOLID ?
+						paint->rgba :
+						canvas_paint_at(paint, px, py),
+					     cov, ro, go, bo, ao);
 			}
 		}
 
 		pen += (double) (glyph->advance.x >> 16);
+	}
+}
+
+
+/* exported function documented in canvas.h */
+bool vita_canvas_as_image(struct vita_canvas *c, struct vita_canvas_image *img)
+{
+	if (c == NULL || img == NULL || c->pixels == NULL) {
+		return false;
+	}
+
+	img->pixels = c->pixels;
+	img->width = c->width;
+	img->height = c->height;
+	img->stride = c->stride;
+	canvas_channel_shifts(&img->ro, &img->go, &img->bo, &img->ao);
+	img->premultiplied = bitmap_fmt.pma;
+
+	return true;
+}
+
+
+/* exported function documented in canvas.h */
+bool vita_canvas_image_of_bitmap(struct bitmap *bitmap,
+				 struct vita_canvas_image *img)
+{
+	if (bitmap == NULL || img == NULL) {
+		return false;
+	}
+
+	img->pixels = guit->bitmap->get_buffer(bitmap);
+	img->width = guit->bitmap->get_width(bitmap);
+	img->height = guit->bitmap->get_height(bitmap);
+	img->stride = guit->bitmap->get_rowstride(bitmap);
+	img->premultiplied = bitmap_fmt.pma;
+	canvas_channel_shifts(&img->ro, &img->go, &img->bo, &img->ao);
+
+	return img->pixels != NULL && img->width > 0 && img->height > 0;
+}
+
+
+/**
+ * One pixel of a source image, as straight red, green, blue and alpha.
+ *
+ * Pixels off the edge come back transparent, so sampling between two
+ * pixels at the border does not wrap round to the other side.
+ */
+static void canvas_sample(const struct vita_canvas_image *img, int x, int y,
+			  unsigned int *out)
+{
+	const unsigned char *px;
+
+	if (x < 0 || y < 0 || x >= img->width || y >= img->height) {
+		out[0] = out[1] = out[2] = out[3] = 0;
+		return;
+	}
+
+	px = img->pixels + y * img->stride + x * 4;
+	out[0] = px[img->ro];
+	out[1] = px[img->go];
+	out[2] = px[img->bo];
+	out[3] = px[img->ao];
+
+	if (img->premultiplied && out[3] != 0 && out[3] != 255) {
+		out[0] = out[0] * 255 / out[3];
+		out[1] = out[1] * 255 / out[3];
+		out[2] = out[2] * 255 / out[3];
+		if (out[0] > 255) out[0] = 255;
+		if (out[1] > 255) out[1] = 255;
+		if (out[2] > 255) out[2] = 255;
+	}
+}
+
+
+/**
+ * The colour an image shows at a point, in image pixels.
+ *
+ * Sampling between pixels is what keeps a logo scaled down to a corner
+ * from breaking up; taking the nearest is what a page asks for when it
+ * turns smoothing off to draw a sprite sheet.
+ */
+static uint32_t canvas_image_at(const struct vita_canvas_image *img,
+				double u, double v, bool smooth)
+{
+	unsigned int c00[4], c10[4], c01[4], c11[4];
+	unsigned int out[4];
+	double fx, fy;
+	int x, y, i;
+
+	if (smooth == false) {
+		unsigned int c[4];
+
+		canvas_sample(img, (int) floor(u), (int) floor(v), c);
+		return ((uint32_t) c[0] << 24) | ((uint32_t) c[1] << 16) |
+		       ((uint32_t) c[2] << 8) | (uint32_t) c[3];
+	}
+
+	u -= 0.5;
+	v -= 0.5;
+	x = (int) floor(u);
+	y = (int) floor(v);
+	fx = u - x;
+	fy = v - y;
+
+	canvas_sample(img, x, y, c00);
+	canvas_sample(img, x + 1, y, c10);
+	canvas_sample(img, x, y + 1, c01);
+	canvas_sample(img, x + 1, y + 1, c11);
+
+	for (i = 0; i < 4; i++) {
+		double top = c00[i] + (c10[i] - (double) c00[i]) * fx;
+		double bottom = c01[i] + (c11[i] - (double) c01[i]) * fx;
+		double val = top + (bottom - top) * fy;
+
+		if (val < 0) val = 0;
+		if (val > 255) val = 255;
+		out[i] = (unsigned int) (val + 0.5);
+	}
+
+	return ((uint32_t) out[0] << 24) | ((uint32_t) out[1] << 16) |
+	       ((uint32_t) out[2] << 8) | (uint32_t) out[3];
+}
+
+
+/* exported function documented in canvas.h */
+void vita_canvas_draw_image(struct vita_canvas *c,
+			    const struct vita_canvas_image *img,
+			    double sx, double sy, double sw, double sh,
+			    const double *m, double alpha, bool smooth)
+{
+	double corner_x[4], corner_y[4];
+	double det, ia, ib, ic, id, ie, iff;
+	int x0, y0, x1, y1, x, y, i;
+	int ro = 0, go = 1, bo = 2, ao = 3;
+
+	if (c == NULL || img == NULL || img->pixels == NULL || m == NULL ||
+			sw <= 0 || sh <= 0 || alpha <= 0) {
+		return;
+	}
+
+	/*
+	 * m maps the unit square of the destination to canvas pixels, so
+	 * the four corners of that square bound the pixels to visit and
+	 * the inverse says which part of the image each one shows.
+	 */
+	for (i = 0; i < 4; i++) {
+		double u = (i == 1 || i == 2) ? 1.0 : 0.0;
+		double v = (i >= 2) ? 1.0 : 0.0;
+
+		corner_x[i] = m[0] * u + m[2] * v + m[4];
+		corner_y[i] = m[1] * u + m[3] * v + m[5];
+	}
+
+	x0 = c->width; y0 = c->height; x1 = 0; y1 = 0;
+	for (i = 0; i < 4; i++) {
+		if ((int) floor(corner_x[i]) < x0) x0 = (int) floor(corner_x[i]);
+		if ((int) floor(corner_y[i]) < y0) y0 = (int) floor(corner_y[i]);
+		if ((int) ceil(corner_x[i]) > x1) x1 = (int) ceil(corner_x[i]);
+		if ((int) ceil(corner_y[i]) > y1) y1 = (int) ceil(corner_y[i]);
+	}
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > c->width) x1 = c->width;
+	if (y1 > c->height) y1 = c->height;
+	if (x0 >= x1 || y0 >= y1) {
+		return;
+	}
+
+	det = m[0] * m[3] - m[1] * m[2];
+	if (fabs(det) < 1e-12) {
+		return;		/* flattened to nothing */
+	}
+	ia = m[3] / det;
+	ib = -m[1] / det;
+	ic = -m[2] / det;
+	id = m[0] / det;
+	ie = (m[2] * m[5] - m[3] * m[4]) / det;
+	iff = (m[1] * m[4] - m[0] * m[5]) / det;
+
+	canvas_channel_shifts(&ro, &go, &bo, &ao);
+
+	for (y = y0; y < y1; y++) {
+		for (x = x0; x < x1; x++) {
+			double px = x + 0.5, py = y + 0.5;
+			double u = ia * px + ic * py + ie;
+			double v = ib * px + id * py + iff;
+			uint32_t rgba;
+			unsigned int cov;
+
+			if (u < 0 || u >= 1 || v < 0 || v >= 1) {
+				continue;	/* outside the rectangle */
+			}
+
+			rgba = canvas_image_at(img, sx + u * sw, sy + v * sh,
+					       smooth);
+			cov = (unsigned int) (alpha * 255 + 0.5);
+			if (cov > 255) {
+				cov = 255;
+			}
+			canvas_blend(c->pixels + y * c->stride + x * 4,
+				     rgba, cov, ro, go, bo, ao);
+		}
+	}
+}
+
+
+/* exported function documented in canvas.h */
+void vita_canvas_read_pixels(struct vita_canvas *c, int x, int y,
+			     int w, int h, unsigned char *out)
+{
+	struct vita_canvas_image img;
+	int row, col;
+
+	if (out == NULL || w <= 0 || h <= 0) {
+		return;
+	}
+
+	memset(out, 0, (size_t) (w * h * 4));
+	if (vita_canvas_as_image(c, &img) == false) {
+		return;
+	}
+
+	for (row = 0; row < h; row++) {
+		for (col = 0; col < w; col++) {
+			unsigned int px[4];
+			unsigned char *dst = out + (row * w + col) * 4;
+
+			canvas_sample(&img, x + col, y + row, px);
+			dst[0] = (unsigned char) px[0];
+			dst[1] = (unsigned char) px[1];
+			dst[2] = (unsigned char) px[2];
+			dst[3] = (unsigned char) px[3];
+		}
+	}
+}
+
+
+/* exported function documented in canvas.h */
+void vita_canvas_write_pixels(struct vita_canvas *c, const unsigned char *in,
+			      int in_w, int in_h, int sx, int sy,
+			      int sw, int sh, int dx, int dy)
+{
+	int ro = 0, go = 1, bo = 2, ao = 3;
+	int row, col;
+
+	if (c == NULL || in == NULL || in_w <= 0 || in_h <= 0) {
+		return;
+	}
+
+	canvas_channel_shifts(&ro, &go, &bo, &ao);
+
+	for (row = 0; row < sh; row++) {
+		int src_y = sy + row;
+		int dst_y = dy + row;
+
+		if (src_y < 0 || src_y >= in_h ||
+		    dst_y < 0 || dst_y >= c->height) {
+			continue;
+		}
+		for (col = 0; col < sw; col++) {
+			int src_x = sx + col;
+			int dst_x = dx + col;
+			const unsigned char *src;
+			unsigned char *dst;
+
+			if (src_x < 0 || src_x >= in_w ||
+			    dst_x < 0 || dst_x >= c->width) {
+				continue;
+			}
+			src = in + (src_y * in_w + src_x) * 4;
+			dst = c->pixels + dst_y * c->stride + dst_x * 4;
+
+			/* putImageData replaces, it does not blend */
+			if (bitmap_fmt.pma) {
+				unsigned int a = src[3];
+
+				dst[ro] = (unsigned char) (src[0] * a / 255);
+				dst[go] = (unsigned char) (src[1] * a / 255);
+				dst[bo] = (unsigned char) (src[2] * a / 255);
+			} else {
+				dst[ro] = src[0];
+				dst[go] = src[1];
+				dst[bo] = src[2];
+			}
+			dst[ao] = src[3];
+		}
 	}
 }
