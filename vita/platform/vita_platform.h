@@ -36,6 +36,8 @@
 #define VITASURF_LOG_PATH     VITASURF_DATA_DIR "/log.txt"
 #define VITASURF_STDOUT_PATH  VITASURF_DATA_DIR "/stdout.txt"
 #define VITASURF_VERBOSE_FLAG VITASURF_DATA_DIR "/verbose"
+/* drop a file of this name beside it to have each page's boxes logged */
+#define VITASURF_LAYOUT_FLAG VITASURF_DATA_DIR "/dumplayout"
 #define VITASURF_CA_BUNDLE    VITASURF_RES_DIR "/cacert.pem"
 
 /* Persistence (phase 5): everything the user accumulates lives here. */
@@ -120,6 +122,17 @@ int vita_read_file(const char *path, char **data, size_t *len);
 
 /** True when the user created the verbose flag file in the data directory. */
 int vita_verbose_requested(void);
+
+/**
+ * Whether the layout dump flag file is present.
+ *
+ * A page that comes out wrong on the device cannot be opened in a
+ * debugger, so with this flag the boxes of each page it loads are
+ * written to the log and can be read later.
+ *
+ * \return non-zero if the flag file is there
+ */
+int vita_layout_dump_requested(void);
 
 /**
  * The main thread's stack size in bytes, as the kernel reports it, or 0

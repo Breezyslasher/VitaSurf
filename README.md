@@ -346,7 +346,10 @@ the Duktape VPK is the `VitaSurf-duktape` artifact and the startup line
 in the log names the engine. Creating an empty file named `verbose` in
 `ux0:data/VitaSurf/` turns NetSurf's verbose logging on at runtime in any
 build; the log also starts with a self-test of the path and clock
-assumptions the port relies on.
+assumptions the port relies on. A file named `dumplayout` in the same
+place writes the first four hundred boxes of each page it loads to the
+log, each with its size and where it ended up, which is how a page that
+comes out wrong on the device can be read here.
 
 `VITASURF_NATIVE=1 ./scripts/build-deps.sh` and
 `VITASURF_NATIVE=1 ./scripts/build-netsurf.sh` build the same libraries for

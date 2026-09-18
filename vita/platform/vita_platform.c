@@ -218,17 +218,25 @@ int vita_read_file(const char *path, char **data, size_t *len)
 	return 0;
 }
 
-int vita_verbose_requested(void)
+/**
+ * Whether a flag file of this name is present.
+ *
+ * Either with or without a .txt on the end, and through the SCE call
+ * or the C library, since which of them sees a file the user dropped
+ * on the memory card from a PC depends on how it got there.
+ */
+static int vita_flag_present(const char *name)
 {
-	static const char *const names[] = {
-		VITASURF_VERBOSE_FLAG,
-		VITASURF_VERBOSE_FLAG ".txt",
-	};
+	char with_txt[256];
+	const char *names[2];
 	SceIoStat st;
 	unsigned int i;
 
-	/* Accept either name, through the SCE call or the C library. */
-	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+	snprintf(with_txt, sizeof(with_txt), "%s.txt", name);
+	names[0] = name;
+	names[1] = with_txt;
+
+	for (i = 0; i < 2; i++) {
 		FILE *f;
 
 		if (sceIoGetstat(names[i], &st) >= 0) {
@@ -241,6 +249,18 @@ int vita_verbose_requested(void)
 		}
 	}
 	return 0;
+}
+
+
+int vita_verbose_requested(void)
+{
+	return vita_flag_present(VITASURF_VERBOSE_FLAG);
+}
+
+
+int vita_layout_dump_requested(void)
+{
+	return vita_flag_present(VITASURF_LAYOUT_FLAG);
 }
 
 /** Log the contents of the data directory so flag files can be checked. */
