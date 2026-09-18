@@ -1,81 +1,167 @@
 diff --git a/src/input/filter.c b/src/input/filter.c
-index 00ee7eb..8a84715 100644
+index 00ee7eb..eea4d2a 100644
 --- a/src/input/filter.c
 +++ b/src/input/filter.c
-@@ -292,6 +292,31 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
+@@ -32,6 +32,9 @@ struct parserutils_filter {
+ 	uint32_t pivot_buf[64];		/**< Conversion pivot buffer */
+ 
+ 	bool leftover;			/**< Data remains from last call */
++	bool read_pending;		/**< The read codec is holding the
++					 * output of a character that did
++					 * not fit in the pivot */
+ 	uint8_t *pivot_left;		/**< Remaining pivot to write */
+ 	size_t pivot_len;		/**< Length of pivot remaining */
+ #endif
+@@ -78,6 +81,7 @@ parserutils_error parserutils__filter_create(const char *int_enc,
+ 	}
+ #else
+ 	f->leftover = false;
++	f->read_pending = false;
+ 	f->pivot_left = NULL;
+ 	f->pivot_len = 0;
+ #endif
+@@ -233,6 +237,8 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
+ 
+ 	return PARSERUTILS_OK;
+ #else
++	parserutils_error read_error;
++
+ 	if (input->leftover) {
+ 		parserutils_error write_error;
+ 
+@@ -255,8 +261,10 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
+ 		input->leftover = false;
+ 	}
+ 
++	read_error = PARSERUTILS_OK;
++
+ 	while (*len > 0) {
+-		parserutils_error read_error, write_error;
++		parserutils_error write_error;
+ 		size_t pivot_len = sizeof(input->pivot_buf);
+ 		uint8_t *pivot = (uint8_t *) input->pivot_buf;
+ 
+@@ -283,11 +291,60 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
+ 			}
+ 		}
+ 
++		input->read_pending = (read_error == PARSERUTILS_NOMEM);
++
+ 		if (read_error != PARSERUTILS_OK && 
+ 				read_error != PARSERUTILS_NOMEM)
+ 			return read_error;
+ 	}
+ 
++	/*
++	 * A character whose output did not fit in the pivot is kept by the
++	 * codec and handed over on the next call. When the input ran out on
++	 * exactly that character there is nothing for the loop above to go
++	 * round for, so the character is dropped -- the last one of every
++	 * sixty-fifth document, with nothing to say so. An empty source is
++	 * all the flush the codec needs, and the flag lives on the filter
++	 * because the input can run out on one call and the room to write
++	 * the character only appear on the next. (VitaSurf)
++	 */
++	while (input->read_pending) {
++		parserutils_error write_error;
++		const uint8_t *none = (const uint8_t *) "";
++		size_t nonelen = 0;
++		size_t pivot_len = sizeof(input->pivot_buf);
++		uint8_t *pivot = (uint8_t *) input->pivot_buf;
++
++		read_error = parserutils_charset_codec_decode(input->read_codec,
++				&none, &nonelen,
++				(uint8_t **) &pivot, &pivot_len);
++
++		pivot = (uint8_t *) input->pivot_buf;
++		pivot_len = sizeof(input->pivot_buf) - pivot_len;
++
++		/* Nothing came out, so there was nothing left to come */
++		if (pivot_len == 0) {
++			input->read_pending = false;
++			break;
++		}
++
++		input->read_pending = (read_error == PARSERUTILS_NOMEM);
++
++		write_error = parserutils_charset_codec_encode(
++				input->write_codec,
++				(const uint8_t **) &pivot,
++				&pivot_len,
++				output, outlen);
++
++		if (write_error != PARSERUTILS_OK) {
++			input->leftover = true;
++			input->pivot_left = pivot;
++			input->pivot_len = pivot_len;
++
++			return write_error;
++		}
++	}
++
+ 	return PARSERUTILS_OK;
  #endif
  }
+@@ -312,6 +369,7 @@ parserutils_error parserutils__filter_reset(parserutils_filter *input)
+ 	input->pivot_left = NULL;
+ 	input->pivot_len = 0;
+ 	input->leftover = false;
++	input->read_pending = false;
  
-+/**
-+ * Whether the filter still holds data it has not been able to write out.
-+ *
-+ * The internal codec path decodes up to a pivot buffer's worth of
-+ * characters at a time and then writes them to the output. When the
-+ * output fills, the characters that did not fit stay in the pivot and
-+ * the input they came from has already been consumed. The stream above
-+ * only asks whether the raw buffer still holds anything, so without this
-+ * those characters are never asked for again: the last few dozen bytes
-+ * of a document are decoded, dropped, and then reported as end of input
-+ * in the middle of whatever tag they fell in. (VitaSurf)
-+ *
-+ * \param input  The input filter to query
-+ * \return true if a further call would produce more output
-+ */
-+bool parserutils__filter_has_pending(parserutils_filter *input)
-+{
-+#ifdef WITHOUT_ICONV_FILTER
-+	return input != NULL && input->leftover && input->pivot_len > 0;
-+#else
-+	(void) input;
-+	return false;
-+#endif
-+}
-+
- /**
-  * Reset an input filter's state
-  *
-diff --git a/src/input/filter.h b/src/input/filter.h
-index 7f4c309..ad73396 100644
---- a/src/input/filter.h
-+++ b/src/input/filter.h
-@@ -9,6 +9,7 @@
- #define parserutils_input_filter_h_
- 
- #include <inttypes.h>
-+#include <stdbool.h>
- 
- #include <parserutils/errors.h>
- #include <parserutils/functypes.h>
-@@ -53,5 +54,8 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
- /* Reset an input filter's state */
- parserutils_error parserutils__filter_reset(parserutils_filter *input);
- 
-+/* Whether the filter is still holding data it has not written out */
-+bool parserutils__filter_has_pending(parserutils_filter *input);
-+
- #endif
- 
+ 	/* Reset read codec */
+ 	error = parserutils_charset_codec_reset(input->read_codec);
 diff --git a/src/input/inputstream.c b/src/input/inputstream.c
-index 120ae88..ac1eee1 100644
+index 120ae88..dfd6cf7 100644
 --- a/src/input/inputstream.c
 +++ b/src/input/inputstream.c
-@@ -241,8 +241,13 @@ parserutils_error parserutils_inputstream_peek_slow(
+@@ -27,6 +27,10 @@ typedef struct parserutils_inputstream_private {
+ 	bool done_first_chunk;		/**< Whether the first chunk has 
+ 					 * been processed */
+ 
++	bool pending;			/**< Whether the conversion is still
++					 * holding output it could not
++					 * write */
++
+ 	uint16_t mibenum;		/**< MIB enum for charset, or 0 */
+ 	uint32_t encsrc;		/**< Charset source */
+ 
+@@ -86,6 +90,7 @@ parserutils_error parserutils_inputstream_create(const char *enc,
+ 	s->public.cursor = 0;
+ 	s->public.had_eof = false;
+ 	s->done_first_chunk = false;
++	s->pending = false;
+ 
+ 	error = parserutils__filter_create("UTF-8", &s->input);
+ 	if (error != PARSERUTILS_OK) {
+@@ -241,8 +246,10 @@ parserutils_error parserutils_inputstream_peek_slow(
  	if (stream == NULL || ptr == NULL || length == NULL)
  		return PARSERUTILS_BADPARM;
  
 -	/* There's insufficient data in the buffer, so read some more */
 -	if (s->raw->length == 0) {
 +	/* There's insufficient data in the buffer, so read some more.
-+	 * The raw buffer running dry does not mean the filter has nothing
-+	 * left: it may be holding characters it decoded but could not fit
-+	 * into the last output buffer, and those are all that is left of
-+	 * the end of the document. (VitaSurf) */
-+	if (s->raw->length == 0 &&
-+			parserutils__filter_has_pending(s->input) == false) {
++	 * The raw buffer running dry does not mean the conversion has
++	 * nothing left; see the note in refill. (VitaSurf) */
++	if (s->raw->length == 0 && s->pending == false) {
  		/* No more data to be had */
  		return s->public.had_eof ? PARSERUTILS_EOF
  					 : PARSERUTILS_NEEDDATA;
-@@ -471,11 +476,16 @@ parserutils_error parserutils_inputstream_refill_buffer(
+@@ -253,9 +260,12 @@ parserutils_error parserutils_inputstream_peek_slow(
+ 	if (error != PARSERUTILS_OK)
+ 		return error;
+ 
+-	/* Refill may have succeeded, but not actually produced any new data */
++	/* Refill may have succeeded, but not actually produced any new data.
++	 * When the input is over, that is the end of the document and not
++	 * something more data would fix. (VitaSurf) */
+ 	if (s->public.cursor + offset == s->public.utf8->length)
+-		return PARSERUTILS_NEEDDATA;
++		return s->public.had_eof ? PARSERUTILS_EOF
++					 : PARSERUTILS_NEEDDATA;
+ 
+ 	/* Now try the read */
+ 	if (IS_ASCII(s->public.utf8->data[s->public.cursor + offset])) {
+@@ -471,11 +481,23 @@ parserutils_error parserutils_inputstream_refill_buffer(
  	if (error != PARSERUTILS_OK && error != PARSERUTILS_NOMEM)
  		return error;
  
@@ -84,8 +170,15 @@ index 120ae88..ac1eee1 100644
 -			stream->raw->length - raw_length);
 -	if (error != PARSERUTILS_OK)
 -		return error;
++	/* ...but not forget it. The conversion holds what it could not
++	 * write, in its pivot or inside either codec, and the raw buffer
++	 * being empty is then no sign that the document has ended. Without
++	 * this the last few bytes of a page are converted, dropped, and
++	 * reported as end of input. (VitaSurf) */
++	stream->pending = (error == PARSERUTILS_NOMEM);
++
 +	/* Remove the raw data we've processed from the raw buffer.
-+	 * A refill that only flushed what the filter was still holding
++	 * A refill that only flushed what the conversion was still holding
 +	 * consumes nothing, and discarding nothing is not a request the
 +	 * buffer accepts. (VitaSurf) */
 +	if (stream->raw->length != raw_length) {
