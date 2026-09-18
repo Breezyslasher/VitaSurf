@@ -981,6 +981,14 @@ static void dump_layout(struct gui_window *gw)
 }
 
 
+/* Exported: the scripts on a page build most of it after the load, so
+ * the boxes worth reading are the ones the rebuild leaves behind. */
+void vita_input_dump_layout(void)
+{
+	dump_layout(the_gw);
+}
+
+
 void vita_input_load_finished(struct gui_window *gw)
 {
 	nsurl *url = NULL;

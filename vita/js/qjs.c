@@ -54,6 +54,7 @@
 #include "utils/useragent.h"
 
 #include "vita_platform.h"
+#include "vita_input.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -3456,6 +3457,9 @@ static void relayout_callback(void *p)
 		 "(%u elements)%s",
 		 thread->relayout_ms, thread->dom_elements,
 		 err == NSERROR_OK ? "" : " (failed)");
+	/* what the page looks like once its scripts have built it, when
+	 * the flag file asks for it (VitaSurf) */
+	vita_input_dump_layout();
 }
 
 /*
