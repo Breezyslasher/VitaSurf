@@ -1641,8 +1641,12 @@ if(!W.queueMicrotask)W.queueMicrotask=function(f){Promise.resolve().then(f);};
 if(!W.structuredClone)W.structuredClone=function(v){try{return JSON.parse(JSON.stringify(v));}catch(e){return v;}};
 /* MutationObserver is implemented further down, against the mutations
    qjs.c reports. */
-W.IntersectionObserver=W.ResizeObserver=W.PerformanceObserver=function(){};W.IntersectionObserver.prototype.observe=GAP('IntersectionObserver.observe');
-W.IntersectionObserver.prototype.unobserve=W.IntersectionObserver.prototype.disconnect=function(){};W.ResizeObserver.prototype=W.PerformanceObserver.prototype=W.IntersectionObserver.prototype;
+W.ResizeObserver=W.PerformanceObserver=function(){};
+W.ResizeObserver.prototype.observe=W.ResizeObserver.prototype.unobserve=
+ W.ResizeObserver.prototype.disconnect=function(){};
+W.PerformanceObserver.prototype=W.ResizeObserver.prototype;
+/* IntersectionObserver is implemented further down, against the page's
+   own geometry; it decides whether a lazily built list ever appears. */
 W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};
 W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
 function Image(){return document.createElement('img');}W.Image=Image;
@@ -3979,10 +3983,151 @@ reflectBool([['shadowRootDelegatesFocus','shadowrootdelegatesfocus'],
  ['shadowRootClonable','shadowrootclonable'],['shadowRootSerializable','shadowrootserializable']]);
 Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
  get:function(){return W.customElements;}});
-(function(){var I=W.IntersectionObserver;if(!I)return;
- I.prototype.rootMargin='0px';I.prototype.scrollMargin='0px';I.prototype.thresholds=[0];
- I.prototype.delay=0;I.prototype.trackVisibility=false;I.prototype.root=null;
- I.prototype.takeRecords=function(){return [];};})();
+/* --- IntersectionObserver ------------------------------------------------
+   A stub here meant a page built around "render it when it scrolls into
+   view" rendered nothing: openmediavault's dashboard widgets and
+   Audiobookshelf's shelves both wait on this, and both came up empty.
+   It is answered from the same geometry the rest of the bindings use --
+   the element's box against the viewport -- and re-checked when the
+   page scrolls, when it is resized, and when its DOM changes, which
+   between them cover every reason an element's visibility can change
+   without a poll running all the time. */
+(function(){
+ var observers=[],timer=null,lastScroll='',lastGen=-1;
+
+ function parseMargin(m){
+  /* one to four lengths, as the CSS margin shorthand is written; a
+     percentage is of the root's own size, which is the viewport */
+  var parts=String(m==null?'0px':m).trim().split(/\s+/),v=[],i;
+  for(i=0;i<4;i++)v.push(parts[Math.min(i,parts.length-1)]);
+  if(parts.length===2)v=[parts[0],parts[1],parts[0],parts[1]];
+  else if(parts.length===3)v=[parts[0],parts[1],parts[2],parts[1]];
+  return v;}
+
+ function marginPx(val,of){
+  var n=parseFloat(val)||0;
+  return /%/.test(val)?n*of/100:n;}
+
+ function rootRect(o){
+  var s=viewport();
+  if(o.root&&o.root.nodeType===1){
+   var b=__vitaBox(o.root);
+   if(b)return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
+  return {left:0,top:0,width:s[2],height:s[3]};}
+
+ function rectOf(el){
+  var b=__vitaBox(el);
+  if(!b)return null;
+  var s=viewport();
+  return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
+
+ function box(r){
+  return {x:r.left,y:r.top,left:r.left,top:r.top,width:r.width,
+   height:r.height,right:r.left+r.width,bottom:r.top+r.height,
+   toJSON:function(){return this;}};}
+
+ function check(o,force){
+  var root=rootRect(o),m=o.__margin,i,records=[];
+  var rl=root.left-marginPx(m[3],root.width);
+  var rt=root.top-marginPx(m[0],root.height);
+  var rr=root.left+root.width+marginPx(m[1],root.width);
+  var rb=root.top+root.height+marginPx(m[2],root.height);
+  var bounds={left:rl,top:rt,width:rr-rl,height:rb-rt};
+
+  for(i=0;i<o.__targets.length;i++){
+   var t=o.__targets[i],r=rectOf(t.el);
+   if(!r){ r={left:0,top:0,width:0,height:0}; }
+   var ix=Math.max(r.left,rl),iy=Math.max(r.top,rt);
+   var ax=Math.min(r.left+r.width,rr),ay=Math.min(r.top+r.height,rb);
+   var iw=Math.max(0,ax-ix),ih=Math.max(0,ay-iy);
+   var area=r.width*r.height;
+   var ratio=area>0?(iw*ih)/area:(iw>0&&ih>0?1:0);
+   var hit=iw>0&&ih>0;
+   /* report only when a threshold has actually been crossed, so a
+      scroll does not call the page back on every frame */
+   var step=0,k;
+   for(k=0;k<o.thresholds.length;k++){
+    if(ratio>=o.thresholds[k])step=k+1;}
+   if(!force&&t.step===step&&t.hit===hit)continue;
+   t.step=step;t.hit=hit;
+   records.push({target:t.el,time:(W.performance&&performance.now)?
+     performance.now():Date.now(),
+    rootBounds:box(bounds),boundingClientRect:box(r),
+    intersectionRect:box({left:hit?ix:0,top:hit?iy:0,
+     width:iw,height:ih}),
+    intersectionRatio:ratio,isIntersecting:hit});}
+
+  if(records.length===0)return;
+  o.__queue=o.__queue.concat(records);
+  try{o.__cb.call(o,records,o);}catch(e){
+   if(W.console&&console.error)console.error('IntersectionObserver: '+e);}
+  o.__queue=[];}
+
+ function checkAll(force){
+  for(var i=0;i<observers.length;i++){
+   if(observers[i].__targets.length)check(observers[i],force);}}
+
+ function tick(){
+  var s=viewport(),key=s[0]+','+s[1]+','+s[2]+','+s[3];
+  var g=W.__vitaDomGen?W.__vitaDomGen():-1;
+  var live=0,i;
+
+  for(i=0;i<observers.length;i++)live+=observers[i].__targets.length;
+  if(live===0){ if(timer!==null){clearInterval(timer);timer=null;} return; }
+  /* nothing that could move anything has happened */
+  if(key===lastScroll&&g===lastGen)return;
+  lastScroll=key;lastGen=g;
+  checkAll(false);}
+
+ function wake(){
+  if(timer===null)timer=setInterval(tick,250);}
+
+ function IntersectionObserver(cb,opts){
+  if(typeof cb!=='function')
+   throw new TypeError('IntersectionObserver needs a callback');
+  opts=opts||{};
+  var th=opts.threshold;
+  if(th==null)th=[0];
+  if(typeof th==='number')th=[th];
+  th=Array.prototype.slice.call(th).map(Number).filter(function(n){
+   return n>=0&&n<=1;}).sort(function(a,b){return a-b;});
+  if(th.length===0)th=[0];
+  this.root=opts.root||null;
+  this.rootMargin=String(opts.rootMargin==null?'0px':opts.rootMargin);
+  this.scrollMargin=String(opts.scrollMargin==null?'0px':opts.scrollMargin);
+  this.thresholds=th;
+  this.delay=Number(opts.delay)||0;
+  this.trackVisibility=!!opts.trackVisibility;
+  this.__cb=cb;this.__targets=[];this.__queue=[];
+  this.__margin=parseMargin(this.rootMargin);
+  observers.push(this);}
+
+ IntersectionObserver.prototype.observe=function(el){
+  if(!el||el.nodeType!==1)return;
+  for(var i=0;i<this.__targets.length;i++)
+   if(this.__targets[i].el===el)return;
+  this.__targets.push({el:el,step:-1,hit:null});
+  wake();
+  /* the specification delivers a first record for a new target without
+     waiting for anything to move, and a page that builds its list from
+     that first call depends on it */
+  var self=this;
+  setTimeout(function(){ check(self,false); },0);};
+
+ IntersectionObserver.prototype.unobserve=function(el){
+  for(var i=0;i<this.__targets.length;i++){
+   if(this.__targets[i].el===el){this.__targets.splice(i,1);return;}}};
+
+ IntersectionObserver.prototype.disconnect=function(){
+  this.__targets.length=0;};
+
+ IntersectionObserver.prototype.takeRecords=function(){
+  var q=this.__queue;this.__queue=[];return q;};
+
+ W.IntersectionObserver=IntersectionObserver;
+ W.addEventListener('scroll',function(){tick();},true);
+ W.addEventListener('resize',function(){lastScroll='';tick();});
+})();
 
 /* --- screen, fetch bodies and the rest ---------------------------------- */
 (function(){var s=W.screen||{};W.screen=s;

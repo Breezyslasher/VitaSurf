@@ -87,6 +87,36 @@ index e60b62c77..218e6cab9 100644
  		object->fetch.fetch = NULL;
  
  		/* Release candidate, if any */
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 459190b30..3a64fe4da 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -33,6 +33,7 @@
+ 
+ #include "utils/errors.h"
+ #include "utils/log.h"
++#include "utils/utils.h"
+ #include "utils/corestrings.h"
+ #include "utils/messages.h"
+ #include "utils/nsoption.h"
+@@ -3336,6 +3337,17 @@ browser_window_navigate(struct browser_window *bw,
+ 
+ 	NSLOG(netsurf, INFO, "bw %p, url %s", bw, nsurl_access(url));
+ 
++	/*
++	 * Start the load timeline here, where the navigation does, not
++	 * when the throbber starts: the document's own fetch is under way
++	 * by then, so the row the waterfall most needs -- the one that
++	 * shows a redirect, or a document that took ten seconds -- was
++	 * the one being thrown away (VitaSurf).
++	 */
++	if (bw->parent == NULL) {
++		vitasurf_timeline_reset();
++	}
++
+ 	/*
+ 	 * determine if navigation is internal url, if so, we do not
+ 	 * do certain things during the load.
 diff --git a/utils/utils.c b/utils/utils.c
 index 4d03f55a7..fc33bb1ba 100644
 --- a/utils/utils.c
