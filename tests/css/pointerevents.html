@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>pointer events</title><style>
+ body { margin: 0; font: 16px sans-serif; }
+ #btn  { display: block; width: 200px; height: 40px; background: #ddd; }
+ #icon { display: block; width: 200px; height: 40px; background: #bbb;
+         pointer-events: none; }
+ #btn2 { display: block; width: 200px; height: 40px; background: #ddd; }
+ #icon2 { display: block; width: 200px; height: 40px; background: #bbb; }
+</style></head>
+<body>
+<div id="btn"><span id="icon">a</span></div>
+<div id="btn2"><span id="icon2">b</span></div>
+<pre id="out"></pre>
+<script>
+/* An icon inside a button is usually marked pointer-events: none so the
+   button takes the tap rather than the picture. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+window.addEventListener('load', function(){ setTimeout(function(){
+  var a = document.elementFromPoint(100, 20);
+  var b = document.elementFromPoint(100, 60);
+  T('a tap on a none child reaches the button', a ? a.id : 'nothing');
+  T('a tap on an ordinary child stops at the child', b ? b.id : 'nothing');
+}, 200); });
+</script></body></html>

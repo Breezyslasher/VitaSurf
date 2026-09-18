@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!-- A negative length is thrown out when it is parsed, but a calc() is
+     only known to be negative once it is resolved, and CSS Values 3
+     clamps that to zero for a property that takes no negative value.
+     padding: calc(0px - 5px) used to shrink the box by five pixels.
+     Expected: four grey boxes the same size, 100 wide and 10 tall, and
+     below them one with a 20px border on every side. A line-height that
+     resolves negative is zero too, so its line of text has no height of
+     its own. Margin keeps its negative value, so one box sits five
+     pixels left of the rest. -->
+<html><head><style>
+body { margin: 0; width: 400px }
+div { width: 100px; height: 10px; background: #ddd }
+.pad { padding: calc(0px - 5px) }
+.wide { width: calc(50px - 150px); background: #dde }
+.line { line-height: calc(1 - 3); height: auto }
+.bord { border: calc(0px - 4px) solid #000 }
+.keep { border: 20px solid #333 }
+.marg { margin-left: calc(0px - 5px) }
+</style></head><body>
+<div class="pad"></div>
+<div class="line">x</div>
+<div class="bord"></div>
+<div class="keep"></div>
+<div class="marg"></div>
+<div class="wide"></div>
+<script>
+setTimeout(function(){
+ function r(c){return document.querySelector('.'+c).getBoundingClientRect();}
+ var pad=r('pad'), line=r('line'), bord=r('bord'), keep=r('keep'), marg=r('marg'), wide=r('wide');
+ var ok = pad.width==100 && pad.height==10 && bord.width==100 && bord.height==10 &&
+          keep.width==140 && keep.height==50 && marg.left==-5 && marg.width==100 &&
+          wide.width==0 && line.height==0;
+ console.log((ok?'PASS':'FAIL')+' negative calc clamp '+[pad.width,pad.height,line.height,bord.width,bord.height,keep.width,keep.height,marg.left,wide.width].join(' '));
+},500);
+</script></body></html>

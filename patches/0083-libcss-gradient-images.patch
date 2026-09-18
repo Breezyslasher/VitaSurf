@@ -1,0 +1,1011 @@
+diff --git a/src/parse/properties/Makefile b/src/parse/properties/Makefile
+index 366749f..36296c0 100644
+--- a/src/parse/properties/Makefile
++++ b/src/parse/properties/Makefile
+@@ -32,7 +32,7 @@ $(eval $(foreach PROP,$(AUTOGEN_PARSERS),$(call gen_prop_parser,$(PROP))))
+ DIR_SOURCES :=				\
+ 	mask_image.c \
+ 	animation.c \
+-	box_shadow.c clip_path.c ignored.c \
++	box_shadow.c clip_path.c ignored.c gradient.c background_image.c \
+ 	azimuth.c			\
+ 	background.c			\
+ 	background_position.c		\
+diff --git a/src/parse/properties/background.c b/src/parse/properties/background.c
+index 20aeb30..da8db13 100644
+--- a/src/parse/properties/background.c
++++ b/src/parse/properties/background.c
+@@ -157,6 +157,13 @@ css_error css__parse_background(css_language *c,
+ 			consumeWhitespace(vector, ctx);
+ 
+ 			token = parserutils_vector_peek(vector, *ctx);
++
++			/* further layers are not painted; only the first
++			 * is kept (VitaSurf) */
++			if (token != NULL && tokenIsChar(token, ',')) {
++				css__skip_background_layers(vector, ctx);
++				token = NULL;
++			}
+ 		} else {
+ 			/* Forcibly cause loop to exit */
+ 			token = NULL;
+diff --git a/src/parse/properties/background_image.c b/src/parse/properties/background_image.c
+new file mode 100644
+index 0000000..158a165
+--- /dev/null
++++ b/src/parse/properties/background_image.c
+@@ -0,0 +1,154 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2010 The NetSurf Browser Project.
++ * Copyright 2026 VitaSurf contributors
++ */
++
++/*
++ * background-image, written out by hand (VitaSurf). It began as the
++ * parser gen_parser produces from properties.gen, and reads the same
++ * for none and url(); the difference is a gradient function, which
++ * the generator's grammar cannot express, and a comma-separated list
++ * of layers, of which the first is kept.
++ */
++
++#include <assert.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++
++/**
++ * Parse background_image
++ *
++ * \param c	  Parsing context
++ * \param vector  Vector of tokens to process
++ * \param ctx	  Pointer to vector iteration context
++ * \param result  resulting style
++ * \return CSS_OK on success,
++ *	   CSS_NOMEM on memory exhaustion,
++ *	   CSS_INVALID if the input is not valid
++ *
++ * Post condition: \a *ctx is updated with the next token to process
++ *		   If the input is invalid, then \a *ctx remains unchanged.
++ */
++css_error css__parse_background_image(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	int32_t orig_ctx = *ctx;
++	css_error error;
++	const css_token *token;
++	bool match;
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if ((token == NULL) || ((token->type != CSS_TOKEN_IDENT) && (token->type != CSS_TOKEN_URI) && (token->type != CSS_TOKEN_FUNCTION))) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[INHERIT],
++			&match) == lwc_error_ok && match)) {
++		error = css_stylesheet_style_inherit(result,
++				CSS_PROP_BACKGROUND_IMAGE);
++
++	} else if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[INITIAL],
++			&match) == lwc_error_ok && match)) {
++		error = css_stylesheet_style_initial(result,
++				CSS_PROP_BACKGROUND_IMAGE);
++
++	} else if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[REVERT],
++			&match) == lwc_error_ok && match)) {
++		error = css_stylesheet_style_revert(result,
++				CSS_PROP_BACKGROUND_IMAGE);
++
++	} else if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[UNSET],
++			&match) == lwc_error_ok && match)) {
++		error = css_stylesheet_style_unset(result,
++				CSS_PROP_BACKGROUND_IMAGE);
++
++	} else if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[NONE],
++			&match) == lwc_error_ok && match)) {
++		error = css__stylesheet_style_appendOPV(result,
++				CSS_PROP_BACKGROUND_IMAGE,
++				0,BACKGROUND_IMAGE_NONE);
++
++	} else if (token->type == CSS_TOKEN_URI) {
++		lwc_string *uri = NULL;
++		uint32_t uri_snumber;
++
++		error = c->sheet->resolve(c->sheet->resolve_pw,
++				c->sheet->url,
++				token->idata, &uri);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_string_add(c->sheet, uri, &uri_snumber);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_style_appendOPV(result, CSS_PROP_BACKGROUND_IMAGE, 0, BACKGROUND_IMAGE_URI);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_style_append(result, uri_snumber);
++		if (error == CSS_OK)
++			css__skip_background_layers(vector, ctx);
++	} else if (token->type == CSS_TOKEN_FUNCTION) {
++		/* a gradient, carried as an image the renderer draws
++		 * itself (VitaSurf) */
++		lwc_string *uri = NULL;
++		uint32_t uri_snumber;
++
++		*ctx = orig_ctx;
++		error = css__parse_gradient(c, vector, ctx, &uri);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_string_add(c->sheet, uri, &uri_snumber);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_style_appendOPV(result, CSS_PROP_BACKGROUND_IMAGE, 0, BACKGROUND_IMAGE_URI);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_style_append(result, uri_snumber);
++		if (error == CSS_OK)
++			css__skip_background_layers(vector, ctx);
++	} else {
++		error = CSS_INVALID;
++	}
++
++	if (error != CSS_OK)
++		*ctx = orig_ctx;
++	
++	return error;
++}
++
+diff --git a/src/parse/properties/gradient.c b/src/parse/properties/gradient.c
+new file mode 100644
+index 0000000..5ce725b
+--- /dev/null
++++ b/src/parse/properties/gradient.c
+@@ -0,0 +1,679 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 VitaSurf contributors
++ */
++
++#include <assert.h>
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
++#include <strings.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
++#include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++#include "utils/utils.h"
++
++/**
++ * CSS gradient images (VitaSurf).
++ *
++ * A gradient is an image the stylesheet describes rather than fetches,
++ * and this library only knows how to carry an image as a URL. So a
++ * gradient function is turned into one: a string under a "gradient:"
++ * scheme that the renderer recognises and paints itself instead of
++ * fetching. Its form is
++ *
++ *   gradient:<kind><angle>:<colour>@<pos>,<colour>@<pos>,...
++ *
++ * with the kind L (linear), R (radial) or C (conic), the angle in
++ * degrees as CSS counts them (0 pointing up, clockwise), each colour as
++ * eight hex digits AARRGGBB, and each position in tenths of a percent
++ * along the gradient line, already resolved and in order, so the
++ * renderer has only to interpolate. Positions given as lengths cannot
++ * be resolved here and are placed as though unspecified.
++ *
++ * Both the standard syntax and the -webkit- forms the older sites in
++ * this browser's census still use are read: -webkit-linear-gradient,
++ * whose angles run the other way, and -webkit-gradient(linear, ...)
++ * with its from(), to() and color-stop() stops.
++ */
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
++#define GRADIENT_MAX_STOPS 16
++
++struct gradient_stop {
++	uint32_t colour;	/* AARRGGBB */
++	int pos;		/* tenths of a percent, or -1 */
++};
++
++struct gradient {
++	char kind;
++	int angle;
++	int n;
++	struct gradient_stop stop[GRADIENT_MAX_STOPS];
++};
++
++static bool name_is(lwc_string *s, const char *name)
++{
++	size_t len = strlen(name);
++
++	return lwc_string_length(s) == len &&
++			strncasecmp(lwc_string_data(s), name, len) == 0;
++}
++
++static bool ident_is(const css_token *t, const char *name)
++{
++	return t != NULL && t->type == CSS_TOKEN_IDENT &&
++			name_is(t->idata, name);
++}
++
++/**
++ * Read a CSS angle token into degrees. A NUMBER 0 counts as 0deg.
++ */
++static bool parse_angle(css_language *c, const parserutils_vector *vector,
++		int32_t *ctx, int *degrees)
++{
++	int32_t orig = *ctx;
++	css_fixed value;
++	uint32_t unit;
++	double d;
++
++	if (css__parse_unit_specifier(c, vector, ctx, UNIT_DEG, &value,
++			&unit) != CSS_OK) {
++		*ctx = orig;
++		return false;
++	}
++	d = FIXTOFLT(value);
++	switch (unit) {
++	case UNIT_DEG:
++		break;
++	case UNIT_GRAD:
++		d = d * 0.9;
++		break;
++	case UNIT_RAD:
++		d = d * 180.0 / M_PI;
++		break;
++	case UNIT_TURN:
++		d = d * 360.0;
++		break;
++	default:
++		if (value != 0) {
++			*ctx = orig;
++			return false;
++		}
++		d = 0;
++		break;
++	}
++	*degrees = (int) lround(d);
++	return true;
++}
++
++/**
++ * The angle a "to <side-or-corner>" direction means, from the sides
++ * named; a legacy direction names where the gradient starts instead.
++ */
++static bool sides_to_angle(bool top, bool bottom, bool left, bool right,
++		bool legacy, int *degrees)
++{
++	int a;
++
++	if ((top && bottom) || (left && right))
++		return false;
++	if (!top && !bottom && !left && !right)
++		return false;
++
++	if (top)
++		a = left ? 315 : right ? 45 : 0;
++	else if (bottom)
++		a = left ? 225 : right ? 135 : 180;
++	else
++		a = left ? 270 : 90;
++
++	if (legacy)
++		a = (a + 180) % 360;
++	*degrees = a;
++	return true;
++}
++
++/**
++ * Read the position after a stop colour: a percentage, or a length,
++ * which cannot be resolved against a box this early and is left open.
++ */
++static bool parse_stop_position(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx, int *pos,
++		bool fraction)
++{
++	const css_token *token;
++	css_fixed value;
++	uint32_t unit;
++	int32_t orig = *ctx;
++
++	consumeWhitespace(vector, ctx);
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL || (token->type != CSS_TOKEN_PERCENTAGE &&
++			token->type != CSS_TOKEN_NUMBER &&
++			token->type != CSS_TOKEN_DIMENSION)) {
++		*ctx = orig;
++		return false;
++	}
++	if (token->type == CSS_TOKEN_NUMBER) {
++		/* a bare number: zero, or in the legacy stops a fraction
++		 * of the line */
++		size_t consumed = 0;
++
++		value = css__number_from_lwc_string(token->idata, false,
++				&consumed);
++		parserutils_vector_iterate(vector, ctx);
++		if (fraction) {
++			int p = (int) lround(FIXTOFLT(value) * 1000.0);
++
++			*pos = p < 0 ? 0 : p > 1000 ? 1000 : p;
++		} else {
++			*pos = value == 0 ? 0 : -1;
++		}
++		return true;
++	}
++	if (css__parse_unit_specifier(c, vector, ctx, UNIT_PX, &value,
++			&unit) != CSS_OK) {
++		*ctx = orig;
++		return false;
++	}
++	if (unit == UNIT_PCT) {
++		int p = (int) lround(FIXTOFLT(value) * 10.0);
++
++		*pos = p < 0 ? 0 : p > 1000 ? 1000 : p;
++	} else if (value == 0) {
++		*pos = 0;
++	} else {
++		*pos = -1;
++	}
++	return true;
++}
++
++/**
++ * Read a colour stop: <colour> [<pos> [<pos>]]. Two positions make
++ * two stops of the same colour.
++ */
++static bool parse_stop(css_language *c, const parserutils_vector *vector,
++		int32_t *ctx, struct gradient *g)
++{
++	uint16_t kind = 0;
++	uint32_t colour = 0;
++	int pos = -1, pos2;
++	int32_t orig = *ctx;
++
++	consumeWhitespace(vector, ctx);
++	if (css__parse_colour_specifier(c, vector, ctx, &kind, &colour) !=
++			CSS_OK) {
++		*ctx = orig;
++		return false;
++	}
++	if (kind == COLOR_TRANSPARENT)
++		colour = 0;
++	else if (kind == COLOR_CURRENT_COLOR)
++		colour = 0xff000000;
++
++	if (g->n == GRADIENT_MAX_STOPS)
++		return true;
++
++	parse_stop_position(c, vector, ctx, &pos, false);
++	g->stop[g->n].colour = colour;
++	g->stop[g->n].pos = pos;
++	g->n++;
++	if (pos != -1 && g->n < GRADIENT_MAX_STOPS &&
++			parse_stop_position(c, vector, ctx, &pos2, false)) {
++		g->stop[g->n].colour = colour;
++		g->stop[g->n].pos = pos2;
++		g->n++;
++	}
++	return true;
++}
++
++/**
++ * Step over the rest of the current argument, up to the comma or
++ * closing bracket that ends it, minding nested brackets.
++ */
++static void skip_argument(const parserutils_vector *vector, int32_t *ctx)
++{
++	const css_token *token;
++	int depth = 0;
++
++	while ((token = parserutils_vector_peek(vector, *ctx)) != NULL) {
++		if (token->type == CSS_TOKEN_FUNCTION ||
++				tokenIsChar(token, '(')) {
++			depth++;
++		} else if (tokenIsChar(token, ')')) {
++			if (depth == 0)
++				return;
++			depth--;
++		} else if (tokenIsChar(token, ',') && depth == 0) {
++			return;
++		}
++		parserutils_vector_iterate(vector, ctx);
++	}
++}
++
++/**
++ * Parse the stop list, from the first stop to the closing bracket.
++ * A bare percentage between two stops is a colour hint, stepped over.
++ */
++static bool parse_stops(css_language *c, const parserutils_vector *vector,
++		int32_t *ctx, struct gradient *g)
++{
++	const css_token *token;
++
++	for (;;) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL)
++			return false;
++		if (token->type == CSS_TOKEN_PERCENTAGE) {
++			skip_argument(vector, ctx);
++		} else if (!parse_stop(c, vector, ctx, g)) {
++			return false;
++		}
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL)
++			return false;
++		if (tokenIsChar(token, ')'))
++			break;
++		if (!tokenIsChar(token, ','))
++			return false;
++	}
++	return g->n >= 2;
++}
++
++/**
++ * A point of the legacy -webkit-gradient(): "left top", "50% 0%",
++ * "center bottom". Each coordinate lands in 0..1000.
++ */
++static bool parse_legacy_point(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		int *x, int *y)
++{
++	const css_token *token;
++	int i;
++
++	*x = 500;
++	*y = 500;
++	for (i = 0; i < 2; i++) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL)
++			return false;
++		if (token->type == CSS_TOKEN_IDENT) {
++			parserutils_vector_iterate(vector, ctx);
++			if (name_is(token->idata, "left"))
++				*x = 0;
++			else if (name_is(token->idata, "right"))
++				*x = 1000;
++			else if (name_is(token->idata, "top"))
++				*y = 0;
++			else if (name_is(token->idata, "bottom"))
++				*y = 1000;
++			else if (!name_is(token->idata, "center"))
++				return false;
++		} else if (token->type == CSS_TOKEN_PERCENTAGE ||
++				token->type == CSS_TOKEN_NUMBER) {
++			int p;
++
++			if (!parse_stop_position(c, vector, ctx, &p, true))
++				return false;
++			if (p < 0)
++				p = 0;
++			if (i == 0)
++				*x = p;
++			else
++				*y = p;
++		} else {
++			break;
++		}
++	}
++	return true;
++}
++
++/**
++ * -webkit-gradient(linear, <point>, <point>, from(c), color-stop(p, c),
++ * to(c)). Anything but linear is read as radial.
++ */
++static bool parse_legacy_webkit(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		struct gradient *g)
++{
++	const css_token *token;
++	int x0, y0, x1, y1;
++
++	consumeWhitespace(vector, ctx);
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL || token->type != CSS_TOKEN_IDENT)
++		return false;
++	g->kind = name_is(token->idata, "linear") ? 'L' : 'R';
++
++	consumeWhitespace(vector, ctx);
++	if (!tokenIsChar(parserutils_vector_iterate(vector, ctx), ','))
++		return false;
++	if (!parse_legacy_point(c, vector, ctx, &x0, &y0))
++		return false;
++	consumeWhitespace(vector, ctx);
++	if (!tokenIsChar(parserutils_vector_iterate(vector, ctx), ','))
++		return false;
++	if (g->kind == 'L') {
++		if (!parse_legacy_point(c, vector, ctx, &x1, &y1))
++			return false;
++		g->angle = (int) lround(atan2((double) (x1 - x0),
++				(double) (y0 - y1)) * 180.0 / M_PI);
++		if (g->angle < 0)
++			g->angle += 360;
++	} else {
++		/* radius, centre, radius */
++		skip_argument(vector, ctx);
++	}
++
++	for (;;) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL)
++			return false;
++		if (tokenIsChar(token, ')'))
++			break;
++		if (!tokenIsChar(token, ','))
++			return false;
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL || token->type != CSS_TOKEN_FUNCTION)
++			return false;
++		if (g->n < GRADIENT_MAX_STOPS) {
++			uint16_t kind = 0;
++			uint32_t colour = 0;
++			int pos;
++
++			if (name_is(token->idata, "from")) {
++				pos = 0;
++			} else if (name_is(token->idata, "to")) {
++				pos = 1000;
++			} else if (name_is(token->idata, "color-stop")) {
++				consumeWhitespace(vector, ctx);
++				if (!parse_stop_position(c, vector, ctx,
++						&pos, true))
++					return false;
++				if (pos < 0)
++					pos = 0;
++				consumeWhitespace(vector, ctx);
++				if (!tokenIsChar(parserutils_vector_iterate(
++						vector, ctx), ','))
++					return false;
++			} else {
++				return false;
++			}
++			if (css__parse_colour_specifier(c, vector, ctx,
++					&kind, &colour) != CSS_OK)
++				return false;
++			if (kind == COLOR_TRANSPARENT)
++				colour = 0;
++			g->stop[g->n].colour = colour;
++			g->stop[g->n].pos = pos;
++			g->n++;
++		} else {
++			skip_argument(vector, ctx);
++		}
++		consumeWhitespace(vector, ctx);
++		if (!tokenIsChar(parserutils_vector_iterate(vector, ctx),
++				')'))
++			return false;
++	}
++	return g->n >= 2;
++}
++
++/**
++ * Give every stop a position: the first 0, the last 100%, the rest
++ * spread evenly between their placed neighbours, none earlier than
++ * the one before it.
++ */
++static void resolve_positions(struct gradient *g)
++{
++	int i, j;
++
++	if (g->stop[0].pos < 0)
++		g->stop[0].pos = 0;
++	if (g->stop[g->n - 1].pos < 0)
++		g->stop[g->n - 1].pos = 1000;
++	for (i = 1; i < g->n - 1; i++) {
++		int span, from;
++
++		if (g->stop[i].pos >= 0)
++			continue;
++		for (j = i + 1; g->stop[j].pos < 0; j++)
++			;
++		from = g->stop[i - 1].pos;
++		span = j - (i - 1);
++		while (i < j) {
++			g->stop[i].pos = from + (g->stop[j].pos - from) *
++					(i - (j - span)) / span;
++			i++;
++		}
++	}
++	for (i = 1; i < g->n; i++) {
++		if (g->stop[i].pos < g->stop[i - 1].pos)
++			g->stop[i].pos = g->stop[i - 1].pos;
++	}
++	/* legacy stops arrive in the order written, which need not be
++	 * along the line */
++	for (i = 1; i < g->n; i++) {
++		for (j = i; j > 0 && g->stop[j].pos < g->stop[j - 1].pos;
++				j--) {
++			struct gradient_stop t = g->stop[j];
++
++			g->stop[j] = g->stop[j - 1];
++			g->stop[j - 1] = t;
++		}
++	}
++}
++
++/* exported interface documented in properties.h */
++css_error css__parse_gradient(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		lwc_string **out)
++{
++	int32_t orig = *ctx;
++	const css_token *token;
++	struct gradient g;
++	bool legacy_angles = false;
++	char buf[24 + GRADIENT_MAX_STOPS * 16];
++	size_t len;
++	int i;
++
++	*out = NULL;
++	memset(&g, 0, sizeof(g));
++	g.kind = 'L';
++	g.angle = 180;
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if (token == NULL || token->type != CSS_TOKEN_FUNCTION)
++		goto invalid;
++
++	if (name_is(token->idata, "-webkit-gradient")) {
++		if (!parse_legacy_webkit(c, vector, ctx, &g))
++			goto invalid;
++	} else {
++		const char *name = lwc_string_data(token->idata);
++		size_t nlen = lwc_string_length(token->idata);
++		bool have_direction = false;
++
++		if (nlen > 8 && strncasecmp(name, "-webkit-", 8) == 0) {
++			name += 8;
++			nlen -= 8;
++			legacy_angles = true;
++		}
++		if (nlen > 10 && strncasecmp(name, "repeating-", 10) == 0) {
++			name += 10;
++			nlen -= 10;
++		}
++		if (nlen == 15 && strncasecmp(name, "linear-gradient",
++				15) == 0) {
++			g.kind = 'L';
++		} else if (nlen == 15 && strncasecmp(name,
++				"radial-gradient", 15) == 0) {
++			g.kind = 'R';
++		} else if (nlen == 14 && strncasecmp(name, "conic-gradient",
++				14) == 0) {
++			g.kind = 'C';
++		} else {
++			goto invalid;
++		}
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL)
++			goto invalid;
++
++		if (g.kind == 'L') {
++			int degrees;
++
++			if (ident_is(token, "to")) {
++				bool top = false, bottom = false;
++				bool left = false, right = false;
++
++				parserutils_vector_iterate(vector, ctx);
++				for (;;) {
++					consumeWhitespace(vector, ctx);
++					token = parserutils_vector_peek(vector,
++							*ctx);
++					if (ident_is(token, "top"))
++						top = true;
++					else if (ident_is(token, "bottom"))
++						bottom = true;
++					else if (ident_is(token, "left"))
++						left = true;
++					else if (ident_is(token, "right"))
++						right = true;
++					else
++						break;
++					parserutils_vector_iterate(vector, ctx);
++				}
++				if (!sides_to_angle(top, bottom, left, right,
++						false, &degrees))
++					goto invalid;
++				g.angle = degrees;
++				have_direction = true;
++			} else if (legacy_angles && (ident_is(token, "top") ||
++					ident_is(token, "bottom") ||
++					ident_is(token, "left") ||
++					ident_is(token, "right"))) {
++				bool top = false, bottom = false;
++				bool left = false, right = false;
++
++				for (;;) {
++					consumeWhitespace(vector, ctx);
++					token = parserutils_vector_peek(vector,
++							*ctx);
++					if (ident_is(token, "top"))
++						top = true;
++					else if (ident_is(token, "bottom"))
++						bottom = true;
++					else if (ident_is(token, "left"))
++						left = true;
++					else if (ident_is(token, "right"))
++						right = true;
++					else
++						break;
++					parserutils_vector_iterate(vector, ctx);
++				}
++				if (!sides_to_angle(top, bottom, left, right,
++						true, &degrees))
++					goto invalid;
++				g.angle = degrees;
++				have_direction = true;
++			} else if (token->type == CSS_TOKEN_DIMENSION ||
++					(token->type == CSS_TOKEN_NUMBER &&
++					 parserutils_vector_peek(vector,
++						*ctx + 1) != NULL)) {
++				int32_t before = *ctx;
++
++				if (parse_angle(c, vector, ctx, &degrees)) {
++					/* the legacy form counts from the
++					 * right, anticlockwise */
++					if (legacy_angles)
++						degrees = 90 - degrees;
++					g.angle = ((degrees % 360) + 360) %
++							360;
++					have_direction = true;
++				} else {
++					*ctx = before;
++				}
++			}
++		} else {
++			/* a shape, size, position or "from <angle>": if
++			 * the first argument is not a colour it is the
++			 * prelude, which the fallback painter cannot use */
++			int32_t before = *ctx;
++			uint16_t kind;
++			uint32_t colour;
++
++			if (css__parse_colour_specifier(c, vector, ctx,
++					&kind, &colour) != CSS_OK) {
++				*ctx = before;
++				skip_argument(vector, ctx);
++				have_direction = true;
++			} else {
++				*ctx = before;
++			}
++		}
++
++		if (have_direction) {
++			consumeWhitespace(vector, ctx);
++			if (!tokenIsChar(parserutils_vector_iterate(vector,
++					ctx), ','))
++				goto invalid;
++		}
++
++		if (!parse_stops(c, vector, ctx, &g))
++			goto invalid;
++	}
++
++	resolve_positions(&g);
++
++	len = (size_t) snprintf(buf, sizeof(buf), "gradient:%c%d:", g.kind,
++			g.angle);
++	for (i = 0; i < g.n; i++) {
++		len += (size_t) snprintf(buf + len, sizeof(buf) - len,
++				"%s%08x@%d", i ? "," : "",
++				(unsigned int) g.stop[i].colour,
++				g.stop[i].pos);
++	}
++
++	if (lwc_intern_string(buf, len, out) != lwc_error_ok)
++		return CSS_NOMEM;
++
++	return CSS_OK;
++
++invalid:
++	*ctx = orig;
++	return CSS_INVALID;
++}
++
++/* exported interface documented in properties.h */
++void css__skip_background_layers(const parserutils_vector *vector,
++		int32_t *ctx)
++{
++	const css_token *token;
++	int32_t before = *ctx;
++
++	consumeWhitespace(vector, ctx);
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL || tokenIsChar(token, ',') == false) {
++		*ctx = before;
++		return;
++	}
++	while ((token = parserutils_vector_peek(vector, *ctx)) != NULL) {
++		if (tokenIsChar(token, '!'))
++			break;
++		parserutils_vector_iterate(vector, ctx);
++	}
++}
+diff --git a/src/parse/properties/properties.gen b/src/parse/properties/properties.gen
+index ee3c8fc..fd8cea5 100644
+--- a/src/parse/properties/properties.gen
++++ b/src/parse/properties/properties.gen
+@@ -121,7 +121,6 @@ caption_side:CSS_PROP_CAPTION_SIDE IDENT:( INHERIT: INITIAL: REVERT: UNSET: TOP:
+ 
+ clear:CSS_PROP_CLEAR IDENT:( INHERIT: INITIAL: REVERT: UNSET: RIGHT:0,CLEAR_RIGHT LEFT:0,CLEAR_LEFT BOTH:0,CLEAR_BOTH NONE:0,CLEAR_NONE IDENT:)
+ 
+-background_image:CSS_PROP_BACKGROUND_IMAGE IDENT:( INHERIT: INITIAL: REVERT: UNSET: NONE:0,BACKGROUND_IMAGE_NONE IDENT:) URI:BACKGROUND_IMAGE_URI
+ 
+ mask_image:CSS_PROP_MASK_IMAGE IDENT:( INHERIT: INITIAL: REVERT: UNSET: NONE:0,MASK_IMAGE_NONE IDENT:) URI:MASK_IMAGE_URI
+ 
+diff --git a/src/parse/properties/properties.h b/src/parse/properties/properties.h
+index c6798ab..0a88a29 100644
+--- a/src/parse/properties/properties.h
++++ b/src/parse/properties/properties.h
+@@ -131,6 +131,21 @@ css_error css__parse_clip_path(css_language *c,
+ css_error css__parse_ignored(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
++/**
++ * Read a gradient function into the "gradient:" string the renderer
++ * paints (VitaSurf). \a *ctx is unchanged and CSS_INVALID returned
++ * when the token is not a gradient.
++ */
++css_error css__parse_gradient(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		lwc_string **out);
++/**
++ * Step over further background layers after a comma (VitaSurf): only
++ * the first is painted, and dropping the declaration for having more
++ * would lose that one too.
++ */
++void css__skip_background_layers(const parserutils_vector *vector,
++		int32_t *ctx);
+ css_error css__parse_transform(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index a5256e7..78c288c 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -45,3 +45,4 @@ container.dat			container query tests
+ has.dat			:has() selectors (VitaSurf)
+ nested-at.dat			At-rules nested inside @media (VitaSurf)
+ clip-path.dat			clip-path, ignored properties, light-dark() (VitaSurf)
++gradient.dat			Gradient images (VitaSurf)
+diff --git a/test/data/parse2/gradient.dat b/test/data/parse2/gradient.dat
+new file mode 100644
+index 0000000..a60fed7
+--- /dev/null
++++ b/test/data/parse2/gradient.dat
+@@ -0,0 +1,82 @@
++#data
++div { background: linear-gradient(red, blue); color: red }
++#errors
++#expected
++| div
++|  background-attachment: scroll
++|  background-color: transparent
++|  background-image: url('gradient:L180:ffff0000@0,ff0000ff@1000')
++|  background-position: left top
++|  background-repeat: repeat
++|  color: #ffff0000
++#reset
++
++#data
++div { background-image: linear-gradient(to right, #fff 0%, #000 100%) }
++#errors
++#expected
++| div
++|  background-image: url('gradient:L90:ffffffff@0,ff000000@1000')
++#reset
++
++#data
++div { background-image: linear-gradient(135deg, rgba(0,0,0,0) 10%, rgba(0,0,0,.5), #123456) }
++#errors
++#expected
++| div
++|  background-image: url('gradient:L135:00000000@100,80000000@550,ff123456@1000')
++#reset
++
++#data
++div { background: #0f0 linear-gradient(transparent, black) no-repeat, url(x.png); color: red }
++#errors
++#expected
++| div
++|  background-attachment: scroll
++|  background-color: #ff00ff00
++|  background-image: url('gradient:L180:00000000@0,ff000000@1000')
++|  background-position: left top
++|  background-repeat: no-repeat
++|  color: #ffff0000
++#reset
++
++#data
++div { background-image: -webkit-linear-gradient(top, #f00, #00f) }
++#errors
++#expected
++| div
++|  background-image: url('gradient:L180:ffff0000@0,ff0000ff@1000')
++#reset
++
++#data
++div { background-image: -webkit-gradient(linear, left top, left bottom, from(#f00), color-stop(0.3, #0f0), to(#00f)) }
++#errors
++#expected
++| div
++|  background-image: url('gradient:L180:ffff0000@0,ff00ff00@300,ff0000ff@1000')
++#reset
++
++#data
++div { background-image: radial-gradient(circle at center, #fff, #000) }
++#errors
++#expected
++| div
++|  background-image: url('gradient:R180:ffffffff@0,ff000000@1000')
++#reset
++
++#data
++div { background-image: url(a.png), linear-gradient(red, blue); color: red }
++#errors
++#expected
++| div
++|  background-image: url('a.png')
++|  color: #ffff0000
++#reset
++
++#data
++div { background-image: linear-gradient(0.25turn, red 30%, 60%, blue) }
++#errors
++#expected
++| div
++|  background-image: url('gradient:L90:ffff0000@300,ff0000ff@1000')
++#reset

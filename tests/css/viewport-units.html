@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!-- vh took its length from the viewport's width and vw from its height,
+     so a page that sizes anything in vw came out the wrong shape; on a
+     screen far wider than it is tall, as the Vita's is, wildly so.
+     Expected: a red bar half the width of the window, a green one half
+     its height, a blue one the full width, and a yellow square whose
+     side is a tenth of the shorter edge beside one a tenth of the
+     longer, then three more bars sized in the dynamic, small and large
+     viewport units, which here are all the same size as the plain ones. -->
+<html><head><style>
+body { margin: 0 }
+.w { width: 50vw; height: 10px; background: #f00 }
+.h { width: 10px; height: 50vh; background: #0f0 }
+.full { width: 100vw; height: 10px; background: #00f }
+.mn { width: 10vmin; height: 10vmin; background: #ff0; display: inline-block }
+.mx { width: 10vmax; height: 10vmax; background: #fa0; display: inline-block }
+/* the small, large and dynamic viewport of CSS Values 4: nothing here
+   comes and goes, so all three are the size the plain unit gives */
+.dv { width: 50dvw; height: 10dvh; background: #8cf }
+.sv { width: 50svw; height: 10svh; background: #8fc }
+.lv { width: 50lvw; height: 10lvh; background: #c8f }
+</style></head><body>
+<div class="w"></div><div class="h"></div><div class="full"></div>
+<div class="mn"></div><div class="mx"></div>
+<div class="dv"></div><div class="sv"></div><div class="lv"></div>
+<script>
+setTimeout(function(){
+ function box(c){var r=document.querySelector('.'+c).getBoundingClientRect();return [Math.round(r.width),Math.round(r.height)];}
+ var vw = window.innerWidth, vh = window.innerHeight;
+ var mn = Math.min(vw, vh), mx = Math.max(vw, vh);
+ var w = box('w'), h = box('h'), full = box('full'), n = box('mn'), x = box('mx');
+ function near(a,b){return Math.abs(a-b)<=1;}
+ var dv = box('dv'), sv = box('sv'), lv = box('lv');
+ var ok = near(w[0],vw/2) && near(h[1],vh/2) && near(full[0],vw) &&
+          near(n[0],mn/10) && near(n[1],mn/10) && near(x[0],mx/10) && near(x[1],mx/10) &&
+          near(dv[0],vw/2) && near(dv[1],vh/10) &&
+          near(sv[0],vw/2) && near(sv[1],vh/10) &&
+          near(lv[0],vw/2) && near(lv[1],vh/10);
+ console.log((ok?'PASS':'FAIL')+' viewport units '+[vw,vh,w[0],h[1],full[0],n[0],x[0],dv[0],dv[1],sv[1],lv[1]].join(' '));
+},500);
+</script></body></html>

@@ -1,0 +1,633 @@
+diff --git a/src/parse/properties/logical.c b/src/parse/properties/logical.c
+index ccc7ebf..2d44a22 100644
+--- a/src/parse/properties/logical.c
++++ b/src/parse/properties/logical.c
+@@ -47,6 +47,24 @@ static css_error parse_as(css_language *c,
+ 	case CSS_PROP_MARGIN_BOTTOM:
+ 	case CSS_PROP_MARGIN_LEFT:
+ 		return css__parse_margin_side(c, vector, ctx, result, prop);
++	case CSS_PROP_BORDER_TOP_WIDTH:
++	case CSS_PROP_BORDER_RIGHT_WIDTH:
++	case CSS_PROP_BORDER_BOTTOM_WIDTH:
++	case CSS_PROP_BORDER_LEFT_WIDTH:
++		return css__parse_border_side_width(c, vector, ctx, result,
++						    prop);
++	case CSS_PROP_BORDER_TOP_STYLE:
++	case CSS_PROP_BORDER_RIGHT_STYLE:
++	case CSS_PROP_BORDER_BOTTOM_STYLE:
++	case CSS_PROP_BORDER_LEFT_STYLE:
++		return css__parse_border_side_style(c, vector, ctx, result,
++						    prop);
++	case CSS_PROP_BORDER_TOP_COLOR:
++	case CSS_PROP_BORDER_RIGHT_COLOR:
++	case CSS_PROP_BORDER_BOTTOM_COLOR:
++	case CSS_PROP_BORDER_LEFT_COLOR:
++		return css__parse_border_side_color(c, vector, ctx, result,
++						    prop);
+ 	default:
+ 		return css__parse_side(c, vector, ctx, result, prop);
+ 	}
+@@ -219,3 +237,156 @@ css_error css__parse_word_wrap(css_language *c,
+ {
+ 	return css__parse_overflow_wrap(c, vector, ctx, result);
+ }
++
++/*
++ * Logical borders, logical sizes, and the old names for the gaps
++ * (VitaSurf).
++ *
++ * The same idea as the spacing above, for the rest of the family. A
++ * border written as border-inline-start was thrown away entirely, so a
++ * divider or an underline simply did not appear, and about 900
++ * declarations across the stylesheets measured here say a side by
++ * direction rather than by edge. inline-size and block-size are width
++ * and height under the same scheme. grid-gap and its two longhands are
++ * the names the gap properties had when grid shipped, and sites that
++ * have not been touched since still write them.
++ */
++
++/**
++ * Parse a border shorthand and apply it to both of two sides.
++ *
++ * border-block is one border, not one per side: the whole value is read
++ * again from the start for the second side.
++ */
++static css_error parse_border_both(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result,
++		enum border_side_e first, enum border_side_e second)
++{
++	int32_t orig_ctx = *ctx;
++	int32_t after_first;
++	css_error error;
++
++	error = css__parse_border_side(c, vector, ctx, result, first);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++	after_first = *ctx;
++
++	*ctx = orig_ctx;
++	error = css__parse_border_side(c, vector, ctx, result, second);
++	if (error != CSS_OK) {
++		*ctx = orig_ctx;
++		return error;
++	}
++
++	*ctx = after_first;
++
++	return CSS_OK;
++}
++
++#define ALIAS(name, phys)						\
++	css_error css__parse_##name(css_language *c,			\
++			const parserutils_vector *vector, int32_t *ctx,	\
++			css_style *result)				\
++	{								\
++		return parse_as(c, vector, ctx, result, phys);		\
++	}
++
++#define PAIR(name, a, b)						\
++	css_error css__parse_##name(css_language *c,			\
++			const parserutils_vector *vector, int32_t *ctx,	\
++			css_style *result)				\
++	{								\
++		return parse_pair(c, vector, ctx, result, a, b);	\
++	}
++
++/** One side, as a whole border shorthand. */
++#define BORDER(name, side)						\
++	css_error css__parse_##name(css_language *c,			\
++			const parserutils_vector *vector, int32_t *ctx,	\
++			css_style *result)				\
++	{								\
++		return css__parse_border_side(c, vector, ctx, result,	\
++					      side);			\
++	}
++
++/** Two sides, both taking the whole border shorthand. */
++#define BORDER_BOTH(name, a, b)						\
++	css_error css__parse_##name(css_language *c,			\
++			const parserutils_vector *vector, int32_t *ctx,	\
++			css_style *result)				\
++	{								\
++		return parse_border_both(c, vector, ctx, result, a, b);	\
++	}
++
++/** Another spelling of a property that is parsed exactly the same way. */
++#define SAME_AS(name, target)						\
++	css_error css__parse_##name(css_language *c,			\
++			const parserutils_vector *vector, int32_t *ctx,	\
++			css_style *result)				\
++	{								\
++		return css__parse_##target(c, vector, ctx, result);	\
++	}
++
++BORDER(border_block_start, BORDER_SIDE_TOP)
++BORDER(border_block_end, BORDER_SIDE_BOTTOM)
++BORDER(border_inline_start, BORDER_SIDE_LEFT)
++BORDER(border_inline_end, BORDER_SIDE_RIGHT)
++BORDER_BOTH(border_block, BORDER_SIDE_TOP, BORDER_SIDE_BOTTOM)
++BORDER_BOTH(border_inline, BORDER_SIDE_LEFT, BORDER_SIDE_RIGHT)
++
++ALIAS(border_block_start_width, CSS_PROP_BORDER_TOP_WIDTH)
++ALIAS(border_block_end_width, CSS_PROP_BORDER_BOTTOM_WIDTH)
++ALIAS(border_inline_start_width, CSS_PROP_BORDER_LEFT_WIDTH)
++ALIAS(border_inline_end_width, CSS_PROP_BORDER_RIGHT_WIDTH)
++PAIR(border_block_width, CSS_PROP_BORDER_TOP_WIDTH,
++		CSS_PROP_BORDER_BOTTOM_WIDTH)
++PAIR(border_inline_width, CSS_PROP_BORDER_LEFT_WIDTH,
++		CSS_PROP_BORDER_RIGHT_WIDTH)
++
++ALIAS(border_block_start_style, CSS_PROP_BORDER_TOP_STYLE)
++ALIAS(border_block_end_style, CSS_PROP_BORDER_BOTTOM_STYLE)
++ALIAS(border_inline_start_style, CSS_PROP_BORDER_LEFT_STYLE)
++ALIAS(border_inline_end_style, CSS_PROP_BORDER_RIGHT_STYLE)
++PAIR(border_block_style, CSS_PROP_BORDER_TOP_STYLE,
++		CSS_PROP_BORDER_BOTTOM_STYLE)
++PAIR(border_inline_style, CSS_PROP_BORDER_LEFT_STYLE,
++		CSS_PROP_BORDER_RIGHT_STYLE)
++
++ALIAS(border_block_start_color, CSS_PROP_BORDER_TOP_COLOR)
++ALIAS(border_block_end_color, CSS_PROP_BORDER_BOTTOM_COLOR)
++ALIAS(border_inline_start_color, CSS_PROP_BORDER_LEFT_COLOR)
++ALIAS(border_inline_end_color, CSS_PROP_BORDER_RIGHT_COLOR)
++PAIR(border_block_color, CSS_PROP_BORDER_TOP_COLOR,
++		CSS_PROP_BORDER_BOTTOM_COLOR)
++PAIR(border_inline_color, CSS_PROP_BORDER_LEFT_COLOR,
++		CSS_PROP_BORDER_RIGHT_COLOR)
++
++/*
++ * The corners are named by the two edges that meet at them, in block
++ * order then inline order, so start-start is where the top and the left
++ * meet.
++ */
++SAME_AS(border_start_start_radius, border_top_left_radius)
++SAME_AS(border_start_end_radius, border_top_right_radius)
++SAME_AS(border_end_start_radius, border_bottom_left_radius)
++SAME_AS(border_end_end_radius, border_bottom_right_radius)
++
++SAME_AS(inline_size, width)
++SAME_AS(block_size, height)
++SAME_AS(min_inline_size, min_width)
++SAME_AS(min_block_size, min_height)
++SAME_AS(max_inline_size, max_width)
++SAME_AS(max_block_size, max_height)
++
++SAME_AS(grid_gap, gap)
++SAME_AS(grid_column_gap, column_gap)
++SAME_AS(grid_row_gap, row_gap)
++
++#undef ALIAS
++#undef PAIR
++#undef BORDER
++#undef BORDER_BOTH
++#undef SAME_AS
+diff --git a/src/parse/properties/properties.c b/src/parse/properties/properties.c
+index 4f61936..e132914 100644
+--- a/src/parse/properties/properties.c
++++ b/src/parse/properties/properties.c
+@@ -211,7 +211,45 @@ const css_prop_handler property_handlers[LAST_PROP + 1 - FIRST_PROP] =
+ 	css__parse_pointer_events,
+ 	css__parse_background_size,
+ 	css__parse_object_fit,
+-	css__parse_aspect_ratio
++	css__parse_aspect_ratio,
++	/* Logical borders, sizes and the old grid gap names (VitaSurf) */
++	css__parse_border_block,
++	css__parse_border_block_start,
++	css__parse_border_block_end,
++	css__parse_border_block_width,
++	css__parse_border_block_start_width,
++	css__parse_border_block_end_width,
++	css__parse_border_block_style,
++	css__parse_border_block_start_style,
++	css__parse_border_block_end_style,
++	css__parse_border_block_color,
++	css__parse_border_block_start_color,
++	css__parse_border_block_end_color,
++	css__parse_border_inline,
++	css__parse_border_inline_start,
++	css__parse_border_inline_end,
++	css__parse_border_inline_width,
++	css__parse_border_inline_start_width,
++	css__parse_border_inline_end_width,
++	css__parse_border_inline_style,
++	css__parse_border_inline_start_style,
++	css__parse_border_inline_end_style,
++	css__parse_border_inline_color,
++	css__parse_border_inline_start_color,
++	css__parse_border_inline_end_color,
++	css__parse_border_start_start_radius,
++	css__parse_border_start_end_radius,
++	css__parse_border_end_start_radius,
++	css__parse_border_end_end_radius,
++	css__parse_inline_size,
++	css__parse_block_size,
++	css__parse_min_inline_size,
++	css__parse_min_block_size,
++	css__parse_max_inline_size,
++	css__parse_max_block_size,
++	css__parse_grid_gap,
++	css__parse_grid_column_gap,
++	css__parse_grid_row_gap
+ };
+ 
+ /** Mapping from property bytecode index to bytecode unit class mask. */
+diff --git a/src/parse/properties/properties.h b/src/parse/properties/properties.h
+index 0a3ca69..efaed33 100644
+--- a/src/parse/properties/properties.h
++++ b/src/parse/properties/properties.h
+@@ -114,6 +114,119 @@ css_error css__parse_aspect_ratio(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
+ 
++/* Logical borders, sizes and the old grid gap names (VitaSurf) */
++css_error css__parse_border_block(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_width(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_start_width(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_end_width(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_style(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_start_style(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_end_style(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_color(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_start_color(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_block_end_color(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_start(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_end(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_width(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_start_width(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_end_width(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_style(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_start_style(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_end_style(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_color(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_start_color(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_inline_end_color(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_start_start_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_start_end_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_end_start_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_border_end_end_radius(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_inline_size(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_block_size(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_min_inline_size(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_min_block_size(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_max_inline_size(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_max_block_size(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_gap(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_column_gap(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++css_error css__parse_grid_row_gap(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result);
++
+ css_error css__parse_pointer_events(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result);
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index eacddd1..269f107 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -293,6 +293,45 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("object-fit"),
+ 	SMAP("aspect-ratio"),
+ 
++	/* Logical borders, sizes and the old grid gap names (VitaSurf) */
++	SMAP("border-block"),
++	SMAP("border-block-start"),
++	SMAP("border-block-end"),
++	SMAP("border-block-width"),
++	SMAP("border-block-start-width"),
++	SMAP("border-block-end-width"),
++	SMAP("border-block-style"),
++	SMAP("border-block-start-style"),
++	SMAP("border-block-end-style"),
++	SMAP("border-block-color"),
++	SMAP("border-block-start-color"),
++	SMAP("border-block-end-color"),
++	SMAP("border-inline"),
++	SMAP("border-inline-start"),
++	SMAP("border-inline-end"),
++	SMAP("border-inline-width"),
++	SMAP("border-inline-start-width"),
++	SMAP("border-inline-end-width"),
++	SMAP("border-inline-style"),
++	SMAP("border-inline-start-style"),
++	SMAP("border-inline-end-style"),
++	SMAP("border-inline-color"),
++	SMAP("border-inline-start-color"),
++	SMAP("border-inline-end-color"),
++	SMAP("border-start-start-radius"),
++	SMAP("border-start-end-radius"),
++	SMAP("border-end-start-radius"),
++	SMAP("border-end-end-radius"),
++	SMAP("inline-size"),
++	SMAP("block-size"),
++	SMAP("min-inline-size"),
++	SMAP("min-block-size"),
++	SMAP("max-inline-size"),
++	SMAP("max-block-size"),
++	SMAP("grid-gap"),
++	SMAP("grid-column-gap"),
++	SMAP("grid-row-gap"),
++
+ 	SMAP("inherit"),
+ 	SMAP("unset"),
+ 	SMAP("important"),
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index 07eeff0..1785b56 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -104,7 +104,23 @@ enum {
+ 	/* How a picture is sized (VitaSurf) */
+ 	BACKGROUND_SIZE, OBJECT_FIT, ASPECT_RATIO,
+ 
+-	LAST_PROP = ASPECT_RATIO,
++	/* Logical borders, sizes and the old grid gap names (VitaSurf) */
++	BORDER_BLOCK, BORDER_BLOCK_START, BORDER_BLOCK_END,
++	BORDER_BLOCK_WIDTH, BORDER_BLOCK_START_WIDTH, BORDER_BLOCK_END_WIDTH,
++	BORDER_BLOCK_STYLE, BORDER_BLOCK_START_STYLE, BORDER_BLOCK_END_STYLE,
++	BORDER_BLOCK_COLOR, BORDER_BLOCK_START_COLOR, BORDER_BLOCK_END_COLOR,
++	BORDER_INLINE, BORDER_INLINE_START, BORDER_INLINE_END,
++	BORDER_INLINE_WIDTH, BORDER_INLINE_START_WIDTH,
++	BORDER_INLINE_END_WIDTH, BORDER_INLINE_STYLE,
++	BORDER_INLINE_START_STYLE, BORDER_INLINE_END_STYLE,
++	BORDER_INLINE_COLOR, BORDER_INLINE_START_COLOR,
++	BORDER_INLINE_END_COLOR, BORDER_START_START_RADIUS,
++	BORDER_START_END_RADIUS, BORDER_END_START_RADIUS,
++	BORDER_END_END_RADIUS, INLINE_SIZE, BLOCK_SIZE, MIN_INLINE_SIZE,
++	MIN_BLOCK_SIZE, MAX_INLINE_SIZE, MAX_BLOCK_SIZE, GRID_GAP,
++	GRID_COLUMN_GAP, GRID_ROW_GAP,
++
++	LAST_PROP = GRID_ROW_GAP,
+ 
+ 	/* Other keywords */
+ 	INHERIT, UNSET, IMPORTANT, NONE, BOTH, FIXED, SCROLL, TRANSPARENT,
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index 8bbc27e..93bc49c 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -32,3 +32,4 @@ logical.dat			Logical property tests
+ textlayout.dat			Text layout property tests
+ pointerevents.dat		Pointer events tests
+ picturesize.dat			Picture sizing tests
++logicalborder.dat		Logical border, size and gap tests
+diff --git a/test/data/parse2/logicalborder.dat b/test/data/parse2/logicalborder.dat
+new file mode 100644
+index 0000000..633c574
+--- /dev/null
++++ b/test/data/parse2/logicalborder.dat
+@@ -0,0 +1,178 @@
++#data
++* { border-inline-start: 1px solid red; }
++#errors
++#expected
++| *
++|  border-left-color: #ffff0000
++|  border-left-style: solid
++|  border-left-width: 1px
++#reset
++
++#data
++* { border-block-end: 2px dashed blue; }
++#errors
++#expected
++| *
++|  border-bottom-color: #ff0000ff
++|  border-bottom-style: dashed
++|  border-bottom-width: 2px
++#reset
++
++#data
++* { border-block: 3px dotted green; }
++#errors
++#expected
++| *
++|  border-top-color: #ff008000
++|  border-top-style: dotted
++|  border-top-width: 3px
++|  border-bottom-color: #ff008000
++|  border-bottom-style: dotted
++|  border-bottom-width: 3px
++#reset
++
++#data
++* { border-inline: 1px solid red; }
++#errors
++#expected
++| *
++|  border-left-color: #ffff0000
++|  border-left-style: solid
++|  border-left-width: 1px
++|  border-right-color: #ffff0000
++|  border-right-style: solid
++|  border-right-width: 1px
++#reset
++
++#data
++* { border-block-start-width: 4px; }
++#errors
++#expected
++| *
++|  border-top-width: 4px
++#reset
++
++#data
++* { border-inline-end-style: dotted; }
++#errors
++#expected
++| *
++|  border-right-style: dotted
++#reset
++
++#data
++* { border-block-width: 1px 3px; }
++#errors
++#expected
++| *
++|  border-top-width: 1px
++|  border-bottom-width: 3px
++#reset
++
++#data
++* { border-inline-width: 2px; }
++#errors
++#expected
++| *
++|  border-left-width: 2px
++|  border-right-width: 2px
++#reset
++
++#data
++* { border-inline-color: red blue; }
++#errors
++#expected
++| *
++|  border-left-color: #ffff0000
++|  border-right-color: #ff0000ff
++#reset
++
++#data
++* { border-block-style: solid dashed; }
++#errors
++#expected
++| *
++|  border-top-style: solid
++|  border-bottom-style: dashed
++#reset
++
++#data
++* { border-end-end-radius: 4px; }
++#errors
++#expected
++| *
++|  border-bottom-right-radius: 4px 4px
++#reset
++
++#data
++* { border-start-end-radius: 2px 6px; }
++#errors
++#expected
++| *
++|  border-top-right-radius: 2px 6px
++#reset
++
++#data
++* { inline-size: 50%; }
++#errors
++#expected
++| *
++|  width: 50%
++#reset
++
++#data
++* { block-size: 10px; }
++#errors
++#expected
++| *
++|  height: 10px
++#reset
++
++#data
++* { min-block-size: 10px; max-inline-size: 20em; }
++#errors
++#expected
++| *
++|  min-height: 10px
++|  max-width: 20em
++#reset
++
++#data
++* { grid-column-gap: 5px; }
++#errors
++#expected
++| *
++|  column-gap: 5px
++#reset
++
++#data
++* { grid-row-gap: 7px; }
++#errors
++#expected
++| *
++|  row-gap: 7px
++#reset
++
++#data
++* { grid-gap: 4px 8px; }
++#errors
++#expected
++| *
++|  column-gap: 8px
++|  row-gap: 4px
++#reset
++
++#data
++* { border-block-start: nonsense; }
++#errors
++#expected
++| *
++#reset
++
++#data
++* { border-inline-start-width: 2px !important; }
++#errors
++#expected
++| *
++|  border-left-width: 2px !important
++#reset

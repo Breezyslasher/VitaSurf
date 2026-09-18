@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<!-- nodeValue = x on a text or comment node changes its data, the way
+     Svelte 5 updates every text node; on an element it does nothing.
+     Expected console output: three lines ending in "ok". -->
+<html><body><p id="p"></p><script>
+var p=document.getElementById('p'), t=document.createTextNode(''); p.appendChild(t);
+t.nodeValue='hello';
+console.log("text:", t.data==='hello' && p.textContent==='hello' && t.nodeValue==='hello' ? "ok" : "FAIL "+JSON.stringify([t.data,p.textContent]));
+var c=document.createComment('a'); c.nodeValue='b';
+console.log("comment:", c.data==='b' ? "ok" : "FAIL "+c.data);
+p.nodeValue='ignored';
+console.log("element:", p.nodeValue===null && p.textContent==='hello' ? "ok" : "FAIL "+p.nodeValue);
+</script></body></html>

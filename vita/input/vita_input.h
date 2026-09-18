@@ -54,4 +54,21 @@ void vita_input_load_started(struct gui_window *gw);
 /** The window finished loading: logs the URL, elapsed time and heap. */
 void vita_input_load_finished(struct gui_window *gw);
 
+/**
+ * Write the boxes of the page on screen to the log (VitaSurf).
+ *
+ * Does nothing unless the dumplayout flag file is there. The scripts
+ * on an application page build most of it after the load, so the
+ * boxes worth reading are the ones a rebuild leaves behind.
+ */
+void vita_input_dump_layout(void);
+
+/**
+ * Write the boxes of the page on screen to the log, flag or not (VitaSurf).
+ *
+ * What the Start menu's entry calls, so a page that comes out wrong can
+ * be reported without creating a file on the memory card first.
+ */
+void vita_input_dump_layout_now(void);
+
 #endif

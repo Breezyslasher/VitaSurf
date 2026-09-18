@@ -1,0 +1,818 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 2b7e850..906d26c 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -148,6 +148,16 @@ typedef struct css_select_handler {
+ 	 */
+ 	css_error (*get_libcss_node_data)(void *pw, void *node,
+ 			void **libcss_node_data);
++
++	/**
++	 * Downward walks for :has() (VitaSurf): the first child element
++	 * and the next sibling element, NULL when there is none. Added
++	 * at the end of the structure so a handler written against the
++	 * original layout still initialises; both NULL means :has()
++	 * matches nothing.
++	 */
++	css_error (*first_child_node)(void *pw, void *node, void **child);
++	css_error (*next_sibling_node)(void *pw, void *node, void **sibling);
+ } css_select_handler;
+ 
+ /**
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 48cdda7..5dd165f 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -118,6 +118,9 @@ static css_error parseGroupChain(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_selector **parent);
+ static void dropPrefixChain(css_language *c);
++static css_error parseHasArgs(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_selector **out);
+ static css_error splicePrefixChain(css_language *c, css_selector *before,
+ 		css_combinator comb, css_selector *subject);
+ 
+@@ -901,6 +904,7 @@ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+ 	c->state = CHARSET_PERMITTED;
+ 	c->used_root_hints = 0;
+ 	c->prefix_n = 0;
++	c->in_has = 0;
+ 	c->default_namespace = NULL;
+ 	c->namespaces = NULL;
+ 	c->num_namespaces = 0;
+@@ -2450,6 +2454,7 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 		{ DISABLED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ CHECKED, CSS_SELECTOR_PSEUDO_CLASS },
+ 		{ NOT, CSS_SELECTOR_PSEUDO_CLASS },
++		{ HAS, CSS_SELECTOR_PSEUDO_CLASS },
+ 
+ 		/*
+ 		 * Shadow tree selectors (VitaSurf). Nothing here has a
+@@ -2597,6 +2602,17 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 			negate = true;
+ 
+ 			consumeWhitespace(vector, ctx);
++		} else if (fun_type == HAS) {
++			/* :has() inside :has() is invalid */
++			if (c->in_has != 0)
++				return CSS_INVALID;
++
++			error = parseHasArgs(c, vector, ctx,
++					&detail_value.selector);
++			if (error != CSS_OK)
++				return error;
++
++			value_type = CSS_SELECTOR_DETAIL_VALUE_SELECTOR;
+ 		}
+ 
+ 		if (fun_type == HOST || fun_type == HOST_CONTEXT ||
+@@ -2626,8 +2642,14 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 			}
+ 		} else {
+ 			token = parserutils_vector_iterate(vector, ctx);
+-			if (token == NULL || tokenIsChar(token, ')') == false)
++			if (token == NULL || tokenIsChar(token, ')') == false) {
++				if (value_type ==
++						CSS_SELECTOR_DETAIL_VALUE_SELECTOR)
++					css__stylesheet_selector_destroy(
++							c->sheet,
++							detail_value.selector);
+ 				return CSS_INVALID;
++			}
+ 		}
+ 	}
+ 
+@@ -2944,6 +2966,102 @@ static css_error parseGroupChain(css_language *c,
+ 	return CSS_OK;
+ }
+ 
++/**
++ * Parse the relative selector list inside :has() (VitaSurf).
++ *
++ * Each argument is one compound, optionally led by the combinator
++ * that places it relative to the subject: ":has(> img)" looks at the
++ * children, ":has(+ p)" at the next sibling, ":has(~ p)" at every
++ * later sibling and a bare ":has(img)" at every descendant. Those
++ * shapes are what sites write; an argument with a combinator in the
++ * middle, ":has(ul > li)", is not supported and drops the rule as it
++ * did before.
++ *
++ * The compounds come back chained through their combinator pointers,
++ * which is the chain css__stylesheet_selector_destroy() frees, with
++ * the relative combinator in each one's data.comb (CSS_COMBINATOR_NONE
++ * meaning descendant). select.c's match_has() walks them.
++ */
++static css_error parseHasArgs(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_selector **out)
++{
++	css_selector *head = NULL, *tail = NULL;
++	const css_token *token;
++	css_error error;
++	int prefix_n = c->prefix_n;
++
++	*out = NULL;
++
++	for (;;) {
++		css_selector *sub = NULL;
++		css_combinator comb = CSS_COMBINATOR_NONE;
++
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL) {
++			error = CSS_INVALID;
++			goto fail;
++		}
++		if (tokenIsChar(token, '>')) {
++			comb = CSS_COMBINATOR_PARENT;
++		} else if (tokenIsChar(token, '+')) {
++			comb = CSS_COMBINATOR_SIBLING;
++		} else if (tokenIsChar(token, '~')) {
++			comb = CSS_COMBINATOR_GENERIC_SIBLING;
++		}
++		if (comb != CSS_COMBINATOR_NONE) {
++			parserutils_vector_iterate(vector, ctx);
++			consumeWhitespace(vector, ctx);
++		}
++
++		c->in_has++;
++		error = parseSimpleSelector(c, vector, ctx, &sub);
++		c->in_has--;
++		if (error != CSS_OK)
++			goto fail;
++
++		/* An :is() with a combinator in it leaves a prefix chain
++		 * for the enclosing selector to pick up, which would put
++		 * the argument's ancestors in front of the subject. */
++		if (c->prefix_n != prefix_n) {
++			css__stylesheet_selector_destroy(c->sheet, sub);
++			dropPrefixChain(c);
++			error = CSS_INVALID;
++			goto fail;
++		}
++
++		sub->data.comb = comb;
++		if (tail == NULL)
++			head = sub;
++		else
++			tail->combinator = sub;
++		tail = sub;
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL) {
++			error = CSS_INVALID;
++			goto fail;
++		}
++		if (tokenIsChar(token, ')'))
++			break;
++		if (tokenIsChar(token, ',') == false) {
++			error = CSS_INVALID;
++			goto fail;
++		}
++		parserutils_vector_iterate(vector, ctx);
++		consumeWhitespace(vector, ctx);
++	}
++
++	*out = head;
++	return CSS_OK;
++
++fail:
++	if (head != NULL)
++		css__stylesheet_selector_destroy(c->sheet, head);
++	return error;
++}
++
+ /**
+  * Append the compound inside :is() or :where() to the selector being
+  * built (VitaSurf).
+diff --git a/src/parse/language.h b/src/parse/language.h
+index 3a34983..0af7815 100644
+--- a/src/parse/language.h
++++ b/src/parse/language.h
+@@ -96,6 +96,8 @@ typedef struct css_language {
+ 	 * includes this one. */
+ 	int prefix_comb[CSS_GROUP_PREFIX_MAX];
+ 	int prefix_n;
++	/* Inside a :has() argument, where another :has() is invalid */
++	int in_has;
+ } css_language;
+ 
+ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index b87e3c0..e77d83a 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -851,7 +851,8 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	/* Shadow tree selectors (VitaSurf) */
+ 	SMAP("host"),
+ 	SMAP("host-context"),
+-	SMAP("slotted")
++	SMAP("slotted"),
++	SMAP("has")
+ };
+ 
+ 
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index db72fa1..46f89fc 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -248,7 +248,7 @@ enum {
+ 	COVER, CONTAIN, LIBCSS_FILL, SCALE_DOWN,
+ 
+ 	/* Shadow tree selectors (VitaSurf) */
+-	HOST, HOST_CONTEXT, SLOTTED,
++	HOST, HOST_CONTEXT, SLOTTED, HAS,
+ 
+ 	LAST_KNOWN
+ };
+diff --git a/src/select/select.c b/src/select/select.c
+index 26d9c22..1adb9de 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -7,6 +7,7 @@
+ 
+ #include <assert.h>
+ #include <stdint.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ #include <libwapcaplet/libwapcaplet.h>
+@@ -2734,6 +2735,152 @@ static inline bool match_nth(int32_t a, int32_t b, int32_t count)
+ 	}
+ }
+ 
++/**
++ * Match one :has() argument's compound against a candidate node
++ * (VitaSurf).
++ */
++static css_error match_has_compound(css_select_ctx *ctx, void *n,
++		const css_selector *sub, css_select_state *state,
++		bool *match)
++{
++	css_error error;
++
++	*match = false;
++
++	if (sub->data.qname.name != ctx->str.universal) {
++		error = state->handler->node_has_name(state->pw, n,
++				&sub->data.qname, match);
++		if (error != CSS_OK)
++			return error;
++		if (*match == false)
++			return CSS_OK;
++	}
++
++	return match_details(ctx, n, &sub->data, state, match, NULL);
++}
++
++/**
++ * Match a :has() detail (VitaSurf).
++ *
++ * The arguments are a chain of compounds (see parseHasArgs in
++ * parse/language.c), each with the combinator that relates it to the
++ * subject in its data.comb. The subject matches when any argument
++ * finds an element: a descendant for CSS_COMBINATOR_NONE, a child for
++ * PARENT, the next sibling element for SIBLING and any later sibling
++ * for GENERIC_SIBLING. The descendant walk is depth first without
++ * recursion, climbing back through parent_node until it reaches the
++ * subject again.
++ *
++ * \param[in]  ctx    Selection context.
++ * \param[in]  node   Subject node.
++ * \param[in]  sub    First argument compound.
++ * \param[in]  state  Selection state.
++ * \param[out] match  Set to whether any argument matched.
++ * 
++eturn CSS_OK on success, appropriate error otherwise.
++ */
++static css_error match_has(css_select_ctx *ctx, void *node,
++		const css_selector *sub, css_select_state *state,
++		bool *match)
++{
++	const css_select_handler *h = state->handler;
++	css_error error;
++
++	*match = false;
++
++	if (h->first_child_node == NULL || h->next_sibling_node == NULL)
++		return CSS_OK;
++
++	for (; sub != NULL; sub = sub->combinator) {
++		void *n = NULL;
++
++		switch (sub->data.comb) {
++		case CSS_COMBINATOR_SIBLING:
++		case CSS_COMBINATOR_GENERIC_SIBLING:
++			if (node == state->node) {
++				state->node_data->flags |=
++						CSS_NODE_FLAGS_TAINT_SIBLING;
++			}
++			error = h->next_sibling_node(state->pw, node, &n);
++			if (error != CSS_OK)
++				return error;
++			while (n != NULL) {
++				error = match_has_compound(ctx, n, sub, state,
++						match);
++				if (error != CSS_OK)
++					return error;
++				if (*match ||
++				    sub->data.comb == CSS_COMBINATOR_SIBLING)
++					break;
++				error = h->next_sibling_node(state->pw, n, &n);
++				if (error != CSS_OK)
++					return error;
++			}
++			break;
++
++		case CSS_COMBINATOR_PARENT:
++			error = h->first_child_node(state->pw, node, &n);
++			if (error != CSS_OK)
++				return error;
++			while (n != NULL) {
++				error = match_has_compound(ctx, n, sub, state,
++						match);
++				if (error != CSS_OK)
++					return error;
++				if (*match)
++					break;
++				error = h->next_sibling_node(state->pw, n, &n);
++				if (error != CSS_OK)
++					return error;
++			}
++			break;
++
++		default:
++			error = h->first_child_node(state->pw, node, &n);
++			if (error != CSS_OK)
++				return error;
++			while (n != NULL) {
++				void *next = NULL;
++
++				error = match_has_compound(ctx, n, sub, state,
++						match);
++				if (error != CSS_OK)
++					return error;
++				if (*match)
++					break;
++
++				/* Down, else along, else up until there is
++				 * an along, stopping at the subject. */
++				error = h->first_child_node(state->pw, n,
++						&next);
++				if (error != CSS_OK)
++					return error;
++				while (next == NULL) {
++					error = h->next_sibling_node(state->pw,
++							n, &next);
++					if (error != CSS_OK)
++						return error;
++					if (next != NULL)
++						break;
++					error = h->parent_node(state->pw, n,
++							&n);
++					if (error != CSS_OK)
++						return error;
++					if (n == NULL || n == node)
++						break;
++				}
++				n = next;
++			}
++			break;
++		}
++
++		if (*match)
++			break;
++	}
++
++	return CSS_OK;
++}
++
+ css_error match_detail(css_select_ctx *ctx, void *node,
+ 		const css_selector_detail *detail, css_select_state *state,
+ 		bool *match, css_pseudo_element *pseudo_element)
+@@ -2918,6 +3065,11 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 		} else if (detail->qname.name == ctx->str.checked) {
+ 			error = state->handler->node_is_checked(state->pw,
+ 					node, match);
++		} else if (detail->qname.name == ctx->str.has &&
++				detail->value_type ==
++				CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++			error = match_has(ctx, node, detail->value.selector,
++					state, match);
+ 		} else {
+ 			*match = false;
+ 		}
+diff --git a/src/select/strings.c b/src/select/strings.c
+index abd0ee6..9b5fa6b 100644
+--- a/src/select/strings.c
++++ b/src/select/strings.c
+@@ -189,6 +189,12 @@ css_error css_select_strings_intern(css_select_strings *str)
+ 	if (error != lwc_error_ok)
+ 		return css_error_from_lwc_error(error);
+ 
++	error = lwc_intern_string(
++			"has", SLEN("has"),
++			&str->has);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
+ 	error = lwc_intern_string(
+ 			"inline-size", SLEN("inline-size"),
+ 			&str->inline_size);
+@@ -242,6 +248,7 @@ void css_select_strings_unref(css_select_strings *str)
+ 
+ 	lwc_string_unref(str->width);
+ 	lwc_string_unref(str->height);
++	lwc_string_unref(str->has);
+ 	lwc_string_unref(str->inline_size);
+ 	lwc_string_unref(str->block_size);
+ 	lwc_string_unref(str->prefers_color_scheme);
+diff --git a/src/select/strings.h b/src/select/strings.h
+index c7d1409..2caeb50 100644
+--- a/src/select/strings.h
++++ b/src/select/strings.h
+@@ -44,6 +44,7 @@ typedef struct {
+ 	lwc_string *height;
+ 	/* Container query size features (@container is
+ 	 * evaluated as a media query against the viewport). */
++	lwc_string *has;
+ 	lwc_string *inline_size;
+ 	lwc_string *block_size;
+ 	lwc_string *prefers_color_scheme;
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 88f23ae..db2c7db 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -1076,6 +1076,10 @@ css_error css__stylesheet_selector_destroy(css_stylesheet *sheet,
+ 					CSS_SELECTOR_DETAIL_VALUE_STRING &&
+ 					detail->value.string != NULL) {
+ 				lwc_string_unref(detail->value.string);
++			} else if (detail->value_type ==
++					CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++				css__stylesheet_selector_destroy(sheet,
++						detail->value.selector);
+ 			}
+ 
+ 			if (detail->next)
+@@ -1094,6 +1098,10 @@ css_error css__stylesheet_selector_destroy(css_stylesheet *sheet,
+ 		if (detail->value_type == CSS_SELECTOR_DETAIL_VALUE_STRING &&
+ 				detail->value.string != NULL) {
+ 			lwc_string_unref(detail->value.string);
++		} else if (detail->value_type ==
++				CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++			css__stylesheet_selector_destroy(sheet,
++					detail->value.selector);
+ 		}
+ 
+ 		if (detail->next)
+@@ -1196,8 +1204,22 @@ css_error css__stylesheet_selector_append_specific(css_stylesheet *sheet,
+ 
+ 	/* Update parent's specificity */
+ 	switch (detail->type) {
+-	case CSS_SELECTOR_CLASS:
+ 	case CSS_SELECTOR_PSEUDO_CLASS:
++		if (detail->value_type == CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++			/* :has() counts as its most specific argument */
++			const css_selector *s;
++			uint32_t most = 0;
++
++			for (s = detail->value.selector; s != NULL;
++					s = s->combinator) {
++				if (s->specificity > most)
++					most = s->specificity;
++			}
++			(*parent)->specificity += most;
++			break;
++		}
++		/* Fall through */
++	case CSS_SELECTOR_CLASS:
+ 	case CSS_SELECTOR_ATTRIBUTE:
+ 	case CSS_SELECTOR_ATTRIBUTE_EQUAL:
+ 	case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 22f5a7e..48768ec 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -58,7 +58,9 @@ typedef enum css_combinator {
+ 
+ typedef enum css_selector_detail_value_type {
+ 	CSS_SELECTOR_DETAIL_VALUE_STRING,
+-	CSS_SELECTOR_DETAIL_VALUE_NTH
++	CSS_SELECTOR_DETAIL_VALUE_NTH,
++	/** The relative selector list inside :has() (VitaSurf) */
++	CSS_SELECTOR_DETAIL_VALUE_SELECTOR
+ } css_selector_detail_value_type;
+ 
+ typedef union css_selector_detail_value {
+@@ -67,6 +69,13 @@ typedef union css_selector_detail_value {
+ 		int32_t a;
+ 		int32_t b;
+ 	} nth;				/**< Data for x = an + b */
++	/**
++	 * Owned by the detail. One compound per :has() argument, the
++	 * alternatives chained through their combinator pointers, each
++	 * with the combinator that relates it to the subject in its
++	 * data.comb (CSS_COMBINATOR_NONE meaning descendant).
++	 */
++	struct css_selector *selector;
+ } css_selector_detail_value;
+ 
+ typedef struct css_selector_detail {
+@@ -77,7 +86,7 @@ typedef struct css_selector_detail {
+ 		     comb       : 3,		/**< Type of combinator */
+ 		     next       : 1,		/**< Another selector detail
+ 						 * follows */
+-		     value_type : 1,		/**< Type of value field */
++		     value_type : 2,		/**< Type of value field */
+ 		     negate     : 1;		/**< Detail match is inverted */
+ } css_selector_detail;
+ 
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index 6e9b7be..7b9edbc 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -42,3 +42,4 @@ transform.dat			transform translate tests
+ animation.dat			animation, keyframes and background-clip tests
+ boxshadow.dat			box-shadow tests
+ container.dat			container query tests
++has.dat			:has() selectors (VitaSurf)
+diff --git a/test/data/parse2/has.dat b/test/data/parse2/has.dat
+new file mode 100644
+index 0000000..b107aaa
+--- /dev/null
++++ b/test/data/parse2/has.dat
+@@ -0,0 +1,52 @@
++#data
++div:has(img) {}
++#errors
++#expected
++| div:has(img)
++#reset
++
++#data
++.card:has(> .title, > p) {}
++#errors
++#expected
++| .card:has(> .title, > p)
++#reset
++
++#data
++label:has(input:checked) {}
++#errors
++#expected
++| label:has(input:checked)
++#reset
++
++#data
++li:has(+ li.x) {}
++#errors
++#expected
++| li:has(+ li.x)
++#reset
++
++#data
++h2:has(~ p) {}
++#errors
++#expected
++| h2:has(~ p)
++#reset
++
++#data
++div:has(ul > li) {}
++#errors
++#expected
++#reset
++
++#data
++div:has(:has(p)) {}
++#errors
++#expected
++#reset
++
++#data
++div:has() {}
++#errors
++#expected
++#reset
+diff --git a/test/data/select/INDEX b/test/data/select/INDEX
+index 40ab62a..cb0ed4d 100644
+--- a/test/data/select/INDEX
++++ b/test/data/select/INDEX
+@@ -7,3 +7,4 @@ defaulting.dat		Explicit defaulting tests
+ calc.dat		Tests involving calc
+ counter.dat		counter-increment/counter-reset named counters
+ grid.dat		Grid properties (VitaSurf)
++has.dat			:has() matching (VitaSurf)
+diff --git a/test/data/select/has.dat b/test/data/select/has.dat
+new file mode 100644
+index 0000000..5ad8c62
+--- /dev/null
++++ b/test/data/select/has.dat
+@@ -0,0 +1,125 @@
++#tree screen
++| div*
++|  class=a
++|  span
++|   img
++#ua
++div { display: block; }
++#author
++.a:has(img) { color: #0f0; }
++#errors
++#expected
++align-content: stretch
++align-items: stretch
++align-self: auto
++background-attachment: scroll
++background-color: #00000000
++background-image: none
++background-position: 0% 0%
++background-repeat: repeat
++border-collapse: separate
++border-spacing: 0px 0px
++border-top-color: #ff00ff00
++border-right-color: #ff00ff00
++border-bottom-color: #ff00ff00
++border-left-color: #ff00ff00
++border-top-style: none
++border-right-style: none
++border-bottom-style: none
++border-left-style: none
++border-top-width: 2px
++border-right-width: 2px
++border-bottom-width: 2px
++border-left-width: 2px
++bottom: auto
++box-sizing: content-box
++break-after: auto
++break-before: auto
++break-inside: auto
++caption-side: top
++clear: none
++clip: auto
++color: #ff00ff00
++column-count: auto
++column-fill: balance
++column-gap: normal
++column-rule-color: #ff00ff00
++column-rule-style: none
++column-rule-width: 2px
++column-span: none
++column-width: auto
++content: normal
++counter-increment: none
++counter-reset: none
++cursor: auto
++direction: ltr
++display: block
++empty-cells: show
++fill-opacity: 1.000
++flex-basis: auto
++flex-direction: row
++flex-grow: 0.000
++flex-shrink: 1.000
++flex-wrap: nowrap
++float: none
++font-family: sans-serif
++font-size: 16px
++font-style: normal
++font-variant: normal
++font-weight: normal
++grid-auto-columns: auto
++grid-auto-flow: row
++grid-auto-rows: auto
++grid-column-end: auto
++grid-column-start: auto
++grid-row-end: auto
++grid-row-start: auto
++grid-template-columns: none
++grid-template-rows: none
++height: auto
++justify-content: flex-start
++left: auto
++letter-spacing: normal
++line-height: normal
++list-style-image: none
++list-style-position: outside
++list-style-type: disc
++margin-top: 0px
++margin-right: 0px
++margin-bottom: 0px
++margin-left: 0px
++max-height: none
++max-width: none
++min-height: 0px
++min-width: 0px
++opacity: 1.000
++order: 0
++outline-color: invert
++outline-style: none
++outline-width: 2px
++overflow-x: visible
++overflow-y: visible
++padding-top: 0px
++padding-right: 0px
++padding-bottom: 0px
++padding-left: 0px
++position: static
++quotes: none
++right: auto
++row-gap: normal
++stroke-opacity: 1.000
++table-layout: auto
++text-align: default
++text-decoration: none
++text-indent: 0px
++text-transform: none
++top: auto
++unicode-bidi: normal
++vertical-align: baseline
++visibility: visible
++white-space: normal
++width: auto
++word-spacing: normal
++writing-mode: horizontal-tb
++z-index: auto
++#reset
+diff --git a/test/dump.h b/test/dump.h
+index fe0c70a..6937034 100644
+--- a/test/dump.h
++++ b/test/dump.h
+@@ -282,6 +282,33 @@ void dump_selector_detail(css_selector_detail *detail, char **ptr)
+ 				**ptr = ')';
+ 				*ptr += 1;
+ 			}
++		} else if (detail->value_type ==
++				CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++			css_selector *sub;
++
++			**ptr = '(';
++			*ptr += 1;
++			for (sub = detail->value.selector; sub != NULL;
++					sub = sub->combinator) {
++				if (sub != detail->value.selector)
++					*ptr += sprintf(*ptr, ", ");
++				switch (sub->data.comb) {
++				case CSS_COMBINATOR_PARENT:
++					*ptr += sprintf(*ptr, "> ");
++					break;
++				case CSS_COMBINATOR_SIBLING:
++					*ptr += sprintf(*ptr, "+ ");
++					break;
++				case CSS_COMBINATOR_GENERIC_SIBLING:
++					*ptr += sprintf(*ptr, "~ ");
++					break;
++				default:
++					break;
++				}
++				dump_selector(sub, ptr);
++			}
++			**ptr = ')';
++			*ptr += 1;
+ 		} else {
+ 			*ptr += sprintf(*ptr, "(%dn+%d)",
+ 					detail->value.nth.a,
+diff --git a/test/select.c b/test/select.c
+index 4bab187..2eea898 100644
+--- a/test/select.c
++++ b/test/select.c
+@@ -226,6 +226,28 @@ static css_error sibling_node(void *pw, void *n, void **sibling)
+ 	return CSS_OK;
+ }
+ 
++static css_error first_child_node(void *pw, void *n, void **child)
++{
++	node *node = n;
++
++	UNUSED(pw);
++
++	*child = (void *) node->children;
++
++	return CSS_OK;
++}
++
++static css_error next_sibling_node(void *pw, void *n, void **sibling)
++{
++	node *node = n;
++
++	UNUSED(pw);
++
++	*sibling = (void *) node->next;
++
++	return CSS_OK;
++}
++
+ static css_error node_has_name(void *pw, void *n,
+ 		const css_qname *qname,
+ 		bool *match)
+@@ -851,6 +873,9 @@ static css_select_handler select_handler = {
+ 
+ 	set_libcss_node_data,
+ 	get_libcss_node_data,
++
++	first_child_node,
++	next_sibling_node,
+ };
+ 
+ static css_error resolve_url(void *pw,

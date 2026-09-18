@@ -1,0 +1,3 @@
+/* widened from print to all by a script long after the page was laid
+ * out, to check the cascade is rebuilt then too */
+#late { width: 250px; background: #ccf }

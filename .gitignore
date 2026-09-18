@@ -30,3 +30,4 @@ psp2core-*
 # run; listed here so an interrupted run leaves nothing to commit.
 *.vitaprobe.html
 *.probe.html
+__pycache__/

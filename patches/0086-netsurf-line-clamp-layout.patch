@@ -1,0 +1,104 @@
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 55ff38732..85d5a9e70 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -90,6 +90,8 @@ typedef enum {
+ 	CONVERT_CHILDREN = 1 << 11,  /* wanted children converting */
+ 	IS_REPLACED = 1 << 12,	/* box is a replaced element */
+ 	GRID_CONTAINER = 1 << 13, /* flex box laid out as a CSS grid (VitaSurf) */
++	CLAMP_ELLIPSIS = 1 << 15, /* last text run of a line-clamped block:
++				   * painted with an ellipsis (VitaSurf) */
+ 	OVERFLOW_VIEWPORT = 1 << 14 /* overflow propagates to the viewport, so
+ 				      * the box itself is visible (VitaSurf) */
+ } box_flags;
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index f0f4828ff..c3771fa8f 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -3578,6 +3578,30 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ 	 * shrink back to 'width' if no word is wider than 'width' (Or just set
+ 	 * curwidth = width and have the multiword lines wrap to the min width)
+ 	 */
++	/*
++	 * line-clamp (VitaSurf): the block shows this many lines and its
++	 * overflow, which the pattern always hides, takes the rest. The
++	 * lines beyond are still laid out, so that nothing else changes,
++	 * but the container's height stops at the last line shown, and
++	 * that line's final text run is marked to end in an ellipsis.
++	 */
++	int32_t clamp = 0;
++	int lines = 0, clamp_y = -1;
++	struct box *clamp_last = NULL;
++
++	{
++		/* the block the text belongs to, not the formatting
++		 * context it floats in */
++		struct box *owner = inline_container->parent;
++
++		if (owner == NULL || owner->style == NULL ||
++				css_computed_line_clamp(owner->style, &clamp)
++					!= CSS_LINE_CLAMP_SET)
++			clamp = 0;
++		else
++			clamp = FIXTOINT(clamp);
++	}
++
+ 	for (c = inline_container->children; c; ) {
+ 
+ 		NSLOG(layout, DEBUG, "c %p", c);
+@@ -3587,10 +3611,26 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ 				has_text_children, content, &next))
+ 			return false;
+ 		maxwidth = max(maxwidth,curwidth);
++		lines++;
++		if (clamp > 0 && lines == clamp) {
++			struct box *b;
++
++			clamp_y = y;
++			for (b = c; b != NULL && b != next; b = b->next) {
++				if (b->type == BOX_TEXT && b->length > 0)
++					clamp_last = b;
++			}
++		}
+ 		c = next;
+ 		first_line = false;
+ 	}
+ 
++	if (clamp > 0 && lines > clamp && clamp_y >= 0) {
++		y = clamp_y;
++		if (clamp_last != NULL)
++			clamp_last->flags |= CLAMP_ELLIPSIS;
++	}
++
+ 	inline_container->width = maxwidth;
+ 	inline_container->height = y;
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 3f9d14c0c..421e9e3fe 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1558,9 +1558,10 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 		}
+ 
+ 		if (block != NULL && box->length > 0 &&
+-				css_computed_text_overflow(block->style) ==
++				((css_computed_text_overflow(block->style) ==
+ 					CSS_TEXT_OVERFLOW_ELLIPSIS &&
+-				box_overflow_x(block) != CSS_OVERFLOW_VISIBLE) {
++				  box_overflow_x(block) != CSS_OVERFLOW_VISIBLE) ||
++				 (box->flags & CLAMP_ELLIPSIS))) {
+ 			static const char ellipsis[] = "\xe2\x80\xa6";
+ 			struct box *b;
+ 			int content_right, available, ell_width = 0;
+@@ -1577,7 +1578,10 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 					scale;
+ 			available = content_right - x;
+ 
+-			if (x + box->width * scale > content_right &&
++			/* a clamped run ends in the ellipsis whether or not
++			 * it reaches the edge: the lines after it are cut */
++			if ((x + box->width * scale > content_right ||
++					(box->flags & CLAMP_ELLIPSIS)) &&
+ 					available > 0) {
+ 				if (scale != 1.0) {
+ 					measure.size = fstyle.size * scale;

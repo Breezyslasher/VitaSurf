@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<!-- A pseudo element got a box and no text, so every ::before and
+     ::after drew nothing: the quotation marks a blockquote adds, the
+     separator between breadcrumbs, the glyph of an icon font, the label
+     a definition list writes before its item. Strings and attr() are
+     read now; counters and url() are still left out, and so is a pseudo
+     element on an inline parent.
+     Expected: five lines, each with its generated text against its own:
+     PRE before one, POST after two, a quotation mark before three, the
+     label before four, and BLOCKBEFORE on a line above five. -->
+<html><head><style>
+body { margin: 0; font: 16px/1 sans-serif }
+.b::before { content: "PRE " }
+.a::after { content: " POST" }
+.q::before { content: open-quote }
+.at::before { content: attr(data-label) ": " }
+.blk::before { content: "BLOCKBEFORE"; display: block }
+.up::before { content: "shout "; text-transform: uppercase }
+</style></head><body>
+<div class="b" id="b">one</div>
+<div class="a" id="a">two</div>
+<div class="q" id="q">three</div>
+<div class="at" id="at" data-label="Label">four</div>
+<div class="blk" id="blk">five</div>
+<div class="up" id="up">six</div>
+<script>
+setTimeout(function(){
+ function h(id){return Math.round(document.getElementById(id).getBoundingClientRect().height);}
+ /* a block whose ::before is inline stays one line high, and one
+    whose ::before is a block of its own is two lines high */
+ var line = h('b');
+ var ok = line > 0 && h('a')==line && h('q')==line && h('at')==line &&
+          h('up')==line && h('blk')==2*line;
+ console.log((ok?'PASS':'FAIL')+' generated content '+
+   [h('b'),h('a'),h('q'),h('at'),h('blk'),h('up')].join(' '));
+},500);
+</script></body></html>

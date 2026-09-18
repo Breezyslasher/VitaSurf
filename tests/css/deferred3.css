@@ -1,0 +1,3 @@
+/* preloaded, and promoted to a stylesheet by the link's own load
+ * handler: the other half of the deferred CSS pattern */
+#pre { width: 275px; background: #ffc }

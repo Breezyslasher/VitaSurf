@@ -1,0 +1,122 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index de0f1d99d..51fc21215 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -89,6 +89,44 @@ static nserror css_error_to_nserror(css_error error)
+ /**
+  * Callback for fetchcache() for stylesheets.
+  */
++/**
++ * Rebuild the selection context and the boxes after a stylesheet that
++ * arrived once the page was already converted (VitaSurf).
++ */
++static void html_css_late_rebuild(void *pw)
++{
++	html_content *c = pw;
++	css_select_ctx *fresh = NULL;
++	nserror err;
++
++	if (c->select_ctx == NULL || c->aborted) {
++		return;
++	}
++	/* other late sheets still arriving: the last one's arrival
++	 * schedules this again, so one rebuild serves them all */
++	if (c->base.active != 0) {
++		return;
++	}
++	/* a box conversion in progress reads the context it started with */
++	if (c->box_conversion_context != NULL) {
++		if (c->late_css_retries++ < 30) {
++			guit->misc->schedule(100, html_css_late_rebuild, c);
++		}
++		return;
++	}
++	if (html_css_new_selection_context(c, &fresh) != NSERROR_OK) {
++		return;
++	}
++	css_select_ctx_destroy(c->select_ctx);
++	c->select_ctx = fresh;
++
++	err = html_relayout(c);
++	if (err == NSERROR_INVALID && c->late_css_retries++ < 30) {
++		/* busy with the user or still being built: try again */
++		guit->misc->schedule(100, html_css_late_rebuild, c);
++	}
++}
++
+ static nserror
+ html_convert_css_callback(hlcache_handle *css,
+ 			  const hlcache_event *event,
+@@ -136,7 +174,24 @@ html_convert_css_callback(hlcache_handle *css,
+ 		break;
+ 	}
+ 
+-	if (html_can_begin_conversion(parent)) {
++	if (parent->select_ctx != NULL) {
++		/*
++		 * The page was styled and laid out already: this sheet is
++		 * one a script added, or a <style> whose text a script
++		 * changed (VitaSurf). It used to be ignored -- "NS layout
++		 * is static" -- which left every theme a page switches on
++		 * by appending a stylesheet, m.youtube.com's dark mode
++		 * among them, doing nothing. Going through the conversion
++		 * again is not the answer either, since that runs the
++		 * deferred scripts a second time; the selection context
++		 * is rebuilt from the sheet list and the boxes with it.
++		 */
++		if (event->type == CONTENT_MSG_DONE ||
++		    event->type == CONTENT_MSG_ERROR) {
++			parent->late_css_retries = 0;
++			guit->misc->schedule(0, html_css_late_rebuild, parent);
++		}
++	} else if (html_can_begin_conversion(parent)) {
+ 		html_begin_conversion(parent);
+ 	}
+ 
+@@ -461,9 +516,15 @@ bool html_css_process_style(html_content *c, dom_node *node)
+ 			break;
+ 	}
+ 
+-		/* Should already exist */
++	/*
++	 * A <style> the parser met has its sheet already. One a script
++	 * made and appended has none (VitaSurf): its text was set before
++	 * it was inserted, so no later modification would create it
++	 * either, and everything styled-components and its kind inject
++	 * was lost. Create it the way a modified one is re-read.
++	 */
+ 	if (i == c->stylesheet_count) {
+-		return false;
++		return html_css_update_style(c, node);
+ 	}
+ 
+ 	exc = dom_element_get_attribute(node, corestring_dom_media, &val);
+@@ -788,7 +849,14 @@ html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
+ 			origin = CSS_ORIGIN_USER;
+ 		}
+ 
+-		if (hsheet->sheet != NULL) {
++		/*
++		 * A sheet a script added is still fetching while an
++		 * earlier one has finished (VitaSurf): it has no content
++		 * to read yet, and asking asserts. It joins the context
++		 * built when it finishes.
++		 */
++		if (hsheet->sheet != NULL &&
++		    content_get_status(hsheet->sheet) == CONTENT_STATUS_DONE) {
+ 			sheet = nscss_get_stylesheet(hsheet->sheet);
+ 		}
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 5e65303df..de95d7088 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -158,6 +158,8 @@ typedef struct html_content {
+ 	struct html_stylesheet *stylesheets;
+ 	/**< Style selection context */
+ 	css_select_ctx *select_ctx;
++	/** retries of the rebuild a late stylesheet asks for (VitaSurf) */
++	unsigned late_css_retries;
+ 	/**< Style selection media specification */
+ 	css_media media;
+ 	/** CSS length conversion context for document. */

@@ -1,0 +1,429 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 51fc21215..1427cfe0a 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -86,6 +86,119 @@ static nserror css_error_to_nserror(css_error error)
+ }
+ 
+ 
++/**
++ * Whether a sheet's media attribute keeps it out of the screen cascade
++ * (VitaSurf).
++ *
++ * An empty attribute means every medium, as it does in a browser; only
++ * a list that names neither screen nor all excludes the sheet.
++ */
++static bool media_excludes_screen(dom_string *media)
++{
++	const char *text;
++
++	if (media == NULL) {
++		return false;
++	}
++
++	text = dom_string_data(media);
++	while (*text == ' ' || *text == '\t' || *text == '\n' ||
++	       *text == '\r' || *text == '\f') {
++		text++;
++	}
++
++	return *text != '\0' &&
++		strcasestr(dom_string_data(media), "screen") == NULL &&
++		strcasestr(dom_string_data(media), "all") == NULL;
++}
++
++
++/**
++ * Read an attribute of a stylesheet's element (VitaSurf).
++ *
++ * A change reports the new value before the DOM holds it, so when the
++ * attribute asked for is the one being changed the reported value is
++ * the answer. The caller owns the result.
++ */
++static dom_string *sheet_attribute(dom_node *node, dom_string *attr,
++				   dom_string *name, dom_string *value)
++{
++	dom_string *out = NULL;
++
++	if (name != NULL && dom_string_caseless_isequal(name, attr)) {
++		return value != NULL ? dom_string_ref(value) : NULL;
++	}
++	if (dom_element_get_attribute(node, attr, &out) != DOM_NO_ERR) {
++		return NULL;
++	}
++
++	return out;
++}
++
++
++/**
++ * Whether the sheet of this element stays out of the screen cascade
++ * (VitaSurf).
++ *
++ * Two things keep it out: a media list that names neither screen nor
++ * all, and a rel that does not say stylesheet yet, which is what a
++ * preload of a stylesheet looks like until a script promotes it.
++ *
++ * \param node   the LINK or STYLE element
++ * \param name   the attribute being changed, or NULL
++ * \param value  that attribute's new value, or NULL
++ */
++static bool css_sheet_unused(dom_node *node, dom_string *name,
++			     dom_string *value)
++{
++	dom_string *rel, *media;
++	bool unused;
++
++	if (node == NULL) {
++		return false;
++	}
++
++	media = sheet_attribute(node, corestring_dom_media, name, value);
++	unused = media_excludes_screen(media);
++	if (media != NULL) {
++		dom_string_unref(media);
++	}
++
++	/* a <style> has no rel, and is a stylesheet by being one */
++	rel = sheet_attribute(node, corestring_dom_rel, name, value);
++	if (rel != NULL) {
++		if (strcasestr(dom_string_data(rel), "stylesheet") == NULL) {
++			unused = true;
++		}
++		dom_string_unref(rel);
++	}
++
++	return unused;
++}
++
++
++/**
++ * Whether a link that is not a stylesheet preloads one (VitaSurf).
++ */
++static bool link_preloads_style(dom_node *node, dom_string *rel)
++{
++	dom_string *as;
++	bool style;
++
++	if (strcasestr(dom_string_data(rel), "preload") == NULL) {
++		return false;
++	}
++	if (dom_element_get_attribute(node, corestring_dom_as, &as) !=
++			DOM_NO_ERR || as == NULL) {
++		return false;
++	}
++	style = strcasecmp(dom_string_data(as), "style") == 0;
++	dom_string_unref(as);
++
++	return style;
++}
++
++
+ /**
+  * Callback for fetchcache() for stylesheets.
+  */
+@@ -153,6 +266,19 @@ html_convert_css_callback(hlcache_handle *css,
+ 		      nsurl_access(hlcache_handle_get_url(css)));
+ 		parent->base.active--;
+ 		NSLOG(netsurf, INFO, "%d fetches active", parent->base.active);
++		/*
++		 * The element the sheet came from gets its load event
++		 * (VitaSurf). A build that inlines the critical CSS ships
++		 * the rest as <link media="print" onload="this.media='all'">
++		 * so it does not hold the first paint up, and with no load
++		 * event that stylesheet never applied: openmediavault's
++		 * login page lost the whole of its Material CSS and drew
++		 * its form fields zero pixels wide.
++		 */
++		if (s->node != NULL) {
++			fire_generic_dom_event(corestring_dom_load, s->node,
++					       false, false);
++		}
+ 		break;
+ 
+ 	case CONTENT_MSG_ERROR:
+@@ -164,6 +290,10 @@ html_convert_css_callback(hlcache_handle *css,
+ 		s->sheet = NULL;
+ 		parent->base.active--;
+ 		NSLOG(netsurf, INFO, "%d fetches active", parent->base.active);
++		if (s->node != NULL) {
++			fire_generic_dom_event(corestring_dom_error, s->node,
++					       false, false);
++		}
+ 		break;
+ 
+ 	case CONTENT_MSG_POINTER:
+@@ -199,6 +329,40 @@ html_convert_css_callback(hlcache_handle *css,
+ }
+ 
+ 
++/* exported function documented in html/css.h */
++void html_css_link_changed(html_content *c, dom_node *node, dom_string *name,
++		dom_string *value)
++{
++	unsigned int i;
++	struct html_stylesheet *s;
++	bool unused;
++
++	for (i = 0, s = c->stylesheets; i != c->stylesheet_count; i++, s++) {
++		if (s->node != node) {
++			continue;
++		}
++		/* the new value comes from the change itself: the DOM
++		 * still holds the old one while it is being reported */
++		unused = css_sheet_unused(node, name, value);
++		if (unused == s->unused) {
++			return;
++		}
++		/*
++		 * The sheet has just joined the cascade, or just left it,
++		 * so the page has to be styled again (VitaSurf). This is
++		 * how a deferred stylesheet arrives: its own load handler
++		 * widens its media from print to all.
++		 */
++		s->unused = unused;
++		if (c->select_ctx != NULL) {
++			c->late_css_retries = 0;
++			guit->misc->schedule(0, html_css_late_rebuild, c);
++		}
++		return;
++	}
++}
++
++
+ static nserror
+ html_stylesheet_from_domnode(html_content *c,
+ 			     dom_node *node,
+@@ -506,8 +670,6 @@ bool html_css_update_style(html_content *c, dom_node *style)
+ bool html_css_process_style(html_content *c, dom_node *node)
+ {
+ 	unsigned int i;
+-	dom_string *val;
+-	dom_exception exc;
+ 	struct html_stylesheet *s;
+ 
+ 	/* Find sheet */
+@@ -527,15 +689,7 @@ bool html_css_process_style(html_content *c, dom_node *node)
+ 		return html_css_update_style(c, node);
+ 	}
+ 
+-	exc = dom_element_get_attribute(node, corestring_dom_media, &val);
+-	if (exc == DOM_NO_ERR && val != NULL) {
+-		if (strcasestr(dom_string_data(val), "screen") == NULL &&
+-				strcasestr(dom_string_data(val),
+-						"all") == NULL) {
+-			s->unused = true;
+-		}
+-		dom_string_unref(val);
+-	}
++	s->unused = css_sheet_unused(node, NULL, NULL);
+ 
+ 	return true;
+ }
+@@ -544,7 +698,7 @@ bool html_css_process_style(html_content *c, dom_node *node)
+ /* exported function documented in html/css.h */
+ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ {
+-	dom_string *rel, *type_attr, *media, *href;
++	dom_string *rel, *type_attr, *href;
+ 	struct html_stylesheet *stylesheets;
+ 	nsurl *joined;
+ 	dom_exception exc;
+@@ -558,11 +712,12 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	if (exc != DOM_NO_ERR || rel == NULL)
+ 		return true;
+ 
+-	if (strcasestr(dom_string_data(rel), "stylesheet") == NULL) {
++	if (strcasestr(dom_string_data(rel), "alternate") != NULL) {
++		/* Ignore alternate stylesheets */
+ 		dom_string_unref(rel);
+ 		return true;
+-	} else if (strcasestr(dom_string_data(rel), "alternate") != NULL) {
+-		/* Ignore alternate stylesheets */
++	} else if (strcasestr(dom_string_data(rel), "stylesheet") == NULL &&
++			link_preloads_style(node, rel) == false) {
+ 		dom_string_unref(rel);
+ 		return true;
+ 	}
+@@ -583,17 +738,6 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 		dom_string_unref(type_attr);
+ 	}
+ 
+-	/* media contains 'screen' or 'all' or not present */
+-	exc = dom_element_get_attribute(node, corestring_dom_media, &media);
+-	if (exc == DOM_NO_ERR && media != NULL) {
+-		if (strcasestr(dom_string_data(media), "screen") == NULL &&
+-		    strcasestr(dom_string_data(media), "all") == NULL) {
+-			dom_string_unref(media);
+-			return true;
+-		}
+-		dom_string_unref(media);
+-	}
+-
+ 	/* href='...' */
+ 	exc = dom_element_get_attribute(node, corestring_dom_href, &href);
+ 	if (exc != DOM_NO_ERR || href == NULL)
+@@ -624,9 +768,17 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	}
+ 
+ 	htmlc->stylesheets = stylesheets;
+-	htmlc->stylesheets[htmlc->stylesheet_count].node = NULL;
++	/*
++	 * The element is kept so the sheet can have its load event and so
++	 * its media can be read again later: a script that widens the
++	 * media of a sheet it deferred expects it to start applying
++	 * (VitaSurf). A sheet for another medium is fetched all the same,
++	 * as a browser fetches it, and simply stays out of the cascade.
++	 */
++	htmlc->stylesheets[htmlc->stylesheet_count].node = dom_node_ref(node);
+ 	htmlc->stylesheets[htmlc->stylesheet_count].modified = false;
+-	htmlc->stylesheets[htmlc->stylesheet_count].unused = false;
++	htmlc->stylesheets[htmlc->stylesheet_count].unused =
++			css_sheet_unused(node, NULL, NULL);
+ 
+ 	/* start fetch */
+ 	child.charset = htmlc->encoding;
+@@ -839,7 +991,9 @@ html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
+ 		/* TODO: We should probably pass the sheet in anyway, and let
+ 		 *       libcss handle the filtering.
+ 		 */
+-		if (hsheet->unused) {
++		if (hsheet->node != NULL ?
++		    css_sheet_unused(hsheet->node, NULL, NULL) :
++		    hsheet->unused) {
+ 			continue;
+ 		}
+ 
+diff --git a/content/handlers/html/css.h b/content/handlers/html/css.h
+index 35f6a61e9..76a626ddb 100644
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -104,6 +104,25 @@ bool html_css_process_style(struct html_content *htmlc, dom_node *node);
+  */
+ bool html_css_update_style(struct html_content *htmlc, dom_node *node);
+ 
++/**
++ * react to an attribute change on a LINK or STYLE element (VitaSurf)
++ *
++ * A sheet whose media no longer excludes the screen joins the cascade,
++ * as does a preload whose rel is promoted to stylesheet; one that goes
++ * the other way leaves it. Either way the page is styled again. This is
++ * what makes a deferred stylesheet take effect: a page that inlines its
++ * critical CSS links the rest for print, or preloads it, and widens it
++ * from the link's own load handler.
++ *
++ * \param htmlc the html content to process for
++ * \param node the DOM node whose attribute changed
++ * \param name the attribute's name
++ * \param value its new value, which the DOM does not hold yet while
++ *              the change is being reported
++ */
++void html_css_link_changed(struct html_content *htmlc, dom_node *node,
++		dom_string *name, dom_string *value);
++
+ 
+ 
+ #endif
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index 3424e0d2f..0c9c7f053 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -26,6 +26,8 @@
+ 
+ #include "utils/config.h"
+ #include "utils/utils.h"
++#include <dom/events/mutation_event.h>
++
+ #include "utils/corestrings.h"
+ #include "utils/nsoption.h"
+ #include "utils/log.h"
+@@ -798,6 +800,67 @@ dom_default_action_DOMSubtreeModified_cb(struct dom_event *evt, void *pw)
+ }
+ 
+ 
++/**
++ * Handle an attribute change on an element (VitaSurf).
++ *
++ * Only the stylesheet elements care: a page that defers its CSS links
++ * it for print and widens the media in the link's own load handler, and
++ * nothing then told the cascade the sheet had arrived.
++ */
++static void
++dom_default_action_DOMAttrModified_cb(struct dom_event *evt, void *pw)
++{
++	dom_event_target *node;
++	dom_node_type type;
++	dom_exception exc;
++	html_content *htmlc = pw;
++
++	exc = dom_event_get_target(evt, &node);
++	if ((exc != DOM_NO_ERR) || (node == NULL)) {
++		return;
++	}
++
++	exc = dom_node_get_node_type(node, &type);
++	if ((exc == DOM_NO_ERR) && (type == DOM_ELEMENT_NODE)) {
++		dom_html_element_type tag_type;
++
++		exc = dom_html_element_get_tag_type(node, &tag_type);
++		if (exc != DOM_NO_ERR) {
++			tag_type = DOM_HTML_ELEMENT_TYPE__UNKNOWN;
++		}
++
++		if ((tag_type == DOM_HTML_ELEMENT_TYPE_LINK ||
++		     tag_type == DOM_HTML_ELEMENT_TYPE_STYLE) &&
++		    nsoption_bool(author_level_css)) {
++			dom_string *name = NULL;
++
++			exc = dom_mutation_event_get_attr_name(
++					(dom_mutation_event *)evt, &name);
++			if (exc == DOM_NO_ERR && name != NULL) {
++				if (dom_string_caseless_isequal(name,
++						corestring_dom_media) ||
++				    dom_string_caseless_isequal(name,
++						corestring_dom_rel)) {
++					dom_string *value = NULL;
++
++					dom_mutation_event_get_new_value(
++						(dom_mutation_event *)evt,
++						&value);
++					html_css_link_changed(htmlc,
++						(dom_node *)node, name, value);
++					if (value != NULL) {
++						dom_string_unref(value);
++					}
++				}
++				dom_string_unref(name);
++			}
++		}
++	}
++
++	dom_node_unref(node);
++}
++
++
+ /**
+  * callback for default action finished
+  */
+@@ -827,6 +890,9 @@ html_dom_event_fetcher(dom_string *type,
+ 			return dom_default_action_DOMNodeInsertedIntoDocument_cb;
+ 		} else if (dom_string_isequal(type, corestring_dom_DOMSubtreeModified)) {
+ 			return dom_default_action_DOMSubtreeModified_cb;
++		} else if (dom_string_isequal(type,
++				corestring_dom_DOMAttrModified)) {
++			return dom_default_action_DOMAttrModified_cb;
+ 		}
+ 	} else if (phase == DOM_DEFAULT_ACTION_FINISHED) {
+ 		return dom_default_action_finished_cb;
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index 30a168721..15e9e14b5 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -202,6 +202,7 @@ CORESTRING_DOM_STRING(ArrowDown);
+ CORESTRING_DOM_STRING(ArrowLeft);
+ CORESTRING_DOM_STRING(ArrowRight);
+ CORESTRING_DOM_STRING(ArrowUp);
++CORESTRING_DOM_STRING(as);
+ CORESTRING_DOM_STRING(async);
+ CORESTRING_DOM_STRING(background);
+ CORESTRING_DOM_STRING(beforeprint);

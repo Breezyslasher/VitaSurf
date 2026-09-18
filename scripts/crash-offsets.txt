@@ -49,3 +49,72 @@
 #   actually got, and sizing the guard from that.
 0xec8a8
 0x133672
+# Build 233: undefined instruction on the main thread after leaving
+#   m.youtube.com for the history page and following a link back to it.
+#   The log stops immediately after YouTube's 1.7 MB player script ran.
+#   Resolved against build 233's own ELF (the disasm workflow): both
+#   offsets are inside newlib's _kill_r, the program counter on its
+#   closing "udf #255" and the link register on the instruction after
+#   its call to sceKernelGetProcessId. _kill_r turns SIGINT and SIGTERM
+#   into an exit, ignores two more, and traps on every other signal, so
+#   landing there means raise() was called with something else -- which
+#   is abort(), and on this build abort() is reached from a failed
+#   assert(). It is not a corrupted function pointer: a Thumb
+#   instruction sits at an even address, so an even program counter
+#   says nothing, and the first reading of this dump was wrong.
+#
+#   Which assertion it was the dump cannot say, so the build now names
+#   the failing expression, file and line in the log before it aborts.
+0x39e94e
+0x39e91b
+# Build 286: data abort on the main thread while github.com's stylesheets
+#   were converting. Resolved against build 286's own symbol map and the
+#   disasm workflow: the program counter was in newlib's _free_r and the
+#   caller css__stylesheet_selector_destroy, reached from parseSelector's
+#   error path, and the pointer being freed lay in the data segment --
+#   which is where a freed chunk's list link points, so the block had
+#   been freed already. The native monkey under valgrind on the saved
+#   GitHub sheets named it: parseGroupChain copies the details of an
+#   :is() argument's last compound into the enclosing selector and then
+#   destroys that compound, and a :has() detail's argument chain is a
+#   pointer, not a reference, so ":is(.a .b:has(.c))" freed the chain
+#   twice. Fixed by patch 0102, which hands the chain over.
+0x3b3e12
+0x8409f
+0x89317
+# Build 286: data abort on the main thread a few seconds into
+#   m.youtube.com, r0 = 0. Resolved against the same symbol map: the
+#   program counter was in fb_fill_scalar, called from fb_font_width
+#   for the toolbar's status text. fbtk builds its font styles on the
+#   stack and never set the families pointer, which the web font lookup
+#   of patch 0096 reads once a page has registered a face -- YouTube's
+#   Roboto was the first. Fixed by patch 0103.
+0x69c34
+0x6a031
+# Build 294: assertion "parent" in box_add_child on the main thread,
+#   about a second and a half after m.youtube.com's player script ran on
+#   a second page. Resolved against build 294's ELF (the disasm
+#   workflow): box_construct.c:959 in box_construct_element_after,
+#   reached from next_node's climb back up the tree during a box
+#   rebuild after script changes. An inline element with converted
+#   children had no containing block: every ancestor with a box was
+#   inline, or had none. Which element, the dump cannot say and the
+#   snapshot of the watch page does not reach that state offline, so
+#   patch 0106 logs the element's name and leaves its inline end out
+#   rather than aborting.
+0x1ed33
+0x1ef5f
+
+# Build 294: data abort in _free_r on the main thread, on Home
+#   Assistant's /auth/authorize page about twenty seconds after a layout
+#   rebuild. Resolved against build 294's ELF (the disasm workflow):
+#   _free_r+0x11e <- Curl_freeset+0x67 <- Curl_close <- curl_easy_cleanup
+#   <- fetch_curl_stop <- fetch_curl_poll <- fetcher_poll <- schedule_run.
+#   The faulting instruction is "str r2, [r0, #8]" with r0 = 0x100, and
+#   r0 was loaded from [r1 + 12], the bk link of a free chunk (r1 =
+#   0x84af6430) already on the small bin list. So a block freed earlier
+#   had bytes 8..11 overwritten with 0x100 after it was freed: a
+#   use-after-free write by whoever held that block, not a double free
+#   of the curl string being freed.
+0x3b44f6
+0x1be85b

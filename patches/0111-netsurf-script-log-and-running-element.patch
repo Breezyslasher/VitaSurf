@@ -1,0 +1,119 @@
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index de95d7088..1ecfe409f 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -371,6 +371,15 @@ bool html_redraw_inline_borders(struct box *box, struct rect b,
+ /* in html/script.c */
+ dom_hubbub_error html_process_script(void *ctx, dom_node *node);
+ 
++/**
++ * The script element whose inline text is running right now, or NULL.
++ *
++ * document.currentScript is read from it. An inline script is handed
++ * to the engine as text, so the element is kept here for the duration
++ * (VitaSurf).
++ */
++dom_node *html_script_running(void);
++
+ /**
+  * Fetch a module named by <link rel="modulepreload"> (VitaSurf).
+  *
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 13904aa7d..69952b934 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -33,6 +33,7 @@
+ #include "utils/corestrings.h"
+ #include "utils/log.h"
+ #include "utils/messages.h"
++#include "utils/utils.h"
+ #include "netsurf/content.h"
+ #include "javascript/js.h"
+ #include "content/content_protected.h"
+@@ -191,6 +192,12 @@ convert_script_async_cb(hlcache_handle *script,
+ 		NSLOG(netsurf, INFO, "script %s failed: %s",
+ 		      nsurl_access(hlcache_handle_get_url(script)),
+ 		      event->data.errordata.errormsg);
++		/* a page whose script never arrives is a blank page, and the
++		 * log said nothing about why (VitaSurf) */
++		vita_log("script: %s not loaded: %s",
++			 nsurl_access(hlcache_handle_get_url(script)),
++			 event->data.errordata.errormsg != NULL ?
++			 event->data.errordata.errormsg : "no reason given");
+ 
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+@@ -254,6 +261,12 @@ convert_script_defer_cb(hlcache_handle *script,
+ 		NSLOG(netsurf, INFO, "script %s failed: %s",
+ 		      nsurl_access(hlcache_handle_get_url(script)),
+ 		      event->data.errordata.errormsg);
++		/* a page whose script never arrives is a blank page, and the
++		 * log said nothing about why (VitaSurf) */
++		vita_log("script: %s not loaded: %s",
++			 nsurl_access(hlcache_handle_get_url(script)),
++			 event->data.errordata.errormsg != NULL ?
++			 event->data.errordata.errormsg : "no reason given");
+ 
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+@@ -341,6 +354,12 @@ convert_script_sync_cb(hlcache_handle *script,
+ 		NSLOG(netsurf, INFO, "script %s failed: %s",
+ 		      nsurl_access(hlcache_handle_get_url(script)),
+ 		      event->data.errordata.errormsg);
++		/* a page whose script never arrives is a blank page, and the
++		 * log said nothing about why (VitaSurf) */
++		vita_log("script: %s not loaded: %s",
++			 nsurl_access(hlcache_handle_get_url(script)),
++			 event->data.errordata.errormsg != NULL ?
++			 event->data.errordata.errormsg : "no reason given");
+ 
+ 		hlcache_handle_release(script);
+ 		s->data.handle = NULL;
+@@ -477,6 +496,10 @@ exec_src_script(html_content *c,
+ 					   CONTENT_SCRIPT,
+ 					   &nscript->data.handle);
+ 
++	if (ns_error != NSERROR_OK) {
++		vita_log("script: %s not fetched (%d)", nsurl_access(joined),
++			 (int) ns_error);
++	}
+ 
+ 	nsurl_unref(joined);
+ 
+@@ -511,6 +534,9 @@ exec_src_script(html_content *c,
+ 	return ret;
+ }
+ 
++/** the element whose inline text the engine is running (VitaSurf) */
++static dom_node *running_script = NULL;
++
+ static dom_hubbub_error
+ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ {
+@@ -548,14 +574,26 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ 	lwc_string_unref(lwcmimetype);
+ 
+ 	if (script_handler != NULL) {
++		/* a script that inserts a script runs it before it goes on,
++		 * so the outer element is put back afterwards */
++		dom_node *outer = running_script;
++
++		running_script = node;
+ 		script_handler(c->jsthread,
+ 			       (const uint8_t *)dom_string_data(script),
+ 			       dom_string_byte_length(script),
+ 			       "?inline script?");
++		running_script = outer;
+ 	}
+ 	return DOM_HUBBUB_OK;
+ }
+ 
++/* exported interface documented in html/private.h */
++dom_node *html_script_running(void)
++{
++	return running_script;
++}
++
+ 
+ /**
+  * Callback for a preloaded module (VitaSurf).

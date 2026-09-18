@@ -1,0 +1,124 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index be3663115..b6fed97b9 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -625,6 +625,7 @@ static bool html_box_masked(struct box *box)
+  */
+ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ 		float scale, const struct rect *clip,
++		const css_unit_ctx *unit_len_ctx,
+ 		const struct redraw_context *ctx)
+ {
+ 	css_color bgcol;
+@@ -648,14 +649,62 @@ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ 	}
+ 	mw = iw * scale;
+ 	mh = ih * scale;
+-	if (mw > pw || mh > ph) {
+-		/* contain */
+-		if ((long)mw * ph > (long)mh * pw) {
+-			mh = mh * pw / mw;
+-			mw = pw;
+-		} else {
+-			mw = mw * ph / mh;
+-			mh = ph;
++
++	/*
++	 * mask-size (VitaSurf). Left unset, the mask is fitted inside the
++	 * box without being enlarged and centred, which is what the
++	 * Codex icons this was written for expect. contain and cover
++	 * scale it to the box; lengths and percentages set it outright,
++	 * an axis left auto following the other.
++	 */
++	{
++		css_fixed hl = 0, vl = 0;
++		css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
++		uint8_t type = css_computed_mask_size(box->style, &hl, &hu,
++				&vl, &vu);
++
++		if (type == CSS_MASK_SIZE_COVER ||
++				type == CSS_MASK_SIZE_CONTAIN) {
++			bool cover = (type == CSS_MASK_SIZE_COVER);
++			bool wide = ((long) mw * ph > (long) mh * pw);
++
++			if (wide == !cover) {
++				mh = (long) mh * pw / mw;
++				mw = pw;
++			} else {
++				mw = (long) mw * ph / mh;
++				mh = ph;
++			}
++		} else if (type == CSS_MASK_SIZE_SET) {
++			int w = 0, h = 0;
++
++			if (hu == CSS_UNIT_PCT)
++				w = (int) (pw * FIXTOFLT(hl) / 100);
++			else if (hl != 0)
++				w = FIXTOINT(css_unit_len2device_px(box->style,
++						unit_len_ctx, hl, hu)) * scale;
++			if (vu == CSS_UNIT_PCT)
++				h = (int) (ph * FIXTOFLT(vl) / 100);
++			else if (vl != 0)
++				h = FIXTOINT(css_unit_len2device_px(box->style,
++						unit_len_ctx, vl, vu)) * scale;
++			if (w > 0 && h <= 0)
++				h = (int) ((long) w * mh / mw);
++			else if (h > 0 && w <= 0)
++				w = (int) ((long) h * mw / mh);
++			if (w > 0 && h > 0) {
++				mw = w;
++				mh = h;
++			}
++		} else if (mw > pw || mh > ph) {
++			/* contain, without enlarging */
++			if ((long)mw * ph > (long)mh * pw) {
++				mh = mh * pw / mw;
++				mw = pw;
++			} else {
++				mw = mw * ph / mh;
++				mh = ph;
++			}
+ 		}
+ 	}
+ 	if (mw <= 0 || mh <= 0) {
+@@ -673,6 +722,30 @@ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ 	}
+ 	data.x = x + (pw - mw) / 2;
+ 	data.y = y + (ph - mh) / 2;
++
++	/* mask-position (VitaSurf): unset means centred, as before */
++	{
++		css_fixed hl = 0, vl = 0;
++		css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
++
++		if (css_computed_mask_position(box->style, &hl, &hu, &vl,
++				&vu) == CSS_MASK_POSITION_SET) {
++			if (hu == CSS_UNIT_PCT)
++				data.x = x + (int) ((pw - mw) * FIXTOFLT(hl) /
++						100);
++			else
++				data.x = x + FIXTOINT(css_unit_len2device_px(
++						box->style, unit_len_ctx, hl,
++						hu)) * scale;
++			if (vu == CSS_UNIT_PCT)
++				data.y = y + (int) ((ph - mh) * FIXTOFLT(vl) /
++						100);
++			else
++				data.y = y + FIXTOINT(css_unit_len2device_px(
++						box->style, unit_len_ctx, vl,
++						vu)) * scale;
++		}
++	}
+ 	data.width = mw;
+ 	data.height = mh;
+ 	data.background_colour = nscss_color_to_ns(bgcol);
+@@ -2672,7 +2745,8 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	 * Codex-style icon buttons rely on this. */
+ 	if (html_box_masked(box)) {
+ 		return html_redraw_mask(x, y, padding_width, padding_height,
+-					box, scale, &r, ctx);
++					box, scale, &r, &html->unit_len_ctx,
++					ctx);
+ 	}
+ 
+ 	/* background colour and image for block level content and replaced

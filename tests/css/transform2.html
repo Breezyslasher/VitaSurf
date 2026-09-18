@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>rotate and scale transforms</title>
+<style>
+body { margin: 0; font-size: 16px; }
+.box { width: 100px; height: 50px; background: #ff0000; margin: 60px 0 60px 100px; }
+/* a: at 100,60: turned a quarter about its centre 150,85: corners land at 175,35 175,135 125,135 125,35 */
+.a { transform: rotate(90deg); }
+/* b: at 100,170: doubled about its centre 150,195: 50,145 to 250,245 */
+.b { transform: scale(2); }
+/* c: halved, with its text half size */
+.c { transform: scale(0.5); }
+/* d: scaled to nothing: paints nothing */
+.d { transform: scale(0); }
+/* e: at 100,500: turned an eighth about its top left corner: 100,500 171,571 135,606 65,535 */
+.e { transform: rotate(45deg); transform-origin: left top; }
+/* f: a scaled parent with a mirrored child: the child's text is at double size */
+.f { transform: scale(2); }
+.f span { display: inline-block; transform: scaleX(-1); }
+</style>
+</head>
+<body>
+<div class="box a"></div>
+<div class="box b"></div>
+<div class="box c">half</div>
+<div class="box d">gone</div>
+<div class="box e"></div>
+<div class="box f"><span>mirror</span></div>
+</body>
+</html>

@@ -1,0 +1,28 @@
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 43854fb6d..9a3a71ffe 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -597,6 +597,23 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 			*box_x -= scrollbar_get_offset(box->scroll_x);
+ 			*box_y -= scrollbar_get_offset(box->scroll_y);
+ 
++			/*
++			 * pointer-events: none asks for the tap to fall
++			 * through to whatever is underneath (VitaSurf).
++			 * Sites lay a transparent sheet over a dialog
++			 * that way, and an icon inside a button is
++			 * usually marked so the button gets the tap
++			 * rather than the picture. Its children may
++			 * still take one, as the property is inherited
++			 * and a child can ask for its tap back.
++			 */
++			if (box->style != NULL &&
++			    css_computed_pointer_events(box->style) ==
++					CSS_POINTER_EVENTS_NONE) {
++				skip_children = false;
++				continue;
++			}
++
+ 			if (physically)
+ 				return box;
+ 

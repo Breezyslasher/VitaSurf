@@ -1,0 +1,17 @@
+diff --git a/src/select/computed.c b/src/select/computed.c
+index f535507..0625ca6 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -1278,7 +1278,11 @@ uint8_t css_computed_##prop##_px(					\
+ 									\
+ 	if (type == (SET) && css__length_to_px(style, unit_ctx,		\
+ 			available_px, value, unit, px_out) == false) {	\
+-		*px_out = 0;						\
++		/* a value that needs a basis there is none for is not	\
++		 * zero: it is the property's own "not resolved" answer,\
++		 * and reporting zero made width: 100% inside a box	\
++		 * that shrinks to fit collapse the box (VitaSurf) */	\
++		type = (FALLBACK);					\
+ 	}								\
+ 	if (*px_out < 0) {						\
+ 		*px_out = 0;						\

@@ -1,0 +1,232 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 475bb8191..99777dce7 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2295,18 +2295,27 @@ static bool layout_apply_minmax_height(
+ 			basis = containing_block->height;
+ 		}
+ 
+-		/* max-height */
++		/* max-height, unless it is a share of a height nothing
++		 * has given, which is no limit at all (VitaSurf) */
+ 		if (css_computed_max_height_px(box->style, unit_len_ctx,
+ 				basis, &h) == CSS_MAX_HEIGHT_SET &&
+-				h < box->height) {
++				h < box->height &&
++				(basis >= 0 ||
++				 !lh__length_needs_basis(
++					css_computed_max_height_px,
++					box->style, unit_len_ctx))) {
+ 			box->height = h;
+ 			updated = true;
+ 		}
+ 
+-		/* min-height */
++		/* min-height, with the same reading of a percentage */
+ 		if (ns_computed_min_height_px(box->style, unit_len_ctx,
+ 				basis, &h) == CSS_MIN_HEIGHT_SET &&
+-				h > box->height) {
++				h > box->height &&
++				(basis >= 0 ||
++				 !lh__length_needs_basis(
++					ns_computed_min_height_px,
++					box->style, unit_len_ctx))) {
+ 			box->height = h;
+ 			updated = true;
+ 		}
+@@ -4116,6 +4125,21 @@ bool layout_block_context(
+ 			layout_block_add_scrollbar(box, BOTTOM);
+ 		}
+ 
++		/*
++		 * min-height and max-height were applied only while
++		 * walking back up out of a box's children, so a block
++		 * with nothing inside it never got them at all: a page
++		 * built on min-height: 100vh, which is most of them, drew
++		 * its content squashed at the top of an empty screen
++		 * (VitaSurf).
++		 */
++		if (box->style != NULL &&
++		    css_computed_position(box->style) !=
++				CSS_POSITION_ABSOLUTE) {
++			layout_apply_minmax_height(&content->unit_len_ctx,
++					box, NULL);
++		}
++
+ 		cy += box->height + box->padding[BOTTOM] +
+ 				box->border[BOTTOM].width;
+ 		cx -= box->x;
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index cd514964e..4df31012e 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -994,6 +994,24 @@ static bool layout_flex__place_line_items_main(
+ 			if (!layout_flex_item(ctx, item, b->width)) {
+ 				return false;
+ 			}
++		} else {
++			/*
++			 * The size the resolver worked out is the item's
++			 * height in a column, and it was never written
++			 * back: flex-grow did nothing at all in a column,
++			 * so a panel told to fill the height of its
++			 * container stayed as tall as its text (VitaSurf).
++			 */
++			int height = item->target_main_size -
++					lh__delta_outer_height(b);
++
++			if (height != b->height) {
++				b->height = height;
++
++				if (!layout_flex_item(ctx, item, b->width)) {
++					return false;
++				}
++			}
+ 		}
+ 
+ 		box_size_main = lh__box_size_main(ctx->horizontal, b);
+@@ -1231,12 +1249,29 @@ bool layout_flex(struct box *flex, int available_width,
+ 
+ 	available_width = min(available_width, flex->width);
+ 
+-	if (ctx->horizontal) {
+-		ctx->available_main = available_width;
+-		ctx->available_cross = ctx->flex->height;
+-	} else {
+-		ctx->available_main = ctx->flex->height;
+-		ctx->available_cross = available_width;
++	{
++		/*
++		 * A container told only how short it may not be is that
++		 * tall for the items inside it: min-height makes the
++		 * size definite, so an item stretches or grows into it
++		 * (Flexbox 9.4). It used to be applied after the items
++		 * were placed, where nothing could use it, and a page
++		 * whose layout rests on min-h-screen drew its content
++		 * squashed at the top (VitaSurf).
++		 */
++		int layout_height = ctx->flex->height;
++
++		if (layout_height == AUTO && min_height > 0) {
++			layout_height = min_height;
++		}
++
++		if (ctx->horizontal) {
++			ctx->available_main = available_width;
++			ctx->available_cross = layout_height;
++		} else {
++			ctx->available_main = layout_height;
++			ctx->available_cross = available_width;
++		}
+ 	}
+ 
+ 	NSLOG(flex, DEEPDEBUG, "box %p: available_main: %i",
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index b506e36d9..ce682a63c 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -136,6 +136,40 @@ static inline bool lh__box_is_inline_flow(const struct box *b)
+ 	       b->type == BOX_INLINE_END;
+ }
+ 
++/**
++ * Whether a vertical length is a share of a height nothing has given
++ * (VitaSurf).
++ *
++ * A percentage height whose containing block has no height of its own
++ * is simply auto (CSS 2.1 10.5), and a max-height written that way is
++ * none. libcss resolves what it is asked to resolve, so with no basis
++ * it answered zero, and a scroll pane of height 100% inside a box that
++ * grows to fit collapsed to its padding, with its content hanging out
++ * below. The accessor is asked twice, against two different bases, so
++ * that a calc() holding a percentage is caught as well as a plain one.
++ *
++ * \param get    The property's px accessor
++ * \param style  The computed style
++ * \param ctx    Length conversion context
++ * \return true if the value changes with the basis
++ */
++static inline bool lh__length_needs_basis(
++		uint8_t (*get)(const css_computed_style *,
++			       const css_unit_ctx *, int, int *),
++		const css_computed_style *style,
++		const css_unit_ctx *ctx)
++{
++	/* "small" is a macro in the Vita build, so neither name is free */
++	int at_zero = 0;
++	int at_thousand = 0;
++
++	get(style, ctx, 0, &at_zero);
++	get(style, ctx, 1000, &at_thousand);
++
++	return at_zero != at_thousand;
++}
++
++
+ /** Layout helper: Check whether box takes part in inline flow. */
+ static inline bool lh__box_is_flex_container(const struct box *b)
+ {
+@@ -612,10 +646,20 @@ static inline void layout_find_dimensions(
+ 			containing_block->height != AUTO &&
+ 			(css_computed_position(box->style) ==
+ 					CSS_POSITION_ABSOLUTE ||
+-				cbhtype == CSS_HEIGHT_SET)) {
++				cbhtype == CSS_HEIGHT_SET ||
++				lh__box_is_flex_item(containing_block))) {
+ 			/* Box is absolutely positioned or its containing
+ 			 * block has a valid specified height.
+-			 * (CSS 2.1 Section 10.5) */
++			 * (CSS 2.1 Section 10.5)
++			 *
++			 * A flex item's cross size is definite once flex
++			 * layout has stretched it, even though nothing
++			 * declared a height, and Flexbox 9.8 resolves a
++			 * percentage against it (VitaSurf). Immich's login
++			 * card holds a scroll pane of height 100%, which
++			 * had nothing to be a percentage of and collapsed
++			 * to its padding, leaving the form hanging out of
++			 * the card that clips it. */
+ 			basis = containing_block->height;
+ 		} else if ((!box->parent || !box->parent->parent) &&
+ 				viewport_height >= 0) {
+@@ -628,6 +672,10 @@ static inline void layout_find_dimensions(
+ 
+ 		if (htype != CSS_HEIGHT_SET) {
+ 			*height = AUTO;
++		} else if (basis < 0 && lh__length_needs_basis(
++				css_computed_height_px, style, unit_len_ctx)) {
++			/* a share of a height nothing has given is auto */
++			*height = AUTO;
+ 		}
+ 
+ 		/*
+@@ -707,19 +755,24 @@ static inline void layout_find_dimensions(
+ 	}
+ 
+ 	if (max_height) {
+-		/* TODO: handle percentage; -1 says there is no basis, so a
+-		 * percentage (or an expression holding one) reports none. */
++		/* -1 says there is no basis, so a percentage (or an
++		 * expression holding one) reports none rather than the
++		 * zero it would otherwise resolve to. */
+ 		if (css_computed_max_height_px(style, unit_len_ctx,
+-				-1, max_height) != CSS_MAX_HEIGHT_SET) {
++				-1, max_height) != CSS_MAX_HEIGHT_SET ||
++		    lh__length_needs_basis(css_computed_max_height_px,
++				style, unit_len_ctx)) {
+ 			/* Inadmissible */
+ 			*max_height = -1;
+ 		}
+ 	}
+ 
+ 	if (min_height) {
+-		/* TODO: handle percentage, as for max-height above. */
++		/* as for max-height above */
+ 		if (ns_computed_min_height_px(style, unit_len_ctx,
+-				-1, min_height) != CSS_MIN_HEIGHT_SET) {
++				-1, min_height) != CSS_MIN_HEIGHT_SET ||
++		    lh__length_needs_basis(ns_computed_min_height_px,
++				style, unit_len_ctx)) {
+ 			/* Inadmissible */
+ 			*min_height = 0;
+ 		}

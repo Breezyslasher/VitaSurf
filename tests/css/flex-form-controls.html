@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!-- A form control inside a flex or grid container was put back inline
+     after it had been blockified, so an anonymous box became the flex
+     item and the width the page gave the control went nowhere: every
+     text field in a modern login form came out a few pixels wide, and
+     only a tap on that sliver reached it. Flexbox 4 makes each element
+     child of the container an item of its own.
+     Expected: four grey bars, each holding a control that fills it: a
+     text field, a dropdown, a button and a text area. Below them a
+     field of its own width, and one 300 wide. -->
+<html><head><style>
+body { margin: 0; font: 16px/1 sans-serif }
+.box { width: 400px; background: #eee; margin-bottom: 6px }
+.flex { display: flex }
+.full { width: 100% }
+.one { flex: 1 }
+input, select, button, textarea { border: 0; padding: 0; margin: 0 }
+</style></head><body>
+<div class="box flex"><input id="i" class="full"></div>
+<div class="box flex"><select id="s" class="full"><option>x</option></select></div>
+<div class="box flex"><button id="b" class="full">go</button></div>
+<div class="box flex"><textarea id="t" class="one"></textarea></div>
+<div class="box"><input id="plain"></div>
+<div class="box"><input id="fixed" style="width:300px"></div>
+<script>
+setTimeout(function(){
+ function w(id){ return Math.round(document.getElementById(id).getBoundingClientRect().width); }
+ var r = ['i','s','b','t','plain','fixed'].map(w);
+ var ok = r[0] >= 396 && r[1] >= 396 && r[2] >= 396 && r[3] >= 396 &&
+          r[4] > 0 && r[4] < 396 && r[5] === 300;
+ console.log((ok ? 'PASS' : 'FAIL') + ' form controls as flex items ' + r.join(' '));
+},600);
+</script></body></html>

@@ -1,0 +1,36 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 0d6fc7c73..5b933f769 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -622,8 +622,17 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		return false;
+ 
+ 	/* If this is the root box, add it to the context */
+-	if (props.node_is_root)
++	if (props.node_is_root) {
+ 		ctx->root_box = box;
++		/*
++		 * rem lengths are resolved against the root's style through
++		 * the unit context, which until now pointed at the previous
++		 * tree's root style throughout a rebuild: that style was
++		 * freed with the old tree, so every rem read freed memory
++		 * (VitaSurf).
++		 */
++		ctx->content->unit_len_ctx.root_style = box->style;
++	}
+ 
+ 	/* The overflow of the root element propagates to the viewport, and
+ 	 * so does the body's when the root's is visible (CSS 2.1 11.1.1).
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index a5483834a..ce4ce60be 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1327,6 +1327,8 @@ nserror html_relayout(html_content *htmlc)
+ 	talloc_free(htmlc->bctx);
+ 	htmlc->bctx = NULL;
+ 	htmlc->layout = NULL;
++	/* the root style went with it; the new root sets it again */
++	htmlc->unit_len_ctx.root_style = NULL;
+ 	htmlc->pinned_boxes = 0;
+ 	htmlc->iframe = NULL;
+ 

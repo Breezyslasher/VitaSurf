@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!-- Tailwind v4 writes padding: calc(var(--spacing) * 8) and the margin
+     classes the same way. libcss's padding and margin shorthands only
+     accepted plain lengths, so p-8 and m-4 applied nothing. Each value of
+     the shorthand now goes through the side parser, which knows calc().
+     Expected: a blue box with 32px of padding on every side around its
+     text, offset 16px from the page edge by its margin, then a second
+     box with 8px top and bottom and 24px left and right padding; below
+     them the same two boxes again, with plain lengths, the same size. -->
+<html><head><style>
+:root { --spacing: .25rem; font-size: 16px; }
+.p8 { padding: calc(var(--spacing) * 8); margin: calc(var(--spacing) * 4); background: #acf; display: inline-block; }
+.px { padding: calc(var(--spacing) * 2) calc(var(--spacing) * 6); background: #fca; display: inline-block; }
+body { margin: 0 }
+.r8 { padding: 32px; margin: 16px; background: #acf; display: inline-block; }
+.rx { padding: 8px 24px; background: #fca; display: inline-block; }
+</style></head><body>
+<div class="p8">padded</div><br>
+<div class="px">two values</div>
+<br><div class="r8">padded</div><br>
+<div class="rx">two values</div>
+<script>
+setTimeout(function(){
+ function r(c){return document.querySelector('.'+c).getBoundingClientRect();}
+ var a=r('p8'), ra=r('r8'), b=r('px'), rb=r('rx');
+ var ok=a.width==ra.width && a.height==ra.height && a.left==16 && ra.left==16 &&
+        b.width==rb.width && b.height==rb.height && a.width>ra.width-1 && a.height>40;
+ console.log((ok?'PASS':'FAIL')+' padding shorthand calc '+[a.width,ra.width,a.height,ra.height,a.left,b.width,rb.width,b.height,rb.height].join(' '));
+},500);
+</script></body></html>

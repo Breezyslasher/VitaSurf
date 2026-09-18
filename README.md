@@ -85,6 +85,98 @@ whole page when a flex container was followed by a block with a top
 margin. Verified natively with NetSurf's monkey frontend on a set of test
 pages; not yet checked on hardware.
 
+CSS coverage was then widened by what a census of real stylesheets
+(`scripts/css-census.py`, run by the `CSS census` workflow) said sites
+actually send. Patches 0075 to 0084 add, in order: media query range
+syntax (`(width >= 40rem)`, which Tailwind v4 writes for every
+breakpoint and which libcss had evaluated wrongly) and `@container`
+evaluated against the viewport; the `:has()` selector, with NetSurf's
+`:checked`, `:enabled` and `:disabled` made real; at-rules nested inside
+`@media` (`@supports`, `@layer`, `@media` and `@keyframes` in a media
+block used to take the block with them); `clip-path: inset()`, the
+visually-hidden pattern, and `light-dark()`; forty-two properties that
+have no effect on a static page (transitions, `user-select`,
+`appearance`, scroll steering, font variation axes) accepted rather than
+dropped; `position: sticky` and `position: fixed` pinned to the viewport
+at redraw, painted above the content they overlap, with the framebuffer
+frontend redrawing instead of panning on such pages; and gradient
+backgrounds (`linear-gradient()`, the `-webkit-` forms, `radial-` and
+`conic-` as their average colour) painted as alpha-blended strips, with
+the knockout renderer taught that a translucent fill does not hide what
+is under it. Patches 0085 to 0090 add `-webkit-line-clamp`, `filter`
+(`blur`, `brightness`, `contrast`, `grayscale`, `invert`, `opacity`,
+`saturate`, `sepia` and `drop-shadow`, applied when the box is painted),
+`mask-size`, `mask-position` and the `mask` shorthand, and the
+`-webkit-` and `-moz-` spellings of flexbox, transforms, border radius,
+box shadow, background size and opacity as aliases of the unprefixed
+properties, with the old `-webkit-box-*` and other prefixed leftovers
+accepted and ignored. Patches 0091 and 0092 finish `transform`: a
+value is folded into one matrix, so `rotate()`, `scale()`, `skew()`,
+`matrix()` and their variants compose in order with the translation,
+`transform-origin` and the `rotate` and `scale` properties are read,
+and a box with such a transform is painted through a plotter layer
+that maps every call about its origin (a turned rectangle becomes a
+polygon, text is placed at its mapped anchor with its size scaled, a
+bitmap is resampled, and a box scaled to nothing paints nothing and
+takes no tap). The same batch reads Internet Explorer's `-ms-flex-*`
+spellings, with their `start`, `end`, `justify` and `distribute`
+keywords, as the standard properties. Patch 0093 draws `blur()`, the
+one filter function that was read and not drawn: the plotters cannot
+blur what they have painted, so each shape is softened on its own. A
+filled rectangle gets a solid core and rings of falling alpha across
+the radius each side of its edge, a bitmap is box-blurred twice in a
+copy with a transparent margin, a filled path takes the soft rectangle
+of its bounding box, and text and strokes fade towards the colour under
+the box by an amount that grows with the radius. `backdrop-filter`
+stays accepted and ignored, since it would need what is already on the
+screen. Patches 0094 and 0095 take the tail of the census: the box
+alignment keywords (`start`, `end`, `self-start`, `normal`, `left`,
+`right`, a leading `safe`), `justify-items` and `justify-self` with the
+`place-*` shorthands, applied to grid items; `text-shadow`, painted as
+a second pass under the text; `text-decoration-color`, `-thickness`,
+`-style` and `text-underline-offset`, with the shorthand reading all of
+them, drawn as dotted, dashed or double lines of the given colour and
+weight; `object-position` for fitted pictures; `stroke-width` on inline
+SVG; `all`; `env()` as its fallback or zero; a `polygon()` clip as the
+box around its points; and forty-odd names accepted and ignored. After
+this the census counts under two percent of declarations dropped on
+every fixture site. Patch 0096 fetches web fonts: the families an
+element's `font-family` names are looked up among the sheet's
+`@font-face` rules, the regular, bold, italic and bold italic faces of
+each are fetched once (TrueType and OpenType first, then WOFF, then
+WOFF2, which needs a FreeType built with brotli), handed to the
+framebuffer font engine as memory faces kept by family name for the
+life of the browser, and the page is laid out again when one lands.
+Faces are capped at 700 KB each and 2 MB in all; beyond that the
+bundled DejaVu faces stand in, as they did before. Each patch has a
+page under `tests/css/` that the monkey frontend checks; none of this
+batch has been verified on hardware yet, and the web font path in
+particular only has its fetch and selection checked there, since the
+monkey has no FreeType. Patches 0097 and 0098 evaluate `@supports`
+at parse time (a declaration test holds when the property is known
+and its value parses, `selector()` holds, `not`, `and` and `or`
+combine, and a block whose condition fails is dropped so its fallback
+applies), answer the media features a page asks about besides its
+size (orientation, hover and pointer as a touch screen with no hover,
+prefers-reduced-motion and its relatives as no preference, resolution
+as one device pixel per CSS pixel, colour, scripting, display-mode),
+paint `outline` as a ring outside the border box, draw inset box
+shadows on the background with their blur fading inward, and paint
+radial gradients as concentric discs instead of their average colour.
+Patches 0099 and 0100 take the three that were left: the second
+shadow of a `box-shadow` list is kept as a property of its own and
+drawn under the first, outer or inset; `::first-letter` gets a box of
+its own holding the leading punctuation and first character in the
+pseudo element's style, floated when the style floats it and inline
+otherwise; and `position: sticky` pins horizontally against `left`
+and `right` as it did vertically. Patch 0101 reads `::first-line`: a
+line is not known until it is laid out, so a block's first line is
+laid out once to find which text runs it holds, each of those is given
+the first-line style composed over its own, and the line is laid out
+again in that; a run that no longer fits goes back to its own style
+on the line after. `text-transform` in a first-line style is not
+applied, since the text was shaped at construction.
+
 Patch 0017 fixes a crash in libnsfb's scaled bitmap plotter: with a large
 image scrolled far past the clip rectangle, the source offset arithmetic
 overflowed 32 bits and the plotter read before the image (a data abort in
@@ -254,7 +346,10 @@ the Duktape VPK is the `VitaSurf-duktape` artifact and the startup line
 in the log names the engine. Creating an empty file named `verbose` in
 `ux0:data/VitaSurf/` turns NetSurf's verbose logging on at runtime in any
 build; the log also starts with a self-test of the path and clock
-assumptions the port relies on.
+assumptions the port relies on. A file named `dumplayout` in the same
+place writes the first four hundred boxes of each page it loads to the
+log, each with its size and where it ended up, which is how a page that
+comes out wrong on the device can be read here.
 
 `VITASURF_NATIVE=1 ./scripts/build-deps.sh` and
 `VITASURF_NATIVE=1 ./scripts/build-netsurf.sh` build the same libraries for
@@ -309,7 +404,7 @@ fails for every charset, so libparserutils is built with its own codecs and
 | Tap or Cross on a text field | Opens the system keyboard for that field |
 | Square | Reload |
 | Select | Toggle pointer mode: the D-pad nudges the pointer instead |
-| Start | Menu: bookmarks, history, home, JavaScript and image toggles, quit |
+| Start | Menu: bookmarks, history, downloads, home, Wi-Fi sign-in, zoom, JavaScript, image and dark mode toggles, quit |
 | Front touch | Tap to click, drag to scroll |
 | Select + Start | Quit |
 

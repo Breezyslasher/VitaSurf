@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<!-- Illustrator exports (Immich's logo) have a viewBox but no width or
+     height, and put their fills in a <style> element by class. The
+     graphic had no intrinsic size, so an <img> of it with only a height
+     took its width from the box it had before the graphic arrived, and
+     every shape was black because the classes were ignored.
+     Expected: a 96px red square with a green circle in it, the same at
+     48px, one 40 wide and 20 tall (its viewBox is 2:1) whose circle is
+     green because its id rule outranks a later class rule, a 24px red
+     square whose width attribute is a percentage, and, with no
+     size given, one as wide as the page allows and square, as CSS 2.1
+     10.3.2 sizes an image that has only an aspect ratio. -->
+<html><head><style>img { display: block; max-width: 100%; height: auto; margin: 4px }</style></head><body>
+<img id="a" style="height:96px" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cstyle%3E.bg{fill:%23f00}.dot{fill:%230f0}%3C/style%3E%3Crect class='bg' width='32' height='32'/%3E%3Ccircle class='dot' cx='16' cy='16' r='10'/%3E%3C/svg%3E">
+<img id="b" style="height:48px" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cstyle%3E.bg{fill:%23f00}.dot{fill:%230f0}%3C/style%3E%3Crect class='bg' width='32' height='32'/%3E%3Ccircle class='dot' cx='16' cy='16' r='10'/%3E%3C/svg%3E">
+<img id="c" style="height:20px" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 32'%3E%3Cstyle%3E rect { fill: %23f00 } %23dot, .none { fill: %230f0 } .dot { fill: %2300f } %3C/style%3E%3Crect width='64' height='32'/%3E%3Ccircle id='dot' class='dot' cx='32' cy='16' r='10'/%3E%3C/svg%3E">
+<img id="e" style="height:24px" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100%25' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' fill='%23f00'/%3E%3C/svg%3E">
+<img id="d" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23f00'/%3E%3C/svg%3E">
+<script>
+setTimeout(function(){
+ var r=['a','b','c','e','d'].map(function(i){var e=document.getElementById(i);var b=e.getBoundingClientRect();return [b.width,b.height];});
+ var ok=r[0][0]==96&&r[0][1]==96&&r[1][0]==48&&r[1][1]==48&&r[2][0]==40&&r[2][1]==20&&r[3][0]==24&&r[3][1]==24&&r[4][0]==r[4][1]&&r[4][0]>=700;
+ console.log((ok?'PASS':'FAIL')+' svg viewBox size '+JSON.stringify(r));
+},1000);
+</script></body></html>

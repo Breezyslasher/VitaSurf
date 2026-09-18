@@ -1,0 +1,24 @@
+<!DOCTYPE html><html dark><head><meta charset="utf-8"><style>
+:root { --bg: rgb(255,255,255); }
+html[dark] { --bg: rgb(15,15,15); }
+.host { --chip: rgb(0,128,0); }
+.host .chip { background: var(--chip); }
+#byclass { background: var(--bg); }
+</style></head><body>
+<div id="byclass">x</div>
+<div class="host"><div class="chip" id="chip">y</div></div>
+<pre id="out"></pre>
+<script>
+var o=document.getElementById('out');
+function T(n,v){o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+window.addEventListener('load',function(){setTimeout(function(){
+ T('a variable overridden on html[dark]', getComputedStyle(document.getElementById('byclass')).backgroundColor);
+ T('a variable a component sets for its children', getComputedStyle(document.getElementById('chip')).backgroundColor);
+},200);});
+</script></body></html>
+
+<!--
+  A variable a component declares for its own subtree reaches its
+  children, which is how a modern site themes a component; YouTube's
+  search bar is built this way.
+-->

@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>first-line</title>
+<style>
+body { margin: 0; font-size: 16px; }
+/* a: 120px wide: the first line holds what fits at the first-line size;
+   its runs paint red at 18pt, the runs on later lines black at 12pt */
+.a { width: 120px; margin: 20px; }
+.a::first-line { color: #ff0000; font-size: 24px; }
+/* b: an inline element inside the first line keeps its own colour where
+   the first-line style does not say otherwise */
+.b { width: 300px; margin: 20px; }
+.b::first-line { font-weight: bold; }
+.b em { color: #0000ff; }
+</style>
+</head>
+<body>
+<p class="a">one two three four five six seven</p>
+<p class="b">start <em>blue</em> end</p>
+</body>
+</html>

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<!-- document.currentScript names the script element running: an inline
+     one from the parser, one inserted by a script (while the outer one is
+     still the current script once the inner finishes), and null from a
+     timer. Expected console output ends in "ok" three times. -->
+<html><body>
+<script id="a">
+var got=[];
+got.push(document.currentScript && document.currentScript.id);
+var s=document.createElement('script'); s.id='b';
+s.textContent="got.push(document.currentScript && document.currentScript.id);";
+document.body.appendChild(s);
+got.push(document.currentScript && document.currentScript.id);
+console.log("parser and inserted:", got.join(",")==="a,b,a" ? "ok" : "FAIL "+got.join(","));
+setTimeout(function(){ console.log("from a timer:", document.currentScript===null ? "ok" : "FAIL "+document.currentScript); }, 50);
+</script>
+<script>console.log("second inline:", document.currentScript && document.currentScript.previousElementSibling && document.currentScript.previousElementSibling.id==="b" ? "ok" : "FAIL");</script>
+</body></html>

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>web fonts</title>
+<style>
+/* a family with a regular and a bold face: both fetched once, the first
+   usable source of each; the eot-only family is never fetched */
+@font-face { font-family: "TestFace"; src: url(missing.eot) format("embedded-opentype"), url(red20x10.png) format("truetype"); }
+@font-face { font-family: "TestFace"; font-weight: bold; src: url(red20x10.png); }
+@font-face { font-family: "Skipped"; src: url(missing.eot) format("embedded-opentype"); }
+body { font-family: "TestFace", sans-serif; }
+.b { font-weight: bold; }
+.s { font-family: Skipped, serif; }
+.again { font-family: testface; }
+</style>
+</head>
+<body>
+<p>regular</p>
+<p class="b">bold</p>
+<p class="s">skipped</p>
+<p class="again">again</p>
+</body>
+</html>

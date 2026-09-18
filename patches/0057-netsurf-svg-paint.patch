@@ -1,0 +1,176 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 659768f83..4a312d7f2 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -2017,17 +2017,111 @@ static dom_string *svg_qualified_name(dom_node *node)
+ 
+ 
+ static void svg_serialise_node(struct svg_buf *b, dom_node *node, bool root);
+-static void svg_serialise_open(struct svg_buf *b, dom_node *node);
++static void svg_serialise_open(struct svg_buf *b, dom_node *node,
++		const css_computed_style *style);
+ static void svg_serialise_children(struct svg_buf *b, dom_node *node);
+ static void svg_serialise_close(struct svg_buf *b, dom_node *node);
+ 
+ /** Write the attributes of an element, and the root's namespaces. */
++/*
++ * The paint the stylesheet chose (VitaSurf).
++ *
++ * libsvgtiny reads fill and stroke from attributes, and a site writes
++ * neither: it writes "fill: currentColor" in a stylesheet so that an
++ * icon takes the colour of the text around it. The two meet here, on
++ * the root of the markup that is about to be handed over -- fill and
++ * stroke inherit in SVG, so saying it once on the root reaches every
++ * shape inside that does not say otherwise.
++ *
++ * Only a value the page actually asked for is written. The initial
++ * value is the same black libsvgtiny already starts from, so leaving
++ * that case alone keeps a graphic that styles itself exactly as it was.
++ */
++static bool svg_paint_value(uint8_t type, css_color colour,
++			    const css_computed_style *style,
++			    char out[8])
++{
++	css_color current = 0;
++
++	/* fill and stroke share their value numbering */
++	switch (type) {
++	case CSS_FILL_NONE:
++		memcpy(out, "none", 5);
++		return true;
++	case CSS_FILL_CURRENT_COLOR:
++		css_computed_color(style, &current);
++		colour = current;
++		break;
++	case CSS_FILL_COLOR:
++		if (colour == 0xff000000) {
++			return false; /* the initial value; say nothing */
++		}
++		break;
++	default:
++		return false;
++	}
++
++	if ((colour >> 24) == 0) {
++		memcpy(out, "none", 5); /* nothing to see */
++		return true;
++	}
++
++	snprintf(out, 8, "#%02x%02x%02x",
++		 (unsigned)((colour >> 16) & 0xff),
++		 (unsigned)((colour >> 8) & 0xff),
++		 (unsigned)(colour & 0xff));
++
++	return true;
++}
++
++/** Write fill and stroke from the style, and say which ones it wrote. */
++static void svg_paint_attributes(struct svg_buf *b,
++				 const css_computed_style *style,
++				 bool *wrote_fill, bool *wrote_stroke)
++{
++	css_color colour = 0;
++	char value[8];
++	uint8_t type;
++
++	*wrote_fill = false;
++	*wrote_stroke = false;
++
++	if (style == NULL) {
++		return;
++	}
++
++	/*
++	 * The colour is read out through the pointer, so it has to be
++	 * fetched before it is passed: as one call it was an argument
++	 * evaluated against whatever the last one left behind, and every
++	 * plain colour came out as "none".
++	 */
++	type = css_computed_fill(style, &colour);
++	if (svg_paint_value(type, colour, style, value)) {
++		svg_buf_lit(b, " fill=\"");
++		svg_buf_lit(b, value);
++		svg_buf_lit(b, "\"");
++		*wrote_fill = true;
++	}
++
++	colour = 0;
++	type = css_computed_stroke(style, &colour);
++	if (svg_paint_value(type, colour, style, value)) {
++		svg_buf_lit(b, " stroke=\"");
++		svg_buf_lit(b, value);
++		svg_buf_lit(b, "\"");
++		*wrote_stroke = true;
++	}
++}
++
+ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+-				     bool root)
++				     bool root,
++				     const css_computed_style *style)
+ {
+ 	dom_namednodemap *attrs;
+ 	dom_exception exc;
+ 	uint32_t i, n = 0;
++	bool wrote_fill = false, wrote_stroke = false;
+ 
+ 	if (root) {
+ 		/*
+@@ -2040,6 +2134,7 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 		 */
+ 		svg_buf_lit(b, " xmlns=\"http://www.w3.org/2000/svg\""
+ 			       " xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
++		svg_paint_attributes(b, style, &wrote_fill, &wrote_stroke);
+ 	}
+ 
+ 	exc = dom_node_get_attributes(node, &attrs);
+@@ -2066,7 +2161,11 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 			size_t nl = dom_string_byte_length(name);
+ 
+ 			if (svg_name_ok(nd, nl) &&
+-			    !(nl >= 5 && strncmp(nd, "xmlns", 5) == 0)) {
++			    !(nl >= 5 && strncmp(nd, "xmlns", 5) == 0) &&
++			    !(wrote_fill && nl == 4 &&
++			      strncmp(nd, "fill", 4) == 0) &&
++			    !(wrote_stroke && nl == 6 &&
++			      strncmp(nd, "stroke", 6) == 0)) {
+ 				svg_buf_lit(b, " ");
+ 				svg_buf_append(b, nd, nl);
+ 				svg_buf_lit(b, "=\"");
+@@ -2134,7 +2233,7 @@ static void svg_serialise_node(struct svg_buf *b, dom_node *node, bool root)
+ 	svg_buf_lit(b, "<");
+ 	svg_buf_append(b, dom_string_data(name),
+ 		       dom_string_byte_length(name));
+-	svg_serialise_attributes(b, node, root);
++	svg_serialise_attributes(b, node, root, NULL);
+ 	svg_buf_lit(b, ">");
+ 	dom_string_unref(name);
+ 
+@@ -2157,7 +2256,8 @@ static void svg_serialise_node(struct svg_buf *b, dom_node *node, bool root)
+ }
+ 
+ /** Write an element's opening tag, with its namespaces if it is the root. */
+-static void svg_serialise_open(struct svg_buf *b, dom_node *node)
++static void svg_serialise_open(struct svg_buf *b, dom_node *node,
++			       const css_computed_style *style)
+ {
+ 	dom_string *name = svg_qualified_name(node);
+ 
+@@ -2167,7 +2267,7 @@ static void svg_serialise_open(struct svg_buf *b, dom_node *node)
+ 	svg_buf_lit(b, "<");
+ 	svg_buf_append(b, dom_string_data(name),
+ 		       dom_string_byte_length(name));
+-	svg_serialise_attributes(b, node, true);
++	svg_serialise_attributes(b, node, true, style);
+ 	svg_buf_lit(b, ">");
+ 	dom_string_unref(name);
+ }
+@@ -2514,7 +2614,7 @@ box_svg(dom_node *n,
+ 
+ 		svg_refs_collect(&refs, content->document, n, 0);
+ 
+-		svg_serialise_open(&buf, n);
++		svg_serialise_open(&buf, n, box->style);
+ 		if (refs.count > 0) {
+ 			svg_buf_lit(&buf, "<defs>");
+ 			for (i = 0; i < refs.count; i++) {

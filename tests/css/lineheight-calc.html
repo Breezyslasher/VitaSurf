@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<!-- Tailwind v4 sets line-height to calc(1.75 / 1.125), a unitless
+     number in a calc(). libcss resolved that to 0px, so every button and
+     input with a text size class collapsed to its padding and its label
+     was drawn above the box. A unitless calc() result is a multiple of
+     the font size, like a plain number.
+     Expected: three boxes of the same height, each with its text inside
+     it, followed by a fourth taller one (line-height 2). -->
+<html><head><style>
+:root { --lh: calc(1.75 / 1.125); --pad: 4px; }
+div { display: inline-block; background: #cde; margin: 4px; padding: var(--pad); font-size: 16px; }
+.a { line-height: 1.5556; }
+.b { line-height: calc(1.75 / 1.125); }
+.c { line-height: var(--lh); }
+.d { line-height: calc(1 + 1); }
+</style></head><body>
+<div class="a">plain number</div>
+<div class="b">calc number</div>
+<div class="c">var calc number</div>
+<div class="d">calc two</div>
+<script>
+setTimeout(function(){
+ var h=['a','b','c','d'].map(function(c){return document.querySelector('.'+c).getBoundingClientRect().height;});
+ var ok=Math.abs(h[0]-h[1])<=1 && Math.abs(h[0]-h[2])<=1 && h[3]>h[0]+6;
+ console.log((ok?'PASS':'FAIL')+' line-height calc heights '+h.join(' '));
+},500);
+</script></body></html>

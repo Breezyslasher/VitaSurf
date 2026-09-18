@@ -36,10 +36,21 @@ jobs:
             apk add bash cmake ninja git make pkgconf perl gperf flex bison \
                     zlib-dev libpng-dev
           elif command -v apt-get >/dev/null 2>&1; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                    bash cmake ninja-build git make pkg-config perl gperf flex bison \
-                    zlib1g-dev libpng-dev
+            # A mirror that has rotated a package out from under the index
+            # answers 404 and takes the whole job with it. Re-reading the
+            # index picks up the version that is actually there.
+            for attempt in 1 2 3; do
+              apt-get update
+              if DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                      --no-install-recommends \
+                      bash cmake ninja-build git make pkg-config perl gperf \
+                      flex bison zlib1g-dev libpng-dev; then
+                break
+              fi
+              [ "$attempt" != 3 ] || { echo "::error::apt install failed"; exit 1; }
+              echo "apt install failed, retrying ($attempt)"
+              sleep $((attempt * 10))
+            done
           elif command -v pacman >/dev/null 2>&1; then
             pacman -Sy --noconfirm bash cmake ninja git make pkgconf perl gperf flex bison zlib libpng
           else

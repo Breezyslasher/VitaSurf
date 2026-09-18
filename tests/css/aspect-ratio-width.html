@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<!-- aspect-ratio filled in a height from a width but never a width from
+     a height, so an empty inline block with h-10 aspect-square, which is
+     how Tailwind draws an avatar or an icon placeholder, came out with
+     no width at all. CSS Sizing 4 resolves an automatic width from the
+     ratio only where the width would otherwise come from the content: an
+     inline block, a float, or an absolutely positioned box. A block in
+     normal flow keeps the width of its containing block.
+     Expected: a red square, a blue box twice as wide as it is tall, a
+     green bar the full width of the page, a yellow box three times as
+     wide as tall, a cyan one four times, and a narrow magenta one that
+     kept the width it was given. -->
+<html><head><style>
+body { margin: 0; width: 400px }
+.sq { width: 100px; aspect-ratio: 1; background: #f00 }
+.ib { height: 50px; aspect-ratio: 2; background: #00f; display: inline-block }
+.blk { height: 50px; aspect-ratio: 2; background: #0f0 }
+.flt { float: left; height: 30px; aspect-ratio: 3; background: #ff0 }
+.abs { position: absolute; top: 200px; height: 20px; aspect-ratio: 4; background: #0ff }
+.both { width: 10px; height: 50px; aspect-ratio: 2; background: #f0f; display: inline-block }
+</style></head><body>
+<div class="sq"></div><div class="ib"></div><div class="blk"></div>
+<div style="clear:both"><div class="flt"></div></div>
+<div class="abs"></div><div class="both"></div>
+<script>
+setTimeout(function(){
+ var r = {};
+ ['sq','ib','blk','flt','abs','both'].forEach(function(c){
+  var b = document.querySelector('.'+c).getBoundingClientRect();
+  r[c] = [b.width, b.height];
+ });
+ var ok = r.sq[0]==100 && r.sq[1]==100 && r.ib[0]==100 && r.ib[1]==50 &&
+          r.blk[0]==400 && r.blk[1]==50 && r.flt[0]==90 && r.flt[1]==30 &&
+          r.abs[0]==80 && r.abs[1]==20 && r.both[0]==10 && r.both[1]==50;
+ console.log((ok?'PASS':'FAIL')+' aspect-ratio width '+JSON.stringify(r));
+},500);
+</script></body></html>

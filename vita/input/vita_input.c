@@ -868,6 +868,138 @@ static void flaresolverr_run(void *p)
 	nsurl_unref(url);
 }
 
+/**
+ * The name to print for a box in the layout dump (VitaSurf).
+ */
+static const char *dump_box_type(box_type type)
+{
+	switch (type) {
+	case BOX_BLOCK:            return "block";
+	case BOX_INLINE_CONTAINER: return "line";
+	case BOX_INLINE:           return "inline";
+	case BOX_TABLE:            return "table";
+	case BOX_TABLE_ROW:        return "row";
+	case BOX_TABLE_CELL:       return "cell";
+	case BOX_TABLE_ROW_GROUP:  return "rowgroup";
+	case BOX_FLOAT_LEFT:       return "floatleft";
+	case BOX_FLOAT_RIGHT:      return "floatright";
+	case BOX_INLINE_BLOCK:     return "inlineblock";
+	case BOX_BR:               return "br";
+	case BOX_TEXT:             return "text";
+	case BOX_INLINE_END:       return "inlineend";
+	case BOX_FLEX:             return "flex";
+	case BOX_INLINE_FLEX:      return "inlineflex";
+	default:                   return "box";
+	}
+}
+
+
+/**
+ * Write one box and everything in it to the log (VitaSurf).
+ *
+ * A page that comes out wrong on the device cannot be opened in a
+ * debugger and cannot be reproduced here without the site, so the
+ * shape of the page goes in the log instead: what each box is, where
+ * it ended up and how big it is. The count is capped, since a page of
+ * any size has thousands of boxes and the log is read by a person.
+ */
+static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
+{
+	char what[96];
+	char text[41];
+	struct box *child;
+	int x = 0, y = 0;
+	size_t n = 0;
+
+	if (box == NULL || *left == 0) {
+		return;
+	}
+	(*left)--;
+
+	what[0] = '\0';
+	if (box->node != NULL) {
+		dom_string *name = NULL;
+
+		if (dom_node_get_node_name(box->node, &name) == DOM_NO_ERR &&
+		    name != NULL) {
+			snprintf(what, sizeof(what), " <%.*s>",
+				 (int)dom_string_byte_length(name),
+				 dom_string_data(name));
+			dom_string_unref(name);
+		}
+	}
+
+	text[0] = '\0';
+	if (box->text != NULL && box->length > 0) {
+		n = box->length < sizeof(text) - 1 ?
+				box->length : sizeof(text) - 1;
+		memcpy(text, box->text, n);
+		text[n] = '\0';
+	}
+
+	box_coords(box, &x, &y);
+	vita_log("layout: %*s%s%s %dx%d at %d,%d%s%s",
+		 (int)(depth * 2), "", dump_box_type(box->type), what,
+		 box->width, box->height, x, y,
+		 n > 0 ? " " : "", text);
+
+	for (child = box->children; child != NULL; child = child->next) {
+		dump_box(child, depth + 1, left);
+	}
+	for (child = box->float_children; child != NULL;
+	     child = child->next_float) {
+		dump_box(child, depth + 1, left);
+	}
+}
+
+
+/**
+ * Log the boxes of the page in the window, if the flag file asks.
+ */
+static void dump_layout(struct gui_window *gw, bool force)
+{
+	struct hlcache_handle *h;
+	struct box *root;
+	unsigned int left = 400;
+
+	if (gw == NULL) {
+		return;
+	}
+	if (force == false && vita_layout_dump_requested() == 0) {
+		return;
+	}
+	h = browser_window_get_content(gw->bw);
+	if (h == NULL || content_get_type(h) != CONTENT_HTML) {
+		return;
+	}
+	root = html_get_box_tree(h);
+	if (root == NULL) {
+		return;
+	}
+	vita_log("layout: the first %u boxes of the page, "
+		 "size then position", left);
+	dump_box(root, 0, &left);
+	vita_log("layout: end of the boxes%s",
+		 left == 0 ? " (there are more)" : "");
+}
+
+
+/* Exported: the scripts on a page build most of it after the load, so
+ * the boxes worth reading are the ones the rebuild leaves behind. */
+void vita_input_dump_layout(void)
+{
+	dump_layout(the_gw, false);
+}
+
+
+/* Exported: the same dump on demand, from the menu, with no flag file
+ * to create first. */
+void vita_input_dump_layout_now(void)
+{
+	dump_layout(the_gw, true);
+}
+
+
 void vita_input_load_finished(struct gui_window *gw)
 {
 	nsurl *url = NULL;
@@ -882,6 +1014,7 @@ void vita_input_load_finished(struct gui_window *gw)
 	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
+		dump_layout(gw, false);
 		{
 			/*
 			 * Say what is left over as well as what was

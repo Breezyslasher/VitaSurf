@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>aspect ratio</title><style>
+ body { margin: 0; }
+ div { background: #ddd; }
+ #wide   { width: 160px; aspect-ratio: 16 / 9; }
+ #square { width: 100px; aspect-ratio: 1; }
+ #told   { width: 160px; height: 40px; aspect-ratio: 16 / 9; }
+ #none   { width: 160px; }
+</style></head>
+<body>
+<div id="wide"></div><div id="square"></div>
+<div id="told"></div><div id="none"></div>
+<pre id="out"></pre>
+<script>
+/* aspect-ratio gives a box its shape when only its width is known. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function h(id){ return Math.round(
+  document.getElementById(id).getBoundingClientRect().height); }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('16 by 9 from a width of 160', h('wide'));
+  T('a square from a width of 100', h('square'));
+  T('a height that was asked for wins', h('told'));
+  T('no ratio leaves it empty', h('none'));
+}, 200); });
+</script></body></html>

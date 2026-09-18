@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>animation rest state</title><style>
+ body { margin: 0; background: #fff; color: #000; }
+ div.b { width: 100px; height: 20px; background: #ddd; }
+ /* width stands in for opacity: it is what the harness can measure, and
+    the machinery is the same for every property */
+ @keyframes grow { from { width: 0; } to { width: 60px; } }
+ @keyframes slideIn { 0% { width: 0; margin-left: 40px; }
+                      100% { width: 60px; margin-left: 10px; } }
+ @-webkit-keyframes pulse { 0%, 100% { width: 60px; } 50% { width: 80px; } }
+ @keyframes multi { to { height: 30px; } 100% { width: 60px; } }
+ /* a comment before an at-rule must not turn its blocks into nesting */
+ @keyframes aftercomment { to { width: 75px; } }
+ #fwd     { animation: grow .3s ease forwards; }
+ #both    { animation: .4s slideIn both; }
+ #nofill  { animation: grow .3s; }
+ #inf     { animation: pulse 1s infinite; }
+ #none    { animation: none; }
+ #missing { animation: nosuch 1s forwards; }
+ #imp     { width: 100px !important; animation: grow 1s forwards; }
+ #multi   { animation: multi 1s forwards; }
+ #long    { animation-name: grow; animation-fill-mode: forwards; }
+ #aftercomment { animation: aftercomment 1s forwards; }
+ #clip    { font-size: 24px; color: transparent; background: #1a73e8;
+            -webkit-background-clip: text; background-clip: text; }
+ #clipgrad{ font-size: 24px; color: transparent;
+            background-image: linear-gradient(90deg, red, blue);
+            -webkit-background-clip: text; background-clip: text; }
+</style></head>
+<body>
+<div class="b" id="fwd"></div>
+<div class="b" id="both"></div>
+<div class="b" id="nofill"></div>
+<div class="b" id="inf"></div>
+<div class="b" id="none"></div>
+<div class="b" id="missing"></div>
+<div class="b" id="imp"></div>
+<div class="b" id="multi"></div>
+<div class="b" id="long"></div>
+<div class="b" id="aftercomment"></div>
+<div id="clip">Cut out</div>
+<div id="clipgrad">Gradient</div>
+<pre id="out"></pre>
+<script>
+/* Nothing is animated here, so the one state drawn has to be where the
+   animation comes to rest: a card that fades in must not stay invisible. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function cs(id, p){ return getComputedStyle(document.getElementById(id))[p]; }
+function W(id){ return Math.round(document.getElementById(id).getBoundingClientRect().width); }
+function L(id){ return Math.round(document.getElementById(id).getBoundingClientRect().left); }
+window.addEventListener('load', function(){ setTimeout(function(){
+  function H(id){ return Math.round(document.getElementById(id).getBoundingClientRect().height); }
+  T('forwards rests at the last keyframe', W('fwd'));
+  T('both rests there too', W('both'));
+  T('both also takes the last margin', L('both'));
+  T('no fill mode rests at the base style', W('nofill'));
+  T('infinite shows the last keyframe', W('inf'));
+  T('none changes nothing', W('none'));
+  T('an unknown name changes nothing', W('missing'));
+  T('important still beats the keyframe', W('imp'));
+  T('two blocks selecting 100% both apply', W('multi') + ' ' + H('multi'));
+  T('the longhands work like the shorthand', W('long'));
+  T('keyframes after a comment are found', W('aftercomment'));
+  T('clipped text is painted in the background colour', cs('clip', 'color'));
+  T('clipped gradient text is painted in something visible', cs('clipgrad', 'color'));
+}, 200); });
+</script></body></html>

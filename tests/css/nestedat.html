@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>At-rules nested inside @media</title>
+<style>
+.box { width: 100px; height: 12px; background: #ccc; margin: 2px 0; }
+/* a: @supports inside a matching @media applies */
+@media screen { @supports (display: block) { .a { width: 60px; } } }
+/* b: @supports inside a non-matching @media does not, whatever it says */
+@media (min-width: 5000px) { @supports (display: block) { .b { width: 60px; } } }
+/* c: @media inside @media, both matching */
+@media screen { @media (min-width: 100px) { .c { width: 60px; } } }
+/* d: @media inside @media, inner not matching */
+@media screen { @media (min-width: 5000px) { .d { width: 60px; } } }
+/* e: @layer inside @media */
+@media screen { @layer base { .e { width: 60px; } } }
+/* f: a rule after a nested block is still inside the outer @media */
+@media (min-width: 5000px) { @supports (display: block) { .x { width: 1px; } } .f { width: 60px; } }
+/* g: a rule after the outer block is back at the top level */
+@media (min-width: 5000px) { @supports (display: block) { .x { width: 1px; } } } .g { width: 60px; }
+/* h: @keyframes inside @media is found by name */
+@media screen { @keyframes grow { from { width: 100px; } to { width: 60px; } } }
+.h { animation: grow 1s forwards; }
+/* i: @container inside @media */
+@media screen { @container (width >= 100px) { .i { width: 60px; } } }
+</style>
+</head>
+<body>
+<div class="box a"></div>
+<div class="box b"></div>
+<div class="box c"></div>
+<div class="box d"></div>
+<div class="box e"></div>
+<div class="box f"></div>
+<div class="box g"></div>
+<div class="box h"></div>
+<div class="box i"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function W(sel){ return Math.round(document.querySelector(sel).getBoundingClientRect().width); }
+var cases = [
+  ['supports inside matching media', '.a', 60],
+  ['supports inside non-matching media', '.b', 100],
+  ['media inside media, both match', '.c', 60],
+  ['media inside media, inner fails', '.d', 100],
+  ['layer inside media', '.e', 60],
+  ['rule after nested block stays inside outer media', '.f', 100],
+  ['rule after outer block is top level', '.g', 60],
+  ['keyframes inside media found', '.h', 60],
+  ['container inside media', '.i', 60]
+];
+window.addEventListener('load', function(){ setTimeout(function(){
+  for (var i = 0; i < cases.length; i++) {
+    var got = W(cases[i][1]);
+    T(cases[i][0], got + (got == cases[i][2] ? '' : ' (expected ' + cases[i][2] + ')'));
+  }
+}, 200); });
+</script>
+</body>
+</html>

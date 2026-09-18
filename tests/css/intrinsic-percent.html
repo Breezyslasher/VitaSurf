@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- CSS 2.1 10.3.5: when a box shrinks to fit, a percentage width on
+     its content resolves against nothing and counts as auto. Reporting
+     zero instead collapsed every such box, which is how Angular
+     Material's form fields, whose inner flex row is width: 100%, came
+     out zero pixels wide inside their inline-block.
+     Expected: four boxes of the same width as the text in them, or of
+     the width the fixed rule asks for, and PASS lines. -->
+<html><head><style>
+body { margin: 0; font: 14px/1.2 monospace }
+.wrap { display: inline-block; background: #eee }
+.fixed { width: 180px; background: #cfc }
+</style></head><body>
+<div class="wrap" id="a"><div style="width:100%">hello there</div></div>
+<div class="wrap" id="b"><div class="fixed">hello there</div></div>
+<div class="wrap" id="c"><div style="display:flex;width:100%"><div class="fixed">x</div></div></div>
+<div class="wrap" id="d">hello there</div>
+<script>
+setTimeout(function(){
+ function w(id){ return Math.round(document.getElementById(id).getBoundingClientRect().width); }
+ var a = w('a'), b = w('b'), c = w('c'), d = w('d');
+ console.log((a === d ? 'PASS' : 'FAIL') + ' percentage width counts as auto ' + a + ' vs ' + d);
+ console.log((b === 180 ? 'PASS' : 'FAIL') + ' fixed width sizes the box ' + b);
+ console.log((c === 180 ? 'PASS' : 'FAIL') + ' flex row with a percentage width ' + c);
+},600);
+</script></body></html>

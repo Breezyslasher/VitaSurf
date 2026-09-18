@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- A family is often served as one face per script, each with its own
+     unicode-range, and only one face per family can be installed in the
+     framebuffer font engine. Taking the first one took the Cyrillic
+     subset of Inter for an English page, and openmediavault's dashboard
+     drew every word as empty boxes. The Latin face is the one to fetch.
+     The descriptor also has to parse: a rule after it must still apply.
+     Expected: the paragraph is 300px wide and readable, and a PASS. -->
+<html><head><style>
+@font-face { font-family: Sub; src: url(nosuch-cyrillic.ttf) format("truetype");
+	unicode-range: U+0460-052F, U+2DE0-2DFF }
+@font-face { font-family: Sub; src: url(nosuch-greek.ttf) format("truetype");
+	unicode-range: U+0370-03FF }
+@font-face { font-family: Sub; src: url(nosuch-latin.ttf) format("truetype");
+	unicode-range: U+0000-00FF, U+0131, U+2000-206F }
+body { margin: 0 }
+#t { font-family: Sub, sans-serif; width: 300px }
+</style></head><body>
+<p id="t">Hello subsets</p>
+<script>
+setTimeout(function(){
+ var w = Math.round(document.getElementById('t').getBoundingClientRect().width);
+ console.log((w === 300 ? 'PASS' : 'FAIL') +
+	     ' rule after a unicode-range descriptor, width ' + w);
+},600);
+</script></body></html>

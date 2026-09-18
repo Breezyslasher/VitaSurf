@@ -1,0 +1,886 @@
+diff --git a/src/parse/Makefile b/src/parse/Makefile
+index 6d11096..db6e205 100644
+--- a/src/parse/Makefile
++++ b/src/parse/Makefile
+@@ -1,4 +1,5 @@
+ # Sources
+-DIR_SOURCES := parse.c language.c important.c propstrings.c font_face.c mq.c
++DIR_SOURCES := parse.c language.c important.c propstrings.c font_face.c mq.c \
++	nesting.c
+ 
+ include $(NSBUILD)/Makefile.subdir
+diff --git a/src/parse/nesting.c b/src/parse/nesting.c
+new file mode 100644
+index 0000000..d356724
+--- /dev/null
++++ b/src/parse/nesting.c
+@@ -0,0 +1,548 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The NetSurf Project
++ */
++
++/**
++ * \file
++ * Flatten CSS nesting into ordinary rules (VitaSurf).
++ *
++ * A rule written inside another rule is how CSS is written now, and
++ * libcss's parser has no notion of it: the nested rule is thrown away,
++ * and so is every declaration after it in the same block, because the
++ * declaration parser reads through the braces looking for a semicolon.
++ * One Tailwind 4 stylesheet measured here has 124 of them -- 49 :hover,
++ * 16 :focus, 13 ::after, and the rest -- so hover states, focus rings
++ * and generated content simply do not appear.
++ *
++ * Teaching the parser's state machine to accept a rule inside a
++ * declaration block is a large change to code every stylesheet goes
++ * through. Rewriting the source before it reaches the parser is a small
++ * one, and it is exact for what the syntax actually means: a nested
++ * rule is its parent's selector combined with its own.
++ *
++ *   .card { color: red; &:hover { color: blue } }
++ *     becomes
++ *   .card{color: red;}.card:hover{color: blue;}
++ *
++ * A sheet with no nesting in it is left alone entirely -- the scan below
++ * says so before anything is copied -- so this cannot change how any
++ * stylesheet that parses today is parsed.
++ */
++
++#include <string.h>
++#include <stdlib.h>
++
++#include "parse/nesting.h"
++
++/** Deepest nesting this will follow; beyond it the input is left alone. */
++#define NEST_MAX_DEPTH 24
++
++typedef struct {
++	char *data;
++	size_t len;
++	size_t alloc;
++	bool oom;
++} nbuf;
++
++typedef struct {
++	const char *s;
++	size_t n;
++	size_t i;
++	bool oom;
++} nscan;
++
++static void nbuf_free(nbuf *b)
++{
++	free(b->data);
++	b->data = NULL;
++	b->len = b->alloc = 0;
++}
++
++static void nbuf_append(nbuf *b, const char *p, size_t n)
++{
++	if (b->oom || n == 0) {
++		return;
++	}
++	if (b->len + n > b->alloc) {
++		size_t want = (b->alloc == 0) ? 256 : b->alloc;
++		char *grown;
++
++		while (want < b->len + n) {
++			want *= 2;
++		}
++		grown = realloc(b->data, want);
++		if (grown == NULL) {
++			b->oom = true;
++			return;
++		}
++		b->data = grown;
++		b->alloc = want;
++	}
++	memcpy(b->data + b->len, p, n);
++	b->len += n;
++}
++
++static void nbuf_lit(nbuf *b, const char *s)
++{
++	nbuf_append(b, s, strlen(s));
++}
++
++/* --- scanning ----------------------------------------------------------- */
++
++/**
++ * Step over one character, or over the whole of whatever it starts.
++ *
++ * A quoted string, an escape and a comment can all hold a brace that
++ * means nothing, and Tailwind's own class names are full of escapes, so
++ * none of them may be read as structure.
++ */
++static size_t nest_step(const char *s, size_t n, size_t i)
++{
++	char c = s[i];
++
++	if (c == '\\' && i + 1 < n) {
++		return i + 2;
++	}
++	if (c == '"' || c == '\'') {
++		size_t j = i + 1;
++
++		while (j < n) {
++			if (s[j] == '\\' && j + 1 < n) {
++				j += 2;
++				continue;
++			}
++			if (s[j] == c) {
++				return j + 1;
++			}
++			j++;
++		}
++		return n;
++	}
++	if (c == '/' && i + 1 < n && s[i + 1] == '*') {
++		size_t j = i + 2;
++
++		while (j + 1 < n) {
++			if (s[j] == '*' && s[j + 1] == '/') {
++				return j + 2;
++			}
++			j++;
++		}
++		return n;
++	}
++
++	return i + 1;
++}
++
++/** Is the text from \a p a comment, so not part of a prelude? */
++static bool nest_is_comment(const char *s, size_t n, size_t i)
++{
++	return (s[i] == '/' && i + 1 < n && s[i + 1] == '*');
++}
++
++/* exported interface documented in parse/nesting.h */
++bool css__source_has_nesting(const char *s, size_t n)
++{
++	/*
++	 * What encloses a block decides whether it is nested. A rule
++	 * inside @media is ordinary CSS and always was; @media inside a
++	 * rule is nesting just as much as a rule inside a rule is, so the
++	 * kind of each open block has to be remembered.
++	 */
++	bool in_at[NEST_MAX_DEPTH];
++	size_t i = 0, depth = 0, prelude_at = 0;
++
++	while (i < n) {
++		char c = s[i];
++
++		if (c == '{') {
++			const char *pre = s + prelude_at;
++			size_t pren = i - prelude_at;
++			bool is_at;
++
++			while (pren > 0 && (*pre == ' ' || *pre == '\t' ||
++					    *pre == '\n' || *pre == '\r')) {
++				pre++;
++				pren--;
++			}
++			is_at = (pren > 0 && pre[0] == '@');
++
++			/* anything at all inside a style rule is nesting */
++			if (depth > 0 && in_at[depth - 1] == false) {
++				return true;
++			}
++
++			if (depth < NEST_MAX_DEPTH) {
++				in_at[depth] = is_at;
++			}
++			depth++;
++			prelude_at = i + 1;
++			i++;
++			continue;
++		}
++		if (c == '}') {
++			if (depth > 0) {
++				depth--;
++			}
++			prelude_at = i + 1;
++			i++;
++			continue;
++		}
++		if (c == ';') {
++			prelude_at = i + 1;
++			i++;
++			continue;
++		}
++
++		i = nest_step(s, n, i);
++	}
++
++	return false;
++}
++
++/* --- selector combination ------------------------------------------------ */
++
++/** Does this selector carry an unescaped '&'? */
++static bool sel_has_amp(const char *s, size_t n)
++{
++	size_t i = 0;
++
++	while (i < n) {
++		if (s[i] == '&') {
++			return true;
++		}
++		i = nest_step(s, n, i);
++	}
++
++	return false;
++}
++
++/** Is there a top level comma, so that this is a list? */
++static bool sel_is_list(const char *s, size_t n)
++{
++	size_t i = 0, depth = 0;
++
++	while (i < n) {
++		char c = s[i];
++
++		if (c == '(' || c == '[') {
++			depth++;
++		} else if (c == ')' || c == ']') {
++			if (depth > 0) {
++				depth--;
++			}
++		} else if (c == ',' && depth == 0) {
++			return true;
++		}
++		i = nest_step(s, n, i);
++	}
++
++	return false;
++}
++
++/**
++ * Write the parent's selector, wrapped when it is a list.
++ *
++ * ".a, .b" nested under is ":is(.a, .b)", which is what the parent means
++ * in a nested selector and keeps a descendant combinator from binding to
++ * only the last of them.
++ */
++static void put_parent(nbuf *out, const char *par, size_t parn)
++{
++	if (sel_is_list(par, parn)) {
++		nbuf_lit(out, ":is(");
++		nbuf_append(out, par, parn);
++		nbuf_lit(out, ")");
++	} else {
++		nbuf_append(out, par, parn);
++	}
++}
++
++/** Combine one nested selector with its parent, into \a out. */
++static void combine_one(nbuf *out, const char *par, size_t parn,
++			const char *sel, size_t seln)
++{
++	size_t i = 0;
++
++	if (par == NULL) {
++		nbuf_append(out, sel, seln);
++		return;
++	}
++
++	if (!sel_has_amp(sel, seln)) {
++		/* no '&' means a descendant of the parent */
++		put_parent(out, par, parn);
++		nbuf_lit(out, " ");
++		nbuf_append(out, sel, seln);
++		return;
++	}
++
++	while (i < seln) {
++		if (sel[i] == '&') {
++			put_parent(out, par, parn);
++			i++;
++		} else {
++			size_t j = nest_step(sel, seln, i);
++
++			nbuf_append(out, sel + i, j - i);
++			i = j;
++		}
++	}
++}
++
++/** Combine a nested selector list with its parent. */
++static void combine(nbuf *out, const char *par, size_t parn,
++		    const char *sel, size_t seln)
++{
++	size_t i = 0, start = 0, depth = 0;
++	bool first = true;
++
++	while (i <= seln) {
++		bool end = (i == seln);
++		char c = end ? ',' : sel[i];
++
++		if (!end && (c == '(' || c == '[')) {
++			depth++;
++		} else if (!end && (c == ')' || c == ']')) {
++			if (depth > 0) {
++				depth--;
++			}
++		}
++
++		if (c == ',' && depth == 0) {
++			const char *p = sel + start;
++			size_t plen = i - start;
++
++			while (plen > 0 && (*p == ' ' || *p == '\t' ||
++					    *p == '\n' || *p == '\r')) {
++				p++;
++				plen--;
++			}
++			while (plen > 0 && (p[plen - 1] == ' ' ||
++					    p[plen - 1] == '\t' ||
++					    p[plen - 1] == '\n' ||
++					    p[plen - 1] == '\r')) {
++				plen--;
++			}
++			if (plen > 0) {
++				if (!first) {
++					nbuf_lit(out, ",");
++				}
++				combine_one(out, par, parn, p, plen);
++				first = false;
++			}
++			start = i + 1;
++			i++;
++			continue;
++		}
++
++		if (end) {
++			break;
++		}
++		i = nest_step(sel, seln, i);
++		if (i > seln) {
++			i = seln;
++		}
++	}
++}
++
++/* --- the walk ------------------------------------------------------------ */
++
++static void flatten_block(nscan *sc, const char *par, size_t parn,
++			  nbuf *out, unsigned depth);
++
++/** Trim whitespace from both ends of a prelude. */
++static void trim(const char **p, size_t *n)
++{
++	while (*n > 0 && ((*p)[0] == ' ' || (*p)[0] == '\t' ||
++			  (*p)[0] == '\n' || (*p)[0] == '\r')) {
++		(*p)++;
++		(*n)--;
++	}
++	while (*n > 0 && ((*p)[*n - 1] == ' ' || (*p)[*n - 1] == '\t' ||
++			  (*p)[*n - 1] == '\n' || (*p)[*n - 1] == '\r')) {
++		(*n)--;
++	}
++}
++
++/**
++ * Walk one block, writing its own declarations as a rule and then
++ * everything nested inside it.
++ *
++ * Declarations come out before the rules nested beside them whatever
++ * order they were written in. Within one block that is the same cascade:
++ * a nested rule is at least as specific as the bare parent, so it was
++ * going to win anyway.
++ */
++static void flatten_block(nscan *sc, const char *par, size_t parn,
++			  nbuf *out, unsigned depth)
++{
++	nbuf decls = { NULL, 0, 0, false };
++	nbuf kids = { NULL, 0, 0, false };
++	size_t start = sc->i;
++
++	while (sc->i < sc->n) {
++		char c = sc->s[sc->i];
++
++		if (c == '{') {
++			const char *pre = sc->s + start;
++			size_t pren = sc->i - start;
++
++			trim(&pre, &pren);
++			sc->i++;
++
++			if (depth >= NEST_MAX_DEPTH) {
++				sc->oom = true;
++				break;
++			}
++
++			if (pren == 0 || pre[pren - 1] == ':') {
++				/*
++				 * Not a selector: a prelude ending in a
++				 * colon is a declaration whose value went
++				 * missing, and the parser has recovery of
++				 * its own for that. Copy it out exactly as
++				 * it was written, braces and all, so that
++				 * recovery sees what it always saw.
++				 */
++				nbuf scratch = { NULL, 0, 0, false };
++
++				flatten_block(sc, NULL, 0, &scratch,
++					      depth + 1);
++				nbuf_free(&scratch);
++				nbuf_append(&decls, sc->s + start,
++					    sc->i - start);
++				/* keep it separated from what follows */
++				nbuf_lit(&decls, ";");
++				start = sc->i;
++				continue;
++			}
++
++			if (pre[0] == '@') {
++				/*
++				 * An at-rule keeps its own brackets, and
++				 * what is inside it is flattened against
++				 * the selector we are already under, which
++				 * hoists it out of the rule it was written
++				 * in.
++				 */
++				nbuf_append(&kids, pre, pren);
++				nbuf_lit(&kids, "{");
++				flatten_block(sc, par, parn, &kids, depth + 1);
++				nbuf_lit(&kids, "}");
++			} else {
++				nbuf sel = { NULL, 0, 0, false };
++
++				combine(&sel, par, parn, pre, pren);
++				flatten_block(sc, sel.data, sel.len, &kids,
++					      depth + 1);
++				if (sel.oom) {
++					sc->oom = true;
++				}
++				nbuf_free(&sel);
++			}
++			start = sc->i;
++			continue;
++		}
++
++		if (c == '}') {
++			sc->i++;
++			break;
++		}
++
++		if (c == ';') {
++			const char *d = sc->s + start;
++			size_t dn = sc->i - start;
++
++			trim(&d, &dn);
++			if (dn > 0) {
++				if (d[0] == '@') {
++					/* @import and friends stand alone */
++					nbuf_append(&kids, d, dn);
++					nbuf_lit(&kids, ";");
++				} else {
++					nbuf_append(&decls, d, dn);
++					nbuf_lit(&decls, ";");
++				}
++			}
++			sc->i++;
++			start = sc->i;
++			continue;
++		}
++
++		if (nest_is_comment(sc->s, sc->n, sc->i)) {
++			size_t j = nest_step(sc->s, sc->n, sc->i);
++
++			/* a comment is not part of the prelude around it */
++			if (start == sc->i) {
++				start = j;
++			}
++			sc->i = j;
++			continue;
++		}
++
++		sc->i = nest_step(sc->s, sc->n, sc->i);
++	}
++
++	/* a last declaration needs no semicolon before the brace */
++	if (sc->i > start) {
++		const char *d = sc->s + start;
++		size_t dn = (sc->i > 0 && sc->s[sc->i - 1] == '}') ?
++				(sc->i - 1 - start) : (sc->i - start);
++
++		trim(&d, &dn);
++		if (dn > 0 && d[0] != '@') {
++			nbuf_append(&decls, d, dn);
++			nbuf_lit(&decls, ";");
++		}
++	}
++
++	/*
++	 * A rule with nothing in it is still a rule, and the parser makes
++	 * one, so an empty block is written out as it stands. A block that
++	 * held only nested rules is not: those have been written already,
++	 * and an empty parent beside them would only cost a selector.
++	 */
++	if (par != NULL && (decls.len > 0 || kids.len == 0)) {
++		nbuf_append(out, par, parn);
++		nbuf_lit(out, "{");
++		nbuf_append(out, decls.data, decls.len);
++		nbuf_lit(out, "}");
++	}
++	nbuf_append(out, kids.data, kids.len);
++
++	if (decls.oom || kids.oom || out->oom) {
++		sc->oom = true;
++	}
++	nbuf_free(&decls);
++	nbuf_free(&kids);
++}
++
++/* exported interface documented in parse/nesting.h */
++css_error css__flatten_nesting(const char *src, size_t len,
++			       char **out, size_t *outlen)
++{
++	nscan sc = { src, len, 0, false };
++	nbuf buf = { NULL, 0, 0, false };
++
++	*out = NULL;
++	*outlen = 0;
++
++	if (css__source_has_nesting(src, len) == false) {
++		return CSS_OK; /* nothing to do; the caller uses the source */
++	}
++
++	flatten_block(&sc, NULL, 0, &buf, 0);
++
++	if (sc.oom || buf.oom) {
++		nbuf_free(&buf);
++		return CSS_NOMEM;
++	}
++
++	*out = buf.data;
++	*outlen = buf.len;
++
++	return CSS_OK;
++}
+diff --git a/src/parse/nesting.h b/src/parse/nesting.h
+new file mode 100644
+index 0000000..3da22b2
+--- /dev/null
++++ b/src/parse/nesting.h
+@@ -0,0 +1,37 @@
++/*
++ * This file is part of LibCSS.
++ * Licensed under the MIT License,
++ *		  http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2026 The NetSurf Project
++ */
++
++#ifndef css_parse_nesting_h_
++#define css_parse_nesting_h_
++
++#include <stdbool.h>
++#include <stddef.h>
++
++#include <libcss/errors.h>
++
++/**
++ * Does this stylesheet source contain a nested style rule?
++ *
++ * An at-rule inside another block does not count: that is ordinary CSS
++ * and the parser already handles it.
++ */
++bool css__source_has_nesting(const char *s, size_t n);
++
++/**
++ * Rewrite nested rules as ordinary ones.
++ *
++ * \param src     Stylesheet source
++ * \param len     Length of \a src
++ * \param out     Receives the rewritten source, or NULL if \a src has no
++ *                nesting in it and should be used as it stands
++ * \param outlen  Receives the length of \a out
++ * \return CSS_OK on success, CSS_NOMEM on memory exhaustion
++ */
++css_error css__flatten_nesting(const char *src, size_t len,
++			       char **out, size_t *outlen);
++
++#endif
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 4c64a92..59fc898 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -11,6 +11,7 @@
+ #include <stdarg.h>
+ 
+ #include "stylesheet.h"
++#include "parse/nesting.h"
+ #include "bytecode/bytecode.h"
+ #include "parse/language.h"
+ #include "parse/mq.h"
+@@ -266,6 +267,9 @@ css_error css_stylesheet_destroy(css_stylesheet *sheet)
+ 
+ 	free(sheet->url);
+ 
++	/* source collected but never handed over, if the fetch failed */
++	free(sheet->src);
++
+ 	for (r = sheet->rule_list; r != NULL; r = s) {
+ 		s = r->next;
+ 
+@@ -321,7 +325,25 @@ css_error css_stylesheet_append_data(css_stylesheet *sheet,
+ 	if (sheet->parser == NULL)
+ 		return CSS_INVALID;
+ 
+-	return css__parser_parse_chunk(sheet->parser, data, len);
++	/* Collected and parsed at data_done; see css_stylesheet::src */
++	if (sheet->src_len + len > sheet->src_alloc) {
++		size_t want = (sheet->src_alloc == 0) ? 4096 : sheet->src_alloc;
++		char *grown;
++
++		while (want < sheet->src_len + len) {
++			want *= 2;
++		}
++		grown = realloc(sheet->src, want);
++		if (grown == NULL) {
++			return CSS_NOMEM;
++		}
++		sheet->src = grown;
++		sheet->src_alloc = want;
++	}
++	memcpy(sheet->src + sheet->src_len, data, len);
++	sheet->src_len += len;
++
++	return CSS_OK;
+ }
+ 
+ /**
+@@ -343,6 +365,41 @@ css_error css_stylesheet_data_done(css_stylesheet *sheet)
+ 	if (sheet->parser == NULL)
+ 		return CSS_INVALID;
+ 
++	/*
++	 * Hand the collected source to the parser, rewriting nested rules
++	 * into ordinary ones first if there are any (VitaSurf). A sheet
++	 * with none is given to the parser exactly as it arrived.
++	 */
++	if (sheet->src != NULL) {
++		char *flat = NULL;
++		size_t flat_len = 0;
++
++		error = css__flatten_nesting(sheet->src, sheet->src_len,
++					     &flat, &flat_len);
++		if (error != CSS_OK) {
++			return error;
++		}
++
++		error = css__parser_parse_chunk(sheet->parser,
++				(const uint8_t *)(flat ? flat : sheet->src),
++				flat ? flat_len : sheet->src_len);
++
++		free(flat);
++		free(sheet->src);
++		sheet->src = NULL;
++		sheet->src_len = sheet->src_alloc = 0;
++
++		/*
++		 * The parser answers a chunk with CSS_NEEDDATA to say it
++		 * wants more, which is what append_data used to hand back
++		 * to the caller. There is no more; completing it below is
++		 * what says so.
++		 */
++		if (error != CSS_OK && error != CSS_NEEDDATA) {
++			return error;
++		}
++	}
++
+ 	error = css__parser_completed(sheet->parser);
+ 	if (error != CSS_OK)
+ 		return error;
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 6e18972..fa5f2a4 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -203,6 +203,18 @@ struct css_stylesheet {
+ 
+ 	css_language_level level;		/**< Language level of sheet */
+ 	css_parser *parser;			/**< Core parser for sheet */
++
++	/**
++	 * The source, held until the end (VitaSurf).
++	 *
++	 * A rule nested inside another one has to be rewritten before the
++	 * parser sees it, and whether the sheet has any cannot be known
++	 * from one chunk, so the chunks are collected and handed over at
++	 * data_done. A sheet with no nesting is passed through untouched.
++	 */
++	char *src;
++	size_t src_len;
++	size_t src_alloc;
+ 	void *parser_frontend;			/**< Frontend parser */
+ 	lwc_string **propstrings;		/**< Property strings, for parser */
+ 
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index 4daceb2..fff2c56 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -36,3 +36,4 @@ logicalborder.dat		Logical border, size and gap tests
+ paint.dat			fill and stroke tests
+ colourfns.dat			oklch, oklab, lab and color-mix tests
+ mathfns.dat			min, max and clamp tests
++nesting.dat			CSS nesting tests
+diff --git a/test/data/parse2/malformed-declarations.dat b/test/data/parse2/malformed-declarations.dat
+index 82e0a3a..3e56859 100644
+--- a/test/data/parse2/malformed-declarations.dat
++++ b/test/data/parse2/malformed-declarations.dat
+@@ -55,6 +55,8 @@
+ #expected
+ | *
+ |  top: 1em
++| * bottom
++|  left: 1in
+ #reset
+ 
+ #data
+@@ -64,6 +66,8 @@
+ | *
+ |  top: 1em
+ |  color: #ffbbbbcc
++| * bottom
++|  left: 1in
+ #reset
+ 
+ #data
+@@ -73,6 +77,8 @@
+ | *
+ |  top: 1em
+ |  color: #ffbbbbcc
++| * bottom
++|  left: 1in
+ #reset
+ 
+ #data
+diff --git a/test/data/parse2/nesting.dat b/test/data/parse2/nesting.dat
+new file mode 100644
+index 0000000..3b352ad
+--- /dev/null
++++ b/test/data/parse2/nesting.dat
+@@ -0,0 +1,118 @@
++#data
++.card { color: red; &:hover { color: blue; } }
++#errors
++#expected
++| .card
++|  color: #ffff0000
++| .card:hover
++|  color: #ff0000ff
++#reset
++
++#data
++.a, .b { color: red; & .c { color: blue; } }
++#errors
++#expected
++| .a, .b
++|  color: #ffff0000
++| .a .c, .b .c
++|  color: #ff0000ff
++#reset
++
++#data
++.a { .b { color: red; } }
++#errors
++#expected
++| .a .b
++|  color: #ffff0000
++#reset
++
++#data
++.a { h2 { color: red; } }
++#errors
++#expected
++| .a h2
++|  color: #ffff0000
++#reset
++
++#data
++.a { @media screen { color: red; } }
++#errors
++#expected
++| @media 040
++|  .a
++|   color: #ffff0000
++#reset
++
++#data
++.a { &:hover, &:focus { color: red; } }
++#errors
++#expected
++| .a:hover, .a:focus
++|  color: #ffff0000
++#reset
++
++#data
++.a { & { color: red; } }
++#errors
++#expected
++| .a
++|  color: #ffff0000
++#reset
++
++#data
++.a { .b { .c { color: red; } } }
++#errors
++#expected
++| .a .b .c
++|  color: #ffff0000
++#reset
++
++#data
++.a { &::after { content: "x{}"; } }
++#errors
++#expected
++| .a:after
++|  content: 'x{}'
++#reset
++
++#data
++.a { color: red; &:hover { color: blue; } border-top-width: 3px; }
++#errors
++#expected
++| .a
++|  color: #ffff0000
++|  border-top-width: 3px
++| .a:hover
++|  color: #ff0000ff
++#reset
++
++#data
++.a\:b { color: red; }
++#errors
++#expected
++| .a:b
++|  color: #ffff0000
++#reset
++
++#data
++.a\:b { &:hover { color: red; } }
++#errors
++#expected
++| .a:b:hover
++|  color: #ffff0000
++#reset
++
++#data
++.x { &\:y { color: red; } }
++#errors
++#expected
++| .x:y
++|  color: #ffff0000
++#reset
++
++#data
++.a { }
++#errors
++#expected
++| .a
++#reset

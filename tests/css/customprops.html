@@ -1,0 +1,32 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+:root { --bg: #ffffff; --fg: #111111; --brand: rgb(0,128,0); }
+html[dark] { --bg: #0f0f0f; --fg: #f1f1f1; }
+body { background: var(--bg); color: var(--fg); }
+#a { background: var(--brand); }
+#b { background: var(--missing, rgb(0,0,255)); }
+#c { background: var(--brand, rgb(255,0,0)); }
+#d { --local: rgb(128,0,128); background: var(--local); }
+#e { background: var(--nested); --nested: var(--brand); }
+</style></head><body>
+<div id="a">a</div><div id="b">b</div><div id="c">c</div>
+<div id="d">d</div><div id="e">e</div>
+<pre id="out"></pre>
+<script>
+var o=document.getElementById('out');
+function T(n,v){o.textContent+='XX '+n+': '+v+'\n';try{console.log('XX '+n+': '+v);}catch(e){}}
+function bg(id){return getComputedStyle(document.getElementById(id)).backgroundColor;}
+window.addEventListener('load',function(){setTimeout(function(){
+ T('body background from a variable', getComputedStyle(document.body).backgroundColor);
+ T('a plain variable', bg('a'));
+ T('a fallback when undefined', bg('b'));
+ T('a fallback that is not needed', bg('c'));
+ T('a variable set on the element', bg('d'));
+ T('a variable made of another', bg('e'));
+},200);});
+</script></body></html>
+
+<!--
+  A variable an element declares for itself, and one built from another,
+  both resolve: they are gathered during the cascade rather than when
+  the sheet is read.
+-->

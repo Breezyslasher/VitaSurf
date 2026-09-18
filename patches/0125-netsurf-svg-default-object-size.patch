@@ -1,0 +1,24 @@
+diff --git a/content/handlers/image/svg.c b/content/handlers/image/svg.c
+index cbf3896c3..eba18d31d 100644
+--- a/content/handlers/image/svg.c
++++ b/content/handlers/image/svg.c
+@@ -393,6 +393,19 @@ static bool svg_convert(struct content *c)
+ 		c->ratio_only = svg->diagram->ratio_only;
+ 	}
+ 
++	/*
++	 * A graphic with no width, no height and no viewBox has no
++	 * intrinsic size at all, and CSS Images 3 gives such a replaced
++	 * element the default object size instead. Without this an
++	 * <img> of one was laid out 0 px wide and never appeared
++	 * (VitaSurf).
++	 */
++	if (c->width <= 0 || c->height <= 0) {
++		c->width = 300;
++		c->height = 150;
++		c->ratio_only = false;
++	}
++
+ 	content_set_ready(c);
+ 	content_set_done(c);
+ 	/* Done: update status bar */

@@ -1,0 +1,137 @@
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 01b76b7..f39c197 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -1256,18 +1256,72 @@ uint8_t css_computed_##prop##_px(					\
+ 	return type;							\
+ }
+ 
+-COMPUTED_LENGTH_PX(width, CSS_WIDTH_SET, CSS_WIDTH_AUTO)
+-COMPUTED_LENGTH_PX(height, CSS_HEIGHT_SET, CSS_HEIGHT_AUTO)
+-COMPUTED_LENGTH_PX(max_width, CSS_MAX_WIDTH_SET, CSS_MAX_WIDTH_NONE)
+-COMPUTED_LENGTH_PX(max_height, CSS_MAX_HEIGHT_SET, CSS_MAX_HEIGHT_NONE)
++/*
++ * The same two accessors for a property that takes no negative value.
++ * A negative literal is thrown out when it is parsed, but a calc() is
++ * only known to be negative once it is resolved, and CSS Values 3
++ * clamps that to zero rather than dropping the declaration: before
++ * this, padding: calc(0px - 5px) shrank the box by five pixels
++ * (VitaSurf).
++ */
++#define COMPUTED_LENGTH_PX_NONNEG(prop, SET, FALLBACK)			\
++uint8_t css_computed_##prop##_px(					\
++		const css_computed_style *style,			\
++		const css_unit_ctx *unit_ctx,				\
++		int available_px,					\
++		int *px_out)						\
++{									\
++	css_fixed_or_calc value = { .value = 0 };			\
++	css_unit unit = CSS_UNIT_PX;					\
++	*px_out = 0;							\
++	uint8_t type = get_##prop(style, &value, &unit);		\
++									\
++	if (type == (SET) && css__length_to_px(style, unit_ctx,		\
++			available_px, value, unit, px_out) == false) {	\
++		*px_out = 0;						\
++	}								\
++	if (*px_out < 0) {						\
++		*px_out = 0;						\
++	}								\
++									\
++	return type;							\
++}
++
++#define COMPUTED_LENGTH_PX_ZERO_NONNEG(prop, SET)			\
++uint8_t css_computed_##prop##_px(					\
++		const css_computed_style *style,			\
++		const css_unit_ctx *unit_ctx,				\
++		int available_px,					\
++		int *px_out)						\
++{									\
++	css_fixed_or_calc value = { .value = 0 };			\
++	css_unit unit = CSS_UNIT_PX;					\
++	*px_out = 0;							\
++	uint8_t type = get_##prop(style, &value, &unit);		\
++									\
++	if (type == (SET) && css__length_to_px(style, unit_ctx,		\
++			available_px, value, unit, px_out) == false) {	\
++		*px_out = 0;						\
++	}								\
++	if (*px_out < 0) {						\
++		*px_out = 0;						\
++	}								\
++									\
++	return type;							\
++}
++
++COMPUTED_LENGTH_PX_NONNEG(width, CSS_WIDTH_SET, CSS_WIDTH_AUTO)
++COMPUTED_LENGTH_PX_NONNEG(height, CSS_HEIGHT_SET, CSS_HEIGHT_AUTO)
++COMPUTED_LENGTH_PX_NONNEG(max_width, CSS_MAX_WIDTH_SET, CSS_MAX_WIDTH_NONE)
++COMPUTED_LENGTH_PX_NONNEG(max_height, CSS_MAX_HEIGHT_SET, CSS_MAX_HEIGHT_NONE)
+ COMPUTED_LENGTH_PX(top, CSS_TOP_SET, CSS_TOP_AUTO)
+ COMPUTED_LENGTH_PX(right, CSS_RIGHT_SET, CSS_RIGHT_AUTO)
+ COMPUTED_LENGTH_PX(bottom, CSS_BOTTOM_SET, CSS_BOTTOM_AUTO)
+ COMPUTED_LENGTH_PX(left, CSS_LEFT_SET, CSS_LEFT_AUTO)
+-COMPUTED_LENGTH_PX(flex_basis, CSS_FLEX_BASIS_SET, CSS_FLEX_BASIS_AUTO)
+-COMPUTED_LENGTH_PX(column_width, CSS_COLUMN_WIDTH_SET, CSS_COLUMN_WIDTH_AUTO)
+-COMPUTED_LENGTH_PX(column_gap, CSS_COLUMN_GAP_SET, CSS_COLUMN_GAP_NORMAL)
+-COMPUTED_LENGTH_PX(row_gap, CSS_ROW_GAP_SET, CSS_ROW_GAP_NORMAL)
++COMPUTED_LENGTH_PX_NONNEG(flex_basis, CSS_FLEX_BASIS_SET, CSS_FLEX_BASIS_AUTO)
++COMPUTED_LENGTH_PX_NONNEG(column_width, CSS_COLUMN_WIDTH_SET, CSS_COLUMN_WIDTH_AUTO)
++COMPUTED_LENGTH_PX_NONNEG(column_gap, CSS_COLUMN_GAP_SET, CSS_COLUMN_GAP_NORMAL)
++COMPUTED_LENGTH_PX_NONNEG(row_gap, CSS_ROW_GAP_SET, CSS_ROW_GAP_NORMAL)
+ COMPUTED_LENGTH_PX(letter_spacing, CSS_LETTER_SPACING_SET,
+ 		CSS_LETTER_SPACING_NORMAL)
+ COMPUTED_LENGTH_PX(word_spacing, CSS_WORD_SPACING_SET,
+@@ -1277,12 +1331,12 @@ COMPUTED_LENGTH_PX_ZERO(margin_top, CSS_MARGIN_SET)
+ COMPUTED_LENGTH_PX_ZERO(margin_right, CSS_MARGIN_SET)
+ COMPUTED_LENGTH_PX_ZERO(margin_bottom, CSS_MARGIN_SET)
+ COMPUTED_LENGTH_PX_ZERO(margin_left, CSS_MARGIN_SET)
+-COMPUTED_LENGTH_PX_ZERO(padding_top, CSS_PADDING_SET)
+-COMPUTED_LENGTH_PX_ZERO(padding_right, CSS_PADDING_SET)
+-COMPUTED_LENGTH_PX_ZERO(padding_bottom, CSS_PADDING_SET)
+-COMPUTED_LENGTH_PX_ZERO(padding_left, CSS_PADDING_SET)
+-COMPUTED_LENGTH_PX_ZERO(min_width, CSS_MIN_WIDTH_SET)
+-COMPUTED_LENGTH_PX_ZERO(min_height, CSS_MIN_HEIGHT_SET)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(padding_top, CSS_PADDING_SET)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(padding_right, CSS_PADDING_SET)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(padding_bottom, CSS_PADDING_SET)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(padding_left, CSS_PADDING_SET)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(min_width, CSS_MIN_WIDTH_SET)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(min_height, CSS_MIN_HEIGHT_SET)
+ COMPUTED_LENGTH_PX_ZERO(text_indent, CSS_TEXT_INDENT_SET)
+ COMPUTED_LENGTH_PX_ZERO(vertical_align, CSS_VERTICAL_ALIGN_SET)
+ /*
+@@ -1319,20 +1373,26 @@ uint8_t css_computed_line_height_px(
+ 					CSS_UNIT_PX);
+ 		}
+ 		*px_out = FIXTOINT(v);
++		if (*px_out < 0) {
++			*px_out = 0;
++		}
+ 		return type;
+ 	}
+ 	if (type == CSS_LINE_HEIGHT_DIMENSION && css__length_to_px(style,
+ 			unit_ctx, available_px, value, unit, px_out) == false) {
+ 		*px_out = 0;
+ 	}
++	if (*px_out < 0) {
++		*px_out = 0;
++	}
+ 	return type;
+ }
+-COMPUTED_LENGTH_PX_ZERO(border_top_width, CSS_BORDER_WIDTH_WIDTH)
+-COMPUTED_LENGTH_PX_ZERO(border_right_width, CSS_BORDER_WIDTH_WIDTH)
+-COMPUTED_LENGTH_PX_ZERO(border_bottom_width, CSS_BORDER_WIDTH_WIDTH)
+-COMPUTED_LENGTH_PX_ZERO(border_left_width, CSS_BORDER_WIDTH_WIDTH)
+-COMPUTED_LENGTH_PX_ZERO(outline_width, CSS_BORDER_WIDTH_WIDTH)
+-COMPUTED_LENGTH_PX_ZERO(column_rule_width, CSS_BORDER_WIDTH_WIDTH)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(border_top_width, CSS_BORDER_WIDTH_WIDTH)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(border_right_width, CSS_BORDER_WIDTH_WIDTH)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(border_bottom_width, CSS_BORDER_WIDTH_WIDTH)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(border_left_width, CSS_BORDER_WIDTH_WIDTH)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(outline_width, CSS_BORDER_WIDTH_WIDTH)
++COMPUTED_LENGTH_PX_ZERO_NONNEG(column_rule_width, CSS_BORDER_WIDTH_WIDTH)
+ 
+ 
+ uint8_t css_computed_width(const css_computed_style *style,

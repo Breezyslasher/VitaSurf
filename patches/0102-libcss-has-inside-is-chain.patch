@@ -1,0 +1,95 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index eda2fa8..830e43b 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -3259,6 +3259,19 @@ static css_error parseGroupChain(css_language *c,
+ 			dropPrefixChain(c);
+ 			return error;
+ 		}
++
++		/*
++		 * Strings are referenced again by the append, so the
++		 * copy and the original each own one reference. A :has()
++		 * argument chain is not: the copy points at the same
++		 * selectors, and destroying "last" below would free them
++		 * under the compound that now carries them -- github.com's
++		 * ":is(.a .b:has(.c))" rules freed theirs twice. Hand the
++		 * chain over instead.
++		 */
++		if (det->value_type == CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++			((css_selector_detail *) det)->value.selector = NULL;
++		}
+ 	}
+ 	(*parent)->specificity += last->specificity;
+ 	css__stylesheet_selector_destroy(c->sheet, last);
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 3e47ed6..bb3ac24 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -2514,8 +2514,10 @@ css_error compute_absolute_length_pair(css_computed_style *style,
+ 				css_fixed len1, css_unit unit1,
+ 				css_fixed len2, css_unit unit2))
+ {
+-	css_fixed length1, length2;
+-	css_unit unit1, unit2;
++	css_fixed length1 = 0, length2 = 0;
++	/* Not every getter writes these: background-size's "auto" shares
++	 * the position SET value without holding lengths (VitaSurf). */
++	css_unit unit1 = CSS_UNIT_PX, unit2 = CSS_UNIT_PX;
+ 	uint8_t type;
+ 
+ 	type = get(style, &length1, &unit1, &length2, &unit2);
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index db2c7db..19201e7 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -1077,7 +1077,8 @@ css_error css__stylesheet_selector_destroy(css_stylesheet *sheet,
+ 					detail->value.string != NULL) {
+ 				lwc_string_unref(detail->value.string);
+ 			} else if (detail->value_type ==
+-					CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++					CSS_SELECTOR_DETAIL_VALUE_SELECTOR &&
++					detail->value.selector != NULL) {
+ 				css__stylesheet_selector_destroy(sheet,
+ 						detail->value.selector);
+ 			}
+@@ -1099,7 +1100,8 @@ css_error css__stylesheet_selector_destroy(css_stylesheet *sheet,
+ 				detail->value.string != NULL) {
+ 			lwc_string_unref(detail->value.string);
+ 		} else if (detail->value_type ==
+-				CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++				CSS_SELECTOR_DETAIL_VALUE_SELECTOR &&
++				detail->value.selector != NULL) {
+ 			css__stylesheet_selector_destroy(sheet,
+ 					detail->value.selector);
+ 		}
+diff --git a/test/data/parse2/has.dat b/test/data/parse2/has.dat
+index b107aaa..5729375 100644
+--- a/test/data/parse2/has.dat
++++ b/test/data/parse2/has.dat
+@@ -50,3 +50,25 @@ div:has() {}
+ #errors
+ #expected
+ #reset
++
++#data
++:is(.a .b:has(img)) {}
++#errors
++#expected
++| .a .b:has(img)
++#reset
++
++#data
++:is(.a .b>.c:has(.d)):after {}
++#errors
++#expected
++| .a .b > .c:has(.d):after
++#reset
++
++#data
++:is(.a .b:has(img)) > {}
++.z {}
++#errors
++#expected
++| .z
++#reset

@@ -1,0 +1,282 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 0a5bd77..48cdda7 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -1583,6 +1583,63 @@ css_error handleStartAtRule(css_language *c, const parserutils_vector *vector)
+ 		/* Rule is now owned by the sheet,
+ 		 * so no need to destroy it */
+ 
++		c->state = HAD_RULE;
++	} else if (lwc_string_caseless_isequal(atkeyword->idata,
++			c->strings[CONTAINER], &match) == lwc_error_ok &&
++			match) {
++		css_mq_query *media = NULL;
++
++		/*
++		 * @container [name] <condition> { rules } (VitaSurf).
++		 *
++		 * A container query asks about the size of an ancestor the
++		 * rule names, which the cascade does not know: it has the
++		 * viewport and nothing else. So the condition is evaluated
++		 * against the viewport, as @media is, and carried as a
++		 * media rule so nesting, selection and the cascade need
++		 * nothing new. A container is never wider than the viewport,
++		 * so a min-width query can apply inside a narrow container
++		 * where a browser would not; that is closer to the intended
++		 * page than dropping the block whole, which is what an
++		 * unknown at-rule got. The condition grammar is the media
++		 * query one, range syntax included, which is what the
++		 * parser already reads.
++		 */
++		token = parserutils_vector_peek(vector, ctx);
++		if (token != NULL && token->type == CSS_TOKEN_IDENT &&
++		    !(lwc_string_caseless_isequal(token->idata,
++				c->strings[NOT], &match) == lwc_error_ok &&
++				match)) {
++			/* a container name, which is nothing here */
++			parserutils_vector_iterate(vector, &ctx);
++			consumeWhitespace(vector, &ctx);
++		}
++
++		error = css__mq_parse_media_list(
++				c->strings, vector, &ctx, &media);
++		if (error != CSS_OK)
++			return error;
++
++		error = css__stylesheet_rule_create(c->sheet,
++				CSS_RULE_MEDIA, &rule);
++		if (error != CSS_OK) {
++			css__mq_query_destroy(media);
++			return error;
++		}
++
++		error = css__stylesheet_rule_set_media(c->sheet, rule, media);
++		if (error != CSS_OK) {
++			css__stylesheet_rule_destroy(c->sheet, rule);
++			css__mq_query_destroy(media);
++			return error;
++		}
++
++		error = css__stylesheet_add_rule(c->sheet, rule, NULL);
++		if (error != CSS_OK) {
++			css__stylesheet_rule_destroy(c->sheet, rule);
++			return error;
++		}
++
+ 		c->state = HAD_RULE;
+ 	} else if ((lwc_string_caseless_isequal(atkeyword->idata,
+ 			c->strings[KEYFRAMES], &match) == lwc_error_ok &&
+diff --git a/src/parse/mq.c b/src/parse/mq.c
+index 5031e34..ed8bbaa 100644
+--- a/src/parse/mq.c
++++ b/src/parse/mq.c
+@@ -335,8 +335,8 @@ static css_error mq_parse_range(lwc_string **strings,
+ 
+ 	if (value_or_name->type == CSS_TOKEN_NUMBER &&
+ 			tokenIsChar(parserutils_vector_peek(vector, *ctx), '/')) {
+-		/* ratio */
+-		error = mq_parse_ratio(vector, ctx, token, &ratio);
++		/* ratio: the value is the token just read, not the operator */
++		error = mq_parse_ratio(vector, ctx, value_or_name, &ratio);
+ 		if (error != CSS_OK) {
+ 			return error;
+ 		}
+@@ -399,15 +399,23 @@ static css_error mq_parse_range(lwc_string **strings,
+ 		return error;
+ 	}
+ 	if (name_first) {
+-		/* Invert operator */
++		/*
++		 * The evaluator reads a single range as <value> <op> <name>,
++		 * so "width >= 24rem" is stored as "24rem <= width": the
++		 * operator is mirrored, not negated. Upstream negated it
++		 * (>= became <), and also took the value from the name
++		 * token, so a name-first range never evaluated true --
++		 * which is how every "@media (width >= 48rem)" breakpoint
++		 * a modern stylesheet writes was silently dropped (VitaSurf).
++		 */
+ 		if (op == CSS_MQ_FEATURE_OP_LT) {
+-			op = CSS_MQ_FEATURE_OP_GTE;
+-		} else if (op == CSS_MQ_FEATURE_OP_LTE) {
+ 			op = CSS_MQ_FEATURE_OP_GT;
++		} else if (op == CSS_MQ_FEATURE_OP_LTE) {
++			op = CSS_MQ_FEATURE_OP_GTE;
+ 		} else if (op == CSS_MQ_FEATURE_OP_GT) {
+-			op = CSS_MQ_FEATURE_OP_LTE;
+-		} else if (op == CSS_MQ_FEATURE_OP_GTE) {
+ 			op = CSS_MQ_FEATURE_OP_LT;
++		} else if (op == CSS_MQ_FEATURE_OP_GTE) {
++			op = CSS_MQ_FEATURE_OP_LTE;
+ 		}
+ 	}
+ 	result->op = op;
+@@ -415,8 +423,9 @@ static css_error mq_parse_range(lwc_string **strings,
+ 		result->value.type = CSS_MQ_VALUE_TYPE_RATIO;
+ 		result->value.data.num_or_ratio = ratio;
+ 	} else {
+-		/* num/dim/ident */
+-		error = mq_populate_value(&result->value, name_or_value);
++		/* num/dim/ident: the value is whichever token was not the name */
++		error = mq_populate_value(&result->value,
++				name_first ? value_or_name : name_or_value);
+ 		if (error != CSS_OK) {
+ 			css__mq_feature_destroy(result);
+ 			return error;
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index 96bcd03..b87e3c0 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -47,6 +47,7 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("supports"),
+ 	SMAP("keyframes"),
+ 	SMAP("-webkit-keyframes"),
++	SMAP("container"),
+ 	SMAP("is"),
+ 	SMAP("where"),
+ 
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index ca9bd9d..db72fa1 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -20,7 +20,7 @@ enum {
+ 
+ 	/* At-rules */
+ 	CHARSET, LIBCSS_IMPORT, MEDIA, NAMESPACE, FONT_FACE, PAGE,
+-	LAYER, SUPPORTS, KEYFRAMES, WEBKIT_KEYFRAMES,
++	LAYER, SUPPORTS, KEYFRAMES, WEBKIT_KEYFRAMES, CONTAINER,
+ 
+ 	/* Functional pseudo-classes (VitaSurf) */
+ 	IS_FN, WHERE_FN,
+diff --git a/src/select/mq.h b/src/select/mq.h
+index 89da2c5..5a8de6e 100644
+--- a/src/select/mq.h
++++ b/src/select/mq.h
+@@ -121,9 +121,12 @@ static inline bool mq_match_feature(
+ 	bool match;
+ 
+ 	/* TODO: Use interned string for comparison. */
+-	if (lwc_string_isequal(feat->name,
++	if ((lwc_string_isequal(feat->name,
+ 			str->width, &match) == lwc_error_ok &&
+-			match == true) {
++			match == true) ||
++	    (lwc_string_isequal(feat->name,
++			str->inline_size, &match) == lwc_error_ok &&
++			match == true)) {
+ 		if (!mq_match_feature_range_length_op1(feat->op, &feat->value,
+ 					media->width, unit_ctx)) {
+ 			return false;
+@@ -131,9 +134,12 @@ static inline bool mq_match_feature(
+ 		return mq_match_feature_range_length_op2(feat->op2,
+ 				&feat->value2, media->width, unit_ctx);
+ 
+-	} else if (lwc_string_isequal(feat->name,
++	} else if ((lwc_string_isequal(feat->name,
+ 			str->height, &match) == lwc_error_ok &&
+-			match == true) {
++			match == true) ||
++		   (lwc_string_isequal(feat->name,
++			str->block_size, &match) == lwc_error_ok &&
++			match == true)) {
+ 		if (!mq_match_feature_range_length_op1(feat->op, &feat->value,
+ 				media->height, unit_ctx)) {
+ 			return false;
+diff --git a/src/select/strings.c b/src/select/strings.c
+index cfa12b0..abd0ee6 100644
+--- a/src/select/strings.c
++++ b/src/select/strings.c
+@@ -189,6 +189,18 @@ css_error css_select_strings_intern(css_select_strings *str)
+ 	if (error != lwc_error_ok)
+ 		return css_error_from_lwc_error(error);
+ 
++	error = lwc_intern_string(
++			"inline-size", SLEN("inline-size"),
++			&str->inline_size);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
++	error = lwc_intern_string(
++			"block-size", SLEN("block-size"),
++			&str->block_size);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
+ 	error = lwc_intern_string(
+ 			"prefers-color-scheme", SLEN("prefers-color-scheme"),
+ 			&str->prefers_color_scheme);
+@@ -230,5 +242,7 @@ void css_select_strings_unref(css_select_strings *str)
+ 
+ 	lwc_string_unref(str->width);
+ 	lwc_string_unref(str->height);
++	lwc_string_unref(str->inline_size);
++	lwc_string_unref(str->block_size);
+ 	lwc_string_unref(str->prefers_color_scheme);
+ }
+diff --git a/src/select/strings.h b/src/select/strings.h
+index ff965e5..c7d1409 100644
+--- a/src/select/strings.h
++++ b/src/select/strings.h
+@@ -42,6 +42,10 @@ typedef struct {
+ 
+ 	lwc_string *width;
+ 	lwc_string *height;
++	/* Container query size features (@container is
++	 * evaluated as a media query against the viewport). */
++	lwc_string *inline_size;
++	lwc_string *block_size;
+ 	lwc_string *prefers_color_scheme;
+ } css_select_strings;
+ 
+diff --git a/test/data/parse2/INDEX b/test/data/parse2/INDEX
+index 3942821..6e9b7be 100644
+--- a/test/data/parse2/INDEX
++++ b/test/data/parse2/INDEX
+@@ -41,3 +41,4 @@ shadowsel.dat			Shadow tree selector tests
+ transform.dat			transform translate tests
+ animation.dat			animation, keyframes and background-clip tests
+ boxshadow.dat			box-shadow tests
++container.dat			container query tests
+diff --git a/test/data/parse2/container.dat b/test/data/parse2/container.dat
+new file mode 100644
+index 0000000..365ebee
+--- /dev/null
++++ b/test/data/parse2/container.dat
+@@ -0,0 +1,38 @@
++#data
++@container (width >= 24rem) { div { color: red } }
++#errors
++#expected
++| @media 3ff
++|  div
++|   color: #ffff0000
++#reset
++
++#data
++@container card (min-width: 400px) { div { color: red } }
++#errors
++#expected
++| @media 3ff
++|  div
++|   color: #ffff0000
++#reset
++
++#data
++@container not (width < 10px) { div { color: red } }
++#errors
++#expected
++| @media 3ff
++|  div
++|   color: #ffff0000
++#reset
++
++#data
++@container (width >= 24rem) { div { color: red } }
++span { color: blue }
++#errors
++#expected
++| @media 3ff
++|  div
++|   color: #ffff0000
++| span
++|  color: #ff0000ff
++#reset

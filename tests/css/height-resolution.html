@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!-- Two ways a height went missing. min-height and max-height were
+     applied only while walking back out of a box's children, so a block
+     with nothing inside it never got them, and a page built on
+     min-height: 100vh drew its content squashed at the top. A
+     percentage height whose containing block has no height of its own
+     is auto (CSS 2.1 10.5), but it was resolved against nothing and
+     came out zero, so a scroll pane of height 100% collapsed to its
+     padding and its content hung out below it.
+     Expected: an empty grey bar 60 tall, another the same from a
+     viewport height, a blue box 60 tall that asked for 20, and a green
+     pane holding a 200 tall box, all of it inside the parent. -->
+<html><head><style>
+body { margin: 0; font: 16px/1 sans-serif }
+div { width: 300px; margin-bottom: 4px }
+.a { min-height: 60px; background: #ddd }
+.b { min-height: 10vh; background: #ccc }
+.c { height: 20px; min-height: 60px; background: #99f }
+.pct { min-height: 10%; background: #fdd }
+.parent { background: #eee }
+.pane { height: 100%; padding: 16px; background: #dfd }
+.tall { height: 200px; background: #ccf }
+.capped { height: 200px; max-height: 50px; background: #fca }
+.uncapped { height: 200px; max-height: 50%; background: #cfa }
+</style></head><body>
+<div class="a"></div>
+<div class="b"></div>
+<div class="c"></div>
+<div class="pct"></div>
+<div class="parent" id="parent"><div class="pane" id="pane"><div class="tall"></div></div></div>
+<div class="capped"></div>
+<div class="uncapped"></div>
+<script>
+setTimeout(function(){
+ function h(sel){ return Math.round(document.querySelector(sel).getBoundingClientRect().height); }
+ var tenth = Math.round(window.innerHeight / 10);
+ var r = { a: h('.a'), b: h('.b'), c: h('.c'), pct: h('.pct'),
+           parent: h('#parent'), pane: h('#pane'),
+           capped: h('.capped'), uncapped: h('.uncapped') };
+ var ok = r.a === 60 && Math.abs(r.b - tenth) <= 1 && r.c === 60 &&
+          r.pct === 0 && r.pane === 232 && r.parent === 232 &&
+          r.capped === 50 && r.uncapped === 200;
+ console.log((ok ? 'PASS' : 'FAIL') + ' height resolution ' + JSON.stringify(r));
+},600);
+</script></body></html>

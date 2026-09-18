@@ -1,0 +1,430 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 4a312d7f2..5143fa655 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -2112,6 +2112,22 @@ static void svg_paint_attributes(struct svg_buf *b,
+ 		svg_buf_lit(b, "\"");
+ 		*wrote_stroke = true;
+ 	}
++
++	/* stroke-width from the stylesheet, in user units (VitaSurf) */
++	{
++		css_fixed width = 0;
++		css_unit unit = CSS_UNIT_PX;
++
++		if (css_computed_stroke_width(style, &width, &unit) ==
++				CSS_STROKE_WIDTH_SET && unit != CSS_UNIT_PCT) {
++			char w[48];
++
++			snprintf(w, sizeof(w), " stroke-width=\"%d.%03d\"",
++					FIXTOINT(width),
++					(int) ((width & 0x3ff) * 1000 / 1024));
++			svg_buf_lit(b, w);
++		}
++	}
+ }
+ 
+ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index be31a1ac7..e0096b312 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -1545,6 +1545,7 @@ bool layout_grid(struct box *grid, int available_width,
+ 				it->row, it->row_span);
+ 		int outer_w, outer_h, free_w, free_h;
+ 		enum css_align_self_e align;
++		enum css_justify_self_e justify;
+ 
+ 		if (b->height == AUTO) {
+ 			b->height = 0;
+@@ -1563,10 +1564,28 @@ bool layout_grid(struct box *grid, int available_width,
+ 		if (b->margin[LEFT] == AUTO && b->margin[RIGHT] == AUTO) {
+ 			b->margin[LEFT] = free_w / 2;
+ 			b->margin[RIGHT] = free_w - b->margin[LEFT];
++			free_w = 0;
+ 		} else if (b->margin[LEFT] == AUTO) {
+ 			b->margin[LEFT] = free_w;
++			free_w = 0;
+ 		} else if (b->margin[RIGHT] == AUTO) {
+ 			b->margin[RIGHT] = free_w;
++			free_w = 0;
++		}
++
++		/* justify-self / justify-items: where a narrower item sits
++		 * in its column (VitaSurf); stretch was done through the
++		 * width, so it and start leave the item where it is */
++		justify = lh__box_justify_self(grid, b);
++		switch (justify) {
++		case CSS_JUSTIFY_SELF_FLEX_END:
++			b->margin[LEFT] += free_w;
++			break;
++		case CSS_JUSTIFY_SELF_CENTER:
++			b->margin[LEFT] += free_w / 2;
++			break;
++		default:
++			break;
+ 		}
+ 
+ 		/* vertical: align-self / align-items, stretch by default */
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index f9fe6bcc6..f354531f4 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -349,6 +349,24 @@ static inline enum css_align_self_e lh__box_align_self(
+ 	return align_self;
+ }
+ 
++/**
++ * How a grid item sits along the row: its justify-self, or the grid's
++ * justify-items when that is auto (VitaSurf).
++ */
++static inline enum css_justify_self_e lh__box_justify_self(
++		const struct box *grid,
++		const struct box *item)
++{
++	enum css_justify_self_e j = css_computed_justify_self(item->style);
++
++	if (j == CSS_JUSTIFY_SELF_AUTO) {
++		j = (enum css_justify_self_e)
++				css_computed_justify_items(grid->style);
++	}
++
++	return j;
++}
++
+ /**
+  * Determine width of margin, borders, and padding on one side of a box.
+  *
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 88c25a42b..7ae2045ff 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1408,15 +1408,12 @@ static bool
+ html_redraw_text_decoration_inline(struct box *box,
+ 				   int x, int y,
+ 				   float scale,
+-				   colour colour,
++				   const plot_style_t *plot_style_box,
+ 				   float ratio,
++				   int dy,
+ 				   const struct redraw_context *ctx)
+ {
+ 	struct box *c;
+-	plot_style_t plot_style_box = {
+-		.stroke_type = PLOT_OP_TYPE_SOLID,
+-		.stroke_colour = colour,
+-	};
+ 	nserror res;
+ 	struct rect rect;
+ 
+@@ -1427,10 +1424,10 @@ html_redraw_text_decoration_inline(struct box *box,
+ 			continue;
+ 		}
+ 		rect.x0 = (x + c->x) * scale;
+-		rect.y0 = (y + c->y + c->height * ratio) * scale;
++		rect.y0 = (y + c->y + c->height * ratio) * scale + dy;
+ 		rect.x1 = (x + c->x + c->width) * scale;
+-		rect.y1 = (y + c->y + c->height * ratio) * scale;
+-		res = ctx->plot->line(ctx, &plot_style_box, &rect);
++		rect.y1 = rect.y0;
++		res = ctx->plot->line(ctx, plot_style_box, &rect);
+ 		if (res != NSERROR_OK) {
+ 			return false;
+ 		}
+@@ -1456,15 +1453,12 @@ static bool
+ html_redraw_text_decoration_block(struct box *box,
+ 				  int x, int y,
+ 				  float scale,
+-				  colour colour,
++				  const plot_style_t *plot_style_box,
+ 				  float ratio,
++				  int dy,
+ 				  const struct redraw_context *ctx)
+ {
+ 	struct box *c;
+-	plot_style_t plot_style_box = {
+-		.stroke_type = PLOT_OP_TYPE_SOLID,
+-		.stroke_colour = colour,
+-	};
+ 	nserror res;
+ 	struct rect rect;
+ 
+@@ -1472,17 +1466,18 @@ html_redraw_text_decoration_block(struct box *box,
+ 	for (c = box->children; c; c = c->next) {
+ 		if (c->type == BOX_TEXT) {
+ 			rect.x0 = (x + c->x) * scale;
+-			rect.y0 = (y + c->y + c->height * ratio) * scale;
++			rect.y0 = (y + c->y + c->height * ratio) * scale + dy;
+ 			rect.x1 = (x + c->x + c->width) * scale;
+-			rect.y1 = (y + c->y + c->height * ratio) * scale;
+-			res = ctx->plot->line(ctx, &plot_style_box, &rect);
++			rect.y1 = rect.y0;
++			res = ctx->plot->line(ctx, plot_style_box, &rect);
+ 			if (res != NSERROR_OK) {
+ 				return false;
+ 			}
+ 		} else if ((c->type == BOX_INLINE_CONTAINER) || (c->type == BOX_BLOCK)) {
+ 			if (!html_redraw_text_decoration_block(c,
+ 					x + c->x, y + c->y,
+-					scale, colour, ratio, ctx))
++					scale, plot_style_box, ratio, dy,
++					ctx))
+ 				return false;
+ 		}
+ 	}
+@@ -1502,7 +1497,8 @@ html_redraw_text_decoration_block(struct box *box,
+  * \return true if successful, false otherwise
+  */
+ 
+-static bool html_redraw_text_decoration(struct box *box,
++static bool html_redraw_text_decoration(const html_content *html,
++		struct box *box,
+ 		int x_parent, int y_parent, float scale,
+ 		colour background_colour, const struct redraw_context *ctx)
+ {
+@@ -1510,37 +1506,111 @@ static bool html_redraw_text_decoration(struct box *box,
+ 		CSS_TEXT_DECORATION_UNDERLINE, CSS_TEXT_DECORATION_OVERLINE,
+ 		CSS_TEXT_DECORATION_LINE_THROUGH };
+ 	static const float line_ratio[] = { 0.9, 0.1, 0.5 };
++	plot_style_t plot_style_box = {
++		.stroke_type = PLOT_OP_TYPE_SOLID,
++	};
+ 	colour fgcol;
+-	unsigned int i;
++	unsigned int i, pass, passes = 1;
+ 	css_color col;
++	css_fixed len = 0;
++	css_unit unit = CSS_UNIT_PX;
++	int offset = 0, thickness = 0;
+ 
+-	css_computed_color(box->style, &col);
++	/*
++	 * The line takes the text colour unless text-decoration-color
++	 * says otherwise; text-decoration-thickness, text-underline-offset
++	 * and text-decoration-style are read too (VitaSurf). A dotted or
++	 * dashed line is one the plotters draw; a wavy one is drawn
++	 * dashed, and a double one as two lines.
++	 */
++	if (css_computed_text_decoration_color(box->style, &col) !=
++			CSS_TEXT_DECORATION_COLOR_COLOR) {
++		css_computed_color(box->style, &col);
++	} else if (nscss_color_is_transparent(col)) {
++		return true;
++	}
+ 	fgcol = nscss_color_to_ns(col);
+ 
+ 	/* antialias colour for under/overline */
+ 	if (html_redraw_printing == false)
+ 		fgcol = blend_colour(background_colour, fgcol);
++	plot_style_box.stroke_colour = fgcol;
++
++	if (css_computed_text_decoration_thickness(box->style, &len, &unit) ==
++			CSS_TEXT_DECORATION_THICKNESS_SET) {
++		if (unit == CSS_UNIT_PCT) {
++			css_fixed fsize = 0;
++			css_unit funit = CSS_UNIT_PX;
++			int fpx;
++
++			css_computed_font_size(box->style, &fsize, &funit);
++			fpx = FIXTOINT(css_unit_len2device_px(box->style,
++					&html->unit_len_ctx, fsize,
++					funit));
++			thickness = FPCT_OF_INT_TOINT(len, fpx);
++		} else {
++			thickness = FIXTOINT(css_unit_len2device_px(box->style,
++					&html->unit_len_ctx, len, unit));
++		}
++		thickness *= scale;
++		if (thickness < 1)
++			thickness = 1;
++		plot_style_box.stroke_width = plot_style_int_to_fixed(thickness);
++	}
+ 
+-	if (box->type == BOX_INLINE) {
+-		if (!box->inline_end)
+-			return true;
+-		for (i = 0; i != NOF_ELEMENTS(decoration); i++)
+-			if (css_computed_text_decoration(box->style) &
+-					decoration[i])
++	if (css_computed_text_underline_offset(box->style, &len, &unit) ==
++			CSS_TEXT_UNDERLINE_OFFSET_SET && unit != CSS_UNIT_PCT) {
++		offset = FIXTOINT(css_unit_len2device_px(box->style,
++				&html->unit_len_ctx, len, unit)) * scale;
++	}
++
++	switch (css_computed_text_decoration_style(box->style)) {
++	case CSS_TEXT_DECORATION_STYLE_DOTTED:
++		plot_style_box.stroke_type = PLOT_OP_TYPE_DOT;
++		break;
++	case CSS_TEXT_DECORATION_STYLE_DASHED:
++	case CSS_TEXT_DECORATION_STYLE_WAVY:
++		plot_style_box.stroke_type = PLOT_OP_TYPE_DASH;
++		break;
++	case CSS_TEXT_DECORATION_STYLE_DOUBLE:
++		passes = 2;
++		break;
++	default:
++		break;
++	}
++
++	for (pass = 0; pass < passes; pass++) {
++		/* the second line of a double sits two pixels further out */
++		int dy = pass == 0 ? 0 : (thickness > 0 ? thickness + 1 : 2);
++
++		for (i = 0; i != NOF_ELEMENTS(decoration); i++) {
++			int line_dy = dy;
++
++			if (!(css_computed_text_decoration(box->style) &
++					decoration[i]))
++				continue;
++			if (i == 0)
++				line_dy += offset;
++			else if (i == 1)
++				line_dy = -line_dy;
++
++			if (box->type == BOX_INLINE) {
++				if (!box->inline_end)
++					return true;
+ 				if (!html_redraw_text_decoration_inline(box,
+ 						x_parent, y_parent, scale,
+-						fgcol, line_ratio[i], ctx))
++						&plot_style_box, line_ratio[i],
++						line_dy, ctx))
+ 					return false;
+-	} else {
+-		for (i = 0; i != NOF_ELEMENTS(decoration); i++)
+-			if (css_computed_text_decoration(box->style) &
+-					decoration[i])
++			} else {
+ 				if (!html_redraw_text_decoration_block(box,
+ 						x_parent + box->x,
+ 						y_parent + box->y,
+-						scale,
+-						fgcol, line_ratio[i], ctx))
++						scale, &plot_style_box,
++						line_ratio[i], line_dy, ctx))
+ 					return false;
++			}
++		}
+ 	}
+ 
+ 	return true;
+@@ -1573,6 +1643,64 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 	font_plot_style_from_css(&html->unit_len_ctx, box->style, &fstyle);
+ 	fstyle.background = current_background_color;
+ 
++	/*
++	 * text-shadow (VitaSurf): the run is painted once more, first,
++	 * offset by the shadow and in its colour. The text plotter has
++	 * no alpha and no blur, so a translucent colour is mixed towards
++	 * the background by its alpha, and a blurred one is faded the
++	 * same way the filter level fades text, by radius / (radius + 4).
++	 * Only the first shadow of a list is kept.
++	 */
++	if (box->style != NULL && box->length > 0) {
++		css_fixed sl[3] = { 0, 0, 0 };
++		css_unit su[3] = { CSS_UNIT_PX, CSS_UNIT_PX, CSS_UNIT_PX };
++		css_color scol = 0;
++
++		if (css_computed_text_shadow(box->style, &sl[0], &su[0],
++				&sl[1], &su[1], &sl[2], &su[2], &scol) ==
++				CSS_TEXT_SHADOW_SET) {
++			plot_font_style_t sstyle = fstyle;
++			colour c, bg = current_background_color;
++			int a, fade, i, px[3];
++
++			for (i = 0; i < 3; i++) {
++				px[i] = FIXTOINT(css_unit_len2device_px(
++						box->style,
++						&html->unit_len_ctx,
++						sl[i], su[i])) * scale;
++			}
++
++			if (scol == 0x00000001) {
++				c = fstyle.foreground;
++				a = 0xff;
++			} else {
++				c = nscss_color_to_ns(scol) & 0x00ffffff;
++				a = scol >> 24;
++			}
++			fade = px[2] > 0 ? 256 * px[2] / (px[2] + 4) : 0;
++			a = a * (256 - fade) / 256;
++			if (a > 0) {
++				int r = ((c & 0xff) * a +
++						(bg & 0xff) * (0xff - a)) / 0xff;
++				int g = (((c >> 8) & 0xff) * a +
++						((bg >> 8) & 0xff) * (0xff - a)) /
++						0xff;
++				int b = (((c >> 16) & 0xff) * a +
++						((bg >> 16) & 0xff) * (0xff - a)) /
++						0xff;
++
++				sstyle.foreground = (b << 16) | (g << 8) | r;
++				if (!text_redraw(box->text, box->length,
++						box->byte_offset, box->space,
++						&sstyle, x + px[0], y + px[1],
++						clip, box->height, scale, true,
++						(struct content *) html,
++						html->sel, ctx))
++					return false;
++			}
++		}
++	}
++
+ 	/*
+ 	 * Text cut out of its background (VitaSurf): the usual recipe is
+ 	 * a gradient background, background-clip: text and a transparent
+@@ -4025,7 +4153,7 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	if ((box->type != BOX_TEXT) &&
+ 	    box->style &&
+ 	    css_computed_text_decoration(box->style) !=	CSS_TEXT_DECORATION_NONE) {
+-		if (!html_redraw_text_decoration(box, x_parent, y_parent,
++		if (!html_redraw_text_decoration(html, box, x_parent, y_parent,
+ 				scale, current_background_color, ctx))
+ 			return false;
+ 	}
+@@ -4102,9 +4230,41 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				nw = (int) (iw * f);
+ 				nh = (int) (ih * f);
+ 
+-				/* centred, which is the initial position */
+-				obj_data.x += (width - nw) / 2;
+-				obj_data.y += (height - nh) / 2;
++				/* object-position, centred unless it says
++				 * otherwise (VitaSurf); a percentage is of
++				 * the room left over, as for backgrounds */
++				{
++					css_fixed hl = INTTOFIX(50);
++					css_fixed vl = INTTOFIX(50);
++					css_unit hu = CSS_UNIT_PCT;
++					css_unit vu = CSS_UNIT_PCT;
++					int ox, oy;
++
++					css_computed_object_position(box->style,
++							&hl, &hu, &vl, &vu);
++					if (hu == CSS_UNIT_PCT) {
++						int room = width - nw;
++
++						ox = FPCT_OF_INT_TOINT(hl, room);
++					} else {
++						ox = FIXTOINT(css_unit_len2device_px(
++							box->style,
++							&html->unit_len_ctx,
++							hl, hu)) * scale;
++					}
++					if (vu == CSS_UNIT_PCT) {
++						int room = height - nh;
++
++						oy = FPCT_OF_INT_TOINT(vl, room);
++					} else {
++						oy = FIXTOINT(css_unit_len2device_px(
++							box->style,
++							&html->unit_len_ctx,
++							vl, vu)) * scale;
++					}
++					obj_data.x += ox;
++					obj_data.y += oy;
++				}
+ 				obj_data.width = nw;
+ 				obj_data.height = nh;
+ 			}

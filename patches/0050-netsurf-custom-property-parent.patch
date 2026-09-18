@@ -1,0 +1,17 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index a96c08cfd..0e2169f7c 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -261,6 +261,12 @@ css_select_results *nscss_get_style(nscss_select_ctx *ctx, dom_node *n,
+ 	css_error error;
+ 
+ 	/* Select style for node */
++	/*
++	 * Say which variables the parent was given, so that a var() on
++	 * this element can be resolved against them (VitaSurf).
++	 */
++	css_select_ctx_set_parent(ctx->ctx, ctx->parent_style);
++
+ 	error = css_select_style(ctx->ctx, n, unit_len_ctx, media, inline_style,
+ 			&selection_handler, ctx, &styles);
+ 

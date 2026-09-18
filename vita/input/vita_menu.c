@@ -51,6 +51,11 @@ extern fbtk_widget_t *fbtk;
 #define COLOUR_ROW       0xFFF0F0F0
 #define COLOUR_ROW_TEXT  0xFF202020
 #define COLOUR_HEAD_TEXT 0xFFFFFFFF
+/* the same menu with the dark mode option on: it stayed light rows on
+ * a grey window when every page had gone dark */
+#define COLOUR_DARK_BG       0xFF1B1B1B
+#define COLOUR_DARK_ROW      0xFF2C2C2C
+#define COLOUR_DARK_ROW_TEXT 0xFFE8E8E8
 
 #define MAX_BOOKMARKS    200
 #define MAX_HISTORY      300
@@ -64,12 +69,14 @@ enum item {
 	ITEM_HISTORY,
 	ITEM_DOWNLOADS,
 	ITEM_HOME,
+	ITEM_WIFI_LOGIN,
 	ITEM_ZOOM_IN,
 	ITEM_ZOOM_OUT,
 	ITEM_ZOOM_RESET,
 	ITEM_JAVASCRIPT,
 	ITEM_IMAGES,
 	ITEM_DARK_MODE,
+	ITEM_DUMP_LAYOUT,
 	ITEM_QUIT,
 	ITEM_CLOSE,
 	ITEM_COUNT
@@ -90,6 +97,7 @@ static bool bookmarks_loaded;
 static uint64_t last_autosave_us;
 
 static void update_labels(void);
+static bool build(void);
 static void save_choices(void);
 
 /* ------------------------------------------------------------------------ */
@@ -193,11 +201,21 @@ static void html_escape(FILE *f, const char *s)
 
 static void page_head(FILE *f, const char *title)
 {
+	/*
+	 * The bookmarks, history and downloads pages are written by the
+	 * browser, so they follow its own dark mode setting rather than
+	 * waiting for a site to be asked (VitaSurf). They stayed light
+	 * when everything else went dark.
+	 */
 	fprintf(f, "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n"
 		"<title>%s</title>\n<style>\n"
 		"body{font-family:sans-serif;margin:16px;background:#f4f4f4;color:#222}\n"
 		"h1{font-size:22px}\nli{margin:6px 0}\n"
 		".u{color:#777;font-size:13px}\n.t{color:#777;font-size:13px}\n"
+		"@media (prefers-color-scheme: dark){\n"
+		"body{background:#1b1b1b;color:#e8e8e8}\n"
+		"a{color:#79b8ff}\na:visited{color:#c8a2ff}\n"
+		".u,.t{color:#a0a0a0}\n}\n"
 		"</style></head><body>\n<h1>%s</h1>\n", title, title);
 }
 
@@ -540,6 +558,18 @@ static void activate(enum item item)
 		go(nsoption_charp(homepage_url) != NULL ?
 		   nsoption_charp(homepage_url) : "file:///resources/vitasurf.html");
 		break;
+	case ITEM_WIFI_LOGIN:
+		/*
+		 * A captive portal can only take over a plain HTTP page:
+		 * an HTTPS one fails its certificate check instead, which
+		 * is what every https:// home page does on a hotel
+		 * network until the sign-in is done. This page is fetched
+		 * over HTTP and answers "Success" when the network is
+		 * open, so the portal's redirect, if any, lands here.
+		 */
+		vita_menu_close();
+		go("http://captive.apple.com/hotspot-detect.html");
+		break;
 	case ITEM_ZOOM_IN:
 		zoom(10);
 		break;
@@ -573,7 +603,22 @@ static void activate(enum item item)
 		nsoption_set_bool(prefer_dark_mode,
 				  !nsoption_bool(prefer_dark_mode));
 		save_choices();
+		/* the menu itself follows the option: rebuilt in the new
+		 * colours, and shown again where it was */
+		fbtk_destroy_widget(menu);
+		menu = NULL;
+		if (build()) {
+			fbtk_set_mapping(menu, true);
+			fbtk_request_redraw(fbtk);
+		}
 		update_labels();
+		break;
+	case ITEM_DUMP_LAYOUT:
+		/* the log is the only way a page that comes out wrong on
+		 * the device can be read here, so close first and let the
+		 * dump describe the page rather than the menu over it */
+		vita_menu_close();
+		vita_input_dump_layout_now();
 		break;
 	case ITEM_QUIT:
 		vita_menu_close();
@@ -636,6 +681,9 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_HOME:
 		snprintf(buf, len, "Home page");
 		break;
+	case ITEM_WIFI_LOGIN:
+		snprintf(buf, len, "Sign in to Wi-Fi (hotel, cafe)");
+		break;
 	case ITEM_ZOOM_IN:
 		snprintf(buf, len, "Zoom in (now %d%%)", zoom_percent());
 		break;
@@ -656,6 +704,9 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_DARK_MODE:
 		snprintf(buf, len, "Dark mode: %s (new pages)",
 			 nsoption_bool(prefer_dark_mode) ? "on" : "off");
+		break;
+	case ITEM_DUMP_LAYOUT:
+		snprintf(buf, len, "Write this page's layout to the log");
 		break;
 	case ITEM_QUIT:
 		snprintf(buf, len, "Quit VitaSurf");
@@ -695,13 +746,18 @@ static bool build(void)
 		return true;
 	}
 
-	menu = fbtk_create_window(fbtk, x, y, MENU_WIDTH, height, COLOUR_BG);
+	bool dark = nsoption_bool(prefer_dark_mode);
+	colour bg = dark ? COLOUR_DARK_BG : COLOUR_BG;
+	colour row = dark ? COLOUR_DARK_ROW : COLOUR_ROW;
+	colour row_text = dark ? COLOUR_DARK_ROW_TEXT : COLOUR_ROW_TEXT;
+
+	menu = fbtk_create_window(fbtk, x, y, MENU_WIDTH, height, bg);
 	if (menu == NULL) {
 		return false;
 	}
 
 	w = fbtk_create_text(menu, MENU_PAD, MENU_PAD, MENU_WIDTH - 2 * MENU_PAD,
-			     MENU_HEADER - MENU_PAD, COLOUR_BG, COLOUR_HEAD_TEXT,
+			     MENU_HEADER - MENU_PAD, bg, COLOUR_HEAD_TEXT,
 			     false);
 	fbtk_set_text(w, "VitaSurf   (D-pad, Cross, Circle closes)");
 
@@ -710,7 +766,7 @@ static bool build(void)
 						  MENU_HEADER + i * MENU_ROW_HEIGHT,
 						  MENU_WIDTH - 2 * MENU_PAD,
 						  MENU_ROW_HEIGHT - 4,
-						  COLOUR_ROW, COLOUR_ROW_TEXT,
+						  row, row_text,
 						  row_click, (void *)(intptr_t)i);
 	}
 

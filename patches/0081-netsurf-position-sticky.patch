@@ -1,0 +1,374 @@
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 805602da9..55ff38732 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -285,6 +285,12 @@ struct box {
+ 	 * Coordinate of top padding edge, relative as for x.
+ 	 */
+ 	int y;
++	/**
++	 * How far a position: sticky box was shifted from y at the last
++	 * redraw (VitaSurf). Applied wherever y is, so a tap lands on
++	 * the box where it was drawn.
++	 */
++	int sticky_dy;
+ 
+ 	/**
+ 	 * Width of content box (excluding padding etc.).
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 9a3a71ffe..816aceb9a 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -208,7 +208,7 @@ box_move_xy(struct box *b, enum box_walk_dir dir, int *x, int *y)
+ 		if (b == NULL)
+ 			break;
+ 		*x += b->x;
+-		*y += b->y;
++		*y += b->y + b->sticky_dy;
+ 		if (!box_is_float(b)) {
+ 			rb = b;
+ 			break;
+@@ -218,19 +218,19 @@ box_move_xy(struct box *b, enum box_walk_dir dir, int *x, int *y)
+ 	case BOX_WALK_NEXT_SIBLING:
+ 		do {
+ 			*x -= b->x;
+-			*y -= b->y;
++			*y -= b->y + b->sticky_dy;
+ 			b = b->next;
+ 			if (b == NULL)
+ 				break;
+ 			*x += b->x;
+-			*y += b->y;
++			*y += b->y + b->sticky_dy;
+ 		} while (box_is_float(b));
+ 		rb = b;
+ 		break;
+ 
+ 	case BOX_WALK_PARENT:
+ 		*x -= b->x;
+-		*y -= b->y;
++		*y -= b->y + b->sticky_dy;
+ 		rb = b->parent;
+ 		break;
+ 
+@@ -239,24 +239,24 @@ box_move_xy(struct box *b, enum box_walk_dir dir, int *x, int *y)
+ 		if (b == NULL)
+ 			break;
+ 		*x += b->x;
+-		*y += b->y;
++		*y += b->y + b->sticky_dy;
+ 		rb = b;
+ 		break;
+ 
+ 	case BOX_WALK_NEXT_FLOAT_SIBLING:
+ 		*x -= b->x;
+-		*y -= b->y;
++		*y -= b->y + b->sticky_dy;
+ 		b = b->next_float;
+ 		if (b == NULL)
+ 			break;
+ 		*x += b->x;
+-		*y += b->y;
++		*y += b->y + b->sticky_dy;
+ 		rb = b;
+ 		break;
+ 
+ 	case BOX_WALK_FLOAT_CONTAINER:
+ 		*x -= b->x;
+-		*y -= b->y;
++		*y -= b->y + b->sticky_dy;
+ 		rb = b->float_container;
+ 		break;
+ 
+@@ -549,7 +549,7 @@ box_nearest_text_box(struct box *box,
+ void box_coords(struct box *box, int *x, int *y)
+ {
+ 	*x = box->x;
+-	*y = box->y;
++	*y = box->y + box->sticky_dy;
+ 	while (box->parent) {
+ 		if (box_is_float(box)) {
+ 			assert(box->float_container);
+@@ -558,7 +558,8 @@ void box_coords(struct box *box, int *x, int *y)
+ 			box = box->parent;
+ 		}
+ 		*x += box->x - scrollbar_get_offset(box->scroll_x);
+-		*y += box->y - scrollbar_get_offset(box->scroll_y);
++		*y += box->y + box->sticky_dy -
++				scrollbar_get_offset(box->scroll_y);
+ 	}
+ }
+ 
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index 8c232f5b9..b19b02a03 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -112,6 +112,7 @@ box_create(css_select_results *styles,
+ 	box->styles = styles;
+ 	box->style = style;
+ 	box->x = box->y = 0;
++	box->sticky_dy = 0;
+ 	box->width = UNKNOWN_WIDTH;
+ 	box->height = 0;
+ 	box->descendant_x0 = box->descendant_y0 = 0;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 49924681b..e901b1efb 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -162,6 +162,14 @@ typedef struct html_content {
+ 	css_media media;
+ 	/** CSS length conversion context for document. */
+ 	css_unit_ctx unit_len_ctx;
++
++	/** The viewport on the content as of the last redraw, for
++	 * position: sticky (VitaSurf); view_h is 0 when unknown. */
++	int view_y;
++	int view_h;
++	/** Where the content's origin was plotted at that redraw: the
++	 * y_parent the painter carries is content y plus this. */
++	int view_origin_y;
+ 	/**< Universal selector */
+ 	lwc_string *universal;
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 98e58ff65..d25c0029c 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1492,31 +1492,132 @@ static bool html_redraw_box_children(const html_content *html, struct box *box,
+ {
+ 	struct box *c;
+ 
+-	for (c = box->children; c; c = c->next) {
++	int pass;
+ 
+-		if (c->type != BOX_FLOAT_LEFT && c->type != BOX_FLOAT_RIGHT)
+-			if (!html_redraw_box(html, c,
+-					x_parent + box->x -
+-					scrollbar_get_offset(box->scroll_x),
+-					y_parent + box->y -
+-					scrollbar_get_offset(box->scroll_y),
+-					clip, scale, current_background_color,
+-					ctx))
+-				return false;
++	/*
++	 * Sticky children are drawn after the others (VitaSurf). A
++	 * sticky box is a positioned box, painted above the in-flow
++	 * content beside it, and once it has been shifted down over the
++	 * siblings that follow it the order matters: painted in tree
++	 * order, the text scrolling under a sticky heading would come
++	 * out on top of it.
++	 */
++	for (pass = 0; pass < 2; pass++) {
++		for (c = box->children; c; c = c->next) {
++			bool sticky = c->style != NULL &&
++					css_computed_position(c->style) ==
++							CSS_POSITION_STICKY;
++
++			if (sticky != (pass == 1))
++				continue;
++			if (c->type != BOX_FLOAT_LEFT &&
++					c->type != BOX_FLOAT_RIGHT)
++				if (!html_redraw_box(html, c,
++						x_parent + box->x -
++						scrollbar_get_offset(
++							box->scroll_x),
++						y_parent + box->y -
++						scrollbar_get_offset(
++							box->scroll_y),
++						clip, scale,
++						current_background_color,
++						ctx))
++					return false;
++		}
++		if (pass == 0) {
++			for (c = box->float_children; c; c = c->next_float)
++				if (!html_redraw_box(html, c,
++						x_parent + box->x -
++						scrollbar_get_offset(
++							box->scroll_x),
++						y_parent + box->y -
++						scrollbar_get_offset(
++							box->scroll_y),
++						clip, scale,
++						current_background_color,
++						ctx))
++					return false;
++		}
+ 	}
+-	for (c = box->float_children; c; c = c->next_float)
+-		if (!html_redraw_box(html, c,
+-				x_parent + box->x -
+-				scrollbar_get_offset(box->scroll_x),
+-				y_parent + box->y -
+-				scrollbar_get_offset(box->scroll_y),
+-				clip, scale, current_background_color,
+-				ctx))
+-			return false;
+ 
+ 	return true;
+ }
+ 
++/**
++ * How far a position: sticky box is shifted at the current scroll
++ * (VitaSurf).
++ *
++ * The box is laid out where static would put it. When the viewport
++ * has scrolled past that by more than its top offset it is drawn
++ * lower, held at the offset, until it would leave its containing
++ * block's content box, where it stops. A bottom offset holds it up
++ * the same way from the viewport's bottom edge. Left and right are
++ * not honoured: this frontend does not scroll sideways.
++ *
++ * \param html      Content the box belongs to, with the viewport of
++ *                  this redraw in view_y and view_h
++ * \param box       The sticky box
++ * \param y_parent  Top of the parent's padding box as plotted
++ * \return the shift to add to box->y, in content px
++ */
++static int html_sticky_offset(const html_content *html, struct box *box,
++		int y_parent)
++{
++	struct box *parent = box->parent;
++	int top_px = 0, bottom_px = 0;
++	int box_top, box_bottom, dy = 0;
++
++	if (html->view_h <= 0 || parent == NULL)
++		return 0;
++
++	/* y_parent is where the parent was plotted; the content's own
++	 * origin was plotted at view_origin_y */
++	y_parent -= html->view_origin_y;
++
++	/* the border edges of the box, as laid out */
++	box_top = y_parent + box->y - box->border[TOP].width;
++	box_bottom = y_parent + box->y + box->padding[TOP] + box->height +
++			box->padding[BOTTOM] + box->border[BOTTOM].width;
++
++	if (css_computed_top_px(box->style, &html->unit_len_ctx,
++			html->view_h, &top_px) == CSS_TOP_SET) {
++		int want = html->view_y + top_px;
++
++		if (box_top < want)
++			dy = want - box_top;
++	}
++	if (dy == 0 && css_computed_bottom_px(box->style,
++			&html->unit_len_ctx, html->view_h, &bottom_px) ==
++			CSS_BOTTOM_SET) {
++		int want = html->view_y + html->view_h - bottom_px;
++
++		if (box_bottom > want)
++			dy = want - box_bottom;
++	}
++
++	if (dy > 0) {
++		/* no further than the bottom of the containing block */
++		int cb_bottom = y_parent + parent->padding[TOP] +
++				parent->height;
++		int room = cb_bottom - (box_bottom + box->margin[BOTTOM]);
++
++		if (room < 0)
++			room = 0;
++		if (dy > room)
++			dy = room;
++	} else if (dy < 0) {
++		int cb_top = y_parent + parent->padding[TOP];
++		int room = cb_top - (box_top - box->margin[TOP]);
++
++		if (room > 0)
++			room = 0;
++		if (dy < room)
++			dy = room;
++	}
++
++	return dy;
++}
++
+ /**
+  * Recursively draw a box.
+  *
+@@ -1698,6 +1799,14 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	}
+ 
+ 	/* avoid trivial FP maths */
++	/* a sticky box is drawn where the scroll holds it (VitaSurf) */
++	box->sticky_dy = 0;
++	if (box->style != NULL && html->view_h > 0 &&
++			css_computed_position(box->style) ==
++					CSS_POSITION_STICKY)
++		box->sticky_dy = html_sticky_offset(html, box, y_parent);
++	y_parent += box->sticky_dy;
++
+ 	if (scale == 1.0) {
+ 		x = x_parent + box->x;
+ 		y = y_parent + box->y;
+@@ -2534,6 +2643,12 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 		.fill_colour = data->background_colour,
+ 	};
+ 
++	/* the viewport this redraw is for, which sticky boxes need
++	 * (VitaSurf); an object or iframe redraw leaves it unknown */
++	html->view_y = data->view_y;
++	html->view_h = data->view_h;
++	html->view_origin_y = data->y;
++
+ 	box = html->layout;
+ 	if (box == NULL) {
+ 		/* No box tree: a rebuild from a script-modified document is
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 6d791fbe4..459190b30 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -2702,6 +2702,32 @@ browser_window_redraw(struct browser_window *bw,
+ 	data.repeat_x = false;
+ 	data.repeat_y = false;
+ 
++	/* Where the viewport is on the content, for sticky boxes
++	 * (VitaSurf). The frontend owns the scroll of a windowed browser
++	 * and reports it in device pixels. */
++	{
++		int sx = 0, sy = 0;
++
++		if (bw->window != NULL) {
++			if (guit->window->get_scroll != NULL)
++				guit->window->get_scroll(bw->window, &sx, &sy);
++			data.view_x = sx / bw->scale;
++			data.view_y = sy / bw->scale;
++		} else {
++			data.view_x = scrollbar_get_offset(bw->scroll_x);
++			data.view_y = scrollbar_get_offset(bw->scroll_y);
++		}
++		/* A frontend that has not reformatted the window yet has
++		 * no size on the browser window; the clip of a full redraw
++		 * is the viewport then. */
++		data.view_w = bw->width;
++		data.view_h = bw->height;
++		if (data.view_h <= 0) {
++			data.view_w = (clip->x1 - clip->x0) / bw->scale;
++			data.view_h = (clip->y1 - clip->y0) / bw->scale;
++		}
++	}
++
+ 	content_clip = *clip;
+ 
+ 	if (!bw->window) {
+diff --git a/include/netsurf/content.h b/include/netsurf/content.h
+index 96f044a72..33fa7fb2b 100644
+--- a/include/netsurf/content.h
++++ b/include/netsurf/content.h
+@@ -38,6 +38,16 @@ struct redraw_context;
+ 
+ /** parameters to content redraw */
+ struct content_redraw_data {
++	/**
++	 * The part of the content in view, in content coordinates
++	 * (VitaSurf): what position: sticky pins to. A caller that
++	 * does not know leaves the four zero, and nothing sticks.
++	 */
++	int view_x;
++	int view_y;
++	int view_w;
++	int view_h;
++
+ 	int x; /**< coordinate for top-left of redraw */
+ 	int y; /**< coordinate for top-left of redraw */
+ 

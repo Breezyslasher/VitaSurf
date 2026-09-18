@@ -1,0 +1,69 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 79678f23b..d603a7a2a 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1332,6 +1332,42 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 	font_plot_style_from_css(&html->unit_len_ctx, box->style, &fstyle);
+ 	fstyle.background = current_background_color;
+ 
++	/*
++	 * Text cut out of its background (VitaSurf): the usual recipe is
++	 * a gradient background, background-clip: text and a transparent
++	 * colour, which paints the gradient through the glyphs. There is
++	 * no gradient-through-glyphs here, so a transparent colour would
++	 * paint nothing. Use the background colour when there is one, and
++	 * otherwise whichever of black and white stands out against what
++	 * the text sits on.
++	 */
++	if (box->style != NULL &&
++			css_computed_background_clip(box->style) ==
++					CSS_BACKGROUND_CLIP_TEXT) {
++		css_color col = 0;
++
++		/* a text box carries its element's style, so the clip and
++		 * the colour are read straight from it */
++		css_computed_color(box->style, &col);
++		if (nscss_color_is_transparent(col)) {
++			css_color bgcol = 0;
++
++			css_computed_background_color(box->style, &bgcol);
++			if (nscss_color_is_transparent(bgcol) == false) {
++				fstyle.foreground = nscss_color_to_ns(bgcol);
++			} else {
++				colour c = current_background_color;
++				unsigned lum = (red_from_colour(c) * 299 +
++						green_from_colour(c) * 587 +
++						blue_from_colour(c) * 114) /
++						1000;
++
++				fstyle.foreground = lum < 128 ?
++						0xffffff : 0x000000;
++			}
++		}
++	}
++
+ 	if (!text_redraw(box->text,
+ 			 box->length,
+ 			 box->byte_offset,
+@@ -1668,6 +1704,21 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 
+ 	bg_box = html_redraw_find_bg_box(box);
+ 
++	/*
++	 * background-clip: text means the background shows only through
++	 * the glyphs (VitaSurf). This painter cannot cut a fill to a
++	 * glyph, so the fill is not drawn at all; the text is painted in
++	 * the background's colour instead, in html_redraw_text_box().
++	 * Drawing the fill would put a coloured bar behind text that is
++	 * usually transparent, which is the one thing a heading built
++	 * this way must not look like.
++	 */
++	if (bg_box != NULL && bg_box->style != NULL &&
++			css_computed_background_clip(bg_box->style) ==
++					CSS_BACKGROUND_CLIP_TEXT) {
++		bg_box = NULL;
++	}
++
+ 	/* bg_box == NULL implies that this box should not have
+ 	* its background rendered. Otherwise filter out linebreaks,
+ 	* optimize away non-differing inlines, only plot background

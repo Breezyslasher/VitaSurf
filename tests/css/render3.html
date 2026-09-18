@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>outline, inset shadow, radial gradient</title>
+<style>
+body { margin: 0; }
+.box { width: 100px; height: 50px; margin: 20px 0 20px 20px; }
+/* a: at 20,20: a 2px blue outline ring around the border box:
+   18,18-122,20  18,70-122,72  18,20-20,70  120,20-122,70 */
+.a { background: #ff0000; outline: 2px solid #0000ff; }
+/* b: at 20,90: inset shadow, no blur, 4px spread: green strips 4px wide
+   inside the padding edge: 20,90-120,94  20,136-120,140  20,94-24,136  116,94-120,136 */
+.b { background: #ff0000; box-shadow: inset 0 0 0 4px #00ff00; }
+/* c: at 20,160: radial gradient red to blue: 48 discs about 70,185, the
+   largest of radius 56 */
+.c { background: radial-gradient(#ff0000, #0000ff); }
+</style>
+</head>
+<body>
+<div class="box a"></div>
+<div class="box b"></div>
+<div class="box c"></div>
+</body>
+</html>

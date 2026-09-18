@@ -1,0 +1,122 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 5143fa655..97e9496bd 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -1878,6 +1878,11 @@ struct svg_buf {
+ 	size_t len;
+ 	size_t alloc;
+ 	bool oom;
++	/* The root's computed colour, for a fill="currentColor" or
++	 * stroke="currentColor" attribute anywhere inside (VitaSurf):
++	 * libsvgtiny does not know the keyword and painted it black. */
++	bool have_current;
++	char current[8];
+ };
+ 
+ static void svg_buf_append(struct svg_buf *b, const char *s, size_t n)
+@@ -2130,6 +2135,29 @@ static void svg_paint_attributes(struct svg_buf *b,
+ 	}
+ }
+ 
++/** Copy a style attribute, with currentColor replaced by the colour. */
++static void svg_buf_style_current(struct svg_buf *b, const char *s, size_t n)
++{
++	size_t i = 0;
++
++	while (i < n) {
++		if (n - i >= 12 && strncasecmp(s + i, "currentColor", 12) == 0) {
++			svg_buf_lit(b, b->current);
++			i += 12;
++		} else {
++			size_t j = i + 1;
++
++			while (j < n && !(n - j >= 12 &&
++					  strncasecmp(s + j, "currentColor",
++						      12) == 0)) {
++				j++;
++			}
++			svg_buf_escaped(b, s + i, j - i);
++			i = j;
++		}
++	}
++}
++
+ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 				     bool root,
+ 				     const css_computed_style *style)
+@@ -2187,9 +2215,24 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 				svg_buf_lit(b, "=\"");
+ 				if (dom_node_get_node_value(attr, &value) ==
+ 						DOM_NO_ERR && value != NULL) {
+-					svg_buf_escaped(b,
+-						dom_string_data(value),
+-						dom_string_byte_length(value));
++					const char *vd = dom_string_data(value);
++					size_t vl = dom_string_byte_length(value);
++					bool paint = (nl == 4 &&
++						strncmp(nd, "fill", 4) == 0) ||
++						(nl == 6 &&
++						strncmp(nd, "stroke", 6) == 0);
++
++					if (paint && b->have_current &&
++					    vl == 12 &&
++					    strncasecmp(vd, "currentColor",
++							12) == 0) {
++						svg_buf_lit(b, b->current);
++					} else if (nl == 5 && b->have_current &&
++						   strncmp(nd, "style", 5) == 0) {
++						svg_buf_style_current(b, vd, vl);
++					} else {
++						svg_buf_escaped(b, vd, vl);
++					}
+ 					dom_string_unref(value);
+ 				}
+ 				svg_buf_lit(b, "\"");
+@@ -2589,7 +2632,7 @@ box_svg(dom_node *n,
+ 	struct box *box,
+ 	bool *convert_children)
+ {
+-	struct svg_buf buf = { NULL, 0, 0, false };
++	struct svg_buf buf = { NULL, 0, 0, false, false, "" };
+ 	enum css_width_e wtype;
+ 	enum css_height_e htype;
+ 	css_fixed value = 0;
+@@ -2628,6 +2671,17 @@ box_svg(dom_node *n,
+ 		struct svg_refs refs = { n, { NULL }, 0, false };
+ 		unsigned int i;
+ 
++		if (box->style != NULL) {
++			css_color current = 0;
++
++			css_computed_color(box->style, &current);
++			snprintf(buf.current, sizeof(buf.current), "#%02x%02x%02x",
++				 (unsigned)(current >> 16) & 0xff,
++				 (unsigned)(current >> 8) & 0xff,
++				 (unsigned)current & 0xff);
++			buf.have_current = true;
++		}
++
+ 		svg_refs_collect(&refs, content->document, n, 0);
+ 
+ 		svg_serialise_open(&buf, n, box->style);
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 88e91c204..a18fcbed5 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2290,7 +2290,15 @@ static bool layout_block_object(struct box *block)
+ 	      hlcache_handle_get_url(block->object), block->width);
+ 
+ 	if (content_can_reformat(block->object)) {
+-		content_reformat(block->object, false, block->width, 1);
++		/*
++		 * A height of 1 asks an HTML object to say how tall it
++		 * wants to be. An SVG takes the pair as its viewport when
++		 * it names no size of its own, and answered one pixel tall
++		 * for every icon a stylesheet sizes (VitaSurf), so a block
++		 * whose height is already known passes it on.
++		 */
++		content_reformat(block->object, false, block->width,
++				 block->height == AUTO ? 1 : block->height);
+ 	} else {
+ 		/* Non-HTML objects */
+ 		/* this case handled already in

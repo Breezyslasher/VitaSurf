@@ -1,0 +1,45 @@
+name: CSS census
+
+# Counts the CSS declarations real pages send and prints the ones libcss
+# drops, so a batch of properties is chosen from what sites write rather
+# than from what seems likely. Edit fixtures/css-census.txt and push.
+
+on:
+  push:
+    paths:
+      - fixtures/css-census.txt
+      - scripts/css-census.py
+      - .github/workflows/css-census.yml
+  workflow_dispatch:
+    inputs:
+      cutoff:
+        description: List properties dropped at least this many times
+        default: "60"
+        required: false
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    steps:
+      # Only libcss is wanted here, and checking out all sixteen
+      # submodules puts a hundred lines of bookkeeping after the report.
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Fetch and patch libcss
+        # The properties this project adds to libcss live in patches/,
+        # not in the pinned submodule, so without this the census counts
+        # every one of them as missing.
+        run: |
+          set -eu
+          git submodule update --init --depth 1 deps/libcss
+          for patch in patches/*-libcss-*.patch; do
+            git -C deps/libcss apply "$PWD/$patch"
+          done
+          echo "applied $(ls patches/*-libcss-*.patch | wc -l) libcss patches"
+
+      - name: Count what is understood and what is dropped
+        run: python3 scripts/css-census.py fixtures/css-census.txt
+        env:
+          CENSUS_CUTOFF: ${{ inputs.cutoff || '60' }}

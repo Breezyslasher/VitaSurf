@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- A dynamic import() waits for its module to arrive instead of failing
+     because it is not here yet: one the page never mentioned, and one
+     a modulepreload link is still fetching when the inline script runs.
+     A string holding the word is left alone.
+     Expected console output: four lines ending in "ok". -->
+<html><head><link rel="modulepreload" href="dynimport-mod2.js"></head><body>
+<script>
+import("./dynimport-mod.js").then(function(m){ console.log("unpreloaded module:", m.answer===42 && m.default==="mod" ? "ok" : "FAIL"); }, function(e){ console.log("unpreloaded module: FAIL", String(e)); });
+import("./dynimport-mod2.js").then(function(m){ console.log("preloaded module:", m.twice===84 ? "ok" : "FAIL"); }, function(e){ console.log("preloaded module: FAIL", String(e)); });
+var later = " import("; // a string, not a call
+console.log("string untouched:", later.length===8 ? "ok" : "FAIL "+later);
+import("./nope.js").then(function(){ console.log("missing module: FAIL resolved"); }, function(e){ console.log("missing module:", e instanceof Error ? "ok" : "FAIL"); });
+</script></body></html>

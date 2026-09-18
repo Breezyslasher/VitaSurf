@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<!-- fill="currentColor" and stroke="currentColor" attributes on inline SVG
+     take the element's computed colour; a style attribute saying it does
+     too. Expected: red square, then a green square with a blue outline,
+     then a magenta square. -->
+<html><head><style>
+.wrap{width:48px;height:48px;background:#eee}
+.red{color:#f00}.green{color:#0f0;--x:1}.blue{color:#00f}.mag{color:#f0f}
+</style></head><body>
+<div class="wrap red"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M2 2h20v20H2z"/></svg></div>
+<div class="wrap green"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path class="blue" d="M2 2h20v20H2z" stroke="currentColor" stroke-width="2"/></svg></div>
+<div class="wrap mag"><svg viewBox="0 0 24 24" width="24" height="24"><path d="M2 2h20v20H2z" style="fill:currentColor"/></svg></div>
+</body></html>

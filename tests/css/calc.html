@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>calc on every length</title><style>
+ body { margin: 0; }
+ html { font-size: 16px; }
+ #wrap { width: 400px; }
+ div.p { margin: 0; padding: 0; height: 10px; background: #ddd; }
+ #mb   { margin-bottom: calc(8px * 2); }
+ #mt   { margin-top: calc(10px + 5px); }
+ #pt   { padding-top: calc(1rem + 4px); }
+ #h    { height: calc(30px + 10px); }
+ #hpc  { height: calc(50% + 10px); }
+ #maxw { width: 400px; max-width: calc(100px + 20px); }
+ #minw { width: 10px; min-width: calc(60px + 20px); }
+ #w    { width: calc(50% + 10px); }
+ #wmin { width: calc(min(300px, 50%) + 10px); }
+ #bw   { border-left: calc(2px + 3px) solid #000; }
+ #bwr  { border-left: 5px solid #000; }
+ #bwn  { border-left: 0 solid #000; }
+ #bw > div, #bwr > div, #bwn > div { height: 4px; background: #f00; }
+ #lh   { line-height: calc(20px + 10px); }
+ #maxh { max-height: calc(6px + 6px); overflow: hidden; }
+ #maxh > div { height: 50px; }
+ #tall { height: 200px; }
+ #tall > div { height: calc(50% + 10px); }
+ #grid, #gridc { display: grid; width: 400px;
+                 grid-template-columns: 100px 100px; }
+ #grid { gap: 20px; }
+ #gridc { gap: calc(10px + 10px); }
+ #grid > div, #gridc > div { height: 10px; background: #ddd; }
+ #flex, #flexc { display: flex; width: 400px; }
+ #flex > div, #flexc > div { flex-grow: 0; flex-shrink: 0;
+                             height: 10px; background: #ddd; }
+ #flex > div { flex-basis: 120px; }
+ #flexc > div { flex-basis: calc(100px + 20px); }
+ #ti, #tic { width: 400px; }
+ #ti { text-indent: 40px; }
+ #tic { text-indent: calc(20px * 2); }
+</style></head>
+<body>
+<div id="wrap">
+ <div class="p" id="mb"></div><div class="p" id="after_mb"></div>
+ <div class="p" id="spacer"></div><div class="p" id="mt"></div>
+ <div class="p" id="pt"></div>
+ <div class="p" id="h"></div>
+ <div class="p" id="maxw"></div>
+ <div class="p" id="minw"></div>
+ <div class="p" id="w"></div>
+ <div class="p" id="wmin"></div>
+ <div class="p" id="bw"><div></div></div>
+ <div class="p" id="bwr"><div></div></div>
+ <div class="p" id="bwn"><div></div></div>
+ <div id="lh">x</div>
+ <div id="maxh"><div></div></div>
+ <div id="tall"><div id="hpc"></div></div>
+ <div id="grid"><div id="g1"></div><div id="g2"></div></div>
+ <div id="gridc"><div id="gc1"></div><div id="gc2"></div></div>
+ <div id="flex"><div id="f1"></div><div></div></div>
+ <div id="flexc"><div id="fc1"></div><div></div></div>
+ <div id="ti">hello</div><div id="tic">hello</div>
+</div>
+<pre id="out"></pre>
+<script>
+/* calc() has to reach the computed style of every length property, not
+   just width, and a percentage inside one has to use the same pixel as
+   a plain length beside it. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function R(id){ return document.getElementById(id).getBoundingClientRect(); }
+function L(id){ return Math.round(R(id).left); }
+function W(id){ return Math.round(R(id).width); }
+function H(id){ return Math.round(R(id).height); }
+function kid(id){ return document.getElementById(id).firstChild; }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('margin-bottom calc(8px * 2)', Math.round(R('after_mb').top - R('mb').bottom));
+  T('margin-top calc(10px + 5px)', Math.round(R('mt').top - R('spacer').bottom));
+  T('padding-top calc(1rem + 4px)', H('pt'));
+  T('height calc(30px + 10px)', H('h'));
+  T('height calc(50% + 10px) of 200px', H('hpc'));
+  T('max-width calc(100px + 20px)', W('maxw'));
+  T('min-width calc(60px + 20px)', W('minw'));
+  T('width calc(50% + 10px) of 400px', W('w'));
+  T('width calc(min(300px, 50%) + 10px)', W('wmin'));
+  T('border-left calc(2px + 3px)',
+      Math.round(kid('bw').getBoundingClientRect().left -
+                 kid('bwn').getBoundingClientRect().left));
+  T('border-left 5px for comparison',
+      Math.round(kid('bwr').getBoundingClientRect().left -
+                 kid('bwn').getBoundingClientRect().left));
+  T('line-height calc(20px + 10px)', H('lh'));
+  T('max-height calc(6px + 6px)', H('maxh'));
+  T('grid gap 20px for comparison', L('g2') - L('g1'));
+  T('grid gap calc(10px + 10px)', L('gc2') - L('gc1'));
+  T('flex-basis calc(100px + 20px)', W('fc1'));
+  T('flex-basis 120px for comparison', W('f1'));
+  T('text-indent calc(20px * 2)', Math.round(
+      R('tic').width - R('ti').width) === 0 ? 'same as 40px' : 'differs');
+}, 200); });
+</script></body></html>

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- The size the flex resolver worked out was written back only for a
+     row, so flex-grow did nothing at all in a column and a panel told
+     to fill its container stayed as tall as its text. A container with
+     only a min-height laid its items out before that minimum was
+     applied, so nothing stretched or grew into it.
+     Expected: four boxes. The first fills its 200 tall column, the next
+     two share it 15 and 185, the fourth fills a container that is only
+     told how short it may not be. -->
+<html><head><style>
+body { margin: 0; font: 16px/1 sans-serif }
+.col { display: flex; flex-direction: column; height: 200px; width: 200px;
+       background: #eed; margin-bottom: 6px }
+.row { display: flex; min-height: 200px; width: 200px; background: #dde;
+       margin-bottom: 6px }
+.item { background: #cdd; width: 100px }
+.grow { flex-grow: 1 }
+</style></head><body>
+<div class="col"><div class="item grow" id="one">one</div></div>
+<div class="col"><div class="item" id="two">two</div><div class="item grow" id="three">three</div></div>
+<div class="row"><div class="item" id="four">four</div></div>
+<script>
+setTimeout(function(){
+ function h(id){ return Math.round(document.getElementById(id).getBoundingClientRect().height); }
+ var one = h('one'), two = h('two'), three = h('three'), four = h('four');
+ var ok = one === 200 && two > 0 && two < 40 && three === 200 - two && four === 200;
+ console.log((ok ? 'PASS' : 'FAIL') + ' flex column growth ' + [one, two, three, four].join(' '));
+},600);
+</script></body></html>

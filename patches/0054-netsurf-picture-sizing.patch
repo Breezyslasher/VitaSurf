@@ -1,0 +1,198 @@
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index a7da79310..2044bdbef 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -576,6 +576,24 @@ static inline void layout_find_dimensions(
+ 			*height = AUTO;
+ 		}
+ 
++		/*
++		 * aspect-ratio gives the box its shape when only its
++		 * width is known, which is how a card holding a
++		 * photograph keeps its proportions (VitaSurf). A height
++		 * that was asked for outright still wins.
++		 */
++		if (*height == AUTO && width != NULL && *width != AUTO) {
++			css_fixed ar_w = 0, ar_h = 0;
++
++			if (css_computed_aspect_ratio(style, &ar_w, &ar_h) ==
++					CSS_ASPECT_RATIO_SET &&
++					ar_w > 0 && ar_h > 0) {
++				*height = (int) (*width *
++						FIXTOFLT(ar_h) /
++						FIXTOFLT(ar_w));
++			}
++		}
++
+ 		if (*height != AUTO) {
+ 			layout_handle_box_sizing(unit_len_ctx, box,
+ 					available_width, false, height);
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 4648df1f0..79678f23b 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -675,6 +675,78 @@ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ 	return ctx->plot->clip(ctx, clip) == NSERROR_OK;
+ }
+ 
++/**
++ * The size a background image should be drawn at (VitaSurf).
++ *
++ * background-size did not exist, so a background was always drawn at
++ * the picture's own size however large the box: a gradient meant to
++ * cover a header was repeated across it instead.
++ */
++static void html_background_size(const struct box *box,
++		const css_unit_ctx *unit_len_ctx,
++		int box_w, int box_h, int *width, int *height)
++{
++	css_fixed hl = 0, vl = 0;
++	css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
++	int iw = *width, ih = *height;
++	uint8_t type;
++
++	if (box->style == NULL || iw <= 0 || ih <= 0 ||
++			box_w <= 0 || box_h <= 0) {
++		return;
++	}
++
++	type = css_computed_background_size(box->style, &hl, &hu, &vl, &vu);
++
++	switch (type) {
++	case CSS_BACKGROUND_SIZE_COVER:
++	case CSS_BACKGROUND_SIZE_CONTAIN:
++	{
++		float sx = (float) box_w / iw;
++		float sy = (float) box_h / ih;
++		float f = (type == CSS_BACKGROUND_SIZE_COVER) ?
++				((sx > sy) ? sx : sy) :
++				((sx < sy) ? sx : sy);
++
++		*width = (int) (iw * f);
++		*height = (int) (ih * f);
++		break;
++	}
++	case CSS_BACKGROUND_SIZE_SET:
++	{
++		int w = 0, h = 0;
++
++		if (hu == CSS_UNIT_PCT) {
++			w = (int) (box_w * FIXTOFLT(hl) / 100);
++		} else if (hl != 0) {
++			w = FIXTOINT(css_unit_len2device_px(box->style,
++					unit_len_ctx, hl, hu));
++		}
++		if (vu == CSS_UNIT_PCT) {
++			h = (int) (box_h * FIXTOFLT(vl) / 100);
++		} else if (vl != 0) {
++			h = FIXTOINT(css_unit_len2device_px(box->style,
++					unit_len_ctx, vl, vu));
++		}
++
++		/* a side left as auto follows the other, keeping shape */
++		if (w > 0 && h <= 0) {
++			h = (int) ((float) w * ih / iw);
++		} else if (h > 0 && w <= 0) {
++			w = (int) ((float) h * iw / ih);
++		}
++		if (w > 0 && h > 0) {
++			*width = w;
++			*height = h;
++		}
++		break;
++	}
++	default:
++		break;	/* auto: the picture's own size */
++	}
++}
++
++
+ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 		const struct rect *clip, colour *background_colour,
+ 		struct box *background,
+@@ -862,6 +934,13 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 			width = content_get_width(background->background);
+ 			height = content_get_height(background->background);
+ 
++			html_background_size(background, unit_len_ctx,
++				background->padding[LEFT] + background->width +
++					background->padding[RIGHT],
++				background->padding[TOP] + background->height +
++					background->padding[BOTTOM],
++				&width, &height);
++
+ 			/* ensure clip area only as large as required */
+ 			if (!repeat_x) {
+ 				if (r.x0 < x)
+@@ -1025,6 +1104,13 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 		int width = content_get_width(box->background);
+ 		int height = content_get_height(box->background);
+ 
++		html_background_size(box, unit_len_ctx,
++				box->padding[LEFT] + box->width +
++					box->padding[RIGHT],
++				box->padding[TOP] + box->height +
++					box->padding[BOTTOM],
++				&width, &height);
++
+ 		if (!repeat_x) {
+ 			if (r.x0 < x)
+ 				r.x0 = x;
+@@ -1896,6 +1982,57 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			obj_data.y /= scale;
+ 		}
+ 
++		/*
++		 * object-fit says how a picture sits in a box that is not
++		 * its shape (VitaSurf). Without it a photograph in a card
++		 * is stretched to whatever shape the card happens to be.
++		 * fill, the initial value, is that stretch, so only the
++		 * others do anything here.
++		 */
++		if (box->style != NULL &&
++		    content_get_type(box->object) != CONTENT_HTML) {
++			uint8_t fit = css_computed_object_fit(box->style);
++			int iw = content_get_width(box->object);
++			int ih = content_get_height(box->object);
++
++			if (fit != CSS_OBJECT_FIT_FILL && iw > 0 && ih > 0 &&
++					width > 0 && height > 0) {
++				float sx = (float) width / iw;
++				float sy = (float) height / ih;
++				float f = 1.0f;
++				int nw, nh;
++
++				switch (fit) {
++				case CSS_OBJECT_FIT_CONTAIN:
++					f = (sx < sy) ? sx : sy;
++					break;
++				case CSS_OBJECT_FIT_COVER:
++					f = (sx > sy) ? sx : sy;
++					break;
++				case CSS_OBJECT_FIT_NONE:
++					f = 1.0f;
++					break;
++				case CSS_OBJECT_FIT_SCALE_DOWN:
++					f = (sx < sy) ? sx : sy;
++					if (f > 1.0f) {
++						f = 1.0f;
++					}
++					break;
++				default:
++					break;
++				}
++
++				nw = (int) (iw * f);
++				nh = (int) (ih * f);
++
++				/* centred, which is the initial position */
++				obj_data.x += (width - nw) / 2;
++				obj_data.y += (height - nh) / 2;
++				obj_data.width = nw;
++				obj_data.height = nh;
++			}
++		}
++
+ 		if (!content_redraw(box->object, &obj_data, &r, ctx)) {
+ 			/* Show image fail */
+ 			/* Unicode (U+FFFC) 'OBJECT REPLACEMENT CHARACTER' */

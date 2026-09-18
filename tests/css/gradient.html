@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Gradient backgrounds</title>
+<style>
+body { margin: 0; }
+.box { width: 96px; height: 48px; margin: 0 0 4px 0; }
+/* a: to bottom, red to blue: top strips red, bottom strips blue */
+.a { background: linear-gradient(red, blue); }
+/* b: to right, white to black */
+.b { background-image: linear-gradient(to right, #ffffff, #000000); }
+/* c: translucent overlay over a colour: strips carry alpha */
+.c { background: #00ff00 linear-gradient(rgba(0,0,0,0), rgba(0,0,0,1)); }
+/* d: a rule with a gradient keeps its other declarations */
+.d { background: linear-gradient(90deg, #111 0%, #eee 100%); width: 60px; }
+/* e: legacy webkit forms */
+.e { background: -webkit-linear-gradient(top, #ff0000, #0000ff); }
+.f { background: -webkit-gradient(linear, left top, left bottom, from(#ff0000), to(#0000ff)); }
+/* g: radial falls back to the average colour */
+.g { background: radial-gradient(circle at center, #ffffff, #000000); }
+/* h: layered backgrounds keep the first layer */
+.h { background: linear-gradient(red, red), url(nothing.png); width: 60px; }
+</style>
+</head>
+<body>
+<div class="box a"></div>
+<div class="box b"></div>
+<div class="box c"></div>
+<div class="box d"></div>
+<div class="box e"></div>
+<div class="box f"></div>
+<div class="box g"></div>
+<div class="box h"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function W(sel){ return Math.round(document.querySelector(sel).getBoundingClientRect().width); }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('gradient rule keeps its width', W('.d') + (W('.d') == 60 ? '' : ' (expected 60)'));
+  T('layered rule keeps its width', W('.h') + (W('.h') == 60 ? '' : ' (expected 60)'));
+}, 200); });
+</script>
+</body>
+</html>

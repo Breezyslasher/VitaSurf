@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>supports and media features</title>
+<style>
+body { margin: 0; }
+div { width: 10px; height: 10px; }
+/* a: a feature this browser has: the block applies */
+@supports (display: grid) { .a { width: 100px; } }
+/* b: a property nobody has: dropped, and the fallback for it applies */
+@supports (foo: bar) { .b { width: 100px; } }
+@supports not (foo: bar) { .b { width: 50px; } }
+/* c: and, or, selector() */
+@supports (display: flex) and (not (foo: bar)) { .c { width: 100px; } }
+@supports (foo: bar) or (color: red) { .d { width: 100px; } }
+@supports selector(:has(a)) { .e { width: 100px; } }
+@supports font-tech(color-COLRv1) { .f { width: 100px; } }
+/* g: media features of this screen */
+@media (orientation: landscape) { .g { width: 100px; } }
+@media (orientation: portrait) { .g { width: 50px; } }
+@media (hover: none) { .h { width: 100px; } }
+@media (hover: hover) { .h { width: 50px; } }
+@media (pointer: coarse) { .i { width: 100px; } }
+@media (prefers-reduced-motion: reduce) { .j { width: 100px; } }
+@media (prefers-reduced-motion: no-preference) { .j { width: 50px; } }
+@media (min-resolution: 2dppx) { .k { width: 100px; } }
+@media (min-resolution: 1dppx) { .k { width: 50px; } }
+@media (min-color: 8) { .l { width: 100px; } }
+@media (forced-colors: active) { .m { width: 100px; } }
+@media (scripting: enabled) { .n { width: 100px; } }
+</style>
+</head>
+<body>
+<div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div>
+<div class="e"></div><div class="f"></div><div class="g"></div><div class="h"></div>
+<div class="i"></div><div class="j"></div><div class="k"></div><div class="l"></div>
+<div class="m"></div><div class="n"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+var want = { a: 100, b: 50, c: 100, d: 100, e: 100, f: 10, g: 100, h: 100, i: 100, j: 50, k: 50, l: 100, m: 10, n: 100 };
+window.addEventListener('load', function(){ setTimeout(function(){
+  for (var k in want) {
+    var w = Math.round(document.querySelector('.' + k).getBoundingClientRect().width);
+    T(k, w + (w == want[k] ? '' : ' (expected ' + want[k] + ')'));
+  }
+}, 200); });
+</script>
+</body>
+</html>

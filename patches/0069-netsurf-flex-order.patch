@@ -1,0 +1,44 @@
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 0d2283c1a..6e17cbebc 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -362,6 +362,39 @@ static void layout_flex_ctx__populate_item_data(
+ 
+ 		layout_flex__base_and_main_sizes(ctx, item, available_width);
+ 	}
++
++	/*
++	 * order (VitaSurf). libcss has computed it all along and nothing
++	 * read it, so items always went in source order. Everything after
++	 * this point walks ctx->item.data rather than the box siblings, so
++	 * sorting the array is the whole job: a stable sort, because items
++	 * with the same order keep their source order. There are rarely
++	 * more than a handful, so an insertion sort is the right tool.
++	 */
++	for (size_t j = 1; j < ctx->item.count; j++) {
++		struct flex_item_data moving = ctx->item.data[j];
++		int32_t moving_order = 0;
++		size_t k = j;
++
++		if (moving.box->style != NULL) {
++			css_computed_order(moving.box->style, &moving_order);
++		}
++
++		while (k > 0) {
++			int32_t before_order = 0;
++
++			if (ctx->item.data[k - 1].box->style != NULL) {
++				css_computed_order(ctx->item.data[k - 1].box->style,
++						&before_order);
++			}
++			if (before_order <= moving_order) {
++				break;
++			}
++			ctx->item.data[k] = ctx->item.data[k - 1];
++			k--;
++		}
++		ctx->item.data[k] = moving;
++	}
+ }
+ 
+ /**
