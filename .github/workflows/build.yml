@@ -94,6 +94,9 @@ jobs:
             fi
           done
 
+      - name: Build FreeType with WOFF2
+        run: ./scripts/build-freetype-woff2.sh
+
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh
 
