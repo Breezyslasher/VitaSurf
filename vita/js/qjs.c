@@ -146,6 +146,17 @@ struct jsthread {
 	uint64_t overrun_said_ms; /**< when that was last logged */
 	const char *current_script; /**< URL of the script js_exec is running */
 	struct js_listener *listeners; /**< event listeners, freed on close */
+	/*
+	 * The listeners of one node, found without walking all of them
+	 * (VitaSurf). Adding a listener has to know whether the same one
+	 * is already there, and a page of any size registers thousands:
+	 * Audiobookshelf's library view hung the browser scanning the
+	 * whole list once per registration.
+	 */
+	struct js_listener **node_hash;
+	size_t node_hash_size;	/**< a power of two, or zero for none */
+	size_t listener_count;
+	size_t dead_listeners;	/**< marked inert, waiting for a sweep */
 	/**
 	 * document.readyState. It was the fixed string "interactive", and
 	 * the usual guard is
@@ -200,6 +211,7 @@ struct js_dispatch {
 /* A DOM event listener that calls a JS function. */
 struct js_listener {
 	struct js_listener *next;
+	struct js_listener *node_next;	/**< next listener on the same node */
 	struct jsthread *thread;
 	struct dom_node *node;
 	struct dom_event_listener *dom_listener;
@@ -2190,6 +2202,90 @@ static void listener_options(JSContext *ctx, JSValueConst opts,
 	*capture = JS_ToBool(ctx, opts) == 1;
 }
 
+/* Which chain of the index a node's listeners are on. */
+static size_t listener_bucket(size_t size, const struct dom_node *node)
+{
+	uintptr_t h = (uintptr_t) node;
+
+	h ^= h >> 12;
+	h *= (uintptr_t) 0x9e3779b1u;
+	h ^= h >> 15;
+
+	return (size_t) h & (size - 1);
+}
+
+/*
+ * Build or grow the index, threading every listener onto it again.
+ *
+ * Returns true when it did, which tells the caller its own listener is
+ * already on a chain and must not be linked a second time -- doing that
+ * makes a chain that points back into itself, and the scan never ends.
+ */
+static bool listener_hash_resize(jsthread *thread, size_t want)
+{
+	struct js_listener **fresh;
+	struct js_listener *l;
+	size_t size = thread->node_hash_size != 0 ?
+			thread->node_hash_size * 2 : 64;
+
+	while (size < want) {
+		size *= 2;
+	}
+	fresh = calloc(size, sizeof(*fresh));
+	if (fresh == NULL) {
+		return false;	/* the old index, or none, still serves */
+	}
+	free(thread->node_hash);
+	thread->node_hash = fresh;
+	thread->node_hash_size = size;
+
+	for (l = thread->listeners; l != NULL; l = l->next) {
+		size_t b = listener_bucket(size, l->node);
+
+		l->node_next = fresh[b];
+		fresh[b] = l;
+	}
+
+	return true;
+}
+
+static void listener_hash_add(jsthread *thread, struct js_listener *l)
+{
+	size_t b;
+
+	if (thread->node_hash_size == 0 ||
+	    thread->listener_count > thread->node_hash_size * 4) {
+		if (listener_hash_resize(thread,
+					 thread->listener_count * 2 + 64)) {
+			return;
+		}
+		if (thread->node_hash_size == 0) {
+			return;	/* no index; the whole list is scanned */
+		}
+	}
+	b = listener_bucket(thread->node_hash_size, l->node);
+	l->node_next = thread->node_hash[b];
+	thread->node_hash[b] = l;
+}
+
+static void listener_hash_remove(jsthread *thread, struct js_listener *l)
+{
+	struct js_listener **pp;
+	size_t b;
+
+	if (thread->node_hash_size == 0) {
+		return;
+	}
+	b = listener_bucket(thread->node_hash_size, l->node);
+	for (pp = &thread->node_hash[b]; *pp != NULL; pp = &(*pp)->node_next) {
+		if (*pp == l) {
+			*pp = l->node_next;
+			break;
+		}
+	}
+	l->node_next = NULL;
+}
+
 /** Whether l is the listener (type, func, capture) on node. */
 static bool listener_matches(JSContext *ctx, struct js_listener *l,
 			     struct dom_node *node, dom_string *type,
@@ -2216,8 +2312,15 @@ static void drop_listener(jsthread *thread, struct js_listener *l)
 	for (pp = &thread->listeners; *pp != NULL; pp = &(*pp)->next) {
 		if (*pp == l) {
 			*pp = l->next;
+			if (thread->listener_count > 0) {
+				thread->listener_count--;
+			}
 			break;
 		}
+	}
+	listener_hash_remove(thread, l);
+	if (l->dead && thread->dead_listeners > 0) {
+		thread->dead_listeners--;
 	}
 	if (l->dom_listener != NULL) dom_event_listener_unref(l->dom_listener);
 	if (l->type != NULL) dom_string_unref(l->type);
@@ -2234,7 +2337,8 @@ static void sweep_dead_listeners(jsthread *thread)
 {
 	struct js_listener *l, *next;
 
-	if (thread->event_depth > 0 || thread->closed) {
+	if (thread->event_depth > 0 || thread->closed ||
+	    thread->dead_listeners == 0) {
 		return;
 	}
 	for (l = thread->listeners; l != NULL; l = next) {
@@ -2275,11 +2379,25 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	 * listener, not two. Pages re-register on every render, and without
 	 * this each one ran as many times as it had been added.
 	 */
-	for (l = thread->listeners; l != NULL; l = l->next) {
-		if (listener_matches(ctx, l, node, type_dom, func, capture)) {
-			dom_string_unref(type_dom);
-			JS_FreeCString(ctx, type);
-			return JS_UNDEFINED;
+	if (thread->node_hash_size != 0) {
+		l = thread->node_hash[listener_bucket(thread->node_hash_size,
+						      node)];
+		for (; l != NULL; l = l->node_next) {
+			if (listener_matches(ctx, l, node, type_dom, func,
+					     capture)) {
+				dom_string_unref(type_dom);
+				JS_FreeCString(ctx, type);
+				return JS_UNDEFINED;
+			}
+		}
+	} else {
+		for (l = thread->listeners; l != NULL; l = l->next) {
+			if (listener_matches(ctx, l, node, type_dom, func,
+					     capture)) {
+				dom_string_unref(type_dom);
+				JS_FreeCString(ctx, type);
+				return JS_UNDEFINED;
+			}
 		}
 	}
 
@@ -2306,6 +2424,8 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	l->passive = passive;
 	l->next = thread->listeners;
 	thread->listeners = l;
+	thread->listener_count++;
+	listener_hash_add(thread, l);
 
 	dom_event_target_add_event_listener(node, type_dom, dl, capture);
 	dom_string_unref(type_dom);
@@ -2335,7 +2455,12 @@ static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 		if (type) JS_FreeCString(ctx, type);
 		return JS_UNDEFINED;
 	}
-	for (l = thread->listeners; l != NULL; l = l->next) {
+	l = thread->node_hash_size != 0 ?
+		thread->node_hash[listener_bucket(thread->node_hash_size,
+						  node)] :
+		thread->listeners;
+	for (; l != NULL; l = thread->node_hash_size != 0 ?
+			l->node_next : l->next) {
 		if (listener_matches(ctx, l, node, type_dom, func, capture)) {
 			/*
 			 * A listener can remove itself from inside its own
@@ -2344,6 +2469,7 @@ static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 			 */
 			if (thread->event_depth > 0) {
 				l->dead = true;
+				thread->dead_listeners++;
 			} else {
 				drop_listener(thread, l);
 			}
@@ -4247,6 +4373,9 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	 */
 	if (l->once) {
 		l->dead = true;
+		if (l->thread != NULL) {
+			l->thread->dead_listeners++;
+		}
 	}
 }
 
@@ -5440,6 +5569,9 @@ void js_destroythread(jsthread *thread)
 		free(l);
 		l = next;
 	}
+	free(thread->node_hash);
+	thread->node_hash = NULL;
+	thread->node_hash_size = 0;
 	t = thread->timers;
 	while (t != NULL) {
 		struct js_timer *next = t->next;

@@ -1,0 +1,184 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index a468e6262..c5a1ca61a 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -869,7 +869,24 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		 * into inline block so that the boxes are constructed in an
+ 		 * inline container as if they were not absolutely positioned.
+ 		 * Layout expects and handles this. */
+-		box->type = box_map[CSS_DISPLAY_INLINE_BLOCK];
++		if (props.containing_block != NULL &&
++		    (props.containing_block->type == BOX_FLEX ||
++		     props.containing_block->type == BOX_INLINE_FLEX)) {
++			/*
++			 * Not inside a flex or grid container, though: the
++			 * anonymous inline container such a box is put in
++			 * becomes an item of the container and takes space
++			 * along its main axis, which an out-of-flow box
++			 * must not. CSS Display 3 blockifies an absolutely
++			 * positioned box in any case. openmediavault's
++			 * login page overlays its background and its
++			 * toolbar this way, and they pushed the card that
++			 * holds the form right off the screen (VitaSurf).
++			 */
++			box->type = BOX_BLOCK;
++		} else {
++			box->type = box_map[CSS_DISPLAY_INLINE_BLOCK];
++		}
+ 	} else if (props.node_is_root) {
+ 		/* Special case for root element: force it to BLOCK, or the
+ 		 * rest of the layout will break. */
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 1427cfe0a..a1342966c 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -275,7 +275,7 @@ html_convert_css_callback(hlcache_handle *css,
+ 		 * login page lost the whole of its Material CSS and drew
+ 		 * its form fields zero pixels wide.
+ 		 */
+-		if (s->node != NULL) {
++		if (s->node != NULL && s->is_link) {
+ 			fire_generic_dom_event(corestring_dom_load, s->node,
+ 					       false, false);
+ 		}
+@@ -290,7 +290,7 @@ html_convert_css_callback(hlcache_handle *css,
+ 		s->sheet = NULL;
+ 		parent->base.active--;
+ 		NSLOG(netsurf, INFO, "%d fetches active", parent->base.active);
+-		if (s->node != NULL) {
++		if (s->node != NULL && s->is_link) {
+ 			fire_generic_dom_event(corestring_dom_error, s->node,
+ 					       false, false);
+ 		}
+@@ -568,6 +568,7 @@ html_create_style_element(html_content *c, dom_node *style)
+ 	c->stylesheets[c->stylesheet_count].sheet = NULL;
+ 	c->stylesheets[c->stylesheet_count].modified = false;
+ 	c->stylesheets[c->stylesheet_count].unused = false;
++	c->stylesheets[c->stylesheet_count].is_link = false;
+ 	c->stylesheet_count++;
+ 
+ 	return c->stylesheets + (c->stylesheet_count - 1);
+@@ -776,6 +777,16 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	 * as a browser fetches it, and simply stays out of the cascade.
+ 	 */
+ 	htmlc->stylesheets[htmlc->stylesheet_count].node = dom_node_ref(node);
++	/*
++	 * Only a link gets a load event. A <style> gets one in a browser
++	 * too, but a page that injects a stylesheet per component injects
++	 * dozens, and a library that waits for the document by adding a
++	 * capturing load listener each time one arrives -- web-vitals does
++	 * exactly that -- then doubles its listeners on every one of them
++	 * and never finishes: Audiobookshelf hung the browser that way
++	 * (VitaSurf).
++	 */
++	htmlc->stylesheets[htmlc->stylesheet_count].is_link = true;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].modified = false;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].unused =
+ 			css_sheet_unused(node, NULL, NULL);
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index cdb78deb0..42e7f8f20 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -60,6 +60,7 @@ struct html_stylesheet {
+ 	struct hlcache_handle *sheet;
+ 	bool modified;
+ 	bool unused;
++	bool is_link;	/**< the node is a LINK, not a STYLE (VitaSurf) */
+ };
+ 
+ 
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 4df31012e..1a8e2f735 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -572,6 +572,13 @@ static inline int layout_flex__remaining_free_main(
+ 	for (size_t i = line->first; i < item_count; i++) {
+ 		struct flex_item_data *item = &ctx->item.data[i];
+ 
++		/* an out-of-flow box is not an item and takes none of the
++		 * line (Flexbox 4.1); counting it here left the items that
++		 * do grow short of the space it was given (VitaSurf) */
++		if (lh__box_is_absolute(item->box)) {
++			continue;
++		}
++
+ 		if (item->freeze) {
+ 			remaining_free_main -= item->target_main_size;
+ 		} else {
+diff --git a/content/handlers/html/webfont.c b/content/handlers/html/webfont.c
+index a33356844..4e82fef3f 100644
+--- a/content/handlers/html/webfont.c
++++ b/content/handlers/html/webfont.c
+@@ -345,6 +345,36 @@ static void webfont_fetch(struct html_content *html, const char *family,
+ 	}
+ }
+ 
++/**
++ * Whether a face is for text in the Latin alphabet (VitaSurf).
++ *
++ * A family is often served as one face per script, each with its own
++ * unicode-range, and only one face per family can be installed here.
++ * Taking the first one meant taking the Cyrillic subset of Inter for an
++ * English page, and every word came out as empty boxes.
++ */
++static bool webfont_face_covers_latin(const css_font_face *face)
++{
++	uint32_t n = css_font_face_count_unicode_ranges(face);
++	uint32_t i;
++
++	if (n == 0) {
++		/* no unicode-range: the face is for every code point */
++		return true;
++	}
++
++	for (i = 0; i < n; i++) {
++		uint32_t start = 0, end = 0;
++
++		if (css_font_face_get_unicode_range(face, i, &start, &end) ==
++				CSS_OK && start <= 'A' && 'A' <= end) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
+ /**
+  * Look one family up among the @font-face rules and fetch its faces.
+  */
+@@ -355,6 +385,7 @@ static void webfont_request_family(struct html_content *html,
+ 	const char *name = lwc_string_data(family);
+ 	uint32_t i;
+ 	int fetched = 0;
++	bool latin_only = false;
+ 
+ 	if (webfont_generic(name) || webfont_family_known(name))
+ 		return;
+@@ -364,6 +395,16 @@ static void webfont_request_family(struct html_content *html,
+ 			faces == NULL)
+ 		return;
+ 
++	/* the faces for other scripts are left alone while there is one
++	 * for this one; a family that is all symbols, as an icon font is,
++	 * has none and is fetched as it comes */
++	for (i = 0; i < faces->n_font_faces; i++) {
++		if (webfont_face_covers_latin(faces->font_faces[i])) {
++			latin_only = true;
++			break;
++		}
++	}
++
+ 	for (i = 0; i < faces->n_font_faces && fetched < 4; i++) {
+ 		const css_font_face *face = faces->font_faces[i];
+ 		const css_font_face_src *best = NULL;
+@@ -373,6 +414,10 @@ static void webfont_request_family(struct html_content *html,
+ 		int weight;
+ 		bool italic;
+ 
++		if (latin_only && webfont_face_covers_latin(face) == false) {
++			continue;
++		}
++
+ 		weight = webfont_weight(css_font_face_font_weight(face));
+ 		italic = css_font_face_font_style(face) ==
+ 				CSS_FONT_STYLE_ITALIC ||

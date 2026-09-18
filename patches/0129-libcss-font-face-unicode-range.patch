@@ -1,0 +1,314 @@
+diff --git a/include/libcss/font_face.h b/include/libcss/font_face.h
+index 135682c..51ffd37 100644
+--- a/include/libcss/font_face.h
++++ b/include/libcss/font_face.h
+@@ -72,6 +72,20 @@ css_font_face_format css_font_face_src_format(const css_font_face_src *src);
+ uint8_t css_font_face_font_style(const css_font_face *font_face);
+ uint8_t css_font_face_font_weight(const css_font_face *font_face);
+ 
++/**
++ * The code points a face is for, from its unicode-range descriptor
++ * (VitaSurf).
++ *
++ * A face with no such descriptor is for every code point and reports no
++ * ranges. A client that can only install one face per family needs
++ * these to pick the one holding the text it has to draw: a font served
++ * as subsets, as Google Fonts serves them, otherwise gets whichever
++ * subset came first, and every word comes out as empty boxes.
++ */
++uint32_t css_font_face_count_unicode_ranges(const css_font_face *font_face);
++css_error css_font_face_get_unicode_range(const css_font_face *font_face,
++		uint32_t index, uint32_t *start, uint32_t *end);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/parse/font_face.c b/src/parse/font_face.c
+index 055a118..29fede8 100644
+--- a/src/parse/font_face.c
++++ b/src/parse/font_face.c
+@@ -10,6 +10,7 @@
+ 
+ #include <assert.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include "parse/propstrings.h"
+ #include "parse/properties/utils.h"
+@@ -359,6 +360,149 @@ static css_error font_face_parse_font_weight(css_language *c,
+ 	return error;
+ }
+ 
++/**
++ * Parse one unicode-range token, "0460-052F" or "4??" (VitaSurf).
++ *
++ * The lexer has already taken the "U+" off the front.
++ */
++static bool font_face_parse_one_range(const char *text, size_t len,
++		uint32_t *start, uint32_t *end)
++{
++	uint32_t lo = 0, hi = 0;
++	size_t i = 0, digits = 0;
++	bool wild = false;
++
++	for (; i < len && text[i] != '-' && digits < 6; i++, digits++) {
++		uint32_t d;
++
++		if (text[i] == '?') {
++			wild = true;
++			lo = lo * 16;
++			hi = hi * 16 + 0xf;
++			continue;
++		}
++		if (wild) {
++			/* a digit after a '?' is not a range */
++			return false;
++		}
++		if (text[i] >= '0' && text[i] <= '9')
++			d = (uint32_t) (text[i] - '0');
++		else if (text[i] >= 'a' && text[i] <= 'f')
++			d = (uint32_t) (text[i] - 'a') + 10;
++		else if (text[i] >= 'A' && text[i] <= 'F')
++			d = (uint32_t) (text[i] - 'A') + 10;
++		else
++			return false;
++
++		lo = lo * 16 + d;
++		hi = hi * 16 + d;
++	}
++
++	if (digits == 0)
++		return false;
++
++	if (i < len && text[i] == '-') {
++		if (wild)
++			return false;
++		hi = 0;
++		digits = 0;
++		for (i++; i < len && digits < 6; i++, digits++) {
++			uint32_t d;
++
++			if (text[i] >= '0' && text[i] <= '9')
++				d = (uint32_t) (text[i] - '0');
++			else if (text[i] >= 'a' && text[i] <= 'f')
++				d = (uint32_t) (text[i] - 'a') + 10;
++			else if (text[i] >= 'A' && text[i] <= 'F')
++				d = (uint32_t) (text[i] - 'A') + 10;
++			else
++				return false;
++
++			hi = hi * 16 + d;
++		}
++		if (digits == 0)
++			return false;
++	}
++
++	if (i != len || hi < lo)
++		return false;
++
++	*start = lo;
++	*end = hi;
++
++	return true;
++}
++
++/**
++ * Parse the unicode-range descriptor of an @font-face rule (VitaSurf).
++ *
++ * unicode-range ::= URANGE [ ',' URANGE ]*
++ *
++ * A descriptor that is not valid leaves the face covering everything,
++ * which is what the initial value says anyway.
++ */
++static css_error font_face_parse_unicode_range(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_font_face *font_face)
++{
++	int32_t orig_ctx = *ctx;
++	css_font_face_range *ranges = NULL;
++	uint32_t n_ranges = 0, cap = 0;
++	const css_token *token;
++	css_error error = CSS_OK;
++
++	(void) c;
++
++	while ((token = parserutils_vector_iterate(vector, ctx)) != NULL) {
++		uint32_t start, end;
++
++		if (token->type != CSS_TOKEN_UNICODE_RANGE ||
++		    token->idata == NULL ||
++		    font_face_parse_one_range(
++				lwc_string_data(token->idata),
++				lwc_string_length(token->idata),
++				&start, &end) == false) {
++			error = CSS_INVALID;
++			break;
++		}
++
++		if (n_ranges == cap) {
++			css_font_face_range *grown;
++
++			cap = cap == 0 ? 4 : cap * 2;
++			grown = realloc(ranges,
++					cap * sizeof(css_font_face_range));
++			if (grown == NULL) {
++				error = CSS_NOMEM;
++				break;
++			}
++			ranges = grown;
++		}
++		ranges[n_ranges].start = start;
++		ranges[n_ranges].end = end;
++		n_ranges++;
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL)
++			break;
++		if (tokenIsChar(token, ',') == false) {
++			error = CSS_INVALID;
++			break;
++		}
++		parserutils_vector_iterate(vector, ctx);
++		consumeWhitespace(vector, ctx);
++	}
++
++	if (error != CSS_OK || n_ranges == 0) {
++		free(ranges);
++		*ctx = orig_ctx;
++		return error == CSS_OK ? CSS_INVALID : error;
++	}
++
++	return css__font_face_set_ranges(font_face, ranges, n_ranges);
++}
++
+ /**
+  * Parse a descriptor in an @font-face rule
+  *
+@@ -404,6 +548,16 @@ css_error css__parse_font_descriptor(css_language *c,
+ 			c->strings[FONT_WEIGHT], &match) == lwc_error_ok &&
+ 			match) {
+ 		return font_face_parse_font_weight(c, vector, ctx, font_face);
++	} else if (lwc_string_length(descriptor->idata) ==
++				SLEN("unicode-range") &&
++			strncasecmp(lwc_string_data(descriptor->idata),
++				"unicode-range",
++				SLEN("unicode-range")) == 0) {
++		/* named here rather than through the property string table,
++		 * which holds the properties a declaration can carry and
++		 * not the descriptors of an at-rule (VitaSurf) */
++		return font_face_parse_unicode_range(c, vector, ctx,
++				font_face);
+ 	}
+ 
+ 	return CSS_INVALID;
+diff --git a/src/select/font_face.c b/src/select/font_face.c
+index 9788c59..ff8d986 100644
+--- a/src/select/font_face.c
++++ b/src/select/font_face.c
+@@ -27,6 +27,8 @@ static const css_font_face default_font_face = {
+ 	NULL,
+ 	NULL,
+ 	0,
++	NULL,
++	0,
+ 	{ (CSS_FONT_WEIGHT_NORMAL << 2) | CSS_FONT_STYLE_NORMAL }
+ };
+ 
+@@ -72,6 +74,8 @@ css_error css__font_face_destroy(css_font_face *font_face)
+ 	if (font_face->srcs != NULL)
+ 		font_faces_srcs_destroy(font_face);
+ 
++	free(font_face->ranges);
++
+ 	free(font_face);
+ 
+ 	return CSS_OK;
+@@ -141,6 +145,53 @@ uint8_t css_font_face_font_weight(const css_font_face *font_face)
+ 	return (font_face->bits[0] >> 2) & 0xf;
+ }
+ 
++/**
++ * Set the code point ranges a font-face is for (VitaSurf)
++ *
++ * The font-face takes ownership of the array.
++ *
++ * \param font_face  The font-face
++ * \param ranges     The ranges, or NULL for none
++ * \param n_ranges   How many ranges there are
++ * \return CSS_OK on success,
++ *         CSS_BADPARM on bad parameters.
++ */
++css_error css__font_face_set_ranges(css_font_face *font_face,
++		css_font_face_range *ranges, uint32_t n_ranges)
++{
++	if (font_face == NULL)
++		return CSS_BADPARM;
++
++	free(font_face->ranges);
++	font_face->ranges = ranges;
++	font_face->n_ranges = n_ranges;
++
++	return CSS_OK;
++}
++
++/* exported function documented in libcss/font_face.h */
++uint32_t css_font_face_count_unicode_ranges(const css_font_face *font_face)
++{
++	if (font_face == NULL)
++		return 0;
++
++	return font_face->n_ranges;
++}
++
++/* exported function documented in libcss/font_face.h */
++css_error css_font_face_get_unicode_range(const css_font_face *font_face,
++		uint32_t index, uint32_t *start, uint32_t *end)
++{
++	if (font_face == NULL || start == NULL || end == NULL ||
++			index >= font_face->n_ranges)
++		return CSS_BADPARM;
++
++	*start = font_face->ranges[index].start;
++	*end = font_face->ranges[index].end;
++
++	return CSS_OK;
++}
++
+ /**
+  * Get the number of potential src locations for a font-face
+  *
+diff --git a/src/select/font_face.h b/src/select/font_face.h
+index 5f46433..4905e81 100644
+--- a/src/select/font_face.h
++++ b/src/select/font_face.h
+@@ -23,11 +23,21 @@ struct css_font_face_src {
+ 	uint8_t bits[1];
+ };
+ 
++/* one span of the unicode-range descriptor (VitaSurf) */
++typedef struct css_font_face_range {
++	uint32_t start;
++	uint32_t end;
++} css_font_face_range;
++
+ struct css_font_face {
+ 	lwc_string *font_family;
+ 	css_font_face_src *srcs;
+ 	uint32_t n_srcs;
+ 
++	/* what unicode-range said, if it said anything (VitaSurf) */
++	css_font_face_range *ranges;
++	uint32_t n_ranges;
++
+ 	/*
+ 	 * Bit allocations:
+ 	 *
+@@ -46,4 +56,7 @@ css_error css__font_face_set_font_family(css_font_face *font_face,
+ css_error css__font_face_set_srcs(css_font_face *font_face,
+ 		css_font_face_src *srcs, uint32_t n_srcs);
+ 
++css_error css__font_face_set_ranges(css_font_face *font_face,
++		css_font_face_range *ranges, uint32_t n_ranges);
++
+ #endif

@@ -1,0 +1,110 @@
+diff --git a/src/events/event_target.c b/src/events/event_target.c
+index e741381..70178f4 100644
+--- a/src/events/event_target.c
++++ b/src/events/event_target.c
+@@ -219,38 +219,80 @@ dom_exception _dom_event_target_dispatch(dom_event_target *et,
+ 		bool *success)
+ {
+ 	if (eti->listeners != NULL) {
++		/*
++		 * The listeners are taken before any of them runs
++		 * (VitaSurf). The DOM says an event goes to the listeners
++		 * the target had when it was dispatched, and walking the
++		 * live list instead handed the event to listeners the
++		 * handlers themselves had just added: a page whose load
++		 * handler registers another load handler never came back,
++		 * which is how Audiobookshelf hung the browser.
++		 */
++		struct dispatch_entry {
++			struct dom_event_listener *listener;
++			dom_string *type;
++			bool capture;
++		} fixed[16], *snapshot = fixed;
+ 		struct listener_entry *le = eti->listeners;
++		size_t count = 0, i;
+ 
+ 		evt->current = et;
+ 
+ 		do {
+-			if (dom_string_isequal(le->type, evt->type)) {
+-				assert(le->listener->handler != NULL);
+-
+-				/* A listener on the target itself belongs to
+-				 * the at-target phase only: firing it in the
+-				 * capture or bubble phase as well called it
+-				 * twice for one event (VitaSurf). */
+-				if ((le->capture &&
+-						phase == DOM_CAPTURING_PHASE &&
+-						evt->target != evt->current) ||
+-				    (le->capture == false && 
+-						phase == DOM_BUBBLING_PHASE &&
+-						evt->target != evt->current) ||
+-				    (evt->target == evt->current && 
+-						phase == DOM_AT_TARGET)) {
+-					le->listener->handler(evt, 
+-							le->listener->pw);
+-					/* If the handler called
+-					 * stopImmediatePropagation, we should
+-					 * break */
+-					if (evt->stop_now == true)
+-						break;
+-				}
+-			}
+-
++			count++;
+ 			le = (struct listener_entry *) le->list.next;
+ 		} while (le != eti->listeners);
++
++		if (count > sizeof(fixed) / sizeof(fixed[0])) {
++			snapshot = malloc(count * sizeof(*snapshot));
++			if (snapshot == NULL) {
++				snapshot = fixed;
++				count = sizeof(fixed) / sizeof(fixed[0]);
++			}
++		}
++
++		le = eti->listeners;
++		for (i = 0; i < count; i++) {
++			snapshot[i].listener = le->listener;
++			dom_event_listener_ref(le->listener);
++			snapshot[i].type = dom_string_ref(le->type);
++			snapshot[i].capture = le->capture;
++			le = (struct listener_entry *) le->list.next;
++		}
++
++		for (i = 0; i < count; i++) {
++			if (evt->stop_now == true)
++				break;
++
++			if (dom_string_isequal(snapshot[i].type,
++					evt->type) == false)
++				continue;
++
++			assert(snapshot[i].listener->handler != NULL);
++
++			/* A listener on the target itself belongs to
++			 * the at-target phase only: firing it in the
++			 * capture or bubble phase as well called it
++			 * twice for one event (VitaSurf). */
++			if ((snapshot[i].capture &&
++					phase == DOM_CAPTURING_PHASE &&
++					evt->target != evt->current) ||
++			    (snapshot[i].capture == false &&
++					phase == DOM_BUBBLING_PHASE &&
++					evt->target != evt->current) ||
++			    (evt->target == evt->current &&
++					phase == DOM_AT_TARGET)) {
++				snapshot[i].listener->handler(evt,
++						snapshot[i].listener->pw);
++			}
++		}
++
++		for (i = 0; i < count; i++) {
++			dom_string_unref(snapshot[i].type);
++			dom_event_listener_unref(snapshot[i].listener);
++		}
++		if (snapshot != fixed)
++			free(snapshot);
+ 	}
+ 
+ 	if (evt->prevent_default == true)

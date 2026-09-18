@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!-- Flexbox 4.1: an absolutely positioned child of a flex container
+     does not take part in flex layout. NetSurf turned such a child into
+     an inline block so it would sit in an inline container, and inside
+     a flex container that anonymous container became an item of its
+     own and took space along the main axis: openmediavault's login page
+     overlays its background and its toolbar that way, and they pushed
+     the card holding the form off the side of the screen.
+     Expected: a grey row with one green item filling it, the two
+     overlays drawn on top at the left, and PASS lines. -->
+<html><head><style>
+body { margin: 0; font: 14px/1.2 sans-serif }
+.row { display: flex; width: 400px; height: 60px; background: #ddd;
+	position: relative }
+.item { flex: 1 1 auto; background: #cfc }
+.over { position: absolute; top: 0; left: 0; width: 40px; height: 20px;
+	background: rgba(255,0,0,.5) }
+.overinline { position: absolute; top: 20px; left: 0; background: rgba(0,0,255,.5) }
+</style></head><body>
+<div class="row">
+  <div class="over"></div>
+  <span class="overinline">over</span>
+  <div class="item" id="i">item</div>
+</div>
+<script>
+setTimeout(function(){
+ function r(sel){ var e = document.querySelector(sel); var b = e.getBoundingClientRect();
+	return [Math.round(b.left), Math.round(b.width)]; }
+ var item = r('.item'), over = r('.over'), oi = r('.overinline');
+ console.log((item[0] === 0 && item[1] === 400 ? 'PASS' : 'FAIL') +
+	     ' flex item keeps the whole line ' + item.join(' wide '));
+ console.log((over[0] === 0 && oi[0] === 0 ? 'PASS' : 'FAIL') +
+	     ' overlays start at the left edge ' + over[0] + ' ' + oi[0]);
+},600);
+</script></body></html>
