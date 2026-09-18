@@ -68,7 +68,28 @@ Object.defineProperty(P,'lastElementChild',{configurable:true,get:function(){var
 Object.defineProperty(P,'parentElement',{configurable:true,get:function(){var p=this.parentNode;return p&&p.nodeType===1?p:null;}});
 Object.defineProperty(P,'innerText',{configurable:true,get:function(){return this.textContent;},set:function(v){this.textContent=v;}});
 Object.defineProperty(P,'outerHTML',{configurable:true,get:function(){return '';}});
-['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;Object.defineProperty(P,a,{configurable:true,get:function(){if(!reflectsOn(this,a))return undefined;var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(attr,String(v));}});});
+/* A canvas, an image and a video report width and height as numbers,
+   and a charting library does arithmetic with them: as strings every
+   size it worked out came out as text joined together (VitaSurf). */
+var NUMERIC_SIZE=' CANVAS IMG VIDEO ';
+['width','height'].forEach(function(a){Object.defineProperty(P,a,{configurable:true,
+ get:function(){if(NUMERIC_SIZE.indexOf(' '+this.tagName+' ')<0)return undefined;
+  var v=this.getAttribute(a);
+  if(v===null||v==='')return this.tagName==='CANVAS'?(a==='width'?300:150):0;
+  var n=parseInt(v,10);return isNaN(n)?0:n;},
+ set:function(v){if(NUMERIC_SIZE.indexOf(' '+this.tagName+' ')<0)
+   return shadowProp(this,a,v);
+  this.setAttribute(a,String(Math.max(0,Math.round(Number(v))||0)));}});});
+['value','type','name','title','alt','rel','target','method','placeholder','lang','dir','htmlFor','content','charset','width','height'].forEach(function(a){var attr=a==='htmlFor'?'for':a;
+ /* width and height on a canvas, an image or a video are numbers, and
+    the accessors above already answer for those elements */
+ var numeric=(a==='width'||a==='height');
+ Object.defineProperty(P,a,{configurable:true,get:function(){
+  if(numeric&&NUMERIC_SIZE.indexOf(' '+this.tagName+' ')>=0){
+   var nv=this.getAttribute(a);
+   if(nv===null||nv==='')return this.tagName==='CANVAS'?(a==='width'?300:150):0;
+   var nn=parseInt(nv,10);return isNaN(nn)?0:nn;}
+  if(!reflectsOn(this,a))return undefined;var v=this.getAttribute(attr);return v===null?'':v;},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(attr,String(v));}});});
 /* The URL-valued attributes reflect as resolved absolute URLs, not as
  * written. getAttribute still gives what the document said. Code tests
  * these against a scheme -- webpack decides its public path by matching
@@ -4007,13 +4028,58 @@ function ImageData(w,h){
  if(typeof w==='object'){this.data=w;this.width=h||0;this.height=arguments[2]||0;}
  else{this.width=w|0;this.height=h|0;this.data=new Uint8ClampedArray(this.width*this.height*4);}
  this.colorSpace='srgb';}
-function CanvasGradient(){}
-CanvasGradient.prototype.addColorStop=function(){};
+function CanvasGradient(){this.__stops=[];}
+/* the stops are kept so a fill with a gradient draws the colour it ends
+   up closest to rather than black; there is no gradient fill yet */
+CanvasGradient.prototype.addColorStop=function(o,c){this.__stops.push(c);
+ this.__middle=this.__stops[Math.floor(this.__stops.length/2)]||c;};
 function CanvasPattern(){}
 CanvasPattern.prototype.setTransform=function(){};
 function Path2D(){}
 ['addPath','closePath','moveTo','lineTo','bezierCurveTo','quadraticCurveTo','arc','arcTo',
  'ellipse','rect','roundRect'].forEach(function(k){Path2D.prototype[k]=function(){};});
+/* The 2D context draws for real: it keeps the state a page sets, turns
+   curves into line segments, applies its own transform, and hands the
+   points to the rasteriser behind __vitaCanvasPath, which fills the
+   bitmap the renderer paints for the element. Text, images and clipping
+   are not drawn yet. */
+var CANVAS_NAMES={black:0x000000,silver:0xc0c0c0,gray:0x808080,grey:0x808080,
+ white:0xffffff,maroon:0x800000,red:0xff0000,purple:0x800080,fuchsia:0xff00ff,
+ magenta:0xff00ff,green:0x008000,lime:0x00ff00,olive:0x808000,yellow:0xffff00,
+ navy:0x000080,blue:0x0000ff,teal:0x008080,aqua:0x00ffff,cyan:0x00ffff,
+ orange:0xffa500,pink:0xffc0cb,brown:0xa52a2a,gold:0xffd700,
+ lightgray:0xd3d3d3,lightgrey:0xd3d3d3,darkgray:0xa9a9a9,darkgrey:0xa9a9a9,
+ lightblue:0xadd8e6,darkblue:0x00008b,lightgreen:0x90ee90,darkgreen:0x006400,
+ dimgray:0x696969,dimgrey:0x696969,whitesmoke:0xf5f5f5,gainsboro:0xdcdcdc};
+function canvasColour(v,alpha){
+ /* to 0xRRGGBBAA, the form the rasteriser takes */
+ if(v&&typeof v==='object'){ v=v.__middle||'#000000'; }
+ var s=String(v==null?'#000000':v).trim();
+ var r=0,g=0,b=0,a=1,m;
+ if(s.charAt(0)==='#'){
+  if(s.length===4||s.length===5){
+   r=parseInt(s.charAt(1)+s.charAt(1),16);g=parseInt(s.charAt(2)+s.charAt(2),16);
+   b=parseInt(s.charAt(3)+s.charAt(3),16);
+   if(s.length===5)a=parseInt(s.charAt(4)+s.charAt(4),16)/255;
+  }else if(s.length>=7){
+   r=parseInt(s.substr(1,2),16);g=parseInt(s.substr(3,2),16);b=parseInt(s.substr(5,2),16);
+   if(s.length>=9)a=parseInt(s.substr(7,2),16)/255;
+  }
+ }else if((m=/^rgba?\(([^)]*)\)$/i.exec(s))){
+  var p=m[1].split(/[,\/\s]+/).filter(function(x){return x!=='';});
+  r=parseFloat(p[0]);g=parseFloat(p[1]);b=parseFloat(p[2]);
+  if(p.length>3)a=p[3].indexOf('%')>=0?parseFloat(p[3])/100:parseFloat(p[3]);
+  if(String(p[0]).indexOf('%')>=0){r=r*255/100;g=g*255/100;b=b*255/100;}
+ }else if(/^transparent$/i.test(s)){a=0;}
+ else{var nc=CANVAS_NAMES[s.toLowerCase()];
+  if(nc!=null){r=(nc>>16)&255;g=(nc>>8)&255;b=nc&255;}}
+ if(!(a>=0))a=1;if(a>1)a=1;
+ a*=(alpha==null?1:alpha);
+ r=Math.max(0,Math.min(255,Math.round(r)));
+ g=Math.max(0,Math.min(255,Math.round(g)));
+ b=Math.max(0,Math.min(255,Math.round(b)));
+ return ((r<<24)>>>0)+(g<<16)+(b<<8)+Math.round(Math.max(0,Math.min(255,a*255)));
+}
 function CanvasRenderingContext2D(canvas){
  this.canvas=canvas;this.fillStyle='#000000';this.strokeStyle='#000000';
  this.lineWidth=1;this.lineCap='butt';this.lineJoin='miter';this.miterLimit=10;
@@ -4023,15 +4089,124 @@ function CanvasRenderingContext2D(canvas){
  this.fontVariantCaps='normal';this.textRendering='auto';
  this.globalAlpha=1;this.globalCompositeOperation='source-over';this.filter='none';
  this.imageSmoothingEnabled=true;this.imageSmoothingQuality='low';
- this.shadowBlur=0;this.shadowColor='rgba(0, 0, 0, 0)';this.shadowOffsetX=0;this.shadowOffsetY=0;}
+ this.shadowBlur=0;this.shadowColor='rgba(0, 0, 0, 0)';this.shadowOffsetX=0;this.shadowOffsetY=0;
+ this.__m=[1,0,0,1,0,0];      /* the current transform */
+ this.__stack=[];             /* what save() put by */
+ this.__subs=[];              /* the path, subpath by subpath */
+ this.__cur=null;             /* the subpath being added to */
+ this.__start=null;           /* where the current subpath began */
+}
 (function(){var C=CanvasRenderingContext2D.prototype;
- ('save restore scale rotate translate transform setTransform resetTransform reset '+
-  'clearRect fillRect strokeRect beginPath closePath moveTo lineTo bezierCurveTo '+
-  'quadraticCurveTo arc arcTo ellipse rect roundRect fill stroke clip drawFocusIfNeeded '+
-  'scrollPathIntoView fillText strokeText drawImage putImageData setLineDash '+
-  'createImageBitmap').split(' ').forEach(function(k){C[k]=function(){};});
+ /* a point through the current transform */
+ function tx(c,x,y){var m=c.__m;return [m[0]*x+m[2]*y+m[4],m[1]*x+m[3]*y+m[5]];}
+ /* roughly how much the transform scales lengths */
+ function scaleOf(c){var m=c.__m;
+  return Math.sqrt(Math.abs(m[0]*m[3]-m[1]*m[2]))||1;}
+ function push(c,x,y){var p=tx(c,x,y);
+  if(c.__cur===null){c.__cur=[];c.__subs.push(c.__cur);}
+  c.__cur.push(p[0],p[1]);}
+ C.save=function(){this.__stack.push({m:this.__m.slice(),fill:this.fillStyle,
+  stroke:this.strokeStyle,lw:this.lineWidth,ga:this.globalAlpha,font:this.font,
+  align:this.textAlign,base:this.textBaseline,cap:this.lineCap,join:this.lineJoin});
+  if(this.__stack.length>64)this.__stack.shift();};
+ C.restore=function(){var s=this.__stack.pop();if(!s)return;
+  this.__m=s.m;this.fillStyle=s.fill;this.strokeStyle=s.stroke;this.lineWidth=s.lw;
+  this.globalAlpha=s.ga;this.font=s.font;this.textAlign=s.align;
+  this.textBaseline=s.base;this.lineCap=s.cap;this.lineJoin=s.join;};
+ C.setTransform=function(a,b,c,d,e,f){
+  if(a&&typeof a==='object'){this.__m=[a.a||0,a.b||0,a.c||0,a.d||0,a.e||0,a.f||0];}
+  else this.__m=[a,b,c,d,e,f];};
+ C.resetTransform=function(){this.__m=[1,0,0,1,0,0];};
+ C.transform=function(a,b,c,d,e,f){var m=this.__m;
+  this.__m=[m[0]*a+m[2]*b,m[1]*a+m[3]*b,m[0]*c+m[2]*d,m[1]*c+m[3]*d,
+            m[0]*e+m[2]*f+m[4],m[1]*e+m[3]*f+m[5]];};
+ C.translate=function(x,y){this.transform(1,0,0,1,x,y);};
+ C.scale=function(x,y){this.transform(x,0,0,y,0,0);};
+ C.rotate=function(r){var c=Math.cos(r),s=Math.sin(r);this.transform(c,s,-s,c,0,0);};
+ C.getTransform=function(){var m=this.__m;
+  return {a:m[0],b:m[1],c:m[2],d:m[3],e:m[4],f:m[5],is2D:true,
+   isIdentity:m[0]===1&&m[1]===0&&m[2]===0&&m[3]===1&&m[4]===0&&m[5]===0};};
+ C.beginPath=function(){this.__subs=[];this.__cur=null;this.__start=null;};
+ C.moveTo=function(x,y){this.__cur=null;this.__start=[x,y];push(this,x,y);};
+ C.lineTo=function(x,y){if(this.__cur===null&&this.__start===null)this.__start=[x,y];
+  push(this,x,y);};
+ C.closePath=function(){if(this.__cur&&this.__start)push(this,this.__start[0],this.__start[1]);
+  this.__cur=null;};
+ C.bezierCurveTo=function(x1,y1,x2,y2,x,y){
+  var p=this.__cur?null:0,last=this.__cur&&this.__cur.length>=2?
+   this.__cur.slice(this.__cur.length-2):null;
+  /* the start of the curve is where the path is now, in user space:
+     it is easier to keep the user-space cursor than to invert */
+  var sx=this.__ux==null?0:this.__ux, sy=this.__uy==null?0:this.__uy;
+  var n=16,i,t,mt;
+  for(i=1;i<=n;i++){t=i/n;mt=1-t;
+   push(this,mt*mt*mt*sx+3*mt*mt*t*x1+3*mt*t*t*x2+t*t*t*x,
+             mt*mt*mt*sy+3*mt*mt*t*y1+3*mt*t*t*y2+t*t*t*y);}
+  this.__ux=x;this.__uy=y;};
+ C.quadraticCurveTo=function(cx,cy,x,y){
+  var sx=this.__ux==null?0:this.__ux, sy=this.__uy==null?0:this.__uy;
+  var n=12,i,t,mt;
+  for(i=1;i<=n;i++){t=i/n;mt=1-t;
+   push(this,mt*mt*sx+2*mt*t*cx+t*t*x, mt*mt*sy+2*mt*t*cy+t*t*y);}
+  this.__ux=x;this.__uy=y;};
+ C.arc=function(x,y,r,a0,a1,ccw){
+  if(!(r>0))r=0;
+  var span=a1-a0,i,n,step;
+  if(ccw){ if(span>0)span-=Math.ceil(span/(2*Math.PI))*2*Math.PI;
+   if(span<=-2*Math.PI)span=-2*Math.PI; }
+  else { if(span<0)span+=Math.ceil(-span/(2*Math.PI))*2*Math.PI;
+   if(span>=2*Math.PI)span=2*Math.PI; }
+  n=Math.max(4,Math.ceil(Math.abs(span)*Math.max(4,Math.min(48,r*scaleOf(this)/2))/1.5));
+  if(n>256)n=256;
+  step=span/n;
+  for(i=0;i<=n;i++)push(this,x+r*Math.cos(a0+step*i),y+r*Math.sin(a0+step*i));
+  this.__ux=x+r*Math.cos(a1);this.__uy=y+r*Math.sin(a1);};
+ C.ellipse=function(x,y,rx,ry,rot,a0,a1,ccw){
+  var span=a1-a0,i,n,t,cx,cy,co=Math.cos(rot||0),si=Math.sin(rot||0);
+  if(ccw&&span>0)span-=2*Math.PI; if(!ccw&&span<0)span+=2*Math.PI;
+  n=Math.max(8,Math.min(128,Math.ceil(Math.abs(span)*12)));
+  for(i=0;i<=n;i++){t=a0+span*i/n;cx=rx*Math.cos(t);cy=ry*Math.sin(t);
+   push(this,x+cx*co-cy*si,y+cx*si+cy*co);}};
+ C.arcTo=function(x1,y1,x2,y2,r){ this.lineTo(x1,y1); this.lineTo(x2,y2); };
+ C.rect=function(x,y,w,h){this.__cur=null;this.__start=[x,y];
+  push(this,x,y);push(this,x+w,y);push(this,x+w,y+h);push(this,x,y+h);
+  push(this,x,y);this.__cur=null;this.__ux=x;this.__uy=y;};
+ C.roundRect=function(x,y,w,h,r){this.rect(x,y,w,h);};
+ function flatten(c){
+  var subs=c.__subs,counts=[],total=0,i,j;
+  for(i=0;i<subs.length;i++){if(subs[i].length>=4){counts.push(subs[i].length/2);
+   total+=subs[i].length;}}
+  if(counts.length===0)return null;
+  var pts=new Float64Array(total),at=0;
+  for(i=0;i<subs.length;i++){if(subs[i].length<4)continue;
+   for(j=0;j<subs[i].length;j++)pts[at++]=subs[i][j];}
+  return {pts:pts,counts:counts};}
+ function draw(c,mode){
+  if(!c.canvas||typeof __vitaCanvasPath!=='function')return;
+  var f=flatten(c);if(!f)return;
+  var colour=canvasColour(mode===2?c.strokeStyle:c.fillStyle,c.globalAlpha);
+  __vitaCanvasPath(c.canvas,f.pts,f.counts,colour,mode,
+   mode===2?Math.abs(c.lineWidth*scaleOf(c)):0);}
+ C.fill=function(rule){draw(this,String(rule)==='evenodd'?1:0);};
+ C.stroke=function(){draw(this,2);};
+ C.clip=function(){};
+ C.clearRect=function(x,y,w,h){
+  if(!this.canvas||typeof __vitaCanvasClear!=='function')return;
+  var a=tx(this,x,y),b=tx(this,x+w,y+h);
+  __vitaCanvasClear(this.canvas,Math.min(a[0],b[0]),Math.min(a[1],b[1]),
+   Math.abs(b[0]-a[0]),Math.abs(b[1]-a[1]));};
+ C.fillRect=function(x,y,w,h){var keep=this.__subs,kc=this.__cur,ks=this.__start;
+  this.__subs=[];this.__cur=null;this.rect(x,y,w,h);draw(this,0);
+  this.__subs=keep;this.__cur=kc;this.__start=ks;};
+ C.strokeRect=function(x,y,w,h){var keep=this.__subs,kc=this.__cur,ks=this.__start;
+  this.__subs=[];this.__cur=null;this.rect(x,y,w,h);draw(this,2);
+  this.__subs=keep;this.__cur=kc;this.__start=ks;};
+ C.reset=function(){this.__m=[1,0,0,1,0,0];this.beginPath();
+  if(this.canvas&&typeof __vitaCanvasClear==='function')
+   __vitaCanvasClear(this.canvas,0,0,this.canvas.width||300,this.canvas.height||150);};
+ ('drawFocusIfNeeded scrollPathIntoView fillText strokeText drawImage putImageData '+
+  'setLineDash createImageBitmap').split(' ').forEach(function(k){C[k]=function(){};});
  C.isPointInPath=C.isPointInStroke=function(){return false;};
- C.getTransform=function(){return {a:1,b:0,c:0,d:1,e:0,f:0,is2D:true,isIdentity:true};};
  C.getLineDash=function(){return [];};
  /* Enough of a width for code that centres text or sizes a box by it. */
  C.measureText=function(t){var px=parseFloat(this.font)||10;

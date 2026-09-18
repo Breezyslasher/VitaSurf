@@ -135,8 +135,11 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
         "/* generated from ${PRELUDE_PARTS} */\n"
         "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n")
-    target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c)
-    target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}/generated")
+    # canvas.c rasterises what a page draws into a <canvas>, which the
+    # engine hands over as flattened paths
+    target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/canvas.c)
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        "${CMAKE_BINARY_DIR}/generated" vita/js)
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE

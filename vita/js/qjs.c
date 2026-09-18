@@ -55,6 +55,7 @@
 
 #include "vita_platform.h"
 #include "vita_input.h"
+#include "canvas.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -4869,6 +4870,184 @@ static void inline_border_box(struct box *box, int *px, int *py,
 	*ph = y1 - y0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Canvas                                                                    */
+
+/**
+ * The drawing surface of the canvas element in argv[0] (VitaSurf).
+ *
+ * Its size is the width and height attributes, which is what the page
+ * draws in, whatever size CSS gives the element on the screen.
+ */
+static struct vita_canvas *canvas_of(JSContext *ctx, JSValueConst v)
+{
+	struct dom_node *node = JS_GetOpaque(v, node_class_id);
+	dom_string *attr = NULL;
+	long width = 300, height = 150;
+
+	(void) ctx;
+	if (node == NULL) {
+		return NULL;
+	}
+
+	if (dom_element_get_attribute(node, corestring_dom_width, &attr) ==
+			DOM_NO_ERR && attr != NULL) {
+		width = strtol(dom_string_data(attr), NULL, 10);
+		dom_string_unref(attr);
+	}
+	attr = NULL;
+	if (dom_element_get_attribute(node, corestring_dom_height, &attr) ==
+			DOM_NO_ERR && attr != NULL) {
+		height = strtol(dom_string_data(attr), NULL, 10);
+		dom_string_unref(attr);
+	}
+
+	return vita_canvas_get(node, (int) width, (int) height);
+}
+
+
+/**
+ * Read the points of a path out of a Float64Array.
+ *
+ * The context flattens curves and applies its transform before it gets
+ * here, so a path is only ever points and the counts that say where one
+ * subpath ends and the next starts.
+ */
+static double *canvas_points(JSContext *ctx, JSValueConst v, int *n_out)
+{
+	size_t byte_offset = 0, byte_length = 0, bytes_per = 0;
+	JSValue buffer;
+	uint8_t *bytes;
+	size_t size = 0;
+
+	buffer = JS_GetTypedArrayBuffer(ctx, v, &byte_offset, &byte_length,
+					&bytes_per);
+	if (JS_IsException(buffer)) {
+		return NULL;
+	}
+	bytes = JS_GetArrayBuffer(ctx, &size, buffer);
+	JS_FreeValue(ctx, buffer);
+	if (bytes == NULL || bytes_per != sizeof(double)) {
+		return NULL;
+	}
+
+	*n_out = (int) (byte_length / sizeof(double));
+
+	return (double *) (bytes + byte_offset);
+}
+
+
+/**
+ * __vitaCanvasPath(node, points, counts, colour, mode, lineWidth)
+ *
+ * mode 0 fills by the nonzero rule, 1 by even-odd, 2 strokes.
+ */
+static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	double *points;
+	int *counts = NULL;
+	uint32_t colour = 0;
+	int32_t mode = 0;
+	double line_width = 1;
+	int n_points = 0;
+	uint32_t n_sub = 0, i;
+	int total = 0;
+
+	(void) this_val;
+	if (argc < 5) {
+		return JS_UNDEFINED;
+	}
+
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_UNDEFINED;
+	}
+
+	points = canvas_points(ctx, argv[1], &n_points);
+	if (points == NULL || n_points < 4) {
+		return JS_UNDEFINED;
+	}
+
+	if (JS_ToUint32(ctx, &colour, argv[3]) != 0 ||
+	    JS_ToInt32(ctx, &mode, argv[4]) != 0) {
+		return JS_UNDEFINED;
+	}
+	if (argc > 5) {
+		JS_ToFloat64(ctx, &line_width, argv[5]);
+	}
+
+	{
+		JSValue len = JS_GetPropertyStr(ctx, argv[2], "length");
+
+		if (JS_ToUint32(ctx, &n_sub, len) != 0) {
+			n_sub = 0;
+		}
+		JS_FreeValue(ctx, len);
+	}
+	if (n_sub == 0 || n_sub > 4096) {
+		return JS_UNDEFINED;
+	}
+
+	counts = malloc(n_sub * sizeof(*counts));
+	if (counts == NULL) {
+		return JS_UNDEFINED;
+	}
+	for (i = 0; i < n_sub; i++) {
+		JSValue item = JS_GetPropertyUint32(ctx, argv[2], i);
+		int32_t count = 0;
+
+		JS_ToInt32(ctx, &count, item);
+		JS_FreeValue(ctx, item);
+		counts[i] = count;
+		total += count;
+	}
+	if (total * 2 > n_points) {
+		free(counts);
+		return JS_UNDEFINED;
+	}
+
+	if (mode == 2) {
+		vita_canvas_stroke_path(canvas, points, counts, (int) n_sub,
+					colour, line_width);
+	} else {
+		vita_canvas_fill_path(canvas, points, counts, (int) n_sub,
+				      colour, mode == 1);
+	}
+	vita_canvas_finish(canvas);
+	free(counts);
+
+	return JS_UNDEFINED;
+}
+
+
+/** __vitaCanvasClear(node, x, y, w, h) */
+static JSValue win_vita_canvas_clear(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct vita_canvas *canvas;
+	double v[4] = { 0, 0, 0, 0 };
+	int i;
+
+	(void) this_val;
+	if (argc < 5) {
+		return JS_UNDEFINED;
+	}
+	canvas = canvas_of(ctx, argv[0]);
+	if (canvas == NULL) {
+		return JS_UNDEFINED;
+	}
+	for (i = 0; i < 4; i++) {
+		JS_ToFloat64(ctx, &v[i], argv[i + 1]);
+	}
+	vita_canvas_clear_rect(canvas, v[0], v[1], v[2], v[3]);
+	vita_canvas_finish(canvas);
+
+	return JS_UNDEFINED;
+}
+
+
 static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
@@ -5175,6 +5354,12 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_dom_gen, "__vitaDomGen", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasPath",
+			  JS_NewCFunction(ctx, win_vita_canvas_path,
+					  "__vitaCanvasPath", 6));
+	JS_SetPropertyStr(ctx, global, "__vitaCanvasClear",
+			  JS_NewCFunction(ctx, win_vita_canvas_clear,
+					  "__vitaCanvasClear", 5));
 	JS_SetPropertyStr(ctx, global, "__vitaElementFromPoint",
 			  JS_NewCFunction(ctx, win_vita_element_from_point,
 					  "__vitaElementFromPoint", 2));

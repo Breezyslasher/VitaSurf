@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<!-- The 2D context accepted every call and drew nothing, so every chart
+     on a dashboard was an empty card: openmediavault's processor and
+     memory gauges are canvases, as most charting libraries are. The
+     context now keeps its state, flattens curves and hands the paths to
+     a rasteriser that fills the bitmap the renderer paints.
+     Expected: a grey ring with a blue segment and a white hole, a red
+     line along the top and right, a half-transparent green square, and
+     PASS lines. -->
+<html><head><style>body { margin: 0; background: #fff }</style></head><body>
+<canvas id="c" width="200" height="120"></canvas>
+<script>
+var c = document.getElementById('c'), x = c.getContext('2d');
+x.fillStyle = '#e0e0e0';
+x.beginPath(); x.arc(100, 60, 50, 0, Math.PI * 2); x.fill();
+x.fillStyle = '#3399ff';
+x.beginPath(); x.moveTo(100, 60);
+x.arc(100, 60, 50, -Math.PI / 2, Math.PI / 3); x.closePath(); x.fill();
+x.fillStyle = '#ffffff';
+x.beginPath(); x.arc(100, 60, 30, 0, Math.PI * 2); x.fill();
+x.strokeStyle = '#ff0000'; x.lineWidth = 3;
+x.beginPath(); x.moveTo(10, 10); x.lineTo(190, 10); x.lineTo(190, 110); x.stroke();
+x.fillStyle = 'rgba(0,128,0,0.5)'; x.fillRect(10, 80, 40, 30);
+setTimeout(function(){
+ /* the context is real: it keeps what it is given and reports a
+    transform of its own */
+ x.save(); x.translate(10, 20); x.scale(2, 2);
+ var t = x.getTransform();
+ var moved = t.a === 2 && t.d === 2 && t.e === 10 && t.f === 20;
+ x.restore();
+ var back = x.getTransform();
+ console.log((moved && back.a === 1 && back.e === 0 ? 'PASS' : 'FAIL') +
+	     ' canvas transform saved and restored');
+ console.log((typeof x.fill === 'function' && x.canvas === c &&
+	      c.width === 200 ? 'PASS' : 'FAIL') + ' canvas context in place');
+},600);
+</script></body></html>
