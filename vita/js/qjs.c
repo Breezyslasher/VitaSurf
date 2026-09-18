@@ -4901,12 +4901,26 @@ static struct js_gap js_gaps[GAP_MAX];
 static unsigned int js_gap_count;
 static unsigned int js_gap_dropped;
 
+static void gap_report(void);
+
 static void gap_reset(void)
 {
 	memset(js_gaps, 0, sizeof(js_gaps));
 	js_gap_count = 0;
 	js_gap_dropped = 0;
 }
+
+/*
+ * The tally is printed when the page closes, which is too late for a
+ * page that is stuck: the one worth asking about cannot be navigated
+ * away from without losing what it had to say. The Start menu's layout
+ * dump calls this to print it where it stands (VitaSurf).
+ */
+void vita_js_report_gaps(void)
+{
+	gap_report();
+}
+
 
 static void gap_report(void)
 {

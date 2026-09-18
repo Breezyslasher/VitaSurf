@@ -957,6 +957,51 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 /**
  * Log the boxes of the page in the window, if the flag file asks.
  */
+/*
+ * The tally of Web APIs the page asked for that this build does not
+ * have. It lives in the QuickJS bindings, which the duktape build does
+ * not compile, so the symbol is weak and the call is skipped there.
+ */
+extern void vita_js_report_gaps(void) __attribute__((weak));
+
+/**
+ * Write the fetches of the page now on screen to the log.
+ *
+ * The Log screen draws the same figures, but a picture has to be read
+ * off a photograph of a handheld; these lines go into the file that a
+ * report is made of. A page that is still waiting on something is
+ * exactly the case where that matters, and it is the case where the
+ * page cannot be navigated away from to see the waterfall either.
+ */
+static void dump_timeline(void)
+{
+	unsigned int count = vitasurf_timeline_count();
+	unsigned int i;
+
+	vita_log("fetches: %u of %u recorded, %u ms from the first request "
+		 "to the last byte", count, vitasurf_timeline_seen(),
+		 vitasurf_timeline_span());
+
+	for (i = 0; i < count; i++) {
+		const struct vitasurf_fetch *f = vitasurf_timeline_get(i);
+		const char *how = "done";
+
+		switch (f->state) {
+		case VITASURF_FETCH_ERROR:   how = "failed"; break;
+		case VITASURF_FETCH_ABORTED: how = "abandoned"; break;
+		case VITASURF_FETCH_RUNNING: how = "still running"; break;
+		default: break;
+		}
+		vita_log("fetches: %4u %6u ms + %6u ms  %7u B  %3d  %-13s %s",
+			 i, f->start_ms,
+			 (f->state != VITASURF_FETCH_RUNNING ?
+				f->end_ms : vitasurf_timeline_span()) -
+				f->start_ms,
+			 f->bytes, f->status, how, f->url);
+	}
+}
+
+
 static void dump_layout(struct gui_window *gw, bool force)
 {
 	struct hlcache_handle *h;
@@ -976,6 +1021,10 @@ static void dump_layout(struct gui_window *gw, bool force)
 	root = html_get_box_tree(h);
 	if (root == NULL) {
 		return;
+	}
+	dump_timeline();
+	if (vita_js_report_gaps != NULL) {
+		vita_js_report_gaps();
 	}
 	vita_log("layout: the first %u boxes of the page, "
 		 "size then position", left);
