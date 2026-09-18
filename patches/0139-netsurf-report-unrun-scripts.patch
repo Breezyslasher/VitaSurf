@@ -31,19 +31,29 @@ index 0824a0b2e..24d920eca 100644
  	} else if (nsoption_bool(incremental_reflow) &&
  		   event->type == CONTENT_MSG_DONE &&
 diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
-index 519edf8de..85794156c 100644
+index 519edf8de..a8763458b 100644
 --- a/content/handlers/html/private.h
 +++ b/content/handlers/html/private.h
-@@ -148,6 +148,8 @@ typedef struct html_content {
+@@ -148,6 +148,18 @@ typedef struct html_content {
  	/** Number of entries in scripts */
  	unsigned int scripts_count;
  	/** Scripts */
 +	/** whether the log has already named this page's unrun scripts */
 +	bool scripts_reported;
++	/**
++	 * How deep the parser is inside running a script (VitaSurf).
++	 *
++	 * It should never be more than one: a script runs to completion
++	 * before the parser reads another. Audiobookshelf's log shows the
++	 * parser reaching its third bundle while the second was still
++	 * running, and the pause each one asks for does not survive being
++	 * nested, so the fourth is never read.
++	 */
++	unsigned int script_depth;
  	struct html_script *scripts;
  	/** javascript thread in use */
  	struct jsthread *jsthread;
-@@ -329,6 +331,13 @@ bool html_saw_insecure_scripts(html_content *htmlc);
+@@ -329,6 +341,13 @@ bool html_saw_insecure_scripts(html_content *htmlc);
   */
  nserror html_proceed_to_done(html_content *html);
  
@@ -58,7 +68,7 @@ index 519edf8de..85794156c 100644
  /* in html/redraw.c */
  bool html_redraw(struct content *c, struct content_redraw_data *data,
 diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
-index 3328165e3..f1216cd87 100644
+index 3328165e3..fdce5991a 100644
 --- a/content/handlers/html/script.c
 +++ b/content/handlers/html/script.c
 @@ -185,6 +185,66 @@ static void script_fetch_settled(html_content *c)
@@ -128,7 +138,50 @@ index 3328165e3..f1216cd87 100644
  /**
   * Callback for asyncronous scripts
   */
-@@ -474,6 +534,16 @@ exec_src_script(html_content *c,
+@@ -373,8 +433,10 @@ convert_script_sync_cb(hlcache_handle *script,
+ 			const uint8_t *data;
+ 			size_t size;
+ 			data = content_get_source_data(s->data.handle, &size );
++			parent->script_depth++;
+ 			script_handler(parent->jsthread, data, size,
+ 				       nsurl_access(hlcache_handle_get_url(s->data.handle)));
++			parent->script_depth--;
+ 		} else {
+ 			/*
+ 			 * It arrived and was then dropped, without a word:
+@@ -397,6 +459,23 @@ convert_script_sync_cb(hlcache_handle *script,
+ 			if (err != DOM_HUBBUB_OK) {
+ 				NSLOG(netsurf, INFO, "unpause returned 0x%x", err);
+ 			}
++			vita_log("script: %u ran, parser told to carry on%s",
++				 i, err == DOM_HUBBUB_OK ? "" :
++					" (which it refused)");
++		} else {
++			/*
++			 * The parser is left paused here, waiting for
++			 * whichever script this is still counting. If
++			 * nothing lifts it the rest of the document is
++			 * never read, and a page whose app is mounted by
++			 * a later bundle stops on its loading screen
++			 * (VitaSurf).
++			 */
++			vita_log("script: %u ran, parser left paused "
++				 "(%s, %u sync fetches still out)", i,
++				 parent->parser == NULL ? "no parser" :
++					"waiting on another script",
++				 active_sync_scripts);
+ 		}
+ 
+ 		break;
+@@ -461,6 +540,7 @@ exec_src_script(html_content *c,
+ 	bool defer;
+ 	enum html_script_type script_type;
+ 	hlcache_handle_callback script_cb;
++	unsigned int script_idx;
+ 	dom_hubbub_error ret = DOM_HUBBUB_OK;
+ 	dom_exception exc; /* returned by libdom functions */
+ 
+@@ -474,6 +554,16 @@ exec_src_script(html_content *c,
  	NSLOG(netsurf, INFO, "script %i '%s'", c->scripts_count,
  	      nsurl_access(joined));
  
@@ -145,3 +198,51 @@ index 3328165e3..f1216cd87 100644
  	/* there are three ways to process the script tag at this point:
  	 *
  	 * Syncronously  pause the parent parse and continue after
+@@ -532,6 +622,7 @@ exec_src_script(html_content *c,
+ 		content_broadcast_error(&c->base, NSERROR_NOMEM, NULL);
+ 		return DOM_HUBBUB_NOMEM;
+ 	}
++	script_idx = (unsigned int) (nscript - c->scripts);
+ 
+ 	/* set up child fetch encoding and quirks */
+ 	child.charset = c->encoding;
+@@ -566,9 +657,26 @@ exec_src_script(html_content *c,
+ 		c->base.active++;
+ 		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
+ 
++		/* running a script can add another, which moves the array */
++		nscript = &c->scripts[script_idx];
++
+ 		switch (script_type) {
+ 		case HTML_SCRIPT_SYNC:
+-			ret =  DOM_HUBBUB_HUBBUB_ERR | HUBBUB_PAUSED;
++			/*
++			 * Content already in the cache is delivered inside
++			 * the retrieve above, so by now the callback may
++			 * have run this script and told the parser to
++			 * carry on. Pausing after that is a pause with
++			 * nothing left to lift it (VitaSurf).
++			 */
++			if (nscript->already_started == false) {
++				ret = DOM_HUBBUB_HUBBUB_ERR | HUBBUB_PAUSED;
++			} else {
++				vita_log("script: %s was already in hand, so "
++					 "the parser is not paused for it",
++					 nsurl_access(hlcache_handle_get_url(
++						nscript->data.handle)));
++			}
+ 			break;
+ 
+ 		case HTML_SCRIPT_ASYNC:
+@@ -814,6 +922,11 @@ html_process_script(void *ctx, dom_node *node)
+ 		mimetype = dom_string_ref(corestring_dom_text_javascript);
+ 	}
+ 
++	if (c->script_depth > 0) {
++		vita_log("script: the parser reached another script while "
++			 "%u was still running", c->script_depth);
++	}
++
+ 	exc = dom_element_get_attribute(node, corestring_dom_src, &src);
+ 	if (exc != DOM_NO_ERR || src == NULL) {
+ 		err = exec_inline_script(c, node, mimetype);
