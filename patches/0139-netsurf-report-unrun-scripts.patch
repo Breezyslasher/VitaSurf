@@ -1,0 +1,100 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index eb5461434..8267f5975 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -305,6 +305,7 @@ html_proceed_to_done(html_content *html)
+ 	switch (content__get_status(&html->base)) {
+ 	case CONTENT_STATUS_READY:
+ 		if (html->base.active == 0) {
++			html_report_scripts(html);
+ 			content_set_done(&html->base);
+ 			return NSERROR_OK;
+ 		}
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 519edf8de..4a5907699 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -329,6 +329,13 @@ bool html_saw_insecure_scripts(html_content *htmlc);
+  */
+ nserror html_proceed_to_done(html_content *html);
+ 
++/**
++ * Say in the log which of a page's scripts never ran (VitaSurf).
++ *
++ * Silent when they all did, so an ordinary page says nothing.
++ */
++void html_report_scripts(html_content *c);
++
+ 
+ /* in html/redraw.c */
+ bool html_redraw(struct content *c, struct content_redraw_data *data,
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 3328165e3..52fece0b2 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -185,6 +185,65 @@ static void script_fetch_settled(html_content *c)
+ 	}
+ }
+ 
++/* exported interface documented in html/private.h */
++void html_report_scripts(html_content *c)
++{
++	unsigned int i, ran = 0, meant = 0;
++	struct html_script *s;
++	static const char *kind[] = {
++		"inline", "sync", "defer", "async", "preload"
++	};
++
++	if (c == NULL || c->scripts_count == 0) {
++		return;
++	}
++
++	/* a preload is fetched to be ready, never to be run on its own */
++	for (i = 0, s = c->scripts; i != c->scripts_count; i++, s++) {
++		if (s->type == HTML_SCRIPT_PRELOAD) {
++			continue;
++		}
++		meant++;
++		if (s->already_started) {
++			ran++;
++		}
++	}
++	if (ran == meant) {
++		return;		/* nothing to explain */
++	}
++
++	/*
++	 * A page whose last bundle is the one that mounts its app looks
++	 * exactly like a page still loading, and until now the log said
++	 * only how many scripts had compiled, never which ones were left
++	 * (VitaSurf).
++	 */
++	vita_log("scripts: %u of %u ran", ran, meant);
++	for (i = 0, s = c->scripts; i != c->scripts_count; i++, s++) {
++		if (s->already_started || s->type == HTML_SCRIPT_PRELOAD) {
++			continue;
++		}
++		{
++			nsurl *url = NULL;
++
++			if (s->type != HTML_SCRIPT_INLINE &&
++					s->data.handle != NULL) {
++				url = hlcache_handle_get_url(s->data.handle);
++			}
++			vita_log("scripts: %u %s not run, %s: %s", i,
++				 (unsigned) s->type < 5 ? kind[s->type] : "?",
++				 s->data.handle == NULL ? "no content" :
++					(content_get_status(s->data.handle) ==
++						CONTENT_STATUS_DONE ?
++						"content is complete and "
++						"waiting" :
++						"content is still arriving"),
++				 url != NULL ? nsurl_access(url) : "<no url>");
++		}
++	}
++}
++
++
+ /**
+  * Callback for asyncronous scripts
+  */

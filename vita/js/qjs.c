@@ -7822,7 +7822,19 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	bool ok;
 	char *src;
 
-	if (thread == NULL || thread->closed || txt == NULL || txtlen == 0) {
+	if (thread == NULL || txt == NULL || txtlen == 0) {
+		return false;
+	}
+	if (thread->closed) {
+		/*
+		 * The page's engine has already been torn down, so this
+		 * script will never run and nothing said so: a bundle
+		 * that mounts an app leaves the page on its loading
+		 * screen for good (VitaSurf).
+		 */
+		vita_log("script: %s handed over after the page's "
+			 "JavaScript was closed, so it did not run",
+			 name != NULL ? name : "<script>");
 		return false;
 	}
 	/*
