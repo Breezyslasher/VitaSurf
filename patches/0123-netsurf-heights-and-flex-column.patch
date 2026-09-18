@@ -122,10 +122,10 @@ index cd514964e..4df31012e 100644
  
  	NSLOG(flex, DEEPDEBUG, "box %p: available_main: %i",
 diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
-index b506e36d9..7bfb579f1 100644
+index b506e36d9..ce682a63c 100644
 --- a/content/handlers/html/layout_internal.h
 +++ b/content/handlers/html/layout_internal.h
-@@ -136,6 +136,39 @@ static inline bool lh__box_is_inline_flow(const struct box *b)
+@@ -136,6 +136,40 @@ static inline bool lh__box_is_inline_flow(const struct box *b)
  	       b->type == BOX_INLINE_END;
  }
  
@@ -152,20 +152,21 @@ index b506e36d9..7bfb579f1 100644
 +		const css_computed_style *style,
 +		const css_unit_ctx *ctx)
 +{
-+	int small = 0;
-+	int large = 0;
++	/* "small" is a macro in the Vita build, so neither name is free */
++	int at_zero = 0;
++	int at_thousand = 0;
 +
-+	get(style, ctx, 0, &small);
-+	get(style, ctx, 1000, &large);
++	get(style, ctx, 0, &at_zero);
++	get(style, ctx, 1000, &at_thousand);
 +
-+	return small != large;
++	return at_zero != at_thousand;
 +}
 +
 +
  /** Layout helper: Check whether box takes part in inline flow. */
  static inline bool lh__box_is_flex_container(const struct box *b)
  {
-@@ -612,10 +645,20 @@ static inline void layout_find_dimensions(
+@@ -612,10 +646,20 @@ static inline void layout_find_dimensions(
  			containing_block->height != AUTO &&
  			(css_computed_position(box->style) ==
  					CSS_POSITION_ABSOLUTE ||
@@ -188,7 +189,7 @@ index b506e36d9..7bfb579f1 100644
  			basis = containing_block->height;
  		} else if ((!box->parent || !box->parent->parent) &&
  				viewport_height >= 0) {
-@@ -628,6 +671,10 @@ static inline void layout_find_dimensions(
+@@ -628,6 +672,10 @@ static inline void layout_find_dimensions(
  
  		if (htype != CSS_HEIGHT_SET) {
  			*height = AUTO;
@@ -199,7 +200,7 @@ index b506e36d9..7bfb579f1 100644
  		}
  
  		/*
-@@ -707,19 +754,24 @@ static inline void layout_find_dimensions(
+@@ -707,19 +755,24 @@ static inline void layout_find_dimensions(
  	}
  
  	if (max_height) {
