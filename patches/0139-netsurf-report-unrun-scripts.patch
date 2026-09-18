@@ -68,17 +68,17 @@ index 519edf8de..a8763458b 100644
  /* in html/redraw.c */
  bool html_redraw(struct content *c, struct content_redraw_data *data,
 diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
-index 3328165e3..fdce5991a 100644
+index 3328165e3..1275d357b 100644
 --- a/content/handlers/html/script.c
 +++ b/content/handlers/html/script.c
-@@ -185,6 +185,66 @@ static void script_fetch_settled(html_content *c)
+@@ -185,6 +185,131 @@ static void script_fetch_settled(html_content *c)
  	}
  }
  
 +/* exported interface documented in html/private.h */
 +void html_report_scripts(html_content *c)
 +{
-+	unsigned int i, ran = 0, meant = 0;
++	unsigned int i, ran = 0, meant = 0, in_dom = 0, missed = 0;
 +	struct html_script *s;
 +	static const char *kind[] = {
 +		"inline", "sync", "defer", "async", "preload"
@@ -86,6 +86,54 @@ index 3328165e3..fdce5991a 100644
 +
 +	if (c == NULL || c->scripts_count == 0 || c->scripts_reported) {
 +		return;
++	}
++
++	/*
++	 * How many script elements the parsed document actually holds.
++	 * A page can end with scripts the parser never reached -- it was
++	 * left paused, or the document arrived short -- and then there is
++	 * nothing in the list to report, because no entry was ever made.
++	 * Audiobookshelf is that case: three of its four bundles are
++	 * asked for and the fourth is not (VitaSurf).
++	 */
++	if (c->document != NULL) {
++		dom_nodelist *list = NULL;
++		dom_string *name = NULL;
++		uint32_t n = 0, k;
++
++		if (dom_string_create((const uint8_t *) "script", 6,
++				      &name) == DOM_NO_ERR) {
++			if (dom_document_get_elements_by_tag_name(c->document,
++					name, &list) == DOM_NO_ERR &&
++					list != NULL) {
++				dom_nodelist_get_length(list, &n);
++				for (k = 0; k < n; k++) {
++					dom_node *node = NULL;
++					bool has = false;
++
++					if (dom_nodelist_item(list, k,
++							&node) != DOM_NO_ERR ||
++							node == NULL) {
++						continue;
++					}
++					/*
++					 * Only one with a src has to become
++					 * an entry; an inline script, and a
++					 * block of JSON a page keeps in a
++					 * script element, never do.
++					 */
++					if (dom_element_has_attribute(node,
++							corestring_dom_src,
++							&has) == DOM_NO_ERR &&
++							has) {
++						in_dom++;
++					}
++					dom_node_unref(node);
++				}
++				dom_nodelist_unref(list);
++			}
++			dom_string_unref(name);
++		}
 +	}
 +
 +	/* a preload is fetched to be ready, never to be run on its own */
@@ -98,8 +146,19 @@ index 3328165e3..fdce5991a 100644
 +			ran++;
 +		}
 +	}
-+	if (ran == meant) {
-+		return;		/* nothing to explain */
++	{
++		unsigned int external = 0;
++
++		for (i = 0, s = c->scripts; i != c->scripts_count; i++, s++) {
++			if (s->type != HTML_SCRIPT_INLINE &&
++					s->type != HTML_SCRIPT_PRELOAD) {
++				external++;
++			}
++		}
++		if (ran == meant && in_dom <= external) {
++			return;		/* nothing to explain */
++		}
++		missed = in_dom > external ? in_dom - external : 0;
 +	}
 +
 +	/*
@@ -109,7 +168,13 @@ index 3328165e3..fdce5991a 100644
 +	 * (VitaSurf).
 +	 */
 +	c->scripts_reported = true;
-+	vita_log("scripts: %u of %u ran", ran, meant);
++	vita_log("scripts: %u of %u ran, and the document holds %u with a "
++		 "src", ran, meant, in_dom);
++	if (missed > 0) {
++		vita_log("scripts: %u of those were never asked for, so the "
++			 "parser stopped short of the end of the document",
++			 missed);
++	}
 +	for (i = 0, s = c->scripts; i != c->scripts_count; i++, s++) {
 +		if (s->already_started || s->type == HTML_SCRIPT_PRELOAD) {
 +			continue;
@@ -138,7 +203,7 @@ index 3328165e3..fdce5991a 100644
  /**
   * Callback for asyncronous scripts
   */
-@@ -373,8 +433,10 @@ convert_script_sync_cb(hlcache_handle *script,
+@@ -373,8 +498,10 @@ convert_script_sync_cb(hlcache_handle *script,
  			const uint8_t *data;
  			size_t size;
  			data = content_get_source_data(s->data.handle, &size );
@@ -149,7 +214,7 @@ index 3328165e3..fdce5991a 100644
  		} else {
  			/*
  			 * It arrived and was then dropped, without a word:
-@@ -397,6 +459,23 @@ convert_script_sync_cb(hlcache_handle *script,
+@@ -397,6 +524,23 @@ convert_script_sync_cb(hlcache_handle *script,
  			if (err != DOM_HUBBUB_OK) {
  				NSLOG(netsurf, INFO, "unpause returned 0x%x", err);
  			}
@@ -173,7 +238,7 @@ index 3328165e3..fdce5991a 100644
  		}
  
  		break;
-@@ -461,6 +540,7 @@ exec_src_script(html_content *c,
+@@ -461,6 +605,7 @@ exec_src_script(html_content *c,
  	bool defer;
  	enum html_script_type script_type;
  	hlcache_handle_callback script_cb;
@@ -181,7 +246,7 @@ index 3328165e3..fdce5991a 100644
  	dom_hubbub_error ret = DOM_HUBBUB_OK;
  	dom_exception exc; /* returned by libdom functions */
  
-@@ -474,6 +554,16 @@ exec_src_script(html_content *c,
+@@ -474,6 +619,16 @@ exec_src_script(html_content *c,
  	NSLOG(netsurf, INFO, "script %i '%s'", c->scripts_count,
  	      nsurl_access(joined));
  
@@ -198,7 +263,7 @@ index 3328165e3..fdce5991a 100644
  	/* there are three ways to process the script tag at this point:
  	 *
  	 * Syncronously  pause the parent parse and continue after
-@@ -532,6 +622,7 @@ exec_src_script(html_content *c,
+@@ -532,6 +687,7 @@ exec_src_script(html_content *c,
  		content_broadcast_error(&c->base, NSERROR_NOMEM, NULL);
  		return DOM_HUBBUB_NOMEM;
  	}
@@ -206,7 +271,7 @@ index 3328165e3..fdce5991a 100644
  
  	/* set up child fetch encoding and quirks */
  	child.charset = c->encoding;
-@@ -566,9 +657,26 @@ exec_src_script(html_content *c,
+@@ -566,9 +722,26 @@ exec_src_script(html_content *c,
  		c->base.active++;
  		NSLOG(netsurf, INFO, "%d fetches active", c->base.active);
  
@@ -234,7 +299,7 @@ index 3328165e3..fdce5991a 100644
  			break;
  
  		case HTML_SCRIPT_ASYNC:
-@@ -814,6 +922,11 @@ html_process_script(void *ctx, dom_node *node)
+@@ -814,6 +987,11 @@ html_process_script(void *ctx, dom_node *node)
  		mimetype = dom_string_ref(corestring_dom_text_javascript);
  	}
  
