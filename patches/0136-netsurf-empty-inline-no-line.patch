@@ -1,0 +1,64 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index a3ac4f929..2dacfef18 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -1407,9 +1407,21 @@ box_noscript(dom_node *n,
+ 	     struct box *box,
+ 	     bool *convert_children)
+ {
+-	/* If scripting is enabled, do not display the contents of noscript */
++	/*
++	 * If scripting is enabled, do not display the contents of
++	 * noscript.
++	 *
++	 * The element itself goes too, which it did not before: with no
++	 * rule for it the element is display: inline, and an empty inline
++	 * still makes a line box. openmediavault's dashboard ends with a
++	 * noscript, and those twenty-one pixels put the page past the
++	 * bottom of the screen and gave it a scrollbar of its own beside
++	 * the one its content area already had. The HTML rendering rules
++	 * ask for display: none here when scripting is enabled.
++	 */
+ 	if (content->enable_scripting) {
+ 		*convert_children = false;
++		box->type = BOX_NONE;
+ 	}
+ 
+ 	return true;
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 99777dce7..c3fddc4de 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2978,6 +2978,32 @@ layout_line(struct box *first,
+ 			b->height = line_height(&content->unit_len_ctx,
+ 					b->style ? b->style :
+ 					b->parent->parent->style);
++
++			/*
++			 * An inline with nothing between it and its end,
++			 * and no box of its own to draw, adds nothing to
++			 * the line: CSS 2.1 9.4.2 asks for a line box of
++			 * no height. It was still a line-height tall here,
++			 * and although the line stayed flat the box
++			 * stretched the scrollable area under it, so a page
++			 * ending in an empty custom element or a noscript
++			 * was a line taller than the screen. That is what
++			 * gave openmediavault's dashboard a scrollbar of
++			 * its own beside the one its content area already
++			 * had (VitaSurf).
++			 */
++			if (b->type == BOX_INLINE && b->text == NULL &&
++					(b->inline_end == NULL ||
++					 b->inline_end == b->next) &&
++					b->padding[TOP] == 0 &&
++					b->padding[BOTTOM] == 0 &&
++					b->border[TOP].width == 0 &&
++					b->border[BOTTOM].width == 0 &&
++					b->margin[TOP] == 0 &&
++					b->margin[BOTTOM] == 0) {
++				b->height = 0;
++			}
++
+ 			if (height < b->height)
+ 				height = b->height;
+ 

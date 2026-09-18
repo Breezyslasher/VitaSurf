@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!-- A page whose last element is an empty inline was a line taller than
+     it should be. An inline with nothing in it and no box of its own
+     still got a line-height of height, and although the line stayed
+     flat the box stretched the scrollable area beneath it, so a page
+     sized to the screen scrolled anyway. openmediavault ends with
+     <noscript>, which is display: none when scripting is on but was
+     laid out as an empty inline all the same, and its dashboard came
+     out twenty-one pixels too tall: the page took a scrollbar of its
+     own beside the one its content area already had.
+     Expected: a grey box filling the frame, no scrolling, PASS lines. -->
+<html><head><style>
+html, body { margin: 0; height: 100%; font: 16px/21px monospace }
+#p { height: 100%; background: #eee }
+#pad { padding: 4px }
+</style></head>
+<body><div id="p">page</div>
+<noscript>This page needs JavaScript.</noscript>
+<x-thing></x-thing><span></span>
+<script>
+setTimeout(function(){
+ function report(ok, what, got, want) {
+  console.log((ok ? 'PASS ' : 'FAIL ') + what +
+              (ok ? '' : ' got ' + got + ', wanted ' + want));
+ }
+ var view = document.documentElement.clientHeight;
+ var page = document.body.scrollHeight;
+ report(page === view, 'empty trailing inlines do not stretch the page',
+        page + ' over a ' + view + ' viewport', 'the two to match');
+
+ /* an empty inline that has a box of its own to draw keeps it, and an
+    inline with text still makes a line */
+ var d = document.createElement('div');
+ d.innerHTML = '<span id="pad"></span>';
+ document.body.appendChild(d);
+ var e = document.createElement('div');
+ e.innerHTML = '<span>x</span>';
+ document.body.appendChild(e);
+ setTimeout(function(){
+  var padded = __vitaBox(document.getElementById('pad'));
+  var texted = getComputedStyle(e).height;
+  report(padded && padded[3] > 21, 'a padded empty inline keeps its box',
+         padded ? padded[3] : 'no box', 'taller than the line it sits on');
+  report(texted === '21px', 'an inline with text still makes a line',
+         texted, '21px');
+ }, 200);
+}, 300);
+</script>
+</body></html>
