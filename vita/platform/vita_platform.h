@@ -63,6 +63,8 @@ void vita_options_floor(void);
 #define VITASURF_STORAGE_DIR    VITASURF_DATA_DIR "/storage"
 #define VITASURF_DOWNLOADS_DIR  VITASURF_DATA_DIR "/downloads"
 #define VITASURF_DOWNLOADS_PAGE VITASURF_DATA_DIR "/downloads.html"
+/* The Log screen: the last page load's waterfall, and the log's tail. */
+#define VITASURF_LOG_PAGE       VITASURF_DATA_DIR "/log.html"
 /* holds the URL of a FlareSolverr server, e.g. http://192.168.1.20:8191/v1 */
 #define VITASURF_FLARESOLVERR_PATH VITASURF_DATA_DIR "/flaresolverr"
 /* The same files as file: URLs NetSurf can open (the Vita file table maps
@@ -70,6 +72,7 @@ void vita_options_floor(void);
 #define VITASURF_BOOKMARKS_URL "file:///ux0:/data/VitaSurf/bookmarks.html"
 #define VITASURF_HISTORY_URL   "file:///ux0:/data/VitaSurf/history.html"
 #define VITASURF_DOWNLOADS_URL "file:///ux0:/data/VitaSurf/downloads.html"
+#define VITASURF_LOG_URL       "file:///ux0:/data/VitaSurf/log.html"
 
 /**
  * Initialise the platform: create the data directory, open the log,

@@ -27,6 +27,8 @@
 
 #include "utils/errors.h"
 #include "utils/nsoption.h"
+/* the load timeline the Log screen draws its waterfall from */
+#include "utils/utils.h"
 #include "utils/nsurl.h"
 #include "netsurf/types.h"
 #include "netsurf/browser_window.h"
@@ -76,6 +78,7 @@ enum item {
 	ITEM_JAVASCRIPT,
 	ITEM_IMAGES,
 	ITEM_DARK_MODE,
+	ITEM_LOG,
 	ITEM_DUMP_LAYOUT,
 	ITEM_QUIT,
 	ITEM_CLOSE,
@@ -364,6 +367,278 @@ static bool write_history_page(void)
 /* ------------------------------------------------------------------------ */
 /* Downloads page                                                           */
 
+/* ------------------------------------------------------------------------ */
+/* The Log screen                                                            */
+
+/** How much of the log's tail the page shows. */
+#define LOG_TAIL_BYTES 24000
+
+/** The colour of a waterfall bar, by what the fetch came to. */
+static const char *fetch_colour(const struct vitasurf_fetch *f, bool pale)
+{
+	switch (f->state) {
+	case VITASURF_FETCH_ERROR:
+		return pale ? "#e7a49c" : "#c0392b";
+	case VITASURF_FETCH_ABORTED:
+		return pale ? "#c9c9c9" : "#8a8a8a";
+	case VITASURF_FETCH_RUNNING:
+		return pale ? "#f0cf94" : "#d98a00";
+	case VITASURF_FETCH_DONE:
+	default:
+		if (f->status >= 400) {
+			return pale ? "#e7a49c" : "#c0392b";
+		}
+		return pale ? "#a9c4ea" : "#2f6fd0";
+	}
+}
+
+
+/**
+ * Draw the last page load as a waterfall.
+ *
+ * One row a fetch: the url, then a track in which the bar starts where
+ * the request went out and ends where the last byte arrived, so the
+ * shape of the load is the shape of the picture. The pale part of a bar
+ * is the wait before the first header, which is the part a slow server
+ * owns; the solid part is the transfer, which is the part the network
+ * owns.
+ *
+ * The bars are spacer and bar elements side by side rather than boxes
+ * positioned over a track, because plain inline-blocks are the thing
+ * most certain to lay out the same here as anywhere.
+ */
+static void write_waterfall(FILE *f)
+{
+	unsigned int count = vitasurf_timeline_count();
+	unsigned int seen = vitasurf_timeline_seen();
+	unsigned int span = vitasurf_timeline_span();
+	unsigned int total_bytes = 0;
+	unsigned int i;
+
+	fputs("<h2>Last page load</h2>\n", f);
+	{
+		/*
+		 * Which page these figures belong to: the one that was on
+		 * screen when the Log screen was asked for, since opening
+		 * it starts a load of its own that clears the timeline.
+		 */
+		struct gui_window *gw = vita_input_window();
+		nsurl *url = NULL;
+
+		if (gw != NULL && browser_window_get_url(gw->bw, false,
+				&url) == NSERROR_OK && url != NULL) {
+			fputs("<p class=\"n\">", f);
+			html_escape(f, nsurl_access(url));
+			fputs("</p>\n", f);
+			nsurl_unref(url);
+		}
+	}
+	if (count == 0) {
+		fputs("<p class=\"u\">No fetches recorded yet. Load a page, "
+		      "then open this screen again.</p>\n", f);
+		return;
+	}
+
+	for (i = 0; i < count; i++) {
+		total_bytes += vitasurf_timeline_get(i)->bytes;
+	}
+	if (span == 0) {
+		span = 1;
+	}
+
+	fprintf(f, "<p class=\"u\">%u fetches%s, %u KB, %u.%01u s from the "
+		"first request to the last byte.</p>\n",
+		seen,
+		seen > count ? " (only the first are timed)" : "",
+		total_bytes / 1024, span / 1000, (span % 1000) / 100);
+
+	fputs("<div class=\"wf\">\n", f);
+	for (i = 0; i < count; i++) {
+		const struct vitasurf_fetch *fe = vitasurf_timeline_get(i);
+		/* a fetch still running is drawn as far as the load got */
+		unsigned int end = fe->state != VITASURF_FETCH_RUNNING ?
+				fe->end_ms : span;
+		unsigned int head = fe->had_header ? fe->header_ms : end;
+		unsigned int lead, wait, body;
+
+		if (end < fe->start_ms) {
+			end = fe->start_ms;
+		}
+		if (head < fe->start_ms || head > end) {
+			head = end;
+		}
+
+		/* in hundredths of the track, so a short fetch still shows */
+		lead = fe->start_ms * 100 / span;
+		wait = (head - fe->start_ms) * 100 / span;
+		body = (end - head) * 100 / span;
+		if (wait + body == 0) {
+			body = 1;
+		}
+		if (lead > 99) {
+			lead = 99;
+		}
+
+		fputs("<div class=\"r\"><div class=\"n\">", f);
+		/*
+		 * Not everything the engine fetches is a request over the
+		 * network: an inline <style> and a bundled file go through
+		 * the same path and would otherwise be a row of scheme
+		 * noise in a list meant to be read at a glance.
+		 */
+		if (strncmp(fe->url, "x-ns-css:", 9) == 0) {
+			fprintf(f, "inline stylesheet %s", fe->url + 9);
+		} else if (strncmp(fe->url, "resource:", 9) == 0) {
+			fprintf(f, "bundled %s", fe->url + 9);
+		} else {
+			html_escape(f, fe->url);
+		}
+		fputs("</div><div class=\"t\">", f);
+		fprintf(f, "<span style=\"width:%u%%\"></span>", lead);
+		if (wait > 0) {
+			fprintf(f, "<span style=\"width:%u%%;background:%s\">"
+				"</span>", wait, fetch_colour(fe, true));
+		}
+		if (body > 0) {
+			fprintf(f, "<span style=\"width:%u%%;background:%s\">"
+				"</span>", body, fetch_colour(fe, false));
+		}
+		fputs("</div><div class=\"m\">", f);
+		fprintf(f, "%u ms", end - fe->start_ms);
+		if (fe->bytes >= 1024) {
+			fprintf(f, " &middot; %u KB", fe->bytes / 1024);
+		} else if (fe->bytes > 0) {
+			fprintf(f, " &middot; %u B", fe->bytes);
+		}
+		if (fe->status > 0) {
+			fprintf(f, " &middot; %d", fe->status);
+		}
+		switch (fe->state) {
+		case VITASURF_FETCH_ERROR:
+			fputs(" &middot; failed", f);
+			break;
+		case VITASURF_FETCH_ABORTED:
+			fputs(" &middot; abandoned", f);
+			break;
+		case VITASURF_FETCH_RUNNING:
+			fputs(" &middot; still running", f);
+			break;
+		default:
+			break;
+		}
+		fputs("</div></div>\n", f);
+	}
+	fputs("</div>\n", f);
+}
+
+
+/**
+ * Copy the tail of the log file into the page.
+ *
+ * The whole log is too much to lay out on a handheld, and the end is
+ * the part worth reading, so the last few thousand bytes go in from the
+ * first line break after the cut.
+ */
+static void write_log_tail(FILE *f)
+{
+	FILE *in;
+	long size, from;
+	char *buf;
+	size_t got;
+
+	fputs("<h2>Log</h2>\n", f);
+	in = fopen(VITASURF_LOG_PATH, "rb");
+	if (in == NULL) {
+		fputs("<p class=\"u\">The log could not be opened.</p>\n", f);
+		return;
+	}
+	if (fseek(in, 0, SEEK_END) != 0 || (size = ftell(in)) < 0) {
+		fclose(in);
+		fputs("<p class=\"u\">The log could not be read.</p>\n", f);
+		return;
+	}
+
+	from = size > LOG_TAIL_BYTES ? size - LOG_TAIL_BYTES : 0;
+	if (fseek(in, from, SEEK_SET) != 0) {
+		fclose(in);
+		fputs("<p class=\"u\">The log could not be read.</p>\n", f);
+		return;
+	}
+
+	buf = malloc(LOG_TAIL_BYTES + 1);
+	if (buf == NULL) {
+		fclose(in);
+		fputs("<p class=\"u\">No room to read the log.</p>\n", f);
+		return;
+	}
+	got = fread(buf, 1, LOG_TAIL_BYTES, in);
+	fclose(in);
+	buf[got] = '\0';
+
+	fprintf(f, "<p class=\"u\">%s of ux0:data/VitaSurf/log.txt "
+		"(%u KB in all).</p>\n",
+		from > 0 ? "The tail" : "All", (unsigned) (size / 1024));
+
+	fputs("<pre>", f);
+	{
+		const char *p = buf;
+
+		if (from > 0) {
+			const char *nl = strchr(buf, '\n');
+
+			/* start at a whole line, not mid-word */
+			if (nl != NULL) {
+				p = nl + 1;
+			}
+		}
+		html_escape(f, p);
+	}
+	fputs("</pre>\n", f);
+	free(buf);
+}
+
+
+/**
+ * Write the Log screen: what the last page load spent its time on, and
+ * what the log has to say about it.
+ *
+ * A report from the device used to mean copying log.txt off the memory
+ * card, and nothing at all showed where a slow page's seconds went.
+ */
+static bool write_log_page(void)
+{
+	FILE *f = fopen(VITASURF_LOG_PAGE, "w");
+
+	if (f == NULL) {
+		vita_log("menu: cannot write %s", VITASURF_LOG_PAGE);
+		return false;
+	}
+
+	page_head(f, "Log");
+	fputs("<style>\n"
+	      ".wf{font-size:12px}\n"
+	      ".r{margin:0 0 6px 0}\n"
+	      ".n{word-break:break-all;color:#333}\n"
+	      ".t{height:10px;background:#e3e3e3;font-size:0;line-height:0}\n"
+	      ".t span{display:inline-block;height:10px;vertical-align:top}\n"
+	      ".m{color:#777;font-size:12px}\n"
+	      "pre{white-space:pre-wrap;word-break:break-all;font-size:12px;"
+	      "background:#fff;padding:8px}\n"
+	      "@media (prefers-color-scheme: dark){\n"
+	      ".n{color:#ddd}\n.t{background:#3a3a3a}\n"
+	      ".m{color:#a0a0a0}\npre{background:#111}\n}\n"
+	      "</style>\n", f);
+
+	write_waterfall(f);
+	write_log_tail(f);
+
+	page_foot(f);
+	fclose(f);
+
+	return true;
+}
+
+
 static bool write_downloads_page(void)
 {
 	FILE *f;
@@ -613,6 +888,12 @@ static void activate(enum item item)
 		}
 		update_labels();
 		break;
+	case ITEM_LOG:
+		vita_menu_close();
+		if (write_log_page()) {
+			go(VITASURF_LOG_URL);
+		}
+		break;
 	case ITEM_DUMP_LAYOUT:
 		/* the log is the only way a page that comes out wrong on
 		 * the device can be read here, so close first and let the
@@ -704,6 +985,9 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_DARK_MODE:
 		snprintf(buf, len, "Dark mode: %s (new pages)",
 			 nsoption_bool(prefer_dark_mode) ? "on" : "off");
+		break;
+	case ITEM_LOG:
+		snprintf(buf, len, "Log: where the last page load went");
 		break;
 	case ITEM_DUMP_LAYOUT:
 		snprintf(buf, len, "Write this page's layout to the log");

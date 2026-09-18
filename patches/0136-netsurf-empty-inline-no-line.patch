@@ -26,39 +26,49 @@ index a3ac4f929..2dacfef18 100644
  
  	return true;
 diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
-index 99777dce7..c3fddc4de 100644
+index 99777dce7..99edfcf3a 100644
 --- a/content/handlers/html/layout.c
 +++ b/content/handlers/html/layout.c
-@@ -2978,6 +2978,32 @@ layout_line(struct box *first,
+@@ -2978,6 +2978,7 @@ layout_line(struct box *first,
  			b->height = line_height(&content->unit_len_ctx,
  					b->style ? b->style :
  					b->parent->parent->style);
 +
-+			/*
-+			 * An inline with nothing between it and its end,
-+			 * and no box of its own to draw, adds nothing to
-+			 * the line: CSS 2.1 9.4.2 asks for a line box of
-+			 * no height. It was still a line-height tall here,
-+			 * and although the line stayed flat the box
-+			 * stretched the scrollable area under it, so a page
-+			 * ending in an empty custom element or a noscript
-+			 * was a line taller than the screen. That is what
-+			 * gave openmediavault's dashboard a scrollbar of
-+			 * its own beside the one its content area already
-+			 * had (VitaSurf).
-+			 */
-+			if (b->type == BOX_INLINE && b->text == NULL &&
-+					(b->inline_end == NULL ||
-+					 b->inline_end == b->next) &&
-+					b->padding[TOP] == 0 &&
-+					b->padding[BOTTOM] == 0 &&
-+					b->border[TOP].width == 0 &&
-+					b->border[BOTTOM].width == 0 &&
-+					b->margin[TOP] == 0 &&
-+					b->margin[BOTTOM] == 0) {
-+				b->height = 0;
-+			}
-+
  			if (height < b->height)
  				height = b->height;
  
+@@ -3574,6 +3575,34 @@ layout_line(struct box *first,
+ 		}
+ 	}
+ 
++	/*
++	 * A line that came out of nothing -- no text, no replaced box,
++	 * no inline with a box of its own to draw -- is a line box of no
++	 * height (CSS 2.1 9.4.2), and the empty inlines on it must not
++	 * stretch the scrollable area under the block either. They were
++	 * each a line-height tall, so a page ending in an empty custom
++	 * element, a noscript, or the trailing fragment of an inline that
++	 * wraps the whole document came out a line taller than the
++	 * screen. That is what gave openmediavault a page scrollbar
++	 * beside the one its content area already had (VitaSurf).
++	 */
++	if (used_height == 0) {
++		for (d = first; d != b; d = d->next) {
++			if ((d->type != BOX_INLINE &&
++					d->type != BOX_INLINE_END) ||
++					lh__box_is_replace(d) ||
++					d->padding[TOP] != 0 ||
++					d->padding[BOTTOM] != 0 ||
++					d->border[TOP].width != 0 ||
++					d->border[BOTTOM].width != 0 ||
++					d->margin[TOP] != 0 ||
++					d->margin[BOTTOM] != 0) {
++				continue;
++			}
++			d->height = 0;
++		}
++	}
++
+ 	/* handle clearance for br */
+ 	if (br_box && css_computed_clear(br_box->style) != CSS_CLEAR_NONE) {
+ 		int clear_y = layout_clear(cont->float_children,

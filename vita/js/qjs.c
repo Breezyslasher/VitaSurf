@@ -3551,11 +3551,21 @@ static void relayout_callback(void *p)
 	}
 	thread->relayout_waits = 0;
 
-	if (thread->dom_elements == 0) {
+	/*
+	 * Count them again every time. The count was taken once and kept,
+	 * so it was whatever the document held when the first rebuild ran
+	 * -- on openmediavault the 124 elements of the shell, logged over
+	 * and over while the dashboard the page went on to build was many
+	 * times that. The limit below is meant to catch a document that
+	 * has grown too big to rebuild, and it cannot do that from a
+	 * number taken before it grew.
+	 */
+	{
 		struct dom_document *doc = thread_document(thread);
 
 		if (doc != NULL) {
-			thread->dom_elements = count_elements((struct dom_node *)doc);
+			thread->dom_elements =
+				count_elements((struct dom_node *)doc);
 		}
 	}
 	if (thread->dom_elements > RELAYOUT_MAX_ELEMENTS) {

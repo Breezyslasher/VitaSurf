@@ -818,6 +818,7 @@ void vita_input_load_started(struct gui_window *gw)
 	if (gw == the_gw) {
 		load_started_us = sceKernelGetProcessTimeWide();
 		vitasurf_profile_reset();
+		vitasurf_timeline_reset();
 	}
 }
 
