@@ -1,5 +1,5 @@
 diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
-index eb5461434..8267f5975 100644
+index eb5461434..c11aded57 100644
 --- a/content/handlers/html/html.c
 +++ b/content/handlers/html/html.c
 @@ -305,6 +305,7 @@ html_proceed_to_done(html_content *html)
@@ -10,11 +10,40 @@ index eb5461434..8267f5975 100644
  			content_set_done(&html->base);
  			return NSERROR_OK;
  		}
+@@ -1106,6 +1107,7 @@ static void html_stop(struct content *c)
+ 		/* If there are no further active fetches and we're still
+ 		 * in the READY state, transition to the DONE state. */
+ 		if (c->status == CONTENT_STATUS_READY && c->active == 0) {
++			html_report_scripts(htmlc);
+ 			content_set_done(c);
+ 		}
+ 
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 0824a0b2e..24d920eca 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -505,6 +505,7 @@ html_object_callback(hlcache_handle *object,
+ 		/* all objects have arrived */
+ 		content__reformat(&c->base, false, c->base.available_width,
+ 				c->base.available_height);
++		html_report_scripts(c);
+ 		content_set_done(&c->base);
+ 	} else if (nsoption_bool(incremental_reflow) &&
+ 		   event->type == CONTENT_MSG_DONE &&
 diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
-index 519edf8de..4a5907699 100644
+index 519edf8de..85794156c 100644
 --- a/content/handlers/html/private.h
 +++ b/content/handlers/html/private.h
-@@ -329,6 +329,13 @@ bool html_saw_insecure_scripts(html_content *htmlc);
+@@ -148,6 +148,8 @@ typedef struct html_content {
+ 	/** Number of entries in scripts */
+ 	unsigned int scripts_count;
+ 	/** Scripts */
++	/** whether the log has already named this page's unrun scripts */
++	bool scripts_reported;
+ 	struct html_script *scripts;
+ 	/** javascript thread in use */
+ 	struct jsthread *jsthread;
+@@ -329,6 +331,13 @@ bool html_saw_insecure_scripts(html_content *htmlc);
   */
  nserror html_proceed_to_done(html_content *html);
  
@@ -29,10 +58,10 @@ index 519edf8de..4a5907699 100644
  /* in html/redraw.c */
  bool html_redraw(struct content *c, struct content_redraw_data *data,
 diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
-index 3328165e3..52fece0b2 100644
+index 3328165e3..f1216cd87 100644
 --- a/content/handlers/html/script.c
 +++ b/content/handlers/html/script.c
-@@ -185,6 +185,65 @@ static void script_fetch_settled(html_content *c)
+@@ -185,6 +185,66 @@ static void script_fetch_settled(html_content *c)
  	}
  }
  
@@ -45,7 +74,7 @@ index 3328165e3..52fece0b2 100644
 +		"inline", "sync", "defer", "async", "preload"
 +	};
 +
-+	if (c == NULL || c->scripts_count == 0) {
++	if (c == NULL || c->scripts_count == 0 || c->scripts_reported) {
 +		return;
 +	}
 +
@@ -69,6 +98,7 @@ index 3328165e3..52fece0b2 100644
 +	 * only how many scripts had compiled, never which ones were left
 +	 * (VitaSurf).
 +	 */
++	c->scripts_reported = true;
 +	vita_log("scripts: %u of %u ran", ran, meant);
 +	for (i = 0, s = c->scripts; i != c->scripts_count; i++, s++) {
 +		if (s->already_started || s->type == HTML_SCRIPT_PRELOAD) {
@@ -98,3 +128,20 @@ index 3328165e3..52fece0b2 100644
  /**
   * Callback for asyncronous scripts
   */
+@@ -474,6 +534,16 @@ exec_src_script(html_content *c,
+ 	NSLOG(netsurf, INFO, "script %i '%s'", c->scripts_count,
+ 	      nsurl_access(joined));
+ 
++	/*
++	 * Name every external script as the parser hands it over, so the
++	 * run-or-not report below can be read against what the page
++	 * actually asked for. Without this a script the parser never
++	 * reached and one the engine quietly dropped look the same
++	 * (VitaSurf).
++	 */
++	vita_log("script: %u asked for %s", c->scripts_count,
++		 nsurl_access(joined));
++
+ 	/* there are three ways to process the script tag at this point:
+ 	 *
+ 	 * Syncronously  pause the parent parse and continue after

@@ -7869,6 +7869,8 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		txtlen--;
 	}
 	if (txtlen == 0) {
+		vita_log("script: %s is empty, so nothing ran",
+			 name != NULL ? name : "<script>");
 		return false;
 	}
 	if (txtlen > SCRIPT_MAX_BYTES) {
