@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- The size a graphic gives itself is read from its root element with
+     a text scan. It used to come from parsing the whole graphic before
+     anything asked to draw it, which on the Vita cost about half a
+     second for each one and happened even for graphics that are never
+     laid out; a page of icons paid it over and over.
+     Expected: a 40 by 20 red bar, a green one the full width of the
+     page at 2:1, a blue one 100 by 50, a magenta one 40 by 20 sized in
+     em, and an orange 25 by 25 square. -->
+<html><head><style>body { margin: 0 } img { display: block; margin-bottom: 4px }</style></head><body>
+<img id="a" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='20'%3E%3Crect width='40' height='20' fill='%23f00'/%3E%3C/svg%3E">
+<img id="b" src="data:image/svg+xml,%3C?xml version='1.0'?%3E%3C!-- a comment --%3E%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 60 30'%3E%3Crect width='60' height='30' fill='%230a0'/%3E%3C/svg%3E">
+<img id="c" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100%25' height='50' viewBox='0 0 10 5'%3E%3Crect width='10' height='5' fill='%2300f'/%3E%3C/svg%3E">
+<img id="d" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2em' height='1em'%3E%3Crect width='40' height='20' fill='%23f0f'/%3E%3C/svg%3E">
+<img id="e" src="data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%2225%22%20height=%2225%22%3E%3Crect%20width=%2225%22%20height=%2225%22%20fill=%22%23fa0%22/%3E%3C/svg%3E">
+<script>
+setTimeout(function(){
+ function box(id){ var r = document.getElementById(id).getBoundingClientRect(); return [Math.round(r.width), Math.round(r.height)]; }
+ var a = box('a'), b = box('b'), c = box('c'), d = box('d'), e = box('e');
+ /* the one with only a viewBox has a shape but no size, so it takes
+    the width of the page and keeps its 2:1 */
+ var ok = a[0] === 40 && a[1] === 20 &&
+          b[0] === window.innerWidth && b[1] === Math.round(b[0] / 2) &&
+          c[0] === 100 && c[1] === 50 &&
+          d[0] === 40 && d[1] === 20 &&
+          e[0] === 25 && e[1] === 25;
+ console.log((ok ? 'PASS' : 'FAIL') + ' svg root size ' + JSON.stringify([a,b,c,d,e]));
+},800);
+</script></body></html>
