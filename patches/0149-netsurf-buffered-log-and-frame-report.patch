@@ -1,5 +1,5 @@
 diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
-index b0536779d..bbfb25505 100644
+index b0536779d..1cf151ba4 100644
 --- a/frontends/framebuffer/gui.c
 +++ b/frontends/framebuffer/gui.c
 @@ -58,6 +58,7 @@
@@ -77,7 +77,7 @@ index b0536779d..bbfb25505 100644
  
  		if (fbtk_event(fbtk, &event, timeout)) {
  			if ((event.type == NSFB_EVENT_CONTROL) &&
-@@ -667,7 +708,33 @@ static void framebuffer_run(void)
+@@ -667,7 +708,38 @@ static void framebuffer_run(void)
  				fb_complete = true;
  		}
  
@@ -95,14 +95,19 @@ index b0536779d..bbfb25505 100644
 +		if (vita_now_us() - report_us >= 1000000ull) {
 +			unsigned long long span = vita_now_us() - report_us;
 +
++			unsigned int boxes, kpixels, gpu_ms;
++
++			vita_surface_take_blits(&boxes, &kpixels, &gpu_ms);
 +			vita_log("frame: %u screens put up, %u rounds in "
 +				 "%u ms; scheduler %u ms, waiting %u ms, "
-+				 "drawing %u ms",
++				 "drawing %u ms; %u boxes copied, %u kpixels, "
++				 "%u ms given back to the GPU",
 +				 vita_surface_take_presents(), rounds,
 +				 (unsigned) (span / 1000),
 +				 (unsigned) (sched_us / 1000),
 +				 (unsigned) (wait_us / 1000),
-+				 (unsigned) (draw_us / 1000));
++				 (unsigned) (draw_us / 1000),
++				 boxes, kpixels, gpu_ms);
 +			report_us = vita_now_us();
 +			sched_us = wait_us = draw_us = 0;
 +			rounds = 0;

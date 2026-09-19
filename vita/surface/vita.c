@@ -104,6 +104,9 @@ struct vita_surface {
 	int stride;               /**< texture row length in pixels */
 	bool dirty;               /**< texture changed since the last present */
 	unsigned int presents;    /**< screens put up since last counted */
+	unsigned int blits;       /**< boxes copied since last counted */
+	unsigned long long blit_px; /**< pixels in them */
+	unsigned long long wait_us; /**< time spent letting the GPU go */
 	bool gpu_reading;         /**< the GPU has not finished with the texture */
 	SceUInt64 last_present_us;
 	bool dialog;              /**< a system dialog is on screen */
@@ -473,7 +476,15 @@ static void draw_focus_overlay(struct vita_surface *vs, const nsfb_bbox_t *area)
 static void gpu_release_texture(struct vita_surface *vs)
 {
 	if (vs->gpu_reading) {
+		/*
+		 * Timed, because presenting every refresh means the GPU
+		 * has more often only just started reading when the next
+		 * blit wants to write, and this is where that would show.
+		 */
+		SceUInt64 t0 = sceKernelGetProcessTimeWide();
+
 		vita2d_wait_rendering_done();
+		vs->wait_us += sceKernelGetProcessTimeWide() - t0;
 		vs->gpu_reading = false;
 	}
 }
@@ -534,6 +545,9 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 	}
 
 	vs->updates++;
+	vs->blits++;
+	vs->blit_px += (unsigned long long) width *
+			(unsigned long long) (area.y1 - area.y0);
 	if (vs->verbose && vs->updates <= DIAG_BOXES) {
 		vita_log("surface: update %u box %d,%d-%d,%d (clipped %d,%d-%d,%d) pixel %08x",
 			 vs->updates, box->x0, box->y0, box->x1, box->y1,
@@ -613,6 +627,27 @@ unsigned int vita_surface_take_presents(void)
 	n = vs->presents;
 	vs->presents = 0;
 	return n;
+}
+
+/* exported interface documented in vita_surface.h */
+void vita_surface_take_blits(unsigned int *boxes, unsigned int *kpixels,
+			     unsigned int *wait_ms)
+{
+	struct vita_surface *vs = the_nsfb != NULL ?
+			the_nsfb->surface_priv : NULL;
+
+	if (vs == NULL) {
+		*boxes = 0;
+		*kpixels = 0;
+		*wait_ms = 0;
+		return;
+	}
+	*boxes = vs->blits;
+	*kpixels = (unsigned int) (vs->blit_px / 1000);
+	*wait_ms = (unsigned int) (vs->wait_us / 1000);
+	vs->blits = 0;
+	vs->blit_px = 0;
+	vs->wait_us = 0;
 }
 
 /* ------------------------------------------------------------------------ */
