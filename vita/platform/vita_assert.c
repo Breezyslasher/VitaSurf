@@ -61,6 +61,8 @@ static void vita_assert_report(const char *file, int line, const char *func,
 	 * tell them apart afterwards.
 	 */
 	vita_log_memory("at assertion");
+	/* abort() follows, so nothing else will write the buffer out */
+	vita_log_flush();
 }
 
 /**

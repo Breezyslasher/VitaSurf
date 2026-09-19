@@ -1,0 +1,66 @@
+diff --git a/content/llcache.c b/content/llcache.c
+index 218e6cab9..4b799ea76 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -4095,6 +4095,17 @@ llcache_handle_retrieve(nsurl *url,
+ 	nsurl *hsts_url;
+ 	bool hsts_in_use;
+ 
++	/*
++	 * The menu can turn the caches off, so that a raw load can be
++	 * timed against a cached one. A forced fetch is never taken from
++	 * the cache and never written to it, which is the whole of what
++	 * that means here. Weak, because the host test build has no Vita
++	 * platform to ask. (VitaSurf)
++	 */
++	if (vitasurf_cache_disabled != NULL && vitasurf_cache_disabled()) {
++		flags |= LLCACHE_RETRIEVE_FORCE_FETCH;
++	}
++
+ 	/* Perform HSTS transform */
+ 	error = llcache_hsts_transform_url(url, &hsts_url, &hsts_in_use);
+ 	if (error != NSERROR_OK) {
+diff --git a/include/netsurf/inttypes.h b/include/netsurf/inttypes.h
+index e2229085a..31fe0b9b8 100644
+--- a/include/netsurf/inttypes.h
++++ b/include/netsurf/inttypes.h
+@@ -38,8 +38,21 @@
+ #define PRIu64 "llu"
+ #endif
+ 
++/*
++ * The Vita is 32-bit, and its newlib printf prints garbage for the C99
++ * size_t length modifier. size_t there is unsigned int and ssize_t is
++ * int, so the plain codes are both correct and readable. (VitaSurf)
++ */
++#if defined(__vita__)
++
++/** vita printf formatting for size_t type */
++#define PRIsizet "u"
++
++/** vita printf formatting for ssize_t type */
++#define PRIssizet "d"
++
+ /* Windows does not have sizet formating codes */
+-#if defined(_WIN32)
++#elif defined(_WIN32)
+ 
+ /** windows printf formatting for size_t type */
+ #define PRIsizet "Iu"
+diff --git a/utils/utils.h b/utils/utils.h
+index 597407500..02682edbd 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -247,4 +247,12 @@ unsigned int vitasurf_timeline_seen(void);
+  */
+ void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+ 
++/**
++ * Whether the caches have been turned off from the menu (VitaSurf).
++ *
++ * Weak: only the Vita build provides one, and the host test build links
++ * the same core without it.
++ */
++extern bool vitasurf_cache_disabled(void) __attribute__((weak));
++
+ #endif

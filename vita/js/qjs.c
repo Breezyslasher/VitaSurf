@@ -6551,7 +6551,8 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	JSValue fn;
 	uint64_t hash;
 
-	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<') {
+	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<' ||
+	    vitasurf_cache_disabled()) {
 		return JS_UNDEFINED;
 	}
 	bc_path(path, sizeof(path), url);
@@ -6623,7 +6624,8 @@ static void bc_store(JSContext *ctx, const char *url,
 	uint64_t hash;
 	struct bc_entry *e;
 
-	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<') {
+	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<' ||
+	    vitasurf_cache_disabled()) {
 		return;
 	}
 	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE);

@@ -78,6 +78,7 @@ enum item {
 	ITEM_JAVASCRIPT,
 	ITEM_IMAGES,
 	ITEM_DARK_MODE,
+	ITEM_CACHE,
 	ITEM_LOG,
 	ITEM_DUMP_LAYOUT,
 	ITEM_QUIT,
@@ -547,6 +548,9 @@ static void write_log_tail(FILE *f)
 	size_t got;
 
 	fputs("<h2>Log</h2>\n", f);
+	/* the log is buffered, so the last moment of it is not on the
+	 * card yet and the screen would end short of what just happened */
+	vita_log_flush();
 	in = fopen(VITASURF_LOG_PATH, "rb");
 	if (in == NULL) {
 		fputs("<p class=\"u\">The log could not be opened.</p>\n", f);
@@ -888,6 +892,15 @@ static void activate(enum item item)
 		}
 		update_labels();
 		break;
+	case ITEM_CACHE:
+		/*
+		 * Off means every fetch goes to the network, so a page
+		 * load can be timed without anything on disk helping it.
+		 * The choice is a flag file, so it survives a restart.
+		 */
+		vitasurf_set_cache_disabled(!vitasurf_cache_disabled());
+		update_labels();
+		break;
 	case ITEM_LOG:
 		vita_menu_close();
 		if (write_log_page()) {
@@ -985,6 +998,11 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_DARK_MODE:
 		snprintf(buf, len, "Dark mode: %s (new pages)",
 			 nsoption_bool(prefer_dark_mode) ? "on" : "off");
+		break;
+	case ITEM_CACHE:
+		snprintf(buf, len, "Cache: %s",
+			 vitasurf_cache_disabled() ?
+			 "off, every fetch goes to the network" : "on");
 		break;
 	case ITEM_LOG:
 		snprintf(buf, len, "Log: where the last page load went");

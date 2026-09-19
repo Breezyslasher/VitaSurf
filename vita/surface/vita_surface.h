@@ -70,6 +70,26 @@ void vita_surface_hold_progress(bool hold);
 void vita_surface_request_quit(void);
 
 /**
+ * How many times the screen has been put up since this was last asked.
+ *
+ * The frame loop reports its own rounds, but a round that draws
+ * nothing changes nothing on screen: this is the number the eye sees,
+ * and reading it resets the count.
+ */
+unsigned int vita_surface_take_presents(void);
+
+/**
+ * How much copying the surface has done since this was last asked.
+ *
+ * \param boxes    Updated with the number of boxes copied.
+ * \param kpixels  Updated with the pixels in them, in thousands.
+ * \param wait_ms  Updated with the time spent waiting for the GPU to
+ *                 let go of the texture before writing to it.
+ */
+void vita_surface_take_blits(unsigned int *boxes, unsigned int *kpixels,
+			     unsigned int *wait_ms);
+
+/**
  * Draw a focus rectangle over the display at screen coordinates, or clear
  * it with NULL. The rectangle is an overlay on the display buffer only:
  * NetSurf's own rendering is never touched, and it is re-applied whenever

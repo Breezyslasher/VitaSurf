@@ -1,0 +1,826 @@
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index d61ab3bb7..55bc3254f 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -25,6 +25,7 @@
+ 
+ #include <ft2build.h>
+ #include FT_CACHE_H
++#include FT_TRUETYPE_TABLES_H
+ 
+ #include "netsurf/inttypes.h"
+ #include "utils/filepath.h"
+@@ -53,12 +54,51 @@ static FTC_ImageCache ft_image_cache;
+ int ft_load_type;
+ 
+ /* cache manager faceID data to create freetype faceid on demand */
++/**
++ * One ligature: a run of glyphs this face draws as a single glyph.
++ *
++ * The components after the first live in the face's pool, because a
++ * name like record_voice_over is seventeen of them and most are two.
++ */
++struct fb_liga {
++	uint16_t first;		/**< glyph the run starts with */
++	uint16_t glyph;		/**< glyph the whole run becomes */
++	uint16_t ncomp;		/**< components after the first */
++	uint32_t comp;		/**< where those start in the pool */
++};
++
+ typedef struct fb_faceid_s {
+         char *fontfile; /* path to font */
+         int index; /* index of font */
+         int cidx; /* character map index for unicode */
+ 	uint8_t *data; /* a web font's bytes, in place of a file (VitaSurf) */
+ 	size_t len;
++	/*
++	 * ASCII to glyph index (VitaSurf). Measuring text used to reach
++	 * the advance cache without asking FreeType anything, and
++	 * finding a glyph index for every character would have undone
++	 * that. calloc leaves this zero, which is why a filled entry
++	 * carries the flag bit rather than a sentinel value.
++	 */
++	uint32_t cmap_ascii[128];
++#define FB_CMAP_KNOWN 0x80000000u
++	/* The face's liga feature, read once on first use (VitaSurf). */
++	bool liga_read;		/**< the table has been looked at */
++	struct fb_liga *liga;	/**< sorted by first glyph, longest first */
++	unsigned liga_count;
++	uint16_t *liga_pool;	/**< the components after each first */
++	uint8_t *liga_starts;	/**< bit per glyph: can it start one */
++	uint8_t *liga_seconds;	/**< bit per glyph: can it be the second */
++	unsigned liga_glyphs;	/**< glyphs the bitset covers */
++	/*
++	 * The same question asked of a code point rather than a glyph,
++	 * for the characters nearly all text is made of. Measuring a
++	 * page reaches the advance cache without asking FreeType
++	 * anything, and a character that cannot begin a ligature must
++	 * keep doing so: DejaVu builds ligatures from a space, so
++	 * without this every space in a paragraph went looking.
++	 */
++	uint8_t liga_start_char[128 / 8];
+ } fb_faceid_t;
+ 
+ /**
+@@ -446,6 +486,10 @@ bool fb_font_finalise(void)
+ 		}
+ 
+ 		free(fb_faces[i]->fontfile);
++		free(fb_faces[i]->liga);
++		free(fb_faces[i]->liga_pool);
++		free(fb_faces[i]->liga_starts);
++		free(fb_faces[i]->liga_seconds);
+ 		free(fb_faces[i]);
+ 
+ 		fb_faces[i] = NULL;
+@@ -523,6 +567,428 @@ static void fb_fill_scalar(const plot_font_style_t *fstyle, FTC_Scaler srec)
+ 	srec->x_res = srec->y_res = browser_get_dpi();
+ }
+ 
++/*
++ * Ligature substitution (VitaSurf).
++ *
++ * An icon font is a ligature font: the page writes the icon's name as
++ * text -- <span class="material-symbols">home</span> -- and the font
++ * carries a rule turning the glyphs h, o, m, e into the house. Without
++ * the rule applied the page draws the word, at icon size, which is what
++ * made Audiobookshelf's sidebar read HOM, IMP, VIE and GRO, and made it
++ * three times too wide.
++ *
++ * HarfBuzz would do this and a great deal more, but it is a large
++ * dependency for one lookup type, and our FreeType is built without it.
++ * The liga feature's ligature substitution is a table walk, so walk it.
++ * Everything else in GSUB is left alone.
++ *
++ * The bytes are from the web, so every read is bounds checked against
++ * the table length before it happens.
++ */
++#define FB_LIGA_MAX_COUNT  16384	/* ligatures kept from one face */
++#define FB_LIGA_MAX_POOL   262144	/* components kept from one face */
++#define FB_LIGA_MAX_COMP   64		/* components in one ligature */
++
++static uint16_t fb_rd16(const uint8_t *p)
++{
++	return (uint16_t) ((p[0] << 8) | p[1]);
++}
++
++static uint32_t fb_rd32(const uint8_t *p)
++{
++	return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) |
++	       ((uint32_t) p[2] << 8) | (uint32_t) p[3];
++}
++
++/** Room to read \a want bytes at \a off of a table \a len long. */
++static bool fb_fits(size_t off, size_t want, size_t len)
++{
++	return off <= len && want <= len - off;
++}
++
++struct fb_liga_build {
++	struct fb_liga *liga;
++	unsigned count;
++	uint16_t *pool;
++	unsigned pool_n;
++	unsigned pool_max;
++	unsigned liga_max;
++};
++
++/** One LigatureSubstFormat1 subtable. */
++static void fb_liga_subtable(const uint8_t *t, size_t len, size_t at,
++			     struct fb_liga_build *b)
++{
++	uint16_t set_count;
++	uint16_t cov_off;
++	size_t cov;
++	unsigned i;
++
++	if (!fb_fits(at, 6, len) || fb_rd16(t + at) != 1) {
++		return;
++	}
++	cov_off = fb_rd16(t + at + 2);
++	set_count = fb_rd16(t + at + 4);
++	cov = at + cov_off;
++	if (!fb_fits(at + 6, (size_t) set_count * 2, len)) {
++		return;
++	}
++
++	for (i = 0; i < set_count; i++) {
++		size_t set = at + fb_rd16(t + at + 6 + i * 2);
++		uint16_t first;
++		uint16_t lig_count;
++		unsigned j;
++
++		/*
++		 * The nth ligature set belongs to the nth glyph in the
++		 * coverage table, which is how the run's first glyph is
++		 * found again later.
++		 */
++		if (!fb_fits(cov, 4, len)) {
++			return;
++		}
++		if (fb_rd16(t + cov) == 1) {
++			uint16_t n = fb_rd16(t + cov + 2);
++
++			if (i >= n || !fb_fits(cov + 4, (size_t) n * 2, len)) {
++				continue;
++			}
++			first = fb_rd16(t + cov + 4 + i * 2);
++		} else if (fb_rd16(t + cov) == 2) {
++			uint16_t n = fb_rd16(t + cov + 2);
++			unsigned r;
++			bool found = false;
++
++			if (!fb_fits(cov + 4, (size_t) n * 6, len)) {
++				continue;
++			}
++			first = 0;
++			for (r = 0; r < n; r++) {
++				const uint8_t *rec = t + cov + 4 + r * 6;
++				uint16_t start = fb_rd16(rec);
++				uint16_t end = fb_rd16(rec + 2);
++				uint16_t base = fb_rd16(rec + 4);
++
++				if (i >= base && i - base <= (unsigned)
++						(end - start)) {
++					first = (uint16_t) (start + (i - base));
++					found = true;
++					break;
++				}
++			}
++			if (!found) {
++				continue;
++			}
++		} else {
++			return;
++		}
++
++		if (!fb_fits(set, 2, len)) {
++			continue;
++		}
++		lig_count = fb_rd16(t + set);
++		if (!fb_fits(set + 2, (size_t) lig_count * 2, len)) {
++			continue;
++		}
++
++		for (j = 0; j < lig_count; j++) {
++			size_t lig = set + fb_rd16(t + set + 2 + j * 2);
++			uint16_t glyph;
++			uint16_t ncomp;
++			unsigned k;
++			struct fb_liga *e;
++
++			if (!fb_fits(lig, 4, len)) {
++				continue;
++			}
++			glyph = fb_rd16(t + lig);
++			ncomp = fb_rd16(t + lig + 2);
++			if (ncomp < 1 || ncomp > FB_LIGA_MAX_COMP) {
++				continue;
++			}
++			ncomp--;	/* the first is the coverage glyph */
++			if (!fb_fits(lig + 4, (size_t) ncomp * 2, len)) {
++				continue;
++			}
++			if (b->count >= b->liga_max ||
++			    b->pool_n + ncomp > b->pool_max) {
++				return;		/* full; keep what we have */
++			}
++
++			e = &b->liga[b->count++];
++			e->first = first;
++			e->glyph = glyph;
++			e->ncomp = ncomp;
++			e->comp = b->pool_n;
++			for (k = 0; k < ncomp; k++) {
++				b->pool[b->pool_n++] =
++					fb_rd16(t + lig + 4 + k * 2);
++			}
++		}
++	}
++}
++
++/** Longest first within one starting glyph, so the first match wins. */
++static int fb_liga_cmp(const void *a, const void *b)
++{
++	const struct fb_liga *x = a;
++	const struct fb_liga *y = b;
++
++	if (x->first != y->first) {
++		return x->first < y->first ? -1 : 1;
++	}
++	if (x->ncomp != y->ncomp) {
++		return x->ncomp > y->ncomp ? -1 : 1;
++	}
++	return 0;
++}
++
++/** Walk one Lookup, following an extension lookup to what it wraps. */
++static void fb_liga_lookup(const uint8_t *t, size_t len, size_t at,
++			   struct fb_liga_build *b, int depth)
++{
++	uint16_t type;
++	uint16_t subs;
++	unsigned i;
++
++	if (depth > 2 || !fb_fits(at, 6, len)) {
++		return;
++	}
++	type = fb_rd16(t + at);
++	subs = fb_rd16(t + at + 4);
++	if (!fb_fits(at + 6, (size_t) subs * 2, len)) {
++		return;
++	}
++
++	for (i = 0; i < subs; i++) {
++		size_t sub = at + fb_rd16(t + at + 6 + i * 2);
++
++		if (type == 4) {
++			fb_liga_subtable(t, len, sub, b);
++		} else if (type == 7) {
++			/* an extension is a type and a 32 bit offset */
++			uint16_t inner;
++
++			if (!fb_fits(sub, 8, len) || fb_rd16(t + sub) != 1) {
++				continue;
++			}
++			inner = fb_rd16(t + sub + 2);
++			if (inner == 4) {
++				fb_liga_subtable(t, len,
++						 sub + fb_rd32(t + sub + 4), b);
++			}
++		}
++	}
++}
++
++/** Read the face's liga feature. Called once per face. */
++static void fb_liga_load(fb_faceid_t *fb_face, FTC_FaceID face_id)
++{
++	FT_Face face = NULL;
++	FT_ULong len = 0;
++	uint8_t *t = NULL;
++	struct fb_liga_build b;
++	size_t feat_at;
++	size_t look_at;
++	uint16_t feat_count;
++	uint16_t look_count;
++	unsigned i;
++	unsigned glyphs;
++
++	fb_face->liga_read = true;
++
++	if (FTC_Manager_LookupFace(ft_cmanager, face_id, &face) != 0 ||
++	    face == NULL) {
++		return;
++	}
++	glyphs = (unsigned) face->num_glyphs;
++	if (glyphs == 0) {
++		return;
++	}
++
++	if (FT_Load_Sfnt_Table(face, FT_MAKE_TAG('G', 'S', 'U', 'B'), 0,
++			       NULL, &len) != 0 || len < 10) {
++		return;		/* no GSUB, which is most faces */
++	}
++	t = malloc(len);
++	if (t == NULL) {
++		return;
++	}
++	if (FT_Load_Sfnt_Table(face, FT_MAKE_TAG('G', 'S', 'U', 'B'), 0,
++			       t, &len) != 0) {
++		free(t);
++		return;
++	}
++
++	feat_at = fb_rd16(t + 6);
++	look_at = fb_rd16(t + 8);
++	if (!fb_fits(feat_at, 2, len) || !fb_fits(look_at, 2, len)) {
++		free(t);
++		return;
++	}
++	feat_count = fb_rd16(t + feat_at);
++	look_count = fb_rd16(t + look_at);
++	if (!fb_fits(feat_at + 2, (size_t) feat_count * 6, len) ||
++	    !fb_fits(look_at + 2, (size_t) look_count * 2, len)) {
++		free(t);
++		return;
++	}
++
++	/*
++	 * Sizing it would mean walking the table twice, so take the
++	 * whole allowance and give back what is not used at the end.
++	 * Material Symbols has thousands of these; DejaVu has a handful.
++	 */
++	memset(&b, 0, sizeof(b));
++	b.liga_max = FB_LIGA_MAX_COUNT;
++	b.pool_max = FB_LIGA_MAX_POOL;
++	b.liga = malloc(sizeof(*b.liga) * FB_LIGA_MAX_COUNT);
++	b.pool = malloc(sizeof(*b.pool) * FB_LIGA_MAX_POOL);
++	if (b.liga == NULL || b.pool == NULL) {
++		free(b.liga);
++		free(b.pool);
++		free(t);
++		return;
++	}
++
++	for (i = 0; i < feat_count; i++) {
++		const uint8_t *rec = t + feat_at + 2 + i * 6;
++		size_t f;
++		uint16_t n;
++		unsigned j;
++
++		if (memcmp(rec, "liga", 4) != 0) {
++			continue;
++		}
++		f = feat_at + fb_rd16(rec + 4);
++		if (!fb_fits(f, 4, len)) {
++			continue;
++		}
++		n = fb_rd16(t + f + 2);
++		if (!fb_fits(f + 4, (size_t) n * 2, len)) {
++			continue;
++		}
++		for (j = 0; j < n; j++) {
++			uint16_t li = fb_rd16(t + f + 4 + j * 2);
++
++			if (li >= look_count) {
++				continue;
++			}
++			fb_liga_lookup(t, len,
++				       look_at + fb_rd16(t + look_at + 2 +
++							 li * 2),
++				       &b, 0);
++		}
++	}
++	free(t);
++
++	if (b.count == 0) {
++		free(b.liga);
++		free(b.pool);
++		return;
++	}
++
++	qsort(b.liga, b.count, sizeof(*b.liga), fb_liga_cmp);
++
++	/*
++	 * One bit per glyph saying whether it can start a ligature, so
++	 * that ordinary text pays a bit test per character and nothing
++	 * more.
++	 */
++	fb_face->liga_starts = calloc((glyphs + 7) / 8, 1);
++	fb_face->liga_seconds = calloc((glyphs + 7) / 8, 1);
++	if (fb_face->liga_starts == NULL || fb_face->liga_seconds == NULL) {
++		free(fb_face->liga_starts);
++		free(fb_face->liga_seconds);
++		fb_face->liga_starts = NULL;
++		fb_face->liga_seconds = NULL;
++		free(b.liga);
++		free(b.pool);
++		return;
++	}
++	fb_face->liga_glyphs = glyphs;
++	for (i = 0; i < b.count; i++) {
++		uint16_t g = b.liga[i].first;
++		uint16_t g2 = b.pool[b.liga[i].comp];
++
++		if (g < glyphs) {
++			fb_face->liga_starts[g / 8] |= (uint8_t) (1 << (g % 8));
++		}
++		/*
++		 * What may follow it. A space begins a ligature in DejaVu,
++		 * so without this every space in a paragraph walked the
++		 * whole set of them before giving up.
++		 */
++		if (g2 < glyphs) {
++			fb_face->liga_seconds[g2 / 8] |=
++					(uint8_t) (1 << (g2 % 8));
++		}
++	}
++
++	/* and the same for the characters, so measuring ordinary text
++	 * need not find a glyph for each one */
++	for (i = 0; i < 128; i++) {
++		FT_UInt g = FTC_CMapCache_Lookup(ft_cmap_cache, face_id,
++						 fb_face->cidx, i);
++
++		if (g < glyphs &&
++		    (fb_face->liga_starts[g / 8] & (1 << (g % 8))) != 0) {
++			fb_face->liga_start_char[i / 8] |=
++					(uint8_t) (1 << (i % 8));
++		}
++	}
++
++	{
++		struct fb_liga *nl = realloc(b.liga,
++				sizeof(*b.liga) * b.count);
++		uint16_t *np = b.pool_n > 0 ?
++				realloc(b.pool, sizeof(*b.pool) * b.pool_n) :
++				b.pool;
++
++		if (nl != NULL) {
++			b.liga = nl;
++		}
++		if (np != NULL) {
++			b.pool = np;
++		}
++	}
++
++	fb_face->liga = b.liga;
++	fb_face->liga_pool = b.pool;
++	fb_face->liga_count = b.count;
++
++	NSLOG(netsurf, INFO, "face %s has %u ligatures",
++	      fb_face->fontfile != NULL ? fb_face->fontfile : "from memory",
++	      b.count);
++}
++
++/** The first ligature entry for a glyph, or NULL. Longest comes first. */
++static const struct fb_liga *fb_liga_find(fb_faceid_t *fb_face, FT_UInt g)
++{
++	unsigned lo = 0;
++	unsigned hi;
++
++	if (fb_face->liga_count == 0 || g >= fb_face->liga_glyphs ||
++	    (fb_face->liga_starts[g / 8] & (1 << (g % 8))) == 0) {
++		return NULL;
++	}
++	hi = fb_face->liga_count;
++	while (lo < hi) {
++		unsigned mid = lo + (hi - lo) / 2;
++
++		if (fb_face->liga[mid].first < g) {
++			lo = mid + 1;
++		} else {
++			hi = mid;
++		}
++	}
++	if (lo < fb_face->liga_count && fb_face->liga[lo].first == g) {
++		return &fb_face->liga[lo];
++	}
++	return NULL;
++}
++
+ /*
+  * Advance cache (VitaSurf).
+  *
+@@ -543,6 +1009,8 @@ static void fb_fill_scalar(const plot_font_style_t *fstyle, FTC_Scaler srec)
+  */
+ #define ADV_STYLES 8		/* faces x sizes kept at once */
+ #define ADV_CHARS  128		/* ASCII, where nearly every advance is */
++/* liga_start_char asks the same question of the same characters */
++typedef char fb_adv_chars_match[ADV_CHARS == 128 ? 1 : -1];
+ #define ADV_UNKNOWN INT16_MIN	/* not looked up yet */
+ 
+ struct adv_style {
+@@ -596,18 +1064,19 @@ static struct adv_style *fb_adv_slot(FTC_ScalerRec *srec)
+  * characters of a face should not pay for ninety-five.
+  */
+ static int fb_advance(struct adv_style *slot, FTC_ScalerRec *srec,
+-		      fb_faceid_t *fb_face, uint32_t ucs4)
++		      FT_UInt glyph_index, uint32_t ucs4)
+ {
++	/*
++	 * FB_LIGA_NO_CHAR for a run of characters drawn as one glyph:
++	 * the cache is keyed by code point and a run has no single one.
++	 */
+ 	bool cacheable = ucs4 < ADV_CHARS;
+-	FT_UInt glyph_index;
+ 	FT_Glyph glyph;
+ 	int advance;
+ 
+ 	if (cacheable && slot->adv[ucs4] != ADV_UNKNOWN) {
+ 		return slot->adv[ucs4];
+ 	}
+-	glyph_index = FTC_CMapCache_Lookup(ft_cmap_cache, srec->face_id,
+-					   fb_face->cidx, ucs4);
+ 	if (FTC_ImageCache_LookupScaler(ft_image_cache, srec,
+ 					FT_LOAD_RENDER |
+ 					FT_LOAD_FORCE_AUTOHINT |
+@@ -647,6 +1116,128 @@ static inline uint32_t fb_next_char(const char *s, size_t len, size_t *off)
+ 	}
+ }
+ 
++
++/**
++ * The glyph a code point maps to, remembering the ASCII ones.
++ *
++ * Measuring text reached the advance cache without asking FreeType
++ * anything; finding a glyph index for every character would undo that,
++ * so the answers for the characters nearly all text is made of are
++ * kept on the face. (VitaSurf)
++ */
++static FT_UInt fb_glyph_for(fb_faceid_t *fb_face, FTC_FaceID face_id,
++			    uint32_t ucs4)
++{
++	uint32_t held;
++
++	if (ucs4 >= 128) {
++		return FTC_CMapCache_Lookup(ft_cmap_cache, face_id,
++					    fb_face->cidx, ucs4);
++	}
++	held = fb_face->cmap_ascii[ucs4];
++	if (held == 0) {
++		held = FB_CMAP_KNOWN | FTC_CMapCache_Lookup(ft_cmap_cache,
++				face_id, fb_face->cidx, ucs4);
++		fb_face->cmap_ascii[ucs4] = held;
++	}
++	return (FT_UInt) (held & ~FB_CMAP_KNOWN);
++}
++
++/**
++ * Whether this byte is one the advance cache alone can answer.
++ *
++ * Below 0x80, already measured at this size, and not a character this
++ * face builds a ligature from -- which is nearly every character of
++ * nearly every page, and the case that has to stay quick. (VitaSurf)
++ */
++static inline bool fb_plain_char(const fb_faceid_t *fb_face,
++				 const struct adv_style *slot,
++				 unsigned char c)
++{
++	return c < ADV_CHARS && slot->adv[c] != ADV_UNKNOWN &&
++	       fb_face->liga_read &&
++	       (fb_face->liga_start_char[c >> 3] & (1 << (c & 7))) == 0;
++}
++
++/** A run of characters drawn as one glyph has no single code point. */
++#define FB_LIGA_NO_CHAR 0xFFFFFFFFu
++
++/**
++ * The glyph for the next run of characters, and where that run ends.
++ *
++ * Usually one character to one glyph. When the face has a ligature
++ * whose components the characters that follow match, the whole run
++ * becomes the one glyph the ligature names -- which is how an icon
++ * font draws an icon from its name. (VitaSurf)
++ *
++ * \param fb_face  The face, whose ligatures are read on first use.
++ * \param face_id  The same face, as the cache manager knows it.
++ * \param s        The text.
++ * \param len      Its length in bytes.
++ * \param off      Where to read from; moved past the whole run.
++ * \param ucs4     The code point read, or FB_LIGA_NO_CHAR for a run.
++ * \return the glyph index to draw.
++ */
++static FT_UInt fb_next_glyph(fb_faceid_t *fb_face, FTC_FaceID face_id,
++			     const char *s, size_t len, size_t *off,
++			     uint32_t *ucs4)
++{
++	const struct fb_liga *e;
++	FT_UInt g;
++
++	*ucs4 = fb_next_char(s, len, off);
++	g = fb_glyph_for(fb_face, face_id, *ucs4);
++
++	if (fb_face->liga_read == false) {
++		fb_liga_load(fb_face, face_id);
++	}
++	e = fb_liga_find(fb_face, g);
++	if (e == NULL) {
++		return g;
++	}
++
++	/* nothing can match unless what follows can be a second */
++	{
++		size_t at = *off;
++		FT_UInt g2;
++
++		if (at >= len) {
++			return g;
++		}
++		g2 = fb_glyph_for(fb_face, face_id, fb_next_char(s, len, &at));
++		if (g2 >= fb_face->liga_glyphs ||
++		    (fb_face->liga_seconds[g2 / 8] & (1 << (g2 % 8))) == 0) {
++			return g;
++		}
++	}
++
++	/* longest first, so the first that matches is the one to take */
++	for (; e < fb_face->liga + fb_face->liga_count && e->first == g; e++) {
++		size_t at = *off;
++		unsigned k;
++
++		for (k = 0; k < e->ncomp; k++) {
++			uint32_t c;
++
++			if (at >= len) {
++				break;
++			}
++			c = fb_next_char(s, len, &at);
++			if (fb_glyph_for(fb_face, face_id, c) !=
++					fb_face->liga_pool[e->comp + k]) {
++				break;
++			}
++		}
++		if (k == e->ncomp) {
++			*off = at;
++			*ucs4 = FB_LIGA_NO_CHAR;
++			return e->glyph;
++		}
++	}
++
++	return g;
++}
++
+ /* exported interface documented in framebuffer/freetype_font.h */
+ FT_Glyph fb_getglyph(const plot_font_style_t *fstyle, uint32_t ucs4)
+ {
+@@ -678,6 +1269,34 @@ FT_Glyph fb_getglyph(const plot_font_style_t *fstyle, uint32_t ucs4)
+ }
+ 
+ 
++/* exported interface documented in framebuffer/freetype_font.h */
++FT_Glyph fb_getglyph_run(const plot_font_style_t *fstyle, const char *text,
++			 size_t len, size_t *off)
++{
++	FTC_ScalerRec srec;
++	fb_faceid_t *fb_face;
++	FT_UInt glyph_index;
++	uint32_t ucs4;
++	FT_Glyph glyph;
++
++	fb_fill_scalar(fstyle, &srec);
++	fb_face = (fb_faceid_t *) srec.face_id;
++
++	glyph_index = fb_next_glyph(fb_face, srec.face_id, text, len, off,
++				    &ucs4);
++
++	if (FTC_ImageCache_LookupScaler(ft_image_cache, &srec,
++					FT_LOAD_RENDER |
++					FT_LOAD_FORCE_AUTOHINT |
++					ft_load_type,
++					glyph_index, &glyph, NULL) != 0) {
++		return NULL;
++	}
++
++	return glyph;
++}
++
++
+ /* exported interface documented in framebuffer/freetype_font.h */
+ nserror
+ fb_font_width(const plot_font_style_t *fstyle,
+@@ -697,9 +1316,21 @@ fb_font_width(const plot_font_style_t *fstyle,
+ 
+         *width = 0;
+         while (nxtchr < length) {
+-                ucs4 = fb_next_char(string, length, &nxtchr);
++                unsigned char c = (unsigned char) string[nxtchr];
++                FT_UInt glyph;
++
++                if (fb_plain_char(fb_face, slot, c)) {
++                        nxtchr++;
++                        if (slot->adv[c] >= 0) {
++                                *width += slot->adv[c];
++                        }
++                        continue;
++                }
+ 
+-                advance = fb_advance(slot, &srec, fb_face, ucs4);
++                glyph = fb_next_glyph(fb_face, srec.face_id, string,
++                                      length, &nxtchr, &ucs4);
++
++                advance = fb_advance(slot, &srec, glyph, ucs4);
+                 if (advance < 0)
+                         continue;
+ 
+@@ -730,8 +1361,18 @@ fb_font_position(const plot_font_style_t *fstyle,
+         *actual_x = 0;
+         while (nxtchr < length) {
+                 size_t after = nxtchr;
++                unsigned char c = (unsigned char) string[nxtchr];
++                FT_UInt glyph;
+ 
+-                ucs4 = fb_next_char(string, length, &after);
++                if (fb_plain_char(fb_face, slot, c)) {
++                        ucs4 = c;
++                        after = nxtchr + 1;
++                        advance = slot->adv[c];
++                } else {
++                        glyph = fb_next_glyph(fb_face, srec.face_id, string,
++                                              length, &after, &ucs4);
++                        advance = fb_advance(slot, &srec, glyph, ucs4);
++                }
+ 
+                 /*
+                  * A character with no glyph used to `continue' here
+@@ -739,7 +1380,6 @@ fb_font_position(const plot_font_style_t *fstyle,
+                  * bottom of the loop: it then ran forever and the
+                  * browser hung in layout with no way out. Step over it.
+                  */
+-                advance = fb_advance(slot, &srec, fb_face, ucs4);
+                 if (advance < 0) {
+                         nxtchr = after;
+                         continue;
+@@ -805,11 +1445,20 @@ fb_font_split(const plot_font_style_t *fstyle,
+         *actual_x = 0;
+         while (nxtchr < length) {
+                 size_t after = nxtchr;
++                unsigned char c = (unsigned char) string[nxtchr];
++                FT_UInt glyph;
+ 
+-                ucs4 = fb_next_char(string, length, &after);
+-
+-                /* as in fb_font_position: never leave nxtchr standing */
+-                advance = fb_advance(slot, &srec, fb_face, ucs4);
++                if (fb_plain_char(fb_face, slot, c)) {
++                        ucs4 = c;
++                        after = nxtchr + 1;
++                        advance = slot->adv[c];
++                } else {
++                        glyph = fb_next_glyph(fb_face, srec.face_id, string,
++                                              length, &after, &ucs4);
++                        /* as in fb_font_position: never leave nxtchr
++                         * standing */
++                        advance = fb_advance(slot, &srec, glyph, ucs4);
++                }
+                 if (advance < 0) {
+                         nxtchr = after;
+                         continue;
+diff --git a/frontends/framebuffer/font_freetype.h b/frontends/framebuffer/font_freetype.h
+index cbc6d82c8..4026e8bd9 100644
+--- a/frontends/framebuffer/font_freetype.h
++++ b/frontends/framebuffer/font_freetype.h
+@@ -27,4 +27,15 @@ extern int ft_load_type;
+ 
+ FT_Glyph fb_getglyph(const plot_font_style_t *fstyle, uint32_t ucs4);
+ 
++/**
++ * The glyph for the next run of characters in a string (VitaSurf).
++ *
++ * A run is one character, unless the face has a ligature the
++ * characters match, in which case it is all of them: an icon font
++ * draws its icon from the icon's name spelt out as text. \a off moves
++ * past whatever the run covered.
++ */
++FT_Glyph fb_getglyph_run(const plot_font_style_t *fstyle, const char *text,
++			 size_t len, size_t *off);
++
+ #endif /* NETSURF_FB_FONT_FREETYPE_H */
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index da9c2c47f..29afcdd6b 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -559,17 +559,18 @@ framebuffer_plot_text(const struct redraw_context *ctx,
+ 		const char *text,
+ 		size_t length)
+ {
+-	uint32_t ucs4;
+ 	size_t nxtchr = 0;
+ 	FT_Glyph glyph;
+ 	FT_BitmapGlyph bglyph;
+ 	nsfb_bbox_t loc;
+ 
+ 	while (nxtchr < length) {
+-		ucs4 = utf8_to_ucs4(text + nxtchr, length - nxtchr);
+-		nxtchr = utf8_next(text, length, nxtchr);
+-
+-		glyph = fb_getglyph(fstyle, ucs4);
++		/*
++		 * By run rather than by character, so that a ligature
++		 * draws as the one glyph it stands for and measuring
++		 * and drawing agree about how wide it is. (VitaSurf)
++		 */
++		glyph = fb_getglyph_run(fstyle, text, length, &nxtchr);
+ 		if (glyph == NULL)
+ 			continue;
+ 

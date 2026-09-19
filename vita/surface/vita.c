@@ -37,6 +37,9 @@
 #include <psp2/touch.h>
 
 #include <vita2d.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #include "libnsfb.h"
 #include "libnsfb_event.h"
@@ -60,6 +63,25 @@
 
 /* Input polling period while waiting for events, in microseconds. */
 #define POLL_INTERVAL_US 8000
+
+/*
+ * How long must have passed before the screen is put up again.
+ *
+ * The screen goes up this often whether or not the page changed, the
+ * way the machine's own browser does, rather than only when something
+ * moved. Presenting on change alone is less work and less power, but
+ * it makes every frame land wherever the change happened to fall
+ * against the refresh, which reads as motion that will not settle.
+ *
+ * It is one refresh less one poll, not one refresh. The loop can only
+ * present when it wakes, and it wakes every POLL_INTERVAL_US: asking
+ * for a full 16.6 ms meant the poll at 16 ms was turned away and the
+ * one at 24 ms let through, so a still page sat at 42 frames a second
+ * instead of 60. Allowing a poll that lands just short of the refresh
+ * puts it back on the 16 ms one. Going up is not a risk: the swap
+ * waits for the vertical blank, so 60 is the ceiling either way.
+ */
+#define FRAME_INTERVAL_US (16600 - POLL_INTERVAL_US)
 
 /* Held D-pad buttons repeat after this delay, then at this rate (ms). */
 #define REPEAT_DELAY_MS  400
@@ -88,6 +110,11 @@ struct vita_surface {
 	uint32_t *display;        /**< texture pixels */
 	int stride;               /**< texture row length in pixels */
 	bool dirty;               /**< texture changed since the last present */
+	unsigned int presents;    /**< screens put up since last counted */
+	unsigned int blits;       /**< boxes copied since last counted */
+	unsigned long long blit_px; /**< pixels in them */
+	unsigned long long wait_us; /**< time spent letting the GPU go */
+	bool gpu_reading;         /**< the GPU has not finished with the texture */
 	SceUInt64 last_present_us;
 	bool dialog;              /**< a system dialog is on screen */
 	bool hold_progress;       /**< do not present part way through a redraw */
@@ -443,6 +470,59 @@ static void draw_focus_overlay(struct vita_surface *vs, const nsfb_bbox_t *area)
 	}
 }
 
+/**
+ * Wait for the GPU to finish with the texture, if it has not already.
+ *
+ * Presenting used to wait here and then return, which parked the CPU for
+ * whatever was left of the frame -- and on this machine that time is
+ * wanted for laying out the page, running its scripts and reading the
+ * network. The wait belongs where the texture is next written instead,
+ * so the two run side by side and the wait is usually over before
+ * anything asks for it.
+ */
+static void gpu_release_texture(struct vita_surface *vs)
+{
+	if (vs->gpu_reading) {
+		/*
+		 * Timed, because presenting every refresh means the GPU
+		 * has more often only just started reading when the next
+		 * blit wants to write, and this is where that would show.
+		 */
+		SceUInt64 t0 = sceKernelGetProcessTimeWide();
+
+		vita2d_wait_rendering_done();
+		vs->wait_us += sceKernelGetProcessTimeWide() - t0;
+		vs->gpu_reading = false;
+	}
+}
+
+/**
+ * Copy one row, forcing every pixel opaque.
+ *
+ * libnsfb leaves the top byte of every pixel zero and vita2d draws with
+ * source-alpha blending, so the alpha has to be put back or the page
+ * never reaches the screen. A full screen is half a million pixels, so
+ * this goes four at a time where the hardware allows it.
+ */
+static inline void blit_row(uint32_t *restrict d,
+			    const uint32_t *restrict s, int n)
+{
+	int x = 0;
+
+#ifdef __ARM_NEON
+	{
+		const uint32x4_t opaque = vdupq_n_u32(0xFF000000u);
+
+		for (; x + 4 <= n; x += 4) {
+			vst1q_u32(d + x, vorrq_u32(vld1q_u32(s + x), opaque));
+		}
+	}
+#endif
+	for (; x < n; x++) {
+		d[x] = s[x] | 0xFF000000u;
+	}
+}
+
 /** Copy a rectangle of the shadow buffer to the display buffer. */
 static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 {
@@ -472,6 +552,9 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 	}
 
 	vs->updates++;
+	vs->blits++;
+	vs->blit_px += (unsigned long long) width *
+			(unsigned long long) (area.y1 - area.y0);
 	if (vs->verbose && vs->updates <= DIAG_BOXES) {
 		vita_log("surface: update %u box %d,%d-%d,%d (clipped %d,%d-%d,%d) pixel %08x",
 			 vs->updates, box->x0, box->y0, box->x1, box->y1,
@@ -482,21 +565,13 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 		vita_log("surface: further updates not logged");
 	}
 
-	/*
-	 * libnsfb leaves the top byte of every pixel zero and vita2d draws
-	 * textures with source-alpha blending, so copy with the alpha byte
-	 * forced opaque or the page never reaches the screen.
-	 */
+	/* the GPU may still be reading what is about to be overwritten */
+	gpu_release_texture(vs);
+
 	src = nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4;
 	dst = vs->display + area.y0 * vs->stride + area.x0;
 	for (y = area.y0; y < area.y1; y++) {
-		const uint32_t *s = (const uint32_t *)(const void *)src;
-		uint32_t *d = dst;
-		int x;
-
-		for (x = 0; x < width; x++) {
-			d[x] = s[x] | 0xFF000000u;
-		}
+		blit_row(dst, (const uint32_t *)(const void *)src, width);
 		src += nsfb->linelen;
 		dst += vs->stride;
 	}
@@ -508,15 +583,27 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 }
 
 /**
- * Put the texture on screen if it changed, or every frame while a system
- * dialog is up so the dialog can composite itself over it. Swapping waits
- * for the vertical blank, so this is only called from the input loop and,
+ * Put the texture on screen.
+ *
+ * At once when the page changed, so a keypress is not held back, and
+ * otherwise once a refresh so the picture is paced by the screen
+ * rather than by whatever last happened to move. Swapping waits for
+ * the vertical blank, so this is only called from the input loop and,
  * during long redraws, from vita_update() at a limited rate.
+ *
+ * \return true if the screen was put up.
  */
-static void present(struct vita_surface *vs)
+static bool present(struct vita_surface *vs)
 {
-	if (vs->tex == NULL || (!vs->dirty && !vs->dialog)) {
-		return;
+	SceUInt64 now;
+
+	if (vs->tex == NULL) {
+		return false;
+	}
+	now = sceKernelGetProcessTimeWide();
+	if (!vs->dirty && !vs->dialog &&
+	    now - vs->last_present_us < FRAME_INTERVAL_US) {
+		return false;
 	}
 	vita2d_start_drawing();
 	vita2d_draw_texture(vs->tex, 0.0f, 0.0f);
@@ -525,10 +612,49 @@ static void present(struct vita_surface *vs)
 		vita2d_common_dialog_update();
 	}
 	vita2d_swap_buffers();
-	/* the GPU reads the texture; do not let NetSurf write it meanwhile */
-	vita2d_wait_rendering_done();
+	/* the GPU now reads the texture; the next write waits, not this */
+	vs->gpu_reading = true;
 	vs->dirty = false;
+	vs->presents++;
 	vs->last_present_us = sceKernelGetProcessTimeWide();
+
+	return true;
+}
+
+/* exported interface documented in vita_surface.h */
+unsigned int vita_surface_take_presents(void)
+{
+	struct vita_surface *vs = the_nsfb != NULL ?
+			the_nsfb->surface_priv : NULL;
+	unsigned int n;
+
+	if (vs == NULL) {
+		return 0;
+	}
+	n = vs->presents;
+	vs->presents = 0;
+	return n;
+}
+
+/* exported interface documented in vita_surface.h */
+void vita_surface_take_blits(unsigned int *boxes, unsigned int *kpixels,
+			     unsigned int *wait_ms)
+{
+	struct vita_surface *vs = the_nsfb != NULL ?
+			the_nsfb->surface_priv : NULL;
+
+	if (vs == NULL) {
+		*boxes = 0;
+		*kpixels = 0;
+		*wait_ms = 0;
+		return;
+	}
+	*boxes = vs->blits;
+	*kpixels = (unsigned int) (vs->blit_px / 1000);
+	*wait_ms = (unsigned int) (vs->wait_us / 1000);
+	vs->blits = 0;
+	vs->blit_px = 0;
+	vs->wait_us = 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -653,7 +779,7 @@ static int vita_finalise(nsfb_t *nsfb)
 	free(nsfb->ptr);
 	nsfb->ptr = NULL;
 
-	vita2d_wait_rendering_done();
+	gpu_release_texture(vs);
 	vita2d_free_texture(vs->tex);
 	vita2d_fini();
 	free(vs);

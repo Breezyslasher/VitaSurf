@@ -1308,7 +1308,71 @@ W.matchMedia=function(q){var mql={media:String(q),onchange:null,_l:[],
 W.__vitaMediaMatches=mediaMatches;
 function Storage(){var d={};this.getItem=function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null;};this.setItem=function(k,v){d[k]=String(v);};this.removeItem=function(k){delete d[k];};this.clear=function(){d={};};this.key=function(i){return Object.keys(d)[i]||null;};Object.defineProperty(this,'length',{configurable:true,get:function(){return Object.keys(d).length;}});}
 W.localStorage=new Storage();W.sessionStorage=new Storage();
-W.history={length:1,state:null,pushState:function(){},replaceState:function(){},back:function(){},forward:function(){},go:function(){}};
+/* --- history ------------------------------------------------------------
+ * Every page that routes on its own calls pushState and then reads the
+ * location back to decide what to render. This was a set of empty
+ * functions, so the url never moved, history.state stayed null and back()
+ * did nothing: a single page app would log you in and then show you the
+ * login page again, because that is still what the address said.
+ *
+ * Nothing here navigates. It moves the same __vitaHref that a fragment
+ * navigation moves, which is what location.href and every part of it
+ * read, and fires popstate when the page walks the stack. */
+(function(){
+ function here(){ try{ return location.href; }catch(e){ return ''; } }
+ var stack=[{state:null,url:here()}], at=0;
+ function resolve(url){
+  if(url===undefined||url===null||url==='')return here();
+  try{ return new URL(String(url), here()).href; }catch(e){ return here(); }
+ }
+ function clone(v){
+  if(v===undefined)return null;
+  try{ return JSON.parse(JSON.stringify(v)); }catch(e){ return v; }
+ }
+ function apply(i,fire){
+  var e=stack[i];
+  at=i;
+  W.__vitaHref=e.url;
+  H.state=e.state;
+  if(!fire)return;
+  setTimeout(function(){
+   var ev;
+   try{ ev=new W.PopStateEvent('popstate',{bubbles:false,cancelable:false}); }
+   catch(err){ ev=new Event('popstate'); }
+   try{ ev.state=e.state; }catch(err){}
+   try{ W.dispatchEvent?W.dispatchEvent(ev):__vitaDispatch(null,ev); }catch(err){}
+  },0);
+ }
+ var H={
+  get length(){ return stack.length; },
+  state:null,
+  scrollRestoration:'auto',
+  pushState:function(state,title,url){
+   stack.length=at+1;
+   stack.push({state:clone(state),url:resolve(url)});
+   apply(stack.length-1,false);
+  },
+  replaceState:function(state,title,url){
+   stack[at]={state:clone(state),
+              url:url===undefined?stack[at].url:resolve(url)};
+   apply(at,false);
+  },
+  go:function(n){
+   n=(n===undefined||n===null)?0:(parseInt(n,10)||0);
+   if(n===0){ try{ location.reload(); }catch(e){} return; }
+   var i=at+n;
+   if(i<0||i>=stack.length)return;
+   apply(i,true);
+  },
+  back:function(){ H.go(-1); },
+  forward:function(){ H.go(1); }
+ };
+ W.history=H;
+ if(!W.PopStateEvent){
+  W.PopStateEvent=function(type,init){
+   var e=new Event(type,init); e.state=(init&&init.state)||null; return e; };
+ }
+})();
 var t0=Date.now();var perf=W.performance||{};W.performance=perf;if(!perf.now)perf.now=function(){return Date.now()-t0;};perf.timing={navigationStart:t0,unloadEventStart:0,unloadEventEnd:0,redirectStart:0,redirectEnd:0,secureConnectionStart:0,fetchStart:t0,domainLookupStart:t0,domainLookupEnd:t0,connectStart:t0,connectEnd:t0,requestStart:t0,responseStart:t0,responseEnd:t0,domLoading:t0,domInteractive:t0,domContentLoadedEventStart:t0,domContentLoadedEventEnd:t0,domComplete:t0,loadEventStart:t0,loadEventEnd:t0};perf.navigation={type:0,redirectCount:0};perf.mark=perf.measure=perf.clearMarks=perf.clearMeasures=function(){};perf.getEntries=perf.getEntriesByType=perf.getEntriesByName=function(){return [];};
 navigator.language='en-US';navigator.languages=['en-US','en'];navigator.cookieEnabled=true;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};
 location.reload=function(){location.href=location.href;};

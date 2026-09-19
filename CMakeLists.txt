@@ -237,11 +237,21 @@ if(EXISTS "${SYSROOT}/lib/pkgconfig/libjxl.pc")
     if(EXISTS "${SYSROOT}/lib/libhwy.a")
         list(APPEND VITASURF_IMAGE_LIBS hwy)
     endif()
-    if(EXISTS "${SYSROOT}/lib/libbrotlidec.a")
-        list(APPEND VITASURF_IMAGE_LIBS brotlidec brotlicommon)
-    endif()
     # libjxl is C++; nothing else here is.
     list(APPEND VITASURF_IMAGE_LIBS stdc++)
+endif()
+# FreeType reads WOFF2 only when it was built against brotli
+# (scripts/build-freetype-woff2.sh). Link brotli when that library is
+# there, and say which kind of FreeType this build found, because a page
+# whose icons are a WOFF2 ligature font draws the ligature names as words
+# when they are missing and the fault is not obvious from the screen.
+set(VITASURF_FONT_LIBS "")
+if(EXISTS "${SYSROOT}/lib/libbrotlidec.a")
+    list(APPEND VITASURF_FONT_LIBS brotlidec brotlicommon)
+    message(STATUS "web fonts: WOFF, WOFF2 and TrueType")
+else()
+    message(STATUS "web fonts: WOFF and TrueType only, no brotli for WOFF2 "
+                   "(run scripts/build-freetype-woff2.sh)")
 endif()
 if(VITASURF_IMAGE_LIBS)
     message(STATUS "extra image decoders: ${VITASURF_IMAGE_LIBS}")
@@ -262,6 +272,7 @@ target_link_libraries(${PROJECT_NAME}
     # libvita2d (MIT) puts the page on screen through the GPU so that the
     # system IME dialog can draw over it.
     vita2d png jpeg freetype z bz2 pthread m
+    ${VITASURF_FONT_LIBS}
     ${VITASURF_IMAGE_LIBS}
     -Wl,--end-group
     SceGxm_stub

@@ -1,0 +1,21 @@
+diff --git a/utils/file.c b/utils/file.c
+index 75a8a1c03..a2bd6bfaf 100644
+--- a/utils/file.c
++++ b/utils/file.c
+@@ -248,7 +248,15 @@ static nserror posix_mkdir_all(const char *fname)
+ 	while ((sep = strchr(sep, '/')) != NULL) {
+ 		*sep = 0;
+ 		if (stat(dname, &sb) != 0) {
+-			if (nsmkdir(dname, S_IRWXU) != 0) {
++			/*
++			 * EEXIST is not a failure: the Vita's stat says
++			 * nothing useful about a device root such as
++			 * "ux0:data", while mkdir on it says it is
++			 * already there. Treating that as an error left
++			 * every disc cache write failing. (VitaSurf)
++			 */
++			if (nsmkdir(dname, S_IRWXU) != 0 &&
++			    errno != EEXIST) {
+ 				/* could not create path element */
+ 				free(dname);
+ 				return NSERROR_NOT_FOUND;

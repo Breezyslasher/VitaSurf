@@ -31,14 +31,17 @@ for patch in "$ROOT"/patches/*.patch; do
     if git -C "$dir" apply --check --reverse "$patch" >/dev/null 2>&1; then
         echo "   PATCH: $name (already applied)"
         grep -qxF "$name" "$stamp" 2>/dev/null || echo "$name" >> "$stamp"
+    elif [ -f "$stamp" ] && grep -qxF "$name" "$stamp"; then
+        # The record says it is in but it will not reverse, because a
+        # later patch moved the lines around it. Applying it again would
+        # be taken as a fresh change and land a second copy, which is
+        # what once put the text-overflow block into redraw.c twice, so
+        # this has to be asked before the forward check, not after it.
+        echo "   PATCH: $name (recorded, cannot verify)"
     elif git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
         echo "   PATCH: $name"
         git -C "$dir" apply "$patch"
         echo "$name" >> "$stamp"
-    elif [ -f "$stamp" ] && grep -qxF "$name" "$stamp"; then
-        # neither direction applies and the record says it is in: the
-        # source has moved on, which is fine, but say so
-        echo "   PATCH: $name (recorded, cannot verify)"
     else
         echo "error: $name does not apply cleanly to deps/$submodule" >&2
         git -C "$dir" apply --check "$patch" || true

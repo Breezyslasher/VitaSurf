@@ -7,6 +7,10 @@
 # Requires VITASDK plus these vdpm packages: zlib bzip2 libpng libjpeg-turbo
 # freetype zstd mbedtls curl-mbedtls expat libvita2d. Set VITASURF_NATIVE=1 to
 # build for the host instead (see scripts/vita-env.sh).
+#
+# Run scripts/build-freetype-woff2.sh as well, or web fonts in WOFF2 --
+# which is what the web actually serves -- are refused and icon fonts
+# come out as words.
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/vita-env.sh"
