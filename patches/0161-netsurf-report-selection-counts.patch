@@ -1,8 +1,8 @@
 diff --git a/utils/utils.c b/utils/utils.c
-index d5854af8e..bd789c1a3 100644
+index d5854af8e..76051a387 100644
 --- a/utils/utils.c
 +++ b/utils/utils.c
-@@ -611,6 +611,11 @@ unsigned int vitasurf_js_jobs_slow;
+@@ -611,6 +611,15 @@ unsigned int vitasurf_js_jobs_slow;
  unsigned int vitasurf_ms_js_jobs_slow;
  unsigned int vitasurf_js_finds;
  unsigned int vitasurf_ms_js_finds;
@@ -10,17 +10,25 @@ index d5854af8e..bd789c1a3 100644
 +extern unsigned int css_select_calls;
 +extern unsigned int css_select_sheets_seen;
 +extern unsigned int css_select_selectors_considered;
++extern unsigned int css_select_from_element;
++extern unsigned int css_select_from_class;
++extern unsigned int css_select_from_id;
++extern unsigned int css_select_from_universal;
 +
  unsigned int vitasurf_ms_select;
  unsigned int vitasurf_box_elements;
  unsigned int vitasurf_sched_calls;
-@@ -656,6 +661,9 @@ void vitasurf_profile_reset(void)
+@@ -656,6 +665,13 @@ void vitasurf_profile_reset(void)
  	vitasurf_ms_js_jobs_slow = 0;
  	vitasurf_js_finds = 0;
  	vitasurf_ms_js_finds = 0;
 +	css_select_calls = 0;
 +	css_select_sheets_seen = 0;
 +	css_select_selectors_considered = 0;
++	css_select_from_element = 0;
++	css_select_from_class = 0;
++	css_select_from_id = 0;
++	css_select_from_universal = 0;
  	vitasurf_ms_select = 0;
  	vitasurf_box_elements = 0;
  	vitasurf_sched_calls = 0;

@@ -1,8 +1,8 @@
 diff --git a/src/select/select.c b/src/select/select.c
-index 458adda..89f049e 100644
+index 458adda..f4194df 100644
 --- a/src/select/select.c
 +++ b/src/select/select.c
-@@ -118,6 +118,18 @@ static css_error set_initial(css_select_state *state,
+@@ -118,6 +118,29 @@ static css_error set_initial(css_select_state *state,
  static css_error select_from_sheet(css_select_ctx *ctx,
  		const css_stylesheet *sheet, css_origin origin,
  		css_select_state *state);
@@ -17,11 +17,22 @@ index 458adda..89f049e 100644
 +unsigned int css_select_calls;
 +unsigned int css_select_sheets_seen;
 +unsigned int css_select_selectors_considered;
++/*
++ * And which hash chain each candidate came from (VitaSurf). 2750 of
++ * them per element on GitHub says the hash is not narrowing; which of
++ * the four chains is handing them over says why. A rule whose key
++ * selector cannot be hashed by name, class or id lands in the
++ * universal chain and is then offered for every element there is.
++ */
++unsigned int css_select_from_element;
++unsigned int css_select_from_class;
++unsigned int css_select_from_id;
++unsigned int css_select_from_universal;
 +
  static css_error match_selectors_in_sheet(css_select_ctx *ctx,
  		const css_stylesheet *sheet, css_select_state *state);
  static css_error match_selector_chain(css_select_ctx *ctx,
-@@ -1470,6 +1482,8 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+@@ -1470,6 +1493,8 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
  		css_select_results **result)
  {
  	css_origin origin = CSS_ORIGIN_UA;
@@ -30,7 +41,7 @@ index 458adda..89f049e 100644
  	uint32_t i, j, nhints;
  	css_error error;
  	css_select_state state;
-@@ -2311,11 +2325,15 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+@@ -2311,11 +2336,14 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
  	if (error != CSS_OK)
  		goto cleanup;
  
@@ -41,8 +52,31 @@ index 458adda..89f049e 100644
  			class_selectors, n_classes, univ_selectors)) {
  		const css_selector *selector;
  
-+		css_select_selectors_considered++;
 +
  		/* Selectors must be matched in ascending order of specificity
  		 * and rule index. (c.f. css__outranks_existing())
  		 *
+@@ -2329,6 +2357,23 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		 * selector here */
+ 		assert(selector != NULL);
+ 
++		/* which chain offered it (VitaSurf) */
++		css_select_selectors_considered++;
++		switch (src.source) {
++		case CSS_SELECT_RULE_SRC_ELEMENT:
++			css_select_from_element++;
++			break;
++		case CSS_SELECT_RULE_SRC_CLASS:
++			css_select_from_class++;
++			break;
++		case CSS_SELECT_RULE_SRC_ID:
++			css_select_from_id++;
++			break;
++		case CSS_SELECT_RULE_SRC_UNIVERSAL:
++			css_select_from_universal++;
++			break;
++		}
++
+ 		/* Match and handle the selector chain */
+ 		error = match_selector_chain(ctx, selector, state);
+ 		if (error != CSS_OK)

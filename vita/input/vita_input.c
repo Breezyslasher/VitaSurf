@@ -1126,6 +1126,10 @@ void vita_input_load_finished(struct gui_window *gw)
 				extern unsigned int css_select_sheets_seen;
 				extern unsigned int
 					css_select_selectors_considered;
+				extern unsigned int css_select_from_element;
+				extern unsigned int css_select_from_class;
+				extern unsigned int css_select_from_id;
+				extern unsigned int css_select_from_universal;
 
 				vita_log("page: selection ran %u times, "
 					 "looked in %u sheets and considered "
@@ -1133,6 +1137,13 @@ void vita_input_load_finished(struct gui_window *gw)
 					 css_select_calls,
 					 css_select_sheets_seen,
 					 css_select_selectors_considered);
+				vita_log("page: those came from %u element, "
+					 "%u class, %u id and %u universal "
+					 "rules",
+					 css_select_from_element,
+					 css_select_from_class,
+					 css_select_from_id,
+					 css_select_from_universal);
 			}
 			vita_log("page: the scheduler ran %u callbacks for "
 				 "%u ms, the longest %u ms",
