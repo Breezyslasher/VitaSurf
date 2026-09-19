@@ -10,10 +10,18 @@ index 99edfcf3a..a5f294c36 100644
  	return ret;
  }
 diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
-index 55bc3254f..db3c78458 100644
+index 55bc3254f..2f4eca715 100644
 --- a/frontends/framebuffer/font_freetype.c
 +++ b/frontends/framebuffer/font_freetype.c
-@@ -29,6 +29,8 @@
+@@ -19,6 +19,7 @@
+ 
+ #include <assert.h>
+ #include <stdlib.h>
++#include <time.h>
+ #include <strings.h>
+ #include <string.h>
+ #include <stdint.h>
+@@ -29,6 +30,8 @@
  
  #include "netsurf/inttypes.h"
  #include "utils/filepath.h"
@@ -22,7 +30,47 @@ index 55bc3254f..db3c78458 100644
  #include "utils/utf8.h"
  #include "utils/log.h"
  #include "utils/nsoption.h"
-@@ -1313,6 +1315,9 @@ fb_font_width(const plot_font_style_t *fstyle,
+@@ -303,7 +306,16 @@ bool fb_font_init(void)
+ {
+         FT_Error error;
+         FT_ULong max_cache_size;
+-        FT_UInt max_faces = 6;
++        /*
++         * Room for every bundled face and the ones a page brings with
++         * it (VitaSurf). Six was fewer than the ten registered here, so
++         * the cache manager threw faces out and asked for them again:
++         * a build 359 log loads eight distinct faces twelve times,
++         * DejaVuSansMono-Bold three times over, and each of those is
++         * FT_New_Face parsing the file again at fifty to ninety
++         * milliseconds a go.
++         */
++        FT_UInt max_faces = FB_FACE_COUNT + 6;
+ 	fb_faceid_t *fb_face;
+ 
+         /* freetype library initialise */
+@@ -1143,6 +1155,16 @@ static FT_UInt fb_glyph_for(fb_faceid_t *fb_face, FTC_FaceID face_id,
+ 	return (FT_UInt) (held & ~FB_CMAP_KNOWN);
+ }
+ 
++
++/** Microseconds on the monotonic clock, for the font counters. */
++static unsigned int fb_now_us(void)
++{
++	struct timespec t;
++
++	clock_gettime(CLOCK_MONOTONIC, &t);
++	return (unsigned int) (t.tv_sec * 1000000u + t.tv_nsec / 1000u);
++}
++
+ /**
+  * Whether this byte is one the advance cache alone can answer.
+  *
+@@ -1310,9 +1332,14 @@ fb_font_width(const plot_font_style_t *fstyle,
+         fb_faceid_t *fb_face;
+         int advance;
+ 
++        unsigned int vs_us0 = fb_now_us();
++
          fb_fill_scalar(fstyle, &srec);
          fb_face = (fb_faceid_t *)srec.face_id;
          slot = fb_adv_slot(&srec);
@@ -32,7 +80,20 @@ index 55bc3254f..db3c78458 100644
  
          *width = 0;
          while (nxtchr < length) {
-@@ -1357,6 +1362,9 @@ fb_font_position(const plot_font_style_t *fstyle,
+@@ -1336,6 +1363,7 @@ fb_font_width(const plot_font_style_t *fstyle,
+ 
+                 *width += advance;
+         }
++	vitasurf_us_font += fb_now_us() - vs_us0;
+ 	return NSERROR_OK;
+ }
+ 
+@@ -1354,9 +1382,14 @@ fb_font_position(const plot_font_style_t *fstyle,
+         int advance;
+         int prev_x = 0;
+ 
++        unsigned int vs_us0 = fb_now_us();
++
          fb_fill_scalar(fstyle, &srec);
          fb_face = (fb_faceid_t *)srec.face_id;
          slot = fb_adv_slot(&srec);
@@ -42,7 +103,20 @@ index 55bc3254f..db3c78458 100644
  
          *actual_x = 0;
          while (nxtchr < length) {
-@@ -1441,6 +1449,9 @@ fb_font_split(const plot_font_style_t *fstyle,
+@@ -1398,6 +1431,7 @@ fb_font_position(const plot_font_style_t *fstyle,
+                 *actual_x = prev_x;
+ 
+         *char_offset = nxtchr;
++	vitasurf_us_font += fb_now_us() - vs_us0;
+ 	return NSERROR_OK;
+ }
+ 
+@@ -1438,9 +1472,14 @@ fb_font_split(const plot_font_style_t *fstyle,
+         fb_faceid_t *fb_face;
+         int advance;
+ 
++        unsigned int vs_us0 = fb_now_us();
++
          fb_fill_scalar(fstyle, &srec);
          fb_face = (fb_faceid_t *)srec.face_id;
          slot = fb_adv_slot(&srec);
@@ -52,35 +126,45 @@ index 55bc3254f..db3c78458 100644
  
          *actual_x = 0;
          while (nxtchr < length) {
+@@ -1483,6 +1522,7 @@ fb_font_split(const plot_font_style_t *fstyle,
+ 
+         *char_offset = nxtchr;
+ 
++	vitasurf_us_font += fb_now_us() - vs_us0;
+ 	return NSERROR_OK;
+ }
+ 
 diff --git a/utils/utils.c b/utils/utils.c
-index fc33bb1ba..2e8ab5000 100644
+index fc33bb1ba..fd84fd258 100644
 --- a/utils/utils.c
 +++ b/utils/utils.c
-@@ -583,6 +583,9 @@ unsigned int vitasurf_images_done;
+@@ -583,6 +583,10 @@ unsigned int vitasurf_images_done;
  unsigned int vitasurf_images_failed;
  unsigned int vitasurf_ms_boxes;
  unsigned int vitasurf_ms_layout;
 +unsigned int vitasurf_layout_runs;
 +unsigned int vitasurf_font_calls;
 +unsigned int vitasurf_font_chars;
++unsigned int vitasurf_us_font;
  unsigned int vitasurf_ms_script;
  unsigned int vitasurf_ms_draw;
  unsigned int vitasurf_ms_teardown;
-@@ -599,6 +602,9 @@ void vitasurf_profile_reset(void)
+@@ -599,6 +603,10 @@ void vitasurf_profile_reset(void)
  	vitasurf_images_failed = 0;
  	vitasurf_ms_boxes = 0;
  	vitasurf_ms_layout = 0;
 +	vitasurf_layout_runs = 0;
 +	vitasurf_font_calls = 0;
 +	vitasurf_font_chars = 0;
++	vitasurf_us_font = 0;
  	vitasurf_ms_script = 0;
  	vitasurf_ms_draw = 0;
  	vitasurf_ms_teardown = 0;
 diff --git a/utils/utils.h b/utils/utils.h
-index 02682edbd..a5d7cc382 100644
+index 02682edbd..e97832314 100644
 --- a/utils/utils.h
 +++ b/utils/utils.h
-@@ -144,6 +144,19 @@ extern unsigned int vitasurf_images_done;
+@@ -144,6 +144,29 @@ extern unsigned int vitasurf_images_done;
  extern unsigned int vitasurf_images_failed;
  extern unsigned int vitasurf_ms_boxes;
  extern unsigned int vitasurf_ms_layout;
@@ -97,6 +181,16 @@ index 02682edbd..a5d7cc382 100644
 +extern unsigned int vitasurf_layout_runs;
 +extern unsigned int vitasurf_font_calls;
 +extern unsigned int vitasurf_font_chars;
++/**
++ * Microseconds the font engine was inside (VitaSurf).
++ *
++ * The counts said a four kilobyte page measures text 192 times over
++ * 3339 characters and is laid out once, which cannot be 1719 ms, so
++ * either the font engine is far slower per call than it measures on a
++ * host or the time is somewhere else in layout. 192 calls is few
++ * enough that a clock read at each end costs nothing.
++ */
++extern unsigned int vitasurf_us_font;
  /**
   * Milliseconds spent inside script, however it was entered: a
   * <script>, a timer, an event listener. The other counters cover

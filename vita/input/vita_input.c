@@ -1093,9 +1093,11 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_image, vitasurf_ms_boxes,
 				 vitasurf_ms_layout, vitasurf_ms_script);
 			vita_log("page: laid out %u times, measuring text "
-				 "%u times over %u characters",
+				 "%u times over %u characters, %u ms of it "
+				 "inside the font engine",
 				 vitasurf_layout_runs, vitasurf_font_calls,
-				 vitasurf_font_chars);
+				 vitasurf_font_chars,
+				 vitasurf_us_font / 1000);
 			vita_log("page: and drawing %u ms, tearing the last "
 				 "page's script down %u ms, our own "
 				 "JavaScript %u ms",
