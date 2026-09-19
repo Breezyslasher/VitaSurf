@@ -1121,6 +1121,19 @@ void vita_input_load_finished(struct gui_window *gw)
 				 "styles",
 				 vitasurf_ms_boxes, vitasurf_box_elements,
 				 vitasurf_ms_select);
+			{
+				extern unsigned int css_select_calls;
+				extern unsigned int css_select_sheets_seen;
+				extern unsigned int
+					css_select_selectors_considered;
+
+				vita_log("page: selection ran %u times, "
+					 "looked in %u sheets and considered "
+					 "%u selectors",
+					 css_select_calls,
+					 css_select_sheets_seen,
+					 css_select_selectors_considered);
+			}
 			vita_log("page: the scheduler ran %u callbacks for "
 				 "%u ms, the longest %u ms",
 				 vitasurf_sched_calls, vitasurf_ms_sched,

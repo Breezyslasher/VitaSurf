@@ -1,0 +1,48 @@
+diff --git a/src/select/select.c b/src/select/select.c
+index 458adda..89f049e 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -118,6 +118,18 @@ static css_error set_initial(css_select_state *state,
+ static css_error select_from_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet, css_origin origin,
+ 		css_select_state *state);
++/*
++ * What selection actually does (VitaSurf). A build 376 log spends
++ * 36956 ms selecting styles for 6270 elements on a GitHub page -- 5.9
++ * ms each, against 0.40 ms on Wikipedia for a document of much the
++ * same size. Whether the hash is failing to narrow the candidates or
++ * the cost is past the matching altogether cannot be told from the
++ * total, so count the sheets looked in and the selectors considered.
++ */
++unsigned int css_select_calls;
++unsigned int css_select_sheets_seen;
++unsigned int css_select_selectors_considered;
++
+ static css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet, css_select_state *state);
+ static css_error match_selector_chain(css_select_ctx *ctx,
+@@ -1470,6 +1482,8 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		css_select_results **result)
+ {
+ 	css_origin origin = CSS_ORIGIN_UA;
++
++	css_select_calls++;
+ 	uint32_t i, j, nhints;
+ 	css_error error;
+ 	css_select_state state;
+@@ -2311,11 +2325,15 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	if (error != CSS_OK)
+ 		goto cleanup;
+ 
++	css_select_sheets_seen++;
++
+ 	/* Process matching selectors, if any */
+ 	while (_selectors_pending(node_selectors, id_selectors,
+ 			class_selectors, n_classes, univ_selectors)) {
+ 		const css_selector *selector;
+ 
++		css_select_selectors_considered++;
++
+ 		/* Selectors must be matched in ascending order of specificity
+ 		 * and rule index. (c.f. css__outranks_existing())
+ 		 *
