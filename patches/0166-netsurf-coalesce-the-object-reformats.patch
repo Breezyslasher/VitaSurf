@@ -1,0 +1,150 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 45c1ee24e..fcaa19a23 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5987,6 +5987,7 @@ bool layout_document(html_content *content, int width, int height)
+ 		unsigned int took = (unsigned int)(vs_t1 - vs_t0);
+ 
+ 		vitasurf_ms_layout += took;
++		vitasurf_ms_layout_last = took;
+ 		if (took > vitasurf_ms_layout_max) {
+ 			vitasurf_ms_layout_max = took;
+ 		}
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 35fef8c66..19444a720 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -132,6 +132,50 @@ html_object_done(struct box *box,
+ }
+ 
+ 
++/**
++ * Lay the page out for the objects that have arrived (VitaSurf).
++ *
++ * Scheduled rather than run as each object becomes ready, so that a
++ * burst of them costs one pass instead of one pass each. The wait is
++ * taken from what the last pass cost: a page whose layout is cheap
++ * reformats almost at once, and one where it costs a sixth of a second
++ * does not spend all its time doing it.
++ */
++static void html_object_reformat(void *pw)
++{
++	html_content *c = pw;
++
++	c->object_reformat_pending = false;
++
++	if (c->layout == NULL) {
++		return;
++	}
++	if (c->base.status != CONTENT_STATUS_READY &&
++	    c->base.status != CONTENT_STATUS_DONE) {
++		return;
++	}
++
++	vitasurf_object_reformats++;
++	content__reformat(&c->base, false,
++			  c->base.available_width,
++			  c->base.available_height);
++}
++
++/** How long to let object arrivals gather before laying out again. */
++static int html_object_reformat_wait(void)
++{
++	/* four times the last pass keeps reflow to a fifth of the time */
++	int wait = (int)(vitasurf_ms_layout_last * 4);
++
++	if (wait < 50) {
++		wait = 50;
++	} else if (wait > 2000) {
++		wait = 2000;
++	}
++	return wait;
++}
++
++
+ /**
+  * Callback for hlcache_handle_retrieve() for objects with no box.
+  */
+@@ -211,11 +255,12 @@ html_object_callback(hlcache_handle *object,
+ 			if (c->layout != NULL &&
+ 					(box->flags & REPLACE_DIM) == 0 &&
+ 					(c->base.status == CONTENT_STATUS_READY ||
+-					c->base.status == CONTENT_STATUS_DONE)) {
+-				vitasurf_object_reformats++;
+-				content__reformat(&c->base, false,
+-						c->base.available_width,
+-						c->base.available_height);
++					c->base.status == CONTENT_STATUS_DONE) &&
++					c->object_reformat_pending == false) {
++				c->object_reformat_pending = true;
++				guit->misc->schedule(
++					html_object_reformat_wait(),
++					html_object_reformat, c);
+ 			}
+ 		}
+ 		break;
+@@ -760,6 +805,10 @@ nserror html_object_free_list(html_content *html,
+ /* exported interface documented in html/object.h */
+ nserror html_object_free_objects(html_content *html)
+ {
++	/* a pending reformat must not outlive the content (VitaSurf) */
++	guit->misc->schedule(-1, html_object_reformat, html);
++	html->object_reformat_pending = false;
++
+ 	while (html->object_list != NULL) {
+ 		struct content_html_object *victim = html->object_list;
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 25c79518a..122b1a48f 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -125,6 +125,17 @@ typedef struct html_content {
+ 	/** Whether an initial layout has been done */
+ 	bool had_initial_layout;
+ 
++	/**
++	 * A reformat asked for by an object, waiting to happen (VitaSurf).
++	 *
++	 * An object whose box has no fixed size can change the shape of the
++	 * page when it arrives, so the page has to be laid out again. Doing
++	 * that for each of them is what made a GitHub profile lay itself out
++	 * 143 times for 23006 ms. One pending reformat at a time turns a
++	 * burst of arrivals into a single pass.
++	 */
++	bool object_reformat_pending;
++
+ 	/** Whether scripts are enabled for this content */
+ 	bool enable_scripting;
+ 
+diff --git a/utils/utils.c b/utils/utils.c
+index f26bdae0b..d4bd83575 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -629,6 +629,7 @@ unsigned int vitasurf_ms_box_text;
+ unsigned int vitasurf_box_texts;
+ unsigned int vitasurf_ms_box_special;
+ unsigned int vitasurf_box_specials;
++unsigned int vitasurf_ms_layout_last;
+ unsigned int vitasurf_ms_layout_max;
+ unsigned int vitasurf_layout_slow;
+ unsigned int vitasurf_ms_layout_slow;
+@@ -698,6 +699,7 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_box_texts = 0;
+ 	vitasurf_ms_box_special = 0;
+ 	vitasurf_box_specials = 0;
++	vitasurf_ms_layout_last = 0;
+ 	vitasurf_ms_layout_max = 0;
+ 	vitasurf_layout_slow = 0;
+ 	vitasurf_ms_layout_slow = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 817fc1a05..5feca368f 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -312,6 +312,7 @@ extern unsigned int vitasurf_box_texts;
+ extern unsigned int vitasurf_ms_box_special;	/**< form controls, images */
+ extern unsigned int vitasurf_box_specials;
+ 
++extern unsigned int vitasurf_ms_layout_last;	/**< the pass just done */
+ extern unsigned int vitasurf_ms_layout_max;	/**< the longest one pass */
+ extern unsigned int vitasurf_layout_slow;	/**< passes of 100 ms or more */
+ extern unsigned int vitasurf_ms_layout_slow;
