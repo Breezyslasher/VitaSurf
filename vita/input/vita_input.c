@@ -1116,6 +1116,11 @@ void vita_input_load_finished(struct gui_window *gw)
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
+			vita_log("page: boxes and styles %u ms covered %u "
+				 "elements, %u ms of it selecting their "
+				 "styles",
+				 vitasurf_ms_boxes, vitasurf_box_elements,
+				 vitasurf_ms_select);
 			vita_log("page: the scheduler ran %u callbacks for "
 				 "%u ms, the longest %u ms",
 				 vitasurf_sched_calls, vitasurf_ms_sched,
