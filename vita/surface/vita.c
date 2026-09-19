@@ -64,6 +64,18 @@
 /* Input polling period while waiting for events, in microseconds. */
 #define POLL_INTERVAL_US 8000
 
+/*
+ * One screen refresh. The screen is put up this often whether or not
+ * the page changed, the way the machine's own browser does, rather
+ * than only when something moved. Presenting on change alone is less
+ * work and less power, but it makes every frame land wherever the
+ * change happened to fall against the refresh, which reads as motion
+ * that will not settle, and it makes the system frame counter show
+ * how often the page changed rather than whether the browser is
+ * keeping up.
+ */
+#define FRAME_INTERVAL_US 16600
+
 /* Held D-pad buttons repeat after this delay, then at this rate (ms). */
 #define REPEAT_DELAY_MS  400
 #define REPEAT_RATE_MS   60
@@ -550,15 +562,27 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 }
 
 /**
- * Put the texture on screen if it changed, or every frame while a system
- * dialog is up so the dialog can composite itself over it. Swapping waits
- * for the vertical blank, so this is only called from the input loop and,
+ * Put the texture on screen.
+ *
+ * At once when the page changed, so a keypress is not held back, and
+ * otherwise once a refresh so the picture is paced by the screen
+ * rather than by whatever last happened to move. Swapping waits for
+ * the vertical blank, so this is only called from the input loop and,
  * during long redraws, from vita_update() at a limited rate.
+ *
+ * \return true if the screen was put up.
  */
-static void present(struct vita_surface *vs)
+static bool present(struct vita_surface *vs)
 {
-	if (vs->tex == NULL || (!vs->dirty && !vs->dialog)) {
-		return;
+	SceUInt64 now;
+
+	if (vs->tex == NULL) {
+		return false;
+	}
+	now = sceKernelGetProcessTimeWide();
+	if (!vs->dirty && !vs->dialog &&
+	    now - vs->last_present_us < FRAME_INTERVAL_US) {
+		return false;
 	}
 	vita2d_start_drawing();
 	vita2d_draw_texture(vs->tex, 0.0f, 0.0f);
@@ -572,6 +596,8 @@ static void present(struct vita_surface *vs)
 	vs->dirty = false;
 	vs->presents++;
 	vs->last_present_us = sceKernelGetProcessTimeWide();
+
+	return true;
 }
 
 /* exported interface documented in vita_surface.h */
