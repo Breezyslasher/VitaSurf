@@ -38,9 +38,32 @@ TOOLCHAIN="$VITASDK/share/vita.toolchain.cmake"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+# Anything the Vita links has to be ordinary position dependent code.
+# vita-elf-create reads the relocations the linker kept (-Wl,-q) and
+# knows only a fixed set of them; a GOT one stops it with "Invalid
+# relocation type 25", which is R_ARM_BASE_PREL, and no VPK is built.
+no_pic_relocations() {
+    if "$VITASDK/bin/arm-vita-eabi-readelf" -r "$1" |
+            grep -q 'R_ARM_GOT_BREL\|R_ARM_BASE_PREL'; then
+        echo "$(basename "$1") was built position independent; " \
+             "vita-elf-create will refuse its relocations" >&2
+        exit 1
+    fi
+}
+
 echo "==== brotli $BROTLI_TAG"
 git clone --depth 1 --branch "$BROTLI_TAG" https://github.com/google/brotli \
     "$work/brotli"
+# brotli asks for position independent code for all three libraries, so
+# that a shared build works. Nothing here is shared, and on ARM it turns
+# every access to a global into a GOT one. Ask for the opposite.
+grep -q 'POSITION_INDEPENDENT_CODE TRUE' "$work/brotli/CMakeLists.txt" || {
+    echo "brotli $BROTLI_TAG no longer sets POSITION_INDEPENDENT_CODE;" \
+         "check what it does instead before removing this" >&2
+    exit 1
+}
+sed -i 's/POSITION_INDEPENDENT_CODE TRUE/POSITION_INDEPENDENT_CODE FALSE/' \
+    "$work/brotli/CMakeLists.txt"
 cmake -S "$work/brotli" -B "$work/brotli/build" \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -54,6 +77,8 @@ cmake -S "$work/brotli" -B "$work/brotli/build" \
 # and nothing else, and skipping the encoder and the tool takes about
 # two minutes off this.
 cmake --build "$work/brotli/build" --target brotlidec brotlicommon -j"$JOBS"
+no_pic_relocations "$work/brotli/build/libbrotlicommon.a"
+no_pic_relocations "$work/brotli/build/libbrotlidec.a"
 # By hand as well, because brotli's install rules are all or nothing and
 # would ask for that same tool. This is a static library, five headers
 # and the two pkg-config files FreeType looks it up through.
@@ -80,6 +105,7 @@ cmake -S "$work/freetype" -B "$work/freetype/build" \
     -DFT_REQUIRE_BROTLI=TRUE \
     -DCMAKE_C_FLAGS="-std=gnu11 -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types"
 cmake --build "$work/freetype/build" -j"$JOBS"
+no_pic_relocations "$work/freetype/build/libfreetype.a"
 cmake --install "$work/freetype/build"
 
 if grep -q '^#define FT_CONFIG_OPTION_USE_BROTLI' \
