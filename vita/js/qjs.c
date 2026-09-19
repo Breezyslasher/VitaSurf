@@ -6070,8 +6070,25 @@ void js_initialise(void)
 	 * every script, which looks like a very fast engine in the log.
 	 */
 	err = javascript_init();
-	vita_log("qjs: QuickJS engine initialised (content handler %s)",
+	/*
+	 * The engine's version, because how large a compiled script is
+	 * depends on it: a host build of quickjs-ng 0.14 writes bytecode
+	 * three times the size of its source, keeping every function's
+	 * text so that toString can return it, where a build 362 log
+	 * cached 73 KB for 221 KB of source. Comparing a measurement
+	 * taken here against one taken on a host means knowing both.
+	 */
+#ifdef QJS_VERSION_MAJOR
+	vita_log("qjs: QuickJS engine initialised (content handler %s), "
+		 "quickjs-ng %d.%d.%d%s",
+		 err == NSERROR_OK ? "registered" : "FAILED",
+		 QJS_VERSION_MAJOR, QJS_VERSION_MINOR, QJS_VERSION_PATCH,
+		 QJS_VERSION_SUFFIX);
+#else
+	vita_log("qjs: QuickJS engine initialised (content handler %s), "
+		 "version not reported by the headers",
 		 err == NSERROR_OK ? "registered" : "FAILED");
+#endif
 }
 
 void js_finalise(void)
@@ -6583,6 +6600,7 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	uint8_t *buf;
 	JSValue fn;
 	uint64_t hash;
+	uint64_t t_read0 = 0, t_read1 = 0, t_decode = 0;
 
 	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<' ||
 	    vitasurf_cache_disabled()) {
@@ -6611,12 +6629,22 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 		fclose(f);
 		return JS_UNDEFINED;
 	}
+	/*
+	 * Where reading an entry back actually goes (VitaSurf). A build
+	 * 362 log reads 1822 KB of script back in 1984 ms against 3947
+	 * ms to compile it, barely twice as quick; the same pair of
+	 * operations on a host is fifteen to eighteen times apart,
+	 * measured over three real bundles. One of these two halves is
+	 * out of proportion and the totals cannot say which.
+	 */
+	nsu_getmonotonic_ms(&t_read0);
 	if (fread(buf, 1, h.bc_len, f) != h.bc_len) {
 		free(buf);
 		fclose(f);
 		return JS_UNDEFINED;
 	}
 	fclose(f);
+	nsu_getmonotonic_ms(&t_read1);
 	/*
 	 * QuickJS stamps its own bytecode version into the stream and
 	 * refuses a stream it did not write, so an entry left behind by an
@@ -6624,6 +6652,14 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	 * something that runs. Treat it as a miss and compile.
 	 */
 	fn = JS_ReadObject(ctx, buf, h.bc_len, JS_READ_OBJ_BYTECODE);
+	nsu_getmonotonic_ms(&t_decode);
+	vita_log("qjs: cache entry %u KB: %u ms off the card at %u KB/s, "
+		 "%u ms decoding it",
+		 (unsigned)(h.bc_len / 1024),
+		 (unsigned)(t_read1 - t_read0),
+		 t_read1 > t_read0 ?
+			(unsigned)(h.bc_len / (t_read1 - t_read0)) : 0u,
+		 (unsigned)(t_decode - t_read1));
 	free(buf);
 	if (JS_IsException(fn)) {
 		JS_FreeValue(ctx, JS_GetException(ctx));
