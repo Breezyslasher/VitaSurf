@@ -70,6 +70,15 @@ void vita_surface_hold_progress(bool hold);
 void vita_surface_request_quit(void);
 
 /**
+ * How many times the screen has been put up since this was last asked.
+ *
+ * The frame loop reports its own rounds, but a round that draws
+ * nothing changes nothing on screen: this is the number the eye sees,
+ * and reading it resets the count.
+ */
+unsigned int vita_surface_take_presents(void);
+
+/**
  * Draw a focus rectangle over the display at screen coordinates, or clear
  * it with NULL. The rectangle is an overlay on the display buffer only:
  * NetSurf's own rendering is never touched, and it is re-applied whenever

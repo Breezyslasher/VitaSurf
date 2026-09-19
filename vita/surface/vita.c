@@ -91,6 +91,7 @@ struct vita_surface {
 	uint32_t *display;        /**< texture pixels */
 	int stride;               /**< texture row length in pixels */
 	bool dirty;               /**< texture changed since the last present */
+	unsigned int presents;    /**< screens put up since last counted */
 	bool gpu_reading;         /**< the GPU has not finished with the texture */
 	SceUInt64 last_present_us;
 	bool dialog;              /**< a system dialog is on screen */
@@ -569,7 +570,23 @@ static void present(struct vita_surface *vs)
 	/* the GPU now reads the texture; the next write waits, not this */
 	vs->gpu_reading = true;
 	vs->dirty = false;
+	vs->presents++;
 	vs->last_present_us = sceKernelGetProcessTimeWide();
+}
+
+/* exported interface documented in vita_surface.h */
+unsigned int vita_surface_take_presents(void)
+{
+	struct vita_surface *vs = the_nsfb != NULL ?
+			the_nsfb->surface_priv : NULL;
+	unsigned int n;
+
+	if (vs == NULL) {
+		return 0;
+	}
+	n = vs->presents;
+	vs->presents = 0;
+	return n;
 }
 
 /* ------------------------------------------------------------------------ */
