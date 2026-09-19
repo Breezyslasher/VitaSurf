@@ -65,16 +65,23 @@
 #define POLL_INTERVAL_US 8000
 
 /*
- * One screen refresh. The screen is put up this often whether or not
- * the page changed, the way the machine's own browser does, rather
- * than only when something moved. Presenting on change alone is less
- * work and less power, but it makes every frame land wherever the
- * change happened to fall against the refresh, which reads as motion
- * that will not settle, and it makes the system frame counter show
- * how often the page changed rather than whether the browser is
- * keeping up.
+ * How long must have passed before the screen is put up again.
+ *
+ * The screen goes up this often whether or not the page changed, the
+ * way the machine's own browser does, rather than only when something
+ * moved. Presenting on change alone is less work and less power, but
+ * it makes every frame land wherever the change happened to fall
+ * against the refresh, which reads as motion that will not settle.
+ *
+ * It is one refresh less one poll, not one refresh. The loop can only
+ * present when it wakes, and it wakes every POLL_INTERVAL_US: asking
+ * for a full 16.6 ms meant the poll at 16 ms was turned away and the
+ * one at 24 ms let through, so a still page sat at 42 frames a second
+ * instead of 60. Allowing a poll that lands just short of the refresh
+ * puts it back on the 16 ms one. Going up is not a risk: the swap
+ * waits for the vertical blank, so 60 is the ceiling either way.
  */
-#define FRAME_INTERVAL_US 16600
+#define FRAME_INTERVAL_US (16600 - POLL_INTERVAL_US)
 
 /* Held D-pad buttons repeat after this delay, then at this rate (ms). */
 #define REPEAT_DELAY_MS  400
