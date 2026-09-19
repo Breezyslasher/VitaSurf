@@ -1151,6 +1151,10 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_layout_runs, vitasurf_ms_layout,
 				 vitasurf_ms_layout_max, vitasurf_layout_slow,
 				 vitasurf_ms_layout_slow);
+			vita_log("page: %u objects became ready and %u of "
+				 "them laid the page out again",
+				 vitasurf_object_ready,
+				 vitasurf_object_reformats);
 			vita_log("page: %u images converted for %u ms, the "
 				 "dearest %u ms, %u kpixels decoded in all",
 				 vitasurf_images_converted, vitasurf_ms_image,
