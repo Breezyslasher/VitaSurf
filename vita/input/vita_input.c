@@ -1098,6 +1098,13 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_layout_runs, vitasurf_font_calls,
 				 vitasurf_font_chars,
 				 vitasurf_us_font / 1000);
+			vita_log("page: %u of those characters reached "
+				 "FreeType, costing %u ms; the other %u ms "
+				 "is our own code around it",
+				 vitasurf_font_lookups,
+				 vitasurf_us_lookup / 1000,
+				 (vitasurf_us_font - vitasurf_us_lookup) /
+					1000);
 			vita_log("page: and drawing %u ms, tearing the last "
 				 "page's script down %u ms, our own "
 				 "JavaScript %u ms",
