@@ -1,0 +1,175 @@
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index 03c6279b0..d2e2a37fc 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <time.h>
+ #include <strings.h>
+@@ -76,6 +77,23 @@ typedef struct fb_faceid_s {
+         int cidx; /* character map index for unicode */
+ 	uint8_t *data; /* a web font's bytes, in place of a file (VitaSurf) */
+ 	size_t len;
++	/*
++	 * The font file, held in memory (VitaSurf).
++	 *
++	 * FT_New_Face leaves the file open and reads out of it as
++	 * glyphs are asked for: four seek-and-read pairs per glyph,
++	 * three hundred and forty-nine bytes in eighty-seven byte
++	 * pieces, and two hundred and four reads the first time a face
++	 * is autohinted. On a desktop those come out of the page cache
++	 * and cost nothing. On the Vita they are reads from app0:, and
++	 * a build 361 log spends 1848 ms inside FreeType for 243
++	 * glyphs -- seven and a half milliseconds each, where the same
++	 * lookups measure seven and a half microseconds on a host. The
++	 * thousandfold gap is not the processor. Read the file once
++	 * and hand FreeType the bytes.
++	 */
++	uint8_t *filedata;
++	size_t filelen;
+ 	/*
+ 	 * ASCII to glyph index (VitaSurf). Measuring text used to reach
+ 	 * the advance cache without asking FreeType anything, and
+@@ -140,6 +158,44 @@ enum fb_face_e {
+ 
+ static fb_faceid_t *fb_faces[FB_FACE_COUNT];
+ 
++/**
++ * Read a face's file into memory (VitaSurf), so that FreeType has no
++ * reason to go back to app0: for every glyph. A file we cannot read
++ * whole is left alone and streamed as before.
++ */
++static void fb_face_read_file(fb_faceid_t *fb_face)
++{
++	FILE *fp;
++	long len;
++	uint8_t *buf;
++
++	fp = fopen(fb_face->fontfile, "rb");
++	if (fp == NULL) {
++		return;
++	}
++	if (fseek(fp, 0, SEEK_END) != 0 || (len = ftell(fp)) <= 0) {
++		fclose(fp);
++		return;
++	}
++	rewind(fp);
++
++	buf = malloc((size_t) len);
++	if (buf == NULL) {
++		fclose(fp);
++		return;
++	}
++	if (fread(buf, 1, (size_t) len, fp) != (size_t) len) {
++		free(buf);
++		fclose(fp);
++		return;
++	}
++	fclose(fp);
++
++	fb_face->filedata = buf;
++	fb_face->filelen = (size_t) len;
++}
++
++
+ /**
+  * map cache manager handle to face id
+  */
+@@ -153,9 +209,18 @@ ft_face_requester(FTC_FaceID face_id,
+         fb_faceid_t *fb_face = (fb_faceid_t *)face_id;
+         int cidx;
+ 
++	if (fb_face->data == NULL && fb_face->filedata == NULL &&
++	    fb_face->fontfile != NULL) {
++		fb_face_read_file(fb_face);
++	}
++
+ 	if (fb_face->data != NULL) {
+ 		error = FT_New_Memory_Face(library, fb_face->data,
+ 				(FT_Long) fb_face->len, fb_face->index, face);
++	} else if (fb_face->filedata != NULL) {
++		error = FT_New_Memory_Face(library, fb_face->filedata,
++				(FT_Long) fb_face->filelen, fb_face->index,
++				face);
+ 	} else {
+ 		error = FT_New_Face(library, fb_face->fontfile,
+ 				fb_face->index, face);
+@@ -177,8 +242,10 @@ ft_face_requester(FTC_FaceID face_id,
+                         }
+                 }
+         }
+-        NSLOG(netsurf, INFO, "Loaded face from %s",
+-	      fb_face->fontfile != NULL ? fb_face->fontfile : "memory");
++        NSLOG(netsurf, INFO, "Loaded face from %s (%u bytes in memory)",
++	      fb_face->fontfile != NULL ? fb_face->fontfile : "memory",
++	      (unsigned int) (fb_face->filedata != NULL ?
++			      fb_face->filelen : fb_face->len));
+ 
+         return error;
+ }
+@@ -280,15 +347,49 @@ fb_new_face(const char *option, const char *resname, const char *fontname)
+         FT_Face aface;
+ 	char buf[PATH_MAX];
+ 
+-        newf = calloc(1, sizeof(fb_faceid_t));
++	const char *path;
++	int i;
+ 
+         if (option != NULL) {
+-                newf->fontfile = strdup(option);
++                path = option;
+         } else {
+-		filepath_sfind(respaths, buf, fontname);
+-                newf->fontfile = strdup(buf);
++		/*
++		 * Check the search succeeded (VitaSurf). filepath_sfind
++		 * returns NULL and leaves buf untouched when the file is
++		 * not there, and buf is an uninitialised stack array, so
++		 * the caller went on to load whatever the last call had
++		 * left in that stack slot. The Vita bundles no
++		 * Comic_Sans_MS.ttf or Impact.ttf, and cursive and
++		 * fantasy were each loading a second and third copy of
++		 * the monospace bold face the call before had found.
++		 */
++		if (filepath_sfind(respaths, buf, fontname) == NULL) {
++			return NULL;
++		}
++		path = buf;
+         }
+ 
++	/*
++	 * One face per file (VitaSurf). Monospace-bold, cursive and
++	 * fantasy all name DejaVuSansMono-Bold, and as three separate
++	 * face ids that is the file parsed three times, three sets of
++	 * autohinter globals built, three copies held in memory and
++	 * three sets of glyphs rendered. They are the same font.
++	 */
++	for (i = 0; i < FB_FACE_COUNT; i++) {
++		if (fb_faces[i] != NULL &&
++		    fb_faces[i]->fontfile != NULL &&
++		    strcmp(fb_faces[i]->fontfile, path) == 0) {
++			return fb_faces[i];
++		}
++	}
++
++        newf = calloc(1, sizeof(fb_faceid_t));
++	if (newf == NULL) {
++		return NULL;
++	}
++	newf->fontfile = strdup(path);
++
+         error = FTC_Manager_LookupFace(ft_cmanager, (FTC_FaceID)newf, &aface);
+         if (error) {
+                 NSLOG(netsurf, INFO, "Could not find font face %s (code %d)",
+@@ -511,6 +612,7 @@ bool fb_font_finalise(void)
+ 		}
+ 
+ 		free(fb_faces[i]->fontfile);
++		free(fb_faces[i]->filedata);
+ 		free(fb_faces[i]->liga);
+ 		free(fb_faces[i]->liga_pool);
+ 		free(fb_faces[i]->liga_starts);
