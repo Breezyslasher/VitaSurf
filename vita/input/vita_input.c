@@ -1118,9 +1118,12 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
 			vita_log("page: boxes and styles %u ms covered %u "
 				 "elements, %u ms of it selecting their "
-				 "styles",
+				 "styles and %u ms parsing the style "
+				 "attribute on %u of them",
 				 vitasurf_ms_boxes, vitasurf_box_elements,
-				 vitasurf_ms_select);
+				 vitasurf_ms_select,
+				 vitasurf_ms_inline_style,
+				 vitasurf_inline_styles);
 			{
 				extern unsigned int css_select_calls;
 				extern unsigned int css_select_sheets_seen;
@@ -1130,6 +1133,10 @@ void vita_input_load_finished(struct gui_window *gw)
 				extern unsigned int css_select_from_class;
 				extern unsigned int css_select_from_id;
 				extern unsigned int css_select_from_universal;
+				extern unsigned int css_hash_in_element;
+				extern unsigned int css_hash_in_class;
+				extern unsigned int css_hash_in_id;
+				extern unsigned int css_hash_in_universal;
 
 				vita_log("page: selection ran %u times, "
 					 "looked in %u sheets and considered "
@@ -1144,6 +1151,11 @@ void vita_input_load_finished(struct gui_window *gw)
 					 css_select_from_class,
 					 css_select_from_id,
 					 css_select_from_universal);
+				vita_log("page: the sheets filed %u rules by "
+					 "element, %u by class, %u by id and "
+					 "%u as universal",
+					 css_hash_in_element, css_hash_in_class,
+					 css_hash_in_id, css_hash_in_universal);
 			}
 			vita_log("page: the scheduler ran %u callbacks for "
 				 "%u ms, the longest %u ms",

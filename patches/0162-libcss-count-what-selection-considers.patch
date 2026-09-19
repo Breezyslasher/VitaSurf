@@ -1,3 +1,54 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index f04434e..3db985a 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -236,6 +236,18 @@ css_error css__selector_hash_destroy(css_selector_hash *hash)
+  * \param selector  Pointer to selector
+  * \return CSS_OK on success, appropriate error otherwise
+  */
++/*
++ * How the page's rules are filed (VitaSurf). Selection offers every
++ * element 2738 candidates out of the universal chain on a GitHub page
++ * and 1 on a local one, and the per element count cannot say whether
++ * those rules are genuinely unhashable or whether something on the way
++ * in put them there. Count them as they are filed.
++ */
++unsigned int css_hash_in_id;
++unsigned int css_hash_in_class;
++unsigned int css_hash_in_element;
++unsigned int css_hash_in_universal;
++
+ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 		const css_selector *selector)
+ {
+@@ -254,6 +266,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 
+ 		error = _insert_into_chain(hash, &hash->ids.slots[index],
+ 				selector);
++		css_hash_in_id++;
+ 	} else if ((name = _class_name(selector)) != NULL) {
+ 		/* Named class */
+ 		mask = hash->classes.n_slots - 1;
+@@ -261,6 +274,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 
+ 		error = _insert_into_chain(hash, &hash->classes.slots[index],
+ 				selector);
++		css_hash_in_class++;
+ 	} else if (lwc_string_length(selector->data.qname.name) != 1 ||
+ 			lwc_string_data(selector->data.qname.name)[0] != '*') {
+ 		/* Named element */
+@@ -269,9 +283,11 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 
+ 		error = _insert_into_chain(hash, &hash->elements.slots[index],
+ 				selector);
++		css_hash_in_element++;
+ 	} else {
+ 		/* Universal chain */
+ 		error = _insert_into_chain(hash, &hash->universal, selector);
++		css_hash_in_universal++;
+ 	}
+ 
+ 	return error;
 diff --git a/src/select/select.c b/src/select/select.c
 index 458adda..f4194df 100644
 --- a/src/select/select.c
