@@ -1,0 +1,104 @@
+diff --git a/frontends/framebuffer/schedule.c b/frontends/framebuffer/schedule.c
+index 0df64606c..f0a994e95 100644
+--- a/frontends/framebuffer/schedule.c
++++ b/frontends/framebuffer/schedule.c
+@@ -19,8 +19,12 @@
+ #include <time.h>
+ #include <stdlib.h>
+ 
++#include <stdint.h>
++
+ #include "utils/sys_time.h"
+ #include "utils/log.h"
++#include "utils/nsurl.h"
++#include "utils/utils.h"
+ 
+ #include "framebuffer/schedule.h"
+ 
+@@ -181,7 +185,40 @@ int schedule_run(void)
+                                 prev_nscb->next = unlnk_nscb->next;
+                         }
+ 
+-                        unlnk_nscb->callback(unlnk_nscb->p);
++                        /*
++                         * Time it (VitaSurf). A GitHub load reports one
++                         * round of this loop taking 23438 ms with 23405
++                         * of it in here, so a single callback ran for
++                         * twenty-three seconds with the browser stopped
++                         * behind it and nothing said which callback. The
++                         * address is enough: the Vita build keeps line
++                         * tables, so it resolves the same way a crash
++                         * offset does.
++                         */
++                        {
++                                struct timeval c0, c1;
++                                unsigned int took;
++
++                                gettimeofday(&c0, NULL);
++                                unlnk_nscb->callback(unlnk_nscb->p);
++                                gettimeofday(&c1, NULL);
++
++                                took = (unsigned int)
++                                        ((c1.tv_sec - c0.tv_sec) * 1000 +
++                                         (c1.tv_usec - c0.tv_usec) / 1000);
++                                vitasurf_sched_calls++;
++                                vitasurf_ms_sched += took;
++                                if (took > vitasurf_ms_sched_max) {
++                                        vitasurf_ms_sched_max = took;
++                                }
++                                if (took >= 200) {
++                                        NSLOG(netsurf, INFO,
++                                              "slow scheduled callback "
++                                              "%08x took %u ms",
++                                              (unsigned int)(uintptr_t)
++                                              unlnk_nscb->callback, took);
++                                }
++                        }
+ 
+                         free(unlnk_nscb);
+ 
+diff --git a/utils/utils.c b/utils/utils.c
+index 0e24c0ddf..ed7e4ecfd 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -611,6 +611,9 @@ unsigned int vitasurf_js_jobs_slow;
+ unsigned int vitasurf_ms_js_jobs_slow;
+ unsigned int vitasurf_js_finds;
+ unsigned int vitasurf_ms_js_finds;
++unsigned int vitasurf_sched_calls;
++unsigned int vitasurf_ms_sched;
++unsigned int vitasurf_ms_sched_max;
+ 
+ /* exported interface documented in utils/utils.h */
+ void vitasurf_profile_reset(void)
+@@ -651,6 +654,9 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_jobs_slow = 0;
+ 	vitasurf_js_finds = 0;
+ 	vitasurf_ms_js_finds = 0;
++	vitasurf_sched_calls = 0;
++	vitasurf_ms_sched = 0;
++	vitasurf_ms_sched_max = 0;
+ 	vitasurf_ms_nested = 0;
+ }
+ 
+diff --git a/utils/utils.h b/utils/utils.h
+index 317bf33be..bdd434dd3 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -264,6 +264,16 @@ extern unsigned int vitasurf_ms_js_jobs_slow;
+ /** Calls into the DOM query binding, which walks the tree. */
+ extern unsigned int vitasurf_js_finds;
+ extern unsigned int vitasurf_ms_js_finds;
++
++/*
++ * The scheduler's callbacks (VitaSurf). A GitHub page load reports
++ * "1 rounds in 23438 ms; scheduler 23405 ms": one scheduled callback
++ * ran for twenty-three seconds with the whole browser stopped behind
++ * it, and the scheduler does not record which callback it was.
++ */
++extern unsigned int vitasurf_sched_calls;
++extern unsigned int vitasurf_ms_sched;
++extern unsigned int vitasurf_ms_sched_max;
+ /**
+  * Milliseconds the conversion now returning spent, handed up so the
+  * conversion that contains it can subtract its own nested work.

@@ -1116,6 +1116,10 @@ void vita_input_load_finished(struct gui_window *gw)
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
+			vita_log("page: the scheduler ran %u callbacks for "
+				 "%u ms, the longest %u ms",
+				 vitasurf_sched_calls, vitasurf_ms_sched,
+				 vitasurf_ms_sched_max);
 			vita_log("page: laid out %u times, measuring text "
 				 "%u times over %u characters, %u ms of it "
 				 "inside the font engine",
