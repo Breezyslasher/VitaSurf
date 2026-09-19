@@ -250,6 +250,24 @@ static int next_timer_handle = 1;
  */
 #define RELAYOUT_MAX_ELEMENTS 6000
 
+/*
+ * And what it is expected to cost (VitaSurf).
+ *
+ * The element count is a proxy for the work, and it does not hold. A
+ * GitHub profile came in at 6270 elements -- under the limit above --
+ * and rebuilt in 55621 ms, because the cost of an element is not the
+ * element, it is the element against every rule that might style it.
+ * That page loads 398 stylesheets whose universal chain alone offers
+ * 2738 candidates to each element, and one element costs 11.7 ms
+ * against a Wikipedia element's 1.1 ms.
+ *
+ * So estimate instead. Laying the page out the first time measured
+ * exactly this, per element, on this page with this CSS; multiply it
+ * by what the document now holds. Over this budget the page keeps the
+ * layout it was parsed with, as it does over the element limit.
+ */
+#define RELAYOUT_MAX_MS 8000
+
 /* ------------------------------------------------------------------------ */
 /* Small helpers                                                            */
 
@@ -3638,6 +3656,28 @@ static void relayout_callback(void *p)
 		thread->relayout_off = true;
 		thread->dom_dirty = false;
 		return;
+	}
+	/*
+	 * What this page's own elements cost, measured while it was first
+	 * laid out (VitaSurf). No measurement yet means no reason to
+	 * refuse.
+	 */
+	if (vitasurf_box_elements > 0) {
+		unsigned per_element_us = (vitasurf_ms_boxes * 1000u) /
+					  vitasurf_box_elements;
+		unsigned estimate = (per_element_us *
+				     thread->dom_elements) / 1000u;
+
+		if (estimate > RELAYOUT_MAX_MS) {
+			vita_log("qjs: not rebuilding the layout, %u "
+				 "elements at %u us each is about %u ms "
+				 "and the browser is stopped for all of it",
+				 thread->dom_elements, per_element_us,
+				 estimate);
+			thread->relayout_off = true;
+			thread->dom_dirty = false;
+			return;
+		}
 	}
 
 	t0 = now_ms();
