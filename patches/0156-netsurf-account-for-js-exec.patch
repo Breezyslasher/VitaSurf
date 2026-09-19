@@ -1,0 +1,49 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 54e61fa87..f0e2a4104 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -602,6 +602,9 @@ unsigned int vitasurf_js_events;
+ unsigned int vitasurf_js_xhrs;
+ unsigned int vitasurf_ms_js_jobs;
+ unsigned int vitasurf_js_jobs;
++unsigned int vitasurf_ms_js_job_max;
++unsigned int vitasurf_ms_js_compile;
++unsigned int vitasurf_ms_js_run;
+ 
+ /* exported interface documented in utils/utils.h */
+ void vitasurf_profile_reset(void)
+@@ -633,6 +636,9 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_js_xhrs = 0;
+ 	vitasurf_ms_js_jobs = 0;
+ 	vitasurf_js_jobs = 0;
++	vitasurf_ms_js_job_max = 0;
++	vitasurf_ms_js_compile = 0;
++	vitasurf_ms_js_run = 0;
+ 	vitasurf_ms_nested = 0;
+ }
+ 
+diff --git a/utils/utils.h b/utils/utils.h
+index 5051ada5f..e2d7a6ad0 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -227,6 +227,20 @@ extern unsigned int vitasurf_js_xhrs;
+  */
+ extern unsigned int vitasurf_ms_js_jobs;
+ extern unsigned int vitasurf_js_jobs;
++/* the longest single job, to say whether 1.5 ms each is the average of
++ * many cheap ones or a handful of expensive ones */
++extern unsigned int vitasurf_ms_js_job_max;
++
++/*
++ * Compiling and running, per page rather than per thread (VitaSurf).
++ * The load event reports the same two numbers, but it fires before the
++ * page has finished and its thread's counters go with the thread, so
++ * they cannot be subtracted from the script bucket to see what else
++ * js_exec does. A build 371 log reads 3849 ms in script elements where
++ * the per script log lines come to about two thirds of that.
++ */
++extern unsigned int vitasurf_ms_js_compile;
++extern unsigned int vitasurf_ms_js_run;
+ /**
+  * Milliseconds the conversion now returning spent, handed up so the
+  * conversion that contains it can subtract its own nested work.

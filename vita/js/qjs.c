@@ -3452,7 +3452,7 @@ static void end_script(jsthread *thread)
 		 * await and every .then() continuation on the page
 		 * actually run.
 		 */
-		uint64_t j0 = now_ms();
+		uint64_t j0 = now_ms(), jlast = j0;
 
 		for (;;) {
 			JSContext *c = NULL;
@@ -3462,6 +3462,16 @@ static void end_script(jsthread *thread)
 					qjs_report_exception(c);
 				}
 				break;
+			}
+			{
+				uint64_t j1 = now_ms();
+
+				if ((unsigned)(j1 - jlast) >
+						vitasurf_ms_js_job_max) {
+					vitasurf_ms_js_job_max =
+						(unsigned)(j1 - jlast);
+				}
+				jlast = j1;
 			}
 			vitasurf_js_jobs++;
 		}
@@ -8193,6 +8203,10 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		thread->js_bytes += (unsigned)txtlen;
 		thread->js_compile_ms += (unsigned)(t_compiled - t_start);
 		thread->js_run_ms += (unsigned)(t_done - t_compiled);
+		/* the same two, per page, so the script bucket can be
+		 * told apart from what else js_exec does (VitaSurf) */
+		vitasurf_ms_js_compile += (unsigned)(t_compiled - t_start);
+		vitasurf_ms_js_run += (unsigned)(t_done - t_compiled);
 
 		if (txtlen > SCRIPT_LOG_BYTES || vita_verbose_requested()) {
 			vita_log("qjs: script %u KB %s in %u ms, "
