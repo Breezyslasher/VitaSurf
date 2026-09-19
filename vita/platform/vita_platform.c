@@ -258,6 +258,42 @@ int vita_verbose_requested(void)
 }
 
 
+/*
+ * The caches, and the switch that turns them off.
+ *
+ * Read once at startup and kept here, because llcache asks for every
+ * single retrieval and a stat per fetch is a waste. The flag file is
+ * what makes the choice survive a restart, so a raw load and a cached
+ * one can be timed against each other without reinstalling.
+ */
+static int cache_off = -1;
+
+bool vitasurf_cache_disabled(void)
+{
+	if (cache_off < 0) {
+		cache_off = vita_flag_present(VITASURF_NOCACHE_FLAG) ? 1 : 0;
+	}
+	return cache_off != 0;
+}
+
+void vitasurf_set_cache_disabled(bool off)
+{
+	cache_off = off ? 1 : 0;
+	if (off) {
+		FILE *f = fopen(VITASURF_NOCACHE_FLAG, "wb");
+
+		if (f != NULL) {
+			fclose(f);
+		}
+	} else {
+		sceIoRemove(VITASURF_NOCACHE_FLAG);
+		sceIoRemove(VITASURF_NOCACHE_FLAG ".txt");
+	}
+	vita_log("cache: %s", off ? "off, every fetch goes to the network"
+				  : "on");
+}
+
+
 int vita_layout_dump_requested(void)
 {
 	return vita_flag_present(VITASURF_LAYOUT_FLAG);
@@ -458,6 +494,7 @@ int vita_platform_init(void)
 	 */
 	sceIoMkdir(VITASURF_JSCACHE_DIR, 0777);
 	sceIoMkdir(VITASURF_STORAGE_DIR, 0777);
+	sceIoMkdir(VITASURF_DISCCACHE_DIR, 0777);
 
 	/*
 	 * Open the log with a plain fopen first so vita_log() works even if

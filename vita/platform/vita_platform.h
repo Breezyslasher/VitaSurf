@@ -61,6 +61,13 @@ void vita_options_floor(void);
 #define VITASURF_JSCACHE_DIR    VITASURF_DATA_DIR "/jscache"
 /* What sites store: localStorage and IndexedDB, one file per origin. */
 #define VITASURF_STORAGE_DIR    VITASURF_DATA_DIR "/storage"
+/* NetSurf's disc cache: fetched pages, scripts and images, kept across
+ * runs. It costs memory card space rather than heap, which is the one
+ * thing this machine has plenty of. */
+#define VITASURF_DISCCACHE_DIR  VITASURF_DATA_DIR "/cache"
+/* Turned off from the menu, and remembered here, so a raw load can be
+ * timed against a cached one without reinstalling anything. */
+#define VITASURF_NOCACHE_FLAG   VITASURF_DATA_DIR "/nocache"
 #define VITASURF_DOWNLOADS_DIR  VITASURF_DATA_DIR "/downloads"
 #define VITASURF_DOWNLOADS_PAGE VITASURF_DATA_DIR "/downloads.html"
 /* The Log screen: the last page load's waterfall, and the log's tail. */
@@ -136,6 +143,17 @@ int vita_verbose_requested(void);
  * \return non-zero if the flag file is there
  */
 int vita_layout_dump_requested(void);
+
+/**
+ * Whether every fetch should ignore the caches.
+ *
+ * NetSurf reads this for each retrieval, so it takes effect on the next
+ * page rather than the next run.
+ */
+bool vitasurf_cache_disabled(void);
+
+/** Turn the caches off or on, and remember which across runs. */
+void vitasurf_set_cache_disabled(bool off);
 
 /**
  * The main thread's stack size in bytes, as the kernel reports it, or 0

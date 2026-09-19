@@ -37,6 +37,13 @@ suppress_curl_debug:0
 send_referer:1
 do_not_track:0
 
+# The disc cache, on the memory card rather than in memory. NetSurf's
+# default limit is a gigabyte, which is not a sensible thing to leave on
+# someone's card; 128 MB holds a lot of pages. disc_cache_age is in days.
+disc_cache_path:ux0:data/VitaSurf/cache
+disc_cache_size:134217728
+disc_cache_age:28
+
 # Persistence (phase 5) writes here.
 cookie_file:ux0:data/VitaSurf/Cookies
 cookie_jar:ux0:data/VitaSurf/Cookies
