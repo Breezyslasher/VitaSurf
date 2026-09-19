@@ -1,0 +1,99 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index e1033a248..a04528b06 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -777,12 +777,35 @@ html_process_data(struct content *c, const char *data, unsigned int size)
+ 	nserror err = NSERROR_OK; /* assume its all going to be ok */
+ 	uint64_t t0 = 0, t1 = 0;
+ 
++	/*
++	 * Parsing runs the scripts it meets (VitaSurf).
++	 *
++	 * dom_hubbub_parser_parse_chunk executes a <script> element
++	 * synchronously as it reaches it, and the first one builds the
++	 * JavaScript thread and runs our prelude. So this bucket used to
++	 * hold every script on the page as well as the parse: a build
++	 * 369 log reads 482 ms to parse a four kilobyte local file whose
++	 * prelude took 463 ms of it, and 1058 ms for a YouTube page
++	 * whose scripts are counted again under script. Take off
++	 * whatever the script and prelude buckets gained while we were
++	 * inside, and what is left is the parser's own time.
++	 */
++	unsigned int s0 = vitasurf_ms_script + vitasurf_ms_prelude;
++	unsigned int spent;
++
+ 	nsu_getmonotonic_ms(&t0);
+ 	dom_ret = dom_hubbub_parser_parse_chunk(html->parser,
+ 					      (const uint8_t *) data,
+ 					      size);
+ 	nsu_getmonotonic_ms(&t1);
+-	vitasurf_ms_html_parse += (unsigned int)(t1 - t0);
++	spent = (unsigned int)(t1 - t0);
++	{
++		unsigned int in_script =
++			vitasurf_ms_script + vitasurf_ms_prelude - s0;
++
++		vitasurf_ms_html_parse += spent > in_script ?
++				spent - in_script : 0;
++	}
+ 
+ 	html->bytes_parsed += size;
+ 
+diff --git a/utils/utils.c b/utils/utils.c
+index 016cb0092..0c89376d1 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -593,6 +593,13 @@ unsigned int vitasurf_ms_script;
+ unsigned int vitasurf_ms_draw;
+ unsigned int vitasurf_ms_teardown;
+ unsigned int vitasurf_ms_prelude;
++unsigned int vitasurf_ms_js_page;
++unsigned int vitasurf_ms_js_timer;
++unsigned int vitasurf_ms_js_event;
++unsigned int vitasurf_ms_js_xhr;
++unsigned int vitasurf_js_timers;
++unsigned int vitasurf_js_events;
++unsigned int vitasurf_js_xhrs;
+ 
+ /* exported interface documented in utils/utils.h */
+ void vitasurf_profile_reset(void)
+@@ -615,6 +622,13 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_draw = 0;
+ 	vitasurf_ms_teardown = 0;
+ 	vitasurf_ms_prelude = 0;
++	vitasurf_ms_js_page = 0;
++	vitasurf_ms_js_timer = 0;
++	vitasurf_ms_js_event = 0;
++	vitasurf_ms_js_xhr = 0;
++	vitasurf_js_timers = 0;
++	vitasurf_js_events = 0;
++	vitasurf_js_xhrs = 0;
+ 	vitasurf_ms_nested = 0;
+ }
+ 
+diff --git a/utils/utils.h b/utils/utils.h
+index 57de52a5b..667ed7ac6 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -201,6 +201,21 @@ extern unsigned int vitasurf_ms_teardown;
+  * happens once per page before any of the page's own script.
+  */
+ extern unsigned int vitasurf_ms_prelude;
++
++/*
++ * Where the script time goes (VitaSurf). A build 369 log puts 4618 ms
++ * of a 7878 ms page in the script bucket, and the load event accounts
++ * for 1906 ms of that in twenty-four script elements. The rest is
++ * JavaScript entered some other way, and until it is split by the way
++ * it was entered there is nothing to aim at.
++ */
++extern unsigned int vitasurf_ms_js_page;	/**< a <script> element */
++extern unsigned int vitasurf_ms_js_timer;
++extern unsigned int vitasurf_ms_js_event;
++extern unsigned int vitasurf_ms_js_xhr;		/**< a fetch or XHR settling */
++extern unsigned int vitasurf_js_timers;
++extern unsigned int vitasurf_js_events;
++extern unsigned int vitasurf_js_xhrs;
+ /**
+  * Milliseconds the conversion now returning spent, handed up so the
+  * conversion that contains it can subtract its own nested work.

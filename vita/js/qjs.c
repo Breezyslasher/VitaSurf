@@ -3352,11 +3352,27 @@ static void rearm_deadline(jsthread *thread)
  */
 static uint64_t script_entered_ms;
 
-static void begin_script(jsthread *thread)
+/*
+ * Why we are in JavaScript (VitaSurf), so that the script bucket can be
+ * split by it. A build 369 log puts 4618 ms of a 7878 ms YouTube load
+ * in that bucket while the load event accounts for 1906 ms of it in
+ * script elements; the remaining 2.7 s is entered some other way and
+ * there is no way to aim at it without knowing which.
+ */
+enum script_why {
+	SCRIPT_PAGE,		/**< a <script> element */
+	SCRIPT_TIMER,
+	SCRIPT_EVENT,
+	SCRIPT_XHR		/**< a fetch or XHR settling */
+};
+static enum script_why script_why;
+
+static void begin_script(jsthread *thread, enum script_why why)
 {
 	if (thread->script_depth++ > 0) {
 		return;
 	}
+	script_why = why;
 	vita_dom_gen++;	/* the parser may have added nodes since */
 	script_entered_ms = now_ms();
 	rearm_deadline(thread);
@@ -3371,7 +3387,27 @@ static void end_script(jsthread *thread)
 	}
 	thread->script_depth = 0;
 	if (script_entered_ms != 0) {
-		vitasurf_ms_script += (unsigned)(now_ms() - script_entered_ms);
+		unsigned took = (unsigned)(now_ms() - script_entered_ms);
+
+		vitasurf_ms_script += took;
+		switch (script_why) {
+		case SCRIPT_TIMER:
+			vitasurf_ms_js_timer += took;
+			vitasurf_js_timers++;
+			break;
+		case SCRIPT_EVENT:
+			vitasurf_ms_js_event += took;
+			vitasurf_js_events++;
+			break;
+		case SCRIPT_XHR:
+			vitasurf_ms_js_xhr += took;
+			vitasurf_js_xhrs++;
+			break;
+		case SCRIPT_PAGE:
+		default:
+			vitasurf_ms_js_page += took;
+			break;
+		}
 		script_entered_ms = 0;
 	}
 	if (thread->overrun_count > 0) {
@@ -3664,7 +3700,7 @@ static void timer_callback(void *p)
 		return;
 	}
 	ctx = thread->ctx;
-	begin_script(thread);
+	begin_script(thread, SCRIPT_TIMER);
 	global = JS_GetGlobalObject(ctx);
 	ret = JS_Call(ctx, t->func, global, 0, NULL);
 	if (JS_IsException(ret)) {
@@ -3811,7 +3847,7 @@ static void xhr_complete(struct js_xhr *x, const char *err)
 		if (err != NULL) {
 			vita_log("xhr: %s: %s", nsurl_access(x->url), err);
 		}
-		begin_script(thread);
+		begin_script(thread, SCRIPT_XHR);
 		args[0] = JS_NewInt32(ctx, x->status);
 		args[1] = JS_NewStringLen(ctx, x->rheaders != NULL ? x->rheaders : "",
 					  x->rheaders_len);
@@ -4307,7 +4343,7 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	}
 	ctx = thread->ctx;
 	thread->event_depth++;
-	begin_script(thread);
+	begin_script(thread, SCRIPT_EVENT);
 	/* this is the element the listener was added to */
 	global = wrap_node(ctx, l->node);
 	/* an event dispatchEvent created keeps its JS object (detail etc) */
@@ -7817,7 +7853,7 @@ static void module_retry_callback(void *p)
 		unsigned missed = thread->js_imports_missed;
 		JSValue fn;
 
-		begin_script(thread);
+		begin_script(thread, SCRIPT_TIMER);
 		thread->current_script = d->name;
 		fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
 			     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -7992,7 +8028,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			txtlen = rwlen;
 		}
 	}
-	begin_script(thread);
+	begin_script(thread, SCRIPT_PAGE);
 	thread->current_script = name;
 	{
 		/*
