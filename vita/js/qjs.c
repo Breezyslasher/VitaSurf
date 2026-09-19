@@ -6422,6 +6422,19 @@ void js_destroythread(jsthread *thread)
  * saving, so modules are left alone.
  */
 
+/*
+ * How much of an entry to move at a time (VitaSurf).
+ *
+ * newlib's fread refills through the FILE's own buffer and never asks
+ * the system for more than that buffer holds, and a stream nobody has
+ * given a buffer to gets BUFSIZ, which is a kilobyte. Reading a 6063 KB
+ * entry that way is six thousand reads, and a build 368 log puts 1601
+ * ms of a 1991 ms read on the card at 3878 KB/s while JS_ReadObject
+ * needs only 288 ms of it. glibc would have bypassed the buffer for a
+ * request this size; newlib does not.
+ */
+#define BC_IO_BUF     (256 * 1024)
+
 #define BC_MAGIC      0x43425356u        /* 'VSBC' */
 #define BC_FORMAT     1u
 /* Below this, compiling is quicker than finding the file on the card. */
@@ -6611,6 +6624,8 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	if (f == NULL) {
 		return JS_UNDEFINED;
 	}
+	/* before the first read, or it has no effect */
+	setvbuf(f, NULL, _IOFBF, BC_IO_BUF);
 	if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
 	    h.magic != BC_MAGIC || h.format != BC_FORMAT ||
 	    h.src_len != (uint32_t)srclen ||
@@ -6736,6 +6751,7 @@ static void bc_store(JSContext *ctx, const char *url,
 		js_free(ctx, out);
 		return;
 	}
+	setvbuf(f, NULL, _IOFBF, BC_IO_BUF);
 	if (fwrite(&h, 1, sizeof(h), f) != sizeof(h) ||
 	    fwrite(out, 1, out_len, f) != out_len) {
 		fclose(f);

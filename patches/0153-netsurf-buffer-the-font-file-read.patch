@@ -1,0 +1,59 @@
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index 39fac6f38..c8fd10fad 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -168,6 +168,9 @@ enum fb_face_e {
+ 
+ static fb_faceid_t *fb_faces[FB_FACE_COUNT];
+ 
++/** How much of a font file to ask the system for at a time (VitaSurf). */
++#define FB_FILE_BUF (256 * 1024)
++
+ /**
+  * Read a face's file into memory (VitaSurf), so that FreeType has no
+  * reason to go back to app0: for every glyph. A file we cannot read
+@@ -178,17 +181,30 @@ static void fb_face_read_file(fb_faceid_t *fb_face)
+ 	FILE *fp;
+ 	long len;
+ 	uint8_t *buf;
++	struct timespec t0, t1;
++	unsigned int ms;
+ 
+ 	fp = fopen(fb_face->fontfile, "rb");
+ 	if (fp == NULL) {
+ 		return;
+ 	}
++	/*
++	 * A buffer worth having (VitaSurf). newlib's fread refills
++	 * through the FILE's own buffer and never asks the system for
++	 * more than that buffer holds, and a stream nobody has given one
++	 * to gets BUFSIZ, a kilobyte: reading DejaVuSans.ttf whole is
++	 * seven hundred and forty reads, not one. glibc bypasses its
++	 * buffer for a request this size, so this costs nothing on a
++	 * host build and is the whole of the cost here.
++	 */
++	setvbuf(fp, NULL, _IOFBF, FB_FILE_BUF);
+ 	if (fseek(fp, 0, SEEK_END) != 0 || (len = ftell(fp)) <= 0) {
+ 		fclose(fp);
+ 		return;
+ 	}
+ 	rewind(fp);
+ 
++	clock_gettime(CLOCK_MONOTONIC, &t0);
+ 	buf = malloc((size_t) len);
+ 	if (buf == NULL) {
+ 		fclose(fp);
+@@ -200,6 +216,13 @@ static void fb_face_read_file(fb_faceid_t *fb_face)
+ 		return;
+ 	}
+ 	fclose(fp);
++	clock_gettime(CLOCK_MONOTONIC, &t1);
++
++	ms = (unsigned int)((t1.tv_sec - t0.tv_sec) * 1000 +
++			    (t1.tv_nsec - t0.tv_nsec) / 1000000);
++	NSLOG(netsurf, INFO, "Read %u KB of %s in %u ms (%u KB/s)",
++	      (unsigned int)(len / 1024), fb_face->fontfile, ms,
++	      ms > 0 ? (unsigned int)((len / 1024) * 1000 / ms) : 0u);
+ 
+ 	fb_face->filedata = buf;
+ 	fb_face->filelen = (size_t) len;
