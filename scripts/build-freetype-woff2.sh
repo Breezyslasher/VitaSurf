@@ -46,10 +46,23 @@ cmake -S "$work/brotli" -B "$work/brotli/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
     -DBUILD_SHARED_LIBS=OFF \
-    -DBROTLI_DISABLE_TESTS=ON \
-    -DBROTLI_BUILD_TOOLS=OFF
-cmake --build "$work/brotli/build" -j"$JOBS"
-cmake --install "$work/brotli/build"
+    -DBROTLI_DISABLE_TESTS=ON
+# Only the decoder, by target name. brotli 1.1.0 has no switch for it:
+# "cmake --build" would also build the brotli command line tool, which
+# reads st_atim and st_mtim out of struct stat, and newlib has neither,
+# so the whole build fails on a member name. FreeType wants the decoder
+# and nothing else, and skipping the encoder and the tool takes about
+# two minutes off this.
+cmake --build "$work/brotli/build" --target brotlidec brotlicommon -j"$JOBS"
+# By hand as well, because brotli's install rules are all or nothing and
+# would ask for that same tool. This is a static library, five headers
+# and the two pkg-config files FreeType looks it up through.
+install -d "$PREFIX/lib/pkgconfig" "$PREFIX/include/brotli"
+install -m 644 "$work/brotli/build/libbrotlicommon.a" \
+               "$work/brotli/build/libbrotlidec.a" "$PREFIX/lib"
+install -m 644 "$work/brotli/build/libbrotlicommon.pc" \
+               "$work/brotli/build/libbrotlidec.pc" "$PREFIX/lib/pkgconfig"
+install -m 644 "$work/brotli"/c/include/brotli/*.h "$PREFIX/include/brotli"
 
 echo "==== freetype $FREETYPE_TAG (with brotli)"
 git clone --depth 1 --branch "$FREETYPE_TAG" \
