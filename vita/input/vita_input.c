@@ -1138,7 +1138,25 @@ void vita_input_load_finished(struct gui_window *gw)
 				extern unsigned int css_hash_in_id;
 				extern unsigned int css_hash_in_universal;
 
-				vita_log("page: selection ran %u times, "
+				vita_log("page: building those boxes was %u ms in "
+				 "the elements and %u ms in %u text nodes, "
+				 "with %u ms of the elements in %u special "
+				 "ones",
+				 vitasurf_ms_box_element, vitasurf_ms_box_text,
+				 vitasurf_box_texts, vitasurf_ms_box_special,
+				 vitasurf_box_specials);
+			vita_log("page: the %u layout passes took %u ms, the "
+				 "longest %u ms; %u of them ran 100 ms or "
+				 "more and account for %u ms",
+				 vitasurf_layout_runs, vitasurf_ms_layout,
+				 vitasurf_ms_layout_max, vitasurf_layout_slow,
+				 vitasurf_ms_layout_slow);
+			vita_log("page: %u images converted for %u ms, the "
+				 "dearest %u ms, %u kpixels decoded in all",
+				 vitasurf_images_converted, vitasurf_ms_image,
+				 vitasurf_ms_image_max,
+				 vitasurf_image_kpixels);
+			vita_log("page: selection ran %u times, "
 					 "looked in %u sheets and considered "
 					 "%u selectors",
 					 css_select_calls,

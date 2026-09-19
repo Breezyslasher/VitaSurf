@@ -1,0 +1,198 @@
+diff --git a/content/content.c b/content/content.c
+index e9bd6ff04..b9caf70ea 100644
+--- a/content/content.c
++++ b/content/content.c
+@@ -113,7 +113,18 @@ static void content_convert(struct content *c)
+ 		if (type == CONTENT_CSS) {
+ 			vitasurf_ms_css += (unsigned int)self;
+ 		} else if (type & CONTENT_IMAGE) {
++			/*
++			 * And per image (VitaSurf), because 22513 ms over
++			 * 313 of them says nothing about whether they are
++			 * all middling or a few are enormous.
++			 */
+ 			vitasurf_ms_image += (unsigned int)self;
++			vitasurf_images_converted++;
++			if ((unsigned int)self > vitasurf_ms_image_max) {
++				vitasurf_ms_image_max = (unsigned int)self;
++			}
++			vitasurf_image_kpixels += (unsigned int)
++				((c->width * c->height) / 1000);
+ 		}
+ 		/*
+ 		 * Name anything that took a noticeable slice of a load.
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 296969773..fd63fd4ad 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -726,6 +726,7 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 	dom_exception err;
+ 	struct box_construct_props props;
+ 	const css_computed_style *root_style = NULL;
++	uint64_t vs_sp0 = 0, vs_sp1 = 0;	/* the special path (VitaSurf) */
+ 
+ 	assert(ctx->n != NULL);
+ 
+@@ -981,12 +982,16 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		}
+ 	}
+ 
++	nsu_getmonotonic_ms(&vs_sp0);
+ 	if (convert_special_elements(ctx->n,
+ 				     ctx->content,
+ 				     box,
+ 				     convert_children) == false) {
+ 		return false;
+ 	}
++	nsu_getmonotonic_ms(&vs_sp1);
++	vitasurf_ms_box_special += (unsigned int)(vs_sp1 - vs_sp0);
++	vitasurf_box_specials++;
+ 
+ 	/* Handle the :before pseudo element */
+ 	if (!(box->flags & IS_REPLACED)) {
+@@ -1788,7 +1793,7 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 	bool convert_children;
+ 	uint32_t num_processed = 0;
+ 	const uint32_t max_processed_before_yield = 10;
+-	uint64_t vs_t0 = 0, vs_t1 = 0;
++	uint64_t vs_t0 = 0, vs_t1 = 0, vs_e0 = 0, vs_e1 = 0;
+ 
+ 	nsu_getmonotonic_ms(&vs_t0);
+ 
+@@ -1797,6 +1802,7 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 
+ 		assert(ctx->n != NULL);
+ 
++		nsu_getmonotonic_ms(&vs_e0);
+ 		if (box_construct_element(ctx, &convert_children) == false) {
+ 			ctx->cb(ctx->content, false);
+ 			dom_node_unref(ctx->n);
+@@ -1806,6 +1812,9 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 			return;
+ 		}
+ 
++		nsu_getmonotonic_ms(&vs_e1);
++		vitasurf_ms_box_element += (unsigned int)(vs_e1 - vs_e0);
++
+ 		/* Find next element to process, converting text nodes as we go */
+ 		next = next_node(ctx->n, ctx->content, convert_children);
+ 		while (next != NULL) {
+@@ -1827,12 +1836,17 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 
+ 			if (type == DOM_TEXT_NODE) {
+ 				ctx->n = next;
++				nsu_getmonotonic_ms(&vs_e0);
+ 				if (box_construct_text(ctx) == false) {
+ 					ctx->cb(ctx->content, false);
+ 					dom_node_unref(ctx->n);
+ 					free(ctx);
+ 					return;
+ 				}
++				nsu_getmonotonic_ms(&vs_e1);
++				vitasurf_ms_box_text +=
++					(unsigned int)(vs_e1 - vs_e0);
++				vitasurf_box_texts++;
+ 			}
+ 
+ 			next = next_node(next, ctx->content, true);
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index a5f294c36..45c1ee24e 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5982,7 +5982,19 @@ bool layout_document(html_content *content, int width, int height)
+ 	layout_calculate_descendant_bboxes(&content->unit_len_ctx, doc);
+ 
+ 	nsu_getmonotonic_ms(&vs_t1);
+-	vitasurf_ms_layout += (unsigned int)(vs_t1 - vs_t0);
++	{
++		/* how the 143 passes of a GitHub load are spread (VitaSurf) */
++		unsigned int took = (unsigned int)(vs_t1 - vs_t0);
++
++		vitasurf_ms_layout += took;
++		if (took > vitasurf_ms_layout_max) {
++			vitasurf_ms_layout_max = took;
++		}
++		if (took >= 100) {
++			vitasurf_layout_slow++;
++			vitasurf_ms_layout_slow += took;
++		}
++	}
+ 	vitasurf_layout_runs++;
+ 	return ret;
+ }
+diff --git a/utils/utils.c b/utils/utils.c
+index 49df7c503..157b1d560 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -624,6 +624,17 @@ unsigned int vitasurf_ms_select;
+ unsigned int vitasurf_box_elements;
+ unsigned int vitasurf_attr_interned_hits;
+ unsigned int vitasurf_attr_interned_misses;
++unsigned int vitasurf_ms_box_element;
++unsigned int vitasurf_ms_box_text;
++unsigned int vitasurf_box_texts;
++unsigned int vitasurf_ms_box_special;
++unsigned int vitasurf_box_specials;
++unsigned int vitasurf_ms_layout_max;
++unsigned int vitasurf_layout_slow;
++unsigned int vitasurf_ms_layout_slow;
++unsigned int vitasurf_images_converted;
++unsigned int vitasurf_image_kpixels;
++unsigned int vitasurf_ms_image_max;
+ unsigned int vitasurf_inline_styles;
+ unsigned int vitasurf_ms_inline_style;
+ unsigned int vitasurf_sched_calls;
+@@ -680,6 +691,17 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_box_elements = 0;
+ 	vitasurf_attr_interned_hits = 0;
+ 	vitasurf_attr_interned_misses = 0;
++	vitasurf_ms_box_element = 0;
++	vitasurf_ms_box_text = 0;
++	vitasurf_box_texts = 0;
++	vitasurf_ms_box_special = 0;
++	vitasurf_box_specials = 0;
++	vitasurf_ms_layout_max = 0;
++	vitasurf_layout_slow = 0;
++	vitasurf_ms_layout_slow = 0;
++	vitasurf_images_converted = 0;
++	vitasurf_image_kpixels = 0;
++	vitasurf_ms_image_max = 0;
+ 	vitasurf_inline_styles = 0;
+ 	vitasurf_ms_inline_style = 0;
+ 	vitasurf_sched_calls = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index d738aa78c..b27ddedfa 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -295,6 +295,31 @@ extern unsigned int vitasurf_box_elements;
+ extern unsigned int vitasurf_attr_interned_hits;
+ extern unsigned int vitasurf_attr_interned_misses;
+ 
++/*
++ * Everything the page report still cannot name (VitaSurf).
++ *
++ * A GitHub load spends 69298 ms in boxes and styles, of which 34351 ms
++ * is selecting styles and 326 ms is the style attribute. The other
++ * 34.6 s has never been looked inside, and it is 5.5 ms an element
++ * against Wikipedia's 0.70 ms for the same code. Layout is 22853 ms
++ * over 143 passes and nothing says what asked for them or how they
++ * were spread. Images are 22513 ms over 313 of them with no split
++ * between decoding one and scaling it.
++ */
++extern unsigned int vitasurf_ms_box_element;	/**< building one box */
++extern unsigned int vitasurf_ms_box_text;	/**< a text node */
++extern unsigned int vitasurf_box_texts;
++extern unsigned int vitasurf_ms_box_special;	/**< form controls, images */
++extern unsigned int vitasurf_box_specials;
++
++extern unsigned int vitasurf_ms_layout_max;	/**< the longest one pass */
++extern unsigned int vitasurf_layout_slow;	/**< passes of 100 ms or more */
++extern unsigned int vitasurf_ms_layout_slow;
++
++extern unsigned int vitasurf_images_converted;
++extern unsigned int vitasurf_image_kpixels;	/**< what they decoded to */
++extern unsigned int vitasurf_ms_image_max;	/**< the dearest single one */
++
+ extern unsigned int vitasurf_inline_styles;
+ extern unsigned int vitasurf_ms_inline_style;
+ 
