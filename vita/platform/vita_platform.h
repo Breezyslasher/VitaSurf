@@ -102,6 +102,19 @@ void vita_platform_fini(void);
  */
 void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/**
+ * Push what has been logged out to the memory card.
+ *
+ * The log is buffered, because a write to the card costs about nine
+ * milliseconds and logging every line straight through left nothing
+ * for the frame. Anything that is about to stop the program calls
+ * this, so what it logged on the way down is on the card.
+ */
+void vita_log_flush(void);
+
+/** Microseconds since the process started, for measuring a frame. */
+unsigned long long vita_now_us(void);
+
 /** Log free user, CDRAM and physically contiguous memory. */
 void vita_log_memory(const char *what);
 

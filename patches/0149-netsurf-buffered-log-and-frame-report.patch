@@ -1,0 +1,108 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index b0536779d..47f86260f 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -638,8 +638,20 @@ static nserror set_defaults(struct nsoption_s *defaults)
+  */
+ static bool nslog_stream_configure(FILE *fptr)
+ {
++#ifdef __vita__
++	/*
++	 * Left as the platform set it up (VitaSurf). This is the same
++	 * stream vita_log() writes, and it is buffered on purpose: a
++	 * write to the memory card costs about nine milliseconds, so an
++	 * unbuffered log cannot coexist with a frame rate. The buffer is
++	 * pushed out on a timer and by vita_log_flush() on the way to a
++	 * crash, which is what the unbuffered stream was protecting.
++	 */
++	(void) fptr;
++#else
+         /* set log stream to be non-buffering */
+ 	setbuf(fptr, NULL);
++#endif
+ 
+ 	return true;
+ }
+@@ -648,8 +660,29 @@ static void framebuffer_run(void)
+ {
+ 	nsfb_event_t event;
+ 	int timeout; /* timeout in miliseconds */
++#ifdef __vita__
++	/*
++	 * Where a frame goes (VitaSurf). The loop runs the scheduler,
++	 * waits for input, and redraws. Sitting on a page doing nothing
++	 * all three should be close to nothing and the wait should be
++	 * the whole frame, so when it is not, this says which of them
++	 * is spending the time. Reported once a second, which is few
++	 * enough lines not to be what it is measuring.
++	 */
++	unsigned long long report_us = vita_now_us();
++	unsigned long long sched_us = 0;
++	unsigned long long wait_us = 0;
++	unsigned long long draw_us = 0;
++	unsigned int rounds = 0;
++	unsigned int redraws = 0;
++#endif
+ 
+ 	while (fb_complete != true) {
++#ifdef __vita__
++		unsigned long long a = vita_now_us();
++		unsigned long long b;
++		bool pending;
++#endif
+ 		/* run the scheduler and discover how long to wait for
+ 		 * the next event.
+ 		 */
+@@ -658,8 +691,19 @@ static void framebuffer_run(void)
+ 		/* if redraws are pending do not wait for event,
+ 		 * return immediately
+ 		 */
++#ifdef __vita__
++		b = vita_now_us();
++		sched_us += b - a;
++		pending = fbtk_get_redraw_pending(fbtk);
++		if (pending) {
++			timeout = 0;
++			redraws++;
++		}
++		a = b;
++#else
+ 		if (fbtk_get_redraw_pending(fbtk))
+ 			timeout = 0;
++#endif
+ 
+ 		if (fbtk_event(fbtk, &event, timeout)) {
+ 			if ((event.type == NSFB_EVENT_CONTROL) &&
+@@ -667,7 +711,32 @@ static void framebuffer_run(void)
+ 				fb_complete = true;
+ 		}
+ 
++#ifdef __vita__
++		b = vita_now_us();
++		wait_us += b - a;
++		a = b;
++#endif
++
+ 		fbtk_redraw(fbtk);
++
++#ifdef __vita__
++		draw_us += vita_now_us() - a;
++		rounds++;
++		if (vita_now_us() - report_us >= 1000000ull) {
++			unsigned long long span = vita_now_us() - report_us;
++
++			vita_log("frame: %u rounds in %u ms, %u wanted a "
++				 "redraw; scheduler %u ms, waiting %u ms, "
++				 "drawing %u ms",
++				 rounds, (unsigned) (span / 1000), redraws,
++				 (unsigned) (sched_us / 1000),
++				 (unsigned) (wait_us / 1000),
++				 (unsigned) (draw_us / 1000));
++			report_us = vita_now_us();
++			sched_us = wait_us = draw_us = 0;
++			rounds = redraws = 0;
++		}
++#endif
+ 	}
+ }
+ 

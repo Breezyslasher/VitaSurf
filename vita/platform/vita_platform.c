@@ -44,22 +44,75 @@
 static FILE *logf = NULL;
 static SceUInt64 start_time_us = 0;
 
+/*
+ * The log was unbuffered and flushed every line, and on this machine a
+ * write to the memory card costs about nine milliseconds. vita_log()
+ * made three stdio calls per line -- the timestamp, the body, the
+ * newline -- so a line cost three of those. Measured on the device:
+ * eight self tests that between them do microseconds of real work were
+ * 19 to 34 ms apart, a median of 26, essentially all of it writing.
+ * At that rate nothing can log and still hold a frame rate.
+ *
+ * So: one write per line into a real buffer, and out to the card a few
+ * times a second. What a crash would otherwise lose is covered by
+ * vita_log_flush(), which the fault handler and the exit path call.
+ */
+#define LOG_BUF_BYTES      (16 * 1024)
+#define LOG_FLUSH_EVERY_US 250000
+
+static char log_buf[LOG_BUF_BYTES];
+static SceUInt64 last_flush_us;
+
 void vita_log(const char *fmt, ...)
 {
+	char line[1024];
 	va_list ap;
 	SceUInt64 now = sceKernelGetProcessTimeWide();
 	unsigned int ms = (unsigned int)((now - start_time_us) / 1000);
+	int n;
 
 	if (logf == NULL) {
 		return;
 	}
 
-	fprintf(logf, "[%6u.%03u] ", ms / 1000, ms % 1000);
+	n = snprintf(line, sizeof(line), "[%6u.%03u] ", ms / 1000, ms % 1000);
+	if (n < 0 || n >= (int) sizeof(line)) {
+		return;
+	}
 	va_start(ap, fmt);
-	vfprintf(logf, fmt, ap);
+	{
+		int m = vsnprintf(line + n, sizeof(line) - (size_t) n, fmt, ap);
+
+		if (m > 0) {
+			n += m;
+		}
+	}
 	va_end(ap);
-	fputc('\n', logf);
-	fflush(logf);
+	if (n > (int) sizeof(line) - 2) {
+		n = (int) sizeof(line) - 2;	/* truncated; still a line */
+	}
+	line[n++] = '\n';
+	fwrite(line, 1, (size_t) n, logf);
+
+	if (now - last_flush_us >= LOG_FLUSH_EVERY_US) {
+		fflush(logf);
+		last_flush_us = now;
+	}
+}
+
+/* exported interface documented in vita_platform.h */
+unsigned long long vita_now_us(void)
+{
+	return (unsigned long long) sceKernelGetProcessTimeWide();
+}
+
+/* exported interface documented in vita_platform.h */
+void vita_log_flush(void)
+{
+	if (logf != NULL) {
+		fflush(logf);
+		last_flush_us = sceKernelGetProcessTimeWide();
+	}
 }
 
 /* exported interface documented in vita_platform.h */
@@ -506,7 +559,7 @@ int vita_platform_init(void)
 	if (logf == NULL) {
 		return -1;
 	}
-	setvbuf(logf, NULL, _IONBF, 0);
+	setvbuf(logf, log_buf, _IOFBF, sizeof(log_buf));
 	vita_log("VitaSurf starting, build %s (%s), JavaScript engine %s",
 		 VITASURF_BUILD_ID, VITASURF_BUILD_SHA, VITASURF_JS_ENGINE);
 	if (mkdir_ret < 0 && mkdir_ret != (int)0x80010011) {
@@ -517,13 +570,13 @@ int vita_platform_init(void)
 	fclose(logf);
 	logf = NULL;
 	if (freopen(VITASURF_LOG_PATH, "a", stderr) != NULL) {
-		setvbuf(stderr, NULL, _IONBF, 0);
+		setvbuf(stderr, log_buf, _IOFBF, sizeof(log_buf));
 		logf = stderr;
 		vita_log("stderr redirected to the log");
 	} else {
 		logf = fopen(VITASURF_LOG_PATH, "a");
 		if (logf != NULL) {
-			setvbuf(logf, NULL, _IONBF, 0);
+			setvbuf(logf, log_buf, _IOFBF, sizeof(log_buf));
 		}
 		vita_log("freopen(stderr) failed; NetSurf messages are lost");
 	}
@@ -584,6 +637,7 @@ void vita_platform_fini(void)
 	vita_log_memory("shutdown");
 	vita_net_fini();
 	vita_log("VitaSurf exiting");
+	vita_log_flush();
 	fflush(stderr);
 	fflush(stdout);
 	sceAppUtilShutdown();

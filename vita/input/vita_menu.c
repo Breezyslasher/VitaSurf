@@ -548,6 +548,9 @@ static void write_log_tail(FILE *f)
 	size_t got;
 
 	fputs("<h2>Log</h2>\n", f);
+	/* the log is buffered, so the last moment of it is not on the
+	 * card yet and the screen would end short of what just happened */
+	vita_log_flush();
 	in = fopen(VITASURF_LOG_PATH, "rb");
 	if (in == NULL) {
 		fputs("<p class=\"u\">The log could not be opened.</p>\n", f);
