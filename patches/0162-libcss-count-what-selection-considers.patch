@@ -1,8 +1,8 @@
 diff --git a/src/select/hash.c b/src/select/hash.c
-index f04434e..3db985a 100644
+index f04434e..0c345f0 100644
 --- a/src/select/hash.c
 +++ b/src/select/hash.c
-@@ -236,6 +236,18 @@ css_error css__selector_hash_destroy(css_selector_hash *hash)
+@@ -236,6 +236,22 @@ css_error css__selector_hash_destroy(css_selector_hash *hash)
   * \param selector  Pointer to selector
   * \return CSS_OK on success, appropriate error otherwise
   */
@@ -17,11 +17,15 @@ index f04434e..3db985a 100644
 +unsigned int css_hash_in_class;
 +unsigned int css_hash_in_element;
 +unsigned int css_hash_in_universal;
++unsigned int css_hash_uni_attribute;
++unsigned int css_hash_uni_pseudo_class;
++unsigned int css_hash_uni_pseudo_element;
++unsigned int css_hash_uni_plain;
 +
  css_error css__selector_hash_insert(css_selector_hash *hash,
  		const css_selector *selector)
  {
-@@ -254,6 +266,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+@@ -254,6 +270,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
  
  		error = _insert_into_chain(hash, &hash->ids.slots[index],
  				selector);
@@ -29,7 +33,7 @@ index f04434e..3db985a 100644
  	} else if ((name = _class_name(selector)) != NULL) {
  		/* Named class */
  		mask = hash->classes.n_slots - 1;
-@@ -261,6 +274,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+@@ -261,6 +278,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
  
  		error = _insert_into_chain(hash, &hash->classes.slots[index],
  				selector);
@@ -37,7 +41,7 @@ index f04434e..3db985a 100644
  	} else if (lwc_string_length(selector->data.qname.name) != 1 ||
  			lwc_string_data(selector->data.qname.name)[0] != '*') {
  		/* Named element */
-@@ -269,9 +283,11 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+@@ -269,9 +287,50 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
  
  		error = _insert_into_chain(hash, &hash->elements.slots[index],
  				selector);
@@ -46,6 +50,45 @@ index f04434e..3db985a 100644
  		/* Universal chain */
  		error = _insert_into_chain(hash, &hash->universal, selector);
 +		css_hash_in_universal++;
++		/*
++		 * And why it landed there (VitaSurf), since 6157 rules do
++		 * on a GitHub page and every one of them is then offered
++		 * to every element. The first detail on the key selector
++		 * is what is left once name, class and id are ruled out.
++		 */
++		{
++			const css_selector_detail *d = &selector->data;
++			bool any = false;
++
++			do {
++				switch (d->type) {
++				case CSS_SELECTOR_PSEUDO_CLASS:
++					css_hash_uni_pseudo_class++;
++					any = true;
++					break;
++				case CSS_SELECTOR_PSEUDO_ELEMENT:
++					css_hash_uni_pseudo_element++;
++					any = true;
++					break;
++				case CSS_SELECTOR_ATTRIBUTE:
++				case CSS_SELECTOR_ATTRIBUTE_EQUAL:
++				case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
++				case CSS_SELECTOR_ATTRIBUTE_INCLUDES:
++				case CSS_SELECTOR_ATTRIBUTE_PREFIX:
++				case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
++				case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
++					css_hash_uni_attribute++;
++					any = true;
++					break;
++				default:
++					break;
++				}
++				if (any)
++					break;
++			} while (d->next != 0 && (d = d + 1) != NULL);
++			if (!any)
++				css_hash_uni_plain++;
++		}
  	}
  
  	return error;
