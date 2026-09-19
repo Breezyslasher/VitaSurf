@@ -5808,6 +5808,20 @@ static JSValue node_ctor(JSContext *ctx, JSValueConst new_target,
 static uint8_t *prelude_bc;
 static size_t prelude_bc_len;
 
+/*
+ * The prelude's name in the compiled script cache on the memory card
+ * (VitaSurf). The cache is keyed by URL and checks the source's hash, so
+ * a build whose prelude has changed misses and compiles once more. It
+ * carries no '<' because the cache uses that to mean a script with no
+ * URL of its own, which is what the prelude used to count as.
+ */
+#define PRELUDE_URL "vitasurf:prelude"
+
+static JSValue bc_load(JSContext *ctx, const char *url,
+		       const char *src, size_t srclen);
+static void bc_store(JSContext *ctx, const char *url,
+		     const char *src, size_t srclen, JSValueConst fn);
+
 static void setup_globals(jsthread *thread)
 {
 	JSContext *ctx = thread->ctx;
@@ -5968,7 +5982,7 @@ static void setup_globals(jsthread *thread)
 		size_t len = sizeof(prelude_js) - 1;
 		uint64_t t0 = 0, t1 = 0;
 		JSValue fn, r;
-		bool cached = prelude_bc != NULL;
+		const char *how = prelude_bc != NULL ? "bytecode" : "source";
 
 		/*
 		 * The prelude runs once per page, so its own cost is part
@@ -5978,12 +5992,35 @@ static void setup_globals(jsthread *thread)
 		 * runtimes, which is how qjsc precompiles a script, so each
 		 * later page reads the same buffer back instead of parsing
 		 * 172 KB of source again.
+		 *
+		 * That left the first page of every run paying the whole
+		 * parse: a build 362 log reads 828 ms for 432 KB, which was
+		 * four fifths of a 1039 ms load, and the first page of a run
+		 * is the home page. The compiled script cache on the memory
+		 * card already holds the bytecode of a page's scripts
+		 * between runs, and the prelude is larger than anything it
+		 * was written for; it was excluded only because it has no
+		 * URL. Give it one. Compiling it now happens once per build
+		 * rather than once per boot.
 		 */
 		nsu_getmonotonic_ms(&t0);
-		if (prelude_bc == NULL) {
-			fn = JS_Eval(ctx, src, len, "<prelude>",
-				     JS_EVAL_TYPE_GLOBAL |
-				     JS_EVAL_FLAG_COMPILE_ONLY);
+		if (prelude_bc != NULL) {
+			fn = JS_ReadObject(ctx, prelude_bc, prelude_bc_len,
+					   JS_READ_OBJ_BYTECODE);
+		} else {
+			fn = bc_load(ctx, PRELUDE_URL, src, len);
+			if (JS_IsUndefined(fn)) {
+				fn = JS_Eval(ctx, src, len, "<prelude>",
+					     JS_EVAL_TYPE_GLOBAL |
+					     JS_EVAL_FLAG_COMPILE_ONLY);
+				if (!JS_IsException(fn)) {
+					bc_store(ctx, PRELUDE_URL, src, len,
+						 fn);
+				}
+			} else {
+				how = "card";
+			}
+			/* and keep it in memory for this run's later pages */
 			if (!JS_IsException(fn)) {
 				uint8_t *out;
 				size_t out_len = 0;
@@ -5995,9 +6032,6 @@ static void setup_globals(jsthread *thread)
 					prelude_bc_len = out_len;
 				}
 			}
-		} else {
-			fn = JS_ReadObject(ctx, prelude_bc, prelude_bc_len,
-					   JS_READ_OBJ_BYTECODE);
 		}
 		if (JS_IsException(fn)) {
 			qjs_report_exception_src(ctx, "<prelude>", src, len);
@@ -6019,8 +6053,7 @@ static void setup_globals(jsthread *thread)
 		vitasurf_ms_prelude += (unsigned int)(t1 - t0);
 		vita_log("qjs: prelude %u KB ran in %u ms (%s)",
 			 (unsigned int)(len / 1024),
-			 (unsigned int)(t1 - t0),
-			 cached ? "bytecode" : "source");
+			 (unsigned int)(t1 - t0), how);
 	}
 }
 

@@ -1,0 +1,118 @@
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index d2e2a37fc..39fac6f38 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -94,6 +94,16 @@ typedef struct fb_faceid_s {
+ 	 */
+ 	uint8_t *filedata;
+ 	size_t filelen;
++	/*
++	 * Whether this face has been asked for yet, and whether it
++	 * worked (VitaSurf). Holding the file in memory made loading a
++	 * face cost what reading it costs, and loading all eight of them
++	 * before the first page put 1.2 s into startup where the old
++	 * streaming loads took 0.65 s. A page uses two or three faces,
++	 * not eight. Load one when something first asks for it.
++	 */
++	bool checked;
++	bool ok;
+ 	/*
+ 	 * ASCII to glyph index (VitaSurf). Measuring text used to reach
+ 	 * the advance cache without asking FreeType anything, and
+@@ -270,7 +280,9 @@ static nserror fb_font_add_face(const char *family, int weight, bool italic,
+ 	newf->len = len;
+ 
+ 	/* load it now, so a file FreeType cannot read is refused here */
++	newf->checked = true;
+ 	error = FTC_Manager_LookupFace(ft_cmanager, (FTC_FaceID) newf, &aface);
++	newf->ok = error == 0;
+ 	if (error) {
+ 		NSLOG(netsurf, INFO, "web font %s not usable (code %d)",
+ 		      family, error);
+@@ -337,14 +349,38 @@ static fb_faceid_t *fb_web_face_for(const plot_font_style_t *fstyle)
+ }
+ 
+ /**
+- * create new framebuffer face and cause it to be loaded to check its ok
++ * Load a face the first time it is wanted (VitaSurf), and say whether
++ * it can be used. A face that FreeType will not parse says so once, and
++ * the caller falls back to the sans face as fb_font_init used to.
++ */
++static bool fb_face_ready(fb_faceid_t *fb_face)
++{
++	FT_Face aface;
++
++	if (fb_face == NULL) {
++		return false;
++	}
++	if (fb_face->checked == false) {
++		fb_face->checked = true;
++		fb_face->ok = FTC_Manager_LookupFace(ft_cmanager,
++				(FTC_FaceID) fb_face, &aface) == 0;
++		if (fb_face->ok == false) {
++			NSLOG(netsurf, INFO, "Could not load font face %s",
++			      fb_face->fontfile != NULL ?
++			      fb_face->fontfile : "memory");
++		}
++	}
++	return fb_face->ok;
++}
++
++
++/**
++ * create new framebuffer face; it is loaded when something first wants it
+  */
+ static fb_faceid_t *
+ fb_new_face(const char *option, const char *resname, const char *fontname)
+ {
+         fb_faceid_t *newf;
+-        FT_Error error;
+-        FT_Face aface;
+ 	char buf[PATH_MAX];
+ 
+ 	const char *path;
+@@ -390,15 +426,6 @@ fb_new_face(const char *option, const char *resname, const char *fontname)
+ 	}
+ 	newf->fontfile = strdup(path);
+ 
+-        error = FTC_Manager_LookupFace(ft_cmanager, (FTC_FaceID)newf, &aface);
+-        if (error) {
+-                NSLOG(netsurf, INFO, "Could not find font face %s (code %d)",
+-                      fontname, error);
+-                free(newf->fontfile);
+-                free(newf);
+-                newf = NULL;
+-        }
+-
+         return newf;
+ }
+ 
+@@ -473,7 +500,7 @@ bool fb_font_init(void)
+ 	fb_face = fb_new_face(nsoption_charp(fb_face_sans_serif),
+ 			      "sans_serif.ttf",
+ 			      NETSURF_FB_FONT_SANS_SERIF);
+-	if (fb_face == NULL) {
++	if (fb_face == NULL || fb_face_ready(fb_face) == false) {
+ 		/* The sans serif font is the default and must be found. */
+                 NSLOG(netsurf, INFO, "Could not find the default font");
+                 FTC_Manager_Done(ft_cmanager);
+@@ -633,7 +660,7 @@ static void fb_fill_scalar(const plot_font_style_t *fstyle, FTC_Scaler srec)
+         int selected_face = FB_FACE_DEFAULT;
+ 	fb_faceid_t *web = fb_web_face_for(fstyle);
+ 
+-	if (web != NULL) {
++	if (web != NULL && fb_face_ready(web)) {
+ 		srec->face_id = (FTC_FaceID) web;
+ 		srec->width = srec->height =
+ 				(fstyle->size * 64) / PLOT_STYLE_SCALE;
+@@ -686,6 +713,10 @@ static void fb_fill_scalar(const plot_font_style_t *fstyle, FTC_Scaler srec)
+                 }
+ 	}
+ 
++	if (fb_face_ready(fb_faces[selected_face]) == false) {
++		selected_face = FB_FACE_SANS_SERIF;
++	}
++
+         srec->face_id = (FTC_FaceID)fb_faces[selected_face];
+ 
+ 	srec->width = srec->height = (fstyle->size * 64) / PLOT_STYLE_SCALE;

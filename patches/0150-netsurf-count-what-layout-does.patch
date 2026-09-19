@@ -1,0 +1,282 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 99edfcf3a..a5f294c36 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5983,5 +5983,6 @@ bool layout_document(html_content *content, int width, int height)
+ 
+ 	nsu_getmonotonic_ms(&vs_t1);
+ 	vitasurf_ms_layout += (unsigned int)(vs_t1 - vs_t0);
++	vitasurf_layout_runs++;
+ 	return ret;
+ }
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index 55bc3254f..03c6279b0 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -19,6 +19,7 @@
+ 
+ #include <assert.h>
+ #include <stdlib.h>
++#include <time.h>
+ #include <strings.h>
+ #include <string.h>
+ #include <stdint.h>
+@@ -29,6 +30,8 @@
+ 
+ #include "netsurf/inttypes.h"
+ #include "utils/filepath.h"
++/* the counters that say what laying out a page asks of the font */
++#include "utils/utils.h"
+ #include "utils/utf8.h"
+ #include "utils/log.h"
+ #include "utils/nsoption.h"
+@@ -303,7 +306,16 @@ bool fb_font_init(void)
+ {
+         FT_Error error;
+         FT_ULong max_cache_size;
+-        FT_UInt max_faces = 6;
++        /*
++         * Room for every bundled face and the ones a page brings with
++         * it (VitaSurf). Six was fewer than the ten registered here, so
++         * the cache manager threw faces out and asked for them again:
++         * a build 359 log loads eight distinct faces twelve times,
++         * DejaVuSansMono-Bold three times over, and each of those is
++         * FT_New_Face parsing the file again at fifty to ninety
++         * milliseconds a go.
++         */
++        FT_UInt max_faces = FB_FACE_COUNT + 6;
+ 	fb_faceid_t *fb_face;
+ 
+         /* freetype library initialise */
+@@ -322,9 +334,22 @@ bool fb_font_init(void)
+ 	}
+ 
+         /* cache manager initialise */
++        /*
++         * Sizes, not left to the default (VitaSurf). Zero here means
++         * FTC_MAX_SIZES_DEFAULT, which is four, and a size node owns
++         * the glyphs rendered at it: discard the node and they are
++         * rendered again. The welcome page alone asks for five sizes
++         * in its own stylesheet before the headings and bold faces
++         * the default stylesheet adds, and layout walks a heading,
++         * then body text, then another heading, so four nodes are
++         * thrown out and rebuilt the whole way down the page. A four
++         * kilobyte page spent 1837 ms inside the font engine for 3339
++         * characters, which is half a millisecond a character, and it
++         * is this. They are small; keep plenty.
++         */
+         error = FTC_Manager_New(library, 
+                                 max_faces, 
+-                                0, 
++                                FB_FACE_COUNT * 8, 
+                                 max_cache_size, 
+                                 ft_face_requester, 
+                                 NULL, 
+@@ -989,6 +1014,15 @@ static const struct fb_liga *fb_liga_find(fb_faceid_t *fb_face, FT_UInt g)
+ 	return NULL;
+ }
+ 
++/** Microseconds on the monotonic clock, for the font counters. */
++static unsigned int fb_now_us(void)
++{
++	struct timespec t;
++
++	clock_gettime(CLOCK_MONOTONIC, &t);
++	return (unsigned int) (t.tv_sec * 1000000u + t.tv_nsec / 1000u);
++}
++
+ /*
+  * Advance cache (VitaSurf).
+  *
+@@ -1007,7 +1041,15 @@ static const struct fb_liga *fb_liga_find(fb_faceid_t *fb_face, FT_UInt g)
+  * the same lookup with the same load flags, so hinting rounds advances
+  * exactly as it did before and nothing in layout moves.
+  */
+-#define ADV_STYLES 8		/* faces x sizes kept at once */
++/*
++ * Faces x sizes kept at once. Eight was on the edge of what one page
++ * asks for -- five sizes of its own, the headings and bold faces the
++ * default stylesheet adds, the toolbar and the status bar -- and a row
++ * thrown out takes its 128 advances with it, so the next character at
++ * that size goes back to FreeType. Thirty two is about nine kilobytes
++ * and covers a page with room to spare. (VitaSurf)
++ */
++#define ADV_STYLES 32
+ #define ADV_CHARS  128		/* ASCII, where nearly every advance is */
+ /* liga_start_char asks the same question of the same characters */
+ typedef char fb_adv_chars_match[ADV_CHARS == 128 ? 1 : -1];
+@@ -1073,10 +1115,14 @@ static int fb_advance(struct adv_style *slot, FTC_ScalerRec *srec,
+ 	bool cacheable = ucs4 < ADV_CHARS;
+ 	FT_Glyph glyph;
+ 	int advance;
++	unsigned int vs_us0;
+ 
+ 	if (cacheable && slot->adv[ucs4] != ADV_UNKNOWN) {
+ 		return slot->adv[ucs4];
+ 	}
++	/* what the advance cache could not answer, and what it cost */
++	vs_us0 = fb_now_us();
++	vitasurf_font_lookups++;
+ 	if (FTC_ImageCache_LookupScaler(ft_image_cache, srec,
+ 					FT_LOAD_RENDER |
+ 					FT_LOAD_FORCE_AUTOHINT |
+@@ -1086,6 +1132,7 @@ static int fb_advance(struct adv_style *slot, FTC_ScalerRec *srec,
+ 	} else {
+ 		advance = glyph->advance.x >> 16;
+ 	}
++	vitasurf_us_lookup += fb_now_us() - vs_us0;
+ 	if (cacheable) {
+ 		slot->adv[ucs4] = (int16_t)advance;
+ 	}
+@@ -1143,6 +1190,7 @@ static FT_UInt fb_glyph_for(fb_faceid_t *fb_face, FTC_FaceID face_id,
+ 	return (FT_UInt) (held & ~FB_CMAP_KNOWN);
+ }
+ 
++
+ /**
+  * Whether this byte is one the advance cache alone can answer.
+  *
+@@ -1310,9 +1358,14 @@ fb_font_width(const plot_font_style_t *fstyle,
+         fb_faceid_t *fb_face;
+         int advance;
+ 
++        unsigned int vs_us0 = fb_now_us();
++
+         fb_fill_scalar(fstyle, &srec);
+         fb_face = (fb_faceid_t *)srec.face_id;
+         slot = fb_adv_slot(&srec);
++        /* what laying out a page asks of the font (VitaSurf) */
++        vitasurf_font_calls++;
++        vitasurf_font_chars += (unsigned int) length;
+ 
+         *width = 0;
+         while (nxtchr < length) {
+@@ -1336,6 +1389,7 @@ fb_font_width(const plot_font_style_t *fstyle,
+ 
+                 *width += advance;
+         }
++	vitasurf_us_font += fb_now_us() - vs_us0;
+ 	return NSERROR_OK;
+ }
+ 
+@@ -1354,9 +1408,14 @@ fb_font_position(const plot_font_style_t *fstyle,
+         int advance;
+         int prev_x = 0;
+ 
++        unsigned int vs_us0 = fb_now_us();
++
+         fb_fill_scalar(fstyle, &srec);
+         fb_face = (fb_faceid_t *)srec.face_id;
+         slot = fb_adv_slot(&srec);
++        /* what laying out a page asks of the font (VitaSurf) */
++        vitasurf_font_calls++;
++        vitasurf_font_chars += (unsigned int) length;
+ 
+         *actual_x = 0;
+         while (nxtchr < length) {
+@@ -1398,6 +1457,7 @@ fb_font_position(const plot_font_style_t *fstyle,
+                 *actual_x = prev_x;
+ 
+         *char_offset = nxtchr;
++	vitasurf_us_font += fb_now_us() - vs_us0;
+ 	return NSERROR_OK;
+ }
+ 
+@@ -1438,9 +1498,14 @@ fb_font_split(const plot_font_style_t *fstyle,
+         fb_faceid_t *fb_face;
+         int advance;
+ 
++        unsigned int vs_us0 = fb_now_us();
++
+         fb_fill_scalar(fstyle, &srec);
+         fb_face = (fb_faceid_t *)srec.face_id;
+         slot = fb_adv_slot(&srec);
++        /* what laying out a page asks of the font (VitaSurf) */
++        vitasurf_font_calls++;
++        vitasurf_font_chars += (unsigned int) length;
+ 
+         *actual_x = 0;
+         while (nxtchr < length) {
+@@ -1483,6 +1548,7 @@ fb_font_split(const plot_font_style_t *fstyle,
+ 
+         *char_offset = nxtchr;
+ 
++	vitasurf_us_font += fb_now_us() - vs_us0;
+ 	return NSERROR_OK;
+ }
+ 
+diff --git a/utils/utils.c b/utils/utils.c
+index fc33bb1ba..016cb0092 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -583,6 +583,12 @@ unsigned int vitasurf_images_done;
+ unsigned int vitasurf_images_failed;
+ unsigned int vitasurf_ms_boxes;
+ unsigned int vitasurf_ms_layout;
++unsigned int vitasurf_layout_runs;
++unsigned int vitasurf_font_calls;
++unsigned int vitasurf_font_chars;
++unsigned int vitasurf_us_font;
++unsigned int vitasurf_font_lookups;
++unsigned int vitasurf_us_lookup;
+ unsigned int vitasurf_ms_script;
+ unsigned int vitasurf_ms_draw;
+ unsigned int vitasurf_ms_teardown;
+@@ -599,6 +605,12 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_images_failed = 0;
+ 	vitasurf_ms_boxes = 0;
+ 	vitasurf_ms_layout = 0;
++	vitasurf_layout_runs = 0;
++	vitasurf_font_calls = 0;
++	vitasurf_font_chars = 0;
++	vitasurf_us_font = 0;
++	vitasurf_font_lookups = 0;
++	vitasurf_us_lookup = 0;
+ 	vitasurf_ms_script = 0;
+ 	vitasurf_ms_draw = 0;
+ 	vitasurf_ms_teardown = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 02682edbd..57de52a5b 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -144,6 +144,40 @@ extern unsigned int vitasurf_images_done;
+ extern unsigned int vitasurf_images_failed;
+ extern unsigned int vitasurf_ms_boxes;
+ extern unsigned int vitasurf_ms_layout;
++/**
++ * What laying the page out actually did (VitaSurf).
++ *
++ * A four kilobyte local page spends 1666 ms in layout where a real
++ * site spends 180, which is the wrong way round, and the millisecond
++ * total cannot say why. These can: how many times the document was
++ * laid out at all, and how much text was measured doing it. Counting
++ * is two increments, so unlike timing it does not change the thing it
++ * is counting.
++ */
++extern unsigned int vitasurf_layout_runs;
++extern unsigned int vitasurf_font_calls;
++extern unsigned int vitasurf_font_chars;
++/**
++ * Microseconds the font engine was inside (VitaSurf).
++ *
++ * The counts said a four kilobyte page measures text 192 times over
++ * 3339 characters and is laid out once, which cannot be 1719 ms, so
++ * either the font engine is far slower per call than it measures on a
++ * host or the time is somewhere else in layout. 192 calls is few
++ * enough that a clock read at each end costs nothing.
++ */
++extern unsigned int vitasurf_us_font;
++/**
++ * The part of that spent inside FreeType, and how often (VitaSurf).
++ *
++ * 1837 ms for 192 calls over 3339 characters is half a millisecond a
++ * character, which is far more than rendering one costs. These split
++ * it: how many characters reached FTC_ImageCache_LookupScaler at all
++ * rather than being answered from the advance cache, and how long
++ * those took. What is left is our own code around them.
++ */
++extern unsigned int vitasurf_font_lookups;
++extern unsigned int vitasurf_us_lookup;
+ /**
+  * Milliseconds spent inside script, however it was entered: a
+  * <script>, a timer, an event listener. The other counters cover
