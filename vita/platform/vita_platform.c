@@ -286,8 +286,8 @@ void vitasurf_set_cache_disabled(bool off)
 			fclose(f);
 		}
 	} else {
-		sceIoRemove(VITASURF_NOCACHE_FLAG);
-		sceIoRemove(VITASURF_NOCACHE_FLAG ".txt");
+		remove(VITASURF_NOCACHE_FLAG);
+		remove(VITASURF_NOCACHE_FLAG ".txt");
 	}
 	vita_log("cache: %s", off ? "off, every fetch goes to the network"
 				  : "on");
