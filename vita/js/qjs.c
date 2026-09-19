@@ -7967,6 +7967,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	JSValue ret;
 	bool ok;
 	char *src;
+	uint64_t t_after0 = 0;	/* when the script's run ended (VitaSurf) */
 
 	if (thread == NULL || txt == NULL || txtlen == 0) {
 		return false;
@@ -8195,6 +8196,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			ret = settle_module(thread, ret, name);
 		}
 		t_done = now_ms();
+		t_after0 = t_done;
 
 		if (module) {
 			thread->js_modules++;
@@ -8208,7 +8210,14 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		vitasurf_ms_js_compile += (unsigned)(t_compiled - t_start);
 		vitasurf_ms_js_run += (unsigned)(t_done - t_compiled);
 
-		if (txtlen > SCRIPT_LOG_BYTES || vita_verbose_requested()) {
+		/*
+		 * runtime_kb walks the whole runtime -- every object,
+		 * shape and string -- to add up what it holds, and asking
+		 * it once per script was 26 walks on a YouTube page
+		 * (VitaSurf). It is worth knowing after a script big
+		 * enough to move the number and not otherwise.
+		 */
+		if (txtlen > SCRIPT_LOG_BYTES) {
 			vita_log("qjs: script %u KB %s in %u ms, "
 				 "ran in %u ms, runtime memory now %u KB: %s",
 				 (unsigned)(txtlen / 1024),
@@ -8217,16 +8226,35 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				 (unsigned)(t_done - t_compiled),
 				 runtime_kb(thread->heap->rt),
 				 name);
-		}
-		if (txtlen > SCRIPT_LOG_BYTES) {
 			vita_log_memory("after a large script");
+		} else if (vita_verbose_requested()) {
+			vita_log("qjs: script %u KB %s in %u ms, "
+				 "ran in %u ms: %s",
+				 (unsigned)(txtlen / 1024),
+				 cached ? "read from cache" : "compiled",
+				 (unsigned)(t_compiled - t_start),
+				 (unsigned)(t_done - t_compiled),
+				 name);
 		}
 	}
 	ok = !JS_IsException(ret);
 	if (!ok) {
 		qjs_report_exception_src(thread->ctx, name, src, txtlen);
 	}
-	JS_FreeValue(thread->ctx, ret);
+	{
+		/*
+		 * The tail, split (VitaSurf). Everything from the end of
+		 * the run to the close of the script bucket lands here,
+		 * and freeing the script's result is the one part of it
+		 * that could plausibly cost anything.
+		 */
+		uint64_t f0 = now_ms(), f1;
+
+		JS_FreeValue(thread->ctx, ret);
+		f1 = now_ms();
+		vitasurf_ms_js_free += (unsigned)(f1 - f0);
+		vitasurf_ms_js_after += (unsigned)(f1 - t_after0);
+	}
 	thread->current_script = NULL;
 	end_script(thread);
 	free(src);

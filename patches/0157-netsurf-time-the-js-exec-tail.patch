@@ -1,0 +1,42 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index f0e2a4104..6ced72818 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -605,6 +605,8 @@ unsigned int vitasurf_js_jobs;
+ unsigned int vitasurf_ms_js_job_max;
+ unsigned int vitasurf_ms_js_compile;
+ unsigned int vitasurf_ms_js_run;
++unsigned int vitasurf_ms_js_after;
++unsigned int vitasurf_ms_js_free;
+ 
+ /* exported interface documented in utils/utils.h */
+ void vitasurf_profile_reset(void)
+@@ -639,6 +641,8 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_job_max = 0;
+ 	vitasurf_ms_js_compile = 0;
+ 	vitasurf_ms_js_run = 0;
++	vitasurf_ms_js_after = 0;
++	vitasurf_ms_js_free = 0;
+ 	vitasurf_ms_nested = 0;
+ }
+ 
+diff --git a/utils/utils.h b/utils/utils.h
+index e2d7a6ad0..8f890ac01 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -241,6 +241,15 @@ extern unsigned int vitasurf_ms_js_job_max;
+  */
+ extern unsigned int vitasurf_ms_js_compile;
+ extern unsigned int vitasurf_ms_js_run;
++/*
++ * What js_exec does after the script has run (VitaSurf). A build 372
++ * log reads 3851 ms in script elements against 2378 ms of compiling and
++ * running, and the per script log lines agree with those two to the
++ * millisecond, so the missing 1473 ms is all in the tail. Only a few
++ * things live there, and freeing the script's result is one of them.
++ */
++extern unsigned int vitasurf_ms_js_after;
++extern unsigned int vitasurf_ms_js_free;
+ /**
+  * Milliseconds the conversion now returning spent, handed up so the
+  * conversion that contains it can subtract its own nested work.

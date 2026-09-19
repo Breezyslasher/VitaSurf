@@ -1094,17 +1094,13 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_layout, vitasurf_ms_script);
 			vita_log("page: script %u ms is %u ms in script "
 				 "elements (%u ms compiling or reading them, "
-				 "%u ms running them, %u ms neither), "
+				 "%u ms running them, %u ms after, of which "
+				 "%u ms freeing the result), "
 				 "%u ms in %u timers, %u ms in %u "
 				 "events, %u ms in %u fetch callbacks",
 				 vitasurf_ms_script, vitasurf_ms_js_page,
 				 vitasurf_ms_js_compile, vitasurf_ms_js_run,
-				 vitasurf_ms_js_page >
-					vitasurf_ms_js_compile +
-					vitasurf_ms_js_run ?
-					vitasurf_ms_js_page -
-					vitasurf_ms_js_compile -
-					vitasurf_ms_js_run : 0,
+				 vitasurf_ms_js_after, vitasurf_ms_js_free,
 				 vitasurf_ms_js_timer, vitasurf_js_timers,
 				 vitasurf_ms_js_event, vitasurf_js_events,
 				 vitasurf_ms_js_xhr, vitasurf_js_xhrs);
