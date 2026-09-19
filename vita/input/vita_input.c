@@ -1157,6 +1157,11 @@ void vita_input_load_finished(struct gui_window *gw)
 					 css_hash_in_element, css_hash_in_class,
 					 css_hash_in_id, css_hash_in_universal);
 			}
+			vita_log("page: attribute selectors asked for a name "
+				 "%u times, interning it %u of them",
+				 vitasurf_attr_interned_hits +
+					vitasurf_attr_interned_misses,
+				 vitasurf_attr_interned_misses);
 			vita_log("page: the scheduler ran %u callbacks for "
 				 "%u ms, the longest %u ms",
 				 vitasurf_sched_calls, vitasurf_ms_sched,

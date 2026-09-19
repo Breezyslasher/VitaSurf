@@ -1,0 +1,274 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 81abc137e..72ae17fb0 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -24,6 +24,7 @@
+ #include "utils/corestrings.h"
+ #include "utils/log.h"
+ #include "utils/nsurl.h"
++#include "utils/utils.h"
+ #include "netsurf/plot_style.h"
+ #include "netsurf/url_db.h"
+ #include "desktop/system_colour.h"
+@@ -913,6 +914,61 @@ css_error node_has_id(void *pw, void *node,
+ 	return CSS_OK;
+ }
+ 
++/*
++ * An attribute name, interned once instead of once per test (VitaSurf).
++ *
++ * Every attribute selector libcss tries against an element arrives here
++ * with the same lwc_string, because libcss interns each name once per
++ * sheet, and each of the seven callbacks below used to build a fresh
++ * dom_string from it and throw it away again. A GitHub page offers 2738
++ * candidate rules to each of its 6270 elements and two thirds of the
++ * universal ones are keyed on an attribute, so that is millions of
++ * internings inside the 36 seconds the page spends selecting styles.
++ *
++ * The cache holds a reference to the lwc_string as well as to the
++ * dom_string it made, so a name that is freed cannot be replaced by a
++ * different one at the same address and read back as a hit. What it
++ * returns is borrowed: the cache owns it, and the callbacks must not
++ * drop it.
++ */
++#define QNAME_CACHE_SLOTS 128
++
++static struct {
++	lwc_string *key;
++	dom_string *name;
++} qname_cache[QNAME_CACHE_SLOTS];
++
++static dom_string *qname_interned(const css_qname *qname)
++{
++	uintptr_t bits = (uintptr_t) qname->name;
++	unsigned slot = (unsigned) ((bits >> 3) & (QNAME_CACHE_SLOTS - 1));
++	dom_exception err;
++	dom_string *name;
++
++	if (qname_cache[slot].key == qname->name) {
++		vitasurf_attr_interned_hits++;
++		return qname_cache[slot].name;
++	}
++
++	err = dom_string_create_interned(
++			(const uint8_t *) lwc_string_data(qname->name),
++			lwc_string_length(qname->name), &name);
++	if (err != DOM_NO_ERR) {
++		return NULL;
++	}
++
++	if (qname_cache[slot].name != NULL) {
++		dom_string_unref(qname_cache[slot].name);
++		lwc_string_unref(qname_cache[slot].key);
++	}
++	qname_cache[slot].key = lwc_string_ref(qname->name);
++	qname_cache[slot].name = name;
++	vitasurf_attr_interned_misses++;
++
++	return name;
++}
++
++
+ /**
+  * Callback to determine if a node has an attribute with the given name.
+  *
+@@ -932,19 +988,15 @@ css_error node_has_attribute(void *pw, void *node,
+ 	dom_string *name;
+ 	dom_exception err;
+ 
+-	err = dom_string_create_interned(
+-			(const uint8_t *) lwc_string_data(qname->name),
+-			lwc_string_length(qname->name), &name);
+-	if (err != DOM_NO_ERR)
++	name = qname_interned(qname);
++	if (name == NULL)
+ 		return CSS_NOMEM;
+ 
+ 	err = dom_element_has_attribute(n, name, match);
+ 	if (err != DOM_NO_ERR) {
+-		dom_string_unref(name);
+ 		return CSS_OK;
+ 	}
+ 
+-	dom_string_unref(name);
+ 
+ 	return CSS_OK;
+ }
+@@ -978,20 +1030,16 @@ css_error node_has_attribute_equal(void *pw, void *node,
+ 		return CSS_OK;
+ 	}
+ 
+-	err = dom_string_create_interned(
+-		(const uint8_t *) lwc_string_data(qname->name),
+-		lwc_string_length(qname->name), &name);
+-	if (err != DOM_NO_ERR)
++	name = qname_interned(qname);
++	if (name == NULL)
+ 		return CSS_NOMEM;
+ 
+ 	err = dom_element_get_attribute(n, name, &atr_val);
+ 	if ((err != DOM_NO_ERR) || (atr_val == NULL)) {
+-		dom_string_unref(name);
+ 		*match = false;
+ 		return CSS_OK;
+ 	}
+ 
+-	dom_string_unref(name);
+ 
+ 	*match = dom_string_caseless_lwc_isequal(atr_val, value);
+ 
+@@ -1030,20 +1078,16 @@ css_error node_has_attribute_dashmatch(void *pw, void *node,
+ 		return CSS_OK;
+ 	}
+ 
+-	err = dom_string_create_interned(
+-		(const uint8_t *) lwc_string_data(qname->name),
+-		lwc_string_length(qname->name), &name);
+-	if (err != DOM_NO_ERR)
++	name = qname_interned(qname);
++	if (name == NULL)
+ 		return CSS_NOMEM;
+ 
+ 	err = dom_element_get_attribute(n, name, &atr_val);
+ 	if ((err != DOM_NO_ERR) || (atr_val == NULL)) {
+-		dom_string_unref(name);
+ 		*match = false;
+ 		return CSS_OK;
+ 	}
+ 
+-	dom_string_unref(name);
+ 
+ 	/* check for exact match */
+ 	*match = dom_string_caseless_lwc_isequal(atr_val, value);
+@@ -1098,20 +1142,16 @@ css_error node_has_attribute_includes(void *pw, void *node,
+ 		return CSS_OK;
+ 	}
+ 
+-	err = dom_string_create_interned(
+-		(const uint8_t *) lwc_string_data(qname->name),
+-		lwc_string_length(qname->name), &name);
+-	if (err != DOM_NO_ERR)
++	name = qname_interned(qname);
++	if (name == NULL)
+ 		return CSS_NOMEM;
+ 
+ 	err = dom_element_get_attribute(n, name, &atr_val);
+ 	if ((err != DOM_NO_ERR) || (atr_val == NULL)) {
+-		dom_string_unref(name);
+ 		*match = false;
+ 		return CSS_OK;
+ 	}
+ 
+-	dom_string_unref(name);
+ 
+ 	/* check for match */
+ 	start = (const char *) dom_string_data(atr_val);
+@@ -1166,20 +1206,16 @@ css_error node_has_attribute_prefix(void *pw, void *node,
+ 		return CSS_OK;
+ 	}
+ 
+-	err = dom_string_create_interned(
+-		(const uint8_t *) lwc_string_data(qname->name),
+-		lwc_string_length(qname->name), &name);
+-	if (err != DOM_NO_ERR)
++	name = qname_interned(qname);
++	if (name == NULL)
+ 		return CSS_NOMEM;
+ 
+ 	err = dom_element_get_attribute(n, name, &atr_val);
+ 	if ((err != DOM_NO_ERR) || (atr_val == NULL)) {
+-		dom_string_unref(name);
+ 		*match = false;
+ 		return CSS_OK;
+ 	}
+ 
+-	dom_string_unref(name);
+ 
+ 	/* check for exact match */
+ 	*match = dom_string_caseless_lwc_isequal(atr_val, value);
+@@ -1230,20 +1266,16 @@ css_error node_has_attribute_suffix(void *pw, void *node,
+ 		return CSS_OK;
+ 	}
+ 
+-	err = dom_string_create_interned(
+-		(const uint8_t *) lwc_string_data(qname->name),
+-		lwc_string_length(qname->name), &name);
+-	if (err != DOM_NO_ERR)
++	name = qname_interned(qname);
++	if (name == NULL)
+ 		return CSS_NOMEM;
+ 
+ 	err = dom_element_get_attribute(n, name, &atr_val);
+ 	if ((err != DOM_NO_ERR) || (atr_val == NULL)) {
+-		dom_string_unref(name);
+ 		*match = false;
+ 		return CSS_OK;
+ 	}
+ 
+-	dom_string_unref(name);
+ 
+ 	/* check for exact match */
+ 	*match = dom_string_caseless_lwc_isequal(atr_val, value);
+@@ -1298,20 +1330,16 @@ css_error node_has_attribute_substring(void *pw, void *node,
+ 		return CSS_OK;
+ 	}
+ 
+-	err = dom_string_create_interned(
+-		(const uint8_t *) lwc_string_data(qname->name),
+-		lwc_string_length(qname->name), &name);
+-	if (err != DOM_NO_ERR)
++	name = qname_interned(qname);
++	if (name == NULL)
+ 		return CSS_NOMEM;
+ 
+ 	err = dom_element_get_attribute(n, name, &atr_val);
+ 	if ((err != DOM_NO_ERR) || (atr_val == NULL)) {
+-		dom_string_unref(name);
+ 		*match = false;
+ 		return CSS_OK;
+ 	}
+ 
+-	dom_string_unref(name);
+ 
+ 	/* check for exact match */
+ 	*match = dom_string_caseless_lwc_isequal(atr_val, value);
+diff --git a/utils/utils.c b/utils/utils.c
+index aaac7d784..49df7c503 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -622,6 +622,8 @@ extern unsigned int css_select_from_universal;
+ 
+ unsigned int vitasurf_ms_select;
+ unsigned int vitasurf_box_elements;
++unsigned int vitasurf_attr_interned_hits;
++unsigned int vitasurf_attr_interned_misses;
+ unsigned int vitasurf_inline_styles;
+ unsigned int vitasurf_ms_inline_style;
+ unsigned int vitasurf_sched_calls;
+@@ -676,6 +678,8 @@ void vitasurf_profile_reset(void)
+ 	css_select_from_universal = 0;
+ 	vitasurf_ms_select = 0;
+ 	vitasurf_box_elements = 0;
++	vitasurf_attr_interned_hits = 0;
++	vitasurf_attr_interned_misses = 0;
+ 	vitasurf_inline_styles = 0;
+ 	vitasurf_ms_inline_style = 0;
+ 	vitasurf_sched_calls = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index bb0f8cc07..d738aa78c 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -288,6 +288,13 @@ extern unsigned int vitasurf_box_elements;
+  * Wikipedia, and this is the one part of it that scales with how the
+  * page is written rather than with how many elements it has.
+  */
++/*
++ * Attribute names interned for selection (VitaSurf): how many tests
++ * found the name already interned and how many had to do it.
++ */
++extern unsigned int vitasurf_attr_interned_hits;
++extern unsigned int vitasurf_attr_interned_misses;
++
+ extern unsigned int vitasurf_inline_styles;
+ extern unsigned int vitasurf_ms_inline_style;
+ 
