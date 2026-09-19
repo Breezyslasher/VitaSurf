@@ -627,6 +627,18 @@ int vita_platform_init(void)
 	vita_log("layout dump flag file %s: %s (the Start menu dumps "
 		 "a page's layout without it)", VITASURF_LAYOUT_FLAG,
 		 vita_layout_dump_requested() ? "present" : "absent");
+	/*
+	 * Say so plainly. A build 362 log was read as a cache-off run
+	 * when the caches had in fact been on the whole time, and the
+	 * only way to tell was to notice that scripts came back from the
+	 * card. The state is on every log from here.
+	 */
+	vita_log("cache: %s (Start menu, Cache row)",
+		 vitasurf_cache_disabled() ?
+		 "off, every fetch goes to the network and nothing is "
+		 "compiled from the card" :
+		 "on, fetches and compiled scripts are kept under "
+		 VITASURF_DATA_DIR);
 	vita_log_memory("startup");
 
 	return logf != NULL ? 0 : -1;
