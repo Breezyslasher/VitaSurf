@@ -1,0 +1,102 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 99edfcf3a..a5f294c36 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5983,5 +5983,6 @@ bool layout_document(html_content *content, int width, int height)
+ 
+ 	nsu_getmonotonic_ms(&vs_t1);
+ 	vitasurf_ms_layout += (unsigned int)(vs_t1 - vs_t0);
++	vitasurf_layout_runs++;
+ 	return ret;
+ }
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index 55bc3254f..db3c78458 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -29,6 +29,8 @@
+ 
+ #include "netsurf/inttypes.h"
+ #include "utils/filepath.h"
++/* the counters that say what laying out a page asks of the font */
++#include "utils/utils.h"
+ #include "utils/utf8.h"
+ #include "utils/log.h"
+ #include "utils/nsoption.h"
+@@ -1313,6 +1315,9 @@ fb_font_width(const plot_font_style_t *fstyle,
+         fb_fill_scalar(fstyle, &srec);
+         fb_face = (fb_faceid_t *)srec.face_id;
+         slot = fb_adv_slot(&srec);
++        /* what laying out a page asks of the font (VitaSurf) */
++        vitasurf_font_calls++;
++        vitasurf_font_chars += (unsigned int) length;
+ 
+         *width = 0;
+         while (nxtchr < length) {
+@@ -1357,6 +1362,9 @@ fb_font_position(const plot_font_style_t *fstyle,
+         fb_fill_scalar(fstyle, &srec);
+         fb_face = (fb_faceid_t *)srec.face_id;
+         slot = fb_adv_slot(&srec);
++        /* what laying out a page asks of the font (VitaSurf) */
++        vitasurf_font_calls++;
++        vitasurf_font_chars += (unsigned int) length;
+ 
+         *actual_x = 0;
+         while (nxtchr < length) {
+@@ -1441,6 +1449,9 @@ fb_font_split(const plot_font_style_t *fstyle,
+         fb_fill_scalar(fstyle, &srec);
+         fb_face = (fb_faceid_t *)srec.face_id;
+         slot = fb_adv_slot(&srec);
++        /* what laying out a page asks of the font (VitaSurf) */
++        vitasurf_font_calls++;
++        vitasurf_font_chars += (unsigned int) length;
+ 
+         *actual_x = 0;
+         while (nxtchr < length) {
+diff --git a/utils/utils.c b/utils/utils.c
+index fc33bb1ba..2e8ab5000 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -583,6 +583,9 @@ unsigned int vitasurf_images_done;
+ unsigned int vitasurf_images_failed;
+ unsigned int vitasurf_ms_boxes;
+ unsigned int vitasurf_ms_layout;
++unsigned int vitasurf_layout_runs;
++unsigned int vitasurf_font_calls;
++unsigned int vitasurf_font_chars;
+ unsigned int vitasurf_ms_script;
+ unsigned int vitasurf_ms_draw;
+ unsigned int vitasurf_ms_teardown;
+@@ -599,6 +602,9 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_images_failed = 0;
+ 	vitasurf_ms_boxes = 0;
+ 	vitasurf_ms_layout = 0;
++	vitasurf_layout_runs = 0;
++	vitasurf_font_calls = 0;
++	vitasurf_font_chars = 0;
+ 	vitasurf_ms_script = 0;
+ 	vitasurf_ms_draw = 0;
+ 	vitasurf_ms_teardown = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 02682edbd..a5d7cc382 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -144,6 +144,19 @@ extern unsigned int vitasurf_images_done;
+ extern unsigned int vitasurf_images_failed;
+ extern unsigned int vitasurf_ms_boxes;
+ extern unsigned int vitasurf_ms_layout;
++/**
++ * What laying the page out actually did (VitaSurf).
++ *
++ * A four kilobyte local page spends 1666 ms in layout where a real
++ * site spends 180, which is the wrong way round, and the millisecond
++ * total cannot say why. These can: how many times the document was
++ * laid out at all, and how much text was measured doing it. Counting
++ * is two increments, so unlike timing it does not change the thing it
++ * is counting.
++ */
++extern unsigned int vitasurf_layout_runs;
++extern unsigned int vitasurf_font_calls;
++extern unsigned int vitasurf_font_chars;
+ /**
+  * Milliseconds spent inside script, however it was entered: a
+  * <script>, a timer, an event listener. The other counters cover
