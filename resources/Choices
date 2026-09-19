@@ -37,6 +37,14 @@ suppress_curl_debug:0
 send_referer:1
 do_not_track:0
 
+# Decode no image larger than the screen. Detail past what 960x544 can
+# show costs memory and buys nothing, and a page of full size photographs
+# is what uses the heap up: eight 2400x1600 JPEGs held 123 MB before this
+# and 14 MB after. Images are still laid out at their own size. Raise it
+# if you zoom in a lot and mind the softness.
+max_image_width:960
+max_image_height:544
+
 # The disc cache, on the memory card rather than in memory. NetSurf's
 # default limit is a gigabyte, which is not a sensible thing to leave on
 # someone's card; 128 MB holds a lot of pages. disc_cache_age is in days.

@@ -1,0 +1,456 @@
+diff --git a/content/handlers/image/image_cache.c b/content/handlers/image/image_cache.c
+index 8f7ff89ff..f4f39470f 100644
+--- a/content/handlers/image/image_cache.c
++++ b/content/handlers/image/image_cache.c
+@@ -30,11 +30,13 @@
+ #include "netsurf/inttypes.h"
+ #include "utils/utils.h"
+ #include "utils/log.h"
++#include "utils/nsoption.h"
+ #include "netsurf/misc.h"
+ #include "netsurf/bitmap.h"
+ #include "content/llcache.h"
+ #include "content/content_protected.h"
+ #include "desktop/gui_internal.h"
++#include "desktop/bitmap.h"
+ 
+ #include "image/image_cache.h"
+ #include "image/image.h"
+@@ -176,13 +178,37 @@ static struct image_cache_entry_s *image_cache__find(const struct content *c)
+ 	return found;
+ }
+ 
++/**
++ * What a decoded bitmap actually occupies.
++ *
++ * Not the image's own size: a bitmap may have been decoded smaller than
++ * the image, and then the cache holds fewer bytes than the image would
++ * suggest. Counting the image's size instead would evict entries that
++ * still fit. (VitaSurf)
++ *
++ * \param bitmap The bitmap to measure, which may be NULL.
++ * \param fallback The size to report when there is no bitmap.
++ */
++static size_t image_cache_bitmap_size(void *bitmap, size_t fallback)
++{
++	if (bitmap == NULL) {
++		return fallback;
++	}
++	return (size_t) guit->bitmap->get_height(bitmap) *
++			guit->bitmap->get_rowstride(bitmap);
++}
++
+ /**
+  * Update the image cache statistics with an entry.
+  *
+  * \param centry The image cache entry to update the stats with.
++ * \param bitmap The bitmap being added, which the entry may not hold yet.
+  */
+-static void image_cache_stats_bitmap_add(struct image_cache_entry_s *centry)
++static void image_cache_stats_bitmap_add(struct image_cache_entry_s *centry,
++					 void *bitmap)
+ {
++	centry->bitmap_size = image_cache_bitmap_size(bitmap,
++						      centry->bitmap_size);
+ 	centry->bitmap_age = image_cache->current_age;
+ 	centry->conversion_count++;
+ 
+@@ -358,7 +384,7 @@ struct bitmap *image_cache_get_bitmap(const struct content *c)
+ 		}
+ 
+ 		if (centry->bitmap != NULL) {
+-			image_cache_stats_bitmap_add(centry);
++			image_cache_stats_bitmap_add(centry, centry->bitmap);
+ 			image_cache->miss_count++;
+ 			image_cache->miss_size += centry->bitmap_size;
+ 		} else {
+@@ -541,7 +567,7 @@ nserror image_cache_add(struct content *content,
+ 		if (centry->bitmap != NULL) {
+ 			guit->bitmap->destroy(centry->bitmap);
+ 		} else {
+-			image_cache_stats_bitmap_add(centry);
++			image_cache_stats_bitmap_add(centry, bitmap);
+ 		}
+ 		centry->bitmap = bitmap;
+ 	} else {
+@@ -551,7 +577,8 @@ nserror image_cache_add(struct content *content,
+ 			centry->bitmap = centry->convert(centry->content);
+ 
+ 			if (centry->bitmap != NULL) {
+-				image_cache_stats_bitmap_add(centry);
++				image_cache_stats_bitmap_add(centry,
++						centry->bitmap);
+ 			} else {
+ 				image_cache->fail_count++;
+ 			}
+@@ -794,6 +821,155 @@ image_cache_snentryf(char *string,
+ }
+ 
+ 
++/* exported interface documented in image_cache.h */
++bool image_cache_decode_size(int width, int height,
++			     int *dest_width, int *dest_height)
++{
++	int cap_width = nsoption_int(max_image_width);
++	int cap_height = nsoption_int(max_image_height);
++	int64_t want_width;
++	int64_t want_height;
++
++	if (width <= 0 || height <= 0) {
++		return false;
++	}
++	if ((cap_width <= 0 || width <= cap_width) &&
++	    (cap_height <= 0 || height <= cap_height)) {
++		return false;
++	}
++
++	/*
++	 * Fit the width first and then the height, because fitting the
++	 * width can leave a tall image still too tall.
++	 */
++	want_width = width;
++	want_height = height;
++	if (cap_width > 0 && want_width > cap_width) {
++		want_height = (want_height * cap_width + want_width / 2) /
++				want_width;
++		want_width = cap_width;
++	}
++	if (cap_height > 0 && want_height > cap_height) {
++		want_width = (want_width * cap_height + want_height / 2) /
++				want_height;
++		want_height = cap_height;
++	}
++	if (want_width < 1) {
++		want_width = 1;
++	}
++	if (want_height < 1) {
++		want_height = 1;
++	}
++
++	*dest_width = (int) want_width;
++	*dest_height = (int) want_height;
++
++	return (*dest_width != width || *dest_height != height);
++}
++
++
++/* exported interface documented in image_cache.h */
++void *image_cache_shrink(void *bitmap, int dest_width, int dest_height)
++{
++	int src_width = guit->bitmap->get_width(bitmap);
++	int src_height = guit->bitmap->get_height(bitmap);
++	bool opaque = guit->bitmap->get_opaque(bitmap);
++	const uint8_t *src;
++	uint8_t *dst;
++	size_t src_stride;
++	size_t dst_stride;
++	void *out;
++	int x;
++	int y;
++
++	if (dest_width < 1 || dest_height < 1 ||
++	    src_width < 1 || src_height < 1 ||
++	    dest_width > src_width || dest_height > src_height) {
++		return NULL;
++	}
++
++	out = guit->bitmap->create(dest_width, dest_height,
++				   opaque ? BITMAP_OPAQUE : BITMAP_NONE);
++	if (out == NULL) {
++		return NULL;
++	}
++
++	src = guit->bitmap->get_buffer(bitmap);
++	dst = guit->bitmap->get_buffer(out);
++	if (src == NULL || dst == NULL) {
++		guit->bitmap->destroy(out);
++		return NULL;
++	}
++	src_stride = guit->bitmap->get_rowstride(bitmap);
++	dst_stride = guit->bitmap->get_rowstride(out);
++
++	for (y = 0; y < dest_height; y++) {
++		int y0 = (int) (((int64_t) y * src_height) / dest_height);
++		int y1 = (int) (((int64_t) (y + 1) * src_height) /
++				dest_height);
++		uint8_t *drow = dst + (size_t) y * dst_stride;
++
++		if (y1 <= y0) {
++			y1 = y0 + 1;
++		}
++
++		for (x = 0; x < dest_width; x++) {
++			int x0 = (int) (((int64_t) x * src_width) /
++					dest_width);
++			int x1 = (int) (((int64_t) (x + 1) * src_width) /
++					dest_width);
++			uint32_t r = 0, g = 0, b = 0, a = 0;
++			uint32_t n = 0;
++			int sx, sy;
++
++			if (x1 <= x0) {
++				x1 = x0 + 1;
++			}
++
++			for (sy = y0; sy < y1; sy++) {
++				const uint8_t *srow = src +
++						(size_t) sy * src_stride;
++
++				for (sx = x0; sx < x1; sx++) {
++					const uint8_t *px = srow + sx * 4;
++					uint32_t pa = px[bitmap_layout.a];
++
++					/*
++					 * Weighted by alpha, so that what a
++					 * transparent pixel happens to hold
++					 * in its colour channels does not
++					 * bleed into the average.
++					 */
++					r += px[bitmap_layout.r] * pa;
++					g += px[bitmap_layout.g] * pa;
++					b += px[bitmap_layout.b] * pa;
++					a += pa;
++					n++;
++				}
++			}
++
++			if (a == 0) {
++				drow[bitmap_layout.r] = 0;
++				drow[bitmap_layout.g] = 0;
++				drow[bitmap_layout.b] = 0;
++				drow[bitmap_layout.a] = 0;
++			} else {
++				drow[bitmap_layout.r] = (uint8_t) (r / a);
++				drow[bitmap_layout.g] = (uint8_t) (g / a);
++				drow[bitmap_layout.b] = (uint8_t) (b / a);
++				drow[bitmap_layout.a] = (uint8_t) (a / n);
++			}
++			drow += 4;
++		}
++	}
++
++	guit->bitmap->set_opaque(out, opaque);
++	guit->bitmap->modified(out);
++
++	return out;
++}
++
++
+ /* exported interface documented in image_cache.h */
+ bool image_cache_redraw(struct content *c,
+ 			struct content_redraw_data *data,
+@@ -816,7 +992,7 @@ bool image_cache_redraw(struct content *c,
+ 		}
+ 
+ 		if (centry->bitmap != NULL) {
+-			image_cache_stats_bitmap_add(centry);
++			image_cache_stats_bitmap_add(centry, centry->bitmap);
+ 			image_cache->miss_count++;
+ 			image_cache->miss_size += centry->bitmap_size;
+ 		} else {
+diff --git a/content/handlers/image/image_cache.h b/content/handlers/image/image_cache.h
+index 1c2d621a6..a1d20f715 100644
+--- a/content/handlers/image/image_cache.h
++++ b/content/handlers/image/image_cache.h
+@@ -169,6 +169,42 @@ int image_cache_snentryf(char *string, size_t size, unsigned int entryn,
+ 
+ int image_cache_snsummaryf(char *string, size_t size, const char *fmt);
+ 
++/********* Decoding images no larger than they can be shown *********/
++
++/**
++ * The size an image should be decoded to.
++ *
++ * Nothing can be shown at more detail than the screen holds, so an
++ * image decoded at its full size spends memory that buys nothing. A
++ * page of thumbnails, each a photograph the camera took, is how a
++ * small machine runs out of heap.
++ *
++ * The limit is the max_image_width and max_image_height options, in
++ * pixels; either at zero means no limit in that direction.
++ *
++ * \param width        The image's own width.
++ * \param height       The image's own height.
++ * \param dest_width   Updated with the width to decode to.
++ * \param dest_height  Updated with the height to decode to.
++ * \return true if the image should be decoded smaller than it is.
++ */
++bool image_cache_decode_size(int width, int height,
++			     int *dest_width, int *dest_height);
++
++/**
++ * A smaller copy of a bitmap, or NULL.
++ *
++ * Averages each block of source pixels the destination pixel covers,
++ * which is what keeps a shrunken photograph from coming out speckled.
++ * The source is left alone; the caller owns both bitmaps afterwards.
++ *
++ * \param bitmap       The bitmap to shrink.
++ * \param dest_width   The width to shrink it to.
++ * \param dest_height  The height to shrink it to.
++ * \return the new bitmap, or NULL if it could not be made.
++ */
++void *image_cache_shrink(void *bitmap, int dest_width, int dest_height);
++
+ /********* Image content handler generic cache callbacks ************/
+ 
+ /**
+diff --git a/content/handlers/image/jpeg.c b/content/handlers/image/jpeg.c
+index 93372f15a..dded52e19 100644
+--- a/content/handlers/image/jpeg.c
++++ b/content/handlers/image/jpeg.c
+@@ -264,6 +264,8 @@ jpeg_cache_convert(struct content *c)
+ 	struct bitmap * volatile bitmap = NULL;
+ 	uint8_t * volatile pixels = NULL;
+ 	size_t rowstride;
++	int want_width = 0;
++	int want_height = 0;
+ 	struct jpeg_source_mgr source_mgr = {
+ 		0,
+ 		0,
+@@ -334,6 +336,30 @@ jpeg_cache_convert(struct content *c)
+ 	}
+ 	cinfo.dct_method = JDCT_ISLOW;
+ 
++	/*
++	 * Decode no larger than the image will ever be shown. libjpeg
++	 * does this inside the transform, so it is faster as well as
++	 * smaller, but it only offers eighths of the original: take the
++	 * smallest one that is still at least the size wanted, and trim
++	 * the remainder afterwards. Sticking to 1/2, 1/4 and 1/8 keeps
++	 * to what every libjpeg can do, not just turbo. (VitaSurf)
++	 */
++	if (image_cache_decode_size(cinfo.image_width, cinfo.image_height,
++				    &want_width, &want_height)) {
++		unsigned int num;
++
++		for (num = 1; num < 8; num <<= 1) {
++			if ((cinfo.image_width * num + 7) / 8 >=
++					(unsigned int) want_width &&
++			    (cinfo.image_height * num + 7) / 8 >=
++					(unsigned int) want_height) {
++				break;
++			}
++		}
++		cinfo.scale_num = num;
++		cinfo.scale_denom = 8;
++	}
++
+ 	/* commence the decompression, output parameters now valid */
+ 	jpeg_start_decompress(&cinfo);
+ 
+@@ -377,6 +403,16 @@ jpeg_cache_convert(struct content *c)
+ 	jpeg_finish_decompress(&cinfo);
+ 	jpeg_destroy_decompress(&cinfo);
+ 
++	if (want_width > 0 && (int) cinfo.output_width > want_width) {
++		struct bitmap *smaller = image_cache_shrink(bitmap,
++				want_width, want_height);
++
++		if (smaller != NULL) {
++			guit->bitmap->destroy(bitmap);
++			bitmap = smaller;
++		}
++	}
++
+ 	return bitmap;
+ }
+ 
+diff --git a/content/handlers/image/png.c b/content/handlers/image/png.c
+index 97a5795b3..7fd3d514b 100644
+--- a/content/handlers/image/png.c
++++ b/content/handlers/image/png.c
+@@ -539,12 +539,35 @@ png_cache_convert_error:
+ 
+ 	if (bitmap != NULL) {
+ 		bool opaque = bitmap_test_opaque((void *)bitmap);
++		int want_width;
++		int want_height;
++
+ 		guit->bitmap->set_opaque((void *)bitmap, opaque);
+ 		bitmap_format_to_client((void *)bitmap, &(bitmap_fmt_t) {
+ 			.layout = bitmap_fmt.layout,
+ 			.pma = opaque ? bitmap_fmt.pma : false,
+ 		});
+ 		guit->bitmap->modified((void *)bitmap);
++
++	/*
++	 * Nothing can show more of an image than the screen holds, so
++	 * a photograph decoded at its own size spends memory that buys
++	 * nothing. libpng has no scaling of its own, so this costs one
++	 * pass over the pixels; what it saves is what the image cache
++	 * then holds on to. (VitaSurf)
++	 */
++		if (image_cache_decode_size(
++				guit->bitmap->get_width((void *)bitmap),
++				guit->bitmap->get_height((void *)bitmap),
++				&want_width, &want_height)) {
++			void *smaller = image_cache_shrink((void *)bitmap,
++					want_width, want_height);
++
++			if (smaller != NULL) {
++				guit->bitmap->destroy((void *)bitmap);
++				bitmap = smaller;
++			}
++		}
+ 	}
+ 
+ 	return (struct bitmap *)bitmap;
+@@ -572,12 +595,33 @@ static bool nspng_convert(struct content *c)
+ 
+ 	if (png_c->bitmap != NULL) {
+ 		bool opaque = bitmap_test_opaque(png_c->bitmap);
++		int want_width;
++		int want_height;
++
+ 		guit->bitmap->set_opaque(png_c->bitmap, opaque);
+ 		bitmap_format_to_client(png_c->bitmap, &(bitmap_fmt_t) {
+ 			.layout = bitmap_fmt.layout,
+ 			.pma = opaque ? bitmap_fmt.pma : false,
+ 		});
+ 		guit->bitmap->modified(png_c->bitmap);
++
++	/*
++	 * Nothing can show more of an image than the screen holds, so
++	 * a photograph decoded at its own size spends memory that buys
++	 * nothing. libpng has no scaling of its own, so this costs one
++	 * pass over the pixels; what it saves is what the image cache
++	 * then holds on to. (VitaSurf)
++	 */
++		if (image_cache_decode_size(c->width, c->height,
++					    &want_width, &want_height)) {
++			void *smaller = image_cache_shrink(png_c->bitmap,
++					want_width, want_height);
++
++			if (smaller != NULL) {
++				guit->bitmap->destroy(png_c->bitmap);
++				png_c->bitmap = smaller;
++			}
++		}
+ 	}
+ 
+ 	image_cache_add(c, png_c->bitmap, png_cache_convert);
+diff --git a/desktop/options.h b/desktop/options.h
+index 397d56598..f25d45cea 100644
+--- a/desktop/options.h
++++ b/desktop/options.h
+@@ -123,6 +123,19 @@ NSOPTION_BOOL(background_images, true)
+ /** Whether to animate images */
+ NSOPTION_BOOL(animate_images, true)
+ 
++/**
++ * Widest an image is decoded, in pixels; 0 for no limit.
++ *
++ * Detail beyond what the screen can show costs memory and buys nothing,
++ * and on a small machine a page of full size photographs is what uses
++ * the heap up. The image is still laid out at its own size; only the
++ * pixels behind it are fewer. (VitaSurf)
++ */
++NSOPTION_INTEGER(max_image_width, 0)
++
++/** Tallest an image is decoded, in pixels; 0 for no limit. (VitaSurf) */
++NSOPTION_INTEGER(max_image_height, 0)
++
+ /** Whether to execute javascript */
+ NSOPTION_BOOL(enable_javascript, false)
+ 
