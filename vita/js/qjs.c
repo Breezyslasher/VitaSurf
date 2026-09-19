@@ -3444,15 +3444,28 @@ static void end_script(jsthread *thread)
 	 * did nothing wrong.
 	 */
 	rearm_deadline(thread);
-	for (;;) {
-		JSContext *c = NULL;
-		int r = JS_ExecutePendingJob(thread->heap->rt, &c);
-		if (r <= 0) {
-			if (r < 0 && c != NULL) {
-				qjs_report_exception(c);
+	{
+		/*
+		 * What the microtask queue costs (VitaSurf). This runs
+		 * after the script bucket above has been closed, so until
+		 * now it was in no bucket at all -- and it is where async,
+		 * await and every .then() continuation on the page
+		 * actually run.
+		 */
+		uint64_t j0 = now_ms();
+
+		for (;;) {
+			JSContext *c = NULL;
+			int r = JS_ExecutePendingJob(thread->heap->rt, &c);
+			if (r <= 0) {
+				if (r < 0 && c != NULL) {
+					qjs_report_exception(c);
+				}
+				break;
 			}
-			break;
+			vitasurf_js_jobs++;
 		}
+		vitasurf_ms_js_jobs += (unsigned)(now_ms() - j0);
 	}
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;

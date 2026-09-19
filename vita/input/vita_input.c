@@ -1099,6 +1099,10 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_js_timer, vitasurf_js_timers,
 				 vitasurf_ms_js_event, vitasurf_js_events,
 				 vitasurf_ms_js_xhr, vitasurf_js_xhrs);
+			vita_log("page: and %u promise jobs after those, "
+				 "costing %u ms, which the script figure "
+				 "does not include",
+				 vitasurf_js_jobs, vitasurf_ms_js_jobs);
 			vita_log("page: laid out %u times, measuring text "
 				 "%u times over %u characters, %u ms of it "
 				 "inside the font engine",
