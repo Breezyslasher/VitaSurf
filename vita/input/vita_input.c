@@ -1106,9 +1106,16 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_js_xhr, vitasurf_js_xhrs);
 			vita_log("page: and %u promise jobs after those, "
 				 "costing %u ms, the longest %u ms, which "
-				 "the script figure does not include",
+				 "the script figure does not include; %u of "
+				 "them took 5 ms or more and account for "
+				 "%u ms",
 				 vitasurf_js_jobs, vitasurf_ms_js_jobs,
-				 vitasurf_ms_js_job_max);
+				 vitasurf_ms_js_job_max,
+				 vitasurf_js_jobs_slow,
+				 vitasurf_ms_js_jobs_slow);
+			vita_log("page: the page asked the tree for elements "
+				 "%u times, costing %u ms",
+				 vitasurf_js_finds, vitasurf_ms_js_finds);
 			vita_log("page: laid out %u times, measuring text "
 				 "%u times over %u characters, %u ms of it "
 				 "inside the font engine",

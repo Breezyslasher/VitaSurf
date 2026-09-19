@@ -3465,11 +3465,14 @@ static void end_script(jsthread *thread)
 			}
 			{
 				uint64_t j1 = now_ms();
+				unsigned took = (unsigned)(j1 - jlast);
 
-				if ((unsigned)(j1 - jlast) >
-						vitasurf_ms_js_job_max) {
-					vitasurf_ms_js_job_max =
-						(unsigned)(j1 - jlast);
+				if (took > vitasurf_ms_js_job_max) {
+					vitasurf_ms_js_job_max = took;
+				}
+				if (took >= 5) {
+					vitasurf_js_jobs_slow++;
+					vitasurf_ms_js_jobs_slow += took;
 				}
 				jlast = j1;
 			}
@@ -4599,8 +4602,28 @@ static bool key_matches(struct dom_node *n, const struct find_key *k,
  * __vitaFind(root, keys): every element under root matching at least one
  * key, in document order. root may be a node or null for the document.
  */
+static JSValue vita_find_impl(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv);
+
+/*
+ * The same, counted and timed (VitaSurf). This walks the tree, and a
+ * page whose promise jobs cost a millisecond each may simply be asking
+ * it to do so a great many times. It has several exits, so the timing
+ * wraps it rather than being threaded through each one.
+ */
 static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 			     int argc, JSValueConst *argv)
+{
+	uint64_t t0 = now_ms();
+	JSValue r = vita_find_impl(ctx, this_val, argc, argv);
+
+	vitasurf_js_finds++;
+	vitasurf_ms_js_finds += (unsigned)(now_ms() - t0);
+	return r;
+}
+
+static JSValue vita_find_impl(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *root = NULL;
