@@ -1277,6 +1277,7 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
 	vitasurf_js_attr_sets++;
+	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name, *value;
 	dom_string *key, *val;
@@ -1307,7 +1308,10 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 	if (val) dom_string_unref(val);
 	if (name) JS_FreeCString(ctx, name);
 	if (value) JS_FreeCString(ctx, value);
+	vitasurf_ms_js_attr_time += (unsigned)(now_ms() - t0);
 	return JS_UNDEFINED;
+	}
+
 }
 
 static JSValue node_has_attribute(JSContext *ctx, JSValueConst this_val,
@@ -1758,6 +1762,7 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
 	vitasurf_js_dom_edits++;
+	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *before = NULL, *ref = NULL;
 	JSValue added;
@@ -1781,7 +1786,10 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 		dom_node_unref(ref);
 	}
 	notify_mutation(ctx, "childList", node, added, JS_NULL);
+	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
 	return JS_DupValue(ctx, argv[0]);
+	}
+
 }
 
 static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
@@ -1906,6 +1914,7 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
 	vitasurf_js_dom_edits++;
+	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *ref = NULL;
 	JSValue added;
@@ -1920,13 +1929,17 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 		dom_node_unref(ref);
 	}
 	notify_mutation(ctx, "childList", node, added, JS_NULL);
+	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
 	return JS_DupValue(ctx, argv[0]);
+	}
+
 }
 
 static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
 	vitasurf_js_dom_edits++;
+	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *ref = NULL;
 
@@ -1939,7 +1952,10 @@ static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 	}
 	notify_mutation(ctx, "childList", node,
 			JS_NULL, JS_DupValue(ctx, argv[0]));
+	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
 	return JS_DupValue(ctx, argv[0]);
+	}
+
 }
 
 /* Replace the element's children with parsed HTML (innerHTML setter). */
@@ -1951,6 +1967,7 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	struct dom_document_fragment *fragment = NULL;
 	struct dom_node *child = NULL, *htmlnode = NULL, *body = NULL;
 	struct dom_nodelist *bodies = NULL;
+	uint64_t t_stage = now_ms();
 
 	if (dom_node_get_owner_document(node, &doc) != DOM_NO_ERR) {
 		return;
@@ -2001,6 +2018,8 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	if (dom_hubbub_parser_completed(parser) != DOM_HUBBUB_OK) {
 		goto out;
 	}
+	vitasurf_ms_html_js_parse += (unsigned)(now_ms() - t_stage);
+	t_stage = now_ms();
 	/* empty the target */
 	dom_node_get_first_child(node, &child);
 	while (child != NULL) {
@@ -2033,6 +2052,8 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	 * So walk the fragment's children: take an <html> element apart
 	 * section by section, and move anything else across as it stands.
 	 */
+	vitasurf_ms_html_js_empty += (unsigned)(now_ms() - t_stage);
+	t_stage = now_ms();
 	dom_node_get_first_child(fragment, &htmlnode);
 	while (htmlnode != NULL) {
 		struct dom_node *after = NULL, *cref = NULL;
@@ -2083,6 +2104,7 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 		dom_node_unref(htmlnode);
 		htmlnode = after;
 	}
+	vitasurf_ms_html_js_move += (unsigned)(now_ms() - t_stage);
 out:
 	if (parser) dom_hubbub_parser_destroy(parser);
 	if (doc) dom_node_unref(doc);
@@ -3811,7 +3833,45 @@ static void timer_callback(void *p)
 	ctx = thread->ctx;
 	begin_script(thread, SCRIPT_TIMER);
 	global = JS_GetGlobalObject(ctx);
-	ret = JS_Call(ctx, t->func, global, 0, NULL);
+	{
+		/*
+		 * How long this one took, and what it was (VitaSurf).
+		 * Wikipedia's 89 timers come to 23103 ms with almost no
+		 * DOM work in them, and an average cannot say whether
+		 * that is one enormous callback or a crowd of middling
+		 * ones; the name says which part of the page it is.
+		 */
+		uint64_t t0 = now_ms();
+		unsigned took;
+
+		ret = JS_Call(ctx, t->func, global, 0, NULL);
+		took = (unsigned)(now_ms() - t0);
+
+		if (took >= 50) {
+			vitasurf_js_timers_slow++;
+			vitasurf_ms_js_timers_slow += took;
+		}
+		if (took > vitasurf_ms_js_timer_max) {
+			JSValue nm = JS_GetPropertyStr(ctx, t->func, "name");
+			const char *ns = JS_ToCString(ctx, nm);
+
+			vitasurf_ms_js_timer_max = took;
+			if (ns != NULL && ns[0] != '\0') {
+				strncpy(vitasurf_js_timer_max_name, ns,
+					sizeof(vitasurf_js_timer_max_name) - 1);
+				vitasurf_js_timer_max_name[
+					sizeof(vitasurf_js_timer_max_name)
+						- 1] = '\0';
+			} else {
+				strcpy(vitasurf_js_timer_max_name,
+				       "(anonymous)");
+			}
+			if (ns != NULL) {
+				JS_FreeCString(ctx, ns);
+			}
+			JS_FreeValue(ctx, nm);
+		}
+	}
 	if (JS_IsException(ret)) {
 		qjs_report_exception(ctx);
 	}

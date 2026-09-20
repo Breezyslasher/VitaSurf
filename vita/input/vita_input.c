@@ -1139,6 +1139,23 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_js_style_reads,
 				 vitasurf_js_html_sets,
 				 vitasurf_js_html_bytes);
+			vita_log("page: those innerHTML sets were %u ms "
+				 "parsing, %u ms emptying the target and "
+				 "%u ms moving the nodes in; setAttribute "
+				 "cost %u ms and the tree edits %u ms",
+				 vitasurf_ms_html_js_parse,
+				 vitasurf_ms_html_js_empty,
+				 vitasurf_ms_html_js_move,
+				 vitasurf_ms_js_attr_time,
+				 vitasurf_ms_js_edit_time);
+			vita_log("page: the longest timer was '%s' at %u ms; "
+				 "%u of the %u ran 50 ms or more and account "
+				 "for %u ms",
+				 vitasurf_js_timer_max_name[0] != '\0' ?
+					vitasurf_js_timer_max_name : "?",
+				 vitasurf_ms_js_timer_max,
+				 vitasurf_js_timers_slow, vitasurf_js_timers,
+				 vitasurf_ms_js_timers_slow);
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
