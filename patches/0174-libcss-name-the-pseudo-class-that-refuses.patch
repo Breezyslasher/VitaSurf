@@ -1,0 +1,69 @@
+diff --git a/src/select/select.c b/src/select/select.c
+index 83898be..619b070 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -162,6 +162,21 @@ unsigned int css_select_refused_by_attribute;
+ unsigned int css_select_refused_by_pseudo_class;
+ unsigned int css_select_refused_by_pseudo_element;
+ unsigned int css_select_refused_by_other;
++/*
++ * And which pseudo-class (VitaSurf). 15,615,658 of a GitHub load's
++ * 16,742,288 compound refusals are a pseudo-class, and the fix depends
++ * entirely on which: only 18 of 990 universal key compounds in that
++ * site's real CSS ask for :hover, :active, :focus or :target, so a
++ * skip built on those four was worth 1.8% and was withdrawn. :not() is
++ * carried as a negate flag on the detail it wraps rather than as a
++ * pseudo-class of its own, so it is counted separately.
++ */
++unsigned int css_select_pseudo_dynamic;
++unsigned int css_select_pseudo_structural;
++unsigned int css_select_pseudo_form;
++unsigned int css_select_pseudo_has;
++unsigned int css_select_pseudo_other;
++unsigned int css_select_refused_negated;
+ 
+ static css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet, css_select_state *state);
+@@ -2787,9 +2802,42 @@ css_error match_details(css_select_ctx *ctx, void *node,
+ 		/* Detail doesn't match, so reject selector chain */
+ 		if (*match == false) {
+ 			/* say which kind of detail refused it (VitaSurf) */
++			if (detail->negate != 0)
++				css_select_refused_negated++;
+ 			switch (detail->type) {
+ 			case CSS_SELECTOR_PSEUDO_CLASS:
+ 				css_select_refused_by_pseudo_class++;
++				{
++					lwc_string *pn = detail->qname.name;
++
++					if (pn == ctx->str.hover ||
++					    pn == ctx->str.active ||
++					    pn == ctx->str.focus ||
++					    pn == ctx->str.target ||
++					    pn == ctx->str.link ||
++					    pn == ctx->str.visited) {
++						css_select_pseudo_dynamic++;
++					} else if (pn == ctx->str.first_child ||
++					    pn == ctx->str.last_child ||
++					    pn == ctx->str.only_child ||
++					    pn == ctx->str.nth_child ||
++					    pn == ctx->str.nth_last_child ||
++					    pn == ctx->str.nth_of_type ||
++					    pn == ctx->str.nth_last_of_type ||
++					    pn == ctx->str.first_of_type ||
++					    pn == ctx->str.last_of_type ||
++					    pn == ctx->str.only_of_type) {
++						css_select_pseudo_structural++;
++					} else if (pn == ctx->str.enabled ||
++					    pn == ctx->str.disabled ||
++					    pn == ctx->str.checked) {
++						css_select_pseudo_form++;
++					} else if (pn == ctx->str.has) {
++						css_select_pseudo_has++;
++					} else {
++						css_select_pseudo_other++;
++					}
++				}
+ 				break;
+ 			case CSS_SELECTOR_PSEUDO_ELEMENT:
+ 				css_select_refused_by_pseudo_element++;

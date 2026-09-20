@@ -3544,15 +3544,27 @@ static void end_script(jsthread *thread)
 
 			r = JS_ExecutePendingJob(thread->heap->rt, &c);
 			if (r <= 0) {
+				unsigned took = (unsigned)(now_ms() - d0);
+
 				/*
-				 * the call that finds nothing left, which
-				 * is the only part of the loop outside a
-				 * job (VitaSurf)
+				 * A negative return is a job that ran and
+				 * threw, not an empty queue, and its time
+				 * is a job's time (VitaSurf). Counting the
+				 * two together reported 7205 ms across 68
+				 * drains for a call that does nothing.
 				 */
-				vitasurf_ms_js_drain_tail +=
-					(unsigned)(now_ms() - d0);
-				if (r < 0 && c != NULL) {
-					qjs_report_exception(c);
+				if (r < 0) {
+					vitasurf_js_jobs_threw++;
+					vitasurf_ms_js_jobs_threw += took;
+					vitasurf_ms_js_jobs_sum += took;
+					if (took > vitasurf_ms_js_job_max) {
+						vitasurf_ms_js_job_max = took;
+					}
+					if (c != NULL) {
+						qjs_report_exception(c);
+					}
+				} else {
+					vitasurf_ms_js_drain_tail += took;
 				}
 				break;
 			}

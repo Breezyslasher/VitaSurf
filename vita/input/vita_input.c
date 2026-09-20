@@ -1173,10 +1173,13 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_js_attr_get_time,
 				 vitasurf_job_max_wraps,
 				 vitasurf_job_max_attr_gets);
-			vita_log("page: the drain ran %u times and %u ms of "
-				 "it was the call that found nothing left",
+			vita_log("page: the drain ran %u times, %u ms of it "
+				 "was the call that found nothing left, and "
+				 "%u jobs threw, costing %u ms",
 				 vitasurf_js_drains,
-				 vitasurf_ms_js_drain_tail);
+				 vitasurf_ms_js_drain_tail,
+				 vitasurf_js_jobs_threw,
+				 vitasurf_ms_js_jobs_threw);
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
@@ -1214,6 +1217,12 @@ void vita_input_load_finished(struct gui_window *gw)
 					css_select_refused_by_pseudo_element;
 				extern unsigned int
 					css_select_refused_by_other;
+				extern unsigned int css_select_pseudo_dynamic;
+				extern unsigned int css_select_pseudo_structural;
+				extern unsigned int css_select_pseudo_form;
+				extern unsigned int css_select_pseudo_has;
+				extern unsigned int css_select_pseudo_other;
+				extern unsigned int css_select_refused_negated;
 
 				vita_log("page: building those boxes was %u ms in "
 				 "the elements and %u ms in %u text nodes, "
@@ -1270,6 +1279,16 @@ void vita_input_load_finished(struct gui_window *gw)
 					 css_select_refused_by_pseudo_class,
 					 css_select_refused_by_pseudo_element,
 					 css_select_refused_by_other);
+				vita_log("page: the pseudo-class ones were "
+					 "%u dynamic, %u structural, %u form, "
+					 "%u :has and %u other; %u refusals "
+					 "of any kind were negated",
+					 css_select_pseudo_dynamic,
+					 css_select_pseudo_structural,
+					 css_select_pseudo_form,
+					 css_select_pseudo_has,
+					 css_select_pseudo_other,
+					 css_select_refused_negated);
 			}
 			vita_log("page: attribute selectors asked for a name "
 				 "%u times, interning it %u of them",

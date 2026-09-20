@@ -1,0 +1,70 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index d775f6c86..c43fcab24 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -641,6 +641,8 @@ unsigned int vitasurf_js_drains;
+ unsigned int vitasurf_ms_js_drain_tail;
+ unsigned int vitasurf_job_max_wraps;
+ unsigned int vitasurf_job_max_attr_gets;
++unsigned int vitasurf_js_jobs_threw;
++unsigned int vitasurf_ms_js_jobs_threw;
+ /* counted inside libcss, reset here with the rest (VitaSurf) */
+ extern unsigned int css_select_calls;
+ extern unsigned int css_select_sheets_seen;
+@@ -656,6 +658,12 @@ extern unsigned int css_select_refused_by_attribute;
+ extern unsigned int css_select_refused_by_pseudo_class;
+ extern unsigned int css_select_refused_by_pseudo_element;
+ extern unsigned int css_select_refused_by_other;
++extern unsigned int css_select_pseudo_dynamic;
++extern unsigned int css_select_pseudo_structural;
++extern unsigned int css_select_pseudo_form;
++extern unsigned int css_select_pseudo_has;
++extern unsigned int css_select_pseudo_other;
++extern unsigned int css_select_refused_negated;
+ 
+ unsigned int vitasurf_ms_select;
+ unsigned int vitasurf_box_elements;
+@@ -750,6 +758,8 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_drain_tail = 0;
+ 	vitasurf_job_max_wraps = 0;
+ 	vitasurf_job_max_attr_gets = 0;
++	vitasurf_js_jobs_threw = 0;
++	vitasurf_ms_js_jobs_threw = 0;
+ 	css_select_calls = 0;
+ 	css_select_sheets_seen = 0;
+ 	css_select_selectors_considered = 0;
+@@ -764,6 +774,12 @@ void vitasurf_profile_reset(void)
+ 	css_select_refused_by_pseudo_class = 0;
+ 	css_select_refused_by_pseudo_element = 0;
+ 	css_select_refused_by_other = 0;
++	css_select_pseudo_dynamic = 0;
++	css_select_pseudo_structural = 0;
++	css_select_pseudo_form = 0;
++	css_select_pseudo_has = 0;
++	css_select_pseudo_other = 0;
++	css_select_refused_negated = 0;
+ 	vitasurf_ms_select = 0;
+ 	vitasurf_box_elements = 0;
+ 	vitasurf_attr_interned_hits = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 619f61a78..4c0189aa4 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -337,6 +337,17 @@ extern unsigned int vitasurf_js_drains;
+ extern unsigned int vitasurf_ms_js_drain_tail;
+ extern unsigned int vitasurf_job_max_wraps;
+ extern unsigned int vitasurf_job_max_attr_gets;
++/**
++ * Promise jobs that threw (VitaSurf).
++ *
++ * JS_ExecutePendingJob returns a negative number when it ran a job and
++ * that job raised, and zero when there was nothing left. The drain
++ * counted both as "nothing left" and reported 7205 ms across 68 drains
++ * for a call that should be instant. Split them: a job that throws is a
++ * job, and its time belongs with the others.
++ */
++extern unsigned int vitasurf_js_jobs_threw;
++extern unsigned int vitasurf_ms_js_jobs_threw;
+ 
+ /*
+  * The scheduler's callbacks (VitaSurf). A GitHub page load reports
