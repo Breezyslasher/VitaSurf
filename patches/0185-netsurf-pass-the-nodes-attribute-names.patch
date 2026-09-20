@@ -1,0 +1,114 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 9c2116440..b56b4a6d7 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -74,7 +74,8 @@ static css_error node_has_attribute_substring(void *pw, void *node,
+ 		const css_qname *qname, lwc_string *value,
+ 		bool *match);
+ static css_error node_is_root(void *pw, void *node, bool *match);
+-static css_error node_attribute_bloom(void *pw, void *node, uint64_t *bloom);
++static css_error node_attribute_hashes(void *pw, void *node,
++		uint32_t *hashes, uint32_t *n_hashes);
+ static css_error node_count_siblings(void *pw, void *node,
+ 		bool same_name, bool after, int32_t *count);
+ static css_error node_is_empty(void *pw, void *node, bool *match);
+@@ -140,7 +141,7 @@ static css_select_handler selection_handler = {
+ 
+ 	first_child_node,
+ 	next_sibling_node,
+-	node_attribute_bloom,
++	node_attribute_hashes,
+ };
+ 
+ /**
+@@ -1413,37 +1414,37 @@ css_error node_is_root(void *pw, void *node, bool *match)
+ }
+ 
+ /**
+- * The names of a node's attributes, as a bloom (VitaSurf).
++ * The names of a node's attributes, hashed (VitaSurf).
+  *
+- * libcss uses this to drop a rule whose key compound needs an
+- * attribute the node has not got, rather than offering it and then
+- * refusing it. 94% of the candidates a GitHub page offers come from
+- * the universal chain and most of those are attribute rules, so one
+- * walk of the node's own attributes here saves hundreds of refusals
+- * per element per sheet.
++ * libcss files a rule whose key compound needs an attribute under that
++ * attribute's name and searches only the buckets a node's own names
++ * fall in. 94% of the candidates a GitHub page offers came from the
++ * chain those rules used to share, which every element walked from end
++ * to end.
+  *
+- * The filter only ever removes work: a node whose attributes cannot
+- * be read answers with every bit set, which skips nothing.
++ * A node with more attributes than fit says so by leaving the count
++ * above the maximum, and every bucket is searched: the filing only
++ * ever removes work, and must never remove a rule that could match.
+  */
+-css_error node_attribute_bloom(void *pw, void *node, uint64_t *bloom)
++css_error node_attribute_hashes(void *pw, void *node, uint32_t *hashes,
++		uint32_t *n_hashes)
+ {
+ 	dom_node *n = node;
+ 	dom_namednodemap *attrs = NULL;
+ 	dom_exception err;
+-	uint32_t i, len = 0;
+-	uint64_t bits = 0;
++	uint32_t i, len = 0, out = 0;
+ 
+ 	(void) pw;
+ 
++	*n_hashes = CSS_ATTRIBUTE_HASHES_MAX + 1;
++
+ 	err = dom_node_get_attributes(n, &attrs);
+ 	if (err != DOM_NO_ERR || attrs == NULL) {
+-		*bloom = ~(uint64_t) 0;
+ 		return CSS_OK;
+ 	}
+ 	err = dom_namednodemap_get_length(attrs, &len);
+ 	if (err != DOM_NO_ERR) {
+ 		dom_namednodemap_unref(attrs);
+-		*bloom = ~(uint64_t) 0;
+ 		return CSS_OK;
+ 	}
+ 	for (i = 0; i < len; i++) {
+@@ -1460,23 +1461,33 @@ css_error node_attribute_bloom(void *pw, void *node, uint64_t *bloom)
+ 			size_t l = dom_string_byte_length(name);
+ 			const char *colon = memchr(d, ':', l);
+ 
+-			bits |= css_attribute_bloom_bits(d, l);
++			if (out < CSS_ATTRIBUTE_HASHES_MAX) {
++				hashes[out++] = css_attribute_name_hash(d, l);
++			} else {
++				out = CSS_ATTRIBUTE_HASHES_MAX + 1;
++			}
+ 			/*
+ 			 * A selector names the local part on its own, so
+ 			 * xlink:href must answer to href as well or the
+-			 * rule would be skipped rather than tested.
++			 * rule would be filed where nothing looks.
+ 			 */
+-			if (colon != NULL) {
+-				bits |= css_attribute_bloom_bits(colon + 1,
++			if (colon != NULL && out < CSS_ATTRIBUTE_HASHES_MAX) {
++				hashes[out++] = css_attribute_name_hash(
++						colon + 1,
+ 						l - (size_t) (colon + 1 - d));
++			} else if (colon != NULL) {
++				out = CSS_ATTRIBUTE_HASHES_MAX + 1;
+ 			}
+ 			dom_string_unref(name);
+ 		}
+ 		dom_node_unref(attr);
++		if (out > CSS_ATTRIBUTE_HASHES_MAX) {
++			break;
++		}
+ 	}
+ 	dom_namednodemap_unref(attrs);
+ 
+-	*bloom = bits;
++	*n_hashes = out;
+ 
+ 	return CSS_OK;
+ }
