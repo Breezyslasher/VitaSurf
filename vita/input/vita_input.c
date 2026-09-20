@@ -1173,6 +1173,22 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_js_attr_get_time,
 				 vitasurf_job_max_wraps,
 				 vitasurf_job_max_attr_gets);
+			vita_log("page: childNodes was rebuilt %u times for "
+				 "%u children in all (%u a list), costing "
+				 "%u ms; the siblings and parents were "
+				 "walked %u times for %u ms",
+				 vitasurf_js_childnodes,
+				 vitasurf_js_childnodes_items,
+				 vitasurf_js_childnodes ?
+					vitasurf_js_childnodes_items /
+						vitasurf_js_childnodes : 0,
+				 vitasurf_ms_js_childnodes,
+				 vitasurf_js_tree_reads,
+				 vitasurf_ms_js_tree_reads);
+			vita_log("page: the longest job did %u of those "
+				 "rebuilds and %u of those walks",
+				 vitasurf_job_max_childnodes,
+				 vitasurf_job_max_tree_reads);
 			vita_log("page: the drain ran %u times, %u ms of it "
 				 "was the call that found nothing left, and "
 				 "%u jobs threw, costing %u ms",

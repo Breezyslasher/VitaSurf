@@ -1062,6 +1062,8 @@ static JSValue node_set_class_name(JSContext *ctx, JSValueConst this_val,
 
 static JSValue node_get_parent(JSContext *ctx, JSValueConst this_val)
 {
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *p = NULL;
 	JSValue r;
@@ -1070,11 +1072,16 @@ static JSValue node_get_parent(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_parent_node(node, &p);
 	r = wrap_node(ctx, p);
 	if (p != NULL) dom_node_unref(p);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_first_child(JSContext *ctx, JSValueConst this_val)
 {
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue r;
@@ -1083,11 +1090,16 @@ static JSValue node_get_first_child(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_first_child(node, &c);
 	r = wrap_node(ctx, c);
 	if (c != NULL) dom_node_unref(c);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_next_sibling(JSContext *ctx, JSValueConst this_val)
 {
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue r;
@@ -1096,11 +1108,16 @@ static JSValue node_get_next_sibling(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_next_sibling(node, &c);
 	r = wrap_node(ctx, c);
 	if (c != NULL) dom_node_unref(c);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_last_child(JSContext *ctx, JSValueConst this_val)
 {
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue r;
@@ -1109,11 +1126,16 @@ static JSValue node_get_last_child(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_last_child(node, &c);
 	r = wrap_node(ctx, c);
 	if (c != NULL) dom_node_unref(c);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
 {
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue r;
@@ -1122,7 +1144,10 @@ static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_previous_sibling(node, &c);
 	r = wrap_node(ctx, c);
 	if (c != NULL) dom_node_unref(c);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 /*
@@ -1140,7 +1165,12 @@ static JSValue node_get_child_nodes(JSContext *ctx, JSValueConst this_val)
 	JSValue arr;
 	uint32_t i = 0;
 
+	uint64_t t0;
+
 	if (node == NULL) return JS_EXCEPTION;
+	/* rebuilt on every read, so count what that costs (VitaSurf) */
+	vitasurf_js_childnodes++;
+	t0 = now_ms();
 	arr = JS_NewArray(ctx);
 	if (dom_node_get_first_child(node, &c) != DOM_NO_ERR) {
 		c = NULL;
@@ -1155,6 +1185,8 @@ static JSValue node_get_child_nodes(JSContext *ctx, JSValueConst this_val)
 		dom_node_unref(c);
 		c = next;
 	}
+	vitasurf_js_childnodes_items += i;
+	vitasurf_ms_js_childnodes += (unsigned)(now_ms() - t0);
 	return arr;
 }
 
@@ -3535,6 +3567,8 @@ static void end_script(jsthread *thread)
 		unsigned b_styles = vitasurf_js_style_reads;
 		unsigned b_wraps = vitasurf_js_node_wraps;
 		unsigned b_agets = vitasurf_js_attr_gets;
+		unsigned b_cn = vitasurf_js_childnodes;
+		unsigned b_tr = vitasurf_js_tree_reads;
 
 		vitasurf_js_drains++;
 		for (;;) {
@@ -3599,6 +3633,12 @@ static void end_script(jsthread *thread)
 					vitasurf_job_max_attr_gets =
 						vitasurf_js_attr_gets -
 							b_agets;
+					vitasurf_job_max_childnodes =
+						vitasurf_js_childnodes -
+							b_cn;
+					vitasurf_job_max_tree_reads =
+						vitasurf_js_tree_reads -
+							b_tr;
 				}
 				if (took >= 5) {
 					vitasurf_js_jobs_slow++;
@@ -3620,6 +3660,8 @@ static void end_script(jsthread *thread)
 				b_styles = vitasurf_js_style_reads;
 				b_wraps = vitasurf_js_node_wraps;
 				b_agets = vitasurf_js_attr_gets;
+				b_cn = vitasurf_js_childnodes;
+				b_tr = vitasurf_js_tree_reads;
 			}
 			vitasurf_js_jobs++;
 		}

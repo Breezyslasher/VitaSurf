@@ -1,0 +1,63 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 41720d14e..844dd55f8 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -643,6 +643,13 @@ unsigned int vitasurf_job_max_wraps;
+ unsigned int vitasurf_job_max_attr_gets;
+ unsigned int vitasurf_js_jobs_threw;
+ unsigned int vitasurf_ms_js_jobs_threw;
++unsigned int vitasurf_js_childnodes;
++unsigned int vitasurf_js_childnodes_items;
++unsigned int vitasurf_ms_js_childnodes;
++unsigned int vitasurf_js_tree_reads;
++unsigned int vitasurf_ms_js_tree_reads;
++unsigned int vitasurf_job_max_childnodes;
++unsigned int vitasurf_job_max_tree_reads;
+ /* counted inside libcss, reset here with the rest (VitaSurf) */
+ extern unsigned int css_select_calls;
+ extern unsigned int css_select_sheets_seen;
+@@ -768,6 +775,13 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_job_max_attr_gets = 0;
+ 	vitasurf_js_jobs_threw = 0;
+ 	vitasurf_ms_js_jobs_threw = 0;
++	vitasurf_js_childnodes = 0;
++	vitasurf_js_childnodes_items = 0;
++	vitasurf_ms_js_childnodes = 0;
++	vitasurf_js_tree_reads = 0;
++	vitasurf_ms_js_tree_reads = 0;
++	vitasurf_job_max_childnodes = 0;
++	vitasurf_job_max_tree_reads = 0;
+ 	css_select_calls = 0;
+ 	css_select_sheets_seen = 0;
+ 	css_select_selectors_considered = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 4c0189aa4..42e03d673 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -348,6 +348,26 @@ extern unsigned int vitasurf_job_max_attr_gets;
+  */
+ extern unsigned int vitasurf_js_jobs_threw;
+ extern unsigned int vitasurf_ms_js_jobs_threw;
++/**
++ * What a tree walk costs (VitaSurf).
++ *
++ * One promise job on a GitHub load runs 11,727 ms and the bindings
++ * counted so far come to about 3.2 s of it. That job was handed a node
++ * 148,096 times for a document of 6,270 elements -- two dozen handoffs
++ * each -- and childNodes builds a fresh array every time it is read,
++ * wrapping every child again. A loop of the shape
++ * "for (i = 0; i < n.childNodes.length; i++) n.childNodes[i]" is then
++ * quadratic in the children. Count the rebuilds and the children they
++ * produce, so the average list length is in the log, and time the
++ * sibling and parent walks beside them.
++ */
++extern unsigned int vitasurf_js_childnodes;
++extern unsigned int vitasurf_js_childnodes_items;
++extern unsigned int vitasurf_ms_js_childnodes;
++extern unsigned int vitasurf_js_tree_reads;
++extern unsigned int vitasurf_ms_js_tree_reads;
++extern unsigned int vitasurf_job_max_childnodes;
++extern unsigned int vitasurf_job_max_tree_reads;
+ 
+ /*
+  * The scheduler's callbacks (VitaSurf). A GitHub page load reports
