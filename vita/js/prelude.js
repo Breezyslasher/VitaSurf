@@ -5495,21 +5495,30 @@ function MutationObserver(cb){
   'The callback provided as parameter 1 is not a function.');
  this._cb=cb;this._records=[];this._watch=[];}
 /* Does this observer want to hear about a change to target? */
-MutationObserver.prototype._wants=function(kind,target,name){
- var i,w,n,depth;
+/* Takes the target's ancestor chain rather than walking it: every
+   parentNode step crosses into C, and this used to walk the whole way
+   to the root once for each watch entry of each observer, on every
+   mutation. A GitHub load makes 2198 setAttribute calls at a depth of
+   about thirty, which cost 1.13 ms each against Wikipedia's 0.093 ms
+   for the same call on the same machine. __vitaMutation now walks it
+   once and hands it here, so the chain is a plain array and finding a
+   watched node in it is an array scan.
+
+   chain[0] is the target, so its index is the depth the walk used to
+   count, and the nearest match is still the one found. */
+MutationObserver.prototype._wants=function(kind,target,name,chain){
+ var i,w,depth;
  for(i=0;i<this._watch.length;i++){
   w=this._watch[i];
-  depth=0;
-  for(n=target;n;n=n.parentNode){
-   if(n===w.target){
-    if(depth>0&&!w.subtree)break;
-    if(kind==='childList'&&!w.childList)break;
-    if(kind==='attributes'){
-     if(!w.attributes)break;
-     if(w.filter&&w.filter.indexOf(String(name).toLowerCase())<0)break;}
-    if(kind==='characterData'&&!w.characterData)break;
-    return w;}
-   depth++;}}
+  depth=chain.indexOf(w.target);
+  if(depth<0)continue;
+  if(depth>0&&!w.subtree)continue;
+  if(kind==='childList'&&!w.childList)continue;
+  if(kind==='attributes'){
+   if(!w.attributes)continue;
+   if(w.filter&&w.filter.indexOf(String(name).toLowerCase())<0)continue;}
+  if(kind==='characterData'&&!w.characterData)continue;
+  return w;}
  return null;};
 MutationObserver.prototype.observe=function(target,options){
  options=options||{};
@@ -5613,10 +5622,13 @@ function siblingsOf(rec,target,after,before){
   rec.nextSibling=MOedges.next;}}
 W.__vitaMutation=function(kind,target,a,b,ns){
  if(!MOlist.length||!target)return;
- var i,o,w,rec;
+ var i,o,w,rec,n;
+ /* once for every observer, not once per watch entry of each */
+ var chain=[];
+ for(n=target;n;n=n.parentNode)chain.push(n);
  for(i=0;i<MOlist.length;i++){
   o=MOlist[i];
-  w=o._wants(kind,target,kind==='attributes'?a:null);
+  w=o._wants(kind,target,kind==='attributes'?a:null,chain);
   if(!w)continue;
   rec=new MutationRecord(kind,target);
   if(kind==='attributes'){
