@@ -1,0 +1,195 @@
+diff --git a/src/select/select.c b/src/select/select.c
+index ee22147..83898be 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -2986,14 +2986,40 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ 	return CSS_OK;
+ }
+ 
++/**
++ * Whether this node is not the root, asking at most once (VitaSurf).
++ *
++ * Used by NOT_ROOT() below so that a pseudo-class which does not care
++ * never asks. A failure is remembered in \a err for the caller to
++ * return, and is treated as "not the root" so the chain still reaches a
++ * branch rather than matching one it should not.
++ */
++static bool detail_not_root(css_select_state *state, void *node,
++		bool *is_root, bool *known, css_error *err)
++{
++	if (*known == false) {
++		*err = state->handler->node_is_root(state->pw, node, is_root);
++		if (*err != CSS_OK)
++			*is_root = false;
++		*known = true;
++	}
++
++	return *is_root == false;
++}
++
+ css_error match_detail(css_select_ctx *ctx, void *node,
+ 		const css_selector_detail *detail, css_select_state *state,
+ 		bool *match, css_pseudo_element *pseudo_element)
+ {
+ 	bool is_root = false;
++	bool root_known = false;
++	css_error root_error = CSS_OK;
+ 	css_error error = CSS_OK;
+ 	css_node_flags flags = CSS_NODE_FLAGS_TAINT_PSEUDO_CLASS;
+ 
++#define NOT_ROOT() detail_not_root(state, node, &is_root, &root_known, \
++		&root_error)
++
+ 	switch (detail->type) {
+ 	case CSS_SELECTOR_ELEMENT:
+ 		/*
+@@ -3018,20 +3044,25 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 				detail->qname.name, match);
+ 		break;
+ 	case CSS_SELECTOR_PSEUDO_CLASS:
+-		error = state->handler->node_is_root(state->pw, node, &is_root);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		if (is_root == false &&
+-				detail->qname.name == ctx->str.first_child) {
++		/*
++		 * Only the structural pseudo-classes below and :root itself
++		 * want to know whether this is the root, and asking walks to
++		 * the parent (VitaSurf). A GitHub page tests a pseudo-class
++		 * 15,615,630 times and nearly all of them are :hover and its
++		 * kind, which never look at it, so the name is compared
++		 * first and the question asked only once a branch has taken
++		 * that needs the answer.
++		 */
++		if (detail->qname.name == ctx->str.first_child &&
++				NOT_ROOT()) {
+ 			int32_t num_before = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+ 					node, false, false, &num_before);
+ 			if (error == CSS_OK)
+ 				*match = (num_before == 0);
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.nth_child) {
++		} else if (detail->qname.name == ctx->str.nth_child &&
++				NOT_ROOT()) {
+ 			int32_t num_before = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+@@ -3042,8 +3073,8 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 
+ 				*match = match_nth(a, b, num_before + 1);
+ 			}
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.nth_last_child) {
++		} else if (detail->qname.name == ctx->str.nth_last_child &&
++				NOT_ROOT()) {
+ 			int32_t num_after = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+@@ -3054,8 +3085,8 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 
+ 				*match = match_nth(a, b, num_after + 1);
+ 			}
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.nth_of_type) {
++		} else if (detail->qname.name == ctx->str.nth_of_type &&
++				NOT_ROOT()) {
+ 			int32_t num_before = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+@@ -3066,8 +3097,8 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 
+ 				*match = match_nth(a, b, num_before + 1);
+ 			}
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.nth_last_of_type) {
++		} else if (detail->qname.name == ctx->str.nth_last_of_type &&
++				NOT_ROOT()) {
+ 			int32_t num_after = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+@@ -3078,32 +3109,32 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 
+ 				*match = match_nth(a, b, num_after + 1);
+ 			}
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.last_child) {
++		} else if (detail->qname.name == ctx->str.last_child &&
++				NOT_ROOT()) {
+ 			int32_t num_after = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+ 					node, false, true, &num_after);
+ 			if (error == CSS_OK)
+ 				*match = (num_after == 0);
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.first_of_type) {
++		} else if (detail->qname.name == ctx->str.first_of_type &&
++				NOT_ROOT()) {
+ 			int32_t num_before = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+ 					node, true, false, &num_before);
+ 			if (error == CSS_OK)
+ 				*match = (num_before == 0);
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.last_of_type) {
++		} else if (detail->qname.name == ctx->str.last_of_type &&
++				NOT_ROOT()) {
+ 			int32_t num_after = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+ 					node, true, true, &num_after);
+ 			if (error == CSS_OK)
+ 				*match = (num_after == 0);
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.only_child) {
++		} else if (detail->qname.name == ctx->str.only_child &&
++				NOT_ROOT()) {
+ 			int32_t num_before = 0, num_after = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+@@ -3116,8 +3147,8 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 					*match = (num_before == 0) &&
+ 							(num_after == 0);
+ 			}
+-		} else if (is_root == false &&
+-				detail->qname.name == ctx->str.only_of_type) {
++		} else if (detail->qname.name == ctx->str.only_of_type &&
++				NOT_ROOT()) {
+ 			int32_t num_before = 0, num_after = 0;
+ 
+ 			error = state->handler->node_count_siblings(state->pw,
+@@ -3131,6 +3162,10 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 							(num_after == 0);
+ 			}
+ 		} else if (detail->qname.name == ctx->str.root) {
++			error = state->handler->node_is_root(state->pw, node,
++					&is_root);
++			if (error != CSS_OK)
++				return error;
+ 			*match = is_root;
+ 		} else if (detail->qname.name == ctx->str.empty) {
+ 			error = state->handler->node_is_empty(state->pw,
+@@ -3178,6 +3213,10 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 		} else {
+ 			*match = false;
+ 		}
++
++		if (root_error != CSS_OK)
++			return root_error;
++
+ 		add_node_flags(node, state, flags);
+ 		break;
+ 	case CSS_SELECTOR_PSEUDO_ELEMENT:
+@@ -3244,6 +3283,8 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 	return error;
+ }
+ 
++#undef NOT_ROOT
++
+ css_error cascade_style(const css_style *style, css_select_state *state)
+ {
+ 	css_style s = *style;
