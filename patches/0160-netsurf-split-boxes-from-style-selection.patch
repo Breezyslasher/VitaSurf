@@ -1,0 +1,118 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 3ded9d2e0..296969773 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -270,12 +270,19 @@ box_get_style(html_content *c,
+ 	}
+ 
+ 	if (s != NULL) {
++		/* time the parse of the style attribute (VitaSurf) */
++		uint64_t in_t0 = 0, in_t1 = 0;
++
++		nsu_getmonotonic_ms(&in_t0);
+ 		inline_style = nscss_create_inline_style(
+ 				(const uint8_t *) dom_string_data(s),
+ 				dom_string_byte_length(s),
+ 				c->encoding,
+ 				nsurl_access(c->base_url),
+ 				c->quirks != DOM_DOCUMENT_QUIRKS_MODE_NONE);
++		nsu_getmonotonic_ms(&in_t1);
++		vitasurf_inline_styles++;
++		vitasurf_ms_inline_style += (unsigned int)(in_t1 - in_t0);
+ 
+ 		dom_string_unref(s);
+ 
+@@ -291,9 +298,17 @@ box_get_style(html_content *c,
+ 	ctx.root_style = root_style;
+ 	ctx.parent_style = parent_style;
+ 
+-	/* Select style for element */
+-	styles = nscss_get_style(&ctx, n, &c->media, &c->unit_len_ctx,
+-			inline_style);
++	/* Select style for element, and time it (VitaSurf) */
++	{
++		uint64_t sel_t0 = 0, sel_t1 = 0;
++
++		nsu_getmonotonic_ms(&sel_t0);
++		styles = nscss_get_style(&ctx, n, &c->media, &c->unit_len_ctx,
++				inline_style);
++		nsu_getmonotonic_ms(&sel_t1);
++		vitasurf_ms_select += (unsigned int)(sel_t1 - sel_t0);
++		vitasurf_box_elements++;
++	}
+ 
+ 	/* No longer need inline style */
+ 	if (inline_style != NULL)
+diff --git a/utils/utils.c b/utils/utils.c
+index ed7e4ecfd..aaac7d784 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -611,6 +611,19 @@ unsigned int vitasurf_js_jobs_slow;
+ unsigned int vitasurf_ms_js_jobs_slow;
+ unsigned int vitasurf_js_finds;
+ unsigned int vitasurf_ms_js_finds;
++/* counted inside libcss, reset here with the rest (VitaSurf) */
++extern unsigned int css_select_calls;
++extern unsigned int css_select_sheets_seen;
++extern unsigned int css_select_selectors_considered;
++extern unsigned int css_select_from_element;
++extern unsigned int css_select_from_class;
++extern unsigned int css_select_from_id;
++extern unsigned int css_select_from_universal;
++
++unsigned int vitasurf_ms_select;
++unsigned int vitasurf_box_elements;
++unsigned int vitasurf_inline_styles;
++unsigned int vitasurf_ms_inline_style;
+ unsigned int vitasurf_sched_calls;
+ unsigned int vitasurf_ms_sched;
+ unsigned int vitasurf_ms_sched_max;
+@@ -654,6 +667,17 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_jobs_slow = 0;
+ 	vitasurf_js_finds = 0;
+ 	vitasurf_ms_js_finds = 0;
++	css_select_calls = 0;
++	css_select_sheets_seen = 0;
++	css_select_selectors_considered = 0;
++	css_select_from_element = 0;
++	css_select_from_class = 0;
++	css_select_from_id = 0;
++	css_select_from_universal = 0;
++	vitasurf_ms_select = 0;
++	vitasurf_box_elements = 0;
++	vitasurf_inline_styles = 0;
++	vitasurf_ms_inline_style = 0;
+ 	vitasurf_sched_calls = 0;
+ 	vitasurf_ms_sched = 0;
+ 	vitasurf_ms_sched_max = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index bdd434dd3..bb0f8cc07 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -271,6 +271,26 @@ extern unsigned int vitasurf_ms_js_finds;
+  * ran for twenty-three seconds with the whole browser stopped behind
+  * it, and the scheduler does not record which callback it was.
+  */
++/*
++ * Inside the boxes-and-styles bucket (VitaSurf). A build 375 log spends
++ * 72391 ms of a 137526 ms GitHub load there, against 7792 ms of script
++ * -- so the page is not bound by JavaScript at all, and the bucket
++ * covers two quite different jobs. Selecting an element's style is a
++ * walk of every rule that could match it; building its box is not.
++ */
++extern unsigned int vitasurf_ms_select;
++extern unsigned int vitasurf_box_elements;
++/*
++ * The style attribute (VitaSurf). Every element carrying one has it
++ * parsed into a stylesheet of its own before its style is selected,
++ * and that parse sat just outside the selection timer. Box
++ * construction costs 5.6 ms an element on GitHub against 0.70 ms on
++ * Wikipedia, and this is the one part of it that scales with how the
++ * page is written rather than with how many elements it has.
++ */
++extern unsigned int vitasurf_inline_styles;
++extern unsigned int vitasurf_ms_inline_style;
++
+ extern unsigned int vitasurf_sched_calls;
+ extern unsigned int vitasurf_ms_sched;
+ extern unsigned int vitasurf_ms_sched_max;

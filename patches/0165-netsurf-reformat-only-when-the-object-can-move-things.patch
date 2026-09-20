@@ -1,0 +1,75 @@
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 24d920eca..35fef8c66 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -191,12 +191,32 @@ html_object_callback(hlcache_handle *object,
+ 
+ 			/* Adjust parent content for new object size */
+ 			html_object_done(box, object, o->background, o->mask);
++			/*
++			 * Only if the object can still change the shape of
++			 * the page (VitaSurf).
++			 *
++			 * This laid the whole document out again for every
++			 * object that became ready. A GitHub profile loads
++			 * 296 images and is laid out 143 times, every one of
++			 * those passes taking 100 ms or more and 23059 ms
++			 * between them -- a sixth of the load, spent
++			 * re-answering a question whose answer had not
++			 * changed. REPLACE_DIM means the box's size is
++			 * already fixed by its attributes or its CSS, so
++			 * what the object turned out to be cannot move
++			 * anything; the DONE case below already relies on
++			 * exactly that to redraw rather than reformat.
++			 */
++			vitasurf_object_ready++;
+ 			if (c->layout != NULL &&
++					(box->flags & REPLACE_DIM) == 0 &&
+ 					(c->base.status == CONTENT_STATUS_READY ||
+-					c->base.status == CONTENT_STATUS_DONE))
++					c->base.status == CONTENT_STATUS_DONE)) {
++				vitasurf_object_reformats++;
+ 				content__reformat(&c->base, false,
+ 						c->base.available_width,
+ 						c->base.available_height);
++			}
+ 		}
+ 		break;
+ 
+diff --git a/utils/utils.c b/utils/utils.c
+index 157b1d560..f26bdae0b 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -632,6 +632,8 @@ unsigned int vitasurf_box_specials;
+ unsigned int vitasurf_ms_layout_max;
+ unsigned int vitasurf_layout_slow;
+ unsigned int vitasurf_ms_layout_slow;
++unsigned int vitasurf_object_ready;
++unsigned int vitasurf_object_reformats;
+ unsigned int vitasurf_images_converted;
+ unsigned int vitasurf_image_kpixels;
+ unsigned int vitasurf_ms_image_max;
+@@ -699,6 +701,8 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_layout_max = 0;
+ 	vitasurf_layout_slow = 0;
+ 	vitasurf_ms_layout_slow = 0;
++	vitasurf_object_ready = 0;
++	vitasurf_object_reformats = 0;
+ 	vitasurf_images_converted = 0;
+ 	vitasurf_image_kpixels = 0;
+ 	vitasurf_ms_image_max = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index b27ddedfa..817fc1a05 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -316,6 +316,10 @@ extern unsigned int vitasurf_ms_layout_max;	/**< the longest one pass */
+ extern unsigned int vitasurf_layout_slow;	/**< passes of 100 ms or more */
+ extern unsigned int vitasurf_ms_layout_slow;
+ 
++/* objects that became ready, and how many of those laid the page out */
++extern unsigned int vitasurf_object_ready;
++extern unsigned int vitasurf_object_reformats;
++
+ extern unsigned int vitasurf_images_converted;
+ extern unsigned int vitasurf_image_kpixels;	/**< what they decoded to */
+ extern unsigned int vitasurf_ms_image_max;	/**< the dearest single one */

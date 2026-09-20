@@ -1,0 +1,176 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index f04434e..0c345f0 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -236,6 +236,22 @@ css_error css__selector_hash_destroy(css_selector_hash *hash)
+  * \param selector  Pointer to selector
+  * \return CSS_OK on success, appropriate error otherwise
+  */
++/*
++ * How the page's rules are filed (VitaSurf). Selection offers every
++ * element 2738 candidates out of the universal chain on a GitHub page
++ * and 1 on a local one, and the per element count cannot say whether
++ * those rules are genuinely unhashable or whether something on the way
++ * in put them there. Count them as they are filed.
++ */
++unsigned int css_hash_in_id;
++unsigned int css_hash_in_class;
++unsigned int css_hash_in_element;
++unsigned int css_hash_in_universal;
++unsigned int css_hash_uni_attribute;
++unsigned int css_hash_uni_pseudo_class;
++unsigned int css_hash_uni_pseudo_element;
++unsigned int css_hash_uni_plain;
++
+ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 		const css_selector *selector)
+ {
+@@ -254,6 +270,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 
+ 		error = _insert_into_chain(hash, &hash->ids.slots[index],
+ 				selector);
++		css_hash_in_id++;
+ 	} else if ((name = _class_name(selector)) != NULL) {
+ 		/* Named class */
+ 		mask = hash->classes.n_slots - 1;
+@@ -261,6 +278,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 
+ 		error = _insert_into_chain(hash, &hash->classes.slots[index],
+ 				selector);
++		css_hash_in_class++;
+ 	} else if (lwc_string_length(selector->data.qname.name) != 1 ||
+ 			lwc_string_data(selector->data.qname.name)[0] != '*') {
+ 		/* Named element */
+@@ -269,9 +287,50 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 
+ 		error = _insert_into_chain(hash, &hash->elements.slots[index],
+ 				selector);
++		css_hash_in_element++;
+ 	} else {
+ 		/* Universal chain */
+ 		error = _insert_into_chain(hash, &hash->universal, selector);
++		css_hash_in_universal++;
++		/*
++		 * And why it landed there (VitaSurf), since 6157 rules do
++		 * on a GitHub page and every one of them is then offered
++		 * to every element. The first detail on the key selector
++		 * is what is left once name, class and id are ruled out.
++		 */
++		{
++			const css_selector_detail *d = &selector->data;
++			bool any = false;
++
++			do {
++				switch (d->type) {
++				case CSS_SELECTOR_PSEUDO_CLASS:
++					css_hash_uni_pseudo_class++;
++					any = true;
++					break;
++				case CSS_SELECTOR_PSEUDO_ELEMENT:
++					css_hash_uni_pseudo_element++;
++					any = true;
++					break;
++				case CSS_SELECTOR_ATTRIBUTE:
++				case CSS_SELECTOR_ATTRIBUTE_EQUAL:
++				case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
++				case CSS_SELECTOR_ATTRIBUTE_INCLUDES:
++				case CSS_SELECTOR_ATTRIBUTE_PREFIX:
++				case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
++				case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
++					css_hash_uni_attribute++;
++					any = true;
++					break;
++				default:
++					break;
++				}
++				if (any)
++					break;
++			} while (d->next != 0 && (d = d + 1) != NULL);
++			if (!any)
++				css_hash_uni_plain++;
++		}
+ 	}
+ 
+ 	return error;
+diff --git a/src/select/select.c b/src/select/select.c
+index 458adda..f4194df 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -118,6 +118,29 @@ static css_error set_initial(css_select_state *state,
+ static css_error select_from_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet, css_origin origin,
+ 		css_select_state *state);
++/*
++ * What selection actually does (VitaSurf). A build 376 log spends
++ * 36956 ms selecting styles for 6270 elements on a GitHub page -- 5.9
++ * ms each, against 0.40 ms on Wikipedia for a document of much the
++ * same size. Whether the hash is failing to narrow the candidates or
++ * the cost is past the matching altogether cannot be told from the
++ * total, so count the sheets looked in and the selectors considered.
++ */
++unsigned int css_select_calls;
++unsigned int css_select_sheets_seen;
++unsigned int css_select_selectors_considered;
++/*
++ * And which hash chain each candidate came from (VitaSurf). 2750 of
++ * them per element on GitHub says the hash is not narrowing; which of
++ * the four chains is handing them over says why. A rule whose key
++ * selector cannot be hashed by name, class or id lands in the
++ * universal chain and is then offered for every element there is.
++ */
++unsigned int css_select_from_element;
++unsigned int css_select_from_class;
++unsigned int css_select_from_id;
++unsigned int css_select_from_universal;
++
+ static css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet, css_select_state *state);
+ static css_error match_selector_chain(css_select_ctx *ctx,
+@@ -1470,6 +1493,8 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		css_select_results **result)
+ {
+ 	css_origin origin = CSS_ORIGIN_UA;
++
++	css_select_calls++;
+ 	uint32_t i, j, nhints;
+ 	css_error error;
+ 	css_select_state state;
+@@ -2311,11 +2336,14 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	if (error != CSS_OK)
+ 		goto cleanup;
+ 
++	css_select_sheets_seen++;
++
+ 	/* Process matching selectors, if any */
+ 	while (_selectors_pending(node_selectors, id_selectors,
+ 			class_selectors, n_classes, univ_selectors)) {
+ 		const css_selector *selector;
+ 
++
+ 		/* Selectors must be matched in ascending order of specificity
+ 		 * and rule index. (c.f. css__outranks_existing())
+ 		 *
+@@ -2329,6 +2357,23 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		 * selector here */
+ 		assert(selector != NULL);
+ 
++		/* which chain offered it (VitaSurf) */
++		css_select_selectors_considered++;
++		switch (src.source) {
++		case CSS_SELECT_RULE_SRC_ELEMENT:
++			css_select_from_element++;
++			break;
++		case CSS_SELECT_RULE_SRC_CLASS:
++			css_select_from_class++;
++			break;
++		case CSS_SELECT_RULE_SRC_ID:
++			css_select_from_id++;
++			break;
++		case CSS_SELECT_RULE_SRC_UNIVERSAL:
++			css_select_from_universal++;
++			break;
++		}
++
+ 		/* Match and handle the selector chain */
+ 		error = match_selector_chain(ctx, selector, state);
+ 		if (error != CSS_OK)

@@ -1,0 +1,51 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 6ced72818..0e24c0ddf 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -607,6 +607,10 @@ unsigned int vitasurf_ms_js_compile;
+ unsigned int vitasurf_ms_js_run;
+ unsigned int vitasurf_ms_js_after;
+ unsigned int vitasurf_ms_js_free;
++unsigned int vitasurf_js_jobs_slow;
++unsigned int vitasurf_ms_js_jobs_slow;
++unsigned int vitasurf_js_finds;
++unsigned int vitasurf_ms_js_finds;
+ 
+ /* exported interface documented in utils/utils.h */
+ void vitasurf_profile_reset(void)
+@@ -643,6 +647,10 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_run = 0;
+ 	vitasurf_ms_js_after = 0;
+ 	vitasurf_ms_js_free = 0;
++	vitasurf_js_jobs_slow = 0;
++	vitasurf_ms_js_jobs_slow = 0;
++	vitasurf_js_finds = 0;
++	vitasurf_ms_js_finds = 0;
+ 	vitasurf_ms_nested = 0;
+ }
+ 
+diff --git a/utils/utils.h b/utils/utils.h
+index 8f890ac01..317bf33be 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -250,6 +250,20 @@ extern unsigned int vitasurf_ms_js_run;
+  */
+ extern unsigned int vitasurf_ms_js_after;
+ extern unsigned int vitasurf_ms_js_free;
++
++/*
++ * The shape of the microtask queue (VitaSurf). A build 373 log runs
++ * 1188 promise jobs in 1794 ms with the longest at 543 ms, so eleven
++ * hundred of them share about 1.05 ms each -- a hundred times what a
++ * bare .then() callback should cost. Whether that is a long tail of
++ * middling jobs or every job being slow decides where to look, and an
++ * average cannot tell the two apart.
++ */
++extern unsigned int vitasurf_js_jobs_slow;	/**< jobs of 5 ms or more */
++extern unsigned int vitasurf_ms_js_jobs_slow;
++/** Calls into the DOM query binding, which walks the tree. */
++extern unsigned int vitasurf_js_finds;
++extern unsigned int vitasurf_ms_js_finds;
+ /**
+  * Milliseconds the conversion now returning spent, handed up so the
+  * conversion that contains it can subtract its own nested work.

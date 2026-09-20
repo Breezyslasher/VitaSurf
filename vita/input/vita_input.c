@@ -1092,6 +1092,102 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_html_parse, vitasurf_ms_css,
 				 vitasurf_ms_image, vitasurf_ms_boxes,
 				 vitasurf_ms_layout, vitasurf_ms_script);
+			vita_log("page: script %u ms is %u ms in script "
+				 "elements (%u ms compiling or reading them, "
+				 "%u ms running them, %u ms after, of which "
+				 "%u ms freeing the result), "
+				 "%u ms in %u timers, %u ms in %u "
+				 "events, %u ms in %u fetch callbacks",
+				 vitasurf_ms_script, vitasurf_ms_js_page,
+				 vitasurf_ms_js_compile, vitasurf_ms_js_run,
+				 vitasurf_ms_js_after, vitasurf_ms_js_free,
+				 vitasurf_ms_js_timer, vitasurf_js_timers,
+				 vitasurf_ms_js_event, vitasurf_js_events,
+				 vitasurf_ms_js_xhr, vitasurf_js_xhrs);
+			vita_log("page: and %u promise jobs after those, "
+				 "costing %u ms, the longest %u ms, which "
+				 "the script figure does not include; %u of "
+				 "them took 5 ms or more and account for "
+				 "%u ms",
+				 vitasurf_js_jobs, vitasurf_ms_js_jobs,
+				 vitasurf_ms_js_job_max,
+				 vitasurf_js_jobs_slow,
+				 vitasurf_ms_js_jobs_slow);
+			vita_log("page: the page asked the tree for elements "
+				 "%u times, costing %u ms",
+				 vitasurf_js_finds, vitasurf_ms_js_finds);
+			vita_log("page: boxes and styles %u ms covered %u "
+				 "elements, %u ms of it selecting their "
+				 "styles and %u ms parsing the style "
+				 "attribute on %u of them",
+				 vitasurf_ms_boxes, vitasurf_box_elements,
+				 vitasurf_ms_select,
+				 vitasurf_ms_inline_style,
+				 vitasurf_inline_styles);
+			{
+				extern unsigned int css_select_calls;
+				extern unsigned int css_select_sheets_seen;
+				extern unsigned int
+					css_select_selectors_considered;
+				extern unsigned int css_select_from_element;
+				extern unsigned int css_select_from_class;
+				extern unsigned int css_select_from_id;
+				extern unsigned int css_select_from_universal;
+				extern unsigned int css_hash_in_element;
+				extern unsigned int css_hash_in_class;
+				extern unsigned int css_hash_in_id;
+				extern unsigned int css_hash_in_universal;
+
+				vita_log("page: building those boxes was %u ms in "
+				 "the elements and %u ms in %u text nodes, "
+				 "with %u ms of the elements in %u special "
+				 "ones",
+				 vitasurf_ms_box_element, vitasurf_ms_box_text,
+				 vitasurf_box_texts, vitasurf_ms_box_special,
+				 vitasurf_box_specials);
+			vita_log("page: the %u layout passes took %u ms, the "
+				 "longest %u ms; %u of them ran 100 ms or "
+				 "more and account for %u ms",
+				 vitasurf_layout_runs, vitasurf_ms_layout,
+				 vitasurf_ms_layout_max, vitasurf_layout_slow,
+				 vitasurf_ms_layout_slow);
+			vita_log("page: %u objects became ready and %u of "
+				 "them laid the page out again",
+				 vitasurf_object_ready,
+				 vitasurf_object_reformats);
+			vita_log("page: %u images converted for %u ms, the "
+				 "dearest %u ms, %u kpixels decoded in all",
+				 vitasurf_images_converted, vitasurf_ms_image,
+				 vitasurf_ms_image_max,
+				 vitasurf_image_kpixels);
+			vita_log("page: selection ran %u times, "
+					 "looked in %u sheets and considered "
+					 "%u selectors",
+					 css_select_calls,
+					 css_select_sheets_seen,
+					 css_select_selectors_considered);
+				vita_log("page: those came from %u element, "
+					 "%u class, %u id and %u universal "
+					 "rules",
+					 css_select_from_element,
+					 css_select_from_class,
+					 css_select_from_id,
+					 css_select_from_universal);
+				vita_log("page: the sheets filed %u rules by "
+					 "element, %u by class, %u by id and "
+					 "%u as universal",
+					 css_hash_in_element, css_hash_in_class,
+					 css_hash_in_id, css_hash_in_universal);
+			}
+			vita_log("page: attribute selectors asked for a name "
+				 "%u times, interning it %u of them",
+				 vitasurf_attr_interned_hits +
+					vitasurf_attr_interned_misses,
+				 vitasurf_attr_interned_misses);
+			vita_log("page: the scheduler ran %u callbacks for "
+				 "%u ms, the longest %u ms",
+				 vitasurf_sched_calls, vitasurf_ms_sched,
+				 vitasurf_ms_sched_max);
 			vita_log("page: laid out %u times, measuring text "
 				 "%u times over %u characters, %u ms of it "
 				 "inside the font engine",

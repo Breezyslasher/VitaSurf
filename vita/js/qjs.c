@@ -250,6 +250,24 @@ static int next_timer_handle = 1;
  */
 #define RELAYOUT_MAX_ELEMENTS 6000
 
+/*
+ * And what it is expected to cost (VitaSurf).
+ *
+ * The element count is a proxy for the work, and it does not hold. A
+ * GitHub profile came in at 6270 elements -- under the limit above --
+ * and rebuilt in 55621 ms, because the cost of an element is not the
+ * element, it is the element against every rule that might style it.
+ * That page loads 398 stylesheets whose universal chain alone offers
+ * 2738 candidates to each element, and one element costs 11.7 ms
+ * against a Wikipedia element's 1.1 ms.
+ *
+ * So estimate instead. Laying the page out the first time measured
+ * exactly this, per element, on this page with this CSS; multiply it
+ * by what the document now holds. Over this budget the page keeps the
+ * layout it was parsed with, as it does over the element limit.
+ */
+#define RELAYOUT_MAX_MS 8000
+
 /* ------------------------------------------------------------------------ */
 /* Small helpers                                                            */
 
@@ -3352,11 +3370,27 @@ static void rearm_deadline(jsthread *thread)
  */
 static uint64_t script_entered_ms;
 
-static void begin_script(jsthread *thread)
+/*
+ * Why we are in JavaScript (VitaSurf), so that the script bucket can be
+ * split by it. A build 369 log puts 4618 ms of a 7878 ms YouTube load
+ * in that bucket while the load event accounts for 1906 ms of it in
+ * script elements; the remaining 2.7 s is entered some other way and
+ * there is no way to aim at it without knowing which.
+ */
+enum script_why {
+	SCRIPT_PAGE,		/**< a <script> element */
+	SCRIPT_TIMER,
+	SCRIPT_EVENT,
+	SCRIPT_XHR		/**< a fetch or XHR settling */
+};
+static enum script_why script_why;
+
+static void begin_script(jsthread *thread, enum script_why why)
 {
 	if (thread->script_depth++ > 0) {
 		return;
 	}
+	script_why = why;
 	vita_dom_gen++;	/* the parser may have added nodes since */
 	script_entered_ms = now_ms();
 	rearm_deadline(thread);
@@ -3371,7 +3405,27 @@ static void end_script(jsthread *thread)
 	}
 	thread->script_depth = 0;
 	if (script_entered_ms != 0) {
-		vitasurf_ms_script += (unsigned)(now_ms() - script_entered_ms);
+		unsigned took = (unsigned)(now_ms() - script_entered_ms);
+
+		vitasurf_ms_script += took;
+		switch (script_why) {
+		case SCRIPT_TIMER:
+			vitasurf_ms_js_timer += took;
+			vitasurf_js_timers++;
+			break;
+		case SCRIPT_EVENT:
+			vitasurf_ms_js_event += took;
+			vitasurf_js_events++;
+			break;
+		case SCRIPT_XHR:
+			vitasurf_ms_js_xhr += took;
+			vitasurf_js_xhrs++;
+			break;
+		case SCRIPT_PAGE:
+		default:
+			vitasurf_ms_js_page += took;
+			break;
+		}
 		script_entered_ms = 0;
 	}
 	if (thread->overrun_count > 0) {
@@ -3408,15 +3462,41 @@ static void end_script(jsthread *thread)
 	 * did nothing wrong.
 	 */
 	rearm_deadline(thread);
-	for (;;) {
-		JSContext *c = NULL;
-		int r = JS_ExecutePendingJob(thread->heap->rt, &c);
-		if (r <= 0) {
-			if (r < 0 && c != NULL) {
-				qjs_report_exception(c);
+	{
+		/*
+		 * What the microtask queue costs (VitaSurf). This runs
+		 * after the script bucket above has been closed, so until
+		 * now it was in no bucket at all -- and it is where async,
+		 * await and every .then() continuation on the page
+		 * actually run.
+		 */
+		uint64_t j0 = now_ms(), jlast = j0;
+
+		for (;;) {
+			JSContext *c = NULL;
+			int r = JS_ExecutePendingJob(thread->heap->rt, &c);
+			if (r <= 0) {
+				if (r < 0 && c != NULL) {
+					qjs_report_exception(c);
+				}
+				break;
 			}
-			break;
+			{
+				uint64_t j1 = now_ms();
+				unsigned took = (unsigned)(j1 - jlast);
+
+				if (took > vitasurf_ms_js_job_max) {
+					vitasurf_ms_js_job_max = took;
+				}
+				if (took >= 5) {
+					vitasurf_js_jobs_slow++;
+					vitasurf_ms_js_jobs_slow += took;
+				}
+				jlast = j1;
+			}
+			vitasurf_js_jobs++;
 		}
+		vitasurf_ms_js_jobs += (unsigned)(now_ms() - j0);
 	}
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;
@@ -3577,6 +3657,28 @@ static void relayout_callback(void *p)
 		thread->dom_dirty = false;
 		return;
 	}
+	/*
+	 * What this page's own elements cost, measured while it was first
+	 * laid out (VitaSurf). No measurement yet means no reason to
+	 * refuse.
+	 */
+	if (vitasurf_box_elements > 0) {
+		unsigned per_element_us = (vitasurf_ms_boxes * 1000u) /
+					  vitasurf_box_elements;
+		unsigned estimate = (per_element_us *
+				     thread->dom_elements) / 1000u;
+
+		if (estimate > RELAYOUT_MAX_MS) {
+			vita_log("qjs: not rebuilding the layout, %u "
+				 "elements at %u us each is about %u ms "
+				 "and the browser is stopped for all of it",
+				 thread->dom_elements, per_element_us,
+				 estimate);
+			thread->relayout_off = true;
+			thread->dom_dirty = false;
+			return;
+		}
+	}
 
 	t0 = now_ms();
 	err = html_relayout(htmlc);
@@ -3664,7 +3766,7 @@ static void timer_callback(void *p)
 		return;
 	}
 	ctx = thread->ctx;
-	begin_script(thread);
+	begin_script(thread, SCRIPT_TIMER);
 	global = JS_GetGlobalObject(ctx);
 	ret = JS_Call(ctx, t->func, global, 0, NULL);
 	if (JS_IsException(ret)) {
@@ -3811,7 +3913,7 @@ static void xhr_complete(struct js_xhr *x, const char *err)
 		if (err != NULL) {
 			vita_log("xhr: %s: %s", nsurl_access(x->url), err);
 		}
-		begin_script(thread);
+		begin_script(thread, SCRIPT_XHR);
 		args[0] = JS_NewInt32(ctx, x->status);
 		args[1] = JS_NewStringLen(ctx, x->rheaders != NULL ? x->rheaders : "",
 					  x->rheaders_len);
@@ -4307,7 +4409,7 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	}
 	ctx = thread->ctx;
 	thread->event_depth++;
-	begin_script(thread);
+	begin_script(thread, SCRIPT_EVENT);
 	/* this is the element the listener was added to */
 	global = wrap_node(ctx, l->node);
 	/* an event dispatchEvent created keeps its JS object (detail etc) */
@@ -4540,8 +4642,28 @@ static bool key_matches(struct dom_node *n, const struct find_key *k,
  * __vitaFind(root, keys): every element under root matching at least one
  * key, in document order. root may be a node or null for the document.
  */
+static JSValue vita_find_impl(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv);
+
+/*
+ * The same, counted and timed (VitaSurf). This walks the tree, and a
+ * page whose promise jobs cost a millisecond each may simply be asking
+ * it to do so a great many times. It has several exits, so the timing
+ * wraps it rather than being threaded through each one.
+ */
 static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 			     int argc, JSValueConst *argv)
+{
+	uint64_t t0 = now_ms();
+	JSValue r = vita_find_impl(ctx, this_val, argc, argv);
+
+	vitasurf_js_finds++;
+	vitasurf_ms_js_finds += (unsigned)(now_ms() - t0);
+	return r;
+}
+
+static JSValue vita_find_impl(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *root = NULL;
@@ -6070,8 +6192,25 @@ void js_initialise(void)
 	 * every script, which looks like a very fast engine in the log.
 	 */
 	err = javascript_init();
-	vita_log("qjs: QuickJS engine initialised (content handler %s)",
+	/*
+	 * The engine's version, because how large a compiled script is
+	 * depends on it: a host build of quickjs-ng 0.14 writes bytecode
+	 * three times the size of its source, keeping every function's
+	 * text so that toString can return it, where a build 362 log
+	 * cached 73 KB for 221 KB of source. Comparing a measurement
+	 * taken here against one taken on a host means knowing both.
+	 */
+#ifdef QJS_VERSION_MAJOR
+	vita_log("qjs: QuickJS engine initialised (content handler %s), "
+		 "quickjs-ng %d.%d.%d%s",
+		 err == NSERROR_OK ? "registered" : "FAILED",
+		 QJS_VERSION_MAJOR, QJS_VERSION_MINOR, QJS_VERSION_PATCH,
+		 QJS_VERSION_SUFFIX);
+#else
+	vita_log("qjs: QuickJS engine initialised (content handler %s), "
+		 "version not reported by the headers",
 		 err == NSERROR_OK ? "registered" : "FAILED");
+#endif
 }
 
 void js_finalise(void)
@@ -6405,6 +6544,19 @@ void js_destroythread(jsthread *thread)
  * saving, so modules are left alone.
  */
 
+/*
+ * How much of an entry to move at a time (VitaSurf).
+ *
+ * newlib's fread refills through the FILE's own buffer and never asks
+ * the system for more than that buffer holds, and a stream nobody has
+ * given a buffer to gets BUFSIZ, which is a kilobyte. Reading a 6063 KB
+ * entry that way is six thousand reads, and a build 368 log puts 1601
+ * ms of a 1991 ms read on the card at 3878 KB/s while JS_ReadObject
+ * needs only 288 ms of it. glibc would have bypassed the buffer for a
+ * request this size; newlib does not.
+ */
+#define BC_IO_BUF     (256 * 1024)
+
 #define BC_MAGIC      0x43425356u        /* 'VSBC' */
 #define BC_FORMAT     1u
 /* Below this, compiling is quicker than finding the file on the card. */
@@ -6583,6 +6735,7 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	uint8_t *buf;
 	JSValue fn;
 	uint64_t hash;
+	uint64_t t_read0 = 0, t_read1 = 0, t_decode = 0;
 
 	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<' ||
 	    vitasurf_cache_disabled()) {
@@ -6593,6 +6746,8 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	if (f == NULL) {
 		return JS_UNDEFINED;
 	}
+	/* before the first read, or it has no effect */
+	setvbuf(f, NULL, _IOFBF, BC_IO_BUF);
 	if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
 	    h.magic != BC_MAGIC || h.format != BC_FORMAT ||
 	    h.src_len != (uint32_t)srclen ||
@@ -6611,12 +6766,22 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 		fclose(f);
 		return JS_UNDEFINED;
 	}
+	/*
+	 * Where reading an entry back actually goes (VitaSurf). A build
+	 * 362 log reads 1822 KB of script back in 1984 ms against 3947
+	 * ms to compile it, barely twice as quick; the same pair of
+	 * operations on a host is fifteen to eighteen times apart,
+	 * measured over three real bundles. One of these two halves is
+	 * out of proportion and the totals cannot say which.
+	 */
+	nsu_getmonotonic_ms(&t_read0);
 	if (fread(buf, 1, h.bc_len, f) != h.bc_len) {
 		free(buf);
 		fclose(f);
 		return JS_UNDEFINED;
 	}
 	fclose(f);
+	nsu_getmonotonic_ms(&t_read1);
 	/*
 	 * QuickJS stamps its own bytecode version into the stream and
 	 * refuses a stream it did not write, so an entry left behind by an
@@ -6624,6 +6789,14 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	 * something that runs. Treat it as a miss and compile.
 	 */
 	fn = JS_ReadObject(ctx, buf, h.bc_len, JS_READ_OBJ_BYTECODE);
+	nsu_getmonotonic_ms(&t_decode);
+	vita_log("qjs: cache entry %u KB: %u ms off the card at %u KB/s, "
+		 "%u ms decoding it",
+		 (unsigned)(h.bc_len / 1024),
+		 (unsigned)(t_read1 - t_read0),
+		 t_read1 > t_read0 ?
+			(unsigned)(h.bc_len / (t_read1 - t_read0)) : 0u,
+		 (unsigned)(t_decode - t_read1));
 	free(buf);
 	if (JS_IsException(fn)) {
 		JS_FreeValue(ctx, JS_GetException(ctx));
@@ -6700,6 +6873,7 @@ static void bc_store(JSContext *ctx, const char *url,
 		js_free(ctx, out);
 		return;
 	}
+	setvbuf(f, NULL, _IOFBF, BC_IO_BUF);
 	if (fwrite(&h, 1, sizeof(h), f) != sizeof(h) ||
 	    fwrite(out, 1, out_len, f) != out_len) {
 		fclose(f);
@@ -7765,7 +7939,7 @@ static void module_retry_callback(void *p)
 		unsigned missed = thread->js_imports_missed;
 		JSValue fn;
 
-		begin_script(thread);
+		begin_script(thread, SCRIPT_TIMER);
 		thread->current_script = d->name;
 		fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
 			     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -7856,6 +8030,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	JSValue ret;
 	bool ok;
 	char *src;
+	uint64_t t_after0 = 0;	/* when the script's run ended (VitaSurf) */
 
 	if (thread == NULL || txt == NULL || txtlen == 0) {
 		return false;
@@ -7940,7 +8115,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			txtlen = rwlen;
 		}
 	}
-	begin_script(thread);
+	begin_script(thread, SCRIPT_PAGE);
 	thread->current_script = name;
 	{
 		/*
@@ -8084,6 +8259,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			ret = settle_module(thread, ret, name);
 		}
 		t_done = now_ms();
+		t_after0 = t_done;
 
 		if (module) {
 			thread->js_modules++;
@@ -8092,8 +8268,19 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		thread->js_bytes += (unsigned)txtlen;
 		thread->js_compile_ms += (unsigned)(t_compiled - t_start);
 		thread->js_run_ms += (unsigned)(t_done - t_compiled);
+		/* the same two, per page, so the script bucket can be
+		 * told apart from what else js_exec does (VitaSurf) */
+		vitasurf_ms_js_compile += (unsigned)(t_compiled - t_start);
+		vitasurf_ms_js_run += (unsigned)(t_done - t_compiled);
 
-		if (txtlen > SCRIPT_LOG_BYTES || vita_verbose_requested()) {
+		/*
+		 * runtime_kb walks the whole runtime -- every object,
+		 * shape and string -- to add up what it holds, and asking
+		 * it once per script was 26 walks on a YouTube page
+		 * (VitaSurf). It is worth knowing after a script big
+		 * enough to move the number and not otherwise.
+		 */
+		if (txtlen > SCRIPT_LOG_BYTES) {
 			vita_log("qjs: script %u KB %s in %u ms, "
 				 "ran in %u ms, runtime memory now %u KB: %s",
 				 (unsigned)(txtlen / 1024),
@@ -8102,16 +8289,35 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				 (unsigned)(t_done - t_compiled),
 				 runtime_kb(thread->heap->rt),
 				 name);
-		}
-		if (txtlen > SCRIPT_LOG_BYTES) {
 			vita_log_memory("after a large script");
+		} else if (vita_verbose_requested()) {
+			vita_log("qjs: script %u KB %s in %u ms, "
+				 "ran in %u ms: %s",
+				 (unsigned)(txtlen / 1024),
+				 cached ? "read from cache" : "compiled",
+				 (unsigned)(t_compiled - t_start),
+				 (unsigned)(t_done - t_compiled),
+				 name);
 		}
 	}
 	ok = !JS_IsException(ret);
 	if (!ok) {
 		qjs_report_exception_src(thread->ctx, name, src, txtlen);
 	}
-	JS_FreeValue(thread->ctx, ret);
+	{
+		/*
+		 * The tail, split (VitaSurf). Everything from the end of
+		 * the run to the close of the script bucket lands here,
+		 * and freeing the script's result is the one part of it
+		 * that could plausibly cost anything.
+		 */
+		uint64_t f0 = now_ms(), f1;
+
+		JS_FreeValue(thread->ctx, ret);
+		f1 = now_ms();
+		vitasurf_ms_js_free += (unsigned)(f1 - f0);
+		vitasurf_ms_js_after += (unsigned)(f1 - t_after0);
+	}
 	thread->current_script = NULL;
 	end_script(thread);
 	free(src);

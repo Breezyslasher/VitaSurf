@@ -1,0 +1,119 @@
+diff --git a/content/handlers/html/webfont.c b/content/handlers/html/webfont.c
+index 4e82fef3f..2b9da058a 100644
+--- a/content/handlers/html/webfont.c
++++ b/content/handlers/html/webfont.c
+@@ -121,6 +121,85 @@ static bool webfont_family_known(const char *family)
+ 	return false;
+ }
+ 
++/** The most families a page may be remembered as having no face for. */
++#define WEBFONT_MISS_MAX 64
++
++/**
++ * The families this page has been asked for and no @font-face describes.
++ *
++ * Looking a family up walks every rule of every sheet, and a font-family
++ * list names a dozen system faces before the web font, so without this
++ * the walk is repeated for each of them on every element: on a GitHub
++ * page that was 15,267 walks of 209 sheets, a third of the time the page
++ * spent on styles. The answer only holds while the page's sheet set does,
++ * as a sheet that arrives later may carry the face, so it is thrown away
++ * whenever the page changes, or its selection context is rebuilt, or the
++ * number of sheets in it changes.
++ */
++static struct {
++	const struct html_content *page;
++	const css_select_ctx *ctx;
++	uint32_t n_sheets;
++	uint32_t n_families;
++	lwc_string *families[WEBFONT_MISS_MAX];
++} webfont_miss;
++
++static void webfont_miss_clear(void)
++{
++	uint32_t i;
++
++	for (i = 0; i < webfont_miss.n_families; i++)
++		lwc_string_unref(webfont_miss.families[i]);
++
++	webfont_miss.n_families = 0;
++	webfont_miss.page = NULL;
++	webfont_miss.ctx = NULL;
++	webfont_miss.n_sheets = 0;
++}
++
++/** Whether this page is already known to have no face for the family. */
++static bool webfont_missed(struct html_content *html, lwc_string *family)
++{
++	uint32_t n_sheets = 0;
++	uint32_t i;
++
++	if (css_select_ctx_count_sheets(html->select_ctx,
++			&n_sheets) != CSS_OK)
++		return false;
++
++	if (webfont_miss.page != html ||
++			webfont_miss.ctx != html->select_ctx ||
++			webfont_miss.n_sheets != n_sheets) {
++		webfont_miss_clear();
++		webfont_miss.page = html;
++		webfont_miss.ctx = html->select_ctx;
++		webfont_miss.n_sheets = n_sheets;
++		return false;
++	}
++
++	for (i = 0; i < webfont_miss.n_families; i++) {
++		if (webfont_miss.families[i] == family)
++			return true;
++	}
++
++	return false;
++}
++
++/** Remember that this page has no face for the family. */
++static void webfont_miss_add(struct html_content *html, lwc_string *family)
++{
++	/* the list belongs to whichever page webfont_missed() last saw, so
++	 * only add to it while that is still this one */
++	if (webfont_miss.page != html || webfont_miss.ctx != html->select_ctx)
++		return;
++
++	if (webfont_miss.n_families >= WEBFONT_MISS_MAX)
++		return;
++
++	webfont_miss.families[webfont_miss.n_families++] =
++			lwc_string_ref(family);
++}
++
+ /** A libcss font weight as a number. */
+ static int webfont_weight(uint8_t w)
+ {
+@@ -390,11 +469,18 @@ static void webfont_request_family(struct html_content *html,
+ 	if (webfont_generic(name) || webfont_family_known(name))
+ 		return;
+ 
++	if (webfont_missed(html, family))
++		return;
++
+ 	if (css_select_font_faces(html->select_ctx, &html->media,
+-			&html->unit_len_ctx, family, &faces) != CSS_OK ||
+-			faces == NULL)
++			&html->unit_len_ctx, family, &faces) != CSS_OK)
+ 		return;
+ 
++	if (faces == NULL) {
++		webfont_miss_add(html, family);
++		return;
++	}
++
+ 	/* the faces for other scripts are left alone while there is one
+ 	 * for this one; a family that is all symbols, as an icon font is,
+ 	 * has none and is fetched as it comes */
+@@ -497,4 +583,7 @@ void html_webfont_forget(struct html_content *html)
+ 		if (wf->owner == html)
+ 			wf->owner = NULL;
+ 	}
++
++	if (webfont_miss.page == html)
++		webfont_miss_clear();
+ }
