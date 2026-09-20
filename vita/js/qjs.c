@@ -1883,6 +1883,34 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 	return JS_DupValue(ctx, argv[1]);
 }
 
+static unsigned count_elements(struct dom_node *root);
+
+/*
+ * A clone that is worth a line of its own (VitaSurf). One cloneNode on
+ * a GitHub load took 879 ms and nothing said what it copied, so a slow
+ * one names the node and counts what came out of it: a single enormous
+ * subtree and a clone that is slow per node look the same in a total.
+ */
+#define CLONE_SLOW_MS 50
+
+static void clone_was_slow(struct dom_node *node, struct dom_node *copy,
+			   bool deep, unsigned took)
+{
+	dom_string *name = NULL;
+
+	if (dom_node_get_node_name(node, &name) != DOM_NO_ERR ||
+	    name == NULL) {
+		vita_log("qjs: a %s clone took %u ms for %u elements",
+			 deep ? "deep" : "shallow", took,
+			 count_elements(copy));
+		return;
+	}
+	vita_log("qjs: a %s clone of <%s> took %u ms for %u elements",
+		 deep ? "deep" : "shallow", dom_string_data(name), took,
+		 count_elements(copy));
+	dom_string_unref(name);
+}
+
 static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
@@ -1899,8 +1927,15 @@ static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	r = wrap_node(ctx, copy);
+	{
+		unsigned took = (unsigned)(now_ms() - y0);
+
+		if (took >= CLONE_SLOW_MS) {
+			clone_was_slow(node, copy, deep, took);
+		}
+		vitasurf_ms_js_clones += took;
+	}
 	dom_node_unref(copy);
-	vitasurf_ms_js_clones += (unsigned)(now_ms() - y0);
 	return r;
 	}
 
@@ -3413,36 +3448,46 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
  * handler -- so a bundle that takes longer to compile than the whole
  * budget must not have that time charged against its run.
  */
+/*
+ * How many seconds the next piece of work gets. Less each time this
+ * page has had a script stopped.
+ *
+ * Twenty seconds is a long time to let a script run, and it is meant to
+ * be generous enough that a page doing real work on a slow processor is
+ * never cut off. A page that has already had a script stopped is not
+ * that page: on YouTube two scripts each ran the full twenty seconds
+ * and were killed, forty seconds of a hundred-and-six second load that
+ * produced nothing, and the page rendered anyway. So halve it after
+ * each one, down to five seconds, which bounds what a runaway costs
+ * without touching a page that never overruns -- and almost none do.
+ */
+static unsigned budget_secs(jsthread *thread)
+{
+	unsigned secs, halvings;
+
+	if (thread->heap->timeout <= 0) {
+		return 0;
+	}
+	secs = (unsigned)thread->heap->timeout;
+	halvings = thread->scripts_killed;
+	if (halvings > 2) {
+		halvings = 2;
+	}
+	secs >>= halvings;
+	if (secs < 5) {
+		secs = 5;
+	}
+	return secs;
+}
+
 static void rearm_deadline(jsthread *thread)
 {
+	unsigned secs = budget_secs(thread);
+
 	thread->aborting = false;
 	thread->overrun_count = 0;
 	thread->overrun_said_ms = 0;
-	if (thread->heap->timeout > 0) {
-		/*
-		 * Less each time this page has had a script stopped.
-		 *
-		 * Twenty seconds is a long time to let a script run, and
-		 * it is meant to be generous enough that a page doing real
-		 * work on a slow processor is never cut off. A page that
-		 * has already had a script stopped is not that page: on
-		 * YouTube two scripts each ran the full twenty seconds and
-		 * were killed, forty seconds of a hundred-and-six second
-		 * load that produced nothing, and the page rendered anyway.
-		 * So halve it after each one, down to five seconds, which
-		 * bounds what a runaway costs without touching a page that
-		 * never overruns -- and almost none do.
-		 */
-		unsigned secs = (unsigned)thread->heap->timeout;
-		unsigned halvings = thread->scripts_killed;
-
-		if (halvings > 2) {
-			halvings = 2;
-		}
-		secs >>= halvings;
-		if (secs < 5) {
-			secs = 5;
-		}
+	if (secs != 0) {
 		thread->deadline_ms = now_ms() + (uint64_t)secs * 1000;
 	} else {
 		thread->deadline_ms = 0;
@@ -3498,6 +3543,33 @@ static void begin_script(jsthread *thread, enum script_why why)
 }
 
 static void schedule_relayout(jsthread *thread, int ms);
+
+/*
+ * How many job budgets the whole microtask drain may spend before it is
+ * cut off. Only a chain that re-queues itself should reach this, since
+ * no single job can outlast one budget. Two is still twice what the
+ * drain used to be allowed -- it had one budget for all its jobs
+ * together -- and covers the worst drain measured, a GitHub load that
+ * wanted a little over twenty seconds in one of its 74 drains.
+ */
+#define DRAIN_BUDGET_BUDGETS 2
+
+/** Say what the budget stopped, since a job that is killed leaves no
+ * other trace of what it was doing (VitaSurf). */
+static void drain_job_killed(unsigned took, unsigned nth, unsigned drain_ms,
+			     unsigned b_edits, unsigned b_attrs,
+			     unsigned b_wraps, unsigned b_html)
+{
+	vita_log("qjs: the budget stopped job %u of this drain after %u ms, "
+		 "%u ms into the drain; it had made %u tree edits and %u "
+		 "attribute sets, was handed a node %u times and parsed %u "
+		 "bytes of HTML",
+		 nth, took, drain_ms,
+		 vitasurf_js_dom_edits - b_edits,
+		 vitasurf_js_attr_sets - b_attrs,
+		 vitasurf_js_node_wraps - b_wraps,
+		 vitasurf_js_html_bytes - b_html);
+}
 
 static void end_script(jsthread *thread)
 {
@@ -3561,6 +3633,18 @@ static void end_script(jsthread *thread)
 	 * the script's own run has already been accounted for above and a
 	 * deadline that has passed would stop the first job on a page that
 	 * did nothing wrong.
+	 *
+	 * It is then armed afresh for each job as well, because one budget
+	 * across the whole drain punishes a page for doing a lot of small
+	 * pieces of work rather than one long one. A GitHub load ran a job
+	 * of 12110 ms and then had the next stopped after 6817 ms: neither
+	 * was a runaway, the two together simply passed twenty seconds,
+	 * and six and a half seconds of work was thrown away with the page
+	 * still half built. A job at a time is what the budget is meant to
+	 * bound. What it cannot bound that way is a chain that re-queues
+	 * itself -- Promise.resolve().then(again) -- where no single job is
+	 * slow, so the drain as a whole gets a ceiling of a few budgets to
+	 * stop that, and says so when it fires.
 	 */
 	rearm_deadline(thread);
 	{
@@ -3572,6 +3656,10 @@ static void end_script(jsthread *thread)
 		 * actually run.
 		 */
 		uint64_t j0 = now_ms(), jlast = j0;
+		unsigned secs = budget_secs(thread);
+		uint64_t drain_end = secs == 0 ? 0 :
+			j0 + (uint64_t)secs * DRAIN_BUDGET_BUDGETS * 1000;
+		unsigned in_drain = 0;
 		unsigned b_finds = vitasurf_js_finds;
 		unsigned b_edits = vitasurf_js_dom_edits;
 		unsigned b_html = vitasurf_js_html_bytes;
@@ -3590,6 +3678,20 @@ static void end_script(jsthread *thread)
 			int r;
 			uint64_t d0 = now_ms();
 
+			if (drain_end != 0 && d0 > drain_end) {
+				vitasurf_js_drains_capped++;
+				vita_log("qjs: the microtask queue is still "
+					 "going after %u ms and %u jobs, so "
+					 "the rest of it is dropped",
+					 (unsigned)(d0 - j0), in_drain);
+				break;
+			}
+			if (secs != 0) {
+				/* this job's own budget, not the drain's */
+				thread->deadline_ms = d0 +
+					(uint64_t)secs * 1000;
+			}
+
 			r = JS_ExecutePendingJob(thread->heap->rt, &c);
 			if (r <= 0) {
 				unsigned took = (unsigned)(now_ms() - d0);
@@ -3602,8 +3704,21 @@ static void end_script(jsthread *thread)
 				 * drains for a call that does nothing.
 				 */
 				if (r < 0) {
-					vitasurf_js_jobs_threw++;
-					vitasurf_ms_js_jobs_threw += took;
+					if (thread->overrun_count > 0) {
+						vitasurf_js_jobs_budget++;
+						vitasurf_ms_js_jobs_budget +=
+							took;
+						drain_job_killed(took,
+							in_drain + 1,
+							(unsigned)(now_ms() -
+								   j0),
+							b_edits, b_attrs,
+							b_wraps, b_html);
+					} else {
+						vitasurf_js_jobs_threw++;
+						vitasurf_ms_js_jobs_threw +=
+							took;
+					}
 					vitasurf_ms_js_jobs_sum += took;
 					if (took > vitasurf_ms_js_job_max) {
 						vitasurf_ms_js_job_max = took;
@@ -3686,8 +3801,17 @@ static void end_script(jsthread *thread)
 				b_txt = vitasurf_js_text_reads;
 			}
 			vitasurf_js_jobs++;
+			in_drain++;
 		}
-		vitasurf_ms_js_jobs += (unsigned)(now_ms() - j0);
+		{
+			unsigned drain_ms = (unsigned)(now_ms() - j0);
+
+			vitasurf_ms_js_jobs += drain_ms;
+			if (drain_ms > vitasurf_ms_js_drain_max) {
+				vitasurf_ms_js_drain_max = drain_ms;
+				vitasurf_js_drain_max_jobs = in_drain;
+			}
+		}
 	}
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;

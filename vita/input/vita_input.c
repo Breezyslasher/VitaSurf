@@ -1295,6 +1295,14 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_ms_js_drain_tail,
 				 vitasurf_js_jobs_threw,
 				 vitasurf_ms_js_jobs_threw);
+			vita_log("page: the budget stopped %u more jobs, "
+				 "costing %u ms, and cut %u drains short; "
+				 "the longest drain was %u ms over %u jobs",
+				 vitasurf_js_jobs_budget,
+				 vitasurf_ms_js_jobs_budget,
+				 vitasurf_js_drains_capped,
+				 vitasurf_ms_js_drain_max,
+				 vitasurf_js_drain_max_jobs);
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
@@ -1319,6 +1327,15 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				extern unsigned int css_hash_in_class;
 				extern unsigned int css_hash_in_id;
 				extern unsigned int css_hash_in_universal;
+				extern unsigned int css_hash_uni_attribute;
+				extern unsigned int css_hash_uni_pseudo_class;
+				extern unsigned int
+					css_hash_uni_pseudo_element;
+				extern unsigned int css_hash_uni_plain;
+				extern unsigned int css_select_steps_element;
+				extern unsigned int css_select_steps_class;
+				extern unsigned int css_select_steps_id;
+				extern unsigned int css_select_steps_universal;
 				extern unsigned int
 					css_select_cand_details_failed;
 				extern unsigned int
@@ -1379,6 +1396,21 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 "%u as universal",
 					 css_hash_in_element, css_hash_in_class,
 					 css_hash_in_id, css_hash_in_universal);
+				vita_log("page: finding them walked %u "
+					 "element, %u class, %u id and %u "
+					 "universal chain entries",
+					 css_select_steps_element,
+					 css_select_steps_class,
+					 css_select_steps_id,
+					 css_select_steps_universal);
+				vita_log("page: of the universal ones %u lead "
+					 "with an attribute, %u with a "
+					 "pseudo-class, %u with a "
+					 "pseudo-element and %u with nothing",
+					 css_hash_uni_attribute,
+					 css_hash_uni_pseudo_class,
+					 css_hash_uni_pseudo_element,
+					 css_hash_uni_plain);
 				vita_log("page: of those candidates %u were "
 					 "refused on their own compound, %u "
 					 "walking their combinators, and %u "
