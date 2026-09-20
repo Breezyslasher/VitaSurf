@@ -643,6 +643,7 @@ static JSClassDef node_class = {
 
 static struct dom_node *this_node(JSContext *ctx, JSValueConst this_val)
 {
+	vitasurf_js_binding_calls++;
 	return JS_GetOpaque2(ctx, this_val, node_class_id);
 }
 
@@ -669,6 +670,7 @@ static struct dom_node *this_element(JSContext *ctx, JSValueConst this_val)
 {
 	struct dom_node *node = JS_GetOpaque2(ctx, this_val, node_class_id);
 
+	vitasurf_js_binding_calls++;
 	return node_is_element(node) ? node : NULL;
 }
 
@@ -777,12 +779,17 @@ static JSValue node_get_node_type(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_text_content(JSContext *ctx, JSValueConst this_val)
 {
+	vitasurf_js_text_reads++;
+	{ uint64_t y0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
 	if (node == NULL) return JS_EXCEPTION;
 	dom_node_get_text_content(node, &s);
+	vitasurf_ms_js_text_reads += (unsigned)(now_ms() - y0);
 	return str_result(ctx, s);
+	}
+
 }
 
 /*
@@ -1879,6 +1886,8 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	vitasurf_js_clones++;
+	{ uint64_t y0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *copy = NULL;
 	bool deep = false;
@@ -1891,7 +1900,10 @@ static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 	}
 	r = wrap_node(ctx, copy);
 	dom_node_unref(copy);
+	vitasurf_ms_js_clones += (unsigned)(now_ms() - y0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_val,
@@ -3569,6 +3581,8 @@ static void end_script(jsthread *thread)
 		unsigned b_agets = vitasurf_js_attr_gets;
 		unsigned b_cn = vitasurf_js_childnodes;
 		unsigned b_tr = vitasurf_js_tree_reads;
+		unsigned b_bc = vitasurf_js_binding_calls;
+		unsigned b_txt = vitasurf_js_text_reads;
 
 		vitasurf_js_drains++;
 		for (;;) {
@@ -3639,6 +3653,12 @@ static void end_script(jsthread *thread)
 					vitasurf_job_max_tree_reads =
 						vitasurf_js_tree_reads -
 							b_tr;
+					vitasurf_job_max_bindings =
+						vitasurf_js_binding_calls -
+							b_bc;
+					vitasurf_job_max_text_reads =
+						vitasurf_js_text_reads -
+							b_txt;
 				}
 				if (took >= 5) {
 					vitasurf_js_jobs_slow++;
@@ -3662,6 +3682,8 @@ static void end_script(jsthread *thread)
 				b_agets = vitasurf_js_attr_gets;
 				b_cn = vitasurf_js_childnodes;
 				b_tr = vitasurf_js_tree_reads;
+				b_bc = vitasurf_js_binding_calls;
+				b_txt = vitasurf_js_text_reads;
 			}
 			vitasurf_js_jobs++;
 		}

@@ -1,0 +1,65 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 844dd55f8..e4bfc64c4 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -650,6 +650,13 @@ unsigned int vitasurf_js_tree_reads;
+ unsigned int vitasurf_ms_js_tree_reads;
+ unsigned int vitasurf_job_max_childnodes;
+ unsigned int vitasurf_job_max_tree_reads;
++unsigned int vitasurf_js_binding_calls;
++unsigned int vitasurf_js_text_reads;
++unsigned int vitasurf_ms_js_text_reads;
++unsigned int vitasurf_js_clones;
++unsigned int vitasurf_ms_js_clones;
++unsigned int vitasurf_job_max_bindings;
++unsigned int vitasurf_job_max_text_reads;
+ /* counted inside libcss, reset here with the rest (VitaSurf) */
+ extern unsigned int css_select_calls;
+ extern unsigned int css_select_sheets_seen;
+@@ -782,6 +789,13 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_tree_reads = 0;
+ 	vitasurf_job_max_childnodes = 0;
+ 	vitasurf_job_max_tree_reads = 0;
++	vitasurf_js_binding_calls = 0;
++	vitasurf_js_text_reads = 0;
++	vitasurf_ms_js_text_reads = 0;
++	vitasurf_js_clones = 0;
++	vitasurf_ms_js_clones = 0;
++	vitasurf_job_max_bindings = 0;
++	vitasurf_job_max_text_reads = 0;
+ 	css_select_calls = 0;
+ 	css_select_sheets_seen = 0;
+ 	css_select_selectors_considered = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 42e03d673..b1f3a4638 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -368,6 +368,28 @@ extern unsigned int vitasurf_js_tree_reads;
+ extern unsigned int vitasurf_ms_js_tree_reads;
+ extern unsigned int vitasurf_job_max_childnodes;
+ extern unsigned int vitasurf_job_max_tree_reads;
++/**
++ * How much of a job is in our bindings at all (VitaSurf).
++ *
++ * childNodes was the suspect and it is not: 36,047 rebuilds produced
++ * 38,539 children, a list of one on average, for 300 ms. Everything
++ * counted so far comes to about 3.3 s of a job that runs 12,090, so
++ * either the rest is in bindings nobody counts or it is the
++ * interpreter itself, and those want opposite fixes.
++ *
++ * Nearly every node binding starts by turning its JSValue back into a
++ * dom_node, so counting that one place bounds the question without
++ * touching two hundred functions. textContent and cloneNode are
++ * counted apart because both walk a subtree, which is the shape that
++ * would hide seconds.
++ */
++extern unsigned int vitasurf_js_binding_calls;
++extern unsigned int vitasurf_js_text_reads;
++extern unsigned int vitasurf_ms_js_text_reads;
++extern unsigned int vitasurf_js_clones;
++extern unsigned int vitasurf_ms_js_clones;
++extern unsigned int vitasurf_job_max_bindings;
++extern unsigned int vitasurf_job_max_text_reads;
+ 
+ /*
+  * The scheduler's callbacks (VitaSurf). A GitHub page load reports

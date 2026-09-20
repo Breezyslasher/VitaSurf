@@ -1189,6 +1189,15 @@ void vita_input_load_finished(struct gui_window *gw)
 				 "rebuilds and %u of those walks",
 				 vitasurf_job_max_childnodes,
 				 vitasurf_job_max_tree_reads);
+			vita_log("page: the bindings were entered %u times "
+				 "in all, %u of them in the longest job; it "
+				 "read textContent %u times for %u ms and "
+				 "cloned a node %u times for %u ms",
+				 vitasurf_js_binding_calls,
+				 vitasurf_job_max_bindings,
+				 vitasurf_js_text_reads,
+				 vitasurf_ms_js_text_reads,
+				 vitasurf_js_clones, vitasurf_ms_js_clones);
 			vita_log("page: the drain ran %u times, %u ms of it "
 				 "was the call that found nothing left, and "
 				 "%u jobs threw, costing %u ms",
