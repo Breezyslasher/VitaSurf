@@ -224,6 +224,53 @@ void vita_log_memory(const char *what)
 		 (unsigned int)info.size_user / 1024,
 		 (unsigned int)info.size_cdram / 1024,
 		 (unsigned int)info.size_phycont / 1024);
+
+	/*
+	 * What a small allocation costs right now (VitaSurf).
+	 *
+	 * setAttribute costs 1.13 ms a call on a GitHub load and 0.011 ms
+	 * on a host doing the same work with the same MutationObserver
+	 * registered -- a hundredfold, where the machines are twelve to
+	 * twenty apart on everything else. Each call allocates several
+	 * times over, and newlib's malloc is one best-fit free list where
+	 * glibc has tcache and fastbins, so a list this long would make
+	 * every small allocation walk it. That is the same shape as the
+	 * kilobyte-at-a-time fread: fine on the host, pathological here.
+	 *
+	 * So measure it instead of arguing about it. A thousand small
+	 * blocks are taken and freed in an order that leaves the list as
+	 * it was found, and the count of free chunks says how long the
+	 * list is. Both are printed beside the heap size, so a log shows
+	 * whether the cost climbs with the heap.
+	 */
+	{
+		enum { MALLOC_PROBE_N = 1000 };
+		static void *probe[MALLOC_PROBE_N];
+		uint64_t t0, t_alloc, t_free;
+		unsigned i;
+
+		t0 = sceKernelGetProcessTimeWide();
+		for (i = 0; i < MALLOC_PROBE_N; i++) {
+			/* the sizes a dom_string, a JSString and a wrapper
+			 * actually ask for */
+			probe[i] = malloc(24 + (i % 5) * 16);
+		}
+		t_alloc = sceKernelGetProcessTimeWide() - t0;
+
+		t0 = sceKernelGetProcessTimeWide();
+		for (i = 0; i < MALLOC_PROBE_N; i++) {
+			free(probe[i]);
+			probe[i] = NULL;
+		}
+		t_free = sceKernelGetProcessTimeWide() - t0;
+
+		vita_log("memory (%s): 1000 small blocks took %u us to "
+			 "allocate and %u us to free, with %u free chunks "
+			 "holding %u KB",
+			 what, (unsigned int)t_alloc, (unsigned int)t_free,
+			 (unsigned int)mi.ordblks,
+			 (unsigned int)mi.fordblks / 1024);
+	}
 }
 
 int vita_platform_poll_resume(void)
