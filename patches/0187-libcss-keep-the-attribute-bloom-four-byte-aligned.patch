@@ -1,0 +1,149 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 66a7cc0..77d0ef7 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -24,9 +24,9 @@ typedef struct hash_entry {
+ 	css_bloom sel_chain_bloom[CSS_BLOOM_SIZE];
+ 	/* CSS_NODE_STATE_* the key compound needs, 0 for none (VitaSurf) */
+ 	uint32_t needs_state;
+-	/* the attribute names the key compound needs, 0 for none
++	/* the attribute names the key compound needs, empty for none
+ 	 * (VitaSurf) */
+-	uint64_t needs_attrs;
++	css_attr_bloom needs_attrs;
+ 	struct hash_entry *next;
+ } hash_entry;
+ 
+@@ -159,15 +159,16 @@ uint32_t css_attribute_name_hash(const char *name, size_t len)
+ 	return h;
+ }
+ 
+-uint64_t css_attribute_bloom_bits(uint32_t hash)
++void css_attribute_bloom_add(css_attr_bloom *bloom, uint32_t hash)
+ {
+-	return (1ull << (hash & 63)) | (1ull << ((hash >> 8) & 63));
++	bloom->w[(hash >> 5) & 1] |= 1u << (hash & 31);
++	bloom->w[(hash >> 14) & 1] |= 1u << ((hash >> 9) & 31);
+ }
+ 
+-static uint64_t _attrs_needed(const css_selector *selector)
++static css_attr_bloom _attrs_needed(const css_selector *selector)
+ {
+ 	const css_selector_detail *d = &selector->data;
+-	uint64_t bits = 0;
++	css_attr_bloom bits = { { 0, 0 } };
+ 
+ 	do {
+ 		switch (d->type) {
+@@ -179,7 +180,7 @@ static uint64_t _attrs_needed(const css_selector *selector)
+ 		case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
+ 		case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
+ 			if (d->negate == 0 && d->qname.name != NULL) {
+-				bits |= css_attribute_bloom_bits(
++				css_attribute_bloom_add(&bits,
+ 					css_attribute_name_hash(
+ 					lwc_string_data(d->qname.name),
+ 					lwc_string_length(d->qname.name)));
+@@ -231,8 +232,8 @@ static bool _attr_key(const css_selector *selector, uint32_t *key)
+ #define RULE_WANTS_WHAT_NODE_HAS(e, req) \
+ 	(((e)->needs_state == 0 || \
+ 	  ((req)->node_state & (e)->needs_state) != 0) && \
+-	 ((e)->needs_attrs == 0 || \
+-	  ((req)->attr_bloom & (e)->needs_attrs) == (e)->needs_attrs))
++	 (CSS_ATTR_BLOOM_EMPTY(&(e)->needs_attrs) || \
++	  CSS_ATTR_BLOOM_HAS(&(req)->attr_bloom, &(e)->needs_attrs)))
+ 
+ static inline lwc_string *_class_name(const css_selector *selector);
+ static inline lwc_string *_id_name(const css_selector *selector);
+diff --git a/src/select/hash.h b/src/select/hash.h
+index 7ffd625..ccaccb4 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -62,6 +62,30 @@ typedef struct css_selector_hash css_selector_hash;
+  */
+ #define CSS_SELECTOR_HASH_SLOTS (1 << 6)
+ 
++/**
++ * A bloom of attribute names (VitaSurf).
++ *
++ * Two words rather than one uint64_t: the hash iterators reach an
++ * entry by casting a css_selector ** to it, and a member wanting
++ * eight-byte alignment makes that cast an error on ARM under
++ * -Wcast-align. Two words are also two instructions there rather than
++ * the several a 64-bit and takes.
++ */
++typedef struct css_attr_bloom {
++	uint32_t w[2];
++} css_attr_bloom;
++
++/** Fold an attribute-name hash into a bloom. */
++void css_attribute_bloom_add(css_attr_bloom *bloom, uint32_t hash);
++
++/** Whether every name \a want asks for is one \a have carries. */
++#define CSS_ATTR_BLOOM_HAS(have, want) \
++	((((have)->w[0] & (want)->w[0]) == (want)->w[0]) && \
++	 (((have)->w[1] & (want)->w[1]) == (want)->w[1]))
++
++/** Whether a bloom asks for nothing at all. */
++#define CSS_ATTR_BLOOM_EMPTY(b)	(((b)->w[0] | (b)->w[1]) == 0)
++
+ struct css_hash_selection_requirments {
+ 	css_qname qname;		/* Element name, or universal "*" */
+ 	lwc_string *class;		/* Name of class, or NULL */
+@@ -71,13 +95,10 @@ struct css_hash_selection_requirments {
+ 	const css_unit_ctx *unit_ctx;	/* Document unit conversion context. */
+ 	const css_bloom *node_bloom;	/* Node's bloom filter */
+ 	uint32_t node_state;		/* CSS_NODE_STATE_* the node is in */
+-	uint64_t attr_bloom;		/* names of the node's attributes */
++	css_attr_bloom attr_bloom;	/* names of the node's attributes */
+ 	uint32_t attr_slot;		/* attribute bucket to search */
+ };
+ 
+-/** The bloom bits an attribute-name hash contributes (VitaSurf). */
+-uint64_t css_attribute_bloom_bits(uint32_t hash);
+-
+ typedef css_error (*css_selector_hash_iterator)(
+ 		const struct css_hash_selection_requirments *req,
+ 		const struct css_selector **current,
+diff --git a/src/select/select.c b/src/select/select.c
+index 925c380..cb3a34f 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -1377,19 +1377,21 @@ static void css_select__note_attributes(css_select_state *state, void *node,
+ 	if (handler->node_attribute_hashes == NULL ||
+ 			n > CSS_ATTRIBUTE_HASHES_MAX) {
+ 		/* nothing is known, so nothing is ruled out */
+-		state->attr_bloom = ~(uint64_t) 0;
++		state->attr_bloom.w[0] = ~(uint32_t) 0;
++		state->attr_bloom.w[1] = ~(uint32_t) 0;
+ 		state->n_attr_slots = CSS_SELECTOR_HASH_SLOTS;
+ 		for (i = 0; i < CSS_SELECTOR_HASH_SLOTS; i++)
+ 			state->attr_slots[i] = (uint8_t) i;
+ 		return;
+ 	}
+ 
+-	state->attr_bloom = 0;
++	state->attr_bloom.w[0] = 0;
++	state->attr_bloom.w[1] = 0;
+ 	state->n_attr_slots = 0;
+ 	for (i = 0; i < n; i++) {
+ 		uint32_t slot = hashes[i] & (CSS_SELECTOR_HASH_SLOTS - 1);
+ 
+-		state->attr_bloom |= css_attribute_bloom_bits(hashes[i]);
++		css_attribute_bloom_add(&state->attr_bloom, hashes[i]);
+ 		if ((seen[slot >> 6] & (1ull << (slot & 63))) != 0)
+ 			continue;
+ 		seen[slot >> 6] |= 1ull << (slot & 63);
+diff --git a/src/select/select.h b/src/select/select.h
+index d20140d..4f272c7 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -83,7 +83,7 @@ typedef struct css_select_state {
+ 	 * be read gets every bucket and a bloom of all ones, which
+ 	 * skips nothing.
+ 	 */
+-	uint64_t attr_bloom;
++	css_attr_bloom attr_bloom;
+ 	uint32_t n_attr_slots;
+ 	uint8_t attr_slots[CSS_SELECTOR_HASH_SLOTS];
+ 	const css_media *media;		/* Currently active media spec */

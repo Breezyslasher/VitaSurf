@@ -77,6 +77,7 @@ Each phase must work on real hardware before the next one starts.
 - TITLE_ID must be exactly 4 uppercase letters followed by 5 digits. A wrong format fails installation at 95-97%.
 - Never use `%zu` or other size_t/64-bit format specifiers. They print garbage on the 32-bit Vita. Use `%d` or `%u` with explicit casts.
 - Vita3K can pass things that fail on hardware, especially IME and startup initialization. Hardware results are the source of truth.
+- ARMv7 needs stricter alignment than x86, and the native harness cannot see it. A struct member wanting 8-byte alignment (a `uint64_t`) makes any cast to that struct from a less-aligned pointer an error under the Vita build's `-Werror=cast-align`, while the same code compiles clean natively because gcc only warns for the host's alignment rules. Check a touched file with `gcc -c -Wcast-align=strict -Werror` before pushing, and prefer two `uint32_t` to one `uint64_t` in a struct reached by a cast.
 - IME is fragile. Call `sceCommonDialogSetConfigParam()` before showing dialogs and keep IME buffers static or otherwise long-lived. Some IME initialization changes break app loading, so change IME code carefully and regression-test on hardware.
 
 ## Browser-specific notes
