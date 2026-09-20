@@ -1276,6 +1276,7 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	vitasurf_js_attr_sets++;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name, *value;
 	dom_string *key, *val;
@@ -1756,6 +1757,7 @@ static JSValue inserted_nodes(JSContext *ctx, struct dom_node *child,
 static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	vitasurf_js_dom_edits++;
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *before = NULL, *ref = NULL;
 	JSValue added;
@@ -1903,6 +1905,7 @@ static JSValue node_get_owner_document(JSContext *ctx, JSValueConst this_val)
 static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	vitasurf_js_dom_edits++;
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *ref = NULL;
 	JSValue added;
@@ -1923,6 +1926,7 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	vitasurf_js_dom_edits++;
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *ref = NULL;
 
@@ -2091,6 +2095,7 @@ out:
 static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 				   JSValueConst val)
 {
+	vitasurf_js_html_sets++;
 	struct dom_node *node = this_node(ctx, this_val);
 	size_t len = 0;
 	const char *s;
@@ -2107,6 +2112,7 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 		s = JS_ToCStringLen(ctx, &len, val);
 	}
 	if (s != NULL) {
+		vitasurf_js_html_bytes += (unsigned) len;
 		set_inner_html(node, s, len);
 		JS_FreeCString(ctx, s);
 		mark_dirty(ctx);
@@ -3471,6 +3477,11 @@ static void end_script(jsthread *thread)
 		 * actually run.
 		 */
 		uint64_t j0 = now_ms(), jlast = j0;
+		unsigned b_finds = vitasurf_js_finds;
+		unsigned b_edits = vitasurf_js_dom_edits;
+		unsigned b_html = vitasurf_js_html_bytes;
+		unsigned b_attrs = vitasurf_js_attr_sets;
+		unsigned b_styles = vitasurf_js_style_reads;
 
 		for (;;) {
 			JSContext *c = NULL;
@@ -3487,12 +3498,44 @@ static void end_script(jsthread *thread)
 
 				if (took > vitasurf_ms_js_job_max) {
 					vitasurf_ms_js_job_max = took;
+					/*
+					 * and what it did, so a job of
+					 * fourteen seconds names its own
+					 * work (VitaSurf)
+					 */
+					vitasurf_job_max_finds =
+						vitasurf_js_finds - b_finds;
+					vitasurf_job_max_edits =
+						vitasurf_js_dom_edits -
+							b_edits;
+					vitasurf_job_max_html =
+						vitasurf_js_html_bytes -
+							b_html;
+					vitasurf_job_max_attrs =
+						vitasurf_js_attr_sets -
+							b_attrs;
+					vitasurf_job_max_styles =
+						vitasurf_js_style_reads -
+							b_styles;
 				}
 				if (took >= 5) {
 					vitasurf_js_jobs_slow++;
 					vitasurf_ms_js_jobs_slow += took;
 				}
+				/*
+				 * Every job, so the drain total minus this
+				 * is what the loop itself costs: a GitHub
+				 * load reports 20440 ms of jobs where the
+				 * ones counted come to 15680, and nothing
+				 * says where the other 4760 went.
+				 */
+				vitasurf_ms_js_jobs_sum += took;
 				jlast = j1;
+				b_finds = vitasurf_js_finds;
+				b_edits = vitasurf_js_dom_edits;
+				b_html = vitasurf_js_html_bytes;
+				b_attrs = vitasurf_js_attr_sets;
+				b_styles = vitasurf_js_style_reads;
 			}
 			vitasurf_js_jobs++;
 		}
@@ -4815,6 +4858,7 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
 static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
+	vitasurf_js_style_reads++;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node;
 	struct box *box;

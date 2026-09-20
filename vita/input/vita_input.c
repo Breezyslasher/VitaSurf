@@ -1113,6 +1113,32 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_js_job_max,
 				 vitasurf_js_jobs_slow,
 				 vitasurf_ms_js_jobs_slow);
+			vita_log("page: the jobs themselves are %u ms of "
+				 "that, so %u ms is the drain loop around "
+				 "them",
+				 vitasurf_ms_js_jobs_sum,
+				 vitasurf_ms_js_jobs >
+					vitasurf_ms_js_jobs_sum ?
+					vitasurf_ms_js_jobs -
+						vitasurf_ms_js_jobs_sum : 0);
+			vita_log("page: the longest job asked the tree %u "
+				 "times, made %u tree edits, %u attribute "
+				 "sets, %u computed style reads and parsed "
+				 "%u bytes of HTML",
+				 vitasurf_job_max_finds,
+				 vitasurf_job_max_edits,
+				 vitasurf_job_max_attrs,
+				 vitasurf_job_max_styles,
+				 vitasurf_job_max_html);
+			vita_log("page: over the whole page that is %u tree "
+				 "edits, %u attribute sets, %u computed "
+				 "style reads and %u innerHTML sets of %u "
+				 "bytes",
+				 vitasurf_js_dom_edits,
+				 vitasurf_js_attr_sets,
+				 vitasurf_js_style_reads,
+				 vitasurf_js_html_sets,
+				 vitasurf_js_html_bytes);
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
