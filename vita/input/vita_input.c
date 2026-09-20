@@ -1137,6 +1137,19 @@ void vita_input_load_finished(struct gui_window *gw)
 				extern unsigned int css_hash_in_class;
 				extern unsigned int css_hash_in_id;
 				extern unsigned int css_hash_in_universal;
+				extern unsigned int
+					css_select_cand_details_failed;
+				extern unsigned int
+					css_select_cand_comb_failed;
+				extern unsigned int css_select_cand_matched;
+				extern unsigned int
+					css_select_refused_by_attribute;
+				extern unsigned int
+					css_select_refused_by_pseudo_class;
+				extern unsigned int
+					css_select_refused_by_pseudo_element;
+				extern unsigned int
+					css_select_refused_by_other;
 
 				vita_log("page: building those boxes was %u ms in "
 				 "the elements and %u ms in %u text nodes, "
@@ -1178,6 +1191,21 @@ void vita_input_load_finished(struct gui_window *gw)
 					 "%u as universal",
 					 css_hash_in_element, css_hash_in_class,
 					 css_hash_in_id, css_hash_in_universal);
+				vita_log("page: of those candidates %u were "
+					 "refused on their own compound, %u "
+					 "walking their combinators, and %u "
+					 "matched",
+					 css_select_cand_details_failed,
+					 css_select_cand_comb_failed,
+					 css_select_cand_matched);
+				vita_log("page: the compound ones were "
+					 "refused by %u attribute, %u "
+					 "pseudo-class, %u pseudo-element and "
+					 "%u other details",
+					 css_select_refused_by_attribute,
+					 css_select_refused_by_pseudo_class,
+					 css_select_refused_by_pseudo_element,
+					 css_select_refused_by_other);
 			}
 			vita_log("page: attribute selectors asked for a name "
 				 "%u times, interning it %u of them",

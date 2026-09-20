@@ -1,0 +1,106 @@
+diff --git a/src/select/select.c b/src/select/select.c
+index f4194df..ee22147 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -140,6 +140,28 @@ unsigned int css_select_from_element;
+ unsigned int css_select_from_class;
+ unsigned int css_select_from_id;
+ unsigned int css_select_from_universal;
++/*
++ * And where a candidate dies (VitaSurf). 16.9 million are offered on a
++ * GitHub load and 99.6% come out of the universal chain, but only 1.07
++ * million ever reach an attribute test, so nine in ten of the rules an
++ * attribute index would remove are already being refused by something
++ * cheaper. Which something decides what is worth indexing: a candidate
++ * refused on its key compound wants that compound indexed, one refused
++ * walking its combinators wants the ancestor filter, and one that
++ * matches is work the page actually asked for.
++ */
++unsigned int css_select_cand_details_failed;
++unsigned int css_select_cand_comb_failed;
++unsigned int css_select_cand_matched;
++/*
++ * For the ones refused on their key compound, which detail said no.
++ * The types are libcss's own CSS_SELECTOR_*; anything that is not an
++ * attribute or a pseudo lands in "other".
++ */
++unsigned int css_select_refused_by_attribute;
++unsigned int css_select_refused_by_pseudo_class;
++unsigned int css_select_refused_by_pseudo_element;
++unsigned int css_select_refused_by_other;
+ 
+ static css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet, css_select_state *state);
+@@ -2468,8 +2490,10 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 		return error;
+ 
+ 	/* Details don't match, so reject selector chain */
+-	if (match == false)
++	if (match == false) {
++		css_select_cand_details_failed++;
+ 		return CSS_OK;
++	}
+ 
+ 	/* Iterate up the selector chain, matching combinators */
+ 	do {
+@@ -2490,8 +2514,10 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 				return error;
+ 
+ 			/* No match for combinator, so reject selector chain */
+-			if (next_node == NULL)
++			if (next_node == NULL) {
++				css_select_cand_comb_failed++;
+ 				return CSS_OK;
++			}
+ 		} else if (s->data.comb != CSS_COMBINATOR_NONE) {
+ 			/* Universal combinator */
+ 			may_optimise &=
+@@ -2507,6 +2533,8 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 
+ 			/* No match for combinator, so reject selector chain */
+ 			if (next_node == NULL) {
++				css_select_cand_comb_failed++;
++
+ 				if (may_optimise && s == selector &&
+ 						rejected_by_cache == false) {
+ 					update_reject_cache(state, s->data.comb,
+@@ -2523,6 +2551,7 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 	} while (s != NULL);
+ 
+ 	/* If we got here, then the entire selector chain matched, so cascade */
++	css_select_cand_matched++;
+ 	state->current_specificity = selector->specificity;
+ 
+ 	/* Ensure that the appropriate computed style exists */
+@@ -2756,8 +2785,30 @@ css_error match_details(css_select_ctx *ctx, void *node,
+ 			return error;
+ 
+ 		/* Detail doesn't match, so reject selector chain */
+-		if (*match == false)
++		if (*match == false) {
++			/* say which kind of detail refused it (VitaSurf) */
++			switch (detail->type) {
++			case CSS_SELECTOR_PSEUDO_CLASS:
++				css_select_refused_by_pseudo_class++;
++				break;
++			case CSS_SELECTOR_PSEUDO_ELEMENT:
++				css_select_refused_by_pseudo_element++;
++				break;
++			case CSS_SELECTOR_ATTRIBUTE:
++			case CSS_SELECTOR_ATTRIBUTE_EQUAL:
++			case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
++			case CSS_SELECTOR_ATTRIBUTE_INCLUDES:
++			case CSS_SELECTOR_ATTRIBUTE_PREFIX:
++			case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
++			case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
++				css_select_refused_by_attribute++;
++				break;
++			default:
++				css_select_refused_by_other++;
++				break;
++			}
+ 			return CSS_OK;
++		}
+ 
+ 		if (detail->next)
+ 			detail++;
