@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!-- :host can never match here: there are no shadow trees. It is parsed
+     only so that ":root, :host { ... }", which is how Tailwind 4 writes
+     every custom property it defines, keeps its :root half instead of
+     the whole selector list being thrown away as invalid.
+
+     So the rule must still apply through :root, while the :host
+     selector itself reaches nothing. The universal chain steps over a
+     :host key compound for every element, and skipping the rule rather
+     than that one selector would take Tailwind's palette with it.
+
+     Asserted through layout: this build's getComputedStyle answers with
+     defaults for colours. -->
+<html><head><meta charset="utf-8"><title>:host matching</title><style>
+:root, :host { padding-left: 70px; }
+:host { margin-left: 400px; }
+:host(.x) { margin-left: 400px; }
+</style></head><body>
+<div id="a">a</div>
+<div><div id="b">b</div></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function left(id){
+  return document.getElementById(id).getBoundingClientRect().left;
+}
+setTimeout(function(){
+  /* the root takes 70px of padding and body its default 8px margin */
+  ok(":root, :host still applies through its :root half", left("a") === 78);
+  /* a bare :host rule reaches nothing, so nothing moves by 400 */
+  ok("a :host rule reaches no element", left("b") === 78);
+  console.log("HOST DONE");
+}, 60);
+</script>
+</body></html>
