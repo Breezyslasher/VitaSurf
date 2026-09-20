@@ -1049,6 +1049,75 @@ void vita_input_dump_layout_now(void)
 }
 
 
+/*
+ * A page that builds itself after it has loaded (VitaSurf).
+ *
+ * The report fires when the document finishes, and on a page rendered
+ * by its own JavaScript that is before the page exists. Build 400
+ * reported a GitHub profile at 21545 ms over 711 elements, and then
+ * spent another forty-six seconds on it -- a callback of 21204 ms, one
+ * of 12577, and a layout declined at 3602 elements -- none of it in
+ * the report, and none of it comparable with build 398's 60533 ms over
+ * 6270 elements, which happened to finish inside the window.
+ *
+ * So keep watching. vita_input_settled() is called once a second from
+ * the frame loop with how busy the scheduler was; when a page has done
+ * real work since its report and has then been quiet for a few
+ * seconds, the report is written again with what it cost.
+ */
+static unsigned long long page_started_us;
+static bool settle_watching;
+static unsigned int settle_busy_ms;
+static unsigned int settle_quiet_ms;
+static unsigned int settle_reports;
+
+/** How much work after the report is worth reporting again. */
+#define SETTLE_BUSY_MS 500
+/** How long the scheduler must be quiet before the page has settled. */
+#define SETTLE_QUIET_MS 3000
+/** The most follow-up reports one page gets, so a busy page cannot
+ * fill the log with them. */
+#define SETTLE_REPORTS_MAX 3
+
+void vita_input_settled(unsigned int sched_ms, unsigned int span_ms)
+{
+	if (settle_watching == false || the_gw == NULL) {
+		return;
+	}
+
+	/* a tenth of a second of scheduler in a second is work, not idle */
+	if (sched_ms > span_ms / 10) {
+		settle_busy_ms += sched_ms;
+		settle_quiet_ms = 0;
+		return;
+	}
+
+	settle_quiet_ms += span_ms;
+	if (settle_quiet_ms < SETTLE_QUIET_MS) {
+		return;
+	}
+
+	settle_quiet_ms = 0;
+	if (settle_busy_ms < SETTLE_BUSY_MS) {
+		/* nothing happened worth another report; stop watching */
+		settle_watching = false;
+		return;
+	}
+
+	vita_log("page: and then %u ms more work after it had loaded, "
+		 "which the figures above do not include; what follows is "
+		 "the page as it settled", settle_busy_ms);
+	settle_busy_ms = 0;
+	if (++settle_reports >= SETTLE_REPORTS_MAX) {
+		settle_watching = false;
+	}
+	/* the counters have run since the page started, so the span they
+	 * are measured against is the whole of it */
+	vita_input_report_page(the_gw, page_started_us == 0 ? 0 :
+			(unsigned int)((sceKernelGetProcessTimeWide() -
+					page_started_us) / 1000));
+}
+
 void vita_input_load_finished(struct gui_window *gw)
 {
 	nsurl *url = NULL;
@@ -1058,11 +1127,32 @@ void vita_input_load_finished(struct gui_window *gw)
 		return;
 	}
 	ms = (unsigned int)((sceKernelGetProcessTimeWide() - load_started_us) / 1000);
+	page_started_us = load_started_us;
 	load_started_us = 0;
+	settle_watching = true;
+	settle_busy_ms = 0;
+	settle_quiet_ms = 0;
+	settle_reports = 0;
 	/* a LiveArea close never reaches gui_quit, so save as we go */
 	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
+		nsurl_unref(url);
+		url = NULL;
+	}
+	vita_input_report_page(gw, ms);
+}
+
+/* The figures for the page as it stands, written when it loads and
+ * again if it keeps working afterwards (VitaSurf). */
+void vita_input_report_page(struct gui_window *gw, unsigned int ms)
+{
+	nsurl *url = NULL;
+
+	if (gw == NULL) {
+		return;
+	}
+	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		dump_layout(gw, false);
 		{
 			/*

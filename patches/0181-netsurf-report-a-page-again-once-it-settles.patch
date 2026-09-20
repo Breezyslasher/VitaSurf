@@ -1,0 +1,15 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 1cf151ba4..e6c6a1400 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -735,6 +735,10 @@ static void framebuffer_run(void)
+ 				 (unsigned) (wait_us / 1000),
+ 				 (unsigned) (draw_us / 1000),
+ 				 boxes, kpixels, gpu_ms);
++			/* a page that builds itself after it has loaded
++			 * is reported again once it goes quiet */
++			vita_input_settled((unsigned)(sched_us / 1000),
++					   (unsigned)(span / 1000));
+ 			report_us = vita_now_us();
+ 			sched_us = wait_us = draw_us = 0;
+ 			rounds = 0;
