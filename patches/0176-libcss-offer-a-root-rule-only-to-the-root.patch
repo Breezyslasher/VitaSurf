@@ -1,0 +1,220 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 0c345f0..e6ffaf2 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -20,6 +20,8 @@
+ typedef struct hash_entry {
+ 	const css_selector *sel;
+ 	css_bloom sel_chain_bloom[CSS_BLOOM_SIZE];
++	/* CSS_NODE_STATE_* the key compound needs, 0 for none (VitaSurf) */
++	uint32_t needs_state;
+ 	struct hash_entry *next;
+ } hash_entry;
+ 
+@@ -44,6 +46,30 @@ struct css_selector_hash {
+ 
+ static hash_entry empty_slot;
+ 
++/**
++ * Whether a key compound can only match the document root (VitaSurf).
++ *
++ * A compound matches only if every detail in it does, so one asking for
++ * :root settles the whole thing for every element but one. A negated
++ * :root is the opposite test and is left alone.
++ */
++static uint32_t _state_needed(const css_selector *selector)
++{
++	const css_selector_detail *d = &selector->data;
++
++	do {
++		if (d->type == CSS_SELECTOR_PSEUDO_CLASS && d->negate == 0 &&
++				d->qname.name != NULL &&
++				lwc_string_length(d->qname.name) == 4 &&
++				strncasecmp(lwc_string_data(d->qname.name),
++					"root", 4) == 0) {
++			return CSS_NODE_STATE_ROOT;
++		}
++	} while (d->next != 0 && (d = d + 1) != NULL);
++
++	return 0;
++}
++
+ static inline lwc_string *_class_name(const css_selector *selector);
+ static inline lwc_string *_id_name(const css_selector *selector);
+ static css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+@@ -646,6 +672,12 @@ css_error css__selector_hash_find_universal(css_selector_hash *hash,
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			if (RULE_HAS_BYTECODE(head) &&
++			    /* only the root can match a :root compound
++			     * (VitaSurf) -- this loop finds the first
++			     * entry and _iterate_universal the rest, so
++			     * both need the test */
++			    (head->needs_state == 0 ||
++			     (req->node_state & head->needs_state) != 0) &&
+ 			    css_bloom_in_bloom(
+ 					head->sel_chain_bloom,
+ 					req->node_bloom) &&
+@@ -862,6 +894,7 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ 		head->sel = selector;
+ 		head->next = NULL;
+ 		_chain_bloom_generate(selector, head->sel_chain_bloom);
++		head->needs_state = _state_needed(selector);
+ 
+ #ifdef PRINT_CHAIN_BLOOM_DETAILS
+ 		print_chain_bloom_details(head->sel_chain_bloom);
+@@ -901,6 +934,7 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ 
+ 		entry->sel = selector;
+ 		_chain_bloom_generate(selector, entry->sel_chain_bloom);
++		entry->needs_state = _state_needed(selector);
+ 
+ #ifdef PRINT_CHAIN_BLOOM_DETAILS
+ 		print_chain_bloom_details(entry->sel_chain_bloom);
+@@ -1159,6 +1193,10 @@ css_error _iterate_universal(
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			if (RULE_HAS_BYTECODE(head) &&
++			    /* only the root can match a :root compound
++			     * (VitaSurf) */
++			    (head->needs_state == 0 ||
++			     (req->node_state & head->needs_state) != 0) &&
+ 			    css_bloom_in_bloom(
+ 					head->sel_chain_bloom,
+ 					req->node_bloom) &&
+diff --git a/src/select/hash.h b/src/select/hash.h
+index 5f48a38..906fc37 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -22,6 +22,26 @@ struct css_selector;
+ 
+ typedef struct css_selector_hash css_selector_hash;
+ 
++/**
++ * A key compound that can only match the document root (VitaSurf).
++ *
++ * :root matches exactly one element in a document, and a rule whose key
++ * compound carries no name, class or id is filed in the universal chain
++ * and handed to every element there is. On a GitHub load 15,564,220 of
++ * the 15,615,612 pseudo-class refusals are of this kind, and on the
++ * saved copy of that page 94% of them are :root -- 69,824 refusals for
++ * rules that could only ever have matched the html element. Themes and
++ * design tokens are written as :root blocks, so a site ships a great
++ * many of them.
++ *
++ * The rule records that it needs the root, the element is asked once
++ * whether it is, and the chain steps over the rest. Nothing that could
++ * have matched is skipped: it is the same question match_detail asks,
++ * and a negated :root is left alone because that matches everything
++ * else.
++ */
++#define CSS_NODE_STATE_ROOT	(1u << 0)
++
+ struct css_hash_selection_requirments {
+ 	css_qname qname;		/* Element name, or universal "*" */
+ 	lwc_string *class;		/* Name of class, or NULL */
+@@ -30,6 +50,7 @@ struct css_hash_selection_requirments {
+ 	const css_media *media;		/* Media spec we're selecting for */
+ 	const css_unit_ctx *unit_ctx;	/* Document unit conversion context. */
+ 	const css_bloom *node_bloom;	/* Node's bloom filter */
++	uint32_t node_state;		/* CSS_NODE_STATE_* the node is in */
+ };
+ 
+ typedef css_error (*css_selector_hash_iterator)(
+diff --git a/src/select/select.c b/src/select/select.c
+index 619b070..f5f01c1 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -177,6 +177,21 @@ unsigned int css_select_pseudo_form;
+ unsigned int css_select_pseudo_has;
+ unsigned int css_select_pseudo_other;
+ unsigned int css_select_refused_negated;
++/*
++ * And the names behind "other", which is 15,564,220 of a GitHub load's
++ * 15,615,612 pseudo-class refusals -- not dynamic, not structural, not
++ * form, not :has. Whatever it is refuses nearly every candidate the
++ * page offers, so name it rather than infer it from the stylesheets.
++ * A small table is enough: the refusals are concentrated, and anything
++ * past it is counted without a name.
++ */
++#define PSEUDO_NAME_SLOTS 8
++struct css_select_pseudo_name {
++	lwc_string *name;
++	unsigned int count;
++};
++struct css_select_pseudo_name css_select_pseudo_names[PSEUDO_NAME_SLOTS];
++unsigned int css_select_pseudo_unnamed;
+ 
+ static css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet, css_select_state *state);
+@@ -1560,6 +1575,23 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	 */
+ 	state.custom = css__custom_map_ref((css_custom_map *) ctx->parent_custom);
+ 
++	/*
++	 * Whether this is the document root, asked once (VitaSurf). A
++	 * rule whose key compound wants :root is offered to every element
++	 * otherwise, and on a GitHub load that is most of the 15,564,220
++	 * refusals nothing else accounts for. This is the same handler
++	 * match_detail would have called for the same question.
++	 */
++	{
++		bool is_root = false;
++
++		state.node_state = 0;
++		if (handler->node_is_root(pw, node, &is_root) == CSS_OK &&
++				is_root) {
++			state.node_state |= CSS_NODE_STATE_ROOT;
++		}
++	}
++
+ 	/* Fetch presentational hints */
+ 	error = handler->node_presentational_hint(pw, node, &nhints, &hints);
+ 	if (error != CSS_OK)
+@@ -2331,6 +2363,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	req.unit_ctx = state->unit_ctx;
+ 	req.node_bloom = state->node_data->bloom;
+ 	req.str = &ctx->str;
++	req.node_state = state->node_state;
+ 
+ 	/* Find hash chain that applies to current node */
+ 	req.qname = state->element;
+@@ -2835,7 +2868,24 @@ css_error match_details(css_select_ctx *ctx, void *node,
+ 					} else if (pn == ctx->str.has) {
+ 						css_select_pseudo_has++;
+ 					} else {
++						unsigned k;
++
+ 						css_select_pseudo_other++;
++						for (k = 0; k <
++							PSEUDO_NAME_SLOTS;
++						     k++) {
++							if (css_select_pseudo_names[k].name == pn) {
++								css_select_pseudo_names[k].count++;
++								break;
++							}
++							if (css_select_pseudo_names[k].name == NULL) {
++								css_select_pseudo_names[k].name = pn;
++								css_select_pseudo_names[k].count = 1;
++								break;
++							}
++						}
++						if (k == PSEUDO_NAME_SLOTS)
++							css_select_pseudo_unnamed++;
+ 					}
+ 				}
+ 				break;
+diff --git a/src/select/select.h b/src/select/select.h
+index d77bb11..dc50753 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -69,6 +69,9 @@ struct revert_data {
+  */
+ typedef struct css_select_state {
+ 	void *node;			/* Node we're selecting for */
++	/* CSS_NODE_STATE_*, asked once rather than per candidate
++	 * (VitaSurf) */
++	uint32_t node_state;
+ 	const css_media *media;		/* Currently active media spec */
+ 	const css_unit_ctx *unit_ctx;	/* Unit conversion context. */
+ 	css_select_results *results;	/* Result set to populate */

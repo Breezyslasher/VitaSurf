@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!-- A bare :root rule is the case the universal chain's skip touches:
+     its key compound carries no name, class or id, so it is filed in
+     that chain and offered to every element on the page. It must reach
+     the html element and nothing else.
+
+     The earlier version of this test used selectors like ":root > body"
+     and "html:root .x", whose key compounds are a name and a class, so
+     they are filed in the element and class chains and never exercised
+     the skip at all -- deliberately breaking the skip left them all
+     passing.
+
+     Asserted through layout: this build's getComputedStyle reports
+     mostly defaults for colours, so a colour test says nothing about
+     matching. -->
+<html><head><meta charset="utf-8"><title>:root matching</title><style>
+:root { padding-left: 90px; }
+</style></head><body>
+<div id="a">a</div>
+<div><div><div id="b">b</div></div></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function left(id){
+  return document.getElementById(id).getBoundingClientRect().left;
+}
+setTimeout(function(){
+  /* the root gets 90px of padding, and body its default 8px margin */
+  ok("a bare :root rule reaches the html element", left("a") === 98);
+  /* and only once: were it matching every element, each of the three
+     divs wrapping b would add another 90 */
+  ok("and reaches nothing else", left("b") === 98);
+  console.log("ROOT DONE");
+}, 60);
+</script>
+</body></html>

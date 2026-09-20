@@ -1289,6 +1289,35 @@ void vita_input_load_finished(struct gui_window *gw)
 					 css_select_pseudo_has,
 					 css_select_pseudo_other,
 					 css_select_refused_negated);
+				{
+					/* name the "other" ones (VitaSurf) */
+					struct css_select_pseudo_name {
+						struct lwc_string_s *name;
+						unsigned int count;
+					};
+					extern struct css_select_pseudo_name
+						css_select_pseudo_names[8];
+					extern unsigned int
+						css_select_pseudo_unnamed;
+					unsigned k;
+
+					for (k = 0; k < 8; k++) {
+						const char *nm;
+
+						if (css_select_pseudo_names[k].name == NULL)
+							break;
+						nm = lwc_string_data(
+							css_select_pseudo_names[k].name);
+						vita_log("page:   :%s refused "
+							 "%u times", nm,
+							 css_select_pseudo_names[k].count);
+					}
+					if (css_select_pseudo_unnamed != 0)
+						vita_log("page:   and %u more "
+							 "with no room to "
+							 "name them",
+							 css_select_pseudo_unnamed);
+				}
 			}
 			vita_log("page: attribute selectors asked for a name "
 				 "%u times, interning it %u of them",
