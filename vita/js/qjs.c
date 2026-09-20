@@ -119,7 +119,17 @@ struct js_deferred {
  * and expando properties (el.style, el.dataset, handlers) survive. The
  * cache holds a reference; wrappers are released when the thread dies.
  */
-#define WRAPPER_BUCKETS 128
+/*
+ * One chain per 128 nodes was one chain per hundred (VitaSurf). Every
+ * crossing that hands JavaScript a node looks it up here, and a page of
+ * six thousand elements and seven thousand text nodes left about a
+ * hundred entries in each chain: a synthetic document of 13000 nodes
+ * walked 31,569,372 chain steps over 523,562 look-ups, sixty a look-up,
+ * and that was 294 ms on a host that is a dozen times quicker than the
+ * device. 4096 chains is 16 KB a thread and takes the same document to
+ * about three.
+ */
+#define WRAPPER_BUCKETS 4096
 struct js_wrapper {
 	struct dom_node *node;
 	JSValue obj;
@@ -560,13 +570,27 @@ static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 	if (node == NULL) {
 		return JS_NULL;
 	}
-	h = (unsigned)(((uintptr_t)node) >> 4) % WRAPPER_BUCKETS;
-	if (thread != NULL) {
-		for (w = thread->wrappers[h]; w != NULL; w = w->next) {
-			if (w->node == node) {
-				return JS_DupValue(ctx, w->obj);
+	/*
+	 * How long the chain is, and what the lookup costs (VitaSurf).
+	 * Every crossing that hands JavaScript a node comes through here.
+	 */
+	vitasurf_js_node_wraps++;
+	{
+		uint64_t w0 = now_ms();
+
+		h = (unsigned)(((uintptr_t)node) >> 4) % WRAPPER_BUCKETS;
+		if (thread != NULL) {
+			for (w = thread->wrappers[h]; w != NULL; w = w->next) {
+				vitasurf_js_wrap_steps++;
+				if (w->node == node) {
+					vitasurf_js_wrap_hits++;
+					vitasurf_ms_js_wrap +=
+						(unsigned)(now_ms() - w0);
+					return JS_DupValue(ctx, w->obj);
+				}
 			}
 		}
+		vitasurf_ms_js_wrap += (unsigned)(now_ms() - w0);
 	}
 	obj = JS_NewObjectClass(ctx, node_class_id);
 	if (JS_IsException(obj)) {
@@ -1173,6 +1197,8 @@ static JSValue node_set_node_value(JSContext *ctx, JSValueConst this_val,
 static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	vitasurf_js_attr_gets++;
+	{ uint64_t g0 = now_ms();
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key, *val = NULL;
@@ -1193,7 +1219,10 @@ static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
 	}
 	r = JS_NewStringLen(ctx, dom_string_data(val), dom_string_byte_length(val));
 	dom_string_unref(val);
+	vitasurf_ms_js_attr_get_time += (unsigned)(now_ms() - g0);
 	return r;
+	}
+
 }
 
 /*
@@ -3504,11 +3533,24 @@ static void end_script(jsthread *thread)
 		unsigned b_html = vitasurf_js_html_bytes;
 		unsigned b_attrs = vitasurf_js_attr_sets;
 		unsigned b_styles = vitasurf_js_style_reads;
+		unsigned b_wraps = vitasurf_js_node_wraps;
+		unsigned b_agets = vitasurf_js_attr_gets;
 
+		vitasurf_js_drains++;
 		for (;;) {
 			JSContext *c = NULL;
-			int r = JS_ExecutePendingJob(thread->heap->rt, &c);
+			int r;
+			uint64_t d0 = now_ms();
+
+			r = JS_ExecutePendingJob(thread->heap->rt, &c);
 			if (r <= 0) {
+				/*
+				 * the call that finds nothing left, which
+				 * is the only part of the loop outside a
+				 * job (VitaSurf)
+				 */
+				vitasurf_ms_js_drain_tail +=
+					(unsigned)(now_ms() - d0);
 				if (r < 0 && c != NULL) {
 					qjs_report_exception(c);
 				}
@@ -3539,6 +3581,12 @@ static void end_script(jsthread *thread)
 					vitasurf_job_max_styles =
 						vitasurf_js_style_reads -
 							b_styles;
+					vitasurf_job_max_wraps =
+						vitasurf_js_node_wraps -
+							b_wraps;
+					vitasurf_job_max_attr_gets =
+						vitasurf_js_attr_gets -
+							b_agets;
 				}
 				if (took >= 5) {
 					vitasurf_js_jobs_slow++;
@@ -3558,6 +3606,8 @@ static void end_script(jsthread *thread)
 				b_html = vitasurf_js_html_bytes;
 				b_attrs = vitasurf_js_attr_sets;
 				b_styles = vitasurf_js_style_reads;
+				b_wraps = vitasurf_js_node_wraps;
+				b_agets = vitasurf_js_attr_gets;
 			}
 			vitasurf_js_jobs++;
 		}

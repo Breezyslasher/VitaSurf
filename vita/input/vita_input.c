@@ -1156,6 +1156,27 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_js_timer_max,
 				 vitasurf_js_timers_slow, vitasurf_js_timers,
 				 vitasurf_ms_js_timers_slow);
+			vita_log("page: JavaScript was handed a node %u "
+				 "times, costing %u ms; %u were already "
+				 "wrapped, found after %u chain steps in all "
+				 "(%u a look-up)",
+				 vitasurf_js_node_wraps, vitasurf_ms_js_wrap,
+				 vitasurf_js_wrap_hits,
+				 vitasurf_js_wrap_steps,
+				 vitasurf_js_node_wraps ?
+					vitasurf_js_wrap_steps /
+						vitasurf_js_node_wraps : 0);
+			vita_log("page: it read an attribute %u times for "
+				 "%u ms; the longest job did %u of the "
+				 "wraps and %u of the reads",
+				 vitasurf_js_attr_gets,
+				 vitasurf_ms_js_attr_get_time,
+				 vitasurf_job_max_wraps,
+				 vitasurf_job_max_attr_gets);
+			vita_log("page: the drain ran %u times and %u ms of "
+				 "it was the call that found nothing left",
+				 vitasurf_js_drains,
+				 vitasurf_ms_js_drain_tail);
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
