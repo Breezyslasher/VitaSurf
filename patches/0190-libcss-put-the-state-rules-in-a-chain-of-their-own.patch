@@ -1,0 +1,192 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 8e05257..59e12b4 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -82,6 +82,20 @@ struct css_selector_hash {
+ 
+ 	hash_entry universal;
+ 
++	/*
++	 * Universal rules whose key compound needs the node to be in
++	 * some state, kept apart from the ones that need nothing
++	 * (VitaSurf).
++	 *
++	 * Build 406 files 5803 universal rules for a GitHub page and
++	 * 5596 of them are :host, which nothing here can ever be. They
++	 * were refused for every element, cheaply -- but refusing them
++	 * still meant walking them, and the walk was 18,503,253 chain
++	 * entries for 3849 elements. A chain nothing looks in costs
++	 * nothing.
++	 */
++	hash_entry universal_state;
++
+ 	size_t hash_size;
+ };
+ 
+@@ -448,6 +462,13 @@ css_error css__selector_hash_destroy(css_selector_hash *hash)
+ 		free(d);
+ 	}
+ 
++	/* Universal chain for rules needing a node state (VitaSurf) */
++	for (d = hash->universal_state.next; d != NULL; d = e) {
++		e = d->next;
++
++		free(d);
++	}
++
+ 	free(hash);
+ 
+ 	return CSS_OK;
+@@ -685,7 +706,11 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 			return error;
+ 		}
+ 		/* Universal chain */
+-		error = _insert_into_chain(hash, &hash->universal, selector);
++		error = _insert_into_chain(hash,
++				_state_needed(selector) != 0 ?
++					&hash->universal_state :
++					&hash->universal,
++				selector);
+ 		css_hash_in_universal++;
+ 		/*
+ 		 * And why it landed there (VitaSurf), since 6157 rules do
+@@ -787,7 +812,11 @@ css_error css__selector_hash_remove(css_selector_hash *hash,
+ 					&hash->attrs.slots[index], selector);
+ 		}
+ 		/* Universal chain */
+-		error = _remove_from_chain(hash, &hash->universal, selector);
++		error = _remove_from_chain(hash,
++				_state_needed(selector) != 0 ?
++					&hash->universal_state :
++					&hash->universal,
++				selector);
+ 	}
+ 
+ 	return error;
+@@ -1094,6 +1123,55 @@ css_error css__selector_hash_find_by_attr(css_selector_hash *hash,
+ 	return CSS_OK;
+ }
+ 
++/**
++ * Find the first universal rule that needs a node state (VitaSurf)
++ *
++ * Only worth calling for a node that is in some state at all: no node
++ * is ever in a shadow tree here, so the :host rules that fill this
++ * chain on a GitHub page are never looked at.
++ */
++css_error css__selector_hash_find_by_state(css_selector_hash *hash,
++		const struct css_hash_selection_requirments *req,
++		css_selector_hash_iterator *iterator,
++		const css_selector ***matched)
++{
++	hash_entry *head;
++
++	if (hash == NULL || req == NULL || iterator == NULL || matched == NULL)
++		return CSS_BADPARM;
++
++	head = &hash->universal_state;
++
++	if (head->sel != NULL) {
++		/* Search through chain for first match */
++		while (head != NULL) {
++			css_select_steps_universal++;
++			if (RULE_HAS_BYTECODE(head) &&
++			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
++			    css_bloom_in_bloom(
++					head->sel_chain_bloom,
++					req->node_bloom) &&
++			    mq_rule_good_for_media(head->sel->rule,
++					req->unit_ctx, req->media,
++					req->str)) {
++				/* Found a match */
++				break;
++			}
++
++			head = head->next;
++		}
++
++		if (head == NULL)
++			head = &empty_slot;
++	}
++
++	/* the same walk, so the same iterator serves */
++	(*iterator) = _iterate_attrs;
++	(*matched) = (const css_selector **) head;
++
++	return CSS_OK;
++}
++
+ css_error css__selector_hash_find_universal(css_selector_hash *hash,
+ 		const struct css_hash_selection_requirments *req,
+ 		css_selector_hash_iterator *iterator,
+diff --git a/src/select/hash.h b/src/select/hash.h
+index c6e4253..5f4b527 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -154,6 +154,12 @@ css_error css__selector_hash_find_universal(css_selector_hash *hash,
+  * into a walk of the few that name an attribute this node carries.
+  * req->attr_slot says which bucket to look in.
+  */
++/** Find the first universal rule needing a node state (VitaSurf). */
++css_error css__selector_hash_find_by_state(css_selector_hash *hash,
++		const struct css_hash_selection_requirments *req,
++		css_selector_hash_iterator *iterator,
++		const struct css_selector ***matched);
++
+ css_error css__selector_hash_find_by_attr(css_selector_hash *hash,
+ 		const struct css_hash_selection_requirments *req,
+ 		css_selector_hash_iterator *iterator,
+diff --git a/src/select/select.c b/src/select/select.c
+index cb3a34f..7f2fd3b 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -2448,9 +2448,11 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	const css_selector **univ_selectors = &empty_selector;
+ 	css_selector_hash_iterator univ_iterator;
+ 	/* one chain per attribute bucket the node can be in (VitaSurf) */
+-	const css_selector **attr_selectors[CSS_SELECTOR_HASH_SLOTS];
++	/* the buckets, plus one more chain when the node is in a state
++	 * that a universal rule can ask for */
++	const css_selector **attr_selectors[CSS_SELECTOR_HASH_SLOTS + 1];
+ 	css_selector_hash_iterator attr_iterator = NULL;
+-	const uint32_t n_attrs = state->n_attr_slots;
++	uint32_t n_attrs = state->n_attr_slots;
+ 	css_select_rule_source src = { CSS_SELECT_RULE_SRC_ELEMENT, 0, 0 };
+ 	struct css_hash_selection_requirments req;
+ 	css_error error;
+@@ -2514,6 +2516,21 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 			goto cleanup;
+ 	}
+ 
++	/*
++	 * And the universal rules that ask for a node state, which only
++	 * a node in one of those states need look at (VitaSurf). The
++	 * root is the only such node today, so for every other element
++	 * this is a chain of thousands that is never touched.
++	 */
++	if (state->node_state != 0) {
++		error = css__selector_hash_find_by_state(sheet->selectors,
++				&req, &attr_iterator,
++				&attr_selectors[n_attrs]);
++		if (error != CSS_OK)
++			goto cleanup;
++		n_attrs++;
++	}
++
+ 	css_select_sheets_seen++;
+ 
+ 	/* Process matching selectors, if any */
+@@ -2586,7 +2603,12 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 			break;
+ 
+ 		case CSS_SELECT_RULE_SRC_ATTRIBUTE:
+-			req.attr_slot = state->attr_slots[src.attr];
++			/* the state chain, when there is one, sits past
++			 * the buckets and needs no slot */
++			if (src.attr < state->n_attr_slots) {
++				req.attr_slot =
++					state->attr_slots[src.attr];
++			}
+ 			error = attr_iterator(&req, attr_selectors[src.attr],
+ 					&attr_selectors[src.attr]);
+ 			break;
