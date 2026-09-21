@@ -598,6 +598,95 @@ static void url_encode(const char *in, char *out, size_t outlen)
 	out[o] = '\0';
 }
 
+/*
+ * Whether a typed host is somewhere on this network rather than out on
+ * the internet (VitaSurf).
+ *
+ * It decides the scheme a bare host gets. Typing 198.18.2.1 for a box
+ * on the LAN used to become https://198.18.2.1, and a server that only
+ * listens on port 80 refuses that in twenty milliseconds: cURL code 7,
+ * an error page, and nothing to say the address was fine and the
+ * scheme was not. A private address is by definition not reachable
+ * from the internet, so there is nothing for a downgrade to attack,
+ * and http is what those servers almost always speak.
+ *
+ * The ranges are the private ones, loopback, link-local, the carrier
+ * range Tailscale hands out, and the benchmarking range a VPN's fake
+ * addresses come from. A name with no dot in it is a LAN name too, and
+ * so are the usual local suffixes.
+ */
+static bool host_is_local(const char *host, size_t len)
+{
+	static const char *suffix[] = {
+		".local", ".lan", ".home", ".internal", ".localdomain"
+	};
+	unsigned a, b, c, d;
+	char name[256];
+	size_t i;
+
+	if (len == 0 || len >= sizeof(name)) {
+		return false;
+	}
+	memcpy(name, host, len);
+	name[len] = '\0';
+
+	if (sscanf(name, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+			a < 256 && b < 256 && c < 256 && d < 256) {
+		if (a == 10 || a == 127) {
+			return true;
+		}
+		if (a == 172 && b >= 16 && b <= 31) {
+			return true;
+		}
+		if (a == 192 && b == 168) {
+			return true;
+		}
+		if (a == 169 && b == 254) {
+			return true;
+		}
+		if (a == 100 && b >= 64 && b <= 127) {
+			return true;
+		}
+		if (a == 198 && (b == 18 || b == 19)) {
+			return true;
+		}
+		return false;
+	}
+
+	if (strcasecmp(name, "localhost") == 0) {
+		return true;
+	}
+	if (strchr(name, '.') == NULL) {
+		return true;	/* a single-label name is a LAN name */
+	}
+	for (i = 0; i < sizeof(suffix) / sizeof(suffix[0]); i++) {
+		size_t sl = strlen(suffix[i]);
+
+		if (len > sl && strcasecmp(name + len - sl, suffix[i]) == 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/** The host part of what was typed: up to the first /, : or ? */
+static size_t host_length(const char *p)
+{
+	size_t n = 0;
+
+	while (p[n] != '\0' && p[n] != '/' && p[n] != ':' && p[n] != '?' &&
+			p[n] != '#') {
+		n++;
+	}
+
+	return n;
+}
+
+/** What the user last asked for, so an error page does not become the
+ * starting point for the next thing they type (VitaSurf). */
+static char last_typed[2048];
+
 /** Go to what the user typed: a URL, or a search if it does not look like one. */
 static void navigate_text(const char *text)
 {
@@ -628,7 +717,9 @@ static void navigate_text(const char *text)
 		url_encode(p, enc, sizeof(enc));
 		snprintf(buf, sizeof(buf), "%s%s", SEARCH_URL, enc);
 	} else {
-		snprintf(buf, sizeof(buf), "https://%s", p);
+		snprintf(buf, sizeof(buf), "%s%s",
+			 host_is_local(p, host_length(p)) ?
+				"http://" : "https://", p);
 	}
 	/* trailing spaces */
 	for (size_t n = strlen(buf); n > 0 && buf[n - 1] == ' '; n--) {
@@ -641,6 +732,7 @@ static void navigate_text(const char *text)
 		return;
 	}
 	vita_log("input: go to %s", buf);
+	snprintf(last_typed, sizeof(last_typed), "%s", buf);
 	drop_focus();
 	browser_window_navigate(the_gw->bw, url, NULL, BW_NAVIGATE_HISTORY,
 				NULL, NULL, NULL);
@@ -658,6 +750,17 @@ static void start_url_entry(void)
 		/* the bundled home page is not a useful starting point */
 		if (strncmp(initial, "file:", 5) == 0) {
 			initial = "";
+		}
+		/*
+		 * Nor is an error page: its address is about:query/...,
+		 * and offering that to the keyboard means the next thing
+		 * typed lands on the end of it. A log has someone reach
+		 * for a page on their own server and arrive at
+		 * "about:query/fetcherrorreg.php" three times running.
+		 * Offer what they last asked for instead (VitaSurf).
+		 */
+		if (strncmp(initial, "about:", 6) == 0) {
+			initial = last_typed;
 		}
 	}
 
