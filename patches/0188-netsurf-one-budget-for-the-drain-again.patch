@@ -1,0 +1,32 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 12515d1ce..29b77cecd 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -645,7 +645,6 @@ unsigned int vitasurf_js_jobs_threw;
+ unsigned int vitasurf_ms_js_jobs_threw;
+ unsigned int vitasurf_js_jobs_budget;
+ unsigned int vitasurf_ms_js_jobs_budget;
+-unsigned int vitasurf_js_drains_capped;
+ unsigned int vitasurf_js_drain_max_jobs;
+ unsigned int vitasurf_ms_js_drain_max;
+ unsigned int vitasurf_js_childnodes;
+@@ -793,7 +792,6 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_jobs_threw = 0;
+ 	vitasurf_js_jobs_budget = 0;
+ 	vitasurf_ms_js_jobs_budget = 0;
+-	vitasurf_js_drains_capped = 0;
+ 	vitasurf_js_drain_max_jobs = 0;
+ 	vitasurf_ms_js_drain_max = 0;
+ 	vitasurf_js_childnodes = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 58d074d06..4e3915d48 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -360,7 +360,6 @@ extern unsigned int vitasurf_ms_js_jobs_threw;
+  */
+ extern unsigned int vitasurf_js_jobs_budget;
+ extern unsigned int vitasurf_ms_js_jobs_budget;
+-extern unsigned int vitasurf_js_drains_capped;
+ extern unsigned int vitasurf_js_drain_max_jobs;
+ extern unsigned int vitasurf_ms_js_drain_max;
+ /**

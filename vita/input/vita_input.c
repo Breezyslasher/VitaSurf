@@ -1296,11 +1296,10 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_js_jobs_threw,
 				 vitasurf_ms_js_jobs_threw);
 			vita_log("page: the budget stopped %u more jobs, "
-				 "costing %u ms, and cut %u drains short; "
-				 "the longest drain was %u ms over %u jobs",
+				 "costing %u ms; the longest drain was %u "
+				 "ms over %u jobs",
 				 vitasurf_js_jobs_budget,
 				 vitasurf_ms_js_jobs_budget,
-				 vitasurf_js_drains_capped,
 				 vitasurf_ms_js_drain_max,
 				 vitasurf_js_drain_max_jobs);
 			vita_log("page: the page asked the tree for elements "
@@ -1336,6 +1335,10 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				extern unsigned int css_select_steps_class;
 				extern unsigned int css_select_steps_id;
 				extern unsigned int css_select_steps_universal;
+				extern unsigned int css_select_steps_attr;
+				extern unsigned int css_select_from_attr;
+				extern unsigned int css_hash_in_attr;
+				extern unsigned int css_hash_uni_unnamed;
 				extern unsigned int
 					css_select_cand_details_failed;
 				extern unsigned int
@@ -1403,6 +1406,12 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 css_select_steps_class,
 					 css_select_steps_id,
 					 css_select_steps_universal);
+				vita_log("page: and %u entries in the %u "
+					 "rules filed by attribute, for %u "
+					 "candidates",
+					 css_select_steps_attr,
+					 css_hash_in_attr,
+					 css_select_from_attr);
 				vita_log("page: of the universal ones %u lead "
 					 "with an attribute, %u with a "
 					 "pseudo-class, %u with a "
@@ -1411,6 +1420,38 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 css_hash_uni_pseudo_class,
 					 css_hash_uni_pseudo_element,
 					 css_hash_uni_plain);
+				{
+					/* and which pseudo-class they are,
+					 * since that decides what can be
+					 * done about them (VitaSurf) */
+					struct css_hash_uni_name {
+						struct lwc_string_s *name;
+						unsigned int count;
+					};
+					extern struct css_hash_uni_name
+						css_hash_uni_names[12];
+					unsigned int k;
+
+					for (k = 0; k < 12; k++) {
+						if (css_hash_uni_names[k].name
+								== NULL) {
+							break;
+						}
+						vita_log("page:   :%s filed "
+							 "%u times",
+							 lwc_string_data(
+							 css_hash_uni_names[k]
+								.name),
+							 css_hash_uni_names[k]
+								.count);
+					}
+					if (css_hash_uni_unnamed != 0) {
+						vita_log("page:   and %u "
+							 "more with other "
+							 "names",
+							 css_hash_uni_unnamed);
+					}
+				}
 				vita_log("page: of those candidates %u were "
 					 "refused on their own compound, %u "
 					 "walking their combinators, and %u "

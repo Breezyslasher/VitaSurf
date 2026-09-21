@@ -3544,15 +3544,26 @@ static void begin_script(jsthread *thread, enum script_why why)
 
 static void schedule_relayout(jsthread *thread, int ms);
 
-/*
- * How many job budgets the whole microtask drain may spend before it is
- * cut off. Only a chain that re-queues itself should reach this, since
- * no single job can outlast one budget. Two is still twice what the
- * drain used to be allowed -- it had one budget for all its jobs
- * together -- and covers the worst drain measured, a GitHub load that
- * wanted a little over twenty seconds in one of its 74 drains.
- */
-#define DRAIN_BUDGET_BUDGETS 2
+/** What the longest job did, so a job of twenty seconds names its own
+ * work rather than the work of whichever job ran before it. */
+static void job_max_deltas(unsigned b_finds, unsigned b_edits,
+			   unsigned b_html, unsigned b_attrs,
+			   unsigned b_styles, unsigned b_wraps,
+			   unsigned b_agets, unsigned b_cn, unsigned b_tr,
+			   unsigned b_bc, unsigned b_txt)
+{
+	vitasurf_job_max_finds = vitasurf_js_finds - b_finds;
+	vitasurf_job_max_edits = vitasurf_js_dom_edits - b_edits;
+	vitasurf_job_max_html = vitasurf_js_html_bytes - b_html;
+	vitasurf_job_max_attrs = vitasurf_js_attr_sets - b_attrs;
+	vitasurf_job_max_styles = vitasurf_js_style_reads - b_styles;
+	vitasurf_job_max_wraps = vitasurf_js_node_wraps - b_wraps;
+	vitasurf_job_max_attr_gets = vitasurf_js_attr_gets - b_agets;
+	vitasurf_job_max_childnodes = vitasurf_js_childnodes - b_cn;
+	vitasurf_job_max_tree_reads = vitasurf_js_tree_reads - b_tr;
+	vitasurf_job_max_bindings = vitasurf_js_binding_calls - b_bc;
+	vitasurf_job_max_text_reads = vitasurf_js_text_reads - b_txt;
+}
 
 /** Say what the budget stopped, since a job that is killed leaves no
  * other trace of what it was doing (VitaSurf). */
@@ -3634,17 +3645,14 @@ static void end_script(jsthread *thread)
 	 * deadline that has passed would stop the first job on a page that
 	 * did nothing wrong.
 	 *
-	 * It is then armed afresh for each job as well, because one budget
-	 * across the whole drain punishes a page for doing a lot of small
-	 * pieces of work rather than one long one. A GitHub load ran a job
-	 * of 12110 ms and then had the next stopped after 6817 ms: neither
-	 * was a runaway, the two together simply passed twenty seconds,
-	 * and six and a half seconds of work was thrown away with the page
-	 * still half built. A job at a time is what the budget is meant to
-	 * bound. What it cannot bound that way is a chain that re-queues
-	 * itself -- Promise.resolve().then(again) -- where no single job is
-	 * slow, so the drain as a whole gets a ceiling of a few budgets to
-	 * stop that, and says so when it fires.
+	 * One deadline for the whole drain, not one per job. Build 405
+	 * tried a budget per job on the grounds that a page should not be
+	 * punished for doing its work in several pieces rather than one,
+	 * and the device said that was the wrong reading: the job the old
+	 * budget cut off after 6844 ms was handed a full twenty seconds,
+	 * spent all of them, and was cut off anyway. It is a runaway. The
+	 * page cost 65642 ms instead of 59708 for exactly the same end
+	 * state, so the drain answers to one budget again.
 	 */
 	rearm_deadline(thread);
 	{
@@ -3656,9 +3664,6 @@ static void end_script(jsthread *thread)
 		 * actually run.
 		 */
 		uint64_t j0 = now_ms(), jlast = j0;
-		unsigned secs = budget_secs(thread);
-		uint64_t drain_end = secs == 0 ? 0 :
-			j0 + (uint64_t)secs * DRAIN_BUDGET_BUDGETS * 1000;
 		unsigned in_drain = 0;
 		unsigned b_finds = vitasurf_js_finds;
 		unsigned b_edits = vitasurf_js_dom_edits;
@@ -3677,20 +3682,6 @@ static void end_script(jsthread *thread)
 			JSContext *c = NULL;
 			int r;
 			uint64_t d0 = now_ms();
-
-			if (drain_end != 0 && d0 > drain_end) {
-				vitasurf_js_drains_capped++;
-				vita_log("qjs: the microtask queue is still "
-					 "going after %u ms and %u jobs, so "
-					 "the rest of it is dropped",
-					 (unsigned)(d0 - j0), in_drain);
-				break;
-			}
-			if (secs != 0) {
-				/* this job's own budget, not the drain's */
-				thread->deadline_ms = d0 +
-					(uint64_t)secs * 1000;
-			}
 
 			r = JS_ExecutePendingJob(thread->heap->rt, &c);
 			if (r <= 0) {
@@ -3720,8 +3711,23 @@ static void end_script(jsthread *thread)
 							took;
 					}
 					vitasurf_ms_js_jobs_sum += took;
+					/*
+					 * and its own deltas if it is the
+					 * longest (VitaSurf). Build 405
+					 * set the time here and the
+					 * deltas only where a job
+					 * finishes, so a killed job of
+					 * 20047 ms was described by the
+					 * work of a shorter one.
+					 */
 					if (took > vitasurf_ms_js_job_max) {
 						vitasurf_ms_js_job_max = took;
+						job_max_deltas(b_finds,
+							b_edits, b_html,
+							b_attrs, b_styles,
+							b_wraps, b_agets,
+							b_cn, b_tr, b_bc,
+							b_txt);
 					}
 					if (c != NULL) {
 						qjs_report_exception(c);
@@ -3737,43 +3743,10 @@ static void end_script(jsthread *thread)
 
 				if (took > vitasurf_ms_js_job_max) {
 					vitasurf_ms_js_job_max = took;
-					/*
-					 * and what it did, so a job of
-					 * fourteen seconds names its own
-					 * work (VitaSurf)
-					 */
-					vitasurf_job_max_finds =
-						vitasurf_js_finds - b_finds;
-					vitasurf_job_max_edits =
-						vitasurf_js_dom_edits -
-							b_edits;
-					vitasurf_job_max_html =
-						vitasurf_js_html_bytes -
-							b_html;
-					vitasurf_job_max_attrs =
-						vitasurf_js_attr_sets -
-							b_attrs;
-					vitasurf_job_max_styles =
-						vitasurf_js_style_reads -
-							b_styles;
-					vitasurf_job_max_wraps =
-						vitasurf_js_node_wraps -
-							b_wraps;
-					vitasurf_job_max_attr_gets =
-						vitasurf_js_attr_gets -
-							b_agets;
-					vitasurf_job_max_childnodes =
-						vitasurf_js_childnodes -
-							b_cn;
-					vitasurf_job_max_tree_reads =
-						vitasurf_js_tree_reads -
-							b_tr;
-					vitasurf_job_max_bindings =
-						vitasurf_js_binding_calls -
-							b_bc;
-					vitasurf_job_max_text_reads =
-						vitasurf_js_text_reads -
-							b_txt;
+					job_max_deltas(b_finds, b_edits,
+						b_html, b_attrs, b_styles,
+						b_wraps, b_agets, b_cn,
+						b_tr, b_bc, b_txt);
 				}
 				if (took >= 5) {
 					vitasurf_js_jobs_slow++;

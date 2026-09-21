@@ -1,0 +1,81 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 77d0ef7..8e05257 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -472,6 +472,41 @@ unsigned int css_hash_in_class;
+ unsigned int css_hash_in_element;
+ unsigned int css_hash_in_universal;
+ unsigned int css_hash_in_attr;
++/*
++ * And which pseudo-class the ones that cannot be bucketed lead with
++ * (VitaSurf). Build 405 files 11312 universal rules under a
++ * pseudo-class and walks 19,097,868 of those chain entries for 6276
++ * elements -- three thousand a piece, and the largest thing left in
++ * selection. Whether they can be narrowed depends entirely on which
++ * names they are: :hover and :focus can be answered from the node's
++ * state, :is() and :where() cannot.
++ */
++struct css_hash_uni_name css_hash_uni_names[CSS_HASH_UNI_NAME_SLOTS];
++unsigned int css_hash_uni_unnamed;
++
++static void _uni_pseudo_named(lwc_string *name)
++{
++	unsigned int k;
++
++	if (name == NULL) {
++		css_hash_uni_unnamed++;
++		return;
++	}
++	for (k = 0; k < CSS_HASH_UNI_NAME_SLOTS; k++) {
++		if (css_hash_uni_names[k].name == name) {
++			css_hash_uni_names[k].count++;
++			return;
++		}
++	}
++	for (k = 0; k < CSS_HASH_UNI_NAME_SLOTS; k++) {
++		if (css_hash_uni_names[k].name == NULL) {
++			css_hash_uni_names[k].name = name;
++			css_hash_uni_names[k].count = 1;
++			return;
++		}
++	}
++	css_hash_uni_unnamed++;
++}
+ unsigned int css_hash_uni_attribute;
+ unsigned int css_hash_uni_pseudo_class;
+ unsigned int css_hash_uni_pseudo_element;
+@@ -666,6 +701,7 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 				switch (d->type) {
+ 				case CSS_SELECTOR_PSEUDO_CLASS:
+ 					css_hash_uni_pseudo_class++;
++					_uni_pseudo_named(d->qname.name);
+ 					any = true;
+ 					break;
+ 				case CSS_SELECTOR_PSEUDO_ELEMENT:
+diff --git a/src/select/hash.h b/src/select/hash.h
+index ccaccb4..c6e4253 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -99,6 +99,22 @@ struct css_hash_selection_requirments {
+ 	uint32_t attr_slot;		/* attribute bucket to search */
+ };
+ 
++/**
++ * Which pseudo-class a universal rule leads with (VitaSurf).
++ *
++ * Names, not just a count, because what can be done about those rules
++ * depends on which ones they are. Interned, so the pointer is the
++ * identity.
++ */
++#define CSS_HASH_UNI_NAME_SLOTS 12
++struct css_hash_uni_name {
++	lwc_string *name;
++	unsigned int count;
++};
++extern struct css_hash_uni_name
++		css_hash_uni_names[CSS_HASH_UNI_NAME_SLOTS];
++extern unsigned int css_hash_uni_unnamed;
++
+ typedef css_error (*css_selector_hash_iterator)(
+ 		const struct css_hash_selection_requirments *req,
+ 		const struct css_selector **current,
