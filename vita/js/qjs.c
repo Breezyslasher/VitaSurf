@@ -314,30 +314,49 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 				 thread->current_script != NULL ?
 				 thread->current_script : "?");
 			/*
-			 * And where it was when the axe fell (VitaSurf). A
-			 * GitHub load has a promise job stopped after 7006
-			 * ms that touched no node at all -- pure
-			 * interpretation -- and the abort throws null, so
-			 * the exception carries no stack to say what it
-			 * was doing. Ask the engine for the script or
-			 * module at each level of the call stack instead,
-			 * innermost first, before the unwinding starts.
+			 * And where it was when the axe fell (VitaSurf). The
+			 * abort itself throws null, which carries no stack,
+			 * and build 410 could name only the script: both
+			 * levels said <prelude>, which is our own code and
+			 * eleven thousand lines of it.
+			 *
+			 * Throwing an Error from C does not help: when the
+			 * current frame is bytecode the engine leaves the
+			 * backtrace to be added as the exception unwinds,
+			 * and taking it straight back means it never is.
+			 * Error.captureStackTrace builds the trace on the
+			 * spot from the live frames, so call that.
 			 */
-			for (level = 0; level < 8; level++) {
-				JSAtom name = JS_GetScriptOrModuleName(
-						thread->ctx, level);
-				const char *s;
+			{
+				JSContext *c = thread->ctx;
+				JSValue global = JS_GetGlobalObject(c);
+				JSValue ector = JS_GetPropertyStr(c, global,
+								  "Error");
+				JSValue capture = JS_GetPropertyStr(c, ector,
+							"captureStackTrace");
+				JSValue err = JS_NewError(c);
+				JSValue stack;
 
-				if (name == JS_ATOM_NULL) {
-					break;
+				if (JS_IsFunction(c, capture)) {
+					JSValue r = JS_Call(c, capture, ector,
+							    1, &err);
+
+					JS_FreeValue(c, r);
 				}
-				s = JS_AtomToCString(thread->ctx, name);
-				if (s != NULL) {
-					vita_log("qjs:   at level %d: %s",
-						 level, s);
-					JS_FreeCString(thread->ctx, s);
+				stack = JS_GetPropertyStr(c, err, "stack");
+				if (JS_IsString(stack)) {
+					const char *st = JS_ToCString(c, stack);
+
+					if (st != NULL) {
+						vita_log("qjs:   %s", st);
+						JS_FreeCString(c, st);
+					}
 				}
-				JS_FreeAtom(thread->ctx, name);
+				JS_FreeValue(c, stack);
+				JS_FreeValue(c, err);
+				JS_FreeValue(c, capture);
+				JS_FreeValue(c, ector);
+				JS_FreeValue(c, global);
 			}
 			thread->overrun_said_ms = now;
 		} else if (now - thread->overrun_said_ms >= 30000) {
@@ -671,6 +690,7 @@ static JSClassDef node_class = {
 
 static struct dom_node *this_node(JSContext *ctx, JSValueConst this_val)
 {
+
 	vitasurf_js_binding_calls++;
 	return JS_GetOpaque2(ctx, this_val, node_class_id);
 }
@@ -3576,8 +3596,16 @@ static unsigned budget_secs(jsthread *thread)
 		halvings = 2;
 	}
 	secs >>= halvings;
+#ifdef __vita__
+	/* never below five seconds on the device, however many scripts
+	 * have been stopped; the native harness keeps what it was given
+	 * so a test can drive a budget of one second (VitaSurf) */
 	if (secs < 5) {
 		secs = 5;
+	}
+#endif
+	if (secs == 0) {
+		secs = 1;
 	}
 	return secs;
 }
@@ -3585,6 +3613,7 @@ static unsigned budget_secs(jsthread *thread)
 static void rearm_deadline(jsthread *thread)
 {
 	unsigned secs = budget_secs(thread);
+
 
 	thread->aborting = false;
 	thread->overrun_count = 0;
@@ -3718,9 +3747,7 @@ static void end_script(jsthread *thread)
 		thread->scripts_killed++;
 		vita_log("qjs: that script was stopped by the budget "
 			 "(%u on this page; the next gets %u seconds)",
-			 thread->scripts_killed,
-			 thread->scripts_killed >= 2 ? 5u :
-			 (unsigned)thread->heap->timeout / 2);
+			 thread->scripts_killed, budget_secs(thread));
 	}
 	/* The outermost call is over, so nothing is still unwinding. An
 	 * exception left pending here is one that was reported already, or
@@ -3892,9 +3919,7 @@ static void end_script(jsthread *thread)
 		thread->scripts_killed++;
 		vita_log("qjs: promise jobs stopped by the budget "
 			 "(%u on this page; the next gets %u seconds)",
-			 thread->scripts_killed,
-			 thread->scripts_killed >= 2 ? 5u :
-			 (unsigned)thread->heap->timeout / 2);
+			 thread->scripts_killed, budget_secs(thread));
 	}
 	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
@@ -6715,9 +6740,14 @@ nserror js_newheap(int timeout, jsheap **heap)
 	 * bundled one, so the floor rather than the option default is what
 	 * actually takes effect on a device that has been used.
 	 */
+#ifdef __vita__
 	if (timeout > 0 && timeout < SCRIPT_TIMEOUT_MIN) {
 		timeout = SCRIPT_TIMEOUT_MIN;
 	}
+#endif
+	/* the floor is the device's; the native harness keeps the option
+	 * as given so that a test can drive a budget of one second
+	 * (VitaSurf) */
 	ret->timeout = timeout;
 	/*
 	 * Keep a page's scripts within a sensible slice of the heap. The
