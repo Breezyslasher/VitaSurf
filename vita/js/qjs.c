@@ -3300,6 +3300,9 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 	return JS_UNDEFINED;
 }
 
+/** Where the location object itself is kept, out of the page's way. */
+#define VITA_LOCATION_SLOT "__vitaLocation"
+
 static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
@@ -3332,6 +3335,60 @@ static JSValue loc_set_href(JSContext *ctx, JSValueConst this_val, JSValueConst 
 	r = win_navigate(ctx, thread, s);
 	if (s) JS_FreeCString(ctx, s);
 	return r;
+}
+
+/*
+ * Assigning to window.location or document.location itself, which is
+ * how a great many pages redirect (VitaSurf).
+ *
+ * It used to be a plain property holding the location object, so
+ * "window.location = url" replaced the object with a string and went
+ * nowhere: a PHP page titled REDIR sat there having done nothing, with
+ * no error and no line in the log to say why. The property is an
+ * accessor now, so the assignment navigates like location.href does.
+ * The getter hands back the object kept under a hidden name, so
+ * location.href and the rest are unchanged.
+ */
+static JSValue win_get_location(JSContext *ctx, JSValueConst this_val)
+{
+	return JS_GetPropertyStr(ctx, this_val, VITA_LOCATION_SLOT);
+}
+
+static JSValue win_set_location(JSContext *ctx, JSValueConst this_val,
+				JSValueConst v)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *s;
+	JSValue r;
+
+	(void)this_val;
+	/*
+	 * An object is what the page gets back from the getter, so
+	 * "location = location" must not be read as a URL.
+	 */
+	if (JS_IsObject(v)) {
+		return JS_UNDEFINED;
+	}
+	s = JS_ToCString(ctx, v);
+	r = win_navigate(ctx, thread, s);
+	if (s) JS_FreeCString(ctx, s);
+	return r;
+}
+
+/** Put the location object on an object under an accessor, so that
+ * assigning to it navigates. */
+static void install_location(JSContext *ctx, JSValueConst on, JSValue loc)
+{
+	JSAtom name = JS_NewAtom(ctx, "location");
+
+	JS_SetPropertyStr(ctx, on, VITA_LOCATION_SLOT, loc);
+	JS_DefinePropertyGetSet(ctx, on, name,
+		JS_NewCFunction2(ctx, (JSCFunction *)win_get_location,
+				 "get location", 0, JS_CFUNC_getter, 0),
+		JS_NewCFunction2(ctx, (JSCFunction *)win_set_location,
+				 "set location", 1, JS_CFUNC_setter, 0),
+		JS_PROP_ENUMERABLE);
+	JS_FreeAtom(ctx, name);
 }
 
 static JSValue loc_assign(JSContext *ctx, JSValueConst this_val,
@@ -6317,8 +6374,8 @@ static void setup_globals(jsthread *thread)
 	loc = JS_NewObject(ctx);
 	JS_SetPropertyFunctionList(ctx, loc, location_proto,
 				   (int)(sizeof(location_proto) / sizeof(location_proto[0])));
-	JS_SetPropertyStr(ctx, global, "location", JS_DupValue(ctx, loc));
-	JS_SetPropertyStr(ctx, doc, "location", loc);
+	install_location(ctx, global, JS_DupValue(ctx, loc));
+	install_location(ctx, doc, loc);
 
 	/* timers and window helpers */
 	JS_SetPropertyStr(ctx, global, "setTimeout",
