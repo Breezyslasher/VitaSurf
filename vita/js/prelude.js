@@ -392,7 +392,27 @@ function splitTop(s,chars,keep){
   buf+=ch;}
  if(buf.replace(/^\s+|\s+$/g,'')!=='')out.push(buf.replace(/^\s+|\s+$/g,''));
  return out;}
+/* Compiled selectors, by their text (VitaSurf). Every querySelector,
+   matches and closest used to parse its selector afresh, and closest
+   did so once per ancestor; a GitHub hydration job spent 7.8 seconds
+   of its 20 in this parser and was stopped by the budget. Nothing
+   writes into a compiled selector after compile returns, so one copy
+   serves every call. Bounded, and simply emptied when full: a page
+   uses a few hundred distinct selectors, not thousands. A selector
+   that fails to parse is cached as its empty result too, so it keeps
+   failing the same way. */
+var compiled={},compiledCount=0;
 function compile(selector){
+ var text=String(selector),hit=compiled[text];
+ if(hit!==undefined){
+  if(typeof __vitaSelector==='function')__vitaSelector(1);
+  return hit;}
+ if(typeof __vitaSelector==='function')__vitaSelector(0);
+ if(compiledCount>=512){compiled={};compiledCount=0;}
+ hit=compileUncached(text);
+ compiled[text]=hit;compiledCount++;
+ return hit;}
+function compileUncached(selector){
  var out=[];
  splitTop(String(selector),',',false).forEach(function(s){
   var toks=splitTop(s,'>+~ \t\n\r\f',true),parts=[],comb=null,ok=true;

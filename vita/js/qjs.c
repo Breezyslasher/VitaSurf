@@ -1959,6 +1959,28 @@ static void clone_was_slow(struct dom_node *node, struct dom_node *copy,
 	dom_string_unref(name);
 }
 
+/*
+ * The prelude says whether a selector it was asked to use came out of
+ * its cache (VitaSurf), so the page report can put a number on the
+ * parser a GitHub hydration job spent 7.8 seconds in.
+ */
+static JSValue win_vita_selector(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	int hit = 0;
+
+	(void)this_val;
+	if (argc >= 1) {
+		JS_ToInt32(ctx, &hit, argv[0]);
+	}
+	if (hit) {
+		vitasurf_js_selector_hits++;
+	} else {
+		vitasurf_js_selector_compiles++;
+	}
+	return JS_UNDEFINED;
+}
+
 static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
@@ -6468,6 +6490,9 @@ static void setup_globals(jsthread *thread)
 	/* layout geometry, scrolling and event dispatch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFind",
 			  JS_NewCFunction(ctx, win_vita_find, "__vitaFind", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaSelector",
+			  JS_NewCFunction(ctx, win_vita_selector,
+					  "__vitaSelector", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaModuleState",
 			  JS_NewCFunction(ctx, win_vita_module_state,
 					  "__vitaModuleState", 2));

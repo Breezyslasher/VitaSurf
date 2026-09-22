@@ -1,0 +1,42 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 29b77cecd..9f354fc08 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -643,6 +643,8 @@ unsigned int vitasurf_job_max_wraps;
+ unsigned int vitasurf_job_max_attr_gets;
+ unsigned int vitasurf_js_jobs_threw;
+ unsigned int vitasurf_ms_js_jobs_threw;
++unsigned int vitasurf_js_selector_compiles;
++unsigned int vitasurf_js_selector_hits;
+ unsigned int vitasurf_js_jobs_budget;
+ unsigned int vitasurf_ms_js_jobs_budget;
+ unsigned int vitasurf_js_drain_max_jobs;
+@@ -790,6 +792,8 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_job_max_attr_gets = 0;
+ 	vitasurf_js_jobs_threw = 0;
+ 	vitasurf_ms_js_jobs_threw = 0;
++	vitasurf_js_selector_compiles = 0;
++	vitasurf_js_selector_hits = 0;
+ 	vitasurf_js_jobs_budget = 0;
+ 	vitasurf_ms_js_jobs_budget = 0;
+ 	vitasurf_js_drain_max_jobs = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 4e3915d48..d1046095e 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -358,6 +358,15 @@ extern unsigned int vitasurf_ms_js_jobs_threw;
+  * and say how long the busiest drain was and how many jobs it ran, so
+  * a ceiling can be set from figures rather than from a guess.
+  */
++/**
++ * Selectors the prelude parsed and selectors it had already parsed
++ * (VitaSurf). A hydration job on GitHub was stopped after 7.8 seconds
++ * in that parser: every matches() and closest() compiled its selector
++ * afresh. Two numbers say whether the cache that replaced that is
++ * doing its work.
++ */
++extern unsigned int vitasurf_js_selector_compiles;
++extern unsigned int vitasurf_js_selector_hits;
+ extern unsigned int vitasurf_js_jobs_budget;
+ extern unsigned int vitasurf_ms_js_jobs_budget;
+ extern unsigned int vitasurf_js_drain_max_jobs;

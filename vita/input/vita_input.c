@@ -1408,6 +1408,13 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
+			vita_log("page: it used a selector %u times, parsing "
+				 "it %u of them and taking it from the cache "
+				 "the other %u",
+				 vitasurf_js_selector_compiles +
+					vitasurf_js_selector_hits,
+				 vitasurf_js_selector_compiles,
+				 vitasurf_js_selector_hits);
 			vita_log("page: boxes and styles %u ms covered %u "
 				 "elements, %u ms of it selecting their "
 				 "styles and %u ms parsing the style "
