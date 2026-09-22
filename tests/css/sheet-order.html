@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!-- The cascade across sheets, now that selection reads one merged
+     index per origin instead of visiting every sheet in turn. Every
+     box should be 200px wide: a rule is beaten only by a more specific
+     one, or an equally specific one in a later sheet; a sheet's
+     @import rules come before its own; a sheet or import for print
+     does not apply on screen. -->
+<html><head>
+<style>
+body { margin: 0 }
+div { width: 100px; height: 10px; background: #fcc }
+#a { width: 100px }
+div#b { width: 200px }
+#c { width: 100px }
+.x1 { width: 100px }
+[data-y2] { width: 100px }
+#f { width: 200px }
+#g { width: 200px }
+p { width: 100px; height: 10px; background: #fcc }
+</style>
+<style>
+#a { width: 200px }
+#b { width: 100px }
+[data-y1] { width: 200px }
+.x2 { width: 200px }
+</style>
+<link rel="stylesheet" href="sheet-order-main.css">
+<link rel="stylesheet" href="sheet-order-print.css" media="print">
+</head><body>
+<div id="a">later sheet wins at equal specificity</div>
+<div id="b">more specific earlier sheet wins</div>
+<div id="c">a sheet's own rule beats its import</div>
+<div id="d">an imported rule applies</div>
+<div id="e">a print import does not</div>
+<div id="f">a print link does not</div>
+<div id="g">a screen link's later rule wins</div>
+<div class="x1" data-y1="1">attribute rule in a later sheet beats a class rule</div>
+<div class="x2" data-y2="1">class rule in a later sheet beats an attribute rule</div>
+<p id="h">element rule in a later sheet beats an earlier one</p>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+setTimeout(function(){
+ var all = document.querySelectorAll('div, p');
+ for (var i = 0; i < all.length; i++) {
+  var w = Math.round(all[i].getBoundingClientRect().width);
+  ok(all[i].textContent + ' (' + w + ')', w === 200);
+ }
+}, 700);
+</script></body></html>

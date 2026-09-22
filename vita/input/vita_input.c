@@ -1447,6 +1447,11 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				extern unsigned int css_select_steps_universal;
 				extern unsigned int css_select_steps_attr;
 				extern unsigned int css_select_sheets_empty;
+				extern unsigned int css_select_index_builds;
+				extern unsigned int css_select_index_entries;
+				extern unsigned int css_select_index_bytes;
+				extern unsigned int css_select_index_sheets;
+				extern unsigned int css_select_index_failed;
 				extern unsigned int css_select_from_attr;
 				extern unsigned int css_hash_in_attr;
 				extern unsigned int css_hash_uni_unnamed;
@@ -1493,13 +1498,23 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_ms_image_max,
 				 vitasurf_image_kpixels);
 			vita_log("page: selection ran %u times, "
-					 "looked in %u sheets, skipped %u more "
+					 "looked in %u indexes, skipped %u more "
 					 "that held nothing, and considered "
 					 "%u selectors",
 					 css_select_calls,
 					 css_select_sheets_seen,
 					 css_select_sheets_empty,
 					 css_select_selectors_considered);
+			vita_log("page: the index was built %u times for "
+					 "%u ms in all, %u of them failing; the "
+					 "last holds %u rules from %u sheets in "
+					 "%u KB",
+					 vitasurf_css_index_builds,
+					 vitasurf_ms_css_index,
+					 css_select_index_failed,
+					 css_select_index_entries,
+					 css_select_index_sheets,
+					 css_select_index_bytes / 1024);
 				vita_log("page: those came from %u element, "
 					 "%u class, %u id and %u universal "
 					 "rules",
