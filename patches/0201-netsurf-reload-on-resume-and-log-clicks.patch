@@ -1,0 +1,40 @@
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index c6d094a12..02ef80556 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1408,6 +1408,16 @@ mouse_action_drag_none(html_content *html,
+ 
+ 	/* fire dom click event */
+ 	if (mouse & BROWSER_MOUSE_CLICK_1) {
++		/*
++		 * What the click was taken as (VitaSurf): a click that
++		 * leads nowhere leaves nothing else in the log to say
++		 * whether it landed on a control, a link, or plain text.
++		 */
++		NSLOG(netsurf, INFO, "click: action %d, gadget type %d, node %p",
++		      (int) mas.result.action,
++		      (mas.gadget.control != NULL) ?
++				(int) mas.gadget.control->type : -1,
++		      (void *) mas.node);
+ 		fire_generic_dom_event(corestring_dom_click, mas.node, true, true);
+ 	}
+ 
+@@ -1430,8 +1440,18 @@ mouse_action_drag_none(html_content *html,
+ 					   mas.gadget.control->form->node,
+ 					   true, true) == false) {
+ 			/* the page cancelled it and is dealing with it */
++			NSLOG(netsurf, INFO, "click: the page cancelled the "
++			      "submit of form '%s' and is handling it itself",
++			      (mas.gadget.control->form->action != NULL) ?
++					mas.gadget.control->form->action : "");
+ 			break;
+ 		}
++		NSLOG(netsurf, INFO, "click: submitting form '%s' by %s",
++		      (mas.gadget.control->form->action != NULL) ?
++				mas.gadget.control->form->action : "",
++		      (mas.gadget.control->form->method == method_POST_URLENC ||
++		       mas.gadget.control->form->method == method_POST_MULTIPART) ?
++				"POST" : "GET");
+ 		res = form_submit(content_get_url(c),
+ 				  browser_window_find_target(bw,
+ 							     mas.gadget.target,

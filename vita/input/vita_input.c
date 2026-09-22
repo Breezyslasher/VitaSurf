@@ -1739,29 +1739,32 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 }
 
 /*
- * After a suspend the network connections are gone. Stop the fetches that
- * were in flight so they fail now instead of waiting for a timeout, and
- * log the network state; Square reloads the page.
+ * After a suspend the network connections are gone. A page that was
+ * still loading cannot finish on them, so it is fetched again rather
+ * than left to time out; a page that had finished is left alone.
+ *
+ * This runs on every tick, not every half second: the resume event
+ * sits in the queue from the moment the application wakes, and a
+ * build 414 log shows a page the user loaded right after waking being
+ * stopped when the event was read 300 ms later, leaving nothing on
+ * screen. Read at once, the event can only ever find the loads that
+ * were under way before the suspend.
  */
 static void check_resume(void)
 {
-	static uint64_t last_poll_us;
-	uint64_t now = sceKernelGetProcessTimeWide();
-
-	if (now - last_poll_us < 500000) {
-		return;
-	}
-	last_poll_us = now;
 	if (!vita_platform_poll_resume()) {
 		return;
 	}
 	vita_log("resume: application resumed from suspend");
 	vita_net_log_state();
 	if (the_gw != NULL && the_gw->bw != NULL) {
-		browser_window_stop(the_gw->bw);
-		if (guit->window->set_status != NULL) {
-			guit->window->set_status(the_gw,
-				"Resumed: press Square to reload if the page did not finish");
+		if (browser_window_stop_available(the_gw->bw)) {
+			vita_log("resume: the page was still loading, "
+				 "fetching it again");
+			browser_window_reload(the_gw->bw, false);
+		} else {
+			vita_log("resume: the page had finished, left as it "
+				 "is");
 		}
 	}
 	vita_log_memory("resume");
