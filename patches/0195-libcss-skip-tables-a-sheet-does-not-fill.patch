@@ -1,0 +1,175 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 59e12b4..d4b69b8 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -701,6 +701,8 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 
+ 			error = _insert_into_chain(hash,
+ 					&hash->attrs.slots[index], selector);
++			if (error == CSS_OK)
++				hash->attrs.n_entries++;
+ 			css_hash_in_attr++;
+ 
+ 			return error;
+@@ -808,8 +810,11 @@ css_error css__selector_hash_remove(css_selector_hash *hash,
+ 			mask = hash->attrs.n_slots - 1;
+ 			index = key & mask;
+ 
+-			return _remove_from_chain(hash,
++			error = _remove_from_chain(hash,
+ 					&hash->attrs.slots[index], selector);
++			if (error == CSS_OK && hash->attrs.n_entries > 0)
++				hash->attrs.n_entries--;
++			return error;
+ 		}
+ 		/* Universal chain */
+ 		error = _remove_from_chain(hash,
+@@ -1787,3 +1792,26 @@ css_error _iterate_universal(
+ 	return CSS_OK;
+ }
+ 
++
++/* exported: see select/hash.h (VitaSurf) */
++uint32_t css__selector_hash_tables(const css_selector_hash *hash)
++{
++	uint32_t mask = 0;
++
++	if (hash == NULL)
++		return 0;
++	if (hash->elements.n_entries != 0)
++		mask |= CSS_HASH_HAS_ELEMENTS;
++	if (hash->classes.n_entries != 0)
++		mask |= CSS_HASH_HAS_CLASSES;
++	if (hash->ids.n_entries != 0)
++		mask |= CSS_HASH_HAS_IDS;
++	if (hash->attrs.n_entries != 0)
++		mask |= CSS_HASH_HAS_ATTRS;
++	if (hash->universal.sel != NULL)
++		mask |= CSS_HASH_HAS_UNIVERSAL;
++	if (hash->universal_state.sel != NULL)
++		mask |= CSS_HASH_HAS_STATE;
++
++	return mask;
++}
+diff --git a/src/select/hash.h b/src/select/hash.h
+index 5f4b527..37e1f96 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -167,5 +167,23 @@ css_error css__selector_hash_find_by_attr(css_selector_hash *hash,
+ 
+ css_error css__selector_hash_size(css_selector_hash *hash, size_t *size);
+ 
++/*
++ * Which of a sheet's tables hold anything at all (VitaSurf).
++ *
++ * A sheet visit asks each table for the node's chains -- one find per
++ * class, one per attribute bucket, one each for the element, the id,
++ * the universal chain and the state chain -- and a GitHub page makes
++ * 2,565,620 visits over sheets that are mostly small, so most of those
++ * finds reach an empty table. One word says which to skip, and a
++ * sheet with nothing in it is skipped whole.
++ */
++#define CSS_HASH_HAS_ELEMENTS	(1u << 0)
++#define CSS_HASH_HAS_CLASSES	(1u << 1)
++#define CSS_HASH_HAS_IDS	(1u << 2)
++#define CSS_HASH_HAS_ATTRS	(1u << 3)
++#define CSS_HASH_HAS_UNIVERSAL	(1u << 4)
++#define CSS_HASH_HAS_STATE	(1u << 5)
++uint32_t css__selector_hash_tables(const css_selector_hash *hash);
++
+ #endif
+ 
+diff --git a/src/select/select.c b/src/select/select.c
+index 79f48c8..055aa68 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -159,6 +159,8 @@ unsigned int css_select_steps_id;
+ unsigned int css_select_steps_universal;
+ unsigned int css_select_steps_attr;
+ unsigned int css_select_from_attr;
++/* sheet visits that could offer nothing, skipped whole (VitaSurf) */
++unsigned int css_select_sheets_empty;
+ /*
+  * And where a candidate dies (VitaSurf). 16.9 million are offered on a
+  * GitHub load and 99.6% come out of the universal chain, but only 1.07
+@@ -2465,6 +2467,18 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	struct css_hash_selection_requirments req;
+ 	css_error error;
+ 
++	/*
++	 * What this sheet holds at all (VitaSurf). Most of a visit's cost
++	 * is now the finds, and most of those hit an empty table in a
++	 * small sheet; a sheet with nothing costs nothing.
++	 */
++	const uint32_t tables = css__selector_hash_tables(sheet->selectors);
++
++	if (tables == 0) {
++		css_select_sheets_empty++;
++		return CSS_OK;
++	}
++
+ 	/* Set up general selector chain requirments */
+ 	req.media = state->media;
+ 	req.unit_ctx = state->unit_ctx;
+@@ -2476,13 +2490,16 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 
+ 	/* Find hash chain that applies to current node */
+ 	req.qname = state->element;
+-	error = css__selector_hash_find(sheet->selectors,
+-			&req, &node_iterator,
+-			&node_selectors);
+-	if (error != CSS_OK)
+-		goto cleanup;
++	if (tables & CSS_HASH_HAS_ELEMENTS) {
++		error = css__selector_hash_find(sheet->selectors,
++				&req, &node_iterator,
++				&node_selectors);
++		if (error != CSS_OK)
++			goto cleanup;
++	}
+ 
+-	if (state->classes != NULL && n_classes > 0) {
++	if ((tables & CSS_HASH_HAS_CLASSES) &&
++			state->classes != NULL && n_classes > 0) {
+ 		/* Find hash chains for node classes */
+ 		if (n_classes <= sizeof(class_room) / sizeof(class_room[0])) {
+ 			class_selectors = class_room;
+@@ -2505,7 +2522,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		}
+ 	}
+ 
+-	if (state->id != NULL) {
++	if ((tables & CSS_HASH_HAS_IDS) && state->id != NULL) {
+ 		/* Find hash chain for node ID */
+ 		req.id = state->id;
+ 		error = css__selector_hash_find_by_id(sheet->selectors,
+@@ -2515,12 +2532,16 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	}
+ 
+ 	/* Find hash chain for universal selector */
+-	error = css__selector_hash_find_universal(sheet->selectors, &req,
+-			&univ_iterator, &univ_selectors);
+-	if (error != CSS_OK)
+-		goto cleanup;
++	if (tables & CSS_HASH_HAS_UNIVERSAL) {
++		error = css__selector_hash_find_universal(sheet->selectors,
++				&req, &univ_iterator, &univ_selectors);
++		if (error != CSS_OK)
++			goto cleanup;
++	}
+ 
+ 	/* And one for each attribute bucket the node falls in (VitaSurf) */
++	if ((tables & CSS_HASH_HAS_ATTRS) == 0)
++		n_attrs = 0;
+ 	for (i = 0; i < n_attrs; i++) {
+ 		req.attr_slot = state->attr_slots[i];
+ 		error = css__selector_hash_find_by_attr(sheet->selectors,
+@@ -2535,7 +2556,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	 * root is the only such node today, so for every other element
+ 	 * this is a chain of thousands that is never touched.
+ 	 */
+-	if (state->node_state != 0) {
++	if ((tables & CSS_HASH_HAS_STATE) && state->node_state != 0) {
+ 		error = css__selector_hash_find_by_state(sheet->selectors,
+ 				&req, &attr_iterator,
+ 				&attr_selectors[n_attrs]);

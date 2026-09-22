@@ -1446,6 +1446,7 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				extern unsigned int css_select_steps_id;
 				extern unsigned int css_select_steps_universal;
 				extern unsigned int css_select_steps_attr;
+				extern unsigned int css_select_sheets_empty;
 				extern unsigned int css_select_from_attr;
 				extern unsigned int css_hash_in_attr;
 				extern unsigned int css_hash_uni_unnamed;
@@ -1492,10 +1493,12 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_ms_image_max,
 				 vitasurf_image_kpixels);
 			vita_log("page: selection ran %u times, "
-					 "looked in %u sheets and considered "
+					 "looked in %u sheets, skipped %u more "
+					 "that held nothing, and considered "
 					 "%u selectors",
 					 css_select_calls,
 					 css_select_sheets_seen,
+					 css_select_sheets_empty,
 					 css_select_selectors_considered);
 				vita_log("page: those came from %u element, "
 					 "%u class, %u id and %u universal "

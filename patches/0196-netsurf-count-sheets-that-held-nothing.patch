@@ -1,0 +1,20 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 9f354fc08..3e679f818 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -675,6 +675,7 @@ extern unsigned int css_select_steps_element;
+ extern unsigned int css_select_steps_class;
+ extern unsigned int css_select_steps_id;
+ extern unsigned int css_select_steps_universal;
++extern unsigned int css_select_sheets_empty;
+ extern unsigned int css_select_cand_details_failed;
+ extern unsigned int css_select_cand_comb_failed;
+ extern unsigned int css_select_cand_matched;
+@@ -823,6 +824,7 @@ void vitasurf_profile_reset(void)
+ 	css_select_steps_class = 0;
+ 	css_select_steps_id = 0;
+ 	css_select_steps_universal = 0;
++	css_select_sheets_empty = 0;
+ 	css_select_cand_details_failed = 0;
+ 	css_select_cand_comb_failed = 0;
+ 	css_select_cand_matched = 0;
