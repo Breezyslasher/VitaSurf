@@ -1452,6 +1452,13 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				extern unsigned int css_select_index_bytes;
 				extern unsigned int css_select_index_sheets;
 				extern unsigned int css_select_index_failed;
+				extern unsigned int css_custom_sets;
+				extern unsigned int css_custom_owns;
+				extern unsigned int css_custom_max_count;
+				extern unsigned int css_custom_gets;
+				extern unsigned int css_custom_get_steps;
+				extern unsigned int css_deferred_compiles;
+				extern unsigned int css_deferred_cache_hits;
 				extern unsigned int css_select_from_attr;
 				extern unsigned int css_hash_in_attr;
 				extern unsigned int css_hash_uni_unnamed;
@@ -1515,6 +1522,16 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 css_select_index_entries,
 					 css_select_index_sheets,
 					 css_select_index_bytes / 1024);
+			vita_log("page: variables were set %u times on %u "
+					 "elements, the most on one being %u; "
+					 "var() looked one up %u times over %u "
+					 "steps, and %u declarations were "
+					 "compiled, %u of them from the cache",
+					 css_custom_sets, css_custom_owns,
+					 css_custom_max_count, css_custom_gets,
+					 css_custom_get_steps,
+					 css_deferred_compiles,
+					 css_deferred_cache_hits);
 				vita_log("page: those came from %u element, "
 					 "%u class, %u id and %u universal "
 					 "rules",

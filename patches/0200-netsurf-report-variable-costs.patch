@@ -1,0 +1,32 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 282cb921a..8b41742bb 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -683,6 +683,13 @@ extern unsigned int css_select_index_entries;
+ extern unsigned int css_select_index_bytes;
+ extern unsigned int css_select_index_sheets;
+ extern unsigned int css_select_index_failed;
++extern unsigned int css_custom_sets;
++extern unsigned int css_custom_owns;
++extern unsigned int css_custom_max_count;
++extern unsigned int css_custom_gets;
++extern unsigned int css_custom_get_steps;
++extern unsigned int css_deferred_compiles;
++extern unsigned int css_deferred_cache_hits;
+ extern unsigned int css_select_cand_details_failed;
+ extern unsigned int css_select_cand_comb_failed;
+ extern unsigned int css_select_cand_matched;
+@@ -836,6 +843,13 @@ void vitasurf_profile_reset(void)
+ 	css_select_sheets_empty = 0;
+ 	css_select_index_builds = 0;
+ 	css_select_index_failed = 0;
++	css_custom_sets = 0;
++	css_custom_owns = 0;
++	css_custom_max_count = 0;
++	css_custom_gets = 0;
++	css_custom_get_steps = 0;
++	css_deferred_compiles = 0;
++	css_deferred_cache_hits = 0;
+ 	css_select_cand_details_failed = 0;
+ 	css_select_cand_comb_failed = 0;
+ 	css_select_cand_matched = 0;
