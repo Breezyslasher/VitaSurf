@@ -1,0 +1,230 @@
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index 0c9c7f053..b5ae8ef6d 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -629,90 +629,165 @@ static void html_texty_element_update(html_content *htmlc, dom_node *node)
+ /**
+  * callback for DOMNodeInserted end type
+  */
+-static void
+-dom_default_action_DOMNodeInserted_cb(struct dom_event *evt, void *pw)
++/**
++ * What an element is owed on entering the document (VitaSurf): the
++ * per-tag processing and the script hook that DOMNodeInserted used to
++ * do inline. Split out so that it can also be done for the descendants
++ * of a subtree that was built quietly -- a deep clone, or a fragment
++ * parsed for innerHTML -- which never got an event of their own.
++ */
++static void html_process_inserted_element(html_content *htmlc,
++		dom_node *node)
+ {
+-	dom_event_target *node;
+-	dom_node_type type;
++	dom_html_element_type tag_type;
+ 	dom_exception exc;
+-	html_content *htmlc = pw;
+ 
+-	exc = dom_event_get_target(evt, &node);
+-	if ((exc != DOM_NO_ERR) || (node == NULL)) {
+-		/* failed to obtain the event target node */
+-		return;
++	exc = dom_html_element_get_tag_type(node, &tag_type);
++	if (exc != DOM_NO_ERR) {
++		tag_type = DOM_HTML_ELEMENT_TYPE__UNKNOWN;
+ 	}
+ 
+-	exc = dom_node_get_node_type(node, &type);
+-	if ((exc == DOM_NO_ERR) && (type == DOM_ELEMENT_NODE)) {
+-		/* an element node has been inserted */
+-		dom_html_element_type tag_type;
++	switch (tag_type) {
++	case DOM_HTML_ELEMENT_TYPE_BASE:
++		html_process_inserted_base(htmlc, node);
++		break;
+ 
+-		exc = dom_html_element_get_tag_type(node, &tag_type);
+-		if (exc != DOM_NO_ERR) {
+-			tag_type = DOM_HTML_ELEMENT_TYPE__UNKNOWN;
++	case DOM_HTML_ELEMENT_TYPE_IMG:
++		html_process_inserted_img(htmlc, node);
++		break;
++
++	case DOM_HTML_ELEMENT_TYPE_LINK:
++		html_process_inserted_link(htmlc, node);
++		break;
++
++	case DOM_HTML_ELEMENT_TYPE_META:
++		html_process_inserted_meta(htmlc, node);
++		break;
++
++	case DOM_HTML_ELEMENT_TYPE_STYLE:
++		if (nsoption_bool(author_level_css)) {
++			html_css_process_style(htmlc, node);
+ 		}
++		break;
+ 
+-		switch (tag_type) {
+-		case DOM_HTML_ELEMENT_TYPE_BASE:
+-			html_process_inserted_base(htmlc, (dom_node *)node);
+-			break;
++	case DOM_HTML_ELEMENT_TYPE_SCRIPT:
++		dom_SCRIPT_showed_up(htmlc, (dom_html_script_element *)node);
++		break;
+ 
+-		case DOM_HTML_ELEMENT_TYPE_IMG:
+-			html_process_inserted_img(htmlc, (dom_node *)node);
+-			break;
++	case DOM_HTML_ELEMENT_TYPE_TITLE:
++		html_process_inserted_title(htmlc, node);
++		break;
+ 
+-		case DOM_HTML_ELEMENT_TYPE_LINK:
+-			html_process_inserted_link(htmlc, (dom_node *)node);
+-			break;
++	default:
++		break;
++	}
+ 
+-		case DOM_HTML_ELEMENT_TYPE_META:
+-			html_process_inserted_meta(htmlc, (dom_node *)node);
+-			break;
++	if (htmlc->enable_scripting) {
++		/* ensure javascript context is available */
++		if (htmlc->jsthread == NULL) {
++			union content_msg_data msg_data;
+ 
+-		case DOM_HTML_ELEMENT_TYPE_STYLE:
+-			if (nsoption_bool(author_level_css)) {
+-				html_css_process_style(htmlc, (dom_node *)node);
+-			}
+-			break;
++			msg_data.jsthread = &htmlc->jsthread;
++			content_broadcast(&htmlc->base,
++					  CONTENT_MSG_GETTHREAD,
++					  &msg_data);
++			NSLOG(netsurf, INFO,
++			      "javascript context: %p (htmlc: %p)",
++			      htmlc->jsthread,
++			      htmlc);
++		}
++		if (htmlc->jsthread != NULL) {
++			js_handle_new_element(htmlc->jsthread,
++					      (dom_element *) node);
++		}
++	}
++}
+ 
+-		case DOM_HTML_ELEMENT_TYPE_SCRIPT:
+-			dom_SCRIPT_showed_up(htmlc,
+-					     (dom_html_script_element *)node);
+-			break;
++/**
++ * Settle what a quietly built subtree owes, now that it is in the
++ * document (VitaSurf). Only nodes still carrying the quiet mark are
++ * processed, so a subtree that was merely moved within the document is
++ * not processed twice.
++ */
++static void html_process_quiet_descendants(html_content *htmlc,
++		dom_node *root)
++{
++	dom_node *n = NULL;
+ 
+-		case DOM_HTML_ELEMENT_TYPE_TITLE:
+-			html_process_inserted_title(htmlc, (dom_node *)node);
+-			break;
++	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
++		return;
++	}
++	while (n != NULL) {
++		dom_node *next = NULL;
++		dom_node_type type;
+ 
+-		default:
+-			break;
++		if (dom_node_take_quiet(n) &&
++				dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++				type == DOM_ELEMENT_NODE) {
++			html_process_inserted_element(htmlc, n);
+ 		}
+ 
+-		if (htmlc->enable_scripting) {
+-			/* ensure javascript context is available */
+-			if (htmlc->jsthread == NULL) {
+-				union content_msg_data msg_data;
+-
+-				msg_data.jsthread = &htmlc->jsthread;
+-				content_broadcast(&htmlc->base,
+-						  CONTENT_MSG_GETTHREAD,
+-						  &msg_data);
+-				NSLOG(netsurf, INFO,
+-				      "javascript context: %p (htmlc: %p)",
+-				      htmlc->jsthread,
+-				      htmlc);
+-			}
+-			if (htmlc->jsthread != NULL) {
+-				js_handle_new_element(htmlc->jsthread,
+-						      (dom_element *) node);
++		/* depth first, without recursion */
++		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
++			next = NULL;
++		}
++		if (next == NULL) {
++			dom_node *cur = dom_node_ref(n);
++
++			while (cur != NULL) {
++				dom_node *sib = NULL, *parent = NULL;
++
++				if (cur == root) {
++					dom_node_unref(cur);
++					cur = NULL;
++					break;
++				}
++				if (dom_node_get_next_sibling(cur, &sib) !=
++						DOM_NO_ERR) {
++					sib = NULL;
++				}
++				if (sib != NULL) {
++					dom_node_unref(cur);
++					next = sib;
++					break;
++				}
++				if (dom_node_get_parent_node(cur, &parent) !=
++						DOM_NO_ERR) {
++					parent = NULL;
++				}
++				dom_node_unref(cur);
++				cur = parent;
+ 			}
+ 		}
++		dom_node_unref(n);
++		n = next;
++	}
++}
++
++static void
++dom_default_action_DOMNodeInserted_cb(struct dom_event *evt, void *pw)
++{
++	dom_event_target *node;
++	dom_node_type type;
++	dom_exception exc;
++	html_content *htmlc = pw;
++
++	exc = dom_event_get_target(evt, &node);
++	if ((exc != DOM_NO_ERR) || (node == NULL)) {
++		/* failed to obtain the event target node */
++		return;
++	}
++
++	exc = dom_node_get_node_type(node, &type);
++	if ((exc == DOM_NO_ERR) && (type == DOM_ELEMENT_NODE)) {
++		html_process_inserted_element(htmlc, (dom_node *)node);
++		html_process_quiet_descendants(htmlc, (dom_node *)node);
+ 	}
+ 	dom_node_unref(node);
+ }
+ 
+ 
++
+ /**
+  * callback for DOMNodeInsertedIntoDocument end type
+  */

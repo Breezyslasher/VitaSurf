@@ -308,9 +308,37 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 		 * and that is worth saying out loud, but only as often
 		 * as it takes to see it. */
 		if (thread->overrun_count == 1) {
+			int level;
+
 			vita_log("qjs: script exceeded its time budget: %s",
 				 thread->current_script != NULL ?
 				 thread->current_script : "?");
+			/*
+			 * And where it was when the axe fell (VitaSurf). A
+			 * GitHub load has a promise job stopped after 7006
+			 * ms that touched no node at all -- pure
+			 * interpretation -- and the abort throws null, so
+			 * the exception carries no stack to say what it
+			 * was doing. Ask the engine for the script or
+			 * module at each level of the call stack instead,
+			 * innermost first, before the unwinding starts.
+			 */
+			for (level = 0; level < 8; level++) {
+				JSAtom name = JS_GetScriptOrModuleName(
+						thread->ctx, level);
+				const char *s;
+
+				if (name == JS_ATOM_NULL) {
+					break;
+				}
+				s = JS_AtomToCString(thread->ctx, name);
+				if (s != NULL) {
+					vita_log("qjs:   at level %d: %s",
+						 level, s);
+					JS_FreeCString(thread->ctx, s);
+				}
+				JS_FreeAtom(thread->ctx, name);
+			}
 			thread->overrun_said_ms = now;
 		} else if (now - thread->overrun_said_ms >= 30000) {
 			vita_log("qjs: script still over budget, aborted %u "
@@ -2101,8 +2129,21 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	params.enc = "UTF-8";
 	params.fix_enc = true;
 	params.enable_script = false;
+	/*
+	 * Parse quietly (VitaSurf). The fragment parser is created on the
+	 * page's own document, so every node it built raised two mutation
+	 * events into NetSurf's default action -- image, style and script
+	 * processing and the inline-handler hook -- for a subtree that is
+	 * not in the page yet. 415 KB of GitHub's markup took 870 ms to
+	 * parse that way. With the document quiet the nodes are marked
+	 * instead, and when they are moved into the target below, the
+	 * insert of each top-level node settles what its descendants are
+	 * owed, once.
+	 */
+	dom_document_quiet_mutations(doc, +1);
 	if (dom_hubbub_fragment_parser_create(&params, doc, &parser,
 					      &fragment) != DOM_HUBBUB_OK) {
+		dom_document_quiet_mutations(doc, -1);
 		goto out;
 	}
 	/*
@@ -2117,15 +2158,19 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	if (node != (struct dom_node *)doc &&
 	    dom_hubbub_parser_parse_chunk(parser, (const uint8_t *)"<body>",
 					  6) != DOM_HUBBUB_OK) {
+		dom_document_quiet_mutations(doc, -1);
 		goto out;
 	}
 	if (dom_hubbub_parser_parse_chunk(parser, (const uint8_t *)html,
 					  len) != DOM_HUBBUB_OK) {
+		dom_document_quiet_mutations(doc, -1);
 		goto out;
 	}
 	if (dom_hubbub_parser_completed(parser) != DOM_HUBBUB_OK) {
+		dom_document_quiet_mutations(doc, -1);
 		goto out;
 	}
+	dom_document_quiet_mutations(doc, -1);
 	vitasurf_ms_html_js_parse += (unsigned)(now_ms() - t_stage);
 	t_stage = now_ms();
 	/* empty the target */

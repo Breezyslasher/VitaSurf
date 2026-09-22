@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<!-- A subtree built while detached -- a deep clone, or markup parsed
+     for innerHTML -- no longer raises a mutation event per node. What
+     those events did for each node (style processing, the inline
+     handler hook) must still happen, once, when the subtree enters the
+     document. Asserted through layout for the style and through a
+     dispatched click for the handler. -->
+<html><head><meta charset="utf-8"><title>quiet building</title></head>
+<body>
+<template id="t"><div class="from-tpl" onclick="window.__clicked=(window.__clicked||0)+1"><span>x</span></div></template>
+<div id="host"></div>
+<div id="host2"></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function pad(id){
+  var e = document.getElementById(id);
+  return e.getBoundingClientRect().left - e.parentNode.getBoundingClientRect().left;
+}
+
+/* 1. a deep clone of a template with a style inside: the style must
+   apply once the clone is in the document */
+var tpl = document.createElement("template");
+tpl.innerHTML = '<style>.q-styled{padding-left:70px}</style><div class="q-styled"><span id="qs">s</span></div>';
+var frag = tpl.content.cloneNode(true);
+document.getElementById("host").appendChild(frag);
+
+/* 2. an inline handler on a cloned element must be wired */
+var c = document.getElementById("t").content.cloneNode(true);
+document.getElementById("host2").appendChild(c);
+var el = document.querySelector("#host2 .from-tpl");
+el.dispatchEvent(new Event("click", {bubbles:true}));
+ok("an inline handler on a cloned element fires", window.__clicked === 1);
+
+/* 3. innerHTML with a style and a handler */
+var h3 = document.createElement("div");
+document.body.appendChild(h3);
+h3.innerHTML = '<style>.ih-styled{padding-left:40px}</style><div class="ih-styled" onclick="window.__ih=1"><span id="ihs">i</span></div>';
+h3.querySelector(".ih-styled").dispatchEvent(new Event("click", {bubbles:true}));
+ok("an inline handler set through innerHTML fires", window.__ih === 1);
+
+/* 4. a subtree moved within the document must not be processed again:
+   moving the handler element must not add a second handler */
+var moved = document.querySelector("#host2 .from-tpl");
+document.body.appendChild(moved);
+moved.dispatchEvent(new Event("click", {bubbles:true}));
+ok("moving an element does not double its handler", window.__clicked === 2);
+
+/* 5. and a large clone is fast: time it */
+var big = document.createElement("template");
+var s = "";
+for (var i = 0; i < 600; i++) s += '<div class="r"><span>a</span><span>b</span></div>';
+big.innerHTML = s;
+/* GitHub's template had been walked by script before it was cloned,
+   so every node carried a wrapper: do the same, or the clone measured
+   here is not the clone the device measured */
+var touched = big.content.querySelectorAll("*").length;
+var t0 = Date.now();
+var bc = big.content.cloneNode(true);
+var dt = Date.now() - t0;
+console.log("CLONEMS " + dt + " for " + bc.querySelectorAll("*").length + " elements, " + touched + " wrapped first");
+
+/* 6. and innerHTML of a large document, the other path built quietly */
+var h6 = document.createElement("div");
+document.body.appendChild(h6);
+var t1 = Date.now();
+h6.innerHTML = s + s + s;
+console.log("INNERHTMLMS " + (Date.now() - t1) + " for " + h6.querySelectorAll("*").length + " elements");
+
+setTimeout(function(){
+  ok("a style cloned in a template applies once inserted", pad("qs") === 70);
+  ok("a style set through innerHTML applies", pad("ihs") === 40);
+  console.log("QUIET DONE");
+}, 60);
+</script>
+</body></html>
