@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!-- Two modules that import each other, one of them also importing a
+     module the page never names. The first attempt has to wait for
+     fetches; QuickJS leaves a module it half resolved pointing at one
+     it freed, and the retry used to crash running through it. The
+     cache's import check also went round the cycle, reading both from
+     the card at every turn. Run it twice: the second run reads the
+     modules back from the cache. -->
+<html><head><title>module cycle</title>
+<script type="module" src="cyc-er.js"></script>
+<script type="module" src="cyc-ge.js"></script>
+</head><body>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var tries=0;
+(function wait(){
+ if(window.__cycSize===undefined&&++tries<40){setTimeout(wait,50);return;}
+ ok("the importing module ran ("+window.__cycSize+" registered)",window.__cycSize===2);
+ ok("the cycle linked ("+window.__cycValue+")",window.__cycValue==="a:objectu");
+ ok("the registry ran once ("+window.__cycRuns+")",window.__cycRuns===1);
+})();
+</script></body></html>

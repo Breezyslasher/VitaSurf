@@ -407,10 +407,17 @@ var compiled={},compiledCount=0,compiledHits=0;
 function countHits(){
  if(compiledHits&&typeof __vitaSelector==='function')__vitaSelector(1,compiledHits);
  compiledHits=0;}
+/* A selector the general path keeps being asked for is named in the
+   log at 4096 uses and each doubling after, so the next fast path is
+   chosen from a log rather than guessed (VitaSurf). */
+function noteSlow(g,text){
+ var n=g.slow=(g.slow|0)+1;
+ if(n>=4096&&(n&(n-1))===0&&typeof __vitaSelector==='function')__vitaSelector(6,n,text);}
 function compile(selector){
  var text=String(selector),hit=compiled[text];
  if(hit!==undefined){
   if(++compiledHits>=256)countHits();
+  if(!hit.bare)noteSlow(hit,text);
   return hit;}
  countHits();
  if(typeof __vitaSelector==='function')__vitaSelector(0);

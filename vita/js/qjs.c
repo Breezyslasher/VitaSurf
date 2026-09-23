@@ -212,6 +212,7 @@ struct jsthread {
 	unsigned js_import_fetches; /**< chunks the loader went and fetched */
 	unsigned retry_delay_ms;  /**< how long before the next retry round */
 	struct js_deferred *deferred; /**< module scripts waiting on imports */
+	struct mod_deps *mod_deps[64]; /**< each module's imports, by URL */
 	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
 				   *   JS_UNINITIALIZED before it is looked
@@ -2327,6 +2328,19 @@ static JSValue win_vita_selector(JSContext *ctx, JSValueConst this_val,
 		vitasurf_js_sel_closest++;
 		if (steps > 0) {
 			vitasurf_js_sel_closest_steps += (unsigned int)steps;
+		}
+		break;
+	case 6:
+		/* a selector the general path has now matched this often */
+		if (argc >= 3) {
+			const char *t = JS_ToCString(ctx, argv[2]);
+
+			if (t != NULL) {
+				vita_log("qjs: selector '%.120s' has taken "
+					 "the general path %d times", t,
+					 steps);
+				JS_FreeCString(ctx, t);
+			}
 		}
 		break;
 	default: break;
@@ -7992,6 +8006,11 @@ static void bc_index_make_room(uint32_t bytes)
  */
 static bool bc_module_deps_ready(JSContext *ctx, const char *url,
 				 const char *src, size_t srclen);
+static int module_graph_check(jsthread *thread, const char *root,
+			      const char *src, size_t len, char *waiting,
+			      size_t waiting_len);
+/** Set while a graph walk resolves specifiers, to keep the log quiet. */
+static bool normalize_quiet;
 
 static JSValue bc_load_kind(JSContext *ctx, const char *url,
 			    const char *src, size_t srclen, bool module)
@@ -8471,40 +8490,24 @@ static int bc_scan_imports(const char *src, size_t len, char *out,
 static bool bc_module_deps_ready(JSContext *ctx, const char *url,
 				 const char *src, size_t srclen)
 {
-	static unsigned serial;
-	char name[1100];
-	char *out;
-	size_t outsz = 64 * 1024;
-	int n;
-	JSValue fn;
+	jsthread *thread = JS_GetContextOpaque(ctx);
 
-	out = malloc(outsz);
-	if (out == NULL) {
+	/*
+	 * This compiled a module of nothing but the imports, from source,
+	 * which asked the loader for each of them -- and the loader read
+	 * each from the cache and checked its imports the same way. Two
+	 * modules that import each other went round that loop, reading
+	 * both from the card at every turn, until the stack ran out: on
+	 * build 422 GitHub's element registry was read 122 times in 3 s,
+	 * and every turn left a copy of it in the engine's module list.
+	 * The walk below reads the imports as text instead, and a module
+	 * already on the walk is not visited again. Only a graph whose
+	 * every module is here and readable counts (VitaSurf).
+	 */
+	if (thread == NULL) {
 		return false;
 	}
-	out[0] = '\0';
-	n = bc_scan_imports(src, srclen, out, outsz);
-	if (n < 0) {
-		free(out);
-		vita_log("qjs: cannot read the imports of '%s', compiling it",
-			 url);
-		return false;
-	}
-	if (n == 0) {
-		free(out);
-		return true;
-	}
-	snprintf(name, sizeof(name), "%s#vitasurf-imports-%u", url,
-		 ++serial);
-	fn = JS_Eval(ctx, out, strlen(out), name,
-		     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-	free(out);
-	if (JS_IsException(fn)) {
-		JS_FreeValue(ctx, JS_GetException(ctx));
-		return false;
-	}
-	JS_FreeValue(ctx, fn);
-	return true;
+	return module_graph_check(thread, url, src, srclen, NULL, 0) == 1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -9058,7 +9061,9 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base,
 	if (out == NULL) {
 		return js_dup_cstr(ctx, name);
 	}
-	vita_log("qjs: import map resolved '%s' to '%s'", name, out);
+	if (!normalize_quiet) {
+		vita_log("qjs: import map resolved '%s' to '%s'", name, out);
+	}
 	return out;
 }
 
@@ -9122,6 +9127,327 @@ static const char *without_retry_suffix(const char *url, char *buf, size_t len)
 	memcpy(buf, url, n);
 	buf[n] = 0;
 	return buf;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Whether a module's import graph is all here (VitaSurf)                    */
+
+/*
+ * QuickJS cannot take back a module compile that fails half way. It
+ * marks each module resolved as it starts on it, before its imports are
+ * found, and when one import cannot be had it frees only the module it
+ * was compiling. Anything else loaded on the way stays in the engine's
+ * list, marked resolved. When two modules import each other, the one
+ * that stays holds a pointer to the one that was freed, and the next
+ * attempt runs through it: a page whose chunks import each other and
+ * arrive out of order crashed when it finally had them all.
+ *
+ * So a module is not compiled until everything it imports, all the way
+ * down, has arrived. That is worked out from the text: each module's
+ * import statements are read once and kept, a walk visits every module
+ * once however they cycle, and a graph found whole is remembered as
+ * whole. The text is read with a heuristic (bc_scan_imports), so only
+ * a module that is actually on its way holds a compile back; one that
+ * cannot be found or read is left to the compile to judge, as before.
+ */
+
+struct mod_deps {
+	struct mod_deps *next;
+	char *url;
+	char **deps;	/**< its imports, resolved to URLs */
+	int n;		/**< how many, or -1 when they could not be read */
+	bool scanned;	/**< its source has been read; else only asked for */
+	bool asked;	/**< a fetch was started for it from here */
+	bool complete;	/**< everything under it was here */
+};
+
+enum mod_src { MOD_SRC_HERE, MOD_SRC_ARRIVING, MOD_SRC_NONE, MOD_SRC_FAILED };
+
+#define GRAPH_MAX_NODES 1024
+
+static unsigned mod_deps_bucket(const char *url)
+{
+	unsigned h = 5381;
+
+	while (*url != '\0') {
+		h = h * 33u + (unsigned char)*url++;
+	}
+	return h % 64u;
+}
+
+static struct mod_deps *mod_deps_find(jsthread *thread, const char *url)
+{
+	struct mod_deps *e = thread->mod_deps[mod_deps_bucket(url)];
+
+	while (e != NULL && strcmp(e->url, url) != 0) {
+		e = e->next;
+	}
+	return e;
+}
+
+static void mod_deps_free(jsthread *thread)
+{
+	unsigned b;
+
+	for (b = 0; b < 64; b++) {
+		struct mod_deps *e = thread->mod_deps[b];
+
+		while (e != NULL) {
+			struct mod_deps *next = e->next;
+			int i;
+
+			for (i = 0; i < e->n; i++) {
+				free(e->deps[i]);
+			}
+			free(e->deps);
+			free(e->url);
+			free(e);
+			e = next;
+		}
+		thread->mod_deps[b] = NULL;
+	}
+}
+
+/** Where the page stands with a module's source. */
+static enum mod_src module_source(jsthread *thread, const char *url,
+				  const uint8_t **data, size_t *size)
+{
+	char stripped[1024];
+	const char *want = without_retry_suffix(url, stripped,
+						sizeof(stripped));
+	enum mod_src best = MOD_SRC_NONE;
+	unsigned int i;
+
+	if (thread->htmlc == NULL) {
+		return MOD_SRC_NONE;
+	}
+	for (i = 0; i < thread->htmlc->scripts_count; i++) {
+		struct html_script *sc = &thread->htmlc->scripts[i];
+		int st;
+
+		if (sc->type == HTML_SCRIPT_INLINE ||
+		    sc->data.handle == NULL ||
+		    strcmp(nsurl_access(hlcache_handle_get_url(
+				sc->data.handle)), want) != 0) {
+			continue;
+		}
+		st = (int)content_get_status(sc->data.handle);
+		if (st == CONTENT_STATUS_DONE) {
+			*data = content_get_source_data(sc->data.handle,
+							size);
+			if (*data != NULL && *size > 0) {
+				return MOD_SRC_HERE;
+			}
+			if (best == MOD_SRC_NONE) best = MOD_SRC_FAILED;
+		} else if (st == CONTENT_STATUS_ERROR) {
+			if (best == MOD_SRC_NONE) best = MOD_SRC_FAILED;
+		} else {
+			best = MOD_SRC_ARRIVING;
+		}
+	}
+	return best;
+}
+
+/** A module's imports, read from its source once and kept. */
+static struct mod_deps *mod_deps_get(jsthread *thread, const char *url,
+				     const char *src, size_t len)
+{
+	struct mod_deps *e = mod_deps_find(thread, url);
+	size_t outsz = 64 * 1024;
+	char *out, *p;
+	int n, i;
+	bool fresh = false;
+
+	if (e != NULL && e->scanned) {
+		return e;
+	}
+	if (e == NULL) {
+		e = calloc(1, sizeof(*e));
+		if (e == NULL) {
+			return NULL;
+		}
+		e->url = strdup(url);
+		if (e->url == NULL) {
+			free(e);
+			return NULL;
+		}
+		fresh = true;
+	}
+	e->scanned = true;
+	out = malloc(outsz);
+	n = out != NULL ? bc_scan_imports(src, len, out, outsz) : -1;
+	e->n = -1;
+	if (n > 0) {
+		e->deps = calloc((size_t)n, sizeof(char *));
+	}
+	if (n == 0) {
+		e->n = 0;
+	} else if (n > 0 && e->deps != NULL) {
+		/* out holds one  import "<spec>";  per line */
+		e->n = 0;
+		p = out;
+		for (i = 0; i < n && p != NULL; i++) {
+			char *q0 = strpbrk(p, "\"'"), *q1, *norm;
+
+			if (q0 == NULL) break;
+			q1 = strchr(q0 + 1, *q0);
+			if (q1 == NULL) break;
+			*q1 = '\0';
+			normalize_quiet = true;
+			norm = qjs_module_normalize(thread->ctx, url, q0 + 1,
+						    NULL);
+			normalize_quiet = false;
+			if (norm != NULL) {
+				e->deps[e->n] = strdup(norm);
+				js_free(thread->ctx, norm);
+				if (e->deps[e->n] != NULL) e->n++;
+			}
+			p = strchr(q1 + 1, '\n');
+		}
+	}
+	free(out);
+	if (fresh) {
+		e->next = thread->mod_deps[mod_deps_bucket(url)];
+		thread->mod_deps[mod_deps_bucket(url)] = e;
+	}
+	return e;
+}
+
+/** Note that a fetch was started for url, so it is not started again. */
+static void mod_deps_asked(jsthread *thread, const char *url)
+{
+	struct mod_deps *e = mod_deps_find(thread, url);
+
+	if (e == NULL) {
+		e = calloc(1, sizeof(*e));
+		if (e == NULL) {
+			return;
+		}
+		e->url = strdup(url);
+		if (e->url == NULL) {
+			free(e);
+			return;
+		}
+		e->n = -1;
+		e->next = thread->mod_deps[mod_deps_bucket(url)];
+		thread->mod_deps[mod_deps_bucket(url)] = e;
+	}
+	e->asked = true;
+}
+
+/*
+ * The module root, whose source is src, and everything it imports:
+ * 1 when all of it is here, 0 when some of it is still arriving (a
+ * fetch is started for any that was never asked for; its URL is copied
+ * to waiting), -1 when the walk cannot tell.
+ */
+static int module_graph_check(jsthread *thread, const char *root,
+			      const char *src, size_t len, char *waiting,
+			      size_t waiting_len)
+{
+	struct mod_deps **queue, *e;
+	unsigned n = 0, i;
+	bool pending = false, unknown = false;
+
+	if (thread == NULL || thread->closed) {
+		return -1;
+	}
+	e = mod_deps_get(thread, root, src, len);
+	if (e == NULL) {
+		return -1;
+	}
+	if (e->complete) {
+		return 1;
+	}
+	queue = malloc(GRAPH_MAX_NODES * sizeof(*queue));
+	if (queue == NULL) {
+		return -1;
+	}
+	queue[n++] = e;
+	for (i = 0; i < n; i++) {
+		int j;
+
+		e = queue[i];
+		if (e->n < 0) {
+			unknown = true;
+			continue;
+		}
+		for (j = 0; j < e->n; j++) {
+			const char *d = e->deps[j];
+			struct mod_deps *de = mod_deps_find(thread, d);
+			const uint8_t *data = NULL;
+			size_t size = 0;
+			enum mod_src s;
+			unsigned k;
+
+			if (de == NULL || !de->scanned) {
+				bool asked = de != NULL && de->asked;
+
+				de = NULL;
+				s = module_source(thread, d, &data, &size);
+				if (s == MOD_SRC_HERE) {
+					de = mod_deps_get(thread, d,
+							  (const char *)data,
+							  size);
+				} else if (s == MOD_SRC_ARRIVING) {
+					if (!pending && waiting != NULL)
+						snprintf(waiting, waiting_len,
+							 "%s", d);
+					pending = true;
+					continue;
+				} else if (s == MOD_SRC_NONE && !asked &&
+					   thread->htmlc != NULL &&
+					   strstr(d, "://") != NULL) {
+					/* once: a fetch that failed leaves it
+					 * to the compile, as before */
+					dom_string *href = to_dom_string(d);
+					bool started = href != NULL &&
+						html_process_module_preload(
+							thread->htmlc, href);
+
+					if (href != NULL)
+						dom_string_unref(href);
+					if (started) {
+						mod_deps_asked(thread, d);
+						thread->js_import_fetches++;
+						vita_log("qjs: fetching '%s', "
+							 "which '%s' imports",
+							 d, e->url);
+						if (!pending && waiting != NULL)
+							snprintf(waiting,
+								 waiting_len,
+								 "%s", d);
+						pending = true;
+						continue;
+					}
+				}
+				if (de == NULL) {
+					unknown = true;
+					continue;
+				}
+			}
+			if (de->complete) {
+				continue;
+			}
+			for (k = 0; k < n && queue[k] != de; k++) {
+			}
+			if (k < n) {
+				continue;	/* already on this walk */
+			}
+			if (n >= GRAPH_MAX_NODES) {
+				unknown = true;
+				continue;
+			}
+			queue[n++] = de;
+		}
+	}
+	if (!pending && !unknown) {
+		for (i = 0; i < n; i++) {
+			queue[i]->complete = true;
+		}
+	}
+	free(queue);
+	return pending ? 0 : unknown ? -1 : 1;
 }
 
 /*
@@ -9314,6 +9640,35 @@ static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+/*
+ * Whether a module compile must wait for its imports: true when some
+ * module under it is still arriving. Counted as a missed import, which
+ * is what the retry logic reads as "try again later", and logged.
+ */
+static bool module_graph_wait_for(jsthread *thread, const char *name,
+				  const char *src, size_t len, char *waiting,
+				  size_t waiting_len)
+{
+	waiting[0] = '\0';
+	if (module_graph_check(thread, name, src, len, waiting,
+			       waiting_len) != 0) {
+		return false;
+	}
+	thread->js_imports_missed++;
+	vita_log("qjs: module '%s' waits for '%s' before compiling", name,
+		 waiting);
+	return true;
+}
+
+static bool module_graph_wait(jsthread *thread, const char *name,
+			      const char *src, size_t len)
+{
+	char waiting[512];
+
+	return module_graph_wait_for(thread, name, src, len, waiting,
+				     sizeof(waiting));
+}
+
 static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 				      void *opaque)
 {
@@ -9410,6 +9765,20 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 						 (unsigned)(size / 1024),
 						 (unsigned)(now_ms() - t_c0));
 					return m;
+				}
+			}
+			{
+				char waiting[512];
+
+				/* named for the one on its way: the dynamic
+				 * import helper waits for that and retries */
+				if (module_graph_wait_for(thread, name, src,
+							  size, waiting,
+							  sizeof(waiting))) {
+					free(src);
+					JS_ThrowReferenceError(ctx, "could not "
+						"load module '%s'", waiting);
+					return NULL;
 				}
 			}
 			{
@@ -9542,6 +9911,7 @@ static void js_free_deferred(jsthread *thread)
 		d = next;
 	}
 	thread->deferred = NULL;
+	mod_deps_free(thread);
 	if (thread->deferred_scheduled) {
 		guit->misc->schedule(-1, module_retry_callback, thread);
 		thread->deferred_scheduled = false;
@@ -9604,6 +9974,11 @@ static void module_retry_callback(void *p)
 			vita_log("qjs: cached module '%s' did not resolve",
 				 d->name);
 			fn = JS_EXCEPTION;
+		} else if (JS_IsUndefined(fn) &&
+			   module_graph_wait(thread, d->name, d->src,
+					     d->len)) {
+			fn = JS_ThrowReferenceError(thread->ctx,
+						    "imports still arriving");
 		} else if (JS_IsUndefined(fn)) {
 			fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
 				     JS_EVAL_TYPE_MODULE |
@@ -9857,10 +10232,19 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			 * away if this compiles as a module (VitaSurf) */
 			uint64_t t_reparse = now_ms();
 			unsigned wasted = (unsigned)(t_reparse - t_start);
-			JSValue as_module =
-				JS_Eval(thread->ctx, src, txtlen, name,
-					JS_EVAL_TYPE_MODULE |
-					JS_EVAL_FLAG_COMPILE_ONLY);
+			JSValue as_module;
+
+			/* not while anything it imports is on its way;
+			 * see module_graph_check (VitaSurf) */
+			if (!module_graph_wait(thread, name, src, txtlen)) {
+				as_module = JS_Eval(thread->ctx, src, txtlen,
+						    name,
+						    JS_EVAL_TYPE_MODULE |
+						    JS_EVAL_FLAG_COMPILE_ONLY);
+			} else {
+				as_module = JS_ThrowReferenceError(
+					thread->ctx, "imports still arriving");
+			}
 
 			if (!JS_IsException(as_module)) {
 				bc_store_module(thread->ctx, name, src,
