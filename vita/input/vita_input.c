@@ -1556,6 +1556,16 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 css_select_shared,
 					 vitasurf_us_compose / 1000);
 			}
+			vita_log("page: %u mutations went to the page's "
+					 "observers and %u more were wanted by none "
+					 "and never reached JavaScript",
+					 vitasurf_js_mutations_told,
+					 vitasurf_js_mutations_skipped);
+			vita_log("page: %u KB of bytecode was serialised "
+					 "for the card in %u ms, to be written "
+					 "once script is quiet",
+					 vitasurf_js_bc_queued_kb,
+					 vitasurf_ms_js_bc_serialise);
 			vita_log("page: variables were set %u times on %u "
 					 "elements, the most on one being %u; "
 					 "var() looked one up %u times over %u "

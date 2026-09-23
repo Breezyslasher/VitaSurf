@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<!-- MutationObserver delivery when the engine decides in C which changes
+     any observer wants: attribute filters, subtree or not, re-observing
+     a node, disconnect, two observers on different nodes, an observer on
+     the document, old values, childList and characterData. -->
+<html><head><title>mutation filtering</title></head><body>
+<div id="a"><div id="b"><span id="c">t</span></div></div>
+<div id="other"></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var a = document.getElementById('a'), b = document.getElementById('b'),
+    c = document.getElementById('c'), other = document.getElementById('other');
+var got = {f:[], sub:[], direct:[], doc:[], other:[], gone:[], re:[], cd:[]};
+function names(list){ return list.map(function(r){ return r.type + ':' +
+  (r.attributeName || '') + ':' + (r.target.id || r.target.nodeName); }); }
+
+/* only data-keep, below a */
+new MutationObserver(function(r){ got.f = got.f.concat(r); })
+  .observe(a, {attributes:true, subtree:true, attributeFilter:['data-keep']});
+/* anything on b itself, not below it */
+new MutationObserver(function(r){ got.direct = got.direct.concat(r); })
+  .observe(b, {attributes:true, attributeOldValue:true});
+/* the whole document */
+new MutationObserver(function(r){ got.doc = got.doc.concat(r); })
+  .observe(document, {childList:true, subtree:true});
+/* a node nothing changes */
+new MutationObserver(function(r){ got.other = got.other.concat(r); })
+  .observe(other, {attributes:true, childList:true, subtree:true});
+/* disconnected before anything happens */
+var gone = new MutationObserver(function(r){ got.gone = got.gone.concat(r); });
+gone.observe(a, {attributes:true, subtree:true}); gone.disconnect();
+/* observed twice: the second options replace the first */
+var re = new MutationObserver(function(r){ got.re = got.re.concat(r); });
+re.observe(c, {attributes:true});
+re.observe(c, {characterData:true, subtree:true});
+/* character data under a */
+new MutationObserver(function(r){ got.cd = got.cd.concat(r); })
+  .observe(a, {characterData:true, subtree:true, characterDataOldValue:true});
+
+c.setAttribute('data-keep', '1');     /* f */
+c.setAttribute('data-drop', '1');     /* nobody */
+b.setAttribute('class', 'x');         /* direct */
+b.setAttribute('class', 'y');         /* direct, old value x */
+c.setAttribute('class', 'z');         /* nobody: below b, not subtree */
+var s = document.createElement('i'); b.appendChild(s);   /* doc */
+c.firstChild.data = 'u';             /* cd, re */
+
+setTimeout(function(){
+  ok("the filter kept data-keep only: " + names(got.f),
+     names(got.f).join() === "attributes:data-keep:c");
+  ok("b's own observer saw two changes to b: " + names(got.direct),
+     names(got.direct).join() === "attributes:class:b,attributes:class:b");
+  ok("with the old values: " + got.direct.map(function(r){return r.oldValue;}),
+     got.direct.length === 2 && got.direct[0].oldValue === null &&
+     got.direct[1].oldValue === 'x');
+  ok("the document's observer saw the insertion: " + names(got.doc),
+     got.doc.length === 1 && got.doc[0].addedNodes[0] === s);
+  ok("an unrelated node heard nothing: " + got.other.length, got.other.length === 0);
+  ok("a disconnected observer heard nothing: " + got.gone.length, got.gone.length === 0);
+  ok("re-observing replaced the options: " + names(got.re),
+     got.re.length === 1 && got.re[0].type === 'characterData');
+  ok("character data came through with its old value",
+     got.cd.length === 1 && got.cd[0].oldValue === 't');
+  console.log("MUT DONE");
+}, 100);
+</script></body></html>

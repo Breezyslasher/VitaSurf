@@ -1,0 +1,43 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 9279110aa..faf30dded 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -604,6 +604,10 @@ unsigned int vitasurf_js_reparse_kb;
+ unsigned int vitasurf_ms_js_import_cached;
+ unsigned int vitasurf_js_import_cache_hits;
+ unsigned int vitasurf_js_import_cached_kb;
++unsigned int vitasurf_js_bc_queued_kb;
++unsigned int vitasurf_js_mutations_told;
++unsigned int vitasurf_js_mutations_skipped;
++unsigned int vitasurf_ms_js_bc_serialise;
+ unsigned int vitasurf_css_index_builds;
+ unsigned int vitasurf_ms_css_index;
+ uint64_t vitasurf_ms_nested;
+@@ -789,6 +793,10 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_import_cached = 0;
+ 	vitasurf_js_import_cache_hits = 0;
+ 	vitasurf_js_import_cached_kb = 0;
++	vitasurf_js_bc_queued_kb = 0;
++	vitasurf_js_mutations_told = 0;
++	vitasurf_js_mutations_skipped = 0;
++	vitasurf_ms_js_bc_serialise = 0;
+ 	vitasurf_css_index_builds = 0;
+ 	vitasurf_ms_css_index = 0;
+ 	vitasurf_ms_image = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index d886aed17..dc1f421d2 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -151,6 +151,12 @@ extern unsigned int vitasurf_js_reparse_kb;
+ extern unsigned int vitasurf_ms_js_import_cached;
+ extern unsigned int vitasurf_js_import_cache_hits;
+ extern unsigned int vitasurf_js_import_cached_kb;
++/* bytecode serialised for the card, and how long that took */
++extern unsigned int vitasurf_js_bc_queued_kb;
++/* mutations told to the page's observers, and those no observer wanted */
++extern unsigned int vitasurf_js_mutations_told;
++extern unsigned int vitasurf_js_mutations_skipped;
++extern unsigned int vitasurf_ms_js_bc_serialise;
+ /* the merged selector index: how often it was built and for how long */
+ extern unsigned int vitasurf_css_index_builds;
+ extern unsigned int vitasurf_ms_css_index;

@@ -5509,7 +5509,7 @@ function MutationRecord(type,target){
  this.attributeName=null;this.attributeNamespace=null;this.oldValue=null;}
 W.MutationRecord=MutationRecord;
 
-var MOlist=[],MOqueued=false;
+var MOlist=[],MOqueued=false,MOid=0;
 function MutationObserver(cb){
  if(typeof cb!=='function')throw new TypeError(
   'The callback provided as parameter 1 is not a function.');
@@ -5578,11 +5578,22 @@ MutationObserver.prototype.observe=function(target,options){
   filter:options.attributeFilter?
    [].map.call(options.attributeFilter,function(x){return String(x).toLowerCase();}):null};
  /* observing the same node twice replaces the first */
- this._watch=this._watch.filter(function(o){return o.target!==target;});
+ this._watch=this._watch.filter(function(o){
+  if(o.target!==target)return true;
+  if(typeof __vitaMOUnwatch==='function')__vitaMOUnwatch(o.id);
+  return false;});
+ /* and C keeps a copy, so a change no observer wants never reaches
+    this file (VitaSurf); see mo_wanted in qjs.c */
+ w.id=++MOid;
+ if(typeof __vitaMOWatch==='function')
+  __vitaMOWatch(w.id,target,(w.subtree?1:0)|(w.attributes?2:0)|
+   (w.childList?4:0)|(w.characterData?8:0),w.filter);
  this._watch.push(w);
  if(MOlist.indexOf(this)<0)MOlist.push(this);
  if(typeof __vitaWatchMutations==='function')__vitaWatchMutations(true);};
 MutationObserver.prototype.disconnect=function(){
+ if(typeof __vitaMOUnwatch==='function')
+  for(var i=0;i<this._watch.length;i++)__vitaMOUnwatch(this._watch[i].id);
  this._watch=[];this._records=[];
  MOlist=MOlist.filter(function(o){return o!==this;},this);
  if(!MOlist.length&&typeof __vitaWatchMutations==='function')
@@ -5640,12 +5651,16 @@ function siblingsOf(rec,target,after,before){
  if(MOedges&&rec.removedNodes.indexOf(MOedges.node)>=0){
   rec.previousSibling=MOedges.prev;
   rec.nextSibling=MOedges.next;}}
-W.__vitaMutation=function(kind,target,a,b,ns){
+W.__vitaMutation=function(kind,target,a,b,ns,matches){
  if(!MOlist.length||!target)return;
  var i,o,w,rec,n;
  /* once for every observer, not once per watch entry of each */
  var chain=[];
- for(n=target;n;n=n.parentNode)chain.push(n);
+ /* C has already walked it and found which watched nodes sit where
+    (VitaSurf): only those go in, each at its depth, and indexOf on
+    the rest of the array finds nothing, as the full chain would not */
+ if(matches)for(i=0;i<matches.length;i+=2)chain[matches[i+1]]=matches[i];
+ else for(n=target;n;n=n.parentNode)chain.push(n);
  for(i=0;i<MOlist.length;i++){
   o=MOlist[i];
   w=o._wants(kind,target,kind==='attributes'?a:null,chain);

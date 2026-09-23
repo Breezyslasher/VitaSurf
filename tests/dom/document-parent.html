@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!-- The document node reached by walking up is the document object
+     itself, so a loop that climbs until it meets document stops there. -->
+<html><head><title>document parent</title></head><body><div id="d"><span id="s"></span></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+ok("documentElement.parentNode is document",
+   document.documentElement.parentNode === document);
+var n = document.getElementById('s'), steps = 0;
+while (n && n !== document) { n = n.parentNode; steps++; }
+ok("walking up from a span reaches document in 4 steps (" + steps + ")",
+   n === document && steps === 4);
+ok("ownerDocument is the same object",
+   document.getElementById('s').ownerDocument === document.documentElement.parentNode);
+ok("document.contains its body", document.contains(document.body));
+</script></body></html>
