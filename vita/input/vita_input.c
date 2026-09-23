@@ -1424,6 +1424,10 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_js_sel_closest,
 				 vitasurf_js_sel_closest_native,
 				 vitasurf_js_sel_closest_steps);
+			vita_log("page: %u of those calls were a bare tag "
+				 "answered in C, visiting %u elements",
+				 vitasurf_js_sel_tag_fast,
+				 vitasurf_js_sel_tag_visits);
 			vita_log("page: boxes and styles %u ms covered %u "
 				 "elements, %u ms of it selecting their "
 				 "styles and %u ms parsing the style "

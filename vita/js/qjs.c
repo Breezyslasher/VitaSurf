@@ -2316,7 +2316,10 @@ static JSValue win_vita_selector(JSContext *ctx, JSValueConst this_val,
 	 * report says which call a page leans on */
 	switch (kind) {
 	case 0: vitasurf_js_selector_compiles++; break;
-	case 1: vitasurf_js_selector_hits++; break;
+	case 1:
+		/* the prelude batches its cache hits: steps is how many */
+		vitasurf_js_selector_hits += steps > 0 ? (unsigned int)steps : 1;
+		break;
 	case 2: vitasurf_js_sel_all++; break;
 	case 3: vitasurf_js_sel_one++; break;
 	case 4: vitasurf_js_sel_matches++; break;
@@ -2336,6 +2339,153 @@ static bool dom_string_is(dom_string *d, const char *s, size_t len)
 {
 	return d != NULL && dom_string_byte_length(d) == len &&
 		memcmp(dom_string_data(d), s, len) == 0;
+}
+
+/*
+ * Whether element n is what a selector of one bare tag names: the name
+ * in any ASCII case for an element in the HTML namespace or none, the
+ * name exactly as written for any other -- the prelude's matchSimple.
+ * local is n's local name, already fetched by the caller.
+ */
+static bool tag_is(struct dom_node *n, dom_string *local,
+		   const char *tag, size_t tag_len)
+{
+	static const char html_ns[] = "http://www.w3.org/1999/xhtml";
+	dom_string *ns = NULL, *name = NULL;
+	bool html, hit;
+
+	if (local == NULL || dom_string_byte_length(local) != tag_len ||
+	    strncasecmp(dom_string_data(local), tag, tag_len) != 0) {
+		return false;	/* the common case: a different name */
+	}
+	dom_node_get_namespace(n, &ns);
+	html = ns == NULL || dom_string_is(ns, html_ns, sizeof(html_ns) - 1);
+	if (ns != NULL) dom_string_unref(ns);
+	if (html) {
+		return true;
+	}
+	if (dom_element_get_tag_name(n, &name) != DOM_NO_ERR) {
+		return false;
+	}
+	hit = dom_string_is(name, tag, tag_len);
+	if (name != NULL) dom_string_unref(name);
+	return hit;
+}
+
+/*
+ * __vitaTagQuery(node, tag, mode): a selector of one bare, ASCII tag
+ * name, answered in C (VitaSurf). mode 0 is matches(), 1 querySelector,
+ * 2 querySelectorAll. GitHub's lazy component loader asks each element
+ * added to the page for every tag it may load -- element.matches(tag),
+ * then element.querySelector(tag) -- 280,000 calls on one profile page,
+ * and through the general selector path that was 20 s of a timer the
+ * budget stopped. Returns undefined for anything that is not a node
+ * wrapper (a document object), and the prelude takes its own path.
+ */
+static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	struct dom_node *root, *n = NULL;
+	const char *tag;
+	size_t tag_len;
+	int32_t mode = 0;
+	JSValue out = JS_NULL;
+	uint32_t out_n = 0;
+
+	(void)this_val;
+	if (argc < 3 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	root = JS_GetOpaque(argv[0], node_class_id);
+	if (root == NULL) {
+		return JS_UNDEFINED;
+	}
+	JS_ToInt32(ctx, &mode, argv[2]);
+	tag = JS_ToCStringLen(ctx, &tag_len, argv[1]);
+	if (tag == NULL) {
+		return JS_EXCEPTION;
+	}
+	vitasurf_js_sel_tag_fast++;
+	if (mode == 0) {
+		dom_node_type type = 0;
+		dom_string *local = NULL;
+		bool hit = false;
+
+		vitasurf_js_sel_matches++;
+		if (dom_node_get_node_type(root, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_node_get_local_name(root, &local);
+			hit = tag_is(root, local, tag, tag_len);
+			if (local != NULL) dom_string_unref(local);
+		}
+		JS_FreeCString(ctx, tag);
+		return JS_NewBool(ctx, hit);
+	}
+	if (mode == 2) {
+		vitasurf_js_sel_all++;
+		out = JS_NewArray(ctx);
+	} else {
+		vitasurf_js_sel_one++;
+	}
+	/* iterative pre-order walk; root itself is not a candidate */
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+		dom_node_type type = 0;
+
+		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_string *local = NULL;
+			bool hit;
+
+			vitasurf_js_sel_tag_visits++;
+			dom_node_get_local_name(n, &local);
+			hit = tag_is(n, local, tag, tag_len);
+			if (local != NULL) dom_string_unref(local);
+			if (hit) {
+				if (mode != 2) {
+					out = wrap_node(ctx, n);
+					dom_node_unref(n);
+					break;
+				}
+				JS_SetPropertyUint32(ctx, out, out_n++,
+						     wrap_node(ctx, n));
+			}
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	JS_FreeCString(ctx, tag);
+	return out;
 }
 
 /*
@@ -7078,6 +7228,9 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaMOUnwatch",
 			  JS_NewCFunction(ctx, win_vita_mo_unwatch,
 					  "__vitaMOUnwatch", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaTagQuery",
+			  JS_NewCFunction(ctx, win_vita_tag_query,
+					  "__vitaTagQuery", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaClosestTag",
 			  JS_NewCFunction(ctx, win_vita_closest_tag,
 					  "__vitaClosestTag", 3));

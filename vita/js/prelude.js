@@ -401,17 +401,40 @@ function splitTop(s,chars,keep){
    uses a few hundred distinct selectors, not thousands. A selector
    that fails to parse is cached as its empty result too, so it keeps
    failing the same way. */
-var compiled={},compiledCount=0;
+var compiled={},compiledCount=0,compiledHits=0;
+/* Cache hits are counted here and handed to C in batches: a crossing
+   per call was a real share of a call that finds its answer in C. */
+function countHits(){
+ if(compiledHits&&typeof __vitaSelector==='function')__vitaSelector(1,compiledHits);
+ compiledHits=0;}
 function compile(selector){
  var text=String(selector),hit=compiled[text];
  if(hit!==undefined){
-  if(typeof __vitaSelector==='function')__vitaSelector(1);
+  if(++compiledHits>=256)countHits();
   return hit;}
+ countHits();
  if(typeof __vitaSelector==='function')__vitaSelector(0);
  if(compiledCount>=512){compiled={};compiledCount=0;}
  hit=compileUncached(text);
+ hit.bare=bareTag(hit);
  compiled[text]=hit;compiledCount++;
  return hit;}
+/* The one simple selector of a selector that is nothing but an ASCII
+   tag name, or null. Those are answered by __vitaTagQuery in C. */
+function bareTag(groups){
+ if(groups.length!==1||groups[0].length!==1)return null;
+ var q=groups[0][0].sel;
+ if(!q.tag||q.tag==='*'||q.id||q.classes.length||q.attrs.length||q.pseudos.length)return null;
+ return /^[A-Za-z][A-Za-z0-9_-]*$/.test(q.tag)?q:null;}
+/* The C answer for a bare tag selector already compiled, or undefined
+   to take the general path: mode 0 matches, 1 first, 2 all. */
+var tagQuery=typeof __vitaTagQuery==='function'?__vitaTagQuery:null;
+function tagFast(el,sel,mode){
+ if(tagQuery===null)return undefined;
+ var g=compiled[typeof sel==='string'?sel:String(sel)];
+ if(g===undefined||!g.bare)return undefined;
+ if(++compiledHits>=256)countHits();
+ return tagQuery(el,g.bare.tag,mode);}
 function compileUncached(selector){
  var out=[];
  splitTop(String(selector),',',false).forEach(function(s){
@@ -462,22 +485,26 @@ function select(root,sel,all){
   if(!all&&out.length)return out;}
  return out;}
 var selCount=typeof __vitaSelector==='function'?__vitaSelector:function(){};
-P.querySelectorAll=function(sel){selCount(2);return select(this,sel,true);};
-P.querySelector=function(sel){selCount(3);var r=select(this,sel,false);return r.length?r[0]:null;};
+P.querySelectorAll=function(sel){
+ var f=tagFast(this,sel,2);if(f!==undefined)return f;
+ selCount(2);return select(this,sel,true);};
+P.querySelector=function(sel){
+ var f=tagFast(this,sel,1);if(f!==undefined)return f;
+ selCount(3);var r=select(this,sel,false);return r.length?r[0]:null;};
 function matchesAny(el,groups){
  for(var g=0;g<groups.length;g++)if(matchAt(el,groups[g],groups[g].length-1))return true;
  return false;}
-P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){selCount(4);return matchesAny(this,compile(String(sel)));};
+P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){
+ var f=tagFast(this,sel,0);if(f!==undefined)return f;
+ selCount(4);return matchesAny(this,compile(String(sel)));};
 /* closest compiles once and walks up in place (VitaSurf); it called
    matches per ancestor, a cache lookup and a crossing into C each. A
    bare tag -- closest('details'), GitHub's components asking for their
    own element -- is walked in C without a wrapper per ancestor. */
 P.closest=function(sel){
  var groups=compile(String(sel)),n=this,steps=0;
- if(groups.length===1&&groups[0].length===1&&typeof __vitaClosestTag==='function'){
-  var q=groups[0][0].sel;
-  if(q.tag&&q.tag!=='*'&&!q.id&&!q.classes.length&&!q.attrs.length&&!q.pseudos.length)
-   return __vitaClosestTag(this,q.tag,q.tagUpper);}
+ if(groups.bare&&typeof __vitaClosestTag==='function')
+  return __vitaClosestTag(this,groups.bare.tag,groups.bare.tagUpper);
  while(n&&n.nodeType===1){steps++;if(matchesAny(n,groups)){selCount(5,steps);return n;}n=n.parentNode;}
  selCount(5,steps);
  return null;};
@@ -3854,9 +3881,12 @@ docOverride('title',function(){
    the document's own tree amounts to. */
 ['querySelector','querySelectorAll','getElementsByTagName',
  'getElementsByClassName','getElementsByName'].forEach(function(m){
- var orig=P[m];
+ var orig=P[m],mode=m==='querySelector'?1:m==='querySelectorAll'?2:-1;
  if(typeof orig!=='function')return;
  P[m]=function(){
+  /* a bare tag on an element is answered in C before anything else;
+     a document object is not a node wrapper, so it comes back here */
+  if(mode>0){var f=tagFast(this,arguments[0],mode);if(f!==undefined)return f;}
   if(!isDoc(this))return orig.apply(this,arguments);
   var de=docElement(this);
   if(!de)return m==='querySelector'?null:[];

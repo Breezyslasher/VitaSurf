@@ -1,0 +1,41 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index c3f470343..7ba71e8fd 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -685,6 +685,8 @@ unsigned int vitasurf_js_sel_matches;
+ unsigned int vitasurf_js_sel_closest;
+ unsigned int vitasurf_js_sel_closest_native;
+ unsigned int vitasurf_js_sel_closest_steps;
++unsigned int vitasurf_js_sel_tag_fast;
++unsigned int vitasurf_js_sel_tag_visits;
+ unsigned int vitasurf_js_jobs_budget;
+ unsigned int vitasurf_ms_js_jobs_budget;
+ unsigned int vitasurf_js_drain_max_jobs;
+@@ -879,6 +881,8 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_js_sel_closest = 0;
+ 	vitasurf_js_sel_closest_native = 0;
+ 	vitasurf_js_sel_closest_steps = 0;
++	vitasurf_js_sel_tag_fast = 0;
++	vitasurf_js_sel_tag_visits = 0;
+ 	vitasurf_js_jobs_budget = 0;
+ 	vitasurf_ms_js_jobs_budget = 0;
+ 	vitasurf_js_drain_max_jobs = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index f6780f0b1..6bb844cf7 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -408,6 +408,14 @@ extern unsigned int vitasurf_js_sel_matches;
+ extern unsigned int vitasurf_js_sel_closest;
+ extern unsigned int vitasurf_js_sel_closest_native;
+ extern unsigned int vitasurf_js_sel_closest_steps;
++/**
++ * querySelector, querySelectorAll and matches calls whose selector was
++ * one bare tag name, answered in C, and the elements those walks
++ * visited (VitaSurf). GitHub's lazy component loader asks every added
++ * element for each of its tag names, 280,000 calls on one page.
++ */
++extern unsigned int vitasurf_js_sel_tag_fast;
++extern unsigned int vitasurf_js_sel_tag_visits;
+ extern unsigned int vitasurf_js_jobs_budget;
+ extern unsigned int vitasurf_ms_js_jobs_budget;
+ extern unsigned int vitasurf_js_drain_max_jobs;

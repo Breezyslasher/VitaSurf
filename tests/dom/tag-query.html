@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!-- A selector of one bare tag is answered in C for matches,
+     querySelector and querySelectorAll. Each answer is checked against
+     the same query with a no-op :not(.zz) added, which takes the
+     general path. -->
+<html><head><title>tag query</title></head><body>
+<div id="root"><p>a</p><section><p>b</p><react-app id="ra"><p>c</p></react-app></section>
+<svg id="svg"><g><foreignObject id="fo"><p>d</p></foreignObject><rect/></g></svg><P>e</P></div>
+<template id="tpl"><p>t</p><react-app></react-app></template>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function same(a,b){if(a===b)return true;if(!a||!b||a.length!==b.length)return false;for(var i=0;i<a.length;i++)if(a[i]!==b[i])return false;return true;}
+var root=document.getElementById('root'),x=':not(.zz)';
+['p','P','react-app','REACT-APP','g','rect','foreignObject','foreignobject','section','div','nope','svg','html','body'].forEach(function(t){
+ [root,document,document.body,document.getElementById('svg')].forEach(function(r,ri){
+  ok("querySelectorAll('"+t+"') on root "+ri+" matches the general path",same(r.querySelectorAll(t),r.querySelectorAll(t+x)));
+  ok("querySelector('"+t+"') on root "+ri+" matches the general path",r.querySelector(t)===r.querySelector(t+x));
+ });
+ var all=document.querySelectorAll('*'),bad=0;
+ for(var i=0;i<all.length;i++)if(all[i].matches(t)!==all[i].matches(t+x))bad++;
+ ok("matches('"+t+"') agrees on every element ("+bad+" differ)",bad===0);
+});
+ok("querySelectorAll excludes the root itself",root.querySelectorAll('div').length===0);
+ok("document.querySelector('html') is the root element",document.querySelector('html')===document.documentElement);
+var frag=document.getElementById('tpl').content;
+ok("a template's content is searched",frag.querySelectorAll('p').length===1&&frag.querySelector('react-app')!==null);
+var d=document.createElement('div');d.innerHTML='<span><b>1</b></span><b>2</b>';
+ok("a detached subtree is searched in document order",d.querySelectorAll('b').length===2&&d.querySelector('b').textContent==='1');
+ok("the same element comes back as the same wrapper",root.querySelector('react-app')===document.getElementById('ra'));
+</script></body></html>
