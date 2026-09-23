@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!-- Siblings with the same name and classes can share one computed
+     style, and a sibling is only refused as a donor if matching looked
+     at its attributes. Rules for an attribute are filed by its name, so
+     a sibling without that attribute never has them looked at: it must
+     still not hand its style to a sibling that does carry it.
+     Every item marked current should be indented 30px. -->
+<html><head><style>
+body { margin: 0 } ul { margin: 0; padding: 0; list-style: none }
+[aria-current] { padding-left: 30px }
+li[data-x] span { margin-left: 20px }
+[data-level="2"] { padding-left: 50px }
+</style></head><body>
+<ul id="u">
+<li><span>plain</span></li>
+<li aria-current="page"><span>current</span></li>
+<li><span>plain</span></li>
+<li aria-current="page"><span>current again</span></li>
+<li data-level="1"><span>level one</span></li>
+<li data-level="2"><span>level two</span></li>
+</ul>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+setTimeout(function(){
+ var li = document.querySelectorAll('#u li');
+ function off(i){ var s = li[i].querySelector('span');
+   return Math.round(s.getBoundingClientRect().left); }
+ ok("a plain item is not indented (" + off(0) + ")", off(0) === 0);
+ ok("an item with aria-current after a plain one is indented (" + off(1) + ")", off(1) === 30);
+ ok("a plain item after it is not (" + off(2) + ")", off(2) === 0);
+ ok("the second current item is indented (" + off(3) + ")", off(3) === 30);
+ ok("level one is not indented (" + off(4) + ")", off(4) === 0);
+ ok("level two after level one is (" + off(5) + ")", off(5) === 50);
+}, 300);
+</script></body></html>

@@ -1522,6 +1522,40 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 css_select_index_entries,
 					 css_select_index_sheets,
 					 css_select_index_bytes / 1024);
+			vita_log("page: %u imports compiled inside the "
+					 "loader, %u KB in %u ms, and %u read "
+					 "from the cache, %u KB in %u ms; %u "
+					 "module scripts were parsed as classic "
+					 "scripts first, %u KB, throwing away "
+					 "%u ms",
+					 vitasurf_js_import_compiles,
+					 vitasurf_js_import_kb,
+					 vitasurf_ms_js_import_compile,
+					 vitasurf_js_import_cache_hits,
+					 vitasurf_js_import_cached_kb,
+					 vitasurf_ms_js_import_cached,
+					 vitasurf_js_reparses,
+					 vitasurf_js_reparse_kb,
+					 vitasurf_ms_js_reparse);
+			{
+				extern unsigned int css_select_us_setup;
+				extern unsigned int css_select_us_match;
+				extern unsigned int css_select_us_deferred;
+				extern unsigned int css_select_us_finish;
+				extern unsigned int css_select_shared;
+
+				vita_log("page: selecting, by phase: setting up "
+					 "%u ms, matching rules %u ms, held-over "
+					 "declarations %u ms, finishing the style "
+					 "%u ms; %u elements shared a sibling's "
+					 "style; composing with the parent %u ms",
+					 css_select_us_setup / 1000,
+					 css_select_us_match / 1000,
+					 css_select_us_deferred / 1000,
+					 css_select_us_finish / 1000,
+					 css_select_shared,
+					 vitasurf_us_compose / 1000);
+			}
 			vita_log("page: variables were set %u times on %u "
 					 "elements, the most on one being %u; "
 					 "var() looked one up %u times over %u "

@@ -1,0 +1,92 @@
+diff --git a/src/charset/codecs/codec_impl.h b/src/charset/codecs/codec_impl.h
+index a14a3f6..a2826b0 100644
+--- a/src/charset/codecs/codec_impl.h
++++ b/src/charset/codecs/codec_impl.h
+@@ -42,4 +42,8 @@ typedef struct parserutils_charset_handler {
+ 			parserutils_charset_codec **codec);
+ } parserutils_charset_handler;
+ 
++/** Whether a codec is UTF-8 and holding nothing between calls (VitaSurf) */
++bool parserutils__charset_utf8_codec_idle(
++		const parserutils_charset_codec *codec);
++
+ #endif
+diff --git a/src/charset/codecs/codec_utf8.c b/src/charset/codecs/codec_utf8.c
+index 39bdb28..be84211 100644
+--- a/src/charset/codecs/codec_utf8.c
++++ b/src/charset/codecs/codec_utf8.c
+@@ -544,3 +544,22 @@ const parserutils_charset_handler charset_utf8_codec_handler = {
+ 	charset_utf8_codec_create
+ };
+ 
++/**
++ * Whether a codec is a UTF-8 codec holding nothing between calls
++ * (VitaSurf).
++ *
++ * The input filter copies runs of ASCII straight through when both of
++ * its codecs are UTF-8, which is only the same as going through them
++ * while neither has part of a character put by: an incomplete input
++ * sequence, or decoded or encoded characters that did not fit.
++ */
++bool parserutils__charset_utf8_codec_idle(
++		const parserutils_charset_codec *codec)
++{
++	const charset_utf8_codec *c = (const charset_utf8_codec *) codec;
++
++	if (codec == NULL || codec->handler.decode != charset_utf8_codec_decode)
++		return false;
++
++	return c->inval_len == 0 && c->read_len == 0 && c->write_len == 0;
++}
+diff --git a/src/input/filter.c b/src/input/filter.c
+index eea4d2a..7f543e7 100644
+--- a/src/input/filter.c
++++ b/src/input/filter.c
+@@ -19,6 +19,9 @@
+ 
+ #include "input/filter.h"
+ #include "utils/utils.h"
++#ifdef WITHOUT_ICONV_FILTER
++#include "charset/codecs/codec_impl.h"
++#endif
+ 
+ /** Input filter */
+ struct parserutils_filter {
+@@ -268,6 +271,37 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
+ 		size_t pivot_len = sizeof(input->pivot_buf);
+ 		uint8_t *pivot = (uint8_t *) input->pivot_buf;
+ 
++		/*
++		 * UTF-8 in and UTF-8 out, which is what nearly every page
++		 * and stylesheet is: a run of ASCII comes out exactly as it
++		 * went in, so copy it rather than decode each byte to UCS-4
++		 * and encode it back (VitaSurf). That round trip was 60% of
++		 * the time libcss spent parsing a GitHub page's CSS. Only
++		 * while neither codec is holding part of a character, and
++		 * never the NUL byte, whose handling is the codec's.
++		 */
++		if (!input->read_pending &&
++		    input->read_codec->mibenum == input->write_codec->mibenum &&
++		    parserutils__charset_utf8_codec_idle(input->read_codec) &&
++		    parserutils__charset_utf8_codec_idle(input->write_codec)) {
++			const uint8_t *s = *data;
++			size_t n = 0, room = *len < *outlen ? *len : *outlen;
++
++			while (n < room && s[n] != 0 && s[n] < 0x80)
++				n++;
++
++			if (n > 0) {
++				memcpy(*output, s, n);
++				*output += n;
++				*outlen -= n;
++				*data += n;
++				*len -= n;
++				continue;
++			}
++			if (*outlen == 0)
++				return PARSERUTILS_NOMEM;
++		}
++
+ 		read_error = parserutils_charset_codec_decode(input->read_codec,
+ 				data, len,
+ 				(uint8_t **) &pivot, &pivot_len);

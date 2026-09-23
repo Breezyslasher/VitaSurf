@@ -6419,6 +6419,11 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 		       const char *src, size_t srclen);
 static void bc_store(JSContext *ctx, const char *url,
 		     const char *src, size_t srclen, JSValueConst fn);
+static JSValue bc_load_module(JSContext *ctx, const char *url,
+			      const char *src, size_t srclen);
+static void bc_store_module(JSContext *ctx, const char *url,
+			    const char *src, size_t srclen, JSValueConst fn);
+static void bc_index_flush(void);
 
 static void setup_globals(jsthread *thread)
 {
@@ -7043,13 +7048,26 @@ void js_destroythread(jsthread *thread)
 
 #define BC_MAGIC      0x43425356u        /* 'VSBC' */
 #define BC_FORMAT     1u
+/*
+ * An ES module's entry (VitaSurf). Its bytecode names the modules it
+ * imports rather than holding them, so it can only be used once those
+ * are loaded; see bc_module_deps_ready.
+ */
+#define BC_FORMAT_MODULE 2u
 /* Below this, compiling is quicker than finding the file on the card. */
 #define BC_MIN_SRC    (128 * 1024)
+/*
+ * The same for a module. A build 416 log compiles GitHub's 35 imports,
+ * 1077 KB of source, at about 250 KB a second, so a 16 KB module costs
+ * some 60 ms to compile against a few to open a file.
+ */
+#define BC_MIN_MODULE_SRC (16 * 1024)
 /* One entry. Bytecode runs three to five times the size of its source. */
 #define BC_MAX_ENTRY  (48u * 1024 * 1024)
 /* The whole directory. An unbounded cache is a bug (see CLAUDE.md). */
 #define BC_BUDGET     (96u * 1024 * 1024)
-#define BC_MAX_ENTRIES 48
+/* GitHub alone is some forty modules. */
+#define BC_MAX_ENTRIES 256
 
 struct bc_header {
 	uint32_t magic;
@@ -7102,6 +7120,7 @@ static struct bc_entry bc_index[BC_MAX_ENTRIES];
 static unsigned bc_index_n;
 static uint32_t bc_stamp;
 static bool bc_index_read;
+static bool bc_index_dirty;
 
 static void bc_index_load(void)
 {
@@ -7151,6 +7170,15 @@ static void bc_index_save(void)
 			(unsigned)bc_index[i].stamp);
 	}
 	fclose(f);
+}
+
+/** Write the index if a hit has changed its use order (VitaSurf). */
+static void bc_index_flush(void)
+{
+	if (bc_index_dirty) {
+		bc_index_dirty = false;
+		bc_index_save();
+	}
 }
 
 static struct bc_entry *bc_index_find(const char *name)
@@ -7210,8 +7238,11 @@ static void bc_index_make_room(uint32_t bytes)
  * source it was built from, so a bundle that changed behind the same URL
  * is a miss rather than the wrong code.
  */
-static JSValue bc_load(JSContext *ctx, const char *url,
-		       const char *src, size_t srclen)
+static bool bc_module_deps_ready(JSContext *ctx, const char *url,
+				 const char *src, size_t srclen);
+
+static JSValue bc_load_kind(JSContext *ctx, const char *url,
+			    const char *src, size_t srclen, bool module)
 {
 	char path[256];
 	struct bc_header h;
@@ -7221,8 +7252,8 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	uint64_t hash;
 	uint64_t t_read0 = 0, t_read1 = 0, t_decode = 0;
 
-	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<' ||
-	    vitasurf_cache_disabled()) {
+	if (srclen < (module ? BC_MIN_MODULE_SRC : BC_MIN_SRC) ||
+	    url == NULL || url[0] == '<' || vitasurf_cache_disabled()) {
 		return JS_UNDEFINED;
 	}
 	bc_path(path, sizeof(path), url);
@@ -7233,7 +7264,8 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	/* before the first read, or it has no effect */
 	setvbuf(f, NULL, _IOFBF, BC_IO_BUF);
 	if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
-	    h.magic != BC_MAGIC || h.format != BC_FORMAT ||
+	    h.magic != BC_MAGIC ||
+	    h.format != (module ? BC_FORMAT_MODULE : BC_FORMAT) ||
 	    h.src_len != (uint32_t)srclen ||
 	    h.bc_len == 0 || h.bc_len > BC_MAX_ENTRY) {
 		fclose(f);
@@ -7243,6 +7275,15 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	if (h.src_hash_lo != (uint32_t)(hash & 0xffffffffu) ||
 	    h.src_hash_hi != (uint32_t)(hash >> 32)) {
 		fclose(f);		/* same URL, different bundle */
+		return JS_UNDEFINED;
+	}
+	/*
+	 * A module's bytecode can only be used once everything it imports
+	 * is loaded (VitaSurf). Checked before the entry is read, so a
+	 * page whose chunks are still arriving pays only for the check.
+	 */
+	if (module && !bc_module_deps_ready(ctx, url, src, srclen)) {
+		fclose(f);
 		return JS_UNDEFINED;
 	}
 	buf = malloc(h.bc_len);
@@ -7287,6 +7328,21 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 		remove(path);
 		return JS_UNDEFINED;
 	}
+	/*
+	 * The kind it was stored as is in the header, but what the
+	 * bytes turned into is what counts (VitaSurf). A module value is
+	 * never freed through JS_FreeValue, so a wrong one is left alone
+	 * and compiled over: a cached module whose stream decoded as
+	 * something else is only possible from a corrupt entry, and a
+	 * stray function is garbage the next collection takes.
+	 */
+	if ((JS_VALUE_GET_TAG(fn) == JS_TAG_MODULE) != module) {
+		if (JS_VALUE_GET_TAG(fn) != JS_TAG_MODULE) {
+			JS_FreeValue(ctx, fn);
+		}
+		remove(path);
+		return JS_UNDEFINED;
+	}
 	{
 		char nm[24];
 		struct bc_entry *e;
@@ -7295,16 +7351,22 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 		bc_index_load();
 		e = bc_index_find(nm);
 		if (e != NULL) {
+			/*
+			 * Written out later, once: forty module hits a
+			 * page each rewriting the index on the card cost
+			 * more than the hits save (VitaSurf).
+			 */
 			e->stamp = ++bc_stamp;
-			bc_index_save();
+			bc_index_dirty = true;
 		}
 	}
 	return fn;
 }
 
 /** Keep the compiled form of this source for the next visit. */
-static void bc_store(JSContext *ctx, const char *url,
-		     const char *src, size_t srclen, JSValueConst fn)
+static void bc_store_kind(JSContext *ctx, const char *url,
+			  const char *src, size_t srclen, JSValueConst fn,
+			  bool module)
 {
 	char path[256], tmp[264], nm[24];
 	struct bc_header h;
@@ -7314,8 +7376,8 @@ static void bc_store(JSContext *ctx, const char *url,
 	uint64_t hash;
 	struct bc_entry *e;
 
-	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<' ||
-	    vitasurf_cache_disabled()) {
+	if (srclen < (module ? BC_MIN_MODULE_SRC : BC_MIN_SRC) ||
+	    url == NULL || url[0] == '<' || vitasurf_cache_disabled()) {
 		return;
 	}
 	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE);
@@ -7341,7 +7403,7 @@ static void bc_store(JSContext *ctx, const char *url,
 	}
 	hash = bc_hash(src, srclen);
 	h.magic = BC_MAGIC;
-	h.format = BC_FORMAT;
+	h.format = module ? BC_FORMAT_MODULE : BC_FORMAT;
 	h.src_len = (uint32_t)srclen;
 	h.src_hash_lo = (uint32_t)(hash & 0xffffffffu);
 	h.src_hash_hi = (uint32_t)(hash >> 32);
@@ -7377,8 +7439,218 @@ static void bc_store(JSContext *ctx, const char *url,
 	bc_index[bc_index_n].stamp = ++bc_stamp;
 	bc_index_n++;
 	bc_index_save();
-	vita_log("qjs: cached %u KB of bytecode for %u KB of source",
-		 (unsigned)(out_len / 1024), (unsigned)(srclen / 1024));
+	vita_log("qjs: cached %u KB of bytecode for %u KB of %s source",
+		 (unsigned)(out_len / 1024), (unsigned)(srclen / 1024),
+		 module ? "module" : "script");
+}
+
+static JSValue bc_load(JSContext *ctx, const char *url,
+		       const char *src, size_t srclen)
+{
+	return bc_load_kind(ctx, url, src, srclen, false);
+}
+
+static void bc_store(JSContext *ctx, const char *url,
+		     const char *src, size_t srclen, JSValueConst fn)
+{
+	bc_store_kind(ctx, url, src, srclen, fn, false);
+}
+
+static JSValue bc_load_module(JSContext *ctx, const char *url,
+			      const char *src, size_t srclen)
+{
+	return bc_load_kind(ctx, url, src, srclen, true);
+}
+
+static void bc_store_module(JSContext *ctx, const char *url,
+			    const char *src, size_t srclen, JSValueConst fn)
+{
+	bc_store_kind(ctx, url, src, srclen, fn, true);
+}
+
+/*
+ * The static imports of a module's source (VitaSurf).
+ *
+ * Every static form names its module in a string that directly follows
+ * the keyword "from" or "import": import x from "a", import {x} from
+ * "a", import * as x from "a", import "a", export {x} from "a", export
+ * * from "a". Dynamic import() is followed by a parenthesis and is not
+ * resolved until it runs, so it is not one.
+ *
+ * What matters is never missing one: a missed import is a module the
+ * cached bytecode needs that was not checked for. So anything this
+ * cannot read with certainty -- a comment between the keyword and the
+ * string, an escape inside the string, a specifier with a space in it,
+ * more of them than fit -- gives up, and the caller compiles from source
+ * as it always did. A string that only looks like an import, inside a
+ * comment or another string, is harmless the other way: it is one more
+ * module asked for, and if nothing has it the cache is not used.
+ *
+ * Writes each specifier as its own import statement into out, and
+ * returns how many, or -1 to give up.
+ */
+#define BC_DEPS_MAX 256
+
+static bool bc_ident_char(char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') || c == '_' || c == '$' ||
+	       (unsigned char)c >= 0x80;
+}
+
+static int bc_scan_imports(const char *src, size_t len, char *out,
+			   size_t outsz)
+{
+	size_t i, used = 0;
+	int n = 0;
+
+	for (i = 0; i + 4 <= len; i++) {
+		size_t kw, j, k;
+		char q;
+
+		if (src[i] == 'f' && i + 4 <= len &&
+		    memcmp(src + i, "from", 4) == 0) {
+			kw = 4;
+		} else if (src[i] == 'i' && i + 6 <= len &&
+			   memcmp(src + i, "import", 6) == 0) {
+			kw = 6;
+		} else {
+			continue;
+		}
+		/* the whole word, and not a property: x.from, a.import */
+		if (i > 0 && (bc_ident_char(src[i - 1]) || src[i - 1] == '.')) {
+			continue;
+		}
+		j = i + kw;
+		if (j < len && bc_ident_char(src[j])) {
+			continue;
+		}
+		while (j < len && (src[j] == ' ' || src[j] == '\t' ||
+				   src[j] == '\n' || src[j] == '\r')) {
+			j++;
+		}
+		if (j >= len) {
+			break;
+		}
+		if (src[j] == '/') {
+			return -1;	/* a comment, or worse: cannot tell */
+		}
+		if (src[j] != '"' && src[j] != '\'') {
+			continue;	/* import( , import{ , from= ... */
+		}
+		q = src[j];
+		for (k = j + 1; k < len && src[k] != q; k++) {
+			if (src[k] == '\\' || src[k] == '\n' ||
+			    src[k] == ' ') {
+				return -1;
+			}
+		}
+		if (k >= len || k == j + 1) {
+			return -1;
+		}
+		/*
+		 * What follows the string decides whether it was an import.
+		 * A static import or export-from statement ends there, so
+		 * the next thing is a semicolon, a line break, the end, or
+		 * an import attribute clause; anything else on the same
+		 * line would be a syntax error. Prose in a string -- "moved
+		 * from 'fixed' to 'sticky'", which GitHub's React bundle
+		 * carries -- goes on with more words, and is not one.
+		 */
+		{
+			size_t t = k + 1;
+
+			while (t < len && (src[t] == ' ' || src[t] == '\t')) {
+				t++;
+			}
+			if (t < len && src[t] == '/') {
+				return -1;	/* a comment: cannot tell */
+			}
+			if (!(t >= len || src[t] == ';' || src[t] == '\n' ||
+			      src[t] == '\r' ||
+			      (t + 4 <= len && memcmp(src + t, "with", 4) == 0 &&
+			       (t + 4 == len || !bc_ident_char(src[t + 4]))) ||
+			      (t + 6 <= len &&
+			       memcmp(src + t, "assert", 6) == 0 &&
+			       (t + 6 == len || !bc_ident_char(src[t + 6]))))) {
+				i = k;
+				continue;
+			}
+		}
+		/* import "<spec>";\n */
+		if (n >= BC_DEPS_MAX || used + (k - j + 1) + 10 >= outsz) {
+			return -1;
+		}
+		memcpy(out + used, "import ", 7);
+		used += 7;
+		memcpy(out + used, src + j, k - j + 1);
+		used += k - j + 1;
+		out[used++] = ';';
+		out[used++] = '\n';
+		out[used] = '\0';
+		n++;
+		i = k;
+	}
+	return n;
+}
+
+/*
+ * Whether a cached module can be used now (VitaSurf).
+ *
+ * Bytecode read back from the card is a module that has not resolved its
+ * imports yet; QuickJS resolves them after the loader hands it over. If
+ * one of them cannot be found then, the module is left in the engine's
+ * list marked resolved with an empty slot where the import should be,
+ * and the next module that imports it links against the empty slot.
+ * Compiling from source never gets that far: a failed compile takes its
+ * module out of the list again.
+ *
+ * So the imports are resolved first, by compiling a module of nothing
+ * but those import statements, from source, under a name beside the
+ * real one so relative specifiers resolve the same. If that compiles,
+ * everything the cached bytecode names is loaded and resolved, and
+ * resolving the bytecode cannot fail. If it does not, the engine has
+ * cleaned up after it, and the caller compiles the real module from
+ * source, which fails or waits exactly as it did before there was a
+ * cache. The empty module stays loaded and is never run.
+ */
+static bool bc_module_deps_ready(JSContext *ctx, const char *url,
+				 const char *src, size_t srclen)
+{
+	static unsigned serial;
+	char name[1100];
+	char *out;
+	size_t outsz = 64 * 1024;
+	int n;
+	JSValue fn;
+
+	out = malloc(outsz);
+	if (out == NULL) {
+		return false;
+	}
+	out[0] = '\0';
+	n = bc_scan_imports(src, srclen, out, outsz);
+	if (n < 0) {
+		free(out);
+		vita_log("qjs: cannot read the imports of '%s', compiling it",
+			 url);
+		return false;
+	}
+	if (n == 0) {
+		free(out);
+		return true;
+	}
+	snprintf(name, sizeof(name), "%s#vitasurf-imports-%u", url,
+		 ++serial);
+	fn = JS_Eval(ctx, out, strlen(out), name,
+		     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+	free(out);
+	if (JS_IsException(fn)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return false;
+	}
+	JS_FreeValue(ctx, fn);
+	return true;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -8257,12 +8529,52 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 					size = rwlen;
 				}
 			}
+			/*
+			 * The compiled module from an earlier visit, if its
+			 * imports can all be had now (VitaSurf). Not under a
+			 * retry name: the bytecode carries the name it was
+			 * compiled under, and the engine files it by that.
+			 */
+			if (strcmp(name, want) == 0) {
+				uint64_t t_c0 = now_ms();
+
+				fn = bc_load_module(ctx, name, src, size);
+				if (!JS_IsUndefined(fn)) {
+					free(src);
+					vitasurf_ms_js_import_cached +=
+						(unsigned)(now_ms() - t_c0);
+					vitasurf_js_import_cache_hits++;
+					vitasurf_js_import_cached_kb +=
+						(unsigned)(size / 1024);
+					set_import_meta(ctx, fn, name);
+					m = JS_VALUE_GET_PTR(fn);
+					JS_FreeValue(ctx, fn);
+					thread->js_modules++;
+					vita_log("qjs: module for import '%s' "
+						 "from the cache (%u KB) in "
+						 "%u ms", name,
+						 (unsigned)(size / 1024),
+						 (unsigned)(now_ms() - t_c0));
+					return m;
+				}
+			}
 			{
 				unsigned missed = thread->js_imports_missed;
+				uint64_t t_c0 = now_ms();
 
 				fn = JS_Eval(ctx, src, size, name,
 					     JS_EVAL_TYPE_MODULE |
 					     JS_EVAL_FLAG_COMPILE_ONLY);
+				vitasurf_ms_js_import_compile +=
+					(unsigned)(now_ms() - t_c0);
+				vitasurf_js_import_compiles++;
+				vitasurf_js_import_kb +=
+					(unsigned)(size / 1024);
+				if (!JS_IsException(fn) &&
+				    strcmp(name, want) == 0) {
+					bc_store_module(ctx, name, src, size,
+							fn);
+				}
 				free(src);
 				if (JS_IsException(fn)) {
 					/* a static import of its own that is
@@ -8425,8 +8737,28 @@ static void module_retry_callback(void *p)
 
 		begin_script(thread, SCRIPT_TIMER);
 		thread->current_script = d->name;
-		fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
-			     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+		/*
+		 * The compiled module from an earlier visit (VitaSurf),
+		 * once everything it imports is here; bc_load_module checks
+		 * that, so resolving it cannot fail.
+		 */
+		fn = bc_load_module(thread->ctx, d->name, d->src, d->len);
+		if (!JS_IsUndefined(fn) &&
+		    JS_ResolveModule(thread->ctx, fn) < 0) {
+			vita_log("qjs: cached module '%s' did not resolve",
+				 d->name);
+			fn = JS_EXCEPTION;
+		} else if (JS_IsUndefined(fn)) {
+			fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
+				     JS_EVAL_TYPE_MODULE |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+			if (!JS_IsException(fn)) {
+				bc_store_module(thread->ctx, d->name, d->src,
+						d->len, fn);
+			}
+		} else {
+			vita_log("qjs: module '%s' from the cache", d->name);
+		}
 		if (!JS_IsException(fn)) {
 			JSValue ret;
 
@@ -8638,6 +8970,25 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			cached = true;
 			goto compiled;
 		}
+		/*
+		 * Or a module's (VitaSurf). Bytecode read back has not
+		 * resolved its imports, which a compile does as it goes, so
+		 * that is done here; bc_load_module has already made sure
+		 * each of them can be found.
+		 */
+		fn = bc_load_module(thread->ctx, name, src, txtlen);
+		if (!JS_IsUndefined(fn)) {
+			if (JS_ResolveModule(thread->ctx, fn) < 0) {
+				vita_log("qjs: cached module '%s' did not "
+					 "resolve", name);
+				fn = JS_EXCEPTION;
+			} else {
+				set_import_meta(thread->ctx, fn, name);
+			}
+			module = true;
+			cached = true;
+			goto compiled;
+		}
 		fn = JS_Eval(thread->ctx, src, txtlen, name,
 			     JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
 		if (!JS_IsException(fn)) {
@@ -8646,12 +8997,22 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		if (JS_IsException(fn)) {
 			JSValue script_err = JS_GetException(thread->ctx);
 			unsigned missed = thread->js_imports_missed;
+			/* the classic parse that failed, and is thrown
+			 * away if this compiles as a module (VitaSurf) */
+			uint64_t t_reparse = now_ms();
+			unsigned wasted = (unsigned)(t_reparse - t_start);
 			JSValue as_module =
 				JS_Eval(thread->ctx, src, txtlen, name,
 					JS_EVAL_TYPE_MODULE |
 					JS_EVAL_FLAG_COMPILE_ONLY);
 
 			if (!JS_IsException(as_module)) {
+				bc_store_module(thread->ctx, name, src,
+						txtlen, as_module);
+				vitasurf_ms_js_reparse += wasted;
+				vitasurf_js_reparses++;
+				vitasurf_js_reparse_kb +=
+					(unsigned)(txtlen / 1024);
 				JS_FreeValue(thread->ctx, script_err);
 				fn = as_module;
 				module = true;
@@ -8670,9 +9031,15 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				JS_FreeValue(thread->ctx,
 					     JS_GetException(thread->ctx));
 				JS_FreeValue(thread->ctx, as_module);
+				/*
+				 * The source as compiled, with its dynamic
+				 * imports rewritten: txtlen is that text's
+				 * length now, and copying that much of the
+				 * original ran past its end whenever the
+				 * rewrite made it longer (VitaSurf).
+				 */
+				defer_module(thread, src, txtlen, name);
 				free(src);
-				defer_module(thread, (const char *)txt, txtlen,
-					     name);
 				thread->current_script = NULL;
 				end_script(thread);
 				return true;
@@ -8825,6 +9192,7 @@ bool js_fire_event(jsthread *thread, const char *type,
 		thread->ready_state = "complete";
 	}
 	if (strcmp(type, "load") == 0) {
+		bc_index_flush();
 		vita_log("qjs: load event, runtime memory %u KB; "
 			 "%u scripts of %u KB compiled in %u ms, ran in %u ms"
 			 "; %u modules, %u import misses",

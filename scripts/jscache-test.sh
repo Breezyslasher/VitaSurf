@@ -57,9 +57,12 @@ out=$(run); check "recompiled" "compiled in"; check "ran correctly" "JC mark=v2 
 echo "5. the entry is garbage past QuickJS's own version byte"
 out=$(run) >/dev/null   # rebuild a good entry
 for seed in 1 2 3; do
-  python3 - "$(ls "$CACHE"/*.bc)" "$seed" <<'PY'
-import sys, struct, random
-p, seed = sys.argv[1], int(sys.argv[2])
+  # the prelude is cached beside it: pick the entry built from big.js
+  python3 - "$CACHE" "$seed" "$(stat -c %s "$WORK/big.js")" <<'PY'
+import sys, struct, random, glob
+cache, seed, srclen = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+p = [f for f in glob.glob(cache + '/*.bc')
+     if struct.unpack('<6I', open(f, 'rb').read(24))[2] == srclen][0]
 d = bytearray(open(p, 'rb').read())
 bclen = struct.unpack('<6I', d[:24])[5]
 ver = d[24]

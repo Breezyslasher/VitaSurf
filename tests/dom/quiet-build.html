@@ -66,10 +66,21 @@ var t1 = Date.now();
 h6.innerHTML = s + s + s;
 console.log("INNERHTMLMS " + (Date.now() - t1) + " for " + h6.querySelectorAll("*").length + " elements");
 
-setTimeout(function(){
-  ok("a style cloned in a template applies once inserted", pad("qs") === 70);
-  ok("a style set through innerHTML applies", pad("ihs") === 40);
-  console.log("QUIET DONE");
-}, 60);
+/* An inserted <style> reaches the cascade through a stylesheet rebuild,
+   and that waits while a box conversion is under way -- as one often is
+   right after the 5400 elements above. What is asserted is that the
+   style applies, not how soon, so look again until it has or 1.5 s
+   have gone. */
+var tries = 0;
+(function check(){
+  var a = pad("qs"), b = pad("ihs");
+  if ((a !== 70 || b !== 40) && ++tries < 30) {
+    setTimeout(check, 50);
+    return;
+  }
+  ok("a style cloned in a template applies once inserted (" + a + ")", a === 70);
+  ok("a style set through innerHTML applies (" + b + ")", b === 40);
+  console.log("QUIET DONE after " + tries + " looks");
+})();
 </script>
 </body></html>

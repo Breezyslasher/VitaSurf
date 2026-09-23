@@ -1,0 +1,139 @@
+diff --git a/src/select/select.c b/src/select/select.c
+index 017d381..360a116 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -204,6 +204,21 @@ unsigned int css_select_steps_attr;
+ unsigned int css_select_from_attr;
+ /* sheet visits that could offer nothing, skipped whole (VitaSurf) */
+ unsigned int css_select_sheets_empty;
++/*
++ * Where one selection's time goes (VitaSurf). The device spends 846 us
++ * an element selecting styles on a GitHub load and no profiler reaches
++ * it, so the client may hand over a microsecond clock and each phase is
++ * summed: setting up (with the check for a sibling whose style can be
++ * shared), matching the rules, the declarations held over for the
++ * variables, and finishing the computed style. No clock, no timing.
++ */
++uint64_t (*css_select_clock_us)(void);
++unsigned int css_select_us_setup;
++unsigned int css_select_us_match;
++unsigned int css_select_us_deferred;
++unsigned int css_select_us_finish;
++unsigned int css_select_shared;
++
+ /* how the merged index fared (VitaSurf) */
+ unsigned int css_select_index_builds;
+ unsigned int css_select_index_entries;
+@@ -1060,6 +1075,7 @@ static css_error css__set_node_data(void *node, css_select_state *state,
+ 		return error;
+ 	}
+ 	node_data->bloom = bloom;
++	node_data->attr_bloom = state->attr_bloom;
+ 
+ 	/* Set selection results */
+ 	results = state->results;
+@@ -1175,6 +1191,22 @@ static css_error css_select_style__get_sharable_node_data_for_candidate(
+ 		return CSS_OK;
+ 	}
+ 
++	/*
++	 * The candidate must carry the same attribute names (VitaSurf).
++	 * Rules that need an attribute are filed by its name and only
++	 * looked at for a node that has it, so a sibling without the
++	 * attribute is never tainted by them and would otherwise hand
++	 * its style to a sibling that should have matched them: the
++	 * second of two list items, one marked aria-current, lost its
++	 * indent that way. With the same names, every such rule that
++	 * could apply to this node was looked at for the candidate too,
++	 * and tainted it if it did.
++	 */
++	if (node_data->attr_bloom.w[0] != state->attr_bloom.w[0] ||
++			node_data->attr_bloom.w[1] != state->attr_bloom.w[1]) {
++		return CSS_OK;
++	}
++
+ 	/* Check candidate ID doesn't prevent sharing */
+ 	error = state->handler->node_id(state->pw,
+ 			share_candidate_node,
+@@ -1940,6 +1972,17 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		css_select_handler *handler, void *pw,
+ 		css_select_results **result)
+ {
++	/* phase clock (VitaSurf); see css_select_clock_us */
++	uint64_t (*const clk)(void) = css_select_clock_us;
++	uint64_t t_phase = (clk != NULL) ? clk() : 0;
++#define SELECT_PHASE(counter) do { \
++		if (clk != NULL) { \
++			uint64_t t_now = clk(); \
++			(counter) += (unsigned int) (t_now - t_phase); \
++			t_phase = t_now; \
++		} \
++	} while (0)
++
+ 	css_origin origin = CSS_ORIGIN_UA;
+ 
+ 	css_select_calls++;
+@@ -2016,6 +2059,9 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		goto cleanup;
+ 	} else if (share != NULL) {
+ 		css_computed_style **styles = share->partial.styles;
++
++		css_select_shared++;
++		SELECT_PHASE(css_select_us_setup);
+ 		for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
+ 			state.results->styles[i] =
+ 					css__computed_style_ref(styles[i]);
+@@ -2031,6 +2077,7 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ #endif
+ 
+ 	/* Not sharing; need to select. */
++	SELECT_PHASE(css_select_us_setup);
+ 	if (ctx->uses_revert ||
+ 			(inline_style != NULL && inline_style->uses_revert)) {
+ 		/* Need to track UA and USER origin styles for revert. */
+@@ -2183,8 +2230,11 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		}
+ 	}
+ 
++	SELECT_PHASE(css_select_us_match);
++
+ 	/* Declarations that were waiting on the variables (VitaSurf) */
+ 	error = apply_deferred(&state);
++	SELECT_PHASE(css_select_us_deferred);
+ 	if (error != CSS_OK)
+ 		goto cleanup;
+ 
+@@ -2305,6 +2355,7 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 
+ complete:
+ 	error = css__set_node_data(node, &state, handler, pw);
++	SELECT_PHASE(css_select_us_finish);
+ 	if (error != CSS_OK) {
+ 		goto cleanup;
+ 	}
+@@ -2320,6 +2371,7 @@ cleanup:
+ 	css_select__finalise_selection_state(&state);
+ 
+ 	return error;
++#undef SELECT_PHASE
+ }
+ 
+ /**
+diff --git a/src/select/select.h b/src/select/select.h
+index 4f272c7..0250922 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -58,6 +58,13 @@ struct css_node_data {
+ 	css_select_results partial;
+ 	css_bloom *bloom;
+ 	css_node_flags flags;
++	/*
++	 * The names of the node's attributes when it was selected
++	 * (VitaSurf). A sibling may share this node's style only if it
++	 * carries the same names; see
++	 * css_select_style__get_sharable_node_data_for_candidate.
++	 */
++	css_attr_bloom attr_bloom;
+ };
+ 
+ struct revert_data {
