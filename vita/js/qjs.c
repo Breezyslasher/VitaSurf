@@ -162,6 +162,7 @@ struct jsthread {
 	 * thousand identical lines, each one flushed to the memory card.
 	 */
 	unsigned script_depth;    /**< nested entries from C into script */
+	bool draining;            /**< end_script is running promise jobs */
 	bool aborting;            /**< the budget is unwinding a script */
 	unsigned scripts_killed;  /**< scripts the budget stopped, this page */
 	unsigned overrun_count;   /**< interrupts past the deadline */
@@ -226,6 +227,10 @@ struct jsthread {
 	struct mod_deps *mod_deps[64]; /**< each module's imports, by URL */
 	struct sel_compiled *sel_cache[128]; /**< selectors answered in C */
 	unsigned int sel_cache_n;
+	struct id_entry **id_idx;  /**< getElementById answers, by id */
+	uint32_t id_idx_nb, id_idx_n; /**< buckets (a power of two), entries */
+	uint32_t id_idx_gen;      /**< vita_id_gen the index is exact for */
+	bool id_idx_built;
 	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
 				   *   JS_UNINITIALIZED before it is looked
@@ -525,11 +530,29 @@ static void prof_tail(const char *what)
 }
 
 /* exported for the page report in vita/input/vita_input.c */
+/* getElementById, for the page report */
+static unsigned int id_calls, id_hits, id_exact, id_builds, id_build_ms;
+/* entries into script from C made while promise jobs were running */
+static unsigned int jobs_reentered;
+
 void vita_js_report_profile(void);
 void vita_js_report_profile(void)
 {
 	unsigned int shown;
 
+	if (id_calls > 0) {
+		vita_log("getElementById: %u calls, %u answered from the index, "
+			 "%u by it being current, %u walks of the document in "
+			 "%u ms", id_calls, id_hits, id_exact, id_builds,
+			 id_build_ms);
+		id_calls = id_hits = id_exact = id_builds = id_build_ms = 0;
+	}
+	if (jobs_reentered > 0) {
+		vita_log("qjs: promise jobs called back into script from C %u "
+			 "times (an event dispatched, a listener run), all "
+			 "under the drain's one budget", jobs_reentered);
+		jobs_reentered = 0;
+	}
 	if (prof_samples == 0) {
 		return;
 	}
@@ -563,14 +586,37 @@ void vita_js_report_profile(void)
 	prof_other = 0;
 }
 
+static int qjs_interrupt_body(jsthread *thread);
+
 static int qjs_interrupt(JSRuntime *rt, void *opaque)
 {
 	jsthread *thread = opaque;
+	static bool inside;
+	int r;
 
 	(void)rt;
 	if (thread == NULL || thread->deadline_ms == 0) {
 		return 0;
 	}
+	/*
+	 * Not re-entered (VitaSurf). Taking a stack, for the profile or
+	 * for the overrun line, runs script, and that script reaches the
+	 * interrupt check too: the abort then fell inside our own stack
+	 * capture, which swallowed it, and what reached the page was a
+	 * plain null its catch could take. tests/budget/mutate.html left
+	 * its loop that way.
+	 */
+	if (inside) {
+		return 0;
+	}
+	inside = true;
+	r = qjs_interrupt_body(thread);
+	inside = false;
+	return r;
+}
+
+static int qjs_interrupt_body(jsthread *thread)
+{
 	/*
 	 * Circle, pressed over the busy overlay, stops the script the same
 	 * way the budget does (VitaSurf): the screen had stayed as it was
@@ -845,6 +891,24 @@ static void qjs_absorb_or_rethrow(JSContext *ctx)
 	JS_FreeValue(ctx, JS_GetException(ctx));
 }
 
+/*
+ * What a binding that called back into script returns (VitaSurf). When
+ * the budget abort landed inside that call -- the page's mutation hook
+ * behind setAttribute, say -- qjs_absorb_or_rethrow leaves it pending,
+ * but a binding that then returns a value lets the script carry on with
+ * the exception still set, and it later surfaced as a plain null the
+ * page's own catch took: the runaway in tests/budget/mutate.html left
+ * its loop and kept going.
+ */
+static JSValue ret_or_abort(JSContext *ctx, JSValue r)
+{
+	if (qjs_budget_abort(ctx) && JS_HasException(ctx)) {
+		JS_FreeValue(ctx, r);
+		return JS_EXCEPTION;
+	}
+	return r;
+}
+
 /** A dom_string from a NUL-terminated C string, or NULL. */
 static dom_string *to_dom_string(const char *s)
 {
@@ -1063,12 +1127,35 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
  * since the parser adds nodes between scripts.
  */
 static uint32_t vita_dom_gen;
+/*
+ * Bumped by whatever can change which element an id names: a node going
+ * in or out, an id attribute set or removed, the parser adding nodes
+ * between scripts. Other attribute writes leave it, so a page setting
+ * classes between lookups keeps its id index.
+ */
+static uint32_t vita_id_gen;
 
 static void mark_dirty(JSContext *ctx)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	vita_dom_gen++;
+	vita_id_gen++;
+	if (thread != NULL) {
+		thread->dom_dirty = true;
+	}
+}
+
+/* mark_dirty for an attribute write, which moves an id only when it is
+   the id attribute that changed. */
+static void mark_attr_dirty(JSContext *ctx, const char *name)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	vita_dom_gen++;
+	if (name == NULL || strcasecmp(name, "id") == 0) {
+		vita_id_gen++;
+	}
 	if (thread != NULL) {
 		thread->dom_dirty = true;
 	}
@@ -1653,7 +1740,7 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		if (!JS_IsNull(olddata)) JS_FreeValue(ctx, olddata);
 	}
 	if (s != NULL) JS_FreeCString(ctx, s);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 static JSValue node_get_attr_prop(JSContext *ctx, JSValueConst this_val,
@@ -1703,7 +1790,7 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_set_attribute(node, key, dv);
-		mark_dirty(ctx);
+		mark_attr_dirty(ctx, name);
 		/* className and id are the same attribute write as
 		 * setAttribute, and an observer watching class has to see
 		 * one: this path reported nothing at all, so a component
@@ -1719,7 +1806,7 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 	if (key != NULL) dom_string_unref(key);
 	if (dv != NULL) dom_string_unref(dv);
 	if (s != NULL) JS_FreeCString(ctx, s);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 static JSValue node_set_id(JSContext *ctx, JSValueConst this_val, JSValueConst v)
@@ -1964,8 +2051,8 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 	dom_namednodemap_get_length(map, &len);
 	for (i = 0; i < len; i++) {
 		struct dom_node *attr = NULL;
-		dom_string *name = NULL, *val = NULL;
-		JSValue entry;
+		dom_string *name = NULL, *val = NULL, *ns = NULL;
+		JSValue entry, jname;
 
 		if (dom_namednodemap_item(map, i, &attr) != DOM_NO_ERR ||
 		    attr == NULL) {
@@ -1973,40 +2060,54 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 		}
 		dom_node_get_node_name(attr, &name);
 		dom_node_get_node_value(attr, &val);
+		dom_node_get_namespace(attr, &ns);
 		entry = JS_NewObject(ctx);
-		JS_SetPropertyStr(ctx, entry, "name",
-				  name != NULL ?
-				  JS_NewStringLen(ctx, dom_string_data(name),
-						  dom_string_byte_length(name)) :
-				  JS_NewString(ctx, ""));
-		JS_SetPropertyStr(ctx, entry, "value",
+		jname = name != NULL ?
+			JS_NewStringLen(ctx, dom_string_data(name),
+					dom_string_byte_length(name)) :
+			JS_NewString(ctx, "");
+		/* defined, not set: a fresh object has no setters to find,
+		 * and Alpine asks for every element's attributes */
+		JS_DefinePropertyValueStr(ctx, entry, "name",
+					  JS_DupValue(ctx, jname), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, entry, "value",
 				  val != NULL ?
 				  JS_NewStringLen(ctx, dom_string_data(val),
 						  dom_string_byte_length(val)) :
-				  JS_NewString(ctx, ""));
-		JS_SetPropertyStr(ctx, entry, "specified", JS_TRUE);
-		{
-			dom_string *ns = NULL, *local = NULL, *prefix = NULL;
+				  JS_NewString(ctx, ""), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, entry, "specified", JS_TRUE,
+					  JS_PROP_C_W_E);
+		if (ns == NULL) {
+			/* An attribute in no namespace has no prefix and is
+			 * its own local name: two libdom calls and a string
+			 * spared on nearly every attribute of a page. */
+			JS_DefinePropertyValueStr(ctx, entry, "namespace",
+						  JS_NULL, JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, entry, "localName",
+						  jname, JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, entry, "prefix",
+						  JS_NULL, JS_PROP_C_W_E);
+		} else {
+			dom_string *local = NULL, *prefix = NULL;
 
-			dom_node_get_namespace(attr, &ns);
+			JS_FreeValue(ctx, jname);
 			dom_node_get_local_name(attr, &local);
 			dom_node_get_prefix(attr, &prefix);
-			JS_SetPropertyStr(ctx, entry, "namespace",
-					  ns != NULL ?
+			JS_DefinePropertyValueStr(ctx, entry, "namespace",
 					  JS_NewStringLen(ctx, dom_string_data(ns),
-							  dom_string_byte_length(ns)) :
-					  JS_NULL);
-			JS_SetPropertyStr(ctx, entry, "localName",
+							  dom_string_byte_length(ns)),
+					  JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, entry, "localName",
 					  local != NULL ?
 					  JS_NewStringLen(ctx, dom_string_data(local),
 							  dom_string_byte_length(local)) :
-					  JS_NULL);
-			JS_SetPropertyStr(ctx, entry, "prefix",
+					  JS_NULL, JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, entry, "prefix",
 					  prefix != NULL ?
 					  JS_NewStringLen(ctx, dom_string_data(prefix),
 							  dom_string_byte_length(prefix)) :
-					  JS_NULL);
-			if (ns != NULL) dom_string_unref(ns);
+					  JS_NULL, JS_PROP_C_W_E);
+			dom_string_unref(ns);
 			if (local != NULL) dom_string_unref(local);
 			if (prefix != NULL) dom_string_unref(prefix);
 		}
@@ -2042,7 +2143,7 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_set_attribute(node, key, val);
-		mark_dirty(ctx);
+		mark_attr_dirty(ctx, name);
 		notify_mutation(ctx, "attributes", node,
 				JS_NewString(ctx, name != NULL ? name : ""),
 				old != NULL ?
@@ -2056,7 +2157,7 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 	if (name) JS_FreeCString(ctx, name);
 	if (value) JS_FreeCString(ctx, value);
 	vitasurf_ms_js_attr_time += (unsigned)(now_ms() - t0);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 	}
 
 }
@@ -2103,7 +2204,7 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_remove_attribute(node, key);
-		mark_dirty(ctx);
+		mark_attr_dirty(ctx, name);
 		/* removing an attribute that was not there changes nothing,
 		 * and nothing is what an observer should see */
 		if (had) {
@@ -2118,7 +2219,7 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 		dom_string_unref(key);
 	}
 	if (name) JS_FreeCString(ctx, name);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 /*
@@ -2222,7 +2323,7 @@ static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
 	if (nsheld) JS_FreeCString(ctx, nsheld);
 	if (qname) JS_FreeCString(ctx, qname);
 	if (value) JS_FreeCString(ctx, value);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 static JSValue node_has_attribute_ns(JSContext *ctx, JSValueConst this_val,
@@ -2284,7 +2385,7 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 	if (ns != NULL) dom_string_unref(ns);
 	if (nsheld) JS_FreeCString(ctx, nsheld);
 	if (local) JS_FreeCString(ctx, local);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 /*
@@ -2548,7 +2649,7 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 	}
 	notify_mutation(ctx, "childList", node, added, JS_NULL);
 	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
-	return JS_DupValue(ctx, argv[0]);
+	return ret_or_abort(ctx, JS_DupValue(ctx, argv[0]));
 	}
 
 }
@@ -2574,7 +2675,7 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 	}
 	notify_mutation(ctx, "childList", node, added,
 			JS_DupValue(ctx, argv[1]));
-	return JS_DupValue(ctx, argv[1]);
+	return ret_or_abort(ctx, JS_DupValue(ctx, argv[1]));
 }
 
 static unsigned count_elements(struct dom_node *root);
@@ -3026,7 +3127,7 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 	}
 	notify_mutation(ctx, "childList", node, added, JS_NULL);
 	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
-	return JS_DupValue(ctx, argv[0]);
+	return ret_or_abort(ctx, JS_DupValue(ctx, argv[0]));
 	}
 
 }
@@ -3050,7 +3151,7 @@ static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 	notify_mutation(ctx, "childList", node,
 			JS_NULL, JS_DupValue(ctx, argv[0]));
 	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
-	return JS_DupValue(ctx, argv[0]);
+	return ret_or_abort(ctx, JS_DupValue(ctx, argv[0]));
 	}
 
 }
@@ -3258,7 +3359,7 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 		before = JS_UNDEFINED;
 	}
 	JS_FreeValue(ctx, before);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 static JSValue node_get_inner_html(JSContext *ctx, JSValueConst this_val)
@@ -3771,6 +3872,206 @@ static const JSCFunctionListEntry node_proto[] = {
 /* ------------------------------------------------------------------------ */
 /* document                                                                 */
 
+/*
+ * getElementById by index (VitaSurf). libdom answers it by walking the
+ * document from the top, reading every element's id attribute on the
+ * way, and GitHub spent 5 s of one stall in those walks. The index maps
+ * each id to the first element carrying it, built by one walk. While
+ * vita_id_gen has not moved it is exact, misses included. After the
+ * tree has changed, an entry is still used when its element still has
+ * that id and is still in the document; only a miss walks again, and
+ * that walk rebuilds the whole index.
+ */
+struct id_entry {
+	struct id_entry *next;
+	dom_string *id;
+	struct dom_node *el;
+	uint32_t hash;
+};
+
+static void id_index_free(jsthread *thread)
+{
+	uint32_t b;
+
+	for (b = 0; b < thread->id_idx_nb; b++) {
+		while (thread->id_idx[b] != NULL) {
+			struct id_entry *e = thread->id_idx[b];
+
+			thread->id_idx[b] = e->next;
+			dom_string_unref(e->id);
+			dom_node_unref(e->el);
+			free(e);
+		}
+	}
+	free(thread->id_idx);
+	thread->id_idx = NULL;
+	thread->id_idx_nb = 0;
+	thread->id_idx_n = 0;
+	thread->id_idx_built = false;
+}
+
+static struct id_entry *id_index_find(jsthread *thread, dom_string *id,
+				      uint32_t h)
+{
+	struct id_entry *e;
+
+	if (thread->id_idx_nb == 0) {
+		return NULL;
+	}
+	for (e = thread->id_idx[h & (thread->id_idx_nb - 1)]; e != NULL;
+	     e = e->next) {
+		if (e->hash == h && dom_string_isequal(e->id, id)) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+static void id_index_grow(jsthread *thread)
+{
+	uint32_t nb = thread->id_idx_nb != 0 ? thread->id_idx_nb * 2 : 256;
+	struct id_entry **nt = calloc(nb, sizeof(*nt));
+	uint32_t b;
+
+	if (nt == NULL) {
+		return;
+	}
+	for (b = 0; b < thread->id_idx_nb; b++) {
+		while (thread->id_idx[b] != NULL) {
+			struct id_entry *e = thread->id_idx[b];
+
+			thread->id_idx[b] = e->next;
+			e->next = nt[e->hash & (nb - 1)];
+			nt[e->hash & (nb - 1)] = e;
+		}
+	}
+	free(thread->id_idx);
+	thread->id_idx = nt;
+	thread->id_idx_nb = nb;
+}
+
+/* Record el under id unless an earlier element already holds it. */
+static void id_index_add(jsthread *thread, dom_string *id, struct dom_node *el)
+{
+	uint32_t h = dom_string_hash(id);
+	struct id_entry *e;
+
+	if (id_index_find(thread, id, h) != NULL) {
+		return;
+	}
+	if (thread->id_idx_n >= thread->id_idx_nb) {
+		id_index_grow(thread);
+		if (thread->id_idx_nb == 0) {
+			return;
+		}
+	}
+	e = malloc(sizeof(*e));
+	if (e == NULL) {
+		return;
+	}
+	e->id = dom_string_ref(id);
+	e->el = dom_node_ref(el);
+	e->hash = h;
+	e->next = thread->id_idx[h & (thread->id_idx_nb - 1)];
+	thread->id_idx[h & (thread->id_idx_nb - 1)] = e;
+	thread->id_idx_n++;
+}
+
+/* One pre-order walk of the document, recording every id. */
+static void id_index_build(jsthread *thread, struct dom_node *root)
+{
+	uint64_t t0 = now_ms();
+	struct dom_node *n = NULL;
+
+	id_index_free(thread);
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+		dom_node_type type = DOM_TEXT_NODE;
+
+		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_string *id = NULL;
+
+			dom_element_get_attribute(n, corestring_dom_id, &id);
+			if (id != NULL) {
+				if (dom_string_byte_length(id) > 0) {
+					id_index_add(thread, id, n);
+				}
+				dom_string_unref(id);
+			}
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	thread->id_idx_built = true;
+	thread->id_idx_gen = vita_id_gen;
+	id_builds++;
+	id_build_ms += (unsigned int)(now_ms() - t0);
+}
+
+/* Whether el still carries id and still hangs from doc. */
+static bool id_entry_holds(struct id_entry *e, struct dom_node *doc)
+{
+	dom_string *now = NULL;
+	struct dom_node *cur;
+	bool same;
+
+	dom_element_get_attribute(e->el, corestring_dom_id, &now);
+	if (now == NULL) {
+		return false;
+	}
+	same = dom_string_isequal(now, e->id);
+	dom_string_unref(now);
+	if (!same) {
+		return false;
+	}
+	cur = dom_node_ref(e->el);
+	while (cur != NULL) {
+		struct dom_node *parent = NULL;
+
+		if (cur == doc) {
+			dom_node_unref(cur);
+			return true;
+		}
+		if (dom_node_get_parent_node(cur, &parent) != DOM_NO_ERR) {
+			parent = NULL;
+		}
+		dom_node_unref(cur);
+		cur = parent;
+	}
+	return false;
+}
+
 static JSValue doc_get_element_by_id(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
@@ -3779,22 +4080,37 @@ static JSValue doc_get_element_by_id(JSContext *ctx, JSValueConst this_val,
 	struct dom_document *doc = thread_document(thread);
 	const char *id;
 	dom_string *key;
-	struct dom_element *el = NULL;
-	JSValue r;
+	struct id_entry *e;
+	uint32_t h;
+	JSValue r = JS_NULL;
 
 	(void)this_val;
 	if (doc == NULL || argc < 1) return JS_NULL;
 	id = JS_ToCString(ctx, argv[0]);
 	key = to_dom_string(id);
+	if (id) JS_FreeCString(ctx, id);
 	if (key == NULL) {
-		if (id) JS_FreeCString(ctx, id);
 		return JS_NULL;
 	}
-	dom_document_get_element_by_id(doc, key, &el);
+	id_calls++;
+	if (dom_string_byte_length(key) == 0) {
+		dom_string_unref(key);
+		return JS_NULL;
+	}
+	h = dom_string_hash(key);
+	e = thread->id_idx_built ? id_index_find(thread, key, h) : NULL;
+	if (thread->id_idx_built && thread->id_idx_gen == vita_id_gen) {
+		id_exact++;
+	} else if (e != NULL && id_entry_holds(e, (struct dom_node *)doc)) {
+		id_hits++;
+	} else {
+		id_index_build(thread, (struct dom_node *)doc);
+		e = id_index_find(thread, key, h);
+	}
+	if (e != NULL) {
+		r = wrap_node(ctx, e->el);
+	}
 	dom_string_unref(key);
-	JS_FreeCString(ctx, id);
-	r = wrap_node(ctx, (struct dom_node *)el);
-	if (el != NULL) dom_node_unref((struct dom_node *)el);
 	return r;
 }
 
@@ -4689,10 +5005,14 @@ static uint64_t bc_last_activity_ms;
 static void begin_script(jsthread *thread, enum script_why why)
 {
 	if (thread->script_depth++ > 0) {
+		if (thread->draining) {
+			jobs_reentered++;
+		}
 		return;
 	}
 	script_why = why;
 	vita_dom_gen++;	/* the parser may have added nodes since */
+	vita_id_gen++;
 	script_entered_ms = now_ms();
 	bc_last_activity_ms = script_entered_ms;
 	rearm_deadline(thread);
@@ -4813,6 +5133,19 @@ static void end_script(jsthread *thread)
 	 * state, so the drain answers to one budget again.
 	 */
 	rearm_deadline(thread);
+	/*
+	 * The drain is still inside the script (VitaSurf). With the depth
+	 * at zero, a job that dispatched an event or ran a listener from C
+	 * entered script as a new outermost call: begin_script handed it a
+	 * fresh deadline, and its end_script drained the queue again and
+	 * then cleared the deadline, so the rest of the outer job ran with
+	 * no budget, no profile samples and no Circle. Yamtrack's Alpine
+	 * start-up ran 9242 ms that way and the profile could say only
+	 * "a promise job". Holding the depth at one makes those calls the
+	 * nested entries they are.
+	 */
+	thread->script_depth = 1;
+	thread->draining = true;
 	{
 		/*
 		 * What the microtask queue costs (VitaSurf). This runs
@@ -4948,6 +5281,8 @@ static void end_script(jsthread *thread)
 			}
 		}
 	}
+	thread->script_depth = 0;
+	thread->draining = false;
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;
 		vita_log("qjs: promise jobs stopped by the budget "
@@ -7157,6 +7492,84 @@ static JSValue win_vita_node_type_test(JSContext *ctx, JSValueConst this_val,
 	return JS_NewCFunctionData(ctx, node_type_test, 1, 0, 1, argv);
 }
 
+/*
+ * firstElementChild, lastElementChild, nextElementSibling and
+ * previousElementSibling, stepped in libdom (VitaSurf). The prelude
+ * built the whole children collection to answer firstElementChild, and
+ * walked nextSibling wrapping every text node on the way; Alpine starts
+ * a page by walking every element with exactly these two, and checks
+ * each one's ancestors through parentElement, magic 4. The magic is
+ * which of the five; data[0] is the JavaScript getter kept for anything
+ * that is not a libdom node.
+ */
+static JSValue element_step(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv, int magic,
+			    JSValue *data)
+{
+	C_WHERE;
+	struct dom_node *n = JS_GetOpaque(this_val, node_class_id);
+	struct dom_node *cur = NULL;
+	bool forward = magic == 0 || magic == 2;
+	JSValue r;
+
+	(void)argc;
+	(void)argv;
+	if (n == NULL) {
+		return JS_Call(ctx, data[0], this_val, 0, NULL);
+	}
+	vitasurf_js_tree_reads++;
+	switch (magic) {
+	case 0: dom_node_get_first_child(n, &cur); break;
+	case 1: dom_node_get_last_child(n, &cur); break;
+	case 2: dom_node_get_next_sibling(n, &cur); break;
+	case 3: dom_node_get_previous_sibling(n, &cur); break;
+	default:
+		dom_node_get_parent_node(n, &cur);
+		if (cur != NULL && !node_is_element(cur)) {
+			dom_node_unref(cur);
+			cur = NULL;
+		}
+		break;
+	}
+	while (cur != NULL) {
+		struct dom_node *next = NULL;
+		dom_node_type type = DOM_TEXT_NODE;
+
+		if (dom_node_get_node_type(cur, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			break;
+		}
+		if (forward) {
+			dom_node_get_next_sibling(cur, &next);
+		} else {
+			dom_node_get_previous_sibling(cur, &next);
+		}
+		dom_node_unref(cur);
+		cur = next;
+	}
+	r = wrap_node(ctx, cur);
+	if (cur != NULL) dom_node_unref(cur);
+	return r;
+}
+
+static JSValue win_vita_element_step(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t kind = 0;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsFunction(ctx, argv[1])) {
+		return argc >= 2 ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
+	}
+	JS_ToInt32(ctx, &kind, argv[0]);
+	if (kind < 0 || kind > 4) {
+		return JS_DupValue(ctx, argv[1]);
+	}
+	return JS_NewCFunctionData(ctx, element_step, 0, kind, 1,
+				   (JSValueConst *)&argv[1]);
+}
+
 static JSValue win_vita_selector_native(JSContext *ctx, JSValueConst this_val,
 					int argc, JSValueConst *argv)
 {
@@ -8443,6 +8856,9 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaNodeTypeTest",
 			  JS_NewCFunction(ctx, win_vita_node_type_test,
 					  "__vitaNodeTypeTest", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaElementStep",
+			  JS_NewCFunction(ctx, win_vita_element_step,
+					  "__vitaElementStep", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaSelectorNative",
 			  JS_NewCFunction(ctx, win_vita_selector_native,
 					  "__vitaSelectorNative", 2));
@@ -11123,6 +11539,7 @@ static void js_free_deferred(jsthread *thread)
 	thread->deferred = NULL;
 	mod_deps_free(thread);
 	sel_cache_free(thread);
+	id_index_free(thread);
 	if (thread->deferred_scheduled) {
 		guit->misc->schedule(-1, module_retry_callback, thread);
 		thread->deferred_scheduled = false;

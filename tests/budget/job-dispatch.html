@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- A promise job that goes back into script through C (a dispatched
+     event with a listener) and then loops. The inner entry used to end
+     the drain's deadline on its way out, and the loop ran with no budget
+     at all; it has to stop on the drain's one deadline. -->
+<html><head><title>budget: a job that dispatches</title></head><body>
+<script>
+var t0=Date.now();
+document.addEventListener('ping',function(){console.log('listener ran');});
+Promise.resolve().then(function(){
+ document.dispatchEvent(new Event('ping'));
+ try{
+  while(Date.now()-t0<90000){}
+  console.log('FAIL left the loop after '+(Date.now()-t0)+' ms');
+ }catch(e){console.log('FAIL the page caught the abort');}
+});
+</script></body></html>

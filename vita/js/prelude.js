@@ -522,6 +522,14 @@ P.closest=function(sel){
 Object.defineProperty(P,'nextElementSibling',{configurable:true,get:function(){var n=this.nextSibling;while(n&&n.nodeType!==1)n=n.nextSibling;return n||null;}});
 Object.defineProperty(P,'previousElementSibling',{configurable:true,get:function(){var n=this.previousSibling;while(n&&n.nodeType!==1)n=n.previousSibling;return n||null;}});
 Object.defineProperty(P,'childElementCount',{configurable:true,get:function(){return this.children.length;}});
+/* the four element steps in C when the bindings have them (VitaSurf);
+   the getters above stay behind them for anything that is not a node */
+if(typeof __vitaElementStep==='function')
+ ['firstElementChild','lastElementChild','nextElementSibling',
+  'previousElementSibling','parentElement'].forEach(function(k,i){
+  var d=Object.getOwnPropertyDescriptor(P,k);
+  Object.defineProperty(P,k,{configurable:true,
+   get:__vitaElementStep(i,d.get)});});
 /* localName, prefix and namespaceURI come from libdom now (qjs.c). An
    SVG clipPath keeps its capital P and an element made with a prefix
    keeps it, neither of which can be guessed from the tag name. These
@@ -3083,7 +3091,7 @@ P.moveBefore=function(n,ref){return this.insertBefore(n,ref||null);};
 /* An attribute node, which getAttributeNode used to fake with an object
  * literal. Sanitizers walk these and read ownerElement off them. */
 function Attr(el,name,value){
- this._e=el;this._v=value===undefined?'':String(value);
+ this._e=el;this._v=value===undefined?'':String(value);this._g=-1;
  this.name=String(name);this.localName=this.name;
  this.prefix=null;this.namespaceURI=null;this.specified=true;
  this.nodeType=2;this.nodeName=this.name;
@@ -3091,14 +3099,22 @@ function Attr(el,name,value){
 /* Live, like the thing it stands for: reading gives what the element
    says now and writing puts it back, rather than a copy taken once. */
 (function(){
+ /* _g is the tree generation _v was read at: until something writes
+    an attribute, the value the map was filled with is still the one
+    the element has, and Alpine reads .value off every attribute of
+    every element it starts (VitaSurf). */
  function get(){
   if(!this._e)return this._v;
+  var g=W.__vitaDomGen?W.__vitaDomGen():-1;
+  if(g>=0&&this._g===g)return this._v;
   var v=this.namespaceURI
    ?this._e.getAttributeNS(this.namespaceURI,this.localName)
    :this._e.getAttribute(this.name);
-  return v===null?this._v:v;}
+  if(v===null)return this._v;
+  this._v=v;this._g=g;
+  return v;}
  function set(v){
-  this._v=String(v);
+  this._v=String(v);this._g=-1;
   if(!this._e)return;
   if(this.namespaceURI)this._e.setAttributeNS(this.namespaceURI,this.name,this._v);
   else this._e.setAttribute(this.name,this._v);}
@@ -3123,7 +3139,7 @@ function attrMap(el){
   Object.defineProperty(el,'__vitaAttrs',{value:m,configurable:true});}
  return m;}
 function attrKeyOf(ns,local){return (ns===null||ns===undefined?'':ns)+'|'+local;}
-function attrNodeFor(el,raw){
+function attrNodeFor(el,raw,g){
  var m=attrMap(el),k=attrKeyOf(raw.namespace,raw.localName||raw.name),a=m[k];
  if(!a||a._e!==el){
   a=new Attr(el,raw.name,raw.value);
@@ -3131,6 +3147,7 @@ function attrNodeFor(el,raw){
   a.localName=raw.localName||raw.name;
   a.prefix=raw.prefix===undefined?null:raw.prefix;
   m[k]=a;}
+ if(g!==undefined&&g>=0){a._v=String(raw.value);a._g=g;}
  return a;}
 /* Removing the attribute leaves the node behind with the value it had
    and no owner, which is what the node's own removal means. */
@@ -3633,13 +3650,17 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){
 /* Not an array: the map's own properties are the indices and the
    attribute names, and nothing else, which is what code that walks it
    with getOwnPropertyNames expects to see. */
-var NNM_OWNER=Symbol('ownerElement');
+var NNM_OWNER=Symbol('ownerElement'),NNM_LEN=Symbol('length');
 function NamedNodeMap(el){
  /* under a symbol: getOwnPropertyNames must show the indices and the
     attribute names and nothing else */
  this[NNM_OWNER]=el;}
+/* The count is kept when the map is filled: counting own properties on
+   every read made a for-of or Array.from over the map quadratic, and
+   Alpine does that for every element it starts. */
 Object.defineProperty(NamedNodeMap.prototype,'length',{configurable:true,
- get:function(){var n=0;while(Object.prototype.hasOwnProperty.call(this,n))n++;
+ get:function(){var n=this[NNM_LEN];if(n!==undefined)return n;
+  n=0;while(Object.prototype.hasOwnProperty.call(this,n))n++;
   return n;}});
 NamedNodeMap.prototype.item=function(i){
  i=i>>>0;return Object.prototype.hasOwnProperty.call(this,i)?this[i]:null;};
@@ -3666,15 +3687,26 @@ W.NamedNodeMap=NamedNodeMap;
  if(!d||!d.get)return;
  rawAttrs=d.get;
  Object.defineProperty(P,'attributes',{configurable:true,get:function(){
-  var el=this,raw=d.get.call(this),map=new NamedNodeMap(el),i,a;
+  var el=this,g=W.__vitaDomGen?W.__vitaDomGen():-1,c=el.__vitaAttrMap,
+      raw,map,i,a;
+  /* The same map while nothing has written an attribute or moved a
+     node since (VitaSurf): el.attributes===el.attributes, as in a
+     browser, and a page that reads it twice builds it once. */
+  if(c&&g>=0&&c.g===g)return c.m;
+  raw=d.get.call(this);map=new NamedNodeMap(el);
   /* The C side hands back plain name-and-value pairs; an attribute is a
      node, and code reads nodeValue, ownerElement and localName off one. */
   for(i=0;i<raw.length;i++){
-   a=attrNodeFor(el,raw[i]);
+   a=attrNodeFor(el,raw[i],g);
    Object.defineProperty(map,i,{value:a,enumerable:true,configurable:true});
    if(!Object.prototype.hasOwnProperty.call(map,a.name))
     Object.defineProperty(map,a.name,
      {value:a,enumerable:false,configurable:true});}
+  map[NNM_LEN]=raw.length;
+  if(g>=0){
+   if(c){c.g=g;c.m=map;}
+   else Object.defineProperty(el,'__vitaAttrMap',
+    {value:{g:g,m:map},configurable:true});}
   return map;}});
 })();
 

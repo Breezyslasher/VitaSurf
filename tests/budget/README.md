@@ -3,6 +3,8 @@
 Two pages that loop forever while reaching back into the browser, which
 is the shape that used to get past the budget: a script that mutates the
 DOM (`mutate.html`) and one that dispatches an event (`dispatch.html`).
+`job-dispatch.html` does the second from inside a promise job, where the
+listener's return used to clear the drain's deadline.
 Each pass goes out to C and comes back, and each of those returns used to
 be a place where the abort could be dropped or the deadline re-armed.
 

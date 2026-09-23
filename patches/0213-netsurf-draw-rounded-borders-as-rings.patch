@@ -1,0 +1,220 @@
+diff --git a/content/handlers/html/redraw_border.c b/content/handlers/html/redraw_border.c
+index 1ec87c537..5b0b074ec 100644
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -38,6 +38,10 @@
+ #include "html/private.h"
+ 
+ 
++static bool rounded_ring_smooth(const struct redraw_context *ctx, colour c,
++		const struct rect *r, const struct html_corner_radii *radii,
++		int bw, nserror *res);
++
+ static plot_style_t plot_style_bdr = {
+ 	.stroke_type = PLOT_OP_TYPE_DASH,
+ };
+@@ -517,6 +521,7 @@ html_redraw_borders(struct box *box,
+ 				.fill_type = PLOT_OP_TYPE_NONE
+ 			};
+ 			struct rect centre;
++			struct html_corner_radii outer = radii;
+ 
+ 			/*
+ 			 * A stroke straddles the line it follows, so the
+@@ -544,6 +549,16 @@ html_redraw_borders(struct box *box,
+ 			if (ctx->plot->clip(ctx, clip) != NSERROR_OK) {
+ 				return false;
+ 			}
++			{
++				nserror res = NSERROR_OK;
++
++				if (rounded_ring_smooth(ctx,
++						pstyle.stroke_colour,
++						&border_box, &outer, stop,
++						&res)) {
++					return res == NSERROR_OK;
++				}
++			}
+ 			return html_plot_rounded_stroke(ctx, &pstyle,
+ 					&centre, &radii) == NSERROR_OK;
+ 		}
+@@ -1311,6 +1326,7 @@ enum corner_which { CORNER_TL, CORNER_TR, CORNER_BR, CORNER_BL };
+ 
+ static struct corner_image {
+ 	int w, h;
++	int bw;		/* border width for a ring's corner, 0 for a fill's */
+ 	colour c;
+ 	enum corner_which which;
+ 	struct bitmap *bitmap;
+@@ -1318,7 +1334,7 @@ static struct corner_image {
+ static unsigned int corner_cache_n;
+ static size_t corner_cache_bytes;
+ 
+-static struct bitmap *corner_image(int w, int h, colour c,
++static struct bitmap *corner_image(int w, int h, int bw, colour c,
+ 				   enum corner_which which)
+ {
+ 	struct corner_image *ci;
+@@ -1331,7 +1347,7 @@ static struct bitmap *corner_image(int w, int h, colour c,
+ 
+ 	for (i = 0; i < corner_cache_n; i++) {
+ 		ci = &corner_cache[i];
+-		if (ci->w == w && ci->h == h && ci->c == c &&
++		if (ci->w == w && ci->h == h && ci->bw == bw && ci->c == c &&
+ 		    ci->which == which) {
+ 			return ci->bitmap;
+ 		}
+@@ -1371,7 +1387,21 @@ static struct bitmap *corner_image(int w, int h, colour c,
+ 						    0.5f) * 0.25f - cx) /
+ 						(float)w;
+ 
+-					if (ex * ex + ey * ey <= 1.0f) in++;
++					if (ex * ex + ey * ey > 1.0f)
++						continue;
++					/* a ring's corner leaves out the
++					 * inner curve, the same centre and
++					 * the border width less each way */
++					if (bw > 0) {
++						float ix = ex * (float)w /
++							(float)(w - bw);
++						float iy = ey * (float)h /
++							(float)(h - bw);
++
++						if (ix * ix + iy * iy <= 1.0f)
++							continue;
++					}
++					in++;
+ 				}
+ 			}
+ 			a = alpha * in / 16u;
+@@ -1385,6 +1415,7 @@ static struct bitmap *corner_image(int w, int h, colour c,
+ 	guit->bitmap->modified(ci->bitmap);
+ 	ci->w = w;
+ 	ci->h = h;
++	ci->bw = bw;
+ 	ci->c = c;
+ 	ci->which = which;
+ 	corner_cache_n++;
+@@ -1423,16 +1454,16 @@ rounded_fill_smooth(const struct redraw_context *ctx,
+ 	}
+ 	/* a corner with no radius one way is square: nothing to smooth */
+ 	if (radii->tl_h > 0 && radii->tl_v > 0 &&
+-	    (tl = corner_image(radii->tl_h, radii->tl_v, c, CORNER_TL)) == NULL)
++	    (tl = corner_image(radii->tl_h, radii->tl_v, 0, c, CORNER_TL)) == NULL)
+ 		return false;
+ 	if (radii->tr_h > 0 && radii->tr_v > 0 &&
+-	    (tr = corner_image(radii->tr_h, radii->tr_v, c, CORNER_TR)) == NULL)
++	    (tr = corner_image(radii->tr_h, radii->tr_v, 0, c, CORNER_TR)) == NULL)
+ 		return false;
+ 	if (radii->br_h > 0 && radii->br_v > 0 &&
+-	    (br = corner_image(radii->br_h, radii->br_v, c, CORNER_BR)) == NULL)
++	    (br = corner_image(radii->br_h, radii->br_v, 0, c, CORNER_BR)) == NULL)
+ 		return false;
+ 	if (radii->bl_h > 0 && radii->bl_v > 0 &&
+-	    (bl = corner_image(radii->bl_h, radii->bl_v, c, CORNER_BL)) == NULL)
++	    (bl = corner_image(radii->bl_h, radii->bl_v, 0, c, CORNER_BL)) == NULL)
+ 		return false;
+ 
+ 	/* the box less the corner squares, as runs of equal rows */
+@@ -1479,11 +1510,100 @@ rounded_fill_smooth(const struct redraw_context *ctx,
+ 	CORNER(br, r->x1 - radii->br_h, r->y1 - radii->br_v,
+ 	       radii->br_h, radii->br_v);
+ 	CORNER(bl, r->x0, r->y1 - radii->bl_v, radii->bl_h, radii->bl_v);
+-#undef CORNER
+ 	*res = NSERROR_OK;
+ 	return true;
+ }
+ 
++/**
++ * Draw a rounded border of one width and colour all round as a ring
++ * (VitaSurf): the four straight sides as rectangles and each rounded
++ * corner as a cached image of the curved band, smoothed like the fills.
++ * It was one stroked path, which the framebuffer fills scan line by
++ * scan line against every edge of the flattened curves; Yamtrack
++ * scrolled with 3400 path plots a second, 130 ms of it.
++ *
++ * false, with nothing drawn, for a shape it does not cover: a corner
++ * radius over CORNER_MAX, curves that meet, or a border as wide as a
++ * radius, whose inner edge would have a square corner inside the curve.
++ */
++static bool
++rounded_ring_smooth(const struct redraw_context *ctx, colour c,
++		    const struct rect *r,
++		    const struct html_corner_radii *radii, int bw,
++		    nserror *res)
++{
++	struct bitmap *tl = NULL, *tr = NULL, *br = NULL, *bl = NULL;
++	plot_style_t style = {
++		.stroke_type = PLOT_OP_TYPE_NONE,
++		.fill_type = PLOT_OP_TYPE_SOLID,
++		.fill_colour = c
++	};
++	struct rect band;
++	bool rtl = radii->tl_h > 0 && radii->tl_v > 0;
++	bool rtr = radii->tr_h > 0 && radii->tr_v > 0;
++	bool rbr = radii->br_h > 0 && radii->br_v > 0;
++	bool rbl = radii->bl_h > 0 && radii->bl_v > 0;
++
++	if (bw <= 0 ||
++	    radii->tl_h > CORNER_MAX || radii->tl_v > CORNER_MAX ||
++	    radii->tr_h > CORNER_MAX || radii->tr_v > CORNER_MAX ||
++	    radii->br_h > CORNER_MAX || radii->br_v > CORNER_MAX ||
++	    radii->bl_h > CORNER_MAX || radii->bl_v > CORNER_MAX ||
++	    radii->tl_v + radii->bl_v > r->y1 - r->y0 ||
++	    radii->tr_v + radii->br_v > r->y1 - r->y0 ||
++	    radii->tl_h + radii->tr_h > r->x1 - r->x0 ||
++	    radii->bl_h + radii->br_h > r->x1 - r->x0 ||
++	    2 * bw >= r->x1 - r->x0 || 2 * bw >= r->y1 - r->y0 ||
++	    (rtl && (bw >= radii->tl_h || bw >= radii->tl_v)) ||
++	    (rtr && (bw >= radii->tr_h || bw >= radii->tr_v)) ||
++	    (rbr && (bw >= radii->br_h || bw >= radii->br_v)) ||
++	    (rbl && (bw >= radii->bl_h || bw >= radii->bl_v))) {
++		return false;
++	}
++	if (rtl && (tl = corner_image(radii->tl_h, radii->tl_v, bw, c,
++				      CORNER_TL)) == NULL)
++		return false;
++	if (rtr && (tr = corner_image(radii->tr_h, radii->tr_v, bw, c,
++				      CORNER_TR)) == NULL)
++		return false;
++	if (rbr && (br = corner_image(radii->br_h, radii->br_v, bw, c,
++				      CORNER_BR)) == NULL)
++		return false;
++	if (rbl && (bl = corner_image(radii->bl_h, radii->bl_v, bw, c,
++				      CORNER_BL)) == NULL)
++		return false;
++
++	/* The sides, none overlapping another or a corner: a square
++	 * corner belongs to the top or bottom side, so the left and right
++	 * sides start and end a border's width in from it. */
++#define BAND(bx0, by0, bx1, by1) do {					\
++		band.x0 = (bx0); band.y0 = (by0);			\
++		band.x1 = (bx1); band.y1 = (by1);			\
++		if (band.x1 > band.x0 && band.y1 > band.y0) {		\
++			*res = ctx->plot->rectangle(ctx, &style, &band); \
++			if (*res != NSERROR_OK) return true;		\
++		}							\
++	} while (0)
++	BAND(r->x0 + (rtl ? radii->tl_h : 0), r->y0,
++	     r->x1 - (rtr ? radii->tr_h : 0), r->y0 + bw);
++	BAND(r->x0 + (rbl ? radii->bl_h : 0), r->y1 - bw,
++	     r->x1 - (rbr ? radii->br_h : 0), r->y1);
++	BAND(r->x0, r->y0 + (rtl ? radii->tl_v : bw),
++	     r->x0 + bw, r->y1 - (rbl ? radii->bl_v : bw));
++	BAND(r->x1 - bw, r->y0 + (rtr ? radii->tr_v : bw),
++	     r->x1, r->y1 - (rbr ? radii->br_v : bw));
++#undef BAND
++
++	*res = NSERROR_OK;
++	CORNER(tl, r->x0, r->y0, radii->tl_h, radii->tl_v);
++	CORNER(tr, r->x1 - radii->tr_h, r->y0, radii->tr_h, radii->tr_v);
++	CORNER(br, r->x1 - radii->br_h, r->y1 - radii->br_v,
++	       radii->br_h, radii->br_v);
++	CORNER(bl, r->x0, r->y1 - radii->bl_v, radii->bl_h, radii->bl_v);
++	return true;
++}
++#undef CORNER
++
+ /**
+  * Fill a rounded rectangle.
+  */
