@@ -302,6 +302,208 @@ static uint64_t now_ms(void)
 }
 
 /** Interrupt handler: stop a script that has run past its deadline. */
+/**
+ * The live JavaScript stack, as the text Error.stack would hold, or
+ * NULL. A malloc'd copy for the caller to free.
+ */
+static char *capture_stack(JSContext *c)
+{
+	JSValue global = JS_GetGlobalObject(c);
+	JSValue ector = JS_GetPropertyStr(c, global, "Error");
+	JSValue capture = JS_GetPropertyStr(c, ector, "captureStackTrace");
+	JSValue err = JS_NewError(c);
+	JSValue stack;
+	char *out = NULL;
+
+	if (JS_IsFunction(c, capture)) {
+		JSValue r = JS_Call(c, capture, ector, 1, &err);
+
+		if (JS_IsException(r)) {
+			JS_FreeValue(c, JS_GetException(c));
+		}
+		JS_FreeValue(c, r);
+	}
+	stack = JS_GetPropertyStr(c, err, "stack");
+	if (JS_IsString(stack)) {
+		const char *st = JS_ToCString(c, stack);
+
+		if (st != NULL) {
+			out = strdup(st);
+			JS_FreeCString(c, st);
+		}
+	}
+	JS_FreeValue(c, stack);
+	JS_FreeValue(c, err);
+	JS_FreeValue(c, capture);
+	JS_FreeValue(c, ector);
+	JS_FreeValue(c, global);
+	return out;
+}
+
+/*
+ * A sampling profile of the page's JavaScript (VitaSurf). The counters
+ * say how often the page called into us and what that cost, but a
+ * GitHub promise job of 11.6 s had 9 s that none of them covered: plain
+ * script, somewhere. Every PROF_INTERVAL_MS while script runs, the
+ * interrupt check notes the two innermost frames, and the page report
+ * names the places most often found running. Only script is sampled;
+ * time inside our bindings is not interruptible and is counted there.
+ */
+#define PROF_INTERVAL_MS 100
+#define PROF_SLOTS 128
+
+static struct {
+	char where[300];
+	unsigned int hits;
+} prof[PROF_SLOTS];
+static unsigned int prof_n, prof_samples, prof_other;
+static uint64_t prof_last_ms;
+static bool prof_busy;
+
+/* One frame of a stack text: "name (file:line:col)", the file's path cut
+ * to its last part. */
+static size_t prof_frame(const char *line, char *out, size_t outsz)
+{
+	const char *end = strchr(line, '\n'), *open, *slash;
+	size_t n, used = 0;
+
+	if (end == NULL) end = line + strlen(line);
+	while (line < end && (*line == ' ' || *line == '\t')) line++;
+	if (end - line >= 3 && memcmp(line, "at ", 3) == 0) line += 3;
+	open = memchr(line, '(', (size_t)(end - line));
+	if (open != NULL) {
+		/* the name, then the location's last path component */
+		n = (size_t)(open - line) + 1;
+		if (n >= outsz) n = outsz - 1;
+		memcpy(out, line, n);
+		used = n;
+		slash = open + 1;
+		{
+			const char *p;
+
+			for (p = open + 1; p < end; p++) {
+				if (*p == '/') slash = p + 1;
+			}
+		}
+		n = (size_t)(end - slash);
+		if (used + n >= outsz) n = outsz - 1 - used;
+		memcpy(out + used, slash, n);
+		used += n;
+	} else {
+		n = (size_t)(end - line);
+		if (n >= outsz) n = outsz - 1;
+		memcpy(out, line, n);
+		used = n;
+	}
+	out[used] = '\0';
+	return used;
+}
+
+/* Whether s[0..n) contains needle (newlib has no memmem). */
+static bool prof_has(const char *s, size_t n, const char *needle)
+{
+	size_t k = strlen(needle), i;
+
+	for (i = 0; i + k <= n; i++) {
+		if (memcmp(s + i, needle, k) == 0) return true;
+	}
+	return false;
+}
+
+static void prof_sample(JSContext *ctx)
+{
+	char *st, key[300], f2[100];
+	const char *l2;
+	unsigned int i;
+
+	if (prof_busy) return;
+	prof_busy = true;
+	st = capture_stack(ctx);
+	prof_busy = false;
+	if (st == NULL) return;
+	prof_samples++;
+	prof_frame(st, key, 100);
+	l2 = strchr(st, '\n');
+	if (l2 != NULL && l2[1] != '\0') {
+		prof_frame(l2 + 1, f2, sizeof(f2));
+		snprintf(key + strlen(key), sizeof(key) - strlen(key),
+			 " < %s", f2);
+		/* two frames of our own code: which page call led there */
+		if (strstr(key, "<prelude>") != NULL &&
+		    strstr(f2, "<prelude>") != NULL) {
+			const char *l = strchr(l2 + 1, '\n');
+
+			while (l != NULL && l[1] != '\0') {
+				const char *e = strchr(l + 1, '\n');
+				size_t n = e != NULL ? (size_t)(e - l) :
+					strlen(l);
+
+				if (!prof_has(l, n, "<prelude>") &&
+				    !prof_has(l, n, "(native)")) {
+					prof_frame(l + 1, f2, sizeof(f2));
+					snprintf(key + strlen(key),
+						 sizeof(key) - strlen(key),
+						 " from %s", f2);
+					break;
+				}
+				l = e;
+			}
+		}
+	}
+	free(st);
+	for (i = 0; i < prof_n; i++) {
+		if (strcmp(prof[i].where, key) == 0) {
+			prof[i].hits++;
+			return;
+		}
+	}
+	if (prof_n < PROF_SLOTS) {
+		snprintf(prof[prof_n].where, sizeof(prof[0].where), "%s", key);
+		prof[prof_n].hits = 1;
+		prof_n++;
+	} else {
+		prof_other++;
+	}
+}
+
+/* exported for the page report in vita/input/vita_input.c */
+void vita_js_report_profile(void);
+void vita_js_report_profile(void)
+{
+	unsigned int shown;
+
+	if (prof_samples == 0) {
+		return;
+	}
+	vita_log("profile: %u samples of running script, one every %u ms; "
+		 "where it was most often:", prof_samples,
+		 (unsigned int)PROF_INTERVAL_MS);
+	for (shown = 0; shown < 12; shown++) {
+		unsigned int i, best = 0;
+		bool any = false;
+
+		for (i = 0; i < prof_n; i++) {
+			if (prof[i].hits > 0 &&
+			    (!any || prof[i].hits > prof[best].hits)) {
+				best = i;
+				any = true;
+			}
+		}
+		if (!any) break;
+		vita_log("profile: %3u%% %s",
+			 prof[best].hits * 100u / prof_samples,
+			 prof[best].where);
+		prof[best].hits = 0;
+	}
+	if (prof_other > 0) {
+		vita_log("profile: %u samples fell outside the %u places kept",
+			 prof_other, (unsigned int)PROF_SLOTS);
+	}
+	prof_n = 0;
+	prof_samples = 0;
+	prof_other = 0;
+}
+
 static int qjs_interrupt(JSRuntime *rt, void *opaque)
 {
 	jsthread *thread = opaque;
@@ -315,6 +517,15 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	 * way the budget does (VitaSurf): the screen had stayed as it was
 	 * for as long as the page's script cared to run.
 	 */
+	{
+		uint64_t t = now_ms();
+
+		if (t - prof_last_ms >= PROF_INTERVAL_MS && thread->ctx != NULL &&
+		    !thread->aborting) {
+			prof_last_ms = t;
+			prof_sample(thread->ctx);
+		}
+	}
 	if (vita_busy_take_cancel()) {
 		vita_log("qjs: Circle stopped the running script: %s",
 			 thread->current_script != NULL ?
@@ -352,35 +563,12 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 			 * spot from the live frames, so call that.
 			 */
 			{
-				JSContext *c = thread->ctx;
-				JSValue global = JS_GetGlobalObject(c);
-				JSValue ector = JS_GetPropertyStr(c, global,
-								  "Error");
-				JSValue capture = JS_GetPropertyStr(c, ector,
-							"captureStackTrace");
-				JSValue err = JS_NewError(c);
-				JSValue stack;
+				char *st = capture_stack(thread->ctx);
 
-				if (JS_IsFunction(c, capture)) {
-					JSValue r = JS_Call(c, capture, ector,
-							    1, &err);
-
-					JS_FreeValue(c, r);
+				if (st != NULL) {
+					vita_log("qjs:   %s", st);
+					free(st);
 				}
-				stack = JS_GetPropertyStr(c, err, "stack");
-				if (JS_IsString(stack)) {
-					const char *st = JS_ToCString(c, stack);
-
-					if (st != NULL) {
-						vita_log("qjs:   %s", st);
-						JS_FreeCString(c, st);
-					}
-				}
-				JS_FreeValue(c, stack);
-				JS_FreeValue(c, err);
-				JS_FreeValue(c, capture);
-				JS_FreeValue(c, ector);
-				JS_FreeValue(c, global);
 			}
 			thread->overrun_said_ms = now;
 		} else if (now - thread->overrun_said_ms >= 30000) {

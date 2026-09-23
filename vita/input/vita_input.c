@@ -1065,6 +1065,8 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
  * not compile, so the symbol is weak and the call is skipped there.
  */
 extern void vita_js_report_gaps(void) __attribute__((weak));
+/* the script profile, from the same place and weak for the same reason */
+extern void vita_js_report_profile(void) __attribute__((weak));
 
 /**
  * Write the fetches of the page now on screen to the log.
@@ -1761,6 +1763,9 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 r.other_bytes / 1024, r.other_count);
 			vita_log("cache: %u of those have no users, %u KB",
 				 r.unused_count, r.unused_bytes / 1024);
+		}
+		if (vita_js_report_profile != NULL) {
+			vita_js_report_profile();
 		}
 		nsurl_unref(url);
 	} else {
