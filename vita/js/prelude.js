@@ -408,11 +408,11 @@ function countHits(){
  if(compiledHits&&typeof __vitaSelector==='function')__vitaSelector(1,compiledHits);
  compiledHits=0;}
 /* A selector the general path keeps being asked for is named in the
-   log at 4096 uses and each doubling after, so the next fast path is
+   log at 1024 uses and each doubling after, so the next fast path is
    chosen from a log rather than guessed (VitaSurf). */
 function noteSlow(g,text){
  var n=g.slow=(g.slow|0)+1;
- if(n>=4096&&(n&(n-1))===0&&typeof __vitaSelector==='function')__vitaSelector(6,n,text);}
+ if(n>=1024&&(n&(n-1))===0&&typeof __vitaSelector==='function')__vitaSelector(6,n,text);}
 function compile(selector){
  var text=String(selector),hit=compiled[text];
  if(hit!==undefined){
@@ -3902,6 +3902,17 @@ docOverride('title',function(){
   if(m==='querySelector'&&de.matches&&arguments[0]){
    try{if(de.matches(arguments[0]))return de;}catch(e){}}
   return orig.apply(de,arguments);};});
+/* The four selector calls as native functions (VitaSurf): a selector of
+   type, #id, .class and [attribute] tests is answered in C without a
+   JavaScript frame, and anything else is handed to the function each
+   replaces. GitHub made 400,000 of these calls in one load, and the
+   frames around each, not the matching, filled a 20 s timer. */
+if(typeof __vitaSelectorNative==='function'){
+ P.matches=P.webkitMatchesSelector=P.msMatchesSelector=
+  __vitaSelectorNative(0,P.matches);
+ P.querySelector=__vitaSelectorNative(1,P.querySelector);
+ P.querySelectorAll=__vitaSelectorNative(2,P.querySelectorAll);
+ P.closest=__vitaSelectorNative(3,P.closest);}
 function docById(root,id){
  var want=String(id),found=null;
  (function walk(n){

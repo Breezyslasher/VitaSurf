@@ -213,6 +213,8 @@ struct jsthread {
 	unsigned retry_delay_ms;  /**< how long before the next retry round */
 	struct js_deferred *deferred; /**< module scripts waiting on imports */
 	struct mod_deps *mod_deps[64]; /**< each module's imports, by URL */
+	struct sel_compiled *sel_cache[128]; /**< selectors answered in C */
+	unsigned int sel_cache_n;
 	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
 				   *   JS_UNINITIALIZED before it is looked
@@ -6007,6 +6009,710 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Selectors answered in C (VitaSurf)                                        */
+
+/*
+ * GitHub's pages asked for about 400,000 selector matches in one load:
+ * catalyst's lazy loader asks every added element for each tag it may
+ * load, and selector-observer asks every added element whether it
+ * matches each of hundreds of selectors. Every call went through three
+ * or four JavaScript frames before any work was done, and on this CPU
+ * that overhead, not the matching, filled a 20 s timer the budget
+ * stopped.
+ *
+ * So matches, querySelector, querySelectorAll and closest are native
+ * functions. They answer in C any selector made only of type, #id,
+ * .class and [attribute] tests joined by descendant, >, + and ~, and
+ * hand everything else -- pseudo-classes, escapes, namespaces, anything
+ * this parser is unsure of -- to the prelude's engine unchanged. The
+ * parser is deliberately stricter than the prelude's, and the matching
+ * follows the prelude's rules (matchSimple, attrOk, matchAt) exactly, so
+ * a selector gets the same answer whichever side takes it.
+ */
+
+enum sel_op {
+	SOP_EXISTS, SOP_EQ, SOP_INCL, SOP_DASH, SOP_PREFIX, SOP_SUFFIX,
+	SOP_SUBSTR
+};
+
+struct sel_attr {
+	dom_string *name;
+	enum sel_op op;
+	char *val;
+	size_t vlen;
+};
+
+struct sel_compound {
+	char *tag;		/**< type selector, NULL for none or * */
+	size_t tag_len;
+	char *id;
+	size_t id_len;
+	char **classes;
+	int nclasses;
+	struct sel_attr *attrs;
+	int nattrs;
+	char comb;		/**< joins it to the one before: ' ' > + ~ */
+};
+
+struct sel_group {
+	struct sel_compound *parts;
+	int n;
+};
+
+struct sel_compiled {
+	struct sel_compiled *next;
+	char *text;
+	struct sel_group *groups;
+	int ngroups;		/**< -1: not one of ours */
+};
+
+#define SEL_CACHE_MAX 1024
+
+static void sel_free_compound(struct sel_compound *c)
+{
+	int i;
+
+	free(c->tag);
+	free(c->id);
+	for (i = 0; i < c->nclasses; i++) free(c->classes[i]);
+	free(c->classes);
+	for (i = 0; i < c->nattrs; i++) {
+		if (c->attrs[i].name != NULL) dom_string_unref(c->attrs[i].name);
+		free(c->attrs[i].val);
+	}
+	free(c->attrs);
+}
+
+static void sel_free(struct sel_compiled *s)
+{
+	int g, i;
+
+	for (g = 0; g < s->ngroups; g++) {
+		for (i = 0; i < s->groups[g].n; i++) {
+			sel_free_compound(&s->groups[g].parts[i]);
+		}
+		free(s->groups[g].parts);
+	}
+	free(s->groups);
+	free(s->text);
+	free(s);
+}
+
+static void sel_cache_free(jsthread *thread)
+{
+	unsigned b;
+
+	for (b = 0; b < 128; b++) {
+		while (thread->sel_cache[b] != NULL) {
+			struct sel_compiled *next = thread->sel_cache[b]->next;
+
+			sel_free(thread->sel_cache[b]);
+			thread->sel_cache[b] = next;
+		}
+	}
+	thread->sel_cache_n = 0;
+}
+
+static bool sel_ident_char(char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
+static bool sel_ws(char c)
+{
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+}
+
+static char *sel_dup(const char *s, size_t n)
+{
+	char *d = malloc(n + 1);
+
+	if (d != NULL) {
+		memcpy(d, s, n);
+		d[n] = '\0';
+	}
+	return d;
+}
+
+/* An identifier run at *p; its length, 0 for none. */
+static size_t sel_ident(const char *p, const char *end)
+{
+	const char *q = p;
+
+	while (q < end && sel_ident_char(*q)) q++;
+	return (size_t)(q - p);
+}
+
+/*
+ * One compound, in the only order the prelude's SIMPLE_RE accepts:
+ * type? #id? .class* [attr]*. false for anything else.
+ */
+static bool sel_parse_compound(const char **pp, const char *end,
+			       struct sel_compound *c)
+{
+	const char *p = *pp;
+	size_t n;
+
+	if (p < end && *p == '*') {
+		p++;
+	} else if (p < end && ((*p >= 'a' && *p <= 'z') ||
+			       (*p >= 'A' && *p <= 'Z'))) {
+		n = sel_ident(p, end);
+		c->tag = sel_dup(p, n);
+		if (c->tag == NULL) return false;
+		c->tag_len = n;
+		p += n;
+	}
+	if (p < end && *p == '#') {
+		n = sel_ident(p + 1, end);
+		if (n == 0) return false;
+		c->id = sel_dup(p + 1, n);
+		if (c->id == NULL) return false;
+		c->id_len = n;
+		p += 1 + n;
+	}
+	while (p < end && *p == '.') {
+		char **grown;
+
+		n = sel_ident(p + 1, end);
+		if (n == 0) return false;
+		grown = realloc(c->classes, (size_t)(c->nclasses + 1) *
+				sizeof(*grown));
+		if (grown == NULL) return false;
+		c->classes = grown;
+		c->classes[c->nclasses] = sel_dup(p + 1, n);
+		if (c->classes[c->nclasses] == NULL) return false;
+		c->nclasses++;
+		p += 1 + n;
+	}
+	while (p < end && *p == '[') {
+		struct sel_attr a, *grown;
+		const char *name;
+		size_t nlen;
+		char *nm;
+
+		memset(&a, 0, sizeof(a));
+		p++;
+		while (p < end && sel_ws(*p)) p++;
+		name = p;
+		nlen = sel_ident(p, end);
+		if (nlen == 0) return false;
+		p += nlen;
+		while (p < end && sel_ws(*p)) p++;
+		if (p >= end) return false;
+		if (*p == ']') {
+			a.op = SOP_EXISTS;
+		} else {
+			if (*p == '=') {
+				a.op = SOP_EQ;
+				p++;
+			} else if (p + 1 < end && p[1] == '=') {
+				switch (*p) {
+				case '~': a.op = SOP_INCL; break;
+				case '|': a.op = SOP_DASH; break;
+				case '^': a.op = SOP_PREFIX; break;
+				case '$': a.op = SOP_SUFFIX; break;
+				case '*': a.op = SOP_SUBSTR; break;
+				default: return false;
+				}
+				p += 2;
+			} else {
+				return false;
+			}
+			while (p < end && sel_ws(*p)) p++;
+			if (p < end && (*p == '"' || *p == '\'')) {
+				char q = *p++;
+				const char *v = p;
+
+				while (p < end && *p != q) {
+					if (*p == '\\' || *p == '"' ||
+					    *p == '\'' || *p == ']' ||
+					    *p == '\n')
+						return false;
+					p++;
+				}
+				if (p >= end || p == v) return false;
+				a.val = sel_dup(v, (size_t)(p - v));
+				a.vlen = (size_t)(p - v);
+				p++;
+			} else {
+				n = sel_ident(p, end);
+				if (n == 0) return false;
+				a.val = sel_dup(p, n);
+				a.vlen = n;
+				p += n;
+			}
+			if (a.val == NULL) return false;
+			/* the prelude's ~= reads spaces in the value its
+			 * own way; leave those to it */
+			if (a.op == SOP_INCL) {
+				size_t k;
+
+				for (k = 0; k < a.vlen; k++) {
+					if (sel_ws(a.val[k])) {
+						free(a.val);
+						return false;
+					}
+				}
+			}
+			while (p < end && sel_ws(*p)) p++;
+			if (p >= end || *p != ']') {
+				free(a.val);
+				return false;
+			}
+		}
+		p++;	/* ] */
+		nm = sel_dup(name, nlen);
+		if (nm == NULL) {
+			free(a.val);
+			return false;
+		}
+		a.name = to_dom_string(nm);
+		free(nm);
+		if (a.name == NULL) {
+			free(a.val);
+			return false;
+		}
+		grown = realloc(c->attrs, (size_t)(c->nattrs + 1) *
+				sizeof(*grown));
+		if (grown == NULL) {
+			dom_string_unref(a.name);
+			free(a.val);
+			return false;
+		}
+		c->attrs = grown;
+		c->attrs[c->nattrs++] = a;
+	}
+	/* a compound ends at white space, a combinator, a comma or the end */
+	if (p < end && !sel_ws(*p) && *p != '>' && *p != '+' && *p != '~' &&
+	    *p != ',') {
+		return false;
+	}
+	if (p == *pp) {
+		return false;	/* nothing at all */
+	}
+	*pp = p;
+	return true;
+}
+
+/* A selector list, or NULL when any part of it is not ours. */
+static struct sel_compiled *sel_parse(const char *text, size_t len)
+{
+	struct sel_compiled *s = calloc(1, sizeof(*s));
+	const char *p = text, *end = text + len;
+
+	if (s == NULL) return NULL;
+	for (;;) {
+		struct sel_group *gg;
+		struct sel_group *g;
+		char comb = 0;
+		bool need = true;	/* a compound must come next */
+
+		gg = realloc(s->groups, (size_t)(s->ngroups + 1) * sizeof(*gg));
+		if (gg == NULL) goto fail;
+		s->groups = gg;
+		g = &s->groups[s->ngroups++];
+		memset(g, 0, sizeof(*g));
+		while (p < end && sel_ws(*p)) p++;
+		for (;;) {
+			struct sel_compound *pa;
+			bool ws = false;
+
+			if (need) {
+				pa = realloc(g->parts, (size_t)(g->n + 1) *
+					     sizeof(*pa));
+				if (pa == NULL) goto fail;
+				g->parts = pa;
+				memset(&g->parts[g->n], 0, sizeof(*pa));
+				g->n++;
+				if (!sel_parse_compound(&p, end,
+							&g->parts[g->n - 1]))
+					goto fail;
+				g->parts[g->n - 1].comb = g->n == 1 ? 0 :
+					(comb != 0 ? comb : ' ');
+				need = false;
+				comb = 0;
+			}
+			while (p < end && sel_ws(*p)) {
+				p++;
+				ws = true;
+			}
+			if (p >= end || *p == ',') {
+				break;
+			}
+			if (*p == '>' || *p == '+' || *p == '~') {
+				comb = *p++;
+				while (p < end && sel_ws(*p)) p++;
+				if (p >= end || *p == ',' || *p == '>' ||
+				    *p == '+' || *p == '~')
+					goto fail;	/* dangling */
+				need = true;
+				continue;
+			}
+			if (!ws) goto fail;
+			need = true;	/* descendant */
+		}
+		if (p >= end) break;
+		p++;	/* , */
+		while (p < end && sel_ws(*p)) p++;
+		if (p >= end) goto fail;	/* trailing comma */
+	}
+	return s;
+fail:
+	sel_free(s);
+	return NULL;
+}
+
+static unsigned sel_bucket(const char *text, size_t len)
+{
+	unsigned h = 5381;
+	size_t i;
+
+	for (i = 0; i < len; i++) h = h * 33u + (unsigned char)text[i];
+	return h % 128u;
+}
+
+/* The compiled form of a selector, parsed once per page. */
+static struct sel_compiled *sel_get(jsthread *thread, const char *text,
+				    size_t len)
+{
+	unsigned b = sel_bucket(text, len);
+	struct sel_compiled *s;
+
+	for (s = thread->sel_cache[b]; s != NULL; s = s->next) {
+		if (strlen(s->text) == len && memcmp(s->text, text, len) == 0)
+			return s;
+	}
+	if (thread->sel_cache_n >= SEL_CACHE_MAX) {
+		sel_cache_free(thread);
+	}
+	s = len > 0 && memchr(text, '\0', len) == NULL ?
+		sel_parse(text, len) : NULL;
+	if (s == NULL) {
+		s = calloc(1, sizeof(*s));
+		if (s == NULL) return NULL;
+		s->ngroups = -1;
+	}
+	s->text = sel_dup(text, len);
+	if (s->text == NULL) {
+		sel_free(s);
+		return NULL;
+	}
+	s->next = thread->sel_cache[b];
+	thread->sel_cache[b] = s;
+	thread->sel_cache_n++;
+	return s;
+}
+
+static bool sel_is_element(struct dom_node *n)
+{
+	dom_node_type type = 0;
+
+	return n != NULL && dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		type == DOM_ELEMENT_NODE;
+}
+
+/* The prelude's matchSimple, for the parts this side handles. */
+static bool sel_match_compound(struct dom_node *n, const struct sel_compound *c)
+{
+	int i;
+
+	if (c->tag != NULL) {
+		dom_string *local = NULL;
+		bool hit;
+
+		dom_node_get_local_name(n, &local);
+		hit = tag_is(n, local, c->tag, c->tag_len);
+		if (local != NULL) dom_string_unref(local);
+		if (!hit) return false;
+	}
+	if (c->id != NULL) {
+		dom_string *v = NULL;
+		bool hit;
+
+		dom_element_get_attribute(n, corestring_dom_id, &v);
+		hit = dom_string_is(v, c->id, c->id_len);
+		if (v != NULL) dom_string_unref(v);
+		if (!hit) return false;
+	}
+	if (c->nclasses > 0) {
+		dom_string *v = NULL;
+		bool hit = true;
+
+		dom_element_get_attribute(n, corestring_dom_class, &v);
+		if (v == NULL) return false;
+		for (i = 0; i < c->nclasses && hit; i++) {
+			hit = class_present(dom_string_data(v),
+					    dom_string_byte_length(v),
+					    c->classes[i]);
+		}
+		dom_string_unref(v);
+		if (!hit) return false;
+	}
+	for (i = 0; i < c->nattrs; i++) {
+		const struct sel_attr *a = &c->attrs[i];
+		dom_string *v = NULL;
+		const char *d;
+		size_t dl;
+		bool hit = false;
+
+		dom_element_get_attribute(n, a->name, &v);
+		if (v == NULL) return false;
+		d = dom_string_data(v);
+		dl = dom_string_byte_length(v);
+		switch (a->op) {
+		case SOP_EXISTS:
+			hit = true;
+			break;
+		case SOP_EQ:
+			hit = dl == a->vlen && memcmp(d, a->val, dl) == 0;
+			break;
+		case SOP_PREFIX:
+			hit = dl >= a->vlen && memcmp(d, a->val, a->vlen) == 0;
+			break;
+		case SOP_SUFFIX:
+			hit = dl >= a->vlen &&
+				memcmp(d + dl - a->vlen, a->val, a->vlen) == 0;
+			break;
+		case SOP_SUBSTR: {
+			size_t k;
+
+			for (k = 0; k + a->vlen <= dl && !hit; k++) {
+				hit = memcmp(d + k, a->val, a->vlen) == 0;
+			}
+			break;
+		}
+		case SOP_DASH:
+			hit = (dl == a->vlen && memcmp(d, a->val, dl) == 0) ||
+				(dl > a->vlen && memcmp(d, a->val, a->vlen) == 0
+				 && d[a->vlen] == '-');
+			break;
+		case SOP_INCL: {
+			/* (' '+v+' ').indexOf(' '+val+' '): a run of the
+			 * value between spaces or the ends */
+			size_t k;
+
+			for (k = 0; k + a->vlen <= dl && !hit; k++) {
+				if ((k == 0 || d[k - 1] == ' ') &&
+				    (k + a->vlen == dl || d[k + a->vlen] == ' ') &&
+				    memcmp(d + k, a->val, a->vlen) == 0)
+					hit = true;
+			}
+			break;
+		}
+		}
+		dom_string_unref(v);
+		if (!hit) return false;
+	}
+	return true;
+}
+
+static struct dom_node *sel_parent_element(struct dom_node *n)
+{
+	struct dom_node *up = NULL;
+
+	if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) return NULL;
+	if (up != NULL && !sel_is_element(up)) {
+		dom_node_unref(up);
+		return NULL;
+	}
+	return up;
+}
+
+static struct dom_node *sel_prev_element(struct dom_node *n)
+{
+	struct dom_node *p = NULL;
+
+	if (dom_node_get_previous_sibling(n, &p) != DOM_NO_ERR) return NULL;
+	while (p != NULL && !sel_is_element(p)) {
+		struct dom_node *q = NULL;
+
+		dom_node_get_previous_sibling(p, &q);
+		dom_node_unref(p);
+		p = q;
+	}
+	return p;
+}
+
+/* The prelude's matchAt: parts[0..i], parts[i] applying to n. */
+static bool sel_match_at(struct dom_node *n, const struct sel_group *g, int i)
+{
+	struct dom_node *m, *next;
+	bool hit = false;
+
+	if (!sel_match_compound(n, &g->parts[i])) return false;
+	if (i == 0) return true;
+	switch (g->parts[i].comb) {
+	case '>':
+		m = sel_parent_element(n);
+		if (m == NULL) return false;
+		hit = sel_match_at(m, g, i - 1);
+		dom_node_unref(m);
+		return hit;
+	case '+':
+		m = sel_prev_element(n);
+		if (m == NULL) return false;
+		hit = sel_match_at(m, g, i - 1);
+		dom_node_unref(m);
+		return hit;
+	case '~':
+		for (m = sel_prev_element(n); m != NULL && !hit; m = next) {
+			hit = sel_match_at(m, g, i - 1);
+			next = hit ? NULL : sel_prev_element(m);
+			dom_node_unref(m);
+		}
+		return hit;
+	default:
+		for (m = sel_parent_element(n); m != NULL && !hit; m = next) {
+			hit = sel_match_at(m, g, i - 1);
+			next = hit ? NULL : sel_parent_element(m);
+			dom_node_unref(m);
+		}
+		return hit;
+	}
+}
+
+static bool sel_matches(struct dom_node *n, const struct sel_compiled *s)
+{
+	int g;
+
+	if (!sel_is_element(n)) return false;
+	for (g = 0; g < s->ngroups; g++) {
+		if (sel_match_at(n, &s->groups[g], s->groups[g].n - 1))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * __vitaSelectorNative(kind, fallback): the native matches (0),
+ * querySelector (1), querySelectorAll (2) or closest (3), answering in C
+ * what it can and calling fallback with the same this and arguments for
+ * the rest.
+ */
+static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
+			  JSValueConst *argv, int magic, JSValue *data)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *root, *n = NULL;
+	struct sel_compiled *s = NULL;
+	const char *text;
+	size_t len;
+	JSValue out = JS_NULL;
+	uint32_t out_n = 0;
+
+	if (thread == NULL || argc < 1 || !JS_IsString(argv[0]) ||
+	    (root = JS_GetOpaque(this_val, node_class_id)) == NULL) {
+		return JS_Call(ctx, data[0], this_val, argc, argv);
+	}
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (text == NULL) return JS_EXCEPTION;
+	s = sel_get(thread, text, len);
+	JS_FreeCString(ctx, text);
+	if (s == NULL || s->ngroups < 0) {
+		return JS_Call(ctx, data[0], this_val, argc, argv);
+	}
+	vitasurf_js_sel_tag_fast++;
+	switch (magic) {
+	case 0:
+		vitasurf_js_sel_matches++;
+		return JS_NewBool(ctx, sel_matches(root, s));
+	case 3:
+		vitasurf_js_sel_closest++;
+		vitasurf_js_sel_closest_native++;
+		n = sel_is_element(root) ? dom_node_ref(root) : NULL;
+		while (n != NULL) {
+			struct dom_node *up;
+
+			vitasurf_js_sel_closest_steps++;
+			if (sel_matches(n, s)) {
+				out = wrap_node(ctx, n);
+				dom_node_unref(n);
+				return out;
+			}
+			up = sel_parent_element(n);
+			dom_node_unref(n);
+			n = up;
+		}
+		return JS_NULL;
+	default:
+		break;
+	}
+	if (magic == 2) {
+		vitasurf_js_sel_all++;
+		out = JS_NewArray(ctx);
+	} else {
+		vitasurf_js_sel_one++;
+	}
+	/* iterative pre-order walk; root itself is not a candidate */
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+
+		if (sel_is_element(n)) {
+			vitasurf_js_sel_tag_visits++;
+			if (sel_matches(n, s)) {
+				if (magic == 1) {
+					out = wrap_node(ctx, n);
+					dom_node_unref(n);
+					return out;
+				}
+				JS_SetPropertyUint32(ctx, out, out_n++,
+						     wrap_node(ctx, n));
+			}
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	return out;
+}
+
+static JSValue win_vita_selector_native(JSContext *ctx, JSValueConst this_val,
+					int argc, JSValueConst *argv)
+{
+	int32_t kind = 0;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsFunction(ctx, argv[1])) {
+		return argc >= 2 ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
+	}
+	JS_ToInt32(ctx, &kind, argv[0]);
+	if (kind < 0 || kind > 3) {
+		return JS_DupValue(ctx, argv[1]);
+	}
+	return JS_NewCFunctionData(ctx, sel_native, 1, kind, 1,
+				   (JSValueConst *)&argv[1]);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Geometry, scrolling and event dispatch                                   */
 
 static void set_index(JSContext *ctx, JSValue arr, int i, int v)
@@ -7253,6 +7959,9 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaMOUnwatch",
 			  JS_NewCFunction(ctx, win_vita_mo_unwatch,
 					  "__vitaMOUnwatch", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaSelectorNative",
+			  JS_NewCFunction(ctx, win_vita_selector_native,
+					  "__vitaSelectorNative", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaTagQuery",
 			  JS_NewCFunction(ctx, win_vita_tag_query,
 					  "__vitaTagQuery", 3));
@@ -9923,6 +10632,7 @@ static void js_free_deferred(jsthread *thread)
 	}
 	thread->deferred = NULL;
 	mod_deps_free(thread);
+	sel_cache_free(thread);
 	if (thread->deferred_scheduled) {
 		guit->misc->schedule(-1, module_retry_callback, thread);
 		thread->deferred_scheduled = false;
