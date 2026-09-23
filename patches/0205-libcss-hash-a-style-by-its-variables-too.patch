@@ -1,0 +1,60 @@
+diff --git a/src/select/arena.c b/src/select/arena.c
+index e9ff033..71b25c7 100644
+--- a/src/select/arena.c
++++ b/src/select/arena.c
+@@ -9,6 +9,8 @@
+ #include <string.h>
+ 
+ #include "select/arena.h"
++#include <stdint.h>
++
+ #include "select/arena_hash.h"
+ #include "select/computed.h"
+ 
+@@ -20,7 +22,17 @@ struct css_computed_style *table_s[TS_SIZE];
+ 
+ static inline uint32_t css__arena_hash_style(struct css_computed_style *s)
+ {
+-	return css__arena_hash((const uint8_t *) &s->i, sizeof(s->i));
++	uint32_t h = css__arena_hash((const uint8_t *) &s->i, sizeof(s->i));
++	/*
++	 * And which variables it carries (VitaSurf). Styles that differ
++	 * only there -- the children of different elements that declared
++	 * variables -- all hashed alike, and a GitHub page compared each
++	 * new style against 28 others, each comparison a memcmp of the
++	 * whole block before the pointer that told them apart.
++	 */
++	uint32_t c = (uint32_t) ((uintptr_t) s->custom >> 4);
++
++	return h ^ (c * 0x9e3779b1u);
+ }
+ 
+ 
+@@ -131,21 +143,22 @@ static inline bool css__arena_style_is_equal(
+ 		struct css_computed_style *a,
+ 		struct css_computed_style *b)
+ {
+-	if (memcmp(&a->i, &b->i, sizeof(struct css_computed_style_i)) != 0) {
+-		return false;
+-	}
+-
+ 	/*
+ 	 * Two elements given different variables are not the same style,
+ 	 * even where every computed value happens to agree, because a
+ 	 * child of one would inherit different values (VitaSurf). Most
+ 	 * elements declare none and simply hold their parent's map, so
+-	 * this is a pointer comparison nearly every time.
++	 * this is a pointer comparison nearly every time -- and so it
++	 * goes before the memcmp of the whole block.
+ 	 */
+ 	if (a->custom != b->custom) {
+ 		return false;
+ 	}
+ 
++	if (memcmp(&a->i, &b->i, sizeof(struct css_computed_style_i)) != 0) {
++		return false;
++	}
++
+ 	if (!arena__compare_string_list(
+ 			a->font_family,
+ 			b->font_family)) {
