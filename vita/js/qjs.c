@@ -308,6 +308,17 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	if (thread == NULL || thread->deadline_ms == 0) {
 		return 0;
 	}
+	/*
+	 * Circle, pressed over the busy overlay, stops the script the same
+	 * way the budget does (VitaSurf): the screen had stayed as it was
+	 * for as long as the page's script cared to run.
+	 */
+	if (vita_busy_take_cancel()) {
+		vita_log("qjs: Circle stopped the running script: %s",
+			 thread->current_script != NULL ?
+			 thread->current_script : "?");
+		thread->deadline_ms = 1;
+	}
 	if (now_ms() > thread->deadline_ms) {
 		uint64_t now = now_ms();
 

@@ -115,6 +115,14 @@ void vita_log_flush(void);
 /** Microseconds since the process started, for measuring a frame. */
 unsigned long long vita_now_us(void);
 
+/**
+ * Whether Circle was pressed to stop the running script, clearing the
+ * request. The surface's busy overlay (vita/surface/vita.c) sets it from
+ * its own thread while the page has not given the screen back; the
+ * script engine's interrupt check asks here.
+ */
+bool vita_busy_take_cancel(void);
+
 /** Log free user, CDRAM and physically contiguous memory. */
 void vita_log_memory(const char *what);
 

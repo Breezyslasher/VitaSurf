@@ -32,6 +32,7 @@
 
 #include <psp2/ctrl.h>
 #include <psp2/gxm.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/touch.h>
@@ -102,6 +103,19 @@
 
 #define EVENT_QUEUE_LEN  64
 
+/*
+ * The busy overlay. When the main thread has not come back to the input
+ * loop for BUSY_AFTER_US -- a script, a layout or a style pass running
+ * long -- a thread on another core puts the last picture of the page
+ * back up every BUSY_FRAME_US with a spinner over it, and reads Circle
+ * as a request to stop the running script.
+ */
+#define BUSY_AFTER_US    400000
+#define BUSY_FRAME_US    50000
+#define BUSY_STACK_SIZE  (32 * 1024)
+/* a little ahead of the main thread (0x10000100), should they share */
+#define BUSY_PRIORITY    (0x10000100 - 10)
+
 /* Claims and updates logged when verbose, before going quiet. */
 #define DIAG_BOXES       200
 
@@ -154,12 +168,48 @@ struct vita_surface {
 	bool focus_valid;
 	nsfb_bbox_t focus;
 
+	/*
+	 * The busy overlay (see BUSY_AFTER_US). gpu_lock is held by
+	 * whichever thread is using the GPU or writing the texture; the
+	 * overlay thread only ever tries for it, so it never holds the
+	 * page up. beat_us is when the main thread last came round the
+	 * input loop.
+	 */
+	SceUID gpu_lock;
+	SceUID busy_thread;
+	volatile uint32_t beat_ms;    /**< 32 bits: read whole on ARMv7 */
+	volatile bool busy_quit;
+	volatile bool busy_shown;     /**< the overlay is on screen */
+	volatile bool swallow_circle; /**< Circle was the overlay's */
+	volatile unsigned int busy_frames;
+	volatile unsigned int busy_cancels;
+	uint32_t busy_seen_frames;    /**< main thread: frames already told */
+	vita2d_texture *busy_label;
+
 	/* diagnostics: claim and update boxes are logged only when the
 	 * verbose flag file exists, and only the first DIAG_BOXES of each */
 	bool verbose;
 	unsigned int updates;
 	unsigned int claims;
 };
+
+/* Set by the overlay thread when Circle asks for the script to stop. */
+static volatile int busy_cancel;
+
+/* exported interface documented in vita_platform.h */
+bool vita_busy_take_cancel(void)
+{
+	if (busy_cancel == 0) {
+		return false;
+	}
+	busy_cancel = 0;
+	return true;
+}
+
+static uint32_t now_ms32(void)
+{
+	return (uint32_t)(sceKernelGetProcessTimeWide() / 1000);
+}
 
 /* ------------------------------------------------------------------------ */
 /* Event queue                                                              */
@@ -280,6 +330,13 @@ static void poll_buttons(struct vita_surface *vs, SceUInt64 now_us)
 	memset(&pad, 0, sizeof(pad));
 	if (sceCtrlPeekBufferPositive(0, &pad, 1) < 0) {
 		return;
+	}
+	/* a Circle press that stopped a script is not also a keypress */
+	if (vs->swallow_circle) {
+		if ((pad.buttons & SCE_CTRL_CIRCLE) == 0) {
+			vs->swallow_circle = false;
+		}
+		pad.buttons &= ~(unsigned int)SCE_CTRL_CIRCLE;
 	}
 
 	elapsed_us = (int)(now_us - vs->last_poll_us);
@@ -470,6 +527,21 @@ static void draw_focus_overlay(struct vita_surface *vs, const nsfb_bbox_t *area)
 	}
 }
 
+/* The GPU and the texture, between the main thread and the overlay. */
+static void gpu_lock(struct vita_surface *vs)
+{
+	if (vs->gpu_lock >= 0) {
+		sceKernelLockMutex(vs->gpu_lock, 1, NULL);
+	}
+}
+
+static void gpu_unlock(struct vita_surface *vs)
+{
+	if (vs->gpu_lock >= 0) {
+		sceKernelUnlockMutex(vs->gpu_lock, 1);
+	}
+}
+
 /**
  * Wait for the GPU to finish with the texture, if it has not already.
  *
@@ -565,6 +637,7 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 		vita_log("surface: further updates not logged");
 	}
 
+	gpu_lock(vs);
 	/* the GPU may still be reading what is about to be overwritten */
 	gpu_release_texture(vs);
 
@@ -580,6 +653,7 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 		draw_focus_overlay(vs, &area);
 	}
 	vs->dirty = true;
+	gpu_unlock(vs);
 }
 
 /**
@@ -601,10 +675,12 @@ static bool present(struct vita_surface *vs)
 		return false;
 	}
 	now = sceKernelGetProcessTimeWide();
+	vs->beat_ms = (uint32_t)(now / 1000);
 	if (!vs->dirty && !vs->dialog &&
 	    now - vs->last_present_us < FRAME_INTERVAL_US) {
 		return false;
 	}
+	gpu_lock(vs);
 	vita2d_start_drawing();
 	vita2d_draw_texture(vs->tex, 0.0f, 0.0f);
 	vita2d_end_drawing();
@@ -615,10 +691,261 @@ static bool present(struct vita_surface *vs)
 	/* the GPU now reads the texture; the next write waits, not this */
 	vs->gpu_reading = true;
 	vs->dirty = false;
+	vs->busy_shown = false;
 	vs->presents++;
 	vs->last_present_us = sceKernelGetProcessTimeWide();
+	gpu_unlock(vs);
 
 	return true;
+}
+
+
+/* ------------------------------------------------------------------------ */
+/* Busy overlay                                                             */
+
+/*
+ * A page that runs a script for twenty seconds used to leave the screen
+ * exactly as it was, with nothing moving and nothing to press: the main
+ * thread runs NetSurf, its scripts and its input in turn, and was in the
+ * script. This thread sits on another core and watches for the main
+ * thread not coming back round the input loop. When it has been away
+ * BUSY_AFTER_US, the thread puts the page's last picture up again with a
+ * spinner and a label over it, drawn by the GPU on top of the texture so
+ * nothing needs cleaning up afterwards: the main thread's next present
+ * draws the texture alone. Circle then asks the running script to stop,
+ * through the same interrupt check that enforces the time budget.
+ *
+ * The overlay only ever tries for the GPU lock, so the page never waits
+ * on it, and it touches nothing of NetSurf's. It does not log: the log
+ * is the main thread's, which says what happened once it is back.
+ */
+
+/* 5x7 glyphs for the label, a bit per pixel, top row first, MSB left */
+static const struct {
+	char c;
+	uint8_t rows[7];
+} busy_glyphs[] = {
+	{ 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A } },
+	{ 'O', { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+	{ 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 } },
+	{ 'K', { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 } },
+	{ 'I', { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+	{ 'N', { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 } },
+	{ 'G', { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F } },
+	{ 'S', { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E } },
+	{ 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+	{ 'P', { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 } },
+	{ 'C', { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E } },
+	{ '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C } },
+};
+
+/* The label, and where the circle symbol goes in it (glyph cells). */
+static const char busy_text[] = "WORKING.   STOP SCRIPT";
+#define BUSY_CIRCLE_CELL 10
+#define BUSY_SCALE       2
+#define BUSY_CELL        (6 * BUSY_SCALE)
+#define BUSY_LABEL_W     ((int)(sizeof(busy_text) - 1) * BUSY_CELL)
+#define BUSY_LABEL_H     (7 * BUSY_SCALE)
+
+/** Render the label into a texture once, white on clear. */
+static vita2d_texture *busy_make_label(void)
+{
+	vita2d_texture *t = vita2d_create_empty_texture_format(
+		BUSY_LABEL_W, BUSY_LABEL_H, SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+	uint32_t *px;
+	int stride, i;
+
+	if (t == NULL) {
+		return NULL;
+	}
+	px = vita2d_texture_get_datap(t);
+	stride = (int)vita2d_texture_get_stride(t) / 4;
+	memset(px, 0, (size_t)stride * BUSY_LABEL_H * 4);
+	for (i = 0; busy_text[i] != '\0'; i++) {
+		unsigned int g;
+
+		for (g = 0; g < sizeof(busy_glyphs) / sizeof(busy_glyphs[0]);
+		     g++) {
+			int row, col;
+
+			if (busy_glyphs[g].c != busy_text[i]) {
+				continue;
+			}
+			for (row = 0; row < 7 * BUSY_SCALE; row++) {
+				uint8_t bits = busy_glyphs[g].rows[row /
+								   BUSY_SCALE];
+
+				for (col = 0; col < 5 * BUSY_SCALE; col++) {
+					if (bits & (0x10 >> (col / BUSY_SCALE))) {
+						px[row * stride + i * BUSY_CELL +
+						   col] = 0xFFFFFFFFu;
+					}
+				}
+			}
+			break;
+		}
+	}
+	return t;
+}
+
+/** One frame of the overlay: the page as it was, and the panel. */
+static void busy_draw(struct vita_surface *vs, uint32_t t_ms)
+{
+	const float pw = (float)(BUSY_LABEL_W + 64), ph = 44.0f;
+	const float px = (float)SCREEN_WIDTH - pw - 12.0f;
+	const float py = (float)SCREEN_HEIGHT - ph - 30.0f;
+	int i, lit = (int)((t_ms / 100u) % 8u);
+
+	vita2d_start_drawing();
+	vita2d_draw_texture(vs->tex, 0.0f, 0.0f);
+	vita2d_draw_rectangle(px, py, pw, ph, 0xD0202020u);
+	/* spinner: eight dots, one bright, going round */
+	for (i = 0; i < 8; i++) {
+		static const float dx[8] = { 0, 7, 10, 7, 0, -7, -10, -7 };
+		static const float dy[8] = { -10, -7, 0, 7, 10, 7, 0, -7 };
+		int age = (lit - i + 8) % 8;
+		unsigned int a = age == 0 ? 0xFF : age < 3 ? 0xA0 : 0x50;
+
+		vita2d_draw_fill_circle(px + 24.0f + dx[i], py + ph / 2 + dy[i],
+					2.5f, (a << 24) | 0x00FFFFFFu);
+	}
+	if (vs->busy_label != NULL) {
+		float lx = px + 46.0f, ly = py + (ph - BUSY_LABEL_H) / 2;
+		float cx = lx + (float)(BUSY_CIRCLE_CELL * BUSY_CELL) + 5.0f;
+
+		vita2d_draw_texture(vs->busy_label, lx, ly);
+		/* the Circle button's symbol, in its colour */
+		vita2d_draw_fill_circle(cx, ly + BUSY_LABEL_H / 2, 8.0f,
+					0xFF4040E0u);
+		vita2d_draw_fill_circle(cx, ly + BUSY_LABEL_H / 2, 5.5f,
+					0xFF202020u);
+	}
+	vita2d_end_drawing();
+	vita2d_swap_buffers();
+}
+
+static int busy_thread_main(SceSize args, void *argp)
+{
+	struct vita_surface *vs = *(struct vita_surface **)argp;
+	bool circle_was = true;	/* a press must start while we watch */
+
+	(void)args;
+	while (!vs->busy_quit) {
+		uint32_t now = now_ms32();
+		uint32_t away = now - vs->beat_ms;
+
+		if (away < BUSY_AFTER_US / 1000 || vs->dialog ||
+		    vs->hold_progress || vs->tex == NULL) {
+			circle_was = true;
+			sceKernelDelayThread(BUSY_FRAME_US);
+			continue;
+		}
+		{
+			SceCtrlData pad;
+			bool circle;
+
+			memset(&pad, 0, sizeof(pad));
+			sceCtrlPeekBufferPositive(0, &pad, 1);
+			circle = (pad.buttons & SCE_CTRL_CIRCLE) != 0;
+			if (circle && !circle_was) {
+				busy_cancel = 1;
+				vs->swallow_circle = true;
+				vs->busy_cancels++;
+			}
+			circle_was = circle;
+		}
+		if (sceKernelTryLockMutex(vs->gpu_lock, 1) >= 0) {
+			/* the main thread may have come back meanwhile */
+			if (now_ms32() - vs->beat_ms >= BUSY_AFTER_US / 1000) {
+				busy_draw(vs, now);
+				vs->gpu_reading = true;
+				vs->busy_shown = true;
+				vs->busy_frames++;
+			}
+			sceKernelUnlockMutex(vs->gpu_lock, 1);
+		}
+		sceKernelDelayThread(BUSY_FRAME_US);
+	}
+	return sceKernelExitDeleteThread(0);
+}
+
+/**
+ * On the main thread, back in the input loop: forget a stale stop
+ * request, have the page redrawn over the overlay, and say what the
+ * overlay did while it was away.
+ */
+static void busy_resumed(struct vita_surface *vs)
+{
+	unsigned int frames = vs->busy_frames;
+
+	busy_cancel = 0;
+	if (vs->busy_shown) {
+		vs->dirty = true;	/* the next present covers the panel */
+	}
+	if (frames != vs->busy_seen_frames) {
+		vita_log("surface: the page held the screen; the busy overlay "
+			 "put up %u frames and Circle stopped %u scripts so far",
+			 frames - vs->busy_seen_frames,
+			 (unsigned int)vs->busy_cancels);
+		vs->busy_seen_frames = frames;
+	}
+}
+
+static void busy_start(struct vita_surface *vs)
+{
+	static struct vita_surface *arg;
+	int ret;
+
+	vs->gpu_lock = sceKernelCreateMutex("vitasurf_gpu",
+					    SCE_KERNEL_MUTEX_ATTR_RECURSIVE, 0,
+					    NULL);
+	if (vs->gpu_lock < 0) {
+		vita_log("surface: no GPU lock (0x%08x), so no busy overlay",
+			 (unsigned int)vs->gpu_lock);
+		return;
+	}
+	vs->busy_label = busy_make_label();
+	vs->beat_ms = now_ms32();
+	arg = vs;
+	/* its own core, and ahead of the main thread if they ever share */
+	vs->busy_thread = sceKernelCreateThread("vitasurf_busy",
+		busy_thread_main, BUSY_PRIORITY,
+		BUSY_STACK_SIZE, 0, SCE_KERNEL_CPU_MASK_USER_2, NULL);
+	if (vs->busy_thread < 0) {
+		vita_log("surface: busy overlay thread not created (0x%08x)",
+			 (unsigned int)vs->busy_thread);
+		return;
+	}
+	ret = sceKernelStartThread(vs->busy_thread, sizeof(arg), &arg);
+	if (ret < 0) {
+		vita_log("surface: busy overlay thread not started (0x%08x)",
+			 (unsigned int)ret);
+		sceKernelDeleteThread(vs->busy_thread);
+		vs->busy_thread = -1;
+		return;
+	}
+	vita_log("surface: busy overlay after %u ms away, on core 2, "
+		 "%u KB stack", (unsigned int)(BUSY_AFTER_US / 1000),
+		 (unsigned int)(BUSY_STACK_SIZE / 1024));
+}
+
+static void busy_stop(struct vita_surface *vs)
+{
+	if (vs->busy_thread >= 0) {
+		SceUInt timeout = 500000;
+
+		vs->busy_quit = true;
+		sceKernelWaitThreadEnd(vs->busy_thread, NULL, &timeout);
+		vs->busy_thread = -1;
+	}
+	if (vs->busy_label != NULL) {
+		vita2d_free_texture(vs->busy_label);
+		vs->busy_label = NULL;
+	}
+	if (vs->gpu_lock >= 0) {
+		sceKernelDeleteMutex(vs->gpu_lock);
+		vs->gpu_lock = -1;
+	}
 }
 
 /* exported interface documented in vita_surface.h */
@@ -710,6 +1037,8 @@ static int vita_initialise(nsfb_t *nsfb)
 	if (vs == NULL) {
 		return -1;
 	}
+	vs->gpu_lock = -1;
+	vs->busy_thread = -1;
 
 	/* GPU: libvita2d owns the display, the page lives in a texture */
 	ret = vita2d_init();
@@ -759,6 +1088,8 @@ static int vita_initialise(nsfb_t *nsfb)
 	vs->dirty = true;
 	present(vs);
 
+	busy_start(vs);
+
 	vita_log("surface: %dx%d, screen texture %u KB, stride %d px",
 		 SCREEN_WIDTH, SCREEN_HEIGHT, (unsigned int)size / 1024, vs->stride);
 
@@ -775,6 +1106,7 @@ static int vita_finalise(nsfb_t *nsfb)
 
 	sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT,
 				 SCE_TOUCH_SAMPLING_STATE_STOP);
+	busy_stop(vs);
 
 	free(nsfb->ptr);
 	nsfb->ptr = NULL;
@@ -886,10 +1218,12 @@ static bool vita_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
 			(SceUInt64)timeout * 1000;
 	}
 
+	busy_resumed(vs);
 	for (;;) {
 		SceUInt64 now_us;
 		SceUInt delay_us = POLL_INTERVAL_US;
 
+		vs->beat_ms = now_ms32();
 		poll_input(vs);
 		present(vs);
 
@@ -948,6 +1282,10 @@ static int vita_update(nsfb_t *nsfb, nsfb_bbox_t *box)
 
 	if ((cursor != NULL) && (cursor->plotted == false)) {
 		nsfb_cursor_plot(nsfb, cursor);
+	}
+	/* a redraw puts up its own progress: not a stall */
+	if (vs != NULL) {
+		vs->beat_ms = now_ms32();
 	}
 
 	blit_box(nsfb, box);
