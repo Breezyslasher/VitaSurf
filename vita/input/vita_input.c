@@ -1415,6 +1415,15 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					vitasurf_js_selector_hits,
 				 vitasurf_js_selector_compiles,
 				 vitasurf_js_selector_hits);
+			vita_log("page: by call, querySelectorAll %u, "
+				 "querySelector %u, matches %u, closest %u "
+				 "(%u of them a bare tag walked in C) over "
+				 "%u ancestors",
+				 vitasurf_js_sel_all, vitasurf_js_sel_one,
+				 vitasurf_js_sel_matches,
+				 vitasurf_js_sel_closest,
+				 vitasurf_js_sel_closest_native,
+				 vitasurf_js_sel_closest_steps);
 			vita_log("page: boxes and styles %u ms covered %u "
 				 "elements, %u ms of it selecting their "
 				 "styles and %u ms parsing the style "

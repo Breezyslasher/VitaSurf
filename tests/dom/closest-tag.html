@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<!-- closest() with one bare tag is walked in C; every other selector,
+     and a detached subtree, keep the JavaScript walk. Both must agree. -->
+<html><head><title>closest tag</title></head><body>
+<details id="det"><summary><span id="s"><b id="b">x</b></span></summary></details>
+<svg id="svg"><g id="g"><foreignObject id="fo"><div id="inner"></div></foreignObject></g></svg>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var b=document.getElementById('b');
+ok("closest('details') finds the ancestor", b.closest('details')===document.getElementById('det'));
+ok("closest('DETAILS') is case insensitive for HTML", b.closest('DETAILS')===document.getElementById('det'));
+ok("closest('b') is the element itself", b.closest('b')===b);
+ok("closest('table') is null", b.closest('table')===null);
+ok("closest('html') reaches the root", b.closest('html')===document.documentElement);
+ok("closest('span b') keeps the JS walk", b.closest('span b')===b);
+ok("closest('summary.x') is null", b.closest('summary.x')===null);
+ok("closest('*') is the element", b.closest('*')===b);
+var inner=document.getElementById('inner');
+ok("closest('g') finds the svg g", inner.closest('g')===document.getElementById('g'));
+ok("closest('foreignObject') matches the case as written", inner.closest('foreignObject')===document.getElementById('fo'));
+ok("closest('foreignobject') does not match an svg element", inner.closest('foreignobject')===null);
+var d=document.createElement('section'),p=document.createElement('p');
+d.appendChild(p);
+ok("a detached subtree still finds its ancestor", p.closest('section')===d);
+ok("closest on the same element twice gives the same wrapper", b.closest('details')===b.closest('details'));
+ok("matches still works", b.matches('summary b')&&!b.matches('i'));
+</script></body></html>

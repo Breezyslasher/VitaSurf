@@ -760,6 +760,16 @@ struct find_key {
 	char *id;         /**< id attribute to match, or NULL */
 	char **classes;   /**< class names that must all be present */
 	int nclasses;
+	/*
+	 * Attribute names that must be present (VitaSurf). A selector of
+	 * nothing but [data-action] used to hand JavaScript every element
+	 * under the root to test one by one, and GitHub's component
+	 * framework asks exactly that of every element it binds. Only a
+	 * necessary condition: the prelude still checks the value.
+	 */
+	dom_string **attrs;
+	dom_string **attrs_lc;	/* the same, lower cased, or NULL */
+	int nattrs;
 };
 
 static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
@@ -1008,6 +1018,57 @@ static JSValue target_snapshot(JSContext *ctx, struct dom_node *node)
 		return JS_UNDEFINED;
 	}
 	return children_snapshot(ctx, node);
+}
+
+
+/*
+ * __vitaConnected(node): whether a node is in this page's document
+ * (VitaSurf). The prelude's inDocument climbed parentNode in JavaScript,
+ * a crossing into C and a wrapper per ancestor, on every querySelector
+ * call; GitHub's component framework makes 160,000 of those binding what
+ * it finds, and a build 419 log has one timer spend 20 s there.
+ */
+static JSValue win_vita_connected(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *n, *doc;
+
+	(void)this_val;
+	if (thread == NULL || argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_FALSE;
+	}
+	doc = (struct dom_node *) thread_document(thread);
+	n = JS_GetOpaque(argv[0], node_class_id);
+	if (n == NULL) {
+		/* the document object is not a node wrapper */
+		JSValue global = JS_GetGlobalObject(ctx);
+		JSValue d = JS_GetPropertyStr(ctx, global, "document");
+		bool same = JS_IsObject(d) &&
+			JS_VALUE_GET_PTR(d) == JS_VALUE_GET_PTR(argv[0]);
+
+		JS_FreeValue(ctx, d);
+		JS_FreeValue(ctx, global);
+		return JS_NewBool(ctx, same && doc != NULL);
+	}
+	if (doc == NULL) {
+		return JS_FALSE;
+	}
+	dom_node_ref(n);
+	while (n != NULL) {
+		struct dom_node *up = NULL;
+
+		if (n == doc) {
+			dom_node_unref(n);
+			return JS_TRUE;
+		}
+		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(n);
+		n = up;
+	}
+	return JS_FALSE;
 }
 
 /* __vitaMOWatch(id, node, flags, filter): register one watch entry */
@@ -2241,18 +2302,120 @@ static void clone_was_slow(struct dom_node *node, struct dom_node *copy,
 static JSValue win_vita_selector(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
-	int hit = 0;
+	int kind = 0, steps = 0;
 
 	(void)this_val;
 	if (argc >= 1) {
-		JS_ToInt32(ctx, &hit, argv[0]);
+		JS_ToInt32(ctx, &kind, argv[0]);
 	}
-	if (hit) {
-		vitasurf_js_selector_hits++;
-	} else {
-		vitasurf_js_selector_compiles++;
+	if (argc >= 2) {
+		JS_ToInt32(ctx, &steps, argv[1]);
+	}
+	/* 0 parsed, 1 from the cache, then one per API: the page
+	 * report says which call a page leans on */
+	switch (kind) {
+	case 0: vitasurf_js_selector_compiles++; break;
+	case 1: vitasurf_js_selector_hits++; break;
+	case 2: vitasurf_js_sel_all++; break;
+	case 3: vitasurf_js_sel_one++; break;
+	case 4: vitasurf_js_sel_matches++; break;
+	case 5:
+		vitasurf_js_sel_closest++;
+		if (steps > 0) {
+			vitasurf_js_sel_closest_steps += (unsigned int)steps;
+		}
+		break;
+	default: break;
 	}
 	return JS_UNDEFINED;
+}
+
+/** Whether a dom_string holds exactly len bytes of s. */
+static bool dom_string_is(dom_string *d, const char *s, size_t len)
+{
+	return d != NULL && dom_string_byte_length(d) == len &&
+		memcmp(dom_string_data(d), s, len) == 0;
+}
+
+/*
+ * __vitaClosestTag(node, tag, tagUpper): closest() for a selector that
+ * is one bare tag name (VitaSurf). GitHub's component framework asks
+ * closest(tagName) of every element it binds; in JavaScript that was a
+ * wrapper and a matches() call per ancestor. The test is the prelude's
+ * matchSimple: tagUpper for an element in the HTML namespace or none,
+ * tag as written for any other.
+ */
+static JSValue win_vita_closest_tag(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	static const char html_ns[] = "http://www.w3.org/1999/xhtml";
+	struct dom_node *n;
+	const char *tag, *upper;
+	size_t tag_len, upper_len;
+	JSValue result = JS_NULL;
+	unsigned int steps = 0;
+
+	(void)this_val;
+	if (argc < 3 || !JS_IsObject(argv[0])) {
+		return JS_NULL;
+	}
+	n = JS_GetOpaque(argv[0], node_class_id);
+	if (n == NULL) {
+		return JS_NULL;
+	}
+	tag = JS_ToCStringLen(ctx, &tag_len, argv[1]);
+	if (tag == NULL) {
+		return JS_EXCEPTION;
+	}
+	upper = JS_ToCStringLen(ctx, &upper_len, argv[2]);
+	if (upper == NULL) {
+		JS_FreeCString(ctx, tag);
+		return JS_EXCEPTION;
+	}
+	vitasurf_js_sel_closest++;
+	vitasurf_js_sel_closest_native++;
+	dom_node_ref(n);
+	while (n != NULL) {
+		dom_node_type type = 0;
+		struct dom_node *up = NULL;
+
+		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+		    type != DOM_ELEMENT_NODE) {
+			break;
+		}
+		steps++;
+		{
+			dom_string *name = NULL, *ns = NULL;
+			bool html, hit;
+
+			dom_node_get_namespace(n, &ns);
+			html = ns == NULL ||
+				dom_string_is(ns, html_ns, sizeof(html_ns) - 1);
+			if (dom_element_get_tag_name(n, &name) != DOM_NO_ERR) {
+				name = NULL;
+			}
+			hit = html ? dom_string_is(name, upper, upper_len)
+				: dom_string_is(name, tag, tag_len);
+			if (name != NULL) dom_string_unref(name);
+			if (ns != NULL) dom_string_unref(ns);
+			if (hit) {
+				result = wrap_node(ctx, n);
+				break;
+			}
+		}
+		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(n);
+		n = up;
+	}
+	if (n != NULL) {
+		dom_node_unref(n);
+	}
+	vitasurf_js_sel_closest_steps += steps;
+	JS_FreeCString(ctx, upper);
+	JS_FreeCString(ctx, tag);
+	return result;
 }
 
 static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
@@ -5263,6 +5426,14 @@ static void free_keys(struct find_key *keys, int n)
 			free(keys[i].classes[j]);
 		}
 		free(keys[i].classes);
+		for (j = 0; j < keys[i].nattrs; j++) {
+			if (keys[i].attrs[j] != NULL)
+				dom_string_unref(keys[i].attrs[j]);
+			if (keys[i].attrs_lc[j] != NULL)
+				dom_string_unref(keys[i].attrs_lc[j]);
+		}
+		free(keys[i].attrs);
+		free(keys[i].attrs_lc);
 	}
 	free(keys);
 }
@@ -5329,6 +5500,48 @@ static struct find_key *build_keys(JSContext *ctx, JSValueConst arr, int *count)
 			}
 		}
 		JS_FreeValue(ctx, cls);
+		/* the attribute names the compound needs (VitaSurf) */
+		{
+			JSValue at = JS_GetPropertyStr(ctx, k, "attrs");
+			JSValue alen = JS_GetPropertyStr(ctx, at, "length");
+			uint32_t na = 0;
+
+			JS_ToUint32(ctx, &na, alen);
+			JS_FreeValue(ctx, alen);
+			if (na > 0 && na <= 16) {
+				keys[i].attrs = calloc(na, sizeof(dom_string *));
+				keys[i].attrs_lc = calloc(na, sizeof(dom_string *));
+			}
+			if (keys[i].attrs != NULL && keys[i].attrs_lc != NULL) {
+				for (j = 0; j < na; j++) {
+					JSValue av = JS_GetPropertyUint32(ctx, at, j);
+					char *nm = key_string(ctx, av, "name");
+
+					JS_FreeValue(ctx, av);
+					if (nm == NULL || nm[0] == '\0') {
+						free(nm);
+						continue;
+					}
+					keys[i].attrs[keys[i].nattrs] =
+						to_dom_string(nm);
+					{
+						char *c;
+
+						for (c = nm; *c; c++) {
+							if (*c >= 'A' && *c <= 'Z')
+								*c = (char) (*c + 32);
+						}
+					}
+					keys[i].attrs_lc[keys[i].nattrs] =
+						to_dom_string(nm);
+					free(nm);
+					if (keys[i].attrs[keys[i].nattrs] == NULL)
+						continue;
+					keys[i].nattrs++;
+				}
+			}
+			JS_FreeValue(ctx, at);
+		}
 		JS_FreeValue(ctx, k);
 	}
 	*count = (int)n;
@@ -5389,6 +5602,17 @@ static bool key_matches(struct dom_node *n, const struct find_key *k,
 		    !class_present(dom_string_data(cls),
 				   dom_string_byte_length(cls),
 				   k->classes[i])) {
+			return false;
+		}
+	}
+	for (i = 0; i < k->nattrs; i++) {
+		bool has = false;
+
+		dom_element_has_attribute(n, k->attrs[i], &has);
+		if (!has && k->attrs_lc[i] != NULL) {
+			dom_element_has_attribute(n, k->attrs_lc[i], &has);
+		}
+		if (!has) {
 			return false;
 		}
 	}
@@ -6777,12 +7001,18 @@ static void setup_globals(jsthread *thread)
 	/* layout geometry, scrolling and event dispatch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFind",
 			  JS_NewCFunction(ctx, win_vita_find, "__vitaFind", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaConnected",
+			  JS_NewCFunction(ctx, win_vita_connected,
+					  "__vitaConnected", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaMOWatch",
 			  JS_NewCFunction(ctx, win_vita_mo_watch,
 					  "__vitaMOWatch", 4));
 	JS_SetPropertyStr(ctx, global, "__vitaMOUnwatch",
 			  JS_NewCFunction(ctx, win_vita_mo_unwatch,
 					  "__vitaMOUnwatch", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaClosestTag",
+			  JS_NewCFunction(ctx, win_vita_closest_tag,
+					  "__vitaClosestTag", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaSelector",
 			  JS_NewCFunction(ctx, win_vita_selector,
 					  "__vitaSelector", 1));

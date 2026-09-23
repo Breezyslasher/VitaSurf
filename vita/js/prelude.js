@@ -432,6 +432,8 @@ function isInside(root,el){if(root.nodeType===9)return true;var n=el.parentNode;
 function isPageRoot(n){
  return n===D||(!!n&&n.nodeType===9&&n.documentElement===D.documentElement);}
 function inDocument(n){
+ /* in C: the climb crossed into C once per ancestor (VitaSurf) */
+ if(typeof __vitaConnected==='function')return __vitaConnected(n);
  while(n){
   if(n===D.documentElement)return true;
   if(n.nodeType===9)return isPageRoot(n);
@@ -459,10 +461,26 @@ function select(root,sel,all){
    if(matchAt(c,groups[g],groups[g].length-1)){out.push(c);break;}}
   if(!all&&out.length)return out;}
  return out;}
-P.querySelectorAll=function(sel){return select(this,sel,true);};
-P.querySelector=function(sel){var r=select(this,sel,false);return r.length?r[0]:null;};
-P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){var el=this;return compile(String(sel)).some(function(g){return matchAt(el,g,g.length-1);});};
-P.closest=function(sel){var n=this;while(n&&n.nodeType===1){if(n.matches(sel))return n;n=n.parentNode;}return null;};
+var selCount=typeof __vitaSelector==='function'?__vitaSelector:function(){};
+P.querySelectorAll=function(sel){selCount(2);return select(this,sel,true);};
+P.querySelector=function(sel){selCount(3);var r=select(this,sel,false);return r.length?r[0]:null;};
+function matchesAny(el,groups){
+ for(var g=0;g<groups.length;g++)if(matchAt(el,groups[g],groups[g].length-1))return true;
+ return false;}
+P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){selCount(4);return matchesAny(this,compile(String(sel)));};
+/* closest compiles once and walks up in place (VitaSurf); it called
+   matches per ancestor, a cache lookup and a crossing into C each. A
+   bare tag -- closest('details'), GitHub's components asking for their
+   own element -- is walked in C without a wrapper per ancestor. */
+P.closest=function(sel){
+ var groups=compile(String(sel)),n=this,steps=0;
+ if(groups.length===1&&groups[0].length===1&&typeof __vitaClosestTag==='function'){
+  var q=groups[0][0].sel;
+  if(q.tag&&q.tag!=='*'&&!q.id&&!q.classes.length&&!q.attrs.length&&!q.pseudos.length)
+   return __vitaClosestTag(this,q.tag,q.tagUpper);}
+ while(n&&n.nodeType===1){steps++;if(matchesAny(n,groups)){selCount(5,steps);return n;}n=n.parentNode;}
+ selCount(5,steps);
+ return null;};
 /* The rest of the modern node surface. Polyfills walk these names and
  * read a descriptor for each, so a missing one is not a shim gap to fill
  * later: it throws where the polyfill patches, and takes the page with
