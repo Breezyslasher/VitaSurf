@@ -196,6 +196,43 @@ struct vita_surface {
 /* Set by the overlay thread when Circle asks for the script to stop. */
 static volatile int busy_cancel;
 
+/* documented in vita_platform.h */
+const char *volatile vita_c_where;
+
+/*
+ * What the main thread was found in while it held the screen, sampled
+ * by the overlay thread each frame: the binding named in vita_c_where,
+ * or NULL for script or NetSurf's own work. Kept by the name's address,
+ * which is a constant string.
+ */
+#define BUSY_WHERE_SLOTS 12
+static struct {
+	const char *where;
+	unsigned int frames;
+} busy_where[BUSY_WHERE_SLOTS];
+static volatile unsigned int busy_where_other;
+
+static void busy_note_where(void)
+{
+	const char *w = vita_c_where;
+	int i;
+
+	for (i = 0; i < BUSY_WHERE_SLOTS; i++) {
+		if (busy_where[i].frames != 0 && busy_where[i].where == w) {
+			busy_where[i].frames++;
+			return;
+		}
+	}
+	for (i = 0; i < BUSY_WHERE_SLOTS; i++) {
+		if (busy_where[i].frames == 0) {
+			busy_where[i].where = w;
+			busy_where[i].frames = 1;
+			return;
+		}
+	}
+	busy_where_other++;
+}
+
 /* exported interface documented in vita_platform.h */
 bool vita_busy_take_cancel(void)
 {
@@ -860,6 +897,7 @@ static int busy_thread_main(SceSize args, void *argp)
 				busy_draw(vs, now);
 				vs->gpu_reading = true;
 				vs->busy_shown = true;
+				busy_note_where();
 				vs->busy_frames++;
 			}
 			sceKernelUnlockMutex(vs->gpu_lock, 1);
@@ -883,11 +921,38 @@ static void busy_resumed(struct vita_surface *vs)
 		vs->dirty = true;	/* the next present covers the panel */
 	}
 	if (frames != vs->busy_seen_frames) {
+		char line[400];
+		size_t at = 0;
+		unsigned int told = frames - vs->busy_seen_frames;
+		int i;
+
 		vita_log("surface: the page held the screen; the busy overlay "
 			 "put up %u frames and Circle stopped %u scripts so far",
-			 frames - vs->busy_seen_frames,
-			 (unsigned int)vs->busy_cancels);
+			 told, (unsigned int)vs->busy_cancels);
 		vs->busy_seen_frames = frames;
+		/* and what it was doing, when that took a second or more:
+		 * the overlay thread's samples, cleared as they are told */
+		line[0] = '\0';
+		for (i = 0; i < BUSY_WHERE_SLOTS; i++) {
+			int n;
+
+			if (busy_where[i].frames == 0) continue;
+			n = snprintf(line + at, sizeof(line) - at, "%s%s %u",
+				     at == 0 ? "" : ", ",
+				     busy_where[i].where != NULL ?
+				     busy_where[i].where :
+				     "script or NetSurf", busy_where[i].frames);
+			busy_where[i].frames = 0;
+			if (n > 0 && (size_t)n < sizeof(line) - at) {
+				at += (size_t)n;
+			}
+		}
+		if (told >= 20 && line[0] != '\0') {
+			vita_log("surface: frames by what it was in: %s%s",
+				 line, busy_where_other > 0 ?
+				 " (and more)" : "");
+		}
+		busy_where_other = 0;
 	}
 }
 

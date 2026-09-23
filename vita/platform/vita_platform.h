@@ -123,6 +123,14 @@ unsigned long long vita_now_us(void);
  */
 bool vita_busy_take_cancel(void);
 
+/**
+ * The script binding running now, by its C function name, or NULL when
+ * none is (VitaSurf). Set on entry to every binding in vita/js/qjs.c and
+ * cleared whenever script runs; the busy overlay reads it from its own
+ * thread to say what a stall was spent in. Defined in the surface.
+ */
+extern const char *volatile vita_c_where;
+
 /** Log free user, CDRAM and physically contiguous memory. */
 void vita_log_memory(const char *what);
 

@@ -136,6 +136,17 @@ struct js_wrapper {
 	struct js_wrapper *next;
 };
 
+/*
+ * The binding running now, for the profile (VitaSurf): every binding
+ * notes its own name on entry, one store, and the interrupt check clears
+ * it whenever script runs. Time the profile finds spent outside the
+ * interpreter is put down to the binding named here, or to a QuickJS
+ * built-in or a compile when none is.
+ */
+#define c_where vita_c_where
+#define C_WHERE const char *c_where_mark_ __attribute__((unused)) = \
+	(c_where = __func__)
+
 struct jsthread {
 	jsheap *heap;
 	JSContext *ctx;
@@ -444,7 +455,6 @@ static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
 {
 	char *st, key[300], f2[100];
 	const char *l2;
-	unsigned int i;
 
 	if (prof_busy) return;
 	prof_busy = true;
@@ -482,8 +492,11 @@ static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
 	}
 	free(st);
 	if (in_c) {
+		const char *w = c_where;
+
 		snprintf(key + strlen(key), sizeof(key) - strlen(key),
-			 " [after time in C]");
+			 " [after %s]", w != NULL ? w :
+			 "a built-in or a compile");
 	}
 	prof_add(key, weight);
 }
@@ -502,11 +515,13 @@ static void prof_tail(const char *what)
 		char key[160];
 		uint64_t slices = (t - prof_last_ms) / PROF_INTERVAL_MS;
 
-		snprintf(key, sizeof(key), "%s [in C, at its end]", what);
+		snprintf(key, sizeof(key), "%s [ended in %s]", what,
+			 c_where != NULL ? c_where : "a built-in or a compile");
 		prof_samples += slices > 600 ? 600u : (unsigned int)slices;
 		prof_add(key, slices > 600 ? 600u : (unsigned int)slices);
 	}
 	prof_last_ms = prof_last_call_ms = t;
+	c_where = NULL;
 }
 
 /* exported for the page report in vita/input/vita_input.c */
@@ -519,8 +534,8 @@ void vita_js_report_profile(void)
 		return;
 	}
 	vita_log("profile: %u slices of %u ms of script; where it was most "
-		 "often ([after time in C]: a binding or a compile ran just "
-		 "before this point):", prof_samples,
+		 "often ([after X]: binding X, or a built-in or a compile, ran "
+		 "long just before this point):", prof_samples,
 		 (unsigned int)PROF_INTERVAL_MS);
 	for (shown = 0; shown < 12; shown++) {
 		unsigned int i, best = 0;
@@ -574,6 +589,8 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 			prof_sample(thread->ctx, slices > 600 ? 600u :
 				    (unsigned int)slices, in_c);
 		}
+		/* script is running again: no binding is */
+		c_where = NULL;
 	}
 	if (vita_busy_take_cancel()) {
 		vita_log("qjs: Circle stopped the running script: %s",
@@ -1063,6 +1080,7 @@ static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_dom_gen(JSContext *ctx, JSValueConst this_val,
 				int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)this_val; (void)argc; (void)argv;
 	return JS_NewUint32(ctx, vita_dom_gen);
 }
@@ -1084,6 +1102,7 @@ static JSValue str_result(JSContext *ctx, dom_string *s)
 
 static JSValue node_get_node_name(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -1094,6 +1113,7 @@ static JSValue node_get_node_name(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_tag_name(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -1107,6 +1127,7 @@ static JSValue node_get_tag_name(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_node_type(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_node_type type = 0;
 
@@ -1117,6 +1138,7 @@ static JSValue node_get_node_type(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_text_content(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	vitasurf_js_text_reads++;
 	{ uint64_t y0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -1283,6 +1305,7 @@ static JSValue target_snapshot(JSContext *ctx, struct dom_node *node)
 static JSValue win_vita_connected(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *n, *doc;
 
@@ -1327,6 +1350,7 @@ static JSValue win_vita_connected(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_mo_watch(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node;
 	struct mo_watch *w;
@@ -1393,6 +1417,7 @@ static JSValue win_vita_mo_watch(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_mo_unwatch(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	uint32_t id = 0;
 	unsigned i;
@@ -1534,6 +1559,7 @@ static JSValue children_snapshot(JSContext *ctx, struct dom_node *node)
 static JSValue win_vita_watch_mutations(JSContext *ctx, JSValueConst this_val,
 					int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	(void)this_val;
@@ -1546,6 +1572,7 @@ static JSValue win_vita_watch_mutations(JSContext *ctx, JSValueConst this_val,
 static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 				     JSValueConst val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	/* textContent is a nullable string, so null and undefined both mean
 	 * "no text", which empties the node rather than writing "null". */
@@ -1632,6 +1659,7 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 static JSValue node_get_attr_prop(JSContext *ctx, JSValueConst this_val,
 				  const char *name)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	dom_string *key = to_dom_string(name);
 	dom_string *val = NULL;
@@ -1647,17 +1675,20 @@ static JSValue node_get_attr_prop(JSContext *ctx, JSValueConst this_val,
 
 static JSValue node_get_id(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	return node_get_attr_prop(ctx, this_val, "id");
 }
 
 static JSValue node_get_class_name(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	return node_get_attr_prop(ctx, this_val, "class");
 }
 
 static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 				  const char *name, JSValueConst val)
 {
+	C_WHERE;
 	vita_dom_gen++;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *s = JS_ToCString(ctx, val);
@@ -1693,17 +1724,20 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 
 static JSValue node_set_id(JSContext *ctx, JSValueConst this_val, JSValueConst v)
 {
+	C_WHERE;
 	return node_set_attr_prop(ctx, this_val, "id", v);
 }
 
 static JSValue node_set_class_name(JSContext *ctx, JSValueConst this_val,
 				   JSValueConst v)
 {
+	C_WHERE;
 	return node_set_attr_prop(ctx, this_val, "class", v);
 }
 
 static JSValue node_get_parent(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	vitasurf_js_tree_reads++;
 	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -1722,6 +1756,7 @@ static JSValue node_get_parent(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_first_child(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	vitasurf_js_tree_reads++;
 	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -1740,6 +1775,7 @@ static JSValue node_get_first_child(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_next_sibling(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	vitasurf_js_tree_reads++;
 	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -1758,6 +1794,7 @@ static JSValue node_get_next_sibling(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_last_child(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	vitasurf_js_tree_reads++;
 	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -1776,6 +1813,7 @@ static JSValue node_get_last_child(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	vitasurf_js_tree_reads++;
 	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -1802,6 +1840,7 @@ static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
  */
 static JSValue node_get_child_nodes(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue arr;
@@ -1834,6 +1873,7 @@ static JSValue node_get_child_nodes(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_node_value(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -1853,6 +1893,7 @@ static JSValue node_get_node_value(JSContext *ctx, JSValueConst this_val)
 static JSValue node_set_node_value(JSContext *ctx, JSValueConst this_val,
 				   JSValueConst val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_node_type type = DOM_ELEMENT_NODE;
 
@@ -1871,6 +1912,7 @@ static JSValue node_set_node_value(JSContext *ctx, JSValueConst this_val,
 static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	vitasurf_js_attr_gets++;
 	{ uint64_t g0 = now_ms();
 	struct dom_node *node = this_element(ctx, this_val);
@@ -1907,6 +1949,7 @@ static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
  */
 static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	struct dom_namednodemap *map = NULL;
 	JSValue arr = JS_NewArray(ctx);
@@ -1979,6 +2022,7 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	vitasurf_js_attr_sets++;
 	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_element(ctx, this_val);
@@ -2020,6 +2064,7 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 static JSValue node_has_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key;
@@ -2039,6 +2084,7 @@ static JSValue node_has_attribute(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key;
@@ -2107,6 +2153,7 @@ static dom_string *ns_arg(JSContext *ctx, JSValueConst v, const char **held)
 static JSValue node_get_attribute_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *nsheld = NULL, *local;
 	dom_string *ns, *key, *val = NULL;
@@ -2132,6 +2179,7 @@ static JSValue node_get_attribute_ns(JSContext *ctx, JSValueConst this_val,
 static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *nsheld = NULL, *qname, *value;
 	dom_string *ns, *key, *val;
@@ -2180,6 +2228,7 @@ static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
 static JSValue node_has_attribute_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *nsheld = NULL, *local;
 	dom_string *ns, *key;
@@ -2202,6 +2251,7 @@ static JSValue node_has_attribute_ns(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 					int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *nsheld = NULL, *local;
 	dom_string *ns, *key;
@@ -2258,6 +2308,7 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 /* A doctype's publicId and systemId, which libdom holds on the node. */
 static JSValue node_get_public_id(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 	dom_node_type t = DOM_ELEMENT_NODE;
@@ -2276,6 +2327,7 @@ static JSValue node_get_public_id(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_system_id(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 	dom_node_type t = DOM_ELEMENT_NODE;
@@ -2297,6 +2349,7 @@ static JSValue node_get_system_id(JSContext *ctx, JSValueConst this_val)
  * an element made with a prefix keeps it. */
 static JSValue node_get_local_name(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -2309,6 +2362,7 @@ static JSValue node_get_local_name(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_prefix(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -2321,6 +2375,7 @@ static JSValue node_get_prefix(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_namespace_uri(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -2334,6 +2389,7 @@ static JSValue node_get_namespace_uri(JSContext *ctx, JSValueConst this_val)
 static JSValue win_vita_create_in(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *host, *made = NULL;
 	struct dom_document *doc;
 	const char *name = NULL;
@@ -2397,6 +2453,7 @@ static JSValue win_vita_create_in(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_parse_document(JSContext *ctx, JSValueConst this_val,
 				       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	dom_hubbub_parser_params params;
 	dom_hubbub_parser *parser = NULL;
 	struct dom_document *doc = NULL;
@@ -2464,6 +2521,7 @@ static JSValue inserted_nodes(JSContext *ctx, struct dom_node *child,
 static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	vitasurf_js_dom_edits++;
 	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -2498,6 +2556,7 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *old, *ref = NULL;
 	JSValue added;
@@ -2554,6 +2613,7 @@ static void clone_was_slow(struct dom_node *node, struct dom_node *copy,
 static JSValue win_vita_selector(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	int kind = 0, steps = 0;
 
 	(void)this_val;
@@ -2649,6 +2709,7 @@ static bool tag_is(struct dom_node *n, dom_string *local,
 static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *root, *n = NULL;
 	const char *tag;
 	size_t tag_len;
@@ -2763,6 +2824,7 @@ static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_closest_tag(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	static const char html_ns[] = "http://www.w3.org/1999/xhtml";
 	struct dom_node *n;
 	const char *tag, *upper;
@@ -2836,6 +2898,7 @@ static JSValue win_vita_closest_tag(JSContext *ctx, JSValueConst this_val,
 static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	vitasurf_js_clones++;
 	{ uint64_t y0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -2866,6 +2929,7 @@ static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_val,
 					     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	const char *name;
 
@@ -2915,6 +2979,7 @@ static struct dom_document *thread_document(jsthread *thread);
 
 static JSValue node_get_owner_document(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = NULL;
@@ -2943,6 +3008,7 @@ static JSValue node_get_owner_document(JSContext *ctx, JSValueConst this_val)
 static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	vitasurf_js_dom_edits++;
 	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -2968,6 +3034,7 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	vitasurf_js_dom_edits++;
 	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
@@ -3164,6 +3231,7 @@ out:
 static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 				   JSValueConst val)
 {
+	C_WHERE;
 	vitasurf_js_html_sets++;
 	struct dom_node *node = this_node(ctx, this_val);
 	size_t len = 0;
@@ -3195,6 +3263,7 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 
 static JSValue node_get_inner_html(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	/* Serialising the DOM back to HTML is not implemented; report empty. */
 	(void)this_val;
 	return JS_NewString(ctx, "");
@@ -3578,6 +3647,7 @@ static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 static JSValue node_add_event_listener(JSContext *ctx, JSValueConst this_val,
 				       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	if (argc < 2) return JS_UNDEFINED;
 	return add_listener(ctx, this_node(ctx, this_val), argv[0], argv[1],
 			    argc > 2 ? argv[2] : JS_UNDEFINED);
@@ -3586,6 +3656,7 @@ static JSValue node_add_event_listener(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_event_listener(JSContext *ctx, JSValueConst this_val,
 					  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	if (argc < 2) return JS_UNDEFINED;
 	return remove_listener(ctx, this_node(ctx, this_val), argv[0], argv[1],
 			       argc > 2 ? argv[2] : JS_UNDEFINED);
@@ -3599,6 +3670,7 @@ static JSValue node_remove_event_listener(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_encoding(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *enc = NULL;
 
@@ -3611,6 +3683,7 @@ static JSValue win_vita_encoding(JSContext *ctx, JSValueConst this_val,
 
 static JSValue doc_get_ready_state(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	(void)this_val;
@@ -3621,6 +3694,7 @@ static JSValue doc_get_ready_state(JSContext *ctx, JSValueConst this_val)
 static JSValue doc_add_event_listener(JSContext *ctx, JSValueConst this_val,
 				      int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	(void)this_val;
@@ -3634,6 +3708,7 @@ static JSValue doc_add_event_listener(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_remove_event_listener(JSContext *ctx, JSValueConst this_val,
 					 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	(void)this_val;
@@ -3646,6 +3721,7 @@ static JSValue doc_remove_event_listener(JSContext *ctx, JSValueConst this_val,
 static JSValue noop(JSContext *ctx, JSValueConst this_val,
 		    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)ctx; (void)this_val; (void)argc; (void)argv;
 	return JS_UNDEFINED;
 }
@@ -3698,6 +3774,7 @@ static const JSCFunctionListEntry node_proto[] = {
 static JSValue doc_get_element_by_id(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *id;
@@ -3724,6 +3801,7 @@ static JSValue doc_get_element_by_id(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_val,
 					    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *name;
@@ -3759,6 +3837,7 @@ static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_va
 static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *name;
@@ -3785,6 +3864,7 @@ static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *text;
@@ -3820,6 +3900,7 @@ static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_element_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *nsheld = NULL, *qname;
@@ -3854,6 +3935,7 @@ static JSValue doc_create_element_ns(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_document(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	const char *ns = NULL, *qname = NULL;
 	struct dom_document_type *dt = NULL;
 	struct dom_document *doc = NULL;
@@ -3899,6 +3981,7 @@ static JSValue doc_create_document(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_doctype(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	const char *qname = NULL, *pub = NULL, *sys = NULL;
 	struct dom_document_type *dt = NULL;
 	JSValue r;
@@ -3936,6 +4019,7 @@ static JSValue doc_create_doctype(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_comment(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *text;
@@ -3963,6 +4047,7 @@ static JSValue doc_create_comment(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_document_fragment(JSContext *ctx, JSValueConst this_val,
 					    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	struct dom_document_fragment *frag = NULL;
@@ -3983,6 +4068,7 @@ static JSValue doc_create_document_fragment(JSContext *ctx, JSValueConst this_va
  */
 static JSValue doc_get_current_script(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	struct dom_nodelist *list = NULL;
@@ -4031,6 +4117,7 @@ static JSValue doc_get_current_script(JSContext *ctx, JSValueConst this_val)
 
 static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	struct dom_html_element *body = NULL;
@@ -4046,6 +4133,7 @@ static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 
 static JSValue doc_get_title(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	dom_string *s = NULL;
@@ -4058,6 +4146,7 @@ static JSValue doc_get_title(JSContext *ctx, JSValueConst this_val)
 
 static JSValue doc_set_title(JSContext *ctx, JSValueConst this_val, JSValueConst v)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *s = JS_ToCString(ctx, v);
@@ -4077,6 +4166,7 @@ static JSValue doc_set_title(JSContext *ctx, JSValueConst this_val, JSValueConst
 
 static JSValue doc_get_cookie(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	nsurl *url = NULL;
 	char *cookies;
@@ -4100,6 +4190,7 @@ static JSValue doc_get_cookie(JSContext *ctx, JSValueConst this_val)
 
 static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueConst v)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	nsurl *url = NULL;
 	const char *s = JS_ToCString(ctx, v);
@@ -4117,6 +4208,7 @@ static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueCons
 
 static JSValue doc_get_document_element(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	struct dom_element *el = NULL;
@@ -4156,6 +4248,7 @@ static const JSCFunctionListEntry document_proto[] = {
 static JSValue console_log(JSContext *ctx, JSValueConst this_val,
 			   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	int i;
 	char line[512];
 	size_t pos = 0;
@@ -4244,6 +4337,7 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 
 static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	nsurl *page = script_page_url(thread);
 	nsurl *url = NULL;
@@ -4266,6 +4360,7 @@ static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 
 static JSValue loc_set_href(JSContext *ctx, JSValueConst this_val, JSValueConst v)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *s = JS_ToCString(ctx, v);
 	JSValue r;
@@ -4290,12 +4385,14 @@ static JSValue loc_set_href(JSContext *ctx, JSValueConst this_val, JSValueConst 
  */
 static JSValue win_get_location(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	return JS_GetPropertyStr(ctx, this_val, VITA_LOCATION_SLOT);
 }
 
 static JSValue win_set_location(JSContext *ctx, JSValueConst this_val,
 				JSValueConst v)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *s;
 	JSValue r;
@@ -4333,6 +4430,7 @@ static void install_location(JSContext *ctx, JSValueConst on, JSValue loc)
 static JSValue loc_assign(JSContext *ctx, JSValueConst this_val,
 			  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *s;
 	JSValue r;
@@ -4353,6 +4451,7 @@ static const JSCFunctionListEntry location_proto[] = {
 
 static JSValue nav_get_user_agent(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	(void)this_val;
 	return JS_NewString(ctx, user_agent_string());
 }
@@ -4372,6 +4471,7 @@ static void timer_callback(void *p);
 static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 			     int argc, JSValueConst *argv, int repeat)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_timer *t;
 	int32_t ms = 0;
@@ -4442,18 +4542,21 @@ static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 static JSValue win_set_timeout(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	return win_set_timer(ctx, this_val, argc, argv, 0);
 }
 
 static JSValue win_set_interval(JSContext *ctx, JSValueConst this_val,
 				int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	return win_set_timer(ctx, this_val, argc, argv, 1);
 }
 
 static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_timer *t;
 	int32_t handle = 0;
@@ -5527,6 +5630,7 @@ static bool xhr_start(struct js_xhr *x)
 static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_xhr *x;
 	nsurl *page = NULL, *url = NULL;
@@ -5633,6 +5737,7 @@ static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_fetch_abort(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_xhr *x;
 	int32_t id = 0;
@@ -5673,6 +5778,7 @@ static void xhr_close_all(jsthread *thread)
 static JSValue ev_prevent_default(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)argc; (void)argv;
 	JS_SetPropertyStr(ctx, this_val, "defaultPrevented", JS_NewBool(ctx, true));
 	return JS_UNDEFINED;
@@ -5681,6 +5787,7 @@ static JSValue ev_prevent_default(JSContext *ctx, JSValueConst this_val,
 static JSValue ev_stop_propagation(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)argc; (void)argv;
 	JS_SetPropertyStr(ctx, this_val, "cancelBubble", JS_NewBool(ctx, true));
 	return JS_UNDEFINED;
@@ -6126,6 +6233,7 @@ static JSValue vita_find_impl(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 			     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	uint64_t t0 = now_ms();
 	JSValue r = vita_find_impl(ctx, this_val, argc, argv);
 
@@ -6137,6 +6245,7 @@ static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 static JSValue vita_find_impl(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *root = NULL;
 	struct find_key *keys;
@@ -6840,6 +6949,7 @@ static bool sel_matches(struct dom_node *n, const struct sel_compiled *s)
 static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 			  JSValueConst *argv, int magic, JSValue *data)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *root, *n = NULL;
 	struct sel_compiled *s = NULL;
@@ -6951,6 +7061,7 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 static JSValue win_vita_utf8_decode(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	size_t n = 0, i = 0, start;
 	uint8_t *p;
 
@@ -7007,6 +7118,7 @@ static JSValue node_type_test(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv, int magic,
 			      JSValue *data)
 {
+	C_WHERE;
 	struct dom_node *n;
 	int32_t mask = 0, t = 0;
 
@@ -7039,6 +7151,7 @@ static JSValue node_type_test(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_node_type_test(JSContext *ctx, JSValueConst this_val,
 				       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)this_val;
 	if (argc < 1) return JS_UNDEFINED;
 	return JS_NewCFunctionData(ctx, node_type_test, 1, 0, 1, argv);
@@ -7047,6 +7160,7 @@ static JSValue win_vita_node_type_test(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_selector_native(JSContext *ctx, JSValueConst this_val,
 					int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	int32_t kind = 0;
 
 	(void)this_val;
@@ -7094,6 +7208,7 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
 static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	vitasurf_js_style_reads++;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node;
@@ -7178,6 +7293,7 @@ static JSValue win_vita_element_from_point(JSContext *ctx,
 					   JSValueConst this_val,
 					   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct box *box, *found;
 	struct dom_node *node = NULL;
@@ -7353,6 +7469,7 @@ static void gap_report(void)
 static JSValue win_vita_gap(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	const char *name;
 	unsigned int i;
 
@@ -7617,6 +7734,7 @@ static bool canvas_image_of(JSContext *ctx, JSValueConst v,
 static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	struct vita_canvas_paint paint;
 	struct vita_canvas_stop *stops = NULL;
@@ -7707,6 +7825,7 @@ static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_text(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	struct vita_canvas_paint paint;
 	struct vita_canvas_stop *stops = NULL;
@@ -7755,6 +7874,7 @@ static JSValue win_vita_canvas_text(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_measure(JSContext *ctx, JSValueConst this_val,
 				       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	const char *text;
 	size_t len = 0;
 	double size_px = 10, width;
@@ -7785,6 +7905,7 @@ static JSValue win_vita_canvas_measure(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_clear(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	double v[4] = { 0, 0, 0, 0 };
 	int i;
@@ -7815,6 +7936,7 @@ static JSValue win_vita_canvas_image_size(JSContext *ctx,
 					  JSValueConst this_val,
 					  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas_image img;
 	JSValue arr;
 
@@ -7840,6 +7962,7 @@ static JSValue win_vita_canvas_image_size(JSContext *ctx,
 static JSValue win_vita_canvas_image(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	struct vita_canvas_image img;
 	double s[4] = { 0, 0, 0, 0 };
@@ -7893,6 +8016,7 @@ static JSValue win_vita_canvas_image(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_read(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	unsigned char *pixels;
 	int32_t v[4] = { 0, 0, 0, 0 };
@@ -7941,6 +8065,7 @@ static JSValue win_vita_canvas_read(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_write(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	size_t byte_offset = 0, byte_length = 0, bytes_per = 0;
 	int32_t v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -7984,6 +8109,7 @@ static JSValue win_vita_canvas_write(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node;
 	struct box *box;
@@ -8048,6 +8174,7 @@ static struct gui_window *thread_gui_window(jsthread *thread)
 static JSValue win_vita_scroll(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct gui_window *gw = thread_gui_window(thread);
 	int sx = 0, sy = 0, vw = 0, vh = 0;
@@ -8089,6 +8216,7 @@ static JSValue win_vita_scroll(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_scroll_to(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct gui_window *gw = thread_gui_window(thread);
 	double x = 0, y = 0;
@@ -8122,6 +8250,7 @@ static JSValue win_vita_scroll_to(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node = NULL;
 	struct dom_event *evt = NULL;
@@ -9777,6 +9906,7 @@ static void store_index_note(const char *name, uint32_t bytes)
 static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	char path[256], *origin, *buf;
 	long len;
@@ -9825,6 +9955,7 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	char path[256], tmp[264], *origin;
 	const char *text;
@@ -10659,6 +10790,7 @@ static char *rewrite_dynamic_imports(const char *src, size_t len,
 static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *base = NULL, *spec = NULL, *state = "none";
 	char *url = NULL;
