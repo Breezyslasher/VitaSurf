@@ -1067,6 +1067,7 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 extern void vita_js_report_gaps(void) __attribute__((weak));
 /* the script profile, from the same place and weak for the same reason */
 extern void vita_js_report_profile(void) __attribute__((weak));
+extern void vita_js_scrolled(struct browser_window *bw) __attribute__((weak));
 
 /**
  * Write the fetches of the page now on screen to the log.
@@ -1892,6 +1893,43 @@ static void tick(void *p)
 		want.x1 = want.x0;
 		want.y1 = want.y0;
 		guit->window->set_scroll(the_gw, &want);
+	}
+
+	/*
+	 * Tell the page's script it scrolled (VitaSurf): a scroll event at
+	 * most every 100 ms while the page moves, and one more when it has
+	 * settled, so a lazy loader sees where it stopped. Any way the page
+	 * moved counts -- stick, touch, focus, a script -- since this reads
+	 * the position rather than watching the inputs.
+	 */
+	if (vita_js_scrolled != NULL) {
+		static struct browser_window *last_bw;
+		static int last_sx = -1, last_sy = -1;
+		static uint64_t last_fire_us;
+		static bool unsent;
+		uint64_t now = sceKernelGetProcessTimeWide();
+		int sx, sy, vw, vh;
+
+		viewport(&sx, &sy, &vw, &vh);
+		if (the_gw->bw != last_bw) {
+			last_bw = the_gw->bw;
+			last_sx = sx;
+			last_sy = sy;
+			unsent = false;
+		} else if (sx != last_sx || sy != last_sy) {
+			last_sx = sx;
+			last_sy = sy;
+			unsent = true;
+			if (now - last_fire_us >= 100000) {
+				last_fire_us = now;
+				unsent = false;
+				vita_js_scrolled(the_gw->bw);
+			}
+		} else if (unsent && now - last_fire_us >= 100000) {
+			last_fire_us = now;
+			unsent = false;
+			vita_js_scrolled(the_gw->bw);
+		}
 	}
 
 	switch (vita_ime_poll(text, sizeof(text))) {

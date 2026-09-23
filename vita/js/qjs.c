@@ -163,6 +163,7 @@ struct jsthread {
 	 */
 	unsigned script_depth;    /**< nested entries from C into script */
 	bool draining;            /**< end_script is running promise jobs */
+	struct jsthread *all_next; /**< every live thread, for window events */
 	bool aborting;            /**< the budget is unwinding a script */
 	unsigned scripts_killed;  /**< scripts the budget stopped, this page */
 	unsigned overrun_count;   /**< interrupts past the deadline */
@@ -532,6 +533,10 @@ static void prof_tail(const char *what)
 /* exported for the page report in vita/input/vita_input.c */
 /* getElementById, for the page report */
 static unsigned int id_calls, id_hits, id_exact, id_builds, id_build_ms;
+/* every live thread, newest first; see vita_js_scrolled */
+static struct jsthread *all_threads;
+/* image sources scripts set, for the scroll log line */
+static unsigned int img_src_sets;
 /* entries into script from C made while promise jobs were running */
 static unsigned int jobs_reentered;
 
@@ -2144,6 +2149,10 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 		}
 		dom_element_set_attribute(node, key, val);
 		mark_attr_dirty(ctx, name);
+		if (name != NULL && (strcasecmp(name, "src") == 0 ||
+				     strcasecmp(name, "srcset") == 0)) {
+			img_src_sets++;
+		}
 		notify_mutation(ctx, "attributes", node,
 				JS_NewString(ctx, name != NULL ? name : ""),
 				old != NULL ?
@@ -4950,6 +4959,12 @@ static void rearm_deadline(jsthread *thread)
 	thread->aborting = false;
 	thread->overrun_count = 0;
 	thread->overrun_said_ms = 0;
+	/* The handler belongs to the heap, and whichever thread was made
+	 * last took it; a page's scripts run under their own (VitaSurf). */
+	if (thread->heap->interrupt_thread != thread) {
+		JS_SetInterruptHandler(thread->heap->rt, qjs_interrupt, thread);
+		thread->heap->interrupt_thread = thread;
+	}
 	/* the profile's clock starts with the script, not the idle before */
 	prof_last_ms = prof_last_call_ms = now_ms();
 	if (secs != 0) {
@@ -7552,6 +7567,104 @@ static JSValue element_step(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+/*
+ * __vitaCECandidates(root, withRoot): the elements under root, and root
+ * itself when asked, that could be custom elements -- a hyphen in the
+ * local name, or an is attribute -- in document order (VitaSurf). The
+ * prelude's upgrade walk visited every node of each inserted subtree
+ * for the few that are, and GitHub spent 9 % of its script there.
+ */
+static bool ce_candidate(struct dom_node *n)
+{
+	dom_string *name = NULL;
+	bool yes = false;
+
+	dom_node_get_local_name(n, &name);
+	if (name == NULL) {
+		dom_node_get_node_name(n, &name);
+	}
+	if (name != NULL) {
+		yes = memchr(dom_string_data(name), '-',
+			     dom_string_byte_length(name)) != NULL;
+		dom_string_unref(name);
+	}
+	if (!yes) {
+		static dom_string *is_name;
+
+		if (is_name == NULL) {
+			dom_string_create_interned((const uint8_t *)"is", 2,
+						   &is_name);
+		}
+		if (is_name != NULL) {
+			dom_element_has_attribute(n, is_name, &yes);
+		}
+	}
+	return yes;
+}
+
+static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *root, *n = NULL;
+	JSValue out = JS_NewArray(ctx);
+	uint32_t k = 0;
+
+	(void)this_val;
+	if (argc < 1 || !JS_IsObject(argv[0])) {
+		return out;
+	}
+	root = JS_GetOpaque(argv[0], node_class_id);
+	if (root == NULL) {
+		return out;
+	}
+	if (argc > 1 && JS_ToBool(ctx, argv[1]) && node_is_element(root) &&
+	    ce_candidate(root)) {
+		JS_SetPropertyUint32(ctx, out, k++, wrap_node(ctx, root));
+	}
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+
+		if (node_is_element(n)) {
+			if (ce_candidate(n)) {
+				JS_SetPropertyUint32(ctx, out, k++,
+						     wrap_node(ctx, n));
+			}
+			dom_node_get_first_child(n, &next);
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	return out;
+}
+
 static JSValue win_vita_element_step(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
@@ -8856,6 +8969,15 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaNodeTypeTest",
 			  JS_NewCFunction(ctx, win_vita_node_type_test,
 					  "__vitaNodeTypeTest", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCECandidates",
+			  JS_NewCFunction(ctx, win_vita_ce_candidates,
+					  "__vitaCECandidates", 2));
+	/* the tree generation itself, for the prelude to read without a
+	 * call: an ArrayBuffer over the static counter, never freed */
+	JS_SetPropertyStr(ctx, global, "__vitaGenBuf",
+			  JS_NewArrayBuffer(ctx, (uint8_t *)&vita_dom_gen,
+					    sizeof(vita_dom_gen), NULL, NULL,
+					    false));
 	JS_SetPropertyStr(ctx, global, "__vitaElementStep",
 			  JS_NewCFunction(ctx, win_vita_element_step,
 					  "__vitaElementStep", 2));
@@ -9240,6 +9362,8 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	heap->interrupt_thread = ret;
 	setup_globals(ret);
 	heap->live_threads++;
+	ret->all_next = all_threads;
+	all_threads = ret;
 	*thread = ret;
 	vita_log("qjs: new thread win=%p doc=%p", win_priv, doc_priv);
 	return NSERROR_OK;
@@ -9368,6 +9492,12 @@ void js_destroythread(jsthread *thread)
 		thread->heap->interrupt_thread = NULL;
 	}
 	thread->heap->live_threads--;
+	{
+		jsthread **pp = &all_threads;
+
+		while (*pp != NULL && *pp != thread) pp = &(*pp)->all_next;
+		if (*pp != NULL) *pp = thread->all_next;
+	}
 	if (thread->heap->pending_destroy && thread->heap->live_threads == 0) {
 		jsheap *heap = thread->heap;
 		JS_FreeRuntime(heap->rt);
@@ -12041,6 +12171,47 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	end_script(thread);
 	free(src);
 	return ok;
+}
+
+/*
+ * The page moved (VitaSurf). NetSurf scrolls without telling script, so
+ * nothing ever fired a scroll event: lazysizes, which unveils an image
+ * when a scroll, resize or click makes it check, left Yamtrack's posters
+ * as placeholders until something was clicked. vita/input calls this
+ * when the scroll position has changed, at most every 100 ms while it
+ * moves and once when it stops; the event goes to the document, where
+ * document and window listeners both hear it. A NULL window means every
+ * page, which is how the native harness drives it.
+ */
+void vita_js_scrolled(struct browser_window *bw);
+void vita_js_scrolled(struct browser_window *bw)
+{
+	jsthread *t;
+
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		if ((bw == NULL || t->win == bw) && !t->closed &&
+		    t->script_depth == 0) {
+			struct dom_document *doc = thread_document(t);
+
+			if (doc != NULL) {
+				static unsigned int fired;
+				unsigned int before = img_src_sets;
+				uint64_t t0 = now_ms();
+
+				js_fire_event(t, "scroll", NULL,
+					      (struct dom_node *)doc);
+				fired++;
+				/* what a scroll made the page do, when it did
+				 * anything: a lazy loader setting sources */
+				if (img_src_sets != before) {
+					vita_log("scroll: event %u set %u image "
+						 "sources, %u ms of script",
+						 fired, img_src_sets - before,
+						 (unsigned int)(now_ms() - t0));
+				}
+			}
+		}
+	}
 }
 
 bool js_fire_event(jsthread *thread, const char *type,

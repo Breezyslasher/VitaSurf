@@ -1172,6 +1172,12 @@ D.getElementsByName=function(n){return D.querySelectorAll('[name='+n+']').filter
 D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};
 ['onload','onreadystatechange','onclick','onkeydown','onkeyup','onmousemove','ontouchstart'].forEach(function(h){Object.defineProperty(D,h,{configurable:true,get:function(){return D['__'+h]||null;},set:function(f){D['__'+h]=f;if(typeof f==='function')D.addEventListener(h.slice(2),f);}});});
 var W=window;
+/* The tree generation, read straight out of the C counter through a
+   typed array over it (VitaSurf): __vitaDomGen() was a call into C on
+   every read, and the attribute cache reads it once per attribute. */
+var GEN=null;
+try{if(W.__vitaGenBuf)GEN=new Uint32Array(W.__vitaGenBuf);delete W.__vitaGenBuf;}catch(e){}
+function domGen(){return GEN?GEN[0]:(domGen());}
 ['onload','onerror','onresize','onscroll','onhashchange','onpopstate','onunload','onbeforeunload','onmessage','onpageshow','onclick','onkeydown','onkeyup','ontouchstart'].forEach(function(h){Object.defineProperty(W,h,{configurable:true,get:function(){return W['__'+h]||null;},set:function(f){W['__'+h]=f;if(typeof f==='function'&&h!=='onerror')W.addEventListener(h.slice(2),f);}});});
 W.dispatchEvent=function(e){return __vitaDispatch(null,e);};
 /* Viewport and scroll position come from the window itself, so a script
@@ -2147,6 +2153,21 @@ function ceUpgrade(el,inDoc){
 /* Upgrade and connect every custom element in a subtree just inserted. */
 function ceConnectTree(n,inDoc,skipSelf){
  if(!n)return;
+ /* Only an element with a hyphen in its name or an is attribute can be
+    a custom element, and C finds those without the walk wrapping every
+    node of the subtree (VitaSurf). A callback that moves the tree about
+    can take a later one out from under n; that one is passed over, as
+    the walk would never have reached it. */
+ if(typeof __vitaCECandidates==='function'){
+  var l=__vitaCECandidates(n,!skipSelf),g=domGen(),k,e,up;
+  for(k=0;k<l.length;k++){
+   e=l[k];
+   if(domGen()!==g){
+    for(up=e;up&&up!==n;up=up.parentNode);
+    if(!up)continue;}
+   if(!e.__ceState)ceUpgrade(e,inDoc);
+   else if(e.__ceState===2&&!e.__ceConn&&inDoc){ceSet(e,'__ceConn',true);ceCall(e,'connectedCallback');}}
+  return;}
  if(!skipSelf&&n.nodeType===1){
   if(!n.__ceState)ceUpgrade(n,inDoc);
   else if(n.__ceState===2&&!n.__ceConn&&inDoc){ceSet(n,'__ceConn',true);ceCall(n,'connectedCallback');}
@@ -3105,7 +3126,7 @@ function Attr(el,name,value){
     every element it starts (VitaSurf). */
  function get(){
   if(!this._e)return this._v;
-  var g=W.__vitaDomGen?W.__vitaDomGen():-1;
+  var g=domGen();
   if(g>=0&&this._g===g)return this._v;
   var v=this.namespaceURI
    ?this._e.getAttributeNS(this.namespaceURI,this.localName)
@@ -3318,7 +3339,7 @@ function liveCollection(items,proto){
     reads .length and [i] each step, and each read was a whole-document
     walk before this. */
  function cached(){
-  var g=W.__vitaDomGen?W.__vitaDomGen():-1;
+  var g=domGen();
   if(cache===null||g<0||g!==gen){cache=items();gen=g;}
   return cache;}
  Object.defineProperty(base,'__vitaItems',{value:cached,configurable:true});
@@ -3677,17 +3698,17 @@ NamedNodeMap.prototype.removeNamedItem=function(n){
  return this[NNM_OWNER].removeAttributeNode(a);};
 NamedNodeMap.prototype.removeNamedItemNS=function(ns,n){
  return this.removeNamedItem(n);};
-NamedNodeMap.prototype[Symbol.iterator]=function(){
- var i=0,m=this;
- return {next:function(){return i<m.length?{value:m[i++],done:false}
-                                          :{value:undefined,done:true};}};};
+/* An array-like's own iterator, which is what a browser gives the map,
+   and native: Array.from(el.attributes) is how Alpine starts on every
+   element, and the closure made two calls and an object per step. */
+NamedNodeMap.prototype[Symbol.iterator]=Array.prototype.values;
 W.NamedNodeMap=NamedNodeMap;
 (function(){
  var d=Object.getOwnPropertyDescriptor(P,'attributes');
  if(!d||!d.get)return;
  rawAttrs=d.get;
  Object.defineProperty(P,'attributes',{configurable:true,get:function(){
-  var el=this,g=W.__vitaDomGen?W.__vitaDomGen():-1,c=el.__vitaAttrMap,
+  var el=this,g=domGen(),c=el.__vitaAttrMap,
       raw,map,i,a;
   /* The same map while nothing has written an attribute or moved a
      node since (VitaSurf): el.attributes===el.attributes, as in a
@@ -4259,7 +4280,7 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
 
  function tick(){
   var s=viewport(),key=s[0]+','+s[1]+','+s[2]+','+s[3];
-  var g=W.__vitaDomGen?W.__vitaDomGen():-1;
+  var g=domGen();
   var live=0,i;
 
   for(i=0;i<observers.length;i++)live+=observers[i].__targets.length;
