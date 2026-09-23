@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<!-- setTimeout and setInterval take a string of code as well as a
+     function, and pass their extra arguments to a function. A captive
+     portal's redirect page used setTimeout("...") and never moved. -->
+<html><head><title>timer string</title></head><body>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var got=null,n=0,iv;
+setTimeout(function(a,b){got=a+b;},10,'x','y');
+setTimeout("var gvar=5;",10);
+iv=setInterval("n++; if(n===3)clearInterval(iv);",15);
+ok("a string timer returns a handle", setTimeout("1",5000)>0);
+setTimeout(function(){
+ ok("extra arguments reach the callback ("+got+")", got==='xy');
+ ok("a string timer runs as global code", window.gvar===5);
+ ok("a string interval ran 3 times and stopped ("+n+")", n===3);
+},300);
+</script></body></html>

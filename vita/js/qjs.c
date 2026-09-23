@@ -247,7 +247,8 @@ struct js_listener {
 struct js_timer {
 	struct js_timer *next;
 	struct jsthread *thread;
-	JSValue func;
+	JSValue func;         /**< a function, or a string of code */
+	JSValue args;         /**< array of extra arguments, or undefined */
 	int interval_ms;      /**< 0 for a one-shot timeout */
 	int handle;
 	bool dead;
@@ -3961,9 +3962,32 @@ static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 	struct js_timer *t;
 	int32_t ms = 0;
 
+	JSValue code = JS_UNDEFINED;
+
 	(void)this_val;
-	if (thread == NULL || argc < 1 || !JS_IsFunction(ctx, argv[0])) {
+	if (thread == NULL || argc < 1) {
 		return JS_NewInt32(ctx, 0);
+	}
+	/*
+	 * A string is code to run when the timer fires (VitaSurf). Old
+	 * pages write setTimeout("go()", 500); a captive portal's
+	 * "Please wait" page redirected that way and sat there, because
+	 * anything but a function was dropped.
+	 */
+	if (!JS_IsFunction(ctx, argv[0])) {
+		const char *s;
+
+		code = JS_ToString(ctx, argv[0]);
+		if (JS_IsException(code)) {
+			return JS_EXCEPTION;
+		}
+		/* rare, and usually the redirect a stuck page wanted */
+		s = JS_ToCString(ctx, code);
+		if (s != NULL) {
+			vita_log("qjs: %s given code as a string: '%.100s'",
+				 repeat ? "setInterval" : "setTimeout", s);
+			JS_FreeCString(ctx, s);
+		}
 	}
 	if (argc >= 2) {
 		JS_ToInt32(ctx, &ms, argv[1]);
@@ -3972,10 +3996,26 @@ static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 
 	t = calloc(1, sizeof(*t));
 	if (t == NULL) {
+		JS_FreeValue(ctx, code);
 		return JS_NewInt32(ctx, 0);
 	}
 	t->thread = thread;
-	t->func = JS_DupValue(ctx, argv[0]);
+	t->func = JS_IsUndefined(code) ? JS_DupValue(ctx, argv[0]) : code;
+	t->args = JS_UNDEFINED;
+	/* setTimeout(fn, ms, a, b) calls fn(a, b) */
+	if (argc > 2 && JS_IsUndefined(code)) {
+		t->args = JS_NewArray(ctx);
+		if (!JS_IsException(t->args)) {
+			int i;
+
+			for (i = 2; i < argc; i++) {
+				JS_SetPropertyUint32(ctx, t->args, i - 2,
+						     JS_DupValue(ctx, argv[i]));
+			}
+		} else {
+			t->args = JS_UNDEFINED;
+		}
+	}
 	t->interval_ms = repeat ? ms : 0;
 	t->handle = next_timer_handle++;
 	t->next = thread->timers;
@@ -4661,7 +4701,35 @@ static void timer_callback(void *p)
 		uint64_t t0 = now_ms();
 		unsigned took;
 
-		ret = JS_Call(ctx, t->func, global, 0, NULL);
+		if (JS_IsString(t->func)) {
+			size_t len = 0;
+			const char *src = JS_ToCStringLen(ctx, &len, t->func);
+
+			ret = src != NULL ?
+				JS_Eval(ctx, src, len, "<timer string>",
+					JS_EVAL_TYPE_GLOBAL) :
+				JS_EXCEPTION;
+			if (src != NULL) {
+				JS_FreeCString(ctx, src);
+			}
+		} else if (JS_IsObject(t->args)) {
+			JSValue av[8];
+			int64_t n = 0;
+			int i;
+
+			JS_GetLength(ctx, t->args, &n);
+			if (n > 8) n = 8;
+			for (i = 0; i < (int)n; i++) {
+				av[i] = JS_GetPropertyUint32(ctx, t->args,
+							     (uint32_t)i);
+			}
+			ret = JS_Call(ctx, t->func, global, (int)n, av);
+			for (i = 0; i < (int)n; i++) {
+				JS_FreeValue(ctx, av[i]);
+			}
+		} else {
+			ret = JS_Call(ctx, t->func, global, 0, NULL);
+		}
 		took = (unsigned)(now_ms() - t0);
 
 		if (took >= 50) {
@@ -7430,6 +7498,8 @@ nserror js_closethread(jsthread *thread)
 		}
 		JS_FreeValue(thread->ctx, t->func);
 		t->func = JS_UNDEFINED;
+		JS_FreeValue(thread->ctx, t->args);
+		t->args = JS_UNDEFINED;
 	}
 	/*
 	 * Listener structs stay allocated: libdom still holds them as the
