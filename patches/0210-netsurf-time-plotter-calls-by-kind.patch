@@ -1,0 +1,208 @@
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index 29afcdd6b..a19e1e03a 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -664,8 +664,157 @@ framebuffer_plot_text(const struct redraw_context *ctx,
+ #endif
+ 
+ 
++#ifdef __vita__
++/*
++ * What drawing a frame is made of (VitaSurf). Scrolling an image-heavy
++ * page drew at 21-25 frames a second with drawing taking the whole of
++ * every second, and nothing said whether that was the images, the text
++ * or the boxes. Each plotter call is counted and timed by kind, and
++ * gui.c writes the tally beside the frame line when drawing ran long.
++ */
++enum fb_plot_kind {
++	FBP_RECT, FBP_TEXT, FBP_BMP_SAME, FBP_BMP_SCALED, FBP_BMP_TILED,
++	FBP_PATH, FBP_LINE, FBP_OTHER, FBP_KINDS
++};
++static const char *const fbp_names[FBP_KINDS] = {
++	"rects", "text", "images at size", "images scaled",
++	"images tiled", "paths", "lines", "other"
++};
++static unsigned int fbp_calls[FBP_KINDS];
++static uint64_t fbp_us[FBP_KINDS];
++static uint64_t fbp_px[FBP_KINDS];
++
++#define FBP_TIMED(kind, call) do {					\
++		uint64_t fbp_t0 = vitasurf_clock_us();			\
++		nserror fbp_r = (call);					\
++		fbp_us[kind] += vitasurf_clock_us() - fbp_t0;		\
++		fbp_calls[kind]++;					\
++		return fbp_r;						\
++	} while (0)
++
++static nserror timed_clip(const struct redraw_context *ctx,
++			  const struct rect *clip)
++{
++	FBP_TIMED(FBP_OTHER, framebuffer_plot_clip(ctx, clip));
++}
++
++static nserror timed_arc(const struct redraw_context *ctx,
++			 const plot_style_t *style, int x, int y, int radius,
++			 int angle1, int angle2)
++{
++	FBP_TIMED(FBP_PATH, framebuffer_plot_arc(ctx, style, x, y, radius,
++						 angle1, angle2));
++}
++
++static nserror timed_disc(const struct redraw_context *ctx,
++			  const plot_style_t *style, int x, int y, int radius)
++{
++	FBP_TIMED(FBP_PATH, framebuffer_plot_disc(ctx, style, x, y, radius));
++}
++
++static nserror timed_line(const struct redraw_context *ctx,
++			  const plot_style_t *style, const struct rect *line)
++{
++	FBP_TIMED(FBP_LINE, framebuffer_plot_line(ctx, style, line));
++}
++
++static nserror timed_rectangle(const struct redraw_context *ctx,
++			       const plot_style_t *style,
++			       const struct rect *rect)
++{
++	fbp_px[FBP_RECT] += (uint64_t)(rect->x1 - rect->x0 > 0 ?
++				       rect->x1 - rect->x0 : 0) *
++		(uint64_t)(rect->y1 - rect->y0 > 0 ? rect->y1 - rect->y0 : 0);
++	FBP_TIMED(FBP_RECT, framebuffer_plot_rectangle(ctx, style, rect));
++}
++
++static nserror timed_polygon(const struct redraw_context *ctx,
++			     const plot_style_t *style, const int *p,
++			     unsigned int n)
++{
++	FBP_TIMED(FBP_PATH, framebuffer_plot_polygon(ctx, style, p, n));
++}
++
++static nserror timed_path(const struct redraw_context *ctx,
++			  const plot_style_t *pstyle, const float *p,
++			  unsigned int n, const float transform[6])
++{
++	FBP_TIMED(FBP_PATH, framebuffer_plot_path(ctx, pstyle, p, n,
++						  transform));
++}
++
++static nserror timed_bitmap(const struct redraw_context *ctx,
++			    struct bitmap *bitmap, int x, int y, int width,
++			    int height, colour bg, bitmap_flags_t flags)
++{
++	int bw = 0, bh = 0;
++	enum nsfb_format_e fmt;
++	enum fb_plot_kind kind;
++
++	nsfb_get_geometry((nsfb_t *)bitmap, &bw, &bh, &fmt);
++	if (flags & (BITMAPF_REPEAT_X | BITMAPF_REPEAT_Y)) {
++		kind = FBP_BMP_TILED;
++	} else if (bw == width && bh == height) {
++		kind = FBP_BMP_SAME;
++	} else {
++		kind = FBP_BMP_SCALED;
++	}
++	fbp_px[kind] += (uint64_t)(width > 0 ? width : 0) *
++		(uint64_t)(height > 0 ? height : 0);
++	FBP_TIMED(kind, framebuffer_plot_bitmap(ctx, bitmap, x, y, width,
++						height, bg, flags));
++}
++
++static nserror timed_text(const struct redraw_context *ctx,
++			  const struct plot_font_style *fstyle, int x, int y,
++			  const char *text, size_t length)
++{
++	FBP_TIMED(FBP_TEXT, framebuffer_plot_text(ctx, fstyle, x, y, text,
++						  length));
++}
++
++/* exported interface documented in framebuffer/framebuffer.h */
++void fb_plot_take_stats(char *buf, size_t len)
++{
++	size_t at = 0;
++	int k;
++
++	buf[0] = '\0';
++	for (k = 0; k < FBP_KINDS; k++) {
++		int n;
++
++		if (fbp_calls[k] == 0) continue;
++		n = snprintf(buf + at, len - at, "%s%s %u in %u ms",
++			     at == 0 ? "" : ", ", fbp_names[k], fbp_calls[k],
++			     (unsigned int)(fbp_us[k] / 1000));
++		if (n < 0 || (size_t)n >= len - at) break;
++		at += (size_t)n;
++		if (fbp_px[k] > 0) {
++			n = snprintf(buf + at, len - at, " (%u kpx)",
++				     (unsigned int)(fbp_px[k] / 1000));
++			if (n < 0 || (size_t)n >= len - at) break;
++			at += (size_t)n;
++		}
++		fbp_calls[k] = 0;
++		fbp_us[k] = 0;
++		fbp_px[k] = 0;
++	}
++}
++#endif
++
+ /** framebuffer plot operation table */
+ const struct plotter_table fb_plotters = {
++#ifdef __vita__
++	.clip = timed_clip,
++	.arc = timed_arc,
++	.disc = timed_disc,
++	.line = timed_line,
++	.rectangle = timed_rectangle,
++	.polygon = timed_polygon,
++	.path = timed_path,
++	.bitmap = timed_bitmap,
++	.text = timed_text,
++#else
+ 	.clip = framebuffer_plot_clip,
+ 	.arc = framebuffer_plot_arc,
+ 	.disc = framebuffer_plot_disc,
+@@ -675,6 +824,7 @@ const struct plotter_table fb_plotters = {
+ 	.path = framebuffer_plot_path,
+ 	.bitmap = framebuffer_plot_bitmap,
+ 	.text = framebuffer_plot_text,
++#endif
+ 	.option_knockout = true,
+ };
+ 
+diff --git a/frontends/framebuffer/framebuffer.h b/frontends/framebuffer/framebuffer.h
+index d99049f52..c4d9b2fde 100644
+--- a/frontends/framebuffer/framebuffer.h
++++ b/frontends/framebuffer/framebuffer.h
+@@ -37,4 +37,12 @@ bool framebuffer_set_cursor(struct fbtk_bitmap *bm);
+  */
+ nsfb_t *framebuffer_set_surface(nsfb_t *new_nsfb);
+ 
++#ifdef __vita__
++/**
++ * The plotter calls since the last call, by kind, with their time and
++ * area, as one line of text; the counts start again (VitaSurf).
++ */
++void fb_plot_take_stats(char *buf, size_t len);
++#endif
++
+ #endif
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index e6c6a1400..2f0d39061 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -735,6 +735,16 @@ static void framebuffer_run(void)
+ 				 (unsigned) (wait_us / 1000),
+ 				 (unsigned) (draw_us / 1000),
+ 				 boxes, kpixels, gpu_ms);
++			/* and what the drawing was made of, when it
++			 * took a good part of the second (VitaSurf) */
++			{
++				char stats[384];
++
++				fb_plot_take_stats(stats, sizeof(stats));
++				if (draw_us >= 300000 && stats[0] != '\0') {
++					vita_log("draw: %s", stats);
++				}
++			}
+ 			/* a page that builds itself after it has loaded
+ 			 * is reported again once it goes quiet */
+ 			vita_input_settled((unsigned)(sched_us / 1000),

@@ -358,6 +358,7 @@ static struct {
 } prof[PROF_SLOTS];
 static unsigned int prof_n, prof_samples, prof_other;
 static uint64_t prof_last_ms;
+static uint64_t prof_last_call_ms;	/* the interrupt check's last visit */
 static bool prof_busy;
 
 /* One frame of a stack text: "name (file:line:col)", the file's path cut
@@ -410,7 +411,36 @@ static bool prof_has(const char *s, size_t n, const char *needle)
 	return false;
 }
 
-static void prof_sample(JSContext *ctx)
+/*
+ * weight is how many PROF_INTERVAL_MS slices have passed since the last
+ * sample. The interrupt check comes round every few microseconds while
+ * the interpreter runs, and not at all inside a binding or while code
+ * made by new Function() compiles: a long silence before this visit was
+ * time in C, and the frame on top now is the script that called there.
+ * Those are marked [after time in C] and weighted by the time they took:
+ * the frame named is the script that was running when the check came
+ * round again, just after the call into C.
+ */
+static void prof_add(const char *key, unsigned int weight)
+{
+	unsigned int i;
+
+	for (i = 0; i < prof_n; i++) {
+		if (strcmp(prof[i].where, key) == 0) {
+			prof[i].hits += weight;
+			return;
+		}
+	}
+	if (prof_n < PROF_SLOTS) {
+		snprintf(prof[prof_n].where, sizeof(prof[0].where), "%s", key);
+		prof[prof_n].hits = weight;
+		prof_n++;
+	} else {
+		prof_other += weight;
+	}
+}
+
+static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
 {
 	char *st, key[300], f2[100];
 	const char *l2;
@@ -421,7 +451,7 @@ static void prof_sample(JSContext *ctx)
 	st = capture_stack(ctx);
 	prof_busy = false;
 	if (st == NULL) return;
-	prof_samples++;
+	prof_samples += weight;
 	prof_frame(st, key, 100);
 	l2 = strchr(st, '\n');
 	if (l2 != NULL && l2[1] != '\0') {
@@ -451,19 +481,32 @@ static void prof_sample(JSContext *ctx)
 		}
 	}
 	free(st);
-	for (i = 0; i < prof_n; i++) {
-		if (strcmp(prof[i].where, key) == 0) {
-			prof[i].hits++;
-			return;
-		}
+	if (in_c) {
+		snprintf(key + strlen(key), sizeof(key) - strlen(key),
+			 " [after time in C]");
 	}
-	if (prof_n < PROF_SLOTS) {
-		snprintf(prof[prof_n].where, sizeof(prof[0].where), "%s", key);
-		prof[prof_n].hits = 1;
-		prof_n++;
-	} else {
-		prof_other++;
+	prof_add(key, weight);
+}
+
+/*
+ * The end of a script or a promise job: a silence since the interrupt
+ * check last came round was time in C with no script after it to be
+ * found in -- one long binding call, or a compile, at the very end.
+ */
+static void prof_tail(const char *what)
+{
+	uint64_t t = now_ms();
+
+	if (t - prof_last_call_ms >= PROF_INTERVAL_MS &&
+	    t - prof_last_ms >= PROF_INTERVAL_MS) {
+		char key[160];
+		uint64_t slices = (t - prof_last_ms) / PROF_INTERVAL_MS;
+
+		snprintf(key, sizeof(key), "%s [in C, at its end]", what);
+		prof_samples += slices > 600 ? 600u : (unsigned int)slices;
+		prof_add(key, slices > 600 ? 600u : (unsigned int)slices);
 	}
+	prof_last_ms = prof_last_call_ms = t;
 }
 
 /* exported for the page report in vita/input/vita_input.c */
@@ -475,8 +518,9 @@ void vita_js_report_profile(void)
 	if (prof_samples == 0) {
 		return;
 	}
-	vita_log("profile: %u samples of running script, one every %u ms; "
-		 "where it was most often:", prof_samples,
+	vita_log("profile: %u slices of %u ms of script; where it was most "
+		 "often ([after time in C]: a binding or a compile ran just "
+		 "before this point):", prof_samples,
 		 (unsigned int)PROF_INTERVAL_MS);
 	for (shown = 0; shown < 12; shown++) {
 		unsigned int i, best = 0;
@@ -519,11 +563,16 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	 */
 	{
 		uint64_t t = now_ms();
+		bool in_c = t - prof_last_call_ms >= PROF_INTERVAL_MS;
 
+		prof_last_call_ms = t;
 		if (t - prof_last_ms >= PROF_INTERVAL_MS && thread->ctx != NULL &&
 		    !thread->aborting) {
+			uint64_t slices = (t - prof_last_ms) / PROF_INTERVAL_MS;
+
 			prof_last_ms = t;
-			prof_sample(thread->ctx);
+			prof_sample(thread->ctx, slices > 600 ? 600u :
+				    (unsigned int)slices, in_c);
 		}
 	}
 	if (vita_busy_take_cancel()) {
@@ -4482,6 +4531,8 @@ static void rearm_deadline(jsthread *thread)
 	thread->aborting = false;
 	thread->overrun_count = 0;
 	thread->overrun_said_ms = 0;
+	/* the profile's clock starts with the script, not the idle before */
+	prof_last_ms = prof_last_call_ms = now_ms();
 	if (secs != 0) {
 		thread->deadline_ms = now_ms() + (uint64_t)secs * 1000;
 	} else {
@@ -4590,6 +4641,10 @@ static void end_script(jsthread *thread)
 		return;
 	}
 	thread->script_depth = 0;
+	prof_tail(script_why == SCRIPT_TIMER ? "a timer" :
+		  script_why == SCRIPT_EVENT ? "an event handler" :
+		  script_why == SCRIPT_XHR ? "a fetch callback" :
+		  "a script element");
 	if (script_entered_ms != 0) {
 		unsigned took = (unsigned)(now_ms() - script_entered_ms);
 
@@ -4685,6 +4740,9 @@ static void end_script(jsthread *thread)
 
 			r = JS_ExecutePendingJob(thread->heap->rt, &c);
 			bc_last_activity_ms = now_ms();
+			if (r != 0) {
+				prof_tail("a promise job");
+			}
 			if (r <= 0) {
 				unsigned took = (unsigned)(now_ms() - d0);
 
@@ -10774,6 +10832,9 @@ static JSValue settle_module(jsthread *thread, JSValue ret, const char *name)
 		int r = JS_ExecutePendingJob(thread->heap->rt, &c);
 
 		bc_last_activity_ms = now_ms();
+		if (r != 0) {
+			prof_tail("a promise job");
+		}
 
 		if (r <= 0) {
 			if (r < 0 && c != NULL) {
