@@ -2004,6 +2004,10 @@ W.TextDecoder.prototype.decode=function(b){
     this.encoding==='windows-1252'){
   for(;i<n;i++)out.push(v[i]);
   return joinCodes(out);}
+ /* valid utf-8 is decoded in C in one go (VitaSurf); anything else
+    comes back undefined and is decoded here */
+ if(typeof __vitaUtf8Decode==='function'&&v instanceof Uint8Array){
+  var fast=__vitaUtf8Decode(v);if(fast!==undefined)return fast;}
  /* utf-8, with a leading byte order mark dropped */
  if(n>=3&&v[0]===0xef&&v[1]===0xbb&&v[2]===0xbf)i=3;
  /* One U+FFFD per maximal subpart, as the encoding standard puts it:
@@ -2165,7 +2169,11 @@ W.customElements={
   var w=CEwait[name];
   if(w){delete CEwait[name];for(var k=0;k<w.length;k++)w[k](ctor);}
  },
- get:function(name){var d=CE[String(name).toLowerCase()];return d?d.ctor:undefined;},
+ /* by the name as given: a custom element's name is lower case, and a
+    browser answers undefined for any other spelling. Lower-casing it on
+    every call was 8 % of GitHub's profile, whose lazy loader asks for
+    each tag it may load for every element it scans (VitaSurf). */
+ get:function(name){var d=CE[name];return d&&d.ctor?d.ctor:undefined;},
  getName:function(c){for(var k in CE)if(CE[k].ctor===c)return k;return null;},
  whenDefined:function(name){
   name=String(name).toLowerCase();
@@ -6113,6 +6121,10 @@ stampConsts(P);
   stampConsts(F);
   return F;}
  function ofType(types){
+  /* in C when the bindings have it (VitaSurf) */
+  if(typeof __vitaNodeTypeTest==='function'){
+   var mask=0;types.forEach(function(t){mask|=1<<t;});
+   return __vitaNodeTypeTest(mask);}
   return function(v){
    return !!v&&typeof v==='object'&&types.indexOf(v.nodeType)>=0;};}
  function ofTag(tags){

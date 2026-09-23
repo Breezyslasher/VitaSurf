@@ -6941,6 +6941,109 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	return out;
 }
 
+/*
+ * __vitaUtf8Decode(u8): the text of a Uint8Array that is strictly valid
+ * UTF-8, with a leading byte order mark dropped, or undefined for
+ * anything else, which the prelude's own decoder then handles with its
+ * replacement-character rules (VitaSurf). The prelude decoded every
+ * fetched body a byte at a time in script: 5 % of GitHub's profile.
+ */
+static JSValue win_vita_utf8_decode(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	size_t n = 0, i = 0, start;
+	uint8_t *p;
+
+	(void)this_val;
+	if (argc < 1) return JS_UNDEFINED;
+	p = JS_GetUint8Array(ctx, &n, argv[0]);
+	if (p == NULL) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return JS_UNDEFINED;
+	}
+	if (n >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) i = 3;
+	start = i;
+	while (i < n) {
+		uint8_t c = p[i];
+		size_t need, k;
+		uint8_t lo = 0x80, hi = 0xBF;
+
+		if (c < 0x80) { i++; continue; }
+		if (c >= 0xC2 && c <= 0xDF) need = 1;
+		else if (c >= 0xE0 && c <= 0xEF) {
+			need = 2;
+			if (c == 0xE0) lo = 0xA0;
+			if (c == 0xED) hi = 0x9F;
+		} else if (c >= 0xF0 && c <= 0xF4) {
+			need = 3;
+			if (c == 0xF0) lo = 0x90;
+			if (c == 0xF4) hi = 0x8F;
+		} else {
+			return JS_UNDEFINED;
+		}
+		if (i + need >= n) {
+			return JS_UNDEFINED;	/* cut short */
+		}
+		if (p[i + 1] < lo || p[i + 1] > hi) return JS_UNDEFINED;
+		for (k = 2; k <= need; k++) {
+			if (p[i + k] < 0x80 || p[i + k] > 0xBF) {
+				return JS_UNDEFINED;
+			}
+		}
+		i += need + 1;
+	}
+	return JS_NewStringLen(ctx, (const char *)p + start, n - start);
+}
+
+/*
+ * The Symbol.hasInstance of Node, Element, Text and the other types
+ * told apart by nodeType: bit t of the mask is set for each type t
+ * that counts (VitaSurf). A node wrapper's type comes straight from
+ * the node; anything else is asked for its nodeType, as the prelude's
+ * test did. GitHub's catalyst asks element instanceof Element of every
+ * element it scans.
+ */
+static JSValue node_type_test(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv, int magic,
+			      JSValue *data)
+{
+	struct dom_node *n;
+	int32_t mask = 0, t = 0;
+
+	(void)this_val;
+	(void)magic;
+	if (argc < 1 || !JS_IsObject(argv[0])) return JS_FALSE;
+	JS_ToInt32(ctx, &mask, data[0]);
+	n = JS_GetOpaque(argv[0], node_class_id);
+	if (n != NULL) {
+		dom_node_type type = 0;
+
+		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR) {
+			return JS_FALSE;
+		}
+		t = (int32_t)type;
+	} else {
+		JSValue v = JS_GetPropertyStr(ctx, argv[0], "nodeType");
+
+		if (JS_IsException(v)) return JS_EXCEPTION;
+		if (!JS_IsNumber(v)) {
+			JS_FreeValue(ctx, v);
+			return JS_FALSE;
+		}
+		JS_ToInt32(ctx, &t, v);
+		JS_FreeValue(ctx, v);
+	}
+	return JS_NewBool(ctx, t > 0 && t < 31 && (mask & (1 << t)) != 0);
+}
+
+static JSValue win_vita_node_type_test(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	if (argc < 1) return JS_UNDEFINED;
+	return JS_NewCFunctionData(ctx, node_type_test, 1, 0, 1, argv);
+}
+
 static JSValue win_vita_selector_native(JSContext *ctx, JSValueConst this_val,
 					int argc, JSValueConst *argv)
 {
@@ -8205,6 +8308,12 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaMOUnwatch",
 			  JS_NewCFunction(ctx, win_vita_mo_unwatch,
 					  "__vitaMOUnwatch", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaUtf8Decode",
+			  JS_NewCFunction(ctx, win_vita_utf8_decode,
+					  "__vitaUtf8Decode", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaNodeTypeTest",
+			  JS_NewCFunction(ctx, win_vita_node_type_test,
+					  "__vitaNodeTypeTest", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaSelectorNative",
 			  JS_NewCFunction(ctx, win_vita_selector_native,
 					  "__vitaSelectorNative", 2));
