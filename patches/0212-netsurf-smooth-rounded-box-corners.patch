@@ -1,0 +1,234 @@
+diff --git a/content/handlers/html/redraw_border.c b/content/handlers/html/redraw_border.c
+index 974d7164d..1ec87c537 100644
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -29,6 +29,9 @@
+ #include "utils/utils.h"
+ #include "utils/log.h"
+ #include "netsurf/plotters.h"
++#include "netsurf/bitmap.h"
++#include "desktop/gui_internal.h"
++#include "desktop/bitmap.h"
+ #include "netsurf/css.h"
+ 
+ #include "html/box.h"
+@@ -1288,6 +1291,199 @@ rounded_fill_spans(const struct redraw_context *ctx,
+ 	return NSERROR_OK;
+ }
+ 
++/*
++ * Smoothed corners (VitaSurf). A corner of a rounded fill is a small
++ * image whose every pixel carries how much of it lies inside the curve,
++ * measured on a 4x4 grid within the pixel, in the fill's colour; the
++ * rest of the box is plain rectangles. Pages repeat the same few radii
++ * and colours, so each corner image is made once and kept.
++ *
++ * Kept for good: knockout queues image plots and draws them later, so
++ * an image freed while a redraw is still queued would be drawn from
++ * freed memory. The cache is bounded instead, and a shape that does not
++ * fit in it is filled unsmoothed as before.
++ */
++#define CORNER_CACHE_SLOTS 128
++#define CORNER_CACHE_BYTES (512 * 1024)
++#define CORNER_MAX 64
++
++enum corner_which { CORNER_TL, CORNER_TR, CORNER_BR, CORNER_BL };
++
++static struct corner_image {
++	int w, h;
++	colour c;
++	enum corner_which which;
++	struct bitmap *bitmap;
++} corner_cache[CORNER_CACHE_SLOTS];
++static unsigned int corner_cache_n;
++static size_t corner_cache_bytes;
++
++static struct bitmap *corner_image(int w, int h, colour c,
++				   enum corner_which which)
++{
++	struct corner_image *ci;
++	unsigned int i;
++	uint8_t *buf;
++	size_t stride;
++	int px, py;
++	float cx, cy;
++	unsigned int alpha = 255u - ((c >> 24) & 0xffu);
++
++	for (i = 0; i < corner_cache_n; i++) {
++		ci = &corner_cache[i];
++		if (ci->w == w && ci->h == h && ci->c == c &&
++		    ci->which == which) {
++			return ci->bitmap;
++		}
++	}
++	if (corner_cache_n >= CORNER_CACHE_SLOTS ||
++	    corner_cache_bytes + (size_t)w * (size_t)h * 4 >
++			CORNER_CACHE_BYTES) {
++		return NULL;
++	}
++	ci = &corner_cache[corner_cache_n];
++	ci->bitmap = guit->bitmap->create(w, h, BITMAP_NONE);
++	if (ci->bitmap == NULL) {
++		return NULL;
++	}
++	buf = guit->bitmap->get_buffer(ci->bitmap);
++	stride = guit->bitmap->get_rowstride(ci->bitmap);
++	if (buf == NULL) {
++		guit->bitmap->destroy(ci->bitmap);
++		return NULL;
++	}
++	/* the ellipse's centre, in the corner square's own pixels */
++	cx = (which == CORNER_TL || which == CORNER_BL) ? (float)w : 0.0f;
++	cy = (which == CORNER_TL || which == CORNER_TR) ? (float)h : 0.0f;
++	for (py = 0; py < h; py++) {
++		uint8_t *dp = buf + (size_t)py * stride;
++
++		for (px = 0; px < w; px++, dp += 4) {
++			unsigned int in = 0, a;
++			int sx, sy;
++
++			for (sy = 0; sy < 4; sy++) {
++				float ey = ((float)py + ((float)sy + 0.5f) *
++					    0.25f - cy) / (float)h;
++
++				for (sx = 0; sx < 4; sx++) {
++					float ex = ((float)px + ((float)sx +
++						    0.5f) * 0.25f - cx) /
++						(float)w;
++
++					if (ex * ex + ey * ey <= 1.0f) in++;
++				}
++			}
++			a = alpha * in / 16u;
++			dp[bitmap_layout.r] = c & 0xff;
++			dp[bitmap_layout.g] = (c >> 8) & 0xff;
++			dp[bitmap_layout.b] = (c >> 16) & 0xff;
++			dp[bitmap_layout.a] = (uint8_t)a;
++		}
++	}
++	guit->bitmap->set_opaque(ci->bitmap, false);
++	guit->bitmap->modified(ci->bitmap);
++	ci->w = w;
++	ci->h = h;
++	ci->c = c;
++	ci->which = which;
++	corner_cache_n++;
++	corner_cache_bytes += (size_t)w * (size_t)h * 4;
++	return ci->bitmap;
++}
++
++/**
++ * Fill a rounded rectangle with smoothed corners: the box less its four
++ * corner squares as rectangles, and each corner as its cached image.
++ * false when a corner cannot be had, for the caller to fill without.
++ */
++static bool
++rounded_fill_smooth(const struct redraw_context *ctx,
++		    const plot_style_t *pstyle,
++		    const struct rect *r,
++		    const struct html_corner_radii *radii,
++		    nserror *res)
++{
++	struct bitmap *tl = NULL, *tr = NULL, *br = NULL, *bl = NULL;
++	plot_style_t style = *pstyle;
++	colour c = pstyle->fill_colour;
++	struct rect run;
++	int y, run_l = 0, run_r = 0;
++	bool open = false;
++
++	if (radii->tl_h > CORNER_MAX || radii->tl_v > CORNER_MAX ||
++	    radii->tr_h > CORNER_MAX || radii->tr_v > CORNER_MAX ||
++	    radii->br_h > CORNER_MAX || radii->br_v > CORNER_MAX ||
++	    radii->bl_h > CORNER_MAX || radii->bl_v > CORNER_MAX ||
++	    radii->tl_v + radii->bl_v > r->y1 - r->y0 ||
++	    radii->tr_v + radii->br_v > r->y1 - r->y0 ||
++	    radii->tl_h + radii->tr_h > r->x1 - r->x0 ||
++	    radii->bl_h + radii->br_h > r->x1 - r->x0) {
++		return false;
++	}
++	/* a corner with no radius one way is square: nothing to smooth */
++	if (radii->tl_h > 0 && radii->tl_v > 0 &&
++	    (tl = corner_image(radii->tl_h, radii->tl_v, c, CORNER_TL)) == NULL)
++		return false;
++	if (radii->tr_h > 0 && radii->tr_v > 0 &&
++	    (tr = corner_image(radii->tr_h, radii->tr_v, c, CORNER_TR)) == NULL)
++		return false;
++	if (radii->br_h > 0 && radii->br_v > 0 &&
++	    (br = corner_image(radii->br_h, radii->br_v, c, CORNER_BR)) == NULL)
++		return false;
++	if (radii->bl_h > 0 && radii->bl_v > 0 &&
++	    (bl = corner_image(radii->bl_h, radii->bl_v, c, CORNER_BL)) == NULL)
++		return false;
++
++	/* the box less the corner squares, as runs of equal rows */
++	style.stroke_type = PLOT_OP_TYPE_NONE;
++	for (y = r->y0; y <= r->y1; y++) {
++		int l = r->x0, rr = r->x1;
++
++		if (y < r->y1) {
++			if (tl != NULL && y < r->y0 + radii->tl_v)
++				l = r->x0 + radii->tl_h;
++			else if (bl != NULL && y >= r->y1 - radii->bl_v)
++				l = r->x0 + radii->bl_h;
++			if (tr != NULL && y < r->y0 + radii->tr_v)
++				rr = r->x1 - radii->tr_h;
++			else if (br != NULL && y >= r->y1 - radii->br_v)
++				rr = r->x1 - radii->br_h;
++		}
++		if (open && y < r->y1 && l == run_l && rr == run_r) {
++			continue;
++		}
++		if (open && run_r > run_l) {
++			run.x0 = run_l;
++			run.x1 = run_r;
++			run.y1 = y;
++			*res = ctx->plot->rectangle(ctx, &style, &run);
++			if (*res != NSERROR_OK) return true;
++		}
++		open = true;
++		run_l = l;
++		run_r = rr;
++		run.y0 = y;
++	}
++
++#define CORNER(bm, x, y, w, h) do {					\
++		if ((bm) != NULL) {					\
++			*res = ctx->plot->bitmap(ctx, (bm), (x), (y),	\
++						 (w), (h), c,		\
++						 BITMAPF_NONE);		\
++			if (*res != NSERROR_OK) return true;		\
++		}							\
++	} while (0)
++	CORNER(tl, r->x0, r->y0, radii->tl_h, radii->tl_v);
++	CORNER(tr, r->x1 - radii->tr_h, r->y0, radii->tr_h, radii->tr_v);
++	CORNER(br, r->x1 - radii->br_h, r->y1 - radii->br_v,
++	       radii->br_h, radii->br_v);
++	CORNER(bl, r->x0, r->y1 - radii->bl_v, radii->bl_h, radii->bl_v);
++#undef CORNER
++	*res = NSERROR_OK;
++	return true;
++}
++
+ /**
+  * Fill a rounded rectangle.
+  */
+@@ -1301,11 +1497,18 @@ html_plot_rounded_fill(const struct redraw_context *ctx,
+ 	unsigned int n;
+ 	plot_style_t style = *pstyle;
+ 
+-	/* a solid fill needs no path: spans are exact and far cheaper */
++	/* a solid fill needs no path: smoothed corner images and
++	 * rectangles, or spans when a corner image cannot be had */
+ 	if (pstyle->fill_type != PLOT_OP_TYPE_NONE &&
+ 	    pstyle->stroke_type == PLOT_OP_TYPE_NONE &&
+ 	    border_box->x1 > border_box->x0 &&
+ 	    border_box->y1 > border_box->y0) {
++		nserror res = NSERROR_OK;
++
++		if (rounded_fill_smooth(ctx, pstyle, border_box, radii,
++					&res)) {
++			return res;
++		}
+ 		return rounded_fill_spans(ctx, pstyle, border_box, radii);
+ 	}
+ 
