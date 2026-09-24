@@ -1,0 +1,280 @@
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 7bfb60494..9988503bd 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -313,6 +313,14 @@ struct box {
+ 	 */
+ 	int sticky_dy;
+ 	int sticky_dx;		/**< the same across, for left and right */
++	/**
++	 * Where a sticky or fixed box and its descendants were last drawn,
++	 * in screen coordinates, by an interactive redraw (VitaSurf): a
++	 * frontend that moves the screen to scroll redraws these places
++	 * rather than the whole screen.
++	 */
++	int pin_x0, pin_y0, pin_x1, pin_y1;
++	bool pin_drawn;
+ 
+ 	/**
+ 	 * The box's style composed with its block's ::first-line style
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index fd63fd4ad..a397d0bba 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -860,8 +860,12 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 
+ 	/* a box the viewport holds in place (VitaSurf) */
+ 	if (css_computed_position(box->style) == CSS_POSITION_STICKY ||
+-			css_computed_position(box->style) == CSS_POSITION_FIXED)
++			css_computed_position(box->style) == CSS_POSITION_FIXED) {
++		if (ctx->content->pinned_boxes < HTML_PINNED_MAX)
++			ctx->content->pinned[ctx->content->pinned_boxes] = box;
++		box->pin_drawn = false;
+ 		ctx->content->pinned_boxes++;
++	}
+ 
+ 	/* the filter the box is painted through (VitaSurf) */
+ 	{
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index a04528b06..5705fde2f 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -2389,6 +2389,33 @@ const char *html_get_base_target(hlcache_handle *h)
+ 
+ 
+ /* exported interface documented in html/html.h */
++int html_pinned_rects(struct hlcache_handle *h, struct rect *out, int max)
++{
++	html_content *c;
++	int i, n = 0;
++
++	if (h == NULL || content_get_type(h) != CONTENT_HTML)
++		return -1;
++	c = (html_content *) hlcache_handle_get_content(h);
++	if (c == NULL || c->pinned_boxes > HTML_PINNED_MAX ||
++			c->pinned_boxes > max)
++		return -1;
++	for (i = 0; i < c->pinned_boxes; i++) {
++		struct box *b = c->pinned[i];
++
++		/* one not drawn yet is off screen: it comes in with the
++		 * content, through the strip a pan draws */
++		if (b == NULL || !b->pin_drawn)
++			continue;
++		out[n].x0 = b->pin_x0;
++		out[n].y0 = b->pin_y0;
++		out[n].x1 = b->pin_x1;
++		out[n].y1 = b->pin_y1;
++		n++;
++	}
++	return n;
++}
++
+ bool html_pins_to_viewport(hlcache_handle *h)
+ {
+ 	html_content *c;
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index a69df2cf0..22c048198 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -210,6 +210,18 @@ const char *html_get_base_target(struct hlcache_handle *h);
+  */
+ bool html_pins_to_viewport(struct hlcache_handle *h);
+ 
++/**
++ * Where the sticky and fixed boxes of an HTML content were last drawn,
++ * in screen coordinates (VitaSurf).
++ *
++ * \param h    The content
++ * \param out  Filled with up to max rectangles
++ * \param max  Room in out
++ * eturn how many were filled, or -1 when they cannot all be told
++ *         (too many, or not an HTML content): redraw everything then
++ */
++int html_pinned_rects(struct hlcache_handle *h, struct rect *out, int max);
++
+ /**
+  * set filename on a file gadget
+  *
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 122b1a48f..dd7fa51b0 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -91,6 +91,9 @@ union html_focus_owner {
+ /**
+  * Data specific to CONTENT_HTML.
+  */
++/** Pinned boxes html_pinned_rects() can answer for (VitaSurf). */
++#define HTML_PINNED_MAX 32
++
+ typedef struct html_content {
+ 	struct content base;
+ 
+@@ -218,6 +221,8 @@ typedef struct html_content {
+ 	 * A frontend that pans the framebuffer on scroll must redraw
+ 	 * instead while this is non-zero. */
+ 	int pinned_boxes;
++	/** The first HTML_PINNED_MAX of them, for html_pinned_rects(). */
++	struct box *pinned[HTML_PINNED_MAX];
+ 
+ 	/**
+ 	 * Fixed boxes met during a redraw, drawn after everything else
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index a1d8f06b1..841ed9aee 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -3939,6 +3939,20 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		}
+ 	}
+ 
++	/* where a pinned box is on screen, for a frontend that pans
++	 * (VitaSurf); a thumbnail's redraw is in other coordinates */
++	if (ctx->interactive && box->style != NULL &&
++			(css_computed_position(box->style) ==
++					CSS_POSITION_STICKY ||
++			 css_computed_position(box->style) ==
++					CSS_POSITION_FIXED)) {
++		box->pin_x0 = r.x0;
++		box->pin_y0 = r.y0;
++		box->pin_x1 = r.x1;
++		box->pin_y1 = r.y1;
++		box->pin_drawn = true;
++	}
++
+ 	/* return if the rectangle is completely outside the clip rectangle */
+ 	if (clip->y1 < r.y0 || r.y1 < clip->y0 ||
+ 			clip->x1 < r.x0 || r.x1 < clip->x0)
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index efc1f9201..b94d3a09b 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -234,6 +234,17 @@ widget_scroll_x(struct gui_window *gw, int x, bool abs)
+ 	fbtk_set_scroll_position(gw->hscroll, bwidget->scrollx + bwidget->panx);
+ }
+ 
++/* pinned boxes a pan redraws in place of the whole screen (VitaSurf) */
++#define FB_PINNED_MAX 32
++#define FB_PINNED_MARGIN 8
++#ifdef __vita__
++static unsigned int fb_pan_moves, fb_pan_pinned_redraws;
++static unsigned long long fb_pan_move_us;
++#endif
++static void fb_redraw(fbtk_widget_t *widget,
++		      struct browser_widget_s *bwidget,
++		      struct browser_window *bw);
++
+ static void
+ fb_pan(fbtk_widget_t *widget,
+        struct browser_widget_s *bwidget,
+@@ -245,6 +256,12 @@ fb_pan(fbtk_widget_t *widget,
+ 	int height;
+ 	nsfb_bbox_t srcbox;
+ 	nsfb_bbox_t dstbox;
++	struct rect pinned[FB_PINNED_MAX];
++	int pinned_n;
++	int dx, dy, i;
++#ifdef __vita__
++	unsigned long long move_t0 = vita_now_us();
++#endif
+ 
+ 	nsfb_t *nsfb = fbtk_get_nsfb(widget);
+ 
+@@ -260,11 +277,20 @@ fb_pan(fbtk_widget_t *widget,
+ 	/* if the pan exceeds the viewport size just redraw the whole area */
+ 	/* A pan moves what is on screen and draws only the strip that
+ 	 * was uncovered. A sticky or fixed box has to stay where it is
+-	 * while the rest moves, so such a page is drawn whole instead
+-	 * (VitaSurf). */
++	 * while the rest moves: the places each was last drawn, and where
++	 * the move has carried its old picture, are drawn again after the
++	 * move (VitaSurf). A page with more of them than can be told is
++	 * drawn whole instead, as every pinned page was: Yamtrack and
++	 * GitHub both have a sticky header, so each step of scrolling
++	 * them drew the whole screen. */
++	pinned_n = 0;
++	if (html_pins_to_viewport(browser_window_get_content(bw))) {
++		pinned_n = html_pinned_rects(browser_window_get_content(bw),
++				pinned, FB_PINNED_MAX);
++	}
+ 	if (bwidget->pany >= height || bwidget->pany <= -height ||
+ 	    bwidget->panx >= width || bwidget->panx <= -width ||
+-	    html_pins_to_viewport(browser_window_get_content(bw))) {
++	    pinned_n < 0) {
+ 
+ 		bwidget->scrolly += bwidget->pany;
+ 		bwidget->scrollx += bwidget->panx;
+@@ -357,6 +383,52 @@ fb_pan(fbtk_widget_t *widget,
+ 				width, height);
+ 	}
+ 
++	/* the pinned boxes: where each was, and where the move put its
++	 * old picture, and everything between in case a sticky one has
++	 * just started or stopped sticking; each is drawn now, on its
++	 * own, since the queued strip is one rectangle and a union with
++	 * a header at the other end of the screen would be all of it */
++	dx = bwidget->panx;
++	dy = bwidget->pany;
++#ifdef __vita__
++	fb_pan_moves++;
++	fb_pan_move_us += vita_now_us() - move_t0;
++#endif
++	if (pinned_n > 0) {
++		nsfb_bbox_t queued = bwidget->redraw_box;
++		bool queued_required = bwidget->redraw_required;
++
++		for (i = 0; i < pinned_n; i++) {
++			struct rect *r = &pinned[i];
++			int x0 = r->x0 - x, y0 = r->y0 - y;
++			int x1 = r->x1 - x, y1 = r->y1 - y;
++
++			/* shadows and outlines reach past the box */
++			x0 = (x0 < x0 - dx ? x0 : x0 - dx) - FB_PINNED_MARGIN;
++			y0 = (y0 < y0 - dy ? y0 : y0 - dy) - FB_PINNED_MARGIN;
++			x1 = (x1 > x1 - dx ? x1 : x1 - dx) + FB_PINNED_MARGIN;
++			y1 = (y1 > y1 - dy ? y1 : y1 - dy) + FB_PINNED_MARGIN;
++			if (x0 < 0) x0 = 0;
++			if (y0 < 0) y0 = 0;
++			if (x1 > width) x1 = width;
++			if (y1 > height) y1 = height;
++			if (x1 <= x0 || y1 <= y0) {
++				continue;
++			}
++			bwidget->redraw_box.x0 = x0;
++			bwidget->redraw_box.y0 = y0;
++			bwidget->redraw_box.x1 = x1;
++			bwidget->redraw_box.y1 = y1;
++			fb_redraw(widget, bwidget, bw);
++#ifdef __vita__
++			fb_pan_pinned_redraws++;
++#endif
++		}
++		/* fb_redraw cleared these: the strip is still to draw */
++		bwidget->redraw_box = queued;
++		bwidget->redraw_required = queued_required;
++	}
++
+ 	bwidget->pan_required = false;
+ 	bwidget->panx = 0;
+ 	bwidget->pany = 0;
+@@ -748,9 +820,19 @@ static void framebuffer_run(void)
+ 					vita_log("draw: %s; the screen "
+ 						 "texture took %u ms of "
+ 						 "copying and %u ms of "
+-						 "putting up", stats,
+-						 copy_ms, present_ms);
++						 "putting up; scrolling moved "
++						 "the picture %u times in %u "
++						 "ms and redrew %u pinned "
++						 "areas", stats,
++						 copy_ms, present_ms,
++						 fb_pan_moves,
++						 (unsigned)(fb_pan_move_us /
++							    1000),
++						 fb_pan_pinned_redraws);
+ 				}
++				fb_pan_moves = 0;
++				fb_pan_move_us = 0;
++				fb_pan_pinned_redraws = 0;
+ 			}
+ 			/* a page that builds itself after it has loaded
+ 			 * is reported again once it goes quiet */
