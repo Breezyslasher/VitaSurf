@@ -128,6 +128,8 @@ struct vita_surface {
 	unsigned int blits;       /**< boxes copied since last counted */
 	unsigned long long blit_px; /**< pixels in them */
 	unsigned long long wait_us; /**< time spent letting the GPU go */
+	unsigned long long copy_us; /**< time copying boxes into the texture */
+	unsigned long long present_us; /**< time putting screens up from update */
 	bool gpu_reading;         /**< the GPU has not finished with the texture */
 	SceUInt64 last_present_us;
 	bool dialog;              /**< a system dialog is on screen */
@@ -1029,6 +1031,22 @@ unsigned int vita_surface_take_presents(void)
 }
 
 /* exported interface documented in vita_surface.h */
+void vita_surface_take_copy_times(unsigned int *copy_ms,
+				  unsigned int *present_ms)
+{
+	struct vita_surface *vs = the_nsfb != NULL ?
+			the_nsfb->surface_priv : NULL;
+
+	*copy_ms = *present_ms = 0;
+	if (vs == NULL) {
+		return;
+	}
+	*copy_ms = (unsigned int) (vs->copy_us / 1000);
+	*present_ms = (unsigned int) (vs->present_us / 1000);
+	vs->copy_us = 0;
+	vs->present_us = 0;
+}
+
 void vita_surface_take_blits(unsigned int *boxes, unsigned int *kpixels,
 			     unsigned int *wait_ms)
 {
@@ -1353,11 +1371,19 @@ static int vita_update(nsfb_t *nsfb, nsfb_bbox_t *box)
 		vs->beat_ms = now_ms32();
 	}
 
-	blit_box(nsfb, box);
+	{
+		SceUInt64 t0 = sceKernelGetProcessTimeWide(), t1;
 
-	if (vs != NULL && !vs->dialog && !vs->hold_progress &&
-	    sceKernelGetProcessTimeWide() - vs->last_present_us > PRESENT_INTERVAL_US) {
-		present(vs);
+		blit_box(nsfb, box);
+		t1 = sceKernelGetProcessTimeWide();
+		if (vs != NULL) {
+			vs->copy_us += t1 - t0;
+		}
+		if (vs != NULL && !vs->dialog && !vs->hold_progress &&
+		    t1 - vs->last_present_us > PRESENT_INTERVAL_US) {
+			present(vs);
+			vs->present_us += sceKernelGetProcessTimeWide() - t1;
+		}
 	}
 
 	return 0;

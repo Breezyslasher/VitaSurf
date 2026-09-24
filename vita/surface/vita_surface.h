@@ -90,6 +90,14 @@ void vita_surface_take_blits(unsigned int *boxes, unsigned int *kpixels,
 			     unsigned int *wait_ms);
 
 /**
+ * Time spent since the last call, within redraws, copying changed boxes
+ * into the screen texture and putting screens up (VitaSurf): the part
+ * of a frame's drawing that is not NetSurf's.
+ */
+void vita_surface_take_copy_times(unsigned int *copy_ms,
+				  unsigned int *present_ms);
+
+/**
  * Draw a focus rectangle over the display at screen coordinates, or clear
  * it with NULL. The rectangle is an overlay on the display buffer only:
  * NetSurf's own rendering is never touched, and it is re-applied whenever

@@ -133,9 +133,20 @@ void vita_options_floor(void)
 	if (nsoption_int(max_fetchers) < 12) {
 		nsoption_set_int(max_fetchers, 12);
 	}
-	vita_log("options: %d fetchers, %d per host",
+	/*
+	 * The memory cache, of which NetSurf gives a quarter to decoded
+	 * images. A settings file saved from the menu kept the 4 MB it was
+	 * written with, which left 1 MB of images: a poster scrolled out of
+	 * view and back was decoded again. The heap peaks near 84 MB of
+	 * 176 MB on the heaviest pages, so 24 MB is room it already has.
+	 */
+	if (nsoption_int(memory_cache_size) < 24 * 1024 * 1024) {
+		nsoption_set_int(memory_cache_size, 24 * 1024 * 1024);
+	}
+	vita_log("options: %d fetchers, %d per host, memory cache %d MB",
 		 nsoption_int(max_fetchers),
-		 nsoption_int(max_fetchers_per_host));
+		 nsoption_int(max_fetchers_per_host),
+		 nsoption_int(memory_cache_size) / (1024 * 1024));
 }
 
 /*
