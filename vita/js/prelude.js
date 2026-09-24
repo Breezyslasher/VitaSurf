@@ -2322,6 +2322,51 @@ P.getRootNode=function(){var n=this;while(n.parentNode)n=n.parentNode;return n==
 Object.defineProperty(P,'shadowRoot',{configurable:true,get:function(){return this.__shadow?this:null;}});
 Object.defineProperty(P,'host',{configurable:true,get:function(){return this.__shadow?this:undefined;}});
 Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return ceInDoc(this);}});
+/* A shadow root's <style>, once per text (VitaSurf). With shadow DOM as
+ * light DOM, every component that puts a style in its shadow root put a
+ * <style> into the page, and NetSurf parsed each as its own sheet and
+ * restyled the document for it: GitHub's contribution calendar has a
+ * <tool-tip> for every day, and its 370 copies of the same sheet held
+ * the page for seconds at a time. The first copy stays where the page
+ * put it; later copies are left empty while it is still in the document,
+ * and one comes back to life if it is not. A <style> with attributes,
+ * a media query say, is left alone. */
+(function(){
+ var canon=Object.create(null);
+ function live(css){var c=canon[css];return !!c&&ceInDoc(c);}
+ function styleNode(n){
+  return n&&n.nodeType===1&&n.tagName==='STYLE'&&
+   !(n.attributes&&n.attributes.length);}
+ function take(host,n){
+  var css=n.textContent;
+  if(!css)return;
+  if(live(css)){n.textContent='';return;}
+  canon[css]=n;}
+ function fix(host,n){
+  if(!host.__shadow||!n)return;
+  if(styleNode(n))take(host,n);
+  else if(n.nodeType===11)
+   for(var c=n.firstChild;c;c=c.nextSibling)if(styleNode(c))take(host,c);}
+ var app=P.appendChild,ins=P.insertBefore;
+ P.appendChild=function(n){fix(this,n);return app.apply(this,arguments);};
+ P.insertBefore=function(n,r){fix(this,n);return ins.apply(this,arguments);};
+ var d=Object.getOwnPropertyDescriptor(P,'innerHTML');
+ if(!d||!d.set)return;
+ Object.defineProperty(P,'innerHTML',{configurable:true,get:d.get,set:function(v){
+  var fresh=[];
+  if(this.__shadow&&typeof v==='string'&&v.indexOf('<style')>=0)
+   v=v.replace(/<style>([\s\S]*?)<\/style>/gi,function(m,css){
+    if(css&&live(css))return '<style></style>';
+    if(css)fresh.push(css);
+    return m;});
+  var r=d.set.call(this,v);
+  if(fresh.length){
+   var st=this.getElementsByTagName('style'),i,j;
+   for(i=0;i<st.length;i++)for(j=0;j<fresh.length;j++)
+    if(!canon[fresh[j]]||!live(fresh[j]))
+     if(st[i].textContent===fresh[j])canon[fresh[j]]=st[i];}
+  return r;}});
+})();
 /* <template>. libdom parses the children into the template element, so
  * content used to be the element itself -- and stamping a template then
  * put a <template> into the page instead of its children. Every Polymer

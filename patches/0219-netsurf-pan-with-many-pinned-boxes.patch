@@ -1,0 +1,186 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index a397d0bba..d30c3cb47 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -861,8 +861,20 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 	/* a box the viewport holds in place (VitaSurf) */
+ 	if (css_computed_position(box->style) == CSS_POSITION_STICKY ||
+ 			css_computed_position(box->style) == CSS_POSITION_FIXED) {
+-		if (ctx->content->pinned_boxes < HTML_PINNED_MAX)
+-			ctx->content->pinned[ctx->content->pinned_boxes] = box;
++		html_content *hc = ctx->content;
++
++		if (hc->pinned_boxes >= hc->pinned_alloc) {
++			int n = hc->pinned_alloc > 0 ? hc->pinned_alloc * 2 : 16;
++			struct box **grown = realloc(hc->pinned,
++					(size_t) n * sizeof(*grown));
++
++			if (grown != NULL) {
++				hc->pinned = grown;
++				hc->pinned_alloc = n;
++			}
++		}
++		if (hc->pinned_boxes < hc->pinned_alloc)
++			hc->pinned[hc->pinned_boxes] = box;
+ 		box->pin_drawn = false;
+ 		ctx->content->pinned_boxes++;
+ 	}
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 5705fde2f..34bfaba22 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1534,6 +1534,11 @@ static void html_destroy(struct content *c)
+ 	/* a web font still on its way must not lay this content out */
+ 	html_webfont_forget(html);
+ 
++	free(html->pinned);
++	html->pinned = NULL;
++	html->pinned_alloc = 0;
++	html->pinned_boxes = 0;
++
+ 	/* If we're still converting a layout, cancel it */
+ 	if (html->box_conversion_context != NULL) {
+ 		if (cancel_dom_to_box(html->box_conversion_context) != NSERROR_OK) {
+@@ -2389,7 +2394,8 @@ const char *html_get_base_target(hlcache_handle *h)
+ 
+ 
+ /* exported interface documented in html/html.h */
+-int html_pinned_rects(struct hlcache_handle *h, struct rect *out, int max)
++int html_pinned_rects(struct hlcache_handle *h, const struct rect *area,
++		struct rect *out, int max)
+ {
+ 	html_content *c;
+ 	int i, n = 0;
+@@ -2397,8 +2403,7 @@ int html_pinned_rects(struct hlcache_handle *h, struct rect *out, int max)
+ 	if (h == NULL || content_get_type(h) != CONTENT_HTML)
+ 		return -1;
+ 	c = (html_content *) hlcache_handle_get_content(h);
+-	if (c == NULL || c->pinned_boxes > HTML_PINNED_MAX ||
+-			c->pinned_boxes > max)
++	if (c == NULL || c->pinned_boxes > c->pinned_alloc)
+ 		return -1;
+ 	for (i = 0; i < c->pinned_boxes; i++) {
+ 		struct box *b = c->pinned[i];
+@@ -2407,6 +2412,13 @@ int html_pinned_rects(struct hlcache_handle *h, struct rect *out, int max)
+ 		 * content, through the strip a pan draws */
+ 		if (b == NULL || !b->pin_drawn)
+ 			continue;
++		/* nor does one last drawn away from the screen matter:
++		 * Yamtrack has more than 32 of these, most never near it */
++		if (b->pin_x1 <= area->x0 || b->pin_x0 >= area->x1 ||
++				b->pin_y1 <= area->y0 || b->pin_y0 >= area->y1)
++			continue;
++		if (n == max)
++			return -1;
+ 		out[n].x0 = b->pin_x0;
+ 		out[n].y0 = b->pin_y0;
+ 		out[n].x1 = b->pin_x1;
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 22c048198..492c20e80 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -212,15 +212,17 @@ bool html_pins_to_viewport(struct hlcache_handle *h);
+ 
+ /**
+  * Where the sticky and fixed boxes of an HTML content were last drawn,
+- * in screen coordinates (VitaSurf).
++ * in screen coordinates, for those last drawn over area (VitaSurf).
+  *
+  * \param h    The content
++ * \param area Only boxes last drawn over this part of the screen
+  * \param out  Filled with up to max rectangles
+  * \param max  Room in out
+- * eturn how many were filled, or -1 when they cannot all be told
++ * \return how many were filled, or -1 when they cannot all be told
+  *         (too many, or not an HTML content): redraw everything then
+  */
+-int html_pinned_rects(struct hlcache_handle *h, struct rect *out, int max);
++int html_pinned_rects(struct hlcache_handle *h, const struct rect *area,
++		struct rect *out, int max);
+ 
+ /**
+  * set filename on a file gadget
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index dd7fa51b0..479af059a 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -91,9 +91,6 @@ union html_focus_owner {
+ /**
+  * Data specific to CONTENT_HTML.
+  */
+-/** Pinned boxes html_pinned_rects() can answer for (VitaSurf). */
+-#define HTML_PINNED_MAX 32
+-
+ typedef struct html_content {
+ 	struct content base;
+ 
+@@ -221,8 +218,10 @@ typedef struct html_content {
+ 	 * A frontend that pans the framebuffer on scroll must redraw
+ 	 * instead while this is non-zero. */
+ 	int pinned_boxes;
+-	/** The first HTML_PINNED_MAX of them, for html_pinned_rects(). */
+-	struct box *pinned[HTML_PINNED_MAX];
++	/** All of them, for html_pinned_rects(); pinned_alloc is its
++	 * room, and a list that could not grow is shorter than the count. */
++	struct box **pinned;
++	int pinned_alloc;
+ 
+ 	/**
+ 	 * Fixed boxes met during a redraw, drawn after everything else
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index b94d3a09b..830d55f09 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -238,7 +238,7 @@ widget_scroll_x(struct gui_window *gw, int x, bool abs)
+ #define FB_PINNED_MAX 32
+ #define FB_PINNED_MARGIN 8
+ #ifdef __vita__
+-static unsigned int fb_pan_moves, fb_pan_pinned_redraws;
++static unsigned int fb_pan_moves, fb_pan_pinned_redraws, fb_pan_whole;
+ static unsigned long long fb_pan_move_us;
+ #endif
+ static void fb_redraw(fbtk_widget_t *widget,
+@@ -285,8 +285,22 @@ fb_pan(fbtk_widget_t *widget,
+ 	 * them drew the whole screen. */
+ 	pinned_n = 0;
+ 	if (html_pins_to_viewport(browser_window_get_content(bw))) {
++		/* the screen, and as far off it as the move reaches */
++		struct rect area;
++		int ax = abs(bwidget->panx) + FB_PINNED_MARGIN;
++		int ay = abs(bwidget->pany) + FB_PINNED_MARGIN;
++
++		area.x0 = x - ax;
++		area.y0 = y - ay;
++		area.x1 = x + width + ax;
++		area.y1 = y + height + ay;
+ 		pinned_n = html_pinned_rects(browser_window_get_content(bw),
+-				pinned, FB_PINNED_MAX);
++				&area, pinned, FB_PINNED_MAX);
++#ifdef __vita__
++		if (pinned_n < 0) {
++			fb_pan_whole++;
++		}
++#endif
+ 	}
+ 	if (bwidget->pany >= height || bwidget->pany <= -height ||
+ 	    bwidget->panx >= width || bwidget->panx <= -width ||
+@@ -823,13 +837,17 @@ static void framebuffer_run(void)
+ 						 "putting up; scrolling moved "
+ 						 "the picture %u times in %u "
+ 						 "ms and redrew %u pinned "
+-						 "areas", stats,
++						 "areas, and redrew the whole "
++						 "screen %u times for too "
++						 "many pinned boxes", stats,
+ 						 copy_ms, present_ms,
+ 						 fb_pan_moves,
+ 						 (unsigned)(fb_pan_move_us /
+ 							    1000),
+-						 fb_pan_pinned_redraws);
++						 fb_pan_pinned_redraws,
++						 fb_pan_whole);
+ 				}
++				fb_pan_whole = 0;
+ 				fb_pan_moves = 0;
+ 				fb_pan_move_us = 0;
+ 				fb_pan_pinned_redraws = 0;
