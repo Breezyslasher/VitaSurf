@@ -1,0 +1,228 @@
+diff --git a/frontends/framebuffer/bitmap.c b/frontends/framebuffer/bitmap.c
+index 74ad2b4a4..8053337f5 100644
+--- a/frontends/framebuffer/bitmap.c
++++ b/frontends/framebuffer/bitmap.c
+@@ -124,6 +124,7 @@ static void bitmap_destroy(void *bitmap)
+ 
+ 	assert(bm != NULL);
+ 
++	framebuffer_scaled_forget(bm);
+ 	nsfb_free(bm);
+ }
+ 
+@@ -134,6 +135,7 @@ static void bitmap_destroy(void *bitmap)
+  * \param  bitmap  a bitmap, as returned by bitmap_create()
+  */
+ static void bitmap_modified(void *bitmap) {
++	framebuffer_scaled_forget(bitmap);
+ }
+ 
+ /**
+@@ -148,6 +150,7 @@ static void bitmap_set_opaque(void *bitmap, bool opaque)
+ 
+ 	assert(bm != NULL);
+ 
++	framebuffer_scaled_forget(bm);
+ 	if (opaque) {
+ 		nsfb_set_geometry(bm, 0, 0, NSFB_FMT_XBGR8888);
+ 	} else {
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index a19e1e03a..acf086e08 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -442,6 +442,149 @@ done:
+  * \param flags the flags controlling the type of plot operation
+  * \return NSERROR_OK on success else error code.
+  */
++/*
++ * Scaled copies of bitmaps (VitaSurf). A scaled plot stepped through the
++ * source for every pixel of every redraw, and a page of posters shown
++ * smaller than they were decoded spent up to 290 ms of each second of
++ * scrolling Yamtrack doing it again. The copy is made with the same
++ * nearest-pixel stepping libnsfb uses, so plotting it unscaled gives the
++ * pixels the scaled plot gave, clipped or not. Entries go least recently
++ * used first, within a bound, and a bitmap's go when it is modified or
++ * destroyed.
++ */
++#define SCALED_SLOTS 64
++#define SCALED_MAX_BYTES (3 * 1024 * 1024)
++#define SCALED_MAX_ONE (1024 * 1024)
++
++static struct fb_scaled {
++	nsfb_t *src;
++	int w, h;
++	nsfb_t *copy;
++	size_t bytes;
++	unsigned int used;
++} fb_scaled[SCALED_SLOTS];
++static size_t fb_scaled_bytes;
++static unsigned int fb_scaled_clock;
++static unsigned int fb_scaled_hits, fb_scaled_made;
++
++static void scaled_drop(struct fb_scaled *e)
++{
++	nsfb_free(e->copy);
++	fb_scaled_bytes -= e->bytes;
++	memset(e, 0, sizeof(*e));
++}
++
++void framebuffer_scaled_forget(nsfb_t *src)
++{
++	int i;
++
++	for (i = 0; i < SCALED_SLOTS; i++) {
++		if (fb_scaled[i].src == src) {
++			scaled_drop(&fb_scaled[i]);
++		}
++	}
++}
++
++static nsfb_t *scaled_copy(nsfb_t *bm, int w, int h)
++{
++	struct fb_scaled *e, *free_slot;
++	enum nsfb_format_e fmt;
++	int bw, bh, bstride, dstride, i, x, y, dx, dxr, dy, dyr, ry, row;
++	uint8_t *bptr, *dptr;
++	size_t bytes;
++	nsfb_t *copy;
++
++	nsfb_get_geometry(bm, &bw, &bh, &fmt);
++	if (w <= 0 || h <= 0 || bw <= 0 || bh <= 0 ||
++	    (fmt != NSFB_FMT_ABGR8888 && fmt != NSFB_FMT_XBGR8888)) {
++		return NULL;
++	}
++	bytes = (size_t)w * (size_t)h * 4;
++	if (bytes > SCALED_MAX_ONE) {
++		return NULL;
++	}
++	for (i = 0; i < SCALED_SLOTS; i++) {
++		e = &fb_scaled[i];
++		if (e->src == bm && e->w == w && e->h == h) {
++			e->used = ++fb_scaled_clock;
++			fb_scaled_hits++;
++			return e->copy;
++		}
++	}
++	/* room: the least recently used go until this fits */
++	for (;;) {
++		struct fb_scaled *lru = NULL;
++
++		free_slot = NULL;
++		for (i = 0; i < SCALED_SLOTS; i++) {
++			e = &fb_scaled[i];
++			if (e->src == NULL) {
++				if (free_slot == NULL) free_slot = e;
++			} else if (lru == NULL || e->used < lru->used) {
++				lru = e;
++			}
++		}
++		if (free_slot != NULL &&
++		    fb_scaled_bytes + bytes <= SCALED_MAX_BYTES) {
++			break;
++		}
++		if (lru == NULL) {
++			return NULL;
++		}
++		scaled_drop(lru);
++	}
++	copy = nsfb_new(NSFB_SURFACE_RAM);
++	if (copy == NULL) {
++		return NULL;
++	}
++	if (nsfb_set_geometry(copy, w, h, fmt) == -1 ||
++	    nsfb_init(copy) == -1) {
++		nsfb_free(copy);
++		return NULL;
++	}
++	nsfb_get_buffer(bm, &bptr, &bstride);
++	nsfb_get_buffer(copy, &dptr, &dstride);
++	/* libnsfb's bitmap_scaled stepping, over the whole target */
++	dx = bw / w;
++	dxr = bw % w;
++	dy = bh / h;
++	dyr = bh % h;
++	row = 0;
++	ry = 0;
++	for (y = 0; y < h; y++) {
++		const uint32_t *sp = (const uint32_t *)(void *)
++			(bptr + (size_t)row * (size_t)bstride);
++		uint32_t *dp = (uint32_t *)(void *)
++			(dptr + (size_t)y * (size_t)dstride);
++		int xoff = 0, rx = 0;
++
++		for (x = 0; x < w; x++) {
++			dp[x] = sp[xoff];
++			xoff += dx;
++			rx += dxr;
++			if (rx >= w) {
++				xoff++;
++				rx -= w;
++			}
++		}
++		row += dy;
++		ry += dyr;
++		if (ry >= h) {
++			row++;
++			ry -= h;
++		}
++	}
++	free_slot->src = bm;
++	free_slot->w = w;
++	free_slot->h = h;
++	free_slot->copy = copy;
++	free_slot->bytes = bytes;
++	free_slot->used = ++fb_scaled_clock;
++	fb_scaled_bytes += bytes;
++	fb_scaled_made++;
++	return copy;
++}
++
+ static nserror
+ framebuffer_plot_bitmap(const struct redraw_context *ctx,
+ 		  struct bitmap *bitmap,
+@@ -469,7 +612,16 @@ framebuffer_plot_bitmap(const struct redraw_context *ctx,
+ 	 */
+ 
+ 	if (!(repeat_x || repeat_y)) {
+-		/* Not repeating at all, so just plot it */
++		/* Not repeating at all, so just plot it: a scaled copy made
++		 * once where the size differs (VitaSurf) */
++		nsfb_get_geometry(bm, &bmwidth, &bmheight, &bmformat);
++		if (width != bmwidth || height != bmheight) {
++			nsfb_t *scaled = scaled_copy(bm, width, height);
++
++			if (scaled != NULL) {
++				bm = scaled;
++			}
++		}
+ 		loc.x0 = x;
+ 		loc.y0 = y;
+ 		loc.x1 = loc.x0 + width;
+@@ -799,6 +951,13 @@ void fb_plot_take_stats(char *buf, size_t len)
+ 		fbp_us[k] = 0;
+ 		fbp_px[k] = 0;
+ 	}
++	if (fb_scaled_hits + fb_scaled_made > 0 && at < len) {
++		snprintf(buf + at, len - at, "; scaled copies %u reused, %u "
++			 "made, %u KB held", fb_scaled_hits, fb_scaled_made,
++			 (unsigned int)(fb_scaled_bytes / 1024));
++		fb_scaled_hits = 0;
++		fb_scaled_made = 0;
++	}
+ }
+ #endif
+ 
+diff --git a/frontends/framebuffer/framebuffer.h b/frontends/framebuffer/framebuffer.h
+index c4d9b2fde..851008dde 100644
+--- a/frontends/framebuffer/framebuffer.h
++++ b/frontends/framebuffer/framebuffer.h
+@@ -37,6 +37,9 @@ bool framebuffer_set_cursor(struct fbtk_bitmap *bm);
+  */
+ nsfb_t *framebuffer_set_surface(nsfb_t *new_nsfb);
+ 
++/** Drop the scaled copies made of a bitmap: it changed or is going. */
++void framebuffer_scaled_forget(nsfb_t *src);
++
+ #ifdef __vita__
+ /**
+  * The plotter calls since the last call, by kind, with their time and
