@@ -2366,6 +2366,19 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
     if(!canon[fresh[j]]||!live(fresh[j]))
      if(st[i].textContent===fresh[j])canon[fresh[j]]=st[i];}
   return r;}});
+ /* and the text given after the style is in: GitHub's <tool-tip>
+  * appends an empty <style> to its shadow root and then sets its
+  * textContent, so the checks above saw nothing to fold, and build 444
+  * still parsed 399 sheets on a profile page, 5641 :host rules that
+  * every element's style was matched against */
+ var t=Object.getOwnPropertyDescriptor(P,'textContent');
+ if(!t||!t.set)return;
+ Object.defineProperty(P,'textContent',{configurable:true,get:t.get,set:function(v){
+  var p;
+  if(typeof v==='string'&&v&&(p=this.parentNode)&&p.__shadow&&styleNode(this)){
+   if(live(v)){if(canon[v]!==this)v='';}
+   else{t.set.call(this,v);canon[v]=this;return;}}
+  t.set.call(this,v);}});
 })();
 /* <template>. libdom parses the children into the template element, so
  * content used to be the element itself -- and stamping a template then

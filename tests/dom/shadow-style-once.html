@@ -27,6 +27,23 @@ box.appendChild(document.createElement('tip-el'));
 ok("with the first gone, a new copy is kept full", full()===1);
 for(i=0;i<5;i++)box.appendChild(document.createElement('tip-app'));
 ok("appendChild of a style into a shadow root is folded too", full()===1);
+/* GitHub's <tool-tip>: an empty <style> goes in, and the text after */
+class TipLate extends HTMLElement{connectedCallback(){
+ if(this.shadowRoot)return;
+ var sh=this.attachShadow({mode:'open'});
+ var s=sh.appendChild(document.createElement('style'));
+ s.textContent=CSS;
+ sh.appendChild(document.createElement('slot'));}}
+customElements.define('tip-late',TipLate);
+for(i=0;i<20;i++)box.appendChild(document.createElement('tip-late'));
+ok("text set after the style is appended is folded too", full()===1);
+var CSS2=':host{color:rgb(4,5,6)}';
+var lone=document.createElement('div');lone.attachShadow({mode:'open'});
+var ls=lone.shadowRoot.appendChild(document.createElement('style'));
+document.body.appendChild(lone);ls.textContent=CSS2;
+ok("a new text set that way is kept", ls.textContent===CSS2);
+ls.textContent=CSS2;
+ok("setting the kept copy's own text again keeps it", ls.textContent===CSS2);
 var m=document.createElement('div');m.attachShadow({mode:'open'});
 var ms=document.createElement('style');ms.setAttribute('media','print');ms.textContent=CSS;m.shadowRoot.appendChild(ms);
 ok("a style with attributes is left alone", ms.textContent===CSS);
