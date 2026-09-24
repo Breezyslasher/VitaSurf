@@ -1,0 +1,37 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 03d05205f..0908dc234 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -1090,18 +1090,29 @@ static void framebuffer_run(void)
+ 
+ 					image_cache_take_decode_stats(&ds);
+ 					if (ds.decodes > 0 || ds.held > 0 ||
+-					    ds.budgeted > 0) {
++					    ds.budgeted > 0 || ds.queued > 0 ||
++					    ds.threaded > 0) {
+ 						vita_log("images: %u decoded, %u "
+ 							 "kpixels in %u ms, the "
+ 							 "longest %u ms for %u "
+ 							 "kpixels; %u draws waited "
+ 							 "for the view to stop "
+ 							 "and %u for a later "
+-							 "frame", ds.decodes,
++							 "frame; the decode "
++							 "thread was given %u "
++							 "(%u dropped) and "
++							 "finished %u in %u ms, "
++							 "the longest %u ms for "
++							 "%u kpixels",
++							 ds.decodes,
+ 							 ds.kpixels, ds.ms,
+ 							 ds.max_ms,
+ 							 ds.max_kpixels, ds.held,
+-							 ds.budgeted);
++							 ds.budgeted, ds.queued,
++							 ds.dropped, ds.threaded,
++							 ds.threaded_ms,
++							 ds.threaded_max_ms,
++							 ds.threaded_max_kpixels);
+ 					}
+ 				}
+ 				fb_pan_whole = 0;
