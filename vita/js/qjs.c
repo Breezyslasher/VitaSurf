@@ -5491,8 +5491,10 @@ static void relayout_callback(void *p)
 	 * the page was frozen for */
 	thread->relayout_ms = (unsigned)(now_ms() - t0);
 	vita_log("qjs: layout rebuilt after script changes in %u ms "
-		 "(%u elements)%s",
+		 "(%u elements), %u images taken back and %u asked for "
+		 "again%s",
 		 thread->relayout_ms, thread->dom_elements,
+		 htmlc->relayout_reused, htmlc->relayout_fetched,
 		 err == NSERROR_OK ? "" : " (failed)");
 	/* what the page looks like once its scripts have built it, when
 	 * the flag file asks for it (VitaSurf) */

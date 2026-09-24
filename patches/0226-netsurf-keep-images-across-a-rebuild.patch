@@ -1,0 +1,246 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 34bfaba22..815b26d65 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1415,12 +1415,14 @@ nserror html_relayout(html_content *htmlc)
+ 
+ 	/* Run to completion here rather than yielding: the content has no
+ 	 * box tree until this finishes, and redraw, hit testing and the
+-	 * rest of NetSurf take one for granted on a loaded page. */
++	 * rest of NetSurf take one for granted on a loaded page. The new
++	 * tree takes back the images it still shows (VitaSurf). */
++	html_object_reuse_begin(htmlc, old_objects);
+ 	err = dom_to_box_sync(html, htmlc, html_relayout_done);
+ 	dom_node_unref(html);
+ 
+ 	/* the new tree now holds its own references, so let these go */
+-	html_object_free_list(htmlc, old_objects);
++	html_object_free_list(htmlc, html_object_reuse_end(htmlc));
+ 
+ 	return err;
+ }
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 492c20e80..328900e15 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -113,6 +113,9 @@ struct content_html_object {
+ 	content_type permitted_types;
+ 	bool background;  /**< This object is a background image. */
+ 	bool mask;        /**< This object is a CSS mask image (VitaSurf). */
++	/** next in the rebuild's table of objects to take back (VitaSurf) */
++	struct content_html_object *reuse_next;
++	bool reused;      /**< taken back by the rebuilt tree (VitaSurf) */
+ };
+ 
+ 
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 19444a720..e25c2a410 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -828,6 +828,128 @@ nserror html_object_free_objects(html_content *html)
+ }
+ 
+ 
++/*
++ * Taking objects back across a layout rebuild (VitaSurf).
++ *
++ * A script that changes the page has the whole box tree rebuilt, and
++ * the new tree asked for every image again. The old objects were held
++ * so each answer came from the cache, but every one still made a new
++ * content, converted it and ran its callbacks: on Yamtrack, 331 images
++ * cost two seconds after each 1.3 s rebuild, with the page frozen for
++ * all of it. A finished image the new tree asks for with the same URL
++ * and role is now handed over as it is.
++ */
++/* the table when there is no memory for a real one */
++static struct content_html_object *reuse_one_slot;
++
++static uint32_t html_object_reuse_hash(nsurl *url)
++{
++	return nsurl_hash(url);
++}
++
++/* exported interface documented in html/object.h */
++void html_object_reuse_begin(html_content *c,
++			     struct content_html_object *objects)
++{
++	struct content_html_object *o, *next;
++	unsigned int n = 0, size = 16;
++
++	c->relayout_reused = 0;
++	c->relayout_fetched = 0;
++	for (o = objects; o != NULL; o = o->next) {
++		n++;
++	}
++	while (size < n * 2) {
++		size *= 2;
++	}
++	c->reuse_slots = calloc(size, sizeof(*c->reuse_slots));
++	if (c->reuse_slots != NULL) {
++		c->reuse_mask = size - 1;
++	} else {
++		/* one chain, searched from end to end, rather than none */
++		reuse_one_slot = NULL;
++		c->reuse_slots = &reuse_one_slot;
++		c->reuse_mask = 0;
++	}
++	for (o = objects; o != NULL; o = next) {
++		unsigned int h = 0;
++
++		next = o->next;
++		o->next = NULL;
++		o->reused = false;
++		if (o->content != NULL) {
++			h = html_object_reuse_hash(
++					hlcache_handle_get_url(o->content)) &
++					c->reuse_mask;
++		}
++		o->reuse_next = c->reuse_slots[h];
++		c->reuse_slots[h] = o;
++	}
++}
++
++/* exported interface documented in html/object.h */
++struct content_html_object *html_object_reuse_end(html_content *c)
++{
++	struct content_html_object *left = NULL, *o, *next;
++	unsigned int i;
++
++	if (c->reuse_slots == NULL) {
++		return NULL;
++	}
++	for (i = 0; i <= c->reuse_mask; i++) {
++		for (o = c->reuse_slots[i]; o != NULL; o = next) {
++			next = o->reuse_next;
++			o->reuse_next = NULL;
++			if (!o->reused) {
++				o->next = left;
++				left = o;
++			}
++		}
++	}
++	if (c->reuse_slots != &reuse_one_slot) {
++		free(c->reuse_slots);
++	}
++	c->reuse_slots = NULL;
++	c->reuse_mask = 0;
++	return left;
++}
++
++/**
++ * Take back a finished image from the rebuild's table, if one matches.
++ */
++static struct content_html_object *
++html_object_reuse_take(html_content *c, nsurl *url,
++		       content_type permitted_types, bool background,
++		       bool mask)
++{
++	struct content_html_object *o;
++
++	if (c->reuse_slots == NULL) {
++		return NULL;
++	}
++	for (o = c->reuse_slots[html_object_reuse_hash(url) & c->reuse_mask];
++	     o != NULL; o = o->reuse_next) {
++		if (o->reused || o->content == NULL || o->box == NULL ||
++		    o->background != background || o->mask != mask ||
++		    o->permitted_types != permitted_types) {
++			continue;
++		}
++		/* an image, and a whole one: anything still arriving, or
++		 * an HTML object with its refresh timer, is asked for anew */
++		if ((content_get_type(o->content) & CONTENT_IMAGE) == 0 ||
++		    content_get_status(o->content) != CONTENT_STATUS_DONE) {
++			continue;
++		}
++		if (!nsurl_compare(url, hlcache_handle_get_url(o->content),
++				   NSURL_COMPLETE)) {
++			continue;
++		}
++		o->reused = true;
++		return o;
++	}
++	return NULL;
++}
++
+ static bool
+ html_fetch_object_role(html_content *c,
+ 		  nsurl *url,
+@@ -845,6 +967,29 @@ html_fetch_object_role(html_content *c,
+ 	if (c->aborted)
+ 		return true;
+ 
++	/* the same image, still whole, from before a rebuild: its handle,
++	 * content and bitmap carry over, and the box has it at once
++	 * (VitaSurf). The handle's callback context is this very struct,
++	 * so the struct moves with it. */
++	if (box != NULL) {
++		object = html_object_reuse_take(c, url, permitted_types,
++						background, mask);
++		if (object != NULL) {
++			object->parent = (struct content *) c;
++			object->box = box;
++			object->next = c->object_list;
++			c->object_list = object;
++			c->num_objects++;
++			c->relayout_reused++;
++			html_object_done(box, object->content, background,
++					 mask);
++			return true;
++		}
++		if (c->reuse_slots != NULL) {
++			c->relayout_fetched++;
++		}
++	}
++
+ 	child.charset = c->encoding;
+ 	child.quirks = c->base.quirks;
+ 
+diff --git a/content/handlers/html/object.h b/content/handlers/html/object.h
+index 9da3bd67a..84fa3cdb7 100644
+--- a/content/handlers/html/object.h
++++ b/content/handlers/html/object.h
+@@ -74,6 +74,22 @@ nserror html_object_free_objects(struct html_content *html);
+  * \param objects head of the saved list, which this consumes
+  * \return NSERROR_OK
+  */
++/**
++ * Set a layout rebuild's old objects aside for the new tree to take back
++ * (VitaSurf). While the table stands, an object asked for with the same
++ * URL and role as a finished image in it is handed over, handle and all,
++ * instead of being fetched, created and converted again.
++ */
++void html_object_reuse_begin(struct html_content *html,
++			     struct content_html_object *objects);
++
++/**
++ * End the rebuild's table.
++ *
++ * \return the objects the new tree did not take, to be freed.
++ */
++struct content_html_object *html_object_reuse_end(struct html_content *html);
++
+ nserror html_object_free_list(struct html_content *html,
+ 			      struct content_html_object *objects);
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 479af059a..476cef6ec 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -135,6 +135,16 @@ typedef struct html_content {
+ 	 * burst of arrivals into a single pass.
+ 	 */
+ 	bool object_reformat_pending;
++	/**
++	 * A layout rebuild's old objects, by URL, for the new tree to take
++	 * back rather than ask for again (VitaSurf); NULL outside one.
++	 */
++	struct content_html_object **reuse_slots;
++	unsigned int reuse_mask;
++	/** of the last rebuild's objects, how many were taken back and how
++	 * many asked for afresh */
++	unsigned int relayout_reused;
++	unsigned int relayout_fetched;
+ 
+ 	/** Whether scripts are enabled for this content */
+ 	bool enable_scripting;
