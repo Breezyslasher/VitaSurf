@@ -99,10 +99,33 @@ void vita_surface_take_copy_times(unsigned int *copy_ms,
 
 /**
  * Draw a focus rectangle over the display at screen coordinates, or clear
- * it with NULL. The rectangle is an overlay on the display buffer only:
- * NetSurf's own rendering is never touched, and it is re-applied whenever
- * NetSurf updates the area underneath.
+ * it with NULL. The rectangle is drawn by the GPU over the page each time
+ * the screen is put up: NetSurf's own rendering is never touched.
  */
 void vita_surface_set_focus_rect(const nsfb_bbox_t *rect);
+
+/**
+ * The part of the screen in view is about to be moved by (dx, dy)
+ * through nsfb_plot_copy() (VitaSurf). The surface moves its picture on
+ * the GPU instead, by reading the view's part of the screen texture
+ * from an offset, so the copy's update is not written to the texture;
+ * only what is drawn afterwards is. Call vita_surface_scroll_done()
+ * after the copy.
+ *
+ * \return false when the move cannot be done that way: the copy is
+ *         then written as usual, and scroll_done need not be called.
+ */
+bool vita_surface_scroll(const nsfb_bbox_t *view, int dx, int dy);
+
+/** End a move vita_surface_scroll() started. */
+void vita_surface_scroll_done(void);
+
+/**
+ * Scrolls moved on the GPU since the last call, the pixels those did not
+ * have to copy, in thousands, and how often the texture had to be put
+ * back in order because the view changed.
+ */
+void vita_surface_take_moves(unsigned int *moves, unsigned int *kpixels,
+			     unsigned int *resets);
 
 #endif

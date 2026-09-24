@@ -4,7 +4,9 @@
  * NetSurf plots into a cached shadow buffer in main memory. Each damaged
  * rectangle reported through nsfb_update() is copied into a GPU texture
  * that covers the screen, and the texture is drawn through libvita2d
- * whenever something changed. The GPU is involved only so that system
+ * whenever something changed. A scroll moves the picture by drawing the
+ * view from an offset into the texture (see ring in vita_surface), so
+ * only the uncovered strip is copied. The GPU is involved only so that system
  * dialogs (the IME keyboard) can composite over the page: they refuse to
  * start unless GXM is initialised, and they render through the common
  * dialog update each frame.
@@ -170,6 +172,31 @@ struct vita_surface {
 	/* focus rectangle overlay, screen coordinates, valid when set */
 	bool focus_valid;
 	nsfb_bbox_t focus;
+
+	/*
+	 * The scrolling view as a ring (VitaSurf). Scrolling used to copy
+	 * all that stayed on screen into the texture again, a screen's
+	 * worth of writes at about 12 ms each step. Inside ring the
+	 * texture is read from an offset instead: screen point (x, y) is
+	 * held at texture point
+	 *
+	 *   (ring.x0 + (x - ring.x0 + ring_ox) % width,
+	 *    ring.y0 + (y - ring.y0 + ring_oy) % height)
+	 *
+	 * so a scroll changes the offsets, the GPU draws the view in up
+	 * to four parts, and only the strip the scroll uncovered is
+	 * written. Outside ring (the toolbar) the texture is the screen.
+	 */
+	bool ring_valid;
+	nsfb_bbox_t ring;
+	int ring_ox;
+	int ring_oy;
+	bool moving;              /**< between scroll and scroll_done */
+	int move_dx;
+	int move_dy;
+	unsigned int gpu_moves;   /**< scrolls moved by offset, since asked */
+	unsigned int ring_resets; /**< times the texture was put in order */
+	unsigned long long moved_px; /**< pixels those did not copy */
 
 	/*
 	 * The busy overlay (see BUSY_AFTER_US). gpu_lock is held by
@@ -537,34 +564,37 @@ static void poll_input(struct vita_surface *vs)
 static nsfb_t *the_nsfb;
 
 /**
- * Draw the part of the focus rectangle outline that falls inside area,
- * directly into the display buffer. area is already clipped to the screen.
+ * Draw the focus rectangle outline over the page, on the GPU.
+ *
+ * It used to be written into the texture over whatever was copied
+ * under it; with the view held as a ring (see vita_surface), what is
+ * in the texture moves with a scroll and the outline would move with
+ * it, so it is drawn on top at present time instead.
  */
-static void draw_focus_overlay(struct vita_surface *vs, const nsfb_bbox_t *area)
+static void draw_focus(const struct vita_surface *vs)
 {
-	int x, y;
+	const float t = (float)FOCUS_THICKNESS;
+	float x0, y0, w, h;
 
-	for (y = area->y0; y < area->y1; y++) {
-		uint32_t *row;
-		bool edge_row;
-
-		if (y < vs->focus.y0 || y >= vs->focus.y1) {
-			continue;
-		}
-		edge_row = (y < vs->focus.y0 + FOCUS_THICKNESS) ||
-			   (y >= vs->focus.y1 - FOCUS_THICKNESS);
-		row = vs->display + y * vs->stride;
-		for (x = area->x0; x < area->x1; x++) {
-			if (x < vs->focus.x0 || x >= vs->focus.x1) {
-				continue;
-			}
-			if (edge_row ||
-			    x < vs->focus.x0 + FOCUS_THICKNESS ||
-			    x >= vs->focus.x1 - FOCUS_THICKNESS) {
-				row[x] = FOCUS_COLOUR;
-			}
-		}
+	if (!vs->focus_valid) {
+		return;
 	}
+	x0 = (float)vs->focus.x0;
+	y0 = (float)vs->focus.y0;
+	w = (float)(vs->focus.x1 - vs->focus.x0);
+	h = (float)(vs->focus.y1 - vs->focus.y0);
+	if (w <= 0.0f || h <= 0.0f) {
+		return;
+	}
+	if (w <= 2.0f * t || h <= 2.0f * t) {
+		vita2d_draw_rectangle(x0, y0, w, h, FOCUS_COLOUR);
+		return;
+	}
+	vita2d_draw_rectangle(x0, y0, w, t, FOCUS_COLOUR);
+	vita2d_draw_rectangle(x0, y0 + h - t, w, t, FOCUS_COLOUR);
+	vita2d_draw_rectangle(x0, y0 + t, t, h - 2.0f * t, FOCUS_COLOUR);
+	vita2d_draw_rectangle(x0 + w - t, y0 + t, t, h - 2.0f * t,
+			      FOCUS_COLOUR);
 }
 
 /* The GPU and the texture, between the main thread and the overlay. */
@@ -715,16 +745,141 @@ static SceKernelMemBlockType pick_texture_memory(void)
 	return pick;
 }
 
+/**
+ * Called with each piece of a screen area and where the texture holds
+ * it: screen rectangle part is at texture point (tx, ty).
+ */
+typedef void part_fn(struct vita_surface *vs, const nsfb_bbox_t *part,
+		     int tx, int ty, void *pw);
+
+/** Split area, inside the ring, where the ring wraps. */
+static void ring_parts(struct vita_surface *vs, const nsfb_bbox_t *area,
+		       part_fn *fn, void *pw)
+{
+	int w = vs->ring.x1 - vs->ring.x0;
+	int h = vs->ring.y1 - vs->ring.y0;
+	int x, y;
+
+	for (y = area->y0; y < area->y1; ) {
+		int ry = (y - vs->ring.y0 + vs->ring_oy) % h;
+		int yn = y + (h - ry);
+
+		if (yn > area->y1) {
+			yn = area->y1;
+		}
+		for (x = area->x0; x < area->x1; ) {
+			int rx = (x - vs->ring.x0 + vs->ring_ox) % w;
+			int xn = x + (w - rx);
+			nsfb_bbox_t part;
+
+			if (xn > area->x1) {
+				xn = area->x1;
+			}
+			part.x0 = x;
+			part.y0 = y;
+			part.x1 = xn;
+			part.y1 = yn;
+			fn(vs, &part, vs->ring.x0 + rx, vs->ring.y0 + ry, pw);
+			x = xn;
+		}
+		y = yn;
+	}
+}
+
+/**
+ * Hand fn each piece of area, which is already on the screen, with
+ * where the texture holds it: one piece while the ring is in order,
+ * otherwise the bands round the ring as they are and the part inside
+ * split where it wraps.
+ */
+static void screen_parts(struct vita_surface *vs, const nsfb_bbox_t *area,
+			 part_fn *fn, void *pw)
+{
+	nsfb_bbox_t in = *area;
+	nsfb_bbox_t band;
+
+	if (!vs->ring_valid || (vs->ring_ox == 0 && vs->ring_oy == 0) ||
+	    !nsfb_plot_clip(&vs->ring, &in)) {
+		fn(vs, area, area->x0, area->y0, pw);
+		return;
+	}
+	if (area->y0 < in.y0) {
+		band = *area;
+		band.y1 = in.y0;
+		fn(vs, &band, band.x0, band.y0, pw);
+	}
+	if (area->y1 > in.y1) {
+		band = *area;
+		band.y0 = in.y1;
+		fn(vs, &band, band.x0, band.y0, pw);
+	}
+	band.y0 = in.y0;
+	band.y1 = in.y1;
+	if (area->x0 < in.x0) {
+		band.x0 = area->x0;
+		band.x1 = in.x0;
+		fn(vs, &band, band.x0, band.y0, pw);
+	}
+	if (area->x1 > in.x1) {
+		band.x0 = in.x1;
+		band.x1 = area->x1;
+		fn(vs, &band, band.x0, band.y0, pw);
+	}
+	ring_parts(vs, &in, fn, pw);
+}
+
+/** part_fn: copy a piece of the shadow buffer (pw) into the texture. */
+static void copy_part(struct vita_surface *vs, const nsfb_bbox_t *part,
+		      int tx, int ty, void *pw)
+{
+	nsfb_t *nsfb = pw;
+	int width = part->x1 - part->x0;
+	int y;
+	const uint8_t *src = nsfb->ptr + part->y0 * nsfb->linelen +
+			     part->x0 * 4;
+	uint32_t *dst = vs->display + ty * vs->stride + tx;
+
+	for (y = part->y0; y < part->y1; y++) {
+		blit_row(dst, (const uint32_t *)(const void *)src, width);
+		src += nsfb->linelen;
+		dst += vs->stride;
+	}
+}
+
+/** part_fn: draw a piece of the texture where it goes on screen. */
+static void draw_part(struct vita_surface *vs, const nsfb_bbox_t *part,
+		      int tx, int ty, void *pw)
+{
+	(void)pw;
+	vita2d_draw_texture_part(vs->tex, (float)part->x0, (float)part->y0,
+				 (float)tx, (float)ty,
+				 (float)(part->x1 - part->x0),
+				 (float)(part->y1 - part->y0));
+}
+
+/**
+ * Draw the page and the focus outline. Between vita2d_start_drawing()
+ * and vita2d_end_drawing(), with the GPU lock held.
+ */
+static void draw_page(struct vita_surface *vs)
+{
+	nsfb_bbox_t all;
+
+	all.x0 = 0;
+	all.y0 = 0;
+	all.x1 = SCREEN_WIDTH;
+	all.y1 = SCREEN_HEIGHT;
+	screen_parts(vs, &all, draw_part, NULL);
+	draw_focus(vs);
+}
+
 /** Copy a rectangle of the shadow buffer to the display buffer. */
 static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 {
 	struct vita_surface *vs = nsfb->surface_priv;
 	nsfb_bbox_t area = *box;
 	nsfb_bbox_t screen;
-	int y;
 	int width;
-	const uint8_t *src;
-	uint32_t *dst;
 
 	if (vs == NULL || vs->display == NULL || nsfb->ptr == NULL) {
 		return;
@@ -751,7 +906,7 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 		vita_log("surface: update %u box %d,%d-%d,%d (clipped %d,%d-%d,%d) pixel %08x",
 			 vs->updates, box->x0, box->y0, box->x1, box->y1,
 			 area.x0, area.y0, area.x1, area.y1,
-			 (unsigned int)*(const uint32_t *)
+			 (unsigned int)*(const uint32_t *)(const void *)
 				(nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4));
 	} else if (vs->verbose && vs->updates == DIAG_BOXES + 1) {
 		vita_log("surface: further updates not logged");
@@ -761,17 +916,7 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 	/* the GPU may still be reading what is about to be overwritten */
 	gpu_release_texture(vs);
 
-	src = nsfb->ptr + area.y0 * nsfb->linelen + area.x0 * 4;
-	dst = vs->display + area.y0 * vs->stride + area.x0;
-	for (y = area.y0; y < area.y1; y++) {
-		blit_row(dst, (const uint32_t *)(const void *)src, width);
-		src += nsfb->linelen;
-		dst += vs->stride;
-	}
-
-	if (vs->focus_valid && nsfb_plot_bbox_intersect(&area, &vs->focus)) {
-		draw_focus_overlay(vs, &area);
-	}
+	screen_parts(vs, &area, copy_part, nsfb);
 	vs->dirty = true;
 	gpu_unlock(vs);
 }
@@ -802,7 +947,7 @@ static bool present(struct vita_surface *vs)
 	}
 	gpu_lock(vs);
 	vita2d_start_drawing();
-	vita2d_draw_texture(vs->tex, 0.0f, 0.0f);
+	draw_page(vs);
 	vita2d_end_drawing();
 	if (vs->dialog) {
 		vita2d_common_dialog_update();
@@ -917,7 +1062,7 @@ static void busy_draw(struct vita_surface *vs, uint32_t t_ms)
 	int i, lit = (int)((t_ms / 100u) % 8u);
 
 	vita2d_start_drawing();
-	vita2d_draw_texture(vs->tex, 0.0f, 0.0f);
+	draw_page(vs);
 	vita2d_draw_rectangle(px, py, pw, ph, 0xD0202020u);
 	/* spinner: eight dots, one bright, going round */
 	for (i = 0; i < 8; i++) {
@@ -1224,6 +1369,9 @@ static int vita_initialise(nsfb_t *nsfb)
 		free(vs);
 		return -1;
 	}
+	/* drawn one to one, in pieces when scrolled: no blending */
+	vita2d_texture_set_filters(vs->tex, SCE_GXM_TEXTURE_FILTER_POINT,
+				   SCE_GXM_TEXTURE_FILTER_POINT);
 	vs->display = vita2d_texture_get_datap(vs->tex);
 	vs->stride = (int)vita2d_texture_get_stride(vs->tex) / 4;
 	size = (SceSize)vs->stride * SCREEN_HEIGHT * (SCREEN_BPP / 8);
@@ -1344,31 +1492,144 @@ void vita_surface_set_dialog(bool active)
 void vita_surface_set_focus_rect(const nsfb_bbox_t *rect)
 {
 	struct vita_surface *vs;
-	nsfb_bbox_t old;
-	bool had_old;
 
 	if (the_nsfb == NULL || the_nsfb->surface_priv == NULL) {
 		return;
 	}
 	vs = the_nsfb->surface_priv;
 
-	had_old = vs->focus_valid;
-	old = vs->focus;
-
+	/* drawn over the page at present time: nothing to restore */
+	gpu_lock(vs);
 	if (rect == NULL) {
 		vs->focus_valid = false;
 	} else {
 		vs->focus = *rect;
 		vs->focus_valid = true;
 	}
+	vs->dirty = true;
+	gpu_unlock(vs);
+}
 
-	/* restore what was under the old outline, then draw the new one */
-	if (had_old) {
-		blit_box(the_nsfb, &old);
+/* exported interface documented in vita_surface.h */
+bool vita_surface_scroll(const nsfb_bbox_t *view, int dx, int dy)
+{
+	struct vita_surface *vs;
+	int w, h;
+
+	if (the_nsfb == NULL || the_nsfb->surface_priv == NULL) {
+		return false;
 	}
-	if (vs->focus_valid) {
-		blit_box(the_nsfb, &vs->focus);
+	vs = the_nsfb->surface_priv;
+	w = view->x1 - view->x0;
+	h = view->y1 - view->y0;
+	if (vs->tex == NULL || view->x0 < 0 || view->y0 < 0 ||
+	    view->x1 > SCREEN_WIDTH || view->y1 > SCREEN_HEIGHT ||
+	    w <= 0 || h <= 0 || dx <= -w || dx >= w || dy <= -h || dy >= h) {
+		return false;
 	}
+	/* held across the reorder too, so the busy overlay never draws
+	 * the texture half put back (the lock is recursive) */
+	gpu_lock(vs);
+	if (!vs->ring_valid || vs->ring.x0 != view->x0 ||
+	    vs->ring.y0 != view->y0 || vs->ring.x1 != view->x1 ||
+	    vs->ring.y1 != view->y1) {
+		/* the view moved or changed size: a ring laid out at
+		 * an offset is put back in order first, from the shadow
+		 * buffer, which still holds the screen as it is */
+		if (vs->ring_valid && (vs->ring_ox != 0 || vs->ring_oy != 0)) {
+			nsfb_bbox_t all;
+
+			all.x0 = 0;
+			all.y0 = 0;
+			all.x1 = SCREEN_WIDTH;
+			all.y1 = SCREEN_HEIGHT;
+			vs->ring_ox = 0;
+			vs->ring_oy = 0;
+			blit_box(the_nsfb, &all);
+			vs->ring_resets++;
+		}
+		vs->ring = *view;
+		vs->ring_valid = true;
+		vs->ring_ox = 0;
+		vs->ring_oy = 0;
+	}
+	/* the picture moved by (dx, dy): screen point p now shows what
+	 * was at p - d, so the ring is read from d further back */
+	vs->ring_ox = ((vs->ring_ox - dx) % w + w) % w;
+	vs->ring_oy = ((vs->ring_oy - dy) % h + h) % h;
+	vs->moving = true;
+	vs->move_dx = dx;
+	vs->move_dy = dy;
+	vs->gpu_moves++;
+	vs->moved_px += (unsigned long long)(w - abs(dx)) *
+			(unsigned long long)(h - abs(dy));
+	vs->dirty = true;
+	gpu_unlock(vs);
+	return true;
+}
+
+/* exported interface documented in vita_surface.h */
+void vita_surface_scroll_done(void)
+{
+	struct vita_surface *vs;
+	struct nsfb_cursor_s *cursor;
+
+	if (the_nsfb == NULL || the_nsfb->surface_priv == NULL) {
+		return;
+	}
+	vs = the_nsfb->surface_priv;
+	if (!vs->moving) {
+		return;
+	}
+	vs->moving = false;
+	/* the pointer is plotted into the shadow buffer and was cleared
+	 * before the copy; the texture carried its old picture along
+	 * with the page, so both places are copied again */
+	cursor = the_nsfb->cursor;
+	if (cursor != NULL) {
+		nsfb_bbox_t loc = cursor->loc;
+		nsfb_bbox_t at;
+		nsfb_bbox_t screen;
+
+		loc.x0 -= cursor->hotspot_x;
+		loc.y0 -= cursor->hotspot_y;
+		loc.x1 -= cursor->hotspot_x;
+		loc.y1 -= cursor->hotspot_y;
+		nsfb_plot_add_rect(&cursor->savloc, &loc, &at);
+		screen.x0 = 0;
+		screen.y0 = 0;
+		screen.x1 = SCREEN_WIDTH;
+		screen.y1 = SCREEN_HEIGHT;
+		if (nsfb_plot_clip(&screen, &at)) {
+			blit_box(the_nsfb, &at);
+		}
+		at.x0 += vs->move_dx;
+		at.y0 += vs->move_dy;
+		at.x1 += vs->move_dx;
+		at.y1 += vs->move_dy;
+		if (nsfb_plot_clip(&screen, &at)) {
+			blit_box(the_nsfb, &at);
+		}
+	}
+}
+
+/* exported interface documented in vita_surface.h */
+void vita_surface_take_moves(unsigned int *moves, unsigned int *kpixels,
+			     unsigned int *resets)
+{
+	struct vita_surface *vs = the_nsfb != NULL ?
+			the_nsfb->surface_priv : NULL;
+
+	*moves = *kpixels = *resets = 0;
+	if (vs == NULL) {
+		return;
+	}
+	*moves = vs->gpu_moves;
+	*kpixels = (unsigned int)(vs->moved_px / 1000);
+	*resets = vs->ring_resets;
+	vs->gpu_moves = 0;
+	vs->moved_px = 0;
+	vs->ring_resets = 0;
 }
 
 static bool vita_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
@@ -1434,9 +1695,13 @@ static int vita_claim(nsfb_t *nsfb, nsfb_bbox_t *box)
 		}
 	}
 
+	/* savloc is where the pointer was drawn; loc is its hotspot's
+	 * box, off by the hotspot, so a box just missing loc could still
+	 * cover the pointer and a scroll carried a sliver of it along
+	 * the page (the hand and caret pointers have hotspots) */
 	if ((cursor != NULL) &&
 	    (cursor->plotted == true) &&
-	    (nsfb_plot_bbox_intersect(box, &cursor->loc))) {
+	    (nsfb_plot_bbox_intersect(box, &cursor->savloc))) {
 		nsfb_cursor_clear(nsfb, cursor);
 	}
 	return 0;
@@ -1453,6 +1718,10 @@ static int vita_update(nsfb_t *nsfb, nsfb_bbox_t *box)
 	/* a redraw puts up its own progress: not a stall */
 	if (vs != NULL) {
 		vs->beat_ms = now_ms32();
+	}
+	/* a scroll's copy: the GPU already moved the picture */
+	if (vs != NULL && vs->moving) {
+		return 0;
 	}
 
 	{

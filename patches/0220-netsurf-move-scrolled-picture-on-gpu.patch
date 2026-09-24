@@ -1,0 +1,125 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 830d55f09..38a69fc04 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -245,6 +245,30 @@ static void fb_redraw(fbtk_widget_t *widget,
+ 		      struct browser_widget_s *bwidget,
+ 		      struct browser_window *bw);
+ 
++/**
++ * Move part of the browser's picture for a pan. On the Vita the screen
++ * texture is moved by the GPU and only the shadow buffer is copied
++ * (VitaSurf): the copy used to be written into the texture as well,
++ * most of a screen at about 12 ms each step of scrolling.
++ */
++static void
++fb_pan_copy(nsfb_t *nsfb, nsfb_bbox_t *srcbox, nsfb_bbox_t *dstbox,
++	    const nsfb_bbox_t *view)
++{
++#ifdef __vita__
++	bool gpu = vita_surface_scroll(view, dstbox->x0 - srcbox->x0,
++				       dstbox->y0 - srcbox->y0);
++#else
++	(void)view;
++#endif
++	nsfb_plot_copy(nsfb, srcbox, nsfb, dstbox);
++#ifdef __vita__
++	if (gpu) {
++		vita_surface_scroll_done();
++	}
++#endif
++}
++
+ static void
+ fb_pan(fbtk_widget_t *widget,
+        struct browser_widget_s *bwidget,
+@@ -256,6 +280,7 @@ fb_pan(fbtk_widget_t *widget,
+ 	int height;
+ 	nsfb_bbox_t srcbox;
+ 	nsfb_bbox_t dstbox;
++	nsfb_bbox_t view;
+ 	struct rect pinned[FB_PINNED_MAX];
+ 	int pinned_n;
+ 	int dx, dy, i;
+@@ -273,6 +298,10 @@ fb_pan(fbtk_widget_t *widget,
+ 
+ 	x = fbtk_get_absx(widget);
+ 	y = fbtk_get_absy(widget);
++	view.x0 = x;
++	view.y0 = y;
++	view.x1 = x + width;
++	view.y1 = y + height;
+ 
+ 	/* if the pan exceeds the viewport size just redraw the whole area */
+ 	/* A pan moves what is on screen and draws only the strip that
+@@ -330,7 +359,7 @@ fb_pan(fbtk_widget_t *widget,
+ 		dstbox.y1 = dstbox.y0 + height + bwidget->pany;
+ 
+ 		/* move part that remains visible up */
+-		nsfb_plot_copy(nsfb, &srcbox, nsfb, &dstbox);
++		fb_pan_copy(nsfb, &srcbox, &dstbox, &view);
+ 
+ 		/* redraw newly exposed area */
+ 		bwidget->scrolly += bwidget->pany;
+@@ -349,7 +378,7 @@ fb_pan(fbtk_widget_t *widget,
+ 		dstbox.y1 = dstbox.y0 + height - bwidget->pany;
+ 
+ 		/* move part that remains visible down */
+-		nsfb_plot_copy(nsfb, &srcbox, nsfb, &dstbox);
++		fb_pan_copy(nsfb, &srcbox, &dstbox, &view);
+ 
+ 		/* redraw newly exposed area */
+ 		bwidget->scrolly += bwidget->pany;
+@@ -370,7 +399,7 @@ fb_pan(fbtk_widget_t *widget,
+ 		dstbox.y1 = dstbox.y0 + height;
+ 
+ 		/* move part that remains visible left */
+-		nsfb_plot_copy(nsfb, &srcbox, nsfb, &dstbox);
++		fb_pan_copy(nsfb, &srcbox, &dstbox, &view);
+ 
+ 		/* redraw newly exposed area */
+ 		bwidget->scrollx += bwidget->panx;
+@@ -389,7 +418,7 @@ fb_pan(fbtk_widget_t *widget,
+ 		dstbox.y1 = dstbox.y0 + height;
+ 
+ 		/* move part that remains visible right */
+-		nsfb_plot_copy(nsfb, &srcbox, nsfb, &dstbox);
++		fb_pan_copy(nsfb, &srcbox, &dstbox, &view);
+ 
+ 		/* redraw newly exposed area */
+ 		bwidget->scrollx += bwidget->panx;
+@@ -826,17 +855,24 @@ static void framebuffer_run(void)
+ 			{
+ 				char stats[768];
+ 				unsigned int copy_ms, present_ms;
++				unsigned int gpu_moves, gpu_kpx, gpu_resets;
+ 
+ 				fb_plot_take_stats(stats, sizeof(stats));
+ 				vita_surface_take_copy_times(&copy_ms,
+ 							     &present_ms);
++				vita_surface_take_moves(&gpu_moves, &gpu_kpx,
++							&gpu_resets);
+ 				if (draw_us >= 300000 && stats[0] != '\0') {
+ 					vita_log("draw: %s; the screen "
+ 						 "texture took %u ms of "
+ 						 "copying and %u ms of "
+ 						 "putting up; scrolling moved "
+ 						 "the picture %u times in %u "
+-						 "ms and redrew %u pinned "
++						 "ms (the GPU moved %u of "
++						 "them, %u kpixels it did not "
++						 "copy, and put the texture "
++						 "back in order %u times) and "
++						 "redrew %u pinned "
+ 						 "areas, and redrew the whole "
+ 						 "screen %u times for too "
+ 						 "many pinned boxes", stats,
+@@ -844,6 +880,8 @@ static void framebuffer_run(void)
+ 						 fb_pan_moves,
+ 						 (unsigned)(fb_pan_move_us /
+ 							    1000),
++						 gpu_moves, gpu_kpx,
++						 gpu_resets,
+ 						 fb_pan_pinned_redraws,
+ 						 fb_pan_whole);
+ 				}
