@@ -1563,6 +1563,10 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				extern unsigned int css_select_us_deferred;
 				extern unsigned int css_select_us_finish;
 				extern unsigned int css_select_shared;
+				extern unsigned int css_select_share_candidates;
+				extern unsigned int css_select_share_tainted;
+				extern unsigned int css_select_share_position;
+				extern unsigned int css_select_share_class_attr;
 
 				vita_log("page: selecting, by phase: setting up "
 					 "%u ms, matching rules %u ms, held-over "
@@ -1575,6 +1579,14 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 css_select_us_finish / 1000,
 					 css_select_shared,
 					 vitasurf_us_compose / 1000);
+				vita_log("page: sharing looked at %u siblings; "
+					 "%u were tainted by a rule, %u answered "
+					 "a test of itself differently and %u "
+					 "had a different class attribute",
+					 css_select_share_candidates,
+					 css_select_share_tainted,
+					 css_select_share_position,
+					 css_select_share_class_attr);
 			}
 			vita_log("page: %u mutations went to the page's "
 					 "observers and %u more were wanted by none "

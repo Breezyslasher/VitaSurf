@@ -1,0 +1,26 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 618d58320..14ea1f6e2 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -730,6 +730,10 @@ extern unsigned int css_select_us_match;
+ extern unsigned int css_select_us_deferred;
+ extern unsigned int css_select_us_finish;
+ extern unsigned int css_select_shared;
++extern unsigned int css_select_share_candidates;
++extern unsigned int css_select_share_tainted;
++extern unsigned int css_select_share_position;
++extern unsigned int css_select_share_class_attr;
+ extern unsigned int css_select_index_builds;
+ extern unsigned int css_select_index_entries;
+ extern unsigned int css_select_index_bytes;
+@@ -799,6 +803,10 @@ void vitasurf_profile_reset(void)
+ 	css_select_us_deferred = 0;
+ 	css_select_us_finish = 0;
+ 	css_select_shared = 0;
++	css_select_share_candidates = 0;
++	css_select_share_tainted = 0;
++	css_select_share_position = 0;
++	css_select_share_class_attr = 0;
+ 	vitasurf_ms_js_import_compile = 0;
+ 	vitasurf_js_import_compiles = 0;
+ 	vitasurf_js_import_kb = 0;
