@@ -1,0 +1,36 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index d78a56836..618d58320 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -675,6 +675,8 @@ unsigned int vitasurf_js_wrap_hits;
+ unsigned int vitasurf_js_wrap_steps;
+ unsigned int vitasurf_ms_js_wrap;
+ unsigned int vitasurf_js_attr_gets;
++unsigned int vitasurf_js_attr_maps;
++unsigned int vitasurf_js_attr_map_items;
+ unsigned int vitasurf_ms_js_attr_get_time;
+ unsigned int vitasurf_js_drains;
+ unsigned int vitasurf_ms_js_drain_tail;
+@@ -871,6 +873,8 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_js_wrap_steps = 0;
+ 	vitasurf_ms_js_wrap = 0;
+ 	vitasurf_js_attr_gets = 0;
++	vitasurf_js_attr_maps = 0;
++	vitasurf_js_attr_map_items = 0;
+ 	vitasurf_ms_js_attr_get_time = 0;
+ 	vitasurf_js_drains = 0;
+ 	vitasurf_ms_js_drain_tail = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index bf62f7f88..3bad38375 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -369,6 +369,9 @@ extern unsigned int vitasurf_js_wrap_hits;
+ extern unsigned int vitasurf_js_wrap_steps;
+ extern unsigned int vitasurf_ms_js_wrap;
+ extern unsigned int vitasurf_js_attr_gets;
++/* el.attributes built from the element, and the attributes in them */
++extern unsigned int vitasurf_js_attr_maps;
++extern unsigned int vitasurf_js_attr_map_items;
+ extern unsigned int vitasurf_ms_js_attr_get_time;
+ extern unsigned int vitasurf_js_drains;
+ extern unsigned int vitasurf_ms_js_drain_tail;
