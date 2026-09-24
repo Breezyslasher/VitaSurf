@@ -1,0 +1,95 @@
+diff --git a/src/plot/32bpp-xbgr8888.c b/src/plot/32bpp-xbgr8888.c
+index e5a0162..a028e2c 100644
+--- a/src/plot/32bpp-xbgr8888.c
++++ b/src/plot/32bpp-xbgr8888.c
+@@ -82,6 +82,10 @@ static inline uint32_t colour_to_pixel(UNUSED nsfb_t *nsfb, nsfb_colour_t c)
+         return c;
+ }
+ 
++/* A colour is its own pixel here, so a bitmap row can be copied as it
++ * is rather than converted pixel by pixel (VitaSurf). */
++#define PLOT_COLOUR_IS_PIXEL 1
++
+ #endif
+ 
+ #define PLOT_TYPE uint32_t
+diff --git a/src/plot/common.c b/src/plot/common.c
+index f6e4a91..7658fb3 100644
+--- a/src/plot/common.c
++++ b/src/plot/common.c
+@@ -17,6 +17,7 @@
+ #endif
+ 
+ #include <stdint.h>
++#include <string.h>
+ 
+ #include "palette.h"
+ 
+@@ -473,6 +474,67 @@ bitmap(nsfb_t *nsfb,
+         /* plot the image */
+         pvideo = get_xy_loc(nsfb, clipped.x0, clipped.y0);
+ 
++#ifdef PLOT_COLOUR_IS_PIXEL
++        /*
++         * The Vita's plotter (VitaSurf): an opaque bitmap is copied a row
++         * at a time, and one with alpha is taken four pixels at a time,
++         * copied where all four are opaque and passed over where all
++         * four are transparent, the pixel loop below only for the rest.
++         * Posters and icons are nearly all one or the other, and this
++         * loop was a thousand scrolled pixels in every one.
++         */
++        if (!alpha) {
++                for (yloop = yoff; yloop < height; yloop += bmp_stride) {
++                        memcpy(pvideo, pixel + yloop + xoff,
++                               (size_t)width * sizeof(PLOT_TYPE));
++                        pvideo += PLOT_LINELEN(nsfb->linelen);
++                }
++                if (set_dither) {
++                        nsfb_palette_dither_fini(nsfb->palette);
++                }
++                return true;
++        }
++        for (yloop = yoff; yloop < height; yloop += bmp_stride) {
++                const nsfb_colour_t *sp = pixel + yloop + xoff;
++
++                xloop = 0;
++                while (xloop < width) {
++                        if (xloop + 4 <= width) {
++                                nsfb_colour_t a = sp[xloop], b = sp[xloop + 1];
++                                nsfb_colour_t c = sp[xloop + 2], d = sp[xloop + 3];
++
++                                if (((a & b & c & d) >> 24) == 0xFF) {
++                                        pvideo[xloop] = a;
++                                        pvideo[xloop + 1] = b;
++                                        pvideo[xloop + 2] = c;
++                                        pvideo[xloop + 3] = d;
++                                        xloop += 4;
++                                        continue;
++                                }
++                                if (((a | b | c | d) >> 24) == 0) {
++                                        xloop += 4;
++                                        continue;
++                                }
++                        }
++                        abpixel = sp[xloop];
++                        if ((abpixel & 0xFF000000) != 0) {
++                                if ((abpixel & 0xFF000000) != 0xFF000000) {
++                                        abpixel = nsfb_plot_ablend(abpixel,
++                                                pixel_to_colour(nsfb,
++                                                        pvideo[xloop]));
++                                }
++                                pvideo[xloop] = colour_to_pixel(nsfb, abpixel);
++                        }
++                        xloop++;
++                }
++                pvideo += PLOT_LINELEN(nsfb->linelen);
++        }
++        if (set_dither) {
++                nsfb_palette_dither_fini(nsfb->palette);
++        }
++        return true;
++#endif
++
+         if (alpha) {
+                 for (yloop = yoff; yloop < height; yloop += bmp_stride) {
+                         for (xloop = 0; xloop < width; xloop++) {

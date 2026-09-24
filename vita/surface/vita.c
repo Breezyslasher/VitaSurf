@@ -34,6 +34,7 @@
 #include <psp2/gxm.h>
 #include <psp2/kernel/cpu.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/touch.h>
 
@@ -634,6 +635,86 @@ static inline void blit_row(uint32_t *restrict d,
 	}
 }
 
+/*
+ * Where the screen texture lives (VitaSurf). Copying changed boxes into
+ * it took 280-400 ms of each second of scrolling on build 435, a screen
+ * a frame into CDRAM, where vita2d puts textures by default. The CPU
+ * writes some kinds of memory much faster than others, and only the
+ * device can say by how much, so a screen's worth of rows is written
+ * into a block of each kind at startup and the log says what each took.
+ * The texture then goes in the faster of the two the GPU reads without
+ * any cache upkeep from us: CDRAM and uncached main memory. Cached main
+ * memory is timed for comparison only, since the GPU would not see
+ * writes still sitting in the CPU's cache.
+ */
+static unsigned int time_screen_write(SceKernelMemBlockType type,
+				      SceSize size, const uint32_t *src)
+{
+	SceUID uid;
+	void *base = NULL;
+	uint32_t *dst;
+	SceUInt64 t0, best = ~(SceUInt64)0;
+	int y, pass;
+
+	uid = sceKernelAllocMemBlock("vitasurf_probe", type, size, NULL);
+	if (uid < 0) {
+		return 0;
+	}
+	if (sceKernelGetMemBlockBase(uid, &base) < 0 || base == NULL) {
+		sceKernelFreeMemBlock(uid);
+		return 0;
+	}
+	dst = base;
+	/* the best of three, so a stray interrupt does not decide it */
+	for (pass = 0; pass < 3; pass++) {
+		t0 = sceKernelGetProcessTimeWide();
+		for (y = 0; y < SCREEN_HEIGHT; y++) {
+			blit_row(dst + y * SCREEN_WIDTH, src + y * SCREEN_WIDTH,
+				 SCREEN_WIDTH);
+		}
+		t0 = sceKernelGetProcessTimeWide() - t0;
+		if (t0 < best) {
+			best = t0;
+		}
+	}
+	sceKernelFreeMemBlock(uid);
+	return (unsigned int)best;
+}
+
+static SceKernelMemBlockType pick_texture_memory(void)
+{
+	/* CDRAM blocks come in 256 KB, main memory in 4 KB */
+	SceSize cdram = (SCREEN_WIDTH * SCREEN_HEIGHT * 4 + 0x3FFFF) &
+			~(SceSize)0x3FFFF;
+	SceSize mainsz = (SCREEN_WIDTH * SCREEN_HEIGHT * 4 + 0xFFF) &
+			 ~(SceSize)0xFFF;
+	uint32_t *src = malloc((size_t)SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+	unsigned int t_cdram, t_nc, t_cached;
+	SceKernelMemBlockType pick;
+
+	if (src == NULL) {
+		return SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW;
+	}
+	memset(src, 0x5a, (size_t)SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+	t_cdram = time_screen_write(SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW,
+				    cdram, src);
+	t_nc = time_screen_write(SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW,
+				 mainsz, src);
+	t_cached = time_screen_write(SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_RW,
+				     mainsz, src);
+	free(src);
+	pick = (t_nc > 0 && (t_cdram == 0 || t_nc < t_cdram)) ?
+		SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_NC_RW :
+		SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW;
+	vita_log("surface: writing a screen took %u us into CDRAM, %u us into "
+		 "uncached main memory and %u us into cached main memory (0: "
+		 "could not allocate); the texture goes in %s",
+		 t_cdram, t_nc, t_cached,
+		 pick == SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW ?
+		 "CDRAM" : "uncached main memory");
+	return pick;
+}
+
 /** Copy a rectangle of the shadow buffer to the display buffer. */
 static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 {
@@ -1131,8 +1212,11 @@ static int vita_initialise(nsfb_t *nsfb)
 		return -1;
 	}
 	vita2d_set_clear_color(0xFF000000u);
+	vita2d_texture_set_alloc_memblock_type(pick_texture_memory());
 	vs->tex = vita2d_create_empty_texture_format(SCREEN_WIDTH, SCREEN_HEIGHT,
 						     SCE_GXM_TEXTURE_FORMAT_A8B8G8R8);
+	/* every other texture keeps vita2d's default */
+	vita2d_texture_set_alloc_memblock_type(0);
 	if (vs->tex == NULL) {
 		vita_log("surface: cannot create the %dx%d screen texture",
 			 SCREEN_WIDTH, SCREEN_HEIGHT);
