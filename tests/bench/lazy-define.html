@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<!-- Shaped like the lazy loader in GitHub's Catalyst: a MutationObserver
+     on the document scans each added element in an animation frame,
+     asking for every tag it may still load whether the element is one
+     (matches), holds one (querySelector) or is defined already
+     (customElements.get). Most of those tags are never on the page.
+     Prints the time in all, the time in the scans, and what they found. -->
+<html><body><div id="app"></div>
+<script>
+var lazy = new Map(), timers = new WeakMap(), scans = 0, calls = 0, found = [], scanMs = 0;
+for (var i = 0; i < 150; i++) lazy.set('lazy-thing-' + i, true);
+lazy.set('present-widget', true);
+lazy.set('late-widget', true);
+function scan(el) {
+  cancelAnimationFrame(timers.get(el) || 0);
+  timers.set(el, requestAnimationFrame(function () {
+    scans++;
+    var s0 = performance.now();
+    for (var tag of lazy.keys()) {
+      calls += 2;
+      var child = el instanceof Element && el.matches(tag) ? el : el.querySelector(tag);
+      if (customElements.get(tag) || child) { found.push(tag); lazy.delete(tag); }
+    }
+    scanMs += performance.now() - s0;
+  }));
+}
+new MutationObserver(function (recs) {
+  if (!lazy.size) return;
+  for (var r of recs) for (var n of r.addedNodes) if (n instanceof Element) scan(n);
+}).observe(document, {subtree: true, childList: true});
+var t0;
+setTimeout(function () {
+  var app = document.getElementById('app');
+  t0 = Date.now();
+  for (var k = 0; k < 400; k++) {
+    var item = document.createElement('div');
+    item.innerHTML = '<span>a</span><button>b</button><i>c</i><div><a>e</a></div>' +
+      (k === 250 ? '<present-widget></present-widget>' : '');
+    app.appendChild(item);
+  }
+  setTimeout(function () {
+    var late = document.createElement('section');
+    late.innerHTML = '<p><late-widget></late-widget></p>';
+    app.appendChild(late);
+    setTimeout(function () {
+      console.log('LAZY ' + scans + ' scans, ' + calls + ' calls, found ' +
+        found.join(' ') + ' in ' + (Date.now() - t0) + ' ms, scanning ' +
+        Math.round(scanMs) + ' ms');
+    }, 200);
+  }, 200);
+}, 100);
+</script></body></html>

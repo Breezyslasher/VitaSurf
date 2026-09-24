@@ -1,0 +1,44 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 14ea1f6e2..bb212974a 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -694,6 +694,10 @@ unsigned int vitasurf_js_sel_closest_native;
+ unsigned int vitasurf_js_sel_closest_steps;
+ unsigned int vitasurf_js_sel_tag_fast;
+ unsigned int vitasurf_js_sel_tag_visits;
++unsigned int vitasurf_js_sel_tag_sets;
++unsigned int vitasurf_js_sel_tag_set_visits;
++unsigned int vitasurf_js_sel_tag_absent;
++unsigned int vitasurf_js_sel_recent_hits;
+ unsigned int vitasurf_js_jobs_budget;
+ unsigned int vitasurf_ms_js_jobs_budget;
+ unsigned int vitasurf_js_drain_max_jobs;
+@@ -900,6 +904,10 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_js_sel_closest_steps = 0;
+ 	vitasurf_js_sel_tag_fast = 0;
+ 	vitasurf_js_sel_tag_visits = 0;
++	vitasurf_js_sel_tag_sets = 0;
++	vitasurf_js_sel_tag_set_visits = 0;
++	vitasurf_js_sel_tag_absent = 0;
++	vitasurf_js_sel_recent_hits = 0;
+ 	vitasurf_js_jobs_budget = 0;
+ 	vitasurf_ms_js_jobs_budget = 0;
+ 	vitasurf_js_drain_max_jobs = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 3bad38375..7271ed7ed 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -427,6 +427,13 @@ extern unsigned int vitasurf_js_sel_closest_steps;
+  */
+ extern unsigned int vitasurf_js_sel_tag_fast;
+ extern unsigned int vitasurf_js_sel_tag_visits;
++/* bare tag queries answered from a root's tag names, the sets built
++ * and the elements they visited, and selector strings found by their
++ * address (VitaSurf) */
++extern unsigned int vitasurf_js_sel_tag_sets;
++extern unsigned int vitasurf_js_sel_tag_set_visits;
++extern unsigned int vitasurf_js_sel_tag_absent;
++extern unsigned int vitasurf_js_sel_recent_hits;
+ extern unsigned int vitasurf_js_jobs_budget;
+ extern unsigned int vitasurf_ms_js_jobs_budget;
+ extern unsigned int vitasurf_js_drain_max_jobs;

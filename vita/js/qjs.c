@@ -147,6 +147,9 @@ struct js_wrapper {
 #define C_WHERE const char *c_where_mark_ __attribute__((unused)) = \
 	(c_where = __func__)
 
+/* selector strings remembered by address; a power of two */
+#define SEL_RECENT 256
+
 struct jsthread {
 	jsheap *heap;
 	JSContext *ctx;
@@ -228,6 +231,36 @@ struct jsthread {
 	struct mod_deps *mod_deps[64]; /**< each module's imports, by URL */
 	struct sel_compiled *sel_cache[128]; /**< selectors answered in C */
 	unsigned int sel_cache_n;
+	/*
+	 * The selectors last asked for, by the script's string itself
+	 * (VitaSurf). A lazy loader asks the same few hundred strings
+	 * over and over, and each call copied the string out of the
+	 * engine and hashed it before it could look it up. Each entry
+	 * holds a reference to its string, so its address cannot be
+	 * reused for another while it is here.
+	 */
+	struct sel_recent {
+		const void *key;
+		JSValue str;
+		struct sel_compiled *s;
+	} sel_recent[SEL_RECENT];
+	/*
+	 * The tag names under one element, for a bare tag query to be
+	 * refused at once when no element of that name is there
+	 * (VitaSurf). GitHub's lazy loader asks each element it scans
+	 * for each of the tags it may load, and nearly all are not on
+	 * the page, so each walked the whole subtree to find nothing.
+	 * Built on the second such query of the same element while the
+	 * tree keeps its shape, so a query asked once still stops at
+	 * the first match; the names are ASCII-lowercased hashes, and
+	 * a hash that is there only means the walk goes ahead.
+	 */
+	struct dom_node *tags_root;
+	uint32_t tags_gen;
+	uint32_t tags_asks;
+	uint32_t *tags_set;       /**< open addressing, 0 is empty */
+	uint32_t tags_cap, tags_n;
+	bool tags_built;
 	struct id_entry **id_idx;  /**< getElementById answers, by id */
 	uint32_t id_idx_nb, id_idx_n; /**< buckets (a power of two), entries */
 	uint32_t id_idx_gen;      /**< vita_id_gen the index is exact for */
@@ -2913,6 +2946,177 @@ static bool tag_is(struct dom_node *n, dom_string *local,
 	return hit;
 }
 
+/* A tag name's hash with ASCII folded to lower case; 0 is never one. */
+static uint32_t tag_hash_lower(const char *p, size_t n)
+{
+	uint32_t h = 2166136261u;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		unsigned char c = (unsigned char) p[i];
+
+		if (c >= 'A' && c <= 'Z') c = (unsigned char) (c + 32);
+		h = (h ^ c) * 16777619u;
+	}
+	return h | 1u;
+}
+
+static void tags_free(jsthread *thread)
+{
+	if (thread->tags_root != NULL) dom_node_unref(thread->tags_root);
+	thread->tags_root = NULL;
+	free(thread->tags_set);
+	thread->tags_set = NULL;
+	thread->tags_cap = thread->tags_n = 0;
+	thread->tags_built = false;
+}
+
+static bool tags_has(const jsthread *thread, uint32_t h)
+{
+	uint32_t mask = thread->tags_cap - 1, i;
+
+	if (thread->tags_cap == 0) return false;
+	for (i = h & mask; thread->tags_set[i] != 0; i = (i + 1) & mask) {
+		if (thread->tags_set[i] == h) return true;
+	}
+	return false;
+}
+
+static bool tags_add(jsthread *thread, uint32_t h)
+{
+	uint32_t mask, i;
+
+	if ((thread->tags_n + 1) * 2 > thread->tags_cap) {
+		uint32_t cap = thread->tags_cap ? thread->tags_cap * 2 : 128;
+		uint32_t *set = calloc(cap, sizeof(*set)), j;
+
+		if (set == NULL) return false;
+		for (j = 0; j < thread->tags_cap; j++) {
+			uint32_t v = thread->tags_set[j];
+
+			if (v == 0) continue;
+			for (i = v & (cap - 1); set[i] != 0;
+			     i = (i + 1) & (cap - 1)) {
+			}
+			set[i] = v;
+		}
+		free(thread->tags_set);
+		thread->tags_set = set;
+		thread->tags_cap = cap;
+	}
+	mask = thread->tags_cap - 1;
+	for (i = h & mask; thread->tags_set[i] != 0; i = (i + 1) & mask) {
+		if (thread->tags_set[i] == h) return true;
+	}
+	thread->tags_set[i] = h;
+	thread->tags_n++;
+	return true;
+}
+
+/* Every element name under root, root itself left out as a query
+ * leaves it out. False if there was no memory for them. */
+static bool tags_build(jsthread *thread, struct dom_node *root)
+{
+	struct dom_node *n = NULL;
+
+	vitasurf_js_sel_tag_sets++;
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+
+		dom_node_type type = 0;
+
+		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_string *local = NULL;
+			bool ok = true;
+
+			vitasurf_js_sel_tag_set_visits++;
+			dom_node_get_local_name(n, &local);
+			if (local != NULL) {
+				ok = tags_add(thread, tag_hash_lower(
+					dom_string_data(local),
+					dom_string_byte_length(local)));
+				dom_string_unref(local);
+			}
+			if (!ok) {
+				dom_node_unref(n);
+				return false;
+			}
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	return true;
+}
+
+/*
+ * Whether no element under root can have the name tag_hash_lower gave
+ * tag_hash, so that a bare tag query of root finds nothing without
+ * walking it (VitaSurf); see jsthread's tags_root. False means only
+ * that the walk must decide.
+ */
+static bool tags_absent(jsthread *thread, struct dom_node *root,
+			uint32_t tag_hash)
+{
+	if (thread->tags_root != root || thread->tags_gen != vita_tree_gen) {
+		if (thread->tags_root != NULL) {
+			dom_node_unref(thread->tags_root);
+		}
+		thread->tags_root = dom_node_ref(root);
+		thread->tags_gen = vita_tree_gen;
+		thread->tags_asks = 0;
+		thread->tags_built = false;
+		thread->tags_n = 0;
+		if (thread->tags_set != NULL) {
+			memset(thread->tags_set, 0,
+			       thread->tags_cap * sizeof(*thread->tags_set));
+		}
+	}
+	if (!thread->tags_built) {
+		if (++thread->tags_asks < 2) return false;
+		if (!tags_build(thread, root)) {
+			thread->tags_n = 0;
+			if (thread->tags_set != NULL) {
+				memset(thread->tags_set, 0, thread->tags_cap *
+				       sizeof(*thread->tags_set));
+			}
+			return false;
+		}
+		thread->tags_built = true;
+	}
+	if (tags_has(thread, tag_hash)) return false;
+	vitasurf_js_sel_tag_absent++;
+	return true;
+}
+
 /*
  * __vitaTagQuery(node, tag, mode): a selector of one bare, ASCII tag
  * name, answered in C (VitaSurf). mode 0 is matches(), 1 querySelector,
@@ -2968,6 +3172,15 @@ static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 		out = JS_NewArray(ctx);
 	} else {
 		vitasurf_js_sel_one++;
+	}
+	{
+		jsthread *thread = JS_GetContextOpaque(ctx);
+
+		if (thread != NULL && tags_absent(thread, root,
+				tag_hash_lower(tag, tag_len))) {
+			JS_FreeCString(ctx, tag);
+			return out;
+		}
 	}
 	/* iterative pre-order walk; root itself is not a candidate */
 	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
@@ -6861,6 +7074,7 @@ struct sel_attr {
 struct sel_compound {
 	char *tag;		/**< type selector, NULL for none or * */
 	size_t tag_len;
+	uint32_t tag_hash;	/**< tag_hash_lower of tag */
 	char *id;
 	size_t id_len;
 	char **classes;
@@ -6914,9 +7128,30 @@ static void sel_free(struct sel_compiled *s)
 	free(s);
 }
 
+/*
+ * Forget the strings sel_lookup remembers (VitaSurf): before the
+ * selectors they point at are freed, and before the context goes.
+ */
+static void sel_recent_free(jsthread *thread)
+{
+	unsigned i;
+
+	for (i = 0; i < SEL_RECENT; i++) {
+		struct sel_recent *r = &thread->sel_recent[i];
+
+		if (r->key != NULL && thread->ctx != NULL) {
+			JS_FreeValue(thread->ctx, r->str);
+		}
+		r->key = NULL;
+		r->s = NULL;
+	}
+}
+
 static void sel_cache_free(jsthread *thread)
 {
 	unsigned b;
+
+	sel_recent_free(thread);
 
 	for (b = 0; b < 128; b++) {
 		while (thread->sel_cache[b] != NULL) {
@@ -6978,6 +7213,7 @@ static bool sel_parse_compound(const char **pp, const char *end,
 		c->tag = sel_dup(p, n);
 		if (c->tag == NULL) return false;
 		c->tag_len = n;
+		c->tag_hash = tag_hash_lower(p, n);
 		p += n;
 	}
 	if (p < end && *p == '#') {
@@ -7402,6 +7638,57 @@ static bool sel_matches(struct dom_node *n, const struct sel_compiled *s)
 }
 
 /*
+ * The compiled selector for a script's string (VitaSurf), found by the
+ * string's own address when it was asked for lately; see jsthread's
+ * sel_recent. NULL with *failed set if the string could not be read.
+ */
+static struct sel_compiled *sel_lookup(JSContext *ctx, jsthread *thread,
+				       JSValueConst str, bool *failed)
+{
+	const void *key = JS_VALUE_GET_PTR(str);
+	struct sel_recent *r =
+		&thread->sel_recent[((uintptr_t) key >> 4) & (SEL_RECENT - 1)];
+	struct sel_compiled *s;
+	const char *text;
+	size_t len;
+
+	*failed = false;
+	if (key != NULL && r->key == key) {
+		vitasurf_js_sel_recent_hits++;
+		return r->s;
+	}
+	text = JS_ToCStringLen(ctx, &len, str);
+	if (text == NULL) {
+		*failed = true;
+		return NULL;
+	}
+	s = sel_get(thread, text, len);
+	JS_FreeCString(ctx, text);
+	if (s != NULL && key != NULL) {
+		if (r->key != NULL) JS_FreeValue(ctx, r->str);
+		r->key = key;
+		r->str = JS_DupValue(ctx, str);
+		r->s = s;
+	}
+	return s;
+}
+
+/* The one compound of a selector that is a bare tag and nothing else,
+ * or NULL. */
+static const struct sel_compound *sel_bare_tag(const struct sel_compiled *s)
+{
+	const struct sel_compound *c;
+
+	if (s->ngroups != 1 || s->groups[0].n != 1) return NULL;
+	c = &s->groups[0].parts[0];
+	if (c->tag == NULL || c->id != NULL || c->nclasses != 0 ||
+	    c->nattrs != 0) {
+		return NULL;
+	}
+	return c;
+}
+
+/*
  * __vitaSelectorNative(kind, fallback): the native matches (0),
  * querySelector (1), querySelectorAll (2) or closest (3), answering in C
  * what it can and calling fallback with the same this and arguments for
@@ -7414,8 +7701,8 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *root, *n = NULL;
 	struct sel_compiled *s = NULL;
-	const char *text;
-	size_t len;
+	const struct sel_compound *bare;
+	bool failed = false;
 	JSValue out = JS_NULL;
 	uint32_t out_n = 0;
 
@@ -7423,10 +7710,8 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	    (root = JS_GetOpaque(this_val, node_class_id)) == NULL) {
 		return JS_Call(ctx, data[0], this_val, argc, argv);
 	}
-	text = JS_ToCStringLen(ctx, &len, argv[0]);
-	if (text == NULL) return JS_EXCEPTION;
-	s = sel_get(thread, text, len);
-	JS_FreeCString(ctx, text);
+	s = sel_lookup(ctx, thread, argv[0], &failed);
+	if (failed) return JS_EXCEPTION;
 	if (s == NULL || s->ngroups < 0) {
 		return JS_Call(ctx, data[0], this_val, argc, argv);
 	}
@@ -7461,6 +7746,10 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 		out = JS_NewArray(ctx);
 	} else {
 		vitasurf_js_sel_one++;
+	}
+	bare = sel_bare_tag(s);
+	if (bare != NULL && tags_absent(thread, root, bare->tag_hash)) {
+		return out;
 	}
 	/* iterative pre-order walk; root itself is not a candidate */
 	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
@@ -11780,6 +12069,7 @@ static void js_free_deferred(jsthread *thread)
 	thread->deferred = NULL;
 	mod_deps_free(thread);
 	sel_cache_free(thread);
+	tags_free(thread);
 	id_index_free(thread);
 	if (thread->deferred_scheduled) {
 		guit->misc->schedule(-1, module_retry_callback, thread);

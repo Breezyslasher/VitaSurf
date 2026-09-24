@@ -1435,6 +1435,14 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 "answered in C, visiting %u elements",
 				 vitasurf_js_sel_tag_fast,
 				 vitasurf_js_sel_tag_visits);
+			vita_log("page: %u bare tag queries were answered "
+				 "from the tag names under their element, "
+				 "gathered %u times over %u elements; %u "
+				 "selector strings were found by address",
+				 vitasurf_js_sel_tag_absent,
+				 vitasurf_js_sel_tag_sets,
+				 vitasurf_js_sel_tag_set_visits,
+				 vitasurf_js_sel_recent_hits);
 			vita_log("page: boxes and styles %u ms covered %u "
 				 "elements, %u ms of it selecting their "
 				 "styles and %u ms parsing the style "
