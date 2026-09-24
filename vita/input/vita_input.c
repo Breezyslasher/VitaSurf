@@ -1369,6 +1369,10 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_ms_js_attr_get_time,
 				 vitasurf_job_max_wraps,
 				 vitasurf_job_max_attr_gets);
+			vita_log("page: el.attributes was built %u times, "
+				 "%u attributes in all",
+				 vitasurf_js_attr_maps,
+				 vitasurf_js_attr_map_items);
 			vita_log("page: childNodes was rebuilt %u times for "
 				 "%u children in all (%u a list), costing "
 				 "%u ms; the siblings and parents were "

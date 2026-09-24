@@ -1177,7 +1177,10 @@ var W=window;
    every read, and the attribute cache reads it once per attribute. */
 var GEN=null;
 try{if(W.__vitaGenBuf)GEN=new Uint32Array(W.__vitaGenBuf);delete W.__vitaGenBuf;}catch(e){}
-function domGen(){return GEN?GEN[0]:(domGen());}
+/* -1 when there is no counter to read: nothing is then kept */
+function domGen(){return GEN?GEN[0]:-1;}
+/* the tree's shape alone, which attribute writes leave (VitaSurf) */
+function treeGen(){return GEN&&GEN.length>1?GEN[1]:-1;}
 ['onload','onerror','onresize','onscroll','onhashchange','onpopstate','onunload','onbeforeunload','onmessage','onpageshow','onclick','onkeydown','onkeyup','ontouchstart'].forEach(function(h){Object.defineProperty(W,h,{configurable:true,get:function(){return W['__'+h]||null;},set:function(f){W['__'+h]=f;if(typeof f==='function'&&h!=='onerror')W.addEventListener(h.slice(2),f);}});});
 W.dispatchEvent=function(e){return __vitaDispatch(null,e);};
 /* Viewport and scroll position come from the window itself, so a script
@@ -2869,7 +2872,7 @@ Object.defineProperty(P,'elements',{configurable:true,get:function(){
  return liveCollection(function(){
   return listOf(self.querySelectorAll(
    'input,select,textarea,button,fieldset,object,output'));},
-  FormControls.prototype);}});
+  FormControls.prototype,true);}});
 Object.defineProperty(P,'length',{configurable:true,get:function(){
  /* On character data it is the number of characters, which is what code
     walking text reads before it slices. */
@@ -3390,14 +3393,15 @@ function indexKey(k){
  return n<=0xfffffffe?n:-1;}
 /* The collection is a proxy so that an index or a name is resolved when
    it is read, which is what makes it live. */
-function liveCollection(items,proto){
- var base=Object.create(proto||HTMLCollection.prototype),cache=null,gen=-1;
+function liveCollection(items,proto,shapeOnly){
+ var base=Object.create(proto||HTMLCollection.prototype),cache=null,gen=-1,
+     now=shapeOnly?treeGen:domGen;
  /* Live, but not by asking again on every read: the answer is kept
     until the C side says the tree changed. A loop over a collection
     reads .length and [i] each step, and each read was a whole-document
     walk before this. */
  function cached(){
-  var g=domGen();
+  var g=now();
   if(cache===null||g<0||g!==gen){cache=items();gen=g;}
   return cache;}
  Object.defineProperty(base,'__vitaItems',{value:cached,configurable:true});
@@ -3767,11 +3771,14 @@ W.NamedNodeMap=NamedNodeMap;
  rawAttrs=d.get;
  Object.defineProperty(P,'attributes',{configurable:true,get:function(){
   var el=this,g=domGen(),c=el.__vitaAttrMap,
+      st=el.__vitaAttrStamp?el.__vitaAttrStamp():-1,
       raw,map,i,a;
-  /* The same map while nothing has written an attribute or moved a
-     node since (VitaSurf): el.attributes===el.attributes, as in a
-     browser, and a page that reads it twice builds it once. */
-  if(c&&g>=0&&c.g===g)return c.m;
+  /* The same map while nothing has written this element's attributes
+     since (VitaSurf): el.attributes===el.attributes, as in a browser,
+     and a page that reads it twice builds it once. It used to go stale
+     on any change to the document, and Alpine, which writes attributes
+     as it walks, had every element's map built again on each read. */
+  if(c&&st>=0&&c.s===st)return c.m;
   raw=d.get.call(this);map=new NamedNodeMap(el);
   /* The C side hands back plain name-and-value pairs; an attribute is a
      node, and code reads nodeValue, ownerElement and localName off one. */
@@ -3782,10 +3789,10 @@ W.NamedNodeMap=NamedNodeMap;
     Object.defineProperty(map,a.name,
      {value:a,enumerable:false,configurable:true});}
   map[NNM_LEN]=raw.length;
-  if(g>=0){
-   if(c){c.g=g;c.m=map;}
+  if(st>=0){
+   if(c){c.s=st;c.m=map;}
    else Object.defineProperty(el,'__vitaAttrMap',
-    {value:{g:g,m:map},configurable:true});}
+    {value:{s:st,m:map},configurable:true});}
   return map;}});
 })();
 
@@ -6330,15 +6337,18 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
 /* getElementsByTagName and friends, made live. The C side does the tree
    walk; the collection calls it again whenever it is read. */
 (function(){
- function live(get){
+ function live(get,shapeOnly){
   return function(){
    var self=this,args=[].slice.call(arguments);
    return liveCollection(function(){
-    return listOf(get.apply(self,args));});};}
+    return listOf(get.apply(self,args));},null,shapeOnly);};}
+ /* a tag name never changes, so a tag's collection only moves with the
+    tree; a class or a name moves with attribute writes too */
  ['getElementsByTagName','getElementsByClassName','getElementsByName',
   'getElementsByTagNameNS'].forEach(function(m){
-  if(typeof P[m]==='function')P[m]=live(P[m]);
-  if(typeof D[m]==='function')D[m]=live(D[m]);});
+  var shapeOnly=m.indexOf('TagName')>0;
+  if(typeof P[m]==='function')P[m]=live(P[m],shapeOnly);
+  if(typeof D[m]==='function')D[m]=live(D[m],shapeOnly);});
  /*
  * A DOM prototype chain with the shapes a framework looks for
  * (VitaSurf).
@@ -6405,10 +6415,12 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
  if(kids&&kids.get)Object.defineProperty(P,'children',{configurable:true,
   get:function(){
    var self=this;
-   return liveCollection(function(){return listOf(kids.get.call(self));});}});
+   return liveCollection(function(){return listOf(kids.get.call(self));},
+    null,true);}});
  var dkids=Object.getOwnPropertyDescriptor(D,'children');
  if(dkids&&dkids.get)Object.defineProperty(D,'children',{configurable:true,
   get:function(){
-   return liveCollection(function(){return listOf(dkids.get.call(D));});}});
+   return liveCollection(function(){return listOf(dkids.get.call(D));},
+    null,true);}});
 })();
 })();

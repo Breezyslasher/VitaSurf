@@ -1131,7 +1131,17 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
  * tree or an attribute bumps it, and so does the start of each script,
  * since the parser adds nodes between scripts.
  */
-static uint32_t vita_dom_gen;
+static uint32_t vita_gens[2];
+#define vita_dom_gen (vita_gens[0])
+/*
+ * The same for the tree's shape alone (VitaSurf): nodes in, out or
+ * moved, and the parser between scripts, but no attribute writes. A
+ * collection that only a node moving can change, el.children or
+ * getElementsByTagName, keeps its answer across attribute writes: a
+ * loop that read el.children[i] and set an attribute each step had
+ * the whole list built again every step.
+ */
+#define vita_tree_gen (vita_gens[1])
 /*
  * Bumped by whatever can change which element an id names: a node going
  * in or out, an id attribute set or removed, the parser adding nodes
@@ -1140,11 +1150,101 @@ static uint32_t vita_dom_gen;
  */
 static uint32_t vita_id_gen;
 
+/*
+ * When each element's attributes last changed (VitaSurf). The prelude
+ * keeps an element's attributes map and used to throw it away whenever
+ * anything anywhere in the document changed: Alpine writes attributes
+ * as it walks the page, so every map went stale at once and every read
+ * of el.attributes built it again from here, 101 of the 152 frames of
+ * Yamtrack's seven-second start. A map now stays until its own
+ * element's attributes change.
+ *
+ * A small table by node; an entry pushed out raises the floor, so an
+ * element without an entry reads as changed at the floor, which is
+ * never earlier than its last real change.
+ */
+#define ATTR_STAMP_SLOTS 4096
+#define ATTR_STAMP_PROBE 8
+static struct attr_stamp {
+	struct dom_node *node;
+	uint32_t stamp;
+} attr_stamps[ATTR_STAMP_SLOTS];
+static uint32_t attr_stamp_clock = 1;
+static uint32_t attr_stamp_floor = 1;
+
+static unsigned int attr_stamp_slot(const struct dom_node *node)
+{
+	return (unsigned int)(((uintptr_t)node >> 3) * 2654435761u) >> 20;
+}
+
+/* An element's attributes have just changed. */
+static void attr_stamp_touch(struct dom_node *node)
+{
+	unsigned int h, i, free_i = ATTR_STAMP_SLOTS;
+
+	if (node == NULL) {
+		return;
+	}
+	attr_stamp_clock++;
+	h = attr_stamp_slot(node);
+	for (i = 0; i < ATTR_STAMP_PROBE; i++) {
+		struct attr_stamp *e = &attr_stamps[(h + i) % ATTR_STAMP_SLOTS];
+
+		if (e->node == node) {
+			e->stamp = attr_stamp_clock;
+			return;
+		}
+		if (e->node == NULL && free_i == ATTR_STAMP_SLOTS) {
+			free_i = (h + i) % ATTR_STAMP_SLOTS;
+		}
+	}
+	if (free_i == ATTR_STAMP_SLOTS) {
+		/* full here: the one pushed out moves the floor up */
+		free_i = h % ATTR_STAMP_SLOTS;
+		if (attr_stamps[free_i].stamp > attr_stamp_floor) {
+			attr_stamp_floor = attr_stamps[free_i].stamp;
+		}
+	}
+	attr_stamps[free_i].node = node;
+	attr_stamps[free_i].stamp = attr_stamp_clock;
+}
+
+/* When an element's attributes last changed, as far as can be told. */
+static uint32_t attr_stamp_of(const struct dom_node *node)
+{
+	unsigned int h = attr_stamp_slot(node), i;
+
+	for (i = 0; i < ATTR_STAMP_PROBE; i++) {
+		const struct attr_stamp *e =
+			&attr_stamps[(h + i) % ATTR_STAMP_SLOTS];
+
+		if (e->node == node) {
+			return e->stamp > attr_stamp_floor ?
+				e->stamp : attr_stamp_floor;
+		}
+	}
+	return attr_stamp_floor;
+}
+
+static JSValue node_attr_stamp(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	struct dom_node *node = JS_GetOpaque2(ctx, this_val, node_class_id);
+
+	(void)argc;
+	(void)argv;
+	if (node == NULL || !node_is_element(node)) {
+		return JS_NewInt32(ctx, -1);
+	}
+	return JS_NewUint32(ctx, attr_stamp_of(node) & 0x3fffffffu);
+}
+
 static void mark_dirty(JSContext *ctx)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	vita_dom_gen++;
+	vita_tree_gen++;
 	vita_id_gen++;
 	if (thread != NULL) {
 		thread->dom_dirty = true;
@@ -1795,6 +1895,7 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_set_attribute(node, key, dv);
+		attr_stamp_touch(node);
 		mark_attr_dirty(ctx, name);
 		/* className and id are the same attribute write as
 		 * setAttribute, and an observer watching class has to see
@@ -2054,6 +2155,8 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 		return arr;
 	}
 	dom_namednodemap_get_length(map, &len);
+	vitasurf_js_attr_maps++;
+	vitasurf_js_attr_map_items += len;
 	for (i = 0; i < len; i++) {
 		struct dom_node *attr = NULL;
 		dom_string *name = NULL, *val = NULL, *ns = NULL;
@@ -2148,6 +2251,7 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_set_attribute(node, key, val);
+		attr_stamp_touch(node);
 		mark_attr_dirty(ctx, name);
 		if (name != NULL && (strcasecmp(name, "src") == 0 ||
 				     strcasecmp(name, "srcset") == 0)) {
@@ -2213,6 +2317,7 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_remove_attribute(node, key);
+		attr_stamp_touch(node);
 		mark_attr_dirty(ctx, name);
 		/* removing an attribute that was not there changes nothing,
 		 * and nothing is what an observer should see */
@@ -2315,6 +2420,7 @@ static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
 			}
 		}
 		dom_element_set_attribute_ns(node, ns, key, val);
+		attr_stamp_touch(node);
 		mark_dirty(ctx);
 		notify_mutation_ns(ctx, "attributes", node,
 				   JS_NewString(ctx, local != NULL ? local : ""),
@@ -2377,6 +2483,7 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 		dom_element_has_attribute_ns(node, ns, key, &had);
 		dom_element_get_attribute_ns(node, ns, key, &old);
 		dom_element_remove_attribute_ns(node, ns, key);
+		attr_stamp_touch(node);
 		mark_dirty(ctx);
 		if (had) {
 			notify_mutation_ns(ctx, "attributes", node,
@@ -3855,6 +3962,7 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CGETSET_DEF("childNodes", node_get_child_nodes, NULL),
 	JS_CGETSET_DEF("nodeValue", node_get_node_value, node_set_node_value),
 	JS_CGETSET_DEF("attributes", node_get_attributes, NULL),
+	JS_CFUNC_DEF("__vitaAttrStamp", 0, node_attr_stamp),
 	JS_CFUNC_DEF("getAttribute", 1, node_get_attribute),
 	JS_CFUNC_DEF("setAttribute", 2, node_set_attribute),
 	JS_CFUNC_DEF("hasAttribute", 1, node_has_attribute),
@@ -5027,6 +5135,7 @@ static void begin_script(jsthread *thread, enum script_why why)
 	}
 	script_why = why;
 	vita_dom_gen++;	/* the parser may have added nodes since */
+	vita_tree_gen++;
 	vita_id_gen++;
 	script_entered_ms = now_ms();
 	bc_last_activity_ms = script_entered_ms;
@@ -8977,8 +9086,8 @@ static void setup_globals(jsthread *thread)
 	/* the tree generation itself, for the prelude to read without a
 	 * call: an ArrayBuffer over the static counter, never freed */
 	JS_SetPropertyStr(ctx, global, "__vitaGenBuf",
-			  JS_NewArrayBuffer(ctx, (uint8_t *)&vita_dom_gen,
-					    sizeof(vita_dom_gen), NULL, NULL,
+			  JS_NewArrayBuffer(ctx, (uint8_t *)vita_gens,
+					    sizeof(vita_gens), NULL, NULL,
 					    false));
 	JS_SetPropertyStr(ctx, global, "__vitaElementStep",
 			  JS_NewCFunction(ctx, win_vita_element_step,
