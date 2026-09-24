@@ -38,6 +38,8 @@
 #define VITASURF_VERBOSE_FLAG VITASURF_DATA_DIR "/verbose"
 /* drop a file of this name beside it to have each page's boxes logged */
 #define VITASURF_LAYOUT_FLAG VITASURF_DATA_DIR "/dumplayout"
+/* drop a file of this name to keep image decoding on the main thread */
+#define VITASURF_NO_DECODE_THREAD_FLAG VITASURF_DATA_DIR "/nodecodethread"
 #define VITASURF_CA_BUNDLE    VITASURF_RES_DIR "/cacert.pem"
 
 /* Persistence (phase 5): everything the user accumulates lives here. */
@@ -172,6 +174,20 @@ int vita_verbose_requested(void);
  * \return non-zero if the flag file is there
  */
 int vita_layout_dump_requested(void);
+
+/**
+ * Whether images should be decoded on a thread of their own: yes unless
+ * the nodecodethread flag file is there, so the two can be timed
+ * against each other on the device without a rebuild.
+ */
+bool vita_decode_thread_wanted(void);
+
+/**
+ * Called on the decode thread as it starts: puts it on the second core,
+ * a little below the main thread's priority. It must not log; the log
+ * is the main thread's.
+ */
+void vita_decode_thread_started(void);
 
 /**
  * Whether every fetch should ignore the caches.

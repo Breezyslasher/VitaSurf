@@ -12,6 +12,8 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/power.h>
 #include <psp2/sysmodule.h>
 #include <psp2/system_param.h>
@@ -408,6 +410,30 @@ void vitasurf_set_cache_disabled(bool off)
 int vita_layout_dump_requested(void)
 {
 	return vita_flag_present(VITASURF_LAYOUT_FLAG);
+}
+
+/* exported interface documented in vita_platform.h */
+bool vita_decode_thread_wanted(void)
+{
+	return !vita_flag_present(VITASURF_NO_DECODE_THREAD_FLAG);
+}
+
+/*
+ * The decode thread's place (VitaSurf). The main thread runs NetSurf,
+ * the busy overlay sits on the third core and mostly sleeps, so the
+ * decoder gets the second: a large JPEG then costs the page nothing
+ * but the memory bandwidth it shares. Below the main thread's priority,
+ * so that if the system puts both on one core the page still wins.
+ */
+#define DECODE_THREAD_PRIORITY (0x10000100 + 10)
+
+/* exported interface documented in vita_platform.h */
+void vita_decode_thread_started(void)
+{
+	SceUID self = sceKernelGetThreadId();
+
+	sceKernelChangeThreadCpuAffinityMask(self, SCE_KERNEL_CPU_MASK_USER_1);
+	sceKernelChangeThreadPriority(self, DECODE_THREAD_PRIORITY);
 }
 
 /** Log the contents of the data directory so flag files can be checked. */
