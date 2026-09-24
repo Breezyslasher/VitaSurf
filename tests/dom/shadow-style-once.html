@@ -49,4 +49,21 @@ var ms=document.createElement('style');ms.setAttribute('media','print');ms.textC
 ok("a style with attributes is left alone", ms.textContent===CSS);
 var plain=document.createElement('style');plain.textContent=CSS;document.body.appendChild(plain);
 ok("a style outside any shadow root is untouched", plain.textContent===CSS);
+plain.parentNode.removeChild(plain);
+/* the kept copy leaving: another copy has to take over */
+function keeper(){var st=document.getElementsByTagName('style');
+ for(var k=0;k<st.length;k++)if(st[k].textContent===CSS)return st[k];return null;}
+var gone=keeper().parentNode;gone.parentNode.removeChild(gone);
+ok("with the kept copy's component removed, no full copy is left for now", full()===0);
+setTimeout(function(){
+ ok("half a second later a parked copy has its text back", full()===1&&keeper().parentNode!==gone);
+ /* the kept copy given other text: the old text comes back elsewhere */
+ var k2=keeper();k2.textContent=':host{color:rgb(9,9,9)}';
+ setTimeout(function(){
+  ok("a kept copy given other text hands its old text on", full()===1&&keeper()!==k2);
+  /* every component gone: nothing to bring back, and nothing breaks */
+  box.textContent='';
+  setTimeout(function(){
+   ok("with every component gone there is nothing to revive", full()===0);
+   console.log("DONE");},700);},700);},700);
 </script></body></html>

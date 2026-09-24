@@ -2336,14 +2336,47 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  * a media query say, is left alone. */
 (function(){
  var canon=Object.create(null);
- function live(css){var c=canon[css];return !!c&&ceInDoc(c);}
+ /* the copy kept for a text is live while it is in the document and
+    still holds that text: a page may give it other text later */
+ function live(css){var c=canon[css];
+  return !!c&&ceInDoc(c)&&c.textContent===css;}
+ /* The emptied copies, by text (VitaSurf). If the kept copy leaves the
+    document, the components still in it would lose their styles, so
+    while any are parked a check every half second, doing nothing unless
+    the tree has changed shape, gives the text back to the first parked
+    copy still in the document and keeps that one instead. */
+ var parked=Object.create(null),nparked=0,timer=null,lastShape=-1,
+     rawText=null,si=W.setInterval,ci=W.clearInterval;
+ var PARK_MAX=4000;
+ function park(n,css){
+  var l=parked[css]||(parked[css]=[]);
+  if(l.length>=PARK_MAX){l.shift();nparked--;}
+  l.push(n);nparked++;
+  if(timer===null&&typeof si==='function')
+   timer=si.call(W,revive,500);}
+ function revive(){
+  var g=treeGen(),css,l,i,n;
+  if(g>=0&&g===lastShape)return;
+  lastShape=g;
+  for(css in parked){
+   l=parked[css];
+   if(!live(css)){
+    for(i=0;i<l.length;i++){
+     n=l[i];
+     if(n.textContent===''&&ceInDoc(n)){
+      l.splice(i,1);nparked--;
+      if(rawText)rawText.call(n,css);else n.textContent=css;
+      canon[css]=n;
+      break;}}}
+   if(!l.length)delete parked[css];}
+  if(nparked<=0&&timer!==null){ci.call(W,timer);timer=null;nparked=0;}}
  function styleNode(n){
   return n&&n.nodeType===1&&n.tagName==='STYLE'&&
    !(n.attributes&&n.attributes.length);}
  function take(host,n){
   var css=n.textContent;
   if(!css)return;
-  if(live(css)){n.textContent='';return;}
+  if(live(css)){n.textContent='';park(n,css);return;}
   canon[css]=n;}
  function fix(host,n){
   if(!host.__shadow||!n)return;
@@ -2356,13 +2389,21 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  var d=Object.getOwnPropertyDescriptor(P,'innerHTML');
  if(!d||!d.set)return;
  Object.defineProperty(P,'innerHTML',{configurable:true,get:d.get,set:function(v){
-  var fresh=[];
+  var fresh=[],emptied=[];
   if(this.__shadow&&typeof v==='string'&&v.indexOf('<style')>=0)
    v=v.replace(/<style>([\s\S]*?)<\/style>/gi,function(m,css){
-    if(css&&live(css))return '<style></style>';
+    if(css&&live(css)){emptied.push(css);return '<style></style>';}
     if(css)fresh.push(css);
     return m;});
   var r=d.set.call(this,v);
+  /* the empty ones it made, in order, when they can be told from any
+     the page wrote empty itself */
+  if(emptied.length){
+   var es=this.getElementsByTagName('style'),k,e=[];
+   for(k=0;k<es.length;k++)
+    if(styleNode(es[k])&&es[k].textContent==='')e.push(es[k]);
+   if(e.length===emptied.length)
+    for(k=0;k<e.length;k++)park(e[k],emptied[k]);}
   if(fresh.length){
    var st=this.getElementsByTagName('style'),i,j;
    for(i=0;i<st.length;i++)for(j=0;j<fresh.length;j++)
@@ -2376,11 +2417,14 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   * every element's style was matched against */
  var t=Object.getOwnPropertyDescriptor(P,'textContent');
  if(!t||!t.set)return;
+ rawText=t.set;
  Object.defineProperty(P,'textContent',{configurable:true,get:t.get,set:function(v){
   var p;
   if(typeof v==='string'&&v&&(p=this.parentNode)&&p.__shadow&&styleNode(this)){
-   if(live(v)){if(canon[v]!==this)v='';}
-   else{t.set.call(this,v);canon[v]=this;return;}}
+   if(live(v)){
+    if(canon[v]!==this){t.set.call(this,'');park(this,v);}
+    return;}
+   t.set.call(this,v);canon[v]=this;return;}
   t.set.call(this,v);}});
 })();
 /* <template>. libdom parses the children into the template element, so
