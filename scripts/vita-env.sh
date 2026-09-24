@@ -53,6 +53,23 @@ fi
 
 export NS_HOST NETSURF_HOST PREFIX TARGET_CC TARGET_AR TARGET_CXX NS_PKGCONFIG NETSURF_PKG_CONFIG JOBS
 
+# Anything the Vita links has to be ordinary position dependent code.
+# vita-elf-create reads the relocations the linker kept (-Wl,-q) and
+# knows only a fixed set of them; a GOT one stops it with "Invalid
+# relocation type 25", which is R_ARM_BASE_PREL, and no VPK is built.
+# grep -c rather than -q: under pipefail, -q stopping at the first match
+# can kill readelf with SIGPIPE while it is still writing, the pipeline
+# then fails, and a library large enough to have more output than the
+# pipe holds would pass with the very relocations this looks for.
+no_pic_relocations() {
+    if "$VITASDK/bin/arm-vita-eabi-readelf" -r "$1" |
+            grep -c 'R_ARM_GOT_BREL\|R_ARM_BASE_PREL' >/dev/null; then
+        echo "$(basename "$1") was built position independent; " \
+             "vita-elf-create will refuse its relocations" >&2
+        exit 1
+    fi
+}
+
 # Arguments common to every NetSurf buildsystem invocation.
 ns_make_args() {
     printf '%s\n' \

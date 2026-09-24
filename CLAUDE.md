@@ -46,6 +46,7 @@ The scripts do not exist yet. Create them in phase 1.
 
 - Requires VITASDK with `$VITASDK` set. Install dependencies with vdpm: curl, openssl, zlib, libpng, libjpeg-turbo, freetype, and SDL2 if the surface uses it. Check exact package names in vdpm before scripting them.
 - vdpm's FreeType has no brotli, so it refuses every WOFF2 font, and WOFF2 is what the web serves. `scripts/build-freetype-woff2.sh` builds brotli and then FreeType against it, over the top of vdpm's copies. Without it, an icon font renders as the ligature's name: openmediavault and Audiobookshelf both show that.
+- vdpm's libjpeg-turbo is built with `-DWITH_SIMD=FALSE`, so every JPEG decodes in plain C. `scripts/build-libjpeg-simd.sh` rebuilds the same version with NEON over vdpm's copy. The startup log says whether NEON is on ("libjpeg SIMD flags").
 - NetSurf and its libraries use NetSurf's make-based `buildsystem`, not CMake. Cross-compile them with the Vita toolchain as the host and install into `$VITASDK/arm-vita-eabi`. Confirm variable names (`HOST`, `PREFIX`, `TARGET`) against `deps/buildsystem` before changing scripts.
 - Build NetSurf with `TARGET=framebuffer`. Put Vita-specific settings in a `Makefile.config` override instead of editing NetSurf's Makefiles.
 - CMake handles only the final link and packaging, via `$VITASDK/share/vita.cmake` (`vita_create_self`, `vita_create_vpk`).

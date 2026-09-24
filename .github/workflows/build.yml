@@ -97,6 +97,9 @@ jobs:
       - name: Build FreeType with WOFF2
         run: ./scripts/build-freetype-woff2.sh
 
+      - name: Build libjpeg-turbo with NEON
+        run: ./scripts/build-libjpeg-simd.sh
+
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh
 

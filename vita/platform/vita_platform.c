@@ -161,6 +161,9 @@ void vita_options_floor(void)
  * registered, and log it once at startup. A page that arrives as a grey
  * box is then one line away from an explanation.
  */
+/* libjpeg-turbo's, present only when it was built with SIMD */
+extern unsigned int jpeg_simd_cpu_support(void) __attribute__((weak));
+
 void vita_log_image_decoders(void)
 {
 	static const struct {
@@ -210,6 +213,22 @@ void vita_log_image_decoders(void)
 	vita_log("image decoders: %s", nhave ? have : "none");
 	if (nmissing > 0) {
 		vita_log("image decoders missing: %s", missing);
+	}
+	/*
+	 * Whether libjpeg-turbo decodes with NEON (VitaSurf). Only a build
+	 * with its SIMD extensions has this function, and vdpm's has none,
+	 * so the reference is weak: it is NULL when JPEGs go through the
+	 * plain C paths, which is the thing to know when reading decode
+	 * times from a log. 0x10 is libjpeg-turbo's JSIMD_NEON.
+	 */
+	if (jpeg_simd_cpu_support == NULL) {
+		vita_log("image decoders: libjpeg has no SIMD extensions; JPEGs "
+			 "decode in plain C");
+	} else {
+		unsigned int simd = jpeg_simd_cpu_support();
+
+		vita_log("image decoders: libjpeg SIMD flags 0x%x, NEON %s",
+			 simd, (simd & 0x10u) ? "on" : "off");
 	}
 }
 
@@ -419,20 +438,24 @@ bool vita_decode_thread_wanted(void)
 }
 
 /*
- * The decode thread's place (VitaSurf). The main thread runs NetSurf,
- * the busy overlay sits on the third core and mostly sleeps, so the
- * decoder gets the second: a large JPEG then costs the page nothing
- * but the memory bandwidth it shares. Below the main thread's priority,
- * so that if the system puts both on one core the page still wins.
+ * The decode threads' places (VitaSurf). The main thread runs NetSurf
+ * on the first core. The first decoder gets the second core to itself;
+ * the second shares the third with the busy overlay, which sleeps but
+ * for a check every 50 ms and outranks it when it wakes. A large JPEG
+ * then costs the page nothing but the memory bandwidth it shares.
+ * Below the main thread's priority, so that if the system puts one
+ * beside it the page still wins.
  */
 #define DECODE_THREAD_PRIORITY (0x10000100 + 10)
 
 /* exported interface documented in vita_platform.h */
-void vita_decode_thread_started(void)
+void vita_decode_thread_started(int index)
 {
 	SceUID self = sceKernelGetThreadId();
 
-	sceKernelChangeThreadCpuAffinityMask(self, SCE_KERNEL_CPU_MASK_USER_1);
+	sceKernelChangeThreadCpuAffinityMask(self, index == 0 ?
+					     SCE_KERNEL_CPU_MASK_USER_1 :
+					     SCE_KERNEL_CPU_MASK_USER_2);
 	sceKernelChangeThreadPriority(self, DECODE_THREAD_PRIORITY);
 }
 

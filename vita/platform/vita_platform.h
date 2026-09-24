@@ -183,11 +183,13 @@ int vita_layout_dump_requested(void);
 bool vita_decode_thread_wanted(void);
 
 /**
- * Called on the decode thread as it starts: puts it on the second core,
- * a little below the main thread's priority. It must not log; the log
- * is the main thread's.
+ * Called on each decode thread as it starts: the first goes on the
+ * second core, the second on the third, both a little below the main
+ * thread's priority. It must not log; the log is the main thread's.
+ *
+ * \param index Which decode thread, from 0.
  */
-void vita_decode_thread_started(void);
+void vita_decode_thread_started(int index);
 
 /**
  * Whether every fetch should ignore the caches.
