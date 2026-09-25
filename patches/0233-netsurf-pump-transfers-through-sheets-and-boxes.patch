@@ -1,0 +1,141 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index f090039a4..fe15b9071 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -281,6 +281,14 @@ static void fetcher_poll(void *unused)
+  * Public API								      *
+  ******************************************************************************/
+ 
++/* exported interface documented in content/fetch.h */
++void fetch_pump(void)
++{
++#ifdef WITH_CURL
++	fetch_curl_pump_tick();
++#endif
++}
++
+ /* exported interface documented in content/fetch.h */
+ nserror fetcher_init(void)
+ {
+diff --git a/content/fetch.h b/content/fetch.h
+index db7534a73..69a7ce81f 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -286,4 +286,13 @@ void fetch_set_cookie(struct fetch *fetch, const char *data);
+  */
+ nserror fetch_fdset(fd_set *read_fd_set, fd_set *write_fd_set, fd_set *except_fd_set, int *maxfd);
+ 
++/**
++ * Let transfers read their sockets from inside a long stretch of work
++ * (VitaSurf): script, a style sheet's parse, box construction. Nothing
++ * is handed to the rest of NetSurf until the next ordinary poll, so it
++ * may be called from anywhere but a fetcher's own callback, where it
++ * does nothing. Rate limited, so cheap to call often.
++ */
++void fetch_pump(void);
++
+ #endif
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index a61e44558..32c429c4b 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -2162,6 +2162,34 @@ static void fetch_curl_flush_held(void)
+ 	}
+ }
+ 
++/* how often a long stretch of work lets transfers read their sockets */
++#define PUMP_INTERVAL_MS 30
++
++/* exported interface documented in content/fetchers/curl.h */
++void fetch_curl_pump_tick(void)
++{
++	static uint64_t last_ms;
++	static int wanted = -1;
++	uint64_t now;
++
++	if (wanted < 0) {
++#ifdef __vita__
++		wanted = vita_curl_pump_wanted() ? 1 : 0;
++#else
++		wanted = getenv("VITASURF_NOPUMP") == NULL ? 1 : 0;
++#endif
++	}
++	if (wanted == 0 || inside_curl) {
++		return;
++	}
++	nsu_getmonotonic_ms(&now);
++	if (now - last_ms < PUMP_INTERVAL_MS) {
++		return;
++	}
++	last_ms = now;
++	fetch_curl_pump();
++}
++
+ /* exported interface documented in content/fetchers/curl.h */
+ void fetch_curl_pump(void)
+ {
+diff --git a/content/fetchers/curl.h b/content/fetchers/curl.h
+index 7d1473138..4f474f51d 100644
+--- a/content/fetchers/curl.h
++++ b/content/fetchers/curl.h
+@@ -45,4 +45,11 @@ extern CURLM *fetch_curl_multi;
+  */
+ void fetch_curl_pump(void);
+ 
++/**
++ * fetch_curl_pump at most every 30 ms, and not at all when the nopump
++ * flag file (VITASURF_NOPUMP natively) says so (VitaSurf). Cheap enough
++ * to call from any long loop.
++ */
++void fetch_curl_pump_tick(void);
++
+ #endif
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index f44eb1713..900a68b46 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -897,6 +897,9 @@ nserror nscss_init(void)
+ 	if (error != NSERROR_OK)
+ 		goto error;
+ 
++	/* transfers keep moving through a long parse (VitaSurf) */
++	css_parse_tick = fetch_pump;
++
+ 	return NSERROR_OK;
+ 
+ error:
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index d30c3cb47..725ecfe32 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -46,6 +46,7 @@
+ #include "html/object.h"
+ #include "html/box.h"
+ #include "html/box_manipulate.h"
++#include "content/fetch.h"
+ #include "html/box_construct.h"
+ #include "html/box_special.h"
+ #include "html/webfont.h"
+@@ -1818,6 +1819,9 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 
+ 		assert(ctx->n != NULL);
+ 
++		/* transfers keep moving while the boxes are built, which
++		 * takes seconds on a large page (VitaSurf) */
++		fetch_pump();
+ 		nsu_getmonotonic_ms(&vs_e0);
+ 		if (box_construct_element(ctx, &convert_children) == false) {
+ 			ctx->cb(ctx->content, false);
+diff --git a/utils/utils.h b/utils/utils.h
+index be73699c0..427e18408 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -434,7 +434,7 @@ extern unsigned int vitasurf_js_sel_tag_sets;
+ extern unsigned int vitasurf_js_sel_tag_set_visits;
+ extern unsigned int vitasurf_js_sel_tag_absent;
+ extern unsigned int vitasurf_js_sel_recent_hits;
+-/* the fetcher's pump while scripts run, and what it held; defined in
++/* the fetcher's pump through long work, and what it held; defined in
+  * content/fetchers/curl.c (VitaSurf) */
+ extern unsigned int vitasurf_curl_pumps;
+ extern unsigned int vitasurf_curl_pump_ms;

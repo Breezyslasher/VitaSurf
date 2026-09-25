@@ -1436,7 +1436,8 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_js_sel_tag_fast,
 				 vitasurf_js_sel_tag_visits);
 			{
-				vita_log("page: while script ran, transfers "
+				vita_log("page: through script, style sheet "
+					 "parses and box building, transfers "
 					 "were pumped %u times for %u ms, "
 					 "holding %u KB for later (%u KB at "
 					 "most at once) and pausing %u times "

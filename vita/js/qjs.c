@@ -44,7 +44,6 @@
 #include "content/urldb.h"
 #include "content/fetch.h"
 #include "content/hlcache.h"
-#include "content/fetchers/curl.h"
 #include "content/handlers/javascript/js.h"
 #include "content/handlers/javascript/content.h"
 
@@ -654,26 +653,13 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	return r;
 }
 
-/* how often a running script lets transfers read their sockets */
-#define PUMP_INTERVAL_MS 30
-
 static int qjs_interrupt_body(jsthread *thread)
 {
 	/*
 	 * Keep transfers moving while script runs (VitaSurf). Nothing is
-	 * handed to the rest of NetSurf from here: see fetch_curl_pump.
+	 * handed to the rest of NetSurf from here: see fetch_pump.
 	 */
-	{
-		static uint64_t pump_last_ms;
-		uint64_t t = now_ms();
-
-		if (t - pump_last_ms >= PUMP_INTERVAL_MS) {
-			pump_last_ms = t;
-			if (vita_curl_pump_wanted()) {
-				fetch_curl_pump();
-			}
-		}
-	}
+	fetch_pump();
 	/*
 	 * Circle, pressed over the busy overlay, stops the script the same
 	 * way the budget does (VitaSurf): the screen had stayed as it was
