@@ -1746,11 +1746,11 @@ static void notify_left_parent(JSContext *ctx, struct dom_node *node,
 	if (dom_node_get_parent_node(node, &old) != DOM_NO_ERR || old == NULL) {
 		return;
 	}
-	if (old != newparent) {
-		gone = JS_NewArray(ctx);
-		JS_SetPropertyUint32(ctx, gone, 0, wrap_node(ctx, node));
-		notify_mutation(ctx, "childList", old, JS_NULL, gone);
-	}
+	/* a move within the same parent is a removal too, as in a
+	 * browser, told while the node still sits where it was */
+	gone = JS_NewArray(ctx);
+	JS_SetPropertyUint32(ctx, gone, 0, wrap_node(ctx, node));
+	notify_mutation(ctx, "childList", old, JS_NULL, gone);
 	dom_node_unref(old);
 }
 

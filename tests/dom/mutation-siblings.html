@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<!-- previousSibling and nextSibling on childList records, read from the
+     nodes' own links: an append, an insert in the middle, a move out of
+     another parent (whose removal record names the siblings the node
+     left), a removal, a fragment of three, and a move within one
+     parent, which a browser reports as a removal and then an addition.
+     A browser also reports the text the parser adds after this script,
+     which is not counted. -->
+<html><body><div id="a"><i id="a1"></i><b id="mv"></b><u id="a3"></u></div><div id="b"><p id="b1"></p><p id="b2"></p></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var A = document.getElementById('a'), B = document.getElementById('b');
+var recs = [];
+var mo = new MutationObserver(function (r) { recs = recs.concat(r); });
+mo.observe(document.body, {childList: true, subtree: true});
+function id(n){ return n ? (n.id || n.nodeName) : 'null'; }
+function show(r){ return r.target.id + ':' + (r.addedNodes.length ? '+' + [].map.call(r.addedNodes, id).join('+') : '') +
+  (r.removedNodes.length ? '-' + [].map.call(r.removedNodes, id).join('-') : '') +
+  ' prev=' + id(r.previousSibling) + ' next=' + id(r.nextSibling); }
+var n1 = document.createElement('em'); n1.id = 'n1'; B.appendChild(n1);
+var n2 = document.createElement('em'); n2.id = 'n2'; B.insertBefore(n2, document.getElementById('b2'));
+B.appendChild(document.getElementById('mv'));
+B.removeChild(document.getElementById('b1'));
+var f = document.createDocumentFragment();
+['f1','f2','f3'].forEach(function (x) { var e = document.createElement('s'); e.id = x; f.appendChild(e); });
+A.insertBefore(f, document.getElementById('a3'));
+setTimeout(function () {
+  var got = recs.filter(function (r) { return r.target === A || r.target === B; }).map(show);
+  var want = [
+    'b:+n1 prev=b2 next=null',
+    'b:+n2 prev=b1 next=b2',
+    'a:-mv prev=a1 next=a3',
+    'b:+mv prev=n1 next=null',
+    'b:-b1 prev=null next=n2',
+    'a:+f1+f2+f3 prev=a1 next=a3'];
+  for (var i = 0; i < want.length; i++)
+    ok('record ' + i + ' ' + want[i] + ' (' + got[i] + ')', got[i] === want[i]);
+  ok('six records for the two lists (' + got.length + ')', got.length === 6);
+  var big = document.createElement('div'); document.body.appendChild(big);
+  for (var k = 0; k < 300; k++) big.appendChild(document.createElement('span'));
+  mo.takeRecords(); recs = [];
+  var t0 = performance.now();
+  for (var m = 0; m < 200; m++) big.appendChild(big.firstChild);
+  var us = (performance.now() - t0) * 1000 / 200;
+  setTimeout(function () {
+    var last = recs[recs.length - 1];
+    var gone = recs[recs.length - 2];
+    ok('a move within a parent of 300 (' + Math.round(us) + ' us each) is a removal and an addition (' +
+       recs.length + ' records)', recs.length === 400);
+    ok('the removal names the siblings it left', gone && gone.removedNodes.length === 1 &&
+       gone.previousSibling === null && gone.nextSibling === big.children[0]);
+    ok('the addition names the siblings it joined', last.addedNodes.length === 1 &&
+       last.previousSibling === big.children[298] && last.nextSibling === null);
+  }, 10);
+}, 10);
+</script></body></html>

@@ -5878,10 +5878,22 @@ var MOedges=null;
 function noteEdges(n){
  MOedges=n&&n.parentNode?
   {node:n,prev:n.previousSibling||null,next:n.nextSibling||null}:null;}
+/* The siblings either side of a run of nodes still under target, from
+   the nodes' own links (VitaSurf). This copied target's whole child
+   list for every record of every observer, and GitHub moves rows
+   within a parent of hundreds: one appendChild wrapped every child four
+   times over. A node reported leaving before it has left still knows
+   its siblings, which the old way never gave it. */
+function edgeOfRun(nodes,target,rec){
+ var first=nodes[0],last=nodes[nodes.length-1];
+ if(!first||first.parentNode!==target)return false;
+ rec.previousSibling=first.previousSibling||null;
+ rec.nextSibling=(last.parentNode===target?last:first).nextSibling||null;
+ return true;}
 function siblingsOf(rec,target,after,before){
- var now=target.childNodes?[].slice.call(target.childNodes):[];
- if(rec.addedNodes.length&&edgeOf(now,rec.addedNodes,rec))return;
+ if(rec.addedNodes.length&&edgeOfRun(rec.addedNodes,target,rec))return;
  if(!rec.removedNodes.length)return;
+ if(edgeOfRun(rec.removedNodes,target,rec))return;
  if(before&&before.length!==undefined&&
     edgeOf([].slice.call(before),rec.removedNodes,rec))return;
  if(MOedges&&rec.removedNodes.indexOf(MOedges.node)>=0){
