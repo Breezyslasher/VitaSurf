@@ -1,0 +1,208 @@
+diff --git a/src/select/bloom.h b/src/select/bloom.h
+index baba48f..a84c539 100644
+--- a/src/select/bloom.h
++++ b/src/select/bloom.h
+@@ -37,8 +37,16 @@
+ /* Size of bloom filter as multiple of 32 bits.
+  * Has to be 4, 8, or 16.
+  * Larger increases optimisation of style selection engine but uses more memory.
++ *
++ * 8 (VitaSurf): at 4 the filter an element inherits from its ancestors
++ * was a fifth full on a GitHub page, and the names every element shares
++ * -- html, body and their classes -- sat on the bits some rules need, so
++ * a rule like .prc-FormControl-LabelContainer-M-FSK > * was offered to
++ * every one of its 5,000 elements. At 8 the saved page offers a third
++ * fewer rules and selection runs 13 % fewer instructions; 16 gains
++ * nothing more. It costs 16 bytes per rule and per element.
+  */
+-#define CSS_BLOOM_SIZE 4
++#define CSS_BLOOM_SIZE 8
+ 
+ 
+ 
+diff --git a/src/select/hash.c b/src/select/hash.c
+index cc356cf..9cd147b 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -267,6 +267,25 @@ static bool _attr_key(const css_selector *selector, uint32_t *key)
+ 	((req)->active == NULL || \
+ 	 (((req)->active[(e)->seq >> 5] >> ((e)->seq & 31)) & 1u) != 0)
+ 
++/**
++ * Whether a rule from an unkeyed chain is offered to this node
++ * (VitaSurf).
++ *
++ * The tests only ever answer together, so their order is free, and it
++ * is cheapest first: what the entry itself holds -- the state and
++ * attributes the key compound needs and the ancestor bloom -- before
++ * the sheet list, and only then the reads through the selector into
++ * its rule, which on the Vita are a cache miss each. On a saved GitHub
++ * page the universal chain was walked 447,601 times to offer 60,492
++ * rules, and most of the rest fail on the bloom.
++ */
++#define ENTRY_OFFERED(e, req) \
++	(RULE_WANTS_WHAT_NODE_HAS(e, req) && \
++	 css_bloom_in_bloom((e)->sel_chain_bloom, (req)->node_bloom) && \
++	 ENTRY_ACTIVE(e, req) && RULE_HAS_BYTECODE(e) && \
++	 mq_rule_good_for_media((e)->sel->rule, (req)->unit_ctx, \
++			(req)->media, (req)->str))
++
+ static inline lwc_string *_class_name(const css_selector *selector);
+ static inline lwc_string *_id_name(const css_selector *selector);
+ static css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+@@ -1121,14 +1140,7 @@ css_error css__selector_hash_find_by_attr(css_selector_hash *hash,
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_attr++;
+-			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+-			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+-			    css_bloom_in_bloom(
+-					head->sel_chain_bloom,
+-					req->node_bloom) &&
+-			    mq_rule_good_for_media(head->sel->rule,
+-					req->unit_ctx, req->media,
+-					req->str)) {
++			if (ENTRY_OFFERED(head, req)) {
+ 				/* Found a match */
+ 				break;
+ 			}
+@@ -1169,14 +1181,7 @@ css_error css__selector_hash_find_by_state(css_selector_hash *hash,
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_universal++;
+-			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+-			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+-			    css_bloom_in_bloom(
+-					head->sel_chain_bloom,
+-					req->node_bloom) &&
+-			    mq_rule_good_for_media(head->sel->rule,
+-					req->unit_ctx, req->media,
+-					req->str)) {
++			if (ENTRY_OFFERED(head, req)) {
+ 				/* Found a match */
+ 				break;
+ 			}
+@@ -1211,18 +1216,7 @@ css_error css__selector_hash_find_universal(css_selector_hash *hash,
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_universal++;
+-			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+-			    /* a rule the node cannot satisfy is never
+-			     * offered (VitaSurf) -- this loop finds the
+-			     * first entry and _iterate_universal the
+-			     * rest, so both need the test */
+-			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+-			    css_bloom_in_bloom(
+-					head->sel_chain_bloom,
+-					req->node_bloom) &&
+-			    mq_rule_good_for_media(head->sel->rule,
+-					req->unit_ctx, req->media,
+-					req->str)) {
++			if (ENTRY_OFFERED(head, req)) {
+ 				/* Found a match */
+ 				break;
+ 			}
+@@ -1752,14 +1746,7 @@ css_error _iterate_attrs(
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_attr++;
+-			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+-			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+-			    css_bloom_in_bloom(
+-					head->sel_chain_bloom,
+-					req->node_bloom) &&
+-			    mq_rule_good_for_media(head->sel->rule,
+-					req->unit_ctx, req->media,
+-					req->str)) {
++			if (ENTRY_OFFERED(head, req)) {
+ 				/* Found a match */
+ 				break;
+ 			}
+@@ -1787,16 +1774,7 @@ css_error _iterate_universal(
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_universal++;
+-			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+-			    /* a rule the node cannot satisfy is never
+-			     * offered (VitaSurf) */
+-			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+-			    css_bloom_in_bloom(
+-					head->sel_chain_bloom,
+-					req->node_bloom) &&
+-			    mq_rule_good_for_media(head->sel->rule,
+-					req->unit_ctx, req->media,
+-					req->str)) {
++			if (ENTRY_OFFERED(head, req)) {
+ 				/* Found a match */
+ 				break;
+ 			}
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 89940fd..0d9e58f 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -1562,6 +1562,56 @@ css_error css__stylesheet_rule_destroy(css_stylesheet *sheet, css_rule *rule)
+ 	return CSS_OK;
+ }
+ 
++/**
++ * Name the element type a compound requires where :is() hid it (VitaSurf)
++ *
++ * The :is() expansion turns ":is(a, iframe) x" into "*:is(a) x" and
++ * "*:is(iframe) x": the type stays in the compound as an extra element
++ * detail and the compound's own type is left as "*". The selector hash
++ * files a rule by that first type, so these went into the universal
++ * chain and were offered to every element on the page -- on a saved
++ * GitHub page one of them was offered 3,635 times and matched almost
++ * none. The ancestor bloom skipped them the same way.
++ *
++ * Copying the hidden type into the compound's own detail files the rule
++ * under its element and puts the name in the ancestor bloom. The extra
++ * detail stays where it is: matching the type twice gives the same
++ * answer, and specificity was counted when the detail was appended.
++ *
++ * \param selector  The selector chain to fix up
++ */
++static void name_hidden_types(css_selector *selector)
++{
++	for (; selector != NULL; selector = selector->combinator) {
++		css_selector_detail *first = &selector->data;
++		css_selector_detail *d;
++
++		if (first->type != CSS_SELECTOR_ELEMENT || first->negate ||
++				lwc_string_length(first->qname.name) != 1 ||
++				lwc_string_data(first->qname.name)[0] != '*')
++			continue;
++
++		for (d = first; d->next; ) {
++			d++;
++			if (d->type != CSS_SELECTOR_ELEMENT || d->negate)
++				continue;
++			if (lwc_string_length(d->qname.name) == 1 &&
++					lwc_string_data(d->qname.name)[0] ==
++					'*')
++				continue;
++			/* The hash and the bloom read the caseless name */
++			if (d->qname.name->insensitive == NULL)
++				break;
++
++			/* Only the name: the compound's own namespace
++			 * still applies, and the extra detail checks its */
++			lwc_string_unref(first->qname.name);
++			first->qname.name = lwc_string_ref(d->qname.name);
++			break;
++		}
++	}
++}
++
+ /**
+  * Add a selector to a CSS rule
+  *
+@@ -1582,6 +1632,8 @@ css_error css__stylesheet_rule_add_selector(css_stylesheet *sheet,
+ 	/* Ensure rule is a CSS_RULE_SELECTOR */
+ 	assert(rule->type == CSS_RULE_SELECTOR);
+ 
++	name_hidden_types(selector);
++
+ 	sels = realloc(r->selectors,
+ 			(r->base.items + 1) * sizeof(css_selector *));
+ 	if (sels == NULL)
