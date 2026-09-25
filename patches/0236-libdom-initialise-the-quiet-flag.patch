@@ -1,0 +1,15 @@
+diff --git a/src/core/node.c b/src/core/node.c
+index 80ed41f..a2f8c11 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -199,6 +199,10 @@ dom_exception _dom_node_initialise(dom_node_internal *node,
+ 
+ 	node->user_data = NULL;
+ 
++	/* nodes come from malloc(), so this is garbage until set
++	 * (VitaSurf) */
++	node->quiet = false;
++
+ 	node->base.refcnt = 1;
+ 
+ 	list_init(&node->pending_list);

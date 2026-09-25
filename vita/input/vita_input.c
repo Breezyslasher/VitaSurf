@@ -1588,6 +1588,8 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				extern unsigned int css_select_share_tainted;
 				extern unsigned int css_select_share_position;
 				extern unsigned int css_select_share_class_attr;
+				extern unsigned int css_compose_cache_hits;
+				extern unsigned int css_compose_cache_misses;
 
 				vita_log("page: selecting, by phase: setting up "
 					 "%u ms, matching rules %u ms, held-over "
@@ -1608,6 +1610,10 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 css_select_share_tainted,
 					 css_select_share_position,
 					 css_select_share_class_attr);
+				vita_log("page: composing took %u styles from "
+					 "the ones kept and composed %u",
+					 css_compose_cache_hits,
+					 css_compose_cache_misses);
 			}
 			vita_log("page: %u mutations went to the page's "
 					 "observers and %u more were wanted by none "

@@ -1,0 +1,478 @@
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index d760ae0..e97b197 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -116,6 +116,13 @@ css_error css_computed_style_compose(
+ 		const css_unit_ctx *unit_ctx,
+ 		css_computed_style **restrict result);
+ 
++/**
++ * Let go of the styles css_computed_style_compose() keeps for reuse
++ * (VitaSurf). Call it when a document goes, or before checking for
++ * leaks; composing works the same either way.
++ */
++void css_computed_style_compose_flush(void);
++
+ /******************************************************************************
+  * speciality formatters                                                      *
+  ******************************************************************************/
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 0ce3c60..e708acb 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -745,6 +745,9 @@ static bool vectorHasVar(const parserutils_vector *vector, int32_t ctx)
+ /**
+  * Append tokens[0..n) to out, replacing var() references.
+  *
++ * With out NULL nothing is appended, and the walk only records what
++ * each var() resolved to, for the compile cache (VitaSurf).
++ *
+  * \return CSS_OK, CSS_INVALID for an unresolvable reference, CSS_NOMEM
+  */
+ /** Record what a var() resolved to (VitaSurf). */
+@@ -774,8 +777,9 @@ static css_error appendSubstituted(css_language *c, const css_token *tokens,
+ 		bool is_env;
+ 
+ 		if (!tokenIsVar(t)) {
+-			if (parserutils_vector_append(out, (void *) t) !=
+-					PARSERUTILS_OK)
++			if (out != NULL &&
++					parserutils_vector_append(out,
++						(void *) t) != PARSERUTILS_OK)
+ 				return CSS_NOMEM;
+ 			continue;
+ 		}
+@@ -820,6 +824,8 @@ static css_error appendSubstituted(css_language *c, const css_token *tokens,
+ 				error = appendSubstituted(c, &tokens[fb_from],
+ 						fb_to - fb_from, out, depth + 1,
+ 						map);
++			} else if (out == NULL) {
++				error = CSS_OK;
+ 			} else {
+ 				css_token zero;
+ 
+@@ -962,6 +968,10 @@ css_error css__language_create(css_stylesheet *sheet, css_parser *parser,
+ 	c->prefix_n = 0;
+ 	c->in_has = 0;
+ 	c->env_zero = NULL;
++	/* read by every var() substituted while parsing, not only by
++	 * compile_deferred, which resets them (VitaSurf) */
++	c->subst_n = 0;
++	c->subst_over = false;
+ 	c->default_namespace = NULL;
+ 	c->namespaces = NULL;
+ 	c->num_namespaces = 0;
+@@ -1032,31 +1042,44 @@ css_error css__language_compile_deferred(css_language *c,
+ 	handler = property_handlers[decl->prop_index - 1];
+ 	css_deferred_compiles++;
+ 
+-	if (parserutils_vector_create(sizeof(css_token), 32, &subst) !=
+-			PARSERUTILS_OK) {
+-		return CSS_NOMEM;
+-	}
+-
++	/*
++	 * First only find what each var() resolves to (VitaSurf). Most
++	 * of the time it is what it was last time, and building the
++	 * substituted tokens just to throw them away was two thirds of a
++	 * compile the cache then answered: 11,388 compiles a GitHub load,
++	 * 10,820 of them answered.
++	 */
+ 	c->subst_n = 0;
+ 	c->subst_over = false;
+-	error = appendSubstituted(c, decl->tokens, decl->n_tokens, subst, 0,
++	error = appendSubstituted(c, decl->tokens, decl->n_tokens, NULL, 0,
+ 			map);
+-	if (error != CSS_OK) {
+-		parserutils_vector_destroy(subst);
++	if (error != CSS_OK)
+ 		return error;
+-	}
+ 
+ 	/* the same values as last time: the same bytecode will do */
+ 	if (decl->cache_valid && decl->cached != NULL && !c->subst_over &&
+ 			decl->cache_n == c->subst_n &&
+ 			memcmp(decl->cache_key, c->subst_key,
+ 				c->subst_n * sizeof(c->subst_key[0])) == 0) {
+-		parserutils_vector_destroy(subst);
+ 		css_deferred_cache_hits++;
+ 		*out = decl->cached;
+ 		return CSS_OK;
+ 	}
+ 
++	if (parserutils_vector_create(sizeof(css_token), 32, &subst) !=
++			PARSERUTILS_OK) {
++		return CSS_NOMEM;
++	}
++
++	c->subst_n = 0;
++	c->subst_over = false;
++	error = appendSubstituted(c, decl->tokens, decl->n_tokens, subst, 0,
++			map);
++	if (error != CSS_OK) {
++		parserutils_vector_destroy(subst);
++		return error;
++	}
++
+ 	error = css__stylesheet_style_create(c->sheet, &style);
+ 	if (error != CSS_OK) {
+ 		parserutils_vector_destroy(subst);
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 0625ca6..6030946 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -286,6 +286,100 @@ css_error css__computed_style_clone(
+ 	return CSS_OK;
+ }
+ 
++/*
++ * Composed results kept for reuse (VitaSurf).
++ *
++ * Composing runs every property's compose function, works out the
++ * absolute values and interns the result: some 10,000 instructions an
++ * element natively, and on the Vita a GitHub page spent 874 ms of its
++ * 3.3 s of style selection there. But both inputs are interned, so the
++ * same parent style and the same selected style are the same pointers,
++ * and cousins -- the cells of a table, the rows of a list, the parts of
++ * each card -- ask for the same composition over and over. Composing
++ * reads nothing but the two styles and the unit context, so an answer
++ * found here is the answer composing would give.
++ *
++ * Each entry holds a reference to both inputs and to the result, so no
++ * address in it can be freed and reused for a different style while it
++ * is here. That keeps at most three styles an entry alive past their
++ * time; css_computed_style_compose_flush() lets them go.
++ */
++#define COMPOSE_CACHE_SIZE 128
++
++struct compose_cache_entry {
++	const css_computed_style *parent;
++	const css_computed_style *child;
++	css_computed_style *result;
++	/* the unit context, but for the callback's own state */
++	css_fixed viewport_width;
++	css_fixed viewport_height;
++	css_fixed font_size_default;
++	css_fixed font_size_minimum;
++	css_fixed device_dpi;
++	const css_computed_style *root_style;
++	void *pw;
++	css_unit_len_measure measure;
++};
++
++static struct compose_cache_entry compose_cache[COMPOSE_CACHE_SIZE];
++
++/* how often the cache answered, and how often it could not (VitaSurf) */
++unsigned int css_compose_cache_hits;
++unsigned int css_compose_cache_misses;
++
++static inline uint32_t compose_cache_slot(const css_computed_style *parent,
++		const css_computed_style *child)
++{
++	uint32_t p = (uint32_t) ((uintptr_t) parent >> 4);
++	uint32_t c = (uint32_t) ((uintptr_t) child >> 4);
++
++	return ((p * 0x9e3779b1u) ^ (c * 0x85ebca6bu)) >> 25;
++}
++
++static inline bool compose_cache_same_units(
++		const struct compose_cache_entry *e,
++		const css_unit_ctx *unit_ctx)
++{
++	return e->viewport_width == unit_ctx->viewport_width &&
++		e->viewport_height == unit_ctx->viewport_height &&
++		e->font_size_default == unit_ctx->font_size_default &&
++		e->font_size_minimum == unit_ctx->font_size_minimum &&
++		e->device_dpi == unit_ctx->device_dpi &&
++		e->root_style == unit_ctx->root_style &&
++		e->pw == unit_ctx->pw &&
++		e->measure == unit_ctx->measure;
++}
++
++/* Take a reference to an interned style (VitaSurf) */
++static inline void compose_cache_ref(const css_computed_style *style)
++{
++	if (style != NULL)
++		((css_computed_style *) style)->count++;
++}
++
++static void compose_cache_drop(struct compose_cache_entry *e)
++{
++	if (e->result == NULL)
++		return;
++	if (e->parent != NULL)
++		css_computed_style_destroy((css_computed_style *) e->parent);
++	css_computed_style_destroy((css_computed_style *) e->child);
++	css_computed_style_destroy(e->result);
++	if (e->root_style != NULL)
++		css_computed_style_destroy(
++				(css_computed_style *) e->root_style);
++	memset(e, 0, sizeof(*e));
++}
++
++/* exported: see include/libcss/computed.h (VitaSurf) */
++void css_computed_style_compose_flush(void)
++{
++	size_t i;
++
++	for (i = 0; i < COMPOSE_CACHE_SIZE; i++)
++		compose_cache_drop(&compose_cache[i]);
++}
++
+ /**
+  * Compose two computed styles
+  *
+@@ -306,9 +400,30 @@ css_error css_computed_style_compose(
+ 		css_computed_style **restrict result)
+ {
+ 	css_computed_style *composed;
++	struct compose_cache_entry *e = NULL;
+ 	css_error error;
+ 	size_t i;
+ 
++	/*
++	 * Only interned styles are known by their address: one that is
++	 * not could be freed and its memory handed to another at any
++	 * time (VitaSurf).
++	 */
++	if (child->count != 0 && (parent == NULL || parent->count != 0) &&
++			(unit_ctx->root_style == NULL ||
++			 unit_ctx->root_style->count != 0)) {
++		e = &compose_cache[compose_cache_slot(parent, child)];
++		if (e->result != NULL && e->parent == parent &&
++				e->child == child &&
++				compose_cache_same_units(e, unit_ctx)) {
++			css_compose_cache_hits++;
++			e->result->count++;
++			*result = e->result;
++			return CSS_OK;
++		}
++		css_compose_cache_misses++;
++	}
++
+ 	/* TODO:
+ 	 *   Make this function take a composition context, to allow us
+ 	 *   to avoid the churn of unnecesaraly allocating and freeing
+@@ -344,7 +459,29 @@ css_error css_computed_style_compose(
+ 	}
+ 
+ 	*result = composed;
+-	return css__arena_intern_style(result);
++	error = css__arena_intern_style(result);
++	if (error != CSS_OK || e == NULL)
++		return error;
++
++	/* Keep it, letting go of whatever held the slot (VitaSurf) */
++	compose_cache_drop(e);
++	compose_cache_ref(parent);
++	compose_cache_ref(child);
++	compose_cache_ref(*result);
++	compose_cache_ref(unit_ctx->root_style);
++	e->parent = parent;
++	e->child = child;
++	e->result = *result;
++	e->viewport_width = unit_ctx->viewport_width;
++	e->viewport_height = unit_ctx->viewport_height;
++	e->font_size_default = unit_ctx->font_size_default;
++	e->font_size_minimum = unit_ctx->font_size_minimum;
++	e->device_dpi = unit_ctx->device_dpi;
++	e->root_style = unit_ctx->root_style;
++	e->pw = unit_ctx->pw;
++	e->measure = unit_ctx->measure;
++
++	return CSS_OK;
+ }
+ 
+ /******************************************************************************
+diff --git a/src/select/select.c b/src/select/select.c
+index ef91ac4..52fa455 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -1623,8 +1624,25 @@ static css_error css_select__initialise_selection_state(
+ 	css_error error;
+ 	bool match;
+ 
+-	/* Set up the selection state */
+-	memset(state, 0, sizeof(*state));
++	/*
++	 * Set up the selection state.
++	 *
++	 * The property table is three quarters of it, one column per
++	 * pseudo-element, and a column is only read once that
++	 * pseudo-element has a style. So only the element's own column
++	 * is cleared here, and the others when their style is made
++	 * (VitaSurf); clearing all 9 KB for every element was 9,000
++	 * instructions each.
++	 */
++	memset(state, 0, offsetof(css_select_state, props));
++	{
++		uint32_t i;
++
++		for (i = 0; i < CSS_N_PROPERTIES; i++) {
++			memset(&state->props[i][CSS_PSEUDO_ELEMENT_NONE], 0,
++					sizeof(prop_state));
++		}
++	}
+ 	state->node = node;
+ 	state->media = media;
+ 	state->unit_ctx = unit_ctx;
+@@ -2073,6 +2091,70 @@ css_error css_select_ctx_set_parent(css_select_ctx *ctx,
+ }
+ 
+ 
++/*
++ * A block with every property that is not inherited already at its
++ * initial value (VitaSurf).
++ *
++ * Finishing a style called set_initial() for each property no rule
++ * had set -- some 157 an element -- and for one that is not
++ * inherited that writes the same constant every time: on the Vita
++ * finishing took 761 ms of a GitHub page's 3.3 s of selection. A new
++ * element's style now starts as a copy of this block, and finishing
++ * skips any property nothing touched, which the copy already holds.
++ * Inherited properties stay zero, which is "inherit", as in a style
++ * fresh from calloc().
++ *
++ * Built once, from the same initial() functions. Should one of them
++ * ever leave a pointer in the style, the block is not used, as the
++ * copies would share it.
++ */
++static struct css_computed_style_i initial_block;
++static int initial_block_state; /* 0 not built, 1 usable, -1 not */
++
++static bool initial_block_ready(css_calculator *calc)
++{
++	css_computed_style *t;
++	css_select_state tmp;
++	uint32_t i;
++	bool ok = true;
++
++	if (initial_block_state != 0)
++		return initial_block_state > 0;
++
++	initial_block_state = -1;
++	if (css__computed_style_create(&t, calc) != CSS_OK)
++		return false;
++
++	memset(&tmp, 0, sizeof(tmp));
++	tmp.computed = t;
++	for (i = 0; i < CSS_N_PROPERTIES; i++) {
++		if (prop_dispatch[i].inherited == false &&
++				prop_dispatch[i].initial(&tmp) != CSS_OK)
++			ok = false;
++	}
++
++	if (t->i.animation_name != NULL || t->i.background_image != NULL ||
++			t->i.filter != NULL ||
++			t->i.list_style_image != NULL ||
++			t->i.mask_image != NULL ||
++			t->content != NULL || t->counter_increment != NULL ||
++			t->counter_reset != NULL || t->cursor != NULL ||
++			t->font_family != NULL || t->quotes != NULL ||
++			t->grid_auto_columns != NULL ||
++			t->grid_auto_rows != NULL ||
++			t->grid_template_columns != NULL ||
++			t->grid_template_rows != NULL || t->custom != NULL)
++		ok = false;
++
++	if (ok) {
++		initial_block = t->i;
++		initial_block_state = 1;
++	}
++	css_computed_style_destroy(t);
++
++	return ok;
++}
++
+ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		const css_unit_ctx *unit_ctx,
+ 		const css_media *media, const css_stylesheet *inline_style,
+@@ -2098,6 +2180,7 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	css_select_state state;
+ 	css_hint *hints = NULL;
+ 	void *parent = NULL;
++	bool seeded = false;
+ 	struct css_node_data *share;
+ 
+ 	if (ctx == NULL || node == NULL || result == NULL || handler == NULL ||
+@@ -2204,6 +2287,8 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 			error = CSS_NOMEM;
+ 			goto cleanup;
+ 		}
++		/* revert copies the whole table, so all of it is cleared */
++		memset(state.props, 0, sizeof(state.props));
+ 	}
+ 
+ 	/* Base element style is guaranteed to exist
+@@ -2213,6 +2298,12 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	if (error != CSS_OK) {
+ 		goto cleanup;
+ 	}
++	/* Start from the initial values; see initial_block (VitaSurf) */
++	seeded = (parent != NULL && initial_block_ready(ctx->calc));
++	if (seeded) {
++		state.results->styles[CSS_PSEUDO_ELEMENT_NONE]->i =
++				initial_block;
++	}
+ 
+ 	/* Apply any hints */
+ 	if (nhints > 0) {
+@@ -2377,6 +2468,11 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	for (i = 0; i < CSS_N_PROPERTIES; i++) {
+ 		prop_state *prop = &state.props[i][CSS_PSEUDO_ELEMENT_NONE];
+ 
++		/* untouched, so the seeded block holds it (VitaSurf) */
++		if (seeded && prop->set == false &&
++				prop->explicit_default == FLAG_VALUE__NONE)
++			continue;
++
+ 		if (prop->explicit_default == FLAG_VALUE_REVERT) {
+ 			error = css__select_revert_property(&state, prop,
+ 					CSS_PSEUDO_ELEMENT_NONE, i);
+@@ -2419,6 +2515,12 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		for (i = 0; i < CSS_N_PROPERTIES; i++) {
+ 			prop_state *prop = &state.props[i][j];
+ 
++			/* untouched, so the seeded block holds it */
++			if (initial_block_state > 0 && prop->set == false &&
++					prop->explicit_default ==
++					FLAG_VALUE__NONE)
++				continue;
++
+ 			if (prop->explicit_default == FLAG_VALUE_REVERT) {
+ 				error = css__select_revert_property(&state,
+ 						prop, j, i);
+@@ -3356,6 +3458,25 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 				&state->results->styles[pseudo], ctx->calc);
+ 		if (error != CSS_OK)
+ 			return error;
++		/*
++		 * A pseudo-element starts from the initial values too
++		 * (VitaSurf): "*, ::before, ::after" gives every element
++		 * two, and they were finished property by property.
++		 */
++		if (pseudo != CSS_PSEUDO_ELEMENT_NONE &&
++				initial_block_ready(ctx->calc)) {
++			state->results->styles[pseudo]->i = initial_block;
++		}
++		/* its column of the property table, not cleared till now */
++		if (pseudo != CSS_PSEUDO_ELEMENT_NONE &&
++				state->revert == NULL) {
++			uint32_t i;
++
++			for (i = 0; i < CSS_N_PROPERTIES; i++) {
++				memset(&state->props[i][pseudo], 0,
++						sizeof(prop_state));
++			}
++		}
+ 	}
+ 
+ 	state->current_pseudo = pseudo;

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!-- A new element's style starts from the initial values and
+     finishing skips what no rule touched; a
+     composed style may come from one composed before for the same
+     parent and selected styles; a held-over declaration may reuse the
+     bytecode compiled for the same var() values. Each check reads a
+     width or margin the rules under test decide. -->
+<html><head><style>
+body { margin: 0 } div, p, ul, li { margin: 0; padding: 0; list-style: none }
+.w { width: 40px; height: 4px }
+#r1 .w { width: 90px }
+#r1 .w.rv { width: revert }
+#i1 .w { margin-left: 30px }
+#i1 .w.in { margin-left: initial }
+#u1 { margin-left: 12px }
+#u1 .w { margin-left: unset }
+#u1 .w.ih { margin-left: inherit }
+.row { width: 30px } .row.big { width: 60px }
+.cell { width: inherit; height: 2px }
+#v1 { --gap: 4px } #v2 { --gap: 9px }
+.g { margin-left: var(--gap); width: 5px; height: 2px }
+.g.two { margin-left: calc(var(--gap) * 2) }
+</style></head><body>
+<div id="r1"><div class="w"></div><div class="w rv"></div></div>
+<div id="i1"><div class="w"></div><div class="w in"></div></div>
+<div id="u1"><div class="w"></div><div class="w ih"></div></div>
+<div id="t1"><div class="row"><div class="cell"></div><div class="cell"></div></div><div class="row big"><div class="cell"></div></div><div class="row"><div class="cell"></div></div><div class="row big"><div class="cell"></div></div></div>
+<div id="v1"><div class="g"></div><div class="g two"></div></div>
+<div id="v2"><div class="g"></div><div class="g two"></div></div>
+<div id="v3"><div class="g"></div></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function vals(sel, f){ var r=[]; var s=document.querySelectorAll(sel);
+  for (var i=0;i<s.length;i++) r.push(Math.round(f(s[i])));
+  return r.join(","); }
+function wid(e){ return e.getBoundingClientRect().width; }
+function left(e){ return e.getBoundingClientRect().left - e.parentNode.getBoundingClientRect().left; }
+function check(name, got, want){ ok(name+" ("+got+")", got===want); }
+setTimeout(function(){
+ check("revert to the user agent's width", vals("#r1 .w", wid), "90," + Math.round(document.getElementById("r1").getBoundingClientRect().width));
+ check("initial beside a set margin", vals("#i1 .w", left), "30,0");
+ check("unset and inherit on a margin", vals("#u1 .w", left), "0,12");
+ check("cousins inherit their own parent's width", vals("#t1 .cell", wid), "30,30,60,30,60");
+ check("var() values per parent", vals("#v1 .g, #v2 .g, #v3 .g", left), "4,8,9,18,0");
+}, 300);
+</script></body></html>
