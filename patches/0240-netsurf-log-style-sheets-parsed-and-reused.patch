@@ -1,0 +1,77 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index 79ea0f28c..c99e1124d 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -288,6 +288,12 @@ bool nscss_convert(struct content *c)
+ {
+ 	nscss_content *css = (nscss_content *) c;
+ 	css_error error;
++	size_t size = 0;
++
++	/* how much was parsed, for the page log (VitaSurf) */
++	(void) content__get_source_data(c, &size);
++	vitasurf_css_parsed++;
++	vitasurf_css_parsed_kb += (unsigned int) (size / 1024);
+ 
+ 	error = nscss_convert_css_data(&css->data);
+ 	if (error != CSS_OK) {
+diff --git a/content/hlcache.c b/content/hlcache.c
+index 08f1cabc6..12cb52b70 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -323,6 +323,13 @@ static nserror hlcache_find_content(hlcache_retrieval_ctx *ctx,
+ 		/* Found a suitable content: no longer need low-level handle */
+ 		llcache_handle_release(ctx->llcache);
+ 		hlcache->hit_count++;
++		{
++			/* a style sheet given already parsed (VitaSurf) */
++			hlcache_handle found = { entry, NULL, NULL };
++
++			if (content_get_type(&found) == CONTENT_CSS)
++				vitasurf_css_reused++;
++		}
+ 	}
+ 
+ 	/* Associate handle with content */
+diff --git a/utils/utils.c b/utils/utils.c
+index 4bdbcef3c..dc16e37e6 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -576,6 +576,9 @@ void regfree(regex_t *preg)
+ /* exported interface documented in utils/utils.h */
+ unsigned int vitasurf_ms_html_parse;
+ unsigned int vitasurf_ms_css;
++unsigned int vitasurf_css_parsed;
++unsigned int vitasurf_css_parsed_kb;
++unsigned int vitasurf_css_reused;
+ unsigned int vitasurf_us_compose;
+ 
+ #ifdef __vita__
+@@ -803,6 +806,9 @@ void vitasurf_profile_reset(void)
+ {
+ 	vitasurf_ms_html_parse = 0;
+ 	vitasurf_ms_css = 0;
++	vitasurf_css_parsed = 0;
++	vitasurf_css_parsed_kb = 0;
++	vitasurf_css_reused = 0;
+ 	vitasurf_us_compose = 0;
+ 	css_select_us_setup = 0;
+ 	css_select_us_match = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 427e18408..29a4ec99d 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -131,6 +131,13 @@ bool is_dir(const char *path);
+  */
+ extern unsigned int vitasurf_ms_html_parse;
+ extern unsigned int vitasurf_ms_css;
++/**
++ * Style sheets parsed, and their size, and those a page was given
++ * already parsed from the memory cache (VitaSurf).
++ */
++extern unsigned int vitasurf_css_parsed;
++extern unsigned int vitasurf_css_parsed_kb;
++extern unsigned int vitasurf_css_reused;
+ /** A microsecond clock, for timing work too short for milliseconds. */
+ uint64_t vitasurf_clock_us(void);
+ /*
