@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!-- Transfers while a script runs: four fetches the server answers
+     after 1.5 s each, then a 3 s script. With transfers kept moving
+     the answers are in when the script ends; without, the requests are
+     only sent then. Served by tests/bench/pump-server.py; prints how
+     long after the script each answer came. -->
+<html><body><script>
+var ends = [], scriptEnd = 0, got = 0;
+for (var i = 0; i < 4; i++) {
+  fetch('/slow?d=1.5&n=200000&i=' + i + '&r=' + Math.random()).then(function (r) { return r.text(); }).then(function (t) {
+    ends.push(Date.now() - scriptEnd);
+    if (++got === 4) console.log('PUMP answers came ' + ends.join(', ') + ' ms after the script, ' + t.length + ' bytes each');
+  }, function (e) { console.log('PUMP failed ' + e); });
+}
+var t0 = Date.now();
+while (Date.now() - t0 < 3000) { }
+scriptEnd = Date.now();
+console.log('PUMP script ran ' + (t0 / 1000).toFixed(3) + ' to ' + (scriptEnd / 1000).toFixed(3));
+</script></body></html>

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!-- What arrives while a script runs must reach the page whole and in
+     order: two answers larger than the 2 MB the fetcher holds (so it
+     pauses them), a redirect, and a request aborted while its answer
+     is held. Served by tests/bench/pump-server.py. -->
+<html><body><script>
+function ok(n, c) { console.log((c ? 'PASS ' : 'FAIL ') + n); }
+function pattern(t) {
+  for (var i = 0; i < t.length; i++)
+    if (t.charCodeAt(i) !== 48 + (i * 7) % 64) return 'bad at ' + i;
+  return 'ok';
+}
+var r = '&r=' + Math.random(), pending = 4;
+function done() { if (--pending === 0) console.log('PUMPCASES done'); }
+[3000000, 2500000].forEach(function (n, k) {
+  fetch('/slow?d=0.1&n=' + n + '&k=' + k + r).then(function (x) { return x.text(); }).then(function (t) {
+    ok(n + ' bytes held and paused arrive whole (' + t.length + ', ' + pattern(t) + ')',
+       t.length === n && pattern(t) === 'ok');
+    done();
+  }, function (e) { ok(n + ' bytes: ' + e, false); done(); });
+});
+fetch('/redir?d=0.2&to=' + encodeURIComponent('/slow?d=0.1&n=5000' + r)).then(function (x) {
+  return x.text().then(function (t) {
+    ok('a redirect met during the script is followed (' + x.status + ', ' + t.length + ')',
+       x.status === 200 && t.length === 5000 && pattern(t) === 'ok');
+    done();
+  });
+}, function (e) { ok('redirect: ' + e, false); done(); });
+var gone = new XMLHttpRequest();
+gone.open('GET', '/slow?d=0.1&n=400000&gone=1' + r);
+gone.onload = function () { ok('an aborted request does not load', false); };
+gone.send();
+var t0 = Date.now();
+while (Date.now() - t0 < 1500) { }
+gone.abort();
+ok('abort while its answer is held', gone.readyState === 0 || gone.readyState === 4);
+done();
+while (Date.now() - t0 < 3000) { }
+</script></body></html>

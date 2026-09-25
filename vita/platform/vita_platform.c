@@ -437,6 +437,19 @@ bool vita_decode_thread_wanted(void)
 	return !vita_flag_present(VITASURF_NO_DECODE_THREAD_FLAG);
 }
 
+/* exported interface documented in vita_platform.h */
+bool vita_curl_pump_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		wanted = vita_flag_present(VITASURF_NO_PUMP_FLAG) ? 0 : 1;
+		vita_log("network: transfers %s kept moving while a script "
+			 "runs", wanted ? "are" : "are not (nopump)");
+	}
+	return wanted != 0;
+}
+
 /*
  * The decode threads' places (VitaSurf). The main thread runs NetSurf
  * on the first core. The first decoder gets the second core to itself;

@@ -40,6 +40,7 @@
 #define VITASURF_LAYOUT_FLAG VITASURF_DATA_DIR "/dumplayout"
 /* drop a file of this name to keep image decoding on the main thread */
 #define VITASURF_NO_DECODE_THREAD_FLAG VITASURF_DATA_DIR "/nodecodethread"
+#define VITASURF_NO_PUMP_FLAG VITASURF_DATA_DIR "/nopump"
 #define VITASURF_CA_BUNDLE    VITASURF_RES_DIR "/cacert.pem"
 
 /* Persistence (phase 5): everything the user accumulates lives here. */
@@ -181,6 +182,13 @@ int vita_layout_dump_requested(void);
  * against each other on the device without a rebuild.
  */
 bool vita_decode_thread_wanted(void);
+
+/**
+ * Whether transfers are kept moving while a script runs (VitaSurf; see
+ * fetch_curl_pump): yes unless the nopump flag file is there, read once,
+ * so a page can be timed with and without on the device.
+ */
+bool vita_curl_pump_wanted(void);
 
 /**
  * Called on each decode thread as it starts: the first goes on the

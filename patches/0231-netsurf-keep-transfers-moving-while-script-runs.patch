@@ -1,0 +1,376 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 970a11e50..a61e44558 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -260,8 +260,53 @@ struct curl_fetch_info {
+ 	uint64_t last_progress_update;	/**< Time of last progress update */
+ 	int cert_depth; /**< deepest certificate in use */
+ 	struct cert_info cert_data[MAX_CERT_DEPTH]; /**< HTTPS certificate data */
++
++	/* what arrived while a script ran, not yet handed on (VitaSurf);
++	 * see fetch_curl_pump */
++	struct curl_held *held, *held_tail;
++	struct curl_fetch_info *held_next; /**< in held_fetches */
++	bool held_listed;	/**< on the held_fetches list */
++	bool held_paused;	/**< paused for want of room to hold */
++};
++
++/*
++ * Keeping transfers moving while a script runs (VitaSurf).
++ *
++ * The fetcher did no work while the main loop was busy, so every
++ * transfer stood still for as long as a script ran: on GitHub two
++ * 30-pixel avatars took eleven seconds, most of it inside one 7.7 s
++ * run of promise jobs, and TLS handshakes waited the same way.
++ * fetch_curl_pump lets curl read its sockets from the script
++ * interrupt, but nothing may reach the rest of NetSurf from there, so
++ * headers and data are held on the fetch, in order, and handed on by
++ * the next ordinary poll before it does anything else. Completion is
++ * only ever read by that poll, so a fetch cannot finish before what it
++ * held has gone.
++ */
++struct curl_held {
++	struct curl_held *next;
++	size_t len;
++	bool header;
++	char data[];
+ };
+ 
++/** held at most, over every fetch, before a fetch is paused */
++#define CURL_HELD_MAX (2 * 1024 * 1024)
++
++static bool curl_holding;
++static struct curl_fetch_info *held_fetches;
++static size_t curl_held_bytes;
++
++/* for the page profile */
++unsigned int vitasurf_curl_pumps;
++unsigned int vitasurf_curl_pump_ms;
++unsigned int vitasurf_curl_held_kb;
++unsigned int vitasurf_curl_held_max_kb;
++unsigned int vitasurf_curl_held_pauses;
++
++static void fetch_curl_drop_held(struct curl_fetch_info *f);
++static void fetch_curl_flush_held(void);
++
+ /** curl handle cache entry */
+ struct cache_handle {
+ 	CURL *handle; /**< The cached cURL handle */
+@@ -450,6 +495,12 @@ static struct curl_fetch_info *fetch_alloc(void)
+ 	memset(fetch->cert_data, 0, sizeof(fetch->cert_data));
+ 	fetch->cert_depth = -1;
+ 
++	fetch->held = NULL;
++	fetch->held_tail = NULL;
++	fetch->held_next = NULL;
++	fetch->held_listed = false;
++	fetch->held_paused = false;
++
+ 	return fetch;
+ }
+ 
+@@ -1441,6 +1492,7 @@ static void fetch_curl_free(void *vf)
+ 	struct curl_fetch_info *f = (struct curl_fetch_info *)vf;
+ 	int i;
+ 
++	fetch_curl_drop_held(f);
+ 	if (f->curl_handle) {
+ 		curl_easy_cleanup(f->curl_handle);
+ 	}
+@@ -1692,6 +1744,8 @@ static void fetch_curl_poll(lwc_string *scheme_ignored)
+ 
+ 	/* do any possible work on the current fetches */
+ 	inside_curl = true;
++	/* first what arrived while a script ran (VitaSurf) */
++	fetch_curl_flush_held();
+ 	do {
+ 		codem = curl_multi_perform(fetch_curl_multi, &running);
+ 		if (codem != CURLM_OK && codem != CURLM_CALL_MULTI_PERFORM) {
+@@ -1736,7 +1790,8 @@ fetch_curl_progress(void *clientp,
+ 	uint64_t time_now_ms;
+ 	fetch_msg msg;
+ 
+-	if (f->abort) {
++	/* nothing reaches the rest of NetSurf from a pump (VitaSurf) */
++	if (f->abort || curl_holding) {
+ 		return 0;
+         }
+ 
+@@ -1815,14 +1870,20 @@ static int fetch_curl_socket_close(void *clientp, curl_socket_t item)
+ }
+ 
+ /**
+- * Callback function for cURL.
++ * Hand received data on (VitaSurf: the body of the old callback, which
++ * a held chunk is replayed through too).
+  */
+-static size_t fetch_curl_data(char *data, size_t size, size_t nmemb, void *_f)
++static size_t fetch_curl_data_deliver(char *data, size_t size, size_t nmemb,
++		void *_f)
+ {
+ 	struct curl_fetch_info *f = _f;
+ 	CURLcode code;
+ 	fetch_msg msg;
+ 
++	if (f->stopped) {
++		return 0;
++	}
++
+ 	/* ensure we only have to get this information once */
+ 	if (!f->http_code) {
+ 		code = curl_easy_getinfo(f->curl_handle, CURLINFO_HTTP_CODE,
+@@ -1865,14 +1926,14 @@ static size_t fetch_curl_data(char *data, size_t size, size_t nmemb, void *_f)
+  * See RFC 2616 4.2.
+  */
+ static size_t
+-fetch_curl_header(char *data, size_t size, size_t nmemb, void *_f)
++fetch_curl_header_deliver(char *data, size_t size, size_t nmemb, void *_f)
+ {
+ 	struct curl_fetch_info *f = _f;
+ 	int i;
+ 	fetch_msg msg;
+ 	size *= nmemb;
+ 
+-	if (f->abort) {
++	if (f->abort || f->stopped) {
+ 		f->stopped = true;
+ 		return 0;
+ 	}
+@@ -1947,6 +2008,184 @@ fetch_curl_header(char *data, size_t size, size_t nmemb, void *_f)
+ #undef SKIP_ST
+ }
+ 
++/** Keep a header or a chunk of data to hand on later (VitaSurf). */
++static bool fetch_curl_hold(struct curl_fetch_info *f, const char *data,
++		size_t len, bool header)
++{
++	struct curl_held *h = malloc(sizeof(*h) + len + 1);
++
++	if (h == NULL) {
++		return false;
++	}
++	h->next = NULL;
++	h->len = len;
++	h->header = header;
++	memcpy(h->data, data, len);
++	/* curl's own buffer has a nul after the data, and header parsers
++	 * lean on it */
++	h->data[len] = '\0';
++	if (f->held_tail != NULL) {
++		f->held_tail->next = h;
++	} else {
++		f->held = h;
++	}
++	f->held_tail = h;
++	if (!f->held_listed) {
++		f->held_next = held_fetches;
++		held_fetches = f;
++		f->held_listed = true;
++	}
++	curl_held_bytes += len;
++	vitasurf_curl_held_kb += (unsigned int)((len + 512) / 1024);
++	if (curl_held_bytes / 1024 > vitasurf_curl_held_max_kb) {
++		vitasurf_curl_held_max_kb =
++				(unsigned int)(curl_held_bytes / 1024);
++	}
++	return true;
++}
++
++/** Free what a fetch holds and take it off the list (VitaSurf). */
++static void fetch_curl_drop_held(struct curl_fetch_info *f)
++{
++	struct curl_fetch_info **pp;
++
++	while (f->held != NULL) {
++		struct curl_held *h = f->held;
++
++		f->held = h->next;
++		curl_held_bytes -= h->len;
++		free(h);
++	}
++	f->held_tail = NULL;
++	if (f->held_listed) {
++		for (pp = &held_fetches; *pp != NULL; pp = &(*pp)->held_next) {
++			if (*pp == f) {
++				*pp = f->held_next;
++				break;
++			}
++		}
++		f->held_listed = false;
++	}
++}
++
++/**
++ * Callback function for cURL: data (VitaSurf: held while a script
++ * runs; see fetch_curl_pump).
++ */
++static size_t fetch_curl_data(char *data, size_t size, size_t nmemb, void *_f)
++{
++	struct curl_fetch_info *f = _f;
++
++	if (!curl_holding) {
++		return fetch_curl_data_deliver(data, size, nmemb, _f);
++	}
++	if (f->abort || f->stopped) {
++		return 0;
++	}
++	if (curl_held_bytes + size * nmemb > CURL_HELD_MAX ||
++	    !fetch_curl_hold(f, data, size * nmemb, false)) {
++		/* curl keeps this chunk and gives it again on resume */
++		f->held_paused = true;
++		vitasurf_curl_held_pauses++;
++		if (!f->held_listed) {
++			f->held_next = held_fetches;
++			held_fetches = f;
++			f->held_listed = true;
++		}
++		return CURL_WRITEFUNC_PAUSE;
++	}
++	return size * nmemb;
++}
++
++/**
++ * Callback function for headers (VitaSurf: held while a script runs).
++ */
++static size_t
++fetch_curl_header(char *data, size_t size, size_t nmemb, void *_f)
++{
++	struct curl_fetch_info *f = _f;
++
++	if (!curl_holding) {
++		return fetch_curl_header_deliver(data, size, nmemb, _f);
++	}
++	if (f->abort || f->stopped ||
++	    !fetch_curl_hold(f, data, size * nmemb, true)) {
++		return 0;
++	}
++	return size * nmemb;
++}
++
++/**
++ * Hand on everything held, in order, then let paused fetches go
++ * (VitaSurf). Called at the start of an ordinary poll, with
++ * inside_curl set as it is for a live callback, so a fetch the content
++ * aborts is only marked, and cleaned up by its completion.
++ */
++static void fetch_curl_flush_held(void)
++{
++	while (held_fetches != NULL) {
++		struct curl_fetch_info *f = held_fetches;
++		bool paused = f->held_paused;
++
++		held_fetches = f->held_next;
++		f->held_listed = false;
++		f->held_paused = false;
++		while (f->held != NULL) {
++			struct curl_held *h = f->held;
++			size_t got;
++
++			f->held = h->next;
++			if (f->held == NULL) {
++				f->held_tail = NULL;
++			}
++			curl_held_bytes -= h->len;
++			if (f->abort || f->stopped) {
++				got = 0;
++			} else if (h->header) {
++				got = fetch_curl_header_deliver(h->data, 1,
++						h->len, f);
++			} else {
++				got = fetch_curl_data_deliver(h->data, 1,
++						h->len, f);
++			}
++			free(h);
++			if (got == 0 && !f->abort) {
++				/* what a live callback returning 0 does:
++				 * the transfer ends as stopped */
++				f->stopped = true;
++			}
++		}
++		if (paused && f->curl_handle != NULL && !f->abort &&
++		    !f->stopped) {
++			curl_easy_pause(f->curl_handle, CURLPAUSE_CONT);
++		}
++	}
++}
++
++/* exported interface documented in content/fetchers/curl.h */
++void fetch_curl_pump(void)
++{
++	uint64_t t0, t1;
++	int running;
++	CURLMcode codem;
++
++	if (inside_curl || fetch_curl_multi == NULL ||
++	    curl_held_bytes >= CURL_HELD_MAX) {
++		return;
++	}
++	nsu_getmonotonic_ms(&t0);
++	inside_curl = true;
++	curl_holding = true;
++	do {
++		codem = curl_multi_perform(fetch_curl_multi, &running);
++	} while (codem == CURLM_CALL_MULTI_PERFORM);
++	curl_holding = false;
++	inside_curl = false;
++	nsu_getmonotonic_ms(&t1);
++	vitasurf_curl_pumps++;
++	vitasurf_curl_pump_ms += (unsigned int)(t1 - t0);
++}
++
+ static int fetch_curl_fdset(lwc_string *scheme, fd_set *read_set,
+ 			    fd_set *write_set, fd_set *error_set)
+ {
+diff --git a/content/fetchers/curl.h b/content/fetchers/curl.h
+index 5f2446a91..7d1473138 100644
+--- a/content/fetchers/curl.h
++++ b/content/fetchers/curl.h
+@@ -35,4 +35,14 @@ nserror fetch_curl_register(void);
+ /** Global cURL multi handle. */
+ extern CURLM *fetch_curl_multi;
+ 
++/**
++ * Let transfers read their sockets while a script runs (VitaSurf).
++ *
++ * Headers and data are held on each fetch and handed to the rest of
++ * NetSurf by the next ordinary poll, so this may be called from where
++ * nothing else in NetSurf may be entered, such as the script
++ * interrupt. It does nothing while curl is already being run.
++ */
++void fetch_curl_pump(void);
++
+ #endif
+diff --git a/utils/utils.c b/utils/utils.c
+index bb212974a..d903f00ba 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -811,6 +811,11 @@ void vitasurf_profile_reset(void)
+ 	css_select_share_tainted = 0;
+ 	css_select_share_position = 0;
+ 	css_select_share_class_attr = 0;
++	vitasurf_curl_pumps = 0;
++	vitasurf_curl_pump_ms = 0;
++	vitasurf_curl_held_kb = 0;
++	vitasurf_curl_held_max_kb = 0;
++	vitasurf_curl_held_pauses = 0;
+ 	vitasurf_ms_js_import_compile = 0;
+ 	vitasurf_js_import_compiles = 0;
+ 	vitasurf_js_import_kb = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 7271ed7ed..be73699c0 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -434,6 +434,13 @@ extern unsigned int vitasurf_js_sel_tag_sets;
+ extern unsigned int vitasurf_js_sel_tag_set_visits;
+ extern unsigned int vitasurf_js_sel_tag_absent;
+ extern unsigned int vitasurf_js_sel_recent_hits;
++/* the fetcher's pump while scripts run, and what it held; defined in
++ * content/fetchers/curl.c (VitaSurf) */
++extern unsigned int vitasurf_curl_pumps;
++extern unsigned int vitasurf_curl_pump_ms;
++extern unsigned int vitasurf_curl_held_kb;
++extern unsigned int vitasurf_curl_held_max_kb;
++extern unsigned int vitasurf_curl_held_pauses;
+ extern unsigned int vitasurf_js_jobs_budget;
+ extern unsigned int vitasurf_ms_js_jobs_budget;
+ extern unsigned int vitasurf_js_drain_max_jobs;

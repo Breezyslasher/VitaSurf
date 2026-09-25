@@ -44,6 +44,7 @@
 #include "content/urldb.h"
 #include "content/fetch.h"
 #include "content/hlcache.h"
+#include "content/fetchers/curl.h"
 #include "content/handlers/javascript/js.h"
 #include "content/handlers/javascript/content.h"
 
@@ -653,8 +654,26 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	return r;
 }
 
+/* how often a running script lets transfers read their sockets */
+#define PUMP_INTERVAL_MS 30
+
 static int qjs_interrupt_body(jsthread *thread)
 {
+	/*
+	 * Keep transfers moving while script runs (VitaSurf). Nothing is
+	 * handed to the rest of NetSurf from here: see fetch_curl_pump.
+	 */
+	{
+		static uint64_t pump_last_ms;
+		uint64_t t = now_ms();
+
+		if (t - pump_last_ms >= PUMP_INTERVAL_MS) {
+			pump_last_ms = t;
+			if (vita_curl_pump_wanted()) {
+				fetch_curl_pump();
+			}
+		}
+	}
 	/*
 	 * Circle, pressed over the busy overlay, stops the script the same
 	 * way the budget does (VitaSurf): the screen had stayed as it was
@@ -6145,8 +6164,15 @@ static void xhr_fetch_callback(const fetch_msg *msg, void *p)
 
 		while (len > 0 && (h[len - 1] == '\r' || h[len - 1] == '\n')) len--;
 		if (len >= 5 && strncasecmp(h, "HTTP/", 5) == 0) {
+			/* the status line, with an end of its own: a
+			 * fetcher's buffer need not have one */
+			char line[64];
+			size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
 			int code = 0;
-			if (sscanf(h, "HTTP/%*[0-9.] %d", &code) == 1) {
+
+			memcpy(line, h, n);
+			line[n] = '\0';
+			if (sscanf(line, "HTTP/%*[0-9.] %d", &code) == 1) {
 				x->status = code;
 			}
 			/* a new status line (100 Continue, retries) restarts the headers */

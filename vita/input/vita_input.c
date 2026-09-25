@@ -1435,6 +1435,18 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 "answered in C, visiting %u elements",
 				 vitasurf_js_sel_tag_fast,
 				 vitasurf_js_sel_tag_visits);
+			{
+				vita_log("page: while script ran, transfers "
+					 "were pumped %u times for %u ms, "
+					 "holding %u KB for later (%u KB at "
+					 "most at once) and pausing %u times "
+					 "for room",
+					 vitasurf_curl_pumps,
+					 vitasurf_curl_pump_ms,
+					 vitasurf_curl_held_kb,
+					 vitasurf_curl_held_max_kb,
+					 vitasurf_curl_held_pauses);
+			}
 			vita_log("page: %u bare tag queries were answered "
 				 "from the tag names under their element, "
 				 "gathered %u times over %u elements; %u "
