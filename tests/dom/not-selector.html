@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!-- :not() of one compound, answered in C: matches, querySelector,
+     querySelectorAll and closest, with attributes, classes, ids and
+     tags inside, more than one :not(), and forms left to the prelude
+     (a list, a combinator, a pseudo-class after it). -->
+<html><body>
+<div id="t">
+ <a id="a1" data-u="x" class="k">1</a>
+ <a id="a2" data-u="x" data-no="1" class="k m">2</a>
+ <b id="b1" data-u="y">3</b>
+ <p id="p1" class="m"><span id="s1" data-u="z">4</span></p>
+</div>
+<script>
+function ok(n, c) { console.log((c ? 'PASS ' : 'FAIL ') + n); }
+function ids(list) { return [].map.call(list, function (e) { return e.id; }).join(','); }
+var t = document.getElementById('t');
+function q(sel) { return ids(t.querySelectorAll(sel)); }
+ok('attribute and :not(attribute)', q('[data-u]:not([data-no])') === 'a1,b1,s1');
+ok(':not(class)', q('a:not(.m)') === 'a1');
+ok(':not(id)', q('[data-u]:not(#b1)') === 'a1,a2,s1');
+ok(':not(tag)', q('[data-u]:not(a)') === 'b1,s1');
+ok('two :not()', q('[data-u]:not(a):not(span)') === 'b1');
+ok(':not(compound)', q('[data-u]:not(a.m)') === 'a1,b1,s1');
+ok(':not(attribute value)', q('[data-u]:not([data-u="x"])') === 'b1,s1');
+ok('with a combinator', q('p :not(a)') === 's1');
+ok('querySelector', t.querySelector('.k:not(.m)').id === 'a1');
+ok('matches true', document.getElementById('a1').matches('[data-u]:not([data-no])'));
+ok('matches false', !document.getElementById('a2').matches('[data-u]:not([data-no])'));
+ok('closest', document.getElementById('s1').closest('*:not(span):not(div)').id === 'p1');
+ok('a list inside, left to the prelude', q('[data-u]:not(a, b)') === 's1');
+ok('a combinator inside, left to the prelude', q('span:not(p > span)') === '');
+ok('a pseudo-class after, left to the prelude', q('a:not(.m):first-child') === 'a1');
+ok('bare :not()', q(':not(a):not(p)') === 'b1,s1');
+</script></body></html>

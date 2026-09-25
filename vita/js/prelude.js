@@ -2121,7 +2121,16 @@ Object.keys(W).forEach(function(k){if(k.indexOf('HTML')===0&&k!=='HTMLDocument'&
  * the error's type and message, which is the half worth reading. */
 function ceErr(e){try{console.error('custom element: '+String(e)+(e&&e.stack?'\n'+e.stack:''));}catch(x){}}
 function ceCall(el,name,args){var f=el[name];if(typeof f!=='function')return;try{f.apply(el,args||[]);}catch(e){ceErr(e);}}
-function ceInDoc(n){var r=D.documentElement;while(n){if(n===r)return true;n=n.parentNode;}return false;}
+/* In C, one call for the whole climb (VitaSurf): the parentNode walk
+   here was a crossing into C per ancestor, and isConnected, which
+   GitHub's components read from every attributeChangedCallback, was 8 %
+   of its profile. The document object itself stays false, as it was. */
+var ceConn=null;
+function ceInDoc(n){
+ if(!n||n===D)return false;
+ if(ceConn===null)ceConn=typeof W.__vitaConnected==='function'?W.__vitaConnected:false;
+ if(ceConn&&n.nodeType!==undefined)return ceConn(n);
+ var r=D.documentElement;while(n){if(n===r)return true;n=n.parentNode;}return false;}
 
 /* The definition an element would upgrade to, or null. */
 function ceDefOf(el){
@@ -2667,12 +2676,21 @@ function hide(o,k,v){try{Object.defineProperty(o,k,
 function TokenList(el,attr){hide(this,'_e',el);hide(this,'_a',attr);
  var t=this._t();for(var i=0;i<t.length;i++)this[i]=t[i];
  Object.defineProperty(this,'length',{configurable:true,value:t.length,writable:true});}
+/* Split on ASCII whitespace (VitaSurf): with nothing but spaces in it,
+   which is nearly every class attribute, a plain string split, since a
+   split on a regular expression goes through Symbol.split and its flags
+   getter and was 3 % of GitHub's profile. Empty tokens are left for the
+   caller, as the regular expression left them at the ends. */
+function splitWS(v){
+ if(v.indexOf('\t')<0&&v.indexOf('\n')<0&&v.indexOf('\r')<0&&v.indexOf('\f')<0)
+  return v.split(' ');
+ return v.split(/[ \t\r\n\f]+/);}
 /* The attribute as an ordered set: split on whitespace, first occurrence
    of each token wins. */
 TokenList.prototype._t=function(){
  if(!this._e)return this._own||(this._own=[]);
  var v=this._e.getAttribute(this._a);
- var out=[],seen={},parts=v?String(v).split(/[ \t\r\n\f]+/):[],i;
+ var out=[],seen={},parts=v?splitWS(String(v)):[],i;
  for(i=0;i<parts.length;i++){
   if(parts[i]===''||Object.prototype.hasOwnProperty.call(seen,parts[i]))continue;
   seen[parts[i]]=1;out.push(parts[i]);}
@@ -2765,7 +2783,7 @@ hide(TokenList.prototype,'_w',TokenList.prototype._w);
 Object.defineProperty(TokenList.prototype,'value',{configurable:true,
  get:function(){return this._e?(this._e.getAttribute(this._a)||''):this._t().join(' ');},
  set:function(v){if(this._e)this._e.setAttribute(this._a,String(v));
-  else this._own=String(v).split(/[ \t\r\n\f]+/).filter(function(x){return x;});}});
+  else this._own=splitWS(String(v)).filter(function(x){return x;});}});
 W.DOMTokenList=TokenList;
 /* A fresh list per read. A browser hands back the same object every time
    and code occasionally compares them, but caching it here means the
@@ -5762,11 +5780,17 @@ function MutationObserver(cb){
 
    chain[0] is the target, so its index is the depth the walk used to
    count, and the nearest match is still the one found. */
-MutationObserver.prototype._wants=function(kind,target,name,chain){
- var i,w,depth;
+MutationObserver.prototype._wants=function(kind,target,name,chain,pairs){
+ var i,j,w,depth;
  for(i=0;i<this._watch.length;i++){
   w=this._watch[i];
-  depth=chain.indexOf(w.target);
+  /* the watched nodes C found and their depths, a short dense list
+     (VitaSurf): the sparse chain built from them was a slow array,
+     and an indexOf on it for every watch of every observer was a
+     real share of each appendChild and setAttribute on GitHub */
+  if(pairs){depth=-1;
+   for(j=0;j<pairs.length;j+=2)if(pairs[j]===w.target){depth=pairs[j+1];break;}}
+  else depth=chain.indexOf(w.target);
   if(depth<0)continue;
   if(depth>0&&!w.subtree)continue;
   if(kind==='childList'&&!w.childList)continue;
@@ -5903,15 +5927,13 @@ W.__vitaMutation=function(kind,target,a,b,ns,matches){
  if(!MOlist.length||!target)return;
  var i,o,w,rec,n;
  /* once for every observer, not once per watch entry of each */
- var chain=[];
+ var chain=null;
  /* C has already walked it and found which watched nodes sit where
-    (VitaSurf): only those go in, each at its depth, and indexOf on
-    the rest of the array finds nothing, as the full chain would not */
- if(matches)for(i=0;i<matches.length;i+=2)chain[matches[i+1]]=matches[i];
- else for(n=target;n;n=n.parentNode)chain.push(n);
+    (VitaSurf), and _wants reads those pairs; without them, the chain */
+ if(!matches){chain=[];for(n=target;n;n=n.parentNode)chain.push(n);}
  for(i=0;i<MOlist.length;i++){
   o=MOlist[i];
-  w=o._wants(kind,target,kind==='attributes'?a:null,chain);
+  w=o._wants(kind,target,kind==='attributes'?a:null,chain,matches);
   if(!w)continue;
   rec=new MutationRecord(kind,target);
   if(kind==='attributes'){

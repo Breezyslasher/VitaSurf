@@ -7093,6 +7093,9 @@ struct sel_compound {
 	int nclasses;
 	struct sel_attr *attrs;
 	int nattrs;
+	/* :not() of a compound, each of which must not match (VitaSurf) */
+	struct sel_compound *nots;
+	int nnots;
 	char comb;		/**< joins it to the one before: ' ' > + ~ */
 };
 
@@ -7123,6 +7126,8 @@ static void sel_free_compound(struct sel_compound *c)
 		free(c->attrs[i].val);
 	}
 	free(c->attrs);
+	for (i = 0; i < c->nnots; i++) sel_free_compound(&c->nots[i]);
+	free(c->nots);
 }
 
 static void sel_free(struct sel_compiled *s)
@@ -7348,6 +7353,40 @@ static bool sel_parse_compound(const char **pp, const char *end,
 		c->attrs = grown;
 		c->attrs[c->nattrs++] = a;
 	}
+	/*
+	 * :not() of one compound (VitaSurf). GitHub asks
+	 * '[data-deferred-details-content-url]:not([data-details-no-preload-
+	 * on-hover])' of every element its selector observer sees, over
+	 * 3,000 times a load, and each went through the prelude. A list,
+	 * a combinator or anything else inside is left to it.
+	 */
+	while (end - p > 5 && strncmp(p, ":not(", 5) == 0) {
+		const char *in = p + 5, *close = in, *q;
+		struct sel_compound inner, *grown;
+
+		while (close < end && *close != ')') {
+			if (*close == '(' || *close == ',') return false;
+			close++;
+		}
+		if (close >= end) return false;
+		while (in < close && sel_ws(*in)) in++;
+		q = close;
+		while (q > in && sel_ws(q[-1])) q--;
+		memset(&inner, 0, sizeof(inner));
+		if (in == q || !sel_parse_compound(&in, q, &inner) || in != q) {
+			sel_free_compound(&inner);
+			return false;
+		}
+		grown = realloc(c->nots, (size_t)(c->nnots + 1) *
+				sizeof(*grown));
+		if (grown == NULL) {
+			sel_free_compound(&inner);
+			return false;
+		}
+		c->nots = grown;
+		c->nots[c->nnots++] = inner;
+		p = close + 1;
+	}
 	/* a compound ends at white space, a combinator, a comma or the end */
 	if (p < end && !sel_ws(*p) && *p != '>' && *p != '+' && *p != '~' &&
 	    *p != ',') {
@@ -7569,6 +7608,9 @@ static bool sel_match_compound(struct dom_node *n, const struct sel_compound *c)
 		dom_string_unref(v);
 		if (!hit) return false;
 	}
+	for (i = 0; i < c->nnots; i++) {
+		if (sel_match_compound(n, &c->nots[i])) return false;
+	}
 	return true;
 }
 
@@ -7694,7 +7736,7 @@ static const struct sel_compound *sel_bare_tag(const struct sel_compiled *s)
 	if (s->ngroups != 1 || s->groups[0].n != 1) return NULL;
 	c = &s->groups[0].parts[0];
 	if (c->tag == NULL || c->id != NULL || c->nclasses != 0 ||
-	    c->nattrs != 0) {
+	    c->nattrs != 0 || c->nnots != 0) {
 		return NULL;
 	}
 	return c;
