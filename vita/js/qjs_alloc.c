@@ -14,14 +14,16 @@
  * How: blocks of up to 512 bytes come from 16 KB pages, each page
  * serving one size class, with its own free list and a bump pointer for
  * the part never yet used. Pages come eight at a time in 128 KB
- * batches taken from malloc, and a page nothing uses any more goes to a
+ * batches taken from malloc -- one page more than that, since newlib on
+ * the Vita has no aligned allocation and the pages are aligned by
+ * rounding up inside it -- and a page nothing uses any more goes to a
  * pool any size class can take from; once a whole batch is unused and
  * the pool holds more than a couple of batches' worth, the batch goes
  * back to malloc, so what is held follows what script is using.
  * Anything bigger goes to malloc as before.
  *
  * QuickJS asks the size of a block with nothing but its address, so
- * the batches are found from an address through one small hash table
+ * the pages are found from an address through one small hash table
  * for the whole program, and every runtime shares one set of pools.
  * Script only ever runs on the main thread.
  */
@@ -54,6 +56,8 @@
 #define NO_CLASS 0xffffu
 
 struct pa_batch {
+	void *raw;                 /**< what malloc gave */
+	char *base;                /**< the first page, aligned */
 	unsigned int empty;        /**< pages of this batch in the pool */
 };
 
@@ -70,7 +74,6 @@ struct pa_page {
 };
 
 #define ROUND_UP(x, a) (((x) + ((a) - 1)) & ~((uintptr_t) (a) - 1))
-#define BATCH_HDR ROUND_UP(sizeof(struct pa_batch), 16)
 #define PAGE_HDR ROUND_UP(sizeof(struct pa_page), 16)
 
 struct pa_class {
@@ -90,38 +93,38 @@ static struct {
 	struct pa_page *empty;     /**< the pool of pages no class holds */
 	unsigned int n_empty;
 
-	uintptr_t *table;          /**< batch addresses, 0 for a free slot */
+	uintptr_t *table;          /**< page addresses, 0 for a free slot */
 	unsigned int table_bits;
 	unsigned int table_count;
 
 	struct qjs_pool_stats stats;
 } pa;
 
-/* --- the batch table -------------------------------------------------- */
+/* --- the page table --------------------------------------------------- */
 
 static inline unsigned int table_slot(uintptr_t base, unsigned int bits)
 {
-	uint32_t k = (uint32_t) (base >> BATCH_SHIFT);
+	uint32_t k = (uint32_t) (base >> PAGE_SHIFT);
 
 	return (unsigned int) ((k * 0x9e3779b1u) >> (32 - bits));
 }
 
-/** The batch holding p, or NULL if malloc gave it out. */
-static inline struct pa_batch *batch_of(const void *p)
+/** Whether p is in one of the pools' pages, rather than from malloc. */
+static inline bool ours(const void *p)
 {
-	uintptr_t base = (uintptr_t) p & ~(BATCH_SIZE - 1);
+	uintptr_t base = (uintptr_t) p & ~(PAGE_SIZE - 1);
 	unsigned int mask, i;
 
 	if (pa.table == NULL)
-		return NULL;
+		return false;
 	mask = (1u << pa.table_bits) - 1;
 	for (i = table_slot(base, pa.table_bits);; i = (i + 1) & mask) {
 		uintptr_t k = pa.table[i];
 
 		if (k == base)
-			return (struct pa_batch *) base;
+			return true;
 		if (k == 0)
-			return NULL;
+			return false;
 	}
 }
 
@@ -189,12 +192,7 @@ static void table_remove(uintptr_t base)
 
 static inline struct pa_page *page_of(const void *p)
 {
-	uintptr_t base = (uintptr_t) p & ~(PAGE_SIZE - 1);
-
-	/* the first page of a batch has the batch's header first */
-	if ((base & (BATCH_SIZE - 1)) == 0)
-		base += BATCH_HDR;
-	return (struct pa_page *) base;
+	return (struct pa_page *) ((uintptr_t) p & ~(PAGE_SIZE - 1));
 }
 
 static inline void list_unlink(struct pa_page **head, struct pa_page *p)
@@ -219,20 +217,31 @@ static inline void list_push(struct pa_page **head, struct pa_page *p)
 
 static bool batch_new(void)
 {
-	void *mem = NULL;
-	struct pa_batch *b;
+	struct pa_batch *b = malloc(sizeof(*b));
 	unsigned int i;
 
-	if (posix_memalign(&mem, BATCH_SIZE, BATCH_SIZE) != 0 || mem == NULL)
+	if (b == NULL)
 		return false;
-	if (!table_insert((uintptr_t) mem)) {
-		free(mem);
+	/* one page over, so that eight aligned pages fit whatever the start */
+	b->raw = malloc(BATCH_SIZE + PAGE_SIZE);
+	if (b->raw == NULL) {
+		free(b);
 		return false;
 	}
-	b = mem;
+	b->base = (char *) ROUND_UP((uintptr_t) b->raw, PAGE_SIZE);
+	for (i = 0; i < PAGES_PER_BATCH; i++) {
+		if (!table_insert((uintptr_t) (b->base + i * PAGE_SIZE))) {
+			while (i-- > 0)
+				table_remove((uintptr_t) (b->base +
+						i * PAGE_SIZE));
+			free(b->raw);
+			free(b);
+			return false;
+		}
+	}
 	b->empty = PAGES_PER_BATCH;
 	for (i = 0; i < PAGES_PER_BATCH; i++) {
-		struct pa_page *p = page_of((char *) mem + i * PAGE_SIZE);
+		struct pa_page *p = page_of(b->base + i * PAGE_SIZE);
 
 		memset(p, 0, sizeof(*p));
 		p->batch = b;
@@ -251,12 +260,13 @@ static void batch_free(struct pa_batch *b)
 	unsigned int i;
 
 	for (i = 0; i < PAGES_PER_BATCH; i++) {
-		struct pa_page *p = page_of((char *) b + i * PAGE_SIZE);
+		struct pa_page *p = page_of(b->base + i * PAGE_SIZE);
 
 		list_unlink(&pa.empty, p);
 		pa.n_empty--;
+		table_remove((uintptr_t) p);
 	}
-	table_remove((uintptr_t) b);
+	free(b->raw);
 	free(b);
 	pa.stats.batches--;
 	pa.stats.batches_freed++;
@@ -380,7 +390,7 @@ static void pa_free(void *opaque, void *ptr)
 	(void) opaque;
 	if (ptr == NULL)
 		return;
-	if (batch_of(ptr) == NULL) {
+	if (!ours(ptr)) {
 		free(ptr);
 		return;
 	}
@@ -416,7 +426,7 @@ static size_t pa_usable_size(const void *ptr)
 {
 	if (ptr == NULL)
 		return 0;
-	if (batch_of(ptr) != NULL)
+	if (ours(ptr))
 		return pa.classes[page_of(ptr)->cls].size;
 	/* what QuickJS's own functions say for a block from malloc */
 #ifdef __GLIBC__
@@ -436,7 +446,7 @@ static void *pa_realloc(void *opaque, void *ptr, size_t size)
 		pa_free(opaque, ptr);
 		return NULL;
 	}
-	if (batch_of(ptr) != NULL) {
+	if (ours(ptr)) {
 		uint32_t cs = pa.classes[page_of(ptr)->cls].size;
 
 		/* it still fits, and would not fit a class half the size */
