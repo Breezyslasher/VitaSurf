@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!-- A script element inserted from an inline script at the end of the
+     body, as Cloudflare's challenge page does, runs after parsing. If it
+     finds the document still 'loading' it waits for DOMContentLoaded, so
+     the document must not say 'loading' once that event has gone. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<script>
+document.addEventListener('DOMContentLoaded', function () { window.__dcl = true; });
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+(function(){ var a = document.createElement('script'); a.src = 'resources/late-script.js';
+ document.getElementsByTagName('head')[0].appendChild(a); }());
+window.addEventListener('load', function () { setTimeout(function () {
+ var l = window.__late || {};
+ ok("the inserted script ran", !!window.__late);
+ ok("DOMContentLoaded fired (" + window.__dcl + ")", window.__dcl === true);
+ ok("it was not left waiting for an event that had gone (state " + l.state + ", DOMContentLoaded before it " + l.dclBefore + ")",
+    l.gotDcl === true || l.gotDcl === 'not needed');
+ ok("'loading' only before DOMContentLoaded", !(l.state === 'loading' && l.dclBefore));
+}, 50); });
+</script></body></html>

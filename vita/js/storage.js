@@ -57,6 +57,20 @@ W.addEventListener('pagehide', flush);
 W.addEventListener('beforeunload', flush);
 W.addEventListener('unload', flush);
 
+/*
+ * objectStoreNames and indexNames are DOMStringLists: an array to read,
+ * with contains() and item() besides. They were plain arrays, and the
+ * check every IndexedDB user makes before creating a store --
+ * db.objectStoreNames.contains(name) -- threw "not a function" out of
+ * the page's onsuccess on claude.ai.
+ */
+function stringList(names){
+ Object.defineProperty(names, 'contains', { configurable: true, writable: true,
+  value: function(n){ return this.indexOf(String(n)) >= 0; } });
+ Object.defineProperty(names, 'item', { configurable: true, writable: true,
+  value: function(i){ i = i >>> 0; return i < this.length ? this[i] : null; } });
+ return names;
+}
 /* ------------------------------------------------- the structured clone */
 
 /*
@@ -473,7 +487,7 @@ function IDBTransaction(db, names, mode){
  Target.call(this);
  this.db = db;
  this.mode = mode || 'readonly';
- this.objectStoreNames = names.slice().sort();
+ this.objectStoreNames = stringList(names.slice().sort());
  this.error = null;
  this.durability = 'default';
  this.oncomplete = null; this.onerror = null; this.onabort = null;
@@ -570,7 +584,7 @@ function IDBObjectStore(tx, name){
  if (!this._s) throw DOMEx('NotFoundError', 'no store ' + name);
  this.keyPath = this._s.keyPath === undefined ? null : this._s.keyPath;
  this.autoIncrement = !!this._s.autoIncrement;
- this.indexNames = Object.keys(this._s.indexes || {}).sort();
+ this.indexNames = stringList(Object.keys(this._s.indexes || {}).sort());
 }
 
 function recordsOf(s){ return s.records; }
@@ -730,7 +744,7 @@ IDBObjectStore.prototype = {
   this._s.indexes[String(name)] = {
    keyPath: keyPath, unique: !!options.unique, multiEntry: !!options.multiEntry
   };
-  this.indexNames = Object.keys(this._s.indexes).sort();
+  this.indexNames = stringList(Object.keys(this._s.indexes).sort());
   touch();
   return new IDBIndex(this, String(name));
  },
@@ -739,7 +753,7 @@ IDBObjectStore.prototype = {
    throw DOMEx('InvalidStateError', 'indexes are removed while upgrading');
   }
   delete this._s.indexes[String(name)];
-  this.indexNames = Object.keys(this._s.indexes).sort();
+  this.indexNames = stringList(Object.keys(this._s.indexes).sort());
   touch();
  },
  index: function(name){
@@ -990,7 +1004,7 @@ function IDBDatabase(name, data){
  this.name = name;
  this._data = data;
  this.version = data.version;
- this.objectStoreNames = Object.keys(data.stores).sort();
+ this.objectStoreNames = stringList(Object.keys(data.stores).sort());
  this.onversionchange = null; this.onclose = null;
  this._closed = false;
 }
@@ -1017,7 +1031,7 @@ IDBDatabase.prototype.createObjectStore = function(name, options){
   autoIncrement: !!options.autoIncrement,
   nextKey: 1, indexes: {}, records: []
  };
- this.objectStoreNames = Object.keys(this._data.stores).sort();
+ this.objectStoreNames = stringList(Object.keys(this._data.stores).sort());
  if (this._upgradeTx.objectStoreNames.indexOf(name) < 0) {
   this._upgradeTx.objectStoreNames.push(name);
   this._upgradeTx.objectStoreNames.sort();
@@ -1029,7 +1043,7 @@ IDBDatabase.prototype.createObjectStore = function(name, options){
 IDBDatabase.prototype.deleteObjectStore = function(name){
  if (!this._upgradeTx) throw DOMEx('InvalidStateError', 'stores are removed while upgrading');
  delete this._data.stores[String(name)];
- this.objectStoreNames = Object.keys(this._data.stores).sort();
+ this.objectStoreNames = stringList(Object.keys(this._data.stores).sort());
 };
 
 /* ---- the factory ---- */
@@ -1162,13 +1176,13 @@ IDBFactory.prototype = {
    if (!(k in Ctor.prototype)) Ctor.prototype[k] = props[k];
   });
  }
- shape(IDBDatabase, { name: '', version: 0, objectStoreNames: [],
+ shape(IDBDatabase, { name: '', version: 0, objectStoreNames: stringList([]),
                       onabort: null, onclose: null, onerror: null,
                       onversionchange: null });
  shape(IDBTransaction, { db: null, durability: 'default', error: null,
-                         mode: 'readonly', objectStoreNames: [],
+                         mode: 'readonly', objectStoreNames: stringList([]),
                          onabort: null, oncomplete: null, onerror: null });
- shape(IDBObjectStore, { autoIncrement: false, indexNames: [], keyPath: null,
+ shape(IDBObjectStore, { autoIncrement: false, indexNames: stringList([]), keyPath: null,
                          name: '', transaction: null });
  shape(IDBIndex, { keyPath: null, multiEntry: false, name: '',
                    objectStore: null, unique: false });

@@ -3122,8 +3122,104 @@ Object.defineProperty(P,'currentSrc',{configurable:true,get:function(){return th
  get:function(){var b=__vitaBox(this);return b?b[n]:0;}});});
 P.decode=function(){return Promise.resolve();};
 Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}});
-Object.defineProperty(P,'contentDocument',{configurable:true,get:function(){return null;}});
-Object.defineProperty(P,'contentWindow',{configurable:true,get:function(){return null;}});
+/* --- frames -------------------------------------------------------------
+ * An iframe's window and document (VitaSurf). Both were null, and a page
+ * that makes a blank iframe to write into, or to take a clean copy of the
+ * built-ins from -- claude.ai's bundle among them -- threw on the first
+ * property it read. Frames are not loaded here, so a frame's window is
+ * this window seen through the frame: the built-ins are the same ones,
+ * and it has its own document, a blank one, when the frame is same
+ * origin. A cross-origin frame's document is refused the way a browser
+ * refuses it, and postMessage to it goes nowhere.
+ */
+(function(){
+ var FRAMES=new WeakMap();
+ function sameOrigin(el){
+  var src=el.getAttribute('src');
+  if(el.hasAttribute('srcdoc')||src===null)return true;
+  src=String(src).trim();
+  if(src===''||/^(about:|javascript:)/i.test(src))return true;
+  try{return new URL(src,D.baseURI).origin===location.origin;}
+  catch(e){return false;}}
+ function refuse(){
+  throw new DOMException('Blocked a frame from accessing a cross-origin '+
+   'frame.','SecurityError');}
+ function frameWindow(el){
+  var f=FRAMES.get(el);
+  if(f)return f;
+  var doc=null,listeners={},own,proxy;
+  function document(){
+   if(!sameOrigin(el))refuse();
+   if(!doc){doc=D.implementation.createHTMLDocument('');
+    try{Object.defineProperty(doc,'defaultView',{configurable:true,
+     get:function(){return proxy;}});}catch(e){}}
+   return doc;}
+  own={
+   frameElement:el,opener:null,closed:false,length:0,
+   postMessage:function(data){
+    var l=(listeners.message||[]).slice(),ev;
+    if(!l.length)return;
+    ev={type:'message',data:data,origin:location.origin,source:W,
+     ports:[],lastEventId:''};
+    setTimeout(function(){l.forEach(function(fn){
+     try{fn.call(proxy,ev);}catch(e){reportError(e);}});},0);},
+   addEventListener:function(t,fn){
+    if(typeof fn!=='function')return;
+    t=String(t);(listeners[t]=listeners[t]||[]);
+    if(listeners[t].indexOf(fn)<0)listeners[t].push(fn);},
+   removeEventListener:function(t,fn){
+    var a=listeners[String(t)],i=a?a.indexOf(fn):-1;
+    if(i>=0)a.splice(i,1);},
+   dispatchEvent:function(ev){
+    (listeners[ev&&ev.type]||[]).slice().forEach(function(fn){
+     fn.call(proxy,ev);});
+    return !(ev&&ev.defaultPrevented);}};
+  Object.defineProperties(own,{
+   document:{configurable:true,get:document},
+   window:{configurable:true,get:function(){return proxy;}},
+   self:{configurable:true,get:function(){return proxy;}},
+   frames:{configurable:true,get:function(){return proxy;}},
+   parent:{configurable:true,get:function(){return W;}},
+   top:{configurable:true,get:function(){return W.top;}},
+   name:{configurable:true,get:function(){return el.getAttribute('name')||'';}},
+   location:{configurable:true,get:function(){
+    var src=el.getAttribute('src');
+    return {
+     get href(){if(!sameOrigin(el))refuse();
+      return src?new URL(src,D.baseURI).href:'about:blank';},
+     set href(v){el.setAttribute('src',String(v));},
+     assign:function(v){el.setAttribute('src',String(v));},
+     replace:function(v){el.setAttribute('src',String(v));},
+     reload:function(){},
+     toString:function(){return this.href;}};}}});
+  proxy=new Proxy(own,{
+   get:function(t,k){
+    if(k in t)return t[k];
+    if(k===Symbol.toStringTag)return 'Window';
+    return W[k];},
+   has:function(t,k){return k in t||k in W;},
+   set:function(t,k,v){t[k]=v;return true;}});
+  FRAMES.set(el,proxy);
+  return proxy;}
+ function isFrame(el){return el.tagName==='IFRAME'||el.tagName==='FRAME';}
+ Object.defineProperty(P,'contentWindow',{configurable:true,get:function(){
+  if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
+  return this.isConnected?frameWindow(this):null;}});
+ Object.defineProperty(P,'contentDocument',{configurable:true,get:function(){
+  if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
+  if(!this.isConnected||!sameOrigin(this))return null;
+  return frameWindow(this).document;}});
+})();
+
+var SVG_NS='http://www.w3.org/2000/svg';
+/* The SVG element an SVG element sits in (VitaSurf): null for the
+   outermost one, and not there at all on an HTML element. */
+['ownerSVGElement','viewportElement'].forEach(function(k){
+ Object.defineProperty(P,k,{configurable:true,get:function(){
+  if(this.namespaceURI!==SVG_NS)return undefined;
+  for(var n=this.parentNode;n&&n.nodeType===1;n=n.parentNode)
+   if(n.namespaceURI===SVG_NS&&n.localName==='svg')return n;
+  return null;}});});
 if(W.HTMLScriptElement)W.HTMLScriptElement.supports=function(t){
  return t==='classic'||t==='module'||t==='importmap';};
 
@@ -3601,6 +3697,11 @@ function liveCollection(items,proto,shapeOnly){
 /* A NodeList holds anything, answers to no name, and has the iteration
    helpers a collection does not. */
 function NodeList(){throw new TypeError('Illegal constructor');}
+/* what Object.prototype.toString calls them (VitaSurf) */
+Object.defineProperty(HTMLCollection.prototype,Symbol.toStringTag,
+ {configurable:true,value:'HTMLCollection'});
+Object.defineProperty(NodeList.prototype,Symbol.toStringTag,
+ {configurable:true,value:'NodeList'});
 Object.defineProperty(NodeList.prototype,'length',{configurable:true,
  get:function(){return this.__vitaItems().length;}});
 NodeList.prototype.item=function(i){
@@ -6484,6 +6585,25 @@ stampConsts(P);
    }else n=BY_TYPE[t];
    return (n&&W[n])||W.Node;},
   set:function(v){shadowProp(this,'constructor',v);}});
+ /* What Object.prototype.toString says a node is (VitaSurf). It said
+    [object Object] for every element, and code that tells a DOM node
+    from a plain object, or an element from a window, by that string --
+    React's and Sentry's among them -- took the wrong branch. The name
+    is the constructor's; an SVG element gets its own interface's. */
+ Object.defineProperty(P,Symbol.toStringTag,{configurable:true,
+  get:function(){
+   var t,ln,c;
+   try{t=this.nodeType;}catch(e){return 'HTMLElement';}
+   if(t===undefined)return 'HTMLElement';
+   if(t===1&&this.namespaceURI===SVG_NS){
+    ln=String(this.localName||'');
+    return ln==='svg'?'SVGSVGElement':
+     'SVG'+ln.charAt(0).toUpperCase()+ln.slice(1)+'Element';}
+   try{c=this.constructor;}catch(e){c=null;}
+   return (c&&c.name)||'Node';}});
+ try{if(W.Document&&W.Document.prototype&&W.Document.prototype!==P)
+  Object.defineProperty(W.Document.prototype,Symbol.toStringTag,
+   {configurable:true,value:'HTMLDocument'});}catch(e){}
  /* An unknown element is one whose tag is not in the HTML vocabulary at
     all -- <section> and <strong> are plain HTMLElements, not unknown. */
  if(W.HTMLUnknownElement===WAS||W.HTMLUnknownElement===CEBase){

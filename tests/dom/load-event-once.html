@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- A <link> stylesheet's load event does not bubble, so it must not
+     reach the window's load listeners: it did, and window.onload ran
+     twice, the first time with the document still loading. The window's
+     own load event is aimed at the document. A script's navigation
+     happens after the script returns, not inside it. -->
+<html><head><title>t</title><link rel="stylesheet" href="resources/plain.css"></head><body><div id="out"></div>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var calls = 0, states = [], targets = [], linkLoads = 0, bodyLoads = 0, bubbled = 0;
+window.onload = function (e) { calls++; states.push(document.readyState);
+ targets.push(e.target === document ? 'document' : (e.target && e.target.nodeName)); };
+document.querySelector('link').addEventListener('load', function () { linkLoads++; });
+document.body.addEventListener('load', function () { bodyLoads++; });
+document.body.addEventListener('custom', function () { bubbled++; });
+window.addEventListener('load', function () { setTimeout(function () {
+ var d = document.createElement('div');
+ d.dispatchEvent(new Event('custom'));
+ document.getElementById('out').appendChild(d);
+ d.dispatchEvent(new Event('custom'));
+ d.dispatchEvent(new Event('custom', {bubbles: true}));
+ ok("window.onload ran once (" + calls + ")", calls === 1);
+ ok("with the document complete (" + states.join() + ")", states[0] === 'complete');
+ ok("aimed at the document (" + targets.join() + ")", targets[0] === 'document');
+ ok("the link got its own load (" + linkLoads + ")", linkLoads === 1);
+ ok("the body did not get the window's load (" + bodyLoads + ")", bodyLoads === 0);
+ ok("an event that does not bubble stays on its target (" + bubbled + ")", bubbled === 1);
+}, 50); });
+</script></body></html>

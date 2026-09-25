@@ -217,6 +217,7 @@ struct jsthread {
 	bool closed;
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
+	nsurl *nav_pending;       /**< where nav_callback will go, or NULL */
 	bool relayout_off;        /**< document too large to rebuild */
 	unsigned relayout_waits;  /**< retries spent waiting on fetches */
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
@@ -4970,6 +4971,30 @@ static nsurl *script_page_url(jsthread *thread)
 }
 
 
+/*
+ * Go where a script asked, once it has returned (VitaSurf). Navigating
+ * from inside the script stopped the page there and then when it was
+ * still loading -- a stylesheet outstanding is enough -- which freed
+ * the context the script was running in and crashed on the way back
+ * out. A browser queues the navigation too; the last one asked wins.
+ */
+static void nav_callback(void *p)
+{
+	jsthread *thread = p;
+	nsurl *url = thread->nav_pending;
+
+	thread->nav_pending = NULL;
+	if (url == NULL) {
+		return;
+	}
+	if (thread->win != NULL && !thread->closed) {
+		/* may destroy this thread; do not touch it after */
+		browser_window_navigate(thread->win, url, NULL,
+					BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
+	}
+	nsurl_unref(url);
+}
+
 static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 {
 	nsurl *cur = NULL, *url = NULL;
@@ -4993,9 +5018,11 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 	}
 	if (url != NULL) {
 		vita_log("qjs: script navigates to %s", nsurl_access(url));
-		browser_window_navigate(thread->win, url, NULL,
-					BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
-		nsurl_unref(url);
+		if (thread->nav_pending != NULL) {
+			nsurl_unref(thread->nav_pending);
+		}
+		thread->nav_pending = url;
+		guit->misc->schedule(0, nav_callback, thread);
 	}
 	(void)ctx;
 	return JS_UNDEFINED;
@@ -9874,6 +9901,12 @@ nserror js_closethread(jsthread *thread)
 	 */
 	t0 = now_ms();
 	thread->closed = true;
+	/* a navigation the page asked for goes with the page */
+	if (thread->nav_pending != NULL) {
+		guit->misc->schedule(-1, nav_callback, thread);
+		nsurl_unref(thread->nav_pending);
+		thread->nav_pending = NULL;
+	}
 	if (thread->relayout_pending) {
 		guit->misc->schedule(-1, relayout_callback, thread);
 		thread->relayout_pending = false;
@@ -12700,7 +12733,6 @@ bool js_fire_event(jsthread *thread, const char *type,
 		   struct dom_document *doc, struct dom_node *target)
 {
 	struct dom_event *evt;
-	struct dom_element *body = NULL;
 	dom_string *type_dom;
 	bool success = false;
 
@@ -12737,17 +12769,14 @@ bool js_fire_event(jsthread *thread, const char *type,
 		dom_event_target_dispatch_event(target, evt, &success);
 	} else if (doc != NULL) {
 		/*
-		 * Window-targetted events (load) go to the body element and
-		 * bubble up to the document node, where window and document
-		 * listeners are registered.
+		 * Window-targetted events (load) go to the document node,
+		 * where window and document listeners are registered. They
+		 * went to the body and bubbled up, which gave the body's own
+		 * listeners the window's load and every handler a target of
+		 * BODY where a browser says the document; body.onload is the
+		 * window's already.
 		 */
-		dom_html_document_get_body(doc, &body);
-		if (body != NULL) {
-			dom_event_target_dispatch_event(body, evt, &success);
-			dom_node_unref((struct dom_node *)body);
-		} else {
-			dom_event_target_dispatch_event(doc, evt, &success);
-		}
+		dom_event_target_dispatch_event(doc, evt, &success);
 	}
 	dom_event_unref(evt);
 	return true;
