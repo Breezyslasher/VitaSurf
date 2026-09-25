@@ -7,6 +7,89 @@
  * This file is part of VitaSurf, a PS Vita port of NetSurf.
  * Licensed under the GNU General Public License version 2.
  */
+/* BEGIN regexp-split (VitaSurf)
+ *
+ * String.prototype.split with a regular expression, the way the
+ * specification writes it: every call builds a new sticky RegExp from
+ * the pattern -- compiling it again -- and then tries a match at every
+ * position in turn, reading and writing lastIndex each time. That was
+ * 36 % of Wikipedia's script on the device, in many small splits.
+ *
+ * For a plain RegExp nobody has changed, the result is the same when
+ * the pattern is compiled once, kept, and searched forward with exec:
+ * a search tries the same positions in the same order and stops at the
+ * first that matches, which is where the sticky tries stop too. An
+ * empty match where the last piece ended moves on one character, as
+ * the specification's does. With the u or v flag a step is a code
+ * point, so those, and any RegExp whose exec or constructor has been
+ * replaced, go the specification's way. The flags are read as the
+ * specification reads them, so a replaced flags counts.
+ */
+(function(){
+var RP=RegExp.prototype,nativeSplit=RP[Symbol.split],nativeExec=RP.exec,
+ getProto=Object.getPrototypeOf,
+ sourceGet=Object.getOwnPropertyDescriptor(RP,'source').get,
+ NativeRegExp=RegExp,cache=new Map(),lastSrc=null,lastFlags=null,lastRe=null;
+/* the searching copy of a pattern, compiled once */
+function searcher(src,flags){
+ var key,re,f='',i,c;
+ if(src===lastSrc&&flags===lastFlags)return lastRe;
+ key=flags+'/'+src;re=cache.get(key);
+ if(re===undefined){
+  for(i=0;i<flags.length;i++){c=flags[i];if(c!=='g'&&c!=='y')f+=c;}
+  re=new NativeRegExp(src,f+'g');
+  if(cache.size>=64)cache.clear();
+  cache.set(key,re);}
+ lastSrc=src;lastFlags=flags;lastRe=re;
+ return re;}
+function split(string,limit){
+ var rx=this,flags,S,lim,re,A,size,p,q,m,start,e,i,n;
+ if(rx===null||typeof rx!=='object')
+  return nativeSplit.call(rx,string,limit);
+ S=String(string);
+ /* Under 32 characters the native split's tries cost less than the
+    checks and the loop here, run by the interpreter */
+ if(S.length<32)return nativeSplit.call(rx,S,limit);
+ /* a RegExp as made, its exec and constructor what they were, read the
+    way the specification reads them */
+ if(getProto(rx)!==RP||
+    rx.constructor!==NativeRegExp||rx.exec!==nativeExec||
+    NativeRegExp[Symbol.species]!==NativeRegExp)
+  return nativeSplit.call(rx,S,limit);
+ flags=String(rx.flags);
+ if(flags.indexOf('u')>=0||flags.indexOf('v')>=0)
+  return nativeSplit.call(rx,S,limit);
+ re=searcher(sourceGet.call(rx),flags);
+ A=[];
+ lim=(limit===undefined)?4294967295:(limit>>>0);
+ if(lim===0)return A;
+ size=S.length;
+ if(size===0){
+  re.lastIndex=0;
+  if(nativeExec.call(re,S)!==null)return A;
+  A.push(S);return A;}
+ p=0;q=0;
+ while(q<size){
+  re.lastIndex=q;
+  m=nativeExec.call(re,S);
+  if(m===null)break;
+  start=m.index;
+  if(start>=size)break;
+  e=start+m[0].length;
+  if(e>size)e=size;
+  if(e===p){q=start+1;continue;}
+  A.push(S.substring(p,start));
+  if(A.length===lim)return A;
+  p=e;
+  for(i=1,n=m.length;i<n;i++){A.push(m[i]);if(A.length===lim)return A;}
+  q=p;}
+ A.push(S.substring(p,size));
+ return A;}
+Object.defineProperty(RP,Symbol.split,{value:split,writable:true,
+ enumerable:false,configurable:true});
+Object.defineProperty(split,'name',{value:'[Symbol.split]'});
+})();
+/* END regexp-split */
 (function(){
 var P=Node.prototype;
 function priv(o,k,make){if(!Object.prototype.hasOwnProperty.call(o,k))Object.defineProperty(o,k,{value:make(),writable:true});return o[k];}

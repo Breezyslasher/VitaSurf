@@ -56,6 +56,7 @@
 #include "vita_platform.h"
 #include "vita_input.h"
 #include "canvas.h"
+#include "qjs_alloc.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -82,6 +83,7 @@
 
 struct jsheap {
 	JSRuntime *rt;
+	struct qjs_pool *pool;  /**< the runtime's small-block allocator */
 	int timeout;          /**< script time budget, seconds */
 	bool pending_destroy;
 	int live_threads;
@@ -577,6 +579,22 @@ void vita_js_report_profile(void);
 void vita_js_report_profile(void)
 {
 	unsigned int shown;
+
+	/* what script's own allocator did since the last report (VitaSurf) */
+	{
+		struct qjs_pool_stats ps;
+
+		qjs_pool_stats(&ps);
+		if (ps.allocs + ps.large > 0) {
+			vita_log("qjs: script allocated %u small blocks from its "
+				 "pools and %u larger ones from malloc, freed %u "
+				 "and grew %u in place; the pools hold %u "
+				 "batches of 128 KB (%u at most) and gave %u back",
+				 ps.allocs, ps.large, ps.frees, ps.reallocs,
+				 ps.batches, ps.batches_peak, ps.batches_freed);
+		}
+		qjs_pool_stats_reset();
+	}
 
 	if (id_calls > 0) {
 		vita_log("getElementById: %u calls, %u answered from the index, "
@@ -9705,8 +9723,15 @@ nserror js_newheap(int timeout, jsheap **heap)
 	if (ret == NULL) {
 		return NSERROR_NOMEM;
 	}
-	ret->rt = JS_NewRuntime();
+	/*
+	 * Script's small blocks come from pools of our own rather than
+	 * newlib's malloc, which takes a lock on every call; see
+	 * qjs_alloc.c (VitaSurf).
+	 */
+	ret->pool = qjs_pool_create();
+	ret->rt = JS_NewRuntime2(qjs_pool_functions(), ret->pool);
 	if (ret->rt == NULL) {
+		qjs_pool_destroy(ret->pool);
 		free(ret);
 		return NSERROR_NOMEM;
 	}
@@ -9789,6 +9814,7 @@ void js_destroyheap(jsheap *heap)
 		return;
 	}
 	JS_FreeRuntime(heap->rt);
+	qjs_pool_destroy(heap->pool);
 	free(heap);
 }
 
@@ -9955,6 +9981,7 @@ void js_destroythread(jsthread *thread)
 	if (thread->heap->pending_destroy && thread->heap->live_threads == 0) {
 		jsheap *heap = thread->heap;
 		JS_FreeRuntime(heap->rt);
+		qjs_pool_destroy(heap->pool);
 		free(heap);
 	}
 	free(thread);
