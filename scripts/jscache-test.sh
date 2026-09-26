@@ -29,7 +29,7 @@ HTML
 run() {
   { echo "WINDOW NEW"; echo "WINDOW GO 0 file://$WORK/p.html"
     sleep 6; echo "QUIT"; } | timeout 90 "$NS" --enable_javascript=1 2>&1 |
-  grep -E "qjs: script .* (compiled|read from cache)|JC mark=" || true
+  grep -E "qjs: script .* (compiled|read from cache)|JC mark=|stock engine" || true
 }
 fail=0
 check() {  # check <what> <regex that must appear in $out>
@@ -75,5 +75,25 @@ PY
   check "seed $seed: recompiled without crashing" "compiled in"
   check "seed $seed: ran correctly" "JC mark=v2 dom=hi"
 done
+
+echo "6. an entry the stock engine wrote (version 25, a function's text each)"
+out=$(run) >/dev/null   # rebuild a good entry
+python3 - "$CACHE" "$(stat -c %s "$WORK/big.js")" <<'PY'
+import sys, struct, glob
+cache, srclen = sys.argv[1], int(sys.argv[2])
+p = [f for f in glob.glob(cache + '/*.bc')
+     if struct.unpack('<6I', open(f, 'rb').read(24))[2] == srclen][0]
+d = bytearray(open(p, 'rb').read())
+if d[24] & 0x80:        # a shared source build: stamp it as a stock one
+    d[24] = 25
+open(p, 'wb').write(bytes(d))
+PY
+out=$(run)
+if echo "$out" | grep -q "read from cache"; then
+  echo "  (a stock engine build: its own entries are current)"
+else
+  check "compiled again" "compiled in"; check "said why" "stock engine"
+fi
+check "ran correctly" "JC mark=v2 dom=hi"
 
 [ $fail -eq 0 ] && echo "all cache cases pass" || { echo "cache cases FAILED"; exit 1; }

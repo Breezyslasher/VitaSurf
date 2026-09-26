@@ -5236,7 +5236,20 @@ W.DocumentType=function(){this.name='html';this.publicId='';this.systemId='';
 Object.defineProperty(D,'doctype',{configurable:true,get:function(){return new W.DocumentType();}});
 if(!W.CSS)W.CSS={};
 W.CSS.escape=W.CSS.escape||function(s){return String(s).replace(/([^\w-])/g,'\\$1');};
-W.CSS.supports=W.CSS.supports||function(){return false;};
+/* CSS.supports(property, value) and CSS.supports(condition), answered
+   by the same parser that judges @supports in a style sheet (VitaSurf).
+   A condition that does not parse is tried again in brackets, as the
+   spec says, so "display: grid" works as well as "(display: grid)". */
+W.CSS.supports=function(a,b){
+ if(arguments.length===0)throw new TypeError("CSS.supports: at least 1 argument required");
+ if(typeof __vitaCSSSupports!=='function')return false;
+ if(arguments.length>=2){
+  var p=String(a),v=String(b);
+  /* a custom property takes any value that is not empty */
+  if(/^--/.test(p))return /\S/.test(v);
+  return __vitaCSSSupports('('+p+':'+v+')');}
+ var c=String(a);
+ return __vitaCSSSupports(c)||__vitaCSSSupports('('+c+')');};
 /* fetch of an object URL comes from the table, not from the network. */
 (function(){var real=W.fetch;
  W.fetch=function(input,init){

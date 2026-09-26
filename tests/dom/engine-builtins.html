@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- quickjs-ng's Array.fromAsync and Iterator.zip are bytecode compiled
+     into the engine. When the engine refused its own bytecode version,
+     reading either threw, and claude.ai's browser check, which asks
+     `typeof Array.fromAsync`, said the browser was out of date. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var t;
+try { t = typeof Array.fromAsync; } catch (e) { t = 'threw ' + e.message; }
+ok("typeof Array.fromAsync (" + t + ")", t === 'function');
+try { t = typeof Iterator === 'function' ? typeof Iterator.zip : 'no Iterator'; } catch (e) { t = 'threw ' + e.message; }
+ok("typeof Iterator.zip (" + t + ")", t === 'function' || t === 'undefined');
+Array.fromAsync([Promise.resolve(1), 2]).then(function (a) {
+ ok("Array.fromAsync runs (" + a + ")", a.join() === '1,2');
+}, function (e) { ok("Array.fromAsync runs (threw " + e.message + ")", false); });
+</script></body></html>

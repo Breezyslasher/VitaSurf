@@ -1,5 +1,5 @@
 diff --git a/quickjs.c b/quickjs.c
-index 04886e3..a23e8c5 100644
+index 04886e3..bee2c76 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -801,8 +801,34 @@ typedef struct JSFunctionBytecode {
@@ -184,18 +184,22 @@ index 04886e3..a23e8c5 100644
      if (err) {
      fail:
          free_token(s, &s->token);
-@@ -36825,7 +36895,9 @@ typedef enum BCTagEnum {
+@@ -36825,7 +36895,13 @@ typedef enum BCTagEnum {
      BC_TAG_SYMBOL,
  } BCTagEnum;
  
 -#define BC_VERSION 25
 +/* VitaSurf: 25 upstream; the high bit marks the shared source format
-+   below, so bytecode written by a stock build is refused, not misread */
-+#define BC_VERSION (25 | 0x80)
++   below. Both are read: quickjs-ng's own built-ins (Array.fromAsync,
++   Iterator.zip) are bytecode compiled into this file with version 25,
++   and refusing it made `typeof Array.fromAsync` throw, which claude.ai's
++   browser check took for an out of date browser. */
++#define BC_VERSION_STOCK 25
++#define BC_VERSION (BC_VERSION_STOCK | 0x80)
  
  typedef struct BCWriterState {
      JSContext *ctx;
-@@ -36846,6 +36918,10 @@ typedef struct BCWriterState {
+@@ -36846,6 +36922,10 @@ typedef struct BCWriterState {
      int sab_tab_size;
      /* list of referenced objects (used if allow_reference = true) */
      JSObjectList object_list;
@@ -206,7 +210,7 @@ index 04886e3..a23e8c5 100644
  } BCWriterState;
  
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-@@ -37188,8 +37264,38 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -37188,8 +37268,38 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
          bc_put_leb128(s, b->pc2line_len);
          dbuf_put(&s->dbuf, b->pc2line_buf, b->pc2line_len);
          if (s->allow_source && b->source) {
@@ -246,7 +250,7 @@ index 04886e3..a23e8c5 100644
          } else {
              bc_put_leb128(s, 0);
          }
-@@ -37629,6 +37735,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
+@@ -37629,6 +37739,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
      js_object_list_end(ctx, &s->object_list);
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
@@ -254,7 +258,7 @@ index 04886e3..a23e8c5 100644
      *psize = s->dbuf.size;
      if (psab_tab) {
          psab_tab->tab = s->sab_tab;
-@@ -37645,6 +37752,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
+@@ -37645,6 +37756,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
      js_object_list_end(ctx, &s->object_list);
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
@@ -262,7 +266,7 @@ index 04886e3..a23e8c5 100644
      dbuf_free(&s->dbuf);
      *psize = 0;
      if (psab_tab) {
-@@ -37681,6 +37789,10 @@ typedef struct BCReaderState {
+@@ -37681,6 +37793,11 @@ typedef struct BCReaderState {
      /* used for JS_DUMP_READ_OBJECT */
      const uint8_t *ptr_last;
      int level;
@@ -270,10 +274,11 @@ index 04886e3..a23e8c5 100644
 +    JSSourceBlob **src_tab;
 +    int src_tab_len;
 +    int src_tab_size;
++    bool stock_layout; /* BC_VERSION_STOCK: each function its own text */
  } BCReaderState;
  
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-@@ -38244,15 +38356,61 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -38244,15 +38361,63 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_leb128_int(s, &b->source_len))
          goto fail;
      if (b->source_len) {
@@ -287,7 +292,9 @@ index 04886e3..a23e8c5 100644
 -        if (!b->source)
 -            goto fail;
 -        if (bc_get_buf(s, b->source, b->source_len))
-+        if (bc_get_leb128_int(s, &where))
++        if (s->stock_layout)
++            where = 0; /* the text follows, with no tag before it */
++        else if (bc_get_leb128_int(s, &where))
              goto fail;
 +        if (where == 0) {
 +            if (s->ptr_last)
@@ -342,7 +349,21 @@ index 04886e3..a23e8c5 100644
      }
      bc_read_trace(s, "}\n");
  
-@@ -38896,6 +39054,9 @@ static void bc_reader_free(BCReaderState *s)
+@@ -38828,11 +38993,12 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
+ 
+     if (bc_get_u8(s, &v8))
+         return -1;
+-    if (v8 != BC_VERSION) {
++    if (v8 != BC_VERSION && v8 != BC_VERSION_STOCK) {
+         JS_ThrowSyntaxError(s->ctx, "invalid version (%d expected=%d)",
+                             v8, BC_VERSION);
+         return -1;
+     }
++    s->stock_layout = (v8 == BC_VERSION_STOCK);
+     if (bc_get_u32(s, &h))
+         return -1;
+     // allow UINT32_MAX as an escape hatch, otherwise updating
+@@ -38896,6 +39062,9 @@ static void bc_reader_free(BCReaderState *s)
          js_free(s->ctx, s->idx_to_atom);
      }
      js_free(s->ctx, s->objects);
@@ -367,27 +388,3 @@ index a44b456..3fb2c5d 100644
  JS_EXTERN const char* JS_GetVersion(void);
  
  /* Integration point for quickjs-libc.c, not for public use. */
-diff --git a/tests/test_bjson.js b/tests/test_bjson.js
-index 353fd85..8ce70af 100644
---- a/tests/test_bjson.js
-+++ b/tests/test_bjson.js
-@@ -284,12 +284,14 @@ function bjson_test_bytecode()
- 
- function bjson_test_fuzz()
- {
-+    // VitaSurf: the version byte is 25 | 0x80 (0x99), "mf" in base64,
-+    // for the shared source format (see BC_VERSION)
-     var corpus = [
--        ["Gf////8QAAAAAARg"],
--        ["Gf/////m5uaCLQ=="],
--        ["Gf////8AEQATBgYGBgYGBgYGBgb/////EAARAC8R/78vEf+/"],
--        ["Gf////8ACH8ACv////9//////////////////////////////9//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAA+fn5+fn5+fn5+fn5AAAAAAAGAKs="],
--        ["Gf////8ADgAAABQA=", bjson.READ_OBJ_REFERENCE],
-+        ["mf////8QAAAAAARg"],
-+        ["mf/////m5uaCLQ=="],
-+        ["mf////8AEQATBgYGBgYGBgYGBgb/////EAARAC8R/78vEf+/"],
-+        ["mf////8ACH8ACv////9//////////////////////////////9//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAA+fn5+fn5+fn5+fn5AAAAAAAGAKs="],
-+        ["mf////8ADgAAABQA=", bjson.READ_OBJ_REFERENCE],
-     ];
-     for (var [input, flags] of corpus) {
-         var buf = base64decode(input);

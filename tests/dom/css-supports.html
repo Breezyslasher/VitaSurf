@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!-- CSS.supports answers from the style sheet parser: it said no to
+     everything, and a page reads that as a browser too old to run it. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+ok("color: red", CSS.supports('color', 'red') === true);
+ok("display: grid", CSS.supports('display', 'grid') === true);
+ok("display: flex as a condition", CSS.supports('(display: flex)') === true);
+ok("a declaration without brackets", CSS.supports('display: grid') === true);
+ok("gap: 1px", CSS.supports('gap', '1px') === true);
+ok("a bogus value", CSS.supports('display', 'blorp') === false);
+ok("a bogus property", CSS.supports('frobnicate', '1') === false);
+ok("not", CSS.supports('not (display: blorp)') === true);
+ok("and", CSS.supports('(display: grid) and (color: red)') === true);
+ok("and with one false", CSS.supports('(display: grid) and (display: blorp)') === false);
+ok("or", CSS.supports('(display: blorp) or (color: red)') === true);
+ok("a custom property", CSS.supports('--x', 'anything') === true);
+ok("garbage", CSS.supports('}{') === false);
+var threw = false; try { CSS.supports(); } catch (e) { threw = e instanceof TypeError; }
+ok("no arguments throws", threw);
+</script></body></html>

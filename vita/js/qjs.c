@@ -31,6 +31,7 @@
 #include <strings.h>
 
 #include <quickjs.h>
+#include <libcss/libcss.h>
 
 #include "utils/errors.h"
 #include "utils/utils.h"
@@ -4120,6 +4121,34 @@ static JSValue node_remove_event_listener(JSContext *ctx, JSValueConst this_val,
  * window and document listeners live on the document node: DOMContentLoaded
  * is dispatched there by NetSurf and load bubbles up to it from the body.
  */
+/*
+ * Whether libcss holds a supports condition, for CSS.supports()
+ * (VitaSurf). It was a stub that said no to everything, even to
+ * "color: red", which is how a page decides this browser cannot run it.
+ */
+static JSValue win_vita_css_supports(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	const char *text;
+	size_t len = 0;
+	bool yes = false;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_FALSE;
+	}
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (text == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (css_supports(text, len, &yes) != CSS_OK) {
+		yes = false;
+	}
+	JS_FreeCString(ctx, text);
+	return JS_NewBool(ctx, yes);
+}
+
 /* The same encoding, reachable from the prelude as a global. */
 static JSValue win_vita_encoding(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
@@ -9540,6 +9569,9 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaParseDocument",
 			  JS_NewCFunction(ctx, win_vita_parse_document,
 					  "__vitaParseDocument", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCSSSupports",
+			  JS_NewCFunction(ctx, win_vita_css_supports,
+					  "__vitaCSSSupports", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaCreateIn",
 			  JS_NewCFunction(ctx, win_vita_create_in,
 					  "__vitaCreateIn", 3));
@@ -10357,6 +10389,22 @@ static JSValue bc_load_kind(JSContext *ctx, const char *url,
 	 * older engine comes back as an exception here rather than as
 	 * something that runs. Treat it as a miss and compile.
 	 */
+#ifdef QJS_VITASURF_SHARED_SOURCE
+	/*
+	 * Our build still reads a stock stream (version 25, without the
+	 * high bit), because quickjs-ng's own built-ins are compiled in
+	 * as one. An entry a stock build wrote holds every function's
+	 * text over again, though, which is what the shared source build
+	 * is for: compile it again and write it the new way.
+	 */
+	if ((buf[0] & 0x80) == 0) {
+		free(buf);
+		remove(path);
+		vita_log("qjs: cache entry from the stock engine, compiling "
+			 "it again");
+		return JS_UNDEFINED;
+	}
+#endif
 	fn = JS_ReadObject(ctx, buf, h.bc_len, JS_READ_OBJ_BYTECODE);
 	nsu_getmonotonic_ms(&t_decode);
 	vita_log("qjs: cache entry %u KB: %u ms off the card at %u KB/s, "

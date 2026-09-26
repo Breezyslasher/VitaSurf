@@ -1,0 +1,96 @@
+diff --git a/include/libcss/stylesheet.h b/include/libcss/stylesheet.h
+index e212300..db75ebb 100644
+--- a/include/libcss/stylesheet.h
++++ b/include/libcss/stylesheet.h
+@@ -139,6 +139,14 @@ css_error css_stylesheet_create(const css_stylesheet_params *params,
+ 		css_stylesheet **stylesheet);
+ css_error css_stylesheet_destroy(css_stylesheet *sheet);
+ 
++/**
++ * Whether a supports condition holds: what CSS.supports() answers
++ * (VitaSurf). \a condition is the text after "@supports", for example
++ * "(display: grid)" or "not (gap: 1px)"; it is judged the way an
++ * @supports rule in a style sheet is.
++ */
++css_error css_supports(const char *condition, size_t len, bool *result);
++
+ css_error css_stylesheet_append_data(css_stylesheet *sheet,
+ 		const uint8_t *data, size_t len);
+ css_error css_stylesheet_data_done(css_stylesheet *sheet);
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 0d9e58f..d52b967 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -2188,3 +2188,72 @@ size_t _rule_size(const css_rule *r)
+ 
+ 	return bytes;
+ }
++
++/* A resolver for a sheet that fetches nothing (VitaSurf) */
++static css_error supports_resolve(void *pw, const char *base,
++		lwc_string *rel, lwc_string **abs)
++{
++	UNUSED(pw);
++	UNUSED(base);
++	*abs = lwc_string_ref(rel);
++	return CSS_OK;
++}
++
++/* exported function documented in include/libcss/stylesheet.h */
++css_error css_supports(const char *condition, size_t len, bool *result)
++{
++	static const char head[] = "@supports ";
++	static const char tail[] = "{a{}}";
++	css_stylesheet_params params;
++	css_stylesheet *sheet = NULL;
++	css_rule_media *rule;
++	css_error error;
++	uint8_t *text;
++	size_t n;
++
++	if (condition == NULL || result == NULL)
++		return CSS_BADPARM;
++	*result = false;
++
++	/*
++	 * Parsed as the one rule of a sheet of its own, so the answer is
++	 * the one the same condition gets in a page's style sheet: the
++	 * parser turns @supports into a media rule whose query matches
++	 * only when the condition held.
++	 */
++	n = sizeof(head) - 1 + len + sizeof(tail) - 1;
++	text = malloc(n);
++	if (text == NULL)
++		return CSS_NOMEM;
++	memcpy(text, head, sizeof(head) - 1);
++	memcpy(text + sizeof(head) - 1, condition, len);
++	memcpy(text + sizeof(head) - 1 + len, tail, sizeof(tail) - 1);
++
++	memset(&params, 0, sizeof(params));
++	params.params_version = CSS_STYLESHEET_PARAMS_VERSION_1;
++	params.level = CSS_LEVEL_DEFAULT;
++	params.charset = "UTF-8";
++	params.url = "about:blank";
++	params.resolve = supports_resolve;
++
++	error = css_stylesheet_create(&params, &sheet);
++	if (error == CSS_OK) {
++		error = css_stylesheet_append_data(sheet, text, n);
++		if (error == CSS_NEEDDATA)
++			error = CSS_OK;
++	}
++	if (error == CSS_OK)
++		error = css_stylesheet_data_done(sheet);
++	free(text);
++
++	if (error == CSS_OK) {
++		rule = (css_rule_media *) sheet->rule_list;
++		*result = rule != NULL && rule->base.type == CSS_RULE_MEDIA &&
++				rule->media != NULL &&
++				rule->media->negate_type == 1 &&
++				rule->media->next == NULL;
++	}
++	if (sheet != NULL)
++		css_stylesheet_destroy(sheet);
++	return error;
++}
