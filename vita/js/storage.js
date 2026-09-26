@@ -74,6 +74,17 @@ function stringList(names){
 /* ------------------------------------------------- the structured clone */
 
 /*
+ * CryptoKeys clone and store as keys (VitaSurf): a page keeps a
+ * non-extractable key in IndexedDB so that it cannot be read out, and
+ * cloning one as an ordinary object lost it. The hooks come from
+ * subtle.js through a registration the prelude takes away again before
+ * any page script runs, because they read a key's material.
+ */
+var keyHooks = null;
+Object.defineProperty(W, '__vitaRegisterKeyClone', { configurable: true,
+ value: function(h){ keyHooks = h; delete W.__vitaRegisterKeyClone; } });
+
+/*
  * IndexedDB stores values, not JSON: a Date comes back a Date, a
  * Uint8Array comes back a Uint8Array, and a value that refers to itself
  * is stored and read back still referring to itself. JSON alone loses
@@ -98,7 +109,9 @@ function encode(value){
   if (at >= 0) return { $: 'ref', i: at };
   seen.push(v); out.push(null);
   var slot = out.length - 1, enc;
-  if (v instanceof Date) {
+  if (keyHooks && keyHooks.is(v)) {
+   enc = { $: 'key', v: walk(keyHooks.pack(v)) };
+  } else if (v instanceof Date) {
    enc = { $: 'date', v: v.getTime() };
   } else if (v instanceof RegExp) {
    enc = { $: 'regexp', s: v.source, f: v.flags };
@@ -141,6 +154,8 @@ function decode(packed){
   var e = table[i], v;
   switch (e && e.$) {
    case 'date': v = new Date(e.v); built[i] = v; return v;
+   case 'key':
+    v = keyHooks ? keyHooks.unpack(take(e.v)) : null; built[i] = v; return v;
    case 'regexp': v = new RegExp(e.s, e.f); built[i] = v; return v;
    case 'blob':
     v = typeof Blob === 'function' ? new Blob([e.v], { type: e.t }) : e.v;

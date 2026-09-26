@@ -2735,6 +2735,26 @@ DOMException.CODES={IndexSizeError:1,HierarchyRequestError:3,WrongDocumentError:
  Object.keys(names).forEach(function(k){
   DOMException[k]=names[k];DOMException.prototype[k]=names[k];});})();
 W.DOMException=DOMException;
+/* QuotaExceededError is an interface of its own now, a DOMException that
+   says how much was asked for and how much there is. crypto.getRandomValues
+   throws one, and a test for it checks the constructor, not just the name. */
+function QuotaExceededError(message,options){
+ var e=DOMException(message,'QuotaExceededError'),q=null,r=null;
+ if(options!==undefined&&options!==null){
+  if(options.quota!==undefined)q=Number(options.quota);
+  if(options.requested!==undefined)r=Number(options.requested);}
+ if((q!==null&&!(q>=0))||(r!==null&&!(r>=0)))
+  throw new RangeError('quota and requested must be finite and not negative');
+ if(q!==null&&r!==null&&r<q)
+  throw new RangeError('requested must not be less than quota');
+ Object.setPrototypeOf(e,QuotaExceededError.prototype);
+ Object.defineProperty(e,'quota',{configurable:true,value:q});
+ Object.defineProperty(e,'requested',{configurable:true,value:r});
+ return e;}
+QuotaExceededError.prototype=Object.create(DOMException.prototype);
+QuotaExceededError.prototype.constructor=QuotaExceededError;
+QuotaExceededError.prototype.name='QuotaExceededError';
+W.QuotaExceededError=QuotaExceededError;
 
 /* --- DOMTokenList -------------------------------------------------------
  * An ordered set of tokens over an attribute. It used to split on

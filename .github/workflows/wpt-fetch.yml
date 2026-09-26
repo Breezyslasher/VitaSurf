@@ -48,7 +48,8 @@ jobs:
               /html/semantics/forms \
               /css/cssom \
               /url \
-              /domparsing
+              /domparsing \
+              /WebCryptoAPI
           echo "revision $(git rev-parse HEAD)"
 
       - name: Copy in what runs from a file, and nothing else
@@ -90,6 +91,14 @@ jobs:
                       pass
                   elif FIXTURES.match(rel):
                       pass
+                  elif rel.startswith('WebCryptoAPI/'):
+                      # every test here is a .any.js; the page for each
+                      # is written below. Not the ones a file cannot run.
+                      if re.search(r'(\.tentative\.|idlharness|sharedarraybuffer|'
+                                   r'/crashtests/|/tools/|/secure_context/|'
+                                   r'\.worker\.|\.window\.js$)', '/' + rel) or \
+                              not f.endswith('.js'):
+                          continue
                   elif not WANT.search(f) or SKIP.search('/' + rel):
                       continue
                   elif f.endswith('.js') and re.search(r'\.(any|window|worker)\.js$', f):
@@ -100,6 +109,8 @@ jobs:
                   kept += 1
           print('kept', kept, 'files')
           PY
+          # WebCryptoAPI's tests are .any.js, run from a page written for each
+          ./scripts/wpt-wrap-any.py tests/wpt/WebCryptoAPI
           du -sh tests/wpt
           find tests/wpt -name '*.html' | wc -l
 

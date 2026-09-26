@@ -121,7 +121,8 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/prelude.js
         vita/js/streams.js
         vita/js/performance.js
-        vita/js/storage.js)
+        vita/js/storage.js
+        vita/js/subtle.js)
     set(PRELUDE_BYTES "")
     foreach(part ${PRELUDE_PARTS})
         set(full "${CMAKE_SOURCE_DIR}/${part}")
@@ -138,7 +139,7 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
-        vita/js/canvas.c)
+        vita/js/canvas.c vita/js/subtle.c)
     target_include_directories(${PROJECT_NAME} PRIVATE
         "${CMAKE_BINARY_DIR}/generated" vita/js)
     # canvas.c draws text with the glyphs the framebuffer frontend's font
