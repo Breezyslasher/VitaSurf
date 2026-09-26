@@ -1,0 +1,401 @@
+diff --git a/core/iwasm/common/wasm_runtime_common.c b/core/iwasm/common/wasm_runtime_common.c
+index 943b46fc..197af880 100644
+--- a/core/iwasm/common/wasm_runtime_common.c
++++ b/core/iwasm/common/wasm_runtime_common.c
+@@ -7166,15 +7166,16 @@ argv_to_params(wasm_val_t *out_params, const uint32 *argv,
+                 u32[1] = *argv++;
+                 break;
+ #if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
++            /* VitaSurf: a reference goes to the host as it is, a function
++               index or the host's own externref handle; the host keeps
++               the map of its objects, not WAMR */
++            case VALUE_TYPE_FUNCREF:
++                param->kind = WASM_FUNCREF;
++                param->of.i32 = (int32)*argv++;
++                break;
+             case VALUE_TYPE_EXTERNREF:
+                 param->kind = WASM_EXTERNREF;
+-
+-                if (!wasm_externref_ref2obj(*argv,
+-                                            (void **)&param->of.foreign)) {
+-                    return false;
+-                }
+-
+-                argv++;
++                param->of.i32 = (int32)*argv++;
+                 break;
+ #endif
+             default:
+@@ -7206,13 +7207,9 @@ results_to_argv(WASMModuleInstanceCommon *module_inst, uint32 *out_argv,
+                 *argv++ = u32[1];
+                 break;
+ #if WASM_ENABLE_GC == 0 && WASM_ENABLE_REF_TYPES != 0
++            case VALUE_TYPE_FUNCREF:
+             case VALUE_TYPE_EXTERNREF:
+-                if (!wasm_externref_obj2ref(module_inst,
+-                                            (void *)result->of.foreign,
+-                                            (uint32 *)argv)) {
+-                    return false;
+-                }
+-                argv++;
++                *(int32 *)argv++ = result->of.i32;
+                 break;
+ #endif
+             default:
+diff --git a/core/iwasm/interpreter/wasm_interp_classic.c b/core/iwasm/interpreter/wasm_interp_classic.c
+index 9f7e03e2..67f735b8 100644
+--- a/core/iwasm/interpreter/wasm_interp_classic.c
++++ b/core/iwasm/interpreter/wasm_interp_classic.c
+@@ -1536,6 +1536,9 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
+ static inline uint8 *
+ get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
+ {
++    /* VitaSurf: a global linked to another instance's */
++    if (global->linked_data)
++        return global->linked_data;
+ #if WASM_ENABLE_MULTI_MODULE == 0
+     return global_data + global->data_offset;
+ #else
+diff --git a/core/iwasm/interpreter/wasm_interp_fast.c b/core/iwasm/interpreter/wasm_interp_fast.c
+index 1c744f9a..cd5d47e1 100644
+--- a/core/iwasm/interpreter/wasm_interp_fast.c
++++ b/core/iwasm/interpreter/wasm_interp_fast.c
+@@ -1197,8 +1197,12 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
+ {
+     WASMFunctionImport *func_import = cur_func->u.func_import;
+     CApiFuncImport *c_api_func_import = NULL;
++    /* VitaSurf: room for the results as well, which a wasm-c-api host
++       function writes over its arguments, however many there are */
+     unsigned local_cell_num =
+-        cur_func->param_cell_num > 2 ? cur_func->param_cell_num : 2;
++        cur_func->param_cell_num > cur_func->ret_cell_num
++            ? (cur_func->param_cell_num > 2 ? cur_func->param_cell_num : 2)
++            : (cur_func->ret_cell_num > 2 ? cur_func->ret_cell_num : 2);
+     unsigned all_cell_num;
+     WASMInterpFrame *frame;
+     uint32 argv_ret[2], cur_func_index;
+@@ -1299,6 +1303,12 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
+         prev_frame->lp[prev_frame->ret_offset] = argv_ret[0];
+         prev_frame->lp[prev_frame->ret_offset + 1] = argv_ret[1];
+     }
++    else if (cur_func->ret_cell_num > 2 && func_import->call_conv_wasm_c_api) {
++        /* VitaSurf: several results, as a bytecode function returns them */
++        uint32 k;
++        for (k = 0; k < cur_func->ret_cell_num; k++)
++            prev_frame->lp[prev_frame->ret_offset + k] = frame->lp[k];
++    }
+ 
+     FREE_FRAME(exec_env, frame);
+     wasm_exec_env_set_cur_frame(exec_env, prev_frame);
+@@ -1482,6 +1492,9 @@ static void **global_handle_table;
+ static inline uint8 *
+ get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
+ {
++    /* VitaSurf: a global linked to another instance's */
++    if (global->linked_data)
++        return global->linked_data;
+ #if WASM_ENABLE_MULTI_MODULE == 0
+     return global_data + global->data_offset;
+ #else
+diff --git a/core/iwasm/interpreter/wasm_loader.c b/core/iwasm/interpreter/wasm_loader.c
+index d3f47203..b5c74840 100644
+--- a/core/iwasm/interpreter/wasm_loader.c
++++ b/core/iwasm/interpreter/wasm_loader.c
+@@ -6509,6 +6509,17 @@ load_from_sections(WASMModule *module, WASMSection *sections,
+         }
+     }
+ 
++    /* VitaSurf: under the WebAssembly JS API, Memory.grow and Table.grow
++       reach an exported memory or table from outside the module, so
++       neither may be sized for what the module's own code does */
++    module->possible_memory_grow = true;
++    for (i = 0; i < module->import_table_count; i++) {
++        module->import_tables[i].u.table.table_type.possible_grow = true;
++    }
++    for (i = 0; i < module->table_count; i++) {
++        module->tables[i].table_type.possible_grow = true;
++    }
++
+     if (!module->possible_memory_grow) {
+ #if WASM_ENABLE_SHRUNK_MEMORY != 0
+         if (aux_data_end_global && aux_heap_base_global
+diff --git a/core/iwasm/interpreter/wasm_runtime.c b/core/iwasm/interpreter/wasm_runtime.c
+index b4aa483d..da667cd0 100644
+--- a/core/iwasm/interpreter/wasm_runtime.c
++++ b/core/iwasm/interpreter/wasm_runtime.c
+@@ -241,6 +241,11 @@ memories_deinstantiate(WASMModuleInstance *module_inst,
+     if (memories) {
+         for (i = 0; i < count; i++) {
+             if (memories[i]) {
++                /* VitaSurf: a linked import is another instance's */
++                if (memories[i]
++                    != module_inst->global_table_data.memory_instances + i) {
++                    continue;
++                }
+ #if WASM_ENABLE_MULTI_MODULE != 0
+                 WASMModule *module = module_inst->module;
+                 if (i < module->import_memory_count
+@@ -501,8 +506,8 @@ fail1:
+ static WASMMemoryInstance **
+ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
+                      WASMModuleInstance *parent, uint32 heap_size,
+-                     uint32 max_memory_pages, char *error_buf,
+-                     uint32 error_buf_size)
++                     uint32 max_memory_pages, const WASMImportLinks *links,
++                     char *error_buf, uint32 error_buf_size)
+ {
+     WASMImport *import;
+     uint32 mem_index = 0, i,
+@@ -530,6 +535,11 @@ memories_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
+         uint32 flags = import->u.memory.mem_type.flags;
+         uint32 actual_heap_size = heap_size;
+ 
++        if (links && links->memories && links->memories[i]) {
++            memories[mem_index++] = links->memories[i];
++            continue;
++        }
++
+ #if WASM_ENABLE_MULTI_MODULE != 0
+         if (import->u.memory.import_module != NULL) {
+             WASMModuleInstance *module_inst_linked;
+@@ -605,7 +615,8 @@ tables_deinstantiate(WASMModuleInstance *module_inst)
+  */
+ static WASMTableInstance **
+ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
+-                   WASMTableInstance *first_table, char *error_buf,
++                   WASMTableInstance *first_table,
++                   const WASMImportLinks *links, char *error_buf,
+                    uint32 error_buf_size)
+ {
+     WASMImport *import;
+@@ -635,6 +646,22 @@ tables_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
+     import = module->import_tables;
+     for (i = 0; i < module->import_table_count; i++, import++) {
+         uint32 max_size_fixed = 0;
++
++        /* VitaSurf: share another instance's table; the slot reserved
++           for this one goes unused */
++        if (links && links->tables && links->tables[i]) {
++            max_size_fixed = import->u.table.table_type.possible_grow
++                                 ? import->u.table.table_type.max_size
++                                 : import->u.table.table_type.init_size;
++            total_size = offsetof(WASMTableInstance, elems)
++                         + (uint64)sizeof(table_elem_type_t) * max_size_fixed;
++            tables[table_index++] = links->tables[i];
++            table = (WASMTableInstance *)((uint8 *)table + (uint32)total_size);
++#if WASM_ENABLE_MULTI_MODULE != 0
++            *table_linked++ = NULL;
++#endif
++            continue;
++        }
+ #if WASM_ENABLE_MULTI_MODULE != 0
+         WASMTableInstance *table_inst_linked = NULL;
+         WASMModuleInstance *module_inst_linked = NULL;
+@@ -776,7 +803,8 @@ functions_deinstantiate(WASMFunctionInstance *functions)
+  */
+ static WASMFunctionInstance *
+ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
+-                      char *error_buf, uint32 error_buf_size)
++                      const WASMImportLinks *links, char *error_buf,
++                      uint32 error_buf_size)
+ {
+     WASMImport *import;
+     uint32 i,
+@@ -826,7 +854,8 @@ functions_instantiate(const WASMModule *module, WASMModuleInstance *module_inst,
+ 
+         /* Copy the function pointer to current instance */
+         module_inst->import_func_ptrs[i] =
+-            function->u.func_import->func_ptr_linked;
++            links ? links->funcs[i].func_ptr_linked
++                  : function->u.func_import->func_ptr_linked;
+ 
+         function++;
+     }
+@@ -1245,7 +1274,8 @@ fail:
+  */
+ static WASMGlobalInstance *
+ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
+-                    char *error_buf, uint32 error_buf_size)
++                    const WASMImportLinks *links, char *error_buf,
++                    uint32 error_buf_size)
+ {
+     WASMImport *import;
+     uint32 global_data_offset = 0;
+@@ -1288,7 +1318,13 @@ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
+         }
+         else
+ #endif
+-        {
++        if (links) {
++            global->initial_value = links->globals[i];
++            if (links->global_addrs) {
++                global->linked_data = links->global_addrs[i];
++            }
++        }
++        else {
+             /* native globals share their initial_values in one module */
+             bh_memcpy_s(&(global->initial_value), sizeof(WASMValue),
+                         &(global_import->global_data_linked),
+@@ -1962,12 +1998,17 @@ execute_free_function(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
+ }
+ 
+ static bool
+-check_linked_symbol(WASMModuleInstance *module_inst, char *error_buf,
++check_linked_symbol(WASMModuleInstance *module_inst,
++                    const WASMImportLinks *links, char *error_buf,
+                     uint32 error_buf_size)
+ {
+     WASMModule *module = module_inst->module;
+     uint32 i;
+ 
++    if (links) {
++        return true;
++    }
++
+     for (i = 0; i < module->import_function_count; i++) {
+         WASMFunctionImport *func =
+             &((module->import_functions + i)->u.function);
+@@ -2419,6 +2460,14 @@ wasm_set_running_mode(WASMModuleInstance *module_inst, RunningMode running_mode)
+ /**
+  * Instantiate module
+  */
++static const WASMImportLinks *next_import_links;
++
++void
++wasm_set_next_import_links(const WASMImportLinks *links)
++{
++    next_import_links = links;
++}
++
+ WASMModuleInstance *
+ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+                  WASMExecEnv *exec_env_main, uint32 stack_size,
+@@ -2440,7 +2489,9 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+     bool ret = false;
+ #endif
+     const bool is_sub_inst = parent != NULL;
++    const WASMImportLinks *links = next_import_links;
+ 
++    next_import_links = NULL;
+     if (!module)
+         return NULL;
+ 
+@@ -2587,8 +2638,8 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+     /* Instantiate global firstly to get the mutable data size */
+     global_count = module->import_global_count + module->global_count;
+     if (global_count
+-        && !(globals = globals_instantiate(module, module_inst, error_buf,
+-                                           error_buf_size))) {
++        && !(globals = globals_instantiate(module, module_inst, links,
++                                           error_buf, error_buf_size))) {
+         goto fail;
+     }
+     module_inst->e->global_count = global_count;
+@@ -2629,14 +2680,14 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+     if ((module_inst->memory_count > 0
+          && !(module_inst->memories = memories_instantiate(
+                   module, module_inst, parent, heap_size, max_memory_pages,
+-                  error_buf, error_buf_size)))
++                  links, error_buf, error_buf_size)))
+         || (module_inst->table_count > 0
+             && !(module_inst->tables =
+                      tables_instantiate(module, module_inst, first_table,
+-                                        error_buf, error_buf_size)))
++                                        links, error_buf, error_buf_size)))
+         || (module_inst->e->function_count > 0
+             && !(module_inst->e->functions = functions_instantiate(
+-                     module, module_inst, error_buf, error_buf_size)))
++                     module, module_inst, links, error_buf, error_buf_size)))
+         || (module_inst->export_func_count > 0
+             && !(module_inst->export_functions = export_functions_instantiate(
+                      module, module_inst, module_inst->export_func_count,
+@@ -2771,10 +2822,26 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+         bh_assert(global_data == global_data_end);
+     }
+ 
+-    if (!check_linked_symbol(module_inst, error_buf, error_buf_size)) {
++    if (!check_linked_symbol(module_inst, links, error_buf, error_buf_size)) {
+         goto fail;
+     }
+ 
++    /* VitaSurf: each import calls its host function through the wasm-c-api
++       convention, set up before the start function can call one */
++    if (links && module->import_function_count > 0) {
++        total_size =
++            sizeof(CApiFuncImport) * (uint64)module->import_function_count;
++        if (!(module_inst->c_api_func_imports =
++                  runtime_malloc(total_size, error_buf, error_buf_size))) {
++            goto fail;
++        }
++        bh_memcpy_s(module_inst->c_api_func_imports, (uint32)total_size,
++                    links->funcs, (uint32)total_size);
++        for (i = 0; i < module->import_function_count; i++) {
++            module->import_functions[i].u.function.call_conv_wasm_c_api = true;
++        }
++    }
++
+     /* Initialize the memory data with data segment section */
+     for (i = 0; i < module->data_seg_count; i++) {
+         WASMMemoryInstance *memory = NULL;
+@@ -3314,7 +3381,7 @@ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+ 
+     if (module->start_function != (uint32)-1) {
+         /* TODO: fix start function can be import function issue */
+-        if (module->start_function >= module->import_function_count)
++        if (links || module->start_function >= module->import_function_count)
+             module_inst->e->start_function =
+                 &module_inst->e->functions[module->start_function];
+     }
+diff --git a/core/iwasm/interpreter/wasm_runtime.h b/core/iwasm/interpreter/wasm_runtime.h
+index 16c670f0..ce5874a6 100644
+--- a/core/iwasm/interpreter/wasm_runtime.h
++++ b/core/iwasm/interpreter/wasm_runtime.h
+@@ -209,6 +209,9 @@ struct WASMGlobalInstance {
+     WASMModuleInstance *import_module_inst;
+     WASMGlobalInstance *import_global_inst;
+ #endif
++    /* VitaSurf: an imported global linked to another instance's global
++       (WASMImportLinks) keeps its value there, not in global_data */
++    uint8 *linked_data;
+ };
+ 
+ struct WASMFunctionInstance {
+@@ -312,6 +315,27 @@ typedef struct CApiFuncImport {
+     void *env_arg;
+ } CApiFuncImport;
+ 
++/*
++ * VitaSurf: what the next wasm_instantiate links a module's imports to,
++ * for the WebAssembly JS API, which resolves imports from JavaScript
++ * per instance rather than per module. Each array has one entry per
++ * import of its kind, in import order.
++ */
++typedef struct WASMImportLinks {
++    /* the host function, and its env, each imported function calls */
++    const CApiFuncImport *funcs;
++    /* the value of each imported global */
++    const WASMValue *globals;
++    /* each imported memory: another instance's memory to share, or NULL
++       for a new one */
++    struct WASMMemoryInstance *const *memories;
++    /* each imported table: another instance's table to share, or NULL */
++    struct WASMTableInstance *const *tables;
++    /* each imported global: where another instance keeps it, to share,
++       or NULL for a copy of the value in globals */
++    uint8 *const *global_addrs;
++} WASMImportLinks;
++
+ /* The common part of WASMModuleInstanceExtra and AOTModuleInstanceExtra */
+ typedef struct WASMModuleInstanceExtraCommon {
+ #if WASM_ENABLE_MODULE_INST_CONTEXT != 0
+@@ -551,6 +575,10 @@ bool
+ wasm_resolve_import_func(const WASMModule *module,
+                          WASMFunctionImport *function);
+ 
++/* VitaSurf: links for the next wasm_instantiate only (see WASMImportLinks) */
++void
++wasm_set_next_import_links(const WASMImportLinks *links);
++
+ WASMModuleInstance *
+ wasm_instantiate(WASMModule *module, WASMModuleInstance *parent,
+                  WASMExecEnv *exec_env_main, uint32 stack_size,

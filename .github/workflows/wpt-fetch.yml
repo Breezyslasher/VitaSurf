@@ -49,7 +49,8 @@ jobs:
               /css/cssom \
               /url \
               /domparsing \
-              /WebCryptoAPI
+              /WebCryptoAPI \
+              /wasm/jsapi
           echo "revision $(git rev-parse HEAD)"
 
       - name: Copy in what runs from a file, and nothing else
@@ -99,6 +100,15 @@ jobs:
                                    r'\.worker\.|\.window\.js$)', '/' + rel) or \
                               not f.endswith('.js'):
                           continue
+                  elif rel.startswith('wasm/jsapi/'):
+                      # the JS API tests, as .any.js with a page written
+                      # below, and their helpers; not the proposals the
+                      # interpreter lacks, nor what needs modules or a
+                      # worker
+                      if re.search(r'(\.tentative\.|idlharness|/esm-integration/|'
+                                   r'/gc/|/js-string/|/jspi/|\.worker\.)', '/' + rel) or \
+                              not WANT.search(f):
+                          continue
                   elif not WANT.search(f) or SKIP.search('/' + rel):
                       continue
                   elif f.endswith('.js') and re.search(r'\.(any|window|worker)\.js$', f):
@@ -110,7 +120,7 @@ jobs:
           print('kept', kept, 'files')
           PY
           # WebCryptoAPI's tests are .any.js, run from a page written for each
-          ./scripts/wpt-wrap-any.py tests/wpt/WebCryptoAPI
+          ./scripts/wpt-wrap-any.py tests/wpt/WebCryptoAPI tests/wpt/wasm
           du -sh tests/wpt
           find tests/wpt -name '*.html' | wc -l
 

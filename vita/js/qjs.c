@@ -59,6 +59,7 @@
 #include "canvas.h"
 #include "qjs_alloc.h"
 #include "subtle.h"
+#include "wasm.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -9571,6 +9572,7 @@ static void setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_vita_parse_document,
 					  "__vitaParseDocument", 1));
 	vita_subtle_register(ctx, global);
+	vita_wasm_register(ctx, global);
 	JS_SetPropertyStr(ctx, global, "__vitaCSSSupports",
 			  JS_NewCFunction(ctx, win_vita_css_supports,
 					  "__vitaCSSSupports", 1));

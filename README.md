@@ -325,6 +325,8 @@ development packages for zlib and libpng (NetSurf builds a few host tools).
 
     vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d quickjs-ng
     git submodule update --init --recursive
+    ./scripts/build-quickjs.sh
+    ./scripts/build-wamr.sh
     ./scripts/build-deps.sh
     ./scripts/build-netsurf.sh
     cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake
@@ -338,7 +340,15 @@ after a few hundred locks, so curl could never load the CA bundle. mbedTLS
 only needs a handful of mutexes. `crypto.subtle` (`vita/js/subtle.c`)
 uses the same mbedTLS for hashing, AES, ECDSA, ECDH and RSA, and takes
 Ed25519 and X25519, which mbedTLS lacks, from Monocypher 4.0.3
-(`deps/monocypher`, BSD-2-Clause or CC0). Add `VITASURF_DEBUG=1` to the
+(`deps/monocypher`, BSD-2-Clause or CC0). WebAssembly runs on WAMR's
+interpreter (WAMR 2.4.5 in `deps/wamr`, Apache-2.0 WITH LLVM-exception:
+the exception is what lets it be combined with GPLv2 code), built by
+`scripts/build-wamr.sh` on the platform layer in `vita/wasm/platform`,
+with the JS API in `vita/js/wasm.c` and `vita/js/wasm.js`. The Vita has
+no JIT, so modules are interpreted. Patch 0246 links a module's imports
+per instance, as the JS API needs. Not yet supported: a funcref table
+shared between instances, shared memory, SIMD, exception handling and
+memory64. Add `VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging. The JavaScript engine is chosen with
 `VITASURF_JS_ENGINE` in the environment of `build-netsurf.sh` and the

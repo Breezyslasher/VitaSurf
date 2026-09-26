@@ -106,6 +106,10 @@ jobs:
         if: matrix.engine == 'quickjs'
         run: ./scripts/build-quickjs.sh
 
+      - name: Build WAMR for WebAssembly
+        if: matrix.engine == 'quickjs'
+        run: ./scripts/build-wamr.sh
+
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh
 

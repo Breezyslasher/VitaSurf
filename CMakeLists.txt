@@ -110,6 +110,9 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/quickjs.h")
         message(FATAL_ERROR "quickjs.h not found: build it with scripts/build-quickjs.sh")
     endif()
+    if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/wamr/glue.h")
+        message(FATAL_ERROR "wamr/glue.h not found: build it with scripts/build-wamr.sh")
+    endif()
     # Hand-written QuickJS bindings implementing NetSurf's js.h, plus the
     # JavaScript half of them embedded as a NUL-terminated byte array.
     # The prelude is several files concatenated in this order. It grew past
@@ -122,7 +125,8 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/streams.js
         vita/js/performance.js
         vita/js/storage.js
-        vita/js/subtle.js)
+        vita/js/subtle.js
+        vita/js/wasm.js)
     set(PRELUDE_BYTES "")
     foreach(part ${PRELUDE_PARTS})
         set(full "${CMAKE_SOURCE_DIR}/${part}")
@@ -139,7 +143,7 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
-        vita/js/canvas.c vita/js/subtle.c)
+        vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c)
     # subtle.c takes Ed25519 and X25519 from Monocypher, which mbedTLS
     # does not have
     target_sources(${PROJECT_NAME} PRIVATE
@@ -147,7 +151,10 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         deps/monocypher/src/optional/monocypher-ed25519.c)
     target_include_directories(${PROJECT_NAME} PRIVATE
         "${CMAKE_BINARY_DIR}/generated" vita/js
-        deps/monocypher/src deps/monocypher/src/optional)
+        deps/monocypher/src deps/monocypher/src/optional
+        # WebAssembly: WAMR's interpreter and vita/wasm/glue.h, built by
+        # scripts/build-wamr.sh
+        "${SYSROOT}/include/wamr")
     # canvas.c draws text with the glyphs the framebuffer frontend's font
     # engine has, so it needs FreeType's headers. NetSurf asks pkg-config
     # for them; here the sysroot is searched directly, because which of
@@ -222,8 +229,9 @@ target_link_options(${PROJECT_NAME} PRIVATE
 set(VITASURF_JS_LIBS)
 if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # quickjs-ng (MIT), built from deps/libquickjs by
-    # scripts/build-quickjs.sh.
-    set(VITASURF_JS_LIBS quickjs)
+    # scripts/build-quickjs.sh; WAMR (Apache-2.0 WITH LLVM-exception),
+    # built from deps/wamr by scripts/build-wamr.sh, runs WebAssembly.
+    set(VITASURF_JS_LIBS quickjs vitawamr)
 endif()
 
 # Image decoders that are only in libnetsurf.a when the toolchain had
