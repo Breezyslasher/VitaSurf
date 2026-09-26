@@ -108,7 +108,7 @@ add_executable(${PROJECT_NAME}
 )
 if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/quickjs.h")
-        message(FATAL_ERROR "quickjs.h not found: install it with 'vdpm quickjs-ng'")
+        message(FATAL_ERROR "quickjs.h not found: build it with scripts/build-quickjs.sh")
     endif()
     # Hand-written QuickJS bindings implementing NetSurf's js.h, plus the
     # JavaScript half of them embedded as a NUL-terminated byte array.
@@ -214,7 +214,8 @@ target_link_options(${PROJECT_NAME} PRIVATE
 
 set(VITASURF_JS_LIBS)
 if(VITASURF_JS_ENGINE STREQUAL "quickjs")
-    # quickjs-ng (MIT), from vdpm.
+    # quickjs-ng (MIT), built from deps/libquickjs by
+    # scripts/build-quickjs.sh.
     set(VITASURF_JS_LIBS quickjs)
 endif()
 

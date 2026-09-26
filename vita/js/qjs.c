@@ -9671,19 +9671,28 @@ void js_initialise(void)
 	 */
 	err = javascript_init();
 	/*
-	 * The engine's version, because how large a compiled script is
-	 * depends on it: a host build of quickjs-ng 0.14 writes bytecode
-	 * three times the size of its source, keeping every function's
-	 * text so that toString can return it, where a build 362 log
-	 * cached 73 KB for 221 KB of source. Comparing a measurement
-	 * taken here against one taken on a host means knowing both.
+	 * The engine's version, and whether it is our build, because how
+	 * large a compiled script is depends on both. Stock quickjs-ng
+	 * keeps a copy of every function's text so that toString can
+	 * return it, and a nested function's text again inside each
+	 * function around it; ours (scripts/build-quickjs.sh) shares one
+	 * copy of the script between its functions. (A build 362 log
+	 * cached 73 KB for 221 KB of source, but that script was
+	 * YouTube's page data, nearly all literals and little function
+	 * text.)
 	 */
 #ifdef QJS_VERSION_MAJOR
 	vita_log("qjs: QuickJS engine initialised (content handler %s), "
-		 "quickjs-ng %d.%d.%d%s",
+		 "quickjs-ng %d.%d.%d%s, %s",
 		 err == NSERROR_OK ? "registered" : "FAILED",
 		 QJS_VERSION_MAJOR, QJS_VERSION_MINOR, QJS_VERSION_PATCH,
-		 QJS_VERSION_SUFFIX);
+		 QJS_VERSION_SUFFIX,
+#ifdef QJS_VITASURF_SHARED_SOURCE
+		 "functions share their script's source"
+#else
+		 "stock build, every function keeps its own source"
+#endif
+		 );
 #else
 	vita_log("qjs: QuickJS engine initialised (content handler %s), "
 		 "version not reported by the headers",

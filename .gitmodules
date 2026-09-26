@@ -62,3 +62,7 @@
 	path = deps/utf8proc
 	url = https://github.com/JuliaStrings/utf8proc.git
 	ignore = dirty
+[submodule "deps/libquickjs"]
+	path = deps/libquickjs
+	url = https://github.com/quickjs-ng/quickjs.git
+	ignore = dirty

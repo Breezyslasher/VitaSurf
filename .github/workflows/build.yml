@@ -78,7 +78,9 @@ jobs:
           if vdpm list curl >/dev/null 2>&1; then
             VDPM_NONINTERACTIVE=1 vdpm remove --nodeps --nodeps curl
           fi
-          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d quickjs-ng
+          VDPM_NONINTERACTIVE=1 vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d
+          # QuickJS is not from vdpm: scripts/build-quickjs.sh builds it
+          # from deps/libquickjs with the patches in patches/.
           # WebP, because most of the images on a modern page are WebP.
           # vdpm has libwebp; it has no libjxl, and JPEG XL is rare
           # enough not to be worth building one from source. Both are
@@ -99,6 +101,10 @@ jobs:
 
       - name: Build libjpeg-turbo with NEON
         run: ./scripts/build-libjpeg-simd.sh
+
+      - name: Build QuickJS with shared function source
+        if: matrix.engine == 'quickjs'
+        run: ./scripts/build-quickjs.sh
 
       - name: Build NetSurf libraries
         run: ./scripts/build-deps.sh

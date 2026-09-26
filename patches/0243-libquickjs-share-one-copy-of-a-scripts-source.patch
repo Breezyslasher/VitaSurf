@@ -1,0 +1,393 @@
+diff --git a/quickjs.c b/quickjs.c
+index 04886e3..a23e8c5 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -801,8 +801,34 @@ typedef struct JSFunctionBytecode {
+     int pc2line_len;
+     uint8_t *pc2line_buf;
+     char *source;
++    struct JSSourceBlob *source_blob; /* holds source, or NULL if it owns it */
+ } JSFunctionBytecode;
+ 
++/*
++ * The text of one script, shared by every function compiled from it
++ * (VitaSurf). Each function used to keep its own copy of its source for
++ * Function.prototype.toString, and a nested function's text is inside
++ * its parent's, so a bundle was held once per level of nesting: 35-47%
++ * of all the memory compiling a large bundle took. Now the script is
++ * copied once, the first time a function needs it, and each function
++ * points into that copy.
++ */
++typedef struct JSSourceBlob {
++    int ref_count;
++    int len;
++    char data[];
++} JSSourceBlob;
++
++static void js_source_release(JSRuntime *rt, JSSourceBlob *blob, char *source)
++{
++    if (blob) {
++        if (--blob->ref_count == 0)
++            js_free_rt(rt, blob);
++    } else {
++        js_free_rt(rt, source);
++    }
++}
++
+ typedef struct JSBoundFunction {
+     JSValue func_obj;
+     JSValue this_val;
+@@ -7100,7 +7126,8 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
+         hp->js_func_code_size += b->byte_code_len;
+     }
+     memory_used_count++;
+-    js_func_size += b->source_len + 1;
++    if (!b->source_blob)
++        js_func_size += b->source_len + 1;
+     if (b->pc2line_len) {
+         memory_used_count++;
+         hp->js_func_pc2line_count += 1;
+@@ -21494,6 +21521,7 @@ typedef struct JSFunctionDef {
+ 
+     char *source;  /* raw source, utf-8 encoded */
+     int source_len;
++    JSSourceBlob *source_blob; /* holds source, or NULL if it owns it */
+ 
+     JSModuleDef *module; /* != NULL when parsing a module */
+ } JSFunctionDef;
+@@ -21543,6 +21571,7 @@ typedef struct JSParseState {
+     JSFunctionDef *cur_func;
+     bool is_module; /* parsing a module */
+     bool allow_html_comments;
++    JSSourceBlob *source_blob; /* the input, once a function wants it */
+ } JSParseState;
+ 
+ typedef struct JSOpCode {
+@@ -21592,6 +21621,49 @@ static void json_free_token(JSParseState *s, JSToken *token) {
+     }
+ }
+ 
++/*
++ * Record where a function's source is (VitaSurf): a place in the one copy
++ * of the input this parse shares out, made the first time it is asked
++ * for, rather than a copy of the function's own text.
++ */
++static int js_parse_save_source(JSParseState *s, JSFunctionDef *fd,
++                                const uint8_t *start, size_t len)
++{
++    JSContext *ctx = s->ctx;
++    JSSourceBlob *blob = s->source_blob;
++
++    if (start < s->buf_start || len > (size_t)(s->buf_end - start)) {
++        /* not in this parse's input: keep a copy of its own */
++        char *copy = js_strndup(ctx, (const char *)start, len);
++        if (!copy)
++            return -1;
++        js_source_release(ctx->rt, fd->source_blob, fd->source);
++        fd->source_blob = NULL;
++        fd->source = copy;
++        fd->source_len = len;
++        return 0;
++    }
++    if (!blob) {
++        size_t n = s->buf_end - s->buf_start;
++        if (n > INT32_MAX)
++            return -1;
++        blob = js_malloc(ctx, sizeof(*blob) + n + 1);
++        if (!blob)
++            return -1;
++        blob->ref_count = 1; /* the parser's own hold */
++        blob->len = n;
++        memcpy(blob->data, s->buf_start, n);
++        blob->data[n] = '\0';
++        s->source_blob = blob;
++    }
++    blob->ref_count++;
++    js_source_release(ctx->rt, fd->source_blob, fd->source);
++    fd->source_blob = blob;
++    fd->source = blob->data + (start - s->buf_start);
++    fd->source_len = len;
++    return 0;
++}
++
+ static void free_token(JSParseState *s, JSToken *token)
+ {
+     switch(token->val) {
+@@ -25037,10 +25109,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
+     put_u32(fd->byte_code.buf + ctor_cpool_offset, ctor_fd->parent_cpool_idx);
+ 
+     /* store the class source code in the constructor. */
+-    js_free(ctx, ctor_fd->source);
+-    ctor_fd->source_len = s->buf_ptr - class_start_ptr;
+-    ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr, ctor_fd->source_len);
+-    if (!ctor_fd->source)
++    if (js_parse_save_source(s, ctor_fd, class_start_ptr,
++                             s->buf_ptr - class_start_ptr))
+         goto fail;
+ 
+     /* consume the '}' */
+@@ -31580,7 +31650,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
+     JS_FreeAtom(ctx, fd->filename);
+     dbuf_free(&fd->pc2line);
+ 
+-    js_free(ctx, fd->source);
++    js_source_release(ctx->rt, fd->source_blob, fd->source);
+ 
+     if (fd->parent) {
+         /* remove in parent list */
+@@ -35517,6 +35587,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     b->pc2line_len = fd->pc2line.size;
+     b->source = fd->source;
+     b->source_len = fd->source_len;
++    b->source_blob = fd->source_blob;
+ 
+     if (fd->scopes != fd->def_scope_array)
+         js_free(ctx, fd->scopes);
+@@ -35589,7 +35660,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+     JS_FreeAtomRT(rt, b->func_name);
+     JS_FreeAtomRT(rt, b->filename);
+     js_free_rt(rt, b->pc2line_buf);
+-    js_free_rt(rt, b->source);
++    js_source_release(rt, b->source_blob, b->source);
+ 
+     remove_gc_object(&b->header);
+     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {
+@@ -36187,9 +36258,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+             /* save the function source code */
+             /* the end of the function source code is after the last
+                 token of the function source stored into s->last_ptr */
+-            fd->source_len = s->last_ptr - ptr;
+-            fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
+-            if (!fd->source)
++            if (js_parse_save_source(s, fd, ptr, s->last_ptr - ptr))
+                 goto fail;
+ 
+             goto done;
+@@ -36214,9 +36283,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+     }
+ 
+     /* save the function source code */
+-    fd->source_len = s->buf_ptr - ptr;
+-    fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
+-    if (!fd->source)
++    if (js_parse_save_source(s, fd, ptr, s->buf_ptr - ptr))
+         goto fail;
+ 
+     if (next_token(s)) {
+@@ -36553,6 +36620,9 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+     fd->body_scope = fd->scope_level;
+ 
+     err = js_parse_program(s);
++    /* the functions hold the shared text now; the parser is done with it */
++    js_source_release(ctx->rt, s->source_blob, NULL);
++    s->source_blob = NULL;
+     if (err) {
+     fail:
+         free_token(s, &s->token);
+@@ -36825,7 +36895,9 @@ typedef enum BCTagEnum {
+     BC_TAG_SYMBOL,
+ } BCTagEnum;
+ 
+-#define BC_VERSION 25
++/* VitaSurf: 25 upstream; the high bit marks the shared source format
++   below, so bytecode written by a stock build is refused, not misread */
++#define BC_VERSION (25 | 0x80)
+ 
+ typedef struct BCWriterState {
+     JSContext *ctx;
+@@ -36846,6 +36918,10 @@ typedef struct BCWriterState {
+     int sab_tab_size;
+     /* list of referenced objects (used if allow_reference = true) */
+     JSObjectList object_list;
++    /* scripts whose shared text is already written (VitaSurf) */
++    JSSourceBlob **src_tab;
++    int src_tab_len;
++    int src_tab_size;
+ } BCWriterState;
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+@@ -37188,8 +37264,38 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+         bc_put_leb128(s, b->pc2line_len);
+         dbuf_put(&s->dbuf, b->pc2line_buf, b->pc2line_len);
+         if (s->allow_source && b->source) {
++            /*
++             * The length, then where the text is (VitaSurf): 0 and the
++             * function's own copy, or n and an offset into shared text
++             * n, which follows the first time n is used. Writing each
++             * function's text wrote a script once per level of nesting.
++             */
+             bc_put_leb128(s, b->source_len);
+-            dbuf_put(&s->dbuf, b->source, b->source_len);
++            if (b->source_blob) {
++                JSSourceBlob *blob = b->source_blob;
++                int i;
++
++                for (i = 0; i < s->src_tab_len; i++) {
++                    if (s->src_tab[i] == blob)
++                        break;
++                }
++                bc_put_leb128(s, i + 1);
++                if (i == s->src_tab_len) {
++                    if (js_resize_array(s->ctx, (void **)&s->src_tab,
++                                        sizeof(s->src_tab[0]),
++                                        &s->src_tab_size,
++                                        s->src_tab_len + 1))
++                        goto fail;
++                    s->src_tab[s->src_tab_len++] = blob;
++                    bc_put_leb128(s, blob->len);
++                    dbuf_put(&s->dbuf, (const uint8_t *)blob->data,
++                             blob->len);
++                }
++                bc_put_leb128(s, b->source - blob->data);
++            } else {
++                bc_put_leb128(s, 0);
++                dbuf_put(&s->dbuf, b->source, b->source_len);
++            }
+         } else {
+             bc_put_leb128(s, 0);
+         }
+@@ -37629,6 +37735,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
+     js_object_list_end(ctx, &s->object_list);
+     js_free(ctx, s->atom_to_idx);
+     js_free(ctx, s->idx_to_atom);
++    js_free(ctx, s->src_tab);
+     *psize = s->dbuf.size;
+     if (psab_tab) {
+         psab_tab->tab = s->sab_tab;
+@@ -37645,6 +37752,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
+     js_object_list_end(ctx, &s->object_list);
+     js_free(ctx, s->atom_to_idx);
+     js_free(ctx, s->idx_to_atom);
++    js_free(ctx, s->src_tab);
+     dbuf_free(&s->dbuf);
+     *psize = 0;
+     if (psab_tab) {
+@@ -37681,6 +37789,10 @@ typedef struct BCReaderState {
+     /* used for JS_DUMP_READ_OBJECT */
+     const uint8_t *ptr_last;
+     int level;
++    /* shared script texts read so far, one hold each (VitaSurf) */
++    JSSourceBlob **src_tab;
++    int src_tab_len;
++    int src_tab_size;
+ } BCReaderState;
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+@@ -38244,15 +38356,61 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+     if (bc_get_leb128_int(s, &b->source_len))
+         goto fail;
+     if (b->source_len) {
++        int where;
++
+         bc_read_trace(s, "source: %d bytes\n", b->source_len);
+-        if (s->ptr_last)
+-            s->ptr_last += b->source_len;  // omit source code hex dump
+-        /* b->source is a UTF-8 encoded null terminated C string */
+-        b->source = js_mallocz(ctx, b->source_len + 1);
+-        if (!b->source)
+-            goto fail;
+-        if (bc_get_buf(s, b->source, b->source_len))
++        if (bc_get_leb128_int(s, &where))
+             goto fail;
++        if (where == 0) {
++            if (s->ptr_last)
++                s->ptr_last += b->source_len;  // omit source code hex dump
++            /* b->source is a UTF-8 encoded null terminated C string */
++            b->source = js_mallocz(ctx, b->source_len + 1);
++            if (!b->source)
++                goto fail;
++            if (bc_get_buf(s, b->source, b->source_len))
++                goto fail;
++        } else {
++            /* a place in a script's shared text (VitaSurf) */
++            JSSourceBlob *blob;
++            int off;
++
++            if (where == s->src_tab_len + 1) {
++                int blen;
++
++                if (bc_get_leb128_int(s, &blen))
++                    goto fail;
++                if (js_resize_array(ctx, (void **)&s->src_tab,
++                                    sizeof(s->src_tab[0]),
++                                    &s->src_tab_size, s->src_tab_len + 1))
++                    goto fail;
++                blob = js_malloc(ctx, sizeof(*blob) + blen + 1);
++                if (!blob)
++                    goto fail;
++                blob->ref_count = 1; /* the reader's hold */
++                blob->len = blen;
++                s->src_tab[s->src_tab_len++] = blob;
++                if (s->ptr_last)
++                    s->ptr_last += blen;
++                if (bc_get_buf(s, (uint8_t *)blob->data, blen))
++                    goto fail;
++                blob->data[blen] = '\0';
++            } else if (where > s->src_tab_len) {
++                JS_ThrowSyntaxError(ctx, "invalid source reference");
++                goto fail;
++            }
++            blob = s->src_tab[where - 1];
++            if (bc_get_leb128_int(s, &off))
++                goto fail;
++            if (off < 0 || off > blob->len ||
++                b->source_len > blob->len - off) {
++                JS_ThrowSyntaxError(ctx, "invalid source range");
++                goto fail;
++            }
++            blob->ref_count++;
++            b->source_blob = blob;
++            b->source = blob->data + off;
++        }
+     }
+     bc_read_trace(s, "}\n");
+ 
+@@ -38896,6 +39054,9 @@ static void bc_reader_free(BCReaderState *s)
+         js_free(s->ctx, s->idx_to_atom);
+     }
+     js_free(s->ctx, s->objects);
++    for(i = 0; i < s->src_tab_len; i++)
++        js_source_release(s->ctx->rt, s->src_tab[i], NULL);
++    js_free(s->ctx, s->src_tab);
+ }
+ 
+ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+diff --git a/quickjs.h b/quickjs.h
+index a44b456..3fb2c5d 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1414,6 +1414,10 @@ JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
+ #define QJS_VERSION_PATCH 0
+ #define QJS_VERSION_SUFFIX ""
+ 
++/* VitaSurf: functions compiled from one script share one copy of its
++   text instead of each keeping its own (see JSSourceBlob). */
++#define QJS_VITASURF_SHARED_SOURCE 1
++
+ JS_EXTERN const char* JS_GetVersion(void);
+ 
+ /* Integration point for quickjs-libc.c, not for public use. */
+diff --git a/tests/test_bjson.js b/tests/test_bjson.js
+index 353fd85..8ce70af 100644
+--- a/tests/test_bjson.js
++++ b/tests/test_bjson.js
+@@ -284,12 +284,14 @@ function bjson_test_bytecode()
+ 
+ function bjson_test_fuzz()
+ {
++    // VitaSurf: the version byte is 25 | 0x80 (0x99), "mf" in base64,
++    // for the shared source format (see BC_VERSION)
+     var corpus = [
+-        ["Gf////8QAAAAAARg"],
+-        ["Gf/////m5uaCLQ=="],
+-        ["Gf////8AEQATBgYGBgYGBgYGBgb/////EAARAC8R/78vEf+/"],
+-        ["Gf////8ACH8ACv////9//////////////////////////////9//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAA+fn5+fn5+fn5+fn5AAAAAAAGAKs="],
+-        ["Gf////8ADgAAABQA=", bjson.READ_OBJ_REFERENCE],
++        ["mf////8QAAAAAARg"],
++        ["mf/////m5uaCLQ=="],
++        ["mf////8AEQATBgYGBgYGBgYGBgb/////EAARAC8R/78vEf+/"],
++        ["mf////8ACH8ACv////9//////////////////////////////9//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAA+fn5+fn5+fn5+fn5AAAAAAAGAKs="],
++        ["mf////8ADgAAABQA=", bjson.READ_OBJ_REFERENCE],
+     ];
+     for (var [input, flags] of corpus) {
+         var buf = base64decode(input);
