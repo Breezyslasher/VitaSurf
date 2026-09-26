@@ -1701,7 +1701,10 @@ static JSValue js_ed25519_sign(JSContext *ctx, JSValueConst this_val,
 /*
  * ed25519Verify(public, signature, data) -> bool. A key or an R of small
  * order verifies nothing, as the specification now says: with one, a
- * signature can be made to pass for more than one message.
+ * signature can be made to pass for more than one message. The equation
+ * is checked cofactorless, as browsers do; Monocypher's own check
+ * multiplies by eight first and so lets a low-order part through
+ * (patches/0245 adds the cofactorless one).
  */
 static JSValue js_ed25519_verify(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
@@ -1718,7 +1721,8 @@ static JSValue js_ed25519_verify(JSContext *ctx, JSValueConst this_val,
 	}
 	ok = pub.len == 32 && sig.len == 64 &&
 	     !small_order_point(pub.p) && !small_order_point(sig.p) &&
-	     crypto_ed25519_check(sig.p, pub.p, data.p, data.len) == 0;
+	     crypto_ed25519_check_cofactorless(sig.p, pub.p, data.p,
+					      data.len) == 0;
 	return JS_NewBool(ctx, ok);
 }
 

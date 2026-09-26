@@ -1,0 +1,104 @@
+diff --git a/src/monocypher.c b/src/monocypher.c
+index c7c5450..d31dcc3 100644
+--- a/src/monocypher.c
++++ b/src/monocypher.c
+@@ -1997,8 +1997,8 @@ static int slide_step(slide_ctx *ctx, int width, int i, const u8 scalar[32])
+ #define B_W_WIDTH 5 // Affects the size of the binary
+ #define P_W_SIZE  (1<<(P_W_WIDTH-2))
+ 
+-int crypto_eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
+-                                const u8 h[32])
++static int check_equation(const u8 signature[64], const u8 public_key[32],
++                          const u8 h[32], int cofactored)
+ {
+ 	ge minus_A; // -public_key
+ 	ge minus_R; // -first_half_of_signature
+@@ -2052,18 +2052,35 @@ int crypto_eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
+ 	// Compare [8](sum-R) and the zero point
+ 	// The multiplication by 8 eliminates any low-order component
+ 	// and ensures consistency with batched verification.
++	// Without it (cofactored == 0), a low-order component makes the check
++	// fail, as in the cofactorless verification WebCrypto asks for.
+ 	ge_cached cached;
+ 	u8 check[32];
+ 	static const u8 zero_point[32] = {1}; // Point of order 1
+ 	ge_cache(&cached, &minus_R);
+ 	ge_add(sum, sum, &cached);
+-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
+-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
+-	ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
++	if (cofactored) {
++		ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
++		ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
++		ge_double(sum, sum, &minus_R); // reuse minus_R as temporary
++	}
+ 	ge_tobytes(check, sum);
+ 	return crypto_verify32(check, zero_point);
+ }
+ 
++int crypto_eddsa_check_equation(const u8 signature[64], const u8 public_key[32],
++                                const u8 h[32])
++{
++	return check_equation(signature, public_key, h, 1);
++}
++
++int crypto_eddsa_check_equation_cofactorless(const u8 signature[64],
++                                             const u8 public_key[32],
++                                             const u8 h[32])
++{
++	return check_equation(signature, public_key, h, 0);
++}
++
+ // 5-bit signed comb in cached format (Niels coordinates, Z=1)
+ static const ge_precomp b_comb_low[8] = {
+ 	{{-6816601,-2324159,-22559413,124364,18015490,
+diff --git a/src/monocypher.h b/src/monocypher.h
+index cf635e8..5d94032 100644
+--- a/src/monocypher.h
++++ b/src/monocypher.h
+@@ -240,6 +240,9 @@ void crypto_eddsa_scalarbase(uint8_t point[32], const uint8_t scalar[32]);
+ int crypto_eddsa_check_equation(const uint8_t signature[64],
+                                 const uint8_t public_key[32],
+                                 const uint8_t h_ram[32]);
++int crypto_eddsa_check_equation_cofactorless(const uint8_t signature[64],
++                                             const uint8_t public_key[32],
++                                             const uint8_t h_ram[32]);
+ 
+ 
+ // Chacha20
+diff --git a/src/optional/monocypher-ed25519.c b/src/optional/monocypher-ed25519.c
+index 4fdd076..bab85bf 100644
+--- a/src/optional/monocypher-ed25519.c
++++ b/src/optional/monocypher-ed25519.c
+@@ -480,6 +480,16 @@ int crypto_ed25519_check(const u8 signature[64], const u8 public_key[32],
+ 	return crypto_eddsa_check_equation(signature, public_key, h_ram);
+ }
+ 
++int crypto_ed25519_check_cofactorless(const u8 signature[64],
++                                      const u8 public_key[32],
++                                      const u8 *msg, size_t msg_size)
++{
++	u8 h_ram[32];
++	hash_reduce(h_ram, signature, 32, public_key, 32, msg, msg_size, 0, 0);
++	return crypto_eddsa_check_equation_cofactorless(signature, public_key,
++	                                                h_ram);
++}
++
+ static const u8 domain[34] = "SigEd25519 no Ed25519 collisions\1";
+ 
+ void crypto_ed25519_ph_sign(uint8_t signature[64], const uint8_t secret_key[64],
+diff --git a/src/optional/monocypher-ed25519.h b/src/optional/monocypher-ed25519.h
+index d7aa004..fae86ce 100644
+--- a/src/optional/monocypher-ed25519.h
++++ b/src/optional/monocypher-ed25519.h
+@@ -124,6 +124,10 @@ void crypto_ed25519_sign(uint8_t        signature [64],
+ int crypto_ed25519_check(const uint8_t  signature [64],
+                          const uint8_t  public_key[32],
+                          const uint8_t *message, size_t message_size);
++int crypto_ed25519_check_cofactorless(const uint8_t  signature [64],
++                                      const uint8_t  public_key[32],
++                                      const uint8_t *message,
++                                      size_t message_size);
+ 
+ // Pre-hash variants
+ void crypto_ed25519_ph_sign(uint8_t       signature   [64],
