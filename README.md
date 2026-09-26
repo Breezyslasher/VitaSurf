@@ -335,7 +335,10 @@ Apache-2.0 or GPL-2.0-or-later) through vdpm's `curl-mbedtls` package. The
 OpenSSL 1.1.1 port was tried first: it creates a pthread read-write lock for
 every BIO and X509 object, and on hardware those allocations started failing
 after a few hundred locks, so curl could never load the CA bundle. mbedTLS
-only needs a handful of mutexes. Add `VITASURF_DEBUG=1` to the
+only needs a handful of mutexes. `crypto.subtle` (`vita/js/subtle.c`)
+uses the same mbedTLS for hashing, AES, ECDSA, ECDH and RSA, and takes
+Ed25519 and X25519, which mbedTLS lacks, from Monocypher 4.0.3
+(`deps/monocypher`, BSD-2-Clause or CC0). Add `VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging. The JavaScript engine is chosen with
 `VITASURF_JS_ENGINE` in the environment of `build-netsurf.sh` and the

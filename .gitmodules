@@ -66,3 +66,7 @@
 	path = deps/libquickjs
 	url = https://github.com/quickjs-ng/quickjs.git
 	ignore = dirty
+[submodule "deps/monocypher"]
+	path = deps/monocypher
+	url = https://github.com/LoupVaillant/Monocypher.git
+	ignore = dirty

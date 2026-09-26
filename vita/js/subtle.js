@@ -8,8 +8,8 @@
  * or a nonce. This follows the Web Cryptography specification: the same
  * algorithms, key formats, usages and errors a browser has, for digest,
  * HMAC, AES (GCM, CBC, CTR, KW), PBKDF2, HKDF, ECDSA and ECDH on the
- * NIST curves, and RSA (PKCS#1 v1.5, PSS, OAEP). Ed25519 and X25519 are
- * not in mbedTLS and are refused as NotSupportedError.
+ * NIST curves, RSA (PKCS#1 v1.5, PSS, OAEP), and Ed25519 and X25519,
+ * which come from Monocypher because mbedTLS has no Ed25519.
  *
  * The work is done synchronously and the promise settled with it; an
  * RSA key takes seconds to generate on the Vita, and holds the page for
@@ -80,7 +80,7 @@ function randomUUID(){
 var NAMES=['SHA-1','SHA-256','SHA-384','SHA-512','HMAC','AES-GCM','AES-CBC',
  'AES-CTR','AES-KW','PBKDF2','HKDF','ECDSA','ECDH','RSASSA-PKCS1-v1_5',
  'RSA-PSS','RSA-OAEP','Ed25519','X25519'];
-var UNSUPPORTED={'Ed25519':1,'X25519':1};
+var UNSUPPORTED={};
 function canonical(name){
  var l=String(name).toUpperCase(),i;
  for(i=0;i<NAMES.length;i++)if(NAMES[i].toUpperCase()===l)return NAMES[i];
@@ -168,14 +168,29 @@ var USAGES={
  'PBKDF2':['deriveKey','deriveBits'],'HKDF':['deriveKey','deriveBits'],
  'ECDSA':['sign','verify'],'ECDH':['deriveKey','deriveBits'],
  'RSASSA-PKCS1-v1_5':['sign','verify'],'RSA-PSS':['sign','verify'],
- 'RSA-OAEP':['encrypt','decrypt','wrapKey','unwrapKey']};
+ 'RSA-OAEP':['encrypt','decrypt','wrapKey','unwrapKey'],
+ 'Ed25519':['sign','verify'],'X25519':['deriveKey','deriveBits']};
 var PUBLIC_USAGES={'ECDSA':['verify'],'ECDH':[],'RSASSA-PKCS1-v1_5':['verify'],
- 'RSA-PSS':['verify'],'RSA-OAEP':['encrypt','wrapKey']};
+ 'RSA-PSS':['verify'],'RSA-OAEP':['encrypt','wrapKey'],'Ed25519':['verify'],'X25519':[]};
 var PRIVATE_USAGES={'ECDSA':['sign'],'ECDH':['deriveKey','deriveBits'],
- 'RSASSA-PKCS1-v1_5':['sign'],'RSA-PSS':['sign'],'RSA-OAEP':['decrypt','unwrapKey']};
+ 'RSASSA-PKCS1-v1_5':['sign'],'RSA-PSS':['sign'],'RSA-OAEP':['decrypt','unwrapKey'],
+ 'Ed25519':['sign'],'X25519':['deriveKey','deriveBits']};
 function split(list,allowed){return list.filter(function(u){return allowed.indexOf(u)>=0;});}
 
 var AES={'AES-GCM':'GCM','AES-CBC':'CBC','AES-CTR':'CTR','AES-KW':'KW'};
+/* The curve 25519 algorithms: 32-byte keys, and fixed DER around them.
+   SubjectPublicKeyInfo and PKCS#8 for these are the same bytes every
+   time, but for the key, so they are matched and written as prefixes. */
+var OKP={'Ed25519':0x70,'X25519':0x6e};
+function okpSpkiHead(n){return [0x30,0x2a,0x30,0x05,0x06,0x03,0x2b,0x65,OKP[n],0x03,0x21,0x00];}
+function okpPkcs8Head(n){return [0x30,0x2e,0x02,0x01,0x00,0x30,0x05,0x06,0x03,0x2b,0x65,OKP[n],
+ 0x04,0x22,0x04,0x20];}
+function okpUnwrap(head,data){
+ var b=u8(data),i;
+ if(b.length!==head.length+32)return null;
+ for(i=0;i<head.length;i++)if(b[i]!==head[i])return null;
+ return b.slice(head.length).buffer;}
+function okpWrap(head,key){return concat(new Uint8Array(head).buffer,key);}
 var RSA={'RSASSA-PKCS1-v1_5':'RS','RSA-PSS':'PS','RSA-OAEP':'RSA-OAEP'};
 var CURVE_BYTES={'P-256':32,'P-384':48,'P-521':66};
 function curveOf(a){
@@ -199,7 +214,7 @@ function rsaAlgorithm(name,hash,spki){
 /* ---- generateKey ---- */
 function generateKey(alg,extractable,usages){
  var a=normalize(alg,['HMAC','AES-GCM','AES-CBC','AES-CTR','AES-KW','ECDSA','ECDH',
-  'RSASSA-PKCS1-v1_5','RSA-PSS','RSA-OAEP'],'generateKey');
+  'RSASSA-PKCS1-v1_5','RSA-PSS','RSA-OAEP','Ed25519','X25519'],'generateKey');
  var list=checkUsages(usages,USAGES[a.name]);
  if(AES[a.name]){
   if(a.length===undefined)throw new TypeError('Algorithm: length: Missing');
@@ -223,6 +238,14 @@ function generateKey(alg,extractable,usages){
   var algo={name:a.name,namedCurve:c};
   return {publicKey:makeKey('public',true,algo,split(list,PUBLIC_USAGES[a.name]),{curve:c,d:null,pub:kp[1]}),
    privateKey:makeKey('private',extractable,algo,priv,{curve:c,d:kp[0],pub:kp[1]})};}
+ if(OKP[a.name]){
+  var okpU=split(list,PRIVATE_USAGES[a.name]);
+  needUsages(okpU,'private');
+  var pair0=N.okpGenerate(a.name);
+  if(!pair0)throw err('Key generation failed','OperationError');
+  var oalg={name:a.name};
+  return {publicKey:makeKey('public',true,oalg,split(list,PUBLIC_USAGES[a.name]),{okp:a.name,priv:null,pub:pair0[1]}),
+   privateKey:makeKey('private',extractable,oalg,okpU,{okp:a.name,priv:pair0[0],pub:pair0[1]})};}
  /* RSA */
  if(a.modulusLength===undefined)throw new TypeError('Algorithm: modulusLength: Missing');
  var hash=hashName(a.hash),mod=enforce(a.modulusLength,ULONG,'modulusLength');
@@ -241,7 +264,8 @@ function generateKey(alg,extractable,usages){
 
 /* ---- importKey ---- */
 var JWK_USE={'HMAC':'sig','ECDSA':'sig','RSASSA-PKCS1-v1_5':'sig','RSA-PSS':'sig',
- 'AES-GCM':'enc','AES-CBC':'enc','AES-CTR':'enc','AES-KW':'enc','ECDH':'enc','RSA-OAEP':'enc'};
+ 'AES-GCM':'enc','AES-CBC':'enc','AES-CTR':'enc','AES-KW':'enc','ECDH':'enc','RSA-OAEP':'enc',
+ 'Ed25519':'sig','X25519':'enc'};
 function checkJwk(jwk,kty,extractable,list,alg,name){
  if(!jwk||typeof jwk!=='object')throw new TypeError('The JWK is not an object');
  if(jwk.kty!==kty)throw err('The JWK "kty" member was not "'+kty+'"','DataError');
@@ -260,7 +284,7 @@ function importKey(format,keyData,alg,extractable,usages){
  if(['raw','jwk','spki','pkcs8'].indexOf(format)<0)
   throw new TypeError("'"+format+"' is not a valid KeyFormat");
  var a=normalize(alg,['HMAC','AES-GCM','AES-CBC','AES-CTR','AES-KW','PBKDF2','HKDF',
-  'ECDSA','ECDH','RSASSA-PKCS1-v1_5','RSA-PSS','RSA-OAEP'],'importKey');
+  'ECDSA','ECDH','RSASSA-PKCS1-v1_5','RSA-PSS','RSA-OAEP','Ed25519','X25519'],'importKey');
  var list,data,jwk=null;
  if(format==='jwk'){jwk=keyData;
   if(!jwk||typeof jwk!=='object'||jwk instanceof ArrayBuffer||ArrayBuffer.isView(jwk))
@@ -329,6 +353,8 @@ function importKey(format,keyData,alg,extractable,usages){
   return makeKey(type,extractable,{name:a.name,namedCurve:c},list,
    {curve:c,d:d,pub:pub});}
 
+ if(OKP[a.name])return importOkp(format,data,jwk,a.name,extractable,usages);
+
  /* RSA */
  var hash=hashName(a.hash),enc,priv;
  if(format==='spki'||format==='pkcs8'){
@@ -350,6 +376,42 @@ function importKey(format,keyData,alg,extractable,usages){
  return makeKey(priv?'private':'public',extractable,rsaAlgorithm(a.name,hash,enc[1]),list,
   {pkcs8:priv?enc[0]:null,spki:enc[1]});}
 
+/*
+ * Ed25519 and X25519. The usages are checked against the kind of key the
+ * format holds before the data is looked at, as the specification orders
+ * it, so a key that is wrong in both ways is refused for its usages.
+ */
+function importOkp(format,data,jwk,name,extractable,usages){
+ var priv=null,pub,type;
+ type=format==='pkcs8'||(format==='jwk'&&jwk.d!==undefined)?'private':'public';
+ var list=checkUsages(usages,type==='private'?PRIVATE_USAGES[name]:PUBLIC_USAGES[name]);
+ if(format==='raw'){
+  if(data.byteLength!==32)throw err('The key must be 32 bytes','DataError');
+  pub=data;}
+ else if(format==='spki'){
+  pub=okpUnwrap(okpSpkiHead(name),data);
+  if(!pub)throw err('The key is not a valid '+name+' SubjectPublicKeyInfo','DataError');}
+ else if(format==='pkcs8'){
+  priv=okpUnwrap(okpPkcs8Head(name),data);
+  if(!priv)throw err('The key is not a valid '+name+' PKCS#8 key','DataError');
+  pub=N.okpPublic(name,priv);}
+ else{
+  checkJwk(jwk,'OKP',extractable,list,undefined,name);
+  if(jwk.crv!==name)throw err('The JWK "crv" member was inconsistent with that specified by the Web Crypto call','DataError');
+  /* Ed25519 takes its own name or the older EdDSA; X25519 has none */
+  if(name==='Ed25519'&&jwk.alg!==undefined&&jwk.alg!=='Ed25519'&&jwk.alg!=='EdDSA')
+   throw err('The JWK "alg" member was inconsistent with that specified by the Web Crypto call','DataError');
+  if(jwk.x===undefined)throw err('The JWK "x" member is missing','DataError');
+  pub=b64uDecode(jwk.x,'x');
+  if(pub.byteLength!==32)throw err('The JWK "x" member is the wrong length','DataError');
+  if(jwk.d!==undefined){
+   priv=b64uDecode(jwk.d,'d');
+   if(priv.byteLength!==32)throw err('The JWK "d" member is the wrong length','DataError');
+   if(!sameBytes(N.okpPublic(name,priv),pub))
+    throw err('The JWK "x" member does not belong to its "d"','DataError');}}
+ needUsages(list,type);
+ return makeKey(type,extractable,{name:name},list,{okp:name,priv:priv,pub:pub});}
+
 /* ---- exportKey ---- */
 function exportKey(format,key){
  format=String(format);
@@ -363,6 +425,16 @@ function exportKey(format,key){
   jwk={kty:'oct',k:b64uEncode(m.raw)};
   if(AES[a.name])jwk.alg='A'+a.length+AES[a.name];
   else if(a.name==='HMAC')jwk.alg='HS'+jwkHashSuffix(a.hash.name);
+ }else if(m.okp){
+  if(format==='raw'||format==='spki'){
+   if(s.type!=='public')throw err('Only a public key has the '+format+' format','InvalidAccessError');
+   return format==='raw'?m.pub.slice(0):okpWrap(okpSpkiHead(m.okp),m.pub);}
+  if(format==='pkcs8'){
+   if(s.type!=='private')throw err('Only a private key has the pkcs8 format','InvalidAccessError');
+   return okpWrap(okpPkcs8Head(m.okp),m.priv);}
+  jwk={kty:'OKP',crv:m.okp,x:b64uEncode(m.pub)};
+  if(m.okp==='Ed25519')jwk.alg='Ed25519';
+  if(m.priv)jwk.d=b64uEncode(m.priv);
  }else if(a.namedCurve){
   if(format==='raw'){if(s.type!=='public')throw err('Only a public key has the raw format','InvalidAccessError');
    return m.pub.slice(0);}
@@ -390,13 +462,16 @@ function exportKey(format,key){
 
 /* ---- sign and verify ---- */
 function signOrVerify(verify,alg,key,sig,data){
- var a=normalize(alg,['HMAC','ECDSA','RSASSA-PKCS1-v1_5','RSA-PSS'],verify?'verify':'sign');
+ var a=normalize(alg,['HMAC','ECDSA','RSASSA-PKCS1-v1_5','RSA-PSS','Ed25519'],verify?'verify':'sign');
  var s=useKey(key,a.name,verify?'verify':'sign'),m=s.m,d=bytesOf(data,'data'),r;
  if(a.name==='HMAC'){
   r=N.hmac(s.algorithm.hash.name,m.raw,d);
   if(!r)throw err('HMAC failed','OperationError');
   return verify?sameBytes(r,sig):r;}
- if(a.name==='ECDSA'){
+ if(a.name==='Ed25519'){
+  if(verify)return N.ed25519Verify(m.pub,sig,d);
+  r=N.ed25519Sign(m.priv,d);}
+ else if(a.name==='ECDSA'){
   var h=hashName(a.hash);
   if(verify)return N.ecdsaVerify(m.curve,h,m.pub,sig,d);
   r=N.ecdsaSign(m.curve,h,m.d,d);}
@@ -443,17 +518,20 @@ function cipher(enc,alg,key,data,usage){
 
 /* ---- deriveBits and deriveKey ---- */
 function deriveBits(alg,key,length,usage){
- var a=normalize(alg,['PBKDF2','HKDF','ECDH'],'deriveBits');
+ var a=normalize(alg,['PBKDF2','HKDF','ECDH','X25519'],'deriveBits');
  var s=useKey(key,a.name,usage||'deriveBits'),m=s.m,r;
- if(a.name==='ECDH'){
+ if(a.name==='ECDH'||a.name==='X25519'){
   var pub=a['public'];
   if(!pub||!SLOTS.get(pub))throw new TypeError('Algorithm: public: Not a CryptoKey');
   var ps=SLOTS.get(pub);
-  if(ps.type!=='public'||ps.algorithm.name!=='ECDH')
-   throw err('The public key is not an ECDH public key','InvalidAccessError');
+  if(ps.type!=='public')
+   throw err('The public key is not a public key','InvalidAccessError');
+  if(ps.algorithm.name!==a.name)
+   throw err('The public key is not an '+a.name+' key','InvalidAccessError');
   if(ps.algorithm.namedCurve!==s.algorithm.namedCurve)
    throw err('The keys are on different curves','InvalidAccessError');
-  r=N.ecdh(m.curve,m.d,ps.m.pub);
+  /* X25519 with a point of small order agrees on nothing: all zeroes */
+  r=a.name==='X25519'?N.x25519(m.priv,ps.m.pub):N.ecdh(m.curve,m.d,ps.m.pub);
   if(!r)throw err('Key agreement failed','OperationError');
   if(length===null||length===undefined)return r;
   length=Number(length)>>>0;

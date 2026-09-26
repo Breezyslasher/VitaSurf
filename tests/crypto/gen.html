@@ -12,6 +12,12 @@ function ec(name, curve, hash) { jobs.push(function () {
     return Promise.all([S.exportKey('spki', kp.publicKey), S.exportKey('jwk', kp.publicKey), S.exportKey('pkcs8', kp.privateKey), S.exportKey('jwk', kp.privateKey), S.exportKey('raw', kp.publicKey),
       name === 'ECDSA' ? S.sign({ name: 'ECDSA', hash: hash }, kp.privateKey, msg) : Promise.resolve(null)]).then(function (v) {
       r.spki = b64(v[0]); r.pubJwk = v[1]; r.pkcs8 = b64(v[2]); r.privJwk = v[3]; r.raw = b64(v[4]); if (v[5]) r.sig = b64(v[5]); }); }); }); }
+function okp(name) { jobs.push(function () {
+  return S.generateKey(name, true, name === 'Ed25519' ? ['sign', 'verify'] : ['deriveBits']).then(function (kp) {
+    var r = R[name] = { name: name, okp: true };
+    return Promise.all([S.exportKey('spki', kp.publicKey), S.exportKey('jwk', kp.publicKey), S.exportKey('pkcs8', kp.privateKey), S.exportKey('jwk', kp.privateKey), S.exportKey('raw', kp.publicKey),
+      name === 'Ed25519' ? S.sign(name, kp.privateKey, msg) : Promise.resolve(null)]).then(function (v) {
+      r.spki = b64(v[0]); r.pubJwk = v[1]; r.pkcs8 = b64(v[2]); r.privJwk = v[3]; r.raw = b64(v[4]); if (v[5]) r.sig = b64(v[5]); }); }); }); }
 function rsa(name, hash, extra) { jobs.push(function () {
   return S.generateKey({ name: name, modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: hash }, true, name === 'RSA-OAEP' ? ['encrypt', 'decrypt'] : ['sign', 'verify']).then(function (kp) {
     var id = name + ' ' + hash, r = R[id] = { name: name, hash: hash, extra: extra };
@@ -20,7 +26,7 @@ function rsa(name, hash, extra) { jobs.push(function () {
     return Promise.all([S.exportKey('spki', kp.publicKey), S.exportKey('jwk', kp.publicKey), S.exportKey('pkcs8', kp.privateKey), S.exportKey('jwk', kp.privateKey), op]).then(function (v) {
       r.spki = b64(v[0]); r.pubJwk = v[1]; r.pkcs8 = b64(v[2]); r.privJwk = v[3]; r.out = b64(v[4]); r.alg = kp.publicKey.algorithm.modulusLength + ' ' + Array.from(kp.publicKey.algorithm.publicExponent).join(','); }); }); }); }
 ec('ECDSA', 'P-256', 'SHA-256'); ec('ECDSA', 'P-384', 'SHA-384'); ec('ECDSA', 'P-521', 'SHA-512'); ec('ECDSA', 'P-256', 'SHA-1');
-ec('ECDH', 'P-256'); ec('ECDH', 'P-384'); ec('ECDH', 'P-521');
+ec('ECDH', 'P-256'); ec('ECDH', 'P-384'); ec('ECDH', 'P-521'); okp('Ed25519'); okp('X25519');
 rsa('RSASSA-PKCS1-v1_5', 'SHA-256'); rsa('RSASSA-PKCS1-v1_5', 'SHA-1'); rsa('RSA-PSS', 'SHA-256', 32); rsa('RSA-PSS', 'SHA-512', 0);
 rsa('RSA-OAEP', 'SHA-256'); rsa('RSA-OAEP', 'SHA-1', 'a label');
 jobs.reduce(function (p, f) { return p.then(f); }, Promise.resolve()).then(function () {

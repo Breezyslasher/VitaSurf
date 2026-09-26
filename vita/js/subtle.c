@@ -51,6 +51,9 @@
 #include <mbedtls/pkcs5.h>
 #include <mbedtls/rsa.h>
 
+#include "monocypher.h"
+#include "monocypher-ed25519.h"
+
 #include "subtle.h"
 
 /* ------------------------------------------------------------------------ */
@@ -1545,6 +1548,215 @@ static JSValue js_rsa_oaep(JSContext *ctx, JSValueConst this_val,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Ed25519 and X25519, from Monocypher                                      */
+
+/*
+ * mbedTLS has no Ed25519, so both of the curve 25519 algorithms come from
+ * Monocypher (BSD-2-Clause or CC0), which has both. Keys travel as their
+ * 32-byte private and public halves.
+ */
+
+static bool okp_kind(JSContext *ctx, JSValueConst v, bool *ed)
+{
+	const char *s = JS_ToCString(ctx, v);
+	bool ok = true;
+
+	if (s == NULL) {
+		return false;
+	}
+	if (strcmp(s, "Ed25519") == 0) {
+		*ed = true;
+	} else if (strcmp(s, "X25519") == 0) {
+		*ed = false;
+	} else {
+		ok = false;
+	}
+	JS_FreeCString(ctx, s);
+	return ok;
+}
+
+/** The public half of a private key. */
+static void okp_public(bool ed, const uint8_t priv[32], uint8_t pub[32])
+{
+	if (ed) {
+		uint8_t seed[32], sk[64];
+
+		/* the key pair function wipes the seed it is given */
+		memcpy(seed, priv, 32);
+		crypto_ed25519_key_pair(sk, pub, seed);
+		crypto_wipe(sk, sizeof(sk));
+	} else {
+		crypto_x25519_public_key(pub, priv);
+	}
+}
+
+/* okpGenerate(kind) -> [private, public] */
+static JSValue js_okp_generate(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	mbedtls_ctr_drbg_context *g = rng();
+	uint8_t priv[32], pub[32];
+	bool ed;
+	JSValue r;
+
+	(void)this_val;
+	(void)argc;
+	if (!okp_kind(ctx, argv[0], &ed) || g == NULL ||
+	    mbedtls_ctr_drbg_random(g, priv, sizeof(priv)) != 0) {
+		return JS_NULL;
+	}
+	okp_public(ed, priv, pub);
+	r = JS_NewArray(ctx);
+	JS_SetPropertyUint32(ctx, r, 0, buffer(ctx, priv, 32));
+	JS_SetPropertyUint32(ctx, r, 1, buffer(ctx, pub, 32));
+	crypto_wipe(priv, sizeof(priv));
+	return r;
+}
+
+/* okpPublic(kind, private) -> public */
+static JSValue js_okp_public(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	struct bytes priv;
+	uint8_t pub[32];
+	bool ed;
+
+	(void)this_val;
+	(void)argc;
+	if (arg_bytes(ctx, argv[1], &priv) != 0) {
+		return JS_EXCEPTION;
+	}
+	if (!okp_kind(ctx, argv[0], &ed) || priv.len != 32) {
+		return JS_NULL;
+	}
+	okp_public(ed, priv.p, pub);
+	return buffer(ctx, pub, 32);
+}
+
+/*
+ * The encodings of the eight points of small order on Ed25519, with the
+ * sign bit left out, including the two non-canonical ones (p and p + 1).
+ * Worked out from the curve: every multiple of a point of order eight.
+ */
+static const uint8_t small_order[7][32] = {
+	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+	{ 0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4,
+	  0x89, 0xf2, 0xef, 0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6,
+	  0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05 },
+	{ 0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b,
+	  0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39,
+	  0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a },
+	{ 0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f },
+	{ 0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f },
+	{ 0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	  0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f },
+};
+
+static bool small_order_point(const uint8_t *enc)
+{
+	int i;
+
+	for (i = 0; i < 7; i++) {
+		if (memcmp(enc, small_order[i], 31) == 0 &&
+		    (enc[31] & 0x7f) == small_order[i][31]) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* ed25519Sign(private, data) -> signature */
+static JSValue js_ed25519_sign(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	struct bytes priv, data;
+	uint8_t seed[32], sk[64], pub[32], sig[64];
+
+	(void)this_val;
+	(void)argc;
+	if (arg_bytes(ctx, argv[0], &priv) != 0 ||
+	    arg_bytes(ctx, argv[1], &data) != 0) {
+		return JS_EXCEPTION;
+	}
+	if (priv.len != 32) {
+		return JS_NULL;
+	}
+	memcpy(seed, priv.p, 32);
+	crypto_ed25519_key_pair(sk, pub, seed);
+	crypto_ed25519_sign(sig, sk, data.p, data.len);
+	crypto_wipe(sk, sizeof(sk));
+	return buffer(ctx, sig, 64);
+}
+
+/*
+ * ed25519Verify(public, signature, data) -> bool. A key or an R of small
+ * order verifies nothing, as the specification now says: with one, a
+ * signature can be made to pass for more than one message.
+ */
+static JSValue js_ed25519_verify(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	struct bytes pub, sig, data;
+	bool ok;
+
+	(void)this_val;
+	(void)argc;
+	if (arg_bytes(ctx, argv[0], &pub) != 0 ||
+	    arg_bytes(ctx, argv[1], &sig) != 0 ||
+	    arg_bytes(ctx, argv[2], &data) != 0) {
+		return JS_EXCEPTION;
+	}
+	ok = pub.len == 32 && sig.len == 64 &&
+	     !small_order_point(pub.p) && !small_order_point(sig.p) &&
+	     crypto_ed25519_check(sig.p, pub.p, data.p, data.len) == 0;
+	return JS_NewBool(ctx, ok);
+}
+
+/*
+ * x25519(private, peerPublic) -> the shared secret, or null when it is
+ * all zeroes: the peer gave a point of small order, and the result says
+ * nothing secret.
+ */
+static JSValue js_x25519(JSContext *ctx, JSValueConst this_val,
+			 int argc, JSValueConst *argv)
+{
+	struct bytes priv, pub;
+	uint8_t shared[32], any = 0;
+	JSValue r;
+	int i;
+
+	(void)this_val;
+	(void)argc;
+	if (arg_bytes(ctx, argv[0], &priv) != 0 ||
+	    arg_bytes(ctx, argv[1], &pub) != 0) {
+		return JS_EXCEPTION;
+	}
+	if (priv.len != 32 || pub.len != 32) {
+		return JS_NULL;
+	}
+	crypto_x25519(shared, priv.p, pub.p);
+	for (i = 0; i < 32; i++) {
+		any |= shared[i];
+	}
+	if (any == 0) {
+		return JS_NULL;
+	}
+	r = buffer(ctx, shared, 32);
+	crypto_wipe(shared, sizeof(shared));
+	return r;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Registration                                                             */
 
 static const JSCFunctionListEntry subtle_funcs[] = {
@@ -1572,6 +1784,11 @@ static const JSCFunctionListEntry subtle_funcs[] = {
 	JS_CFUNC_DEF("rsaSign", 5, js_rsa_sign),
 	JS_CFUNC_DEF("rsaVerify", 6, js_rsa_verify),
 	JS_CFUNC_DEF("rsaOaep", 5, js_rsa_oaep),
+	JS_CFUNC_DEF("okpGenerate", 1, js_okp_generate),
+	JS_CFUNC_DEF("okpPublic", 2, js_okp_public),
+	JS_CFUNC_DEF("ed25519Sign", 2, js_ed25519_sign),
+	JS_CFUNC_DEF("ed25519Verify", 3, js_ed25519_verify),
+	JS_CFUNC_DEF("x25519", 2, js_x25519),
 };
 
 void vita_subtle_register(JSContext *ctx, JSValueConst global)

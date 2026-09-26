@@ -83,6 +83,38 @@ steps.push(function () { return S.importKey('jwk', pubJwk, { name: 'ECDSA', name
 steps.push(function () { return Promise.all([S.importKey('jwk', ecJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']),
   S.importKey('jwk', { kty: 'EC', crv: 'P-256', x: 'gI0GAILBdu7T53akrFmMyGcsF3n5dO7MmwNBHKW5SV0', y: 'SLW_xSffzlPWrHEVI30DHM_4egVwt3NQqeUD7nMFpps' }, { name: 'ECDH', namedCurve: 'P-256' }, true, [])]).then(function (ks) {
   return Promise.all([run('ecdh bits', S.deriveBits({ name: 'ECDH', public: ks[1] }, ks[0], 256)), run('ecdh null', S.deriveBits({ name: 'ECDH', public: ks[1] }, ks[0], null)), run('ecdh 100', S.deriveBits({ name: 'ECDH', public: ks[1] }, ks[0], 100))]); }); });
+// Ed25519, RFC 8032 section 7.1 tests 1 and 2, and X25519, RFC 7748
+// section 6.1; the private keys go in as PKCS#8, raw is public only
+var okp8 = { 'Ed25519': '302e020100300506032b657004220420', 'X25519': '302e020100300506032b656e04220420' };
+function okpPriv(name, seed, usages) { return S.importKey('pkcs8', unhex(okp8[name] + seed), name, true, usages); }
+[['1', '9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60', 'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a', ''],
+ ['2', '4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb', '3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c', '72']].forEach(function (t) {
+  steps.push(function () { return Promise.all([okpPriv('Ed25519', t[1], ['sign']), S.importKey('raw', unhex(t[2]), { name: 'Ed25519' }, true, ['verify'])]).then(function (ks) {
+    var msg = unhex(t[3]);
+    return S.sign('Ed25519', ks[0], msg).then(function (sig) { out('ed25519 rfc8032 #' + t[0], hex(sig)); var bad = new Uint8Array(sig.slice(0)); bad[0] ^= 1;
+      return Promise.all([run('ed25519 verify #' + t[0], S.verify('Ed25519', ks[1], sig, msg)), run('ed25519 verify flipped #' + t[0], S.verify('Ed25519', ks[1], bad, msg)),
+        run('ed25519 verify short #' + t[0], S.verify('Ed25519', ks[1], sig.slice(1), msg)), run('ed25519 priv jwk #' + t[0], S.exportKey('jwk', ks[0])),
+        run('ed25519 pkcs8 #' + t[0], S.exportKey('pkcs8', ks[0])), run('ed25519 spki #' + t[0], S.exportKey('spki', ks[1])), run('ed25519 pub jwk #' + t[0], S.exportKey('jwk', ks[1])),
+        run('ed25519 alg #' + t[0], Promise.resolve(ks[0].algorithm.name + ' ' + ks[0].type + ' ' + ks[0].usages.join(',') + ' / ' + ks[1].algorithm.name + ' ' + ks[1].type + ' ' + ks[1].usages.join(',')))]); }); }); });
+});
+steps.push(function () { var d = 'nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A', x = '11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo';
+  return Promise.all([run('ed25519 jwk import', S.importKey('jwk', { kty: 'OKP', crv: 'Ed25519', d: d, x: x }, 'Ed25519', true, ['sign']).then(function (k) { return S.exportKey('pkcs8', k); })),
+    run('ed25519 jwk wrong x', S.importKey('jwk', { kty: 'OKP', crv: 'Ed25519', d: d, x: 'PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw' }, 'Ed25519', true, ['sign'])),
+    run('ed25519 jwk wrong crv', S.importKey('jwk', { kty: 'OKP', crv: 'X25519', x: x }, 'Ed25519', true, ['verify'])),
+    run('ed25519 jwk wrong kty', S.importKey('jwk', { kty: 'EC', crv: 'Ed25519', x: x }, 'Ed25519', true, ['verify'])),
+    run('ed25519 raw 31', S.importKey('raw', new Uint8Array(31), 'Ed25519', true, ['verify'])),
+    run('ed25519 raw sign usage', S.importKey('raw', unhex('d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a'), 'Ed25519', true, ['sign'])),
+    run('ed25519 derive usage', S.generateKey('Ed25519', true, ['deriveBits']))]); });
+steps.push(function () { return Promise.all([okpPriv('X25519', '77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a', ['deriveBits', 'deriveKey']),
+  S.importKey('raw', unhex('de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f'), 'X25519', true, []),
+  S.importKey('raw', new Uint8Array(32), 'X25519', true, [])]).then(function (ks) {
+  return Promise.all([run('x25519 rfc7748', S.deriveBits({ name: 'X25519', public: ks[1] }, ks[0], 256)), run('x25519 null', S.deriveBits({ name: 'X25519', public: ks[1] }, ks[0], null)),
+    run('x25519 128', S.deriveBits({ name: 'X25519', public: ks[1] }, ks[0], 128)), run('x25519 264', S.deriveBits({ name: 'X25519', public: ks[1] }, ks[0], 264)),
+    run('x25519 zero point', S.deriveBits({ name: 'X25519', public: ks[2] }, ks[0], 256)),
+    run('x25519 derived aes', S.deriveKey({ name: 'X25519', public: ks[1] }, ks[0], { name: 'AES-GCM', length: 128 }, true, ['encrypt']).then(function (k) { return S.exportKey('raw', k); })),
+    run('x25519 priv jwk', S.exportKey('jwk', ks[0])), run('x25519 spki', S.exportKey('spki', ks[1])), run('x25519 pub jwk', S.exportKey('jwk', ks[1])),
+    run('x25519 public derive usage', S.importKey('raw', unhex('de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f'), 'X25519', true, ['deriveBits'])),
+    run('x25519 as ed25519 public', S.deriveBits({ name: 'X25519', public: ks[0] }, ks[0], 256))]); }); });
 // errors
 steps.push(function () { return Promise.all([run('no args', S.digest()), run('bad alg', S.encrypt('FOO', null, abc)), run('ed25519', S.generateKey('Ed25519', true, ['sign'])),
   run('empty usages', S.generateKey({ name: 'AES-GCM', length: 128 }, true, [])), run('bad usage', S.generateKey({ name: 'AES-GCM', length: 128 }, true, ['sign'])),

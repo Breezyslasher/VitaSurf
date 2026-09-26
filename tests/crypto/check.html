@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <!-- Verifies what gen.html printed in another browser: imports every key
-     in every format, checks the signatures, decrypts, agrees ECDH secrets,
-     and exports again to compare. vec.js sets window.VEC. -->
+     in every format, checks the signatures, decrypts, agrees ECDH and X25519
+     secrets, and exports again to compare. vec.js sets window.VEC. -->
 <html><head><title>check</title><script src="vec.js"></script></head><body><script>
 var S = crypto.subtle, te = new TextEncoder(), msg = te.encode('the message VitaSurf signs');
 function ub(s) { var b = atob(s), a = new Uint8Array(b.length); for (var i = 0; i < a.length; i++) a[i] = b.charCodeAt(i); return a; }
@@ -10,9 +10,11 @@ function same(a, b) { a = new Uint8Array(a); b = new Uint8Array(b); if (a.length
 function jsonSame(a, b) { var ka = Object.keys(a).filter(function (k) { return k !== 'key_ops' && k !== 'ext'; }).sort(); return ka.every(function (k) { return a[k] === b[k]; }) && ka.length === Object.keys(b).filter(function (k) { return k !== 'key_ops' && k !== 'ext'; }).length; }
 var jobs = [];
 Object.keys(VEC).forEach(function (id) { var r = VEC[id]; jobs.push(function () {
-  var isEc = !!r.curve, alg = isEc ? { name: r.name, namedCurve: r.curve } : { name: r.name, hash: r.hash };
-  var pubU = r.name === 'ECDSA' ? ['verify'] : r.name === 'ECDH' ? [] : r.name === 'RSA-OAEP' ? ['encrypt'] : ['verify'];
-  var privU = r.name === 'ECDSA' ? ['sign'] : r.name === 'ECDH' ? ['deriveBits'] : r.name === 'RSA-OAEP' ? ['decrypt'] : ['sign'];
+  var isEc = !!r.curve || !!r.okp, alg = r.okp ? { name: r.name } : r.curve ? { name: r.name, namedCurve: r.curve } : { name: r.name, hash: r.hash };
+  var signer = r.name === 'ECDSA' || r.name === 'Ed25519', agree = r.name === 'ECDH' || r.name === 'X25519';
+  var sa = r.name === 'ECDSA' ? { name: 'ECDSA', hash: r.hash } : r.name === 'RSA-PSS' ? { name: r.name, saltLength: r.extra } : r.name;
+  var pubU = agree ? [] : r.name === 'RSA-OAEP' ? ['encrypt'] : ['verify'];
+  var privU = agree ? ['deriveBits'] : r.name === 'RSA-OAEP' ? ['decrypt'] : ['sign'];
   return Promise.all([S.importKey('spki', ub(r.spki), alg, true, pubU), S.importKey('jwk', r.pubJwk, alg, true, pubU),
     S.importKey('pkcs8', ub(r.pkcs8), alg, true, privU), S.importKey('jwk', r.privJwk, alg, true, privU),
     isEc ? S.importKey('raw', ub(r.raw), alg, true, pubU) : Promise.resolve(null)]).then(function (k) {
@@ -21,17 +23,16 @@ Object.keys(VEC).forEach(function (id) { var r = VEC[id]; jobs.push(function () 
     checks.push(S.exportKey('jwk', k[2]).then(function (x) { ok(id + ': private jwk from pkcs8 is the same jwk', jsonSame(x, r.privJwk)); }));
     checks.push(S.exportKey('jwk', k[0]).then(function (x) { ok(id + ': public jwk from spki is the same jwk', jsonSame(x, r.pubJwk)); }));
     if (!isEc) ok(id + ': algorithm ' + r.alg, k[0].algorithm.modulusLength + ' ' + Array.from(k[0].algorithm.publicExponent).join(',') === r.alg && k[0].algorithm.hash.name === r.hash);
-    if (r.name === 'ECDSA') {
-      checks.push(S.verify({ name: 'ECDSA', hash: r.hash }, k[0], ub(r.sig), msg).then(function (v) { ok(id + ': their signature verifies', v); }));
-      checks.push(S.verify({ name: 'ECDSA', hash: r.hash }, k[4], ub(r.sig), te.encode('another message')).then(function (v) { ok(id + ': not for another message', !v); }));
-      checks.push(S.sign({ name: 'ECDSA', hash: r.hash }, k[3], msg).then(function (s) { return S.verify({ name: 'ECDSA', hash: r.hash }, k[1], s, msg); }).then(function (v) { ok(id + ': our signature with their key verifies', v); }));
+    if (signer) {
+      checks.push(S.verify(sa, k[0], ub(r.sig), msg).then(function (v) { ok(id + ': their signature verifies', v); }));
+      checks.push(S.verify(sa, k[4], ub(r.sig), te.encode('another message')).then(function (v) { ok(id + ': not for another message', !v); }));
+      checks.push(S.sign(sa, k[3], msg).then(function (s) { return S.verify(sa, k[1], s, msg); }).then(function (v) { ok(id + ': our signature with their key verifies', v); }));
     }
-    if (r.name === 'ECDH') {
+    if (agree) {
       checks.push(S.generateKey(alg, true, ['deriveBits']).then(function (mine) {
-        return Promise.all([S.deriveBits({ name: 'ECDH', public: k[0] }, mine.privateKey, null), S.deriveBits({ name: 'ECDH', public: mine.publicKey }, k[2], null)]); }).then(function (z) { ok(id + ': both sides agree', same(z[0], z[1])); }));
+        return Promise.all([S.deriveBits({ name: r.name, public: k[0] }, mine.privateKey, null), S.deriveBits({ name: r.name, public: mine.publicKey }, k[2], null)]); }).then(function (z) { ok(id + ': both sides agree', same(z[0], z[1])); }));
     }
     if (r.name === 'RSASSA-PKCS1-v1_5' || r.name === 'RSA-PSS') {
-      var sa = r.name === 'RSA-PSS' ? { name: r.name, saltLength: r.extra } : r.name;
       checks.push(S.verify(sa, k[0], ub(r.out), msg).then(function (v) { ok(id + ': their signature verifies', v); }));
       checks.push(S.verify(sa, k[1], ub(r.out), te.encode('x')).then(function (v) { ok(id + ': not for another message', !v); }));
       checks.push(S.sign(sa, k[2], msg).then(function (s) { return S.verify(sa, k[0], s, msg); }).then(function (v) { ok(id + ': our signature with their key verifies', v); }));

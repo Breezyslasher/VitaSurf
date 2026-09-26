@@ -140,8 +140,14 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # engine hands over as flattened paths
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
         vita/js/canvas.c vita/js/subtle.c)
+    # subtle.c takes Ed25519 and X25519 from Monocypher, which mbedTLS
+    # does not have
+    target_sources(${PROJECT_NAME} PRIVATE
+        deps/monocypher/src/monocypher.c
+        deps/monocypher/src/optional/monocypher-ed25519.c)
     target_include_directories(${PROJECT_NAME} PRIVATE
-        "${CMAKE_BINARY_DIR}/generated" vita/js)
+        "${CMAKE_BINARY_DIR}/generated" vita/js
+        deps/monocypher/src deps/monocypher/src/optional)
     # canvas.c draws text with the glyphs the framebuffer frontend's font
     # engine has, so it needs FreeType's headers. NetSurf asks pkg-config
     # for them; here the sysroot is searched directly, because which of
