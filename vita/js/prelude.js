@@ -3167,24 +3167,30 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   '__vitaFrameElement','__vitaEntryGlobal'].forEach(function(k){delete W[k];});
  function call(f,a){try{return f?f(a):null;}catch(e){return null;}}
  /* origins, as keys to compare: a file page's is the scheme, as the
-    frames of a local page are one site; an about: page has its maker's */
+    frames of a local page are one site; about:blank and about:srcdoc
+    have their maker's. Any other about: page is one of NetSurf's own,
+    such as the error page a failed load leaves in a frame, and is
+    opaque: a browser's error page is no site's either. */
  function hrefOf(g){try{return String(g.location.href);}catch(e){return '';}}
+ function inherits(h){return /^about:(blank|srcdoc)([?#]|$)/i.test(h);}
  function keyOfHref(h){
+  if(/^about:/i.test(h))return 'opaque '+h;
   try{var u=new URL(h);return u.protocol==='file:'?'file:':u.origin;}
   catch(e){return 'null';}}
  function myKey(){
   var h=hrefOf(W),p;
-  if(/^about:/i.test(h)&&(p=call(NP))){
-   var ph=hrefOf(p);return /^about:/i.test(ph)?'null':keyOfHref(ph);}
+  if(inherits(h)&&(p=call(NP))){
+   var ph=hrefOf(p);return inherits(ph)?'null':keyOfHref(ph);}
   return keyOfHref(h);}
  function keyOf(g){
   if(g===W)return myKey();
   var h=hrefOf(g);
-  return /^about:/i.test(h)?myKey():keyOfHref(h);}
+  return inherits(h)?myKey():keyOfHref(h);}
  /* what event.origin says for a window */
  function originOf(g){
   var h=g===W?hrefOf(W):hrefOf(g),p;
-  if(/^about:/i.test(h)){
+  if(/^about:/i.test(h)&&!inherits(h))return 'null';
+  if(inherits(h)){
    if(g!==W)return originOf(W);
    p=call(NP);return p?originOf(p):'null';}
   try{return new URL(h).origin;}catch(e){return 'null';}}
