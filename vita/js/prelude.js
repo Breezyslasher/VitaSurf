@@ -644,7 +644,7 @@ function asciiLower(t){
    var t=this.tagName;
    return t?asciiLower(t):'';}
   return this.nodeType===1?asciiLower(v):v;}});})();
-Object.defineProperty(P,'baseURI',{configurable:true,get:function(){return location.href;}});
+Object.defineProperty(P,'baseURI',{configurable:true,get:function(){return D.baseURI;}});
 Object.defineProperty(P,'assignedSlot',{configurable:true,get:function(){return null;}});
 Object.defineProperty(P,'slot',{configurable:true,get:function(){var v=this.getAttribute('slot');return v===null?'':v;},set:function(v){this.setAttribute('slot',String(v));}});
 /* Turn each argument into a node: a string becomes a text node. */
@@ -1246,11 +1246,69 @@ Object.defineProperty(D,'baseURI',{configurable:true,get:function(){
  var b=D.getElementsByTagName('base');
  for(var i=0;i<b.length;i++){var h=b[i].getAttribute('href');
   if(h){try{return new URL(h,location.href).href;}catch(e){}}}
- return location.href;
+ /* the document's own base: a srcdoc or blank frame's is its parent's */
+ var n=W.__vitaDocBase?W.__vitaDocBase():'';
+ return n||location.href;
 }});
 Object.defineProperty(D,'URL',{configurable:true,get:function(){return location.href;}});Object.defineProperty(D,'documentURI',{configurable:true,get:function(){return location.href;}});
 Object.defineProperty(D,'activeElement',{configurable:true,get:function(){return D.body;}});
 /* createComment is a real comment node from qjs.c now. */D.write=D.writeln=function(){};
+/* document.open, write and close on a document that is not being parsed
+   (VitaSurf): what a page does to fill a blank iframe. What is written
+   is kept until close, or the next task, then parsed into the document,
+   and its scripts run as a browser runs written ones. A write from the
+   document's own script while it is still being parsed belongs in the
+   parser's input, which is not supported: it does nothing, as before. */
+(function(){
+ var buf=null,pending=false;
+ function parsing(){
+  var s=D.readyState==='loading'?D.currentScript:null;
+  return !!s&&s.ownerDocument===D;}
+ function clear(el){while(el&&el.firstChild)el.removeChild(el.firstChild);}
+ function attrs(from,to){
+  if(!from||!to)return;
+  Array.prototype.slice.call(to.attributes).forEach(function(a){
+   to.removeAttribute(a.name);});
+  Array.prototype.slice.call(from.attributes).forEach(function(a){
+   to.setAttribute(a.name,a.value);});}
+ function live(el){
+  Array.prototype.slice.call(el.getElementsByTagName('script')).forEach(
+   function(old){
+    var n=D.createElement('script');
+    Array.prototype.slice.call(old.attributes).forEach(function(a){
+     n.setAttribute(a.name,a.value);});
+    n.textContent=old.textContent;
+    /* insertBefore runs an inserted script; replaceChild does not */
+    if(old.parentNode){old.parentNode.insertBefore(n,old);
+     old.parentNode.removeChild(old);}});}
+ function flush(){
+  var src=buf,p;
+  buf=null;
+  if(src===null)return;
+  p=W.__vitaParseDocument?W.__vitaParseDocument(src):null;
+  if(!p||!D.documentElement)return;
+  attrs(p.documentElement,D.documentElement);
+  if(D.head){D.head.innerHTML=p.head?p.head.innerHTML:'';}
+  if(D.body){attrs(p.body,D.body);D.body.innerHTML=p.body?p.body.innerHTML:'';}
+  if(D.head)live(D.head);
+  if(D.body)live(D.body);}
+ D.open=function(){
+  /* the three-argument form is window.open */
+  if(arguments.length>2)return W.open.apply(W,arguments);
+  if(parsing())return D;
+  buf='';
+  clear(D.head);clear(D.body);
+  return D;};
+ D.write=function(){
+  var i;
+  if(buf===null){if(parsing())return;D.open();}
+  for(i=0;i<arguments.length;i++)buf+=String(arguments[i]);
+  if(!pending){pending=true;
+   setTimeout(function(){pending=false;flush();},0);}};
+ D.writeln=function(){
+  D.write.apply(D,Array.prototype.slice.call(arguments).concat(['\n']));};
+ D.close=function(){flush();};
+})();
 D.getElementsByName=function(n){return D.querySelectorAll('[name='+n+']').filter(function(e){return e.getAttribute('name')===n;});};
 D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};
 ['onload','onreadystatechange','onclick','onkeydown','onkeyup','onmousemove','ontouchstart'].forEach(function(h){Object.defineProperty(D,h,{configurable:true,get:function(){return D['__'+h]||null;},set:function(f){D['__'+h]=f;if(typeof f==='function')D.addEventListener(h.slice(2),f);}});});
@@ -3162,10 +3220,33 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
  */
 (function(){
  var NF=W.__vitaFrameGlobal,NP=W.__vitaParentGlobal,NT=W.__vitaTopGlobal,
-  NE=W.__vitaFrameElement,NX=W.__vitaEntryGlobal;
+  NE=W.__vitaFrameElement,NX=W.__vitaEntryGlobal,NS=W.__vitaFrameStart;
  ['__vitaFrameGlobal','__vitaParentGlobal','__vitaTopGlobal',
-  '__vitaFrameElement','__vitaEntryGlobal'].forEach(function(k){delete W[k];});
+  '__vitaFrameElement','__vitaEntryGlobal','__vitaFrameStart'].forEach(
+  function(k){delete W[k];});
  function call(f,a){try{return f?f(a):null;}catch(e){return null;}}
+ /* an iframe's page, its window made now if layout has not made it: a
+    blank or srcdoc-less frame has its document at once, as in a browser,
+    and anything else starts loading sooner */
+ function frameGlobal(el){
+  var g=call(NF,el);
+  return g||el.tagName!=='IFRAME'?g:call(NS,el);}
+ /* a new src or srcdoc navigates the frame at once, as in a browser */
+ Object.defineProperty(P,'srcdoc',{configurable:true,
+  get:function(){
+   if(this.tagName!=='IFRAME')return undefined;
+   var v=this.getAttribute('srcdoc');return v===null?'':v;},
+  set:function(v){
+   if(this.tagName!=='IFRAME'){Object.defineProperty(this,'srcdoc',
+    {value:v,writable:true,configurable:true,enumerable:true});return;}
+   this.setAttribute('srcdoc',String(v));}});
+ ['setAttribute','removeAttribute'].forEach(function(m){
+  var orig=P[m];
+  P[m]=function(n){
+   var r=orig.apply(this,arguments);
+   if(this.tagName==='IFRAME'&&/^src(doc)?$/i.test(String(n))&&
+      this.isConnected)call(NS,this);
+   return r;};});
  /* origins, as keys to compare: a file page's is the scheme, as the
     frames of a local page are one site; about:blank and about:srcdoc
     have their maker's. Any other about: page is one of NetSurf's own,
@@ -3341,12 +3422,12 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
  Object.defineProperty(P,'contentWindow',{configurable:true,get:function(){
   if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
   if(!this.isConnected)return null;
-  var g=call(NF,this);
+  var g=frameGlobal(this);
   return g?view(g):frameWindow(this);}});
  Object.defineProperty(P,'contentDocument',{configurable:true,get:function(){
   if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
   if(!this.isConnected)return null;
-  var g=call(NF,this);
+  var g=frameGlobal(this);
   if(g)return keyOf(g)===myKey()?g.document:null;
   if(!sameOrigin(this))return null;
   return frameWindow(this).document;}});
@@ -3909,9 +3990,15 @@ W.closed=false;
 W.name=W.name||'';
 W.status='';
 W.external={AddSearchProvider:function(){},IsSearchProviderInstalled:function(){return false;}};
+/* about:blank and about:srcdoc have the origin of the page that made
+   them, which for a frame is its parent */
+function inheritsOrigin(){
+ return /^about:(blank|srcdoc)$/i.test(String(location.href))&&W.parent!==W;}
 Object.defineProperty(W,'origin',{configurable:true,get:function(){
+ if(inheritsOrigin()){try{return W.parent.origin;}catch(e){return 'null';}}
  try{return new URL(location.href).origin;}catch(e){return 'null';}}});
 Object.defineProperty(W,'isSecureContext',{configurable:true,get:function(){
+ if(inheritsOrigin()){try{return W.parent.isSecureContext;}catch(e){return false;}}
  return String(location.href).indexOf('https:')===0;}});
 W.crossOriginIsolated=false;
 W.originAgentCluster=false;

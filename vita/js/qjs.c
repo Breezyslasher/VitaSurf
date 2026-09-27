@@ -48,6 +48,7 @@
 #include "content/handlers/javascript/js.h"
 #include "content/handlers/javascript/content.h"
 #include "desktop/browser_private.h"
+#include "desktop/frames.h"
 
 #include <dom/dom.h>
 #include <dom/bindings/hubbub/parser.h>
@@ -161,6 +162,8 @@ struct jsthread {
 	JSContext *ctx;
 	struct browser_window *win;
 	html_content *htmlc;
+	unsigned frames_logged;   /**< frame pages this page made, logged */
+	bool frame_cap_said;      /**< the frame cap has been logged */
 	uint64_t deadline_ms;     /**< when the running script must stop */
 	/*
 	 * How the running script's overrun has been reported. QuickJS
@@ -1029,6 +1032,7 @@ static dom_string *to_dom_string_len(const char *s, size_t len)
  * reference to the same node.
  */
 
+static const char *shown_url(const char *url);
 static struct dom_document *thread_document(jsthread *thread);
 
 static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
@@ -4222,6 +4226,121 @@ static JSValue win_vita_frame_global(JSContext *ctx, JSValueConst this_val,
 	return JS_NULL;
 }
 
+/*
+ * How many frame windows there may be under one top window before script
+ * stops getting new ones (VitaSurf). Each frame's page is a realm of its
+ * own with the prelude run in it, about 2.4 MB of the runtime's 96 on the
+ * native harness, and some pages make a hidden blank iframe per widget.
+ * Past the cap script gets the old stand-in window; frames that layout
+ * shows still get real ones.
+ */
+#define FRAME_WINDOW_CAP 8
+
+static int frame_windows(struct browser_window *bw)
+{
+	int i, n = 0;
+
+	for (i = 0; i < bw->iframe_count; i++) {
+		if (bw->iframes[i] != NULL) {
+			n += 1 + frame_windows(bw->iframes[i]);
+		}
+	}
+	return n;
+}
+
+static bool has_frame_window(struct browser_window *bw, struct dom_node *node)
+{
+	int i;
+
+	for (i = 0; i < bw->iframe_count; i++) {
+		if (bw->iframes[i] != NULL &&
+		    bw->iframes[i]->frame_node == node) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * __vitaFrameStart(iframe): the global of an iframe's page, making the
+ * frame's window if layout has not yet (VitaSurf). A frame with no src
+ * has its blank document, and so its global, on return; any other has
+ * only begun to load and gives null until its page has scripts.
+ */
+static JSValue win_vita_frame_start(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct browser_window *bw = thread_window(ctx), *frame = NULL;
+	struct dom_node *node;
+	uint64_t t0;
+	int before;
+
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1 || bw == NULL || thread == NULL) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_NULL;
+	}
+	if (!has_frame_window(bw, node)) {
+		struct browser_window *root = bw;
+
+		while (root->parent != NULL) {
+			root = root->parent;
+		}
+		if (frame_windows(root) >= FRAME_WINDOW_CAP) {
+			if (!thread->frame_cap_said) {
+				thread->frame_cap_said = true;
+				vita_log("qjs: %d frames already; script gets a "
+					 "stand-in for more", FRAME_WINDOW_CAP);
+			}
+			return JS_NULL;
+		}
+	}
+	t0 = now_ms();
+	before = bw->iframe_count;
+	if (browser_window_iframe_now(bw, node, &frame) != NSERROR_OK ||
+	    frame == NULL) {
+		return JS_NULL;
+	}
+	/* A frame's page is a whole realm with the prelude run in it: say
+	 * what one cost, for the first few a page makes. Counting the
+	 * runtime walks the heap, so not for every one. */
+	if (bw->iframe_count > before && window_thread(frame) != NULL &&
+	    thread->frames_logged < 8) {
+		thread->frames_logged++;
+		vita_log("qjs: an iframe's blank page, made for script in %u ms;"
+			 " runtime now %u KB",
+			 (unsigned)(now_ms() - t0), runtime_kb(thread->heap->rt));
+	}
+	return window_global(frame);
+}
+
+/*
+ * __vitaDocBase(): the document's base URL as NetSurf has it (VitaSurf).
+ * A srcdoc or blank frame document's is its parent's, which the page's
+ * own URL cannot tell it.
+ */
+static JSValue win_vita_doc_base(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (thread == NULL || thread->htmlc == NULL ||
+	    thread->htmlc->base_url == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	return JS_NewString(ctx, shown_url(nsurl_access(
+		thread->htmlc->base_url)));
+}
+
 /* __vitaParentGlobal(): the global of the page around this frame */
 static JSValue win_vita_parent_global(JSContext *ctx, JSValueConst this_val,
 				      int argc, JSValueConst *argv)
@@ -5236,6 +5355,25 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 /** Where the location object itself is kept, out of the page's way. */
 #define VITA_LOCATION_SLOT "__vitaLocation"
 
+/*
+ * The URL a page is told it has (VitaSurf). An iframe's srcdoc and blank
+ * documents load from about: URLs that name the frame, and carry a token
+ * other pages must not learn; the page sees about:srcdoc or about:blank,
+ * as in a browser.
+ */
+static const char *shown_url(const char *url)
+{
+	if (strncmp(url, "about:srcdoc?vitasurf-frame=",
+		    SLEN("about:srcdoc?vitasurf-frame=")) == 0) {
+		return "about:srcdoc";
+	}
+	if (strncmp(url, "about:blank?vitasurf-frame=",
+		    SLEN("about:blank?vitasurf-frame=")) == 0) {
+		return "about:blank";
+	}
+	return url;
+}
+
 static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 {
 	C_WHERE;
@@ -5246,7 +5384,7 @@ static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 
 	(void)this_val;
 	if (page != NULL) {
-		return JS_NewString(ctx, nsurl_access(page));
+		return JS_NewString(ctx, shown_url(nsurl_access(page)));
 	}
 
 	if (thread == NULL || thread->win == NULL) return JS_NewString(ctx, "");
@@ -5254,7 +5392,7 @@ static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 	    url == NULL) {
 		return JS_NewString(ctx, "");
 	}
-	r = JS_NewString(ctx, nsurl_access(url));
+	r = JS_NewString(ctx, shown_url(nsurl_access(url)));
 	nsurl_unref(url);
 	return r;
 }
@@ -9809,6 +9947,12 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaFrameGlobal",
 			  JS_NewCFunction(ctx, win_vita_frame_global,
 					  "__vitaFrameGlobal", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaDocBase",
+			  JS_NewCFunction(ctx, win_vita_doc_base,
+					  "__vitaDocBase", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaFrameStart",
+			  JS_NewCFunction(ctx, win_vita_frame_start,
+					  "__vitaFrameStart", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaParentGlobal",
 			  JS_NewCFunction(ctx, win_vita_parent_global,
 					  "__vitaParentGlobal", 0));
@@ -10156,11 +10300,77 @@ void js_destroyheap(jsheap *heap)
 	free(heap);
 }
 
+/** Whether a space-separated list holds a token, ignoring ASCII case. */
+static bool has_token(const char *s, size_t len, const char *token)
+{
+	size_t tl = strlen(token), i = 0, start;
+
+	while (i < len) {
+		while (i < len && (s[i] == ' ' || s[i] == '\t' ||
+				   s[i] == '\n' || s[i] == '\r' ||
+				   s[i] == '\f')) {
+			i++;
+		}
+		start = i;
+		while (i < len && s[i] != ' ' && s[i] != '\t' &&
+		       s[i] != '\n' && s[i] != '\r' && s[i] != '\f') {
+			i++;
+		}
+		if (i - start == tl && strncasecmp(s + start, token, tl) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Whether a frame's sandbox attribute keeps its page from running script
+ * (VitaSurf). A sandboxed frame is meant to be its own opaque origin,
+ * which is not done here, so script runs only where the sandbox would
+ * not have isolated it anyway: with both allow-scripts and
+ * allow-same-origin. Anything else runs none. That is what keeps the
+ * scripts of an untrusted srcdoc -- an HTML mail, say -- out of the page
+ * showing it.
+ */
+static bool frame_sandbox_blocks_scripts(struct browser_window *bw)
+{
+	dom_string *name, *v = NULL;
+	bool blocked = false;
+
+	if (bw == NULL || bw->frame_node == NULL) {
+		return false;
+	}
+	if (dom_string_create((const uint8_t *)"sandbox", SLEN("sandbox"),
+			      &name) != DOM_NO_ERR) {
+		return true;
+	}
+	if (dom_element_get_attribute(bw->frame_node, name, &v) ==
+	    DOM_NO_ERR && v != NULL) {
+		const char *s = dom_string_data(v);
+		size_t len = dom_string_byte_length(v);
+
+		blocked = !(has_token(s, len, "allow-scripts") &&
+			    has_token(s, len, "allow-same-origin"));
+		dom_string_unref(v);
+	}
+	dom_string_unref(name);
+	return blocked;
+}
+
 nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 		     jsthread **thread)
 {
-	jsthread *ret;
+	jsthread *ret, *running;
 	struct browser_window *bw = win_priv;
+
+	if (frame_sandbox_blocks_scripts(bw)) {
+		/* and no asking again for every element it parses */
+		if (doc_priv != NULL) {
+			((html_content *)doc_priv)->enable_scripting = false;
+		}
+		vita_log("qjs: a sandboxed iframe's page runs no script");
+		return NSERROR_PERMISSION;
+	}
 
 	/* an iframe's scripts run in its top window's runtime */
 	if (bw != NULL && bw->parent != NULL) {
@@ -10190,9 +10400,23 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	 * "not looked up yet" marker import_map_of tests for. */
 	ret->import_map = JS_UNINITIALIZED;
 	JS_SetContextOpaque(ret->ctx, ret);
+	/*
+	 * A blank iframe's page is made the moment a script asks for it,
+	 * so this can run inside that script. Its budget is still the one
+	 * that counts: the handler goes back to it once the new page's
+	 * globals are set up (VitaSurf).
+	 */
+	running = heap->interrupt_thread;
+	if (running != NULL && (running->closed || running->deadline_ms == 0)) {
+		running = NULL;
+	}
 	JS_SetInterruptHandler(heap->rt, qjs_interrupt, ret);
 	heap->interrupt_thread = ret;
 	setup_globals(ret);
+	if (running != NULL) {
+		JS_SetInterruptHandler(heap->rt, qjs_interrupt, running);
+		heap->interrupt_thread = running;
+	}
 	heap->live_threads++;
 	ret->all_next = all_threads;
 	all_threads = ret;

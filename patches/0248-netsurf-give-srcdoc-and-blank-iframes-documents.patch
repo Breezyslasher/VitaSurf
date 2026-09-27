@@ -1,0 +1,1122 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index fe15b9071..e25f252e3 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -539,6 +539,19 @@ fetch_start(nsurl *url,
+ 	return NSERROR_OK;
+ }
+ 
++/* exported interface documented in content/fetch.h */
++void fetch_run_now(struct fetch *f)
++{
++	int fetcherd = f->fetcherd;
++
++	if (!f->fetch_is_active) {
++		fetch_dispatch_job(f);
++	}
++	if (f->fetch_is_active && fetchers[fetcherd].refcount > 0) {
++		fetchers[fetcherd].ops.poll(fetchers[fetcherd].scheme);
++	}
++}
++
+ /* exported interface documented in content/fetch.h */
+ void fetch_abort(struct fetch *f)
+ {
+diff --git a/content/fetch.h b/content/fetch.h
+index 69a7ce81f..132e4a404 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -176,6 +176,15 @@ nserror fetch_start(nsurl *url, nsurl *referer, fetch_callback callback,
+  */
+ void fetch_abort(struct fetch *f);
+ 
++/**
++ * Start a fetch if it is still queued and poll its fetcher once, so a
++ * fetcher that answers in one go (about:) has answered on return
++ * (VitaSurf). The fetch may be freed by the time this returns.
++ *
++ * \param f fetch to run
++ */
++void fetch_run_now(struct fetch *f);
++
+ 
+ /**
+  * Check if a URL's scheme can be fetched.
+diff --git a/content/fetchers/about/about.c b/content/fetchers/about/about.c
+index c42f54834..35128d2c9 100644
+--- a/content/fetchers/about/about.c
++++ b/content/fetchers/about/about.c
+@@ -412,6 +412,14 @@ struct about_handlers about_handler_list[] = {
+ 		fetch_about_blank_handler,
+ 		true
+ 	},
++	{
++		/* an iframe's srcdoc document (VitaSurf) */
++		"srcdoc",
++		SLEN("srcdoc"),
++		NULL,
++		fetch_about_srcdoc_handler,
++		true
++	},
+ 	{
+ 		/* details about a certificate */
+ 		"certificate",
+diff --git a/content/fetchers/about/blank.c b/content/fetchers/about/blank.c
+index 8ad774512..7749c4853 100644
+--- a/content/fetchers/about/blank.c
++++ b/content/fetchers/about/blank.c
+@@ -30,6 +30,7 @@
+ 
+ #include "private.h"
+ #include "blank.h"
++#include "html/frame_doc.h"
+ 
+ /**
+  * Handler to generate about scheme cache page.
+@@ -39,7 +40,18 @@
+  */
+ bool fetch_about_blank_handler(struct fetch_about_context *ctx)
+ {
+-	const char buffer[2] = { ' ', '\0' };
++	const char *buffer = " ";
++
++	/*
++	 * An iframe's own blank document (VitaSurf): script can reach it the
++	 * moment the element is in the page, so it has its elements at once.
++	 * A lone space makes none until the parse completes, which waits for
++	 * the stylesheets. No doctype, so quirks mode, as a browser's
++	 * about:blank is.
++	 */
++	if (html_frame_doc_is_blank(fetch_about_get_url(ctx))) {
++		buffer = "<html><head></head><body>";
++	}
+ 
+ 	/* content is going to return ok */
+ 	fetch_about_set_http_code(ctx, 200);
+@@ -58,3 +70,34 @@ bool fetch_about_blank_handler(struct fetch_about_context *ctx)
+ fetch_about_blank_handler_aborted:
+ 	return false;
+ }
++
++/* exported interface documented in blank.h */
++bool fetch_about_srcdoc_handler(struct fetch_about_context *ctx)
++{
++	const char *data;
++	size_t len;
++
++	if (!html_frame_doc_source(fetch_about_get_url(ctx), &data, &len)) {
++		return fetch_about_blank_handler(ctx);
++	}
++
++	fetch_about_set_http_code(ctx, 200);
++
++	if (fetch_about_send_header(ctx, "Content-Type: text/html; charset=utf-8"))
++		goto fetch_about_srcdoc_handler_aborted;
++
++	/* an empty srcdoc is still a document */
++	if (len == 0) {
++		data = " ";
++		len = 1;
++	}
++	if (fetch_about_senddata(ctx, (const uint8_t *) data, len) != NSERROR_OK)
++		goto fetch_about_srcdoc_handler_aborted;
++
++	fetch_about_send_finished(ctx);
++
++	return true;
++
++fetch_about_srcdoc_handler_aborted:
++	return false;
++}
+diff --git a/content/fetchers/about/blank.h b/content/fetchers/about/blank.h
+index 09dcc1f6a..46c7cfeef 100644
+--- a/content/fetchers/about/blank.h
++++ b/content/fetchers/about/blank.h
+@@ -32,4 +32,10 @@
+  */
+ bool fetch_about_blank_handler(struct fetch_about_context *ctx);
+ 
++/**
++ * Handler for an iframe's srcdoc document (VitaSurf): the srcdoc text
++ * the URL names, or a blank page if it names none.
++ */
++bool fetch_about_srcdoc_handler(struct fetch_about_context *ctx);
++
+ #endif
+diff --git a/content/handlers/html/Makefile b/content/handlers/html/Makefile
+index ed690c358..ac05a3838 100644
+--- a/content/handlers/html/Makefile
++++ b/content/handlers/html/Makefile
+@@ -10,6 +10,7 @@ S_HTML := box_construct.c	\
+ 	css.c			\
+ 	css_fetcher.c		\
+ 	dom_event.c		\
++	frame_doc.c		\
+ 	font.c			\
+ 	form.c			\
+ 	forms.c			\
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 2dacfef18..682aec3b3 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -56,6 +56,7 @@
+ #include "html/box_construct.h"
+ #include "html/box_special.h"
+ #include "html/box_textarea.h"
++#include "html/frame_doc.h"
+ #include "html/form_internal.h"
+ 
+ 
+@@ -1062,24 +1063,13 @@ box_iframe(dom_node *n,
+ 		return true;
+ 	}
+ 
+-	/* get frame URL */
+-	err = dom_element_get_attribute(n, corestring_dom_src, &s);
+-	if (err != DOM_NO_ERR || s == NULL)
+-		return true;
+-	if (box_extract_link(content, s, content->base_url, &url) == false) {
+-		dom_string_unref(s);
++	/* the frame's URL: its srcdoc, its src, or its own blank
++	 * document (VitaSurf; an iframe with no src had no frame) */
++	if (html_iframe_url(content, n, &url) != NSERROR_OK)
+ 		return false;
+-	}
+-	dom_string_unref(s);
+ 	if (url == NULL)
+ 		return true;
+ 
+-	/* don't include ourself */
+-	if (nsurl_compare(content->base_url, url, NSURL_COMPLETE)) {
+-		nsurl_unref(url);
+-		return true;
+-	}
+-
+ 	/* create a new iframe */
+ 	iframe = talloc(content->bctx, struct content_html_iframe);
+ 	if (iframe == NULL) {
+diff --git a/content/handlers/html/frame_doc.c b/content/handlers/html/frame_doc.c
+new file mode 100644
+index 000000000..8cc4348ae
+--- /dev/null
++++ b/content/handlers/html/frame_doc.c
+@@ -0,0 +1,334 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Documents an iframe makes itself (VitaSurf); see frame_doc.h.
++ */
++
++#include <stdint.h>
++#include <stdio.h>
++#include <time.h>
++#include <stdlib.h>
++#include <string.h>
++#include <dom/dom.h>
++
++#include "utils/utils.h"
++#include "utils/errors.h"
++#include "utils/corestrings.h"
++#include "utils/nsurl.h"
++#include "content/content.h"
++
++#include "html/private.h"
++#include "html/box.h"
++#include "html/box_construct.h"
++#include "html/frame_doc.h"
++
++struct frame_doc {
++	struct frame_doc *next;
++	html_content *owner;
++	dom_node *node;
++	bool srcdoc;
++	char *text;		/**< srcdoc text, NULL for a blank document */
++	size_t len;
++	nsurl *url;
++	nsurl *base;
++	bool armed;		/**< its frame is navigating to it */
++};
++
++static struct frame_doc *frame_docs;
++static unsigned int frame_doc_serial;
++static uint32_t frame_doc_seed;
++
++/**
++ * A number for a URL that another page cannot guess. The URL is never
++ * shown to script, and a load that is not the frame's own is refused
++ * anyway; this is the second lock.
++ */
++static uint32_t frame_doc_token(void)
++{
++	uint32_t x;
++
++	if (frame_doc_seed == 0) {
++		frame_doc_seed = (uint32_t)time(NULL) ^
++			(uint32_t)(uintptr_t)&frame_docs ^ 0x9e3779b9u;
++		if (frame_doc_seed == 0) {
++			frame_doc_seed = 1;
++		}
++	}
++	/* xorshift32 */
++	x = frame_doc_seed;
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	frame_doc_seed = x;
++	return x ^ (uint32_t)clock();
++}
++
++static void frame_doc_free(struct frame_doc *d)
++{
++	dom_node_unref(d->node);
++	nsurl_unref(d->url);
++	if (d->base != NULL) {
++		nsurl_unref(d->base);
++	}
++	free(d->text);
++	free(d);
++}
++
++/**
++ * The entry for an element's document of one kind, made if need be. A
++ * srcdoc that has changed gets a new entry, and so a new URL, which is
++ * what makes the frame load it again.
++ */
++static nserror frame_doc_get(html_content *c, dom_node *node, bool srcdoc,
++		const char *text, size_t len, struct frame_doc **out)
++{
++	struct frame_doc **p, *d;
++	char buf[64];
++	nserror err;
++
++	for (p = &frame_docs; (d = *p) != NULL; p = &d->next) {
++		if (d->owner != c || d->node != node || d->srcdoc != srcdoc) {
++			continue;
++		}
++		if (!srcdoc || (d->len == len &&
++				memcmp(d->text, text, len) == 0)) {
++			*out = d;
++			return NSERROR_OK;
++		}
++		/* the srcdoc changed: the old text is not needed again */
++		*p = d->next;
++		frame_doc_free(d);
++		break;
++	}
++
++	d = calloc(1, sizeof(*d));
++	if (d == NULL) {
++		return NSERROR_NOMEM;
++	}
++	if (srcdoc) {
++		d->text = malloc(len + 1);
++		if (d->text == NULL) {
++			free(d);
++			return NSERROR_NOMEM;
++		}
++		memcpy(d->text, text, len);
++		d->text[len] = '\0';
++		d->len = len;
++	}
++	snprintf(buf, sizeof(buf), "about:%s?vitasurf-frame=%u-%08x%08x",
++		 srcdoc ? "srcdoc" : "blank", ++frame_doc_serial,
++		 (unsigned int)frame_doc_token(),
++		 (unsigned int)frame_doc_token());
++	err = nsurl_create(buf, &d->url);
++	if (err != NSERROR_OK) {
++		free(d->text);
++		free(d);
++		return err;
++	}
++	if (c->base_url != NULL) {
++		d->base = nsurl_ref(c->base_url);
++	}
++	d->owner = c;
++	d->node = dom_node_ref(node);
++	d->srcdoc = srcdoc;
++	d->next = frame_docs;
++	frame_docs = d;
++	*out = d;
++	return NSERROR_OK;
++}
++
++static struct frame_doc *frame_doc_find(nsurl *url)
++{
++	struct frame_doc *d;
++
++	for (d = frame_docs; d != NULL; d = d->next) {
++		if (nsurl_compare(d->url, url, NSURL_COMPLETE)) {
++			return d;
++		}
++	}
++	return NULL;
++}
++
++/* exported interface documented in html/frame_doc.h */
++nserror html_iframe_url(html_content *c, dom_node *node, nsurl **url)
++{
++	struct frame_doc *d;
++	dom_string *name, *s = NULL;
++	dom_exception exc;
++	nserror err;
++
++	*url = NULL;
++
++	/* srcdoc, even an empty one, wins over src */
++	exc = dom_string_create((const uint8_t *)"srcdoc", SLEN("srcdoc"),
++				&name);
++	if (exc != DOM_NO_ERR) {
++		return NSERROR_NOMEM;
++	}
++	exc = dom_element_get_attribute(node, name, &s);
++	dom_string_unref(name);
++	if (exc == DOM_NO_ERR && s != NULL) {
++		err = frame_doc_get(c, node, true, dom_string_data(s),
++				    dom_string_byte_length(s), &d);
++		dom_string_unref(s);
++		if (err == NSERROR_OK) {
++			*url = nsurl_ref(d->url);
++		}
++		return err;
++	}
++
++	exc = dom_element_get_attribute(node, corestring_dom_src, &s);
++	if (exc == DOM_NO_ERR && s != NULL) {
++		if (box_extract_link(c, s, c->base_url, url) == false) {
++			dom_string_unref(s);
++			return NSERROR_NOMEM;
++		}
++		dom_string_unref(s);
++	}
++	if (*url != NULL) {
++		lwc_string *scheme = nsurl_get_component(*url, NSURL_SCHEME);
++		lwc_string *path = nsurl_get_component(*url, NSURL_PATH);
++		bool about = (scheme == corestring_lwc_about && path != NULL);
++		bool blank = (about &&
++			      lwc_string_length(path) == SLEN("blank") &&
++			      memcmp(lwc_string_data(path), "blank",
++				     SLEN("blank")) == 0 &&
++			      !nsurl_has_component(*url, NSURL_QUERY));
++		/* about:srcdoc is only ever a srcdoc's; a src cannot name it */
++		bool srcdoc = (about &&
++			       lwc_string_length(path) == SLEN("srcdoc") &&
++			       memcmp(lwc_string_data(path), "srcdoc",
++				      SLEN("srcdoc")) == 0);
++
++		if (scheme != NULL) {
++			lwc_string_unref(scheme);
++		}
++		if (path != NULL) {
++			lwc_string_unref(path);
++		}
++		if (srcdoc) {
++			nsurl_unref(*url);
++			*url = NULL;
++			return NSERROR_OK;
++		}
++		if (!blank) {
++			/* don't include ourself */
++			if (nsurl_compare(c->base_url, *url,
++					  NSURL_COMPLETE)) {
++				nsurl_unref(*url);
++				*url = NULL;
++			}
++			return NSERROR_OK;
++		}
++		nsurl_unref(*url);
++		*url = NULL;
++	}
++
++	/* no src, an empty one or about:blank: the frame's own blank page */
++	err = frame_doc_get(c, node, false, NULL, 0, &d);
++	if (err == NSERROR_OK) {
++		*url = nsurl_ref(d->url);
++	}
++	return err;
++}
++
++/* exported interface documented in html/frame_doc.h */
++bool html_frame_doc_arm(nsurl *url, dom_node *frame_node)
++{
++	struct frame_doc *d;
++	lwc_string *scheme;
++	bool about;
++
++	scheme = nsurl_get_component(url, NSURL_SCHEME);
++	about = (scheme == corestring_lwc_about);
++	if (scheme != NULL) {
++		lwc_string_unref(scheme);
++	}
++	if (!about || (d = frame_doc_find(url)) == NULL) {
++		return true;
++	}
++	if (frame_node == NULL || d->node != frame_node) {
++		return false;
++	}
++	d->armed = true;
++	return true;
++}
++
++/* exported interface documented in html/frame_doc.h */
++bool html_frame_doc_is_blank(nsurl *url)
++{
++	struct frame_doc *d = frame_doc_find(url);
++
++	return d != NULL && !d->srcdoc;
++}
++
++/* exported interface documented in html/frame_doc.h */
++bool html_frame_doc_source(nsurl *url, const char **data, size_t *len)
++{
++	struct frame_doc *d = frame_doc_find(url);
++
++	if (d == NULL || !d->srcdoc || !d->armed) {
++		return false;
++	}
++	*data = d->text;
++	*len = d->len;
++	return true;
++}
++
++/* exported interface documented in html/frame_doc.h */
++nsurl *html_frame_doc_base(nsurl *url)
++{
++	struct frame_doc *d;
++	lwc_string *scheme;
++	bool about;
++
++	/* most contents are not frame documents: skip the list for them */
++	scheme = nsurl_get_component(url, NSURL_SCHEME);
++	about = (scheme == corestring_lwc_about);
++	if (scheme != NULL) {
++		lwc_string_unref(scheme);
++	}
++	if (!about) {
++		return NULL;
++	}
++	d = frame_doc_find(url);
++	if (d == NULL || !d->armed) {
++		return NULL;
++	}
++	/* the frame's document is being made: that is the end of the
++	 * load this entry was armed for */
++	d->armed = false;
++	return d->base;
++}
++
++/* exported interface documented in html/frame_doc.h */
++void html_frame_doc_release(html_content *c)
++{
++	struct frame_doc **p = &frame_docs, *d;
++
++	while ((d = *p) != NULL) {
++		if (d->owner == c) {
++			*p = d->next;
++			frame_doc_free(d);
++		} else {
++			p = &d->next;
++		}
++	}
++}
+diff --git a/content/handlers/html/frame_doc.h b/content/handlers/html/frame_doc.h
+new file mode 100644
+index 000000000..adcc3885a
+--- /dev/null
++++ b/content/handlers/html/frame_doc.h
+@@ -0,0 +1,87 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Documents an iframe makes itself: srcdoc, and the blank document of an
++ * iframe with no src (VitaSurf).
++ *
++ * Each is loaded from an about: URL that names the frame
++ * (about:srcdoc?vitasurf-frame=N, about:blank?vitasurf-frame=N), so the
++ * about fetcher can hand over the srcdoc text and the html content can
++ * take its parent's base URL, which both documents inherit. An entry
++ * belongs to the page holding the iframe and goes with it; each iframe
++ * has at most one of each kind.
++ */
++
++#ifndef NETSURF_HTML_FRAME_DOC_H
++#define NETSURF_HTML_FRAME_DOC_H
++
++#include <stdbool.h>
++#include <stddef.h>
++
++#include "utils/errors.h"
++
++struct html_content;
++struct dom_node;
++struct nsurl;
++
++/**
++ * The URL an iframe element loads: its srcdoc if it has one, else its
++ * src, else its blank document.
++ *
++ * \param c    html content the element is in
++ * \param node the iframe element
++ * \param url  updated to a new reference, or NULL when the frame loads
++ *             nothing (its src is the page itself)
++ * \return NSERROR_OK or an error
++ */
++nserror html_iframe_url(struct html_content *c, struct dom_node *node,
++		struct nsurl **url);
++
++/**
++ * Let a browser window load a URL (VitaSurf). An iframe's own documents
++ * load only in that iframe's window: true, and the URL armed for one
++ * load, when frame_node is the element the URL was made for; false when
++ * it is not. Any other URL is always allowed.
++ */
++bool html_frame_doc_arm(struct nsurl *url, struct dom_node *frame_node);
++
++/** Whether a URL is one an iframe made for its blank document. */
++bool html_frame_doc_is_blank(struct nsurl *url);
++
++/**
++ * The srcdoc text a URL names, if its frame is loading it. The text
++ * stays valid until the page that holds the iframe goes or the srcdoc
++ * changes.
++ *
++ * \return true with the text in data and len, false if it names none
++ */
++bool html_frame_doc_source(struct nsurl *url, const char **data,
++		size_t *len);
++
++/**
++ * The base URL a frame document inherits (not a new reference), or NULL.
++ * Asked as the document is made, which ends the load it was armed for.
++ */
++struct nsurl *html_frame_doc_base(struct nsurl *url);
++
++/** Forget a page's frame documents, as it goes. */
++void html_frame_doc_release(struct html_content *c);
++
++#endif
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 66028b5c6..73a0ce97b 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -74,6 +74,7 @@
+ #include "html/imagemap.h"
+ #include "html/layout.h"
+ #include "html/textselection.h"
++#include "html/frame_doc.h"
+ 
+ #define CHUNK 4096
+ 
+@@ -490,6 +491,16 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 	c->quirks = DOM_DOCUMENT_QUIRKS_MODE_NONE;
+ 	c->encoding = NULL;
+ 	c->base_url = nsurl_ref(content_get_url(&c->base));
++	/* an iframe's srcdoc or blank document has its parent's base
++	 * (VitaSurf) */
++	{
++		nsurl *inherit = html_frame_doc_base(c->base_url);
++
++		if (inherit != NULL) {
++			nsurl_unref(c->base_url);
++			c->base_url = nsurl_ref(inherit);
++		}
++	}
+ 	c->base_target = NULL;
+ 	c->aborted = false;
+ 	c->refresh = false;
+@@ -1549,6 +1560,9 @@ static void html_destroy(struct content *c)
+ 	/* a web font still on its way must not lay this content out */
+ 	html_webfont_forget(html);
+ 
++	/* the documents its iframes made for themselves */
++	html_frame_doc_release(html);
++
+ 	free(html->pinned);
+ 	html->pinned = NULL;
+ 	html->pinned_alloc = 0;
+diff --git a/content/hlcache.c b/content/hlcache.c
+index 12cb52b70..b68441223 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -819,6 +819,28 @@ struct content *hlcache_handle_get_content(const hlcache_handle *handle)
+ 	return NULL;
+ }
+ 
++/* See hlcache.h for documentation */
++nserror hlcache_handle_run_now(hlcache_handle *handle)
++{
++	hlcache_retrieval_ctx *ctx = hlcache->retrieval_ctx_ring;
++
++	/* still retrieving: the context holds the low-level handle */
++	if (ctx != NULL) {
++		do {
++			if (ctx->handle == handle) {
++				return llcache_handle_run_now(ctx->llcache);
++			}
++			ctx = ctx->r_next;
++		} while (ctx != hlcache->retrieval_ctx_ring);
++	}
++	/* the content exists and holds it */
++	if (handle->entry != NULL && handle->entry->content != NULL &&
++	    handle->entry->content->llcache != NULL) {
++		return llcache_handle_run_now(handle->entry->content->llcache);
++	}
++	return NSERROR_OK;
++}
++
+ /* See hlcache.h for documentation */
+ nserror hlcache_handle_abort(hlcache_handle *handle)
+ {
+diff --git a/content/hlcache.h b/content/hlcache.h
+index cea697e49..fc6ce0d11 100644
+--- a/content/hlcache.h
++++ b/content/hlcache.h
+@@ -158,6 +158,16 @@ nserror hlcache_handle_release(hlcache_handle *handle);
+  */
+ nserror hlcache_handle_abort(hlcache_handle *handle);
+ 
++/**
++ * Run an about: retrieval now rather than from the scheduler, so its
++ * content exists and has its data on return (VitaSurf). See
++ * llcache_handle_run_now.
++ *
++ * \param handle  Handle of the retrieval to run
++ * \return NSERROR_OK on success, appropriate error otherwise
++ */
++nserror hlcache_handle_run_now(hlcache_handle *handle);
++
+ /**
+  * Replace a high-level cache handle's callback
+  *
+diff --git a/content/llcache.c b/content/llcache.c
+index 4b799ea76..f8e18d266 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -4200,6 +4200,38 @@ nserror llcache_handle_clone(llcache_handle *handle, llcache_handle **result)
+ 	return error;
+ }
+ 
++/* See llcache.h for documentation */
++nserror llcache_handle_run_now(llcache_handle *handle)
++{
++	llcache_object *object = handle->object;
++	lwc_string *scheme;
++	bool about;
++	int i;
++
++	scheme = nsurl_get_component(object->url, NSURL_SCHEME);
++	about = (scheme == corestring_lwc_about);
++	if (scheme != NULL) {
++		lwc_string_unref(scheme);
++	}
++	if (!about) {
++		return NSERROR_OK;
++	}
++
++	if (object->fetch.fetch != NULL) {
++		fetch_run_now(object->fetch.fetch);
++	}
++	/* A user may ask to see the data again once it has it (type
++	 * sniffing does), so go round more than once. The object outlives
++	 * this: objects are only freed when the cache is cleaned. */
++	for (i = 0; i < 3; i++) {
++		nserror error = llcache_object_notify_users(object);
++		if (error != NSERROR_OK) {
++			return error;
++		}
++	}
++	return NSERROR_OK;
++}
++
+ /* See llcache.h for documentation */
+ nserror llcache_handle_abort(llcache_handle *handle)
+ {
+diff --git a/content/llcache.h b/content/llcache.h
+index e4e3a96ae..e882139b2 100644
+--- a/content/llcache.h
++++ b/content/llcache.h
+@@ -231,6 +231,17 @@ nserror llcache_handle_clone(llcache_handle *handle, llcache_handle **result);
+  */
+ nserror llcache_handle_abort(llcache_handle *handle);
+ 
++/**
++ * Run an about: fetch now and bring this object's users up to date,
++ * instead of waiting for the scheduler (VitaSurf). An iframe with no src
++ * has a document script can reach the moment the element is in the page,
++ * and this is what builds it. Other fetches are left to the scheduler.
++ *
++ * \param handle Handle of the object to run
++ * \return NSERROR_OK on success, appropriate error otherwise
++ */
++nserror llcache_handle_run_now(llcache_handle *handle);
++
+ /**
+  * Force a low-level cache handle into streaming mode
+  *
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index db11e1740..1bb135352 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -51,6 +51,7 @@
+ 
+ #include "html/html.h"
+ #include "html/form_internal.h"
++#include "html/frame_doc.h"
+ #include "javascript/js.h"
+ 
+ #include "desktop/browser_private.h"
+@@ -771,7 +772,11 @@ static void browser_window_update(struct browser_window *bw, bool scroll_to_top)
+ 	case BROWSER_WINDOW_IFRAME:
+ 		/* Internal iframe browser window */
+ 		assert(bw->parent != NULL);
+-		assert(bw->parent->current_content != NULL);
++		/* a frame script made can finish before the page holding it
++		 * has anything showing (VitaSurf) */
++		if (bw->parent->current_content == NULL) {
++			break;
++		}
+ 
+ 		browser_window_update_extent(bw);
+ 
+@@ -3503,7 +3508,9 @@ browser_window_navigate(struct browser_window *bw,
+ 		params.post_multipart = fetch_multipart_data_clone(post_multipart);
+ 	}
+ 
+-	if (parent != NULL) {
++	/* a page still being parsed may not know its charset yet: a frame
++	 * script makes in it then has none to inherit (VitaSurf) */
++	if (parent != NULL && child.charset != NULL) {
+ 		params.parent_charset = strdup(child.charset);
+ 		params.parent_quirks = child.quirks;
+ 	}
+@@ -3829,6 +3836,14 @@ browser_window__navigate_internal(struct browser_window *bw,
+ {
+ 	lwc_string *scheme, *path;
+ 
++	/* an iframe's srcdoc or blank document loads only in that
++	 * iframe (VitaSurf) */
++	if (!html_frame_doc_arm(params->url, bw->frame_node)) {
++		NSLOG(netsurf, INFO, "refused '%s': another frame's document",
++		      nsurl_access(params->url));
++		return NSERROR_BAD_URL;
++	}
++
+ 	/* All our special URIs are in the about: scheme */
+ 	scheme = nsurl_get_component(params->url, NSURL_SCHEME);
+ 	if (scheme != corestring_lwc_about) {
+diff --git a/desktop/frames.c b/desktop/frames.c
+index 3e23389a5..b54c0400a 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -34,11 +34,14 @@
+ #include "utils/log.h"
+ #include "utils/utils.h"
+ #include "utils/nsurl.h"
++#include "utils/corestrings.h"
+ #include "netsurf/content.h"
+ #include "content/hlcache.h"
+ #include "html/html.h"
+ #include "html/box.h"
+ #include "html/box_inspect.h"
++#include "html/html_save.h"
++#include "html/frame_doc.h"
+ 
+ #include "desktop/browser_private.h"
+ #include "desktop/frames.h"
+@@ -63,7 +66,10 @@ void browser_window_scroll_callback(void *client_data,
+ 	switch(scrollbar_data->msg) {
+ 	case SCROLLBAR_MSG_MOVED:
+ 		if (bw->browser_window_type == BROWSER_WINDOW_IFRAME) {
+-			html_redraw_a_box(bw->parent->current_content, bw->box);
++			if (bw->box != NULL) {
++				html_redraw_a_box(bw->parent->current_content,
++						  bw->box);
++			}
+ 		} else {
+ 			struct rect rect;
+ 
+@@ -199,7 +205,8 @@ nserror browser_window_invalidate_iframe(struct browser_window *bw)
+  * Make the window for one iframe (VitaSurf: its own allocation).
+  */
+ static struct browser_window *
+-iframe_window_new(struct browser_window *bw, struct content_html_iframe *cur)
++iframe_window_new(struct browser_window *bw, struct dom_node *node,
++		  const char *name)
+ {
+ 	struct browser_window *window = calloc(1, sizeof(*window));
+ 
+@@ -214,16 +221,51 @@ iframe_window_new(struct browser_window *bw, struct content_html_iframe *cur)
+ 	window->browser_window_type = BROWSER_WINDOW_IFRAME;
+ 	window->no_resize = true;
+ 	window->scale = bw->scale;
+-	if (cur->name != NULL) {
+-		window->name = strdup(cur->name);
++	if (name != NULL) {
++		window->name = strdup(name);
+ 	}
+ 	window->parent = bw;
+-	if (cur->box->node != NULL) {
+-		window->frame_node = dom_node_ref(cur->box->node);
++	if (node != NULL) {
++		window->frame_node = dom_node_ref(node);
+ 	}
+ 	return window;
+ }
+ 
++/**
++ * The page an iframe element is in, if it is in one of the window's: the
++ * one showing or the one loading (VitaSurf). NULL for an element that has
++ * left the document.
++ */
++static struct hlcache_handle *
++frame_node_page(struct browser_window *bw, struct dom_node *node)
++{
++	struct hlcache_handle *pages[2];
++	struct hlcache_handle *found = NULL;
++	dom_node *n = dom_node_ref(node), *p;
++	dom_node_type type;
++	int i;
++
++	while (dom_node_get_parent_node(n, &p) == DOM_NO_ERR && p != NULL) {
++		dom_node_unref(n);
++		n = p;
++	}
++	if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++	    type == DOM_DOCUMENT_NODE) {
++		pages[0] = bw->current_content;
++		pages[1] = bw->loading_content;
++		for (i = 0; i < 2 && found == NULL; i++) {
++			if (pages[i] != NULL &&
++			    hlcache_handle_get_content(pages[i]) != NULL &&
++			    content_get_type(pages[i]) == CONTENT_HTML &&
++			    (dom_node *)html_get_document(pages[i]) == n) {
++				found = pages[i];
++			}
++		}
++	}
++	dom_node_unref(n);
++	return found;
++}
++
+ /**
+  * Tie an iframe window to its box and give it the box's place.
+  */
+@@ -296,9 +338,10 @@ nserror browser_window_rebuild_iframes(struct browser_window *bw)
+ 	for (cur = iframe; cur; cur = cur->next) {
+ 		iframes++;
+ 	}
+-	if (iframes > 0) {
+-		fresh = calloc(iframes, sizeof(*fresh));
+-		navigate = calloc(iframes, sizeof(*navigate));
++	if (iframes + old_count > 0) {
++		/* room for every window kept without a box, too */
++		fresh = calloc(iframes + old_count, sizeof(*fresh));
++		navigate = calloc(iframes + old_count, sizeof(*navigate));
+ 		if (fresh == NULL || navigate == NULL) {
+ 			free(fresh);
+ 			free(navigate);
+@@ -322,7 +365,8 @@ nserror browser_window_rebuild_iframes(struct browser_window *bw)
+ 			}
+ 		}
+ 		if (window == NULL) {
+-			window = iframe_window_new(bw, cur);
++			window = iframe_window_new(bw, cur->box->node,
++						   cur->name);
+ 			if (window == NULL) {
+ 				ret = NSERROR_NOMEM;
+ 				continue;
+@@ -342,16 +386,23 @@ nserror browser_window_rebuild_iframes(struct browser_window *bw)
+ 		}
+ 		fresh[n++] = window;
+ 	}
+-	bw->iframes = fresh;
+-	bw->iframe_count = n;
+-
+-	/* windows whose elements went */
++	/* A window with no box now is kept while its element is in the
++	 * page: one not displayed, or one script made before the box tree
++	 * had it, still runs, as in a browser. The rest go. */
+ 	for (j = 0; j < old_count; j++) {
+-		if (old[j] != NULL) {
++		if (old[j] == NULL) {
++			continue;
++		}
++		if (fresh != NULL && old[j]->frame_node != NULL &&
++		    frame_node_page(bw, old[j]->frame_node) != NULL) {
++			fresh[n++] = old[j];
++		} else {
+ 			iframe_window_free(old[j]);
+ 		}
+ 	}
+ 	free(old);
++	bw->iframes = fresh;
++	bw->iframe_count = n;
+ 
+ 	/* calculate dimensions */
+ 	browser_window_update_extent(bw);
+@@ -374,6 +425,102 @@ nserror browser_window_rebuild_iframes(struct browser_window *bw)
+ 	return ret;
+ }
+ 
++/* exported function documented in desktop/frames.h */
++nserror browser_window_iframe_now(struct browser_window *bw,
++				  struct dom_node *node,
++				  struct browser_window **out)
++{
++	struct hlcache_handle *page;
++	struct browser_window *window, **grown;
++	dom_string *name = NULL;
++	nsurl *url;
++	nserror err;
++	int i;
++
++	*out = NULL;
++	page = frame_node_page(bw, node);
++	if (page == NULL) {
++		return NSERROR_NOT_FOUND;
++	}
++	err = html_iframe_url((struct html_content *)
++			      hlcache_handle_get_content(page), node, &url);
++	if (err != NSERROR_OK) {
++		return err;
++	}
++
++	for (i = 0; i < bw->iframe_count; i++) {
++		if (bw->iframes[i] == NULL ||
++		    bw->iframes[i]->frame_node != node) {
++			continue;
++		}
++		window = bw->iframes[i];
++		*out = window;
++		/* the element has a new src or srcdoc: go there now */
++		if (url != NULL && (window->frame_src == NULL ||
++		    !nsurl_compare(window->frame_src, url,
++				   NSURL_COMPLETE))) {
++			if (window->frame_src != NULL) {
++				nsurl_unref(window->frame_src);
++			}
++			window->frame_src = url;
++			url = NULL;
++			err = browser_window_navigate(window,
++					window->frame_src,
++					hlcache_handle_get_url(page),
++					BW_NAVIGATE_UNVERIFIABLE,
++					NULL, NULL, page);
++			if (err == NSERROR_OK &&
++			    window->loading_content != NULL &&
++			    html_frame_doc_is_blank(window->frame_src)) {
++				err = hlcache_handle_run_now(
++						window->loading_content);
++			}
++		}
++		if (url != NULL) {
++			nsurl_unref(url);
++		}
++		return err;
++	}
++	if (url == NULL) {
++		return NSERROR_OK;
++	}
++
++	grown = realloc(bw->iframes,
++			(bw->iframe_count + 1) * sizeof(*grown));
++	if (grown == NULL) {
++		nsurl_unref(url);
++		return NSERROR_NOMEM;
++	}
++	bw->iframes = grown;
++
++	(void)dom_element_get_attribute(node, corestring_dom_name, &name);
++	window = iframe_window_new(bw, node,
++				   name != NULL ? dom_string_data(name) : NULL);
++	if (name != NULL) {
++		dom_string_unref(name);
++	}
++	if (window == NULL) {
++		nsurl_unref(url);
++		return NSERROR_NOMEM;
++	}
++	/* an iframe's default size, until layout gives it its box */
++	browser_window_set_dimensions(window, 300, 150);
++	window->frame_src = url;
++	bw->iframes[bw->iframe_count++] = window;
++
++	err = browser_window_navigate(window, url,
++				      hlcache_handle_get_url(page),
++				      BW_NAVIGATE_UNVERIFIABLE,
++				      NULL, NULL, page);
++	/* a blank document is there the moment the element is */
++	if (err == NSERROR_OK && window->loading_content != NULL &&
++	    html_frame_doc_is_blank(url)) {
++		err = hlcache_handle_run_now(window->loading_content);
++	}
++	*out = window;
++	return err;
++}
++
+ /* exported function documented in desktop/frames.h */
+ void browser_window_detach_iframes(struct browser_window *bw)
+ {
+diff --git a/desktop/frames.h b/desktop/frames.h
+index b7e3888b8..78dd8910d 100644
+--- a/desktop/frames.h
++++ b/desktop/frames.h
+@@ -77,6 +77,25 @@ void browser_window_detach_iframes(struct browser_window *bw);
+  */
+ nserror browser_window_rebuild_iframes(struct browser_window *bw);
+ 
++/**
++ * The window of an iframe element, made now if it has none yet
++ * (VitaSurf). Script can reach a frame's window as soon as its element
++ * is in the page, before layout builds the box that would make it. A
++ * frame with no src or with src="about:blank" has its blank document on
++ * return; any other starts loading. The window is matched to the
++ * element's box when the page is next laid out. A frame whose element
++ * has a new src or srcdoc since it last navigated goes there now.
++ *
++ * \param bw   The browser window showing or loading the element's page.
++ * \param node The iframe element.
++ * \param out  Updated to the frame's window, or NULL if it has none
++ *             (it is not in the page, or it would load the page itself).
++ * \return NSERROR_OK or an error.
++ */
++nserror browser_window_iframe_now(struct browser_window *bw,
++				  struct dom_node *node,
++				  struct browser_window **out);
++
+ /**
+  * Create and open a frameset for a browser window.
+  *

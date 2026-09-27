@@ -352,8 +352,17 @@ memory64. An iframe with a src runs its page in a window of its own
 that shares the top page's JavaScript runtime, so same-origin frames reach
 each other directly and cross-origin ones only through `postMessage` and
 `location`. Patch 0247 keeps a frame's window across the layout rebuilds
-that used to replace it. An iframe with no src or with srcdoc, and one
-that is not displayed, still gets an empty stand-in window. Add
+that used to replace it. Patch 0248 gives an iframe with no src a real
+blank document the moment script asks for it (NetSurf answers that one
+about: fetch synchronously), loads srcdoc as `about:srcdoc` with the
+parent's base URL, and keeps a frame that is not displayed. Each frame
+page is a realm of its own, about 2.4 MB, so script gets real windows for
+at most eight frames under one page and a stand-in after that; the log
+says what each one cost. A sandboxed frame is not given an opaque origin
+yet, so its page runs script only when the sandbox allows both scripts
+and same-origin, and otherwise none. `document.write` works on a document that is not
+being parsed, which is how pages fill a blank iframe; a page's own script
+writing into itself during the parse still does nothing. Add
 `VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging. The JavaScript engine is chosen with
