@@ -2069,7 +2069,20 @@ getResponseHeader:function(n){var lines=this._rh.split('\n'),p=String(n).toLower
 getAllResponseHeaders:function(){return this._rh?this._rh.replace(/\n/g,'\r\n'):'';},
 overrideMimeType:function(){}};
 W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpRequestEventTarget=function(){};
-function FormData(form){this._p=[];if(form&&form.getElementsByTagName){['input','select','textarea'].forEach(function(t){var els=form.getElementsByTagName(t);for(var i=0;i<els.length;i++){var e=els[i],n=e.getAttribute('name');if(!n||e.disabled)continue;var ty=(e.getAttribute('type')||'').toLowerCase();if(ty==='checkbox'||ty==='radio'){if(e.checked)this._p.push([n,e.value||'on']);}else if(ty!=='submit'&&ty!=='button'&&ty!=='file')this._p.push([n,e.value]);}},this);}}
+function FormData(form){this._p=[];if(form&&form.getElementsByTagName){['input','select','textarea'].forEach(function(t){var els=form.getElementsByTagName(t);for(var i=0;i<els.length;i++){var e=els[i],n=e.getAttribute('name');if(!n||e.disabled)continue;var ty=(e.getAttribute('type')||'').toLowerCase();if(ty==='checkbox'||ty==='radio'){if(e.checked)this._p.push([n,e.value||'on']);}else if(ty!=='submit'&&ty!=='button'&&ty!=='file')this._p.push([n,e.value]);}},this);
+ if(W.__vitaFaceSeen)faceEntries(form).forEach(function(p){this._p.push(p);},this);}}
+/* the entries form-associated custom elements give their form: a string,
+   a File, or a FormData of their own (VitaSurf) */
+function faceEntries(form){
+ var out=[];
+ listOf(form.getElementsByTagName('*')).forEach(function(e){
+  if(e.localName.indexOf('-')<0)return;
+  var v=W.__vitaFaceValue(e),n=e.getAttribute('name');
+  if(v===undefined||v===null||e.hasAttribute('disabled'))return;
+  if(v&&typeof v==='object'&&typeof v.forEach==='function'&&v._p){
+   v.forEach(function(val,k){out.push([k,val]);});return;}
+  if(n)out.push([n,typeof v==='object'?v:String(v)]);});
+ return out;}
 FormData.prototype={append:function(k,v){this._p.push([String(k),String(v)]);},set:function(k,v){this['delete'](k);this.append(k,v);},get:function(k){for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},
 getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},has:function(k){return this.get(k)!==null;},'delete':function(k){this._p=this._p.filter(function(p){return p[0]!==k;});},
 forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},
@@ -2734,10 +2747,137 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
  var v=this.getAttribute('formaction');if(v===null||v==='')return D.baseURI;
  try{return new URL(v,D.baseURI).href;}catch(e){return v;}},
  set:function(v){this.setAttribute('formaction',String(v));}});
-P.attachInternals=function(){var el=this;return {shadowRoot:el.shadowRoot,form:el.form,
- setFormValue:function(){},setValidity:function(){},checkValidity:function(){return true;},
- reportValidity:function(){return true;},validity:el.validity,validationMessage:'',
- willValidate:false,labels:el.labels,states:new TokenList(null,'')};};
+/* ElementInternals, for custom elements (VitaSurf). Everything is read
+   when asked, not when the internals are made: a Web Awesome control
+   (Home Assistant's login form) calls attachInternals() in its
+   constructor and has its own form getter that reads this.internals.form,
+   so reading the element's form while attaching found no internals yet,
+   threw, and the control ran without them. */
+(function(){
+ var INTERNALS=new WeakMap(),FLAGS=['valueMissing','typeMismatch',
+  'patternMismatch','tooLong','tooShort','rangeUnderflow','rangeOverflow',
+  'stepMismatch','badInput','customError'];
+ function notSupported(m){return new DOMException(m,'NotSupportedError');}
+ function state(i){return INTERNALS.get(i._el);}
+ function formAssociated(el){
+  var C=W.customElements&&W.customElements.get(el.localName);
+  return !!(C&&C.formAssociated);}
+ function needForm(i,what){
+  if(!formAssociated(i._el))throw notSupported("Failed to read the '"+what+
+   "' property from 'ElementInternals': The target element is not a "+
+   "form-associated custom element.");}
+ function formOwner(el){
+  var id=el.getAttribute('form'),n;
+  if(id!==null){n=D.getElementById(id);return n&&n.tagName==='FORM'?n:null;}
+  for(n=el.parentNode;n&&n.nodeType===1;n=n.parentNode)
+   if(n.tagName==='FORM')return n;
+  return null;}
+ function disabled(el){
+  var n;
+  if(el.hasAttribute('disabled'))return true;
+  for(n=el.parentNode;n&&n.nodeType===1;n=n.parentNode)
+   if(n.tagName==='FIELDSET'&&n.hasAttribute('disabled'))return true;
+  return false;}
+ /* The states a custom element shows, for :state(); a set of strings */
+ function CustomStateSet(){this._s=new Set();}
+ CustomStateSet.prototype={constructor:CustomStateSet,
+  add:function(v){this._s.add(String(v));return this;},
+  'delete':function(v){return this._s['delete'](String(v));},
+  has:function(v){return this._s.has(String(v));},
+  clear:function(){this._s.clear();},
+  forEach:function(f,t){var me=this;this._s.forEach(function(v){f.call(t,v,v,me);});},
+  values:function(){return this._s.values();},
+  keys:function(){return this._s.values();},
+  entries:function(){return this._s.entries();},
+  get size(){return this._s.size;}};
+ CustomStateSet.prototype[Symbol.iterator]=CustomStateSet.prototype.values;
+ W.CustomStateSet=CustomStateSet;
+ function ElementInternals(){throw new TypeError('Illegal constructor');}
+ var EP=ElementInternals.prototype;
+ Object.defineProperties(EP,{
+  shadowRoot:{configurable:true,get:function(){
+   var el=this._el;return el.__shadow?el:null;}},
+  form:{configurable:true,get:function(){
+   needForm(this,'form');return formOwner(this._el);}},
+  labels:{configurable:true,get:function(){
+   needForm(this,'labels');
+   var out=[],el=this._el,id=el.id,n;
+   if(id)out=listOf(D.querySelectorAll('label[for="'+id+'"]'));
+   for(n=el.parentNode;n&&n.nodeType===1;n=n.parentNode)
+    if(n.tagName==='LABEL'&&out.indexOf(n)<0)out.push(n);
+   return out;}},
+  willValidate:{configurable:true,get:function(){
+   needForm(this,'willValidate');
+   var el=this._el;
+   return !disabled(el)&&!el.hasAttribute('readonly')&&
+    !(el.closest&&el.closest('datalist'));}},
+  validity:{configurable:true,get:function(){
+   needForm(this,'validity');
+   var f=state(this).flags,v=Object.create(ValidityState.prototype),ok=true;
+   FLAGS.forEach(function(k){v[k]=!!f[k];if(f[k])ok=false;});
+   v.valid=ok;return v;}},
+  validationMessage:{configurable:true,get:function(){
+   needForm(this,'validationMessage');return state(this).message;}},
+  states:{configurable:true,get:function(){return state(this).states;}},
+  [Symbol.toStringTag]:{configurable:true,value:'ElementInternals'}});
+ EP.setFormValue=function(value,st){
+  needForm(this,'setFormValue');
+  var s=state(this);s.value=value===undefined?null:value;
+  s.state=st===undefined?s.value:st;};
+ EP.setValidity=function(flags,message,anchor){
+  needForm(this,'setValidity');
+  var s=state(this),f={},any=false;
+  flags=flags||{};
+  FLAGS.forEach(function(k){f[k]=!!flags[k];if(f[k])any=true;});
+  if(any&&(message===undefined||message===''))
+   throw new TypeError("Failed to execute 'setValidity' on 'ElementInternals': "+
+    'The second argument should not be empty if one or more flags in the '+
+    'first argument are true.');
+  s.flags=f;s.message=any?String(message):'';s.anchor=anchor||null;};
+ EP.checkValidity=function(){
+  var el=this._el;
+  if(!this.willValidate||this.validity.valid)return true;
+  el.dispatchEvent(new Event('invalid',{bubbles:false,cancelable:true}));
+  return false;};
+ EP.reportValidity=function(){return this.checkValidity();};
+ /* the ARIA a custom element sets on itself through its internals */
+ ['role','ariaAtomic','ariaAutoComplete','ariaBusy','ariaChecked',
+  'ariaColCount','ariaColIndex','ariaColSpan','ariaCurrent','ariaDescription',
+  'ariaDisabled','ariaExpanded','ariaHasPopup','ariaHidden','ariaInvalid',
+  'ariaKeyShortcuts','ariaLabel','ariaLevel','ariaLive','ariaModal',
+  'ariaMultiLine','ariaMultiSelectable','ariaOrientation','ariaPlaceholder',
+  'ariaPosInSet','ariaPressed','ariaReadOnly','ariaRequired',
+  'ariaRoleDescription','ariaRowCount','ariaRowIndex','ariaRowSpan',
+  'ariaSelected','ariaSetSize','ariaSort','ariaValueMax','ariaValueMin',
+  'ariaValueNow','ariaValueText'].forEach(function(k){
+  Object.defineProperty(EP,k,{configurable:true,enumerable:true,
+   get:function(){var a=state(this).aria;return k in a?a[k]:null;},
+   set:function(v){state(this).aria[k]=v===null?null:String(v);}});});
+ W.ElementInternals=ElementInternals;
+ P.attachInternals=function(){
+  var el=this,name=el.localName||'',C;
+  if(el.nodeType!==1)throw new TypeError('Illegal invocation');
+  if(name.indexOf('-')<0)throw notSupported("Failed to execute 'attachInternals'"+
+   " on 'HTMLElement': Unable to attach ElementInternals to non-custom elements.");
+  C=W.customElements&&W.customElements.get(name);
+  if(C&&C.disabledFeatures&&Array.prototype.indexOf.call(C.disabledFeatures,
+   'internals')>=0)throw notSupported("Failed to execute 'attachInternals' on "+
+   "'HTMLElement': ElementInternals is disabled by disabledFeature static field.");
+  if(INTERNALS.has(el))throw notSupported("Failed to execute 'attachInternals' on"+
+   " 'HTMLElement': ElementInternals for the specified element was already attached.");
+  var i=Object.create(EP);
+  Object.defineProperty(i,'_el',{value:el});
+  var s={flags:{},message:'',anchor:null,value:null,state:null,aria:{},
+   states:new CustomStateSet()};
+  INTERNALS.set(el,s);INTERNALS.set(i,s);
+  if(formAssociated(el))W.__vitaFaceSeen=true;
+  return i;};
+ /* what a form-associated custom element gives its form's data:
+    undefined for any other element */
+ W.__vitaFaceValue=function(el){
+  var s=INTERNALS.get(el);
+  return s&&formAssociated(el)?s.value:undefined;};
+})();
 /* Popovers, as a plain show and hide: there is no top layer here, so an
  * open popover is a visible element and a closed one is hidden. */
 P.showPopover=function(){this.removeAttribute('hidden');this.__popopen=true;
@@ -3093,8 +3233,12 @@ Object.defineProperty(P,'elements',{configurable:true,get:function(){
     reaches form.elements.username */
  var self=this;
  return liveCollection(function(){
-  return listOf(self.querySelectorAll(
-   'input,select,textarea,button,fieldset,object,output'));},
+  var sel='input,select,textarea,button,fieldset,object,output';
+  if(!W.__vitaFaceSeen)return listOf(self.querySelectorAll(sel));
+  /* and the form-associated custom elements, once a page has one */
+  return listOf(self.getElementsByTagName('*')).filter(function(e){
+   return e.matches(sel)||(e.localName.indexOf('-')>0&&
+    W.__vitaFaceValue(e)!==undefined);});},
   FormControls.prototype,true);}});
 Object.defineProperty(P,'length',{configurable:true,get:function(){
  /* On character data it is the number of characters, which is what code
@@ -3193,11 +3337,14 @@ P.submit=function(submitter){
  if(method!=='get')return;   /* a navigation cannot carry a body here */
  var q=new URLSearchParams('');
  listOf(this.elements).forEach(function(c){
+  if(c.localName&&c.localName.indexOf('-')>0)return;
   var n=c.name;if(!n||c.disabled)return;
   var t=String(c.type||'').toLowerCase();
   if(t==='submit'||t==='button'||t==='reset'||t==='file')return;
   if((t==='checkbox'||t==='radio')&&!c.checked)return;
   q.append(n,c.value===undefined?'':c.value);});
+ if(W.__vitaFaceSeen)faceEntries(this).forEach(function(p){
+  if(typeof p[1]==='string')q.append(p[0],p[1]);});
  /* Navigating in the middle of a dispatch tears down the page the
     dispatch is walking; let the current task finish first. */
  try{var u=new URL(action,D.baseURI);u.search=q.toString();
@@ -6972,4 +7119,5 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    return liveCollection(function(){return listOf(dkids.get.call(D));},
     null,true);}});
 })();
+
 })();
