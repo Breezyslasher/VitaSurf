@@ -3160,8 +3160,34 @@ Object.defineProperty(P,'index',{configurable:true,get:function(){
 P.requestSubmit=function(submitter){
  if(!this.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})))return;
  this.submit(submitter);};
-P.submit=function(){
+/* The window a form or link target names (VitaSurf): _self, _parent,
+   _top, or a frame by name, looked for here, then in the frames around
+   this one. A name found nowhere, and _blank, stay here: there is one
+   window on the Vita. */
+function targetWindow(name){
+ var n=String(name||'').trim(),l=n.toLowerCase(),w,seen=0;
+ if(!n||l==='_self'||l==='_blank')return W;
+ if(l==='_top')return W.top;
+ if(l==='_parent')return W.parent;
+ function find(win){
+  var f,i;
+  try{f=win.document.getElementsByTagName('iframe');}catch(e){return null;}
+  for(i=0;i<f.length;i++){
+   if(f[i].getAttribute('name')===n&&f[i].contentWindow)return f[i].contentWindow;}
+  for(i=0;i<f.length;i++){
+   var c=f[i].contentWindow,r=c&&c!==win?find(c):null;
+   if(r)return r;}
+  return null;}
+ for(w=W;w&&seen<16;seen++){
+  var r=find(w);if(r)return r;
+  if(w===w.parent)break;w=w.parent;}
+ return W;}
+P.submit=function(submitter){
  if(this.tagName!=='FORM')return;
+ var target=(submitter&&submitter.getAttribute&&submitter.getAttribute('formtarget'))||
+  this.getAttribute('target');
+ if(target===null||target===''){var bt=D.querySelector('base[target]');
+  target=bt?bt.getAttribute('target'):'';}
  var method=String(this.getAttribute('method')||'get').toLowerCase();
  var action=this.action||D.baseURI;
  if(method!=='get')return;   /* a navigation cannot carry a body here */
@@ -3174,9 +3200,9 @@ P.submit=function(){
   q.append(n,c.value===undefined?'':c.value);});
  /* Navigating in the middle of a dispatch tears down the page the
     dispatch is walking; let the current task finish first. */
- try{var u=new URL(action,D.baseURI);u.searchParams=q;
-  var href=u.href;
-  setTimeout(function(){try{location.href=href;}catch(e){}},0);
+ try{var u=new URL(action,D.baseURI);u.search=q.toString();
+  var href=u.href,win=targetWindow(target);
+  setTimeout(function(){try{win.location.href=href;}catch(e){}},0);
  }catch(e){}};
 P.reset=function(){
  if(this.tagName!=='FORM')return;

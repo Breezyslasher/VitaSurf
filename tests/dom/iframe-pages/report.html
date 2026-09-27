@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<!-- A frame tests/dom/iframe-hidden.html loads: it tells its parent it
+     ran, with its query, by postMessage. -->
+<html><head><title>report</title></head><body><script>
+if (window.parent !== window) {
+ window.parent.postMessage({ from: location.search }, '*');
+}
+</script></body></html>

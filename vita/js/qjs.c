@@ -4226,28 +4226,6 @@ static JSValue win_vita_frame_global(JSContext *ctx, JSValueConst this_val,
 	return JS_NULL;
 }
 
-/*
- * How many frame windows there may be under one top window before script
- * stops getting new ones (VitaSurf). Each frame's page is a realm of its
- * own with the prelude run in it, about 2.4 MB of the runtime's 96 on the
- * native harness, and some pages make a hidden blank iframe per widget.
- * Past the cap script gets the old stand-in window; frames that layout
- * shows still get real ones.
- */
-#define FRAME_WINDOW_CAP 8
-
-static int frame_windows(struct browser_window *bw)
-{
-	int i, n = 0;
-
-	for (i = 0; i < bw->iframe_count; i++) {
-		if (bw->iframes[i] != NULL) {
-			n += 1 + frame_windows(bw->iframes[i]);
-		}
-	}
-	return n;
-}
-
 static bool has_frame_window(struct browser_window *bw, struct dom_node *node)
 {
 	int i;
@@ -4291,11 +4269,14 @@ static JSValue win_vita_frame_start(JSContext *ctx, JSValueConst this_val,
 		while (root->parent != NULL) {
 			root = root->parent;
 		}
-		if (frame_windows(root) >= FRAME_WINDOW_CAP) {
+		/* each frame page is a realm: see the cap in frames.h */
+		if (browser_window_frame_count(root) >=
+		    BROWSER_WINDOW_FRAME_CAP) {
 			if (!thread->frame_cap_said) {
 				thread->frame_cap_said = true;
 				vita_log("qjs: %d frames already; script gets a "
-					 "stand-in for more", FRAME_WINDOW_CAP);
+					 "stand-in for more",
+					 BROWSER_WINDOW_FRAME_CAP);
 			}
 			return JS_NULL;
 		}

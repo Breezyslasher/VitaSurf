@@ -355,10 +355,13 @@ each other directly and cross-origin ones only through `postMessage` and
 that used to replace it. Patch 0248 gives an iframe with no src a real
 blank document the moment script asks for it (NetSurf answers that one
 about: fetch synchronously), loads srcdoc as `about:srcdoc` with the
-parent's base URL, and keeps a frame that is not displayed. Each frame
-page is a realm of its own, about 2.4 MB, so script gets real windows for
-at most eight frames under one page and a stand-in after that; the log
-says what each one cost. A sandboxed frame is not given an opaque origin
+parent's base URL, and keeps a frame that is not displayed. Patch 0249
+loads an iframe layout does not show (display: none, visibility: hidden)
+as a browser does, and a form can post into one by name. Each frame page
+is a realm of its own, about 2.4 MB, so there are at most eight frame
+windows under one page, except for frames that are shown: past that,
+script gets a stand-in and a hidden frame does not load. The log says
+what each frame script made cost. A sandboxed frame is not given an opaque origin
 yet, so its page runs script only when the sandbox allows both scripts
 and same-origin, and otherwise none. `document.write` works on a document that is not
 being parsed, which is how pages fill a blank iframe; a page's own script
