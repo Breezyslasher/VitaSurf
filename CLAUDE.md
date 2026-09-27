@@ -13,7 +13,7 @@ License: NetSurf is GPLv2, so this project is GPLv2. Every added library must be
 ## Platform constraints
 
 - CPU: 32-bit ARMv7 (Cortex-A9, NEON). Toolchain prefix `arm-vita-eabi-`. The compiler defines `__vita__`.
-- Memory is the main constraint. The system has 512 MB total and the app gets only part of it. Set `_newlib_heap_size_user` explicitly, log free memory at startup and after each page load, and treat any unbounded cache as a bug. Try extended memory mode (`ATTRIBUTE2=12` in the SFO) only after basic boot works, and verify it on hardware.
+- Memory is the main constraint. The system has 512 MB total and the app gets only part of it. Set `_newlib_heap_size_user` explicitly, log free memory at startup and after each page load, and treat any unbounded cache as a bug. The newlib heap is sized at startup from the memory then free, less a reserve (`vita/platform/vita_heap.c`), so `_newlib_heap_size_user` is only its fallback. Extended memory mode (`ATTRIBUTE2=12` in the SFO) is built as a second VPK, `VitaSurf-extmem`, until it is verified on hardware.
 - No JIT. Both Duktape and QuickJS are interpreters, so JS performance comes from doing less work, not from engine tricks.
 - Screen: 960x544. Front touch reports coordinates at 1920x1088, so divide by 2.
 - `app0:` is read-only. All writable data goes under `ux0:data/VitaSurf/`.

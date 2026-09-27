@@ -165,6 +165,29 @@ jobs:
           name: ${{ matrix.artifact }}-${{ github.run_number }}
           path: build/VitaSurf.vpk
 
+      - name: Build the extended memory VPK
+        # The same build linked again with ATTRIBUTE2=12 in its SFO, which
+        # asks for the 365 MB main memory budget. It is a separate VPK
+        # while it is tried on hardware; the heap takes whatever budget the
+        # system grants, so a refused request starts with the ordinary one.
+        if: matrix.engine == 'quickjs'
+        run: |
+          cmake -B build-ext -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVITASURF_JS_ENGINE="${{ matrix.engine }}" \
+            -DVITASURF_EXTENDED_MEMORY=ON \
+            -DVITASURF_BUILD_ID="${GITHUB_RUN_NUMBER}" \
+            -DVITASURF_BUILD_SHA="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          cmake --build build-ext
+
+      - name: Upload the extended memory VPK
+        if: matrix.engine == 'quickjs'
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaSurf-extmem-${{ github.run_number }}
+          path: build-ext/VitaSurf.vpk
+
       - name: Upload ELF for debugging
         uses: actions/upload-artifact@v4
         with:

@@ -372,7 +372,14 @@ every fetch uses). Module workers, `blob:` workers and `terminate()` work;
 a worker making workers, shared and service workers do not. A page runs
 at most four. A frame's page or a worker is refused a realm when less than
 16 MB of the heap is left, rather than left half made, and the log says
-so. The log says
+so. The heap itself is sized when the app starts, from the memory the
+system has given it less a 32 MB reserve for the screen, the GPU, the
+network stack and the system dialogs (`vita/platform/vita_heap.c`, which
+replaces newlib's own heap setup), and the script memory limit grows with
+it. CI also builds `VitaSurf-extmem`, the same build asking for the
+extended memory budget (365 MB in place of about 256), which gives it
+about 109 MB more heap; the startup line in the log says how much memory
+was free and how big the heap is. The log says
 what each frame script made cost. A sandboxed frame is not given an opaque origin
 yet, so its page runs script only when the sandbox allows both scripts
 and same-origin, and otherwise none. `document.write` works on a document that is not

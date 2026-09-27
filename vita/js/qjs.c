@@ -10484,11 +10484,12 @@ static nserror heap_start(jsheap *ret)
 		return NSERROR_NOMEM;
 	}
 	/*
-	 * Keep a page's scripts within a sensible slice of the heap. The
-	 * newlib heap is 176 MB (VITASURF_HEAP_MB) and the rest of it holds
-	 * the document, the box tree and the image cache, so scripts get a
-	 * third of it. Large application bundles need most of this for
-	 * their bytecode alone.
+	 * Keep a page's scripts within a sensible slice of the heap: 96 MB
+	 * of the 176 MB heap there used to be, the same share of the heap
+	 * there is now (it is sized at startup; see vita_heap.c), and never
+	 * less than 96 MB. The rest of the heap holds the document, the box
+	 * tree and the image cache. Large application bundles need most of
+	 * this for their bytecode alone.
 	 *
 	 * The stack limit is QuickJS's own recursion guard, measured against
 	 * the C stack. The main thread has 4 MB (VITASURF_STACK_KB) and
@@ -10499,7 +10500,17 @@ static nserror heap_start(jsheap *ret)
 	JS_SetModuleLoaderFunc(ret->rt, qjs_module_normalize,
 			       qjs_module_loader, NULL);
 	JS_SetHostPromiseRejectionTracker(ret->rt, qjs_rejection_tracker, NULL);
-	JS_SetMemoryLimit(ret->rt, 96 * 1024 * 1024);
+	{
+		size_t limit = (size_t)vita_heap_size_kb() / 176 * 96 * 1024;
+
+		if (limit < (size_t)96 * 1024 * 1024) {
+			limit = (size_t)96 * 1024 * 1024;
+		}
+		JS_SetMemoryLimit(ret->rt, limit);
+		vita_log("qjs: script memory limit %u MB of a %u MB heap",
+			 (unsigned int)(limit / (1024 * 1024)),
+			 vita_heap_size_kb() / 1024);
+	}
 	{
 		/*
 		 * Measured against the stack the thread actually got, never

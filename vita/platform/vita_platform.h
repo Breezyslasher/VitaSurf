@@ -144,6 +144,14 @@ void vita_log_memory(const char *what);
  */
 unsigned int vita_heap_free_kb(void);
 
+/*
+ * The newlib heap's size, and the user memory that was free when it was
+ * taken (vita_heap.c): the heap is sized from that at startup, so a log
+ * shows what the system gave and whether extended memory was granted.
+ */
+unsigned int vita_heap_size_kb(void);
+unsigned int vita_heap_free_at_start_kb(void);
+
 /**
  * Log which image formats registered a content handler. Call after
  * netsurf_init(), which is what registers them.

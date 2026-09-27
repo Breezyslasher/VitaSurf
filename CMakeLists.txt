@@ -35,10 +35,15 @@ else()
 endif()
 
 option(VITASURF_DEBUG "Verbose logging and debug symbols" OFF)
-# The app has about 256 MB of user memory (the startup log shows 114 MB
-# free beside a 128 MB heap). 176 MB leaves room for the main thread
-# stack, the GPU contexts and the system dialogs.
-set(VITASURF_HEAP_MB 176 CACHE STRING "newlib heap size in MB (_newlib_heap_size_user)")
+# The newlib heap is sized at startup from the user memory then free, less
+# VITASURF_HEAP_RESERVE_MB for what is allocated outside it later (the
+# screen texture, the GPU contexts, the network stack and the system
+# dialogs); see vita/platform/vita_heap.c. The ordinary budget gives about
+# 204 MB that way, the extended one about 109 MB more. VITASURF_HEAP_MB is
+# the size taken if the free memory cannot be read: the fixed size used
+# before, which a build 472 log ran to 178 of 180 MB with 60 MB unused.
+set(VITASURF_HEAP_MB 176 CACHE STRING "newlib heap size in MB when free memory cannot be read")
+set(VITASURF_HEAP_RESERVE_MB 32 CACHE STRING "user memory in MB left outside the newlib heap")
 set(VITASURF_BUILD_ID "local" CACHE STRING "Build identifier written to the log (CI run number)")
 set(VITASURF_BUILD_SHA "" CACHE STRING "Short commit hash written to the log")
 if(VITASURF_BUILD_SHA STREQUAL "")
@@ -66,8 +71,11 @@ endif()
 set(NETSURF_STAGE "${CMAKE_SOURCE_DIR}/out/netsurf" CACHE PATH
     "Output of scripts/build-netsurf.sh (libnetsurf.a and resources/)")
 
-# Extended memory mode (ATTRIBUTE2=12) is off until basic boot works on
-# hardware; enable it with -DVITASURF_EXTENDED_MEMORY=ON afterwards.
+# Extended memory mode (ATTRIBUTE2=12) asks for a 365 MB main memory
+# budget in place of about 256 MB. CI builds it as a second VPK
+# (VitaSurf-extmem) while it is tried on hardware; the heap takes whatever
+# budget the system actually grants, so a build that asks and is refused
+# starts with the ordinary heap.
 option(VITASURF_EXTENDED_MEMORY "Request the extended memory budget" OFF)
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
 if(VITASURF_EXTENDED_MEMORY)
@@ -87,6 +95,7 @@ set(NETSURF_LIBNSFB_SRC "${CMAKE_SOURCE_DIR}/deps/libnsfb")
 # ---------------------------------------------------------------------------
 add_executable(${PROJECT_NAME}
     vita/platform/vita_main.c
+    vita/platform/vita_heap.c
     vita/platform/vita_platform.c
     # Names the failing assertion in the log; without it a failed assert
     # reaches the dump as an undefined instruction inside newlib.
@@ -193,11 +202,15 @@ target_compile_options(${PROJECT_NAME} PRIVATE
 )
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     VITASURF_HEAP_MB=${VITASURF_HEAP_MB}
+    VITASURF_HEAP_RESERVE_MB=${VITASURF_HEAP_RESERVE_MB}
     VITASURF_STACK_KB=${VITASURF_STACK_KB}
     VITASURF_BUILD_ID="${VITASURF_BUILD_ID}"
     VITASURF_BUILD_SHA="${VITASURF_BUILD_SHA}"
     VITASURF_JS_ENGINE="${VITASURF_JS_ENGINE}"
 )
+if(VITASURF_EXTENDED_MEMORY)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_EXTENDED_MEMORY=1)
+endif()
 if(VITASURF_DEBUG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_DEBUG=1)
 endif()
