@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<!-- The innermost frame of tests/dom/iframe-load-order.html: it notes its
+     load, and what the top page's readyState was then. -->
+<html><head><title>leaf</title></head><body><script>
+window.addEventListener('load', function () {
+ if (top.order) top.order.push('leaf load, top ' + top.document.readyState);
+});
+</script></body></html>

@@ -360,7 +360,9 @@ loads an iframe layout does not show (display: none, visibility: hidden)
 as a browser does, and a form can post into one by name. Each frame page
 is a realm of its own, about 2.4 MB, so there are at most eight frame
 windows under one page, except for frames that are shown: past that,
-script gets a stand-in and a hidden frame does not load. The log says
+script gets a stand-in and a hidden frame does not load. A page's load
+event waits for its frames' own loads, as in a browser, for at most 20
+seconds. The log says
 what each frame script made cost. A sandboxed frame is not given an opaque origin
 yet, so its page runs script only when the sandbox allows both scripts
 and same-origin, and otherwise none. `document.write` works on a document that is not

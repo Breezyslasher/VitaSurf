@@ -80,6 +80,7 @@
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_construct.h"
 #include "content/handlers/html/box_inspect.h"
+#include "content/handlers/html/frame_doc.h"
 #include "desktop/browser_private.h"
 #include "desktop/scrollbar.h"
 
@@ -163,6 +164,11 @@ struct jsthread {
 	struct browser_window *win;
 	html_content *htmlc;
 	unsigned frames_logged;   /**< frame pages this page made, logged */
+	/* The window's load, held until the page's frames have loaded */
+	bool load_deferred;
+	bool load_releasing;      /**< firing the held load: do not hold it */
+	uint64_t load_deferred_ms;
+	struct dom_document *load_doc;
 	bool frame_cap_said;      /**< the frame cap has been logged */
 	uint64_t deadline_ms;     /**< when the running script must stop */
 	/*
@@ -1033,6 +1039,7 @@ static dom_string *to_dom_string_len(const char *s, size_t len)
  */
 
 static const char *shown_url(const char *url);
+static void deferred_load_check(void *p);
 static struct dom_document *thread_document(jsthread *thread);
 
 static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
@@ -10442,6 +10449,8 @@ nserror js_closethread(jsthread *thread)
 		thread->relayout_pending = false;
 	}
 	guit->misc->schedule(-1, close_removed_frames, thread);
+	guit->misc->schedule(-1, deferred_load_check, thread);
+	thread->load_deferred = false;
 	/* drop module scripts still waiting on an import, and the
 	 * scheduler entry that would have retried them */
 	js_free_deferred(thread);
@@ -13276,6 +13285,112 @@ void vita_js_scrolled(struct browser_window *bw)
 	}
 }
 
+/*
+ * A page's load waits for its frames, as in a browser (VitaSurf): an
+ * iframe in the page delays it until the frame's own load has fired.
+ * NetSurf fires the page's load as its document is converted, before
+ * layout has made the frames' windows at all, so an iframe with no
+ * window yet counts as loading until the page has been laid out once;
+ * after that one layout gave no window (past the frame cap, or with
+ * nothing to load) never will get one, and does not hold the page.
+ */
+#define LOAD_WAIT_POLL_MS 50
+#define LOAD_WAIT_MAX_MS 20000
+
+/** Whether a frame window's page has fired its load event. */
+static bool frame_loaded(struct browser_window *w)
+{
+	jsthread *t;
+
+	if (w->loading_content != NULL) {
+		t = content_thread(w->loading_content);
+		return t != NULL && t->ready_state != NULL &&
+			strcmp(t->ready_state, "complete") == 0;
+	}
+	t = content_thread(w->current_content);
+	/* a page without script (sandboxed, or not HTML) is loaded once
+	 * it is what the frame shows */
+	return t == NULL || (t->ready_state != NULL &&
+			     strcmp(t->ready_state, "complete") == 0);
+}
+
+struct frames_wait {
+	jsthread *thread;
+	bool laid_out;            /**< the page has had its first layout */
+	bool pending;
+};
+
+static bool frame_pending_visit(struct dom_node *node, bool *stop, void *pw)
+{
+	struct frames_wait *wait = pw;
+	struct browser_window *bw = wait->thread->win;
+	int i;
+
+	if (!node_in_document(node)) {
+		return true;
+	}
+	for (i = 0; i < bw->iframe_count; i++) {
+		if (bw->iframes[i] != NULL &&
+		    bw->iframes[i]->frame_node == node) {
+			if (!frame_loaded(bw->iframes[i])) {
+				wait->pending = true;
+				*stop = true;
+			}
+			return true;
+		}
+	}
+	if (!wait->laid_out) {
+		wait->pending = true;
+		*stop = true;
+	}
+	return true;
+}
+
+/** Whether any iframe in the thread's page is still loading. */
+static bool frames_pending(jsthread *thread)
+{
+	struct browser_window *bw = thread->win;
+	struct frames_wait wait;
+
+	if (bw == NULL || thread->htmlc == NULL) {
+		return false;
+	}
+	wait.thread = thread;
+	wait.pending = false;
+	wait.laid_out = bw->current_content != NULL &&
+		hlcache_handle_get_content(bw->current_content) ==
+		(struct content *)thread->htmlc;
+	html_frame_doc_each_iframe(thread->htmlc, frame_pending_visit, &wait);
+	return wait.pending;
+}
+
+static void deferred_load_check(void *p)
+{
+	jsthread *thread = p;
+	uint64_t waited;
+
+	if (thread == NULL || thread->closed || !thread->load_deferred) {
+		return;
+	}
+	waited = now_ms() - thread->load_deferred_ms;
+	if (frames_pending(thread) && waited < LOAD_WAIT_MAX_MS) {
+		guit->misc->schedule(LOAD_WAIT_POLL_MS, deferred_load_check,
+				     thread);
+		return;
+	}
+	if (waited >= LOAD_WAIT_MAX_MS) {
+		vita_log("qjs: a frame still loading after %u s; the page's "
+			 "load fires anyway", LOAD_WAIT_MAX_MS / 1000);
+	} else {
+		vita_log("qjs: the page's frames have loaded (%u ms); its "
+			 "load fires", (unsigned)waited);
+	}
+	thread->load_deferred = false;
+	thread->load_releasing = true;
+	js_fire_event(thread, "load", thread->load_doc, NULL);
+	thread->load_releasing = false;
+}
+
 bool js_fire_event(jsthread *thread, const char *type,
 		   struct dom_document *doc, struct dom_node *target)
 {
@@ -13285,6 +13400,20 @@ bool js_fire_event(jsthread *thread, const char *type,
 
 	if (thread == NULL || thread->closed) {
 		return true;
+	}
+	if (target == NULL && strcmp(type, "load") == 0 &&
+	    !thread->load_releasing) {
+		if (thread->load_deferred) {
+			return true;
+		}
+		if (frames_pending(thread)) {
+			thread->load_deferred = true;
+			thread->load_deferred_ms = now_ms();
+			thread->load_doc = doc;
+			guit->misc->schedule(LOAD_WAIT_POLL_MS,
+					     deferred_load_check, thread);
+			return true;
+		}
 	}
 	if (strcmp(type, "DOMContentLoaded") == 0) {
 		thread->ready_state = "interactive";
@@ -13346,6 +13475,14 @@ bool js_fire_event(jsthread *thread, const char *type,
 					bw->frame_node, evt, &success);
 			}
 			dom_event_unref(evt);
+		}
+		/* the page around it may be waiting on this frame */
+		if (bw != NULL && bw->parent != NULL) {
+			jsthread *up = window_thread(bw->parent);
+
+			if (up != NULL && up->load_deferred) {
+				guit->misc->schedule(0, deferred_load_check, up);
+			}
 		}
 	}
 	return true;
