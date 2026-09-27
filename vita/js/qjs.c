@@ -49,6 +49,7 @@
 #include "content/handlers/javascript/content.h"
 #include "desktop/browser_private.h"
 #include "desktop/frames.h"
+#include "content/fetchers/curl.h"
 
 #include <dom/dom.h>
 #include <dom/bindings/hubbub/parser.h>
@@ -164,6 +165,17 @@ struct jsthread {
 	struct browser_window *win;
 	html_content *htmlc;
 	unsigned frames_logged;   /**< frame pages this page made, logged */
+	/*
+	 * Dedicated workers (VitaSurf). A worker is a realm of its own on
+	 * the page's runtime, run by the same scheduler: it shares the
+	 * page's window and content for fetching and base URLs, and has no
+	 * document. The page owns its workers and takes them down with it.
+	 */
+	bool is_worker;
+	bool worker_closing;      /**< its close is scheduled */
+	struct jsthread *owner;   /**< the page's thread, for a worker */
+	struct jsthread *workers; /**< a page's workers */
+	struct jsthread *worker_next;
 	/* The window's load, held until the page's frames have loaded */
 	bool load_deferred;
 	bool load_releasing;      /**< firing the held load: do not hold it */
@@ -1040,6 +1052,9 @@ static dom_string *to_dom_string_len(const char *s, size_t len)
 
 static const char *shown_url(const char *url);
 static void deferred_load_check(void *p);
+static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
+			     bool whole);
+static bool realm_room(const char *what);
 static struct dom_document *thread_document(jsthread *thread);
 
 static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
@@ -3758,7 +3773,8 @@ static void listener_trampoline(struct dom_event *evt, void *pw);
 
 static struct dom_document *thread_document(jsthread *thread)
 {
-	if (thread == NULL || thread->htmlc == NULL) {
+	/* a worker has no document, though it shares its page's content */
+	if (thread == NULL || thread->is_worker || thread->htmlc == NULL) {
 		return NULL;
 	}
 	return thread->htmlc->document;
@@ -4327,6 +4343,235 @@ static JSValue win_vita_doc_base(JSContext *ctx, JSValueConst this_val,
 	}
 	return JS_NewString(ctx, shown_url(nsurl_access(
 		thread->htmlc->base_url)));
+}
+
+/*
+ * Dedicated workers (VitaSurf). The most a page runs at once: each is a
+ * realm with the prelude in it, like a frame's page.
+ */
+#define WORKER_CAP 4
+
+/*
+ * __vitaWorkerNew(): a new worker's global, or null when the page has as
+ * many as it may, there is no room, or its prelude did not finish. The
+ * prelude's Worker then turns it into a worker's global and runs the
+ * script in it.
+ */
+static JSValue win_vita_worker_new(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *owner = JS_GetContextOpaque(ctx), *w;
+	unsigned int n = 0;
+	uint64_t t0;
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	/* a worker making a worker is not supported */
+	if (owner == NULL || owner->closed || owner->is_worker) {
+		return JS_NULL;
+	}
+	for (w = owner->workers; w != NULL; w = w->worker_next) {
+		if (!w->worker_closing) {
+			n++;
+		}
+	}
+	if (n >= WORKER_CAP) {
+		vita_log("qjs: %u workers already; no more", n);
+		return JS_NULL;
+	}
+	if (!realm_room("a worker")) {
+		return JS_NULL;
+	}
+	t0 = now_ms();
+	w = thread_make(owner->heap, owner->win, owner->htmlc, true);
+	if (w == NULL) {
+		return JS_NULL;
+	}
+	/* from here on it has no document */
+	w->is_worker = true;
+	w->owner = owner;
+	w->ready_state = "complete";
+	w->worker_next = owner->workers;
+	owner->workers = w;
+	vita_log("qjs: a worker's realm, made in %u ms; runtime now %u KB",
+		 (unsigned)(now_ms() - t0), runtime_kb(owner->heap->rt));
+	return JS_GetGlobalObject(w->ctx);
+}
+
+static void worker_unlink(jsthread *w)
+{
+	jsthread **pp;
+
+	if (w->owner == NULL) {
+		return;
+	}
+	for (pp = &w->owner->workers; *pp != NULL; pp = &(*pp)->worker_next) {
+		if (*pp == w) {
+			*pp = w->worker_next;
+			break;
+		}
+	}
+	w->owner = NULL;
+	w->worker_next = NULL;
+}
+
+static void worker_close_cb(void *p)
+{
+	jsthread *w = p;
+
+	worker_unlink(w);
+	js_destroythread(w);
+}
+
+/*
+ * __vitaWorkerClose(global): end the worker whose global this is, from
+ * its page (terminate) or from itself (close). Its realm goes at the
+ * next turn of the scheduler, not under the script calling this.
+ */
+static JSValue win_vita_worker_close(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *me = JS_GetContextOpaque(ctx), *owner, *w;
+
+	C_WHERE;
+	(void)this_val;
+	if (me == NULL || argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	owner = me->is_worker ? me->owner : me;
+	for (w = owner != NULL ? owner->workers : NULL; w != NULL;
+	     w = w->worker_next) {
+		JSValue g;
+		bool same;
+
+		if (w->worker_closing || w->closed) {
+			continue;
+		}
+		g = JS_GetGlobalObject(w->ctx);
+		same = JS_VALUE_GET_PTR(g) == JS_VALUE_GET_PTR(argv[0]);
+		JS_FreeValue(ctx, g);
+		if (same) {
+			w->worker_closing = true;
+			/* its timers stop now; the realm goes shortly */
+			guit->misc->schedule(0, worker_close_cb, w);
+			break;
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+struct sync_body {
+	char *data;
+	size_t len;
+	size_t cap;
+	bool over;
+};
+
+/* A script importScripts() waits for is at most this big. */
+#define SYNC_FETCH_MAX (8u * 1024u * 1024u)
+
+static size_t sync_write(char *p, size_t size, size_t n, void *ud)
+{
+	struct sync_body *b = ud;
+	size_t len = size * n;
+
+	if (b->len + len > SYNC_FETCH_MAX) {
+		b->over = true;
+		return 0;
+	}
+	if (b->len + len + 1 > b->cap) {
+		size_t cap = b->cap != 0 ? b->cap : 16384;
+		char *d;
+
+		while (cap < b->len + len + 1) {
+			cap *= 2;
+		}
+		d = realloc(b->data, cap);
+		if (d == NULL) {
+			return 0;
+		}
+		b->data = d;
+		b->cap = cap;
+	}
+	memcpy(b->data + b->len, p, len);
+	b->len += len;
+	b->data[b->len] = '\0';
+	return len;
+}
+
+/*
+ * __vitaFetchSync(url): [status, text] for a worker's importScripts(),
+ * or null if it could not be fetched. importScripts() is synchronous and
+ * NetSurf's fetches are not, so this is the one fetch that blocks: the
+ * whole browser waits for it, as a worker thread would in a browser. It
+ * starts from the same curl handle every fetch does.
+ */
+static JSValue win_vita_fetch_sync(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct sync_body body = { NULL, 0, 0, false };
+	const char *url;
+	CURL *c;
+	CURLcode rc;
+	long status = 0;
+	uint64_t t0;
+	JSValue r = JS_NULL;
+
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1 || thread == NULL) {
+		return JS_NULL;
+	}
+	url = JS_ToCString(ctx, argv[0]);
+	if (url == NULL) {
+		return JS_EXCEPTION;
+	}
+	c = fetch_curl_blank_dup();
+	if (c == NULL) {
+		c = curl_easy_init();
+	}
+	if (c == NULL) {
+		JS_FreeCString(ctx, url);
+		return JS_NULL;
+	}
+	t0 = now_ms();
+	curl_easy_setopt(c, CURLOPT_URL, url);
+	curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 10L);
+	curl_easy_setopt(c, CURLOPT_TIMEOUT, 20L);
+	curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+	curl_easy_setopt(c, CURLOPT_USERAGENT, user_agent_string());
+	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sync_write);
+	curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
+	curl_easy_setopt(c, CURLOPT_PRIVATE, NULL);
+	curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, NULL);
+	curl_easy_setopt(c, CURLOPT_PROGRESSFUNCTION, NULL);
+	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 1L);
+	rc = curl_easy_perform(c);
+	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+	curl_easy_cleanup(c);
+	vita_log("qjs: a worker's script waited %u ms for %u KB (%s, "
+		 "status %d)",
+		 (unsigned)(now_ms() - t0), (unsigned)(body.len / 1024),
+		 rc == CURLE_OK ? "ok" : curl_easy_strerror(rc), (int)status);
+	if (rc == CURLE_OK && !body.over) {
+		/* a file: URL has no status; it read, so it is there */
+		if (status == 0) {
+			status = 200;
+		}
+		r = JS_NewArray(ctx);
+		JS_SetPropertyUint32(ctx, r, 0, JS_NewInt32(ctx, (int32_t)status));
+		JS_SetPropertyUint32(ctx, r, 1, JS_NewStringLen(ctx,
+			body.data != NULL ? body.data : "", body.len));
+	}
+	free(body.data);
+	JS_FreeCString(ctx, url);
+	return r;
 }
 
 /* __vitaParentGlobal(): the global of the page around this frame */
@@ -5311,7 +5556,9 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 {
 	nsurl *cur = NULL, *url = NULL;
 
-	if (thread == NULL || thread->win == NULL || href == NULL) {
+	/* a worker shares its page's window but cannot take it anywhere */
+	if (thread == NULL || thread->win == NULL || href == NULL ||
+	    thread->is_worker) {
 		return JS_UNDEFINED;
 	}
 	/*
@@ -9773,8 +10020,10 @@ static void bc_store_module(JSContext *ctx, const char *url,
 			    const char *src, size_t srclen, JSValueConst fn);
 static void bc_index_flush(void);
 
-static void setup_globals(jsthread *thread)
+static bool setup_globals(jsthread *thread)
 {
+	bool ok = true;
+
 	JSContext *ctx = thread->ctx;
 	JSValue global = JS_GetGlobalObject(ctx);
 	JSValue doc, console, nav, loc, node_proto_obj;
@@ -9935,6 +10184,15 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaFrameGlobal",
 			  JS_NewCFunction(ctx, win_vita_frame_global,
 					  "__vitaFrameGlobal", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaWorkerNew",
+			  JS_NewCFunction(ctx, win_vita_worker_new,
+					  "__vitaWorkerNew", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaWorkerClose",
+			  JS_NewCFunction(ctx, win_vita_worker_close,
+					  "__vitaWorkerClose", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaFetchSync",
+			  JS_NewCFunction(ctx, win_vita_fetch_sync,
+					  "__vitaFetchSync", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaDocBase",
 			  JS_NewCFunction(ctx, win_vita_doc_base,
 					  "__vitaDocBase", 0));
@@ -10052,11 +10310,13 @@ static void setup_globals(jsthread *thread)
 		if (JS_IsException(fn)) {
 			qjs_report_exception_src(ctx, "<prelude>", src, len);
 			JS_FreeValue(ctx, fn);
+			ok = false;
 		} else {
 			r = JS_EvalFunction(ctx, fn);
 			if (JS_IsException(r)) {
 				qjs_report_exception_src(ctx, "<prelude>",
 							 src, len);
+				ok = false;
 			}
 			JS_FreeValue(ctx, r);
 		}
@@ -10071,6 +10331,7 @@ static void setup_globals(jsthread *thread)
 			 (unsigned int)(len / 1024),
 			 (unsigned int)(t1 - t0), how);
 	}
+	return ok;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -10345,41 +10606,50 @@ static bool frame_sandbox_blocks_scripts(struct browser_window *bw)
 	return blocked;
 }
 
-nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
-		     jsthread **thread)
+/*
+ * The newlib heap a new realm needs left over (VitaSurf). A realm is the
+ * prelude's objects and then the page's own, 2.4 MB of the runtime before
+ * a line of the page runs. A build 472 log on claude.ai made the Google
+ * sign-in frame's page with 2.6 MB of the heap left: its prelude ran out
+ * of memory halfway, and the frame was left with half a window. A frame
+ * or a worker is refused a realm below this instead.
+ */
+#define REALM_MIN_FREE_KB (16 * 1024)
+
+static bool realm_room(const char *what)
+{
+	unsigned int free_kb = vita_heap_free_kb();
+
+	if (free_kb >= REALM_MIN_FREE_KB) {
+		return true;
+	}
+	vita_log("qjs: %s gets no script: %u KB of the heap left, under %u",
+		 what, free_kb, (unsigned int)REALM_MIN_FREE_KB);
+	return false;
+}
+
+/*
+ * Make a thread: a realm on the heap's runtime with the prelude run in it.
+ * whole: refuse one whose prelude did not finish, which a frame's page or
+ * a worker can do without (a top page keeps what it got, as before).
+ */
+static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
+			     bool whole)
 {
 	jsthread *ret, *running;
-	struct browser_window *bw = win_priv;
+	bool ok;
 
-	if (frame_sandbox_blocks_scripts(bw)) {
-		/* and no asking again for every element it parses */
-		if (doc_priv != NULL) {
-			((html_content *)doc_priv)->enable_scripting = false;
-		}
-		vita_log("qjs: a sandboxed iframe's page runs no script");
-		return NSERROR_PERMISSION;
-	}
-
-	/* an iframe's scripts run in its top window's runtime */
-	if (bw != NULL && bw->parent != NULL) {
-		while (bw->parent != NULL) {
-			bw = bw->parent;
-		}
-		if (bw->jsheap != NULL) {
-			heap = bw->jsheap;
-		}
-	}
 	if (heap_start(heap) != NSERROR_OK) {
-		return NSERROR_NOMEM;
+		return NULL;
 	}
 	ret = calloc(1, sizeof(*ret));
 	if (ret == NULL) {
-		return NSERROR_NOMEM;
+		return NULL;
 	}
 	ret->ctx = JS_NewContext(heap->rt);
 	if (ret->ctx == NULL) {
 		free(ret);
-		return NSERROR_NOMEM;
+		return NULL;
 	}
 	ret->heap = heap;
 	ret->win = win_priv;
@@ -10389,10 +10659,10 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	ret->import_map = JS_UNINITIALIZED;
 	JS_SetContextOpaque(ret->ctx, ret);
 	/*
-	 * A blank iframe's page is made the moment a script asks for it,
-	 * so this can run inside that script. Its budget is still the one
-	 * that counts: the handler goes back to it once the new page's
-	 * globals are set up (VitaSurf).
+	 * A blank iframe's page, or a worker, is made the moment a script
+	 * asks for it, so this can run inside that script. Its budget is
+	 * still the one that counts: the handler goes back to it once the
+	 * new realm's globals are set up (VitaSurf).
 	 */
 	running = heap->interrupt_thread;
 	if (running != NULL && (running->closed || running->deadline_ms == 0)) {
@@ -10400,14 +10670,63 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	}
 	JS_SetInterruptHandler(heap->rt, qjs_interrupt, ret);
 	heap->interrupt_thread = ret;
-	setup_globals(ret);
+	ok = setup_globals(ret);
 	if (running != NULL) {
 		JS_SetInterruptHandler(heap->rt, qjs_interrupt, running);
 		heap->interrupt_thread = running;
+	} else if (!ok && whole) {
+		JS_SetInterruptHandler(heap->rt, NULL, NULL);
+		heap->interrupt_thread = NULL;
+	}
+	if (!ok && whole) {
+		vita_log("qjs: the prelude did not finish; the realm is "
+			 "thrown away");
+		JS_FreeContext(ret->ctx);
+		free(ret);
+		return NULL;
 	}
 	heap->live_threads++;
 	ret->all_next = all_threads;
 	all_threads = ret;
+	return ret;
+}
+
+nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
+		     jsthread **thread)
+{
+	jsthread *ret;
+	struct browser_window *bw = win_priv;
+	bool frame = bw != NULL && bw->parent != NULL;
+
+	if (frame_sandbox_blocks_scripts(bw) ||
+	    (frame && !realm_room("an iframe's page"))) {
+		/* and no asking again for every element it parses */
+		if (doc_priv != NULL) {
+			((html_content *)doc_priv)->enable_scripting = false;
+		}
+		if (frame_sandbox_blocks_scripts(bw)) {
+			vita_log("qjs: a sandboxed iframe's page runs no "
+				 "script");
+		}
+		return NSERROR_PERMISSION;
+	}
+
+	/* an iframe's scripts run in its top window's runtime */
+	if (frame) {
+		while (bw->parent != NULL) {
+			bw = bw->parent;
+		}
+		if (bw->jsheap != NULL) {
+			heap = bw->jsheap;
+		}
+	}
+	ret = thread_make(heap, win_priv, doc_priv, frame);
+	if (ret == NULL) {
+		if (frame && doc_priv != NULL) {
+			((html_content *)doc_priv)->enable_scripting = false;
+		}
+		return NSERROR_NOMEM;
+	}
 	*thread = ret;
 	vita_log("qjs: new thread win=%p doc=%p", win_priv, doc_priv);
 	return NSERROR_OK;
@@ -10451,6 +10770,14 @@ nserror js_closethread(jsthread *thread)
 	guit->misc->schedule(-1, close_removed_frames, thread);
 	guit->misc->schedule(-1, deferred_load_check, thread);
 	thread->load_deferred = false;
+	/* a page's workers stop with it */
+	{
+		jsthread *w;
+
+		for (w = thread->workers; w != NULL; w = w->worker_next) {
+			js_closethread(w);
+		}
+	}
 	/* drop module scripts still waiting on an import, and the
 	 * scheduler entry that would have retried them */
 	js_free_deferred(thread);
@@ -10503,6 +10830,18 @@ void js_destroythread(jsthread *thread)
 		return;
 	}
 	t0 = now_ms();		/* the rest of the teardown; see above */
+	/* a page's workers go with it; a worker leaves its page's list */
+	while (thread->workers != NULL) {
+		jsthread *w = thread->workers;
+
+		guit->misc->schedule(-1, worker_close_cb, w);
+		worker_unlink(w);
+		js_destroythread(w);
+	}
+	if (thread->is_worker) {
+		guit->misc->schedule(-1, worker_close_cb, thread);
+		worker_unlink(thread);
+	}
 	js_free_deferred(thread);
 	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;

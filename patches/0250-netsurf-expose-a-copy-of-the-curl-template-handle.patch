@@ -1,0 +1,36 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 32c429c4b..bb19028ed 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -2232,6 +2232,13 @@ static int fetch_curl_fdset(lwc_string *scheme, fd_set *read_set,
+ 
+ 
+ 
++/* exported function documented in content/fetchers/curl.h */
++CURL *fetch_curl_blank_dup(void)
++{
++	return fetch_blank_curl != NULL ? curl_easy_duphandle(fetch_blank_curl)
++					: NULL;
++}
++
+ /* exported function documented in content/fetchers/curl.h */
+ nserror fetch_curl_register(void)
+ {
+diff --git a/content/fetchers/curl.h b/content/fetchers/curl.h
+index 4f474f51d..a4d409222 100644
+--- a/content/fetchers/curl.h
++++ b/content/fetchers/curl.h
+@@ -52,4 +52,13 @@ void fetch_curl_pump(void);
+  */
+ void fetch_curl_pump_tick(void);
+ 
++/**
++ * A copy of the handle every fetch starts from, with the CA bundle,
++ * proxy, user agent and timeouts already set (VitaSurf). For the one
++ * fetch that has to be synchronous, a worker's importScripts(); the
++ * caller runs it with curl_easy_perform and cleans it up. NULL before
++ * the fetcher is initialised.
++ */
++CURL *fetch_curl_blank_dup(void);
++
+ #endif

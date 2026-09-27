@@ -362,7 +362,17 @@ is a realm of its own, about 2.4 MB, so there are at most eight frame
 windows under one page, except for frames that are shown: past that,
 script gets a stand-in and a hidden frame does not load. A page's load
 event waits for its frames' own loads, as in a browser, for at most 20
-seconds. The log says
+seconds. A dedicated `Worker` is a realm of its own on the page's
+runtime, run by the same scheduler as the page (there are no threads), so
+its script shares the page's time budget: messages cross as clones, the
+worker has no document, and `importScripts` of a network URL blocks the
+browser until the script arrives, since NetSurf's fetches are
+asynchronous and that one cannot be (patch 0250 lends it the curl setup
+every fetch uses). Module workers, `blob:` workers and `terminate()` work;
+a worker making workers, shared and service workers do not. A page runs
+at most four. A frame's page or a worker is refused a realm when less than
+16 MB of the heap is left, rather than left half made, and the log says
+so. The log says
 what each frame script made cost. A sandboxed frame is not given an opaque origin
 yet, so its page runs script only when the sandbox allows both scripts
 and same-origin, and otherwise none. `document.write` works on a document that is not

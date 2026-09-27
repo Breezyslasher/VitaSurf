@@ -232,6 +232,18 @@ void vita_log_image_decoders(void)
 	}
 }
 
+/* set in vita_main.c */
+extern int _newlib_heap_size_user;
+
+unsigned int vita_heap_free_kb(void)
+{
+	struct mallinfo mi = mallinfo();
+	unsigned int size_kb = (unsigned int)_newlib_heap_size_user / 1024;
+	unsigned int used_kb = (unsigned int)mi.uordblks / 1024;
+
+	return used_kb < size_kb ? size_kb - used_kb : 0;
+}
+
 void vita_log_memory(const char *what)
 {
 	SceKernelFreeMemorySizeInfo info;

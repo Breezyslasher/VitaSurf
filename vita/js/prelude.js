@@ -7120,4 +7120,242 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
     null,true);}});
 })();
 
+/* --- dedicated workers (VitaSurf) --------------------------------------
+ * A worker is a realm of its own on the page's runtime, run by the same
+ * scheduler as the page: messages cross between the two as clones, and
+ * the worker has no document. The page's side is Worker below; the
+ * worker's side is made by __vitaBecomeWorker, which the page calls in
+ * the new realm's own copy of this prelude, so everything it defines is
+ * the worker's. qjs.c makes the realm (__vitaWorkerNew), ends it
+ * (__vitaWorkerClose) and fetches for importScripts (__vitaFetchSync).
+ */
+(function(){
+ var NW=W.__vitaWorkerNew,NC=W.__vitaWorkerClose,FS=W.__vitaFetchSync;
+ ['__vitaWorkerNew','__vitaWorkerClose','__vitaFetchSync'].forEach(
+  function(k){delete W[k];});
+ var geval=eval;
+ /* listeners in script, for objects the DOM does not own */
+ function listens(obj,onerr){
+  var L={};
+  obj.addEventListener=function(t,fn,o){
+   if(!fn)return;t=String(t);
+   var a=L[t]||(L[t]=[]),i;
+   for(i=0;i<a.length;i++)if(a[i].fn===fn)return;
+   a.push({fn:fn,once:!!(o&&typeof o==='object'&&o.once)});};
+  obj.removeEventListener=function(t,fn){
+   var a=L[String(t)],i;
+   if(a)for(i=0;i<a.length;i++)if(a[i].fn===fn){a.splice(i,1);return;}};
+  obj.dispatchEvent=function(ev){
+   var h=obj['on'+ev.type],a=(L[ev.type]||[]).slice();
+   try{ev.target=obj;ev.currentTarget=obj;}catch(e){}
+   function run(fn){
+    try{
+     if(typeof fn==='function'){if(fn.call(obj,ev)===false&&ev.cancelable)ev.preventDefault();}
+     else if(fn&&typeof fn.handleEvent==='function')fn.handleEvent(ev);}
+    catch(e){onerr(e);}}
+   if(typeof h==='function')run(h);
+   a.forEach(function(l){
+    if(l.once)obj.removeEventListener(ev.type,l.fn);
+    run(l.fn);});
+   return !ev.defaultPrevented;};}
+ function errorFields(err,where){
+  var msg,file=where||'',line=0,col=0,m;
+  try{msg=(err&&err.message!==undefined)?String(err.message):String(err);}
+  catch(e){msg='Script error.';}
+  if(err&&err.name&&msg.indexOf(err.name)!==0)msg=err.name+': '+msg;
+  try{m=/\((.*):(\d+):(\d+)\)/.exec(String(err&&err.stack||''));
+   if(m){file=m[1];line=Number(m[2])||0;col=Number(m[3])||0;}}catch(e){}
+  return {message:'Uncaught '+msg,filename:file,lineno:line,colno:col};}
+
+ /* the page's side */
+ function Worker(url,options){
+  if(!(this instanceof Worker))throw new TypeError(
+   "Failed to construct 'Worker': Please use the 'new' operator, this DOM "+
+   "object constructor cannot be called as a function.");
+  if(arguments.length<1)throw new TypeError("Failed to construct 'Worker': "+
+   '1 argument required, but only 0 present.');
+  options=options||{};
+  var me=this,abs,type=options.type==='module'?'module':'classic',
+   name=options.name===undefined?'':String(options.name),st,g=null;
+  try{abs=new URL(String(url),D.baseURI).href;}
+  catch(e){throw new DOMException("Failed to construct 'Worker': The URL '"+
+   url+"' is invalid.",'SyntaxError');}
+  /* a worker's script is the page's own, or a blob or data: URL */
+  if(!/^(blob|data):/i.test(abs)){
+   var mine=new URL(D.baseURI),theirs=new URL(abs);
+   if(theirs.protocol!==mine.protocol||
+      (theirs.protocol!=='file:'&&theirs.origin!==mine.origin))
+    throw new DOMException("Failed to construct 'Worker': Script at '"+abs+
+     "' cannot be accessed from origin '"+location.origin+"'.",'SecurityError');}
+  listens(this,function(e){W.__vitaReportError(e);});
+  this.onmessage=this.onmessageerror=this.onerror=null;
+  st={dead:false,port:null,g:null};
+  Object.defineProperty(this,'__vitaWorker',{value:st});
+  /* a worker that could not start has no realm to keep */
+  function fail(message){
+   if(st.g&&NC)NC(st.g);
+   st.g=null;st.port=null;
+   setTimeout(function(){
+    if(st.dead)return;
+    var ev=new ErrorEvent('error',{message:message,filename:abs,cancelable:true});
+    if(me.dispatchEvent(ev))console.error('Worker '+abs+': '+message);},0);}
+  try{g=NW?NW():null;}catch(e){g=null;}
+  if(!g||typeof g.__vitaBecomeWorker!=='function'){
+   fail('The worker could not be started');return;}
+  st.g=g;
+  st.port=g.__vitaBecomeWorker(abs,name,type,{
+   message:function(data){
+    if(st.dead)return;
+    var d;
+    try{d=W.structuredClone(data);}
+    catch(e){setTimeout(function(){if(!st.dead)
+     me.dispatchEvent(new MessageEvent('messageerror',{}));},0);return;}
+    setTimeout(function(){if(!st.dead)
+     me.dispatchEvent(new MessageEvent('message',{data:d}));},0);},
+   error:function(f){
+    setTimeout(function(){
+     if(st.dead)return;
+     var ev=new ErrorEvent('error',{message:f.message,filename:f.filename,
+      lineno:f.lineno,colno:f.colno,cancelable:true});
+     if(me.dispatchEvent(ev))console.error(f.message+' ('+f.filename+':'+
+      f.lineno+')');},0);},
+   close:function(){me.terminate();},
+   blobText:function(u){
+    var b=blobURLs[u];
+    return b===undefined?null:(b._t!==undefined?b._t:String(b));}});
+  if(type==='module'){st.port.runModule();return;}
+  /* fetch does not read files; the fetch importScripts uses does */
+  if(abs.indexOf('file:')===0){
+   setTimeout(function(){
+    var r=FS?FS(abs):null;
+    if(st.dead)return;
+    if(r&&r[0]>=200&&r[0]<300)st.port.run(r[1]);
+    else fail("Failed to load the worker's script");},0);
+   return;}
+  W.fetch(abs).then(function(r){
+   if(!r.ok)throw new Error('status '+r.status);
+   return r.text();}).then(function(src){
+   if(!st.dead)st.port.run(src);},function(){
+   fail("Failed to load the worker's script");});}
+ Worker.prototype.postMessage=function(message,transfer){
+  var st=this.__vitaWorker;
+  if(arguments.length<1)throw new TypeError("Failed to execute 'postMessage' on "+
+   "'Worker': 1 argument required, but only 0 present.");
+  if(st&&!st.dead&&st.port)st.port.receive(message);};
+ Worker.prototype.terminate=function(){
+  var st=this.__vitaWorker;
+  if(!st||st.dead)return;
+  st.dead=true;
+  if(st.g&&NC)NC(st.g);
+  st.g=null;st.port=null;};
+ Object.defineProperty(Worker.prototype,Symbol.toStringTag,
+  {configurable:true,value:'Worker'});
+ W.Worker=Worker;
+
+ /* the worker's side, called by the page in this realm */
+ W.__vitaBecomeWorker=function(url,name,type,owner){
+  delete W.__vitaBecomeWorker;
+  var started=false,queue=[],closing=false,reporting=false,u=new URL(url);
+  /* what a worker's global does not have */
+  ['document','window','parent','top','frames','frameElement','opener',
+   'localStorage','sessionStorage','alert','confirm','prompt','print','open',
+   'history','customElements','Worker','SharedWorker','external','screen',
+   'visualViewport','scrollX','scrollY','innerWidth','innerHeight'
+  ].forEach(function(k){
+   try{delete W[k];}catch(e){}
+   if(k in W)try{Object.defineProperty(W,k,{value:undefined,
+    configurable:true,writable:true});}catch(e){}});
+  /* where it is */
+  function WorkerLocation(){throw new TypeError('Illegal constructor');}
+  var loc=Object.create(WorkerLocation.prototype);
+  ['href','origin','protocol','host','hostname','port','pathname','search',
+   'hash'].forEach(function(k){
+   Object.defineProperty(loc,k,{enumerable:true,value:u[k]});});
+  WorkerLocation.prototype.toString=function(){return this.href;};
+  W.WorkerLocation=WorkerLocation;
+  /* window.location cannot be redefined; what its getter hands back can */
+  W.__vitaLocation=loc;
+  Object.defineProperty(D,'baseURI',{configurable:true,
+   get:function(){return url;}});
+  W.name=name;
+  /* its scope's interfaces */
+  function WorkerGlobalScope(){throw new TypeError('Illegal constructor');}
+  function DedicatedWorkerGlobalScope(){throw new TypeError('Illegal constructor');}
+  WorkerGlobalScope.prototype=Object.create(Object.getPrototypeOf(W));
+  WorkerGlobalScope.prototype.constructor=WorkerGlobalScope;
+  DedicatedWorkerGlobalScope.prototype=Object.create(WorkerGlobalScope.prototype);
+  DedicatedWorkerGlobalScope.prototype.constructor=DedicatedWorkerGlobalScope;
+  Object.defineProperty(DedicatedWorkerGlobalScope.prototype,Symbol.toStringTag,
+   {configurable:true,value:'DedicatedWorkerGlobalScope'});
+  W.WorkerGlobalScope=WorkerGlobalScope;
+  W.DedicatedWorkerGlobalScope=DedicatedWorkerGlobalScope;
+  /* the global's prototype cannot be changed here, so the global
+     answers instanceof and toString for both itself */
+  try{Object.setPrototypeOf(W,DedicatedWorkerGlobalScope.prototype);}catch(e){}
+  [WorkerGlobalScope,DedicatedWorkerGlobalScope].forEach(function(C){
+   Object.defineProperty(C,Symbol.hasInstance,{configurable:true,
+    value:function(v){return v===W||Object.prototype.isPrototypeOf.call(
+     C.prototype,v);}});});
+  Object.defineProperty(W,Symbol.toStringTag,{configurable:true,
+   value:'DedicatedWorkerGlobalScope'});
+  /* its events: an error it does not handle goes to its Worker */
+  W.__vitaReportError=function(err,where){
+   var f=errorFields(err,where||url),ev;
+   if(reporting){console.error(f.message);return;}
+   reporting=true;
+   try{
+    ev=new ErrorEvent('error',{message:f.message,filename:f.filename,
+     lineno:f.lineno,colno:f.colno,error:err,cancelable:true});
+    if(W.dispatchEvent(ev))owner.error(f);}
+   finally{reporting=false;}};
+  listens(W,function(e){W.__vitaReportError(e);});
+  /* plain handler properties: the window's also add a listener, and
+     the handler then ran twice */
+  ['onmessage','onmessageerror','onerror'].forEach(function(k){
+   Object.defineProperty(W,k,{configurable:true,enumerable:true,writable:true,
+    value:null});});
+  W.postMessage=function(message){
+   if(arguments.length<1)throw new TypeError("Failed to execute 'postMessage'"+
+    " on 'DedicatedWorkerGlobalScope': 1 argument required, but only 0 present.");
+   if(!closing)owner.message(message);};
+  W.close=function(){if(closing)return;closing=true;owner.close();};
+  W.importScripts=function(){
+   var i,abs,src,r;
+   for(i=0;i<arguments.length;i++){
+    try{abs=new URL(String(arguments[i]),url).href;}
+    catch(e){throw new DOMException("Failed to execute 'importScripts' on "+
+     "'WorkerGlobalScope': The URL '"+arguments[i]+"' is invalid.",'SyntaxError');}
+    if(abs.indexOf('blob:')===0)src=owner.blobText(abs);
+    else if(abs.indexOf('data:')===0){
+     var c=abs.indexOf(','),head=abs.slice(5,c),body=abs.slice(c+1);
+     src=/;base64$/i.test(head)?atob(decodeURIComponent(body)):
+      decodeURIComponent(body);}
+    else{r=FS?FS(abs):null;src=r&&r[0]>=200&&r[0]<300?r[1]:null;}
+    if(src===null||src===undefined)throw new DOMException(
+     "Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '"+
+     abs+"' failed to load.",'NetworkError');
+    geval(src);}};
+  function deliver(message){
+   var d;
+   try{d=structuredClone(message);}
+   catch(e){setTimeout(function(){
+    W.dispatchEvent(new MessageEvent('messageerror',{}));},0);return;}
+   setTimeout(function(){
+    if(!closing)W.dispatchEvent(new MessageEvent('message',{data:d}));},0);}
+  function begin(){started=true;queue.splice(0).forEach(deliver);}
+  return {
+   receive:function(message){
+    if(closing)return;
+    if(started)deliver(message);else queue.push(message);},
+   run:function(src){
+    setTimeout(function(){
+     try{geval(src);}catch(e){W.__vitaReportError(e,url);}
+     begin();},0);},
+   runModule:function(){
+    setTimeout(function(){
+     /* through the helper that waits for a module to arrive, as a
+        page's own import() does */
+     W.__vitaImport(url,url).then(begin,function(e){
+      W.__vitaReportError(e,url);begin();});},0);}};};
+})();
 })();

@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<!-- Dedicated workers: a worker runs its script in a global of its own
+     with no document, gets and sends cloned messages, loads more script
+     with importScripts or as a module, can be made from a blob, reports
+     an error it does not handle to its Worker, and stops when terminated
+     or when it closes itself. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+/* at most four workers at once: a first four, then two more */
+var pending = 4, finished = false;
+function done() { if (--pending === 0) second(); }
+ok("Worker is there", typeof Worker === 'function' && typeof Worker.prototype.postMessage === 'function');
+
+var w = new Worker('worker-pages/echo.js', { name: 'echo' });
+var replies = 0;
+w.onmessage = function (e) {
+ var r = e.data;
+ if (++replies > 1) { ok("one reply per message", false); return; }
+ ok("a reply to a message", r.n === 2);
+ ok("the message arrived as a clone", r.isDate && r.time === 0);
+ ok("the worker has no document or window", r.noDocument);
+ ok("its global is a DedicatedWorkerGlobalScope", r.scope && r.tag === '[object DedicatedWorkerGlobalScope]');
+ ok("its location is its script", /worker-pages\/echo\.js$/.test(r.href) && r.name === 'echo');
+ ok("importScripts ran a file and a data: URL", r.lib === 42 && r.fromData === 7);
+ ok("it has fetch and timers", r.hasFetch);
+ setTimeout(function () { ok("one reply per message", replies === 1); w.terminate(); done(); }, 150);
+};
+w.postMessage({ n: 1, d: new Date(0) });
+
+var b = new Worker(URL.createObjectURL(new Blob(['onmessage = function (e) { postMessage(e.data * 2); };'])));
+b.onmessage = function (e) { ok("a worker made from a blob", e.data === 42); b.terminate(); done(); };
+b.postMessage(21);
+
+var t = new Worker('worker-pages/throws.js');
+t.onerror = function (e) {
+ ok("an error it does not handle reaches its Worker (" + e.message + ")", /boom/.test(e.message));
+ e.preventDefault();
+ t.terminate();
+ done();
+};
+
+var missing = new Worker('worker-pages/no-such-worker.js');
+missing.onerror = function () { ok("a script that is not there is an error", true); done(); };
+
+function second() {
+ var left = 3;
+ function end() { if (--left === 0) finished = true; }
+ var ticks = new Worker('worker-pages/echo.js'), seen = 0;
+ ticks.onmessage = function () {
+  if (++seen === 2) {
+   ticks.terminate();
+   var at = seen;
+   setTimeout(function () { ok("terminate stops it (" + (seen - at) + " late)", seen === at); end(); }, 200);
+  }
+ };
+ ticks.postMessage('tick');
+ var closer = new Worker('worker-pages/echo.js'), afterClose = false;
+ closer.onmessage = function (e) { if (e.data === 'after close') afterClose = true; };
+ closer.postMessage('close');
+ setTimeout(function () { ok("close() in the worker stops its messages", !afterClose); end(); }, 400);
+ var mod = new Worker('worker-pages/module.js', { type: 'module' });
+ mod.onmessage = function (e) { ok("a module worker imports and answers", e.data === 42); mod.terminate(); end(); };
+ mod.onerror = function (e) { ok("a module worker imports and answers (" + e.message + ")", false); end(); };
+ mod.postMessage(21);
+}
+
+setTimeout(function () { if (!finished) ok("every worker answered in time", false); }, 2800);
+</script></body></html>

@@ -138,6 +138,13 @@ extern const char *volatile vita_c_where;
 void vita_log_memory(const char *what);
 
 /**
+ * KB left in the newlib heap (VitaSurf). The heap is one block taken at
+ * startup, so this is what every allocation still has to share: a new
+ * JavaScript realm is refused when it is low rather than left half made.
+ */
+unsigned int vita_heap_free_kb(void);
+
+/**
  * Log which image formats registered a content handler. Call after
  * netsurf_init(), which is what registers them.
  */
