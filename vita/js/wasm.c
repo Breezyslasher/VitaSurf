@@ -30,10 +30,12 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <quickjs.h>
 
 #include "glue.h"
+#include "vita_platform.h"
 #include "wasm.h"
 
 /* each call gets this much interpreter stack */
@@ -736,7 +738,21 @@ static JSValue w_compile(JSContext *ctx, JSValueConst this_val, int argc,
 	if (len > UINT32_MAX) {
 		return throw_error(ctx, st->compile_error, "module too large");
 	}
-	m = vw_module_load(p, (uint32_t)len, err, sizeof(err));
+	{
+		struct timespec t0, t1;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		m = vw_module_load(p, (uint32_t)len, err, sizeof(err));
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		/* a page's modules are worth a line each: what WebAssembly
+		   the web sends, and what it costs the Vita to load */
+		vita_log("wasm: %s a %u KB module in %u ms%s%s",
+			 m ? "compiled" : "refused",
+			 (unsigned int)((len + 1023) / 1024),
+			 (unsigned int)((t1.tv_sec - t0.tv_sec) * 1000 +
+					(t1.tv_nsec - t0.tv_nsec) / 1000000),
+			 m ? "" : ": ", m ? "" : err);
+	}
 	if (m == NULL) {
 		return throw_error(ctx, st->compile_error, err);
 	}

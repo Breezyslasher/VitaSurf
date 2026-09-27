@@ -1273,7 +1273,7 @@ W.devicePixelRatio=1;
 /* Frame relationships. Scripts test self !== top to find out whether they
    are framed, and a missing top is a ReferenceError that takes the script
    out: Google's page header does exactly that. */
-W.top=W.parent=W.frames=W;W.opener=null;
+W.frames=W;W.opener=null;
 try{Object.defineProperty(W,'length',{configurable:true,get:function(){return D.getElementsByTagName('iframe').length;},configurable:true});}catch(e){}
 W.screen={width:960,height:544,availWidth:960,availHeight:544,colorDepth:32,pixelDepth:32,orientation:{type:'landscape-primary'}};
 W.focus=W.blur=W.stop=W.print=W.close=function(){};W.open=function(){return null;};
@@ -3143,16 +3143,126 @@ Object.defineProperty(P,'currentSrc',{configurable:true,get:function(){return th
 P.decode=function(){return Promise.resolve();};
 Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}});
 /* --- frames -------------------------------------------------------------
- * An iframe's window and document (VitaSurf). Both were null, and a page
- * that makes a blank iframe to write into, or to take a clean copy of the
- * built-ins from -- claude.ai's bundle among them -- threw on the first
- * property it read. Frames are not loaded here, so a frame's window is
- * this window seen through the frame: the built-ins are the same ones,
- * and it has its own document, a blank one, when the frame is same
- * origin. A cross-origin frame's document is refused the way a browser
- * refuses it, and postMessage to it goes nowhere.
+ * An iframe's window and document (VitaSurf). An iframe NetSurf loads is
+ * a window of its own whose scripts run in this page's runtime, so its
+ * global is the real window: a same-origin frame's contentWindow is that
+ * global and its contentDocument that document, and the frame sees this
+ * page as its parent and its iframe as frameElement. A cross-origin frame
+ * is seen through a window that has only what a browser allows across
+ * origins -- postMessage, location to navigate, closed, focus -- and
+ * refuses the rest. postMessage between windows carries a copy of the
+ * data with the sender's origin and window.
+ *
+ * An iframe NetSurf has no window for -- one with no src, or hidden --
+ * falls back to a stand-in: this window seen through the frame, with a
+ * blank document of its own when same origin. A page that makes a blank
+ * iframe to write into, or to take a clean copy of the built-ins from --
+ * claude.ai's bundle among them -- had thrown on the first property it
+ * read when both were null.
  */
 (function(){
+ var NF=W.__vitaFrameGlobal,NP=W.__vitaParentGlobal,NT=W.__vitaTopGlobal,
+  NE=W.__vitaFrameElement,NX=W.__vitaEntryGlobal;
+ ['__vitaFrameGlobal','__vitaParentGlobal','__vitaTopGlobal',
+  '__vitaFrameElement','__vitaEntryGlobal'].forEach(function(k){delete W[k];});
+ function call(f,a){try{return f?f(a):null;}catch(e){return null;}}
+ /* origins, as keys to compare: a file page's is the scheme, as the
+    frames of a local page are one site; an about: page has its maker's */
+ function hrefOf(g){try{return String(g.location.href);}catch(e){return '';}}
+ function keyOfHref(h){
+  try{var u=new URL(h);return u.protocol==='file:'?'file:':u.origin;}
+  catch(e){return 'null';}}
+ function myKey(){
+  var h=hrefOf(W),p;
+  if(/^about:/i.test(h)&&(p=call(NP))){
+   var ph=hrefOf(p);return /^about:/i.test(ph)?'null':keyOfHref(ph);}
+  return keyOfHref(h);}
+ function keyOf(g){
+  if(g===W)return myKey();
+  var h=hrefOf(g);
+  return /^about:/i.test(h)?myKey():keyOfHref(h);}
+ /* what event.origin says for a window */
+ function originOf(g){
+  var h=g===W?hrefOf(W):hrefOf(g),p;
+  if(/^about:/i.test(h)){
+   if(g!==W)return originOf(W);
+   p=call(NP);return p?originOf(p):'null';}
+  try{return new URL(h).origin;}catch(e){return 'null';}}
+ var CROSS=new WeakMap();
+ /* a raw global as this page may see it */
+ function view(g){
+  if(!g||g===W)return g?W:null;
+  if(keyOf(g)===myKey())return g;
+  var r=CROSS.get(g);
+  if(!r){r=crossWindow(g);CROSS.set(g,r);}
+  return r;}
+ function deny(k){
+  throw new DOMException('Blocked a frame from accessing a cross-origin frame'+
+   (typeof k==='string'?' (property "'+k+'")':'')+'.','SecurityError');}
+ function crossWindow(g){
+  var self,loc=Object.create(null),fns={
+   postMessage:function postMessage(m,o,t){return g.postMessage(m,o,t);},
+   close:function close(){},focus:function focus(){},blur:function blur(){}};
+  Object.defineProperty(loc,'href',{get:function(){deny('href');},
+   set:function(v){g.location.href=String(v);}});
+  loc.replace=function(v){g.location.replace(String(v));};
+  self=new Proxy(Object.create(null),{
+   get:function(t,k){
+    if(Object.prototype.hasOwnProperty.call(fns,k))return fns[k];
+    if(k==='closed')return false;
+    if(k==='window'||k==='self'||k==='frames')return self;
+    if(k==='top')return view(call(NT)||W);
+    if(k==='parent')return g===call(NP)?view(call(NT)||W):W;
+    if(k==='opener')return null;
+    if(k==='length')return 0;
+    if(k==='location')return loc;
+    if(k==='then'||typeof k==='symbol')return undefined;
+    deny(k);},
+   set:function(t,k,v){
+    if(k==='location'){g.location.href=String(v);return true;}
+    deny(k);},
+   has:function(t,k){return k in fns||k==='closed'||k==='location';},
+   ownKeys:function(){return [];},
+   getOwnPropertyDescriptor:function(t,k){deny(k);},
+   defineProperty:function(t,k){deny(k);},
+   deleteProperty:function(t,k){deny(k);},
+   getPrototypeOf:function(){return null;},
+   setPrototypeOf:function(){deny('prototype');}});
+  return self;}
+ Object.defineProperties(W,{
+  parent:{configurable:true,get:function(){var p=call(NP);return p?view(p):W;},
+   set:function(){}},
+  top:{configurable:true,get:function(){var t=call(NT);return t?view(t):W;},
+   set:function(){}},
+  frameElement:{configurable:true,get:function(){
+   var p=call(NP);
+   if(!p||keyOf(p)!==myKey())return null;
+   return call(NE);},set:function(){}}});
+ /* window[n] is the nth frame's window */
+ function frameEls(){return D.querySelectorAll('iframe,frame');}
+ for(var n=0;n<10;n++)(function(n){
+  Object.defineProperty(W,n,{configurable:true,get:function(){
+   var e=frameEls()[n];return e?e.contentWindow:undefined;}});})(n);
+ /*
+  * postMessage from whichever window called it: the page whose script
+  * the runtime entered is the sender, the data is copied here, into the
+  * receiving window's own objects, and the event is queued here.
+  */
+ W.postMessage=function postMessage(message,options){
+  if(arguments.length<1)
+   throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
+  var to=(options!==null&&typeof options==='object')?options.targetOrigin:options,
+   src=call(NX)||W,data,ev;
+  to=to===undefined?'/':String(to);
+  if(to==='/')to=originOf(src);
+  else if(to!=='*'){
+   try{to=new URL(to).origin;}
+   catch(e){throw new DOMException("Invalid target origin '"+to+"' in a call to 'postMessage'.",'SyntaxError');}}
+  data=W.structuredClone(message);
+  if(to!=='*'&&to!==originOf(W))return;
+  ev=new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
+   source:view(src),ports:[]});
+  setTimeout(function(){__vitaDispatch(null,ev);},0);};
  var FRAMES=new WeakMap();
  function sameOrigin(el){
   var src=el.getAttribute('src');
@@ -3224,10 +3334,15 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
  function isFrame(el){return el.tagName==='IFRAME'||el.tagName==='FRAME';}
  Object.defineProperty(P,'contentWindow',{configurable:true,get:function(){
   if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
-  return this.isConnected?frameWindow(this):null;}});
+  if(!this.isConnected)return null;
+  var g=call(NF,this);
+  return g?view(g):frameWindow(this);}});
  Object.defineProperty(P,'contentDocument',{configurable:true,get:function(){
   if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
-  if(!this.isConnected||!sameOrigin(this))return null;
+  if(!this.isConnected)return null;
+  var g=call(NF,this);
+  if(g)return keyOf(g)===myKey()?g.document:null;
+  if(!sameOrigin(this))return null;
   return frameWindow(this).document;}});
 })();
 
@@ -3794,7 +3909,6 @@ Object.defineProperty(W,'isSecureContext',{configurable:true,get:function(){
  return String(location.href).indexOf('https:')===0;}});
 W.crossOriginIsolated=false;
 W.originAgentCluster=false;
-W.frameElement=null;
 W.clientInformation=navigator;
 ['screenX','screenLeft'].forEach(function(k){W[k]=0;});
 ['screenY','screenTop'].forEach(function(k){W[k]=0;});
@@ -5089,11 +5203,13 @@ Blob.prototype.slice=function(a,b,type){
  b=b===undefined?n:(b<0?Math.max(n+b,0):Math.min(b,n));
  return new Blob([u.subarray(a,Math.max(a,b))],{type:type||''});};
 /* Blob.prototype.stream is a real ReadableStream; see streams.js. */
+Object.defineProperty(Blob.prototype,Symbol.toStringTag,{configurable:true,value:'Blob'});
 W.Blob=Blob;
 function File(parts,name,opts){Blob.call(this,parts,opts);
  this.name=String(name);this.lastModified=(opts&&opts.lastModified)||Date.now();
  this.webkitRelativePath='';}
 File.prototype=Object.create(Blob.prototype);File.prototype.constructor=File;
+Object.defineProperty(File.prototype,Symbol.toStringTag,{configurable:true,value:'File'});
 W.File=File;
 W.FileList=function(){Object.defineProperty(this,'length',{configurable:true,value:0});};
 W.FileList.prototype.item=function(i){return this[i]||null;};

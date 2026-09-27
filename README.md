@@ -348,7 +348,13 @@ with the JS API in `vita/js/wasm.c` and `vita/js/wasm.js`. The Vita has
 no JIT, so modules are interpreted. Patch 0246 links a module's imports
 per instance, as the JS API needs. Not yet supported: a funcref table
 shared between instances, shared memory, SIMD, exception handling and
-memory64. Add `VITASURF_DEBUG=1` to the
+memory64. An iframe with a src runs its page in a window of its own
+that shares the top page's JavaScript runtime, so same-origin frames reach
+each other directly and cross-origin ones only through `postMessage` and
+`location`. Patch 0247 keeps a frame's window across the layout rebuilds
+that used to replace it. An iframe with no src or with srcdoc, and one
+that is not displayed, still gets an empty stand-in window. Add
+`VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging. The JavaScript engine is chosen with
 `VITASURF_JS_ENGINE` in the environment of `build-netsurf.sh` and the

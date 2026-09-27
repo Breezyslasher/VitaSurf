@@ -47,6 +47,7 @@
 #include "content/hlcache.h"
 #include "content/handlers/javascript/js.h"
 #include "content/handlers/javascript/content.h"
+#include "desktop/browser_private.h"
 
 #include <dom/dom.h>
 #include <dom/bindings/hubbub/parser.h>
@@ -648,6 +649,9 @@ void vita_js_report_profile(void)
 
 static int qjs_interrupt_body(jsthread *thread);
 
+/* the binding script called most recently, for the overrun line */
+static const char *last_binding;
+
 static int qjs_interrupt(JSRuntime *rt, void *opaque)
 {
 	jsthread *thread = opaque;
@@ -701,6 +705,9 @@ static int qjs_interrupt_body(jsthread *thread)
 				    (unsigned int)slices, in_c);
 		}
 		/* script is running again: no binding is */
+		if (c_where != NULL) {
+			last_binding = c_where;
+		}
 		c_where = NULL;
 	}
 	if (vita_busy_take_cancel()) {
@@ -742,6 +749,14 @@ static int qjs_interrupt_body(jsthread *thread)
 			{
 				char *st = capture_stack(thread->ctx);
 
+				/* no stack means no script frame to take it
+				   from: say which binding it last called */
+				if (st == NULL || st[0] == '\0') {
+					vita_log("qjs:   no stack; the last binding "
+						 "it called was %s",
+						 last_binding != NULL ?
+						 last_binding : "none");
+				}
 				if (st != NULL) {
 					vita_log("qjs:   %s", st);
 					free(st);
@@ -4123,6 +4138,165 @@ static JSValue node_remove_event_listener(JSContext *ctx, JSValueConst this_val,
  * window and document listeners live on the document node: DOMContentLoaded
  * is dispatched there by NetSurf and load bubbles up to it from the body.
  */
+/* ------------------------------------------------------------------------ */
+/* Frames (VitaSurf)                                                        */
+
+/*
+ * An iframe's window runs its scripts in the runtime of the window at the
+ * top of its tree (js_newthread), so script in a frame and in the page
+ * around it can hold each other's objects. These hand prelude.js the raw
+ * global objects; it decides what a page may see of them, by origin.
+ */
+
+static jsthread *content_thread(struct hlcache_handle *h)
+{
+	struct content *c;
+	jsthread *t;
+
+	if (h == NULL || content_get_type(h) != CONTENT_HTML) {
+		return NULL;
+	}
+	c = hlcache_handle_get_content(h);
+	if (c == NULL) {
+		return NULL;
+	}
+	t = ((html_content *)c)->jsthread;
+	if (t == NULL || t->closed || t->ctx == NULL) {
+		return NULL;
+	}
+	return t;
+}
+
+/*
+ * The thread of the page a window shows, while its scripts are running:
+ * the page it is loading once that page has scripts, which is already so
+ * when the page's load event fires, before it replaces the one shown.
+ */
+static jsthread *window_thread(struct browser_window *bw)
+{
+	jsthread *t;
+
+	if (bw == NULL) {
+		return NULL;
+	}
+	t = content_thread(bw->loading_content);
+	return t != NULL ? t : content_thread(bw->current_content);
+}
+
+static JSValue window_global(struct browser_window *bw)
+{
+	jsthread *t = window_thread(bw);
+
+	return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
+}
+
+static struct browser_window *thread_window(JSContext *ctx)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	return thread != NULL ? thread->win : NULL;
+}
+
+/* __vitaFrameGlobal(iframe): the global of the page an iframe shows */
+static JSValue win_vita_frame_global(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct browser_window *bw = thread_window(ctx);
+	struct dom_node *node;
+	int i;
+
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1 || bw == NULL) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_NULL;
+	}
+	for (i = 0; i < bw->iframe_count; i++) {
+		if (bw->iframes[i]->frame_node == node) {
+			return window_global(bw->iframes[i]);
+		}
+	}
+	return JS_NULL;
+}
+
+/* __vitaParentGlobal(): the global of the page around this frame */
+static JSValue win_vita_parent_global(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	struct browser_window *bw = thread_window(ctx);
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	return bw != NULL && bw->parent != NULL ? window_global(bw->parent)
+						: JS_NULL;
+}
+
+/* __vitaTopGlobal(): the global of the page at the top of the tree */
+static JSValue win_vita_top_global(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	struct browser_window *bw = thread_window(ctx);
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (bw == NULL || bw->parent == NULL) {
+		return JS_NULL;
+	}
+	while (bw->parent != NULL) {
+		bw = bw->parent;
+	}
+	return window_global(bw);
+}
+
+/* __vitaFrameElement(): this frame's iframe element, in the parent page */
+static JSValue win_vita_frame_element(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	struct browser_window *bw = thread_window(ctx);
+	jsthread *t;
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (bw == NULL || bw->parent == NULL || bw->frame_node == NULL) {
+		return JS_NULL;
+	}
+	t = window_thread(bw->parent);
+	return t != NULL ? wrap_node(t->ctx, bw->frame_node) : JS_NULL;
+}
+
+/*
+ * __vitaEntryGlobal(): the global of the page whose script was entered
+ * from outside, which for a message is the window that sent it.
+ */
+static JSValue win_vita_entry_global(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	jsthread *entry;
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (thread == NULL) {
+		return JS_NULL;
+	}
+	entry = thread->heap->interrupt_thread;
+	if (entry == NULL || entry->closed || entry->ctx == NULL) {
+		entry = thread;
+	}
+	return JS_GetGlobalObject(entry->ctx);
+}
+
 /*
  * Whether libcss holds a supports condition, for CSS.supports()
  * (VitaSurf). It was a stub that said no to everything, even to
@@ -5910,8 +6084,67 @@ static void relayout_callback(void *p)
  * running makes html_relayout() ask to be called back later, so at most
  * one runs at a time.
  */
+/* whether a node is still in a document */
+static bool node_in_document(struct dom_node *node)
+{
+	struct dom_node *n = dom_node_ref(node), *p = NULL;
+	dom_node_type type = DOM_ELEMENT_NODE;
+
+	while (n != NULL) {
+		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+		    type == DOM_DOCUMENT_NODE) {
+			break;
+		}
+		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR) {
+			p = NULL;
+		}
+		dom_node_unref(n);
+		n = p;
+	}
+	if (n != NULL) {
+		dom_node_unref(n);
+		return type == DOM_DOCUMENT_NODE;
+	}
+	return false;
+}
+
+/*
+ * An iframe taken out of the document ends its page there and then, as a
+ * browser does, rather than when the next layout rebuild gets round to
+ * dropping its window, which a busy page puts off for seconds (VitaSurf).
+ * From the scheduler, so that no script of the frame is running.
+ */
+static void close_removed_frames(void *p)
+{
+	jsthread *thread = p;
+	struct browser_window *bw = thread->win;
+	int i;
+
+	if (bw == NULL) {
+		return;
+	}
+	for (i = 0; i < bw->iframe_count; i++) {
+		struct browser_window *f = bw->iframes[i];
+		jsthread *t;
+
+		if (f->frame_node == NULL || node_in_document(f->frame_node)) {
+			continue;
+		}
+		t = window_thread(f);
+		if (t != NULL) {
+			vita_log("qjs: an iframe left the document, and its "
+				 "page's scripts stop");
+			js_closethread(t);
+		}
+	}
+}
+
 static void schedule_relayout(jsthread *thread, int ms)
 {
+	if (thread->win != NULL && thread->win->iframe_count > 0 &&
+	    !thread->closed) {
+		guit->misc->schedule(0, close_removed_frames, thread);
+	}
 	if (thread->relayout_pending || thread->closed) {
 		return;
 	}
@@ -9573,6 +9806,21 @@ static void setup_globals(jsthread *thread)
 					  "__vitaParseDocument", 1));
 	vita_subtle_register(ctx, global);
 	vita_wasm_register(ctx, global);
+	JS_SetPropertyStr(ctx, global, "__vitaFrameGlobal",
+			  JS_NewCFunction(ctx, win_vita_frame_global,
+					  "__vitaFrameGlobal", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaParentGlobal",
+			  JS_NewCFunction(ctx, win_vita_parent_global,
+					  "__vitaParentGlobal", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaTopGlobal",
+			  JS_NewCFunction(ctx, win_vita_top_global,
+					  "__vitaTopGlobal", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaFrameElement",
+			  JS_NewCFunction(ctx, win_vita_frame_element,
+					  "__vitaFrameElement", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaEntryGlobal",
+			  JS_NewCFunction(ctx, win_vita_entry_global,
+					  "__vitaEntryGlobal", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaCSSSupports",
 			  JS_NewCFunction(ctx, win_vita_css_supports,
 					  "__vitaCSSSupports", 1));
@@ -9796,18 +10044,6 @@ nserror js_newheap(int timeout, jsheap **heap)
 		return NSERROR_NOMEM;
 	}
 	/*
-	 * Script's small blocks come from pools of our own rather than
-	 * newlib's malloc, which takes a lock on every call; see
-	 * qjs_alloc.c (VitaSurf).
-	 */
-	ret->pool = qjs_pool_create();
-	ret->rt = JS_NewRuntime2(qjs_pool_functions(), ret->pool);
-	if (ret->rt == NULL) {
-		qjs_pool_destroy(ret->pool);
-		free(ret);
-		return NSERROR_NOMEM;
-	}
-	/*
 	 * The timeout is NetSurf's script_timeout option, in seconds, and 0
 	 * means no limit. The Vita runs script roughly 25 times slower than
 	 * a desktop, so a budget short enough to be useful there stops work
@@ -9825,6 +10061,35 @@ nserror js_newheap(int timeout, jsheap **heap)
 	 * as given so that a test can drive a budget of one second
 	 * (VitaSurf) */
 	ret->timeout = timeout;
+	/*
+	 * The runtime itself is made when the window's first page wants a
+	 * thread (heap_start): an iframe's window runs its scripts in the
+	 * runtime of the window at the top of its tree, so that script in
+	 * the frame and in the page around it can reach each other's
+	 * objects, and a runtime of its own would go unused (VitaSurf).
+	 */
+	*heap = ret;
+	return NSERROR_OK;
+}
+
+/* make a heap's runtime, if it has none yet */
+static nserror heap_start(jsheap *ret)
+{
+	if (ret->rt != NULL) {
+		return NSERROR_OK;
+	}
+	/*
+	 * Script's small blocks come from pools of our own rather than
+	 * newlib's malloc, which takes a lock on every call; see
+	 * qjs_alloc.c (VitaSurf).
+	 */
+	ret->pool = qjs_pool_create();
+	ret->rt = JS_NewRuntime2(qjs_pool_functions(), ret->pool);
+	if (ret->rt == NULL) {
+		qjs_pool_destroy(ret->pool);
+		ret->pool = NULL;
+		return NSERROR_NOMEM;
+	}
 	/*
 	 * Keep a page's scripts within a sensible slice of the heap. The
 	 * newlib heap is 176 MB (VITASURF_HEAP_MB) and the rest of it holds
@@ -9872,7 +10137,6 @@ nserror js_newheap(int timeout, jsheap **heap)
 	/* register the shared node class once per runtime */
 	JS_NewClassID(ret->rt, &node_class_id);
 	JS_NewClass(ret->rt, node_class_id, &node_class);
-	*heap = ret;
 	return NSERROR_OK;
 }
 
@@ -9885,16 +10149,32 @@ void js_destroyheap(jsheap *heap)
 		heap->pending_destroy = true;
 		return;
 	}
-	JS_FreeRuntime(heap->rt);
-	qjs_pool_destroy(heap->pool);
+	if (heap->rt != NULL) {
+		JS_FreeRuntime(heap->rt);
+		qjs_pool_destroy(heap->pool);
+	}
 	free(heap);
 }
 
 nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 		     jsthread **thread)
 {
-	jsthread *ret = calloc(1, sizeof(*ret));
+	jsthread *ret;
+	struct browser_window *bw = win_priv;
 
+	/* an iframe's scripts run in its top window's runtime */
+	if (bw != NULL && bw->parent != NULL) {
+		while (bw->parent != NULL) {
+			bw = bw->parent;
+		}
+		if (bw->jsheap != NULL) {
+			heap = bw->jsheap;
+		}
+	}
+	if (heap_start(heap) != NSERROR_OK) {
+		return NSERROR_NOMEM;
+	}
+	ret = calloc(1, sizeof(*ret));
 	if (ret == NULL) {
 		return NSERROR_NOMEM;
 	}
@@ -9956,6 +10236,7 @@ nserror js_closethread(jsthread *thread)
 		guit->misc->schedule(-1, relayout_callback, thread);
 		thread->relayout_pending = false;
 	}
+	guit->misc->schedule(-1, close_removed_frames, thread);
 	/* drop module scripts still waiting on an import, and the
 	 * scheduler entry that would have retried them */
 	js_free_deferred(thread);
@@ -12840,6 +13121,28 @@ bool js_fire_event(jsthread *thread, const char *type,
 		dom_event_target_dispatch_event(doc, evt, &success);
 	}
 	dom_event_unref(evt);
+	/*
+	 * A frame's window has loaded: its iframe element in the page
+	 * around it gets a load event too, which is how that page learns
+	 * the frame is ready (VitaSurf).
+	 */
+	if (target == NULL && strcmp(type, "load") == 0) {
+		struct browser_window *bw = thread->win;
+
+		if (bw != NULL && bw->parent != NULL &&
+		    bw->frame_node != NULL &&
+		    window_thread(bw->parent) != NULL &&
+		    dom_event_create(&evt) == DOM_NO_ERR) {
+			type_dom = to_dom_string("load");
+			if (type_dom != NULL) {
+				dom_event_init(evt, type_dom, false, false);
+				dom_string_unref(type_dom);
+				dom_event_target_dispatch_event(
+					bw->frame_node, evt, &success);
+			}
+			dom_event_unref(evt);
+		}
+	}
 	return true;
 }
 

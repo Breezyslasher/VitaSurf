@@ -90,6 +90,15 @@ Object.defineProperty(W, '__vitaRegisterKeyClone', { configurable: true,
  * is stored and read back still referring to itself. JSON alone loses
  * all three, so types it cannot carry are tagged and rebuilt.
  */
+/*
+ * What a value is, by its brand rather than by instanceof: a message from
+ * a frame carries that frame's Dates and Maps, which are not instances of
+ * this window's (VitaSurf).
+ */
+function brand(v){
+ return Object.prototype.toString.call(v).slice(8, -1);
+}
+
 function encode(value){
  var seen = [], out = [];
  function walk(v){
@@ -111,24 +120,24 @@ function encode(value){
   var slot = out.length - 1, enc;
   if (keyHooks && keyHooks.is(v)) {
    enc = { $: 'key', v: walk(keyHooks.pack(v)) };
-  } else if (v instanceof Date) {
+  } else if (brand(v) === 'Date') {
    enc = { $: 'date', v: v.getTime() };
-  } else if (v instanceof RegExp) {
+  } else if (brand(v) === 'RegExp') {
    enc = { $: 'regexp', s: v.source, f: v.flags };
-  } else if (typeof Blob === 'function' && v instanceof Blob) {
+  } else if (brand(v) === 'Blob' || brand(v) === 'File') {
    /* a Blob's bytes are not reachable synchronously here, so it is
       stored as its text, which is what a page that stores one wants */
    enc = { $: 'blob', t: v.type || '', v: v._t === undefined ? '' : String(v._t) };
-  } else if (v instanceof ArrayBuffer) {
+  } else if (brand(v) === 'ArrayBuffer') {
    enc = { $: 'ab', v: bytesToString(new Uint8Array(v)) };
   } else if (ArrayBuffer.isView(v)) {
    enc = { $: 'view', n: v.constructor.name,
            v: bytesToString(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) };
-  } else if (v instanceof Map) {
+  } else if (brand(v) === 'Map') {
    var pairs = [];
    v.forEach(function(val, key){ pairs.push([walk(key), walk(val)]); });
    enc = { $: 'map', v: pairs };
-  } else if (v instanceof Set) {
+  } else if (brand(v) === 'Set') {
    var items = [];
    v.forEach(function(item){ items.push(walk(item)); });
    enc = { $: 'set', v: items };
