@@ -4210,6 +4210,39 @@ static jsthread *window_thread(struct browser_window *bw)
 	return t != NULL ? t : content_thread(bw->current_content);
 }
 
+/*
+ * The page a frame's iframe element is in (VitaSurf). Its parent window
+ * can hold two pages while a new one loads over the one on screen, and
+ * picking by window gave a frame of either page the other as its parent:
+ * claude.ai's frames and the Cloudflare page loading over it held each
+ * other's objects, and a closed page's 70 MB stayed in use.
+ */
+static jsthread *frame_parent_thread(struct browser_window *bw)
+{
+	struct dom_document *doc = NULL;
+	jsthread *t = NULL;
+
+	if (bw == NULL || bw->parent == NULL) {
+		return NULL;
+	}
+	if (bw->frame_node != NULL &&
+	    dom_node_get_owner_document(bw->frame_node, &doc) == DOM_NO_ERR &&
+	    doc != NULL) {
+		jsthread *a = content_thread(bw->parent->loading_content);
+		jsthread *b = content_thread(bw->parent->current_content);
+
+		if (a != NULL && thread_document(a) == doc) {
+			t = a;
+		} else if (b != NULL && thread_document(b) == doc) {
+			t = b;
+		}
+		dom_node_unref(doc);
+		/* the element's page is neither: it is going */
+		return t;
+	}
+	return window_thread(bw->parent);
+}
+
 static JSValue window_global(struct browser_window *bw)
 {
 	jsthread *t = window_thread(bw);
@@ -4584,8 +4617,11 @@ static JSValue win_vita_parent_global(JSContext *ctx, JSValueConst this_val,
 	(void)this_val;
 	(void)argc;
 	(void)argv;
-	return bw != NULL && bw->parent != NULL ? window_global(bw->parent)
-						: JS_NULL;
+	{
+		jsthread *t = frame_parent_thread(bw);
+
+		return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
+	}
 }
 
 /* __vitaTopGlobal(): the global of the page at the top of the tree */
@@ -4601,10 +4637,16 @@ static JSValue win_vita_top_global(JSContext *ctx, JSValueConst this_val,
 	if (bw == NULL || bw->parent == NULL) {
 		return JS_NULL;
 	}
-	while (bw->parent != NULL) {
-		bw = bw->parent;
+	{
+		jsthread *t = NULL;
+
+		/* page by page up the iframe elements, as parent does */
+		while (bw->parent != NULL) {
+			t = frame_parent_thread(bw);
+			bw = bw->parent;
+		}
+		return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
 	}
-	return window_global(bw);
 }
 
 /* __vitaFrameElement(): this frame's iframe element, in the parent page */
@@ -4621,7 +4663,7 @@ static JSValue win_vita_frame_element(JSContext *ctx, JSValueConst this_val,
 	if (bw == NULL || bw->parent == NULL || bw->frame_node == NULL) {
 		return JS_NULL;
 	}
-	t = window_thread(bw->parent);
+	t = frame_parent_thread(bw);
 	return t != NULL ? wrap_node(t->ctx, bw->frame_node) : JS_NULL;
 }
 
@@ -13959,7 +14001,7 @@ bool js_fire_event(jsthread *thread, const char *type,
 
 		if (bw != NULL && bw->parent != NULL &&
 		    bw->frame_node != NULL &&
-		    window_thread(bw->parent) != NULL &&
+		    frame_parent_thread(bw) != NULL &&
 		    dom_event_create(&evt) == DOM_NO_ERR) {
 			type_dom = to_dom_string("load");
 			if (type_dom != NULL) {
@@ -13972,7 +14014,7 @@ bool js_fire_event(jsthread *thread, const char *type,
 		}
 		/* the page around it may be waiting on this frame */
 		if (bw != NULL && bw->parent != NULL) {
-			jsthread *up = window_thread(bw->parent);
+			jsthread *up = frame_parent_thread(bw);
 
 			if (up != NULL && up->load_deferred) {
 				guit->misc->schedule(0, deferred_load_check, up);
