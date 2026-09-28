@@ -159,6 +159,32 @@ struct js_wrapper {
 /* selector strings remembered by address; a power of two */
 #define SEL_RECENT 256
 
+/*
+ * Which of a shadow host's own children go into which of its slots
+ * (VitaSurf). The prelude works it out; box construction reads it
+ * through vitasurf_composed, so a child is drawn where its slot is
+ * rather than after everything the component rendered.
+ */
+struct slot_entry {
+	struct dom_node *node;	/**< a host's own child */
+	struct dom_node *host;	/**< its parent when this was recorded */
+	struct dom_node *slot;	/**< where it is drawn, NULL for nowhere */
+	int next;		/**< the next entry in the same slot, or -1 */
+};
+struct slot_head {
+	struct dom_node *slot;
+	int first;		/**< its first entry */
+};
+struct slot_map {
+	struct slot_entry *e;
+	unsigned n;
+	struct slot_head *h;
+	unsigned nh;
+	int *etab;		/**< node to entry, open addressing, -1 free */
+	int *htab;		/**< slot to head */
+	unsigned mask;		/**< both tables have mask + 1 buckets */
+};
+
 struct jsthread {
 	jsheap *heap;
 	JSContext *ctx;
@@ -248,6 +274,7 @@ struct jsthread {
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
 	unsigned relayout_ms;     /**< how long the last rebuild took */
 	uint32_t relayout_due;    /**< now_ms() the pending rebuild runs at, low 32 bits */
+	struct slot_map slots;    /**< the composed tree's slots (VitaSurf) */
 	unsigned js_scripts;      /**< scripts executed for this page */
 	unsigned js_bytes;        /**< their total size */
 	unsigned js_compile_ms;   /**< time spent compiling them */
@@ -6689,6 +6716,326 @@ static void schedule_relayout(jsthread *thread, int ms)
 	}
 }
 
+/* ------------------------------------------------------------------------ */
+/* Slots: the composed tree box construction is built from (VitaSurf)      */
+
+static void slot_map_free(struct slot_map *m)
+{
+	unsigned i;
+
+	for (i = 0; i < m->n; i++) {
+		dom_node_unref(m->e[i].node);
+		dom_node_unref(m->e[i].host);
+		if (m->e[i].slot != NULL) {
+			dom_node_unref(m->e[i].slot);
+		}
+	}
+	for (i = 0; i < m->nh; i++) {
+		dom_node_unref(m->h[i].slot);
+	}
+	free(m->e);
+	free(m->h);
+	free(m->etab);
+	free(m->htab);
+	memset(m, 0, sizeof(*m));
+}
+
+static unsigned slot_hash(const struct dom_node *n, unsigned mask)
+{
+	uintptr_t v = (uintptr_t)n >> 3;
+
+	return (unsigned)((v * 2654435761u) & mask);
+}
+
+static int slot_find_entry(const struct slot_map *m, const struct dom_node *n)
+{
+	unsigned i;
+
+	if (m->etab == NULL) {
+		return -1;
+	}
+	for (i = slot_hash(n, m->mask); m->etab[i] >= 0; i = (i + 1) & m->mask) {
+		if (m->e[m->etab[i]].node == n) {
+			return m->etab[i];
+		}
+	}
+	return -1;
+}
+
+static int slot_find_head(const struct slot_map *m, const struct dom_node *n)
+{
+	unsigned i;
+
+	if (m->htab == NULL) {
+		return -1;
+	}
+	for (i = slot_hash(n, m->mask); m->htab[i] >= 0; i = (i + 1) & m->mask) {
+		if (m->h[m->htab[i]].slot == n) {
+			return m->htab[i];
+		}
+	}
+	return -1;
+}
+
+/** Whether anc is n or one of its ancestors in the DOM. */
+static bool slot_dom_contains(struct dom_node *anc, struct dom_node *n)
+{
+	struct dom_node *cur = dom_node_ref(n), *up = NULL;
+	unsigned depth = 0;
+
+	while (cur != NULL && depth++ < 4096) {
+		if (cur == anc) {
+			dom_node_unref(cur);
+			return true;
+		}
+		if (dom_node_get_parent_node(cur, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(cur);
+		cur = up;
+	}
+	if (cur != NULL) {
+		dom_node_unref(cur);
+	}
+	return false;
+}
+
+/*
+ * Whether an entry still describes the tree. Scripts can move nodes
+ * between the prelude's pass and the boxes being built, and the three
+ * questions below must agree with each other or the walk would lose
+ * its way; so each asks this, and an entry that no longer holds is
+ * treated as an ordinary child where the DOM has it.
+ */
+static bool slot_entry_holds(const struct slot_entry *e)
+{
+	struct dom_node *parent = NULL;
+	bool same;
+
+	if (dom_node_get_parent_node(e->node, &parent) != DOM_NO_ERR) {
+		return false;
+	}
+	same = (parent == e->host);
+	if (parent != NULL) {
+		dom_node_unref(parent);
+	}
+	if (!same) {
+		return false;
+	}
+	if (e->slot == NULL) {
+		return true;
+	}
+	return slot_dom_contains(e->host, e->slot) &&
+		!slot_dom_contains(e->node, e->slot);
+}
+
+/** Whether a node is a host's own child that a slot draws, or nothing. */
+static bool slot_is_moved(const struct slot_map *m, struct dom_node *n)
+{
+	int i = slot_find_entry(m, n);
+
+	return i >= 0 && slot_entry_holds(&m->e[i]);
+}
+
+/** Step *p forward past the children that are drawn somewhere else. */
+static void slot_skip_moved(const struct slot_map *m, struct dom_node **p)
+{
+	struct dom_node *next = NULL;
+
+	while (*p != NULL && slot_is_moved(m, *p)) {
+		if (dom_node_get_next_sibling(*p, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		dom_node_unref(*p);
+		*p = next;
+	}
+}
+
+/** The first entry from i on that still holds, or -1. */
+static int slot_next_holding(const struct slot_map *m, int i)
+{
+	while (i >= 0 && !slot_entry_holds(&m->e[i])) {
+		i = m->e[i].next;
+	}
+	return i;
+}
+
+/** Ask the prelude which children go where; it calls __vitaSlots. */
+static void slot_pass(jsthread *thread)
+{
+	JSContext *ctx = thread->ctx;
+	JSValue global, fn, r;
+
+	if (ctx == NULL || thread->closed || thread->is_worker) {
+		return;
+	}
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaSlotPass");
+	if (JS_IsFunction(ctx, fn)) {
+		r = JS_Call(ctx, fn, global, 0, NULL);
+		if (JS_IsException(r)) {
+			qjs_absorb_or_rethrow(ctx);
+		}
+		JS_FreeValue(ctx, r);
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+}
+
+static bool composed_hook(struct html_content *c, enum vitasurf_composed_op op,
+			  struct dom_node *n, struct dom_node **out)
+{
+	jsthread *thread = (c != NULL) ? c->jsthread : NULL;
+	struct slot_map *m;
+	struct dom_node *d = NULL;
+	int i;
+
+	if (thread == NULL || thread->closed) {
+		return false;
+	}
+	if (op == VITASURF_COMPOSED_PREPARE) {
+		slot_pass(thread);
+		return true;
+	}
+	m = &thread->slots;
+	if (m->n == 0 || n == NULL || out == NULL) {
+		return false;
+	}
+	switch (op) {
+	case VITASURF_COMPOSED_PARENT:
+		i = slot_find_entry(m, n);
+		if (i >= 0 && m->e[i].slot != NULL &&
+		    slot_entry_holds(&m->e[i])) {
+			*out = dom_node_ref(m->e[i].slot);
+			return true;
+		}
+		return false;
+
+	case VITASURF_COMPOSED_FIRST_CHILD:
+		i = slot_find_head(m, n);
+		if (i >= 0) {
+			i = slot_next_holding(m, m->h[i].first);
+			if (i >= 0) {
+				*out = dom_node_ref(m->e[i].node);
+				return true;
+			}
+			/* nothing assigned now: the slot's own content */
+		}
+		if (dom_node_get_first_child(n, &d) != DOM_NO_ERR) {
+			return false;
+		}
+		slot_skip_moved(m, &d);
+		*out = d;
+		return true;
+
+	case VITASURF_COMPOSED_NEXT_SIBLING:
+		i = slot_find_entry(m, n);
+		if (i >= 0 && m->e[i].slot != NULL &&
+		    slot_entry_holds(&m->e[i])) {
+			i = slot_next_holding(m, m->e[i].next);
+			*out = (i >= 0) ? dom_node_ref(m->e[i].node) : NULL;
+			return true;
+		}
+		if (dom_node_get_next_sibling(n, &d) != DOM_NO_ERR) {
+			return false;
+		}
+		slot_skip_moved(m, &d);
+		*out = d;
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+/*
+ * __vitaSlots(nodes, slots): a host's own children, and for each the
+ * slot that draws it or null. Replaces what was known before.
+ */
+static JSValue win_vita_slots(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct slot_map m;
+	int64_t len64 = 0;
+	unsigned len, i, buckets;
+
+	(void)this_val;
+	if (thread == NULL || argc < 2) {
+		return JS_UNDEFINED;
+	}
+	slot_map_free(&thread->slots);
+	if (JS_GetLength(ctx, argv[0], &len64) < 0 || len64 <= 0) {
+		return JS_UNDEFINED;
+	}
+	len = (len64 > 200000) ? 200000u : (unsigned)len64;
+	memset(&m, 0, sizeof(m));
+	for (buckets = 16; buckets < len * 2; buckets <<= 1)
+		;
+	m.mask = buckets - 1;
+	m.e = calloc(len, sizeof(*m.e));
+	m.h = calloc(len, sizeof(*m.h));
+	m.etab = malloc(buckets * sizeof(int));
+	m.htab = malloc(buckets * sizeof(int));
+	if (m.e == NULL || m.h == NULL || m.etab == NULL || m.htab == NULL) {
+		slot_map_free(&m);
+		return JS_UNDEFINED;
+	}
+	memset(m.etab, 0xff, buckets * sizeof(int));
+	memset(m.htab, 0xff, buckets * sizeof(int));
+	for (i = 0; i < len; i++) {
+		JSValue nv = JS_GetPropertyUint32(ctx, argv[0], i);
+		JSValue sv = JS_GetPropertyUint32(ctx, argv[1], i);
+		struct dom_node *node = JS_GetOpaque(nv, node_class_id);
+		struct dom_node *slot = JS_GetOpaque(sv, node_class_id);
+		struct dom_node *host = NULL;
+		struct slot_entry *e;
+		unsigned b;
+		int hi;
+
+		JS_FreeValue(ctx, nv);
+		JS_FreeValue(ctx, sv);
+		if (node == NULL || slot_find_entry(&m, node) >= 0 ||
+		    dom_node_get_parent_node(node, &host) != DOM_NO_ERR ||
+		    host == NULL) {
+			continue;
+		}
+		e = &m.e[m.n];
+		e->node = dom_node_ref(node);
+		e->host = host;
+		e->slot = (slot != NULL) ? dom_node_ref(slot) : NULL;
+		e->next = -1;
+		for (b = slot_hash(node, m.mask); m.etab[b] >= 0;
+		     b = (b + 1) & m.mask)
+			;
+		m.etab[b] = (int)m.n;
+		if (slot != NULL) {
+			/* entries arrive in order; append to the slot's list */
+			hi = slot_find_head(&m, slot);
+			if (hi < 0) {
+				hi = (int)m.nh++;
+				m.h[hi].slot = dom_node_ref(slot);
+				m.h[hi].first = (int)m.n;
+				for (b = slot_hash(slot, m.mask);
+				     m.htab[b] >= 0; b = (b + 1) & m.mask)
+					;
+				m.htab[b] = hi;
+			} else {
+				int k = m.h[hi].first;
+
+				while (m.e[k].next >= 0) {
+					k = m.e[k].next;
+				}
+				m.e[k].next = (int)m.n;
+			}
+		}
+		m.n++;
+	}
+	thread->slots = m;
+	return JS_UNDEFINED;
+}
+
 /*
  * Whether there is a layout to read geometry from. A rebuild after a DOM
  * change runs from the scheduler, not from here: NetSurf's conversion
@@ -10511,6 +10858,9 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaCanvasMeasure", 5));
 	JS_SetPropertyStr(ctx, global, "__vitaGap",
 			  JS_NewCFunction(ctx, win_vita_gap, "__vitaGap", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaSlots",
+			  JS_NewCFunction(ctx, win_vita_slots,
+					  "__vitaSlots", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaFocusControl",
 			  JS_NewCFunction(ctx, win_vita_focus_control,
 					  "__vitaFocusControl", 1));
@@ -10710,6 +11060,7 @@ void js_initialise(void)
 	 * text.)
 	 */
 	dom_event_set_window_hook(window_hook, NULL);
+	vitasurf_composed = composed_hook;
 #ifdef QJS_VERSION_MAJOR
 	vita_log("qjs: QuickJS engine initialised (content handler %s), "
 		 "quickjs-ng %d.%d.%d%s, %s",
@@ -11120,6 +11471,7 @@ nserror js_closethread(jsthread *thread)
 	 */
 	t0 = now_ms();
 	thread->closed = true;
+	slot_map_free(&thread->slots);
 	/* a navigation the page asked for goes with the page */
 	if (thread->nav_pending != NULL) {
 		guit->misc->schedule(-1, nav_callback, thread);

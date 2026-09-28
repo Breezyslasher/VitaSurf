@@ -911,12 +911,16 @@ var LABELABLE=' BUTTON INPUT METER OUTPUT PROGRESS SELECT TEXTAREA ';
    rather than looking only at what was clicked. */
 function activationTarget(target){
  var n=target,a;
+ /* a text node, and a host's own child drawn in a slot, are activated
+    through where they are drawn: the label text of a checkbox sits in
+    a slot inside the component's label (VitaSurf) */
+ if(n&&n.nodeType===3)n=n.__vsSlot||n.parentNode;
  while(n&&n.nodeType===1){
   a=otherActivation(n);
   if(a)return a;
   a=preActivate(n);
   if(a)return a;
-  n=n.parentNode;}
+  n=n.__vsSlot||n.parentNode;}
  return null;}
 /* Following a link. A href that differs from where we are only in its
    fragment is a same-document navigation: the page does not reload, the
@@ -1037,7 +1041,26 @@ P.dispatchEvent=function(e){
   if(e.defaultPrevented)cancelActivate(act);
   else fireAfterActivate(act);}
  else if(act&&!e.defaultPrevented)runActivation(act);
- return r;};P.getContext=function(){return null;};
+ return r;};
+/* A tap inside a label (VitaSurf). NetSurf follows links and toggles its
+ * own form gadgets itself, but knows nothing of labels, and the
+ * activation above runs only for a click a script dispatched. Home
+ * Assistant's "Keep me logged in" is a label around a checkbox the page
+ * keeps invisible and untappable, so a tap on its box or its text did
+ * nothing. Last on the window, after the page's own listeners, a real
+ * click that nothing cancelled and that lands in a label clicks the
+ * control the label is for, or focuses it when it is a text field. */
+window.addEventListener('click',function(e){
+ var a,c,t;
+ if(!e||e.__vitaActivated||e.defaultPrevented)return;
+ a=activationTarget(e.target);
+ if(!a||a.kind!=='label'||!(c=a.control)||c===e.target)return;
+ if(c.disabled)return;
+ t=String(c.type||'').toLowerCase();
+ if(c.tagName==='TEXTAREA'||c.tagName==='SELECT'||(c.tagName==='INPUT'&&
+    !/^(checkbox|radio|submit|reset|button|image|file|color|range)$/.test(t))){
+  if(c.focus)c.focus();return;}
+ if(c.click)c.click();});P.getContext=function(){return null;};
 P.add=function(o,before){this.insertBefore(o,before||null);};
 Object.defineProperty(P,'options',{configurable:true,get:function(){return this.getElementsByTagName('option');}});
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){var o=this.options;for(var i=0;i<o.length;i++)if(o[i].hasAttribute('selected'))return i;return o.length?0:-1;},set:function(i){var o=this.options;for(var j=0;j<o.length;j++){if(j===i)o[j].setAttribute('selected','');else o[j].removeAttribute('selected');}}});
@@ -2692,46 +2715,105 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    t.set.call(this,v);canon[v]=this;return;}
   t.set.call(this,v);}});
 })();
-/* Slotted children with no slot to go to (VitaSurf). A host's own
- * children show only through a <slot> of the same name in its shadow
- * tree, and a component leaves a slot out to hide what would go in it:
- * Home Assistant's text field hands the field under it a clear button
- * and a show-password button, which that field puts a slot out for
- * only when it is clearable or a password. With shadow DOM as light
- * DOM both drew on every field, as a black X the width of the form.
- * While any shadow root exists, each change to the tree's shape marks
- * a host's child whose slot names no slot of that host, and the
- * default stylesheet hides what is marked. */
+/* Slots (VitaSurf). A host's own children are drawn only through a
+ * <slot> in its shadow tree: the one whose name matches their slot
+ * attribute, or the unnamed one. With shadow DOM kept as light DOM they
+ * sat after everything the component rendered, so Home Assistant's Log
+ * in button had its label under it, the checkbox its text below the
+ * box, and the password field its eye icon under the field; and what a
+ * component puts out no slot for, which it means to hide, was drawn.
+ *
+ * Before boxes are built the engine calls __vitaSlotPass, which works
+ * out each host's own children and where each goes, and hands that to
+ * __vitaSlots; box construction then walks the composed tree.
+ *
+ * Which children are the host's own: a Lit component renders between
+ * a marker comment and the node that was its first child when it first
+ * rendered (renderBefore), and whatever lies outside that range is the
+ * page's. For any other component only the children that name a slot
+ * are counted, which is all that could be told apart before. */
 (function(){
- var ATTR='vitasurf-unslotted',timer=null,last=-1,marked=[];
- function hostOf(n){
-  for(n=n.parentNode;n&&n.nodeType===1;n=n.parentNode)if(n.__shadow)return n;
+ var HOSTS=[],last=-1,lastLen=-1,had=false,prev=[];
+ function partRange(h){
+  var c=h,p,k,v,start,end;
+  while(c){
+   p=c._$litPart$;
+   if(p&&typeof p==='object'){
+    start=null;
+    for(k in p){v=p[k];
+     if(v&&typeof v==='object'&&v.nodeType===8&&v.parentNode===h){start=v;break;}}
+    if(start){
+     end=p.options&&p.options.renderBefore;
+     if(end===undefined&&p._$endNode!==undefined)end=p._$endNode;
+     if(!end||end.parentNode!==h)end=null;
+     return {start:start,end:end};}}
+   c=(c===h)?h.firstChild:c.nextSibling;}
   return null;}
- function hasSlot(h,name,e){
-  var ss=h.getElementsByTagName('slot'),i,s;
-  for(i=0;i<ss.length;i++){
-   s=ss[i];
-   if((s.getAttribute('name')||'')!==name||s===e||e.contains(s))continue;
-   if(hostOf(s)===h)return true;}
-  return false;}
+ function lightOf(h){
+  var out=[],r=partRange(h),c,state=0;
+  if(r){
+   for(c=h.firstChild;c;c=c.nextSibling){
+    if(c===r.start)state=1;
+    else if(state===1&&c===r.end)state=2;
+    if(state!==1&&c.nodeType!==8)out.push(c);}
+   return out;}
+  for(c=h.firstChild;c;c=c.nextSibling)
+   if(c.nodeType===1&&c.hasAttribute('slot'))out.push(c);
+  return out;}
  function pass(){
-  var g=treeGen(),l,i,e,h,now=[];
-  if(g>=0&&g===last)return;
+  var g=domGen(),i,j,h,l,light=new Set(),perHost=[],nodes=[],slots=[],
+      ss,s,n,p,name,byName,live=[];
+  if(g>=0&&g===last&&HOSTS.length===lastLen)return;
   last=g;
-  l=D.querySelectorAll('[slot]');
-  for(i=0;i<l.length;i++){
-   e=l[i];h=e.parentNode;
-   if(h&&h.__shadow&&!hasSlot(h,e.getAttribute('slot')||'',e)){
-    now.push(e);
-    if(!e.hasAttribute(ATTR))e.setAttribute(ATTR,'');}}
-  for(i=0;i<marked.length;i++)
-   if(now.indexOf(marked[i])<0)marked[i].removeAttribute(ATTR);
-  marked=now;}
+  for(i=0;i<HOSTS.length;i++){
+   h=HOSTS[i];
+   if(!h.__shadow)continue;
+   if(!ceInDoc(h)){if(HOSTS.length<4096)live.push(h);continue;}
+   live.push(h);
+   l=lightOf(h);
+   for(j=0;j<l.length;j++)light.add(l[j]);
+   perHost.push([h,l]);}
+  HOSTS=live;lastLen=HOSTS.length;
+  for(i=0;i<perHost.length;i++){
+   h=perHost[i][0];l=perHost[i][1];
+   if(!l.length)continue;
+   /* the host's own slots: those whose nearest host, climbing past
+      any host they are a page child of, is this one */
+   byName=Object.create(null);
+   ss=h.getElementsByTagName('slot');
+   for(j=0;j<ss.length;j++){
+    s=ss[j];n=s;
+    for(;;){p=n.parentNode;
+     if(!p||p.nodeType!==1){p=null;break;}
+     if(p.__shadow&&!light.has(n))break;
+     n=p;}
+    if(p!==h)continue;
+    name=s.getAttribute('name')||'';
+    if(!(name in byName))byName[name]=s;}
+   for(j=0;j<l.length;j++){
+    n=l[j];
+    name=n.nodeType===1?(n.getAttribute('slot')||''):'';
+    s=byName[name]||null;
+    nodes.push(n);slots.push(s);
+    if(n.__vsSlot!==s)Object.defineProperty(n,'__vsSlot',
+     {configurable:true,writable:true,enumerable:false,value:s});}}
+  /* what was drawn in a slot and no longer is */
+  if(prev.length){
+   var now=new Set(nodes);
+   for(i=0;i<prev.length;i++)
+    if(!now.has(prev[i])&&prev[i].__vsSlot)prev[i].__vsSlot=null;}
+  prev=nodes;
+  if(nodes.length||had)__vitaSlots(nodes,slots);
+  had=nodes.length>0;}
+ if(typeof __vitaSlots==='function')
+  Object.defineProperty(W,'__vitaSlotPass',{configurable:true,writable:true,
+   enumerable:false,value:function(){try{pass();}catch(e){}}});
  var att=P.attachShadow;
  P.attachShadow=function(){
-  if(timer===null&&typeof W.setInterval==='function')
-   timer=W.setInterval(pass,250);
+  if(!this.__shadow)HOSTS.push(this);
   return att.apply(this,arguments);};
+ Object.defineProperty(P,'assignedSlot',{configurable:true,
+  get:function(){return this.__vsSlot||null;}});
 })();
 /* <template>. libdom parses the children into the template element, so
  * content used to be the element itself -- and stamping a template then
