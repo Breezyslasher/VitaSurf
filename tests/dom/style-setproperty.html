@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- el.style keeps its parsed declarations while the style attribute
+     reads the same, so a theme that sets hundreds of variables does not
+     parse and rewrite the whole attribute for each. The attribute stays
+     the truth: a change made through setAttribute is seen at once.
+     Expected console output: seven lines ending in "ok". -->
+<html><body><div id=d style="color: red">x</div><script>
+var d = document.getElementById('d'), s = d.style;
+s.setProperty('--a', '1px');
+s.setProperty('--b', '2px', 'important');
+console.log("added:", s.getPropertyValue('--a') === '1px' && s.getPropertyPriority('--b') === 'important' && s.color === 'red' ? "ok" : "FAIL " + d.getAttribute('style'));
+s.setProperty('--a', '3px');
+console.log("replaced:", d.style.getPropertyValue('--a') === '3px' && d.style.length === 3 ? "ok" : "FAIL " + d.getAttribute('style'));
+d.setAttribute('style', 'margin-top: 4px');
+console.log("attribute wins:", s.getPropertyValue('--a') === '' && s.marginTop === '4px' ? "ok" : "FAIL " + d.getAttribute('style'));
+s.setProperty('--c', 'x');
+console.log("added after setAttribute:", d.getAttribute('style') === 'margin-top: 4px; --c: x;' ? "ok" : "FAIL " + d.getAttribute('style'));
+s.removeProperty('margin-top');
+console.log("removed:", d.getAttribute('style') === '--c: x;' && s.item(0) === '--c' ? "ok" : "FAIL " + d.getAttribute('style'));
+s.cssText = 'color: blue; color: green';
+console.log("last of two wins:", s.color === 'green' ? "ok" : "FAIL " + s.color);
+var h = document.documentElement, t0 = Date.now(), i;
+for (i = 0; i < 600; i++) h.style.setProperty('--theme-' + i, '#' + (100 + i));
+for (i = 0; i < 600; i++) if (h.style.getPropertyValue('--theme-' + i) !== '#' + (100 + i)) break;
+console.log("600 variables:", i === 600 && Date.now() - t0 < 1000 ? "ok" : "FAIL " + i + " in " + (Date.now() - t0) + " ms");
+</script></body></html>

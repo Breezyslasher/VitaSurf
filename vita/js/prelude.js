@@ -4252,28 +4252,57 @@ function parseDecl(t){var out=[];
 function serialDecl(list){return list.map(function(d){
  return d[0]+': '+d[1]+(d[2]?' !'+d[2]:'')+';';}).join(' ');}
 function CSSStyleDeclaration(el){this._e=el;}
+/* The parsed style attribute of each element, while the attribute still
+ * reads the same. Home Assistant's theme sets some 600 variables on one
+ * element through setProperty, and parsing and writing the whole
+ * attribute for each of them took 14 s on the Vita. */
+var STYLE_PARSED=new WeakMap();
+function styleOf(e){
+ var s=e.getAttribute('style')||'',c=STYLE_PARSED.get(e);
+ if(c&&c.s===s)return c;
+ var l=parseDecl(s),ix=new Map(),i;
+ for(i=0;i<l.length;i++)ix.set(l[i][0],i);
+ c={s:s,l:l,ix:ix};STYLE_PARSED.set(e,c);return c;}
+function declText(d){return d[0]+': '+d[1]+(d[2]?' !'+d[2]:'')+';';}
 CSSStyleDeclaration.prototype._d=function(){
- return this._e?parseDecl(this._e.getAttribute('style')):(this._own||(this._own=[]));};
+ return this._e?styleOf(this._e).l:(this._own||(this._own=[]));};
 CSSStyleDeclaration.prototype._w=function(list){
  if(this._e)this._e.setAttribute('style',serialDecl(list));else this._own=list;};
+CSSStyleDeclaration.prototype._find=function(n){
+ if(this._e){var c=styleOf(this._e),i=c.ix.get(n);return i===undefined?null:c.l[i];}
+ var d=this._d();
+ for(var j=d.length-1;j>=0;j--)if(d[j][0]===n)return d[j];
+ return null;};
 CSSStyleDeclaration.prototype.getPropertyValue=function(n){
- n=cssName(n);var d=this._d();
- for(var i=0;i<d.length;i++)if(d[i][0]===n)return d[i][1];
- return '';};
+ var d=this._find(cssName(n));return d?d[1]:'';};
 CSSStyleDeclaration.prototype.getPropertyPriority=function(n){
- n=cssName(n);var d=this._d();
- for(var i=0;i<d.length;i++)if(d[i][0]===n)return d[i][2];
- return '';};
+ var d=this._find(cssName(n));return d?d[2]:'';};
 CSSStyleDeclaration.prototype.setProperty=function(n,v,pr){
  n=cssName(n);
  if(v===''||v===null||v===undefined)return this.removeProperty(n);
- var d=this._d(),done=false;
- for(var i=0;i<d.length;i++)if(d[i][0]===n){d[i][1]=String(v);d[i][2]=pr||'';done=true;}
- if(!done)d.push([n,String(v),pr||'']);
- this._w(d);};
+ var d=[n,String(v),pr||''];
+ if(!this._e){
+  var own=this._d(),i;
+  for(i=0;i<own.length;i++)if(own[i][0]===n){own[i]=d;return;}
+  own.push(d);return;}
+ var e=this._e,c=styleOf(e),at=c.ix.get(n),s;
+ if(at===undefined){
+  /* a new one goes on the end, so the rest need not be written again */
+  /* not /\s+$/: that tries every space in 30 KB of attribute */
+  s=c.s;var k=s.length;
+  while(k>0&&s.charCodeAt(k-1)<=32)k--;
+  if(k<s.length)s=s.slice(0,k);
+  if(s&&s.charAt(s.length-1)!==';')s+=';';
+  s+=(s?' ':'')+declText(d);
+  e.setAttribute('style',s);
+  c.l.push(d);c.ix.set(n,c.l.length-1);c.s=s;
+  return;}
+ c.l[at]=d;
+ s=serialDecl(c.l);
+ e.setAttribute('style',s);c.s=s;};
 CSSStyleDeclaration.prototype.removeProperty=function(n){
  n=cssName(n);var old=this.getPropertyValue(n);
- this._w(this._d().filter(function(x){return x[0]!==n;}));
+ if(this._find(n))this._w(this._d().filter(function(x){return x[0]!==n;}));
  return old;};
 CSSStyleDeclaration.prototype.item=function(i){var d=this._d();return d[i]?d[i][0]:'';};
 Object.defineProperty(CSSStyleDeclaration.prototype,'length',{configurable:true,

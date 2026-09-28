@@ -7278,6 +7278,66 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 	return obj;
 }
 
+/*
+ * The listeners of a destroyed thread, still registered with libdom,
+ * until no dispatch is walking a node's list (VitaSurf). Their nodes can
+ * outlive the thread: the page kept a frame's document, or a frame's
+ * script listened on the page's nodes. Freeing them with the thread left
+ * libdom calling freed memory, and build 478 crashed on claude.ai.
+ */
+static struct js_listener *orphan_listeners;
+static int trampoline_depth;
+static bool orphan_sweep_due;
+
+static void orphan_listener_free(struct js_listener *l)
+{
+	if (l->node != NULL && l->type != NULL && l->dom_listener != NULL) {
+		dom_event_target_remove_event_listener(l->node, l->type,
+						       l->dom_listener,
+						       l->capture);
+	}
+	if (l->dom_listener != NULL) dom_event_listener_unref(l->dom_listener);
+	if (l->type != NULL) dom_string_unref(l->type);
+	if (l->node != NULL) dom_node_unref(l->node);
+	free(l);
+}
+
+static void orphan_sweep_cb(void *p)
+{
+	(void)p;
+	orphan_sweep_due = false;
+	if (trampoline_depth > 0) {
+		orphan_sweep_due = true;
+		guit->misc->schedule(10, orphan_sweep_cb, NULL);
+		return;
+	}
+	while (orphan_listeners != NULL) {
+		struct js_listener *l = orphan_listeners;
+
+		orphan_listeners = l->next;
+		orphan_listener_free(l);
+	}
+}
+
+/** Unregister and free a destroyed thread's listener, now or later. */
+static void orphan_listener(struct js_listener *l)
+{
+	l->thread = NULL;
+	l->dead = true;
+	if (trampoline_depth == 0) {
+		orphan_listener_free(l);
+		return;
+	}
+	/* a dispatch is walking some node's list: taking l off it now
+	 * could corrupt that walk */
+	l->next = orphan_listeners;
+	orphan_listeners = l;
+	if (!orphan_sweep_due) {
+		orphan_sweep_due = true;
+		guit->misc->schedule(0, orphan_sweep_cb, NULL);
+	}
+}
+
 static void listener_trampoline(struct dom_event *evt, void *pw)
 {
 	struct js_listener *l = pw;
@@ -7294,6 +7354,7 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		return;
 	}
 	ctx = thread->ctx;
+	trampoline_depth++;
 	thread->event_depth++;
 	begin_script(thread, SCRIPT_EVENT);
 	/* this is the element the listener was added to */
@@ -7364,6 +7425,7 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	JS_FreeValue(ctx, global);
 	end_script(thread);
 	thread->event_depth--;
+	trampoline_depth--;
 	/*
 	 * A once listener is spent. It cannot be freed here: libdom is
 	 * still inside the dispatch that is walking the list it is in, and
@@ -10819,6 +10881,13 @@ nserror js_closethread(jsthread *thread)
 		JS_FreeValue(thread->ctx, thread->import_map);
 		thread->import_map = JS_UNINITIALIZED;
 	}
+	/*
+	 * Not this thread any more: a function made here can outlive the
+	 * context, held by another page's listener or timer, and the
+	 * natives it calls find their thread through the context. Every
+	 * one of them takes NULL as "no page".
+	 */
+	JS_SetContextOpaque(thread->ctx, NULL);
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
 	JS_RunGC(thread->heap->rt);
@@ -10856,18 +10925,12 @@ void js_destroythread(jsthread *thread)
 	js_free_deferred(thread);
 	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;
+	thread->listeners = NULL;
 	while (l != NULL) {
 		struct js_listener *next = l->next;
-		if (l->dom_listener != NULL) {
-			dom_event_listener_unref(l->dom_listener);
-		}
-		if (l->type != NULL) {
-			dom_string_unref(l->type);
-		}
-		if (l->node != NULL) {
-			dom_node_unref(l->node);
-		}
-		free(l);
+
+		/* off its node too: the node may outlive this thread */
+		orphan_listener(l);
 		l = next;
 	}
 	free(thread->node_hash);
