@@ -1089,7 +1089,10 @@ D.createEvent=function(t){
  ev.type='';ev.target=null;ev.currentTarget=null;ev.eventPhase=0;
  ev.bubbles=false;ev.cancelable=false;ev.defaultPrevented=false;
  ev.isTrusted=false;
- return ev;};D.dispatchEvent=function(e){return __vitaDispatch(null,e);};D.hasFocus=function(){return true;};
+ return ev;};D.dispatchEvent=function(e){return __vitaDispatch(D,e);};
+/* window.event: undefined outside a dispatch; the listener call sets it */
+if(!Object.prototype.hasOwnProperty.call(window,'event'))window.event=undefined;
+D.hasFocus=function(){return true;};
 /* The qualified name has to satisfy the same namespace rules as an
    attribute's before an element is made from it. */
 /* createElement takes a Name, in which a colon is an ordinary name
@@ -1688,7 +1691,13 @@ W.TouchList=Array;W.DataTransfer=function(){this.items=[];this.files=[];this.typ
  * names, reads undefined through an inherited getter, and dies on it.
  * Give each one an empty prototype in the chain instead. */
 var DocumentProto={};Object.setPrototypeOf(D,DocumentProto);
-function Document(){throw new TypeError('Illegal constructor');}
+/* new Document() makes an empty document; a document the parser or the
+   implementation made is a node wrapper, which instanceof still knows */
+function Document(){
+ if(new.target===undefined)throw new TypeError("Failed to construct 'Document': Please use the 'new' operator");
+ return D.implementation.createDocument(null,null,null);}
+try{Object.defineProperty(Document,Symbol.hasInstance,{configurable:true,
+ value:function(o){return !!o&&typeof o==='object'&&o.nodeType===9;}});}catch(e){}
 function HTMLDocument(){throw new TypeError('Illegal constructor');}
 W.Document=Document;W.HTMLDocument=HTMLDocument;
 Document.prototype=DocumentProto;HTMLDocument.prototype=DocumentProto;
@@ -2536,9 +2545,98 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  function styleNode(n){
   return n&&n.nodeType===1&&n.tagName==='STYLE'&&
    !(n.attributes&&n.attributes.length);}
+ /* A shadow root's rules, kept to its host (VitaSurf). Without
+  * scoping, the checkbox component on Home Assistant's login page
+  * brought input{opacity:0;pointer-events:none;position:absolute}
+  * into the page, and the username and password fields went
+  * invisible to taps. Each selector is put under the host's tag:
+  * :host is the tag, :host(X) the tag with X, :host-context(X) the
+  * tag inside X, ::slotted(X) an X inside the tag, anything else a
+  * descendant of the tag. Rules in @media and @supports are scoped
+  * the same way; @keyframes, @font-face and the like are left as
+  * they are. The tag, not the host, so every copy of a component
+  * gets the same text and the folding below still works. */
+ var scoped=Object.create(null),nscoped=0;
+ function closeAt(t,i,open,close){
+  /* index of the bracket closing the one at i, strings skipped */
+  var d=0,c,q;
+  for(;i<t.length;i++){
+   c=t.charAt(i);
+   if(c==='"'||c==="'"){q=c;for(i++;i<t.length&&t.charAt(i)!==q;i++)
+    if(t.charAt(i)==='\\')i++;continue;}
+   if(c===open)d++;
+   else if(c===close&&--d===0)return i;}
+  return -1;}
+ function splitList(t){
+  var out=[],d=0,st=0,i,c,q;
+  for(i=0;i<t.length;i++){
+   c=t.charAt(i);
+   if(c==='"'||c==="'"){q=c;for(i++;i<t.length&&t.charAt(i)!==q;i++)
+    if(t.charAt(i)==='\\')i++;continue;}
+   if(c==='\\'){i++;continue;}
+   if(c==='('||c==='[')d++;
+   else if(c===')'||c===']')d--;
+   else if(c===','&&d===0){out.push(t.slice(st,i));st=i+1;}}
+  out.push(t.slice(st));
+  return out;}
+ function scopeSel(s,tag){
+  var m,e,x;
+  s=s.replace(/^\s+|\s+$/g,'');
+  if(!s)return s;
+  s=s.replace(/[^\s>+~]*::slotted\(/g,function(){return ' ::slotted(';});
+  while((x=s.indexOf('::slotted('))>=0){
+   e=closeAt(s,x+9,'(',')');
+   if(e<0)break;
+   s=s.slice(0,x)+s.slice(x+10,e)+s.slice(e+1);}
+  s=s.replace(/^\s+/,'');
+  if((m=/^:host-context\(/.exec(s))){
+   e=closeAt(s,m[0].length-1,'(',')');
+   if(e>0)return s.slice(m[0].length,e)+' '+tag+s.slice(e+1);}
+  if((m=/^:host\(/.exec(s))){
+   e=closeAt(s,m[0].length-1,'(',')');
+   if(e>0){x=s.slice(m[0].length,e);
+    if(/^[a-zA-Z*]/.test(x))x=':is('+x+')';
+    return tag+x+s.slice(e+1);}}
+  if(/^:host(?![\w-])/.test(s))return tag+s.slice(5);
+  return tag+' '+s;}
+ function scopeRules(t,tag){
+  var out='',i=0,b,e,pre,at;
+  while(i<t.length){
+   b=-1;
+   while(i<t.length&&/\s/.test(t.charAt(i)))out+=t.charAt(i++);
+   for(e=i;e<t.length;e++){
+    var c=t.charAt(e);
+    if(c==='"'||c==="'"){var q=c;for(e++;e<t.length&&t.charAt(e)!==q;e++)
+     if(t.charAt(e)==='\\')e++;continue;}
+    if(c==='{'){b=e;break;}
+    if(c===';'&&t.charAt(i)==='@'){break;}}
+   if(b<0){out+=t.slice(i,e+1);i=e+1;continue;}
+   e=closeAt(t,b,'{','}');
+   if(e<0){out+=t.slice(i);break;}
+   pre=t.slice(i,b);at=/^\s*@([\w-]+)/.exec(pre);
+   if(at){
+    if(/^(media|supports|container|layer|document|-moz-document)$/i.test(at[1]))
+     out+=pre+'{'+scopeRules(t.slice(b+1,e),tag)+'}';
+    else out+=t.slice(i,e+1);}
+   else out+=splitList(pre).map(function(x){return scopeSel(x,tag);}).join(',')+
+    t.slice(b,e+1);
+   i=e+1;}
+  return out;}
+ function scope(css,host){
+  var tag=host&&host.localName,k,r;
+  if(!css||!tag||tag==='html'||tag==='body')return css;
+  k=tag+'\n'+css;r=scoped[k];
+  if(r!==undefined)return r;
+  try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}
+  catch(x){r=css;}
+  if(nscoped>=400){scoped=Object.create(null);nscoped=0;}
+  scoped[k]=r;nscoped++;
+  return r;}
  function take(host,n){
-  var css=n.textContent;
+  var css=n.textContent,sc;
   if(!css)return;
+  sc=scope(css,host);
+  if(sc!==css){css=sc;if(rawText)rawText.call(n,css);else n.textContent=css;}
   if(live(css)){n.textContent='';park(n,css);return;}
   canon[css]=n;}
  function fix(host,n){
@@ -2554,10 +2652,13 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  Object.defineProperty(P,'innerHTML',{configurable:true,get:d.get,set:function(v){
   var fresh=[],emptied=[];
   if(this.__shadow&&typeof v==='string'&&v.indexOf('<style')>=0)
+   {var host=this;
    v=v.replace(/<style>([\s\S]*?)<\/style>/gi,function(m,css){
+    var sc=scope(css,host);
+    if(sc!==css){css=sc;m='<style>'+sc+'</style>';}
     if(css&&live(css)){emptied.push(css);return '<style></style>';}
     if(css)fresh.push(css);
-    return m;});
+    return m;});}
   var r=d.set.call(this,v);
   /* the empty ones it made, in order, when they can be told from any
      the page wrote empty itself */
@@ -2584,11 +2685,53 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  Object.defineProperty(P,'textContent',{configurable:true,get:t.get,set:function(v){
   var p;
   if(typeof v==='string'&&v&&(p=this.parentNode)&&p.__shadow&&styleNode(this)){
+   v=scope(v,p);
    if(live(v)){
     if(canon[v]!==this){t.set.call(this,'');park(this,v);}
     return;}
    t.set.call(this,v);canon[v]=this;return;}
   t.set.call(this,v);}});
+})();
+/* Slotted children with no slot to go to (VitaSurf). A host's own
+ * children show only through a <slot> of the same name in its shadow
+ * tree, and a component leaves a slot out to hide what would go in it:
+ * Home Assistant's text field hands the field under it a clear button
+ * and a show-password button, which that field puts a slot out for
+ * only when it is clearable or a password. With shadow DOM as light
+ * DOM both drew on every field, as a black X the width of the form.
+ * While any shadow root exists, each change to the tree's shape marks
+ * a host's child whose slot names no slot of that host, and the
+ * default stylesheet hides what is marked. */
+(function(){
+ var ATTR='vitasurf-unslotted',timer=null,last=-1,marked=[];
+ function hostOf(n){
+  for(n=n.parentNode;n&&n.nodeType===1;n=n.parentNode)if(n.__shadow)return n;
+  return null;}
+ function hasSlot(h,name,e){
+  var ss=h.getElementsByTagName('slot'),i,s;
+  for(i=0;i<ss.length;i++){
+   s=ss[i];
+   if((s.getAttribute('name')||'')!==name||s===e||e.contains(s))continue;
+   if(hostOf(s)===h)return true;}
+  return false;}
+ function pass(){
+  var g=treeGen(),l,i,e,h,now=[];
+  if(g>=0&&g===last)return;
+  last=g;
+  l=D.querySelectorAll('[slot]');
+  for(i=0;i<l.length;i++){
+   e=l[i];h=e.parentNode;
+   if(h&&h.__shadow&&!hasSlot(h,e.getAttribute('slot')||'',e)){
+    now.push(e);
+    if(!e.hasAttribute(ATTR))e.setAttribute(ATTR,'');}}
+  for(i=0;i<marked.length;i++)
+   if(now.indexOf(marked[i])<0)marked[i].removeAttribute(ATTR);
+  marked=now;}
+ var att=P.attachShadow;
+ P.attachShadow=function(){
+  if(timer===null&&typeof W.setInterval==='function')
+   timer=W.setInterval(pass,250);
+  return att.apply(this,arguments);};
 })();
 /* <template>. libdom parses the children into the template element, so
  * content used to be the element itself -- and stamping a template then
@@ -4734,10 +4877,46 @@ Object.keys(DOC_MAKE).forEach(function(m){
    a===undefined?'':String(a)):null;
   return n||D[m](a);};});
 P.createElementNS=function(ns,t){return this.createElement(t);};
+/* Adoption: a node inserted into a fragment of this document becomes this
+   document's (libdom adopts it in place), and leaves it again with no
+   parent. importNode is that, on a copy. They handed back the node as it
+   was, still another document's, which nothing could then insert. */
+function adoptInto(doc,n){
+ if(!n||typeof n!=='object'||n.nodeType===9)return n;
+ if(n.ownerDocument===doc)return n;
+ var f=doc.createDocumentFragment&&doc.createDocumentFragment();
+ if(!f||!f.appendChild)return n;
+ try{f.appendChild(n);f.removeChild(n);}catch(e){}
+ return n;}
 P.importNode=function(n,deep){
  var c=n&&n.cloneNode?n.cloneNode(!!deep):null;
- return c;};
-P.adoptNode=function(n){return n;};
+ return isDoc(this)?adoptInto(this,c):c;};
+P.adoptNode=function(n){return isDoc(this)?adoptInto(this,n):n;};
+D.importNode=function(n,deep){
+ return adoptInto(D,n&&n.cloneNode?n.cloneNode(!!deep):n);};
+D.adoptNode=function(n){return adoptInto(D,n);};
+/* A copy of a document: one of its kind, with copies of its children
+   when deep. There was no cloneNode on the page's document, and a parsed
+   document's gave null. */
+function cloneDocument(src,deep){
+ var html=src===D||src.contentType==='text/html';
+ var d=html?D.implementation.createHTMLDocument(''):
+  D.implementation.createDocument(null,null,null);
+ /* guarded: a child that will not go must not loop forever */
+ var guard=0,f;
+ while((f=d.firstChild)&&guard++<64){d.removeChild(f);if(d.firstChild===f)break;}
+ if(deep){
+  /* the page's document object carries no childNodes of its own */
+  var k=src.childNodes||(src.documentElement?[src.documentElement]:[]),i;
+  for(i=0;i<k.length;i++){
+   if(k[i].nodeType===10&&html)continue;
+   try{d.appendChild(d.importNode(k[i],true));}catch(e){}}}
+ return d;}
+D.cloneNode=function(deep){return cloneDocument(D,!!deep);};
+(function(){var c=P.cloneNode;
+ P.cloneNode=function(deep){
+  if(isDoc(this))return cloneDocument(this,!!deep);
+  return c.apply(this,arguments);};})();
 /* Each document has its own implementation: what it creates belongs to
    it, and the tests check exactly that. */
 Object.defineProperty(P,'implementation',{configurable:true,
@@ -4756,6 +4935,29 @@ Object.defineProperty(P,'defaultView',{configurable:true,
  get:function(){return isDoc(this)?null:undefined;}});
 Object.defineProperty(P,'contentType',{configurable:true,
  get:function(){return isDoc(this)?'text/html':undefined;}});
+/* A document made here (createHTMLDocument, DOMParser) has the metadata a
+   document has: it was all undefined, and code that reads a parsed
+   document's URL or characterSet took it for something else. */
+(function(){
+ /* for a document only: an element keeps what it had (charset reflects
+    an attribute on script and meta) */
+ function docProp(k,val){
+  var d=Object.getOwnPropertyDescriptor(P,k);
+  Object.defineProperty(P,k,{configurable:true,
+   get:function(){
+    if(isDoc(this))return val(this);
+    return d?(d.get?d.get.call(this):d.value):undefined;},
+   set:function(v){
+    if(isDoc(this))return;
+    if(d&&d.set)d.set.call(this,v);
+    else Object.defineProperty(this,k,{value:v,writable:true,configurable:true,enumerable:true});}});}
+ function url(doc){return doc.__vitaURL||'about:blank';}
+ docProp('URL',url);docProp('documentURI',url);
+ ['characterSet','charset','inputEncoding'].forEach(function(k){
+  docProp(k,function(){return 'UTF-8';});});
+ docProp('compatMode',function(){return 'CSS1Compat';});
+ docProp('location',function(){return null;});
+})();
 Object.defineProperty(P,'name',{configurable:true,
  get:function(){
   if(this.nodeType===10)return String(this.nodeName);
@@ -4921,7 +5123,47 @@ P.assign=function(){};
 
 /* --- the shadow root, the template and the observers -------------------- */
 Object.defineProperty(P,'mode',{configurable:true,get:function(){return this.__shadow?'open':undefined;}});
-Object.defineProperty(P,'activeElement',{configurable:true,get:function(){return D.body;}});
+/* --- focus ---------------------------------------------------------------
+ * focus() did nothing and activeElement was always the body. A login page
+ * that focuses its first field, a component that focuses its input when
+ * its frame is tapped, and code that asks what has focus all went without.
+ * The element with focus is kept here; a text field gets the caret as
+ * well, which on the Vita opens the keyboard when a tap led to it. */
+var focused=null;
+function focusable(el){
+ if(!el||el.nodeType!==1||el.disabled)return false;
+ var t=el.tagName;
+ if(t==='INPUT')return String(el.type||'').toLowerCase()!=='hidden';
+ if(t==='TEXTAREA'||t==='SELECT'||t==='BUTTON'||t==='IFRAME'||t==='SUMMARY')return true;
+ if((t==='A'||t==='AREA')&&el.hasAttribute('href'))return true;
+ if(el.hasAttribute('tabindex'))return true;
+ var ce=el.getAttribute('contenteditable');
+ return ce!==null&&ce!=='false';}
+function focusEvent(el,type,bubbles,related){
+ var e=new Event(type,{bubbles:bubbles,cancelable:false,composed:true});
+ try{e.relatedTarget=related||null;}catch(x){}
+ try{el.dispatchEvent(e);}catch(x){}}
+function moveFocus(el,caret){
+ var prev=focused;
+ if(prev===el)return;
+ focused=el;
+ if(prev&&ceInDoc(prev)){
+  focusEvent(prev,'blur',false,el);focusEvent(prev,'focusout',true,el);}
+ if(el){
+  if(caret&&W.__vitaFocusControl&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'))
+   try{W.__vitaFocusControl(el);}catch(x){}
+  focusEvent(el,'focus',false,prev);focusEvent(el,'focusin',true,prev);}}
+P.focus=function(){if(focusable(this)&&ceInDoc(this))moveFocus(this,true);};
+P.blur=function(){if(focused===this)moveFocus(null,false);};
+function activeEl(){return focused&&ceInDoc(focused)?focused:D.body;}
+Object.defineProperty(D,'activeElement',{configurable:true,get:activeEl});
+Object.defineProperty(P,'activeElement',{configurable:true,
+ get:function(){return isDoc(this)?activeEl():undefined;}});
+/* a tap on a control focuses it too */
+W.addEventListener('click',function(e){
+ var t=e&&e.target,n=t;
+ while(n&&n.nodeType===1&&!focusable(n))n=n.parentNode;
+ if(n&&n.nodeType===1&&focused!==n)moveFocus(n,false);},true);
 Object.defineProperty(P,'delegatesFocus',{configurable:true,get:function(){return false;}});
 Object.defineProperty(P,'slotAssignment',{configurable:true,get:function(){return 'named';}});
 Object.defineProperty(P,'clonable',{configurable:true,get:function(){return false;}});
@@ -6703,6 +6945,9 @@ DocumentType.prototype.isEqualNode=function(o){
  return !!o&&o.nodeType===10&&o.name===this.name&&
   o.publicId===this.publicId&&o.systemId===this.systemId;};
 W.DocumentType=DocumentType;
+/* a doctype the parser made is a node wrapper, not one of these */
+try{Object.defineProperty(DocumentType,Symbol.hasInstance,{configurable:true,
+ value:function(o){return !!o&&typeof o==='object'&&o.nodeType===10;}});}catch(e){}
 Object.defineProperty(D,'doctype',{configurable:true,
  get:function(){return priv(D,'__doctype',function(){
   return new DocumentType('html','','');});}});

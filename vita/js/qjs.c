@@ -247,6 +247,7 @@ struct jsthread {
 	unsigned relayout_waits;  /**< retries spent waiting on fetches */
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
 	unsigned relayout_ms;     /**< how long the last rebuild took */
+	uint32_t relayout_due;    /**< now_ms() the pending rebuild runs at, low 32 bits */
 	unsigned js_scripts;      /**< scripts executed for this page */
 	unsigned js_bytes;        /**< their total size */
 	unsigned js_compile_ms;   /**< time spent compiling them */
@@ -298,6 +299,9 @@ struct jsthread {
 				   *   JS_UNINITIALIZED before it is looked
 				   *   up and JS_UNDEFINED if there is none */
 	int event_depth;          /**< DOM event dispatches in progress */
+	int window_phase;         /**< eventPhase for window listeners run
+				   *   at target, 0 when libdom says */
+	bool stop_now_seen;       /**< stopImmediatePropagation was called */
 	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
 	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
 };
@@ -322,6 +326,7 @@ struct js_listener {
 	bool once;
 	bool passive;		/**< preventDefault from it is ignored */
 	bool dead;		/**< removed while its own call was running */
+	bool on_window;		/**< the window's: in no libdom list */
 };
 
 /* A scheduled setTimeout/setInterval callback. */
@@ -3541,6 +3546,22 @@ static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
+	/* a page's own root and doctype stay (VitaSurf): layout reads the
+	 * page from its root. Any other document gives them up. */
+	{
+		dom_node_type ct = DOM_ELEMENT_NODE;
+		jsthread *t;
+
+		if (dom_node_get_node_type(child, &ct) == DOM_NO_ERR &&
+		    (ct == DOM_ELEMENT_NODE || ct == DOM_DOCUMENT_TYPE_NODE)) {
+			for (t = all_threads; t != NULL; t = t->all_next) {
+				if ((struct dom_node *)thread_document(t) ==
+				    node) {
+					return JS_DupValue(ctx, argv[0]);
+				}
+			}
+		}
+	}
 	mark_dirty(ctx);
 	if (dom_node_remove_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
@@ -4012,9 +4033,21 @@ static void sweep_dead_listeners(jsthread *thread)
 }
 
 /** Register func as a listener for event type on node. */
+static JSValue add_listener_to(JSContext *ctx, struct dom_node *node,
+			       bool on_window, JSValueConst type_v,
+			       JSValueConst func, JSValueConst opts);
+
+/** Register func as a listener for event type on node. */
 static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 			    JSValueConst type_v, JSValueConst func,
 			    JSValueConst opts)
+{
+	return add_listener_to(ctx, node, false, type_v, func, opts);
+}
+
+static JSValue add_listener_to(JSContext *ctx, struct dom_node *node,
+			       bool on_window, JSValueConst type_v,
+			       JSValueConst func, JSValueConst opts)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *type;
@@ -4023,7 +4056,11 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	struct dom_event_listener *dl = NULL;
 	bool capture = false, once = false, passive = false;
 
-	if (node == NULL || thread == NULL || !JS_IsFunction(ctx, func)) {
+	/* a function, or an object with handleEvent (VitaSurf): Lit binds
+	 * every @event in its templates with the object form, and those
+	 * were dropped, so no Lit component heard its own clicks */
+	if ((node == NULL && !on_window) || thread == NULL ||
+	    !(JS_IsFunction(ctx, func) || JS_IsObject(func))) {
 		return JS_UNDEFINED;
 	}
 	sweep_dead_listeners(thread);
@@ -4069,7 +4106,9 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 		JS_FreeCString(ctx, type);
 		return JS_UNDEFINED;
 	}
-	if (dom_event_listener_create(listener_trampoline, l, &dl) != DOM_NO_ERR) {
+	/* the window's listeners are run by window_hook, not libdom */
+	if (!on_window &&
+	    dom_event_listener_create(listener_trampoline, l, &dl) != DOM_NO_ERR) {
 		free(l);
 		dom_string_unref(type_dom);
 		JS_FreeCString(ctx, type);
@@ -4077,7 +4116,8 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	}
 	l->thread = thread;
 	l->node = node;
-	dom_node_ref(node);
+	if (node != NULL) dom_node_ref(node);
+	l->on_window = on_window;
 	l->dom_listener = dl;
 	l->func = JS_DupValue(ctx, func);
 	l->type = dom_string_ref(type_dom);
@@ -4089,16 +4129,30 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	thread->listener_count++;
 	listener_hash_add(thread, l);
 
-	dom_event_target_add_event_listener(node, type_dom, dl, capture);
+	if (!on_window) {
+		dom_event_target_add_event_listener(node, type_dom, dl,
+						    capture);
+	}
 	dom_string_unref(type_dom);
 	JS_FreeCString(ctx, type);
 	return JS_UNDEFINED;
 }
 
 /** removeEventListener: take off the one that matches, if it is there. */
+static JSValue remove_listener_from(JSContext *ctx, struct dom_node *node,
+				    bool on_window, JSValueConst type_v,
+				    JSValueConst func, JSValueConst opts);
+
 static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 			       JSValueConst type_v, JSValueConst func,
 			       JSValueConst opts)
+{
+	return remove_listener_from(ctx, node, false, type_v, func, opts);
+}
+
+static JSValue remove_listener_from(JSContext *ctx, struct dom_node *node,
+				    bool on_window, JSValueConst type_v,
+				    JSValueConst func, JSValueConst opts)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *type;
@@ -4106,7 +4160,8 @@ static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 	struct js_listener *l;
 	bool capture = false;
 
-	if (node == NULL || thread == NULL || !JS_IsFunction(ctx, func)) {
+	if ((node == NULL && !on_window) || thread == NULL ||
+	    !(JS_IsFunction(ctx, func) || JS_IsObject(func))) {
 		return JS_UNDEFINED;
 	}
 	sweep_dead_listeners(thread);
@@ -4769,6 +4824,33 @@ static JSValue doc_remove_event_listener(JSContext *ctx, JSValueConst this_val,
 	return remove_listener(ctx, (struct dom_node *)thread_document(thread),
 			       argv[0], argv[1],
 			       argc > 2 ? argv[2] : JS_UNDEFINED);
+}
+
+/*
+ * The window's listeners (VitaSurf). They lived on the document node, so
+ * the window's bubbling listeners ran among the document's in the order
+ * they were added -- before a document listener that could stop the
+ * event -- and a window's own event reached document listeners too.
+ */
+static JSValue win_add_event_listener(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	(void)this_val;
+	if (argc < 2) return JS_UNDEFINED;
+	return add_listener_to(ctx, NULL, true, argv[0], argv[1],
+			       argc > 2 ? argv[2] : JS_UNDEFINED);
+}
+
+static JSValue win_remove_event_listener(JSContext *ctx,
+					 JSValueConst this_val,
+					 int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	(void)this_val;
+	if (argc < 2) return JS_UNDEFINED;
+	return remove_listener_from(ctx, NULL, true, argv[0], argv[1],
+				    argc > 2 ? argv[2] : JS_UNDEFINED);
 }
 
 static JSValue noop(JSContext *ctx, JSValueConst this_val,
@@ -6377,6 +6459,7 @@ static void relayout_callback(void *p)
 			/* being built from a document that just changed */
 			guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
 			thread->relayout_pending = true;
+			thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		} else {
 			/* the first conversion has not run yet; it will see the changes */
 			thread->dom_dirty = false;
@@ -6417,6 +6500,7 @@ static void relayout_callback(void *p)
 		}
 		guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
 		thread->relayout_pending = true;
+		thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		return;
 	}
 	thread->relayout_waits = 0;
@@ -6476,6 +6560,7 @@ static void relayout_callback(void *p)
 		/* busy, or a rebuild is already running */
 		guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
 		thread->relayout_pending = true;
+		thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		return;
 	}
 	thread->dom_dirty = false;
@@ -6556,11 +6641,13 @@ static void close_removed_frames(void *p)
 
 static void schedule_relayout(jsthread *thread, int ms)
 {
+	uint32_t due;
+
 	if (thread->win != NULL && thread->win->iframe_count > 0 &&
 	    !thread->closed) {
 		guit->misc->schedule(0, close_removed_frames, thread);
 	}
-	if (thread->relayout_pending || thread->closed) {
+	if (thread->closed) {
 		return;
 	}
 	if (thread->htmlc != NULL && thread->htmlc->base.active > 0 &&
@@ -6583,8 +6670,22 @@ static void schedule_relayout(jsthread *thread, int ms)
 			ms = (int)floor_ms;
 		}
 	}
+	/*
+	 * One already waiting stays unless this one is due sooner
+	 * (VitaSurf). A change made while the page was still fetching
+	 * waits the longest delay, and a change a script made once the
+	 * page had loaded waited with it: a component that marked what
+	 * it hides a quarter of a second after the load event was drawn
+	 * unhidden for eight seconds.
+	 */
+	due = (uint32_t)now_ms() + (uint32_t)ms;
+	if (thread->relayout_pending &&
+	    (int32_t)(due - thread->relayout_due) >= 0) {
+		return;
+	}
 	if (guit->misc->schedule(ms, relayout_callback, thread) == NSERROR_OK) {
 		thread->relayout_pending = true;
+		thread->relayout_due = due;
 	}
 }
 
@@ -7399,8 +7500,9 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	trampoline_depth++;
 	thread->event_depth++;
 	begin_script(thread, SCRIPT_EVENT);
-	/* this is the element the listener was added to */
-	global = wrap_node(ctx, l->node);
+	/* this is the element the listener was added to, or the window */
+	global = l->on_window ? JS_GetGlobalObject(ctx) :
+		wrap_node(ctx, l->node);
 	/* an event dispatchEvent created keeps its JS object (detail etc) */
 	for (d = thread->dispatches; d != NULL; d = d->next) {
 		if (d->evt == evt) {
@@ -7422,9 +7524,16 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	} else {
 		event_obj = wrap_event(ctx, evt);
 	}
+	if (l->on_window) {
+		JS_SetPropertyStr(ctx, event_obj, "currentTarget",
+				  JS_DupValue(ctx, global));
+	}
 	/* which phase the listener is being called in, which an event out
 	 * of dispatch does not have at all */
-	{
+	if (l->on_window && thread->window_phase != 0) {
+		JS_SetPropertyStr(ctx, event_obj, "eventPhase",
+				  JS_NewInt32(ctx, thread->window_phase));
+	} else {
 		dom_event_flow_phase phase = DOM_AT_TARGET;
 
 		if (dom_event_get_event_phase(evt, &phase) == DOM_NO_ERR) {
@@ -7437,7 +7546,30 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	if (l->passive) {
 		JS_SetPropertyStr(ctx, event_obj, "__vitaPassive", JS_TRUE);
 	}
-	ret = JS_Call(ctx, l->func, global, 1, args);
+	/* window.event is the event while a listener has it (VitaSurf):
+	 * older code reads it instead of taking the argument */
+	{
+		JSValue win = JS_GetGlobalObject(ctx);
+		JSValue prev = JS_GetPropertyStr(ctx, win, "event");
+
+		JS_SetPropertyStr(ctx, win, "event",
+				  JS_DupValue(ctx, event_obj));
+		if (JS_IsFunction(ctx, l->func)) {
+			ret = JS_Call(ctx, l->func, global, 1, args);
+		} else {
+			/* an EventListener object: its handleEvent, with
+			 * the object as this, looked up at each call */
+			JSValue he = JS_GetPropertyStr(ctx, l->func,
+						       "handleEvent");
+
+			ret = JS_IsFunction(ctx, he) ?
+				JS_Call(ctx, he, l->func, 1, args) :
+				JS_UNDEFINED;
+			JS_FreeValue(ctx, he);
+		}
+		JS_SetPropertyStr(ctx, win, "event", prev);
+		JS_FreeValue(ctx, win);
+	}
 	if (l->passive) {
 		JS_SetPropertyStr(ctx, event_obj, "__vitaPassive", JS_FALSE);
 	}
@@ -7463,6 +7595,14 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		dom_event_stop_propagation(evt);
 	}
 	JS_FreeValue(ctx, flag);
+	/* stopImmediatePropagation: the rest on this target as well
+	 * (VitaSurf), which went on being called */
+	flag = JS_GetPropertyStr(ctx, event_obj, "__stopNow");
+	if (JS_ToBool(ctx, flag) == 1) {
+		dom_event_stop_immediate_propagation(evt);
+		thread->stop_now_seen = true;
+	}
+	JS_FreeValue(ctx, flag);
 	JS_FreeValue(ctx, event_obj);
 	JS_FreeValue(ctx, global);
 	end_script(thread);
@@ -7479,6 +7619,70 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		if (l->thread != NULL) {
 			l->thread->dead_listeners++;
 		}
+	}
+}
+
+/*
+ * Run the window's listeners for evt (VitaSurf): which is 1 for the
+ * capturing ones, 3 for the bubbling ones and 2 for all of them, when
+ * the window is the target. They are collected first, as a listener may
+ * add or remove others.
+ */
+static void run_window_listeners(jsthread *thread, struct dom_event *evt,
+				 int which)
+{
+	struct js_listener *l, **run = NULL;
+	dom_string *type = NULL;
+	unsigned n = 0, cap = 0, i;
+
+	if (thread == NULL || thread->closed ||
+	    dom_event_get_type(evt, &type) != DOM_NO_ERR || type == NULL) {
+		return;
+	}
+	for (l = thread->listeners; l != NULL; l = l->next) {
+		if (!l->on_window || l->dead || l->type == NULL ||
+		    (which == 1 && !l->capture) ||
+		    (which == 3 && l->capture) ||
+		    !dom_string_isequal(l->type, type)) {
+			continue;
+		}
+		if (n == cap) {
+			struct js_listener **g;
+
+			cap = cap ? cap * 2 : 8;
+			g = realloc(run, cap * sizeof(*run));
+			if (g == NULL) break;
+			run = g;
+		}
+		run[n++] = l;
+	}
+	dom_string_unref(type);
+	/* registration order: the thread's list is newest first */
+	thread->stop_now_seen = false;
+	thread->event_depth++;
+	for (i = n; i > 0; i--) {
+		listener_trampoline(evt, run[i - 1]);
+		if (thread->closed || thread->stop_now_seen) break;
+	}
+	thread->event_depth--;
+	free(run);
+}
+
+/* libdom's window step: a dispatch in a page's document reaches here
+ * before its capture phase and after its bubbling phase */
+static void window_hook(struct dom_event *evt, struct dom_document *doc,
+			bool capture, void *pw)
+{
+	jsthread *t;
+
+	(void)pw;
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		if (!t->closed && !t->is_worker && thread_document(t) == doc) {
+			break;
+		}
+	}
+	if (t != NULL) {
+		run_window_listeners(t, evt, capture ? 1 : 3);
 	}
 }
 
@@ -9047,6 +9251,30 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 }
 
 /*
+ * __vitaFocusControl(node): give the caret to a text field, for
+ * element.focus() (VitaSurf). On the Vita a caret placed within a moment
+ * of a tap opens the keyboard, so a component that focuses its input from
+ * its own click handler opens it as a tap on the input would.
+ */
+static JSValue win_vita_focus_control(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+
+	(void)this_val;
+	if (thread == NULL || thread->htmlc == NULL || argc < 1) {
+		return JS_FALSE;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_FALSE;
+	}
+	return JS_NewBool(ctx, html_focus_control(thread->htmlc, node));
+}
+
+/*
  * __vitaElementFromPoint(x, y): the element at a point in the page, in
  * CSS pixels from the top left of the document.
  *
@@ -10032,12 +10260,13 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	}
 	if (JS_IsObject(argv[0])) {
 		node = JS_GetOpaque(argv[0], node_class_id);
-	}
-	if (node == NULL) {
-		node = (struct dom_node *)thread_document(thread);
-	}
-	if (node == NULL) {
-		return JS_TRUE;
+		/* the document object is not a node wrapper */
+		if (node == NULL) {
+			node = (struct dom_node *)thread_document(thread);
+			if (node == NULL) {
+				return JS_TRUE;
+			}
+		}
 	}
 	v = JS_GetPropertyStr(ctx, argv[1], "type");
 	type = JS_ToCString(ctx, v);
@@ -10068,7 +10297,21 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	d.next = thread->dispatches;
 	thread->dispatches = &d;
 	thread->js_dispatch_depth++;
-	dom_event_target_dispatch_event(node, evt, &success);
+	if (node != NULL) {
+		dom_event_target_dispatch_event(node, evt, &success);
+	} else {
+		/* the window is the target: its listeners only (VitaSurf),
+		 * where the document's used to hear it as well */
+		JSValue global = JS_GetGlobalObject(ctx);
+		int was = thread->window_phase;
+
+		JS_SetPropertyStr(ctx, argv[1], "target",
+				  JS_DupValue(ctx, global));
+		JS_FreeValue(ctx, global);
+		thread->window_phase = 2;
+		run_window_listeners(thread, evt, 2);
+		thread->window_phase = was;
+	}
 	thread->js_dispatch_depth--;
 	thread->dispatches = d.next;
 	JS_FreeValue(ctx, d.obj);
@@ -10268,6 +10511,9 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaCanvasMeasure", 5));
 	JS_SetPropertyStr(ctx, global, "__vitaGap",
 			  JS_NewCFunction(ctx, win_vita_gap, "__vitaGap", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaFocusControl",
+			  JS_NewCFunction(ctx, win_vita_focus_control,
+					  "__vitaFocusControl", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaElementFromPoint",
 			  JS_NewCFunction(ctx, win_vita_element_from_point,
 					  "__vitaElementFromPoint", 2));
@@ -10336,11 +10582,12 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaDispatch",
 			  JS_NewCFunction(ctx, win_vita_dispatch, "__vitaDispatch", 2));
 
-	/* window listeners live on the document node (see add_listener) */
+	/* the window's own listeners, which window_hook runs */
 	JS_SetPropertyStr(ctx, global, "addEventListener",
-			  JS_NewCFunction(ctx, doc_add_event_listener, "addEventListener", 2));
+			  JS_NewCFunction(ctx, win_add_event_listener,
+					  "addEventListener", 2));
 	JS_SetPropertyStr(ctx, global, "removeEventListener",
-			  JS_NewCFunction(ctx, doc_remove_event_listener,
+			  JS_NewCFunction(ctx, win_remove_event_listener,
 					  "removeEventListener", 2));
 
 	/* Node, Element and HTMLElement all share the node prototype */
@@ -10462,6 +10709,7 @@ void js_initialise(void)
 	 * YouTube's page data, nearly all literals and little function
 	 * text.)
 	 */
+	dom_event_set_window_hook(window_hook, NULL);
 #ifdef QJS_VERSION_MAJOR
 	vita_log("qjs: QuickJS engine initialised (content handler %s), "
 		 "quickjs-ng %d.%d.%d%s, %s",
@@ -13979,6 +14227,40 @@ bool js_fire_event(jsthread *thread, const char *type,
 
 	if (target != NULL) {
 		dom_event_target_dispatch_event(target, evt, &success);
+	} else if (strcmp(type, "load") == 0 && thread->ctx != NULL) {
+		/*
+		 * The page's load is the window's (VitaSurf): its listeners
+		 * hear it, with the document as the target, and the
+		 * document's do not. It went to the document node, where
+		 * window listeners used to live.
+		 */
+		JSContext *ctx = thread->ctx;
+		JSValue global = JS_GetGlobalObject(ctx);
+		JSValue ctor = JS_GetPropertyStr(ctx, global, "Event");
+		JSValue name = JS_NewString(ctx, "load");
+		JSValue obj = JS_IsFunction(ctx, ctor) ?
+			JS_CallConstructor(ctx, ctor, 1, &name) : JS_UNDEFINED;
+		struct js_dispatch d;
+		int was = thread->window_phase;
+
+		JS_FreeValue(ctx, name);
+		JS_FreeValue(ctx, ctor);
+		if (JS_IsObject(obj)) {
+			JS_SetPropertyStr(ctx, obj, "target",
+				JS_GetPropertyStr(ctx, global, "document"));
+			d.evt = evt;
+			d.obj = obj;
+			d.next = thread->dispatches;
+			thread->dispatches = &d;
+			thread->window_phase = 2;
+			run_window_listeners(thread, evt, 2);
+			thread->window_phase = was;
+			thread->dispatches = d.next;
+		} else {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+		}
+		JS_FreeValue(ctx, obj);
+		JS_FreeValue(ctx, global);
 	} else if (doc != NULL) {
 		/*
 		 * Window-targetted events (load) go to the document node,

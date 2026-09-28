@@ -40,6 +40,11 @@ add_completion_callback(function (tests, status) {
   if (status && status.status !== 0) line('HARNESS ' + status.status);
   tests.forEach(function (t) {
     line((t.status === 0 ? 'PASS ' : 'FAIL ') + t.name);
+    /* why, for SHOWFAIL: only PASS lines are counted */
+    if (t.status !== 0 && t.message) {
+      try { console.log('XX MSG ' + t.name + ' :: ' +
+                        String(t.message).replace(/\s+/g, ' ')); } catch (e) {}
+    }
   });
 });
 </script>
@@ -106,6 +111,10 @@ sys.stdout.write(html.unescape(m.group(1)).strip() + "\n" if m else "")' > "$wor
     rm -f "$probe"
 
     rel="${test#$ROOT/}"
+    # SHOWFAIL=1: our own failure messages, to see why a test fails here
+    if [ -n "${SHOWFAIL:-}" ]; then
+        grep -E '^(MSG|HARNESS) ' "$work/v.txt" | sed "s|^|$rel: |" | cut -c1-400
+    fi
     bp=$(grep -c '^PASS ' "$work/b.txt")
     vp=$(grep -c '^PASS ' "$work/v.txt")
     bt=$(grep -cE '^(PASS|FAIL) ' "$work/b.txt")
