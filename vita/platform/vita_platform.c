@@ -37,6 +37,7 @@
 #include "netsurf/content_type.h"
 
 #include <mbedtls/error.h>
+#include <mbedtls/ssl.h>
 #include <mbedtls/version.h>
 #include <mbedtls/x509_crt.h>
 
@@ -584,6 +585,56 @@ static void log_tls_selftest(void)
 	}
 	mbedtls_x509_crt_free(&chain);
 	free(pem);
+	/*
+	 * What the TLS build can speak (VitaSurf). A server that wants
+	 * something missing here fails the handshake as cURL error 35
+	 * with nothing else said: Home Assistant behind its own HTTPS did.
+	 */
+	vita_log("selftest: TLS 1.3 %s, 1.2 %s; records in %d / out %d bytes; "
+		 "x25519 %s, P-384 %s, SHA-384 %s, RSA-PSS %s, "
+		 "ChaCha20 %s, GCM %s",
+#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_SSL_PROTO_TLS1_2)
+		 "yes",
+#else
+		 "no",
+#endif
+		 (int)MBEDTLS_SSL_IN_CONTENT_LEN, (int)MBEDTLS_SSL_OUT_CONTENT_LEN,
+#if defined(MBEDTLS_ECP_DP_CURVE25519_ENABLED)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_ECP_DP_SECP384R1_ENABLED)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_SHA384_C)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_PKCS1_V21)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_CHACHAPOLY_C)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_GCM_C)
+		 "yes"
+#else
+		 "no"
+#endif
+		 );
 }
 
 /**
