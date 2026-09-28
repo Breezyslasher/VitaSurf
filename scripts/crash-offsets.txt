@@ -138,3 +138,12 @@
 0x9ad0c
 0x9b332
 0x4075b0
+# Build 478 (VitaSurf-extmem): data abort on claude.ai, main thread, while
+#   a frame's browser window was destroyed and its content aborted after
+#   the page went to /logout. PC (Thumb), LR, then the stack.
+0x19cf6
+0x10b130
+0x19e9c
+0x422a64
+0x422a74
+0x423edc
