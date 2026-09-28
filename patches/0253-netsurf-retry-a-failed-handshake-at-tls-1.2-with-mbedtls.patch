@@ -1,0 +1,27 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 69b2b6e39..adfecc3b6 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1289,6 +1289,22 @@ static CURLcode fetch_curl_set_options(struct curl_fetch_info *f)
+ 		SETOPT(CURLOPT_SSL_CIPHER_LIST,
+ 			f->downgrade_tls ? CIPHER_LIST_LEGACY : CIPHER_LIST);
+ 	}
++#if LIBCURL_VERSION_NUM >= 0x073600
++	else {
++		/*
++		 * The retry after a failed handshake at TLS 1.2 at most
++		 * (VitaSurf). Only the OpenSSL path above did anything with
++		 * downgrade_tls, so with mbedTLS the second try repeated the
++		 * first: a Home Assistant behind a Cloudflare tunnel failed
++		 * both with cURL error 35, and got through only by luck.
++		 * Set both ways, as the handle is reused.
++		 */
++		SETOPT(CURLOPT_SSLVERSION, f->downgrade_tls ?
++		       (long)(CURL_SSLVERSION_TLSv1_2 |
++			      CURL_SSLVERSION_MAX_TLSv1_2) :
++		       (long)CURL_SSLVERSION_DEFAULT);
++	}
++#endif
+ 
+ 	/* Force-enable SSL session ID caching, as some distros are odd. */
+ 	SETOPT(CURLOPT_SSL_SESSIONID_CACHE, 1L);
