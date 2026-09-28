@@ -1377,7 +1377,7 @@ W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:fal
 /* Indexed by the libcss enum, which starts its values at 1. */
 var CS_DISPLAY=['','inline','block','list-item','run-in','inline-block','table','inline-table',
  'table-row-group','table-header-group','table-footer-group','table-row','table-column-group',
- 'table-column','table-cell','table-caption','none','flex','inline-flex','grid','inline-grid'];
+ 'table-column','table-cell','table-caption','none','flex','inline-flex','grid','inline-grid','contents'];
 var CS_VIS=['','visible','hidden','collapse'];
 var CS_DEFAULTS={
  display:'block',visibility:'visible',opacity:'1',position:'static',float:'none',clear:'none',
@@ -1589,6 +1589,14 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
   if(v===undefined)return null;
   try{ return JSON.parse(JSON.stringify(v)); }catch(e){ return v; }
  }
+ /* the browser's own idea of the address: what it shows, records and
+    reloads (VitaSurf). Home Assistant replaces its login callback
+    address, code and all, once the code is spent; kept, a reload or
+    the History page went back to a code that no longer worked. */
+ var SU=typeof W.__vitaScriptURL==='function'?W.__vitaScriptURL:null;
+ function tell(replace){
+  if(!SU)return;
+  try{SU(stack[at].url,replace);}catch(e){}}
  function apply(i,fire){
   var e=stack[i];
   at=i;
@@ -1611,11 +1619,13 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
    stack.length=at+1;
    stack.push({state:clone(state),url:resolve(url)});
    apply(stack.length-1,false);
+   tell(false);
   },
   replaceState:function(state,title,url){
    stack[at]={state:clone(state),
               url:url===undefined?stack[at].url:resolve(url)};
    apply(at,false);
+   tell(true);
   },
   go:function(n){
    n=(n===undefined||n===null)?0:(parseInt(n,10)||0);
@@ -1623,6 +1633,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
    var i=at+n;
    if(i<0||i>=stack.length)return;
    apply(i,true);
+   tell(true);
   },
   back:function(){ H.go(-1); },
   forward:function(){ H.go(1); }

@@ -2043,13 +2043,19 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 	if (node != NULL && key != NULL && dv != NULL) {
 		dom_string *old = NULL;
 		jsthread *th = JS_GetContextOpaque(ctx);
+		bool same;
 
-		if (th != NULL && th->watch_mutations) {
-			dom_element_get_attribute(node, key, &old);
-		}
+		dom_element_get_attribute(node, key, &old);
+		same = old != NULL && dom_string_isequal(old, dv);
 		dom_element_set_attribute(node, key, dv);
-		attr_stamp_touch(node);
-		mark_attr_dirty(ctx, name);
+		if (!same) {
+			attr_stamp_touch(node);
+			mark_attr_dirty(ctx, name);
+		}
+		if (th == NULL || !th->watch_mutations) {
+			if (old != NULL) dom_string_unref(old);
+			old = NULL;
+		}
 		/* className and id are the same attribute write as
 		 * setAttribute, and an observer watching class has to see
 		 * one: this path reported nothing at all, so a component
@@ -2399,13 +2405,28 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 	if (node != NULL && key != NULL && val != NULL) {
 		dom_string *old = NULL;
 		jsthread *th = JS_GetContextOpaque(ctx);
+		bool same;
 
-		if (th != NULL && th->watch_mutations) {
-			dom_element_get_attribute(node, key, &old);
-		}
+		/*
+		 * Writing the value an attribute already has changes
+		 * nothing on screen, so it asks for no rebuild (VitaSurf).
+		 * Observers still get a record, as the DOM says they do.
+		 * Bubble Card, on Home Assistant, puts the same classes
+		 * and icon back on every card each time any entity
+		 * changes, and each of those rebuilt the page's layout,
+		 * which on a dashboard takes the Vita a second.
+		 */
+		dom_element_get_attribute(node, key, &old);
+		same = old != NULL && dom_string_isequal(old, val);
 		dom_element_set_attribute(node, key, val);
-		attr_stamp_touch(node);
-		mark_attr_dirty(ctx, name);
+		if (!same) {
+			attr_stamp_touch(node);
+			mark_attr_dirty(ctx, name);
+		}
+		if (th == NULL || !th->watch_mutations) {
+			if (old != NULL) dom_string_unref(old);
+			old = NULL;
+		}
 		if (name != NULL && (strcasecmp(name, "src") == 0 ||
 				     strcasecmp(name, "srcset") == 0)) {
 			img_src_sets++;
@@ -2470,8 +2491,10 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_remove_attribute(node, key);
-		attr_stamp_touch(node);
-		mark_attr_dirty(ctx, name);
+		if (had) {
+			attr_stamp_touch(node);
+			mark_attr_dirty(ctx, name);
+		}
 		/* removing an attribute that was not there changes nothing,
 		 * and nothing is what an observer should see */
 		if (had) {
@@ -6601,7 +6624,9 @@ static void relayout_callback(void *p)
 	 * laid out (VitaSurf). No measurement yet means no reason to
 	 * refuse.
 	 */
-	if (vitasurf_box_elements > 0) {
+	/* a rebuild this page already had is a better measure than
+	 * anything estimated from its first load (VitaSurf) */
+	if (vitasurf_box_elements > 0 && thread->relayout_ms == 0) {
 		unsigned per_element_us = (vitasurf_ms_boxes * 1000u) /
 					  vitasurf_box_elements;
 		unsigned estimate = (per_element_us *
@@ -7186,6 +7211,45 @@ static JSValue win_vita_ws_buffered(JSContext *ctx, JSValueConst this_val,
 		return JS_NewInt32(ctx, 0);
 	}
 	return JS_NewFloat64(ctx, (double)vws_buffered(id));
+}
+
+/*
+ * __vitaScriptURL(url, replace): the page gave itself a new address with
+ * history.pushState or replaceState (VitaSurf). The browser shows it,
+ * records it in the history and reloads it; see
+ * browser_window_set_script_url.
+ */
+static JSValue win_vita_script_url(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *s;
+	nsurl *url = NULL;
+	struct hlcache_handle *h;
+
+	(void)this_val;
+	if (thread == NULL || thread->closed || thread->is_worker ||
+	    thread->win == NULL || thread->win->parent != NULL || argc < 1) {
+		return JS_UNDEFINED;
+	}
+	/* only the page on screen names the window's address */
+	h = browser_window_get_content(thread->win);
+	if (h == NULL || hlcache_handle_get_content(h) !=
+	    (struct content *)thread->htmlc) {
+		return JS_UNDEFINED;
+	}
+	s = JS_ToCString(ctx, argv[0]);
+	if (s == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (nsurl_create(s, &url) == NSERROR_OK) {
+		browser_window_set_script_url(thread->win, url,
+			argc > 1 && JS_ToBool(ctx, argv[1]));
+		nsurl_unref(url);
+	}
+	JS_FreeCString(ctx, s);
+	return JS_UNDEFINED;
 }
 
 /*
@@ -10706,7 +10770,8 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	box = box_for_node(node);
-	if (box == NULL) {
+	if (box == NULL || (box->flags & DISPLAY_CONTENTS)) {
+		/* display: contents lays out nothing of its own */
 		return JS_NULL;
 	}
 	box_coords(box, &x, &y);
@@ -11111,6 +11176,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaWsBuffered",
 			  JS_NewCFunction(ctx, win_vita_ws_buffered,
 					  "__vitaWsBuffered", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaScriptURL",
+			  JS_NewCFunction(ctx, win_vita_script_url,
+					  "__vitaScriptURL", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaSlots",
 			  JS_NewCFunction(ctx, win_vita_slots,
 					  "__vitaSlots", 2));

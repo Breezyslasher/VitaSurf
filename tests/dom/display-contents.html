@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!-- display: contents: the element makes no box and its children are
+     laid out as its parent's. Bubble Card, the Home Assistant card most
+     HACS dashboards use, puts its name and state in such a wrapper
+     inside a flex row; without it the row broke and the icon came out an
+     oval. Expected console output: five lines ending in "ok". -->
+<html><head><style>
+body { margin: 0 }
+#row { display: flex; width: 400px; height: 50px; color: rgb(0, 0, 255) }
+#icon { width: 38px; height: 38px; flex: none }
+#wrap { display: contents; color: rgb(0, 128, 0) }
+#name { flex: 1 }
+#state { width: 60px }
+</style></head><body>
+<div id=row><div id=icon></div><div id=wrap><div id=name>Name</div><div id=state>On</div></div></div>
+<p id=after>after</p>
+<script>
+setTimeout(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var icon = $('icon').getBoundingClientRect(), name = $('name').getBoundingClientRect(),
+      state = $('state').getBoundingClientRect(), wrap = $('wrap').getBoundingClientRect();
+  console.log("computed:", getComputedStyle($('wrap')).display === 'contents' ? "ok" : "FAIL " + getComputedStyle($('wrap')).display);
+  console.log("icon square:", icon.width === 38 && icon.height === 38 ? "ok" : "FAIL " + icon.width + "x" + icon.height);
+  console.log("children are flex items:", name.left === 38 && name.top === 0 && state.left === 340 && state.top === 0 ? "ok" : "FAIL name " + name.left + "," + name.top + " state " + state.left + "," + state.top);
+  console.log("no box of its own:", wrap.width === 0 && wrap.height === 0 ? "ok" : "FAIL " + wrap.width + "x" + wrap.height);
+  console.log("children inherit from it:", getComputedStyle($('name')).color === 'rgb(0, 128, 0)' ? "ok" : "FAIL " + getComputedStyle($('name')).color);
+}, 1000);
+</script></body></html>
