@@ -4204,7 +4204,6 @@ D.dir='';
 Object.defineProperty(D,'all',{configurable:true,get:function(){return D.getElementsByTagName('*');}});
 Object.defineProperty(D,'styleSheets',{configurable:true,get:function(){
  var l=[];l.item=function(i){return this[i]||null;};return l;}});
-D.adoptedStyleSheets=[];
 D.timeline={currentTime:0};
 ['alinkColor','bgColor','fgColor','linkColor','vlinkColor'].forEach(function(k){D[k]='';});
 D.append=P.append;D.prepend=P.prepend;D.replaceChildren=P.replaceChildren;
@@ -4781,39 +4780,246 @@ Object.defineProperty(P,'style',{configurable:true,
  set:function(v){this.setAttribute('style',String(v));}});
 
 /* --- the style sheet interfaces ----------------------------------------- */
-function CSSRule(){this.cssText='';this.parentRule=null;this.parentStyleSheet=null;this.type=1;
- this.style=new CSSStyleDeclaration(null);this.selectorText='';}
-function MediaList(t){this._m=t?String(t).split(','):[];}
+/* A sheet's rules as script sees them (VitaSurf). The rules are read from
+ * the sheet's text when first asked for; insertRule(), deleteRule(),
+ * replaceSync() and a rule's style change that list, and the list is
+ * written back to the engine as text once the task that changed it ends,
+ * so a library adding a thousand rules one at a time costs one parse.
+ * Emotion, which MUI uses, and styled-components in production style a
+ * page this way and nothing else: with insertRule doing nothing, those
+ * pages had no styles at all. */
+function cssStrip(t){
+ /* comments out, strings kept */
+ var o='',i=0,n=t.length;
+ while(i<n){var c=t.charCodeAt(i);
+  if(c===47&&t.charCodeAt(i+1)===42){var e=t.indexOf('*/',i+2);i=e<0?n:e+2;continue;}
+  if(c===34||c===39){var s=i++;while(i<n&&t.charCodeAt(i)!==c){if(t.charCodeAt(i)===92)i++;i++;}
+   o+=t.slice(s,++i);continue;}
+  o+=t.charAt(i++);}
+ return o;}
+function cssSplit(t){
+ /* the top-level rules of a sheet or a block, as text */
+ var out=[],i=0,n=t.length,start=0,depth=0;
+ while(i<n){var c=t.charCodeAt(i);
+  if(c===34||c===39){i++;while(i<n&&t.charCodeAt(i)!==c){if(t.charCodeAt(i)===92)i++;i++;}i++;continue;}
+  if(c===123)depth++;
+  else if(c===125){if(depth>0)depth--;if(depth===0){var r=t.slice(start,i+1).trim();if(r)out.push(r);start=i+1;}}
+  else if(c===59&&depth===0){var st=t.slice(start,i+1).trim();if(st.length>1)out.push(st);start=i+1;}
+  i++;}
+ return out;}
+function cssDecls(body){
+ /* declarations in order: [name, value, important] */
+ var out=[],parts=[],i=0,n=body.length,start=0,depth=0;
+ while(i<n){var c=body.charCodeAt(i);
+  if(c===34||c===39){i++;while(i<n&&body.charCodeAt(i)!==c){if(body.charCodeAt(i)===92)i++;i++;}i++;continue;}
+  if(c===40||c===123||c===91)depth++;else if(c===41||c===125||c===93)depth--;
+  else if(c===59&&depth===0){parts.push(body.slice(start,i));start=i+1;}
+  i++;}
+ parts.push(body.slice(start));
+ parts.forEach(function(p){var k=p.indexOf(':');if(k<0)return;
+  var name=p.slice(0,k).trim(),v=p.slice(k+1).trim(),imp=false;
+  if(!name)return;
+  var m=/!\s*important\s*$/i.exec(v);if(m){imp=true;v=v.slice(0,m.index).trim();}
+  if(name.slice(0,2)!=='--')name=name.toLowerCase();
+  out.push([name,v,imp]);});
+ return out;}
+function camelToDash(p){return p==='cssFloat'?'float':p.replace(/[A-Z]/g,function(c){return '-'+c.toLowerCase();}).replace(/^(webkit|moz|ms)-/,'-$1-');}
+function RuleStyle(rule,body){this._rule=rule;this._d=cssDecls(body||'');}
+RuleStyle.prototype.getPropertyValue=function(p){p=String(p);
+ for(var i=this._d.length-1;i>=0;i--)if(this._d[i][0]===p||this._d[i][0]===p.toLowerCase())return this._d[i][1];return '';};
+RuleStyle.prototype.getPropertyPriority=function(p){
+ for(var i=this._d.length-1;i>=0;i--)if(this._d[i][0]===String(p))return this._d[i][2]?'important':'';return '';};
+RuleStyle.prototype.setProperty=function(p,v,pri){p=String(p);if(p.slice(0,2)!=='--')p=p.toLowerCase();
+ v=v==null?'':String(v);
+ if(v===''){this.removeProperty(p);return;}
+ var imp=String(pri||'').toLowerCase()==='important';
+ for(var i=0;i<this._d.length;i++)if(this._d[i][0]===p){this._d[i][1]=v;this._d[i][2]=imp;sheetDirty(this._rule);return;}
+ this._d.push([p,v,imp]);sheetDirty(this._rule);};
+RuleStyle.prototype.removeProperty=function(p){p=String(p);var old=this.getPropertyValue(p);
+ var before=this._d.length;this._d=this._d.filter(function(d){return d[0]!==p;});
+ if(this._d.length!==before)sheetDirty(this._rule);return old;};
+RuleStyle.prototype.item=function(i){return this._d[i]?this._d[i][0]:'';};
+Object.defineProperty(RuleStyle.prototype,'length',{configurable:true,get:function(){return this._d.length;}});
+Object.defineProperty(RuleStyle.prototype,'cssText',{configurable:true,
+ get:function(){return this._d.map(function(d){return d[0]+': '+d[1]+(d[2]?' !important':'')+';';}).join(' ');},
+ set:function(v){this._d=cssDecls(String(v));sheetDirty(this._rule);}});
+Object.defineProperty(RuleStyle.prototype,'parentRule',{configurable:true,get:function(){return this._rule;}});
+function ruleStyleProxy(rs){
+ /* style.color = 'red' on a rule, as on an element */
+ return new Proxy(rs,{get:function(t,k){if(typeof k==='string'&&!(k in t)&&/^[a-zA-Z]+$/.test(k))return t.getPropertyValue(camelToDash(k));return t[k];},
+  set:function(t,k,v){if(typeof k==='string'&&!(k in t)&&/^[a-zA-Z]+$/.test(k)){t.setProperty(camelToDash(k),v);return true;}t[k]=v;return true;}});}
+function CSSRule(){this.parentRule=null;this.parentStyleSheet=null;}
+CSSRule.STYLE_RULE=1;CSSRule.CHARSET_RULE=2;CSSRule.IMPORT_RULE=3;CSSRule.MEDIA_RULE=4;
+CSSRule.FONT_FACE_RULE=5;CSSRule.PAGE_RULE=6;CSSRule.KEYFRAMES_RULE=7;CSSRule.KEYFRAME_RULE=8;
+CSSRule.NAMESPACE_RULE=10;CSSRule.SUPPORTS_RULE=12;
+['STYLE_RULE','CHARSET_RULE','IMPORT_RULE','MEDIA_RULE','FONT_FACE_RULE','PAGE_RULE','KEYFRAMES_RULE',
+ 'KEYFRAME_RULE','NAMESPACE_RULE','SUPPORTS_RULE'].forEach(function(k){CSSRule.prototype[k]=CSSRule[k];});
+function CSSStyleRule(){CSSRule.call(this);}
+CSSStyleRule.prototype=Object.create(CSSRule.prototype);CSSStyleRule.prototype.constructor=CSSStyleRule;
+CSSStyleRule.prototype.type=1;
+Object.defineProperty(CSSStyleRule.prototype,'cssText',{configurable:true,get:function(){
+ var b=this.style.cssText;return this.selectorText+' {'+(b?' '+b+' ':' ')+'}';}});
+function CSSGroupingRule(){CSSRule.call(this);}
+CSSGroupingRule.prototype=Object.create(CSSRule.prototype);CSSGroupingRule.prototype.constructor=CSSGroupingRule;
+CSSGroupingRule.prototype.insertRule=function(text,index){return rulesInsert(this.cssRules,this.parentStyleSheet,this,text,index);};
+CSSGroupingRule.prototype.deleteRule=function(index){rulesDelete(this.cssRules,index);sheetDirty(this);};
+Object.defineProperty(CSSGroupingRule.prototype,'cssText',{configurable:true,get:function(){
+ return this._head+' {\n'+this.cssRules.map(function(r){return '  '+r.cssText;}).join('\n')+'\n}';}});
+function CSSMediaRule(){CSSGroupingRule.call(this);}
+CSSMediaRule.prototype=Object.create(CSSGroupingRule.prototype);CSSMediaRule.prototype.constructor=CSSMediaRule;
+CSSMediaRule.prototype.type=4;
+function CSSSupportsRule(){CSSGroupingRule.call(this);}
+CSSSupportsRule.prototype=Object.create(CSSGroupingRule.prototype);CSSSupportsRule.prototype.constructor=CSSSupportsRule;
+CSSSupportsRule.prototype.type=12;
+function CSSOtherRule(){CSSRule.call(this);}
+CSSOtherRule.prototype=Object.create(CSSRule.prototype);
+Object.defineProperty(CSSOtherRule.prototype,'cssText',{configurable:true,get:function(){return this._text;}});
+function CSSKeyframesRule(){CSSRule.call(this);}
+CSSKeyframesRule.prototype=Object.create(CSSOtherRule.prototype);CSSKeyframesRule.prototype.type=7;
+function CSSFontFaceRule(){CSSRule.call(this);}
+CSSFontFaceRule.prototype=Object.create(CSSRule.prototype);CSSFontFaceRule.prototype.type=5;
+Object.defineProperty(CSSFontFaceRule.prototype,'cssText',{configurable:true,get:function(){
+ return '@font-face { '+this.style.cssText+' }';}});
+function CSSImportRule(){CSSRule.call(this);}
+CSSImportRule.prototype=Object.create(CSSOtherRule.prototype);CSSImportRule.prototype.type=3;
+function makeRule(text,sheet,parent){
+ var t=String(text).trim(),r,brace=t.indexOf('{');
+ if(t.charAt(0)==='@'){
+  var m=/^@(-?[\w-]+)/.exec(t),name=m?m[1].toLowerCase():'';
+  var head=(brace<0?t.replace(/;\s*$/,''):t.slice(0,brace)).trim();
+  var cond=head.slice(name.length+1).trim();
+  if(brace>=0&&(name==='media'||name==='supports'||name==='container'||name==='layer'||name==='scope'||name==='document'||name==='starting-style')){
+   r=name==='media'?new CSSMediaRule():name==='supports'?new CSSSupportsRule():new CSSGroupingRule();
+   r._head=head;r.conditionText=cond;if(name==='media')r.media=new MediaList(cond);
+   if(name==='layer')r.name=cond;
+   r.parentStyleSheet=sheet;r.parentRule=parent;
+   r.cssRules=cssSplit(t.slice(brace+1,t.lastIndexOf('}'))).map(function(x){return makeRule(x,sheet,r);});
+   return r;}
+  if(name==='font-face'&&brace>=0){r=new CSSFontFaceRule();
+   r.style=ruleStyleProxy(new RuleStyle(r,t.slice(brace+1,t.lastIndexOf('}'))));}
+  else if(/keyframes$/.test(name)){r=new CSSKeyframesRule();r.name=cond;}
+  else if(name==='import'){r=new CSSImportRule();
+   var h=/url\(\s*['"]?([^'")]*)['"]?\s*\)|['"]([^'"]*)['"]/.exec(cond);r.href=h?(h[1]||h[2]||''):'';}
+  else{r=new CSSOtherRule();r.type=0;}
+  r._text=t;r.parentStyleSheet=sheet;r.parentRule=parent;return r;}
+ r=new CSSStyleRule();r.parentStyleSheet=sheet;r.parentRule=parent;
+ r.selectorText=brace<0?t:t.slice(0,brace).trim();
+ r.style=ruleStyleProxy(new RuleStyle(r,brace<0?'':t.slice(brace+1,t.lastIndexOf('}'))));
+ return r;}
+function rulesInsert(list,sheet,parent,text,index){
+ index=index===undefined?0:index>>>0;
+ if(index>list.length)throw new DOMException("Failed to execute 'insertRule' on 'CSSStyleSheet': The index provided ("+index+
+  ") is larger than the maximum index ("+list.length+").",'IndexSizeError');
+ var parts=cssSplit(cssStrip(String(text)));
+ if(parts.length!==1)throw new DOMException("Failed to execute 'insertRule' on 'CSSStyleSheet': Failed to parse the rule '"+text+"'.",'SyntaxError');
+ list.splice(index,0,makeRule(parts[0],sheet,parent));
+ sheetDirty(parent||sheet);
+ return index;}
+function rulesDelete(list,index){index=index>>>0;
+ if(index>=list.length)throw new DOMException("Failed to execute 'deleteRule' on 'CSSStyleSheet': The index provided ("+index+
+  ") is outside the range [0, "+list.length+").",'IndexSizeError');
+ list.splice(index,1);}
+function MediaList(t){this._m=t?String(t).split(',').map(function(x){return x.trim();}).filter(Boolean):[];}
 Object.defineProperty(MediaList.prototype,'mediaText',{configurable:true,
- get:function(){return this._m.join(', ');},set:function(v){this._m=String(v).split(',');}});
+ get:function(){return this._m.join(', ');},set:function(v){this._m=String(v).split(',').map(function(x){return x.trim();}).filter(Boolean);}});
 Object.defineProperty(MediaList.prototype,'length',{configurable:true,get:function(){return this._m.length;}});
 MediaList.prototype.item=function(i){return this._m[i]===undefined?null:this._m[i];};
 MediaList.prototype.appendMedium=function(m){this._m.push(String(m));};
 MediaList.prototype.deleteMedium=function(m){this._m=this._m.filter(function(x){return x!==m;});};
 MediaList.prototype.toString=function(){return this.mediaText;};
-function CSSStyleSheet(owner){this.ownerNode=owner||null;this.ownerRule=null;
- this.parentStyleSheet=null;this.disabled=false;this.type='text/css';
- this.href=owner&&owner.href?owner.href:null;this.title=owner?owner.title:'';
- this.media=new MediaList(owner?owner.media:'');
- /* The rules are not exposed: libcss keeps the parsed sheet and there is
-  * no serialisation back out of it. An empty list is what a cross-origin
-  * sheet gives, which is the case code already handles. */
- this.cssRules=[];this.rules=this.cssRules;}
-CSSStyleSheet.prototype.insertRule=function(){return 0;};
-CSSStyleSheet.prototype.deleteRule=function(){};
-CSSStyleSheet.prototype.addRule=function(){return -1;};
-CSSStyleSheet.prototype.removeRule=function(){};
-CSSStyleSheet.prototype.replace=function(){return Promise.resolve(this);};
-CSSStyleSheet.prototype.replaceSync=GAP('CSSStyleSheet.replaceSync');
-W.CSSRule=CSSRule;W.CSSStyleRule=CSSRule;W.MediaList=MediaList;
-W.StyleSheet=W.CSSStyleSheet=CSSStyleSheet;
+var SHEET_NEW={};
+function CSSStyleSheet(opts){
+ /* new CSSStyleSheet() makes a constructed sheet; an element's sheet is
+    made with SHEET_NEW and its owner */
+ var owner=opts===SHEET_NEW?arguments[1]:null;
+ this.ownerNode=owner;this.ownerRule=null;this.parentStyleSheet=null;
+ this.disabled=false;this.type='text/css';
+ this.href=owner&&owner.tagName==='LINK'?owner.href:null;this.title=owner?owner.title||null:null;
+ this.media=new MediaList(owner?owner.getAttribute('media'):(opts&&opts.media)||'');
+ this._constructed=!owner;this._rules=owner?null:[];this._src=null;this._adopters=[];}
+Object.defineProperty(CSSStyleSheet.prototype,'cssRules',{configurable:true,get:function(){
+ var o=this.ownerNode;
+ if(o&&o.tagName==='STYLE'){var t=o.textContent||'';
+  /* the element's text, unless script has changed the rules since it
+     was last read, and then only until the text itself changes */
+  if(this._rules===null||t!==this._src){this._src=t;
+   this._rules=cssSplit(cssStrip(t)).map(function(x){return makeRule(x,this,null);},this);}}
+ else if(this._rules===null)this._rules=[];
+ return this._rules;}});
+Object.defineProperty(CSSStyleSheet.prototype,'rules',{configurable:true,get:function(){return this.cssRules;}});
+CSSStyleSheet.prototype.insertRule=function(text,index){return rulesInsert(this.cssRules,this,null,text,index);};
+CSSStyleSheet.prototype.deleteRule=function(index){rulesDelete(this.cssRules,index);sheetDirty(this);};
+CSSStyleSheet.prototype.addRule=function(sel,style,index){
+ this.insertRule(sel+' { '+(style||'')+' }',index===undefined?this.cssRules.length:index);return -1;};
+CSSStyleSheet.prototype.removeRule=function(index){this.deleteRule(index===undefined?0:index);};
+CSSStyleSheet.prototype.replaceSync=function(text){
+ if(!this._constructed)throw new DOMException("Failed to execute 'replaceSync' on 'CSSStyleSheet': Can't call replaceSync on non-constructed CSSStyleSheets.",'NotAllowedError');
+ /* @import is not allowed in a constructed sheet and is dropped */
+ this._rules=cssSplit(cssStrip(String(text))).filter(function(x){return !/^@import\b/i.test(x);})
+  .map(function(x){return makeRule(x,this,null);},this);
+ sheetDirty(this);};
+CSSStyleSheet.prototype.replace=function(text){var s=this;
+ try{s.replaceSync(text);}catch(e){return Promise.reject(e);}
+ return Promise.resolve(s);};
+CSSStyleSheet.prototype._text=function(){
+ return this.disabled?'':this.cssRules.map(function(r){return r.cssText;}).join('\n');};
+var sheetsDirty=[],sheetsFlush=false;
+function sheetDirty(r){
+ /* a rule or a sheet: find the sheet and write it back soon */
+ var s=r;while(s&&!(s instanceof CSSStyleSheet))s=s.parentStyleSheet||null;
+ if(!s)return;
+ if(s.ownerNode&&s.ownerNode.tagName==='STYLE')s._src=s.ownerNode.textContent||'';
+ if(sheetsDirty.indexOf(s)<0)sheetsDirty.push(s);
+ if(!sheetsFlush){sheetsFlush=true;Promise.resolve().then(sheetsWrite);}}
+function sheetsWrite(){
+ var list=sheetsDirty,seen=[];sheetsDirty=[];sheetsFlush=false;
+ list.forEach(function(s){
+  if(s.ownerNode&&s.ownerNode.tagName==='STYLE'&&W.__vitaSetSheetText)
+   try{W.__vitaSetSheetText(s.ownerNode,s._text());}catch(e){}
+  s._adopters.forEach(function(a){if(seen.indexOf(a)<0){seen.push(a);adoptWrite(a);}});});}
+var sheetOf=new WeakMap();
+function elementSheet(el){
+ var s=sheetOf.get(el);
+ if(!s){s=new CSSStyleSheet(SHEET_NEW,el);sheetOf.set(el,s);}
+ return s;}
+W.CSSRule=CSSRule;W.CSSStyleRule=CSSStyleRule;W.CSSGroupingRule=CSSGroupingRule;
+W.CSSMediaRule=CSSMediaRule;W.CSSSupportsRule=CSSSupportsRule;W.CSSKeyframesRule=CSSKeyframesRule;
+W.CSSFontFaceRule=CSSFontFaceRule;W.CSSImportRule=CSSImportRule;W.MediaList=MediaList;
+W.CSSStyleSheet=CSSStyleSheet;W.StyleSheet=CSSStyleSheet;
+W.CSSRuleList=W.CSSRuleList||function CSSRuleList(){};
+function inDoc(n){while(n&&n.parentNode)n=n.parentNode;return n===D;}
 Object.defineProperty(D,'styleSheets',{configurable:true,get:function(){
- var l=D.querySelectorAll('style,link[rel~="stylesheet"]').map(function(n){
-  return new CSSStyleSheet(n);});
+ var l=D.querySelectorAll('style,link[rel~="stylesheet"]').map(elementSheet);
  l.item=function(i){return this[i]||null;};
  return l;}});
 Object.defineProperty(P,'sheet',{configurable:true,get:function(){
- var t=this.tagName;return (t==='STYLE'||t==='LINK')?new CSSStyleSheet(this):null;}});
+ var t=this.tagName;
+ if(t!=='STYLE'&&t!=='LINK')return undefined;
+ if(t==='LINK'&&!/(^|\s)stylesheet(\s|$)/i.test(this.getAttribute('rel')||''))return null;
+ return inDoc(this)?elementSheet(this):null;}});
+/* adoptedStyleSheets (VitaSurf): the document's are one sheet the engine
+   reads from a <style> that is never put in the document; a shadow
+   root's are a <style> inside it, which is scoped as its own are. */
+var adoptedOf=new WeakMap(),adoptEl=new WeakMap();
+function adoptWrite(target){
+ var list=adoptedOf.get(target)||[],text=list.map(function(s){return s._text();}).join('\n');
+ var el=adoptEl.get(target);
+ if(target===D){
+  if(!el){el=D.createElement('style');adoptEl.set(target,el);}
+  if(W.__vitaSetSheetText)try{W.__vitaSetSheetText(el,text);}catch(e){}
+ }else{
+  if(!el){el=D.createElement('style');el.setAttribute('data-adopted','');adoptEl.set(target,el);}
+  el.textContent=text;
+  if(el.parentNode!==target)try{target.appendChild(el);}catch(e){}}}
+function adoptedAccessor(){return {configurable:true,
+ get:function(){return (adoptedOf.get(this)||[]).slice();},
+ set:function(v){var self=this,list=Array.prototype.slice.call(v||[]);
+  list.forEach(function(s){if(!(s instanceof CSSStyleSheet)||!s._constructed)
+   throw new TypeError("Failed to set the 'adoptedStyleSheets' property: Can't adopt non-constructed stylesheets.");});
+  (adoptedOf.get(self)||[]).forEach(function(s){var i=s._adopters.indexOf(self);if(i>=0)s._adopters.splice(i,1);});
+  list.forEach(function(s){if(s._adopters.indexOf(self)<0)s._adopters.push(self);});
+  adoptedOf.set(self,list);adoptWrite(self);}};}
+Object.defineProperty(D,'adoptedStyleSheets',adoptedAccessor());
 
 /* --- attributes as a NamedNodeMap --------------------------------------- */
 /* Not an array: the map's own properties are the indices and the
@@ -5415,6 +5621,8 @@ function moveFocus(el,caret){
  var prev=focused;
  if(prev===el)return;
  focused=el;
+ /* :focus, :focus-within and :focus-visible in the style sheets */
+ if(W.__vitaSetFocus)try{W.__vitaSetFocus(el||null);}catch(x){}
  if(prev&&ceInDoc(prev)){
   focusEvent(prev,'blur',false,el);focusEvent(prev,'focusout',true,el);}
  if(el){
@@ -5438,7 +5646,7 @@ Object.defineProperty(P,'clonable',{configurable:true,get:function(){return fals
 Object.defineProperty(P,'serializable',{configurable:true,get:function(){return false;}});
 Object.defineProperty(P,'styleSheets',{configurable:true,get:function(){
  var l=[];l.item=function(i){return this[i]||null;};return l;}});
-P.adoptedStyleSheets=[];
+Object.defineProperty(P,'adoptedStyleSheets',adoptedAccessor());
 reflectString([['shadowRootMode','shadowrootmode'],['shadowRootSlotAssignment','shadowrootslotassignment']]);
 reflectBool([['shadowRootDelegatesFocus','shadowrootdelegatesfocus'],
  ['shadowRootClonable','shadowrootclonable'],['shadowRootSerializable','shadowrootserializable']]);

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!-- A pseudo-class a browser knows no longer throws away the rule it is
+     in: "#a:focus-visible, #b" lost #b as well. Those that can be
+     answered here match. Expected console output: lines ending in "ok". -->
+<html dir=ltr><head><style>
+#x1:focus-visible, #b1 { color: rgb(255, 0, 0) }
+#x2::placeholder, #b2 { color: rgb(255, 0, 0) }
+#x3::marker, #b3 { color: rgb(255, 0, 0) }
+#x4::selection, #b4 { color: rgb(255, 0, 0) }
+#x5::-webkit-scrollbar, #b5 { color: rgb(255, 0, 0) }
+#x6:nosuchthing, #b6 { color: rgb(255, 0, 0) }
+a:any-link { color: rgb(0, 128, 0) }
+input:required { color: rgb(0, 0, 255) }
+input:optional { color: rgb(0, 128, 128) }
+input:read-only { background-color: rgb(1, 2, 3) }
+input:invalid { background-color: rgb(4, 5, 6) }
+details:open { color: rgb(7, 8, 9) }
+p:dir(rtl) { color: rgb(10, 11, 12) }
+li:nth-child(2 of .on) { color: rgb(13, 14, 15) }
+li:nth-last-child(1 of .on) { background-color: rgb(16, 17, 18) }
+</style></head><body>
+<p id=b1>1</p><p id=b2>2</p><p id=b3>3</p><p id=b4>4</p><p id=b5>5</p><p id=b6>6</p>
+<a id=l href="#">link</a><a id=nl>not a link</a>
+<input id=req required><input id=opt><input id=ro readonly value=x>
+<details id=det open><summary>s</summary>d</details>
+<div dir=rtl><p id=rtl>r</p></div>
+<ul><li id=i1>1</li><li id=i2 class=on>2</li><li id=i3>3</li><li id=i4 class=on>4</li><li id=i5 class=on>5</li><li id=i6>6</li></ul>
+<script>
+setTimeout(function () {
+  function cs(id, p) { return getComputedStyle(document.getElementById(id))[p || 'color']; }
+  function t(label, got, want) { console.log(label + ":", got === want ? "ok" : "FAIL " + got); }
+  for (var i = 1; i <= 5; i++) t("rule kept past a known name " + i, cs('b' + i), 'rgb(255, 0, 0)');
+  t("an unknown name still drops its rule", cs('b6'), 'rgb(0, 0, 0)');
+  t(":any-link", cs('l'), 'rgb(0, 128, 0)');
+  t(":any-link needs href", cs('nl') === 'rgb(0, 128, 0)' ? 'matched' : 'no', 'no');
+  t(":required", cs('req'), 'rgb(0, 0, 255)');
+  t(":optional", cs('opt'), 'rgb(0, 128, 128)');
+  t(":read-only", cs('ro', 'backgroundColor'), 'rgb(1, 2, 3)');
+  t(":invalid (required and empty)", cs('req', 'backgroundColor'), 'rgb(4, 5, 6)');
+  t(":open", cs('det'), 'rgb(7, 8, 9)');
+  t(":dir(rtl)", cs('rtl'), 'rgb(10, 11, 12)');
+  t(":nth-child(2 of .on)", cs('i4'), 'rgb(13, 14, 15)');
+  t(":nth-child(2 of .on) skips the rest", cs('i2') === 'rgb(13, 14, 15)' || cs('i5') === 'rgb(13, 14, 15)' ? 'matched' : 'no', 'no');
+  t(":nth-last-child(1 of .on)", cs('i5', 'backgroundColor'), 'rgb(16, 17, 18)');
+}, 500);
+</script></body></html>

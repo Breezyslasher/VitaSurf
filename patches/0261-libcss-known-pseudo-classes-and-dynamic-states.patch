@@ -1,0 +1,3010 @@
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index e97b197..8d41028 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -110,6 +110,15 @@ typedef struct css_computed_grid_track {
+ 
+ css_error css_computed_style_destroy(css_computed_style *style);
+ 
++/**
++ * Whether two computed styles lay a box out the same way, differing at
++ * most in how it is painted: colours, backgrounds other than images,
++ * borders' colours and corners, shadows, outlines, opacity, filter,
++ * transform, visibility, z-index and the like (VitaSurf).
++ */
++bool css_computed_style_same_layout(const css_computed_style *a,
++		const css_computed_style *b);
++
+ css_error css_computed_style_compose(
+ 		const css_computed_style *restrict parent,
+ 		const css_computed_style *restrict child,
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 2964ce4..f29d27e 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -182,6 +182,25 @@ typedef struct css_select_handler {
+ 	 */
+ 	css_error (*node_attribute_hashes)(void *pw, void *node,
+ 			uint32_t *hashes, uint32_t *n_hashes);
++
++	/**
++	 * Whether a node matches a pseudo-class libcss knows only by
++	 * name (VitaSurf): :focus-visible, :focus-within, :any-link,
++	 * :placeholder-shown, :required, :read-only, :dir() and the rest
++	 * of the list in parse/language.c.
++	 *
++	 * \param pw     Client data
++	 * \param node   DOM node
++	 * \param name   The pseudo-class, as written; compare it without
++	 *               case
++	 * \param arg    Its identifier argument, for :dir(), else NULL
++	 * \param match  Set to whether it matches
++	 *
++	 * NULL, the default for a handler written before it, matches
++	 * none of them.
++	 */
++	css_error (*node_is_pseudo)(void *pw, void *node, lwc_string *name,
++			lwc_string *arg, bool *match);
+ } css_select_handler;
+ 
+ /** How many attribute names a node can name before every bucket is
+@@ -272,7 +291,8 @@ css_error css_select_ctx_count_sheets(css_select_ctx *ctx, uint32_t *count);
+  * it. It says how many sheets went in, counting imports, how many
+  * rules the index holds and roughly how many bytes it takes.
+  *
+- * eturn CSS_OK, or CSS_NOMEM, after which selection carries on sheet
++ * 
++eturn CSS_OK, or CSS_NOMEM, after which selection carries on sheet
+  *         by sheet.
+  */
+ css_error css_select_ctx_build_index(css_select_ctx *ctx,
+diff --git a/include/libcss/stylesheet.h b/include/libcss/stylesheet.h
+index db75ebb..b1dde6b 100644
+--- a/include/libcss/stylesheet.h
++++ b/include/libcss/stylesheet.h
+@@ -184,6 +184,21 @@ css_error css_stylesheet_size(css_stylesheet *sheet, size_t *size);
+  */
+ uint32_t css_stylesheet_gap_count(const css_stylesheet *sheet);
+ 
++/** The element states a selector can depend on (VitaSurf). */
++#define CSS_DYNAMIC_HOVER   (1u << 0)	/**< :hover */
++#define CSS_DYNAMIC_ACTIVE  (1u << 1)	/**< :active */
++#define CSS_DYNAMIC_FOCUS   (1u << 2)	/**< :focus and its kin */
++#define CSS_DYNAMIC_TARGET  (1u << 3)	/**< :target, :target-within */
++
++/**
++ * Which of the CSS_DYNAMIC_ states a selector in the sheet asks of an
++ * element other than the one it styles (VitaSurf): ".menu:hover .sub"
++ * restyles more than the element hovered. A client restyling after a
++ * change of state restyles only the element and its ancestors unless
++ * the state's bit is set here.
++ */
++uint32_t css_stylesheet_dynamic_ancestor(const css_stylesheet *sheet);
++
+ /**
+  * Read one of those (VitaSurf).
+  *
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 443aa44..6f8f4fc 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -2811,6 +2811,195 @@ css_error parseNth(css_language *c,
+ 	return CSS_OK;
+ }
+ 
++/**
++ * Whether a token is the identifier \a word, ignoring case (VitaSurf).
++ */
++static bool isIdent(const css_token *t, const char *word)
++{
++	size_t n = strlen(word);
++
++	return t != NULL && t->type == CSS_TOKEN_IDENT &&
++			lwc_string_length(t->idata) == n &&
++			strncasecmp(lwc_string_data(t->idata), word, n) == 0;
++}
++
++/**
++ * Parse the "of S" of :nth-child(An+B of S) (VitaSurf).
++ *
++ * The result goes in value.selector, as :has() keeps its arguments, so
++ * that the ownership, copying and freeing already written for those
++ * apply: a compound of its own holds A and B in its nth value and
++ * leads a chain of the argument compounds. Its specificity is the
++ * pseudo-class's own plus that of the most specific argument, which is
++ * how the parent's specificity comes out right when the :has() rule
++ * (the most specific of the chain) is applied to it.
++ */
++static css_error parseNthOf(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_selector_detail_value *value)
++{
++	css_selector *head = NULL, *list = NULL, *s;
++	css_qname qname;
++	uint32_t most = 0;
++	css_error error;
++
++	/* "of" */
++	parserutils_vector_iterate(vector, ctx);
++	consumeWhitespace(vector, ctx);
++
++	error = parseHasArgs(c, vector, ctx, &list);
++	if (error != CSS_OK)
++		return error;
++
++	for (s = list; s != NULL; s = s->combinator) {
++		/* a compound on its own: no combinators */
++		if (s->data.comb != CSS_COMBINATOR_NONE) {
++			css__stylesheet_selector_destroy(c->sheet, list);
++			return CSS_INVALID;
++		}
++		if (s->specificity > most)
++			most = s->specificity;
++	}
++
++	qname.ns = NULL;
++	qname.name = c->strings[UNIVERSAL];
++	error = css__stylesheet_selector_create(c->sheet, &qname, &head);
++	if (error != CSS_OK) {
++		css__stylesheet_selector_destroy(c->sheet, list);
++		return error;
++	}
++	head->data.value.nth.a = value->nth.a;
++	head->data.value.nth.b = value->nth.b;
++	head->data.value_type = CSS_SELECTOR_DETAIL_VALUE_NTH;
++	head->combinator = list;
++	head->specificity = CSS_SPECIFICITY_C + most;
++
++	value->selector = head;
++	return CSS_OK;
++}
++
++/**
++ * The pseudo-classes and pseudo-elements a browser knows that have no
++ * entry of their own here (VitaSurf).
++ *
++ * An unknown pseudo-class makes the whole selector list invalid, so
++ * "#a:focus-visible, #b" lost its rule for #b as well. These are the
++ * names Chrome and Firefox accept; each is kept by name and matched by
++ * the client's node_is_pseudo, and a pseudo-element among them matches
++ * nothing, so its rule is kept for the rest of the list and does no
++ * harm. A name no browser knows stays invalid, as it is there.
++ */
++static const char *const known_classes[] = {
++	"any-link", "-webkit-any-link", "local-link", "focus-visible",
++	"focus-within", "target-within", "placeholder-shown", "required",
++	"optional", "read-only", "read-write", "valid", "invalid",
++	"user-valid", "user-invalid", "default", "indeterminate",
++	"defined", "in-range", "out-of-range", "autofill",
++	"-webkit-autofill", "modal", "fullscreen", "-webkit-full-screen",
++	"popover-open", "open", "closed", "playing", "paused", "seeking",
++	"buffering", "stalled", "muted", "volume-locked",
++	"picture-in-picture", "scope", "blank", "past", "current",
++	"future", "has-slotted", "xr-overlay", NULL
++};
++
++static const char *const known_class_functions[] = {
++	"dir", "state", "current", "nth-col", "nth-last-col", NULL
++};
++
++static const char *const known_elements[] = {
++	"marker", "placeholder", "selection", "backdrop",
++	"file-selector-button", "cue", "cue-region", "target-text",
++	"spelling-error", "grammar-error", "details-content",
++	"search-text", "scroll-marker", "scroll-marker-group",
++	"scroll-button", "column", "checkmark", "picker-icon",
++	"view-transition", NULL
++};
++
++static const char *const known_element_functions[] = {
++	"part", "highlight", "picker", "cue", "cue-region",
++	"scroll-button", "view-transition-group",
++	"view-transition-image-pair", "view-transition-old",
++	"view-transition-new", NULL
++};
++
++static bool inList(const char *const *list, const char *name, size_t n)
++{
++	for (; *list != NULL; list++) {
++		if (strlen(*list) == n && strncasecmp(*list, name, n) == 0)
++			return true;
++	}
++	return false;
++}
++
++/**
++ * Parse a pseudo-class or pseudo-element from the lists above (VitaSurf).
++ * The ':' or '::' has been consumed and \a token is its name.
++ */
++static css_error parsePseudoKnown(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		const css_token *token, bool require_element, bool in_not,
++		css_selector_detail *specific)
++{
++	const char *name = lwc_string_data(token->idata);
++	size_t len = lwc_string_length(token->idata);
++	bool fn = (token->type == CSS_TOKEN_FUNCTION);
++	css_selector_type type;
++	css_selector_detail_value value;
++	css_qname qname;
++	lwc_string *arg = NULL;
++
++	if (require_element) {
++		/* Chrome takes any ::-webkit- name, so sites write them
++		 * next to the standard one in a single list */
++		if (!(fn ? inList(known_element_functions, name, len) :
++				(inList(known_elements, name, len) ||
++				 (len > 8 && strncasecmp(name, "-webkit-",
++						8) == 0))))
++			return CSS_INVALID;
++		if (in_not)
++			return CSS_INVALID;
++		type = CSS_SELECTOR_PSEUDO_ELEMENT;
++	} else {
++		if (!(fn ? inList(known_class_functions, name, len) :
++				inList(known_classes, name, len)))
++			return CSS_INVALID;
++		type = CSS_SELECTOR_PSEUDO_CLASS;
++	}
++
++	if (fn) {
++		/* Keep a single identifier argument, for :dir(); step
++		 * over anything else */
++		int nesting = 0;
++		const css_token *t;
++
++		consumeWhitespace(vector, ctx);
++		t = parserutils_vector_peek(vector, *ctx);
++		if (t != NULL && t->type == CSS_TOKEN_IDENT)
++			arg = t->idata;
++		for (;;) {
++			t = parserutils_vector_iterate(vector, ctx);
++			if (t == NULL)
++				return CSS_INVALID;
++			if (t->type == CSS_TOKEN_FUNCTION ||
++					tokenIsChar(t, '(')) {
++				nesting++;
++			} else if (tokenIsChar(t, ')')) {
++				if (nesting == 0)
++					break;
++				nesting--;
++			}
++		}
++	}
++
++	/* The name as written: the client compares it without case */
++	qname.ns = NULL;
++	qname.name = token->idata;
++	value.string = arg;
++	return css__stylesheet_selector_detail_init(c->sheet, type, &qname,
++			value, CSS_SELECTOR_DETAIL_VALUE_STRING, false,
++			specific);
++}
++
+ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 		int32_t *ctx, bool in_not, css_selector_detail *specific)
+ {
+@@ -2911,9 +3100,10 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 		}
+ 	}
+ 
+-	/* Not found: invalid */
++	/* Not found: one a browser knows, or invalid */
+ 	if (lut_idx == N_ELEMENTS(pseudo_lut))
+-		return CSS_INVALID;
++		return parsePseudoKnown(c, vector, ctx, token, require_element,
++				in_not, specific);
+ 
+ 	/* Required a pseudo element, but didn't find one: invalid */
+ 	if (require_element && type != CSS_SELECTOR_PSEUDO_ELEMENT)
+@@ -2949,6 +3139,18 @@ css_error parsePseudo(css_language *c, const parserutils_vector *vector,
+ 				return error;
+ 
+ 			value_type = CSS_SELECTOR_DETAIL_VALUE_NTH;
++
++			if ((fun_type == NTH_CHILD ||
++					fun_type == NTH_LAST_CHILD) &&
++					isIdent(parserutils_vector_peek(
++						vector, *ctx), "of")) {
++				error = parseNthOf(c, vector, ctx,
++						&detail_value);
++				if (error != CSS_OK)
++					return error;
++				value_type =
++					CSS_SELECTOR_DETAIL_VALUE_SELECTOR;
++			}
+ 		} else if (fun_type == NOT) {
+ 			/* type_selector | specific */
+ 			token = parserutils_vector_peek(vector, *ctx);
+diff --git a/src/select/arena.c b/src/select/arena.c
+index 71b25c7..c378f96 100644
+--- a/src/select/arena.c
++++ b/src/select/arena.c
+@@ -13,6 +13,7 @@
+ 
+ #include "select/arena_hash.h"
+ #include "select/computed.h"
++#include "select/autogenerated_overlay.h"
+ 
+ #define TU_SIZE 3037
+ #define TS_SIZE 5101
+@@ -308,3 +309,81 @@ enum css_error css__arena_remove_style(struct css_computed_style *style)
+ 
+ 	return CSS_OK;
+ }
++
++
++/*
++ * Whether two styles lay a box out the same way (VitaSurf).
++ *
++ * A copy of \a a is given b's value for every property that only
++ * changes how a box is painted, and then compared with b. What is left
++ * to differ, if anything, moves or sizes something. A property missing
++ * from the list costs a relayout that was not needed, never a stale
++ * layout, which is why the list names what is paint only rather than
++ * what is not. Images are not in it: a new one has to be fetched, and
++ * box construction is what asks for them.
++ */
++bool css_computed_style_same_layout(const css_computed_style *a,
++		const css_computed_style *b)
++{
++	struct css_computed_style tmp;
++
++	if (a == b)
++		return true;
++	if (a == NULL || b == NULL)
++		return false;
++
++	tmp = *a;
++	overlay_animation_fill_mode(&tmp, b);
++	overlay_animation_iteration_count(&tmp, b);
++	overlay_animation_name(&tmp, b);
++	overlay_background_attachment(&tmp, b);
++	overlay_background_clip(&tmp, b);
++	overlay_background_color(&tmp, b);
++	overlay_background_position(&tmp, b);
++	overlay_background_repeat(&tmp, b);
++	overlay_background_size(&tmp, b);
++	overlay_border_bottom_color(&tmp, b);
++	overlay_border_left_color(&tmp, b);
++	overlay_border_right_color(&tmp, b);
++	overlay_border_top_color(&tmp, b);
++	overlay_border_bottom_left_radius(&tmp, b);
++	overlay_border_bottom_right_radius(&tmp, b);
++	overlay_border_top_left_radius(&tmp, b);
++	overlay_border_top_right_radius(&tmp, b);
++	overlay_box_shadow(&tmp, b);
++	overlay_box_shadow_2(&tmp, b);
++	overlay_clip_path(&tmp, b);
++	overlay_color(&tmp, b);
++	overlay_column_rule_color(&tmp, b);
++	overlay_cursor(&tmp, b);
++	overlay_fill(&tmp, b);
++	overlay_fill_opacity(&tmp, b);
++	overlay_filter(&tmp, b);
++	overlay_mask_position(&tmp, b);
++	overlay_mask_size(&tmp, b);
++	overlay_opacity(&tmp, b);
++	overlay_outline_color(&tmp, b);
++	overlay_outline_style(&tmp, b);
++	overlay_outline_width(&tmp, b);
++	overlay_pointer_events(&tmp, b);
++	overlay_stroke(&tmp, b);
++	overlay_stroke_opacity(&tmp, b);
++	overlay_stroke_width(&tmp, b);
++	overlay_text_decoration(&tmp, b);
++	overlay_text_decoration_color(&tmp, b);
++	overlay_text_decoration_style(&tmp, b);
++	overlay_text_decoration_thickness(&tmp, b);
++	overlay_text_shadow(&tmp, b);
++	overlay_text_underline_offset(&tmp, b);
++	overlay_transform(&tmp, b);
++	overlay_transform_origin(&tmp, b);
++	overlay_visibility(&tmp, b);
++	overlay_z_index(&tmp, b);
++
++	/* the variables are inherited, not laid out; a child that uses
++	 * one is restyled and compared in its own right */
++	tmp.custom = b->custom;
++
++	return css__arena_style_is_equal(&tmp,
++			(struct css_computed_style *) b);
++}
+diff --git a/src/select/assets.py b/src/select/assets.py
+index 0372b4c..ce0dd40 100644
+--- a/src/select/assets.py
++++ b/src/select/assets.py
+@@ -53,3 +53,7 @@ assets['propget.h']['footer'] = '\n#endif\n'
+ assets['destroy.inc'] = {}
+ assets['destroy.inc']['header'] = copyright
+ assets['destroy.inc']['footer'] = ''
++
++assets['overlay.h'] = {}
++assets['overlay.h']['header'] = copyright + ifndef("overlay")
++assets['overlay.h']['footer'] = '\n#endif\n'
+diff --git a/src/select/autogenerated_overlay.h b/src/select/autogenerated_overlay.h
+new file mode 100644
+index 0000000..d9708d1
+--- /dev/null
++++ b/src/select/autogenerated_overlay.h
+@@ -0,0 +1,2312 @@
++/*
++ * This file is part of LibCSS
++ * Licensed under the MIT License,
++ *                http://www.opensource.org/licenses/mit-license.php
++ * Copyright 2017 The NetSurf Project
++ */
++
++#ifndef CSS_COMPUTED_OVERLAY_H_
++#define CSS_COMPUTED_OVERLAY_H_
++
++
++#define ALIGN_CONTENT_INDEX 17
++#define ALIGN_CONTENT_SHIFT 14
++#define ALIGN_CONTENT_MASK 0x1c000
++static inline void overlay_align_content(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ALIGN_CONTENT_INDEX] = (dst->i.bits[ALIGN_CONTENT_INDEX] &
++			~ALIGN_CONTENT_MASK) |
++			(src->i.bits[ALIGN_CONTENT_INDEX] & ALIGN_CONTENT_MASK);
++}
++#undef ALIGN_CONTENT_INDEX
++#undef ALIGN_CONTENT_SHIFT
++#undef ALIGN_CONTENT_MASK
++
++#define ALIGN_ITEMS_INDEX 17
++#define ALIGN_ITEMS_SHIFT 17
++#define ALIGN_ITEMS_MASK 0xe0000
++static inline void overlay_align_items(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ALIGN_ITEMS_INDEX] = (dst->i.bits[ALIGN_ITEMS_INDEX] &
++			~ALIGN_ITEMS_MASK) |
++			(src->i.bits[ALIGN_ITEMS_INDEX] & ALIGN_ITEMS_MASK);
++}
++#undef ALIGN_ITEMS_INDEX
++#undef ALIGN_ITEMS_SHIFT
++#undef ALIGN_ITEMS_MASK
++
++#define ALIGN_SELF_INDEX 17
++#define ALIGN_SELF_SHIFT 20
++#define ALIGN_SELF_MASK 0x700000
++static inline void overlay_align_self(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ALIGN_SELF_INDEX] = (dst->i.bits[ALIGN_SELF_INDEX] &
++			~ALIGN_SELF_MASK) |
++			(src->i.bits[ALIGN_SELF_INDEX] & ALIGN_SELF_MASK);
++}
++#undef ALIGN_SELF_INDEX
++#undef ALIGN_SELF_SHIFT
++#undef ALIGN_SELF_MASK
++
++#define ANIMATION_FILL_MODE_INDEX 17
++#define ANIMATION_FILL_MODE_SHIFT 23
++#define ANIMATION_FILL_MODE_MASK 0x3800000
++static inline void overlay_animation_fill_mode(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ANIMATION_FILL_MODE_INDEX] = (dst->i.bits[
++			ANIMATION_FILL_MODE_INDEX] & ~ANIMATION_FILL_MODE_MASK)
++			|
++			(src->i.bits[ANIMATION_FILL_MODE_INDEX] & ANIMATION_FILL_MODE_MASK);
++}
++#undef ANIMATION_FILL_MODE_INDEX
++#undef ANIMATION_FILL_MODE_SHIFT
++#undef ANIMATION_FILL_MODE_MASK
++
++#define ANIMATION_ITERATION_COUNT_INDEX 23
++#define ANIMATION_ITERATION_COUNT_SHIFT 28
++#define ANIMATION_ITERATION_COUNT_MASK 0x30000000
++static inline void overlay_animation_iteration_count(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ANIMATION_ITERATION_COUNT_INDEX] = (dst->i.bits[
++			ANIMATION_ITERATION_COUNT_INDEX] &
++			~ANIMATION_ITERATION_COUNT_MASK) |
++			(src->i.bits[ANIMATION_ITERATION_COUNT_INDEX] &
++			ANIMATION_ITERATION_COUNT_MASK);
++	dst->i.animation_iteration_count = src->i.animation_iteration_count;
++}
++#undef ANIMATION_ITERATION_COUNT_INDEX
++#undef ANIMATION_ITERATION_COUNT_SHIFT
++#undef ANIMATION_ITERATION_COUNT_MASK
++
++#define ANIMATION_NAME_INDEX 23
++#define ANIMATION_NAME_SHIFT 30
++#define ANIMATION_NAME_MASK 0xc0000000
++static inline void overlay_animation_name(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ANIMATION_NAME_INDEX] = (dst->i.bits[ANIMATION_NAME_INDEX]
++			& ~ANIMATION_NAME_MASK) |
++			(src->i.bits[ANIMATION_NAME_INDEX] & ANIMATION_NAME_MASK);
++	dst->i.animation_name = src->i.animation_name;
++}
++#undef ANIMATION_NAME_INDEX
++#undef ANIMATION_NAME_SHIFT
++#undef ANIMATION_NAME_MASK
++
++#define ASPECT_RATIO_INDEX 19
++#define ASPECT_RATIO_SHIFT 0
++#define ASPECT_RATIO_MASK 0x3
++static inline void overlay_aspect_ratio(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ASPECT_RATIO_INDEX] = (dst->i.bits[ASPECT_RATIO_INDEX] &
++			~ASPECT_RATIO_MASK) |
++			(src->i.bits[ASPECT_RATIO_INDEX] & ASPECT_RATIO_MASK);
++	dst->i.aspect_ratio_a = src->i.aspect_ratio_a;
++	dst->i.aspect_ratio_b = src->i.aspect_ratio_b;
++}
++#undef ASPECT_RATIO_INDEX
++#undef ASPECT_RATIO_SHIFT
++#undef ASPECT_RATIO_MASK
++
++#define BACKGROUND_ATTACHMENT_INDEX 19
++#define BACKGROUND_ATTACHMENT_SHIFT 2
++#define BACKGROUND_ATTACHMENT_MASK 0xc
++static inline void overlay_background_attachment(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BACKGROUND_ATTACHMENT_INDEX] = (dst->i.bits[
++			BACKGROUND_ATTACHMENT_INDEX] &
++			~BACKGROUND_ATTACHMENT_MASK) |
++			(src->i.bits[BACKGROUND_ATTACHMENT_INDEX] &
++			BACKGROUND_ATTACHMENT_MASK);
++}
++#undef BACKGROUND_ATTACHMENT_INDEX
++#undef BACKGROUND_ATTACHMENT_SHIFT
++#undef BACKGROUND_ATTACHMENT_MASK
++
++#define BACKGROUND_CLIP_INDEX 17
++#define BACKGROUND_CLIP_SHIFT 26
++#define BACKGROUND_CLIP_MASK 0x1c000000
++static inline void overlay_background_clip(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BACKGROUND_CLIP_INDEX] = (dst->i.bits[
++			BACKGROUND_CLIP_INDEX] & ~BACKGROUND_CLIP_MASK) |
++			(src->i.bits[BACKGROUND_CLIP_INDEX] & BACKGROUND_CLIP_MASK);
++}
++#undef BACKGROUND_CLIP_INDEX
++#undef BACKGROUND_CLIP_SHIFT
++#undef BACKGROUND_CLIP_MASK
++
++#define BACKGROUND_COLOR_INDEX 19
++#define BACKGROUND_COLOR_SHIFT 4
++#define BACKGROUND_COLOR_MASK 0x30
++static inline void overlay_background_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BACKGROUND_COLOR_INDEX] = (dst->i.bits[
++			BACKGROUND_COLOR_INDEX] & ~BACKGROUND_COLOR_MASK) |
++			(src->i.bits[BACKGROUND_COLOR_INDEX] & BACKGROUND_COLOR_MASK);
++	dst->i.background_color = src->i.background_color;
++}
++#undef BACKGROUND_COLOR_INDEX
++#undef BACKGROUND_COLOR_SHIFT
++#undef BACKGROUND_COLOR_MASK
++
++#define BACKGROUND_IMAGE_INDEX 23
++#define BACKGROUND_IMAGE_SHIFT 16
++#define BACKGROUND_IMAGE_MASK 0x10000
++static inline void overlay_background_image(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BACKGROUND_IMAGE_INDEX] = (dst->i.bits[
++			BACKGROUND_IMAGE_INDEX] & ~BACKGROUND_IMAGE_MASK) |
++			(src->i.bits[BACKGROUND_IMAGE_INDEX] & BACKGROUND_IMAGE_MASK);
++	dst->i.background_image = src->i.background_image;
++}
++#undef BACKGROUND_IMAGE_INDEX
++#undef BACKGROUND_IMAGE_SHIFT
++#undef BACKGROUND_IMAGE_MASK
++
++#define BACKGROUND_POSITION_INDEX 3
++#define BACKGROUND_POSITION_SHIFT 21
++#define BACKGROUND_POSITION_MASK 0xffe00000
++static inline void overlay_background_position(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BACKGROUND_POSITION_INDEX] = (dst->i.bits[
++			BACKGROUND_POSITION_INDEX] & ~BACKGROUND_POSITION_MASK)
++			|
++			(src->i.bits[BACKGROUND_POSITION_INDEX] & BACKGROUND_POSITION_MASK);
++	dst->i.background_position_a = src->i.background_position_a;
++	dst->i.background_position_b = src->i.background_position_b;
++}
++#undef BACKGROUND_POSITION_INDEX
++#undef BACKGROUND_POSITION_SHIFT
++#undef BACKGROUND_POSITION_MASK
++
++#define BACKGROUND_REPEAT_INDEX 17
++#define BACKGROUND_REPEAT_SHIFT 29
++#define BACKGROUND_REPEAT_MASK 0xe0000000
++static inline void overlay_background_repeat(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BACKGROUND_REPEAT_INDEX] = (dst->i.bits[
++			BACKGROUND_REPEAT_INDEX] & ~BACKGROUND_REPEAT_MASK) |
++			(src->i.bits[BACKGROUND_REPEAT_INDEX] & BACKGROUND_REPEAT_MASK);
++}
++#undef BACKGROUND_REPEAT_INDEX
++#undef BACKGROUND_REPEAT_SHIFT
++#undef BACKGROUND_REPEAT_MASK
++
++#define BACKGROUND_SIZE_INDEX 1
++#define BACKGROUND_SIZE_SHIFT 19
++#define BACKGROUND_SIZE_MASK 0xfff80000
++static inline void overlay_background_size(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BACKGROUND_SIZE_INDEX] = (dst->i.bits[
++			BACKGROUND_SIZE_INDEX] & ~BACKGROUND_SIZE_MASK) |
++			(src->i.bits[BACKGROUND_SIZE_INDEX] & BACKGROUND_SIZE_MASK);
++	dst->i.background_size_a = src->i.background_size_a;
++	dst->i.background_size_b = src->i.background_size_b;
++}
++#undef BACKGROUND_SIZE_INDEX
++#undef BACKGROUND_SIZE_SHIFT
++#undef BACKGROUND_SIZE_MASK
++
++#define BORDER_BOTTOM_COLOR_INDEX 19
++#define BORDER_BOTTOM_COLOR_SHIFT 6
++#define BORDER_BOTTOM_COLOR_MASK 0xc0
++static inline void overlay_border_bottom_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_BOTTOM_COLOR_INDEX] = (dst->i.bits[
++			BORDER_BOTTOM_COLOR_INDEX] & ~BORDER_BOTTOM_COLOR_MASK)
++			|
++			(src->i.bits[BORDER_BOTTOM_COLOR_INDEX] & BORDER_BOTTOM_COLOR_MASK);
++	dst->i.border_bottom_color = src->i.border_bottom_color;
++}
++#undef BORDER_BOTTOM_COLOR_INDEX
++#undef BORDER_BOTTOM_COLOR_SHIFT
++#undef BORDER_BOTTOM_COLOR_MASK
++
++#define BORDER_BOTTOM_LEFT_RADIUS_INDEX 15
++#define BORDER_BOTTOM_LEFT_RADIUS_SHIFT 10
++#define BORDER_BOTTOM_LEFT_RADIUS_MASK 0x1ffc00
++static inline void overlay_border_bottom_left_radius(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_BOTTOM_LEFT_RADIUS_INDEX] = (dst->i.bits[
++			BORDER_BOTTOM_LEFT_RADIUS_INDEX] &
++			~BORDER_BOTTOM_LEFT_RADIUS_MASK) |
++			(src->i.bits[BORDER_BOTTOM_LEFT_RADIUS_INDEX] &
++			BORDER_BOTTOM_LEFT_RADIUS_MASK);
++	dst->i.border_bottom_left_radius_a = src->i.border_bottom_left_radius_a;
++	dst->i.border_bottom_left_radius_b = src->i.border_bottom_left_radius_b;
++}
++#undef BORDER_BOTTOM_LEFT_RADIUS_INDEX
++#undef BORDER_BOTTOM_LEFT_RADIUS_SHIFT
++#undef BORDER_BOTTOM_LEFT_RADIUS_MASK
++
++#define BORDER_BOTTOM_RIGHT_RADIUS_INDEX 15
++#define BORDER_BOTTOM_RIGHT_RADIUS_SHIFT 21
++#define BORDER_BOTTOM_RIGHT_RADIUS_MASK 0xffe00000
++static inline void overlay_border_bottom_right_radius(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_BOTTOM_RIGHT_RADIUS_INDEX] = (dst->i.bits[
++			BORDER_BOTTOM_RIGHT_RADIUS_INDEX] &
++			~BORDER_BOTTOM_RIGHT_RADIUS_MASK) |
++			(src->i.bits[BORDER_BOTTOM_RIGHT_RADIUS_INDEX] &
++			BORDER_BOTTOM_RIGHT_RADIUS_MASK);
++	dst->i.border_bottom_right_radius_a =
++			src->i.border_bottom_right_radius_a;
++	dst->i.border_bottom_right_radius_b =
++			src->i.border_bottom_right_radius_b;
++}
++#undef BORDER_BOTTOM_RIGHT_RADIUS_INDEX
++#undef BORDER_BOTTOM_RIGHT_RADIUS_SHIFT
++#undef BORDER_BOTTOM_RIGHT_RADIUS_MASK
++
++#define BORDER_BOTTOM_STYLE_INDEX 22
++#define BORDER_BOTTOM_STYLE_SHIFT 16
++#define BORDER_BOTTOM_STYLE_MASK 0xf0000
++static inline void overlay_border_bottom_style(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_BOTTOM_STYLE_INDEX] = (dst->i.bits[
++			BORDER_BOTTOM_STYLE_INDEX] & ~BORDER_BOTTOM_STYLE_MASK)
++			|
++			(src->i.bits[BORDER_BOTTOM_STYLE_INDEX] & BORDER_BOTTOM_STYLE_MASK);
++}
++#undef BORDER_BOTTOM_STYLE_INDEX
++#undef BORDER_BOTTOM_STYLE_SHIFT
++#undef BORDER_BOTTOM_STYLE_MASK
++
++#define BORDER_BOTTOM_WIDTH_INDEX 3
++#define BORDER_BOTTOM_WIDTH_SHIFT 13
++#define BORDER_BOTTOM_WIDTH_MASK 0x1fe000
++static inline void overlay_border_bottom_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_BOTTOM_WIDTH_INDEX] = (dst->i.bits[
++			BORDER_BOTTOM_WIDTH_INDEX] & ~BORDER_BOTTOM_WIDTH_MASK)
++			|
++			(src->i.bits[BORDER_BOTTOM_WIDTH_INDEX] & BORDER_BOTTOM_WIDTH_MASK);
++	dst->i.border_bottom_width = src->i.border_bottom_width;
++}
++#undef BORDER_BOTTOM_WIDTH_INDEX
++#undef BORDER_BOTTOM_WIDTH_SHIFT
++#undef BORDER_BOTTOM_WIDTH_MASK
++
++#define BORDER_COLLAPSE_INDEX 19
++#define BORDER_COLLAPSE_SHIFT 8
++#define BORDER_COLLAPSE_MASK 0x300
++static inline void overlay_border_collapse(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_COLLAPSE_INDEX] = (dst->i.bits[
++			BORDER_COLLAPSE_INDEX] & ~BORDER_COLLAPSE_MASK) |
++			(src->i.bits[BORDER_COLLAPSE_INDEX] & BORDER_COLLAPSE_MASK);
++}
++#undef BORDER_COLLAPSE_INDEX
++#undef BORDER_COLLAPSE_SHIFT
++#undef BORDER_COLLAPSE_MASK
++
++#define BORDER_LEFT_COLOR_INDEX 19
++#define BORDER_LEFT_COLOR_SHIFT 10
++#define BORDER_LEFT_COLOR_MASK 0xc00
++static inline void overlay_border_left_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_LEFT_COLOR_INDEX] = (dst->i.bits[
++			BORDER_LEFT_COLOR_INDEX] & ~BORDER_LEFT_COLOR_MASK) |
++			(src->i.bits[BORDER_LEFT_COLOR_INDEX] & BORDER_LEFT_COLOR_MASK);
++	dst->i.border_left_color = src->i.border_left_color;
++}
++#undef BORDER_LEFT_COLOR_INDEX
++#undef BORDER_LEFT_COLOR_SHIFT
++#undef BORDER_LEFT_COLOR_MASK
++
++#define BORDER_LEFT_STYLE_INDEX 22
++#define BORDER_LEFT_STYLE_SHIFT 20
++#define BORDER_LEFT_STYLE_MASK 0xf00000
++static inline void overlay_border_left_style(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_LEFT_STYLE_INDEX] = (dst->i.bits[
++			BORDER_LEFT_STYLE_INDEX] & ~BORDER_LEFT_STYLE_MASK) |
++			(src->i.bits[BORDER_LEFT_STYLE_INDEX] & BORDER_LEFT_STYLE_MASK);
++}
++#undef BORDER_LEFT_STYLE_INDEX
++#undef BORDER_LEFT_STYLE_SHIFT
++#undef BORDER_LEFT_STYLE_MASK
++
++#define BORDER_LEFT_WIDTH_INDEX 15
++#define BORDER_LEFT_WIDTH_SHIFT 2
++#define BORDER_LEFT_WIDTH_MASK 0x3fc
++static inline void overlay_border_left_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_LEFT_WIDTH_INDEX] = (dst->i.bits[
++			BORDER_LEFT_WIDTH_INDEX] & ~BORDER_LEFT_WIDTH_MASK) |
++			(src->i.bits[BORDER_LEFT_WIDTH_INDEX] & BORDER_LEFT_WIDTH_MASK);
++	dst->i.border_left_width = src->i.border_left_width;
++}
++#undef BORDER_LEFT_WIDTH_INDEX
++#undef BORDER_LEFT_WIDTH_SHIFT
++#undef BORDER_LEFT_WIDTH_MASK
++
++#define BORDER_RIGHT_COLOR_INDEX 19
++#define BORDER_RIGHT_COLOR_SHIFT 12
++#define BORDER_RIGHT_COLOR_MASK 0x3000
++static inline void overlay_border_right_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_RIGHT_COLOR_INDEX] = (dst->i.bits[
++			BORDER_RIGHT_COLOR_INDEX] & ~BORDER_RIGHT_COLOR_MASK) |
++			(src->i.bits[BORDER_RIGHT_COLOR_INDEX] & BORDER_RIGHT_COLOR_MASK);
++	dst->i.border_right_color = src->i.border_right_color;
++}
++#undef BORDER_RIGHT_COLOR_INDEX
++#undef BORDER_RIGHT_COLOR_SHIFT
++#undef BORDER_RIGHT_COLOR_MASK
++
++#define BORDER_RIGHT_STYLE_INDEX 22
++#define BORDER_RIGHT_STYLE_SHIFT 24
++#define BORDER_RIGHT_STYLE_MASK 0xf000000
++static inline void overlay_border_right_style(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_RIGHT_STYLE_INDEX] = (dst->i.bits[
++			BORDER_RIGHT_STYLE_INDEX] & ~BORDER_RIGHT_STYLE_MASK) |
++			(src->i.bits[BORDER_RIGHT_STYLE_INDEX] & BORDER_RIGHT_STYLE_MASK);
++}
++#undef BORDER_RIGHT_STYLE_INDEX
++#undef BORDER_RIGHT_STYLE_SHIFT
++#undef BORDER_RIGHT_STYLE_MASK
++
++#define BORDER_RIGHT_WIDTH_INDEX 14
++#define BORDER_RIGHT_WIDTH_SHIFT 2
++#define BORDER_RIGHT_WIDTH_MASK 0x3fc
++static inline void overlay_border_right_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_RIGHT_WIDTH_INDEX] = (dst->i.bits[
++			BORDER_RIGHT_WIDTH_INDEX] & ~BORDER_RIGHT_WIDTH_MASK) |
++			(src->i.bits[BORDER_RIGHT_WIDTH_INDEX] & BORDER_RIGHT_WIDTH_MASK);
++	dst->i.border_right_width = src->i.border_right_width;
++}
++#undef BORDER_RIGHT_WIDTH_INDEX
++#undef BORDER_RIGHT_WIDTH_SHIFT
++#undef BORDER_RIGHT_WIDTH_MASK
++
++#define BORDER_SPACING_INDEX 14
++#define BORDER_SPACING_SHIFT 10
++#define BORDER_SPACING_MASK 0x1ffc00
++static inline void overlay_border_spacing(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_SPACING_INDEX] = (dst->i.bits[BORDER_SPACING_INDEX]
++			& ~BORDER_SPACING_MASK) |
++			(src->i.bits[BORDER_SPACING_INDEX] & BORDER_SPACING_MASK);
++	dst->i.border_spacing_a = src->i.border_spacing_a;
++	dst->i.border_spacing_b = src->i.border_spacing_b;
++}
++#undef BORDER_SPACING_INDEX
++#undef BORDER_SPACING_SHIFT
++#undef BORDER_SPACING_MASK
++
++#define BORDER_TOP_COLOR_INDEX 19
++#define BORDER_TOP_COLOR_SHIFT 14
++#define BORDER_TOP_COLOR_MASK 0xc000
++static inline void overlay_border_top_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_TOP_COLOR_INDEX] = (dst->i.bits[
++			BORDER_TOP_COLOR_INDEX] & ~BORDER_TOP_COLOR_MASK) |
++			(src->i.bits[BORDER_TOP_COLOR_INDEX] & BORDER_TOP_COLOR_MASK);
++	dst->i.border_top_color = src->i.border_top_color;
++}
++#undef BORDER_TOP_COLOR_INDEX
++#undef BORDER_TOP_COLOR_SHIFT
++#undef BORDER_TOP_COLOR_MASK
++
++#define BORDER_TOP_LEFT_RADIUS_INDEX 14
++#define BORDER_TOP_LEFT_RADIUS_SHIFT 21
++#define BORDER_TOP_LEFT_RADIUS_MASK 0xffe00000
++static inline void overlay_border_top_left_radius(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_TOP_LEFT_RADIUS_INDEX] = (dst->i.bits[
++			BORDER_TOP_LEFT_RADIUS_INDEX] &
++			~BORDER_TOP_LEFT_RADIUS_MASK) |
++			(src->i.bits[BORDER_TOP_LEFT_RADIUS_INDEX] &
++			BORDER_TOP_LEFT_RADIUS_MASK);
++	dst->i.border_top_left_radius_a = src->i.border_top_left_radius_a;
++	dst->i.border_top_left_radius_b = src->i.border_top_left_radius_b;
++}
++#undef BORDER_TOP_LEFT_RADIUS_INDEX
++#undef BORDER_TOP_LEFT_RADIUS_SHIFT
++#undef BORDER_TOP_LEFT_RADIUS_MASK
++
++#define BORDER_TOP_RIGHT_RADIUS_INDEX 13
++#define BORDER_TOP_RIGHT_RADIUS_SHIFT 10
++#define BORDER_TOP_RIGHT_RADIUS_MASK 0x1ffc00
++static inline void overlay_border_top_right_radius(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_TOP_RIGHT_RADIUS_INDEX] = (dst->i.bits[
++			BORDER_TOP_RIGHT_RADIUS_INDEX] &
++			~BORDER_TOP_RIGHT_RADIUS_MASK) |
++			(src->i.bits[BORDER_TOP_RIGHT_RADIUS_INDEX] &
++			BORDER_TOP_RIGHT_RADIUS_MASK);
++	dst->i.border_top_right_radius_a = src->i.border_top_right_radius_a;
++	dst->i.border_top_right_radius_b = src->i.border_top_right_radius_b;
++}
++#undef BORDER_TOP_RIGHT_RADIUS_INDEX
++#undef BORDER_TOP_RIGHT_RADIUS_SHIFT
++#undef BORDER_TOP_RIGHT_RADIUS_MASK
++
++#define BORDER_TOP_STYLE_INDEX 22
++#define BORDER_TOP_STYLE_SHIFT 28
++#define BORDER_TOP_STYLE_MASK 0xf0000000
++static inline void overlay_border_top_style(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_TOP_STYLE_INDEX] = (dst->i.bits[
++			BORDER_TOP_STYLE_INDEX] & ~BORDER_TOP_STYLE_MASK) |
++			(src->i.bits[BORDER_TOP_STYLE_INDEX] & BORDER_TOP_STYLE_MASK);
++}
++#undef BORDER_TOP_STYLE_INDEX
++#undef BORDER_TOP_STYLE_SHIFT
++#undef BORDER_TOP_STYLE_MASK
++
++#define BORDER_TOP_WIDTH_INDEX 13
++#define BORDER_TOP_WIDTH_SHIFT 2
++#define BORDER_TOP_WIDTH_MASK 0x3fc
++static inline void overlay_border_top_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BORDER_TOP_WIDTH_INDEX] = (dst->i.bits[
++			BORDER_TOP_WIDTH_INDEX] & ~BORDER_TOP_WIDTH_MASK) |
++			(src->i.bits[BORDER_TOP_WIDTH_INDEX] & BORDER_TOP_WIDTH_MASK);
++	dst->i.border_top_width = src->i.border_top_width;
++}
++#undef BORDER_TOP_WIDTH_INDEX
++#undef BORDER_TOP_WIDTH_SHIFT
++#undef BORDER_TOP_WIDTH_MASK
++
++#define BOTTOM_INDEX 21
++#define BOTTOM_SHIFT 25
++#define BOTTOM_MASK 0xfe000000
++static inline void overlay_bottom(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BOTTOM_INDEX] = (dst->i.bits[BOTTOM_INDEX] & ~BOTTOM_MASK) |
++			(src->i.bits[BOTTOM_INDEX] & BOTTOM_MASK);
++	dst->i.bottom = src->i.bottom;
++}
++#undef BOTTOM_INDEX
++#undef BOTTOM_SHIFT
++#undef BOTTOM_MASK
++
++#define BOX_SHADOW_INDEX 12
++#define BOX_SHADOW_SHIFT 10
++#define BOX_SHADOW_MASK 0xfffffc00
++static inline void overlay_box_shadow(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BOX_SHADOW_INDEX] = (dst->i.bits[BOX_SHADOW_INDEX] &
++			~BOX_SHADOW_MASK) |
++			(src->i.bits[BOX_SHADOW_INDEX] & BOX_SHADOW_MASK);
++	dst->i.box_shadow_a = src->i.box_shadow_a;
++	dst->i.box_shadow_b = src->i.box_shadow_b;
++	dst->i.box_shadow_c = src->i.box_shadow_c;
++	dst->i.box_shadow_d = src->i.box_shadow_d;
++	dst->i.box_shadow_e = src->i.box_shadow_e;
++}
++#undef BOX_SHADOW_INDEX
++#undef BOX_SHADOW_SHIFT
++#undef BOX_SHADOW_MASK
++
++#define BOX_SHADOW_2_INDEX 11
++#define BOX_SHADOW_2_SHIFT 10
++#define BOX_SHADOW_2_MASK 0xfffffc00
++static inline void overlay_box_shadow_2(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BOX_SHADOW_2_INDEX] = (dst->i.bits[BOX_SHADOW_2_INDEX] &
++			~BOX_SHADOW_2_MASK) |
++			(src->i.bits[BOX_SHADOW_2_INDEX] & BOX_SHADOW_2_MASK);
++	dst->i.box_shadow_2_a = src->i.box_shadow_2_a;
++	dst->i.box_shadow_2_b = src->i.box_shadow_2_b;
++	dst->i.box_shadow_2_c = src->i.box_shadow_2_c;
++	dst->i.box_shadow_2_d = src->i.box_shadow_2_d;
++	dst->i.box_shadow_2_e = src->i.box_shadow_2_e;
++}
++#undef BOX_SHADOW_2_INDEX
++#undef BOX_SHADOW_2_SHIFT
++#undef BOX_SHADOW_2_MASK
++
++#define BOX_SIZING_INDEX 19
++#define BOX_SIZING_SHIFT 16
++#define BOX_SIZING_MASK 0x30000
++static inline void overlay_box_sizing(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BOX_SIZING_INDEX] = (dst->i.bits[BOX_SIZING_INDEX] &
++			~BOX_SIZING_MASK) |
++			(src->i.bits[BOX_SIZING_INDEX] & BOX_SIZING_MASK);
++}
++#undef BOX_SIZING_INDEX
++#undef BOX_SIZING_SHIFT
++#undef BOX_SIZING_MASK
++
++#define BREAK_AFTER_INDEX 9
++#define BREAK_AFTER_SHIFT 3
++#define BREAK_AFTER_MASK 0x78
++static inline void overlay_break_after(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BREAK_AFTER_INDEX] = (dst->i.bits[BREAK_AFTER_INDEX] &
++			~BREAK_AFTER_MASK) |
++			(src->i.bits[BREAK_AFTER_INDEX] & BREAK_AFTER_MASK);
++}
++#undef BREAK_AFTER_INDEX
++#undef BREAK_AFTER_SHIFT
++#undef BREAK_AFTER_MASK
++
++#define BREAK_BEFORE_INDEX 9
++#define BREAK_BEFORE_SHIFT 7
++#define BREAK_BEFORE_MASK 0x780
++static inline void overlay_break_before(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BREAK_BEFORE_INDEX] = (dst->i.bits[BREAK_BEFORE_INDEX] &
++			~BREAK_BEFORE_MASK) |
++			(src->i.bits[BREAK_BEFORE_INDEX] & BREAK_BEFORE_MASK);
++}
++#undef BREAK_BEFORE_INDEX
++#undef BREAK_BEFORE_SHIFT
++#undef BREAK_BEFORE_MASK
++
++#define BREAK_INSIDE_INDEX 8
++#define BREAK_INSIDE_SHIFT 0
++#define BREAK_INSIDE_MASK 0xf
++static inline void overlay_break_inside(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[BREAK_INSIDE_INDEX] = (dst->i.bits[BREAK_INSIDE_INDEX] &
++			~BREAK_INSIDE_MASK) |
++			(src->i.bits[BREAK_INSIDE_INDEX] & BREAK_INSIDE_MASK);
++}
++#undef BREAK_INSIDE_INDEX
++#undef BREAK_INSIDE_SHIFT
++#undef BREAK_INSIDE_MASK
++
++#define CAPTION_SIDE_INDEX 19
++#define CAPTION_SIDE_SHIFT 18
++#define CAPTION_SIDE_MASK 0xc0000
++static inline void overlay_caption_side(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[CAPTION_SIDE_INDEX] = (dst->i.bits[CAPTION_SIDE_INDEX] &
++			~CAPTION_SIDE_MASK) |
++			(src->i.bits[CAPTION_SIDE_INDEX] & CAPTION_SIDE_MASK);
++}
++#undef CAPTION_SIDE_INDEX
++#undef CAPTION_SIDE_SHIFT
++#undef CAPTION_SIDE_MASK
++
++#define CLEAR_INDEX 16
++#define CLEAR_SHIFT 2
++#define CLEAR_MASK 0x1c
++static inline void overlay_clear(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[CLEAR_INDEX] = (dst->i.bits[CLEAR_INDEX] & ~CLEAR_MASK) |
++			(src->i.bits[CLEAR_INDEX] & CLEAR_MASK);
++}
++#undef CLEAR_INDEX
++#undef CLEAR_SHIFT
++#undef CLEAR_MASK
++
++#define CLIP_INDEX 2
++#define CLIP_SHIFT 6
++#define CLIP_MASK 0xffffffc0
++static inline void overlay_clip(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[CLIP_INDEX] = (dst->i.bits[CLIP_INDEX] & ~CLIP_MASK) |
++			(src->i.bits[CLIP_INDEX] & CLIP_MASK);
++	dst->i.clip_a = src->i.clip_a;
++	dst->i.clip_b = src->i.clip_b;
++	dst->i.clip_c = src->i.clip_c;
++	dst->i.clip_d = src->i.clip_d;
++}
++#undef CLIP_INDEX
++#undef CLIP_SHIFT
++#undef CLIP_MASK
++
++#define CLIP_PATH_INDEX 20
++#define CLIP_PATH_SHIFT 10
++#define CLIP_PATH_MASK 0xfffffc00
++static inline void overlay_clip_path(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[CLIP_PATH_INDEX] = (dst->i.bits[CLIP_PATH_INDEX] &
++			~CLIP_PATH_MASK) |
++			(src->i.bits[CLIP_PATH_INDEX] & CLIP_PATH_MASK);
++	dst->i.clip_path_a = src->i.clip_path_a;
++	dst->i.clip_path_b = src->i.clip_path_b;
++	dst->i.clip_path_c = src->i.clip_path_c;
++	dst->i.clip_path_d = src->i.clip_path_d;
++}
++#undef CLIP_PATH_INDEX
++#undef CLIP_PATH_SHIFT
++#undef CLIP_PATH_MASK
++
++#define COLOR_INDEX 23
++#define COLOR_SHIFT 17
++#define COLOR_MASK 0x20000
++static inline void overlay_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLOR_INDEX] = (dst->i.bits[COLOR_INDEX] & ~COLOR_MASK) |
++			(src->i.bits[COLOR_INDEX] & COLOR_MASK);
++	dst->i.color = src->i.color;
++}
++#undef COLOR_INDEX
++#undef COLOR_SHIFT
++#undef COLOR_MASK
++
++#define COLUMN_COUNT_INDEX 19
++#define COLUMN_COUNT_SHIFT 20
++#define COLUMN_COUNT_MASK 0x300000
++static inline void overlay_column_count(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLUMN_COUNT_INDEX] = (dst->i.bits[COLUMN_COUNT_INDEX] &
++			~COLUMN_COUNT_MASK) |
++			(src->i.bits[COLUMN_COUNT_INDEX] & COLUMN_COUNT_MASK);
++	dst->i.column_count = src->i.column_count;
++}
++#undef COLUMN_COUNT_INDEX
++#undef COLUMN_COUNT_SHIFT
++#undef COLUMN_COUNT_MASK
++
++#define COLUMN_FILL_INDEX 19
++#define COLUMN_FILL_SHIFT 22
++#define COLUMN_FILL_MASK 0xc00000
++static inline void overlay_column_fill(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLUMN_FILL_INDEX] = (dst->i.bits[COLUMN_FILL_INDEX] &
++			~COLUMN_FILL_MASK) |
++			(src->i.bits[COLUMN_FILL_INDEX] & COLUMN_FILL_MASK);
++}
++#undef COLUMN_FILL_INDEX
++#undef COLUMN_FILL_SHIFT
++#undef COLUMN_FILL_MASK
++
++#define COLUMN_GAP_INDEX 8
++#define COLUMN_GAP_SHIFT 4
++#define COLUMN_GAP_MASK 0x7f0
++static inline void overlay_column_gap(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLUMN_GAP_INDEX] = (dst->i.bits[COLUMN_GAP_INDEX] &
++			~COLUMN_GAP_MASK) |
++			(src->i.bits[COLUMN_GAP_INDEX] & COLUMN_GAP_MASK);
++	dst->i.column_gap = src->i.column_gap;
++}
++#undef COLUMN_GAP_INDEX
++#undef COLUMN_GAP_SHIFT
++#undef COLUMN_GAP_MASK
++
++#define COLUMN_RULE_COLOR_INDEX 19
++#define COLUMN_RULE_COLOR_SHIFT 24
++#define COLUMN_RULE_COLOR_MASK 0x3000000
++static inline void overlay_column_rule_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLUMN_RULE_COLOR_INDEX] = (dst->i.bits[
++			COLUMN_RULE_COLOR_INDEX] & ~COLUMN_RULE_COLOR_MASK) |
++			(src->i.bits[COLUMN_RULE_COLOR_INDEX] & COLUMN_RULE_COLOR_MASK);
++	dst->i.column_rule_color = src->i.column_rule_color;
++}
++#undef COLUMN_RULE_COLOR_INDEX
++#undef COLUMN_RULE_COLOR_SHIFT
++#undef COLUMN_RULE_COLOR_MASK
++
++#define COLUMN_RULE_STYLE_INDEX 7
++#define COLUMN_RULE_STYLE_SHIFT 0
++#define COLUMN_RULE_STYLE_MASK 0xf
++static inline void overlay_column_rule_style(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLUMN_RULE_STYLE_INDEX] = (dst->i.bits[
++			COLUMN_RULE_STYLE_INDEX] & ~COLUMN_RULE_STYLE_MASK) |
++			(src->i.bits[COLUMN_RULE_STYLE_INDEX] & COLUMN_RULE_STYLE_MASK);
++}
++#undef COLUMN_RULE_STYLE_INDEX
++#undef COLUMN_RULE_STYLE_SHIFT
++#undef COLUMN_RULE_STYLE_MASK
++
++#define COLUMN_RULE_WIDTH_INDEX 12
++#define COLUMN_RULE_WIDTH_SHIFT 2
++#define COLUMN_RULE_WIDTH_MASK 0x3fc
++static inline void overlay_column_rule_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLUMN_RULE_WIDTH_INDEX] = (dst->i.bits[
++			COLUMN_RULE_WIDTH_INDEX] & ~COLUMN_RULE_WIDTH_MASK) |
++			(src->i.bits[COLUMN_RULE_WIDTH_INDEX] & COLUMN_RULE_WIDTH_MASK);
++	dst->i.column_rule_width = src->i.column_rule_width;
++}
++#undef COLUMN_RULE_WIDTH_INDEX
++#undef COLUMN_RULE_WIDTH_SHIFT
++#undef COLUMN_RULE_WIDTH_MASK
++
++#define COLUMN_SPAN_INDEX 19
++#define COLUMN_SPAN_SHIFT 26
++#define COLUMN_SPAN_MASK 0xc000000
++static inline void overlay_column_span(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLUMN_SPAN_INDEX] = (dst->i.bits[COLUMN_SPAN_INDEX] &
++			~COLUMN_SPAN_MASK) |
++			(src->i.bits[COLUMN_SPAN_INDEX] & COLUMN_SPAN_MASK);
++}
++#undef COLUMN_SPAN_INDEX
++#undef COLUMN_SPAN_SHIFT
++#undef COLUMN_SPAN_MASK
++
++#define COLUMN_WIDTH_INDEX 8
++#define COLUMN_WIDTH_SHIFT 11
++#define COLUMN_WIDTH_MASK 0x3f800
++static inline void overlay_column_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COLUMN_WIDTH_INDEX] = (dst->i.bits[COLUMN_WIDTH_INDEX] &
++			~COLUMN_WIDTH_MASK) |
++			(src->i.bits[COLUMN_WIDTH_INDEX] & COLUMN_WIDTH_MASK);
++	dst->i.column_width = src->i.column_width;
++}
++#undef COLUMN_WIDTH_INDEX
++#undef COLUMN_WIDTH_SHIFT
++#undef COLUMN_WIDTH_MASK
++
++#define CONTENT_INDEX 19
++#define CONTENT_SHIFT 28
++#define CONTENT_MASK 0x30000000
++static inline void overlay_content(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[CONTENT_INDEX] = (dst->i.bits[CONTENT_INDEX] &
++			~CONTENT_MASK) |
++			(src->i.bits[CONTENT_INDEX] & CONTENT_MASK);
++	dst->content = src->content;
++}
++#undef CONTENT_INDEX
++#undef CONTENT_SHIFT
++#undef CONTENT_MASK
++
++#define COUNTER_INCREMENT_INDEX 23
++#define COUNTER_INCREMENT_SHIFT 18
++#define COUNTER_INCREMENT_MASK 0x40000
++static inline void overlay_counter_increment(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COUNTER_INCREMENT_INDEX] = (dst->i.bits[
++			COUNTER_INCREMENT_INDEX] & ~COUNTER_INCREMENT_MASK) |
++			(src->i.bits[COUNTER_INCREMENT_INDEX] & COUNTER_INCREMENT_MASK);
++	dst->counter_increment = src->counter_increment;
++}
++#undef COUNTER_INCREMENT_INDEX
++#undef COUNTER_INCREMENT_SHIFT
++#undef COUNTER_INCREMENT_MASK
++
++#define COUNTER_RESET_INDEX 23
++#define COUNTER_RESET_SHIFT 19
++#define COUNTER_RESET_MASK 0x80000
++static inline void overlay_counter_reset(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[COUNTER_RESET_INDEX] = (dst->i.bits[COUNTER_RESET_INDEX] &
++			~COUNTER_RESET_MASK) |
++			(src->i.bits[COUNTER_RESET_INDEX] & COUNTER_RESET_MASK);
++	dst->counter_reset = src->counter_reset;
++}
++#undef COUNTER_RESET_INDEX
++#undef COUNTER_RESET_SHIFT
++#undef COUNTER_RESET_MASK
++
++#define CURSOR_INDEX 9
++#define CURSOR_SHIFT 11
++#define CURSOR_MASK 0xf800
++static inline void overlay_cursor(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[CURSOR_INDEX] = (dst->i.bits[CURSOR_INDEX] & ~CURSOR_MASK) |
++			(src->i.bits[CURSOR_INDEX] & CURSOR_MASK);
++	dst->cursor = src->cursor;
++}
++#undef CURSOR_INDEX
++#undef CURSOR_SHIFT
++#undef CURSOR_MASK
++
++#define DIRECTION_INDEX 19
++#define DIRECTION_SHIFT 30
++#define DIRECTION_MASK 0xc0000000
++static inline void overlay_direction(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[DIRECTION_INDEX] = (dst->i.bits[DIRECTION_INDEX] &
++			~DIRECTION_MASK) |
++			(src->i.bits[DIRECTION_INDEX] & DIRECTION_MASK);
++}
++#undef DIRECTION_INDEX
++#undef DIRECTION_SHIFT
++#undef DIRECTION_MASK
++
++#define DISPLAY_INDEX 9
++#define DISPLAY_SHIFT 16
++#define DISPLAY_MASK 0x1f0000
++static inline void overlay_display(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[DISPLAY_INDEX] = (dst->i.bits[DISPLAY_INDEX] &
++			~DISPLAY_MASK) |
++			(src->i.bits[DISPLAY_INDEX] & DISPLAY_MASK);
++}
++#undef DISPLAY_INDEX
++#undef DISPLAY_SHIFT
++#undef DISPLAY_MASK
++
++#define EMPTY_CELLS_INDEX 18
++#define EMPTY_CELLS_SHIFT 0
++#define EMPTY_CELLS_MASK 0x3
++static inline void overlay_empty_cells(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[EMPTY_CELLS_INDEX] = (dst->i.bits[EMPTY_CELLS_INDEX] &
++			~EMPTY_CELLS_MASK) |
++			(src->i.bits[EMPTY_CELLS_INDEX] & EMPTY_CELLS_MASK);
++}
++#undef EMPTY_CELLS_INDEX
++#undef EMPTY_CELLS_SHIFT
++#undef EMPTY_CELLS_MASK
++
++#define FILL_INDEX 18
++#define FILL_SHIFT 2
++#define FILL_MASK 0xc
++static inline void overlay_fill(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FILL_INDEX] = (dst->i.bits[FILL_INDEX] & ~FILL_MASK) |
++			(src->i.bits[FILL_INDEX] & FILL_MASK);
++	dst->i.fill = src->i.fill;
++}
++#undef FILL_INDEX
++#undef FILL_SHIFT
++#undef FILL_MASK
++
++#define FILL_OPACITY_INDEX 23
++#define FILL_OPACITY_SHIFT 20
++#define FILL_OPACITY_MASK 0x100000
++static inline void overlay_fill_opacity(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FILL_OPACITY_INDEX] = (dst->i.bits[FILL_OPACITY_INDEX] &
++			~FILL_OPACITY_MASK) |
++			(src->i.bits[FILL_OPACITY_INDEX] & FILL_OPACITY_MASK);
++	dst->i.fill_opacity = src->i.fill_opacity;
++}
++#undef FILL_OPACITY_INDEX
++#undef FILL_OPACITY_SHIFT
++#undef FILL_OPACITY_MASK
++
++#define FILTER_INDEX 18
++#define FILTER_SHIFT 4
++#define FILTER_MASK 0x30
++static inline void overlay_filter(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FILTER_INDEX] = (dst->i.bits[FILTER_INDEX] & ~FILTER_MASK) |
++			(src->i.bits[FILTER_INDEX] & FILTER_MASK);
++	dst->i.filter = src->i.filter;
++}
++#undef FILTER_INDEX
++#undef FILTER_SHIFT
++#undef FILTER_MASK
++
++#define FLEX_BASIS_INDEX 8
++#define FLEX_BASIS_SHIFT 18
++#define FLEX_BASIS_MASK 0x1fc0000
++static inline void overlay_flex_basis(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FLEX_BASIS_INDEX] = (dst->i.bits[FLEX_BASIS_INDEX] &
++			~FLEX_BASIS_MASK) |
++			(src->i.bits[FLEX_BASIS_INDEX] & FLEX_BASIS_MASK);
++	dst->i.flex_basis = src->i.flex_basis;
++}
++#undef FLEX_BASIS_INDEX
++#undef FLEX_BASIS_SHIFT
++#undef FLEX_BASIS_MASK
++
++#define FLEX_DIRECTION_INDEX 16
++#define FLEX_DIRECTION_SHIFT 5
++#define FLEX_DIRECTION_MASK 0xe0
++static inline void overlay_flex_direction(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FLEX_DIRECTION_INDEX] = (dst->i.bits[FLEX_DIRECTION_INDEX]
++			& ~FLEX_DIRECTION_MASK) |
++			(src->i.bits[FLEX_DIRECTION_INDEX] & FLEX_DIRECTION_MASK);
++}
++#undef FLEX_DIRECTION_INDEX
++#undef FLEX_DIRECTION_SHIFT
++#undef FLEX_DIRECTION_MASK
++
++#define FLEX_GROW_INDEX 23
++#define FLEX_GROW_SHIFT 21
++#define FLEX_GROW_MASK 0x200000
++static inline void overlay_flex_grow(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FLEX_GROW_INDEX] = (dst->i.bits[FLEX_GROW_INDEX] &
++			~FLEX_GROW_MASK) |
++			(src->i.bits[FLEX_GROW_INDEX] & FLEX_GROW_MASK);
++	dst->i.flex_grow = src->i.flex_grow;
++}
++#undef FLEX_GROW_INDEX
++#undef FLEX_GROW_SHIFT
++#undef FLEX_GROW_MASK
++
++#define FLEX_SHRINK_INDEX 23
++#define FLEX_SHRINK_SHIFT 22
++#define FLEX_SHRINK_MASK 0x400000
++static inline void overlay_flex_shrink(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FLEX_SHRINK_INDEX] = (dst->i.bits[FLEX_SHRINK_INDEX] &
++			~FLEX_SHRINK_MASK) |
++			(src->i.bits[FLEX_SHRINK_INDEX] & FLEX_SHRINK_MASK);
++	dst->i.flex_shrink = src->i.flex_shrink;
++}
++#undef FLEX_SHRINK_INDEX
++#undef FLEX_SHRINK_SHIFT
++#undef FLEX_SHRINK_MASK
++
++#define FLEX_WRAP_INDEX 18
++#define FLEX_WRAP_SHIFT 6
++#define FLEX_WRAP_MASK 0xc0
++static inline void overlay_flex_wrap(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FLEX_WRAP_INDEX] = (dst->i.bits[FLEX_WRAP_INDEX] &
++			~FLEX_WRAP_MASK) |
++			(src->i.bits[FLEX_WRAP_INDEX] & FLEX_WRAP_MASK);
++}
++#undef FLEX_WRAP_INDEX
++#undef FLEX_WRAP_SHIFT
++#undef FLEX_WRAP_MASK
++
++#define FLOAT_INDEX 18
++#define FLOAT_SHIFT 8
++#define FLOAT_MASK 0x300
++static inline void overlay_float(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FLOAT_INDEX] = (dst->i.bits[FLOAT_INDEX] & ~FLOAT_MASK) |
++			(src->i.bits[FLOAT_INDEX] & FLOAT_MASK);
++}
++#undef FLOAT_INDEX
++#undef FLOAT_SHIFT
++#undef FLOAT_MASK
++
++#define FONT_FAMILY_INDEX 16
++#define FONT_FAMILY_SHIFT 8
++#define FONT_FAMILY_MASK 0x700
++static inline void overlay_font_family(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FONT_FAMILY_INDEX] = (dst->i.bits[FONT_FAMILY_INDEX] &
++			~FONT_FAMILY_MASK) |
++			(src->i.bits[FONT_FAMILY_INDEX] & FONT_FAMILY_MASK);
++	dst->font_family = src->font_family;
++}
++#undef FONT_FAMILY_INDEX
++#undef FONT_FAMILY_SHIFT
++#undef FONT_FAMILY_MASK
++
++#define FONT_SIZE_INDEX 20
++#define FONT_SIZE_SHIFT 1
++#define FONT_SIZE_MASK 0x3fe
++static inline void overlay_font_size(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FONT_SIZE_INDEX] = (dst->i.bits[FONT_SIZE_INDEX] &
++			~FONT_SIZE_MASK) |
++			(src->i.bits[FONT_SIZE_INDEX] & FONT_SIZE_MASK);
++	dst->i.font_size = src->i.font_size;
++}
++#undef FONT_SIZE_INDEX
++#undef FONT_SIZE_SHIFT
++#undef FONT_SIZE_MASK
++
++#define FONT_STYLE_INDEX 18
++#define FONT_STYLE_SHIFT 10
++#define FONT_STYLE_MASK 0xc00
++static inline void overlay_font_style(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FONT_STYLE_INDEX] = (dst->i.bits[FONT_STYLE_INDEX] &
++			~FONT_STYLE_MASK) |
++			(src->i.bits[FONT_STYLE_INDEX] & FONT_STYLE_MASK);
++}
++#undef FONT_STYLE_INDEX
++#undef FONT_STYLE_SHIFT
++#undef FONT_STYLE_MASK
++
++#define FONT_VARIANT_INDEX 18
++#define FONT_VARIANT_SHIFT 12
++#define FONT_VARIANT_MASK 0x3000
++static inline void overlay_font_variant(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FONT_VARIANT_INDEX] = (dst->i.bits[FONT_VARIANT_INDEX] &
++			~FONT_VARIANT_MASK) |
++			(src->i.bits[FONT_VARIANT_INDEX] & FONT_VARIANT_MASK);
++}
++#undef FONT_VARIANT_INDEX
++#undef FONT_VARIANT_SHIFT
++#undef FONT_VARIANT_MASK
++
++#define FONT_WEIGHT_INDEX 6
++#define FONT_WEIGHT_SHIFT 0
++#define FONT_WEIGHT_MASK 0xf
++static inline void overlay_font_weight(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[FONT_WEIGHT_INDEX] = (dst->i.bits[FONT_WEIGHT_INDEX] &
++			~FONT_WEIGHT_MASK) |
++			(src->i.bits[FONT_WEIGHT_INDEX] & FONT_WEIGHT_MASK);
++}
++#undef FONT_WEIGHT_INDEX
++#undef FONT_WEIGHT_SHIFT
++#undef FONT_WEIGHT_MASK
++
++#define GRID_AUTO_COLUMNS_INDEX 18
++#define GRID_AUTO_COLUMNS_SHIFT 14
++#define GRID_AUTO_COLUMNS_MASK 0xc000
++static inline void overlay_grid_auto_columns(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_AUTO_COLUMNS_INDEX] = (dst->i.bits[
++			GRID_AUTO_COLUMNS_INDEX] & ~GRID_AUTO_COLUMNS_MASK) |
++			(src->i.bits[GRID_AUTO_COLUMNS_INDEX] & GRID_AUTO_COLUMNS_MASK);
++	dst->grid_auto_columns = src->grid_auto_columns;
++}
++#undef GRID_AUTO_COLUMNS_INDEX
++#undef GRID_AUTO_COLUMNS_SHIFT
++#undef GRID_AUTO_COLUMNS_MASK
++
++#define GRID_AUTO_FLOW_INDEX 16
++#define GRID_AUTO_FLOW_SHIFT 11
++#define GRID_AUTO_FLOW_MASK 0x3800
++static inline void overlay_grid_auto_flow(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_AUTO_FLOW_INDEX] = (dst->i.bits[GRID_AUTO_FLOW_INDEX]
++			& ~GRID_AUTO_FLOW_MASK) |
++			(src->i.bits[GRID_AUTO_FLOW_INDEX] & GRID_AUTO_FLOW_MASK);
++}
++#undef GRID_AUTO_FLOW_INDEX
++#undef GRID_AUTO_FLOW_SHIFT
++#undef GRID_AUTO_FLOW_MASK
++
++#define GRID_AUTO_ROWS_INDEX 18
++#define GRID_AUTO_ROWS_SHIFT 16
++#define GRID_AUTO_ROWS_MASK 0x30000
++static inline void overlay_grid_auto_rows(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_AUTO_ROWS_INDEX] = (dst->i.bits[GRID_AUTO_ROWS_INDEX]
++			& ~GRID_AUTO_ROWS_MASK) |
++			(src->i.bits[GRID_AUTO_ROWS_INDEX] & GRID_AUTO_ROWS_MASK);
++	dst->grid_auto_rows = src->grid_auto_rows;
++}
++#undef GRID_AUTO_ROWS_INDEX
++#undef GRID_AUTO_ROWS_SHIFT
++#undef GRID_AUTO_ROWS_MASK
++
++#define GRID_COLUMN_END_INDEX 18
++#define GRID_COLUMN_END_SHIFT 18
++#define GRID_COLUMN_END_MASK 0xc0000
++static inline void overlay_grid_column_end(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_COLUMN_END_INDEX] = (dst->i.bits[
++			GRID_COLUMN_END_INDEX] & ~GRID_COLUMN_END_MASK) |
++			(src->i.bits[GRID_COLUMN_END_INDEX] & GRID_COLUMN_END_MASK);
++	dst->i.grid_column_end = src->i.grid_column_end;
++}
++#undef GRID_COLUMN_END_INDEX
++#undef GRID_COLUMN_END_SHIFT
++#undef GRID_COLUMN_END_MASK
++
++#define GRID_COLUMN_START_INDEX 18
++#define GRID_COLUMN_START_SHIFT 20
++#define GRID_COLUMN_START_MASK 0x300000
++static inline void overlay_grid_column_start(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_COLUMN_START_INDEX] = (dst->i.bits[
++			GRID_COLUMN_START_INDEX] & ~GRID_COLUMN_START_MASK) |
++			(src->i.bits[GRID_COLUMN_START_INDEX] & GRID_COLUMN_START_MASK);
++	dst->i.grid_column_start = src->i.grid_column_start;
++}
++#undef GRID_COLUMN_START_INDEX
++#undef GRID_COLUMN_START_SHIFT
++#undef GRID_COLUMN_START_MASK
++
++#define GRID_ROW_END_INDEX 18
++#define GRID_ROW_END_SHIFT 22
++#define GRID_ROW_END_MASK 0xc00000
++static inline void overlay_grid_row_end(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_ROW_END_INDEX] = (dst->i.bits[GRID_ROW_END_INDEX] &
++			~GRID_ROW_END_MASK) |
++			(src->i.bits[GRID_ROW_END_INDEX] & GRID_ROW_END_MASK);
++	dst->i.grid_row_end = src->i.grid_row_end;
++}
++#undef GRID_ROW_END_INDEX
++#undef GRID_ROW_END_SHIFT
++#undef GRID_ROW_END_MASK
++
++#define GRID_ROW_START_INDEX 18
++#define GRID_ROW_START_SHIFT 24
++#define GRID_ROW_START_MASK 0x3000000
++static inline void overlay_grid_row_start(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_ROW_START_INDEX] = (dst->i.bits[GRID_ROW_START_INDEX]
++			& ~GRID_ROW_START_MASK) |
++			(src->i.bits[GRID_ROW_START_INDEX] & GRID_ROW_START_MASK);
++	dst->i.grid_row_start = src->i.grid_row_start;
++}
++#undef GRID_ROW_START_INDEX
++#undef GRID_ROW_START_SHIFT
++#undef GRID_ROW_START_MASK
++
++#define GRID_TEMPLATE_COLUMNS_INDEX 18
++#define GRID_TEMPLATE_COLUMNS_SHIFT 26
++#define GRID_TEMPLATE_COLUMNS_MASK 0xc000000
++static inline void overlay_grid_template_columns(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_TEMPLATE_COLUMNS_INDEX] = (dst->i.bits[
++			GRID_TEMPLATE_COLUMNS_INDEX] &
++			~GRID_TEMPLATE_COLUMNS_MASK) |
++			(src->i.bits[GRID_TEMPLATE_COLUMNS_INDEX] &
++			GRID_TEMPLATE_COLUMNS_MASK);
++	dst->grid_template_columns = src->grid_template_columns;
++}
++#undef GRID_TEMPLATE_COLUMNS_INDEX
++#undef GRID_TEMPLATE_COLUMNS_SHIFT
++#undef GRID_TEMPLATE_COLUMNS_MASK
++
++#define GRID_TEMPLATE_ROWS_INDEX 18
++#define GRID_TEMPLATE_ROWS_SHIFT 28
++#define GRID_TEMPLATE_ROWS_MASK 0x30000000
++static inline void overlay_grid_template_rows(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[GRID_TEMPLATE_ROWS_INDEX] = (dst->i.bits[
++			GRID_TEMPLATE_ROWS_INDEX] & ~GRID_TEMPLATE_ROWS_MASK) |
++			(src->i.bits[GRID_TEMPLATE_ROWS_INDEX] & GRID_TEMPLATE_ROWS_MASK);
++	dst->grid_template_rows = src->grid_template_rows;
++}
++#undef GRID_TEMPLATE_ROWS_INDEX
++#undef GRID_TEMPLATE_ROWS_SHIFT
++#undef GRID_TEMPLATE_ROWS_MASK
++
++#define HEIGHT_INDEX 8
++#define HEIGHT_SHIFT 25
++#define HEIGHT_MASK 0xfe000000
++static inline void overlay_height(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[HEIGHT_INDEX] = (dst->i.bits[HEIGHT_INDEX] & ~HEIGHT_MASK) |
++			(src->i.bits[HEIGHT_INDEX] & HEIGHT_MASK);
++	dst->i.height = src->i.height;
++}
++#undef HEIGHT_INDEX
++#undef HEIGHT_SHIFT
++#undef HEIGHT_MASK
++
++#define JUSTIFY_CONTENT_INDEX 16
++#define JUSTIFY_CONTENT_SHIFT 14
++#define JUSTIFY_CONTENT_MASK 0x1c000
++static inline void overlay_justify_content(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[JUSTIFY_CONTENT_INDEX] = (dst->i.bits[
++			JUSTIFY_CONTENT_INDEX] & ~JUSTIFY_CONTENT_MASK) |
++			(src->i.bits[JUSTIFY_CONTENT_INDEX] & JUSTIFY_CONTENT_MASK);
++}
++#undef JUSTIFY_CONTENT_INDEX
++#undef JUSTIFY_CONTENT_SHIFT
++#undef JUSTIFY_CONTENT_MASK
++
++#define JUSTIFY_ITEMS_INDEX 16
++#define JUSTIFY_ITEMS_SHIFT 17
++#define JUSTIFY_ITEMS_MASK 0xe0000
++static inline void overlay_justify_items(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[JUSTIFY_ITEMS_INDEX] = (dst->i.bits[JUSTIFY_ITEMS_INDEX] &
++			~JUSTIFY_ITEMS_MASK) |
++			(src->i.bits[JUSTIFY_ITEMS_INDEX] & JUSTIFY_ITEMS_MASK);
++}
++#undef JUSTIFY_ITEMS_INDEX
++#undef JUSTIFY_ITEMS_SHIFT
++#undef JUSTIFY_ITEMS_MASK
++
++#define JUSTIFY_SELF_INDEX 16
++#define JUSTIFY_SELF_SHIFT 20
++#define JUSTIFY_SELF_MASK 0x700000
++static inline void overlay_justify_self(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[JUSTIFY_SELF_INDEX] = (dst->i.bits[JUSTIFY_SELF_INDEX] &
++			~JUSTIFY_SELF_MASK) |
++			(src->i.bits[JUSTIFY_SELF_INDEX] & JUSTIFY_SELF_MASK);
++}
++#undef JUSTIFY_SELF_INDEX
++#undef JUSTIFY_SELF_SHIFT
++#undef JUSTIFY_SELF_MASK
++
++#define LEFT_INDEX 7
++#define LEFT_SHIFT 4
++#define LEFT_MASK 0x7f0
++static inline void overlay_left(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[LEFT_INDEX] = (dst->i.bits[LEFT_INDEX] & ~LEFT_MASK) |
++			(src->i.bits[LEFT_INDEX] & LEFT_MASK);
++	dst->i.left = src->i.left;
++}
++#undef LEFT_INDEX
++#undef LEFT_SHIFT
++#undef LEFT_MASK
++
++#define LETTER_SPACING_INDEX 7
++#define LETTER_SPACING_SHIFT 11
++#define LETTER_SPACING_MASK 0x3f800
++static inline void overlay_letter_spacing(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[LETTER_SPACING_INDEX] = (dst->i.bits[LETTER_SPACING_INDEX]
++			& ~LETTER_SPACING_MASK) |
++			(src->i.bits[LETTER_SPACING_INDEX] & LETTER_SPACING_MASK);
++	dst->i.letter_spacing = src->i.letter_spacing;
++}
++#undef LETTER_SPACING_INDEX
++#undef LETTER_SPACING_SHIFT
++#undef LETTER_SPACING_MASK
++
++#define LINE_CLAMP_INDEX 18
++#define LINE_CLAMP_SHIFT 30
++#define LINE_CLAMP_MASK 0xc0000000
++static inline void overlay_line_clamp(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[LINE_CLAMP_INDEX] = (dst->i.bits[LINE_CLAMP_INDEX] &
++			~LINE_CLAMP_MASK) |
++			(src->i.bits[LINE_CLAMP_INDEX] & LINE_CLAMP_MASK);
++	dst->i.line_clamp = src->i.line_clamp;
++}
++#undef LINE_CLAMP_INDEX
++#undef LINE_CLAMP_SHIFT
++#undef LINE_CLAMP_MASK
++
++#define LINE_HEIGHT_INDEX 7
++#define LINE_HEIGHT_SHIFT 18
++#define LINE_HEIGHT_MASK 0x1fc0000
++static inline void overlay_line_height(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[LINE_HEIGHT_INDEX] = (dst->i.bits[LINE_HEIGHT_INDEX] &
++			~LINE_HEIGHT_MASK) |
++			(src->i.bits[LINE_HEIGHT_INDEX] & LINE_HEIGHT_MASK);
++	dst->i.line_height = src->i.line_height;
++}
++#undef LINE_HEIGHT_INDEX
++#undef LINE_HEIGHT_SHIFT
++#undef LINE_HEIGHT_MASK
++
++#define LIST_STYLE_IMAGE_INDEX 23
++#define LIST_STYLE_IMAGE_SHIFT 23
++#define LIST_STYLE_IMAGE_MASK 0x800000
++static inline void overlay_list_style_image(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[LIST_STYLE_IMAGE_INDEX] = (dst->i.bits[
++			LIST_STYLE_IMAGE_INDEX] & ~LIST_STYLE_IMAGE_MASK) |
++			(src->i.bits[LIST_STYLE_IMAGE_INDEX] & LIST_STYLE_IMAGE_MASK);
++	dst->i.list_style_image = src->i.list_style_image;
++}
++#undef LIST_STYLE_IMAGE_INDEX
++#undef LIST_STYLE_IMAGE_SHIFT
++#undef LIST_STYLE_IMAGE_MASK
++
++#define LIST_STYLE_POSITION_INDEX 17
++#define LIST_STYLE_POSITION_SHIFT 0
++#define LIST_STYLE_POSITION_MASK 0x3
++static inline void overlay_list_style_position(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[LIST_STYLE_POSITION_INDEX] = (dst->i.bits[
++			LIST_STYLE_POSITION_INDEX] & ~LIST_STYLE_POSITION_MASK)
++			|
++			(src->i.bits[LIST_STYLE_POSITION_INDEX] & LIST_STYLE_POSITION_MASK);
++}
++#undef LIST_STYLE_POSITION_INDEX
++#undef LIST_STYLE_POSITION_SHIFT
++#undef LIST_STYLE_POSITION_MASK
++
++#define LIST_STYLE_TYPE_INDEX 9
++#define LIST_STYLE_TYPE_SHIFT 26
++#define LIST_STYLE_TYPE_MASK 0xfc000000
++static inline void overlay_list_style_type(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[LIST_STYLE_TYPE_INDEX] = (dst->i.bits[
++			LIST_STYLE_TYPE_INDEX] & ~LIST_STYLE_TYPE_MASK) |
++			(src->i.bits[LIST_STYLE_TYPE_INDEX] & LIST_STYLE_TYPE_MASK);
++}
++#undef LIST_STYLE_TYPE_INDEX
++#undef LIST_STYLE_TYPE_SHIFT
++#undef LIST_STYLE_TYPE_MASK
++
++#define MARGIN_BOTTOM_INDEX 7
++#define MARGIN_BOTTOM_SHIFT 25
++#define MARGIN_BOTTOM_MASK 0xfe000000
++static inline void overlay_margin_bottom(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MARGIN_BOTTOM_INDEX] = (dst->i.bits[MARGIN_BOTTOM_INDEX] &
++			~MARGIN_BOTTOM_MASK) |
++			(src->i.bits[MARGIN_BOTTOM_INDEX] & MARGIN_BOTTOM_MASK);
++	dst->i.margin_bottom = src->i.margin_bottom;
++}
++#undef MARGIN_BOTTOM_INDEX
++#undef MARGIN_BOTTOM_SHIFT
++#undef MARGIN_BOTTOM_MASK
++
++#define MARGIN_LEFT_INDEX 6
++#define MARGIN_LEFT_SHIFT 4
++#define MARGIN_LEFT_MASK 0x7f0
++static inline void overlay_margin_left(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MARGIN_LEFT_INDEX] = (dst->i.bits[MARGIN_LEFT_INDEX] &
++			~MARGIN_LEFT_MASK) |
++			(src->i.bits[MARGIN_LEFT_INDEX] & MARGIN_LEFT_MASK);
++	dst->i.margin_left = src->i.margin_left;
++}
++#undef MARGIN_LEFT_INDEX
++#undef MARGIN_LEFT_SHIFT
++#undef MARGIN_LEFT_MASK
++
++#define MARGIN_RIGHT_INDEX 6
++#define MARGIN_RIGHT_SHIFT 11
++#define MARGIN_RIGHT_MASK 0x3f800
++static inline void overlay_margin_right(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MARGIN_RIGHT_INDEX] = (dst->i.bits[MARGIN_RIGHT_INDEX] &
++			~MARGIN_RIGHT_MASK) |
++			(src->i.bits[MARGIN_RIGHT_INDEX] & MARGIN_RIGHT_MASK);
++	dst->i.margin_right = src->i.margin_right;
++}
++#undef MARGIN_RIGHT_INDEX
++#undef MARGIN_RIGHT_SHIFT
++#undef MARGIN_RIGHT_MASK
++
++#define MARGIN_TOP_INDEX 6
++#define MARGIN_TOP_SHIFT 18
++#define MARGIN_TOP_MASK 0x1fc0000
++static inline void overlay_margin_top(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MARGIN_TOP_INDEX] = (dst->i.bits[MARGIN_TOP_INDEX] &
++			~MARGIN_TOP_MASK) |
++			(src->i.bits[MARGIN_TOP_INDEX] & MARGIN_TOP_MASK);
++	dst->i.margin_top = src->i.margin_top;
++}
++#undef MARGIN_TOP_INDEX
++#undef MARGIN_TOP_SHIFT
++#undef MARGIN_TOP_MASK
++
++#define MASK_IMAGE_INDEX 23
++#define MASK_IMAGE_SHIFT 24
++#define MASK_IMAGE_MASK 0x1000000
++static inline void overlay_mask_image(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MASK_IMAGE_INDEX] = (dst->i.bits[MASK_IMAGE_INDEX] &
++			~MASK_IMAGE_MASK) |
++			(src->i.bits[MASK_IMAGE_INDEX] & MASK_IMAGE_MASK);
++	dst->i.mask_image = src->i.mask_image;
++}
++#undef MASK_IMAGE_INDEX
++#undef MASK_IMAGE_SHIFT
++#undef MASK_IMAGE_MASK
++
++#define MASK_POSITION_INDEX 0
++#define MASK_POSITION_SHIFT 20
++#define MASK_POSITION_MASK 0xfff00000
++static inline void overlay_mask_position(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MASK_POSITION_INDEX] = (dst->i.bits[MASK_POSITION_INDEX] &
++			~MASK_POSITION_MASK) |
++			(src->i.bits[MASK_POSITION_INDEX] & MASK_POSITION_MASK);
++	dst->i.mask_position_a = src->i.mask_position_a;
++	dst->i.mask_position_b = src->i.mask_position_b;
++}
++#undef MASK_POSITION_INDEX
++#undef MASK_POSITION_SHIFT
++#undef MASK_POSITION_MASK
++
++#define MASK_SIZE_INDEX 10
++#define MASK_SIZE_SHIFT 2
++#define MASK_SIZE_MASK 0x7ffc
++static inline void overlay_mask_size(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MASK_SIZE_INDEX] = (dst->i.bits[MASK_SIZE_INDEX] &
++			~MASK_SIZE_MASK) |
++			(src->i.bits[MASK_SIZE_INDEX] & MASK_SIZE_MASK);
++	dst->i.mask_size_a = src->i.mask_size_a;
++	dst->i.mask_size_b = src->i.mask_size_b;
++}
++#undef MASK_SIZE_INDEX
++#undef MASK_SIZE_SHIFT
++#undef MASK_SIZE_MASK
++
++#define MAX_HEIGHT_INDEX 6
++#define MAX_HEIGHT_SHIFT 25
++#define MAX_HEIGHT_MASK 0xfe000000
++static inline void overlay_max_height(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MAX_HEIGHT_INDEX] = (dst->i.bits[MAX_HEIGHT_INDEX] &
++			~MAX_HEIGHT_MASK) |
++			(src->i.bits[MAX_HEIGHT_INDEX] & MAX_HEIGHT_MASK);
++	dst->i.max_height = src->i.max_height;
++}
++#undef MAX_HEIGHT_INDEX
++#undef MAX_HEIGHT_SHIFT
++#undef MAX_HEIGHT_MASK
++
++#define MAX_WIDTH_INDEX 5
++#define MAX_WIDTH_SHIFT 4
++#define MAX_WIDTH_MASK 0x7f0
++static inline void overlay_max_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MAX_WIDTH_INDEX] = (dst->i.bits[MAX_WIDTH_INDEX] &
++			~MAX_WIDTH_MASK) |
++			(src->i.bits[MAX_WIDTH_INDEX] & MAX_WIDTH_MASK);
++	dst->i.max_width = src->i.max_width;
++}
++#undef MAX_WIDTH_INDEX
++#undef MAX_WIDTH_SHIFT
++#undef MAX_WIDTH_MASK
++
++#define MIN_HEIGHT_INDEX 5
++#define MIN_HEIGHT_SHIFT 11
++#define MIN_HEIGHT_MASK 0x3f800
++static inline void overlay_min_height(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MIN_HEIGHT_INDEX] = (dst->i.bits[MIN_HEIGHT_INDEX] &
++			~MIN_HEIGHT_MASK) |
++			(src->i.bits[MIN_HEIGHT_INDEX] & MIN_HEIGHT_MASK);
++	dst->i.min_height = src->i.min_height;
++}
++#undef MIN_HEIGHT_INDEX
++#undef MIN_HEIGHT_SHIFT
++#undef MIN_HEIGHT_MASK
++
++#define MIN_WIDTH_INDEX 5
++#define MIN_WIDTH_SHIFT 18
++#define MIN_WIDTH_MASK 0x1fc0000
++static inline void overlay_min_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[MIN_WIDTH_INDEX] = (dst->i.bits[MIN_WIDTH_INDEX] &
++			~MIN_WIDTH_MASK) |
++			(src->i.bits[MIN_WIDTH_INDEX] & MIN_WIDTH_MASK);
++	dst->i.min_width = src->i.min_width;
++}
++#undef MIN_WIDTH_INDEX
++#undef MIN_WIDTH_SHIFT
++#undef MIN_WIDTH_MASK
++
++#define OBJECT_FIT_INDEX 16
++#define OBJECT_FIT_SHIFT 23
++#define OBJECT_FIT_MASK 0x3800000
++static inline void overlay_object_fit(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OBJECT_FIT_INDEX] = (dst->i.bits[OBJECT_FIT_INDEX] &
++			~OBJECT_FIT_MASK) |
++			(src->i.bits[OBJECT_FIT_INDEX] & OBJECT_FIT_MASK);
++}
++#undef OBJECT_FIT_INDEX
++#undef OBJECT_FIT_SHIFT
++#undef OBJECT_FIT_MASK
++
++#define OBJECT_POSITION_INDEX 13
++#define OBJECT_POSITION_SHIFT 21
++#define OBJECT_POSITION_MASK 0xffe00000
++static inline void overlay_object_position(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OBJECT_POSITION_INDEX] = (dst->i.bits[
++			OBJECT_POSITION_INDEX] & ~OBJECT_POSITION_MASK) |
++			(src->i.bits[OBJECT_POSITION_INDEX] & OBJECT_POSITION_MASK);
++	dst->i.object_position_a = src->i.object_position_a;
++	dst->i.object_position_b = src->i.object_position_b;
++}
++#undef OBJECT_POSITION_INDEX
++#undef OBJECT_POSITION_SHIFT
++#undef OBJECT_POSITION_MASK
++
++#define OPACITY_INDEX 23
++#define OPACITY_SHIFT 25
++#define OPACITY_MASK 0x2000000
++static inline void overlay_opacity(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OPACITY_INDEX] = (dst->i.bits[OPACITY_INDEX] &
++			~OPACITY_MASK) |
++			(src->i.bits[OPACITY_INDEX] & OPACITY_MASK);
++	dst->i.opacity = src->i.opacity;
++}
++#undef OPACITY_INDEX
++#undef OPACITY_SHIFT
++#undef OPACITY_MASK
++
++#define ORDER_INDEX 23
++#define ORDER_SHIFT 26
++#define ORDER_MASK 0x4000000
++static inline void overlay_order(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ORDER_INDEX] = (dst->i.bits[ORDER_INDEX] & ~ORDER_MASK) |
++			(src->i.bits[ORDER_INDEX] & ORDER_MASK);
++	dst->i.order = src->i.order;
++}
++#undef ORDER_INDEX
++#undef ORDER_SHIFT
++#undef ORDER_MASK
++
++#define ORPHANS_INDEX 23
++#define ORPHANS_SHIFT 27
++#define ORPHANS_MASK 0x8000000
++static inline void overlay_orphans(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ORPHANS_INDEX] = (dst->i.bits[ORPHANS_INDEX] &
++			~ORPHANS_MASK) |
++			(src->i.bits[ORPHANS_INDEX] & ORPHANS_MASK);
++	dst->i.orphans = src->i.orphans;
++}
++#undef ORPHANS_INDEX
++#undef ORPHANS_SHIFT
++#undef ORPHANS_MASK
++
++#define OUTLINE_COLOR_INDEX 17
++#define OUTLINE_COLOR_SHIFT 2
++#define OUTLINE_COLOR_MASK 0xc
++static inline void overlay_outline_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OUTLINE_COLOR_INDEX] = (dst->i.bits[OUTLINE_COLOR_INDEX] &
++			~OUTLINE_COLOR_MASK) |
++			(src->i.bits[OUTLINE_COLOR_INDEX] & OUTLINE_COLOR_MASK);
++	dst->i.outline_color = src->i.outline_color;
++}
++#undef OUTLINE_COLOR_INDEX
++#undef OUTLINE_COLOR_SHIFT
++#undef OUTLINE_COLOR_MASK
++
++#define OUTLINE_STYLE_INDEX 5
++#define OUTLINE_STYLE_SHIFT 0
++#define OUTLINE_STYLE_MASK 0xf
++static inline void overlay_outline_style(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OUTLINE_STYLE_INDEX] = (dst->i.bits[OUTLINE_STYLE_INDEX] &
++			~OUTLINE_STYLE_MASK) |
++			(src->i.bits[OUTLINE_STYLE_INDEX] & OUTLINE_STYLE_MASK);
++}
++#undef OUTLINE_STYLE_INDEX
++#undef OUTLINE_STYLE_SHIFT
++#undef OUTLINE_STYLE_MASK
++
++#define OUTLINE_WIDTH_INDEX 11
++#define OUTLINE_WIDTH_SHIFT 2
++#define OUTLINE_WIDTH_MASK 0x3fc
++static inline void overlay_outline_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OUTLINE_WIDTH_INDEX] = (dst->i.bits[OUTLINE_WIDTH_INDEX] &
++			~OUTLINE_WIDTH_MASK) |
++			(src->i.bits[OUTLINE_WIDTH_INDEX] & OUTLINE_WIDTH_MASK);
++	dst->i.outline_width = src->i.outline_width;
++}
++#undef OUTLINE_WIDTH_INDEX
++#undef OUTLINE_WIDTH_SHIFT
++#undef OUTLINE_WIDTH_MASK
++
++#define OVERFLOW_WRAP_INDEX 17
++#define OVERFLOW_WRAP_SHIFT 4
++#define OVERFLOW_WRAP_MASK 0x30
++static inline void overlay_overflow_wrap(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OVERFLOW_WRAP_INDEX] = (dst->i.bits[OVERFLOW_WRAP_INDEX] &
++			~OVERFLOW_WRAP_MASK) |
++			(src->i.bits[OVERFLOW_WRAP_INDEX] & OVERFLOW_WRAP_MASK);
++}
++#undef OVERFLOW_WRAP_INDEX
++#undef OVERFLOW_WRAP_SHIFT
++#undef OVERFLOW_WRAP_MASK
++
++#define OVERFLOW_X_INDEX 16
++#define OVERFLOW_X_SHIFT 26
++#define OVERFLOW_X_MASK 0x1c000000
++static inline void overlay_overflow_x(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OVERFLOW_X_INDEX] = (dst->i.bits[OVERFLOW_X_INDEX] &
++			~OVERFLOW_X_MASK) |
++			(src->i.bits[OVERFLOW_X_INDEX] & OVERFLOW_X_MASK);
++}
++#undef OVERFLOW_X_INDEX
++#undef OVERFLOW_X_SHIFT
++#undef OVERFLOW_X_MASK
++
++#define OVERFLOW_Y_INDEX 16
++#define OVERFLOW_Y_SHIFT 29
++#define OVERFLOW_Y_MASK 0xe0000000
++static inline void overlay_overflow_y(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[OVERFLOW_Y_INDEX] = (dst->i.bits[OVERFLOW_Y_INDEX] &
++			~OVERFLOW_Y_MASK) |
++			(src->i.bits[OVERFLOW_Y_INDEX] & OVERFLOW_Y_MASK);
++}
++#undef OVERFLOW_Y_INDEX
++#undef OVERFLOW_Y_SHIFT
++#undef OVERFLOW_Y_MASK
++
++#define PADDING_BOTTOM_INDEX 21
++#define PADDING_BOTTOM_SHIFT 1
++#define PADDING_BOTTOM_MASK 0x7e
++static inline void overlay_padding_bottom(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[PADDING_BOTTOM_INDEX] = (dst->i.bits[PADDING_BOTTOM_INDEX]
++			& ~PADDING_BOTTOM_MASK) |
++			(src->i.bits[PADDING_BOTTOM_INDEX] & PADDING_BOTTOM_MASK);
++	dst->i.padding_bottom = src->i.padding_bottom;
++}
++#undef PADDING_BOTTOM_INDEX
++#undef PADDING_BOTTOM_SHIFT
++#undef PADDING_BOTTOM_MASK
++
++#define PADDING_LEFT_INDEX 21
++#define PADDING_LEFT_SHIFT 7
++#define PADDING_LEFT_MASK 0x1f80
++static inline void overlay_padding_left(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[PADDING_LEFT_INDEX] = (dst->i.bits[PADDING_LEFT_INDEX] &
++			~PADDING_LEFT_MASK) |
++			(src->i.bits[PADDING_LEFT_INDEX] & PADDING_LEFT_MASK);
++	dst->i.padding_left = src->i.padding_left;
++}
++#undef PADDING_LEFT_INDEX
++#undef PADDING_LEFT_SHIFT
++#undef PADDING_LEFT_MASK
++
++#define PADDING_RIGHT_INDEX 21
++#define PADDING_RIGHT_SHIFT 13
++#define PADDING_RIGHT_MASK 0x7e000
++static inline void overlay_padding_right(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[PADDING_RIGHT_INDEX] = (dst->i.bits[PADDING_RIGHT_INDEX] &
++			~PADDING_RIGHT_MASK) |
++			(src->i.bits[PADDING_RIGHT_INDEX] & PADDING_RIGHT_MASK);
++	dst->i.padding_right = src->i.padding_right;
++}
++#undef PADDING_RIGHT_INDEX
++#undef PADDING_RIGHT_SHIFT
++#undef PADDING_RIGHT_MASK
++
++#define PADDING_TOP_INDEX 21
++#define PADDING_TOP_SHIFT 19
++#define PADDING_TOP_MASK 0x1f80000
++static inline void overlay_padding_top(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[PADDING_TOP_INDEX] = (dst->i.bits[PADDING_TOP_INDEX] &
++			~PADDING_TOP_MASK) |
++			(src->i.bits[PADDING_TOP_INDEX] & PADDING_TOP_MASK);
++	dst->i.padding_top = src->i.padding_top;
++}
++#undef PADDING_TOP_INDEX
++#undef PADDING_TOP_SHIFT
++#undef PADDING_TOP_MASK
++
++#define PAGE_BREAK_AFTER_INDEX 22
++#define PAGE_BREAK_AFTER_SHIFT 1
++#define PAGE_BREAK_AFTER_MASK 0xe
++static inline void overlay_page_break_after(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[PAGE_BREAK_AFTER_INDEX] = (dst->i.bits[
++			PAGE_BREAK_AFTER_INDEX] & ~PAGE_BREAK_AFTER_MASK) |
++			(src->i.bits[PAGE_BREAK_AFTER_INDEX] & PAGE_BREAK_AFTER_MASK);
++}
++#undef PAGE_BREAK_AFTER_INDEX
++#undef PAGE_BREAK_AFTER_SHIFT
++#undef PAGE_BREAK_AFTER_MASK
++
++#define PAGE_BREAK_BEFORE_INDEX 22
++#define PAGE_BREAK_BEFORE_SHIFT 4
++#define PAGE_BREAK_BEFORE_MASK 0x70
++static inline void overlay_page_break_before(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[PAGE_BREAK_BEFORE_INDEX] = (dst->i.bits[
++			PAGE_BREAK_BEFORE_INDEX] & ~PAGE_BREAK_BEFORE_MASK) |
++			(src->i.bits[PAGE_BREAK_BEFORE_INDEX] & PAGE_BREAK_BEFORE_MASK);
++}
++#undef PAGE_BREAK_BEFORE_INDEX
++#undef PAGE_BREAK_BEFORE_SHIFT
++#undef PAGE_BREAK_BEFORE_MASK
++
++#define PAGE_BREAK_INSIDE_INDEX 17
++#define PAGE_BREAK_INSIDE_SHIFT 6
++#define PAGE_BREAK_INSIDE_MASK 0xc0
++static inline void overlay_page_break_inside(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[PAGE_BREAK_INSIDE_INDEX] = (dst->i.bits[
++			PAGE_BREAK_INSIDE_INDEX] & ~PAGE_BREAK_INSIDE_MASK) |
++			(src->i.bits[PAGE_BREAK_INSIDE_INDEX] & PAGE_BREAK_INSIDE_MASK);
++}
++#undef PAGE_BREAK_INSIDE_INDEX
++#undef PAGE_BREAK_INSIDE_SHIFT
++#undef PAGE_BREAK_INSIDE_MASK
++
++#define POINTER_EVENTS_INDEX 17
++#define POINTER_EVENTS_SHIFT 8
++#define POINTER_EVENTS_MASK 0x300
++static inline void overlay_pointer_events(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[POINTER_EVENTS_INDEX] = (dst->i.bits[POINTER_EVENTS_INDEX]
++			& ~POINTER_EVENTS_MASK) |
++			(src->i.bits[POINTER_EVENTS_INDEX] & POINTER_EVENTS_MASK);
++}
++#undef POINTER_EVENTS_INDEX
++#undef POINTER_EVENTS_SHIFT
++#undef POINTER_EVENTS_MASK
++
++#define POSITION_INDEX 22
++#define POSITION_SHIFT 7
++#define POSITION_MASK 0x380
++static inline void overlay_position(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[POSITION_INDEX] = (dst->i.bits[POSITION_INDEX] &
++			~POSITION_MASK) |
++			(src->i.bits[POSITION_INDEX] & POSITION_MASK);
++}
++#undef POSITION_INDEX
++#undef POSITION_SHIFT
++#undef POSITION_MASK
++
++#define QUOTES_INDEX 22
++#define QUOTES_SHIFT 0
++#define QUOTES_MASK 0x1
++static inline void overlay_quotes(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[QUOTES_INDEX] = (dst->i.bits[QUOTES_INDEX] & ~QUOTES_MASK) |
++			(src->i.bits[QUOTES_INDEX] & QUOTES_MASK);
++	dst->quotes = src->quotes;
++}
++#undef QUOTES_INDEX
++#undef QUOTES_SHIFT
++#undef QUOTES_MASK
++
++#define RIGHT_INDEX 5
++#define RIGHT_SHIFT 25
++#define RIGHT_MASK 0xfe000000
++static inline void overlay_right(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[RIGHT_INDEX] = (dst->i.bits[RIGHT_INDEX] & ~RIGHT_MASK) |
++			(src->i.bits[RIGHT_INDEX] & RIGHT_MASK);
++	dst->i.right = src->i.right;
++}
++#undef RIGHT_INDEX
++#undef RIGHT_SHIFT
++#undef RIGHT_MASK
++
++#define ROW_GAP_INDEX 4
++#define ROW_GAP_SHIFT 4
++#define ROW_GAP_MASK 0x7f0
++static inline void overlay_row_gap(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[ROW_GAP_INDEX] = (dst->i.bits[ROW_GAP_INDEX] &
++			~ROW_GAP_MASK) |
++			(src->i.bits[ROW_GAP_INDEX] & ROW_GAP_MASK);
++	dst->i.row_gap = src->i.row_gap;
++}
++#undef ROW_GAP_INDEX
++#undef ROW_GAP_SHIFT
++#undef ROW_GAP_MASK
++
++#define STROKE_INDEX 17
++#define STROKE_SHIFT 10
++#define STROKE_MASK 0xc00
++static inline void overlay_stroke(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[STROKE_INDEX] = (dst->i.bits[STROKE_INDEX] & ~STROKE_MASK) |
++			(src->i.bits[STROKE_INDEX] & STROKE_MASK);
++	dst->i.stroke = src->i.stroke;
++}
++#undef STROKE_INDEX
++#undef STROKE_SHIFT
++#undef STROKE_MASK
++
++#define STROKE_OPACITY_INDEX 21
++#define STROKE_OPACITY_SHIFT 0
++#define STROKE_OPACITY_MASK 0x1
++static inline void overlay_stroke_opacity(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[STROKE_OPACITY_INDEX] = (dst->i.bits[STROKE_OPACITY_INDEX]
++			& ~STROKE_OPACITY_MASK) |
++			(src->i.bits[STROKE_OPACITY_INDEX] & STROKE_OPACITY_MASK);
++	dst->i.stroke_opacity = src->i.stroke_opacity;
++}
++#undef STROKE_OPACITY_INDEX
++#undef STROKE_OPACITY_SHIFT
++#undef STROKE_OPACITY_MASK
++
++#define STROKE_WIDTH_INDEX 3
++#define STROKE_WIDTH_SHIFT 0
++#define STROKE_WIDTH_MASK 0x3f
++static inline void overlay_stroke_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[STROKE_WIDTH_INDEX] = (dst->i.bits[STROKE_WIDTH_INDEX] &
++			~STROKE_WIDTH_MASK) |
++			(src->i.bits[STROKE_WIDTH_INDEX] & STROKE_WIDTH_MASK);
++	dst->i.stroke_width = src->i.stroke_width;
++}
++#undef STROKE_WIDTH_INDEX
++#undef STROKE_WIDTH_SHIFT
++#undef STROKE_WIDTH_MASK
++
++#define TABLE_LAYOUT_INDEX 17
++#define TABLE_LAYOUT_SHIFT 12
++#define TABLE_LAYOUT_MASK 0x3000
++static inline void overlay_table_layout(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TABLE_LAYOUT_INDEX] = (dst->i.bits[TABLE_LAYOUT_INDEX] &
++			~TABLE_LAYOUT_MASK) |
++			(src->i.bits[TABLE_LAYOUT_INDEX] & TABLE_LAYOUT_MASK);
++}
++#undef TABLE_LAYOUT_INDEX
++#undef TABLE_LAYOUT_SHIFT
++#undef TABLE_LAYOUT_MASK
++
++#define TEXT_ALIGN_INDEX 4
++#define TEXT_ALIGN_SHIFT 0
++#define TEXT_ALIGN_MASK 0xf
++static inline void overlay_text_align(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_ALIGN_INDEX] = (dst->i.bits[TEXT_ALIGN_INDEX] &
++			~TEXT_ALIGN_MASK) |
++			(src->i.bits[TEXT_ALIGN_INDEX] & TEXT_ALIGN_MASK);
++}
++#undef TEXT_ALIGN_INDEX
++#undef TEXT_ALIGN_SHIFT
++#undef TEXT_ALIGN_MASK
++
++#define TEXT_DECORATION_INDEX 9
++#define TEXT_DECORATION_SHIFT 21
++#define TEXT_DECORATION_MASK 0x3e00000
++static inline void overlay_text_decoration(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_DECORATION_INDEX] = (dst->i.bits[
++			TEXT_DECORATION_INDEX] & ~TEXT_DECORATION_MASK) |
++			(src->i.bits[TEXT_DECORATION_INDEX] & TEXT_DECORATION_MASK);
++}
++#undef TEXT_DECORATION_INDEX
++#undef TEXT_DECORATION_SHIFT
++#undef TEXT_DECORATION_MASK
++
++#define TEXT_DECORATION_COLOR_INDEX 16
++#define TEXT_DECORATION_COLOR_SHIFT 0
++#define TEXT_DECORATION_COLOR_MASK 0x3
++static inline void overlay_text_decoration_color(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_DECORATION_COLOR_INDEX] = (dst->i.bits[
++			TEXT_DECORATION_COLOR_INDEX] &
++			~TEXT_DECORATION_COLOR_MASK) |
++			(src->i.bits[TEXT_DECORATION_COLOR_INDEX] &
++			TEXT_DECORATION_COLOR_MASK);
++	dst->i.text_decoration_color = src->i.text_decoration_color;
++}
++#undef TEXT_DECORATION_COLOR_INDEX
++#undef TEXT_DECORATION_COLOR_SHIFT
++#undef TEXT_DECORATION_COLOR_MASK
++
++#define TEXT_DECORATION_STYLE_INDEX 22
++#define TEXT_DECORATION_STYLE_SHIFT 10
++#define TEXT_DECORATION_STYLE_MASK 0x1c00
++static inline void overlay_text_decoration_style(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_DECORATION_STYLE_INDEX] = (dst->i.bits[
++			TEXT_DECORATION_STYLE_INDEX] &
++			~TEXT_DECORATION_STYLE_MASK) |
++			(src->i.bits[TEXT_DECORATION_STYLE_INDEX] &
++			TEXT_DECORATION_STYLE_MASK);
++}
++#undef TEXT_DECORATION_STYLE_INDEX
++#undef TEXT_DECORATION_STYLE_SHIFT
++#undef TEXT_DECORATION_STYLE_MASK
++
++#define TEXT_DECORATION_THICKNESS_INDEX 4
++#define TEXT_DECORATION_THICKNESS_SHIFT 11
++#define TEXT_DECORATION_THICKNESS_MASK 0x3f800
++static inline void overlay_text_decoration_thickness(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_DECORATION_THICKNESS_INDEX] = (dst->i.bits[
++			TEXT_DECORATION_THICKNESS_INDEX] &
++			~TEXT_DECORATION_THICKNESS_MASK) |
++			(src->i.bits[TEXT_DECORATION_THICKNESS_INDEX] &
++			TEXT_DECORATION_THICKNESS_MASK);
++	dst->i.text_decoration_thickness = src->i.text_decoration_thickness;
++}
++#undef TEXT_DECORATION_THICKNESS_INDEX
++#undef TEXT_DECORATION_THICKNESS_SHIFT
++#undef TEXT_DECORATION_THICKNESS_MASK
++
++#define TEXT_INDENT_INDEX 2
++#define TEXT_INDENT_SHIFT 0
++#define TEXT_INDENT_MASK 0x3f
++static inline void overlay_text_indent(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_INDENT_INDEX] = (dst->i.bits[TEXT_INDENT_INDEX] &
++			~TEXT_INDENT_MASK) |
++			(src->i.bits[TEXT_INDENT_INDEX] & TEXT_INDENT_MASK);
++	dst->i.text_indent = src->i.text_indent;
++}
++#undef TEXT_INDENT_INDEX
++#undef TEXT_INDENT_SHIFT
++#undef TEXT_INDENT_MASK
++
++#define TEXT_OVERFLOW_INDEX 15
++#define TEXT_OVERFLOW_SHIFT 0
++#define TEXT_OVERFLOW_MASK 0x3
++static inline void overlay_text_overflow(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_OVERFLOW_INDEX] = (dst->i.bits[TEXT_OVERFLOW_INDEX] &
++			~TEXT_OVERFLOW_MASK) |
++			(src->i.bits[TEXT_OVERFLOW_INDEX] & TEXT_OVERFLOW_MASK);
++}
++#undef TEXT_OVERFLOW_INDEX
++#undef TEXT_OVERFLOW_SHIFT
++#undef TEXT_OVERFLOW_MASK
++
++#define TEXT_SHADOW_INDEX 10
++#define TEXT_SHADOW_SHIFT 15
++#define TEXT_SHADOW_MASK 0xffff8000
++static inline void overlay_text_shadow(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_SHADOW_INDEX] = (dst->i.bits[TEXT_SHADOW_INDEX] &
++			~TEXT_SHADOW_MASK) |
++			(src->i.bits[TEXT_SHADOW_INDEX] & TEXT_SHADOW_MASK);
++	dst->i.text_shadow_a = src->i.text_shadow_a;
++	dst->i.text_shadow_b = src->i.text_shadow_b;
++	dst->i.text_shadow_c = src->i.text_shadow_c;
++	dst->i.text_shadow_d = src->i.text_shadow_d;
++}
++#undef TEXT_SHADOW_INDEX
++#undef TEXT_SHADOW_SHIFT
++#undef TEXT_SHADOW_MASK
++
++#define TEXT_TRANSFORM_INDEX 22
++#define TEXT_TRANSFORM_SHIFT 13
++#define TEXT_TRANSFORM_MASK 0xe000
++static inline void overlay_text_transform(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_TRANSFORM_INDEX] = (dst->i.bits[TEXT_TRANSFORM_INDEX]
++			& ~TEXT_TRANSFORM_MASK) |
++			(src->i.bits[TEXT_TRANSFORM_INDEX] & TEXT_TRANSFORM_MASK);
++}
++#undef TEXT_TRANSFORM_INDEX
++#undef TEXT_TRANSFORM_SHIFT
++#undef TEXT_TRANSFORM_MASK
++
++#define TEXT_UNDERLINE_OFFSET_INDEX 4
++#define TEXT_UNDERLINE_OFFSET_SHIFT 18
++#define TEXT_UNDERLINE_OFFSET_MASK 0x1fc0000
++static inline void overlay_text_underline_offset(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TEXT_UNDERLINE_OFFSET_INDEX] = (dst->i.bits[
++			TEXT_UNDERLINE_OFFSET_INDEX] &
++			~TEXT_UNDERLINE_OFFSET_MASK) |
++			(src->i.bits[TEXT_UNDERLINE_OFFSET_INDEX] &
++			TEXT_UNDERLINE_OFFSET_MASK);
++	dst->i.text_underline_offset = src->i.text_underline_offset;
++}
++#undef TEXT_UNDERLINE_OFFSET_INDEX
++#undef TEXT_UNDERLINE_OFFSET_SHIFT
++#undef TEXT_UNDERLINE_OFFSET_MASK
++
++#define TOP_INDEX 4
++#define TOP_SHIFT 25
++#define TOP_MASK 0xfe000000
++static inline void overlay_top(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TOP_INDEX] = (dst->i.bits[TOP_INDEX] & ~TOP_MASK) |
++			(src->i.bits[TOP_INDEX] & TOP_MASK);
++	dst->i.top = src->i.top;
++}
++#undef TOP_INDEX
++#undef TOP_SHIFT
++#undef TOP_MASK
++
++#define TRANSFORM_INDEX 1
++#define TRANSFORM_SHIFT 7
++#define TRANSFORM_MASK 0x7ff80
++static inline void overlay_transform(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TRANSFORM_INDEX] = (dst->i.bits[TRANSFORM_INDEX] &
++			~TRANSFORM_MASK) |
++			(src->i.bits[TRANSFORM_INDEX] & TRANSFORM_MASK);
++	dst->i.transform_a = src->i.transform_a;
++	dst->i.transform_b = src->i.transform_b;
++	dst->i.transform_c = src->i.transform_c;
++	dst->i.transform_d = src->i.transform_d;
++	dst->i.transform_e = src->i.transform_e;
++	dst->i.transform_f = src->i.transform_f;
++}
++#undef TRANSFORM_INDEX
++#undef TRANSFORM_SHIFT
++#undef TRANSFORM_MASK
++
++#define TRANSFORM_ORIGIN_INDEX 0
++#define TRANSFORM_ORIGIN_SHIFT 9
++#define TRANSFORM_ORIGIN_MASK 0xffe00
++static inline void overlay_transform_origin(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[TRANSFORM_ORIGIN_INDEX] = (dst->i.bits[
++			TRANSFORM_ORIGIN_INDEX] & ~TRANSFORM_ORIGIN_MASK) |
++			(src->i.bits[TRANSFORM_ORIGIN_INDEX] & TRANSFORM_ORIGIN_MASK);
++	dst->i.transform_origin_a = src->i.transform_origin_a;
++	dst->i.transform_origin_b = src->i.transform_origin_b;
++}
++#undef TRANSFORM_ORIGIN_INDEX
++#undef TRANSFORM_ORIGIN_SHIFT
++#undef TRANSFORM_ORIGIN_MASK
++
++#define UNICODE_BIDI_INDEX 14
++#define UNICODE_BIDI_SHIFT 0
++#define UNICODE_BIDI_MASK 0x3
++static inline void overlay_unicode_bidi(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[UNICODE_BIDI_INDEX] = (dst->i.bits[UNICODE_BIDI_INDEX] &
++			~UNICODE_BIDI_MASK) |
++			(src->i.bits[UNICODE_BIDI_INDEX] & UNICODE_BIDI_MASK);
++}
++#undef UNICODE_BIDI_INDEX
++#undef UNICODE_BIDI_SHIFT
++#undef UNICODE_BIDI_MASK
++
++#define VERTICAL_ALIGN_INDEX 0
++#define VERTICAL_ALIGN_SHIFT 0
++#define VERTICAL_ALIGN_MASK 0x1ff
++static inline void overlay_vertical_align(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[VERTICAL_ALIGN_INDEX] = (dst->i.bits[VERTICAL_ALIGN_INDEX]
++			& ~VERTICAL_ALIGN_MASK) |
++			(src->i.bits[VERTICAL_ALIGN_INDEX] & VERTICAL_ALIGN_MASK);
++	dst->i.vertical_align = src->i.vertical_align;
++}
++#undef VERTICAL_ALIGN_INDEX
++#undef VERTICAL_ALIGN_SHIFT
++#undef VERTICAL_ALIGN_MASK
++
++#define VISIBILITY_INDEX 13
++#define VISIBILITY_SHIFT 0
++#define VISIBILITY_MASK 0x3
++static inline void overlay_visibility(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[VISIBILITY_INDEX] = (dst->i.bits[VISIBILITY_INDEX] &
++			~VISIBILITY_MASK) |
++			(src->i.bits[VISIBILITY_INDEX] & VISIBILITY_MASK);
++}
++#undef VISIBILITY_INDEX
++#undef VISIBILITY_SHIFT
++#undef VISIBILITY_MASK
++
++#define WHITE_SPACE_INDEX 9
++#define WHITE_SPACE_SHIFT 0
++#define WHITE_SPACE_MASK 0x7
++static inline void overlay_white_space(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[WHITE_SPACE_INDEX] = (dst->i.bits[WHITE_SPACE_INDEX] &
++			~WHITE_SPACE_MASK) |
++			(src->i.bits[WHITE_SPACE_INDEX] & WHITE_SPACE_MASK);
++}
++#undef WHITE_SPACE_INDEX
++#undef WHITE_SPACE_SHIFT
++#undef WHITE_SPACE_MASK
++
++#define WIDOWS_INDEX 20
++#define WIDOWS_SHIFT 0
++#define WIDOWS_MASK 0x1
++static inline void overlay_widows(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[WIDOWS_INDEX] = (dst->i.bits[WIDOWS_INDEX] & ~WIDOWS_MASK) |
++			(src->i.bits[WIDOWS_INDEX] & WIDOWS_MASK);
++	dst->i.widows = src->i.widows;
++}
++#undef WIDOWS_INDEX
++#undef WIDOWS_SHIFT
++#undef WIDOWS_MASK
++
++#define WIDTH_INDEX 3
++#define WIDTH_SHIFT 6
++#define WIDTH_MASK 0x1fc0
++static inline void overlay_width(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[WIDTH_INDEX] = (dst->i.bits[WIDTH_INDEX] & ~WIDTH_MASK) |
++			(src->i.bits[WIDTH_INDEX] & WIDTH_MASK);
++	dst->i.width = src->i.width;
++}
++#undef WIDTH_INDEX
++#undef WIDTH_SHIFT
++#undef WIDTH_MASK
++
++#define WORD_BREAK_INDEX 12
++#define WORD_BREAK_SHIFT 0
++#define WORD_BREAK_MASK 0x3
++static inline void overlay_word_break(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[WORD_BREAK_INDEX] = (dst->i.bits[WORD_BREAK_INDEX] &
++			~WORD_BREAK_MASK) |
++			(src->i.bits[WORD_BREAK_INDEX] & WORD_BREAK_MASK);
++}
++#undef WORD_BREAK_INDEX
++#undef WORD_BREAK_SHIFT
++#undef WORD_BREAK_MASK
++
++#define WORD_SPACING_INDEX 1
++#define WORD_SPACING_SHIFT 0
++#define WORD_SPACING_MASK 0x7f
++static inline void overlay_word_spacing(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[WORD_SPACING_INDEX] = (dst->i.bits[WORD_SPACING_INDEX] &
++			~WORD_SPACING_MASK) |
++			(src->i.bits[WORD_SPACING_INDEX] & WORD_SPACING_MASK);
++	dst->i.word_spacing = src->i.word_spacing;
++}
++#undef WORD_SPACING_INDEX
++#undef WORD_SPACING_SHIFT
++#undef WORD_SPACING_MASK
++
++#define WRITING_MODE_INDEX 11
++#define WRITING_MODE_SHIFT 0
++#define WRITING_MODE_MASK 0x3
++static inline void overlay_writing_mode(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[WRITING_MODE_INDEX] = (dst->i.bits[WRITING_MODE_INDEX] &
++			~WRITING_MODE_MASK) |
++			(src->i.bits[WRITING_MODE_INDEX] & WRITING_MODE_MASK);
++}
++#undef WRITING_MODE_INDEX
++#undef WRITING_MODE_SHIFT
++#undef WRITING_MODE_MASK
++
++#define Z_INDEX_INDEX 10
++#define Z_INDEX_SHIFT 0
++#define Z_INDEX_MASK 0x3
++static inline void overlay_z_index(css_computed_style *dst,
++		const css_computed_style *src)
++{
++	dst->i.bits[Z_INDEX_INDEX] = (dst->i.bits[Z_INDEX_INDEX] &
++			~Z_INDEX_MASK) |
++			(src->i.bits[Z_INDEX_INDEX] & Z_INDEX_MASK);
++	dst->i.z_index = src->i.z_index;
++}
++#undef Z_INDEX_INDEX
++#undef Z_INDEX_SHIFT
++#undef Z_INDEX_MASK
++
++#endif
+diff --git a/src/select/select.c b/src/select/select.c
+index 52fa455..1e3e432 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -4151,6 +4151,24 @@ static css_error match_has_compound(css_select_ctx *ctx, void *n,
+ 	return match_details(ctx, n, &sub->data, state, match, NULL);
+ }
+ 
++/**
++ * Whether a node matches any compound of a chain (VitaSurf).
++ */
++static css_error match_any_compound(css_select_ctx *ctx, void *n,
++		const css_selector *sub, css_select_state *state,
++		bool *match)
++{
++	css_error error;
++
++	*match = false;
++	for (; sub != NULL; sub = sub->combinator) {
++		error = match_has_compound(ctx, n, sub, state, match);
++		if (error != CSS_OK || *match)
++			return error;
++	}
++	return CSS_OK;
++}
++
+ /**
+  * Match a :has() detail (VitaSurf).
+  *
+@@ -4387,6 +4405,60 @@ static css_error self_test_other(css_select_state *state, void *node,
+ 	return CSS_OK;
+ }
+ 
++/**
++ * Match :nth-child(An+B of S) or :nth-last-child(An+B of S) (VitaSurf).
++ *
++ * The detail's selector holds A and B in its nth value and leads the
++ * chain of compounds S (see parseNthOf in parse/language.c). The node
++ * must match S itself, and is counted among the siblings before it --
++ * or after it, for the last-child form -- that match S too.
++ */
++static css_error match_nth_of(css_select_ctx *ctx, void *node,
++		const css_selector_detail *detail, css_select_state *state,
++		bool *match)
++{
++	const css_select_handler *h = state->handler;
++	const css_selector *head = detail->value.selector;
++	bool last = (detail->qname.name == ctx->str.nth_last_child);
++	int32_t count = 0;
++	void *n = NULL;
++	css_error error;
++
++	*match = false;
++	if (head == NULL || h->sibling_node == NULL ||
++			h->next_sibling_node == NULL)
++		return CSS_OK;
++
++	error = match_any_compound(ctx, node, head->combinator, state, match);
++	if (error != CSS_OK || *match == false)
++		return error;
++
++	if (last)
++		error = h->next_sibling_node(state->pw, node, &n);
++	else
++		error = h->sibling_node(state->pw, node, &n);
++	while (error == CSS_OK && n != NULL) {
++		bool m = false;
++
++		error = match_any_compound(ctx, n, head->combinator, state,
++				&m);
++		if (error != CSS_OK)
++			return error;
++		if (m)
++			count++;
++		if (last)
++			error = h->next_sibling_node(state->pw, n, &n);
++		else
++			error = h->sibling_node(state->pw, n, &n);
++	}
++	if (error != CSS_OK)
++		return error;
++
++	*match = match_nth(head->data.value.nth.a, head->data.value.nth.b,
++			count + 1);
++	return CSS_OK;
++}
++
+ css_error match_detail(css_select_ctx *ctx, void *node,
+ 		const css_selector_detail *detail, css_select_state *state,
+ 		bool *match, css_pseudo_element *pseudo_element)
+@@ -4444,6 +4516,13 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 			error = state->handler->node_is_visited(state->pw,
+ 					node, match);
+ 			flags = CSS_NODE_FLAGS_NONE;
++		} else if (detail->value_type ==
++				CSS_SELECTOR_DETAIL_VALUE_SELECTOR &&
++				(detail->qname.name == ctx->str.nth_child ||
++				 detail->qname.name ==
++						ctx->str.nth_last_child)) {
++			error = match_nth_of(ctx, node, detail, state, match);
++			flags = CSS_NODE_FLAGS_TAINT_SIBLING;
+ 		} else if ((test = self_kind(ctx, detail->qname.name)) !=
+ 				CSS_SELF_NONE) {
+ 			int32_t a = 0, b = 0;
+@@ -4476,6 +4555,14 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 				CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
+ 			error = match_has(ctx, node, detail->value.selector,
+ 					state, match);
++		} else if (state->handler->node_is_pseudo != NULL) {
++			/* the ones the parser knows only by name, answered
++			 * by the client (VitaSurf) */
++			error = state->handler->node_is_pseudo(state->pw,
++					node, detail->qname.name,
++					detail->value_type ==
++					CSS_SELECTOR_DETAIL_VALUE_STRING ?
++					detail->value.string : NULL, match);
+ 		} else {
+ 			/* One not known here matches nothing, whatever the
+ 			 * node, so no sibling can differ (VitaSurf). */
+diff --git a/src/select/select_generator.py b/src/select/select_generator.py
+index bae1281..0e9ee37 100644
+--- a/src/select/select_generator.py
++++ b/src/select/select_generator.py
+@@ -773,8 +773,44 @@ class CSSGroup:
+                     r.append('{} {}{};'.format(v_type + or_calc, v_name, v.suffix))
+         return r
+ 
++    def make_overlay_h(self):
++        """Output this group's overlay functions for overlay.h (VitaSurf).
++
++        overlay_<name>(dst, src) copies one property's bits and values
++        from src into dst, pointers and all, without taking references:
++        it is for a scratch copy of a style that is compared and then
++        dropped, never destroyed.
++        """
++        t = Text()
++
++        for p in sorted(self.props, key=(lambda x: x.name)):
++            defines, undefs = p.def_undefs
++
++            t.append()
++            t.append(defines)
++            t.append('static inline void overlay_{}(css_computed_style *dst,'
++                     .format(p.name))
++            t.append('\t\tconst css_computed_style *src)')
++            t.append('{')
++            t.indent(1)
++            t.append('dst->i.bits[{0}_INDEX] = (dst->i.bits[{0}_INDEX] & '
++                     '~{0}_MASK) |'.format(p.name.upper()))
++            t.append('\t\t(src->i.bits[{0}_INDEX] & {0}_MASK);'.format(
++                p.name.upper()))
++            for v in p.values:
++                i_dot = '' if v.is_ptr and v.name != 'string' else 'i.'
++                t.append('dst->{0}{1} = src->{0}{1};'.format(
++                    i_dot, p.name + v.suffix))
++            t.indent(-1)
++            t.append('}')
++            t.append(undefs)
++
++        return t.to_string()
++
+     def make_text(self, filename):
+         """Return this group's text for the given file."""
++        if filename == 'overlay.h':
++            return self.make_overlay_h()
+         if filename == 'computed.h':
+             return self.make_computed_h()
+         elif filename == 'propset.h':
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index d789c7e..bec57cb 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -8,6 +8,7 @@
+ #include <assert.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ #include <stdarg.h>
+ 
+ #include "stylesheet.h"
+@@ -921,6 +922,11 @@ void css__stylesheet_note_gap(css_stylesheet *sheet, lwc_string *name,
+ 
+ 
+ /* exported function documented in libcss/stylesheet.h */
++uint32_t css_stylesheet_dynamic_ancestor(const css_stylesheet *sheet)
++{
++	return sheet != NULL ? sheet->dynamic_ancestor : 0;
++}
++
+ uint32_t css_stylesheet_gap_count(const css_stylesheet *sheet)
+ {
+ 	return sheet == NULL ? 0 : sheet->n_gaps;
+@@ -1640,6 +1646,52 @@ static void name_hidden_types(css_selector *selector)
+  * \param selector  The selector to add
+  * \return CSS_OK on success, appropriate error otherwise
+  */
++/**
++ * The CSS_DYNAMIC_ bits of the pseudo-classes in a chain of compounds
++ * (VitaSurf): every compound from \a sel on, through its combinators
++ * when \a chain, and the selectors inside :has() and the like.
++ */
++static uint32_t dynamic_bits(const css_selector *sel, bool chain)
++{
++	uint32_t bits = 0;
++
++	for (; sel != NULL; sel = chain ? sel->combinator : NULL) {
++		const css_selector_detail *d = &sel->data;
++
++		for (;;) {
++			/* :not(:hover) depends on it as much as :hover */
++			if (d->type == CSS_SELECTOR_PSEUDO_CLASS) {
++				const char *n = lwc_string_data(d->qname.name);
++
++				if (strcasecmp(n, "hover") == 0)
++					bits |= CSS_DYNAMIC_HOVER;
++				else if (strcasecmp(n, "active") == 0)
++					bits |= CSS_DYNAMIC_ACTIVE;
++				else if (strcasecmp(n, "focus") == 0 ||
++						strcasecmp(n, "focus-within")
++						== 0 ||
++						strcasecmp(n, "focus-visible")
++						== 0)
++					bits |= CSS_DYNAMIC_FOCUS;
++				else if (strcasecmp(n, "target") == 0 ||
++						strcasecmp(n, "target-within")
++						== 0)
++					bits |= CSS_DYNAMIC_TARGET;
++			}
++			if (d->type == CSS_SELECTOR_PSEUDO_CLASS &&
++					d->value_type ==
++					CSS_SELECTOR_DETAIL_VALUE_SELECTOR)
++				bits |= dynamic_bits(d->value.selector, true);
++			if (d->next == 0)
++				break;
++			d++;
++		}
++		if (!chain)
++			break;
++	}
++	return bits;
++}
++
+ css_error css__stylesheet_rule_add_selector(css_stylesheet *sheet,
+ 		css_rule *rule, css_selector *selector)
+ {
+@@ -1653,6 +1705,7 @@ css_error css__stylesheet_rule_add_selector(css_stylesheet *sheet,
+ 	assert(rule->type == CSS_RULE_SELECTOR);
+ 
+ 	name_hidden_types(selector);
++	sheet->dynamic_ancestor |= dynamic_bits(selector->combinator, true);
+ 
+ 	sels = realloc(r->selectors,
+ 			(r->base.items + 1) * sizeof(css_selector *));
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index bb1e0d6..d2d4f87 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -250,6 +250,10 @@ struct css_stylesheet {
+ 	css_stylesheet_gap gaps[CSS_STYLESHEET_GAPS];
+ 	uint32_t n_gaps;
+ 
++	/* the CSS_DYNAMIC_ states some selector asks of an element other
++	 * than its subject, as ".menu:hover .submenu" does (VitaSurf) */
++	uint32_t dynamic_ancestor;
++
+ 	uint32_t rule_count;			/**< Number of rules in sheet */
+ 	css_rule *rule_list;			/**< List of rules in sheet */
+ 	css_rule *last_rule;			/**< Last rule in list */

@@ -59,6 +59,7 @@
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_inspect.h"
 #include "content/handlers/html/html_save.h"
+#include "content/handlers/html/html.h"
 #include "content/handlers/html/form_internal.h"
 #include "framebuffer/gui.h"
 #include "framebuffer/fbtk.h"
@@ -533,6 +534,10 @@ static void move_focus(enum direction dir)
 	}
 
 	set_focus_to(best, content);
+	/* the page's own focus styles follow the D-pad (VitaSurf) */
+	html_focus_at_point(hlcache_handle_get_content(content),
+			    (focus.r.x0 + focus.r.x1) / 2,
+			    (focus.r.y0 + focus.r.y1) / 2);
 	reveal_focus();
 	refresh_overlay();
 }

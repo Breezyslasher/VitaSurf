@@ -82,6 +82,7 @@
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_construct.h"
 #include "content/handlers/html/box_inspect.h"
+#include "content/handlers/html/css.h"
 #include "content/handlers/html/frame_doc.h"
 #include "desktop/browser_private.h"
 #include "desktop/scrollbar.h"
@@ -9926,6 +9927,82 @@ static JSValue win_vita_focus_control(JSContext *ctx, JSValueConst this_val,
 }
 
 /*
+ * __vitaSetSheetText(styleElement, text or null): what the engine reads
+ * for a <style>'s sheet in place of its text, after script changed the
+ * rules with insertRule() and the like (VitaSurf). The element need not
+ * be in the document; the prelude keeps one that is not for the
+ * document's adoptedStyleSheets.
+ */
+static JSValue win_vita_set_sheet_text(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	const char *text = NULL;
+	bool ok;
+
+	(void)this_val;
+	if (thread == NULL || thread->htmlc == NULL || argc < 2) {
+		return JS_FALSE;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_FALSE;
+	}
+	if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+		text = JS_ToCString(ctx, argv[1]);
+		if (text == NULL) {
+			return JS_EXCEPTION;
+		}
+	}
+	ok = html_css_set_style_text(thread->htmlc, node, text);
+	if (text != NULL) {
+		JS_FreeCString(ctx, text);
+	}
+	return JS_NewBool(ctx, ok);
+}
+
+/*
+ * __vitaSetFocus(node or null): the element that matches :focus in the
+ * style sheets (VitaSurf). focus() from script moves it as a tap does;
+ * a field that takes typing also matches :focus-visible, as in Chrome.
+ */
+static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node = NULL;
+	bool text = false;
+
+	(void)this_val;
+	if (thread == NULL || thread->htmlc == NULL) {
+		return JS_UNDEFINED;
+	}
+	if (argc > 0 && !JS_IsNull(argv[0])) {
+		node = JS_GetOpaque(argv[0], node_class_id);
+		if (node == NULL) {
+			return JS_UNDEFINED;
+		}
+	}
+	if (node != NULL) {
+		dom_string *name = NULL;
+
+		if (dom_node_get_node_name(node, &name) == DOM_NO_ERR &&
+		    name != NULL) {
+			text = strcasecmp(dom_string_data(name),
+					  "textarea") == 0 ||
+			       strcasecmp(dom_string_data(name),
+					  "input") == 0;
+			dom_string_unref(name);
+		}
+	}
+	html_set_dynamic(thread->htmlc, NSCSS_FOCUS, node, text);
+	return JS_UNDEFINED;
+}
+
+/*
  * __vitaElementFromPoint(x, y): the element at a point in the page, in
  * CSS pixels from the top left of the document.
  *
@@ -9968,10 +10045,14 @@ static JSValue win_vita_element_from_point(JSContext *ctx,
 	 * path does too.
 	 */
 	found = box;
+	/* the box painted on top, as a tap finds it (VitaSurf) */
+	box_at_point_limit = html_topmost_box_at(thread->htmlc, (int) x,
+						 (int) y);
 	while ((box = box_at_point(&thread->htmlc->unit_len_ctx, box,
 			(int) x, (int) y, &bx, &by)) != NULL) {
 		found = box;
 	}
+	box_at_point_limit = NULL;
 
 	/* the nearest ancestor that is an element, as the spec asks */
 	while (found != NULL && found->node == NULL) {
@@ -11136,6 +11217,12 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaModuleState", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaDomGen",
 			  JS_NewCFunction(ctx, win_vita_dom_gen, "__vitaDomGen", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaSetSheetText",
+			  JS_NewCFunction(ctx, win_vita_set_sheet_text,
+					  "__vitaSetSheetText", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaSetFocus",
+			  JS_NewCFunction(ctx, win_vita_set_focus,
+					  "__vitaSetFocus", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaCanvasPath",

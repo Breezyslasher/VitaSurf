@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!-- Rules added through the CSSOM style the page: insertRule on an
+     appended <style>, as Emotion and styled-components do, deleteRule,
+     a rule's style, and a constructed sheet in adoptedStyleSheets.
+     Expected console output: lines ending in "ok". -->
+<html><head><style id=own>#a { color: rgb(1, 1, 1) } @media screen { #b { color: rgb(2, 2, 2) } }</style></head><body>
+<p id=a>a</p><p id=b>b</p><p id=c>c</p><p id=d>d</p><p id=e>e</p><p id=f>f</p>
+<script>
+function cs(id, p) { return getComputedStyle(document.getElementById(id))[p || 'color']; }
+function t(label, got, want) { console.log(label + ":", got === want ? "ok" : "FAIL " + got); }
+var own = document.getElementById('own').sheet;
+t("rules read from the text", own.cssRules.length, 2);
+t("a style rule's selector", own.cssRules[0].selectorText, '#a');
+t("a media rule's rules", own.cssRules[1].cssRules.length, 1);
+t("a rule's declaration", own.cssRules[0].style.color, 'rgb(1, 1, 1)');
+
+var s = document.createElement('style');
+document.head.appendChild(s);
+for (var i = 0; i < 200; i++) s.sheet.insertRule('.x' + i + ' { margin: ' + i + 'px }', s.sheet.cssRules.length);
+s.sheet.insertRule('#c { color: rgb(0, 128, 0) }', s.sheet.cssRules.length);
+s.sheet.insertRule('#d { color: rgb(9, 9, 9) }', 0);
+s.sheet.deleteRule(0);
+own.cssRules[0].style.setProperty('color', 'rgb(3, 3, 3)');
+var bad = false;
+try { s.sheet.insertRule('#e { color: red } #f { color: red }'); } catch (e) { bad = e.name; }
+t("two rules at once refused", bad, 'SyntaxError');
+
+var sheet = new CSSStyleSheet();
+sheet.replaceSync('#e { color: rgb(4, 4, 4) }');
+document.adoptedStyleSheets = [sheet];
+var nonc = false;
+try { document.adoptedStyleSheets = [own]; } catch (e) { nonc = e instanceof TypeError; }
+t("only constructed sheets adopted", nonc, true);
+document.adoptedStyleSheets = [sheet];
+
+setTimeout(function () {
+  t("inserted rule applies", cs('c'), 'rgb(0, 128, 0)');
+  t("deleted rule does not", cs('d'), 'rgb(0, 0, 0)');
+  t("a rule's style changed", cs('a'), 'rgb(3, 3, 3)');
+  t("the media rule still applies", cs('b'), 'rgb(2, 2, 2)');
+  t("adopted sheet applies", cs('e'), 'rgb(4, 4, 4)');
+  t("the element's text is untouched", document.getElementById('own').textContent.indexOf('rgb(1, 1, 1)') >= 0, true);
+  sheet.replaceSync('#f { color: rgb(5, 5, 5) }');
+  setTimeout(function () {
+    t("replaceSync on an adopted sheet", cs('f'), 'rgb(5, 5, 5)');
+    t("and its old rule gone", cs('e'), 'rgb(0, 0, 0)');
+  }, 800);
+}, 800);
+</script></body></html>
