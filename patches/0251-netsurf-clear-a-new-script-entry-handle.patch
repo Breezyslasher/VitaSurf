@@ -1,0 +1,21 @@
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index c3036714a..065be2809 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -164,6 +164,16 @@ html_process_new_script(html_content *c,
+ 
+ 	nscript->type = type;
+ 
++	/*
++	 * The entry comes from realloc, and its handle is only set by a
++	 * fetch that starts (VitaSurf). One that could not start -- a
++	 * modulepreload of a blob: URL, which nothing fetches -- left
++	 * whatever bytes were there, and every walk of the list that skips
++	 * an entry with no handle took them for one: build 475 crashed on
++	 * claude.ai reading a handle that was the text ", bu".
++	 */
++	memset(&nscript->data, 0, sizeof(nscript->data));
++
+ 	nscript->mimetype = dom_string_ref(mimetype); /* reference mimetype */
+ 
+ 	return nscript;

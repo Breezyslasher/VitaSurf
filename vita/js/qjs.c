@@ -12143,6 +12143,17 @@ static char *map_lookup(JSContext *ctx, jsthread *thread, JSValueConst imports,
  * matches the importer first, longest first, then the top level imports.
  * Anything still unmatched is passed through for the loader to report.
  */
+/**
+ * A blob: or data: URL: the module is in the page already, and nothing
+ * fetches it. NetSurf has no fetcher for blob:, and a modulepreload of
+ * one used to leave a script entry with no handle behind (build 475).
+ */
+static bool url_is_local(const char *url)
+{
+	return url != NULL && (strncmp(url, "blob:", 5) == 0 ||
+			       strncmp(url, "data:", 5) == 0);
+}
+
 static char *qjs_module_normalize(JSContext *ctx, const char *base,
 				  const char *name, void *opaque)
 {
@@ -12154,6 +12165,9 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base,
 	(void)opaque;
 	if (thread == NULL || name == NULL) {
 		return js_dup_cstr(ctx, name != NULL ? name : "");
+	}
+	if (url_is_local(name)) {
+		return js_dup_cstr(ctx, name);
 	}
 	if (name[0] == '.' || name[0] == '/' || strstr(name, "://") != NULL) {
 		return resolve_against(ctx, thread, base, name);
@@ -12569,6 +12583,7 @@ static int module_graph_check(jsthread *thread, const char *root,
 					continue;
 				} else if (s == MOD_SRC_NONE && !asked &&
 					   thread->htmlc != NULL &&
+					   !url_is_local(d) &&
 					   strstr(d, "://") != NULL) {
 					/* once: a fetch that failed leaves it
 					 * to the compile, as before */
@@ -12793,7 +12808,8 @@ static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 				CONTENT_STATUS_DONE ? "done" : "arriving";
 			break;
 		}
-		if (!found && strstr(url, "://") != NULL) {
+		if (!found && !url_is_local(url) &&
+		    strstr(url, "://") != NULL) {
 			dom_string *href = to_dom_string(url);
 
 			if (href != NULL) {
@@ -12842,6 +12858,68 @@ static bool module_graph_wait(jsthread *thread, const char *name,
 				     sizeof(waiting));
 }
 
+/**
+ * Compile a module whose text the realm holds: an object URL made from a
+ * Blob, or a data: URL. The prelude's __vitaLocalModule has it.
+ */
+static JSModuleDef *local_module(JSContext *ctx, jsthread *thread,
+				 const char *name)
+{
+	JSValue global, get, text, fn;
+	const char *src;
+	char *rw;
+	size_t len, rwlen = 0;
+	JSModuleDef *m;
+
+	global = JS_GetGlobalObject(ctx);
+	get = JS_GetPropertyStr(ctx, global, "__vitaLocalModule");
+	text = JS_UNDEFINED;
+	if (JS_IsFunction(ctx, get)) {
+		JSValue arg = JS_NewString(ctx, name);
+
+		text = JS_Call(ctx, get, global, 1, &arg);
+		JS_FreeValue(ctx, arg);
+	}
+	JS_FreeValue(ctx, get);
+	JS_FreeValue(ctx, global);
+	if (JS_IsException(text)) {
+		return NULL;
+	}
+	if (!JS_IsString(text)) {
+		JS_FreeValue(ctx, text);
+		/* not "could not load module": the dynamic import helper
+		 * waits for a module named that to arrive */
+		JS_ThrowTypeError(ctx, "no module at '%.200s'", name);
+		return NULL;
+	}
+	src = JS_ToCStringLen(ctx, &len, text);
+	JS_FreeValue(ctx, text);
+	if (src == NULL) {
+		return NULL;
+	}
+	rw = rewrite_dynamic_imports(src, len, name, &rwlen);
+	if (rw != NULL) {
+		fn = JS_Eval(ctx, rw, rwlen, name, JS_EVAL_TYPE_MODULE |
+			     JS_EVAL_FLAG_COMPILE_ONLY);
+		free(rw);
+	} else {
+		fn = JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_MODULE |
+			     JS_EVAL_FLAG_COMPILE_ONLY);
+	}
+	JS_FreeCString(ctx, src);
+	if (JS_IsException(fn)) {
+		vita_log("qjs: module at '%.80s' did not compile", name);
+		return NULL;
+	}
+	set_import_meta(ctx, fn, name);
+	m = JS_VALUE_GET_PTR(fn);
+	JS_FreeValue(ctx, fn);
+	thread->js_modules++;
+	vita_log("qjs: compiled module at '%.80s' (%u KB)", name,
+		 (unsigned)(len / 1024));
+	return m;
+}
+
 static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 				      void *opaque)
 {
@@ -12855,6 +12933,9 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 	if (thread == NULL || name == NULL) {
 		JS_ThrowReferenceError(ctx, "could not load module");
 		return NULL;
+	}
+	if (url_is_local(name)) {
+		return local_module(ctx, thread, name);
 	}
 	want = without_retry_suffix(name, stripped, sizeof(stripped));
 
@@ -12998,7 +13079,7 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 	 * retries the same chunk a few times a second apart when the
 	 * import fails. This one fails too, but the retry can find it.
 	 */
-	if (!unready && thread->htmlc != NULL &&
+	if (!unready && thread->htmlc != NULL && !url_is_local(want) &&
 	    strstr(want, "://") != NULL) {
 		dom_string *href = to_dom_string(want);
 

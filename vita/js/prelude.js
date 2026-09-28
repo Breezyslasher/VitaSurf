@@ -5518,6 +5518,22 @@ W.FileReaderSync.prototype.readAsText=function(b){return b?b._t||'':'';};
 URL.createObjectURL=function(o){var u='blob:'+String(location.href)+'/'+(++blobSeq);
  blobURLs[u]=o;return u;};
 URL.revokeObjectURL=function(u){delete blobURLs[u];};
+/* A module imported from an object URL or a data: URL has nothing to
+   fetch: qjs.c asks here for its text, or null if there is none. */
+W.__vitaLocalModule=function(u){
+ u=String(u);
+ if(u.indexOf('blob:')===0){
+  var b=blobURLs[u];
+  return b===undefined?null:(b._t!==undefined?b._t:String(b));}
+ var m=/^data:([^,]*),/i.exec(u);
+ if(!m)return null;
+ try{
+  var body=decodeURIComponent(u.slice(m[0].length));
+  if(!/;base64$/i.test(m[1]))return body;
+  var s=W.atob(body),a=new Uint8Array(s.length),i;
+  for(i=0;i<s.length;i++)a[i]=s.charCodeAt(i);
+  return new TextDecoder().decode(a);
+ }catch(e){return null;}};
 (function(){var F=W.FormData&&W.FormData.prototype;
  if(!F||F.append)return;
  F.append=function(k,v){this._p.push([String(k),v]);};
@@ -7255,6 +7271,12 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
  /* the worker's side, called by the page in this realm */
  W.__vitaBecomeWorker=function(url,name,type,owner){
   delete W.__vitaBecomeWorker;
+  /* the page's object URLs are in the page's table, not this realm's */
+  var ownLocal=W.__vitaLocalModule;
+  W.__vitaLocalModule=function(m){
+   var t=ownLocal(m);
+   if(t===null&&String(m).indexOf('blob:')===0)t=owner.blobText(String(m));
+   return t===undefined?null:t;};
   var started=false,queue=[],closing=false,reporting=false,u=new URL(url);
   /* what a worker's global does not have */
   ['document','window','parent','top','frames','frameElement','opener',
