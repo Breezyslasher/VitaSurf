@@ -1499,7 +1499,10 @@ function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(va
   if(value===''||value===undefined)return true;
   return W.__vitaDarkMode?value==='dark':
    (value==='light'||value==='no-preference');
- case 'prefers-reduced-motion':return value==='reduce'||value==='no-preference';
+ /* reduced motion is asked for, as the stylesheets are told: Home
+    Assistant's login page animates a particle field on a canvas every
+    frame unless it is, and the Vita ran it at 25 fps (VitaSurf) */
+ case 'prefers-reduced-motion':return value==='reduce';
  case 'prefers-contrast':case 'forced-colors':case 'inverted-colors':return value==='no-preference'||value==='none';
  case 'pointer':case 'any-pointer':return value==='coarse';
  case 'hover':case 'any-hover':return value==='none';
@@ -1521,7 +1524,8 @@ function mediaFeatureBool(name){
  /* there is always one scheme or the other */
  case 'prefers-color-scheme':return true;
  /* reported as no-preference or none, so the bare query is false */
- case 'prefers-reduced-motion':case 'prefers-reduced-transparency':
+ case 'prefers-reduced-motion':return true;       /* reduce */
+ case 'prefers-reduced-transparency':
  case 'prefers-contrast':case 'forced-colors':case 'inverted-colors':
   return false;
  case 'pointer':case 'any-pointer':return true;   /* coarse */
@@ -1973,8 +1977,24 @@ W.ResizeObserver.prototype.observe=W.ResizeObserver.prototype.unobserve=
 W.PerformanceObserver.prototype=W.ResizeObserver.prototype;
 /* IntersectionObserver is implemented further down, against the page's
    own geometry; it decides whether a lazily built list ever appears. */
-W.atob=function(s){s=String(s).replace(/[^A-Za-z0-9+\/=]/g,'');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=A.indexOf(s.charAt(i++)),b=A.indexOf(s.charAt(i++)),c=A.indexOf(s.charAt(i++)),d=A.indexOf(s.charAt(i++));var n=(a<<18)|(b<<12)|((c&63)<<6)|(d&63);o+=String.fromCharCode((n>>16)&255);if(c!==64&&c>=0)o+=String.fromCharCode((n>>8)&255);if(d!==64&&d>=0)o+=String.fromCharCode(n&255);}return o;};
-W.btoa=function(s){s=String(s);var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
+/* atob by the forgiving-base64 rules (VitaSurf): padding may be left
+   off, and anything else wrong throws. Home Assistant reads its login
+   state from a query string whose parser drops the "=" padding, and the
+   old decoder turned the missing padding into NUL bytes, so JSON.parse
+   of the state threw and the app never asked for its token. */
+W.atob=function(s){
+ var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',
+     o='',i,n=0,bits=0,c;
+ s=String(s).replace(/[\t\n\f\r ]/g,'');
+ if(s.length%4===0)s=s.replace(/==?$/,'');
+ if(s.length%4===1||/[^A-Za-z0-9+\/]/.test(s))
+  throw new DOMException("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.",'InvalidCharacterError');
+ for(i=0;i<s.length;i++){
+  c=A.indexOf(s.charAt(i));
+  n=(n<<6)|c;bits+=6;
+  if(bits>=8){bits-=8;o+=String.fromCharCode((n>>bits)&255);}}
+ return o;};
+W.btoa=function(s){s=String(s);if(/[^\u0000-\u00ff]/.test(s))throw new DOMException("Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",'InvalidCharacterError');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
 function Image(){return document.createElement('img');}W.Image=Image;
 /* The other two legacy element constructors. new Audio() is how a page
    makes a sound without markup, and a page that calls it and gets a
@@ -2065,6 +2085,29 @@ W.Intl.Segmenter=function(loc,opt){var gran=(opt&&opt.granularity)||'grapheme';t
 Date.prototype.toLocaleDateString=function(){return new Intl.DateTimeFormat(undefined,{year:1,month:1,day:1}).format(this);};Date.prototype.toLocaleTimeString=function(){return new Intl.DateTimeFormat(undefined,{hour:1,minute:1,second:1}).format(this);};Date.prototype.toLocaleString=function(){return new Intl.DateTimeFormat(undefined,{year:1,month:1,day:1,hour:1,minute:1,second:1}).format(this);};
 function Option(t,v){var o=document.createElement('option');if(t!==undefined)o.textContent=t;if(v!==undefined)o.setAttribute('value',v);return o;}W.Option=Option;
 
+/* A data: URL's media type and bytes, or null when it is not one. */
+function dataURL(u){
+ var m=/^data:([^,]*),([\s\S]*)$/i.exec(String(u)),meta,b64,body,out,i,c,s,enc;
+ if(!m)return null;
+ meta=m[1];b64=/;\s*base64\s*$/i.test(meta);
+ if(b64)meta=meta.replace(/;\s*base64\s*$/i,'');
+ meta=meta.replace(/^\s+|\s+$/g,'')||'text/plain;charset=US-ASCII';
+ body=m[2];
+ if(b64){
+  try{s=W.atob(decodeURIComponent(body));}catch(e){return null;}
+  out=new Uint8Array(s.length);
+  for(i=0;i<s.length;i++)out[i]=s.charCodeAt(i)&255;}
+ else{
+  /* runs of text are encoded whole, so a character outside the basic
+     plane is not split into two halves */
+  var bytes=[],parts=body.split(/(%[0-9a-fA-F]{2})/),k,e;enc=new TextEncoder();
+  for(i=0;i<parts.length;i++){
+   c=parts[i];
+   if(!c)continue;
+   if(c.length===3&&c.charAt(0)==='%'&&/^%[0-9a-fA-F]{2}$/.test(c))bytes.push(parseInt(c.slice(1),16));
+   else{e=enc.encode(c);for(k=0;k<e.length;k++)bytes.push(e[k]);}}
+  out=new Uint8Array(bytes);}
+ return {type:meta,bytes:out.buffer};}
 /* --- XMLHttpRequest and fetch over __vitaFetch (qjs.c) --- */
 function XMLHttpRequest(){this.readyState=0;this.status=0;this.statusText='';this.responseText='';this.response='';this.responseType='';this.responseURL='';this.timeout=0;this.withCredentials=false;this._h={};this._l={};this._id=0;this._rh='';this.upload={addEventListener:function(){},removeEventListener:function(){}};}
 XMLHttpRequest.prototype={
@@ -2094,6 +2137,14 @@ send:function(body){var self=this;if(this.readyState!==1)return;var data=this._b
   else if(rt==='blob'){self.response=new Blob([self._bytes]);}
   else if(rt==='document'){self.response=null;}else self.response=text;
   self._set(4);self._emit('load');self._emit('loadend');};
+ /* a data: URL is its own response (VitaSurf): Web Awesome's icons
+    fetch their SVG from one, and the network layer refused them */
+ if(/^data:/i.test(this._u)){
+  var du=dataURL(this._u),u0=this._u;
+  setTimeout(function(){
+   if(!du)done(0,'',new ArrayBuffer(0),'bad data URL',u0);
+   else done(200,'content-type: '+du.type,du.bytes,null,u0);},0);
+  return;}
  this._id=__vitaFetch(this._u,this._m,hs,data,this.timeout|0,done);
  if(!this._id)setTimeout(function(){done(0,'',new ArrayBuffer(0),'request refused','');},0);},
 abort:function(){if(this._id){__vitaFetchAbort(this._id);this._id=0;}if(this.readyState!==0&&this.readyState!==4){this.readyState=4;this.status=0;this._emit('readystatechange');this._emit('abort');this._emit('loadend');}this.readyState=0;},
@@ -6062,6 +6113,9 @@ P.stop=function(){};
  * by asking whether it has one. */
 P.getElementById=function(id){
  if(this.nodeType===9)return docById(this,id);
+ /* a shadow root is its host here, and Home Assistant's dashboard
+    finds its view with this.shadowRoot.getElementById("view") */
+ if(this.nodeType===1)return this.__shadow?docById(this,id):null;
  if(this.nodeType!==11)return null;
  return docById(this,id);};
 
@@ -7601,6 +7655,28 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   if(W.Element)W.Element.prototype=E;
   if(W.CharacterData)W.CharacterData.prototype=N;
  }catch(e){}
+})();
+/* The document as a node (VitaSurf). The page's document is a plain
+ * object with its own methods, and it had none of the node ones:
+ * childNodes, firstChild, appendChild, getRootNode. Home Assistant's
+ * custom element registry polyfill calls getRootNode on it for every
+ * element it upgrades, and every one of them failed. The node bindings
+ * take the document object as the document node now, so it borrows
+ * them; what a document answers differently is set here. */
+(function(){
+ ['appendChild','removeChild','insertBefore','replaceChild',
+  'compareDocumentPosition','hasChildNodes','normalize','isEqualNode',
+  'isSameNode','lookupPrefix','lookupNamespaceURI','isDefaultNamespace',
+  'firstChild','lastChild','childNodes','getRootNode'].forEach(function(k){
+  if(Object.prototype.hasOwnProperty.call(D,k))return;
+  var d=Object.getOwnPropertyDescriptor(P,k);
+  if(d)try{Object.defineProperty(D,k,d);}catch(e){}});
+ [['parentNode',null],['parentElement',null],['nextSibling',null],
+  ['previousSibling',null],['nodeValue',null],['ownerDocument',null],
+  ['isConnected',true]].forEach(function(p){
+  if(Object.prototype.hasOwnProperty.call(D,p[0]))return;
+  try{Object.defineProperty(D,p[0],{configurable:true,
+   get:function(){return p[1];}});}catch(e){}});
 })();
 
  var kids=Object.getOwnPropertyDescriptor(P,'children');

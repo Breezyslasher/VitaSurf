@@ -281,11 +281,16 @@ function fireStorage(key, oldValue, newValue){
 }
 
 W.Storage = Storage;
+/* The store is kept here, not on the window: it was window._ls, and Home
+   Assistant's page defines a global function _ls to load its scripts, so
+   localStorage came back as that function and the app stopped at
+   "not a function" (VitaSurf). */
+var localStore = null;
 Object.defineProperty(W, 'localStorage', {
  configurable: true,
  get: function(){
-  if (!this._ls) this._ls = new Storage(readStore().local, true);
-  return this._ls;
+  if (!localStore) localStore = new Storage(readStore().local, true);
+  return localStore;
  }
 });
 W.sessionStorage = new Storage({}, false);	/* by design, not persisted */

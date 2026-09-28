@@ -276,6 +276,7 @@ struct jsthread {
 	unsigned relayout_ms;     /**< how long the last rebuild took */
 	uint32_t relayout_due;    /**< now_ms() the pending rebuild runs at, low 32 bits */
 	struct slot_map slots;    /**< the composed tree's slots (VitaSurf) */
+	void *doc_obj;            /**< the document object, compared by address */
 	unsigned js_scripts;      /**< scripts executed for this page */
 	unsigned js_bytes;        /**< their total size */
 	unsigned js_compile_ms;   /**< time spent compiling them */
@@ -1190,8 +1191,26 @@ static JSClassDef node_class = {
 
 static struct dom_node *this_node(JSContext *ctx, JSValueConst this_val)
 {
+	struct dom_node *node;
+	jsthread *thread;
 
 	vitasurf_js_binding_calls++;
+	node = JS_GetOpaque(this_val, node_class_id);
+	if (node != NULL) {
+		return node;
+	}
+	/*
+	 * The page's document object is a plain object with methods of
+	 * its own, not a wrapped node, so the node bindings refused it
+	 * and document had no childNodes, firstChild or appendChild
+	 * (VitaSurf). It stands for the document node here.
+	 */
+	thread = JS_GetContextOpaque(ctx);
+	if (thread != NULL && !thread->closed && JS_IsObject(this_val) &&
+	    thread->doc_obj != NULL &&
+	    JS_VALUE_GET_PTR(this_val) == thread->doc_obj) {
+		return (struct dom_node *)thread_document(thread);
+	}
 	return JS_GetOpaque2(ctx, this_val, node_class_id);
 }
 
@@ -5729,6 +5748,24 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 	}
 	if (url != NULL) {
 		vita_log("qjs: script navigates to %s", nsurl_access(url));
+		/* and from where: a page that sends itself somewhere
+		 * unexpected is otherwise a mystery in the log (VitaSurf) */
+		if (ctx != NULL) {
+			JSValue st = JS_Eval(ctx, "new Error().stack", 17,
+					     "<nav>", JS_EVAL_TYPE_GLOBAL);
+
+			if (JS_IsString(st)) {
+				const char *str = JS_ToCString(ctx, st);
+
+				if (str != NULL) {
+					vita_log("qjs: navigation from %.600s", str);
+					JS_FreeCString(ctx, str);
+				}
+			} else if (JS_IsException(st)) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+			}
+			JS_FreeValue(ctx, st);
+		}
 		if (thread->nav_pending != NULL) {
 			nsurl_unref(thread->nav_pending);
 		}
@@ -10939,6 +10976,7 @@ static bool setup_globals(jsthread *thread)
 	doc = JS_NewObject(ctx);
 	JS_SetPropertyFunctionList(ctx, doc, document_proto,
 				   (int)(sizeof(document_proto) / sizeof(document_proto[0])));
+	thread->doc_obj = JS_VALUE_GET_PTR(doc);
 	JS_SetPropertyStr(ctx, global, "document", doc);
 
 	/* console */

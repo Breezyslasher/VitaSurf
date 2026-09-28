@@ -1,0 +1,43 @@
+diff --git a/src/select/mq.h b/src/select/mq.h
+index ba3d005..514e924 100644
+--- a/src/select/mq.h
++++ b/src/select/mq.h
+@@ -211,8 +211,19 @@ static inline bool mq_match_feature(
+ 		return false;
+ 	}
+ 
+-	if (MQ_NAME(prefers_reduced_motion) ||
+-			MQ_NAME(prefers_reduced_transparency) ||
++	/*
++	 * Reduced motion is asked for (VitaSurf). An animation the page
++	 * runs costs the Vita most of its frame: Home Assistant's login
++	 * page draws a particle field on a canvas every frame unless the
++	 * browser says otherwise, and the page ran at 25 fps for it.
++	 */
++	if (MQ_NAME(prefers_reduced_motion)) {
++		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
++			return true;
++		return MQ_IS(reduce);
++	}
++
++	if (MQ_NAME(prefers_reduced_transparency) ||
+ 			MQ_NAME(prefers_contrast)) {
+ 		/* no preference is expressed */
+ 		if (feat->op == CSS_MQ_FEATURE_OP_BOOL)
+diff --git a/src/select/strings.c b/src/select/strings.c
+index 4485259..78ab7b2 100644
+--- a/src/select/strings.c
++++ b/src/select/strings.c
+@@ -256,11 +256,11 @@ css_error css_select_strings_intern(css_select_strings *str)
+ 	error = lwc_intern_string("no-preference", SLEN("no-preference"), &str->no_preference);
+ 	if (error != lwc_error_ok)
+ 		return css_error_from_lwc_error(error);
+-
+ 	error = lwc_intern_string("reduce", SLEN("reduce"), &str->reduce);
+ 	if (error != lwc_error_ok)
+ 		return css_error_from_lwc_error(error);
+ 
++
+ 	error = lwc_intern_string("none", SLEN("none"), &str->none);
+ 	if (error != lwc_error_ok)
+ 		return css_error_from_lwc_error(error);
