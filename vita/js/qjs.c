@@ -63,6 +63,7 @@
 #include "qjs_alloc.h"
 #include "subtle.h"
 #include "wasm.h"
+#include "websocket.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -6948,6 +6949,208 @@ static bool composed_hook(struct html_content *c, enum vitasurf_composed_op op,
 	}
 }
 
+/* ------------------------------------------------------------------------ */
+/* WebSocket (VitaSurf): vita/js/websocket.c does the connections           */
+
+/* An event on one of a page's connections, to the prelude's
+ * __vitaWsEvent(id, kind, data, code), run as script so the promise
+ * jobs a message handler queues run after it. */
+static void ws_event(void *owner, int id, enum vws_event ev,
+		     const char *data, size_t len, int code)
+{
+	jsthread *thread = owner;
+	JSContext *ctx;
+	JSValue global, fn, args[4], r;
+	int i;
+
+	if (thread == NULL || thread->closed || thread->ctx == NULL) {
+		return;
+	}
+	ctx = thread->ctx;
+	begin_script(thread, SCRIPT_XHR);
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaWsEvent");
+	if (JS_IsFunction(ctx, fn)) {
+		args[0] = JS_NewInt32(ctx, id);
+		args[1] = JS_NewInt32(ctx, (int)ev);
+		args[2] = (ev == VWS_BINARY) ?
+			JS_NewArrayBufferCopy(ctx, (const uint8_t *)data, len) :
+			JS_NewStringLen(ctx, data != NULL ? data : "", len);
+		args[3] = JS_NewInt32(ctx, code);
+		r = JS_Call(ctx, fn, global, 4, args);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		}
+		JS_FreeValue(ctx, r);
+		for (i = 0; i < 4; i++) {
+			JS_FreeValue(ctx, args[i]);
+		}
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	end_script(thread);
+}
+
+/* The cookies the page's http(s) URL of the same host would send. */
+static char *ws_cookie(const char *url)
+{
+	char *http;
+	nsurl *u = NULL;
+	char *cookie = NULL;
+	size_t n = strlen(url);
+
+	if (n < 5) {
+		return NULL;
+	}
+	http = malloc(n + 2);
+	if (http == NULL) {
+		return NULL;
+	}
+	if (strncasecmp(url, "wss:", 4) == 0) {
+		snprintf(http, n + 2, "https:%s", url + 4);
+	} else if (strncasecmp(url, "ws:", 3) == 0) {
+		snprintf(http, n + 2, "http:%s", url + 3);
+	} else {
+		free(http);
+		return NULL;
+	}
+	if (nsurl_create(http, &u) == NSERROR_OK) {
+		cookie = urldb_get_cookie(u, true);
+		nsurl_unref(u);
+	}
+	free(http);
+	return cookie;
+}
+
+/* __vitaWsOpen(url, protocols, origin): an id, or -1. */
+static JSValue win_vita_ws_open(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *url, *protocols = NULL, *origin = NULL;
+	char *cookie;
+	int id;
+
+	(void)this_val;
+	if (thread == NULL || thread->closed || argc < 1) {
+		return JS_NewInt32(ctx, -1);
+	}
+	url = JS_ToCString(ctx, argv[0]);
+	if (url == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (argc > 1 && JS_IsString(argv[1])) {
+		protocols = JS_ToCString(ctx, argv[1]);
+	}
+	if (argc > 2 && JS_IsString(argv[2])) {
+		origin = JS_ToCString(ctx, argv[2]);
+	}
+	cookie = ws_cookie(url);
+	id = vws_open(url, origin, protocols, cookie, ws_event, thread);
+	free(cookie);
+	JS_FreeCString(ctx, url);
+	if (protocols != NULL) {
+		JS_FreeCString(ctx, protocols);
+	}
+	if (origin != NULL) {
+		JS_FreeCString(ctx, origin);
+	}
+	return JS_NewInt32(ctx, id);
+}
+
+/* __vitaWsSend(id, data): data a string, or an ArrayBuffer or a view. */
+static JSValue win_vita_ws_send(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t id = 0;
+	bool ok = false;
+
+	(void)this_val;
+	if (argc < 2 || JS_ToInt32(ctx, &id, argv[0]) < 0) {
+		return JS_FALSE;
+	}
+	if (JS_IsString(argv[1])) {
+		size_t len = 0;
+		const char *str = JS_ToCStringLen(ctx, &len, argv[1]);
+
+		if (str == NULL) {
+			return JS_EXCEPTION;
+		}
+		ok = vws_send(id, str, len, false);
+		JS_FreeCString(ctx, str);
+	} else {
+		size_t len = 0, off = 0, bpe = 0;
+		uint8_t *buf = JS_GetArrayBuffer(ctx, &len, argv[1]);
+
+		if (buf == NULL) {
+			JSValue ab;
+
+			JS_FreeValue(ctx, JS_GetException(ctx));
+			ab = JS_GetTypedArrayBuffer(ctx, argv[1], &off, &len,
+						    &bpe);
+			if (JS_IsException(ab)) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+				return JS_FALSE;
+			}
+			{
+				size_t total = 0;
+				uint8_t *base = JS_GetArrayBuffer(ctx, &total, ab);
+
+				if (base != NULL && off + len <= total) {
+					ok = vws_send(id, base + off, len, true);
+				}
+			}
+			JS_FreeValue(ctx, ab);
+		} else {
+			ok = vws_send(id, buf, len, true);
+		}
+	}
+	return JS_NewBool(ctx, ok);
+}
+
+/* __vitaWsClose(id, code, reason) */
+static JSValue win_vita_ws_close(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t id = 0, code = 0;
+	size_t len = 0;
+	const char *reason = NULL;
+
+	(void)this_val;
+	if (argc < 1 || JS_ToInt32(ctx, &id, argv[0]) < 0) {
+		return JS_UNDEFINED;
+	}
+	if (argc > 1 && !JS_IsUndefined(argv[1]) &&
+	    JS_ToInt32(ctx, &code, argv[1]) < 0) {
+		return JS_EXCEPTION;
+	}
+	if (argc > 2 && JS_IsString(argv[2])) {
+		reason = JS_ToCStringLen(ctx, &len, argv[2]);
+	}
+	vws_close(id, code, reason, len);
+	if (reason != NULL) {
+		JS_FreeCString(ctx, reason);
+	}
+	return JS_UNDEFINED;
+}
+
+/* __vitaWsBuffered(id) */
+static JSValue win_vita_ws_buffered(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t id = 0;
+
+	(void)this_val;
+	if (argc < 1 || JS_ToInt32(ctx, &id, argv[0]) < 0) {
+		return JS_NewInt32(ctx, 0);
+	}
+	return JS_NewFloat64(ctx, (double)vws_buffered(id));
+}
+
 /*
  * __vitaSlots(nodes, slots): a host's own children, and for each the
  * slot that draws it or null. Replaces what was known before.
@@ -10858,6 +11061,18 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaCanvasMeasure", 5));
 	JS_SetPropertyStr(ctx, global, "__vitaGap",
 			  JS_NewCFunction(ctx, win_vita_gap, "__vitaGap", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaWsOpen",
+			  JS_NewCFunction(ctx, win_vita_ws_open,
+					  "__vitaWsOpen", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaWsSend",
+			  JS_NewCFunction(ctx, win_vita_ws_send,
+					  "__vitaWsSend", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaWsClose",
+			  JS_NewCFunction(ctx, win_vita_ws_close,
+					  "__vitaWsClose", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaWsBuffered",
+			  JS_NewCFunction(ctx, win_vita_ws_buffered,
+					  "__vitaWsBuffered", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaSlots",
 			  JS_NewCFunction(ctx, win_vita_slots,
 					  "__vitaSlots", 2));
@@ -11472,6 +11687,7 @@ nserror js_closethread(jsthread *thread)
 	t0 = now_ms();
 	thread->closed = true;
 	slot_map_free(&thread->slots);
+	vws_drop_owner(thread);
 	/* a navigation the page asked for goes with the page */
 	if (thread->nav_pending != NULL) {
 		guit->misc->schedule(-1, nav_callback, thread);

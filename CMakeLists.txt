@@ -151,8 +151,9 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
+    # websocket.c runs WebSocket connections on libcurl's ws API
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
-        vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c)
+        vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c)
     # subtle.c takes Ed25519 and X25519 from Monocypher, which mbedTLS
     # does not have
     target_sources(${PROJECT_NAME} PRIVATE

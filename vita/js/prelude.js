@@ -2101,6 +2101,130 @@ getResponseHeader:function(n){var lines=this._rh.split('\n'),p=String(n).toLower
 getAllResponseHeaders:function(){return this._rh?this._rh.replace(/\n/g,'\r\n'):'';},
 overrideMimeType:function(){}};
 W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpRequestEventTarget=function(){};
+/* WebSocket (VitaSurf), over curl's ws API in vita/js/websocket.c.
+ * Home Assistant's whole interface talks to its server over one, and
+ * the app stopped at "WebSocket is not defined" as soon as the login
+ * went through. The connection runs in C; events come back through
+ * __vitaWsEvent from the scheduler, never from inside a call here. */
+(function(){
+ if(typeof __vitaWsOpen!=='function')return;
+ var OPEN_=__vitaWsOpen,SEND_=__vitaWsSend,CLOSE_=__vitaWsClose,
+     BUF_=__vitaWsBuffered,socks=Object.create(null),
+     /* the prototype as it is now: a later part replaces
+        EventTarget.prototype, and listeners added through this one
+        must be dispatched by this one */
+     ETP=EventTarget.prototype;
+ function dx(msg,name){return new DOMException(msg,name);}
+ function fire(ws,e){
+  var h=ws['on'+e.type];
+  try{e.target=ws;e.currentTarget=ws;}catch(x){}
+  if(typeof h==='function'){
+   try{h.call(ws,e);}catch(err){if(W.__vitaReportError)W.__vitaReportError(err);}}
+  ETP.dispatchEvent.call(ws,e);}
+ function utf8len(s){
+  var n=0,i,c;
+  for(i=0;i<s.length;i++){c=s.charCodeAt(i);
+   n+=c<0x80?1:c<0x800?2:(c>=0xd800&&c<0xdc00)?(i++,4):3;}
+  return n;}
+ function WebSocket(url,protocols){
+  if(!(this instanceof WebSocket))
+   throw new TypeError("Failed to construct 'WebSocket': Please use the 'new' operator");
+  var u,list,i,st;
+  try{u=new URL(String(url),location.href);}
+  catch(e){throw dx("Failed to construct 'WebSocket': The URL '"+url+"' is invalid.",'SyntaxError');}
+  if(u.protocol==='http:')u.protocol='ws:';
+  else if(u.protocol==='https:')u.protocol='wss:';
+  if(u.protocol!=='ws:'&&u.protocol!=='wss:')
+   throw dx("Failed to construct 'WebSocket': The URL's scheme must be either "+
+    "'http', 'https', 'ws', or 'wss'. '"+u.protocol.slice(0,-1)+"' is not allowed.",'SyntaxError');
+  if(u.hash)u.hash='';
+  list=protocols===undefined?[]:(typeof protocols==='string'?[protocols]:
+   Array.prototype.slice.call(protocols).map(String));
+  for(i=0;i<list.length;i++){
+   if(!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(list[i])||list.indexOf(list[i])!==i)
+    throw dx("Failed to construct 'WebSocket': The subprotocol '"+list[i]+
+     "' is invalid.",'SyntaxError');}
+  st={id:-1,state:0,protocol:'',binaryType:'blob',url:u.href,extra:0};
+  Object.defineProperty(this,'__ws',{value:st});
+  this.onopen=this.onmessage=this.onerror=this.onclose=null;
+  st.id=OPEN_(u.href,list.join(', '),location.origin);
+  if(st.id<0){
+   var me=this;
+   st.state=3;
+   setTimeout(function(){
+    fire(me,new Event('error'));
+    fire(me,new CloseEvent('close',{wasClean:false,code:1006,reason:''}));},0);
+   return;}
+  socks[st.id]=this;}
+ WebSocket.prototype=Object.create(ETP);
+ WebSocket.prototype.constructor=WebSocket;
+ ['CONNECTING','OPEN','CLOSING','CLOSED'].forEach(function(k,i){
+  Object.defineProperty(WebSocket,k,{value:i,enumerable:true});
+  Object.defineProperty(WebSocket.prototype,k,{value:i,enumerable:true});});
+ function st(ws){
+  if(!ws||!ws.__ws)throw new TypeError('Illegal invocation');
+  return ws.__ws;}
+ Object.defineProperties(WebSocket.prototype,{
+  url:{configurable:true,get:function(){return st(this).url;}},
+  readyState:{configurable:true,get:function(){return st(this).state;}},
+  protocol:{configurable:true,get:function(){return st(this).protocol;}},
+  extensions:{configurable:true,get:function(){st(this);return '';}},
+  bufferedAmount:{configurable:true,get:function(){
+   var s=st(this);return (s.id>0&&s.state<3?BUF_(s.id):0)+s.extra;}},
+  binaryType:{configurable:true,get:function(){return st(this).binaryType;},
+   set:function(v){if(v==='blob'||v==='arraybuffer')st(this).binaryType=v;}}});
+ WebSocket.prototype.send=function(data){
+  var s=st(this),me=this,n;
+  if(arguments.length<1)
+   throw new TypeError("Failed to execute 'send' on 'WebSocket': 1 argument required, but only 0 present.");
+  if(s.state===0)
+   throw dx("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.",'InvalidStateError');
+  if(W.Blob&&data instanceof W.Blob){
+   if(s.state!==1){s.extra+=data.size||0;return;}
+   data.arrayBuffer().then(function(b){if(s.state===1)SEND_(s.id,b);});
+   return;}
+  if(data instanceof ArrayBuffer||ArrayBuffer.isView(data)){
+   n=data.byteLength;
+   if(s.state!==1){s.extra+=n;return;}
+   SEND_(s.id,data);return;}
+  data=String(data);
+  if(s.state!==1){s.extra+=utf8len(data);return;}
+  SEND_(s.id,data);};
+ WebSocket.prototype.close=function(code,reason){
+  var s=st(this);
+  if(code!==undefined){
+   code=Number(code)|0;
+   if(code!==1000&&(code<3000||code>4999))
+    throw dx("Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. "+code+' is neither.','InvalidAccessError');}
+  reason=reason===undefined?'':String(reason);
+  if(utf8len(reason)>123)
+   throw dx("Failed to execute 'close' on 'WebSocket': The message must not be greater than 123 bytes.",'SyntaxError');
+  if(s.state>=2)return;
+  s.state=2;
+  CLOSE_(s.id,code===undefined?(reason?1000:0):code,reason);};
+ Object.defineProperty(W,'__vitaWsEvent',{configurable:true,writable:true,enumerable:false,
+  value:function(id,kind,data,code){
+   var ws=socks[id],s,d;
+   if(!ws)return;
+   s=ws.__ws;
+   if(kind===1){
+    if(s.state!==0)return;
+    s.state=1;s.protocol=data||'';
+    fire(ws,new Event('open'));}
+   else if(kind===2||kind===3){
+    if(s.state!==1)return;
+    d=data;
+    if(kind===3&&s.binaryType==='blob'&&W.Blob)d=new W.Blob([data]);
+    fire(ws,new MessageEvent('message',{data:d,origin:new URL(s.url).origin}));}
+   else if(kind===4){
+    fire(ws,new Event('error'));}
+   else if(kind===5){
+    delete socks[id];
+    s.state=3;
+    fire(ws,new CloseEvent('close',{wasClean:code!==1006,code:code,reason:data||''}));}}});
+ W.WebSocket=WebSocket;
+})();
+
 function FormData(form){this._p=[];if(form&&form.getElementsByTagName){['input','select','textarea'].forEach(function(t){var els=form.getElementsByTagName(t);for(var i=0;i<els.length;i++){var e=els[i],n=e.getAttribute('name');if(!n||e.disabled)continue;var ty=(e.getAttribute('type')||'').toLowerCase();if(ty==='checkbox'||ty==='radio'){if(e.checked)this._p.push([n,e.value||'on']);}else if(ty!=='submit'&&ty!=='button'&&ty!=='file')this._p.push([n,e.value]);}},this);
  if(W.__vitaFaceSeen)faceEntries(form).forEach(function(p){this._p.push(p);},this);}}
 /* the entries form-associated custom elements give their form: a string,

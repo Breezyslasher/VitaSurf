@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!-- WebSocket against tests/websocket/echo-server.py, which serves this
+     page on its port and the socket on the next. Expected console
+     output: ten lines ending in "ok", then DONE. -->
+<html><body><script>
+function ok(n, c, extra) { console.log(n + ": " + (c ? "ok" : "FAIL " + (extra || ""))); }
+var port = Number(location.port) + 1, base = 'ws://127.0.0.1:' + port + '/';
+var ws = new WebSocket(base, ['chat', 'other']), got = [], t0 = Date.now();
+ok("starts connecting", ws.readyState === WebSocket.CONNECTING);
+ws.binaryType = 'arraybuffer';
+ws.onopen = function () {
+  ok("opens with the chosen protocol", ws.readyState === 1 && ws.protocol === 'chat', ws.protocol);
+  ws.send('hello');
+  ws.send(new Uint8Array([1, 2, 250]).buffer);
+  ws.send('big');
+  ws.send('close');
+};
+ws.addEventListener('message', function (e) { got.push(e.data); });
+ws.onclose = function (e) {
+  ok("text echoed", got[0] === 'hello', JSON.stringify(got[0]));
+  ok("binary echoed as an ArrayBuffer", got[1] instanceof ArrayBuffer && new Uint8Array(got[1])[2] === 250);
+  ok("a 300 KB message arrives whole", typeof got[2] === 'string' && got[2].length === 300000, got[2] && got[2].length);
+  ok("the server's close code and reason", e.code === 4001 && e.reason === 'bye' && e.wasClean, e.code + ' ' + e.reason);
+  ok("closed", ws.readyState === 3);
+  var bad = new WebSocket('ws://127.0.0.1:1/'), sawError = false;
+  bad.onerror = function () { sawError = true; };
+  bad.onclose = function (e2) {
+    ok("a refused connection errors and closes 1006", sawError && e2.code === 1006 && !e2.wasClean, e2.code);
+    var threw = false;
+    try { new WebSocket('ftp://x/'); } catch (x) { threw = x.name === 'SyntaxError'; }
+    ok("a bad scheme throws SyntaxError", threw);
+    var mine = new WebSocket(base);
+    mine.onopen = function () { mine.close(1000, 'done'); };
+    mine.onclose = function (e3) {
+      ok("our own close completes cleanly", e3.code === 1000 && e3.wasClean && mine.readyState === 3, e3.code + ' ' + e3.wasClean);
+      console.log("DONE " + (Date.now() - t0) + " ms");
+    };
+  };
+};
+</script></body></html>
