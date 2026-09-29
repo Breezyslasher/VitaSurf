@@ -188,6 +188,28 @@ jobs:
           name: VitaSurf-extmem-${{ github.run_number }}
           path: build-ext/VitaSurf.vpk
 
+      - name: Build the animation VPK
+        # The same build linked again with CSS animations running, while
+        # what they cost is measured on hardware (the log's "anim:"
+        # lines). The others show where each animation comes to rest.
+        if: matrix.engine == 'quickjs'
+        run: |
+          cmake -B build-anim -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$VITASDK/share/vita.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVITASURF_JS_ENGINE="${{ matrix.engine }}" \
+            -DVITASURF_ANIMATIONS=ON \
+            -DVITASURF_BUILD_ID="${GITHUB_RUN_NUMBER}" \
+            -DVITASURF_BUILD_SHA="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          cmake --build build-anim
+
+      - name: Upload the animation VPK
+        if: matrix.engine == 'quickjs'
+        uses: actions/upload-artifact@v4
+        with:
+          name: VitaSurf-anim-${{ github.run_number }}
+          path: build-anim/VitaSurf.vpk
+
       - name: Upload ELF for debugging
         uses: actions/upload-artifact@v4
         with:

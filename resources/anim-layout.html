@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Animation test: layout</title>
+<meta name="viewport" content="width=device-width">
+<style>
+body { font: 18px sans-serif; margin: 20px; background: #fff; color: #222; }
+@keyframes slide { from { left: 0; } to { left: 300px; } }
+@keyframes grow { from { width: 60px; } to { width: 400px; } }
+.box { position: relative; width: 120px; padding: 10px; margin: 10px 0;
+  background: #1a73e8; color: #fff; }
+.slide { animation: slide 2s ease-in-out infinite alternate; }
+.grow { animation: grow 3s linear infinite alternate; }
+</style></head><body>
+<h1>Animation test: layout</h1>
+<p>A box moved by left and a box whose width changes: each frame lays the
+page out again, which is what an animation of a size or position costs.
+The "anim:" lines count these as relayouts.</p>
+<div class="box slide">Sliding</div>
+<div class="box grow">Growing, with text that wraps as the box changes size</div>
+<p><a href="file:///resources/anim-light.html">Light test</a> |
+<a href="file:///resources/anim-heavy.html">Heavy test</a></p>
+</body></html>

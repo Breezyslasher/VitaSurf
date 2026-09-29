@@ -77,6 +77,10 @@ set(NETSURF_STAGE "${CMAKE_SOURCE_DIR}/out/netsurf" CACHE PATH
 # budget the system actually grants, so a build that asks and is refused
 # starts with the ordinary heap.
 option(VITASURF_EXTENDED_MEMORY "Request the extended memory budget" OFF)
+# CSS animations run, rather than showing where they come to rest. CI
+# builds it as a third VPK (VitaSurf-anim) while its cost is measured on
+# hardware; the log's "anim:" lines give the frame rate.
+option(VITASURF_ANIMATIONS "Run CSS animations" OFF)
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
 if(VITASURF_EXTENDED_MEMORY)
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
@@ -211,6 +215,9 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 )
 if(VITASURF_EXTENDED_MEMORY)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_EXTENDED_MEMORY=1)
+endif()
+if(VITASURF_ANIMATIONS)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_ANIMATIONS=1)
 endif()
 if(VITASURF_DEBUG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_DEBUG=1)
@@ -353,6 +360,9 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
     FILE resources/Choices                        resources/Choices
     FILE resources/vitasurf.html                  resources/vitasurf.html
     FILE resources/jstest.html                    resources/jstest.html
+    FILE resources/anim-light.html                resources/anim-light.html
+    FILE resources/anim-heavy.html                resources/anim-heavy.html
+    FILE resources/anim-layout.html               resources/anim-layout.html
     FILE resources/cacert.pem                     resources/cacert.pem
     ${VPK_FILES}
 )

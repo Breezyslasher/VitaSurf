@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Animation test: light</title>
+<meta name="viewport" content="width=device-width">
+<style>
+body { font: 18px sans-serif; margin: 20px; background: #fff; color: #222; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
+.spinner { width: 48px; height: 48px; border: 6px solid #ccc;
+  border-top-color: #1a73e8; border-radius: 50%;
+  animation: spin 1s linear infinite; margin: 20px 0; }
+.pulse { width: 200px; padding: 12px; background: #1a73e8; color: #fff;
+  animation: pulse 2s ease-in-out infinite; }
+</style></head><body>
+<h1>Animation test: light</h1>
+<p>One spinner (a transform) and one fading box (opacity). Both only
+repaint. The log has a line starting "anim:" every five seconds with
+the frame rate and what selecting the moving elements cost.</p>
+<div class="spinner"></div>
+<div class="pulse">Fading in and out</div>
+<p><a href="file:///resources/anim-heavy.html">Heavy test</a> |
+<a href="file:///resources/anim-layout.html">Layout test</a></p>
+</body></html>

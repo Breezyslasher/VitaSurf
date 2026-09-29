@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!-- CSS animations running at a clock (--css_animations=1): a colour
+     and a left offset part way through a linear two-second animation,
+     a delay not yet over, a finished animation that fills forwards and
+     one that does not, and one with no keyframes at its start or end,
+     which run from and to the element's own style. Expected console
+     output: lines ending in "PASS". -->
+<html><head><style>
+body { margin: 0; }
+@keyframes redden { from { color: rgb(0, 0, 0); } to { color: rgb(200, 0, 0); } }
+@keyframes slide { from { left: 0px; } to { left: 200px; } }
+@keyframes middle { 50% { color: rgb(0, 0, 200); } }
+@keyframes quick { to { color: rgb(0, 150, 0); } }
+div { position: relative; width: 50px; height: 20px; }
+#c { animation: redden 2s linear; }
+#l { animation: slide 2s linear infinite; }
+#d { animation: redden 2s linear 10s both; }
+#f { animation: quick 100ms forwards; }
+#n { animation: quick 100ms; color: rgb(1, 2, 3); }
+#m { animation: middle 2s linear; color: rgb(0, 0, 0); }
+</style></head><body>
+<div id=c>c</div><div id=l>l</div><div id=d>d</div>
+<div id=f>f</div><div id=n>n</div><div id=m>m</div>
+<script>
+setTimeout(function () {
+  function col(id) { return getComputedStyle(document.getElementById(id)).color; }
+  function red(id) { return +col(id).match(/\d+/)[0]; }
+  function t(label, ok, got) {
+    console.log((ok ? 'PASS ' : 'FAIL ') + label + ' (' + got + ')'); }
+  var r = red('c');
+  t('a colour part way through', r > 60 && r < 160, r);
+  var x = document.getElementById('l').getBoundingClientRect().left;
+  t('a left offset part way through', x > 60 && x < 160, x);
+  t('a delay not over fills backwards', col('d') === 'rgb(0, 0, 0)', col('d'));
+  t('a finished animation fills forwards', col('f') === 'rgb(0, 150, 0)', col('f'));
+  t('one that does not fill goes back', col('n') === 'rgb(1, 2, 3)', col('n'));
+  var b = +col('m').match(/\d+/g)[2];
+  t('from its own style towards a middle keyframe', b > 150 && b <= 200, col('m'));
+}, 1100);
+</script></body></html>

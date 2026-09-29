@@ -146,10 +146,17 @@ void vita_options_floor(void)
 	if (nsoption_int(memory_cache_size) < 24 * 1024 * 1024) {
 		nsoption_set_int(memory_cache_size, 24 * 1024 * 1024);
 	}
-	vita_log("options: %d fetchers, %d per host, memory cache %d MB",
+#ifdef VITASURF_ANIMATIONS
+	/* the animation build runs them, whatever Choices says */
+	nsoption_set_bool(css_animations, true);
+#endif
+	vita_log("options: %d fetchers, %d per host, memory cache %d MB, "
+		 "CSS animations %s at %d frames a second",
 		 nsoption_int(max_fetchers),
 		 nsoption_int(max_fetchers_per_host),
-		 nsoption_int(memory_cache_size) / (1024 * 1024));
+		 nsoption_int(memory_cache_size) / (1024 * 1024),
+		 nsoption_bool(css_animations) ? "on" : "off",
+		 nsoption_int(css_animation_fps));
 }
 
 /*
