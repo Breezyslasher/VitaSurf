@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<!-- Anchor positioning. Each XX line gives where a box went and PASS
+     when it is where a browser puts it. The anchor #btn is 100x30 at
+     (50, 40); the popover #pop has no position-anchor and is placed
+     against the button that opens it. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+#btn { position: absolute; left: 50px; top: 40px; width: 100px; height: 30px; anchor-name: --btn; }
+.p { position: absolute; width: 60px; height: 20px; position-anchor: --btn; margin: 0; }
+#below { top: anchor(bottom); left: anchor(left); }
+#right { left: anchor(right); top: anchor(center); }
+#calc { top: calc(anchor(bottom) + 5px); left: calc(anchor(--btn right) - 60px); }
+#area { position-area: bottom; }
+#areatl { position-area: top left; }
+#size { width: anchor-size(width); top: anchor(top); left: anchor(left); }
+#flip { position-anchor: --low; top: anchor(bottom); left: 0; position-try-fallbacks: flip-block; }
+#low { position: absolute; top: 570px; left: 0; width: 40px; height: 20px; anchor-name: --low; }
+#over { top: anchor(bottom); top: 7px; left: anchor(left); }
+#pop { position: fixed; inset: auto; margin: 0; top: anchor(bottom); left: anchor(left); width: 30px; height: 10px; }
+#pb { position: absolute; left: 300px; top: 10px; width: 40px; height: 20px; }
+</style></head><body>
+<div id="btn"></div>
+<div class="p" id="below"></div>
+<div class="p" id="right"></div>
+<div class="p" id="calc"></div>
+<div class="p" id="area"></div>
+<div class="p" id="areatl"></div>
+<div class="p" id="size"></div>
+<div id="low"></div>
+<div class="p" id="flip"></div>
+<div class="p" id="over"></div>
+<button id="pb" popovertarget="pop">open</button>
+<div id="pop" popover style="display:block">x</div>
+<div style="height: 600px"></div>
+<script>
+var want = {
+  below: [50, 70], right: [150, 55], calc: [90, 75], area: [70, 70],
+  areatl: [-10, 20], size: [50, 40, 100], flip: [0, 550], over: [50, 7],
+  pop: null
+};
+window.addEventListener('load', function () { setTimeout(function () {
+  var n = 0, ok = 0;
+  for (var id in want) {
+    var r = document.getElementById(id).getBoundingClientRect(), w = want[id];
+    if (w === null) {
+      /* the popover's default anchor is the button that opens it */
+      var b = document.getElementById('pb').getBoundingClientRect();
+      w = [Math.round(b.left), Math.round(b.bottom)];
+    }
+    var got = [Math.round(r.left), Math.round(r.top)];
+    if (w.length > 2) got.push(Math.round(r.width));
+    var pass = got.join() === w.join();
+    n++; if (pass) ok++;
+    console.log('XX ' + id + ' ' + got.join(',') + (pass ? ' PASS' : ' FAIL (want ' + w.join(',') + ')'));
+  }
+  console.log('XX supports ' + CSS.supports('anchor-name', '--a') + ' ' + CSS.supports('top', 'anchor(bottom)'));
+  console.log('XX ' + ok + ' of ' + n + ' pass');
+}, 200); });
+</script></body></html>

@@ -10538,6 +10538,25 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 				css_computed_backface_visibility(s));
 	}
 	{
+		/* anchor positioning, as written */
+		lwc_string *as = NULL;
+
+		sm_set(ctx, obj, "anchorName",
+				css_computed_anchor_name(s, &as) ==
+					CSS_ANCHOR_NAME_SET && as != NULL ?
+				lwc_string_data(as) : "none");
+		as = NULL;
+		sm_set(ctx, obj, "positionAnchor",
+				css_computed_position_anchor(s, &as) ==
+					CSS_POSITION_ANCHOR_SET && as != NULL ?
+				lwc_string_data(as) : "auto");
+		as = NULL;
+		sm_set(ctx, obj, "positionArea",
+				css_computed_position_area(s, &as) ==
+					CSS_POSITION_AREA_SET && as != NULL ?
+				lwc_string_data(as) : "none");
+	}
+	{
 		static const char *const cv[] = { NULL, "visible", "auto",
 			"hidden" };
 
