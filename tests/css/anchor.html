@@ -18,6 +18,14 @@ body { margin: 0; }
 #over { top: anchor(bottom); top: 7px; left: anchor(left); }
 #pop { position: fixed; inset: auto; margin: 0; top: anchor(bottom); left: anchor(left); width: 30px; height: 10px; }
 #pb { position: absolute; left: 300px; top: 10px; width: 40px; height: 20px; }
+@position-try --above { top: auto; bottom: anchor(top); }
+#tr { position-anchor: --low; top: anchor(bottom); left: anchor(right); position-try-fallbacks: --above; }
+#ac { top: anchor(bottom); justify-self: anchor-center; }
+#wide { position: absolute; position-anchor: --btn; position-area: left; font: 10px/10px sans-serif; }
+#sc { position: absolute; left: 500px; top: 100px; width: 100px; height: 50px; overflow: auto; }
+#scin { height: 300px; }
+#sca { height: 20px; anchor-name: --sca; }
+#scp { position: absolute; position-anchor: --sca; top: anchor(bottom); left: anchor(left); width: 20px; height: 10px; }
 </style></head><body>
 <div id="btn"></div>
 <div class="p" id="below"></div>
@@ -31,12 +39,17 @@ body { margin: 0; }
 <div class="p" id="over"></div>
 <button id="pb" popovertarget="pop">open</button>
 <div id="pop" popover style="display:block">x</div>
+<div class="p" id="tr"></div>
+<div class="p" id="ac"></div>
+<div id="wide">a b c d e f g h i j k l m n o p q r s t u v w x y z a b c d e f g h</div>
+<div id="sc"><div id="scin"><div id="sca"></div></div></div>
+<div id="scp"></div>
 <div style="height: 600px"></div>
 <script>
 var want = {
   below: [50, 70], right: [150, 55], calc: [90, 75], area: [70, 70],
   areatl: [-10, 20], size: [50, 40, 100], flip: [0, 550], over: [50, 7],
-  pop: null
+  pop: null, tr: [40, 550], ac: [70, 70]
 };
 window.addEventListener('load', function () { setTimeout(function () {
   var n = 0, ok = 0;
@@ -53,6 +66,17 @@ window.addEventListener('load', function () { setTimeout(function () {
     n++; if (pass) ok++;
     console.log('XX ' + id + ' ' + got.join(',') + (pass ? ' PASS' : ' FAIL (want ' + w.join(',') + ')'));
   }
+  var wd = document.getElementById('wide').getBoundingClientRect(); n++;
+  var wok = Math.round(wd.width) <= 50 && Math.round(wd.right) === 50;
+  if (wok) ok++;
+  console.log('XX wide ' + Math.round(wd.left) + '..' + Math.round(wd.right) + (wok ? ' PASS' : ' FAIL (want no wider than 50, ending at 50)'));
+  var before = Math.round(document.getElementById('scp').getBoundingClientRect().top);
+  document.getElementById('sc').scrollTop = 15;
+  setTimeout(function () {
+    var after = Math.round(document.getElementById('scp').getBoundingClientRect().top);
+    var sok = before === 120 && after === 105;
+    console.log('XX scrolled anchor ' + before + ' -> ' + after + (sok ? ' PASS' : ' FAIL (want 120 -> 105)'));
+  }, 100);
   console.log('XX supports ' + CSS.supports('anchor-name', '--a') + ' ' + CSS.supports('top', 'anchor(bottom)'));
   console.log('XX ' + ok + ' of ' + n + ' pass');
 }, 200); });

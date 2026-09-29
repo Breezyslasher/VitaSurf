@@ -205,7 +205,9 @@ Object.keys(BOXIDX).forEach(function(a){var i=BOXIDX[a];Object.defineProperty(P,
 ['clientWidth','clientHeight'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){if(isViewportEl(this)){return viewport()[2+n];}return boxOf(this)[4+n];}});});
 Object.defineProperty(P,'offsetParent',{configurable:true,get:function(){var n=this.parentNode;while(n&&n.nodeType===1&&n!==D.body&&n!==D.documentElement)n=n.parentNode;return n&&n.nodeType===1?n:null;}});
 ['offsetTop','offsetLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){var b=__vitaBox(this);if(!b)return 0;var p=this.offsetParent,pb=p?__vitaBox(p):null;return b[1-n]-(pb?pb[1-n]:0);}});});
-['scrollTop','scrollLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){if(isViewportEl(this)||this===D.body){return viewport()[1-n];}return boxOf(this)[11-n];},set:function(v){if(isViewportEl(this)||this===D.body){var s=viewport();__vitaScrollTo(n===1?Number(v)||0:s[0],n===1?s[1]:Number(v)||0);}}});});
+['scrollTop','scrollLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){if(isViewportEl(this)||this===D.body){return viewport()[1-n];}return boxOf(this)[11-n];},set:function(v){if(isViewportEl(this)||this===D.body){var s=viewport();__vitaScrollTo(n===1?Number(v)||0:s[0],n===1?s[1]:Number(v)||0);}
+ /* a box that scrolls its own content (VitaSurf) */
+ else if(typeof __vitaScrollElement==='function')__vitaScrollElement(this,n===1?Number(v)||0:null,n===1?null:Number(v)||0);}});});
 P.tabIndex=0;
 ['onclick','onchange','onsubmit','oninput','onkeydown','onkeyup','onkeypress','onmousedown','onmouseup','onmouseover','onmouseout','onfocus','onblur','onload','onerror','ontouchstart','ontouchend'].forEach(function(h){Object.defineProperty(P,h,{configurable:true,get:function(){return this['__'+h]||null;},set:function(f){this['__'+h]=f;if(typeof f==='function')this.addEventListener(h.slice(2),function(e){return f.call(this,e);});}});});
 P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};var s=viewport(),x=b[0]-s[0],y=b[1]-s[1];return {x:x,y:y,left:x,top:y,width:b[2],height:b[3],right:x+b[2],bottom:y+b[3]};};
@@ -718,8 +720,17 @@ P.insertAdjacentText=function(where,t){
  * scrolling an element that is not the root scrolls what actually
  * scrolls rather than doing nothing. scrollIntoViewIfNeeded is the old
  * WebKit spelling of a method we already have. */
-P.scrollTo=P.scroll=function(a,b){window.scrollTo(a,b);};
-P.scrollBy=function(a,b){window.scrollBy(a,b);};
+/* an element that scrolls its own content is scrolled; any other
+   scrolls the page, as before (VitaSurf) */
+function elScrollArgs(a,b){if(a&&typeof a==='object')return [a.left,a.top];return [a,b];}
+P.scrollTo=P.scroll=function(a,b){var p=elScrollArgs(a,b);
+ if(typeof __vitaScrollElement==='function'&&!isViewportEl(this)&&this!==D.body&&
+  __vitaScrollElement(this,p[0]===undefined?null:Number(p[0])||0,p[1]===undefined?null:Number(p[1])||0))return;
+ window.scrollTo(a,b);};
+P.scrollBy=function(a,b){var p=elScrollArgs(a,b);
+ if(typeof __vitaScrollElement==='function'&&!isViewportEl(this)&&this!==D.body&&
+  __vitaScrollElement(this,p[0]===undefined?null:this.scrollLeft+(Number(p[0])||0),p[1]===undefined?null:this.scrollTop+(Number(p[1])||0)))return;
+ window.scrollBy(a,b);};
 P.scrollIntoViewIfNeeded=function(centre){return this.scrollIntoView(centre===false?{block:'nearest'}:true);};
 P.toggleAttribute=function(n,force){
  checkAttrName(n);

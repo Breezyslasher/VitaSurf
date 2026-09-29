@@ -83,6 +83,7 @@
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_construct.h"
 #include "content/handlers/html/box_inspect.h"
+#include "content/handlers/html/box_manipulate.h"
 #include "content/handlers/html/css.h"
 #include "content/handlers/html/frame_doc.h"
 #include "desktop/browser_private.h"
@@ -10063,7 +10064,8 @@ static const char *const sm_justify_content[] = { NULL, "flex-start",
 	"flex-end", "center", "space-between", "space-around",
 	"space-evenly" };
 static const char *const sm_align_items[] = { NULL, "stretch",
-	"flex-start", "flex-end", "center", "baseline", "auto" };
+	"flex-start", "flex-end", "center", "baseline", "auto",
+	"anchor-center" };
 static const char *const sm_align_content[] = { NULL, "stretch",
 	"flex-start", "flex-end", "center", "space-between",
 	"space-around", "space-evenly" };
@@ -10315,6 +10317,7 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			css_computed_justify_content(s));
 	SM_ENUM("alignItems", sm_align_items, css_computed_align_items(s));
 	SM_ENUM("alignSelf", sm_align_items, css_computed_align_self(s));
+	SM_ENUM("justifySelf", sm_align_items, css_computed_justify_self(s));
 	SM_ENUM("alignContent", sm_align_content,
 			css_computed_align_content(s));
 	v = 0;
@@ -10708,6 +10711,65 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 	}
 	lwc_string_unref(lname);
 	return ret;
+}
+
+/*
+ * __vitaScrollElement(node, x, y): scroll a box that scrolls its own
+ * content to x and y in CSS px, either null to leave that axis
+ * (VitaSurf). True when the box has a scrollbar for an axis it was
+ * asked to move. The scrollbar tells the page it moved, which redraws
+ * the box and places again what is anchored inside it.
+ */
+static JSValue win_vita_scroll_element(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct box *box;
+	bool done = false;
+	double v;
+
+	(void)this_val;
+	if (argc < 3 || thread == NULL || thread->htmlc == NULL)
+		return JS_FALSE;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !layout_current(thread))
+		return JS_FALSE;
+	box = box_for_node(node);
+	if (box == NULL || box->style == NULL)
+		return JS_FALSE;
+
+	/* the scrollbars are made when the box is first drawn; one not
+	 * drawn yet has them made now, as drawing would */
+	if (box->scroll_x == NULL && box->scroll_y == NULL) {
+		uint8_t ox = css_computed_overflow_x(box->style);
+		uint8_t oy = css_computed_overflow_y(box->style);
+		bool hx = ox == CSS_OVERFLOW_SCROLL ||
+				(ox == CSS_OVERFLOW_AUTO &&
+				 box_hscrollbar_present(box));
+		bool hy = oy == CSS_OVERFLOW_SCROLL ||
+				(oy == CSS_OVERFLOW_AUTO &&
+				 box_vscrollbar_present(box));
+
+		if ((hx || hy) && box_handle_scrollbars(
+				(struct content *) thread->htmlc, box, hx,
+				hy) != NSERROR_OK)
+			return JS_FALSE;
+	}
+	if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1]) &&
+			box->scroll_x != NULL &&
+			JS_ToFloat64(ctx, &v, argv[1]) == 0 && v == v) {
+		scrollbar_set(box->scroll_x, v < 0 ? 0 : (int) v, false);
+		done = true;
+	}
+	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]) &&
+			box->scroll_y != NULL &&
+			JS_ToFloat64(ctx, &v, argv[2]) == 0 && v == v) {
+		scrollbar_set(box->scroll_y, v < 0 ? 0 : (int) v, false);
+		done = true;
+	}
+	return JS_NewBool(ctx, done);
 }
 
 /*
@@ -12085,6 +12147,9 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaElementFromPoint", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaStyle",
 			  JS_NewCFunction(ctx, win_vita_style, "__vitaStyle", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaScrollElement",
+			  JS_NewCFunction(ctx, win_vita_scroll_element,
+					  "__vitaScrollElement", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaCustomProp",
 			  JS_NewCFunction(ctx, win_vita_custom_prop,
 					  "__vitaCustomProp", 2));
