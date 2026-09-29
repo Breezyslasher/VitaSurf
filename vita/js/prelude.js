@@ -2722,7 +2722,10 @@ W.addEventListener('load',namedAccess);
 P.attachShadow=function(){Object.defineProperty(this,'__shadow',{configurable:true,value:true,writable:true,enumerable:false});return this;};
 P.getRootNode=function(){var n=this;while(n.parentNode)n=n.parentNode;return n===D.documentElement?D:n;};
 Object.defineProperty(P,'shadowRoot',{configurable:true,get:function(){return this.__shadow?this:null;}});
-Object.defineProperty(P,'host',{configurable:true,get:function(){return this.__shadow?this:undefined;}});
+/* An element has no host of its own. Its shadow root is the element
+ * itself here, so giving it one would be the element, and code that
+ * climbs e.host || e.parentNode would never leave it (card-mod does). */
+Object.defineProperty(P,'host',{configurable:true,get:function(){return undefined;}});
 Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return ceInDoc(this);}});
 /* A shadow root's <style>, once per text (VitaSurf). With shadow DOM as
  * light DOM, every component that puts a style in its shadow root put a
@@ -3557,9 +3560,9 @@ function urlOf(el){try{return new URL(el.getAttribute('href')||'',D.baseURI);}ca
    u[k]=v;this.setAttribute('href',u.href);}});});
 Object.defineProperty(P,'origin',{configurable:true,get:function(){
  if(!isURLEl(this))return '';var u=urlOf(this);return u?u.origin:'';}});
-/* host doubles as the shadow root's host, which wins when there is one. */
+/* host is a link's URL host; no other element has one (see above). */
 Object.defineProperty(P,'host',{configurable:true,
- get:function(){if(this.__shadow)return this;if(!isURLEl(this))return undefined;
+ get:function(){if(!isURLEl(this))return undefined;
   var u=urlOf(this);return u?u.host:'';},
  set:function(v){
   if(!isURLEl(this))return shadowProp(this,'host',v);
