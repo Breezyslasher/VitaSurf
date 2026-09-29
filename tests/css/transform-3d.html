@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!-- 3d turns seen from in front, and backface-visibility. Checked in the
+     plot output: a flip card turned half way about its y axis shows its
+     back (green) and not its front (red); rotateX(60deg) draws a box
+     half as tall (cos 60); an unturned card shows its front (blue) and
+     not its back (orange). -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+.card { position: relative; width: 60px; height: 40px; margin: 10px; transform-style: preserve-3d; }
+.flipped { transform: rotateY(180deg); }
+.face { position: absolute; inset: 0; backface-visibility: hidden; }
+.back { transform: rotateY(180deg); }
+#c1 .front { background: #f00; } #c1 .back { background: #0f0; }
+#c2 .front { background: #00f; } #c2 .back { background: #f80; }
+#tilt { width: 60px; height: 40px; background: #808; transform: rotateX(60deg); margin: 10px; }
+</style></head><body>
+<div class="card flipped" id="c1"><div class="face front"></div><div class="face back"></div></div>
+<div class="card" id="c2"><div class="face front"></div><div class="face back"></div></div>
+<div id="tilt"></div>
+</body></html>

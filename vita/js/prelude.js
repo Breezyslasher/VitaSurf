@@ -1434,7 +1434,7 @@ function cssColour(rgb,a){
  if(Math.round(f*255)!==a)f=Math.round(a/255*1000)/1000;
  return 'rgba('+r+', '+g+', '+b+', '+f+')';
 }
-function computedStyle(el){
+function computedStyle(el,pseudo){
  /* A browser reports nothing for an element that is not in the document,
     and code tests the value it gets back. */
  if(el&&el.nodeType===1&&el.isConnected===false){
@@ -1466,6 +1466,15 @@ function computedStyle(el){
  }
  if(box){cs.width=box[4]+'px';cs.height=box[5]+'px';}
  else{cs.width='auto';cs.height='auto';}
+ /* The rest of the cascade's answers, and a pseudo element's own: what
+    the element is positioned and laid out with, its font, borders and
+    text, as a browser reports them. */
+ var more=(el&&el.nodeType===1&&typeof __vitaStyleMore==='function')?
+  __vitaStyleMore(el,typeof pseudo==='string'&&pseudo?pseudo:null):null;
+ if(more)for(var mk in more)cs[mk]=more[mk];
+ /* a ::before or ::after that is not there still answers, with no content */
+ if(typeof pseudo==='string'&&/^::?(before|after)$/i.test(pseudo)&&
+  (!more||more.content===undefined))cs.content='none';
  /* Whatever the element says inline wins over the defaults, for the
     properties nothing else here can answer: a declaration the page
     wrote on the element itself is the one value that is certain, and
@@ -1479,18 +1488,27 @@ function computedStyle(el){
   if(inline)parseDecl(inline).forEach(function(d){
    var k=dashToCamel(d[0]);
    if(st&&(RESOLVED[k]||(st.length>18&&BOX_RESOLVED.test(k))))return;
+   if(more&&more[k]!==undefined)return;
    cs[k]=d[1];});
  }
- cs.getPropertyValue=function(n){var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};
+ cs.getPropertyValue=function(n){n=String(n);
+  /* a custom property is the cascade's, read as the page wrote it */
+  if(n.slice(0,2)==='--'){
+   if(this[n]!==undefined)return String(this[n]);
+   return (el&&el.nodeType===1&&typeof __vitaCustomProp==='function')?
+    __vitaCustomProp(el,n):'';}
+  var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};
  cs.getPropertyPriority=function(){return '';};
  cs.setProperty=function(n,v){this[dashToCamel(n)]=String(v);};
  cs.removeProperty=function(n){var c=dashToCamel(n),v=this[c];delete this[c];return v===undefined?'':String(v);};
- cs.item=function(i){return Object.keys(CS_DEFAULTS)[i]||'';};
- Object.defineProperty(cs,'length',{configurable:true,get:function(){return Object.keys(CS_DEFAULTS).length;}});
+ var names=Object.keys(cs).filter(function(k){return typeof cs[k]==='string';}).map(function(k){
+  return k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});});
+ cs.item=function(i){return names[i]||'';};
+ Object.defineProperty(cs,'length',{configurable:true,get:function(){return names.length;}});
  cs.cssText='';
  return cs;
 }
-W.getComputedStyle=function(el){return computedStyle(el);};
+W.getComputedStyle=function(el,pseudo){return computedStyle(el,pseudo);};
 /* A media query evaluator over the real viewport. Handles the features
    responsive sites actually branch on; anything else is false. */
 function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(value);

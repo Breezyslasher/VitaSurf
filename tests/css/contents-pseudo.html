@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<!-- ::before and ::after of a display: contents element, checked in the
+     plot output: they are its first and last children, so they appear
+     around its children in the parent's flow: "[" "a" "b" "]" on one
+     line, then a block-level ::before "<top>" on a line of its own
+     before "c", with its counter "2" from counter-increment on the
+     pseudo elements. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; counter-reset: n; }
+.c { display: contents; }
+.c::before { content: "["; counter-increment: n; }
+.c::after { content: "]"; }
+.d { display: contents; }
+.d::before { content: "<top" counter(n) ">"; display: block; counter-increment: n; }
+</style></head><body>
+<p><span class="c"><b>a</b> <i>b</i></span></p>
+<div><div class="d"><p>c</p></div></div>
+</body></html>

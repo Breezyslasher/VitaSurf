@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<!-- url() inside ::before and ::after content: each is an image of its
+     own size (4x4 here) in the line, next to the pseudo element's text.
+     Checked in the plot output: bitmaps drawn left of "A" and right of
+     "B", and one between "x" and "y" in a block-level ::before. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; }
+.i::before { content: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGPQmGYDRwzEcQCVQw+hQvbY6QAAAABJRU5ErkJggg==) " "; }
+.i::after { content: " " url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGPQmGYDRwzEcQCVQw+hQvbY6QAAAABJRU5ErkJggg==); }
+.b::before { display: block; content: "x" url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEElEQVR4nGPQmGYDRwzEcQCVQw+hQvbY6QAAAABJRU5ErkJggg==) "y"; }
+</style></head><body>
+<p><span class="i">A</span> <span>B</span></p>
+<p class="i">B</p>
+<div class="b">z</div>
+</body></html>

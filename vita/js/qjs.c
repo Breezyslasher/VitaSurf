@@ -9923,6 +9923,768 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 }
 
 /*
+ * __vitaStyleMore(node, pseudo): the resolved values of the properties
+ * a page reads back through getComputedStyle, beyond the handful
+ * __vitaStyle gives, as an object of camel-cased names to the strings a
+ * browser reports: lengths in px, colours as rgb() or rgba(), keywords
+ * as written. \a pseudo, if given, is "::before", "::after",
+ * "::marker", "::first-line", "::first-letter" or "::placeholder", and
+ * the values are that pseudo element's. Null when the element (or the
+ * pseudo element) has no style, which the prelude answers from its
+ * defaults (VitaSurf).
+ */
+#define SM_BUF 256
+
+static void sm_number(char *buf, size_t len, css_fixed v)
+{
+	uint32_t a = v < 0 ? (uint32_t) -v : (uint32_t) v;
+	uint32_t ip = a >> CSS_RADIX_POINT;
+	uint32_t fp = ((a & ((1u << CSS_RADIX_POINT) - 1)) * 1000u +
+			(1u << (CSS_RADIX_POINT - 1))) >> CSS_RADIX_POINT;
+
+	if (fp >= 1000) {
+		ip++;
+		fp -= 1000;
+	}
+	if (fp == 0) {
+		snprintf(buf, len, "%s%u", v < 0 && ip != 0 ? "-" : "",
+				(unsigned) ip);
+	} else {
+		char f[4];
+		int n = 3;
+
+		snprintf(f, sizeof(f), "%03u", (unsigned) fp);
+		while (n > 1 && f[n - 1] == '0')
+			f[--n] = '\0';
+		snprintf(buf, len, "%s%u.%s", v < 0 ? "-" : "",
+				(unsigned) ip, f);
+	}
+}
+
+/** A length as a browser reports it: px, or a percentage kept as one. */
+static void sm_length(char *buf, size_t len, const css_computed_style *s,
+		const css_unit_ctx *uctx, css_fixed v, css_unit unit)
+{
+	size_t n;
+
+	if (unit == CSS_UNIT_PCT) {
+		sm_number(buf, len, v);
+		n = strlen(buf);
+		snprintf(buf + n, len - n, "%%");
+		return;
+	}
+	sm_number(buf, len, css_unit_len2css_px(s, uctx, v, unit));
+	n = strlen(buf);
+	snprintf(buf + n, len - n, "px");
+}
+
+static void sm_colour(char *buf, size_t len, css_color c)
+{
+	unsigned r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+	unsigned a = (c >> 24) & 0xff;
+	unsigned f;
+	char fs[8];
+
+	if (a == 255) {
+		snprintf(buf, len, "rgb(%u, %u, %u)", r, g, b);
+		return;
+	}
+	/* the shortest fraction that comes back to the same byte, as the
+	 * prelude's cssColour() does */
+	f = (a * 100 + 127) / 255;
+	if ((f * 255 + 50) / 100 == a) {
+		snprintf(fs, sizeof(fs), "%u.%02u", f / 100, f % 100);
+	} else {
+		f = (a * 1000 + 127) / 255;
+		snprintf(fs, sizeof(fs), "%u.%03u", f / 1000, f % 1000);
+	}
+	/* trim the zeros a browser leaves off: 0.50 is 0.5, 1.00 is 1 */
+	{
+		size_t n = strlen(fs);
+
+		while (n > 0 && fs[n - 1] == '0')
+			fs[--n] = '\0';
+		if (n > 0 && fs[n - 1] == '.')
+			fs[--n] = '\0';
+	}
+	snprintf(buf, len, "rgba(%u, %u, %u, %s)", r, g, b, fs);
+}
+
+static void sm_set(JSContext *ctx, JSValue obj, const char *name,
+		const char *value)
+{
+	JS_SetPropertyStr(ctx, obj, name, JS_NewString(ctx, value));
+}
+
+static void sm_enum(JSContext *ctx, JSValue obj, const char *name,
+		const char *const *tbl, unsigned n, unsigned v)
+{
+	if (v < n && tbl[v] != NULL)
+		sm_set(ctx, obj, name, tbl[v]);
+}
+
+#define SM_ENUM(name, tbl, v) \
+	sm_enum(ctx, obj, name, tbl, sizeof(tbl) / sizeof(tbl[0]), v)
+
+static const char *const sm_display[] = { NULL, "inline", "block",
+	"list-item", "run-in", "inline-block", "table", "inline-table",
+	"table-row-group", "table-header-group", "table-footer-group",
+	"table-row", "table-column-group", "table-column", "table-cell",
+	"table-caption", "none", "flex", "inline-flex", "grid",
+	"inline-grid", "contents" };
+static const char *const sm_position[] = { NULL, "static", "relative",
+	"absolute", "fixed", "sticky" };
+static const char *const sm_float[] = { NULL, "left", "right", "none" };
+static const char *const sm_clear[] = { NULL, "none", "left", "right",
+	"both" };
+static const char *const sm_overflow[] = { NULL, "visible", "hidden",
+	"scroll", "auto" };
+static const char *const sm_visibility[] = { NULL, "visible", "hidden",
+	"collapse" };
+static const char *const sm_font_style[] = { NULL, "normal", "italic",
+	"oblique" };
+static const char *const sm_font_variant[] = { NULL, "normal",
+	"small-caps" };
+static const char *const sm_font_weight[] = { NULL, "400", "700", "700",
+	"400", "100", "200", "300", "400", "500", "600", "700", "800",
+	"900" };
+static const char *const sm_text_align[] = { "start", "start", "left",
+	"right", "center", "justify", "start", "-webkit-left",
+	"-webkit-center", "-webkit-right", "end" };
+static const char *const sm_white_space[] = { NULL, "normal", "pre",
+	"nowrap", "pre-wrap", "pre-line" };
+static const char *const sm_box_sizing[] = { NULL, "content-box",
+	"border-box" };
+static const char *const sm_flex_direction[] = { NULL, "row",
+	"row-reverse", "column", "column-reverse" };
+static const char *const sm_flex_wrap[] = { NULL, "nowrap", "wrap",
+	"wrap-reverse" };
+static const char *const sm_justify_content[] = { NULL, "flex-start",
+	"flex-end", "center", "space-between", "space-around",
+	"space-evenly" };
+static const char *const sm_align_items[] = { NULL, "stretch",
+	"flex-start", "flex-end", "center", "baseline", "auto" };
+static const char *const sm_align_content[] = { NULL, "stretch",
+	"flex-start", "flex-end", "center", "space-between",
+	"space-around", "space-evenly" };
+static const char *const sm_text_transform[] = { NULL, "capitalize",
+	"uppercase", "lowercase", "none" };
+static const char *const sm_vertical_align[] = { NULL, "baseline", "sub",
+	"super", "top", "text-top", "middle", "bottom", "text-bottom" };
+static const char *const sm_direction[] = { NULL, "ltr", "rtl" };
+static const char *const sm_border_style[] = { NULL, "none", "hidden",
+	"dotted", "dashed", "solid", "double", "groove", "ridge", "inset",
+	"outset" };
+static const char *const sm_table_layout[] = { NULL, "auto", "fixed" };
+static const char *const sm_border_collapse[] = { NULL, "separate",
+	"collapse" };
+static const char *const sm_writing_mode[] = { NULL, "horizontal-tb",
+	"vertical-rl", "vertical-lr" };
+static const char *const sm_object_fit[] = { NULL, "fill", "contain",
+	"cover", "none", "scale-down" };
+static const char *const sm_text_overflow[] = { NULL, "clip",
+	"ellipsis" };
+static const char *const sm_word_break[] = { NULL, "normal", "break-all",
+	"keep-all" };
+static const char *const sm_overflow_wrap[] = { NULL, "normal",
+	"break-word", "anywhere" };
+static const char *const sm_pointer_events[] = { NULL, "auto", "none" };
+static const char *const sm_cursor[] = { NULL, "auto", "crosshair",
+	"default", "pointer", "move", "e-resize", "ne-resize", "nw-resize",
+	"n-resize", "se-resize", "sw-resize", "s-resize", "w-resize",
+	"text", "wait", "help", "progress" };
+static const char *const sm_empty_cells[] = { NULL, "show", "hide" };
+static const char *const sm_caption_side[] = { NULL, "top", "bottom" };
+static const char *const sm_unicode_bidi[] = { NULL, "normal", "embed",
+	"bidi-override" };
+static const char *const sm_list_style_type[] = { NULL, "disc", "circle",
+	"square", "decimal", "decimal-leading-zero", "lower-roman",
+	"upper-roman", "lower-greek", "lower-latin", "upper-latin",
+	"armenian", "georgian", "lower-alpha", "upper-alpha", "none",
+	"binary", "octal", "lower-hexadecimal", "upper-hexadecimal",
+	"arabic-indic", "lower-armenian", "upper-armenian", "bengali",
+	"cambodian", "khmer", "cjk-decimal", "devanagari", "gujarati",
+	"gurmukhi", "hebrew", "kannada", "lao", "malayalam", "mongolian",
+	"myanmar", "oriya", "persian", "tamil", "telugu", "thai", "tibetan",
+	"cjk-earthly-branch", "cjk-heavenly-stem", "hiragana",
+	"hiragana-iroha", "katakana", "katakana-iroha", "japanese-informal",
+	"japanese-formal", "korean-hangul-formal", "korean-hanja-informal",
+	"korean-hanja-formal" };
+
+typedef uint8_t (*sm_len_fn)(const css_computed_style *, css_fixed *,
+		css_unit *);
+
+/** An offset or size that is a length, or a keyword for its other
+ * values: \a set is the value that means a length. */
+static void sm_len_prop(JSContext *ctx, JSValue obj, const char *name,
+		const css_computed_style *s, const css_unit_ctx *uctx,
+		sm_len_fn fn, uint8_t set, const char *other)
+{
+	css_fixed v = 0;
+	css_unit u = CSS_UNIT_PX;
+	char buf[SM_BUF];
+
+	if (fn(s, &v, &u) == set) {
+		sm_length(buf, sizeof(buf), s, uctx, v, u);
+		sm_set(ctx, obj, name, buf);
+	} else if (other != NULL) {
+		sm_set(ctx, obj, name, other);
+	}
+}
+
+static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct box *box;
+	const css_computed_style *s;
+	const css_unit_ctx *uctx;
+	JSValue obj;
+	char buf[SM_BUF];
+	css_fixed v = 0, fs_px;
+	css_unit u = CSS_UNIT_PX;
+	css_color c = 0, colour = 0;
+	int32_t i32 = 0;
+	uint8_t t;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL || thread->htmlc == NULL)
+		return JS_NULL;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !layout_current(thread))
+		return JS_NULL;
+	box = box_for_node(node);
+	if (box == NULL || box->style == NULL)
+		return JS_NULL;
+	s = box->style;
+	if (argc > 1 && JS_IsString(argv[1])) {
+		const char *p = JS_ToCString(ctx, argv[1]);
+		int which = -1;
+
+		if (p != NULL) {
+			const char *q = p;
+
+			while (*q == ':')
+				q++;
+			if (*q == '\0')
+				which = CSS_PSEUDO_ELEMENT_NONE;
+			else if (strcasecmp(q, "before") == 0)
+				which = CSS_PSEUDO_ELEMENT_BEFORE;
+			else if (strcasecmp(q, "after") == 0)
+				which = CSS_PSEUDO_ELEMENT_AFTER;
+			else if (strcasecmp(q, "marker") == 0)
+				which = CSS_PSEUDO_ELEMENT_MARKER;
+			else if (strcasecmp(q, "first-line") == 0)
+				which = CSS_PSEUDO_ELEMENT_FIRST_LINE;
+			else if (strcasecmp(q, "first-letter") == 0)
+				which = CSS_PSEUDO_ELEMENT_FIRST_LETTER;
+			else if (strcasecmp(q, "placeholder") == 0)
+				which = CSS_PSEUDO_ELEMENT_PLACEHOLDER;
+			JS_FreeCString(ctx, p);
+		}
+		if (which < 0)
+			return JS_NULL;
+		if (which != CSS_PSEUDO_ELEMENT_NONE) {
+			if (box->styles == NULL ||
+					box->styles->styles[which] == NULL)
+				return JS_NULL;
+			s = box->styles->styles[which];
+		}
+	}
+	uctx = &thread->htmlc->unit_len_ctx;
+	obj = JS_NewObject(ctx);
+
+	/* the font, which em and line-height resolve against */
+	css_computed_font_size(s, &v, &u);
+	fs_px = css_unit_len2css_px(s, uctx, v, u);
+	sm_number(buf, sizeof(buf), fs_px);
+	strncat(buf, "px", sizeof(buf) - strlen(buf) - 1);
+	sm_set(ctx, obj, "fontSize", buf);
+	SM_ENUM("fontStyle", sm_font_style, css_computed_font_style(s));
+	SM_ENUM("fontVariant", sm_font_variant, css_computed_font_variant(s));
+	SM_ENUM("fontWeight", sm_font_weight, css_computed_font_weight(s));
+	{
+		lwc_string **names = NULL;
+		size_t n = 0;
+
+		t = css_computed_font_family(s, &names);
+		buf[0] = '\0';
+		for (; names != NULL && *names != NULL; names++) {
+			const char *d = lwc_string_data(*names);
+			bool q = strchr(d, ' ') != NULL;
+
+			n = strlen(buf);
+			snprintf(buf + n, sizeof(buf) - n, "%s%s%s%s",
+					n > 0 ? ", " : "", q ? "\"" : "", d,
+					q ? "\"" : "");
+		}
+		if (t == CSS_FONT_FAMILY_SERIF || t == CSS_FONT_FAMILY_SANS_SERIF ||
+				t == CSS_FONT_FAMILY_CURSIVE ||
+				t == CSS_FONT_FAMILY_FANTASY ||
+				t == CSS_FONT_FAMILY_MONOSPACE) {
+			const char *g = t == CSS_FONT_FAMILY_SERIF ? "serif" :
+				t == CSS_FONT_FAMILY_SANS_SERIF ? "sans-serif" :
+				t == CSS_FONT_FAMILY_CURSIVE ? "cursive" :
+				t == CSS_FONT_FAMILY_FANTASY ? "fantasy" :
+				"monospace";
+
+			n = strlen(buf);
+			snprintf(buf + n, sizeof(buf) - n, "%s%s",
+					n > 0 ? ", " : "", g);
+		}
+		if (buf[0] != '\0')
+			sm_set(ctx, obj, "fontFamily", buf);
+	}
+	t = css_computed_line_height(s, &v, &u);
+	if (t == CSS_LINE_HEIGHT_NUMBER) {
+		sm_number(buf, sizeof(buf), FMUL(v, fs_px));
+		strncat(buf, "px", sizeof(buf) - strlen(buf) - 1);
+		sm_set(ctx, obj, "lineHeight", buf);
+	} else if (t == CSS_LINE_HEIGHT_DIMENSION) {
+		if (u == CSS_UNIT_PCT) {
+			sm_number(buf, sizeof(buf),
+					FDIV(FMUL(v, fs_px), INTTOFIX(100)));
+			strncat(buf, "px", sizeof(buf) - strlen(buf) - 1);
+		} else {
+			sm_length(buf, sizeof(buf), s, uctx, v, u);
+		}
+		sm_set(ctx, obj, "lineHeight", buf);
+	} else {
+		sm_set(ctx, obj, "lineHeight", "normal");
+	}
+
+	/* where the box is and how it lays out */
+	SM_ENUM("display", sm_display, css_computed_display_static(s));
+	SM_ENUM("position", sm_position, css_computed_position(s));
+	SM_ENUM("float", sm_float, css_computed_float(s));
+	SM_ENUM("cssFloat", sm_float, css_computed_float(s));
+	SM_ENUM("clear", sm_clear, css_computed_clear(s));
+	SM_ENUM("visibility", sm_visibility, css_computed_visibility(s));
+	SM_ENUM("overflowX", sm_overflow, css_computed_overflow_x(s));
+	SM_ENUM("overflowY", sm_overflow, css_computed_overflow_y(s));
+	if (css_computed_overflow_x(s) == css_computed_overflow_y(s)) {
+		SM_ENUM("overflow", sm_overflow, css_computed_overflow_x(s));
+	} else {
+		unsigned ox = css_computed_overflow_x(s);
+		unsigned oy = css_computed_overflow_y(s);
+
+		if (ox < 5 && oy < 5 && sm_overflow[ox] != NULL &&
+				sm_overflow[oy] != NULL) {
+			snprintf(buf, sizeof(buf), "%s %s", sm_overflow[ox],
+					sm_overflow[oy]);
+			sm_set(ctx, obj, "overflow", buf);
+		}
+	}
+	if (css_computed_z_index(s, &i32) == CSS_Z_INDEX_SET) {
+		/* libcss keeps the integer in fixed point */
+		snprintf(buf, sizeof(buf), "%d", (int) FIXTOINT(i32));
+		sm_set(ctx, obj, "zIndex", buf);
+	} else {
+		sm_set(ctx, obj, "zIndex", "auto");
+	}
+	v = INTTOFIX(1);
+	if (css_computed_opacity(s, &v) == CSS_OPACITY_SET) {
+		sm_number(buf, sizeof(buf), v);
+		sm_set(ctx, obj, "opacity", buf);
+	}
+	sm_len_prop(ctx, obj, "top", s, uctx, css_computed_top,
+			CSS_TOP_SET, "auto");
+	sm_len_prop(ctx, obj, "right", s, uctx, css_computed_right,
+			CSS_RIGHT_SET, "auto");
+	sm_len_prop(ctx, obj, "bottom", s, uctx, css_computed_bottom,
+			CSS_BOTTOM_SET, "auto");
+	sm_len_prop(ctx, obj, "left", s, uctx, css_computed_left,
+			CSS_LEFT_SET, "auto");
+	sm_len_prop(ctx, obj, "minWidth", s, uctx, css_computed_min_width,
+			CSS_MIN_WIDTH_SET, "auto");
+	sm_len_prop(ctx, obj, "minHeight", s, uctx, css_computed_min_height,
+			CSS_MIN_HEIGHT_SET, "auto");
+	sm_len_prop(ctx, obj, "maxWidth", s, uctx, css_computed_max_width,
+			CSS_MAX_WIDTH_SET, "none");
+	sm_len_prop(ctx, obj, "maxHeight", s, uctx, css_computed_max_height,
+			CSS_MAX_HEIGHT_SET, "none");
+	SM_ENUM("boxSizing", sm_box_sizing, css_computed_box_sizing(s));
+
+	/* flex */
+	SM_ENUM("flexDirection", sm_flex_direction,
+			css_computed_flex_direction(s));
+	SM_ENUM("flexWrap", sm_flex_wrap, css_computed_flex_wrap(s));
+	SM_ENUM("justifyContent", sm_justify_content,
+			css_computed_justify_content(s));
+	SM_ENUM("alignItems", sm_align_items, css_computed_align_items(s));
+	SM_ENUM("alignSelf", sm_align_items, css_computed_align_self(s));
+	SM_ENUM("alignContent", sm_align_content,
+			css_computed_align_content(s));
+	v = 0;
+	css_computed_flex_grow(s, &v);
+	sm_number(buf, sizeof(buf), v);
+	sm_set(ctx, obj, "flexGrow", buf);
+	v = INTTOFIX(1);
+	css_computed_flex_shrink(s, &v);
+	sm_number(buf, sizeof(buf), v);
+	sm_set(ctx, obj, "flexShrink", buf);
+	t = css_computed_flex_basis(s, &v, &u);
+	if (t == CSS_FLEX_BASIS_SET) {
+		sm_length(buf, sizeof(buf), s, uctx, v, u);
+		sm_set(ctx, obj, "flexBasis", buf);
+	} else {
+		sm_set(ctx, obj, "flexBasis", t == CSS_FLEX_BASIS_CONTENT ?
+				"content" : "auto");
+	}
+	i32 = 0;
+	css_computed_order(s, &i32);
+	snprintf(buf, sizeof(buf), "%d", (int) i32);
+	sm_set(ctx, obj, "order", buf);
+	sm_len_prop(ctx, obj, "rowGap", s, uctx, css_computed_row_gap,
+			CSS_ROW_GAP_SET, "normal");
+	sm_len_prop(ctx, obj, "columnGap", s, uctx, css_computed_column_gap,
+			CSS_COLUMN_GAP_SET, "normal");
+
+	/* text */
+	SM_ENUM("textAlign", sm_text_align, css_computed_text_align(s));
+	SM_ENUM("whiteSpace", sm_white_space, css_computed_white_space(s));
+	SM_ENUM("textTransform", sm_text_transform,
+			css_computed_text_transform(s));
+	SM_ENUM("direction", sm_direction, css_computed_direction(s));
+	SM_ENUM("unicodeBidi", sm_unicode_bidi, css_computed_unicode_bidi(s));
+	SM_ENUM("writingMode", sm_writing_mode, css_computed_writing_mode(s));
+	SM_ENUM("textOverflow", sm_text_overflow,
+			css_computed_text_overflow(s));
+	SM_ENUM("wordBreak", sm_word_break, css_computed_word_break(s));
+	SM_ENUM("overflowWrap", sm_overflow_wrap,
+			css_computed_overflow_wrap(s));
+	SM_ENUM("wordWrap", sm_overflow_wrap, css_computed_overflow_wrap(s));
+	sm_len_prop(ctx, obj, "letterSpacing", s, uctx,
+			css_computed_letter_spacing, CSS_LETTER_SPACING_SET,
+			"normal");
+	sm_len_prop(ctx, obj, "wordSpacing", s, uctx,
+			css_computed_word_spacing, CSS_WORD_SPACING_SET, "0px");
+	sm_len_prop(ctx, obj, "textIndent", s, uctx, css_computed_text_indent,
+			CSS_TEXT_INDENT_SET, "0px");
+	t = css_computed_vertical_align(s, &v, &u);
+	if (t == CSS_VERTICAL_ALIGN_SET) {
+		sm_length(buf, sizeof(buf), s, uctx, v, u);
+		sm_set(ctx, obj, "verticalAlign", buf);
+	} else {
+		SM_ENUM("verticalAlign", sm_vertical_align, t);
+	}
+	colour = 0;
+	css_computed_color(s, &colour);
+	sm_colour(buf, sizeof(buf), colour);
+	sm_set(ctx, obj, "color", buf);
+	{
+		uint8_t d = css_computed_text_decoration(s);
+		char line[64];
+
+		line[0] = '\0';
+		if (d & CSS_TEXT_DECORATION_UNDERLINE)
+			strcat(line, "underline");
+		if (d & CSS_TEXT_DECORATION_OVERLINE)
+			strcat(line, line[0] ? " overline" : "overline");
+		if (d & CSS_TEXT_DECORATION_LINE_THROUGH)
+			strcat(line, line[0] ? " line-through" :
+					"line-through");
+		if (line[0] == '\0')
+			strcpy(line, "none");
+		sm_set(ctx, obj, "textDecorationLine", line);
+		snprintf(buf, sizeof(buf), "%s solid ", line);
+		sm_colour(buf + strlen(buf), sizeof(buf) - strlen(buf),
+				colour);
+		sm_set(ctx, obj, "textDecoration", buf);
+	}
+	SM_ENUM("listStyleType", sm_list_style_type,
+			css_computed_list_style_type(s));
+
+	/* the box's paint */
+	c = 0;
+	if (css_computed_background_color(s, &c) ==
+			CSS_BACKGROUND_COLOR_COLOR) {
+		sm_colour(buf, sizeof(buf), c);
+		sm_set(ctx, obj, "backgroundColor", buf);
+	}
+	{
+		lwc_string *url = NULL;
+
+		if (css_computed_background_image(s, &url) ==
+				CSS_BACKGROUND_IMAGE_IMAGE && url != NULL) {
+			snprintf(buf, sizeof(buf), "url(\"%s\")",
+					lwc_string_data(url));
+			sm_set(ctx, obj, "backgroundImage", buf);
+		} else {
+			sm_set(ctx, obj, "backgroundImage", "none");
+		}
+	}
+	{
+		static const char *const side[4] = { "Top", "Right", "Bottom",
+			"Left" };
+		uint8_t st[4];
+		char cs[4][48];
+		int i;
+
+		st[0] = css_computed_border_top_style(s);
+		st[1] = css_computed_border_right_style(s);
+		st[2] = css_computed_border_bottom_style(s);
+		st[3] = css_computed_border_left_style(s);
+		for (i = 0; i < 4; i++) {
+			uint8_t ct;
+			char name[32];
+
+			c = colour;
+			switch (i) {
+			case 0: ct = css_computed_border_top_color(s, &c);
+				break;
+			case 1: ct = css_computed_border_right_color(s, &c);
+				break;
+			case 2: ct = css_computed_border_bottom_color(s, &c);
+				break;
+			default: ct = css_computed_border_left_color(s, &c);
+				break;
+			}
+			if (ct != CSS_BORDER_COLOR_COLOR)
+				c = colour;
+			sm_colour(cs[i], sizeof(cs[i]), c);
+			snprintf(name, sizeof(name), "border%sColor", side[i]);
+			sm_set(ctx, obj, name, cs[i]);
+			snprintf(name, sizeof(name), "border%sStyle", side[i]);
+			SM_ENUM(name, sm_border_style, st[i]);
+		}
+		if (st[0] == st[1] && st[0] == st[2] && st[0] == st[3])
+			SM_ENUM("borderStyle", sm_border_style, st[0]);
+		if (strcmp(cs[0], cs[1]) == 0 && strcmp(cs[0], cs[2]) == 0 &&
+				strcmp(cs[0], cs[3]) == 0)
+			sm_set(ctx, obj, "borderColor", cs[0]);
+	}
+	{
+		static const char *const corner[4] = { "TopLeft", "TopRight",
+			"BottomRight", "BottomLeft" };
+		char rs[4][64];
+		int i;
+
+		for (i = 0; i < 4; i++) {
+			css_fixed h = 0, vv = 0;
+			css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
+			uint8_t rt;
+			char name[40];
+
+			switch (i) {
+			case 0: rt = css_computed_border_top_left_radius(s,
+					&h, &hu, &vv, &vu);
+				break;
+			case 1: rt = css_computed_border_top_right_radius(s,
+					&h, &hu, &vv, &vu);
+				break;
+			case 2: rt = css_computed_border_bottom_right_radius(s,
+					&h, &hu, &vv, &vu);
+				break;
+			default: rt = css_computed_border_bottom_left_radius(s,
+					&h, &hu, &vv, &vu);
+				break;
+			}
+			if (rt != CSS_BORDER_RADIUS_SET) {
+				strcpy(rs[i], "0px");
+			} else {
+				char hb[32], vb[32];
+
+				sm_length(hb, sizeof(hb), s, uctx, h, hu);
+				sm_length(vb, sizeof(vb), s, uctx, vv, vu);
+				if (strcmp(hb, vb) == 0)
+					snprintf(rs[i], sizeof(rs[i]), "%s", hb);
+				else
+					snprintf(rs[i], sizeof(rs[i]), "%s %s",
+							hb, vb);
+			}
+			snprintf(name, sizeof(name), "border%sRadius",
+					corner[i]);
+			sm_set(ctx, obj, name, rs[i]);
+		}
+		if (strcmp(rs[0], rs[1]) == 0 && strcmp(rs[0], rs[2]) == 0 &&
+				strcmp(rs[0], rs[3]) == 0)
+			sm_set(ctx, obj, "borderRadius", rs[0]);
+		else {
+			snprintf(buf, sizeof(buf), "%s %s %s %s", rs[0], rs[1],
+					rs[2], rs[3]);
+			sm_set(ctx, obj, "borderRadius", buf);
+		}
+	}
+	{
+		uint8_t os = css_computed_outline_style(s);
+		uint8_t ot;
+
+		SM_ENUM("outlineStyle", sm_border_style, os);
+		ot = css_computed_outline_width(s, &v, &u);
+		if (os == CSS_OUTLINE_STYLE_NONE)
+			strcpy(buf, "0px");
+		else if (ot == CSS_OUTLINE_WIDTH_WIDTH)
+			sm_length(buf, sizeof(buf), s, uctx, v, u);
+		else
+			strcpy(buf, ot == CSS_OUTLINE_WIDTH_THIN ? "1px" :
+					ot == CSS_OUTLINE_WIDTH_THICK ? "5px" :
+					"3px");
+		sm_set(ctx, obj, "outlineWidth", buf);
+		c = colour;
+		if (css_computed_outline_color(s, &c) !=
+				CSS_OUTLINE_COLOR_COLOR)
+			c = colour;
+		sm_colour(buf, sizeof(buf), c);
+		sm_set(ctx, obj, "outlineColor", buf);
+	}
+	SM_ENUM("objectFit", sm_object_fit, css_computed_object_fit(s));
+	{
+		static const char *const bv[] = { NULL, "visible", "hidden" };
+
+		SM_ENUM("backfaceVisibility", bv,
+				css_computed_backface_visibility(s));
+	}
+	SM_ENUM("pointerEvents", sm_pointer_events,
+			css_computed_pointer_events(s));
+	{
+		lwc_string **urls = NULL;
+
+		SM_ENUM("cursor", sm_cursor, css_computed_cursor(s, &urls));
+	}
+	SM_ENUM("tableLayout", sm_table_layout, css_computed_table_layout(s));
+	SM_ENUM("borderCollapse", sm_border_collapse,
+			css_computed_border_collapse(s));
+	SM_ENUM("emptyCells", sm_empty_cells, css_computed_empty_cells(s));
+	SM_ENUM("captionSide", sm_caption_side, css_computed_caption_side(s));
+
+	/* generated content, for a pseudo element */
+	{
+		const css_computed_content_item *item = NULL;
+
+		t = css_computed_content(s, &item);
+		if (t == CSS_CONTENT_NONE) {
+			sm_set(ctx, obj, "content", "none");
+		} else if (t != CSS_CONTENT_SET || item == NULL) {
+			sm_set(ctx, obj, "content", "normal");
+		} else {
+			buf[0] = '\0';
+			for (; item->type != CSS_COMPUTED_CONTENT_NONE;
+					item++) {
+				size_t n = strlen(buf);
+				const char *sep = n > 0 ? " " : "";
+
+				switch (item->type) {
+				case CSS_COMPUTED_CONTENT_STRING:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%s\"%s\"", sep,
+						lwc_string_data(
+							item->data.string));
+					break;
+				case CSS_COMPUTED_CONTENT_URI:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%surl(\"%s\")", sep,
+						lwc_string_data(
+							item->data.uri));
+					break;
+				case CSS_COMPUTED_CONTENT_ATTR:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sattr(%s)", sep,
+						lwc_string_data(
+							item->data.attr));
+					break;
+				case CSS_COMPUTED_CONTENT_COUNTER:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%scounter(%s)", sep,
+						lwc_string_data(
+						item->data.counter.name));
+					break;
+				case CSS_COMPUTED_CONTENT_COUNTERS:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%scounters(%s, \"%s\")", sep,
+						lwc_string_data(
+						item->data.counters.name),
+						lwc_string_data(
+						item->data.counters.sep));
+					break;
+				case CSS_COMPUTED_CONTENT_OPEN_QUOTE:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sopen-quote", sep);
+					break;
+				case CSS_COMPUTED_CONTENT_CLOSE_QUOTE:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sclose-quote", sep);
+					break;
+				case CSS_COMPUTED_CONTENT_NO_OPEN_QUOTE:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sno-open-quote", sep);
+					break;
+				case CSS_COMPUTED_CONTENT_NO_CLOSE_QUOTE:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sno-close-quote", sep);
+					break;
+				default:
+					break;
+				}
+			}
+			sm_set(ctx, obj, "content", buf);
+		}
+	}
+	return obj;
+}
+
+/*
+ * __vitaCustomProp(node, name): a custom property's value on an element,
+ * as getComputedStyle().getPropertyValue("--name") answers it, or ""
+ * when nothing declares it (VitaSurf). Theme code reads its colours this
+ * way: Home Assistant's cards ask for --primary-color and the like.
+ */
+static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct box *box;
+	const char *name;
+	lwc_string *lname = NULL;
+	char small[256];
+	char *buf = small;
+	size_t len = 0;
+	JSValue ret = JS_NewString(ctx, "");
+
+	(void)this_val;
+	if (argc < 2 || thread == NULL || thread->htmlc == NULL)
+		return ret;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !layout_current(thread))
+		return ret;
+	box = box_for_node(node);
+	if (box == NULL || box->style == NULL)
+		return ret;
+	name = JS_ToCString(ctx, argv[1]);
+	if (name == NULL)
+		return ret;
+	if (lwc_intern_string(name, strlen(name), &lname) != lwc_error_ok) {
+		JS_FreeCString(ctx, name);
+		return ret;
+	}
+	JS_FreeCString(ctx, name);
+	if (css_computed_custom_property(box->style, lname, buf,
+			sizeof(small), &len) == CSS_OK) {
+		if (len >= sizeof(small)) {
+			buf = malloc(len + 1);
+			if (buf != NULL && css_computed_custom_property(
+					box->style, lname, buf, len + 1,
+					&len) != CSS_OK) {
+				free(buf);
+				buf = NULL;
+			}
+		}
+		if (buf != NULL) {
+			JS_FreeValue(ctx, ret);
+			ret = JS_NewStringLen(ctx, buf, len);
+			if (buf != small)
+				free(buf);
+		}
+	}
+	lwc_string_unref(lname);
+	return ret;
+}
+
+/*
  * __vitaFocusControl(node): give the caret to a text field, for
  * element.focus() (VitaSurf). On the Vita a caret placed within a moment
  * of a tap opens the keyboard, so a component that focuses its input from
@@ -11297,6 +12059,12 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaElementFromPoint", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaStyle",
 			  JS_NewCFunction(ctx, win_vita_style, "__vitaStyle", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCustomProp",
+			  JS_NewCFunction(ctx, win_vita_custom_prop,
+					  "__vitaCustomProp", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaStyleMore",
+			  JS_NewCFunction(ctx, win_vita_style_more,
+					  "__vitaStyleMore", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaScroll",
 			  JS_NewCFunction(ctx, win_vita_scroll, "__vitaScroll", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaEncoding",

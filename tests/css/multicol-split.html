@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!-- A block split across columns keeps its background in each column,
+     and a float moves with the line beside it. Two columns of 190px,
+     gap 20px. The blue box (#sec) runs from the first column into the
+     second: its background is drawn in both (the plot output shows a
+     blue FILL at x 0 and one at x 210), its bottom border only in the
+     second. The red float sits beside the last lines, so it goes with
+     them into the second column (XX float left >= 210). -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px/20px sans-serif; }
+#mc { columns: 2; column-gap: 20px; width: 400px; }
+p { margin: 0; height: 20px; }
+#sec { background: #00f; border-bottom: 4px solid #000; }
+#fl { float: left; width: 10px; height: 10px; background: #f00; }
+</style></head><body>
+<div id="mc">
+<p>a</p><p>b</p><p>c</p>
+<div id="sec"><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p></div>
+<p>i</p><p><span id="fl"></span>j</p>
+</div>
+<script>
+window.addEventListener('load', function () { setTimeout(function () {
+  var f = document.getElementById('fl').getBoundingClientRect();
+  var m = document.getElementById('mc').getBoundingClientRect();
+  console.log('XX float left ' + Math.round(f.left) + (f.left >= 210 ? ' PASS' : ' FAIL'));
+  console.log('XX height ' + Math.round(m.height) + (m.height <= 130 ? ' PASS' : ' FAIL'));
+}, 200); });
+</script></body></html>
