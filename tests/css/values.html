@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!-- CSS values: the lh and rlh units, container units (taken against
+     the viewport), round(), mod(), rem(), abs() and sign(), relative
+     colours ("rgb(from red r g b)"), color(), and @scope. Expected
+     console output: lines ending in "PASS". -->
+<html><head><style>
+html { font-size: 16px; line-height: 2; }
+body { margin: 0; }
+div { height: 1px; }
+#lh { line-height: 2em; width: 2lh; }
+#rlh { line-height: 1; width: 2rlh; }
+#em4 { width: 4em; }
+#cqw { width: 10cqw; }
+#vw { width: 10vw; }
+#round { width: round(33px, 10px); }
+#up { width: round(up, 31px, 10px); }
+#down { width: round(down, 39px, 10px); }
+#zero { width: calc(-1 * round(to-zero, -39px, 10px)); }
+#mod { width: calc(mod(-7px, 5px) * 10); }
+#rem { width: calc(rem(-7px, 5px) * -10); }
+#abs { width: abs(-20px); }
+#sign { width: calc(sign(-3px) * -20px); }
+#c1 { color: rgb(from red r g b); }
+#c2 { color: rgb(from rgb(10 20 30) b g r); }
+#c3 { color: hsl(from red calc(h + 120) s l); }
+#c4 { color: rgb(from red r g b / 0.5); }
+#c5 { color: color(srgb 1 0 0); }
+#c6 { color: color(srgb 0 0.5 1 / 50%); }
+#c7 { color: color(display-p3 0 0 0); }
+#c8 { color: rgb(from #0000ff calc(r + 255) g 0); }
+@scope (.card) {
+  p { color: rgb(0, 128, 0); }
+  :scope { color: rgb(0, 0, 255); }
+}
+</style></head><body>
+<div id=lh></div><div id=rlh></div><div id=em4></div><div id=cqw></div><div id=vw></div>
+<div id=round></div><div id=up></div><div id=down></div><div id=zero></div>
+<div id=mod></div><div id=rem></div><div id=abs></div><div id=sign></div>
+<p id=c1>1</p><p id=c2>2</p><p id=c3>3</p><p id=c4>4</p>
+<p id=c5>5</p><p id=c6>6</p><p id=c7>7</p><p id=c8>8</p>
+<section class=card id=card><p id=in>in</p></section><p id=out>out</p>
+<script>
+setTimeout(function () {
+  function el(id) { return document.getElementById(id); }
+  function w(id) { return Math.round(el(id).getBoundingClientRect().width); }
+  function t(label, got, want) {
+    console.log((got === want ? "PASS " : "FAIL ") + label + " (" + got + ")"); }
+  function c(id) { return getComputedStyle(el(id)).color; }
+  /* lh and rlh against em, as a length in em is rounded to device
+   * pixels the same way (a line height of 2em, and a root one of 2) */
+  t("2lh is twice the line height", w('lh'), w('em4'));
+  t("2rlh is twice the root line height", w('rlh'), w('em4'));
+  t("cqw is taken as vw", w('cqw'), w('vw'));
+  t("round() to nearest", w('round'), 30);
+  t("round(up)", w('up'), 40);
+  t("round(down)", w('down'), 30);
+  t("round(to-zero)", w('zero'), 30);
+  t("mod() takes the divisor's sign", w('mod'), 30);
+  t("rem() takes the dividend's sign", w('rem'), 20);
+  t("abs()", w('abs'), 20);
+  t("sign()", w('sign'), 20);
+  t("rgb(from red r g b)", c('c1'), 'rgb(255, 0, 0)');
+  t("channels swapped", c('c2'), 'rgb(30, 20, 10)');
+  t("hsl(from red calc(h + 120) s l)", c('c3'), 'rgb(0, 255, 0)');
+  t("relative colour with alpha", c('c4'), 'rgba(255, 0, 0, 0.5)');
+  t("color(srgb 1 0 0)", c('c5'), 'rgb(255, 0, 0)');
+  t("color(srgb) with alpha", c('c6'), 'rgba(0, 128, 255, 0.5)');
+  t("color(display-p3 0 0 0)", c('c7'), 'rgb(0, 0, 0)');
+  t("calc() on a channel", c('c8'), 'rgb(255, 0, 0)');
+  t("@scope applies inside its root", c('in'), 'rgb(0, 128, 0)');
+  t("@scope does not apply outside", c('out') === 'rgb(0, 128, 0)', false);
+  t(":scope is the root", c('card'), 'rgb(0, 0, 255)');
+}, 500);
+</script></body></html>

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!-- Grid named areas and lines: grid-template-areas with grid-area, the
+     grid-template shorthand's area form, and bracketed line names in a
+     track list used by grid-column. Expected console output: lines
+     starting "PASS". -->
+<html><head><style>
+body { margin: 0 }
+#g { display: grid; width: 400px; grid-template-columns: 100px 1fr 100px;
+     grid-template-rows: 50px 100px 30px;
+     grid-template-areas: "head head head" "nav main side" "foot foot foot" }
+#head { grid-area: head } #nav { grid-area: nav } #main { grid-area: main }
+#side { grid-area: side } #foot { grid-area: foot }
+#t { display: grid; width: 300px;
+     grid-template: "a b" 40px "c c" 60px / 100px 1fr }
+#tc { grid-area: c } #tb { grid-area: b }
+#l { display: grid; width: 600px;
+     grid-template-columns: [full-start] 100px [content-start] 1fr [content-end] 100px [full-end] }
+#lc { grid-column: content } #lf { grid-column: full-start / full-end } #le { grid-column: content-end / full-end }
+</style></head><body>
+<div id=g><div id=foot>f</div><div id=side>s</div><div id=main>m</div><div id=nav>n</div><div id=head>h</div></div>
+<div id=t><div id=tc>c</div><div id=tb>b</div></div>
+<div id=l><div id=lc>c</div><div id=lf>f</div><div id=le>e</div></div>
+<script>
+setTimeout(function () {
+  function r(id) { var g = document.getElementById(id.charAt(0) === 't' ? 't' : id.charAt(0) === 'l' ? 'l' : 'g').getBoundingClientRect(), b = document.getElementById(id).getBoundingClientRect();
+    return [Math.round(b.left - g.left), Math.round(b.top - g.top), Math.round(b.width), Math.round(b.height)].join(','); }
+  function t(label, id, want) { var got = r(id); console.log((got === want ? "PASS " : "FAIL ") + label + " (" + got + ")"); }
+  t("head spans the top row", 'head', '0,0,400,50');
+  t("nav on the left", 'nav', '0,50,100,100');
+  t("main in the middle", 'main', '100,50,200,100');
+  t("side on the right", 'side', '300,50,100,100');
+  t("foot spans the bottom", 'foot', '0,150,400,30');
+  t("grid-template area form: b", 'tb', '100,0,200,40');
+  t("grid-template area form: c", 'tc', '0,40,300,60');
+  t("named lines: content", 'lc', '100,0,400,' + document.getElementById('lc').getBoundingClientRect().height);
+  t("named lines: full-start / full-end", 'lf', '0,' + Math.round(document.getElementById('lf').getBoundingClientRect().top - document.getElementById('l').getBoundingClientRect().top) + ',600,' + document.getElementById('lf').getBoundingClientRect().height);
+  t("named lines: content-end / full-end", 'le', '500,' + Math.round(document.getElementById('le').getBoundingClientRect().top - document.getElementById('l').getBoundingClientRect().top) + ',100,' + document.getElementById('le').getBoundingClientRect().height);
+}, 500);
+</script></body></html>

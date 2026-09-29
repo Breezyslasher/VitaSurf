@@ -13,8 +13,8 @@
 @media screen { @media (min-width: 100px) { .c { width: 60px; } } }
 /* d: @media inside @media, inner not matching */
 @media screen { @media (min-width: 5000px) { .d { width: 60px; } } }
-/* e: @layer inside @media */
-@media screen { @layer base { .e { width: 60px; } } }
+/* e: @layer inside @media (important, as a layered normal rule loses to the unlayered .box) */
+@media screen { @layer base { .e { width: 60px !important; } } }
 /* f: a rule after a nested block is still inside the outer @media */
 @media (min-width: 5000px) { @supports (display: block) { .x { width: 1px; } } .f { width: 60px; } }
 /* g: a rule after the outer block is back at the top level */

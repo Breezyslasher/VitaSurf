@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!-- The focus moves while a stylesheet a script added is still being
+     fetched. Restyling for :focus asks every sheet which states its
+     rules want of ancestors, and asking one with no content yet
+     asserted (build 489, Home Assistant). Expected console output:
+     both lines, in order, with no assertion between them. -->
+<html><head><style>
+input:focus { outline: 2px solid red }
+.w:focus-within p { color: blue }
+</style></head><body>
+<div class=w><input id=i><p id=t>t</p></div>
+<script>
+window.addEventListener('load', function () { setTimeout(function () {
+  var l = document.createElement('link');
+  l.rel = 'stylesheet';
+  l.href = '/slow.css';
+  document.head.appendChild(l);
+  setTimeout(function () {
+    document.getElementById('i').focus();
+    console.log('focused while the sheet loads');
+  }, 300);
+  setTimeout(function () {
+    var got = getComputedStyle(document.getElementById('t')).color;
+    console.log((got === 'rgb(0, 128, 0)' ? 'PASS' : 'FAIL') +
+        ' the sheet applies once it arrives (' + got + ')');
+  }, 6000);
+}, 500); });
+</script></body></html>

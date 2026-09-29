@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!-- Cascade layers: a rule in no layer beats every layered one, a later
+     layer beats an earlier, the order a statement names them in wins
+     over the order their blocks come in, sublayers lose to their
+     parent's own rules, and !important runs the other way. Specificity
+     counts only inside a layer. Expected console output: lines ending in
+     "PASS". -->
+<html><head><style>
+@layer base, theme;
+#a { color: rgb(0, 0, 255) }
+@layer base { html body p#a { color: rgb(255, 0, 0) } }
+@layer theme { #b { color: rgb(0, 128, 0) } }
+@layer base { #b { color: rgb(255, 0, 0) } }
+@layer theme { #c { color: rgb(255, 0, 0) !important } }
+@layer base { #c { color: rgb(0, 128, 0) !important } }
+@layer ui { @layer inner { #d { color: rgb(255, 0, 0) } } #d { color: rgb(0, 128, 0) } }
+@layer ui.inner { #e { color: rgb(255, 0, 0) } }
+@layer ui.early { #e { color: rgb(0, 128, 0) } }
+#f { color: rgb(255, 0, 0) !important }
+@layer base { #f { color: rgb(0, 128, 0) !important } }
+</style></head><body>
+<p id=a>a</p><p id=b>b</p><p id=c>c</p><p id=d>d</p><p id=e>e</p><p id=f>f</p>
+<script>
+setTimeout(function () {
+  function t(label, id, want) { var got = getComputedStyle(document.getElementById(id)).color;
+    console.log((got === want ? "PASS " : "FAIL ") + label + " (" + got + ")"); }
+  t("unlayered beats a layer, whatever the specificity", 'a', 'rgb(0, 0, 255)');
+  t("the statement's order, not the blocks'", 'b', 'rgb(0, 128, 0)');
+  t("!important: the earlier layer wins", 'c', 'rgb(0, 128, 0)');
+  t("a layer's own rules beat its sublayer", 'd', 'rgb(0, 128, 0)');
+  t("sublayers in the order first named", 'e', 'rgb(0, 128, 0)');
+  t("!important in a layer beats unlayered !important", 'f', 'rgb(0, 128, 0)');
+}, 500);
+</script></body></html>
