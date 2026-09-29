@@ -1066,8 +1066,9 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
  */
 /*
  * The tally of Web APIs the page asked for that this build does not
- * have. It lives in the QuickJS bindings, which the duktape build does
- * not compile, so the symbol is weak and the call is skipped there.
+ * have. It lives in the QuickJS bindings, which a build without
+ * JavaScript does not compile, so the symbol is weak and the call is
+ * skipped there.
  */
 extern void vita_js_report_gaps(void) __attribute__((weak));
 /* the script profile, from the same place and weak for the same reason */

@@ -1,0 +1,93 @@
+diff --git a/quickjs.c b/quickjs.c
+index bee2c76..73f363f 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -334,6 +334,8 @@ struct JSRuntime {
+     } u;
+     JSModuleCheckSupportedImportAttributes *module_check_attrs;
+     void *module_loader_opaque;
++    /* VitaSurf: offered every import() before the module is loaded */
++    JSDynamicImportHook *dynamic_import_hook;
+     /* timestamp for internal use in module evaluation */
+     int64_t module_async_evaluation_next_timestamp;
+ 
+@@ -6592,6 +6594,10 @@ static void js_bound_function_finalizer(JSRuntime *rt, JSValueConst val)
+     JSBoundFunction *bf = p->u.bound_function;
+     int i;
+ 
++    /* VitaSurf: bind() frees its object without a record when the
++       record's allocation fails, which is out of memory */
++    if (!bf)
++        return;
+     JS_FreeValueRT(rt, bf->func_obj);
+     JS_FreeValueRT(rt, bf->this_val);
+     for(i = 0; i < bf->argc; i++) {
+@@ -6607,6 +6613,8 @@ static void js_bound_function_mark(JSRuntime *rt, JSValueConst val,
+     JSBoundFunction *bf = p->u.bound_function;
+     int i;
+ 
++    if (!bf)
++        return;
+     JS_MarkValue(rt, bf->func_obj, mark_func);
+     JS_MarkValue(rt, bf->this_val, mark_func);
+     for(i = 0; i < bf->argc; i++)
+@@ -7302,6 +7310,8 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
+         case JS_CLASS_BOUND_FUNCTION:    /* u.bound_function */
+             {
+                 JSBoundFunction *bf = p->u.bound_function;
++                if (!bf)
++                    break;
+                 /* func_obj and this_val are objects */
+                 for (i = 0; i < bf->argc; i++) {
+                     compute_value_size(bf->argv[i], hp);
+@@ -29287,6 +29297,11 @@ void JS_SetModuleLoaderFunc2(JSRuntime *rt,
+     rt->module_loader_opaque = opaque;
+ }
+ 
++void JS_SetDynamicImportHook(JSRuntime *rt, JSDynamicImportHook *hook)
++{
++    rt->dynamic_import_hook = hook;
++}
++
+ void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
+                                 JSModuleNormalizeFunc2 *module_normalize)
+ {
+@@ -30462,6 +30477,17 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+     if (!filename)
+         goto exception;
+ 
++    /* VitaSurf: the host may settle the promise itself, once the module
++       has arrived over the network */
++    if (ctx->rt->dynamic_import_hook &&
++        ctx->rt->dynamic_import_hook(ctx, basename, filename,
++                                     resolving_funcs,
++                                     ctx->rt->module_loader_opaque)) {
++        JS_FreeCString(ctx, filename);
++        JS_FreeCString(ctx, basename);
++        return JS_UNDEFINED;
++    }
++
+     JS_LoadModuleInternal(ctx, basename, filename, resolving_funcs, attributes);
+     JS_FreeCString(ctx, filename);
+     JS_FreeCString(ctx, basename);
+diff --git a/quickjs.h b/quickjs.h
+index 3fb2c5d..19af40b 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1189,6 +1189,16 @@ JS_EXTERN void JS_SetModuleLoaderFunc2(JSRuntime *rt,
+                                        JSModuleCheckSupportedImportAttributes *module_check_attrs,
+                                        void *opaque);
+ 
++/* VitaSurf: called for each import() in place of loading the module at
++   once. Returning true means the hook has taken the promise's resolving
++   functions and will settle it; false loads the module as usual. */
++typedef bool JSDynamicImportHook(JSContext *ctx, const char *base_name,
++                                 const char *specifier,
++                                 JSValueConst *resolving_funcs,
++                                 void *opaque);
++JS_EXTERN void JS_SetDynamicImportHook(JSRuntime *rt,
++                                       JSDynamicImportHook *hook);
++
+ /* Set an attributes-aware module normalizer. Call after JS_SetModuleLoaderFunc2. */
+ JS_EXTERN void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
+                                           JSModuleNormalizeFunc2 *module_normalize);

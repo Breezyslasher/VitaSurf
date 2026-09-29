@@ -2083,8 +2083,8 @@ Object.defineProperties(URL.prototype,{
    this.searchParams=u.searchParams;}}});
 URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=GAP('URL.createObjectURL',function(){return 'blob:';});URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};URL.parse=function(u,b){try{return new URL(u,b);}catch(e){return null;}};
 W.URL=URL;W.URLSearchParams=URLSearchParams;
-/* A dynamic import() in page code arrives here (qjs.c rewrites the call
- * with the importing script's name as base). QuickJS loads modules
+/* A dynamic import() in page code arrives here (qjs.c's import hook
+ * passes the importing script's name as base). QuickJS loads modules
  * synchronously and can only compile source that has arrived, so wait
  * for the module first, then import it for real. */
 W.__vitaImport=function(base,spec){

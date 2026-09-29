@@ -190,6 +190,9 @@ struct slot_map {
 };
 
 struct jsthread {
+	/** the log has said this Home Assistant page gets a current
+	 * browser's user agent (VitaSurf) */
+	bool told_modern_ua;
 	jsheap *heap;
 	JSContext *ctx;
 	struct browser_window *win;
@@ -916,6 +919,8 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
 static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
+static bool is_budget_interrupt(JSContext *ctx, JSValueConst v);
+
 static void qjs_report_exception_src(JSContext *ctx, const char *name,
 				     const char *src, size_t len)
 {
@@ -934,6 +939,17 @@ static void qjs_report_exception_src(JSContext *ctx, const char *name,
 		return;
 	}
 	exc = JS_GetException(ctx);
+	if (is_budget_interrupt(ctx, exc)) {
+		static unsigned hidden;
+
+		if ((hidden++ % 100) == 0) {
+			vita_log("qjs: a script stopped by the time budget "
+				 "surfaced again (%u so far), not reported "
+				 "to the page", hidden);
+		}
+		JS_FreeValue(ctx, exc);
+		return;
+	}
 	msg = JS_ToCString(ctx, exc);
 
 	vita_log("qjs: uncaught %s", msg != NULL ? msg : "(error)");
@@ -988,6 +1004,43 @@ static void qjs_report_exception_src(JSContext *ctx, const char *name,
 static void qjs_report_exception(JSContext *ctx)
 {
 	qjs_report_exception_src(ctx, NULL, NULL, 0);
+}
+
+/*
+ * Whether a value is the error the time budget stops a script with
+ * (VitaSurf). It reaches script after all when an interrupted async
+ * function's promise is rejected with it, and a page that reports its
+ * errors then does its reporting -- Home Assistant parses the stack with
+ * regular expressions -- which overran the budget in turn: 4554 of them
+ * on one dashboard, and the job queue grew until memory ran out. It is
+ * not the page's error, so it is not reported to the page.
+ */
+static bool is_budget_interrupt(JSContext *ctx, JSValueConst v)
+{
+	JSValue name, msg;
+	const char *n = NULL, *m = NULL;
+	bool yes = false;
+
+	if (!JS_IsObject(v)) {
+		return false;
+	}
+	name = JS_GetPropertyStr(ctx, v, "name");
+	msg = JS_GetPropertyStr(ctx, v, "message");
+	if (JS_IsString(name) && JS_IsString(msg)) {
+		n = JS_ToCString(ctx, name);
+		m = JS_ToCString(ctx, msg);
+		yes = n != NULL && m != NULL &&
+		      strcmp(n, "InternalError") == 0 &&
+		      strcmp(m, "interrupted") == 0;
+	}
+	if (n != NULL) JS_FreeCString(ctx, n);
+	if (m != NULL) JS_FreeCString(ctx, m);
+	JS_FreeValue(ctx, name);
+	JS_FreeValue(ctx, msg);
+	if (JS_HasException(ctx)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+	}
+	return yes;
 }
 
 /** True if err stringifies to something containing needle. */
@@ -5938,10 +5991,51 @@ static const JSCFunctionListEntry location_proto[] = {
 	JS_CFUNC_DEF("replace", 1, loc_assign),
 };
 
+/*
+ * Home Assistant chooses its build in page script, from navigator.userAgent:
+ * Chrome 129 or later and the like get frontend_latest, and anything else,
+ * this device's own string included, gets frontend_es5, which is bigger and
+ * transpiled for engines older than QuickJS. A page that preloads
+ * /frontend_latest/ is Home Assistant's, and script on it is told a current
+ * Chrome. Requests keep the device's string (VitaSurf).
+ */
+static const char ha_modern_ua[] =
+	"Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36 "
+	"(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+static bool page_is_home_assistant(jsthread *thread)
+{
+	unsigned int i;
+
+	if (thread == NULL || thread->htmlc == NULL) {
+		return false;
+	}
+	for (i = 0; i < thread->htmlc->scripts_count; i++) {
+		struct html_script *sc = &thread->htmlc->scripts[i];
+
+		if (sc->type == HTML_SCRIPT_PRELOAD && sc->asked != NULL &&
+		    strstr(nsurl_access(sc->asked), "/frontend_latest/") !=
+				NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static JSValue nav_get_user_agent(JSContext *ctx, JSValueConst this_val)
 {
 	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
 	(void)this_val;
+	if (nsoption_bool(ha_latest) && page_is_home_assistant(thread)) {
+		if (!thread->told_modern_ua) {
+			thread->told_modern_ua = true;
+			vita_log("qjs: a Home Assistant page: script is told "
+				 "Chrome 140, so it loads frontend_latest");
+		}
+		return JS_NewString(ctx, ha_modern_ua);
+	}
 	return JS_NewString(ctx, user_agent_string());
 }
 
@@ -11959,6 +12053,10 @@ static size_t prelude_bc_len;
  * URL of its own, which is what the prelude used to count as.
  */
 #define PRELUDE_URL "vitasurf:prelude"
+static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
+				    const char *spec,
+				    JSValueConst *resolving_funcs,
+				    void *opaque);
 
 static JSValue bc_load(JSContext *ctx, const char *url,
 		       const char *src, size_t srclen);
@@ -12391,6 +12489,10 @@ static void qjs_rejection_tracker(JSContext *ctx, JSValueConst promise,
 	if (ctx == NULL) {
 		return;
 	}
+	/* a job the time budget stopped, not the page's rejection */
+	if (!is_handled && is_budget_interrupt(ctx, reason)) {
+		return;
+	}
 	/*
 	 * A handler attached after the rejection cancels the report: the
 	 * prelude holds it for a turn so a .catch() added later in the
@@ -12489,6 +12591,7 @@ static nserror heap_start(jsheap *ret)
 	 */
 	JS_SetModuleLoaderFunc(ret->rt, qjs_module_normalize,
 			       qjs_module_loader, NULL);
+	JS_SetDynamicImportHook(ret->rt, qjs_dynamic_import_hook);
 	JS_SetHostPromiseRejectionTracker(ret->rt, qjs_rejection_tracker, NULL);
 	{
 		size_t limit = (size_t)vita_heap_size_kb() / 176 * 96 * 1024;
@@ -14700,128 +14803,60 @@ static int module_graph_check(jsthread *thread, const char *root,
 }
 
 /*
- * A dynamic import() in page code is rewritten to __vitaImport(base, spec)
- * before the source is compiled. QuickJS asks its loader for the module
- * synchronously, and the loader can only hand over source the page has
- * already received: a module still on its way (SvelteKit's bootstrap
- * imports two the head is preloading) failed on the spot, and nothing
- * retried it. The helper in the prelude asks __vitaModuleState until the
- * module has arrived and only then does the real import.
+ * Every import() is offered to this before QuickJS loads the module
+ * (VitaSurf). QuickJS asks its loader for a module synchronously, and
+ * the loader can only hand over source the page has already received: a
+ * module still on its way failed on the spot, and nothing retried it.
+ * So the import goes to __vitaImport in the prelude, which waits until
+ * the module and everything it imports have arrived and then imports it
+ * for real; that import() is the prelude's own, which loads at once.
+ *
+ * This used to be done by rewriting import( in each script's source to a
+ * call of the helper, which meant finding the calls in minified code by
+ * scanning it. A regular expression holding a quote threw the scan off,
+ * and Home Assistant's current build loads every one of its chunks with
+ * an import() the scan never found.
  */
-static bool is_ident_char(unsigned char c)
+static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
+				    const char *spec,
+				    JSValueConst *resolving_funcs,
+				    void *opaque)
 {
-	return isalnum(c) || c == '_' || c == '$' || c >= 0x80;
-}
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue global, helper, args[2], promise, then, ret;
+	bool taken = false;
 
-/*
- * Find the next "import (" that is code: not part of a longer name, and
- * not inside a string, a template or a comment. A regular expression
- * literal holding the word is not told apart, and is not expected.
- * Returns the offset of "import", with *paren the offset of the "(",
- * or len when there is none.
- */
-static size_t next_dynamic_import(const char *src, size_t len, size_t from,
-				  size_t *paren)
-{
-	size_t i = from;
-
-	while (i < len) {
-		char c = src[i];
-
-		if (c == '"' || c == '\'' || c == '`') {
-			char q = c;
-
-			for (i++; i < len && src[i] != q; i++) {
-				if (src[i] == '\\') i++;
-			}
-			i++;
-		} else if (c == '/' && i + 1 < len && src[i + 1] == '/') {
-			while (i < len && src[i] != '\n') i++;
-		} else if (c == '/' && i + 1 < len && src[i + 1] == '*') {
-			/* newlib has no memmem */
-			for (i += 2; i + 1 < len; i++) {
-				if (src[i] == '*' && src[i + 1] == '/') {
-					break;
-				}
-			}
-			i = i + 1 < len ? i + 2 : len;
-		} else if (c == 'i' && len - i >= 6 &&
-			   memcmp(src + i, "import", 6) == 0 &&
-			   (i == 0 || !is_ident_char((unsigned char)src[i - 1])) &&
-			   !(len - i > 6 && is_ident_char((unsigned char)src[i + 6]))) {
-			size_t q = i + 6;
-
-			while (q < len && (src[q] == ' ' || src[q] == '\t' ||
-					   src[q] == '\n' || src[q] == '\r')) {
-				q++;
-			}
-			if (q < len && src[q] == '(') {
-				*paren = q;
-				return i;
-			}
-			i = q;
+	(void)opaque;
+	if (thread == NULL || thread->closed || base == NULL ||
+	    strcmp(base, "<prelude>") == 0) {
+		return false;
+	}
+	global = JS_GetGlobalObject(ctx);
+	helper = JS_GetPropertyStr(ctx, global, "__vitaImport");
+	if (JS_IsFunction(ctx, helper)) {
+		args[0] = JS_NewString(ctx, base);
+		args[1] = JS_NewString(ctx, spec);
+		promise = JS_Call(ctx, helper, global, 2, args);
+		JS_FreeValue(ctx, args[0]);
+		JS_FreeValue(ctx, args[1]);
+		if (JS_IsException(promise)) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
 		} else {
-			i++;
+			then = JS_GetPropertyStr(ctx, promise, "then");
+			ret = JS_Call(ctx, then, promise, 2, resolving_funcs);
+			if (JS_IsException(ret)) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+			} else {
+				taken = true;
+			}
+			JS_FreeValue(ctx, ret);
+			JS_FreeValue(ctx, then);
 		}
+		JS_FreeValue(ctx, promise);
 	}
-	return len;
-}
-
-static char *rewrite_dynamic_imports(const char *src, size_t len,
-				     const char *name, size_t *outlen)
-{
-	size_t count = 0, namelen, extra, o = 0, i, at, paren;
-	char *out, *ename;
-
-	/* count first, so the copy is made in one piece */
-	for (at = next_dynamic_import(src, len, 0, &paren); at < len;
-	     at = next_dynamic_import(src, len, paren + 1, &paren)) {
-		count++;
-	}
-	if (count == 0) {
-		return NULL;
-	}
-	/* the base name, as a JS string literal */
-	namelen = strlen(name);
-	ename = malloc(namelen * 2 + 1);
-	if (ename == NULL) {
-		return NULL;
-	}
-	for (i = 0; i < namelen; i++) {
-		unsigned char c = (unsigned char)name[i];
-
-		if (c == '"' || c == '\\') {
-			ename[o++] = '\\';
-			ename[o++] = c;
-		} else if (c < 0x20) {
-			ename[o++] = ' ';
-		} else {
-			ename[o++] = c;
-		}
-	}
-	ename[o] = 0;
-	/* "import(" -> "__vitaImport("<name>"," */
-	extra = strlen("__vitaImport(\"\",") + o;
-	out = malloc(len + count * extra + 1);
-	if (out == NULL) {
-		free(ename);
-		return NULL;
-	}
-	o = 0;
-	i = 0;
-	for (at = next_dynamic_import(src, len, 0, &paren); at < len;
-	     at = next_dynamic_import(src, len, paren + 1, &paren)) {
-		memcpy(out + o, src + i, at - i);
-		o += at - i;
-		o += (size_t)sprintf(out + o, "__vitaImport(\"%s\",", ename);
-		i = paren + 1;
-	}
-	memcpy(out + o, src + i, len - i);
-	o += len - i;
-	out[o] = 0;
-	*outlen = o;
-	free(ename);
-	return out;
+	JS_FreeValue(ctx, helper);
+	JS_FreeValue(ctx, global);
+	return taken;
 }
 
 /*
@@ -14926,8 +14961,7 @@ static JSModuleDef *local_module(JSContext *ctx, jsthread *thread,
 {
 	JSValue global, get, text, fn;
 	const char *src;
-	char *rw;
-	size_t len, rwlen = 0;
+	size_t len;
 	JSModuleDef *m;
 
 	global = JS_GetGlobalObject(ctx);
@@ -14956,15 +14990,8 @@ static JSModuleDef *local_module(JSContext *ctx, jsthread *thread,
 	if (src == NULL) {
 		return NULL;
 	}
-	rw = rewrite_dynamic_imports(src, len, name, &rwlen);
-	if (rw != NULL) {
-		fn = JS_Eval(ctx, rw, rwlen, name, JS_EVAL_TYPE_MODULE |
-			     JS_EVAL_FLAG_COMPILE_ONLY);
-		free(rw);
-	} else {
-		fn = JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_MODULE |
-			     JS_EVAL_FLAG_COMPILE_ONLY);
-	}
+	fn = JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_MODULE |
+		     JS_EVAL_FLAG_COMPILE_ONLY);
 	JS_FreeCString(ctx, src);
 	if (JS_IsException(fn)) {
 		vita_log("qjs: module at '%.80s' did not compile", name);
@@ -15039,17 +15066,6 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 			}
 			memcpy(src, data, size);
 			src[size] = 0;
-			{
-				size_t rwlen = 0;
-				char *rw = rewrite_dynamic_imports(src, size,
-								   name, &rwlen);
-
-				if (rw != NULL) {
-					free(src);
-					src = rw;
-					size = rwlen;
-				}
-			}
 			/*
 			 * The compiled module from an earlier visit, if its
 			 * imports can all be had now (VitaSurf). Not under a
@@ -15469,16 +15485,6 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	src[txtlen] = 0;
 	if (name == NULL) {
 		name = "<script>";
-	}
-	{
-		size_t rwlen = 0;
-		char *rw = rewrite_dynamic_imports(src, txtlen, name, &rwlen);
-
-		if (rw != NULL) {
-			free(src);
-			src = rw;
-			txtlen = rwlen;
-		}
 	}
 	begin_script(thread, SCRIPT_PAGE);
 	thread->current_script = name;

@@ -1,0 +1,15 @@
+diff --git a/desktop/options.h b/desktop/options.h
+index 7de475276..f695b46ab 100644
+--- a/desktop/options.h
++++ b/desktop/options.h
+@@ -146,6 +146,10 @@ NSOPTION_BOOL(css_animations, false)
+ /** Frames a second animations are drawn at (VitaSurf) */
+ NSOPTION_INTEGER(css_animation_fps, 30)
+ 
++/** Tell Home Assistant a current browser, so it sends its current build
++ * rather than its legacy one (VitaSurf) */
++NSOPTION_BOOL(ha_latest, true)
++
+ /** Whether to allow Author level CSS. */
+ NSOPTION_BOOL(author_level_css, true)
+ 

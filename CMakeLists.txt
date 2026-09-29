@@ -61,24 +61,24 @@ endif()
 set(VITASURF_STACK_KB 4096 CACHE STRING "main thread stack size in KB")
 # Must match the VITASURF_JS_ENGINE scripts/build-netsurf.sh was run with:
 # quickjs (default) leaves the js_* symbols for vita/js/qjs.c and
-# libquickjs.a (vdpm quickjs-ng), duktape builds NetSurf's engine into
-# libnetsurf.a, no uses NetSurf's stub engine.
-set(VITASURF_JS_ENGINE "quickjs" CACHE STRING "JavaScript engine: quickjs, duktape or no")
-set_property(CACHE VITASURF_JS_ENGINE PROPERTY STRINGS quickjs duktape no)
-if(NOT VITASURF_JS_ENGINE MATCHES "^(duktape|quickjs|no)$")
-    message(FATAL_ERROR "VITASURF_JS_ENGINE must be duktape, quickjs or no, not '${VITASURF_JS_ENGINE}'")
+# libquickjs.a (built from deps/libquickjs), no uses NetSurf's stub
+# engine. The Duktape build was dropped once QuickJS had long outgrown it.
+set(VITASURF_JS_ENGINE "quickjs" CACHE STRING "JavaScript engine: quickjs or no")
+set_property(CACHE VITASURF_JS_ENGINE PROPERTY STRINGS quickjs no)
+if(NOT VITASURF_JS_ENGINE MATCHES "^(quickjs|no)$")
+    message(FATAL_ERROR "VITASURF_JS_ENGINE must be quickjs or no, not '${VITASURF_JS_ENGINE}'")
 endif()
 set(NETSURF_STAGE "${CMAKE_SOURCE_DIR}/out/netsurf" CACHE PATH
     "Output of scripts/build-netsurf.sh (libnetsurf.a and resources/)")
 
 # Extended memory mode (ATTRIBUTE2=12) asks for a 365 MB main memory
-# budget in place of about 256 MB. CI builds it as a second VPK
-# (VitaSurf-extmem) while it is tried on hardware; the heap takes whatever
-# budget the system actually grants, so a build that asks and is refused
-# starts with the ordinary heap.
-option(VITASURF_EXTENDED_MEMORY "Request the extended memory budget" OFF)
+# budget in place of about 256 MB. It ran on hardware from build 483 on
+# with a 312 MB heap against 203 MB without, so every build asks for it;
+# the heap takes whatever budget the system actually grants, so a build
+# that asks and is refused starts with the ordinary heap.
+option(VITASURF_EXTENDED_MEMORY "Request the extended memory budget" ON)
 # CSS animations run, rather than showing where they come to rest. CI
-# builds it as a third VPK (VitaSurf-anim) while its cost is measured on
+# builds it as a second VPK (VitaSurf-anim) while its cost is measured on
 # hardware; the log's "anim:" lines give the frame rate.
 option(VITASURF_ANIMATIONS "Run CSS animations" OFF)
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")

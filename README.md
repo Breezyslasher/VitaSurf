@@ -30,7 +30,7 @@ default engine. Measured on hardware against Duktape, it runs the modern
 JavaScript that documentation sites, wikis and forums ship, where
 NetSurf's Duktape fails to parse it; it is somewhat slower on pages
 where it therefore does real work, and its own allocations stay under
-1 MB on such pages. Duktape remains selectable for comparison. Phase 7
+1 MB on such pages. The Duktape build has since been dropped. Phase 7
 (polish) is in progress: page zoom from the Start menu, downloads saved
 under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, and
 resume handling that stops stale fetches after a suspend.
@@ -376,10 +376,9 @@ so. The heap itself is sized when the app starts, from the memory the
 system has given it less a 32 MB reserve for the screen, the GPU, the
 network stack and the system dialogs (`vita/platform/vita_heap.c`, which
 replaces newlib's own heap setup), and the script memory limit grows with
-it. CI also builds `VitaSurf-extmem`, the same build asking for the
-extended memory budget (365 MB in place of about 256), which gives it
-about 109 MB more heap; the startup line in the log says how much memory
-was free and how big the heap is. The log says
+it. Every build asks for the extended memory budget (365 MB in place of
+about 256), which gives it about 109 MB more heap; the startup line in
+the log says how much memory was free and how big the heap is. The log says
 what each frame script made cost. A sandboxed frame is not given an opaque origin
 yet, so its page runs script only when the sandbox allows both scripts
 and same-origin, and otherwise none. `document.write` works on a document that is not
@@ -390,10 +389,8 @@ environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging. The JavaScript engine is chosen with
 `VITASURF_JS_ENGINE` in the environment of `build-netsurf.sh` and the
 matching `-DVITASURF_JS_ENGINE=` for CMake: `quickjs` (default: quickjs-ng,
-MIT, with the hand-written bindings in `vita/js/qjs.c`), `duktape`
-(NetSurf's engine with nsgenbind bindings) or `no`. CI builds both engines;
-the Duktape VPK is the `VitaSurf-duktape` artifact and the startup line
-in the log names the engine. Creating an empty file named `verbose` in
+MIT, with the hand-written bindings in `vita/js/qjs.c`) or `no`. The
+startup line in the log names the engine. Creating an empty file named `verbose` in
 `ux0:data/VitaSurf/` turns NetSurf's verbose logging on at runtime in any
 build; the log also starts with a self-test of the path and clock
 assumptions the port relies on. A file named `dumplayout` in the same
