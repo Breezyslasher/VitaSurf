@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<!-- border-image-width and border-image-outset, checked in the plot
+     output: each box is 100x40 at left 30 with a 4px border. #w draws
+     its pieces 10px wide (a clip from 30 to 40 across for the left
+     edge), #n at twice the border (8px), #o over the border box grown
+     by 6px (a clip starting at 24), and #s, whose longhands are set
+     apart from the shorthand, 12px wide with a 2px outset. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+div { width: 100px; height: 40px; margin: 30px; border: 4px solid black; }
+#w { border-image: linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255)) 4 / 10px; }
+#n { border-image: linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255)) 4 / 2; }
+#o { border-image: linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255)) 4 / / 6px; }
+#s { border-image-source: linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255));
+     border-image-slice: 4; border-image-width: 12px; border-image-outset: 2px; }
+</style></head><body>
+<div id=w></div><div id=n></div><div id=o></div><div id=s></div>
+</body></html>

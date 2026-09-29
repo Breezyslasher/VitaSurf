@@ -1,0 +1,928 @@
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 7c35de0a0..4c35aae27 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -113,9 +113,11 @@ typedef enum {
+ 				      * the box itself is visible (VitaSurf) */
+ 	FIRST_LINE = 1 << 16,	/* text on its block's first line, set in
+ 				 * first_line_style (VitaSurf) */
+-	DISPLAY_CONTENTS = 1 << 17 /* display: contents; the box is kept for
++	DISPLAY_CONTENTS = 1 << 17, /* display: contents; the box is kept for
+ 				    * its style and is not in the tree
+ 				    * (VitaSurf) */
++	Z_NEG_ASIDE = 1 << 18	/* a negative z-index box its stacking
++				 * context paints first (VitaSurf) */
+ } box_flags;
+ 
+ 
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 8c4f29d6a..d1a5166ee 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -374,6 +374,29 @@ static void box_text_transform(char *s, unsigned int len,
+ 		enum css_text_transform_e tt);
+ 
+ 
++/**
++ * Note an element, or its ::before or ::after, positioned with a
++ * negative z-index (VitaSurf): redraw only looks for such boxes, which
++ * paint under the in-flow content of their stacking context, on a page
++ * that has one.
++ */
++static void box_note_neg_z(html_content *c, const css_select_results *r)
++{
++	int i;
++
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT && !c->neg_z; i++) {
++		int32_t z = 0;
++
++		if (r->styles[i] != NULL &&
++				css_computed_position(r->styles[i]) !=
++					CSS_POSITION_STATIC &&
++				css_computed_z_index(r->styles[i], &z) ==
++					CSS_Z_INDEX_SET && z < 0)
++			c->neg_z = true;
++	}
++}
++
++
+ /**
+  * The text a pseudo element's content property asks for (VitaSurf).
+  *
+@@ -601,8 +624,19 @@ box_construct_marker(struct box *box,
+ 	lwc_string *image_uri;
+ 	struct box *marker;
+ 	enum css_list_style_type_e list_style_type;
++	css_computed_style *mstyle = box->style;
++	const css_computed_content_item *item = NULL;
++	uint8_t content = CSS_CONTENT_NORMAL;
++
++	/* ::marker gives the marker its own colour and font (VitaSurf);
++	 * the list style it draws is still the item's */
++	if (box->styles != NULL &&
++			box->styles->styles[CSS_PSEUDO_ELEMENT_MARKER] != NULL) {
++		mstyle = box->styles->styles[CSS_PSEUDO_ELEMENT_MARKER];
++		content = css_computed_content(mstyle, &item);
++	}
+ 
+-	marker = box_create(NULL, box->style, false, NULL, NULL, title,
++	marker = box_create(NULL, mstyle, false, NULL, NULL, title,
+ 			NULL, ctx->bctx);
+ 	if (marker == false)
+ 		return false;
+@@ -640,6 +674,18 @@ box_construct_marker(struct box *box,
+ 		break;
+ 	}
+ 
++	/* its content replaces the bullet or the number; none, or an
++	 * empty string, leaves no marker (an empty text is not numbered) */
++	if (content == CSS_CONTENT_NONE) {
++		marker->text = (char *) "";
++		marker->length = 0;
++	} else if (content == CSS_CONTENT_SET) {
++		char *text = box_generated_text(box->node, item, ctx->bctx);
++
++		marker->text = text != NULL ? text : (char *) "";
++		marker->length = text != NULL ? strlen(text) : 0;
++	}
++
+ 	if (css_computed_list_style_image(box->style, &image_uri) == CSS_LIST_STYLE_IMAGE_URI &&
+ 	    (image_uri != NULL) &&
+ 	    (nsoption_bool(foreground_images) == true)) {
+@@ -811,6 +857,7 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 			ctx->n);
+ 	if (styles == NULL)
+ 		return false;
++	box_note_neg_z(ctx->content, styles);
+ 
+ 	/* the faces its font-family names, if @font-face has them
+ 	 * (VitaSurf) */
+@@ -2350,6 +2397,8 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 
+ 	nscss_clear_node_data(n);
+ 	fresh = box_get_style(c, props.parent_style, root_style, n);
++	if (fresh != NULL)
++		box_note_neg_z(c, fresh);
+ 	if (fresh == NULL)
+ 		return BOX_RESTYLE_LAYOUT;
+ 
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 11d3bc097..4bb1a852b 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5891,6 +5891,49 @@ layout_get_box_bbox(
+ 					*desc_y1 = by1 + reach;
+ 			}
+ 		}
++
++		/* a border image is drawn out past the border box by its
++		 * outset (VitaSurf) */
++		{
++			lwc_string *src = NULL, *ext = NULL;
++			int k[4], v[4], i, reach = 0;
++
++			if (css_computed_border_image_source(box->style,
++					&src) == CSS_BORDER_IMAGE_SOURCE_SET &&
++					css_computed_border_image_outset(
++						box->style, &ext) ==
++						CSS_BORDER_IMAGE_OUTSET_SET &&
++					ext != NULL && sscanf(
++						lwc_string_data(ext),
++						"%d:%d,%d:%d,%d:%d,%d:%d",
++						&k[0], &v[0], &k[1], &v[1],
++						&k[2], &v[2], &k[3],
++						&v[3]) == 8) {
++				for (i = 0; i < 4; i++) {
++					int r = k[i] == -1 ?
++						FIXTOINT(FMUL(v[i], INTTOFIX(
++						  box->border[i].width))) :
++						FIXTOINT(css_unit_len2device_px(
++						  box->style, unit_len_ctx,
++						  v[i], (css_unit) k[i]));
++
++					if (r > reach)
++						reach = r;
++				}
++			}
++			if (reach > 0) {
++				if (*desc_x0 > -box->border[LEFT].width - reach)
++					*desc_x0 = -box->border[LEFT].width -
++							reach;
++				if (*desc_y0 > -box->border[TOP].width - reach)
++					*desc_y0 = -box->border[TOP].width -
++							reach;
++				if (*desc_x1 < bx1 + reach)
++					*desc_x1 = bx1 + reach;
++				if (*desc_y1 < by1 + reach)
++					*desc_y1 = by1 + reach;
++			}
++		}
+ 	}
+ 
+ 	/* To stop the top of text getting clipped when css line-height is
+diff --git a/content/handlers/html/layout_multicol.c b/content/handlers/html/layout_multicol.c
+index d968d945b..14142d92b 100644
+--- a/content/handlers/html/layout_multicol.c
++++ b/content/handlers/html/layout_multicol.c
+@@ -28,11 +28,15 @@
+  * the least that fits them into the column count. Moving a fragment is
+  * moving its boxes: nothing is laid out twice.
+  *
++ * A child with column-span: all ends the columns above it: they are
++ * balanced on their own, the child is laid out again across the whole
++ * box below them, and the columns start again under it.
++ *
+  * What this leaves out: a block that is not split, other than by the
+  * lines and blocks inside it, keeps its whole height in one column, so
+  * a box with a background that runs across a column break has it drawn
+  * only in the first; floats inside the content stay where the single
+- * column put them; column-span is not honoured.
++ * column put them; only the box's own children can span.
+  */
+ 
+ #include <assert.h>
+@@ -66,6 +70,7 @@ struct multicol_frag {
+ 	struct box *last;
+ 	int top;
+ 	int bottom;
++	bool span;	/**< a child with column-span: all */
+ };
+ 
+ struct multicol_ctx {
+@@ -158,6 +163,7 @@ static void multicol_add(struct multicol_ctx *m, struct box *first,
+ 	m->frag[m->n_frag].last = last;
+ 	m->frag[m->n_frag].top = top;
+ 	m->frag[m->n_frag].bottom = bottom < top ? top : bottom;
++	m->frag[m->n_frag].span = false;
+ 	m->n_frag++;
+ }
+ 
+@@ -269,6 +275,15 @@ static void multicol_collect(struct multicol_ctx *m, struct box *parent,
+ 		bottom = base_y + c->y + c->padding[TOP] + c->height +
+ 				c->padding[BOTTOM] + c->border[BOTTOM].width;
+ 
++		if (depth == 0 && c->style != NULL &&
++				css_computed_column_span(c->style) ==
++					CSS_COLUMN_SPAN_ALL) {
++			multicol_add(m, c, c, top, bottom);
++			if (!m->nomem)
++				m->frag[m->n_frag - 1].span = true;
++			continue;
++		}
++
+ 		if (depth < MULTICOL_DEPTH && bottom - top > m->threshold &&
+ 				multicol_can_cut(c)) {
+ 			multicol_note_cut(m, c);
+@@ -281,26 +296,29 @@ static void multicol_collect(struct multicol_ctx *m, struct box *parent,
+ 
+ 
+ /**
+- * Deal the fragments into columns of a height.
++ * Deal a run of the fragments into columns of a height.
+  *
+  * \param m          the fragments
++ * \param a          the first of the run
++ * \param b          one past its last
+  * \param col_h      the most a column holds
+  * \param col_step   a column's width and the gap after it
++ * \param y0         where the columns' tops go
+  * \param apply      move the boxes, or only count
+  * \param bottom_out if not NULL, set to the lowest bottom of a column
+  * \return how many columns that takes
+  */
+-static int multicol_deal(const struct multicol_ctx *m, int col_h,
+-		int col_step, bool apply, int *bottom_out)
++static int multicol_deal(const struct multicol_ctx *m, unsigned int a,
++		unsigned int b, int col_h, int col_step, int y0, bool apply,
++		int *bottom_out)
+ {
+ 	unsigned int i;
+ 	int k = 0;
+-	int y0 = m->frag[0].top;
+-	int start = y0;
++	int start = m->frag[a].top;
+ 	int bottom = y0;
+ 	bool empty = true;
+ 
+-	for (i = 0; i < m->n_frag; i++) {
++	for (i = a; i < b; i++) {
+ 		const struct multicol_frag *f = &m->frag[i];
+ 
+ 		if (!empty && f->bottom - start > col_h) {
+@@ -371,15 +389,89 @@ static void multicol_shrink(struct box *b)
+ }
+ 
+ 
++/** The least column height that fits a run into n columns. */
++static int multicol_balance(const struct multicol_ctx *m, unsigned int a,
++		unsigned int b, int n, int col_step)
++{
++	unsigned int i;
++	int lo = 0, hi;
++
++	/* found by halving; no column can be shorter than its tallest
++	 * fragment */
++	for (i = a; i < b; i++) {
++		if (m->frag[i].bottom - m->frag[i].top > lo)
++			lo = m->frag[i].bottom - m->frag[i].top;
++	}
++	hi = 0;
++	for (i = a; i < b; i++) {
++		if (m->frag[i].bottom - m->frag[a].top > hi)
++			hi = m->frag[i].bottom - m->frag[a].top;
++	}
++	if (hi < lo)
++		hi = lo;
++	while (lo < hi) {
++		int mid = lo + (hi - lo) / 2;
++
++		if (multicol_deal(m, a, b, mid, col_step, m->frag[a].top,
++				false, NULL) <= n)
++			hi = mid;
++		else
++			lo = mid + 1;
++	}
++	return lo;
++}
++
++
++/**
++ * Lay a spanning child out again across the whole box, its border's
++ * top at y, and return where its border ends.
++ */
++static bool multicol_span(struct box *box, struct box *c, int y,
++		int viewport_height, html_content *content, int *bottom)
++{
++	(void) viewport_height;
++
++	if (c->type == BOX_BLOCK && c->style != NULL) {
++		css_fixed len = 0;
++		css_unit unit = CSS_UNIT_PX;
++		int old_h = c->height;
++		bool fixed_h = css_computed_height(c->style, &len, &unit) ==
++				CSS_HEIGHT_SET && unit != CSS_UNIT_PCT;
++
++		if (css_computed_width(c->style, &len, &unit) ==
++				CSS_WIDTH_AUTO) {
++			c->width = box->width - c->margin[LEFT] -
++					c->margin[RIGHT] -
++					c->border[LEFT].width -
++					c->border[RIGHT].width -
++					c->padding[LEFT] - c->padding[RIGHT];
++			if (c->width < 0)
++				c->width = 0;
++		}
++		c->float_children = NULL;
++		c->cached_place_below_level = 0;
++		c->height = AUTO;
++		if (!layout_block_context(c, -1, content))
++			return false;
++		if (fixed_h)
++			c->height = old_h;
++	}
++	c->y = y + c->border[TOP].width;
++	*bottom = c->y + c->padding[TOP] + c->height + c->padding[BOTTOM] +
++			c->border[BOTTOM].width;
++	return true;
++}
++
++
+ /* exported interface documented in html/layout_internal.h */
+ bool layout_multicol(struct box *box, int viewport_height,
+ 		html_content *content)
+ {
+ 	struct multicol_ctx m;
+-	int n, colw, gap, width, height_spec, total, lo, hi, col_h;
++	int n, colw, gap, width, height_spec, total, col_h = 0;
+ 	int orig_bottom = INT_MIN, new_bottom = 0, trailing;
+ 	unsigned int i;
+-	bool ok;
++	bool ok, spans = false;
+ 
+ 	if (!layout_multicol_columns(&content->unit_len_ctx, box,
+ 			box->width, &n, &colw, &gap)) {
+@@ -409,38 +501,55 @@ bool layout_multicol(struct box *box, int viewport_height,
+ 	for (i = 0; i < m.n_frag; i++) {
+ 		if (m.frag[i].bottom > orig_bottom)
+ 			orig_bottom = m.frag[i].bottom;
++		if (m.frag[i].span)
++			spans = true;
+ 	}
+ 
+-	if (height_spec != AUTO) {
+-		/* a box with a height fills each column to it, and what
+-		 * does not fit goes into more columns beside them */
+-		col_h = height_spec;
+-	} else {
+-		/* balanced: the least height that fits the fragments into
+-		 * n columns, found by halving; no column can be shorter
+-		 * than its tallest fragment */
+-		lo = 0;
+-		for (i = 0; i < m.n_frag; i++) {
+-			if (m.frag[i].bottom - m.frag[i].top > lo)
+-				lo = m.frag[i].bottom - m.frag[i].top;
++	if (!spans) {
++		if (height_spec != AUTO) {
++			/* a box with a height fills each column to it, and
++			 * what does not fit goes into more columns beside
++			 * them */
++			col_h = height_spec;
++		} else {
++			/* balanced */
++			col_h = multicol_balance(&m, 0, m.n_frag, n,
++					colw + gap);
+ 		}
+-		hi = orig_bottom - m.frag[0].top;
+-		if (hi < lo)
+-			hi = lo;
+-		while (lo < hi) {
+-			int mid = lo + (hi - lo) / 2;
+-
+-			if (multicol_deal(&m, mid, colw + gap, false,
+-					NULL) <= n)
+-				hi = mid;
+-			else
+-				lo = mid + 1;
++		multicol_deal(&m, 0, m.n_frag, col_h, colw + gap,
++				m.frag[0].top, true, &new_bottom);
++	} else {
++		/* runs of columns, each balanced, with the spanning
++		 * children between them; each part keeps the gap the one
++		 * column had above it, which is its margins */
++		unsigned int a = 0, b;
++		int cur = m.frag[0].top;
++
++		while (a < m.n_frag) {
++			int y = a == 0 ? m.frag[0].top :
++					cur + m.frag[a].top -
++					m.frag[a - 1].bottom;
++			if (m.frag[a].span) {
++				if (!multicol_span(box, m.frag[a].first, y,
++						viewport_height, content,
++						&cur)) {
++					free(m.frag);
++					free(m.cut);
++					return false;
++				}
++				a++;
++				continue;
++			}
++			for (b = a; b < m.n_frag && !m.frag[b].span; b++)
++				;
++			col_h = multicol_balance(&m, a, b, n, colw + gap);
++			multicol_deal(&m, a, b, col_h, colw + gap, y, true,
++					&cur);
++			a = b;
+ 		}
+-		col_h = lo;
++		new_bottom = cur;
+ 	}
+ 
+-	multicol_deal(&m, col_h, colw + gap, true, &new_bottom);
+-
+ 	/* the boxes that were cut up take only what is left in them,
+ 	 * innermost first */
+ 	for (i = m.n_cut; i-- > 0; )
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 9ad60cdc5..d8ea6e2e3 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -297,6 +297,10 @@ typedef struct html_content {
+ 	 */
+ 	struct form_control *visible_select_menu;
+ 
++	/** Whether a box was ever given a negative z-index while
++	 * positioned, so redraw looks ahead for such boxes (VitaSurf) */
++	bool neg_z;
++
+ } html_content;
+ 
+ /**
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 83ef4da98..45e4e84f3 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1987,6 +1987,11 @@ bool html_redraw_box(const html_content *html, struct box *box,
+  * \return true if successful, false otherwise
+  */
+ 
++static bool html_z_paint_negatives(const html_content *html,
++		struct box *box, int x_parent, int y_parent,
++		const struct rect *clip, float scale,
++		colour bg, const struct redraw_context *ctx);
++
+ static bool html_redraw_box_children(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, float scale,
+@@ -1997,6 +2002,11 @@ static bool html_redraw_box_children(const html_content *html, struct box *box,
+ 
+ 	int pass;
+ 
++	/* a stacking context's negative z-index boxes go first (VitaSurf) */
++	if (!html_z_paint_negatives(html, box, x_parent, y_parent, clip, scale,
++			current_background_color, ctx))
++		return false;
++
+ 	/*
+ 	 * Sticky children are drawn after the others (VitaSurf). A
+ 	 * sticky box is a positioned box, painted above the in-flow
+@@ -3809,9 +3819,11 @@ static int html_sticky_offset_x(const html_content *html, struct box *box,
+  * covered by whatever in-flow content came after it. Each stacking
+  * context now sets its positioned descendants aside as it meets them
+  * and paints them after its in-flow content, in z-index order and then
+- * tree order (CSS 2.1 appendix E, simplified). A negative z-index is
+- * painted where it stands, as before: it belongs under the in-flow
+- * content, and the painter does not look ahead to find it.
++ * tree order (CSS 2.1 appendix E, simplified). A negative z-index
++ * goes under the context's in-flow content: on a page that has one, a
++ * context looks ahead through its descendants for them when it starts
++ * and paints them once its own background is down. One inside a box
++ * that clips, or inside a float, is painted where it stands.
+  *
+  * A box that pushes a filter, an opacity or a transform in front of
+  * the plotters starts a stacking context of its own, as CSS says it
+@@ -3832,6 +3844,13 @@ struct html_z_list {
+ 	struct html_z_entry *e;
+ 	unsigned n, alloc;
+ 	uint32_t seq;
++	/** the boxes with a negative z-index, found ahead, painted
++	 * before the in-flow content (VitaSurf) */
++	struct html_z_entry *neg;
++	unsigned n_neg, neg_alloc;
++	bool neg_done;
++	/** where the root was painted from when they were found */
++	int neg_x, neg_y;
+ };
+ 
+ /** the stacking contexts being painted, innermost last; one nested deeper
+@@ -4320,9 +4339,9 @@ static bool html_redraw_clip_shape(const html_content *html,
+ 
+ /**
+  * An empty text field's placeholder (VitaSurf): the placeholder
+- * attribute's text in the field's font, at the field's text origin,
+- * its colour the text colour taken halfway to the background, as
+- * browsers draw it when ::placeholder says nothing else.
++ * attribute's text at the field's text origin, in ::placeholder's font
++ * and colour when a rule gives it one, and otherwise in the field's
++ * font with the text colour taken halfway to the background.
+  */
+ static bool html_redraw_placeholder(const html_content *html,
+ 		struct box *box, int x, int y, int padding_width,
+@@ -4333,6 +4352,7 @@ static bool html_redraw_placeholder(const html_content *html,
+ 	plot_font_style_t fstyle;
+ 	struct rect r = *clip;
+ 	int px, tx, ty;
++	unsigned int a;
+ 	colour fg;
+ 	nserror res;
+ 
+@@ -4349,14 +4369,29 @@ static bool html_redraw_placeholder(const html_content *html,
+ 		return true;
+ 	}
+ 
+-	font_plot_style_from_css(&html->unit_len_ctx, box->style, &fstyle);
+-	fg = fstyle.foreground;
+ 	if (bg == NS_TRANSPARENT)
+ 		bg = 0xffffff;
++	if (box->styles != NULL && box->styles->styles[
++			CSS_PSEUDO_ELEMENT_PLACEHOLDER] != NULL) {
++		/* ::placeholder's colour, its alpha laid over the field */
++		font_plot_style_from_css(&html->unit_len_ctx, box->styles->
++				styles[CSS_PSEUDO_ELEMENT_PLACEHOLDER],
++				&fstyle);
++		fg = fstyle.foreground;
++		a = 255 - ((fg >> 24) & 0xff);
++	} else {
++		/* otherwise halfway between the text and the field */
++		font_plot_style_from_css(&html->unit_len_ctx, box->style,
++				&fstyle);
++		fg = fstyle.foreground;
++		a = 128;
++	}
+ 	fstyle.foreground =
+-		((((fg & 0xff) + (bg & 0xff)) / 2) & 0xff) |
+-		(((((fg >> 8) & 0xff) + ((bg >> 8) & 0xff)) / 2) << 8) |
+-		(((((fg >> 16) & 0xff) + ((bg >> 16) & 0xff)) / 2) << 16);
++		(((fg & 0xff) * a + (bg & 0xff) * (255 - a)) / 255) |
++		(((((fg >> 8) & 0xff) * a +
++		   ((bg >> 8) & 0xff) * (255 - a)) / 255) << 8) |
++		(((((fg >> 16) & 0xff) * a +
++		   ((bg >> 16) & 0xff) * (255 - a)) / 255) << 16);
+ 	fstyle.background = bg;
+ 	fstyle.size *= scale;
+ 	px = (int) (plot_style_fixed_to_float(fstyle.size) *
+@@ -4870,12 +4905,45 @@ static bool html_border_image_piece(struct hlcache_handle *img,
+ 	return true;
+ }
+ 
++/**
++ * One side of border-image-width or border-image-outset, in device
++ * pixels (VitaSurf). \a k and \a v are as css_border_image_width_e
++ * gives them; \a border is the side's border width, \a area the border
++ * image area across that side and \a slice the slice's size there.
++ */
++static float html_border_image_extent(const html_content *html,
++		const struct box *box, int k, int v, float border, float area,
++		float slice, float scale)
++{
++	switch (k) {
++	case -1:	/* a multiple of the border's width */
++		return border * FIXTOFLT(v);
++	case -2:	/* a percentage of the area */
++		return area * FIXTOFLT(v) / 100.0f;
++	case -3:	/* auto: the slice's own size */
++		return slice;
++	default:
++		return FIXTOFLT(css_unit_len2device_px(box->style,
++				&html->unit_len_ctx, v, (css_unit) k)) * scale;
++	}
++}
++
++/** Read four sides of a border-image-width or -outset (VitaSurf). */
++static bool html_border_image_sides(lwc_string *str, int k[4], int v[4])
++{
++	return str != NULL && sscanf(lwc_string_data(str),
++			"%d:%d,%d:%d,%d:%d,%d:%d", &k[0], &v[0], &k[1], &v[1],
++			&k[2], &v[2], &k[3], &v[3]) == 8;
++}
++
+ /**
+  * border-image (VitaSurf): the source cut into nine by the slice, the
+  * corners into the border's corners, the edges along its sides,
+  * stretched or repeated as border-image-repeat says (round and space
+  * repeat), and the middle over the padding box if the slice says fill.
+- * The border's own widths are the widths the image is drawn at.
++ * The image is drawn border-image-width wide, the border's own widths
++ * unless that says otherwise, over the border box grown by
++ * border-image-outset.
+  *
+  * \return true if the border image was painted in place of the border
+  */
+@@ -4885,12 +4953,14 @@ static bool html_redraw_border_image(const html_content *html,
+ 		float scale, const struct rect *clip,
+ 		const struct redraw_context *ctx, bool *ok)
+ {
+-	lwc_string *src = NULL, *slice = NULL;
++	lwc_string *src = NULL, *slice = NULL, *ext = NULL;
+ 	const char *gradient = NULL;
+ 	struct hlcache_handle *img = NULL;
+ 	struct rect bb, d;
+-	float iw, ih, s[4], sx[4], sy[4];
++	float iw, ih, s[4], sx[4], sy[4], w[4], f;
++	float bw[4] = { bt, br, bb_, bl };
+ 	int dx[4], dy[4], v[4] = { 100, 100, 100, 100 }, mask = 15, fill = 0;
++	int ek[4], ev[4];
+ 	int i, j;
+ 	uint8_t rep;
+ 	bool tile_h, tile_v;
+@@ -4914,6 +4984,18 @@ static bool html_redraw_border_image(const html_content *html,
+ 	bb.y0 = y - bt;
+ 	bb.x1 = x + padding_width + br;
+ 	bb.y1 = y + padding_height + bb_;
++	/* the outset grows the area the image is drawn over */
++	if (css_computed_border_image_outset(box->style, &ext) ==
++			CSS_BORDER_IMAGE_OUTSET_SET &&
++			html_border_image_sides(ext, ek, ev)) {
++		for (i = 0; i < 4; i++)
++			w[i] = html_border_image_extent(html, box, ek[i], ev[i],
++					bw[i], 0, 0, scale);
++		bb.y0 -= (int) w[0];
++		bb.x1 += (int) w[1];
++		bb.y1 += (int) w[2];
++		bb.x0 -= (int) w[3];
++	}
+ 	if (gradient != NULL) {
+ 		iw = bb.x1 - bb.x0;
+ 		ih = bb.y1 - bb.y0;
+@@ -4943,8 +5025,38 @@ static bool html_redraw_border_image(const html_content *html,
+ 	}
+ 	sx[0] = 0; sx[1] = s[3]; sx[2] = iw - s[1]; sx[3] = iw;
+ 	sy[0] = 0; sy[1] = s[0]; sy[2] = ih - s[2]; sy[3] = ih;
+-	dx[0] = bb.x0; dx[1] = bb.x0 + bl; dx[2] = bb.x1 - br; dx[3] = bb.x1;
+-	dy[0] = bb.y0; dy[1] = bb.y0 + bt; dy[2] = bb.y1 - bb_; dy[3] = bb.y1;
++
++	/* the widths the pieces are drawn at; auto is the slice's size,
++	 * in device pixels when the source is an image */
++	for (i = 0; i < 4; i++)
++		w[i] = bw[i];
++	if (css_computed_border_image_width(box->style, &ext) ==
++			CSS_BORDER_IMAGE_WIDTH_SET &&
++			html_border_image_sides(ext, ek, ev)) {
++		for (i = 0; i < 4; i++) {
++			bool across = (i == 1 || i == 3);
++
++			w[i] = html_border_image_extent(html, box, ek[i],
++					ev[i], bw[i], across ?
++					bb.x1 - bb.x0 : bb.y1 - bb.y0,
++					gradient != NULL ? s[i] :
++					s[i] * scale, scale);
++		}
++	}
++	/* two opposite widths wider than the area are scaled down
++	 * together until they fit */
++	f = 1.0f;
++	if (w[1] + w[3] > bb.x1 - bb.x0 && w[1] + w[3] > 0)
++		f = (bb.x1 - bb.x0) / (w[1] + w[3]);
++	if (w[0] + w[2] > bb.y1 - bb.y0 && w[0] + w[2] > 0 &&
++			(bb.y1 - bb.y0) / (w[0] + w[2]) < f)
++		f = (bb.y1 - bb.y0) / (w[0] + w[2]);
++	for (i = 0; i < 4; i++)
++		w[i] *= f;
++	dx[0] = bb.x0; dx[1] = bb.x0 + (int) w[3];
++	dx[2] = bb.x1 - (int) w[1]; dx[3] = bb.x1;
++	dy[0] = bb.y0; dy[1] = bb.y0 + (int) w[0];
++	dy[2] = bb.y1 - (int) w[2]; dy[3] = bb.y1;
+ 
+ 	rep = css_computed_border_image_repeat(box->style);
+ 	if (rep == CSS_BORDER_IMAGE_REPEAT_INHERIT)
+@@ -5005,6 +5117,9 @@ static bool html_z_defer(struct box *box, int x_parent, int y_parent,
+ 	struct html_z_list *l = html_z_top;
+ 	struct html_z_entry *e;
+ 
++	/* found ahead and painted under the in-flow content */
++	if ((box->flags & Z_NEG_ASIDE) && box != html_z_painting)
++		return true;
+ 	if (l == NULL || box == l->root || box == html_z_painting ||
+ 			box == html_composite_active ||
+ 			!html_z_deferrable(box))
+@@ -5067,6 +5182,137 @@ static bool html_z_flush(const html_content *html, struct html_z_list *l,
+ 	return ok;
+ }
+ 
++/** Whether a box starts a stacking context of its own, for the look
++ * ahead: a z-index, an opacity, a filter or a transform. */
++static bool html_z_own_context(const html_content *html,
++		const struct box *box)
++{
++	css_fixed op = INTTOFIX(1);
++	float m[4];
++	int ox, oy;
++
++	if (css_computed_position(box->style) != CSS_POSITION_STATIC &&
++			css_computed_z_index(box->style, &(int32_t){0}) ==
++				CSS_Z_INDEX_SET)
++		return true;
++	if (box->filter != NULL)
++		return true;
++	if (css_computed_opacity(box->style, &op) == CSS_OPACITY_SET &&
++			op < INTTOFIX(1))
++		return true;
++	return box_transform(&html->unit_len_ctx, box, m, &ox, &oy);
++}
++
++/**
++ * Find the negative z-index boxes a stacking context paints first
++ * (VitaSurf): its descendants, not those of a context inside it, a box
++ * that clips, or a float. \a bx and \a by are where the children of
++ * \a b are painted from, as html_redraw_box_children gives them.
++ */
++static void html_z_scan(const html_content *html, struct html_z_list *l,
++		struct box *b, int bx, int by, int depth)
++{
++	struct box *c;
++
++	if (depth > 64)
++		return;
++	for (c = b->children; c != NULL; c = c->next) {
++		int32_t z = 0;
++
++		if (c->type == BOX_FLOAT_LEFT || c->type == BOX_FLOAT_RIGHT)
++			continue;
++		if (c->style != NULL) {
++			if (css_computed_position(c->style) !=
++					CSS_POSITION_STATIC &&
++					css_computed_position(c->style) !=
++					CSS_POSITION_FIXED &&
++					css_computed_z_index(c->style, &z) ==
++					CSS_Z_INDEX_SET && z < 0 &&
++					c->type != BOX_INLINE &&
++					c->type != BOX_TEXT) {
++				struct html_z_entry *e;
++
++				if (l->n_neg == l->neg_alloc) {
++					unsigned grown = l->neg_alloc > 0 ?
++							l->neg_alloc * 2 : 8;
++					struct html_z_entry *ne = realloc(
++							l->neg, grown *
++							sizeof(*ne));
++
++					if (ne == NULL)
++						return;	/* in place */
++					l->neg = ne;
++					l->neg_alloc = grown;
++				}
++				e = &l->neg[l->n_neg];
++				e->box = c;
++				e->x_parent = bx;
++				e->y_parent = by;
++				e->z = z;
++				e->seq = l->n_neg++;
++				c->flags |= Z_NEG_ASIDE;
++				continue;
++			}
++			if (html_z_own_context(html, c) ||
++					box_overflow_x(c) !=
++						CSS_OVERFLOW_VISIBLE ||
++					box_overflow_y(c) !=
++						CSS_OVERFLOW_VISIBLE)
++				continue;
++		}
++		html_z_scan(html, l, c,
++				bx + c->x - scrollbar_get_offset(c->scroll_x),
++				by + c->y - scrollbar_get_offset(c->scroll_y),
++				depth + 1);
++	}
++}
++
++/**
++ * Paint a stacking context's negative z-index boxes, before the first of
++ * its children (VitaSurf). The root is painted from x_parent, y_parent
++ * now, which is not where it was when they were found if it is being
++ * painted aside.
++ */
++static bool html_z_paint_negatives(const html_content *html,
++		struct box *box, int x_parent, int y_parent,
++		const struct rect *clip, float scale,
++		colour bg, const struct redraw_context *ctx)
++{
++	struct html_z_list *l = html_z_top;
++	int dx, dy;
++	unsigned i;
++	bool ok = true;
++
++	if (l == NULL || l->root != box || l->n_neg == 0 || l->neg_done)
++		return true;
++	l->neg_done = true;
++	dx = x_parent - l->neg_x;
++	dy = y_parent - l->neg_y;
++	qsort(l->neg, l->n_neg, sizeof(*l->neg), html_z_cmp);
++	for (i = 0; i < l->n_neg; i++) {
++		struct box *was = html_z_painting;
++
++		html_z_painting = l->neg[i].box;
++		ok &= html_redraw_box(html, l->neg[i].box,
++				l->neg[i].x_parent + dx,
++				l->neg[i].y_parent + dy,
++				clip, scale, bg, ctx);
++		html_z_painting = was;
++	}
++	return ok;
++}
++
++/** Let a stacking context's negative z-index boxes be painted in place
++ * again, for the next redraw. */
++static void html_z_neg_release(struct html_z_list *l)
++{
++	unsigned i;
++
++	for (i = 0; i < l->n_neg; i++)
++		l->neg[i].box->flags &= ~Z_NEG_ASIDE;
++	l->n_neg = 0;
++}
++
+ /**
+  * Recursively draw a box.
+  *
+@@ -5185,7 +5431,17 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		zl->root = box;
+ 		zl->n = 0;
+ 		zl->seq = 0;
++		zl->n_neg = 0;
++		zl->neg_done = false;
++		zl->neg_x = x_parent;
++		zl->neg_y = y_parent;
+ 		html_z_top = zl;
++		if (html->neg_z)
++			html_z_scan(html, zl, box,
++				x_parent + box->x -
++				scrollbar_get_offset(box->scroll_x),
++				y_parent + box->y -
++				scrollbar_get_offset(box->scroll_y), 0);
+ 	} else if (context) {
+ 		/* too deep: its descendants are painted where they stand */
+ 		html_z_top = NULL;
+@@ -5213,6 +5469,9 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 
+ 	if (zl != NULL) {
+ 		ok &= html_z_flush(html, zl, scale);
++		/* after the flush: a box set aside paints its children,
++		 * which may hold the negative ones */
++		html_z_neg_release(zl);
+ 		/* the entries' memory stays with the level for the next
+ 		 * context painted at this depth */
+ 		html_z_depth--;
+@@ -5816,7 +6075,8 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	/*
+ 	 * Column rules (VitaSurf): a line in the middle of each gap of a
+ 	 * multi-column box, the height of its content, drawn solid
+-	 * whatever its style says, as the outline is.
++	 * whatever its style says, as the outline is, and broken where a
++	 * child spans the columns.
+ 	 */
+ 	if (box->style != NULL && box->type == BOX_BLOCK &&
+ 			css_computed_column_rule_style(box->style) !=
+@@ -5845,21 +6105,49 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				.fill_colour = nscss_color_to_ns(rcol),
+ 				.stroke_type = PLOT_OP_TYPE_NONE,
+ 			};
+-			int k;
+-
+-			for (k = 1; k < n; k++) {
+-				int mid = box->padding[LEFT] + k * colw +
+-						(k - 1) * gap + gap / 2;
+-				struct rect line;
+-
+-				line.x0 = x + mid * scale - rw / 2;
+-				line.x1 = line.x0 + rw;
+-				line.y0 = y + box->padding[TOP] * scale;
+-				line.y1 = y + (box->padding[TOP] +
+-						box->height) * scale;
+-				if (ctx->plot->rectangle(ctx, &rstyle,
+-						&line) != NSERROR_OK)
+-					return false;
++			const struct box *c = box->children;
++			int top = box->padding[TOP], k;
++
++			for (;;) {
++				int end = box->padding[TOP] + box->height;
++				int next = end;
++
++				/* down to the next spanning child */
++				for (; c != NULL; c = c->next) {
++					if (c->style != NULL &&
++					    css_computed_column_span(c->style) ==
++					    CSS_COLUMN_SPAN_ALL)
++						break;
++				}
++				if (c != NULL) {
++					end = c->y - c->border[TOP].width -
++							c->margin[TOP];
++					next = c->y + c->padding[TOP] +
++						c->height +
++						c->padding[BOTTOM] +
++						c->border[BOTTOM].width +
++						c->margin[BOTTOM];
++				}
++				for (k = 1; k < n && end > top; k++) {
++					int mid = box->padding[LEFT] +
++							k * colw +
++							(k - 1) * gap +
++							gap / 2;
++					struct rect line;
++
++					line.x0 = x + mid * scale - rw / 2;
++					line.x1 = line.x0 + rw;
++					line.y0 = y + top * scale;
++					line.y1 = y + end * scale;
++					if (ctx->plot->rectangle(ctx,
++							&rstyle, &line) !=
++							NSERROR_OK)
++						return false;
++				}
++				if (c == NULL)
++					break;
++				top = next;
++				c = c->next;
+ 			}
+ 		}
+ 	}

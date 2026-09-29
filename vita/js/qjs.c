@@ -23,6 +23,7 @@
  * Licensed under the GNU General Public License version 2.
  */
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -9814,7 +9815,8 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
 /*
  * __vitaStyle(node): the computed values a page is most likely to read
  * back, as [fontSize px, display, visibility, colour, background
- * colour]. Everything else getComputedStyle reports comes from the
+ * colour, colour alpha, background alpha, margins, padding, border
+ * widths]. Everything else getComputedStyle reports comes from the
  * prelude's defaults; these are the ones that actually vary and that
  * code branches on. A page doing its own rem arithmetic reads the root
  * font size, which is what sent YouTube into "cannot read property
@@ -9898,6 +9900,24 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	} else {
 		set_index(ctx, arr, 4, -1);
 		set_index(ctx, arr, 6, -1);
+	}
+
+	/*
+	 * The margins, padding and border widths layout used, top, right,
+	 * bottom, left each, in slots 7 to 18: what a browser reports for
+	 * them, and what code measuring an element's content box reads.
+	 */
+	{
+		int side;
+
+		for (side = 0; side < 4; side++) {
+			int m = box->margin[side];
+
+			set_index(ctx, arr, 7 + side, m == INT_MIN ? 0 : m);
+			set_index(ctx, arr, 11 + side, box->padding[side]);
+			set_index(ctx, arr, 15 + side,
+					box->border[side].width);
+		}
 	}
 	return arr;
 }

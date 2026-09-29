@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!-- @scope (A) to (B): the rules reach A and what is inside it, down to
+     but not into B; a B above the scope root is no limit; a rule's
+     pseudo-element keeps working; and @scope adds no specificity, so a
+     later plain rule of the same weight wins. Expected console output:
+     lines ending in "PASS". -->
+<html><head><style>
+@scope (.card) to (.content) {
+  p { color: rgb(255, 0, 0); }
+  .note::before { content: "x"; }
+  .late { color: rgb(0, 128, 0); }
+}
+.late2 { color: rgb(0, 0, 255); }
+</style></head><body>
+<div class=card><p id=in>in scope</p>
+  <div class=content><p id=out>inside the limit</p></div>
+</div>
+<div class=content><div class=card><p id=deep>limit above the root</p></div></div>
+<div class=card><p id=late class="late late2">plain rule later</p></div>
+<script>
+setTimeout(function () {
+  function c(id) { return getComputedStyle(document.getElementById(id)).color; }
+  function t(label, got, want) {
+    console.log((got === want ? 'PASS ' : 'FAIL ') + label + ' (' + got + ')'); }
+  t('a p in the card is red', c('in'), 'rgb(255, 0, 0)');
+  t('a p inside the limit is not', c('out'), 'rgb(0, 0, 0)');
+  t('a limit above the root does not stop it', c('deep'), 'rgb(255, 0, 0)');
+  t('@scope adds no specificity', c('late'), 'rgb(0, 0, 255)');
+}, 500);
+</script></body></html>

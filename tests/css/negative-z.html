@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!-- A negative z-index box goes under the in-flow content of its
+     stacking context, checked in the plot output (colours are BGR
+     there). In #p, a positioned box with no z-index, which is not a
+     stacking context, the red box is drawn before #p's blue background,
+     so the blue covers it where they overlap. In #q, which has
+     z-index: 0, the green box is drawn after #q's yellow background and
+     before its text. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; }
+.box { position: relative; width: 100px; height: 40px; margin: 30px; }
+.under { position: absolute; z-index: -1; left: 10px; top: 10px; width: 150px; height: 50px; }
+#p { background: rgb(0, 0, 255); }
+#p .under { background: rgb(255, 0, 0); }
+#q { background: rgb(255, 255, 0); z-index: 0; }
+#q .under { background: rgb(0, 128, 0); }
+</style></head><body>
+<div class=box id=p><div class=under></div>p</div>
+<div class=box id=q><div class=under></div>q</div>
+</body></html>

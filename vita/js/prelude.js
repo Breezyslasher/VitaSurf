@@ -1421,6 +1421,7 @@ var UA_DISPLAY={SPAN:'inline',A:'inline',B:'inline',I:'inline',EM:'inline',
 /* Properties __vitaStyle resolves, so the style attribute must not
    overwrite them with the author's own spelling. */
 var RESOLVED={fontSize:1,display:1,visibility:1,color:1,backgroundColor:1};
+var BOX_RESOLVED=/^(margin|padding)(Top|Right|Bottom|Left)?$|^border(Top|Right|Bottom|Left)?Width$/;
 function cssColour(rgb,a){
  if(typeof rgb!=='number'||rgb<0||typeof a!=='number'||a<0)return '';
  var r=(rgb>>16)&255,g=(rgb>>8)&255,b=rgb&255;
@@ -1455,6 +1456,13 @@ function computedStyle(el){
   if(CS_VIS[st[2]])cs.visibility=CS_VIS[st[2]];
   var c=cssColour(st[3],st[5]);if(c)cs.color=c;
   var b=cssColour(st[4],st[6]);if(b)cs.backgroundColor=b;
+  /* the margins, padding and border widths layout used */
+  if(st.length>18)[['margin',7,''],['padding',11,''],['border',15,'Width']].forEach(function(g){
+   var v=[];
+   ['Top','Right','Bottom','Left'].forEach(function(e,i){
+    v.push(cs[g[0]+e+g[2]]=st[g[1]+i]+'px');});
+   cs[g[0]+g[2]]=v[0]===v[1]&&v[0]===v[2]&&v[0]===v[3]?v[0]:
+    v[1]===v[3]?(v[0]===v[2]?v[0]+' '+v[1]:v[0]+' '+v[1]+' '+v[2]):v.join(' ');});
  }
  if(box){cs.width=box[4]+'px';cs.height=box[5]+'px';}
  else{cs.width='auto';cs.height='auto';}
@@ -1470,7 +1478,7 @@ function computedStyle(el){
   var inline=el.getAttribute('style');
   if(inline)parseDecl(inline).forEach(function(d){
    var k=dashToCamel(d[0]);
-   if(st&&RESOLVED[k])return;
+   if(st&&(RESOLVED[k]||(st.length>18&&BOX_RESOLVED.test(k))))return;
    cs[k]=d[1];});
  }
  cs.getPropertyValue=function(n){var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};
