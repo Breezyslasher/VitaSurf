@@ -1,0 +1,550 @@
+diff --git a/content/handlers/html/Makefile b/content/handlers/html/Makefile
+index 9442ded39..b90224f90 100644
+--- a/content/handlers/html/Makefile
++++ b/content/handlers/html/Makefile
+@@ -22,6 +22,7 @@ S_HTML := box_construct.c	\
+ 	layout_grid.c		\
+ 	layout_multicol.c	\
+ 	layout_anchor.c		\
++	scroll_anchor.c		\
+ 	bidi.c			\
+ 	object.c		\
+ 	redraw.c		\
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 133dc010d..4a147eb5b 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1419,9 +1419,14 @@ static void html_reformat(struct content *c, int width, int height)
+ 	htmlc->viewport_w = width;
+ 	htmlc->viewport_h = height;
+ 
++	/* what is in view now, to keep it there (VitaSurf) */
++	html_scroll_anchor_pick(htmlc);
++
+ 	layout_document(htmlc, width, height);
+ 	layout = htmlc->layout;
+ 
++	html_scroll_anchor_settle(htmlc);
++
+ 	/* width and height are at least margin box of document */
+ 	c->width = layout->x + layout->padding[LEFT] + layout->width +
+ 		layout->padding[RIGHT] + layout->border[RIGHT].width +
+@@ -1603,6 +1608,9 @@ nserror html_relayout(html_content *htmlc)
+ 		browser_window_detach_iframes(htmlc->bw);
+ 	}
+ 
++	/* what is in view, chosen from the tree about to go (VitaSurf) */
++	html_scroll_anchor_pick(htmlc);
++
+ 	html_clear_node_boxes(html);
+ 
+ 	/* iframes and framesets live in the box tree's talloc context */
+@@ -1751,6 +1759,9 @@ static void html_destroy(struct content *c)
+ 	/* the counters its boxes were counted with */
+ 	html_counters_clear(html);
+ 
++	/* the element it was keeping in view */
++	html_scroll_anchor_free(html);
++
+ 	/* the sizes its containers came out */
+ 	html_containers_free(html->csizes, html->n_csizes);
+ 	html->csizes = NULL;
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 872488e6a..5e172ce62 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -270,4 +270,14 @@ void html_focus_at_point(struct content *c, int x, int y);
+ bool html_get_id_offset(struct hlcache_handle *h, lwc_string *frag_id,
+ 		int *x, int *y);
+ 
++/**
++ * How far the last layout moved what was in view, to scroll the view by
++ * so it stays on it; once only (VitaSurf).
++ *
++ * \param h The content.
++ * \param dy Receives the distance down, in content px.
++ * \return true when the view should follow.
++ */
++bool html_scroll_anchor_take(struct hlcache_handle *h, int *dy);
++
+ #endif
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 28e514598..abafe8d4a 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -328,6 +328,11 @@ typedef struct html_content {
+ 	 * where the viewport was when they were (VitaSurf) */
+ 	bool anchored_any;
+ 	int anchor_view_x, anchor_view_y;
++	/** The element in view picked before a layout, where it was, and
++	 * how far the layout moved it, for scroll anchoring (VitaSurf) */
++	struct dom_node *sa_node;
++	int sa_y, sa_dy;
++	bool sa_moved;
+ 	struct html_multicol_piece *mc_pieces;
+ 	unsigned int n_mc_pieces, mc_pieces_alloc;
+ 	struct html_container_size *csizes;
+@@ -659,4 +664,20 @@ extern struct dom_string *html_dom_string_text_javascript;
+ extern struct dom_string *html_dom_string_type;
+ extern struct dom_string *html_dom_string_src;
+ 
++/**
++ * Choose the element in view that the view should stay on across the
++ * layout about to happen (VitaSurf).
++ */
++void html_scroll_anchor_pick(html_content *htmlc);
++
++/**
++ * Find how far the layout just done moved the element chosen before it.
++ */
++void html_scroll_anchor_settle(html_content *htmlc);
++
++/**
++ * Let go of a chosen element, when the content is destroyed.
++ */
++void html_scroll_anchor_free(html_content *htmlc);
++
+ #endif
+diff --git a/content/handlers/html/scroll_anchor.c b/content/handlers/html/scroll_anchor.c
+new file mode 100644
+index 000000000..7b0747d15
+--- /dev/null
++++ b/content/handlers/html/scroll_anchor.c
+@@ -0,0 +1,236 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Scroll anchoring (VitaSurf).
++ *
++ * An image arriving, a web font loading or a script adding to the page
++ * lays the page out again, and whatever sits above the view grows or
++ * shrinks, so what the user was reading moves under them. Before each
++ * layout an element in view is chosen as the anchor and where it was is
++ * noted; after it, the browser window scrolls by as much as the anchor
++ * moved. The anchor is the first element, in document order, wholly in
++ * view, or failing that the deepest one the top of the view cuts
++ * through. Fixed, absolute and sticky boxes, boxes placed against an
++ * anchor() and anything inside a scroll container are passed over, as
++ * CSS Scroll Anchoring says. With the view at the top of the page
++ * nothing is anchored, so content added above it is seen.
++ */
++
++#include <stdbool.h>
++#include <stddef.h>
++
++#include <dom/dom.h>
++#include <libcss/libcss.h>
++
++#include "utils/log.h"
++#include "netsurf/types.h"
++#include "netsurf/content.h"
++#include "content/content_protected.h"
++#include "content/hlcache.h"
++#include "desktop/frames.h"
++
++#include "html/box.h"
++#include "html/box_construct.h"
++#include "html/private.h"
++#include "html/html.h"
++
++struct sa_pick {
++	int vx0, vy0, vx1, vy1;
++	struct box *full;
++	int full_y;
++	struct box *part;
++	int part_y;
++};
++
++/** Whether a box stays where it is when what comes before it grows. */
++static bool sa_excluded(const struct box *b)
++{
++	if (b->flags & ANCHORED) {
++		return true;
++	}
++	if (b->style != NULL) {
++		switch (css_computed_position(b->style)) {
++		case CSS_POSITION_FIXED:
++		case CSS_POSITION_ABSOLUTE:
++		case CSS_POSITION_STICKY:
++			return true;
++		default:
++			break;
++		}
++	}
++	return false;
++}
++
++static bool sa_inside(const struct box *b, const struct box *outer)
++{
++	for (; b != NULL; b = b->parent) {
++		if (b == outer) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/**
++ * Look through a box's children for the anchor, x and y being where the
++ * box itself is. Returns true once an element wholly in view is found.
++ */
++static bool sa_walk(struct box *parent, int px, int py, struct sa_pick *p)
++{
++	struct box *c;
++
++	for (c = parent->children; c != NULL; c = c->next) {
++		int x = px + c->x;
++		int y = py + c->y;
++		int w = c->padding[LEFT] + c->width + c->padding[RIGHT];
++		int h = c->padding[TOP] + c->height + c->padding[BOTTOM];
++
++		if (sa_excluded(c)) {
++			continue;
++		}
++		/* nothing of it or in it reaches the view */
++		if (y + c->descendant_y1 <= p->vy0 ||
++		    y + c->descendant_y0 >= p->vy1) {
++			continue;
++		}
++
++		/* only an element's principal box is found again after
++		 * the layout, so only that can be the anchor */
++		if (c->node != NULL && h > 0 &&
++		    x < p->vx1 && x + w > p->vx0 &&
++		    box_for_node(c->node) == c) {
++			if (y >= p->vy0 && y + h <= p->vy1) {
++				p->full = c;
++				p->full_y = y;
++				return true;
++			}
++			if (y < p->vy1 && y + h > p->vy0 &&
++			    (p->part == NULL || sa_inside(c, p->part))) {
++				p->part = c;
++				p->part_y = y;
++			}
++		}
++
++		/* a scroll container's content moves with its own
++		 * scrolling, not the page's */
++		if (c->scroll_x != NULL || c->scroll_y != NULL ||
++		    c->object != NULL) {
++			continue;
++		}
++		if (sa_walk(c, x, y, p)) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* exported interface documented in html/private.h */
++void html_scroll_anchor_pick(html_content *htmlc)
++{
++	struct sa_pick p;
++	struct box *root = htmlc->layout;
++	int vx, vy, vw, vh;
++
++	if (htmlc->sa_node != NULL) {
++		/* a rebuild already chose one from the old tree */
++		return;
++	}
++	htmlc->sa_moved = false;
++	if (root == NULL || htmlc->had_initial_layout == false ||
++	    htmlc->bw == NULL ||
++	    !browser_window_view_rect(htmlc->bw, &htmlc->base,
++				      &vx, &vy, &vw, &vh) ||
++	    vy <= 0) {
++		return;
++	}
++
++	p.vx0 = vx;
++	p.vy0 = vy;
++	p.vx1 = vx + vw;
++	p.vy1 = vy + vh;
++	p.full = p.part = NULL;
++	p.full_y = p.part_y = 0;
++	sa_walk(root, root->x, root->y, &p);
++
++	if (p.full != NULL) {
++		htmlc->sa_node = dom_node_ref(p.full->node);
++		htmlc->sa_y = p.full_y;
++	} else if (p.part != NULL) {
++		htmlc->sa_node = dom_node_ref(p.part->node);
++		htmlc->sa_y = p.part_y;
++	}
++}
++
++/* exported interface documented in html/private.h */
++void html_scroll_anchor_settle(html_content *htmlc)
++{
++	struct box *b, *a;
++	int y = 0;
++
++	if (htmlc->sa_node == NULL) {
++		return;
++	}
++	b = box_for_node(htmlc->sa_node);
++	dom_node_unref(htmlc->sa_node);
++	htmlc->sa_node = NULL;
++	if (b == NULL) {
++		/* it went, or is display: none now */
++		return;
++	}
++	for (a = b; a != NULL; a = a->parent) {
++		if (sa_excluded(a) ||
++		    (a != b && (a->scroll_x != NULL || a->scroll_y != NULL))) {
++			/* it no longer moves with the page */
++			return;
++		}
++		y += a->y;
++	}
++	if (y != htmlc->sa_y) {
++		htmlc->sa_dy = y - htmlc->sa_y;
++		htmlc->sa_moved = true;
++	}
++}
++
++/* exported interface documented in html/private.h */
++void html_scroll_anchor_free(html_content *htmlc)
++{
++	if (htmlc->sa_node != NULL) {
++		dom_node_unref(htmlc->sa_node);
++		htmlc->sa_node = NULL;
++	}
++	htmlc->sa_moved = false;
++}
++
++/* exported interface documented in html/html.h */
++bool html_scroll_anchor_take(struct hlcache_handle *h, int *dy)
++{
++	html_content *htmlc;
++
++	if (content_get_type(h) != CONTENT_HTML) {
++		return false;
++	}
++	htmlc = (html_content *) hlcache_handle_get_content(h);
++	if (htmlc == NULL || htmlc->sa_moved == false) {
++		return false;
++	}
++	htmlc->sa_moved = false;
++	*dy = htmlc->sa_dy;
++	return true;
++}
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+index e7554c189..3c23702e3 100644
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -173,6 +173,12 @@ struct browser_window {
+ 
+ 	/** Fragment identifier for current_content. */
+ 	lwc_string *frag_id;
++	/** The fragment was scrolled to, and where that left the view;
++	 * once the view is somewhere else the user has moved on and a
++	 * relayout no longer pulls it back (VitaSurf). */
++	bool frag_done;
++	bool frag_left;
++	int frag_sx, frag_sy;
+ 
+ 	/**
+ 	 * Current drag status.
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 70cf8b0d2..c25455a1a 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -257,6 +257,79 @@ browser_window_set_scroll(struct browser_window *bw, const struct rect *rect)
+ }
+ 
+ 
++/**
++ * Where a browser window is scrolled to, in window px (VitaSurf).
++ */
++static bool
++browser_window_scroll_offsets(struct browser_window *bw, int *sx, int *sy)
++{
++	if (bw->window != NULL) {
++		return guit->window->get_scroll(bw->window, sx, sy);
++	}
++	*sx = (bw->scroll_x != NULL) ? scrollbar_get_offset(bw->scroll_x) : 0;
++	*sy = (bw->scroll_y != NULL) ? scrollbar_get_offset(bw->scroll_y) : 0;
++	return true;
++}
++
++
++/* exported interface documented in desktop/frames.h */
++bool browser_window_view_rect(struct browser_window *bw,
++		struct content *c, int *x, int *y, int *w, int *h)
++{
++	int sx, sy, vw, vh;
++	float scale;
++
++	if (bw == NULL || bw->current_content == NULL ||
++	    hlcache_handle_get_content(bw->current_content) != c) {
++		return false;
++	}
++	if (!browser_window_scroll_offsets(bw, &sx, &sy) ||
++	    browser_window_get_dimensions(bw, &vw, &vh) != NSERROR_OK ||
++	    vw <= 0 || vh <= 0) {
++		return false;
++	}
++	scale = bw->scale > 0.0f ? bw->scale : 1.0f;
++	*x = (int)(sx / scale);
++	*y = (int)(sy / scale);
++	*w = (int)(vw / scale);
++	*h = (int)(vh / scale);
++	return true;
++}
++
++
++/**
++ * Keep what the view showed in place after a relayout moved it: scroll
++ * by as much as the content's anchor element moved (VitaSurf). Until the
++ * user leaves a fragment it was scrolled to, the fragment is the anchor
++ * instead and frag_scroll() has already put the view there.
++ */
++static void browser_window_scroll_anchor(struct browser_window *bw)
++{
++	struct rect rect;
++	int dy, sx, sy;
++	float scale;
++
++	if (bw->current_content == NULL ||
++	    !html_scroll_anchor_take(bw->current_content, &dy)) {
++		return;
++	}
++	if (bw->frag_id != NULL && !bw->frag_left) {
++		return;
++	}
++	if (!browser_window_scroll_offsets(bw, &sx, &sy)) {
++		return;
++	}
++	scale = bw->scale > 0.0f ? bw->scale : 1.0f;
++	rect.x0 = rect.x1 = sx;
++	rect.y0 = rect.y1 = sy + (int)(dy * scale);
++	if (rect.y0 < 0) {
++		rect.y0 = rect.y1 = 0;
++	}
++	NSLOG(netsurf, INFO, "scroll anchor: view follows %d px", dy);
++	browser_window_set_scroll(bw, &rect);
++}
++
++
+ /**
+  * Internal helper for getting the positional features
+  *
+@@ -703,8 +776,18 @@ browser_window_convert_to_download(struct browser_window *bw,
+ static bool frag_scroll(struct browser_window *bw)
+ {
+ 	struct rect rect;
++	int sx, sy;
++
++	if (bw->frag_id == NULL || bw->frag_left) {
++		return false;
++	}
+ 
+-	if (bw->frag_id == NULL) {
++	/* the view has moved since it was put on the fragment, so the
++	 * user has scrolled away: leave it where they took it (VitaSurf) */
++	if (bw->frag_done &&
++	    browser_window_scroll_offsets(bw, &sx, &sy) &&
++	    (sx != bw->frag_sx || sy != bw->frag_sy)) {
++		bw->frag_left = true;
+ 		return false;
+ 	}
+ 
+@@ -718,6 +801,11 @@ static bool frag_scroll(struct browser_window *bw)
+ 	rect.x1 = rect.x0;
+ 	rect.y1 = rect.y0;
+ 	if (browser_window_set_scroll(bw, &rect) == NSERROR_OK) {
++		if (browser_window_scroll_offsets(bw, &sx, &sy)) {
++			bw->frag_sx = sx;
++			bw->frag_sy = sy;
++			bw->frag_done = true;
++		}
+ 		if (bw->current_content != NULL &&
+ 		    bw->history != NULL &&
+ 		    bw->history->current != NULL) {
+@@ -1585,6 +1673,11 @@ browser_window_callback(hlcache_handle *c, const hlcache_event *event, void *pw)
+ 			/* Reformatted content should be redrawn */
+ 			browser_window_update(bw, false);
+ 		}
++
++		/* and what was in view should still be (VitaSurf) */
++		if (c == bw->current_content) {
++			browser_window_scroll_anchor(bw);
++		}
+ 		break;
+ 
+ 	case CONTENT_MSG_REDRAW:
+@@ -3483,6 +3576,8 @@ browser_window_navigate(struct browser_window *bw,
+ 
+ 	lwc_string_unref(bw->frag_id);
+ 	bw->frag_id = NULL;
++	bw->frag_done = false;
++	bw->frag_left = false;
+ 
+ 	if (nsurl_has_component(url, NSURL_FRAGMENT)) {
+ 		bool same_url = false;
+diff --git a/desktop/frames.h b/desktop/frames.h
+index d7a95a70b..949507a8c 100644
+--- a/desktop/frames.h
++++ b/desktop/frames.h
+@@ -27,6 +27,7 @@
+ struct scrollbar_msg_data;
+ struct content_html_iframe;
+ struct content_html_frames;
++struct content;
+ 
+ /**
+  * Create and open iframes for a browser window.
+@@ -137,4 +138,16 @@ void browser_window_scroll_callback(void *client_data,
+  */
+ void browser_window_handle_scrollbars(struct browser_window *bw);
+ 
++/**
++ * The part of a content a browser window shows, in content px, for
++ * scroll anchoring (VitaSurf).
++ *
++ * \param bw The browser window.
++ * \param c The content asking, which must be the one the window shows.
++ * \param x, y, w, h Receive the visible rectangle.
++ * \return true when the window shows c and the rectangle was found.
++ */
++bool browser_window_view_rect(struct browser_window *bw,
++		struct content *c, int *x, int *y, int *w, int *h);
++
+ #endif
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 2ebf753c6..36dc3f688 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -2401,8 +2401,11 @@ gui_window_get_scroll(struct gui_window *g, int *sx, int *sy)
+ {
+ 	struct browser_widget_s *bwidget = fbtk_get_userpw(g->browser);
+ 
+-	*sx = bwidget->scrollx;
+-	*sy = bwidget->scrolly;
++	/* with any scroll asked for and not yet drawn: the core sets
++	 * the scroll and reads it back before the next redraw, and
++	 * script expects scrollTo() to show in scrollY at once (VitaSurf) */
++	*sx = bwidget->scrollx + bwidget->panx;
++	*sy = bwidget->scrolly + bwidget->pany;
+ 
+ 	return true;
+ }

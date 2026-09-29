@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<!-- Scroll anchoring: when the page lays out again and content above the
+     view grows or shrinks, the view follows what it was showing. At the
+     top of the page it stays put, so content added above is seen. -->
+<html><head><title>scroll anchoring</title>
+<style>
+body { margin: 0; }
+p { height: 100px; margin: 0; }
+#fixedbar { position: fixed; top: 0; height: 20px; }
+</style></head><body>
+<div id="fixedbar">bar</div>
+<div id="top"></div>
+<script>
+for (var i = 0; i < 60; i++) {
+  var p = document.createElement('p');
+  p.id = 'p' + i;
+  p.textContent = 'paragraph ' + i;
+  document.body.appendChild(p);
+}
+function ok(n, c) { console.log((c ? "PASS " : "FAIL ") + n); }
+function topOf(id) { return Math.round(document.getElementById(id).getBoundingClientRect().top); }
+var steps = [
+  function () { window.scrollTo(0, 1500); },
+  function () {
+    ok("scrolled to 1500 (" + window.scrollY + ")", window.scrollY === 1500);
+    ok("p15 at the top of the view (" + topOf('p15') + ")", topOf('p15') === 0);
+    var d = document.createElement('div');
+    d.id = 'added';
+    d.style.height = '300px';
+    document.getElementById('top').appendChild(d);
+  },
+  function () {
+    ok("view followed 300px added above (" + window.scrollY + ")", window.scrollY === 1800);
+    ok("p15 still at the top of the view (" + topOf('p15') + ")", topOf('p15') === 0);
+    document.getElementById('added').style.height = '100px';
+  },
+  function () {
+    ok("view followed a 200px shrink (" + window.scrollY + ")", window.scrollY === 1600);
+    ok("p15 still at the top after shrink (" + topOf('p15') + ")", topOf('p15') === 0);
+    var gone = document.getElementById('p3');
+    gone.parentNode.removeChild(gone);
+  },
+  function () {
+    ok("view followed a removal above (" + window.scrollY + ")", window.scrollY === 1500);
+    ok("p15 still at the top after removal (" + topOf('p15') + ")", topOf('p15') === 0);
+    var below = document.createElement('div');
+    below.style.height = '400px';
+    document.getElementById('p40').appendChild(below);
+  },
+  function () {
+    ok("growth below the view leaves it alone (" + window.scrollY + ")", window.scrollY === 1500);
+    window.scrollTo(0, 0);
+  },
+  function () {
+    var d = document.createElement('div');
+    d.style.height = '250px';
+    document.getElementById('top').appendChild(d);
+  },
+  function () {
+    ok("at the top, content added above is shown (" + window.scrollY + ")", window.scrollY === 0);
+    console.log("done");
+  }
+];
+var n = 0;
+function next() { if (n < steps.length) { steps[n++](); setTimeout(next, 150); } }
+window.addEventListener('load', function () { setTimeout(next, 100); });
+</script></body></html>
