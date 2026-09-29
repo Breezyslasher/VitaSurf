@@ -1,0 +1,375 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 1629f1ccc..3d3d1c378 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1699,8 +1699,23 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 	vitasurf_ms_box_special += (unsigned int)(vs_sp1 - vs_sp0);
+ 	vitasurf_box_specials++;
+ 
++	/*
++	 * content-visibility: hidden (VitaSurf): the box is laid out, as
++	 * big as its own size says, but nothing in it is -- not its
++	 * children and not its ::before or ::after. It is how a page keeps
++	 * a collapsed panel's markup ready without drawing it. An inline
++	 * box has no content of its own to hide, and is left alone.
++	 */
++	if (box->style != NULL && !(box->flags & IS_REPLACED) &&
++			box->type != BOX_INLINE &&
++			css_computed_content_visibility(box->style) ==
++				CSS_CONTENT_VISIBILITY_HIDDEN)
++		*convert_children = false;
++
+ 	/* Handle the :before pseudo element */
+-	if (!(box->flags & IS_REPLACED)) {
++	if (!(box->flags & IS_REPLACED) && !(box->style != NULL &&
++			css_computed_content_visibility(box->style) ==
++				CSS_CONTENT_VISIBILITY_HIDDEN)) {
+ 		box_construct_generate(ctx->n, ctx->content, box,
+ 				box->styles->styles[CSS_PSEUDO_ELEMENT_BEFORE]);
+ 	}
+@@ -2017,7 +2032,9 @@ static void box_construct_element_after_inner(dom_node *n,
+ 			box->inline_end = inline_end;
+ 			inline_end->inline_end = box;
+ 		}
+-	} else if (!(box->flags & IS_REPLACED)) {
++	} else if (!(box->flags & IS_REPLACED) && !(box->style != NULL &&
++			css_computed_content_visibility(box->style) ==
++				CSS_CONTENT_VISIBILITY_HIDDEN)) {
+ 		/* Handle the :after pseudo element */
+ 		box_construct_generate(n, content, box,
+ 				box->styles->styles[CSS_PSEUDO_ELEMENT_AFTER]);
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index d5065bd2f..cc9362040 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1295,10 +1295,27 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 			 int *max_pos_margin,
+ 			 int *max_neg_margin)
+ {
++	/* whether a float has been passed, or placed above, which a box
++	 * with clear then has clearance from (VitaSurf) */
++	bool floats;
++
+ 	assert(block != NULL);
++	floats = block->float_children != NULL;
+ 
+ 	while (box != NULL) {
+ 
++		if (box->type == BOX_INLINE_CONTAINER && !floats) {
++			struct box *c;
++
++			for (c = box->children; c != NULL; c = c->next) {
++				if (c->type == BOX_FLOAT_LEFT ||
++						c->type == BOX_FLOAT_RIGHT) {
++					floats = true;
++					break;
++				}
++			}
++		}
++
+ 		if (box->type == BOX_INLINE_CONTAINER || (box->style &&
+ 				(css_computed_position(box->style) !=
+ 					CSS_POSITION_ABSOLUTE &&
+@@ -1327,7 +1344,14 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 			 * to. Flex and grid containers establish their own
+ 			 * formatting context, so margins stop at them
+ 			 * (VitaSurf). */
++			/* A box with clearance ends the collapsing too: the
++			 * margins after it do not reach above it (CSS 2.1
++			 * 8.3.1) (VitaSurf). */
+ 			if (box->flags & MAKE_HEIGHT ||
++					(floats && box->style != NULL &&
++					 box->type != BOX_INLINE_CONTAINER &&
++					 css_computed_clear(box->style) !=
++						CSS_CLEAR_NONE) ||
+ 					box->type == BOX_FLEX ||
+ 					box->border[TOP].width ||
+ 					box->padding[TOP] ||
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index cee1888d9..79f5e0171 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -29,8 +29,11 @@
+  * sparse and dense auto placement in row or column flow, implicit tracks
+  * sized by grid-auto-rows/columns, stretch alignment of items, and the
+  * content distribution keywords on justify-content and align-content.
+- * Named lines and areas, subgrid and baseline alignment are not
+- * supported (libcss drops named lines while parsing).
++ * Named lines and areas are supported (VitaSurf). A subgrid takes the
++ * sizes of the parent's tracks it spans, and the parent's gap; its
++ * items size the parent's rows, as the least each row can be, but not
++ * its columns, which are sized before the items are laid out. Baseline
++ * alignment is not supported.
+  */
+ 
+ #include <assert.h>
+@@ -138,6 +141,80 @@ struct grid_ctx {
+ 	unsigned n_areas;
+ };
+ 
++/**
++ * What a grid tells an item that is a subgrid (VitaSurf): for columns
++ * [0] and rows [1], how many of its tracks the item spans, their sizes
++ * (NULL while they are not known yet) and its gap.
++ */
++struct grid_subgrid_req {
++	const struct box *box;
++	unsigned n[2];
++	const int *sizes[2];
++	int gap[2];
++	/** filled in by the subgrid, if not NULL: the sizes its content
++	 * gave the tracks it was laid out with */
++	int *out[2];
++};
++
++/** The request for the item being laid out now, if it is a subgrid. */
++static const struct grid_subgrid_req *grid_subgrid_pending;
++
++/** Whether a template is subgrid. */
++static bool grid_tmpl_is_subgrid(const css_computed_grid_track *t)
++{
++	return t != NULL && t[0].min_type != CSS_GRID_TRACK_NONE &&
++			(t[0].flags & CSS_GRID_TRACK_FLAG_SUBGRID) != 0;
++}
++
++/** Whether a box is a grid with a subgrid in an axis, 0 columns, 1 rows. */
++static bool grid_box_is_subgrid(const struct box *b, int axis)
++{
++	const css_computed_grid_track *t = NULL;
++
++	if (b->style == NULL || (b->type != BOX_FLEX &&
++			b->type != BOX_INLINE_FLEX) ||
++			!(b->flags & GRID_CONTAINER))
++		return false;
++	if ((axis == 0 ? css_computed_grid_template_columns(b->style, &t) :
++			css_computed_grid_template_rows(b->style, &t)) !=
++			CSS_GRID_TEMPLATE_SET)
++		return false;
++	return grid_tmpl_is_subgrid(t);
++}
++
++/**
++ * The tracks of a subgrid axis: the parent's, fixed at their sizes, or
++ * auto while those are not known.
++ */
++static bool grid_build_subgrid(const struct grid_subgrid_req *req, int axis,
++		struct grid_track **tracks_out, unsigned *count_out)
++{
++	struct grid_track *tracks;
++	unsigned i, n = req->n[axis];
++
++	*tracks_out = NULL;
++	*count_out = 0;
++	if (n == 0)
++		return true;
++	if (n > GRID_MAX_TRACKS)
++		n = GRID_MAX_TRACKS;
++	tracks = calloc(n, sizeof(*tracks));
++	if (tracks == NULL)
++		return false;
++	for (i = 0; i < n; i++) {
++		if (req->sizes[axis] != NULL) {
++			tracks[i].min_type = tracks[i].max_type = GS_FIXED;
++			tracks[i].min_fixed = tracks[i].max_fixed =
++					req->sizes[axis][i];
++		} else {
++			tracks[i].min_type = tracks[i].max_type = GS_AUTO;
++		}
++	}
++	*tracks_out = tracks;
++	*count_out = n;
++	return true;
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* Track definitions                                                         */
+ 
+@@ -1449,6 +1526,79 @@ static bool grid_layout_item(struct grid_ctx *ctx, struct grid_item *it,
+ 	return success;
+ }
+ 
++/**
++ * Lay out an item, telling it the tracks it spans if it is a subgrid
++ * (VitaSurf): the columns' sizes, and the rows' once \a rows_known.
++ */
++static bool grid_layout_subgrid_item(struct grid_ctx *ctx,
++		struct grid_item *it, int area_w, bool rows_known)
++{
++	struct grid_subgrid_req req;
++	const struct grid_subgrid_req *was = grid_subgrid_pending;
++	int *cs = NULL, *rs = NULL;
++	bool ok;
++	int k;
++
++	if (!grid_box_is_subgrid(it->box, 0) &&
++			!grid_box_is_subgrid(it->box, 1))
++		return grid_layout_item(ctx, it, area_w);
++
++	memset(&req, 0, sizeof(req));
++	req.box = it->box;
++	req.n[0] = it->col_span > 0 ? (unsigned) it->col_span : 0;
++	req.n[1] = it->row_span > 0 ? (unsigned) it->row_span : 0;
++	req.gap[0] = ctx->col_gap;
++	req.gap[1] = ctx->row_gap;
++	cs = malloc((req.n[0] + 1) * sizeof(*cs));
++	rs = malloc((req.n[1] + 1) * sizeof(*rs));
++	if (cs == NULL || rs == NULL) {
++		free(cs);
++		free(rs);
++		return grid_layout_item(ctx, it, area_w);
++	}
++	for (k = 0; k < (int) req.n[0]; k++)
++		cs[k] = (unsigned) (it->col + k) < ctx->n_cols ?
++				ctx->cols[it->col + k].base : 0;
++	for (k = 0; k < (int) req.n[1]; k++)
++		rs[k] = (unsigned) (it->row + k) < ctx->n_rows ?
++				ctx->rows[it->row + k].base : 0;
++	req.sizes[0] = cs;
++	req.sizes[1] = rows_known ? rs : NULL;
++	if (!rows_known && grid_box_is_subgrid(it->box, 1)) {
++		/* its rows, as its own items size them, come back in rs */
++		for (k = 0; k < (int) req.n[1]; k++)
++			rs[k] = 0;
++		req.out[1] = rs;
++	}
++
++	grid_subgrid_pending = &req;
++	ok = grid_layout_item(ctx, it, area_w);
++	grid_subgrid_pending = was;
++
++	/* and each is the least the parent's row can be */
++	if (ok && req.out[1] != NULL) {
++		for (k = 0; k < (int) req.n[1]; k++) {
++			struct grid_track *t;
++
++			if ((unsigned) (it->row + k) >= ctx->n_rows)
++				break;
++			t = &ctx->rows[it->row + k];
++			if (t->min_type == GS_FIXED) {
++				if (rs[k] > t->min_fixed)
++					t->min_fixed = rs[k];
++			} else if (t->min_type == GS_AUTO ||
++					t->min_type == GS_MIN_CONTENT ||
++					t->min_type == GS_MAX_CONTENT) {
++				t->min_type = GS_FIXED;
++				t->min_fixed = rs[k];
++			}
++		}
++	}
++	free(cs);
++	free(rs);
++	return ok;
++}
++
+ /**
+  * Collect the grid items and their placement requests.
+  */
+@@ -1648,6 +1798,7 @@ bool layout_grid(struct box *grid, int available_width,
+ 	struct grid_ctx ctx;
+ 	int max_height, min_height;
+ 	const css_computed_grid_track *tmpl;
++	const struct grid_subgrid_req *sub;
+ 	uint8_t flow;
+ 	unsigned i;
+ 	bool success = false;
+@@ -1677,6 +1828,13 @@ bool layout_grid(struct box *grid, int available_width,
+ 	ctx.col_gap = grid_gap(&ctx, css_computed_column_gap_px, ctx.avail_w);
+ 	ctx.row_gap = grid_gap(&ctx, css_computed_row_gap_px, ctx.avail_h);
+ 
++	/* a subgrid's tracks are its parent's: what the parent said, if
++	 * this is the item it is laying out (VitaSurf) */
++	sub = (grid_subgrid_pending != NULL &&
++			grid_subgrid_pending->box == grid) ?
++			grid_subgrid_pending : NULL;
++	grid_subgrid_pending = NULL;
++
+ 	flow = css_computed_grid_auto_flow(grid->style);
+ 	ctx.column_flow = (flow == CSS_GRID_AUTO_FLOW_COLUMN ||
+ 			flow == CSS_GRID_AUTO_FLOW_COLUMN_DENSE);
+@@ -1689,7 +1847,24 @@ bool layout_grid(struct box *grid, int available_width,
+ 			CSS_GRID_TEMPLATE_SET) {
+ 		tmpl = NULL;
+ 	}
+-	if (!grid_build_explicit(&ctx, tmpl, ctx.avail_w, ctx.col_gap,
++	if (grid_tmpl_is_subgrid(tmpl)) {
++		/* the parent's columns, and its gap unless one is given */
++		if (sub == NULL) {
++			tmpl = NULL;
++		} else {
++			css_fixed l = 0;
++			css_unit u = CSS_UNIT_PX;
++
++			if (css_computed_column_gap(grid->style, &l, &u) !=
++					CSS_COLUMN_GAP_SET)
++				ctx.col_gap = sub->gap[0];
++			if (!grid_build_subgrid(sub, 0, &ctx.cols,
++					&ctx.n_explicit_cols))
++				goto cleanup;
++		}
++	}
++	if (!grid_tmpl_is_subgrid(tmpl) && !grid_build_explicit(&ctx, tmpl,
++			ctx.avail_w, ctx.col_gap,
+ 			&ctx.cols, &ctx.n_explicit_cols, &ctx.col_names,
+ 			&ctx.n_col_names)) {
+ 		goto cleanup;
+@@ -1699,7 +1874,23 @@ bool layout_grid(struct box *grid, int available_width,
+ 			CSS_GRID_TEMPLATE_SET) {
+ 		tmpl = NULL;
+ 	}
+-	if (!grid_build_explicit(&ctx, tmpl, ctx.avail_h, ctx.row_gap,
++	if (grid_tmpl_is_subgrid(tmpl)) {
++		if (sub == NULL) {
++			tmpl = NULL;
++		} else {
++			css_fixed l = 0;
++			css_unit u = CSS_UNIT_PX;
++
++			if (css_computed_row_gap(grid->style, &l, &u) !=
++					CSS_ROW_GAP_SET)
++				ctx.row_gap = sub->gap[1];
++			if (!grid_build_subgrid(sub, 1, &ctx.rows,
++					&ctx.n_explicit_rows))
++				goto cleanup;
++		}
++	}
++	if (!grid_tmpl_is_subgrid(tmpl) && !grid_build_explicit(&ctx, tmpl,
++			ctx.avail_h, ctx.row_gap,
+ 			&ctx.rows, &ctx.n_explicit_rows, &ctx.row_names,
+ 			&ctx.n_row_names)) {
+ 		goto cleanup;
+@@ -1735,7 +1926,7 @@ bool layout_grid(struct box *grid, int available_width,
+ 		int area_w = grid_span_size(ctx.cols, ctx.n_cols, ctx.col_gap,
+ 				it->col, it->col_span);
+ 
+-		if (!grid_layout_item(&ctx, it, area_w)) {
++		if (!grid_layout_subgrid_item(&ctx, it, area_w, false)) {
+ 			goto cleanup;
+ 		}
+ 	}
+@@ -1746,6 +1937,26 @@ bool layout_grid(struct box *grid, int available_width,
+ 	}
+ 	grid_position_tracks(&ctx, false);
+ 
++	/* a subgrid tells its parent what its rows came to */
++	if (sub != NULL && sub->out[1] != NULL) {
++		for (i = 0; i < sub->n[1] && i < ctx.n_rows; i++)
++			sub->out[1][i] = ctx.rows[i].base;
++	}
++
++	/* an item that is a subgrid of rows, again with the rows' sizes */
++	/* (sized from what its first layout reported, above) */
++	for (i = 0; i < ctx.n_items; i++) {
++		struct grid_item *it = &ctx.items[i];
++
++		if (grid_box_is_subgrid(it->box, 1)) {
++			int area_w = grid_span_size(ctx.cols, ctx.n_cols,
++					ctx.col_gap, it->col, it->col_span);
++
++			if (!grid_layout_subgrid_item(&ctx, it, area_w, true))
++				goto cleanup;
++		}
++	}
++
+ 	/* position and align the items in their areas */
+ 	for (i = 0; i < ctx.n_items; i++) {
+ 		struct grid_item *it = &ctx.items[i];

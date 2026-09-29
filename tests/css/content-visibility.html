@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<!-- content-visibility: hidden keeps the box, as big as its own size says,
+     and lays out and draws nothing in it; auto and visible draw it all.
+     Each XX line gives a height and PASS when it is what a browser
+     gives. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px/20px sans-serif; }
+#h1 { content-visibility: hidden; }
+#h2 { content-visibility: hidden; height: 50px; }
+#h2::before { content: "never"; }
+#a { content-visibility: auto; }
+</style></head><body>
+<div id="h1"><p style="margin:0">hidden text</p></div>
+<div id="h2">also hidden</div>
+<div id="a"><p style="margin:0">shown</p></div>
+<script>
+window.addEventListener('load', function () { setTimeout(function () {
+  [['h1', 0], ['h2', 50], ['a', 20]].forEach(function (k) {
+    var h = Math.round(document.getElementById(k[0]).getBoundingClientRect().height);
+    console.log('XX ' + k[0] + ' ' + h + (h === k[1] ? ' PASS' : ' FAIL (want ' + k[1] + ')'));
+  });
+  console.log('XX style ' + getComputedStyle(document.getElementById('h1')).contentVisibility);
+}, 200); });
+</script></body></html>

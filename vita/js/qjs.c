@@ -10537,6 +10537,13 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 		SM_ENUM("backfaceVisibility", bv,
 				css_computed_backface_visibility(s));
 	}
+	{
+		static const char *const cv[] = { NULL, "visible", "auto",
+			"hidden" };
+
+		SM_ENUM("contentVisibility", cv,
+				css_computed_content_visibility(s));
+	}
 	SM_ENUM("pointerEvents", sm_pointer_events,
 			css_computed_pointer_events(s));
 	{
