@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!-- A row-reverse flex container with padding, as Bubble Card draws its
+     sub-buttons: the items start at the far content edge. They were put
+     both paddings short of it, so the icon sat outside its button. -->
+<html><body style="margin:0">
+<style>.sb{display:flex;flex-direction:row-reverse;align-items:center;justify-content:center;box-sizing:border-box;width:max-content;min-width:36px;height:36px;padding:0 8px;background:#ddd;font-size:12px;white-space:nowrap}
+.nc{display:flex}.ic{display:flex;width:20px;height:20px;background:#333}</style>
+<div style="display:flex">
+<div class="sb" id="a"><div class="nc" id="an"></div><div class="ic" id="ai"></div></div>
+<div class="sb" id="b"><div class="nc" id="bn">On</div><div class="ic" id="bi"></div></div>
+<div class="sb" id="c" style="flex-direction:row"><div class="nc" id="cn"></div><div class="ic" id="ci"></div></div>
+</div>
+<script>window.addEventListener('load',function(){setTimeout(function(){
+function L(id,of){return Math.round(document.getElementById(id).getBoundingClientRect().left-document.getElementById(of).getBoundingClientRect().left);}
+function ok(n,c,g){console.log((c?'PASS ':'FAIL ')+n+' ('+g+')');}
+ok('icon inside its padding, row-reverse', L('ai','a')===8, L('ai','a'));
+ok('first item at the far edge, row-reverse', L('bn','b')===document.getElementById('b').getBoundingClientRect().width-8-document.getElementById('bn').getBoundingClientRect().width, L('bn','b'));
+ok('second item before it, row-reverse', L('bi','b')===8, L('bi','b'));
+ok('row is unchanged', L('ci','c')===8, L('ci','c'));
+},50);});</script></body></html>

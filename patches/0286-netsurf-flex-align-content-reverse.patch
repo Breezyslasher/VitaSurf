@@ -1,0 +1,96 @@
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index e46863c51..39dfbc591 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -930,8 +930,17 @@ static bool layout_flex__place_line_items_main(
+ 	int placed = 0;
+ 
+ 	if (ctx->main_reversed) {
+-		main_pos = lh__box_size_main(ctx->horizontal, ctx->flex) -
+-				main_pos;
++		/*
++		 * The content box's far edge: the near padding and the
++		 * content size, measured from the padding edge the items
++		 * are placed from. Taking the far padding off the content
++		 * size put every item of a padded row-reverse container
++		 * both paddings short of where it belonged, which is how
++		 * Bubble Card's sub-button icons came to sit outside their
++		 * buttons (VitaSurf).
++		 */
++		main_pos = ctx->flex->padding[ctx->horizontal ? LEFT : TOP] +
++				lh__box_size_main(ctx->horizontal, ctx->flex);
+ 	}
+ 
+ 	for (size_t i = line->first; i < item_count; i++) {
+@@ -1199,21 +1208,67 @@ static void layout_flex__place_lines(struct flex_ctx *ctx)
+ 	int pre_multiplier = reversed ? -1 : 0;
+ 	int extra_remainder = 0;
+ 	int extra = 0;
++	int lead = 0, between = 0;
+ 
+ 	if (ctx->available_cross != AUTO &&
+ 	    ctx->available_cross > ctx->cross_size &&
+ 	    ctx->line.count > 0) {
+-		extra = ctx->available_cross - ctx->cross_size;
++		int total = ctx->available_cross - ctx->cross_size;
++		size_t n = ctx->line.count;
++
++		extra = total;
++
++		/*
++		 * align-content, for a container whose items may wrap,
++		 * even onto one line (VitaSurf). It was always stretch:
++		 * the free space went to the lines, so an item in a
++		 * "flex-wrap: wrap; align-content: center" box -- how
++		 * Bubble Card centres its icons -- was stretched instead,
++		 * with its icon at the top.
++		 */
++		if (ctx->wrap == CSS_FLEX_WRAP_WRAP) {
++			switch (css_computed_align_content(ctx->flex->style)) {
++			case CSS_ALIGN_CONTENT_FLEX_START:
++				extra = 0;
++				break;
++			case CSS_ALIGN_CONTENT_FLEX_END:
++				lead = total;
++				extra = 0;
++				break;
++			case CSS_ALIGN_CONTENT_CENTER:
++				lead = total / 2;
++				extra = 0;
++				break;
++			case CSS_ALIGN_CONTENT_SPACE_BETWEEN:
++				between = n > 1 ? total / (int)(n - 1) : 0;
++				extra = 0;
++				break;
++			case CSS_ALIGN_CONTENT_SPACE_AROUND:
++				between = total / (int)n;
++				lead = between / 2;
++				extra = 0;
++				break;
++			case CSS_ALIGN_CONTENT_SPACE_EVENLY:
++				between = total / (int)(n + 1);
++				lead = between;
++				extra = 0;
++				break;
++			default:
++				break;
++			}
++		}
+ 
+-		extra_remainder = extra % ctx->line.count;
+-		extra /= ctx->line.count;
++		extra_remainder = extra % (int)n;
++		extra /= (int)n;
+ 	}
++	line_pos += lead;
+ 
+ 	for (size_t i = 0; i < ctx->line.count; i++) {
+ 		struct flex_line_data *line = &ctx->line.data[i];
+ 
+ 		if (i > 0) {
+-			line_pos += (reversed ? -1 : 1) * ctx->cross_gap;
++			line_pos += (reversed ? -1 : 1) *
++					(ctx->cross_gap + between);
+ 		}
+ 		line_pos += pre_multiplier * line->cross_size;
+ 		line->pos = line_pos;
