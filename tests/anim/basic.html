@@ -3,7 +3,8 @@
      and a left offset part way through a linear two-second animation,
      a delay not yet over, a finished animation that fills forwards and
      one that does not, and one with no keyframes at its start or end,
-     which run from and to the element's own style. Expected console
+     which run from and to the element's own style; the same set by
+     the longhands. Expected console
      output: lines ending in "PASS". -->
 <html><head><style>
 body { margin: 0; }
@@ -18,9 +19,13 @@ div { position: relative; width: 50px; height: 20px; }
 #f { animation: quick 100ms forwards; }
 #n { animation: quick 100ms; color: rgb(1, 2, 3); }
 #m { animation: middle 2s linear; color: rgb(0, 0, 0); }
+#lh { animation-name: redden; animation-duration: 2s;
+  animation-timing-function: linear; animation-delay: -0.5s; }
+#tr { transition-timing-function: 5s; transition-delay: 1s; color: rgb(4, 5, 6); }
 </style></head><body>
 <div id=c>c</div><div id=l>l</div><div id=d>d</div>
 <div id=f>f</div><div id=n>n</div><div id=m>m</div>
+<div id=lh>lh</div><div id=tr>tr</div>
 <script>
 setTimeout(function () {
   function col(id) { return getComputedStyle(document.getElementById(id)).color; }
@@ -36,5 +41,8 @@ setTimeout(function () {
   t('one that does not fill goes back', col('n') === 'rgb(1, 2, 3)', col('n'));
   var b = +col('m').match(/\d+/g)[2];
   t('from its own style towards a middle keyframe', b > 150 && b <= 200, col('m'));
+  var lr = red('lh');
+  t('the longhands: a negative delay starts it part way on', lr > 120 && lr <= 200, lr);
+  t('transition properties are not taken as animation ones', col('tr') === 'rgb(4, 5, 6)', col('tr'));
 }, 1100);
 </script></body></html>

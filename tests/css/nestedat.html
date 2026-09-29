@@ -22,7 +22,7 @@
 /* h: @keyframes inside @media is found by name */
 @media screen { @keyframes grow { from { width: 100px; } to { width: 60px; } } }
 .h { animation: grow 1s forwards; }
-/* i: @container inside @media */
+/* i: @container inside @media (it needs a container to query) */
 @media screen { @container (width >= 100px) { .i { width: 60px; } } }
 </style>
 </head>
@@ -35,7 +35,7 @@
 <div class="box f"></div>
 <div class="box g"></div>
 <div class="box h"></div>
-<div class="box i"></div>
+<div style="container-type: inline-size"><div class="box i"></div></div>
 <pre id="out"></pre>
 <script>
 var o = document.getElementById('out');
