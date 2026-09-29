@@ -1,0 +1,3999 @@
+diff --git a/content/handlers/html/Makefile b/content/handlers/html/Makefile
+index ac05a3838..25a17e5a0 100644
+--- a/content/handlers/html/Makefile
++++ b/content/handlers/html/Makefile
+@@ -20,6 +20,8 @@ S_HTML := box_construct.c	\
+ 	layout.c		\
+ 	layout_flex.c		\
+ 	layout_grid.c		\
++	layout_multicol.c	\
++	bidi.c			\
+ 	object.c		\
+ 	redraw.c		\
+ 	redraw_border.c		\
+diff --git a/content/handlers/html/bidi.c b/content/handlers/html/bidi.c
+new file mode 100644
+index 000000000..017fd2226
+--- /dev/null
++++ b/content/handlers/html/bidi.c
+@@ -0,0 +1,581 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Right-to-left text for one run (VitaSurf).
++ *
++ * A cut-down Unicode bidirectional algorithm (UAX #9) for a single run
++ * with no explicit embeddings: characters are classed as left to right,
++ * right to left, Arabic, numbers, spacing marks, white space or other
++ * neutrals; numbers take the direction of the strong text before them;
++ * neutrals between text of one direction take it, and the paragraph's
++ * otherwise; levels are given as the rules I1 and I2 give them and the
++ * run is reversed level by level (L2), with brackets mirrored (L4).
++ *
++ * Arabic is joined first, in the order it was written, by replacing
++ * each letter with its isolated, final, initial or medial presentation
++ * form (U+FB50 to U+FEFC), and lam followed by alef with their
++ * ligature. A font with those forms, as DejaVu Sans has, then draws
++ * the letters joined without an OpenType shaper.
++ */
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "html/bidi.h"
++
++/** Longest run, in characters, that is reordered; longer is drawn as
++ * it is. A text box holds a line's worth or less. */
++#define BIDI_MAX 1024
++
++enum bidi_class {
++	BC_L,	/**< left to right */
++	BC_R,	/**< right to left */
++	BC_AL,	/**< Arabic letter, right to left */
++	BC_EN,	/**< European number */
++	BC_AN,	/**< Arabic number */
++	BC_NSM,	/**< spacing mark: takes the class before it */
++	BC_WS,	/**< white space */
++	BC_ON	/**< other neutral */
++};
++
++/*
++ * Where the visual runs are kept. The knockout plotter holds on to the
++ * text it is given until the redraw has finished, so a run must outlive
++ * the call that made it: runs are copied into chunks that are freed
++ * when the next outermost redraw starts.
++ */
++#define BIDI_CHUNK 8192
++
++struct bidi_chunk {
++	struct bidi_chunk *next;
++	size_t used;
++	size_t size;
++	char data[];
++};
++
++static struct bidi_chunk *bidi_chunks;
++static int bidi_redraw_depth;
++
++static const char *bidi_keep(const char *s, size_t len)
++{
++	struct bidi_chunk *c = bidi_chunks;
++
++	if (c == NULL || c->size - c->used < len) {
++		size_t size = len > BIDI_CHUNK ? len : BIDI_CHUNK;
++
++		c = malloc(sizeof(*c) + size);
++		if (c == NULL)
++			return NULL;
++		c->next = bidi_chunks;
++		c->used = 0;
++		c->size = size;
++		bidi_chunks = c;
++	}
++	memcpy(c->data + c->used, s, len);
++	c->used += len;
++	return c->data + c->used - len;
++}
++
++
++/* exported interface documented in html/bidi.h */
++void html_bidi_redraw_begin(void)
++{
++	if (bidi_redraw_depth++ == 0) {
++		struct bidi_chunk *c = bidi_chunks, *next;
++
++		/* keep one chunk for the next redraw, free the rest */
++		if (c != NULL) {
++			for (next = c->next; next != NULL; ) {
++				struct bidi_chunk *n = next->next;
++
++				free(next);
++				next = n;
++			}
++			c->next = NULL;
++			c->used = 0;
++		}
++	}
++}
++
++
++/* exported interface documented in html/bidi.h */
++void html_bidi_redraw_end(void)
++{
++	if (bidi_redraw_depth > 0)
++		bidi_redraw_depth--;
++}
++
++
++static uint32_t bidi_cp[BIDI_MAX];
++static uint8_t bidi_cls[BIDI_MAX];
++static uint8_t bidi_lvl[BIDI_MAX];
++static char bidi_out[BIDI_MAX * 4 + 4];
++
++
++static enum bidi_class bidi_class_of(uint32_t c)
++{
++	if (c < 0x80) {
++		if (c >= '0' && c <= '9')
++			return BC_EN;
++		if (((c | 0x20) >= 'a' && (c | 0x20) <= 'z'))
++			return BC_L;
++		if (c == ' ' || c == '\t')
++			return BC_WS;
++		return BC_ON;
++	}
++	if (c == 0xa0)
++		return BC_WS;
++	if (c < 0xc0)
++		return (c == 0xaa || c == 0xb5 || c == 0xba) ? BC_L : BC_ON;
++	if (c == 0xd7 || c == 0xf7)
++		return BC_ON;
++	if (c < 0x300)
++		return BC_L;
++	if (c <= 0x36f)
++		return BC_NSM;
++	if (c < 0x590)
++		return BC_L;
++	if (c <= 0x5ff) {
++		if ((c >= 0x591 && c <= 0x5bd) || c == 0x5bf ||
++				c == 0x5c1 || c == 0x5c2 || c == 0x5c4 ||
++				c == 0x5c5 || c == 0x5c7)
++			return BC_NSM;
++		return BC_R;
++	}
++	if (c <= 0x7bf) {
++		if ((c >= 0x610 && c <= 0x61a) ||
++				(c >= 0x64b && c <= 0x65f) || c == 0x670 ||
++				(c >= 0x6d6 && c <= 0x6dc) ||
++				(c >= 0x6df && c <= 0x6e4) ||
++				c == 0x6e7 || c == 0x6e8 ||
++				(c >= 0x6ea && c <= 0x6ed))
++			return BC_NSM;
++		if ((c >= 0x660 && c <= 0x669) || c == 0x66b || c == 0x66c)
++			return BC_AN;
++		if (c >= 0x6f0 && c <= 0x6f9)
++			return BC_EN;
++		return BC_AL;
++	}
++	if (c <= 0x8ff)
++		return (c >= 0x8a0) ? BC_AL : BC_R;
++	if (c >= 0x2000 && c <= 0x200a)
++		return BC_WS;
++	if (c == 0x200e)
++		return BC_L;
++	if (c == 0x200f)
++		return BC_R;
++	if (c == 0x2028 || c == 0x3000)
++		return BC_WS;
++	if (c >= 0x2010 && c <= 0x2bff)
++		return BC_ON;
++	if (c >= 0xfb1d && c <= 0xfb4f)
++		return BC_R;
++	if (c >= 0xfb50 && c <= 0xfdff)
++		return BC_AL;
++	if (c >= 0xfe00 && c <= 0xfe0f)
++		return BC_NSM;
++	if (c >= 0xfe70 && c <= 0xfefe)
++		return BC_AL;
++	return BC_L;
++}
++
++
++/*
++ * Arabic joining. Each letter's presentation forms follow one another
++ * from its isolated form: final, initial, medial. A letter with four
++ * joins on both sides, with two only to the letter before it, with one
++ * to neither.
++ */
++struct bidi_arabic {
++	uint16_t base;
++	uint8_t forms;
++};
++
++/** U+0621 to U+064A */
++static const struct bidi_arabic bidi_arabic_main[] = {
++	{ 0xfe80, 1 }, { 0xfe81, 2 }, { 0xfe83, 2 }, { 0xfe85, 2 },
++	{ 0xfe87, 2 }, { 0xfe89, 4 }, { 0xfe8d, 2 }, { 0xfe8f, 4 },
++	{ 0xfe93, 2 }, { 0xfe95, 4 }, { 0xfe99, 4 }, { 0xfe9d, 4 },
++	{ 0xfea1, 4 }, { 0xfea5, 4 }, { 0xfea9, 2 }, { 0xfeab, 2 },
++	{ 0xfead, 2 }, { 0xfeaf, 2 }, { 0xfeb1, 4 }, { 0xfeb5, 4 },
++	{ 0xfeb9, 4 }, { 0xfebd, 4 }, { 0xfec1, 4 }, { 0xfec5, 4 },
++	{ 0xfec9, 4 }, { 0xfecd, 4 },
++	/* U+063B to U+063F have no presentation forms */
++	{ 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 },
++	/* U+0640 tatweel joins both ways and has no forms */
++	{ 0, 4 },
++	{ 0xfed1, 4 }, { 0xfed5, 4 }, { 0xfed9, 4 }, { 0xfedd, 4 },
++	{ 0xfee1, 4 }, { 0xfee5, 4 }, { 0xfee9, 4 }, { 0xfeed, 2 },
++	{ 0xfeef, 2 }, { 0xfef1, 4 }
++};
++
++/** The letters Persian and Urdu add */
++static const struct {
++	uint16_t c;
++	struct bidi_arabic a;
++} bidi_arabic_extra[] = {
++	{ 0x0679, { 0xfb66, 4 } }, { 0x067e, { 0xfb56, 4 } },
++	{ 0x0686, { 0xfb7a, 4 } }, { 0x0688, { 0xfb88, 2 } },
++	{ 0x0691, { 0xfb8c, 2 } }, { 0x0698, { 0xfb8a, 2 } },
++	{ 0x06a9, { 0xfb8e, 4 } }, { 0x06af, { 0xfb92, 4 } },
++	{ 0x06ba, { 0xfb9e, 2 } }, { 0x06be, { 0xfbaa, 4 } },
++	{ 0x06c1, { 0xfba6, 4 } }, { 0x06cc, { 0xfbfc, 4 } },
++	{ 0x06d2, { 0xfbae, 2 } }
++};
++
++
++static struct bidi_arabic bidi_arabic_of(uint32_t c)
++{
++	struct bidi_arabic none = { 0, 0 };
++	unsigned int i;
++
++	if (c >= 0x621 && c <= 0x64a)
++		return bidi_arabic_main[c - 0x621];
++	for (i = 0; i < sizeof(bidi_arabic_extra) /
++			sizeof(bidi_arabic_extra[0]); i++) {
++		if (bidi_arabic_extra[i].c == c)
++			return bidi_arabic_extra[i].a;
++	}
++	return none;
++}
++
++
++/** The next or previous letter that joins, passing over marks. */
++static int bidi_arabic_neighbour(unsigned int n, int i, int step)
++{
++	for (i += step; i >= 0 && (unsigned int) i < n; i += step) {
++		if (bidi_class_of(bidi_cp[i]) != BC_NSM)
++			return i;
++	}
++	return -1;
++}
++
++
++/** Join the Arabic letters of bidi_cp[0..n), in logical order.
++ * \return the new number of characters, fewer if lam-alef joined */
++static unsigned int bidi_arabic_shape(unsigned int n)
++{
++	static uint32_t shaped[BIDI_MAX];
++	unsigned int i, o = 0;
++
++	for (i = 0; i < n; i++) {
++		uint32_t c = bidi_cp[i];
++		struct bidi_arabic a = bidi_arabic_of(c);
++		struct bidi_arabic pa, na;
++		int p, nx;
++		bool jp = false, jn = false;
++
++		if (a.forms == 0) {
++			shaped[o++] = c;
++			continue;
++		}
++		p = bidi_arabic_neighbour(n, (int) i, -1);
++		nx = bidi_arabic_neighbour(n, (int) i, 1);
++		if (p >= 0) {
++			pa = bidi_arabic_of(bidi_cp[p]);
++			jp = pa.forms == 4 && a.forms >= 2;
++		}
++		if (nx >= 0) {
++			na = bidi_arabic_of(bidi_cp[nx]);
++			jn = a.forms == 4 && na.forms >= 2;
++		}
++
++		/* lam then alef: one ligature, joined to what comes before
++		 * the lam if it can be */
++		if (c == 0x644 && nx >= 0 && (bidi_cp[nx] == 0x622 ||
++				bidi_cp[nx] == 0x623 || bidi_cp[nx] == 0x625 ||
++				bidi_cp[nx] == 0x627)) {
++			uint32_t lig = bidi_cp[nx] == 0x622 ? 0xfef5 :
++					bidi_cp[nx] == 0x623 ? 0xfef7 :
++					bidi_cp[nx] == 0x625 ? 0xfef9 : 0xfefb;
++			unsigned int k;
++
++			shaped[o++] = lig + (jp ? 1 : 0);
++			/* keep any marks between them */
++			for (k = i + 1; k < (unsigned int) nx; k++)
++				shaped[o++] = bidi_cp[k];
++			i = (unsigned int) nx;
++			continue;
++		}
++
++		if (a.base == 0) {
++			/* tatweel */
++			shaped[o++] = c;
++		} else if (jp && jn && a.forms == 4) {
++			shaped[o++] = a.base + 3;
++		} else if (jp) {
++			shaped[o++] = a.base + 1;
++		} else if (jn && a.forms == 4) {
++			shaped[o++] = a.base + 2;
++		} else {
++			shaped[o++] = a.base;
++		}
++	}
++	memcpy(bidi_cp, shaped, o * sizeof(shaped[0]));
++	return o;
++}
++
++
++static uint32_t bidi_mirror(uint32_t c)
++{
++	switch (c) {
++	case '(': return ')';
++	case ')': return '(';
++	case '[': return ']';
++	case ']': return '[';
++	case '{': return '}';
++	case '}': return '{';
++	case '<': return '>';
++	case '>': return '<';
++	case 0xab: return 0xbb;
++	case 0xbb: return 0xab;
++	default: return c;
++	}
++}
++
++
++/** Whether a run could need anything done to it in a left-to-right
++ * paragraph: it has a character from U+0580 up in the two byte range,
++ * or from U+0800 to U+08FF, or from U+FB00 up. */
++static bool bidi_may_have_rtl(const char *text, size_t len)
++{
++	const unsigned char *p = (const unsigned char *) text;
++	size_t i;
++
++	for (i = 0; i < len; i++) {
++		if (p[i] >= 0xd6 && p[i] <= 0xdf)
++			return true;
++		if ((p[i] == 0xe0 && i + 1 < len && p[i + 1] >= 0xa0 &&
++				p[i + 1] <= 0xa3) ||
++				(p[i] == 0xef && i + 1 < len &&
++				 p[i + 1] >= 0xac && p[i + 1] <= 0xbb))
++			return true;
++	}
++	return false;
++}
++
++
++static unsigned int bidi_decode(const char *text, size_t len)
++{
++	const unsigned char *p = (const unsigned char *) text;
++	size_t i = 0;
++	unsigned int n = 0;
++
++	while (i < len) {
++		uint32_t c = p[i];
++		int extra = 0;
++
++		if (n == BIDI_MAX)
++			return BIDI_MAX + 1;
++		if (c >= 0xf0) {
++			c &= 0x07;
++			extra = 3;
++		} else if (c >= 0xe0) {
++			c &= 0x0f;
++			extra = 2;
++		} else if (c >= 0xc0) {
++			c &= 0x1f;
++			extra = 1;
++		}
++		i++;
++		while (extra-- > 0 && i < len) {
++			c = (c << 6) | (p[i] & 0x3f);
++			i++;
++		}
++		bidi_cp[n++] = c;
++	}
++	return n;
++}
++
++
++static size_t bidi_encode(unsigned int n)
++{
++	unsigned int i;
++	size_t o = 0;
++
++	for (i = 0; i < n; i++) {
++		uint32_t c = bidi_cp[i];
++
++		if (c < 0x80) {
++			bidi_out[o++] = (char) c;
++		} else if (c < 0x800) {
++			bidi_out[o++] = (char) (0xc0 | (c >> 6));
++			bidi_out[o++] = (char) (0x80 | (c & 0x3f));
++		} else if (c < 0x10000) {
++			bidi_out[o++] = (char) (0xe0 | (c >> 12));
++			bidi_out[o++] = (char) (0x80 | ((c >> 6) & 0x3f));
++			bidi_out[o++] = (char) (0x80 | (c & 0x3f));
++		} else {
++			bidi_out[o++] = (char) (0xf0 | (c >> 18));
++			bidi_out[o++] = (char) (0x80 | ((c >> 12) & 0x3f));
++			bidi_out[o++] = (char) (0x80 | ((c >> 6) & 0x3f));
++			bidi_out[o++] = (char) (0x80 | (c & 0x3f));
++		}
++	}
++	return o;
++}
++
++
++/* exported interface documented in html/bidi.h */
++size_t html_bidi_visual(const char *text, size_t len, bool rtl,
++		const char **out)
++{
++	unsigned int n, i, j;
++	uint8_t para = rtl ? 1 : 0, max_level = 0, lowest_odd = 0xff;
++	bool any_rtl = false, any_arabic = false;
++	int last_strong;
++
++	if (len == 0 || (!rtl && !bidi_may_have_rtl(text, len)))
++		return 0;
++
++	n = bidi_decode(text, len);
++	if (n > BIDI_MAX)
++		return 0;
++
++	for (i = 0; i < n; i++) {
++		enum bidi_class c = bidi_class_of(bidi_cp[i]);
++
++		if (c == BC_R || c == BC_AL)
++			any_rtl = true;
++		if (c == BC_AL)
++			any_arabic = true;
++	}
++	if (!any_rtl && !rtl)
++		return 0;
++
++	if (any_arabic)
++		n = bidi_arabic_shape(n);
++
++	/* classes, marks taking the class before them (W1) */
++	for (i = 0; i < n; i++) {
++		enum bidi_class c = bidi_class_of(bidi_cp[i]);
++
++		if (c == BC_NSM)
++			c = i > 0 ? (enum bidi_class) bidi_cls[i - 1] :
++					(rtl ? BC_R : BC_L);
++		bidi_cls[i] = (uint8_t) c;
++	}
++
++	/* numbers after Arabic are Arabic numbers (W2), Arabic letters
++	 * are right to left (W3), numbers after left-to-right text are
++	 * left to right (W7) */
++	last_strong = rtl ? BC_R : BC_L;
++	for (i = 0; i < n; i++) {
++		uint8_t c = bidi_cls[i];
++
++		if (c == BC_L || c == BC_R || c == BC_AL) {
++			last_strong = c;
++			if (c == BC_AL)
++				bidi_cls[i] = BC_R;
++		} else if (c == BC_EN) {
++			if (last_strong == BC_AL)
++				bidi_cls[i] = BC_AN;
++			else if (last_strong == BC_L)
++				bidi_cls[i] = BC_L;
++		}
++	}
++
++	/* neutrals: between text of one direction they take it, numbers
++	 * counting as right to left; otherwise the paragraph's (N1, N2) */
++	for (i = 0; i < n; ) {
++		uint8_t before, after, dir;
++
++		if (bidi_cls[i] != BC_WS && bidi_cls[i] != BC_ON) {
++			i++;
++			continue;
++		}
++		for (j = i; j < n && (bidi_cls[j] == BC_WS ||
++				bidi_cls[j] == BC_ON); j++)
++			;
++		before = i > 0 ? bidi_cls[i - 1] : (rtl ? BC_R : BC_L);
++		after = j < n ? bidi_cls[j] : (rtl ? BC_R : BC_L);
++		if (before == BC_EN || before == BC_AN)
++			before = BC_R;
++		if (after == BC_EN || after == BC_AN)
++			after = BC_R;
++		dir = (before == after) ? before : (rtl ? BC_R : BC_L);
++		for (; i < j; i++) {
++			/* white space at the end of the run goes at the
++			 * paragraph's level (L1) */
++			bidi_cls[i] = (j == n && bidi_cls[i] == BC_WS) ?
++					(rtl ? BC_R : BC_L) : dir;
++		}
++	}
++
++	/* levels (I1, I2) */
++	for (i = 0; i < n; i++) {
++		uint8_t c = bidi_cls[i], l;
++
++		if (para == 0)
++			l = c == BC_R ? 1 : (c == BC_EN || c == BC_AN) ? 2 : 0;
++		else
++			l = c == BC_R ? 1 : 2;
++		bidi_lvl[i] = l;
++		if (l > max_level)
++			max_level = l;
++		if ((l & 1) && l < lowest_odd)
++			lowest_odd = l;
++	}
++	if (lowest_odd == 0xff)
++		lowest_odd = 1;
++
++	/* brackets in right-to-left text face the other way (L4) */
++	for (i = 0; i < n; i++) {
++		if (bidi_lvl[i] & 1)
++			bidi_cp[i] = bidi_mirror(bidi_cp[i]);
++	}
++
++	/* reverse every run at or above each level, highest first (L2) */
++	for (; max_level >= lowest_odd && max_level > 0; max_level--) {
++		for (i = 0; i < n; ) {
++			unsigned int a, b;
++
++			if (bidi_lvl[i] < max_level) {
++				i++;
++				continue;
++			}
++			for (j = i; j < n && bidi_lvl[j] >= max_level; j++)
++				;
++			for (a = i, b = j - 1; a < b; a++, b--) {
++				uint32_t t = bidi_cp[a];
++				uint8_t tl = bidi_lvl[a];
++
++				bidi_cp[a] = bidi_cp[b];
++				bidi_cp[b] = t;
++				bidi_lvl[a] = bidi_lvl[b];
++				bidi_lvl[b] = tl;
++			}
++			i = j;
++		}
++	}
++
++	{
++		size_t len_out = bidi_encode(n);
++		const char *kept = bidi_keep(bidi_out, len_out);
++
++		if (kept == NULL)
++			return 0;
++		*out = kept;
++		return len_out;
++	}
++}
+diff --git a/content/handlers/html/bidi.h b/content/handlers/html/bidi.h
+new file mode 100644
+index 000000000..85667ce38
+--- /dev/null
++++ b/content/handlers/html/bidi.h
+@@ -0,0 +1,59 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Right-to-left text for one run (VitaSurf): Arabic letters given the
++ * forms that join them, and the run put in the order it is seen.
++ */
++
++#ifndef NETSURF_HTML_BIDI_H
++#define NETSURF_HTML_BIDI_H
++
++#include <stdbool.h>
++#include <stddef.h>
++
++/**
++ * Put a run of text in the order it is drawn in.
++ *
++ * The run is taken as a paragraph of its own whose direction is the
++ * block's: runs of Hebrew and Arabic are reversed, numbers and
++ * left-to-right text inside them are not, spaces and punctuation go
++ * with the text either side, brackets are mirrored, and Arabic letters
++ * are replaced by their joined presentation forms.
++ *
++ * \param text  the run, UTF-8, in the order it was written
++ * \param len   its length in bytes
++ * \param rtl   whether the block the run is in is right to left
++ * \param out   set to the visual run, in memory owned by this module
++ *              that stays valid until the next outermost redraw begins
++ * \return the visual run's length, or 0 if the run is drawn as it is
++ */
++size_t html_bidi_visual(const char *text, size_t len, bool rtl,
++		const char **out);
++
++/**
++ * A redraw is starting (VitaSurf). The outermost one frees the runs the
++ * last redraw made; a nested one, for an iframe, keeps them.
++ */
++void html_bidi_redraw_begin(void);
++
++/** A redraw has finished. */
++void html_bidi_redraw_end(void);
++
++#endif
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 0bce88ffb..7c35de0a0 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -500,6 +500,12 @@ struct box {
+ 	 */
+ 	struct hlcache_handle *mask;
+ 
++	/**
++	 * border-image source for this box, or NULL if none or a gradient
++	 * (VitaSurf).
++	 */
++	struct hlcache_handle *border_image;
++
+ 
+ 	/**
+ 	 * Object in this box (usually an image), or NULL if none.
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index cc0bdabec..8c4f29d6a 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -702,16 +702,14 @@ static inline bool box__containing_block_is_flex(
+  * See libcss parse/properties/filter.c for the form. The result is
+  * owned by the box.
+  */
+-static struct html_paint_filter *box_parse_filter(struct box *box,
+-		const char *spec)
++/* exported interface documented in html/private.h */
++bool html_paint_filter_parse(const char *spec, struct html_paint_filter *f)
+ {
+-	struct html_paint_filter *f = talloc_zero(box, struct html_paint_filter);
+ 	const char *p = spec;
+ 	char *end;
+ 	int i;
+ 
+-	if (f == NULL)
+-		return NULL;
++	memset(f, 0, sizeof(*f));
+ 	f->alpha = 256;
+ 	f->m[0] = f->m[5] = f->m[10] = 4096;
+ 
+@@ -758,7 +756,21 @@ static struct html_paint_filter *box_parse_filter(struct box *box,
+ 			break;
+ 	}
+ 
+-	if (f->alpha == 256 && !f->colour && !f->shadow && f->blur == 0) {
++	return !(f->alpha == 256 && !f->colour && !f->shadow && f->blur == 0);
++}
++
++/**
++ * The filter a box is painted through, owned by the box, or NULL for
++ * none (VitaSurf).
++ */
++static struct html_paint_filter *box_parse_filter(struct box *box,
++		const char *spec)
++{
++	struct html_paint_filter *f = talloc_zero(box, struct html_paint_filter);
++
++	if (f == NULL)
++		return NULL;
++	if (!html_paint_filter_parse(spec, f)) {
+ 		talloc_free(f);
+ 		return NULL;
+ 	}
+@@ -1195,6 +1207,29 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		}
+ 	}
+ 
++	/* and any border-image source that is not a gradient (VitaSurf) */
++	{
++		lwc_string *bisrc = NULL;
++
++		if (css_computed_border_image_source(box->style, &bisrc) ==
++				CSS_BORDER_IMAGE_SOURCE_SET && bisrc != NULL &&
++				strncmp(lwc_string_data(bisrc), "gradient:",
++						9) != 0 &&
++				nsoption_bool(background_images) == true) {
++			nsurl *url;
++
++			if (nsurl_create(lwc_string_data(bisrc), &url) ==
++					NSERROR_OK) {
++				if (html_fetch_border_image(ctx->content, url,
++						box) == false) {
++					nsurl_unref(url);
++					return false;
++				}
++				nsurl_unref(url);
++			}
++		}
++	}
++
+ 	if (*convert_children)
+ 		box->flags |= CONVERT_CHILDREN;
+ 
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index d243a3809..276483217 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -744,6 +744,34 @@ struct box *box_find_by_id(struct box *box, lwc_string *id)
+ }
+ 
+ 
++/* Exported function documented in html/box_inspect.h */
++uint8_t box_vertical(const struct box *box)
++{
++	const struct box *p;
++	uint8_t mode;
++
++	if (box->style == NULL || (box->type != BOX_BLOCK &&
++			box->type != BOX_INLINE_BLOCK) ||
++			box->object != NULL || (box->flags & IFRAME) ||
++			box->gadget != NULL)
++		return 0;
++	/* the root and the body keep their pages horizontal */
++	if (box->parent == NULL || box->parent->parent == NULL)
++		return 0;
++	mode = css_computed_writing_mode(box->style);
++	if (mode != CSS_WRITING_MODE_VERTICAL_RL &&
++			mode != CSS_WRITING_MODE_VERTICAL_LR)
++		return 0;
++	/* only where the mode changes: what is inside a vertical box is
++	 * laid out horizontally within it and turned with it */
++	for (p = box->parent; p != NULL && p->style == NULL; p = p->parent)
++		;
++	if (p != NULL && css_computed_writing_mode(p->style) == mode)
++		return 0;
++	return mode;
++}
++
++
+ /* Exported function documented in html/box_inspect.h */
+ bool box_transform(const css_unit_ctx *unit_len_ctx, const struct box *box,
+ 		float m[4], int *ox, int *oy)
+@@ -752,10 +780,37 @@ bool box_transform(const css_unit_ctx *unit_len_ctx, const struct box *box,
+ 	css_fixed hl = 0, vl = 0;
+ 	css_unit hu = CSS_UNIT_PCT, vu = CSS_UNIT_PCT;
+ 	int bw, bh;
++	uint8_t vertical;
+ 
+ 	if (box->style == NULL)
+ 		return false;
+ 
++	/*
++	 * A vertical writing mode (VitaSurf): the box's content is laid
++	 * out as horizontal lines as long as the box is tall, and painted
++	 * turned. vertical-rl turns it a quarter clockwise, so the first
++	 * line is at the right, about the point that keeps it in the box;
++	 * vertical-lr transposes it, first line at the left. Either way
++	 * text reads downwards. Its box's own transform is not applied.
++	 */
++	vertical = box_vertical(box);
++	if (vertical != 0) {
++		if (vertical == CSS_WRITING_MODE_VERTICAL_RL) {
++			/* the layout's height is the box's width */
++			int hb = box->border[TOP].width +
++					box->padding[TOP] + box->width +
++					box->padding[BOTTOM] +
++					box->border[BOTTOM].width;
++
++			m[0] = 0; m[1] = 1; m[2] = -1; m[3] = 0;
++			*ox = *oy = hb / 2;
++		} else {
++			m[0] = 0; m[1] = 1; m[2] = 1; m[3] = 0;
++			*ox = *oy = 0;
++		}
++		return true;
++	}
++
+ 	/* a text box shares its element's style, and a transform does not
+ 	 * apply to an inline box; the element's block handles it */
+ 	if (box->type == BOX_TEXT || box->type == BOX_INLINE ||
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+index a6f0c6d29..16dde0436 100644
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -133,6 +133,15 @@ bool box_visible(struct box *box);
+ bool box_transform(const css_unit_ctx *unit_len_ctx, const struct box *box,
+ 		float m[4], int *ox, int *oy);
+ 
++/**
++ * Whether a box starts a vertical writing mode (VitaSurf).
++ *
++ * \param box  box to inspect
++ * \return CSS_WRITING_MODE_VERTICAL_RL or _LR for a block or inline
++ *         block whose mode is vertical where its parent's is not, else 0
++ */
++uint8_t box_vertical(const struct box *box);
++
+ 
+ /**
+  * Print a box tree to a file.
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index 312e6fb95..672f1f03b 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -153,6 +153,7 @@ box_create(css_select_results *styles,
+ 	box->id = id;
+ 	box->background = NULL;
+ 	box->mask = NULL;
++	box->border_image = NULL;
+ 	box->object = NULL;
+ 	box->object_params = NULL;
+ 	box->iframe = NULL;
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index fcaa19a23..11d3bc097 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -961,7 +961,20 @@ static void layout_minmax_block(
+ 	}
+ 
+ 	/* set whether the minimum width is of any interest for this box */
+-	if (((block->parent && lh__box_is_float_box(block->parent)) ||
++	if (block->style != NULL && (lh__is_intrinsic_size(wtype) ||
++			lh__is_intrinsic_size(css_computed_min_width(
++				block->style, &width, &wunit)) ||
++			lh__is_intrinsic_size(css_computed_max_width(
++				block->style, &width, &wunit)))) {
++		/* an intrinsic size keyword is measured from it
++		 * (VitaSurf) */
++		block->flags |= NEED_MIN;
++		if (wtype == CSS_WIDTH_SET) {
++			/* the reads above wrote over the width */
++			wtype = css_computed_width(block->style,
++					&width, &wunit);
++		}
++	} else if (((block->parent && lh__box_is_float_box(block->parent)) ||
+ 			block->type == BOX_INLINE_BLOCK ||
+ 			block->type == BOX_INLINE_FLEX) &&
+ 			wtype != CSS_WIDTH_SET) {
+@@ -1104,6 +1117,31 @@ static void layout_minmax_block(
+ 		assert(0);
+ 	}
+ 
++	if (lh__box_is_multicol(block)) {
++		/* at its widest a multi-column box sets its columns side
++		 * by side, each as wide as its content goes (VitaSurf) */
++		int32_t count = 0;
++
++		if (css_computed_column_count(block->style, &count) ==
++				CSS_COLUMN_COUNT_SET && count > 1) {
++			int gap = 0;
++
++			if (count > 32)
++				count = 32;
++			if (css_computed_column_gap_px(block->style,
++					&content->unit_len_ctx, -1, &gap) !=
++					CSS_COLUMN_GAP_SET) {
++				gap = FIXTOINT(css_unit_len2device_px(
++						block->style,
++						&content->unit_len_ctx,
++						INTTOFIX(1), CSS_UNIT_EM));
++			}
++			if (gap < 0)
++				gap = 0;
++			max = max * count + gap * (count - 1);
++		}
++	}
++
+ 	/* fixed width takes priority. A flex item's width only counts when
+ 	 * its flex-basis is auto, since the basis replaces it otherwise
+ 	 * (VitaSurf: upstream skipped every flex item, so a fixed-width
+@@ -1118,11 +1156,22 @@ static void layout_minmax_block(
+ 		css_fixed value = 0;
+ 		int width;
+ 
+-		if (css_computed_width_px(block->style, &content->unit_len_ctx,
+-				-1, &width) == CSS_WIDTH_SET) {
++		/* the content's own widths, before the box's width,
++		 * min-width and max-width say otherwise, for the intrinsic
++		 * sizing keywords (VitaSurf) */
++		int content_min = min, content_max = max;
++		enum css_width_e type;
++
++		type = css_computed_width_px(block->style,
++				&content->unit_len_ctx, -1, &width);
++		if (type == CSS_WIDTH_SET) {
+ 			min = max = width;
+ 			using_max_border_box = border_box;
+ 			using_min_border_box = border_box;
++		} else if (type == CSS_WIDTH_MAX_CONTENT) {
++			min = max = content_max;
++		} else if (type == CSS_WIDTH_MIN_CONTENT) {
++			min = max = content_min;
+ 		}
+ 
+ 		min_type = css_computed_min_width(block->style, &value, &unit);
+@@ -1134,6 +1183,20 @@ static void layout_minmax_block(
+ 				min = val;
+ 				using_min_border_box = border_box;
+ 			}
++		} else if (lh__is_intrinsic_size(min_type)) {
++			/* min-width wins over width, so the maximum rises
++			 * with it */
++			int val = min_type == CSS_MIN_WIDTH_MAX_CONTENT ?
++					content_max : content_min;
++
++			if (min < val) {
++				min = val;
++				using_min_border_box = false;
++			}
++			if (max < min) {
++				max = min;
++				using_max_border_box = false;
++			}
+ 		}
+ 
+ 		max_type = css_computed_max_width(block->style, &value, &unit);
+@@ -1145,6 +1208,14 @@ static void layout_minmax_block(
+ 				max = val;
+ 				using_max_border_box = border_box;
+ 			}
++		} else if (lh__is_intrinsic_size(max_type)) {
++			int val = max_type == CSS_MAX_WIDTH_MIN_CONTENT ?
++					content_min : content_max;
++
++			if (max > val) {
++				max = val;
++				using_max_border_box = false;
++			}
+ 		}
+ 	}
+ 
+@@ -1534,6 +1605,18 @@ layout_solve_width(struct box *box,
+ 				box->border[RIGHT].width + box->margin[RIGHT]);
+ 		box->margin[LEFT] = box->margin[LEFT] < lm
+ 				? lm : box->margin[LEFT];
++	} else if (box->margin[RIGHT] != AUTO && box->parent != NULL &&
++			box->parent->style != NULL &&
++			css_computed_direction(box->parent->style) ==
++					CSS_DIRECTION_RTL) {
++		/* over-constrained in a right-to-left block: the left
++		 * margin gives way, so the box sits at the right (VitaSurf) */
++		box->margin[LEFT] = available_width - lm -
++				(box->border[LEFT].width + box->padding[LEFT] +
++				width + box->padding[RIGHT] +
++				box->border[RIGHT].width + box->margin[RIGHT]);
++		box->margin[LEFT] = box->margin[LEFT] < lm
++				? lm : box->margin[LEFT];
+ 	} else {
+ 		/* margin-right auto or "over-constrained" */
+ 		box->margin[RIGHT] = available_width - rm -
+@@ -3491,6 +3574,13 @@ layout_line(struct box *first,
+ 			break;
+ 		}
+ 		break;
++	case CSS_TEXT_ALIGN_END:
++		/* the other side from the direction's start (VitaSurf) */
++		if (css_computed_direction(first->parent->parent->style) !=
++				CSS_DIRECTION_RTL) {
++			x0 = x1 - x;
++		}
++		break;
+ 	}
+ 
+ 	for (d = first; d != b; d = d->next) {
+@@ -3542,6 +3632,46 @@ layout_line(struct box *first,
+ 		}
+ 	}
+ 
++	/*
++	 * A right-to-left block lays its line out from the right
++	 * (VitaSurf): the boxes on it are mirrored within the space they
++	 * take, so the first is rightmost. What is inside each text box
++	 * is put in visual order when it is drawn (html_bidi_visual).
++	 */
++	if (css_computed_direction(first->parent->parent->style) ==
++			CSS_DIRECTION_RTL && first->next != b) {
++		int a0 = x0, a1 = x0 + x;
++
++		for (d = first; d != b; d = d->next) {
++			int l, r;
++
++			if (d->type == BOX_TEXT || d->type == BOX_BR ||
++					d->type == BOX_INLINE_END ||
++					(d->type == BOX_INLINE &&
++					 lh__box_is_replace(d) == false)) {
++				l = d->x;
++				r = d->x + (d->type == BOX_TEXT ? d->width : 0);
++			} else if (d->type == BOX_INLINE ||
++					d->type == BOX_INLINE_BLOCK ||
++					d->type == BOX_INLINE_FLEX) {
++				if (css_computed_position(d->style) ==
++						CSS_POSITION_ABSOLUTE ||
++				    css_computed_position(d->style) ==
++						CSS_POSITION_FIXED)
++					continue;
++				l = d->x - d->border[LEFT].width -
++						d->margin[LEFT];
++				r = d->x + d->padding[LEFT] + d->width +
++						d->padding[RIGHT] +
++						d->border[RIGHT].width +
++						d->margin[RIGHT];
++			} else {
++				continue;
++			}
++			d->x += a0 + a1 - r - l;
++		}
++	}
++
+ 	first->flags |= NEW_LINE;
+ 
+ 	assert(b != first || (move_y && 0 < used_height && (left || right)));
+@@ -3786,11 +3916,82 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ }
+ 
+ 
+-/* Documented in layout_intertnal.h */
++/**
++ * Layout a box that starts a vertical writing mode (VitaSurf).
++ *
++ * Its content is laid out as horizontal lines as long as the box is
++ * tall -- the height it is given, or the widest its content goes up to
++ * the viewport's height -- and box_transform turns it when it is
++ * painted. The box then takes its place in the page the other way
++ * about: as wide as its lines stack up, unless it has a width, and as
++ * tall as they are long. html_redraw_box swaps the two back while the
++ * box is painted.
++ */
++static bool layout_vertical(struct box *box, int viewport_height,
++		html_content *content)
++{
++	int phys_w = box->width;
++	int inline_size, stack;
++	bool width_auto = true;
++	bool ok;
++
++	if (box->style != NULL) {
++		css_fixed len = 0;
++		css_unit unit = CSS_UNIT_PX;
++
++		width_auto = css_computed_width(box->style, &len, &unit) !=
++				CSS_WIDTH_SET;
++	}
++
++	if (box->height != AUTO) {
++		inline_size = box->height;
++	} else {
++		int mbp = box->padding[LEFT] + box->padding[RIGHT] +
++				box->border[LEFT].width +
++				box->border[RIGHT].width;
++
++		if (box->margin[LEFT] != AUTO)
++			mbp += box->margin[LEFT];
++		if (box->margin[RIGHT] != AUTO)
++			mbp += box->margin[RIGHT];
++		inline_size = box->max_width != UNKNOWN_MAX_WIDTH ?
++				box->max_width - mbp : phys_w;
++		if (viewport_height > 0 && inline_size > viewport_height)
++			inline_size = viewport_height;
++	}
++	if (inline_size < 1)
++		inline_size = 1;
++
++	box->width = inline_size;
++	box->height = AUTO;
++	ok = layout_block_context_single(box, viewport_height, content);
++	stack = box->height == AUTO ? 0 : box->height;
++
++	box->height = inline_size;
++	box->width = width_auto ? stack : phys_w;
++	return ok;
++}
++
++
++/* Documented in layout_internal.h */
+ bool layout_block_context(
+ 		struct box *block,
+ 		int viewport_height,
+ 		html_content *content)
++{
++	if (box_vertical(block) != 0)
++		return layout_vertical(block, viewport_height, content);
++	if (lh__box_is_multicol(block))
++		return layout_multicol(block, viewport_height, content);
++	return layout_block_context_single(block, viewport_height, content);
++}
++
++
++/* Documented in layout_internal.h */
++bool layout_block_context_single(
++		struct box *block,
++		int viewport_height,
++		html_content *content)
+ {
+ 	struct box *box;
+ 	int cx, cy;  /**< current coordinates */
+@@ -3935,7 +4136,9 @@ bool layout_block_context(
+ 			if (lh__box_is_object(box) == false &&
+ 					box->style &&
+ 					(overflow_x != CSS_OVERFLOW_VISIBLE ||
+-					 overflow_y != CSS_OVERFLOW_VISIBLE)) {
++					 overflow_y != CSS_OVERFLOW_VISIBLE ||
++					 lh__box_is_multicol(box) ||
++					 box_vertical(box) != 0)) {
+ 				/* box establishes new block formatting context
+ 				 * so available width may be diminished due to
+ 				 * floats. */
+@@ -4041,11 +4244,14 @@ bool layout_block_context(
+ 		}
+ 
+ 		/* Unless the box has an overflow style of visible, the box
+-		 * establishes a new block context. */
++		 * establishes a new block context. So does a multi-column
++		 * box (VitaSurf). */
+ 		if (box->type == BOX_FLEX ||
+ 				(box->type == BOX_BLOCK && box->style &&
+ 				 (overflow_x != CSS_OVERFLOW_VISIBLE ||
+-				  overflow_y != CSS_OVERFLOW_VISIBLE))) {
++				  overflow_y != CSS_OVERFLOW_VISIBLE ||
++				  lh__box_is_multicol(box) ||
++				  box_vertical(box) != 0))) {
+ 
+ 			if (box->type == BOX_FLEX) {
+ 				if (!layout_flex(box, box->width, content)) {
+@@ -5650,6 +5856,41 @@ layout_get_box_bbox(
+ 			*desc_x1 += box->filter->blur;
+ 			*desc_y1 += box->filter->blur;
+ 		}
++
++		/* the outline is outside the border box by its width and
++		 * its offset (VitaSurf) */
++		if (box->type != BOX_TEXT && box->type != BOX_INLINE &&
++				box->type != BOX_INLINE_END &&
++				box->type != BOX_INLINE_CONTAINER &&
++				css_computed_outline_style(box->style) !=
++						CSS_OUTLINE_STYLE_NONE &&
++				css_computed_outline_style(box->style) !=
++						CSS_OUTLINE_STYLE_INHERIT) {
++			css_fixed olen = 0;
++			css_unit ounit = CSS_UNIT_PX;
++			int reach;
++
++			css_computed_outline_width(box->style, &olen, &ounit);
++			reach = FIXTOINT(css_unit_len2device_px(box->style,
++					unit_len_ctx, olen, ounit));
++			if (css_computed_outline_offset(box->style, &olen,
++					&ounit) == CSS_OUTLINE_OFFSET_SET)
++				reach += FIXTOINT(css_unit_len2device_px(
++						box->style, unit_len_ctx,
++						olen, ounit));
++			if (reach > 0) {
++				if (*desc_x0 > -box->border[LEFT].width - reach)
++					*desc_x0 = -box->border[LEFT].width -
++							reach;
++				if (*desc_y0 > -box->border[TOP].width - reach)
++					*desc_y0 = -box->border[TOP].width -
++							reach;
++				if (*desc_x1 < bx1 + reach)
++					*desc_x1 = bx1 + reach;
++				if (*desc_y1 < by1 + reach)
++					*desc_y1 = by1 + reach;
++			}
++		}
+ 	}
+ 
+ 	/* To stop the top of text getting clipped when css line-height is
+diff --git a/content/handlers/html/layout.h b/content/handlers/html/layout.h
+index 0811e81de..5b2c1c721 100644
+--- a/content/handlers/html/layout.h
++++ b/content/handlers/html/layout.h
+@@ -31,6 +31,7 @@
+ struct box;
+ struct html_content;
+ struct gui_layout_table;
++struct css_unit_ctx;
+ 
+ /**
+  * Calculate positions of boxes in a document.
+@@ -42,4 +43,19 @@ struct gui_layout_table;
+  */
+ bool layout_document(struct html_content *content, int width, int height);
+ 
++/**
++ * The columns a multi-column box is laid out in (VitaSurf).
++ *
++ * \param unit_len_ctx     length conversion context
++ * \param box              the box
++ * \param available_width  the box's content width
++ * \param n_out            set to the number of columns
++ * \param width_out        set to each column's width
++ * \param gap_out          set to the gap between columns
++ * \return true if the box has more than one column
++ */
++bool layout_multicol_columns(const struct css_unit_ctx *unit_len_ctx,
++		const struct box *box, int available_width,
++		int *n_out, int *width_out, int *gap_out);
++
+ #endif
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 1a8e2f735..e46863c51 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -173,6 +173,12 @@ static struct flex_ctx *layout_flex_ctx__create(
+ 	ctx->wrap = css_computed_flex_wrap(flex->style);
+ 	ctx->horizontal = lh__flex_main_is_horizontal(flex);
+ 	ctx->main_reversed = lh__flex_direction_reversed(flex);
++	if (ctx->horizontal && css_computed_direction(flex->style) ==
++			CSS_DIRECTION_RTL) {
++		/* a row runs from the right in right-to-left text, and
++		 * row-reverse from the left (VitaSurf) */
++		ctx->main_reversed = !ctx->main_reversed;
++	}
+ 
+ 	/*
+ 	 * gap (VitaSurf). column-gap runs between items in a row and
+@@ -318,6 +324,9 @@ static inline bool layout_flex__base_and_main_sizes(
+ 	if (item->base_size == AUTO) {
+ 		if (ctx->horizontal == false) {
+ 			item->base_size = b->height;
++		} else if (item->basis == CSS_FLEX_BASIS_MIN_CONTENT) {
++			/* (VitaSurf) */
++			item->base_size = content_min_width - delta_outer_main;
+ 		} else {
+ 			item->base_size = content_max_width - delta_outer_main;
+ 		}
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index 22f9e205a..cee1888d9 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -1820,6 +1820,14 @@ bool layout_grid(struct box *grid, int available_width,
+ 
+ 		b->x = ctx.cols[it->col].pos + b->margin[LEFT] +
+ 				b->border[LEFT].width;
++		if (css_computed_direction(grid->style) ==
++				CSS_DIRECTION_RTL) {
++			/* columns run from the right in right-to-left text
++			 * (VitaSurf): the item's area is mirrored within the
++			 * content box */
++			b->x += 2 * grid->padding[LEFT] + grid->width -
++					2 * ctx.cols[it->col].pos - area_w;
++		}
+ 		b->y = ctx.rows[it->row].pos + b->margin[TOP] +
+ 				b->border[TOP].width;
+ 
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index ce682a63c..cfbef64a7 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -42,6 +42,23 @@ bool layout_block_context(
+ 		int viewport_height,
+ 		html_content *content);
+ 
++/**
++ * Layout a block formatting context as a single column, whatever
++ * column-count or column-width it has (VitaSurf). layout_block_context
++ * is this for a box that is not a multi-column box.
++ */
++bool layout_block_context_single(
++		struct box *block,
++		int viewport_height,
++		html_content *content);
++
++/**
++ * Layout a multi-column box (VitaSurf, layout_multicol.c): its content
++ * as one column a column wide, then dealt into balanced columns.
++ */
++bool layout_multicol(struct box *box, int viewport_height,
++		html_content *content);
++
+ /**
+  * Layout a table.
+  *
+@@ -194,6 +211,25 @@ static inline bool lh__flex_item_basis_is_auto(const struct box *b)
+ 			CSS_FLEX_BASIS_AUTO;
+ }
+ 
++/**
++ * Layout helper: Check whether a box lays its content out in columns
++ * (VitaSurf): a block with column-count above one or a column-width.
++ */
++static inline bool lh__box_is_multicol(const struct box *b)
++{
++	int32_t count = 0;
++	css_fixed len = 0;
++	css_unit unit = CSS_UNIT_PX;
++
++	if (b->type != BOX_BLOCK || b->style == NULL || b->object != NULL ||
++			(b->flags & IFRAME) || b->gadget != NULL)
++		return false;
++	return (css_computed_column_count(b->style, &count) ==
++			CSS_COLUMN_COUNT_SET && count > 1) ||
++	       css_computed_column_width(b->style, &len, &unit) ==
++			CSS_COLUMN_WIDTH_SET;
++}
++
+ /** Layout helper: Check whether box is a grid container (VitaSurf). */
+ static inline bool lh__box_is_grid_container(const struct box *b)
+ {
+@@ -568,6 +604,62 @@ static inline bool layout_shrink_to_fit_width(
+ }
+ 
+ 
++/**
++ * Whether a sizing property holds max-content, min-content or
++ * fit-content (VitaSurf). The computed values are the same numbers for
++ * width, height, their min- and max- forms and flex-basis.
++ */
++static inline bool lh__is_intrinsic_size(uint8_t type)
++{
++	return type == CSS_WIDTH_MAX_CONTENT ||
++	       type == CSS_WIDTH_MIN_CONTENT ||
++	       type == CSS_WIDTH_FIT_CONTENT;
++}
++
++/**
++ * The content width an intrinsic sizing keyword gives a box (VitaSurf).
++ *
++ * layout_minmax_block has folded the keyword into the box's minimum
++ * and maximum widths, which include its margins, borders and padding:
++ * max-content is the widest the content goes with no line broken,
++ * min-content the narrowest it goes breaking every line it can, and
++ * fit-content the maximum clamped to the space there is, but never
++ * below the minimum, as a float shrinks to fit.
++ *
++ * \param box              the box, its min_width and max_width known
++ * \param type             the keyword
++ * \param available_width  width of the containing block
++ * \param mbp              the box's horizontal margins, borders and
++ *                         padding
++ * 
++eturn the content width, or AUTO if the box has none measured
++ */
++static inline int lh__intrinsic_width(const struct box *box, uint8_t type,
++		int available_width, int mbp)
++{
++	int w;
++
++	if (box->max_width == UNKNOWN_MAX_WIDTH)
++		return AUTO;
++
++	switch (type) {
++	case CSS_WIDTH_MAX_CONTENT:
++		w = box->max_width;
++		break;
++	case CSS_WIDTH_MIN_CONTENT:
++		w = box->min_width;
++		break;
++	default:
++		w = box->max_width < available_width ?
++				box->max_width : available_width;
++		if (w < box->min_width)
++			w = box->min_width;
++		break;
++	}
++	w -= mbp;
++	return w < 0 ? 0 : w;
++}
++
+ static inline void layout_find_dimensions(
+ 		const css_unit_ctx *unit_len_ctx,
+ 		int available_width,
+@@ -586,14 +678,21 @@ static inline void layout_find_dimensions(
+ {
+ 	struct box *containing_block = NULL;
+ 	unsigned int i;
++	/* intrinsic sizing keywords, resolved once the margins, borders
++	 * and padding are known (VitaSurf) */
++	uint8_t width_kw = 0, min_width_kw = 0, max_width_kw = 0;
+ 
+ 	if (width) {
+-		if (css_computed_width_px(style, unit_len_ctx,
+-				available_width, width) == CSS_WIDTH_SET) {
++		uint8_t wtype = css_computed_width_px(style, unit_len_ctx,
++				available_width, width);
++
++		if (wtype == CSS_WIDTH_SET) {
+ 			layout_handle_box_sizing(unit_len_ctx, box,
+ 					available_width, true, width);
+ 		} else {
+ 			*width = AUTO;
++			if (lh__is_intrinsic_size(wtype))
++				width_kw = wtype;
+ 		}
+ 	}
+ 
+@@ -727,11 +826,14 @@ static inline void layout_find_dimensions(
+ 	}
+ 
+ 	if (max_width) {
+-		if (css_computed_max_width_px(style, unit_len_ctx,
+-				available_width, max_width) !=
+-				CSS_MAX_WIDTH_SET) {
++		uint8_t mtype = css_computed_max_width_px(style, unit_len_ctx,
++				available_width, max_width);
++
++		if (mtype != CSS_MAX_WIDTH_SET) {
+ 			/* Inadmissible */
+ 			*max_width = -1;
++			if (lh__is_intrinsic_size(mtype))
++				max_width_kw = mtype;
+ 		}
+ 
+ 		if (*max_width != -1) {
+@@ -741,11 +843,14 @@ static inline void layout_find_dimensions(
+ 	}
+ 
+ 	if (min_width) {
+-		if (ns_computed_min_width_px(style, unit_len_ctx,
+-				available_width, min_width) !=
+-				CSS_MIN_WIDTH_SET) {
++		uint8_t mtype = ns_computed_min_width_px(style, unit_len_ctx,
++				available_width, min_width);
++
++		if (mtype != CSS_MIN_WIDTH_SET) {
+ 			/* Inadmissible */
+ 			*min_width = 0;
++			if (lh__is_intrinsic_size(mtype))
++				min_width_kw = mtype;
+ 		}
+ 
+ 		if (*min_width != 0) {
+@@ -822,6 +927,41 @@ static inline void layout_find_dimensions(
+ 				border[i].width = 0;
+ 		}
+ 	}
++
++	if (width_kw != 0 || min_width_kw != 0 || max_width_kw != 0) {
++		/* the box's own margins, borders and padding, which its
++		 * measured widths include; where the caller did not ask
++		 * for them, the ones its last layout gave it */
++		const int *m = margin ? margin : box->margin;
++		const int *p = padding ? padding : box->padding;
++		const struct box_border *b = border ? border : box->border;
++		int mbp = 0;
++
++		for (i = 0; i != 4; i++) {
++			if (i != LEFT && i != RIGHT)
++				continue;
++			if (m[i] != AUTO)
++				mbp += m[i];
++			mbp += p[i] + b[i].width;
++		}
++
++		if (width_kw != 0) {
++			*width = lh__intrinsic_width(box, width_kw,
++					available_width, mbp);
++		}
++		if (min_width_kw != 0) {
++			int w = lh__intrinsic_width(box, min_width_kw,
++					available_width, mbp);
++
++			*min_width = w == AUTO ? 0 : w;
++		}
++		if (max_width_kw != 0) {
++			int w = lh__intrinsic_width(box, max_width_kw,
++					available_width, mbp);
++
++			*max_width = w == AUTO ? -1 : w;
++		}
++	}
+ }
+ 
+ #endif
+diff --git a/content/handlers/html/layout_multicol.c b/content/handlers/html/layout_multicol.c
+new file mode 100644
+index 000000000..d968d945b
+--- /dev/null
++++ b/content/handlers/html/layout_multicol.c
+@@ -0,0 +1,467 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Multi-column layout (VitaSurf): column-count, column-width, columns.
++ *
++ * A multi-column box's content is laid out once, as a single column as
++ * wide as one of its columns. The result is then cut into fragments --
++ * the lines of its inline content and the blocks it holds, looking
++ * inside a tall plain block such as a list for its lines and items --
++ * and the fragments are dealt out in order into columns of one height,
++ * the least that fits them into the column count. Moving a fragment is
++ * moving its boxes: nothing is laid out twice.
++ *
++ * What this leaves out: a block that is not split, other than by the
++ * lines and blocks inside it, keeps its whole height in one column, so
++ * a box with a background that runs across a column break has it drawn
++ * only in the first; floats inside the content stay where the single
++ * column put them; column-span is not honoured.
++ */
++
++#include <assert.h>
++#include <limits.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "utils/log.h"
++#include "utils/utils.h"
++
++#include "html/box.h"
++#include "html/html.h"
++#include "html/private.h"
++#include "html/box_inspect.h"
++#include "html/layout.h"
++#include "html/layout_internal.h"
++
++/** Deepest a tall block is looked inside for fragments. */
++#define MULTICOL_DEPTH 8
++
++/** Most columns laid out, whatever a page asks for. */
++#define MULTICOL_MAX 32
++
++/**
++ * A run of sibling boxes that goes into a column whole: a line of an
++ * inline container, or a block. Its top and bottom are measured from
++ * the multi-column box's own origin, as its children's are.
++ */
++struct multicol_frag {
++	struct box *first;
++	struct box *last;
++	int top;
++	int bottom;
++};
++
++struct multicol_ctx {
++	struct multicol_frag *frag;
++	unsigned int n_frag;
++	unsigned int alloc;
++	/** boxes whose content was cut up, parents first, to be given
++	 * their new heights afterwards */
++	struct box **cut;
++	unsigned int n_cut;
++	unsigned int cut_alloc;
++	/** a block at least this tall is looked inside */
++	int threshold;
++	bool nomem;
++};
++
++
++/* exported interface documented in html/layout.h */
++bool layout_multicol_columns(const css_unit_ctx *unit_len_ctx,
++		const struct box *box, int available_width,
++		int *n_out, int *width_out, int *gap_out)
++{
++	int32_t count = 0;
++	int cw = 0, gap = 0, n, colw;
++	bool has_count, has_width;
++
++	if (box->style == NULL || available_width <= 0)
++		return false;
++
++	has_count = css_computed_column_count(box->style, &count) ==
++			CSS_COLUMN_COUNT_SET && count > 0;
++	has_width = css_computed_column_width_px(box->style, unit_len_ctx,
++			available_width, &cw) == CSS_COLUMN_WIDTH_SET &&
++			cw > 0;
++	if (!has_count && !has_width)
++		return false;
++
++	/* "normal" is 1em in a multi-column box */
++	if (css_computed_column_gap_px(box->style, unit_len_ctx,
++			available_width, &gap) != CSS_COLUMN_GAP_SET) {
++		gap = FIXTOINT(css_unit_len2device_px(box->style,
++				unit_len_ctx, INTTOFIX(1), CSS_UNIT_EM));
++	}
++	if (gap < 0)
++		gap = 0;
++
++	if (has_width) {
++		/* as many columns of at least that width as fit, but no
++		 * more than a count that is also given */
++		n = (available_width + gap) / (cw + gap);
++		if (n < 1)
++			n = 1;
++		if (has_count && n > count)
++			n = count;
++	} else {
++		n = count;
++	}
++	if (n > MULTICOL_MAX)
++		n = MULTICOL_MAX;
++
++	colw = (available_width - (n - 1) * gap) / n;
++	if (colw < 1) {
++		n = 1;
++		colw = available_width;
++	}
++
++	*n_out = n;
++	*width_out = colw;
++	*gap_out = gap;
++	return n > 1;
++}
++
++
++static void multicol_add(struct multicol_ctx *m, struct box *first,
++		struct box *last, int top, int bottom)
++{
++	if (m->n_frag == m->alloc) {
++		unsigned int alloc = m->alloc ? m->alloc * 2 : 64;
++		struct multicol_frag *f = realloc(m->frag,
++				alloc * sizeof(*f));
++
++		if (f == NULL) {
++			m->nomem = true;
++			return;
++		}
++		m->frag = f;
++		m->alloc = alloc;
++	}
++	m->frag[m->n_frag].first = first;
++	m->frag[m->n_frag].last = last;
++	m->frag[m->n_frag].top = top;
++	m->frag[m->n_frag].bottom = bottom < top ? top : bottom;
++	m->n_frag++;
++}
++
++
++static void multicol_note_cut(struct multicol_ctx *m, struct box *b)
++{
++	if (m->n_cut == m->cut_alloc) {
++		unsigned int alloc = m->cut_alloc ? m->cut_alloc * 2 : 16;
++		struct box **c = realloc(m->cut, alloc * sizeof(*c));
++
++		if (c == NULL) {
++			m->nomem = true;
++			return;
++		}
++		m->cut = c;
++		m->cut_alloc = alloc;
++	}
++	m->cut[m->n_cut++] = b;
++}
++
++
++/** Whether a child of an inline container moves with its line. A float
++ * is placed against its block, not the line, and is left alone. */
++static inline bool multicol_moves(const struct box *b)
++{
++	return b->type != BOX_FLOAT_LEFT && b->type != BOX_FLOAT_RIGHT;
++}
++
++
++/** Cut an inline container into its lines. */
++static void multicol_lines(struct multicol_ctx *m, struct box *ic,
++		int base_y)
++{
++	struct box *c, *first = NULL, *last = NULL;
++	int top = 0, bottom = 0;
++
++	multicol_note_cut(m, ic);
++	for (c = ic->children; c != NULL; c = c->next) {
++		int ct, cb;
++
++		if (!multicol_moves(c))
++			continue;
++		ct = base_y + c->y;
++		cb = ct + c->height + c->padding[TOP] + c->padding[BOTTOM] +
++				c->border[TOP].width + c->border[BOTTOM].width;
++
++		if (first != NULL && ct >= bottom) {
++			/* below everything on the line so far: a new line */
++			multicol_add(m, first, last, top, bottom);
++			first = NULL;
++		}
++		if (first == NULL) {
++			first = c;
++			top = ct;
++			bottom = cb;
++		}
++		if (cb > bottom)
++			bottom = cb;
++		last = c;
++	}
++	if (first != NULL)
++		multicol_add(m, first, last, top, bottom);
++}
++
++
++/** Whether a block may be looked inside for smaller fragments. */
++static bool multicol_can_cut(const struct box *b)
++{
++	enum css_overflow_e ox, oy;
++
++	if (b->type != BOX_BLOCK || b->children == NULL ||
++			b->object != NULL || (b->flags & IFRAME) ||
++			b->gadget != NULL || b->style == NULL)
++		return false;
++	if (b->list_marker != NULL)
++		/* the marker stays with the item's first line */
++		return false;
++	ox = box_overflow_x(b);
++	oy = box_overflow_y(b);
++	if (ox != CSS_OVERFLOW_VISIBLE || oy != CSS_OVERFLOW_VISIBLE)
++		return false;
++	if (css_computed_break_inside(b->style) == CSS_BREAK_INSIDE_AVOID)
++		return false;
++	return !lh__box_is_multicol(b);
++}
++
++
++static void multicol_collect(struct multicol_ctx *m, struct box *parent,
++		int base_y, int depth)
++{
++	struct box *c;
++
++	for (c = parent->children; c != NULL && !m->nomem; c = c->next) {
++		int top, bottom;
++
++		if (c->style != NULL &&
++				(css_computed_position(c->style) ==
++					CSS_POSITION_ABSOLUTE ||
++				 css_computed_position(c->style) ==
++					CSS_POSITION_FIXED))
++			continue;
++
++		if (c->type == BOX_INLINE_CONTAINER) {
++			multicol_lines(m, c, base_y + c->y);
++			continue;
++		}
++
++		top = base_y + c->y - c->border[TOP].width;
++		bottom = base_y + c->y + c->padding[TOP] + c->height +
++				c->padding[BOTTOM] + c->border[BOTTOM].width;
++
++		if (depth < MULTICOL_DEPTH && bottom - top > m->threshold &&
++				multicol_can_cut(c)) {
++			multicol_note_cut(m, c);
++			multicol_collect(m, c, base_y + c->y, depth + 1);
++			continue;
++		}
++		multicol_add(m, c, c, top, bottom);
++	}
++}
++
++
++/**
++ * Deal the fragments into columns of a height.
++ *
++ * \param m          the fragments
++ * \param col_h      the most a column holds
++ * \param col_step   a column's width and the gap after it
++ * \param apply      move the boxes, or only count
++ * \param bottom_out if not NULL, set to the lowest bottom of a column
++ * \return how many columns that takes
++ */
++static int multicol_deal(const struct multicol_ctx *m, int col_h,
++		int col_step, bool apply, int *bottom_out)
++{
++	unsigned int i;
++	int k = 0;
++	int y0 = m->frag[0].top;
++	int start = y0;
++	int bottom = y0;
++	bool empty = true;
++
++	for (i = 0; i < m->n_frag; i++) {
++		const struct multicol_frag *f = &m->frag[i];
++
++		if (!empty && f->bottom - start > col_h) {
++			k++;
++			start = f->top;
++		}
++		empty = false;
++		if (f->bottom - start + y0 > bottom)
++			bottom = f->bottom - start + y0;
++
++		if (apply && (k != 0 || start != y0)) {
++			int dx = k * col_step, dy = y0 - start;
++			struct box *b;
++
++			for (b = f->first; b != NULL; b = b->next) {
++				if (multicol_moves(b)) {
++					b->x += dx;
++					b->y += dy;
++				}
++				if (b == f->last)
++					break;
++			}
++		}
++	}
++	if (bottom_out != NULL)
++		*bottom_out = bottom;
++	return k + 1;
++}
++
++
++/** Give a box whose content was cut up the height its content now
++ * takes, as the columns have moved some of it up. */
++static void multicol_shrink(struct box *b)
++{
++	struct box *c;
++	int bottom = 0;
++
++	if (b->type == BOX_BLOCK && b->style != NULL) {
++		css_fixed len = 0;
++		css_unit unit = CSS_UNIT_PX;
++
++		if (css_computed_height(b->style, &len, &unit) ==
++				CSS_HEIGHT_SET)
++			return;
++	}
++
++	for (c = b->children; c != NULL; c = c->next) {
++		int cb;
++
++		if (!multicol_moves(c))
++			continue;
++		if (c->style != NULL &&
++				(css_computed_position(c->style) ==
++					CSS_POSITION_ABSOLUTE ||
++				 css_computed_position(c->style) ==
++					CSS_POSITION_FIXED))
++			continue;
++		cb = c->y + c->padding[TOP] + c->height +
++				c->padding[BOTTOM] + c->border[BOTTOM].width;
++		if (c->type != BOX_INLINE_CONTAINER && c->margin[BOTTOM] > 0)
++			cb += c->margin[BOTTOM];
++		if (cb > bottom)
++			bottom = cb;
++	}
++	bottom -= b->type == BOX_INLINE_CONTAINER ? 0 : b->padding[TOP];
++	if (bottom < b->height)
++		b->height = bottom < 0 ? 0 : bottom;
++}
++
++
++/* exported interface documented in html/layout_internal.h */
++bool layout_multicol(struct box *box, int viewport_height,
++		html_content *content)
++{
++	struct multicol_ctx m;
++	int n, colw, gap, width, height_spec, total, lo, hi, col_h;
++	int orig_bottom = INT_MIN, new_bottom = 0, trailing;
++	unsigned int i;
++	bool ok;
++
++	if (!layout_multicol_columns(&content->unit_len_ctx, box,
++			box->width, &n, &colw, &gap)) {
++		return layout_block_context_single(box, viewport_height,
++				content);
++	}
++
++	/* the content, as a single column one column wide */
++	width = box->width;
++	height_spec = box->height;
++	box->width = colw;
++	ok = layout_block_context_single(box, viewport_height, content);
++	box->width = width;
++	if (!ok)
++		return false;
++
++	memset(&m, 0, sizeof(m));
++	total = box->height;
++	m.threshold = total / n;
++	multicol_collect(&m, box, 0, 0);
++	if (m.nomem || m.n_frag < 2) {
++		free(m.frag);
++		free(m.cut);
++		return !m.nomem;
++	}
++
++	for (i = 0; i < m.n_frag; i++) {
++		if (m.frag[i].bottom > orig_bottom)
++			orig_bottom = m.frag[i].bottom;
++	}
++
++	if (height_spec != AUTO) {
++		/* a box with a height fills each column to it, and what
++		 * does not fit goes into more columns beside them */
++		col_h = height_spec;
++	} else {
++		/* balanced: the least height that fits the fragments into
++		 * n columns, found by halving; no column can be shorter
++		 * than its tallest fragment */
++		lo = 0;
++		for (i = 0; i < m.n_frag; i++) {
++			if (m.frag[i].bottom - m.frag[i].top > lo)
++				lo = m.frag[i].bottom - m.frag[i].top;
++		}
++		hi = orig_bottom - m.frag[0].top;
++		if (hi < lo)
++			hi = lo;
++		while (lo < hi) {
++			int mid = lo + (hi - lo) / 2;
++
++			if (multicol_deal(&m, mid, colw + gap, false,
++					NULL) <= n)
++				hi = mid;
++			else
++				lo = mid + 1;
++		}
++		col_h = lo;
++	}
++
++	multicol_deal(&m, col_h, colw + gap, true, &new_bottom);
++
++	/* the boxes that were cut up take only what is left in them,
++	 * innermost first */
++	for (i = m.n_cut; i-- > 0; )
++		multicol_shrink(m.cut[i]);
++
++	if (height_spec == AUTO) {
++		/* the tallest column, and whatever margin followed the
++		 * content when it was one column */
++		trailing = total + box->padding[TOP] - orig_bottom;
++		if (trailing < 0)
++			trailing = 0;
++		box->height = new_bottom - box->padding[TOP] + trailing;
++		if (box->height < 0)
++			box->height = 0;
++	}
++
++	NSLOG(layout, DEBUG, "multicol %p: %d columns of %d, gap %d, "
++			"height %d, %u fragments", box, n, colw, gap,
++			col_h, m.n_frag);
++
++	free(m.frag);
++	free(m.cut);
++	return true;
++}
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index e25c2a410..c2e1e17c9 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -97,6 +97,11 @@ html_object_done(struct box *box,
+ {
+ 	struct box *b;
+ 
++	if (mask && background) {
++		/* the two together are a border image (VitaSurf) */
++		box->border_image = object;
++		return;
++	}
+ 	if (mask) {
+ 		box->mask = object;
+ 		return;
+@@ -326,7 +331,22 @@ html_object_callback(hlcache_handle *object,
+ 
+ 			box_coords(box, &x, &y);
+ 
+-			if (object == box->mask) {
++			if (object == box->border_image) {
++				/* a border image: the whole border box
++				 * (VitaSurf) */
++				data.redraw.x = x - box->border[LEFT].width;
++				data.redraw.y = y - box->border[TOP].width;
++				data.redraw.width = box->border[LEFT].width +
++						box->padding[LEFT] +
++						box->width +
++						box->padding[RIGHT] +
++						box->border[RIGHT].width;
++				data.redraw.height = box->border[TOP].width +
++						box->padding[TOP] +
++						box->height +
++						box->padding[BOTTOM] +
++						box->border[BOTTOM].width;
++			} else if (object == box->mask) {
+ 				/* Redraw request is for the mask: the whole
+ 				 * padding box is painted through it */
+ 				data.redraw.x = x;
+@@ -1061,3 +1081,11 @@ html_fetch_mask(html_content *c, nsurl *url, struct box *box)
+ {
+ 	return html_fetch_object_role(c, url, box, CONTENT_IMAGE, false, true);
+ }
++
++/* exported interface documented in html/object.h */
++bool
++html_fetch_border_image(html_content *c, nsurl *url, struct box *box)
++{
++	/* both roles at once mark a border image (VitaSurf) */
++	return html_fetch_object_role(c, url, box, CONTENT_IMAGE, true, true);
++}
+diff --git a/content/handlers/html/object.h b/content/handlers/html/object.h
+index 84fa3cdb7..e169a4675 100644
+--- a/content/handlers/html/object.h
++++ b/content/handlers/html/object.h
+@@ -55,6 +55,12 @@ bool html_fetch_object(struct html_content *c, struct nsurl *url, struct box *bo
+  */
+ bool html_fetch_mask(struct html_content *c, struct nsurl *url, struct box *box);
+ 
++/**
++ * Start fetching a box's border-image source (VitaSurf).
++ */
++bool html_fetch_border_image(struct html_content *c, struct nsurl *url,
++		struct box *box);
++
+ /**
+  * release memory of content objects associated with a HTML content
+  *
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 05ee26496..9ad60cdc5 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -410,6 +410,17 @@ struct html_corner_radii {
+ 	int bl_h, bl_v;
+ };
+ 
++/**
++ * Read the string libcss folds a filter or backdrop-filter list into
++ * (VitaSurf; the form is in libcss parse/properties/filter.c).
++ *
++ * \param spec  the string
++ * \param f     filled in
++ * \return true if the filter does anything
++ */
++struct html_paint_filter;
++bool html_paint_filter_parse(const char *spec, struct html_paint_filter *f);
++
+ bool html_box_corner_radii(const struct box *box,
+ 		const struct rect *border_box,
+ 		const css_unit_ctx *unit_len_ctx, float scale,
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 9f449276c..83ef4da98 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -64,6 +64,7 @@
+ #include "html/form_internal.h"
+ #include "html/private.h"
+ #include "html/layout.h"
++#include "html/bidi.h"
+ 
+ 
+ bool html_redraw_debug = false;
+@@ -164,6 +165,12 @@ static struct box *html_redraw_find_bg_box(struct box *box)
+  * \return true iff successful and redraw should proceed
+  */
+ 
++/**
++ * Whether the text being drawn is in a right-to-left block (VitaSurf),
++ * set by html_redraw_text_box around its calls to text_redraw.
++ */
++static bool text_redraw_rtl = false;
++
+ static bool
+ text_redraw(const char *utf8_text,
+ 	    size_t utf8_len,
+@@ -183,6 +190,19 @@ text_redraw(const char *utf8_text,
+ 	bool highlighted = false;
+ 	plot_font_style_t plot_fstyle = *fstyle;
+ 	nserror res;
++	const char *visual = NULL;
++	size_t visual_len;
++
++	/* right-to-left text in the order it is seen, Arabic joined
++	 * (VitaSurf). The selection's offsets are into the text as it
++	 * was written, so reordered text is drawn unhighlighted. */
++	visual_len = html_bidi_visual(utf8_text, utf8_len, text_redraw_rtl,
++			&visual);
++	if (visual_len > 0) {
++		utf8_text = visual;
++		utf8_len = visual_len;
++		excluded = true;
++	}
+ 
+ 	/* Need scaled text size to pass to plotters */
+ 	plot_fstyle.size *= scale;
+@@ -615,37 +635,29 @@ static bool html_box_masked(struct box *box)
+ }
+ 
+ /**
+- * Paint a masked box: its background colour through the mask image, which
+- * is fitted inside the padding box and centred, as mask-size: contain and
+- * mask-position: center would. Nothing is painted until the mask has
+- * loaded, since a missing mask hides the element entirely.
++ * Where a box's mask image goes (VitaSurf): fitted inside the padding
++ * box and centred unless mask-size and mask-position say otherwise.
+  *
+  * \param x, y   padding box origin in device pixels
+  * \param pw, ph padding box size in device pixels
++ * \param data   filled in with the mask's place and size
++ * \return false if the mask is not ready or has no size
+  */
+-static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+-		float scale, const struct rect *clip,
+-		const css_unit_ctx *unit_len_ctx,
+-		const struct redraw_context *ctx)
++static bool html_mask_place(int x, int y, int pw, int ph, struct box *box,
++		float scale, const css_unit_ctx *unit_len_ctx,
++		struct content_redraw_data *data)
+ {
+-	css_color bgcol;
+-	struct content_redraw_data data;
+-	struct rect r = *clip;
+ 	int iw, ih, mw, mh;
+ 
+ 	if (box->mask == NULL ||
+ 	    (content_get_status(box->mask) != CONTENT_STATUS_READY &&
+ 	     content_get_status(box->mask) != CONTENT_STATUS_DONE)) {
+-		return true;
+-	}
+-	css_computed_background_color(box->style, &bgcol);
+-	if (nscss_color_is_transparent(bgcol)) {
+-		return true;
++		return false;
+ 	}
+ 	iw = content_get_width(box->mask);
+ 	ih = content_get_height(box->mask);
+ 	if (iw <= 0 || ih <= 0 || pw <= 0 || ph <= 0) {
+-		return true;
++		return false;
+ 	}
+ 	mw = iw * scale;
+ 	mh = ih * scale;
+@@ -708,20 +720,11 @@ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ 		}
+ 	}
+ 	if (mw <= 0 || mh <= 0) {
+-		return true;
+-	}
+-	if (r.x0 < x) r.x0 = x;
+-	if (r.y0 < y) r.y0 = y;
+-	if (r.x1 > x + pw) r.x1 = x + pw;
+-	if (r.y1 > y + ph) r.y1 = y + ph;
+-	if (r.x0 >= r.x1 || r.y0 >= r.y1) {
+-		return true;
+-	}
+-	if (ctx->plot->clip(ctx, &r) != NSERROR_OK) {
+ 		return false;
+ 	}
+-	data.x = x + (pw - mw) / 2;
+-	data.y = y + (ph - mh) / 2;
++	memset(data, 0, sizeof(*data));
++	data->x = x + (pw - mw) / 2;
++	data->y = y + (ph - mh) / 2;
+ 
+ 	/* mask-position (VitaSurf): unset means centred, as before */
+ 	{
+@@ -731,27 +734,64 @@ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ 		if (css_computed_mask_position(box->style, &hl, &hu, &vl,
+ 				&vu) == CSS_MASK_POSITION_SET) {
+ 			if (hu == CSS_UNIT_PCT)
+-				data.x = x + (int) ((pw - mw) * FIXTOFLT(hl) /
++				data->x = x + (int) ((pw - mw) * FIXTOFLT(hl) /
+ 						100);
+ 			else
+-				data.x = x + FIXTOINT(css_unit_len2device_px(
++				data->x = x + FIXTOINT(css_unit_len2device_px(
+ 						box->style, unit_len_ctx, hl,
+ 						hu)) * scale;
+ 			if (vu == CSS_UNIT_PCT)
+-				data.y = y + (int) ((ph - mh) * FIXTOFLT(vl) /
++				data->y = y + (int) ((ph - mh) * FIXTOFLT(vl) /
+ 						100);
+ 			else
+-				data.y = y + FIXTOINT(css_unit_len2device_px(
++				data->y = y + FIXTOINT(css_unit_len2device_px(
+ 						box->style, unit_len_ctx, vl,
+ 						vu)) * scale;
+ 		}
+ 	}
+-	data.width = mw;
+-	data.height = mh;
++	data->width = mw;
++	data->height = mh;
++	data->scale = scale;
++	data->repeat_x = false;
++	data->repeat_y = false;
++	return true;
++}
++
++/**
++ * Paint a masked box: its background colour through the mask image, which
++ * is fitted inside the padding box and centred, as mask-size: contain and
++ * mask-position: center would. Nothing is painted until the mask has
++ * loaded, since a missing mask hides the element entirely.
++ *
++ * \param x, y   padding box origin in device pixels
++ * \param pw, ph padding box size in device pixels
++ */
++static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
++		float scale, const struct rect *clip,
++		const css_unit_ctx *unit_len_ctx,
++		const struct redraw_context *ctx)
++{
++	css_color bgcol;
++	struct content_redraw_data data;
++	struct rect r = *clip;
++
++	css_computed_background_color(box->style, &bgcol);
++	if (nscss_color_is_transparent(bgcol)) {
++		return true;
++	}
++	if (!html_mask_place(x, y, pw, ph, box, scale, unit_len_ctx, &data))
++		return true;
++	if (r.x0 < x) r.x0 = x;
++	if (r.y0 < y) r.y0 = y;
++	if (r.x1 > x + pw) r.x1 = x + pw;
++	if (r.y1 > y + ph) r.y1 = y + ph;
++	if (r.x0 >= r.x1 || r.y0 >= r.y1) {
++		return true;
++	}
++	if (ctx->plot->clip(ctx, &r) != NSERROR_OK) {
++		return false;
++	}
+ 	data.background_colour = nscss_color_to_ns(bgcol);
+-	data.scale = scale;
+-	data.repeat_x = false;
+-	data.repeat_y = false;
+ 	data.mask = true;
+ 	data.mask_colour = nscss_color_to_ns(bgcol);
+ 	content_redraw(box->mask, &data, &r, ctx);
+@@ -1692,6 +1732,12 @@ static bool html_redraw_text_decoration(const html_content *html,
+  * \return true iff successful and redraw should proceed
+  */
+ 
++static bool html_redraw_text_box_runs(const html_content *html,
++		struct box *box, int x, int y, const struct rect *clip,
++		float scale, colour current_background_color,
++		const struct redraw_context *ctx, bool excluded,
++		plot_font_style_t *fstyle_in);
++
+ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 		int x, int y, const struct rect *clip, float scale,
+ 		colour current_background_color,
+@@ -1699,11 +1745,34 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ {
+ 	bool excluded = (box->object != NULL);
+ 	plot_font_style_t fstyle;
++	bool ok;
+ 
+ 	font_plot_style_from_css(&html->unit_len_ctx, box_text_style(box),
+ 			&fstyle);
+ 	fstyle.background = current_background_color;
+ 
++	/* the direction of the block the text is in (VitaSurf): a text
++	 * box's parent is its inline container, whose parent is it */
++	text_redraw_rtl = box->parent != NULL && box->parent->parent != NULL &&
++			box->parent->parent->style != NULL &&
++			css_computed_direction(box->parent->parent->style) ==
++					CSS_DIRECTION_RTL;
++	ok = html_redraw_text_box_runs(html, box, x, y, clip, scale,
++			current_background_color, ctx, excluded, &fstyle);
++	text_redraw_rtl = false;
++	return ok;
++}
++
++
++/** The text box's runs, drawn by html_redraw_text_box. */
++static bool html_redraw_text_box_runs(const html_content *html,
++		struct box *box, int x, int y, const struct rect *clip,
++		float scale, colour current_background_color,
++		const struct redraw_context *ctx, bool excluded,
++		plot_font_style_t *fstyle_in)
++{
++	plot_font_style_t fstyle = *fstyle_in;
++
+ 	/*
+ 	 * text-shadow (VitaSurf): the run is painted once more, first,
+ 	 * offset by the shadow and in its colour. The text plotter has
+@@ -2969,8 +3038,20 @@ static nserror html_filter_bitmap(const struct redraw_context *ctx,
+ 
+ 	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->bitmap(&rctx_, bitmap, x, y,
+ 			width, height, bg, flags));
+-	if (copy != NULL)
++	if (copy != NULL) {
++		/* the knockout plotter keeps the bitmap it is given until
++		 * it flushes, so it is made to draw the copy before the
++		 * copy goes (VitaSurf) */
++		if (lv->real->flush != NULL) {
++			nserror keep = res;
++
++			HTML_FILTER_FORWARD(lv, ctx,
++					rctx_.plot->flush(&rctx_));
++			if (keep != NSERROR_OK)
++				res = keep;
++		}
+ 		guit->bitmap->destroy(copy);
++	}
+ 	return res;
+ }
+ 
+@@ -3442,6 +3523,16 @@ static nserror html_transform_bitmap(const struct redraw_context *ctx,
+ 					&rctx_, copy, dest.x0, dest.y0,
+ 					dest.x1 - dest.x0, dest.y1 - dest.y0,
+ 					bg, flags));
++			/* drawn before it goes: knockout keeps the pointer
++			 * until it flushes (VitaSurf) */
++			if (lv->real->flush != NULL) {
++				nserror keep = res;
++
++				HTML_TRANSFORM_FORWARD(lv, ctx,
++						rctx_.plot->flush(&rctx_));
++				if (keep != NSERROR_OK)
++					res = keep;
++			}
+ 			guit->bitmap->destroy(copy);
+ 			return res;
+ 		}
+@@ -3453,6 +3544,23 @@ static nserror html_transform_bitmap(const struct redraw_context *ctx,
+ 	return res;
+ }
+ 
++/** A run drawn into a bitmap for a turned level (VitaSurf). */
++struct html_transform_run {
++	const plot_font_style_t *fstyle;
++	const char *text;
++	size_t length;
++	int baseline;
++};
++
++static bool html_transform_run_draw(const struct redraw_context *ctx,
++		void *pw)
++{
++	const struct html_transform_run *run = pw;
++
++	return ctx->plot->text(ctx, run->fstyle, 0, run->baseline,
++			run->text, run->length) == NSERROR_OK;
++}
++
+ static nserror html_transform_text(const struct redraw_context *ctx,
+ 		const plot_font_style_t *fstyle, int x, int y,
+ 		const char *text, size_t length)
+@@ -3463,6 +3571,45 @@ static nserror html_transform_text(const struct redraw_context *ctx,
+ 	float tx, ty;
+ 	nserror res = NSERROR_OK;
+ 
++	/*
++	 * Through a turn the plotters cannot turn glyphs (VitaSurf): where
++	 * the frontend can draw into a bitmap the run is drawn upright into
++	 * one, which goes through the level as a picture does, turned. A
++	 * run too long for that is placed at its anchor as below.
++	 */
++	if (lv->axis == false && vitasurf_raster != NULL && length > 0) {
++		int w = 0;
++		int px = (int) (plot_style_fixed_to_float(fstyle->size) *
++				FIXTOFLT(nscss_screen_dpi) / 72.0f + 0.5f);
++		int h = px + px / 2 + 1;
++
++		if (px > 0 && guit->layout->width(fstyle, text, length,
++				&w) == NSERROR_OK && w > 0 &&
++				w * h <= HTML_TRANSFORM_BITMAP_MAX) {
++			struct html_transform_run run = {
++				fstyle, text, length, px
++			};
++			struct bitmap *bm = NULL;
++
++			if (vitasurf_raster(w, h, html_transform_run_draw,
++					&run, &bm) == NSERROR_OK && bm != NULL) {
++				res = html_transform_bitmap(ctx, bm, x, y - px,
++						w, h, fstyle->background,
++						BITMAPF_NONE);
++				if (lv->real->flush != NULL) {
++					nserror keep = res;
++
++					HTML_TRANSFORM_FORWARD(lv, ctx,
++							rctx_.plot->flush(&rctx_));
++					if (keep != NSERROR_OK)
++						res = keep;
++				}
++				guit->bitmap->destroy(bm);
++				return res;
++			}
++		}
++	}
++
+ 	st.size = (plot_style_fixed) (fstyle->size * lv->sy + 0.5f);
+ 	if (st.size <= 0)
+ 		return NSERROR_OK;
+@@ -3711,6 +3858,1120 @@ static int32_t html_z_index(const struct box *box)
+ 	return z;
+ }
+ 
++/*
++ * Painting aside and cutting to a shape (VitaSurf).
++ *
++ * The plotters clip to rectangles only. Where a box must be cut to a
++ * curve -- the rounded corners of an image or of a box whose overflow
++ * is hidden, a clip-path circle or ellipse -- what would be painted is
++ * painted instead into a bitmap the size of the area (vitasurf_raster,
++ * which the framebuffer frontend provides), each pixel's alpha is
++ * scaled by how much of it lies inside the shape, a pixel's width of
++ * soft edge included, and the bitmap is plotted where the area is.
++ * Without vitasurf_raster, or for an area too big to copy, the box is
++ * painted as it was, square.
++ */
++#define HTML_COMPOSITE_MAX (1024 * 1024)
++
++/** A shape to cut to, in device coordinates. */
++struct html_shape {
++	bool ellipse;
++	int x0, y0, x1, y1;		/**< the rounded rectangle */
++	struct html_corner_radii r;	/**< its corners */
++	float cx, cy, ex, ey;		/**< the ellipse's centre and radii */
++};
++
++/** The box being painted aside, which is painted normally inside. */
++static const struct box *html_composite_active;
++
++/** How much of a pixel at (px, py) lies inside an ellipse. */
++static inline float html_shape_curve(float px, float py, float cx,
++		float cy, float rx, float ry)
++{
++	float dx = (px - cx) / rx, dy = (py - cy) / ry;
++	float m = rx < ry ? rx : ry;
++	float c = (1.0f - sqrtf(dx * dx + dy * dy)) * m + 0.5f;
++
++	return c < 0.0f ? 0.0f : c > 1.0f ? 1.0f : c;
++}
++
++static float html_shape_cover(const struct html_shape *s, float px,
++		float py)
++{
++	const struct html_corner_radii *r = &s->r;
++
++	if (s->ellipse) {
++		if (s->ex <= 0.0f || s->ey <= 0.0f)
++			return 0.0f;
++		return html_shape_curve(px, py, s->cx, s->cy, s->ex, s->ey);
++	}
++	if (px < s->x0 || px >= s->x1 || py < s->y0 || py >= s->y1)
++		return 0.0f;
++	if (r->tl_h > 0 && r->tl_v > 0 && px < s->x0 + r->tl_h &&
++			py < s->y0 + r->tl_v)
++		return html_shape_curve(px, py, s->x0 + r->tl_h,
++				s->y0 + r->tl_v, r->tl_h, r->tl_v);
++	if (r->tr_h > 0 && r->tr_v > 0 && px >= s->x1 - r->tr_h &&
++			py < s->y0 + r->tr_v)
++		return html_shape_curve(px, py, s->x1 - r->tr_h,
++				s->y0 + r->tr_v, r->tr_h, r->tr_v);
++	if (r->br_h > 0 && r->br_v > 0 && px >= s->x1 - r->br_h &&
++			py >= s->y1 - r->br_v)
++		return html_shape_curve(px, py, s->x1 - r->br_h,
++				s->y1 - r->br_v, r->br_h, r->br_v);
++	if (r->bl_h > 0 && r->bl_v > 0 && px < s->x0 + r->bl_h &&
++			py >= s->y1 - r->bl_v)
++		return html_shape_curve(px, py, s->x0 + r->bl_h,
++				s->y1 - r->bl_v, r->bl_h, r->bl_v);
++	return 1.0f;
++}
++
++/** What html_composite paints aside: the drawing, moved by -dx, -dy
++ * in layout pixels (ox, oy in device pixels), through ctx, within
++ * clip. */
++struct html_composite_job {
++	bool (*draw)(const struct redraw_context *ctx, void *pw, int dx,
++			int dy, int ox, int oy, const struct rect *clip);
++	void *pw;
++	int dx, dy, ox, oy;
++	struct rect clip;
++};
++
++static bool html_composite_trampoline(const struct redraw_context *ctx,
++		void *pw)
++{
++	struct html_composite_job *j = pw;
++
++	return j->draw(ctx, j->pw, j->dx, j->dy, j->ox, j->oy, &j->clip);
++}
++
++/**
++ * Paint an area aside (VitaSurf).
++ *
++ * \param area   the area, device coordinates
++ * \param clip   the clip in force
++ * \param scale  the redraw's scale
++ * \param draw   paints what is in the area
++ * \param pw     passed to draw
++ * \param out    set to the bitmap, or NULL if there is none
++ * \param ox     set to where its left edge lands
++ * \param oy     set to where its top edge lands
++ * \return false if the area is empty and nothing needs painting; true
++ *         otherwise, with *out NULL if it could not be painted aside
++ */
++static bool html_composite_raster(const struct rect *area,
++		const struct rect *clip, float scale,
++		bool (*draw)(const struct redraw_context *ctx, void *pw,
++			int dx, int dy, int ox, int oy,
++			const struct rect *clip),
++		void *pw, struct bitmap **out, int *ox, int *oy)
++{
++	struct html_composite_job job;
++	struct rect r = *area;
++	int w, h;
++
++	*out = NULL;
++	if (r.x0 < clip->x0) r.x0 = clip->x0;
++	if (r.y0 < clip->y0) r.y0 = clip->y0;
++	if (r.x1 > clip->x1) r.x1 = clip->x1;
++	if (r.y1 > clip->y1) r.y1 = clip->y1;
++	if (r.x0 >= r.x1 || r.y0 >= r.y1)
++		return false;
++	if (vitasurf_raster == NULL || scale <= 0.0f)
++		return true;
++
++	/* the origin on a whole layout pixel, so what is painted aside
++	 * lands where it would have */
++	job.dx = (int) floorf(r.x0 / scale);
++	job.dy = (int) floorf(r.y0 / scale);
++	job.ox = (int) (job.dx * scale);
++	job.oy = (int) (job.dy * scale);
++	w = r.x1 - job.ox;
++	h = r.y1 - job.oy;
++	if (w <= 0 || h <= 0 || w * h > HTML_COMPOSITE_MAX)
++		return true;
++	job.draw = draw;
++	job.pw = pw;
++	job.clip.x0 = r.x0 - job.ox;
++	job.clip.y0 = r.y0 - job.oy;
++	job.clip.x1 = w;
++	job.clip.y1 = h;
++
++	if (vitasurf_raster(w, h, html_composite_trampoline, &job,
++			out) != NSERROR_OK)
++		*out = NULL;
++	*ox = job.ox;
++	*oy = job.oy;
++	return true;
++}
++
++/** Scale a bitmap's alpha by how much of each pixel is in a shape. */
++static void html_shape_apply(struct bitmap *bm, int ox, int oy,
++		const struct html_shape *shape)
++{
++	uint8_t *buf = guit->bitmap->get_buffer(bm);
++	size_t stride = guit->bitmap->get_rowstride(bm);
++	int w = guit->bitmap->get_width(bm);
++	int h = guit->bitmap->get_height(bm);
++	int x, y;
++
++	if (buf == NULL)
++		return;
++	for (y = 0; y < h; y++) {
++		uint8_t *row = buf + y * stride;
++		float py = oy + y + 0.5f;
++
++		for (x = 0; x < w; x++) {
++			uint8_t *px = row + x * 4;
++			float c;
++
++			if (px[bitmap_layout.a] == 0)
++				continue;
++			c = html_shape_cover(shape, ox + x + 0.5f, py);
++			if (c < 1.0f)
++				px[bitmap_layout.a] = (uint8_t)
++					(px[bitmap_layout.a] * c + 0.5f);
++		}
++	}
++	guit->bitmap->set_opaque(bm, false);
++	guit->bitmap->modified(bm);
++}
++
++/** Plot a bitmap made for this redraw, then let it go: the knockout
++ * plotter draws later from the pointer it keeps, so it is flushed
++ * first. */
++static bool html_plot_made(const struct redraw_context *ctx,
++		struct bitmap *bm, int x, int y)
++{
++	nserror res = ctx->plot->bitmap(ctx, bm, x, y,
++			guit->bitmap->get_width(bm),
++			guit->bitmap->get_height(bm), 0, BITMAPF_NONE);
++
++	if (ctx->plot->flush != NULL)
++		ctx->plot->flush(ctx);
++	guit->bitmap->destroy(bm);
++	return res == NSERROR_OK;
++}
++
++/**
++ * Paint an area aside and plot it cut to a shape.
++ *
++ * \param ctx    the redraw context it is plotted through
++ * \param area   the area, device coordinates
++ * \param clip   the clip in force
++ * \param scale  the redraw's scale
++ * \param shape  the shape to cut to
++ * \param draw   paints what is in the area
++ * \param pw     passed to draw
++ * \param done   set to false if nothing was done and the caller is
++ *               to paint the area as it would have
++ * \return false on a plotting error
++ */
++static bool html_composite(const struct redraw_context *ctx,
++		const struct rect *area, const struct rect *clip, float scale,
++		const struct html_shape *shape,
++		bool (*draw)(const struct redraw_context *ctx, void *pw,
++			int dx, int dy, int ox, int oy,
++			const struct rect *clip),
++		void *pw, bool *done)
++{
++	struct bitmap *bm;
++	int ox = 0, oy = 0;
++
++	*done = false;
++	if (!html_composite_raster(area, clip, scale, draw, pw, &bm, &ox,
++			&oy)) {
++		*done = true;
++		return true;
++	}
++	if (bm == NULL)
++		return true;
++	html_shape_apply(bm, ox, oy, shape);
++	*done = true;
++	return html_plot_made(ctx, bm, ox, oy);
++}
++
++/** The padding box of a box with rounded corners, as a shape: the
++ * corners' radii less the borders (VitaSurf). */
++static bool html_padding_shape(const html_content *html,
++		const struct box *box, int x, int y, int padding_width,
++		int padding_height, int bl, int bt, int br, int bb, float scale,
++		struct html_shape *s)
++{
++	struct rect border_box;
++	struct html_corner_radii r;
++
++	border_box.x0 = x - bl;
++	border_box.y0 = y - bt;
++	border_box.x1 = x + padding_width + br;
++	border_box.y1 = y + padding_height + bb;
++	if (box->style == NULL || !html_box_corner_radii(box, &border_box,
++			&html->unit_len_ctx, scale, &r))
++		return false;
++
++#define HTML_SHRINK(v, by) v = (v) > (by) ? (v) - (by) : 0
++	HTML_SHRINK(r.tl_h, bl); HTML_SHRINK(r.tl_v, bt);
++	HTML_SHRINK(r.tr_h, br); HTML_SHRINK(r.tr_v, bt);
++	HTML_SHRINK(r.br_h, br); HTML_SHRINK(r.br_v, bb);
++	HTML_SHRINK(r.bl_h, bl); HTML_SHRINK(r.bl_v, bb);
++#undef HTML_SHRINK
++	if ((r.tl_h == 0 || r.tl_v == 0) && (r.tr_h == 0 || r.tr_v == 0) &&
++			(r.br_h == 0 || r.br_v == 0) &&
++			(r.bl_h == 0 || r.bl_v == 0))
++		return false;
++
++	s->ellipse = false;
++	s->x0 = x;
++	s->y0 = y;
++	s->x1 = x + padding_width;
++	s->y1 = y + padding_height;
++	s->r = r;
++	return true;
++}
++
++/**
++ * Whether anything painted inside a box reaches into one of the corner
++ * squares of its shape (VitaSurf): a background, a border or a replaced
++ * object. Text keeps clear of the corners behind the padding, so a
++ * card that holds only text need not be painted aside; one whose image
++ * runs to its top edge must be. At most a few hundred boxes are looked
++ * at, and a box too busy to check is taken to reach them.
++ */
++static bool html_corners_touched(const struct box *box, int ox, int oy,
++		float scale, const struct html_shape *s, int *budget)
++{
++	const struct box *c;
++
++	for (c = box->children; c != NULL; c = c->next) {
++		int x0, y0, x1, y1;
++		bool paints;
++
++		if (--*budget <= 0)
++			return true;
++		x0 = (int) ((ox + c->x - c->border[LEFT].width) * scale);
++		y0 = (int) ((oy + c->y - c->border[TOP].width) * scale);
++		x1 = (int) ((ox + c->x + c->padding[LEFT] + c->width +
++				c->padding[RIGHT] + c->border[RIGHT].width) *
++				scale);
++		y1 = (int) ((oy + c->y + c->padding[TOP] + c->height +
++				c->padding[BOTTOM] + c->border[BOTTOM].width) *
++				scale);
++
++		paints = c->object != NULL || c->gadget != NULL ||
++				(c->style != NULL &&
++				 (html_redraw_box_has_background(
++						(struct box *) c) ||
++				  c->border[TOP].width || c->border[LEFT].width ||
++				  c->border[RIGHT].width ||
++				  c->border[BOTTOM].width));
++		if (paints && (
++			(x0 < s->x0 + s->r.tl_h && y0 < s->y0 + s->r.tl_v) ||
++			(x1 > s->x1 - s->r.tr_h && y0 < s->y0 + s->r.tr_v) ||
++			(x1 > s->x1 - s->r.br_h && y1 > s->y1 - s->r.br_v) ||
++			(x0 < s->x0 + s->r.bl_h && y1 > s->y1 - s->r.bl_v)))
++			return true;
++		if (c->children != NULL && html_corners_touched(c,
++				ox + c->x, oy + c->y, scale, s, budget))
++			return true;
++	}
++	return false;
++}
++
++
++/** A replaced object, painted aside (VitaSurf). */
++struct html_composite_object {
++	struct hlcache_handle *object;
++	const struct content_redraw_data *data;
++};
++
++static bool html_composite_object_draw(const struct redraw_context *ctx,
++		void *pw, int dx, int dy, int ox, int oy,
++		const struct rect *clip)
++{
++	struct html_composite_object *o = pw;
++	struct content_redraw_data data = *o->data;
++
++	(void) dx;
++	(void) dy;
++	data.x -= ox;
++	data.y -= oy;
++	return content_redraw(o->object, &data, clip, ctx);
++}
++
++/** A box's children, or the box itself, painted aside (VitaSurf). */
++struct html_composite_boxes {
++	const html_content *html;
++	struct box *box;
++	int x_parent, y_parent;
++	float scale;
++	colour bg;
++	bool whole;
++};
++
++static bool html_composite_boxes_draw(const struct redraw_context *ctx,
++		void *pw, int dx, int dy, int ox, int oy,
++		const struct rect *clip)
++{
++	struct html_composite_boxes *b = pw;
++
++	(void) ox;
++	(void) oy;
++	if (b->whole)
++		return html_redraw_box(b->html, b->box, b->x_parent - dx,
++				b->y_parent - dy, clip, b->scale, b->bg, ctx);
++	return html_redraw_box_children(b->html, b->box, b->x_parent - dx,
++			b->y_parent - dy, clip, b->scale, b->bg, ctx);
++}
++
++/** A clip-path radius in device pixels: a percentage of the basis, a
++ * length, or closest-side (-1px) or farthest-side (-2px) from the
++ * distances to the sides given. */
++static float html_clip_radius(const html_content *html,
++		const struct box *box, css_fixed v, css_unit u, float basis,
++		float nearest, float farthest, float scale)
++{
++	if (u == CSS_UNIT_PX && v == INTTOFIX(-1))
++		return nearest;
++	if (u == CSS_UNIT_PX && v == INTTOFIX(-2))
++		return farthest;
++	if (u == CSS_UNIT_PCT)
++		return basis * FIXTOFLT(v) / 100.0f;
++	return FIXTOFLT(css_unit_len2device_px(box->style,
++			&html->unit_len_ctx, v, u)) * scale;
++}
++
++/**
++ * Paint a box cut to its clip-path circle() or ellipse() (VitaSurf).
++ *
++ * \return true if it was painted, with *ok the result
++ */
++static bool html_redraw_clip_shape(const html_content *html,
++		struct box *box, int x_parent, int y_parent,
++		const struct rect *clip, float scale, colour bg,
++		const struct redraw_context *ctx, bool *ok)
++{
++	css_fixed v[4];
++	css_unit u[4];
++	uint8_t type;
++	struct html_shape shape;
++	struct html_composite_boxes pw;
++	const struct box *outer;
++	struct rect area;
++	float x0, y0, w, h, dl, dr, dt, db;
++	bool done;
++
++	if (box->style == NULL || vitasurf_raster == NULL ||
++			box == html_composite_active)
++		return false;
++	type = css_computed_clip_path(box->style, &v[0], &u[0], &v[1], &u[1],
++			&v[2], &u[2], &v[3], &u[3]);
++	if (type != CSS_CLIP_PATH_CIRCLE && type != CSS_CLIP_PATH_ELLIPSE)
++		return false;
++
++	x0 = (x_parent + box->x - box->border[LEFT].width) * scale;
++	y0 = (y_parent + box->y - box->border[TOP].width) * scale;
++	w = (box->border[LEFT].width + box->padding[LEFT] + box->width +
++			box->padding[RIGHT] + box->border[RIGHT].width) * scale;
++	h = (box->border[TOP].width + box->padding[TOP] + box->height +
++			box->padding[BOTTOM] + box->border[BOTTOM].width) * scale;
++
++	shape.ellipse = true;
++	shape.cx = x0 + html_clip_radius(html, box, v[2], u[2], w, 0, 0, scale);
++	shape.cy = y0 + html_clip_radius(html, box, v[3], u[3], h, 0, 0, scale);
++	dl = shape.cx - x0;
++	dr = x0 + w - shape.cx;
++	dt = shape.cy - y0;
++	db = y0 + h - shape.cy;
++	if (type == CSS_CLIP_PATH_CIRCLE) {
++		/* a percentage is of the box's diagonal over root two */
++		float basis = sqrtf((w * w + h * h) / 2.0f);
++		float nearest = fminf(fminf(dl, dr), fminf(dt, db));
++		float farthest = fmaxf(fmaxf(dl, dr), fmaxf(dt, db));
++
++		shape.ex = shape.ey = html_clip_radius(html, box, v[0], u[0],
++				basis, nearest, farthest, scale);
++	} else {
++		shape.ex = html_clip_radius(html, box, v[0], u[0], w,
++				fminf(dl, dr), fmaxf(dl, dr), scale);
++		shape.ey = html_clip_radius(html, box, v[1], u[1], h,
++				fminf(dt, db), fmaxf(dt, db), scale);
++	}
++
++	area.x0 = (int) x0;
++	area.y0 = (int) y0;
++	area.x1 = (int) (x0 + w + 0.5f);
++	area.y1 = (int) (y0 + h + 0.5f);
++
++	pw.html = html;
++	pw.box = box;
++	pw.x_parent = x_parent;
++	pw.y_parent = y_parent;
++	pw.scale = scale;
++	pw.bg = bg;
++	pw.whole = true;
++	outer = html_composite_active;
++	html_composite_active = box;
++	*ok = html_composite(ctx, &area, clip, scale, &shape,
++			html_composite_boxes_draw, &pw, &done);
++	html_composite_active = outer;
++	return done;
++}
++
++
++/**
++ * An empty text field's placeholder (VitaSurf): the placeholder
++ * attribute's text in the field's font, at the field's text origin,
++ * its colour the text colour taken halfway to the background, as
++ * browsers draw it when ::placeholder says nothing else.
++ */
++static bool html_redraw_placeholder(const html_content *html,
++		struct box *box, int x, int y, int padding_width,
++		int padding_height, float scale, colour bg,
++		const struct rect *clip, const struct redraw_context *ctx)
++{
++	dom_string *ph = NULL;
++	plot_font_style_t fstyle;
++	struct rect r = *clip;
++	int px, tx, ty;
++	colour fg;
++	nserror res;
++
++	if (box->node == NULL || box->style == NULL ||
++			box->gadget->data.text.ta == NULL ||
++			textarea_get_text(box->gadget->data.text.ta,
++					NULL, 0) > 1)
++		return true;
++	if (dom_element_get_attribute(box->node, corestring_dom_placeholder,
++			&ph) != DOM_NO_ERR || ph == NULL)
++		return true;
++	if (dom_string_byte_length(ph) == 0) {
++		dom_string_unref(ph);
++		return true;
++	}
++
++	font_plot_style_from_css(&html->unit_len_ctx, box->style, &fstyle);
++	fg = fstyle.foreground;
++	if (bg == NS_TRANSPARENT)
++		bg = 0xffffff;
++	fstyle.foreground =
++		((((fg & 0xff) + (bg & 0xff)) / 2) & 0xff) |
++		(((((fg >> 8) & 0xff) + ((bg >> 8) & 0xff)) / 2) << 8) |
++		(((((fg >> 16) & 0xff) + ((bg >> 16) & 0xff)) / 2) << 16);
++	fstyle.background = bg;
++	fstyle.size *= scale;
++	px = (int) (plot_style_fixed_to_float(fstyle.size) *
++			FIXTOFLT(nscss_screen_dpi) / 72.0f + 0.5f);
++
++	/* the field's text starts four pixels in (box_textarea.c) */
++	tx = x + 4 * scale;
++	if (box->gadget->type == GADGET_TEXTAREA)
++		ty = y + 4 * scale + px;
++	else
++		ty = y + (padding_height + px * 7 / 10) / 2;
++
++	if (r.x0 < x) r.x0 = x;
++	if (r.y0 < y) r.y0 = y;
++	if (r.x1 > x + padding_width) r.x1 = x + padding_width;
++	if (r.y1 > y + padding_height) r.y1 = y + padding_height;
++	if (r.x0 >= r.x1 || r.y0 >= r.y1) {
++		dom_string_unref(ph);
++		return true;
++	}
++	res = ctx->plot->clip(ctx, &r);
++	if (res == NSERROR_OK)
++		res = ctx->plot->text(ctx, &fstyle, tx, ty,
++				dom_string_data(ph),
++				dom_string_byte_length(ph));
++	if (res == NSERROR_OK)
++		res = ctx->plot->clip(ctx, clip);
++	/* the knockout plotter keeps the text's pointer until it
++	 * flushes, and the string is released here */
++	if (res == NSERROR_OK && ctx->plot->flush != NULL)
++		res = ctx->plot->flush(ctx);
++	dom_string_unref(ph);
++	return res == NSERROR_OK;
++}
++
++
++/** A box's border box, in device coordinates (VitaSurf). */
++static void html_border_box_device(const struct box *box, int x_parent,
++		int y_parent, float scale, struct rect *r)
++{
++	r->x0 = (int) ((x_parent + box->x - box->border[LEFT].width) *
++			scale);
++	r->y0 = (int) ((y_parent + box->y - box->border[TOP].width) *
++			scale);
++	r->x1 = (int) ((x_parent + box->x + box->padding[LEFT] + box->width +
++			box->padding[RIGHT] + box->border[RIGHT].width) *
++			scale + 0.5f);
++	r->y1 = (int) ((y_parent + box->y + box->padding[TOP] +
++			box->height + box->padding[BOTTOM] +
++			box->border[BOTTOM].width) * scale + 0.5f);
++}
++
++/**
++ * backdrop-filter (VitaSurf): what is already on the screen behind the
++ * box is read back, blurred and recoloured as the filter says, cut to
++ * the box's rounded border box and put back, before the box paints its
++ * own background over it. Frosted headers and menus are made this way.
++ * Without a surface to read back, the box paints as it would.
++ */
++static bool html_redraw_backdrop(const html_content *html,
++		const struct box *box, int x_parent, int y_parent,
++		const struct rect *clip, float scale,
++		const struct redraw_context *ctx)
++{
++	lwc_string *spec = NULL;
++	struct html_paint_filter f;
++	struct html_shape shape;
++	struct rect bb, area;
++	struct bitmap *bm = NULL;
++	uint8_t *buf;
++	size_t stride;
++	int w, h, x, y;
++
++	if (vitasurf_backdrop == NULL || box->style == NULL ||
++			css_computed_backdrop_filter(box->style, &spec) !=
++					CSS_BACKDROP_FILTER_SET || spec == NULL ||
++			!html_paint_filter_parse(lwc_string_data(spec), &f))
++		return true;
++
++	html_border_box_device(box, x_parent, y_parent, scale, &bb);
++	area = bb;
++	if (area.x0 < clip->x0) area.x0 = clip->x0;
++	if (area.y0 < clip->y0) area.y0 = clip->y0;
++	if (area.x1 > clip->x1) area.x1 = clip->x1;
++	if (area.y1 > clip->y1) area.y1 = clip->y1;
++	if (area.x0 >= area.x1 || area.y0 >= area.y1 ||
++			(area.x1 - area.x0) * (area.y1 - area.y0) >
++					HTML_COMPOSITE_MAX)
++		return true;
++
++	if (ctx->plot->flush != NULL)
++		ctx->plot->flush(ctx);
++	if (vitasurf_backdrop(&area, &bm) != NSERROR_OK || bm == NULL)
++		return true;
++	buf = guit->bitmap->get_buffer(bm);
++	stride = guit->bitmap->get_rowstride(bm);
++	w = guit->bitmap->get_width(bm);
++	h = guit->bitmap->get_height(bm);
++	if (buf == NULL) {
++		guit->bitmap->destroy(bm);
++		return true;
++	}
++
++	if (f.blur > 0) {
++		int radius = (int) (f.blur * scale);
++		int span = w > h ? w : h;
++		uint8_t *tmp = malloc((size_t) span * 4);
++
++		if (radius > 64)
++			radius = 64;
++		if (tmp != NULL && radius > 0) {
++			html_filter_blur_pass(buf, w, h, stride, radius, tmp);
++			html_filter_blur_pass(buf, w, h, stride,
++					(radius + 1) / 2, tmp);
++		}
++		free(tmp);
++	}
++	if (f.colour) {
++		for (y = 0; y < h; y++) {
++			uint8_t *px = buf + y * stride;
++
++			for (x = 0; x < w; x++, px += 4) {
++				int r = px[bitmap_layout.r];
++				int g = px[bitmap_layout.g];
++				int b = px[bitmap_layout.b];
++				const int32_t *m = f.m;
++
++				px[bitmap_layout.r] = html_filter_clamp(
++					(m[0] * r + m[1] * g + m[2] * b) /
++					4096 + m[3] * 255 / 4096);
++				px[bitmap_layout.g] = html_filter_clamp(
++					(m[4] * r + m[5] * g + m[6] * b) /
++					4096 + m[7] * 255 / 4096);
++				px[bitmap_layout.b] = html_filter_clamp(
++					(m[8] * r + m[9] * g + m[10] * b) /
++					4096 + m[11] * 255 / 4096);
++			}
++		}
++	}
++	guit->bitmap->modified(bm);
++
++	/* cut to the border box's corners */
++	if (html_box_corner_radii(box, &bb, &html->unit_len_ctx, scale,
++			&shape.r)) {
++		shape.ellipse = false;
++		shape.x0 = bb.x0;
++		shape.y0 = bb.y0;
++		shape.x1 = bb.x1;
++		shape.y1 = bb.y1;
++		html_shape_apply(bm, area.x0, area.y0, &shape);
++	}
++	return html_plot_made(ctx, bm, area.x0, area.y0);
++}
++
++/** One channel of a separable blend mode, 0..255 (VitaSurf). */
++static int html_blend_channel(uint8_t mode, int s, int b)
++{
++	switch (mode) {
++	case CSS_MIX_BLEND_MODE_MULTIPLY:
++		return s * b / 255;
++	case CSS_MIX_BLEND_MODE_SCREEN:
++		return s + b - s * b / 255;
++	case CSS_MIX_BLEND_MODE_OVERLAY:
++		return b < 128 ? 2 * s * b / 255 :
++				255 - 2 * (255 - s) * (255 - b) / 255;
++	case CSS_MIX_BLEND_MODE_DARKEN:
++		return s < b ? s : b;
++	case CSS_MIX_BLEND_MODE_LIGHTEN:
++		return s > b ? s : b;
++	case CSS_MIX_BLEND_MODE_COLOR_DODGE:
++		return b == 0 ? 0 : s == 255 ? 255 :
++				html_filter_clamp(b * 255 / (255 - s));
++	case CSS_MIX_BLEND_MODE_COLOR_BURN:
++		return b == 255 ? 255 : s == 0 ? 0 :
++				255 - html_filter_clamp((255 - b) * 255 / s);
++	case CSS_MIX_BLEND_MODE_HARD_LIGHT:
++		return s < 128 ? 2 * s * b / 255 :
++				255 - 2 * (255 - s) * (255 - b) / 255;
++	case CSS_MIX_BLEND_MODE_SOFT_LIGHT:
++		return html_filter_clamp(((255 - 2 * s) * b / 255 * b +
++				2 * s * b) / 255);
++	case CSS_MIX_BLEND_MODE_DIFFERENCE:
++		return s > b ? s - b : b - s;
++	case CSS_MIX_BLEND_MODE_EXCLUSION:
++		return s + b - 2 * s * b / 255;
++	case CSS_MIX_BLEND_MODE_PLUS_LIGHTER:
++		return s + b > 255 ? 255 : s + b;
++	default:
++		return s;
++	}
++}
++
++/** The non-separable modes: a colour given another's luminosity. */
++static void html_blend_set_lum(int c[3], int lum)
++{
++	int d = lum - (30 * c[0] + 59 * c[1] + 11 * c[2]) / 100;
++	int i;
++
++	for (i = 0; i < 3; i++)
++		c[i] = html_filter_clamp(c[i] + d);
++}
++
++/**
++ * mix-blend-mode (VitaSurf): the box is painted aside, what is on the
++ * screen behind it is read back, and the two are mixed pixel by pixel
++ * as the mode says, the box's own alpha deciding how much of the mix
++ * shows. hue and saturation are taken as color.
++ *
++ * \return true if the box was painted this way, with *ok the result
++ */
++static bool html_redraw_blend(const html_content *html, struct box *box,
++		int x_parent, int y_parent, const struct rect *clip,
++		float scale, colour bg, const struct redraw_context *ctx,
++		bool *ok)
++{
++	struct html_composite_boxes pw;
++	const struct box *outer;
++	struct rect bb, area;
++	struct bitmap *src = NULL, *back = NULL;
++	uint8_t mode, *sb, *bb_buf;
++	size_t ss, bs;
++	int ox = 0, oy = 0, w, h, x, y;
++
++	if (box->style == NULL || vitasurf_raster == NULL ||
++			vitasurf_backdrop == NULL ||
++			box == html_composite_active)
++		return false;
++	mode = css_computed_mix_blend_mode(box->style);
++	if (mode == CSS_MIX_BLEND_MODE_INHERIT ||
++			mode == CSS_MIX_BLEND_MODE_NORMAL)
++		return false;
++
++	html_border_box_device(box, x_parent, y_parent, scale, &bb);
++	pw.html = html;
++	pw.box = box;
++	pw.x_parent = x_parent;
++	pw.y_parent = y_parent;
++	pw.scale = scale;
++	pw.bg = bg;
++	pw.whole = true;
++	outer = html_composite_active;
++	html_composite_active = box;
++	if (!html_composite_raster(&bb, clip, scale,
++			html_composite_boxes_draw, &pw, &src, &ox, &oy)) {
++		html_composite_active = outer;
++		*ok = true;
++		return true;
++	}
++	html_composite_active = outer;
++	if (src == NULL)
++		return false;
++
++	w = guit->bitmap->get_width(src);
++	h = guit->bitmap->get_height(src);
++	area.x0 = ox;
++	area.y0 = oy;
++	area.x1 = ox + w;
++	area.y1 = oy + h;
++	if (ctx->plot->flush != NULL)
++		ctx->plot->flush(ctx);
++	if (vitasurf_backdrop(&area, &back) != NSERROR_OK || back == NULL ||
++			guit->bitmap->get_width(back) != w ||
++			guit->bitmap->get_height(back) != h) {
++		/* nothing to mix with: the box as it is */
++		if (back != NULL)
++			guit->bitmap->destroy(back);
++		*ok = html_plot_made(ctx, src, ox, oy);
++		return true;
++	}
++
++	sb = guit->bitmap->get_buffer(src);
++	bb_buf = guit->bitmap->get_buffer(back);
++	ss = guit->bitmap->get_rowstride(src);
++	bs = guit->bitmap->get_rowstride(back);
++	for (y = 0; y < h && sb != NULL && bb_buf != NULL; y++) {
++		uint8_t *sp = sb + y * ss;
++		uint8_t *bp = bb_buf + y * bs;
++
++		for (x = 0; x < w; x++, sp += 4, bp += 4) {
++			int a = sp[bitmap_layout.a];
++			int s3[3], b3[3], m3[3], i;
++
++			if (a == 0)
++				continue;
++			s3[0] = sp[bitmap_layout.r];
++			s3[1] = sp[bitmap_layout.g];
++			s3[2] = sp[bitmap_layout.b];
++			b3[0] = bp[bitmap_layout.r];
++			b3[1] = bp[bitmap_layout.g];
++			b3[2] = bp[bitmap_layout.b];
++			if (mode == CSS_MIX_BLEND_MODE_LUMINOSITY) {
++				memcpy(m3, b3, sizeof(m3));
++				html_blend_set_lum(m3, (30 * s3[0] +
++						59 * s3[1] + 11 * s3[2]) / 100);
++			} else if (mode == CSS_MIX_BLEND_MODE_COLOR ||
++					mode == CSS_MIX_BLEND_MODE_HUE ||
++					mode == CSS_MIX_BLEND_MODE_SATURATION) {
++				memcpy(m3, s3, sizeof(m3));
++				html_blend_set_lum(m3, (30 * b3[0] +
++						59 * b3[1] + 11 * b3[2]) / 100);
++			} else {
++				for (i = 0; i < 3; i++)
++					m3[i] = html_blend_channel(mode, s3[i],
++							b3[i]);
++			}
++			bp[bitmap_layout.r] = (uint8_t) ((b3[0] * (255 - a) +
++					m3[0] * a) / 255);
++			bp[bitmap_layout.g] = (uint8_t) ((b3[1] * (255 - a) +
++					m3[1] * a) / 255);
++			bp[bitmap_layout.b] = (uint8_t) ((b3[2] * (255 - a) +
++					m3[2] * a) / 255);
++		}
++	}
++	guit->bitmap->destroy(src);
++	guit->bitmap->modified(back);
++	*ok = html_plot_made(ctx, back, ox, oy);
++	return true;
++}
++
++
++/** The mask drawn aside, white where it lets the box through. */
++struct html_mask_job {
++	struct hlcache_handle *mask;
++	struct content_redraw_data data;
++	struct rect clip;
++};
++
++static bool html_mask_draw(const struct redraw_context *ctx, void *pw)
++{
++	struct html_mask_job *j = pw;
++
++	return content_redraw(j->mask, &j->data, &j->clip, ctx);
++}
++
++/**
++ * A mask over a box that holds more than its background colour
++ * (VitaSurf): the box and everything in it is painted aside, the mask
++ * is drawn aside in white, and the box's alpha is multiplied by the
++ * mask's. html_redraw_mask keeps the plainer case, a background colour
++ * shown through the mask, which is how icons are drawn.
++ *
++ * \return true if the box was painted this way, with *ok the result
++ */
++static bool html_redraw_mask_all(const html_content *html, struct box *box,
++		int x_parent, int y_parent, const struct rect *clip,
++		float scale, colour bg, const struct redraw_context *ctx,
++		bool *ok)
++{
++	struct html_composite_boxes pw;
++	struct html_mask_job job;
++	const struct box *outer;
++	struct rect bb;
++	struct bitmap *src = NULL, *mbm = NULL;
++	uint8_t *sb, *mb;
++	size_t ss, ms;
++	int x, y, pwid, phei, ox = 0, oy = 0, w, h, i, j;
++
++	if (vitasurf_raster == NULL || box == html_composite_active ||
++			!html_box_masked(box) || box->children == NULL)
++		return false;
++
++	x = (x_parent + box->x) * scale;
++	y = (y_parent + box->y) * scale;
++	pwid = (box->padding[LEFT] + box->width + box->padding[RIGHT]) * scale;
++	phei = (box->padding[TOP] + box->height + box->padding[BOTTOM]) *
++			scale;
++	if (!html_mask_place(x, y, pwid, phei, box, scale,
++			&html->unit_len_ctx, &job.data)) {
++		/* a mask not yet here hides the box */
++		*ok = true;
++		return true;
++	}
++
++	html_border_box_device(box, x_parent, y_parent, scale, &bb);
++	pw.html = html;
++	pw.box = box;
++	pw.x_parent = x_parent;
++	pw.y_parent = y_parent;
++	pw.scale = scale;
++	pw.bg = bg;
++	pw.whole = true;
++	outer = html_composite_active;
++	html_composite_active = box;
++	if (!html_composite_raster(&bb, clip, scale,
++			html_composite_boxes_draw, &pw, &src, &ox, &oy)) {
++		html_composite_active = outer;
++		*ok = true;
++		return true;
++	}
++	html_composite_active = outer;
++	if (src == NULL)
++		return false;
++
++	w = guit->bitmap->get_width(src);
++	h = guit->bitmap->get_height(src);
++	job.mask = box->mask;
++	job.data.x -= ox;
++	job.data.y -= oy;
++	job.data.background_colour = 0xffffff;
++	job.data.mask = true;
++	job.data.mask_colour = 0xffffff;
++	job.clip.x0 = x - ox;
++	job.clip.y0 = y - oy;
++	job.clip.x1 = x - ox + pwid;
++	job.clip.y1 = y - oy + phei;
++	if (vitasurf_raster(w, h, html_mask_draw, &job, &mbm) != NSERROR_OK ||
++			mbm == NULL) {
++		guit->bitmap->destroy(src);
++		return false;
++	}
++
++	sb = guit->bitmap->get_buffer(src);
++	mb = guit->bitmap->get_buffer(mbm);
++	ss = guit->bitmap->get_rowstride(src);
++	ms = guit->bitmap->get_rowstride(mbm);
++	for (j = 0; j < h && sb != NULL && mb != NULL; j++) {
++		uint8_t *sp = sb + j * ss;
++		const uint8_t *mp = mb + j * ms;
++
++		for (i = 0; i < w; i++, sp += 4, mp += 4)
++			sp[bitmap_layout.a] = (uint8_t)
++				(sp[bitmap_layout.a] * mp[bitmap_layout.a] /
++				 255);
++	}
++	guit->bitmap->destroy(mbm);
++	guit->bitmap->set_opaque(src, false);
++	guit->bitmap->modified(src);
++	*ok = html_plot_made(ctx, src, ox, oy);
++	return true;
++}
++
++
++/**
++ * One piece of a border image (VitaSurf): the part of the source from
++ * sx0 to sx1 across and sy0 to sy1 down, source pixels, into the
++ * device rectangle d, stretched, or repeated along an axis whose flag
++ * is set. The whole source is drawn, scaled so that the part lands on
++ * the piece, clipped to the piece.
++ */
++static bool html_border_image_piece(struct hlcache_handle *img,
++		const char *gradient, const struct rect *bb, float iw, float ih,
++		float sx0, float sx1, float sy0, float sy1,
++		const struct rect *d, bool tile_x, bool tile_y, float scale,
++		const struct rect *clip, const struct redraw_context *ctx)
++{
++	struct rect pc = *d;
++	float sw = sx1 - sx0, sh = sy1 - sy0;
++	float kx, ky, tw, th, x, y;
++	int dw = d->x1 - d->x0, dh = d->y1 - d->y0;
++
++	if (dw <= 0 || dh <= 0 || sw <= 0.0f || sh <= 0.0f)
++		return true;
++	if (pc.x0 < clip->x0) pc.x0 = clip->x0;
++	if (pc.y0 < clip->y0) pc.y0 = clip->y0;
++	if (pc.x1 > clip->x1) pc.x1 = clip->x1;
++	if (pc.y1 > clip->y1) pc.y1 = clip->y1;
++	if (pc.x0 >= pc.x1 || pc.y0 >= pc.y1)
++		return true;
++
++	if (gradient != NULL) {
++		/* a gradient is as big as the border box, and each piece
++		 * shows the part of it that lies there */
++		if (ctx->plot->clip(ctx, &pc) != NSERROR_OK)
++			return false;
++		return html_redraw_gradient(gradient, bb, &pc, ctx);
++	}
++
++	kx = dw / sw;
++	ky = dh / sh;
++	/* a repeated edge keeps the source's proportions along it */
++	if (tile_x && !tile_y)
++		kx = ky;
++	if (tile_y && !tile_x)
++		ky = kx;
++	tw = sw * kx;
++	th = sh * ky;
++	if (tw < 1.0f || th < 1.0f)
++		return true;
++
++	if (ctx->plot->clip(ctx, &pc) != NSERROR_OK)
++		return false;
++	for (y = d->y0; y < d->y1; y += th) {
++		for (x = d->x0; x < d->x1; x += tw) {
++			struct content_redraw_data data;
++			struct rect tc = pc;
++
++			memset(&data, 0, sizeof(data));
++			data.x = (int) (x - sx0 * kx);
++			data.y = (int) (y - sy0 * ky);
++			data.width = (int) (iw * kx + 0.5f);
++			data.height = (int) (ih * ky + 0.5f);
++			data.background_colour = NS_TRANSPARENT;
++			data.scale = scale;
++			if (tc.x0 < (int) x) tc.x0 = (int) x;
++			if (tc.y0 < (int) y) tc.y0 = (int) y;
++			if (tc.x1 > (int) (x + tw + 0.5f))
++				tc.x1 = (int) (x + tw + 0.5f);
++			if (tc.y1 > (int) (y + th + 0.5f))
++				tc.y1 = (int) (y + th + 0.5f);
++			if (tc.x0 < tc.x1 && tc.y0 < tc.y1) {
++				if (ctx->plot->clip(ctx, &tc) != NSERROR_OK)
++					return false;
++				content_redraw(img, &data, &tc, ctx);
++			}
++			if (!tile_x)
++				break;
++		}
++		if (!tile_y)
++			break;
++	}
++	return true;
++}
++
++/**
++ * border-image (VitaSurf): the source cut into nine by the slice, the
++ * corners into the border's corners, the edges along its sides,
++ * stretched or repeated as border-image-repeat says (round and space
++ * repeat), and the middle over the padding box if the slice says fill.
++ * The border's own widths are the widths the image is drawn at.
++ *
++ * \return true if the border image was painted in place of the border
++ */
++static bool html_redraw_border_image(const html_content *html,
++		struct box *box, int x, int y, int padding_width,
++		int padding_height, int bl, int bt, int br, int bb_,
++		float scale, const struct rect *clip,
++		const struct redraw_context *ctx, bool *ok)
++{
++	lwc_string *src = NULL, *slice = NULL;
++	const char *gradient = NULL;
++	struct hlcache_handle *img = NULL;
++	struct rect bb, d;
++	float iw, ih, s[4], sx[4], sy[4];
++	int dx[4], dy[4], v[4] = { 100, 100, 100, 100 }, mask = 15, fill = 0;
++	int i, j;
++	uint8_t rep;
++	bool tile_h, tile_v;
++
++	*ok = true;
++	if (box->style == NULL || css_computed_border_image_source(box->style,
++			&src) != CSS_BORDER_IMAGE_SOURCE_SET || src == NULL)
++		return false;
++	if (strncmp(lwc_string_data(src), "gradient:", 9) == 0) {
++		gradient = lwc_string_data(src) + 9;
++	} else {
++		img = box->border_image;
++		if (img == NULL ||
++		    (content_get_status(img) != CONTENT_STATUS_READY &&
++		     content_get_status(img) != CONTENT_STATUS_DONE))
++			/* the border until the image is here */
++			return false;
++	}
++
++	bb.x0 = x - bl;
++	bb.y0 = y - bt;
++	bb.x1 = x + padding_width + br;
++	bb.y1 = y + padding_height + bb_;
++	if (gradient != NULL) {
++		iw = bb.x1 - bb.x0;
++		ih = bb.y1 - bb.y0;
++	} else {
++		iw = content_get_width(img);
++		ih = content_get_height(img);
++	}
++	if (iw <= 0 || ih <= 0)
++		return false;
++
++	if (css_computed_border_image_slice(box->style, &slice) ==
++			CSS_BORDER_IMAGE_SLICE_SET && slice != NULL) {
++		sscanf(lwc_string_data(slice), "%d,%d,%d,%d,%d,%d", &v[0],
++				&v[1], &v[2], &v[3], &mask, &fill);
++	}
++	/* a slice in pixels of the source; a gradient's source pixels are
++	 * the device's */
++	for (i = 0; i < 4; i++) {
++		float basis = (i == 0 || i == 2) ? ih : iw;
++
++		if (mask & (1 << i))
++			s[i] = basis * v[i] / 100.0f;
++		else
++			s[i] = gradient != NULL ? v[i] * scale : v[i];
++		if (s[i] > basis)
++			s[i] = basis;
++	}
++	sx[0] = 0; sx[1] = s[3]; sx[2] = iw - s[1]; sx[3] = iw;
++	sy[0] = 0; sy[1] = s[0]; sy[2] = ih - s[2]; sy[3] = ih;
++	dx[0] = bb.x0; dx[1] = bb.x0 + bl; dx[2] = bb.x1 - br; dx[3] = bb.x1;
++	dy[0] = bb.y0; dy[1] = bb.y0 + bt; dy[2] = bb.y1 - bb_; dy[3] = bb.y1;
++
++	rep = css_computed_border_image_repeat(box->style);
++	if (rep == CSS_BORDER_IMAGE_REPEAT_INHERIT)
++		rep = CSS_BORDER_IMAGE_REPEAT_STRETCH;
++	tile_h = ((rep - 1) & 3) != 0;
++	tile_v = (((rep - 1) >> 2) & 3) != 0;
++
++	for (j = 0; j < 3 && *ok; j++) {
++		for (i = 0; i < 3 && *ok; i++) {
++			if (i == 1 && j == 1 && !fill)
++				continue;
++			d.x0 = dx[i];
++			d.x1 = dx[i + 1];
++			d.y0 = dy[j];
++			d.y1 = dy[j + 1];
++			*ok = html_border_image_piece(img, gradient, &bb, iw,
++					ih, sx[i], sx[i + 1], sy[j], sy[j + 1],
++					&d, i == 1 && tile_h, j == 1 && tile_v,
++					scale, clip, ctx);
++		}
++	}
++	if (*ok)
++		*ok = ctx->plot->clip(ctx, clip) == NSERROR_OK;
++	return true;
++}
++
++
+ /** Whether a box is set aside for its stacking context's later pass. */
+ static bool html_z_deferrable(const struct box *box)
+ {
+@@ -3745,6 +5006,7 @@ static bool html_z_defer(struct box *box, int x_parent, int y_parent,
+ 	struct html_z_entry *e;
+ 
+ 	if (l == NULL || box == l->root || box == html_z_painting ||
++			box == html_composite_active ||
+ 			!html_z_deferrable(box))
+ 		return false;
+ 	if (l->n == l->alloc) {
+@@ -3826,6 +5088,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	const int32_t *m = NULL;
+ 	bool pushed = false;
+ 	int transformed;
++	bool vertical;
+ 	bool ok;
+ 	bool context;
+ 	struct html_z_list *z_outer = html_z_top, *zl = NULL;
+@@ -3837,6 +5100,27 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			current_background_color, ctx))
+ 		return true;
+ 
++	/* a box cut to a clip-path circle or ellipse (VitaSurf) */
++	if (html_redraw_clip_shape(html, box, x_parent, y_parent, clip, scale,
++			current_background_color, ctx, &ok))
++		return ok;
++
++	/* a mask over more than a background colour (VitaSurf) */
++	if (html_redraw_mask_all(html, box, x_parent, y_parent, clip, scale,
++			current_background_color, ctx, &ok))
++		return ok;
++
++	/* a box mixed with what is behind it (VitaSurf) */
++	if (html_redraw_blend(html, box, x_parent, y_parent, clip, scale,
++			current_background_color, ctx, &ok))
++		return ok;
++
++	/* what is behind the box, filtered, under it (VitaSurf) */
++	if (box != html_composite_active &&
++			!html_redraw_backdrop(html, box, x_parent, y_parent,
++				clip, scale, ctx))
++		return false;
++
+ 	if (box->style != NULL) {
+ 		css_fixed op = INTTOFIX(1);
+ 
+@@ -3890,6 +5174,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	/* the root, a positioned box with a z-index, and one painted
+ 	 * through a level start a stacking context */
+ 	context = box == html->layout || pushed || transformed > 0 ||
++			box == html_composite_active ||
+ 			(box->style != NULL &&
+ 			 css_computed_position(box->style) !=
+ 					CSS_POSITION_STATIC &&
+@@ -3906,9 +5191,26 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		html_z_top = NULL;
+ 	}
+ 
++	/* a vertical box is painted as it was laid out, its lines across,
++	 * and turned by its level (VitaSurf) */
++	vertical = transformed > 0 && box_vertical(box) != 0;
++	if (vertical) {
++		int t = box->width;
++
++		box->width = box->height;
++		box->height = t;
++	}
++
+ 	ok = html_redraw_box_inner(html, box, x_parent, y_parent, clip, scale,
+ 			current_background_color, ctx);
+ 
++	if (vertical) {
++		int t = box->width;
++
++		box->width = box->height;
++		box->height = t;
++	}
++
+ 	if (zl != NULL) {
+ 		ok &= html_z_flush(html, zl, scale);
+ 		/* the entries' memory stays with the level for the next
+@@ -4297,7 +5599,7 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	/* A box with a CSS mask paints only its background colour through
+ 	 * the mask; borders, text and children are masked out (VitaSurf).
+ 	 * Codex-style icon buttons rely on this. */
+-	if (html_box_masked(box)) {
++	if (html_box_masked(box) && box != html_composite_active) {
+ 		return html_redraw_mask(x, y, padding_width, padding_height,
+ 					box, scale, &r, &html->unit_len_ctx,
+ 					ctx);
+@@ -4433,16 +5735,27 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	       box->gadget->type == GADGET_TEXTBOX ||
+ 	       box->gadget->type == GADGET_PASSWORD))) &&
+ 	    (border_top || border_right || border_bottom || border_left)) {
+-		if (!html_redraw_borders(box, x_parent, y_parent,
+-				padding_width, padding_height, &r,
+-				scale, &html->unit_len_ctx, ctx))
++		bool biok = true;
++
++		/* a border image in place of the border (VitaSurf) */
++		if (!html_redraw_border_image(html, box, x, y, padding_width,
++				padding_height, border_left, border_top,
++				border_right, border_bottom, scale, &r, ctx,
++				&biok)) {
++			if (!html_redraw_borders(box, x_parent, y_parent,
++					padding_width, padding_height, &r,
++					scale, &html->unit_len_ctx, ctx))
++				return false;
++		} else if (!biok) {
+ 			return false;
++		}
+ 	}
+ 
+ 	/*
+-	 * The outline (VitaSurf): a ring outside the border box, drawn
+-	 * solid whatever its style says, since it is nearly always a
+-	 * focus ring or a one pixel edge. outline-offset is not read.
++	 * The outline (VitaSurf): a ring outside the border box, or as far
++	 * outside it as outline-offset says (inside it, for a negative
++	 * one), drawn solid whatever its style says, since it is nearly
++	 * always a focus ring or a one pixel edge.
+ 	 */
+ 	if (box->style != NULL && box->type != BOX_TEXT &&
+ 			box->type != BOX_INLINE && box->type != BOX_INLINE_END &&
+@@ -4469,10 +5782,21 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				.fill_colour = nscss_color_to_ns(ocol),
+ 				.stroke_type = PLOT_OP_TYPE_NONE,
+ 			};
+-			int ox0 = x - border_left - ow;
+-			int oy0 = y - border_top - ow;
+-			int ox1 = x + padding_width + border_right + ow;
+-			int oy1 = y + padding_height + border_bottom + ow;
++			css_fixed olen2 = 0;
++			css_unit ounit2 = CSS_UNIT_PX;
++			int off = 0, ox0, oy0, ox1, oy1;
++
++			if (css_computed_outline_offset(box->style, &olen2,
++					&ounit2) == CSS_OUTLINE_OFFSET_SET) {
++				off = FIXTOINT(css_unit_len2device_px(
++						box->style,
++						&html->unit_len_ctx, olen2,
++						ounit2)) * scale;
++			}
++			ox0 = x - border_left - ow - off;
++			oy0 = y - border_top - ow - off;
++			ox1 = x + padding_width + border_right + ow + off;
++			oy1 = y + padding_height + border_bottom + ow + off;
+ 			struct rect ring[4] = {
+ 				{ ox0, oy0, ox1, oy0 + ow },
+ 				{ ox0, oy1 - ow, ox1, oy1 },
+@@ -4489,6 +5813,57 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		}
+ 	}
+ 
++	/*
++	 * Column rules (VitaSurf): a line in the middle of each gap of a
++	 * multi-column box, the height of its content, drawn solid
++	 * whatever its style says, as the outline is.
++	 */
++	if (box->style != NULL && box->type == BOX_BLOCK &&
++			css_computed_column_rule_style(box->style) !=
++					CSS_COLUMN_RULE_STYLE_NONE &&
++			css_computed_column_rule_style(box->style) !=
++					CSS_COLUMN_RULE_STYLE_HIDDEN &&
++			css_computed_column_rule_style(box->style) !=
++					CSS_COLUMN_RULE_STYLE_INHERIT) {
++		int n = 0, colw = 0, gap = 0, rw = 0;
++		css_color rcol = 0;
++
++		if (layout_multicol_columns(&html->unit_len_ctx, box,
++				box->width, &n, &colw, &gap) &&
++				css_computed_column_rule_width_px(box->style,
++					&html->unit_len_ctx, -1, &rw) ==
++					CSS_COLUMN_RULE_WIDTH_WIDTH) {
++			rw = rw * scale;
++			if (css_computed_column_rule_color(box->style,
++					&rcol) != CSS_COLUMN_RULE_COLOR_COLOR) {
++				css_computed_color(box->style, &rcol);
++			}
++		}
++		if (n > 1 && rw > 0 && !nscss_color_is_transparent(rcol)) {
++			plot_style_t rstyle = {
++				.fill_type = PLOT_OP_TYPE_SOLID,
++				.fill_colour = nscss_color_to_ns(rcol),
++				.stroke_type = PLOT_OP_TYPE_NONE,
++			};
++			int k;
++
++			for (k = 1; k < n; k++) {
++				int mid = box->padding[LEFT] + k * colw +
++						(k - 1) * gap + gap / 2;
++				struct rect line;
++
++				line.x0 = x + mid * scale - rw / 2;
++				line.x1 = line.x0 + rw;
++				line.y0 = y + box->padding[TOP] * scale;
++				line.y1 = y + (box->padding[TOP] +
++						box->height) * scale;
++				if (ctx->plot->rectangle(ctx, &rstyle,
++						&line) != NSERROR_OK)
++					return false;
++			}
++		}
++	}
++
+ 	/* backgrounds and borders for non-replaced inlines */
+ 	if (box->style && box->type == BOX_INLINE && box->inline_end &&
+ 			(html_redraw_box_has_background(box) ||
+@@ -4807,7 +6182,29 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			}
+ 		}
+ 
+-		if (!content_redraw(box->object, &obj_data, &r, ctx)) {
++		/* an image with rounded corners is cut to them
++		 * (VitaSurf) */
++		struct html_shape oshape;
++		bool odone = false;
++
++		if (html_padding_shape(html, box, x_scrolled, y_scrolled,
++				padding_width, padding_height, border_left,
++				border_top, border_right, border_bottom, scale,
++				&oshape)) {
++			struct html_composite_object ow = {
++				box->object, &obj_data
++			};
++			struct rect oarea = {
++				oshape.x0, oshape.y0, oshape.x1, oshape.y1
++			};
++
++			if (!html_composite(ctx, &oarea, &r, scale, &oshape,
++					html_composite_object_draw, &ow, &odone))
++				return false;
++		}
++
++		if (!odone && !content_redraw(box->object, &obj_data, &r,
++				ctx)) {
+ 			/* Show image fail */
+ 			/* Unicode (U+FFFC) 'OBJECT REPLACEMENT CHARACTER' */
+ 			const char *obj = "\xef\xbf\xbc";
+@@ -4884,6 +6281,10 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			box->gadget->type == GADGET_TEXTBOX)) {
+ 		textarea_redraw(box->gadget->data.text.ta, x, y,
+ 				current_background_color, scale, &r, ctx);
++		if (!html_redraw_placeholder(html, box, x, y, padding_width,
++				padding_height, scale, current_background_color,
++				&r, ctx))
++			return false;
+ 
+ 	} else if (box->text) {
+ 		if (!html_redraw_text_box(html, box, x, y, &r, scale,
+@@ -4891,8 +6292,40 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			return false;
+ 
+ 	} else {
+-		if (!html_redraw_box_children(html, box, x_parent, y_parent, &r,
+-				scale, current_background_color, ctx))
++		/* a rounded box that clips its overflow cuts its children
++		 * to its corners (VitaSurf) */
++		struct html_shape cshape;
++		bool cdone = false;
++
++		if (box->style != NULL &&
++				(box_overflow_x(box) != CSS_OVERFLOW_VISIBLE ||
++				 box_overflow_y(box) != CSS_OVERFLOW_VISIBLE) &&
++				html_padding_shape(html, box, x, y,
++					padding_width, padding_height,
++					border_left, border_top, border_right,
++					border_bottom, scale, &cshape) &&
++				html_corners_touched(box,
++					x_parent + box->x -
++					scrollbar_get_offset(box->scroll_x),
++					y_parent + box->y -
++					scrollbar_get_offset(box->scroll_y),
++					scale, &cshape,
++					&(int){ 300 })) {
++			struct html_composite_boxes cw = {
++				html, box, x_parent, y_parent, scale,
++				current_background_color, false
++			};
++			struct rect carea = {
++				cshape.x0, cshape.y0, cshape.x1, cshape.y1
++			};
++
++			if (!html_composite(ctx, &carea, &r, scale, &cshape,
++					html_composite_boxes_draw, &cw, &cdone))
++				return false;
++		}
++		if (!cdone && !html_redraw_box_children(html, box, x_parent,
++				y_parent, &r, scale, current_background_color,
++				ctx))
+ 			return false;
+ 	}
+ 
+@@ -5089,8 +6522,25 @@ uint32_t html_redraw_rank(html_content *html, int x, int y)
+ 	return html_probe_gen;
+ }
+ 
++static bool html_redraw_content(struct content *c,
++		struct content_redraw_data *data,
++		const struct rect *clip, const struct redraw_context *ctx);
++
+ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 		const struct rect *clip, const struct redraw_context *ctx)
++{
++	bool result;
++
++	/* the right-to-left runs drawn last time can go (VitaSurf) */
++	html_bidi_redraw_begin();
++	result = html_redraw_content(c, data, clip, ctx);
++	html_bidi_redraw_end();
++	return result;
++}
++
++static bool html_redraw_content(struct content *c,
++		struct content_redraw_data *data,
++		const struct rect *clip, const struct redraw_context *ctx)
+ {
+ 	html_content *html = (html_content *) c;
+ 	struct box *box;
+diff --git a/desktop/bitmap.h b/desktop/bitmap.h
+index 107b7a992..427199072 100644
+--- a/desktop/bitmap.h
++++ b/desktop/bitmap.h
+@@ -53,12 +53,29 @@ struct redraw_context;
+  * do this defines it; for any other the symbol is NULL and callers keep
+  * plotting as they did.
+  *
+- * eturn NSERROR_OK with the bitmap in *out, or an error and no bitmap
++ * 
++eturn NSERROR_OK with the bitmap in *out, or an error and no bitmap
+  */
+ nserror vitasurf_raster(int width, int height,
+ 		bool (*draw)(const struct redraw_context *ctx, void *pw),
+ 		void *pw, struct bitmap **out) __attribute__((weak));
+ 
++struct rect;
++
++/**
++ * Copy what is on the screen in an area into a new, opaque bitmap
++ * (VitaSurf), for painting that depends on what lies behind a box:
++ * backdrop-filter and mix-blend-mode. The caller flushes its plotters
++ * first. A frontend that can read its surface back defines it; for any
++ * other the symbol is NULL.
++ *
++ * \param area  the area, in the plotters' coordinates
++ * \param out   set to the bitmap
++ * \return NSERROR_OK with the bitmap in *out, or an error and no bitmap
++ */
++nserror vitasurf_backdrop(const struct rect *area, struct bitmap **out)
++		__attribute__((weak));
++
+ /**
+  * Convert a bitmap pixel to a NetSurf colour (0xAARRGGBB).
+  *
+diff --git a/frontends/framebuffer/bitmap.c b/frontends/framebuffer/bitmap.c
+index 8053337f5..52c984bf5 100644
+--- a/frontends/framebuffer/bitmap.c
++++ b/frontends/framebuffer/bitmap.c
+@@ -383,6 +383,67 @@ nserror vitasurf_raster(int width, int height,
+ 	return NSERROR_OK;
+ }
+ 
++/*
++ * vitasurf_backdrop() for the framebuffer (VitaSurf): the pixels already
++ * plotted to the surface in the area, copied out. The surface is the
++ * one the plotters draw to, whose coordinates the redraw uses.
++ */
++nserror vitasurf_backdrop(const struct rect *area, struct bitmap **out)
++{
++	nsfb_t *surf = framebuffer_set_surface(NULL);
++	enum nsfb_format_e fmt = NSFB_FMT_ANY;
++	uint8_t *src, *dst;
++	int stride, sw = 0, sh = 0, w, h, x, y, x0, y0, rbyte;
++	size_t dststride;
++	struct bitmap *bm;
++
++	framebuffer_set_surface(surf);
++	*out = NULL;
++	if (surf == NULL || nsfb_get_buffer(surf, &src, &stride) == -1 ||
++			nsfb_get_geometry(surf, &sw, &sh, &fmt) == -1)
++		return NSERROR_INVALID;
++	switch (fmt) {
++	case NSFB_FMT_XBGR8888:
++	case NSFB_FMT_ABGR8888:
++		rbyte = 0;
++		break;
++	case NSFB_FMT_XRGB8888:
++	case NSFB_FMT_ARGB8888:
++		rbyte = 2;
++		break;
++	default:
++		return NSERROR_NOT_IMPLEMENTED;
++	}
++
++	x0 = area->x0 < 0 ? 0 : area->x0;
++	y0 = area->y0 < 0 ? 0 : area->y0;
++	w = (area->x1 > sw ? sw : area->x1) - x0;
++	h = (area->y1 > sh ? sh : area->y1) - y0;
++	if (w <= 0 || h <= 0)
++		return NSERROR_BAD_PARAMETER;
++
++	bm = bitmap_create(w, h, BITMAP_OPAQUE);
++	if (bm == NULL)
++		return NSERROR_NOMEM;
++	dst = bitmap_get_buffer(bm);
++	dststride = bitmap_get_rowstride(bm);
++	for (y = 0; y < h; y++) {
++		const uint8_t *sp = src + (size_t)(y0 + y) * (size_t)stride +
++				(size_t)x0 * 4;
++		uint8_t *dp = dst + (size_t)y * dststride;
++
++		for (x = 0; x < w; x++, sp += 4, dp += 4) {
++			dp[bitmap_layout.r] = sp[rbyte];
++			dp[bitmap_layout.g] = sp[1];
++			dp[bitmap_layout.b] = sp[2 - rbyte];
++			dp[bitmap_layout.a] = 0xff;
++		}
++	}
++	bitmap_modified(bm);
++	*out = bm;
++	return NSERROR_OK;
++}
++
+ static struct gui_bitmap_table bitmap_table = {
+ 	.create = bitmap_create,
+ 	.destroy = bitmap_destroy,
+diff --git a/resources/default.css b/resources/default.css
+index 059fdbc5e..09c8f4828 100644
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -168,3 +168,8 @@ mark {
+ dialog:not([open]) { display: none; }
+ datalist { display: none; }
+ input[type=hidden] { display: none; }
++
++/* The dir attribute sets the direction (VitaSurf); "auto" is left to
++ * inherit, as nothing here looks at the text to decide. */
++[dir="rtl"], [dir="RTL"] { direction: rtl; }
++[dir="ltr"], [dir="LTR"] { direction: ltr; }
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index 56a0d437b..a63b812da 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -295,6 +295,7 @@ CORESTRING_DOM_STRING(pagehide);
+ CORESTRING_DOM_STRING(pageshow);
+ CORESTRING_DOM_STRING(PageUp);
+ CORESTRING_DOM_STRING(pause);
++CORESTRING_DOM_STRING(placeholder);
+ CORESTRING_DOM_STRING(play);
+ CORESTRING_DOM_STRING(playing);
+ CORESTRING_DOM_STRING(popstate);

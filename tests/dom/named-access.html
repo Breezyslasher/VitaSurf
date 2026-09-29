@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!-- Named access on the window: an element's id is a property of the
+     window when nothing else has the name, a script's own variable of
+     that name wins, and the window's own properties are never covered.
+     Expected console output: lines ending in "PASS". -->
+<html><body>
+<form id=myForm><input id=field value=x></form>
+<div id=taken></div><div id=location></div>
+<script>var taken = 5;</script>
+<script>
+window.addEventListener('load', function () {
+  function t(label, ok) { console.log((ok ? 'PASS ' : 'FAIL ') + label); }
+  t('window.myForm is the form', window.myForm === document.getElementById('myForm'));
+  t('a bare name reaches it too', typeof field !== 'undefined' && field.value === 'x');
+  t("a script's variable wins", taken === 5);
+  t("the window's own property is kept", typeof window.location.href === 'string');
+  window.myForm = 7;
+  t('assigning the name replaces it', window.myForm === 7);
+});
+</script></body></html>

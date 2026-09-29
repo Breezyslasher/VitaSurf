@@ -2695,6 +2695,24 @@ W.addEventListener('load',function(){
  sweepTemplates();
  if(CEn)ceConnectTree(D.documentElement,true,false);});
 
+/* Named access on the window (VitaSurf): window.foo is the element whose
+ * id is foo, where the window has nothing of that name, as HTML says and
+ * older scripts rely on ("myForm.submit()"). A getter is set for each id
+ * once the document is parsed and again when it has loaded, looked up
+ * afresh on each read; a script that assigns the name or declares it
+ * gets an ordinary property instead. */
+function namedAccess(){
+ var all=D.querySelectorAll('[id]'),i,n=all.length<2000?all.length:2000;
+ for(i=0;i<n;i++)(function(id){
+  if(!id||id in W)return;
+  try{Object.defineProperty(W,id,{configurable:true,enumerable:false,
+   get:function(){return D.getElementById(id);},
+   set:function(v){Object.defineProperty(W,id,{configurable:true,
+    writable:true,enumerable:true,value:v});}});}catch(e){}
+ })(all[i].id);}
+W.addEventListener('DOMContentLoaded',namedAccess);
+W.addEventListener('load',namedAccess);
+
 /* Shadow DOM, as light DOM. A shadow root is the element itself, so
  * there is no style or selector scoping, which is the point: content put
  * in a shadow root still lays out and still renders, where an

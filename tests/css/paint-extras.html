@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<!-- Painting that JavaScript cannot see, checked in the plot output:
+     an outline drawn outline-offset away from the border box (a ring
+     from 26 to 132 across for #off), and a box-shadow list whose first
+     two entries are Tailwind's invisible "0 0 #0000" ring placeholders,
+     where the third, the real shadow, is the one drawn. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+div { width: 100px; height: 40px; margin: 30px; background: #eee; }
+#off { outline: 2px solid rgb(255, 0, 0); outline-offset: 2px; }
+#neg { outline: 2px solid rgb(0, 0, 255); outline-offset: -6px; }
+#tw { box-shadow: 0 0 #0000, 0 0 #0000, 4px 4px 0 0 rgb(0, 128, 0); }
+</style></head><body>
+<div id=off></div><div id=neg></div><div id=tw></div>
+</body></html>

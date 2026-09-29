@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<!-- Multi-column layout: column-count, column-width and the columns
+     shorthand deal the content into balanced columns side by side; a
+     list's items are dealt one by one; a box with a height fills its
+     columns to it. Expected console output: lines ending in "PASS". -->
+<html><head><style>
+body { margin: 0; font: 16px sans-serif; }
+.mc { width: 600px; column-gap: 20px; margin-bottom: 10px; }
+.item { height: 20px; margin: 0; }
+#count { column-count: 3; }
+#cw { column-width: 180px; }
+#short { columns: 2; }
+#list { column-count: 2; }
+#list ul { margin: 0; padding: 0; list-style: none; }
+#list li { height: 20px; }
+#fixed { column-count: 2; height: 60px; }
+#rule { column-count: 2; column-rule: 4px solid rgb(255, 0, 0); }
+#wide { width: 600px; }
+</style></head><body>
+<div id=count class=mc>
+<div class=item id=c1>1</div><div class=item>2</div><div class=item>3</div>
+<div class=item id=c4>4</div><div class=item>5</div><div class=item>6</div>
+<div class=item id=c7>7</div><div class=item>8</div><div class=item id=c9>9</div>
+</div>
+<div id=cw class=mc>
+<div class=item id=w1>1</div><div class=item>2</div><div class=item id=w3>3</div>
+<div class=item>4</div><div class=item id=w5>5</div><div class=item>6</div>
+</div>
+<div id=short class=mc><div class=item id=s1>only</div></div>
+<div id=list class=mc><ul>
+<li id=l1>a</li><li>b</li><li>c</li><li id=l4>d</li><li>e</li><li id=l6>f</li>
+</ul></div>
+<div id=fixed class=mc>
+<div class=item id=f1>1</div><div class=item>2</div><div class=item>3</div>
+<div class=item id=f4>4</div><div class=item>5</div>
+</div>
+<div id=rule class=mc><div class=item>1</div><div class=item>2</div></div>
+<script>
+setTimeout(function () {
+  function r(id) { return document.getElementById(id).getBoundingClientRect(); }
+  function t(label, got, want) {
+    console.log((got === want ? "PASS " : "FAIL ") + label + " (" + got + ")"); }
+  var top = r('count').top;
+  /* 3 columns of (600 - 2 * 20) / 3 = 186 */
+  t("column-count: 3, first column", r('c1').left + ',' + (r('c1').top - top), '0,0');
+  t("second column starts with item 4", r('c4').left + ',' + (r('c4').top - top), '206,0');
+  t("third column starts with item 7", r('c7').left + ',' + (r('c7').top - top), '412,0');
+  t("an item is a column wide", r('c1').width, 186);
+  t("balanced: the box is three items tall", r('count').height, 60);
+  t("item 9 ends the third column", r('c9').top - top, 40);
+  var wtop = r('cw').top;
+  /* column-width 180 in 600: (600 + 20) / (180 + 20) = 3 columns */
+  t("column-width: three columns fit", r('w5').left + ',' + (r('w5').top - wtop), '412,0');
+  t("column-width: item 3 heads the second", r('w3').left + ',' + (r('w3').top - wtop), '206,0');
+  t("one fragment stays in the first column", r('s1').left, 0);
+  var ltop = r('list').top;
+  t("a list is dealt item by item", r('l4').left + ',' + (r('l4').top - ltop), '310,0');
+  t("the list ends the second column", r('l6').top - ltop, 40);
+  t("the list's box takes half the height", r('list').height, 60);
+  var ftop = r('fixed').top;
+  t("a set height fills the first column", r('f4').left + ',' + (r('f4').top - ftop), '310,0');
+  t("and keeps its height", r('fixed').height, 60);
+}, 500);
+</script></body></html>

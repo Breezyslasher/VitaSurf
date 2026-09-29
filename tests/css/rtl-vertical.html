@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<!-- Right-to-left and vertical text: text-align start and end, the dir
+     attribute, inline boxes laid out from the right, flex rows and grid
+     columns from the right, an over-constrained block at the right, and
+     a vertical-rl box taking the size its turned lines give it. The
+     Hebrew and Arabic lines at the end are drawn in visual order, which
+     the plot output shows. Expected console output: lines ending in
+     "PASS". -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; }
+.w { width: 400px; }
+.dot { display: inline-block; width: 30px; height: 10px; }
+#end { text-align: end; }
+#start { text-align: start; }
+#row { display: flex; }
+#row > div { width: 50px; height: 10px; }
+#grid { display: grid; grid-template-columns: 100px 100px; }
+#grid > div { height: 10px; }
+#fixed > div { width: 100px; height: 10px; margin-left: 0; margin-right: 0; }
+#vert { writing-mode: vertical-rl; height: 100px; line-height: 20px; }
+#vert .dot { width: 40px; height: 20px; }
+</style></head><body>
+<div class=w id=end><span class=dot id=e1></span></div>
+<div class=w id=start dir=rtl><span class=dot id=s1></span></div>
+<div class=w dir=rtl><span class=dot id=a></span><span class=dot id=b></span></div>
+<div class=w id=row dir=rtl><div id=r1></div><div id=r2></div></div>
+<div class=w id=grid dir=rtl><div id=g1></div><div id=g2></div></div>
+<div class=w id=fixed dir=rtl><div id=f1></div></div>
+<div id=vert><span class=dot></span><span class=dot></span><span class=dot></span><span class=dot></span><span class=dot></span></div>
+<p dir=rtl>שלום עולם 123</p>
+<p>abc שלום def</p>
+<p dir=rtl>مرحبا بالعالم</p>
+<script>
+setTimeout(function () {
+  function r(id) { return document.getElementById(id).getBoundingClientRect(); }
+  function t(label, got, want) {
+    console.log((got === want ? "PASS " : "FAIL ") + label + " (" + got + ")"); }
+  t("text-align: end is right in ltr", r('e1').left, 370);
+  t("text-align: start is right in rtl", r('s1').left, 370);
+  t("dir=rtl: the first inline box is rightmost", r('a').left > r('b').left, true);
+  t("the second sits to its left", r('b').left, 340);
+  t("an rtl flex row starts at the right", r('r1').left, 350);
+  t("and runs leftwards", r('r2').left, 300);
+  t("an rtl grid's first column is at the right", r('g1').left, 300);
+  t("its second is left of it", r('g2').left, 200);
+  t("an over-constrained block sits at the right", r('f1').left, 300);
+  t("a vertical-rl box is as tall as its height", Math.round(r('vert').height), 100);
+  t("and as wide as its three turned lines", Math.round(r('vert').width), 60);
+}, 500);
+</script></body></html>

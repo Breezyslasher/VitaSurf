@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<!-- Boxes painted aside and cut to a curve: an image with rounded
+     corners, a rounded card that hides its overflow with an image at
+     its top edge, a rounded card holding only text (not painted aside:
+     nothing reaches its corners), and clip-path circle() and ellipse().
+     Run with VITASURF_TEST_RASTER=plots to see what is painted aside
+     between RASTER lines; without a raster the boxes paint square. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+img { display: block; }
+#round { width: 40px; height: 20px; border-radius: 8px; margin: 10px; }
+.card { width: 100px; border-radius: 12px; overflow: hidden; margin: 10px; background: #eee; }
+.card img { width: 100px; height: 30px; }
+.card p { margin: 0; padding: 12px; }
+#circle { width: 60px; height: 60px; background: rgb(0, 0, 255); clip-path: circle(50%); margin: 10px; }
+#ellipse { width: 80px; height: 40px; background: rgb(0, 128, 0); clip-path: ellipse(40px 20px at 50% 50%); margin: 10px; }
+</style></head><body>
+<img id=round src="red20x10.png">
+<div class=card id=imgcard><img src="red20x10.png"><p>text</p></div>
+<div class=card id=textcard><p>only text</p></div>
+<div id=circle></div>
+<div id=ellipse></div>
+</body></html>
