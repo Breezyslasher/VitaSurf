@@ -14147,7 +14147,7 @@ static bool url_is_local(const char *url)
 			       strncmp(url, "data:", 5) == 0);
 }
 
-static char *qjs_module_normalize(JSContext *ctx, const char *base,
+static char *module_normalize_url(JSContext *ctx, const char *base,
 				  const char *name, void *opaque)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
@@ -14244,6 +14244,59 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base,
 		vita_log("qjs: import map resolved '%s' to '%s'", name, out);
 	}
 	return out;
+}
+
+/*
+ * A module that answered with a redirect is known by where it ended up,
+ * as a browser's module map knows it: its own relative imports resolve
+ * against that, rather than each going through the redirect again, and
+ * whichever of the two URLs a module imports it by, it is the same
+ * module (VitaSurf).
+ */
+/* where a module fetched from url ended up, when a redirect took it
+   somewhere else and it has arrived; NULL otherwise */
+static const char *module_redirect_target(jsthread *thread, const char *url)
+{
+	unsigned int i;
+
+	if (url == NULL || thread == NULL || thread->htmlc == NULL) {
+		return NULL;
+	}
+	for (i = 0; i < thread->htmlc->scripts_count; i++) {
+		struct html_script *sc = &thread->htmlc->scripts[i];
+		const char *final;
+
+		if (sc->type == HTML_SCRIPT_INLINE || sc->data.handle == NULL ||
+		    sc->asked == NULL ||
+		    strcmp(nsurl_access(sc->asked), url) != 0 ||
+		    content_get_status(sc->data.handle) !=
+				CONTENT_STATUS_DONE) {
+			continue;
+		}
+		final = nsurl_access(hlcache_handle_get_url(sc->data.handle));
+		return strcmp(final, url) != 0 ? final : NULL;
+	}
+	return NULL;
+}
+
+static char *qjs_module_normalize(JSContext *ctx, const char *base,
+				  const char *name, void *opaque)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *moved = module_redirect_target(thread, base);
+	char *url = module_normalize_url(ctx, moved != NULL ? moved : base,
+					 name, opaque);
+
+	moved = module_redirect_target(thread, url);
+	if (moved != NULL) {
+		char *out = js_dup_cstr(ctx, moved);
+
+		if (out != NULL) {
+			js_free(ctx, url);
+			url = out;
+		}
+	}
+	return url;
 }
 
 /*
@@ -14388,6 +14441,25 @@ static void mod_deps_free(jsthread *thread)
 }
 
 /** Where the page stands with a module's source. */
+/*
+ * Whether a fetched script is the one at url: where it ended up, or where
+ * it was asked for. unpkg answers lit-html@^1.1.1 with a redirect to
+ * lit-html@1.4.1, and an import that only matched the second waited for
+ * a module it already had, fetching it again on every retry: 640 times
+ * on a Home Assistant dashboard (VitaSurf).
+ */
+static bool script_is(const struct html_script *sc, const char *url)
+{
+	if (sc->type == HTML_SCRIPT_INLINE || sc->data.handle == NULL) {
+		return false;
+	}
+	if (strcmp(nsurl_access(hlcache_handle_get_url(sc->data.handle)),
+		   url) == 0) {
+		return true;
+	}
+	return sc->asked != NULL && strcmp(nsurl_access(sc->asked), url) == 0;
+}
+
 static enum mod_src module_source(jsthread *thread, const char *url,
 				  const uint8_t **data, size_t *size)
 {
@@ -14404,10 +14476,7 @@ static enum mod_src module_source(jsthread *thread, const char *url,
 		struct html_script *sc = &thread->htmlc->scripts[i];
 		int st;
 
-		if (sc->type == HTML_SCRIPT_INLINE ||
-		    sc->data.handle == NULL ||
-		    strcmp(nsurl_access(hlcache_handle_get_url(
-				sc->data.handle)), want) != 0) {
+		if (!script_is(sc, want)) {
 			continue;
 		}
 		st = (int)content_get_status(sc->data.handle);
@@ -14790,10 +14859,7 @@ static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 		for (i = 0; i < thread->htmlc->scripts_count; i++) {
 			struct html_script *sc = &thread->htmlc->scripts[i];
 
-			if (sc->type == HTML_SCRIPT_INLINE ||
-			    sc->data.handle == NULL ||
-			    strcmp(nsurl_access(hlcache_handle_get_url(
-					sc->data.handle)), url) != 0) {
+			if (!script_is(sc, url)) {
 				continue;
 			}
 			found = true;
@@ -14953,8 +15019,7 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 				continue;
 			}
 			fetched++;
-			if (strcmp(nsurl_access(hlcache_handle_get_url(
-					sc->data.handle)), want) != 0) {
+			if (!script_is(sc, want)) {
 				continue;
 			}
 			if (content_get_status(sc->data.handle) !=

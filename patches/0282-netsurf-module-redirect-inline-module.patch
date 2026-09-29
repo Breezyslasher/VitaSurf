@@ -1,0 +1,89 @@
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 5e172ce62..95b38beca 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -92,6 +92,9 @@ struct html_script {
+ 	} data;	/**< Script data */
+ 	struct dom_string *mimetype;
+ 	struct dom_string *encoding;
++	/** the URL asked for, which a redirect makes differ from the
++	 * handle's; NULL for inline scripts (VitaSurf) */
++	struct nsurl *asked;
+ 	bool already_started;
+ 	/** whether the log has said this one was dropped (VitaSurf) */
+ 	bool reported;
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 065be2809..6ce4ec6f1 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -173,6 +173,7 @@ html_process_new_script(html_content *c,
+ 	 * claude.ai reading a handle that was the text ", bu".
+ 	 */
+ 	memset(&nscript->data, 0, sizeof(nscript->data));
++	nscript->asked = NULL;
+ 
+ 	nscript->mimetype = dom_string_ref(mimetype); /* reference mimetype */
+ 
+@@ -852,6 +853,7 @@ exec_src_script(html_content *c,
+ 	child.charset = c->encoding;
+ 	child.quirks = c->base.quirks;
+ 
++	nscript->asked = nsurl_ref(joined);
+ 	ns_error = hlcache_handle_retrieve(joined,
+ 					   0,
+ 					   content_get_url(&c->base),
+@@ -947,6 +949,16 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ 	nscript->data.string = script;
+ 	nscript->already_started = true;
+ 
++	/* type="module", and an empty type, are JavaScript too; the
++	 * engine compiles a module as one once it meets import or export.
++	 * Looked up as the type they are, they found no handler and never
++	 * ran (VitaSurf). */
++	if (dom_string_byte_length(mimetype) == 0 ||
++	    (dom_string_byte_length(mimetype) == 6 &&
++	     strncasecmp(dom_string_data(mimetype), "module", 6) == 0)) {
++		mimetype = corestring_dom_text_javascript;
++	}
++
+ 	/* ensure script handler for content type */
+ 	exc = dom_string_intern(mimetype, &lwcmimetype);
+ 	if (exc != DOM_NO_ERR) {
+@@ -1069,11 +1081,17 @@ bool html_process_module_preload(html_content *c, dom_string *href)
+ 		unsigned int i;
+ 
+ 		for (i = 0; i != c->scripts_count; i++) {
++			/* by where it was asked for too: one that was
++			 * redirected has another URL now, and a retry
++			 * fetched it again every time (VitaSurf) */
+ 			if (c->scripts[i].type != HTML_SCRIPT_INLINE &&
+ 			    c->scripts[i].data.handle != NULL &&
+-			    nsurl_compare(hlcache_handle_get_url(
++			    (nsurl_compare(hlcache_handle_get_url(
+ 						c->scripts[i].data.handle),
+-					  joined, NSURL_COMPLETE)) {
++					  joined, NSURL_COMPLETE) ||
++			     (c->scripts[i].asked != NULL &&
++			      nsurl_compare(c->scripts[i].asked, joined,
++					    NSURL_COMPLETE)))) {
+ 				nsurl_unref(joined);
+ 				return false;
+ 			}
+@@ -1092,6 +1110,7 @@ bool html_process_module_preload(html_content *c, dom_string *href)
+ 	child.charset = c->encoding;
+ 	child.quirks = c->base.quirks;
+ 
++	nscript->asked = nsurl_ref(joined);
+ 	ns_error = hlcache_handle_retrieve(joined, 0,
+ 					   content_get_url(&c->base), NULL,
+ 					   convert_script_preload_cb, c, &child,
+@@ -1208,6 +1227,9 @@ nserror html_script_free(html_content *html)
+ 	unsigned int i;
+ 
+ 	for (i = 0; i != html->scripts_count; i++) {
++		if (html->scripts[i].asked != NULL) {
++			nsurl_unref(html->scripts[i].asked);
++		}
+ 		if (html->scripts[i].mimetype != NULL) {
+ 			dom_string_unref(html->scripts[i].mimetype);
+ 		}

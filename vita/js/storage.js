@@ -526,7 +526,19 @@ function IDBTransaction(db, names, mode){
  this._snapshot = null;
  if (this.mode !== 'readonly') {
   /* what to put back if this transaction is abandoned */
-  this._snapshot = JSON.stringify(db._data.stores);
+  if (this.mode === 'versionchange') {
+   this._snapshot = JSON.stringify(db._data.stores);
+  } else {
+   /* only the stores it may write, and only their record lists:
+      records are replaced, never changed in place, so a copy of the
+      list is enough to put back, where serialising every store made
+      each small write cost the whole database (VitaSurf) */
+   this._lists = {};
+   for (var i = 0; i < names.length; i++) {
+    var st = db._data.stores[names[i]];
+    if (st) this._lists[names[i]] = { records: st.records.slice(), nextKey: st.nextKey };
+   }
+  }
  }
  var self = this;
  /* The transaction is active for as long as script keeps adding to it,
@@ -588,6 +600,15 @@ IDBTransaction.prototype._abort = function(err){
  if (this._snapshot !== null) {
   try { this.db._data.stores = JSON.parse(this._snapshot); } catch (e) {}
   touch();
+ } else if (this._lists) {
+  var stores = this.db._data.stores, n;
+  for (n in this._lists) {
+   if (stores[n]) {
+    stores[n].records = this._lists[n].records;
+    stores[n].nextKey = this._lists[n].nextKey;
+   }
+  }
+  touch();
  }
  this.error = err || DOMEx('AbortError', 'this transaction was abandoned');
  /*
@@ -627,11 +648,31 @@ function findAt(s, key){
  }
  return -(lo + 1);
 }
+/* the first record at or above key, or above it when open */
+function lowerAt(s, key, open){
+ var lo = 0, hi = s.records.length;
+ while (lo < hi) {
+  var mid = (lo + hi) >> 1, c = cmpKeys(decode(s.records[mid].k), key);
+  if (c < 0 || (c === 0 && open)) lo = mid + 1; else hi = mid;
+ }
+ return lo;
+}
+/*
+ * The records a range takes in, found by halving to its lower end and
+ * walking to its upper one. Checking every record against the range made
+ * a get() cost the whole store: Home Assistant's icon cache holds
+ * thousands, and its icon lookups spent 32 seconds here (VitaSurf).
+ */
 function inRange(s, range, desc){
- var out = [], i;
- for (i = 0; i < s.records.length; i++) {
-  var k = decode(s.records[i].k);
-  if (range.includes(k)) out.push({ key: k, rec: s.records[i] });
+ var out = [], recs = s.records, i = 0;
+ if (range.lower !== undefined) i = lowerAt(s, range.lower, range.lowerOpen);
+ for (; i < recs.length; i++) {
+  var k = decode(recs[i].k);
+  if (range.upper !== undefined) {
+   var d = cmpKeys(k, range.upper);
+   if (d > 0 || (d === 0 && range.upperOpen)) break;
+  }
+  out.push({ key: k, rec: recs[i] });
  }
  if (desc) out.reverse();
  return out;
@@ -980,11 +1021,16 @@ IDBCursor.prototype = {
  },
  update: function(value){
   if (this._tx.mode === 'readonly') throw DOMEx('ReadOnlyError', 'this transaction is read only');
-  var h = this._hits[this._at];
+  var h = this._hits[this._at], st = this.source._s || this.source.objectStore._s;
   var req = new IDBRequest(this.source, this._tx);
   var key = this.primaryKey;
   return this._tx._push(function(){
-   h.rec.v = encode(value);
+   /* a new record rather than a change to this one, which an
+      abandoned transaction's copy of the list still holds */
+   var at = st.records.indexOf(h.rec);
+   var rec = { k: h.rec.k, v: encode(value) };
+   if (at >= 0) st.records[at] = rec;
+   h.rec = rec;
    return key;
   }, req);
  },

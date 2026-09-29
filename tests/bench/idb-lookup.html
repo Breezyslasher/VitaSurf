@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!-- IndexedDB with a store the size of Home Assistant's icon cache: 5000
+     records, then 1000 lookups and 200 small write transactions. Before
+     ranges were cut by halving, the lookups did not finish in a minute
+     natively. -->
+<html><body><script>
+var req = indexedDB.open('bench' + Date.now(), 1);
+req.onupgradeneeded = function(e){ e.target.result.createObjectStore('icons'); };
+req.onsuccess = function(){
+  var db = req.result, t0 = Date.now();
+  var tx = db.transaction('icons', 'readwrite'), s = tx.objectStore('icons');
+  for (var i = 0; i < 5000; i++) s.put('M0 0L' + i, 'mdi:icon-' + i);
+  tx.oncomplete = function(){
+    var t1 = Date.now(), left = 1000;
+    console.log('BENCH put 5000 in ' + (t1 - t0) + ' ms');
+    for (var j = 0; j < 1000; j++) {
+      var g = db.transaction('icons', 'readonly').objectStore('icons').get('mdi:icon-' + (j * 5));
+      g.onsuccess = function(){ if (--left === 0) console.log('BENCH get 1000 in ' + (Date.now() - t1) + ' ms'); };
+    }
+    var t2 = Date.now(), n = 0;
+    for (var k = 0; k < 200; k++) {
+      var w = db.transaction('icons', 'readwrite');
+      w.objectStore('icons').put('x', 'extra-' + k);
+      w.oncomplete = function(){ if (++n === 200) console.log('BENCH 200 write transactions in ' + (Date.now() - t2) + ' ms'); };
+    }
+  };
+};
+</script></body></html>
