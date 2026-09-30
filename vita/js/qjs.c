@@ -693,6 +693,7 @@ static void walk_cost_note(const char *kind, const char *what, size_t len,
 }
 
 static struct dom_document *thread_document(jsthread *thread);
+static void ws_report(void);
 
 /** Whether a walk began at the document or its root element. */
 static bool walk_from_top(jsthread *thread, struct dom_node *root)
@@ -738,6 +739,7 @@ void vita_js_report_profile(void)
 	unsigned int shown;
 
 	walk_cost_report();
+	ws_report();
 
 	/* what script's own allocator did since the last report (VitaSurf) */
 	{
@@ -7361,6 +7363,85 @@ static bool composed_hook(struct html_content *c, enum vitasurf_composed_op op,
 /* ------------------------------------------------------------------------ */
 /* WebSocket (VitaSurf): vita/js/websocket.c does the connections           */
 
+/*
+ * What the page's WebSocket messages cost (VitaSurf). Home Assistant
+ * sends its whole state over one connection -- every entity when it
+ * subscribes, then a message per change -- and a log could not say how
+ * big those were or how long the page took over them. Counted per
+ * page and reported with the profile; a message whose handling takes
+ * WS_SLOW_MS or more is named as it happens, by its type and size
+ * only, never its contents.
+ */
+#define WS_SLOW_MS 200
+static unsigned ws_msgs, ws_kb, ws_max_bytes, ws_max_ms;
+static unsigned ws_ms_handler, ws_ms_jobs, ws_slow;
+static unsigned ws_first_bytes, ws_first_handler, ws_first_jobs;
+
+/** The value of "type" near the start of a JSON message, for the log. */
+static void ws_msg_type(const char *data, size_t len, char *out, size_t n)
+{
+	size_t i, k = 0, lim = len < 96 ? len : 96;
+
+	out[0] = '\0';
+	for (i = 0; i + 8 < lim; i++) {
+		if (memcmp(data + i, "\"type\":\"", 8) == 0) {
+			for (i += 8; i < len && data[i] != '"' && k + 1 < n; i++) {
+				char c = data[i];
+
+				out[k++] = (isalnum((unsigned char) c) ||
+					    c == '_' || c == '/') ? c : '?';
+			}
+			out[k] = '\0';
+			return;
+		}
+	}
+}
+
+static void ws_note(size_t len, const char *data, bool text,
+		    unsigned handler_ms, unsigned jobs_ms)
+{
+	unsigned total = handler_ms + jobs_ms;
+
+	if (ws_msgs == 0) {
+		ws_first_bytes = (unsigned) len;
+		ws_first_handler = handler_ms;
+		ws_first_jobs = jobs_ms;
+	}
+	ws_msgs++;
+	ws_kb += (unsigned) (len / 1024);
+	ws_ms_handler += handler_ms;
+	ws_ms_jobs += jobs_ms;
+	if (len > ws_max_bytes) ws_max_bytes = (unsigned) len;
+	if (total > ws_max_ms) ws_max_ms = total;
+	if (total >= WS_SLOW_MS) {
+		char type[32];
+
+		ws_slow++;
+		type[0] = '\0';
+		if (text) ws_msg_type(data, len, type, sizeof(type));
+		vita_log("websocket: a %u KB message%s%s%s took %u ms in the "
+			 "page's handler and %u ms in the promise jobs after "
+			 "it", (unsigned) (len / 1024),
+			 type[0] ? " of type '" : "", type,
+			 type[0] ? "'" : "", handler_ms, jobs_ms);
+	}
+}
+
+static void ws_report(void)
+{
+	if (ws_msgs == 0) return;
+	vita_log("websocket: %u messages received, %u KB; the page's handlers "
+		 "took %u ms and the promise jobs after them %u ms; the "
+		 "largest was %u KB and the dearest %u ms, %u took %u ms or "
+		 "more", ws_msgs, ws_kb, ws_ms_handler, ws_ms_jobs,
+		 ws_max_bytes / 1024, ws_max_ms, ws_slow, WS_SLOW_MS);
+	vita_log("websocket: the first was %u KB, %u ms in its handler and "
+		 "%u ms in the jobs after it", ws_first_bytes / 1024,
+		 ws_first_handler, ws_first_jobs);
+	ws_msgs = ws_kb = ws_max_bytes = ws_max_ms = 0;
+	ws_ms_handler = ws_ms_jobs = ws_slow = 0;
+}
+
 /* An event on one of a page's connections, to the prelude's
  * __vitaWsEvent(id, kind, data, code), run as script so the promise
  * jobs a message handler queues run after it. */
@@ -7371,11 +7452,14 @@ static void ws_event(void *owner, int id, enum vws_event ev,
 	JSContext *ctx;
 	JSValue global, fn, args[4], r;
 	int i;
+	uint64_t t0, t1 = 0;
+	bool message = (ev == VWS_TEXT || ev == VWS_BINARY);
 
 	if (thread == NULL || thread->closed || thread->ctx == NULL) {
 		return;
 	}
 	ctx = thread->ctx;
+	t0 = now_ms();
 	begin_script(thread, SCRIPT_XHR);
 	global = JS_GetGlobalObject(ctx);
 	fn = JS_GetPropertyStr(ctx, global, "__vitaWsEvent");
@@ -7397,7 +7481,12 @@ static void ws_event(void *owner, int id, enum vws_event ev,
 	}
 	JS_FreeValue(ctx, fn);
 	JS_FreeValue(ctx, global);
+	t1 = now_ms();
 	end_script(thread);
+	if (message && thread->script_depth == 0) {
+		ws_note(len, data, ev == VWS_TEXT, (unsigned) (t1 - t0),
+			(unsigned) (now_ms() - t1));
+	}
 }
 
 /* The cookies the page's http(s) URL of the same host would send. */

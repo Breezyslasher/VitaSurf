@@ -1,0 +1,470 @@
+diff --git a/quickjs.c b/quickjs.c
+index 2d066e5..c34b6eb 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21462,6 +21462,11 @@ typedef struct JSFunctionDef {
+ 
+     JSVarDef *vars;
+     uint32_t *vars_htab; // indexes into vars[]
++    /* resolve_scope_var's chain walks, remembered once the chains are
++       final (VitaSurf); see scope_chain_find */
++    struct JSChainMemo *chain_memo;
++    uint32_t chain_memo_size, chain_memo_count;
++    bool chains_final;
+     int var_size; /* allocated size for vars[] */
+     int var_count;
+     JSVarDef *args;
+@@ -21582,8 +21587,19 @@ typedef struct JSParseState {
+     bool is_module; /* parsing a module */
+     bool allow_html_comments;
+     JSSourceBlob *source_blob; /* the input, once a function wants it */
++    /* what js_parse_skip_parens_token found for the brackets it has
++       already scanned, by the bracket's place in the source (VitaSurf) */
++    struct JSSkipMemo *skip_memo;
++    uint32_t skip_memo_size, skip_memo_count;
+ } JSParseState;
+ 
++typedef struct JSSkipMemo {
++    const uint8_t *ptr;     /* the opening bracket, NULL for a free slot */
++    int32_t tok;            /* the token after the matching close */
++    uint8_t bits;           /* SKIP_HAS_* inside it */
++    uint8_t nl;             /* a line break before that token */
++} JSSkipMemo;
++
+ typedef struct JSOpCode {
+ #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_*
+     const char *name;
+@@ -24231,6 +24247,103 @@ static bool is_regexp_allowed(int tok)
+ #define SKIP_HAS_SEMI       (1 << 0)
+ #define SKIP_HAS_ELLIPSIS   (1 << 1)
+ #define SKIP_HAS_ASSIGNMENT (1 << 2)
++#define SKIP_UNSURE         (1 << 3)    /* not kept: see below */
++
++/*
++ * The skip memo (VitaSurf). The parser asks js_parse_skip_parens_token
++ * at a bracket what follows its match -- whether '(' starts an arrow
++ * function, whether '[' or '{' is a destructuring pattern -- and it
++ * answers by tokenizing everything up to the match. Code n brackets deep
++ * was tokenized n + 1 times, and a plugin bundle is one call wrapped
++ * around all of its code: 36% of the compile of Home Assistant's cards
++ * was this lookahead. The scan now notes the answer for every bracket
++ * it closes on the way, and the parser's own question at that bracket
++ * later is a look-up.
++ *
++ * A bracket's answer is kept only if nothing in it can tokenize
++ * differently where the parser meets it: whether '/' starts a regular
++ * expression depends on the token before it, and await, yield and the
++ * strict mode reserved words are keywords in some functions and names
++ * in others. A '/' after one of those leaves the enclosing brackets
++ * unkept, to be scanned in their own place as before. Short brackets
++ * are not kept either: scanning them again costs less than the table.
++ */
++#define SKIP_MEMO_MIN_SPAN 48
++
++static JSSkipMemo *skip_memo_find(JSParseState *s, const uint8_t *ptr)
++{
++    uint32_t mask, i;
++
++    if (!s->skip_memo)
++        return NULL;
++    mask = s->skip_memo_size - 1;
++    for (i = ((uint32_t)(uintptr_t)ptr * 2654435761u) & mask;
++         s->skip_memo[i].ptr; i = (i + 1) & mask) {
++        if (s->skip_memo[i].ptr == ptr)
++            return &s->skip_memo[i];
++    }
++    return NULL;
++}
++
++static void skip_memo_add(JSParseState *s, const uint8_t *ptr, int tok,
++                          int bits, bool nl)
++{
++    JSRuntime *rt = s->ctx->rt;
++    JSSkipMemo *m;
++    uint32_t mask, i;
++
++    if ((s->skip_memo_count + 1) * 2 > s->skip_memo_size) {
++        uint32_t n = s->skip_memo_size ? s->skip_memo_size * 2 : 256, j;
++        JSSkipMemo *t = js_mallocz_rt(rt, n * sizeof(*t));
++
++        if (!t)
++            return; /* not kept: the scan is simply done again */
++        for (j = 0; j < s->skip_memo_size; j++) {
++            JSSkipMemo *o = &s->skip_memo[j];
++            if (!o->ptr)
++                continue;
++            for (i = ((uint32_t)(uintptr_t)o->ptr * 2654435761u) & (n - 1);
++                 t[i].ptr; i = (i + 1) & (n - 1)) {
++            }
++            t[i] = *o;
++        }
++        js_free_rt(rt, s->skip_memo);
++        s->skip_memo = t;
++        s->skip_memo_size = n;
++    }
++    mask = s->skip_memo_size - 1;
++    for (i = ((uint32_t)(uintptr_t)ptr * 2654435761u) & mask;
++         s->skip_memo[i].ptr; i = (i + 1) & mask) {
++        if (s->skip_memo[i].ptr == ptr)
++            return;
++    }
++    m = &s->skip_memo[i];
++    m->ptr = ptr;
++    m->tok = tok;
++    m->bits = bits;
++    m->nl = nl;
++    s->skip_memo_count++;
++}
++
++static void skip_memo_free(JSParseState *s)
++{
++    js_free_rt(s->ctx->rt, s->skip_memo);
++    s->skip_memo = NULL;
++    s->skip_memo_size = s->skip_memo_count = 0;
++}
++
++/* A name that is a keyword in some functions and not in others. */
++static bool token_reads_by_function(const JSToken *t)
++{
++    JSAtom a;
++
++    if (t->val != TOK_IDENT &&
++        !(t->val >= TOK_FIRST_KEYWORD && t->val <= TOK_LAST_KEYWORD))
++        return false;
++    a = t->u.ident.atom;
++    return (a > JS_ATOM_LAST_KEYWORD && a <= JS_ATOM_LAST_STRICT_KEYWORD) ||
++        a == JS_ATOM_await || a == JS_ATOM_yield;
++}
+ 
+ /* XXX: improve speed with early bailout */
+ /* XXX: no longer works if regexps are present. Could use previous
+@@ -24238,12 +24351,30 @@ static bool is_regexp_allowed(int tok)
+ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_terminator)
+ {
+     char state[256];
++    /* per open bracket (VitaSurf): where it began and what is in it */
++    const uint8_t *start[256];
++    uint8_t lbits[256];
++    const uint8_t *pend = NULL;
++    int pend_bits = 0;
++    bool last_by_function = false;
++    bool arrow_only = (!pbits && no_line_terminator && s->token.val == '(');
++    bool first = true;
++    JSSkipMemo *memo;
+     size_t level = 0;
+     JSParsePos pos;
+     int last_tok, tok = TOK_EOF;
+     int c, tok_len, bits = 0;
+ 
++    memo = skip_memo_find(s, s->token.ptr);
++    if (memo) {
++        if (pbits)
++            *pbits = memo->bits;
++        return (no_line_terminator && memo->nl) ? '\n' : memo->tok;
++    }
++
+     /* protect from underflow */
++    lbits[level] = 0;
++    start[level] = NULL;
+     state[level++] = 0;
+ 
+     js_parse_get_pos(s, &pos);
+@@ -24255,19 +24386,33 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
+         case '{':
+             if (level >= sizeof(state))
+                 goto done;
++            start[level] = s->token.ptr;
++            lbits[level] = 0;
+             state[level++] = s->token.val;
+             break;
+         case ')':
+             if (state[--level] != '(')
+                 goto done;
+-            break;
++            goto popped;
+         case ']':
+             if (state[--level] != '[')
+                 goto done;
++        popped:
++            /* what the parent inherits, and the answer to keep once
++               the token after it is known */
++            lbits[level - 1] |= lbits[level] & (SKIP_HAS_ASSIGNMENT | SKIP_UNSURE);
++            if (!(lbits[level] & SKIP_UNSURE) &&
++                s->token.ptr - start[level] >= SKIP_MEMO_MIN_SPAN) {
++                pend = start[level];
++                pend_bits = lbits[level] & ~SKIP_UNSURE;
++            }
+             break;
+         case '}':
+             c = state[--level];
++            if (c == '{')
++                goto popped;
+             if (c == '`') {
++                lbits[level - 1] |= lbits[level] & (SKIP_HAS_ASSIGNMENT | SKIP_UNSURE);
+                 /* continue the parsing of the template */
+                 free_token(s, &s->token);
+                 /* Resume TOK_TEMPLATE parsing (s->token.line_num and
+@@ -24289,6 +24434,8 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
+                    parsing the template */
+                 if (level >= sizeof(state))
+                     goto done;
++                start[level] = NULL;
++                lbits[level] = 0;
+                 state[level++] = '`';
+             }
+             break;
+@@ -24298,14 +24445,17 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
+             if (level == 2) {
+                 bits |= SKIP_HAS_SEMI;
+             }
++            lbits[level - 1] |= SKIP_HAS_SEMI;
+             break;
+         case TOK_ELLIPSIS:
+             if (level == 2) {
+                 bits |= SKIP_HAS_ELLIPSIS;
+             }
++            lbits[level - 1] |= SKIP_HAS_ELLIPSIS;
+             break;
+         case '=':
+             bits |= SKIP_HAS_ASSIGNMENT;
++            lbits[level - 1] |= SKIP_HAS_ASSIGNMENT;
+             break;
+ 
+         case TOK_DIV_ASSIGN:
+@@ -24314,6 +24464,8 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
+         case '/':
+             tok_len = 1;
+         parse_regexp:
++            if (last_by_function)
++                lbits[level - 1] |= SKIP_UNSURE;
+             if (is_regexp_allowed(last_tok)) {
+                 s->buf_ptr -= tok_len;
+                 if (js_parse_regexp(s)) {
+@@ -24331,10 +24483,34 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
+         } else {
+             last_tok = s->token.val;
+         }
++        last_by_function = token_reads_by_function(&s->token);
+         if (next_token(s)) {
+             /* XXX: should clear the exception generated by next_token() */
+             break;
+         }
++        if (pend) {
++            int t = s->token.val;
++            if (token_is_pseudo_keyword(s, JS_ATOM_of))
++                t = TOK_OF;
++            skip_memo_add(s, pend, t, pend_bits,
++                          s->last_line_num != s->token.line_num);
++            pend = NULL;
++        }
++        /*
++         * Asked only whether '(' starts an arrow function (VitaSurf):
++         * arrow parameters begin with ')', a name, a pattern or '...',
++         * so anything else after the '(' is not one, and there is no
++         * need to scan to the match. A bundle is one call wrapped
++         * around all of its code, "(function(){" or "(()=>{", and that
++         * question used to tokenize the whole of it first.
++         */
++        if (arrow_only && first) {
++            int t = s->token.val;
++            first = false;
++            if (t != ')' && t != '[' && t != '{' && t != TOK_ELLIPSIS &&
++                t != TOK_IDENT && !token_reads_by_function(&s->token))
++                goto done;
++        }
+         if (level <= 1) {
+             tok = s->token.val;
+             if (token_is_pseudo_keyword(s, JS_ATOM_of))
+@@ -31628,6 +31804,9 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
+     int i;
+     struct list_head *el, *el1;
+ 
++    js_free(ctx, fd->chain_memo);
++    fd->chain_memo = NULL;
++
+     /* free the child functions */
+     list_for_each_safe(el, el1, &fd->child_list) {
+         JSFunctionDef *fd1;
+@@ -32432,6 +32611,96 @@ static inline void capture_var(JSFunctionDef *s, JSVarDef *vd)
+ }
+ 
+ /* return the position of the next opcode */
++/*
++ * The first variable called name on the scope chain that begins at
++ * scope_level, or the chain's end (-1, or ARG_SCOPE_END), with *with set
++ * if a 'with' object lies before it (VitaSurf).
++ *
++ * The chains are linked lists through every lexical variable in scope,
++ * and a minified bundle is a few functions each declaring thousands:
++ * every reference walked them, and resolving variables was a fifth of
++ * the compile of a Home Assistant plugin. Once js_create_function has
++ * linked the chains for the last time nothing changes them, so each
++ * (scope, name) is walked once and remembered.
++ */
++typedef struct JSChainMemo {
++    JSAtom name;            /* JS_ATOM_NULL for a free slot */
++    int32_t scope;
++    int32_t result;
++    int32_t with;
++} JSChainMemo;
++
++static int scope_chain_walk(JSFunctionDef *fd, int scope_level, JSAtom name,
++                            bool *with)
++{
++    int idx;
++
++    *with = false;
++    for (idx = fd->scopes[scope_level].first; idx >= 0;
++         idx = fd->vars[idx].scope_next) {
++        if (fd->vars[idx].var_name == name)
++            break;
++        if (fd->vars[idx].var_name == JS_ATOM__with_)
++            *with = true;
++    }
++    return idx;
++}
++
++static int scope_chain_find(JSContext *ctx, JSFunctionDef *fd,
++                            int scope_level, JSAtom name, bool *with)
++{
++    JSChainMemo *m;
++    uint32_t mask, i, h;
++    int r;
++
++    if (!fd->chains_final)
++        return scope_chain_walk(fd, scope_level, name, with);
++    h = (name * 2654435761u) ^ ((uint32_t)scope_level * 40503u);
++    if (fd->chain_memo) {
++        mask = fd->chain_memo_size - 1;
++        for (i = h & mask; fd->chain_memo[i].name != JS_ATOM_NULL;
++             i = (i + 1) & mask) {
++            m = &fd->chain_memo[i];
++            if (m->name == name && m->scope == scope_level) {
++                *with = m->with;
++                return m->result;
++            }
++        }
++    }
++    r = scope_chain_walk(fd, scope_level, name, with);
++    if ((fd->chain_memo_count + 1) * 2 > fd->chain_memo_size) {
++        uint32_t n = fd->chain_memo_size ? fd->chain_memo_size * 2 : 64, j;
++        JSChainMemo *t = js_mallocz_rt(ctx->rt, n * sizeof(*t));
++
++        if (!t)
++            return r; /* not remembered: walked again next time */
++        for (j = 0; j < fd->chain_memo_size; j++) {
++            JSChainMemo *o = &fd->chain_memo[j];
++            uint32_t k;
++            if (o->name == JS_ATOM_NULL)
++                continue;
++            k = ((o->name * 2654435761u) ^ ((uint32_t)o->scope * 40503u)) & (n - 1);
++            while (t[k].name != JS_ATOM_NULL)
++                k = (k + 1) & (n - 1);
++            t[k] = *o;
++        }
++        js_free_rt(ctx->rt, fd->chain_memo);
++        fd->chain_memo = t;
++        fd->chain_memo_size = n;
++    }
++    mask = fd->chain_memo_size - 1;
++    for (i = h & mask; fd->chain_memo[i].name != JS_ATOM_NULL;
++         i = (i + 1) & mask) {
++    }
++    m = &fd->chain_memo[i];
++    m->name = name;
++    m->scope = scope_level;
++    m->result = r;
++    m->with = *with;
++    fd->chain_memo_count++;
++    return r;
++}
++
+ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+                              JSAtom var_name, int scope_level, int op,
+                              DynBuf *bc, uint8_t *bc_buf,
+@@ -32454,6 +32723,26 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+ 
+     /* resolve local scoped variables */
+     var_idx = -1;
++    {
++        bool with;
++        idx = scope_chain_find(ctx, s, scope_level, var_name, &with);
++        if (with)
++            goto local_walk;
++        if (idx >= 0) {
++            vd = &s->vars[idx];
++            if (op == OP_scope_put_var || op == OP_scope_make_ref) {
++                if (vd->is_const) {
++                    dbuf_putc(bc, OP_throw_error);
++                    dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
++                    dbuf_putc(bc, JS_THROW_VAR_RO);
++                    goto done;
++                }
++            }
++            var_idx = idx;
++        }
++        goto local_walked;
++    }
++ local_walk:
+     for (idx = s->scopes[scope_level].first; idx >= 0;) {
+         vd = &s->vars[idx];
+         if (vd->var_name == var_name) {
+@@ -32475,6 +32764,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+         }
+         idx = vd->scope_next;
+     }
++ local_walked:
+     is_arg_scope = (idx == ARG_SCOPE_END);
+     if (var_idx < 0) {
+         /* argument scope: variables are not visible but pseudo
+@@ -32617,8 +32907,25 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+ 
+     /* check parent scopes */
+     for (fd = s; fd->parent;) {
++        bool with;
+         scope_level = fd->parent_scope_level;
+         fd = fd->parent;
++        idx = scope_chain_find(ctx, fd, scope_level, var_name, &with);
++        if (!with) {
++            if (idx >= 0) {
++                vd = &fd->vars[idx];
++                if (op == OP_scope_put_var || op == OP_scope_make_ref) {
++                    if (vd->is_const) {
++                        dbuf_putc(bc, OP_throw_error);
++                        dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
++                        dbuf_putc(bc, JS_THROW_VAR_RO);
++                        goto done;
++                    }
++                }
++                var_idx = idx;
++            }
++            goto parent_walked;
++        }
+         for (idx = fd->scopes[scope_level].first; idx >= 0;) {
+             vd = &fd->vars[idx];
+             if (vd->var_name == var_name) {
+@@ -32643,6 +32950,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+             }
+             idx = vd->scope_next;
+         }
++    parent_walked:
+         is_arg_scope = (idx == ARG_SCOPE_END);
+         if (var_idx >= 0)
+             break;
+@@ -35490,6 +35798,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+             vd->scope_next = fd->scopes[scope].first;
+         }
+     }
++    /* nothing relinks a scope from here on (VitaSurf) */
++    fd->chains_final = true;
+ 
+     /* if the function contains an eval call, the closure variables
+        are used to compile the eval and they must be ordered by scope,
+@@ -36646,6 +36956,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+     fd->body_scope = fd->scope_level;
+ 
+     err = js_parse_program(s);
++    skip_memo_free(s);
+     /* the functions hold the shared text now; the parser is done with it */
+     js_source_release(ctx->rt, s->source_blob, NULL);
+     s->source_blob = NULL;
