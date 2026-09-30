@@ -1,0 +1,534 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 65a7e1fe7..ee1ce1382 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -207,6 +207,33 @@ static bool link_preloads_style(dom_node *node, dom_string *rel)
+ }
+ 
+ 
++/**
++ * Whether a stylesheet's fetch is still to finish.
++ */
++static bool html_css_in_flight(const struct html_stylesheet *s)
++{
++	content_status status;
++
++	/* a failed fetch leaves no handle */
++	if (s->sheet == NULL)
++		return false;
++	/* no content yet is still fetching, though the status of a
++	 * handle without one reads as an error */
++	if (hlcache_handle_get_content(s->sheet) == NULL)
++		return true;
++	status = content_get_status(s->sheet);
++	return status != CONTENT_STATUS_DONE && status != CONTENT_STATUS_ERROR;
++}
++
++/**
++ * Whether a stylesheet is for another medium than the screen.
++ */
++static bool html_css_sheet_unused(const struct html_stylesheet *s)
++{
++	return s->node != NULL ? css_sheet_unused(s->node, NULL, NULL) :
++			s->unused;
++}
++
+ /**
+  * Callback for fetchcache() for stylesheets.
+  */
+@@ -312,6 +339,13 @@ html_convert_css_callback(hlcache_handle *css,
+ 		break;
+ 	}
+ 
++	/* a parser script waiting for the stylesheets runs once they are
++	 * in, before the document can be converted (VitaSurf) */
++	if (event->type == CONTENT_MSG_DONE ||
++	    event->type == CONTENT_MSG_ERROR) {
++		html_script_css_settled(parent);
++	}
++
+ 	if (parent->select_ctx != NULL) {
+ 		/*
+ 		 * The page was styled and laid out already: this sheet is
+@@ -324,8 +358,9 @@ html_convert_css_callback(hlcache_handle *css,
+ 		 * deferred scripts a second time; the selection context
+ 		 * is rebuilt from the sheet list and the boxes with it.
+ 		 */
+-		if (event->type == CONTENT_MSG_DONE ||
+-		    event->type == CONTENT_MSG_ERROR) {
++		if ((event->type == CONTENT_MSG_DONE ||
++		     event->type == CONTENT_MSG_ERROR) &&
++		    !(s->is_link && html_css_sheet_unused(s))) {
+ 			parent->late_css_retries = 0;
+ 			guit->misc->schedule(0, html_css_late_rebuild, parent);
+ 		}
+@@ -333,10 +368,50 @@ html_convert_css_callback(hlcache_handle *css,
+ 		html_begin_conversion(parent);
+ 	}
+ 
++	/* the page did not wait for a sheet for another medium, but it
++	 * is not done without it (VitaSurf) */
++	if (parent->conversion_begun &&
++	    (event->type == CONTENT_MSG_DONE ||
++	     event->type == CONTENT_MSG_ERROR)) {
++		html_proceed_to_done(parent);
++	}
++
+ 	return NSERROR_OK;
+ }
+ 
+ 
++/* exported function documented in html/css.h */
++unsigned int html_css_unused_in_flight(html_content *c)
++{
++	unsigned int i, n = 0;
++
++	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
++		const struct html_stylesheet *s = &c->stylesheets[i];
++
++		if (s->is_link && html_css_in_flight(s) &&
++		    html_css_sheet_unused(s))
++			n++;
++	}
++	return n;
++}
++
++/* exported function documented in html/css.h */
++bool html_css_blocks_scripts(html_content *c)
++{
++	unsigned int i;
++
++	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
++		const struct html_stylesheet *s = &c->stylesheets[i];
++
++		/* one for another medium does not hold scripts up */
++		if (s->blocks_scripts && html_css_in_flight(s) &&
++		    !html_css_sheet_unused(s))
++			return true;
++	}
++	return false;
++}
++
++
+ /* exported function documented in html/css.h */
+ void html_css_link_changed(html_content *c, dom_node *node, dom_string *name,
+ 		dom_string *value)
+@@ -584,6 +659,7 @@ html_create_style_element(html_content *c, dom_node *style)
+ 	c->stylesheets[c->stylesheet_count].modified = false;
+ 	c->stylesheets[c->stylesheet_count].unused = false;
+ 	c->stylesheets[c->stylesheet_count].is_link = false;
++	c->stylesheets[c->stylesheet_count].blocks_scripts = false;
+ 	c->stylesheets[c->stylesheet_count].override = NULL;
+ 	c->stylesheet_count++;
+ 
+@@ -845,6 +921,9 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	 * (VitaSurf).
+ 	 */
+ 	htmlc->stylesheets[htmlc->stylesheet_count].is_link = true;
++	/* one the parser met, not one a script added (VitaSurf) */
++	htmlc->stylesheets[htmlc->stylesheet_count].blocks_scripts =
++			htmlc->parsing > 0 && htmlc->script_depth == 0;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].override = NULL;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].modified = false;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].unused =
+diff --git a/content/handlers/html/css.h b/content/handlers/html/css.h
+index 9b61ad6db..11a095e6d 100644
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -62,6 +62,25 @@ nserror html_css_early_selection_context(struct html_content *c,
+ 		css_select_ctx **select_ctx, css_stylesheet ***owned,
+ 		unsigned int *n_owned);
+ 
++/**
++ * Whether a stylesheet the parser met is still loading, which a parser
++ * script waits for (VitaSurf).
++ *
++ * \param c  the document
++ * \return true if a script should wait
++ */
++bool html_css_blocks_scripts(struct html_content *c);
++
++/**
++ * Count the linked stylesheets for another medium still being fetched.
++ *
++ * The document is converted without waiting for them (VitaSurf).
++ *
++ * \param c html content
++ * \return the number of them
++ */
++unsigned int html_css_unused_in_flight(struct html_content *c);
++
+ /** Destroy the sheets html_css_early_selection_context parsed (VitaSurf). */
+ void html_css_free_owned(css_stylesheet **owned, unsigned int n_owned);
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 69a99925e..6fd3df9e6 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -768,7 +768,7 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 	parse_params.fix_enc = true;
+ 	parse_params.enable_script = c->enable_scripting;
+ 	parse_params.msg = NULL;
+-	parse_params.script = html_process_script;
++	parse_params.script = html_process_script_parser;
+ 	parse_params.ctx = c;
+ 	parse_params.daf = html_dom_event_fetcher;
+ 
+@@ -916,7 +916,7 @@ html_process_encoding_change(struct content *c,
+ 	parse_params.fix_enc = true;
+ 	parse_params.enable_script = html->enable_scripting;
+ 	parse_params.msg = NULL;
+-	parse_params.script = html_process_script;
++	parse_params.script = html_process_script_parser;
+ 	parse_params.ctx = html;
+ 	parse_params.daf = html_dom_event_fetcher;
+ 
+@@ -950,9 +950,11 @@ html_process_encoding_change(struct content *c,
+ 	 * the encoding is now specified at parser start which means
+ 	 * it cannot be changed again.
+ 	 */
++	html->parsing++;
+ 	error = dom_hubbub_parser_parse_chunk(html->parser,
+ 					      source_data,
+ 					      source_size);
++	html->parsing--;
+ 	html->bytes_parsed = source_size;
+ 
+ 	return libdom_hubbub_error_to_nserror(error);
+@@ -988,9 +990,11 @@ html_process_data(struct content *c, const char *data, unsigned int size)
+ 	unsigned int spent;
+ 
+ 	nsu_getmonotonic_ms(&t0);
++	html->parsing++;
+ 	dom_ret = dom_hubbub_parser_parse_chunk(html->parser,
+ 					      (const uint8_t *) data,
+ 					      size);
++	html->parsing--;
+ 	nsu_getmonotonic_ms(&t1);
+ 	spent = (unsigned int)(t1 - t0);
+ 	{
+@@ -1070,13 +1074,28 @@ static bool html_convert(struct content *c)
+ 	return true;
+ }
+ 
++/**
++ * Whether the fetches the conversion waits for are all in.
++ *
++ * Stylesheets for another medium are not among them: they style
++ * nothing on the screen, and <link media="print"
++ * onload="this.media='all'"> is how a page asks for one not to hold it
++ * up. The content is not done until they are in (VitaSurf).
++ */
++static bool html_fetches_settled(html_content *htmlc)
++{
++	if (htmlc->base.active == 0)
++		return true;
++	return htmlc->base.active == html_css_unused_in_flight(htmlc);
++}
++
+ /* Exported interface documented in html_internal.h */
+ bool html_can_begin_conversion(html_content *htmlc)
+ {
+ 	unsigned int i;
+ 
+ 	/* Cannot begin conversion if we're still fetching stuff */
+-	if (htmlc->base.active != 0)
++	if (!html_fetches_settled(htmlc))
+ 		return false;
+ 
+ 	for (i = 0; i != htmlc->stylesheet_count; i++) {
+@@ -1182,6 +1201,22 @@ html_begin_conversion_inner(html_content *htmlc)
+ 	dom_string *node_name = NULL;
+ 	dom_hubbub_error error;
+ 
++	/*
++	 * It began before, and the boxes wait for a fetch the page
++	 * started meanwhile: run any script that came in and build them
++	 * once nothing else is owed. Starting it again fired
++	 * DOMContentLoaded a second time (VitaSurf).
++	 */
++	if (htmlc->conversion_begun) {
++		html_script_exec(htmlc, false);
++		if (htmlc->select_ctx == NULL && !htmlc->aborted &&
++		    html_fetches_settled(htmlc)) {
++			html_finish_conversion(htmlc);
++		}
++		html_proceed_to_done(htmlc);
++		return true;
++	}
++
+ 	/* The act of completing the parse can result in additional data
+ 	 * being flushed through the parser. This may result in new style or
+ 	 * script nodes, upon which the conversion depends. Thus, once we
+@@ -1212,15 +1247,19 @@ html_begin_conversion_inner(html_content *htmlc)
+ 			vita_log("parse: the parser was %u bytes short of the "
+ 				 "document; handing them over before the end",
+ 				 (unsigned) owed);
++			htmlc->parsing++;
+ 			dom_hubbub_parser_parse_chunk(htmlc->parser,
+ 					source_data + htmlc->bytes_parsed,
+ 					owed);
++			htmlc->parsing--;
+ 			htmlc->bytes_parsed = source_size;
+ 		}
+ 
+ 		NSLOG(netsurf, INFO, "Completing parse (%p)", htmlc);
+ 		/* complete parsing */
++		htmlc->parsing++;
+ 		error = dom_hubbub_parser_completed(htmlc->parser);
++		htmlc->parsing--;
+ 		if (error == DOM_HUBBUB_HUBBUB_ERR_PAUSED && htmlc->base.active > 0) {
+ 			/* The act of completing the parse failed because we've
+ 			 * encountered a sync script which needs to run
+@@ -1335,7 +1374,7 @@ html_begin_conversion_inner(html_content *htmlc)
+ 
+ 	dom_node_unref(html);
+ 
+-	if (htmlc->base.active == 0) {
++	if (html_fetches_settled(htmlc)) {
+ 		html_finish_conversion(htmlc);
+ 	}
+ 
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 95b38beca..d93748a79 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -61,6 +61,9 @@ struct html_stylesheet {
+ 	bool modified;
+ 	bool unused;
+ 	bool is_link;	/**< the node is a LINK, not a STYLE (VitaSurf) */
++	/** a LINK the parser made: a parser script waits while it loads,
++	 * as it would in a browser (VitaSurf) */
++	bool blocks_scripts;
+ 	/** what script made of a STYLE's sheet through insertRule and
+ 	 * the like, read instead of its text; malloc'd (VitaSurf) */
+ 	char *override;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 6ca01e5bc..4727fa5a8 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -200,6 +200,12 @@ typedef struct html_content {
+ 	 * nested, so the fourth is never read.
+ 	 */
+ 	unsigned int script_depth;
++	/** how deep we are inside the document's own parser, feeding or
++	 * resuming it; a LINK met there is the parser's (VitaSurf) */
++	unsigned int parsing;
++	/** a parser script waiting for the stylesheets before it to load,
++	 * with the parser paused on it (VitaSurf) */
++	struct dom_node *blocked_script;
+ 	struct html_script *scripts;
+ 	/** javascript thread in use */
+ 	struct jsthread *jsthread;
+@@ -509,6 +515,19 @@ bool html_redraw_inline_borders(struct box *box, struct rect b,
+ /* in html/script.c */
+ dom_hubbub_error html_process_script(void *ctx, dom_node *node);
+ 
++/**
++ * The parser's script callback (VitaSurf): a classic script that would
++ * run now waits, with the parser paused on it, while a stylesheet the
++ * parser met before it is still loading, as a browser's does.
++ */
++dom_hubbub_error html_process_script_parser(void *ctx, dom_node *node);
++
++/**
++ * A stylesheet finished loading or failed: run the parser script that
++ * waited for it, if nothing else still holds it up (VitaSurf).
++ */
++void html_script_css_settled(html_content *c);
++
+ /**
+  * The script element whose inline text is running right now, or NULL.
+  *
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 080fa852c..358d75e39 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -44,6 +44,9 @@
+ 
+ #include "html/html.h"
+ #include "html/private.h"
++#include "html/css.h"
++#include "netsurf/misc.h"
++#include "desktop/gui_internal.h"
+ 
+ typedef bool (script_handler_t)(struct jsthread *jsthread, const uint8_t *data, size_t size, const char *name);
+ 
+@@ -151,6 +154,16 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 	return NSERROR_OK;
+ }
+ 
++/** Run the async scripts that have arrived, before the conversion
++ * (VitaSurf). */
++static void html_script_async_soon(void *p)
++{
++	html_content *c = p;
++
++	if (c->jsthread != NULL && !c->aborted)
++		(void) html_script_exec(c, false);
++}
++
+ /* create new html script entry */
+ static struct html_script *
+ html_process_new_script(html_content *c,
+@@ -559,6 +572,18 @@ convert_script_async_cb(hlcache_handle *script,
+ 		script_fetch_settled(parent);
+ 		return err;
+ 	}
++
++	/*
++	 * An async script runs as soon as it is here, parsing or not
++	 * (VitaSurf). It waited for the conversion, which waits for every
++	 * fetch the page started, and so for the slowest stylesheet on
++	 * the page. It runs in a task of its own, not inside whatever
++	 * delivered it, which may be the parser handing a cached script
++	 * over.
++	 */
++	else if (parent->jsthread != NULL && event->type == CONTENT_MSG_DONE) {
++		guit->misc->schedule(0, html_script_async_soon, parent);
++	}
+ 	script_fetch_settled(parent);
+ 
+ 	return NSERROR_OK;
+@@ -699,7 +724,9 @@ convert_script_sync_cb(hlcache_handle *script,
+ 
+ 		/* continue parse */
+ 		if (parent->parser != NULL && active_sync_scripts == 0) {
++			parent->parsing++;
+ 			err = dom_hubbub_parser_pause(parent->parser, false);
++			parent->parsing--;
+ 			if (err != DOM_HUBBUB_OK) {
+ 				NSLOG(netsurf, INFO, "unpause returned 0x%x", err);
+ 			}
+@@ -745,7 +772,9 @@ convert_script_sync_cb(hlcache_handle *script,
+ 
+ 		/* continue parse */
+ 		if (parent->parser != NULL && active_sync_scripts == 0) {
++			parent->parsing++;
+ 			err = dom_hubbub_parser_pause(parent->parser, false);
++			parent->parsing--;
+ 			if (err != DOM_HUBBUB_OK) {
+ 				NSLOG(netsurf, INFO, "unpause returned 0x%x", err);
+ 			}
+@@ -1217,6 +1246,105 @@ html_process_script(void *ctx, dom_node *node)
+ 	return err;
+ }
+ 
++/*
++ * Script-blocking stylesheets (VitaSurf).
++ *
++ * A browser does not run a parser script while a stylesheet the parser
++ * met before it is still loading: a script that reads a style or a size
++ * gets the page as styled. Here the parser is paused on the script, as
++ * it is for a script being fetched, and the script runs when the last
++ * such stylesheet arrives or fails. A stylesheet that never arrives
++ * would hold the page for ever, so after a while the script runs
++ * without it, as it did before.
++ */
++#define SCRIPT_CSS_WAIT_MS 10000
++
++static void html_script_run_blocked(html_content *c);
++
++static void html_script_css_timeout(void *p)
++{
++	html_content *c = p;
++
++	if (c->blocked_script == NULL)
++		return;
++	vita_log("script: stylesheets still loading after %u ms; the "
++		 "script runs without them", (unsigned) SCRIPT_CSS_WAIT_MS);
++	html_script_run_blocked(c);
++}
++
++static void html_script_run_blocked(html_content *c)
++{
++	dom_node *node = c->blocked_script;
++	dom_hubbub_error err;
++
++	if (node == NULL)
++		return;
++	c->blocked_script = NULL;
++	guit->misc->schedule(-1, html_script_css_timeout, c);
++
++	err = html_process_script(c, node);
++	dom_node_unref(node);
++
++	/* an external script now being fetched keeps the parser paused,
++	 * and lifts the pause itself once it has run */
++	if (err != (DOM_HUBBUB_HUBBUB_ERR | HUBBUB_PAUSED) &&
++	    c->parser != NULL) {
++		c->parsing++;
++		dom_hubbub_parser_pause(c->parser, false);
++		c->parsing--;
++	}
++}
++
++/* exported internal interface documented in html/private.h */
++void html_script_css_settled(html_content *c)
++{
++	if (c->blocked_script != NULL && !html_css_blocks_scripts(c))
++		html_script_run_blocked(c);
++}
++
++/** Whether a parser script runs as soon as it is met: a classic one,
++ * inline or fetched without async or defer. */
++static bool script_runs_now(dom_node *node)
++{
++	dom_string *type = NULL, *src = NULL;
++	bool now = true, flag = false;
++
++	if (dom_element_get_attribute(node, corestring_dom_type, &type) ==
++			DOM_NO_ERR && type != NULL) {
++		if (script_type_is_module(type))
++			now = false;
++		dom_string_unref(type);
++	}
++	if (now && dom_element_get_attribute(node, corestring_dom_src,
++			&src) == DOM_NO_ERR && src != NULL) {
++		dom_string_unref(src);
++		if ((dom_element_has_attribute(node, corestring_dom_async,
++				&flag) == DOM_NO_ERR && flag) ||
++		    (dom_element_has_attribute(node, corestring_dom_defer,
++				&flag) == DOM_NO_ERR && flag))
++			now = false;
++	}
++	return now;
++}
++
++/* exported internal interface documented in html/private.h */
++dom_hubbub_error html_process_script_parser(void *ctx, dom_node *node)
++{
++	html_content *c = (html_content *) ctx;
++
++	if (c->parser != NULL && !c->parse_completed &&
++	    c->blocked_script == NULL && c->script_depth == 0 &&
++	    script_runs_now(node) && html_css_blocks_scripts(c)) {
++		/* not run twice by the pass that finds dropped scripts */
++		script_mark_seen(node);
++		c->blocked_script = dom_node_ref(node);
++		guit->misc->schedule(SCRIPT_CSS_WAIT_MS,
++				     html_script_css_timeout, c);
++		return DOM_HUBBUB_HUBBUB_ERR | HUBBUB_PAUSED;
++	}
++	return html_process_script(ctx, node);
++}
++
+ /* exported internal interface documented in html/html_internal.h */
+ bool html_saw_insecure_scripts(html_content *htmlc)
+ {
+@@ -1247,6 +1375,15 @@ nserror html_script_free(html_content *html)
+ {
+ 	unsigned int i;
+ 
++	guit->misc->schedule(-1, html_script_async_soon, html);
++
++	/* a script still waiting for stylesheets never runs (VitaSurf) */
++	if (html->blocked_script != NULL) {
++		guit->misc->schedule(-1, html_script_css_timeout, html);
++		dom_node_unref(html->blocked_script);
++		html->blocked_script = NULL;
++	}
++
+ 	for (i = 0; i != html->scripts_count; i++) {
+ 		if (html->scripts[i].asked != NULL) {
+ 			nsurl_unref(html->scripts[i].asked);

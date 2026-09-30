@@ -3,14 +3,15 @@
      reach the window's load listeners: it did, and window.onload ran
      twice, the first time with the document still loading. The window's
      own load event is aimed at the document. A script's navigation
-     happens after the script returns, not inside it. -->
-<html><head><title>t</title><link rel="stylesheet" href="resources/plain.css"></head><body><div id="out"></div>
+     happens after the script returns, not inside it. The link's listener
+     goes on before the link: a script after it waits for the stylesheet,
+     and so for its load event too. -->
+<html><head><title>t</title><script>var linkLoads = 0;</script><link rel="stylesheet" href="resources/plain.css" onload="linkLoads++"></head><body><div id="out"></div>
 <script>
 function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
-var calls = 0, states = [], targets = [], linkLoads = 0, bodyLoads = 0, bubbled = 0;
+var calls = 0, states = [], targets = [], bodyLoads = 0, bubbled = 0;
 window.onload = function (e) { calls++; states.push(document.readyState);
  targets.push(e.target === document ? 'document' : (e.target && e.target.nodeName)); };
-document.querySelector('link').addEventListener('load', function () { linkLoads++; });
 document.body.addEventListener('load', function () { bodyLoads++; });
 document.body.addEventListener('custom', function () { bubbled++; });
 window.addEventListener('load', function () { setTimeout(function () {

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<!-- A parser script after a linked stylesheet waits for it, so it sees
+     the page styled: it ran as soon as the parser got to it and read the
+     colours from before the sheet came in. A sheet for another medium
+     and one that fails do not hold it up. -->
+<html><head><title>t</title>
+<link rel="stylesheet" href="resources/blocking.css">
+<link rel="stylesheet" media="print" href="resources/plain.css">
+<link rel="stylesheet" href="resources/missing.css">
+<script>
+var inlineColor = getComputedStyle(document.documentElement).color;
+</script>
+</head><body><div id="out"></div>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+ok("the head script saw the stylesheet (" + inlineColor + ")", inlineColor === 'rgb(1, 2, 3)');
+ok("so did the body script", getComputedStyle(document.body).color === 'rgb(1, 2, 3)');
+</script></body></html>
