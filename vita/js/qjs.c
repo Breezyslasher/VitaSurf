@@ -10609,7 +10609,9 @@ static css_select_results *select_without_box(jsthread *thread,
 	int depth = 0, i;
 	bool have_layout = layout_current(thread);
 
-	if (htmlc == NULL || htmlc->select_ctx == NULL)
+	/* before conversion html_select_style uses the sheets loaded so
+	 * far */
+	if (htmlc == NULL)
 		return NULL;
 	/* the element and its element ancestors, nearest first */
 	n = dom_node_ref(node);

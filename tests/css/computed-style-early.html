@@ -13,12 +13,17 @@
    box to read a style from, and getComputedStyle gave the defaults:
    auto, auto, rgb(0, 0, 0). A script asking at load time or about a
    hidden panel saw the wrong answers. While the page is still being
-   parsed there is no selection context yet, and the defaults remain. */
+   parsed the STYLE sheets are still being fetched, and a browser applies
+   them already: they are parsed there and then for the answer. */
 var o = document.getElementById('out');
 function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
   try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
 function S(id){ return getComputedStyle(document.getElementById(id)); }
+T('while parsing: cursor, pointer-events, color, display (pointer none rgb(10, 20, 30) block)',
+  [S('a').cursor, S('a').pointerEvents, S('a').color, S('a').display].join(' '));
+var parsingSize = S('c').fontSize;
 window.addEventListener('load', function(){
+  T('font size while parsing and at load agree (20px 20px)', parsingSize + ' ' + S('c').fontSize);
   T('at load: cursor (pointer)', S('a').cursor);
   T('display: none element (none rgb(1, 2, 3))', S('b').display + ' ' + S('b').color);
   T('inside display: none, inherited colour (rgb(1, 2, 3))', S('bi').color);

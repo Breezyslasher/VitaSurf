@@ -1,0 +1,570 @@
+diff --git a/content/fetchers/resource.c b/content/fetchers/resource.c
+index 360d4e0c1..d66d6b4d3 100644
+--- a/content/fetchers/resource.c
++++ b/content/fetchers/resource.c
+@@ -312,6 +312,27 @@ static bool fetch_resource_initialise(lwc_string *scheme)
+ }
+ 
+ /** callback to finalise the resource fetcher. */
++/* exported interface documented in content/fetchers/resource.h */
++nserror fetch_resource_lookup(const char *path, const uint8_t **data,
++		size_t *data_len, struct nsurl **redirect)
++{
++	uint32_t i;
++
++	*data = NULL;
++	*data_len = 0;
++	*redirect = NULL;
++	for (i = 0; i < fetch_resource_path_count; i++) {
++		if (strcmp(lwc_string_data(fetch_resource_map[i].path),
++				path) == 0) {
++			*data = fetch_resource_map[i].data;
++			*data_len = fetch_resource_map[i].data_len;
++			*redirect = fetch_resource_map[i].redirect_url;
++			return NSERROR_OK;
++		}
++	}
++	return NSERROR_NOT_FOUND;
++}
++
+ static void fetch_resource_finalise(lwc_string *scheme)
+ {
+ 	uint32_t i;
+diff --git a/content/fetchers/resource.h b/content/fetchers/resource.h
+index 8c7b2d10c..36c6aabb9 100644
+--- a/content/fetchers/resource.h
++++ b/content/fetchers/resource.h
+@@ -40,4 +40,18 @@
+  */
+ nserror fetch_resource_register(void);
+ 
++/**
++ * Where a resource scheme path's data is (VitaSurf): the frontend's
++ * data, or the URL the scheme redirects to, as the scheme found them
++ * when it started. Neither is to be freed.
++ *
++ * \param path      the path, as "default.css"
++ * \param data      receives the data, or NULL
++ * \param data_len  receives its length
++ * \param redirect  receives the URL, or NULL
++ * \return NSERROR_OK if the path is one the scheme knows
++ */
++nserror fetch_resource_lookup(const char *path, const uint8_t **data,
++		size_t *data_len, struct nsurl **redirect);
++
+ #endif
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 759354b33..272b03da9 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -386,9 +386,18 @@ css_select_results *html_select_style(html_content *c,
+ 	css_select_results *res;
+ 	dom_node *parent = NULL;
+ 	void *kept, *kept_parent = NULL;
++	bool early = false;
+ 
+-	if (c == NULL || c->select_ctx == NULL || n == NULL)
++	if (c == NULL || n == NULL)
+ 		return NULL;
++	if (c->select_ctx == NULL) {
++		/* before conversion: the sheets loaded so far, lent to
++		 * box_get_style for this one selection */
++		c->select_ctx = html_select_ctx_early(c);
++		if (c->select_ctx == NULL)
++			return NULL;
++		early = true;
++	}
+ 	/* libcss keeps what it selected on the node, and on its parent
+ 	 * when that had nothing, and box construction insists on finding
+ 	 * nothing there: put back what was there on both */
+@@ -402,6 +411,8 @@ css_select_results *html_select_style(html_content *c,
+ 		nscss_put_node_data(parent, kept_parent);
+ 		dom_node_unref(parent);
+ 	}
++	if (early)
++		c->select_ctx = NULL;
+ 	return res;
+ }
+ 
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 37abc3c4b..65a7e1fe7 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -24,6 +24,7 @@
+ #include "utils/config.h"
+ 
+ #include <assert.h>
++#include <stdio.h>
+ #include <ctype.h>
+ #include <stdint.h>
+ #include <string.h>
+@@ -46,6 +47,10 @@
+ #include "html/html.h"
+ #include "html/private.h"
+ #include "html/css.h"
++#include "css/internal.h"
++#include "desktop/system_colour.h"
++#include "utils/file.h"
++#include "content/fetchers/resource.h"
+ 
+ static nsurl *html_default_stylesheet_url;
+ static nsurl *html_adblock_stylesheet_url;
+@@ -655,6 +660,8 @@ bool html_css_update_style(html_content *c, dom_node *style)
+ 	unsigned int i;
+ 	struct html_stylesheet *s;
+ 
++	c->css_generation++;	/* VitaSurf */
++
+ 	/* Find sheet */
+ 	for (i = 0, s = c->stylesheets;	i != c->stylesheet_count; i++, s++) {
+ 		if (s->node == style)
+@@ -689,6 +696,8 @@ bool html_css_set_style_text(html_content *c, dom_node *style,
+ 	struct html_stylesheet *s;
+ 	char *copy = NULL;
+ 
++	c->css_generation++;	/* VitaSurf */
++
+ 	if (text != NULL) {
+ 		copy = strdup(text);
+ 		if (copy == NULL)
+@@ -718,6 +727,8 @@ bool html_css_process_style(html_content *c, dom_node *node)
+ 	unsigned int i;
+ 	struct html_stylesheet *s;
+ 
++	c->css_generation++;	/* VitaSurf */
++
+ 	/* Find sheet */
+ 	for (i = 0, s = c->stylesheets;	i != c->stylesheet_count; i++, s++) {
+ 		if (s->node == node)
+@@ -751,6 +762,8 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	nserror ns_error;
+ 	hlcache_child_context child;
+ 
++	htmlc->css_generation++;	/* VitaSurf */
++
+ 	html_css_set_root_hints(htmlc);
+ 
+ 	/* rel=<space separated list, including 'stylesheet'> */
+@@ -1083,14 +1096,186 @@ nserror html_css_new_stylesheets(html_content *c)
+ }
+ 
+ 
+-/* exported function documented in html/css.h */
+-nserror
+-html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
++/**
++ * A sheet parsed there and then from text (VitaSurf), as the CSS content
++ * handler would parse it, for a selection made before its fetch is done.
++ * Its imports are not fetched; the sheet is used without them.
++ */
++static css_stylesheet *html_css_parse_now(html_content *c, const uint8_t *data,
++		size_t len)
++{
++	css_stylesheet_params params;
++	css_stylesheet *sheet = NULL;
++	css_error error;
++
++	memset(&params, 0, sizeof(params));
++	params.params_version = CSS_STYLESHEET_PARAMS_VERSION_1;
++	params.level = CSS_LEVEL_DEFAULT;
++	params.charset = c->encoding;
++	params.url = nsurl_access(c->base_url);
++	params.allow_quirks = c->base.quirks;
++	params.inline_style = false;
++	params.resolve = nscss_resolve_url;
++	params.color = ns_system_colour;
++
++	if (css_stylesheet_create(&params, &sheet) != CSS_OK)
++		return NULL;
++	error = css_stylesheet_append_data(sheet, data, len);
++	if (error != CSS_OK && error != CSS_NEEDDATA) {
++		css_stylesheet_destroy(sheet);
++		return NULL;
++	}
++	error = css_stylesheet_data_done(sheet);
++	if (error != CSS_OK && error != CSS_IMPORTS_PENDING) {
++		css_stylesheet_destroy(sheet);
++		return NULL;
++	}
++	return sheet;
++}
++
++/**
++ * A built-in sheet read there and then (VitaSurf): resource:default.css
++ * and the like, from the frontend's data or from the file its URL names,
++ * for the first document, which can ask before their fetches deliver.
++ */
++static css_stylesheet *html_css_resource_now(html_content *c,
++		hlcache_handle *h)
++{
++	nsurl *url = hlcache_handle_get_url(h);
++	lwc_string *scheme, *lpath;
++	const char *path;
++	const uint8_t *data = NULL;
++	size_t size = 0;
++	css_stylesheet *sheet = NULL;
++	nsurl *file_url;
++	char *file_path = NULL;
++	bool match = false;
++
++	if (url == NULL)
++		return NULL;
++	scheme = nsurl_get_component(url, NSURL_SCHEME);
++	if (scheme == NULL)
++		return NULL;
++	match = (strcmp(lwc_string_data(scheme), "resource") == 0);
++	if (!match && strcmp(lwc_string_data(scheme), "file") == 0) {
++		/* the fetch has already followed the scheme's redirect */
++		lwc_string_unref(scheme);
++		lpath = NULL;
++		file_url = url;
++		goto read_file;
++	}
++	lwc_string_unref(scheme);
++	if (!match)
++		return NULL;
++	lpath = nsurl_get_component(url, NSURL_PATH);
++	if (lpath == NULL)
++		return NULL;
++	path = lwc_string_data(lpath);
++	while (*path == '/')
++		path++;
++
++	if (fetch_resource_lookup(path, &data, &size, &file_url) !=
++			NSERROR_OK) {
++		lwc_string_unref(lpath);
++		return NULL;
++	}
++read_file:
++	if (data != NULL && size > 0) {
++		sheet = html_css_parse_now(c, data, size);
++	} else if (file_url != NULL &&
++		   netsurf_nsurl_to_path(file_url, &file_path) == NSERROR_OK &&
++		   file_path != NULL) {
++		FILE *fp = fopen(file_path, "rb");
++
++		if (fp != NULL) {
++			long len;
++
++			if (fseek(fp, 0, SEEK_END) == 0 &&
++			    (len = ftell(fp)) > 0 &&
++			    fseek(fp, 0, SEEK_SET) == 0) {
++				uint8_t *buf = malloc((size_t) len);
++
++				if (buf != NULL) {
++					if (fread(buf, 1, (size_t) len, fp) ==
++							(size_t) len)
++						sheet = html_css_parse_now(c,
++							buf, (size_t) len);
++					free(buf);
++				}
++			}
++			fclose(fp);
++		}
++		free(file_path);
++	}
++	if (lpath != NULL)
++		lwc_string_unref(lpath);
++	return sheet;
++}
++
++/**
++ * The text of a sheet whose fetch has not finished, parsed now (VitaSurf):
++ * a STYLE's own text, which a browser applies as soon as it is parsed,
++ * and a built-in sheet whose data has arrived. A LINK still loading is
++ * left out, as it has nothing to read yet.
++ */
++static css_stylesheet *html_css_sheet_now(html_content *c, uint32_t i)
++{
++	const struct html_stylesheet *hsheet = &c->stylesheets[i];
++	css_stylesheet *sheet = NULL;
++
++	if (hsheet->node != NULL && !hsheet->is_link) {
++		if (hsheet->override != NULL) {
++			sheet = html_css_parse_now(c,
++					(const uint8_t *) hsheet->override,
++					strlen(hsheet->override));
++		} else {
++			dom_string *text = NULL;
++
++			if (dom_node_get_text_content(hsheet->node, &text) ==
++					DOM_NO_ERR && text != NULL) {
++				sheet = html_css_parse_now(c,
++						(const uint8_t *)
++						dom_string_data(text),
++						dom_string_byte_length(text));
++				dom_string_unref(text);
++			}
++		}
++	} else if (hsheet->node == NULL && i < STYLESHEET_START &&
++			hsheet->sheet != NULL) {
++		size_t size = 0;
++		const uint8_t *data = content_get_source_data(hsheet->sheet,
++				&size);
++
++		if (data != NULL && size > 0)
++			sheet = html_css_parse_now(c, data, size);
++		else
++			sheet = html_css_resource_now(c, hsheet->sheet);
++	}
++	return sheet;
++}
++
++/**
++ * Build a selection context from the document's sheets (VitaSurf: the
++ * builder behind html_css_new_selection_context). Early, for a script
++ * asking for a style before the document is converted, it also parses
++ * the sheets whose fetches are not done, and hands them back in owned,
++ * to destroy after the context.
++ */
++static nserror
++html_css_build_selection_context(html_content *c,
++		css_select_ctx **ret_select_ctx, bool early,
++		css_stylesheet ***owned, unsigned int *n_owned)
+ {
+ 	uint32_t i;
+ 	css_error css_ret;
+ 	css_select_ctx *select_ctx;
+ 
++	if (early) {
++		*owned = NULL;
++		*n_owned = 0;
++		html_css_set_root_hints(c);
++	}
++
+ 	/* check that the base stylesheet loaded; layout fails without it */
+ 	if (c->stylesheets[STYLESHEET_BASE].sheet == NULL) {
+ 		return NSERROR_CSS_BASE;
+@@ -1133,6 +1318,21 @@ html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
+ 		if (hsheet->sheet != NULL &&
+ 		    content_get_status(hsheet->sheet) == CONTENT_STATUS_DONE) {
+ 			sheet = nscss_get_stylesheet(hsheet->sheet);
++		} else if (early) {
++			sheet = html_css_sheet_now(c, i);
++			if (sheet != NULL) {
++				css_stylesheet **grown = realloc(*owned,
++						(*n_owned + 1) *
++						sizeof(**owned));
++
++				if (grown == NULL) {
++					css_stylesheet_destroy(sheet);
++					sheet = NULL;
++				} else {
++					*owned = grown;
++					(*owned)[(*n_owned)++] = sheet;
++				}
++			}
+ 		}
+ 
+ 		if (sheet != NULL) {
+@@ -1145,6 +1345,8 @@ html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
+ 							      "screen");
+ 			if (css_ret != CSS_OK) {
+ 				css_select_ctx_destroy(select_ctx);
++				if (early)
++					html_css_free_owned(*owned, *n_owned);
+ 				return css_error_to_nserror(css_ret);
+ 			}
+ 		}
+@@ -1166,7 +1368,9 @@ html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
+ 		nsu_getmonotonic_ms(&t1);
+ 		vitasurf_css_index_builds++;
+ 		vitasurf_ms_css_index += (unsigned int) (t1 - t0);
+-		if (ierr == CSS_OK) {
++		if (early) {
++			/* not logged: a script may ask more than once */
++		} else if (ierr == CSS_OK) {
+ 			vita_log("css: index of %u rules from %u sheets "
+ 				 "built in %u ms, %u KB",
+ 				 (unsigned int) entries, (unsigned int) sheets,
+@@ -1183,6 +1387,33 @@ html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
+ 	return NSERROR_OK;
+ }
+ 
++/* exported function documented in html/css.h */
++nserror
++html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
++{
++	return html_css_build_selection_context(c, ret_select_ctx, false,
++			NULL, NULL);
++}
++
++/* exported function documented in html/css.h */
++nserror html_css_early_selection_context(html_content *c,
++		css_select_ctx **ret_select_ctx, css_stylesheet ***owned,
++		unsigned int *n_owned)
++{
++	return html_css_build_selection_context(c, ret_select_ctx, true,
++			owned, n_owned);
++}
++
++/* exported function documented in html/css.h */
++void html_css_free_owned(css_stylesheet **owned, unsigned int n_owned)
++{
++	unsigned int i;
++
++	for (i = 0; i < n_owned; i++)
++		css_stylesheet_destroy(owned[i]);
++	free(owned);
++}
++
+ 
+ /* exported function documented in html/css.h */
+ nserror html_css_init(void)
+diff --git a/content/handlers/html/css.h b/content/handlers/html/css.h
+index d04558f56..9b61ad6db 100644
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -45,6 +45,26 @@ void html_css_fini(void);
+  */
+ nserror html_css_new_selection_context(struct html_content *c, css_select_ctx **select_ctx);
+ 
++/**
++ * A selection context for a script asking for a style before the
++ * document is converted (VitaSurf): the sheets done so far, and those
++ * still fetching that can be parsed now -- a STYLE's text and a built-in
++ * sheet whose data has arrived.
++ *
++ * \param c           the document
++ * \param select_ctx  receives the context
++ * \param owned       receives the sheets parsed for it, to destroy with
++ *                    html_css_free_owned after the context
++ * \param n_owned     receives how many
++ * \return NSERROR_OK on success
++ */
++nserror html_css_early_selection_context(struct html_content *c,
++		css_select_ctx **select_ctx, css_stylesheet ***owned,
++		unsigned int *n_owned);
++
++/** Destroy the sheets html_css_early_selection_context parsed (VitaSurf). */
++void html_css_free_owned(css_stylesheet **owned, unsigned int n_owned);
++
+ /**
+  * Initialise core stylesheets for a content
+  *
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index b76822844..69a99925e 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -329,8 +329,8 @@ static void html_get_dimensions(html_content *htmlc)
+ 	css_fixed device_dpi = nscss_screen_dpi;
+ 	unsigned f_size;
+ 	unsigned f_min;
+-	unsigned w;
+-	unsigned h;
++	unsigned w = 0;
++	unsigned h = 0;
+ 	union content_msg_data msg_data = {
+ 		.getdims = {
+ 			.viewport_width = &w,
+@@ -360,6 +360,54 @@ static void html_get_dimensions(html_content *htmlc)
+ 	htmlc->unit_len_ctx.font_size_minimum = f_min;
+ }
+ 
++/** Drop the early selection context and the sheets parsed for it. */
++static void html_drop_early_select_ctx(html_content *c)
++{
++	if (c->early_select_ctx != NULL) {
++		css_select_ctx_destroy(c->early_select_ctx);
++		c->early_select_ctx = NULL;
++	}
++	if (c->early_owned != NULL) {
++		html_css_free_owned(c->early_owned, c->early_n_owned);
++		c->early_owned = NULL;
++		c->early_n_owned = 0;
++	}
++}
++
++/* exported function documented in html/private.h */
++css_select_ctx *html_select_ctx_early(html_content *c)
++{
++	unsigned int done = 0, i;
++
++	if (c->select_ctx != NULL)
++		return c->select_ctx;
++	for (i = 0; i < c->stylesheet_count; i++) {
++		if (c->stylesheets[i].sheet != NULL &&
++		    content_get_status(c->stylesheets[i].sheet) ==
++				CONTENT_STATUS_DONE)
++			done++;
++	}
++	if (c->early_select_ctx != NULL &&
++	    c->early_select_sheets == c->stylesheet_count &&
++	    c->early_select_done == done &&
++	    c->early_select_gen == c->css_generation)
++		return c->early_select_ctx;
++	/* lengths resolve against the viewport and the default font size,
++	 * which conversion sets; set them now if it has not */
++	if (c->unit_len_ctx.device_dpi == 0)
++		html_get_dimensions(c);
++	html_drop_early_select_ctx(c);
++	if (html_css_early_selection_context(c, &c->early_select_ctx,
++			&c->early_owned, &c->early_n_owned) != NSERROR_OK) {
++		c->early_select_ctx = NULL;
++		return NULL;
++	}
++	c->early_select_sheets = c->stylesheet_count;
++	c->early_select_done = done;
++	c->early_select_gen = c->css_generation;
++	return c->early_select_ctx;
++}
++
+ /* exported function documented in html/html_internal.h */
+ void html_finish_conversion(html_content *htmlc)
+ {
+@@ -391,6 +439,9 @@ void html_finish_conversion(html_content *htmlc)
+ 		return;
+ 	}
+ 
++	/* the early one was only for scripts until now (VitaSurf) */
++	html_drop_early_select_ctx(htmlc);
++
+ 	/* create new css selection context */
+ 	error = html_css_new_selection_context(htmlc, &htmlc->select_ctx);
+ 	if (error != NSERROR_OK) {
+@@ -1993,6 +2044,7 @@ static void html_destroy(struct content *c)
+ 		css_select_ctx_destroy(html->select_ctx);
+ 		html->select_ctx = NULL;
+ 	}
++	html_drop_early_select_ctx(html);
+ 
+ 	lwc_string_unref(html->universal);
+ 	html->universal = NULL;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index c1e2bc939..6ca01e5bc 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -210,6 +210,18 @@ typedef struct html_content {
+ 	struct html_stylesheet *stylesheets;
+ 	/**< Style selection context */
+ 	css_select_ctx *select_ctx;
++	/** A selection context from the sheets loaded so far, for a script
++	 * asking for a computed style before select_ctx exists, and the
++	 * sheets it was built from (VitaSurf) */
++	css_select_ctx *early_select_ctx;
++	unsigned int early_select_sheets;
++	unsigned int early_select_done;
++	unsigned int early_select_gen;
++	/** bumped whenever a sheet is added or its text changes */
++	unsigned int css_generation;
++	/** the sheets parsed for it, its STYLEs still fetching */
++	struct css_stylesheet **early_owned;
++	unsigned int early_n_owned;
+ 	/** retries of the rebuild a late stylesheet asks for (VitaSurf) */
+ 	unsigned late_css_retries;
+ 	/**< Style selection media specification */
+@@ -696,4 +708,14 @@ void html_scroll_anchor_settle(html_content *htmlc);
+  */
+ void html_scroll_anchor_free(html_content *htmlc);
+ 
++/**
++ * The selection context to select a style with before the document is
++ * converted (VitaSurf): the real one once it exists, else one built from
++ * the stylesheets loaded so far, kept until another arrives.
++ *
++ * \param c  the document
++ * \return the context, or NULL if there is none yet
++ */
++css_select_ctx *html_select_ctx_early(html_content *c);
++
+ #endif
