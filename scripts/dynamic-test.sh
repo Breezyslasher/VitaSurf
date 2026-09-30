@@ -25,6 +25,12 @@ cd "$ROOT/deps/netsurf"
   echo "WINDOW EXEC 0 JS report('row3')"; sleep 1
   echo "WINDOW CLICK WIN 0 X 30 Y 110 BUTTON LEFT KIND SINGLE"; sleep 1
   echo "WINDOW EXEC 0 JS report('row5')"; sleep 1
+  echo "WINDOW MOVE WIN 0 X 30 Y 130"
+  echo "WINDOW MOVE WIN 0 X 30 Y 150"
+  echo "WINDOW MOVE WIN 0 X 30 Y 170"
+  echo "WINDOW MOVE WIN 0 X 30 Y 190"; sleep 2
+  echo "WINDOW EXEC 0 JS report('moved')"; sleep 1
   echo QUIT
 } | timeout 60 ./nsmonkey --enable_javascript=1 2>&1 |
-  grep -E "console:|SIGSEGV|Assertion|laid the page out again"
+  grep -E "console:|SIGSEGV|Assertion|laid the page out again|pointer rested" |
+  awk '/pointer rested/ { n++; next } { print } END { print "rebuilds after the pointer rested: " n+0 }'

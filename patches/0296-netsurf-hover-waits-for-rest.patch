@@ -1,0 +1,212 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index eb91482e4..b76822844 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -567,7 +567,7 @@ void html_memory_report(void)
+ 	html_content *c;
+ 	unsigned n = 0;
+ 
+-	unsigned nodes = 0;
++	unsigned nodes = 0, owned = 0;
+ 
+ 	for (c = html_live; c != NULL; c = c->live_next)
+ 		n++;
+@@ -578,10 +578,12 @@ void html_memory_report(void)
+ 		const char *url = u != NULL ? nsurl_access(u) : "?";
+ 
+ 		unsigned in_doc = html_live_nodes((dom_node *) c->document);
++		unsigned own = dom_document_owned_nodes(c->document);
+ 
+ 		nodes += in_doc;
+-		vita_log("memory:   %.60s: %u nodes, boxes %u KB, %s, %u users, "
+-			 "%s", url, in_doc,
++		owned += own;
++		vita_log("memory:   %.60s: %u nodes in its tree of %u it owns, "
++			 "boxes %u KB, %s, %u users, %s", url, in_doc, own,
+ 			 c->bctx != NULL ?
+ 				(unsigned) (talloc_total_size(c->bctx) / 1024) :
+ 				0,
+@@ -593,9 +595,12 @@ void html_memory_report(void)
+ 	}
+ 	/* the rest are in no page's tree: removed by script and still
+ 	 * held, in documents script made, or left from pages gone */
+-	vita_log("memory: %u nodes are in those documents' trees, %u are not",
+-		 nodes, (unsigned) dom_node_live_count() > nodes ?
+-			(unsigned) dom_node_live_count() - nodes : 0);
++	vita_log("memory: %u nodes are in those documents' trees and %u more "
++		 "are theirs outside them; %u belong to documents no page has "
++		 "(script made them, or a page gone left them)",
++		 nodes, owned > nodes ? owned - nodes : 0,
++		 (unsigned) dom_node_live_count() > owned ?
++			(unsigned) dom_node_live_count() - owned : 0);
+ }
+ 
+ static nserror
+@@ -3231,16 +3236,34 @@ static uint32_t dynamic_ancestor_bits(html_content *c)
+ /** What the relayouts an animation asked for took (VitaSurf) */
+ static unsigned html_anim_relayout_ms;
+ 
++/*
++ * How long the pointer has to rest before a change of :hover that needs
++ * the layout rebuilt is laid out (VitaSurf). GitHub shows a row's
++ * buttons on :hover, and each row the pointer crossed rebuilt the page,
++ * two seconds on the Vita: a build 515 log has eight in twenty seconds.
++ * While the pointer moves the rebuild waits; where it stops, it happens
++ * once. A tap is not held back.
++ */
++#define DYNAMIC_REST_MS 400
++
++bool html_dynamic_pointer_moving;
++
+ static void html_dynamic_relayout(void *p)
+ {
+ 	html_content *c = p;
+ 	uint64_t t0 = 0, t1 = 0;
+ 	nserror res;
+ 
++	bool rested = c->dynamic_relayout_resting;
++
+ 	c->dynamic_relayout_pending = false;
++	c->dynamic_relayout_resting = false;
+ 	nsu_getmonotonic_ms(&t0);
+ 	res = html_relayout(c);
+ 	nsu_getmonotonic_ms(&t1);
++	if (rested && res != NSERROR_INVALID)
++		vita_log("hover: the pointer rested, and the page was laid out "
++			 "again in %u ms", (unsigned) (t1 - t0));
+ 	if (c->n_anim > 0)
+ 		html_anim_relayout_ms += (unsigned) (t1 - t0);
+ 	if (res == NSERROR_INVALID) {
+@@ -3565,7 +3588,7 @@ static bool dynamic_keyed(html_content *c, dom_node *n, uint32_t bit)
+ 
+ /** What the state changes that laid the page out again were (VitaSurf) */
+ static struct {
+-	unsigned changes, rebuilds, restyled, subtrees, skipped;
++	unsigned changes, rebuilds, restyled, subtrees, skipped, deferred;
+ } dynamic_stats;
+ 
+ /* exported interface documented in html/private.h */
+@@ -3575,10 +3598,11 @@ void html_dynamic_report(void)
+ 		return;
+ 	vita_log("hover: %u changes of state restyled %u elements, %u "
+ 		 "subtrees under an ancestor and %u ancestors passed over "
+-		 "as no sheet asks about them; %u laid the page out again",
++		 "as no sheet asks about them; %u laid the page out again "
++		 "at once and %u waited for the pointer to rest",
+ 		 dynamic_stats.changes, dynamic_stats.restyled,
+ 		 dynamic_stats.subtrees, dynamic_stats.skipped,
+-		 dynamic_stats.rebuilds);
++		 dynamic_stats.rebuilds, dynamic_stats.deferred);
+ 	memset(&dynamic_stats, 0, sizeof(dynamic_stats));
+ }
+ 
+@@ -3679,6 +3703,22 @@ void html_set_dynamic(html_content *c, enum nscss_dynamic which,
+ 	dynamic_stats.changes++;
+ 	dynamic_stats.restyled += DYNAMIC_BUDGET - budget;
+ 
++	/* a rebuild waiting for the pointer to rest waits again */
++	if (c->dynamic_relayout_resting && which == NSCSS_HOVER &&
++			html_dynamic_pointer_moving)
++		guit->misc->schedule(DYNAMIC_REST_MS, html_dynamic_relayout, c);
++
++	if (result == BOX_RESTYLE_LAYOUT && which == NSCSS_HOVER &&
++			html_dynamic_pointer_moving &&
++			(!c->dynamic_relayout_pending ||
++			 c->dynamic_relayout_resting)) {
++		dynamic_stats.deferred++;
++		c->dynamic_relayout_pending = true;
++		c->dynamic_relayout_resting = true;
++		guit->misc->schedule(DYNAMIC_REST_MS, html_dynamic_relayout, c);
++		goto out;
++	}
++
+ 	if (result == BOX_RESTYLE_LAYOUT) {
+ 		dynamic_stats.rebuilds++;
+ 		vita_log("hover: a change of %s laid the page out again: %s, "
+@@ -3688,8 +3728,10 @@ void html_set_dynamic(html_content *c, enum nscss_dynamic which,
+ 			 which == NSCSS_FOCUS ? ":focus" : ":target",
+ 			 budget == 0 ? "more than it may restyle in place" :
+ 			 box_restyle_why(), DYNAMIC_BUDGET - budget);
+-		if (!c->dynamic_relayout_pending) {
++		if (!c->dynamic_relayout_pending || c->dynamic_relayout_resting) {
++			/* now, not after a rest */
+ 			c->dynamic_relayout_pending = true;
++			c->dynamic_relayout_resting = false;
+ 			guit->misc->schedule(0, html_dynamic_relayout, c);
+ 		}
+ 	} else if (result == BOX_RESTYLE_PAINT) {
+@@ -3710,6 +3752,7 @@ void html_drop_dynamic(html_content *c)
+ 	if (c->dynamic_relayout_pending) {
+ 		guit->misc->schedule(-1, html_dynamic_relayout, c);
+ 		c->dynamic_relayout_pending = false;
++		c->dynamic_relayout_resting = false;
+ 	}
+ 	for (which = 0; which < NSCSS_DYNAMIC_COUNT; which++) {
+ 		dom_node *n = nscss_dynamic_node(which);
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 454f1b228..a478375fd 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1469,7 +1469,12 @@ static void html_track_dynamic(html_content *html, browser_mouse_state mouse,
+ 			BROWSER_MOUSE_DRAG_ON)) != 0)
+ 		return;
+ 
++	html_dynamic_pointer_moving = (mouse & (BROWSER_MOUSE_PRESS_1 |
++			BROWSER_MOUSE_PRESS_2 | BROWSER_MOUSE_CLICK_1 |
++			BROWSER_MOUSE_CLICK_2 | BROWSER_MOUSE_HOLDING_1 |
++			BROWSER_MOUSE_HOLDING_2)) == 0;
+ 	html_set_dynamic(html, NSCSS_HOVER, node, false);
++	html_dynamic_pointer_moving = false;
+ 
+ 	if (mouse & (BROWSER_MOUSE_PRESS_1 | BROWSER_MOUSE_PRESS_2)) {
+ 		html_set_dynamic(html, NSCSS_ACTIVE, node, false);
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 089ad6c41..c1e2bc939 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -167,6 +167,8 @@ typedef struct html_content {
+ 	/** a rebuild for a change of :hover or :focus is scheduled
+ 	 * (VitaSurf) */
+ 	bool dynamic_relayout_pending;
++	/** and it waits for the pointer to rest (VitaSurf) */
++	bool dynamic_relayout_resting;
+ 	/** Document background colour. */
+ 	colour background_colour;
+ 
+@@ -573,6 +575,10 @@ void html_drop_dynamic(html_content *c);
+  * (VitaSurf). */
+ void html_dynamic_report(void);
+ 
++/** Set while :hover follows the pointer moving with no button down,
++ * rather than a tap (VitaSurf). */
++extern bool html_dynamic_pointer_moving;
++
+ /** Log every html content still alive and what it holds (VitaSurf). */
+ void html_memory_report(void);
+ 
+diff --git a/frontends/monkey/browser.c b/frontends/monkey/browser.c
+index 958375486..c86c2156e 100644
+--- a/frontends/monkey/browser.c
++++ b/frontends/monkey/browser.c
+@@ -727,6 +727,21 @@ monkey_window_handle_command(int argc, char **argv)
+ 		monkey_window_handle_exec(argc, argv);
+ 	} else if (strcmp(argv[1], "CLICK") == 0) {
+ 		monkey_window_handle_click(argc, argv);
++	} else if (strcmp(argv[1], "MOVE") == 0) {
++		/* `WINDOW MOVE WIN` _%id%_ `X` _%num%_ `Y` _%num%_: the
++		 * pointer moving with no button down (VitaSurf) */
++		struct gui_window *gw;
++		if (argc != 8) {
++			moutf(MOUT_ERROR, "WINDOW MOVE ARGS BAD\n");
++			return;
++		}
++		gw = monkey_find_window_by_num(atoi(argv[3]));
++		if (gw == NULL) {
++			moutf(MOUT_ERROR, "WINDOW NUM BAD");
++			return;
++		}
++		browser_window_mouse_track(gw->bw, 0, atoi(argv[5]),
++				atoi(argv[7]));
+ 	} else {
+ 		moutf(MOUT_ERROR, "WINDOW COMMAND UNKNOWN %s\n", argv[1]);
+ 	}

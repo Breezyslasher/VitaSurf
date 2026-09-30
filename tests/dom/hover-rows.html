@@ -4,15 +4,19 @@
      restyles what is under it. Before, pointing at a row restyled the
      subtree under each of its six nearest ancestors, the whole list among
      them, which was past the budget and rebuilt the page: two seconds a
-     pointer move on the Vita. Only the row's subtree matters. Run by
-     scripts/dynamic-test.sh, which taps row 3 and then row 5; expected
-     console output: lines ending in "ok", and no "laid the page out
-     again" line from the harness. -->
+     pointer move on the Vita. Only the row's subtree matters. Each row
+     also shows a hidden button on :hover, as GitHub's do, which needs the
+     page laid out again: moving the pointer across rows must do that once
+     where it stops, not once a row. Run by scripts/dynamic-test.sh, which
+     taps row 3 and then row 5, then moves across rows 6 to 9; expected
+     console output: lines ending in "ok". -->
 <html><head><style>
 body { margin: 0 }
 .Box-row { height: 20px; overflow: hidden }
 .Box-row:hover .Link--muted { color: rgb(255, 0, 0) }
 .Link--muted { color: rgb(0, 0, 0) }
+.reveal { display: none }
+.Box-row:hover .reveal { display: inline }
 .menu:hover .sub { display: block }
 .sub { display: none }
 </style></head><body>
@@ -23,7 +27,7 @@ var list = document.getElementById('list'), html = '';
 for (var i = 0; i < 120; i++) {
   html += '<div class=Box-row id=r' + i + '><span class=title>row ' + i + '</span> ';
   for (var j = 0; j < 8; j++) html += '<span class=bit>' + j + '</span>';
-  html += '<span class=Link--muted id=m' + i + '>muted</span></div>';
+  html += '<span class=Link--muted id=m' + i + '>muted</span><span class=reveal id=v' + i + '>button</span></div>';
 }
 list.innerHTML = html;
 function col(id) { return getComputedStyle(document.getElementById(id)).color; }
@@ -31,6 +35,9 @@ window.report = function (stage) {
   if (stage === 'row3') {
     console.log("pointed row's muted link red:", col('m3') === 'rgb(255, 0, 0)' ? "ok" : "FAIL " + col('m3'));
     console.log("other rows untouched:", col('m4') === 'rgb(0, 0, 0)' ? "ok" : "FAIL " + col('m4'));
+  } else if (stage === 'moved') {
+    console.log("pointer resting on row 9 shows its button:", getComputedStyle(document.getElementById('v9')).display === 'inline' ? "ok" : "FAIL " + getComputedStyle(document.getElementById('v9')).display);
+    console.log("rows passed over hide theirs again:", getComputedStyle(document.getElementById('v7')).display === 'none' ? "ok" : "FAIL " + getComputedStyle(document.getElementById('v7')).display);
   } else if (stage === 'row5') {
     console.log("new row's muted link red:", col('m5') === 'rgb(255, 0, 0)' ? "ok" : "FAIL " + col('m5'));
     console.log("old row's back to black:", col('m3') === 'rgb(0, 0, 0)' ? "ok" : "FAIL " + col('m3'));
