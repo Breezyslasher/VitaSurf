@@ -1,0 +1,31 @@
+diff --git a/quickjs.c b/quickjs.c
+index a01d274..c600f91 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7158,6 +7158,11 @@ static void compute_value_size(JSValue val, JSMemoryUsage_helper *hp)
+     }
+ }
+ 
++size_t JS_GetMallocSize(JSRuntime *rt)
++{
++    return rt->malloc_state.malloc_size;
++}
++
+ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
+ {
+     struct list_head *el, *el1;
+diff --git a/quickjs.h b/quickjs.h
+index 19af40b..8cead91 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -606,6 +606,10 @@ typedef struct JSMemoryUsage {
+ } JSMemoryUsage;
+ 
+ JS_EXTERN void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
++/* The bytes the runtime has allocated now, from the count it keeps as it
++   goes (VitaSurf): JS_ComputeMemoryUsage walks every object to add the
++   same thing up, 640 ms on a Home Assistant page on the Vita. */
++JS_EXTERN size_t JS_GetMallocSize(JSRuntime *rt);
+ JS_EXTERN void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
+ 
+ /* atom support */

@@ -947,18 +947,16 @@ static bool qjs_budget_abort(JSContext *ctx)
 }
 
 /** QuickJS's own allocation total for the runtime, in KB. */
-/* What the last runtime_kb cost: it walks every object in the runtime,
- * and a log could not say whether that was a real share of a page's
- * time (VitaSurf). */
-static unsigned runtime_kb_ms;
+/*
+ * What the runtime has allocated (VitaSurf). This walked every object
+ * in the runtime through JS_ComputeMemoryUsage to add the figure up, and
+ * a build 511 log has it doing that 17 times on one visit for 6880 ms,
+ * 640 ms at the worst, for a number in the log. QuickJS keeps the same
+ * figure as it allocates.
+ */
 static unsigned runtime_kb(JSRuntime *rt)
 {
-	JSMemoryUsage u;
-	uint64_t t0 = now_ms();
-
-	JS_ComputeMemoryUsage(rt, &u);
-	runtime_kb_ms = (unsigned)(now_ms() - t0);
-	return (unsigned)(u.malloc_size / 1024);
+	return (unsigned)(JS_GetMallocSize(rt) / 1024);
 }
 
 /**
@@ -16078,23 +16076,18 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		vitasurf_ms_js_run += (unsigned)(t_done - t_compiled);
 
 		/*
-		 * runtime_kb walks the whole runtime -- every object,
-		 * shape and string -- to add up what it holds, and asking
-		 * it once per script was 26 walks on a YouTube page
-		 * (VitaSurf). It is worth knowing after a script big
-		 * enough to move the number and not otherwise.
+		 * Logged after a script big enough to move the runtime's
+		 * memory, and not otherwise (VitaSurf): a line per script
+		 * was 26 on a YouTube page.
 		 */
 		if (txtlen > SCRIPT_LOG_BYTES) {
-			unsigned kb = runtime_kb(thread->heap->rt);
-
 			vita_log("qjs: script %u KB %s in %u ms, "
-				 "ran in %u ms, runtime memory now %u KB "
-				 "(counting it took %u ms): %s",
+				 "ran in %u ms, runtime memory now %u KB: %s",
 				 (unsigned)(txtlen / 1024),
 				 cached ? "read from cache" : "compiled",
 				 (unsigned)(t_compiled - t_start),
 				 (unsigned)(t_done - t_compiled),
-				 kb, runtime_kb_ms, name);
+				 runtime_kb(thread->heap->rt), name);
 			vita_log_memory("after a large script");
 		} else if (vita_verbose_requested()) {
 			vita_log("qjs: script %u KB %s in %u ms, "
