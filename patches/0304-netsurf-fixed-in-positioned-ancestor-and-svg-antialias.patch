@@ -1,0 +1,169 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 69bf14ad4..6f0a907f3 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5357,16 +5357,34 @@ layout_position_absolute(struct box *box,
+ 			 * window at the document's origin; the painter
+ 			 * moves the box along with the scroll.
+ 			 */
++			int fx = cx, fy = cy;
++
+ 			if (css_computed_position(c->style) ==
+ 					CSS_POSITION_FIXED &&
+ 					content->viewport_h > 0) {
++				int ax = 0, ay = 0;
++
+ 				memset(&viewport, 0, sizeof(viewport));
+ 				viewport.type = BOX_BLOCK;
+ 				viewport.width = content->viewport_w;
+ 				viewport.height = content->viewport_h;
+ 				cb = &viewport;
++				/*
++				 * cx and cy are from the positioned ancestor,
++				 * and the viewport stands at the document's
++				 * origin: the ancestor's own place goes in too
++				 * (VitaSurf). Inside a positioned box 13px down
++				 * the page, top: 0 was 13px down, which is
++				 * where Home Assistant's header and sidebar
++				 * sat.
++				 */
++				if (containing_block != NULL &&
++						containing_block->parent != NULL)
++					box_coords(containing_block, &ax, &ay);
++				fx = cx + ax;
++				fy = cy + ay;
+ 			}
+-			if (!layout_absolute(c, cb, cx, cy, content))
++			if (!layout_absolute(c, cb, fx, fy, content))
+ 				return false;
+ 			if (!layout_position_absolute(c, c, 0, 0, content))
+ 				return false;
+diff --git a/content/handlers/image/svg.c b/content/handlers/image/svg.c
+index f2ec722b6..30234f918 100644
+--- a/content/handlers/image/svg.c
++++ b/content/handlers/image/svg.c
+@@ -680,6 +680,75 @@ static bool svg_raster_draw_cb(const struct redraw_context *ctx, void *pw)
+ 			ctx, d->scale, d->background, false, 0);
+ }
+ 
++/**
++ * A bitmap ss times the size, averaged down to width by height
++ * (VitaSurf). Colours are weighted by their alpha, so the transparent
++ * pixels around a shape do not darken its edge.
++ */
++static struct bitmap *
++svg_downsample(struct bitmap *big, int width, int height, int ss)
++{
++	struct bitmap *out;
++	const uint8_t *src;
++	uint8_t *dst;
++	size_t sstride, dstride;
++	int x, y, i, j, n = ss * ss;
++
++	if (guit->bitmap->get_width(big) != width * ss ||
++	    guit->bitmap->get_height(big) != height * ss) {
++		return NULL;
++	}
++	out = guit->bitmap->create(width, height, BITMAP_NONE);
++	if (out == NULL) {
++		return NULL;
++	}
++	src = guit->bitmap->get_buffer(big);
++	dst = guit->bitmap->get_buffer(out);
++	if (src == NULL || dst == NULL) {
++		guit->bitmap->destroy(out);
++		return NULL;
++	}
++	sstride = guit->bitmap->get_rowstride(big);
++	dstride = guit->bitmap->get_rowstride(out);
++	for (y = 0; y < height; y++) {
++		uint8_t *dp = dst + (size_t)y * dstride;
++
++		for (x = 0; x < width; x++, dp += 4) {
++			unsigned int sa = 0, sr = 0, sg = 0, sb = 0;
++
++			for (j = 0; j < ss; j++) {
++				const uint8_t *sp = src +
++						(size_t)(y * ss + j) * sstride +
++						(size_t)(x * ss) * 4;
++
++				for (i = 0; i < ss; i++, sp += 4) {
++					unsigned int a =
++						sp[bitmap_layout.a];
++
++					sa += a;
++					sr += sp[bitmap_layout.r] * a;
++					sg += sp[bitmap_layout.g] * a;
++					sb += sp[bitmap_layout.b] * a;
++				}
++			}
++			dp[bitmap_layout.a] = (uint8_t)(sa / n);
++			if (sa > 0) {
++				dp[bitmap_layout.r] = (uint8_t)(sr / sa);
++				dp[bitmap_layout.g] = (uint8_t)(sg / sa);
++				dp[bitmap_layout.b] = (uint8_t)(sb / sa);
++			} else {
++				dp[bitmap_layout.r] = 0;
++				dp[bitmap_layout.g] = 0;
++				dp[bitmap_layout.b] = 0;
++			}
++		}
++	}
++	guit->bitmap->set_opaque(out, false);
++	guit->bitmap->modified(out);
++	return out;
++}
++
++
+ /**
+  * The graphic drawn at this size as a bitmap, made now if it can be;
+  * NULL to plot it as paths.
+@@ -712,14 +781,40 @@ svg_raster_for(svg_content *svg, const struct content_redraw_data *data)
+ 	    svg_raster_bytes + bytes > SVG_RASTER_MAX_BYTES) {
+ 		return NULL;
+ 	}
+-	d.svg = svg;
+-	d.width = data->width;
+-	d.height = data->height;
+-	d.scale = data->scale;
+-	d.background = data->background_colour;
+-	if (vitasurf_raster(data->width, data->height, svg_raster_draw_cb,
+-			    &d, &bm) != NSERROR_OK || bm == NULL) {
+-		return NULL;
++	/*
++	 * Drawn larger and averaged down (VitaSurf). The framebuffer fills
++	 * a path pixel by pixel, all or nothing, so an icon drawn at its own
++	 * size had stepped edges and read heavier than a browser's: Home
++	 * Assistant's Material icons looked slightly wrong. At 4x each pixel
++	 * is the average of sixteen, which is anti-aliasing; a larger
++	 * graphic gets 2x, and one past that is drawn as before.
++	 */
++	{
++		int ss = 1;
++
++		if ((size_t)data->width * (size_t)data->height <= 64 * 64)
++			ss = 4;
++		else if ((size_t)data->width * (size_t)data->height <=
++				160 * 160)
++			ss = 2;
++		d.svg = svg;
++		d.width = data->width * ss;
++		d.height = data->height * ss;
++		d.scale = data->scale * ss;
++		d.background = data->background_colour;
++		if (vitasurf_raster(d.width, d.height, svg_raster_draw_cb,
++				    &d, &bm) != NSERROR_OK || bm == NULL) {
++			return NULL;
++		}
++		if (ss > 1) {
++			struct bitmap *small = svg_downsample(bm,
++					data->width, data->height, ss);
++
++			guit->bitmap->destroy(bm);
++			if (small == NULL)
++				return NULL;
++			bm = small;
++		}
+ 	}
+ 	r = &svg->raster[svg->raster_n++];
+ 	r->width = data->width;
