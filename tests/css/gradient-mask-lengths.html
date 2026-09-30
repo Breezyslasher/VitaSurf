@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>gradient stops at lengths, gradient masks</title><style>
+ body { margin: 0; }
+ /* a scroller's edges faded with stops at lengths and calc() */
+ #a { width: 100px; height: 20px;
+      background-image: linear-gradient(to right, red 9px, blue calc(100% - 9px)); }
+ /* a box of nothing but a colour, faded out by a mask */
+ #b { width: 200px; height: 20px; background: #00f;
+      -webkit-mask-image: linear-gradient(to right, black 50%, transparent); }
+ /* text faded at its end, the last 40px */
+ #c { width: 200px; height: 20px; background: #0f0;
+      mask-image: linear-gradient(to right, black calc(100% - 40px), transparent); }
+ /* the shorthand, with a second layer that is not painted */
+ #d { width: 200px; height: 20px; background: #0f0;
+      mask: linear-gradient(to bottom, transparent, black) center / cover no-repeat, url(x.png); }
+</style></head>
+<body><div id="a"></div><div id="b"></div><div id="c">text text</div><div id="d">x</div>
+<!-- Both were dropped: the log said "css dropped: mask-image (value)" and
+     "background-image (value)", and the boxes painted unmasked or not at
+     all. With VITASURF_TEST_RASTER=plots: #a is red to x 9 and blue from
+     x 91; each of #b, #c and #d is painted aside with a second RASTER
+     block of white strips whose alpha falls along the gradient, and the
+     text in #c and #d is masked once, with its element. Nothing is logged
+     as dropped. -->
+</body></html>
