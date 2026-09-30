@@ -10492,7 +10492,7 @@ static const char *const sm_float[] = { NULL, "left", "right", "none" };
 static const char *const sm_clear[] = { NULL, "none", "left", "right",
 	"both" };
 static const char *const sm_overflow[] = { NULL, "visible", "hidden",
-	"scroll", "auto" };
+	"scroll", "auto", "clip" };
 static const char *const sm_visibility[] = { NULL, "visible", "hidden",
 	"collapse" };
 static const char *const sm_font_style[] = { NULL, "normal", "italic",
@@ -10725,7 +10725,7 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 		unsigned ox = css_computed_overflow_x(s);
 		unsigned oy = css_computed_overflow_y(s);
 
-		if (ox < 5 && oy < 5 && sm_overflow[ox] != NULL &&
+		if (ox < 6 && oy < 6 && sm_overflow[ox] != NULL &&
 				sm_overflow[oy] != NULL) {
 			snprintf(buf, sizeof(buf), "%s %s", sm_overflow[ox],
 					sm_overflow[oy]);

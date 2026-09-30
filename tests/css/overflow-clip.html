@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>overflow: clip and two-value overflow</title><style>
+ body { margin: 0; }
+ .box { width: 100px; height: 20px; background: #ddd; }
+ .big { width: 300px; height: 60px; background: #f00; }
+ #clip { overflow: clip; }
+ #two { overflow: hidden auto; }
+ /* clip is no new block formatting context: the child's margin still
+    collapses through its parent, where hidden stops it */
+ .outer { margin-top: 0; }
+ .inner { margin-top: 30px; height: 10px; background: #00f; }
+</style></head>
+<body>
+<div class="box" id="clip"><div class="big"></div></div>
+<div class="box" id="two"></div>
+<div id="c1" class="outer" style="overflow: clip"><div class="inner"></div></div>
+<div id="h1" class="outer" style="overflow: hidden"><div class="inner"></div></div>
+<pre id="out"></pre>
+<script>
+/* overflow: clip was dropped, so the red box spilled out of its parent,
+   and overflow with two values was dropped too. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function S(id, p){ return getComputedStyle(document.getElementById(id))[p]; }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('overflow of #clip (clip clip)', S('clip', 'overflowX') + ' ' + S('clip', 'overflowY'));
+  T('overflow of #two (hidden auto)', S('two', 'overflowX') + ' ' + S('two', 'overflowY'));
+  T('clip lets the margin through, hidden does not (0 30)',
+    Math.round(document.getElementById('c1').firstChild.getBoundingClientRect().top - document.getElementById('c1').getBoundingClientRect().top) + ' ' +
+    Math.round(document.getElementById('h1').firstChild.getBoundingClientRect().top - document.getElementById('h1').getBoundingClientRect().top));
+}, 200); });
+</script></body></html>

@@ -170,23 +170,27 @@ static bool target_visible(struct box *b, int x, int y, int w, int h)
 	}
 	for (a = b->parent; a != NULL; a = a->parent) {
 		int ax, ay, aw, ah;
+		uint8_t ox, oy;
+		bool cx, cy;
 
 		if (a->style == NULL) {
 			continue;
 		}
-		if (css_computed_overflow_x(a->style) != CSS_OVERFLOW_HIDDEN &&
-		    css_computed_overflow_y(a->style) != CSS_OVERFLOW_HIDDEN) {
+		/* clip cuts the content off as hidden does */
+		ox = css_computed_overflow_x(a->style);
+		oy = css_computed_overflow_y(a->style);
+		cx = ox == CSS_OVERFLOW_HIDDEN || ox == CSS_OVERFLOW_CLIP;
+		cy = oy == CSS_OVERFLOW_HIDDEN || oy == CSS_OVERFLOW_CLIP;
+		if (!cx && !cy) {
 			continue;
 		}
 		box_coords(a, &ax, &ay);
 		aw = a->padding[LEFT] + a->width + a->padding[RIGHT];
 		ah = a->padding[TOP] + a->height + a->padding[BOTTOM];
-		if (css_computed_overflow_x(a->style) == CSS_OVERFLOW_HIDDEN &&
-		    (x >= ax + aw || x + w <= ax)) {
+		if (cx && (x >= ax + aw || x + w <= ax)) {
 			return false;
 		}
-		if (css_computed_overflow_y(a->style) == CSS_OVERFLOW_HIDDEN &&
-		    (y >= ay + ah || y + h <= ay)) {
+		if (cy && (y >= ay + ah || y + h <= ay)) {
 			return false;
 		}
 	}
