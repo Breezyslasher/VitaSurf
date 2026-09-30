@@ -15,3 +15,16 @@ cd "$ROOT/deps/netsurf"
   echo "WINDOW EXEC 0 JS report('menu')"; sleep 1
   echo QUIT
 } | timeout 60 ./nsmonkey --enable_javascript=1 2>&1 | grep -E "console:|SIGSEGV|Assertion"
+
+# rows under a long list, as GitHub's: a tap on a row must restyle the
+# row, not rebuild the page
+{ echo WINDOW NEW
+  echo "WINDOW GO 0 file://$ROOT/tests/dom/hover-rows.html"
+  sleep 2
+  echo "WINDOW CLICK WIN 0 X 30 Y 70 BUTTON LEFT KIND SINGLE"; sleep 1
+  echo "WINDOW EXEC 0 JS report('row3')"; sleep 1
+  echo "WINDOW CLICK WIN 0 X 30 Y 110 BUTTON LEFT KIND SINGLE"; sleep 1
+  echo "WINDOW EXEC 0 JS report('row5')"; sleep 1
+  echo QUIT
+} | timeout 60 ./nsmonkey --enable_javascript=1 2>&1 |
+  grep -E "console:|SIGSEGV|Assertion|laid the page out again"

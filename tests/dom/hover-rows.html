@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!-- A list the way GitHub builds one: rows under a long container, and a
+     sheet asking ".Box-row:hover .Link--muted", so a state on an ancestor
+     restyles what is under it. Before, pointing at a row restyled the
+     subtree under each of its six nearest ancestors, the whole list among
+     them, which was past the budget and rebuilt the page: two seconds a
+     pointer move on the Vita. Only the row's subtree matters. Run by
+     scripts/dynamic-test.sh, which taps row 3 and then row 5; expected
+     console output: lines ending in "ok", and no "laid the page out
+     again" line from the harness. -->
+<html><head><style>
+body { margin: 0 }
+.Box-row { height: 20px; overflow: hidden }
+.Box-row:hover .Link--muted { color: rgb(255, 0, 0) }
+.Link--muted { color: rgb(0, 0, 0) }
+.menu:hover .sub { display: block }
+.sub { display: none }
+</style></head><body>
+<div class=app><div class=layout><div class=main><div class=list id=list></div></div></div></div>
+<div class=menu>menu<div class=sub>sub</div></div>
+<script>
+var list = document.getElementById('list'), html = '';
+for (var i = 0; i < 120; i++) {
+  html += '<div class=Box-row id=r' + i + '><span class=title>row ' + i + '</span> ';
+  for (var j = 0; j < 8; j++) html += '<span class=bit>' + j + '</span>';
+  html += '<span class=Link--muted id=m' + i + '>muted</span></div>';
+}
+list.innerHTML = html;
+function col(id) { return getComputedStyle(document.getElementById(id)).color; }
+window.report = function (stage) {
+  if (stage === 'row3') {
+    console.log("pointed row's muted link red:", col('m3') === 'rgb(255, 0, 0)' ? "ok" : "FAIL " + col('m3'));
+    console.log("other rows untouched:", col('m4') === 'rgb(0, 0, 0)' ? "ok" : "FAIL " + col('m4'));
+  } else if (stage === 'row5') {
+    console.log("new row's muted link red:", col('m5') === 'rgb(255, 0, 0)' ? "ok" : "FAIL " + col('m5'));
+    console.log("old row's back to black:", col('m3') === 'rgb(0, 0, 0)' ? "ok" : "FAIL " + col('m3'));
+  }
+};
+</script></body></html>

@@ -1,0 +1,268 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 1976b4bff..3780d5785 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3014,6 +3014,15 @@ static bool restyle_results_equal(const css_select_results *a,
+  * \param changed  set to whether its style changed
+  * \return BOX_RESTYLE_LAYOUT if the layout has to be rebuilt
+  */
++/* why restyle_element last asked for the layout (VitaSurf) */
++static const char *restyle_why = "?";
++
++/* exported interface documented in html/box_construct.h */
++const char *box_restyle_why(void)
++{
++	return restyle_why;
++}
++
+ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 		bool *changed)
+ {
+@@ -3024,8 +3033,10 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 	int i;
+ 
+ 	*changed = false;
+-	if (c->layout == NULL || c->bctx == NULL)
++	if (c->layout == NULL || c->bctx == NULL) {
++		restyle_why = "no layout yet";
+ 		return BOX_RESTYLE_LAYOUT;
++	}
+ 
+ 	box_extract_properties(c, n, &props);
+ 	root_style = props.node_is_root ? NULL : c->layout->style;
+@@ -3034,8 +3045,10 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 	fresh = box_get_style(c, props.parent_style, root_style, n);
+ 	if (fresh != NULL)
+ 		box_note_neg_z(c, fresh);
+-	if (fresh == NULL)
++	if (fresh == NULL) {
++		restyle_why = "its style could not be selected";
+ 		return BOX_RESTYLE_LAYOUT;
++	}
+ 
+ 	if (box == NULL) {
+ 		/* not drawn: only a change to being drawn matters, and
+@@ -3046,14 +3059,17 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 				props.node_is_root) != CSS_DISPLAY_NONE;
+ 
+ 		css_select_results_destroy(fresh);
+-		if (shown && props.parent_style != NULL)
++		if (shown && props.parent_style != NULL) {
++			restyle_why = "a hidden element is shown";
+ 			return BOX_RESTYLE_LAYOUT;
++		}
+ 		return BOX_RESTYLE_SAME;
+ 	}
+ 
+ 	old = box->styles;
+ 	if (old == NULL) {
+ 		css_select_results_destroy(fresh);
++		restyle_why = "a box without its styles";
+ 		return BOX_RESTYLE_LAYOUT;
+ 	}
+ 	if (restyle_results_equal(old, fresh)) {
+@@ -3066,6 +3082,9 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 	 * keeps the colours it was made with, but its box takes the rest */
+ 	if ((box->flags & DISPLAY_CONTENTS) != 0 ||
+ 			!restyle_same_layout(old, fresh)) {
++		restyle_why = (box->flags & DISPLAY_CONTENTS) != 0 ?
++			"display: contents" :
++			"the new style changes the layout";
+ 		css_select_results_destroy(fresh);
+ 		return BOX_RESTYLE_LAYOUT;
+ 	}
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index e2ec85fff..a8067e6fd 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -169,6 +169,9 @@ enum box_restyle {
+  *                 one, and none left is a BOX_RESTYLE_LAYOUT
+  * \return what the page needs now
+  */
++/** Why the last restyle asked for the layout, for the log (VitaSurf). */
++const char *box_restyle_why(void);
++
+ enum box_restyle box_restyle(struct html_content *c, struct dom_node *n,
+ 		bool subtree, unsigned *budget);
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 4a147eb5b..bd540ba11 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -3342,6 +3342,118 @@ static void html_animation_tick(void *p)
+ 		html_animation_schedule(c);
+ }
+ 
++/** Whether an element has one of a sheet's keys for a state. */
++static bool dynamic_sheet_keyed(const css_stylesheet *sheet, uint32_t bit,
++		dom_string *name, dom_string *id, lwc_string **classes,
++		uint32_t n_classes, bool *any)
++{
++	const css_dynamic_key *keys;
++	uint32_t n, i, j;
++
++	css_stylesheet_dynamic_keys(sheet, bit, &keys, &n, any);
++	if (*any)
++		return true;
++	for (i = 0; i < n; i++) {
++		switch (keys[i].kind) {
++		case CSS_DYNAMIC_KEY_ID:
++			if (id != NULL &&
++			    dom_string_caseless_lwc_isequal(id, keys[i].name))
++				return true;
++			break;
++		case CSS_DYNAMIC_KEY_CLASS:
++			for (j = 0; j < n_classes; j++) {
++				bool eq = false;
++				if (lwc_string_caseless_isequal(classes[j],
++						keys[i].name, &eq) ==
++						lwc_error_ok && eq)
++					return true;
++			}
++			break;
++		default:
++			if (name != NULL &&
++			    dom_string_caseless_lwc_isequal(name, keys[i].name))
++				return true;
++			break;
++		}
++	}
++	return false;
++}
++
++/*
++ * Whether a change of state on an element can restyle what is under it
++ * (VitaSurf): only if some sheet has an ancestor compound asking for the
++ * state that the element could match. GitHub's sheets ask ".Box-row:hover
++ * .Link--muted" and the like, which set the sheet's bit, and every
++ * pointer move restyled the subtree under each of the six nearest
++ * ancestors of what it crossed: past the budget, that became a rebuild
++ * of the whole page, two seconds each on the Vita. Now an ancestor's
++ * subtree is restyled only if it has the class, id or name a sheet asks
++ * for with the state.
++ */
++static bool dynamic_keyed(html_content *c, dom_node *n, uint32_t bit)
++{
++	dom_string *name = NULL, *id = NULL;
++	lwc_string **classes = NULL;
++	uint32_t n_classes = 0, i, k;
++	bool hit = false, any = false;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR)
++		name = NULL;
++	if (dom_element_get_attribute(n, corestring_dom_id, &id) !=
++			DOM_NO_ERR)
++		id = NULL;
++	if (dom_element_get_classes((dom_element *) n, &classes,
++			&n_classes) != DOM_NO_ERR) {
++		classes = NULL;
++		n_classes = 0;
++	}
++
++	for (i = 0; i < c->stylesheet_count && !hit; i++) {
++		struct hlcache_handle *h = c->stylesheets[i].sheet;
++		struct nscss_import *imports;
++		uint32_t ni = 0;
++
++		if (!dynamic_sheet_ready(h))
++			continue;
++		hit = dynamic_sheet_keyed(nscss_get_stylesheet(h), bit, name,
++				id, classes, n_classes, &any);
++		imports = nscss_get_imports(h, &ni);
++		for (k = 0; k < ni && !hit; k++) {
++			if (dynamic_sheet_ready(imports[k].c))
++				hit = dynamic_sheet_keyed(nscss_get_stylesheet(
++						imports[k].c), bit, name, id,
++						classes, n_classes, &any);
++		}
++	}
++
++	for (i = 0; i < n_classes; i++)
++		lwc_string_unref(classes[i]);
++	if (name != NULL)
++		dom_string_unref(name);
++	if (id != NULL)
++		dom_string_unref(id);
++	return hit;
++}
++
++/** What the state changes that laid the page out again were (VitaSurf) */
++static struct {
++	unsigned changes, rebuilds, restyled, subtrees, skipped;
++} dynamic_stats;
++
++/* exported interface documented in html/private.h */
++void html_dynamic_report(void)
++{
++	if (dynamic_stats.changes == 0)
++		return;
++	vita_log("hover: %u changes of state restyled %u elements, %u "
++		 "subtrees under an ancestor and %u ancestors passed over "
++		 "as no sheet asks about them; %u laid the page out again",
++		 dynamic_stats.changes, dynamic_stats.restyled,
++		 dynamic_stats.subtrees, dynamic_stats.skipped,
++		 dynamic_stats.rebuilds);
++	memset(&dynamic_stats, 0, sizeof(dynamic_stats));
++}
++
+ /** Whether a node is in a chain. */
+ static bool dynamic_in(dom_node *n, dom_node **chain, unsigned count)
+ {
+@@ -3371,7 +3483,7 @@ void html_set_dynamic(html_content *c, enum nscss_dynamic which,
+ 	dom_node *old[64], **chain;
+ 	unsigned n_old, n_new, i, budget = DYNAMIC_BUDGET;
+ 	enum box_restyle result = BOX_RESTYLE_SAME, r;
+-	bool subtree_wanted;
++	bool subtree_wanted, sub;
+ 	int pass;
+ 
+ 	/* the pointer moving within the same element */
+@@ -3423,14 +3535,31 @@ void html_set_dynamic(html_content *c, enum nscss_dynamic which,
+ 			if (pass == 1 && dynamic_in(list[i], old, n_old) &&
+ 					!end)
+ 				continue;
+-			r = box_restyle(c, list[i], subtree_wanted &&
+-					i < DYNAMIC_SUBTREE_DEPTH, &budget);
++			sub = subtree_wanted && i < DYNAMIC_SUBTREE_DEPTH;
++			if (sub && !dynamic_keyed(c, list[i],
++					dynamic_bit(which))) {
++				sub = false;
++				dynamic_stats.skipped++;
++			} else if (sub) {
++				dynamic_stats.subtrees++;
++			}
++			r = box_restyle(c, list[i], sub, &budget);
+ 			if (r > result)
+ 				result = r;
+ 		}
+ 	}
++	dynamic_stats.changes++;
++	dynamic_stats.restyled += DYNAMIC_BUDGET - budget;
+ 
+ 	if (result == BOX_RESTYLE_LAYOUT) {
++		dynamic_stats.rebuilds++;
++		vita_log("hover: a change of %s laid the page out again: %s, "
++			 "after restyling %u elements",
++			 which == NSCSS_HOVER ? ":hover" :
++			 which == NSCSS_ACTIVE ? ":active" :
++			 which == NSCSS_FOCUS ? ":focus" : ":target",
++			 budget == 0 ? "more than it may restyle in place" :
++			 box_restyle_why(), DYNAMIC_BUDGET - budget);
+ 		if (!c->dynamic_relayout_pending) {
+ 			c->dynamic_relayout_pending = true;
+ 			guit->misc->schedule(0, html_dynamic_relayout, c);
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index abafe8d4a..856c678a9 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -566,6 +566,10 @@ struct box *html_topmost_box_at(html_content *html, int x, int y);
+ /** Let go of a document's elements in any state, as it goes. */
+ void html_drop_dynamic(html_content *c);
+ 
++/** Log what changes of :hover and the like cost since the last call
++ * (VitaSurf). */
++void html_dynamic_report(void);
++
+ /* in html/forms.c */
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
+ /**

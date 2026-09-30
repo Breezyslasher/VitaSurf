@@ -1073,6 +1073,7 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 extern void vita_js_report_gaps(void) __attribute__((weak));
 /* the script profile, from the same place and weak for the same reason */
 extern void vita_js_report_profile(void) __attribute__((weak));
+extern void html_dynamic_report(void) __attribute__((weak));
 extern void vita_js_scrolled(struct browser_window *bw) __attribute__((weak));
 
 /**
@@ -1838,6 +1839,9 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 r.other_bytes / 1024, r.other_count);
 			vita_log("cache: %u of those have no users, %u KB",
 				 r.unused_count, r.unused_bytes / 1024);
+		}
+		if (html_dynamic_report != NULL) {
+			html_dynamic_report();
 		}
 		if (vita_js_report_profile != NULL) {
 			vita_js_report_profile();

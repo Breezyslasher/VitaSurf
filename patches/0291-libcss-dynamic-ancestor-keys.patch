@@ -1,0 +1,254 @@
+diff --git a/include/libcss/stylesheet.h b/include/libcss/stylesheet.h
+index 9451d27..2c5aac7 100644
+--- a/include/libcss/stylesheet.h
++++ b/include/libcss/stylesheet.h
+@@ -208,6 +208,37 @@ uint32_t css_stylesheet_gap_count(const css_stylesheet *sheet);
+  */
+ uint32_t css_stylesheet_dynamic_ancestor(const css_stylesheet *sheet);
+ 
++/**
++ * What an ancestor has to be for a state on it to matter (VitaSurf).
++ *
++ * For each ancestor compound that asks for a CSS_DYNAMIC_ state -- the
++ * ".menu:hover" of ".menu:hover .sub" -- one thing an element must have
++ * to match it: its id if it names one, else its first class, else its
++ * element name. A client restyles what is under an element whose state
++ * changed only if the element has one of these. *any is set when some
++ * such compound cannot be keyed (":hover .sub", or the state inside
++ * :is() or :not()), and then every element counts.
++ */
++enum css_dynamic_key_kind {
++	CSS_DYNAMIC_KEY_ELEMENT,
++	CSS_DYNAMIC_KEY_CLASS,
++	CSS_DYNAMIC_KEY_ID
++};
++typedef struct css_dynamic_key {
++	uint32_t kind;		/**< a css_dynamic_key_kind */
++	lwc_string *name;
++} css_dynamic_key;
++
++/**
++ * \param sheet  The stylesheet
++ * \param bit    One CSS_DYNAMIC_ bit
++ * \param keys   Set to the keys, owned by the sheet
++ * \param n      Set to how many
++ * \param any    Set to whether any element counts
++ */
++void css_stylesheet_dynamic_keys(const css_stylesheet *sheet, uint32_t bit,
++		const css_dynamic_key **keys, uint32_t *n, bool *any);
++
+ /**
+  * Read one of those (VitaSurf).
+  *
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 8052989..3824801 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -264,6 +264,17 @@ css_error css_stylesheet_destroy(css_stylesheet *sheet)
+ 	if (sheet == NULL)
+ 		return CSS_BADPARM;
+ 
++	{
++		int k;
++		uint32_t j;
++
++		for (k = 0; k < 4; k++) {
++			for (j = 0; j < sheet->dynamic_keys[k].n; j++)
++				lwc_string_unref(
++					sheet->dynamic_keys[k].keys[j].name);
++			free(sheet->dynamic_keys[k].keys);
++		}
++	}
+ 	for (gap = 0; gap < sheet->n_gaps; gap++) {
+ 		lwc_string_unref(sheet->gaps[gap].name);
+ 	}
+@@ -1057,6 +1068,34 @@ uint32_t css_stylesheet_dynamic_ancestor(const css_stylesheet *sheet)
+ 	return sheet != NULL ? sheet->dynamic_ancestor : 0;
+ }
+ 
++static int dynamic_bit_index(uint32_t bit)
++{
++	switch (bit) {
++	case CSS_DYNAMIC_HOVER:  return 0;
++	case CSS_DYNAMIC_ACTIVE: return 1;
++	case CSS_DYNAMIC_FOCUS:  return 2;
++	case CSS_DYNAMIC_TARGET: return 3;
++	default:                 return -1;
++	}
++}
++
++/* exported function documented in libcss/stylesheet.h */
++void css_stylesheet_dynamic_keys(const css_stylesheet *sheet, uint32_t bit,
++		const css_dynamic_key **keys, uint32_t *n, bool *any)
++{
++	int i = dynamic_bit_index(bit);
++
++	if (sheet == NULL || i < 0) {
++		*keys = NULL;
++		*n = 0;
++		*any = false;
++		return;
++	}
++	*keys = sheet->dynamic_keys[i].keys;
++	*n = sheet->dynamic_keys[i].n;
++	*any = sheet->dynamic_keys[i].any;
++}
++
+ uint32_t css_stylesheet_gap_count(const css_stylesheet *sheet)
+ {
+ 	return sheet == NULL ? 0 : sheet->n_gaps;
+@@ -1836,6 +1875,128 @@ static uint32_t dynamic_bits(const css_selector *sel, bool chain)
+ 	return bits;
+ }
+ 
++/** The CSS_DYNAMIC_ bits of one compound's own pseudo-classes. */
++static uint32_t dynamic_bits_own(const css_selector *sel)
++{
++	const css_selector_detail *d = &sel->data;
++	uint32_t bits = 0;
++
++	for (;;) {
++		if (d->type == CSS_SELECTOR_PSEUDO_CLASS &&
++				d->value_type != CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++			const char *n = lwc_string_data(d->qname.name);
++
++			if (strcasecmp(n, "hover") == 0)
++				bits |= CSS_DYNAMIC_HOVER;
++			else if (strcasecmp(n, "active") == 0)
++				bits |= CSS_DYNAMIC_ACTIVE;
++			else if (strcasecmp(n, "focus") == 0 ||
++					strcasecmp(n, "focus-within") == 0 ||
++					strcasecmp(n, "focus-visible") == 0)
++				bits |= CSS_DYNAMIC_FOCUS;
++			else if (strcasecmp(n, "target") == 0 ||
++					strcasecmp(n, "target-within") == 0)
++				bits |= CSS_DYNAMIC_TARGET;
++		}
++		if (d->next == 0)
++			break;
++		d++;
++	}
++	return bits;
++}
++
++/** Note what an element must have to match an ancestor compound. */
++static void dynamic_key_add(css_stylesheet *sheet, uint32_t bits,
++		const css_selector *sel)
++{
++	const css_selector_detail *d = &sel->data;
++	const css_selector_detail *id = NULL, *cls = NULL, *el = NULL;
++	int i;
++
++	for (;;) {
++		if (d->type == CSS_SELECTOR_ID && id == NULL)
++			id = d;
++		else if (d->type == CSS_SELECTOR_CLASS && cls == NULL)
++			cls = d;
++		else if (d->type == CSS_SELECTOR_ELEMENT &&
++				!(lwc_string_length(d->qname.name) == 1 &&
++				  lwc_string_data(d->qname.name)[0] == '*'))
++			el = d;
++		if (d->next == 0)
++			break;
++		d++;
++	}
++	if (id != NULL)
++		d = id;
++	else if (cls != NULL)
++		d = cls;
++	else
++		d = el;
++
++	for (i = 0; i < 4; i++) {
++		uint32_t kind, j;
++
++		if (!(bits & (1u << i)))
++			continue;
++		if (d == NULL) {
++			sheet->dynamic_keys[i].any = true;
++			continue;
++		}
++		kind = d == id ? CSS_DYNAMIC_KEY_ID :
++			d == cls ? CSS_DYNAMIC_KEY_CLASS :
++			CSS_DYNAMIC_KEY_ELEMENT;
++		for (j = 0; j < sheet->dynamic_keys[i].n; j++) {
++			if (sheet->dynamic_keys[i].keys[j].kind == kind &&
++					sheet->dynamic_keys[i].keys[j].name ==
++					d->qname.name)
++				break;
++		}
++		if (j < sheet->dynamic_keys[i].n)
++			continue;
++		if (sheet->dynamic_keys[i].n == sheet->dynamic_keys[i].alloc) {
++			uint32_t want = sheet->dynamic_keys[i].alloc ?
++				sheet->dynamic_keys[i].alloc * 2 : 8;
++			css_dynamic_key *k = realloc(
++					sheet->dynamic_keys[i].keys,
++					want * sizeof(*k));
++
++			if (k == NULL) {
++				/* unkeyed, so every element counts */
++				sheet->dynamic_keys[i].any = true;
++				continue;
++			}
++			sheet->dynamic_keys[i].keys = k;
++			sheet->dynamic_keys[i].alloc = want;
++		}
++		sheet->dynamic_keys[i].keys[sheet->dynamic_keys[i].n].kind =
++			kind;
++		sheet->dynamic_keys[i].keys[sheet->dynamic_keys[i].n].name =
++			lwc_string_ref(d->qname.name);
++		sheet->dynamic_keys[i].n++;
++	}
++}
++
++/** Key every ancestor compound of a selector that asks for a state. */
++static void dynamic_keys_note(css_stylesheet *sheet,
++		const css_selector *selector)
++{
++	const css_selector *sel;
++
++	for (sel = selector->combinator; sel != NULL; sel = sel->combinator) {
++		uint32_t all = dynamic_bits(sel, false);
++		uint32_t own = dynamic_bits_own(sel);
++		int i;
++
++		if (own != 0)
++			dynamic_key_add(sheet, own, sel);
++		/* inside :is(), :not(), :has() and the like: not keyed */
++		for (i = 0; i < 4; i++) {
++			if ((all & ~own) & (1u << i))
++				sheet->dynamic_keys[i].any = true;
++		}
++	}
++}
++
+ css_error css__stylesheet_rule_add_selector(css_stylesheet *sheet,
+ 		css_rule *rule, css_selector *selector)
+ {
+@@ -1850,6 +2011,7 @@ css_error css__stylesheet_rule_add_selector(css_stylesheet *sheet,
+ 
+ 	name_hidden_types(selector);
+ 	sheet->dynamic_ancestor |= dynamic_bits(selector->combinator, true);
++	dynamic_keys_note(sheet, selector);
+ 
+ 	sels = realloc(r->selectors,
+ 			(r->base.items + 1) * sizeof(css_selector *));
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 6fd9e21..5fb80cf 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -284,6 +284,13 @@ struct css_stylesheet {
+ 	/* the CSS_DYNAMIC_ states some selector asks of an element other
+ 	 * than its subject, as ".menu:hover .submenu" does (VitaSurf) */
+ 	uint32_t dynamic_ancestor;
++	/* and what those ancestors have to be, per state: see
++	 * css_stylesheet_dynamic_keys (VitaSurf) */
++	struct {
++		css_dynamic_key *keys;
++		uint32_t n, alloc;
++		bool any;
++	} dynamic_keys[4];
+ 
+ 	uint32_t rule_count;			/**< Number of rules in sheet */
+ 	css_rule *rule_list;			/**< List of rules in sheet */
