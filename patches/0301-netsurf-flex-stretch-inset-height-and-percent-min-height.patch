@@ -1,0 +1,182 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 0130918d5..69bf14ad4 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2396,10 +2396,14 @@ static bool layout_apply_minmax_height(
+ 			containing_block->height != AUTO &&
+ 			(css_computed_position(box->style) ==
+ 					CSS_POSITION_ABSOLUTE ||
+-				htype == CSS_HEIGHT_SET)) {
++				htype == CSS_HEIGHT_SET ||
++				lh__box_is_flex_item(containing_block))) {
+ 			/* Box is absolutely positioned or its containing
+ 			 * block has a valid specified height.
+-			 * (CSS 2.1 Section 10.5) */
++			 * (CSS 2.1 Section 10.5) A flex item's size is
++			 * definite once flex layout has given it, as for
++			 * height (VitaSurf): Home Assistant's sections
++			 * wrapper is min-height: 100% of one. */
+ 			basis = containing_block->height;
+ 		}
+ 
+@@ -4902,6 +4906,10 @@ layout_compute_offsets(const css_unit_ctx *unit_len_ctx,
+ }
+ 
+ 
++/* see layout_internal.h (VitaSurf) */
++struct box *layout_flex_given_box;
++int layout_flex_given_height;
++
+ /**
+  * Layout and position an absolutely positioned box.
+  *
+@@ -5166,10 +5174,33 @@ layout_absolute(struct box *box,
+ 		layout_solve_width(box, box->parent->width, box->width, 0, 0,
+ 				-1, -1);
+ 	} else if (box->type == BOX_FLEX || box->type == BOX_INLINE_FLEX) {
++		bool flexed;
++
+ 		/* layout_table also expects the containing block to be
+ 		 * stored in the float_container field */
+ 		box->float_container = containing_block;
+-		if (!layout_flex(box, width, content))
++		/*
++		 * A top and a bottom with no height make the height, from
++		 * the containing block (10.6.4), and the items are laid out
++		 * in it (VitaSurf). It was only worked out after them, so
++		 * align-items: center had nothing to centre in, and a
++		 * Bubble Card button's icon sat at its top.
++		 */
++		if (height == AUTO && top != AUTO && bottom != AUTO &&
++				containing_block->height != AUTO) {
++			int h = containing_block->height - top - bottom -
++					(margin[TOP] == AUTO ? 0 : margin[TOP]) -
++					(margin[BOTTOM] == AUTO ?
++						0 : margin[BOTTOM]) -
++					border[TOP].width - padding[TOP] -
++					padding[BOTTOM] - border[BOTTOM].width;
++
++			layout_flex_given_box = box;
++			layout_flex_given_height = h > 0 ? h : 0;
++		}
++		flexed = layout_flex(box, width, content);
++		layout_flex_given_box = NULL;
++		if (!flexed)
+ 			return false;
+ 		box->float_container = NULL;
+ 	}
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 91c5226bc..96656fc16 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -1222,10 +1222,27 @@ static void layout_flex__place_line_items_cross(struct flex_ctx *ctx,
+ 		default:
+ 		case CSS_ALIGN_SELF_STRETCH:
+ 			if (lh__box_size_cross_is_auto(ctx->horizontal, b)) {
++				bool ok;
++
+ 				*box_size_cross += cross_free_space;
+ 
+-				/* Relayout children for stretch. */
+-				if (!layout_flex_item(ctx, item, b->width)) {
++				/*
++				 * Relayout children for stretch. A flex
++				 * container read its auto height again and
++				 * went back to its content's, so a column
++				 * stretched across a row stayed short and its
++				 * flex: 1 items had nothing to grow into
++				 * (VitaSurf): it is given the stretched one.
++				 */
++				if (ctx->horizontal &&
++				    (b->type == BOX_FLEX ||
++				     b->type == BOX_INLINE_FLEX)) {
++					layout_flex_given_box = b;
++					layout_flex_given_height = b->height;
++				}
++				ok = layout_flex_item(ctx, item, b->width);
++				layout_flex_given_box = NULL;
++				if (!ok) {
+ 					return;
+ 				}
+ 			}
+@@ -1380,6 +1397,14 @@ bool layout_flex(struct box *flex, int available_width,
+ 
+ 	available_width = min(available_width, flex->width);
+ 
++	/* a height given from outside its style (VitaSurf) */
++	if (flex == layout_flex_given_box) {
++		if (flex->height == AUTO) {
++			flex->height = layout_flex_given_height;
++		}
++		layout_flex_given_box = NULL;
++	}
++
+ 	{
+ 		/*
+ 		 * A container told only how short it may not be is that
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index e41dc35f9..d8db895aa 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -539,6 +539,15 @@ static inline void calculate_mbp_width(
+ 	}
+ }
+ 
++/**
++ * A flex container whose height is given from outside its style, and
++ * that height, for layout_flex to lay its items out in (VitaSurf): an
++ * absolutely positioned one whose top and bottom give it, or a flex item
++ * stretched across its line. Set around the one call that lays it out.
++ */
++extern struct box *layout_flex_given_box;
++extern int layout_flex_given_height;
++
+ /**
+  * Adjust a specified width or height for the box-sizing property.
+  *
+@@ -703,6 +712,9 @@ static inline void layout_find_dimensions(
+ 	/* intrinsic sizing keywords, resolved once the margins, borders
+ 	 * and padding are known (VitaSurf) */
+ 	uint8_t width_kw = 0, min_width_kw = 0, max_width_kw = 0;
++	/* what a percentage height resolves against, -1 for nothing; the
++	 * same for min-height and max-height (VitaSurf) */
++	int height_basis = -1;
+ 
+ 	if (width) {
+ 		uint8_t wtype = css_computed_width_px(style, unit_len_ctx,
+@@ -788,6 +800,7 @@ static inline void layout_find_dimensions(
+ 			basis = viewport_height;
+ 		}
+ 
++		height_basis = basis;
+ 		htype = css_computed_height_px(style, unit_len_ctx,
+ 				basis, height);
+ 
+@@ -886,9 +899,10 @@ static inline void layout_find_dimensions(
+ 		 * expression holding one) reports none rather than the
+ 		 * zero it would otherwise resolve to. */
+ 		if (css_computed_max_height_px(style, unit_len_ctx,
+-				-1, max_height) != CSS_MAX_HEIGHT_SET ||
+-		    lh__length_needs_basis(css_computed_max_height_px,
+-				style, unit_len_ctx)) {
++				height_basis, max_height) != CSS_MAX_HEIGHT_SET ||
++		    (height_basis < 0 && lh__length_needs_basis(
++				css_computed_max_height_px,
++				style, unit_len_ctx))) {
+ 			/* Inadmissible */
+ 			*max_height = -1;
+ 		}
+@@ -904,9 +918,10 @@ static inline void layout_find_dimensions(
+ 	if (min_height) {
+ 		/* as for max-height above */
+ 		if (ns_computed_min_height_px(style, unit_len_ctx,
+-				-1, min_height) != CSS_MIN_HEIGHT_SET ||
+-		    lh__length_needs_basis(ns_computed_min_height_px,
+-				style, unit_len_ctx)) {
++				height_basis, min_height) != CSS_MIN_HEIGHT_SET ||
++		    (height_basis < 0 && lh__length_needs_basis(
++				ns_computed_min_height_px,
++				style, unit_len_ctx))) {
+ 			/* Inadmissible */
+ 			*min_height = 0;
+ 		}

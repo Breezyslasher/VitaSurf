@@ -13,6 +13,12 @@
  #minbb { min-height: 200px; padding-top: 50px; box-sizing: border-box; }
  #maxbb { height: 300px; max-height: 100px; padding-top: 50px; box-sizing: border-box; }
  .shorthand { display: flex; }
+ #stretch { display: flex; height: 200px; }
+ #sc { display: flex; flex-direction: column; }
+ #scg { flex: 1; }
+ #card { position: relative; width: 300px; height: 56px; }
+ #inset { position: absolute; inset: 0; display: flex; align-items: center; }
+ #ci { width: 42px; height: 42px; }
 </style></head>
 <body>
 <div id="outer"><div id="view"><div id="sections"><div id="wrapper"><div id="content"></div></div></div></div></div>
@@ -20,10 +26,14 @@
 <div id="minbb">x</div>
 <div id="maxbb">x</div>
 <div class="shorthand"><div id="f1" style="flex: 100%"></div><div id="f2" style="flex: none"></div><div id="f3" style="flex: auto"></div><div id="f4" style="flex: 1 30px"></div></div>
+<div id="stretch"><div id="sr" style="display: flex">a</div><div id="sc"><div id="scg">b</div></div></div>
+<div id="card"><div id="inset"><div id="ci"></div></div></div>
 <pre id="out"></pre>
 <script>
 /* A flex: 1 item in a column of auto height grew to 2097151 pixels, the
-   column around it came out 0 tall, min-height and max-height ignored
+   column around it came out 0 tall, a stretched flex item went back to
+   its content's height, an inset: 0 flex box centred nothing, a
+   min-height percentage of a flex item was ignored, min-height and max-height ignored
    box-sizing, and flex: 100% left flex-grow at 0. */
 var o = document.getElementById('out');
 function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
@@ -32,7 +42,9 @@ function H(id){ return Math.round(document.getElementById(id).getBoundingClientR
 function Y(id){ var e = document.getElementById(id); return Math.round(e.getBoundingClientRect().top - e.parentNode.getBoundingClientRect().top); }
 function F(id){ var s = getComputedStyle(document.getElementById(id)); return s.flexGrow + '/' + s.flexShrink + '/' + s.flexBasis; }
 window.addEventListener('load', function(){ setTimeout(function(){
-  T('outer, view, sections heights (a browser: 300 244 244; stretching a column item is not done yet, so 300 120 120 here)', [H('outer'), H('view'), H('sections')].join(' '));
+  T('outer, view, sections, wrapper heights (300 244 244 244)', [H('outer'), H('view'), H('sections'), H('wrapper')].join(' '));
+  T('stretched flex items in a 200px row (200 200 200)', [H('sr'), H('sc'), H('scg')].join(' '));
+  T('centred in an inset: 0 flex box (7)', Y('ci'));
   T('column items with gap 20 (0 40 80, each 20)', [Y('k1'), Y('k2'), Y('k3')].join(' ') + ', ' + H('k1'));
   T('border-box min-height 200 (200)', H('minbb'));
   T('border-box max-height 100 (100)', H('maxbb'));
