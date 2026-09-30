@@ -39,7 +39,7 @@ index 69bf14ad4..6f0a907f3 100644
  			if (!layout_position_absolute(c, c, 0, 0, content))
  				return false;
 diff --git a/content/handlers/image/svg.c b/content/handlers/image/svg.c
-index f2ec722b6..30234f918 100644
+index f2ec722b6..07a224dbd 100644
 --- a/content/handlers/image/svg.c
 +++ b/content/handlers/image/svg.c
 @@ -680,6 +680,75 @@ static bool svg_raster_draw_cb(const struct redraw_context *ctx, void *pw)
@@ -156,13 +156,13 @@ index f2ec722b6..30234f918 100644
 +			return NULL;
 +		}
 +		if (ss > 1) {
-+			struct bitmap *small = svg_downsample(bm,
++			struct bitmap *down = svg_downsample(bm,
 +					data->width, data->height, ss);
 +
 +			guit->bitmap->destroy(bm);
-+			if (small == NULL)
++			if (down == NULL)
 +				return NULL;
-+			bm = small;
++			bm = down;
 +		}
  	}
  	r = &svg->raster[svg->raster_n++];
