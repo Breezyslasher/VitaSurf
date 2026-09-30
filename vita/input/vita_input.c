@@ -40,6 +40,7 @@
 #include <libnsfb_event.h>
 #include <libnsfb_plot.h>
 #include <libnsfb_plot_util.h>
+#include <libnsfb_cursor.h>
 
 #include <dom/dom.h>
 
@@ -60,6 +61,8 @@
 #include "content/handlers/html/box_inspect.h"
 #include "content/handlers/html/html_save.h"
 #include "content/handlers/html/html.h"
+#include "content/handlers/html/private.h"
+#include "utils/corestrings.h"
 #include "content/handlers/html/form_internal.h"
 #include "framebuffer/gui.h"
 #include "framebuffer/fbtk.h"
@@ -1003,6 +1006,61 @@ static const char *dump_box_type(box_type type)
 
 
 /**
+ * The element a box is for, as <name.class> (VitaSurf). The first class
+ * is what tells one card's boxes from another's in a page built of
+ * custom elements, where every name is a div.
+ */
+static void dump_box_name(struct box *box, char *what, size_t size)
+{
+	dom_string *name = NULL, *cls = NULL;
+	const char *c = "";
+	size_t cn = 0;
+
+	what[0] = '\0';
+	if (box->node == NULL ||
+	    dom_node_get_node_name(box->node, &name) != DOM_NO_ERR ||
+	    name == NULL) {
+		return;
+	}
+	if (dom_element_get_attribute(box->node, corestring_dom_class,
+				      &cls) == DOM_NO_ERR && cls != NULL) {
+		c = dom_string_data(cls);
+		cn = dom_string_byte_length(cls);
+		while (cn > 0 && c[0] == ' ') {
+			c++;
+			cn--;
+		}
+		cn = strcspn(c, " ") < cn ? strcspn(c, " ") : cn;
+		if (cn > 40) {
+			cn = 40;
+		}
+	}
+	snprintf(what, size, " <%.*s%s%.*s>",
+		 (int)dom_string_byte_length(name), dom_string_data(name),
+		 cn > 0 ? "." : "", (int)cn, c);
+	dom_string_unref(name);
+	if (cls != NULL) {
+		dom_string_unref(cls);
+	}
+}
+
+/** How a box is positioned, when it is not in the flow. */
+static const char *dump_box_position(struct box *box)
+{
+	if (box->style == NULL) {
+		return "";
+	}
+	switch (css_computed_position(box->style)) {
+	case CSS_POSITION_ABSOLUTE: return " absolute";
+	case CSS_POSITION_FIXED:    return " fixed";
+	case CSS_POSITION_RELATIVE: return " relative";
+	case CSS_POSITION_STICKY:   return " sticky";
+	default:                    return "";
+	}
+}
+
+
+/**
  * Write one box and everything in it to the log (VitaSurf).
  *
  * A page that comes out wrong on the device cannot be opened in a
@@ -1024,18 +1082,7 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 	}
 	(*left)--;
 
-	what[0] = '\0';
-	if (box->node != NULL) {
-		dom_string *name = NULL;
-
-		if (dom_node_get_node_name(box->node, &name) == DOM_NO_ERR &&
-		    name != NULL) {
-			snprintf(what, sizeof(what), " <%.*s>",
-				 (int)dom_string_byte_length(name),
-				 dom_string_data(name));
-			dom_string_unref(name);
-		}
-	}
+	dump_box_name(box, what, sizeof(what));
 
 	text[0] = '\0';
 	if (box->text != NULL && box->length > 0) {
@@ -1046,9 +1093,9 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 	}
 
 	box_coords(box, &x, &y);
-	vita_log("layout: %*s%s%s %dx%d at %d,%d%s%s",
+	vita_log("layout: %*s%s%s%s %dx%d at %d,%d%s%s",
 		 (int)(depth * 2), "", dump_box_type(box->type), what,
-		 box->width, box->height, x, y,
+		 dump_box_position(box), box->width, box->height, x, y,
 		 n > 0 ? " " : "", text);
 
 	for (child = box->children; child != NULL; child = child->next) {
@@ -1115,6 +1162,9 @@ static void dump_timeline(void)
 }
 
 
+static void dump_under_pointer(struct gui_window *gw, html_content *html,
+			       struct box *root);
+
 static void dump_layout(struct gui_window *gw, bool force)
 {
 	struct hlcache_handle *h;
@@ -1143,6 +1193,72 @@ static void dump_layout(struct gui_window *gw, bool force)
 		 "size then position", left);
 	dump_box(root, 0, &left);
 	vita_log("layout: end of the boxes%s",
+		 left == 0 ? " (there are more)" : "");
+	if (force) {
+		dump_under_pointer(gw,
+			(html_content *)hlcache_handle_get_content(h), root);
+	}
+}
+
+
+/**
+ * Log the boxes under the pointer (VitaSurf).
+ *
+ * The page dump stops after its first few hundred boxes, and on a
+ * dashboard the card that came out wrong is thousands of boxes in. So
+ * the dump from the menu also follows the pointer down to the deepest
+ * box under it, logging each box on the way, and then writes out the
+ * boxes around that one: point at the part that is wrong, then dump.
+ */
+static void dump_under_pointer(struct gui_window *gw, html_content *html,
+			       struct box *root)
+{
+	nsfb_bbox_t loc;
+	struct box *b = root, *deepest = root, *around;
+	int sx, sy, vw, vh, px, py, bx = 0, by = 0, x, y;
+	unsigned int depth = 0, left = 200, up;
+	float scale;
+	char what[96];
+
+	if (!nsfb_cursor_loc_get(fbtk_get_nsfb(gw->browser), &loc)) {
+		return;
+	}
+	viewport(&sx, &sy, &vw, &vh);
+	scale = page_scale();
+	px = (int)((loc.x0 - fbtk_get_absx(gw->browser) + sx) / scale);
+	py = (int)((loc.y0 - fbtk_get_absy(gw->browser) + sy) / scale);
+	vita_log("layout: the boxes under the pointer at %d,%d on the page",
+		 px, py);
+	while ((b = box_at_point(&html->unit_len_ctx, b,
+				 px, py, &bx, &by)) != NULL) {
+		deepest = b;
+	}
+	/* the chain from the page down, outermost first */
+	for (b = deepest; b != NULL; b = b->parent) {
+		depth++;
+	}
+	while (depth > 0) {
+		unsigned int i;
+
+		b = deepest;
+		for (i = 1; i < depth; i++) {
+			b = b->parent;
+		}
+		box_coords(b, &x, &y);
+		dump_box_name(b, what, sizeof(what));
+		vita_log("layout: under %s%s%s %dx%d at %d,%d",
+			 dump_box_type(b->type), what, dump_box_position(b),
+			 b->width, b->height, x, y);
+		depth--;
+	}
+	/* then what is around it: enough levels up to take in a card */
+	around = deepest;
+	for (up = 0; up < 8 && around->parent != NULL; up++) {
+		around = around->parent;
+	}
+	vita_log("layout: the boxes around it");
+	dump_box(around, 0, &left);
+	vita_log("layout: end of the boxes under the pointer%s",
 		 left == 0 ? " (there are more)" : "");
 }
 
