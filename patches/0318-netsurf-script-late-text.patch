@@ -1,0 +1,69 @@
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index ea92593f6..ead5236bf 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -344,8 +344,9 @@ dom_SCRIPT_showed_up(html_content *htmlc, dom_html_script_element *script)
+ 	 * A script is prepared once (VitaSurf). One inside a subtree put
+ 	 * in the document came here from the subtree's insertion and again
+ 	 * from its own, and ran twice; a copy of one that ran was run
+-	 * again. One with neither a src nor any text is not started, as
+-	 * the text it gets later runs.
++	 * again. One with neither a src nor any text is not started: it
++	 * runs when it gets one, from the handlers for a change to its
++	 * children or its src below.
+ 	 */
+ 	if (flags & DOM_HTML_SCRIPT_ELEMENT_FLAG_ALREADY_STARTED) {
+ 		return;
+@@ -364,10 +365,12 @@ dom_SCRIPT_showed_up(html_content *htmlc, dom_html_script_element *script)
+ 			started = dom_string_byte_length(text) > 0;
+ 			dom_string_unref(text);
+ 		}
+-		if (started) {
+-			(void) dom_html_script_element_set_flags(script,
+-				flags | DOM_HTML_SCRIPT_ELEMENT_FLAG_ALREADY_STARTED);
++		if (!started) {
++			/* nothing to run until it has text or a src */
++			return;
+ 		}
++		(void) dom_html_script_element_set_flags(script,
++			flags | DOM_HTML_SCRIPT_ELEMENT_FLAG_ALREADY_STARTED);
+ 	}
+ 
+ 	res = html_process_script(htmlc, (dom_node *) script);
+@@ -898,6 +901,12 @@ dom_default_action_DOMSubtreeModified_cb(struct dom_event *evt, void *pw)
+ 							(dom_node *)node);
+ 				}
+ 				break;
++			case DOM_HTML_ELEMENT_TYPE_SCRIPT:
++				/* a script that went in empty runs when it
++				 * gets its text (VitaSurf) */
++				dom_SCRIPT_showed_up(htmlc,
++					(dom_html_script_element *)node);
++				break;
+ 			case DOM_HTML_ELEMENT_TYPE_TEXTAREA:
+ 			case DOM_HTML_ELEMENT_TYPE_INPUT:
+ 				html_texty_element_update(htmlc, (dom_node *)node);
+@@ -940,6 +949,23 @@ dom_default_action_DOMAttrModified_cb(struct dom_event *evt, void *pw)
+ 			tag_type = DOM_HTML_ELEMENT_TYPE__UNKNOWN;
+ 		}
+ 
++		if (tag_type == DOM_HTML_ELEMENT_TYPE_SCRIPT) {
++			dom_string *name = NULL;
++
++			/* a script that went in empty runs when it gets a
++			 * src (VitaSurf) */
++			exc = dom_mutation_event_get_attr_name(
++					(dom_mutation_event *)evt, &name);
++			if (exc == DOM_NO_ERR && name != NULL) {
++				if (dom_string_caseless_isequal(name,
++						corestring_dom_src)) {
++					dom_SCRIPT_showed_up(htmlc,
++						(dom_html_script_element *)node);
++				}
++				dom_string_unref(name);
++			}
++		}
++
+ 		if ((tag_type == DOM_HTML_ELEMENT_TYPE_LINK ||
+ 		     tag_type == DOM_HTML_ELEMENT_TYPE_STYLE) &&
+ 		    nsoption_bool(author_level_css)) {
