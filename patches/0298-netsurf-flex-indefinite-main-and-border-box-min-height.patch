@@ -1,0 +1,227 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 7c89686f2..0130918d5 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2403,29 +2403,44 @@ static bool layout_apply_minmax_height(
+ 			basis = containing_block->height;
+ 		}
+ 
++		/* a percentage padding is a share of the containing
++		 * block's width, as for the box's own width */
++		int cb_width = (containing_block != NULL &&
++				containing_block->width != AUTO &&
++				containing_block->width != UNKNOWN_WIDTH) ?
++				containing_block->width : 0;
++
+ 		/* max-height, unless it is a share of a height nothing
+-		 * has given, which is no limit at all (VitaSurf) */
++		 * has given, which is no limit at all (VitaSurf). A
++		 * border-box one counts the padding and border in, and
++		 * box->height is the content's. */
+ 		if (css_computed_max_height_px(box->style, unit_len_ctx,
+ 				basis, &h) == CSS_MAX_HEIGHT_SET &&
+-				h < box->height &&
+ 				(basis >= 0 ||
+ 				 !lh__length_needs_basis(
+ 					css_computed_max_height_px,
+ 					box->style, unit_len_ctx))) {
+-			box->height = h;
+-			updated = true;
++			layout_handle_box_sizing(unit_len_ctx, box,
++					cb_width, false, &h);
++			if (h < box->height) {
++				box->height = h;
++				updated = true;
++			}
+ 		}
+ 
+ 		/* min-height, with the same reading of a percentage */
+ 		if (ns_computed_min_height_px(box->style, unit_len_ctx,
+ 				basis, &h) == CSS_MIN_HEIGHT_SET &&
+-				h > box->height &&
+ 				(basis >= 0 ||
+ 				 !lh__length_needs_basis(
+ 					ns_computed_min_height_px,
+ 					box->style, unit_len_ctx))) {
+-			box->height = h;
+-			updated = true;
++			layout_handle_box_sizing(unit_len_ctx, box,
++					cb_width, false, &h);
++			if (h > box->height) {
++				box->height = h;
++				updated = true;
++			}
+ 		}
+ 	}
+ 	return updated;
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 39dfbc591..91c5226bc 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -60,6 +60,7 @@ struct flex_item_data {
+ 	int target_main_size;
+ 	int base_size;
+ 	int main_size;
++	int content_main;	/**< outer size of its content (VitaSurf) */
+ 	size_t line;
+ 
+ 	bool freeze;
+@@ -333,6 +334,8 @@ static inline bool layout_flex__base_and_main_sizes(
+ 	}
+ 
+ 	item->base_size += delta_outer_main;
++	item->content_main = (ctx->horizontal ?
++			content_max_width : b->height) + delta_outer_main;
+ 
+ 	if (ctx->horizontal) {
+ 		item->base_size = min(item->base_size, available_width);
+@@ -684,12 +687,22 @@ static inline int layout_flex__get_min_max_violations(
+ 					item->min_main);
+ 		}
+ 
+-		if (layout_flex__auto_minimum(ctx, item->box) &&
+-		    target_main_size < item->box->min_width) {
+-			target_main_size = item->box->min_width;
+-			item->min_violation = true;
+-			NSLOG(flex, DEEPDEBUG, "Violation: box min_width: %i",
+-					item->box->min_width);
++		/* the automatic minimum is the content's size along the
++		 * main axis: its height in a column, where this took the
++		 * box's minimum width and made a 50 by 20 item 50 tall
++		 * (VitaSurf) */
++		if (layout_flex__auto_minimum(ctx, item->box)) {
++			int auto_min = ctx->horizontal ?
++					item->box->min_width :
++					item->content_main;
++
++			if (target_main_size < auto_min) {
++				target_main_size = auto_min;
++				item->min_violation = true;
++				NSLOG(flex, DEEPDEBUG,
++						"Violation: automatic minimum: %i",
++						auto_min);
++			}
+ 		}
+ 
+ 		if (target_main_size < 0) {
+@@ -811,23 +824,46 @@ static bool layout_flex__resolve_line(
+ 	int initial_free_main;
+ 	bool grow;
+ 
+-	if (available_main == AUTO) {
+-		available_main = INT_MAX;
+-	} else {
++	int in_flow = 0;
++	int gaps = 0;
++
++	for (size_t i = line->first; i < item_count; i++) {
++		if (!lh__box_is_absolute(ctx->item.data[i].box)) {
++			in_flow++;
++		}
++	}
++	if (in_flow > 1) {
+ 		/* the gaps between the items in flow are spoken for */
+-		int in_flow = 0;
++		gaps = ctx->main_gap * (in_flow - 1);
++	}
+ 
++	if (available_main == AUTO) {
++		/*
++		 * A container whose main size is not known is as big as
++		 * its items' content (Flexbox 9.9.1), so there is no more
++		 * room than that to grow into. Taking it as INT_MAX grew a
++		 * flex: 1 item in a column of auto height to the largest
++		 * height there is, and Home Assistant's sections view,
++		 * one of those, was 2097151 pixels tall (VitaSurf).
++		 */
++		available_main = 0;
+ 		for (size_t i = line->first; i < item_count; i++) {
+-			if (!lh__box_is_absolute(ctx->item.data[i].box)) {
+-				in_flow++;
++			const struct flex_item_data *item =
++					&ctx->item.data[i];
++
++			if (lh__box_is_absolute(item->box)) {
++				continue;
+ 			}
++			available_main += max(item->main_size,
++					item->content_main);
+ 		}
+-		if (in_flow > 1) {
+-			available_main -= ctx->main_gap * (in_flow - 1);
+-		}
++	} else {
++		available_main -= gaps;
+ 	}
+ 
+-	grow = (line->main_size < available_main);
++	/* the line's items against the room for them, gaps left out of
++	 * both: the line's size counts its gaps (VitaSurf) */
++	grow = (line->main_size - gaps < available_main);
+ 	initial_free_main = available_main;
+ 
+ 	NSLOG(flex, DEEPDEBUG, "box %p: line %zu: first: %zu, count: %zu",
+@@ -1127,6 +1163,30 @@ static bool layout_flex__collect_items_into_lines(
+ 		if (ctx->main_size < line->main_size) {
+ 			ctx->main_size = line->main_size;
+ 		}
++		{
++			/*
++			 * The line as its items came out, not as they
++			 * started: a column of flex: 1 items has a basis
++			 * of 0, and one whose height is its content's was
++			 * taken as 0 tall (VitaSurf).
++			 */
++			int used = line->used_main_size;
++			int in_flow = 0;
++
++			for (size_t i = line->first;
++			     i < line->first + line->count; i++) {
++				if (!lh__box_is_absolute(
++						ctx->item.data[i].box)) {
++					in_flow++;
++				}
++			}
++			if (in_flow > 1) {
++				used += ctx->main_gap * (in_flow - 1);
++			}
++			if (ctx->main_size < used) {
++				ctx->main_size = used;
++			}
++		}
+ 	}
+ 
+ 	return true;
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index 9a1a1aeca..e41dc35f9 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -892,6 +892,13 @@ static inline void layout_find_dimensions(
+ 			/* Inadmissible */
+ 			*max_height = -1;
+ 		}
++
++		/* border-box counts the padding and border in, as it
++		 * does for max-width (VitaSurf) */
++		if (*max_height != -1) {
++			layout_handle_box_sizing(unit_len_ctx, box,
++					available_width, false, max_height);
++		}
+ 	}
+ 
+ 	if (min_height) {
+@@ -903,6 +910,14 @@ static inline void layout_find_dimensions(
+ 			/* Inadmissible */
+ 			*min_height = 0;
+ 		}
++
++		/* as for max-height: a border-box min-height of 100vh
++		 * with a header's padding on top made Home Assistant's
++		 * view taller than the screen by that padding (VitaSurf) */
++		if (*min_height != 0) {
++			layout_handle_box_sizing(unit_len_ctx, box,
++					available_width, false, min_height);
++		}
+ 	}
+ 
+ 	for (i = 0; i != 4; i++) {

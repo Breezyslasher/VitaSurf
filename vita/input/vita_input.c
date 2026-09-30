@@ -1061,6 +1061,43 @@ static const char *dump_box_position(struct box *box)
 
 
 /**
+ * What about a box changes how it is painted, when anything does
+ * (VitaSurf): an opacity below one, a filter, visibility: hidden, and the
+ * colour of its text. A box laid out in the right place and not seen on
+ * the screen is explained by one of these.
+ */
+static void dump_box_paint(struct box *box, char *out, size_t size)
+{
+	css_fixed op = 0;
+	css_color c = 0;
+	lwc_string *filter = NULL;
+	size_t n = 0;
+
+	out[0] = '\0';
+	if (box->style == NULL) {
+		return;
+	}
+	if (css_computed_opacity(box->style, &op) == CSS_OPACITY_SET &&
+	    op < INTTOFIX(1)) {
+		n += snprintf(out + n, size - n, " opacity %d%%",
+			      (int)(FIXTOFLT(op) * 100));
+	}
+	if (n < size && css_computed_filter(box->style, &filter) ==
+			CSS_FILTER_SET) {
+		n += snprintf(out + n, size - n, " filter");
+	}
+	if (n < size && css_computed_visibility(box->style) ==
+			CSS_VISIBILITY_HIDDEN) {
+		n += snprintf(out + n, size - n, " hidden");
+	}
+	if (n < size && box->text != NULL && box->length > 0 &&
+	    css_computed_color(box->style, &c) == CSS_COLOR_COLOR) {
+		snprintf(out + n, size - n, " colour %08x", (unsigned)c);
+	}
+}
+
+
+/**
  * Write one box and everything in it to the log (VitaSurf).
  *
  * A page that comes out wrong on the device cannot be opened in a
@@ -1073,6 +1110,7 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 {
 	char what[96];
 	char text[41];
+	char paint[64];
 	struct box *child;
 	int x = 0, y = 0;
 	size_t n = 0;
@@ -1093,10 +1131,11 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 	}
 
 	box_coords(box, &x, &y);
-	vita_log("layout: %*s%s%s%s %dx%d at %d,%d%s%s",
+	dump_box_paint(box, paint, sizeof(paint));
+	vita_log("layout: %*s%s%s%s %dx%d at %d,%d%s%s%s",
 		 (int)(depth * 2), "", dump_box_type(box->type), what,
 		 dump_box_position(box), box->width, box->height, x, y,
-		 n > 0 ? " " : "", text);
+		 paint, n > 0 ? " " : "", text);
 
 	for (child = box->children; child != NULL; child = child->next) {
 		dump_box(child, depth + 1, left);
@@ -1219,6 +1258,7 @@ static void dump_under_pointer(struct gui_window *gw, html_content *html,
 	unsigned int depth = 0, left = 200, up;
 	float scale;
 	char what[96];
+	char paint[64];
 
 	if (!nsfb_cursor_loc_get(fbtk_get_nsfb(gw->browser), &loc)) {
 		return;
@@ -1246,9 +1286,10 @@ static void dump_under_pointer(struct gui_window *gw, html_content *html,
 		}
 		box_coords(b, &x, &y);
 		dump_box_name(b, what, sizeof(what));
-		vita_log("layout: under %s%s%s %dx%d at %d,%d",
+		dump_box_paint(b, paint, sizeof(paint));
+		vita_log("layout: under %s%s%s %dx%d at %d,%d%s",
 			 dump_box_type(b->type), what, dump_box_position(b),
-			 b->width, b->height, x, y);
+			 b->width, b->height, x, y, paint);
 		depth--;
 	}
 	/* then what is around it: enough levels up to take in a card */
