@@ -190,6 +190,8 @@ struct slot_map {
 };
 
 struct jsthread {
+	/** the busy sampling's phase when script was entered (VitaSurf) */
+	const char *phase_was;
 	/** the log has said this Home Assistant page gets a current
 	 * browser's user agent (VitaSurf) */
 	bool told_modern_ua;
@@ -6284,6 +6286,12 @@ static void begin_script(jsthread *thread, enum script_why why)
 		return;
 	}
 	script_why = why;
+	/* for the busy sampling: what the frames are spent in (VitaSurf) */
+	thread->phase_was = vitasurf_phase;
+	vitasurf_phase = why == SCRIPT_TIMER ? "script: a timer" :
+			 why == SCRIPT_EVENT ? "script: an event" :
+			 why == SCRIPT_XHR ? "script: a fetch callback" :
+			 "script: a script element";
 	vita_dom_gen++;	/* the parser may have added nodes since */
 	vita_tree_gen++;
 	vita_id_gen++;
@@ -6338,6 +6346,10 @@ static void end_script(jsthread *thread)
 		return;
 	}
 	thread->script_depth = 0;
+	/* back out to NetSurf: no binding is running now, and the phase
+	 * is whatever called into script (VitaSurf) */
+	vitasurf_phase = thread->phase_was;
+	c_where = NULL;
 	prof_tail(script_why == SCRIPT_TIMER ? "a timer" :
 		  script_why == SCRIPT_EVENT ? "an event handler" :
 		  script_why == SCRIPT_XHR ? "a fetch callback" :
@@ -6443,6 +6455,7 @@ static void end_script(jsthread *thread)
 		unsigned b_txt = vitasurf_js_text_reads;
 
 		vitasurf_js_drains++;
+		vitasurf_phase = "promise jobs";
 		for (;;) {
 			JSContext *c = NULL;
 			int r;

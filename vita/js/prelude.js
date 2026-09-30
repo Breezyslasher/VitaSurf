@@ -2809,9 +2809,15 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
       break;}}}
    if(!l.length)delete parked[css];}
   if(nparked<=0&&timer!==null){ci.call(W,timer);timer=null;nparked=0;}}
+ /* A plain <style>, or the one adoptedStyleSheets writes a shadow root's
+    sheets into: its data-adopted is ours and means nothing to CSS. It
+    was taken for a <style> with a media query and left alone, so every
+    Lit component on a Home Assistant dashboard parsed its own copy of
+    the same sheet, unscoped: 444 parses in one log (VitaSurf). */
  function styleNode(n){
-  return n&&n.nodeType===1&&n.tagName==='STYLE'&&
-   !(n.attributes&&n.attributes.length);}
+  if(!(n&&n.nodeType===1&&n.tagName==='STYLE'))return false;
+  var a=n.attributes;
+  return !a||!a.length||(a.length===1&&n.hasAttribute('data-adopted'));}
  /* A shadow root's rules, kept to its host (VitaSurf). Without
   * scoping, the checkbox component on Home Assistant's login page
   * brought input{opacity:0;pointer-events:none;position:absolute}

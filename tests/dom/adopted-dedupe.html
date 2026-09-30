@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!-- adoptedStyleSheets on many copies of one component: the sheet is
+     parsed once and kept to the components. The <style data-adopted> it
+     is written into was passed over by the shadow <style> folding, and
+     a Home Assistant dashboard parsed its sheets 444 times. -->
+<html><body>
+<script>
+var sheet=new CSSStyleSheet();sheet.replaceSync(':host{display:block;color:rgb(255,0,0)} .x{color:rgb(0,0,255)}');
+customElements.define('my-card',class extends HTMLElement{constructor(){super();var r=this.attachShadow({mode:'open'});r.adoptedStyleSheets=[sheet];r.innerHTML='<span class="x">in</span>';}});
+for(var i=0;i<60;i++)document.body.appendChild(document.createElement('my-card'));
+var out=document.createElement('span');out.className='x';out.id='out';out.textContent='outside';document.body.appendChild(out);
+window.addEventListener('load',function(){setTimeout(function(){
+ var styles=document.getElementsByTagName('style'),full=0;for(var k=0;k<styles.length;k++)if(styles[k].textContent)full++;
+ var inside=document.querySelector('my-card').shadowRoot.querySelector('.x');
+ console.log((full===1?'PASS':'FAIL')+' one sheet kept for 60 components ('+full+' of '+styles.length+' styles hold text)');
+ console.log((getComputedStyle(inside).color==='rgb(0, 0, 255)'?'PASS':'FAIL')+' the components get the rule ('+getComputedStyle(inside).color+')');
+ console.log((getComputedStyle(document.getElementById('out')).color!=='rgb(0, 0, 255)'?'PASS':'FAIL')+' and it stays in them ('+getComputedStyle(document.getElementById('out')).color+')');
+},200);});
+</script></body></html>

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<!-- An element script removed is measured after the page has been laid
+     out again. Its box went with the old tree; the element must not go on
+     naming it (build 504 crashed reading a freed box that way). -->
+<html><body><div id="a" style="height:50px">a</div><div id="b">b</div>
+<script>
+var a=document.getElementById('a');
+window.addEventListener('load',function(){setTimeout(function(){
+ var r1=a.getBoundingClientRect();
+ a.parentNode.removeChild(a);
+ document.getElementById('b').textContent='changed';
+ setTimeout(function(){
+  var r2=a.getBoundingClientRect(), cs=getComputedStyle(a).display;
+  console.log((r2.height===0?'PASS':'FAIL')+' a removed element measures nothing after a rebuild ('+r1.height+' -> '+r2.height+', '+cs+')');
+ },300);},100);});
+</script></body></html>

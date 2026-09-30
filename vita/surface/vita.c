@@ -235,7 +235,7 @@ const char *volatile vita_c_where;
  * or NULL for script or NetSurf's own work. Kept by the name's address,
  * which is a constant string.
  */
-#define BUSY_WHERE_SLOTS 12
+#define BUSY_WHERE_SLOTS 20
 static struct {
 	const char *where;
 	unsigned int frames;
@@ -246,6 +246,13 @@ static void busy_note_where(void)
 {
 	const char *w = vita_c_where;
 	int i;
+
+	/* no binding: the phase NetSurf or the script runner is in, which
+	 * was one bucket, "script or NetSurf", and the largest in every
+	 * long stall (VitaSurf) */
+	if (w == NULL && &vitasurf_phase != NULL) {
+		w = vitasurf_phase;
+	}
 
 	for (i = 0; i < BUSY_WHERE_SLOTS; i++) {
 		if (busy_where[i].frames != 0 && busy_where[i].where == w) {
@@ -1149,7 +1156,7 @@ static void busy_resumed(struct vita_surface *vs)
 		vs->dirty = true;	/* the next present covers the panel */
 	}
 	if (frames != vs->busy_seen_frames) {
-		char line[400];
+		char line[900];
 		size_t at = 0;
 		unsigned int told = frames - vs->busy_seen_frames;
 		int i;
@@ -1169,7 +1176,7 @@ static void busy_resumed(struct vita_surface *vs)
 				     at == 0 ? "" : ", ",
 				     busy_where[i].where != NULL ?
 				     busy_where[i].where :
-				     "script or NetSurf", busy_where[i].frames);
+				     "NetSurf, unmarked", busy_where[i].frames);
 			busy_where[i].frames = 0;
 			if (n > 0 && (size_t)n < sizeof(line) - at) {
 				at += (size_t)n;

@@ -1189,7 +1189,12 @@ static unsigned int settle_reports;
 #define SETTLE_QUIET_MS 3000
 /** The most follow-up reports one page gets, so a busy page cannot
  * fill the log with them. */
-#define SETTLE_REPORTS_MAX 3
+#define SETTLE_REPORTS_MAX 6
+/** How much work without a quiet spell is reported anyway (VitaSurf).
+ * A Home Assistant dashboard worked for five minutes after it had
+ * loaded, never quiet for three seconds, and crashed with none of it in
+ * a report. */
+#define SETTLE_BUSY_REPORT_MS 60000
 
 void vita_input_settled(unsigned int sched_ms, unsigned int span_ms)
 {
@@ -1201,6 +1206,19 @@ void vita_input_settled(unsigned int sched_ms, unsigned int span_ms)
 	if (sched_ms > span_ms / 10) {
 		settle_busy_ms += sched_ms;
 		settle_quiet_ms = 0;
+		if (settle_busy_ms < SETTLE_BUSY_REPORT_MS) {
+			return;
+		}
+		vita_log("page: still working, %u ms of it since the last "
+			 "report without a quiet spell; the page so far:",
+			 settle_busy_ms);
+		settle_busy_ms = 0;
+		if (++settle_reports >= SETTLE_REPORTS_MAX) {
+			settle_watching = false;
+		}
+		vita_input_report_page(the_gw, page_started_us == 0 ? 0 :
+				(unsigned int)((sceKernelGetProcessTimeWide() -
+						page_started_us) / 1000));
 		return;
 	}
 

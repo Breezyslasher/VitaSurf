@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!-- The element the view is anchored to is removed by script before the
+     page is laid out again. Its box went with the old tree, and following
+     the node's pointer to it read freed memory: build 504 crashed on a
+     Home Assistant dashboard. The view has to fall back to staying where
+     it is, and the page carry on. -->
+<html><head><title>scroll anchoring, anchor removed</title>
+<style>body { margin: 0; } p { height: 100px; margin: 0; }</style></head><body>
+<div id="top"></div>
+<script>
+for (var i = 0; i < 60; i++) {
+  var p = document.createElement('p');
+  p.id = 'p' + i;
+  p.textContent = 'paragraph ' + i;
+  document.body.appendChild(p);
+}
+function ok(n, c) { console.log((c ? "PASS " : "FAIL ") + n); }
+var steps = [
+  function () { window.scrollTo(0, 1500); },
+  function () {
+    /* the anchor chosen for the next layout is p15; take it and its
+       neighbours out, and add above, in one go */
+    for (var i = 14; i < 18; i++) {
+      var e = document.getElementById('p' + i);
+      e.parentNode.removeChild(e);
+    }
+    var d = document.createElement('div');
+    d.style.height = '200px';
+    document.getElementById('top').appendChild(d);
+  },
+  function () {
+    var e = document.getElementById('p30');
+    e.parentNode.removeChild(e);
+  },
+  function () {
+    ok("the page carried on after its anchor was removed (" + window.scrollY + ")", true);
+    console.log("done");
+  }
+];
+var n = 0;
+function next() { if (n < steps.length) { steps[n++](); setTimeout(next, 150); } }
+window.addEventListener('load', function () { setTimeout(next, 100); });
+</script></body></html>

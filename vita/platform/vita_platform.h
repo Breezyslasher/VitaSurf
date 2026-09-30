@@ -133,6 +133,10 @@ bool vita_busy_take_cancel(void);
  * thread to say what a stall was spent in. Defined in the surface.
  */
 extern const char *volatile vita_c_where;
+/* What NetSurf or the script runner is doing when no binding is named:
+ * layout, box building, a style sheet, drawing, script, promise jobs
+ * (VitaSurf). Defined in NetSurf's utils/utils.c. */
+extern const char *volatile vitasurf_phase __attribute__((weak));
 
 /** Log free user, CDRAM and physically contiguous memory. */
 void vita_log_memory(const char *what);
