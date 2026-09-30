@@ -42,6 +42,11 @@
 #include "websocket.h"
 
 #define POLL_MS 20		/**< how often a connection is looked at */
+/** How long one look may spend handing messages to the page. A page that
+ * takes long over each message (Home Assistant building its dashboard
+ * took 27 s over a backlog) left the rest of the browser, layout and
+ * drawing included, waiting until the backlog was gone. */
+#define POLL_BUDGET_MS 100
 #define CLOSE_WAIT_MS 3000	/**< how long a close waits for the server */
 #define MAX_MESSAGE (16u * 1024u * 1024u)
 #define MAX_SOCKETS 32		/**< a page that opens more gets errors */
@@ -308,8 +313,8 @@ static bool flush_out(struct vws *s)
 	return true;
 }
 
-/* Read what has arrived, message by message. */
-static void poll_open(struct vws *s)
+/* Read what has arrived, message by message, until the deadline. */
+static void poll_open(struct vws *s, uint64_t deadline)
 {
 	char buf[16384];
 	unsigned int rounds = 0;
@@ -399,6 +404,10 @@ static void poll_open(struct vws *s)
 				s->msg_cap = 0;
 			}
 			s->msg_len = 0;
+			/* the rest waits in curl for the next look */
+			if (ms_now() >= deadline) {
+				break;
+			}
 		}
 	}
 	if (s->state == ST_CLOSING &&
@@ -411,12 +420,14 @@ static void poll_cb(void *p)
 {
 	struct vws *s, **pp;
 
+	uint64_t deadline = ms_now() + POLL_BUDGET_MS;
+
 	(void)p;
 	scheduled = false;
 	poll_connecting();
 	for (s = sockets; s != NULL; s = s->next) {
 		if (s->state == ST_OPEN || s->state == ST_CLOSING) {
-			poll_open(s);
+			poll_open(s, deadline);
 		}
 	}
 	/* free what is done */

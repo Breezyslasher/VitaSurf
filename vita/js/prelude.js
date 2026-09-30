@@ -2602,6 +2602,16 @@ function ceConnectTree(n,inDoc,skipSelf){
 
 function ceDisconnectTree(n,skipSelf){
  if(!n)return;
+ /* the elements C finds that could be custom ones, as ceConnectTree
+    does: the walk built a child list for every node of each subtree
+    taken out, text included, and Home Assistant takes out thousands
+    (VitaSurf) */
+ if(typeof __vitaCECandidates==='function'){
+  var l=__vitaCECandidates(n,!skipSelf),k,e;
+  for(k=0;k<l.length;k++){
+   e=l[k];
+   if(e.__ceConn){ceSet(e,'__ceConn',false);ceCall(e,'disconnectedCallback');}}
+  return;}
  if(!skipSelf&&n.nodeType===1&&n.__ceConn){ceSet(n,'__ceConn',false);ceCall(n,'disconnectedCallback');}
  var c=n.childNodes;if(!c)return;
  for(var i=0;i<c.length;i++)ceDisconnectTree(c[i],false);
@@ -4774,6 +4784,10 @@ CSSStyleDeclaration.prototype.setProperty=function(n,v,pr){
   e.setAttribute('style',s);
   c.l.push(d);c.ix.set(n,c.l.length-1);c.s=s;
   return;}
+ /* the value it has already: nothing is written, as the CSSOM says, and
+    a theme put back on an element does not write out its 600 variables
+    once for each of them */
+ if(c.l[at][1]===d[1]&&c.l[at][2]===d[2])return;
  c.l[at]=d;
  s=serialDecl(c.l);
  e.setAttribute('style',s);c.s=s;};
