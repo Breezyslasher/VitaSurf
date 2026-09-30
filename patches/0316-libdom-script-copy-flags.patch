@@ -1,0 +1,17 @@
+diff --git a/src/html/html_script_element.c b/src/html/html_script_element.c
+index 9acbf29..393b603 100644
+--- a/src/html/html_script_element.c
++++ b/src/html/html_script_element.c
+@@ -143,6 +143,12 @@ dom_exception _dom_html_script_element_copy_internal(
+ 		return err;
+ 	}
+ 
++	/* A copy is never the parser's, and is started only if the
++	 * original was: the flags were left as malloc had them, so a
++	 * copy of a script might or might not run. (VitaSurf) */
++	new->flags = DOM_HTML_SCRIPT_ELEMENT_FLAG_NON_BLOCKING |
++		(old->flags & DOM_HTML_SCRIPT_ELEMENT_FLAG_ALREADY_STARTED);
++
+ 	return DOM_NO_ERR;
+ }
+ 

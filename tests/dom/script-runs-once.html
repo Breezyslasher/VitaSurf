@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<!-- A script element runs once: not again when it is moved, and not
+     twice when it goes in inside a subtree, which reached it both through
+     the subtree's insertion and through its own. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var runs = 0;
+var d = document.createElement('div'), s = document.createElement('script');
+s.text = 'runs++;';
+d.appendChild(s);
+ok("not run while outside the document (" + runs + ")", runs === 0);
+document.body.appendChild(d);
+ok("run once when its subtree goes in (" + runs + ")", runs === 1);
+document.body.removeChild(d);
+document.body.appendChild(d);
+ok("not run again when moved (" + runs + ")", runs === 1);
+</script></body></html>
