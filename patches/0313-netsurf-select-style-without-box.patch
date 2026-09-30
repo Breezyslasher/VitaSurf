@@ -1,0 +1,128 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index edc3effed..8710be48a 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -2261,6 +2261,29 @@ css_error ua_default_for_property(void *pw, uint32_t property, css_hint *hint)
+ 	return CSS_OK;
+ }
+ 
++/* exported interface documented in css/select.h */
++void *nscss_take_node_data(dom_node *n)
++{
++	void *old = NULL;
++
++	if (dom_node_set_user_data(n, corestring_dom___ns_key_libcss_node_data,
++			NULL, NULL, &old) != DOM_NO_ERR)
++		return NULL;
++	return old;
++}
++
++/* exported interface documented in css/select.h */
++void nscss_put_node_data(dom_node *n, void *data)
++{
++	void *cur = NULL;
++
++	nscss_clear_node_data(n);
++	if (data != NULL)
++		dom_node_set_user_data(n,
++				corestring_dom___ns_key_libcss_node_data,
++				data, nscss_dom_user_data_handler, &cur);
++}
++
+ /* exported interface documented in css/select.h */
+ void nscss_clear_node_data(dom_node *n)
+ {
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index 0b91309b0..434df8646 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -72,6 +72,25 @@ css_error node_is_visited(void *pw, void *node, bool *match);
+  */
+ void nscss_clear_node_data(dom_node *n);
+ 
++/**
++ * Take the selection data libcss cached on a node off it, without
++ * destroying it, so the node can be selected for again and the data put
++ * back afterwards (VitaSurf).
++ *
++ * \param n the node
++ * \return the data, or NULL if there was none
++ */
++void *nscss_take_node_data(dom_node *n);
++
++/**
++ * Drop whatever selection data a node now has and put back what
++ * nscss_take_node_data took (VitaSurf).
++ *
++ * \param n     the node
++ * \param data  what nscss_take_node_data returned
++ */
++void nscss_put_node_data(dom_node *n, void *data);
++
+ /**
+  * The states an element can be in that selectors ask about and markup
+  * does not say (VitaSurf).
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index dbd873773..759354b33 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -377,6 +377,34 @@ box_get_style(html_content *c,
+ }
+ 
+ 
++/* exported function documented in html/box_construct.h */
++css_select_results *html_select_style(html_content *c,
++		const css_computed_style *parent_style,
++		const css_computed_style *root_style,
++		dom_node *n)
++{
++	css_select_results *res;
++	dom_node *parent = NULL;
++	void *kept, *kept_parent = NULL;
++
++	if (c == NULL || c->select_ctx == NULL || n == NULL)
++		return NULL;
++	/* libcss keeps what it selected on the node, and on its parent
++	 * when that had nothing, and box construction insists on finding
++	 * nothing there: put back what was there on both */
++	dom_node_get_parent_node(n, &parent);
++	if (parent != NULL)
++		kept_parent = nscss_take_node_data(parent);
++	kept = nscss_take_node_data(n);
++	res = box_get_style(c, parent_style, root_style, n);
++	nscss_put_node_data(n, kept);
++	if (parent != NULL) {
++		nscss_put_node_data(parent, kept_parent);
++		dom_node_unref(parent);
++	}
++	return res;
++}
++
+ static void box_text_transform(char *s, unsigned int len,
+ 		enum css_text_transform_e tt);
+ 
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index a8067e6fd..e86fb7d29 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -175,4 +175,20 @@ const char *box_restyle_why(void);
+ enum box_restyle box_restyle(struct html_content *c, struct dom_node *n,
+ 		bool subtree, unsigned *budget);
+ 
++/**
++ * Select an element's style as box construction would, for an element
++ * that has no box (VitaSurf): before the first layout, or one that is
++ * display: none. The caller destroys the results.
++ *
++ * \param c             the document
++ * \param parent_style  the parent element's style, or NULL for the root
++ * \param root_style    the root element's style, or NULL for the root
++ * \param n             the element
++ * eturn the results, or NULL
++ */
++struct css_select_results *html_select_style(struct html_content *c,
++		const struct css_computed_style *parent_style,
++		const struct css_computed_style *root_style,
++		struct dom_node *n);
++
+ #endif

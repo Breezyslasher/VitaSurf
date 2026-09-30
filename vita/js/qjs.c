@@ -10590,6 +10590,93 @@ static void sm_len_prop(JSContext *ctx, JSValue obj, const char *name,
 	}
 }
 
+/*
+ * An element's style when it has no box to read it from (VitaSurf):
+ * before the page's first layout, when a script asking in its load
+ * handler was told the defaults, or when it is display: none. It is
+ * selected as box construction would select it, from the nearest
+ * ancestor that has a style, or from the root, down to the element.
+ * The caller destroys the results.
+ */
+static css_select_results *select_without_box(jsthread *thread,
+		struct dom_node *node)
+{
+	html_content *htmlc = thread->htmlc;
+	struct dom_node *chain[64];
+	const css_computed_style *parent = NULL, *root = NULL;
+	css_select_results *above = NULL, *root_res = NULL, *res = NULL;
+	struct dom_node *n;
+	int depth = 0, i;
+	bool have_layout = layout_current(thread);
+
+	if (htmlc == NULL || htmlc->select_ctx == NULL)
+		return NULL;
+	/* the element and its element ancestors, nearest first */
+	n = dom_node_ref(node);
+	while (n != NULL) {
+		struct dom_node *up = NULL;
+		dom_node_type type = DOM_ELEMENT_NODE;
+
+		dom_node_get_node_type(n, &type);
+		if (type != DOM_ELEMENT_NODE) {
+			dom_node_unref(n);
+			break;
+		}
+		if (depth > 0 && have_layout) {
+			struct box *b = box_for_node(n);
+
+			if (b != NULL && b->style != NULL) {
+				parent = b->style;
+				dom_node_unref(n);
+				break;
+			}
+		}
+		if (depth == (int)(sizeof(chain) / sizeof(chain[0]))) {
+			dom_node_unref(n);
+			goto out;
+		}
+		chain[depth++] = n;
+		dom_node_get_parent_node(n, &up);
+		n = up;
+	}
+	if (depth == 0)
+		return NULL;
+	/* the root's style, which rem and some inheritance read, once
+	 * box construction has made it */
+	if (parent != NULL)
+		root = htmlc->unit_len_ctx.root_style;
+	for (i = depth - 1; i >= 0; i--) {
+		res = html_select_style(htmlc, parent, root, chain[i]);
+		if (res == NULL)
+			break;
+		if (res->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
+			css_select_results_destroy(res);
+			res = NULL;
+			break;
+		}
+		if (root == NULL) {
+			/* the outermost one selected is the root when no
+			 * ancestor had a style */
+			root_res = res;
+			root = res->styles[CSS_PSEUDO_ELEMENT_NONE];
+		} else if (above != NULL && above != root_res) {
+			css_select_results_destroy(above);
+		}
+		above = res;
+		parent = res->styles[CSS_PSEUDO_ELEMENT_NONE];
+		if (i > 0)
+			res = NULL;
+	}
+	if (res == NULL && above != NULL && above != root_res)
+		css_select_results_destroy(above);
+	if (root_res != NULL && root_res != res)
+		css_select_results_destroy(root_res);
+out:
+	for (i = 0; i < depth; i++)
+		dom_node_unref(chain[i]);
+	return res;
+}
+
 static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
@@ -10606,17 +10693,25 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	css_color c = 0, colour = 0;
 	int32_t i32 = 0;
 	uint8_t t;
+	css_select_results *owned = NULL;
 
 	(void)this_val;
 	if (argc < 1 || thread == NULL || thread->htmlc == NULL)
 		return JS_NULL;
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread))
+	if (node == NULL)
 		return JS_NULL;
-	box = box_for_node(node);
-	if (box == NULL || box->style == NULL)
-		return JS_NULL;
-	s = box->style;
+	box = layout_current(thread) ? box_for_node(node) : NULL;
+	if (box != NULL && box->style != NULL) {
+		s = box->style;
+	} else {
+		/* no box yet, or none at all: select it (VitaSurf) */
+		box = NULL;
+		owned = select_without_box(thread, node);
+		if (owned == NULL)
+			return JS_NULL;
+		s = owned->styles[CSS_PSEUDO_ELEMENT_NONE];
+	}
 	if (argc > 1 && JS_IsString(argv[1])) {
 		const char *p = JS_ToCString(ctx, argv[1]);
 		int which = -1;
@@ -10642,13 +10737,21 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 				which = CSS_PSEUDO_ELEMENT_PLACEHOLDER;
 			JS_FreeCString(ctx, p);
 		}
-		if (which < 0)
+		if (which < 0) {
+			if (owned != NULL)
+				css_select_results_destroy(owned);
 			return JS_NULL;
+		}
 		if (which != CSS_PSEUDO_ELEMENT_NONE) {
-			if (box->styles == NULL ||
-					box->styles->styles[which] == NULL)
+			const css_select_results *r = box != NULL ?
+					box->styles : owned;
+
+			if (r == NULL || r->styles[which] == NULL) {
+				if (owned != NULL)
+					css_select_results_destroy(owned);
 				return JS_NULL;
-			s = box->styles->styles[which];
+			}
+			s = r->styles[which];
 		}
 	}
 	uctx = &thread->htmlc->unit_len_ctx;
@@ -11107,6 +11210,8 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			sm_set(ctx, obj, "content", buf);
 		}
 	}
+	if (owned != NULL)
+		css_select_results_destroy(owned);
 	return obj;
 }
 
