@@ -1,0 +1,18 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 682aec3b3..1a9f3e602 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -2478,6 +2478,13 @@ static bool svg_paints_something(dom_node *node, unsigned int depth)
+ 		child = next;
+ 	}
+ 
++	/* the sibling taken when the loop stopped on finding one: it was
++	 * held for good, and every inline <svg> with a second child kept
++	 * nodes of its page alive after the page closed (VitaSurf) */
++	if (child != NULL) {
++		dom_node_unref(child);
++	}
++
+ 	return found;
+ }
+ 
