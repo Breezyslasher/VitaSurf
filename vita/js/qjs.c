@@ -694,6 +694,9 @@ static void walk_cost_note(const char *kind, const char *what, size_t len,
 
 static struct dom_document *thread_document(jsthread *thread);
 static void ws_report(void);
+/* the first runtime made, the page's, for the memory report (VitaSurf) */
+static JSRuntime *qjs_memory_rt;
+static unsigned runtime_kb(JSRuntime *rt);
 
 /** Whether a walk began at the document or its root element. */
 static bool walk_from_top(jsthread *thread, struct dom_node *root)
@@ -753,6 +756,11 @@ void vita_js_report_profile(void)
 				 "batches of 128 KB (%u at most) and gave %u back",
 				 ps.allocs, ps.large, ps.frees, ps.reallocs,
 				 ps.batches, ps.batches_peak, ps.batches_freed);
+			if (qjs_memory_rt != NULL)
+				vita_log("memory: script uses %u KB, and its "
+					 "pools hold %u KB",
+					 runtime_kb(qjs_memory_rt),
+					 ps.batches * 128);
 		}
 		qjs_pool_stats_reset();
 	}
@@ -12926,6 +12934,8 @@ static nserror heap_start(jsheap *ret)
 		ret->pool = NULL;
 		return NSERROR_NOMEM;
 	}
+	if (qjs_memory_rt == NULL)
+		qjs_memory_rt = ret->rt;
 	/*
 	 * Keep a page's scripts within a sensible slice of the heap: 96 MB
 	 * of the 176 MB heap there used to be, the same share of the heap
@@ -12998,6 +13008,8 @@ void js_destroyheap(jsheap *heap)
 		return;
 	}
 	if (heap->rt != NULL) {
+		if (qjs_memory_rt == heap->rt)
+			qjs_memory_rt = NULL;
 		JS_FreeRuntime(heap->rt);
 		qjs_pool_destroy(heap->pool);
 	}
@@ -13353,6 +13365,8 @@ void js_destroythread(jsthread *thread)
 	}
 	if (thread->heap->pending_destroy && thread->heap->live_threads == 0) {
 		jsheap *heap = thread->heap;
+		if (qjs_memory_rt == heap->rt)
+			qjs_memory_rt = NULL;
 		JS_FreeRuntime(heap->rt);
 		qjs_pool_destroy(heap->pool);
 		free(heap);
