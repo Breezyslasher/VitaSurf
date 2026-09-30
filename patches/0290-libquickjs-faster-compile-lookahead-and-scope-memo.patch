@@ -1,5 +1,5 @@
 diff --git a/quickjs.c b/quickjs.c
-index 2d066e5..c34b6eb 100644
+index 2d066e5..a01d274 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -21462,6 +21462,11 @@ typedef struct JSFunctionDef {
@@ -285,7 +285,7 @@ index 2d066e5..c34b6eb 100644
      /* free the child functions */
      list_for_each_safe(el, el1, &fd->child_list) {
          JSFunctionDef *fd1;
-@@ -32432,6 +32611,96 @@ static inline void capture_var(JSFunctionDef *s, JSVarDef *vd)
+@@ -32432,6 +32611,110 @@ static inline void capture_var(JSFunctionDef *s, JSVarDef *vd)
  }
  
  /* return the position of the next opcode */
@@ -333,6 +333,20 @@ index 2d066e5..c34b6eb 100644
 +
 +    if (!fd->chains_final)
 +        return scope_chain_walk(fd, scope_level, name, with);
++    /* a short chain costs less to walk than to look up */
++    {
++        int n = 0;
++        *with = false;
++        for (r = fd->scopes[scope_level].first; r >= 0 && n < 16;
++             r = fd->vars[r].scope_next, n++) {
++            if (fd->vars[r].var_name == name)
++                return r;
++            if (fd->vars[r].var_name == JS_ATOM__with_)
++                *with = true;
++        }
++        if (r < 0)
++            return r;
++    }
 +    h = (name * 2654435761u) ^ ((uint32_t)scope_level * 40503u);
 +    if (fd->chain_memo) {
 +        mask = fd->chain_memo_size - 1;
@@ -382,7 +396,7 @@ index 2d066e5..c34b6eb 100644
  static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                               JSAtom var_name, int scope_level, int op,
                               DynBuf *bc, uint8_t *bc_buf,
-@@ -32454,6 +32723,26 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+@@ -32454,6 +32737,26 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
  
      /* resolve local scoped variables */
      var_idx = -1;
@@ -409,7 +423,7 @@ index 2d066e5..c34b6eb 100644
      for (idx = s->scopes[scope_level].first; idx >= 0;) {
          vd = &s->vars[idx];
          if (vd->var_name == var_name) {
-@@ -32475,6 +32764,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+@@ -32475,6 +32778,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
          }
          idx = vd->scope_next;
      }
@@ -417,7 +431,7 @@ index 2d066e5..c34b6eb 100644
      is_arg_scope = (idx == ARG_SCOPE_END);
      if (var_idx < 0) {
          /* argument scope: variables are not visible but pseudo
-@@ -32617,8 +32907,25 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+@@ -32617,8 +32921,25 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
  
      /* check parent scopes */
      for (fd = s; fd->parent;) {
@@ -443,7 +457,7 @@ index 2d066e5..c34b6eb 100644
          for (idx = fd->scopes[scope_level].first; idx >= 0;) {
              vd = &fd->vars[idx];
              if (vd->var_name == var_name) {
-@@ -32643,6 +32950,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+@@ -32643,6 +32964,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
              }
              idx = vd->scope_next;
          }
@@ -451,7 +465,7 @@ index 2d066e5..c34b6eb 100644
          is_arg_scope = (idx == ARG_SCOPE_END);
          if (var_idx >= 0)
              break;
-@@ -35490,6 +35798,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -35490,6 +35812,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
              vd->scope_next = fd->scopes[scope].first;
          }
      }
@@ -460,7 +474,7 @@ index 2d066e5..c34b6eb 100644
  
      /* if the function contains an eval call, the closure variables
         are used to compile the eval and they must be ordered by scope,
-@@ -36646,6 +36956,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+@@ -36646,6 +36970,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
      fd->body_scope = fd->scope_level;
  
      err = js_parse_program(s);
