@@ -347,6 +347,25 @@ static void pa_init(void)
 
 /* --- the functions QuickJS calls ----------------------------------------- */
 
+/*
+ * The last block asked about (VitaSurf). QuickJS asks for a block's size
+ * right after allocating it and again right before freeing it, and each
+ * of those looked the page up in the table, as the free did once more:
+ * three lookups for every block, 4 % of Home Assistant's first load
+ * natively. The memo answers the size question after an allocation and
+ * the free after a size question. It only ever describes a live block,
+ * and is dropped when that block is freed.
+ */
+static const void *memo_ptr;
+static uint32_t memo_size;
+static bool memo_ours;
+
+static inline void memo_forget(const void *ptr)
+{
+	if (memo_ptr == ptr)
+		memo_ptr = NULL;
+}
+
 static void *pa_malloc(void *opaque, size_t size)
 {
 	unsigned int c;
@@ -380,6 +399,9 @@ static void *pa_malloc(void *opaque, size_t size)
 		p->listed = 0;
 	}
 	pa.stats.allocs++;
+	memo_ptr = obj;
+	memo_size = cs;
+	memo_ours = true;
 	return obj;
 }
 
@@ -390,7 +412,13 @@ static void pa_free(void *opaque, void *ptr)
 	(void) opaque;
 	if (ptr == NULL)
 		return;
-	if (!ours(ptr)) {
+	if (memo_ptr == ptr) {
+		memo_ptr = NULL;
+		if (!memo_ours) {
+			free(ptr);
+			return;
+		}
+	} else if (!ours(ptr)) {
 		free(ptr);
 		return;
 	}
@@ -426,14 +454,22 @@ static size_t pa_usable_size(const void *ptr)
 {
 	if (ptr == NULL)
 		return 0;
-	if (ours(ptr))
-		return pa.classes[page_of(ptr)->cls].size;
+	if (ptr == memo_ptr)
+		return memo_size;
+	memo_ptr = ptr;
+	if (ours(ptr)) {
+		memo_ours = true;
+		memo_size = pa.classes[page_of(ptr)->cls].size;
+		return memo_size;
+	}
+	memo_ours = false;
 	/* what QuickJS's own functions say for a block from malloc */
 #ifdef __GLIBC__
-	return malloc_usable_size((void *) ptr);
+	memo_size = (uint32_t) malloc_usable_size((void *) ptr);
 #else
-	return 0;
+	memo_size = 0;
 #endif
+	return memo_size;
 }
 
 static void *pa_realloc(void *opaque, void *ptr, size_t size)
@@ -446,7 +482,7 @@ static void *pa_realloc(void *opaque, void *ptr, size_t size)
 		pa_free(opaque, ptr);
 		return NULL;
 	}
-	if (ours(ptr)) {
+	if (memo_ptr == ptr ? memo_ours : ours(ptr)) {
 		uint32_t cs = pa.classes[page_of(ptr)->cls].size;
 
 		/* it still fits, and would not fit a class half the size */
@@ -465,6 +501,7 @@ static void *pa_realloc(void *opaque, void *ptr, size_t size)
 	 * From malloc, so bigger than any class: it stays with malloc
 	 * unless it now fits one, when only the first size bytes matter.
 	 */
+	memo_forget(ptr);
 	if (size > MAX_SMALL)
 		return realloc(ptr, size);
 	n = pa_malloc(opaque, size);
@@ -506,6 +543,7 @@ void qjs_pool_destroy(struct qjs_pool *pool)
 	pa.users--;
 	if (pa.users != 0)
 		return;
+	memo_ptr = NULL;
 
 	/*
 	 * No runtime left, so every page should be empty but the one each
