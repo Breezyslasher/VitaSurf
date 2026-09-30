@@ -139,7 +139,9 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/performance.js
         vita/js/storage.js
         vita/js/subtle.js
-        vita/js/wasm.js)
+        vita/js/wasm.js
+        vita/js/intl_pattern.js
+        vita/js/intl.js)
     set(PRELUDE_BYTES "")
     foreach(part ${PRELUDE_PARTS})
         set(full "${CMAKE_SOURCE_DIR}/${part}")
@@ -156,8 +158,10 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
     # websocket.c runs WebSocket connections on libcurl's ws API
+    # intl.c is Intl.DateTimeFormat's time zones and formatting
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
-        vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c)
+        vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c
+        vita/js/intl.c)
     # subtle.c takes Ed25519 and X25519 from Monocypher, which mbedTLS
     # does not have
     target_sources(${PROJECT_NAME} PRIVATE

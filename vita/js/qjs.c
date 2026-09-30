@@ -63,6 +63,7 @@
 #include "canvas.h"
 #include "qjs_alloc.h"
 #include "subtle.h"
+#include "intl.h"
 #include "wasm.h"
 #include "websocket.h"
 
@@ -12735,6 +12736,7 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaParseDocument", 1));
 	vita_subtle_register(ctx, global);
 	vita_wasm_register(ctx, global);
+	vita_intl_register(ctx, global);
 	JS_SetPropertyStr(ctx, global, "__vitaFrameGlobal",
 			  JS_NewCFunction(ctx, win_vita_frame_global,
 					  "__vitaFrameGlobal", 1));
