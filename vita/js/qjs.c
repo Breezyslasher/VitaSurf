@@ -947,11 +947,17 @@ static bool qjs_budget_abort(JSContext *ctx)
 }
 
 /** QuickJS's own allocation total for the runtime, in KB. */
+/* What the last runtime_kb cost: it walks every object in the runtime,
+ * and a log could not say whether that was a real share of a page's
+ * time (VitaSurf). */
+static unsigned runtime_kb_ms;
 static unsigned runtime_kb(JSRuntime *rt)
 {
 	JSMemoryUsage u;
+	uint64_t t0 = now_ms();
 
 	JS_ComputeMemoryUsage(rt, &u);
+	runtime_kb_ms = (unsigned)(now_ms() - t0);
 	return (unsigned)(u.malloc_size / 1024);
 }
 
@@ -16079,14 +16085,16 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 * enough to move the number and not otherwise.
 		 */
 		if (txtlen > SCRIPT_LOG_BYTES) {
+			unsigned kb = runtime_kb(thread->heap->rt);
+
 			vita_log("qjs: script %u KB %s in %u ms, "
-				 "ran in %u ms, runtime memory now %u KB: %s",
+				 "ran in %u ms, runtime memory now %u KB "
+				 "(counting it took %u ms): %s",
 				 (unsigned)(txtlen / 1024),
 				 cached ? "read from cache" : "compiled",
 				 (unsigned)(t_compiled - t_start),
 				 (unsigned)(t_done - t_compiled),
-				 runtime_kb(thread->heap->rt),
-				 name);
+				 kb, runtime_kb_ms, name);
 			vita_log_memory("after a large script");
 		} else if (vita_verbose_requested()) {
 			vita_log("qjs: script %u KB %s in %u ms, "
