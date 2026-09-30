@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<!-- type="module" scripts compile as modules at once (the engine used to
+     try a classic compile first), and one labelled a module that only
+     compiles as a classic script still runs. document.head is the root's
+     head child. -->
+<html><head><title>t</title></head><body><script type="module">
+var x = 1;
+console.log((document.head && document.head.tagName === 'HEAD' ? 'PASS' : 'FAIL') + ' head');
+console.log((typeof window.x === 'undefined' ? 'PASS' : 'FAIL') + ' module top level stays out of window');
+</script><script type="module">export var y = 2; console.log('PASS module with export ran');</script>
+<script type="module">var z = 3; function f(){ with(Math){} } console.log('PASS a classic script labelled a module still ran');</script>
+</body></html>

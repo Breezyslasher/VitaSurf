@@ -1597,7 +1597,8 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 "from the cache, %u KB in %u ms; %u "
 					 "module scripts were parsed as classic "
 					 "scripts first, %u KB, throwing away "
-					 "%u ms",
+					 "%u ms, and %u compiled as modules "
+					 "at once, their element saying so",
 					 vitasurf_js_import_compiles,
 					 vitasurf_js_import_kb,
 					 vitasurf_ms_js_import_compile,
@@ -1606,7 +1607,8 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 vitasurf_ms_js_import_cached,
 					 vitasurf_js_reparses,
 					 vitasurf_js_reparse_kb,
-					 vitasurf_ms_js_reparse);
+					 vitasurf_ms_js_reparse,
+					 vitasurf_js_module_first);
 			{
 				extern unsigned int css_select_us_setup;
 				extern unsigned int css_select_us_match;

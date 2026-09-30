@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<!-- MutationObserver with many observers, as a Home Assistant dashboard
+     has them: card-mod puts one on every card it styles (childList on the
+     card and its host), and Bubble Card watches the whole body for
+     everything. Build 507 on a dashboard spent 52 s in 24747 setAttribute
+     calls, 2.1 ms each, and 43% of its script time choosing which
+     observers wanted each change. Prints the cost per change. -->
+<html><body><div id="root"></div><script>
+var CARDS = 1200, DEPTH = 40, SETS = 3000, ADDS = 600;
+var root = document.getElementById('root'), cards = [], seen = 0;
+for (var c = 0; c < CARDS; c++) {
+  var card = document.createElement('div'), el = card;
+  root.appendChild(card);
+  cards.push(card);
+  new MutationObserver(function(){}).observe(card, {childList: true});
+}
+/* a deep chain inside one card, where the changes happen */
+var deep = cards[CARDS >> 1];
+for (var d = 0; d < DEPTH; d++) {
+  var n = document.createElement('span');
+  deep.appendChild(n);
+  deep = n;
+}
+new MutationObserver(function(r){ seen += r.length; })
+  .observe(document.body, {childList: true, subtree: true, attributes: true,
+                           characterData: true});
+var t0 = Date.now();
+for (var i = 0; i < SETS; i++) deep.setAttribute('data-x', String(i));
+var t1 = Date.now();
+for (var j = 0; j < ADDS; j++) deep.appendChild(document.createElement('i'));
+var t2 = Date.now();
+setTimeout(function(){
+  console.log('BENCH ' + SETS + ' setAttribute in ' + (t1 - t0) + ' ms, ' +
+              ADDS + ' appendChild in ' + (t2 - t1) + ' ms, ' +
+              seen + ' records delivered');
+}, 0);
+</script></body></html>

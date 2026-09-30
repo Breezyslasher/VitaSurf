@@ -1092,7 +1092,10 @@ D.querySelector=function(s){
  try{if(r.matches(s))return r;}catch(e){}
  return r.querySelector(s);};
 D.getElementsByClassName=function(c){return D.querySelectorAll('.'+c);};
-Object.defineProperty(D,'head',{configurable:true,get:function(){var h=D.getElementsByTagName('head');return h.length?h[0]:null;}});
+/* the root's first head child, as the specification has it: this was a
+   walk of the whole document on every read, and Lit and card-mod read
+   document.head as they go (VitaSurf) */
+Object.defineProperty(D,'head',{configurable:true,get:function(){var r=D.documentElement,c;if(!r)return null;for(c=r.firstElementChild;c;c=c.nextElementSibling)if(c.localName==='head'&&!c.namespaceURI||c.namespaceURI==='http://www.w3.org/1999/xhtml'&&c.localName==='head')return c;return null;}});
 Object.defineProperty(D,'forms',{configurable:true,get:function(){return D.getElementsByTagName('form');}});
 Object.defineProperty(D,'images',{configurable:true,get:function(){return D.getElementsByTagName('img');}});
 /* links is defined further down: it is the a and area elements that
@@ -7193,6 +7196,8 @@ function MutationRecord(type,target){
 W.MutationRecord=MutationRecord;
 
 var MOlist=[],MOqueued=false,MOid=0;
+/* watch id -> [observer, watch], for the ids qjs.c hands __vitaMutation */
+var MOby=new Map();
 function MutationObserver(cb){
  if(typeof cb!=='function')throw new TypeError(
   'The callback provided as parameter 1 is not a function.');
@@ -7209,17 +7214,11 @@ function MutationObserver(cb){
 
    chain[0] is the target, so its index is the depth the walk used to
    count, and the nearest match is still the one found. */
-MutationObserver.prototype._wants=function(kind,target,name,chain,pairs){
- var i,j,w,depth;
+MutationObserver.prototype._wants=function(kind,target,name,chain){
+ var i,w,depth;
  for(i=0;i<this._watch.length;i++){
   w=this._watch[i];
-  /* the watched nodes C found and their depths, a short dense list
-     (VitaSurf): the sparse chain built from them was a slow array,
-     and an indexOf on it for every watch of every observer was a
-     real share of each appendChild and setAttribute on GitHub */
-  if(pairs){depth=-1;
-   for(j=0;j<pairs.length;j+=2)if(pairs[j]===w.target){depth=pairs[j+1];break;}}
-  else depth=chain.indexOf(w.target);
+  depth=chain.indexOf(w.target);
   if(depth<0)continue;
   if(depth>0&&!w.subtree)continue;
   if(kind==='childList'&&!w.childList)continue;
@@ -7270,6 +7269,7 @@ MutationObserver.prototype.observe=function(target,options){
  this._watch=this._watch.filter(function(o){
   if(o.target!==target)return true;
   if(typeof __vitaMOUnwatch==='function')__vitaMOUnwatch(o.id);
+  MOby.delete(o.id);
   return false;});
  /* and C keeps a copy, so a change no observer wants never reaches
     this file (VitaSurf); see mo_wanted in qjs.c */
@@ -7278,11 +7278,13 @@ MutationObserver.prototype.observe=function(target,options){
   __vitaMOWatch(w.id,target,(w.subtree?1:0)|(w.attributes?2:0)|
    (w.childList?4:0)|(w.characterData?8:0),w.filter);
  this._watch.push(w);
+ MOby.set(w.id,[this,w]);
  if(MOlist.indexOf(this)<0)MOlist.push(this);
  if(typeof __vitaWatchMutations==='function')__vitaWatchMutations(true);};
 MutationObserver.prototype.disconnect=function(){
- if(typeof __vitaMOUnwatch==='function')
-  for(var i=0;i<this._watch.length;i++)__vitaMOUnwatch(this._watch[i].id);
+ for(var i=0;i<this._watch.length;i++){
+  if(typeof __vitaMOUnwatch==='function')__vitaMOUnwatch(this._watch[i].id);
+  MOby.delete(this._watch[i].id);}
  this._watch=[];this._records=[];
  MOlist=MOlist.filter(function(o){return o!==this;},this);
  if(!MOlist.length&&typeof __vitaWatchMutations==='function')
@@ -7352,25 +7354,46 @@ function siblingsOf(rec,target,after,before){
  if(MOedges&&rec.removedNodes.indexOf(MOedges.node)>=0){
   rec.previousSibling=MOedges.prev;
   rec.nextSibling=MOedges.next;}}
-W.__vitaMutation=function(kind,target,a,b,ns,matches){
- if(!MOlist.length||!target)return;
- var i,o,w,rec,n;
- /* once for every observer, not once per watch entry of each */
- var chain=null;
- /* C has already walked it and found which watched nodes sit where
-    (VitaSurf), and _wants reads those pairs; without them, the chain */
- if(!matches){chain=[];for(n=target;n;n=n.parentNode)chain.push(n);}
+/* The observers that want a change, each once, with whether any of its
+   watches that want it asks for the old value, as the specification's
+   interested observers are. */
+function MOinterested(kind,target,a,matches){
+ var out=[],i,j,e,o,w,old,chain;
+ if(matches){
+  /* C has already found the watches that want it, nearest first
+     (VitaSurf): with an observer on every card of a Home Assistant
+     dashboard, asking each observer in turn was 43% of script time */
+  for(i=0;i<matches.length;i++){
+   e=MOby.get(matches[i]);
+   if(!e)continue;
+   o=e[0];w=e[1];
+   old=kind==='attributes'?w.attributeOldValue:
+    kind==='characterData'?w.characterDataOldValue:false;
+   for(j=0;j<out.length;j+=2)if(out[j]===o)break;
+   if(j<out.length){if(old)out[j+1]=true;}
+   else out.push(o,old);}
+  return out;}
+ chain=[];
+ for(e=target;e;e=e.parentNode)chain.push(e);
  for(i=0;i<MOlist.length;i++){
   o=MOlist[i];
-  w=o._wants(kind,target,kind==='attributes'?a:null,chain,matches);
+  w=o._wants(kind,target,kind==='attributes'?a:null,chain);
   if(!w)continue;
+  out.push(o,kind==='attributes'?w.attributeOldValue:
+   kind==='characterData'?w.characterDataOldValue:false);}
+ return out;}
+W.__vitaMutation=function(kind,target,a,b,ns,matches){
+ if(!MOlist.length||!target)return;
+ var i,o,old,rec,list=MOinterested(kind,target,a,matches);
+ for(i=0;i<list.length;i+=2){
+  o=list[i];old=list[i+1];
   rec=new MutationRecord(kind,target);
   if(kind==='attributes'){
    rec.attributeName=String(a);
    rec.attributeNamespace=(ns===undefined||ns===null)?null:String(ns);
-   if(w.attributeOldValue)rec.oldValue=b===null?null:String(b);
+   if(old)rec.oldValue=b===null?null:String(b);
   }else if(kind==='characterData'){
-   if(w.characterDataOldValue)rec.oldValue=b===null?null:String(b);
+   if(old)rec.oldValue=b===null?null:String(b);
   }else{
    /* a and b are either single nodes or before-and-after child arrays */
    if(a&&a.nodeType!==undefined)rec.addedNodes=[a];

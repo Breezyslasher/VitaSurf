@@ -270,6 +270,10 @@ struct jsthread {
 	 */
 	struct mo_watch *mo;
 	unsigned mo_n, mo_alloc;
+	/* the watches by node: open addressing, each slot the head of a
+	 * chain through mo[].next (see mo_slot_find) */
+	struct mo_slot *mo_slots;
+	unsigned mo_slot_n, mo_slot_used;
 	struct js_timer *timers;       /**< live timers, cancelled on close */
 	struct js_wrapper *wrappers[WRAPPER_BUCKETS];
 	struct js_xhr *xhrs;           /**< requests in flight */
@@ -643,10 +647,97 @@ static unsigned int img_src_sets;
 /* entries into script from C made while promise jobs were running */
 static unsigned int jobs_reentered;
 
+/*
+ * Which queries walk the most of the tree (VitaSurf). A build 507 log of
+ * a Home Assistant dashboard counts 21202 queries answered in C visiting
+ * 40 million elements, without saying which; this keeps the dearest few
+ * by what was asked, and the profile report names them.
+ */
+#define WALK_COST_SLOTS 24
+static struct walk_cost {
+	const char *kind;		/* a static string */
+	char what[48];
+	uint32_t calls, visits, from_top;
+} walk_costs[WALK_COST_SLOTS];
+static uint32_t find_visits;	/* elements find_in_subtree looked at */
+
+static void walk_cost_note(const char *kind, const char *what, size_t len,
+			   uint32_t visits, bool from_top)
+{
+	struct walk_cost *e = NULL, *least = NULL;
+	unsigned i;
+
+	if (len >= sizeof(e->what)) len = sizeof(e->what) - 1;
+	for (i = 0; i < WALK_COST_SLOTS; i++) {
+		struct walk_cost *c = &walk_costs[i];
+
+		if (c->kind == kind && strncmp(c->what, what, len) == 0 &&
+		    c->what[len] == '\0') {
+			e = c;
+			break;
+		}
+		if (least == NULL || c->visits < least->visits) least = c;
+	}
+	if (e == NULL) {
+		/* a new one displaces the cheapest only if it cost more */
+		if (least->kind != NULL && least->visits >= visits) return;
+		e = least;
+		e->kind = kind;
+		memcpy(e->what, what, len);
+		e->what[len] = '\0';
+		e->calls = e->visits = e->from_top = 0;
+	}
+	e->calls++;
+	e->visits += visits;
+	if (from_top) e->from_top++;
+}
+
+static struct dom_document *thread_document(jsthread *thread);
+
+/** Whether a walk began at the document or its root element. */
+static bool walk_from_top(jsthread *thread, struct dom_node *root)
+{
+	struct dom_node *doc = (struct dom_node *) thread_document(thread);
+	struct dom_node *up = NULL;
+	bool top;
+
+	if (root == doc) return true;
+	if (dom_node_get_parent_node(root, &up) != DOM_NO_ERR) return false;
+	top = up != NULL && up == doc;
+	if (up != NULL) dom_node_unref(up);
+	return top;
+}
+
+static int walk_cost_cmp(const void *a, const void *b)
+{
+	const struct walk_cost *x = a, *y = b;
+
+	return x->visits < y->visits ? 1 : x->visits > y->visits ? -1 : 0;
+}
+
+static void walk_cost_report(void)
+{
+	unsigned i;
+
+	qsort(walk_costs, WALK_COST_SLOTS, sizeof(walk_costs[0]),
+	      walk_cost_cmp);
+	for (i = 0; i < 8 && walk_costs[i].kind != NULL &&
+		    walk_costs[i].visits >= 10000; i++) {
+		vita_log("qjs: %s('%s') walked %u elements in %u calls, %u of "
+			 "them from the document or its root",
+			 walk_costs[i].kind, walk_costs[i].what,
+			 walk_costs[i].visits, walk_costs[i].calls,
+			 walk_costs[i].from_top);
+	}
+	memset(walk_costs, 0, sizeof(walk_costs));
+}
+
 void vita_js_report_profile(void);
 void vita_js_report_profile(void)
 {
 	unsigned int shown;
+
+	walk_cost_report();
 
 	/* what script's own allocator did since the last report (VitaSurf) */
 	{
@@ -1147,7 +1238,6 @@ static void deferred_load_check(void *p);
 static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 			     bool whole);
 static bool realm_room(const char *what);
-static struct dom_document *thread_document(jsthread *thread);
 
 static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 {
@@ -1586,7 +1676,129 @@ struct mo_watch {
 	uint32_t flags;
 	char **filter;			/* lower case names, or NULL */
 	uint32_t n_filter;
+	uint32_t next;			/* next watch on the same node */
 };
+
+/*
+ * The watches indexed by node (VitaSurf). mo_wanted looked through every
+ * watch at every ancestor of a change, and a Home Assistant dashboard
+ * has card-mod put an observer on each card: build 507 spent 52 s in
+ * 24747 setAttribute calls, 2.1 ms each, most of it here. With 1200
+ * observers the native harness took 35 times as long per change as with
+ * two. Now each ancestor is one probe of a table keyed by node, and only
+ * the watches on that node are looked at.
+ */
+#define MO_NONE		UINT32_MAX
+#define MO_TOMB		((struct dom_node *) 1)
+
+struct mo_slot {
+	struct dom_node *node;		/* NULL empty, MO_TOMB removed */
+	uint32_t head;			/* first watch on it */
+};
+
+static unsigned mo_hash(const struct dom_node *node, unsigned mask)
+{
+	return ((unsigned) ((uintptr_t) node >> 3) * 2654435761u) & mask;
+}
+
+/** The slot holding node's watches, or NULL. */
+static struct mo_slot *mo_slot_find(jsthread *thread,
+				    const struct dom_node *node)
+{
+	unsigned mask, i;
+
+	if (thread->mo_slot_n == 0) return NULL;
+	mask = thread->mo_slot_n - 1;
+	for (i = mo_hash(node, mask); thread->mo_slots[i].node != NULL;
+	     i = (i + 1) & mask) {
+		if (thread->mo_slots[i].node == node) {
+			return &thread->mo_slots[i];
+		}
+	}
+	return NULL;
+}
+
+/** Rebuild the table from mo[], at a size fit for mo_n watches. */
+static bool mo_slots_rebuild(jsthread *thread)
+{
+	unsigned want = 16, i;
+	struct mo_slot *slots;
+
+	while (want < thread->mo_n * 2 + 2) want *= 2;
+	slots = calloc(want, sizeof(*slots));
+	if (slots == NULL) return false;
+	free(thread->mo_slots);
+	thread->mo_slots = slots;
+	thread->mo_slot_n = want;
+	thread->mo_slot_used = 0;
+	for (i = thread->mo_n; i-- > 0; ) {
+		struct mo_watch *w = &thread->mo[i];
+		unsigned mask = want - 1, j = mo_hash(w->node, mask);
+
+		while (slots[j].node != NULL && slots[j].node != w->node) {
+			j = (j + 1) & mask;
+		}
+		if (slots[j].node == NULL) {
+			slots[j].node = w->node;
+			slots[j].head = MO_NONE;
+			thread->mo_slot_used++;
+		}
+		w->next = slots[j].head;
+		slots[j].head = i;
+	}
+	return true;
+}
+
+/** File watch mo[i] under its node. */
+static bool mo_slot_add(jsthread *thread, uint32_t i)
+{
+	struct mo_watch *w = &thread->mo[i];
+	struct mo_slot *s;
+	unsigned mask, j;
+
+	if ((thread->mo_slot_used + 1) * 4 >= thread->mo_slot_n * 3) {
+		/* mo[i] is counted in mo_n already, so this files it */
+		return mo_slots_rebuild(thread);
+	}
+	s = mo_slot_find(thread, w->node);
+	if (s == NULL) {
+		mask = thread->mo_slot_n - 1;
+		for (j = mo_hash(w->node, mask);
+		     thread->mo_slots[j].node != NULL &&
+		     thread->mo_slots[j].node != MO_TOMB;
+		     j = (j + 1) & mask) {
+		}
+		if (thread->mo_slots[j].node == NULL) {
+			thread->mo_slot_used++;
+		}
+		s = &thread->mo_slots[j];
+		s->node = w->node;
+		s->head = MO_NONE;
+	}
+	w->next = s->head;
+	s->head = i;
+	return true;
+}
+
+/** Point whatever links to watch from at watch to instead. */
+static void mo_slot_relink(jsthread *thread, uint32_t from, uint32_t to,
+			   bool drop)
+{
+	struct mo_slot *s = mo_slot_find(thread, thread->mo[from].node);
+	uint32_t *link;
+
+	if (s == NULL) return;
+	for (link = &s->head; *link != MO_NONE; link = &thread->mo[*link].next) {
+		if (*link == from) {
+			*link = drop ? thread->mo[from].next : to;
+			break;
+		}
+	}
+	if (s->head == MO_NONE) {
+		/* the node has no watches left */
+		s->node = MO_TOMB;
+	}
+}
 
 static void mo_watch_free(struct mo_watch *w)
 {
@@ -1630,9 +1842,9 @@ static bool mo_watch_wants(const struct mo_watch *w, uint32_t kind,
 /**
  * Whether any observer wants a change of this kind to target.
  *
- * \param matches  if not NULL, receives an array of the watched nodes
- *                 found at or above target and their depths, as the
- *                 prelude's _wants reads them
+ * \param matches  if not NULL, receives the ids of the watches that
+ *                 want it, the nearest to target first, for the
+ *                 prelude's __vitaMutation
  */
 static bool mo_wanted(JSContext *ctx, jsthread *thread, uint32_t kind,
 		      struct dom_node *target, const char *attr,
@@ -1652,24 +1864,26 @@ static bool mo_wanted(JSContext *ctx, jsthread *thread, uint32_t kind,
 	dom_node_ref(n);
 	while (n != NULL) {
 		struct dom_node *up = NULL;
-		unsigned i;
-		bool listed = false;
+		const struct mo_slot *s;
+		uint32_t i;
 
-		for (i = 0; i < thread->mo_n; i++) {
+		s = mo_slot_find(thread, n);
+		for (i = s != NULL ? s->head : MO_NONE; i != MO_NONE;
+		     i = thread->mo[i].next) {
 			const struct mo_watch *w = &thread->mo[i];
 
-			if (w->node != n) continue;
-			if (mo_watch_wants(w, kind, depth, attr)) any = true;
-			listed = true;
-		}
-		if (listed && matches != NULL) {
+			if (!mo_watch_wants(w, kind, depth, attr)) continue;
+			any = true;
+			if (matches == NULL) break;
 			if (JS_IsUndefined(*matches)) {
 				*matches = JS_NewArray(ctx);
 			}
 			JS_SetPropertyUint32(ctx, *matches, out++,
-					     wrap_node(ctx, n));
-			JS_SetPropertyUint32(ctx, *matches, out++,
-					     JS_NewInt32(ctx, (int32_t) depth));
+					     JS_NewUint32(ctx, w->id));
+		}
+		if (any && matches == NULL) {
+			dom_node_unref(n);
+			return true;
 		}
 		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
 			up = NULL;
@@ -1677,10 +1891,6 @@ static bool mo_wanted(JSContext *ctx, jsthread *thread, uint32_t kind,
 		dom_node_unref(n);
 		n = up;
 		depth++;
-	}
-	if (!any && matches != NULL && !JS_IsUndefined(*matches)) {
-		JS_FreeValue(ctx, *matches);
-		*matches = JS_UNDEFINED;
 	}
 	return any;
 }
@@ -1813,6 +2023,10 @@ static JSValue win_vita_mo_watch(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 	thread->mo_n++;
+	if (!mo_slot_add(thread, thread->mo_n - 1)) {
+		/* not filed, so never found: drop it again */
+		mo_watch_free(&thread->mo[--thread->mo_n]);
+	}
 	return JS_UNDEFINED;
 }
 
@@ -1829,9 +2043,17 @@ static JSValue win_vita_mo_unwatch(JSContext *ctx, JSValueConst this_val,
 	if (thread == NULL || argc < 1) return JS_UNDEFINED;
 	JS_ToUint32(ctx, &id, argv[0]);
 	for (i = 0; i < thread->mo_n; i++) {
+		unsigned last = thread->mo_n - 1;
+
 		if (thread->mo[i].id != id) continue;
+		mo_slot_relink(thread, i, MO_NONE, true);
 		mo_watch_free(&thread->mo[i]);
-		thread->mo[i] = thread->mo[--thread->mo_n];
+		if (i != last) {
+			/* the last watch moves into the hole */
+			mo_slot_relink(thread, last, i, false);
+			thread->mo[i] = thread->mo[last];
+		}
+		thread->mo_n--;
 		break;
 	}
 	return JS_UNDEFINED;
@@ -3337,7 +3559,7 @@ static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 	size_t tag_len;
 	int32_t mode = 0;
 	JSValue out = JS_NULL;
-	uint32_t out_n = 0;
+	uint32_t out_n = 0, visits0;
 
 	(void)this_val;
 	if (argc < 3 || !JS_IsObject(argv[0])) {
@@ -3383,6 +3605,7 @@ static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 			return out;
 		}
 	}
+	visits0 = vitasurf_js_sel_tag_visits;
 	/* iterative pre-order walk; root itself is not a candidate */
 	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
 		n = NULL;
@@ -3440,6 +3663,9 @@ static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 		dom_node_unref(n);
 		n = next;
 	}
+	walk_cost_note(mode == 2 ? "querySelectorAll" : "querySelector",
+		       tag, tag_len, vitasurf_js_sel_tag_visits - visits0,
+		       walk_from_top(JS_GetContextOpaque(ctx), root));
 	JS_FreeCString(ctx, tag);
 	return out;
 }
@@ -3588,7 +3814,13 @@ static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_v
 			k.tag[len] = 0;
 		}
 		JS_FreeCString(ctx, name);
+		len = find_visits;
 		out = find_in_subtree(ctx, node, &k, 1);
+		walk_cost_note("el.getElementsByTagName",
+			       k.tag != NULL ? k.tag : "*",
+			       strlen(k.tag != NULL ? k.tag : "*"),
+			       find_visits - (uint32_t) len,
+			       walk_from_top(JS_GetContextOpaque(ctx), node));
 		free(k.tag);
 		return out;
 	}
@@ -5308,7 +5540,12 @@ static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_va
 		k.tag[len] = 0;
 	}
 	JS_FreeCString(ctx, name);
+	len = find_visits;
 	out = find_in_subtree(ctx, (struct dom_node *)doc, &k, 1);
+	walk_cost_note("document.getElementsByTagName",
+		       k.tag != NULL ? k.tag : "*",
+		       strlen(k.tag != NULL ? k.tag : "*"),
+		       find_visits - (uint32_t) len, true);
 	free(k.tag);
 	return out;
 }
@@ -8742,6 +8979,7 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
 		    type == DOM_ELEMENT_NODE) {
 			dom_string *tag = NULL, *id = NULL, *cls = NULL;
 
+			find_visits++;
 			/* The local name, as libdom's own tag lookup matched
 			 * it: getElementsByTagNameNS("ns", "body") finds the
 			 * element made as createElementNS("ns", "te:body"),
@@ -9509,7 +9747,7 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	const struct sel_compound *bare;
 	bool failed = false;
 	JSValue out = JS_NULL;
-	uint32_t out_n = 0;
+	uint32_t out_n = 0, visits0;
 
 	if (thread == NULL || argc < 1 || !JS_IsString(argv[0]) ||
 	    (root = JS_GetOpaque(this_val, node_class_id)) == NULL) {
@@ -9556,6 +9794,7 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	if (bare != NULL && tags_absent(thread, root, bare->tag_hash)) {
 		return out;
 	}
+	visits0 = vitasurf_js_sel_tag_visits;
 	/* iterative pre-order walk; root itself is not a candidate */
 	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
 	while (n != NULL) {
@@ -9567,7 +9806,7 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 				if (magic == 1) {
 					out = wrap_node(ctx, n);
 					dom_node_unref(n);
-					return out;
+					break;
 				}
 				JS_SetPropertyUint32(ctx, out, out_n++,
 						     wrap_node(ctx, n));
@@ -9602,6 +9841,12 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 		}
 		dom_node_unref(n);
 		n = next;
+	}
+	if (s->text != NULL) {
+		walk_cost_note(magic == 2 ? "querySelectorAll" :
+			       "querySelector", s->text, strlen(s->text),
+			       vitasurf_js_sel_tag_visits - visits0,
+			       walk_from_top(thread, root));
 	}
 	return out;
 }
@@ -12992,6 +13237,9 @@ void js_destroythread(jsthread *thread)
 		free(thread->mo);
 		thread->mo = NULL;
 		thread->mo_n = thread->mo_alloc = 0;
+		free(thread->mo_slots);
+		thread->mo_slots = NULL;
+		thread->mo_slot_n = thread->mo_slot_used = 0;
 	}
 	t = thread->timers;
 	while (t != NULL) {
@@ -15509,7 +15757,11 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 */
 		uint64_t t_start = now_ms(), t_compiled, t_done;
 		bool module = false, cached = false;
+		/* taken now, so nothing this script runs inherits it */
+		bool hinted = vitasurf_js_module_hint;
 		JSValue fn;
+
+		vitasurf_js_module_hint = false;
 
 		/*
 		 * Sites serve their own code as ES modules, which are not
@@ -15557,8 +15809,19 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			cached = true;
 			goto compiled;
 		}
-		fn = JS_Eval(thread->ctx, src, txtlen, name,
-			     JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+		/*
+		 * Unless the element said type="module" (VitaSurf): then
+		 * it goes straight to the module compile below, and back
+		 * to a classic one only if that fails.
+		 */
+		if (hinted) {
+			fn = JS_ThrowSyntaxError(thread->ctx,
+						 "a module script");
+		} else {
+			fn = JS_Eval(thread->ctx, src, txtlen, name,
+				     JS_EVAL_TYPE_GLOBAL |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+		}
 		if (!JS_IsException(fn)) {
 			bc_store(thread->ctx, name, src, txtlen, fn);
 		}
@@ -15586,10 +15849,14 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			if (!JS_IsException(as_module)) {
 				bc_store_module(thread->ctx, name, src,
 						txtlen, as_module);
-				vitasurf_ms_js_reparse += wasted;
-				vitasurf_js_reparses++;
-				vitasurf_js_reparse_kb +=
-					(unsigned)(txtlen / 1024);
+				if (hinted) {
+					vitasurf_js_module_first++;
+				} else {
+					vitasurf_ms_js_reparse += wasted;
+					vitasurf_js_reparses++;
+					vitasurf_js_reparse_kb +=
+						(unsigned)(txtlen / 1024);
+				}
 				JS_FreeValue(thread->ctx, script_err);
 				fn = as_module;
 				module = true;
@@ -15620,6 +15887,20 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				thread->current_script = NULL;
 				end_script(thread);
 				return true;
+			} else if (hinted) {
+				/* labelled a module and not one: what it
+				 * is as a classic script decides */
+				JS_FreeValue(thread->ctx,
+					     JS_GetException(thread->ctx));
+				JS_FreeValue(thread->ctx, as_module);
+				JS_FreeValue(thread->ctx, script_err);
+				fn = JS_Eval(thread->ctx, src, txtlen, name,
+					     JS_EVAL_TYPE_GLOBAL |
+					     JS_EVAL_FLAG_COMPILE_ONLY);
+				if (!JS_IsException(fn)) {
+					bc_store(thread->ctx, name, src,
+						 txtlen, fn);
+				}
 			} else {
 				/* Not a module either: the first error is
 				 * the one that describes the source. */
