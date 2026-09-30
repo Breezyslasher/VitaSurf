@@ -1,0 +1,114 @@
+diff --git a/content/handlers/css/dump.c b/content/handlers/css/dump.c
+index b36e6b32f..f7645ab8d 100644
+--- a/content/handlers/css/dump.c
++++ b/content/handlers/css/dump.c
+@@ -804,6 +804,63 @@ void nscss_dump_computed_style(FILE *stream, const css_computed_style *style)
+ 	case CSS_CURSOR_PROGRESS:
+ 		fprintf(stream, " progress ");
+ 		break;
++	case CSS_CURSOR_NONE:
++		fprintf(stream, " none ");
++		break;
++	case CSS_CURSOR_CONTEXT_MENU:
++		fprintf(stream, " context-menu ");
++		break;
++	case CSS_CURSOR_CELL:
++		fprintf(stream, " cell ");
++		break;
++	case CSS_CURSOR_VERTICAL_TEXT:
++		fprintf(stream, " vertical-text ");
++		break;
++	case CSS_CURSOR_ALIAS:
++		fprintf(stream, " alias ");
++		break;
++	case CSS_CURSOR_COPY:
++		fprintf(stream, " copy ");
++		break;
++	case CSS_CURSOR_NO_DROP:
++		fprintf(stream, " no-drop ");
++		break;
++	case CSS_CURSOR_NOT_ALLOWED:
++		fprintf(stream, " not-allowed ");
++		break;
++	case CSS_CURSOR_GRAB:
++		fprintf(stream, " grab ");
++		break;
++	case CSS_CURSOR_GRABBING:
++		fprintf(stream, " grabbing ");
++		break;
++	case CSS_CURSOR_ALL_SCROLL:
++		fprintf(stream, " all-scroll ");
++		break;
++	case CSS_CURSOR_COL_RESIZE:
++		fprintf(stream, " col-resize ");
++		break;
++	case CSS_CURSOR_ROW_RESIZE:
++		fprintf(stream, " row-resize ");
++		break;
++	case CSS_CURSOR_EW_RESIZE:
++		fprintf(stream, " ew-resize ");
++		break;
++	case CSS_CURSOR_NS_RESIZE:
++		fprintf(stream, " ns-resize ");
++		break;
++	case CSS_CURSOR_NESW_RESIZE:
++		fprintf(stream, " nesw-resize ");
++		break;
++	case CSS_CURSOR_NWSE_RESIZE:
++		fprintf(stream, " nwse-resize ");
++		break;
++	case CSS_CURSOR_ZOOM_IN:
++		fprintf(stream, " zoom-in ");
++		break;
++	case CSS_CURSOR_ZOOM_OUT:
++		fprintf(stream, " zoom-out ");
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index a478375fd..8d1794b98 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -151,6 +151,41 @@ static browser_pointer_shape get_pointer_shape(struct box *box, bool imagemap)
+ 	case CSS_CURSOR_HELP:
+ 		pointer = BROWSER_POINTER_HELP;
+ 		break;
++	/* CSS Basic User Interface 3 (VitaSurf); the rest are the default */
++	case CSS_CURSOR_CONTEXT_MENU:
++		pointer = BROWSER_POINTER_MENU;
++		break;
++	case CSS_CURSOR_CELL:
++		pointer = BROWSER_POINTER_CROSS;
++		break;
++	case CSS_CURSOR_VERTICAL_TEXT:
++		pointer = BROWSER_POINTER_CARET;
++		break;
++	case CSS_CURSOR_NO_DROP:
++		pointer = BROWSER_POINTER_NO_DROP;
++		break;
++	case CSS_CURSOR_NOT_ALLOWED:
++		pointer = BROWSER_POINTER_NOT_ALLOWED;
++		break;
++	case CSS_CURSOR_GRAB:
++	case CSS_CURSOR_GRABBING:
++	case CSS_CURSOR_ALL_SCROLL:
++		pointer = BROWSER_POINTER_MOVE;
++		break;
++	case CSS_CURSOR_COL_RESIZE:
++	case CSS_CURSOR_EW_RESIZE:
++		pointer = BROWSER_POINTER_RIGHT;
++		break;
++	case CSS_CURSOR_ROW_RESIZE:
++	case CSS_CURSOR_NS_RESIZE:
++		pointer = BROWSER_POINTER_DOWN;
++		break;
++	case CSS_CURSOR_NESW_RESIZE:
++		pointer = BROWSER_POINTER_RU;
++		break;
++	case CSS_CURSOR_NWSE_RESIZE:
++		pointer = BROWSER_POINTER_RD;
++		break;
+ 	default:
+ 		pointer = BROWSER_POINTER_DEFAULT;
+ 		break;

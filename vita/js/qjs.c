@@ -10547,7 +10547,10 @@ static const char *const sm_pointer_events[] = { NULL, "auto", "none" };
 static const char *const sm_cursor[] = { NULL, "auto", "crosshair",
 	"default", "pointer", "move", "e-resize", "ne-resize", "nw-resize",
 	"n-resize", "se-resize", "sw-resize", "s-resize", "w-resize",
-	"text", "wait", "help", "progress" };
+	"text", "wait", "help", "progress", "none", "context-menu", "cell",
+	"vertical-text", "alias", "copy", "no-drop", "not-allowed", "grab",
+	"grabbing", "all-scroll", "col-resize", "row-resize", "ew-resize",
+	"ns-resize", "nesw-resize", "nwse-resize", "zoom-in", "zoom-out" };
 static const char *const sm_empty_cells[] = { NULL, "show", "hide" };
 static const char *const sm_caption_side[] = { NULL, "top", "bottom" };
 static const char *const sm_unicode_bidi[] = { NULL, "normal", "embed",

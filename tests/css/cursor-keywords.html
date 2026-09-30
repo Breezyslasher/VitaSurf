@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>CSS3 cursor keywords</title><style>
+ #a { cursor: not-allowed; } #b { cursor: grab; } #c { cursor: grabbing; }
+ #d { cursor: url(a.cur), zoom-out; } #e { cursor: ew-resize; }
+</style></head>
+<body><div id="a">a</div><div id="b">b</div><div id="c">c</div><div id="d">d</div><div id="e">e</div>
+<pre id="out"></pre>
+<script>
+/* not-allowed, grab and the other keywords CSS Basic User Interface 3
+   added dropped the whole declaration, logged as "cursor (value)". */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+window.addEventListener('load', function(){ setTimeout(function(){
+  T('cursors (not-allowed grab grabbing zoom-out ew-resize)',
+    ['a','b','c','d','e'].map(function(id){
+      return getComputedStyle(document.getElementById(id)).cursor; }).join(' '));
+}, 200); });
+</script></body></html>
