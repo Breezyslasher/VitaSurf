@@ -1,0 +1,19 @@
+diff --git a/quickjs.c b/quickjs.c
+index 73f363f..2d066e5 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -53149,8 +53149,13 @@ static int js_create_resolving_functions(JSContext *ctx,
+             JS_FreeValue(ctx, obj);
+         fail:
+ 
+-            if (i != 0)
++            /* and not left behind for the caller to free again: an
++               async function call that ran out of memory here freed it
++               twice (VitaSurf) */
++            if (i != 0) {
+                 JS_FreeValue(ctx, resolving_funcs[0]);
++                resolving_funcs[0] = JS_UNDEFINED;
++            }
+             ret = -1;
+             break;
+         }

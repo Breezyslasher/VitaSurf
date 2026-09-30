@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- Async event listeners called until script runs out of memory. QuickJS
+     freed a promise resolving function twice when the second of the pair
+     could not be made, and the harness crashed on this page every time. -->
+var keep=[];
+window.addEventListener('poke', async function(e){ keep.push(new Array(2000).fill(e)); await null; keep.push({}); });
+var n=0;
+function go(){
+  for(var i=0;i<200;i++){ try{ window.dispatchEvent(new CustomEvent('poke')); n++; }catch(e){} }
+  if(n<200000) setTimeout(go,0); else console.log('done');
+}
+go();
+setTimeout(function(){ keep=null; console.log('PASS survived after '+n); },8000);
+</script></body></html>
