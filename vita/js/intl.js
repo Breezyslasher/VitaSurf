@@ -19,9 +19,10 @@
  */
 (function () {
 	'use strict';
-	var W = window, N = W.__vitaIntl, P = W.__vitaIntlPattern;
+	var W = window, N = W.__vitaIntl, P = W.__vitaIntlPattern,
+		C = W.__vitaIntlCore;
 
-	if (!N || !P || !W.Intl)
+	if (!N || !P || !C || !W.Intl)
 		return;
 
 	var TAGS = N.locales(), DATA = [];
@@ -51,96 +52,22 @@
 
 	/* ---- locales ---- */
 
-	var LANGTAG = /^[a-z]{2,3}(-[a-z]{4})?(-([a-z]{2}|\d{3}))?(-([a-z\d]{5,8}|\d[a-z\d]{3}))*(-[a-wyz\d](-[a-z\d]{2,8})+)*(-x(-[a-z\d]{1,8})+)?$/i;
-
-	function canonicalTag(tag) {
-		if (typeof tag !== 'string' && (typeof tag !== 'object' ||
-		    tag === null))
-			throw new TypeError('Locale must be a string or object');
-		tag = String(tag);
-		if (!LANGTAG.test(tag))
-			throw new RangeError('Incorrect locale information ' +
-					     'provided');
-		var p = tag.split('-'), i, ext = false;
-
-		p[0] = p[0].toLowerCase();
-		for (i = 1; i < p.length; i++) {
-			if (p[i].length === 1)
-				ext = true;
-			if (ext)
-				p[i] = p[i].toLowerCase();
-			else if (p[i].length === 4 && /^[a-z]/i.test(p[i]))
-				p[i] = p[i].charAt(0).toUpperCase() +
-					p[i].slice(1).toLowerCase();
-			else if (p[i].length === 2)
-				p[i] = p[i].toUpperCase();
-			else
-				p[i] = p[i].toLowerCase();
-		}
-		return p.join('-');
-	}
-
-	function localeList(locales) {
-		var out = [], i;
-
-		if (locales === undefined)
-			return out;
-		if (typeof locales === 'string' ||
-		    (W.Intl.Locale && locales instanceof W.Intl.Locale))
-			locales = [String(locales)];
-		locales = Object(locales);
-		for (i = 0; i < (locales.length >>> 0); i++) {
-			if (!(i in locales))
-				continue;
-			var t = canonicalTag(locales[i]);
-
-			if (out.indexOf(t) < 0)
-				out.push(t);
-		}
-		return out;
-	}
-
-	/* the tag without its extensions, and its -u- keywords */
-	function splitTag(tag) {
-		var m = /^(.*?)(-u(-[a-z\d]{2,8})+)?(-x-.*)?$/.exec(tag);
-		var kw = {}, base = m[1], u = m[2];
-
-		base = base.replace(/-[a-wyz\d](-[a-z\d]{2,8})+$/, '');
-		if (u) {
-			var p = u.slice(3).split('-'), key = null, i;
-
-			for (i = 0; i < p.length; i++) {
-				if (p[i].length === 2 && /^[a-z\d][a-z]$/.test(p[i])) {
-					key = p[i];
-					kw[key] = '';
-				} else if (key) {
-					kw[key] = kw[key] ? kw[key] + '-' + p[i] : p[i];
-				}
-			}
-		}
-		return { base: base, kw: kw };
-	}
+	var localeList = C.localeList, splitTag = C.splitTag;
 
 	/* the tag we have data for that a tag falls back to, by dropping
 	 * subtags from the end */
 	function available(base) {
-		var t = base, i;
+		return C.lookup(base, function (t) {
+			var i;
 
-		while (t) {
 			for (i = 0; i < TAGS.length; i++) {
 				if (TAGS[i].toLowerCase() === t.toLowerCase())
 					return { idx: i, tag: TAGS[i] };
 			}
 			if (t.toLowerCase() === 'en-us')
 				return { idx: 0, tag: 'en-US' };
-			var cut = t.lastIndexOf('-');
-
-			t = cut > 0 ? t.slice(0, cut) : '';
-			/* a single letter left behind is not a subtag */
-			if (/-[a-z\d]$/i.test(t))
-				t = t.slice(0, t.lastIndexOf('-'));
-		}
-		return null;
+			return null;
+		});
 	}
 
 	function defaultLocale() {

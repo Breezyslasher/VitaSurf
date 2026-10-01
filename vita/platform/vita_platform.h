@@ -42,6 +42,8 @@
 #define VITASURF_NO_DECODE_THREAD_FLAG VITASURF_DATA_DIR "/nodecodethread"
 #define VITASURF_NO_PUMP_FLAG VITASURF_DATA_DIR "/nopump"
 #define VITASURF_CA_BUNDLE    VITASURF_RES_DIR "/cacert.pem"
+/* Intl.NumberFormat's locale data, from scripts/gen-intl-numbers.mjs */
+#define VITASURF_INTL_PAK     VITASURF_RES_DIR "/intl.pak"
 
 /* Persistence (phase 5): everything the user accumulates lives here. */
 #define VITASURF_USER_CHOICES VITASURF_DATA_DIR "/Choices"

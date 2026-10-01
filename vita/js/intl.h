@@ -13,7 +13,8 @@
 /**
  * Put the native half of Intl.DateTimeFormat on the global object, as
  * __vitaIntl, for vita/js/intl.js to build the API on: the time zone
- * database, the locale data and the formatter.
+ * database, the locale data and the formatter; and the reader of
+ * resources/intl.pak, which vita/js/intl_number.js formats numbers with.
  */
 void vita_intl_register(JSContext *ctx, JSValueConst global);
 

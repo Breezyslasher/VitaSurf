@@ -140,8 +140,10 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/storage.js
         vita/js/subtle.js
         vita/js/wasm.js
+        vita/js/intl_core.js
         vita/js/intl_pattern.js
-        vita/js/intl.js)
+        vita/js/intl.js
+        vita/js/intl_number.js)
     set(PRELUDE_BYTES "")
     foreach(part ${PRELUDE_PARTS})
         set(full "${CMAKE_SOURCE_DIR}/${part}")
@@ -158,7 +160,8 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
     # websocket.c runs WebSocket connections on libcurl's ws API
-    # intl.c is Intl.DateTimeFormat's time zones and formatting
+    # intl.c is Intl.DateTimeFormat's time zones and formatting, and
+    # reads the locale data Intl.NumberFormat formats with
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
         vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c
         vita/js/intl.c)
@@ -368,5 +371,7 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
     FILE resources/anim-heavy.html                resources/anim-heavy.html
     FILE resources/anim-layout.html               resources/anim-layout.html
     FILE resources/cacert.pem                     resources/cacert.pem
+    # Intl.NumberFormat's locale data, scripts/gen-intl-numbers.mjs
+    FILE resources/intl.pak                       resources/intl.pak
     ${VPK_FILES}
 )
