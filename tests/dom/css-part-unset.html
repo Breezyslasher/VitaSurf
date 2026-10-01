@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!-- Four things Web Awesome's buttons need, as Chrome has them. A var()
+     that cannot be resolved makes its declaration compute as unset, not
+     drop out so a weaker one wins; ::part() styles a component's named
+     element from outside; :is() counts for its most specific argument;
+     slot[name=a]::slotted(*) is only what was put in slot a. Home
+     Assistant's toolbar icons came out 74px wide for 48. -->
+<html><head><title>t</title><style>
+html { --P: 12px; }
+#c1 { color: rgb(255, 0, 0); }
+#c1 { color: var(--nope, --not-a-colour); }
+#c2 { color: rgb(0, 128, 0); }
+#c3 { padding-left: 5px; }
+#c3 { padding-left: var(--nope); }
+span:is(.q, #zz) { color: rgb(0, 128, 0); }
+span.q.r.s { color: rgb(255, 0, 0); }
+x-btn::part(base) { width: 40px; color: rgb(0, 128, 0); }
+x-btn::part(lbl icon) { margin-left: 7px; }
+</style></head><body><div id="out"></div>
+<div style="color: rgb(0, 0, 255)"><span id="c1">c1</span></div>
+<span id="c2">c2</span><div id="c3">c3</div>
+<span id="is" class="q r s">is</span>
+<x-btn id="a"></x-btn>
+<x-wrap id="w"></x-wrap>
+<x-slots id="s"><i id="si1" slot="start">a</i><i id="si2">b</i></x-slots>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+function sheet(t){var s=new CSSStyleSheet();s.replaceSync(t);return s;}
+var IN=sheet(':host{--P:16px;display:block} .b{display:inline-block;width:100px;padding:0 var(--P)}');
+customElements.define('x-btn',class extends HTMLElement{constructor(){super();var s=this.attachShadow({mode:'open'});s.adoptedStyleSheets=[IN];s.innerHTML='<span class="b" part="base" id="b">x</span><span part="lbl icon" id="l">y</span><span part="lbl" id="l2">z</span>';}});
+customElements.define('x-wrap',class extends HTMLElement{constructor(){super();var s=this.attachShadow({mode:'open'});s.adoptedStyleSheets=[sheet('x-btn{--P:var(--nope2,--not-a-length)}')];s.innerHTML='<x-btn id="i"></x-btn>';}});
+customElements.define('x-slots',class extends HTMLElement{constructor(){super();var s=this.attachShadow({mode:'open'});s.adoptedStyleSheets=[sheet('slot[name=start]::slotted(*){margin-left:9px}')];var n=document.createElement('slot');n.name='start';s.appendChild(n);s.appendChild(document.createElement('slot'));n=document.createElement('b');n.id='own';n.textContent='c';s.appendChild(n);}});
+setTimeout(function(){
+ function cs(e){return getComputedStyle(e);}
+ ok("an unresolvable var() is unset: colour inherits", cs(document.getElementById('c1')).color==='rgb(0, 0, 255)');
+ ok("an unresolvable var() is unset: padding is initial", cs(document.getElementById('c3')).paddingLeft==='0px');
+ ok("a resolved declaration still applies", cs(document.getElementById('c2')).color==='rgb(0, 128, 0)');
+ ok(":is() counts for its most specific argument", cs(document.getElementById('is')).color==='rgb(0, 128, 0)');
+ var a=document.getElementById('a').shadowRoot;
+ ok("::part() beats the component's own rule", Math.round(a.getElementById('b').getBoundingClientRect().width)===72);
+ ok("::part() sets the part's colour", cs(a.getElementById('b')).color==='rgb(0, 128, 0)');
+ ok("::part(a b) needs both names", cs(a.getElementById('l')).marginLeft==='7px' && cs(a.getElementById('l2')).marginLeft==='0px');
+ var i=document.getElementById('w').shadowRoot.getElementById('i').shadowRoot;
+ ok("a var() whose fallback is no length leaves the padding at 0", cs(i.getElementById('b')).paddingLeft==='0px');
+ ok("slot[name=start]::slotted(*) styles what is in that slot", cs(document.getElementById('si1')).marginLeft==='9px');
+ ok("and not what is in another", cs(document.getElementById('si2')).marginLeft==='0px');
+ ok("nor the component's own elements", cs(document.getElementById('s').shadowRoot.getElementById('own')).marginLeft==='0px');
+},300);
+</script></body></html>

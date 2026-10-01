@@ -1,0 +1,323 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 6772518..9b2dbb1 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -1030,6 +1030,56 @@ unsigned int css_deferred_compiles;
+ unsigned int css_deferred_prop_steps;
+ unsigned int css_deferred_cache_hits;
+ 
++/*
++ * A declaration whose var() cannot be resolved, or whose value does not
++ * parse once it is, is invalid at computed-value time: CSS Variables has
++ * it compute as unset, at its own place in the cascade, not drop out so
++ * that a weaker declaration wins. Home Assistant's icon buttons are
++ * padded with var(--ha-icon-button-padding-inline, --ha-space-2), whose
++ * fallback is not a length, and come out unpadded and square in a
++ * browser; dropping it let the padding compiled against the document
++ * root's variables stand (VitaSurf).
++ */
++static css_error compileUnset(css_language *c, css_deferred_decl *decl,
++		css_prop_handler handler, css_style **out)
++{
++	parserutils_vector *v = NULL;
++	css_style *style = NULL;
++	css_token unset;
++	css_error error;
++	int32_t ctx = 0;
++
++	if (decl->unset != NULL) {
++		*out = decl->unset;
++		return CSS_OK;
++	}
++	if (parserutils_vector_create(sizeof(css_token), 1, &v) !=
++			PARSERUTILS_OK)
++		return CSS_NOMEM;
++	memset(&unset, 0, sizeof(unset));
++	unset.type = CSS_TOKEN_IDENT;
++	unset.idata = c->strings[UNSET];
++	if (parserutils_vector_append(v, &unset) != PARSERUTILS_OK) {
++		parserutils_vector_destroy(v);
++		return CSS_NOMEM;
++	}
++	error = css__stylesheet_style_create(c->sheet, &style);
++	if (error == CSS_OK) {
++		/* a property that takes no unset is left out, as before */
++		error = handler(c, v, &ctx, style);
++		if (error != CSS_OK)
++			css__stylesheet_style_destroy(style);
++	}
++	parserutils_vector_destroy(v);
++	if (error != CSS_OK)
++		return error;
++	if (decl->important)
++		css__make_style_important(style);
++	decl->unset = style;
++	*out = style;
++	return CSS_OK;
++}
++
+ css_error css__language_compile_deferred(css_language *c,
+ 		const css_custom_map *map, css_deferred_decl *decl,
+ 		css_style **out)
+@@ -1080,6 +1130,8 @@ css_error css__language_compile_deferred(css_language *c,
+ 	c->subst_over = false;
+ 	error = appendSubstituted(c, decl->tokens, decl->n_tokens, NULL, 0,
+ 			map);
++	if (error == CSS_INVALID)
++		return compileUnset(c, decl, handler, out);
+ 	if (error != CSS_OK)
+ 		return error;
+ 
+@@ -1124,6 +1176,8 @@ css_error css__language_compile_deferred(css_language *c,
+ 
+ 	if (error != CSS_OK) {
+ 		css__stylesheet_style_destroy(style);
++		if (error == CSS_INVALID)
++			return compileUnset(c, decl, handler, out);
+ 		return error;
+ 	}
+ 
+@@ -3920,11 +3974,116 @@ fail:
+  * compound merges in here as usual and the rest is handed to
+  * parseSelector() to put in front.
+  */
++/*
++ * The specificity of the most specific argument of the :is() whose
++ * arguments start at ctx, read off the tokens (VitaSurf). Each argument
++ * is parsed into a selector of its own, which on its own would count
++ * only for itself; Selectors 4 gives :is() and :not() the most specific
++ * of their arguments, in every one of them. Nested :is(), :not() and
++ * :has() count for their own most specific argument, :where() for
++ * nothing, and any other functional pseudo-class as one.
++ */
++static uint32_t groupMostSpecific(const parserutils_vector *vector,
++		int32_t ctx, int32_t *end)
++{
++	const css_token *t;
++	uint32_t most = 0, cur = 0;
++
++	while ((t = parserutils_vector_peek(vector, ctx)) != NULL) {
++		if (tokenIsChar(t, ')')) {
++			ctx++;
++			break;
++		}
++		if (tokenIsChar(t, ',')) {
++			if (cur > most)
++				most = cur;
++			cur = 0;
++			ctx++;
++			continue;
++		}
++		if (t->type == CSS_TOKEN_HASH) {
++			cur += CSS_SPECIFICITY_A;
++			ctx++;
++		} else if (tokenIsChar(t, '.')) {
++			cur += CSS_SPECIFICITY_B;
++			ctx += 2;
++		} else if (tokenIsChar(t, '[')) {
++			cur += CSS_SPECIFICITY_B;
++			for (ctx++; (t = parserutils_vector_peek(vector,
++					ctx)) != NULL; ctx++) {
++				if (tokenIsChar(t, ']')) {
++					ctx++;
++					break;
++				}
++			}
++		} else if (tokenIsChar(t, ':')) {
++			t = parserutils_vector_peek(vector, ctx + 1);
++			if (t != NULL && tokenIsChar(t, ':')) {
++				cur += CSS_SPECIFICITY_C;
++				ctx += 2;
++				t = parserutils_vector_peek(vector, ctx);
++				if (t != NULL && t->type == CSS_TOKEN_FUNCTION) {
++					ctx++;
++					skipToCloseParen(vector, &ctx);
++					ctx++;
++				} else {
++					ctx++;
++				}
++			} else if (t != NULL && t->type == CSS_TOKEN_FUNCTION) {
++				int32_t after = ctx + 2;
++
++				if (nameIs(t->idata, "where")) {
++					skipToCloseParen(vector, &after);
++					after++;
++				} else if (nameIs(t->idata, "is") ||
++						nameIs(t->idata, "not") ||
++						nameIs(t->idata, "has") ||
++						nameIs(t->idata, "matches") ||
++						nameIs(t->idata, "-vita-not")) {
++					cur += groupMostSpecific(vector, after,
++							&after);
++				} else {
++					cur += CSS_SPECIFICITY_B;
++					skipToCloseParen(vector, &after);
++					after++;
++				}
++				ctx = after;
++			} else {
++				cur += CSS_SPECIFICITY_B;
++				ctx += 2;
++			}
++		} else if (t->type == CSS_TOKEN_IDENT) {
++			cur += CSS_SPECIFICITY_C;
++			ctx++;
++		} else if (t->type == CSS_TOKEN_FUNCTION || tokenIsChar(t, '(')) {
++			ctx++;
++			skipToCloseParen(vector, &ctx);
++			ctx++;
++		} else {
++			ctx++;
++		}
++	}
++	if (cur > most)
++		most = cur;
++	if (end != NULL)
++		*end = ctx;
++	return most;
++}
++
++/* the specificity :is() gives: its own argument's, or the most
++ * specific argument's when that is more */
++static void groupSpecificity(css_selector *parent, uint32_t before,
++		uint32_t most)
++{
++	if (parent->specificity < before + most)
++		parent->specificity = before + most;
++}
++
+ static css_error parseAppendGroup(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_selector **parent, int which)
+ {
+-	uint32_t before = (*parent)->specificity;
++	uint32_t before = (*parent)->specificity, most;
+ 	int slot = c->alt_seen;
+ 	int want = (slot < CSS_ALT_MAX) ? c->alt_choice[slot] : 0;
+ 	const css_token *token;
+@@ -3934,6 +4093,8 @@ static css_error parseAppendGroup(css_language *c,
+ 	parserutils_vector_iterate(vector, ctx);	/* ':' */
+ 	parserutils_vector_iterate(vector, ctx);	/* FUNCTION */
+ 	consumeWhitespace(vector, ctx);
++	most = (which == WHERE_FN) ? 0 :
++			groupMostSpecific(vector, *ctx, NULL);
+ 
+ 	n = findAlternative(vector, ctx, want);
+ 	if (n < 0)
+@@ -3961,6 +4122,8 @@ static css_error parseAppendGroup(css_language *c,
+ 		}
+ 		if (which == WHERE_FN)
+ 			(*parent)->specificity = before;
++		else
++			groupSpecificity(*parent, before, most);
+ 		return CSS_OK;
+ 	}
+ 
+@@ -4070,6 +4233,8 @@ static css_error parseAppendGroup(css_language *c,
+ 	/* :where() matches, and counts for nothing */
+ 	if (which == WHERE_FN)
+ 		(*parent)->specificity = before;
++	else
++		groupSpecificity(*parent, before, most);
+ 
+ 	return CSS_OK;
+ }
+diff --git a/src/parse/nesting.c b/src/parse/nesting.c
+index 7e76e1f..6d067ec 100644
+--- a/src/parse/nesting.c
++++ b/src/parse/nesting.c
+@@ -749,6 +749,45 @@ static void sel_rewrite_prelude(struct sbuf *b, const char *s, size_t n)
+ 			i = j;
+ 			continue;
+ 		}
++		/*
++		 * X::part(a b) is the element in X's shadow tree whose part
++		 * attribute names a and b. Shadow trees are X's descendants
++		 * here, so it is read as X [part~="a"][part~="b"]: Web
++		 * Awesome's and Shoelace's components are sized and themed
++		 * through it, Home Assistant's icon buttons among them
++		 * (VitaSurf). Parts a nested component exports are matched
++		 * too, as if exportparts had named them.
++		 *
++		 * A rule from outside a shadow tree beats the tree's own
++		 * rules whatever their specificity, and here both are
++		 * ordinary rules, the tree's coming later. An :is() with an
++		 * ID no element has lifts the part above any class-based
++		 * rule inside, and keeps two ::part rules in their order.
++		 */
++		if (c == ':' && sel_prefix(s + i, n - i, "::part(")) {
++			size_t end = sel_close(s, n, i + 6), j, a;
++
++			if (end == 0) {
++				sb_put(b, s + i, n - i);
++				return;
++			}
++			sb_put(b, " :is(", 5);
++			for (j = i + 7; j < end - 1; ) {
++				while (j < end - 1 && sel_ws(s[j]))
++					j++;
++				a = j;
++				while (j < end - 1 && !sel_ws(s[j]))
++					j++;
++				if (j > a) {
++					sb_put(b, "[part~=\"", 8);
++					sb_put(b, s + a, j - a);
++					sb_put(b, "\"]", 2);
++				}
++			}
++			sb_put(b, ",#-vita-part)", 13);
++			i = end;
++			continue;
++		}
+ 		if (c == ':' && sel_prefix(s + i, n - i, ":-webkit-any(")) {
+ 			sb_put(b, ":is(", 4);
+ 			i += 13;
+@@ -859,6 +898,8 @@ css_error css__rewrite_selectors(const char *src, size_t len,
+ 		for (j = 0; j + 5 <= len && !any; j++) {
+ 			if (src[j] == ':' &&
+ 			    (strncasecmp(src + j, ":not(", 5) == 0 ||
++			     (j + 7 <= len &&
++			      strncasecmp(src + j, "::part(", 7) == 0) ||
+ 			     (j + 9 <= len &&
+ 			      strncasecmp(src + j, ":-moz-any(", 10) == 0) ||
+ 			     (j + 13 <= len &&
+diff --git a/src/select/select.c b/src/select/select.c
+index f2c4e8b..ff30f94 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -873,7 +873,7 @@ static css_error apply_deferred(css_select_state *state)
+ 				m->sheet->parser_frontend, state->custom,
+ 				(css_deferred_decl *) m->decl, &style);
+ 		if (error != CSS_OK) {
+-			continue;	/* still unresolved: leave it out */
++			continue;	/* unset not taken: leave it out */
+ 		}
+ 
+ 		state->current_specificity = m->specificity;
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index e53bbaf..20709a5 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -1721,6 +1721,8 @@ css_error css__stylesheet_rule_destroy(css_stylesheet *sheet, css_rule *rule)
+ 			free(d->tokens);
+ 			if (d->cached != NULL)
+ 				css__stylesheet_style_destroy(d->cached);
++			if (d->unset != NULL)
++				css__stylesheet_style_destroy(d->unset);
+ 		}
+ 		free(s->deferred);
+ 	}
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 3495d23..95ed119 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -171,6 +171,9 @@ typedef struct css_deferred_decl {
+ 	bool cache_valid;	/**< cached matches cache_key */
+ 	uintptr_t cache_key[CSS_DEFERRED_KEY_MAX];
+ 	css_style *cached;	/**< owned; the caller must not destroy it */
++	/** what it computes to when a var() cannot be resolved: unset,
++	 * which does not depend on the element, so it is kept once; owned */
++	css_style *unset;
+ } css_deferred_decl;
+ 
+ typedef struct css_rule_selector {

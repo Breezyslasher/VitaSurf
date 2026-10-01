@@ -2869,6 +2869,18 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   var m,e,x;
   s=s.replace(/^\s+|\s+$/g,'');
   if(!s)return s;
+  /* slot[name=a]::slotted(X): an X the page put in slot a, which is a
+     child of the host with slot="a". Read as any X inside the tag, Home
+     Assistant's slot[name=start]::slotted(*){margin-inline-end:4px}
+     put a margin on every element in its buttons, the buttons too
+     (VitaSurf). */
+  if((x=s.indexOf('::slotted('))>=0&&
+     (m=/slot\[name=["']?([^"'\]]+)["']?\]$/.exec(s.slice(0,x)))){
+   e=closeAt(s,x+9,'(',')');
+   if(e>0){
+    var hp=/^:host(\([^)]*\))?/.exec(s),arg=s.slice(x+10,e).replace(/^\s+|\s+$/g,'')||'*';
+    s=(hp?hp[0]:'')+' > '+arg+'[slot="'+m[1]+'"]'+s.slice(e+1);
+    if(!hp)return tag+s;}}
   s=s.replace(/[^\s>+~]*::slotted\(/g,function(){return ' ::slotted(';});
   while((x=s.indexOf('::slotted('))>=0){
    e=closeAt(s,x+9,'(',')');
