@@ -6,9 +6,15 @@
 // Licensed under the GNU General Public License version 2.
 //
 // Write resources/intl.pak, the data Intl.NumberFormat and
-// Intl.PluralRules format with (vita/js/intl_number.js), from CLDR's
-// JSON release. The Unicode CLDR data is under the Unicode licence,
-// which is GPL-compatible.
+// Intl.PluralRules format with (vita/js/intl_number.js), and
+// Intl.RelativeTimeFormat and Intl.DisplayNames with
+// (vita/js/intl_names.js), from CLDR's JSON release. The Unicode CLDR
+// data is under the Unicode licence, which is GPL-compatible.
+//
+// Entries, by name: index (the locales and their parents), plurals, and
+// for each CLDR locale n: (numbers), c: (currency names), d: (names of
+// languages, regions, scripts, variants and calendars) and r: (relative
+// times and the names of date fields).
 //
 // The pack holds one entry per CLDR locale, read only when a page asks
 // for that locale. A locale's entry is what it changes from its CLDR
@@ -25,7 +31,8 @@
 // (node -p process.versions.cldr), then run this under that Node:
 //
 //   mkdir cldr && cd cldr
-//   for p in cldr-core cldr-numbers-full cldr-units-full; do
+//   for p in cldr-core cldr-numbers-full cldr-units-full \
+//            cldr-localenames-full cldr-dates-full; do
 //     npm pack $p@48.0.0 && mkdir $p && tar xzf $p-48.0.0.tgz -C $p
 //   done
 //   node scripts/gen-intl-numbers.mjs cldr > resources/intl.pak
@@ -47,6 +54,7 @@ const pkg = name => {
 				return p;
 	throw new Error('no ' + name + ' under ' + DIR);
 };
+const NAMES = pkg('cldr-localenames-full'), DATES = pkg('cldr-dates-full');
 const CORE = pkg('cldr-core'), NUM = pkg('cldr-numbers-full'),
 	UNITS = pkg('cldr-units-full');
 const json = f => JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -166,6 +174,91 @@ function counts(o, prefix) {
 	for (const k in o) {
 		if (k.startsWith(prefix + '-count-') && !/-case-|-gender-/.test(k))
 			out[k.slice(prefix.length + 7)] = o[k];
+	}
+	return out;
+}
+
+function mainFile(pkgDir, tag, file) {
+	const f = path.join(pkgDir, 'main', tag, file);
+
+	return fs.existsSync(f) ? json(f).main[tag] : null;
+}
+
+// Intl.DisplayNames': languages, regions, scripts, variants and
+// calendars, with their short and stand-alone forms, and how a
+// locale's name is put together from its parts
+function displayData(tag) {
+	const ln = (file, key) => {
+		const m = mainFile(NAMES, tag, file);
+
+		return m ? m.localeDisplayNames[key] : {};
+	};
+	const split = (o) => {
+		const out = { n: {}, short: {}, long: {} };
+
+		for (const k in o) {
+			const m = /^(.*?)-alt-(short|long)$/.exec(k);
+
+			if (m)
+				out[m[2]][m[1]] = o[k];
+			else if (!/-alt-|-menu-/.test(k))
+				out.n[k] = o[k];
+		}
+		return out;
+	};
+	const l = split(ln('languages.json', 'languages'));
+	const t = split(ln('territories.json', 'territories'));
+	const sc = split(ln('scripts.json', 'scripts'));
+	const ldn = mainFile(NAMES, tag, 'localeDisplayNames.json');
+	const d = ldn ? ldn.localeDisplayNames : {};
+	const pat = d.localeDisplayPattern || {};
+
+	return {
+		L: l.n, Ls: l.short, Ll: l.long,
+		T: t.n, Ts: t.short,
+		S: sc.n, Ss: sc.short,
+		V: ln('variants.json', 'variants'),
+		K: d.types ? d.types.calendar : {},
+		p: [pat.localePattern, pat.localeSeparator]
+	};
+}
+
+// Intl.RelativeTimeFormat's, and Intl.DisplayNames' names of the date
+// fields: for each field and width, its name, the words for -1, 0 and
+// 1 (yesterday, today, tomorrow) and the patterns for the future and
+// the past by plural
+const FIELDS = ['era', 'year', 'quarter', 'month', 'week', 'weekday', 'day',
+	'dayperiod', 'hour', 'minute', 'second', 'zone'];
+
+function relativeData(tag) {
+	const m = mainFile(DATES, tag, 'dateFields.json');
+	const f = m ? m.dates.fields : {}, out = {};
+
+	for (const field of FIELDS) {
+		for (const w of ['', '-short', '-narrow']) {
+			const e = f[field + w];
+
+			if (!e)
+				continue;
+			const o = { n: e.displayName };
+			const rel = {};
+
+			for (const k in e) {
+				const r = /^relative-type-(-?\d+)$/.exec(k);
+
+				if (r)
+					rel[r[1]] = e[k];
+			}
+			if (Object.keys(rel).length)
+				o.r = rel;
+			if (e['relativeTime-type-future'])
+				o.f = counts(e['relativeTime-type-future'],
+					     'relativeTimePattern');
+			if (e['relativeTime-type-past'])
+				o.p = counts(e['relativeTime-type-past'],
+					     'relativeTimePattern');
+			out[field + (w || '-long')] = o;
+		}
 	}
 	return out;
 }
@@ -497,6 +590,8 @@ function nameOrder(tag, d) {
 const get = t => {
 	if (!cache[t]) {
 		cache[t] = numberData(t);
+		cache[t].display = displayData(t);
+		cache[t].relative = relativeData(t);
 		arabicSymbols(t, cache[t].num);
 		currencyFormats(t, cache[t].num);
 		nameOrder(t, cache[t].num);
@@ -521,6 +616,10 @@ for (const t of [...used].sort()) {
 			delete entries['n:und'].P[ns].dl;
 	}
 	entries['c:' + t] = p ? diff(get(p).names, mine.names) || {} : mine.names;
+	entries['d:' + t] = p ? diff(get(p).display, mine.display) || {} :
+		mine.display;
+	entries['r:' + t] = p ? diff(get(p).relative, mine.relative) || {} :
+		mine.relative;
 }
 
 // currency digits, and the numbering systems that are digits

@@ -38,7 +38,7 @@ var __vitaIntlNumber = function (W, N, C, install) {
 
 	/* ---- data ---- */
 
-	var INDEX = null, LOADED = { n: {}, c: {} }, PLURALS = null;
+	var INDEX = null, LOADED = {}, PLURALS = null;
 
 	function index() {
 		return INDEX || (INDEX = JSON.parse(N.pak('index')));
@@ -62,7 +62,7 @@ var __vitaIntlNumber = function (W, N, C, install) {
 	/* a CLDR locale's data, kind 'n' (numbers) or 'c' (currency names),
 	 * with what it inherits */
 	function entry(kind, tag) {
-		var cache = LOADED[kind], d, p;
+		var cache = LOADED[kind] || (LOADED[kind] = {}), d, p;
 
 		if (cache[tag])
 			return cache[tag];
@@ -1836,8 +1836,17 @@ var __vitaIntlNumber = function (W, N, C, install) {
 		return values ? values.call(this, key) : [];
 	};
 
+	/* what vita/js/intl_names.js builds on */
+	var shared = {
+		index: index, entry: entry, dataTag: dataTag, hasLocale: hasLocale,
+		hasPlural: hasPlural, resolveLocale: resolveLocale,
+		supported: supported, getOption: getOption, toObject: toObject,
+		method: method, rulesFor: rulesFor, category: category,
+		operands: operands
+	};
+
 	if (!install)
-		return;
+		return shared;
 
 	/* ---- Number's and BigInt's own ---- */
 
@@ -1867,12 +1876,14 @@ var __vitaIntlNumber = function (W, N, C, install) {
 			return formatter(arguments[0], arguments[1]).format(x);
 		});
 	}
+	return shared;
 };
 
 if (typeof window !== 'undefined' && window.__vitaIntl &&
     window.__vitaIntl.has && window.__vitaIntl.has('index') &&
     window.__vitaIntlCore && window.Intl)
-	__vitaIntlNumber(window, window.__vitaIntl, window.__vitaIntlCore, true);
+	window.__vitaIntl.number = __vitaIntlNumber(window, window.__vitaIntl,
+						   window.__vitaIntlCore, true);
 
 if (typeof module !== 'undefined')
 	module.exports = __vitaIntlNumber;
