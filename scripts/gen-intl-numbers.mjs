@@ -8,8 +8,10 @@
 // Write resources/intl.pak, the data Intl.NumberFormat and
 // Intl.PluralRules format with (vita/js/intl_number.js), and
 // Intl.RelativeTimeFormat and Intl.DisplayNames with
-// (vita/js/intl_names.js), and that Intl.Locale and every tag's
-// canonical form take (vita/js/intl_tags.js), from CLDR's JSON release.
+// (vita/js/intl_names.js), that Intl.Locale and every tag's canonical
+// form take (vita/js/intl_tags.js), and that Intl.ListFormat and
+// Intl.DurationFormat join lists with (vita/js/intl_list.js), from
+// CLDR's JSON release.
 // The Unicode CLDR data is under the Unicode licence, which is
 // GPL-compatible.
 //
@@ -19,7 +21,8 @@
 // calendar and collation preferences, time zones by region, scripts
 // written right to left), and for each CLDR locale n: (numbers), c:
 // (currency names), d: (names of languages, regions, scripts, variants
-// and calendars) and r: (relative times and the names of date fields).
+// and calendars), r: (relative times and the names of date fields) and
+// l: (list patterns).
 //
 // The pack holds one entry per CLDR locale, read only when a page asks
 // for that locale. A locale's entry is what it changes from its CLDR
@@ -31,14 +34,16 @@
 // their data from. Where ICU's data departs from CLDR's JSON, it is read
 // off ICU itself: the Arabic numbering systems' symbols, the order of a
 // currency's name and number, the list of currencies in use, the time
-// zones and collations Intl.Locale lists, and three language aliases.
+// zones and collations Intl.Locale lists, three language aliases, and
+// the locales Intl.ListFormat offers.
 //
 // Get the CLDR packages, at the version Node's ICU uses
 // (node -p process.versions.cldr), then run this under that Node:
 //
 //   mkdir cldr && cd cldr
 //   for p in cldr-core cldr-numbers-full cldr-units-full \
-//            cldr-localenames-full cldr-dates-full cldr-bcp47; do
+//            cldr-localenames-full cldr-dates-full cldr-bcp47 \
+//            cldr-misc-full; do
 //     npm pack $p@48.0.0 && mkdir $p && tar xzf $p-48.0.0.tgz -C $p
 //   done
 //   node scripts/gen-intl-numbers.mjs cldr > resources/intl.pak
@@ -62,7 +67,7 @@ const pkg = name => {
 };
 const NAMES = pkg('cldr-localenames-full'), DATES = pkg('cldr-dates-full');
 const CORE = pkg('cldr-core'), NUM = pkg('cldr-numbers-full'),
-	UNITS = pkg('cldr-units-full');
+	UNITS = pkg('cldr-units-full'), MISC = pkg('cldr-misc-full');
 const json = f => JSON.parse(fs.readFileSync(f, 'utf8'));
 const SUP = f => json(path.join(CORE, 'supplemental', f)).supplemental;
 const CLDR_VERSION = json(path.join(CORE, 'package.json')).version;
@@ -83,7 +88,7 @@ const UNIT_NAMES = ('acre bit byte celsius centimeter day degree ' +
 const SYMBOLS = ['decimal', 'group', 'currencyDecimal', 'currencyGroup',
 	'percentSign', 'plusSign', 'minusSign',
 	'exponential', 'perMille', 'infinity', 'nan', 'approximatelySign',
-	'superscriptingExponent'];
+	'superscriptingExponent', 'timeSeparator'];
 
 const FOLDERS = fs.readdirSync(path.join(NUM, 'main'));
 const parentMap = SUP('parentLocales.json').parentLocales.parentLocale;
@@ -264,6 +269,24 @@ function relativeData(tag) {
 				o.p = counts(e['relativeTime-type-past'],
 					     'relativeTimePattern');
 			out[field + (w || '-long')] = o;
+		}
+	}
+	return out;
+}
+
+// Intl.ListFormat's patterns, by type and style: [start, middle, end, 2]
+function listData(tag) {
+	const m = mainFile(MISC, tag, 'listPatterns.json');
+	const lp = m ? m.listPatterns : {}, out = {};
+	const TYPES = { standard: 'conjunction', or: 'disjunction', unit: 'unit' };
+
+	for (const t in TYPES) {
+		for (const w of ['', '-short', '-narrow']) {
+			const e = lp['listPattern-type-' + t + w];
+
+			if (e)
+				out[TYPES[t] + (w || '-long')] =
+					[e.start, e.middle, e.end, e['2']];
 		}
 	}
 	return out;
@@ -598,6 +621,7 @@ const get = t => {
 		cache[t] = numberData(t);
 		cache[t].display = displayData(t);
 		cache[t].relative = relativeData(t);
+		cache[t].list = listData(t);
 		arabicSymbols(t, cache[t].num);
 		currencyFormats(t, cache[t].num);
 		nameOrder(t, cache[t].num);
@@ -626,6 +650,7 @@ for (const t of [...used].sort()) {
 		mine.display;
 	entries['r:' + t] = p ? diff(get(p).relative, mine.relative) || {} :
 		mine.relative;
+	entries['l:' + t] = p ? diff(get(p).list, mine.list) || {} : mine.list;
 }
 
 // currency digits, and the numbering systems that are digits
@@ -645,9 +670,15 @@ for (const k in ns) {
 
 // Intl.supportedValuesOf('currency'): ICU's list of the currencies in
 // use, which CLDR does not keep as one
+// and the locales ICU has no list patterns of its own for, which
+// Intl.ListFormat does not offer: one it resolves to another
+const listed = new Set(Object.keys(index).filter(t =>
+	new Intl.ListFormat(t).resolvedOptions().locale === t));
+
 entries.index = {
 	cldr: CLDR_VERSION, locales: index, parents, digits, ns: nsDigits,
-	rc: regionCurrencies(), currencies: Intl.supportedValuesOf('currency')
+	rc: regionCurrencies(), currencies: Intl.supportedValuesOf('currency'),
+	nolist: Object.keys(index).filter(t => !listed.has(t))
 };
 entries.plurals = plurals();
 
