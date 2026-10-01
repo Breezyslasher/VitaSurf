@@ -227,7 +227,10 @@ var __vitaIntlNames = function (W, C, X) {
 				if (v.indexOf(v[i]) !== i)
 					throw new RangeError('invalid_argument');
 			}
-			return C.canonicalTag(code);
+			/* the canonical form has POSIX as a keyword, which ICU
+			 * names as the variant it was */
+			return C.canonicalTag(code).replace(/-u-va-posix$/,
+							    '-posix');
 		case 'region':
 			if (!/^([a-z]{2}|\d{3})$/i.test(code))
 				throw new RangeError('invalid_argument');

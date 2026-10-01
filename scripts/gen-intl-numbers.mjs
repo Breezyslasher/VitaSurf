@@ -8,13 +8,18 @@
 // Write resources/intl.pak, the data Intl.NumberFormat and
 // Intl.PluralRules format with (vita/js/intl_number.js), and
 // Intl.RelativeTimeFormat and Intl.DisplayNames with
-// (vita/js/intl_names.js), from CLDR's JSON release. The Unicode CLDR
-// data is under the Unicode licence, which is GPL-compatible.
+// (vita/js/intl_names.js), and that Intl.Locale and every tag's
+// canonical form take (vita/js/intl_tags.js), from CLDR's JSON release.
+// The Unicode CLDR data is under the Unicode licence, which is
+// GPL-compatible.
 //
-// Entries, by name: index (the locales and their parents), plurals, and
-// for each CLDR locale n: (numbers), c: (currency names), d: (names of
-// languages, regions, scripts, variants and calendars) and r: (relative
-// times and the names of date fields).
+// Entries, by name: index (the locales and their parents), plurals,
+// aliases (of languages, scripts, regions, variants, subdivisions and
+// keyword values), likely (likely subtags), locinfo (week, hour cycle,
+// calendar and collation preferences, time zones by region, scripts
+// written right to left), and for each CLDR locale n: (numbers), c:
+// (currency names), d: (names of languages, regions, scripts, variants
+// and calendars) and r: (relative times and the names of date fields).
 //
 // The pack holds one entry per CLDR locale, read only when a page asks
 // for that locale. A locale's entry is what it changes from its CLDR
@@ -25,14 +30,15 @@
 // ICU's aliases (en-US, sr-RS, zh-TW) point at the CLDR locale they take
 // their data from. Where ICU's data departs from CLDR's JSON, it is read
 // off ICU itself: the Arabic numbering systems' symbols, the order of a
-// currency's name and number, the list of currencies in use.
+// currency's name and number, the list of currencies in use, the time
+// zones and collations Intl.Locale lists, and three language aliases.
 //
 // Get the CLDR packages, at the version Node's ICU uses
 // (node -p process.versions.cldr), then run this under that Node:
 //
 //   mkdir cldr && cd cldr
 //   for p in cldr-core cldr-numbers-full cldr-units-full \
-//            cldr-localenames-full cldr-dates-full; do
+//            cldr-localenames-full cldr-dates-full cldr-bcp47; do
 //     npm pack $p@48.0.0 && mkdir $p && tar xzf $p-48.0.0.tgz -C $p
 //   done
 //   node scripts/gen-intl-numbers.mjs cldr > resources/intl.pak
@@ -644,6 +650,157 @@ entries.index = {
 	rc: regionCurrencies(), currencies: Intl.supportedValuesOf('currency')
 };
 entries.plurals = plurals();
+
+// ---- Intl.Locale and the canonical form of every tag ----
+
+const BCP47 = pkg('cldr-bcp47');
+
+// CLDR's aliases for UTS #35's canonical form: of languages (with the
+// variants and regions some rules take), scripts, regions, variants and
+// subdivisions, and of the values of -u- and -t- keywords
+function aliases() {
+	const a = SUP('aliases.json').metadata.alias;
+	const m = o => {
+		const out = {};
+
+		for (const k in o)
+			out[k] = o[k]._replacement;
+		return out;
+	};
+	const kw = {}, tkw = {};
+
+	for (const f of fs.readdirSync(path.join(BCP47, 'bcp47'))) {
+		const k = json(path.join(BCP47, 'bcp47', f)).keyword;
+
+		for (const [ext, into] of [['u', kw], ['t', tkw]]) {
+			for (const key in (k && k[ext]) || {}) {
+				const vals = k[ext][key];
+
+				for (const v in vals) {
+					if (v.startsWith('_'))
+						continue;
+					const e = vals[v];
+
+					for (const al of (e._deprecated ? '' : e._alias || '')
+						.split(' ')) {
+						if (/^[a-z\d]{3,8}(-[a-z\d]{3,8})*$/i.test(al) &&
+						    al.toLowerCase() !== v)
+							(into[key] = into[key] || {})[al.toLowerCase()] = v;
+					}
+					if (e._deprecated && e._preferred)
+						(into[key] = into[key] || {})[v] = e._preferred;
+				}
+			}
+		}
+	}
+	// and ICU's own where it departs from CLDR's JSON: it keeps bh and
+	// tw, and has sgn-NO as nsl
+	const lang = m(a.languageAlias);
+
+	for (const k in lang) {
+		let icu;
+
+		if (k.startsWith('und'))
+			continue;
+		try {
+			icu = Intl.getCanonicalLocales(k.replace(/_/g, '-'))[0];
+		} catch (e) {
+			continue;
+		}
+		if (icu === k.replace(/_/g, '-'))
+			delete lang[k];
+		else if (icu.toLowerCase() !==
+			 lang[k].replace(/_/g, '-').toLowerCase() &&
+			 Intl.getCanonicalLocales(lang[k].replace(/_/g, '-'))[0] !==
+			 icu)
+			lang[k] = icu;
+	}
+	return { l: lang, s: m(a.scriptAlias),
+		r: m(a.territoryAlias), v: m(a.variantAlias),
+		d: m(a.subdivisionAlias), u: kw, t: tkw };
+}
+
+// what Intl.Locale's getWeekInfo, getHourCycles, getCalendars,
+// getTimeZones, getCollations and getTextInfo answer from: CLDR's week,
+// time and calendar preferences by region, and from ICU itself the time
+// zones of each region, the collations of each locale and the scripts
+// written right to left
+function localeInfo() {
+	const w = SUP('weekData.json').weekData;
+	const DAYS = { mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6, sun: 7 };
+	const days = o => {
+		const out = {};
+
+		for (const r in o)
+			out[r] = DAYS[o[r]];
+		return out;
+	};
+	const num = o => {
+		const out = {};
+
+		for (const r in o)
+			out[r] = +o[r];
+		return out;
+	};
+	const hc = {}, t = SUP('timeData.json').timeData;
+	const HC = { h: 'h12', H: 'h23', K: 'h11', k: 'h24' };
+
+	for (const k in t)
+		hc[k] = HC[t[k]._preferred];
+	const CAL = { gregorian: 'gregory', 'ethiopic-amete-alem': 'ethioaa' };
+	const cal = {}, pref = SUP('calendarPreferenceData.json')
+		.calendarPreferenceData;
+
+	for (const r in pref)
+		cal[r] = pref[r].map(c => CAL[c] || c);
+	const regions = Object.keys(json(path.join(NAMES, 'main', 'en',
+		'territories.json')).main.en.localeDisplayNames.territories)
+		.filter(r => /^([A-Z]{2}|\d{3})$/.test(r));
+	const tz = {};
+
+	// every region, so that rg and sd are read as ICU reads them
+	for (const r of regions)
+		tz[r] = new Intl.Locale('und-' + r).timeZones || [];
+	// a locale's collations are its own, or those of the first of its
+	// fallbacks that has some, where a script the language is not likely
+	// written in falls back to root (vita/js/intl_tags.js); kept where
+	// that does not give what ICU has
+	const coll = {}, root = new Intl.Locale('und').collations.join(' ');
+	const fallback = tag => {
+		for (let p = tag; p; p = p.lastIndexOf('-') > 0 ?
+		     p.slice(0, p.lastIndexOf('-')) : null) {
+			const q = p.split('-');
+
+			if (coll[p] !== undefined)
+				return coll[p];
+			if (q.length === 2 && q[1].length === 4 &&
+			    new Intl.Locale(q[0]).maximize().script !== q[1])
+				return root;
+		}
+		return root;
+	};
+
+	for (const tag of ICU.slice().sort((a, b) => a.length - b.length)) {
+		const c = new Intl.Locale(tag).collations.join(' ');
+
+		if (c !== fallback(tag))
+			coll[tag] = c;
+	}
+	const rtl = Object.keys(json(path.join(NAMES, 'main', 'en',
+		'scripts.json')).main.en.localeDisplayNames.scripts)
+		.filter(s => /^[A-Z][a-z]{3}$/.test(s) &&
+			new Intl.Locale('und-' + s).textInfo.direction === 'rtl');
+
+	return {
+		first: days(w.firstDay), start: days(w.weekendStart),
+		end: days(w.weekendEnd), min: num(w.minDays), hc, cal, tz,
+		coll, collRoot: root, rtl
+	};
+}
+
+entries.aliases = aliases();
+entries.likely = SUP('likelySubtags.json').likelySubtags;
+entries.locinfo = localeInfo();
 
 // ---- write ----
 

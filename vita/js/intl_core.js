@@ -19,10 +19,18 @@ var __vitaIntlCore = (function () {
 
 	var LANGTAG = /^[a-z]{2,3}(-[a-z]{4})?(-([a-z]{2}|\d{3}))?(-([a-z\d]{5,8}|\d[a-z\d]{3}))*(-[a-wyz\d](-[a-z\d]{2,8})+)*(-x(-[a-z\d]{1,8})+)?$/i;
 
+	/* the full canonicalization, once vita/js/intl_tags.js is in */
+	var CANON = null, LOCALE_TAG = null;
+
 	function canonicalTag(tag) {
 		if (typeof tag !== 'string' && (typeof tag !== 'object' ||
 		    tag === null))
 			throw new TypeError('Locale must be a string or object');
+		if (CANON) {
+			var held = typeof tag === 'object' && LOCALE_TAG(tag);
+
+			return held || CANON(String(tag));
+		}
 		tag = String(tag);
 		if (!LANGTAG.test(tag))
 			throw new RangeError('Incorrect locale information ' +
@@ -48,6 +56,14 @@ var __vitaIntlCore = (function () {
 
 	var LISTS = new Map();
 
+	/* f canonicalizes a tag; localeTag gives an Intl.Locale's tag, or
+	 * null for anything else */
+	function setCanonical(f, localeTag) {
+		CANON = f;
+		LOCALE_TAG = localeTag;
+		LISTS.clear();
+	}
+
 	function localeList(locales) {
 		var out = [], i;
 
@@ -62,10 +78,10 @@ var __vitaIntlCore = (function () {
 			}
 			return [LISTS.get(locales)];
 		}
-		if (typeof locales === 'string' ||
-		    (typeof Intl !== 'undefined' && Intl.Locale &&
-		     locales instanceof Intl.Locale))
-			locales = [String(locales)];
+		if (LOCALE_TAG ? typeof locales === 'object' && locales !== null &&
+		    LOCALE_TAG(locales) : typeof Intl !== 'undefined' &&
+		    Intl.Locale && locales instanceof Intl.Locale)
+			locales = [locales];
 		locales = Object(locales);
 		for (i = 0; i < (locales.length >>> 0); i++) {
 			if (!(i in locales))
@@ -120,6 +136,7 @@ var __vitaIntlCore = (function () {
 
 	return {
 		canonicalTag: canonicalTag,
+		setCanonical: setCanonical,
 		localeList: localeList,
 		splitTag: splitTag,
 		lookup: lookup
