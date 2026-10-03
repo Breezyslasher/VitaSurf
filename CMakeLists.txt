@@ -146,7 +146,8 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/intl_number.js
         vita/js/intl_names.js
         vita/js/intl_tags.js
-        vita/js/intl_list.js)
+        vita/js/intl_list.js
+        vita/js/intl_collator.js)
     set(PRELUDE_BYTES "")
     foreach(part ${PRELUDE_PARTS})
         set(full "${CMAKE_SOURCE_DIR}/${part}")

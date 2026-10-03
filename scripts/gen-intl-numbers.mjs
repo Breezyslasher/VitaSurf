@@ -11,7 +11,8 @@
 // (vita/js/intl_names.js), that Intl.Locale and every tag's canonical
 // form take (vita/js/intl_tags.js), and that Intl.ListFormat and
 // Intl.DurationFormat join lists with (vita/js/intl_list.js), from
-// CLDR's JSON release.
+// CLDR's JSON release; and, given ICU's data as well, what Intl.Collator
+// sorts with (vita/js/intl_collator.js, scripts/gen-intl-collation.mjs).
 // The Unicode CLDR data is under the Unicode licence, which is
 // GPL-compatible.
 //
@@ -22,7 +23,7 @@
 // written right to left), and for each CLDR locale n: (numbers), c:
 // (currency names), d: (names of languages, regions, scripts, variants
 // and calendars), r: (relative times and the names of date fields) and
-// l: (list patterns).
+// l: (list patterns), and the collation entries, k:.
 //
 // The pack holds one entry per CLDR locale, read only when a page asks
 // for that locale. A locale's entry is what it changes from its CLDR
@@ -46,7 +47,10 @@
 //            cldr-misc-full; do
 //     npm pack $p@48.0.0 && mkdir $p && tar xzf $p-48.0.0.tgz -C $p
 //   done
-//   node scripts/gen-intl-numbers.mjs cldr > resources/intl.pak
+//   curl -LO https://github.com/unicode-org/icu/releases/download/\
+//   release-78.2/icu4c-78.2-data.zip   (the ICU version Node has)
+//   unzip -q icu4c-78.2-data.zip -d icu
+//   node scripts/gen-intl-numbers.mjs cldr icu/data > resources/intl.pak
 //
 // Pack format, all integers little-endian:
 //   "VSIP" u32 entries, then per entry: u8 name length, name,
@@ -827,6 +831,14 @@ function localeInfo() {
 		end: days(w.weekendEnd), min: num(w.minDays), hc, cal, tz,
 		coll, collRoot: root, rtl
 	};
+}
+
+// Intl.Collator's, from ICU's data when its directory is given
+if (process.argv[3]) {
+	const { collationEntries } = await import('./gen-intl-collation.mjs');
+
+	Object.assign(entries, collationEntries(process.argv[3],
+		Object.keys(index)));
 }
 
 entries.aliases = aliases();
