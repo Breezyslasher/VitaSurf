@@ -12553,9 +12553,11 @@ static size_t prelude_bc_len;
  * (VitaSurf). The cache is keyed by URL and checks the source's hash, so
  * a build whose prelude has changed misses and compiles once more. It
  * carries no '<' because the cache uses that to mean a script with no
- * URL of its own, which is what the prelude used to count as.
+ * URL of its own, which is what the prelude used to count as. The
+ * name changed when the source text left the prelude's bytecode
+ * (prelude_strip_source), so a copy that still carries it is not read.
  */
-#define PRELUDE_URL "vitasurf:prelude"
+#define PRELUDE_URL "vitasurf:prelude-nosrc"
 static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
 				    const char *spec,
 				    JSValueConst *resolving_funcs,
@@ -12570,6 +12572,36 @@ static JSValue bc_load_module(JSContext *ctx, const char *url,
 static void bc_store_module(JSContext *ctx, const char *url,
 			    const char *src, size_t srclen, JSValueConst fn);
 static void bc_index_flush(void);
+
+/*
+ * The prelude's compiled form without its source text (VitaSurf). The
+ * bytecode kept a copy of all 900 KB of it, for Function.prototype.
+ * toString, and every page and frame read that copy back into its own
+ * heap. Without it a prelude function prints as a built-in does in a
+ * browser, "function name() { [native code] }", which is what the
+ * functions it stands in for are. Line numbers stay, for the log.
+ */
+static JSValue prelude_strip_source(JSContext *ctx, JSValue fn)
+{
+	uint8_t *out;
+	size_t out_len = 0;
+	JSValue stripped;
+
+	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE |
+			     JS_WRITE_OBJ_STRIP_SOURCE);
+	if (out == NULL) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return fn;
+	}
+	stripped = JS_ReadObject(ctx, out, out_len, JS_READ_OBJ_BYTECODE);
+	js_free(ctx, out);
+	if (JS_IsException(stripped)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return fn;
+	}
+	JS_FreeValue(ctx, fn);
+	return stripped;
+}
 
 static bool setup_globals(jsthread *thread)
 {
@@ -12878,6 +12910,7 @@ static bool setup_globals(jsthread *thread)
 					     JS_EVAL_TYPE_GLOBAL |
 					     JS_EVAL_FLAG_COMPILE_ONLY);
 				if (!JS_IsException(fn)) {
+					fn = prelude_strip_source(ctx, fn);
 					bc_store(ctx, PRELUDE_URL, src, len,
 						 fn);
 				}
@@ -14487,11 +14520,13 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 	long len;
 	FILE *f;
 	JSValue out;
+	uint64_t t0, t1, t2;
 
 	(void)this_val; (void)argc; (void)argv;
 	if (thread == NULL || thread->htmlc == NULL) {
 		return JS_NULL;
 	}
+	t0 = now_ms();
 	origin = origin_of(thread->htmlc->base_url);
 	if (origin == NULL) {
 		return JS_NULL;
@@ -14521,8 +14556,24 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 	}
 	fclose(f);
 	buf[len] = 0;
-	out = JS_NewStringLen(ctx, buf, (size_t)len);
+	/*
+	 * Parsed here rather than handed over as text, so the log can say
+	 * what a site's storage costs (VitaSurf): a dashboard's first
+	 * promise job spent half a second inside this call and nothing
+	 * said whether the card or the parse was the slow part. The file
+	 * is the whole origin, localStorage and IndexedDB together.
+	 */
+	t1 = now_ms();
+	out = JS_ParseJSON(ctx, buf, (size_t)len, "<storage>");
 	free(buf);
+	if (JS_IsException(out)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		out = JS_NULL;
+	}
+	t2 = now_ms();
+	vita_log("storage: %u KB read in %u ms, parsed in %u ms",
+		 (unsigned)(len / 1024), (unsigned)(t1 - t0),
+		 (unsigned)(t2 - t1));
 	return out;
 }
 

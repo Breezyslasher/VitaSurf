@@ -7778,6 +7778,28 @@ stampConsts(P);
    var d=W.__vitaParseDocument?W.__vitaParseDocument(''):null;
    if(d){var de=d.documentElement;if(de)d.removeChild(de);return d;}
    return D.createDocumentFragment();}};
+ /* What every interface built from one old constructor carries: its
+    own properties, then the node type constants over them, as one set
+    of descriptors made once (VitaSurf). Seventy interfaces copied them
+    one call at a time, a few thousand calls on every page. */
+ var CARRIED=[];
+ function carried(from){
+  var i,d,names,k;
+  for(i=0;i<CARRIED.length;i++)if(CARRIED[i][0]===from)return CARRIED[i][1];
+  d={};
+  names=from?Object.getOwnPropertyNames(from):[];
+  for(i=0;i<names.length;i++){k=names[i];
+   if(k==='prototype'||k==='length'||k==='name'||k==='caller'||
+      k==='arguments')continue;
+   d[k]=Object.getOwnPropertyDescriptor(from,k);}
+  /* as stampConsts would redefine them: a data property keeps whether
+     it was writable */
+  Object.keys(NODE_CONSTS).forEach(function(k){
+   var was=d[k];
+   d[k]={configurable:true,enumerable:true,value:NODE_CONSTS[k]};
+   if(was&&'value' in was)d[k].writable=was.writable;});
+  CARRIED.push([from,d]);
+  return d;}
  function iface(name,test,from,make){
   var F=make?function(a){return make(a);}
             :function(){return CEBase.apply(this,arguments);};
@@ -7788,14 +7810,16 @@ stampConsts(P);
   /* keep whatever the old constructor carried -- Node.ELEMENT_NODE and
      the rest of the node type constants live there, and code reads
      them by name */
-  if(from)Object.getOwnPropertyNames(from).forEach(function(k){
-   if(k==='prototype'||k==='length'||k==='name'||k==='caller'||
-      k==='arguments')return;
-   try{Object.defineProperty(F,k,
-    Object.getOwnPropertyDescriptor(from,k));}catch(e){}});
+  try{Object.defineProperties(F,carried(from));}
+  catch(e){
+   if(from)Object.getOwnPropertyNames(from).forEach(function(k){
+    if(k==='prototype'||k==='length'||k==='name'||k==='caller'||
+       k==='arguments')return;
+    try{Object.defineProperty(F,k,
+     Object.getOwnPropertyDescriptor(from,k));}catch(e2){}});
+   stampConsts(F);}
   try{Object.defineProperty(F,Symbol.hasInstance,
    {configurable:true,value:test});}catch(e){}
-  stampConsts(F);
   return F;}
  function ofType(types){
   /* in C when the bindings have it (VitaSurf) */

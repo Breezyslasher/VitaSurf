@@ -29,9 +29,10 @@ function readStore(){
  if (store !== null) return store;
  store = { local: {}, idb: {} };
  try {
-  var text = load ? load() : null;
-  if (text) {
-   var got = JSON.parse(text);
+  /* the bindings parse it (vita/js/qjs.c), so the log can time it */
+  var got = load ? load() : null;
+  if (typeof got === 'string') got = JSON.parse(got);
+  if (got) {
    if (got && typeof got === 'object') {
     if (got.local && typeof got.local === 'object') store.local = got.local;
     if (got.idb && typeof got.idb === 'object') store.idb = got.idb;
