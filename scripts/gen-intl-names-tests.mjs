@@ -23,7 +23,7 @@ export const LOCALES = ['en', 'en-GB', 'en-IN', 'de', 'de-CH', 'fr', 'es',
 	'es-419', 'it', 'pt', 'pt-PT', 'nl', 'sv', 'pl', 'ru', 'uk', 'tr', 'ar',
 	'ar-EG', 'he', 'fa', 'hi', 'bn', 'ja', 'zh', 'zh-TW', 'zh-HK', 'ko',
 	'th', 'vi', 'id', 'sw', 'cy', 'ga', 'mt', 'ps', 'my', 'sr-Latn', 'und',
-	'xx-YY', 'en-u-nu-arab'];
+	'xx-YY', 'en-u-nu-arab', 'kgp', 'af-NA'];
 
 const LANGUAGES = ['en', 'en-US', 'en-GB', 'en-AU', 'en-Latn', 'en-Latn-US',
 	'en-US-posix', 'en-GB-oxendict', 'de', 'de-AT', 'de-CH', 'de-CH-1996',
@@ -32,16 +32,18 @@ const LANGUAGES = ['en', 'en-US', 'en-GB', 'en-AU', 'en-Latn', 'en-Latn-US',
 	'zh-TW', 'sr-Latn', 'sr-Latn-RS', 'sr-ME', 'sr-Cyrl-ME', 'ar-001',
 	'ar-EG', 'hi-Latn', 'hi-Latn-IN', 'yue', 'tlh', 'und', 'und-US', 'xx',
 	'xx-YY', 'xx-Latn', 'en-ZZ', 'en-Zzzz', 'ku-Arab', 'az-Arab', 'ca-ES',
-	'sw-CD', 'ro-MD', 'nds-NL', 'fa-AF', 'EN-us', 'zh-hant-tw'];
+	'sw-CD', 'ro-MD', 'nds-NL', 'fa-AF', 'EN-us', 'zh-hant-tw',
+	'ca-ES-valencia', 'sl-rozaj', 'sl-rozaj-biske', 'sl-IT-rozaj-biske-1994'];
 const REGIONS = ['CA', 'US', 'GB', 'DE', 'JP', '419', '001', '150', 'ZZ',
-	'XA', 'HK', 'MO', 'CD', 'CG', 'PS', 'EU', 'UN', 'TW', 'QO', 'AQ'];
+	'XA', 'HK', 'MO', 'CD', 'CG', 'PS', 'EU', 'UN', 'TW', 'QO', 'AQ',
+	'UK', 'BU', 'SU', 'DD', 'YU', 'AN', 'ZR'];
 const SCRIPTS = ['Latn', 'Arab', 'Hans', 'Hant', 'Cyrl', 'Zzzz', 'Cans',
 	'Xsux', 'Qaaa', 'Zxxx', 'Jpan', 'Rohg', 'Brai'];
 const CURRENCIES = ['USD', 'usd', 'EUR', 'JPY', 'GBP', 'CHF', 'XAU', 'XYZ',
 	'BTC'];
 const CALENDARS = ['gregory', 'buddhist', 'chinese', 'islamic',
 	'islamic-civil', 'islamic-umalqura', 'ethioaa', 'ethiopic', 'japanese',
-	'roc', 'iso8601', 'persian', 'hebrew', 'dangi', 'nocal'];
+	'roc', 'iso8601', 'persian', 'hebrew', 'dangi', 'nocal', 'islamicc'];
 const FIELDS = ['era', 'year', 'quarter', 'month', 'weekOfYear', 'weekday',
 	'day', 'dayPeriod', 'hour', 'minute', 'second', 'timeZoneName'];
 const BAD = {

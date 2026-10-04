@@ -225,6 +225,13 @@ function displayData(tag) {
 		return out;
 	};
 	const l = split(ln('languages.json', 'languages'));
+	// ICU names root (und) in some locales where CLDR's JSON does not
+	const dn = new Intl.DisplayNames(tag, { type: 'language', fallback: 'none' });
+	const rootName = dn.resolvedOptions().locale === tag ? dn.of('und') :
+		undefined;
+
+	if (rootName !== undefined && l.n.root === undefined)
+		l.n.root = rootName;
 	const t = split(ln('territories.json', 'territories'));
 	const sc = split(ln('scripts.json', 'scripts'));
 	const ldn = mainFile(NAMES, tag, 'localeDisplayNames.json');

@@ -182,8 +182,14 @@ var __vitaIntlNames = function (W, C, X) {
 	};
 	/* the BCP 47 calendar names CLDR names otherwise */
 	var CALENDARS = {
-		gregory: 'gregorian', ethioaa: 'ethiopic-amete-alem',
-		islamicc: 'islamic-civil'
+		gregory: 'gregorian', ethioaa: 'ethiopic-amete-alem'
+	};
+	/* the region codes ICU's locales replace (uloc.cpp's
+	 * DEPRECATED_COUNTRIES), which it names as their replacements */
+	var OLD_REGIONS = {
+		AN: 'CW', BU: 'MM', CS: 'RS', DD: 'DE', DY: 'BJ', FX: 'FR',
+		HV: 'BF', NH: 'VU', RH: 'ZW', SU: 'RU', TP: 'TL', UK: 'GB',
+		VD: 'VN', YD: 'YE', YU: 'RS', ZR: 'CD'
 	};
 
 	function DisplayNames() {
@@ -342,11 +348,13 @@ var __vitaIntlNames = function (W, C, X) {
 			missing = missing || n === undefined;
 			rest.push(bracket(n !== undefined ? n : region));
 		}
-		for (i = 0; i < variants.length; i++) {
-			n = own(d.V, variants[i].toUpperCase());
+		/* ICU names the variants as one, so two or more have no
+		 * name and show as their code */
+		if (variants.length) {
+			variants = variants.join('_').toUpperCase();
+			n = own(d.V, variants);
 			missing = missing || n === undefined;
-			rest.push(bracket(n !== undefined ? n :
-					  variants[i].toUpperCase()));
+			rest.push(bracket(n !== undefined ? n : variants));
 		}
 		if (none && missing)
 			return undefined;
@@ -366,7 +374,11 @@ var __vitaIntlNames = function (W, C, X) {
 		case 'language':
 			return languageName(s, X.entry('d', X.dataTag(s.tag)), code);
 		case 'region':
-			return regionName(X.entry('d', X.dataTag(s.tag)), code, s.style);
+			/* ICU finds a replaced code's name under its
+			 * replacement, but not its short name */
+			n = own(OLD_REGIONS, code);
+			return regionName(X.entry('d', X.dataTag(s.tag)), n || code,
+					  n ? 'long' : s.style);
 		case 'script':
 			return scriptName(X.entry('d', X.dataTag(s.tag)), code, s.style);
 		case 'calendar':
