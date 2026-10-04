@@ -844,6 +844,14 @@ var __vitaIntlTags = function (W, N, C, X) {
 	Object.defineProperty(Locale, 'prototype', { writable: false });
 
 	Intl.Locale = Locale;
+	/* for vita/js/intl.js: a tag's likely language, script and region
+	 * (UTS #35 Add Likely Subtags), or null */
+	X.likely = function (tag) {
+		var m = likely(parse(tag));
+
+		return m ? { lang: m.lang, script: titleCase(m.script),
+			     region: m.region.toUpperCase() } : null;
+	};
 	C.setCanonical(canonicalize, function (o) {
 		var s = SLOTS.get(o);
 

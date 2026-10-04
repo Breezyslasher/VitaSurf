@@ -6,132 +6,606 @@
  */
 
 /*
- * Intl.DateTimeFormat (VitaSurf).
+ * Intl.DateTimeFormat (VitaSurf), for every locale ICU has.
  *
- * The options are read as ECMA-402 reads them, the pattern is chosen by
- * vita/js/intl_pattern.js as ICU would choose it, and the time is
- * formatted in C (vita/js/intl.c) in any IANA time zone. It replaces
- * the prelude's stand-in, which a page could tell apart from the real
- * thing -- no formatToParts on the prototype, no dateStyle, no time
- * zones -- and Home Assistant told apart and polyfilled, at the cost of
- * eight seconds of a cold load. Only English locales have data; a page
- * that asks for another gets English, and supportedLocalesOf says so.
+ * V8's DateTimeFormat, step by step from its js-date-time-format.cc: the
+ * options read as ECMA-402 reads them, the hour cycle chosen as V8
+ * chooses it, the pattern from ICU's DateTimePatternGenerator or the
+ * locale's date and time styles, and the time written as ICU's
+ * SimpleDateFormat writes it, with ICU's names and numbering systems.
+ * The generator, the names and the resource lookups behind them are
+ * vita/js/intl_pattern.js, over ICU's own locale data in
+ * resources/intl.pak; time zones, their offsets and names are
+ * vita/js/intl_zone.js's, calendars other than the Gregorian one
+ * vita/js/intl_calendar.js's, and formatRange vita/js/intl_range.js's.
+ * Where V8 and ICU write something, so does this, ICU's failures and
+ * all, except where V8 itself fails.
+ *
+ * Runs under Node too, to be held against V8: __vitaIntlDate(W, N, C, X,
+ * P, Z, K, R) builds DateTimeFormat onto W.Intl from the pack reader (N),
+ * vita/js/intl_core.js (C), what __vitaIntlNumber returned (X), the
+ * pattern, zone and calendar modules, and the range module's factory.
  */
-(function () {
+var __vitaIntlDate = function (W, N, C, X, P, Z, K, R) {
 	'use strict';
-	var W = window, N = W.__vitaIntl, P = W.__vitaIntlPattern,
-		C = W.__vitaIntlCore;
 
-	if (!N || !P || !C || !W.Intl)
-		return;
-
-	var TAGS = N.locales(), DATA = [];
-	var FIELDS = ['weekday', 'era', 'year', 'month', 'day', 'dayPeriod',
-		'hour', 'minute', 'second', 'fractionalSecondDigits',
-		'timeZoneName'];
-	var VALUES = {
-		weekday: ['narrow', 'short', 'long'],
-		era: ['narrow', 'short', 'long'],
-		year: ['2-digit', 'numeric'],
-		month: ['2-digit', 'numeric', 'narrow', 'short', 'long'],
-		day: ['2-digit', 'numeric'],
-		dayPeriod: ['narrow', 'short', 'long'],
-		hour: ['2-digit', 'numeric'],
-		minute: ['2-digit', 'numeric'],
-		second: ['2-digit', 'numeric'],
-		timeZoneName: ['short', 'long', 'shortOffset', 'longOffset',
-			'shortGeneric', 'longGeneric']
+	var Intl = W.Intl, getOption = X.getOption, method = X.method;
+	var own = function (o, k) {
+		return Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined;
 	};
-	var STYLES = ['full', 'long', 'medium', 'short'];
-	var HC_CHAR = { h11: 'K', h12: 'h', h23: 'H', h24: 'k' };
-	var UTC_NAMES = { 'Etc/UTC': 1, 'Etc/GMT': 1 };
 
-	function data(i) {
-		return DATA[i] || (DATA[i] = N.data(i));
+	/* ---- calendars ---- */
+
+	var CALENDARS = ['buddhist', 'chinese', 'coptic', 'dangi', 'ethioaa',
+		'ethiopic', 'gregory', 'hebrew', 'indian', 'islamic',
+		'islamic-civil', 'islamic-rgsa', 'islamic-tbla', 'islamic-umalqura',
+		'iso8601', 'japanese', 'persian', 'roc'];
+	var TO_ICU = { gregory: 'gregorian', ethioaa: 'ethiopic-amete-alem' };
+	var TO_BCP = { gregorian: 'gregory', 'ethiopic-amete-alem': 'ethioaa' };
+
+	function icuCalendar(bcp) {
+		return TO_ICU[bcp] || bcp;
+	}
+
+	function bcpCalendar(icu) {
+		return TO_BCP[icu] || icu;
+	}
+
+	/* days from 1970-01-01 to a proleptic Gregorian date */
+	function daysFromCivil(y, m, d) {
+		y -= m <= 2 ? 1 : 0;
+		var era = Math.floor(y / 400), yoe = y - era * 400;
+		var doy = Math.floor((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1;
+		var doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) +
+			doy;
+
+		return era * 146097 + doe - 719468;
+	}
+
+	function civilFromDays(z) {
+		z += 719468;
+		var era = Math.floor(z / 146097), doe = z - era * 146097;
+		var yoe = Math.floor((doe - Math.floor(doe / 1460) +
+			Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+		var y = yoe + era * 400, doy = doe - (365 * yoe + Math.floor(yoe / 4) -
+			Math.floor(yoe / 100)), mp = Math.floor((5 * doy + 2) / 153);
+		var d = doy - Math.floor((153 * mp + 2) / 5) + 1;
+		var m = mp + (mp < 10 ? 3 : -9);
+
+		return [y + (m <= 2 ? 1 : 0), m, d];
+	}
+
+	/*
+	 * A moment's calendar fields, as ICU's Calendar has them: era, year
+	 * (of the era), extended year, month (0 first), leap month, day of
+	 * the month, related Gregorian year. V8 makes the Gregorian calendar
+	 * proleptic; the others are vita/js/intl_calendar.js's.
+	 */
+	function dateFields(type, days, utc, week) {
+		if (type !== 'gregorian' && type !== 'iso8601')
+			return K.fields(type, days, utc, week);
+		var c = civilFromDays(days);
+
+		return { era: c[0] > 0 ? 1 : 0, year: c[0] > 0 ? c[0] : 1 - c[0],
+			ext: c[0], month: c[1] - 1, leap: 0, day: c[2], related: c[0],
+			dayOfYear: days - daysFromCivil(c[0], 1, 1) + 1 };
 	}
 
 	/* ---- locales ---- */
 
-	var localeList = C.localeList, splitTag = C.splitTag;
+	/* the ICU locale ID of a tag: its language, script, region and
+	 * variants as ICU writes them */
+	function icuId(tag) {
+		var p = tag.split('-'), out = [p[0].toLowerCase()], i = 1;
 
-	/* the tag we have data for that a tag falls back to, by dropping
-	 * subtags from the end */
-	function available(base) {
-		return C.lookup(base, function (t) {
-			var i;
+		if (p[i] && p[i].length === 4 && /^[a-z]/i.test(p[i]))
+			out.push(p[i].charAt(0).toUpperCase() +
+				 p[i++].slice(1).toLowerCase());
+		if (p[i] && /^([a-z]{2}|\d{3})$/i.test(p[i]))
+			out.push(p[i++].toUpperCase());
+		for (; i < p.length; i++)
+			out.push(p[i].toUpperCase());
+		return out[0] === 'und' && out.length === 1 ? 'root' :
+			out.join('_');
+	}
 
-			for (i = 0; i < TAGS.length; i++) {
-				if (TAGS[i].toLowerCase() === t.toLowerCase())
-					return { idx: i, tag: TAGS[i] };
+	/* ECMA-402 ResolveLocale over ca, nu and hc: the locale, and the
+	 * keywords it keeps */
+	function resolve(requested) {
+		var i, found = null, kw = {};
+
+		for (i = 0; i < requested.length && !found; i++) {
+			var s = C.splitTag(requested[i]);
+
+			found = C.lookup(s.base, X.hasLocale);
+			if (found)
+				kw = s.kw;
+		}
+		if (!found) {
+			found = C.lookup((W.navigator && W.navigator.language) ||
+					 'en-US', X.hasLocale) || 'en-US';
+			kw = {};
+		}
+		var ext = {};
+
+		if (kw.ca !== undefined && CALENDARS.indexOf(kw.ca) >= 0)
+			ext.ca = kw.ca;
+		if (kw.nu !== undefined && own(X.index().ns, kw.nu))
+			ext.nu = kw.nu;
+		if (kw.hc !== undefined && HC_CHAR[kw.hc])
+			ext.hc = kw.hc;
+		return { locale: found, ext: ext };
+	}
+
+	function localeString(base, ext) {
+		var s = '';
+
+		if (ext.ca)
+			s += '-ca-' + ext.ca;
+		if (ext.hc)
+			s += '-hc-' + ext.hc;
+		if (ext.nu)
+			s += '-nu-' + ext.nu;
+		return s ? base + '-u' + s : base;
+	}
+
+	/* the language and region ICU takes a locale's preferences by: its
+	 * own, or its likely ones where it has none */
+	var LIKELY = {};
+
+	function langRegion(tag) {
+		if (LIKELY[tag])
+			return LIKELY[tag];
+		var p = icuId(tag).split('_'), lang = p[0], region = null, i;
+
+		for (i = 1; i < p.length; i++) {
+			if (/^([A-Z]{2}|\d{3})$/.test(p[i]))
+				region = p[i];
+		}
+		if (!region || !lang) {
+			var m = X.likely ? X.likely(tag) : null;
+
+			if (m) {
+				lang = m.lang;
+				region = m.region;
 			}
-			if (t.toLowerCase() === 'en-us')
-				return { idx: 0, tag: 'en-US' };
-			return null;
-		});
-	}
-
-	function defaultLocale() {
-		var l = (W.navigator && W.navigator.language) || 'en-US';
-
-		return available(l) ? l : 'en';
-	}
-
-	function resolveLocale(requested) {
-		var i;
-
-		for (i = 0; i < requested.length; i++) {
-			var s = splitTag(requested[i]), a = available(s.base);
-
-			if (a)
-				return { idx: a.idx, tag: a.tag, kw: s.kw };
 		}
-		var d = available(defaultLocale());
-
-		return { idx: d.idx, tag: d.tag, kw: {} };
+		return (LIKELY[tag] = { lang: lang, region: region || '001' });
 	}
 
-	function supported(locales, options) {
-		var req = localeList(locales), out = [], i;
+	/* Calendar::getCalendarTypeForLocale: the keyword's, else the first
+	 * the region prefers */
+	var INFO = null;
 
-		if (options !== undefined) {
-			options = Object(options);
-			getOption(options, 'localeMatcher',
-				  ['lookup', 'best fit'], 'best fit');
+	function calendarOf(tag, ca) {
+		if (ca)
+			return icuCalendar(ca);
+		if (!INFO)
+			INFO = JSON.parse(N.pak('locinfo'));
+		var prefs = own(INFO.cal, langRegion(tag).region) ||
+			INFO.cal['001'];
+
+		return icuCalendar(prefs[0]);
+	}
+
+	/* the calendar's week: its first day (1 for Sunday) and the days
+	 * the first week needs, by the locale's region */
+	function weekData(tag) {
+		if (!INFO)
+			INFO = JSON.parse(N.pak('locinfo'));
+		var r = langRegion(tag).region;
+		var first = own(INFO.first, r), min = own(INFO.min, r);
+
+		return { first: (first === undefined ? INFO.first['001'] : first) %
+			7 + 1, min: min === undefined ? INFO.min['001'] : min };
+	}
+
+	var HC_CHAR = { h11: 'K', h12: 'h', h23: 'H', h24: 'k' };
+	var CHAR_HC = { K: 'h11', h: 'h12', H: 'h23', k: 'h24' };
+	var HOURS = null;
+
+	/* getAllowedHourFormats: the hour symbol a locale prefers */
+	function hourChar(tag, hc) {
+		if (hc)
+			return HC_CHAR[hc];
+		if (!HOURS)
+			HOURS = JSON.parse(N.pak('dt:hours'));
+		var lr = langRegion(tag);
+		var v = own(HOURS, lr.lang + '_' + lr.region) ||
+			own(HOURS, lr.region);
+
+		return v && HC_CHAR[CHAR_HC[v]] ? v : 'H';
+	}
+
+	/* the numbering system and its symbols */
+	function numbering(tag, nu) {
+		var data = X.entry('n', X.dataTag(tag));
+
+		nu = nu || data.nu;
+		var sym = (data.S && (data.S[nu] || data.S.latn)) || {};
+
+		return { nu: nu, digits: Array.from(X.index().ns[nu] ||
+			'0123456789'), decimal: sym.decimal || '.',
+			minus: sym.minusSign || '-' };
+	}
+
+	/* ---- the pattern ---- */
+
+	var GENERATORS = {};
+
+	/* the DateTimePatternGenerator for an ICU locale */
+	function generator(loc, noStd) {
+		var key = loc.name + '/' + loc.cal + '/' + loc.calType + '/' +
+			loc.hour + '/' + loc.decimal + (noStd ? '/n' : '');
+
+		if (!GENERATORS[key]) {
+			if (Object.keys(GENERATORS).length >= 8)
+				GENERATORS = {};
+			GENERATORS[key] = new P.Generator(loc, noStd);
 		}
-		for (i = 0; i < req.length; i++) {
-			if (available(splitTag(req[i]).base))
-				out.push(req[i]);
+		return GENERATORS[key];
+	}
+
+	/* ReplaceHourCycleInPattern */
+	function replaceHourCycle(pattern, hc) {
+		if (!hc)
+			return pattern;
+		var to = HC_CHAR[hc], out = '', replace = true, last = '', i;
+
+		for (i = 0; i < pattern.length; i++) {
+			var c = pattern.charAt(i);
+
+			if (c === "'") {
+				replace = !replace;
+				out += c;
+			} else if (c === 'H' || c === 'h' || c === 'K' || c === 'k') {
+				if (replace && last === 'd')
+					out += ' ';
+				out += replace ? to : c;
+			} else {
+				out += c;
+			}
+			last = c;
 		}
 		return out;
 	}
 
-	function getOption(o, name, allowed, fallback) {
-		var v = o[name];
+	function hourCycleOfPattern(pattern) {
+		var q = false, i;
 
-		if (v === undefined)
-			return fallback;
-		v = String(v);
-		if (allowed && allowed.indexOf(v) < 0)
-			throw new RangeError('Value ' + v + ' out of range for ' +
-					     'Intl.DateTimeFormat options ' +
-					     'property ' + name);
-		return v;
+		for (i = 0; i < pattern.length; i++) {
+			var c = pattern.charAt(i);
+
+			if (c === "'")
+				q = !q;
+			else if (!q && CHAR_HC[c])
+				return CHAR_HC[c];
+		}
+		return null;
+	}
+
+	/* ReplaceSkeleton: the day period dropped, the hour made hc's */
+	function replaceSkeleton(skel, hc) {
+		return skel.replace(/[abB]/g, '').replace(/[hHKk]/g, HC_CHAR[hc]);
+	}
+
+	var TIME_SKELETONS = ['jmmsszzzz', 'jmmssz', 'jmmss', 'jmm'];
+	var STYLES = ['full', 'long', 'medium', 'short'];
+
+	function first(p) {
+		return Array.isArray(p) ? p[0] : p;
+	}
+
+	/*
+	 * Whether SimpleDateFormat::construct makes its time style with the
+	 * generator: where the locale names an hour cycle, or the bundle
+	 * found for it differs from it in language, or lacks its region.
+	 */
+	function timeFromGenerator(loc) {
+		if (loc.hcKeyword)
+			return true;
+		var valid = P.opened(loc.name);
+
+		if (valid === loc.name)
+			return false;
+		var a = loc.name.split('_'), b = valid.split('_');
+		var region = function (p) {
+			for (var i = 1; i < p.length; i++) {
+				if (/^([A-Z]{2}|\d{3})$/.test(p[i]))
+					return p[i];
+			}
+			return '';
+		};
+		var r = region(a);
+
+		return (r !== '' && r !== region(b)) || a[0] !== b[0];
+	}
+
+	/*
+	 * ICU's DateFormat::createDateTimeInstance, as SimpleDateFormat's
+	 * construct builds it: the calendar's style patterns, a time one
+	 * from the generator where timeFromGenerator says, joined by the
+	 * date style's glue; and the number overrides that go with them.
+	 */
+	function stylePattern(loc, ds, ts) {
+		var dtp = P.get(loc.name, ['calendar', loc.calType,
+					   'DateTimePatterns']);
+
+		if (!dtp)
+			dtp = P.get(loc.name, ['calendar', 'gregorian',
+					       'DateTimePatterns']);
+		var r = { pattern: '', dateOverride: null, timeOverride: null };
+		var timePattern = '';
+
+		if (ts !== undefined && timeFromGenerator(loc))
+			timePattern = generator(loc, true).bestPattern(
+				TIME_SKELETONS[ts], 0);
+		if (ds !== undefined && ts !== undefined) {
+			var tp = timePattern, t = dtp[ts], d = dtp[4 + ds];
+
+			if (!tp) {
+				tp = first(t);
+				if (Array.isArray(t))
+					r.timeOverride = t[1];
+			}
+			if (Array.isArray(d))
+				r.dateOverride = d[1];
+			var at = loc.calType !== 'gregorian' ?
+				P.get(loc.name, ['calendar', loc.calType,
+						 'DateTimePatterns%atTime']) : null;
+
+			if (!at)
+				at = P.get(loc.name, ['calendar', 'gregorian',
+						      'DateTimePatterns%atTime']);
+			var glue = at && at.length >= 4 ? first(at[ds]) :
+				first(dtp[dtp.length >= 13 ? 9 + ds : 8]);
+
+			r.pattern = P.simpleFormat(glue, [tp, first(d)]);
+		} else if (ts !== undefined) {
+			r.pattern = timePattern || first(dtp[ts]);
+			if (!timePattern && Array.isArray(dtp[ts]))
+				r.dateOverride = dtp[ts][1];
+		} else {
+			r.pattern = first(dtp[4 + ds]);
+			if (Array.isArray(dtp[4 + ds]))
+				r.dateOverride = dtp[4 + ds][1];
+		}
+		return r;
+	}
+
+	/* ---- options ---- */
+
+	/* Table 7: the components, the skeleton letters V8 asks for */
+	var COMPONENTS = [
+		['weekday', ['narrow', 'long', 'short'], { narrow: 'EEEEE',
+			long: 'EEEE', short: 'EEE' }],
+		['era', ['narrow', 'long', 'short'], { narrow: 'GGGGG',
+			long: 'GGGG', short: 'GGG' }],
+		['year', ['2-digit', 'numeric'], { '2-digit': 'yy', numeric: 'y' }],
+		['month', ['narrow', 'long', 'short', '2-digit', 'numeric'],
+			{ narrow: 'MMMMM', long: 'MMMM', short: 'MMM',
+			  '2-digit': 'MM', numeric: 'M' }],
+		['day', ['2-digit', 'numeric'], { '2-digit': 'dd', numeric: 'd' }],
+		['dayPeriod', ['narrow', 'long', 'short'], { narrow: 'BBBBB',
+			long: 'BBBB', short: 'B' }],
+		['hour', ['2-digit', 'numeric'], null],
+		['minute', ['2-digit', 'numeric'], { '2-digit': 'mm', numeric: 'm' }],
+		['second', ['2-digit', 'numeric'], { '2-digit': 'ss', numeric: 's' }],
+		['timeZoneName', ['long', 'short', 'longOffset', 'shortOffset',
+			'longGeneric', 'shortGeneric'], { long: 'zzzz', short: 'z',
+			longOffset: 'OOOO', shortOffset: 'O', longGeneric: 'vvvv',
+			shortGeneric: 'v' }]
+	];
+
+	function toObject(o) {
+		if (o === undefined)
+			return Object.create(null);
+		return Object(o);
+	}
+
+	var SLOTS = new WeakMap();
+
+	function slots(dtf, name) {
+		var s = SLOTS.get(dtf);
+
+		if (!s)
+			throw new TypeError('Method Intl.DateTimeFormat.prototype.' +
+					    name + ' called on incompatible receiver');
+		return s;
+	}
+
+	/*
+	 * CreateDateTimeFormat. required and defaults are 'any'/'date'/'time'
+	 * and 'date'/'time'/'all', as Date's toLocale*String pass them.
+	 */
+	function create(dtf, locales, options, required, defaults) {
+		var req = C.localeList(locales), o = toObject(options), s = {};
+		var i;
+
+		required = required || 'any';
+		defaults = defaults || 'date';
+		getOption(o, 'localeMatcher', ['lookup', 'best fit'], 'best fit');
+		var cal = o.calendar;
+
+		if (cal !== undefined) {
+			cal = String(cal);
+			if (!/^[a-z\d]{3,8}(-[a-z\d]{3,8})*$/i.test(cal))
+				throw new RangeError('Invalid calendar : ' + cal);
+			cal = cal.toLowerCase();
+			if (cal === 'islamicc')
+				cal = 'islamic-civil';
+			else if (cal === 'ethiopic-amete-alem')
+				cal = 'ethioaa';
+		}
+		var nu = o.numberingSystem;
+
+		if (nu !== undefined) {
+			nu = String(nu);
+			if (!/^[a-z\d]{3,8}(-[a-z\d]{3,8})*$/i.test(nu))
+				throw new RangeError('Invalid numberingSystem : ' + nu);
+			nu = nu.toLowerCase();
+		}
+		var hour12 = o.hour12;
+
+		if (hour12 !== undefined)
+			hour12 = Boolean(hour12);
+		var hourCycle = getOption(o, 'hourCycle',
+					  ['h11', 'h12', 'h23', 'h24'], undefined);
+
+		if (hour12 !== undefined)
+			hourCycle = undefined;
+
+		var r = resolve(req), ext = r.ext, icuExt = {};
+
+		if (cal !== undefined && ext.ca !== undefined && ext.ca !== cal)
+			delete ext.ca;
+		if (nu !== undefined && ext.nu !== undefined && ext.nu !== nu)
+			delete ext.nu;
+		var resolvedExt = { ca: ext.ca, nu: ext.nu, hc: ext.hc };
+
+		icuExt.ca = cal !== undefined && CALENDARS.indexOf(cal) >= 0 ?
+			cal : ext.ca;
+		icuExt.nu = nu !== undefined && own(X.index().ns, nu) ? nu :
+			ext.nu;
+		icuExt.hc = ext.hc;
+
+		/* what ICU is given: the locale, its calendar, hour symbol and
+		 * numbering system */
+		var tag = r.locale, name = P.opened(icuId(tag));
+		var num = numbering(tag, icuExt.nu);
+		var loc = {
+			name: icuId(tag),
+			cal: icuExt.ca ? icuCalendar(icuExt.ca) :
+				P.defaultCalendar(icuId(tag)),
+			calType: calendarOf(tag, icuExt.ca),
+			hour: hourChar(tag, icuExt.hc),
+			decimal: num.decimal,
+			hcKeyword: !!icuExt.hc
+		};
+		var gen = generator(loc);
+		var hcDefault = gen.hourCycle(), hc = null;
+
+		if (hourCycle === undefined && hour12 === undefined)
+			hc = icuExt.hc || null;
+		else if (hourCycle !== undefined)
+			hc = hourCycle;
+		if (hour12 !== undefined) {
+			if (hour12)
+				hc = hcDefault === 'h11' || hcDefault === 'h12' ?
+					hcDefault : /_JP(_|$)/.test(loc.name) ? 'h11' :
+					'h12';
+			else
+				hc = hcDefault === 'h23' || hcDefault === 'h24' ?
+					hcDefault : 'h23';
+		} else if (!hc) {
+			hc = hcDefault;
+		}
+
+		var tz = o.timeZone;
+
+		s.zone = tz === undefined ? defaultZone() : resolveZone(tz);
+
+		/* the components, and the skeleton they make */
+		var skeleton = '', explicit = {}, hasHour = false;
+
+		for (i = 0; i < COMPONENTS.length; i++) {
+			var c = COMPONENTS[i];
+
+			if (c[0] === 'timeZoneName') {
+				var fsd = o.fractionalSecondDigits;
+
+				if (fsd !== undefined) {
+					fsd = Number(fsd);
+					if (isNaN(fsd) || fsd < 1 || fsd > 3)
+						throw new RangeError('fractionalSecondDigits ' +
+								     'value is out of range.');
+					fsd = Math.floor(fsd);
+					explicit.fractionalSecondDigits = fsd;
+					skeleton += 'SSS'.slice(0, fsd);
+				}
+			}
+			var v = getOption(o, c[0], c[1], undefined);
+
+			if (v === undefined)
+				continue;
+			explicit[c[0]] = v;
+			if (c[0] === 'hour') {
+				hasHour = true;
+				skeleton += v === '2-digit' ? HC_CHAR[hc] + HC_CHAR[hc] :
+					HC_CHAR[hc];
+			} else {
+				skeleton += c[2][v];
+			}
+		}
+		getOption(o, 'formatMatcher', ['basic', 'best fit'], 'best fit');
+		var ds = getOption(o, 'dateStyle', STYLES, undefined);
+		var ts = getOption(o, 'timeStyle', STYLES, undefined);
+		var dtfHc = ts !== undefined ? hc : null, pat;
+
+		if (ds !== undefined || ts !== undefined) {
+			if (Object.keys(explicit).length)
+				throw new TypeError('Invalid option : option');
+			if (required === 'date' && ts !== undefined)
+				throw new TypeError('Invalid option : timeStyle');
+			if (required === 'time' && ds !== undefined)
+				throw new TypeError('Invalid option : dateStyle');
+			var di = ds === undefined ? undefined : STYLES.indexOf(ds);
+			var ti = ts === undefined ? undefined : STYLES.indexOf(ts);
+
+			pat = stylePattern(loc, di, ti);
+			if (ti !== undefined && dtfHc !== hourCycleOfPattern(pat.pattern)) {
+				pat = { pattern: replaceHourCycle(gen.bestPattern(
+					replaceSkeleton(P.staticSkeleton(pat.pattern), dtfHc),
+					P.MATCH_HOUR_FIELD_LENGTH), dtfHc) };
+			}
+			s.dateStyle = ds;
+			s.timeStyle = ts;
+		} else {
+			var need = true;
+
+			if (required !== 'time' && (explicit.weekday || explicit.year ||
+			    explicit.month || explicit.day))
+				need = false;
+			if (required !== 'date' && (explicit.dayPeriod ||
+			    explicit.hour || explicit.minute || explicit.second ||
+			    explicit.fractionalSecondDigits))
+				need = false;
+			if (need && (defaults === 'date' || defaults === 'all'))
+				skeleton += 'yMd';
+			if (need && (defaults === 'time' || defaults === 'all'))
+				skeleton += { h12: 'hms', h23: 'Hms', h11: 'Kms',
+					h24: 'kms' }[hc];
+			dtfHc = hasHour ? hc : null;
+			pat = { pattern: replaceHourCycle(gen.bestPattern(skeleton,
+				P.MATCH_HOUR_FIELD_LENGTH), dtfHc) };
+		}
+
+		/* hour12 and hourCycle drop an -hc- the result does not keep */
+		if ((hour12 !== undefined || hourCycle !== undefined) &&
+		    resolvedExt.hc !== undefined && dtfHc !== resolvedExt.hc)
+			delete resolvedExt.hc;
+
+		s.locale = localeString(tag, resolvedExt);
+		s.hc = dtfHc;
+		s.calendar = loc.calType;
+		s.nu = num.nu;
+		s.pattern = pat.pattern;
+		s.fmt = formatter(loc, num, pat, tag);
+		s.loc = loc;
+		s.num = num;
+		s.tag = tag;
+		SLOTS.set(dtf, s);
+		return dtf;
 	}
 
 	/* ---- time zones ---- */
 
 	function resolveZone(tz) {
-		var z;
+		var z = Z.fromOption(String(tz));
 
-		if (tz === undefined)
-			return defaultZone();
-		z = N.zone(String(tz));
 		if (!z)
 			throw new RangeError('Invalid time zone specified: ' + tz);
-		/* every name of UTC goes by UTC */
-		if (UTC_NAMES[z[0]] || z[0] === 'UTC')
-			return { name: 'UTC', num: N.zone('Etc/UTC')[1] };
-		return { name: z[0], num: z[1] };
+		return z;
 	}
 
 	var DEFAULT_ZONE = null;
@@ -145,8 +619,7 @@
 		if (off === 0) {
 			name = 'UTC';
 		} else if (off % 60 === 0 && Math.abs(off) <= 14 * 60) {
-			name = 'Etc/GMT' + (off > 0 ? '-' : '+') +
-				Math.abs(off / 60);
+			name = 'Etc/GMT' + (off > 0 ? '-' : '+') + Math.abs(off / 60);
 		} else {
 			var a = Math.abs(off);
 
@@ -158,216 +631,455 @@
 		return DEFAULT_ZONE;
 	}
 
-	/* ---- the formatter ---- */
+	/* ---- SimpleDateFormat ---- */
 
-	var SLOTS = new WeakMap();
+	var PERIODS = null;
 
-	function slots(dtf, method) {
-		var s = SLOTS.get(dtf);
+	/* DayPeriodRules::getInstance: the locale's rule set, by its name
+	 * with subtags dropped until one has rules */
+	function dayPeriodRules(tag) {
+		if (!PERIODS)
+			PERIODS = JSON.parse(N.pak('dt:periods'));
+		var name = icuId(tag);
 
-		if (!s)
-			throw new TypeError('Method Intl.DateTimeFormat.prototype.' +
-					    method + ' called on incompatible ' +
-					    'receiver');
-		return s;
+		while (name) {
+			var set = own(PERIODS.locales, name);
+
+			if (set)
+				return PERIODS.sets[set];
+			var cut = name.lastIndexOf('_');
+
+			name = cut > 0 ? name.slice(0, cut) : '';
+		}
+		return null;
 	}
 
-	function skeletonOf(o, hc) {
-		var s = '';
+	/* the digits a numbering system override names, "d=hanidec" or
+	 * "hebr", by field; the name of one ICU spells out (hebr, jpanyear),
+	 * which vita/js/intl_calendar.js writes */
+	function overrides(str, dateFields) {
+		var out = {}, parts = str ? str.split(';') : [], i;
 
-		if (o.era)
-			s += { short: 'G', long: 'GGGG', narrow: 'GGGGG' }[o.era];
-		if (o.year)
-			s += o.year === '2-digit' ? 'yy' : 'y';
-		if (o.month)
-			s += { numeric: 'M', '2-digit': 'MM', short: 'MMM',
-				long: 'MMMM', narrow: 'MMMMM' }[o.month];
-		if (o.weekday)
-			s += { short: 'EEE', long: 'EEEE', narrow: 'EEEEE' }[o.weekday];
-		if (o.day)
-			s += o.day === '2-digit' ? 'dd' : 'd';
-		if (o.dayPeriod && !(o.hour && (hc === 'h23' || hc === 'h24')))
-			s += { short: 'B', long: 'BBBB', narrow: 'BBBBB' }[o.dayPeriod];
-		if (o.hour)
-			s += o.hour === '2-digit' ? HC_CHAR[hc] + HC_CHAR[hc] :
-				HC_CHAR[hc];
-		if (o.minute)
-			s += o.minute === '2-digit' ? 'mm' : 'm';
-		if (o.second)
-			s += o.second === '2-digit' ? 'ss' : 's';
-		if (o.fractionalSecondDigits)
-			s += 'SSS'.slice(0, o.fractionalSecondDigits);
-		if (o.timeZoneName)
-			s += { short: 'z', long: 'zzzz', shortOffset: 'O',
-				longOffset: 'OOOO', shortGeneric: 'v',
-				longGeneric: 'vvvv' }[o.timeZoneName];
-		return s;
-	}
+		for (i = 0; i < parts.length; i++) {
+			var eq = parts[i].indexOf('='), ns = eq < 0 ? parts[i] :
+				parts[i].slice(eq + 1);
+			var digits = X.index().ns[ns];
+			var f = digits ? Array.from(digits) : ns;
 
-	/* what resolvedOptions reports, read off the pattern */
-	function optionsOfPattern(pattern) {
-		var f = P.fieldsOf(pattern), o = {}, c, n;
-		var TEXT = [null, 'short', 'short', 'short', 'long', 'narrow'];
-
-		for (c in f) {
-			n = f[c];
-			switch (c) {
-			case 'G': o.era = TEXT[n]; break;
-			case 'y': case 'Y': case 'u':
-				o.year = n === 2 ? '2-digit' : 'numeric'; break;
-			case 'M': case 'L':
-				o.month = n === 1 ? 'numeric' : n === 2 ? '2-digit' :
-					TEXT[n]; break;
-			case 'd': o.day = n === 2 ? '2-digit' : 'numeric'; break;
-			case 'E': case 'c': case 'e':
-				o.weekday = n === 4 ? 'long' : n === 5 ? 'narrow' :
-					'short'; break;
-			case 'B': o.dayPeriod = TEXT[n]; break;
-			case 'h': case 'H': case 'K': case 'k':
-				o.hour = n === 2 ? '2-digit' : 'numeric'; break;
-			case 'm': o.minute = n === 2 ? '2-digit' : 'numeric'; break;
-			case 's': o.second = n === 2 ? '2-digit' : 'numeric'; break;
-			case 'S': o.fractionalSecondDigits = n; break;
-			case 'z': o.timeZoneName = n === 4 ? 'long' : 'short'; break;
-			case 'O': o.timeZoneName = n === 4 ? 'longOffset' :
-				'shortOffset'; break;
-			case 'v': o.timeZoneName = n === 4 ? 'longGeneric' :
-				'shortGeneric'; break;
+			if (eq < 0) {
+				dateFields.split('').forEach(function (c) {
+					out[c] = f;
+				});
+			} else {
+				out[parts[i].charAt(0)] = f;
 			}
 		}
-		return o;
+		return out;
+	}
+
+	/* the fields an override without a field letter is for, as
+	 * SimpleDateFormat's kDateFields and kTimeFields list them */
+	var DATE_FIELDS = 'yMdDFwWYugcLQqUr', TIME_FIELDS = 'kHmsShKAZO';
+
+	function formatter(loc, num, pat, tag) {
+		var f = {
+			pattern: pat.pattern,
+			sym: P.symbols(P.opened(loc.name), loc.calType),
+			calType: loc.calType,
+			num: num,
+			rules: dayPeriodRules(tag),
+			tag: tag,
+			name: loc.name,
+			ovr: {},
+			/* what TimeZoneFormat and TimeZoneGenericNames take from
+			 * the locale: its zone names, the region whose metazone
+			 * names it prefers, and its names for regions */
+			zoneLocale: loc.name,
+			targetRegion: langRegion(tag).region,
+			regionName: function (code) {
+				var d = X.entry('d', X.dataTag(tag));
+				var n = d && d.T ? own(d.T, code) : undefined;
+
+				return n !== undefined ? n : code;
+			}
+		};
+		var unq = pat.pattern.replace(/'[^']*'/g, '');
+
+		f.hasMinute = unq.indexOf('m') >= 0;
+		f.hasSecond = unq.indexOf('s') >= 0;
+		f.dateOverride = pat.dateOverride || null;
+		/* ISO8601Calendar's weeks start on Monday and need four days */
+		if (loc.calType === 'iso8601')
+			f.week = { first: 2, min: 4 };
+		else if (loc.calType === 'chinese' || loc.calType === 'dangi' ||
+			 unq.indexOf('Y') >= 0)
+			f.week = weekData(tag);
+		/* ja@calendar=japanese writes the first year of an era 元年
+		 * where the pattern has 年, quoted or not */
+		f.hanYear = loc.calType === 'japanese' && /^ja\b/.test(tag);
+		if (!f.dateOverride && f.hanYear && pat.pattern.indexOf('\u5e74') >= 0)
+			f.dateOverride = 'y=jpanyear';
+		if (f.dateOverride)
+			Object.assign(f.ovr, overrides(f.dateOverride, DATE_FIELDS));
+		if (pat.timeOverride)
+			Object.assign(f.ovr, overrides(pat.timeOverride, TIME_FIELDS));
+		return f;
+	}
+
+	/* zeroPaddingNumber: min digits at least, max at most */
+	function number(f, ch, value, min, max) {
+		var o = f.ovr[ch], digits = Array.isArray(o) ? o : f.num.digits;
+
+		if (typeof o === 'string') {
+			/* RuleBasedNumberFormat, which pads nothing */
+			var spelt = K.spell(o, value);
+
+			if (spelt !== null)
+				return spelt;
+		}
+		var neg = value < 0, s = String(Math.abs(value)), out = '', i;
+
+		if (s.length > max)
+			s = s.slice(s.length - max);
+		while (s.length < min)
+			s = '0' + s;
+		for (i = 0; i < s.length; i++)
+			out += digits[s.charCodeAt(i) - 48];
+		return neg ? f.num.minus + out : out;
+	}
+
+	var TYPES = {
+		G: 'era', y: 'year', Y: 'year', u: 'year', U: 'yearName',
+		r: 'relatedYear', M: 'month', L: 'month', d: 'day',
+		E: 'weekday', c: 'weekday', e: 'weekday', a: 'dayPeriod',
+		b: 'dayPeriod', B: 'dayPeriod', h: 'hour', H: 'hour', K: 'hour',
+		k: 'hour', m: 'minute', s: 'second', S: 'fractionalSecond',
+		z: 'timeZoneName', Z: 'timeZoneName', O: 'timeZoneName',
+		v: 'timeZoneName', V: 'timeZoneName', X: 'timeZoneName',
+		x: 'timeZoneName'
+	};
+
+	function symbol(list, i) {
+		return list && i >= 0 && i < list.length && list[i] !== null &&
+			list[i] !== undefined ? list[i] : '';
+	}
+
+	function withMonthPattern(name, pattern) {
+		return pattern ? P.simpleFormat(pattern, [name]) : name;
+	}
+
+	/* subFormat: one field */
+	function field(f, ch, count, t) {
+		var sym = f.sym, v;
+
+		switch (ch) {
+		case 'G':
+			if (f.calType === 'chinese' || f.calType === 'dangi')
+				return number(f, ch, t.era, 1, 9);
+			return symbol(count === 5 ? sym.G.n : count === 4 ? sym.G.w :
+				      sym.G.a, t.era);
+		case 'U':
+			if (sym.yn && t.year <= sym.yn.length)
+				return symbol(sym.yn, t.year - 1);
+			/* falls through */
+		case 'y':
+		case 'Y':
+			v = ch === 'Y' ? K.weekYear(f.calType, t, f.week ||
+				(f.week = weekData(f.tag))) : t.year;
+			if (f.dateOverride === 'hebr' && v > 5000 && v < 6000)
+				v -= 5000;
+			return count === 2 ? number(f, ch, v, 2, 2) :
+				number(f, ch, v, count, 10);
+		case 'u':
+			return number(f, ch, t.ext, count, 10);
+		case 'r':
+			return number(f, ch, t.related, count, 10);
+		case 'M':
+		case 'L': {
+			var m = t.month, lp = sym.lp && t.leap ? sym.lp : null;
+			var form = ch === 'M' ? sym.M.f : sym.M.s;
+
+			if (t.hebrewLeap !== undefined) {
+				if (t.hebrewLeap && m === 6 && count >= 3)
+					m = 13;
+				if (!t.hebrewLeap && m >= 6 && count < 3)
+					m--;
+			}
+			if (count === 5)
+				return withMonthPattern(symbol(form.n, m), lp &&
+					lp[ch === 'M' ? 2 : 5]);
+			if (count === 4)
+				return withMonthPattern(symbol(form.w, m), lp &&
+					lp[ch === 'M' ? 0 : 3]);
+			if (count === 3)
+				return withMonthPattern(symbol(form.a, m), lp &&
+					lp[ch === 'M' ? 1 : 4]);
+			return withMonthPattern(number(f, ch, m + 1, count, 10),
+						lp && lp[6]);
+		}
+		case 'd':
+			return number(f, ch, t.day, count, 10);
+		case 'E':
+			return symbol(count === 5 ? sym.E.f.n : count === 4 ?
+				sym.E.f.w : count === 6 ? sym.E.f.s : sym.E.f.a, t.dow - 1);
+		case 'c':
+			if (count < 3)
+				return number(f, ch, t.localDow, 1, 10);
+			return symbol(count === 5 ? sym.E.s.n : count === 4 ?
+				sym.E.s.w : count === 6 ? sym.E.s.s : sym.E.s.a, t.dow - 1);
+		case 'e':
+			if (count < 3)
+				return number(f, ch, t.localDow, count, 10);
+			return symbol(count === 5 ? sym.E.f.n : count === 4 ?
+				sym.E.f.w : count === 6 ? sym.E.f.s : sym.E.f.a, t.dow - 1);
+		case 'a':
+			return symbol(count === 4 ? sym.ap.w : count === 5 ? sym.ap.n :
+				      sym.ap.a, t.hour >= 12 ? 1 : 0);
+		case 'b':
+			if (t.hour === 12 && (!f.hasMinute || t.minute === 0) &&
+			    (!f.hasSecond || t.second === 0)) {
+				var nb = periodName(sym, count, 1);
+
+				if (nb !== null)
+					return nb;
+			}
+			return field(f, 'a', count, t);
+		case 'B':
+			return flexiblePeriod(f, count, t);
+		case 'h':
+			v = t.hour % 12;
+			return number(f, ch, v === 0 ? 12 : v, count, 10);
+		case 'K':
+			return number(f, ch, t.hour % 12, count, 10);
+		case 'H':
+			return number(f, ch, t.hour, count, 10);
+		case 'k':
+			return number(f, ch, t.hour === 0 ? 24 : t.hour, count, 10);
+		case 'm':
+			return number(f, ch, t.minute, count, 10);
+		case 's':
+			return number(f, ch, t.second, count, 10);
+		case 'S': {
+			v = t.ms;
+			if (count === 1)
+				v = Math.floor(v / 100);
+			else if (count === 2)
+				v = Math.floor(v / 10);
+			var out = number(f, ch, v, count > 3 ? 3 : count, 10);
+
+			if (count > 3)
+				out += number(f, ch, 0, count - 3, 10);
+			return out;
+		}
+		case 'z': case 'Z': case 'O': case 'v': case 'V': case 'X':
+		case 'x':
+			return Z.format(f, ch, count, t);
+		case 'Q': case 'q':
+			return number(f, ch, Math.floor(t.month / 3) + 1, count, 10);
+		case 'D':
+			return number(f, ch, t.dayOfYear || 0, count, 10);
+		default:
+			return '';
+		}
+	}
+
+	function periodName(sym, count, i) {
+		var list = count <= 3 ? sym.dp.f.a : count === 4 || count > 5 ?
+			sym.dp.f.w : sym.dp.f.n;
+
+		return list[i] === null || list[i] === undefined ? null : list[i];
+	}
+
+	/* 'B': the locale's rules' period for the hour, noon and midnight
+	 * only when the time shown is exactly that, else AM or PM */
+	function flexiblePeriod(f, count, t) {
+		var rules = f.rules;
+
+		if (!rules)
+			return field(f, 'a', count, t);
+		var minute = f.hasMinute ? t.minute : 0,
+			second = f.hasSecond ? t.second : 0, p;
+
+		if (t.hour === 0 && minute === 0 && second === 0 && rules.midnight)
+			p = 0;
+		else if (t.hour === 12 && minute === 0 && second === 0 && rules.noon)
+			p = 1;
+		else
+			p = rules.h[t.hour];
+		var name = null;
+
+		if (p !== 10 && p !== 11 && p !== 0)
+			name = periodName(f.sym, count, p);
+		if (name === null && (p === 0 || p === 1)) {
+			p = rules.h[t.hour];
+			name = p === 10 || p === 11 ? null :
+				periodName(f.sym, count, p);
+		}
+		if (p === 10 || p === 11 || name === null)
+			return field(f, 'a', count, t);
+		return name;
+	}
+
+	/* the fields of a moment in the formatter's zone and calendar */
+	function moment(f, zone, x) {
+		var o = zone.tz.offsets(x, false), off = o[0] + o[1], local = x + off;
+		var days = Math.floor(local / 864e5), msDay = local - days * 864e5;
+		var t = dateFields(f.calType, days, x, f.week);
+
+		t.dow = ((days % 7) + 11) % 7 + 1;
+		t.hour = Math.floor(msDay / 3600000);
+		t.minute = Math.floor(msDay / 60000) % 60;
+		t.second = Math.floor(msDay / 1000) % 60;
+		t.ms = msDay % 1000;
+		t.utc = x;
+		t.offset = off;
+		t.zone = zone;
+		return t;
 	}
 
 	/*
-	 * ECMA-402 CreateDateTimeFormat. required and defaults are
-	 * ToDateTimeOptions' for Date.prototype.toLocale*String:
-	 * 'any'/'date'/'time' and 'date'/'time'/'all'.
+	 * SimpleDateFormat::_format: the formatter's pattern for a moment,
+	 * appended to acc.s, with each field written appended to acc.fields
+	 * as { ch, start, end }
 	 */
-	function create(dtf, locales, options, required, defaults) {
-		var req = localeList(locales), o, s = {}, i, hc, hour12,
-			hourCycle, ld, need, explicit = false;
+	function render(f, t, acc) {
+		var p = f.pattern, n = p.length, i = 0;
 
-		required = required || 'any';
-		defaults = defaults || 'date';
-		o = options === undefined ? Object.create(null) : Object(options);
-		getOption(o, 'localeMatcher', ['lookup', 'best fit'], 'best fit');
-		var cal = o.calendar;
+		while (i < n) {
+			var c = p.charAt(i);
 
-		if (cal !== undefined && !/^[a-z\d]{3,8}(-[a-z\d]{3,8})*$/i.test(
-				String(cal)))
-			throw new RangeError('Invalid calendar : ' + cal);
-		var nu = o.numberingSystem;
-
-		if (nu !== undefined && !/^[a-z\d]{3,8}(-[a-z\d]{3,8})*$/i.test(
-				String(nu)))
-			throw new RangeError('Invalid numberingSystem : ' + nu);
-		hour12 = o.hour12;
-		if (hour12 !== undefined)
-			hour12 = Boolean(hour12);
-		hourCycle = getOption(o, 'hourCycle', ['h11', 'h12', 'h23', 'h24'],
-				      undefined);
-		if (hour12 !== undefined)
-			hourCycle = null;
-
-		var loc = resolveLocale(req);
-
-		s.idx = loc.idx;
-		ld = data(loc.idx);
-		s.data = ld;
-		s.locale = loc.tag;
-		/* -u-hc, where no option overrides it */
-		if (hourCycle === undefined && hour12 === undefined &&
-		    HC_CHAR[loc.kw.hc]) {
-			hourCycle = loc.kw.hc;
-			s.locale += '-u-hc-' + hourCycle;
-		}
-		s.zone = resolveZone(o.timeZone);
-
-		var f = {};
-
-		for (i = 0; i < FIELDS.length; i++) {
-			var k = FIELDS[i], v;
-
-			if (k === 'fractionalSecondDigits') {
-				v = o[k];
-				if (v !== undefined) {
-					v = Number(v);
-					if (!(v >= 1 && v <= 3) || isNaN(v))
-						throw new RangeError(
-							'fractionalSecondDigits ' +
-							'value is out of range.');
-					v = Math.floor(v);
+			if (c === "'") {
+				if (p.charAt(i + 1) === "'") {
+					acc.s += "'";
+					i += 2;
+					continue;
 				}
-			} else {
-				v = getOption(o, k, VALUES[k], undefined);
+				var j = i + 1;
+
+				while (j < n) {
+					if (p.charAt(j) === "'") {
+						if (p.charAt(j + 1) === "'") {
+							acc.s += "'";
+							j += 2;
+							continue;
+						}
+						break;
+					}
+					acc.s += p.charAt(j++);
+				}
+				i = j + 1;
+				continue;
 			}
-			if (v !== undefined) {
-				f[k] = v;
-				explicit = true;
+			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+				var k = i + 1;
+
+				while (k < n && p.charAt(k) === c)
+					k++;
+				var v = field(f, c, k - i, t);
+
+				if (v) {
+					acc.fields.push({ ch: c, start: acc.s.length,
+						end: acc.s.length + v.length });
+					acc.s += v;
+				}
+				i = k;
+				continue;
 			}
+			acc.s += c;
+			i++;
 		}
-		getOption(o, 'formatMatcher', ['basic', 'best fit'], 'best fit');
-		var ds = getOption(o, 'dateStyle', STYLES, undefined);
-		var ts = getOption(o, 'timeStyle', STYLES, undefined);
-
-		/* the hour cycle, for a pattern with an hour in it */
-		if (hour12 === true)
-			hc = 'h12';
-		else if (hour12 === false)
-			hc = 'h23';
-		else
-			hc = hourCycle || ld.hc;
-		s.hcExplicit = hour12 !== undefined || !!hourCycle;
-
-		if (ds || ts) {
-			if (explicit)
-				throw new TypeError("Can't set option " +
-					Object.keys(f)[0] + ' when ' +
-					(ds ? 'dateStyle' : 'timeStyle') +
-					' is used');
-			if (required === 'date' && ts)
-				throw new TypeError('Invalid option : timeStyle');
-			if (required === 'time' && ds)
-				throw new TypeError('Invalid option : dateStyle');
-			var tp = ts ? (s.hcExplicit ? ld.timeHc[ts][hc] :
-				       ld.time[ts]) : null;
-			var dp = ds ? ld.date[ds] : null;
-
-			s.pattern = dp && tp ? ld.styleGlue[ds].replace('{1}', dp)
-				.replace('{0}', tp) : dp || tp;
-			s.dateStyle = ds;
-			s.timeStyle = ts;
-			s.skeleton = skeletonFromPattern(s.pattern);
-		} else {
-			need = true;
-			if (required !== 'time' && (f.weekday || f.year ||
-			    f.month || f.day))
-				need = false;
-			if (required !== 'date' && (f.dayPeriod || f.hour ||
-			    f.minute || f.second || f.fractionalSecondDigits))
-				need = false;
-			if (need && (defaults === 'date' || defaults === 'all')) {
-				f.year = f.month = f.day = 'numeric';
-			}
-			if (need && (defaults === 'time' || defaults === 'all')) {
-				f.hour = f.minute = f.second = 'numeric';
-			}
-			s.skeleton = skeletonOf(f, hc);
-			s.pattern = P.bestPattern(ld, s.skeleton);
-		}
-		s.hc = /[hHKk]/.test(s.pattern.replace(/'[^']*'/g, '')) ?
-			hc : null;
-		SLOTS.set(dtf, s);
-		return dtf;
 	}
 
-	function skeletonFromPattern(p) {
-		var f = P.fieldsOf(p), out = '', c;
+	/* the parts of what render wrote: its fields, and literal text
+	 * between, with the fields formatToParts has no type for left in
+	 * the literal text */
+	function toParts(acc, source) {
+		var parts = [], lit = '', prev = 0, i;
 
-		for (c in f) {
-			if (/[GyMLEcdBhHKkmsSzOv]/.test(c))
-				out += new Array(f[c] + 1).join(c === 'L' ? 'M' :
-								c === 'c' ? 'E' : c);
+		function push(type, value) {
+			var part = { type: type, value: value };
+
+			if (source)
+				part.source = source;
+			parts.push(part);
+		}
+		for (i = 0; i < acc.fields.length; i++) {
+			var e = acc.fields[i], type = TYPES[e.ch];
+
+			lit += acc.s.slice(prev, e.start);
+			prev = e.end;
+			if (!type) {
+				lit += acc.s.slice(e.start, e.end);
+				continue;
+			}
+			if (lit)
+				push('literal', lit);
+			lit = '';
+			push(type, acc.s.slice(e.start, e.end));
+		}
+		lit += acc.s.slice(prev);
+		if (lit)
+			push('literal', lit);
+		return parts;
+	}
+
+	function formatParts(f, zone, x, source) {
+		var acc = { s: '', fields: [] };
+
+		render(f, moment(f, zone, x), acc);
+		return toParts(acc, source);
+	}
+
+	/* SimpleDateFormat::applyPattern, for the formatter
+	 * DateIntervalFormat keeps: the flags the pattern sets, and the
+	 * Japanese first year where it has 年 */
+	function applyPattern(f, p) {
+		if (f.pattern === p)
+			return;
+		f.pattern = p;
+		var unq = p.replace(/'[^']*'/g, '');
+
+		f.hasMinute = unq.indexOf('m') >= 0;
+		f.hasSecond = unq.indexOf('s') >= 0;
+		if (f.hanYear) {
+			if (f.dateOverride === 'y=jpanyear' && p.indexOf('\u5e74') < 0) {
+				f.dateOverride = null;
+				f.ovr = {};
+			} else if (!f.dateOverride && p.indexOf('\u5e74') >= 0) {
+				f.dateOverride = 'y=jpanyear';
+				f.ovr = { y: 'jpanyear' };
+			}
+		}
+	}
+
+	/*
+	 * What SimpleDateFormat::format has written when its calendar fails
+	 * on the first field: the literal text before that field and the
+	 * character after it, if that is literal too.
+	 */
+	function failedText(p) {
+		var out = '', prev = '', count = 0, q = false, i;
+
+		for (i = 0; i < p.length; i++) {
+			var c = p.charAt(i), failed = false;
+
+			if (c !== prev && count > 0)
+				failed = true;
+			if (c === "'") {
+				if (p.charAt(i + 1) === "'") {
+					out += "'";
+					i++;
+				} else {
+					q = !q;
+				}
+			} else if (!q && /[A-Za-z]/.test(c)) {
+				prev = c;
+				count++;
+			} else {
+				out += c;
+			}
+			if (failed)
+				break;
 		}
 		return out;
 	}
@@ -377,264 +1089,7 @@
 
 		if (!isFinite(x) || Math.abs(x) > 8.64e15)
 			throw new RangeError('Invalid time value');
-		return x;
-	}
-
-	function parts(flat, source) {
-		var out = [], i;
-
-		for (i = 0; i < flat.length; i += 2) {
-			var p = { type: flat[i], value: flat[i + 1] };
-
-			if (source)
-				p.source = source;
-			out.push(p);
-		}
-		return out;
-	}
-
-	/* ---- ranges ---- */
-
-	/* the pattern's fields by how fine they are: era 0 to fraction 8 */
-	var RANK = { G: 0, y: 1, M: 2, L: 2, d: 3, E: 3, c: 3, a: 4, B: 4,
-		h: 5, H: 5, K: 5, k: 5, m: 6, s: 7, S: 8 };
-	var DIFF = ['G', 'y', 'M', 'd', 'a', 'h', 'm', 's', 'S'];
-
-	function finest(skel) {
-		var r = -1, i;
-
-		for (i = 0; i < skel.length; i++) {
-			var k = RANK[skel.charAt(i)];
-
-			if (k !== undefined && k > r)
-				r = k;
-		}
-		return r;
-	}
-
-	function splitSkeleton(sk) {
-		return {
-			date: sk.replace(/[BhHKkmsSzOv]/g, ''),
-			time: sk.replace(/[GyMLEcd]/g, '')
-		};
-	}
-
-	/* a range pattern cut where its second date starts: at the first
-	 * field that comes round again */
-	function cut(pattern) {
-		var seen = {}, i = 0, n = pattern.length;
-
-		while (i < n) {
-			var c = pattern.charAt(i), j = i + 1;
-
-			if (c === "'") {
-				while (j < n && pattern.charAt(j) !== "'")
-					j++;
-				i = j + 1;
-				continue;
-			}
-			while (j < n && pattern.charAt(j) === c)
-				j++;
-			if (/[A-Za-z]/.test(c)) {
-				var f = c === 'L' ? 'M' : c;
-
-				if (seen[f])
-					return [pattern.slice(0, i), pattern.slice(i)];
-				seen[f] = 1;
-			}
-			i = j;
-		}
-		return null;
-	}
-
-	function letters(pattern) {
-		var out = [], i = 0, n = pattern.length;
-
-		while (i < n) {
-			var c = pattern.charAt(i), j = i + 1;
-
-			if (c === "'") {
-				while (j < n && pattern.charAt(j) !== "'")
-					j++;
-				i = j + 1;
-				continue;
-			}
-			while (j < n && pattern.charAt(j) === c)
-				j++;
-			if (/[A-Za-z]/.test(c))
-				out.push(c === 'L' ? 'M' : c);
-			i = j;
-		}
-		return out;
-	}
-
-	/* the parts of one half of a range: its fields that the other half
-	 * has too, and what lies between them, are its own; the rest is
-	 * shared */
-	function halfParts(flat, pat, other, source) {
-		var ps = parts(flat), mine = letters(pat), theirs = letters(other),
-			fi = 0, first = -1, last = -1, i;
-
-		for (i = 0; i < ps.length; i++) {
-			if (ps[i].type === 'literal')
-				continue;
-			if (theirs.indexOf(mine[fi]) >= 0) {
-				if (first < 0)
-					first = i;
-				last = i;
-			}
-			fi++;
-		}
-		for (i = 0; i < ps.length; i++)
-			ps[i].source = i >= first && i <= last && first >= 0 ?
-				source : 'shared';
-		return ps;
-	}
-
-	function mergeLiterals(ps) {
-		var out = [], i;
-
-		for (i = 0; i < ps.length; i++) {
-			var last = out[out.length - 1];
-
-			if (last && last.type === 'literal' &&
-			    ps[i].type === 'literal' && last.source === ps[i].source)
-				last.value += ps[i].value;
-			else
-				out.push(ps[i]);
-		}
-		return out;
-	}
-
-	function formatRangeParts(s, x, y) {
-		var z = s.zone.num, fa = N.fields(z, x), fb = N.fields(z, y),
-			diff = -1, i, ld = s.data;
-
-		for (i = 0; i < 9; i++) {
-			if (fa[i] !== fb[i]) {
-				diff = i;
-				break;
-			}
-		}
-		/* the era is told by the year, and a 24 hour clock tells AM
-		 * from PM by the hour */
-		if (diff === 0)
-			diff = 1;
-		var sk = s.skeleton, sp = splitSkeleton(sk);
-
-		if (diff === 4 && !/[ahKB]/.test(s.pattern.replace(/'[^']*'/g, '')) &&
-		    /[Hk]/.test(sk))
-			diff = 5;
-		if (diff < 0 || diff > finest(sk))
-			return single(s, x, 'shared');
-
-		var letter = DIFF[diff];
-
-		if (sp.date && sp.time) {
-			/* dates apart: each written out, with the date fields
-			 * down to the one that changed */
-			if (diff <= 3)
-				return fallback(s, P.bestPattern(ld,
-					withDate(sp.date, diff) + sp.time, true), x, y);
-			var iv = rangePattern(ld, sp.time, letter);
-			var dp = P.bestPattern(ld, sp.date);
-			var g = ld.ivGlue.split(/\{([01])\}/), out = [], k;
-
-			for (k = 0; k < g.length; k++) {
-				if (k % 2 === 0) {
-					if (g[k])
-						out.push({ type: 'literal',
-							value: unquote(g[k]),
-							source: 'shared' });
-				} else if (g[k] === '1') {
-					out = out.concat(parts(N.format(s.idx, dp, z,
-						x, true), 'shared'));
-				} else if (iv) {
-					out = out.concat(rangeHalves(s, iv, x, y));
-				} else {
-					/* no pattern for a range of these times:
-					 * the two times in full */
-					out = out.concat(fallback(s, P.bestPattern(ld,
-						sp.time, true), x, y));
-				}
-			}
-			return mergeLiterals(out);
-		}
-		if (sp.time) {
-			if (diff <= 3)
-				return fallback(s, P.bestPattern(ld, 'yMd' + sp.time,
-								 true), x, y);
-			var tv = rangePattern(ld, sp.time, letter);
-
-			return tv ? mergeLiterals(rangeHalves(s, tv, x, y)) :
-				fallback(s, P.bestPattern(ld, sk, true), x, y);
-		}
-		/* a date: what a year or a month apart needs to show it */
-		var ext = sp.date;
-
-		if (diff === 2 && /d/.test(ext) && !/M/.test(ext))
-			ext = 'M' + ext;
-		if (diff <= 1 && /d/.test(ext) && !/y/.test(ext))
-			ext = 'y' + ext;
-		/* one that has to be given fields to show the change is the
-		 * two dates in full */
-		var dv = ext === sp.date ? rangePattern(ld, ext, letter) : null;
-
-		if (dv)
-			return mergeLiterals(rangeHalves(s, dv, x, y));
-		return fallback(s, P.bestPattern(ld, ext, true), x, y);
-	}
-
-	/* a date skeleton with the fields from the one a range changes in
-	 * down to the day, where it has not got them */
-	function withDate(date, diff) {
-		var add = '';
-
-		if (diff <= 1 && !/y/.test(date))
-			add += 'y';
-		if (diff <= 2 && !/[ML]/.test(date))
-			add += 'M';
-		if (diff <= 3 && !/d/.test(date))
-			add += 'd';
-		return add + date;
-	}
-
-	function unquote(t) {
-		return t.replace(/'([^']*)'/g, function (m, q) {
-			return q === '' ? "'" : q;
-		});
-	}
-
-	function rangePattern(ld, skel, letter) {
-		return P.intervalPattern(ld, skel, letter);
-	}
-
-	function rangeHalves(s, iv, x, y) {
-		var c = cut(iv);
-
-		if (!c)
-			return single(s, x, 'shared');
-		var a = halfParts(N.format(s.idx, c[0], s.zone.num, x, true),
-				  c[0], c[1], 'startRange');
-		var b = halfParts(N.format(s.idx, c[1], s.zone.num, y, true),
-				  c[1], c[0], 'endRange');
-
-		return a.concat(b);
-	}
-
-	function single(s, x, source) {
-		return parts(N.format(s.idx, s.pattern, s.zone.num, x, true),
-			     source);
-	}
-
-	function fallback(s, pattern, x, y) {
-		var sep = unquote(s.data.ivSep);
-
-		return mergeLiterals(parts(N.format(s.idx, pattern, s.zone.num,
-						     x, true), 'startRange')
-			.concat([{ type: 'literal', value: sep, source: 'shared' }])
-			.concat(parts(N.format(s.idx, pattern, s.zone.num, y,
-					       true), 'endRange')));
+		return x < 0 ? -Math.floor(-x) : Math.floor(x);
 	}
 
 	/* ---- the API ---- */
@@ -654,95 +1109,195 @@
 			var s = slots(this, 'format');
 
 			if (!s.bound) {
-				/* ICU writes a narrow no-break space before AM
-				 * and PM; format, and only format, gives a
-				 * plain one, as V8 does for the pages that
-				 * split on it */
+				/* V8 writes a plain space where ICU has a narrow
+				 * no-break one, for the pages that split on it */
 				s.bound = function (date) {
-					return N.format(s.idx, s.pattern, s.zone.num,
-							timeValue(date)).replace(
-						/\u202f/g, ' ');
+					return formatString(s, timeValue(date));
 				};
 			}
 			return s.bound;
 		}
 	});
 
-	function method(name, fn) {
-		Object.defineProperty(proto, name, {
-			configurable: true, writable: true, value: fn
-		});
+	/* FormatDateTime, which V8 has write a plain space where ICU has a
+	 * narrow no-break one, for the pages that split on it */
+	function formatString(s, x) {
+		var acc = { s: '', fields: [] };
+
+		try {
+			render(s.fmt, moment(s.fmt, s.zone, x), acc);
+		} catch (e) {
+			if (!e.icu)
+				throw e;
+			return failedText(s.fmt.pattern);
+		}
+		return acc.s.replace(/\u202f/g, ' ');
 	}
 
-	method('formatToParts', function (date) {
-		var s = slots(this, 'formatToParts');
-
-		return parts(N.format(s.idx, s.pattern, s.zone.num,
-				      timeValue(date), true));
-	});
-
-	function rangeArgs(a, b) {
-		if (a === undefined || b === undefined)
-			throw new TypeError('startDate and endDate are required');
-		return [timeValue(a), timeValue(b)];
+	function icuError(e) {
+		return e.icu ? new TypeError('Internal error. Icu error.') : e;
 	}
 
-	method('formatRange', function (a, b) {
-		var s = slots(this, 'formatRange'), t = rangeArgs(a, b);
-		var ps = formatRangeParts(s, t[0], t[1]), str = ps.map(function (p) {
-			return p.value;
-		}).join('');
+	method(proto, 'formatToParts', function formatToParts(date) {
+		var s = slots(this, 'formatToParts'), x = timeValue(date);
 
-		/* a range that comes to one date is written as format writes
-		 * it, with a plain space before AM and PM */
-		return ps.every(function (p) { return p.source === 'shared'; }) ?
-			str.replace(/\u202f/g, ' ') : str;
+		try {
+			return formatParts(s.fmt, s.zone, x);
+		} catch (e) {
+			throw icuError(e);
+		}
 	});
 
-	method('formatRangeToParts', function (a, b) {
-		var s = slots(this, 'formatRangeToParts'), t = rangeArgs(a, b);
+	/* ---- ranges ---- */
 
-		return formatRangeParts(s, t[0], t[1]);
+	/* what vita/js/intl_range.js works with */
+	var RANGE = R ? R({ P: P, generator: generator, formatter: formatter,
+		moment: moment, render: render, applyPattern: applyPattern,
+		HC_CHAR: HC_CHAR, TYPES: TYPES }) : null;
+
+	/* PartitionDateTimeRangePattern's arguments, as V8 reads them */
+	function rangeValues(start, end) {
+		if (start === undefined || end === undefined)
+			throw new TypeError('Invalid time value');
+		var x = Number(start), y = Number(end);
+
+		if (!isFinite(x) || Math.abs(x) > 8.64e15 || !isFinite(y) ||
+		    Math.abs(y) > 8.64e15)
+			throw new RangeError('Invalid time value');
+		return [x < 0 ? -Math.floor(-x) : Math.floor(x),
+			y < 0 ? -Math.floor(-y) : Math.floor(y)];
+	}
+
+	function rangeOf(s) {
+		return s.range || (s.range = RANGE.create(s));
+	}
+
+	/* where the two dates look the same in every field shown, V8
+	 * formats the first alone */
+	method(proto, 'formatRange', function formatRange(startDate, endDate) {
+		var s = slots(this, 'formatRange'), v = rangeValues(startDate, endDate);
+		var r;
+
+		try {
+			r = RANGE.format(rangeOf(s), s, v[0], v[1]);
+		} catch (e) {
+			throw icuError(e);
+		}
+		return r === null ? formatString(s, v[0]) : r;
 	});
 
-	method('resolvedOptions', function () {
+	method(proto, 'formatRangeToParts',
+	       function formatRangeToParts(startDate, endDate) {
+		var s = slots(this, 'formatRangeToParts');
+		var v = rangeValues(startDate, endDate), r;
+
+		try {
+			r = RANGE.formatToParts(rangeOf(s), s, v[0], v[1]);
+			return r === null ? formatParts(s.fmt, s.zone, v[0], 'shared') : r;
+		} catch (e) {
+			throw icuError(e);
+		}
+	});
+
+	/* V8's resolvedOptions reads the components off the pattern as it
+	 * is written, quoted text and all */
+	var PAIRS = [
+		['weekday', [['EEEEE', 'narrow'], ['EEEE', 'long'], ['EEE', 'short'],
+			['ccccc', 'narrow'], ['cccc', 'long'], ['ccc', 'short']]],
+		['era', [['GGGGG', 'narrow'], ['GGGG', 'long'], ['GGG', 'short']]],
+		['year', [['yy', '2-digit'], ['y', 'numeric']]],
+		['month', [['MMMMM', 'narrow'], ['MMMM', 'long'], ['MMM', 'short'],
+			['MM', '2-digit'], ['M', 'numeric'], ['LLLLL', 'narrow'],
+			['LLLL', 'long'], ['LLL', 'short'], ['LL', '2-digit'],
+			['L', 'numeric']]],
+		['day', [['dd', '2-digit'], ['d', 'numeric']]],
+		['dayPeriod', [['BBBBB', 'narrow'], ['bbbbb', 'narrow'],
+			['BBBB', 'long'], ['bbbb', 'long'], ['B', 'short'],
+			['b', 'short']]],
+		['hour', [['HH', '2-digit'], ['H', 'numeric'], ['hh', '2-digit'],
+			['h', 'numeric'], ['kk', '2-digit'], ['k', 'numeric'],
+			['KK', '2-digit'], ['K', 'numeric']]],
+		['minute', [['mm', '2-digit'], ['m', 'numeric']]],
+		['second', [['ss', '2-digit'], ['s', 'numeric']]],
+		['timeZoneName', [['zzzz', 'long'], ['z', 'short'],
+			['OOOO', 'longOffset'], ['O', 'shortOffset'],
+			['vvvv', 'longGeneric'], ['v', 'shortGeneric']]]
+	];
+
+	method(proto, 'resolvedOptions', function resolvedOptions() {
 		var s = slots(this, 'resolvedOptions'), r = {
-			locale: s.locale, calendar: 'gregory',
-			numberingSystem: 'latn', timeZone: s.zone.name
-		};
+			locale: s.locale, calendar: bcpCalendar(s.calendar),
+			numberingSystem: s.nu, timeZone: Z.resolvedName(s.zone)
+		}, i, j;
 
 		if (s.hc) {
 			r.hourCycle = s.hc;
 			r.hour12 = s.hc === 'h11' || s.hc === 'h12';
 		}
-		if (s.dateStyle || s.timeStyle) {
-			if (s.dateStyle)
-				r.dateStyle = s.dateStyle;
-			if (s.timeStyle)
-				r.timeStyle = s.timeStyle;
-			return r;
-		}
-		var o = optionsOfPattern(s.pattern), i;
+		if (s.dateStyle === undefined && s.timeStyle === undefined) {
+			for (i = 0; i < PAIRS.length; i++) {
+				if (PAIRS[i][0] === 'timeZoneName') {
+					var fsd = Math.min(3, (s.pattern.match(/S/g) || [])
+							   .length);
 
-		for (i = 0; i < FIELDS.length; i++) {
-			if (o[FIELDS[i]] !== undefined)
-				r[FIELDS[i]] = o[FIELDS[i]];
+					if (fsd)
+						r.fractionalSecondDigits = fsd;
+				}
+				for (j = 0; j < PAIRS[i][1].length; j++) {
+					if (s.pattern.indexOf(PAIRS[i][1][j][0]) >= 0) {
+						r[PAIRS[i][0]] = PAIRS[i][1][j][1];
+						break;
+					}
+				}
+			}
 		}
+		if (s.dateStyle !== undefined)
+			r.dateStyle = s.dateStyle;
+		if (s.timeStyle !== undefined)
+			r.timeStyle = s.timeStyle;
 		return r;
 	});
 
 	Object.defineProperty(proto, Symbol.toStringTag, {
 		configurable: true, value: 'Intl.DateTimeFormat'
 	});
-	Object.defineProperty(DateTimeFormat, 'supportedLocalesOf', {
-		configurable: true, writable: true,
-		value: function supportedLocalesOf(locales, options) {
-			return supported(locales, options);
-		}
+	method(DateTimeFormat, 'supportedLocalesOf',
+	       function supportedLocalesOf(locales, options) {
+		return X.supported(locales, options);
 	});
 	Object.defineProperty(DateTimeFormat, 'prototype', { writable: false });
 
-	W.Intl.DateTimeFormat = DateTimeFormat;
+	Intl.DateTimeFormat = DateTimeFormat;
+
+	/* ---- Intl's own ---- */
+
+	/* the collation types ICU has, under the names V8 lists them by */
+	var COLLATIONS = ['compat', 'dict', 'emoji', 'eor', 'phonebk',
+		'phonetic', 'pinyin', 'searchjl', 'stroke', 'trad', 'unihan',
+		'zhuyin'];
+	var values = Intl.supportedValuesOf;
+
+	/* not enumerable, as an earlier module may have left it */
+	Object.defineProperty(Intl, 'supportedValuesOf', { enumerable: false });
+	method(Intl, 'supportedValuesOf', function supportedValuesOf(key) {
+		key = String(key);
+		switch (key) {
+		case 'calendar':
+			return CALENDARS.slice();
+		case 'collation':
+			return COLLATIONS.slice();
+		case 'timeZone':
+			return Z.zones();
+		case 'currency':
+		case 'numberingSystem':
+		case 'unit':
+			return values.call(Intl, key);
+		}
+		throw new RangeError('Invalid key : ' + key);
+	});
+	method(Intl, 'getCanonicalLocales', function getCanonicalLocales(locales) {
+		return C.localeList(locales);
+	});
 
 	/* ---- Date's own formatting ---- */
 
@@ -763,41 +1318,38 @@
 
 	function toLocale(kind) {
 		return function (locales, options) {
-			var t = this instanceof Date ? this.getTime() : NaN;
-
 			if (!(this instanceof Date))
 				throw new TypeError('this is not a Date object.');
+			var t = this.getTime();
+
 			if (isNaN(t))
 				return 'Invalid Date';
 			return dateFormatter(kind, locales, options).format(t);
 		};
 	}
 
-	Object.defineProperty(Date.prototype, 'toLocaleString', {
-		configurable: true, writable: true, value: toLocale('all')
-	});
-	Object.defineProperty(Date.prototype, 'toLocaleDateString', {
-		configurable: true, writable: true, value: toLocale('date')
-	});
-	Object.defineProperty(Date.prototype, 'toLocaleTimeString', {
-		configurable: true, writable: true, value: toLocale('time')
-	});
+	method(Date.prototype, 'toLocaleString', toLocale('all'));
+	method(Date.prototype, 'toLocaleDateString', toLocale('date'));
+	method(Date.prototype, 'toLocaleTimeString', toLocale('time'));
 
-	/* ---- Intl ---- */
+	return { DateTimeFormat: DateTimeFormat, slots: slots,
+		formatParts: formatParts, create: create };
+};
 
-	var values = W.Intl.supportedValuesOf;
+if (typeof window !== 'undefined' && window.__vitaIntl &&
+    window.__vitaIntl.number && window.__vitaIntl.has &&
+    window.__vitaIntl.has('dt:index') && window.__vitaIntl.has('tz:index') &&
+    window.__vitaIntlCore && typeof __vitaIntlPattern !== 'undefined' &&
+    typeof __vitaIntlZone !== 'undefined' &&
+    typeof __vitaIntlCalendar !== 'undefined') {
+	(function (N) {
+		var P = __vitaIntlPattern(N);
 
-	W.Intl.supportedValuesOf = function (key) {
-		key = String(key);
-		if (key === 'timeZone')
-			return N.zones().sort();
-		if (key === 'calendar')
-			return ['gregory'];
-		if (key === 'numberingSystem')
-			return ['latn'];
-		return values ? values(key) : [];
-	};
-	W.Intl.getCanonicalLocales = function (locales) {
-		return localeList(locales);
-	};
-})();
+		N.date = __vitaIntlDate(window, N, window.__vitaIntlCore, N.number,
+			P, __vitaIntlZone(N, P), __vitaIntlCalendar(N),
+			typeof __vitaIntlRange !== 'undefined' ? __vitaIntlRange : null);
+	})(window.__vitaIntl);
+}
+
+if (typeof module !== 'undefined')
+	module.exports = __vitaIntlDate;

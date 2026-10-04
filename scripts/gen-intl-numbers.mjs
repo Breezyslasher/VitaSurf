@@ -848,11 +848,15 @@ function localeInfo() {
 if (process.argv[3]) {
 	const { collationEntries } = await import('./gen-intl-collation.mjs');
 	const { segmenterEntries } = await import('./gen-intl-segmenter.mjs');
+	const { dateEntries } = await import('./gen-intl-dates.mjs');
+	const { zoneEntries } = await import('./gen-intl-zones.mjs');
 
 	Object.assign(entries, collationEntries(process.argv[3],
 		Object.keys(index)));
 	Object.assign(entries, segmenterEntries(process.argv[3],
 		Object.keys(index)));
+	Object.assign(entries, dateEntries(process.argv[3], Object.keys(index)));
+	Object.assign(entries, zoneEntries(process.argv[3], Object.keys(index)));
 }
 
 entries.aliases = aliases();

@@ -141,14 +141,17 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/subtle.js
         vita/js/wasm.js
         vita/js/intl_core.js
-        vita/js/intl_pattern.js
-        vita/js/intl.js
         vita/js/intl_number.js
         vita/js/intl_names.js
         vita/js/intl_tags.js
         vita/js/intl_list.js
         vita/js/intl_collator.js
-        vita/js/intl_segmenter.js)
+        vita/js/intl_segmenter.js
+        vita/js/intl_pattern.js
+        vita/js/intl_zone.js
+        vita/js/intl_calendar.js
+        vita/js/intl_range.js
+        vita/js/intl.js)
     set(PRELUDE_BYTES "")
     foreach(part ${PRELUDE_PARTS})
         set(full "${CMAKE_SOURCE_DIR}/${part}")
@@ -165,8 +168,7 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
     # websocket.c runs WebSocket connections on libcurl's ws API
-    # intl.c is Intl.DateTimeFormat's time zones and formatting, and
-    # reads the locale data Intl.NumberFormat formats with
+    # intl.c reads the locale data Intl is built on, resources/intl.pak
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
         vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c
         vita/js/intl.c)
