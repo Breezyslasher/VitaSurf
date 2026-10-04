@@ -229,6 +229,14 @@ export function cases(full) {
 		out.push({ k: 'can', t, c: err(() => Intl.getCanonicalLocales(t)),
 			l: locale(t, undefined, !full || out.length % 4 === 0) });
 	}
+	// every locale's preferences, numbering system among them
+	if (full) {
+		const R = pakReader(process.env.PAK ||
+				    path.join(ROOT, 'resources/intl.pak'));
+
+		for (const t of Object.keys(R('index').locales))
+			out.push({ k: 'loc', t, l: locale(t, undefined, true) });
+	}
 	// every region's time zones and preferences, and every region an rg
 	// or sd keyword might name
 	if (full) {
