@@ -21,8 +21,8 @@
 // Entries, by name: index (the locales and their parents), plurals,
 // aliases (of languages, scripts, regions, variants, subdivisions and
 // keyword values), likely (likely subtags), locinfo (week, hour cycle,
-// calendar and collation preferences, time zones by region, scripts
-// written right to left), and for each CLDR locale n: (numbers), c:
+// calendar and collation preferences, scripts written right to left),
+// and for each CLDR locale n: (numbers), c:
 // (currency names), d: (names of languages, regions, scripts, variants
 // and calendars), r: (relative times and the names of date fields) and
 // l: (list patterns), and the collation entries, k:, and the
@@ -798,14 +798,6 @@ function localeInfo() {
 
 	for (const r in pref)
 		cal[r] = pref[r].map(c => CAL[c] || c);
-	const regions = Object.keys(json(path.join(NAMES, 'main', 'en',
-		'territories.json')).main.en.localeDisplayNames.territories)
-		.filter(r => /^([A-Z]{2}|\d{3})$/.test(r));
-	const tz = {};
-
-	// every region, so that rg and sd are read as ICU reads them
-	for (const r of regions)
-		tz[r] = new Intl.Locale('und-' + r).timeZones || [];
 	// a locale's collations are its own, or those of the first of its
 	// fallbacks that has some, where a script the language is not likely
 	// written in falls back to root (vita/js/intl_tags.js); kept where
@@ -838,7 +830,7 @@ function localeInfo() {
 
 	return {
 		first: days(w.firstDay), start: days(w.weekendStart),
-		end: days(w.weekendEnd), min: num(w.minDays), hc, cal, tz,
+		end: days(w.weekendEnd), min: num(w.minDays), hc, cal,
 		coll, collRoot: root, rtl
 	};
 }

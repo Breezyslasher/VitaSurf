@@ -692,15 +692,26 @@ var __vitaIntlTags = function (W, N, C, X) {
 
 	/* ---- what a locale prefers ---- */
 
+	/* ICU's RegionValidateMap (common/loclikely.cpp): a bit for each two
+	 * letters, AA first, set for those an rg or sd keyword may name */
+	var RG_REGIONS = [
+		0xeedf597c, 0xdeddbdef, 0x15943f3f, 0x0e00d580, 0xb0095c00,
+		0x0015fb9f, 0x781c068d, 0x0340400f, 0xf42b1d00, 0xfd4f8141,
+		0x25d7fffc, 0x0100084b, 0x538f3c40, 0x40000001, 0xfdf15100,
+		0x9fbb7ae7, 0x0410419a, 0x00408557, 0x00004002, 0x00100001,
+		0x00400408, 0x00000001
+	];
+
 	/* the region a keyword gives, as ICU reads rg and sd: its first two
-	 * letters, if they are a region */
+	 * letters, if ICU takes them for a region */
 	function keywordRegion(t, key) {
-		var v = keyword(t, key), r;
+		var v = keyword(t, key), r, i;
 
 		if (!v || !/^[a-z]{2}[a-z\d]{1,4}$/.test(v))
 			return null;
 		r = v.slice(0, 2).toUpperCase();
-		return own(data('locinfo').tz, r) ? r : null;
+		i = (r.charCodeAt(0) - 65) * 26 + r.charCodeAt(1) - 65;
+		return RG_REGIONS[i >> 5] >>> (i & 31) & 1 ? r : null;
 	}
 
 	/* the region whose preferences the locale takes: rg's, the tag's,
@@ -762,14 +773,28 @@ var __vitaIntlTags = function (W, N, C, X) {
 		return (c || info.collRoot).split(' ');
 	}
 
+	/* DateTimePatternGenerator::getAllowedHourFormats: the language and
+	 * the region (rg's or the tag's), the likely ones if either is
+	 * missing (ICU has no language for und), then CLDR's preference for
+	 * the two or the region, and h23 where CLDR has none */
 	function hourCycles(t) {
-		var v = keyword(t, 'hc'), hc = data('locinfo').hc, r = region(t);
+		var v = keyword(t, 'hc'), hc = data('locinfo').hc, m;
+		var lang = t.lang === 'und' ? '' : t.lang;
+		var r = keywordRegion(t, 'rg') ||
+			(t.region ? t.region.toUpperCase() : '');
 
 		if (v)
 			return [v];
-		/* ICU takes h23 where CLDR has no preference */
-		v = own(hc, t.lang + '-' + r) || own(hc, r) || 'h23';
-		return [v];
+		if (!lang || !r) {
+			m = likely(t);
+			if (m) {
+				lang = m.lang;
+				r = m.region ? m.region.toUpperCase() : '';
+			}
+		}
+		lang = lang || 'und';
+		r = r || '001';
+		return [own(hc, lang + '-' + r) || own(hc, r) || 'h23'];
 	}
 
 	function numberingSystems(t) {
@@ -783,11 +808,38 @@ var __vitaIntlTags = function (W, N, C, X) {
 		return [found ? X.entry('n', X.dataTag(found)).nu : 'latn'];
 	}
 
+	/* TimeZone::createTimeZoneIDEnumeration(UCAL_ZONE_TYPE_CANONICAL,
+	 * region), as V8 sorts it: the zones of ICU's zoneinfo64 that are
+	 * their own CLDR canonical ID and whose region is the tag's, from the
+	 * index vita/js/intl_zone.js reads (scripts/gen-intl-zones.mjs). The
+	 * index has the region of every canonical location zone; the rest,
+	 * Etc/Unknown aside, are ICU's zones of region 001 */
+	var ZONES = null;
+
+	function zonesByRegion() {
+		var ix, z, r;
+
+		if (ZONES)
+			return ZONES;
+		ix = JSON.parse(N.pak('tz:index'));
+		ZONES = { '001': [] };
+		for (z in ix.r) {
+			r = ix.r[z];
+			(ZONES[r] = ZONES[r] || []).push(z);
+		}
+		ix.n.split(' ').forEach(function (n) {
+			if (!own(ix.c, n) && !own(ix.r, n) && n !== 'Etc/Unknown')
+				ZONES['001'].push(n);
+		});
+		for (r in ZONES)
+			ZONES[r].sort();
+		return ZONES;
+	}
+
 	function timeZones(t) {
 		if (!t.region)
 			return undefined;
-		return (own(data('locinfo').tz, t.region.toUpperCase()) || [])
-			.slice();
+		return (own(zonesByRegion(), t.region.toUpperCase()) || []).slice();
 	}
 
 	function textInfo(t) {

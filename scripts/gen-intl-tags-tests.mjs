@@ -71,6 +71,10 @@ const TAGS = ['en', 'en-US', 'EN-us', 'en-Latn-US', 'zh', 'zh-TW', 'zh-HK',
 	'en-GB-u-ca-iso8601', 'ar-SA-u-ca-iso8601', 'fa-u-ca-iso8601-fw-thu',
 	'en-u-ca-iso8601-rg-sazzzz', 'und-u-ca-iso8601', 'en-u-rg-ilzzzz',
 	'en-u-rg-xxzzzz', 'en-GB-u-ca-iso8601-fw-sun', 'ar-AE', 'ar-MA',
+	'und-001', 'und-ZZ', 'und-999', 'und-AQ', 'und-Arab-001', 'und-150',
+	'und-US', 'und-IN', 'und-CN', 'und-RU', 'und-u-rg-gbzzzz',
+	'und-u-rg-zzzzzz', 'en-u-rg-xazzzz', 'fr-u-rg-euzzzz', 'fr-u-rg-qozzzz',
+	'fr-Latn-AX-u-rg-xazzzz', 'en-u-sd-zzzzzz', 'de-u-rg-unzzzz',
 	'ar-DZ', 'fa-IR-u-fw-sat', 'en-IR', 'ps-AF', 'en-MV', 'en-BR', 'pt-BR',
 	'en-ES', 'es', 'es-MX', 'es-US', 'ca-ES', 'gl', 'eu', 'ast', 'en-GB',
 	'en-AU', 'en-CA', 'fr-CH', 'it-CH', 'de', 'de-LI', 'lt', 'lv', 'et',
@@ -217,6 +221,26 @@ export function cases(full) {
 	for (const t of tags) {
 		out.push({ k: 'can', t, c: err(() => Intl.getCanonicalLocales(t)),
 			l: locale(t, undefined, !full || out.length % 4 === 0) });
+	}
+	// every region's time zones and preferences, and every region an rg
+	// keyword might name
+	if (full) {
+		const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', regions = [];
+
+		for (const a of A) {
+			for (const b of A)
+				regions.push(a + b);
+		}
+		for (let i = 0; i < 1000; i++)
+			regions.push(String(i).padStart(3, '0'));
+		for (const r of regions) {
+			const ts = ['und-' + r];
+
+			if (/^[A-Z]/.test(r))
+				ts.push('fr-u-rg-' + r.toLowerCase() + 'zzzz');
+			for (const t of ts)
+				out.push({ k: 'loc', t, l: locale(t, undefined, true) });
+		}
 	}
 	for (const t of BAD)
 		out.push({ k: 'can', t, c: err(() => Intl.getCanonicalLocales(t)),
