@@ -32,8 +32,13 @@ NetSurf's Duktape fails to parse it; it is somewhat slower on pages
 where it therefore does real work, and its own allocations stay under
 1 MB on such pages. The Duktape build has since been dropped. Phase 7
 (polish) is in progress: page zoom from the Start menu, downloads saved
-under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, and
-resume handling that stops stale fetches after a suspend.
+under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, a
+file browser (Files in the Start menu, `about:files`) that lists every
+storage device the console can read, opens `.html` pages and shows `.css`
+files as text, and resume handling that stops stale fetches after a
+suspend. The file browser's types are a table in
+`content/fetchers/about/files.c` (patch 0321), so a new kind of file is
+one row; pages cannot open it, only the browser itself.
 
 Sites behind Cloudflare's browser check ("Just a moment...") cannot be
 passed by the browser itself. If you run
@@ -451,7 +456,7 @@ fails for every charset, so libparserutils is built with its own codecs and
 | Tap or Cross on a text field | Opens the system keyboard for that field |
 | Square | Reload |
 | Select | Toggle pointer mode: the D-pad nudges the pointer instead |
-| Start | Menu: bookmarks, history, downloads, home, Wi-Fi sign-in, zoom, JavaScript, image and dark mode toggles, quit |
+| Start | Menu: bookmarks, history, downloads, files, home, Wi-Fi sign-in, zoom, JavaScript, image and dark mode toggles, quit |
 | Front touch | Tap to click, drag to scroll |
 | Select + Start | Quit |
 

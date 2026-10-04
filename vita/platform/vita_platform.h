@@ -247,6 +247,20 @@ extern unsigned int vita_main_stack_bytes;
 struct gui_file_table;
 extern struct gui_file_table *vita_file_table;
 
+/** A place the file browser (about:files) starts from. */
+struct vita_file_root {
+	const char *path;  /**< a folder, ending in a slash: "ux0:/" */
+	const char *label; /**< what is there */
+};
+
+/**
+ * The places the file browser lists first (vita_file.c): VitaSurf's own
+ * folders, then each storage device that can be read now.
+ *
+ * eturn How many were written to roots, at most max.
+ */
+int vita_file_roots(struct vita_file_root *roots, int max);
+
 /** NetSurf download table (vita_download.c): saves to the downloads dir. */
 struct gui_download_table;
 extern struct gui_download_table *vita_download_table;

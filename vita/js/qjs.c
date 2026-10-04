@@ -6056,6 +6056,28 @@ static void nav_callback(void *p)
 	nsurl_unref(url);
 }
 
+/* whether a URL is the browser's file browser, about:files */
+static bool is_file_browser(nsurl *url)
+{
+	lwc_string *scheme = nsurl_get_component(url, NSURL_SCHEME);
+	lwc_string *path = nsurl_get_component(url, NSURL_PATH);
+	bool about = false, files = false;
+
+	if (scheme != NULL) {
+		if (lwc_string_caseless_isequal(scheme, corestring_lwc_about,
+						&about) != lwc_error_ok) {
+			about = false;
+		}
+		lwc_string_unref(scheme);
+	}
+	if (path != NULL) {
+		files = lwc_string_length(path) == 5 &&
+			strncasecmp(lwc_string_data(path), "files", 5) == 0;
+		lwc_string_unref(path);
+	}
+	return about && files;
+}
+
 static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 {
 	nsurl *cur = NULL, *url = NULL;
@@ -6078,6 +6100,17 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 		nsurl_unref(cur);
 	} else {
 		nsurl_create(href, &url);
+	}
+	/*
+	 * The file browser (about:files) is the browser's own page: the
+	 * about: fetcher refuses a fetch a page made, but a script's
+	 * navigation carries no referer, so it is refused here (VitaSurf).
+	 */
+	if (url != NULL && is_file_browser(url)) {
+		vita_log("qjs: script may not navigate to %s",
+			 nsurl_access(url));
+		nsurl_unref(url);
+		url = NULL;
 	}
 	if (url != NULL) {
 		vita_log("qjs: script navigates to %s", nsurl_access(url));
