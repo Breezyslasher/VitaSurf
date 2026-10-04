@@ -34,12 +34,13 @@
 // regional locale costs a few bytes and a numbering system a locale has
 // no symbols for takes root's. The locales are those ICU in Node offers,
 // so Intl.NumberFormat.supportedLocalesOf answers as a browser's would;
-// ICU's aliases (en-US, sr-RS, zh-TW) point at the CLDR locale they take
-// their data from. Where ICU's data departs from CLDR's JSON, it is read
-// off ICU itself: the Arabic numbering systems' symbols, the order of a
-// currency's name and number, the list of currencies in use, the time
-// zones and collations Intl.Locale lists, three language aliases, and
-// the locales Intl.ListFormat offers.
+// ICU's aliases (en-US, sr-RS, zh-TW, and ars, which is ar_SA in ICU's
+// data) point at the CLDR locale they take their data from. Where ICU's
+// data departs from CLDR's JSON, it is read off ICU itself: the Arabic
+// numbering systems' symbols, the order of a currency's name and number,
+// the list of currencies in use, three language aliases, and the
+// locales Intl.ListFormat offers; and the collations Intl.Locale lists
+// are those of ICU's collation data.
 //
 // Get the CLDR packages, at the version Node's ICU uses
 // (node -p process.versions.cldr), then run this under that Node:
@@ -113,6 +114,23 @@ function parentOf(tag) {
 
 // ---- the locales ICU has, and where each takes its data from ----
 
+// the locales ICU's data has as an alias of another (%%ALIAS), given
+// its directory
+const ICU_ALIAS = {};
+
+if (process.argv[3]) {
+	const dir = path.join(process.argv[3], 'locales');
+
+	for (const f of fs.readdirSync(dir)) {
+		const m = /^([a-z]+(?:_[A-Za-z0-9]+)*)\.txt$/.exec(f);
+		const a = m && /"%%ALIAS"\s*\{\s*"([^"]+)"/.exec(
+			fs.readFileSync(path.join(dir, f), 'utf8'));
+
+		if (a)
+			ICU_ALIAS[m[1].replace(/_/g, '-')] = a[1].replace(/_/g, '-');
+	}
+}
+
 function icuLocales() {
 	const terr = new Set(Object.keys(SUP('territoryInfo.json').territoryInfo));
 	const bases = new Set();
@@ -132,6 +150,9 @@ function icuLocales() {
 	for (const b of bases)
 		for (const r of terr)
 			cand.add(b + '-' + r);
+	// and ICU's own aliases of locales, ars (ar_SA) among them
+	for (const t in ICU_ALIAS)
+		cand.add(t);
 	const out = [];
 
 	for (const t of cand) {
@@ -150,6 +171,8 @@ const likely = SUP('likelySubtags.json').likelySubtags;
 function source(tag) {
 	if (FOLDERS.includes(tag))
 		return tag;
+	if (ICU_ALIAS[tag] && !tag.includes('-'))
+		return source(ICU_ALIAS[tag]);
 	const p = tag.split('-'), lang = p[0];
 	let script = p.length > 2 ? p[1] : null;
 	const region = p[p.length - 1];
@@ -798,11 +821,31 @@ function localeInfo() {
 
 	for (const r in pref)
 		cal[r] = pref[r].map(c => CAL[c] || c);
-	// a locale's collations are its own, or those of the first of its
-	// fallbacks that has some, where a script the language is not likely
-	// written in falls back to root (vita/js/intl_tags.js); kept where
-	// that does not give what ICU has
-	const coll = {}, root = new Intl.Locale('und').collations.join(' ');
+	// a locale's collations, as ucol_getKeywordValuesForLocale reads them
+	// and V8 lists them: the types of ICU's collation bundle for it and
+	// its parents (scripts/gen-intl-collation.mjs), its default among
+	// them, less private-, standard and search, sorted; or, without
+	// ICU's data, what Node's ICU gives
+	const L = entries['k:meta'] ? entries['k:meta'].locales : null;
+	const typesOf = tag => {
+		let p = tag;
+
+		if (!L)
+			return new Intl.Locale(tag === 'root' ? 'und' : tag)
+				.collations.join(' ');
+		while (p && !L[p])
+			p = p.lastIndexOf('-') > 0 ? p.slice(0, p.lastIndexOf('-')) :
+				null;
+		const e = L[p || 'root'];
+
+		return [...new Set(Object.keys(e.types).concat([e.dflt]))]
+			.filter(t => t !== 'standard' && t !== 'search').sort()
+			.join(' ');
+	};
+	// kept where they are not those of the first of its fallbacks that
+	// has some, where a script the language is not likely written in
+	// falls back to root (vita/js/intl_tags.js)
+	const coll = {}, root = typesOf('root');
 	const fallback = tag => {
 		for (let p = tag; p; p = p.lastIndexOf('-') > 0 ?
 		     p.slice(0, p.lastIndexOf('-')) : null) {
@@ -811,14 +854,20 @@ function localeInfo() {
 			if (coll[p] !== undefined)
 				return coll[p];
 			if (q.length === 2 && q[1].length === 4 &&
-			    new Intl.Locale(q[0]).maximize().script !== q[1])
+			    (entries.likely[q[0]] || '').split('-')[1] !== q[1])
 				return root;
 		}
 		return root;
 	};
+	const tags = new Set(ICU);
 
-	for (const tag of ICU.slice().sort((a, b) => a.length - b.length)) {
-		const c = new Intl.Locale(tag).collations.join(' ');
+	for (const t in L || {}) {
+		if (t !== 'root' && !/-POSIX$/.test(t))
+			tags.add(t);
+	}
+	for (const tag of [...tags].sort((a, b) => a.length - b.length ||
+					 (a < b ? -1 : a > b ? 1 : 0))) {
+		const c = typesOf(tag);
 
 		if (c !== fallback(tag))
 			coll[tag] = c;

@@ -77,6 +77,8 @@ const TAGS = ['en', 'en-US', 'EN-us', 'en-Latn-US', 'zh', 'zh-TW', 'zh-HK',
 	'und-US', 'und-IN', 'und-CN', 'und-RU', 'und-u-rg-gbzzzz',
 	'und-u-rg-zzzzzz', 'en-u-rg-xazzzz', 'fr-u-rg-euzzzz', 'fr-u-rg-qozzzz',
 	'fr-Latn-AX-u-rg-xazzzz', 'en-u-sd-zzzzzz', 'de-u-rg-unzzzz',
+	'ars', 'ars-SA', 'ars-u-co-compat', 'zh-Latn', 'sr-Latn', 'en-Arab',
+	'yue-Hans', 'zh-Hant-HK', 'ja-Kore', 'de-AT-u-co-phonebk',
 	'ar-DZ', 'fa-IR-u-fw-sat', 'en-IR', 'ps-AF', 'en-MV', 'en-BR', 'pt-BR',
 	'en-ES', 'es', 'es-MX', 'es-US', 'ca-ES', 'gl', 'eu', 'ast', 'en-GB',
 	'en-AU', 'en-CA', 'fr-CH', 'it-CH', 'de', 'de-LI', 'lt', 'lv', 'et',
@@ -218,6 +220,9 @@ export function cases(full) {
 		for (const t of Object.keys(a.d))
 			tags.push('en-u-rg-' + t, 'en-u-sd-' + t);
 		tags = tags.concat(Object.keys(L));
+		// every locale ICU has a collation bundle for
+		tags = tags.concat(Object.keys(R('k:meta').locales).filter(t =>
+			t !== 'root' && !/-POSIX$/.test(t)));
 	}
 	tags = [...new Set(tags)];
 	for (const t of tags) {
