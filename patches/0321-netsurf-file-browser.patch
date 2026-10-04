@@ -92,10 +92,10 @@ index 35128d2c9..239ef5d15 100644
  
 diff --git a/content/fetchers/about/files.c b/content/fetchers/about/files.c
 new file mode 100644
-index 000000000..39db549c7
+index 000000000..5b432cc61
 --- /dev/null
 +++ b/content/fetchers/about/files.c
-@@ -0,0 +1,767 @@
+@@ -0,0 +1,768 @@
 +/*
 + * Copyright 2026 VitaSurf contributors
 + *
@@ -122,9 +122,10 @@ index 000000000..39db549c7
 + * devices (vita/platform/vita_file.c), elsewhere the root folder.
 + * about:files?path=FOLDER/ lists a folder, folders first. A file is
 + * offered by what kinds[] says of its extension: a page opens at its
-+ * file: URL, a text file is shown here, and the rest are listed without
-+ * a link until the browser can open them. Adding a type is a row in
-+ * kinds[].
++ * file: URL (and loads the stylesheets it links to, as any page does),
++ * and the rest are listed without a link until the browser can open
++ * them. Adding a type is a row in kinds[]; FILES_TEXT shows a file here
++ * as text, for a kind that wants it.
 + *
 + * Only the browser itself may ask: a fetch that a page made (it has a
 + * referer, and that is not another about: page) is refused, so a site
@@ -180,8 +181,8 @@ index 000000000..39db549c7
 +	{ "html", "HTML page", FILES_PAGE },
 +	{ "htm", "HTML page", FILES_PAGE },
 +	{ "xhtml", "HTML page", FILES_PAGE },
-+	{ "css", "Stylesheet", FILES_TEXT },
-+	/* known, but not opened yet */
++	/* known, but not opened yet; a page loads its stylesheets */
++	{ "css", "Stylesheet", FILES_NONE },
 +	{ "txt", "Text", FILES_NONE },
 +	{ "log", "Text", FILES_NONE },
 +	{ "ini", "Text", FILES_NONE },
@@ -537,9 +538,9 @@ index 000000000..39db549c7
 +	int i;
 +
 +	out_head(o, "Files");
-+	out_str(o, "<p class=\"p\">Pages (.html) open in the browser and "
-+		"stylesheets (.css) are shown as text. Other files are "
-+		"listed only, for now.</p>\n<ul>\n");
++	out_str(o, "<p class=\"p\">Pages (.html) open in the browser, with "
++		"the stylesheets (.css) they link to. Other files are listed "
++		"only, for now.</p>\n<ul>\n");
 +	for (i = 0; i < n; i++) {
 +		out_str(o, "<li><a href=\"");
 +		out_files_href(o, roots[i].path);

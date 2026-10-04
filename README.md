@@ -34,8 +34,8 @@ where it therefore does real work, and its own allocations stay under
 (polish) is in progress: page zoom from the Start menu, downloads saved
 under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, a
 file browser (Files in the Start menu, `about:files`) that lists every
-storage device the console can read, opens `.html` pages and shows `.css`
-files as text, and resume handling that stops stale fetches after a
+storage device the console can read and opens `.html` pages, which load
+the `.css` stylesheets they link to, and resume handling that stops stale fetches after a
 suspend. The file browser's types are a table in
 `content/fetchers/about/files.c` (patch 0321), so a new kind of file is
 one row; pages cannot open it, only the browser itself.
