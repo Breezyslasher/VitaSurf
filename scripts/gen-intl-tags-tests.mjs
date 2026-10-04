@@ -22,9 +22,11 @@
 // no language for und, keeps -u-va-posix in the baseName of en-US-posix,
 // and leaves nine und- tags unminimized (und-Hant, und-PH...) though
 // UTS #35's Remove Likely Subtags, run on ICU's own maximize, gives
-// zh-TW and fil. A tag whose -u-rg- has no value (en-u-rg-uk, two keys)
-// is left out: ICU writes the empty value as "yes" and takes YE from it,
-// so V8 gives such a tag Yemen's week.
+// zh-TW and fil; and a key with no value (en-u-ca) gives its list the
+// getter's "true", where V8 gives ICU's "yes". A tag whose -u-rg- has
+// no value (en-u-rg-uk, two keys) is left out: ICU writes the empty
+// value as "yes" and takes YE from it, so V8 gives such a tag Yemen's
+// week.
 
 import fs from 'fs';
 import zlib from 'zlib';
@@ -223,7 +225,7 @@ export function cases(full) {
 			l: locale(t, undefined, !full || out.length % 4 === 0) });
 	}
 	// every region's time zones and preferences, and every region an rg
-	// keyword might name
+	// or sd keyword might name
 	if (full) {
 		const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', regions = [];
 
@@ -237,7 +239,8 @@ export function cases(full) {
 			const ts = ['und-' + r];
 
 			if (/^[A-Z]/.test(r))
-				ts.push('fr-u-rg-' + r.toLowerCase() + 'zzzz');
+				ts.push('fr-u-rg-' + r.toLowerCase() + 'zzzz',
+					'und-u-sd-' + r.toLowerCase() + 'zzzz');
 			for (const t of ts)
 				out.push({ k: 'loc', t, l: locale(t, undefined, true) });
 		}
@@ -394,6 +397,16 @@ export function SPEC(I) {
 	is('fresh arrays', new L('en-US').getCalendars() !==
 	   new L('en-US').getCalendars(), true);
 	is('no region, no time zones', new L('en').getTimeZones(), undefined);
+	// a key with no value: the getter's "true", which V8 gives as ICU's
+	// "yes" (and its hourCycles throws for en-u-nu)
+	is('ca with no value', new L('en-u-ca').getCalendars(), ['true']);
+	is('co with no value', new L('en-u-co').getCollations(), ['true']);
+	is('hc with no value', new L('en-u-hc').getHourCycles(), ['true']);
+	is('nu with no value', new L('en-u-nu').getNumberingSystems(),
+	   ['true']);
+	is('nu with no value, hour cycles', new L('en-u-nu').getHourCycles(),
+	   ['h12']);
+	is('ca and nu with no value', new L('en-u-ca-nu').calendars, ['true']);
 	is('toStringTag', Object.prototype.toString.call(new L('en')),
 	   '[object Intl.Locale]');
 	is('und-x-private', new L('und-x-private').toString(), 'und-x-private');

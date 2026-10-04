@@ -692,6 +692,15 @@ var __vitaIntlTags = function (W, N, C, X) {
 
 	/* ---- what a locale prefers ---- */
 
+	/* the value the locale's own key gives a list of preferences: as
+	 * its getter has it, "true" for a key with no value, where ICU (and
+	 * so V8) writes "yes" */
+	function preference(t, key) {
+		var v = keyword(t, key);
+
+		return v === '' ? 'true' : v;
+	}
+
 	/* ICU's RegionValidateMap (common/loclikely.cpp): a bit for each two
 	 * letters, AA first, set for those an rg or sd keyword may name */
 	var RG_REGIONS = [
@@ -731,7 +740,7 @@ var __vitaIntlTags = function (W, N, C, X) {
 	}
 
 	function calendars(t) {
-		var v = keyword(t, 'ca'), cal = data('locinfo').cal;
+		var v = preference(t, 'ca'), cal = data('locinfo').cal;
 
 		if (v)
 			return [v];
@@ -760,7 +769,7 @@ var __vitaIntlTags = function (W, N, C, X) {
 	}
 
 	function collations(t) {
-		var v = keyword(t, 'co'), info = data('locinfo'), base, c;
+		var v = preference(t, 'co'), info = data('locinfo'), base, c;
 
 		if (v)
 			return [v];
@@ -778,7 +787,7 @@ var __vitaIntlTags = function (W, N, C, X) {
 	 * missing (ICU has no language for und), then CLDR's preference for
 	 * the two or the region, and h23 where CLDR has none */
 	function hourCycles(t) {
-		var v = keyword(t, 'hc'), hc = data('locinfo').hc, m;
+		var v = preference(t, 'hc'), hc = data('locinfo').hc, m;
 		var lang = t.lang === 'und' ? '' : t.lang;
 		var r = keywordRegion(t, 'rg') ||
 			(t.region ? t.region.toUpperCase() : '');
@@ -798,7 +807,7 @@ var __vitaIntlTags = function (W, N, C, X) {
 	}
 
 	function numberingSystems(t) {
-		var v = keyword(t, 'nu'), base, found;
+		var v = preference(t, 'nu'), base, found;
 
 		if (v)
 			return [v];
