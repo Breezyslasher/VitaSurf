@@ -80,7 +80,12 @@ var __vitaIntlNames = function (W, C, X) {
 		s.numeric = getOption(o, 'numeric', ['always', 'auto'], 'always');
 		nfo = { numberingSystem: s.nu };
 		s.nf = new Intl.NumberFormat(s.tag, nfo);
-		s.pr = new Intl.PluralRules(s.tag);
+		/* the plural goes by the locale's own rules, root's (all
+		 * "other") where ICU has none, as ICU's formatter takes them;
+		 * PluralRules would take the default locale's */
+		s.rules = X.rulesFor(s.tag, 'c');
+		s.plain = new Intl.NumberFormat(s.tag, { numberingSystem: 'latn',
+			useGrouping: false });
 		s.data = X.entry('r', X.dataTag(s.tag));
 		RTF_SLOTS.set(this, s);
 		return this;
@@ -113,7 +118,9 @@ var __vitaIntlNames = function (W, C, X) {
 			throw new RangeError('Invalid unit argument for ' +
 					     'Intl.RelativeTimeFormat \'' + unit + '\'');
 		field = fieldOf(s.data, u, s.style) || {};
-		if (s.numeric === 'auto' && field.r) {
+		/* ICU has words for -2 to 2 only (UDateDirection), though
+		 * CLDR has Scottish Gaelic's 3 */
+		if (s.numeric === 'auto' && field.r && /^-?[0-2]$/.test(String(value))) {
 			rel = field.r[String(value)];
 			if (rel !== undefined)
 				return [{ type: 'literal', value: rel }];
@@ -125,9 +132,17 @@ var __vitaIntlNames = function (W, C, X) {
 		num = '';
 		for (i = 0; i < parts.length; i++)
 			num += parts[i].value;
-		var forms = field[tl] || {};
+		var forms = field[tl] || {}, int = '', frac = '', p;
 
-		pattern = forms[s.pr.select(value)] || forms.other || '{0}';
+		p = s.plain.formatToParts(value);
+		for (i = 0; i < p.length; i++) {
+			if (p[i].type === 'integer')
+				int += p[i].value;
+			else if (p[i].type === 'fraction')
+				frac += p[i].value;
+		}
+		pattern = forms[X.category(s.rules, X.operands(int, frac, 0))] ||
+			forms.other || '{0}';
 		at = pattern.indexOf('{0}');
 		if (at < 0)
 			return [{ type: 'literal', value: pattern }];

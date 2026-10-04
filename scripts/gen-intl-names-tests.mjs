@@ -17,7 +17,11 @@
 // and Arabic; and it gives a calendar it has no name for by CLDR's key
 // (ethiopic-amete-alem) where the spec gives its code (ethioaa), and a
 // currency code in lower case with no name back as its code, though
-// fallback is none.
+// fallback is none. Its RelativeTimeFormat also departs, and those cases
+// are not written: it rounds half to even where the spec's NumberFormat
+// rounds half away from zero (1.0005 days is 1 day), it takes a value
+// within 0.005 of -2 to 2 as that day (0.995 days is tomorrow), and an
+// unsupported numberingSystem option drops the locale's -u-nu-.
 
 export const LOCALES = ['en', 'en-GB', 'en-IN', 'de', 'de-CH', 'fr', 'es',
 	'es-419', 'it', 'pt', 'pt-PT', 'nl', 'sv', 'pl', 'ru', 'uk', 'tr', 'ar',
@@ -167,6 +171,12 @@ export function cases(full) {
 			}
 		}
 	}
+	// ICU's plural rules for the formatter, root's where it has none
+	// (yrl, ccp), and its relative words for -2 to 2 only (gd has 3)
+	for (const loc of ['yrl', 'ccp', 'gd', 'kgp'])
+		for (const numeric of ['always', 'auto'])
+			rtf(loc, { numeric }, [-3, -2, -1, 0, 1, 2, 3, 1.5],
+			    ['second', 'day', 'quarter', 'year']);
 	for (const type in BAD)
 		dn('en', { type }, BAD[type]);
 	for (const o of [undefined, {}, { type: 'bogus' }, { type: 'region',
