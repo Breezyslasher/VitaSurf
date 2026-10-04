@@ -1,0 +1,172 @@
+diff --git a/quickjs.c b/quickjs.c
+index 6cb394b..dc7faa9 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -266,6 +266,8 @@ typedef struct JSValueLink {
+ 
+ struct JSRuntime {
+     JSMallocFunctions mf;
++    /* the handler of lazy properties (VitaSurf), or NULL */
++    JSLazyPropertyHandler *lazy_handler;
+     JSMallocState malloc_state;
+     const char *rt_info;
+ 
+@@ -8650,6 +8652,61 @@ static JSAutoInitFunc *const js_autoinit_func_table[] = {
+     js_bytecode_autoinit, /* JS_AUTOINIT_ID_BYTECODE */
+ };
+ 
++/*
++ * Lazy properties (VitaSurf) are bytecode autoinit properties whose
++ * opaque value is at or above this: the two bits of the autoinit kind
++ * are all taken, and the built-ins' own opaque values are small.
++ */
++#define JS_LAZY_OPAQUE_BASE ((uintptr_t)1 << 20)
++
++static bool js_autoinit_is_lazy(JSProperty *pr)
++{
++    return js_autoinit_get_id(pr) == JS_AUTOINIT_ID_BYTECODE &&
++        (uintptr_t)pr->u.init.opaque >= JS_LAZY_OPAQUE_BASE;
++}
++
++/*
++ * A lazy property's handler may change the object, this property among
++ * them, so nothing found before it runs is trusted after: the property
++ * is looked up again, and given the value only if it is still the same
++ * placeholder. Otherwise the caller, which retries, finds what is there.
++ */
++static int js_lazy_init_property(JSContext *ctx, JSObject *p, JSAtom prop,
++                                 JSProperty *pr)
++{
++    void *opaque = pr->u.init.opaque;
++    JSContext *realm = JS_DupContext(js_autoinit_get_realm(pr));
++    JSShapeProperty *prs;
++    JSValue val;
++
++    if (ctx->rt->lazy_handler)
++        val = ctx->rt->lazy_handler(realm, JS_MKPTR(JS_TAG_OBJECT, p), prop,
++                                    (uint32_t)((uintptr_t)opaque -
++                                               JS_LAZY_OPAQUE_BASE));
++    else
++        val = JS_UNDEFINED;
++    JS_FreeContext(realm);
++    prs = find_own_property(&pr, p, prop);
++    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
++        pr->u.init.opaque == opaque) {
++        if (js_shape_prepare_update(ctx, p, &prs)) {
++            JS_FreeValue(ctx, val);
++            return -1;
++        }
++        js_autoinit_free(ctx->rt, pr);
++        prs->flags &= ~JS_PROP_TMASK;
++        pr->u.value = JS_UNDEFINED;
++        if (JS_IsException(val))
++            return -1;
++        pr->u.value = val;
++        return 0;
++    }
++    if (JS_IsException(val))
++        return -1;
++    JS_FreeValue(ctx, val);
++    return 0;
++}
++
+ /* warning: 'prs' is reallocated after it */
+ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
+                                JSProperty *pr, JSShapeProperty *prs)
+@@ -8658,6 +8715,8 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
+     JSContext *realm;
+     JSAutoInitFunc *func;
+ 
++    if (js_autoinit_is_lazy(pr))
++        return js_lazy_init_property(ctx, p, prop, pr);
+     if (js_shape_prepare_update(ctx, p, &prs))
+         return -1;
+ 
+@@ -10993,6 +11052,58 @@ int JS_DefineProperty(JSContext *ctx, JSValueConst this_obj,
+     return JS_CreateProperty(ctx, p, prop, val, getter, setter, flags);
+ }
+ 
++void JS_SetLazyPropertyHandler(JSRuntime *rt, JSLazyPropertyHandler *handler)
++{
++    rt->lazy_handler = handler;
++}
++
++int JS_DefineLazyProperty(JSContext *ctx, JSValueConst obj, JSAtom prop,
++                          int flags, uint32_t id)
++{
++    JSObject *p;
++    JSProperty *pr;
++    JSShapeProperty *prs;
++
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return -1;
++    p = JS_VALUE_GET_OBJ(obj);
++    prs = find_own_property(&pr, p, prop);
++    if (prs) {
++        /* only a plain data property, which keeps its place */
++        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
++            !(prs->flags & JS_PROP_CONFIGURABLE))
++            return -1;
++        if (js_shape_prepare_update(ctx, p, &prs))
++            return -1;
++        JS_FreeValue(ctx, pr->u.value);
++        prs->flags = (flags & JS_PROP_C_W_E) | JS_PROP_AUTOINIT;
++    } else {
++        if (!p->extensible)
++            return -1;
++        pr = add_property(ctx, p, prop, (flags & JS_PROP_C_W_E) |
++                          JS_PROP_AUTOINIT);
++        if (unlikely(!pr))
++            return -1;
++    }
++    pr->u.init.realm_and_id = (uintptr_t)JS_DupContext(ctx) |
++        JS_AUTOINIT_ID_BYTECODE;
++    pr->u.init.opaque = (void *)(JS_LAZY_OPAQUE_BASE + (uintptr_t)id);
++    return 0;
++}
++
++bool JS_IsLazyProperty(JSContext *ctx, JSValueConst obj, JSAtom prop)
++{
++    JSProperty *pr;
++    JSShapeProperty *prs;
++
++    (void)ctx;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return false;
++    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(obj), prop);
++    return prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
++        js_autoinit_is_lazy(pr);
++}
++
+ static int JS_DefineAutoInitProperty(JSContext *ctx, JSValueConst this_obj,
+                                      JSAtom prop, JSAutoInitIDEnum id,
+                                      void *opaque, int flags)
+diff --git a/quickjs.h b/quickjs.h
+index 8cead91..d1d2323 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1153,6 +1153,24 @@ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
+ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
++/*
++ * Lazy properties (VitaSurf). A lazy property looks like the data
++ * property it is defined as -- its attributes are the given flags -- and
++ * the first operation that needs its value calls the runtime's handler,
++ * which returns that value. Unlike a built-in's autoinit, the handler
++ * may run script that changes the object, or this very property: if it
++ * has, the property is looked up again rather than overwritten.
++ */
++typedef JSValue JSLazyPropertyHandler(JSContext *ctx, JSValueConst obj,
++                                      JSAtom prop, uint32_t id);
++JS_EXTERN void JS_SetLazyPropertyHandler(JSRuntime *rt,
++                                         JSLazyPropertyHandler *handler);
++/* a data property already there keeps its place in the key order */
++JS_EXTERN int JS_DefineLazyProperty(JSContext *ctx, JSValueConst obj,
++                                    JSAtom prop, int flags, uint32_t id);
++/* whether obj's own property prop is a lazy one not yet given its value */
++JS_EXTERN bool JS_IsLazyProperty(JSContext *ctx, JSValueConst obj,
++                                 JSAtom prop);
+ /* set the [IsHTMLDDA] internal slot */
+ JS_EXTERN void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj);
+ 

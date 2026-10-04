@@ -140,6 +140,11 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/storage.js
         vita/js/subtle.js
         vita/js/wasm.js
+        vita/js/lazy.js)
+    # Intl, the largest part, is a unit of its own that runs the first
+    # time a page uses it (vita/js/lazy.js): most pages never do, and it
+    # was a fifth of the prelude every page paid for.
+    set(PRELUDE_INTL_PARTS
         vita/js/intl_core.js
         vita/js/intl_number.js
         vita/js/intl_names.js
@@ -152,19 +157,22 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/intl_calendar.js
         vita/js/intl_range.js
         vita/js/intl.js)
-    set(PRELUDE_BYTES "")
-    foreach(part ${PRELUDE_PARTS})
-        set(full "${CMAKE_SOURCE_DIR}/${part}")
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${full}")
-        file(READ "${full}" part_hex HEX)
-        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," part_bytes "${part_hex}")
-        # a newline between parts, so a file that ends in a comment cannot
-        # swallow the first line of the next one
-        set(PRELUDE_BYTES "${PRELUDE_BYTES}${part_bytes}0x0a,")
+    foreach(unit PRELUDE PRELUDE_INTL)
+        set(${unit}_BYTES "")
+        foreach(part ${${unit}_PARTS})
+            set(full "${CMAKE_SOURCE_DIR}/${part}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${full}")
+            file(READ "${full}" part_hex HEX)
+            string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," part_bytes "${part_hex}")
+            # a newline between parts, so a file that ends in a comment cannot
+            # swallow the first line of the next one
+            set(${unit}_BYTES "${${unit}_BYTES}${part_bytes}0x0a,")
+        endforeach()
     endforeach()
     file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
-        "/* generated from ${PRELUDE_PARTS} */\n"
-        "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n")
+        "/* generated from ${PRELUDE_PARTS} and ${PRELUDE_INTL_PARTS} */\n"
+        "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n"
+        "static const unsigned char prelude_intl_js[] = {${PRELUDE_INTL_BYTES}0x00};\n")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
     # websocket.c runs WebSocket connections on libcurl's ws API

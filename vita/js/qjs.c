@@ -12603,6 +12603,183 @@ static JSValue prelude_strip_source(JSContext *ctx, JSValue fn)
 	return stripped;
 }
 
+/*
+ * Units of the prelude that run the first time a page uses them
+ * (VitaSurf): vita/js/lazy.js leaves a lazy property where each would
+ * install something, and the first touch of one runs the unit. Each
+ * unit is compiled once a run, kept without its source like the
+ * prelude, and in the card's compiled script cache between runs.
+ */
+struct prelude_unit {
+	const char *name;	/**< what __vitaLoadUnit asks for */
+	const char *url;	/**< its name in the card's cache */
+	const char *file;	/**< its name in an error's stack */
+	const unsigned char *src;
+	size_t len;
+	uint8_t *bc;		/**< compiled, for the life of the process */
+	size_t bc_len;
+};
+
+static struct prelude_unit prelude_units[] = {
+	{ "intl", "vitasurf:intl-nosrc", "<intl>", prelude_intl_js,
+	  sizeof(prelude_intl_js) - 1, NULL, 0 },
+};
+
+/* run a unit in this context; reason is what the page touched */
+static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
+			     const char *reason)
+{
+	const char *src = (const char *)u->src;
+	const char *how = u->bc != NULL ? "bytecode" : "source";
+	uint64_t t0 = now_ms(), t1;
+	JSValue fn, r;
+	bool ok = true;
+
+	if (u->bc != NULL) {
+		fn = JS_ReadObject(ctx, u->bc, u->bc_len, JS_READ_OBJ_BYTECODE);
+	} else {
+		fn = bc_load(ctx, u->url, src, u->len);
+		if (JS_IsUndefined(fn)) {
+			fn = JS_Eval(ctx, src, u->len, u->file,
+				     JS_EVAL_TYPE_GLOBAL |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+			if (!JS_IsException(fn)) {
+				fn = prelude_strip_source(ctx, fn);
+				bc_store(ctx, u->url, src, u->len, fn);
+			}
+		} else {
+			how = "card";
+		}
+		/* in memory of its own: the runtime that wrote it, and its
+		 * allocator, end with this page */
+		if (!JS_IsException(fn)) {
+			size_t out_len = 0;
+			uint8_t *out = JS_WriteObject(ctx, &out_len, fn,
+						      JS_WRITE_OBJ_BYTECODE);
+
+			if (out != NULL) {
+				u->bc = malloc(out_len);
+				if (u->bc != NULL) {
+					memcpy(u->bc, out, out_len);
+					u->bc_len = out_len;
+				}
+				js_free(ctx, out);
+			}
+		}
+	}
+	if (JS_IsException(fn)) {
+		qjs_report_exception_src(ctx, u->file, src, u->len);
+		JS_FreeValue(ctx, fn);
+		ok = false;
+	} else {
+		r = JS_EvalFunction(ctx, fn);
+		if (JS_IsException(r)) {
+			qjs_report_exception_src(ctx, u->file, src, u->len);
+			ok = false;
+		}
+		JS_FreeValue(ctx, r);
+	}
+	t1 = now_ms();
+	vitasurf_ms_prelude += (unsigned int)(t1 - t0);
+	vita_log("qjs: %s %u KB ran in %u ms (%s), on first use of %s",
+		 u->name, (unsigned int)(u->len / 1024),
+		 (unsigned int)(t1 - t0), how, reason);
+	return ok;
+}
+
+/* __vitaLoadUnit(name, reason): run a unit of the prelude */
+static JSValue win_vita_load_unit(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	const char *name, *reason;
+	bool ok = false;
+	unsigned int i;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_FALSE;
+	}
+	name = JS_ToCString(ctx, argv[0]);
+	reason = argc > 1 ? JS_ToCString(ctx, argv[1]) : NULL;
+	for (i = 0; name != NULL &&
+		    i < sizeof(prelude_units) / sizeof(prelude_units[0]); i++) {
+		if (strcmp(name, prelude_units[i].name) == 0) {
+			ok = prelude_unit_run(ctx, &prelude_units[i],
+					      reason != NULL ? reason : "?");
+			break;
+		}
+	}
+	JS_FreeCString(ctx, name);
+	JS_FreeCString(ctx, reason);
+	return JS_NewBool(ctx, ok);
+}
+
+/* __vitaLazy(obj, name, flags, id): make obj's name a lazy property */
+static JSValue win_vita_lazy(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	JSAtom atom;
+	int32_t flags = 0;
+	uint32_t id = 0;
+	int r;
+
+	(void)this_val;
+	if (argc < 4 || !JS_IsObject(argv[0]) ||
+	    JS_ToInt32(ctx, &flags, argv[2]) ||
+	    JS_ToUint32(ctx, &id, argv[3])) {
+		return JS_FALSE;
+	}
+	atom = JS_ValueToAtom(ctx, argv[1]);
+	if (atom == JS_ATOM_NULL) {
+		return JS_EXCEPTION;
+	}
+	r = JS_DefineLazyProperty(ctx, argv[0], atom, flags, id);
+	JS_FreeAtom(ctx, atom);
+	return JS_NewBool(ctx, r == 0);
+}
+
+/* __vitaIsLazy(obj, name): whether it is still waiting for its unit */
+static JSValue win_vita_is_lazy(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	JSAtom atom;
+	bool r;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsObject(argv[0])) {
+		return JS_FALSE;
+	}
+	atom = JS_ValueToAtom(ctx, argv[1]);
+	if (atom == JS_ATOM_NULL) {
+		return JS_EXCEPTION;
+	}
+	r = JS_IsLazyProperty(ctx, argv[0], atom);
+	JS_FreeAtom(ctx, atom);
+	return JS_NewBool(ctx, r);
+}
+
+/*
+ * The runtime's handler of lazy properties: vita/js/lazy.js decides
+ * what a lazy property's value is, running its unit first if need be.
+ */
+static JSValue qjs_lazy_handler(JSContext *ctx, JSValueConst obj,
+				JSAtom prop, uint32_t id)
+{
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue init = JS_GetPropertyStr(ctx, global, "__vitaLazyInit");
+	JSValue arg = JS_NewUint32(ctx, id), r = JS_UNDEFINED;
+
+	(void)obj; (void)prop;
+	if (JS_IsException(init)) {
+		r = init;
+	} else if (JS_IsFunction(ctx, init)) {
+		r = JS_Call(ctx, init, global, 1, &arg);
+	}
+	JS_FreeValue(ctx, init);
+	JS_FreeValue(ctx, global);
+	return r;
+}
+
 static bool setup_globals(jsthread *thread)
 {
 	bool ok = true;
@@ -12666,6 +12843,16 @@ static bool setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_clear_timer, "clearInterval", 1));
 	JS_SetPropertyStr(ctx, global, "alert",
 			  JS_NewCFunction(ctx, console_log, "alert", 1));
+
+	/* the prelude's units that run on first use (vita/js/lazy.js) */
+	JS_SetPropertyStr(ctx, global, "__vitaLazy",
+			  JS_NewCFunction(ctx, win_vita_lazy, "__vitaLazy", 4));
+	JS_SetPropertyStr(ctx, global, "__vitaIsLazy",
+			  JS_NewCFunction(ctx, win_vita_is_lazy,
+					  "__vitaIsLazy", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaLoadUnit",
+			  JS_NewCFunction(ctx, win_vita_load_unit,
+					  "__vitaLoadUnit", 2));
 
 	/* transport for XMLHttpRequest and fetch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFetch",
@@ -13114,6 +13301,8 @@ static nserror heap_start(jsheap *ret)
 	}
 	if (qjs_memory_rt == NULL)
 		qjs_memory_rt = ret->rt;
+	/* the first touch of a lazy property runs its unit (lazy.js) */
+	JS_SetLazyPropertyHandler(ret->rt, qjs_lazy_handler);
 	/*
 	 * Keep a page's scripts within a sensible slice of the heap: 96 MB
 	 * of the 176 MB heap there used to be, the same share of the heap
