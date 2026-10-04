@@ -12,7 +12,9 @@
 // form take (vita/js/intl_tags.js), and that Intl.ListFormat and
 // Intl.DurationFormat join lists with (vita/js/intl_list.js), from
 // CLDR's JSON release; and, given ICU's data as well, what Intl.Collator
-// sorts with (vita/js/intl_collator.js, scripts/gen-intl-collation.mjs).
+// sorts with (vita/js/intl_collator.js, scripts/gen-intl-collation.mjs)
+// and what Intl.Segmenter divides text with (vita/js/intl_segmenter.js,
+// scripts/gen-intl-segmenter.mjs).
 // The Unicode CLDR data is under the Unicode licence, which is
 // GPL-compatible.
 //
@@ -23,7 +25,8 @@
 // written right to left), and for each CLDR locale n: (numbers), c:
 // (currency names), d: (names of languages, regions, scripts, variants
 // and calendars), r: (relative times and the names of date fields) and
-// l: (list patterns), and the collation entries, k:.
+// l: (list patterns), and the collation entries, k:, and the
+// segmenter's, g:.
 //
 // The pack holds one entry per CLDR locale, read only when a page asks
 // for that locale. A locale's entry is what it changes from its CLDR
@@ -833,11 +836,15 @@ function localeInfo() {
 	};
 }
 
-// Intl.Collator's, from ICU's data when its directory is given
+// Intl.Collator's and Intl.Segmenter's, from ICU's data when its
+// directory is given
 if (process.argv[3]) {
 	const { collationEntries } = await import('./gen-intl-collation.mjs');
+	const { segmenterEntries } = await import('./gen-intl-segmenter.mjs');
 
 	Object.assign(entries, collationEntries(process.argv[3],
+		Object.keys(index)));
+	Object.assign(entries, segmenterEntries(process.argv[3],
 		Object.keys(index)));
 }
 

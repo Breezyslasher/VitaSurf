@@ -584,7 +584,7 @@ class Builder {
 		const flush = () => {
 			if (!plain)
 				return;
-			const flat = this.core.ces(plain, null, false);
+			const flat = this.core.ces(plain, null, false).flat();
 
 			for (let k = 0; k < flat.length; k += 3) {
 				const p = Math.floor(flat[k] / 65536);
@@ -662,7 +662,7 @@ class Builder {
 		let cases = [], last = 0, n = 0;
 
 		if (tailored) {
-			const flat = this.core.ces(nfd, null, false);
+			const flat = this.core.ces(nfd, null, false).flat();
 
 			for (let k = 0; k < flat.length; k += 3) {
 				if (Math.floor(flat[k] / 65536) === 0)
