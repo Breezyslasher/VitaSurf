@@ -851,10 +851,24 @@ var __vitaIntlTags = function (W, N, C, X) {
 		return (own(zonesByRegion(), t.region.toUpperCase()) || []).slice();
 	}
 
-	function textInfo(t) {
-		var m = likely(t), s = (m ? m.script : t.script) || '';
+	/* uloc_isRightToLeft: the direction of the tag's script; without
+	 * one, ICU's answer for a few common languages (LANG_DIR, - for left
+	 * to right, + for right to left), else that of the likely script */
+	var LANG_DIR = 'root-en-es-pt-zh-ja-ko-de-fr-it-ar+he+fa+ru-nl-pl-th-tr-';
 
-		return { direction: data('locinfo').rtl.indexOf(titleCase(s)) >= 0 ?
+	function textInfo(t) {
+		var s = t.script ? titleCase(t.script) : '', m, i, c;
+		var lang = t.lang === 'und' ? '' : t.lang;
+
+		if (!s) {
+			i = lang ? LANG_DIR.indexOf(lang) : -1;
+			c = i >= 0 ? LANG_DIR.charAt(i + lang.length) : '';
+			if (c === '-' || c === '+')
+				return { direction: c === '+' ? 'rtl' : 'ltr' };
+			m = likely(t);
+			s = m && m.script ? titleCase(m.script) : '';
+		}
+		return { direction: s && data('locinfo').rtl.indexOf(s) >= 0 ?
 			'rtl' : 'ltr' };
 	}
 

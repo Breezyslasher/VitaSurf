@@ -872,10 +872,10 @@ function localeInfo() {
 		if (c !== fallback(tag))
 			coll[tag] = c;
 	}
-	const rtl = Object.keys(json(path.join(NAMES, 'main', 'en',
-		'scripts.json')).main.en.localeDisplayNames.scripts)
-		.filter(s => /^[A-Z][a-z]{3}$/.test(s) &&
-			new Intl.Locale('und-' + s).textInfo.direction === 'rtl');
+	// the scripts written right to left, from CLDR's script metadata:
+	// the same 37 as ICU's uscript_isRightToLeft
+	const meta = json(path.join(CORE, 'scriptMetadata.json')).scriptMetadata;
+	const rtl = Object.keys(meta).filter(s => meta[s].rtl === 'YES').sort();
 
 	return {
 		first: days(w.firstDay), start: days(w.weekendStart),
