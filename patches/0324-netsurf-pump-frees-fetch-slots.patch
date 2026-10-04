@@ -1,0 +1,322 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index 6cb011e0b..447ddea49 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -102,10 +102,16 @@ struct fetch {
+ 	struct fetch *r_prev;	/**< Previous active fetch in ::fetch_ring. */
+ 	struct fetch *r_next;	/**< Next active fetch in ::fetch_ring. */
+ 	unsigned int queued_ms;	/**< when it was queued (VitaSurf) */
++	bool finishing;		/**< in ::finish_ring (VitaSurf) */
+ };
+ 
+ static struct fetch *fetch_ring = NULL;	/**< Ring of active fetches. */
+ static struct fetch *queue_ring = NULL;	/**< Ring of queued fetches */
++/**
++ * Fetches whose transfer is over but whose fetcher has not yet said so
++ * (VitaSurf); see fetch_transport_done. They hold no slot.
++ */
++static struct fetch *finish_ring = NULL;
+ 
+ /******************************************************************************
+  * fetch internals							      *
+@@ -259,7 +265,8 @@ static bool fetch_dispatch_jobs(void)
+ 	NSLOG(fetch, DEBUG, "Fetch ring is now %d elements.", all_active);
+ 	NSLOG(fetch, DEBUG, "Queue ring is now %d elements.", all_queued);
+ 
+-	return (all_active > 0);
++	/* finishing fetches still need a poll to be told of (VitaSurf) */
++	return (all_active > 0 || finish_ring != NULL);
+ }
+ 
+ static void fetcher_poll(void *unused)
+@@ -284,11 +291,27 @@ static void fetcher_poll(void *unused)
+  * Public API								      *
+  ******************************************************************************/
+ 
++/* exported interface documented in content/fetch.h */
++void fetch_transport_done(struct fetch *fetch)
++{
++	if (!fetch->fetch_is_active || fetch->finishing) {
++		return;
++	}
++	RING_REMOVE(fetch_ring, fetch);
++	RING_INSERT(finish_ring, fetch);
++	fetch->finishing = true;
++}
++
+ /* exported interface documented in content/fetch.h */
+ void fetch_pump(void)
+ {
+ #ifdef WITH_CURL
+-	fetch_curl_pump_tick();
++	/* a transfer that ended gives its slot to a queued fetch at once,
++	 * rather than when the work in hand lets the poll run (VitaSurf);
++	 * starting a fetch hands nothing to the rest of NetSurf */
++	if (fetch_curl_pump_tick()) {
++		fetch_dispatch_jobs();
++	}
+ #endif
+ }
+ 
+@@ -796,7 +819,10 @@ void fetch_remove_from_queues(struct fetch *fetch)
+ 	      fetch->fetcher_handle);
+ 
+ 	/* Go ahead and free the fetch properly now */
+-	if (fetch->fetch_is_active) {
++	if (fetch->finishing) {
++		RING_REMOVE(finish_ring, fetch);
++		fetch->finishing = false;
++	} else if (fetch->fetch_is_active) {
+ 		RING_REMOVE(fetch_ring, fetch);
+ 	} else {
+ 		RING_REMOVE(queue_ring, fetch);
+diff --git a/content/fetch.h b/content/fetch.h
+index 132e4a404..38f61a15c 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -254,6 +254,18 @@ void fetch_send_callback(const fetch_msg *msg, struct fetch *fetch);
+  */
+ void fetch_remove_from_queues(struct fetch *fetch);
+ 
++/**
++ * Note that a fetch's transfer has ended before its fetcher can say so
++ * (VitaSurf).
++ *
++ * A transfer that ends while a script runs is only reported by the next
++ * ordinary poll, and until then it held a slot that max_fetchers and
++ * max_fetchers_per_host count, so a page's queued fetches waited on the
++ * script as well as on the network. This frees the slot; the fetcher
++ * still finishes the fetch, with fetch_remove_from_queues, as before.
++ */
++void fetch_transport_done(struct fetch *fetch);
++
+ /**
+  * Free a fetch structure and associated resources.
+  */
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 4dfc9366d..ca4622d0b 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -267,6 +267,10 @@ struct curl_fetch_info {
+ 	struct curl_fetch_info *held_next; /**< in held_fetches */
+ 	bool held_listed;	/**< on the held_fetches list */
+ 	bool held_paused;	/**< paused for want of room to hold */
++	/* a transfer the pump saw end, reported by the next poll */
++	bool done_pending;
++	CURLcode done_result;
++	struct curl_fetch_info *done_next; /**< in done_fetches */
+ };
+ 
+ /*
+@@ -295,6 +299,8 @@ struct curl_held {
+ 
+ static bool curl_holding;
+ static struct curl_fetch_info *held_fetches;
++/* transfers the pump saw end, oldest first, for the next poll */
++static struct curl_fetch_info *done_fetches, *done_fetches_tail;
+ static size_t curl_held_bytes;
+ 
+ /* for the page profile */
+@@ -303,6 +309,7 @@ unsigned int vitasurf_curl_pump_ms;
+ unsigned int vitasurf_curl_held_kb;
+ unsigned int vitasurf_curl_held_max_kb;
+ unsigned int vitasurf_curl_held_pauses;
++unsigned int vitasurf_curl_pump_ended;
+ 
+ static void fetch_curl_drop_held(struct curl_fetch_info *f);
+ static void fetch_curl_flush_held(void);
+@@ -500,6 +507,9 @@ static struct curl_fetch_info *fetch_alloc(void)
+ 	fetch->held_next = NULL;
+ 	fetch->held_listed = false;
+ 	fetch->held_paused = false;
++	fetch->done_pending = false;
++	fetch->done_result = CURLE_OK;
++	fetch->done_next = NULL;
+ 
+ 	return fetch;
+ }
+@@ -1509,6 +1519,21 @@ static void fetch_curl_free(void *vf)
+ 	int i;
+ 
+ 	fetch_curl_drop_held(f);
++	if (f->done_pending) {
++		struct curl_fetch_info **pp, *prev = NULL;
++
++		for (pp = &done_fetches; *pp != NULL;
++		     prev = *pp, pp = &(*pp)->done_next) {
++			if (*pp == f) {
++				*pp = f->done_next;
++				if (done_fetches_tail == f) {
++					done_fetches_tail = prev;
++				}
++				break;
++			}
++		}
++		f->done_pending = false;
++	}
+ 	if (f->curl_handle) {
+ 		curl_easy_cleanup(f->curl_handle);
+ 	}
+@@ -1787,8 +1812,19 @@ static void fetch_curl_poll(lwc_string *scheme_ignored)
+ 
+ 	/* do any possible work on the current fetches */
+ 	inside_curl = true;
+-	/* first what arrived while a script ran (VitaSurf) */
++	/* first what arrived while a script ran, then the transfers that
++	 * ended then (VitaSurf) */
+ 	fetch_curl_flush_held();
++	while (done_fetches != NULL) {
++		struct curl_fetch_info *f = done_fetches;
++
++		done_fetches = f->done_next;
++		if (done_fetches == NULL) {
++			done_fetches_tail = NULL;
++		}
++		f->done_pending = false;
++		fetch_curl_done(f->curl_handle, f->done_result);
++	}
+ 	do {
+ 		codem = curl_multi_perform(fetch_curl_multi, &running);
+ 		if (codem != CURLM_OK && codem != CURLM_CALL_MULTI_PERFORM) {
+@@ -2209,7 +2245,7 @@ static void fetch_curl_flush_held(void)
+ #define PUMP_INTERVAL_MS 30
+ 
+ /* exported interface documented in content/fetchers/curl.h */
+-void fetch_curl_pump_tick(void)
++bool fetch_curl_pump_tick(void)
+ {
+ 	static uint64_t last_ms;
+ 	static int wanted = -1;
+@@ -2223,26 +2259,28 @@ void fetch_curl_pump_tick(void)
+ #endif
+ 	}
+ 	if (wanted == 0 || inside_curl) {
+-		return;
++		return false;
+ 	}
+ 	nsu_getmonotonic_ms(&now);
+ 	if (now - last_ms < PUMP_INTERVAL_MS) {
+-		return;
++		return false;
+ 	}
+ 	last_ms = now;
+-	fetch_curl_pump();
++	return fetch_curl_pump();
+ }
+ 
+ /* exported interface documented in content/fetchers/curl.h */
+-void fetch_curl_pump(void)
++bool fetch_curl_pump(void)
+ {
+ 	uint64_t t0, t1;
+-	int running;
++	int running, queue;
+ 	CURLMcode codem;
++	CURLMsg *curl_msg;
++	bool ended = false;
+ 
+ 	if (inside_curl || fetch_curl_multi == NULL ||
+ 	    curl_held_bytes >= CURL_HELD_MAX) {
+-		return;
++		return false;
+ 	}
+ 	nsu_getmonotonic_ms(&t0);
+ 	inside_curl = true;
+@@ -2251,10 +2289,39 @@ void fetch_curl_pump(void)
+ 		codem = curl_multi_perform(fetch_curl_multi, &running);
+ 	} while (codem == CURLM_CALL_MULTI_PERFORM);
+ 	curl_holding = false;
++
++	/* Transfers that ended: curl has already given their connections
++	 * back, so their slots go to queued fetches now, and the next poll
++	 * reports them, after what they held */
++	while ((curl_msg = curl_multi_info_read(fetch_curl_multi,
++						&queue)) != NULL) {
++		struct curl_fetch_info *f;
++		char **hack = (char **) (void *) &f;
++
++		if (curl_msg->msg != CURLMSG_DONE ||
++		    curl_easy_getinfo(curl_msg->easy_handle, CURLINFO_PRIVATE,
++				      hack) != CURLE_OK ||
++		    f == NULL || f->done_pending) {
++			continue;
++		}
++		f->done_pending = true;
++		f->done_result = curl_msg->data.result;
++		f->done_next = NULL;
++		if (done_fetches_tail != NULL) {
++			done_fetches_tail->done_next = f;
++		} else {
++			done_fetches = f;
++		}
++		done_fetches_tail = f;
++		fetch_transport_done(f->fetch_handle);
++		vitasurf_curl_pump_ended++;
++		ended = true;
++	}
+ 	inside_curl = false;
+ 	nsu_getmonotonic_ms(&t1);
+ 	vitasurf_curl_pumps++;
+ 	vitasurf_curl_pump_ms += (unsigned int)(t1 - t0);
++	return ended;
+ }
+ 
+ static int fetch_curl_fdset(lwc_string *scheme, fd_set *read_set,
+diff --git a/content/fetchers/curl.h b/content/fetchers/curl.h
+index a4d409222..68e3075fd 100644
+--- a/content/fetchers/curl.h
++++ b/content/fetchers/curl.h
+@@ -23,6 +23,7 @@
+ #ifndef NETSURF_CONTENT_FETCHERS_FETCH_CURL_H
+ #define NETSURF_CONTENT_FETCHERS_FETCH_CURL_H
+ 
++#include <stdbool.h>
+ #include <curl/curl.h>
+ 
+ /**
+@@ -42,15 +43,19 @@ extern CURLM *fetch_curl_multi;
+  * NetSurf by the next ordinary poll, so this may be called from where
+  * nothing else in NetSurf may be entered, such as the script
+  * interrupt. It does nothing while curl is already being run.
++ *
++ * \return true if a transfer ended, so a queued fetch may start.
+  */
+-void fetch_curl_pump(void);
++bool fetch_curl_pump(void);
+ 
+ /**
+  * fetch_curl_pump at most every 30 ms, and not at all when the nopump
+  * flag file (VITASURF_NOPUMP natively) says so (VitaSurf). Cheap enough
+  * to call from any long loop.
++ *
++ * \return true if a transfer ended, so a queued fetch may start.
+  */
+-void fetch_curl_pump_tick(void);
++bool fetch_curl_pump_tick(void);
+ 
+ /**
+  * A copy of the handle every fetch starts from, with the CA bundle,
+diff --git a/utils/utils.c b/utils/utils.c
+index 0970820b1..fe629f9b3 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -890,6 +890,7 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_curl_held_kb = 0;
+ 	vitasurf_curl_held_max_kb = 0;
+ 	vitasurf_curl_held_pauses = 0;
++	vitasurf_curl_pump_ended = 0;
+ 	vitasurf_ms_js_import_compile = 0;
+ 	vitasurf_js_import_compiles = 0;
+ 	vitasurf_js_import_kb = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index ea002046b..22d52414a 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -509,6 +509,7 @@ extern unsigned int vitasurf_curl_pump_ms;
+ extern unsigned int vitasurf_curl_held_kb;
+ extern unsigned int vitasurf_curl_held_max_kb;
+ extern unsigned int vitasurf_curl_held_pauses;
++extern unsigned int vitasurf_curl_pump_ended; /**< transfers it saw end */
+ extern unsigned int vitasurf_js_jobs_budget;
+ extern unsigned int vitasurf_ms_js_jobs_budget;
+ extern unsigned int vitasurf_js_drain_max_jobs;

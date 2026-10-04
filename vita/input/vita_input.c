@@ -1633,12 +1633,15 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 					 "were pumped %u times for %u ms, "
 					 "holding %u KB for later (%u KB at "
 					 "most at once) and pausing %u times "
-					 "for room",
+					 "for room; %u transfers ended there "
+					 "and gave their slots to queued "
+					 "fetches at once",
 					 vitasurf_curl_pumps,
 					 vitasurf_curl_pump_ms,
 					 vitasurf_curl_held_kb,
 					 vitasurf_curl_held_max_kb,
-					 vitasurf_curl_held_pauses);
+					 vitasurf_curl_held_pauses,
+					 vitasurf_curl_pump_ended);
 			}
 			vita_log("page: %u bare tag queries were answered "
 				 "from the tag names under their element, "
