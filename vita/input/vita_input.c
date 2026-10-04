@@ -1988,6 +1988,31 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 		vita_log("page: images %u asked for, %u decoded, %u failed",
 			 vitasurf_images_asked, vitasurf_images_done,
 			 vitasurf_images_failed);
+		if (vitasurf_net_transfers > 0) {
+			vita_log("net: %u transfers, %u KB; %u new connections "
+				 "(%u ms connecting), %u TLS handshakes (%u ms "
+				 "in all, longest %u ms)",
+				 vitasurf_net_transfers, vitasurf_net_kb,
+				 vitasurf_net_connections,
+				 vitasurf_ms_net_connect,
+				 vitasurf_net_handshakes,
+				 vitasurf_ms_net_tls,
+				 vitasurf_ms_net_tls_max);
+			vita_log("net: waiting for the first byte %u ms in all "
+				 "(longest %u ms), receiving %u ms (longest "
+				 "%u ms); these overlap, so they are not "
+				 "shares of the load",
+				 vitasurf_ms_net_first_byte,
+				 vitasurf_ms_net_first_byte_max,
+				 vitasurf_ms_net_body,
+				 vitasurf_ms_net_body_max);
+		}
+		if (vitasurf_net_queued > 0) {
+			vita_log("net: %u fetches waited for a free slot in "
+				 "NetSurf's queue, %u ms in all, longest %u ms",
+				 vitasurf_net_queued, vitasurf_ms_net_queue,
+				 vitasurf_ms_net_queue_max);
+		}
 		{
 			struct hlcache_size_report r;
 
