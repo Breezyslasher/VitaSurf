@@ -22,7 +22,9 @@
 // no language for und, keeps -u-va-posix in the baseName of en-US-posix,
 // and leaves nine und- tags unminimized (und-Hant, und-PH...) though
 // UTS #35's Remove Likely Subtags, run on ICU's own maximize, gives
-// zh-TW and fil.
+// zh-TW and fil. A tag whose -u-rg- has no value (en-u-rg-uk, two keys)
+// is left out: ICU writes the empty value as "yes" and takes YE from it,
+// so V8 gives such a tag Yemen's week.
 
 import fs from 'fs';
 import zlib from 'zlib';
@@ -65,7 +67,10 @@ const TAGS = ['en', 'en-US', 'EN-us', 'en-Latn-US', 'zh', 'zh-TW', 'zh-HK',
 	'th-TH-u-nu-thai', 'ja-JP-u-ca-japanese', 'he-IL-u-ca-hebrew',
 	'fa-IR', 'fa-AF', 'ps', 'ur-IN', 'dv', 'syr', 'yi', 'nqo', 'sd-Arab',
 	'sd-Deva', 'ff-Adlm', 'hi-Latn', 'zh-Latn', 'en-Arab', 'ku-Arab', 'apc',
-	'en-US-u-fw-mon', 'en-US-u-fw-sun', 'en-u-fw-xyz', 'ar-AE', 'ar-MA',
+	'en-US-u-fw-mon', 'en-US-u-fw-sun', 'en-u-fw-xyz', 'en-u-ca-iso8601',
+	'en-GB-u-ca-iso8601', 'ar-SA-u-ca-iso8601', 'fa-u-ca-iso8601-fw-thu',
+	'en-u-ca-iso8601-rg-sazzzz', 'und-u-ca-iso8601', 'en-u-rg-ilzzzz',
+	'en-u-rg-xxzzzz', 'en-GB-u-ca-iso8601-fw-sun', 'ar-AE', 'ar-MA',
 	'ar-DZ', 'fa-IR-u-fw-sat', 'en-IR', 'ps-AF', 'en-MV', 'en-BR', 'pt-BR',
 	'en-ES', 'es', 'es-MX', 'es-US', 'ca-ES', 'gl', 'eu', 'ast', 'en-GB',
 	'en-AU', 'en-CA', 'fr-CH', 'it-CH', 'de', 'de-LI', 'lt', 'lv', 'et',

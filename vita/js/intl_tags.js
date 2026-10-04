@@ -813,6 +813,15 @@ var __vitaIntlTags = function (W, N, C, X) {
 			min = w.min['001'];
 		if (fw && WEEKDAYS.indexOf(fw) >= 0)
 			first = WEEKDAYS.indexOf(fw) || 7;
+		/* V8 reads the week off an ICU calendar for the locale, and
+		 * ICU's ISO 8601 calendar has weeks of ISO 8601: from Monday
+		 * unless the tag names a first day or a region, and of four
+		 * days at least */
+		if (keyword(t, 'ca') === 'iso8601') {
+			if (!fw && !keyword(t, 'rg'))
+				first = 1;
+			min = 4;
+		}
 		for (d = start; ; d = d % 7 + 1) {
 			weekend.push(d);
 			if (d === end)
