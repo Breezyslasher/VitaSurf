@@ -1,0 +1,979 @@
+diff --git a/quickjs.c b/quickjs.c
+index dc7faa9..2ec6ade 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -24472,6 +24472,740 @@ static bool token_reads_by_function(const JSToken *t)
+         a == JS_ATOM_await || a == JS_ATOM_yield;
+ }
+ 
++/*
++ * The light scan (VitaSurf). js_parse_skip_parens_token answered by
++ * running the real tokenizer to the matching bracket: every name became
++ * an atom, every string and number a value, all of it thrown away. A
++ * webpack chunk is "__webpack_modules__={...}", and at that '{' the
++ * parser asks whether an '=' follows its match, so the whole chunk was
++ * tokenized twice: 27% of compiling Home Assistant's frontend. This scan
++ * finds the same tokens' bounds and kinds straight from the bytes and
++ * gives the same answer. Anything it is not sure it reads exactly as the
++ * tokenizer would -- non-ASCII outside strings and comments, escapes in
++ * names, legacy octal, numeric separators, HTML comments, a '/' whose
++ * meaning depends on the function, invalid input -- makes it give up,
++ * and the question is answered by the tokenizer as before.
++ */
++typedef struct JSLightScan {
++    const uint8_t *p;       /* next byte to read */
++    const uint8_t *end;
++    const uint8_t *ptr;     /* the current token */
++    int val;                /* what s->token.val would be */
++    bool nl;                /* a line break before it */
++    bool by_function;       /* see token_reads_by_function */
++    bool is_of;             /* the name "of" */
++    int sep;                /* TOK_TEMPLATE: '`' at the end, else '$' */
++} JSLightScan;
++
++static inline bool light_ident_first(int c)
++{
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++        c == '_' || c == '$';
++}
++
++static inline bool light_ident_next(int c)
++{
++    return light_ident_first(c) || (c >= '0' && c <= '9');
++}
++
++static inline bool light_is_hex(int c)
++{
++    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
++        (c >= 'A' && c <= 'F');
++}
++
++/* after a number or a name: what the tokenizer would read on with */
++static inline bool light_more_ident(const uint8_t *p)
++{
++    return light_ident_next(*p) || *p == '\\' || *p >= 0x80;
++}
++
++static int light_word(JSLightScan *L, const uint8_t *w, size_t len)
++{
++    /* the keywords by first letter, and (token 0) the names that are
++       keywords in some functions; a keyword's token is TOK_NULL plus
++       its place among the atoms */
++    static const struct { uint8_t len; char rest[10]; int tok; } words[] = {
++        { 5, "wait", 0 },
++        { 5, "reak", TOK_NULL + 17 },
++        { 8, "ontinue", TOK_NULL + 18 },
++        { 4, "ase", TOK_NULL + 20 },
++        { 5, "atch", TOK_NULL + 24 },
++        { 5, "lass", TOK_NULL + 29 },
++        { 5, "onst", TOK_NULL + 30 },
++        { 6, "elete", TOK_NULL + 8 },
++        { 2, "o", TOK_NULL + 14 },
++        { 7, "efault", TOK_NULL + 21 },
++        { 8, "ebugger", TOK_NULL + 27 },
++        { 4, "lse", TOK_NULL + 4 },
++        { 4, "num", TOK_NULL + 31 },
++        { 6, "xport", TOK_NULL + 32 },
++        { 7, "xtends", TOK_NULL + 33 },
++        { 5, "alse", TOK_NULL + 1 },
++        { 3, "or", TOK_NULL + 16 },
++        { 7, "inally", TOK_NULL + 25 },
++        { 8, "unction", TOK_NULL + 26 },
++        { 2, "f", TOK_NULL + 3 },
++        { 2, "n", TOK_NULL + 12 },
++        { 10, "nstanceof", TOK_NULL + 13 },
++        { 6, "mport", TOK_NULL + 34 },
++        { 10, "mplements", 0 },
++        { 9, "nterface", 0 },
++        { 3, "et", 0 },
++        { 4, "ull", TOK_NULL + 0 },
++        { 3, "ew", TOK_NULL + 11 },
++        { 7, "ackage", 0 },
++        { 7, "rivate", 0 },
++        { 9, "rotected", 0 },
++        { 6, "ublic", 0 },
++        { 6, "eturn", TOK_NULL + 5 },
++        { 6, "witch", TOK_NULL + 19 },
++        { 5, "uper", TOK_NULL + 35 },
++        { 6, "tatic", 0 },
++        { 4, "rue", TOK_NULL + 2 },
++        { 4, "his", TOK_NULL + 7 },
++        { 6, "ypeof", TOK_NULL + 10 },
++        { 5, "hrow", TOK_NULL + 22 },
++        { 3, "ry", TOK_NULL + 23 },
++        { 3, "ar", TOK_NULL + 6 },
++        { 4, "oid", TOK_NULL + 9 },
++        { 5, "hile", TOK_NULL + 15 },
++        { 4, "ith", TOK_NULL + 28 },
++        { 5, "ield", 0 },
++    };
++    static const uint8_t first[27] = {
++        0, 1, 2, 7, 11, 15, 19, 19, 19, 25, 25, 25, 26, 26, 28, 28, 32, 32, 33, 36, 41, 41, 43, 45, 45, 46, 46,
++    };
++    int i, n;
++
++    L->by_function = false;
++    L->is_of = false;
++    if (len < 2 || len > 10 || w[0] < 'a' || w[0] > 'z')
++        return TOK_IDENT;
++    if (len == 2 && w[0] == 'o' && w[1] == 'f') {
++        L->is_of = true;
++        return TOK_IDENT;
++    }
++    n = first[w[0] - 'a' + 1];
++    for (i = first[w[0] - 'a']; i < n; i++) {
++        if (words[i].len == len && !memcmp(words[i].rest, w + 1, len - 1)) {
++            if (words[i].tok != 0)
++                return words[i].tok;
++            L->by_function = true;
++            break;
++        }
++    }
++    return TOK_IDENT;
++}
++
++/* a string's body after its quote; 0 at the closing quote, -1 to give up */
++static int light_string(JSLightScan *L, int sep)
++{
++    const uint8_t *p = L->p, *p_next;
++    uint32_t c;
++    int ret;
++
++    for (;;) {
++        if (p >= L->end)
++            return -1;
++        c = *p++;
++        if (c == (uint32_t)sep)
++            break;
++        if (c == '\n' || c == '\r')
++            return -1;
++        if (c == '\\') {
++            c = *p;
++            if (p >= L->end)
++                return -1;
++            if (c == '\'' || c == '"' || c == '\\' || c == '\n' ||
++                c == '\0') {
++                p++;
++            } else if (c == '\r') {
++                p += (p[1] == '\n') ? 2 : 1;
++            } else if (c == '0' && !(p[1] >= '0' && p[1] <= '9')) {
++                p++;
++            } else if (c >= '0' && c <= '9') {
++                return -1;  /* legacy octal: strict mode decides */
++            } else if (c >= 0x80) {
++                utf8_decode(p, &p_next);
++                if (p_next == p + 1)
++                    return -1;
++                p = p_next;
++            } else {
++                ret = lre_parse_escape(&p, true);
++                if (ret == -1)
++                    return -1;
++                if (ret < 0)
++                    p++;
++            }
++        } else if (c >= 0x80) {
++            utf8_decode(p - 1, &p_next);
++            if (p_next == p)
++                return -1;
++            p = p_next;
++        }
++    }
++    L->p = p;
++    return 0;
++}
++
++/* a template part after '`' or the '}' of a substitution */
++static int light_template(JSLightScan *L)
++{
++    const uint8_t *p = L->p, *p_next;
++    uint32_t c;
++
++    for (;;) {
++        if (p >= L->end)
++            return -1;
++        c = *p++;
++        if (c == '`') {
++            L->sep = '`';
++            break;
++        }
++        if (c == '$' && *p == '{') {
++            p++;
++            L->sep = '$';
++            break;
++        }
++        if (c == '\\') {
++            if (p >= L->end)
++                return -1;
++            c = *p++;
++        }
++        if (c >= 0x80) {
++            utf8_decode(p - 1, &p_next);
++            if (p_next == p)
++                return -1;
++            p = p_next;
++        }
++    }
++    L->p = p;
++    L->val = TOK_TEMPLATE;
++    return 0;
++}
++
++/* a regular expression, L->ptr at its '/' */
++static int light_regexp(JSLightScan *L)
++{
++    const uint8_t *p = L->ptr + 1, *p_next;
++    bool in_class = false;
++    uint32_t c;
++
++    for (;;) {
++        if (p >= L->end)
++            return -1;
++        c = *p++;
++        if (c == '\n' || c == '\r') {
++            return -1;
++        } else if (c == '/') {
++            if (!in_class)
++                break;
++        } else if (c == '[') {
++            in_class = true;
++        } else if (c == ']') {
++            in_class = false;
++        } else if (c == '\\') {
++            if (p >= L->end)
++                return -1;
++            c = *p++;
++            if (c == '\n' || c == '\r' || c >= 0x80)
++                return -1;
++        } else if (c >= 0x80) {
++            c = utf8_decode(p - 1, &p_next);
++            if (p_next == p || c == CP_LS || c == CP_PS)
++                return -1;
++            p = p_next;
++        }
++    }
++    while (light_ident_next(*p))
++        p++;
++    if (*p == '\\' || *p >= 0x80)
++        return -1;
++    L->p = p;
++    L->val = TOK_REGEXP;
++    return 0;
++}
++
++/* a number, L->ptr at its first byte */
++static int light_number(JSLightScan *L)
++{
++    const uint8_t *p = L->ptr;
++    bool integer = true;
++
++    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X' || p[1] == 'o' ||
++                        p[1] == 'O' || p[1] == 'b' || p[1] == 'B')) {
++        int k = p[1] | 0x20;
++        const uint8_t *q;
++
++        p += 2;
++        q = p;
++        while (k == 'x' ? light_is_hex(*p) :
++               k == 'o' ? (*p >= '0' && *p <= '7') :
++               (*p == '0' || *p == '1'))
++            p++;
++        if (p == q)
++            return -1;
++    } else if (p[0] == '0' && p[1] >= '0' && p[1] <= '9') {
++        return -1;  /* legacy octal: strict mode decides */
++    } else {
++        while (*p >= '0' && *p <= '9')
++            p++;
++        if (*p == '.') {
++            integer = false;
++            p++;
++            while (*p >= '0' && *p <= '9')
++                p++;
++        }
++        if (*p == 'e' || *p == 'E') {
++            const uint8_t *q;
++
++            integer = false;
++            p++;
++            if (*p == '+' || *p == '-')
++                p++;
++            q = p;
++            while (*p >= '0' && *p <= '9')
++                p++;
++            if (p == q)
++                return -1;
++        }
++    }
++    if (*p == 'n' && integer)
++        p++;
++    if (light_more_ident(p))
++        return -1;
++    L->p = p;
++    L->val = TOK_NUMBER;
++    return 0;
++}
++
++/* the next token: 0, or -1 to give up */
++static int light_next(JSLightScan *L, bool html)
++{
++    const uint8_t *p = L->p, *p_next;
++    uint32_t c;
++
++    L->nl = false;
++    L->by_function = false;
++    L->is_of = false;
++    for (;;) {
++        c = *p;
++        if (c == ' ' || c == '\t' || c == '\v' || c == '\f') {
++            p++;
++        } else if (c == '\n') {
++            p++;
++            L->nl = true;
++        } else if (c == '\r') {
++            p += (p[1] == '\n') ? 2 : 1;
++            L->nl = true;
++        } else if (c == '/' && p[1] == '*') {
++            p += 2;
++            for (;;) {
++                if (p >= L->end)
++                    return -1;
++                if (p[0] == '*' && p[1] == '/') {
++                    p += 2;
++                    break;
++                }
++                if (*p == '\n') {
++                    L->nl = true;
++                    p++;
++                } else if (*p >= 0x80) {
++                    utf8_decode(p, &p);
++                } else {
++                    p++;
++                }
++            }
++        } else if (c == '/' && p[1] == '/') {
++            p += 2;
++            for (;;) {
++                if (p >= L->end || *p == '\r' || *p == '\n')
++                    break;
++                if (*p >= 0x80) {
++                    c = utf8_decode(p, &p_next);
++                    if (c == CP_LS || c == CP_PS)
++                        return -1;
++                    p = p_next;
++                } else {
++                    p++;
++                }
++            }
++        } else {
++            break;
++        }
++    }
++    L->ptr = p;
++    if (p >= L->end)
++        return -1;
++    switch (c) {
++    case '(': case ')': case '[': case ']': case '{': case '}':
++    case ';': case ',': case ':': case '~': case '@':
++        L->val = c;
++        p++;
++        break;
++    case '\'':
++    case '"':
++        L->p = p + 1;
++        if (light_string(L, c))
++            return -1;
++        L->val = TOK_STRING;
++        return 0;
++    case '`':
++        L->p = p + 1;
++        return light_template(L);
++    case '.':
++        if (p[1] == '.' && p[2] == '.') {
++            L->val = TOK_ELLIPSIS;
++            p += 3;
++        } else if (p[1] >= '0' && p[1] <= '9') {
++            return light_number(L);
++        } else {
++            L->val = '.';
++            p++;
++        }
++        break;
++    case '0': case '1': case '2': case '3': case '4':
++    case '5': case '6': case '7': case '8': case '9':
++        return light_number(L);
++    case '#':
++        p++;
++        if (!light_ident_first(*p))
++            return -1;
++        while (light_ident_next(*p))
++            p++;
++        if (*p == '\\' || *p >= 0x80)
++            return -1;
++        L->val = TOK_PRIVATE_NAME;
++        break;
++    case '/':
++        if (p[1] == '=') {
++            L->val = TOK_DIV_ASSIGN;
++            p += 2;
++        } else {
++            L->val = '/';
++            p++;
++        }
++        break;
++    case '=':
++        if (p[1] == '>') {
++            L->val = TOK_ARROW;
++            p += 2;
++        } else if (p[1] == '=') {
++            if (p[2] == '=') {
++                L->val = TOK_STRICT_EQ;
++                p += 3;
++            } else {
++                L->val = TOK_EQ;
++                p += 2;
++            }
++        } else {
++            L->val = '=';
++            p++;
++        }
++        break;
++    case '+':
++        if (p[1] == '=') {
++            L->val = TOK_PLUS_ASSIGN;
++            p += 2;
++        } else if (p[1] == '+') {
++            L->val = TOK_INC;
++            p += 2;
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    case '-':
++        if (p[1] == '=') {
++            L->val = TOK_MINUS_ASSIGN;
++            p += 2;
++        } else if (p[1] == '-') {
++            if (html && p[2] == '>')
++                return -1;
++            L->val = TOK_DEC;
++            p += 2;
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    case '<':
++        if (p[1] == '=') {
++            L->val = TOK_LTE;
++            p += 2;
++        } else if (p[1] == '<') {
++            if (p[2] == '=') {
++                L->val = TOK_SHL_ASSIGN;
++                p += 3;
++            } else {
++                L->val = TOK_SHL;
++                p += 2;
++            }
++        } else if (html && p[1] == '!' && p[2] == '-' && p[3] == '-') {
++            return -1;
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    case '>':
++        if (p[1] == '=') {
++            L->val = TOK_GTE;
++            p += 2;
++        } else if (p[1] == '>') {
++            if (p[2] == '>') {
++                if (p[3] == '=') {
++                    L->val = TOK_SHR_ASSIGN;
++                    p += 4;
++                } else {
++                    L->val = TOK_SHR;
++                    p += 3;
++                }
++            } else if (p[2] == '=') {
++                L->val = TOK_SAR_ASSIGN;
++                p += 3;
++            } else {
++                L->val = TOK_SAR;
++                p += 2;
++            }
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    case '*':
++        if (p[1] == '=') {
++            L->val = TOK_MUL_ASSIGN;
++            p += 2;
++        } else if (p[1] == '*') {
++            if (p[2] == '=') {
++                L->val = TOK_POW_ASSIGN;
++                p += 3;
++            } else {
++                L->val = TOK_POW;
++                p += 2;
++            }
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    case '&':
++    case '|':
++        if (p[1] == '=') {
++            L->val = (c == '&') ? TOK_AND_ASSIGN : TOK_OR_ASSIGN;
++            p += 2;
++        } else if (p[1] == c) {
++            if (p[2] == '=') {
++                L->val = (c == '&') ? TOK_LAND_ASSIGN : TOK_LOR_ASSIGN;
++                p += 3;
++            } else {
++                L->val = (c == '&') ? TOK_LAND : TOK_LOR;
++                p += 2;
++            }
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    case '%':
++    case '^':
++        if (p[1] == '=') {
++            L->val = (c == '%') ? TOK_MOD_ASSIGN : TOK_XOR_ASSIGN;
++            p += 2;
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    case '!':
++        if (p[1] == '=') {
++            if (p[2] == '=') {
++                L->val = TOK_STRICT_NEQ;
++                p += 3;
++            } else {
++                L->val = TOK_NEQ;
++                p += 2;
++            }
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    case '?':
++        if (p[1] == '?') {
++            if (p[2] == '=') {
++                L->val = TOK_DOUBLE_QUESTION_MARK_ASSIGN;
++                p += 3;
++            } else {
++                L->val = TOK_DOUBLE_QUESTION_MARK;
++                p += 2;
++            }
++        } else if (p[1] == '.' && !(p[2] >= '0' && p[2] <= '9')) {
++            L->val = TOK_QUESTION_MARK_DOT;
++            p += 2;
++        } else {
++            L->val = c;
++            p++;
++        }
++        break;
++    default:
++        if (!light_ident_first(c))
++            return -1;
++        p++;
++        while (light_ident_next(*p))
++            p++;
++        if (*p == '\\' || *p >= 0x80)
++            return -1;
++        L->val = light_word(L, L->ptr, p - L->ptr);
++        break;
++    }
++    L->p = p;
++    return 0;
++}
++
++/*
++ * js_parse_skip_parens_token's scan without the tokenizer: the same
++ * states, answers and memo entries. 0 with the answer in *ptok, or -1
++ * if the tokenizer must answer.
++ */
++static int js_parse_skip_parens_light(JSParseState *s, int *pbits,
++                                      bool no_line_terminator, int *ptok)
++{
++    char state[256];
++    const uint8_t *start[256];
++    uint8_t lbits[256];
++    const uint8_t *pend = NULL;
++    int pend_bits = 0;
++    bool last_by_function = false;
++    bool arrow_only = (!pbits && no_line_terminator && s->token.val == '(');
++    bool first = true;
++    bool html = s->allow_html_comments;
++    JSLightScan L;
++    size_t level = 0;
++    int last_tok, tok = TOK_EOF, bits = 0;
++
++    if (s->token.val != '(' && s->token.val != '[' && s->token.val != '{')
++        return -1;
++    L.p = s->token.ptr + 1;
++    L.end = s->buf_end;
++    L.ptr = s->token.ptr;
++    L.val = s->token.val;
++    L.nl = false;
++    L.by_function = false;
++    L.is_of = false;
++
++    lbits[level] = 0;
++    start[level] = NULL;
++    state[level++] = 0;
++    last_tok = 0;
++    for (;;) {
++        switch (L.val) {
++        case '(':
++        case '[':
++        case '{':
++            if (level >= sizeof(state))
++                return -1;
++            start[level] = L.ptr;
++            lbits[level] = 0;
++            state[level++] = L.val;
++            break;
++        case ')':
++            if (state[--level] != '(')
++                return -1;
++            goto popped;
++        case ']':
++            if (state[--level] != '[')
++                return -1;
++        popped:
++            lbits[level - 1] |= lbits[level] & SKIP_HAS_ASSIGNMENT;
++            if (L.ptr - start[level] >= SKIP_MEMO_MIN_SPAN) {
++                pend = start[level];
++                pend_bits = lbits[level];
++            }
++            break;
++        case '}':
++            {
++                int c = state[--level];
++                if (c == '{')
++                    goto popped;
++                if (c != '`')
++                    return -1;
++                lbits[level - 1] |= lbits[level] & SKIP_HAS_ASSIGNMENT;
++                /* the template goes on after the substitution */
++                if (light_template(&L))
++                    return -1;
++                goto handle_template;
++            }
++        case TOK_TEMPLATE:
++        handle_template:
++            if (L.sep != '`') {
++                if (level >= sizeof(state))
++                    return -1;
++                start[level] = NULL;
++                lbits[level] = 0;
++                state[level++] = '`';
++            }
++            break;
++        case ';':
++            if (level == 2)
++                bits |= SKIP_HAS_SEMI;
++            lbits[level - 1] |= SKIP_HAS_SEMI;
++            break;
++        case TOK_ELLIPSIS:
++            if (level == 2)
++                bits |= SKIP_HAS_ELLIPSIS;
++            lbits[level - 1] |= SKIP_HAS_ELLIPSIS;
++            break;
++        case '=':
++            bits |= SKIP_HAS_ASSIGNMENT;
++            lbits[level - 1] |= SKIP_HAS_ASSIGNMENT;
++            break;
++        case TOK_DIV_ASSIGN:
++        case '/':
++            /* what '/' means after these depends on the function */
++            if (last_by_function)
++                return -1;
++            if (is_regexp_allowed(last_tok)) {
++                if (light_regexp(&L))
++                    return -1;
++            }
++            break;
++        }
++        if (L.val == TOK_IDENT && (L.is_of ||
++            (L.by_function && L.ptr[0] == 'y'))) {
++            last_tok = TOK_OF;
++        } else {
++            last_tok = L.val;
++        }
++        last_by_function = L.by_function;
++        if (light_next(&L, html))
++            return -1;
++        if (pend) {
++            skip_memo_add(s, pend, L.is_of ? TOK_OF : L.val, pend_bits, L.nl);
++            pend = NULL;
++        }
++        if (arrow_only && first) {
++            first = false;
++            if (L.val != ')' && L.val != '[' && L.val != '{' &&
++                L.val != TOK_ELLIPSIS && L.val != TOK_IDENT &&
++                !L.by_function)
++                break;
++        }
++        if (level <= 1) {
++            tok = L.is_of ? TOK_OF : L.val;
++            if (no_line_terminator && L.nl)
++                tok = '\n';
++            break;
++        }
++    }
++    if (pbits)
++        *pbits = bits;
++    *ptok = tok;
++    return 0;
++}
++
+ /* XXX: improve speed with early bailout */
+ /* XXX: no longer works if regexps are present. Could use previous
+    regexp parsing heuristics to handle most cases */
+@@ -24498,6 +25232,8 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
+             *pbits = memo->bits;
+         return (no_line_terminator && memo->nl) ? '\n' : memo->tok;
+     }
++    if (js_parse_skip_parens_light(s, pbits, no_line_terminator, &tok) == 0)
++        return tok;
+ 
+     /* protect from underflow */
+     lbits[level] = 0;
+@@ -27391,16 +28127,61 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
+ }
+ 
+ /* allowed parse_flags: PF_IN_ACCEPTED */
++/*
++ * The level of a binary operator token, 1 (multiplicative) to 8 ('|'),
++ * and its opcode; 0 if it is none (VitaSurf).
++ */
++static int js_binary_op_level(int op, int parse_flags, int *popcode)
++{
++    switch(op) {
++    case '*': *popcode = OP_mul; return 1;
++    case '/': *popcode = OP_div; return 1;
++    case '%': *popcode = OP_mod; return 1;
++    case '+': *popcode = OP_add; return 2;
++    case '-': *popcode = OP_sub; return 2;
++    case TOK_SHL: *popcode = OP_shl; return 3;
++    case TOK_SAR: *popcode = OP_sar; return 3;
++    case TOK_SHR: *popcode = OP_shr; return 3;
++    case '<': *popcode = OP_lt; return 4;
++    case '>': *popcode = OP_gt; return 4;
++    case TOK_LTE: *popcode = OP_lte; return 4;
++    case TOK_GTE: *popcode = OP_gte; return 4;
++    case TOK_INSTANCEOF: *popcode = OP_instanceof; return 4;
++    case TOK_IN:
++        if (!(parse_flags & PF_IN_ACCEPTED))
++            return 0;
++        *popcode = OP_in;
++        return 4;
++    case TOK_EQ: *popcode = OP_eq; return 5;
++    case TOK_NEQ: *popcode = OP_neq; return 5;
++    case TOK_STRICT_EQ: *popcode = OP_strict_eq; return 5;
++    case TOK_STRICT_NEQ: *popcode = OP_strict_neq; return 5;
++    case '&': *popcode = OP_and; return 6;
++    case '^': *popcode = OP_xor; return 7;
++    case '|': *popcode = OP_or; return 8;
++    default: return 0;
++    }
++}
++
++/*
++ * A binary expression of operators up to the given level (VitaSurf: by
++ * precedence climbing). The operand used to be parsed by a call per
++ * level, eight deep for every name and number, each asking whether the
++ * token after it was its own operator; now the token's level is looked
++ * up once and the levels below it skipped. The work is done in the same
++ * order, so the bytecode and the errors are the same -- including that
++ * "#x in o" leaves level 4 without looking for another operator there.
++ */
+ static __exception int js_parse_expr_binary(JSParseState *s, int level,
+                                             int parse_flags)
+ {
+-    int op, opcode;
++    int lvl, tl, opcode;
+ 
+-    if (level == 0) {
++    if (level == 0)
+         return js_parse_unary(s, PF_POW_ALLOWED);
+-    } else if (s->token.val == TOK_PRIVATE_NAME &&
+-               (parse_flags & PF_IN_ACCEPTED) && level == 4 &&
+-               peek_token(s, false) == TOK_IN) {
++    if (level >= 4 && s->token.val == TOK_PRIVATE_NAME &&
++        (parse_flags & PF_IN_ACCEPTED) &&
++        peek_token(s, false) == TOK_IN) {
+         JSAtom atom;
+         atom = JS_DupAtom(s->ctx, s->token.u.ident.atom);
+         if (next_token(s))
+@@ -27409,7 +28190,7 @@ static __exception int js_parse_expr_binary(JSParseState *s, int level,
+             goto fail_private_in;
+         if (next_token(s))
+             goto fail_private_in;
+-        if (js_parse_expr_binary(s, level - 1, parse_flags)) {
++        if (js_parse_expr_binary(s, 3, parse_flags)) {
+         fail_private_in:
+             JS_FreeAtom(s->ctx, atom);
+             return -1;
+@@ -27418,140 +28199,24 @@ static __exception int js_parse_expr_binary(JSParseState *s, int level,
+         emit_atom(s, atom);
+         emit_u16(s, s->cur_func->scope_level);
+         JS_FreeAtom(s->ctx, atom);
+-        return 0;
++        lvl = 5;
+     } else {
+-        if (js_parse_expr_binary(s, level - 1, parse_flags))
++        if (js_parse_unary(s, PF_POW_ALLOWED))
+             return -1;
++        lvl = 1;
+     }
+     for(;;) {
+-        op = s->token.val;
+-        switch(level) {
+-        case 1:
+-            switch(op) {
+-            case '*':
+-                opcode = OP_mul;
+-                break;
+-            case '/':
+-                opcode = OP_div;
+-                break;
+-            case '%':
+-                opcode = OP_mod;
+-                break;
+-            default:
+-                return 0;
+-            }
+-            break;
+-        case 2:
+-            switch(op) {
+-            case '+':
+-                opcode = OP_add;
+-                break;
+-            case '-':
+-                opcode = OP_sub;
+-                break;
+-            default:
+-                return 0;
+-            }
+-            break;
+-        case 3:
+-            switch(op) {
+-            case TOK_SHL:
+-                opcode = OP_shl;
+-                break;
+-            case TOK_SAR:
+-                opcode = OP_sar;
+-                break;
+-            case TOK_SHR:
+-                opcode = OP_shr;
+-                break;
+-            default:
+-                return 0;
+-            }
+-            break;
+-        case 4:
+-            switch(op) {
+-            case '<':
+-                opcode = OP_lt;
+-                break;
+-            case '>':
+-                opcode = OP_gt;
+-                break;
+-            case TOK_LTE:
+-                opcode = OP_lte;
+-                break;
+-            case TOK_GTE:
+-                opcode = OP_gte;
+-                break;
+-            case TOK_INSTANCEOF:
+-                opcode = OP_instanceof;
+-                break;
+-            case TOK_IN:
+-                if (parse_flags & PF_IN_ACCEPTED) {
+-                    opcode = OP_in;
+-                } else {
+-                    return 0;
+-                }
+-                break;
+-            default:
+-                return 0;
+-            }
+-            break;
+-        case 5:
+-            switch(op) {
+-            case TOK_EQ:
+-                opcode = OP_eq;
+-                break;
+-            case TOK_NEQ:
+-                opcode = OP_neq;
+-                break;
+-            case TOK_STRICT_EQ:
+-                opcode = OP_strict_eq;
+-                break;
+-            case TOK_STRICT_NEQ:
+-                opcode = OP_strict_neq;
+-                break;
+-            default:
+-                return 0;
+-            }
+-            break;
+-        case 6:
+-            switch(op) {
+-            case '&':
+-                opcode = OP_and;
+-                break;
+-            default:
+-                return 0;
+-            }
+-            break;
+-        case 7:
+-            switch(op) {
+-            case '^':
+-                opcode = OP_xor;
+-                break;
+-            default:
+-                return 0;
+-            }
+-            break;
+-        case 8:
+-            switch(op) {
+-            case '|':
+-                opcode = OP_or;
+-                break;
+-            default:
+-                return 0;
+-            }
+-            break;
+-        default:
+-            abort();
+-        }
++        tl = js_binary_op_level(s->token.val, parse_flags, &opcode);
++        if (tl == 0 || tl < lvl || tl > level)
++            return 0;
++        lvl = tl;
+         if (next_token(s))
+             return -1;
+         emit_source_loc(s);
+-        if (js_parse_expr_binary(s, level - 1, parse_flags))
++        if (js_parse_expr_binary(s, lvl - 1, parse_flags))
+             return -1;
+         emit_op(s, opcode);
+     }
+-    return 0;
+ }
+ 
+ /* allowed parse_flags: PF_IN_ACCEPTED */
