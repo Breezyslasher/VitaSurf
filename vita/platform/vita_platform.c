@@ -550,48 +550,119 @@ static void log_iconv_selftest(void)
 	}
 }
 
-/**
- * Parse the bundled CA file through mbedTLS the way libcurl does and log
- * the result, so a TLS failure can be traced to the bundle or the library.
- */
-static void log_tls_selftest(void)
+/* The shared CA chain; see vita_tls_ca_shared() */
+static mbedtls_x509_crt ca_chain;
+static int ca_state;		/* 0 not tried, 1 ready, -1 failed */
+static int ca_rejected;		/* certificates the parse skipped */
+static char *ca_path;
+static char *ca_first;
+static size_t ca_first_len;
+
+static void ca_load(const char *path)
 {
 	char *pem = NULL;
 	size_t len = 0;
-	mbedtls_x509_crt chain;
-	const mbedtls_x509_crt *c;
-	char version[16];
-	char buf[160];
+	unsigned long long t0 = vita_now_us();
+	const char *b, *e;
 	int ret;
-	int count = 0;
 
-	if (vita_read_file(VITASURF_CA_BUNDLE, &pem, &len) != 0) {
-		vita_log("selftest: cannot read %s", VITASURF_CA_BUNDLE);
+	ca_state = -1;
+	ca_path = strdup(path);
+	if (ca_path == NULL || vita_read_file(path, &pem, &len) != 0) {
+		vita_log("tls: cannot read the CA bundle %s", path);
 		return;
 	}
+	mbedtls_x509_crt_init(&ca_chain);
+	/* PEM input must include the terminating NUL, which vita_read_file adds */
+	ret = mbedtls_x509_crt_parse(&ca_chain, (const unsigned char *)pem,
+				     len + 1);
+	if (ret < 0) {
+		char buf[128];
+
+		mbedtls_strerror(ret, buf, sizeof(buf));
+		vita_log("tls: the CA bundle did not parse: -0x%04x %s",
+			 (unsigned int)-ret, buf);
+		mbedtls_x509_crt_free(&ca_chain);
+		free(pem);
+		return;
+	}
+	ca_rejected = ret;
+
+	/* the first certificate as it stands, for libcurl to parse */
+	b = strstr(pem, "-----BEGIN CERTIFICATE-----");
+	e = (b != NULL) ? strstr(b, "-----END CERTIFICATE-----") : NULL;
+	if (e != NULL) {
+		size_t n = (size_t)(e - b) + strlen("-----END CERTIFICATE-----");
+
+		ca_first = malloc(n + 2);
+		if (ca_first != NULL) {
+			memcpy(ca_first, b, n);
+			ca_first[n] = '\n';
+			ca_first[n + 1] = '\0';
+			ca_first_len = n + 2;
+		}
+	}
+	free(pem);
+	if (ca_first == NULL) {
+		mbedtls_x509_crt_free(&ca_chain);
+		return;
+	}
+	ca_state = 1;
+	vita_log("tls: CA bundle parsed once in %u ms; every connection "
+		 "shares it",
+		 (unsigned int)((vita_now_us() - t0) / 1000));
+}
+
+int vita_tls_ca_shared(const char *path, const char **first_pem,
+		       size_t *first_len)
+{
+	if (path == NULL)
+		return 0;
+	if (ca_state == 0)
+		ca_load(path);
+	if (ca_state != 1 || strcmp(path, ca_path) != 0)
+		return 0;
+	*first_pem = ca_first;
+	*first_len = ca_first_len;
+	return 1;
+}
+
+void vita_tls_ca_attach(void *mbedtls_ssl_config)
+{
+	if (ca_state == 1 && mbedtls_ssl_config != NULL)
+		mbedtls_ssl_conf_ca_chain(
+			(struct mbedtls_ssl_config *)mbedtls_ssl_config,
+			&ca_chain, NULL);
+}
+
+/**
+ * Log what mbedTLS made of the bundled CA file, which is the chain every
+ * connection shares, so a TLS failure can be traced to the bundle or the
+ * library.
+ */
+static void log_tls_selftest(void)
+{
+	const mbedtls_x509_crt *c;
+	const char *first;
+	size_t first_len;
+	char version[16];
+	char buf[160];
+	int count = 0;
 
 	mbedtls_version_get_string(version);
-	mbedtls_x509_crt_init(&chain);
-	/* PEM input must include the terminating NUL, which vita_read_file adds */
-	ret = mbedtls_x509_crt_parse(&chain, (const unsigned char *)pem, len + 1);
-	for (c = &chain; c != NULL && c->version != 0; c = c->next) {
-		count++;
-	}
-	if (ret < 0) {
-		mbedtls_strerror(ret, buf, sizeof(buf));
-		vita_log("selftest: mbedTLS %s failed to parse the CA bundle: -0x%04x %s",
-			 version, (unsigned int)-ret, buf);
+	if (!vita_tls_ca_shared(VITASURF_CA_BUNDLE, &first, &first_len)) {
+		vita_log("selftest: mbedTLS %s could not load the CA bundle",
+			 version);
 	} else {
+		for (c = &ca_chain; c != NULL && c->version != 0; c = c->next) {
+			count++;
+		}
 		vita_log("selftest: mbedTLS %s parsed %d certificates from the bundle (%d rejected)",
-			 version, count, ret);
-	}
-	if (count > 0) {
+			 version, count, ca_rejected);
 		buf[0] = '\0';
-		mbedtls_x509_dn_gets(buf, sizeof(buf), &chain.subject);
+		mbedtls_x509_dn_gets(buf, sizeof(buf), &ca_chain.subject);
 		vita_log("selftest: first certificate: %s", buf);
 	}
-	mbedtls_x509_crt_free(&chain);
-	free(pem);
 	/*
 	 * What the TLS build can speak (VitaSurf). A server that wants
 	 * something missing here fails the handshake as cURL error 35

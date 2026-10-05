@@ -183,6 +183,32 @@ void vita_net_fini(void);
  */
 int vita_read_file(const char *path, char **data, size_t *len);
 
+/**
+ * The CA bundle parsed once and shared by every TLS connection (VitaSurf).
+ *
+ * libcurl's mbedTLS backend parses whatever CA bundle it is given inside
+ * every connect, and the 121 certificates of ours take about 170 ms to
+ * parse on the Vita: each HTTPS connection paid that before its
+ * handshake began. The fetcher now gives libcurl a single certificate,
+ * which costs nothing to parse, and puts this chain in its place from
+ * CURLOPT_SSL_CTX_FUNCTION, which runs after libcurl has set its own.
+ *
+ * \param path       the bundle to share; loaded on the first call
+ * \param first_pem  updated to the bundle's first certificate, PEM with
+ *                   its NUL, for CURLOPT_CAINFO_BLOB
+ * \param first_len  its length, the NUL included
+ * \return 1 when the chain is ready, 0 when the bundle could not be
+ *         read or parsed, or is not the one already loaded
+ */
+int vita_tls_ca_shared(const char *path, const char **first_pem,
+		       size_t *first_len);
+
+/**
+ * Put the shared chain into an mbedtls_ssl_config, as the trust anchors
+ * the peer's certificate is verified against.
+ */
+void vita_tls_ca_attach(void *mbedtls_ssl_config);
+
 /** True when the user created the verbose flag file in the data directory. */
 int vita_verbose_requested(void);
 
@@ -257,7 +283,8 @@ struct vita_file_root {
  * The places the file browser lists first (vita_file.c): VitaSurf's own
  * folders, then each storage device that can be read now.
  *
- * eturn How many were written to roots, at most max.
+ * 
+eturn How many were written to roots, at most max.
  */
 int vita_file_roots(struct vita_file_root *roots, int max);
 
