@@ -1,0 +1,322 @@
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index b5ae8ef6d..c2a616412 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -46,6 +46,7 @@
+ #include "html/box_construct.h"
+ #include "html/form_internal.h"
+ #include "html/dom_event.h"
++#include "html/frame_doc.h"
+ 
+ 
+ /**
+@@ -652,6 +653,11 @@ static void html_process_inserted_element(html_content *htmlc,
+ 		html_process_inserted_base(htmlc, node);
+ 		break;
+ 
++	case DOM_HTML_ELEMENT_TYPE_IFRAME:
++		/* a frame loads whether or not layout shows it (VitaSurf) */
++		html_frame_doc_note_iframe(htmlc, node);
++		break;
++
+ 	case DOM_HTML_ELEMENT_TYPE_IMG:
+ 		html_process_inserted_img(htmlc, node);
+ 		break;
+diff --git a/content/handlers/html/frame_doc.c b/content/handlers/html/frame_doc.c
+index 8cc4348ae..48f1fc497 100644
+--- a/content/handlers/html/frame_doc.c
++++ b/content/handlers/html/frame_doc.c
+@@ -52,6 +52,15 @@ struct frame_doc {
+ };
+ 
+ static struct frame_doc *frame_docs;
++
++/** An iframe element a page has had put into it. */
++struct frame_el {
++	struct frame_el *next;
++	html_content *owner;
++	dom_node *node;
++};
++
++static struct frame_el *frame_els;
+ static unsigned int frame_doc_serial;
+ static uint32_t frame_doc_seed;
+ 
+@@ -318,10 +327,63 @@ nsurl *html_frame_doc_base(nsurl *url)
+ 	return d->base;
+ }
+ 
++/* exported interface documented in html/frame_doc.h */
++void html_frame_doc_note_iframe(html_content *c, dom_node *node)
++{
++	struct frame_el *e;
++
++	for (e = frame_els; e != NULL; e = e->next) {
++		if (e->owner == c && e->node == node) {
++			return;
++		}
++	}
++	e = malloc(sizeof(*e));
++	if (e == NULL) {
++		return;
++	}
++	e->owner = c;
++	e->node = dom_node_ref(node);
++	e->next = frame_els;
++	frame_els = e;
++}
++
++/* exported interface documented in html/frame_doc.h */
++void html_frame_doc_each_iframe(html_content *c,
++		bool (*visit)(dom_node *node, bool *stop, void *pw), void *pw)
++{
++	struct frame_el **p = &frame_els, *e;
++	bool stop = false;
++
++	while (!stop && (e = *p) != NULL) {
++		if (e->owner != c) {
++			p = &e->next;
++			continue;
++		}
++		if (visit(e->node, &stop, pw)) {
++			p = &e->next;
++		} else {
++			*p = e->next;
++			dom_node_unref(e->node);
++			free(e);
++		}
++	}
++}
++
+ /* exported interface documented in html/frame_doc.h */
+ void html_frame_doc_release(html_content *c)
+ {
+ 	struct frame_doc **p = &frame_docs, *d;
++	struct frame_el **q = &frame_els, *e;
++
++	while ((e = *q) != NULL) {
++		if (e->owner == c) {
++			*q = e->next;
++			dom_node_unref(e->node);
++			free(e);
++		} else {
++			q = &e->next;
++		}
++	}
+ 
+ 	while ((d = *p) != NULL) {
+ 		if (d->owner == c) {
+diff --git a/content/handlers/html/frame_doc.h b/content/handlers/html/frame_doc.h
+index adcc3885a..a43f658af 100644
+--- a/content/handlers/html/frame_doc.h
++++ b/content/handlers/html/frame_doc.h
+@@ -81,7 +81,25 @@ bool html_frame_doc_source(struct nsurl *url, const char **data,
+  */
+ struct nsurl *html_frame_doc_base(struct nsurl *url);
+ 
+-/** Forget a page's frame documents, as it goes. */
++/**
++ * Note an iframe element put into a page, by the parser or by script
++ * (VitaSurf). One that layout gives no box -- display: none -- still has
++ * to load, and this is how the page's frames are found without walking
++ * its document.
++ */
++void html_frame_doc_note_iframe(struct html_content *c,
++		struct dom_node *node);
++
++/**
++ * Visit each iframe element noted in a page. visit returns false to
++ * forget the element (it has left the document; being put back notes it
++ * again), and stop is set to end the walk early.
++ */
++void html_frame_doc_each_iframe(struct html_content *c,
++		bool (*visit)(struct dom_node *node, bool *stop, void *pw),
++		void *pw);
++
++/** Forget a page's frame documents and iframe elements, as it goes. */
+ void html_frame_doc_release(struct html_content *c);
+ 
+ #endif
+diff --git a/desktop/frames.c b/desktop/frames.c
+index b54c0400a..4e5b3f737 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -317,6 +317,8 @@ nserror browser_window_create_iframes(struct browser_window *bw)
+ 	return browser_window_rebuild_iframes(bw);
+ }
+ 
++static void start_hidden_iframes(struct browser_window *bw);
++
+ /* exported function documented in desktop/frames.h */
+ nserror browser_window_rebuild_iframes(struct browser_window *bw)
+ {
+@@ -422,13 +424,18 @@ nserror browser_window_rebuild_iframes(struct browser_window *bw)
+ 	}
+ 	free(navigate);
+ 
++	start_hidden_iframes(bw);
++
+ 	return ret;
+ }
+ 
+-/* exported function documented in desktop/frames.h */
+-nserror browser_window_iframe_now(struct browser_window *bw,
+-				  struct dom_node *node,
+-				  struct browser_window **out)
++/**
++ * The window of an iframe element, made or sent to the element's new
++ * src or srcdoc if need be (VitaSurf). now: make a blank document at
++ * once, for script that asked for it; layout leaves it to the scheduler.
++ */
++static nserror iframe_start(struct browser_window *bw, struct dom_node *node,
++			    bool now, struct browser_window **out)
+ {
+ 	struct hlcache_handle *page;
+ 	struct browser_window *window, **grown;
+@@ -469,7 +476,7 @@ nserror browser_window_iframe_now(struct browser_window *bw,
+ 					hlcache_handle_get_url(page),
+ 					BW_NAVIGATE_UNVERIFIABLE,
+ 					NULL, NULL, page);
+-			if (err == NSERROR_OK &&
++			if (err == NSERROR_OK && now &&
+ 			    window->loading_content != NULL &&
+ 			    html_frame_doc_is_blank(window->frame_src)) {
+ 				err = hlcache_handle_run_now(
+@@ -513,7 +520,7 @@ nserror browser_window_iframe_now(struct browser_window *bw,
+ 				      BW_NAVIGATE_UNVERIFIABLE,
+ 				      NULL, NULL, page);
+ 	/* a blank document is there the moment the element is */
+-	if (err == NSERROR_OK && window->loading_content != NULL &&
++	if (err == NSERROR_OK && now && window->loading_content != NULL &&
+ 	    html_frame_doc_is_blank(url)) {
+ 		err = hlcache_handle_run_now(window->loading_content);
+ 	}
+@@ -521,6 +528,92 @@ nserror browser_window_iframe_now(struct browser_window *bw,
+ 	return err;
+ }
+ 
++/* exported function documented in desktop/frames.h */
++nserror browser_window_iframe_now(struct browser_window *bw,
++				  struct dom_node *node,
++				  struct browser_window **out)
++{
++	return iframe_start(bw, node, true, out);
++}
++
++/* exported function documented in desktop/frames.h */
++int browser_window_frame_count(struct browser_window *bw)
++{
++	int i, n = 0;
++
++	for (i = 0; i < bw->iframe_count; i++) {
++		if (bw->iframes[i] != NULL) {
++			n += 1 + browser_window_frame_count(bw->iframes[i]);
++		}
++	}
++	return n;
++}
++
++struct hidden_walk {
++	struct browser_window *bw;
++	struct browser_window *root;
++	int started;
++};
++
++static bool start_hidden_iframe(struct dom_node *node, bool *stop, void *pw)
++{
++	struct hidden_walk *walk = pw;
++	struct browser_window *window;
++	int i;
++
++	for (i = 0; i < walk->bw->iframe_count; i++) {
++		if (walk->bw->iframes[i] != NULL &&
++		    walk->bw->iframes[i]->frame_node == node) {
++			return true;
++		}
++	}
++	/* gone from the page: forget it until it is put back */
++	if (frame_node_page(walk->bw, node) == NULL) {
++		return false;
++	}
++	if (browser_window_frame_count(walk->root) >=
++	    BROWSER_WINDOW_FRAME_CAP) {
++		NSLOG(netsurf, INFO, "%d frames already: a hidden iframe "
++		      "waits", BROWSER_WINDOW_FRAME_CAP);
++		*stop = true;
++		return true;
++	}
++	if (iframe_start(walk->bw, node, false, &window) == NSERROR_OK &&
++	    window != NULL) {
++		walk->started++;
++	}
++	return true;
++}
++
++/**
++ * Load the iframes layout gave no box, as a browser does: one that is
++ * display: none still runs its page, and pages hide the frames they
++ * talk to by postMessage, or post a form into, that way (VitaSurf).
++ */
++static void start_hidden_iframes(struct browser_window *bw)
++{
++	struct hidden_walk walk;
++
++	if (bw->current_content == NULL ||
++	    content_get_type(bw->current_content) != CONTENT_HTML ||
++	    hlcache_handle_get_content(bw->current_content) == NULL) {
++		return;
++	}
++	walk.bw = bw;
++	walk.root = bw;
++	while (walk.root->parent != NULL) {
++		walk.root = walk.root->parent;
++	}
++	walk.started = 0;
++	html_frame_doc_each_iframe((struct html_content *)
++			hlcache_handle_get_content(bw->current_content),
++			start_hidden_iframe, &walk);
++	if (walk.started > 0) {
++		NSLOG(netsurf, INFO, "started %d iframes layout does not show",
++		      walk.started);
++	}
++}
++
+ /* exported function documented in desktop/frames.h */
+ void browser_window_detach_iframes(struct browser_window *bw)
+ {
+diff --git a/desktop/frames.h b/desktop/frames.h
+index 78dd8910d..d7a95a70b 100644
+--- a/desktop/frames.h
++++ b/desktop/frames.h
+@@ -84,7 +84,9 @@ nserror browser_window_rebuild_iframes(struct browser_window *bw);
+  * frame with no src or with src="about:blank" has its blank document on
+  * return; any other starts loading. The window is matched to the
+  * element's box when the page is next laid out. A frame whose element
+- * has a new src or srcdoc since it last navigated goes there now.
++ * has a new src or srcdoc since it last navigated goes there now. An
++ * iframe layout gives no box is loaded when the page is laid out, and
++ * kept while its element is in the page.
+  *
+  * \param bw   The browser window showing or loading the element's page.
+  * \param node The iframe element.
+@@ -96,6 +98,20 @@ nserror browser_window_iframe_now(struct browser_window *bw,
+ 				  struct dom_node *node,
+ 				  struct browser_window **out);
+ 
++/**
++ * How many frame windows there may be under one top window before no
++ * more are made except for frames layout shows (VitaSurf). Each frame's
++ * page has a JavaScript realm of its own, about 2.4 MB, and pages make
++ * hidden frames freely: past this, script gets a stand-in window and a
++ * hidden iframe does not load.
++ */
++#define BROWSER_WINDOW_FRAME_CAP 8
++
++/**
++ * The number of frame windows under a window, at every depth (VitaSurf).
++ */
++int browser_window_frame_count(struct browser_window *bw);
++
+ /**
+  * Create and open a frameset for a browser window.
+  *

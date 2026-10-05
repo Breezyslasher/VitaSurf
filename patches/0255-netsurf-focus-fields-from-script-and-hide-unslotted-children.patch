@@ -1,0 +1,116 @@
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 02ef80556..c7540cfa9 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -992,6 +992,44 @@ gadget_mouse_action(html_content *html,
+ }
+ 
+ 
++/* exported interface documented in html/private.h (VitaSurf) */
++bool html_focus_control(struct html_content *html, struct dom_node *node)
++{
++	struct form_control *ctl;
++
++	if (html == NULL || node == NULL || html->forms == NULL) {
++		return false;
++	}
++	ctl = html_forms_get_control_for_node(html->forms, node);
++	if (ctl == NULL || ctl->box == NULL) {
++		return false;
++	}
++	switch (ctl->type) {
++	case GADGET_TEXTBOX:
++	case GADGET_PASSWORD:
++	case GADGET_TEXTAREA:
++		break;
++	default:
++		return false;
++	}
++	if (ctl->data.text.ta == NULL) {
++		return false;
++	}
++	if (html->selection_type != HTML_SELECTION_TEXTAREA ||
++	    html->selection_owner.textarea != ctl->box) {
++		union html_selection_owner sel_owner;
++
++		sel_owner.none = true;
++		html_set_selection(html, HTML_SELECTION_NONE, sel_owner, true);
++	}
++	NSLOG(netsurf, INFO, "focus: caret to a field of type %d from script",
++	      (int) ctl->type);
++	/* at the end of what is there; the textarea tells the content,
++	 * which places the caret as a tap does */
++	return textarea_set_caret(ctl->data.text.ta, 0x3fffffff);
++}
++
++
+ /**
+  * process mouse activity on an iframe
+  */
+@@ -1413,11 +1451,30 @@ mouse_action_drag_none(html_content *html,
+ 		 * leads nowhere leaves nothing else in the log to say
+ 		 * whether it landed on a control, a link, or plain text.
+ 		 */
+-		NSLOG(netsurf, INFO, "click: action %d, gadget type %d, node %p",
+-		      (int) mas.result.action,
+-		      (mas.gadget.control != NULL) ?
+-				(int) mas.gadget.control->type : -1,
+-		      (void *) mas.node);
++		{
++			/* and what it was, by tag and class, as a pointer
++			 * alone says nothing in a hardware log (VitaSurf) */
++			dom_string *tag = NULL, *cls = NULL;
++
++			if (mas.node != NULL) {
++				dom_node_get_node_name(mas.node, &tag);
++				dom_element_get_attribute(mas.node,
++						corestring_dom_class, &cls);
++			}
++			NSLOG(netsurf, INFO, "click: action %d, gadget type %d, "
++			      "node %p <%.*s class=\"%.*s\">",
++			      (int) mas.result.action,
++			      (mas.gadget.control != NULL) ?
++					(int) mas.gadget.control->type : -1,
++			      (void *) mas.node,
++			      tag ? (int) dom_string_byte_length(tag) : 0,
++			      tag ? dom_string_data(tag) : "",
++			      cls ? (int) (dom_string_byte_length(cls) > 60 ?
++					60 : dom_string_byte_length(cls)) : 0,
++			      cls ? dom_string_data(cls) : "");
++			if (tag != NULL) dom_string_unref(tag);
++			if (cls != NULL) dom_string_unref(cls);
++		}
+ 		fire_generic_dom_event(corestring_dom_click, mas.node, true, true);
+ 	}
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 476cef6ec..807c96578 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -477,6 +477,14 @@ nserror html_relayout(html_content *htmlc);
+ 
+ /* in html/forms.c */
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
++/**
++ * Give the caret to the text field a DOM node stands for (VitaSurf), as a
++ * tap in it would, for element.focus(). Nothing is clicked.
++ *
++ * \return true if the node is a text field with a box to focus
++ */
++bool html_focus_control(struct html_content *html, struct dom_node *node);
++
+ struct form_control *html_forms_get_control_for_node(struct form *forms,
+ 		dom_node *node);
+ 
+diff --git a/resources/default.css b/resources/default.css
+index 059fdbc5e..50db4bb5e 100644
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -168,3 +168,7 @@ mark {
+ dialog:not([open]) { display: none; }
+ datalist { display: none; }
+ input[type=hidden] { display: none; }
++
++/* A host's child whose slot the component does not put out, marked by
++ * the script prelude, which keeps shadow trees as light DOM (VitaSurf). */
++[vitasurf-unslotted] { display: none !important; }

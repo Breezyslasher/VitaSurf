@@ -1,0 +1,172 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 72ae17fb0..9c2116440 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -74,6 +74,7 @@ static css_error node_has_attribute_substring(void *pw, void *node,
+ 		const css_qname *qname, lwc_string *value,
+ 		bool *match);
+ static css_error node_is_root(void *pw, void *node, bool *match);
++static css_error node_attribute_bloom(void *pw, void *node, uint64_t *bloom);
+ static css_error node_count_siblings(void *pw, void *node,
+ 		bool same_name, bool after, int32_t *count);
+ static css_error node_is_empty(void *pw, void *node, bool *match);
+@@ -139,6 +140,7 @@ static css_select_handler selection_handler = {
+ 
+ 	first_child_node,
+ 	next_sibling_node,
++	node_attribute_bloom,
+ };
+ 
+ /**
+@@ -1410,6 +1412,75 @@ css_error node_is_root(void *pw, void *node, bool *match)
+ 	return CSS_OK;
+ }
+ 
++/**
++ * The names of a node's attributes, as a bloom (VitaSurf).
++ *
++ * libcss uses this to drop a rule whose key compound needs an
++ * attribute the node has not got, rather than offering it and then
++ * refusing it. 94% of the candidates a GitHub page offers come from
++ * the universal chain and most of those are attribute rules, so one
++ * walk of the node's own attributes here saves hundreds of refusals
++ * per element per sheet.
++ *
++ * The filter only ever removes work: a node whose attributes cannot
++ * be read answers with every bit set, which skips nothing.
++ */
++css_error node_attribute_bloom(void *pw, void *node, uint64_t *bloom)
++{
++	dom_node *n = node;
++	dom_namednodemap *attrs = NULL;
++	dom_exception err;
++	uint32_t i, len = 0;
++	uint64_t bits = 0;
++
++	(void) pw;
++
++	err = dom_node_get_attributes(n, &attrs);
++	if (err != DOM_NO_ERR || attrs == NULL) {
++		*bloom = ~(uint64_t) 0;
++		return CSS_OK;
++	}
++	err = dom_namednodemap_get_length(attrs, &len);
++	if (err != DOM_NO_ERR) {
++		dom_namednodemap_unref(attrs);
++		*bloom = ~(uint64_t) 0;
++		return CSS_OK;
++	}
++	for (i = 0; i < len; i++) {
++		dom_node *attr = NULL;
++		dom_string *name = NULL;
++
++		if (dom_namednodemap_item(attrs, i, &attr) != DOM_NO_ERR ||
++				attr == NULL) {
++			continue;
++		}
++		if (dom_node_get_node_name(attr, &name) == DOM_NO_ERR &&
++				name != NULL) {
++			const char *d = dom_string_data(name);
++			size_t l = dom_string_byte_length(name);
++			const char *colon = memchr(d, ':', l);
++
++			bits |= css_attribute_bloom_bits(d, l);
++			/*
++			 * A selector names the local part on its own, so
++			 * xlink:href must answer to href as well or the
++			 * rule would be skipped rather than tested.
++			 */
++			if (colon != NULL) {
++				bits |= css_attribute_bloom_bits(colon + 1,
++						l - (size_t) (colon + 1 - d));
++			}
++			dom_string_unref(name);
++		}
++		dom_node_unref(attr);
++	}
++	dom_namednodemap_unref(attrs);
++
++	*bloom = bits;
++
++	return CSS_OK;
++}
++
+ static int
+ node_count_siblings_check(dom_node *node,
+ 			  bool check_name,
+diff --git a/utils/utils.c b/utils/utils.c
+index e4bfc64c4..12515d1ce 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -643,6 +643,11 @@ unsigned int vitasurf_job_max_wraps;
+ unsigned int vitasurf_job_max_attr_gets;
+ unsigned int vitasurf_js_jobs_threw;
+ unsigned int vitasurf_ms_js_jobs_threw;
++unsigned int vitasurf_js_jobs_budget;
++unsigned int vitasurf_ms_js_jobs_budget;
++unsigned int vitasurf_js_drains_capped;
++unsigned int vitasurf_js_drain_max_jobs;
++unsigned int vitasurf_ms_js_drain_max;
+ unsigned int vitasurf_js_childnodes;
+ unsigned int vitasurf_js_childnodes_items;
+ unsigned int vitasurf_ms_js_childnodes;
+@@ -665,6 +670,10 @@ extern unsigned int css_select_from_element;
+ extern unsigned int css_select_from_class;
+ extern unsigned int css_select_from_id;
+ extern unsigned int css_select_from_universal;
++extern unsigned int css_select_steps_element;
++extern unsigned int css_select_steps_class;
++extern unsigned int css_select_steps_id;
++extern unsigned int css_select_steps_universal;
+ extern unsigned int css_select_cand_details_failed;
+ extern unsigned int css_select_cand_comb_failed;
+ extern unsigned int css_select_cand_matched;
+@@ -782,6 +791,11 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_job_max_attr_gets = 0;
+ 	vitasurf_js_jobs_threw = 0;
+ 	vitasurf_ms_js_jobs_threw = 0;
++	vitasurf_js_jobs_budget = 0;
++	vitasurf_ms_js_jobs_budget = 0;
++	vitasurf_js_drains_capped = 0;
++	vitasurf_js_drain_max_jobs = 0;
++	vitasurf_ms_js_drain_max = 0;
+ 	vitasurf_js_childnodes = 0;
+ 	vitasurf_js_childnodes_items = 0;
+ 	vitasurf_ms_js_childnodes = 0;
+@@ -803,6 +817,10 @@ void vitasurf_profile_reset(void)
+ 	css_select_from_class = 0;
+ 	css_select_from_id = 0;
+ 	css_select_from_universal = 0;
++	css_select_steps_element = 0;
++	css_select_steps_class = 0;
++	css_select_steps_id = 0;
++	css_select_steps_universal = 0;
+ 	css_select_cand_details_failed = 0;
+ 	css_select_cand_comb_failed = 0;
+ 	css_select_cand_matched = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index b1f3a4638..58d074d06 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -348,6 +348,21 @@ extern unsigned int vitasurf_job_max_attr_gets;
+  */
+ extern unsigned int vitasurf_js_jobs_threw;
+ extern unsigned int vitasurf_ms_js_jobs_threw;
++/**
++ * What the time budget costs the page (VitaSurf).
++ *
++ * A GitHub load spent 20458 ms in 59 promise jobs and one of them was
++ * stopped by the budget after 6817 ms -- six and a half seconds of work
++ * thrown away, and the page never finished building itself. Count the
++ * jobs the budget stops apart from the ones that raise on their own,
++ * and say how long the busiest drain was and how many jobs it ran, so
++ * a ceiling can be set from figures rather than from a guess.
++ */
++extern unsigned int vitasurf_js_jobs_budget;
++extern unsigned int vitasurf_ms_js_jobs_budget;
++extern unsigned int vitasurf_js_drains_capped;
++extern unsigned int vitasurf_js_drain_max_jobs;
++extern unsigned int vitasurf_ms_js_drain_max;
+ /**
+  * What a tree walk costs (VitaSurf).
+  *

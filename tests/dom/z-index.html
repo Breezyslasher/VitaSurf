@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<!-- z-index and the painting order: a positioned box is painted after
+     the in-flow content of its stacking context, higher z-index over
+     lower, and a tap goes to what is painted on top. elementFromPoint
+     is the tap's hit test. Expected console output: lines ending in
+     "ok". -->
+<html><head><style>
+body { margin: 0 }
+div { box-sizing: border-box }
+#wrap { position: relative; height: 300px; width: 440px }
+#hi { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 5 }
+#lo { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 1 }
+#drop { position: absolute; left: 150px; top: 0; width: 100px; height: 100px }
+#later { margin-left: 150px; height: 100px; background: rgb(200, 200, 200) }
+#ctx { position: absolute; left: 300px; top: 0; width: 100px; height: 100px; z-index: 1 }
+#inner { position: absolute; left: 0; top: 0; width: 100px; height: 100px; z-index: 100 }
+#over { position: absolute; left: 300px; top: 0; width: 100px; height: 100px; z-index: 2 }
+#under { position: absolute; left: 450px; top: 0; width: 100px; height: 100px; z-index: -1 }
+#flow { margin-left: 450px; margin-top: -100px; height: 100px }
+</style></head><body>
+<div id=wrap>
+<div id=hi>hi</div><div id=lo>lo</div>
+<div id=drop>drop</div>
+<div id=ctx><div id=inner>inner</div></div><div id=over>over</div>
+</div>
+<div id=under>under</div>
+<div id=later style="margin-top:-300px">later</div>
+<div id=flow>flow</div>
+<script>
+setTimeout(function () {
+  function at(x, y) { var e = document.elementFromPoint(x, y); return e ? e.id : 'null'; }
+  function t(label, got, want) { console.log(label + ":", got === want ? "ok" : "FAIL " + got); }
+  t("higher z-index on top, though earlier", at(50, 50), 'hi');
+  t("positioned over in-flow content after it", at(200, 50), 'drop');
+  t("a stacking context keeps its children in it", at(350, 50), 'over');
+  t("negative z-index under in-flow content", at(500, 50), 'flow');
+}, 500);
+</script></body></html>

@@ -1,0 +1,353 @@
+diff --git a/content/handlers/css/dump.c b/content/handlers/css/dump.c
+index a82c60ba2..f525ac2bb 100644
+--- a/content/handlers/css/dump.c
++++ b/content/handlers/css/dump.c
+@@ -124,6 +124,9 @@ static void dump_css_unit(FILE *stream, css_fixed val, css_unit unit)
+ 	case CSS_UNIT_LH:
+ 		fprintf(stream, "lh");
+ 		break;
++	case CSS_UNIT_RLH:
++		fprintf(stream, "rlh");
++		break;
+ 	case CSS_UNIT_VH:
+ 		fprintf(stream, "vh");
+ 		break;
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index d2590ad5d..7b7871122 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -2858,6 +2858,16 @@ static uint32_t dynamic_bit(enum nscss_dynamic which)
+ 	}
+ }
+ 
++/**
++ * Whether a sheet's handle has content to read. One a script added may
++ * still be fetching, and asking for its sheet then asserts: the
++ * selection context skips it the same way until it finishes.
++ */
++static bool dynamic_sheet_ready(struct hlcache_handle *h)
++{
++	return h != NULL && content_get_status(h) == CONTENT_STATUS_DONE;
++}
++
+ /** Which states the document's sheets ask of an element's ancestors. */
+ static uint32_t dynamic_ancestor_bits(html_content *c)
+ {
+@@ -2868,13 +2878,13 @@ static uint32_t dynamic_ancestor_bits(html_content *c)
+ 		struct nscss_import *imports;
+ 		uint32_t n = 0, j;
+ 
+-		if (h == NULL)
++		if (!dynamic_sheet_ready(h))
+ 			continue;
+ 		bits |= css_stylesheet_dynamic_ancestor(
+ 				nscss_get_stylesheet(h));
+ 		imports = nscss_get_imports(h, &n);
+ 		for (j = 0; j < n; j++) {
+-			if (imports[j].c != NULL)
++			if (dynamic_sheet_ready(imports[j].c))
+ 				bits |= css_stylesheet_dynamic_ancestor(
+ 					nscss_get_stylesheet(imports[j].c));
+ 		}
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index e0096b312..22f9e205a 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -89,6 +89,18 @@ struct grid_item {
+ 	int max_height;
+ };
+ 
++/** A named line of one axis: the name's id and the line, from 0. */
++struct grid_line_name {
++	uint32_t id;
++	int line;
++};
++
++/** A named area: its lines, from 0, end exclusive. */
++struct grid_area {
++	lwc_string *name;
++	int row0, row1, col0, col1;
++};
++
+ struct grid_ctx {
+ 	html_content *content;
+ 	const css_unit_ctx *unit_len_ctx;
+@@ -116,6 +128,14 @@ struct grid_ctx {
+ 	uint8_t *occ;
+ 	unsigned occ_major;
+ 	unsigned occ_minor;
++
++	/** named lines and areas (VitaSurf) */
++	struct grid_line_name *col_names;
++	unsigned n_col_names;
++	struct grid_line_name *row_names;
++	unsigned n_row_names;
++	struct grid_area *areas;
++	unsigned n_areas;
+ };
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -237,9 +257,34 @@ static int grid_def_fixed_size(const struct grid_ctx *ctx,
+  *
+  * \return true on success, false on memory exhaustion
+  */
++/** Note the names a template gives the line before track j. */
++static void grid_note_names(const css_computed_grid_track *t, int line,
++		struct grid_line_name **names, unsigned *n_names)
++{
++	uint32_t ids[2] = { t->line_name, t->line_name2 };
++	unsigned k;
++
++	for (k = 0; k < 2; k++) {
++		struct grid_line_name *grown;
++
++		if (ids[k] == 0) {
++			continue;
++		}
++		grown = realloc(*names, (*n_names + 1) * sizeof(**names));
++		if (grown == NULL) {
++			return;
++		}
++		*names = grown;
++		grown[*n_names].id = ids[k];
++		grown[*n_names].line = line;
++		(*n_names)++;
++	}
++}
++
+ static bool grid_build_explicit(const struct grid_ctx *ctx,
+ 		const css_computed_grid_track *tmpl, int axis_avail, int gap,
+-		struct grid_track **tracks_out, unsigned *count_out)
++		struct grid_track **tracks_out, unsigned *count_out,
++		struct grid_line_name **names, unsigned *n_names)
+ {
+ 	unsigned n = 0, group_start = 0, group_len = 0, reps = 1;
+ 	unsigned i, j, total;
+@@ -296,6 +341,7 @@ static bool grid_build_explicit(const struct grid_ctx *ctx,
+ 		if (group_len > 0 && i == group_start) {
+ 			unsigned r, k;
+ 
++			grid_note_names(&tmpl[i], (int) j, names, n_names);
+ 			for (r = 0; r < reps && j < total; r++) {
+ 				for (k = 0; k < group_len && j < total; k++) {
+ 					grid_track_init(ctx, &tmpl[i + k],
+@@ -306,8 +352,11 @@ static bool grid_build_explicit(const struct grid_ctx *ctx,
+ 			i += group_len - 1;
+ 			continue;
+ 		}
++		grid_note_names(&tmpl[i], (int) j, names, n_names);
+ 		grid_track_init(ctx, &tmpl[i], axis_avail, &tracks[j++]);
+ 	}
++	/* the names after the last track are in the terminator */
++	grid_note_names(&tmpl[n], (int) j, names, n_names);
+ 
+ 	*tracks_out = tracks;
+ 	*count_out = j;
+@@ -333,6 +382,153 @@ static int grid_line_index(int32_t line, unsigned n_explicit)
+ 	return (int) n_explicit + line + 1;
+ }
+ 
++/**
++ * Read grid-template-areas into the areas' rectangles (VitaSurf). The
++ * value is its rows joined by '|', cells by single spaces, '.' for an
++ * empty cell. An area is the box around every cell with its name.
++ */
++static void grid_read_areas(struct grid_ctx *ctx)
++{
++	lwc_string *spec = NULL;
++	const char *p;
++	int row = 0, col = 0;
++
++	if (css_computed_grid_template_areas(ctx->grid->style, &spec) !=
++			CSS_GRID_TEMPLATE_AREAS_SET || spec == NULL) {
++		return;
++	}
++	p = lwc_string_data(spec);
++	while (*p != '\0') {
++		const char *s = p;
++		size_t n;
++
++		while (*p != '\0' && *p != ' ' && *p != '|') {
++			p++;
++		}
++		n = (size_t) (p - s);
++		if (n > 0 && !(n == 1 && s[0] == '.')) {
++			unsigned i;
++			lwc_string *name;
++
++			if (lwc_intern_string(s, n, &name) == lwc_error_ok) {
++				for (i = 0; i < ctx->n_areas; i++) {
++					if (ctx->areas[i].name == name) {
++						break;
++					}
++				}
++				if (i == ctx->n_areas) {
++					struct grid_area *g = realloc(ctx->areas,
++							(i + 1) * sizeof(*g));
++
++					if (g == NULL) {
++						lwc_string_unref(name);
++						return;
++					}
++					ctx->areas = g;
++					g[i].name = lwc_string_ref(name);
++					g[i].row0 = row;
++					g[i].row1 = row + 1;
++					g[i].col0 = col;
++					g[i].col1 = col + 1;
++					ctx->n_areas++;
++				} else {
++					struct grid_area *a = &ctx->areas[i];
++
++					if (row < a->row0) a->row0 = row;
++					if (row + 1 > a->row1) a->row1 = row + 1;
++					if (col < a->col0) a->col0 = col;
++					if (col + 1 > a->col1) a->col1 = col + 1;
++				}
++				lwc_string_unref(name);
++			}
++		}
++		if (*p == ' ') {
++			col++;
++			p++;
++		} else if (*p == '|') {
++			row++;
++			col = 0;
++			p++;
++		}
++	}
++}
++
++/** The line a name gives in one axis's names, or -1. */
++static int grid_find_line(const struct grid_line_name *names, unsigned n,
++		uint32_t id)
++{
++	unsigned i;
++
++	if (id == 0) {
++		return -1;
++	}
++	for (i = 0; i < n; i++) {
++		if (names[i].id == id) {
++			return names[i].line;
++		}
++	}
++	return -1;
++}
++
++/**
++ * Turn a placement that names a line or an area into a line number
++ * (VitaSurf): "head" as a start is the start of the area head, or the
++ * line head-start, or the line head; as an end, the same with -end. A
++ * name that is none of those leaves the placement auto.
++ */
++static void grid_resolve_name(const struct grid_ctx *ctx, bool columns,
++		bool start, uint8_t *type, int32_t *value)
++{
++	const struct grid_line_name *names = columns ? ctx->col_names :
++			ctx->row_names;
++	unsigned n_names = columns ? ctx->n_col_names : ctx->n_row_names;
++	lwc_string *name;
++	char buf[256];
++	size_t len;
++	unsigned i;
++	int line = -1;
++
++	if (*type != CSS_GRID_LINE_SET || *value < CSS_GRID_LINE_NAME_BASE) {
++		return;
++	}
++	name = css_grid_line_name((uint32_t) (*value -
++			CSS_GRID_LINE_NAME_BASE));
++	*type = CSS_GRID_LINE_AUTO;
++	*value = 0;
++	if (name == NULL) {
++		return;
++	}
++
++	for (i = 0; i < ctx->n_areas && line < 0; i++) {
++		bool match = false;
++
++		if (lwc_string_isequal(ctx->areas[i].name, name, &match) ==
++				lwc_error_ok && match) {
++			const struct grid_area *a = &ctx->areas[i];
++
++			line = columns ? (start ? a->col0 : a->col1) :
++					(start ? a->row0 : a->row1);
++		}
++	}
++
++	len = lwc_string_length(name);
++	if (line < 0 && len + 7 < sizeof(buf)) {
++		memcpy(buf, lwc_string_data(name), len);
++		memcpy(buf + len, start ? "-start" : "-end",
++				start ? 6 : 4);
++		line = grid_find_line(names, n_names, css_grid_line_name_find(
++				buf, len + (start ? 6 : 4)));
++	}
++	if (line < 0) {
++		line = grid_find_line(names, n_names, css_grid_line_name_find(
++				lwc_string_data(name), len));
++	}
++	if (line >= 0) {
++		*type = CSS_GRID_LINE_SET;
++		*value = line + 1;
++	}
++}
++
+ /**
+  * Resolve the start/end pair of one axis into a start index and span.
+  * A start of -1 means the item is auto placed in that axis.
+@@ -1297,11 +1493,15 @@ static bool grid_collect_items(struct grid_ctx *ctx)
+ 
+ 		stype = css_computed_grid_column_start(b->style, &sval);
+ 		etype = css_computed_grid_column_end(b->style, &eval);
++		grid_resolve_name(ctx, true, true, &stype, &sval);
++		grid_resolve_name(ctx, true, false, &etype, &eval);
+ 		grid_resolve_lines(stype, sval, etype, eval,
+ 				ctx->n_explicit_cols, &it->col, &it->col_span);
+ 
+ 		stype = css_computed_grid_row_start(b->style, &sval);
+ 		etype = css_computed_grid_row_end(b->style, &eval);
++		grid_resolve_name(ctx, false, true, &stype, &sval);
++		grid_resolve_name(ctx, false, false, &etype, &eval);
+ 		grid_resolve_lines(stype, sval, etype, eval,
+ 				ctx->n_explicit_rows, &it->row, &it->row_span);
+ 	}
+@@ -1410,6 +1610,14 @@ static void grid_collapse_empty(struct grid_ctx *ctx, bool horizontal)
+ 
+ static void grid_ctx_destroy(struct grid_ctx *ctx)
+ {
++	unsigned i;
++
++	for (i = 0; i < ctx->n_areas; i++) {
++		lwc_string_unref(ctx->areas[i].name);
++	}
++	free(ctx->areas);
++	free(ctx->col_names);
++	free(ctx->row_names);
+ 	free(ctx->items);
+ 	free(ctx->cols);
+ 	free(ctx->rows);
+@@ -1482,7 +1690,8 @@ bool layout_grid(struct box *grid, int available_width,
+ 		tmpl = NULL;
+ 	}
+ 	if (!grid_build_explicit(&ctx, tmpl, ctx.avail_w, ctx.col_gap,
+-			&ctx.cols, &ctx.n_explicit_cols)) {
++			&ctx.cols, &ctx.n_explicit_cols, &ctx.col_names,
++			&ctx.n_col_names)) {
+ 		goto cleanup;
+ 	}
+ 	tmpl = NULL;
+@@ -1491,9 +1700,11 @@ bool layout_grid(struct box *grid, int available_width,
+ 		tmpl = NULL;
+ 	}
+ 	if (!grid_build_explicit(&ctx, tmpl, ctx.avail_h, ctx.row_gap,
+-			&ctx.rows, &ctx.n_explicit_rows)) {
++			&ctx.rows, &ctx.n_explicit_rows, &ctx.row_names,
++			&ctx.n_row_names)) {
+ 		goto cleanup;
+ 	}
++	grid_read_areas(&ctx);
+ 
+ 	/* items and placement */
+ 	if (!grid_collect_items(&ctx)) {

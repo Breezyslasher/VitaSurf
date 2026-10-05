@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<!-- el.attributes stays the same map until that element's own attributes
+     change, whatever else in the document changes meanwhile, and every
+     way of changing them is seen at once. -->
+<html><head><title>attributes map</title></head><body>
+<div id="a" data-x="1" class="c"></div><div id="b"></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function names(el){return Array.from(el.attributes).map(function(a){return a.name+'='+a.value;}).join(',');}
+var a=document.getElementById('a'),b=document.getElementById('b');
+var m=a.attributes;
+ok("the same map on a second read", a.attributes===m);
+b.setAttribute('title','t');b.className='z';b.appendChild(document.createElement('span'));
+ok("still the same map after other elements change", a.attributes===m);
+a.setAttribute('title','hello');
+ok("setAttribute is seen", a.attributes!==m&&a.attributes.getNamedItem('title').value==='hello');
+m=a.attributes;a.removeAttribute('data-x');
+ok("removeAttribute is seen", !a.attributes.getNamedItem('data-x')&&a.attributes.length===3);
+a.className='d';
+ok("className is seen", a.attributes.getNamedItem('class').value==='d');
+a.id='a2';
+ok("id is seen", a.attributes.getNamedItem('id').value==='a2');
+a.setAttributeNS('http://www.w3.org/1999/xlink','xlink:href','#q');
+ok("setAttributeNS is seen", names(a).indexOf('xlink:href=#q')>=0);
+a.removeAttributeNS('http://www.w3.org/1999/xlink','href');
+ok("removeAttributeNS is seen", names(a).indexOf('xlink:href')<0);
+a.attributes.getNamedItem('title').value='bye';
+ok("setting an Attr's value is seen", a.getAttribute('title')==='bye'&&a.attributes.getNamedItem('title').value==='bye');
+a.toggleAttribute('hidden');
+ok("toggleAttribute is seen", a.attributes.getNamedItem('hidden')!==null);
+a.dataset.k='v';
+ok("dataset is seen", a.attributes.getNamedItem('data-k').value==='v');
+a.style.color='red';
+ok("style is seen", /red/.test(a.attributes.getNamedItem('style').value));
+/* an Alpine-like walk: read every element's attributes, writing others */
+var box=document.createElement('div'),i;
+for(i=0;i<300;i++){var d=box.appendChild(document.createElement('div'));d.setAttribute('x-data','{n:'+i+'}');d.setAttribute('class','k'+i);}
+document.body.appendChild(box);
+var kids=box.children,bad=0,t0=Date.now();
+for(var r=0;r<5;r++)for(i=0;i<kids.length;i++){
+ var at=kids[i].attributes,seen=at.getNamedItem('data-seen');
+ /* element i was last written by i-1 this round, or, for the first,
+    by the last element of the round before */
+ var want=i>0?String(r):(r>0?String(r-1):null);
+ if(at[0].name!=='x-data'||at.getNamedItem('class').value!=='k'+i||
+    (seen?seen.value:null)!==want)bad++;
+ kids[(i+1)%kids.length].setAttribute('data-seen',String(r));}
+ok("a walk that writes as it reads sees each element's own attributes", bad===0&&kids[5].attributes.getNamedItem('data-seen').value==='4');
+console.log("walk ms "+(Date.now()-t0));
+/* collections: the shape-only ones keep across attribute writes and
+   still follow the tree; class and name ones follow attributes too */
+var ul=document.body.appendChild(document.createElement('ul'));
+for(i=0;i<3;i++)ul.appendChild(document.createElement('li'));
+var kidsL=ul.children,lis=ul.getElementsByTagName('li'),byClass=ul.getElementsByClassName('on');
+ok("children counts the items", kidsL.length===3&&lis.length===3&&byClass.length===0);
+ul.children[1].setAttribute('class','on');
+ok("a class write is seen by getElementsByClassName", byClass.length===1&&byClass[0]===ul.children[1]);
+ul.appendChild(document.createElement('li'));
+ok("an insert is seen by children and getElementsByTagName", kidsL.length===4&&lis.length===4);
+ul.removeChild(ul.firstChild);
+ok("a removal is seen too", kidsL.length===3&&lis.length===3&&byClass[0]===kidsL[0]);
+ul.textContent='';
+ok("emptying with textContent is seen", kidsL.length===0&&lis.length===0&&byClass.length===0);
+ul.innerHTML='<li class="on"></li><li></li>';
+ok("innerHTML is seen", kidsL.length===2&&lis.length===2&&byClass.length===1);
+</script></body></html>

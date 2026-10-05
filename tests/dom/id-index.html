@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<!-- getElementById answers from an index kept between tree changes. Each
+     change that can move an id has to be seen by the next lookup. -->
+<html><head><title>id index</title></head><body>
+<div id="a"></div><span id="dup">first</span><p id="dup">second</p>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var a=document.getElementById('a');
+ok("finds an element", a!==null&&a.tagName==='DIV');
+ok("the same element twice gives the same wrapper", document.getElementById('a')===a);
+ok("a duplicate id gives the first in document order", document.getElementById('dup').tagName==='SPAN');
+ok("a missing id is null", document.getElementById('nope')===null);
+ok("a missing id is still null asked again", document.getElementById('nope')===null);
+ok("the empty id is null", document.getElementById('')===null);
+var n=document.createElement('i');n.id='late';
+ok("a detached element is not found", document.getElementById('late')===null);
+document.body.appendChild(n);
+ok("appended, it is found", document.getElementById('late')===n);
+a.className='changed';
+ok("a class change keeps the answer", document.getElementById('late')===n&&document.getElementById('a')===a);
+n.id='renamed';
+ok("the old id is gone after el.id changes", document.getElementById('late')===null);
+ok("the new id is found", document.getElementById('renamed')===n);
+n.setAttribute('id','viaattr');
+ok("setAttribute('id') moves it", document.getElementById('viaattr')===n&&document.getElementById('renamed')===null);
+n.removeAttribute('id');
+ok("removeAttribute('id') drops it", document.getElementById('viaattr')===null);
+n.setAttribute('ID','upper');
+ok("setAttribute('ID') is the id attribute", document.getElementById('upper')===n);
+document.body.removeChild(n);
+ok("a removed element is not found", document.getElementById('upper')===null);
+a.innerHTML='<b id="inner">x</b>';
+ok("an element from innerHTML is found", document.getElementById('inner')!==null&&document.getElementById('inner').tagName==='B');
+a.innerHTML='';
+ok("emptied by innerHTML, it is gone", document.getElementById('inner')===null);
+var s=document.getElementById('dup');s.parentNode.removeChild(s);
+ok("removing the first duplicate reveals the second", document.getElementById('dup').tagName==='P');
+var w=document.createElement('div');w.innerHTML='<em id="deep">d</em>';
+a.appendChild(w);
+ok("an id inside an appended subtree is found", document.getElementById('deep')!==null);
+a.removeChild(w);
+ok("and gone when the subtree is removed", document.getElementById('deep')===null);
+var t=document.createElement('u');t.id='text';document.body.appendChild(t);
+document.body.lastChild.textContent='';
+t.textContent='plain';
+ok("textContent on the element keeps it", document.getElementById('text')===t);
+</script></body></html>

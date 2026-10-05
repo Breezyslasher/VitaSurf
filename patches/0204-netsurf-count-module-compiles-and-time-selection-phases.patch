@@ -1,0 +1,150 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index b56b4a6d7..2303ec6c1 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -259,11 +259,15 @@ static void nscss_dom_user_data_handler(dom_node_operation operation,
+  * \return Pointer to selection results (containing computed styles),
+  *         or NULL on failure
+  */
++/* libcss's phase clock (VitaSurf); see css_select_style */
++extern uint64_t (*css_select_clock_us)(void);
++
+ css_select_results *nscss_get_style(nscss_select_ctx *ctx, dom_node *n,
+ 		const css_media *media,
+ 		const css_unit_ctx *unit_len_ctx,
+ 		const css_stylesheet *inline_style)
+ {
++	uint64_t t_compose = 0;
+ 	css_computed_style *composed;
+ 	css_select_results *styles;
+ 	int pseudo_element;
+@@ -275,6 +279,8 @@ css_select_results *nscss_get_style(nscss_select_ctx *ctx, dom_node *n,
+ 	 * this element can be resolved against them (VitaSurf).
+ 	 */
+ 	css_select_ctx_set_parent(ctx->ctx, ctx->parent_style);
++	/* libcss times its phases with our clock (VitaSurf) */
++	css_select_clock_us = vitasurf_clock_us;
+ 
+ 	error = css_select_style(ctx->ctx, n, unit_len_ctx, media, inline_style,
+ 			&selection_handler, ctx, &styles);
+@@ -286,6 +292,7 @@ css_select_results *nscss_get_style(nscss_select_ctx *ctx, dom_node *n,
+ 
+ 	/* If there's a parent style, compose with partial to obtain
+ 	 * complete computed style for element */
++	t_compose = vitasurf_clock_us();
+ 	if (ctx->parent_style != NULL) {
+ 		/* Complete the computed style, by composing with the parent
+ 		 * element's style */
+@@ -335,6 +342,8 @@ css_select_results *nscss_get_style(nscss_select_ctx *ctx, dom_node *n,
+ 		styles->styles[pseudo_element] = composed;
+ 	}
+ 
++	vitasurf_us_compose += (unsigned int)
++			(vitasurf_clock_us() - t_compose);
+ 	return styles;
+ }
+ 
+diff --git a/utils/utils.c b/utils/utils.c
+index 8b41742bb..9279110aa 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -576,6 +576,34 @@ void regfree(regex_t *preg)
+ /* exported interface documented in utils/utils.h */
+ unsigned int vitasurf_ms_html_parse;
+ unsigned int vitasurf_ms_css;
++unsigned int vitasurf_us_compose;
++
++#ifdef __vita__
++unsigned long long vita_now_us(void);
++#endif
++
++/* exported: see utils.h (VitaSurf) */
++uint64_t vitasurf_clock_us(void)
++{
++#ifdef __vita__
++	return (uint64_t) vita_now_us();
++#else
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64_t) ts.tv_sec * 1000000u +
++		(uint64_t) (ts.tv_nsec / 1000);
++#endif
++}
++unsigned int vitasurf_ms_js_import_compile;
++unsigned int vitasurf_js_import_compiles;
++unsigned int vitasurf_js_import_kb;
++unsigned int vitasurf_ms_js_reparse;
++unsigned int vitasurf_js_reparses;
++unsigned int vitasurf_js_reparse_kb;
++unsigned int vitasurf_ms_js_import_cached;
++unsigned int vitasurf_js_import_cache_hits;
++unsigned int vitasurf_js_import_cached_kb;
+ unsigned int vitasurf_css_index_builds;
+ unsigned int vitasurf_ms_css_index;
+ uint64_t vitasurf_ms_nested;
+@@ -678,6 +706,11 @@ extern unsigned int css_select_steps_class;
+ extern unsigned int css_select_steps_id;
+ extern unsigned int css_select_steps_universal;
+ extern unsigned int css_select_sheets_empty;
++extern unsigned int css_select_us_setup;
++extern unsigned int css_select_us_match;
++extern unsigned int css_select_us_deferred;
++extern unsigned int css_select_us_finish;
++extern unsigned int css_select_shared;
+ extern unsigned int css_select_index_builds;
+ extern unsigned int css_select_index_entries;
+ extern unsigned int css_select_index_bytes;
+@@ -741,6 +774,21 @@ void vitasurf_profile_reset(void)
+ {
+ 	vitasurf_ms_html_parse = 0;
+ 	vitasurf_ms_css = 0;
++	vitasurf_us_compose = 0;
++	css_select_us_setup = 0;
++	css_select_us_match = 0;
++	css_select_us_deferred = 0;
++	css_select_us_finish = 0;
++	css_select_shared = 0;
++	vitasurf_ms_js_import_compile = 0;
++	vitasurf_js_import_compiles = 0;
++	vitasurf_js_import_kb = 0;
++	vitasurf_ms_js_reparse = 0;
++	vitasurf_js_reparses = 0;
++	vitasurf_js_reparse_kb = 0;
++	vitasurf_ms_js_import_cached = 0;
++	vitasurf_js_import_cache_hits = 0;
++	vitasurf_js_import_cached_kb = 0;
+ 	vitasurf_css_index_builds = 0;
+ 	vitasurf_ms_css_index = 0;
+ 	vitasurf_ms_image = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 5978dece6..d886aed17 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -131,6 +131,26 @@ bool is_dir(const char *path);
+  */
+ extern unsigned int vitasurf_ms_html_parse;
+ extern unsigned int vitasurf_ms_css;
++/** A microsecond clock, for timing work too short for milliseconds. */
++uint64_t vitasurf_clock_us(void);
++/* composing selected styles with their parents' (VitaSurf) */
++extern unsigned int vitasurf_us_compose;
++/*
++ * Module compiles (VitaSurf). An import is compiled inside the loader,
++ * while its importer runs or inside a promise job, so none of it reaches
++ * the script compile figure; and a top-level module is first parsed as a
++ * classic script, which fails, and then again as a module.
++ */
++extern unsigned int vitasurf_ms_js_import_compile;
++extern unsigned int vitasurf_js_import_compiles;
++extern unsigned int vitasurf_js_import_kb;
++extern unsigned int vitasurf_ms_js_reparse;
++extern unsigned int vitasurf_js_reparses;
++extern unsigned int vitasurf_js_reparse_kb;
++/* imports read back from the compiled script cache instead */
++extern unsigned int vitasurf_ms_js_import_cached;
++extern unsigned int vitasurf_js_import_cache_hits;
++extern unsigned int vitasurf_js_import_cached_kb;
+ /* the merged selector index: how often it was built and for how long */
+ extern unsigned int vitasurf_css_index_builds;
+ extern unsigned int vitasurf_ms_css_index;

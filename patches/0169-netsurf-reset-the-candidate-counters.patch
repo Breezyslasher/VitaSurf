@@ -1,0 +1,32 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index d4bd83575..59792a7e5 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -619,6 +619,13 @@ extern unsigned int css_select_from_element;
+ extern unsigned int css_select_from_class;
+ extern unsigned int css_select_from_id;
+ extern unsigned int css_select_from_universal;
++extern unsigned int css_select_cand_details_failed;
++extern unsigned int css_select_cand_comb_failed;
++extern unsigned int css_select_cand_matched;
++extern unsigned int css_select_refused_by_attribute;
++extern unsigned int css_select_refused_by_pseudo_class;
++extern unsigned int css_select_refused_by_pseudo_element;
++extern unsigned int css_select_refused_by_other;
+ 
+ unsigned int vitasurf_ms_select;
+ unsigned int vitasurf_box_elements;
+@@ -690,6 +697,13 @@ void vitasurf_profile_reset(void)
+ 	css_select_from_class = 0;
+ 	css_select_from_id = 0;
+ 	css_select_from_universal = 0;
++	css_select_cand_details_failed = 0;
++	css_select_cand_comb_failed = 0;
++	css_select_cand_matched = 0;
++	css_select_refused_by_attribute = 0;
++	css_select_refused_by_pseudo_class = 0;
++	css_select_refused_by_pseudo_element = 0;
++	css_select_refused_by_other = 0;
+ 	vitasurf_ms_select = 0;
+ 	vitasurf_box_elements = 0;
+ 	vitasurf_attr_interned_hits = 0;

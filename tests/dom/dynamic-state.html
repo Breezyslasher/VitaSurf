@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!-- :hover, :focus, :focus-within, :focus-visible and :active follow the
+     pointer and taps, and a change that moves nothing is restyled in place
+     while one that does is laid out again. The script cannot tap, so the
+     harness runs this with a click at (20, 20) on the link and another at
+     (20, 120) on the field; see scripts/dynamic-test.sh. Before any click
+     nothing matches. Expected console output: lines ending in "ok". -->
+<html><head><style>
+body { margin: 0 }
+#lnk { position: absolute; left: 0; top: 0; width: 100px; height: 40px; display: block; color: rgb(0, 0, 0) }
+#lnk:hover { background-color: rgb(255, 255, 0) }
+#lnk:focus { color: rgb(0, 128, 0) }
+#lnk:focus-visible { outline-color: rgb(255, 0, 0) }
+#menu { position: absolute; left: 0; top: 50px; width: 100px; height: 40px }
+#menu:hover .sub { display: block }
+.sub { display: none; height: 30px }
+#frm { position: absolute; left: 0; top: 100px; width: 200px; height: 60px }
+#frm:focus-within { background-color: rgb(0, 0, 255) }
+#fld:focus-visible { color: rgb(128, 0, 0) }
+#fld:placeholder-shown { background-color: rgb(0, 255, 0) }
+</style></head><body>
+<a id=lnk href="#nowhere">link</a>
+<div id=menu>menu<div class=sub id=sub>sub</div></div>
+<form id=frm onsubmit="return false"><input id=fld placeholder="type here" style="width:150px"></form>
+<script>
+function cs(id, p) { return getComputedStyle(document.getElementById(id))[p]; }
+window.report = function (stage) {
+  if (stage === 'before') {
+    console.log("nothing hovered:", cs('lnk', 'backgroundColor') !== 'rgb(255, 255, 0)' ? "ok" : "FAIL " + cs('lnk', 'backgroundColor'));
+    console.log("nothing focused:", cs('lnk', 'color') === 'rgb(0, 0, 0)' ? "ok" : "FAIL " + cs('lnk', 'color'));
+    console.log("placeholder shown:", cs('fld', 'backgroundColor') === 'rgb(0, 255, 0)' ? "ok" : "FAIL " + cs('fld', 'backgroundColor'));
+  } else if (stage === 'link') {
+    console.log("tapped link hovered:", cs('lnk', 'backgroundColor') === 'rgb(255, 255, 0)' ? "ok" : "FAIL " + cs('lnk', 'backgroundColor'));
+    console.log("tapped link focused:", cs('lnk', 'color') === 'rgb(0, 128, 0)' ? "ok" : "FAIL " + cs('lnk', 'color'));
+  } else if (stage === 'field') {
+    console.log("link no longer hovered:", cs('lnk', 'backgroundColor') !== 'rgb(255, 255, 0)' ? "ok" : "FAIL " + cs('lnk', 'backgroundColor'));
+    console.log("link no longer focused:", cs('lnk', 'color') === 'rgb(0, 0, 0)' ? "ok" : "FAIL " + cs('lnk', 'color'));
+    console.log("form focus-within:", cs('frm', 'backgroundColor') === 'rgb(0, 0, 255)' ? "ok" : "FAIL " + cs('frm', 'backgroundColor'));
+    console.log("field focus-visible:", cs('fld', 'color') === 'rgb(128, 0, 0)' ? "ok" : "FAIL " + cs('fld', 'color'));
+  } else if (stage === 'menu') {
+    var r = document.getElementById('sub').getBoundingClientRect();
+    console.log("hover opens the menu:", r.height === 30 ? "ok" : "FAIL " + r.height);
+  }
+};
+setTimeout(function () { report('before'); }, 300);
+</script></body></html>

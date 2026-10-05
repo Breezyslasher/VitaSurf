@@ -1,0 +1,7 @@
+/* loaded by sheet-order.html: the import's rules come before this
+ * sheet's own, and a print import is not applied on screen */
+@import "sheet-order-imp.css";
+@import "sheet-order-printimp.css" print;
+#c { width: 200px }
+#g { width: 200px }
+p { width: 200px }

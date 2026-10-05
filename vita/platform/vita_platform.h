@@ -38,7 +38,12 @@
 #define VITASURF_VERBOSE_FLAG VITASURF_DATA_DIR "/verbose"
 /* drop a file of this name beside it to have each page's boxes logged */
 #define VITASURF_LAYOUT_FLAG VITASURF_DATA_DIR "/dumplayout"
+/* drop a file of this name to keep image decoding on the main thread */
+#define VITASURF_NO_DECODE_THREAD_FLAG VITASURF_DATA_DIR "/nodecodethread"
+#define VITASURF_NO_PUMP_FLAG VITASURF_DATA_DIR "/nopump"
 #define VITASURF_CA_BUNDLE    VITASURF_RES_DIR "/cacert.pem"
+/* Intl.NumberFormat's locale data, from scripts/gen-intl-numbers.mjs */
+#define VITASURF_INTL_PAK     VITASURF_RES_DIR "/intl.pak"
 
 /* Persistence (phase 5): everything the user accumulates lives here. */
 #define VITASURF_USER_CHOICES VITASURF_DATA_DIR "/Choices"
@@ -115,8 +120,43 @@ void vita_log_flush(void);
 /** Microseconds since the process started, for measuring a frame. */
 unsigned long long vita_now_us(void);
 
+/**
+ * Whether Circle was pressed to stop the running script, clearing the
+ * request. The surface's busy overlay (vita/surface/vita.c) sets it from
+ * its own thread while the page has not given the screen back; the
+ * script engine's interrupt check asks here.
+ */
+bool vita_busy_take_cancel(void);
+
+/**
+ * The script binding running now, by its C function name, or NULL when
+ * none is (VitaSurf). Set on entry to every binding in vita/js/qjs.c and
+ * cleared whenever script runs; the busy overlay reads it from its own
+ * thread to say what a stall was spent in. Defined in the surface.
+ */
+extern const char *volatile vita_c_where;
+/* What NetSurf or the script runner is doing when no binding is named:
+ * layout, box building, a style sheet, drawing, script, promise jobs
+ * (VitaSurf). Defined in NetSurf's utils/utils.c. */
+extern const char *volatile vitasurf_phase __attribute__((weak));
+
 /** Log free user, CDRAM and physically contiguous memory. */
 void vita_log_memory(const char *what);
+
+/**
+ * KB left in the newlib heap (VitaSurf). The heap is one block taken at
+ * startup, so this is what every allocation still has to share: a new
+ * JavaScript realm is refused when it is low rather than left half made.
+ */
+unsigned int vita_heap_free_kb(void);
+
+/*
+ * The newlib heap's size, and the user memory that was free when it was
+ * taken (vita_heap.c): the heap is sized from that at startup, so a log
+ * shows what the system gave and whether extended memory was granted.
+ */
+unsigned int vita_heap_size_kb(void);
+unsigned int vita_heap_free_at_start_kb(void);
 
 /**
  * Log which image formats registered a content handler. Call after
@@ -143,6 +183,32 @@ void vita_net_fini(void);
  */
 int vita_read_file(const char *path, char **data, size_t *len);
 
+/**
+ * The CA bundle parsed once and shared by every TLS connection (VitaSurf).
+ *
+ * libcurl's mbedTLS backend parses whatever CA bundle it is given inside
+ * every connect, and the 121 certificates of ours take about 170 ms to
+ * parse on the Vita: each HTTPS connection paid that before its
+ * handshake began. The fetcher now gives libcurl a single certificate,
+ * which costs nothing to parse, and puts this chain in its place from
+ * CURLOPT_SSL_CTX_FUNCTION, which runs after libcurl has set its own.
+ *
+ * \param path       the bundle to share; loaded on the first call
+ * \param first_pem  updated to the bundle's first certificate, PEM with
+ *                   its NUL, for CURLOPT_CAINFO_BLOB
+ * \param first_len  its length, the NUL included
+ * \return 1 when the chain is ready, 0 when the bundle could not be
+ *         read or parsed, or is not the one already loaded
+ */
+int vita_tls_ca_shared(const char *path, const char **first_pem,
+		       size_t *first_len);
+
+/**
+ * Put the shared chain into an mbedtls_ssl_config, as the trust anchors
+ * the peer's certificate is verified against.
+ */
+void vita_tls_ca_attach(void *mbedtls_ssl_config);
+
 /** True when the user created the verbose flag file in the data directory. */
 int vita_verbose_requested(void);
 
@@ -156,6 +222,29 @@ int vita_verbose_requested(void);
  * \return non-zero if the flag file is there
  */
 int vita_layout_dump_requested(void);
+
+/**
+ * Whether images should be decoded on a thread of their own: yes unless
+ * the nodecodethread flag file is there, so the two can be timed
+ * against each other on the device without a rebuild.
+ */
+bool vita_decode_thread_wanted(void);
+
+/**
+ * Whether transfers are kept moving while a script runs (VitaSurf; see
+ * fetch_curl_pump): yes unless the nopump flag file is there, read once,
+ * so a page can be timed with and without on the device.
+ */
+bool vita_curl_pump_wanted(void);
+
+/**
+ * Called on each decode thread as it starts: the first goes on the
+ * second core, the second on the third, both a little below the main
+ * thread's priority. It must not log; the log is the main thread's.
+ *
+ * \param index Which decode thread, from 0.
+ */
+void vita_decode_thread_started(int index);
 
 /**
  * Whether every fetch should ignore the caches.
@@ -183,6 +272,21 @@ extern unsigned int vita_main_stack_bytes;
  */
 struct gui_file_table;
 extern struct gui_file_table *vita_file_table;
+
+/** A place the file browser (about:files) starts from. */
+struct vita_file_root {
+	const char *path;  /**< a folder, ending in a slash: "ux0:/" */
+	const char *label; /**< what is there */
+};
+
+/**
+ * The places the file browser lists first (vita_file.c): VitaSurf's own
+ * folders, then each storage device that can be read now.
+ *
+ * 
+eturn How many were written to roots, at most max.
+ */
+int vita_file_roots(struct vita_file_root *roots, int max);
 
 /** NetSurf download table (vita_download.c): saves to the downloads dir. */
 struct gui_download_table;

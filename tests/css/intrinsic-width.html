@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<!-- Intrinsic sizes: width, min-width, max-width and flex-basis take
+     max-content, min-content and fit-content. A float with the same
+     text gives the max-content width to compare with, and one that is
+     as narrow as it can be the min-content width. Expected console
+     output: lines ending in "PASS". -->
+<html><head><style>
+body { margin: 0; font: 16px sans-serif; }
+div { background: #ccc; margin: 2px 0; }
+#refmax { float: left; }
+#clear { clear: both; background: none; }
+#max { width: max-content; }
+#min { width: min-content; }
+#fit { width: fit-content; }
+#fitlong { width: fit-content; }
+#minw { width: 10px; min-width: max-content; }
+#maxw { max-width: min-content; }
+#pad { width: max-content; padding: 0 10px; border: 3px solid; margin: 0 7px; }
+#bb { width: max-content; box-sizing: border-box; padding: 0 10px; }
+#row { display: flex; background: none; }
+#row > div { flex-basis: min-content; }
+#ib { display: inline-block; width: min-content; }
+</style></head><body>
+<div id=refmax>hello world</div><div id=clear></div>
+<div id=max>hello world</div><div id=min>hello world</div>
+<div id=fit>hello world</div>
+<div id=fitlong>lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit amet</div>
+<div id=minw>hello world</div><div id=maxw>hello world</div>
+<div id=pad>hello world</div><div id=bb>hello world</div>
+<div id=row><div id=fi>hello world</div></div>
+<div style="background:none"><span id=ib>hello world</span></div>
+<div id=wrap style="width:1px;background:none"><span id=refminsp style="display:inline-block">hello world</span></div>
+<script>
+setTimeout(function () {
+  function r(id) { return document.getElementById(id).getBoundingClientRect(); }
+  function w(id) { return Math.round(r(id).width); }
+  function t(label, got, want) {
+    console.log((got === want ? "PASS " : "FAIL ") + label + " (" + got + ")"); }
+  var mx = w('refmax'), mn = w('refminsp'), page = w('clear');
+  t("max-content is the unbroken width", w('max'), mx);
+  t("min-content is the widest word", w('min'), mn);
+  t("fit-content of short text is max-content", w('fit'), mx);
+  t("fit-content of long text fills the line", w('fitlong'), page);
+  t("min-width: max-content beats width", w('minw'), mx);
+  t("max-width: min-content", w('maxw'), mn);
+  t("padding and border go round max-content", w('pad'), mx + 26);
+  t("margin is outside it", Math.round(r('pad').left), 7);
+  t("border-box keeps the padding inside the keyword", w('bb'), mx + 20);
+  t("flex-basis: min-content", w('fi'), mn);
+  t("inline-block width: min-content", w('ib'), mn);
+}, 500);
+</script></body></html>

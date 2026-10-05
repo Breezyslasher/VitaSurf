@@ -1,0 +1,422 @@
+diff --git a/src/parse/properties/gradient.c b/src/parse/properties/gradient.c
+index 5ce725b..4c47fd8 100644
+--- a/src/parse/properties/gradient.c
++++ b/src/parse/properties/gradient.c
+@@ -50,6 +50,7 @@
+ struct gradient_stop {
+ 	uint32_t colour;	/* AARRGGBB */
+ 	int pos;		/* tenths of a percent, or -1 */
++	int px;			/* and this many CSS px along (VitaSurf) */
+ };
+ 
+ struct gradient {
+@@ -142,20 +143,111 @@ static bool sides_to_angle(bool top, bool bottom, bool left, bool right,
+ }
+ 
+ /**
+- * Read the position after a stop colour: a percentage, or a length,
+- * which cannot be resolved against a box this early and is left open.
++ * A length in CSS px, from a value and unit libcss has read; false for
++ * one that cannot be known here (VitaSurf). em and rem are taken at the
++ * default 16px.
++ */
++static bool stop_length_px(css_fixed value, uint32_t unit, int *px)
++{
++	float v = FIXTOFLT(value);
++
++	switch (unit) {
++	case UNIT_PX: break;
++	case UNIT_EM: case UNIT_REM: v *= 16.0f; break;
++	case UNIT_PT: v *= 4.0f / 3.0f; break;
++	default: return false;
++	}
++	*px = (int) lroundf(v);
++	return true;
++}
++
++/**
++ * A stop position written as calc() (VitaSurf): a sum of percentages and
++ * lengths, such as calc(100% - 9px), which is what sites fading the edge
++ * of a scroller write. The percentage parts go to *pos and the lengths
++ * to *px, for the renderer to add once it knows the line's length.
++ */
++static bool parse_stop_calc(css_language *c, const parserutils_vector *vector,
++		int32_t *ctx, int *pos, int *px)
++{
++	const css_token *token;
++	float pct = 0.0f;
++	int len = 0;
++	int sign = 1;
++	bool want_term = true;
++
++	for (;;) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL)
++			return false;
++		if (want_term) {
++			css_fixed value;
++			uint32_t unit;
++			int l;
++
++			if (token->type == CSS_TOKEN_NUMBER) {
++				size_t consumed = 0;
++
++				value = css__number_from_lwc_string(
++						token->idata, false, &consumed);
++				if (value != 0)
++					return false;
++				parserutils_vector_iterate(vector, ctx);
++			} else if (css__parse_unit_specifier(c, vector, ctx,
++					UNIT_PX, &value, &unit) != CSS_OK) {
++				return false;
++			} else if (unit == UNIT_PCT) {
++				pct += sign * FIXTOFLT(value);
++			} else if (stop_length_px(value, unit, &l)) {
++				len += sign * l;
++			} else {
++				return false;
++			}
++			want_term = false;
++		} else if (tokenIsChar(token, ')')) {
++			parserutils_vector_iterate(vector, ctx);
++			break;
++		} else if (tokenIsChar(token, '+') ||
++				tokenIsChar(token, '-')) {
++			sign = tokenIsChar(token, '+') ? 1 : -1;
++			parserutils_vector_iterate(vector, ctx);
++			want_term = true;
++		} else {
++			return false;
++		}
++	}
++	*pos = (int) lroundf(pct * 10.0f);
++	*px = len;
++	return true;
++}
++
++/**
++ * Read the position after a stop colour: a percentage to *pos, and a
++ * length, which cannot be resolved against a box this early, to *px,
++ * for the renderer (VitaSurf). A length it cannot convert leaves the
++ * stop to be placed between its neighbours.
+  */
+ static bool parse_stop_position(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx, int *pos,
+-		bool fraction)
++		int *px, bool fraction)
+ {
+ 	const css_token *token;
+ 	css_fixed value;
+ 	uint32_t unit;
+ 	int32_t orig = *ctx;
+ 
++	*px = 0;
+ 	consumeWhitespace(vector, ctx);
+ 	token = parserutils_vector_peek(vector, *ctx);
++	if (token != NULL && token->type == CSS_TOKEN_FUNCTION &&
++			name_is(token->idata, "calc")) {
++		parserutils_vector_iterate(vector, ctx);
++		if (parse_stop_calc(c, vector, ctx, pos, px))
++			return true;
++		*ctx = orig;
++		return false;
++	}
+ 	if (token == NULL || (token->type != CSS_TOKEN_PERCENTAGE &&
+ 			token->type != CSS_TOKEN_NUMBER &&
+ 			token->type != CSS_TOKEN_DIMENSION)) {
+@@ -190,6 +282,10 @@ static bool parse_stop_position(css_language *c,
+ 		*pos = p < 0 ? 0 : p > 1000 ? 1000 : p;
+ 	} else if (value == 0) {
+ 		*pos = 0;
++	} else if (stop_length_px(value, unit, px)) {
++		/* a length: from the start of the line, resolved by the
++		 * renderer, which knows how long it is (VitaSurf) */
++		*pos = 0;
+ 	} else {
+ 		*pos = -1;
+ 	}
+@@ -206,6 +302,7 @@ static bool parse_stop(css_language *c, const parserutils_vector *vector,
+ 	uint16_t kind = 0;
+ 	uint32_t colour = 0;
+ 	int pos = -1, pos2;
++	int px = 0, px2 = 0;
+ 	int32_t orig = *ctx;
+ 
+ 	consumeWhitespace(vector, ctx);
+@@ -222,14 +319,17 @@ static bool parse_stop(css_language *c, const parserutils_vector *vector,
+ 	if (g->n == GRADIENT_MAX_STOPS)
+ 		return true;
+ 
+-	parse_stop_position(c, vector, ctx, &pos, false);
++	parse_stop_position(c, vector, ctx, &pos, &px, false);
+ 	g->stop[g->n].colour = colour;
+ 	g->stop[g->n].pos = pos;
++	g->stop[g->n].px = px;
+ 	g->n++;
+ 	if (pos != -1 && g->n < GRADIENT_MAX_STOPS &&
+-			parse_stop_position(c, vector, ctx, &pos2, false)) {
++			parse_stop_position(c, vector, ctx, &pos2, &px2,
++					false)) {
+ 		g->stop[g->n].colour = colour;
+ 		g->stop[g->n].pos = pos2;
++		g->stop[g->n].px = px2;
+ 		g->n++;
+ 	}
+ 	return true;
+@@ -322,9 +422,10 @@ static bool parse_legacy_point(css_language *c,
+ 				return false;
+ 		} else if (token->type == CSS_TOKEN_PERCENTAGE ||
+ 				token->type == CSS_TOKEN_NUMBER) {
+-			int p;
++			int p, px;
+ 
+-			if (!parse_stop_position(c, vector, ctx, &p, true))
++			if (!parse_stop_position(c, vector, ctx, &p, &px,
++					true))
+ 				return false;
+ 			if (p < 0)
+ 				p = 0;
+@@ -392,7 +493,7 @@ static bool parse_legacy_webkit(css_language *c,
+ 		if (g->n < GRADIENT_MAX_STOPS) {
+ 			uint16_t kind = 0;
+ 			uint32_t colour = 0;
+-			int pos;
++			int pos, px;
+ 
+ 			if (name_is(token->idata, "from")) {
+ 				pos = 0;
+@@ -401,7 +502,7 @@ static bool parse_legacy_webkit(css_language *c,
+ 			} else if (name_is(token->idata, "color-stop")) {
+ 				consumeWhitespace(vector, ctx);
+ 				if (!parse_stop_position(c, vector, ctx,
+-						&pos, true))
++						&pos, &px, true))
+ 					return false;
+ 				if (pos < 0)
+ 					pos = 0;
+@@ -434,10 +535,13 @@ static bool parse_legacy_webkit(css_language *c,
+ /**
+  * Give every stop a position: the first 0, the last 100%, the rest
+  * spread evenly between their placed neighbours, none earlier than
+- * the one before it.
++ * the one before it. A stop with a length in it cannot be compared
++ * with its neighbours until the line's length is known, so the renderer
++ * keeps those in order instead (VitaSurf).
+  */
+ static void resolve_positions(struct gradient *g)
+ {
++	bool lengths = false;
+ 	int i, j;
+ 
+ 	if (g->stop[0].pos < 0)
+@@ -445,20 +549,31 @@ static void resolve_positions(struct gradient *g)
+ 	if (g->stop[g->n - 1].pos < 0)
+ 		g->stop[g->n - 1].pos = 1000;
+ 	for (i = 1; i < g->n - 1; i++) {
+-		int span, from;
++		int span, from, from_px;
+ 
+ 		if (g->stop[i].pos >= 0)
+ 			continue;
+ 		for (j = i + 1; g->stop[j].pos < 0; j++)
+ 			;
+ 		from = g->stop[i - 1].pos;
++		from_px = g->stop[i - 1].px;
+ 		span = j - (i - 1);
+ 		while (i < j) {
++			int k = i - (j - span);
++
+ 			g->stop[i].pos = from + (g->stop[j].pos - from) *
+-					(i - (j - span)) / span;
++					k / span;
++			g->stop[i].px = from_px + (g->stop[j].px - from_px) *
++					k / span;
+ 			i++;
+ 		}
+ 	}
++	for (i = 0; i < g->n; i++) {
++		if (g->stop[i].px != 0)
++			lengths = true;
++	}
++	if (lengths)
++		return;
+ 	for (i = 1; i < g->n; i++) {
+ 		if (g->stop[i].pos < g->stop[i - 1].pos)
+ 			g->stop[i].pos = g->stop[i - 1].pos;
+@@ -485,7 +600,7 @@ css_error css__parse_gradient(css_language *c,
+ 	const css_token *token;
+ 	struct gradient g;
+ 	bool legacy_angles = false;
+-	char buf[24 + GRADIENT_MAX_STOPS * 16];
++	char buf[24 + GRADIENT_MAX_STOPS * 28];
+ 	size_t len;
+ 	int i;
+ 
+@@ -646,6 +761,11 @@ css_error css__parse_gradient(css_language *c,
+ 				"%s%08x@%d", i ? "," : "",
+ 				(unsigned int) g.stop[i].colour,
+ 				g.stop[i].pos);
++		/* a length along the line, after the percentage */
++		if (g.stop[i].px != 0)
++			len += (size_t) snprintf(buf + len,
++					sizeof(buf) - len, "%+dp",
++					g.stop[i].px);
+ 	}
+ 
+ 	if (lwc_intern_string(buf, len, out) != lwc_error_ok)
+diff --git a/src/parse/properties/mask_image.c b/src/parse/properties/mask_image.c
+index bd6ae50..0f4e114 100644
+--- a/src/parse/properties/mask_image.c
++++ b/src/parse/properties/mask_image.c
+@@ -2,13 +2,134 @@
+  * This file is part of LibCSS.
+  * Licensed under the MIT License,
+  *		  http://www.opensource.org/licenses/mit-license.php
+- *
+- * mask-image aliases (VitaSurf addition). The mask-image parser itself is
+- * generated from properties.gen; -webkit-mask-image, which stylesheets
+- * still ship alongside the unprefixed property, produces the same bytecode.
++ * Copyright 2010 The NetSurf Browser Project.
++ * Copyright 2026 VitaSurf contributors
+  */
+ 
++/*
++ * mask-image, written out by hand (VitaSurf). It began as the parser
++ * gen_parser produces from properties.gen and reads the same for none
++ * and url(); like background-image it also takes a gradient, carried
++ * as an image the renderer draws itself, and a comma-separated list of
++ * layers, of which the first is kept. -webkit-mask-image, which
++ * stylesheets still ship alongside the unprefixed property, produces
++ * the same bytecode.
++ */
++
++#include <assert.h>
++#include <string.h>
++
++#include "bytecode/bytecode.h"
++#include "bytecode/opcodes.h"
+ #include "parse/properties/properties.h"
++#include "parse/properties/utils.h"
++
++/**
++ * Parse mask_image
++ *
++ * \param c	  Parsing context
++ * \param vector  Vector of tokens to process
++ * \param ctx	  Pointer to vector iteration context
++ * \param result  resulting style
++ * \return CSS_OK on success,
++ *	   CSS_NOMEM on memory exhaustion,
++ *	   CSS_INVALID if the input is not valid
++ *
++ * Post condition: \a *ctx is updated with the next token to process
++ *		   If the input is invalid, then \a *ctx remains unchanged.
++ */
++css_error css__parse_mask_image(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_style *result)
++{
++	int32_t orig_ctx = *ctx;
++	css_error error;
++	const css_token *token;
++	lwc_string *uri = NULL;
++	uint32_t uri_snumber;
++	bool match;
++
++	token = parserutils_vector_iterate(vector, ctx);
++	if ((token == NULL) || ((token->type != CSS_TOKEN_IDENT) &&
++			(token->type != CSS_TOKEN_URI) &&
++			(token->type != CSS_TOKEN_FUNCTION))) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
++	}
++
++	if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[INHERIT],
++			&match) == lwc_error_ok && match)) {
++		error = css_stylesheet_style_inherit(result,
++				CSS_PROP_MASK_IMAGE);
++	} else if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[INITIAL],
++			&match) == lwc_error_ok && match)) {
++		error = css_stylesheet_style_initial(result,
++				CSS_PROP_MASK_IMAGE);
++	} else if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[REVERT],
++			&match) == lwc_error_ok && match)) {
++		error = css_stylesheet_style_revert(result,
++				CSS_PROP_MASK_IMAGE);
++	} else if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[UNSET],
++			&match) == lwc_error_ok && match)) {
++		error = css_stylesheet_style_unset(result,
++				CSS_PROP_MASK_IMAGE);
++	} else if ((token->type == CSS_TOKEN_IDENT) &&
++			(lwc_string_caseless_isequal(
++			token->idata, c->strings[NONE],
++			&match) == lwc_error_ok && match)) {
++		error = css__stylesheet_style_appendOPV(result,
++				CSS_PROP_MASK_IMAGE, 0, MASK_IMAGE_NONE);
++		if (error == CSS_OK)
++			css__skip_background_layers(vector, ctx);
++	} else if (token->type == CSS_TOKEN_IDENT) {
++		error = CSS_INVALID;
++	} else {
++		if (token->type == CSS_TOKEN_URI) {
++			error = c->sheet->resolve(c->sheet->resolve_pw,
++					c->sheet->url, token->idata, &uri);
++		} else {
++			/* a gradient: the whole function is read again
++			 * from its name */
++			*ctx = orig_ctx;
++			error = css__parse_gradient(c, vector, ctx, &uri);
++		}
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_string_add(c->sheet, uri,
++				&uri_snumber);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_style_appendOPV(result,
++				CSS_PROP_MASK_IMAGE, 0, MASK_IMAGE_URI);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++
++		error = css__stylesheet_style_append(result, uri_snumber);
++		if (error == CSS_OK)
++			css__skip_background_layers(vector, ctx);
++	}
++
++	if (error != CSS_OK)
++		*ctx = orig_ctx;
++
++	return error;
++}
+ 
+ css_error css__parse_webkit_mask_image(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+diff --git a/src/parse/properties/properties.gen b/src/parse/properties/properties.gen
+index 814be2b..db1a894 100644
+--- a/src/parse/properties/properties.gen
++++ b/src/parse/properties/properties.gen
+@@ -124,7 +124,6 @@ caption_side:CSS_PROP_CAPTION_SIDE IDENT:( INHERIT: INITIAL: REVERT: UNSET: TOP:
+ clear:CSS_PROP_CLEAR IDENT:( INHERIT: INITIAL: REVERT: UNSET: RIGHT:0,CLEAR_RIGHT LEFT:0,CLEAR_LEFT BOTH:0,CLEAR_BOTH NONE:0,CLEAR_NONE IDENT:)
+ 
+ 
+-mask_image:CSS_PROP_MASK_IMAGE IDENT:( INHERIT: INITIAL: REVERT: UNSET: NONE:0,MASK_IMAGE_NONE IDENT:) URI:MASK_IMAGE_URI
+ 
+ list_style_image:CSS_PROP_LIST_STYLE_IMAGE IDENT:( INHERIT: INITIAL: REVERT: UNSET: NONE:0,LIST_STYLE_IMAGE_NONE IDENT:) URI:LIST_STYLE_IMAGE_URI
+ 

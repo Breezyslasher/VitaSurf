@@ -1,0 +1,29 @@
+crypto.subtle against a browser
+===============================
+
+These pages check vita/js/subtle.js and vita/js/subtle.c against a real
+browser, run natively in the test harness (deps/netsurf/nsmonkey) and in
+Chromium. They add to the web platform tests in tests/wpt/WebCryptoAPI,
+which scripts/wpt-run.sh runs.
+
+kat.html
+    Every deterministic operation on fixed inputs -- digests, HMAC,
+    PBKDF2, HKDF, AES-GCM/CBC/CTR/KW, ECDH, Ed25519, X25519, key export --
+    and the error each bad call gives, printed as "OUT <name> <hex or
+    error>". Run it in both and diff the sorted OUT lines; they should
+    not differ.
+
+gen.html, check.html, join.py
+    What has random parts -- key generation, ECDSA and RSA signatures,
+    RSA-OAEP -- is checked across the two: gen.html makes keys, signs and
+    encrypts in one browser, and check.html imports every key in every
+    format, verifies, decrypts and agrees ECDH and X25519 secrets in the
+    other.
+    gen.html prints its result in numbered "RES" pieces, because the
+    harness cuts long console lines; join.py puts them back together:
+
+      nsmonkey ... gen.html | grep 'console: RES ' | python3 join.py > vec.js
+
+    then load check.html in the other browser (served over HTTP for
+    Chromium, as a file for the harness). Do it in both directions.
+    vec.js is generated and not kept.

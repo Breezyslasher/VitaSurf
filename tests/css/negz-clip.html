@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!-- Negative z-index inside a box that clips and inside a float. Each
+     red square (z-index: -1) belongs to the root stacking context, so it
+     is painted before the in-flow content: the blue block that follows
+     it in the same clipping box, and the green one after the float, are
+     drawn over it. The clipping box is 60px square and the red square
+     sticks out past it, so its fill is clipped to 60x60. Checked in the
+     plot output: each red FILL comes before the blue and green ones, and
+     the first under a CLIP of the clipping box. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+.clip { overflow: hidden; width: 60px; height: 60px; }
+.neg { position: relative; z-index: -1; width: 100px; height: 100px; background: #f00; }
+.over { margin-top: -80px; width: 40px; height: 40px; background: #00f; }
+.fl { float: left; width: 50px; }
+.neg2 { position: relative; z-index: -1; width: 50px; height: 50px; background: #f80; }
+.after { width: 30px; height: 30px; background: #0f0; position: relative; top: -20px; }
+</style></head><body>
+<div class="clip"><div class="neg"></div><div class="over"></div></div>
+<div style="height: 10px"></div>
+<div><div class="fl"><div class="neg2"></div></div><div style="clear: both"></div><div class="after"></div></div>
+</body></html>

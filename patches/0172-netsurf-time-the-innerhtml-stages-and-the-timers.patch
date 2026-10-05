@@ -1,0 +1,76 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 0ce24f355..466c7e6ae 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -622,6 +622,15 @@ unsigned int vitasurf_job_max_edits;
+ unsigned int vitasurf_job_max_html;
+ unsigned int vitasurf_job_max_attrs;
+ unsigned int vitasurf_job_max_styles;
++unsigned int vitasurf_ms_html_js_parse;
++unsigned int vitasurf_ms_html_js_empty;
++unsigned int vitasurf_ms_html_js_move;
++unsigned int vitasurf_ms_js_attr_time;
++unsigned int vitasurf_ms_js_edit_time;
++unsigned int vitasurf_ms_js_timer_max;
++unsigned int vitasurf_js_timers_slow;
++unsigned int vitasurf_ms_js_timers_slow;
++char vitasurf_js_timer_max_name[64];
+ /* counted inside libcss, reset here with the rest (VitaSurf) */
+ extern unsigned int css_select_calls;
+ extern unsigned int css_select_sheets_seen;
+@@ -712,6 +721,15 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_job_max_html = 0;
+ 	vitasurf_job_max_attrs = 0;
+ 	vitasurf_job_max_styles = 0;
++	vitasurf_ms_html_js_parse = 0;
++	vitasurf_ms_html_js_empty = 0;
++	vitasurf_ms_html_js_move = 0;
++	vitasurf_ms_js_attr_time = 0;
++	vitasurf_ms_js_edit_time = 0;
++	vitasurf_ms_js_timer_max = 0;
++	vitasurf_js_timers_slow = 0;
++	vitasurf_ms_js_timers_slow = 0;
++	vitasurf_js_timer_max_name[0] = '\0';
+ 	css_select_calls = 0;
+ 	css_select_sheets_seen = 0;
+ 	css_select_selectors_considered = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 6dd6f9707..4fd2e1a92 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -286,6 +286,35 @@ extern unsigned int vitasurf_job_max_edits;
+ extern unsigned int vitasurf_job_max_html;
+ extern unsigned int vitasurf_job_max_attrs;
+ extern unsigned int vitasurf_job_max_styles;
++/**
++ * Where an innerHTML assignment's time goes (VitaSurf).
++ *
++ * One job on a GitHub load runs for 14253 ms and the page makes exactly
++ * one innerHTML set, of 412727 bytes. Hubbub parses the whole 690 KB
++ * document in 46 ms, so the parse cannot be it; the same call also
++ * empties the target and moves the parsed nodes into a live tree, and
++ * the same job makes 2198 attribute sets and 737 tree edits. Time each
++ * of them apart.
++ */
++extern unsigned int vitasurf_ms_html_js_parse;
++extern unsigned int vitasurf_ms_html_js_empty;
++extern unsigned int vitasurf_ms_html_js_move;
++extern unsigned int vitasurf_ms_js_attr_time;
++extern unsigned int vitasurf_ms_js_edit_time;
++/**
++ * The shape of the timers, and which one is the worst (VitaSurf).
++ *
++ * Wikipedia spends 23103 ms in 89 timers -- 260 ms each -- while making
++ * 216 tree edits and reading two computed styles in the whole load, so
++ * it is not the DOM. An average cannot tell 89 middling callbacks from
++ * one enormous one, and the name of the worst says which module of the
++ * page it is.
++ */
++extern unsigned int vitasurf_ms_js_timer_max;
++extern unsigned int vitasurf_js_timers_slow;
++extern unsigned int vitasurf_ms_js_timers_slow;
++/** The name of the longest timer's callback, or "?". */
++extern char vitasurf_js_timer_max_name[64];
+ 
+ /*
+  * The scheduler's callbacks (VitaSurf). A GitHub page load reports

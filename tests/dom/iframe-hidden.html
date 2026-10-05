@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!-- An iframe that layout does not show still loads and runs its page,
+     as in a browser: display: none in its style or from a stylesheet,
+     visibility: hidden, or put in by script. It keeps its window when it
+     is shown, and a form can post into a hidden frame by name. -->
+<html><head><title>parent</title><style>.gone { display: none; }</style></head><body><div id="out"></div>
+<iframe id="a" src="iframe-pages/report.html?a" style="display:none"></iframe>
+<iframe id="b" src="iframe-pages/report.html?b" style="visibility:hidden"></iframe>
+<iframe id="c" src="iframe-pages/report.html?c" class="gone"></iframe>
+<iframe id="sink" name="sink" style="display:none"></iframe>
+<form id="f" action="iframe-pages/report.html" target="sink"><input name="q" value="posted"></form>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var got = {}, done = false, shown = false;
+var d = document.createElement('iframe');
+d.id = 'd'; d.src = 'iframe-pages/report.html?d'; d.style.display = 'none';
+document.body.appendChild(d);
+window.addEventListener('message', function (e) {
+ var key = e.data && e.data.from, el;
+ if (key === '?q=posted') {
+  ok("a form posts into a hidden frame by name", e.source === document.getElementById('sink').contentWindow);
+  got.form = true;
+ } else if (key) {
+  el = document.getElementById(key.slice(1));
+  got[key] = !!el && e.source === el.contentWindow;
+ }
+ if (!shown && got['?a'] !== undefined && got['?b'] !== undefined &&
+     got['?c'] !== undefined && got['?d'] !== undefined) {
+  shown = true;
+  ok("display: none in its style", got['?a']);
+  ok("visibility: hidden", got['?b']);
+  ok("display: none from a stylesheet", got['?c']);
+  ok("put in by script, hidden", got['?d']);
+  var a = document.getElementById('a'), w = a.contentWindow;
+  w.marker = 5;
+  a.style.display = 'block';
+  document.getElementById('f').submit();
+  setTimeout(function () {
+   ok("shown later, it keeps its window", a.contentWindow === w && w.marker === 5);
+   ok("the form's page is this one still", location.pathname.indexOf('iframe-hidden') >= 0);
+   done = !!got.form;
+  }, 800);
+ }
+});
+setTimeout(function () {
+ if (!shown) ok("every hidden frame ran its page in time (" + JSON.stringify(got) + ")", false);
+ else if (!done) ok("the form reached the hidden frame in time", false);
+}, 2900);
+</script></body></html>

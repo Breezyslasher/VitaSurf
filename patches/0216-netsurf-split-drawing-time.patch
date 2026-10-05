@@ -1,0 +1,152 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 8fc2b971d..a1d8f06b1 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -2834,6 +2834,7 @@ static nserror html_filter_bitmap(const struct redraw_context *ctx,
+ 	}
+ 
+ 	if (lv->m != NULL || lv->alpha < 256 || margin > 0) {
++		uint64_t copy_t0 = vitasurf_clock_us();
+ 		int bw = guit->bitmap->get_width(bitmap);
+ 		int bh = guit->bitmap->get_height(bitmap);
+ 		int cw = bw + 2 * margin, ch = bh + 2 * margin;
+@@ -2962,6 +2963,8 @@ static nserror html_filter_bitmap(const struct redraw_context *ctx,
+ 				height += 2 * my;
+ 			}
+ 		}
++		vitasurf_redraw_copies++;
++		vitasurf_us_redraw_copies += vitasurf_clock_us() - copy_t0;
+ 	}
+ 
+ 	HTML_FILTER_FORWARD(lv, ctx, rctx_.plot->bitmap(&rctx_, bitmap, x, y,
+@@ -3428,8 +3431,12 @@ static nserror html_transform_bitmap(const struct redraw_context *ctx,
+ 	flags &= ~(BITMAPF_REPEAT_X | BITMAPF_REPEAT_Y);
+ 
+ 	if (lv->axis == false || lv->m[0] < 0 || lv->m[3] < 0) {
++		uint64_t copy_t0 = vitasurf_clock_us();
++
+ 		copy = html_transform_resample(lv, bitmap, x, y, width,
+ 				height, &dest);
++		vitasurf_redraw_copies++;
++		vitasurf_us_redraw_copies += vitasurf_clock_us() - copy_t0;
+ 		if (copy != NULL) {
+ 			HTML_TRANSFORM_FORWARD(lv, ctx, rctx_.plot->bitmap(
+ 					&rctx_, copy, dest.x0, dest.y0,
+@@ -3670,6 +3677,8 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	int transformed;
+ 	bool ok;
+ 
++	vitasurf_redraw_boxes++;
++
+ 	if (box->style != NULL) {
+ 		css_fixed op = INTTOFIX(1);
+ 
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index acf086e08..8cf697e43 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -453,7 +453,7 @@ done:
+  * destroyed.
+  */
+ #define SCALED_SLOTS 64
+-#define SCALED_MAX_BYTES (3 * 1024 * 1024)
++#define SCALED_MAX_BYTES (6 * 1024 * 1024)
+ #define SCALED_MAX_ONE (1024 * 1024)
+ 
+ static struct fb_scaled {
+@@ -929,9 +929,13 @@ static nserror timed_text(const struct redraw_context *ctx,
+ void fb_plot_take_stats(char *buf, size_t len)
+ {
+ 	size_t at = 0;
++	uint64_t plot_us = 0;
+ 	int k;
+ 
+ 	buf[0] = '\0';
++	for (k = 0; k < FBP_KINDS; k++) {
++		plot_us += fbp_us[k];
++	}
+ 	for (k = 0; k < FBP_KINDS; k++) {
+ 		int n;
+ 
+@@ -951,6 +955,21 @@ void fb_plot_take_stats(char *buf, size_t len)
+ 		fbp_us[k] = 0;
+ 		fbp_px[k] = 0;
+ 	}
++	/* what the redraw did besides the plot calls themselves */
++	if (at < len) {
++		int n = snprintf(buf + at, len - at, "; plot calls %u ms in "
++				 "all, %u boxes visited, %u image copies for "
++				 "opacity, filters or transforms in %u ms",
++				 (unsigned int)(plot_us / 1000),
++				 vitasurf_redraw_boxes, vitasurf_redraw_copies,
++				 (unsigned int)(vitasurf_us_redraw_copies /
++						1000));
++
++		if (n > 0 && (size_t)n < len - at) at += (size_t)n;
++		vitasurf_redraw_boxes = 0;
++		vitasurf_redraw_copies = 0;
++		vitasurf_us_redraw_copies = 0;
++	}
+ 	if (fb_scaled_hits + fb_scaled_made > 0 && at < len) {
+ 		snprintf(buf + at, len - at, "; scaled copies %u reused, %u "
+ 			 "made, %u KB held", fb_scaled_hits, fb_scaled_made,
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 2f0d39061..efc1f9201 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -738,11 +738,18 @@ static void framebuffer_run(void)
+ 			/* and what the drawing was made of, when it
+ 			 * took a good part of the second (VitaSurf) */
+ 			{
+-				char stats[384];
++				char stats[768];
++				unsigned int copy_ms, present_ms;
+ 
+ 				fb_plot_take_stats(stats, sizeof(stats));
++				vita_surface_take_copy_times(&copy_ms,
++							     &present_ms);
+ 				if (draw_us >= 300000 && stats[0] != '\0') {
+-					vita_log("draw: %s", stats);
++					vita_log("draw: %s; the screen "
++						 "texture took %u ms of "
++						 "copying and %u ms of "
++						 "putting up", stats,
++						 copy_ms, present_ms);
+ 				}
+ 			}
+ 			/* a page that builds itself after it has loaded
+diff --git a/utils/utils.c b/utils/utils.c
+index 7ba71e8fd..d78a56836 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -582,6 +582,11 @@ unsigned int vitasurf_us_compose;
+ unsigned long long vita_now_us(void);
+ #endif
+ 
++/* exported: see utils.h (VitaSurf) */
++unsigned int vitasurf_redraw_boxes;
++unsigned int vitasurf_redraw_copies;
++uint64_t vitasurf_us_redraw_copies;
++
+ /* exported: see utils.h (VitaSurf) */
+ uint64_t vitasurf_clock_us(void)
+ {
+diff --git a/utils/utils.h b/utils/utils.h
+index 6bb844cf7..bf62f7f88 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -133,6 +133,14 @@ extern unsigned int vitasurf_ms_html_parse;
+ extern unsigned int vitasurf_ms_css;
+ /** A microsecond clock, for timing work too short for milliseconds. */
+ uint64_t vitasurf_clock_us(void);
++/*
++ * What a redraw did besides plotting (VitaSurf): boxes visited, and the
++ * image copies made for opacity, filters and transforms, with their
++ * time. The draw line reports them beside the plotter tally.
++ */
++extern unsigned int vitasurf_redraw_boxes;
++extern unsigned int vitasurf_redraw_copies;
++extern uint64_t vitasurf_us_redraw_copies;
+ /* composing selected styles with their parents' (VitaSurf) */
+ extern unsigned int vitasurf_us_compose;
+ /*

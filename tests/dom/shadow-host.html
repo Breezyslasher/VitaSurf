@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- An element with a shadow root has no host of its own, so code that
+     climbs e.host || e.parentElement reaches the document instead of
+     going round the same element forever (card-mod's config lookup on
+     Home Assistant overflowed the stack that way). A link's host is
+     still its URL's. Expected console output: lines ending in "PASS". -->
+<html><body><div id=h></div><a id=a href="http://example.com:8080/x">a</a>
+<script>
+window.addEventListener('load', function () {
+  function t(label, ok) { console.log((ok ? 'PASS ' : 'FAIL ') + label); }
+  function find(e, d) {
+    if (d > 50) return 'cycle';
+    return e.config ? e.config : e.host ? find(e.host, d + 1) :
+      e.parentElement ? find(e.parentElement, d + 1) :
+      e.parentNode ? find(e.parentNode, d + 1) : null;
+  }
+  var h = document.getElementById('h'), sr = h.attachShadow({mode: 'open'});
+  sr.innerHTML = '<span>x</span>';
+  t('a shadow host has no host', h.host === undefined);
+  t('climbing from the host ends', find(h, 0) === null);
+  t('climbing from inside its shadow root ends', find(sr.firstChild, 0) === null);
+  document.body.config = 'found';
+  t('and finds what an ancestor holds', find(sr.firstChild, 0) === 'found');
+  t("a link's host is its URL's", document.getElementById('a').host === 'example.com:8080');
+});
+</script></body></html>

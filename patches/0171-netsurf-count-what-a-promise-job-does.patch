@@ -1,0 +1,73 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 59792a7e5..0ce24f355 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -611,6 +611,17 @@ unsigned int vitasurf_js_jobs_slow;
+ unsigned int vitasurf_ms_js_jobs_slow;
+ unsigned int vitasurf_js_finds;
+ unsigned int vitasurf_ms_js_finds;
++unsigned int vitasurf_js_dom_edits;
++unsigned int vitasurf_js_html_sets;
++unsigned int vitasurf_js_html_bytes;
++unsigned int vitasurf_js_attr_sets;
++unsigned int vitasurf_js_style_reads;
++unsigned int vitasurf_ms_js_jobs_sum;
++unsigned int vitasurf_job_max_finds;
++unsigned int vitasurf_job_max_edits;
++unsigned int vitasurf_job_max_html;
++unsigned int vitasurf_job_max_attrs;
++unsigned int vitasurf_job_max_styles;
+ /* counted inside libcss, reset here with the rest (VitaSurf) */
+ extern unsigned int css_select_calls;
+ extern unsigned int css_select_sheets_seen;
+@@ -690,6 +701,17 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_jobs_slow = 0;
+ 	vitasurf_js_finds = 0;
+ 	vitasurf_ms_js_finds = 0;
++	vitasurf_js_dom_edits = 0;
++	vitasurf_js_html_sets = 0;
++	vitasurf_js_html_bytes = 0;
++	vitasurf_js_attr_sets = 0;
++	vitasurf_js_style_reads = 0;
++	vitasurf_ms_js_jobs_sum = 0;
++	vitasurf_job_max_finds = 0;
++	vitasurf_job_max_edits = 0;
++	vitasurf_job_max_html = 0;
++	vitasurf_job_max_attrs = 0;
++	vitasurf_job_max_styles = 0;
+ 	css_select_calls = 0;
+ 	css_select_sheets_seen = 0;
+ 	css_select_selectors_considered = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 5feca368f..6dd6f9707 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -264,6 +264,28 @@ extern unsigned int vitasurf_ms_js_jobs_slow;
+ /** Calls into the DOM query binding, which walks the tree. */
+ extern unsigned int vitasurf_js_finds;
+ extern unsigned int vitasurf_ms_js_finds;
++/**
++ * What a promise job actually does (VitaSurf).
++ *
++ * A GitHub load spends 20440 ms in 59 promise jobs, one of them 14201
++ * ms, and nothing says what that job was doing. These count the
++ * bindings a continuation can call a great many times; the report
++ * prints the difference across the longest job, so the next log names
++ * the work instead of leaving it to be guessed at.
++ */
++extern unsigned int vitasurf_js_dom_edits;
++extern unsigned int vitasurf_js_html_sets;
++extern unsigned int vitasurf_js_html_bytes;
++extern unsigned int vitasurf_js_attr_sets;
++extern unsigned int vitasurf_js_style_reads;
++/** The drain total minus the jobs in it: loop and teardown, not a job. */
++extern unsigned int vitasurf_ms_js_jobs_sum;
++/** The counters above, as they moved across the single longest job. */
++extern unsigned int vitasurf_job_max_finds;
++extern unsigned int vitasurf_job_max_edits;
++extern unsigned int vitasurf_job_max_html;
++extern unsigned int vitasurf_job_max_attrs;
++extern unsigned int vitasurf_job_max_styles;
+ 
+ /*
+  * The scheduler's callbacks (VitaSurf). A GitHub page load reports

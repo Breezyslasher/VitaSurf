@@ -1,0 +1,227 @@
+diff --git a/src/parse/properties/border_radius.c b/src/parse/properties/border_radius.c
+index 782c45a..3516866 100644
+--- a/src/parse/properties/border_radius.c
++++ b/src/parse/properties/border_radius.c
+@@ -7,6 +7,7 @@
+ 
+ #include <assert.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include "bytecode/bytecode.h"
+ #include "bytecode/opcodes.h"
+@@ -23,6 +24,186 @@
+  * layout.
+  */
+ 
++/*
++ * A calc() in a radius, worked out here (VitaSurf). A corner holds a
++ * length and a unit, not an expression, so a calc() whose terms share
++ * one unit is reduced to that length: calc(56px / 2) is 28px, and
++ * calc(var(--row-height, 56px) / 2) is the same once the variable is in.
++ * Bubble Card writes every radius that way and every card came out
++ * square. Terms in different units are not reduced, and the value is
++ * dropped as before.
++ */
++struct radius_term {
++	css_fixed v;
++	uint32_t unit;
++	bool has_unit;
++};
++
++static css_error radius_calc_sum(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		struct radius_term *out, int depth);
++
++static css_error radius_calc_value(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		struct radius_term *out, int depth)
++{
++	const css_token *token;
++	css_error error;
++
++	consumeWhitespace(vector, ctx);
++	token = parserutils_vector_peek(vector, *ctx);
++	if (token == NULL || depth > 8) {
++		return CSS_INVALID;
++	}
++	if (token->type == CSS_TOKEN_NUMBER) {
++		size_t consumed = 0;
++
++		out->v = css__number_from_lwc_string(token->idata, false,
++				&consumed);
++		if (consumed != lwc_string_length(token->idata)) {
++			return CSS_INVALID;
++		}
++		out->has_unit = false;
++		out->unit = UNIT_PX;
++		parserutils_vector_iterate(vector, ctx);
++		return CSS_OK;
++	}
++	if (token->type == CSS_TOKEN_DIMENSION ||
++			token->type == CSS_TOKEN_PERCENTAGE) {
++		error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
++				&out->v, &out->unit);
++		out->has_unit = true;
++		return error;
++	}
++	if (tokenIsChar(token, '(') ||
++			(token->type == CSS_TOKEN_FUNCTION &&
++			 lwc_string_length(token->idata) == 4 &&
++			 strncasecmp(lwc_string_data(token->idata),
++					"calc", 4) == 0)) {
++		parserutils_vector_iterate(vector, ctx);
++		error = radius_calc_sum(c, vector, ctx, out, depth + 1);
++		if (error != CSS_OK) {
++			return error;
++		}
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++		return tokenIsChar(token, ')') ? CSS_OK : CSS_INVALID;
++	}
++	return CSS_INVALID;
++}
++
++static css_error radius_calc_product(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		struct radius_term *out, int depth)
++{
++	const css_token *token;
++	struct radius_term rhs;
++	css_error error;
++
++	error = radius_calc_value(c, vector, ctx, out, depth);
++	while (error == CSS_OK) {
++		bool mul;
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (tokenIsChar(token, '*')) {
++			mul = true;
++		} else if (tokenIsChar(token, '/')) {
++			mul = false;
++		} else {
++			break;
++		}
++		parserutils_vector_iterate(vector, ctx);
++		error = radius_calc_value(c, vector, ctx, &rhs, depth);
++		if (error != CSS_OK) {
++			break;
++		}
++		if (mul) {
++			if (out->has_unit && rhs.has_unit) {
++				return CSS_INVALID;
++			}
++			if (rhs.has_unit) {
++				out->unit = rhs.unit;
++				out->has_unit = true;
++			}
++			out->v = FMUL(out->v, rhs.v);
++		} else {
++			if (rhs.has_unit || rhs.v == 0) {
++				return CSS_INVALID;
++			}
++			out->v = FDIV(out->v, rhs.v);
++		}
++	}
++	return error;
++}
++
++static css_error radius_calc_sum(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		struct radius_term *out, int depth)
++{
++	const css_token *token;
++	struct radius_term rhs;
++	css_error error;
++
++	error = radius_calc_product(c, vector, ctx, out, depth);
++	while (error == CSS_OK) {
++		bool add;
++
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (tokenIsChar(token, '+')) {
++			add = true;
++		} else if (tokenIsChar(token, '-')) {
++			add = false;
++		} else {
++			break;
++		}
++		parserutils_vector_iterate(vector, ctx);
++		error = radius_calc_product(c, vector, ctx, &rhs, depth);
++		if (error != CSS_OK) {
++			break;
++		}
++		if (out->has_unit != rhs.has_unit ||
++				(out->has_unit && out->unit != rhs.unit)) {
++			/* a zero term takes the other's unit */
++			if (out->v == 0 && rhs.has_unit) {
++				out->unit = rhs.unit;
++				out->has_unit = true;
++			} else if (!(rhs.v == 0)) {
++				return CSS_INVALID;
++			}
++		}
++		out->v = add ? FADD(out->v, rhs.v) : FSUB(out->v, rhs.v);
++	}
++	return error;
++}
++
++/**
++ * One radius: a length or percentage, or a calc() reduced to one.
++ */
++static css_error parse_radius_length(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_fixed *length, uint32_t *unit)
++{
++	const css_token *token = parserutils_vector_peek(vector, *ctx);
++	struct radius_term t;
++	int32_t before = *ctx;
++	css_error error;
++
++	if (token == NULL || token->type != CSS_TOKEN_FUNCTION) {
++		return css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
++				length, unit);
++	}
++	error = radius_calc_value(c, vector, ctx, &t, 0);
++	if (error != CSS_OK || (!t.has_unit && t.v != 0)) {
++		*ctx = before;
++		return CSS_INVALID;
++	}
++	*length = t.v;
++	*unit = t.unit;
++	return CSS_OK;
++}
++
+ /**
+  * Parse one corner's radii: <length-percentage>{1,2}
+  *
+@@ -36,8 +217,7 @@ static css_error parse_corner_radii(css_language *c,
+ 	const css_token *token;
+ 	css_error error;
+ 
+-	error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
+-			&length[0], &unit[0]);
++	error = parse_radius_length(c, vector, ctx, &length[0], &unit[0]);
+ 	if (error != CSS_OK) {
+ 		return error;
+ 	}
+@@ -57,7 +237,7 @@ static css_error parse_corner_radii(css_language *c,
+ 			tokenIsChar(token, '!') == false) {
+ 		int32_t before = *ctx;
+ 
+-		error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
++		error = parse_radius_length(c, vector, ctx,
+ 				&length[1], &unit[1]);
+ 		if (error != CSS_OK) {
+ 			/* not a second radius, which is allowed */
+@@ -199,7 +379,7 @@ static css_error parse_radius_list(css_language *c,
+ 			break;
+ 		}
+ 
+-		error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
++		error = parse_radius_length(c, vector, ctx,
+ 				&length[n], &unit[n]);
+ 		if (error != CSS_OK) {
+ 			if (n == 0) {

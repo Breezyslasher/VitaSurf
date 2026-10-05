@@ -1,0 +1,2011 @@
+diff --git a/content/handlers/html/bidi.c b/content/handlers/html/bidi.c
+index 017fd2226..e33f8dec3 100644
+--- a/content/handlers/html/bidi.c
++++ b/content/handlers/html/bidi.c
+@@ -579,3 +579,83 @@ size_t html_bidi_visual(const char *text, size_t len, bool rtl,
+ 		return len_out;
+ 	}
+ }
++
++
++/* exported interface documented in html/bidi.h */
++unsigned int html_bidi_strength(const char *text, size_t len)
++{
++	const unsigned char *p = (const unsigned char *) text;
++	unsigned int out = 0;
++	size_t i = 0;
++
++	while (i < len && out != (HTML_BIDI_HAS_L | HTML_BIDI_HAS_R)) {
++		uint32_t c = p[i];
++		enum bidi_class k;
++
++		if (c < 0x80) {
++			i++;
++		} else if (c >= 0xf0 && i + 3 < len) {
++			c = ((c & 0x07) << 18) | ((p[i + 1] & 0x3f) << 12) |
++					((p[i + 2] & 0x3f) << 6) |
++					(p[i + 3] & 0x3f);
++			i += 4;
++		} else if (c >= 0xe0 && i + 2 < len) {
++			c = ((c & 0x0f) << 12) | ((p[i + 1] & 0x3f) << 6) |
++					(p[i + 2] & 0x3f);
++			i += 3;
++		} else if (c >= 0xc0 && i + 1 < len) {
++			c = ((c & 0x1f) << 6) | (p[i + 1] & 0x3f);
++			i += 2;
++		} else {
++			i++;
++			continue;
++		}
++		k = bidi_class_of(c);
++		if (k == BC_L)
++			out |= HTML_BIDI_HAS_L;
++		else if (k == BC_R || k == BC_AL)
++			out |= HTML_BIDI_HAS_R;
++	}
++	return out;
++}
++
++
++/* exported interface documented in html/bidi.h */
++size_t html_bidi_override(const char *text, size_t len, const char **out)
++{
++	unsigned int n, i;
++	bool any_arabic = false;
++
++	if (len == 0)
++		return 0;
++	n = bidi_decode(text, len);
++	if (n > BIDI_MAX)
++		return 0;
++	for (i = 0; i < n; i++) {
++		if (bidi_class_of(bidi_cp[i]) == BC_AL)
++			any_arabic = true;
++	}
++	if (any_arabic)
++		n = bidi_arabic_shape(n);
++
++	/* every character right to left: the run reversed, its brackets
++	 * facing the other way */
++	for (i = 0; i < n / 2; i++) {
++		uint32_t t = bidi_cp[i];
++
++		bidi_cp[i] = bidi_cp[n - 1 - i];
++		bidi_cp[n - 1 - i] = t;
++	}
++	for (i = 0; i < n; i++)
++		bidi_cp[i] = bidi_mirror(bidi_cp[i]);
++
++	{
++		size_t len_out = bidi_encode(n);
++		const char *kept = bidi_keep(bidi_out, len_out);
++
++		if (kept == NULL)
++			return 0;
++		*out = kept;
++		return len_out;
++	}
++}
+diff --git a/content/handlers/html/bidi.h b/content/handlers/html/bidi.h
+index 85667ce38..79cb8410c 100644
+--- a/content/handlers/html/bidi.h
++++ b/content/handlers/html/bidi.h
+@@ -47,6 +47,30 @@
+ size_t html_bidi_visual(const char *text, size_t len, bool rtl,
+ 		const char **out);
+ 
++/** html_bidi_strength(): the run has left-to-right letters */
++#define HTML_BIDI_HAS_L 1
++/** html_bidi_strength(): the run has right-to-left letters */
++#define HTML_BIDI_HAS_R 2
++
++/**
++ * Which directions a run's letters have (VitaSurf), for putting the
++ * boxes of a line in order: HTML_BIDI_HAS_L, HTML_BIDI_HAS_R, both or
++ * neither.
++ */
++unsigned int html_bidi_strength(const char *text, size_t len);
++
++/**
++ * A run with every character right to left (VitaSurf), as
++ * unicode-bidi: bidi-override and direction: rtl ask: reversed, its
++ * brackets mirrored and Arabic joined.
++ *
++ * \param text  the run, UTF-8, in the order it was written
++ * \param len   its length in bytes
++ * \param out   set to the visual run, kept as html_bidi_visual() keeps it
++ * \return the visual run's length, or 0 if it is drawn as it is
++ */
++size_t html_bidi_override(const char *text, size_t len, const char **out);
++
+ /**
+  * A redraw is starting (VitaSurf). The outermost one frees the runs the
+  * last redraw made; a nested one, for an iframe, keeps them.
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 4c35aae27..091d4cd5e 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -116,8 +116,11 @@ typedef enum {
+ 	DISPLAY_CONTENTS = 1 << 17, /* display: contents; the box is kept for
+ 				    * its style and is not in the tree
+ 				    * (VitaSurf) */
+-	Z_NEG_ASIDE = 1 << 18	/* a negative z-index box its stacking
++	Z_NEG_ASIDE = 1 << 18,	/* a negative z-index box its stacking
+ 				 * context paints first (VitaSurf) */
++	MULTICOL_PIECES = 1 << 19 /* a block split across columns, with
++				   * pieces painted in the later ones
++				   * (VitaSurf) */
+ } box_flags;
+ 
+ 
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 5e05881ef..1629f1ccc 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -68,6 +68,8 @@ struct box_construct_ctx {
+ 	int *bctx;			/**< talloc context */
+ 
+ 	bool sync;			/**< run to completion without yielding (VitaSurf) */
++
++	int32_t list_value;		/**< the list-item counter at the last list item (VitaSurf) */
+ };
+ 
+ /**
+@@ -423,6 +425,8 @@ struct html_counter {
+ 	lwc_string *name;
+ 	int32_t value;
+ 	const void *scope;
++	int32_t step;	/**< the implicit list-item increment: -1 once
++			 * a reversed ol resets it */
+ };
+ 
+ /* exported interface documented in html/private.h */
+@@ -474,6 +478,7 @@ box_counter_push(html_content *c, lwc_string *name, int32_t value,
+ 	e->name = lwc_string_ref(name);
+ 	e->value = value;
+ 	e->scope = scope;
++	e->step = 1;
+ 	return e;
+ }
+ 
+@@ -506,9 +511,10 @@ box_counters_apply(html_content *c, const css_computed_style *style,
+ 			CSS_COUNTER_RESET_NAMED && k != NULL) {
+ 		for (; k->name != NULL; k++) {
+ 			e = box_counter_find(c, k->name);
+-			if (e != NULL && e->scope == scope)
++			if (e != NULL && e->scope == scope) {
+ 				e->value = FIXTOINT(k->value);
+-			else
++				e->step = 1;
++			} else
+ 				box_counter_push(c, k->name,
+ 						FIXTOINT(k->value), scope);
+ 		}
+@@ -530,7 +536,7 @@ box_counters_apply(html_content *c, const css_computed_style *style,
+ 	if (list_item) {
+ 		e = box_counter_get(c, corestring_lwc_list_item, scope);
+ 		if (e != NULL)
+-			e->value++;
++			e->value += e->step;
+ 	}
+ 	k = NULL;
+ 	if (css_computed_counter_set(style, &k) ==
+@@ -553,6 +559,109 @@ static void box_counters_leave(html_content *c, const void *node)
+ 	}
+ }
+ 
++/**
++ * Apply the list attributes HTML maps to the list-item counter: an ol's
++ * start and reversed adjust the counter-reset: list-item it makes, and
++ * an li's value is a counter-set: list-item. The reset is adjusted only
++ * when it is the default, list-item 0, so an author's counter-reset
++ * wins as it would over a presentational hint.
++ *
++ * \param c      the document
++ * \param n      the element
++ * \param style  its style
++ * \param scope  the scope its counters were made in
++ */
++static void
++box_counters_list_attributes(html_content *c, dom_node *n,
++		const css_computed_style *style, const void *scope)
++{
++	dom_html_element_type type;
++	struct html_counter *e;
++	bool has = false;
++
++	if (dom_html_element_get_tag_type(n, &type) != DOM_NO_ERR)
++		return;
++
++	if (type == DOM_HTML_ELEMENT_TYPE_OL) {
++		bool reversed = false;
++		dom_long start = 1;
++
++		e = box_counter_find(c, corestring_lwc_list_item);
++		if (e == NULL || e->scope != scope || e->value != 0)
++			return;
++		if (dom_element_has_attribute(n, corestring_dom_reversed,
++				&reversed) != DOM_NO_ERR)
++			reversed = false;
++		if (dom_element_has_attribute(n, corestring_dom_start,
++				&has) != DOM_NO_ERR)
++			has = false;
++		if (has && dom_html_olist_element_get_start(
++				(dom_html_olist_element *) n, &start) !=
++				DOM_NO_ERR)
++			has = false;
++
++		if (reversed) {
++			if (!has) {
++				/* the number of items: reversed(list-item)
++				 * counts down to 1 */
++				dom_node *child = NULL, *next;
++				dom_html_element_type ct;
++				dom_node_type nt;
++
++				start = 0;
++				if (dom_node_get_first_child(n, &child) !=
++						DOM_NO_ERR)
++					child = NULL;
++				while (child != NULL) {
++					if (dom_node_get_node_type(child,
++							&nt) == DOM_NO_ERR &&
++							nt == DOM_ELEMENT_NODE &&
++							dom_html_element_get_tag_type(
++							child, &ct) ==
++							DOM_NO_ERR && ct ==
++							DOM_HTML_ELEMENT_TYPE_LI)
++						start++;
++					if (dom_node_get_next_sibling(child,
++							&next) != DOM_NO_ERR)
++						next = NULL;
++					dom_node_unref(child);
++					child = next;
++				}
++			}
++			e->value = start + 1;
++			e->step = -1;
++		} else if (has) {
++			e->value = start - 1;
++		}
++	} else if (type == DOM_HTML_ELEMENT_TYPE_LI) {
++		const css_computed_counter *k = NULL;
++		dom_long value;
++
++		if (css_computed_counter_set(style, &k) ==
++				CSS_COUNTER_SET_NAMED && k != NULL) {
++			for (; k->name != NULL; k++) {
++				bool match = false;
++
++				if (lwc_string_isequal(k->name,
++						corestring_lwc_list_item,
++						&match) == lwc_error_ok &&
++						match)
++					return;
++			}
++		}
++		if (dom_element_has_attribute(n, corestring_dom_value,
++				&has) != DOM_NO_ERR || !has)
++			return;
++		if (dom_html_li_element_get_value(
++				(dom_html_li_element *) n, &value) !=
++				DOM_NO_ERR)
++			return;
++		e = box_counter_get(c, corestring_lwc_list_item, scope);
++		if (e != NULL)
++			e->value = value;
++	}
++}
++
+ /** Append a counter's value in a list style (the opcode, as content
+  * holds it) to \a out. */
+ static char *
+@@ -589,13 +698,41 @@ box_counter_format(char *out, int32_t value, uint8_t style_op, void *bctx)
+  * \return the text, allocated in bctx, or NULL for none
+  */
+ static char *
++box_generated_text_until(dom_node *n,
++		   html_content *content,
++		   const css_computed_style *style,
++		   const css_computed_content_item *item,
++		   void *bctx,
++		   const css_computed_content_item **stop);
++
++static char *
+ box_generated_text(dom_node *n,
+ 		   html_content *content,
+ 		   const css_computed_style *style,
+ 		   const css_computed_content_item *item,
+ 		   void *bctx)
+ {
+-	char *text = talloc_strdup(bctx, "");
++	return box_generated_text_until(n, content, style, item, bctx, NULL);
++}
++
++/**
++ * The text of content items up to the first url() (VitaSurf), which is
++ * an image rather than text: \a stop is set to it, or NULL at the end.
++ * Without \a stop a url() is passed over.
++ */
++static char *
++box_generated_text_until(dom_node *n,
++		   html_content *content,
++		   const css_computed_style *style,
++		   const css_computed_content_item *item,
++		   void *bctx,
++		   const css_computed_content_item **stop)
++{
++	char *text;
++
++	if (stop != NULL)
++		*stop = NULL;
++	text = talloc_strdup(bctx, "");
+ 	lwc_string **quotes = NULL;
+ 	int n_quotes = -1;
+ 
+@@ -608,6 +745,11 @@ box_generated_text(dom_node *n,
+ 		const char *add = NULL;
+ 		dom_string *value = NULL;
+ 
++		if (stop != NULL && item->type == CSS_COMPUTED_CONTENT_URI) {
++			*stop = item;
++			break;
++		}
++
+ 		switch (item->type) {
+ 		case CSS_COMPUTED_CONTENT_STRING:
+ 			add = lwc_string_data(item->data.string);
+@@ -750,6 +892,97 @@ box_generated_text(dom_node *n,
+ }
+ 
+ 
++/**
++ * Add a pseudo element's content to an inline container (VitaSurf): its
++ * text as text boxes in its style, and each url() as an image, an
++ * anonymous inline replaced box of the image's own size (CSS Content 3).
++ *
++ * \return true if anything was added
++ */
++static bool
++box_generated_add_items(dom_node *n,
++		html_content *content,
++		struct box *container,
++		const css_computed_style *style,
++		const css_computed_content_item *item)
++{
++	bool added = false;
++
++	while (item != NULL) {
++		const css_computed_content_item *stop = NULL;
++		char *text = box_generated_text_until(n, content, style, item,
++				content->bctx, &stop);
++
++		if (text != NULL) {
++			/** \todo Not wise to drop const from the style */
++			struct box *text_box = box_create(NULL,
++					(css_computed_style *) style, false,
++					NULL, NULL, NULL, NULL,
++					content->bctx);
++
++			if (text_box == NULL)
++				return added;
++			text_box->type = BOX_TEXT;
++			text_box->text = text;
++			text_box->length = strlen(text);
++			if (css_computed_text_transform(style) !=
++					CSS_TEXT_TRANSFORM_NONE)
++				box_text_transform(text_box->text,
++						text_box->length,
++						css_computed_text_transform(
++							style));
++			box_add_child(container, text_box);
++			added = true;
++		}
++		if (stop == NULL)
++			break;
++
++		if (stop->data.uri != NULL &&
++				nsoption_bool(foreground_images) == true) {
++			nscss_select_ctx sctx;
++			css_computed_style *istyle;
++			struct box *img;
++			nsurl *url = NULL;
++
++			sctx.ctx = content->select_ctx;
++			sctx.quirks = (content->quirks ==
++					DOM_DOCUMENT_QUIRKS_MODE_FULL);
++			sctx.base_url = content->base_url;
++			sctx.universal = content->universal;
++			sctx.root_style = NULL;
++			sctx.parent_style = style;
++			sctx.html = content;
++			istyle = nscss_get_blank_style(&sctx,
++					&content->unit_len_ctx, style);
++			if (istyle == NULL)
++				return added;
++			img = box_create(NULL, istyle, true, NULL, NULL, NULL,
++					NULL, content->bctx);
++			if (img == NULL) {
++				css_computed_style_destroy(istyle);
++				return added;
++			}
++			img->type = BOX_INLINE;
++			img->flags |= IS_REPLACED;
++			if (nsurl_join(content->base_url,
++					lwc_string_data(stop->data.uri),
++					&url) == NSERROR_OK &&
++					html_fetch_object(content, url, img,
++						image_types, false)) {
++				box_add_child(container, img);
++				added = true;
++			} else {
++				box_free(img);
++			}
++			if (url != NULL)
++				nsurl_unref(url);
++		}
++		item = stop + 1;
++	}
++	return added;
++}
++
++
+ /**
+  * Put a pseudo element's text in an inline box inside its own box.
+  */
+@@ -761,13 +994,6 @@ box_generated_add_text(dom_node *n,
+ 		       const css_computed_content_item *item)
+ {
+ 	struct box *container;
+-	struct box *text_box;
+-	char *text;
+-
+-	text = box_generated_text(n, content, style, item, content->bctx);
+-	if (text == NULL) {
+-		return;
+-	}
+ 
+ 	/*
+ 	 * ::after text belongs on the last line of the element rather
+@@ -777,31 +1003,20 @@ box_generated_add_text(dom_node *n,
+ 	 */
+ 	container = parent->last;
+ 	if (container == NULL || container->type != BOX_INLINE_CONTAINER) {
++		/* a new run is added only if there is something in it */
+ 		container = box_create(NULL, NULL, false, NULL, NULL, NULL,
+ 				NULL, content->bctx);
+ 		if (container == NULL) {
+ 			return;
+ 		}
+ 		container->type = BOX_INLINE_CONTAINER;
+-		box_add_child(parent, container);
+-	}
+-
+-	/** \todo Not wise to drop const from the computed style */
+-	text_box = box_create(NULL, (css_computed_style *) style, false,
+-			NULL, NULL, NULL, NULL, content->bctx);
+-	if (text_box == NULL) {
++		if (box_generated_add_items(n, content, container, style,
++				item))
++			box_add_child(parent, container);
+ 		return;
+ 	}
+-	text_box->type = BOX_TEXT;
+-	text_box->text = text;
+-	text_box->length = strlen(text);
+ 
+-	if (css_computed_text_transform(style) != CSS_TEXT_TRANSFORM_NONE) {
+-		box_text_transform(text_box->text, text_box->length,
+-				css_computed_text_transform(style));
+-	}
+-
+-	box_add_child(container, text_box);
++	box_generated_add_items(n, content, container, style, item);
+ }
+ 
+ 
+@@ -892,8 +1107,6 @@ box_construct_generate_inline(dom_node *n, html_content *content,
+ 		struct box *container, const css_computed_style *style)
+ {
+ 	const css_computed_content_item *c_item;
+-	struct box *text_box;
+-	char *text;
+ 
+ 	if (container == NULL || style == NULL ||
+ 			css_computed_content(style, &c_item) !=
+@@ -904,23 +1117,7 @@ box_construct_generate_inline(dom_node *n, html_content *content,
+ 	box_counters_apply(content, style,
+ 			ns_computed_display(style, false) ==
+ 				CSS_DISPLAY_LIST_ITEM, n);
+-	text = box_generated_text(n, content, style, c_item, content->bctx);
+-	if (text == NULL)
+-		return false;
+-
+-	/** \todo Not wise to drop const from the computed style */
+-	text_box = box_create(NULL, (css_computed_style *) style, false,
+-			NULL, NULL, NULL, NULL, content->bctx);
+-	if (text_box == NULL)
+-		return false;
+-	text_box->type = BOX_TEXT;
+-	text_box->text = text;
+-	text_box->length = strlen(text);
+-	if (css_computed_text_transform(style) != CSS_TEXT_TRANSFORM_NONE)
+-		box_text_transform(text_box->text, text_box->length,
+-				css_computed_text_transform(style));
+-	box_add_child(container, text_box);
+-	return true;
++	return box_generated_add_items(n, content, container, style, c_item);
+ }
+ 
+ 
+@@ -961,6 +1158,10 @@ box_construct_marker(struct box *box,
+ 
+ 	marker->type = BOX_BLOCK;
+ 
++	/* its number is the list-item counter's, which counting the
++	 * element in has just set (VitaSurf) */
++	marker->list_value = ctx->list_value;
++
+ 	list_style_type = css_computed_list_style_type(box->style);
+ 
+ 	/** \todo marker content (list-style-type) */
+@@ -1449,6 +1650,15 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 			box_counters_apply(ctx->content, box->style,
+ 					css_display == CSS_DISPLAY_LIST_ITEM,
+ 					parent);
++			box_counters_list_attributes(ctx->content, ctx->n,
++					box->style, parent);
++			if (css_display == CSS_DISPLAY_LIST_ITEM) {
++				struct html_counter *e = box_counter_find(
++						ctx->content,
++						corestring_lwc_list_item);
++
++				ctx->list_value = e != NULL ? e->value : 1;
++			}
+ 			if (parent != NULL)
+ 				dom_node_unref(parent);
+ 		}
+@@ -1467,6 +1677,14 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		if (err != DOM_NO_ERR)
+ 			return false;
+ 		box->node = dom_node_ref(ctx->n);
++
++		/* its ::before is its first child, so it goes where its
++		 * children go: into the parent's flow */
++		if (box->styles != NULL)
++			box_construct_generate(ctx->n, ctx->content,
++					props.containing_block,
++					box->styles->styles[
++						CSS_PSEUDO_ELEMENT_BEFORE]);
+ 		return true;
+ 	}
+ 
+@@ -1700,9 +1918,19 @@ static void box_construct_element_after_inner(dom_node *n,
+ 
+ 	assert(box != NULL);
+ 
+-	/* display: contents has no box of its own to end (VitaSurf) */
+-	if (box->flags & DISPLAY_CONTENTS)
++	/* display: contents has no box of its own to end, but its
++	 * ::after follows its children in the parent's flow (VitaSurf) */
++	if (box->flags & DISPLAY_CONTENTS) {
++		if (box->styles != NULL) {
++			box_extract_properties(content, n, &props);
++			if (props.containing_block != NULL)
++				box_construct_generate(n, content,
++						props.containing_block,
++						box->styles->styles[
++						CSS_PSEUDO_ELEMENT_AFTER]);
++		}
+ 		return;
++	}
+ 
+ 	box_extract_properties(content, n, &props);
+ 
+@@ -2492,6 +2720,7 @@ dom_to_box(dom_node *n,
+ 	ctx->cb = cb;
+ 	ctx->bctx = c->bctx;
+ 	ctx->sync = false;
++	ctx->list_value = 1;
+ 
+ 	/* counting starts again with the document (VitaSurf) */
+ 	html_counters_clear(c);
+@@ -2531,6 +2760,7 @@ dom_to_box_sync(dom_node *n, html_content *c, box_construct_complete_cb cb)
+ 	ctx->cb = cb;
+ 	ctx->bctx = c->bctx;
+ 	ctx->sync = true;
++	ctx->list_value = 1;
+ 
+ 	/* counting starts again with the document (VitaSurf) */
+ 	html_counters_clear(c);
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 796db1fed..133dc010d 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1756,6 +1756,11 @@ static void html_destroy(struct content *c)
+ 	html->csizes = NULL;
+ 	html->n_csizes = 0;
+ 
++	/* the pieces of its blocks split across columns */
++	free(html->mc_pieces);
++	html->mc_pieces = NULL;
++	html->n_mc_pieces = html->mc_pieces_alloc = 0;
++
+ 	/* the documents its iframes made for themselves */
+ 	html_frame_doc_release(html);
+ 
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 4bb1a852b..d5065bd2f 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -71,6 +71,7 @@
+ #include "html/layout.h"
+ #include "html/layout_internal.h"
+ #include "html/table.h"
++#include "html/bidi.h"
+ 
+ /** Array of per-side access functions for computed style margins. */
+ const css_len_func margin_funcs[4] = {
+@@ -2889,6 +2890,121 @@ static int line_height(
+ }
+ 
+ 
++/** Most boxes on a line put in bidirectional order (VitaSurf). */
++#define LAYOUT_BIDI_MAX 256
++
++/**
++ * Put a line's boxes in bidirectional order (VitaSurf): a run of boxes
++ * whose text goes the other way from the block's -- right-to-left words
++ * in a left-to-right paragraph, split between elements, or an element
++ * with a direction of its own -- is shown in its own order, the first
++ * of it at its far end, as UAX #9's reordering of levels (L2) does
++ * across a line. Boxes with no letters of either direction, spaces and
++ * the edges of inline elements, go with the run when it is on both
++ * sides of them. What is inside each text box is ordered when it is
++ * drawn.
++ */
++static void layout__bidi_line(struct box *first, struct box *end, bool rtl)
++{
++	struct box *bx[LAYOUT_BIDI_MAX];
++	int l[LAYOUT_BIDI_MAX], r[LAYOUT_BIDI_MAX];
++	int8_t lv[LAYOUT_BIDI_MAX];	/* 1 raised, 0 base, -1 neutral */
++	unsigned int n = 0, i, j;
++	bool any = false;
++	struct box *d;
++
++	for (d = first; d != end; d = d->next) {
++		int8_t level = -1;
++
++		if (n == LAYOUT_BIDI_MAX)
++			return;
++		if (d->type == BOX_TEXT) {
++			if (d->style != NULL && (css_computed_direction(
++					d->style) == CSS_DIRECTION_RTL) != rtl) {
++				level = 1;
++			} else if (d->text != NULL) {
++				unsigned int k = html_bidi_strength(d->text,
++						d->length);
++				unsigned int other = rtl ? HTML_BIDI_HAS_L :
++						HTML_BIDI_HAS_R;
++
++				if (k == other)
++					level = 1;
++				else if (k != 0)
++					level = 0;
++			}
++			l[n] = d->x;
++			r[n] = d->x + d->width;
++		} else if (d->type == BOX_BR || d->type == BOX_INLINE_END ||
++				(d->type == BOX_INLINE &&
++				 lh__box_is_replace(d) == false)) {
++			l[n] = r[n] = d->x;
++		} else if (d->type == BOX_INLINE ||
++				d->type == BOX_INLINE_BLOCK ||
++				d->type == BOX_INLINE_FLEX) {
++			if (d->style != NULL &&
++					(css_computed_position(d->style) ==
++						CSS_POSITION_ABSOLUTE ||
++					 css_computed_position(d->style) ==
++						CSS_POSITION_FIXED))
++				continue;
++			l[n] = d->x - d->border[LEFT].width - d->margin[LEFT];
++			r[n] = d->x + d->padding[LEFT] + d->width +
++					d->padding[RIGHT] +
++					d->border[RIGHT].width +
++					d->margin[RIGHT];
++		} else {
++			continue;
++		}
++		if (level == 1)
++			any = true;
++		bx[n] = d;
++		lv[n] = level;
++		n++;
++	}
++	if (!any)
++		return;
++
++	/* the boxes with no direction of their own go with what is on
++	 * both sides of them, the base where the sides differ */
++	for (i = 0; i < n; ) {
++		int8_t before, after;
++
++		if (lv[i] >= 0) {
++			i++;
++			continue;
++		}
++		for (j = i; j < n && lv[j] < 0; j++)
++			;
++		before = i > 0 ? lv[i - 1] : 0;
++		after = j < n ? lv[j] : 0;
++		for (; i < j; i++)
++			lv[i] = (before == 1 && after == 1) ? 1 : 0;
++	}
++
++	/* each run of raised boxes, mirrored within the space it takes */
++	for (i = 0; i < n; ) {
++		int a0, a1;
++
++		if (lv[i] != 1) {
++			i++;
++			continue;
++		}
++		a0 = l[i];
++		a1 = r[i];
++		for (j = i; j < n && lv[j] == 1; j++) {
++			if (l[j] < a0) a0 = l[j];
++			if (r[j] > a1) a1 = r[j];
++		}
++		if (j - i > 1) {
++			for (; i < j; i++)
++				bx[i]->x += a0 + a1 - r[i] - l[i];
++		}
++		i = j;
++	}
++}
++
++
+ /**
+  * Position a line of boxes in inline formatting context.
+  *
+@@ -3672,6 +3788,14 @@ layout_line(struct box *first,
+ 		}
+ 	}
+ 
++	/* runs going the other way, in their own order (VitaSurf) */
++	if (first->parent != NULL && first->parent->parent != NULL &&
++			first->parent->parent->style != NULL)
++		layout__bidi_line(first, b,
++				css_computed_direction(
++					first->parent->parent->style) ==
++					CSS_DIRECTION_RTL);
++
+ 	first->flags |= NEW_LINE;
+ 
+ 	assert(b != first || (move_y && 0 < used_height && (left || right)));
+@@ -4510,314 +4634,6 @@ bool layout_block_context_single(
+ 	return true;
+ }
+ 
+-/**
+- * Get a dom node's element tag type.
+- *
+- * \param[in]  node  Node to get tag type of.
+- * \param[in]  type  Returns element tag type on success.
+- * \return true if on success, false otherwise.
+- */
+-static bool
+-layout__get_element_tag(
+-		const dom_node *node,
+-		dom_html_element_type *type)
+-{
+-	dom_html_element_type element_type;
+-	dom_node_type node_type;
+-	dom_exception exc;
+-
+-	exc = dom_node_get_node_type(node, &node_type);
+-	if (exc != DOM_NO_ERR ||
+-	    node_type != DOM_ELEMENT_NODE) {
+-		return false;
+-	}
+-
+-	exc = dom_html_element_get_tag_type(node, &element_type);
+-	if (exc != DOM_NO_ERR) {
+-		return false;
+-	}
+-
+-	*type = element_type;
+-	return true;
+-}
+-
+-
+-/**
+- * Check a node's tag type.
+- *
+- * \param[in]  node  Node to check tag type of.
+- * \param[in]  type  Tag type to test for.
+- * \return true if if node has given type, false otherwise.
+- */
+-static inline bool
+-layout__check_element_type(
+-		const dom_node *node,
+-		dom_html_element_type type)
+-{
+-	dom_html_element_type element_type;
+-
+-	if (!layout__get_element_tag(node, &element_type)) {
+-		return false;
+-	}
+-
+-	return element_type == type;
+-}
+-
+-
+-/**
+- * Helper to get attribute value from a LI node.
+- *
+- * \param[in]  li_node    DOM node for the LI element;
+- * \param[out] value_out  Returns the value on success.
+- * \return true if node has value, otherwise false.
+- */
+-static bool
+-layout__get_li_value(dom_node *li_node, dom_long *value_out)
+-{
+-	dom_exception exc;
+-	dom_long value;
+-	bool has_value;
+-
+-	/** \todo
+-	 * dom_html_li_element_get_value() is rubbish and we can't tell
+-	 * a lack of value attribute or invalid value from a perfectly
+-	 * valid '-1'.
+-	 *
+-	 * This helps for the common case of no value.  However we should
+-	 * fix libdom to have some kind of sane interface to get numerical
+-	 * attributes.
+-	 */
+-	exc = dom_element_has_attribute(li_node,
+-			corestring_dom_value,
+-			&has_value);
+-	if (exc != DOM_NO_ERR || has_value == false) {
+-		return false;
+-	}
+-
+-	exc = dom_html_li_element_get_value(
+-			(dom_html_li_element *)li_node,
+-			&value);
+-	if (exc != DOM_NO_ERR) {
+-		return false;
+-	}
+-
+-	*value_out = value;
+-	return true;
+-}
+-
+-
+-/**
+- * Helper to get start attribute value from a OL node.
+- *
+- * \param[in]  ol_node    DOM node for the OL element;
+- * \param[out] start_out  Returns the value on success.
+- * \return true if node has value, otherwise false.
+- */
+-static bool
+-layout__get_ol_start(dom_node *ol_node, dom_long *start_out)
+-{
+-	dom_exception exc;
+-	dom_long start;
+-	bool has_start;
+-
+-	/** \todo
+-	 * see layout__get_li_value().
+-	 */
+-	exc = dom_element_has_attribute(ol_node,
+-			corestring_dom_start,
+-			&has_start);
+-	if (exc != DOM_NO_ERR || has_start == false) {
+-		return false;
+-	}
+-
+-	exc = dom_html_olist_element_get_start(
+-			(dom_html_olist_element *)ol_node,
+-			&start);
+-	if (exc != DOM_NO_ERR) {
+-		return false;
+-	}
+-
+-	*start_out = start;
+-	return true;
+-}
+-
+-
+-/**
+- * Helper to get reversed attribute value from a OL node.
+- *
+- * \param[in]  ol_node    DOM node for the OL element;
+- * \return true if node has reversed, otherwise false.
+- */
+-static bool
+-layout__get_ol_reversed(dom_node *ol_node)
+-{
+-	dom_exception exc;
+-	bool has_reversed;
+-
+-	exc = dom_element_has_attribute(ol_node,
+-			corestring_dom_reversed,
+-			&has_reversed);
+-	if (exc != DOM_NO_ERR) {
+-		return false;
+-	}
+-
+-	return has_reversed;
+-}
+-
+-
+-/**
+- * Get the number of list items for a list owner.
+- *
+- * \param[in]  list_owner  DOM node to count list items for.
+- * \param[in]  count_out   Returns list item count on success.
+- * \return true on success, otherwise false.
+- */
+-static bool
+-layout__get_list_item_count(
+-		dom_node *list_owner, dom_long *count_out)
+-{
+-	dom_html_element_type tag_type;
+-	dom_exception exc;
+-	dom_node *child;
+-	int count;
+-
+-	if (list_owner == NULL) {
+-		return false;
+-	}
+-
+-	if (!layout__get_element_tag(list_owner, &tag_type)) {
+-		return false;
+-	}
+-
+-	if (tag_type != DOM_HTML_ELEMENT_TYPE_OL &&
+-	    tag_type != DOM_HTML_ELEMENT_TYPE_UL) {
+-		return false;
+-	}
+-
+-	exc = dom_node_get_first_child(list_owner, &child);
+-	if (exc != DOM_NO_ERR) {
+-		return false;
+-	}
+-
+-	count = 0;
+-	while (child != NULL) {
+-		dom_node *temp_node;
+-
+-		if (layout__check_element_type(child,
+-				DOM_HTML_ELEMENT_TYPE_LI)) {
+-			struct box *child_box;
+-			if (dom_node_get_user_data(child,
+-					corestring_dom___ns_key_box_node_data,
+-					&child_box) != DOM_NO_ERR) {
+-				dom_node_unref(child);
+-				return false;
+-			}
+-
+-			if (child_box != NULL &&
+-			    child_box->list_marker != NULL) {
+-				count++;
+-			}
+-		}
+-
+-		exc = dom_node_get_next_sibling(child, &temp_node);
+-		dom_node_unref(child);
+-		if (exc != DOM_NO_ERR) {
+-			return false;
+-		}
+-
+-		child = temp_node;
+-	}
+-
+-	*count_out = count;
+-	return true;
+-}
+-
+-
+-/**
+- * Handle list item counting, if this is a list owner box.
+- *
+- * \param[in]  box  Box to do list item counting for.
+- */
+-static void
+-layout__ordered_list_count(
+-		struct box *box)
+-{
+-	dom_html_element_type tag_type;
+-	dom_exception exc;
+-	dom_node *child;
+-	int step = 1;
+-	dom_long next;
+-
+-	if (box->node == NULL) {
+-		return;
+-	}
+-
+-	if (!layout__get_element_tag(box->node, &tag_type)) {
+-		return;
+-	}
+-
+-	if (tag_type != DOM_HTML_ELEMENT_TYPE_OL &&
+-	    tag_type != DOM_HTML_ELEMENT_TYPE_UL) {
+-		return;
+-	}
+-
+-	next = 1;
+-	if (tag_type == DOM_HTML_ELEMENT_TYPE_OL) {
+-		bool have_start = layout__get_ol_start(box->node, &next);
+-		bool have_reversed = layout__get_ol_reversed(box->node);
+-
+-		if (have_reversed) {
+-			step = -1;
+-		}
+-
+-		if (!have_start && have_reversed) {
+-			layout__get_list_item_count(box->node, &next);
+-		}
+-	}
+-
+-	exc = dom_node_get_first_child(box->node, &child);
+-	if (exc != DOM_NO_ERR) {
+-		return;
+-	}
+-
+-	while (child != NULL) {
+-		dom_node *temp_node;
+-
+-		if (layout__check_element_type(child,
+-				DOM_HTML_ELEMENT_TYPE_LI)) {
+-			struct box *child_box;
+-
+-			if (dom_node_get_user_data(child,
+-					corestring_dom___ns_key_box_node_data,
+-					&child_box) != DOM_NO_ERR) {
+-				dom_node_unref(child);
+-				return;
+-			}
+-
+-			if (child_box != NULL &&
+-			    child_box->list_marker != NULL) {
+-				dom_long value;
+-				struct box *marker = child_box->list_marker;
+-				if (layout__get_li_value(child, &value)) {
+-					marker->list_value = value;
+-					next = marker->list_value;
+-				} else {
+-					marker->list_value = next;
+-				}
+-				next += step;
+-			}
+-		}
+-
+-		exc = dom_node_get_next_sibling(child, &temp_node);
+-		dom_node_unref(child);
+-		if (exc != DOM_NO_ERR) {
+-			return;
+-		}
+-
+-		child = temp_node;
+-	}
+-}
+-
+ /**
+  * Set up the marker text for a numerical list item.
+  *
+@@ -4900,8 +4716,8 @@ layout_lists(const html_content *content, struct box *box)
+ {
+ 	struct box *child;
+ 
+-	layout__ordered_list_count(box);
+-
++	/* the numbers were set by the list-item counter when the boxes
++	 * were built (VitaSurf) */
+ 	for (child = box->children; child; child = child->next) {
+ 		if (child->list_marker) {
+ 			struct box *marker = child->list_marker;
+@@ -6225,6 +6041,9 @@ bool layout_document(html_content *content, int width, int height)
+ 			width, height, nsurl_access(content_get_url(
+ 					&content->base)));
+ 
++	/* the pieces of split blocks are noted again (VitaSurf) */
++	content->n_mc_pieces = 0;
++
+ 	layout_minmax_block(doc, font_func, content);
+ 
+ 	layout_block_find_dimensions(&content->unit_len_ctx,
+diff --git a/content/handlers/html/layout_multicol.c b/content/handlers/html/layout_multicol.c
+index 14142d92b..850b582c1 100644
+--- a/content/handlers/html/layout_multicol.c
++++ b/content/handlers/html/layout_multicol.c
+@@ -32,11 +32,15 @@
+  * balanced on their own, the child is laid out again across the whole
+  * box below them, and the columns start again under it.
+  *
++ * A block split across columns keeps its box where it began; in each
++ * later column its content reaches, a piece of it is noted for the
++ * painter, which draws the block's background and side borders there
++ * too, its bottom border in the last. Floats move with the fragment
++ * they were placed beside.
++ *
+  * What this leaves out: a block that is not split, other than by the
+- * lines and blocks inside it, keeps its whole height in one column, so
+- * a box with a background that runs across a column break has it drawn
+- * only in the first; floats inside the content stay where the single
+- * column put them; only the box's own children can span.
++ * lines and blocks inside it, keeps its whole height in one column;
++ * only the box's own children can span.
+  */
+ 
+ #include <assert.h>
+@@ -71,6 +75,19 @@ struct multicol_frag {
+ 	int top;
+ 	int bottom;
+ 	bool span;	/**< a child with column-span: all */
++	/** how far the dealing moved it, once it has */
++	int dx, dy;
++	bool placed;
++};
++
++/** A box whose content was cut into fragments. */
++struct multicol_cut {
++	struct box *box;
++	/** where its children are measured from, in the multi-column
++	 * box's coordinates */
++	int origin;
++	/** its fragments, which are consecutive */
++	unsigned int start, end;
+ };
+ 
+ struct multicol_ctx {
+@@ -79,7 +96,7 @@ struct multicol_ctx {
+ 	unsigned int alloc;
+ 	/** boxes whose content was cut up, parents first, to be given
+ 	 * their new heights afterwards */
+-	struct box **cut;
++	struct multicol_cut *cut;
+ 	unsigned int n_cut;
+ 	unsigned int cut_alloc;
+ 	/** a block at least this tall is looked inside */
+@@ -164,24 +181,40 @@ static void multicol_add(struct multicol_ctx *m, struct box *first,
+ 	m->frag[m->n_frag].top = top;
+ 	m->frag[m->n_frag].bottom = bottom < top ? top : bottom;
+ 	m->frag[m->n_frag].span = false;
++	m->frag[m->n_frag].dx = 0;
++	m->frag[m->n_frag].dy = 0;
++	m->frag[m->n_frag].placed = false;
+ 	m->n_frag++;
+ }
+ 
+ 
+-static void multicol_note_cut(struct multicol_ctx *m, struct box *b)
++/** Note a box whose content is cut up; its fragments are those added
++ * until multicol_cut_done() is called with the index this returns. */
++static int multicol_note_cut(struct multicol_ctx *m, struct box *b,
++		int origin)
+ {
+ 	if (m->n_cut == m->cut_alloc) {
+ 		unsigned int alloc = m->cut_alloc ? m->cut_alloc * 2 : 16;
+-		struct box **c = realloc(m->cut, alloc * sizeof(*c));
++		struct multicol_cut *c = realloc(m->cut, alloc * sizeof(*c));
+ 
+ 		if (c == NULL) {
+ 			m->nomem = true;
+-			return;
++			return -1;
+ 		}
+ 		m->cut = c;
+ 		m->cut_alloc = alloc;
+ 	}
+-	m->cut[m->n_cut++] = b;
++	m->cut[m->n_cut].box = b;
++	m->cut[m->n_cut].origin = origin;
++	m->cut[m->n_cut].start = m->n_frag;
++	m->cut[m->n_cut].end = m->n_frag;
++	return (int) m->n_cut++;
++}
++
++static void multicol_cut_done(struct multicol_ctx *m, int i)
++{
++	if (i >= 0)
++		m->cut[i].end = m->n_frag;
+ }
+ 
+ 
+@@ -199,8 +232,8 @@ static void multicol_lines(struct multicol_ctx *m, struct box *ic,
+ {
+ 	struct box *c, *first = NULL, *last = NULL;
+ 	int top = 0, bottom = 0;
++	int cut = multicol_note_cut(m, ic, base_y);
+ 
+-	multicol_note_cut(m, ic);
+ 	for (c = ic->children; c != NULL; c = c->next) {
+ 		int ct, cb;
+ 
+@@ -226,6 +259,7 @@ static void multicol_lines(struct multicol_ctx *m, struct box *ic,
+ 	}
+ 	if (first != NULL)
+ 		multicol_add(m, first, last, top, bottom);
++	multicol_cut_done(m, cut);
+ }
+ 
+ 
+@@ -286,8 +320,10 @@ static void multicol_collect(struct multicol_ctx *m, struct box *parent,
+ 
+ 		if (depth < MULTICOL_DEPTH && bottom - top > m->threshold &&
+ 				multicol_can_cut(c)) {
+-			multicol_note_cut(m, c);
++			int cut = multicol_note_cut(m, c, base_y + c->y);
++
+ 			multicol_collect(m, c, base_y + c->y, depth + 1);
++			multicol_cut_done(m, cut);
+ 			continue;
+ 		}
+ 		multicol_add(m, c, c, top, bottom);
+@@ -308,7 +344,7 @@ static void multicol_collect(struct multicol_ctx *m, struct box *parent,
+  * \param bottom_out if not NULL, set to the lowest bottom of a column
+  * \return how many columns that takes
+  */
+-static int multicol_deal(const struct multicol_ctx *m, unsigned int a,
++static int multicol_deal(struct multicol_ctx *m, unsigned int a,
+ 		unsigned int b, int col_h, int col_step, int y0, bool apply,
+ 		int *bottom_out)
+ {
+@@ -319,7 +355,7 @@ static int multicol_deal(const struct multicol_ctx *m, unsigned int a,
+ 	bool empty = true;
+ 
+ 	for (i = a; i < b; i++) {
+-		const struct multicol_frag *f = &m->frag[i];
++		struct multicol_frag *f = &m->frag[i];
+ 
+ 		if (!empty && f->bottom - start > col_h) {
+ 			k++;
+@@ -329,6 +365,11 @@ static int multicol_deal(const struct multicol_ctx *m, unsigned int a,
+ 		if (f->bottom - start + y0 > bottom)
+ 			bottom = f->bottom - start + y0;
+ 
++		if (apply) {
++			f->dx = k * col_step;
++			f->dy = y0 - start;
++			f->placed = true;
++		}
+ 		if (apply && (k != 0 || start != y0)) {
+ 			int dx = k * col_step, dy = y0 - start;
+ 			struct box *b;
+@@ -390,7 +431,7 @@ static void multicol_shrink(struct box *b)
+ 
+ 
+ /** The least column height that fits a run into n columns. */
+-static int multicol_balance(const struct multicol_ctx *m, unsigned int a,
++static int multicol_balance(struct multicol_ctx *m, unsigned int a,
+ 		unsigned int b, int n, int col_step)
+ {
+ 	unsigned int i;
+@@ -463,6 +504,151 @@ static bool multicol_span(struct box *box, struct box *c, int y,
+ }
+ 
+ 
++/** The fragment a point in the single column was in, or the last one
++ * above it; -1 for none. */
++static int multicol_frag_at(const struct multicol_ctx *m, unsigned int a,
++		unsigned int b, int y)
++{
++	unsigned int i;
++	int best = -1;
++
++	for (i = a; i < b; i++) {
++		if (!m->frag[i].placed)
++			continue;
++		if (m->frag[i].top <= y) {
++			best = (int) i;
++			if (y < m->frag[i].bottom)
++				break;
++		}
++	}
++	return best;
++}
++
++
++/**
++ * Move the floats with the content they were placed beside. A float is
++ * a child of the block its line is in, but placed against the block
++ * formatting context, the multi-column box, and so it did not move with
++ * the line.
++ */
++static void multicol_floats(struct multicol_ctx *m, struct box *box)
++{
++	struct box *f;
++
++	for (f = box->float_children; f != NULL; f = f->next_float) {
++		int i = multicol_frag_at(m, 0, m->n_frag, f->y);
++
++		if (i < 0)
++			continue;
++		f->x += m->frag[i].dx;
++		f->y += m->frag[i].dy;
++	}
++}
++
++
++/** Whether a block paints anything of its own: a background or a
++ * border. */
++static bool multicol_decorated(const struct box *b)
++{
++	css_color c = 0;
++	lwc_string *img = NULL;
++
++	if (b->style == NULL)
++		return false;
++	if (b->border[LEFT].width > 0 || b->border[RIGHT].width > 0 ||
++			b->border[TOP].width > 0 ||
++			b->border[BOTTOM].width > 0)
++		return true;
++	if (css_computed_background_color(b->style, &c) ==
++			CSS_BACKGROUND_COLOR_COLOR && (c >> 24) != 0)
++		return true;
++	return css_computed_background_image(b->style, &img) ==
++			CSS_BACKGROUND_IMAGE_IMAGE && img != NULL;
++}
++
++
++static void multicol_piece_add(html_content *c, struct box *b, int dx,
++		int y0, int y1, bool last)
++{
++	struct html_multicol_piece *p;
++
++	if (c->n_mc_pieces == c->mc_pieces_alloc) {
++		unsigned int alloc = c->mc_pieces_alloc ?
++				c->mc_pieces_alloc * 2 : 16;
++		struct html_multicol_piece *n = realloc(c->mc_pieces,
++				alloc * sizeof(*n));
++
++		if (n == NULL)
++			return;
++		c->mc_pieces = n;
++		c->mc_pieces_alloc = alloc;
++	}
++	p = &c->mc_pieces[c->n_mc_pieces++];
++	p->box = b;
++	p->dx = dx;
++	p->y0 = y0;
++	p->y1 = y1;
++	p->last = last;
++	b->flags |= MULTICOL_PIECES;
++}
++
++
++/**
++ * Note the pieces of the blocks split across columns: for each block
++ * with a background or a border, each run of its fragments that went
++ * to a column after the one it began in.
++ */
++static void multicol_pieces(struct multicol_ctx *m, html_content *content)
++{
++	unsigned int i, j, n;
++
++	for (i = 0; i < m->n_cut; i++) {
++		struct multicol_cut *cut = &m->cut[i];
++		struct box *b = cut->box;
++		int dx0, dy0;
++
++		/* a box laid out again forgets the pieces it had */
++		if (b->flags & MULTICOL_PIECES) {
++			for (j = 0, n = 0; j < content->n_mc_pieces; j++) {
++				if (content->mc_pieces[j].box != b)
++					content->mc_pieces[n++] =
++						content->mc_pieces[j];
++			}
++			content->n_mc_pieces = n;
++			b->flags &= ~MULTICOL_PIECES;
++		}
++		if (b->type != BOX_BLOCK || cut->start >= cut->end ||
++				!multicol_decorated(b))
++			continue;
++
++		/* the box stays where its first fragment went */
++		dx0 = m->frag[cut->start].dx;
++		dy0 = m->frag[cut->start].dy;
++		j = cut->start;
++		while (j < cut->end) {
++			int dx = m->frag[j].dx, dy = m->frag[j].dy;
++			int top = m->frag[j].top + dy;
++			int bottom = m->frag[j].bottom + dy;
++			unsigned int k;
++
++			for (k = j + 1; k < cut->end &&
++					m->frag[k].dx == dx &&
++					m->frag[k].dy == dy; k++) {
++				if (m->frag[k].bottom + dy > bottom)
++					bottom = m->frag[k].bottom + dy;
++			}
++			if (dx != dx0 || dy != dy0) {
++				multicol_piece_add(content, b, dx,
++						top - cut->origin,
++						bottom - cut->origin,
++						k == cut->end);
++			}
++			j = k;
++		}
++	}
++}
++
++
+ /* exported interface documented in html/layout_internal.h */
+ bool layout_multicol(struct box *box, int viewport_height,
+ 		html_content *content)
+@@ -473,6 +659,25 @@ bool layout_multicol(struct box *box, int viewport_height,
+ 	unsigned int i;
+ 	bool ok, spans = false;
+ 
++	/* what an earlier layout of this box split is split again, or
++	 * not, from scratch */
++	if (content->n_mc_pieces > 0) {
++		unsigned int j, k = 0;
++
++		for (j = 0; j < content->n_mc_pieces; j++) {
++			struct box *b = content->mc_pieces[j].box;
++
++			while (b != NULL && b != box)
++				b = b->parent;
++			if (b == NULL)
++				content->mc_pieces[k++] = content->mc_pieces[j];
++			else
++				content->mc_pieces[j].box->flags &=
++						~MULTICOL_PIECES;
++		}
++		content->n_mc_pieces = k;
++	}
++
+ 	if (!layout_multicol_columns(&content->unit_len_ctx, box,
+ 			box->width, &n, &colw, &gap)) {
+ 		return layout_block_context_single(box, viewport_height,
+@@ -553,7 +758,10 @@ bool layout_multicol(struct box *box, int viewport_height,
+ 	/* the boxes that were cut up take only what is left in them,
+ 	 * innermost first */
+ 	for (i = m.n_cut; i-- > 0; )
+-		multicol_shrink(m.cut[i]);
++		multicol_shrink(m.cut[i].box);
++
++	multicol_floats(&m, box);
++	multicol_pieces(&m, content);
+ 
+ 	if (height_spec == AUTO) {
+ 		/* the tallest column, and whatever margin followed the
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 49026f35d..3f3f2f7fb 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -321,6 +321,11 @@ typedef struct html_content {
+ 
+ 	/** The containers' sizes at the last layout, for @container, and
+ 	 * whether a container query has asked about one (VitaSurf) */
++	/** the pieces of the blocks split across columns, in the
++	 * columns after the first, which are painted with each block's
++	 * background and side borders (VitaSurf) */
++	struct html_multicol_piece *mc_pieces;
++	unsigned int n_mc_pieces, mc_pieces_alloc;
+ 	struct html_container_size *csizes;
+ 	unsigned n_csizes;
+ 	bool containers_asked;
+@@ -575,6 +580,15 @@ void html_animation_note(struct html_content *c, struct dom_node *node);
+ uint8_t html_container_lookup(struct html_content *c, struct dom_node *node,
+ 		lwc_string *name, css_fixed *width, css_fixed *height);
+ 
++/** A block's piece in a later column (VitaSurf): its offset across, and
++ * the part of its height there, from its padding box's top. */
++struct html_multicol_piece {
++	struct box *box;
++	int dx;
++	int y0, y1;
++	bool last;	/**< the block ends in this piece */
++};
++
+ /** Let the counters box construction kept go (VitaSurf). */
+ void html_counters_clear(struct html_content *c);
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 45e4e84f3..fdf639e74 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -30,6 +30,7 @@
+ 
+ #include "utils/config.h"
+ #include <assert.h>
++#include <limits.h>
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -170,6 +171,8 @@ static struct box *html_redraw_find_bg_box(struct box *box)
+  * set by html_redraw_text_box around its calls to text_redraw.
+  */
+ static bool text_redraw_rtl = false;
++/** unicode-bidi: bidi-override on the text's element (VitaSurf) */
++static bool text_redraw_override = false;
+ 
+ static bool
+ text_redraw(const char *utf8_text,
+@@ -196,8 +199,15 @@ text_redraw(const char *utf8_text,
+ 	/* right-to-left text in the order it is seen, Arabic joined
+ 	 * (VitaSurf). The selection's offsets are into the text as it
+ 	 * was written, so reordered text is drawn unhighlighted. */
+-	visual_len = html_bidi_visual(utf8_text, utf8_len, text_redraw_rtl,
+-			&visual);
++	/* bdo and unicode-bidi: bidi-override set the characters in the
++	 * direction whatever they are: right to left reversed, left to
++	 * right as written */
++	if (text_redraw_override)
++		visual_len = text_redraw_rtl ? html_bidi_override(utf8_text,
++				utf8_len, &visual) : 0;
++	else
++		visual_len = html_bidi_visual(utf8_text, utf8_len,
++				text_redraw_rtl, &visual);
+ 	if (visual_len > 0) {
+ 		utf8_text = visual;
+ 		utf8_len = visual_len;
+@@ -1751,15 +1761,22 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 			&fstyle);
+ 	fstyle.background = current_background_color;
+ 
+-	/* the direction of the block the text is in (VitaSurf): a text
+-	 * box's parent is its inline container, whose parent is it */
+-	text_redraw_rtl = box->parent != NULL && box->parent->parent != NULL &&
+-			box->parent->parent->style != NULL &&
+-			css_computed_direction(box->parent->parent->style) ==
+-					CSS_DIRECTION_RTL;
++	/* the text's direction (VitaSurf): its element's, which is the
++	 * block's unless an inline element it is in set one of its own */
++	text_redraw_rtl = box->style != NULL ?
++			css_computed_direction(box->style) ==
++					CSS_DIRECTION_RTL :
++			(box->parent != NULL && box->parent->parent != NULL &&
++			 box->parent->parent->style != NULL &&
++			 css_computed_direction(box->parent->parent->style) ==
++					CSS_DIRECTION_RTL);
++	text_redraw_override = box->style != NULL &&
++			css_computed_unicode_bidi(box->style) ==
++					CSS_UNICODE_BIDI_BIDI_OVERRIDE;
+ 	ok = html_redraw_text_box_runs(html, box, x, y, clip, scale,
+ 			current_background_color, ctx, excluded, &fstyle);
+ 	text_redraw_rtl = false;
++	text_redraw_override = false;
+ 	return ok;
+ }
+ 
+@@ -3823,7 +3840,8 @@ static int html_sticky_offset_x(const html_content *html, struct box *box,
+  * goes under the context's in-flow content: on a page that has one, a
+  * context looks ahead through its descendants for them when it starts
+  * and paints them once its own background is down. One inside a box
+- * that clips, or inside a float, is painted where it stands.
++ * that clips is clipped by it there, and one inside a float is found
++ * through the block the float is painted from.
+  *
+  * A box that pushes a filter, an opacity or a transform in front of
+  * the plotters starts a stacking context of its own, as CSS says it
+@@ -3837,6 +3855,10 @@ struct html_z_entry {
+ 	struct redraw_context ctx;
+ 	int32_t z;
+ 	uint32_t seq;
++	/** a negative one found inside a box that clips: \a clip is
++	 * the padding boxes it is inside, in CSS px from where they were
++	 * found (VitaSurf) */
++	bool clipped;
+ };
+ 
+ struct html_z_list {
+@@ -3859,6 +3881,10 @@ struct html_z_list {
+ static struct html_z_list html_z_stack[HTML_Z_DEPTH];
+ static unsigned html_z_depth;
+ static struct html_z_list *html_z_top;
++/** A split block's real bottom padding and border, which its first part
++ * is painted without (VitaSurf). */
++static int html_mc_padding_bottom, html_mc_border_bottom;
++
+ /** the set-aside box being painted now, which is not set aside again */
+ static struct box *html_z_painting;
+ 
+@@ -5205,66 +5231,118 @@ static bool html_z_own_context(const html_content *html,
+ 
+ /**
+  * Find the negative z-index boxes a stacking context paints first
+- * (VitaSurf): its descendants, not those of a context inside it, a box
+- * that clips, or a float. \a bx and \a by are where the children of
+- * \a b are painted from, as html_redraw_box_children gives them.
++ * (VitaSurf): its descendants, not those of a context inside it. \a bx
++ * and \a by are where the children of \a b are painted from, as
++ * html_redraw_box_children gives them; \a clip, if not NULL, is what
++ * the boxes that clip on the way down leave, in the same CSS px.
+  */
++static void html_z_scan_one(const html_content *html, struct html_z_list *l,
++		struct box *c, int bx, int by, int depth,
++		const struct rect *clip);
++
+ static void html_z_scan(const html_content *html, struct html_z_list *l,
+-		struct box *b, int bx, int by, int depth)
++		struct box *b, int bx, int by, int depth,
++		const struct rect *clip)
+ {
+ 	struct box *c;
+ 
+ 	if (depth > 64)
+ 		return;
+ 	for (c = b->children; c != NULL; c = c->next) {
+-		int32_t z = 0;
+-
+ 		if (c->type == BOX_FLOAT_LEFT || c->type == BOX_FLOAT_RIGHT)
+ 			continue;
+-		if (c->style != NULL) {
+-			if (css_computed_position(c->style) !=
+-					CSS_POSITION_STATIC &&
+-					css_computed_position(c->style) !=
+-					CSS_POSITION_FIXED &&
+-					css_computed_z_index(c->style, &z) ==
+-					CSS_Z_INDEX_SET && z < 0 &&
+-					c->type != BOX_INLINE &&
+-					c->type != BOX_TEXT) {
+-				struct html_z_entry *e;
+-
+-				if (l->n_neg == l->neg_alloc) {
+-					unsigned grown = l->neg_alloc > 0 ?
+-							l->neg_alloc * 2 : 8;
+-					struct html_z_entry *ne = realloc(
+-							l->neg, grown *
+-							sizeof(*ne));
+-
+-					if (ne == NULL)
+-						return;	/* in place */
+-					l->neg = ne;
+-					l->neg_alloc = grown;
+-				}
+-				e = &l->neg[l->n_neg];
+-				e->box = c;
+-				e->x_parent = bx;
+-				e->y_parent = by;
+-				e->z = z;
+-				e->seq = l->n_neg++;
+-				c->flags |= Z_NEG_ASIDE;
+-				continue;
++		html_z_scan_one(html, l, c, bx, by, depth, clip);
++	}
++	/* floats are painted from the block they float in, as are theirs */
++	for (c = b->float_children; c != NULL; c = c->next_float)
++		html_z_scan_one(html, l, c, bx, by, depth, clip);
++}
++
++static void html_z_scan_one(const html_content *html, struct html_z_list *l,
++		struct box *c, int bx, int by, int depth,
++		const struct rect *clip)
++{
++	struct rect inner;
++	int32_t z = 0;
++
++	if (c->style != NULL) {
++		enum css_overflow_e ox, oy;
++
++		if (css_computed_position(c->style) != CSS_POSITION_STATIC &&
++				css_computed_position(c->style) !=
++				CSS_POSITION_FIXED &&
++				css_computed_z_index(c->style, &z) ==
++				CSS_Z_INDEX_SET && z < 0 &&
++				c->type != BOX_INLINE &&
++				c->type != BOX_TEXT) {
++			struct html_z_entry *e;
++
++			if (l->n_neg == l->neg_alloc) {
++				unsigned grown = l->neg_alloc > 0 ?
++						l->neg_alloc * 2 : 8;
++				struct html_z_entry *ne = realloc(l->neg,
++						grown * sizeof(*ne));
++
++				if (ne == NULL)
++					return;	/* in place */
++				l->neg = ne;
++				l->neg_alloc = grown;
+ 			}
+-			if (html_z_own_context(html, c) ||
+-					box_overflow_x(c) !=
+-						CSS_OVERFLOW_VISIBLE ||
+-					box_overflow_y(c) !=
+-						CSS_OVERFLOW_VISIBLE)
+-				continue;
++			e = &l->neg[l->n_neg];
++			e->box = c;
++			e->x_parent = bx;
++			e->y_parent = by;
++			e->z = z;
++			e->seq = l->n_neg++;
++			e->clipped = clip != NULL;
++			if (clip != NULL)
++				e->clip = *clip;
++			c->flags |= Z_NEG_ASIDE;
++			return;
++		}
++		if (html_z_own_context(html, c))
++			return;
++
++		/* a box that clips its children, as
++		 * html_redraw_box_inner does, to its padding box */
++		ox = box_overflow_x(c);
++		oy = box_overflow_y(c);
++		if (c->object != NULL || (c->flags & IFRAME))
++			return;
++		if ((ox != CSS_OVERFLOW_VISIBLE ||
++				oy != CSS_OVERFLOW_VISIBLE) &&
++				(c->type == BOX_BLOCK ||
++				 c->type == BOX_INLINE_BLOCK ||
++				 c->type == BOX_TABLE_CELL)) {
++			if (clip != NULL) {
++				inner = *clip;
++			} else {
++				inner.x0 = inner.y0 = INT_MIN / 2;
++				inner.x1 = inner.y1 = INT_MAX / 2;
++			}
++			if (ox != CSS_OVERFLOW_VISIBLE) {
++				int x0 = bx + c->x;
++				int x1 = x0 + c->padding[LEFT] + c->width +
++						c->padding[RIGHT];
++
++				if (inner.x0 < x0) inner.x0 = x0;
++				if (inner.x1 > x1) inner.x1 = x1;
++			}
++			if (oy != CSS_OVERFLOW_VISIBLE) {
++				int y0 = by + c->y;
++				int y1 = y0 + c->padding[TOP] + c->height +
++						c->padding[BOTTOM];
++
++				if (inner.y0 < y0) inner.y0 = y0;
++				if (inner.y1 > y1) inner.y1 = y1;
++			}
++			clip = &inner;
+ 		}
+-		html_z_scan(html, l, c,
+-				bx + c->x - scrollbar_get_offset(c->scroll_x),
+-				by + c->y - scrollbar_get_offset(c->scroll_y),
+-				depth + 1);
+ 	}
++	html_z_scan(html, l, c,
++			bx + c->x - scrollbar_get_offset(c->scroll_x),
++			by + c->y - scrollbar_get_offset(c->scroll_y),
++			depth + 1, clip);
+ }
+ 
+ /**
+@@ -5292,12 +5370,34 @@ static bool html_z_paint_negatives(const html_content *html,
+ 	for (i = 0; i < l->n_neg; i++) {
+ 		struct box *was = html_z_painting;
+ 
++		const struct rect *use = clip;
++		struct rect r;
++
++		if (l->neg[i].clipped) {
++			/* the clip of the boxes it is inside, where they
++			 * are painted now, within the context's */
++			r.x0 = (l->neg[i].clip.x0 + dx) * scale;
++			r.y0 = (l->neg[i].clip.y0 + dy) * scale;
++			r.x1 = (l->neg[i].clip.x1 + dx) * scale;
++			r.y1 = (l->neg[i].clip.y1 + dy) * scale;
++			if (r.x0 < clip->x0) r.x0 = clip->x0;
++			if (r.y0 < clip->y0) r.y0 = clip->y0;
++			if (r.x1 > clip->x1) r.x1 = clip->x1;
++			if (r.y1 > clip->y1) r.y1 = clip->y1;
++			if (r.x1 <= r.x0 || r.y1 <= r.y0)
++				continue;
++			if (ctx->plot->clip(ctx, &r) != NSERROR_OK)
++				return false;
++			use = &r;
++		}
+ 		html_z_painting = l->neg[i].box;
+ 		ok &= html_redraw_box(html, l->neg[i].box,
+ 				l->neg[i].x_parent + dx,
+ 				l->neg[i].y_parent + dy,
+-				clip, scale, bg, ctx);
++				use, scale, bg, ctx);
+ 		html_z_painting = was;
++		if (use != clip && ctx->plot->clip(ctx, clip) != NSERROR_OK)
++			return false;
+ 	}
+ 	return ok;
+ }
+@@ -5321,6 +5421,34 @@ static void html_z_neg_release(struct html_z_list *l)
+  * opacity at all paints nothing. The drawing itself is
+  * html_redraw_box_inner().
+  */
++/**
++ * Whether a box is turned to face away from the reader (VitaSurf): the
++ * transforms of it and its ancestors, projected onto the page, mirror
++ * it an odd number of times, as rotateY(180deg) does. One turned edge
++ * on is not seen either.
++ */
++static bool html_faces_away(const html_content *html, const struct box *box)
++{
++	const struct box *b;
++	bool away = false;
++
++	for (b = box; b != NULL; b = b->parent) {
++		float m[4];
++		int ox, oy;
++		float d;
++
++		if (b->style == NULL || !box_transform(&html->unit_len_ctx,
++				b, m, &ox, &oy))
++			continue;
++		d = m[0] * m[3] - m[1] * m[2];
++		if (d > -0.0001f && d < 0.0001f)
++			return true;
++		if (d < 0)
++			away = !away;
++	}
++	return away;
++}
++
+ bool html_redraw_box(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+@@ -5346,6 +5474,12 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 			current_background_color, ctx))
+ 		return true;
+ 
++	/* backface-visibility: hidden on a box turned away (VitaSurf) */
++	if (box->style != NULL && css_computed_backface_visibility(
++			box->style) == CSS_BACKFACE_VISIBILITY_HIDDEN &&
++			html_faces_away(html, box))
++		return true;
++
+ 	/* a box cut to a clip-path circle or ellipse (VitaSurf) */
+ 	if (html_redraw_clip_shape(html, box, x_parent, y_parent, clip, scale,
+ 			current_background_color, ctx, &ok))
+@@ -5441,7 +5575,7 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 				x_parent + box->x -
+ 				scrollbar_get_offset(box->scroll_x),
+ 				y_parent + box->y -
+-				scrollbar_get_offset(box->scroll_y), 0);
++				scrollbar_get_offset(box->scroll_y), 0, NULL);
+ 	} else if (context) {
+ 		/* too deep: its descendants are painted where they stand */
+ 		html_z_top = NULL;
+@@ -5457,8 +5591,24 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		box->height = t;
+ 	}
+ 
+-	ok = html_redraw_box_inner(html, box, x_parent, y_parent, clip, scale,
+-			current_background_color, ctx);
++	if (box->flags & MULTICOL_PIECES) {
++		/* a block split across columns ends in its last piece, so
++		 * its first part has no bottom edge (VitaSurf) */
++		int pb = box->padding[BOTTOM];
++		int bb = box->border[BOTTOM].width;
++
++		box->padding[BOTTOM] = 0;
++		box->border[BOTTOM].width = 0;
++		html_mc_padding_bottom = pb;
++		html_mc_border_bottom = bb;
++		ok = html_redraw_box_inner(html, box, x_parent, y_parent,
++				clip, scale, current_background_color, ctx);
++		box->padding[BOTTOM] = pb;
++		box->border[BOTTOM].width = bb;
++	} else {
++		ok = html_redraw_box_inner(html, box, x_parent, y_parent,
++				clip, scale, current_background_color, ctx);
++	}
+ 
+ 	if (vertical) {
+ 		int t = box->width;
+@@ -5489,6 +5639,84 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	return ok;
+ }
+ 
++/**
++ * Paint a block's pieces in the columns after the one it began in
++ * (VitaSurf): its background and side borders over each, with its
++ * bottom border on the last, as if it were cut there with
++ * box-decoration-break: slice. The box's geometry is changed to each
++ * piece's while it is painted, and put back.
++ */
++static bool html_redraw_multicol_pieces(const html_content *html,
++		struct box *box, int x_parent, int y_parent,
++		const struct rect *clip, float scale,
++		colour current_background_color,
++		const struct redraw_context *ctx)
++{
++	unsigned int i;
++	bool ok = true;
++
++	for (i = 0; i < html->n_mc_pieces && ok; i++) {
++		const struct html_multicol_piece *pc = &html->mc_pieces[i];
++		int sx = box->x, sy = box->y, sh = box->height;
++		int spt = box->padding[TOP], spb = box->padding[BOTTOM];
++		int sbt = box->border[TOP].width;
++		int sbb = box->border[BOTTOM].width;
++		int x, y, pw, ph, bl, br, bb;
++		struct rect border_box, p;
++		colour bgc = current_background_color;
++
++		if (pc->box != box)
++			continue;
++		box->x += pc->dx;
++		box->y += pc->y0;
++		box->height = pc->y1 - pc->y0;
++		box->padding[TOP] = 0;
++		box->border[TOP].width = 0;
++		box->padding[BOTTOM] = pc->last ? html_mc_padding_bottom : 0;
++		box->border[BOTTOM].width = pc->last ?
++				html_mc_border_bottom : 0;
++		if (box->height < 0)
++			box->height = 0;
++
++		x = (x_parent + box->x) * scale;
++		y = (y_parent + box->y) * scale;
++		pw = (box->padding[LEFT] + box->width +
++				box->padding[RIGHT]) * scale;
++		ph = (box->height + box->padding[BOTTOM]) * scale;
++		bl = box->border[LEFT].width * scale;
++		br = box->border[RIGHT].width * scale;
++		bb = box->border[BOTTOM].width * scale;
++		border_box.x0 = x - bl;
++		border_box.y0 = y;
++		border_box.x1 = x + pw + br;
++		border_box.y1 = y + ph + bb;
++		p = border_box;
++		if (p.x0 < clip->x0) p.x0 = clip->x0;
++		if (p.y0 < clip->y0) p.y0 = clip->y0;
++		if (p.x1 > clip->x1) p.x1 = clip->x1;
++		if (p.y1 > clip->y1) p.y1 = clip->y1;
++		if (p.x0 < p.x1 && p.y0 < p.y1) {
++			ok = html_redraw_background(x, y, box, scale, &p,
++					&bgc, box, &border_box,
++					&html->unit_len_ctx, ctx) &&
++				ctx->plot->clip(ctx, clip) == NSERROR_OK;
++			if (ok && (bl || br || bb))
++				ok = html_redraw_borders(box, x_parent,
++						y_parent, pw, ph, clip, scale,
++						&html->unit_len_ctx, ctx);
++		}
++
++		box->x = sx;
++		box->y = sy;
++		box->height = sh;
++		box->padding[TOP] = spt;
++		box->padding[BOTTOM] = spb;
++		box->border[TOP].width = sbt;
++		box->border[BOTTOM].width = sbb;
++	}
++	return ok;
++}
++
+ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+@@ -6010,6 +6238,13 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		}
+ 	}
+ 
++	/* a block split across columns, in the columns after its first */
++	if ((box->flags & MULTICOL_PIECES) &&
++			!html_redraw_multicol_pieces(html, box, x_parent,
++				y_parent, &r, scale, current_background_color,
++				ctx))
++		return false;
++
+ 	/*
+ 	 * The outline (VitaSurf): a ring outside the border box, or as far
+ 	 * outside it as outline-offset says (inside it, for a negative
+diff --git a/resources/default.css b/resources/default.css
+index 344d6d690..d15b10b3e 100644
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -174,6 +174,11 @@ input[type=hidden] { display: none; }
+  * inherit, as nothing here looks at the text to decide. */
+ [dir="rtl"], [dir="RTL"] { direction: rtl; }
+ [dir="ltr"], [dir="LTR"] { direction: ltr; }
++/* an element with a direction of its own is embedded in its line, and
++ * bdo sets its characters in that direction whatever they are */
++[dir] { unicode-bidi: embed; }
++bdo, bdo[dir] { unicode-bidi: bidi-override; }
++bdi { unicode-bidi: embed; }
+ 
+ /* Lists count their items on the list-item counter (VitaSurf) */
+ ol, ul, menu { counter-reset: list-item; }

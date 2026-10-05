@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<!-- What _wants() decides: which observer, if any, a mutation belongs to.
+     The match walks the target's ancestors, so the cases that matter are
+     depth (subtree on and off), the four kinds, an attribute filter, old
+     values, several watch entries on one observer, and a mutation that
+     belongs to nobody. -->
+<html><head><meta charset="utf-8"><title>MutationObserver matching</title></head>
+<body>
+<div id="a"><div id="a1"><span id="a2">t</span></div></div>
+<div id="b"><span id="b1">t</span></div>
+<div id="c"></div>
+<script>
+var log = [];
+function ok(name, cond) { console.log((cond ? "PASS " : "FAIL ") + name); }
+function el(id) { return document.getElementById(id); }
+
+function collect(target, opts, act, done) {
+  var seen = [];
+  var mo = new MutationObserver(function (recs) {
+    for (var i = 0; i < recs.length; i++) seen.push(recs[i]);
+  });
+  if (target) mo.observe(target, opts);
+  act(mo);
+  Promise.resolve().then(function () {
+    setTimeout(function () { mo.disconnect(); done(seen); }, 0);
+  });
+}
+
+/* 1. an attribute change on the watched node itself */
+collect(el("a"), { attributes: true }, function () {
+  el("a").setAttribute("data-one", "1");
+}, function (seen) {
+  ok("attribute on the watched node", seen.length === 1 &&
+     seen[0].type === "attributes" && seen[0].attributeName === "data-one" &&
+     seen[0].target === el("a"));
+
+  /* 2. a descendant, with subtree off, belongs to nobody */
+  collect(el("a"), { attributes: true }, function () {
+    el("a2").setAttribute("data-two", "2");
+  }, function (seen2) {
+    ok("descendant ignored without subtree", seen2.length === 0);
+
+    /* 3. the same descendant, with subtree on */
+    collect(el("a"), { attributes: true, subtree: true }, function () {
+      el("a2").setAttribute("data-three", "3");
+    }, function (seen3) {
+      ok("descendant seen with subtree", seen3.length === 1 &&
+         seen3[0].target === el("a2"));
+
+      /* 4. an attribute filter keeps the others out */
+      collect(el("b"), { attributes: true, attributeFilter: ["data-keep"] },
+        function () {
+          el("b").setAttribute("data-drop", "x");
+          el("b").setAttribute("data-keep", "y");
+        }, function (seen4) {
+          ok("attributeFilter keeps only its own", seen4.length === 1 &&
+             seen4[0].attributeName === "data-keep");
+
+          /* 5. childList on the watched node */
+          collect(el("c"), { childList: true }, function () {
+            el("c").appendChild(document.createElement("i"));
+          }, function (seen5) {
+            ok("childList on the watched node", seen5.length === 1 &&
+               seen5[0].type === "childList" &&
+               seen5[0].addedNodes.length === 1);
+
+            /* 6. an attribute change is not a childList record */
+            collect(el("c"), { childList: true }, function () {
+              el("c").setAttribute("data-four", "4");
+            }, function (seen6) {
+              ok("attributes ignored by a childList watch",
+                 seen6.length === 0);
+
+              /* 7. one observer watching two roots sees both */
+              var seen7 = [];
+              var mo7 = new MutationObserver(function (r) {
+                for (var i = 0; i < r.length; i++) seen7.push(r[i]);
+              });
+              mo7.observe(el("a"), { attributes: true, subtree: true });
+              mo7.observe(el("b"), { attributes: true, subtree: true });
+              el("a2").setAttribute("data-five", "5");
+              el("b1").setAttribute("data-six", "6");
+              el("c").setAttribute("data-seven", "7");
+              setTimeout(function () {
+                mo7.disconnect();
+                ok("two watched roots, both seen and the third not",
+                   seen7.length === 2 &&
+                   seen7[0].target === el("a2") &&
+                   seen7[1].target === el("b1"));
+
+                /* 8. attributeOldValue reports what was there */
+                el("c").setAttribute("data-old", "before");
+                collect(el("c"), { attributes: true, attributeOldValue: true },
+                  function () {
+                    el("c").setAttribute("data-old", "after");
+                  }, function (seen8) {
+                    ok("attributeOldValue", seen8.length === 1 &&
+                       seen8[0].oldValue === "before");
+
+                    /* 9. characterData on a descendant text node */
+                    collect(el("b"), { characterData: true, subtree: true },
+                      function () {
+                        el("b1").firstChild.data = "changed";
+                      }, function (seen9) {
+                        ok("characterData in the subtree",
+                           seen9.length === 1 &&
+                           seen9[0].type === "characterData");
+                        console.log("MO DONE");
+                      });
+                  });
+              }, 0);
+            });
+          });
+        });
+    });
+  });
+});
+</script>
+</body></html>

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!-- A script put in the document with neither text nor a src runs when
+     it gets one: it never ran at all. Once it has run, more text or
+     another src does nothing, and a script written with innerHTML never
+     runs. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var runs = 0, late = 0;
+var s = document.createElement('script');
+document.body.appendChild(s);
+ok("an empty script does not run (" + runs + ")", runs === 0);
+s.appendChild(document.createTextNode('runs++;'));
+ok("it runs when it gets its text (" + runs + ")", runs === 1);
+s.appendChild(document.createTextNode('runs++;'));
+s.text = 'runs++;';
+ok("and not again when the text changes (" + runs + ")", runs === 1);
+var x = document.createElement('div');
+x.innerHTML = '<script>runs += 100;<\/script>';
+document.body.appendChild(x);
+ok("one written with innerHTML does not run (" + runs + ")", runs === 1);
+var e = document.createElement('script');
+document.body.appendChild(e);
+e.src = 'resources/late-script.js';
+window.addEventListener('load', function () {
+ ok("an empty script given a src fetches and runs it (" + typeof window.__late + ")", typeof window.__late === 'object');
+});
+</script></body></html>

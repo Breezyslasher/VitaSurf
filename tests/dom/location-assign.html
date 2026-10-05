@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!-- Assigning to location itself is how a great many pages redirect,
+     and it used to do nothing here: location was a plain property, so
+     "window.location = url" replaced the object with a string and the
+     page sat where it was. A PHP page titled REDIR did exactly that.
+
+     Navigating for real would end the test, so this checks the shape
+     the fix depends on rather than the navigation: that location is an
+     accessor, that assigning a string does not replace it, and that
+     the object's own members still work. -->
+<html><head><meta charset="utf-8"><title>location assignment</title></head>
+<body>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+
+var d = Object.getOwnPropertyDescriptor(window, "location");
+ok("window.location is an accessor, not a plain value",
+   d != null && typeof d.set === "function");
+
+var dd = Object.getOwnPropertyDescriptor(document, "location");
+ok("document.location is one too",
+   dd != null && typeof dd.set === "function");
+
+/* the object itself must survive a read */
+ok("location is still an object", typeof window.location === "object");
+ok("and still answers href", typeof window.location.href === "string");
+ok("and still has assign and replace",
+   typeof window.location.assign === "function" &&
+   typeof window.location.replace === "function");
+
+/* assigning the object back to itself must not be read as a URL, which
+   is what "location = location" does in the wild */
+window.location = window.location;
+ok("assigning location to itself leaves it an object",
+   typeof window.location === "object");
+ok("and leaves href readable", typeof window.location.href === "string");
+
+console.log("LOCATION DONE");
+</script>
+</body></html>

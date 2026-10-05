@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<!-- A page scrolled to a #fragment stays on the fragment through
+     relayouts, until the view is scrolled somewhere else; from then on a
+     relayout keeps what is in view instead of going back to it. -->
+<html><head><title>scroll anchoring fragment</title>
+<style>
+body { margin: 0; }
+p { height: 100px; margin: 0; }
+</style></head><body>
+<div id="top"></div>
+<script>
+for (var i = 0; i < 60; i++) {
+  var p = document.createElement('p');
+  p.id = 'p' + i;
+  p.textContent = 'paragraph ' + i;
+  document.body.appendChild(p);
+}
+function ok(n, c) { console.log((c ? "PASS " : "FAIL ") + n); }
+function topOf(id) { return Math.round(document.getElementById(id).getBoundingClientRect().top); }
+function grow(h) {
+  var d = document.createElement('div');
+  d.style.height = h + 'px';
+  document.getElementById('top').appendChild(d);
+}
+var steps = [
+  function () { location.hash = '#p20'; },
+  function () {
+    ok("on the fragment (" + window.scrollY + ")", window.scrollY === 2000);
+    grow(300);
+  },
+  function () {
+    ok("still on the fragment after growth (" + topOf('p20') + ")", topOf('p20') === 0);
+    window.scrollTo(0, 1000);
+  },
+  function () {
+    var at = topOf('p7');
+    grow(200);
+    setTimeout(function () {
+      ok("scrolled away: view kept p7 (" + at + " -> " + topOf('p7') + ")", topOf('p7') === at);
+      ok("and did not go back to the fragment (" + topOf('p20') + ")", topOf('p20') !== 0);
+      console.log("done");
+    }, 150);
+  }
+];
+var n = 0;
+function next() { if (n < steps.length) { steps[n++](); setTimeout(next, 150); } }
+window.addEventListener('load', function () { setTimeout(next, 100); });
+</script></body></html>

@@ -1,0 +1,13 @@
+<!doctype html><head><style>
+body{margin:0}
+.g{display:grid;width:100px;--row-size:2;grid-template-rows: repeat(calc(2*var(--row-size,1)), 10px);row-gap: calc(20px / (var(--row-size,1) + 0));}
+.g div{background:#ccc}
+#s{grid-row: 1 / calc(var(--row-size,1) + 1);}
+</style></head><body>
+<div class=g id=g><div id=s>a</div><div id=t>b</div><div id=u>c</div></div>
+<!-- Custom properties are substituted before a declaration is parsed, so
+     Bubble Card's repeat(calc(2*var(--row-size,1)), ...), its
+     grid-row: 1 / calc(var(--row-size,1) + 1) and a row-gap divided by
+     (var(--row-size,1) + 0) arrive as arithmetic, and all three were
+     dropped. Expected: s top 0 h 30, t top 40, u top 60, grid h 70. -->
+<script>window.onload=function(){setTimeout(function(){var g=document.getElementById('g').getBoundingClientRect();['s','t','u'].forEach(function(id){var r=document.getElementById(id).getBoundingClientRect();console.log('H '+id+' top '+Math.round(r.top-g.top)+' h '+Math.round(r.height))});console.log('H grid h '+Math.round(g.height))},200)}</script></body>

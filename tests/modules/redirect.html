@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<!-- A module import answered with a redirect, as unpkg answers a version
+     range. redirect-server.py serves this page and redirects
+     /lib@%5E1.0/x.js to /lib@1.2/x.js; a.js imports ./b.js and ./c.js.
+     The module arrives once, is known by where it ended up, and is the
+     same module by either URL. See README.md for how to run it. -->
+<html><head><title>module redirect</title></head><body>
+<script type="module">
+import { v, meta } from '/lib@%5E1.0/a.js';
+import { id as id1 } from '/lib@1.2/b.js';
+import { id as id2 } from '/lib@%5E1.0/b.js';
+function ok(n, c) { console.log((c ? "PASS " : "FAIL ") + n); }
+ok("the redirected module ran (" + v + ")", v === 'abc');
+ok("import.meta.url is where it ended up (" + meta + ")", /\/lib@1\.2\/a\.js$/.test(meta));
+ok("one module whichever URL imports it", id1 === id2);
+fetch('/hits').then(function (r) { return r.text(); }).then(function (t) {
+  var h = eval('(' + t.replace(/'/g, '"') + ')');
+  ok("the redirect was followed once (" + h['/lib@%5E1.0/a.js'] + ")", h['/lib@%5E1.0/a.js'] === 1);
+  ok("the module was fetched once (" + h['/lib@1.2/a.js'] + ")", h['/lib@1.2/a.js'] === 1);
+  ok("its relative import resolved where it ended up (" + (h['/lib@%5E1.0/c.js'] || 0) + ", " + h['/lib@1.2/c.js'] + ")", !h['/lib@%5E1.0/c.js'] && h['/lib@1.2/c.js'] === 1);
+  console.log("done");
+});
+</script></body></html>

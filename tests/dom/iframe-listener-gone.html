@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<!-- A frame's listeners outlive neither the frame nor its script. Build
+     478 crashed on claude.ai when an event reached a node that a
+     destroyed frame's script had listened on: the listener's memory was
+     freed but libdom still called it.
+     Expected console output: two lines ending in "ok". -->
+<html><body>
+<iframe id=f srcdoc="<body><script>document.body.addEventListener('ping',function(){parent.heard++;});parent.document.getElementById('b').addEventListener('ping',function(){parent.heard++;});parent.ready();</script></body>"></iframe>
+<div id=b>b</div>
+<script>
+var heard = 0, body = null;
+function ready() {
+  var f = document.getElementById('f');
+  body = f.contentDocument.body;
+  body.dispatchEvent(new Event('ping'));
+  console.log("frame listener heard:", heard === 1 ? "ok" : "FAIL " + heard);
+  f.parentNode.removeChild(f);
+  setTimeout(function () {
+    body.dispatchEvent(new Event('ping'));
+    document.getElementById('b').dispatchEvent(new Event('ping'));
+    body.dispatchEvent(new Event('ping'));
+    console.log("events after the frame went:", "ok");
+  }, 800);
+}
+</script></body></html>

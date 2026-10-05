@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<!-- Anchor positioning. Each XX line gives where a box went and PASS
+     when it is where a browser puts it. The anchor #btn is 100x30 at
+     (50, 40); the popover #pop has no position-anchor and is placed
+     against the button that opens it. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+#btn { position: absolute; left: 50px; top: 40px; width: 100px; height: 30px; anchor-name: --btn; }
+.p { position: absolute; width: 60px; height: 20px; position-anchor: --btn; margin: 0; }
+#below { top: anchor(bottom); left: anchor(left); }
+#right { left: anchor(right); top: anchor(center); }
+#calc { top: calc(anchor(bottom) + 5px); left: calc(anchor(--btn right) - 60px); }
+#area { position-area: bottom; }
+#areatl { position-area: top left; }
+#size { width: anchor-size(width); top: anchor(top); left: anchor(left); }
+#flip { position-anchor: --low; top: anchor(bottom); left: 0; position-try-fallbacks: flip-block; }
+#low { position: absolute; top: 570px; left: 0; width: 40px; height: 20px; anchor-name: --low; }
+#over { top: anchor(bottom); top: 7px; left: anchor(left); }
+#pop { position: fixed; inset: auto; margin: 0; top: anchor(bottom); left: anchor(left); width: 30px; height: 10px; }
+#pb { position: absolute; left: 300px; top: 10px; width: 40px; height: 20px; }
+@position-try --above { top: auto; bottom: anchor(top); }
+#tr { position-anchor: --low; top: anchor(bottom); left: anchor(right); position-try-fallbacks: --above; }
+#ac { top: anchor(bottom); justify-self: anchor-center; }
+#wide { position: absolute; position-anchor: --btn; position-area: left; font: 10px/10px sans-serif; }
+#sc { position: absolute; left: 500px; top: 100px; width: 100px; height: 50px; overflow: auto; }
+#scin { height: 300px; }
+#sca { height: 20px; anchor-name: --sca; }
+#scp { position: absolute; position-anchor: --sca; top: anchor(bottom); left: anchor(left); width: 20px; height: 10px; }
+</style></head><body>
+<div id="btn"></div>
+<div class="p" id="below"></div>
+<div class="p" id="right"></div>
+<div class="p" id="calc"></div>
+<div class="p" id="area"></div>
+<div class="p" id="areatl"></div>
+<div class="p" id="size"></div>
+<div id="low"></div>
+<div class="p" id="flip"></div>
+<div class="p" id="over"></div>
+<button id="pb" popovertarget="pop">open</button>
+<div id="pop" popover style="display:block">x</div>
+<div class="p" id="tr"></div>
+<div class="p" id="ac"></div>
+<div id="wide">a b c d e f g h i j k l m n o p q r s t u v w x y z a b c d e f g h</div>
+<div id="sc"><div id="scin"><div id="sca"></div></div></div>
+<div id="scp"></div>
+<div style="height: 600px"></div>
+<script>
+var want = {
+  below: [50, 70], right: [150, 55], calc: [90, 75], area: [70, 70],
+  areatl: [-10, 20], size: [50, 40, 100], flip: [0, 550], over: [50, 7],
+  pop: null, tr: [40, 550], ac: [70, 70]
+};
+window.addEventListener('load', function () { setTimeout(function () {
+  var n = 0, ok = 0;
+  for (var id in want) {
+    var r = document.getElementById(id).getBoundingClientRect(), w = want[id];
+    if (w === null) {
+      /* the popover's default anchor is the button that opens it */
+      var b = document.getElementById('pb').getBoundingClientRect();
+      w = [Math.round(b.left), Math.round(b.bottom)];
+    }
+    var got = [Math.round(r.left), Math.round(r.top)];
+    if (w.length > 2) got.push(Math.round(r.width));
+    var pass = got.join() === w.join();
+    n++; if (pass) ok++;
+    console.log('XX ' + id + ' ' + got.join(',') + (pass ? ' PASS' : ' FAIL (want ' + w.join(',') + ')'));
+  }
+  var wd = document.getElementById('wide').getBoundingClientRect(); n++;
+  var wok = Math.round(wd.width) <= 50 && Math.round(wd.right) === 50;
+  if (wok) ok++;
+  console.log('XX wide ' + Math.round(wd.left) + '..' + Math.round(wd.right) + (wok ? ' PASS' : ' FAIL (want no wider than 50, ending at 50)'));
+  var before = Math.round(document.getElementById('scp').getBoundingClientRect().top);
+  document.getElementById('sc').scrollTop = 15;
+  setTimeout(function () {
+    var after = Math.round(document.getElementById('scp').getBoundingClientRect().top);
+    var sok = before === 120 && after === 105;
+    console.log('XX scrolled anchor ' + before + ' -> ' + after + (sok ? ' PASS' : ' FAIL (want 120 -> 105)'));
+  }, 100);
+  console.log('XX supports ' + CSS.supports('anchor-name', '--a') + ' ' + CSS.supports('top', 'anchor(bottom)'));
+  console.log('XX ' + ok + ' of ' + n + ' pass');
+}, 200); });
+</script></body></html>

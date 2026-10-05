@@ -62,3 +62,15 @@
 	path = deps/utf8proc
 	url = https://github.com/JuliaStrings/utf8proc.git
 	ignore = dirty
+[submodule "deps/libquickjs"]
+	path = deps/libquickjs
+	url = https://github.com/quickjs-ng/quickjs.git
+	ignore = dirty
+[submodule "deps/monocypher"]
+	path = deps/monocypher
+	url = https://github.com/LoupVaillant/Monocypher.git
+	ignore = dirty
+[submodule "deps/wamr"]
+	path = deps/wamr
+	url = https://github.com/bytecodealliance/wasm-micro-runtime.git
+	ignore = dirty

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!-- A blank iframe has a window and a document a page can write into;
+     a cross-origin one refuses its document. Object.prototype.toString
+     names DOM objects by interface, and an SVG element knows the <svg>
+     it sits in. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<svg id="s" width="10" height="10"><g id="g"><circle id="c" r="1"></circle></g></svg>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+function tag(o){return Object.prototype.toString.call(o);}
+var f = document.createElement('iframe');
+ok("a detached iframe has no window", f.contentWindow === null && f.contentDocument === null);
+document.body.appendChild(f);
+var w = f.contentWindow, d = f.contentDocument;
+ok("an attached blank iframe has a window", !!w && typeof w === 'object');
+ok("and a document", !!d && d.nodeType === 9);
+ok("the window's document is that document", w.document === d);
+ok("the frame's parent is this window", w.parent === window && w.frameElement === f);
+ok("the frame has the built-ins", typeof w.Array === 'function' && typeof w.JSON.stringify === 'function');
+ok("its document has a body", !!d.body && d.body.nodeName === 'BODY');
+var p = d.createElement('p'); p.textContent = 'x'; d.body.appendChild(p);
+ok("its document can be built into", d.body.firstChild === p);
+ok("the same window every time", f.contentWindow === w);
+ok("the div is not a frame", document.createElement('div').contentWindow === undefined);
+var x = document.createElement('iframe'); x.src = 'https://example.com/'; document.body.appendChild(x);
+/* a browser's frame holds a blank same-origin document until its
+   navigation commits, so ask once it has had time to */
+setTimeout(function () {
+ var threw = null; try { x.contentWindow.document; } catch (e) { threw = e.name; }
+ ok("a cross-origin frame's document is refused (" + threw + ")", threw === 'SecurityError');
+ ok("a cross-origin frame has no contentDocument", x.contentDocument === null);
+ ok("but it can be posted to", typeof x.contentWindow.postMessage === 'function');
+}, 1500);
+ok("body tag (" + tag(document.body) + ")", tag(document.body) === '[object HTMLBodyElement]');
+ok("div tag (" + tag(document.createElement('div')) + ")", tag(document.createElement('div')) === '[object HTMLDivElement]');
+ok("document tag (" + tag(document) + ")", tag(document) === '[object HTMLDocument]');
+ok("collection tag (" + tag(document.getElementsByTagName('div')) + ")", tag(document.getElementsByTagName('div')) === '[object HTMLCollection]');
+ok("svg tag (" + tag(document.getElementById('s')) + ")", tag(document.getElementById('s')) === '[object SVGSVGElement]');
+ok("circle tag (" + tag(document.getElementById('c')) + ")", tag(document.getElementById('c')) === '[object SVGCircleElement]');
+ok("the circle's svg", document.getElementById('c').ownerSVGElement === document.getElementById('s'));
+ok("the outer svg has none", document.getElementById('s').ownerSVGElement === null);
+ok("an HTML element has no such property", document.body.ownerSVGElement === undefined);
+</script></body></html>

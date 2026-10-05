@@ -1,0 +1,177 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index bd540ba11..eb91482e4 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -473,6 +473,131 @@ html_document_user_data_handler(dom_node_operation operation,
+ }
+ 
+ 
++/*
++ * Every html content alive (VitaSurf). A build 511 log has the heap at
++ * 183 MB on the history page, with 3 MB in the cache and 23 MB in the
++ * script runtime, after GitHub, Audiobookshelf, a NAS and YouTube: each
++ * of those left tens of megabytes behind that nothing counted, and Home
++ * Assistant then ran out. The cache counts an html content's source,
++ * not its document, boxes or script, so what each still holds is
++ * reported here.
++ */
++static html_content *html_live;
++
++static void html_live_add(html_content *c)
++{
++	c->live_prev = NULL;
++	c->live_next = html_live;
++	if (html_live != NULL)
++		html_live->live_prev = c;
++	html_live = c;
++}
++
++static void html_live_remove(html_content *c)
++{
++	if (c->live_prev != NULL)
++		c->live_prev->live_next = c->live_next;
++	else if (html_live == c)
++		html_live = c->live_next;
++	if (c->live_next != NULL)
++		c->live_next->live_prev = c->live_prev;
++	c->live_next = c->live_prev = NULL;
++}
++
++/** The nodes in a document, counted by walking it. */
++static unsigned html_live_nodes(dom_node *root)
++{
++	dom_node *n = root, *next;
++	unsigned count = 0;
++
++	if (root == NULL)
++		return 0;
++	dom_node_ref(n);
++	for (;;) {
++		dom_node_type type;
++
++		count++;
++		/* and its attributes, which are nodes of their own */
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++				type == DOM_ELEMENT_NODE) {
++			struct dom_namednodemap *attrs = NULL;
++			uint32_t len = 0;
++
++			if (dom_node_get_attributes(n, &attrs) == DOM_NO_ERR &&
++					attrs != NULL) {
++				if (dom_namednodemap_get_length(attrs, &len) ==
++						DOM_NO_ERR)
++					count += len;
++				dom_namednodemap_unref(attrs);
++			}
++		}
++		/* down to the first child */
++		if (dom_node_get_first_child(n, &next) == DOM_NO_ERR &&
++				next != NULL) {
++			dom_node_unref(n);
++			n = next;
++			continue;
++		}
++		/* else up until there is a next sibling */
++		for (;;) {
++			if (n == root) {
++				dom_node_unref(n);
++				return count;
++			}
++			if (dom_node_get_next_sibling(n, &next) ==
++					DOM_NO_ERR && next != NULL) {
++				dom_node_unref(n);
++				n = next;
++				break;
++			}
++			if (dom_node_get_parent_node(n, &next) !=
++					DOM_NO_ERR || next == NULL) {
++				dom_node_unref(n);
++				return count;
++			}
++			dom_node_unref(n);
++			n = next;
++		}
++	}
++}
++
++/* exported interface documented in html/private.h */
++void html_memory_report(void)
++{
++	html_content *c;
++	unsigned n = 0;
++
++	unsigned nodes = 0;
++
++	for (c = html_live; c != NULL; c = c->live_next)
++		n++;
++	vita_log("memory: %u html documents alive; libdom holds %u nodes in "
++		 "all", n, (unsigned) dom_node_live_count());
++	for (c = html_live; c != NULL; c = c->live_next) {
++		nsurl *u = content_get_url(&c->base);
++		const char *url = u != NULL ? nsurl_access(u) : "?";
++
++		unsigned in_doc = html_live_nodes((dom_node *) c->document);
++
++		nodes += in_doc;
++		vita_log("memory:   %.60s: %u nodes, boxes %u KB, %s, %u users, "
++			 "%s", url, in_doc,
++			 c->bctx != NULL ?
++				(unsigned) (talloc_total_size(c->bctx) / 1024) :
++				0,
++			 c->jsthread != NULL ? "script running" : "no script",
++			 content_count_users(&c->base),
++			 c->base.status == CONTENT_STATUS_DONE ? "done" :
++			 c->base.status == CONTENT_STATUS_READY ? "ready" :
++			 "loading");
++	}
++	/* the rest are in no page's tree: removed by script and still
++	 * held, in documents script made, or left from pages gone */
++	vita_log("memory: %u nodes are in those documents' trees, %u are not",
++		 nodes, (unsigned) dom_node_live_count() > nodes ?
++			(unsigned) dom_node_live_count() - nodes : 0);
++}
++
+ static nserror
+ html_create_html_data(html_content *c, const http_parameter *params)
+ {
+@@ -485,6 +610,7 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 	const char *prefer_color_mode = (nsoption_bool(prefer_dark_mode)) ?
+ 			"dark" : "light";
+ 
++	html_live_add(c);
+ 	c->parser = NULL;
+ 	c->parse_completed = false;
+ 	c->conversion_begun = false;
+@@ -1747,6 +1873,8 @@ static void html_destroy(struct content *c)
+ 
+ 	NSLOG(netsurf, INFO, "content %p", c);
+ 
++	html_live_remove(html);
++
+ 	/* a web font still on its way must not lay this content out */
+ 	html_webfont_forget(html);
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 856c678a9..089ad6c41 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -95,6 +95,9 @@ union html_focus_owner {
+ typedef struct html_content {
+ 	struct content base;
+ 
++	/** every html content alive, for the memory report (VitaSurf) */
++	struct html_content *live_next, *live_prev;
++
+ 	dom_hubbub_parser *parser; /**< Parser object handle */
+ 	bool parse_completed; /**< Whether the parse has been completed */
+ 	bool conversion_begun; /**< Whether or not the conversion has begun */
+@@ -570,6 +573,9 @@ void html_drop_dynamic(html_content *c);
+  * (VitaSurf). */
+ void html_dynamic_report(void);
+ 
++/** Log every html content still alive and what it holds (VitaSurf). */
++void html_memory_report(void);
++
+ /* in html/forms.c */
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
+ /**

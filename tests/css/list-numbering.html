@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<!-- List markers numbered by the list-item counter, checked in the plot
+     output (markers are drawn as text): an ol from start=4 gives 4. 5.;
+     reversed gives 3. 2. 1.; reversed start=10 gives 10. 9.; li value=7
+     restarts at 7. then 8.; divs with display: list-item number 1. 2.;
+     counter-increment: list-item 2 steps 2. 4.; counter-reset:
+     list-item 5 on an ol starts at 6.; and a nested ol starts again at 1.
+     inside item 2. of the outer one. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; }
+ol, .dl { margin: 0; padding-left: 40px; }
+.dl { counter-reset: list-item; }
+.dl div { display: list-item; list-style-type: decimal; }
+.two li { counter-increment: list-item 2; }
+.five { counter-reset: list-item 5; }
+</style></head><body>
+<ol start="4"><li>a4</li><li>a5</li></ol>
+<ol reversed><li>b3</li><li>b2</li><li>b1</li></ol>
+<ol reversed start="10"><li>c10</li><li>c9</li></ol>
+<ol><li>d1</li><li value="7">d7</li><li>d8</li></ol>
+<div class="dl"><div>e1</div><div>e2</div></div>
+<ol class="two"><li>f2</li><li>f4</li></ol>
+<ol class="five"><li>g6</li></ol>
+<ol><li>h1</li><li>h2<ol><li>i1</li><li>i2</li></ol></li><li>h3</li></ol>
+</body></html>

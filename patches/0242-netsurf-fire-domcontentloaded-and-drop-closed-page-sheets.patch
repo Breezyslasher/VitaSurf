@@ -1,0 +1,127 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index b207fce45..85b4dcea1 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -876,6 +876,69 @@ nserror html_css_free_stylesheets(html_content *html)
+ }
+ 
+ 
++/* exported function documented in html/css.h */
++void html_css_abort_pending(html_content *html)
++{
++	unsigned int i;
++	unsigned int aborted = 0;
++
++	/*
++	 * A page closed before its stylesheets arrived has no use for
++	 * them (VitaSurf). An HTML content is never shared, so once it
++	 * is closed it is never shown again. claude.ai's script navigates
++	 * away while a 1.4 MB stylesheet it linked late is still
++	 * downloading; the old page went on to parse it, 2.1 seconds on
++	 * the Vita, and the new page then fetched and parsed the same
++	 * sheet again. hlcache keeps an unused content that is still
++	 * loading, so letting go of the handle alone does not stop it.
++	 *
++	 * Only with the cache off: then every fetch is forced to the
++	 * network and the next page cannot pick up this one's. With it
++	 * on, llcache hands an object still being fetched to whoever asks
++	 * for the same URL, so a same-site navigation gets the sheet
++	 * without fetching it again.
++	 */
++	if (vitasurf_cache_disabled == NULL || !vitasurf_cache_disabled()) {
++		return;
++	}
++
++	for (i = 0; i != html->stylesheet_count; i++) {
++		struct html_stylesheet *s = &html->stylesheets[i];
++		struct content *c;
++
++		if (s->sheet == NULL) {
++			continue;
++		}
++		/* no content yet means no response yet: still pending */
++		c = hlcache_handle_get_content(s->sheet);
++		if (c != NULL &&
++		    content__get_status(c) != CONTENT_STATUS_LOADING) {
++			continue;
++		}
++
++		/*
++		 * Abort the fetch only when no other page wants this
++		 * content; otherwise letting go of it is enough. A handle
++		 * with no content yet has its fetch stopped by the release.
++		 */
++		if (c != NULL && content_count_users(c) == 1) {
++			hlcache_handle_abort(s->sheet);
++		}
++		hlcache_handle_release(s->sheet);
++		s->sheet = NULL;
++		if (html->base.active > 0) {
++			html->base.active--;
++		}
++		aborted++;
++	}
++
++	if (aborted != 0) {
++		NSLOG(netsurf, INFO, "closed page dropped %u pending stylesheets",
++		      aborted);
++	}
++}
++
++
+ /* exported function documented in html/css.h */
+ nserror html_css_quirks_stylesheets(html_content *c)
+ {
+diff --git a/content/handlers/html/css.h b/content/handlers/html/css.h
+index 76a626ddb..c07c90ab6 100644
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -69,6 +69,13 @@ nserror html_css_quirks_stylesheets(struct html_content *c);
+  */
+ nserror html_css_free_stylesheets(struct html_content *html);
+ 
++/**
++ * Stop the stylesheet fetches a closed HTML content still has running.
++ *
++ * \param html The HTML content being closed.
++ */
++void html_css_abort_pending(struct html_content *html);
++
+ /**
+  * determine if any of the stylesheets were loaded insecurely
+  *
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 6ffdb9df9..185050257 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1078,7 +1078,18 @@ html_begin_conversion_inner(html_content *htmlc)
+ 
+ 	/* fire a simple event that bubbles named DOMContentLoaded at
+ 	 * the Document.
++	 *
++	 * Upstream stopped at the comment, so no page ever saw it, and the
++	 * usual guard -- wait for DOMContentLoaded while readyState is
++	 * "loading" -- waited for ever: Cloudflare's challenge never
++	 * started. Firing it also moves readyState to "interactive"
++	 * (VitaSurf). Window listeners live on the document node too.
+ 	 */
++	if (htmlc->jsthread != NULL) {
++		js_fire_event(htmlc->jsthread, "DOMContentLoaded",
++			      htmlc->document,
++			      (struct dom_node *) htmlc->document);
++	}
+ 
+ 	/* get encoding */
+ 	if (htmlc->encoding == NULL) {
+@@ -1701,6 +1712,11 @@ static nserror html_close(struct content *c)
+ 	/* remove all object references from the html content */
+ 	html_object_close_objects(htmlc);
+ 
++	/* stop stylesheet fetches nobody will see the result of */
++	if (htmlc->stylesheets != NULL) {
++		html_css_abort_pending(htmlc);
++	}
++
+ 	if (htmlc->jsthread != NULL) {
+ 		/* Close, but do not destroy (yet) the JS thread */
+ 		ret = js_closethread(htmlc->jsthread);

@@ -1,0 +1,929 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index c4911faa0..4ef08ff04 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -36,6 +36,7 @@
+ #include "css/internal.h"
+ #include "css/hints.h"
+ #include "css/select.h"
++#include "html/private.h"
+ 
+ static css_error node_name(void *pw, void *node, css_qname *qname);
+ static css_error node_classes(void *pw, void *node,
+@@ -95,6 +96,8 @@ static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
+ 		lwc_string *arg, bool *match);
+ static css_error node_animation_start(void *pw, void *node,
+ 		lwc_string *name, uint32_t *start_ms);
++static css_error node_container_size(void *pw, void *node, lwc_string *name,
++		css_fixed *width, css_fixed *height, uint8_t *status);
+ static css_error node_is_lang(void *pw, void *node,
+ 		lwc_string *lang, bool *match);
+ static css_error ua_default_for_property(void *pw, uint32_t property,
+@@ -152,8 +155,20 @@ static css_select_handler selection_handler = {
+ 	node_attribute_hashes,
+ 	node_is_pseudo,
+ 	node_animation_start,
++	node_container_size,
+ };
+ 
++/* The size of a node's container, for @container (VitaSurf) */
++static css_error node_container_size(void *pw, void *node, lwc_string *name,
++		css_fixed *width, css_fixed *height, uint8_t *status)
++{
++	nscss_select_ctx *ctx = pw;
++
++	*status = ctx->html != NULL ? html_container_lookup(ctx->html,
++			(dom_node *) node, name, width, height) : 2;
++	return CSS_OK;
++}
++
+ /*
+  * The animation clock (VitaSurf): milliseconds since animations were
+  * first run, and when each element's animation started on it. An
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index 2fd6e29c0..0b91309b0 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -39,6 +39,8 @@ typedef struct nscss_select_ctx
+ 	lwc_string *universal;
+ 	const css_computed_style *root_style;
+ 	const css_computed_style *parent_style;
++	/** the document, for @container (VitaSurf); may be NULL */
++	struct html_content *html;
+ } nscss_select_ctx;
+ 
+ css_stylesheet *nscss_create_inline_style(const uint8_t *data, size_t len,
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index f09367434..5e05881ef 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -349,6 +349,7 @@ box_get_style(html_content *c,
+ 	ctx.universal = c->universal;
+ 	ctx.root_style = root_style;
+ 	ctx.parent_style = parent_style;
++	ctx.html = c;
+ 
+ 	/* Select style for element, and time it (VitaSurf) */
+ 	{
+@@ -401,27 +402,202 @@ static void box_note_neg_z(html_content *c, const css_select_results *r)
+ }
+ 
+ 
++/*
++ * CSS counters (VitaSurf).
++ *
++ * The boxes are built in document order, which is the order counters
++ * are counted in. As an element that gets a box is reached, its
++ * counter-reset makes new counters, its counter-increment adds to the
++ * innermost counter of each name and its counter-set sets it, in that
++ * order; a list item adds one to list-item unless it names it itself.
++ * A counter an element makes is seen by the element, what follows it
++ * among its siblings and all their descendants, so it is kept until
++ * the element's parent is left: each is noted with that parent, its
++ * scope. A reset of a name a sibling already made replaces it rather
++ * than nesting. ::before and ::after count as the element's first and
++ * last children. counter() reads the innermost counter of a name and
++ * counters() all of them, outermost first; either makes one at 0 if
++ * there is none.
++ */
++struct html_counter {
++	lwc_string *name;
++	int32_t value;
++	const void *scope;
++};
++
++/* exported interface documented in html/private.h */
++void html_counters_clear(html_content *c)
++{
++	unsigned i;
++
++	for (i = 0; i < c->n_counters; i++)
++		lwc_string_unref(c->counters[i].name);
++	free(c->counters);
++	c->counters = NULL;
++	c->n_counters = 0;
++	c->counters_alloc = 0;
++	c->quote_depth = 0;
++}
++
++static struct html_counter *
++box_counter_find(html_content *c, lwc_string *name)
++{
++	unsigned i;
++	bool match;
++
++	for (i = c->n_counters; i-- > 0; ) {
++		if (lwc_string_caseless_isequal(c->counters[i].name, name,
++				&match) == lwc_error_ok && match)
++			return &c->counters[i];
++	}
++	return NULL;
++}
++
++static struct html_counter *
++box_counter_push(html_content *c, lwc_string *name, int32_t value,
++		const void *scope)
++{
++	struct html_counter *e;
++
++	if (c->n_counters == c->counters_alloc) {
++		unsigned alloc = c->counters_alloc ?
++				c->counters_alloc * 2 : 16;
++		struct html_counter *n = realloc(c->counters,
++				alloc * sizeof(*n));
++
++		if (n == NULL)
++			return NULL;
++		c->counters = n;
++		c->counters_alloc = alloc;
++	}
++	e = &c->counters[c->n_counters++];
++	e->name = lwc_string_ref(name);
++	e->value = value;
++	e->scope = scope;
++	return e;
++}
++
++/** The innermost counter of a name, made at 0 in \a scope if none. */
++static struct html_counter *
++box_counter_get(html_content *c, lwc_string *name, const void *scope)
++{
++	struct html_counter *e = box_counter_find(c, name);
++
++	return e != NULL ? e : box_counter_push(c, name, 0, scope);
++}
++
++/**
++ * Apply one style's counter-reset, counter-increment and counter-set.
++ *
++ * \param c          the document
++ * \param style      the style, the element's or a pseudo element's
++ * \param list_item  whether it is a list item, which counts list-item
++ * \param scope      the node its new counters are kept for
++ */
++static void
++box_counters_apply(html_content *c, const css_computed_style *style,
++		bool list_item, const void *scope)
++{
++	const css_computed_counter *k = NULL;
++	struct html_counter *e;
++	bool counts_list_item = false;
++
++	if (css_computed_counter_reset(style, &k) ==
++			CSS_COUNTER_RESET_NAMED && k != NULL) {
++		for (; k->name != NULL; k++) {
++			e = box_counter_find(c, k->name);
++			if (e != NULL && e->scope == scope)
++				e->value = FIXTOINT(k->value);
++			else
++				box_counter_push(c, k->name,
++						FIXTOINT(k->value), scope);
++		}
++	}
++	k = NULL;
++	if (css_computed_counter_increment(style, &k) ==
++			CSS_COUNTER_INCREMENT_NAMED && k != NULL) {
++		for (; k->name != NULL; k++) {
++			e = box_counter_get(c, k->name, scope);
++			if (e != NULL)
++				e->value += FIXTOINT(k->value);
++			if (lwc_string_isequal(k->name,
++					corestring_lwc_list_item,
++					&counts_list_item) == lwc_error_ok &&
++					counts_list_item)
++				list_item = false;
++		}
++	}
++	if (list_item) {
++		e = box_counter_get(c, corestring_lwc_list_item, scope);
++		if (e != NULL)
++			e->value++;
++	}
++	k = NULL;
++	if (css_computed_counter_set(style, &k) ==
++			CSS_COUNTER_SET_NAMED && k != NULL) {
++		for (; k->name != NULL; k++) {
++			e = box_counter_get(c, k->name, scope);
++			if (e != NULL)
++				e->value = FIXTOINT(k->value);
++		}
++	}
++}
++
++/** Leave an element: the counters its children made go. */
++static void box_counters_leave(html_content *c, const void *node)
++{
++	while (c->n_counters > 0 &&
++			c->counters[c->n_counters - 1].scope == node) {
++		c->n_counters--;
++		lwc_string_unref(c->counters[c->n_counters].name);
++	}
++}
++
++/** Append a counter's value in a list style (the opcode, as content
++ * holds it) to \a out. */
++static char *
++box_counter_format(char *out, int32_t value, uint8_t style_op, void *bctx)
++{
++	char buf[64];
++	size_t len = 0;
++	char *joined;
++
++	if (css_format_counter((uint8_t) (style_op + 1), value, buf,
++			sizeof(buf) - 1, &len) != CSS_OK)
++		return out;
++	if (len > sizeof(buf) - 1)
++		len = sizeof(buf) - 1;
++	joined = talloc_asprintf(bctx, "%s%.*s", out, (int) len, buf);
++	if (joined == NULL)
++		return out;
++	talloc_free(out);
++	return joined;
++}
++
+ /**
+  * The text a pseudo element's content property asks for (VitaSurf).
+  *
+- * A box was made for a pseudo element and left empty, so every
+- * ::before and ::after on a page drew nothing: a quotation mark, a
+- * separator, the glyph of an icon font, the label a list writes before
+- * its item. Strings and attr() are read; a counter, a URL and the
+- * quote keywords, which need state this does not keep, are left out,
+- * except that open-quote and close-quote give a plain double quote.
++ * Strings, attr(), counter() and counters() are read, and the quote
++ * keywords give the quotes the quotes property names at the depth the
++ * document has reached, or curly ones; a URL is left out.
+  *
+- * \param n     The element the pseudo element belongs to
+- * \param item  First content item
+- * \param bctx  Talloc context for the result
++ * \param n        The element the pseudo element belongs to
++ * \param content  The document, whose counters are read
++ * \param style    The pseudo element's style
++ * \param item     First content item
++ * \param bctx     Talloc context for the result
+  * \return the text, allocated in bctx, or NULL for none
+  */
+ static char *
+ box_generated_text(dom_node *n,
++		   html_content *content,
++		   const css_computed_style *style,
+ 		   const css_computed_content_item *item,
+ 		   void *bctx)
+ {
+ 	char *text = talloc_strdup(bctx, "");
++	lwc_string **quotes = NULL;
++	int n_quotes = -1;
+ 
+ 	if (text == NULL) {
+ 		return NULL;
+@@ -437,6 +613,49 @@ box_generated_text(dom_node *n,
+ 			add = lwc_string_data(item->data.string);
+ 			break;
+ 
++		case CSS_COMPUTED_CONTENT_COUNTER:
++		{
++			struct html_counter *e = box_counter_get(content,
++					item->data.counter.name, n);
++
++			if (e != NULL)
++				text = box_counter_format(text, e->value,
++						item->data.counter.style, bctx);
++			break;
++		}
++
++		case CSS_COMPUTED_CONTENT_COUNTERS:
++		{
++			unsigned i;
++			bool first = true, match;
++
++			if (box_counter_find(content,
++					item->data.counters.name) == NULL)
++				box_counter_push(content,
++						item->data.counters.name, 0, n);
++			for (i = 0; i < content->n_counters; i++) {
++				struct html_counter *e = &content->counters[i];
++
++				if (lwc_string_caseless_isequal(e->name,
++						item->data.counters.name,
++						&match) != lwc_error_ok || !match)
++					continue;
++				if (!first) {
++					char *j = talloc_asprintf(bctx, "%s%s",
++						text, lwc_string_data(
++						item->data.counters.sep));
++					if (j != NULL) {
++						talloc_free(text);
++						text = j;
++					}
++				}
++				first = false;
++				text = box_counter_format(text, e->value,
++						item->data.counters.style, bctx);
++			}
++			break;
++		}
++
+ 		case CSS_COMPUTED_CONTENT_ATTR:
+ 		{
+ 			dom_string *name;
+@@ -458,7 +677,52 @@ box_generated_text(dom_node *n,
+ 
+ 		case CSS_COMPUTED_CONTENT_OPEN_QUOTE:
+ 		case CSS_COMPUTED_CONTENT_CLOSE_QUOTE:
+-			add = "\"";
++		{
++			/* the pair for the depth reached, the innermost
++			 * pair past the last; curly quotes by default */
++			static const char *const curly[4] = {
++				"\xe2\x80\x9c", "\xe2\x80\x9d",
++				"\xe2\x80\x98", "\xe2\x80\x99"
++			};
++			bool open = item->type ==
++					CSS_COMPUTED_CONTENT_OPEN_QUOTE;
++			int depth, pair;
++
++			if (n_quotes < 0) {
++				/* libcss gives none and the initial value
++				 * alike as no list: both get curly quotes */
++				n_quotes = 0;
++				quotes = NULL;
++				if (style != NULL)
++					css_computed_quotes(style, &quotes);
++				while (quotes != NULL &&
++						quotes[n_quotes] != NULL)
++					n_quotes++;
++			}
++			if (!open && content->quote_depth > 0)
++				content->quote_depth--;
++			depth = content->quote_depth;
++			if (open)
++				content->quote_depth++;
++			if (n_quotes >= 2) {
++				pair = depth < n_quotes / 2 ? depth :
++						n_quotes / 2 - 1;
++				add = lwc_string_data(
++						quotes[2 * pair + (open ? 0 : 1)]);
++			} else {
++				pair = depth > 0 ? 1 : 0;
++				add = curly[2 * pair + (open ? 0 : 1)];
++			}
++			break;
++		}
++
++		case CSS_COMPUTED_CONTENT_NO_OPEN_QUOTE:
++			content->quote_depth++;
++			break;
++
++		case CSS_COMPUTED_CONTENT_NO_CLOSE_QUOTE:
++			if (content->quote_depth > 0)
++				content->quote_depth--;
+ 			break;
+ 
+ 		default:
+@@ -500,7 +764,7 @@ box_generated_add_text(dom_node *n,
+ 	struct box *text_box;
+ 	char *text;
+ 
+-	text = box_generated_text(n, item, content->bctx);
++	text = box_generated_text(n, content, style, item, content->bctx);
+ 	if (text == NULL) {
+ 		return;
+ 	}
+@@ -584,6 +848,11 @@ box_construct_generate(dom_node *n,
+ 	if (computed_display == CSS_DISPLAY_NONE) {
+ 		return;
+ 	}
++
++	/* its counters, before its content reads them (VitaSurf) */
++	box_counters_apply(content, style,
++			computed_display == CSS_DISPLAY_LIST_ITEM, n);
++
+ 	if (computed_display == CSS_DISPLAY_BLOCK ||
+ 			computed_display == CSS_DISPLAY_TABLE) {
+ 		/* a block level pseudo element gets a box of its own */
+@@ -610,6 +879,51 @@ box_construct_generate(dom_node *n,
+ }
+ 
+ 
++/**
++ * Generated content of an inline element (VitaSurf): its ::before or
++ * ::after as a run of text in the element's line, in the pseudo
++ * element's style, between the element's start and its end. Whatever
++ * display the pseudo element asks for, it is laid out as that text.
++ *
++ * \return true if text was added
++ */
++static bool
++box_construct_generate_inline(dom_node *n, html_content *content,
++		struct box *container, const css_computed_style *style)
++{
++	const css_computed_content_item *c_item;
++	struct box *text_box;
++	char *text;
++
++	if (container == NULL || style == NULL ||
++			css_computed_content(style, &c_item) !=
++				CSS_CONTENT_SET ||
++			ns_computed_display(style, false) == CSS_DISPLAY_NONE)
++		return false;
++
++	box_counters_apply(content, style,
++			ns_computed_display(style, false) ==
++				CSS_DISPLAY_LIST_ITEM, n);
++	text = box_generated_text(n, content, style, c_item, content->bctx);
++	if (text == NULL)
++		return false;
++
++	/** \todo Not wise to drop const from the computed style */
++	text_box = box_create(NULL, (css_computed_style *) style, false,
++			NULL, NULL, NULL, NULL, content->bctx);
++	if (text_box == NULL)
++		return false;
++	text_box->type = BOX_TEXT;
++	text_box->text = text;
++	text_box->length = strlen(text);
++	if (css_computed_text_transform(style) != CSS_TEXT_TRANSFORM_NONE)
++		box_text_transform(text_box->text, text_box->length,
++				css_computed_text_transform(style));
++	box_add_child(container, text_box);
++	return true;
++}
++
++
+ /**
+  * Construct a list marker box
+  *
+@@ -684,7 +998,8 @@ box_construct_marker(struct box *box,
+ 		marker->text = (char *) "";
+ 		marker->length = 0;
+ 	} else if (content == CSS_CONTENT_SET) {
+-		char *text = box_generated_text(box->node, item, ctx->bctx);
++		char *text = box_generated_text(box->node, ctx->content,
++				mstyle, item, ctx->bctx);
+ 
+ 		marker->text = text != NULL ? text : (char *) "";
+ 		marker->length = text != NULL ? strlen(text) : 0;
+@@ -1123,6 +1438,22 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 	 * container. Bubble Card, the most used Home Assistant card from
+ 	 * HACS, lays out its icon, name and state this way (VitaSurf).
+ 	 */
++	/* the element's counters, if it is drawn at all (VitaSurf); those
++	 * it makes are kept until its parent is left */
++	if (box->type != BOX_NONE && (css_display != CSS_DISPLAY_NONE ||
++			props.node_is_root)) {
++		dom_node *parent = NULL;
++
++		if (composed_parent(ctx->content, ctx->n, &parent) ==
++				DOM_NO_ERR) {
++			box_counters_apply(ctx->content, box->style,
++					css_display == CSS_DISPLAY_LIST_ITEM,
++					parent);
++			if (parent != NULL)
++				dom_node_unref(parent);
++		}
++	}
++
+ 	if (css_display == CSS_DISPLAY_CONTENTS && !props.node_is_root &&
+ 			props.containing_block != NULL &&
+ 			(box->flags & IS_REPLACED) == 0) {
+@@ -1292,6 +1623,14 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		assert(props.inline_container != NULL);
+ 
+ 		box_add_child(props.inline_container, box);
++
++		/* an inline element's ::before starts its run (VitaSurf) */
++		if (box->type == BOX_INLINE && box->styles != NULL &&
++				!(box->flags & IS_REPLACED))
++			box_construct_generate_inline(ctx->n, ctx->content,
++					props.inline_container,
++					box->styles->styles[
++						CSS_PSEUDO_ELEMENT_BEFORE]);
+ 	} else {
+ 		if (ns_computed_display(box->style, props.node_is_root) ==
+ 				CSS_DISPLAY_LIST_ITEM) {
+@@ -1342,7 +1681,19 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+  *
+  * This will be called after all children of an element have been processed
+  */
++static void box_construct_element_after_inner(dom_node *n,
++		html_content *content);
++
++/** Leave an element: its end, its ::after, and the counters its children
++ * made go out of scope (VitaSurf). */
+ static void box_construct_element_after(dom_node *n, html_content *content)
++{
++	box_construct_element_after_inner(n, content);
++	box_counters_leave(content, n);
++}
++
++static void box_construct_element_after_inner(dom_node *n,
++		html_content *content)
+ {
+ 	struct box_construct_props props;
+ 	struct box *box = box_for_node(n);
+@@ -1358,15 +1709,27 @@ static void box_construct_element_after(dom_node *n, html_content *content)
+ 	if (box->type == BOX_INLINE || box->type == BOX_BR) {
+ 		/* Insert INLINE_END into containing block */
+ 		struct box *inline_end;
+-		bool has_children;
++		bool has_children, want_after;
++		const css_computed_content_item *c_item;
+ 		dom_exception err;
+ 
+ 		err = composed_has_children(content, n, &has_children);
+ 		if (err != DOM_NO_ERR)
+ 			return;
+ 
+-		if (has_children == false ||
+-				(box->flags & CONVERT_CHILDREN) == 0) {
++		/* generated content needs the end as its children do, an
++		 * ::after or a ::before already in the run (VitaSurf) */
++		want_after = box->type == BOX_INLINE && box->styles != NULL &&
++				!(box->flags & IS_REPLACED) &&
++				box->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] !=
++					NULL &&
++				css_computed_content(box->styles->styles[
++					CSS_PSEUDO_ELEMENT_AFTER], &c_item) ==
++					CSS_CONTENT_SET;
++
++		if ((has_children == false ||
++				(box->flags & CONVERT_CHILDREN) == 0) &&
++				box->next == NULL && !want_after) {
+ 			/* No children, or didn't want children converted */
+ 			return;
+ 		}
+@@ -1406,6 +1769,12 @@ static void box_construct_element_after(dom_node *n, html_content *content)
+ 					props.inline_container);
+ 		}
+ 
++		if (want_after)
++			box_construct_generate_inline(n, content,
++					props.inline_container,
++					box->styles->styles[
++						CSS_PSEUDO_ELEMENT_AFTER]);
++
+ 		inline_end = box_create(NULL, box->style, false,
+ 				box->href, box->target, box->title,
+ 				box->id == NULL ? NULL :
+@@ -2124,6 +2493,9 @@ dom_to_box(dom_node *n,
+ 	ctx->bctx = c->bctx;
+ 	ctx->sync = false;
+ 
++	/* counting starts again with the document (VitaSurf) */
++	html_counters_clear(c);
++
+ 	*box_conversion_context = ctx;
+ 
+ 	/* what goes in which slot, as of now (VitaSurf) */
+@@ -2160,6 +2532,9 @@ dom_to_box_sync(dom_node *n, html_content *c, box_construct_complete_cb cb)
+ 	ctx->bctx = c->bctx;
+ 	ctx->sync = true;
+ 
++	/* counting starts again with the document (VitaSurf) */
++	html_counters_clear(c);
++
+ 	if (vitasurf_composed != NULL)
+ 		vitasurf_composed(c, VITASURF_COMPOSED_PREPARE, n, NULL);
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index fadf81094..796db1fed 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1207,6 +1207,184 @@ static void html_stop(struct content *c)
+ }
+ 
+ 
++/*
++ * Container queries (VitaSurf).
++ *
++ * An @container rule's condition is about the size of the element's
++ * container, which layout decides after the styles are chosen. So each
++ * layout notes the size every container came out, by element, and the
++ * next selection answers from that; a container not laid out yet is
++ * answered with the viewport, as @media is. When a layout finds that
++ * a container's size is not what the styles were chosen with, and a
++ * query has asked, the tree is rebuilt with the new sizes; twice at
++ * most for one viewport width, so a query that changes the size it
++ * asks about cannot go round for ever.
++ */
++struct html_container_size {
++	dom_node *node;
++	css_fixed width, height;
++};
++
++static void html_dynamic_relayout(void *p);
++
++static struct box *html_box_of(dom_node *n)
++{
++	struct box *box = NULL;
++
++	if (dom_node_get_user_data(n, corestring_dom___ns_key_box_node_data,
++			(void *) &box) != DOM_NO_ERR)
++		return NULL;
++	return box;
++}
++
++/** Whether a space-separated list of names has \a name. */
++static bool html_container_named(lwc_string *names, lwc_string *name)
++{
++	const char *s = lwc_string_data(names);
++	const char *want = lwc_string_data(name);
++	size_t len = lwc_string_length(names), n = lwc_string_length(name);
++	size_t i = 0;
++
++	while (i < len) {
++		size_t j = i;
++
++		while (j < len && s[j] != ' ')
++			j++;
++		if (j - i == n && memcmp(s + i, want, n) == 0)
++			return true;
++		i = j + 1;
++	}
++	return false;
++}
++
++/* exported interface documented in html/private.h */
++uint8_t html_container_lookup(html_content *c, dom_node *node,
++		lwc_string *name, css_fixed *width, css_fixed *height)
++{
++	dom_node *n = dom_node_ref(node), *p = NULL;
++	uint8_t status = 0;
++
++	while (dom_node_get_parent_node(n, &p) == DOM_NO_ERR && p != NULL) {
++		struct box *box;
++		uint8_t type;
++		unsigned i;
++
++		dom_node_unref(n);
++		n = p;
++		p = NULL;
++		box = html_box_of(n);
++		if (box == NULL || box->style == NULL)
++			continue;
++		type = css_computed_container_type(box->style);
++		if (type != CSS_CONTAINER_TYPE_SIZE &&
++				type != CSS_CONTAINER_TYPE_INLINE_SIZE)
++			continue;
++		if (name != NULL) {
++			lwc_string *names = NULL;
++
++			if (css_computed_container_name(box->style, &names) !=
++					CSS_CONTAINER_NAME_SET ||
++					names == NULL ||
++					!html_container_named(names, name))
++				continue;
++		}
++		c->containers_asked = true;
++		status = 2;
++		for (i = 0; i < c->n_csizes; i++) {
++			if (c->csizes[i].node == n) {
++				*width = c->csizes[i].width;
++				*height = c->csizes[i].height;
++				status = 1;
++				break;
++			}
++		}
++		break;
++	}
++	dom_node_unref(n);
++	return status;
++}
++
++static void html_containers_free(struct html_container_size *t, unsigned n)
++{
++	unsigned i;
++
++	for (i = 0; i < n; i++)
++		dom_node_unref(t[i].node);
++	free(t);
++}
++
++/** Note the size each container came out, and rebuild if one changed. */
++static void html_containers_measure(html_content *c)
++{
++	struct html_container_size *t = NULL;
++	unsigned n = 0, alloc = 0, i;
++	struct box *b = c->layout;
++	bool changed = false;
++
++	/* every box, in tree order, without recursion */
++	while (b != NULL) {
++		if (b->style != NULL && b->node != NULL &&
++				(b->flags & DISPLAY_CONTENTS) == 0 &&
++				css_computed_container_type(b->style) >
++					CSS_CONTAINER_TYPE_NORMAL &&
++				html_box_of(b->node) == b) {
++			if (n == alloc) {
++				unsigned na = alloc ? alloc * 2 : 8;
++				struct html_container_size *nt =
++					realloc(t, na * sizeof(*nt));
++
++				if (nt == NULL)
++					break;
++				t = nt;
++				alloc = na;
++			}
++			t[n].node = dom_node_ref(b->node);
++			t[n].width = css_unit_device2css_px(INTTOFIX(b->width),
++					c->unit_len_ctx.device_dpi);
++			t[n].height = css_unit_device2css_px(
++					INTTOFIX(b->height),
++					c->unit_len_ctx.device_dpi);
++			n++;
++		}
++		if (b->children != NULL) {
++			b = b->children;
++		} else {
++			while (b != NULL && b->next == NULL)
++				b = b->parent;
++			if (b != NULL)
++				b = b->next;
++		}
++	}
++
++	if (n != c->n_csizes) {
++		changed = true;
++	} else {
++		for (i = 0; i < n && !changed; i++) {
++			changed = t[i].node != c->csizes[i].node ||
++				t[i].width != c->csizes[i].width ||
++				t[i].height != c->csizes[i].height;
++		}
++	}
++	html_containers_free(c->csizes, c->n_csizes);
++	c->csizes = t;
++	c->n_csizes = n;
++
++	if (c->viewport_w != c->container_width_seen) {
++		c->container_width_seen = c->viewport_w;
++		c->container_rebuilds = 0;
++	}
++	if (changed && c->containers_asked && c->container_rebuilds < 2) {
++		c->container_rebuilds++;
++		NSLOG(netsurf, INFO, "container sizes changed: styles "
++				"chosen again (content %p)", c);
++		if (!c->dynamic_relayout_pending) {
++			c->dynamic_relayout_pending = true;
++			guit->misc->schedule(0, html_dynamic_relayout, c);
++		}
++	}
++}
++
++
+ /**
+  * Reformat a CONTENT_HTML to a new width.
+  */
+@@ -1263,6 +1441,9 @@ static void html_reformat(struct content *c, int width, int height)
+ 	htmlc->reflowing = false;
+ 	htmlc->had_initial_layout = true;
+ 
++	/* what size each container came out, for @container (VitaSurf) */
++	html_containers_measure(htmlc);
++
+ 	/* calculate next reflow time at three times what it took to reflow */
+ 	nsu_getmonotonic_ms(&ms_after);
+ 
+@@ -1567,6 +1748,14 @@ static void html_destroy(struct content *c)
+ 	/* and those it was animating */
+ 	html_animation_drop(html);
+ 
++	/* the counters its boxes were counted with */
++	html_counters_clear(html);
++
++	/* the sizes its containers came out */
++	html_containers_free(html->csizes, html->n_csizes);
++	html->csizes = NULL;
++	html->n_csizes = 0;
++
+ 	/* the documents its iframes made for themselves */
+ 	html_frame_doc_release(html);
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index fecacae53..49026f35d 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -313,6 +313,20 @@ typedef struct html_content {
+ 	struct css_select_results **anim_held;
+ 	unsigned anim_held_next;
+ 
++	/** The counters in scope as the boxes are built, in document
++	 * order, innermost last, and how deep the quotes are (VitaSurf) */
++	struct html_counter *counters;
++	unsigned n_counters, counters_alloc;
++	int quote_depth;
++
++	/** The containers' sizes at the last layout, for @container, and
++	 * whether a container query has asked about one (VitaSurf) */
++	struct html_container_size *csizes;
++	unsigned n_csizes;
++	bool containers_asked;
++	unsigned container_rebuilds;
++	int container_width_seen;
++
+ } html_content;
+ 
+ /**
+@@ -554,6 +568,16 @@ bool html_focus_control(struct html_content *html, struct dom_node *node);
+  */
+ void html_animation_note(struct html_content *c, struct dom_node *node);
+ 
++/**
++ * The size of a node's container, for @container (VitaSurf); see
++ * css_select_handler's node_container_size.
++ */
++uint8_t html_container_lookup(struct html_content *c, struct dom_node *node,
++		lwc_string *name, css_fixed *width, css_fixed *height);
++
++/** Let the counters box construction kept go (VitaSurf). */
++void html_counters_clear(struct html_content *c);
++
+ /** Stop running a document's animations and let its elements go. */
+ void html_animation_drop(struct html_content *c);
+ 
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index fae577085..70cf8b0d2 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -1348,6 +1348,22 @@ browser_window__handle_fetcherror(struct browser_window *bw,
+ 	struct browser_fetch_parameters params;
+ 	nserror err;
+ 
++	/*
++	 * The error page itself failed (VitaSurf): out of memory, on a
++	 * Home Assistant dashboard, it failed as it was built, and each
++	 * failure asked for the error page again, 826 times, until an
++	 * allocation for a URL failed and an assertion stopped the
++	 * browser. The reason goes to the status bar instead.
++	 */
++	if (url != NULL && nsurl_compare(url,
++			corestring_nsurl_about_query_fetcherror,
++			NSURL_SCHEME | NSURL_PATH)) {
++		NSLOG(netsurf, WARNING, "the error page failed: %s",
++				reason != NULL ? reason : "?");
++		browser_window_set_status(bw, reason != NULL ? reason : "");
++		return NSERROR_OK;
++	}
++
+ 	memset(&params, 0, sizeof(params));
+ 
+ 	params.url = nsurl_ref(corestring_nsurl_about_query_fetcherror);
+@@ -3310,6 +3326,12 @@ nserror browser_window_refresh_url_bar(struct browser_window *bw)
+ 		} else {
+ 			url = hlcache_handle_get_url(bw->current_content);
+ 		}
++		/* an internal page whose loading parameters are gone
++		 * shows its own address (VitaSurf) */
++		if (url == NULL)
++			url = hlcache_handle_get_url(bw->current_content);
++		if (url == NULL)
++			url = corestring_nsurl_about_blank;
+ 		ret = browser_window_refresh_url_bar_internal(bw, url);
+ 	} else {
+ 		/* Combine URL and Fragment */
+@@ -3318,6 +3340,10 @@ nserror browser_window_refresh_url_bar(struct browser_window *bw)
+ 		} else {
+ 			url = hlcache_handle_get_url(bw->current_content);
+ 		}
++		if (url == NULL)
++			url = hlcache_handle_get_url(bw->current_content);
++		if (url == NULL)
++			url = corestring_nsurl_about_blank;
+ 		ret = nsurl_refragment(
+ 				       url,
+ 				       bw->frag_id, &display_url);
+diff --git a/resources/default.css b/resources/default.css
+index 09c8f4828..344d6d690 100644
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -34,7 +34,8 @@ acronym { font-variant: small-caps; }
+ 
+ blockquote { display: block; margin: 1.12em 40px;}
+ 
+-q { font-style: italic; }
++q::before { content: open-quote; }
++q::after { content: close-quote; }
+ 
+ sub { vertical-align: sub; font-size: .83em; }
+ sup { vertical-align: super; font-size: .83em; }
+@@ -173,3 +174,6 @@ input[type=hidden] { display: none; }
+  * inherit, as nothing here looks at the text to decide. */
+ [dir="rtl"], [dir="RTL"] { direction: rtl; }
+ [dir="ltr"], [dir="LTR"] { direction: ltr; }
++
++/* Lists count their items on the list-item counter (VitaSurf) */
++ol, ul, menu { counter-reset: list-item; }
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index a63b812da..3a36e5be1 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -147,6 +147,8 @@ CORESTRING_LWC_VALUE(shortcut_icon, "shortcut icon");
+ CORESTRING_LWC_VALUE(slash_, "/");
+ CORESTRING_LWC_VALUE(max_age, "max-age");
+ CORESTRING_LWC_VALUE(no_cache, "no-cache");
++/* the counter a list item counts (VitaSurf) */
++CORESTRING_LWC_VALUE(list_item, "list-item");
+ CORESTRING_LWC_VALUE(no_store, "no-store");
+ CORESTRING_LWC_VALUE(query_auth, "query/auth");
+ CORESTRING_LWC_VALUE(query_ssl, "query/ssl");

@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<!-- align-content in a flex container that may wrap, even onto one line:
+     Bubble Card centres its icons with flex-wrap: wrap and
+     align-content: center, and the icon was stretched with its glyph at
+     the top. Stretch, the initial value, still shares the space out. -->
+<html><body style="margin:0">
+<div id="c" style="display:flex;flex-wrap:wrap;align-content:center;justify-content:center;min-width:38px;min-height:38px;width:38px;background:#eee"><span id="i" style="display:inline-block;width:24px;height:24px;background:#333"></span></div>
+<div id="c2" style="display:flex;flex-wrap:wrap;align-content:flex-end;height:100px;width:100px"><span id="i2" style="width:30px;height:20px"></span><span style="width:80px;height:20px"></span></div>
+<div id="c3" style="display:flex;flex-wrap:wrap;align-content:space-between;height:100px;width:100px"><span id="a3" style="width:80px;height:20px"></span><span id="b3" style="width:80px;height:20px"></span></div>
+<div id="c4" style="display:flex;flex-wrap:wrap;height:100px;width:100px"><span id="a4" style="width:80px"></span><span id="b4" style="width:80px"></span></div>
+<script>
+window.addEventListener('load',function(){setTimeout(function(){
+function r(id){var b=document.getElementById(id).getBoundingClientRect();return Math.round(b.top)+'+'+Math.round(b.height);}
+var c0=document.getElementById('c').getBoundingClientRect().top, c2=document.getElementById('c2').getBoundingClientRect().top, c3=document.getElementById('c3').getBoundingClientRect().top, c4=document.getElementById('c4').getBoundingClientRect().top;
+function rel(id,base){var b=document.getElementById(id).getBoundingClientRect();return Math.round(b.top-base)+'+'+Math.round(b.height);}
+function ok(n,c,g){console.log((c?'PASS ':'FAIL ')+n+' ('+g+')');}
+var g;
+g=rel('i',c0); ok('icon centred in a wrapping box', g==='7+24', g);
+g=rel('i2',c2); ok('align-content flex-end: first line', g==='60+20', g);
+g=rel('b3',c3); ok('space-between: last line at the end', g==='80+20', g);
+g=rel('a4',c4)+' '+rel('b4',c4); ok('stretch still shares the space', g==='0+50 50+50', g);
+},50);});
+</script></body></html>

@@ -1,0 +1,53 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index faf30dded..c3f470343 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -679,6 +679,12 @@ unsigned int vitasurf_js_jobs_threw;
+ unsigned int vitasurf_ms_js_jobs_threw;
+ unsigned int vitasurf_js_selector_compiles;
+ unsigned int vitasurf_js_selector_hits;
++unsigned int vitasurf_js_sel_all;
++unsigned int vitasurf_js_sel_one;
++unsigned int vitasurf_js_sel_matches;
++unsigned int vitasurf_js_sel_closest;
++unsigned int vitasurf_js_sel_closest_native;
++unsigned int vitasurf_js_sel_closest_steps;
+ unsigned int vitasurf_js_jobs_budget;
+ unsigned int vitasurf_ms_js_jobs_budget;
+ unsigned int vitasurf_js_drain_max_jobs;
+@@ -867,6 +873,12 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_ms_js_jobs_threw = 0;
+ 	vitasurf_js_selector_compiles = 0;
+ 	vitasurf_js_selector_hits = 0;
++	vitasurf_js_sel_all = 0;
++	vitasurf_js_sel_one = 0;
++	vitasurf_js_sel_matches = 0;
++	vitasurf_js_sel_closest = 0;
++	vitasurf_js_sel_closest_native = 0;
++	vitasurf_js_sel_closest_steps = 0;
+ 	vitasurf_js_jobs_budget = 0;
+ 	vitasurf_ms_js_jobs_budget = 0;
+ 	vitasurf_js_drain_max_jobs = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index dc1f421d2..f6780f0b1 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -396,6 +396,18 @@ extern unsigned int vitasurf_ms_js_jobs_threw;
+  */
+ extern unsigned int vitasurf_js_selector_compiles;
+ extern unsigned int vitasurf_js_selector_hits;
++/**
++ * Selector calls by API (VitaSurf): querySelectorAll, querySelector,
++ * matches and closest, how many closest calls took the native path for
++ * a bare tag, and the ancestors closest walked. A GitHub build 419 log
++ * used selectors 160,000 times and could not say which call made them.
++ */
++extern unsigned int vitasurf_js_sel_all;
++extern unsigned int vitasurf_js_sel_one;
++extern unsigned int vitasurf_js_sel_matches;
++extern unsigned int vitasurf_js_sel_closest;
++extern unsigned int vitasurf_js_sel_closest_native;
++extern unsigned int vitasurf_js_sel_closest_steps;
+ extern unsigned int vitasurf_js_jobs_budget;
+ extern unsigned int vitasurf_ms_js_jobs_budget;
+ extern unsigned int vitasurf_js_drain_max_jobs;

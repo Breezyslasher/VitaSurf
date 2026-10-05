@@ -1,0 +1,324 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index ea496f8..66a7cc0 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -5,6 +5,7 @@
+  * Copyright 2009 John-Mark Bell <jmb@netsurf-browser.org>
+  */
+ 
++#include <assert.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
+@@ -29,9 +30,36 @@ typedef struct hash_entry {
+ 	struct hash_entry *next;
+ } hash_entry;
+ 
++/*
++ * What a table is filed by, so that it can be rebuilt bigger
++ * (VitaSurf).
++ */
++typedef enum {
++	HASH_BY_ELEMENT,
++	HASH_BY_CLASS,
++	HASH_BY_ID
++} hash_kind;
++
+ typedef struct hash_t {
+-#define DEFAULT_SLOTS CSS_SELECTOR_HASH_SLOTS
++/*
++ * Where a table starts, and how full it is allowed to get before it
++ * doubles (VitaSurf).
++ *
++ * Every table used to have 64 slots whatever it held. That is at once
++ * too many and too few: a GitHub page loads 206 sheets, so the empty
++ * slots alone came to about two megabytes of a sixty-one megabyte
++ * heap, while the 15798 class rules across those sheets still left
++ * nine to a bucket and the class chains were walked 1381 entries per
++ * element to find eleven candidates. Start small and grow with the
++ * rules, and the memory follows the number of rules rather than the
++ * number of sheets: that page's tables come to about a fifth of a
++ * megabyte all told.
++ */
++#define DEFAULT_SLOTS 8
++#define HASH_MAX_PER_SLOT 4
+ 	size_t n_slots;
++	size_t n_entries;
++	hash_kind kind;
+ 
+ 	hash_entry *slots;
+ } hash_t;
+@@ -307,6 +335,7 @@ css_error css__selector_hash_create(css_selector_hash **hash)
+ 		return CSS_NOMEM;
+ 	}
+ 	h->elements.n_slots = DEFAULT_SLOTS;
++	h->elements.kind = HASH_BY_ELEMENT;
+ 
+ 	/* Class hash */
+ 	h->classes.slots = calloc(DEFAULT_SLOTS, sizeof(hash_entry));
+@@ -316,6 +345,7 @@ css_error css__selector_hash_create(css_selector_hash **hash)
+ 		return CSS_NOMEM;
+ 	}
+ 	h->classes.n_slots = DEFAULT_SLOTS;
++	h->classes.kind = HASH_BY_CLASS;
+ 
+ 	/* ID hash */
+ 	h->ids.slots = calloc(DEFAULT_SLOTS, sizeof(hash_entry));
+@@ -326,9 +356,10 @@ css_error css__selector_hash_create(css_selector_hash **hash)
+ 		return CSS_NOMEM;
+ 	}
+ 	h->ids.n_slots = DEFAULT_SLOTS;
++	h->ids.kind = HASH_BY_ID;
+ 
+ 	/* Attribute hash (VitaSurf) */
+-	h->attrs.slots = calloc(DEFAULT_SLOTS, sizeof(hash_entry));
++	h->attrs.slots = calloc(CSS_SELECTOR_HASH_SLOTS, sizeof(hash_entry));
+ 	if (h->attrs.slots == NULL) {
+ 		free(h->ids.slots);
+ 		free(h->classes.slots);
+@@ -336,15 +367,19 @@ css_error css__selector_hash_create(css_selector_hash **hash)
+ 		free(h);
+ 		return CSS_NOMEM;
+ 	}
+-	h->attrs.n_slots = DEFAULT_SLOTS;
++	/*
++	 * Fixed, unlike the three above: select.c works out which
++	 * buckets a node's attributes fall in once per node and hands
++	 * the answer to every sheet, so every sheet must agree on how
++	 * many there are (VitaSurf).
++	 */
++	h->attrs.n_slots = CSS_SELECTOR_HASH_SLOTS;
+ 
+ 	/* Universal chain head already initiliased by calloc of `h`. */
+ 
+ 	h->hash_size = sizeof(css_selector_hash) +
+-			DEFAULT_SLOTS * sizeof(hash_entry) +
+-			DEFAULT_SLOTS * sizeof(hash_entry) +
+-			DEFAULT_SLOTS * sizeof(hash_entry) +
+-			DEFAULT_SLOTS * sizeof(hash_entry);
++			3 * DEFAULT_SLOTS * sizeof(hash_entry) +
++			CSS_SELECTOR_HASH_SLOTS * sizeof(hash_entry);
+ 
+ 	*hash = h;
+ 
+@@ -441,6 +476,134 @@ unsigned int css_hash_uni_pseudo_class;
+ unsigned int css_hash_uni_pseudo_element;
+ unsigned int css_hash_uni_plain;
+ 
++/** What a table files a selector by (VitaSurf). */
++static uint32_t _entry_key(hash_kind kind, const css_selector *selector)
++{
++	lwc_string *name = NULL;
++
++	switch (kind) {
++	case HASH_BY_ID:
++		name = _id_name(selector);
++		break;
++	case HASH_BY_CLASS:
++		name = _class_name(selector);
++		break;
++	case HASH_BY_ELEMENT:
++	default:
++		name = selector->data.qname.name;
++		break;
++	}
++
++	/* every rule in a table has the name that table files by */
++	assert(name != NULL);
++
++	return _hash_name(name);
++}
++
++/*
++ * Double a table that has grown past its load and refile everything
++ * (VitaSurf).
++ *
++ * Re-inserting keeps each chain in its sorted order, because that is
++ * what _insert_into_chain does. Running out of memory here is not an
++ * error the caller need care about: the table simply stays as it was
++ * and the chains stay longer than they should.
++ */
++static void _grow(css_selector_hash *ctx, hash_t *h)
++{
++	const css_selector **all;
++	hash_entry *old_slots = h->slots;
++	size_t old_n = h->n_slots, count = 0, i;
++	hash_entry *fresh;
++
++	all = malloc(h->n_entries * sizeof(*all));
++	if (all == NULL)
++		return;
++
++	fresh = calloc(old_n * 2, sizeof(hash_entry));
++	if (fresh == NULL) {
++		free(all);
++		return;
++	}
++
++	for (i = 0; i < old_n; i++) {
++		hash_entry *e = &old_slots[i];
++
++		if (e->sel == NULL)
++			continue;
++		for (; e != NULL; e = e->next) {
++			if (count < h->n_entries)
++				all[count++] = e->sel;
++		}
++	}
++
++	h->slots = fresh;
++	h->n_slots = old_n * 2;
++	ctx->hash_size += old_n * sizeof(hash_entry);
++
++	for (i = 0; i < count; i++) {
++		uint32_t slot = _entry_key(h->kind, all[i]) &
++				(h->n_slots - 1);
++
++		if (_insert_into_chain(ctx, &h->slots[slot], all[i]) ==
++				CSS_OK) {
++			continue;
++		}
++
++		/*
++		 * Out of memory part way through. Put the table back
++		 * exactly as it was rather than lose the rules that
++		 * have not been refiled yet: a dropped rule is a page
++		 * that renders wrongly, and a table that did not grow
++		 * is only slower.
++		 */
++		for (i = 0; i < h->n_slots; i++) {
++			hash_entry *e = h->slots[i].next, *n;
++
++			for (; e != NULL; e = n) {
++				n = e->next;
++				free(e);
++				ctx->hash_size -= sizeof(hash_entry);
++			}
++		}
++		free(h->slots);
++		h->slots = old_slots;
++		h->n_slots = old_n;
++		ctx->hash_size -= old_n * sizeof(hash_entry);
++		free(all);
++		return;
++	}
++
++	for (i = 0; i < old_n; i++) {
++		hash_entry *e = old_slots[i].next, *n;
++
++		for (; e != NULL; e = n) {
++			n = e->next;
++			free(e);
++			ctx->hash_size -= sizeof(hash_entry);
++		}
++	}
++	free(old_slots);
++	free(all);
++}
++
++/** File a selector, growing the table if its chains have got long. */
++static css_error _file(css_selector_hash *ctx, hash_t *h,
++		const css_selector *selector, uint32_t key)
++{
++	css_error error = _insert_into_chain(ctx,
++			&h->slots[key & (h->n_slots - 1)], selector);
++
++	if (error != CSS_OK)
++		return error;
++
++	h->n_entries++;
++	if (h->n_entries > h->n_slots * HASH_MAX_PER_SLOT)
++		_grow(ctx, h);
++
++	return CSS_OK;
++}
++
+ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 		const css_selector *selector)
+ {
+@@ -454,28 +617,18 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 	/* Work out which hash to insert into */
+ 	if ((name = _id_name(selector)) != NULL) {
+ 		/* Named ID */
+-		mask = hash->ids.n_slots - 1;
+-		index = _hash_name(name) & mask;
+-
+-		error = _insert_into_chain(hash, &hash->ids.slots[index],
+-				selector);
++		error = _file(hash, &hash->ids, selector, _hash_name(name));
+ 		css_hash_in_id++;
+ 	} else if ((name = _class_name(selector)) != NULL) {
+ 		/* Named class */
+-		mask = hash->classes.n_slots - 1;
+-		index = _hash_name(name) & mask;
+-
+-		error = _insert_into_chain(hash, &hash->classes.slots[index],
+-				selector);
++		error = _file(hash, &hash->classes, selector,
++				_hash_name(name));
+ 		css_hash_in_class++;
+ 	} else if (lwc_string_length(selector->data.qname.name) != 1 ||
+ 			lwc_string_data(selector->data.qname.name)[0] != '*') {
+ 		/* Named element */
+-		mask = hash->elements.n_slots - 1;
+-		index = _hash_name(selector->data.qname.name) & mask;
+-
+-		error = _insert_into_chain(hash, &hash->elements.slots[index],
+-				selector);
++		error = _file(hash, &hash->elements, selector,
++				_hash_name(selector->data.qname.name));
+ 		css_hash_in_element++;
+ 	} else {
+ 		uint32_t key;
+@@ -549,6 +702,19 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+  * \param selector  Pointer to selector
+  * \return CSS_OK on success, appropriate error otherwise
+  */
++/** Take a selector out of a table, keeping its count right. */
++static css_error _unfile(css_selector_hash *ctx, hash_t *h,
++		const css_selector *selector, uint32_t key)
++{
++	css_error error = _remove_from_chain(ctx,
++			&h->slots[key & (h->n_slots - 1)], selector);
++
++	if (error == CSS_OK && h->n_entries > 0)
++		h->n_entries--;
++
++	return error;
++}
++
+ css_error css__selector_hash_remove(css_selector_hash *hash,
+ 		const css_selector *selector)
+ {
+@@ -562,26 +728,16 @@ css_error css__selector_hash_remove(css_selector_hash *hash,
+ 	/* Work out which hash to remove from */
+ 	if ((name = _id_name(selector)) != NULL) {
+ 		/* Named ID */
+-		mask = hash->ids.n_slots - 1;
+-		index = _hash_name(name) & mask;
+-
+-		error = _remove_from_chain(hash, &hash->ids.slots[index],
+-				selector);
++		error = _unfile(hash, &hash->ids, selector, _hash_name(name));
+ 	} else if ((name = _class_name(selector)) != NULL) {
+ 		/* Named class */
+-		mask = hash->classes.n_slots - 1;
+-		index = _hash_name(name) & mask;
+-
+-		error = _remove_from_chain(hash, &hash->classes.slots[index],
+-				selector);
++		error = _unfile(hash, &hash->classes, selector,
++				_hash_name(name));
+ 	} else if (lwc_string_length(selector->data.qname.name) != 1 ||
+ 			lwc_string_data(selector->data.qname.name)[0] != '*') {
+ 		/* Named element */
+-		mask = hash->elements.n_slots - 1;
+-		index = _hash_name(selector->data.qname.name) & mask;
+-
+-		error = _remove_from_chain(hash, &hash->elements.slots[index],
+-				selector);
++		error = _unfile(hash, &hash->elements, selector,
++				_hash_name(selector->data.qname.name));
+ 	} else {
+ 		uint32_t key;
+ 

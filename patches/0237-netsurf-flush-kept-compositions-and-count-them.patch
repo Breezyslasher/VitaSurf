@@ -1,0 +1,48 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index 900a68b46..79ea0f28c 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -868,6 +868,7 @@ static void nscss_fini(void)
+ 		css_stylesheet_destroy(blank_import);
+ 		blank_import = NULL;
+ 	}
++	css_computed_style_compose_flush();
+ 	css_hint_fini();
+ }
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 815b26d65..6ffdb9df9 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1541,6 +1541,9 @@ static void html_destroy(struct content *c)
+ 	html->pinned_alloc = 0;
+ 	html->pinned_boxes = 0;
+ 
++	/* the compositions libcss kept may hold this page's styles */
++	css_computed_style_compose_flush();
++
+ 	/* If we're still converting a layout, cancel it */
+ 	if (html->box_conversion_context != NULL) {
+ 		if (cancel_dom_to_box(html->box_conversion_context) != NSERROR_OK) {
+diff --git a/utils/utils.c b/utils/utils.c
+index d903f00ba..4bdbcef3c 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -738,6 +738,8 @@ extern unsigned int css_select_share_candidates;
+ extern unsigned int css_select_share_tainted;
+ extern unsigned int css_select_share_position;
+ extern unsigned int css_select_share_class_attr;
++extern unsigned int css_compose_cache_hits;
++extern unsigned int css_compose_cache_misses;
+ extern unsigned int css_select_index_builds;
+ extern unsigned int css_select_index_entries;
+ extern unsigned int css_select_index_bytes;
+@@ -811,6 +813,8 @@ void vitasurf_profile_reset(void)
+ 	css_select_share_tainted = 0;
+ 	css_select_share_position = 0;
+ 	css_select_share_class_attr = 0;
++	css_compose_cache_hits = 0;
++	css_compose_cache_misses = 0;
+ 	vitasurf_curl_pumps = 0;
+ 	vitasurf_curl_pump_ms = 0;
+ 	vitasurf_curl_held_kb = 0;

@@ -1,0 +1,325 @@
+diff --git a/include/parserutils/utils/stack.h b/include/parserutils/utils/stack.h
+index 60f2d71..7615150 100644
+--- a/include/parserutils/utils/stack.h
++++ b/include/parserutils/utils/stack.h
+@@ -14,11 +14,21 @@ extern "C"
+ #endif
+ 
+ #include <stddef.h>
++#include <stdint.h>
++#include <string.h>
+ 
+ #include <parserutils/errors.h>
+ #include <parserutils/functypes.h>
+ 
+-struct parserutils_stack;
++/* Public so the common calls can be inline (VitaSurf); see vector.h */
++struct parserutils_stack
++{
++	size_t item_size;		/**< Size of an item in the stack */
++	size_t chunk_size;		/**< Size of a stack chunk */
++	size_t items_allocated;		/**< Number of slots allocated */
++	int32_t current_item;		/**< Index of current item */
++	void *items;			/**< Items in stack */
++};
+ typedef struct parserutils_stack parserutils_stack;
+ 
+ parserutils_error parserutils_stack_create(size_t item_size, size_t chunk_size,
+@@ -31,6 +41,64 @@ parserutils_error parserutils_stack_pop(parserutils_stack *stack, void *item);
+ 
+ void *parserutils_stack_get_current(parserutils_stack *stack);
+ 
++#ifndef PARSERUTILS_NO_INLINE
++/* Inline forms of the calls above (VitaSurf); same results */
++static inline parserutils_error parserutils__stack_push_inline(
++		parserutils_stack *stack, const void *item)
++{
++	int32_t slot;
++
++	if (stack == NULL || item == NULL || stack->current_item < -1 ||
++			stack->current_item == INT32_MAX)
++		return parserutils_stack_push(stack, item);
++
++	slot = stack->current_item + 1;
++	if ((size_t) slot >= stack->items_allocated)
++		return parserutils_stack_push(stack, item);
++
++	memcpy((uint8_t *) stack->items + (slot * stack->item_size),
++			item, stack->item_size);
++	stack->current_item = slot;
++
++	return PARSERUTILS_OK;
++}
++
++static inline parserutils_error parserutils__stack_pop_inline(
++		parserutils_stack *stack, void *item)
++{
++	if (stack == NULL)
++		return PARSERUTILS_BADPARM;
++	if (stack->current_item < 0)
++		return PARSERUTILS_INVALID;
++
++	if (item != NULL) {
++		memcpy(item, (uint8_t *) stack->items +
++				(stack->current_item * stack->item_size),
++				stack->item_size);
++	}
++	stack->current_item -= 1;
++
++	return PARSERUTILS_OK;
++}
++
++static inline void *parserutils__stack_get_current_inline(
++		parserutils_stack *stack)
++{
++	if (stack == NULL || stack->current_item < 0)
++		return NULL;
++
++	return (uint8_t *) stack->items +
++			(stack->current_item * stack->item_size);
++}
++
++#define parserutils_stack_push(s, i) \
++	parserutils__stack_push_inline((s), (i))
++#define parserutils_stack_pop(s, i) \
++	parserutils__stack_pop_inline((s), (i))
++#define parserutils_stack_get_current(s) \
++	parserutils__stack_get_current_inline((s))
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/include/parserutils/utils/vector.h b/include/parserutils/utils/vector.h
+index f01f00e..7ff2ff3 100644
+--- a/include/parserutils/utils/vector.h
++++ b/include/parserutils/utils/vector.h
+@@ -14,11 +14,26 @@ extern "C"
+ #endif
+ 
+ #include <stddef.h>
++#include <stdint.h>
++#include <string.h>
+ 
+ #include <parserutils/errors.h>
+ #include <parserutils/functypes.h>
+ 
+-struct parserutils_vector;
++/*
++ * The layout is public so that the calls a parser makes for every token
++ * can be inline (VitaSurf). libcss appends, peeks and iterates some
++ * millions of times for a large site's style sheets, and as calls they
++ * were a fifth of the parse. Use the functions, not the fields.
++ */
++struct parserutils_vector
++{
++	size_t item_size;       /**< Size of an item in the vector */
++	size_t chunk_size;      /**< Size of a vector chunk */
++	size_t items_allocated; /**< Number of slots allocated */
++	int32_t current_item;   /**< Index of current item */
++	void *items;            /**< Items in vector */
++};
+ typedef struct parserutils_vector parserutils_vector;
+ 
+ parserutils_error parserutils_vector_create(size_t item_size, 
+@@ -36,6 +51,76 @@ const void *parserutils_vector_iterate(const parserutils_vector *vector,
+ const void *parserutils_vector_peek(const parserutils_vector *vector,
+ 		int32_t ctx);
+ 
++#ifndef PARSERUTILS_NO_INLINE
++/* Inline forms of the calls above (VitaSurf); same results */
++static inline parserutils_error parserutils__vector_append_inline(
++		parserutils_vector *vector, void *item)
++{
++	int32_t slot;
++
++	if (vector == NULL || item == NULL || vector->current_item < -1 ||
++			vector->current_item == INT32_MAX)
++		return parserutils_vector_append(vector, item);
++
++	slot = vector->current_item + 1;
++	if ((size_t) slot >= vector->items_allocated)
++		return parserutils_vector_append(vector, item);
++
++	memcpy((uint8_t *) vector->items + (slot * vector->item_size),
++			item, vector->item_size);
++	vector->current_item = slot;
++
++	return PARSERUTILS_OK;
++}
++
++static inline parserutils_error parserutils__vector_remove_last_inline(
++		parserutils_vector *vector)
++{
++	if (vector == NULL)
++		return PARSERUTILS_BADPARM;
++	if (vector->current_item < 0)
++		return PARSERUTILS_INVALID;
++	vector->current_item--;
++	return PARSERUTILS_OK;
++}
++
++static inline const void *parserutils__vector_iterate_inline(
++		const parserutils_vector *vector, int32_t *ctx)
++{
++	void *item;
++
++	if (vector == NULL || ctx == NULL || vector->current_item < 0)
++		return NULL;
++	if ((*ctx) > vector->current_item)
++		return NULL;
++
++	item = (uint8_t *) vector->items + ((*ctx) * vector->item_size);
++	(*ctx)++;
++
++	return item;
++}
++
++static inline const void *parserutils__vector_peek_inline(
++		const parserutils_vector *vector, int32_t ctx)
++{
++	if (vector == NULL || vector->current_item < 0)
++		return NULL;
++	if (ctx > vector->current_item)
++		return NULL;
++
++	return (uint8_t *) vector->items + (ctx * vector->item_size);
++}
++
++#define parserutils_vector_append(v, i) \
++	parserutils__vector_append_inline((v), (i))
++#define parserutils_vector_remove_last(v) \
++	parserutils__vector_remove_last_inline((v))
++#define parserutils_vector_iterate(v, c) \
++	parserutils__vector_iterate_inline((v), (c))
++#define parserutils_vector_peek(v, c) \
++	parserutils__vector_peek_inline((v), (c))
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/input/filter.c b/src/input/filter.c
+index 7f543e7..8370248 100644
+--- a/src/input/filter.c
++++ b/src/input/filter.c
+@@ -47,6 +47,51 @@ struct parserutils_filter {
+ 	} settings;			/**< Filter settings */
+ };
+ 
++#ifdef WITHOUT_ICONV_FILTER
++/**
++ * How long the character at s is, if the UTF-8 codec would give back
++ * exactly its bytes; 0 if it would not, or if it does not all fit
++ * (VitaSurf).
++ *
++ * A run of ASCII already went straight across, but each other
++ * character sent the codec off to decode the next 64 characters one by
++ * one: GitHub's style sheets have enough of them in strings and content
++ * values that the round trip was still 6 % of their parse. A sequence
++ * of 2 to 4 bytes that the decoder accepts -- not overlong, not a
++ * surrogate, not U+FFFE or U+FFFF -- is re-encoded to the same bytes;
++ * past U+10FFFF, and anything else, is left to the codec.
++ */
++static inline size_t utf8_valid_length(const uint8_t *s, size_t room)
++{
++	uint32_t c, min;
++	size_t n, i;
++
++	if (s[0] < 0x80)
++		return 1;
++	if ((s[0] & 0xE0) == 0xC0) {
++		c = s[0] & 0x1F; n = 2; min = 0x80;
++	} else if ((s[0] & 0xF0) == 0xE0) {
++		c = s[0] & 0x0F; n = 3; min = 0x800;
++	} else if ((s[0] & 0xF8) == 0xF0) {
++		c = s[0] & 0x07; n = 4; min = 0x10000;
++	} else {
++		return 0;
++	}
++	if (n > room)
++		return 0;
++	for (i = 1; i < n; i++) {
++		if ((s[i] & 0xC0) != 0x80)
++			return 0;
++		c = (c << 6) | (s[i] & 0x3F);
++	}
++	if (c < min || (c >= 0xD800 && c <= 0xDFFF) || c == 0xFFFE ||
++			c == 0xFFFF || c > 0x10FFFF)
++		return 0;
++
++	return n;
++}
++#endif
++
+ static parserutils_error filter_set_defaults(parserutils_filter *input);
+ static parserutils_error filter_set_encoding(parserutils_filter *input,
+ 		const char *enc);
+@@ -287,8 +332,13 @@ parserutils_error parserutils__filter_process_chunk(parserutils_filter *input,
+ 			const uint8_t *s = *data;
+ 			size_t n = 0, room = *len < *outlen ? *len : *outlen;
+ 
+-			while (n < room && s[n] != 0 && s[n] < 0x80)
+-				n++;
++			while (n < room && s[n] != 0) {
++				size_t k = utf8_valid_length(s + n, room - n);
++
++				if (k == 0)
++					break;
++				n += k;
++			}
+ 
+ 			if (n > 0) {
+ 				memcpy(*output, s, n);
+diff --git a/src/utils/stack.c b/src/utils/stack.c
+index 539ec9d..fdd0ae1 100644
+--- a/src/utils/stack.c
++++ b/src/utils/stack.c
+@@ -8,19 +8,13 @@
+ #include <inttypes.h>
+ #include <string.h>
+ 
++/* the real functions, not the inline forms (VitaSurf) */
++#define PARSERUTILS_NO_INLINE
+ #include <parserutils/utils/stack.h>
+ 
+ /**
+  * Stack object
+  */
+-struct parserutils_stack
+-{
+-	size_t item_size;		/**< Size of an item in the stack */
+-	size_t chunk_size;		/**< Size of a stack chunk */
+-	size_t items_allocated;		/**< Number of slots allocated */
+-	int32_t current_item;		/**< Index of current item */
+-	void *items;			/**< Items in stack */
+-};
+ 
+ /**
+  * Create a stack
+diff --git a/src/utils/vector.c b/src/utils/vector.c
+index 94ed587..b1637f7 100644
+--- a/src/utils/vector.c
++++ b/src/utils/vector.c
+@@ -8,19 +8,13 @@
+ #include <inttypes.h>
+ #include <string.h>
+ 
++/* the real functions, not the inline forms (VitaSurf) */
++#define PARSERUTILS_NO_INLINE
+ #include <parserutils/utils/vector.h>
+ 
+ /**
+  * Vector object
+  */
+-struct parserutils_vector
+-{
+-	size_t item_size;       /**< Size of an item in the vector */
+-	size_t chunk_size;      /**< Size of a vector chunk */
+-	size_t items_allocated; /**< Number of slots allocated */
+-	int32_t current_item;   /**< Index of current item */
+-	void *items;            /**< Items in vector */
+-};
+ 
+ /**
+  * Create a vector

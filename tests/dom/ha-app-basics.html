@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<!-- What Home Assistant's app needs from the browser before it can start.
+     Expected console output: eight lines ending in "ok", then DONE. -->
+<html><body><script>
+/* the page's own global _ls, which HA's index defines to load scripts */
+function _ls(src) { return src; }
+function ok(n, c, extra) { console.log(n + ": " + (c ? "ok" : "FAIL " + (extra || ""))); }
+ok("localStorage survives a global named _ls", typeof localStorage.getItem === 'function' && localStorage !== window._ls);
+var st = btoa(JSON.stringify({hassUrl: 'http://x', clientId: 'http://x/'})).replace(/=+$/, '');
+var threw = null;
+try { JSON.parse(atob(st)); } catch (e) { threw = e.message; }
+ok("atob takes base64 with its padding cut off", threw === null, threw);
+ok("atob refuses a bad length", (function () { try { atob('abcde'); return false; } catch (e) { return e.name === 'InvalidCharacterError'; } })());
+ok("document is a node with a root", document.getRootNode() === document && document.childNodes.length >= 1 && document.firstChild !== null && document.parentNode === null);
+ok("a shadow root finds its own element by id", (function () {
+  var h = document.createElement('x-host'); document.body.appendChild(h);
+  var r = h.attachShadow({mode: 'open'}); var d = document.createElement('div'); d.id = 'view'; r.appendChild(d);
+  return r.getElementById('view') === d; })());
+ok("reduced motion is asked for", matchMedia('(prefers-reduced-motion)').matches && matchMedia('(prefers-reduced-motion: reduce)').matches && !matchMedia('(prefers-reduced-motion: no-preference)').matches);
+fetch('data:image/svg+xml,%3Csvg%2F%3E').then(function (r) { return r.text().then(function (t) {
+  ok("fetch of a data: URL", r.status === 200 && t === '<svg/>' && r.headers.get('content-type') === 'image/svg+xml', r.status + ' ' + t);
+  return fetch('data:text/plain;base64,aMOpbGxv'); }); }).then(function (r) { return r.text(); }).then(function (t) {
+  ok("fetch of a base64 data: URL", t === 'h\u00e9llo', t);
+  console.log("DONE"); }, function (e) { console.log("fetch: FAIL " + e); });
+</script></body></html>

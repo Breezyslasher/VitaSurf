@@ -1,0 +1,566 @@
+diff --git a/content/handlers/image/image_cache.c b/content/handlers/image/image_cache.c
+index f4f39470f..92b30a3a2 100644
+--- a/content/handlers/image/image_cache.c
++++ b/content/handlers/image/image_cache.c
+@@ -31,8 +31,11 @@
+ #include "utils/utils.h"
+ #include "utils/log.h"
+ #include "utils/nsoption.h"
++#include "utils/nsurl.h"
+ #include "netsurf/misc.h"
+ #include "netsurf/bitmap.h"
++#include "netsurf/content.h"
++#include "netsurf/plotters.h"
+ #include "content/llcache.h"
+ #include "content/content_protected.h"
+ #include "desktop/gui_internal.h"
+@@ -41,6 +44,9 @@
+ #include "image/image_cache.h"
+ #include "image/image.h"
+ 
++struct image_cache_entry_s;
++static void image_cache_decode(struct image_cache_entry_s *centry);
++
+ /**
+  * Age of an entry within the cache
+  *
+@@ -380,7 +386,7 @@ struct bitmap *image_cache_get_bitmap(const struct content *c)
+ 
+ 	if (centry->bitmap == NULL) {
+ 		if (centry->convert != NULL) {
+-			centry->bitmap = centry->convert(centry->content);
++			image_cache_decode(centry);
+ 		}
+ 
+ 		if (centry->bitmap != NULL) {
+@@ -574,7 +580,7 @@ nserror image_cache_add(struct content *content,
+ 		/* no bitmap, check to see if we should speculatively convert */
+ 		if ((centry->convert != NULL) &&
+ 		    (image_cache_speculate(content) == true)) {
+-			centry->bitmap = centry->convert(centry->content);
++			image_cache_decode(centry);
+ 
+ 			if (centry->bitmap != NULL) {
+ 				image_cache_stats_bitmap_add(centry,
+@@ -970,6 +976,162 @@ void *image_cache_shrink(void *bitmap, int dest_width, int dest_height)
+ }
+ 
+ 
++/*
++ * Decode pacing (VitaSurf); see image_cache_frame(). Images at or
++ * under this many pixels decode even while the view moves: an icon
++ * takes well under a millisecond, and leaving one out as the page
++ * goes past shows more than it saves.
++ */
++#define IMAGE_CACHE_HOLD_PIXELS (128 * 128)
++/* a decode longer than this is named in the log */
++#define IMAGE_CACHE_SLOW_DECODE_MS 40
++
++static bool decode_hold;
++static unsigned int decode_budget_us;
++static uint64_t decode_frame_us;
++static unsigned int decode_frame_n;
++/* where skipped images were, merged into the last once full */
++#define IMAGE_CACHE_DEFERRED_MAX 32
++static struct rect deferred[IMAGE_CACHE_DEFERRED_MAX];
++static int deferred_n;
++static struct image_cache_decode_stats decode_stats;
++static uint64_t decode_stats_us;
++
++/* exported interface documented in image_cache.h */
++void image_cache_frame(bool hold, unsigned int budget_us)
++{
++	decode_hold = hold;
++	decode_budget_us = budget_us;
++	decode_frame_us = 0;
++	decode_frame_n = 0;
++}
++
++/* exported interface documented in image_cache.h */
++int image_cache_take_deferred(struct rect *out, int max)
++{
++	int i, n = 0;
++
++	for (i = 0; i < deferred_n; i++) {
++		if (n < max) {
++			out[n++] = deferred[i];
++		} else {
++			struct rect *m = &out[max - 1];
++
++			if (deferred[i].x0 < m->x0) m->x0 = deferred[i].x0;
++			if (deferred[i].y0 < m->y0) m->y0 = deferred[i].y0;
++			if (deferred[i].x1 > m->x1) m->x1 = deferred[i].x1;
++			if (deferred[i].y1 > m->y1) m->y1 = deferred[i].y1;
++		}
++	}
++	deferred_n = 0;
++	return n;
++}
++
++/* exported interface documented in image_cache.h */
++bool image_cache_frame_spent(void)
++{
++	return decode_budget_us != 0 && decode_frame_n > 0 &&
++		decode_frame_us >= decode_budget_us;
++}
++
++/* exported interface documented in image_cache.h */
++void image_cache_take_decode_stats(struct image_cache_decode_stats *s)
++{
++	*s = decode_stats;
++	s->ms = (unsigned int)(decode_stats_us / 1000);
++	memset(&decode_stats, 0, sizeof(decode_stats));
++	decode_stats_us = 0;
++}
++
++/**
++ * Whether an image may be decoded now, in an interactive redraw; if
++ * not, where it would have been drawn is recorded (VitaSurf).
++ */
++static bool image_cache_may_decode(const struct content *c,
++		const struct content_redraw_data *data,
++		const struct rect *clip)
++{
++	struct rect r;
++
++	if (decode_hold &&
++	    (uint64_t)c->width * (uint64_t)c->height >
++			IMAGE_CACHE_HOLD_PIXELS) {
++		decode_stats.held++;
++	} else if (image_cache_frame_spent()) {
++		decode_stats.budgeted++;
++	} else {
++		return true;
++	}
++
++	/* a tiled background can cover the whole clip */
++	r = *clip;
++	if (!data->repeat_x) {
++		if (r.x0 < data->x) r.x0 = data->x;
++		if (r.x1 > data->x + data->width) r.x1 = data->x + data->width;
++	}
++	if (!data->repeat_y) {
++		if (r.y0 < data->y) r.y0 = data->y;
++		if (r.y1 > data->y + data->height) r.y1 = data->y + data->height;
++	}
++	if (r.x1 <= r.x0 || r.y1 <= r.y0) {
++		/* nothing of it shows: nothing to come back for */
++		return false;
++	}
++	{
++		int i;
++		struct rect *m;
++
++		/* the same image met again in the same place */
++		for (i = 0; i < deferred_n; i++) {
++			if (deferred[i].x0 == r.x0 && deferred[i].y0 == r.y0 &&
++			    deferred[i].x1 == r.x1 && deferred[i].y1 == r.y1) {
++				return false;
++			}
++		}
++		if (deferred_n < IMAGE_CACHE_DEFERRED_MAX) {
++			deferred[deferred_n++] = r;
++			return false;
++		}
++		m = &deferred[IMAGE_CACHE_DEFERRED_MAX - 1];
++		if (r.x0 < m->x0) m->x0 = r.x0;
++		if (r.y0 < m->y0) m->y0 = r.y0;
++		if (r.x1 > m->x1) m->x1 = r.x1;
++		if (r.y1 > m->y1) m->y1 = r.y1;
++	}
++	return false;
++}
++
++/** Decode an entry's bitmap, timing it (VitaSurf). */
++static void image_cache_decode(struct image_cache_entry_s *centry)
++{
++	uint64_t t0 = vitasurf_clock_us();
++	uint64_t us;
++	unsigned int kpx;
++
++	centry->bitmap = centry->convert(centry->content);
++	us = vitasurf_clock_us() - t0;
++	decode_frame_us += us;
++	decode_frame_n++;
++	decode_stats_us += us;
++	decode_stats.decodes++;
++	kpx = (unsigned int)(((uint64_t)centry->content->width *
++			      (uint64_t)centry->content->height) / 1000);
++	decode_stats.kpixels += kpx;
++	if (us / 1000 > decode_stats.max_ms) {
++		decode_stats.max_ms = (unsigned int)(us / 1000);
++		decode_stats.max_kpixels = kpx;
++	}
++	if (us / 1000 >= IMAGE_CACHE_SLOW_DECODE_MS) {
++		const char *url = nsurl_access_leaf(
++				llcache_handle_get_url(
++					centry->content->llcache));
++
++		vita_log("images: decoding %dx%d %s took %u ms",
++			 centry->content->width, centry->content->height,
++			 url != NULL ? url : "?", (unsigned int)(us / 1000));
++	}
++}
++
+ /* exported interface documented in image_cache.h */
+ bool image_cache_redraw(struct content *c,
+ 			struct content_redraw_data *data,
+@@ -988,7 +1150,14 @@ bool image_cache_redraw(struct content *c,
+ 
+ 	if (centry->bitmap == NULL) {
+ 		if (centry->convert != NULL) {
+-			centry->bitmap = centry->convert(centry->content);
++			/* on screen, decoding waits its turn and the
++			 * image is drawn as nothing meanwhile: it is not
++			 * broken, so this is not a failure (VitaSurf) */
++			if (ctx->interactive &&
++			    !image_cache_may_decode(c, data, clip)) {
++				return true;
++			}
++			image_cache_decode(centry);
+ 		}
+ 
+ 		if (centry->bitmap != NULL) {
+diff --git a/content/handlers/image/image_cache.h b/content/handlers/image/image_cache.h
+index a1d20f715..81b69c948 100644
+--- a/content/handlers/image/image_cache.h
++++ b/content/handlers/image/image_cache.h
+@@ -40,6 +40,8 @@
+ #include "utils/errors.h"
+ #include "netsurf/content_type.h"
+ 
++struct rect;
++
+ struct content;
+ struct content_redraw_data;
+ struct redraw_context;
+@@ -205,6 +207,54 @@ bool image_cache_decode_size(int width, int height,
+  */
+ void *image_cache_shrink(void *bitmap, int dest_width, int dest_height);
+ 
++/********* Pacing the decodes a redraw does (VitaSurf) *********/
++
++/**
++ * Start a frame's decoding (VitaSurf).
++ *
++ * An image is decoded the first time it is drawn, inside the redraw,
++ * on the one thread there is: a large one holds that frame for as long
++ * as it takes, and a screenful arriving together holds it for all of
++ * them. The frontend calls this at the top of each frame to say how
++ * much of it decoding may have. An image that may not be decoded yet
++ * is drawn as nothing and its place recorded, for
++ * image_cache_take_deferred() to hand back so it can be drawn again.
++ *
++ * \param hold      The view is moving: only images small enough to
++ *                  decode at once (icons) are decoded.
++ * \param budget_us Once an image has been decoded this frame, no more
++ *                  are after this long; 0 for no limit.
++ */
++void image_cache_frame(bool hold, unsigned int budget_us);
++
++/**
++ * Where images were drawn as nothing since this was last asked, in the
++ * coordinates of the redraws that skipped them: a rectangle each, the
++ * last grown to hold the rest when there are more than max.
++ *
++ * \param out Filled with up to max rectangles.
++ * \param max Room in out, at least 1.
++ * \return how many were filled.
++ */
++int image_cache_take_deferred(struct rect *out, int max);
++
++/** Whether this frame's decoding budget is spent. */
++bool image_cache_frame_spent(void);
++
++/** What decoding cost, for the log (VitaSurf). */
++struct image_cache_decode_stats {
++	unsigned int decodes;      /**< images decoded */
++	unsigned int ms;           /**< time decoding them */
++	unsigned int max_ms;       /**< the longest one */
++	unsigned int max_kpixels;  /**< its size, in thousands of pixels */
++	unsigned int kpixels;      /**< pixels decoded, in thousands */
++	unsigned int held;         /**< draws skipped while the view moved */
++	unsigned int budgeted;     /**< draws skipped for the frame budget */
++};
++
++/** Fill in the decoding figures since the last call, and reset them. */
++void image_cache_take_decode_stats(struct image_cache_decode_stats *s);
++
+ /********* Image content handler generic cache callbacks ************/
+ 
+ /**
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 38a69fc04..9bfd02974 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -47,6 +47,7 @@
+ #endif
+ #include "content/fetch.h"
+ #include "html/html.h"
++#include "image/image_cache.h"
+ 
+ #include "framebuffer/gui.h"
+ #include "framebuffer/fbtk.h"
+@@ -82,6 +83,9 @@ struct gui_window *search_current_window;
+ struct gui_window *window_list = NULL;
+ 
+ /* private data for browser user widget */
++/* images a browser widget remembers to draw again (VitaSurf) */
++#define FB_IMAGES_WAITING_MAX 32
++
+ struct browser_widget_s {
+ 	struct browser_window *bw; /**< The browser window connected to this gui window */
+ 	int scrollx, scrolly; /**< scroll offsets. */
+@@ -95,6 +99,16 @@ struct browser_widget_s {
+ 			    * needs to pan the window.
+ 			    */
+ 	int panx, pany; /**< Panning required. */
++
++	/*
++	 * Images drawn as nothing while their decoding waited (VitaSurf),
++	 * in document pixels at the current scale (a redraw's plot
++	 * coordinates less its origin), so a scroll does not move them.
++	 * Each is drawn again, on its own, once decoding may go on.
++	 */
++	struct rect images_waiting[FB_IMAGES_WAITING_MAX];
++	int images_waiting_n;
++	bool images_flush; /**< the redraw is for them alone */
+ };
+ 
+ static struct gui_drag {
+@@ -234,6 +248,19 @@ widget_scroll_x(struct gui_window *gw, int x, bool abs)
+ 	fbtk_set_scroll_position(gw->hscroll, bwidget->scrollx + bwidget->panx);
+ }
+ 
++/*
++ * Decode pacing (VitaSurf): while the view has moved within the last
++ * FB_IMAGE_HOLD_US, large images wait; otherwise decoding stops for
++ * the frame once it has used FB_IMAGE_BUDGET_US, after the first. The
++ * figures are Vita_Suwayomi's: it holds uploads until a scroll has been
++ * still for six frames, and gives them 8 ms of a frame.
++ */
++#define FB_IMAGE_HOLD_US 100000
++#define FB_IMAGE_BUDGET_US 8000
++#ifdef __vita__
++static unsigned long long fb_last_move_us;
++#endif
++
+ /* pinned boxes a pan redraws in place of the whole screen (VitaSurf) */
+ #define FB_PINNED_MAX 32
+ #define FB_PINNED_MARGIN 8
+@@ -245,6 +272,107 @@ static void fb_redraw(fbtk_widget_t *widget,
+ 		      struct browser_widget_s *bwidget,
+ 		      struct browser_window *bw);
+ 
++/** Add a waiting image's place, once (VitaSurf). */
++static void
++fb_images_add(struct browser_widget_s *bwidget, const struct rect *d)
++{
++	struct rect *m;
++	int j;
++
++	for (j = 0; j < bwidget->images_waiting_n; j++) {
++		struct rect *w = &bwidget->images_waiting[j];
++
++		if (w->x0 == d->x0 && w->y0 == d->y0 &&
++		    w->x1 == d->x1 && w->y1 == d->y1) {
++			return;
++		}
++	}
++	if (bwidget->images_waiting_n < FB_IMAGES_WAITING_MAX) {
++		bwidget->images_waiting[bwidget->images_waiting_n++] = *d;
++		return;
++	}
++	m = &bwidget->images_waiting[FB_IMAGES_WAITING_MAX - 1];
++	if (d->x0 < m->x0) m->x0 = d->x0;
++	if (d->y0 < m->y0) m->y0 = d->y0;
++	if (d->x1 > m->x1) m->x1 = d->x1;
++	if (d->y1 > m->y1) m->y1 = d->y1;
++}
++
++/**
++ * Remember where the redraw just made left images out, in document
++ * pixels (VitaSurf): origin is where the redraw put the document's top
++ * left corner. The list merges into its last entry once full.
++ */
++static void
++fb_images_waited(struct browser_widget_s *bwidget, int ox, int oy)
++{
++	struct rect r[FB_IMAGES_WAITING_MAX];
++	int n, i;
++
++	n = image_cache_take_deferred(r, FB_IMAGES_WAITING_MAX);
++	for (i = 0; i < n; i++) {
++		struct rect d;
++
++		d.x0 = r[i].x0 - ox;
++		d.y0 = r[i].y0 - oy;
++		d.x1 = r[i].x1 - ox;
++		d.y1 = r[i].y1 - oy;
++		fb_images_add(bwidget, &d);
++	}
++}
++
++/**
++ * Draw again the images that waited, one at a time, until this frame's
++ * decoding budget is spent (VitaSurf). One left off the screen by a
++ * scroll since is dropped: it is drawn, and decoded, when it comes
++ * back into view. What is not reached stays for the next frame.
++ */
++static void
++fb_images_draw_waiting(fbtk_widget_t *widget,
++		       struct browser_widget_s *bwidget,
++		       struct browser_window *bw)
++{
++	struct rect left[FB_IMAGES_WAITING_MAX];
++	int n = bwidget->images_waiting_n, i, kept = 0;
++	int width = fbtk_get_width(widget);
++	int height = fbtk_get_height(widget);
++	nsfb_bbox_t queued = bwidget->redraw_box;
++	bool queued_required = bwidget->redraw_required;
++
++	memcpy(left, bwidget->images_waiting, sizeof(left[0]) * n);
++	bwidget->images_waiting_n = 0;
++	for (i = 0; i < n; i++) {
++		int x0 = left[i].x0 - bwidget->scrollx;
++		int y0 = left[i].y0 - bwidget->scrolly;
++		int x1 = left[i].x1 - bwidget->scrollx;
++		int y1 = left[i].y1 - bwidget->scrolly;
++
++		if (x0 < 0) x0 = 0;
++		if (y0 < 0) y0 = 0;
++		if (x1 > width) x1 = width;
++		if (y1 > height) y1 = height;
++		if (x1 <= x0 || y1 <= y0) {
++			continue;
++		}
++		if (image_cache_frame_spent()) {
++			/* for the next frame, with any this one adds */
++			left[kept++] = left[i];
++			continue;
++		}
++		bwidget->redraw_box.x0 = x0;
++		bwidget->redraw_box.y0 = y0;
++		bwidget->redraw_box.x1 = x1;
++		bwidget->redraw_box.y1 = y1;
++		fb_redraw(widget, bwidget, bw);
++	}
++	for (i = 0; i < kept; i++) {
++		fb_images_add(bwidget, &left[i]);
++	}
++	/* fb_redraw cleared these */
++	bwidget->redraw_box = queued;
++	bwidget->redraw_required = queued_required;
++}
++
+ /**
+  * Move part of the browser's picture for a pan. On the Vita the screen
+  * texture is moved by the GPU and only the shadow buffer is copied
+@@ -286,6 +414,8 @@ fb_pan(fbtk_widget_t *widget,
+ 	int dx, dy, i;
+ #ifdef __vita__
+ 	unsigned long long move_t0 = vita_now_us();
++
++	fb_last_move_us = move_t0;
+ #endif
+ 
+ 	nsfb_t *nsfb = fbtk_get_nsfb(widget);
+@@ -528,6 +658,8 @@ fb_redraw(fbtk_widget_t *widget,
+ 		nsu_getmonotonic_ms(&vs_t1);
+ 		vitasurf_ms_draw += (unsigned int)(vs_t1 - vs_t0);
+ 	}
++	fb_images_waited(bwidget, x - bwidget->scrollx,
++			 y - bwidget->scrolly);
+ 
+ 	if (fbtk_get_caret(widget, &caret_x, &caret_y, &caret_h)) {
+ 		/* This widget has caret, so render it */
+@@ -572,13 +704,17 @@ fb_browser_window_redraw(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 
+ 	if (bwidget->redraw_required) {
+ 		fb_redraw(widget, bwidget, gw->bw);
+-	} else {
++	} else if (!bwidget->images_flush) {
+ 		bwidget->redraw_box.x0 = 0;
+ 		bwidget->redraw_box.y0 = 0;
+ 		bwidget->redraw_box.x1 = fbtk_get_width(widget);
+ 		bwidget->redraw_box.y1 = fbtk_get_height(widget);
+ 		fb_redraw(widget, bwidget, gw->bw);
+ 	}
++	if (bwidget->images_flush) {
++		bwidget->images_flush = false;
++		fb_images_draw_waiting(widget, bwidget, gw->bw);
++	}
+ 	return 0;
+ }
+ 
+@@ -772,6 +908,30 @@ static bool nslog_stream_configure(FILE *fptr)
+ 	return true;
+ }
+ 
++#ifdef __vita__
++/**
++ * Have the images that waited drawn again, when the view is still and
++ * nothing else is waiting to be drawn (VitaSurf).
++ */
++static void fb_images_ask_redraw(void)
++{
++	struct gui_window *gw;
++
++	for (gw = window_list; gw != NULL; gw = gw->next) {
++		struct browser_widget_s *bwidget;
++
++		if (gw->browser == NULL) {
++			continue;
++		}
++		bwidget = fbtk_get_userpw(gw->browser);
++		if (bwidget != NULL && bwidget->images_waiting_n > 0) {
++			bwidget->images_flush = true;
++			fbtk_request_redraw(gw->browser);
++		}
++	}
++}
++#endif
++
+ static void framebuffer_run(void)
+ {
+ 	nsfb_event_t event;
+@@ -796,6 +956,13 @@ static void framebuffer_run(void)
+ #ifdef __vita__
+ 		unsigned long long a = vita_now_us();
+ 		unsigned long long b;
++		bool hold = a - fb_last_move_us < FB_IMAGE_HOLD_US;
++
++		/* a frame's decoding starts here, the scheduler's included */
++		image_cache_frame(hold, FB_IMAGE_BUDGET_US);
++		if (!hold && !fbtk_get_redraw_pending(fbtk)) {
++			fb_images_ask_redraw();
++		}
+ #endif
+ 		/* run the scheduler and discover how long to wait for
+ 		 * the next event.
+@@ -885,6 +1052,25 @@ static void framebuffer_run(void)
+ 						 fb_pan_pinned_redraws,
+ 						 fb_pan_whole);
+ 				}
++				{
++					struct image_cache_decode_stats ds;
++
++					image_cache_take_decode_stats(&ds);
++					if (ds.decodes > 0 || ds.held > 0 ||
++					    ds.budgeted > 0) {
++						vita_log("images: %u decoded, %u "
++							 "kpixels in %u ms, the "
++							 "longest %u ms for %u "
++							 "kpixels; %u draws waited "
++							 "for the view to stop "
++							 "and %u for a later "
++							 "frame", ds.decodes,
++							 ds.kpixels, ds.ms,
++							 ds.max_ms,
++							 ds.max_kpixels, ds.held,
++							 ds.budgeted);
++					}
++				}
+ 				fb_pan_whole = 0;
+ 				fb_pan_moves = 0;
+ 				fb_pan_move_us = 0;

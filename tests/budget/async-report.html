@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!-- An async function the budget stops. Its promise is rejected with the
+     budget's error, and a page that reports its errors hears about it
+     from window.onerror, the error event or unhandledrejection -- Home
+     Assistant then parsed the stack, overran the budget again, and the
+     errors fed each other until memory ran out. None of them may fire
+     for the budget's own error. A thrown error of the page's own still
+     reaches them. -->
+<html><head><title>budget: an async overrun is not the page's error</title></head><body>
+<script>
+var heard = [];
+window.onerror = function (m) { heard.push('onerror: ' + m); };
+window.addEventListener('error', function (e) { heard.push('error event: ' + e.message); });
+window.addEventListener('unhandledrejection', function (e) {
+  heard.push('unhandledrejection: ' + (e.reason && e.reason.message));
+});
+var t0 = Date.now();
+(async function () {
+  await null;
+  while (Date.now() - t0 < 90000) {}
+  console.log('FAIL left the loop after ' + (Date.now() - t0) + ' ms');
+})();
+setTimeout(function () {
+  var own = heard.filter(function (h) { return /mine/.test(h); });
+  var budget = heard.filter(function (h) { return /interrupted/.test(h); });
+  console.log((budget.length === 0 ? 'PASS' : 'FAIL') +
+              ' the budget error reached the page ' + budget.length + ' times');
+  setTimeout(function () { throw new Error('mine'); }, 0);
+  setTimeout(function () {
+    var own2 = heard.filter(function (h) { return /mine/.test(h); });
+    console.log((own2.length > 0 ? 'PASS' : 'FAIL') + ' the page still hears its own errors');
+  }, 200);
+}, 25000);
+</script></body></html>

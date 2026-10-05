@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<!-- The universal chain drops a rule whose key compound needs an
+     attribute the element has not got. These rules are the ones that
+     touches: no name, class or id in the key compound, so they are
+     filed in that chain and offered to every element on the page.
+
+     Asserted through layout, because this build's getComputedStyle
+     reports mostly defaults. Every div is a child of body, so the
+     baseline left edge is body's 8px margin. -->
+<html><head><meta charset="utf-8"><title>attribute rule matching</title>
+<style>
+/* first, so that the rules below win the ties on source order */
+:not([data-absent]) { padding-left: 20px; }
+[data-one] { padding-left: 90px; }
+[data-a][data-b] { padding-left: 40px; }
+[DATA-CAPS] { padding-left: 60px; }
+</style></head><body>
+<div data-one><span id="has">has</span></div>
+<div><span id="hasnt">hasnt</span></div>
+<div data-a data-b><span id="both">both</span></div>
+<div data-a><span id="one">one</span></div>
+<div data-caps><span id="caps">caps</span></div>
+<div id="laterbox"><span id="later">later</span></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+/* padding is inside the border box, so a div's own left edge does not
+   move with it: measure where its content starts instead */
+function pad(id){
+  var e = document.getElementById(id);
+  return e.getBoundingClientRect().left - e.parentNode.getBoundingClientRect().left;
+}
+setTimeout(function(){
+  /* the plain case: the rule must still reach the element that has
+     the attribute, and must not reach the one that has not */
+  ok("an attribute rule reaches an element with that attribute",
+     pad("has") === 90);
+  /* 20 rather than 0: the :not() rule below matches everything */
+  ok("and not one without it", pad("hasnt") === 20);
+  /* both names are needed, so both must be present */
+  ok("a rule wanting two attributes reaches an element with both",
+     pad("both") === 40);
+  ok("and not one with only the first", pad("one") === 20);
+  /* a negated detail asks for an absence and so can never be used to
+     skip: if it were, nothing on this page would get 20px */
+  ok(":not([attr]) still reaches an element without that attribute",
+     pad("hasnt") === 20);
+  /* an attribute name is matched without regard to case in HTML */
+  ok("an upper-case selector reaches a lower-case attribute",
+     pad("caps") === 60);
+  /* and an attribute set after the page loaded must be seen when the
+     element is selected again */
+  document.getElementById("laterbox").setAttribute("data-one", "");
+  setTimeout(function(){
+    ok("an attribute added later brings its rule with it",
+       pad("later") === 90);
+    console.log("ATTRBLOOM DONE");
+  }, 60);
+}, 60);
+</script>
+</body></html>

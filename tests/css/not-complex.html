@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!-- :not() with complex selectors and @scope with lists and complex
+     roots and limits. Each XX line names a box, its width and PASS when
+     the width is what a browser gives it. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+div { width: 100px; height: 4px; }
+.x:not(.a .x) { width: 60px; }
+.y:not(.a > .y, .b) { width: 50px; }
+.z:not(.a + .z) { width: 40px; }
+@scope (.card, .panel) to (.slot, .inner > .deep) {
+  .t { width: 30px; }
+}
+@scope (main .sec) to (:scope > .stop) {
+  .u { width: 20px; }
+}
+</style></head><body>
+<div class="a"><div class="x" id="x1"></div><div class="y" id="y1"></div></div>
+<div class="x" id="x2"></div>
+<div class="y" id="y2"></div>
+<div class="y b" id="y3"></div>
+<div class="a"></div><div class="z" id="z1"></div><div class="z" id="z2"></div>
+<div class="card"><div class="t" id="t1"></div><div class="slot"><div class="t" id="t2"></div></div>
+  <div class="inner"><div class="deep"><div class="t" id="t3"></div></div><div class="t" id="t4"></div></div></div>
+<div class="panel"><div class="t" id="t5"></div></div>
+<div class="t" id="t6"></div>
+<main><div class="sec"><div class="u" id="u1"></div><div class="stop"><div class="u" id="u2"></div></div></div></main>
+<script>
+var want = { x1: 100, x2: 60, y1: 100, y2: 50, y3: 100, z1: 100, z2: 40,
+  t1: 30, t2: 100, t3: 100, t4: 30, t5: 30, t6: 100, u1: 20, u2: 100 };
+window.addEventListener('load', function () { setTimeout(function () {
+  var n = 0, ok = 0;
+  for (var id in want) {
+    var w = Math.round(document.getElementById(id).getBoundingClientRect().width);
+    n++; if (w === want[id]) ok++;
+    console.log('XX ' + id + ' ' + w + (w === want[id] ? ' PASS' : ' FAIL (want ' + want[id] + ')'));
+  }
+  console.log('XX ' + ok + ' of ' + n + ' pass');
+}, 200); });
+</script></body></html>

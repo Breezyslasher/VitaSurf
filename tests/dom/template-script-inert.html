@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<!-- A script inside a template is inert: the parser neither runs nor
+     fetches it, and it runs only once a copy is put in the document. The
+     parser here puts a template's children in the page and ran every
+     script in them as it read it. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<script>var ran = [], once = 0;</script>
+<script id="once">once++;</script>
+<template id="t"><script>ran.push('inline');</script><script src="resources/late-script.js"></script><div><script>ran.push('nested');</script></div></template>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+ok("the parser ran nothing in the template (" + ran.join() + ")", ran.length === 0);
+window.addEventListener('load', function () {
+ ok("nor had by load (" + ran.join() + ")", ran.length === 0);
+ var t = document.getElementById('t');
+ document.body.appendChild(document.importNode(t.content, true));
+ setTimeout(function () {
+  ok("a copy put in the document runs (" + ran.join() + ")",
+     ran.indexOf('inline') >= 0 && ran.indexOf('nested') >= 0);
+  ok("a copy of a script that ran does not run (" + once + ")", once === 1);
+ }, 100);
+});
+</script></body></html>

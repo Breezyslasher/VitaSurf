@@ -1,0 +1,109 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index a1342966c..b207fce45 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -30,9 +30,12 @@
+ #include <strings.h>
+ #include <stdlib.h>
+ 
++#include <nsutils/time.h>
++
+ #include "utils/nsoption.h"
+ #include "utils/corestrings.h"
+ #include "utils/log.h"
++#include "utils/utils.h"
+ #include "netsurf/inttypes.h"
+ #include "netsurf/misc.h"
+ #include "netsurf/content.h"
+@@ -1040,6 +1043,34 @@ html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
+ 		}
+ 	}
+ 
++	/*
++	 * Build the merged selector index now rather than on the first
++	 * element, so that its cost is timed and logged (VitaSurf). If
++	 * there is no memory for it selection goes sheet by sheet.
++	 */
++	{
++		uint32_t sheets = 0, entries = 0, bytes = 0;
++		uint64_t t0 = 0, t1 = 0;
++		css_error ierr;
++
++		nsu_getmonotonic_ms(&t0);
++		ierr = css_select_ctx_build_index(select_ctx, &sheets,
++				&entries, &bytes);
++		nsu_getmonotonic_ms(&t1);
++		vitasurf_css_index_builds++;
++		vitasurf_ms_css_index += (unsigned int) (t1 - t0);
++		if (ierr == CSS_OK) {
++			vita_log("css: index of %u rules from %u sheets "
++				 "built in %u ms, %u KB",
++				 (unsigned int) entries, (unsigned int) sheets,
++				 (unsigned int) (t1 - t0),
++				 (unsigned int) (bytes / 1024));
++		} else {
++			vita_log("css: no index (error %d): selection goes "
++				 "sheet by sheet", (int) ierr);
++		}
++	}
++
+ 	/* return new selection context to caller */
+ 	*ret_select_ctx = select_ctx;
+ 	return NSERROR_OK;
+diff --git a/utils/utils.c b/utils/utils.c
+index 3e679f818..282cb921a 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -576,6 +576,8 @@ void regfree(regex_t *preg)
+ /* exported interface documented in utils/utils.h */
+ unsigned int vitasurf_ms_html_parse;
+ unsigned int vitasurf_ms_css;
++unsigned int vitasurf_css_index_builds;
++unsigned int vitasurf_ms_css_index;
+ uint64_t vitasurf_ms_nested;
+ unsigned int vitasurf_ms_image;
+ unsigned int vitasurf_images_asked;
+@@ -676,6 +678,11 @@ extern unsigned int css_select_steps_class;
+ extern unsigned int css_select_steps_id;
+ extern unsigned int css_select_steps_universal;
+ extern unsigned int css_select_sheets_empty;
++extern unsigned int css_select_index_builds;
++extern unsigned int css_select_index_entries;
++extern unsigned int css_select_index_bytes;
++extern unsigned int css_select_index_sheets;
++extern unsigned int css_select_index_failed;
+ extern unsigned int css_select_cand_details_failed;
+ extern unsigned int css_select_cand_comb_failed;
+ extern unsigned int css_select_cand_matched;
+@@ -727,6 +734,8 @@ void vitasurf_profile_reset(void)
+ {
+ 	vitasurf_ms_html_parse = 0;
+ 	vitasurf_ms_css = 0;
++	vitasurf_css_index_builds = 0;
++	vitasurf_ms_css_index = 0;
+ 	vitasurf_ms_image = 0;
+ 	vitasurf_images_asked = 0;
+ 	vitasurf_images_done = 0;
+@@ -825,6 +834,8 @@ void vitasurf_profile_reset(void)
+ 	css_select_steps_id = 0;
+ 	css_select_steps_universal = 0;
+ 	css_select_sheets_empty = 0;
++	css_select_index_builds = 0;
++	css_select_index_failed = 0;
+ 	css_select_cand_details_failed = 0;
+ 	css_select_cand_comb_failed = 0;
+ 	css_select_cand_matched = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index d1046095e..5978dece6 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -131,6 +131,9 @@ bool is_dir(const char *path);
+  */
+ extern unsigned int vitasurf_ms_html_parse;
+ extern unsigned int vitasurf_ms_css;
++/* the merged selector index: how often it was built and for how long */
++extern unsigned int vitasurf_css_index_builds;
++extern unsigned int vitasurf_ms_css_index;
+ extern unsigned int vitasurf_ms_image;
+ /**
+  * Images the page asked for, decoded, and failed (VitaSurf).

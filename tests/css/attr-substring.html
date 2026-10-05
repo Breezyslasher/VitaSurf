@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!-- [attr*="value"] anywhere in the value: at the start, the end, the
+     middle, the whole of it, a single character, across case as this
+     engine has always compared it, and not when absent or longer than
+     the value. Each box is 200px wide when it matches and 100px when not. -->
+<html><head><style>
+body { margin: 0 } div { width: 100px; height: 4px }
+[data-t*="abc"] { width: 200px }
+[data-u*="x"] { width: 200px }
+</style></head><body>
+<div id="a" data-t="abcdef"></div>
+<div id="b" data-t="defabc"></div>
+<div id="c" data-t="dabcef"></div>
+<div id="d" data-t="abc"></div>
+<div id="e" data-t="ABCdef"></div>
+<div id="f" data-t="ab"></div>
+<div id="g" data-t="aabbcc"></div>
+<div id="h" data-t="abababc"></div>
+<div id="i" data-u="x"></div>
+<div id="j" data-u="yyyx"></div>
+<div id="k" data-u="yyy"></div>
+<div id="l"></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+setTimeout(function(){
+ var want = {a:200,b:200,c:200,d:200,e:200,f:100,g:100,h:200,i:200,j:200,k:100,l:100};
+ for (var id in want) {
+  var w = Math.round(document.getElementById(id).getBoundingClientRect().width);
+  ok(id + " is " + w + ", wants " + want[id], w === want[id]);
+ }
+}, 300);
+</script></body></html>

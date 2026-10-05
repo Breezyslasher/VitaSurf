@@ -1,0 +1,71 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index 466c7e6ae..d775f6c86 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -631,6 +631,16 @@ unsigned int vitasurf_ms_js_timer_max;
+ unsigned int vitasurf_js_timers_slow;
+ unsigned int vitasurf_ms_js_timers_slow;
+ char vitasurf_js_timer_max_name[64];
++unsigned int vitasurf_js_node_wraps;
++unsigned int vitasurf_js_wrap_hits;
++unsigned int vitasurf_js_wrap_steps;
++unsigned int vitasurf_ms_js_wrap;
++unsigned int vitasurf_js_attr_gets;
++unsigned int vitasurf_ms_js_attr_get_time;
++unsigned int vitasurf_js_drains;
++unsigned int vitasurf_ms_js_drain_tail;
++unsigned int vitasurf_job_max_wraps;
++unsigned int vitasurf_job_max_attr_gets;
+ /* counted inside libcss, reset here with the rest (VitaSurf) */
+ extern unsigned int css_select_calls;
+ extern unsigned int css_select_sheets_seen;
+@@ -730,6 +740,16 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_js_timers_slow = 0;
+ 	vitasurf_ms_js_timers_slow = 0;
+ 	vitasurf_js_timer_max_name[0] = '\0';
++	vitasurf_js_node_wraps = 0;
++	vitasurf_js_wrap_hits = 0;
++	vitasurf_js_wrap_steps = 0;
++	vitasurf_ms_js_wrap = 0;
++	vitasurf_js_attr_gets = 0;
++	vitasurf_ms_js_attr_get_time = 0;
++	vitasurf_js_drains = 0;
++	vitasurf_ms_js_drain_tail = 0;
++	vitasurf_job_max_wraps = 0;
++	vitasurf_job_max_attr_gets = 0;
+ 	css_select_calls = 0;
+ 	css_select_sheets_seen = 0;
+ 	css_select_selectors_considered = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 4fd2e1a92..619f61a78 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -315,6 +315,28 @@ extern unsigned int vitasurf_js_timers_slow;
+ extern unsigned int vitasurf_ms_js_timers_slow;
+ /** The name of the longest timer's callback, or "?". */
+ extern char vitasurf_js_timer_max_name[64];
++/**
++ * What the bindings are asked for, and what a crossing costs (VitaSurf).
++ *
++ * The longest job on a GitHub load is 12388 ms and the five things
++ * counted so far come to 2910 of it, so nine and a half seconds are in
++ * bindings nobody counts. Every crossing that hands JavaScript a node
++ * goes through wrap_node, which looks the node up in a table of 128
++ * chains; a document of six thousand elements and seven thousand text
++ * nodes puts about a hundred entries in each. Count the calls, the
++ * hits, and the chain steps walked, so the average chain length is in
++ * the log rather than inferred.
++ */
++extern unsigned int vitasurf_js_node_wraps;
++extern unsigned int vitasurf_js_wrap_hits;
++extern unsigned int vitasurf_js_wrap_steps;
++extern unsigned int vitasurf_ms_js_wrap;
++extern unsigned int vitasurf_js_attr_gets;
++extern unsigned int vitasurf_ms_js_attr_get_time;
++extern unsigned int vitasurf_js_drains;
++extern unsigned int vitasurf_ms_js_drain_tail;
++extern unsigned int vitasurf_job_max_wraps;
++extern unsigned int vitasurf_job_max_attr_gets;
+ 
+ /*
+  * The scheduler's callbacks (VitaSurf). A GitHub page load reports

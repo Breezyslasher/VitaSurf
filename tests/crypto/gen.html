@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<!-- Generates keys, signatures and ciphertexts with random parts and
+     prints them as one JSON line ("RES ..."), for check.html to verify in
+     another browser. -->
+<html><head><title>gen</title></head><body><script>
+var S = crypto.subtle, te = new TextEncoder(), msg = te.encode('the message VitaSurf signs');
+function b64(b) { var s = ''; new Uint8Array(b).forEach(function (x) { s += String.fromCharCode(x); }); return btoa(s); }
+var R = {}, jobs = [];
+function ec(name, curve, hash) { jobs.push(function () {
+  return S.generateKey({ name: name, namedCurve: curve }, true, name === 'ECDSA' ? ['sign', 'verify'] : ['deriveBits']).then(function (kp) {
+    var id = name + ' ' + curve, r = R[id] = { name: name, curve: curve, hash: hash };
+    return Promise.all([S.exportKey('spki', kp.publicKey), S.exportKey('jwk', kp.publicKey), S.exportKey('pkcs8', kp.privateKey), S.exportKey('jwk', kp.privateKey), S.exportKey('raw', kp.publicKey),
+      name === 'ECDSA' ? S.sign({ name: 'ECDSA', hash: hash }, kp.privateKey, msg) : Promise.resolve(null)]).then(function (v) {
+      r.spki = b64(v[0]); r.pubJwk = v[1]; r.pkcs8 = b64(v[2]); r.privJwk = v[3]; r.raw = b64(v[4]); if (v[5]) r.sig = b64(v[5]); }); }); }); }
+function okp(name) { jobs.push(function () {
+  return S.generateKey(name, true, name === 'Ed25519' ? ['sign', 'verify'] : ['deriveBits']).then(function (kp) {
+    var r = R[name] = { name: name, okp: true };
+    return Promise.all([S.exportKey('spki', kp.publicKey), S.exportKey('jwk', kp.publicKey), S.exportKey('pkcs8', kp.privateKey), S.exportKey('jwk', kp.privateKey), S.exportKey('raw', kp.publicKey),
+      name === 'Ed25519' ? S.sign(name, kp.privateKey, msg) : Promise.resolve(null)]).then(function (v) {
+      r.spki = b64(v[0]); r.pubJwk = v[1]; r.pkcs8 = b64(v[2]); r.privJwk = v[3]; r.raw = b64(v[4]); if (v[5]) r.sig = b64(v[5]); }); }); }); }
+function rsa(name, hash, extra) { jobs.push(function () {
+  return S.generateKey({ name: name, modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: hash }, true, name === 'RSA-OAEP' ? ['encrypt', 'decrypt'] : ['sign', 'verify']).then(function (kp) {
+    var id = name + ' ' + hash, r = R[id] = { name: name, hash: hash, extra: extra };
+    var op = name === 'RSA-OAEP' ? S.encrypt(extra ? { name: 'RSA-OAEP', label: te.encode(extra) } : { name: 'RSA-OAEP' }, kp.publicKey, msg)
+      : S.sign(name === 'RSA-PSS' ? { name: name, saltLength: extra } : name, kp.privateKey, msg);
+    return Promise.all([S.exportKey('spki', kp.publicKey), S.exportKey('jwk', kp.publicKey), S.exportKey('pkcs8', kp.privateKey), S.exportKey('jwk', kp.privateKey), op]).then(function (v) {
+      r.spki = b64(v[0]); r.pubJwk = v[1]; r.pkcs8 = b64(v[2]); r.privJwk = v[3]; r.out = b64(v[4]); r.alg = kp.publicKey.algorithm.modulusLength + ' ' + Array.from(kp.publicKey.algorithm.publicExponent).join(','); }); }); }); }
+ec('ECDSA', 'P-256', 'SHA-256'); ec('ECDSA', 'P-384', 'SHA-384'); ec('ECDSA', 'P-521', 'SHA-512'); ec('ECDSA', 'P-256', 'SHA-1');
+ec('ECDH', 'P-256'); ec('ECDH', 'P-384'); ec('ECDH', 'P-521'); okp('Ed25519'); okp('X25519');
+rsa('RSASSA-PKCS1-v1_5', 'SHA-256'); rsa('RSASSA-PKCS1-v1_5', 'SHA-1'); rsa('RSA-PSS', 'SHA-256', 32); rsa('RSA-PSS', 'SHA-512', 0);
+rsa('RSA-OAEP', 'SHA-256'); rsa('RSA-OAEP', 'SHA-1', 'a label');
+jobs.reduce(function (p, f) { return p.then(f); }, Promise.resolve()).then(function () {
+  /* in pieces: a log line can be cut short, and the whole is kilobytes */
+  var j = JSON.stringify(R), n = Math.ceil(j.length / 300);
+  for (var i = 0; i < n; i++) console.log('RES ' + (1000 + i) + ' ' + j.substr(i * 300, 300));
+  console.log('RES END ' + n); }, function (e) { console.log('RES ERROR ' + e.name + ' ' + e.message); });
+</script></body></html>

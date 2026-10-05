@@ -12,6 +12,8 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/sysmem.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/power.h>
 #include <psp2/sysmodule.h>
 #include <psp2/system_param.h>
@@ -35,6 +37,7 @@
 #include "netsurf/content_type.h"
 
 #include <mbedtls/error.h>
+#include <mbedtls/ssl.h>
 #include <mbedtls/version.h>
 #include <mbedtls/x509_crt.h>
 
@@ -133,9 +136,27 @@ void vita_options_floor(void)
 	if (nsoption_int(max_fetchers) < 12) {
 		nsoption_set_int(max_fetchers, 12);
 	}
-	vita_log("options: %d fetchers, %d per host",
+	/*
+	 * The memory cache, of which NetSurf gives a quarter to decoded
+	 * images. A settings file saved from the menu kept the 4 MB it was
+	 * written with, which left 1 MB of images: a poster scrolled out of
+	 * view and back was decoded again. The heap peaks near 84 MB of
+	 * 176 MB on the heaviest pages, so 24 MB is room it already has.
+	 */
+	if (nsoption_int(memory_cache_size) < 24 * 1024 * 1024) {
+		nsoption_set_int(memory_cache_size, 24 * 1024 * 1024);
+	}
+#ifdef VITASURF_ANIMATIONS
+	/* the animation build runs them, whatever Choices says */
+	nsoption_set_bool(css_animations, true);
+#endif
+	vita_log("options: %d fetchers, %d per host, memory cache %d MB, "
+		 "CSS animations %s at %d frames a second",
 		 nsoption_int(max_fetchers),
-		 nsoption_int(max_fetchers_per_host));
+		 nsoption_int(max_fetchers_per_host),
+		 nsoption_int(memory_cache_size) / (1024 * 1024),
+		 nsoption_bool(css_animations) ? "on" : "off",
+		 nsoption_int(css_animation_fps));
 }
 
 /*
@@ -148,6 +169,9 @@ void vita_options_floor(void)
  * registered, and log it once at startup. A page that arrives as a grey
  * box is then one line away from an explanation.
  */
+/* libjpeg-turbo's, present only when it was built with SIMD */
+extern unsigned int jpeg_simd_cpu_support(void) __attribute__((weak));
+
 void vita_log_image_decoders(void)
 {
 	static const struct {
@@ -198,6 +222,31 @@ void vita_log_image_decoders(void)
 	if (nmissing > 0) {
 		vita_log("image decoders missing: %s", missing);
 	}
+	/*
+	 * Whether libjpeg-turbo decodes with NEON (VitaSurf). Only a build
+	 * with its SIMD extensions has this function, and vdpm's has none,
+	 * so the reference is weak: it is NULL when JPEGs go through the
+	 * plain C paths, which is the thing to know when reading decode
+	 * times from a log. 0x10 is libjpeg-turbo's JSIMD_NEON.
+	 */
+	if (jpeg_simd_cpu_support == NULL) {
+		vita_log("image decoders: libjpeg has no SIMD extensions; JPEGs "
+			 "decode in plain C");
+	} else {
+		unsigned int simd = jpeg_simd_cpu_support();
+
+		vita_log("image decoders: libjpeg SIMD flags 0x%x, NEON %s",
+			 simd, (simd & 0x10u) ? "on" : "off");
+	}
+}
+
+unsigned int vita_heap_free_kb(void)
+{
+	struct mallinfo mi = mallinfo();
+	unsigned int size_kb = vita_heap_size_kb();
+	unsigned int used_kb = (unsigned int)mi.uordblks / 1024;
+
+	return used_kb < size_kb ? size_kb - used_kb : 0;
 }
 
 void vita_log_memory(const char *what)
@@ -224,6 +273,53 @@ void vita_log_memory(const char *what)
 		 (unsigned int)info.size_user / 1024,
 		 (unsigned int)info.size_cdram / 1024,
 		 (unsigned int)info.size_phycont / 1024);
+
+	/*
+	 * What a small allocation costs right now (VitaSurf).
+	 *
+	 * setAttribute costs 1.13 ms a call on a GitHub load and 0.011 ms
+	 * on a host doing the same work with the same MutationObserver
+	 * registered -- a hundredfold, where the machines are twelve to
+	 * twenty apart on everything else. Each call allocates several
+	 * times over, and newlib's malloc is one best-fit free list where
+	 * glibc has tcache and fastbins, so a list this long would make
+	 * every small allocation walk it. That is the same shape as the
+	 * kilobyte-at-a-time fread: fine on the host, pathological here.
+	 *
+	 * So measure it instead of arguing about it. A thousand small
+	 * blocks are taken and freed in an order that leaves the list as
+	 * it was found, and the count of free chunks says how long the
+	 * list is. Both are printed beside the heap size, so a log shows
+	 * whether the cost climbs with the heap.
+	 */
+	{
+		enum { MALLOC_PROBE_N = 1000 };
+		static void *probe[MALLOC_PROBE_N];
+		uint64_t t0, t_alloc, t_free;
+		unsigned i;
+
+		t0 = sceKernelGetProcessTimeWide();
+		for (i = 0; i < MALLOC_PROBE_N; i++) {
+			/* the sizes a dom_string, a JSString and a wrapper
+			 * actually ask for */
+			probe[i] = malloc(24 + (i % 5) * 16);
+		}
+		t_alloc = sceKernelGetProcessTimeWide() - t0;
+
+		t0 = sceKernelGetProcessTimeWide();
+		for (i = 0; i < MALLOC_PROBE_N; i++) {
+			free(probe[i]);
+			probe[i] = NULL;
+		}
+		t_free = sceKernelGetProcessTimeWide() - t0;
+
+		vita_log("memory (%s): 1000 small blocks took %u us to "
+			 "allocate and %u us to free, with %u free chunks "
+			 "holding %u KB",
+			 what, (unsigned int)t_alloc, (unsigned int)t_free,
+			 (unsigned int)mi.ordblks,
+			 (unsigned int)mi.fordblks / 1024);
+	}
 }
 
 int vita_platform_poll_resume(void)
@@ -352,6 +448,47 @@ int vita_layout_dump_requested(void)
 	return vita_flag_present(VITASURF_LAYOUT_FLAG);
 }
 
+/* exported interface documented in vita_platform.h */
+bool vita_decode_thread_wanted(void)
+{
+	return !vita_flag_present(VITASURF_NO_DECODE_THREAD_FLAG);
+}
+
+/* exported interface documented in vita_platform.h */
+bool vita_curl_pump_wanted(void)
+{
+	static int wanted = -1;
+
+	if (wanted < 0) {
+		wanted = vita_flag_present(VITASURF_NO_PUMP_FLAG) ? 0 : 1;
+		vita_log("network: transfers %s kept moving while a script "
+			 "runs", wanted ? "are" : "are not (nopump)");
+	}
+	return wanted != 0;
+}
+
+/*
+ * The decode threads' places (VitaSurf). The main thread runs NetSurf
+ * on the first core. The first decoder gets the second core to itself;
+ * the second shares the third with the busy overlay, which sleeps but
+ * for a check every 50 ms and outranks it when it wakes. A large JPEG
+ * then costs the page nothing but the memory bandwidth it shares.
+ * Below the main thread's priority, so that if the system puts one
+ * beside it the page still wins.
+ */
+#define DECODE_THREAD_PRIORITY (0x10000100 + 10)
+
+/* exported interface documented in vita_platform.h */
+void vita_decode_thread_started(int index)
+{
+	SceUID self = sceKernelGetThreadId();
+
+	sceKernelChangeThreadCpuAffinityMask(self, index == 0 ?
+					     SCE_KERNEL_CPU_MASK_USER_1 :
+					     SCE_KERNEL_CPU_MASK_USER_2);
+	sceKernelChangeThreadPriority(self, DECODE_THREAD_PRIORITY);
+}
+
 /** Log the contents of the data directory so flag files can be checked. */
 static void log_data_dir(void)
 {
@@ -413,48 +550,169 @@ static void log_iconv_selftest(void)
 	}
 }
 
-/**
- * Parse the bundled CA file through mbedTLS the way libcurl does and log
- * the result, so a TLS failure can be traced to the bundle or the library.
- */
-static void log_tls_selftest(void)
+/* The shared CA chain; see vita_tls_ca_shared() */
+static mbedtls_x509_crt ca_chain;
+static int ca_state;		/* 0 not tried, 1 ready, -1 failed */
+static int ca_rejected;		/* certificates the parse skipped */
+static char *ca_path;
+static char *ca_first;
+static size_t ca_first_len;
+
+static void ca_load(const char *path)
 {
 	char *pem = NULL;
 	size_t len = 0;
-	mbedtls_x509_crt chain;
-	const mbedtls_x509_crt *c;
-	char version[16];
-	char buf[160];
+	unsigned long long t0 = vita_now_us();
+	const char *b, *e;
 	int ret;
-	int count = 0;
 
-	if (vita_read_file(VITASURF_CA_BUNDLE, &pem, &len) != 0) {
-		vita_log("selftest: cannot read %s", VITASURF_CA_BUNDLE);
+	ca_state = -1;
+	ca_path = strdup(path);
+	if (ca_path == NULL || vita_read_file(path, &pem, &len) != 0) {
+		vita_log("tls: cannot read the CA bundle %s", path);
 		return;
 	}
+	mbedtls_x509_crt_init(&ca_chain);
+	/* PEM input must include the terminating NUL, which vita_read_file adds */
+	ret = mbedtls_x509_crt_parse(&ca_chain, (const unsigned char *)pem,
+				     len + 1);
+	if (ret < 0) {
+		char buf[128];
+
+		mbedtls_strerror(ret, buf, sizeof(buf));
+		vita_log("tls: the CA bundle did not parse: -0x%04x %s",
+			 (unsigned int)-ret, buf);
+		mbedtls_x509_crt_free(&ca_chain);
+		free(pem);
+		return;
+	}
+	ca_rejected = ret;
+
+	/* the first certificate as it stands, for libcurl to parse */
+	b = strstr(pem, "-----BEGIN CERTIFICATE-----");
+	e = (b != NULL) ? strstr(b, "-----END CERTIFICATE-----") : NULL;
+	if (e != NULL) {
+		size_t n = (size_t)(e - b) + strlen("-----END CERTIFICATE-----");
+
+		ca_first = malloc(n + 2);
+		if (ca_first != NULL) {
+			memcpy(ca_first, b, n);
+			ca_first[n] = '\n';
+			ca_first[n + 1] = '\0';
+			ca_first_len = n + 2;
+		}
+	}
+	free(pem);
+	if (ca_first == NULL) {
+		mbedtls_x509_crt_free(&ca_chain);
+		return;
+	}
+	ca_state = 1;
+	vita_log("tls: CA bundle parsed once in %u ms; every connection "
+		 "shares it",
+		 (unsigned int)((vita_now_us() - t0) / 1000));
+}
+
+int vita_tls_ca_shared(const char *path, const char **first_pem,
+		       size_t *first_len)
+{
+	if (path == NULL)
+		return 0;
+	if (ca_state == 0)
+		ca_load(path);
+	if (ca_state != 1 || strcmp(path, ca_path) != 0)
+		return 0;
+	*first_pem = ca_first;
+	*first_len = ca_first_len;
+	return 1;
+}
+
+void vita_tls_ca_attach(void *mbedtls_ssl_config)
+{
+	if (ca_state == 1 && mbedtls_ssl_config != NULL)
+		mbedtls_ssl_conf_ca_chain(
+			(struct mbedtls_ssl_config *)mbedtls_ssl_config,
+			&ca_chain, NULL);
+}
+
+/**
+ * Log what mbedTLS made of the bundled CA file, which is the chain every
+ * connection shares, so a TLS failure can be traced to the bundle or the
+ * library.
+ */
+static void log_tls_selftest(void)
+{
+	const mbedtls_x509_crt *c;
+	const char *first;
+	size_t first_len;
+	char version[16];
+	char buf[160];
+	int count = 0;
 
 	mbedtls_version_get_string(version);
-	mbedtls_x509_crt_init(&chain);
-	/* PEM input must include the terminating NUL, which vita_read_file adds */
-	ret = mbedtls_x509_crt_parse(&chain, (const unsigned char *)pem, len + 1);
-	for (c = &chain; c != NULL && c->version != 0; c = c->next) {
-		count++;
-	}
-	if (ret < 0) {
-		mbedtls_strerror(ret, buf, sizeof(buf));
-		vita_log("selftest: mbedTLS %s failed to parse the CA bundle: -0x%04x %s",
-			 version, (unsigned int)-ret, buf);
+	if (!vita_tls_ca_shared(VITASURF_CA_BUNDLE, &first, &first_len)) {
+		vita_log("selftest: mbedTLS %s could not load the CA bundle",
+			 version);
 	} else {
+		for (c = &ca_chain; c != NULL && c->version != 0; c = c->next) {
+			count++;
+		}
 		vita_log("selftest: mbedTLS %s parsed %d certificates from the bundle (%d rejected)",
-			 version, count, ret);
-	}
-	if (count > 0) {
+			 version, count, ca_rejected);
 		buf[0] = '\0';
-		mbedtls_x509_dn_gets(buf, sizeof(buf), &chain.subject);
+		mbedtls_x509_dn_gets(buf, sizeof(buf), &ca_chain.subject);
 		vita_log("selftest: first certificate: %s", buf);
 	}
-	mbedtls_x509_crt_free(&chain);
-	free(pem);
+	/*
+	 * What the TLS build can speak (VitaSurf). A server that wants
+	 * something missing here fails the handshake as cURL error 35
+	 * with nothing else said: Home Assistant behind its own HTTPS did.
+	 */
+	vita_log("selftest: TLS 1.3 %s, 1.2 %s; records in %d / out %d bytes; "
+		 "x25519 %s, P-384 %s, SHA-384 %s, RSA-PSS %s, "
+		 "ChaCha20 %s, GCM %s",
+#if defined(MBEDTLS_SSL_PROTO_TLS1_3)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_SSL_PROTO_TLS1_2)
+		 "yes",
+#else
+		 "no",
+#endif
+		 (int)MBEDTLS_SSL_IN_CONTENT_LEN, (int)MBEDTLS_SSL_OUT_CONTENT_LEN,
+#if defined(MBEDTLS_ECP_DP_CURVE25519_ENABLED)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_ECP_DP_SECP384R1_ENABLED)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_SHA384_C)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_PKCS1_V21)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_CHACHAPOLY_C)
+		 "yes",
+#else
+		 "no",
+#endif
+#if defined(MBEDTLS_GCM_C)
+		 "yes"
+#else
+		 "no"
+#endif
+		 );
 }
 
 /**

@@ -13,8 +13,8 @@
 @media screen { @media (min-width: 100px) { .c { width: 60px; } } }
 /* d: @media inside @media, inner not matching */
 @media screen { @media (min-width: 5000px) { .d { width: 60px; } } }
-/* e: @layer inside @media */
-@media screen { @layer base { .e { width: 60px; } } }
+/* e: @layer inside @media (important, as a layered normal rule loses to the unlayered .box) */
+@media screen { @layer base { .e { width: 60px !important; } } }
 /* f: a rule after a nested block is still inside the outer @media */
 @media (min-width: 5000px) { @supports (display: block) { .x { width: 1px; } } .f { width: 60px; } }
 /* g: a rule after the outer block is back at the top level */
@@ -22,7 +22,7 @@
 /* h: @keyframes inside @media is found by name */
 @media screen { @keyframes grow { from { width: 100px; } to { width: 60px; } } }
 .h { animation: grow 1s forwards; }
-/* i: @container inside @media */
+/* i: @container inside @media (it needs a container to query) */
 @media screen { @container (width >= 100px) { .i { width: 60px; } } }
 </style>
 </head>
@@ -35,7 +35,7 @@
 <div class="box f"></div>
 <div class="box g"></div>
 <div class="box h"></div>
-<div class="box i"></div>
+<div style="container-type: inline-size"><div class="box i"></div></div>
 <pre id="out"></pre>
 <script>
 var o = document.getElementById('out');

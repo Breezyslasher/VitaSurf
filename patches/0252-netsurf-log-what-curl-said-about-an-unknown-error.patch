@@ -1,0 +1,18 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index bb19028ed..69b2b6e39 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1647,7 +1647,12 @@ static void fetch_curl_done(CURL *curl_handle, CURLcode result)
+ 		 */
+ 		cert = true;
+ 	} else {
+-		NSLOG(netsurf, INFO, "Unknown cURL response code %d", result);
++		/* and what cURL said about it: code 35 alone does not say
++		 * which part of the handshake failed (VitaSurf) */
++		NSLOG(netsurf, INFO, "Unknown cURL response code %d: %s (%s)",
++		      result, curl_easy_strerror(result),
++		      fetch_error_buffer[0] != '\0' ? fetch_error_buffer :
++		      "no detail");
+ 		error = true;
+ 	}
+ 

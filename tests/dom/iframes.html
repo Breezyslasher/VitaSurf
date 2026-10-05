@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!-- An iframe with a src gets a real window running its own page's
+     scripts. Same-origin frames reach each other's documents and
+     functions both ways, frames[0], length, parent, top and
+     frameElement name the right windows, postMessage carries a cloned
+     value with the right source, and a frame taken out of the document
+     stops running its scripts. -->
+<html><head><title>parent</title></head><body><div id="out"></div>
+<iframe id="f" src="iframe-pages/child.html" width="300" height="100"></iframe>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var f = document.getElementById('f'), report = null, ticks = 0, done = false;
+window.fromChild = function (r) { report = r; };
+ok("the top window is its own parent and top", window.parent === window && window.top === window && window.frameElement === null);
+window.addEventListener('message', function (e) {
+ var r = e.data;
+ ok("a reply comes from the frame's window", e.source === f.contentWindow);
+ ok("the frame got a cloned Date from its parent", r.reply === 'pong' && r.n === 2 && r.isDate && r.time === 0 && r.fromParent);
+ ok("the frame saw this page's origin", r.origin === window.location.origin || (window.location.protocol === 'file:' && r.origin === 'null'));
+ f.contentWindow.postMessage({ tick: true }, '*');
+ setTimeout(function () {
+  ok("the frame's timer runs while it is in the document", ticks > 0);
+  f.parentNode.removeChild(f);
+  var at = ticks;
+  setTimeout(function () {
+   ok("a frame taken out of the document stops (" + (ticks - at) + " late ticks)", ticks - at <= 1);
+   ok("and its element has no window", f.contentWindow === null);
+   done = true;
+  }, 300);
+ }, 200);
+});
+f.addEventListener('load', function () {
+ var w = f.contentWindow, d = f.contentDocument;
+ ok("the frame ran its page's script and reported", report !== null);
+ ok("the frame sees this window as parent and top", report && report.parentIsOther && report.topIsParent);
+ ok("the frame's frameElement is the iframe", report && report.frameElementId === 'f');
+ ok("the frame reads this document", report && report.parentTitle === 'parent');
+ ok("contentDocument is the frame's page", !!d && d.title === 'child' && d.getElementById('c').textContent === 'child text');
+ ok("contentWindow holds the page's globals", w.here === 'child' && w.document === d);
+ ok("a call into the frame runs there", w.greet('parent') === 'hello parent from child');
+ ok("frames[0] and length name the frame", window.frames[0] === w && window[0] === w && window.length === 1);
+ ok("the same window every time", f.contentWindow === w);
+ w.postMessage({ n: 1, d: new Date(0) }, '*');
+});
+setTimeout(function () { if (!done) ok("the frame loaded and answered in time", false); }, 2800);
+</script></body></html>

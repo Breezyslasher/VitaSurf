@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!-- The page scrolling reaches script as a scroll event on the document,
+     heard by document and window listeners. Run it in the native harness
+     with VITASURF_TEST_SCROLL_MS=500, which fires the hook vita/input
+     calls when the page moves. -->
+<html><head><title>scroll event</title></head><body>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var onDoc=0,onWin=0,target=null,viaHandler=0;
+document.addEventListener('scroll',function(e){onDoc++;target=e.target;});
+window.addEventListener('scroll',function(){onWin++;});
+window.onscroll=function(){viaHandler++;};
+setTimeout(function(){
+ ok("document heard the scroll", onDoc===1);
+ ok("window heard the scroll", onWin===1);
+ ok("window.onscroll ran", viaHandler===1);
+ ok("its target is the document", target===document);
+},1500);
+</script></body></html>

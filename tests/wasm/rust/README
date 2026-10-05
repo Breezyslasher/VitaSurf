@@ -1,0 +1,12 @@
+lib.rs is the source of the module tests/dom/wasm-rust.html embeds: what
+rustc makes for wasm32-unknown-unknown, with the features current LLVM
+turns on (bulk memory, reference types, multi-value, sign extension,
+non-trapping conversions) and the shape of a real crate -- a heap grown
+with memory.grow, indirect calls through trait objects and function
+pointers, an imported function, a panic that traps. Rebuild it with
+
+  rustup target add wasm32-unknown-unknown
+  rustc --target wasm32-unknown-unknown -C opt-level=s --crate-type cdylib \
+      -C panic=abort -C strip=symbols -C debuginfo=0 lib.rs -o rs.wasm
+
+and put base64 of rs.wasm into the page.

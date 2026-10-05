@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!-- Function.prototype.bind when memory runs out. bind() makes its
+     object first and the record of what it binds second; when the
+     record could not be had, freeing the object read the missing record
+     and the Vita crashed (build 501, on a Home Assistant dashboard whose
+     errors had used up the script memory). It has to fail with an
+     out-of-memory error and leave the page running. -->
+<html><head><title>budget: bind out of memory</title></head><body>
+<script>
+var hoard = [], bound = [], f = function (a, b) { return a + b; }, got = null;
+try {
+  for (;;) {
+    hoard.push(new Array(4096).fill(hoard.length));
+    for (var i = 0; i < 64; i++) bound.push(f.bind(null, i, 1, 2, 3, 4, 5, 6, 7));
+  }
+} catch (e) { got = String(e); }
+hoard = null; bound = null;
+console.log((got && /memory/.test(got) ? 'PASS' : 'FAIL') + ' bind ran out of memory cleanly: ' + got);
+setTimeout(function () { console.log('PASS the page carried on'); }, 100);
+</script></body></html>

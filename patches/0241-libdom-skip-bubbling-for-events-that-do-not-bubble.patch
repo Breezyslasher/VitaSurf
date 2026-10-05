@@ -1,0 +1,21 @@
+diff --git a/src/core/node.c b/src/core/node.c
+index a2f8c11..a1a36b1 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -2635,10 +2635,14 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	if (evt->stop_now == true || evt->stop == true)
+ 		goto cleanup;
+ 
+-	/* Bubbling phase */
++	/* Bubbling phase, for an event that bubbles (VitaSurf). It ran for
++	 * every event, so a <link>'s load, which does not bubble, reached
++	 * the document and the window's listeners with it: every page that
++	 * linked a stylesheet had its window.onload run twice, the first
++	 * time with the document still loading. */
+ 	evt->phase = DOM_BUBBLING_PHASE;
+ 
+-	for (targetnr = 0; targetnr < ntargets; ++targetnr) {
++	for (targetnr = 0; evt->bubble && targetnr < ntargets; ++targetnr) {
+ 		dom_node_internal *node =
+ 			(dom_node_internal *) targets[targetnr];
+ 		err = _dom_event_target_dispatch(targets[targetnr],

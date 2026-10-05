@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!-- ElementInternals: a custom element attaches them once, in its
+     constructor if it likes, even when it has its own form getter that
+     reads them back (Web Awesome's controls do, and Home Assistant's
+     login form is made of them). A form-associated element has a form
+     owner, validity it sets itself, a value its form submits, and states;
+     a plain element and a second attach are refused. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<form id="f"><fieldset id="fs"><x-field id="a" name="user"></x-field></fieldset><x-plain id="p"></x-plain></form>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+function name(f){try{f();return 'none';}catch(e){return e.name;}}
+class XField extends HTMLElement {
+ static formAssociated = true;
+ get form() { return this.internals.form; }
+ get willValidate() { return this.internals.willValidate; }
+ constructor() { super(); try { this.internals = this.attachInternals(); } catch (e) { this.error = e; } }
+}
+class XPlain extends HTMLElement {
+ constructor() { super(); this.internals = this.attachInternals(); }
+}
+customElements.define('x-field', XField);
+customElements.define('x-plain', XPlain);
+var a = document.getElementById('a'), p = document.getElementById('p'), i = a.internals, f = document.getElementById('f');
+ok("attached in the constructor, with its own form getter", !a.error && i instanceof ElementInternals);
+ok("and that getter answers", a.form === f && a.willValidate === true);
+ok("a second attach is refused", name(function () { a.attachInternals(); }) === 'NotSupportedError');
+ok("a plain element cannot attach", name(function () { document.createElement('div').attachInternals(); }) === 'NotSupportedError');
+ok("an element that is not form-associated has no form", name(function () { return p.internals.form; }) === 'NotSupportedError');
+ok("valid until told otherwise", i.validity.valid && i.validationMessage === '' && i.checkValidity());
+ok("a flag needs a message", name(function () { i.setValidity({ valueMissing: true }); }) === 'TypeError');
+var invalid = 0; a.addEventListener('invalid', function () { invalid++; });
+i.setValidity({ valueMissing: true }, 'Fill it in');
+ok("setValidity sets validity and the message", !i.validity.valid && i.validity.valueMissing && i.validationMessage === 'Fill it in');
+ok("checkValidity fires invalid", i.checkValidity() === false && invalid === 1);
+i.setValidity({});
+ok("and clears", i.validity.valid && i.checkValidity());
+i.setFormValue('ada');
+ok("the form submits its value", new FormData(f).get('user') === 'ada');
+ok("the form lists it among its elements", Array.prototype.indexOf.call(f.elements, a) >= 0);
+document.getElementById('fs').disabled = true;
+ok("a disabled fieldset stops it validating", i.willValidate === false);
+document.getElementById('fs').disabled = false;
+i.states.add('checked');
+ok("states", i.states.has('checked') && i.states.size === 1 && !i.states.has('other'));
+i.role = 'checkbox'; i.ariaChecked = 'true';
+ok("ARIA through the internals", i.role === 'checkbox' && i.ariaChecked === 'true' && i.ariaLabel === null);
+ok("it has no shadow root until it attaches one", i.shadowRoot === null);
+</script></body></html>

@@ -1,0 +1,323 @@
+diff --git a/content/handlers/image/svg.c b/content/handlers/image/svg.c
+index eba18d31d..f2ec722b6 100644
+--- a/content/handlers/image/svg.c
++++ b/content/handlers/image/svg.c
+@@ -38,6 +38,28 @@
+ #include "content/content_factory.h"
+ 
+ #include "image/svg.h"
++#include "desktop/gui_internal.h"
++#include "desktop/bitmap.h"
++
++/*
++ * Drawn once, plotted as an image after (VitaSurf). svgtiny's paths were
++ * flattened and filled again on every redraw, and a page of icons is the
++ * same few small graphics over and over: Yamtrack scrolled with 1700 to
++ * 2400 path plots a second. Each graphic keeps its rendering at the last
++ * few sizes it was drawn at, within a bound for all of them together;
++ * past that, or where the frontend cannot draw into a bitmap, it is
++ * plotted as paths as before.
++ */
++#define SVG_RASTER_SIZES 4
++#define SVG_RASTER_MAX_PIXELS (256 * 256)
++#define SVG_RASTER_MAX_BYTES (4 * 1024 * 1024)
++
++struct svg_raster {
++	int width, height;
++	struct bitmap *bitmap;
++};
++
++static size_t svg_raster_bytes;
+ 
+ typedef struct svg_content {
+ 	struct content base;
+@@ -46,8 +68,24 @@ typedef struct svg_content {
+ 
+ 	int current_width;
+ 	int current_height;
++
++	struct svg_raster raster[SVG_RASTER_SIZES];
++	unsigned int raster_n;
+ } svg_content;
+ 
++/** Free every cached rendering: the graphic changed, or is going. */
++static void svg_raster_free(svg_content *svg)
++{
++	unsigned int i;
++
++	for (i = 0; i < svg->raster_n; i++) {
++		guit->bitmap->destroy(svg->raster[i].bitmap);
++		svg_raster_bytes -= (size_t)svg->raster[i].width *
++			(size_t)svg->raster[i].height * 4;
++	}
++	svg->raster_n = 0;
++}
++
+ 
+ 
+ static nserror svg_create_svg_data(svg_content *c)
+@@ -444,6 +482,7 @@ static void svg_reformat(struct content *c, int width, int height)
+ 		return;
+ 	}
+ 
++	svg_raster_free(svg);
+ 	svg_parse_at(svg, width, height);
+ }
+ 
+@@ -621,6 +660,76 @@ svg_redraw_tiled_internal(svg_content *svg,
+ }
+ 
+ 
++struct svg_raster_draw {
++	svg_content *svg;
++	int width, height;
++	float scale;
++	colour background;
++};
++
++static bool svg_raster_draw_cb(const struct redraw_context *ctx, void *pw)
++{
++	struct svg_raster_draw *d = pw;
++	struct rect clip;
++
++	clip.x0 = 0;
++	clip.y0 = 0;
++	clip.x1 = d->width;
++	clip.y1 = d->height;
++	return svg_redraw_internal(d->svg, 0, 0, d->width, d->height, &clip,
++			ctx, d->scale, d->background, false, 0);
++}
++
++/**
++ * The graphic drawn at this size as a bitmap, made now if it can be;
++ * NULL to plot it as paths.
++ */
++static struct bitmap *
++svg_raster_for(svg_content *svg, const struct content_redraw_data *data)
++{
++	struct svg_raster_draw d;
++	struct svg_raster *r;
++	struct bitmap *bm = NULL;
++	size_t bytes;
++	unsigned int i;
++
++	if (vitasurf_raster == NULL || data->mask ||
++	    data->width <= 0 || data->height <= 0 ||
++	    (size_t)data->width * (size_t)data->height >
++			SVG_RASTER_MAX_PIXELS) {
++		return NULL;
++	}
++	for (i = 0; i < svg->raster_n; i++) {
++		if (svg->raster[i].width == data->width &&
++		    svg->raster[i].height == data->height) {
++			return svg->raster[i].bitmap;
++		}
++	}
++	/* Not freed to make room: knockout plots queued earlier in this
++	 * redraw may still hold an older size. */
++	bytes = (size_t)data->width * (size_t)data->height * 4;
++	if (svg->raster_n >= SVG_RASTER_SIZES ||
++	    svg_raster_bytes + bytes > SVG_RASTER_MAX_BYTES) {
++		return NULL;
++	}
++	d.svg = svg;
++	d.width = data->width;
++	d.height = data->height;
++	d.scale = data->scale;
++	d.background = data->background_colour;
++	if (vitasurf_raster(data->width, data->height, svg_raster_draw_cb,
++			    &d, &bm) != NSERROR_OK || bm == NULL) {
++		return NULL;
++	}
++	r = &svg->raster[svg->raster_n++];
++	r->width = data->width;
++	r->height = data->height;
++	r->bitmap = bm;
++	svg_raster_bytes += bytes;
++	return bm;
++}
++
++
+ /**
+  * Redraw a CONTENT_SVG.
+  */
+@@ -639,6 +748,14 @@ svg_redraw(struct content *c,
+ 	}
+ 
+ 	if ((data->repeat_x == false) && (data->repeat_y == false)) {
++		struct bitmap *bm = svg_raster_for(svg, data);
++
++		if (bm != NULL) {
++			return ctx->plot->bitmap(ctx, bm, data->x, data->y,
++					data->width, data->height,
++					data->background_colour,
++					BITMAPF_NONE) == NSERROR_OK;
++		}
+ 		/* Simple case: SVG is not tiled */
+ 		return svg_redraw_internal(svg, data->x, data->y,
+ 				data->width, data->height,
+@@ -659,6 +776,7 @@ static void svg_destroy(struct content *c)
+ {
+ 	svg_content *svg = (svg_content *) c;
+ 
++	svg_raster_free(svg);
+ 	if (svg->diagram != NULL)
+ 		svgtiny_free(svg->diagram);
+ }
+diff --git a/desktop/bitmap.h b/desktop/bitmap.h
+index 51ce2c908..107b7a992 100644
+--- a/desktop/bitmap.h
++++ b/desktop/bitmap.h
+@@ -42,6 +42,23 @@ extern bitmap_fmt_t bitmap_fmt;
+ /** The client bitmap colour channel layout. */
+ extern struct bitmap_colour_layout bitmap_layout;
+ 
++struct redraw_context;
++
++/**
++ * Draw into a new bitmap of width by height (VitaSurf).
++ *
++ * draw() is called to plot what the bitmap is to hold, with a redraw
++ * context whose plotters write into it and a clip of the whole bitmap;
++ * what it leaves unpainted comes out transparent. A frontend that can
++ * do this defines it; for any other the symbol is NULL and callers keep
++ * plotting as they did.
++ *
++ * eturn NSERROR_OK with the bitmap in *out, or an error and no bitmap
++ */
++nserror vitasurf_raster(int width, int height,
++		bool (*draw)(const struct redraw_context *ctx, void *pw),
++		void *pw, struct bitmap **out) __attribute__((weak));
++
+ /**
+  * Convert a bitmap pixel to a NetSurf colour (0xAARRGGBB).
+  *
+diff --git a/frontends/framebuffer/bitmap.c b/frontends/framebuffer/bitmap.c
+index c9b58541e..74ad2b4a4 100644
+--- a/frontends/framebuffer/bitmap.c
++++ b/frontends/framebuffer/bitmap.c
+@@ -33,6 +33,7 @@
+ #include "netsurf/bitmap.h"
+ #include "netsurf/plotters.h"
+ #include "netsurf/content.h"
++#include "desktop/bitmap.h"
+ 
+ #include "framebuffer/gui.h"
+ #include "framebuffer/fbtk.h"
+@@ -269,6 +270,116 @@ bitmap_render(struct bitmap *bitmap,
+ 	return NSERROR_OK;
+ }
+ 
++/*
++ * vitasurf_raster() for the framebuffer (VitaSurf): the plot calls are
++ * made twice, into scratch surfaces cleared to black and to white, and
++ * each pixel's coverage is how far the two differ -- the same on both
++ * where something opaque was drawn, black against white where nothing
++ * was. The plotters write every pixel opaque, so this is the one way to
++ * learn what they left transparent.
++ */
++nserror vitasurf_raster(int width, int height,
++		bool (*draw)(const struct redraw_context *ctx, void *pw),
++		void *pw, struct bitmap **out)
++{
++	struct redraw_context ctx = {
++		.interactive = false,
++		.background_images = true,
++		.plot = &fb_plotters
++	};
++	struct rect clip;
++	nsfb_t *surf[2] = { NULL, NULL };
++	uint8_t *src[2];
++	int srcstride[2];
++	nsfb_t *current;
++	struct bitmap *bm;
++	uint8_t *dst;
++	size_t dststride;
++	bool opaque = true, ok = true;
++	int k, x, y;
++
++	*out = NULL;
++	if (width <= 0 || height <= 0) {
++		return NSERROR_BAD_PARAMETER;
++	}
++	clip.x0 = 0;
++	clip.y0 = 0;
++	clip.x1 = width;
++	clip.y1 = height;
++	for (k = 0; k < 2; k++) {
++		plot_style_t bg = {
++			.stroke_type = PLOT_OP_TYPE_NONE,
++			.fill_type = PLOT_OP_TYPE_SOLID,
++			.fill_colour = k == 0 ? 0x000000 : 0xffffff
++		};
++
++		surf[k] = nsfb_new(NSFB_SURFACE_RAM);
++		if (surf[k] == NULL ||
++		    nsfb_set_geometry(surf[k], width, height,
++				      NSFB_FMT_XBGR8888) == -1 ||
++		    nsfb_init(surf[k]) == -1) {
++			ok = false;
++			break;
++		}
++		current = framebuffer_set_surface(surf[k]);
++		fb_plotters.clip(&ctx, &clip);
++		fb_plotters.rectangle(&ctx, &bg, &clip);
++		ok = draw(&ctx, pw);
++		framebuffer_set_surface(current);
++		if (!ok) {
++			break;
++		}
++		nsfb_get_buffer(surf[k], &src[k], &srcstride[k]);
++	}
++	bm = ok ? bitmap_create(width, height, BITMAP_NONE) : NULL;
++	if (bm == NULL) {
++		for (k = 0; k < 2; k++) {
++			if (surf[k] != NULL) nsfb_free(surf[k]);
++		}
++		return ok ? NSERROR_NOMEM : NSERROR_INVALID;
++	}
++	dst = bitmap_get_buffer(bm);
++	dststride = bitmap_get_rowstride(bm);
++	for (y = 0; y < height; y++) {
++		const uint32_t *pb = (const uint32_t *)(void *)
++			(src[0] + (size_t)y * (size_t)srcstride[0]);
++		const uint32_t *pw_ = (const uint32_t *)(void *)
++			(src[1] + (size_t)y * (size_t)srcstride[1]);
++		uint8_t *dp = dst + (size_t)y * dststride;
++
++		for (x = 0; x < width; x++, dp += 4) {
++			uint32_t b = pb[x], w = pw_[x];
++			int cb[3], d = 0, i, a;
++
++			for (i = 0; i < 3; i++) {
++				int vb = (int)((b >> (8 * i)) & 0xff);
++				int vw = (int)((w >> (8 * i)) & 0xff);
++
++				cb[i] = vb;
++				if (vw - vb > d) d = vw - vb;
++			}
++			a = 255 - d;
++			if (a < 255) opaque = false;
++			for (i = 0; i < 3; i++) {
++				/* the colour, undone from its blend
++				 * onto black */
++				cb[i] = a > 0 ? cb[i] * 255 / a : 0;
++				if (cb[i] > 255) cb[i] = 255;
++			}
++			dp[bitmap_layout.r] = (uint8_t)cb[0];
++			dp[bitmap_layout.g] = (uint8_t)cb[1];
++			dp[bitmap_layout.b] = (uint8_t)cb[2];
++			dp[bitmap_layout.a] = (uint8_t)a;
++		}
++	}
++	nsfb_free(surf[0]);
++	nsfb_free(surf[1]);
++	bitmap_set_opaque(bm, opaque);
++	bitmap_modified(bm);
++	*out = bm;
++	return NSERROR_OK;
++}
++
+ static struct gui_bitmap_table bitmap_table = {
+ 	.create = bitmap_create,
+ 	.destroy = bitmap_destroy,

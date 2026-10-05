@@ -8,6 +8,9 @@
 # A patch that is missing from the record but reverse-applies cleanly is
 # treated as already applied, which covers checkouts patched before the
 # record existed.
+#
+# Name submodules to apply only their patches:
+#   ./scripts/apply-patches.sh libquickjs
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +20,9 @@ for patch in "$ROOT"/patches/*.patch; do
     [ -e "$patch" ] || continue
     name="$(basename "$patch" .patch)"
     submodule="$(echo "$name" | cut -d- -f2)"
+    if [ $# -gt 0 ] && ! printf '%s\n' "$@" | grep -qxF "$submodule"; then
+        continue
+    fi
     dir="$ROOT/deps/$submodule"
     stamp="$dir/.vitasurf-patched"
     if [ ! -d "$dir" ]; then

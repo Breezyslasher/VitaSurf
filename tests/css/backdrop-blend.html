@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- Painting that reads back what is behind a box: backdrop-filter blurs
+     and recolours what is under a translucent header, mix-blend-mode
+     mixes a box with the page under it, and a mask over a box with
+     children cuts all of it. Run with VITASURF_TEST_RASTER=plots to see
+     the areas read back (BACKDROP) and painted aside (RASTER); without
+     a surface to read, the boxes paint as they would. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; background: rgb(255, 255, 0); }
+#frost { width: 100px; height: 20px; margin: 10px; background: rgba(255, 255, 255, 0.5); backdrop-filter: blur(4px) grayscale(1); border-radius: 6px; }
+#blend { width: 50px; height: 20px; margin: 10px; background: rgb(0, 0, 255); mix-blend-mode: multiply; }
+#masked { width: 40px; height: 20px; margin: 10px; background: rgb(255, 0, 0); mask: url(red20x10.png) no-repeat; }
+#masked span { color: white; }
+</style></head><body>
+<div id=frost></div><div id=blend></div>
+<div id=masked><span>x</span></div>
+</body></html>

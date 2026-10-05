@@ -1,0 +1,352 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 3780d5785..dbd873773 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1809,6 +1809,8 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 	 * paints its background colour through the image's alpha. */
+ 	if (css_computed_mask_image(box->style, &maskimage_uri) ==
+ 			CSS_MASK_IMAGE_IMAGE && maskimage_uri != NULL &&
++			strncmp(lwc_string_data(maskimage_uri), "gradient:",
++					9) != 0 /* painted, not fetched */ &&
+ 			nsoption_bool(background_images) == true) {
+ 		nsurl *url;
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 733c22415..ade762877 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -640,11 +640,85 @@ static bool html_box_masked(struct box *box)
+ {
+ 	lwc_string *uri = NULL;
+ 
+-	return box->style != NULL &&
+-		css_computed_mask_image(box->style, &uri) == CSS_MASK_IMAGE_IMAGE &&
+-		uri != NULL;
++	if (box->style == NULL ||
++			css_computed_mask_image(box->style, &uri) !=
++					CSS_MASK_IMAGE_IMAGE || uri == NULL)
++		return false;
++	/* text shares its element's style, and a gradient mask, which is
++	 * painted over the element, is not painted again over its text */
++	return box->type != BOX_TEXT ||
++		strncmp(lwc_string_data(uri), "gradient:", 9) != 0;
+ }
+ 
++/**
++ * A box's mask image when it is a gradient (VitaSurf), which is painted
++ * rather than fetched: the gradient's spec after "gradient:", or NULL.
++ */
++static const char *html_mask_gradient(struct box *box)
++{
++	lwc_string *uri = NULL;
++
++	/* text shares its element's style, and is masked with it */
++	if (box->type == BOX_TEXT)
++		return NULL;
++	if (box->style == NULL || css_computed_mask_image(box->style,
++			&uri) != CSS_MASK_IMAGE_IMAGE || uri == NULL ||
++			strncmp(lwc_string_data(uri), "gradient:", 9) != 0)
++		return NULL;
++	return lwc_string_data(uri) + 9;
++}
++
++/**
++ * Copy a gradient spec with every stop in one colour, keeping each
++ * stop's alpha scaled by the colour's (VitaSurf). A gradient mask is a
++ * run of alphas, and this turns it into the colour to paint through it.
++ *
++ * \param spec    Gradient spec, after "gradient:"
++ * \param argb    Colour to paint, 0xAARRGGBB as libcss gives it
++ * \param out     Where the new spec goes
++ * \param outlen  Size of out
++ * \return false if out is too small
++ */
++static bool html_gradient_recolour(const char *spec, uint32_t argb,
++		char *out, size_t outlen)
++{
++	const char *p = strchr(spec, ':');
++	size_t n;
++
++	if (p == NULL || (size_t) (p + 1 - spec) >= outlen)
++		return false;
++	n = p + 1 - spec;
++	memcpy(out, spec, n);
++	p++;
++	while (*p != '\0') {
++		char *end;
++		uint32_t c = (uint32_t) strtoul(p, &end, 16);
++		uint32_t a = ((c >> 24) * (argb >> 24) + 127) / 255;
++		const char *next = strchr(end, ',');
++		size_t rest = next != NULL ? (size_t) (next + 1 - end) :
++				strlen(end);
++		int w;
++
++		if (end == p)
++			return false;
++		w = snprintf(out + n, outlen - n, "%08x",
++				(unsigned int) ((a << 24) |
++				(argb & 0xffffff)));
++		if (w < 0 || n + (size_t) w + rest >= outlen)
++			return false;
++		n += (size_t) w;
++		memcpy(out + n, end, rest);
++		n += rest;
++		p = end + rest;
++	}
++	out[n] = '\0';
++	return true;
++}
++
++static bool html_redraw_gradient(const char *spec, const struct rect *area,
++		const struct rect *clip, float scale,
++		const struct redraw_context *ctx);
++
+ /**
+  * Where a box's mask image goes (VitaSurf): fitted inside the padding
+  * box and centred unless mask-size and mask-position say otherwise.
+@@ -786,11 +860,15 @@ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ 	struct content_redraw_data data;
+ 	struct rect r = *clip;
+ 
++	const char *gradient = html_mask_gradient(box);
++
+ 	css_computed_background_color(box->style, &bgcol);
+ 	if (nscss_color_is_transparent(bgcol)) {
+ 		return true;
+ 	}
+-	if (!html_mask_place(x, y, pw, ph, box, scale, unit_len_ctx, &data))
++	if (gradient == NULL &&
++			!html_mask_place(x, y, pw, ph, box, scale, unit_len_ctx,
++					&data))
+ 		return true;
+ 	if (r.x0 < x) r.x0 = x;
+ 	if (r.y0 < y) r.y0 = y;
+@@ -802,6 +880,19 @@ static bool html_redraw_mask(int x, int y, int pw, int ph, struct box *box,
+ 	if (ctx->plot->clip(ctx, &r) != NSERROR_OK) {
+ 		return false;
+ 	}
++	if (gradient != NULL) {
++		/* the colour painted along the gradient, each stop's
++		 * alpha letting that much of it through */
++		char spec[640];
++		struct rect area = { x, y, x + pw, y + ph };
++
++		if (html_gradient_recolour(gradient, bgcol, spec,
++				sizeof(spec)) &&
++				!html_redraw_gradient(spec, &area, &r, scale,
++						ctx))
++			return false;
++		return ctx->plot->clip(ctx, clip) == NSERROR_OK;
++	}
+ 	data.background_colour = nscss_color_to_ns(bgcol);
+ 	data.mask = true;
+ 	data.mask_colour = nscss_color_to_ns(bgcol);
+@@ -881,6 +972,39 @@ static void html_background_size(const struct box *box,
+ }
+ 
+ 
++/**
++ * Add the lengths in a gradient's stops to their positions, now that the
++ * gradient line's length is known, and keep each stop no earlier than
++ * the one before it (VitaSurf). libcss could do neither, not knowing
++ * the box.
++ *
++ * \param pos    Stop positions in tenths of a percent, updated
++ * \param px     Lengths in CSS pixels to add to them
++ * \param n      Number of stops
++ * \param len    The gradient line's length in device pixels
++ * \param scale  Device pixels to a CSS pixel
++ */
++static void html_gradient_lengths(int *pos, const int *px, int n, int len,
++		float scale)
++{
++	bool any = false;
++	int i;
++
++	for (i = 0; i < n; i++) {
++		if (px[i] != 0) {
++			pos[i] += (int) (px[i] * scale * 1000.0f / len);
++			any = true;
++		}
++	}
++	if (!any)
++		return;
++	for (i = 1; i < n; i++) {
++		if (pos[i] < pos[i - 1])
++			pos[i] = pos[i - 1];
++	}
++}
++
++
+ /**
+  * Paint a CSS gradient background (VitaSurf).
+  *
+@@ -894,17 +1018,19 @@ static void html_background_size(const struct box *box,
+  * A radial or conic gradient, which strips cannot draw, is painted as
+  * the average of its stops.
+  *
+- * \param spec  The gradient string, after "gradient:"
+- * \param area  The box the gradient spans, in device pixels
+- * \param clip  Where painting may go
+- * \param ctx   Redraw context
++ * \param spec   The gradient string, after "gradient:"
++ * \param area   The box the gradient spans, in device pixels
++ * \param clip   Where painting may go
++ * \param scale  Device pixels to a CSS pixel, for stops given as lengths
++ * \param ctx    Redraw context
+  * \return true on success, false on plotter error
+  */
+ static bool html_redraw_gradient(const char *spec, const struct rect *area,
+-		const struct rect *clip, const struct redraw_context *ctx)
++		const struct rect *clip, float scale,
++		const struct redraw_context *ctx)
+ {
+ 	uint32_t colour[16];
+-	int pos[16];
++	int pos[16], px[16];
+ 	int n = 0, i, angle, extent, strips;
+ 	char kind;
+ 	const char *p = spec;
+@@ -925,6 +1051,18 @@ static bool html_redraw_gradient(const char *spec, const struct rect *area,
+ 		pos[n] = (int) strtol(p, &end, 10);
+ 		if (end == p)
+ 			break;
++		/* a length along the line too, as "+9p", from calc() or a
++		 * stop written in px */
++		px[n] = 0;
++		if (*end == '+' || *end == '-') {
++			char *e;
++			int v = (int) strtol(end, &e, 10);
++
++			if (e != end + 1 && *e == 'p') {
++				px[n] = v;
++				end = e + 1;
++			}
++		}
+ 		n++;
+ 		p = end;
+ 		if (*p != ',')
+@@ -952,6 +1090,7 @@ static bool html_redraw_gradient(const char *spec, const struct rect *area,
+ 
+ 		if (radius <= 0)
+ 			return true;
++		html_gradient_lengths(pos, px, n, radius, scale);
+ 		if (ctx->plot->clip(ctx, clip) != NSERROR_OK)
+ 			return false;
+ 
+@@ -1015,6 +1154,7 @@ static bool html_redraw_gradient(const char *spec, const struct rect *area,
+ 	extent = along_x ? area->x1 - area->x0 : area->y1 - area->y0;
+ 	if (extent <= 0)
+ 		return true;
++	html_gradient_lengths(pos, px, n, extent, scale);
+ 	strips = extent < 48 ? extent : 48;
+ 
+ 	for (i = 0; i < strips; i++) {
+@@ -1276,7 +1416,7 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 					return false;
+ 				if (!html_redraw_gradient(
+ 						lwc_string_data(bg_uri) + 9,
+-						area, &r, ctx))
++						area, &r, scale, ctx))
+ 					return false;
+ 			}
+ 		}
+@@ -4777,12 +4917,22 @@ struct html_mask_job {
+ 	struct hlcache_handle *mask;
+ 	struct content_redraw_data data;
+ 	struct rect clip;
++	/* or a gradient, in white, over area (VitaSurf) */
++	char gradient[640];
++	struct rect area;
++	float scale;
+ };
+ 
+ static bool html_mask_draw(const struct redraw_context *ctx, void *pw)
+ {
+ 	struct html_mask_job *j = pw;
+ 
++	if (j->mask == NULL) {
++		if (ctx->plot->clip(ctx, &j->clip) != NSERROR_OK)
++			return false;
++		return html_redraw_gradient(j->gradient, &j->area, &j->clip,
++				j->scale, ctx);
++	}
+ 	return content_redraw(j->mask, &j->data, &j->clip, ctx);
+ }
+ 
+@@ -4808,9 +4958,17 @@ static bool html_redraw_mask_all(const html_content *html, struct box *box,
+ 	uint8_t *sb, *mb;
+ 	size_t ss, ms;
+ 	int x, y, pwid, phei, ox = 0, oy = 0, w, h, i, j;
++	const char *gradient;
+ 
+ 	if (vitasurf_raster == NULL || box == html_composite_active ||
+-			!html_box_masked(box) || box->children == NULL)
++			!html_box_masked(box))
++		return false;
++	/* a gradient mask, which usually fades out the edge of a box of
++	 * text, is painted this way whatever the box holds; an image mask
++	 * over a box of nothing but a colour is an icon, which
++	 * html_redraw_mask draws more cheaply */
++	gradient = html_mask_gradient(box);
++	if (gradient == NULL && box->children == NULL)
+ 		return false;
+ 
+ 	x = (x_parent + box->x) * scale;
+@@ -4818,14 +4976,22 @@ static bool html_redraw_mask_all(const html_content *html, struct box *box,
+ 	pwid = (box->padding[LEFT] + box->width + box->padding[RIGHT]) * scale;
+ 	phei = (box->padding[TOP] + box->height + box->padding[BOTTOM]) *
+ 			scale;
+-	if (!html_mask_place(x, y, pwid, phei, box, scale,
++	html_border_box_device(box, x_parent, y_parent, scale, &bb);
++	if (gradient != NULL) {
++		/* over the border box, mask-origin's initial value */
++		if (!html_gradient_recolour(gradient, 0xffffffff,
++				job.gradient, sizeof(job.gradient)))
++			return false;
++		memset(&job.data, 0, sizeof(job.data));
++		job.area = bb;
++		job.scale = scale;
++	} else if (!html_mask_place(x, y, pwid, phei, box, scale,
+ 			&html->unit_len_ctx, &job.data)) {
+ 		/* a mask not yet here hides the box */
+ 		*ok = true;
+ 		return true;
+ 	}
+ 
+-	html_border_box_device(box, x_parent, y_parent, scale, &bb);
+ 	pw.html = html;
+ 	pw.box = box;
+ 	pw.x_parent = x_parent;
+@@ -4847,7 +5013,7 @@ static bool html_redraw_mask_all(const html_content *html, struct box *box,
+ 
+ 	w = guit->bitmap->get_width(src);
+ 	h = guit->bitmap->get_height(src);
+-	job.mask = box->mask;
++	job.mask = gradient != NULL ? NULL : box->mask;
+ 	job.data.x -= ox;
+ 	job.data.y -= oy;
+ 	job.data.background_colour = 0xffffff;
+@@ -4857,6 +5023,13 @@ static bool html_redraw_mask_all(const html_content *html, struct box *box,
+ 	job.clip.y0 = y - oy;
+ 	job.clip.x1 = x - ox + pwid;
+ 	job.clip.y1 = y - oy + phei;
++	if (gradient != NULL) {
++		job.area.x0 -= ox;
++		job.area.y0 -= oy;
++		job.area.x1 -= ox;
++		job.area.y1 -= oy;
++		job.clip = job.area;
++	}
+ 	if (vitasurf_raster(w, h, html_mask_draw, &job, &mbm) != NSERROR_OK ||
+ 			mbm == NULL) {
+ 		guit->bitmap->destroy(src);
+@@ -4916,7 +5089,7 @@ static bool html_border_image_piece(struct hlcache_handle *img,
+ 		 * shows the part of it that lies there */
+ 		if (ctx->plot->clip(ctx, &pc) != NSERROR_OK)
+ 			return false;
+-		return html_redraw_gradient(gradient, bb, &pc, ctx);
++		return html_redraw_gradient(gradient, bb, &pc, scale, ctx);
+ 	}
+ 
+ 	kx = dw / sw;

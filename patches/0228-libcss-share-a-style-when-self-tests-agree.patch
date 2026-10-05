@@ -1,0 +1,1120 @@
+diff --git a/src/select/select.c b/src/select/select.c
+index 360a116..ef91ac4 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -218,6 +218,16 @@ unsigned int css_select_us_match;
+ unsigned int css_select_us_deferred;
+ unsigned int css_select_us_finish;
+ unsigned int css_select_shared;
++/*
++ * Siblings looked at for a style to share, and why they were turned
++ * down (VitaSurf): tainted by a rule that looked at something a sibling
++ * may not share, given a different answer to a test of itself, or
++ * carrying a different class attribute where a rule read it.
++ */
++unsigned int css_select_share_candidates;
++unsigned int css_select_share_tainted;
++unsigned int css_select_share_position;
++unsigned int css_select_share_class_attr;
+ 
+ /* how the merged index fared (VitaSurf) */
+ unsigned int css_select_index_builds;
+@@ -302,6 +312,8 @@ static css_error match_detail(css_select_ctx *ctx, void *node,
+ 		bool *match, css_pseudo_element *pseudo_element);
+ static css_error cascade_style(const css_style *style,
+ 		css_select_state *state);
++static css_error self_same(css_select_state *state,
++		const struct css_node_data *nd, bool *same);
+ 
+ /**
+  * Leave the element where its animation comes to rest (VitaSurf).
+@@ -1104,6 +1116,63 @@ enum share_candidate_type {
+ };
+ 
+ 
++/**
++ * Whether a sibling's class attribute is the same string as this
++ * node's (VitaSurf).
++ *
++ * A rule such as [class*="col-"] reads the attribute rather than the
++ * list, and a GitHub element meets a dozen of them, which tainted it
++ * as any attribute test did. Its classes already match this node's,
++ * one by one; if both attributes also equal those classes joined by
++ * single spaces, by the handler's own test of equality, then every
++ * such rule reads the same string and gives the same answer. Anything
++ * else, a double space or a list too long for the buffer, is refused.
++ */
++static css_error class_attr_same(css_select_ctx *ctx,
++		css_select_state *state, void *candidate, bool *same)
++{
++	css_qname qname = { NULL, ctx->str.class_attr };
++	char buf[256];
++	size_t len = 0;
++	lwc_string *joined;
++	css_error error;
++	bool match = false;
++	uint32_t i;
++
++	*same = false;
++
++	if (state->n_classes == 0)
++		return CSS_OK;
++
++	for (i = 0; i < state->n_classes; i++) {
++		size_t n = lwc_string_length(state->classes[i]);
++
++		if (len + n + 1 > sizeof(buf))
++			return CSS_OK;
++		if (i > 0)
++			buf[len++] = ' ';
++		memcpy(buf + len, lwc_string_data(state->classes[i]), n);
++		len += n;
++	}
++
++	if (lwc_intern_string(buf, len, &joined) != lwc_error_ok)
++		return CSS_NOMEM;
++
++	error = state->handler->node_has_attribute_equal(state->pw,
++			state->node, &qname, joined, &match);
++	if (error == CSS_OK && match) {
++		error = state->handler->node_has_attribute_equal(state->pw,
++				candidate, &qname, joined, &match);
++		if (error == CSS_OK && match)
++			*same = true;
++	}
++
++	lwc_string_unref(joined);
++
++	return error;
++}
++
++
+ /**
+  * Get node_data for candidate node if we can reuse its style.
+  *
+@@ -1114,6 +1183,7 @@ enum share_candidate_type {
+  * \return CSS_OK on success, appropriate error otherwise.
+  */
+ static css_error css_select_style__get_sharable_node_data_for_candidate(
++		css_select_ctx *ctx,
+ 		css_select_state *state,
+ 		void *share_candidate_node,
+ 		enum share_candidate_type type,
+@@ -1172,6 +1242,7 @@ static css_error css_select_style__get_sharable_node_data_for_candidate(
+ 			CSS_NODE_FLAGS_TAINT_ATTRIBUTE |
+ 			CSS_NODE_FLAGS_TAINT_SIBLING |
+ 			CSS_NODE_FLAGS_HAS_INLINE_STYLE)) {
++		css_select_share_tainted++;
+ #ifdef DEBUG_STYLE_SHARING
+ 		printf("      \t%s\tno share: candidate flags: %s%s%s%s\n",
+ 				lwc_string_data(state->element.name),
+@@ -1267,6 +1338,35 @@ static css_error css_select_style__get_sharable_node_data_for_candidate(
+ 		goto cleanup;
+ 	}
+ 
++	if (node_data->flags & CSS_NODE_FLAGS_TAINT_CLASS_ATTR) {
++		bool same = false;
++
++		error = class_attr_same(ctx, state, share_candidate_node,
++				&same);
++		if (error != CSS_OK || same == false) {
++			if (error == CSS_OK)
++				css_select_share_class_attr++;
++			goto cleanup;
++		}
++	}
++
++	/*
++	 * Every test of itself the candidate's rules asked must give this
++	 * node the same answer (VitaSurf). With the same name, classes
++	 * and attribute names and no id, the two are offered the same
++	 * rules, and each rule then goes the same way test by test.
++	 */
++	if (node_data->self_tested != 0 || node_data->nth[0].kind != 0) {
++		bool same = false;
++
++		error = self_same(state, node_data, &same);
++		if (error != CSS_OK || same == false) {
++			if (error == CSS_OK)
++				css_select_share_position++;
++			goto cleanup;
++		}
++	}
++
+ 	*sharable_node_data = node_data;
+ 
+ cleanup:
+@@ -1276,7 +1376,7 @@ cleanup:
+ 		}
+ 	}
+ 
+-	return CSS_OK;
++	return error;
+ }
+ 
+ 
+@@ -1318,7 +1418,7 @@ static css_error css_select_style__get_named_cousin(
+  * \return CSS_OK on success or appropriate error otherwise.
+  */
+ static css_error css_select_style__get_sharable_node_data(
+-		void *node, css_select_state *state,
++		css_select_ctx *ctx, void *node, css_select_state *state,
+ 		struct css_node_data **sharable_node_data)
+ {
+ 	css_error error;
+@@ -1348,7 +1448,13 @@ printf("      \t%s\tno share: inline style\n");
+ 		return CSS_OK;
+ 	}
+ 
+-	while (true) {
++	/*
++	 * Only the nearest few (VitaSurf). Each sibling of the same name
++	 * was tried in turn, so the last of a thousand list items that
++	 * could share with none of the others looked at all of them,
++	 * and the list cost a million looks.
++	 */
++	for (uint32_t tries = 0; tries < 8; tries++) {
+ 		void *share_candidate_node;
+ 
+ 		/* Get previous sibling with same element name */
+@@ -1376,8 +1482,9 @@ printf("      \t%s\tno share: inline style\n");
+ 		 * style.  We already know the element names match,
+ 		 * check that candidate node's ID and class won't
+ 		 * prevent sharing. */
++		css_select_share_candidates++;
+ 		error = css_select_style__get_sharable_node_data_for_candidate(
+-				state, share_candidate_node,
++				ctx, state, share_candidate_node,
+ 				type, sharable_node_data);
+ 		if (error != CSS_OK) {
+ 			return error;
+@@ -2054,13 +2161,24 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	}
+ 
+ 	/* Check if we can share another node's style */
+-	error = css_select_style__get_sharable_node_data(node, &state, &share);
++	error = css_select_style__get_sharable_node_data(ctx, node, &state,
++			&share);
+ 	if (error != CSS_OK) {
+ 		goto cleanup;
+ 	} else if (share != NULL) {
+ 		css_computed_style **styles = share->partial.styles;
+ 
+ 		css_select_shared++;
++		/*
++		 * The answers are this node's too, so a later sibling can
++		 * share with it on the same terms (VitaSurf).
++		 */
++		state.node_data->flags |= share->flags &
++				CSS_NODE_FLAGS_TAINT_CLASS_ATTR;
++		state.node_data->self_tested = share->self_tested;
++		state.node_data->self_result = share->self_result;
++		memcpy(state.node_data->nth, share->nth,
++				sizeof(state.node_data->nth));
+ 		SELECT_PHASE(css_select_us_setup);
+ 		for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
+ 			state.results->styles[i] =
+@@ -3329,9 +3447,24 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+ 	return CSS_OK;
+ }
+ 
++
++/**
++ * The taint an attribute test leaves on the node (VitaSurf): one of
++ * its own for the class attribute, which a sibling can clear, and the
++ * old one for any other.
++ */
++static inline css_node_flags attr_taint(const css_select_ctx *ctx,
++		const css_selector_detail *detail)
++{
++	return (detail->qname.name == ctx->str.class_attr) ?
++			CSS_NODE_FLAGS_TAINT_CLASS_ATTR :
++			CSS_NODE_FLAGS_TAINT_ATTRIBUTE;
++}
++
+ static inline void add_node_flags(const void *node,
+ 		const css_select_state *state, css_node_flags flags)
+ {
++
+ 	/* If the node in question is the node we're selecting for then its
+ 	 * style has been tainted by particular rules that affect whether the
+ 	 * node's style can be shared.  We don't care whether the rule matched
+@@ -3568,6 +3701,311 @@ static inline bool match_nth(int32_t a, int32_t b, int32_t count)
+ 	}
+ }
+ 
++/**
++ * Whether the node being selected for has no sibling of a kind, or for
++ * CSS_SIDE_EMPTY no content (VitaSurf).
++ *
++ * Answered once per selection. Counting the siblings walked all of
++ * them; this stops at the first, which for :first-child is the one
++ * before the node.
++ */
++static css_error side_none(css_select_state *state, enum css_side side,
++		bool *none)
++{
++	const uint8_t bit = 1u << side;
++	css_select_handler *h = state->handler;
++	void *node = state->node;
++
++	if ((state->side_known & bit) == 0) {
++		css_error error = CSS_OK;
++		bool is_none;
++		void *n = NULL;
++
++		if (side < CSS_SIDE_EMPTY &&
++				(state->count_known & bit) != 0) {
++			is_none = (state->count[side] == 0);
++		} else if (side == CSS_SIDE_EMPTY) {
++			error = h->node_is_empty(state->pw, node, &is_none);
++		} else if (side == CSS_SIDE_BEFORE) {
++			error = h->sibling_node(state->pw, node, &n);
++			is_none = (n == NULL);
++		} else if (side == CSS_SIDE_BEFORE_TYPE) {
++			error = h->named_generic_sibling_node(state->pw, node,
++					&state->element, &n);
++			is_none = (n == NULL);
++		} else if (h->next_sibling_node != NULL) {
++			error = h->next_sibling_node(state->pw, node, &n);
++			while (error == CSS_OK && n != NULL &&
++					side == CSS_SIDE_AFTER_TYPE) {
++				bool same = false;
++
++				error = h->node_has_name(state->pw, n,
++						&state->element, &same);
++				if (error != CSS_OK || same)
++					break;
++				error = h->next_sibling_node(state->pw, n, &n);
++			}
++			is_none = (n == NULL);
++		} else {
++			int32_t count = 0;
++
++			error = h->node_count_siblings(state->pw, node,
++					side == CSS_SIDE_AFTER_TYPE, true,
++					&count);
++			is_none = (count == 0);
++		}
++		if (error != CSS_OK)
++			return error;
++
++		state->side_known |= bit;
++		if (is_none)
++			state->side_none |= bit;
++	}
++
++	*none = (state->side_none & bit) != 0;
++
++	return CSS_OK;
++}
++
++/**
++ * How many siblings of a kind the node being selected for has
++ * (VitaSurf), counted once per selection.
++ */
++static css_error side_count(css_select_state *state, enum css_side side,
++		int32_t *count)
++{
++	const uint8_t bit = 1u << side;
++
++	if ((state->count_known & bit) == 0) {
++		css_error error;
++
++		error = state->handler->node_count_siblings(state->pw,
++				state->node,
++				side == CSS_SIDE_BEFORE_TYPE ||
++				side == CSS_SIDE_AFTER_TYPE,
++				side == CSS_SIDE_AFTER ||
++				side == CSS_SIDE_AFTER_TYPE,
++				&state->count[side]);
++		if (error != CSS_OK)
++			return error;
++		state->count_known |= bit;
++	}
++
++	*count = state->count[side];
++
++	return CSS_OK;
++}
++
++/**
++ * Answer a test of the node being selected for (VitaSurf).
++ *
++ * The same answers match_detail gave, but a position is found at most
++ * once per selection rather than counted for each rule. The root has
++ * no siblings, and no position pseudo-class matches it.
++ */
++static css_error self_test(css_select_state *state, enum css_self_test kind,
++		int32_t a, int32_t b, bool *match)
++{
++	css_select_handler *h = state->handler;
++	css_error error = CSS_OK;
++	bool before = false, after = false;
++	int32_t count = 0;
++
++	*match = false;
++
++	switch (kind) {
++	case CSS_SELF_ROOT:
++		*match = (state->node_state & CSS_NODE_STATE_ROOT) != 0;
++		return CSS_OK;
++	case CSS_SELF_EMPTY:
++		return side_none(state, CSS_SIDE_EMPTY, match);
++	case CSS_SELF_TARGET:
++		return h->node_is_target(state->pw, state->node, match);
++	case CSS_SELF_ENABLED:
++		return h->node_is_enabled(state->pw, state->node, match);
++	case CSS_SELF_DISABLED:
++		return h->node_is_disabled(state->pw, state->node, match);
++	case CSS_SELF_CHECKED:
++		return h->node_is_checked(state->pw, state->node, match);
++	default:
++		break;
++	}
++
++	if ((state->node_state & CSS_NODE_STATE_ROOT) != 0)
++		return CSS_OK;
++
++	switch (kind) {
++	case CSS_SELF_FIRST_CHILD:
++		error = side_none(state, CSS_SIDE_BEFORE, match);
++		break;
++	case CSS_SELF_LAST_CHILD:
++		error = side_none(state, CSS_SIDE_AFTER, match);
++		break;
++	case CSS_SELF_ONLY_CHILD:
++		error = side_none(state, CSS_SIDE_BEFORE, &before);
++		if (error == CSS_OK && before)
++			error = side_none(state, CSS_SIDE_AFTER, &after);
++		*match = before && after;
++		break;
++	case CSS_SELF_FIRST_OF_TYPE:
++		error = side_none(state, CSS_SIDE_BEFORE_TYPE, match);
++		break;
++	case CSS_SELF_LAST_OF_TYPE:
++		error = side_none(state, CSS_SIDE_AFTER_TYPE, match);
++		break;
++	case CSS_SELF_ONLY_OF_TYPE:
++		error = side_none(state, CSS_SIDE_BEFORE_TYPE, &before);
++		if (error == CSS_OK && before)
++			error = side_none(state, CSS_SIDE_AFTER_TYPE, &after);
++		*match = before && after;
++		break;
++	case CSS_SELF_NTH_CHILD:
++		error = side_count(state, CSS_SIDE_BEFORE, &count);
++		*match = match_nth(a, b, count + 1);
++		break;
++	case CSS_SELF_NTH_LAST_CHILD:
++		error = side_count(state, CSS_SIDE_AFTER, &count);
++		*match = match_nth(a, b, count + 1);
++		break;
++	case CSS_SELF_NTH_OF_TYPE:
++		error = side_count(state, CSS_SIDE_BEFORE_TYPE, &count);
++		*match = match_nth(a, b, count + 1);
++		break;
++	case CSS_SELF_NTH_LAST_OF_TYPE:
++		error = side_count(state, CSS_SIDE_AFTER_TYPE, &count);
++		*match = match_nth(a, b, count + 1);
++		break;
++	default:
++		break;
++	}
++
++	if (error != CSS_OK)
++		*match = false;
++
++	return error;
++}
++
++/**
++ * Keep a test's answer with the node (VitaSurf), so a sibling can
++ * repeat it; see struct css_node_data. False when there is
++ * no room, and the node must be tainted instead.
++ */
++static bool self_note(css_select_state *state, enum css_self_test kind,
++		int32_t a, int32_t b, bool match)
++{
++	struct css_node_data *nd = state->node_data;
++	uint32_t i;
++
++	if (kind < CSS_SELF_NTH_CHILD) {
++		nd->self_tested |= 1u << kind;
++		if (match)
++			nd->self_result |= 1u << kind;
++		return true;
++	}
++
++	if (a < INT8_MIN || a > INT8_MAX || b < INT8_MIN || b > INT8_MAX)
++		return false;
++
++	for (i = 0; i < CSS_NTH_OUTCOMES; i++) {
++		css_nth_outcome *o = &nd->nth[i];
++
++		if (o->kind == 0) {
++			o->kind = (uint8_t) (kind - CSS_SELF_NTH_CHILD + 1);
++			o->a = (int8_t) a;
++			o->b = (int8_t) b;
++			o->result = match ? 1 : 0;
++			return true;
++		}
++		if (o->kind == kind - CSS_SELF_NTH_CHILD + 1 &&
++				o->a == a && o->b == b)
++			return true;
++	}
++
++	return false;
++}
++
++/**
++ * Whether every test of itself a sibling's rules asked gives the node
++ * being selected for the same answer (VitaSurf).
++ */
++static css_error self_same(css_select_state *state,
++		const struct css_node_data *nd, bool *same)
++{
++	css_error error;
++	uint32_t i;
++	bool match;
++
++	*same = false;
++
++	for (i = 0; i < CSS_SELF_NTH_CHILD; i++) {
++		if ((nd->self_tested & (1u << i)) == 0)
++			continue;
++		error = self_test(state, (enum css_self_test) i, 0, 0, &match);
++		if (error != CSS_OK)
++			return error;
++		if (match != ((nd->self_result & (1u << i)) != 0))
++			return CSS_OK;
++	}
++
++	for (i = 0; i < CSS_NTH_OUTCOMES && nd->nth[i].kind != 0; i++) {
++		const css_nth_outcome *o = &nd->nth[i];
++
++		error = self_test(state, (enum css_self_test)
++				(CSS_SELF_NTH_CHILD + o->kind - 1),
++				o->a, o->b, &match);
++		if (error != CSS_OK)
++			return error;
++		if (match != (o->result != 0))
++			return CSS_OK;
++	}
++
++	*same = true;
++
++	return CSS_OK;
++}
++
++/**
++ * The test of the node itself a pseudo-class name asks for, or
++ * CSS_SELF_NONE (VitaSurf).
++ */
++static enum css_self_test self_kind(const css_select_ctx *ctx,
++		const lwc_string *name)
++{
++	if (name == ctx->str.first_child)
++		return CSS_SELF_FIRST_CHILD;
++	if (name == ctx->str.last_child)
++		return CSS_SELF_LAST_CHILD;
++	if (name == ctx->str.nth_child)
++		return CSS_SELF_NTH_CHILD;
++	if (name == ctx->str.nth_last_child)
++		return CSS_SELF_NTH_LAST_CHILD;
++	if (name == ctx->str.nth_of_type)
++		return CSS_SELF_NTH_OF_TYPE;
++	if (name == ctx->str.nth_last_of_type)
++		return CSS_SELF_NTH_LAST_OF_TYPE;
++	if (name == ctx->str.first_of_type)
++		return CSS_SELF_FIRST_OF_TYPE;
++	if (name == ctx->str.last_of_type)
++		return CSS_SELF_LAST_OF_TYPE;
++	if (name == ctx->str.only_child)
++		return CSS_SELF_ONLY_CHILD;
++	if (name == ctx->str.only_of_type)
++		return CSS_SELF_ONLY_OF_TYPE;
++	if (name == ctx->str.empty)
++		return CSS_SELF_EMPTY;
++	if (name == ctx->str.target)
++		return CSS_SELF_TARGET;
++	if (name == ctx->str.root)
++		return CSS_SELF_ROOT;
++	if (name == ctx->str.disabled)
++		return CSS_SELF_DISABLED;
++	if (name == ctx->str.enabled)
++		return CSS_SELF_ENABLED;
++	if (name == ctx->str.checked)
++		return CSS_SELF_CHECKED;
++	return CSS_SELF_NONE;
++}
++
+ /**
+  * Match one :has() argument's compound against a candidate node
+  * (VitaSurf).
+@@ -3715,38 +4153,126 @@ static css_error match_has(css_select_ctx *ctx, void *node,
+ }
+ 
+ /**
+- * Whether this node is not the root, asking at most once (VitaSurf).
++ * Answer a test of a node other than the one being selected for, such
++ * as an ancestor (VitaSurf).
+  *
+- * Used by NOT_ROOT() below so that a pseudo-class which does not care
+- * never asks. A failure is remembered in \a err for the caller to
+- * return, and is treated as "not the root" so the chain still reaches a
+- * branch rather than matching one it should not.
++ * Nothing is kept: the answer belongs to that node. The root has no
++ * siblings and no position pseudo-class matches it.
+  */
+-static bool detail_not_root(css_select_state *state, void *node,
+-		bool *is_root, bool *known, css_error *err)
++static css_error self_test_other(css_select_state *state, void *node,
++		enum css_self_test kind, int32_t a, int32_t b, bool *match)
+ {
+-	if (*known == false) {
+-		*err = state->handler->node_is_root(state->pw, node, is_root);
+-		if (*err != CSS_OK)
+-			*is_root = false;
+-		*known = true;
++	css_select_handler *h = state->handler;
++	css_error error;
++	int32_t before = 0, after = 0;
++	bool is_root = false;
++
++	*match = false;
++
++	switch (kind) {
++	case CSS_SELF_EMPTY:
++		return h->node_is_empty(state->pw, node, match);
++	case CSS_SELF_ROOT:
++		return h->node_is_root(state->pw, node, match);
++	case CSS_SELF_TARGET:
++		return h->node_is_target(state->pw, node, match);
++	case CSS_SELF_ENABLED:
++		return h->node_is_enabled(state->pw, node, match);
++	case CSS_SELF_DISABLED:
++		return h->node_is_disabled(state->pw, node, match);
++	case CSS_SELF_CHECKED:
++		return h->node_is_checked(state->pw, node, match);
++	default:
++		break;
+ 	}
+ 
+-	return *is_root == false;
++	error = h->node_is_root(state->pw, node, &is_root);
++	if (error != CSS_OK)
++		return error;
++	if (is_root)
++		return CSS_OK;
++
++	switch (kind) {
++	case CSS_SELF_FIRST_CHILD:
++	case CSS_SELF_NTH_CHILD:
++	case CSS_SELF_ONLY_CHILD:
++		error = h->node_count_siblings(state->pw, node, false, false,
++				&before);
++		break;
++	case CSS_SELF_FIRST_OF_TYPE:
++	case CSS_SELF_NTH_OF_TYPE:
++	case CSS_SELF_ONLY_OF_TYPE:
++		error = h->node_count_siblings(state->pw, node, true, false,
++				&before);
++		break;
++	default:
++		break;
++	}
++	if (error != CSS_OK)
++		return error;
++
++	switch (kind) {
++	case CSS_SELF_LAST_CHILD:
++	case CSS_SELF_NTH_LAST_CHILD:
++		error = h->node_count_siblings(state->pw, node, false, true,
++				&after);
++		break;
++	case CSS_SELF_ONLY_CHILD:
++		if (before == 0)
++			error = h->node_count_siblings(state->pw, node,
++					false, true, &after);
++		break;
++	case CSS_SELF_LAST_OF_TYPE:
++	case CSS_SELF_NTH_LAST_OF_TYPE:
++		error = h->node_count_siblings(state->pw, node, true, true,
++				&after);
++		break;
++	case CSS_SELF_ONLY_OF_TYPE:
++		if (before == 0)
++			error = h->node_count_siblings(state->pw, node,
++					true, true, &after);
++		break;
++	default:
++		break;
++	}
++	if (error != CSS_OK)
++		return error;
++
++	switch (kind) {
++	case CSS_SELF_FIRST_CHILD:
++	case CSS_SELF_FIRST_OF_TYPE:
++		*match = (before == 0);
++		break;
++	case CSS_SELF_LAST_CHILD:
++	case CSS_SELF_LAST_OF_TYPE:
++		*match = (after == 0);
++		break;
++	case CSS_SELF_ONLY_CHILD:
++	case CSS_SELF_ONLY_OF_TYPE:
++		*match = (before == 0) && (after == 0);
++		break;
++	case CSS_SELF_NTH_CHILD:
++	case CSS_SELF_NTH_OF_TYPE:
++		*match = match_nth(a, b, before + 1);
++		break;
++	case CSS_SELF_NTH_LAST_CHILD:
++	case CSS_SELF_NTH_LAST_OF_TYPE:
++		*match = match_nth(a, b, after + 1);
++		break;
++	default:
++		break;
++	}
++
++	return CSS_OK;
+ }
+ 
+ css_error match_detail(css_select_ctx *ctx, void *node,
+ 		const css_selector_detail *detail, css_select_state *state,
+ 		bool *match, css_pseudo_element *pseudo_element)
+ {
+-	bool is_root = false;
+-	bool root_known = false;
+-	css_error root_error = CSS_OK;
+ 	css_error error = CSS_OK;
+ 	css_node_flags flags = CSS_NODE_FLAGS_TAINT_PSEUDO_CLASS;
+-
+-#define NOT_ROOT() detail_not_root(state, node, &is_root, &root_known, \
+-		&root_error)
++	enum css_self_test test;
+ 
+ 	switch (detail->type) {
+ 	case CSS_SELECTOR_ELEMENT:
+@@ -3773,140 +4299,11 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 		break;
+ 	case CSS_SELECTOR_PSEUDO_CLASS:
+ 		/*
+-		 * Only the structural pseudo-classes below and :root itself
+-		 * want to know whether this is the root, and asking walks to
+-		 * the parent (VitaSurf). A GitHub page tests a pseudo-class
+-		 * 15,615,630 times and nearly all of them are :hover and its
+-		 * kind, which never look at it, so the name is compared
+-		 * first and the question asked only once a branch has taken
+-		 * that needs the answer.
++		 * :hover and its kind first: a GitHub page tests a
++		 * pseudo-class 15,615,630 times and nearly all of them are
++		 * those, which never look at the node's position (VitaSurf).
+ 		 */
+-		if (detail->qname.name == ctx->str.first_child &&
+-				NOT_ROOT()) {
+-			int32_t num_before = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, false, false, &num_before);
+-			if (error == CSS_OK)
+-				*match = (num_before == 0);
+-		} else if (detail->qname.name == ctx->str.nth_child &&
+-				NOT_ROOT()) {
+-			int32_t num_before = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, false, false, &num_before);
+-			if (error == CSS_OK) {
+-				int32_t a = detail->value.nth.a;
+-				int32_t b = detail->value.nth.b;
+-
+-				*match = match_nth(a, b, num_before + 1);
+-			}
+-		} else if (detail->qname.name == ctx->str.nth_last_child &&
+-				NOT_ROOT()) {
+-			int32_t num_after = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, false, true, &num_after);
+-			if (error == CSS_OK) {
+-				int32_t a = detail->value.nth.a;
+-				int32_t b = detail->value.nth.b;
+-
+-				*match = match_nth(a, b, num_after + 1);
+-			}
+-		} else if (detail->qname.name == ctx->str.nth_of_type &&
+-				NOT_ROOT()) {
+-			int32_t num_before = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, true, false, &num_before);
+-			if (error == CSS_OK) {
+-				int32_t a = detail->value.nth.a;
+-				int32_t b = detail->value.nth.b;
+-
+-				*match = match_nth(a, b, num_before + 1);
+-			}
+-		} else if (detail->qname.name == ctx->str.nth_last_of_type &&
+-				NOT_ROOT()) {
+-			int32_t num_after = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, true, true, &num_after);
+-			if (error == CSS_OK) {
+-				int32_t a = detail->value.nth.a;
+-				int32_t b = detail->value.nth.b;
+-
+-				*match = match_nth(a, b, num_after + 1);
+-			}
+-		} else if (detail->qname.name == ctx->str.last_child &&
+-				NOT_ROOT()) {
+-			int32_t num_after = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, false, true, &num_after);
+-			if (error == CSS_OK)
+-				*match = (num_after == 0);
+-		} else if (detail->qname.name == ctx->str.first_of_type &&
+-				NOT_ROOT()) {
+-			int32_t num_before = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, true, false, &num_before);
+-			if (error == CSS_OK)
+-				*match = (num_before == 0);
+-		} else if (detail->qname.name == ctx->str.last_of_type &&
+-				NOT_ROOT()) {
+-			int32_t num_after = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, true, true, &num_after);
+-			if (error == CSS_OK)
+-				*match = (num_after == 0);
+-		} else if (detail->qname.name == ctx->str.only_child &&
+-				NOT_ROOT()) {
+-			int32_t num_before = 0, num_after = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, false, false, &num_before);
+-			if (error == CSS_OK) {
+-				error = state->handler->node_count_siblings(
+-						state->pw, node, false, true,
+-						&num_after);
+-				if (error == CSS_OK)
+-					*match = (num_before == 0) &&
+-							(num_after == 0);
+-			}
+-		} else if (detail->qname.name == ctx->str.only_of_type &&
+-				NOT_ROOT()) {
+-			int32_t num_before = 0, num_after = 0;
+-
+-			error = state->handler->node_count_siblings(state->pw,
+-					node, true, false, &num_before);
+-			if (error == CSS_OK) {
+-				error = state->handler->node_count_siblings(
+-						state->pw, node, true, true,
+-						&num_after);
+-				if (error == CSS_OK)
+-					*match = (num_before == 0) &&
+-							(num_after == 0);
+-			}
+-		} else if (detail->qname.name == ctx->str.root) {
+-			error = state->handler->node_is_root(state->pw, node,
+-					&is_root);
+-			if (error != CSS_OK)
+-				return error;
+-			*match = is_root;
+-		} else if (detail->qname.name == ctx->str.empty) {
+-			error = state->handler->node_is_empty(state->pw,
+-					node, match);
+-		} else if (detail->qname.name == ctx->str.link) {
+-			error = state->handler->node_is_link(state->pw,
+-					node, match);
+-			flags = CSS_NODE_FLAGS_NONE;
+-		} else if (detail->qname.name == ctx->str.visited) {
+-			error = state->handler->node_is_visited(state->pw,
+-					node, match);
+-			flags = CSS_NODE_FLAGS_NONE;
+-		} else if (detail->qname.name == ctx->str.hover) {
++		if (detail->qname.name == ctx->str.hover) {
+ 			error = state->handler->node_is_hover(state->pw,
+ 					node, match);
+ 			flags = CSS_NODE_FLAGS_NONE;
+@@ -3918,33 +4315,53 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 			error = state->handler->node_is_focus(state->pw,
+ 					node, match);
+ 			flags = CSS_NODE_FLAGS_NONE;
+-		} else if (detail->qname.name == ctx->str.target) {
+-			error = state->handler->node_is_target(state->pw,
++		} else if (detail->qname.name == ctx->str.link) {
++			error = state->handler->node_is_link(state->pw,
++					node, match);
++			flags = CSS_NODE_FLAGS_NONE;
++		} else if (detail->qname.name == ctx->str.visited) {
++			error = state->handler->node_is_visited(state->pw,
+ 					node, match);
++			flags = CSS_NODE_FLAGS_NONE;
++		} else if ((test = self_kind(ctx, detail->qname.name)) !=
++				CSS_SELF_NONE) {
++			int32_t a = 0, b = 0;
++
++			if (test >= CSS_SELF_NTH_CHILD) {
++				a = detail->value.nth.a;
++				b = detail->value.nth.b;
++			}
++			if (node == state->node) {
++				/*
++				 * Answered once per selection and kept
++				 * with the node, so that a sibling given
++				 * the same answers can share its style
++				 * (VitaSurf).
++				 */
++				error = self_test(state, test, a, b, match);
++				if (error != CSS_OK)
++					return error;
++				if (self_note(state, test, a, b, *match))
++					flags = CSS_NODE_FLAGS_NONE;
++			} else {
++				error = self_test_other(state, node, test,
++						a, b, match);
++			}
+ 		} else if (detail->qname.name == ctx->str.lang) {
+ 			error = state->handler->node_is_lang(state->pw,
+ 					node, detail->value.string, match);
+-		} else if (detail->qname.name == ctx->str.enabled) {
+-			error = state->handler->node_is_enabled(state->pw,
+-					node, match);
+-		} else if (detail->qname.name == ctx->str.disabled) {
+-			error = state->handler->node_is_disabled(state->pw,
+-					node, match);
+-		} else if (detail->qname.name == ctx->str.checked) {
+-			error = state->handler->node_is_checked(state->pw,
+-					node, match);
+ 		} else if (detail->qname.name == ctx->str.has &&
+ 				detail->value_type ==
+ 				CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
+ 			error = match_has(ctx, node, detail->value.selector,
+ 					state, match);
+ 		} else {
++			/* One not known here matches nothing, whatever the
++			 * node, so no sibling can differ (VitaSurf). */
+ 			*match = false;
++			flags = CSS_NODE_FLAGS_NONE;
+ 		}
+ 
+-		if (root_error != CSS_OK)
+-			return root_error;
+-
+ 		add_node_flags(node, state, flags);
+ 		break;
+ 	case CSS_SELECTOR_PSEUDO_ELEMENT:
+@@ -3964,43 +4381,43 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 	case CSS_SELECTOR_ATTRIBUTE:
+ 		error = state->handler->node_has_attribute(state->pw, node,
+ 				&detail->qname, match);
+-		add_node_flags(node, state, CSS_NODE_FLAGS_TAINT_ATTRIBUTE);
++		add_node_flags(node, state, attr_taint(ctx, detail));
+ 		break;
+ 	case CSS_SELECTOR_ATTRIBUTE_EQUAL:
+ 		error = state->handler->node_has_attribute_equal(state->pw,
+ 				node, &detail->qname, detail->value.string,
+ 				match);
+-		add_node_flags(node, state, CSS_NODE_FLAGS_TAINT_ATTRIBUTE);
++		add_node_flags(node, state, attr_taint(ctx, detail));
+ 		break;
+ 	case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
+ 		error = state->handler->node_has_attribute_dashmatch(state->pw,
+ 				node, &detail->qname, detail->value.string,
+ 				match);
+-		add_node_flags(node, state, CSS_NODE_FLAGS_TAINT_ATTRIBUTE);
++		add_node_flags(node, state, attr_taint(ctx, detail));
+ 		break;
+ 	case CSS_SELECTOR_ATTRIBUTE_INCLUDES:
+ 		error = state->handler->node_has_attribute_includes(state->pw,
+ 				node, &detail->qname, detail->value.string,
+ 				match);
+-		add_node_flags(node, state, CSS_NODE_FLAGS_TAINT_ATTRIBUTE);
++		add_node_flags(node, state, attr_taint(ctx, detail));
+ 		break;
+ 	case CSS_SELECTOR_ATTRIBUTE_PREFIX:
+ 		error = state->handler->node_has_attribute_prefix(state->pw,
+ 				node, &detail->qname, detail->value.string,
+ 				match);
+-		add_node_flags(node, state, CSS_NODE_FLAGS_TAINT_ATTRIBUTE);
++		add_node_flags(node, state, attr_taint(ctx, detail));
+ 		break;
+ 	case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
+ 		error = state->handler->node_has_attribute_suffix(state->pw,
+ 				node, &detail->qname, detail->value.string,
+ 				match);
+-		add_node_flags(node, state, CSS_NODE_FLAGS_TAINT_ATTRIBUTE);
++		add_node_flags(node, state, attr_taint(ctx, detail));
+ 		break;
+ 	case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
+ 		error = state->handler->node_has_attribute_substring(state->pw,
+ 				node, &detail->qname, detail->value.string,
+ 				match);
+-		add_node_flags(node, state, CSS_NODE_FLAGS_TAINT_ATTRIBUTE);
++		add_node_flags(node, state, attr_taint(ctx, detail));
+ 		break;
+ 	}
+ 
+@@ -4011,7 +4428,6 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 	return error;
+ }
+ 
+-#undef NOT_ROOT
+ 
+ css_error cascade_style(const css_style *style, css_select_state *state)
+ {
+diff --git a/src/select/select.h b/src/select/select.h
+index 0250922..b97b827 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -46,6 +46,13 @@ typedef enum css_node_flags {
+ 	CSS_NODE_FLAGS_TAINT_PSEUDO_CLASS   = (1 <<  7),
+ 	CSS_NODE_FLAGS_TAINT_ATTRIBUTE      = (1 <<  8),
+ 	CSS_NODE_FLAGS_TAINT_SIBLING        = (1 <<  9),
++	/*
++	 * Only the class attribute's value was tested (VitaSurf), by
++	 * [class^=...] and the like. A sibling whose class attribute
++	 * is the same string gets the same answers, so this refuses a
++	 * sibling only when the strings differ.
++	 */
++	CSS_NODE_FLAGS_TAINT_CLASS_ATTR     = (1 << 10),
+ 	CSS_NODE_FLAGS__PSEUDO_CLASSES_MASK =
+ 			(CSS_NODE_FLAGS_PSEUDO_CLASS_ACTIVE |
+ 			 CSS_NODE_FLAGS_PSEUDO_CLASS_FOCUS  |
+@@ -54,10 +61,76 @@ typedef enum css_node_flags {
+ 			 CSS_NODE_FLAGS_PSEUDO_CLASS_VISITED),
+ } css_node_flags;
+ 
++/*
++ * The pseudo-classes that ask only about the node itself, which a
++ * sibling may repeat (VitaSurf): where it sits among its siblings, and
++ * what it is. The ones up to :checked are one bit each of
++ * css_node_data's self_tested and self_result; the :nth-* ones carry
++ * arguments and go in its nth slots.
++ */
++enum css_self_test {
++	CSS_SELF_FIRST_CHILD,
++	CSS_SELF_LAST_CHILD,
++	CSS_SELF_ONLY_CHILD,
++	CSS_SELF_FIRST_OF_TYPE,
++	CSS_SELF_LAST_OF_TYPE,
++	CSS_SELF_ONLY_OF_TYPE,
++	CSS_SELF_EMPTY,
++	CSS_SELF_ROOT,
++	CSS_SELF_TARGET,
++	CSS_SELF_ENABLED,
++	CSS_SELF_DISABLED,
++	CSS_SELF_CHECKED,
++	CSS_SELF_NTH_CHILD,
++	CSS_SELF_NTH_LAST_CHILD,
++	CSS_SELF_NTH_OF_TYPE,
++	CSS_SELF_NTH_LAST_OF_TYPE,
++	CSS_SELF_NONE
++};
++
++/* The siblings a position test counts (VitaSurf); CSS_SIDE_EMPTY is
++ * :empty's answer, kept with them. */
++enum css_side {
++	CSS_SIDE_BEFORE,
++	CSS_SIDE_AFTER,
++	CSS_SIDE_BEFORE_TYPE,
++	CSS_SIDE_AFTER_TYPE,
++	CSS_SIDE_EMPTY
++};
++
++/*
++ * An :nth-* test and what it said, for the node's sibling to repeat
++ * (VitaSurf). See struct css_node_data. kind is 0 for an empty slot,
++ * else CSS_SELF_NTH_* plus one.
++ */
++typedef struct css_nth_outcome {
++	int8_t a;
++	int8_t b;
++	uint8_t kind;
++	uint8_t result;
++} css_nth_outcome;
++
++#define CSS_NTH_OUTCOMES 4
++
+ struct css_node_data {
+ 	css_select_results partial;
+ 	css_bloom *bloom;
+ 	css_node_flags flags;
++	/*
++	 * The tests of the node itself that its rules asked, and their
++	 * answers (VitaSurf). Any such pseudo-class used to taint the
++	 * node outright, and on a GitHub page every element meets 35
++	 * universal :first-child and :last-child rules and a :target
++	 * one, so none could share a sibling's style. Now a sibling may,
++	 * if every test gives it the same answer: self_tested and
++	 * self_result hold one bit each for :first-child through
++	 * :checked (CSS_SELF_*), and nth holds the :nth-* tests with
++	 * their arguments. A node that asks more of those than fit is
++	 * tainted as before.
++	 */
++	uint16_t self_tested;
++	uint16_t self_result;
++	css_nth_outcome nth[CSS_NTH_OUTCOMES];
+ 	/*
+ 	 * The names of the node's attributes when it was selected
+ 	 * (VitaSurf). A sibling may share this node's style only if it
+@@ -121,6 +194,19 @@ typedef struct css_select_state {
+ 
+ 	struct css_node_data *node_data;	/* Data we'll store on node */
+ 
++	/*
++	 * Where the node sits among its siblings, found once and only
++	 * if a rule asks (VitaSurf). Each position test counted every
++	 * sibling before or after the node, once per rule, and a
++	 * GitHub element meets 35 of them. The bits are indexed by
++	 * CSS_SIDE_*: side_known says whether side_none (no such
++	 * sibling at all) is known, count_known whether count[] is.
++	 */
++	uint8_t side_known;
++	uint8_t side_none;
++	uint8_t count_known;
++	int32_t count[4];
++
+ 	/*
+ 	 * Declarations held over for the cascade (VitaSurf). Variables
+ 	 * this element was given, and the declarations that spend them,
+diff --git a/src/select/strings.c b/src/select/strings.c
+index e2e2f2b..4485259 100644
+--- a/src/select/strings.c
++++ b/src/select/strings.c
+@@ -353,6 +353,10 @@ css_error css_select_strings_intern(css_select_strings *str)
+ 	if (error != lwc_error_ok)
+ 		return css_error_from_lwc_error(error);
+ 
++	error = lwc_intern_string("class", SLEN("class"), &str->class_attr);
++	if (error != lwc_error_ok)
++		return css_error_from_lwc_error(error);
++
+ 	return CSS_OK;
+ }
+ 
+@@ -427,4 +431,5 @@ void css_select_strings_unref(css_select_strings *str)
+ 	lwc_string_unref(str->aspect_ratio);
+ 	lwc_string_unref(str->min_aspect_ratio);
+ 	lwc_string_unref(str->max_aspect_ratio);
++	lwc_string_unref(str->class_attr);
+ }
+diff --git a/src/select/strings.h b/src/select/strings.h
+index ce030bb..6b74c52 100644
+--- a/src/select/strings.h
++++ b/src/select/strings.h
+@@ -85,6 +85,8 @@ typedef struct {
+ 	lwc_string *aspect_ratio;
+ 	lwc_string *min_aspect_ratio;
+ 	lwc_string *max_aspect_ratio;
++	/* the attribute a class list is read from (VitaSurf) */
++	lwc_string *class_attr;
+ } css_select_strings;
+ 
+ css_error css_select_strings_intern(css_select_strings *str);

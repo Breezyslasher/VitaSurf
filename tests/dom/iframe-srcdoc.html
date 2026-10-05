@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<!-- An iframe with no src has a real window and document the moment it
+     is in the page: a realm of its own, which document.open, write and
+     close fill and whose scripts run there, and which it keeps across
+     layout, hidden or not. An iframe with srcdoc loads that markup as
+     about:srcdoc with this page's base URL and origin, runs its scripts,
+     and loads again when the srcdoc changes. A sandboxed srcdoc's
+     script never reaches this page. -->
+<html><head><title>parent</title></head><body><div id="out"></div>
+<iframe id="sd" srcdoc="<title>sd</title><p id=x>from srcdoc</p><a id=a href='iframe-pages/child.html'>l</a><script>parent.fromSrcdoc({href:location.href,base:document.baseURI,a:document.getElementById('a').href,origin:self.origin,parentTitle:parent.document.title,frameElement:frameElement&&frameElement.id})</script>"></iframe>
+<iframe id="sb" sandbox srcdoc="<script>parent.sandboxRan = true;</script>"></iframe>
+<iframe id="sb2" sandbox="allow-scripts" srcdoc="<script>parent.sandboxRan2 = true;</script>"></iframe>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var report = null, done = false, sd = document.getElementById('sd');
+window.fromSrcdoc = function (r) { if (!report) report = r; };
+
+var f = document.createElement('iframe');
+document.body.appendChild(f);
+var w = f.contentWindow, d = f.contentDocument;
+ok("a blank iframe's window is a realm of its own", !!w && w.Array !== Array && typeof w.Array === 'function');
+ok("its document is there at once", !!d && w.document === d && !!d.body);
+ok("it is about:blank with this page's base", w.location.href === 'about:blank' && d.baseURI === document.baseURI);
+ok("its parent and frameElement", w.parent === window && w.top === window && w.frameElement === f);
+d.open();
+d.write('<p id="w">written</p><script>window.ran = (window !== parent);<\/script>');
+d.close();
+ok("what is written is in its document", !!d.getElementById('w') && d.getElementById('w').textContent === 'written');
+ok("a written script runs in the frame", w.ran === true && typeof window.ran === 'undefined');
+var s = d.createElement('script'); s.textContent = 'window.inserted = (window !== parent);'; d.body.appendChild(s);
+ok("an inserted script runs in the frame", w.inserted === true);
+w.marker = 7;
+var h = document.createElement('iframe'); h.style.display = 'none'; document.body.appendChild(h);
+var hw = h.contentWindow; hw.kept = 1;
+ok("a hidden blank iframe has a real window too", !!hw && hw.Array !== Array);
+
+setTimeout(function () {
+ ok("the blank frame keeps its window and document across layout", f.contentWindow === w && w.marker === 7 && f.contentDocument === d && !!d.getElementById('w'));
+ ok("the hidden one keeps its window", h.contentWindow === hw && hw.kept === 1);
+ ok("a sandboxed srcdoc's script does not reach this page", window.sandboxRan === undefined && window.sandboxRan2 === undefined);
+ ok("the srcdoc ran its script", report !== null);
+ if (report) {
+  ok("srcdoc is about:srcdoc", report.href === 'about:srcdoc');
+  ok("with this page's base URL", report.base === document.baseURI);
+  ok("its links resolve against it", report.a === new URL('iframe-pages/child.html', document.baseURI).href);
+  ok("and this page's origin", report.origin === self.origin);
+  ok("its parent and frameElement", report.parentTitle === 'parent' && report.frameElement === 'sd');
+ }
+ var sdd = sd.contentDocument;
+ ok("contentDocument is the srcdoc", !!sdd && sdd.title === 'sd' && sdd.getElementById('x').textContent === 'from srcdoc');
+ sd.onload = function () {
+  var n = sd.contentDocument;
+  ok("a new srcdoc loads", !!n && !!n.getElementById('y') && n.getElementById('y').textContent === 'changed');
+  done = true;
+ };
+ sd.srcdoc = '<p id="y">changed</p>';
+}, 1000);
+setTimeout(function () { if (!done) ok("the new srcdoc loaded in time", false); }, 2800);
+</script></body></html>

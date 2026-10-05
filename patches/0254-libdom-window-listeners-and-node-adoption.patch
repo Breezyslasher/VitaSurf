@@ -1,0 +1,253 @@
+diff --git a/include/dom/events/event_target.h b/include/dom/events/event_target.h
+index e55b6cb..f14c383 100644
+--- a/include/dom/events/event_target.h
++++ b/include/dom/events/event_target.h
+@@ -69,6 +69,18 @@ static inline dom_exception dom_event_target_remove_event_listener(
+ 		(dom_event_target *) (et), (dom_string *) (t),\
+ 		(struct dom_event_listener *) (l), (bool) (c))
+ 
++/*
++ * The window above a document (VitaSurf). libdom knows no window, so a
++ * client that has one gives this hook: a dispatch whose target is in a
++ * document calls it with capture true before the capture phase, and with
++ * capture false after the bubbling phase of an event that bubbles. It
++ * may stop propagation or prevent the default, as a listener can.
++ */
++struct dom_document;
++typedef void (*dom_event_window_hook)(struct dom_event *evt,
++		struct dom_document *doc, bool capture, void *pw);
++void dom_event_set_window_hook(dom_event_window_hook hook, void *pw);
++
+ static inline dom_exception dom_event_target_dispatch_event(
+ 		dom_event_target *et, struct dom_event *evt, bool *success)
+ {
+diff --git a/src/core/element.c b/src/core/element.c
+index 26f5a62..659a579 100644
+--- a/src/core/element.c
++++ b/src/core/element.c
+@@ -160,6 +160,21 @@ static dom_attr_list * _dom_element_attr_list_next(const dom_attr_list *n)
+ 	return (dom_attr_list *)(n->list.next);
+ }
+ 
++/* Exported function documented in element.h (VitaSurf) */
++void _dom_element_each_attr(struct dom_element *ele,
++		void (*fn)(struct dom_node_internal *node, void *pw), void *pw)
++{
++	dom_attr_list *attr = ele->attributes;
++
++	if (attr == NULL)
++		return;
++	do {
++		if (attr->attr != NULL)
++			fn((struct dom_node_internal *) attr->attr, pw);
++		attr = _dom_element_attr_list_next(attr);
++	} while (attr != ele->attributes);
++}
++
+ /**
+  * Unlink an attribute list node from its linked list
+  *
+diff --git a/src/core/element.h b/src/core/element.h
+index fb946b7..3befb85 100644
+--- a/src/core/element.h
++++ b/src/core/element.h
+@@ -238,6 +238,10 @@ dom_exception _dom_element_copy_internal(dom_element *old,
+ 
+ dom_exception _dom_element_get_id(struct dom_element *ele, dom_string **id);
+ 
++/* Each attribute node of the element, for adoption (VitaSurf) */
++void _dom_element_each_attr(struct dom_element *ele,
++		void (*fn)(struct dom_node_internal *node, void *pw), void *pw);
++
+ extern const struct dom_element_vtable _dom_element_vtable;
+ 
+ #endif
+diff --git a/src/core/node.c b/src/core/node.c
+index a1a36b1..184755f 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -726,6 +726,61 @@ dom_exception _dom_node_get_owner_document(dom_node_internal *node,
+  * the responsibility of the caller to unref the node once it has
+  * finished with it.
+  */
++/*
++ * Move a subtree into another document, as it is (VitaSurf). The DOM
++ * adopts a node that is inserted into a document other than its own;
++ * libdom refused with WRONG_DOCUMENT_ERR, and the page's scripts, which
++ * never see that error, had nodes a DOMParser made go nowhere when put
++ * into the page. dom_document_adopt_node makes copies, which the page's
++ * references to the originals would not follow, so the owner changes
++ * in place: the strings are shared between documents already.
++ */
++static void adopt_one(dom_node_internal *n, void *pw)
++{
++	struct dom_document *to = pw;
++	dom_node_internal *c;
++	bool pending = n->pending_list.prev != &n->pending_list;
++
++	if (n->owner != to && n->type != DOM_DOCUMENT_NODE) {
++		if (pending)
++			list_del(&n->pending_list);
++		n->owner = to;
++		if (pending)
++			list_append(&to->pending_nodes, &n->pending_list);
++	}
++	if (n->type == DOM_ELEMENT_NODE)
++		_dom_element_each_attr((struct dom_element *) n, adopt_one, to);
++	for (c = n->first_child; c != NULL; c = c->next)
++		adopt_one(c, to);
++}
++
++static dom_exception adopt_in_place(dom_node_internal *node,
++		struct dom_document *to)
++{
++	struct dom_document *from = node->owner;
++	dom_node_internal *removed = NULL;
++	dom_exception err;
++
++	if (from == NULL || from == to || to == NULL)
++		return DOM_NO_ERR;
++	if (node->type == DOM_DOCUMENT_NODE)
++		return DOM_NOT_SUPPORTED_ERR;
++	/* out of its old tree first, which leaves it pending in the old
++	 * document */
++	if (node->parent != NULL) {
++		err = dom_node_remove_child(node->parent, node, &removed);
++		if (err != DOM_NO_ERR)
++			return err;
++		if (removed != NULL)
++			dom_node_unref(removed);
++	}
++	/* the old document may be kept alive by its pending node alone */
++	dom_node_ref(from);
++	adopt_one(node, to);
++	dom_node_unref(from);
++	return DOM_NO_ERR;
++}
++
+ dom_exception _dom_node_insert_before(dom_node_internal *node,
+ 		dom_node_internal *new_child, dom_node_internal *ref_child,
+ 		dom_node_internal **result)
+@@ -735,6 +790,16 @@ dom_exception _dom_node_insert_before(dom_node_internal *node,
+ 	
+ 	assert(node != NULL);
+ 	
++	/* A node from another document is adopted (VitaSurf) */
++	if (new_child->owner != NULL && new_child->owner != node->owner &&
++			node->owner != NULL &&
++			new_child->type != DOM_DOCUMENT_NODE) {
++		dom_exception aerr = adopt_in_place(new_child, node->owner);
++
++		if (aerr != DOM_NO_ERR)
++			return aerr;
++	}
++
+ 	/* Ensure that new_child and node are owned by the same document */
+ 	if ((new_child->type == DOM_DOCUMENT_TYPE_NODE && 
+ 			new_child->owner != NULL && 
+@@ -881,6 +946,16 @@ dom_exception _dom_node_replace_child(dom_node_internal *node,
+ 			new_child->type == DOM_ELEMENT_NODE))
+ 		return DOM_NOT_SUPPORTED_ERR;
+ 
++	/* A node from another document is adopted (VitaSurf) */
++	if (new_child->owner != NULL && new_child->owner != node->owner &&
++			node->owner != NULL &&
++			new_child->type != DOM_DOCUMENT_NODE) {
++		dom_exception aerr = adopt_in_place(new_child, node->owner);
++
++		if (aerr != DOM_NO_ERR)
++			return aerr;
++	}
++
+ 	/* Ensure that new_child and node are owned by the same document */
+ 	if (new_child->owner != node->owner)
+ 		return DOM_WRONG_DOCUMENT_ERR;
+@@ -974,11 +1049,10 @@ dom_exception _dom_node_remove_child(dom_node_internal *node,
+ 	dom_exception err;
+ 	bool success = true;
+ 
+-	/* We don't support removal of DocumentType or root Element nodes */
+-	if (node->type == DOM_DOCUMENT_NODE &&
+-			(old_child->type == DOM_DOCUMENT_TYPE_NODE ||
+-			old_child->type == DOM_ELEMENT_NODE))
+-		return DOM_NOT_SUPPORTED_ERR;
++	/* A document's doctype and root element can be removed, as the DOM
++	 * allows (VitaSurf): libdom refused, so a document a DOMParser made
++	 * could not be emptied, nor its root adopted into the page. The
++	 * client keeps a page's own root where layout needs it. */
+ 
+ 	/* Ensure old_child is a child of node */
+ 	if (old_child->parent != node)
+@@ -2510,6 +2584,16 @@ static bool _event_is_mutation(dom_document *doc, struct dom_event *evt)
+  *         DOM_INVALID_CHARACTER_ERR      If the type of this event is not a
+  *                                        valid NCName.
+  */
++/* The client's window above a document (VitaSurf) */
++static dom_event_window_hook window_hook;
++static void *window_hook_pw;
++
++void dom_event_set_window_hook(dom_event_window_hook hook, void *pw)
++{
++	window_hook = hook;
++	window_hook_pw = pw;
++}
++
+ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 		struct dom_event *evt, bool *success)
+ {
+@@ -2520,6 +2604,7 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	dom_event_target **targets;
+ 	uint32_t ntargets, ntargets_allocated, targetnr;
+ 	void *pw;
++	bool to_window = false;
+ 
+ 	assert(et != NULL);
+ 	assert(evt != NULL);
+@@ -2595,6 +2680,19 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	evt->target = et;
+ 	evt->phase = DOM_CAPTURING_PHASE;
+ 
++	/* The window is on the path when the target is in its document,
++	 * except for load, which a browser never lets reach the window
++	 * from a node (VitaSurf) */
++	if (window_hook != NULL) {
++		dom_node_internal *root = (dom_node_internal *) et;
++
++		while (root->parent != NULL)
++			root = root->parent;
++		to_window = root == (dom_node_internal *) doc &&
++			!(dom_string_byte_length(evt->type) == 4 &&
++			  memcmp(dom_string_data(evt->type), "load", 4) == 0);
++	}
++
+ 	/* The started callback of default action */
+ 	dei = &doc->dei;
+ 	pw = dei->actions_ctx;
+@@ -2606,6 +2704,14 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 		}
+ 	}
+ 
++	/* The window first (VitaSurf) */
++	if (to_window) {
++		evt->current = NULL;
++		window_hook(evt, doc, true, window_hook_pw);
++		if (evt->stop_now == true || evt->stop == true)
++			goto cleanup;
++	}
++
+ 	/* The capture phase */
+ 	for (targetnr = ntargets; targetnr > 0; --targetnr) {
+ 		dom_node_internal *node =
+@@ -2657,6 +2763,12 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 			goto cleanup;
+ 	}
+ 
++	/* and the window last (VitaSurf) */
++	if (to_window && evt->bubble) {
++		evt->current = NULL;
++		window_hook(evt, doc, false, window_hook_pw);
++	}
++
+ 	if (dei->actions == NULL)
+ 		goto cleanup;
+ 

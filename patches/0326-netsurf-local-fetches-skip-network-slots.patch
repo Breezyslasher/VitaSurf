@@ -1,0 +1,117 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index 447ddea49..2c972a16b 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -103,6 +103,7 @@ struct fetch {
+ 	struct fetch *r_next;	/**< Next active fetch in ::fetch_ring. */
+ 	unsigned int queued_ms;	/**< when it was queued (VitaSurf) */
+ 	bool finishing;		/**< in ::finish_ring (VitaSurf) */
++	bool local;		/**< needs no network: see fetch_is_local */
+ };
+ 
+ static struct fetch *fetch_ring = NULL;	/**< Ring of active fetches. */
+@@ -179,6 +180,63 @@ static bool fetch_dispatch_job(struct fetch *fetch)
+  * We don't check the overall dispatch size here because we're not called unless
+  * there is room in the fetch queue for us.
+  */
++/*
++ * Local fetches (VitaSurf). max_fetchers and max_fetchers_per_host are
++ * there to share the network, but every fetch was counted: a page's
++ * data: images were one "host" of six at a time, behind the downloads
++ * for the twelve in all, and Home Assistant's 145 inline SVG icons
++ * spent minutes in the queue between them. A fetch that needs no
++ * network starts at once and holds no slot.
++ */
++static bool fetch_is_local(lwc_string *scheme)
++{
++	bool match;
++
++	if (lwc_string_isequal(scheme, corestring_lwc_http, &match) ==
++	    lwc_error_ok && match)
++		return false;
++	if (lwc_string_isequal(scheme, corestring_lwc_https, &match) ==
++	    lwc_error_ok && match)
++		return false;
++	return true;
++}
++
++/** The fetches in the fetch ring that hold a network slot. */
++static int fetch_count_network(lwc_string *host)
++{
++	struct fetch *f = fetch_ring;
++	int count = 0;
++	bool match;
++
++	if (f == NULL)
++		return 0;
++	do {
++		if (!f->local &&
++		    (host == NULL ||
++		     (lwc_string_isequal(f->host, host, &match) ==
++		      lwc_error_ok && match)))
++			count++;
++		f = f->r_next;
++	} while (f != fetch_ring);
++	return count;
++}
++
++/** Start every queued local fetch. */
++static void fetch_dispatch_local(void)
++{
++	struct fetch *q, *next;
++	int n;
++
++	RING_GETSIZE(struct fetch, queue_ring, n);
++	q = queue_ring;
++	while (n-- > 0 && q != NULL) {
++		next = q->r_next;
++		if (q->local)
++			fetch_dispatch_job(q);
++		q = (queue_ring == NULL) ? NULL : next;
++	}
++}
++
+ static bool fetch_choose_and_dispatch(void)
+ {
+ 	bool same_host;
+@@ -189,8 +247,8 @@ static bool fetch_choose_and_dispatch(void)
+ 		 * fetch ring
+ 		 */
+ 		int countbyhost;
+-		RING_COUNTBYLWCHOST(struct fetch, fetch_ring, countbyhost,
+-				    queueitem->host);
++		countbyhost = queueitem->local ? 0 :
++			fetch_count_network(queueitem->host);
+ 		if (countbyhost < nsoption_int(max_fetchers_per_host)) {
+ 			/* We can dispatch this item in theory */
+ 			return fetch_dispatch_job(queueitem);
+@@ -242,8 +300,9 @@ static bool fetch_dispatch_jobs(void)
+ 	int all_active;
+ 	int all_queued;
+ 
++	fetch_dispatch_local();
+ 	RING_GETSIZE(struct fetch, queue_ring, all_queued);
+-	RING_GETSIZE(struct fetch, fetch_ring, all_active);
++	all_active = fetch_count_network(NULL);
+ 
+ 	NSLOG(fetch, DEBUG,
+ 	      "queue_ring %i, fetch_ring %i",
+@@ -265,8 +324,8 @@ static bool fetch_dispatch_jobs(void)
+ 	NSLOG(fetch, DEBUG, "Fetch ring is now %d elements.", all_active);
+ 	NSLOG(fetch, DEBUG, "Queue ring is now %d elements.", all_queued);
+ 
+-	/* finishing fetches still need a poll to be told of (VitaSurf) */
+-	return (all_active > 0 || finish_ring != NULL);
++	/* local and finishing fetches still need polling (VitaSurf) */
++	return (fetch_ring != NULL || finish_ring != NULL);
+ }
+ 
+ static void fetcher_poll(void *unused)
+@@ -506,6 +565,7 @@ fetch_start(nsurl *url,
+ 
+ 	/* try and obtain a fetcher for this scheme */
+ 	fetch->fetcherd = get_fetcher_for_scheme(scheme);
++	fetch->local = fetch_is_local(scheme);
+ 	lwc_string_unref(scheme);
+ 	if (fetch->fetcherd == -1) {
+ 		free(fetch);

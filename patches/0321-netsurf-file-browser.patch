@@ -1,0 +1,926 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index e25f252e3..c6574ad67 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -818,6 +818,13 @@ nserror fetch_set_http_code(struct fetch *fetch, http_response_code http_code)
+ }
+ 
+ 
++/* exported interface documented in content/fetchers.h */
++nsurl *fetch_get_referer(struct fetch *fetch)
++{
++	return fetch->referer;
++}
++
++
+ /* exported interface documented in content/fetch.h */
+ void fetch_set_cookie(struct fetch *fetch, const char *data)
+ {
+diff --git a/content/fetchers.h b/content/fetchers.h
+index 6392e245e..1c8c6782a 100644
+--- a/content/fetchers.h
++++ b/content/fetchers.h
+@@ -113,6 +113,16 @@ struct fetcher_operation_table {
+ nserror fetcher_add(lwc_string *scheme, const struct fetcher_operation_table *ops);
+ 
+ 
++/**
++ * The page a fetch was made for (VitaSurf)
++ *
++ * \param fetch The fetch.
++ * \return The referring URL, or NULL when the browser asked by itself;
++ *         not referenced for the caller.
++ */
++struct nsurl *fetch_get_referer(struct fetch *fetch);
++
++
+ /**
+  * Initialise all registered fetchers.
+  *
+diff --git a/content/fetchers/about/Makefile b/content/fetchers/about/Makefile
+index d76cfc874..289e8c68f 100644
+--- a/content/fetchers/about/Makefile
++++ b/content/fetchers/about/Makefile
+@@ -7,6 +7,7 @@ S_FETCHER_ABOUT := \
+ 	chart.c \
+ 	choices.c \
+ 	config.c \
++	files.c \
+ 	imagecache.c \
+ 	nscolours.c \
+ 	query.c \
+diff --git a/content/fetchers/about/about.c b/content/fetchers/about/about.c
+index 35128d2c9..239ef5d15 100644
+--- a/content/fetchers/about/about.c
++++ b/content/fetchers/about/about.c
+@@ -61,6 +61,7 @@
+ #include "query_timeout.h"
+ #include "atestament.h"
+ #include "websearch.h"
++#include "files.h"
+ 
+ typedef bool (*fetch_about_handler)(struct fetch_about_context *);
+ 
+@@ -225,6 +226,13 @@ nsurl *fetch_about_get_url(struct fetch_about_context *ctx)
+ }
+ 
+ 
++/* exported interface documented in about/private.h */
++nsurl *fetch_about_get_referer(struct fetch_about_context *ctx)
++{
++	return fetch_get_referer(ctx->fetchh);
++}
++
++
+ /* exported interface documented in about/private.h */
+ const struct fetch_multipart_data *
+ fetch_about_get_multipart(struct fetch_about_context *ctx)
+@@ -471,6 +479,14 @@ struct about_handlers about_handler_list[] = {
+ 		NULL,
+ 		fetch_about_websearch_handler,
+ 		true
++	},
++	{
++		/* the file browser (VitaSurf) */
++		"files",
++		SLEN("files"),
++		NULL,
++		fetch_about_files_handler,
++		true
+ 	}
+ };
+ 
+diff --git a/content/fetchers/about/files.c b/content/fetchers/about/files.c
+new file mode 100644
+index 000000000..5b432cc61
+--- /dev/null
++++ b/content/fetchers/about/files.c
+@@ -0,0 +1,768 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * content generator for the about scheme file browser (VitaSurf)
++ *
++ * about:files lists the places to start from: on the Vita, its storage
++ * devices (vita/platform/vita_file.c), elsewhere the root folder.
++ * about:files?path=FOLDER/ lists a folder, folders first. A file is
++ * offered by what kinds[] says of its extension: a page opens at its
++ * file: URL (and loads the stylesheets it links to, as any page does),
++ * and the rest are listed without a link until the browser can open
++ * them. Adding a type is a row in kinds[]; FILES_TEXT shows a file here
++ * as text, for a kind that wants it.
++ *
++ * Only the browser itself may ask: a fetch that a page made (it has a
++ * referer, and that is not another about: page) is refused, so a site
++ * cannot list the files on the machine.
++ */
++
++#include <stdbool.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <errno.h>
++#include <dirent.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++
++#include "netsurf/types.h"
++#include "utils/errors.h"
++#include "utils/nsurl.h"
++#include "utils/url.h"
++#include "utils/file.h"
++#include "utils/corestrings.h"
++
++#include "private.h"
++#include "files.h"
++
++#ifdef __vita__
++#include "vita_platform.h"
++#endif
++
++/** The most entries a folder lists; the page says how many it left out. */
++#define FILES_MAX_ENTRIES 2000
++
++/** The most of a text file shown, in bytes. */
++#define FILES_VIEW_MAX (512 * 1024)
++
++/** What the browser does with a file. */
++enum files_action {
++	FILES_NONE, /**< listed, not opened yet */
++	FILES_PAGE, /**< opened at its file: URL */
++	FILES_TEXT, /**< shown here as text */
++};
++
++/** A kind of file, by its extension (lower case, without the dot). */
++struct files_kind {
++	const char *ext;
++	const char *label;
++	enum files_action action;
++};
++
++static const struct files_kind kinds[] = {
++	{ "html", "HTML page", FILES_PAGE },
++	{ "htm", "HTML page", FILES_PAGE },
++	{ "xhtml", "HTML page", FILES_PAGE },
++	/* known, but not opened yet; a page loads its stylesheets */
++	{ "css", "Stylesheet", FILES_NONE },
++	{ "txt", "Text", FILES_NONE },
++	{ "log", "Text", FILES_NONE },
++	{ "ini", "Text", FILES_NONE },
++	{ "cfg", "Text", FILES_NONE },
++	{ "md", "Text", FILES_NONE },
++	{ "js", "Script", FILES_NONE },
++	{ "mjs", "Script", FILES_NONE },
++	{ "json", "JSON", FILES_NONE },
++	{ "xml", "XML", FILES_NONE },
++	{ "svg", "Image", FILES_NONE },
++	{ "png", "Image", FILES_NONE },
++	{ "jpg", "Image", FILES_NONE },
++	{ "jpeg", "Image", FILES_NONE },
++	{ "gif", "Image", FILES_NONE },
++	{ "webp", "Image", FILES_NONE },
++	{ "bmp", "Image", FILES_NONE },
++	{ "ico", "Image", FILES_NONE },
++	{ "ttf", "Font", FILES_NONE },
++	{ "otf", "Font", FILES_NONE },
++	{ "woff", "Font", FILES_NONE },
++	{ "woff2", "Font", FILES_NONE },
++	{ "mp3", "Audio", FILES_NONE },
++	{ "ogg", "Audio", FILES_NONE },
++	{ "wav", "Audio", FILES_NONE },
++	{ "mp4", "Video", FILES_NONE },
++	{ "pdf", "PDF", FILES_NONE },
++	{ "zip", "Archive", FILES_NONE },
++	{ "7z", "Archive", FILES_NONE },
++	{ "rar", "Archive", FILES_NONE },
++	{ "vpk", "Package", FILES_NONE },
++};
++
++/** The page as it is written: sent on in pieces of a few kilobytes. */
++struct files_out {
++	struct fetch_about_context *ctx;
++	char buf[8192];
++	size_t len;
++	bool failed;
++};
++
++static void out_flush(struct files_out *o)
++{
++	if (o->len > 0 && !o->failed &&
++	    fetch_about_senddata(o->ctx, (const uint8_t *)o->buf,
++				 o->len) != NSERROR_OK) {
++		o->failed = true;
++	}
++	o->len = 0;
++}
++
++static void out_write(struct files_out *o, const char *s, size_t n)
++{
++	while (n > 0 && !o->failed) {
++		size_t room = sizeof(o->buf) - o->len;
++		size_t take = n < room ? n : room;
++
++		memcpy(o->buf + o->len, s, take);
++		o->len += take;
++		s += take;
++		n -= take;
++		if (o->len == sizeof(o->buf)) {
++			out_flush(o);
++		}
++	}
++}
++
++static void out_str(struct files_out *o, const char *s)
++{
++	out_write(o, s, strlen(s));
++}
++
++static void out_printf(struct files_out *o, const char *fmt, ...)
++{
++	char buf[512];
++	va_list ap;
++	int n;
++
++	va_start(ap, fmt);
++	n = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (n > 0) {
++		out_write(o, buf, (size_t)n < sizeof(buf) ?
++			  (size_t)n : sizeof(buf) - 1);
++	}
++}
++
++/** Text, escaped for HTML. */
++static void out_html(struct files_out *o, const char *s, size_t n)
++{
++	size_t i, run = 0;
++
++	for (i = 0; i < n; i++) {
++		const char *e = NULL;
++
++		switch (s[i]) {
++		case '&': e = "&amp;"; break;
++		case '<': e = "&lt;"; break;
++		case '>': e = "&gt;"; break;
++		case '"': e = "&quot;"; break;
++		case '\'': e = "&#39;"; break;
++		case '\0': e = "\xef\xbf\xbd"; break;
++		default: break;
++		}
++		if (e != NULL) {
++			out_write(o, s + run, i - run);
++			out_str(o, e);
++			run = i + 1;
++		}
++	}
++	out_write(o, s + run, n - run);
++}
++
++static void out_htmls(struct files_out *o, const char *s)
++{
++	out_html(o, s, strlen(s));
++}
++
++/** The address of the browser's page for a path. */
++static void out_files_href(struct files_out *o, const char *path)
++{
++	char *esc = NULL;
++
++	out_str(o, "about:files");
++	if (path == NULL) {
++		return;
++	}
++	if (url_escape(path, false, "/:", &esc) != NSERROR_OK) {
++		return;
++	}
++	out_str(o, "?path=");
++	out_htmls(o, esc);
++	free(esc);
++}
++
++static void out_size(struct files_out *o, off_t size)
++{
++	unsigned long kb = (unsigned long)(size / 1024);
++
++	if (size < 1024) {
++		out_printf(o, "%u bytes", (unsigned int)size);
++	} else if (kb < 1024) {
++		out_printf(o, "%lu KB", kb);
++	} else {
++		unsigned long tenths = kb * 10 / 1024;
++
++		out_printf(o, "%lu.%lu MB", tenths / 10, tenths % 10);
++	}
++}
++
++static void out_head(struct files_out *o, const char *title)
++{
++	out_str(o, "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n"
++		"<title>");
++	out_htmls(o, title);
++	out_str(o, "</title>\n<style>\n"
++		"body{font-family:sans-serif;margin:16px;background:#f4f4f4;"
++		"color:#222}\n"
++		"h1{font-size:22px;word-wrap:break-word}\n"
++		"ul{list-style:none;margin:0;padding:0}\n"
++		"li{border-bottom:1px solid #ddd}\n"
++		"li a,li span.n{display:block;padding:10px 8px;"
++		"text-decoration:none;word-wrap:break-word}\n"
++		"li span.n{color:#888}\n"
++		".t{float:right;color:#777;font-size:13px;padding:12px 8px}\n"
++		".p{margin:8px 0 14px}\n.p a{margin-right:6px}\n"
++		"pre{background:#fff;border:1px solid #ddd;padding:8px;"
++		"white-space:pre-wrap;word-wrap:break-word;font-size:13px}\n"
++		"@media (prefers-color-scheme: dark){\n"
++		"body{background:#1b1b1b;color:#e8e8e8}\n"
++		"a{color:#79b8ff}\na:visited{color:#c8a2ff}\n"
++		"li{border-color:#333}\nli span.n,.t{color:#a0a0a0}\n"
++		"pre{background:#111;border-color:#333}\n}\n"
++		"</style></head><body>\n<h1>");
++	out_htmls(o, title);
++	out_str(o, "</h1>\n");
++}
++
++static void out_foot(struct files_out *o)
++{
++	out_str(o, "</body></html>\n");
++	out_flush(o);
++}
++
++/** The kind of file a name is, or NULL for one not in kinds[]. */
++static const struct files_kind *kind_of(const char *name)
++{
++	const char *dot = strrchr(name, '.');
++	size_t i;
++
++	if (dot == NULL || dot == name) {
++		return NULL;
++	}
++	for (i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
++		const char *a = dot + 1, *b = kinds[i].ext;
++
++		while (*a != '\0' && tolower((unsigned char)*a) == *b) {
++			a++;
++			b++;
++		}
++		if (*a == '\0' && *b == '\0') {
++			return &kinds[i];
++		}
++	}
++	return NULL;
++}
++
++/** Whether a page, rather than the browser itself, asked for this. */
++static bool asked_by_page(struct fetch_about_context *ctx)
++{
++	nsurl *referer = fetch_about_get_referer(ctx);
++	lwc_string *scheme;
++	bool about = false;
++
++	if (referer == NULL) {
++		return false;
++	}
++	scheme = nsurl_get_component(referer, NSURL_SCHEME);
++	if (scheme != NULL) {
++		if (lwc_string_caseless_isequal(scheme, corestring_lwc_about,
++						&about) != lwc_error_ok) {
++			about = false;
++		}
++		lwc_string_unref(scheme);
++	}
++	return !about;
++}
++
++/** The value of a query parameter, unescaped, or NULL. */
++static char *query_value(nsurl *url, const char *key)
++{
++	lwc_string *query = nsurl_get_component(url, NSURL_QUERY);
++	size_t klen = strlen(key);
++	const char *s, *end;
++	char *value = NULL;
++
++	if (query == NULL) {
++		return NULL;
++	}
++	s = lwc_string_data(query);
++	end = s + lwc_string_length(query);
++	while (s < end) {
++		const char *amp = memchr(s, '&', end - s);
++		const char *stop = amp != NULL ? amp : end;
++
++		if ((size_t)(stop - s) > klen && strncmp(s, key, klen) == 0 &&
++		    s[klen] == '=') {
++			if (url_unescape(s + klen + 1, stop - s - klen - 1,
++					 NULL, &value) != NSERROR_OK) {
++				value = NULL;
++			}
++			break;
++		}
++		s = stop + 1;
++	}
++	lwc_string_unref(query);
++	return value;
++}
++
++/**
++ * The folder above a folder (which ends in a slash), or NULL at the top
++ * of a device or of the file system.
++ */
++static char *parent_of(const char *dir)
++{
++	size_t n = strlen(dir);
++	char *p;
++
++	while (n > 0 && dir[n - 1] == '/') {
++		n--;
++	}
++	while (n > 0 && dir[n - 1] != '/') {
++		n--;
++	}
++	if (n == 0) {
++		return NULL;
++	}
++	p = malloc(n + 1);
++	if (p != NULL) {
++		memcpy(p, dir, n);
++		p[n] = '\0';
++	}
++	return p;
++}
++
++/** Links to every folder a path is in, then to the list of devices. */
++static void out_trail(struct files_out *o, const char *path)
++{
++	char *up = parent_of(path);
++	size_t i, start = 0, n = strlen(path);
++
++	out_str(o, "<p class=\"p\"><a href=\"about:files\">All storage</a>");
++	if (up != NULL) {
++		out_str(o, " <a href=\"");
++		out_files_href(o, up);
++		out_str(o, "\">Up one folder</a>");
++		free(up);
++	}
++	out_str(o, "<br>\n");
++	/* ux0:/data/VitaSurf/ as ux0:/ > data > VitaSurf */
++	for (i = 0; i <= n; i++) {
++		if (i < n && path[i] != '/') {
++			continue;
++		}
++		if (i == n && start == n) {
++			break;
++		}
++		{
++			char *prefix = malloc(i + 2);
++
++			if (prefix == NULL) {
++				break;
++			}
++			memcpy(prefix, path, i);
++			prefix[i] = '/';
++			prefix[i + 1] = '\0';
++			if (start > 0) {
++				out_str(o, " &rsaquo; ");
++			}
++			out_str(o, "<a href=\"");
++			out_files_href(o, prefix);
++			out_str(o, "\">");
++			if (i == 0) {
++				out_str(o, "/");
++			} else if (start == 0) {
++				out_html(o, path, i);
++				out_str(o, "/");
++			} else {
++				out_html(o, path + start, i - start);
++			}
++			out_str(o, "</a>");
++			free(prefix);
++		}
++		start = i + 1;
++	}
++	out_str(o, "</p>\n");
++}
++
++/** The places to start from. */
++static void files_roots(struct files_out *o)
++{
++#ifdef __vita__
++	struct vita_file_root roots[24];
++	int n = vita_file_roots(roots, 24);
++#else
++	static const struct {
++		const char *path;
++		const char *label;
++	} roots[] = {
++		{ "/", "The file system" },
++	};
++	int n = 1;
++#endif
++	int i;
++
++	out_head(o, "Files");
++	out_str(o, "<p class=\"p\">Pages (.html) open in the browser, with "
++		"the stylesheets (.css) they link to. Other files are listed "
++		"only, for now.</p>\n<ul>\n");
++	for (i = 0; i < n; i++) {
++		out_str(o, "<li><a href=\"");
++		out_files_href(o, roots[i].path);
++		out_str(o, "\"><span class=\"t\">");
++		out_htmls(o, roots[i].label);
++		out_str(o, "</span>");
++		out_htmls(o, roots[i].path);
++		out_str(o, "</a></li>\n");
++	}
++	if (n == 0) {
++		out_str(o, "<li><span class=\"n\">No storage could be "
++			"read.</span></li>\n");
++	}
++	out_str(o, "</ul>\n");
++	out_foot(o);
++}
++
++/** A folder entry, as listed. */
++struct files_entry {
++	char *name;
++	bool dir;
++	bool file;
++	off_t size;
++};
++
++/* folders first, then by name, with runs of digits by their value:
++ * file2 before file10 (as content/fetchers/file/file.c sorts) */
++static int entry_compare(const void *a, const void *b)
++{
++	const struct files_entry *x = a, *y = b;
++	const char *s1 = x->name, *s2 = y->name;
++
++	if (x->dir != y->dir) {
++		return x->dir ? -1 : 1;
++	}
++	while (*s1 != '\0' && *s2 != '\0') {
++		if (isdigit((unsigned char)*s1) &&
++		    isdigit((unsigned char)*s2)) {
++			unsigned long n1 = 0, n2 = 0;
++
++			while (isdigit((unsigned char)*s1)) {
++				n1 = n1 * 10 + (*s1++ - '0');
++			}
++			while (isdigit((unsigned char)*s2)) {
++				n2 = n2 * 10 + (*s2++ - '0');
++			}
++			if (n1 != n2) {
++				return n1 < n2 ? -1 : 1;
++			}
++			continue;
++		}
++		if (tolower((unsigned char)*s1) !=
++		    tolower((unsigned char)*s2)) {
++			break;
++		}
++		s1++;
++		s2++;
++	}
++	return tolower((unsigned char)*s1) - tolower((unsigned char)*s2);
++}
++
++static void out_entry(struct files_out *o, const char *dir,
++		      const struct files_entry *e)
++{
++	const struct files_kind *k = e->dir ? NULL : kind_of(e->name);
++	size_t len = strlen(dir) + strlen(e->name) + 2;
++	char *path = malloc(len);
++	enum files_action action = k != NULL ? k->action : FILES_NONE;
++
++	if (path == NULL) {
++		return;
++	}
++	snprintf(path, len, "%s%s%s", dir, e->name, e->dir ? "/" : "");
++
++	if (e->dir || action == FILES_TEXT) {
++		out_str(o, "<li><a href=\"");
++		out_files_href(o, path);
++		out_str(o, "\">");
++	} else if (action == FILES_PAGE) {
++		nsurl *url;
++
++		if (netsurf_path_to_nsurl(path, &url) == NSERROR_OK) {
++			out_str(o, "<li><a href=\"");
++			out_htmls(o, nsurl_access(url));
++			out_str(o, "\">");
++			nsurl_unref(url);
++		} else {
++			action = FILES_NONE;
++		}
++	}
++	if (!e->dir && action == FILES_NONE) {
++		out_str(o, "<li><span class=\"n\">");
++	}
++	out_str(o, "<span class=\"t\">");
++	if (e->dir) {
++		out_str(o, "Folder");
++	} else {
++		if (k != NULL) {
++			out_htmls(o, k->label);
++			out_str(o, ", ");
++		}
++		if (e->file) {
++			out_size(o, e->size);
++		}
++	}
++	out_str(o, "</span>");
++	out_htmls(o, e->name);
++	if (e->dir) {
++		out_str(o, "/");
++	}
++	out_str(o, !e->dir && action == FILES_NONE ? "</span></li>\n" :
++		"</a></li>\n");
++	free(path);
++}
++
++/** A folder's contents. */
++static void files_folder(struct files_out *o, const char *dir)
++{
++	struct files_entry *entries = NULL;
++	size_t n = 0, cap = 0, skipped = 0, i;
++	struct dirent *ent;
++	DIR *d;
++
++	out_head(o, dir);
++	out_trail(o, dir);
++
++	d = opendir(dir);
++	if (d == NULL) {
++		out_str(o, "<p>This folder cannot be read: ");
++		out_htmls(o, strerror(errno));
++		out_str(o, ".</p>\n");
++		out_foot(o);
++		return;
++	}
++	while ((ent = readdir(d)) != NULL) {
++		struct stat st;
++		size_t len;
++		char *path;
++
++		if (strcmp(ent->d_name, ".") == 0 ||
++		    strcmp(ent->d_name, "..") == 0) {
++			continue;
++		}
++		if (n == FILES_MAX_ENTRIES) {
++			skipped++;
++			continue;
++		}
++		if (n == cap) {
++			size_t ncap = cap == 0 ? 64 : cap * 2;
++			struct files_entry *ne = realloc(entries,
++							 ncap * sizeof(*ne));
++
++			if (ne == NULL) {
++				skipped++;
++				continue;
++			}
++			entries = ne;
++			cap = ncap;
++		}
++		len = strlen(dir) + strlen(ent->d_name) + 1;
++		path = malloc(len);
++		entries[n].name = strdup(ent->d_name);
++		if (path == NULL || entries[n].name == NULL) {
++			free(path);
++			free(entries[n].name);
++			skipped++;
++			continue;
++		}
++		snprintf(path, len, "%s%s", dir, ent->d_name);
++		entries[n].dir = false;
++		entries[n].file = false;
++		entries[n].size = 0;
++		if (stat(path, &st) == 0) {
++			entries[n].dir = S_ISDIR(st.st_mode);
++			entries[n].file = S_ISREG(st.st_mode);
++			entries[n].size = st.st_size;
++		}
++		free(path);
++		n++;
++	}
++	closedir(d);
++
++	if (n > 1) {
++		qsort(entries, n, sizeof(entries[0]), entry_compare);
++	}
++	out_str(o, "<ul>\n");
++	for (i = 0; i < n; i++) {
++		out_entry(o, dir, &entries[i]);
++		free(entries[i].name);
++	}
++	free(entries);
++	if (n == 0 && skipped == 0) {
++		out_str(o, "<li><span class=\"n\">This folder is "
++			"empty.</span></li>\n");
++	}
++	out_str(o, "</ul>\n");
++	if (skipped > 0) {
++		out_printf(o, "<p>%u more entries are not listed.</p>\n",
++			   (unsigned int)skipped);
++	}
++	out_foot(o);
++}
++
++/** A file: shown as text, or said to be one the browser cannot open. */
++static void files_file(struct files_out *o, const char *path,
++		       const struct stat *st)
++{
++	const struct files_kind *k = kind_of(path);
++	char *dir = parent_of(path);
++	FILE *f;
++
++	out_head(o, path);
++	out_trail(o, dir != NULL ? dir : path);
++	free(dir);
++	out_str(o, "<p>");
++	if (k != NULL) {
++		out_htmls(o, k->label);
++		out_str(o, ", ");
++	}
++	out_size(o, st->st_size);
++	out_str(o, "</p>\n");
++
++	if (k == NULL || k->action != FILES_TEXT) {
++		out_str(o, "<p>The browser cannot open this kind of file "
++			"yet.</p>\n");
++		out_foot(o);
++		return;
++	}
++	f = fopen(path, "rb");
++	if (f == NULL) {
++		out_str(o, "<p>This file cannot be read: ");
++		out_htmls(o, strerror(errno));
++		out_str(o, ".</p>\n");
++		out_foot(o);
++		return;
++	}
++	out_str(o, "<pre>");
++	{
++		char buf[4096];
++		size_t total = 0, got;
++
++		while (total < FILES_VIEW_MAX && !o->failed &&
++		       (got = fread(buf, 1, sizeof(buf), f)) > 0) {
++			if (got > FILES_VIEW_MAX - total) {
++				got = FILES_VIEW_MAX - total;
++			}
++			out_html(o, buf, got);
++			total += got;
++		}
++		out_str(o, "</pre>\n");
++		if (total == FILES_VIEW_MAX && st->st_size > FILES_VIEW_MAX) {
++			out_printf(o, "<p>Only the first %u KB are shown.</p>\n",
++				   (unsigned int)(FILES_VIEW_MAX / 1024));
++		}
++	}
++	fclose(f);
++	out_foot(o);
++}
++
++/* exported interface documented in files.h */
++bool fetch_about_files_handler(struct fetch_about_context *ctx)
++{
++	struct files_out *o;
++	char *path;
++	struct stat st;
++
++	if (asked_by_page(ctx)) {
++		fetch_about_set_http_code(ctx, 403);
++		if (fetch_about_send_header(ctx, "Content-Type: text/plain"))
++			return false;
++		if (fetch_about_ssenddataf(ctx, "Only the browser can open "
++					   "its file browser.") != NSERROR_OK)
++			return false;
++		fetch_about_send_finished(ctx);
++		return true;
++	}
++
++	o = malloc(sizeof(*o));
++	if (o == NULL) {
++		return fetch_about_srverror(ctx);
++	}
++	o->ctx = ctx;
++	o->len = 0;
++	o->failed = false;
++
++	fetch_about_set_http_code(ctx, 200);
++	if (fetch_about_send_header(ctx, "Content-Type: text/html; "
++				    "charset=utf-8") ||
++	    fetch_about_send_header(ctx, "Cache-Control: no-cache")) {
++		free(o);
++		return false;
++	}
++
++	path = query_value(fetch_about_get_url(ctx), "path");
++	if (path == NULL || path[0] == '\0') {
++		files_roots(o);
++	} else if (stat(path, &st) == 0 && !S_ISDIR(st.st_mode)) {
++		files_file(o, path, &st);
++	} else {
++		/* a folder's path ends in a slash */
++		size_t len = strlen(path);
++
++		if (path[len - 1] != '/') {
++			char *p = realloc(path, len + 2);
++
++			if (p != NULL) {
++				path = p;
++				path[len] = '/';
++				path[len + 1] = '\0';
++			}
++		}
++		files_folder(o, path);
++	}
++	free(path);
++
++	if (o->failed) {
++		free(o);
++		return false;
++	}
++	free(o);
++	fetch_about_send_finished(ctx);
++	return true;
++}
+diff --git a/content/fetchers/about/files.h b/content/fetchers/about/files.h
+new file mode 100644
+index 000000000..2f4793b14
+--- /dev/null
++++ b/content/fetchers/about/files.h
+@@ -0,0 +1,38 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * about scheme file browser interface
++ */
++
++#ifndef NETSURF_CONTENT_FETCHERS_ABOUT_FILES_H
++#define NETSURF_CONTENT_FETCHERS_ABOUT_FILES_H
++
++/**
++ * Handler to generate the about scheme file browser (VitaSurf).
++ *
++ * about:files lists the places browsing starts from; about:files?path=
++ * a folder's contents, or a file the browser shows as text.
++ *
++ * \param ctx The fetcher context.
++ * \return true if handled false if aborted.
++ */
++bool fetch_about_files_handler(struct fetch_about_context *ctx);
++
++#endif
+diff --git a/content/fetchers/about/private.h b/content/fetchers/about/private.h
+index 00d50accc..efb2d3c15 100644
+--- a/content/fetchers/about/private.h
++++ b/content/fetchers/about/private.h
+@@ -69,6 +69,11 @@ bool fetch_about_srverror(struct fetch_about_context *ctx);
+  */
+ struct nsurl *fetch_about_get_url(struct fetch_about_context *ctx);
+ 
++/**
++ * get the page the fetch was made for, or NULL (VitaSurf)
++ */
++struct nsurl *fetch_about_get_referer(struct fetch_about_context *ctx);
++
+ /**
+  * get multipart fetch data
+  */

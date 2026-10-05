@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<!-- crypto.subtle works end to end, and keys behave as keys: a clone of
+     one still encrypts, a non-extractable key stored in IndexedDB comes
+     back usable and still not extractable, and the key's material is not
+     reachable from the page. Known answers and the comparison with a
+     browser are in tests/crypto. -->
+<html><head><title>t</title></head><body><div id="out"></div>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var S = crypto.subtle, te = new TextEncoder(), iv = new Uint8Array(12);
+function hex(b){return Array.from(new Uint8Array(b)).map(function(x){return (x+256).toString(16).slice(1);}).join('');}
+ok("crypto.subtle is a SubtleCrypto", Object.prototype.toString.call(S) === '[object SubtleCrypto]');
+ok("the registration hook is gone", typeof window.__vitaRegisterKeyClone === 'undefined');
+S.digest('SHA-256', te.encode('abc')).then(function (d) {
+ ok("SHA-256 of abc", hex(d) === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+ return S.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}).then(function (k) {
+ ok("a generated key", k instanceof CryptoKey && k.type === 'secret' && k.algorithm.length === 256 && !k.extractable);
+ ok("no own properties to read the key from", Object.getOwnPropertyNames(k).length === 0);
+ var copy = structuredClone(k);
+ ok("a clone is a CryptoKey", copy instanceof CryptoKey && copy !== k && copy.usages.join() === 'encrypt,decrypt');
+ return S.encrypt({ name: 'AES-GCM', iv: iv }, k, te.encode('secret')).then(function (c) {
+  return S.decrypt({ name: 'AES-GCM', iv: iv }, copy, c); }).then(function (p) {
+  ok("the clone decrypts what the key encrypted", new TextDecoder().decode(p) === 'secret');
+  return new Promise(function (resolve, reject) {
+   var open = indexedDB.open('webcrypto-test', 1);
+   open.onupgradeneeded = function () { open.result.createObjectStore('keys'); };
+   open.onerror = function () { reject(open.error); };
+   open.onsuccess = function () {
+    var db = open.result, tx = db.transaction('keys', 'readwrite');
+    tx.objectStore('keys').put({ key: k, note: 'stored' }, 'k1');
+    tx.oncomplete = function () {
+     var get = db.transaction('keys').objectStore('keys').get('k1');
+     get.onsuccess = function () { resolve(get.result); };
+     get.onerror = function () { reject(get.error); };
+    };
+   };
+  });
+ }).then(function (rec) {
+  ok("IndexedDB gives back a CryptoKey", rec && rec.note === 'stored' && rec.key instanceof CryptoKey);
+  ok("still not extractable", rec.key.extractable === false);
+  return S.exportKey('raw', rec.key).then(function () { ok("export refused", false); },
+   function (e) { ok("export refused (" + e.name + ")", e.name === 'InvalidAccessError'); }).then(function () {
+   return S.encrypt({ name: 'AES-GCM', iv: iv }, rec.key, te.encode('x')); }).then(function (c) {
+   ok("the stored key encrypts", c.byteLength === 17); });
+ });
+}).then(function () {
+ return S.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+}).then(function (kp) {
+ return S.sign({ name: 'ECDSA', hash: 'SHA-256' }, kp.privateKey, te.encode('m')).then(function (sig) {
+  ok("an ECDSA signature is 64 bytes", sig.byteLength === 64);
+  return S.verify({ name: 'ECDSA', hash: 'SHA-256' }, structuredClone(kp.publicKey), sig, te.encode('m')); }).then(function (v) {
+  ok("a cloned public key verifies it", v === true); });
+}).catch(function (e) { ok("threw " + e.name + ": " + e.message, false); });
+</script></body></html>

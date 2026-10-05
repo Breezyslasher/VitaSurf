@@ -1,0 +1,274 @@
+diff --git a/content/content.c b/content/content.c
+index b9caf70ea..d680fce84 100644
+--- a/content/content.c
++++ b/content/content.c
+@@ -99,8 +99,17 @@ static void content_convert(struct content *c)
+ 
+ 		c->locked = true;
+ 		nsu_getmonotonic_ms(&t0);
+-		if (c->handler->data_complete(c) == false) {
+-			content_set_error(c);
++		{
++			VITASURF_PHASE(type == CONTENT_CSS ?
++					"style sheet parse" :
++					(type & CONTENT_IMAGE) ? "image decode" :
++					type == CONTENT_HTML ? "page parse" :
++					"content conversion");
++
++			if (c->handler->data_complete(c) == false) {
++				content_set_error(c);
++			}
++			VITASURF_PHASE_END();
+ 		}
+ 		nsu_getmonotonic_ms(&t1);
+ 
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 3d3d1c378..1976b4bff 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -2593,6 +2593,9 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 	const uint32_t max_processed_before_yield = 10;
+ 	uint64_t vs_t0 = 0, vs_t1 = 0, vs_e0 = 0, vs_e1 = 0;
+ 
++	/* for the busy sampling; the scheduler clears it after each
++	 * callback, so the returns below need not (VitaSurf) */
++	vitasurf_phase = "boxes and styles";
+ 	nsu_getmonotonic_ms(&vs_t0);
+ 
+ 	do {
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index 672f1f03b..fab74a9da 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -29,6 +29,7 @@
+ #include "utils/errors.h"
+ #include "utils/talloc.h"
+ #include "utils/nsurl.h"
++#include "utils/corestrings.h"
+ #include "netsurf/types.h"
+ #include "netsurf/mouse.h"
+ #include "desktop/scrollbar.h"
+@@ -66,6 +67,27 @@ static int box_talloc_destructor(struct box *b)
+ 	lwc_string_unref(b->id);
+ 
+ 	if (b->node != NULL) {
++		/*
++		 * A node must not go on naming a box that is gone
++		 * (VitaSurf). A rebuild clears the names of the nodes still
++		 * in the document, but a node script took out of it keeps
++		 * its name for the box in the freed tree, and anything that
++		 * looked its box up -- a script measuring an element it
++		 * removed, the scroll anchor -- read freed memory: build 504
++		 * crashed that way on a Home Assistant dashboard.
++		 */
++		struct box *named = NULL;
++
++		if (dom_node_get_user_data(b->node,
++				corestring_dom___ns_key_box_node_data,
++				(void *) &named) == DOM_NO_ERR &&
++				named == b) {
++			void *old = NULL;
++
++			dom_node_set_user_data(b->node,
++					corestring_dom___ns_key_box_node_data,
++					NULL, NULL, &old);
++		}
+ 		dom_node_unref(b->node);
+ 	}
+ 
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 70ee297e4..7c89686f2 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -6058,6 +6058,7 @@ bool layout_document(html_content *content, int width, int height)
+ 	struct box *doc = content->layout;
+ 	const struct gui_layout_table *font_func = content->font_func;
+ 	uint64_t vs_t0 = 0, vs_t1 = 0;
++	VITASURF_PHASE("layout");
+ 
+ 	nsu_getmonotonic_ms(&vs_t0);
+ 
+@@ -6127,5 +6128,6 @@ bool layout_document(html_content *content, int width, int height)
+ 		}
+ 	}
+ 	vitasurf_layout_runs++;
++	VITASURF_PHASE_END();
+ 	return ret;
+ }
+diff --git a/content/handlers/html/scroll_anchor.c b/content/handlers/html/scroll_anchor.c
+index 7b0747d15..92ec8009b 100644
+--- a/content/handlers/html/scroll_anchor.c
++++ b/content/handlers/html/scroll_anchor.c
+@@ -178,6 +178,39 @@ void html_scroll_anchor_pick(html_content *htmlc)
+ 	}
+ }
+ 
++/**
++ * A node's principal box, found in the tree that exists.
++ *
++ * Not box_for_node() alone. A rebuild clears the box a node points at
++ * only for the nodes still in the document; a node script removed in the
++ * meantime keeps pointing into the tree the rebuild freed, and reading it
++ * crashed build 504 on a Home Assistant dashboard. The pointer is only
++ * compared here, never followed: a box that is in this tree, is the
++ * node's, and is the one the node names.
++ */
++static struct box *sa_find(struct box *root, struct dom_node *node)
++{
++	struct box *b = root;
++
++	while (b != NULL) {
++		if (b->node == node && box_for_node(node) == b) {
++			return b;
++		}
++		if (b->children != NULL) {
++			b = b->children;
++			continue;
++		}
++		while (b != NULL && b != root && b->next == NULL) {
++			b = b->parent;
++		}
++		if (b == NULL || b == root) {
++			break;
++		}
++		b = b->next;
++	}
++	return NULL;
++}
++
+ /* exported interface documented in html/private.h */
+ void html_scroll_anchor_settle(html_content *htmlc)
+ {
+@@ -187,7 +220,8 @@ void html_scroll_anchor_settle(html_content *htmlc)
+ 	if (htmlc->sa_node == NULL) {
+ 		return;
+ 	}
+-	b = box_for_node(htmlc->sa_node);
++	b = htmlc->layout != NULL ?
++			sa_find(htmlc->layout, htmlc->sa_node) : NULL;
+ 	dom_node_unref(htmlc->sa_node);
+ 	htmlc->sa_node = NULL;
+ 	if (b == NULL) {
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 36dc3f688..511675157 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -670,12 +670,15 @@ fb_redraw(fbtk_widget_t *widget,
+ 		 */
+ 		uint64_t vs_t0 = 0, vs_t1 = 0;
+ 
++		VITASURF_PHASE("drawing");
++
+ 		nsu_getmonotonic_ms(&vs_t0);
+ 		browser_window_redraw(bw,
+ 				x - bwidget->scrollx,
+ 				y - bwidget->scrolly,
+ 				&clip, &ctx);
+ 		nsu_getmonotonic_ms(&vs_t1);
++		VITASURF_PHASE_END();
+ 		vitasurf_ms_draw += (unsigned int)(vs_t1 - vs_t0);
+ 	}
+ 	fb_images_waited(bwidget, x - bwidget->scrollx,
+diff --git a/frontends/framebuffer/schedule.c b/frontends/framebuffer/schedule.c
+index f0a994e95..6201b8dda 100644
+--- a/frontends/framebuffer/schedule.c
++++ b/frontends/framebuffer/schedule.c
+@@ -198,10 +198,32 @@ int schedule_run(void)
+                         {
+                                 struct timeval c0, c1;
+                                 unsigned int took;
+-
++                                /*
++                                 * What a slow callback spent its time
++                                 * on (VitaSurf): the phase counters
++                                 * before and after it. Build 504 had
++                                 * one callback of 95 seconds on a Home
++                                 * Assistant dashboard and nothing to
++                                 * say whether it was script, style
++                                 * sheets, boxes or layout.
++                                 */
++                                unsigned int s_script = vitasurf_ms_script,
++                                        s_jobs = vitasurf_ms_js_jobs,
++                                        s_css = vitasurf_ms_css,
++                                        s_sheets = vitasurf_css_parsed,
++                                        s_inl = vitasurf_ms_inline_style,
++                                        s_boxes = vitasurf_ms_boxes,
++                                        s_layout = vitasurf_ms_layout,
++                                        s_runs = vitasurf_layout_runs,
++                                        s_image = vitasurf_ms_image,
++                                        s_draw = vitasurf_ms_draw,
++                                        s_index = vitasurf_ms_css_index;
++
++                                vitasurf_phase = NULL;
+                                 gettimeofday(&c0, NULL);
+                                 unlnk_nscb->callback(unlnk_nscb->p);
+                                 gettimeofday(&c1, NULL);
++                                vitasurf_phase = NULL;
+ 
+                                 took = (unsigned int)
+                                         ((c1.tv_sec - c0.tv_sec) * 1000 +
+@@ -214,9 +236,25 @@ int schedule_run(void)
+                                 if (took >= 200) {
+                                         NSLOG(netsurf, INFO,
+                                               "slow scheduled callback "
+-                                              "%08x took %u ms",
++                                              "%08x took %u ms: script %u, "
++                                              "promise jobs %u, %u style "
++                                              "sheets %u (inline %u, "
++                                              "index %u), boxes and "
++                                              "styles %u, %u layouts %u, "
++                                              "images %u, drawing %u",
+                                               (unsigned int)(uintptr_t)
+-                                              unlnk_nscb->callback, took);
++                                              unlnk_nscb->callback, took,
++                                              vitasurf_ms_script - s_script,
++                                              vitasurf_ms_js_jobs - s_jobs,
++                                              vitasurf_css_parsed - s_sheets,
++                                              vitasurf_ms_css - s_css,
++                                              vitasurf_ms_inline_style - s_inl,
++                                              vitasurf_ms_css_index - s_index,
++                                              vitasurf_ms_boxes - s_boxes,
++                                              vitasurf_layout_runs - s_runs,
++                                              vitasurf_ms_layout - s_layout,
++                                              vitasurf_ms_image - s_image,
++                                              vitasurf_ms_draw - s_draw);
+                                 }
+                         }
+ 
+diff --git a/utils/utils.c b/utils/utils.c
+index dc16e37e6..89a67bb46 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -625,6 +625,7 @@ unsigned int vitasurf_images_done;
+ unsigned int vitasurf_images_failed;
+ unsigned int vitasurf_ms_boxes;
+ unsigned int vitasurf_ms_layout;
++const char *volatile vitasurf_phase;
+ unsigned int vitasurf_layout_runs;
+ unsigned int vitasurf_font_calls;
+ unsigned int vitasurf_font_chars;
+diff --git a/utils/utils.h b/utils/utils.h
+index 29a4ec99d..afe1c52b4 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -188,6 +188,20 @@ extern unsigned int vitasurf_images_done;
+ extern unsigned int vitasurf_images_failed;
+ extern unsigned int vitasurf_ms_boxes;
+ extern unsigned int vitasurf_ms_layout;
++/*
++ * What the main thread is doing, for the Vita's busy sampling (VitaSurf):
++ * the overlay thread reads it on every frame the page holds the screen
++ * and no script binding is named, so a long stall is put down to the
++ * phase it was in -- layout, box building, a style sheet, drawing,
++ * script -- rather than to "script or NetSurf". Set with
++ * VITASURF_PHASE() and put back with VITASURF_PHASE_END() in the same
++ * scope.
++ */
++extern const char *volatile vitasurf_phase;
++#define VITASURF_PHASE(name) \
++	const char *vitasurf_phase_was_ = vitasurf_phase; \
++	vitasurf_phase = (name)
++#define VITASURF_PHASE_END() (vitasurf_phase = vitasurf_phase_was_)
+ /**
+  * What laying the page out actually did (VitaSurf).
+  *

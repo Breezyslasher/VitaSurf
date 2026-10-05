@@ -1,0 +1,218 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 154415794..c07b32d27 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1871,7 +1871,22 @@ static void convert_xml_to_box(struct box_construct_ctx *ctx)
+ 
+ 		/* transfers keep moving while the boxes are built, which
+ 		 * takes seconds on a large page (VitaSurf) */
+-		fetch_pump();
++		{
++			uint64_t p0 = 0, p1 = 0;
++
++			nsu_getmonotonic_ms(&p0);
++			fetch_pump();
++			nsu_getmonotonic_ms(&p1);
++			/*
++			 * What the pump did is not box building: a
++			 * finished script runs from inside it, and Home
++			 * Assistant's took seconds, which counted as the
++			 * boxes' time made its 142 elements look like 77 ms
++			 * each, and every later rebuild of the page was
++			 * refused as too slow (VitaSurf).
++			 */
++			vs_t0 += (p1 - p0);
++		}
+ 		nsu_getmonotonic_ms(&vs_e0);
+ 		if (box_construct_element(ctx, &convert_children) == false) {
+ 			ctx->cb(ctx->content, false);
+diff --git a/desktop/browser_history.c b/desktop/browser_history.c
+index 42a152ee7..fc9af24c3 100644
+--- a/desktop/browser_history.c
++++ b/desktop/browser_history.c
+@@ -420,6 +420,29 @@ browser_window_history_add(struct browser_window *bw,
+ 
+ 
+ /* exported interface documented in desktop/browser_history.h */
++/* exported interface documented in desktop/browser_history.h (VitaSurf) */
++nserror browser_window_history_set_url(struct browser_window *bw,
++		struct nsurl *url)
++{
++	struct history *history;
++
++	if (bw == NULL || url == NULL) {
++		return NSERROR_BAD_PARAMETER;
++	}
++	history = bw->history;
++	if (history == NULL || history->current == NULL) {
++		return NSERROR_INVALID;
++	}
++	nsurl_unref(history->current->page.url);
++	history->current->page.url = nsurl_ref(url);
++	if (history->current->page.frag_id != NULL) {
++		lwc_string_unref(history->current->page.frag_id);
++		history->current->page.frag_id = NULL;
++	}
++	return NSERROR_OK;
++}
++
++
+ nserror browser_window_history_update(struct browser_window *bw,
+ 		struct hlcache_handle *content)
+ {
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+index 0d9f975c7..e7554c189 100644
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -101,6 +101,13 @@ struct browser_window {
+ 	 */
+ 	struct hlcache_handle *current_content;
+ 
++	/**
++	 * The address the page gave itself with history.pushState or
++	 * replaceState, or NULL (VitaSurf). The address bar shows it and
++	 * a reload goes to it; the next page to load clears it.
++	 */
++	struct nsurl *script_url;
++
+ 	/**
+ 	 * The fetch parameters for the current content
+ 	 */
+@@ -392,6 +399,13 @@ nserror browser_window_history_add(struct browser_window *bw,
+  * \param content content for current entry
+  * \return NSERROR_OK or error code on faliure.
+  */
++/**
++ * Give the current history entry a new address, which the page gave
++ * itself with pushState or replaceState (VitaSurf).
++ */
++nserror browser_window_history_set_url(struct browser_window *bw,
++		struct nsurl *url);
++
+ nserror browser_window_history_update(struct browser_window *bw,
+ 		struct hlcache_handle *content);
+ 
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 1bb135352..fae577085 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -839,6 +839,12 @@ static nserror browser_window_content_ready(struct browser_window *bw)
+ 	bw->current_content = bw->loading_content;
+ 	bw->loading_content = NULL;
+ 
++	/* a new page has its own address (VitaSurf) */
++	if (bw->script_url != NULL) {
++		nsurl_unref(bw->script_url);
++		bw->script_url = NULL;
++	}
++
+ 	if (!bw->internal_nav) {
+ 		/* Transfer the fetch parameters */
+ 		browser_window__free_fetch_parameters(&bw->current_parameters);
+@@ -1892,6 +1898,11 @@ nserror browser_window_destroy_internal(struct browser_window *bw)
+ 		bw->current_content = NULL;
+ 	}
+ 
++	if (bw->script_url != NULL) {
++		nsurl_unref(bw->script_url);
++		bw->script_url = NULL;
++	}
++
+ 	if (bw->favicon.loading != NULL) {
+ 		hlcache_handle_abort(bw->favicon.loading);
+ 		hlcache_handle_release(bw->favicon.loading);
+@@ -3289,6 +3300,10 @@ nserror browser_window_refresh_url_bar(struct browser_window *bw)
+ 		/* Throbbing and we have loading parameters, use those */
+ 		url = bw->loading_parameters.url;
+ 		ret = browser_window_refresh_url_bar_internal(bw, url);
++	} else if (bw->script_url != NULL) {
++		/* the address the page gave itself (VitaSurf) */
++		ret = browser_window_refresh_url_bar_internal(bw,
++				bw->script_url);
+ 	} else if (bw->frag_id == NULL) {
+ 		if (bw->internal_nav) {
+ 			url = bw->loading_parameters.url;
+@@ -4163,6 +4178,42 @@ void browser_window_stop(struct browser_window *bw)
+ }
+ 
+ 
++/* Exported interface, documented in netsurf/browser_window.h */
++nserror browser_window_set_script_url(struct browser_window *bw,
++		struct nsurl *url, bool replace)
++{
++	struct nsurl *was;
++
++	if (bw == NULL || url == NULL || bw->current_content == NULL) {
++		return NSERROR_BAD_PARAMETER;
++	}
++	was = bw->script_url != NULL ? bw->script_url :
++		hlcache_handle_get_url(bw->current_content);
++	if (was != NULL && nsurl_compare(was, url, NSURL_COMPLETE)) {
++		return NSERROR_OK;
++	}
++	/* the global history: the new address was visited, and one that
++	 * was replaced was never really seen */
++	if (replace && was != NULL) {
++		urldb_reset_url_visit_data(was);
++	}
++	if (urldb_add_url(url)) {
++		const char *title = content_get_title(bw->current_content);
++
++		urldb_update_url_visit_data(url);
++		if (title != NULL) {
++			urldb_set_url_title(url, title);
++		}
++	}
++	browser_window_history_set_url(bw, url);
++	if (bw->script_url != NULL) {
++		nsurl_unref(bw->script_url);
++	}
++	bw->script_url = nsurl_ref(url);
++	return browser_window_refresh_url_bar(bw);
++}
++
++
+ /* Exported interface, documented in netsurf/browser_window.h */
+ nserror browser_window_reload(struct browser_window *bw, bool all)
+ {
+@@ -4203,6 +4254,11 @@ nserror browser_window_reload(struct browser_window *bw, bool all)
+ 	content_invalidate_reuse_data(bw->current_content);
+ 
+ 	reload_url = hlcache_handle_get_url(bw->current_content);
++	/* the address the page gave itself, not the one it came from:
++	 * a login callback's code is spent once it is used (VitaSurf) */
++	if (bw->script_url != NULL) {
++		reload_url = bw->script_url;
++	}
+ 
+ 	return browser_window_navigate(bw,
+ 				       reload_url,
+diff --git a/include/netsurf/browser_window.h b/include/netsurf/browser_window.h
+index 4cfa66792..e092adad0 100644
+--- a/include/netsurf/browser_window.h
++++ b/include/netsurf/browser_window.h
+@@ -438,6 +438,24 @@ void browser_window_set_gadget_filename(struct browser_window *bw,
+  */
+ nserror browser_window_refresh_url_bar(struct browser_window *bw);
+ 
++/**
++ * The page gave itself a new address without loading one (VitaSurf).
++ *
++ * history.pushState and replaceState move the address a page reports,
++ * and a browser shows that address, records it in its history and
++ * reloads it. Home Assistant puts its login code in the address it
++ * returns to and replaces it once the code is used; kept, that address
++ * was what the History page offered and what a reload fetched, and the
++ * code in it had long expired.
++ *
++ * \param bw       the window
++ * \param url      the new address
++ * \param replace  true for replaceState: the old address was never
++ *                 really visited and leaves the global history
++ */
++nserror browser_window_set_script_url(struct browser_window *bw,
++		struct nsurl *url, bool replace);
++
+ 
+ /**
+  * Handle mouse clicks in a browser window.

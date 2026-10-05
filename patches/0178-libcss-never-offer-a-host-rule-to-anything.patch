@@ -1,0 +1,47 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index e6ffaf2..7e8f8d3 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -59,11 +59,16 @@ static uint32_t _state_needed(const css_selector *selector)
+ 
+ 	do {
+ 		if (d->type == CSS_SELECTOR_PSEUDO_CLASS && d->negate == 0 &&
+-				d->qname.name != NULL &&
+-				lwc_string_length(d->qname.name) == 4 &&
+-				strncasecmp(lwc_string_data(d->qname.name),
+-					"root", 4) == 0) {
+-			return CSS_NODE_STATE_ROOT;
++				d->qname.name != NULL) {
++			const char *n = lwc_string_data(d->qname.name);
++			size_t l = lwc_string_length(d->qname.name);
++
++			if (l == 4 && strncasecmp(n, "root", 4) == 0)
++				return CSS_NODE_STATE_ROOT;
++			if ((l == 4 && strncasecmp(n, "host", 4) == 0) ||
++			    (l == 12 &&
++			     strncasecmp(n, "host-context", 12) == 0))
++				return CSS_NODE_STATE_SHADOW;
+ 		}
+ 	} while (d->next != 0 && (d = d + 1) != NULL);
+ 
+diff --git a/src/select/hash.h b/src/select/hash.h
+index 906fc37..2449748 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -41,6 +41,16 @@ typedef struct css_selector_hash css_selector_hash;
+  * else.
+  */
+ #define CSS_NODE_STATE_ROOT	(1u << 0)
++/*
++ * A key compound asking for :host or :host-context, which nothing here
++ * can be: this browser has no shadow trees, and those names are parsed
++ * only so that Tailwind's ":root, :host { ... }" keeps its :root half
++ * instead of the whole selector list being thrown away. No element ever
++ * carries this bit, so such a rule is offered to nobody. GitHub's web
++ * components ship about 2419 of them per element and they accounted for
++ * 15,163,995 of that page's 16,554,703 candidates.
++ */
++#define CSS_NODE_STATE_SHADOW	(1u << 1)
+ 
+ struct css_hash_selection_requirments {
+ 	css_qname qname;		/* Element name, or universal "*" */

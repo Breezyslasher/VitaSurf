@@ -9,8 +9,12 @@ homepage_url:file:///resources/vitasurf.html
 window_width:960
 window_height:544
 
-# Memory is the main constraint: keep every cache small.
-memory_cache_size:4194304
+# Memory is the main constraint: every cache has a bound.
+# 24 MB: NetSurf gives a quarter of this to decoded images, and at 4 MB
+# that was 1 MB, about one poster, so a picture scrolled off and back
+# was decoded again. The heap peaked at 84 MB of its 176 MB on GitHub
+# and Yamtrack with the old figure. vita_options_floor() holds it here.
+memory_cache_size:25165824
 max_cached_fetch_handles:4
 # A page that loads its code in pieces asks for a dozen at once and a
 # bundler gives up on one after a couple of seconds, so these have to be

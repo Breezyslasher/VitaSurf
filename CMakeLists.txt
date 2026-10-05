@@ -35,10 +35,15 @@ else()
 endif()
 
 option(VITASURF_DEBUG "Verbose logging and debug symbols" OFF)
-# The app has about 256 MB of user memory (the startup log shows 114 MB
-# free beside a 128 MB heap). 176 MB leaves room for the main thread
-# stack, the GPU contexts and the system dialogs.
-set(VITASURF_HEAP_MB 176 CACHE STRING "newlib heap size in MB (_newlib_heap_size_user)")
+# The newlib heap is sized at startup from the user memory then free, less
+# VITASURF_HEAP_RESERVE_MB for what is allocated outside it later (the
+# screen texture, the GPU contexts, the network stack and the system
+# dialogs); see vita/platform/vita_heap.c. The ordinary budget gives about
+# 204 MB that way, the extended one about 109 MB more. VITASURF_HEAP_MB is
+# the size taken if the free memory cannot be read: the fixed size used
+# before, which a build 472 log ran to 178 of 180 MB with 60 MB unused.
+set(VITASURF_HEAP_MB 176 CACHE STRING "newlib heap size in MB when free memory cannot be read")
+set(VITASURF_HEAP_RESERVE_MB 32 CACHE STRING "user memory in MB left outside the newlib heap")
 set(VITASURF_BUILD_ID "local" CACHE STRING "Build identifier written to the log (CI run number)")
 set(VITASURF_BUILD_SHA "" CACHE STRING "Short commit hash written to the log")
 if(VITASURF_BUILD_SHA STREQUAL "")
@@ -56,19 +61,26 @@ endif()
 set(VITASURF_STACK_KB 4096 CACHE STRING "main thread stack size in KB")
 # Must match the VITASURF_JS_ENGINE scripts/build-netsurf.sh was run with:
 # quickjs (default) leaves the js_* symbols for vita/js/qjs.c and
-# libquickjs.a (vdpm quickjs-ng), duktape builds NetSurf's engine into
-# libnetsurf.a, no uses NetSurf's stub engine.
-set(VITASURF_JS_ENGINE "quickjs" CACHE STRING "JavaScript engine: quickjs, duktape or no")
-set_property(CACHE VITASURF_JS_ENGINE PROPERTY STRINGS quickjs duktape no)
-if(NOT VITASURF_JS_ENGINE MATCHES "^(duktape|quickjs|no)$")
-    message(FATAL_ERROR "VITASURF_JS_ENGINE must be duktape, quickjs or no, not '${VITASURF_JS_ENGINE}'")
+# libquickjs.a (built from deps/libquickjs), no uses NetSurf's stub
+# engine. The Duktape build was dropped once QuickJS had long outgrown it.
+set(VITASURF_JS_ENGINE "quickjs" CACHE STRING "JavaScript engine: quickjs or no")
+set_property(CACHE VITASURF_JS_ENGINE PROPERTY STRINGS quickjs no)
+if(NOT VITASURF_JS_ENGINE MATCHES "^(quickjs|no)$")
+    message(FATAL_ERROR "VITASURF_JS_ENGINE must be quickjs or no, not '${VITASURF_JS_ENGINE}'")
 endif()
 set(NETSURF_STAGE "${CMAKE_SOURCE_DIR}/out/netsurf" CACHE PATH
     "Output of scripts/build-netsurf.sh (libnetsurf.a and resources/)")
 
-# Extended memory mode (ATTRIBUTE2=12) is off until basic boot works on
-# hardware; enable it with -DVITASURF_EXTENDED_MEMORY=ON afterwards.
-option(VITASURF_EXTENDED_MEMORY "Request the extended memory budget" OFF)
+# Extended memory mode (ATTRIBUTE2=12) asks for a 365 MB main memory
+# budget in place of about 256 MB. It ran on hardware from build 483 on
+# with a 312 MB heap against 203 MB without, so every build asks for it;
+# the heap takes whatever budget the system actually grants, so a build
+# that asks and is refused starts with the ordinary heap.
+option(VITASURF_EXTENDED_MEMORY "Request the extended memory budget" ON)
+# CSS animations run, rather than showing where they come to rest. CI
+# builds it as a second VPK (VitaSurf-anim) while its cost is measured on
+# hardware; the log's "anim:" lines give the frame rate.
+option(VITASURF_ANIMATIONS "Run CSS animations" OFF)
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
 if(VITASURF_EXTENDED_MEMORY)
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
@@ -87,6 +99,7 @@ set(NETSURF_LIBNSFB_SRC "${CMAKE_SOURCE_DIR}/deps/libnsfb")
 # ---------------------------------------------------------------------------
 add_executable(${PROJECT_NAME}
     vita/platform/vita_main.c
+    vita/platform/vita_heap.c
     vita/platform/vita_platform.c
     # Names the failing assertion in the log; without it a failed assert
     # reaches the dump as an undefined instruction inside newlib.
@@ -108,7 +121,10 @@ add_executable(${PROJECT_NAME}
 )
 if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/quickjs.h")
-        message(FATAL_ERROR "quickjs.h not found: install it with 'vdpm quickjs-ng'")
+        message(FATAL_ERROR "quickjs.h not found: build it with scripts/build-quickjs.sh")
+    endif()
+    if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/wamr/glue.h")
+        message(FATAL_ERROR "wamr/glue.h not found: build it with scripts/build-wamr.sh")
     endif()
     # Hand-written QuickJS bindings implementing NetSurf's js.h, plus the
     # JavaScript half of them embedded as a NUL-terminated byte array.
@@ -121,25 +137,60 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/prelude.js
         vita/js/streams.js
         vita/js/performance.js
-        vita/js/storage.js)
-    set(PRELUDE_BYTES "")
-    foreach(part ${PRELUDE_PARTS})
-        set(full "${CMAKE_SOURCE_DIR}/${part}")
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${full}")
-        file(READ "${full}" part_hex HEX)
-        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," part_bytes "${part_hex}")
-        # a newline between parts, so a file that ends in a comment cannot
-        # swallow the first line of the next one
-        set(PRELUDE_BYTES "${PRELUDE_BYTES}${part_bytes}0x0a,")
+        vita/js/storage.js
+        vita/js/subtle.js
+        vita/js/wasm.js
+        vita/js/lazy.js)
+    # Intl, the largest part, is a unit of its own that runs the first
+    # time a page uses it (vita/js/lazy.js): most pages never do, and it
+    # was a fifth of the prelude every page paid for.
+    set(PRELUDE_INTL_PARTS
+        vita/js/intl_core.js
+        vita/js/intl_number.js
+        vita/js/intl_names.js
+        vita/js/intl_tags.js
+        vita/js/intl_list.js
+        vita/js/intl_collator.js
+        vita/js/intl_segmenter.js
+        vita/js/intl_pattern.js
+        vita/js/intl_zone.js
+        vita/js/intl_calendar.js
+        vita/js/intl_range.js
+        vita/js/intl.js)
+    foreach(unit PRELUDE PRELUDE_INTL)
+        set(${unit}_BYTES "")
+        foreach(part ${${unit}_PARTS})
+            set(full "${CMAKE_SOURCE_DIR}/${part}")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${full}")
+            file(READ "${full}" part_hex HEX)
+            string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," part_bytes "${part_hex}")
+            # a newline between parts, so a file that ends in a comment cannot
+            # swallow the first line of the next one
+            set(${unit}_BYTES "${${unit}_BYTES}${part_bytes}0x0a,")
+        endforeach()
     endforeach()
     file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
-        "/* generated from ${PRELUDE_PARTS} */\n"
-        "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n")
+        "/* generated from ${PRELUDE_PARTS} and ${PRELUDE_INTL_PARTS} */\n"
+        "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n"
+        "static const unsigned char prelude_intl_js[] = {${PRELUDE_INTL_BYTES}0x00};\n")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
-    target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/canvas.c)
+    # websocket.c runs WebSocket connections on libcurl's ws API
+    # intl.c reads the locale data Intl is built on, resources/intl.pak
+    target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
+        vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c
+        vita/js/intl.c)
+    # subtle.c takes Ed25519 and X25519 from Monocypher, which mbedTLS
+    # does not have
+    target_sources(${PROJECT_NAME} PRIVATE
+        deps/monocypher/src/monocypher.c
+        deps/monocypher/src/optional/monocypher-ed25519.c)
     target_include_directories(${PROJECT_NAME} PRIVATE
-        "${CMAKE_BINARY_DIR}/generated" vita/js)
+        "${CMAKE_BINARY_DIR}/generated" vita/js
+        deps/monocypher/src deps/monocypher/src/optional
+        # WebAssembly: WAMR's interpreter and vita/wasm/glue.h, built by
+        # scripts/build-wamr.sh
+        "${SYSROOT}/include/wamr")
     # canvas.c draws text with the glyphs the framebuffer frontend's font
     # engine has, so it needs FreeType's headers. NetSurf asks pkg-config
     # for them; here the sysroot is searched directly, because which of
@@ -178,11 +229,18 @@ target_compile_options(${PROJECT_NAME} PRIVATE
 )
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     VITASURF_HEAP_MB=${VITASURF_HEAP_MB}
+    VITASURF_HEAP_RESERVE_MB=${VITASURF_HEAP_RESERVE_MB}
     VITASURF_STACK_KB=${VITASURF_STACK_KB}
     VITASURF_BUILD_ID="${VITASURF_BUILD_ID}"
     VITASURF_BUILD_SHA="${VITASURF_BUILD_SHA}"
     VITASURF_JS_ENGINE="${VITASURF_JS_ENGINE}"
 )
+if(VITASURF_EXTENDED_MEMORY)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_EXTENDED_MEMORY=1)
+endif()
+if(VITASURF_ANIMATIONS)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_ANIMATIONS=1)
+endif()
 if(VITASURF_DEBUG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VITASURF_DEBUG=1)
 endif()
@@ -213,8 +271,10 @@ target_link_options(${PROJECT_NAME} PRIVATE
 
 set(VITASURF_JS_LIBS)
 if(VITASURF_JS_ENGINE STREQUAL "quickjs")
-    # quickjs-ng (MIT), from vdpm.
-    set(VITASURF_JS_LIBS quickjs)
+    # quickjs-ng (MIT), built from deps/libquickjs by
+    # scripts/build-quickjs.sh; WAMR (Apache-2.0 WITH LLVM-exception),
+    # built from deps/wamr by scripts/build-wamr.sh, runs WebAssembly.
+    set(VITASURF_JS_LIBS quickjs vitawamr)
 endif()
 
 # Image decoders that are only in libnetsurf.a when the toolchain had
@@ -322,6 +382,11 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
     FILE resources/Choices                        resources/Choices
     FILE resources/vitasurf.html                  resources/vitasurf.html
     FILE resources/jstest.html                    resources/jstest.html
+    FILE resources/anim-light.html                resources/anim-light.html
+    FILE resources/anim-heavy.html                resources/anim-heavy.html
+    FILE resources/anim-layout.html               resources/anim-layout.html
     FILE resources/cacert.pem                     resources/cacert.pem
+    # Intl.NumberFormat's locale data, scripts/gen-intl-numbers.mjs
+    FILE resources/intl.pak                       resources/intl.pak
     ${VPK_FILES}
 )

@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>RegExp replace, match and exec, fast and not</title></head>
+<body><pre id="out"></pre>
+<script>
+/* An unmodified regexp takes a fast path for its flags and exec
+   (VitaSurf); a page that changes RegExp.prototype must still see the
+   spec's behaviour. Each line gives the browser's answer in brackets. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+T('replace global (a+b+c)', 'a-b-c'.replace(/-/g, '+'));
+T('replace first ($a-b)', 'a-b'.replace(/(a)/, '$$$1'));
+T('replace function (A-B-c)', 'a-b-c'.replace(/[ab]/g, function(m){ return m.toUpperCase(); }));
+T('flags (dgimsuy)', /x/dgimsuy.flags);
+T('flags v (v)', new RegExp('x', 'v').flags);
+T('toString (/a\\/b/gi)', String(/a\/b/gi));
+T('match global (a,a,a)', 'banana'.match(/a/g).join(','));
+T('match first (an 1)', (function(m){ return m[0] + ' ' + m.index; })('banana'.match(/an/)));
+T('test (true false)', /n/.test('banana') + ' ' + /x/.test('banana'));
+T('empty unicode (-a-😀-)', 'a😀'.replace(/(?:)/gu, '-'));
+T('empty not unicode (7)', 'a😀'.replace(/(?:)/g, '-').length);
+var st = /a/y; st.lastIndex = 1;
+T('sticky from 1 (true)', st.test('ba'));
+var re = /o/g; re.lastIndex = 5;
+T('lastIndex reset by replace (0)', ('foo'.replace(re, '0'), re.lastIndex));
+var own = /a/; var calls = 0;
+own.exec = function(s){ calls++; return RegExp.prototype.exec.call(this, s); };
+T('own exec is called (1 true)', (own.test('a') ? (calls + ' true') : 'no'));
+var ex = RegExp.prototype.exec, pcalls = 0;
+RegExp.prototype.exec = function(s){ pcalls++; return ex.call(this, s); };
+'aaa'.replace(/a/g, 'b');
+T('prototype exec is called (4)', pcalls);
+RegExp.prototype.exec = ex;
+var gd = Object.getOwnPropertyDescriptor(RegExp.prototype, 'global');
+Object.defineProperty(RegExp.prototype, 'global', { configurable: true, get: function(){ return false; } });
+T('prototype global getter is read (i baa)', /a/gi.flags + ' ' + 'aaa'.replace(/a/g, 'b'));
+Object.defineProperty(RegExp.prototype, 'global', gd);
+T('and put back (gi bbb)', /a/gi.flags + ' ' + 'aaa'.replace(/a/g, 'b'));
+var fd = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags');
+Object.defineProperty(RegExp.prototype, 'flags', { configurable: true, get: function(){ return ''; } });
+T('prototype flags getter is read (baa)', 'aaa'.replace(/a/g, 'b'));
+Object.defineProperty(RegExp.prototype, 'flags', fd);
+var sub = /a/g; sub.foo = 1;
+T('regexp with its own property (bbb)', 'aaa'.replace(sub, 'b'));
+var keep = /a/; keep.lastIndex = 5;
+T('non-global keeps lastIndex (ba 5)', 'aa'.replace(keep, 'b') + ' ' + keep.lastIndex);
+var glob = /a/g; glob.lastIndex = 1;
+T('global starts at 0 and ends at 0 (bb 0)', 'aa'.replace(glob, 'b') + ' ' + glob.lastIndex);
+T('captures with a plain replacement (aXc)', 'abc'.replace(/(b)/, 'X'));
+T('wide characters (h\u00e9llo world)', 'h\u00e9llo w\u00f6rld'.replace(/\u00f6/g, 'o'));
+T('wide replacement (a\u00fcc)', 'abc'.replace(/b/g, '\u00fc'));
+T('no match (abc)', 'abc'.replace(/x/g, 'y'));
+T('empty pattern global (-a-b-)', 'ab'.replace(/(?:)/g, '-'));
+T('sticky global stops at the gap (bbba)', 'aaba'.replace(/a/gy, 'b'));
+T('dollar still substitutes (a[b]c)', 'abc'.replace(/(b)/, '[$1]'));
+var t0 = Date.now(), s = '';
+for (var i = 0; i < 100000; i++) s = 'a-b-c'.replace(/-/g, '+');
+T('100000 replaces took', (Date.now() - t0) + ' ms');
+</script></body></html>

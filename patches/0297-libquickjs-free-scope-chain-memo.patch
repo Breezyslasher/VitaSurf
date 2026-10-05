@@ -1,0 +1,14 @@
+diff --git a/quickjs.c b/quickjs.c
+index c600f91..5b536dc 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -35981,6 +35981,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+         list_del(&fd->link);
+     }
+ 
++    /* the lookups it answered are done; js_free_function_def only
++       runs on failure (VitaSurf) */
++    js_free(ctx, fd->chain_memo);
+     js_free(ctx, fd);
+     return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
+  fail:

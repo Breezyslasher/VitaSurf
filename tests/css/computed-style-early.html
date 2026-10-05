@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>getComputedStyle before layout and without a box</title><style>
+ #a { cursor: pointer; pointer-events: none; color: rgb(10, 20, 30); }
+ #b { display: none; color: rgb(1, 2, 3); }
+ #c { font-size: 20px; }
+ #c span { opacity: 0.5; }
+</style></head>
+<body><div id="a">a</div><div id="b"><i id="bi">hidden</i></div>
+<div id="c"><span id="cs">x</span></div>
+<pre id="out"></pre>
+<script>
+/* Before the first layout, and for anything display: none, there is no
+   box to read a style from, and getComputedStyle gave the defaults:
+   auto, auto, rgb(0, 0, 0). A script asking at load time or about a
+   hidden panel saw the wrong answers. While the page is still being
+   parsed the STYLE sheets are still being fetched, and a browser applies
+   them already: they are parsed there and then for the answer. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function S(id){ return getComputedStyle(document.getElementById(id)); }
+T('while parsing: cursor, pointer-events, color, display (pointer none rgb(10, 20, 30) block)',
+  [S('a').cursor, S('a').pointerEvents, S('a').color, S('a').display].join(' '));
+var parsingSize = S('c').fontSize;
+window.addEventListener('load', function(){
+  T('font size while parsing and at load agree (20px 20px)', parsingSize + ' ' + S('c').fontSize);
+  T('at load: cursor (pointer)', S('a').cursor);
+  T('display: none element (none rgb(1, 2, 3))', S('b').display + ' ' + S('b').color);
+  T('inside display: none, inherited colour (rgb(1, 2, 3))', S('bi').color);
+  T('inherited font size and own opacity (20px 0.5)', S('cs').fontSize + ' ' + S('cs').opacity);
+});
+</script></body></html>

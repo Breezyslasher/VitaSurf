@@ -1,0 +1,720 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 70989ff..ba322d2 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -159,35 +159,47 @@ typedef struct css_select_handler {
+ 	css_error (*first_child_node)(void *pw, void *node, void **child);
+ 	css_error (*next_sibling_node)(void *pw, void *node, void **sibling);
+ 	/**
+-	 * The names of the attributes this node carries, as a bloom
+-	 * (VitaSurf). A rule whose key compound needs an attribute
+-	 * cannot match a node that has no such attribute, and a bloom
+-	 * says so without a call per rule.
++	 * The names of the attributes this node carries, hashed
++	 * (VitaSurf).
+ 	 *
+-	 * Build the value by OR-ing css_attribute_bloom_bits() over
+-	 * every attribute name on the node. Leave the pointer NULL, or
+-	 * answer anything but CSS_OK, and no rule is skipped: the
+-	 * filter is an optimisation and never a source of truth.
++	 * A rule whose key compound needs an attribute cannot match a
++	 * node without that attribute, so those rules are filed by the
++	 * name they need and only the buckets a node's own attributes
++	 * fall in are searched. Fill \a hashes, which has room for
++	 * CSS_ATTRIBUTE_HASHES_MAX of them, with
++	 * css_attribute_name_hash() of each name and say how many were
++	 * written.
++	 *
++	 * A node with more attributes than that sets \a n_hashes to
++	 * CSS_ATTRIBUTE_HASHES_MAX + 1 and every bucket is searched
++	 * instead, which is what happened before any of them were
++	 * bucketed. Leaving the pointer NULL, or answering anything but
++	 * CSS_OK, does the same: the filing is an optimisation and
++	 * never a source of truth.
+ 	 *
+ 	 * At the end of the structure so a handler written against the
+ 	 * earlier layout still initialises.
+ 	 */
+-	css_error (*node_attribute_bloom)(void *pw, void *node,
+-			uint64_t *bloom);
++	css_error (*node_attribute_hashes)(void *pw, void *node,
++			uint32_t *hashes, uint32_t *n_hashes);
+ } css_select_handler;
+ 
++/** How many attribute names a node can name before every bucket is
++ * searched instead. */
++#define CSS_ATTRIBUTE_HASHES_MAX 32
++
+ /**
+- * The bits an attribute name contributes to the node bloom above.
++ * The hash of an attribute name, for the callback above.
+  *
+- * Case-insensitive over ASCII, since HTML attribute names are, and
+- * over the local name only, so a namespaced attribute lands with its
+- * unqualified twin and the filter errs towards keeping rules.
++ * Case-insensitive over ASCII, since HTML attribute names are. A
++ * namespaced attribute should be offered twice, qualified and local,
++ * because a selector names the local part on its own.
+  *
+- * \param name  The attribute's local name
++ * \param name  The attribute's name
+  * \param len   Its length in bytes
+- * \return the bits to OR into the node's bloom
++ * \return the hash of that name
+  */
+-uint64_t css_attribute_bloom_bits(const char *name, size_t len);
++uint32_t css_attribute_name_hash(const char *name, size_t len);
+ 
+ /**
+  * Font face selection result set
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 74a42e8..ea496f8 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -30,7 +30,7 @@ typedef struct hash_entry {
+ } hash_entry;
+ 
+ typedef struct hash_t {
+-#define DEFAULT_SLOTS (1<<6)
++#define DEFAULT_SLOTS CSS_SELECTOR_HASH_SLOTS
+ 	size_t n_slots;
+ 
+ 	hash_entry *slots;
+@@ -43,6 +43,15 @@ struct css_selector_hash {
+ 
+ 	hash_t ids;
+ 
++	/*
++	 * Universal rules whose key compound needs a named attribute,
++	 * filed by that name (VitaSurf). Before this they all sat in
++	 * the chain below and were walked for every element in the
++	 * document: a GitHub page files 593 of them and selects 1192
++	 * elements, and the walk was 1652 entries per element.
++	 */
++	hash_t attrs;
++
+ 	hash_entry universal;
+ 
+ 	size_t hash_size;
+@@ -59,6 +68,7 @@ extern unsigned int css_select_steps_element;
+ extern unsigned int css_select_steps_class;
+ extern unsigned int css_select_steps_id;
+ extern unsigned int css_select_steps_universal;
++extern unsigned int css_select_steps_attr;
+ 
+ /**
+  * Whether a key compound can only match the document root (VitaSurf).
+@@ -104,7 +114,7 @@ static uint32_t _state_needed(const css_selector *selector)
+  * absence of an attribute and so says nothing about what the node
+  * carries; those are left out.
+  */
+-uint64_t css_attribute_bloom_bits(const char *name, size_t len)
++uint32_t css_attribute_name_hash(const char *name, size_t len)
+ {
+ 	uint32_t h = 2166136261u;
+ 	size_t i;
+@@ -118,7 +128,12 @@ uint64_t css_attribute_bloom_bits(const char *name, size_t len)
+ 		h *= 16777619u;
+ 	}
+ 
+-	return (1ull << (h & 63)) | (1ull << ((h >> 8) & 63));
++	return h;
++}
++
++uint64_t css_attribute_bloom_bits(uint32_t hash)
++{
++	return (1ull << (hash & 63)) | (1ull << ((hash >> 8) & 63));
+ }
+ 
+ static uint64_t _attrs_needed(const css_selector *selector)
+@@ -137,8 +152,9 @@ static uint64_t _attrs_needed(const css_selector *selector)
+ 		case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
+ 			if (d->negate == 0 && d->qname.name != NULL) {
+ 				bits |= css_attribute_bloom_bits(
++					css_attribute_name_hash(
+ 					lwc_string_data(d->qname.name),
+-					lwc_string_length(d->qname.name));
++					lwc_string_length(d->qname.name)));
+ 			}
+ 			break;
+ 		default:
+@@ -149,6 +165,40 @@ static uint64_t _attrs_needed(const css_selector *selector)
+ 	return bits;
+ }
+ 
++/*
++ * The first attribute name the key compound insists on, which is the
++ * one the rule is filed under (VitaSurf). All of them must be present
++ * for the compound to match, so any one of them will do as a key, and
++ * the bloom above catches the rest.
++ */
++static bool _attr_key(const css_selector *selector, uint32_t *key)
++{
++	const css_selector_detail *d = &selector->data;
++
++	do {
++		switch (d->type) {
++		case CSS_SELECTOR_ATTRIBUTE:
++		case CSS_SELECTOR_ATTRIBUTE_EQUAL:
++		case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
++		case CSS_SELECTOR_ATTRIBUTE_INCLUDES:
++		case CSS_SELECTOR_ATTRIBUTE_PREFIX:
++		case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
++		case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
++			if (d->negate == 0 && d->qname.name != NULL) {
++				*key = css_attribute_name_hash(
++					lwc_string_data(d->qname.name),
++					lwc_string_length(d->qname.name));
++				return true;
++			}
++			break;
++		default:
++			break;
++		}
++	} while (d->next != 0 && (d = d + 1) != NULL);
++
++	return false;
++}
++
+ /** Whether a filed rule can be skipped for this node outright. */
+ #define RULE_WANTS_WHAT_NODE_HAS(e, req) \
+ 	(((e)->needs_state == 0 || \
+@@ -179,6 +229,10 @@ static css_error _iterate_universal(
+ 		const struct css_hash_selection_requirments *req,
+ 		const css_selector **current,
+ 		const css_selector ***next);
++static css_error _iterate_attrs(
++		const struct css_hash_selection_requirments *req,
++		const css_selector **current,
++		const css_selector ***next);
+ 
+ 
+ 
+@@ -273,9 +327,21 @@ css_error css__selector_hash_create(css_selector_hash **hash)
+ 	}
+ 	h->ids.n_slots = DEFAULT_SLOTS;
+ 
++	/* Attribute hash (VitaSurf) */
++	h->attrs.slots = calloc(DEFAULT_SLOTS, sizeof(hash_entry));
++	if (h->attrs.slots == NULL) {
++		free(h->ids.slots);
++		free(h->classes.slots);
++		free(h->elements.slots);
++		free(h);
++		return CSS_NOMEM;
++	}
++	h->attrs.n_slots = DEFAULT_SLOTS;
++
+ 	/* Universal chain head already initiliased by calloc of `h`. */
+ 
+ 	h->hash_size = sizeof(css_selector_hash) +
++			DEFAULT_SLOTS * sizeof(hash_entry) +
+ 			DEFAULT_SLOTS * sizeof(hash_entry) +
+ 			DEFAULT_SLOTS * sizeof(hash_entry) +
+ 			DEFAULT_SLOTS * sizeof(hash_entry);
+@@ -329,6 +395,16 @@ css_error css__selector_hash_destroy(css_selector_hash *hash)
+ 	}
+ 	free(hash->ids.slots);
+ 
++	/* Attribute hash (VitaSurf) */
++	for (i = 0; i < hash->attrs.n_slots; i++) {
++		for (d = hash->attrs.slots[i].next; d != NULL; d = e) {
++			e = d->next;
++
++			free(d);
++		}
++	}
++	free(hash->attrs.slots);
++
+ 	/* Universal chain */
+ 	for (d = hash->universal.next; d != NULL; d = e) {
+ 		e = d->next;
+@@ -359,6 +435,7 @@ unsigned int css_hash_in_id;
+ unsigned int css_hash_in_class;
+ unsigned int css_hash_in_element;
+ unsigned int css_hash_in_universal;
++unsigned int css_hash_in_attr;
+ unsigned int css_hash_uni_attribute;
+ unsigned int css_hash_uni_pseudo_class;
+ unsigned int css_hash_uni_pseudo_element;
+@@ -401,6 +478,23 @@ css_error css__selector_hash_insert(css_selector_hash *hash,
+ 				selector);
+ 		css_hash_in_element++;
+ 	} else {
++		uint32_t key;
++
++		/*
++		 * A rule that needs a named attribute goes in that
++		 * name's bucket, and only what is left goes in the
++		 * chain every element walks (VitaSurf).
++		 */
++		if (_attr_key(selector, &key)) {
++			mask = hash->attrs.n_slots - 1;
++			index = key & mask;
++
++			error = _insert_into_chain(hash,
++					&hash->attrs.slots[index], selector);
++			css_hash_in_attr++;
++
++			return error;
++		}
+ 		/* Universal chain */
+ 		error = _insert_into_chain(hash, &hash->universal, selector);
+ 		css_hash_in_universal++;
+@@ -489,6 +583,16 @@ css_error css__selector_hash_remove(css_selector_hash *hash,
+ 		error = _remove_from_chain(hash, &hash->elements.slots[index],
+ 				selector);
+ 	} else {
++		uint32_t key;
++
++		/* filed by the attribute it needs (VitaSurf) */
++		if (_attr_key(selector, &key)) {
++			mask = hash->attrs.n_slots - 1;
++			index = key & mask;
++
++			return _remove_from_chain(hash,
++					&hash->attrs.slots[index], selector);
++		}
+ 		/* Universal chain */
+ 		error = _remove_from_chain(hash, &hash->universal, selector);
+ 	}
+@@ -745,6 +849,58 @@ css_error css__selector_hash_find_by_id(css_selector_hash *hash,
+  *
+  * If nothing matches, CSS_OK will be returned and **matched == NULL
+  */
++/**
++ * Find the first rule filed under one attribute name (VitaSurf)
++ *
++ * \param hash      Hash to search
++ * \param req       What the node is; req->attr_slot picks the bucket
++ * \param iterator  Pointer to location to receive iterator function
++ * \param matched   Pointer to location to receive selector
++ * \return CSS_OK on success, appropriate error otherwise
++ *
++ * If nothing matches, CSS_OK will be returned and **matched == NULL
++ */
++css_error css__selector_hash_find_by_attr(css_selector_hash *hash,
++		const struct css_hash_selection_requirments *req,
++		css_selector_hash_iterator *iterator,
++		const css_selector ***matched)
++{
++	hash_entry *head;
++
++	if (hash == NULL || req == NULL || iterator == NULL || matched == NULL)
++		return CSS_BADPARM;
++
++	head = &hash->attrs.slots[req->attr_slot & (hash->attrs.n_slots - 1)];
++
++	if (head->sel != NULL) {
++		/* Search through chain for first match */
++		while (head != NULL) {
++			css_select_steps_attr++;
++			if (RULE_HAS_BYTECODE(head) &&
++			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
++			    css_bloom_in_bloom(
++					head->sel_chain_bloom,
++					req->node_bloom) &&
++			    mq_rule_good_for_media(head->sel->rule,
++					req->unit_ctx, req->media,
++					req->str)) {
++				/* Found a match */
++				break;
++			}
++
++			head = head->next;
++		}
++
++		if (head == NULL)
++			head = &empty_slot;
++	}
++
++	(*iterator) = _iterate_attrs;
++	(*matched) = (const css_selector **) head;
++
++	return CSS_OK;
++}
++
+ css_error css__selector_hash_find_universal(css_selector_hash *hash,
+ 		const struct css_hash_selection_requirments *req,
+ 		css_selector_hash_iterator *iterator,
+@@ -1067,8 +1223,20 @@ css_error _remove_from_chain(css_selector_hash *ctx, hash_entry *head,
+ 
+ 	if (prev == NULL) {
+ 		if (search->next != NULL) {
+-			head->sel = search->next->sel;
+-			head->next = search->next->next;
++			hash_entry *second = search->next;
++
++			/*
++			 * The whole entry, not just the selector and the
++			 * link (VitaSurf): the head also carries the
++			 * chain bloom and what the key compound needs,
++			 * and copying two fields out of four left the
++			 * promoted rule answering with the removed
++			 * rule's requirements. The entry it came from
++			 * was leaked as well.
++			 */
++			*head = *second;
++			free(second);
++			ctx->hash_size -= sizeof(hash_entry);
+ 		} else {
+ 			head->sel = NULL;
+ 			head->next = NULL;
+@@ -1275,6 +1443,42 @@ css_error _iterate_ids(
+  *
+  * If nothing further matches, CSS_OK will be returned and **next == NULL
+  */
++/** The next rule in one attribute bucket (VitaSurf). */
++css_error _iterate_attrs(
++		const struct css_hash_selection_requirments *req,
++		const css_selector **current,
++		const css_selector ***next)
++{
++	const hash_entry *head = (const hash_entry *) current;
++	head = head->next;
++
++	if (head != NULL && head->sel != NULL) {
++		/* Search through chain for first match */
++		while (head != NULL) {
++			css_select_steps_attr++;
++			if (RULE_HAS_BYTECODE(head) &&
++			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
++			    css_bloom_in_bloom(
++					head->sel_chain_bloom,
++					req->node_bloom) &&
++			    mq_rule_good_for_media(head->sel->rule,
++					req->unit_ctx, req->media,
++					req->str)) {
++				/* Found a match */
++				break;
++			}
++			head = head->next;
++		}
++	}
++
++	if (head == NULL)
++		head = &empty_slot;
++
++	(*next) = (const css_selector **) head;
++
++	return CSS_OK;
++}
++
+ css_error _iterate_universal(
+ 		const struct css_hash_selection_requirments *req,
+ 		const css_selector **current,
+diff --git a/src/select/hash.h b/src/select/hash.h
+index 3ccfd6a..7ffd625 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -52,6 +52,16 @@ typedef struct css_selector_hash css_selector_hash;
+  */
+ #define CSS_NODE_STATE_SHADOW	(1u << 1)
+ 
++/*
++ * How many buckets the attribute chains are split over (VitaSurf).
++ *
++ * Shared with select.c, which works out which of them a node's
++ * attributes fall in once per node rather than once per sheet, so both
++ * ends have to agree on the count. It is the same as the other chains
++ * use, and like them it is never resized.
++ */
++#define CSS_SELECTOR_HASH_SLOTS (1 << 6)
++
+ struct css_hash_selection_requirments {
+ 	css_qname qname;		/* Element name, or universal "*" */
+ 	lwc_string *class;		/* Name of class, or NULL */
+@@ -62,8 +72,12 @@ struct css_hash_selection_requirments {
+ 	const css_bloom *node_bloom;	/* Node's bloom filter */
+ 	uint32_t node_state;		/* CSS_NODE_STATE_* the node is in */
+ 	uint64_t attr_bloom;		/* names of the node's attributes */
++	uint32_t attr_slot;		/* attribute bucket to search */
+ };
+ 
++/** The bloom bits an attribute-name hash contributes (VitaSurf). */
++uint64_t css_attribute_bloom_bits(uint32_t hash);
++
+ typedef css_error (*css_selector_hash_iterator)(
+ 		const struct css_hash_selection_requirments *req,
+ 		const struct css_selector **current,
+@@ -93,6 +107,20 @@ css_error css__selector_hash_find_universal(css_selector_hash *hash,
+ 		const struct css_hash_selection_requirments *req,
+ 		css_selector_hash_iterator *iterator,
+ 		const struct css_selector ***matched);
++/**
++ * Find the first rule in one attribute bucket (VitaSurf).
++ *
++ * The rules that used to fill the universal chain are mostly attribute
++ * rules -- [data-view-component] and its like -- and a node that has
++ * not got the attribute can never match one. Filing them by the name
++ * their key compound needs turns a walk of every such rule on the page
++ * into a walk of the few that name an attribute this node carries.
++ * req->attr_slot says which bucket to look in.
++ */
++css_error css__selector_hash_find_by_attr(css_selector_hash *hash,
++		const struct css_hash_selection_requirments *req,
++		css_selector_hash_iterator *iterator,
++		const struct css_selector ***matched);
+ 
+ css_error css__selector_hash_size(css_selector_hash *hash, size_t *size);
+ 
+diff --git a/src/select/select.c b/src/select/select.c
+index 625a248..925c380 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -104,9 +104,11 @@ typedef struct css_select_rule_source {
+ 		CSS_SELECT_RULE_SRC_ELEMENT,
+ 		CSS_SELECT_RULE_SRC_CLASS,
+ 		CSS_SELECT_RULE_SRC_ID,
+-		CSS_SELECT_RULE_SRC_UNIVERSAL
++		CSS_SELECT_RULE_SRC_UNIVERSAL,
++		CSS_SELECT_RULE_SRC_ATTRIBUTE	/* VitaSurf */
+ 	} source;
+ 	uint32_t class;
++	uint32_t attr;			/* which bucket (VitaSurf) */
+ } css_select_rule_source;
+ 
+ 
+@@ -155,6 +157,8 @@ unsigned int css_select_steps_element;
+ unsigned int css_select_steps_class;
+ unsigned int css_select_steps_id;
+ unsigned int css_select_steps_universal;
++unsigned int css_select_steps_attr;
++unsigned int css_select_from_attr;
+ /*
+  * And where a candidate dies (VitaSurf). 16.9 million are offered on a
+  * GitHub load and 99.6% come out of the universal chain, but only 1.07
+@@ -1348,6 +1352,51 @@ static void css_select__finalise_selection_state(
+  * \param[in]  pw            The client private data, passed out to callbacks.
+  * \return CSS_OK or appropriate error otherwise.
+  */
++/*
++ * Which attribute buckets this node's rules can be in (VitaSurf).
++ *
++ * The bucket count is the same for every sheet, so this is worked out
++ * once per node rather than once per sheet, and the buckets are
++ * deduplicated: two names in one bucket would otherwise have its rules
++ * offered twice.
++ */
++static void css_select__note_attributes(css_select_state *state, void *node,
++		const css_select_handler *handler, void *pw)
++{
++	uint32_t hashes[CSS_ATTRIBUTE_HASHES_MAX];
++	uint32_t n = CSS_ATTRIBUTE_HASHES_MAX + 1;
++	uint64_t seen[(CSS_SELECTOR_HASH_SLOTS + 63) / 64] = { 0 };
++	uint32_t i;
++
++	if (handler->node_attribute_hashes != NULL &&
++			handler->node_attribute_hashes(pw, node, hashes, &n) !=
++				CSS_OK) {
++		n = CSS_ATTRIBUTE_HASHES_MAX + 1;
++	}
++
++	if (handler->node_attribute_hashes == NULL ||
++			n > CSS_ATTRIBUTE_HASHES_MAX) {
++		/* nothing is known, so nothing is ruled out */
++		state->attr_bloom = ~(uint64_t) 0;
++		state->n_attr_slots = CSS_SELECTOR_HASH_SLOTS;
++		for (i = 0; i < CSS_SELECTOR_HASH_SLOTS; i++)
++			state->attr_slots[i] = (uint8_t) i;
++		return;
++	}
++
++	state->attr_bloom = 0;
++	state->n_attr_slots = 0;
++	for (i = 0; i < n; i++) {
++		uint32_t slot = hashes[i] & (CSS_SELECTOR_HASH_SLOTS - 1);
++
++		state->attr_bloom |= css_attribute_bloom_bits(hashes[i]);
++		if ((seen[slot >> 6] & (1ull << (slot & 63))) != 0)
++			continue;
++		seen[slot >> 6] |= 1ull << (slot & 63);
++		state->attr_slots[state->n_attr_slots++] = (uint8_t) slot;
++	}
++}
++
+ static css_error css_select__initialise_selection_state(
+ 		css_select_state *state,
+ 		void *node,
+@@ -1609,17 +1658,13 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 
+ 	/*
+ 	 * And the names of its attributes, for the same reason and at
+-	 * the same cost of one call (VitaSurf). A handler that does not
+-	 * offer them, or cannot answer, leaves every bit set so that
+-	 * nothing is skipped.
++	 * the same cost of one call (VitaSurf). They say which buckets
++	 * of each sheet's attribute hash can hold a rule for this node;
++	 * a handler that does not offer them, or cannot answer, or a
++	 * node with more attributes than fit, gets all of them and a
++	 * bloom of all ones, which skips nothing.
+ 	 */
+-	state.attr_bloom = ~(uint64_t) 0;
+-	if (handler->node_attribute_bloom != NULL) {
+-		uint64_t bloom = 0;
+-
+-		if (handler->node_attribute_bloom(pw, node, &bloom) == CSS_OK)
+-			state.attr_bloom = bloom;
+-	}
++	css_select__note_attributes(&state, node, handler, pw);
+ 
+ 	/* Fetch presentational hints */
+ 	error = handler->node_presentational_hint(pw, node, &nhints, &hints);
+@@ -2288,7 +2333,8 @@ static css_error select_font_faces_from_sheet(
+ 
+ static inline bool _selectors_pending(const css_selector **node,
+ 		const css_selector **id, const css_selector ***classes,
+-		uint32_t n_classes, const css_selector **univ)
++		uint32_t n_classes, const css_selector **univ,
++		const css_selector ***attrs, uint32_t n_attrs)
+ {
+ 	bool pending = false;
+ 	uint32_t i;
+@@ -2302,6 +2348,9 @@ static inline bool _selectors_pending(const css_selector **node,
+ 			pending |= *(classes[i]) != NULL;
+ 	}
+ 
++	for (i = 0; i < n_attrs; i++)
++		pending |= *(attrs[i]) != NULL;
++
+ 	return pending;
+ }
+ 
+@@ -2335,6 +2384,7 @@ static inline bool _selector_less_specific(const css_selector *ref,
+ static const css_selector *_selector_next(const css_selector **node,
+ 		const css_selector **id, const css_selector ***classes,
+ 		uint32_t n_classes, const css_selector **univ,
++		const css_selector ***attrs, uint32_t n_attrs,
+ 		css_select_rule_source *src)
+ {
+ 	const css_selector *ret = NULL;
+@@ -2366,6 +2416,18 @@ static const css_selector *_selector_next(const css_selector **node,
+ 		}
+ 	}
+ 
++	{
++		uint32_t i;
++
++		for (i = 0; i < n_attrs; i++) {
++			if (_selector_less_specific(ret, *(attrs[i]))) {
++				ret = *(attrs[i]);
++				src->source = CSS_SELECT_RULE_SRC_ATTRIBUTE;
++				src->attr = i;
++			}
++		}
++	}
++
+ 	return ret;
+ }
+ 
+@@ -2383,7 +2445,11 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	css_selector_hash_iterator class_iterator;
+ 	const css_selector **univ_selectors = &empty_selector;
+ 	css_selector_hash_iterator univ_iterator;
+-	css_select_rule_source src = { CSS_SELECT_RULE_SRC_ELEMENT, 0 };
++	/* one chain per attribute bucket the node can be in (VitaSurf) */
++	const css_selector **attr_selectors[CSS_SELECTOR_HASH_SLOTS];
++	css_selector_hash_iterator attr_iterator = NULL;
++	const uint32_t n_attrs = state->n_attr_slots;
++	css_select_rule_source src = { CSS_SELECT_RULE_SRC_ELEMENT, 0, 0 };
+ 	struct css_hash_selection_requirments req;
+ 	css_error error;
+ 
+@@ -2394,6 +2460,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	req.str = &ctx->str;
+ 	req.node_state = state->node_state;
+ 	req.attr_bloom = state->attr_bloom;
++	req.attr_slot = 0;
+ 
+ 	/* Find hash chain that applies to current node */
+ 	req.qname = state->element;
+@@ -2436,11 +2503,21 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	if (error != CSS_OK)
+ 		goto cleanup;
+ 
++	/* And one for each attribute bucket the node falls in (VitaSurf) */
++	for (i = 0; i < n_attrs; i++) {
++		req.attr_slot = state->attr_slots[i];
++		error = css__selector_hash_find_by_attr(sheet->selectors,
++				&req, &attr_iterator, &attr_selectors[i]);
++		if (error != CSS_OK)
++			goto cleanup;
++	}
++
+ 	css_select_sheets_seen++;
+ 
+ 	/* Process matching selectors, if any */
+ 	while (_selectors_pending(node_selectors, id_selectors,
+-			class_selectors, n_classes, univ_selectors)) {
++			class_selectors, n_classes, univ_selectors,
++			attr_selectors, n_attrs)) {
+ 		const css_selector *selector;
+ 
+ 
+@@ -2451,7 +2528,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		 */
+ 		selector = _selector_next(node_selectors, id_selectors,
+ 				class_selectors, n_classes, univ_selectors,
+-				&src);
++				attr_selectors, n_attrs, &src);
+ 
+ 		/* We know there are selectors pending, so should have a
+ 		 * selector here */
+@@ -2472,6 +2549,9 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		case CSS_SELECT_RULE_SRC_UNIVERSAL:
+ 			css_select_from_universal++;
+ 			break;
++		case CSS_SELECT_RULE_SRC_ATTRIBUTE:
++			css_select_from_attr++;
++			break;
+ 		}
+ 
+ 		/* Match and handle the selector chain */
+@@ -2502,6 +2582,12 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 			error = class_iterator(&req, class_selectors[src.class],
+ 					&class_selectors[src.class]);
+ 			break;
++
++		case CSS_SELECT_RULE_SRC_ATTRIBUTE:
++			req.attr_slot = state->attr_slots[src.attr];
++			error = attr_iterator(&req, attr_selectors[src.attr],
++					&attr_selectors[src.attr]);
++			break;
+ 		}
+ 
+ 		if (error != CSS_OK)
+diff --git a/src/select/select.h b/src/select/select.h
+index e072336..d20140d 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -15,6 +15,7 @@
+ 
+ #include "stylesheet.h"
+ #include "select/custom.h"
++#include "select/hash.h"
+ 
+ /**
+  * Item in the reject cache (only class and id types are valid)
+@@ -73,12 +74,18 @@ typedef struct css_select_state {
+ 	 * (VitaSurf) */
+ 	uint32_t node_state;
+ 	/*
+-	 * The names of the node's attributes, as a bloom (VitaSurf).
+-	 * Asked for once per node and handed to every sheet, so that a
+-	 * rule needing an attribute the node has not got is never
+-	 * offered. All ones when the handler cannot say.
++	 * The names of the node's attributes (VitaSurf). Asked for once
++	 * per node and handed to every sheet, so that a rule needing an
++	 * attribute the node has not got is neither walked nor offered:
++	 * attr_slots says which buckets of the attribute hash can hold
++	 * a rule for this node, and attr_bloom catches a compound that
++	 * needs a second name as well. A node whose attributes cannot
++	 * be read gets every bucket and a bloom of all ones, which
++	 * skips nothing.
+ 	 */
+ 	uint64_t attr_bloom;
++	uint32_t n_attr_slots;
++	uint8_t attr_slots[CSS_SELECTOR_HASH_SLOTS];
+ 	const css_media *media;		/* Currently active media spec */
+ 	const css_unit_ctx *unit_ctx;	/* Unit conversion context. */
+ 	css_select_results *results;	/* Result set to populate */

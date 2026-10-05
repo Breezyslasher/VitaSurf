@@ -1,0 +1,20 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 511675157..5d8d4c5e1 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -583,6 +583,15 @@ fb_pan(fbtk_widget_t *widget,
+ 	 * a header at the other end of the screen would be all of it */
+ 	dx = bwidget->panx;
+ 	dy = bwidget->pany;
++	/*
++	 * The move is in scrollx and scrolly now. Left in panx and pany
++	 * as well, gui_window_get_scroll() counted it twice for the
++	 * redraws below, and a sticky header was drawn one step of the
++	 * scroll away from the top: Yamtrack's slid down the screen while
++	 * scrolling up and off it while scrolling down (VitaSurf).
++	 */
++	bwidget->panx = 0;
++	bwidget->pany = 0;
+ #ifdef __vita__
+ 	fb_pan_moves++;
+ 	fb_pan_move_us += vita_now_us() - move_t0;

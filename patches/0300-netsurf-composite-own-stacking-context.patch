@@ -1,0 +1,60 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 44ddcc340..733c22415 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -4254,19 +4254,52 @@ struct html_composite_boxes {
+ 	bool whole;
+ };
+ 
++static bool html_z_flush(const html_content *html, struct html_z_list *l,
++		float scale);
++
+ static bool html_composite_boxes_draw(const struct redraw_context *ctx,
+ 		void *pw, int dx, int dy, int ox, int oy,
+ 		const struct rect *clip)
+ {
+ 	struct html_composite_boxes *b = pw;
++	struct html_z_list *z_outer = html_z_top, *zl = NULL;
++	bool ok;
+ 
+ 	(void) ox;
+ 	(void) oy;
++	/*
++	 * What is painted aside is a stacking context of its own
++	 * (VitaSurf). The positioned boxes inside it were set aside in the
++	 * list of the context around it, with this drawing's plotters and
++	 * its offset, and painted after the bitmap was made: onto the
++	 * screen, at the bitmap's own coordinates, in its top left corner.
++	 * A Bubble Card button, whose icon and name are all positioned
++	 * inside a pill with rounded corners, came out as the bare pill.
++	 */
++	if (html_z_depth < HTML_Z_DEPTH) {
++		zl = &html_z_stack[html_z_depth++];
++		zl->root = NULL;
++		zl->n = 0;
++		zl->seq = 0;
++		zl->n_neg = 0;
++		zl->neg_done = true;
++		zl->neg_x = b->x_parent - dx;
++		zl->neg_y = b->y_parent - dy;
++	}
++	html_z_top = zl;
+ 	if (b->whole)
+-		return html_redraw_box(b->html, b->box, b->x_parent - dx,
++		ok = html_redraw_box(b->html, b->box, b->x_parent - dx,
+ 				b->y_parent - dy, clip, b->scale, b->bg, ctx);
+-	return html_redraw_box_children(b->html, b->box, b->x_parent - dx,
+-			b->y_parent - dy, clip, b->scale, b->bg, ctx);
++	else
++		ok = html_redraw_box_children(b->html, b->box,
++				b->x_parent - dx, b->y_parent - dy, clip,
++				b->scale, b->bg, ctx);
++	if (zl != NULL) {
++		ok &= html_z_flush(b->html, zl, b->scale);
++		html_z_depth--;
++	}
++	html_z_top = z_outer;
++	return ok;
+ }
+ 
+ /** A clip-path radius in device pixels: a percentage of the basis, a

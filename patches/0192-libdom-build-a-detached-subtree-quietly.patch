@@ -1,0 +1,181 @@
+diff --git a/include/dom/core/document.h b/include/dom/core/document.h
+index de3e07a..6b22cbd 100644
+--- a/include/dom/core/document.h
++++ b/include/dom/core/document.h
+@@ -136,6 +136,14 @@ static inline dom_exception dom_document_get_doctype(struct dom_document *doc,
+ 	return ((dom_document_vtable *) ((dom_node *) doc)->vtable)->
+ 			dom_document_get_doctype(doc, result);
+ }
++/**
++ * Raise or lower the document's quiet count (VitaSurf). While it is
++ * raised, attaching a node marks it instead of dispatching mutation
++ * events; the embedder settles the marks when the subtree enters the
++ * document. Pair every +1 with a -1.
++ */
++void dom_document_quiet_mutations(struct dom_document *doc, int delta);
++
+ #define dom_document_get_doctype(d, r) dom_document_get_doctype( \
+ 		(dom_document *) (d), (struct dom_document_type **) (r))
+ 
+diff --git a/include/dom/core/node.h b/include/dom/core/node.h
+index 90026a1..8d63b5e 100644
+--- a/include/dom/core/node.h
++++ b/include/dom/core/node.h
+@@ -313,6 +313,13 @@ static inline dom_exception dom_node_get_attributes(struct dom_node *node,
+ 	return ((dom_node_vtable *) node->vtable)->dom_node_get_attributes(
+ 			(dom_node_internal *) node, result);
+ }
++/**
++ * Whether a node was attached while its document was quiet, and so
++ * still owes the embedder the notice its attach would have given
++ * (VitaSurf). Answers once: the mark is cleared as it is read.
++ */
++bool dom_node_take_quiet(struct dom_node *node);
++
+ #define dom_node_get_attributes(n, r) dom_node_get_attributes( \
+ 		(dom_node *) (n), (struct dom_namednodemap **) (r))
+ 
+diff --git a/src/core/document.c b/src/core/document.c
+index e8cbdd4..7671f6a 100644
+--- a/src/core/document.c
++++ b/src/core/document.c
+@@ -287,6 +287,7 @@ dom_exception _dom_document_initialise(dom_document *doc,
+ 	}
+ 
+ 	doc->dispatching_mutation = 0;
++	doc->quiet_mutations = 0;
+ 
+ 	/* We should not pass a NULL when all things hook up */
+ 	return _dom_document_event_internal_initialise(&doc->dei, daf, daf_ctx);
+@@ -1555,3 +1556,14 @@ dom_exception _dom_document_set_quirks_mode(dom_document *doc,
+ 	doc->quirks = quirks;
+ 	return DOM_NO_ERR;
+ }
++
++/* exported: see include/dom/core/document.h */
++void dom_document_quiet_mutations(struct dom_document *doc, int delta)
++{
++	if (doc == NULL)
++		return;
++	if (delta < 0 && doc->quiet_mutations < (uint32_t) -delta)
++		doc->quiet_mutations = 0;
++	else
++		doc->quiet_mutations += delta;
++}
+diff --git a/src/core/document.h b/src/core/document.h
+index 97dedec..ea0f3ed 100644
+--- a/src/core/document.h
++++ b/src/core/document.h
+@@ -72,6 +72,22 @@ struct dom_document {
+ 	dom_string *_memo_domsubtreemodified; /**< DOMSubtreeModified */
+ 
+ 	uint32_t dispatching_mutation; /**< Mutation event semaphore */
++
++	/*
++	 * While this is raised, attaching a node marks it quiet instead
++	 * of dispatching DOMNodeInserted and DOMSubtreeModified (VitaSurf).
++	 *
++	 * A deep clone appends every node of the copy one at a time, and
++	 * each append built two mutation events, ran them through the
++	 * whole capture and bubble path and into the embedder's default
++	 * action -- for a subtree nothing can observe, because it is not
++	 * in the document yet. A GitHub page clones a template of 1818
++	 * elements that way and it took 893 ms, half a millisecond a
++	 * node. The embedder is told about the nodes it was not told
++	 * about when the subtree does enter the document, through the
++	 * quiet flag on each of them.
++	 */
++	uint32_t quiet_mutations;
+ };
+ 
+ /* Create a DOM document */
+diff --git a/src/core/node.c b/src/core/node.c
+index 33ef6f3..80ed41f 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -1096,6 +1096,16 @@ dom_exception _dom_node_has_child_nodes(dom_node_internal *node, bool *result)
+  * of clone. Special clones like Attr/EntitiReference stated above should 
+  * provide their overload of this interface in their implementation file. 
+  */
++/* exported: see include/dom/core/node.h */
++bool dom_node_take_quiet(struct dom_node *node)
++{
++	dom_node_internal *n = (dom_node_internal *) node;
++	bool was = n->quiet;
++
++	n->quiet = false;
++	return was;
++}
++
+ dom_exception _dom_node_clone_node(dom_node_internal *node, bool deep,
+ 		dom_node_internal **result)
+ {
+@@ -1116,17 +1126,22 @@ dom_exception _dom_node_clone_node(dom_node_internal *node, bool deep,
+ 	}
+ 
+ 	if (deep) {
++		/* the copy is not in the document, so nothing can hear
++		 * the events its appends would raise (VitaSurf) */
++		node->owner->quiet_mutations++;
+ 		child = node->first_child;
+ 		while (child != NULL) {
+ 			dom_node_internal *cc, *r;
+ 			err = dom_node_clone_node(child, deep, (void *) &cc);
+ 			if (err != DOM_NO_ERR) {
++				node->owner->quiet_mutations--;
+ 				dom_node_unref(n);
+ 				return err;
+ 			}
+ 
+ 			err = dom_node_append_child(n, cc, (void *) &r);
+ 			if (err != DOM_NO_ERR) {
++				node->owner->quiet_mutations--;
+ 				dom_node_unref(cc);
+ 				dom_node_unref(n);
+ 				return err;
+@@ -1138,6 +1153,7 @@ dom_exception _dom_node_clone_node(dom_node_internal *node, bool deep,
+ 			dom_node_unref(cc);
+ 			child = child->next;
+ 		}
++		node->owner->quiet_mutations--;
+ 	}
+ 
+ 	*result = n;
+@@ -2145,6 +2161,19 @@ dom_exception _dom_node_attach_range(dom_node_internal *first,
+ 	else
+ 		parent->last_child = last;
+ 
++	/*
++	 * Owed rather than dispatched while the document is quiet
++	 * (VitaSurf): the node is marked, and the embedder collects the
++	 * marks when the subtree enters the document.
++	 */
++	if (parent->owner != NULL && parent->owner->quiet_mutations > 0) {
++		for (n = first; n != last->next; n = n->next) {
++			n->parent = parent;
++			n->quiet = true;
++		}
++		return DOM_NO_ERR;
++	}
++
+ 	for (n = first; n != last->next; n = n->next) {
+ 		n->parent = parent;
+ 		/* Dispatch a DOMNodeInserted event */
+diff --git a/src/core/node.h b/src/core/node.h
+index 2ebf01d..91f0ec1 100644
+--- a/src/core/node.h
++++ b/src/core/node.h
+@@ -76,6 +76,13 @@ struct dom_node_internal {
+ 	struct list_entry pending_list; /**< The document delete pending list */
+ 
+ 	dom_event_target_internal eti;	/**< The EventTarget interface */
++
++	/*
++	 * Attached while the owner was quiet, so the DOMNodeInserted the
++	 * attach would have dispatched is still owed (VitaSurf). See
++	 * quiet_mutations on the document.
++	 */
++	bool quiet;
+ };
+ 
+ dom_node_internal * _dom_node_create(void);

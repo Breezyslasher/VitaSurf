@@ -1,0 +1,49 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 4ef08ff04..edc3effed 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -604,6 +604,29 @@ css_error named_ancestor_node(void *pw, void *node,
+ css_error named_parent_node(void *pw, void *node,
+ 		const css_qname *qname, void **parent)
+ {
++	dom_string *name = NULL;
++
++	/*
++	 * A slot's parent is its shadow root, which no selector names, so
++	 * "host > *" from outside never reaches it (VitaSurf). Here the
++	 * shadow tree is the host's own children, and Home Assistant's
++	 * hui-view-container>*{display:flex;flex:100%} made the slot in it
++	 * a flex item as wide as the view, in place of display: contents.
++	 * The shadow's own rules are scoped as "host descendant", which
++	 * still reaches it.
++	 */
++	*parent = NULL;
++	if (dom_node_get_node_name(node, &name) == DOM_NO_ERR &&
++			name != NULL) {
++		bool slot = dom_string_byte_length(name) == 4 &&
++				strncasecmp(dom_string_data(name), "slot",
++						4) == 0;
++
++		dom_string_unref(name);
++		if (slot)
++			return CSS_OK;
++	}
++
+ 	dom_element_named_parent_node(node, qname->name,
+ 			(struct dom_element **)parent);
+ 	dom_node_unref(*parent);
+diff --git a/resources/default.css b/resources/default.css
+index d15b10b3e..836c276d7 100644
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -169,6 +169,10 @@ mark {
+ dialog:not([open]) { display: none; }
+ datalist { display: none; }
+ input[type=hidden] { display: none; }
++/* a slot is where its assigned nodes go, with no box of its own, as in
++ * HTML's own rendering rules (VitaSurf): Home Assistant's view sat
++ * inside a slot box that stretched and grew in its place */
++slot { display: contents; }
+ 
+ /* The dir attribute sets the direction (VitaSurf); "auto" is left to
+  * inherit, as nothing here looks at the text to decide. */

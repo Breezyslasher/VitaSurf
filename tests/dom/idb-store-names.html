@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- objectStoreNames and indexNames are DOMStringLists: contains() and
+     item() as well as length and indexing. The usual upgrade check,
+     db.objectStoreNames.contains(name), threw "not a function" here. -->
+<html><body><script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.body.appendChild(d);}
+var name = "vs-names-" + Date.now();
+var req = indexedDB.open(name, 1);
+req.onupgradeneeded = function(){
+ var db = req.result;
+ ok("contains() before creating", db.objectStoreNames.contains("things") === false);
+ var st = db.createObjectStore("things", { keyPath: "id" });
+ st.createIndex("byName", "name");
+ ok("contains() after creating", db.objectStoreNames.contains("things") === true);
+ ok("indexNames.contains()", st.indexNames.contains("byName") === true && st.indexNames.contains("nope") === false);
+};
+req.onsuccess = function(){
+ var db = req.result;
+ ok("contains() on open", db.objectStoreNames.contains("things"));
+ ok("item(0)", db.objectStoreNames.item(0) === "things");
+ ok("item() past the end is null", db.objectStoreNames.item(5) === null);
+ ok("length and index", db.objectStoreNames.length === 1 && db.objectStoreNames[0] === "things");
+ var tx = db.transaction("things", "readonly");
+ ok("transaction objectStoreNames.contains()", tx.objectStoreNames.contains("things"));
+ db.close();
+ indexedDB.deleteDatabase(name);
+};
+req.onerror = function(){ ok("open", false); };
+</script></body></html>

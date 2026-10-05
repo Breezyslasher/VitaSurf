@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!-- subgrid: an item that spans three columns of its parent and lays
+     its own children on those columns (100px, 50px, 150px, gap 10px), so
+     they line up with the parent's; and cards of two rows each whose
+     rows are the parent's, so the second row starts at the same place
+     in both, below the taller first row. Each XX line gives a position and PASS when it is the
+     browser's. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; }
+#g { display: grid; grid-template-columns: 100px 50px 150px; gap: 10px; }
+#sub { grid-column: 1 / 4; display: grid; grid-template-columns: subgrid; }
+#sub div, #top div { height: 10px; }
+#rows { display: grid; grid-template-columns: 100px 100px; grid-template-rows: auto auto; column-gap: 10px; margin-top: 20px; }
+.card { grid-row: span 2; display: grid; grid-template-rows: subgrid; row-gap: 0; }
+.t1 { height: 30px; } .t2 { height: 50px; } .b { height: 10px; }
+</style></head><body>
+<div id="g">
+ <div id="top"><div></div></div><div></div><div></div>
+ <div id="sub"><div id="s1"></div><div id="s2"></div><div id="s3"></div></div>
+</div>
+<div id="rows">
+ <div class="card"><div class="t1"></div><div class="b" id="b1"></div></div>
+ <div class="card"><div class="t2"></div><div class="b" id="b2"></div></div>
+</div>
+<script>
+function R(id) { return document.getElementById(id).getBoundingClientRect(); }
+window.addEventListener('load', function () { setTimeout(function () {
+  [['s1', 'left', 0], ['s2', 'left', 110], ['s3', 'left', 170], ['s3', 'width', 150]].forEach(function (k) {
+    var v = Math.round(R(k[0])[k[1]]);
+    console.log('XX ' + k[0] + ' ' + k[1] + ' ' + v + (v === k[2] ? ' PASS' : ' FAIL (want ' + k[2] + ')'));
+  });
+  var a = Math.round(R('b1').top), b = Math.round(R('b2').top);
+  console.log('XX second rows at ' + a + ' and ' + b + (a === 100 && b === 100 ? ' PASS' : ' FAIL (want 100)'));
+}, 200); });
+</script></body></html>

@@ -1,0 +1,48 @@
+diff --git a/src/select/select.c b/src/select/select.c
+index 7f2fd3b..79f48c8 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -2444,6 +2444,14 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	const css_selector **id_selectors = &empty_selector;
+ 	css_selector_hash_iterator id_iterator;
+ 	const css_selector ***class_selectors = NULL;
++	/*
++	 * Room for the class chains without a heap allocation (VitaSurf).
++	 * This runs once per element per sheet -- 2,565,620 times on a
++	 * GitHub load -- and a malloc and free cost about 1.3 us of the
++	 * 5.95 us a visit takes on the device. A node with more classes
++	 * than this still gets the heap.
++	 */
++	const css_selector **class_room[16];
+ 	css_selector_hash_iterator class_iterator;
+ 	const css_selector **univ_selectors = &empty_selector;
+ 	css_selector_hash_iterator univ_iterator;
+@@ -2476,10 +2484,15 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 
+ 	if (state->classes != NULL && n_classes > 0) {
+ 		/* Find hash chains for node classes */
+-		class_selectors = malloc(n_classes * sizeof(css_selector **));
+-		if (class_selectors == NULL) {
+-			error = CSS_NOMEM;
+-			goto cleanup;
++		if (n_classes <= sizeof(class_room) / sizeof(class_room[0])) {
++			class_selectors = class_room;
++		} else {
++			class_selectors = malloc(
++					n_classes * sizeof(css_selector **));
++			if (class_selectors == NULL) {
++				error = CSS_NOMEM;
++				goto cleanup;
++			}
+ 		}
+ 
+ 		for (i = 0; i < n_classes; i++) {
+@@ -2620,7 +2633,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 
+ 	error = CSS_OK;
+ cleanup:
+-	if (class_selectors != NULL)
++	if (class_selectors != NULL && class_selectors != class_room)
+ 		free(class_selectors);
+ 
+ 	return error;

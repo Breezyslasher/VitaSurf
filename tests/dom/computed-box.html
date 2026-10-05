@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!-- getComputedStyle reports the margins, padding and border widths
+     layout used, from a stylesheet, from auto margins, and for a border
+     whose style is none. Expected console output: lines ending in
+     "PASS". -->
+<html><head><style>
+body { margin: 0; }
+#a { margin: 5px 10px; padding: 1px 2px 3px 4px; border: 3px solid black; border-left-width: 7px; }
+#b { width: 200px; margin: 0 auto; border-width: 6px; }
+</style></head><body>
+<div id=a>a</div><div id=wrap style="width:600px"><div id=b>b</div></div>
+<script>
+setTimeout(function () {
+  function t(label, got, want) {
+    console.log((got === want ? 'PASS ' : 'FAIL ') + label + ' (' + got + ')'); }
+  var a = getComputedStyle(document.getElementById('a'));
+  var b = getComputedStyle(document.getElementById('b'));
+  t('marginTop', a.marginTop, '5px');
+  t('marginLeft', a.marginLeft, '10px');
+  t('margin shorthand', a.margin, '5px 10px');
+  t('paddingLeft', a.paddingLeft, '4px');
+  t('padding shorthand', a.padding, '1px 2px 3px 4px');
+  t('borderLeftWidth', a.borderLeftWidth, '7px');
+  t('borderTopWidth', a.getPropertyValue('border-top-width'), '3px');
+  t('an auto margin reports what layout used', b.marginLeft, '200px');
+  t('a border with no style is 0px wide', b.borderTopWidth, '0px');
+}, 500);
+</script></body></html>

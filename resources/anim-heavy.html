@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Animation test: heavy</title>
+<meta name="viewport" content="width=device-width">
+<style>
+body { font: 16px sans-serif; margin: 20px; background: #fff; color: #222; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .3; transform: scale(.85); } }
+@keyframes hue { 0% { color: rgb(220, 30, 30); } 33% { color: rgb(30, 160, 30); }
+  66% { color: rgb(30, 60, 220); } 100% { color: rgb(220, 30, 30); } }
+.spinner { display: inline-block; width: 28px; height: 28px; margin: 6px;
+  border: 4px solid #ddd; border-top-color: #e8711a; border-radius: 50%;
+  animation: spin 1s linear infinite; }
+.pulse { display: inline-block; width: 60px; padding: 10px 0; margin: 6px;
+  text-align: center; background: #1a73e8; color: #fff;
+  animation: pulse 1.6s ease-in-out infinite; }
+.c { font-weight: bold; animation: hue 3s linear infinite; }
+</style></head><body>
+<h1>Animation test: heavy</h1>
+<p>24 spinners, 8 pulsing boxes (opacity and scale) and 8 words changing
+colour: 40 elements moving at once, all repainting only. Compare the
+"anim:" lines in the log with the light test.</p>
+<div><div class="spinner" style="animation-duration:0.60s"></div><div class="spinner" style="animation-duration:0.65s"></div><div class="spinner" style="animation-duration:0.70s"></div><div class="spinner" style="animation-duration:0.75s"></div><div class="spinner" style="animation-duration:0.80s"></div><div class="spinner" style="animation-duration:0.85s"></div><div class="spinner" style="animation-duration:0.90s"></div><div class="spinner" style="animation-duration:0.95s"></div><div class="spinner" style="animation-duration:1.00s"></div><div class="spinner" style="animation-duration:1.05s"></div><div class="spinner" style="animation-duration:1.10s"></div><div class="spinner" style="animation-duration:1.15s"></div><div class="spinner" style="animation-duration:1.20s"></div><div class="spinner" style="animation-duration:1.25s"></div><div class="spinner" style="animation-duration:1.30s"></div><div class="spinner" style="animation-duration:1.35s"></div><div class="spinner" style="animation-duration:1.40s"></div><div class="spinner" style="animation-duration:1.45s"></div><div class="spinner" style="animation-duration:1.50s"></div><div class="spinner" style="animation-duration:1.55s"></div><div class="spinner" style="animation-duration:1.60s"></div><div class="spinner" style="animation-duration:1.65s"></div><div class="spinner" style="animation-duration:1.70s"></div><div class="spinner" style="animation-duration:1.75s"></div></div>
+<div><div class="pulse" style="animation-delay:-0.0s">1</div><div class="pulse" style="animation-delay:-0.2s">2</div><div class="pulse" style="animation-delay:-0.4s">3</div><div class="pulse" style="animation-delay:-0.6s">4</div><div class="pulse" style="animation-delay:-0.8s">5</div><div class="pulse" style="animation-delay:-1.0s">6</div><div class="pulse" style="animation-delay:-1.2s">7</div><div class="pulse" style="animation-delay:-1.4s">8</div></div>
+<p><span class="c" style="animation-delay:-0.0s">colour</span> <span class="c" style="animation-delay:-0.3s">colour</span> <span class="c" style="animation-delay:-0.6s">colour</span> <span class="c" style="animation-delay:-0.9s">colour</span> <span class="c" style="animation-delay:-1.2s">colour</span> <span class="c" style="animation-delay:-1.5s">colour</span> <span class="c" style="animation-delay:-1.8s">colour</span> <span class="c" style="animation-delay:-2.1s">colour</span> </p>
+<p><a href="file:///resources/anim-light.html">Light test</a> |
+<a href="file:///resources/anim-layout.html">Layout test</a></p>
+</body></html>

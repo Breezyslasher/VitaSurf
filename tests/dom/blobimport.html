@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- Modules from object URLs and data: URLs, which nothing fetches.
+     claude.ai imports a blob: module, and a modulepreload of one left a
+     script entry with no handle that build 475 crashed reading.
+     Expected console output: six lines ending in "ok". -->
+<html><head></head><body>
+<script>
+var src = "export const answer = 42; export default 'blob';";
+var u = URL.createObjectURL(new Blob([src], {type: "text/javascript"}));
+var link = document.createElement("link");
+link.rel = "modulepreload";
+link.href = u;
+document.head.appendChild(link);
+import(u).then(function(m){ console.log("blob module:", m.answer===42 && m.default==="blob" ? "ok" : "FAIL"); }, function(e){ console.log("blob module: FAIL", String(e)); });
+import(u).then(function(m){ console.log("same blob twice:", m.answer===42 ? "ok" : "FAIL"); }, function(e){ console.log("same blob twice: FAIL", String(e)); });
+import("data:text/javascript,export%20const%20x%20%3D%207%3B").then(function(m){ console.log("data module:", m.x===7 ? "ok" : "FAIL"); }, function(e){ console.log("data module: FAIL", String(e)); });
+import("data:text/javascript;base64," + btoa("export const y = 'b64';")).then(function(m){ console.log("base64 data module:", m.y==="b64" ? "ok" : "FAIL"); }, function(e){ console.log("base64 data module: FAIL", String(e)); });
+var gone = URL.createObjectURL(new Blob(["export const z = 1;"]));
+URL.revokeObjectURL(gone);
+import(gone).then(function(){ console.log("revoked blob: FAIL resolved"); }, function(e){ console.log("revoked blob:", e instanceof Error ? "ok" : "FAIL"); });
+var wsrc = "self.onmessage = function(e){ self.postMessage(e.data * 2); };";
+var w = new Worker(URL.createObjectURL(new Blob([wsrc])), {type: "module"});
+w.onmessage = function(e){ console.log("blob module worker:", e.data===42 ? "ok" : "FAIL " + e.data); w.terminate(); };
+w.onerror = function(e){ console.log("blob module worker: FAIL", e.message); };
+w.postMessage(21);
+</script></body></html>

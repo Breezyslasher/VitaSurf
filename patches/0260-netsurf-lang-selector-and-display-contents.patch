@@ -1,0 +1,139 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 1af2c1b8c..fcf312ed7 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -1988,9 +1988,48 @@ css_error node_is_target(void *pw, void *node, bool *match)
+ css_error node_is_lang(void *pw, void *node,
+ 		lwc_string *lang, bool *match)
+ {
+-	/** \todo Support languages */
++	/*
++	 * The language is the nearest lang attribute on the element or
++	 * above it; :lang(en) matches "en" and "en-US" alike (VitaSurf).
++	 * Home Assistant keeps its sidebar off the dashboard with a rule
++	 * that asks whether the page is in a right-to-left language.
++	 */
++	dom_node *n = node, *parent;
++	dom_string *value = NULL;
++	dom_exception err;
++	const char *want = lwc_string_data(lang);
++	size_t wl = lwc_string_length(lang);
++	unsigned depth = 0;
+ 
++	(void)pw;
+ 	*match = false;
++	dom_node_ref(n);
++	while (n != NULL && depth++ < 256) {
++		dom_node_type type;
++
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
++		    type != DOM_ELEMENT_NODE) {
++			break;
++		}
++		err = dom_element_get_attribute(n, corestring_dom_lang, &value);
++		if (err == DOM_NO_ERR && value != NULL) {
++			const char *v = dom_string_data(value);
++			size_t vl = dom_string_byte_length(value);
++
++			*match = (vl >= wl && strncasecmp(v, want, wl) == 0 &&
++				  (vl == wl || v[wl] == '-'));
++			dom_string_unref(value);
++			break;
++		}
++		if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR) {
++			parent = NULL;
++		}
++		dom_node_unref(n);
++		n = parent;
++	}
++	if (n != NULL) {
++		dom_node_unref(n);
++	}
+ 
+ 	return CSS_OK;
+ }
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index 9988503bd..f5387f3f4 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -111,8 +111,11 @@ typedef enum {
+ 				   * painted with an ellipsis (VitaSurf) */
+ 	OVERFLOW_VIEWPORT = 1 << 14, /* overflow propagates to the viewport, so
+ 				      * the box itself is visible (VitaSurf) */
+-	FIRST_LINE = 1 << 16	/* text on its block's first line, set in
++	FIRST_LINE = 1 << 16,	/* text on its block's first line, set in
+ 				 * first_line_style (VitaSurf) */
++	DISPLAY_CONTENTS = 1 << 17 /* display: contents; the box is kept for
++				    * its style and is not in the tree
++				    * (VitaSurf) */
+ } box_flags;
+ 
+ 
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index c07b32d27..49e4107f3 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -117,6 +117,7 @@ static const box_type box_map[] = {
+ 	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_FLEX */
+ 	BOX_FLEX,            /* CSS_DISPLAY_GRID (VitaSurf: grid layout) */
+ 	BOX_INLINE_FLEX,     /* CSS_DISPLAY_INLINE_GRID */
++	BOX_INLINE,          /* CSS_DISPLAY_CONTENTS (VitaSurf) */
+ };
+ 
+ 
+@@ -1049,6 +1050,32 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 		}
+ 	}
+ 
++	/*
++	 * display: contents (CSS Display 3): the element generates no box
++	 * and its children are laid out as its parent's. A box is still
++	 * made and tied to the node, for the style its children inherit,
++	 * but it is not put in the tree. Being inline, the search for a
++	 * containing block passes over it, so its children land in its
++	 * parent's block, and are flex items when that is a flex
++	 * container. Bubble Card, the most used Home Assistant card from
++	 * HACS, lays out its icon, name and state this way (VitaSurf).
++	 */
++	if (css_display == CSS_DISPLAY_CONTENTS && !props.node_is_root &&
++			props.containing_block != NULL &&
++			(box->flags & IS_REPLACED) == 0) {
++		box->type = BOX_INLINE;
++		box->flags |= DISPLAY_CONTENTS;
++		if (*convert_children)
++			box->flags |= CONVERT_CHILDREN;
++		err = dom_node_set_user_data(ctx->n,
++				corestring_dom___ns_key_box_node_data, box,
++				NULL, (void *) &old_box);
++		if (err != DOM_NO_ERR)
++			return false;
++		box->node = dom_node_ref(ctx->n);
++		return true;
++	}
++
+ 	nsu_getmonotonic_ms(&vs_sp0);
+ 	if (convert_special_elements(ctx->n,
+ 				     ctx->content,
+@@ -1236,6 +1263,10 @@ static void box_construct_element_after(dom_node *n, html_content *content)
+ 
+ 	assert(box != NULL);
+ 
++	/* display: contents has no box of its own to end (VitaSurf) */
++	if (box->flags & DISPLAY_CONTENTS)
++		return;
++
+ 	box_extract_properties(content, n, &props);
+ 
+ 	if (box->type == BOX_INLINE || box->type == BOX_BR) {
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index 15e9e14b5..07e29c619 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -266,6 +266,7 @@ CORESTRING_DOM_STRING(keydown);
+ CORESTRING_DOM_STRING(keypress);
+ CORESTRING_DOM_STRING(keyup);
+ CORESTRING_DOM_STRING(link);
++CORESTRING_DOM_STRING(lang);
+ CORESTRING_DOM_STRING(languagechange);
+ CORESTRING_DOM_STRING(load);
+ CORESTRING_DOM_STRING(loadeddata);

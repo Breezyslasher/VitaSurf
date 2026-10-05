@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!-- firstElementChild, lastElementChild, nextElementSibling and
+     previousElementSibling are stepped in C; they must skip text and
+     comments and agree with children. -->
+<html><head><title>element steps</title></head><body>
+<div id="p"> text <!-- c --> <b id="b1">1</b> mid <i id="i2">2</i><!-- end --> tail </div>
+<div id="empty"> only text </div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var p=document.getElementById('p'),b=document.getElementById('b1'),i=document.getElementById('i2');
+ok("firstElementChild skips text and comments", p.firstElementChild===b);
+ok("lastElementChild skips a trailing comment and text", p.lastElementChild===i);
+ok("nextElementSibling skips text", b.nextElementSibling===i);
+ok("previousElementSibling skips text", i.previousElementSibling===b);
+ok("the last element has no next", i.nextElementSibling===null);
+ok("the first element has no previous", b.previousElementSibling===null);
+ok("agrees with children", p.firstElementChild===p.children[0]&&p.lastElementChild===p.children[p.children.length-1]);
+var e=document.getElementById('empty');
+ok("no element children gives null", e.firstElementChild===null&&e.lastElementChild===null);
+ok("a text node has a next element sibling", p.firstChild.nextElementSibling===b);
+ok("a text node has no element children", p.firstChild.firstElementChild===undefined||p.firstChild.firstElementChild===null);
+var f=document.createDocumentFragment(),x=document.createElement('x'),y=document.createElement('y');
+f.appendChild(document.createTextNode('t'));f.appendChild(x);f.appendChild(y);
+ok("a fragment's first element child", f.firstElementChild===x);
+ok("a detached element's sibling", x.nextElementSibling===y&&y.previousElementSibling===x);
+ok("the document's first element child is html", document.firstElementChild===document.documentElement);
+ok("html's first element child is head", document.documentElement.firstElementChild===document.head);
+ok("head's next element sibling is body", document.head.nextElementSibling===document.body);
+ok("parentElement of an element", b.parentElement===p);
+ok("parentElement of html is null", document.documentElement.parentElement===null);
+ok("parentElement of a fragment child is null", x.parentElement===null);
+ok("parentElement of a text node", p.firstChild.parentElement===p);
+ok("parentElement of a detached element is null", document.createElement('q').parentElement===null);
+var n=0,el=document.body.firstElementChild;while(el){n++;el=el.nextElementSibling;}
+ok("walking body's elements counts children", n===document.body.children.length);
+</script></body></html>

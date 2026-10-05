@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<!-- ::marker and ::placeholder, checked in the plot output. The first
+     list's bullets are red (fg 0x0000ff in the plot's BGR); the second
+     list's markers are "->" from content; the third has content: none
+     and draws no number. The first field's placeholder is drawn in
+     green (0x008000), the second's, whose ::placeholder colour is half
+     transparent black, in grey (0x7f7f7f) over its white field, and the
+     third's, with no rule, halfway from its text to its field. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; }
+ul, ol { margin: 0 0 10px 40px; padding: 0; }
+#red li::marker { color: rgb(255, 0, 0); }
+#arrow li::marker { content: "->"; }
+#none li::marker { content: none; }
+input { display: block; width: 200px; background: #fff; color: #000; margin: 4px; }
+#g::placeholder { color: rgb(0, 128, 0); }
+#half::placeholder { color: rgba(0, 0, 0, 0.5); }
+</style></head><body>
+<ul id=red><li>red bullet</li></ul>
+<ul id=arrow><li>arrow</li></ul>
+<ol id=none><li>no number</li></ol>
+<input id=g placeholder="green">
+<input id=half placeholder="half">
+<input id=plain placeholder="plain">
+</body></html>

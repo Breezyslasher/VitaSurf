@@ -40,6 +40,7 @@
 #include <libnsfb_event.h>
 #include <libnsfb_plot.h>
 #include <libnsfb_plot_util.h>
+#include <libnsfb_cursor.h>
 
 #include <dom/dom.h>
 
@@ -59,6 +60,9 @@
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_inspect.h"
 #include "content/handlers/html/html_save.h"
+#include "content/handlers/html/html.h"
+#include "content/handlers/html/private.h"
+#include "utils/corestrings.h"
 #include "content/handlers/html/form_internal.h"
 #include "framebuffer/gui.h"
 #include "framebuffer/fbtk.h"
@@ -166,23 +170,27 @@ static bool target_visible(struct box *b, int x, int y, int w, int h)
 	}
 	for (a = b->parent; a != NULL; a = a->parent) {
 		int ax, ay, aw, ah;
+		uint8_t ox, oy;
+		bool cx, cy;
 
 		if (a->style == NULL) {
 			continue;
 		}
-		if (css_computed_overflow_x(a->style) != CSS_OVERFLOW_HIDDEN &&
-		    css_computed_overflow_y(a->style) != CSS_OVERFLOW_HIDDEN) {
+		/* clip cuts the content off as hidden does */
+		ox = css_computed_overflow_x(a->style);
+		oy = css_computed_overflow_y(a->style);
+		cx = ox == CSS_OVERFLOW_HIDDEN || ox == CSS_OVERFLOW_CLIP;
+		cy = oy == CSS_OVERFLOW_HIDDEN || oy == CSS_OVERFLOW_CLIP;
+		if (!cx && !cy) {
 			continue;
 		}
 		box_coords(a, &ax, &ay);
 		aw = a->padding[LEFT] + a->width + a->padding[RIGHT];
 		ah = a->padding[TOP] + a->height + a->padding[BOTTOM];
-		if (css_computed_overflow_x(a->style) == CSS_OVERFLOW_HIDDEN &&
-		    (x >= ax + aw || x + w <= ax)) {
+		if (cx && (x >= ax + aw || x + w <= ax)) {
 			return false;
 		}
-		if (css_computed_overflow_y(a->style) == CSS_OVERFLOW_HIDDEN &&
-		    (y >= ay + ah || y + h <= ay)) {
+		if (cy && (y >= ay + ah || y + h <= ay)) {
 			return false;
 		}
 	}
@@ -533,6 +541,10 @@ static void move_focus(enum direction dir)
 	}
 
 	set_focus_to(best, content);
+	/* the page's own focus styles follow the D-pad (VitaSurf) */
+	html_focus_at_point(hlcache_handle_get_content(content),
+			    (focus.r.x0 + focus.r.x1) / 2,
+			    (focus.r.y0 + focus.r.y1) / 2);
 	reveal_focus();
 	refresh_overlay();
 }
@@ -598,6 +610,95 @@ static void url_encode(const char *in, char *out, size_t outlen)
 	out[o] = '\0';
 }
 
+/*
+ * Whether a typed host is somewhere on this network rather than out on
+ * the internet (VitaSurf).
+ *
+ * It decides the scheme a bare host gets. Typing 198.18.2.1 for a box
+ * on the LAN used to become https://198.18.2.1, and a server that only
+ * listens on port 80 refuses that in twenty milliseconds: cURL code 7,
+ * an error page, and nothing to say the address was fine and the
+ * scheme was not. A private address is by definition not reachable
+ * from the internet, so there is nothing for a downgrade to attack,
+ * and http is what those servers almost always speak.
+ *
+ * The ranges are the private ones, loopback, link-local, the carrier
+ * range Tailscale hands out, and the benchmarking range a VPN's fake
+ * addresses come from. A name with no dot in it is a LAN name too, and
+ * so are the usual local suffixes.
+ */
+static bool host_is_local(const char *host, size_t len)
+{
+	static const char *suffix[] = {
+		".local", ".lan", ".home", ".internal", ".localdomain"
+	};
+	unsigned a, b, c, d;
+	char name[256];
+	size_t i;
+
+	if (len == 0 || len >= sizeof(name)) {
+		return false;
+	}
+	memcpy(name, host, len);
+	name[len] = '\0';
+
+	if (sscanf(name, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+			a < 256 && b < 256 && c < 256 && d < 256) {
+		if (a == 10 || a == 127) {
+			return true;
+		}
+		if (a == 172 && b >= 16 && b <= 31) {
+			return true;
+		}
+		if (a == 192 && b == 168) {
+			return true;
+		}
+		if (a == 169 && b == 254) {
+			return true;
+		}
+		if (a == 100 && b >= 64 && b <= 127) {
+			return true;
+		}
+		if (a == 198 && (b == 18 || b == 19)) {
+			return true;
+		}
+		return false;
+	}
+
+	if (strcasecmp(name, "localhost") == 0) {
+		return true;
+	}
+	if (strchr(name, '.') == NULL) {
+		return true;	/* a single-label name is a LAN name */
+	}
+	for (i = 0; i < sizeof(suffix) / sizeof(suffix[0]); i++) {
+		size_t sl = strlen(suffix[i]);
+
+		if (len > sl && strcasecmp(name + len - sl, suffix[i]) == 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/** The host part of what was typed: up to the first /, : or ? */
+static size_t host_length(const char *p)
+{
+	size_t n = 0;
+
+	while (p[n] != '\0' && p[n] != '/' && p[n] != ':' && p[n] != '?' &&
+			p[n] != '#') {
+		n++;
+	}
+
+	return n;
+}
+
+/** What the user last asked for, so an error page does not become the
+ * starting point for the next thing they type (VitaSurf). */
+static char last_typed[2048];
+
 /** Go to what the user typed: a URL, or a search if it does not look like one. */
 static void navigate_text(const char *text)
 {
@@ -628,7 +729,9 @@ static void navigate_text(const char *text)
 		url_encode(p, enc, sizeof(enc));
 		snprintf(buf, sizeof(buf), "%s%s", SEARCH_URL, enc);
 	} else {
-		snprintf(buf, sizeof(buf), "https://%s", p);
+		snprintf(buf, sizeof(buf), "%s%s",
+			 host_is_local(p, host_length(p)) ?
+				"http://" : "https://", p);
 	}
 	/* trailing spaces */
 	for (size_t n = strlen(buf); n > 0 && buf[n - 1] == ' '; n--) {
@@ -641,6 +744,7 @@ static void navigate_text(const char *text)
 		return;
 	}
 	vita_log("input: go to %s", buf);
+	snprintf(last_typed, sizeof(last_typed), "%s", buf);
 	drop_focus();
 	browser_window_navigate(the_gw->bw, url, NULL, BW_NAVIGATE_HISTORY,
 				NULL, NULL, NULL);
@@ -658,6 +762,17 @@ static void start_url_entry(void)
 		/* the bundled home page is not a useful starting point */
 		if (strncmp(initial, "file:", 5) == 0) {
 			initial = "";
+		}
+		/*
+		 * Nor is an error page: its address is about:query/...,
+		 * and offering that to the keyboard means the next thing
+		 * typed lands on the end of it. A log has someone reach
+		 * for a page on their own server and arrive at
+		 * "about:query/fetcherrorreg.php" three times running.
+		 * Offer what they last asked for instead (VitaSurf).
+		 */
+		if (strncmp(initial, "about:", 6) == 0) {
+			initial = last_typed;
 		}
 	}
 
@@ -895,6 +1010,98 @@ static const char *dump_box_type(box_type type)
 
 
 /**
+ * The element a box is for, as <name.class> (VitaSurf). The first class
+ * is what tells one card's boxes from another's in a page built of
+ * custom elements, where every name is a div.
+ */
+static void dump_box_name(struct box *box, char *what, size_t size)
+{
+	dom_string *name = NULL, *cls = NULL;
+	const char *c = "";
+	size_t cn = 0;
+
+	what[0] = '\0';
+	if (box->node == NULL ||
+	    dom_node_get_node_name(box->node, &name) != DOM_NO_ERR ||
+	    name == NULL) {
+		return;
+	}
+	if (dom_element_get_attribute(box->node, corestring_dom_class,
+				      &cls) == DOM_NO_ERR && cls != NULL) {
+		c = dom_string_data(cls);
+		cn = dom_string_byte_length(cls);
+		while (cn > 0 && c[0] == ' ') {
+			c++;
+			cn--;
+		}
+		cn = strcspn(c, " ") < cn ? strcspn(c, " ") : cn;
+		if (cn > 40) {
+			cn = 40;
+		}
+	}
+	snprintf(what, size, " <%.*s%s%.*s>",
+		 (int)dom_string_byte_length(name), dom_string_data(name),
+		 cn > 0 ? "." : "", (int)cn, c);
+	dom_string_unref(name);
+	if (cls != NULL) {
+		dom_string_unref(cls);
+	}
+}
+
+/** How a box is positioned, when it is not in the flow. */
+static const char *dump_box_position(struct box *box)
+{
+	if (box->style == NULL) {
+		return "";
+	}
+	switch (css_computed_position(box->style)) {
+	case CSS_POSITION_ABSOLUTE: return " absolute";
+	case CSS_POSITION_FIXED:    return " fixed";
+	case CSS_POSITION_RELATIVE: return " relative";
+	case CSS_POSITION_STICKY:   return " sticky";
+	default:                    return "";
+	}
+}
+
+
+/**
+ * What about a box changes how it is painted, when anything does
+ * (VitaSurf): an opacity below one, a filter, visibility: hidden, and the
+ * colour of its text. A box laid out in the right place and not seen on
+ * the screen is explained by one of these.
+ */
+static void dump_box_paint(struct box *box, char *out, size_t size)
+{
+	css_fixed op = 0;
+	css_color c = 0;
+	lwc_string *filter = NULL;
+	size_t n = 0;
+
+	out[0] = '\0';
+	if (box->style == NULL) {
+		return;
+	}
+	if (css_computed_opacity(box->style, &op) == CSS_OPACITY_SET &&
+	    op < INTTOFIX(1)) {
+		n += snprintf(out + n, size - n, " opacity %d%%",
+			      (int)(FIXTOFLT(op) * 100));
+	}
+	if (n < size && css_computed_filter(box->style, &filter) ==
+			CSS_FILTER_SET) {
+		n += snprintf(out + n, size - n, " filter");
+	}
+	if (n < size && css_computed_visibility(box->style) ==
+			CSS_VISIBILITY_HIDDEN) {
+		n += snprintf(out + n, size - n, " hidden");
+	}
+	if (n < size && box->text != NULL && box->length > 0 &&
+	    css_computed_color(box->style, &c) == CSS_COLOR_COLOR) {
+		snprintf(out + n, size - n, " colour %08x", (unsigned)c);
+	}
+}
+
+
+/**
  * Write one box and everything in it to the log (VitaSurf).
  *
  * A page that comes out wrong on the device cannot be opened in a
@@ -907,6 +1114,7 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 {
 	char what[96];
 	char text[41];
+	char paint[64];
 	struct box *child;
 	int x = 0, y = 0;
 	size_t n = 0;
@@ -916,18 +1124,7 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 	}
 	(*left)--;
 
-	what[0] = '\0';
-	if (box->node != NULL) {
-		dom_string *name = NULL;
-
-		if (dom_node_get_node_name(box->node, &name) == DOM_NO_ERR &&
-		    name != NULL) {
-			snprintf(what, sizeof(what), " <%.*s>",
-				 (int)dom_string_byte_length(name),
-				 dom_string_data(name));
-			dom_string_unref(name);
-		}
-	}
+	dump_box_name(box, what, sizeof(what));
 
 	text[0] = '\0';
 	if (box->text != NULL && box->length > 0) {
@@ -938,10 +1135,11 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 	}
 
 	box_coords(box, &x, &y);
-	vita_log("layout: %*s%s%s %dx%d at %d,%d%s%s",
+	dump_box_paint(box, paint, sizeof(paint));
+	vita_log("layout: %*s%s%s%s %dx%d at %d,%d%s%s%s",
 		 (int)(depth * 2), "", dump_box_type(box->type), what,
-		 box->width, box->height, x, y,
-		 n > 0 ? " " : "", text);
+		 dump_box_position(box), box->width, box->height, x, y,
+		 paint, n > 0 ? " " : "", text);
 
 	for (child = box->children; child != NULL; child = child->next) {
 		dump_box(child, depth + 1, left);
@@ -958,10 +1156,16 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
  */
 /*
  * The tally of Web APIs the page asked for that this build does not
- * have. It lives in the QuickJS bindings, which the duktape build does
- * not compile, so the symbol is weak and the call is skipped there.
+ * have. It lives in the QuickJS bindings, which a build without
+ * JavaScript does not compile, so the symbol is weak and the call is
+ * skipped there.
  */
 extern void vita_js_report_gaps(void) __attribute__((weak));
+/* the script profile, from the same place and weak for the same reason */
+extern void vita_js_report_profile(void) __attribute__((weak));
+extern void html_dynamic_report(void) __attribute__((weak));
+extern void html_memory_report(void) __attribute__((weak));
+extern void vita_js_scrolled(struct browser_window *bw) __attribute__((weak));
 
 /**
  * Write the fetches of the page now on screen to the log.
@@ -1001,6 +1205,9 @@ static void dump_timeline(void)
 }
 
 
+static void dump_under_pointer(struct gui_window *gw, html_content *html,
+			       struct box *root);
+
 static void dump_layout(struct gui_window *gw, bool force)
 {
 	struct hlcache_handle *h;
@@ -1030,6 +1237,74 @@ static void dump_layout(struct gui_window *gw, bool force)
 	dump_box(root, 0, &left);
 	vita_log("layout: end of the boxes%s",
 		 left == 0 ? " (there are more)" : "");
+	if (force) {
+		dump_under_pointer(gw,
+			(html_content *)hlcache_handle_get_content(h), root);
+	}
+}
+
+
+/**
+ * Log the boxes under the pointer (VitaSurf).
+ *
+ * The page dump stops after its first few hundred boxes, and on a
+ * dashboard the card that came out wrong is thousands of boxes in. So
+ * the dump from the menu also follows the pointer down to the deepest
+ * box under it, logging each box on the way, and then writes out the
+ * boxes around that one: point at the part that is wrong, then dump.
+ */
+static void dump_under_pointer(struct gui_window *gw, html_content *html,
+			       struct box *root)
+{
+	nsfb_bbox_t loc;
+	struct box *b = root, *deepest = root, *around;
+	int sx, sy, vw, vh, px, py, bx = 0, by = 0, x, y;
+	unsigned int depth = 0, left = 200, up;
+	float scale;
+	char what[96];
+	char paint[64];
+
+	if (!nsfb_cursor_loc_get(fbtk_get_nsfb(gw->browser), &loc)) {
+		return;
+	}
+	viewport(&sx, &sy, &vw, &vh);
+	scale = page_scale();
+	px = (int)((loc.x0 - fbtk_get_absx(gw->browser) + sx) / scale);
+	py = (int)((loc.y0 - fbtk_get_absy(gw->browser) + sy) / scale);
+	vita_log("layout: the boxes under the pointer at %d,%d on the page",
+		 px, py);
+	while ((b = box_at_point(&html->unit_len_ctx, b,
+				 px, py, &bx, &by)) != NULL) {
+		deepest = b;
+	}
+	/* the chain from the page down, outermost first */
+	for (b = deepest; b != NULL; b = b->parent) {
+		depth++;
+	}
+	while (depth > 0) {
+		unsigned int i;
+
+		b = deepest;
+		for (i = 1; i < depth; i++) {
+			b = b->parent;
+		}
+		box_coords(b, &x, &y);
+		dump_box_name(b, what, sizeof(what));
+		dump_box_paint(b, paint, sizeof(paint));
+		vita_log("layout: under %s%s%s %dx%d at %d,%d%s",
+			 dump_box_type(b->type), what, dump_box_position(b),
+			 b->width, b->height, x, y, paint);
+		depth--;
+	}
+	/* then what is around it: enough levels up to take in a card */
+	around = deepest;
+	for (up = 0; up < 8 && around->parent != NULL; up++) {
+		around = around->parent;
+	}
+	vita_log("layout: the boxes around it");
+	dump_box(around, 0, &left);
+	vita_log("layout: end of the boxes under the pointer%s",
+		 left == 0 ? " (there are more)" : "");
 }
 
 
@@ -1049,6 +1324,93 @@ void vita_input_dump_layout_now(void)
 }
 
 
+/*
+ * A page that builds itself after it has loaded (VitaSurf).
+ *
+ * The report fires when the document finishes, and on a page rendered
+ * by its own JavaScript that is before the page exists. Build 400
+ * reported a GitHub profile at 21545 ms over 711 elements, and then
+ * spent another forty-six seconds on it -- a callback of 21204 ms, one
+ * of 12577, and a layout declined at 3602 elements -- none of it in
+ * the report, and none of it comparable with build 398's 60533 ms over
+ * 6270 elements, which happened to finish inside the window.
+ *
+ * So keep watching. vita_input_settled() is called once a second from
+ * the frame loop with how busy the scheduler was; when a page has done
+ * real work since its report and has then been quiet for a few
+ * seconds, the report is written again with what it cost.
+ */
+static unsigned long long page_started_us;
+static bool settle_watching;
+static unsigned int settle_busy_ms;
+static unsigned int settle_quiet_ms;
+static unsigned int settle_reports;
+
+/** How much work after the report is worth reporting again. */
+#define SETTLE_BUSY_MS 500
+/** How long the scheduler must be quiet before the page has settled. */
+#define SETTLE_QUIET_MS 3000
+/** The most follow-up reports one page gets, so a busy page cannot
+ * fill the log with them. */
+#define SETTLE_REPORTS_MAX 6
+/** How much work without a quiet spell is reported anyway (VitaSurf).
+ * A Home Assistant dashboard worked for five minutes after it had
+ * loaded, never quiet for three seconds, and crashed with none of it in
+ * a report. */
+#define SETTLE_BUSY_REPORT_MS 60000
+
+void vita_input_settled(unsigned int sched_ms, unsigned int span_ms)
+{
+	if (settle_watching == false || the_gw == NULL) {
+		return;
+	}
+
+	/* a tenth of a second of scheduler in a second is work, not idle */
+	if (sched_ms > span_ms / 10) {
+		settle_busy_ms += sched_ms;
+		settle_quiet_ms = 0;
+		if (settle_busy_ms < SETTLE_BUSY_REPORT_MS) {
+			return;
+		}
+		vita_log("page: still working, %u ms of it since the last "
+			 "report without a quiet spell; the page so far:",
+			 settle_busy_ms);
+		settle_busy_ms = 0;
+		if (++settle_reports >= SETTLE_REPORTS_MAX) {
+			settle_watching = false;
+		}
+		vita_input_report_page(the_gw, page_started_us == 0 ? 0 :
+				(unsigned int)((sceKernelGetProcessTimeWide() -
+						page_started_us) / 1000));
+		return;
+	}
+
+	settle_quiet_ms += span_ms;
+	if (settle_quiet_ms < SETTLE_QUIET_MS) {
+		return;
+	}
+
+	settle_quiet_ms = 0;
+	if (settle_busy_ms < SETTLE_BUSY_MS) {
+		/* nothing happened worth another report; stop watching */
+		settle_watching = false;
+		return;
+	}
+
+	vita_log("page: and then %u ms more work after it had loaded, "
+		 "which the figures above do not include; what follows is "
+		 "the page as it settled", settle_busy_ms);
+	settle_busy_ms = 0;
+	if (++settle_reports >= SETTLE_REPORTS_MAX) {
+		settle_watching = false;
+	}
+	/* the counters have run since the page started, so the span they
+	 * are measured against is the whole of it */
+	vita_input_report_page(the_gw, page_started_us == 0 ? 0 :
+			(unsigned int)((sceKernelGetProcessTimeWide() -
+					page_started_us) / 1000));
+}
+
 void vita_input_load_finished(struct gui_window *gw)
 {
 	nsurl *url = NULL;
@@ -1058,11 +1420,32 @@ void vita_input_load_finished(struct gui_window *gw)
 		return;
 	}
 	ms = (unsigned int)((sceKernelGetProcessTimeWide() - load_started_us) / 1000);
+	page_started_us = load_started_us;
 	load_started_us = 0;
+	settle_watching = true;
+	settle_busy_ms = 0;
+	settle_quiet_ms = 0;
+	settle_reports = 0;
 	/* a LiveArea close never reaches gui_quit, so save as we go */
 	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
+		nsurl_unref(url);
+		url = NULL;
+	}
+	vita_input_report_page(gw, ms);
+}
+
+/* The figures for the page as it stands, written when it loads and
+ * again if it keeps working afterwards (VitaSurf). */
+void vita_input_report_page(struct gui_window *gw, unsigned int ms)
+{
+	nsurl *url = NULL;
+
+	if (gw == NULL) {
+		return;
+	}
+	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		dump_layout(gw, false);
 		{
 			/*
@@ -1092,6 +1475,11 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_html_parse, vitasurf_ms_css,
 				 vitasurf_ms_image, vitasurf_ms_boxes,
 				 vitasurf_ms_layout, vitasurf_ms_script);
+			vita_log("page: %u style sheets were parsed, %u KB, "
+				 "and %u were taken already parsed from the "
+				 "memory cache",
+				 vitasurf_css_parsed, vitasurf_css_parsed_kb,
+				 vitasurf_css_reused);
 			vita_log("page: script %u ms is %u ms in script "
 				 "elements (%u ms compiling or reading them, "
 				 "%u ms running them, %u ms after, of which "
@@ -1113,9 +1501,156 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_js_job_max,
 				 vitasurf_js_jobs_slow,
 				 vitasurf_ms_js_jobs_slow);
+			vita_log("page: the jobs themselves are %u ms of "
+				 "that, so %u ms is the drain loop around "
+				 "them",
+				 vitasurf_ms_js_jobs_sum,
+				 vitasurf_ms_js_jobs >
+					vitasurf_ms_js_jobs_sum ?
+					vitasurf_ms_js_jobs -
+						vitasurf_ms_js_jobs_sum : 0);
+			vita_log("page: the longest job asked the tree %u "
+				 "times, made %u tree edits, %u attribute "
+				 "sets, %u computed style reads and parsed "
+				 "%u bytes of HTML",
+				 vitasurf_job_max_finds,
+				 vitasurf_job_max_edits,
+				 vitasurf_job_max_attrs,
+				 vitasurf_job_max_styles,
+				 vitasurf_job_max_html);
+			vita_log("page: over the whole page that is %u tree "
+				 "edits, %u attribute sets, %u computed "
+				 "style reads and %u innerHTML sets of %u "
+				 "bytes",
+				 vitasurf_js_dom_edits,
+				 vitasurf_js_attr_sets,
+				 vitasurf_js_style_reads,
+				 vitasurf_js_html_sets,
+				 vitasurf_js_html_bytes);
+			vita_log("page: those innerHTML sets were %u ms "
+				 "parsing, %u ms emptying the target and "
+				 "%u ms moving the nodes in; setAttribute "
+				 "cost %u ms and the tree edits %u ms",
+				 vitasurf_ms_html_js_parse,
+				 vitasurf_ms_html_js_empty,
+				 vitasurf_ms_html_js_move,
+				 vitasurf_ms_js_attr_time,
+				 vitasurf_ms_js_edit_time);
+			vita_log("page: the longest timer was '%s' at %u ms; "
+				 "%u of the %u ran 50 ms or more and account "
+				 "for %u ms",
+				 vitasurf_js_timer_max_name[0] != '\0' ?
+					vitasurf_js_timer_max_name : "?",
+				 vitasurf_ms_js_timer_max,
+				 vitasurf_js_timers_slow, vitasurf_js_timers,
+				 vitasurf_ms_js_timers_slow);
+			vita_log("page: JavaScript was handed a node %u "
+				 "times, costing %u ms; %u were already "
+				 "wrapped, found after %u chain steps in all "
+				 "(%u a look-up)",
+				 vitasurf_js_node_wraps, vitasurf_ms_js_wrap,
+				 vitasurf_js_wrap_hits,
+				 vitasurf_js_wrap_steps,
+				 vitasurf_js_node_wraps ?
+					vitasurf_js_wrap_steps /
+						vitasurf_js_node_wraps : 0);
+			vita_log("page: it read an attribute %u times for "
+				 "%u ms; the longest job did %u of the "
+				 "wraps and %u of the reads",
+				 vitasurf_js_attr_gets,
+				 vitasurf_ms_js_attr_get_time,
+				 vitasurf_job_max_wraps,
+				 vitasurf_job_max_attr_gets);
+			vita_log("page: el.attributes was built %u times, "
+				 "%u attributes in all",
+				 vitasurf_js_attr_maps,
+				 vitasurf_js_attr_map_items);
+			vita_log("page: childNodes was rebuilt %u times for "
+				 "%u children in all (%u a list), costing "
+				 "%u ms; the siblings and parents were "
+				 "walked %u times for %u ms",
+				 vitasurf_js_childnodes,
+				 vitasurf_js_childnodes_items,
+				 vitasurf_js_childnodes ?
+					vitasurf_js_childnodes_items /
+						vitasurf_js_childnodes : 0,
+				 vitasurf_ms_js_childnodes,
+				 vitasurf_js_tree_reads,
+				 vitasurf_ms_js_tree_reads);
+			vita_log("page: the longest job did %u of those "
+				 "rebuilds and %u of those walks",
+				 vitasurf_job_max_childnodes,
+				 vitasurf_job_max_tree_reads);
+			vita_log("page: the bindings were entered %u times "
+				 "in all, %u of them in the longest job; it "
+				 "read textContent %u times for %u ms and "
+				 "cloned a node %u times for %u ms",
+				 vitasurf_js_binding_calls,
+				 vitasurf_job_max_bindings,
+				 vitasurf_js_text_reads,
+				 vitasurf_ms_js_text_reads,
+				 vitasurf_js_clones, vitasurf_ms_js_clones);
+			vita_log("page: the drain ran %u times, %u ms of it "
+				 "was the call that found nothing left, and "
+				 "%u jobs threw, costing %u ms",
+				 vitasurf_js_drains,
+				 vitasurf_ms_js_drain_tail,
+				 vitasurf_js_jobs_threw,
+				 vitasurf_ms_js_jobs_threw);
+			vita_log("page: the budget stopped %u more jobs, "
+				 "costing %u ms; the longest drain was %u "
+				 "ms over %u jobs",
+				 vitasurf_js_jobs_budget,
+				 vitasurf_ms_js_jobs_budget,
+				 vitasurf_ms_js_drain_max,
+				 vitasurf_js_drain_max_jobs);
 			vita_log("page: the page asked the tree for elements "
 				 "%u times, costing %u ms",
 				 vitasurf_js_finds, vitasurf_ms_js_finds);
+			vita_log("page: it used a selector %u times, parsing "
+				 "it %u of them and taking it from the cache "
+				 "the other %u",
+				 vitasurf_js_selector_compiles +
+					vitasurf_js_selector_hits,
+				 vitasurf_js_selector_compiles,
+				 vitasurf_js_selector_hits);
+			vita_log("page: by call, querySelectorAll %u, "
+				 "querySelector %u, matches %u, closest %u "
+				 "(%u of them a bare tag walked in C) over "
+				 "%u ancestors",
+				 vitasurf_js_sel_all, vitasurf_js_sel_one,
+				 vitasurf_js_sel_matches,
+				 vitasurf_js_sel_closest,
+				 vitasurf_js_sel_closest_native,
+				 vitasurf_js_sel_closest_steps);
+			vita_log("page: %u of those calls were a bare tag "
+				 "answered in C, visiting %u elements",
+				 vitasurf_js_sel_tag_fast,
+				 vitasurf_js_sel_tag_visits);
+			{
+				vita_log("page: through script, style sheet "
+					 "parses and box building, transfers "
+					 "were pumped %u times for %u ms, "
+					 "holding %u KB for later (%u KB at "
+					 "most at once) and pausing %u times "
+					 "for room; %u transfers ended there "
+					 "and gave their slots to queued "
+					 "fetches at once",
+					 vitasurf_curl_pumps,
+					 vitasurf_curl_pump_ms,
+					 vitasurf_curl_held_kb,
+					 vitasurf_curl_held_max_kb,
+					 vitasurf_curl_held_pauses,
+					 vitasurf_curl_pump_ended);
+			}
+			vita_log("page: %u bare tag queries were answered "
+				 "from the tag names under their element, "
+				 "gathered %u times over %u elements; %u "
+				 "selector strings were found by address",
+				 vitasurf_js_sel_tag_absent,
+				 vitasurf_js_sel_tag_sets,
+				 vitasurf_js_sel_tag_set_visits,
+				 vitasurf_js_sel_recent_hits);
 			vita_log("page: boxes and styles %u ms covered %u "
 				 "elements, %u ms of it selecting their "
 				 "styles and %u ms parsing the style "
@@ -1137,6 +1672,51 @@ void vita_input_load_finished(struct gui_window *gw)
 				extern unsigned int css_hash_in_class;
 				extern unsigned int css_hash_in_id;
 				extern unsigned int css_hash_in_universal;
+				extern unsigned int css_hash_uni_attribute;
+				extern unsigned int css_hash_uni_pseudo_class;
+				extern unsigned int
+					css_hash_uni_pseudo_element;
+				extern unsigned int css_hash_uni_plain;
+				extern unsigned int css_select_steps_element;
+				extern unsigned int css_select_steps_class;
+				extern unsigned int css_select_steps_id;
+				extern unsigned int css_select_steps_universal;
+				extern unsigned int css_select_steps_attr;
+				extern unsigned int css_select_sheets_empty;
+				extern unsigned int css_select_index_builds;
+				extern unsigned int css_select_index_entries;
+				extern unsigned int css_select_index_bytes;
+				extern unsigned int css_select_index_sheets;
+				extern unsigned int css_select_index_failed;
+				extern unsigned int css_custom_sets;
+				extern unsigned int css_custom_owns;
+				extern unsigned int css_custom_max_count;
+				extern unsigned int css_custom_gets;
+				extern unsigned int css_custom_get_steps;
+				extern unsigned int css_deferred_compiles;
+				extern unsigned int css_deferred_cache_hits;
+				extern unsigned int css_select_from_attr;
+				extern unsigned int css_hash_in_attr;
+				extern unsigned int css_hash_uni_unnamed;
+				extern unsigned int
+					css_select_cand_details_failed;
+				extern unsigned int
+					css_select_cand_comb_failed;
+				extern unsigned int css_select_cand_matched;
+				extern unsigned int
+					css_select_refused_by_attribute;
+				extern unsigned int
+					css_select_refused_by_pseudo_class;
+				extern unsigned int
+					css_select_refused_by_pseudo_element;
+				extern unsigned int
+					css_select_refused_by_other;
+				extern unsigned int css_select_pseudo_dynamic;
+				extern unsigned int css_select_pseudo_structural;
+				extern unsigned int css_select_pseudo_form;
+				extern unsigned int css_select_pseudo_has;
+				extern unsigned int css_select_pseudo_other;
+				extern unsigned int css_select_refused_negated;
 
 				vita_log("page: building those boxes was %u ms in "
 				 "the elements and %u ms in %u text nodes, "
@@ -1161,11 +1741,97 @@ void vita_input_load_finished(struct gui_window *gw)
 				 vitasurf_ms_image_max,
 				 vitasurf_image_kpixels);
 			vita_log("page: selection ran %u times, "
-					 "looked in %u sheets and considered "
+					 "looked in %u indexes, skipped %u more "
+					 "that held nothing, and considered "
 					 "%u selectors",
 					 css_select_calls,
 					 css_select_sheets_seen,
+					 css_select_sheets_empty,
 					 css_select_selectors_considered);
+			vita_log("page: the index was built %u times for "
+					 "%u ms in all, %u of them failing; the "
+					 "last holds %u rules from %u sheets in "
+					 "%u KB",
+					 vitasurf_css_index_builds,
+					 vitasurf_ms_css_index,
+					 css_select_index_failed,
+					 css_select_index_entries,
+					 css_select_index_sheets,
+					 css_select_index_bytes / 1024);
+			vita_log("page: %u imports compiled inside the "
+					 "loader, %u KB in %u ms, and %u read "
+					 "from the cache, %u KB in %u ms; %u "
+					 "module scripts were parsed as classic "
+					 "scripts first, %u KB, throwing away "
+					 "%u ms, and %u compiled as modules "
+					 "at once, their element saying so",
+					 vitasurf_js_import_compiles,
+					 vitasurf_js_import_kb,
+					 vitasurf_ms_js_import_compile,
+					 vitasurf_js_import_cache_hits,
+					 vitasurf_js_import_cached_kb,
+					 vitasurf_ms_js_import_cached,
+					 vitasurf_js_reparses,
+					 vitasurf_js_reparse_kb,
+					 vitasurf_ms_js_reparse,
+					 vitasurf_js_module_first);
+			{
+				extern unsigned int css_select_us_setup;
+				extern unsigned int css_select_us_match;
+				extern unsigned int css_select_us_deferred;
+				extern unsigned int css_select_us_finish;
+				extern unsigned int css_select_shared;
+				extern unsigned int css_select_share_candidates;
+				extern unsigned int css_select_share_tainted;
+				extern unsigned int css_select_share_position;
+				extern unsigned int css_select_share_class_attr;
+				extern unsigned int css_compose_cache_hits;
+				extern unsigned int css_compose_cache_misses;
+
+				vita_log("page: selecting, by phase: setting up "
+					 "%u ms, matching rules %u ms, held-over "
+					 "declarations %u ms, finishing the style "
+					 "%u ms; %u elements shared a sibling's "
+					 "style; composing with the parent %u ms",
+					 css_select_us_setup / 1000,
+					 css_select_us_match / 1000,
+					 css_select_us_deferred / 1000,
+					 css_select_us_finish / 1000,
+					 css_select_shared,
+					 vitasurf_us_compose / 1000);
+				vita_log("page: sharing looked at %u siblings; "
+					 "%u were tainted by a rule, %u answered "
+					 "a test of itself differently and %u "
+					 "had a different class attribute",
+					 css_select_share_candidates,
+					 css_select_share_tainted,
+					 css_select_share_position,
+					 css_select_share_class_attr);
+				vita_log("page: composing took %u styles from "
+					 "the ones kept and composed %u",
+					 css_compose_cache_hits,
+					 css_compose_cache_misses);
+			}
+			vita_log("page: %u mutations went to the page's "
+					 "observers and %u more were wanted by none "
+					 "and never reached JavaScript",
+					 vitasurf_js_mutations_told,
+					 vitasurf_js_mutations_skipped);
+			vita_log("page: %u KB of bytecode was serialised "
+					 "for the card in %u ms, to be written "
+					 "once script is quiet",
+					 vitasurf_js_bc_queued_kb,
+					 vitasurf_ms_js_bc_serialise);
+			vita_log("page: variables were set %u times on %u "
+					 "elements, the most on one being %u; "
+					 "var() looked one up %u times over %u "
+					 "steps, and %u declarations were "
+					 "compiled, %u of them from the cache",
+					 css_custom_sets, css_custom_owns,
+					 css_custom_max_count, css_custom_gets,
+					 css_custom_get_steps,
+					 css_deferred_compiles,
+					 css_deferred_cache_hits);
 				vita_log("page: those came from %u element, "
 					 "%u class, %u id and %u universal "
 					 "rules",
@@ -1178,6 +1844,113 @@ void vita_input_load_finished(struct gui_window *gw)
 					 "%u as universal",
 					 css_hash_in_element, css_hash_in_class,
 					 css_hash_in_id, css_hash_in_universal);
+				vita_log("page: finding them walked %u "
+					 "element, %u class, %u id and %u "
+					 "universal chain entries",
+					 css_select_steps_element,
+					 css_select_steps_class,
+					 css_select_steps_id,
+					 css_select_steps_universal);
+				vita_log("page: and %u entries in the %u "
+					 "rules filed by attribute, for %u "
+					 "candidates",
+					 css_select_steps_attr,
+					 css_hash_in_attr,
+					 css_select_from_attr);
+				vita_log("page: of the universal ones %u lead "
+					 "with an attribute, %u with a "
+					 "pseudo-class, %u with a "
+					 "pseudo-element and %u with nothing",
+					 css_hash_uni_attribute,
+					 css_hash_uni_pseudo_class,
+					 css_hash_uni_pseudo_element,
+					 css_hash_uni_plain);
+				{
+					/* and which pseudo-class they are,
+					 * since that decides what can be
+					 * done about them (VitaSurf) */
+					struct css_hash_uni_name {
+						struct lwc_string_s *name;
+						unsigned int count;
+					};
+					extern struct css_hash_uni_name
+						css_hash_uni_names[12];
+					unsigned int k;
+
+					for (k = 0; k < 12; k++) {
+						if (css_hash_uni_names[k].name
+								== NULL) {
+							break;
+						}
+						vita_log("page:   :%s filed "
+							 "%u times",
+							 lwc_string_data(
+							 css_hash_uni_names[k]
+								.name),
+							 css_hash_uni_names[k]
+								.count);
+					}
+					if (css_hash_uni_unnamed != 0) {
+						vita_log("page:   and %u "
+							 "more with other "
+							 "names",
+							 css_hash_uni_unnamed);
+					}
+				}
+				vita_log("page: of those candidates %u were "
+					 "refused on their own compound, %u "
+					 "walking their combinators, and %u "
+					 "matched",
+					 css_select_cand_details_failed,
+					 css_select_cand_comb_failed,
+					 css_select_cand_matched);
+				vita_log("page: the compound ones were "
+					 "refused by %u attribute, %u "
+					 "pseudo-class, %u pseudo-element and "
+					 "%u other details",
+					 css_select_refused_by_attribute,
+					 css_select_refused_by_pseudo_class,
+					 css_select_refused_by_pseudo_element,
+					 css_select_refused_by_other);
+				vita_log("page: the pseudo-class ones were "
+					 "%u dynamic, %u structural, %u form, "
+					 "%u :has and %u other; %u refusals "
+					 "of any kind were negated",
+					 css_select_pseudo_dynamic,
+					 css_select_pseudo_structural,
+					 css_select_pseudo_form,
+					 css_select_pseudo_has,
+					 css_select_pseudo_other,
+					 css_select_refused_negated);
+				{
+					/* name the "other" ones (VitaSurf) */
+					struct css_select_pseudo_name {
+						struct lwc_string_s *name;
+						unsigned int count;
+					};
+					extern struct css_select_pseudo_name
+						css_select_pseudo_names[8];
+					extern unsigned int
+						css_select_pseudo_unnamed;
+					unsigned k;
+
+					for (k = 0; k < 8; k++) {
+						const char *nm;
+
+						if (css_select_pseudo_names[k].name == NULL)
+							break;
+						nm = lwc_string_data(
+							css_select_pseudo_names[k].name);
+						vita_log("page:   :%s refused "
+							 "%u times", nm,
+							 css_select_pseudo_names[k].count);
+					}
+					if (css_select_pseudo_unnamed != 0)
+						vita_log("page:   and %u more "
+							 "with no room to "
+							 "name them",
+							 css_select_pseudo_unnamed);
+				}
 			}
 			vita_log("page: attribute selectors asked for a name "
 				 "%u times, interning it %u of them",
@@ -1218,6 +1991,31 @@ void vita_input_load_finished(struct gui_window *gw)
 		vita_log("page: images %u asked for, %u decoded, %u failed",
 			 vitasurf_images_asked, vitasurf_images_done,
 			 vitasurf_images_failed);
+		if (vitasurf_net_transfers > 0) {
+			vita_log("net: %u transfers, %u KB; %u new connections "
+				 "(%u ms connecting), %u TLS handshakes (%u ms "
+				 "in all, longest %u ms)",
+				 vitasurf_net_transfers, vitasurf_net_kb,
+				 vitasurf_net_connections,
+				 vitasurf_ms_net_connect,
+				 vitasurf_net_handshakes,
+				 vitasurf_ms_net_tls,
+				 vitasurf_ms_net_tls_max);
+			vita_log("net: waiting for the first byte %u ms in all "
+				 "(longest %u ms), receiving %u ms (longest "
+				 "%u ms); these overlap, so they are not "
+				 "shares of the load",
+				 vitasurf_ms_net_first_byte,
+				 vitasurf_ms_net_first_byte_max,
+				 vitasurf_ms_net_body,
+				 vitasurf_ms_net_body_max);
+		}
+		if (vitasurf_net_queued > 0) {
+			vita_log("net: %u fetches waited for a free slot in "
+				 "NetSurf's queue, %u ms in all, longest %u ms",
+				 vitasurf_net_queued, vitasurf_ms_net_queue,
+				 vitasurf_ms_net_queue_max);
+		}
 		{
 			struct hlcache_size_report r;
 
@@ -1231,6 +2029,15 @@ void vita_input_load_finished(struct gui_window *gw)
 				 r.other_bytes / 1024, r.other_count);
 			vita_log("cache: %u of those have no users, %u KB",
 				 r.unused_count, r.unused_bytes / 1024);
+		}
+		if (html_dynamic_report != NULL) {
+			html_dynamic_report();
+		}
+		if (html_memory_report != NULL) {
+			html_memory_report();
+		}
+		if (vita_js_report_profile != NULL) {
+			vita_js_report_profile();
 		}
 		nsurl_unref(url);
 	} else {
@@ -1266,29 +2073,32 @@ void vita_input_load_finished(struct gui_window *gw)
 }
 
 /*
- * After a suspend the network connections are gone. Stop the fetches that
- * were in flight so they fail now instead of waiting for a timeout, and
- * log the network state; Square reloads the page.
+ * After a suspend the network connections are gone. A page that was
+ * still loading cannot finish on them, so it is fetched again rather
+ * than left to time out; a page that had finished is left alone.
+ *
+ * This runs on every tick, not every half second: the resume event
+ * sits in the queue from the moment the application wakes, and a
+ * build 414 log shows a page the user loaded right after waking being
+ * stopped when the event was read 300 ms later, leaving nothing on
+ * screen. Read at once, the event can only ever find the loads that
+ * were under way before the suspend.
  */
 static void check_resume(void)
 {
-	static uint64_t last_poll_us;
-	uint64_t now = sceKernelGetProcessTimeWide();
-
-	if (now - last_poll_us < 500000) {
-		return;
-	}
-	last_poll_us = now;
 	if (!vita_platform_poll_resume()) {
 		return;
 	}
 	vita_log("resume: application resumed from suspend");
 	vita_net_log_state();
 	if (the_gw != NULL && the_gw->bw != NULL) {
-		browser_window_stop(the_gw->bw);
-		if (guit->window->set_status != NULL) {
-			guit->window->set_status(the_gw,
-				"Resumed: press Square to reload if the page did not finish");
+		if (browser_window_stop_available(the_gw->bw)) {
+			vita_log("resume: the page was still loading, "
+				 "fetching it again");
+			browser_window_reload(the_gw->bw, false);
+		} else {
+			vita_log("resume: the page had finished, left as it "
+				 "is");
 		}
 	}
 	vita_log_memory("resume");
@@ -1354,6 +2164,43 @@ static void tick(void *p)
 		want.x1 = want.x0;
 		want.y1 = want.y0;
 		guit->window->set_scroll(the_gw, &want);
+	}
+
+	/*
+	 * Tell the page's script it scrolled (VitaSurf): a scroll event at
+	 * most every 100 ms while the page moves, and one more when it has
+	 * settled, so a lazy loader sees where it stopped. Any way the page
+	 * moved counts -- stick, touch, focus, a script -- since this reads
+	 * the position rather than watching the inputs.
+	 */
+	if (vita_js_scrolled != NULL) {
+		static struct browser_window *last_bw;
+		static int last_sx = -1, last_sy = -1;
+		static uint64_t last_fire_us;
+		static bool unsent;
+		uint64_t now = sceKernelGetProcessTimeWide();
+		int sx, sy, vw, vh;
+
+		viewport(&sx, &sy, &vw, &vh);
+		if (the_gw->bw != last_bw) {
+			last_bw = the_gw->bw;
+			last_sx = sx;
+			last_sy = sy;
+			unsent = false;
+		} else if (sx != last_sx || sy != last_sy) {
+			last_sx = sx;
+			last_sy = sy;
+			unsent = true;
+			if (now - last_fire_us >= 100000) {
+				last_fire_us = now;
+				unsent = false;
+				vita_js_scrolled(the_gw->bw);
+			}
+		} else if (unsent && now - last_fire_us >= 100000) {
+			last_fire_us = now;
+			unsent = false;
+			vita_js_scrolled(the_gw->bw);
+		}
 	}
 
 	switch (vita_ime_poll(text, sizeof(text))) {

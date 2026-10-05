@@ -1,0 +1,74 @@
+diff --git a/content/fetchers/about/files.c b/content/fetchers/about/files.c
+index 5b432cc61..a68cc3b2f 100644
+--- a/content/fetchers/about/files.c
++++ b/content/fetchers/about/files.c
+@@ -615,11 +615,25 @@ static void files_folder(struct files_out *o, const char *dir)
+ 		entries[n].dir = false;
+ 		entries[n].file = false;
+ 		entries[n].size = 0;
++#ifdef __vita__
++		/*
++		 * The Vita's directory read gives each entry's status
++		 * already; a stat of every name in ux0:/ as well rebooted
++		 * the console (build 557), so none is made.
++		 */
++		(void)st;
++		entries[n].dir = (ent->d_stat.st_mode & SCE_S_IFMT) ==
++			SCE_S_IFDIR;
++		entries[n].file = (ent->d_stat.st_mode & SCE_S_IFMT) ==
++			SCE_S_IFREG;
++		entries[n].size = (off_t)ent->d_stat.st_size;
++#else
+ 		if (stat(path, &st) == 0) {
+ 			entries[n].dir = S_ISDIR(st.st_mode);
+ 			entries[n].file = S_ISREG(st.st_mode);
+ 			entries[n].size = st.st_size;
+ 		}
++#endif
+ 		free(path);
+ 		n++;
+ 	}
+@@ -739,7 +753,10 @@ bool fetch_about_files_handler(struct fetch_about_context *ctx)
+ 	path = query_value(fetch_about_get_url(ctx), "path");
+ 	if (path == NULL || path[0] == '\0') {
+ 		files_roots(o);
+-	} else if (stat(path, &st) == 0 && !S_ISDIR(st.st_mode)) {
++	} else if (path[strlen(path) - 1] != '/' &&
++		   stat(path, &st) == 0 && !S_ISDIR(st.st_mode)) {
++		/* a folder's link ends in a slash, and is not stat'ed: a
++		 * device root such as ux0:/ is read as a folder at once */
+ 		files_file(o, path, &st);
+ 	} else {
+ 		/* a folder's path ends in a slash */
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 272b03da9..c6026ec82 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1401,6 +1401,27 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 
+ 	box_extract_properties(ctx->content, ctx->n, &props);
+ 
++	/*
++	 * An element none of whose ancestors has a box to hold it (VitaSurf).
++	 * m.youtube.com reached this on a rebuild: the code below took the
++	 * containing block's type to blockify flex items and read through
++	 * NULL (build 557). The inline end of such an element was already
++	 * skipped (build 294); the element and what is under it are left
++	 * out now, as display: none would leave them.
++	 */
++	if (props.containing_block == NULL && !props.node_is_root) {
++		dom_string *name = NULL;
++
++		if (dom_node_get_node_name(ctx->n, &name) == DOM_NO_ERR &&
++				name != NULL) {
++			vita_log("box: <%s> with no containing block is "
++				 "left out", dom_string_data(name));
++			dom_string_unref(name);
++		}
++		*convert_children = false;
++		return true;
++	}
++
+ 	if (props.containing_block != NULL) {
+ 		/* In case the containing block is a pre block, we clear
+ 		 * the PRE_STRIP flag since it is not used if we follow

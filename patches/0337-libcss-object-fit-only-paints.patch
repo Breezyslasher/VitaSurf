@@ -1,0 +1,37 @@
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index f21c369..01f4937 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -135,7 +135,7 @@ css_error css_computed_style_destroy(css_computed_style *style);
+  * Whether two computed styles lay a box out the same way, differing at
+  * most in how it is painted: colours, backgrounds other than images,
+  * borders' colours and corners, shadows, outlines, opacity, filter,
+- * transform, visibility, z-index and the like (VitaSurf).
++ * transform, visibility, z-index, object-fit and the like (VitaSurf).
+  */
+ bool css_computed_style_same_layout(const css_computed_style *a,
+ 		const css_computed_style *b);
+diff --git a/src/select/arena.c b/src/select/arena.c
+index 93bced1..2cefd04 100644
+--- a/src/select/arena.c
++++ b/src/select/arena.c
+@@ -366,6 +366,10 @@ static void overlay_paint_only(css_computed_style *tmp,
+ 	overlay_outline_offset(tmp, b);
+ 	overlay_backdrop_filter(tmp, b);
+ 	overlay_mix_blend_mode(tmp, b);
++	/* how an image sits in its box, which is drawn, not laid out:
++	 * Yamtrack's lazy-loaded posters change it as each one arrives */
++	overlay_object_fit(tmp, b);
++	overlay_object_position(tmp, b);
+ 	overlay_border_image_source(tmp, b);
+ 	overlay_border_image_slice(tmp, b);
+ 	overlay_border_image_width(tmp, b);
+@@ -503,8 +507,6 @@ bool css_computed_style_same_boxes(const css_computed_style *a,
+ 	overlay_max_width(&tmp, b);
+ 	overlay_min_height(&tmp, b);
+ 	overlay_min_width(&tmp, b);
+-	overlay_object_fit(&tmp, b);
+-	overlay_object_position(&tmp, b);
+ 	overlay_order(&tmp, b);
+ 	overlay_overflow_wrap(&tmp, b);
+ 	overlay_overflow_x(&tmp, b);

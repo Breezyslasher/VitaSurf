@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!-- getComputedStyle reports the cascade's values for the properties
+     pages read back, not defaults: each XX line gives the property, what
+     came back and PASS when it is what a browser reports. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; }
+:root { --brand: #123456; }
+#f { --gap: 4px  2px; }
+#a { position: absolute; top: 10px; left: 2em; z-index: 5; opacity: 0.5;
+     font-weight: bold; font-style: italic; line-height: 1.5;
+     text-align: center; white-space: nowrap; box-sizing: border-box;
+     overflow: hidden; border: 2px dashed rgb(255, 0, 0);
+     border-radius: 4px; text-transform: uppercase; max-width: 300px;
+     min-height: 20px; cursor: pointer; pointer-events: none;
+     text-decoration: underline; letter-spacing: 1px;
+     font-family: "Helvetica Neue", Arial, sans-serif; }
+#f { display: flex; flex-direction: column; justify-content: space-between;
+     align-items: center; flex-wrap: wrap; column-gap: 8px; }
+#f > span { flex-grow: 2; flex-shrink: 0; flex-basis: 50%; order: 3; }
+#b::before { content: "x" counter(n); color: rgba(0, 0, 255, 0.5); }
+#c { float: right; clear: both; background: url(red20x10.png); vertical-align: middle; }
+</style></head><body>
+<div id="a">a</div>
+<div id="f"><span>s</span></div>
+<p id="b">b</p>
+<div id="c">c</div>
+<script>
+var n = 0, bad = 0;
+function C(id, prop, want, pseudo) {
+  var cs = getComputedStyle(document.getElementById(id), pseudo || null);
+  var got = cs[prop];
+  var ok = typeof want === 'function' ? want(got) : got === want;
+  if (!ok) bad++;
+  n++;
+  console.log('XX ' + id + (pseudo || '') + ' ' + prop + ': ' + got + (ok ? ' PASS' : ' FAIL (want ' + want + ')'));
+}
+window.addEventListener('load', function () { setTimeout(function () {
+  C('a', 'position', 'absolute'); C('a', 'top', '10px'); C('a', 'left', '32px');
+  C('a', 'zIndex', '5'); C('a', 'opacity', '0.5'); C('a', 'fontWeight', '700');
+  C('a', 'fontStyle', 'italic'); C('a', 'lineHeight', '24px');
+  C('a', 'textAlign', 'center'); C('a', 'whiteSpace', 'nowrap');
+  C('a', 'boxSizing', 'border-box'); C('a', 'overflow', 'hidden');
+  C('a', 'borderTopStyle', 'dashed'); C('a', 'borderLeftColor', 'rgb(255, 0, 0)');
+  C('a', 'borderTopLeftRadius', '4px'); C('a', 'borderRadius', '4px');
+  C('a', 'textTransform', 'uppercase'); C('a', 'maxWidth', '300px');
+  C('a', 'minHeight', '20px'); C('a', 'cursor', 'pointer');
+  C('a', 'pointerEvents', 'none'); C('a', 'textDecorationLine', 'underline');
+  C('a', 'letterSpacing', '1px');
+  C('a', 'fontFamily', '"Helvetica Neue", Arial, sans-serif');
+  C('f', 'display', 'flex'); C('f', 'flexDirection', 'column');
+  C('f', 'justifyContent', 'space-between'); C('f', 'alignItems', 'center');
+  C('f', 'flexWrap', 'wrap'); C('f', 'columnGap', '8px');
+  var s = document.querySelector('#f > span'); s.id = 's';
+  C('s', 'flexGrow', '2'); C('s', 'flexShrink', '0'); C('s', 'flexBasis', '50%');
+  C('s', 'order', '3');
+  C('b', 'content', '"x" counter(n)', '::before');
+  C('b', 'color', 'rgba(0, 0, 255, 0.5)', '::before');
+  C('b', 'content', 'none', '::after');
+  C('c', 'float', 'right'); C('c', 'cssFloat', 'right'); C('c', 'clear', 'both');
+  C('c', 'backgroundImage', function (v) { return /^url\(".*red20x10\.png"\)$/.test(v); });
+  C('c', 'verticalAlign', 'middle');
+  [['f', '--gap', '4px 2px'], ['s', '--gap', '4px 2px'], ['a', '--brand', '#123456'],
+   ['a', '--missing', '']].forEach(function (k) {
+    var v = getComputedStyle(document.getElementById(k[0])).getPropertyValue(k[1]); n++;
+    if (v !== k[2]) bad++;
+    console.log('XX ' + k[0] + ' ' + k[1] + ': [' + v + ']' + (v === k[2] ? ' PASS' : ' FAIL (want ' + k[2] + ')'));
+  });
+  var cs = getComputedStyle(document.getElementById('a'));
+  var g = cs.getPropertyValue('z-index'); n++;
+  if (g !== '5') bad++;
+  console.log('XX getPropertyValue z-index: ' + g + (g === '5' ? ' PASS' : ' FAIL'));
+  console.log('XX ' + (n - bad) + ' of ' + n + ' pass');
+}, 200); });
+</script></body></html>

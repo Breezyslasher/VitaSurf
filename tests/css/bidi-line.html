@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!-- Bidirectional text across elements, checked in the plot output (the
+     order and x of each PLOT TEXT):
+     1. two Hebrew words in <b> and <i> inside English: the <i> word is
+        drawn left of the <b> word, as they read right to left;
+     2. <bdo dir="rtl">abc</bdo> is drawn "cba";
+     3. <span dir="rtl">abc!</span> is drawn "!abc", the mark taking
+        the span's direction at its end;
+     4. English words in <b> and <i> inside a right-to-left paragraph
+        keep their own order, the <b> word left of the <i> word. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; }
+p { margin: 0 0 4px; }
+</style></head><body>
+<p>one <b>שלום</b> <i>עולם</i> two</p>
+<p><bdo dir="rtl">abc</bdo></p>
+<p><span dir="rtl">abc!</span></p>
+<p dir="rtl">שלום <b>left</b> <i>right</i> עולם</p>
+</body></html>

@@ -11,12 +11,14 @@
  * front of a drive prefix restores the path newlib understands.
  *
  * This is the one place in VitaSurf that knows about drive prefixes inside
- * URLs; every other path rule lives in vita_platform.h.
+ * URLs; every other path rule lives in vita_platform.h. It also holds the
+ * devices the file browser (about:files, patch 0321) starts from.
  *
  * This file is part of VitaSurf, a PS Vita port of NetSurf.
  * Licensed under the GNU General Public License version 2.
  */
 
+#include <dirent.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <string.h>
@@ -96,3 +98,47 @@ static struct gui_file_table file_table = {
 };
 
 struct gui_file_table *vita_file_table = &file_table;
+
+/*
+ * Where the file browser starts: VitaSurf's own folders, then the
+ * devices, each listed only if it can be opened. Which are there depends
+ * on the model (imc0: is a PS TV's and a later model's internal memory),
+ * what is plugged in (uma0:, gro0:) and the plugins a console runs
+ * (StorageMgr moves an SD2Vita card to ux0:).
+ */
+static const struct vita_file_root vita_roots[] = {
+	{ "ux0:/data/VitaSurf/", "VitaSurf's data" },
+	{ "app0:/", "VitaSurf itself (read only)" },
+	{ "ux0:/", "Main storage" },
+	{ "uma0:/", "USB or second card" },
+	{ "imc0:/", "Internal memory" },
+	{ "xmc0:/", "Memory card" },
+	{ "grw0:/", "Game card storage" },
+	{ "gro0:/", "Game card (read only)" },
+	{ "ur0:/", "System user data" },
+	{ "ud0:/", "System update data" },
+	{ "sa0:/", "System data (read only)" },
+	{ "pd0:/", "Preinstalled data (read only)" },
+	{ "vs0:/", "System (read only)" },
+	{ "os0:/", "System (read only)" },
+	{ "vd0:/", "System registry" },
+	{ "tm0:/", "System" },
+};
+
+/* exported interface documented in vita_platform.h */
+int vita_file_roots(struct vita_file_root *roots, int max)
+{
+	int i, n = 0;
+
+	for (i = 0; i < (int)(sizeof(vita_roots) / sizeof(vita_roots[0])) &&
+		    n < max; i++) {
+		DIR *d = opendir(vita_roots[i].path);
+
+		if (d == NULL) {
+			continue;
+		}
+		closedir(d);
+		roots[n++] = vita_roots[i];
+	}
+	return n;
+}

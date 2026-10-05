@@ -1,0 +1,10 @@
+<!DOCTYPE html>
+<!-- The middle frame of tests/dom/iframe-load-order.html: a frame holding
+     a frame, noting its own load. -->
+<html><head><title>nest</title></head><body>
+<iframe src="order-leaf.html"></iframe>
+<script>
+window.addEventListener('load', function () {
+ if (top.order) top.order.push('nest load');
+});
+</script></body></html>

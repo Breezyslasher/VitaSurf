@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<!-- A sibling may share another's computed style when every position
+     test (:first-child, :nth-child() and the rest, and :empty) that
+     the other's rules asked gives it the same answer. Each span's
+     left edge says which rules its item matched. -->
+<html><head><style>
+body { margin: 0 } ul, div { margin: 0; padding: 0; list-style: none }
+span { display: inline-block; width: 5px; height: 5px }
+#a > li:first-child span { margin-left: 10px }
+#a > li:last-child span { margin-left: 20px }
+#b > li:nth-child(3n) span { margin-left: 30px }
+#b > li:nth-last-child(2) span { margin-left: 40px }
+.u > :first-child span { margin-left: 50px }
+.u > :last-child span { margin-left: 60px }
+#t > p:first-of-type span { margin-left: 70px }
+#t > p:last-of-type span { margin-left: 80px }
+#t > p { margin: 0 }
+#o > li:only-child span { margin-left: 90px }
+#e > li { height: 5px }
+#e > li:empty { height: 15px }
+#n > li:not(:first-child):not(:last-child) span { margin-left: 25px }
+</style></head><body>
+<ul id="a"><li><span></span></li><li><span></span></li><li><span></span></li><li><span></span></li><li><span></span></li><li><span></span></li></ul>
+<ul id="b"><li><span></span></li><li><span></span></li><li><span></span></li><li><span></span></li><li><span></span></li><li><span></span></li><li><span></span></li></ul>
+<div class="u" id="u"><div><span></span></div><div><span></span></div><div><span></span></div><div><span></span></div></div>
+<div id="t"><div>x</div><p><span></span></p><div>x</div><p><span></span></p><p><span></span></p><div>x</div></div>
+<ul id="o"><li><span></span></li></ul>
+<ul id="o2"><li><span></span></li><li><span></span></li></ul>
+<ul id="e"><li></li><li><span></span></li><li></li><li></li><li><span></span></li></ul>
+<ul id="n"><li><span></span></li><li><span></span></li><li><span></span></li><li><span></span></li></ul>
+<ul id="g" class="u"><li><span></span></li><li><span></span></li><li><span></span></li></ul>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function lefts(sel){ var r=[]; var s=document.querySelectorAll(sel);
+  for (var i=0;i<s.length;i++) r.push(Math.round(s[i].getBoundingClientRect().left));
+  return r.join(","); }
+function heights(sel){ var r=[]; var s=document.querySelectorAll(sel);
+  for (var i=0;i<s.length;i++) r.push(Math.round(s[i].getBoundingClientRect().height));
+  return r.join(","); }
+function check(name, got, want){ ok(name+" ("+got+")", got===want); }
+setTimeout(function(){
+ check("first and last child", lefts("#a span"), "10,0,0,0,0,20");
+ check("nth-child(3n) and nth-last-child(2)", lefts("#b span"), "0,0,30,0,0,40,0");
+ check("universal first and last child", lefts("#u span"), "50,0,0,60");
+ check("first and last of type among other names", lefts("#t span"), "70,0,80");
+ check("only child", lefts("#o span"), "90");
+ check("two children are not only children", lefts("#o2 span"), "0,0");
+ check(":empty", heights("#e li"), "15,5,15,15,5");
+ check("negated position tests", lefts("#n span"), "0,25,25,0");
+ check("universal rules on a list", lefts("#g span"), "50,0,60");
+ var g=document.getElementById("g"); var li=document.createElement("li");
+ li.appendChild(document.createElement("span")); g.appendChild(li);
+ setTimeout(function(){
+  var s=document.querySelectorAll("#g span");
+  check("an appended last item takes the last-child rule", String(Math.round(s[3].getBoundingClientRect().left)), "60");
+ }, 300);
+}, 300);
+</script></body></html>

@@ -75,6 +75,11 @@ git -C "$work/base" -c user.email=vitasurf@invalid -c user.name=VitaSurf \
 } | sort -zu > "$work/files"
 
 while IFS= read -r -d '' f; do
+    # A submodule of the submodule (quickjs-ng's test262) is a directory
+    # here, not a file, and nothing a patch changes.
+    if [ -d "$work/base/$f" ] && [ ! -L "$work/base/$f" ]; then
+        continue
+    fi
     if [ -e "$dir/$f" ] || [ -L "$dir/$f" ]; then
         mkdir -p "$work/base/$(dirname "$f")"
         rm -f "$work/base/$f"

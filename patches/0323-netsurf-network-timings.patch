@@ -1,0 +1,237 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index c6574ad67..6cb011e0b 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -47,6 +47,7 @@
+ #include "utils/messages.h"
+ #include "utils/nsurl.h"
+ #include "utils/ring.h"
++#include "utils/utils.h"
+ #include "netsurf/misc.h"
+ #include "desktop/gui_internal.h"
+ 
+@@ -100,6 +101,7 @@ struct fetch {
+ 	fetch_msg_type last_msg;/**< The last message sent for this fetch */
+ 	struct fetch *r_prev;	/**< Previous active fetch in ::fetch_ring. */
+ 	struct fetch *r_next;	/**< Next active fetch in ::fetch_ring. */
++	unsigned int queued_ms;	/**< when it was queued (VitaSurf) */
+ };
+ 
+ static struct fetch *fetch_ring = NULL;	/**< Ring of active fetches. */
+@@ -159,6 +161,7 @@ static bool fetch_dispatch_job(struct fetch *fetch)
+ 	} else {
+ 		RING_INSERT(fetch_ring, fetch);
+ 		fetch->fetch_is_active = true;
++		vitasurf_net_queue_wait(vitasurf_clock_ms() - fetch->queued_ms);
+ 		return true;
+ 	}
+ }
+@@ -526,6 +529,7 @@ fetch_start(nsurl *url,
+ 	fetch_ref_fetcher(fetch->fetcherd);
+ 
+ 	/* Dump new fetch in the queue. */
++	fetch->queued_ms = vitasurf_clock_ms();
+ 	RING_INSERT(queue_ring, fetch);
+ 
+ 	/* Ask the queue to run. */
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index adfecc3b6..4dfc9366d 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1598,6 +1598,27 @@ static bool fetch_curl_process_headers(struct curl_fetch_info *f)
+ }
+ 
+ 
++/* add a finished transfer to the page's network figures (VitaSurf) */
++static void fetch_curl_note_times(CURL *curl_handle)
++{
++#if LIBCURL_VERSION_NUM >= 0x073d00
++	long connects = 0;
++	curl_off_t connect = 0, tls = 0, request = 0, first = 0, total = 0;
++	curl_off_t bytes = 0;
++
++	curl_easy_getinfo(curl_handle, CURLINFO_NUM_CONNECTS, &connects);
++	curl_easy_getinfo(curl_handle, CURLINFO_CONNECT_TIME_T, &connect);
++	curl_easy_getinfo(curl_handle, CURLINFO_APPCONNECT_TIME_T, &tls);
++	curl_easy_getinfo(curl_handle, CURLINFO_PRETRANSFER_TIME_T, &request);
++	curl_easy_getinfo(curl_handle, CURLINFO_STARTTRANSFER_TIME_T, &first);
++	curl_easy_getinfo(curl_handle, CURLINFO_TOTAL_TIME_T, &total);
++	curl_easy_getinfo(curl_handle, CURLINFO_SIZE_DOWNLOAD_T, &bytes);
++	vitasurf_net_note(connects, connect, tls, request, first, total, bytes);
++#else
++	(void)curl_handle;
++#endif
++}
++
+ /**
+  * Handle a completed fetch (CURLMSG_DONE from curl_multi_info_read()).
+  *
+@@ -1621,6 +1642,7 @@ static void fetch_curl_done(CURL *curl_handle, CURLcode result)
+ 
+ 	abort_fetch = f->abort;
+ 	NSLOG(netsurf, INFO, "done %s", nsurl_access(f->url));
++	fetch_curl_note_times(curl_handle);
+ 
+ 	if ((abort_fetch == false) &&
+ 	    (result == CURLE_OK ||
+diff --git a/utils/utils.c b/utils/utils.c
+index 959323a1c..0970820b1 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -625,6 +625,67 @@ unsigned int vitasurf_ms_image;
+ unsigned int vitasurf_images_asked;
+ unsigned int vitasurf_images_done;
+ unsigned int vitasurf_images_failed;
++unsigned int vitasurf_net_transfers;
++unsigned int vitasurf_net_connections;
++unsigned int vitasurf_net_handshakes;
++unsigned int vitasurf_ms_net_connect;
++unsigned int vitasurf_ms_net_tls;
++unsigned int vitasurf_ms_net_tls_max;
++unsigned int vitasurf_ms_net_first_byte;
++unsigned int vitasurf_ms_net_first_byte_max;
++unsigned int vitasurf_ms_net_body;
++unsigned int vitasurf_ms_net_body_max;
++unsigned int vitasurf_net_kb;
++unsigned int vitasurf_net_queued;
++unsigned int vitasurf_ms_net_queue;
++unsigned int vitasurf_ms_net_queue_max;
++
++/* exported interface documented in utils/utils.h */
++void vitasurf_net_note(long connects, int64_t connect_us, int64_t tls_us,
++		       int64_t request_us, int64_t first_byte_us,
++		       int64_t total_us, int64_t bytes)
++{
++	unsigned int ms;
++
++	vitasurf_net_transfers++;
++	vitasurf_net_kb += (unsigned int)(bytes / 1024);
++	if (connects > 0) {
++		vitasurf_net_connections += (unsigned int)connects;
++		vitasurf_ms_net_connect += (unsigned int)(connect_us / 1000);
++		/* TLS done after the TCP connection: a handshake was made */
++		if (tls_us > connect_us) {
++			ms = (unsigned int)((tls_us - connect_us) / 1000);
++			vitasurf_net_handshakes++;
++			vitasurf_ms_net_tls += ms;
++			if (ms > vitasurf_ms_net_tls_max)
++				vitasurf_ms_net_tls_max = ms;
++		}
++	}
++	if (first_byte_us > request_us) {
++		ms = (unsigned int)((first_byte_us - request_us) / 1000);
++		vitasurf_ms_net_first_byte += ms;
++		if (ms > vitasurf_ms_net_first_byte_max)
++			vitasurf_ms_net_first_byte_max = ms;
++	}
++	if (total_us > first_byte_us && first_byte_us > 0) {
++		ms = (unsigned int)((total_us - first_byte_us) / 1000);
++		vitasurf_ms_net_body += ms;
++		if (ms > vitasurf_ms_net_body_max)
++			vitasurf_ms_net_body_max = ms;
++	}
++}
++
++/* exported interface documented in utils/utils.h */
++void vitasurf_net_queue_wait(unsigned int ms)
++{
++	if (ms == 0)
++		return;
++	vitasurf_net_queued++;
++	vitasurf_ms_net_queue += ms;
++	if (ms > vitasurf_ms_net_queue_max)
++		vitasurf_ms_net_queue_max = ms;
++}
++
+ unsigned int vitasurf_ms_boxes;
+ unsigned int vitasurf_ms_layout;
+ const char *volatile vitasurf_phase;
+@@ -849,6 +910,20 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_images_asked = 0;
+ 	vitasurf_images_done = 0;
+ 	vitasurf_images_failed = 0;
++	vitasurf_net_transfers = 0;
++	vitasurf_net_connections = 0;
++	vitasurf_net_handshakes = 0;
++	vitasurf_ms_net_connect = 0;
++	vitasurf_ms_net_tls = 0;
++	vitasurf_ms_net_tls_max = 0;
++	vitasurf_ms_net_first_byte = 0;
++	vitasurf_ms_net_first_byte_max = 0;
++	vitasurf_ms_net_body = 0;
++	vitasurf_ms_net_body_max = 0;
++	vitasurf_net_kb = 0;
++	vitasurf_net_queued = 0;
++	vitasurf_ms_net_queue = 0;
++	vitasurf_ms_net_queue_max = 0;
+ 	vitasurf_ms_boxes = 0;
+ 	vitasurf_ms_layout = 0;
+ 	vitasurf_layout_runs = 0;
+@@ -1049,6 +1124,13 @@ static uint64_t vitasurf_now_ms(void)
+ }
+ 
+ 
++/* exported interface documented in utils/utils.h */
++unsigned int vitasurf_clock_ms(void)
++{
++	return (unsigned int) vitasurf_now_ms();
++}
++
++
+ /** Milliseconds since this page load began. */
+ static unsigned int vitasurf_since_start(void)
+ {
+diff --git a/utils/utils.h b/utils/utils.h
+index 902f7b77c..ea002046b 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -190,6 +190,49 @@ extern unsigned int vitasurf_ms_image;
+ extern unsigned int vitasurf_images_asked;
+ extern unsigned int vitasurf_images_done;
+ extern unsigned int vitasurf_images_failed;
++
++/*
++ * What the page's network transfers cost (VitaSurf), as curl times them
++ * when each one ends. A first visit is mostly waiting, and the log could
++ * not say whether on connections, TLS handshakes, the server or the
++ * bodies. The times are summed over transfers that overlap, so they are
++ * not shares of the load; the longest of each is kept too.
++ */
++extern unsigned int vitasurf_net_transfers; /**< finished transfers */
++extern unsigned int vitasurf_net_connections; /**< new connections */
++extern unsigned int vitasurf_net_handshakes; /**< of those, with TLS */
++extern unsigned int vitasurf_ms_net_connect; /**< DNS and TCP */
++extern unsigned int vitasurf_ms_net_tls;
++extern unsigned int vitasurf_ms_net_tls_max;
++extern unsigned int vitasurf_ms_net_first_byte; /**< request to reply */
++extern unsigned int vitasurf_ms_net_first_byte_max;
++extern unsigned int vitasurf_ms_net_body; /**< first byte to last */
++extern unsigned int vitasurf_ms_net_body_max;
++extern unsigned int vitasurf_net_kb;
++
++/**
++ * Add one finished transfer to those figures; times in microseconds
++ * since the transfer began, as curl's CURLINFO_*_TIME_T give them.
++ */
++void vitasurf_net_note(long connects, int64_t connect_us, int64_t tls_us,
++		       int64_t request_us, int64_t first_byte_us,
++		       int64_t total_us, int64_t bytes);
++
++/**
++ * Fetches that waited in NetSurf's own queue for a free fetcher slot
++ * (max_fetchers, max_fetchers_per_host) before curl saw them, the
++ * time they waited in all, and the longest wait.
++ */
++extern unsigned int vitasurf_net_queued;
++extern unsigned int vitasurf_ms_net_queue;
++extern unsigned int vitasurf_ms_net_queue_max;
++
++/** Milliseconds on a monotonic clock, for measuring short waits. */
++unsigned int vitasurf_clock_ms(void);
++
++/** Note that a fetch waited \a ms in the queue before it started. */
++void vitasurf_net_queue_wait(unsigned int ms);
++
+ extern unsigned int vitasurf_ms_boxes;
+ extern unsigned int vitasurf_ms_layout;
+ /*

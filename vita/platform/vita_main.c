@@ -30,7 +30,8 @@
 /*
  * newlib heap and main thread stack. Both are read by the VitaSDK C runtime
  * before main() runs. CSS selection and layout recurse deeply, hence the
- * large stack. The heap size is a CMake option (VITASURF_HEAP_MB).
+ * large stack. The heap is sized from the memory free at startup
+ * (vita_heap.c); VITASURF_HEAP_MB is the size it falls back to.
  *
  * Both are marked used and kept as link roots (see --undefined in
  * CMakeLists.txt). The runtime reads them weakly, so --gc-sections is
@@ -117,7 +118,16 @@ int __wrap_main(int argc, char **argv)
 	args[nargs] = NULL;
 
 	vita_measure_stack();
-	vita_log("heap %d MB, main thread stack %u KB (asked for %d KB)",
+	vita_log("heap %u MB, of %u MB free at startup (%s memory asked "
+		 "for; %d MB if that could not be read), main thread stack "
+		 "%u KB (asked for %d KB)",
+		 vita_heap_size_kb() / 1024,
+		 vita_heap_free_at_start_kb() / 1024,
+#ifdef VITASURF_EXTENDED_MEMORY
+		 "extended",
+#else
+		 "ordinary",
+#endif
 		 VITASURF_HEAP_MB,
 		 (unsigned int)(vita_main_stack_bytes / 1024),
 		 VITASURF_STACK_KB);

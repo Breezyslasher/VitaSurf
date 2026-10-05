@@ -1,0 +1,2067 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index fcf312ed7..023174467 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -17,6 +17,8 @@
+  */
+ 
+ #include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
+ 
+@@ -25,6 +27,7 @@
+ #include "utils/log.h"
+ #include "utils/nsurl.h"
+ #include "utils/utils.h"
++#include "utils/ascii.h"
+ #include "netsurf/plot_style.h"
+ #include "netsurf/url_db.h"
+ #include "desktop/system_colour.h"
+@@ -87,6 +90,8 @@ static css_error node_is_enabled(void *pw, void *node, bool *match);
+ static css_error node_is_disabled(void *pw, void *node, bool *match);
+ static css_error node_is_checked(void *pw, void *node, bool *match);
+ static css_error node_is_target(void *pw, void *node, bool *match);
++static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
++		lwc_string *arg, bool *match);
+ static css_error node_is_lang(void *pw, void *node,
+ 		lwc_string *lang, bool *match);
+ static css_error ua_default_for_property(void *pw, uint32_t property,
+@@ -142,6 +147,7 @@ static css_select_handler selection_handler = {
+ 	first_child_node,
+ 	next_sibling_node,
+ 	node_attribute_hashes,
++	node_is_pseudo,
+ };
+ 
+ /**
+@@ -1774,6 +1780,80 @@ css_error node_is_visited(void *pw, void *node, bool *match)
+ 	return CSS_OK;
+ }
+ 
++/*
++ * The element under the pointer, the one being pressed, the one with the
++ * focus and the one the address's fragment names (VitaSurf). NetSurf had
++ * none of them and matched :hover, :active, :focus and :target against
++ * nothing. Each is kept with the chain of its ancestors, referenced,
++ * because :hover, :active and :focus-within match all the way up.
++ */
++#define DYNAMIC_CHAIN_MAX 64
++
++static struct {
++	dom_node *chain[DYNAMIC_CHAIN_MAX];
++	unsigned n;
++} dynamic[NSCSS_DYNAMIC_COUNT];
++
++static bool focus_visible;
++
++static bool dynamic_chain_has(enum nscss_dynamic which, void *node)
++{
++	unsigned i;
++
++	for (i = 0; i < dynamic[which].n; i++) {
++		if (dynamic[which].chain[i] == node)
++			return true;
++	}
++	return false;
++}
++
++/* exported interface documented in css/select.h */
++dom_node *nscss_dynamic_node(enum nscss_dynamic which)
++{
++	return dynamic[which].n > 0 ? dynamic[which].chain[0] : NULL;
++}
++
++/* exported interface documented in css/select.h */
++unsigned nscss_dynamic_chain(enum nscss_dynamic which, dom_node ***chain)
++{
++	*chain = dynamic[which].chain;
++	return dynamic[which].n;
++}
++
++/* exported interface documented in css/select.h */
++bool nscss_set_dynamic(enum nscss_dynamic which, dom_node *node,
++		bool visible)
++{
++	dom_node *n;
++	unsigned i;
++
++	if (which == NSCSS_FOCUS)
++		focus_visible = visible;
++	if (node == nscss_dynamic_node(which))
++		return false;
++
++	for (i = 0; i < dynamic[which].n; i++)
++		dom_node_unref(dynamic[which].chain[i]);
++	dynamic[which].n = 0;
++
++	for (n = node != NULL ? dom_node_ref(node) : NULL; n != NULL; ) {
++		dom_node *parent = NULL;
++		dom_node_type type;
++
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
++				type != DOM_ELEMENT_NODE ||
++				dynamic[which].n == DYNAMIC_CHAIN_MAX) {
++			dom_node_unref(n);
++			break;
++		}
++		dynamic[which].chain[dynamic[which].n++] = n;
++		if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR)
++			parent = NULL;
++		n = parent;
++	}
++	return true;
++}
++
+ /**
+  * Callback to determine if a node is currently being hovered over.
+  *
+@@ -1786,10 +1866,8 @@ css_error node_is_visited(void *pw, void *node, bool *match)
+  */
+ css_error node_is_hover(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support hovering */
+-
+-	*match = false;
+-
++	(void)pw;
++	*match = dynamic_chain_has(NSCSS_HOVER, node);
+ 	return CSS_OK;
+ }
+ 
+@@ -1805,10 +1883,8 @@ css_error node_is_hover(void *pw, void *node, bool *match)
+  */
+ css_error node_is_active(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support active nodes */
+-
+-	*match = false;
+-
++	(void)pw;
++	*match = dynamic_chain_has(NSCSS_ACTIVE, node);
+ 	return CSS_OK;
+ }
+ 
+@@ -1824,10 +1900,9 @@ css_error node_is_active(void *pw, void *node, bool *match)
+  */
+ css_error node_is_focus(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support focussed nodes */
+-
+-	*match = false;
+-
++	(void)pw;
++	*match = (dynamic[NSCSS_FOCUS].n > 0 &&
++		  dynamic[NSCSS_FOCUS].chain[0] == node);
+ 	return CSS_OK;
+ }
+ 
+@@ -1967,10 +2042,9 @@ css_error node_is_checked(void *pw, void *node, bool *match)
+  */
+ css_error node_is_target(void *pw, void *node, bool *match)
+ {
+-	/** \todo Support target */
+-
+-	*match = false;
+-
++	(void)pw;
++	*match = (dynamic[NSCSS_TARGET].n > 0 &&
++		  dynamic[NSCSS_TARGET].chain[0] == node);
+ 	return CSS_OK;
+ }
+ 
+@@ -2129,3 +2203,403 @@ css_error get_libcss_node_data(void *pw, void *node, void **libcss_node_data)
+ 
+ 	return CSS_OK;
+ }
++
++
++/*
++ * The attribute names node_is_pseudo reads, made once (VitaSurf).
++ */
++enum pseudo_attr {
++	PA_PLACEHOLDER, PA_REQUIRED, PA_READONLY, PA_CONTENTEDITABLE,
++	PA_DIR, PA_MIN, PA_MAX, PA_OPEN, PA_MUTED, PA_COUNT
++};
++
++static dom_string *pseudo_attr_name(enum pseudo_attr which)
++{
++	static const char *const names[PA_COUNT] = {
++		"placeholder", "required", "readonly", "contenteditable",
++		"dir", "min", "max", "open", "muted"
++	};
++	static dom_string *made[PA_COUNT];
++
++	if (made[which] == NULL &&
++			dom_string_create_interned(
++				(const uint8_t *) names[which],
++				strlen(names[which]),
++				&made[which]) != DOM_NO_ERR) {
++		made[which] = NULL;
++	}
++	return made[which];
++}
++
++static bool pseudo_has(dom_node *n, enum pseudo_attr which)
++{
++	dom_string *name = pseudo_attr_name(which);
++	bool has = false;
++
++	if (name == NULL || dom_element_has_attribute(n, name, &has) !=
++			DOM_NO_ERR)
++		return false;
++	return has;
++}
++
++/** The value of an attribute, or NULL; the caller unrefs it. */
++static dom_string *pseudo_get(dom_node *n, dom_string *name)
++{
++	dom_string *value = NULL;
++
++	if (name == NULL || dom_element_get_attribute(n, name, &value) !=
++			DOM_NO_ERR)
++		return NULL;
++	return value;
++}
++
++static bool pseudo_tag_is(dom_node *n, const char *tag)
++{
++	dom_string *name = NULL;
++	bool is;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	is = strcasecmp(dom_string_data(name), tag) == 0;
++	dom_string_unref(name);
++	return is;
++}
++
++/** An input's type, lower case, into buf ("text" when it has none). */
++static void pseudo_input_type(dom_node *n, char *buf, size_t len)
++{
++	dom_string *type = pseudo_get(n, corestring_dom_type);
++	size_t i;
++
++	snprintf(buf, len, "%s", type != NULL && dom_string_byte_length(
++			type) > 0 ? dom_string_data(type) : "text");
++	for (i = 0; buf[i] != '\0'; i++)
++		buf[i] = (char) ascii_to_lower(buf[i]);
++	if (type != NULL)
++		dom_string_unref(type);
++}
++
++/** Whether an input of this type takes typed text. */
++static bool pseudo_type_is_text(const char *t)
++{
++	return strcmp(t, "text") == 0 || strcmp(t, "search") == 0 ||
++		strcmp(t, "email") == 0 || strcmp(t, "url") == 0 ||
++		strcmp(t, "tel") == 0 || strcmp(t, "password") == 0 ||
++		strcmp(t, "number") == 0 || strcmp(t, "date") == 0 ||
++		strcmp(t, "time") == 0 || strcmp(t, "datetime-local") == 0 ||
++		strcmp(t, "month") == 0 || strcmp(t, "week") == 0;
++}
++
++/**
++ * A form control's current value, or NULL (VitaSurf): what was typed,
++ * from the gadget when the control has one, else the markup's value.
++ */
++static char *pseudo_value(dom_node *n)
++{
++	dom_string *v = NULL;
++	char *out;
++
++	if (nscss_control_value != NULL) {
++		out = nscss_control_value(n);
++		if (out != NULL)
++			return out;
++	}
++	if (pseudo_tag_is(n, "textarea")) {
++		if (dom_node_get_text_content(n, &v) != DOM_NO_ERR)
++			v = NULL;
++	} else {
++		v = pseudo_get(n, corestring_dom_value);
++	}
++	out = strdup(v != NULL ? dom_string_data(v) : "");
++	if (v != NULL)
++		dom_string_unref(v);
++	return out;
++}
++
++char *(*nscss_control_value)(dom_node *n) = NULL;
++
++/** Whether a node is an element that takes typing. */
++static bool pseudo_read_write(dom_node *n)
++{
++	char type[24];
++	dom_node *a;
++	unsigned depth = 0;
++
++	if (pseudo_tag_is(n, "textarea")) {
++		return !pseudo_has(n, PA_READONLY) &&
++			!node_has_disabled_attribute(n);
++	}
++	if (pseudo_tag_is(n, "input")) {
++		pseudo_input_type(n, type, sizeof(type));
++		return pseudo_type_is_text(type) &&
++			!pseudo_has(n, PA_READONLY) &&
++			!node_has_disabled_attribute(n);
++	}
++	/* contenteditable, on the element or inherited */
++	for (a = dom_node_ref(n); a != NULL && depth++ < 64; ) {
++		dom_string *ce = pseudo_get(a,
++				pseudo_attr_name(PA_CONTENTEDITABLE));
++		dom_node *p = NULL;
++
++		if (ce != NULL) {
++			bool on = strcasecmp(dom_string_data(ce), "false")
++					!= 0;
++
++			dom_string_unref(ce);
++			dom_node_unref(a);
++			return on;
++		}
++		if (dom_node_get_parent_node(a, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(a);
++		a = p;
++		if (a != NULL) {
++			dom_node_type t;
++
++			if (dom_node_get_node_type(a, &t) != DOM_NO_ERR ||
++					t != DOM_ELEMENT_NODE) {
++				dom_node_unref(a);
++				a = NULL;
++			}
++		}
++	}
++	if (a != NULL)
++		dom_node_unref(a);
++	return false;
++}
++
++/** Whether a node is a control that constraint validation looks at. */
++static bool pseudo_validates(dom_node *n)
++{
++	return pseudo_tag_is(n, "input") || pseudo_tag_is(n, "select") ||
++		pseudo_tag_is(n, "textarea");
++}
++
++/** Whether a control fails validation: a required one left empty, an
++ * email address with no @. */
++static bool pseudo_invalid(dom_node *n)
++{
++	char type[24] = "";
++	char *value;
++	bool bad = false;
++
++	if (pseudo_tag_is(n, "input")) {
++		pseudo_input_type(n, type, sizeof(type));
++		if (strcmp(type, "checkbox") == 0 ||
++				strcmp(type, "radio") == 0) {
++			bool checked = false;
++
++			node_is_checked(NULL, n, &checked);
++			return pseudo_has(n, PA_REQUIRED) && !checked &&
++				strcmp(type, "checkbox") == 0;
++		}
++	}
++	value = pseudo_value(n);
++	if (value == NULL)
++		return false;
++	if (value[0] == '\0') {
++		bad = pseudo_has(n, PA_REQUIRED);
++	} else if (strcmp(type, "email") == 0) {
++		bad = strchr(value, '@') == NULL;
++	}
++	free(value);
++	return bad;
++}
++
++/** For :in-range and :out-of-range: 1 in range, 0 out, -1 neither. */
++static int pseudo_range(dom_node *n)
++{
++	char type[24];
++	dom_string *lo, *hi;
++	char *value, *end;
++	double v;
++	int in = -1;
++
++	if (!pseudo_tag_is(n, "input"))
++		return -1;
++	pseudo_input_type(n, type, sizeof(type));
++	if (strcmp(type, "number") != 0 && strcmp(type, "range") != 0)
++		return -1;
++	lo = pseudo_get(n, pseudo_attr_name(PA_MIN));
++	hi = pseudo_get(n, pseudo_attr_name(PA_MAX));
++	if (lo == NULL && hi == NULL)
++		return -1;
++	in = 1;
++	value = pseudo_value(n);
++	if (value != NULL && value[0] != '\0') {
++		v = strtod(value, &end);
++		if (end != value) {
++			if (lo != NULL && v < strtod(dom_string_data(lo),
++					NULL))
++				in = 0;
++			if (hi != NULL && v > strtod(dom_string_data(hi),
++					NULL))
++				in = 0;
++		}
++	}
++	free(value);
++	if (lo != NULL)
++		dom_string_unref(lo);
++	if (hi != NULL)
++		dom_string_unref(hi);
++	return in;
++}
++
++/** The direction in force at a node, from the nearest dir attribute. */
++static bool pseudo_is_rtl(dom_node *n)
++{
++	dom_node *a = dom_node_ref(n);
++	unsigned depth = 0;
++
++	while (a != NULL && depth++ < 256) {
++		dom_string *dir = pseudo_get(a, pseudo_attr_name(PA_DIR));
++		dom_node *p = NULL;
++		dom_node_type t;
++
++		if (dir != NULL) {
++			bool rtl = strcasecmp(dom_string_data(dir), "rtl")
++					== 0;
++			bool set = rtl || strcasecmp(dom_string_data(dir),
++					"ltr") == 0;
++
++			dom_string_unref(dir);
++			if (set) {
++				dom_node_unref(a);
++				return rtl;
++			}
++		}
++		if (dom_node_get_parent_node(a, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(a);
++		a = p;
++		if (a != NULL && (dom_node_get_node_type(a, &t) !=
++				DOM_NO_ERR || t != DOM_ELEMENT_NODE)) {
++			dom_node_unref(a);
++			a = NULL;
++		}
++	}
++	if (a != NULL)
++		dom_node_unref(a);
++	return false;
++}
++
++static bool pseudo_named(lwc_string *name, const char *want)
++{
++	size_t n = strlen(want);
++
++	return lwc_string_length(name) == n &&
++		strncasecmp(lwc_string_data(name), want, n) == 0;
++}
++
++/**
++ * The pseudo-classes libcss knows only by name (VitaSurf). See
++ * parsePseudoKnown in libcss's parse/language.c for the list; what is
++ * not answered here does not match.
++ */
++static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
++		lwc_string *arg, bool *match)
++{
++	dom_node *n = node;
++
++	(void)pw;
++	*match = false;
++
++	if (pseudo_named(name, "focus-visible")) {
++		*match = focus_visible && dynamic[NSCSS_FOCUS].n > 0 &&
++			dynamic[NSCSS_FOCUS].chain[0] == node;
++	} else if (pseudo_named(name, "focus-within")) {
++		*match = dynamic_chain_has(NSCSS_FOCUS, node);
++	} else if (pseudo_named(name, "target-within")) {
++		*match = dynamic_chain_has(NSCSS_TARGET, node);
++	} else if (pseudo_named(name, "any-link") ||
++			pseudo_named(name, "-webkit-any-link")) {
++		if (pseudo_tag_is(n, "a") || pseudo_tag_is(n, "area")) {
++			dom_element_has_attribute(n, corestring_dom_href,
++					match);
++		}
++	} else if (pseudo_named(name, "placeholder-shown")) {
++		if ((pseudo_tag_is(n, "input") ||
++				pseudo_tag_is(n, "textarea")) &&
++				pseudo_has(n, PA_PLACEHOLDER)) {
++			char *value = pseudo_value(n);
++
++			*match = value != NULL && value[0] == '\0';
++			free(value);
++		}
++	} else if (pseudo_named(name, "required")) {
++		*match = pseudo_validates(n) && pseudo_has(n, PA_REQUIRED);
++	} else if (pseudo_named(name, "optional")) {
++		*match = pseudo_validates(n) && !pseudo_has(n, PA_REQUIRED);
++	} else if (pseudo_named(name, "read-write")) {
++		*match = pseudo_read_write(n);
++	} else if (pseudo_named(name, "read-only")) {
++		*match = !pseudo_read_write(n);
++	} else if (pseudo_named(name, "invalid")) {
++		*match = pseudo_validates(n) && pseudo_invalid(n);
++	} else if (pseudo_named(name, "valid")) {
++		*match = (pseudo_validates(n) && !pseudo_invalid(n)) ||
++			pseudo_tag_is(n, "form") ||
++			pseudo_tag_is(n, "fieldset");
++	} else if (pseudo_named(name, "default")) {
++		if (pseudo_tag_is(n, "option")) {
++			dom_element_has_attribute(n, corestring_dom_selected,
++					match);
++		} else if (pseudo_tag_is(n, "input")) {
++			dom_element_has_attribute(n, corestring_dom_checked,
++					match);
++		}
++	} else if (pseudo_named(name, "indeterminate")) {
++		/* a progress bar with no value; a checkbox made
++		 * indeterminate from script is not seen from here */
++		if (pseudo_tag_is(n, "progress")) {
++			bool has = false;
++
++			dom_element_has_attribute(n, corestring_dom_value,
++					&has);
++			*match = !has;
++		}
++	} else if (pseudo_named(name, "defined")) {
++		/* no way to know from here which custom elements are
++		 * defined; the page's own are, by the time it is drawn */
++		*match = true;
++	} else if (pseudo_named(name, "in-range")) {
++		*match = pseudo_range(n) == 1;
++	} else if (pseudo_named(name, "out-of-range")) {
++		*match = pseudo_range(n) == 0;
++	} else if (pseudo_named(name, "open")) {
++		*match = (pseudo_tag_is(n, "details") ||
++				pseudo_tag_is(n, "dialog")) &&
++			pseudo_has(n, PA_OPEN);
++	} else if (pseudo_named(name, "closed")) {
++		*match = (pseudo_tag_is(n, "details") ||
++				pseudo_tag_is(n, "dialog")) &&
++			!pseudo_has(n, PA_OPEN);
++	} else if (pseudo_named(name, "paused")) {
++		/* media never plays here */
++		*match = pseudo_tag_is(n, "video") ||
++			pseudo_tag_is(n, "audio");
++	} else if (pseudo_named(name, "muted")) {
++		*match = (pseudo_tag_is(n, "video") ||
++				pseudo_tag_is(n, "audio")) &&
++			pseudo_has(n, PA_MUTED);
++	} else if (pseudo_named(name, "scope")) {
++		/* outside @scope, :scope is the root */
++		dom_node *p = NULL;
++		dom_node_type t = DOM_ELEMENT_NODE;
++
++		if (dom_node_get_parent_node(n, &p) == DOM_NO_ERR &&
++				p != NULL) {
++			dom_node_get_node_type(p, &t);
++			dom_node_unref(p);
++			*match = (t == DOM_DOCUMENT_NODE);
++		}
++	} else if (pseudo_named(name, "dir")) {
++		if (arg != NULL) {
++			bool rtl = pseudo_is_rtl(n);
++
++			*match = pseudo_named(arg, rtl ? "rtl" : "ltr");
++		}
++	}
++
++	return CSS_OK;
++}
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index 2af10bfd5..2fd6e29c0 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -70,4 +70,45 @@ css_error node_is_visited(void *pw, void *node, bool *match);
+  */
+ void nscss_clear_node_data(dom_node *n);
+ 
++/**
++ * The states an element can be in that selectors ask about and markup
++ * does not say (VitaSurf).
++ */
++enum nscss_dynamic {
++	NSCSS_HOVER,		/**< :hover, under the pointer */
++	NSCSS_ACTIVE,		/**< :active, being pressed */
++	NSCSS_FOCUS,		/**< :focus, :focus-within, :focus-visible */
++	NSCSS_TARGET,		/**< :target, named by the fragment */
++	NSCSS_DYNAMIC_COUNT
++};
++
++/**
++ * Put an element in a state, taking it from whichever had it.
++ *
++ * \param which    the state
++ * \param node     the element, or NULL for none
++ * \param visible  for NSCSS_FOCUS, whether it matches :focus-visible:
++ *                 focus from the keys, or a field that takes typing
++ * \return true if the element in that state changed
++ */
++bool nscss_set_dynamic(enum nscss_dynamic which, dom_node *node,
++		bool visible);
++
++/** The element in a state, or NULL; not referenced. */
++dom_node *nscss_dynamic_node(enum nscss_dynamic which);
++
++/**
++ * The element in a state and its ancestors, nearest first.
++ *
++ * \return how many; the nodes stay referenced by the state
++ */
++unsigned nscss_dynamic_chain(enum nscss_dynamic which, dom_node ***chain);
++
++/**
++ * What a form control holds now, for :placeholder-shown, :invalid and
++ * :in-range: set by the HTML handler, which has the gadgets. The result
++ * is malloc'd; NULL means the markup's value is to be used.
++ */
++extern char *(*nscss_control_value)(dom_node *n);
++
+ #endif
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index f5387f3f4..0bce88ffb 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -316,6 +316,11 @@ struct box {
+ 	 */
+ 	int sticky_dy;
+ 	int sticky_dx;		/**< the same across, for left and right */
++
++	/** where the box came in the painting order at the last hit
++	 * test, when z_gen is that test's (VitaSurf) */
++	uint32_t z_rank;
++	uint32_t z_gen;
+ 	/**
+ 	 * Where a sticky or fixed box and its descendants were last drawn,
+ 	 * in screen coordinates, by an interactive redraw (VitaSurf): a
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 49e4107f3..cc0bdabec 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -2184,3 +2184,252 @@ box_extract_link(const html_content *content,
+ 
+ 	return true;
+ }
++
++
++/* ------------------------------------------------------------------------ */
++/* Restyling for a change of state (VitaSurf)                               */
++
++/*
++ * An element that becomes :hover, :focus, :active or :target is selected
++ * again on its own rather than the whole tree being rebuilt, which on
++ * the Vita can take a second. When all that changed is paint -- colours,
++ * a background, an outline, a shadow -- the new styles are put on the
++ * boxes the element owns and the page is drawn again; when something
++ * would move, the caller rebuilds the layout instead.
++ */
++
++/**
++ * Keep a set of selection results alive with the box tree (VitaSurf).
++ * A box missed by the remapping below still points into them, so they
++ * go when the tree does rather than now.
++ */
++static int restyle_old_destructor(css_select_results **held)
++{
++	if (*held != NULL)
++		css_select_results_destroy(*held);
++	return 0;
++}
++
++static void restyle_keep(html_content *c, css_select_results *old)
++{
++	css_select_results **held = talloc(c->bctx, css_select_results *);
++
++	if (held == NULL) {
++		/* leaked rather than freed under a box still using it */
++		return;
++	}
++	*held = old;
++	talloc_set_destructor(held, restyle_old_destructor);
++}
++
++static void restyle_remap_one(struct box *b, const css_select_results *old,
++		const css_select_results *new)
++{
++	int i;
++
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		if (old->styles[i] == NULL)
++			continue;
++		if (b->style == old->styles[i])
++			b->style = new->styles[i];
++		if (b->first_line_style == old->styles[i])
++			b->first_line_style = new->styles[i];
++	}
++}
++
++/**
++ * Point every box an element owns at its new styles: its text, its
++ * anonymous wrappers, its generated content and its marker, but not the
++ * boxes of the elements inside it, which may hold the very same style
++ * pointer, since libcss keeps one copy of identical styles.
++ */
++static void restyle_remap(struct box *owner, struct box *b,
++		const css_select_results *old, const css_select_results *new)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->node != NULL && b->node != owner->node) {
++			/* another element's: an inline one owns the run up
++			 * to its end, the rest own their subtree */
++			if (b->type == BOX_INLINE && b->inline_end != NULL)
++				b = b->inline_end;
++			continue;
++		}
++		restyle_remap_one(b, old, new);
++		if (b->list_marker != NULL)
++			restyle_remap_one(b->list_marker, old, new);
++		restyle_remap(owner, b->children, old, new);
++	}
++}
++
++/** Whether two sets of results lay out the same. */
++static bool restyle_same_layout(const css_select_results *a,
++		const css_select_results *b)
++{
++	int i;
++
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		if ((a->styles[i] == NULL) != (b->styles[i] == NULL))
++			return false;
++		if (a->styles[i] != NULL && !css_computed_style_same_layout(
++				a->styles[i], b->styles[i]))
++			return false;
++	}
++	return true;
++}
++
++static bool restyle_results_equal(const css_select_results *a,
++		const css_select_results *b)
++{
++	int i;
++
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		if (a->styles[i] != b->styles[i])
++			return false;
++	}
++	return true;
++}
++
++/**
++ * Select an element's style again and apply it if only paint changed.
++ *
++ * \param c        the document
++ * \param n        the element
++ * \param changed  set to whether its style changed
++ * \return BOX_RESTYLE_LAYOUT if the layout has to be rebuilt
++ */
++static enum box_restyle restyle_element(html_content *c, dom_node *n,
++		bool *changed)
++{
++	struct box_construct_props props;
++	struct box *box = box_for_node(n);
++	const css_computed_style *root_style;
++	css_select_results *fresh, *old;
++	int i;
++
++	*changed = false;
++	if (c->layout == NULL || c->bctx == NULL)
++		return BOX_RESTYLE_LAYOUT;
++
++	box_extract_properties(c, n, &props);
++	root_style = props.node_is_root ? NULL : c->layout->style;
++
++	nscss_clear_node_data(n);
++	fresh = box_get_style(c, props.parent_style, root_style, n);
++	if (fresh == NULL)
++		return BOX_RESTYLE_LAYOUT;
++
++	if (box == NULL) {
++		/* not drawn: only a change to being drawn matters, and
++		 * that needs boxes */
++		bool shown = fresh->styles[CSS_PSEUDO_ELEMENT_NONE] != NULL &&
++			ns_computed_display(
++				fresh->styles[CSS_PSEUDO_ELEMENT_NONE],
++				props.node_is_root) != CSS_DISPLAY_NONE;
++
++		css_select_results_destroy(fresh);
++		if (shown && props.parent_style != NULL)
++			return BOX_RESTYLE_LAYOUT;
++		return BOX_RESTYLE_SAME;
++	}
++
++	old = box->styles;
++	if (old == NULL) {
++		css_select_results_destroy(fresh);
++		return BOX_RESTYLE_LAYOUT;
++	}
++	if (restyle_results_equal(old, fresh)) {
++		css_select_results_destroy(fresh);
++		return BOX_RESTYLE_SAME;
++	}
++	*changed = true;
++	/* display: contents puts what it owns in its ancestors' boxes,
++	 * where it cannot be told apart; a form control's own drawing
++	 * keeps the colours it was made with, but its box takes the rest */
++	if ((box->flags & DISPLAY_CONTENTS) != 0 ||
++			!restyle_same_layout(old, fresh)) {
++		css_select_results_destroy(fresh);
++		return BOX_RESTYLE_LAYOUT;
++	}
++
++	/* the element's own box, then what it owns */
++	restyle_remap_one(box, old, fresh);
++	if (box->list_marker != NULL)
++		restyle_remap_one(box->list_marker, old, fresh);
++	if (box->type == BOX_INLINE) {
++		struct box *b;
++
++		for (b = box->next; b != NULL; b = b->next) {
++			if (b == box->inline_end) {
++				restyle_remap_one(b, old, fresh);
++				break;
++			}
++			if (b->node != NULL && b->node != n) {
++				if (b->type == BOX_INLINE &&
++						b->inline_end != NULL)
++					b = b->inline_end;
++				continue;
++			}
++			restyle_remap_one(b, old, fresh);
++		}
++	} else {
++		restyle_remap(box, box->children, old, fresh);
++	}
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		if (box->style == old->styles[i])
++			box->style = fresh->styles[i];
++	}
++	box->styles = fresh;
++	box->style = fresh->styles[CSS_PSEUDO_ELEMENT_NONE];
++	if (box == c->layout)
++		c->unit_len_ctx.root_style = box->style;
++	restyle_keep(c, old);
++	return BOX_RESTYLE_PAINT;
++}
++
++static enum box_restyle restyle_worse(enum box_restyle a, enum box_restyle b)
++{
++	return a > b ? a : b;
++}
++
++/* exported interface documented in html/box_construct.h */
++enum box_restyle box_restyle(html_content *c, dom_node *n, bool subtree,
++		unsigned *budget)
++{
++	enum box_restyle result;
++	dom_node *child = NULL, *next;
++	bool changed = false;
++
++	if (*budget == 0)
++		return BOX_RESTYLE_LAYOUT;
++	(*budget)--;
++
++	result = restyle_element(c, n, &changed);
++	if (result == BOX_RESTYLE_LAYOUT)
++		return result;
++
++	/* what is inside inherits the change, or is selected by it */
++	if (!(subtree || changed) || box_for_node(n) == NULL)
++		return result;
++
++	if (composed_first_child(c, n, &child) != DOM_NO_ERR)
++		return BOX_RESTYLE_LAYOUT;
++	while (child != NULL) {
++		dom_node_type type;
++
++		if (dom_node_get_node_type(child, &type) == DOM_NO_ERR &&
++				type == DOM_ELEMENT_NODE) {
++			result = restyle_worse(result, box_restyle(c, child,
++					subtree, budget));
++			if (result == BOX_RESTYLE_LAYOUT) {
++				dom_node_unref(child);
++				return result;
++			}
++		}
++		next = NULL;
++		if (composed_next_sibling(c, child, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(child);
++		child = next;
++	}
++	return result;
++}
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index 87af8d7c6..e2ec85fff 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -149,4 +149,27 @@ typedef bool (*vitasurf_composed_hook)(struct html_content *c,
+ 		struct dom_node **out);
+ extern vitasurf_composed_hook vitasurf_composed;
+ 
++/** What restyling an element for a change of state came to (VitaSurf). */
++enum box_restyle {
++	BOX_RESTYLE_SAME = 0,	/**< nothing changed */
++	BOX_RESTYLE_PAINT,	/**< new styles are on the boxes; redraw */
++	BOX_RESTYLE_LAYOUT	/**< the layout has to be rebuilt */
++};
++
++/**
++ * Select an element's style again after its :hover, :focus, :active or
++ * :target state changed, and put the result on its boxes when only how
++ * they are painted changed (VitaSurf).
++ *
++ * \param c        the document
++ * \param n        the element
++ * \param subtree  also restyle everything inside it, which a selector
++ *                 asking the state of an ancestor needs
++ * \param budget   how many more elements may be restyled; each takes
++ *                 one, and none left is a BOX_RESTYLE_LAYOUT
++ * \return what the page needs now
++ */
++enum box_restyle box_restyle(struct html_content *c, struct dom_node *n,
++		bool subtree, unsigned *budget);
++
+ #endif
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 7000e6829..d243a3809 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -614,6 +614,9 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 	     const int x, const int y,
+ 	     int *box_x, int *box_y)
+ {
++	/* when set, only the boxes the one on top is inside (VitaSurf) */
++	struct box *limit = box_at_point_limit;
++
+ 	bool skip_children;
+ 	bool physically;
+ 
+@@ -623,6 +626,11 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 	while ((box = box_next_xy(box, box_x, box_y, skip_children))) {
+ 		if (box_contains_point(unit_len_ctx, box, x - *box_x, y - *box_y,
+ 				       &physically)) {
++			if (limit != NULL && !box_holds(box, limit)) {
++				/* under the box on top */
++				skip_children = true;
++				continue;
++			}
+ 			*box_x -= scrollbar_get_offset(box->scroll_x);
+ 			*box_y -= scrollbar_get_offset(box->scroll_y);
+ 
+@@ -686,6 +694,34 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ }
+ 
+ 
++/* Exported function documented in html/box_inspect.h */
++struct box *box_at_point_limit = NULL;
++
++/* Exported function documented in html/box_inspect.h */
++bool box_holds(const struct box *a, const struct box *b)
++{
++	const struct box *x;
++
++	for (x = b; x != NULL; x = x->parent) {
++		const struct box *s;
++
++		if (x == a)
++			return true;
++		/* an inline element owns the run of its siblings up to its
++		 * end, text and all, though none is its child */
++		if (a->type == BOX_INLINE && a->inline_end != NULL &&
++				x->parent == a->parent) {
++			for (s = a->next; s != NULL; s = s->next) {
++				if (s == x)
++					return true;
++				if (s == a->inline_end)
++					break;
++			}
++		}
++	}
++	return false;
++}
++
+ /* Exported function documented in html/box.h */
+ struct box *box_find_by_id(struct box *box, lwc_string *id)
+ {
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+index 4f900f9f9..a6f0c6d29 100644
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -197,4 +197,18 @@ static inline unsigned box_count_children(const struct box *b)
+ 	return count;
+ }
+ 
++/**
++ * Whether box a holds box b (VitaSurf): is b or an ancestor of it, or
++ * is the inline element whose run of siblings b's line of ancestors
++ * passes through.
++ */
++bool box_holds(const struct box *a, const struct box *b);
++
++/**
++ * The box on top at the point box_at_point() is asked about, when
++ * painting order puts one there that tree order does not (VitaSurf).
++ * While set, box_at_point() passes over every box not holding it.
++ */
++extern struct box *box_at_point_limit;
++
+ #endif
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 85b4dcea1..37abc3c4b 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -369,6 +369,7 @@ void html_css_link_changed(html_content *c, dom_node *node, dom_string *name,
+ static nserror
+ html_stylesheet_from_domnode(html_content *c,
+ 			     dom_node *node,
++			     const char *override,
+ 			     hlcache_handle **sheet)
+ {
+ 	hlcache_child_context child;
+@@ -382,7 +383,13 @@ html_stylesheet_from_domnode(html_content *c,
+ 	child.charset = c->encoding;
+ 	child.quirks = c->base.quirks;
+ 
+-	exc = dom_node_get_text_content(node, &style);
++	if (override != NULL) {
++		/* the sheet as script left it (VitaSurf) */
++		exc = dom_string_create((const uint8_t *) override,
++				strlen(override), &style);
++	} else {
++		exc = dom_node_get_text_content(node, &style);
++	}
+ 	if ((exc != DOM_NO_ERR) || (style == NULL)) {
+ 		NSLOG(netsurf, INFO, "No text content");
+ 		return NSERROR_OK;
+@@ -572,6 +579,7 @@ html_create_style_element(html_content *c, dom_node *style)
+ 	c->stylesheets[c->stylesheet_count].modified = false;
+ 	c->stylesheets[c->stylesheet_count].unused = false;
+ 	c->stylesheets[c->stylesheet_count].is_link = false;
++	c->stylesheets[c->stylesheet_count].override = NULL;
+ 	c->stylesheet_count++;
+ 
+ 	return c->stylesheets + (c->stylesheet_count - 1);
+@@ -586,7 +594,7 @@ html_css_process_modified_style(html_content *c, struct html_stylesheet *s)
+ 
+ 	html_css_set_root_hints(c);
+ 
+-	error = html_stylesheet_from_domnode(c, s->node, &sheet);
++	error = html_stylesheet_from_domnode(c, s->node, s->override, &sheet);
+ 	if (error != NSERROR_OK) {
+ 		NSLOG(netsurf, INFO, "Failed to update sheet");
+ 		content_broadcast_error(&c->base, error, NULL);
+@@ -662,6 +670,9 @@ bool html_css_update_style(html_content *c, dom_node *style)
+ 		return false;
+ 	}
+ 
++	/* new text replaces what script made of the old (VitaSurf) */
++	free(s->override);
++	s->override = NULL;
+ 	s->modified = true;
+ 
+ 	guit->misc->schedule(0, html_css_process_modified_styles, c);
+@@ -670,6 +681,37 @@ bool html_css_update_style(html_content *c, dom_node *style)
+ }
+ 
+ 
++/* exported function documented in html/css.h */
++bool html_css_set_style_text(html_content *c, dom_node *style,
++		const char *text)
++{
++	unsigned int i;
++	struct html_stylesheet *s;
++	char *copy = NULL;
++
++	if (text != NULL) {
++		copy = strdup(text);
++		if (copy == NULL)
++			return false;
++	}
++	for (i = 0, s = c->stylesheets; i != c->stylesheet_count; i++, s++) {
++		if (s->node == style)
++			break;
++	}
++	if (i == c->stylesheet_count)
++		s = html_create_style_element(c, style);
++	if (s == NULL) {
++		free(copy);
++		return false;
++	}
++
++	free(s->override);
++	s->override = copy;
++	s->modified = true;
++	guit->misc->schedule(0, html_css_process_modified_styles, c);
++	return true;
++}
++
+ /* exported function documented in html/css.h */
+ bool html_css_process_style(html_content *c, dom_node *node)
+ {
+@@ -790,6 +832,7 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	 * (VitaSurf).
+ 	 */
+ 	htmlc->stylesheets[htmlc->stylesheet_count].is_link = true;
++	htmlc->stylesheets[htmlc->stylesheet_count].override = NULL;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].modified = false;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].unused =
+ 			css_sheet_unused(node, NULL, NULL);
+@@ -869,6 +912,7 @@ nserror html_css_free_stylesheets(html_content *html)
+ 		if (html->stylesheets[i].node != NULL) {
+ 			dom_node_unref(html->stylesheets[i].node);
+ 		}
++		free(html->stylesheets[i].override);
+ 	}
+ 	free(html->stylesheets);
+ 
+diff --git a/content/handlers/html/css.h b/content/handlers/html/css.h
+index c07c90ab6..d04558f56 100644
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -111,6 +111,21 @@ bool html_css_process_style(struct html_content *htmlc, dom_node *node);
+  */
+ bool html_css_update_style(struct html_content *htmlc, dom_node *node);
+ 
++/**
++ * Give a STYLE element's sheet the text script made of it with
++ * insertRule(), deleteRule() or replaceSync(), read instead of the
++ * element's own text until that changes (VitaSurf). The element need not
++ * be in the document: one that is not holds a document's
++ * adoptedStyleSheets.
++ *
++ * \param htmlc  The HTML content.
++ * \param style  The STYLE element.
++ * \param text   The sheet's text, or NULL to go back to the element's.
++ * \return true on success else false.
++ */
++bool html_css_set_style_text(struct html_content *htmlc, dom_node *style,
++		const char *text);
++
+ /**
+  * react to an attribute change on a LINK or STYLE element (VitaSurf)
+  *
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 73a0ce97b..d2590ad5d 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -39,6 +39,7 @@
+ #include "utils/talloc.h"
+ #include "utils/utf8.h"
+ #include "utils/nsoption.h"
++#include "css/css.h"
+ #include "utils/string.h"
+ #include "utils/ascii.h"
+ #include "netsurf/content.h"
+@@ -1560,6 +1561,9 @@ static void html_destroy(struct content *c)
+ 	/* a web font still on its way must not lay this content out */
+ 	html_webfont_forget(html);
+ 
++	/* its elements under the pointer or with the focus (VitaSurf) */
++	html_drop_dynamic(html);
++
+ 	/* the documents its iframes made for themselves */
+ 	html_frame_doc_release(html);
+ 
+@@ -2499,6 +2503,12 @@ bool html_get_id_offset(hlcache_handle *h, lwc_string *frag_id, int *x, int *y)
+ 
+ 	if ((pos = box_find_by_id(layout, frag_id)) != 0) {
+ 		box_coords(pos, x, y);
++		/* the element the fragment names is the :target
++		 * (VitaSurf) */
++		if (pos->node != NULL)
++			html_set_dynamic((html_content *)
++					hlcache_handle_get_content(h),
++					NSCSS_TARGET, pos->node, false);
+ 		return true;
+ 	}
+ 	return false;
+@@ -2796,11 +2806,23 @@ static const content_handler html_content_handler = {
+ 
+ 
+ /* exported function documented in html/html.h */
++/** What a form control holds now, for :placeholder-shown (VitaSurf). */
++static char *html_control_value(dom_node *n)
++{
++	struct box *b = box_for_node(n);
++
++	if (b == NULL || b->gadget == NULL || b->gadget->value == NULL)
++		return NULL;
++	return strdup(b->gadget->value);
++}
++
+ nserror html_init(void)
+ {
+ 	uint32_t i;
+ 	nserror error;
+ 
++	nscss_control_value = html_control_value;
++
+ 	error = html_css_init();
+ 	if (error != NSERROR_OK)
+ 		goto error;
+@@ -2819,3 +2841,182 @@ error:
+ 
+ 	return error;
+ }
++
++
++/* ------------------------------------------------------------------------ */
++/* :hover, :active, :focus and :target (VitaSurf)                           */
++
++/** The CSS_DYNAMIC_ bit for a state. */
++static uint32_t dynamic_bit(enum nscss_dynamic which)
++{
++	switch (which) {
++	case NSCSS_HOVER:  return CSS_DYNAMIC_HOVER;
++	case NSCSS_ACTIVE: return CSS_DYNAMIC_ACTIVE;
++	case NSCSS_FOCUS:  return CSS_DYNAMIC_FOCUS;
++	case NSCSS_TARGET: return CSS_DYNAMIC_TARGET;
++	default:           return 0;
++	}
++}
++
++/** Which states the document's sheets ask of an element's ancestors. */
++static uint32_t dynamic_ancestor_bits(html_content *c)
++{
++	uint32_t bits = 0, i;
++
++	for (i = 0; i < c->stylesheet_count; i++) {
++		struct hlcache_handle *h = c->stylesheets[i].sheet;
++		struct nscss_import *imports;
++		uint32_t n = 0, j;
++
++		if (h == NULL)
++			continue;
++		bits |= css_stylesheet_dynamic_ancestor(
++				nscss_get_stylesheet(h));
++		imports = nscss_get_imports(h, &n);
++		for (j = 0; j < n; j++) {
++			if (imports[j].c != NULL)
++				bits |= css_stylesheet_dynamic_ancestor(
++					nscss_get_stylesheet(imports[j].c));
++		}
++	}
++	return bits;
++}
++
++static void html_dynamic_relayout(void *p)
++{
++	html_content *c = p;
++
++	c->dynamic_relayout_pending = false;
++	if (html_relayout(c) == NSERROR_INVALID) {
++		/* busy, or a field is being edited: try again */
++		c->dynamic_relayout_pending = true;
++		guit->misc->schedule(250, html_dynamic_relayout, c);
++	}
++}
++
++/** Whether a node is in a chain. */
++static bool dynamic_in(dom_node *n, dom_node **chain, unsigned count)
++{
++	unsigned i;
++
++	for (i = 0; i < count; i++) {
++		if (chain[i] == n)
++			return true;
++	}
++	return false;
++}
++
++/*
++ * How many elements a change of state may restyle before the layout is
++ * rebuilt instead, and how close to the element an ancestor has to be
++ * for its whole subtree to be restyled when a sheet asks for that
++ * (".menu:hover .submenu" -- the menu is rarely far above what the
++ * pointer is on, and the root always is).
++ */
++#define DYNAMIC_BUDGET 600
++#define DYNAMIC_SUBTREE_DEPTH 6
++
++/* exported interface documented in html/private.h */
++void html_set_dynamic(html_content *c, enum nscss_dynamic which,
++		dom_node *node, bool visible)
++{
++	dom_node *old[64], **chain;
++	unsigned n_old, n_new, i, budget = DYNAMIC_BUDGET;
++	enum box_restyle result = BOX_RESTYLE_SAME, r;
++	bool subtree_wanted;
++	int pass;
++
++	/* the pointer moving within the same element */
++	if (which != NSCSS_FOCUS && node == nscss_dynamic_node(which))
++		return;
++
++	n_old = nscss_dynamic_chain(which, &chain);
++	if (n_old > 64)
++		n_old = 64;
++	for (i = 0; i < n_old; i++)
++		old[i] = dom_node_ref(chain[i]);
++
++	if (!nscss_set_dynamic(which, node, visible)) {
++		/* the same element; for the focus, perhaps now seen */
++		for (i = 0; i < n_old; i++)
++			dom_node_unref(old[i]);
++		if (which != NSCSS_FOCUS || node == NULL)
++			return;
++		n_old = 0;
++	}
++	n_new = nscss_dynamic_chain(which, &chain);
++
++	if (c->layout == NULL || c->bctx == NULL || c->reflowing ||
++			c->box_conversion_context != NULL) {
++		/* no tree to restyle; the next one is built in the new
++		 * state */
++		goto out;
++	}
++
++	subtree_wanted = (dynamic_ancestor_bits(c) & dynamic_bit(which)) != 0;
++
++	/*
++	 * An element whose state changed is in one chain and not the
++	 * other; the ends change too, whichever chain they share, since
++	 * :focus and :target ask about the element itself. Ancestors
++	 * first, so each is selected against its parent's new style.
++	 */
++	for (pass = 0; pass < 2 && result != BOX_RESTYLE_LAYOUT; pass++) {
++		dom_node **list = pass == 0 ? old : chain;
++		dom_node **other = pass == 0 ? chain : old;
++		unsigned count = pass == 0 ? n_old : n_new;
++		unsigned other_n = pass == 0 ? n_new : n_old;
++
++		for (i = count; i-- > 0 && result != BOX_RESTYLE_LAYOUT; ) {
++			bool end = (i == 0);
++
++			if (!end && dynamic_in(list[i], other, other_n))
++				continue;
++			if (pass == 1 && dynamic_in(list[i], old, n_old) &&
++					!end)
++				continue;
++			r = box_restyle(c, list[i], subtree_wanted &&
++					i < DYNAMIC_SUBTREE_DEPTH, &budget);
++			if (r > result)
++				result = r;
++		}
++	}
++
++	if (result == BOX_RESTYLE_LAYOUT) {
++		if (!c->dynamic_relayout_pending) {
++			c->dynamic_relayout_pending = true;
++			guit->misc->schedule(0, html_dynamic_relayout, c);
++		}
++	} else if (result == BOX_RESTYLE_PAINT) {
++		content__request_redraw(&c->base, 0, 0,
++				c->base.width, c->base.height);
++	}
++
++out:
++	for (i = 0; i < n_old; i++)
++		dom_node_unref(old[i]);
++}
++
++/* exported interface documented in html/private.h */
++void html_drop_dynamic(html_content *c)
++{
++	int which;
++
++	if (c->dynamic_relayout_pending) {
++		guit->misc->schedule(-1, html_dynamic_relayout, c);
++		c->dynamic_relayout_pending = false;
++	}
++	for (which = 0; which < NSCSS_DYNAMIC_COUNT; which++) {
++		dom_node *n = nscss_dynamic_node(which);
++		dom_document *doc = NULL;
++
++		if (n == NULL)
++			continue;
++		if (dom_node_get_owner_document(n, &doc) == DOM_NO_ERR &&
++				doc != NULL) {
++			if ((dom_node *) doc == (dom_node *) c->document)
++				nscss_set_dynamic(which, NULL, false);
++			dom_node_unref(doc);
++		}
++	}
++}
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 328900e15..872488e6a 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -61,6 +61,9 @@ struct html_stylesheet {
+ 	bool modified;
+ 	bool unused;
+ 	bool is_link;	/**< the node is a LINK, not a STYLE (VitaSurf) */
++	/** what script made of a STYLE's sheet through insertRule and
++	 * the like, read instead of its text; malloc'd (VitaSurf) */
++	char *override;
+ };
+ 
+ 
+@@ -258,6 +261,12 @@ struct content_html_object *html_get_objects(struct hlcache_handle *h,
+ /**
+  * get the offset within the docuemnt of a fragment id
+  */
++/**
++ * Give the focus to the focusable element at a point in the document, as
++ * the D-pad does (VitaSurf): it matches :focus and :focus-visible.
++ */
++void html_focus_at_point(struct content *c, int x, int y);
++
+ bool html_get_id_offset(struct hlcache_handle *h, lwc_string *frag_id,
+ 		int *x, int *y);
+ 
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index c7540cfa9..3cd121bf5 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -27,6 +27,7 @@
+ #include <assert.h>
+ #include <stdbool.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include <dom/dom.h>
+ 
+@@ -56,6 +57,7 @@
+ #include "html/box_inspect.h"
+ #include "html/font.h"
+ #include "html/form_internal.h"
++#include "html/html.h"
+ #include "html/private.h"
+ #include "html/imagemap.h"
+ #include "html/interaction.h"
+@@ -691,6 +693,9 @@ get_mouse_action_node(html_content *html,
+ 	man->node = html->layout->node; /* Default dom node to the <HTML> */
+ 	man->result.pointer = BROWSER_POINTER_DEFAULT;
+ 
++	/* the box painted on top there, if tree order has another */
++	box_at_point_limit = html_topmost_box_at(html, x, y);
++
+ 	/* search the box tree for a link, imagemap, form control, or
+ 	 * box with scrollbars
+ 	 */
+@@ -818,6 +823,8 @@ get_mouse_action_node(html_content *html,
+ 		box = box_at_point(&html->unit_len_ctx, box, x, y, &box_x, &box_y);
+ 	} while (box != NULL);
+ 
++	box_at_point_limit = NULL;
++
+ 	/* use of box_x, box_y, or content below this point is probably a
+ 	 * mistake; they will refer to the last box returned by box_at_point */
+ 
+@@ -1365,6 +1372,173 @@ default_mouse_action(html_content *html,
+ /**
+  * handle non dragging mouse actions
+  */
++/* exported interface documented in html/private.h */
++struct box *html_topmost_box_at(html_content *html, int x, int y)
++{
++	struct box *b = html->layout, *best = NULL, *last = NULL;
++	int bx, by;
++	uint32_t gen, best_rank = 0;
++	unsigned n = 0;
++
++	if (b == NULL)
++		return NULL;
++	gen = html_redraw_rank(html, x, y);
++	if (gen == 0)
++		return NULL;
++
++	bx = b->margin[LEFT];
++	by = b->margin[TOP];
++	box_at_point_limit = NULL;
++	while ((b = box_at_point(&html->unit_len_ctx, b, x, y, &bx, &by)) !=
++			NULL && n++ < 100000) {
++		last = b;
++		if (b->z_gen == gen && b->z_rank >= best_rank) {
++			best = b;
++			best_rank = b->z_rank;
++		}
++	}
++	/* tree order already has it last: nothing to limit */
++	if (best == NULL || best == last)
++		return NULL;
++	return best;
++}
++
++/**
++ * Whether an element takes the focus when it is clicked (VitaSurf).
++ *
++ * \param n     the element
++ * \param text  set to whether it takes typing, for :focus-visible
++ */
++static bool dynamic_focusable(dom_node *n, bool *text)
++{
++	dom_string *name = NULL, *type = NULL;
++	const char *tag;
++	bool is = false, has = false;
++
++	*text = false;
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return false;
++	tag = dom_string_data(name);
++
++	if (strcasecmp(tag, "input") == 0) {
++		const char *t = "text";
++
++		if (dom_element_get_attribute(n, corestring_dom_type, &type)
++				== DOM_NO_ERR && type != NULL)
++			t = dom_string_data(type);
++		is = strcasecmp(t, "hidden") != 0;
++		*text = strcasecmp(t, "checkbox") != 0 &&
++			strcasecmp(t, "radio") != 0 &&
++			strcasecmp(t, "button") != 0 &&
++			strcasecmp(t, "submit") != 0 &&
++			strcasecmp(t, "reset") != 0 &&
++			strcasecmp(t, "image") != 0 &&
++			strcasecmp(t, "file") != 0 &&
++			strcasecmp(t, "range") != 0 &&
++			strcasecmp(t, "color") != 0;
++		if (type != NULL)
++			dom_string_unref(type);
++	} else if (strcasecmp(tag, "textarea") == 0) {
++		is = *text = true;
++	} else if (strcasecmp(tag, "select") == 0 ||
++			strcasecmp(tag, "button") == 0 ||
++			strcasecmp(tag, "summary") == 0 ||
++			strcasecmp(tag, "iframe") == 0) {
++		is = true;
++	} else if (strcasecmp(tag, "a") == 0 || strcasecmp(tag, "area") == 0) {
++		dom_element_has_attribute(n, corestring_dom_href, &is);
++	}
++	dom_string_unref(name);
++
++	if (!is && dom_element_has_attribute(n, corestring_dom_tabindex,
++			&has) == DOM_NO_ERR && has)
++		is = true;
++	return is;
++}
++
++/**
++ * Follow the pointer for :hover, a press for :active and a click for
++ * :focus (VitaSurf). A tap on the Vita is a move, a press and a click,
++ * so what was tapped stays hovered until the next tap, as on a phone.
++ */
++static void html_track_dynamic(html_content *html, browser_mouse_state mouse,
++		dom_node *node)
++{
++	if ((mouse & (BROWSER_MOUSE_DRAG_1 | BROWSER_MOUSE_DRAG_2 |
++			BROWSER_MOUSE_DRAG_ON)) != 0)
++		return;
++
++	html_set_dynamic(html, NSCSS_HOVER, node, false);
++
++	if (mouse & (BROWSER_MOUSE_PRESS_1 | BROWSER_MOUSE_PRESS_2)) {
++		html_set_dynamic(html, NSCSS_ACTIVE, node, false);
++	} else if ((mouse & (BROWSER_MOUSE_HOLDING_1 |
++			BROWSER_MOUSE_HOLDING_2)) == 0) {
++		html_set_dynamic(html, NSCSS_ACTIVE, NULL, false);
++	}
++
++	if (mouse & (BROWSER_MOUSE_CLICK_1 | BROWSER_MOUSE_CLICK_2)) {
++		dom_node *n = node != NULL ? dom_node_ref(node) : NULL;
++		bool text = false;
++
++		while (n != NULL) {
++			dom_node *p = NULL;
++			dom_node_type t;
++
++			if (dom_node_get_node_type(n, &t) != DOM_NO_ERR ||
++					t != DOM_ELEMENT_NODE) {
++				dom_node_unref(n);
++				n = NULL;
++				break;
++			}
++			if (dynamic_focusable(n, &text))
++				break;
++			if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++				p = NULL;
++			dom_node_unref(n);
++			n = p;
++		}
++		html_set_dynamic(html, NSCSS_FOCUS, n, text);
++		if (n != NULL)
++			dom_node_unref(n);
++	}
++}
++
++/* exported interface documented in html/html.h */
++void html_focus_at_point(struct content *c, int x, int y)
++{
++	html_content *html = (html_content *) c;
++	static struct mouse_action_state mas;
++	dom_node *n;
++	bool text = false;
++
++	if (html->layout == NULL ||
++			get_mouse_action_node(html, x, y, &mas) != NSERROR_OK)
++		return;
++	for (n = mas.node != NULL ? dom_node_ref(mas.node) : NULL;
++			n != NULL; ) {
++		dom_node *p = NULL;
++		dom_node_type t;
++
++		if (dom_node_get_node_type(n, &t) != DOM_NO_ERR ||
++				t != DOM_ELEMENT_NODE) {
++			dom_node_unref(n);
++			n = NULL;
++			break;
++		}
++		if (dynamic_focusable(n, &text))
++			break;
++		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(n);
++		n = p;
++	}
++	/* from the keys, so it is seen */
++	html_set_dynamic(html, NSCSS_FOCUS, n, true);
++	if (n != NULL)
++		dom_node_unref(n);
++}
++
+ static nserror
+ mouse_action_drag_none(html_content *html,
+ 		       struct browser_window *bw,
+@@ -1388,6 +1562,8 @@ mouse_action_drag_none(html_content *html,
+ 		return res;
+ 	}
+ 
++	html_track_dynamic(html, mouse, mas.node);
++
+ 	if (mouse & BROWSER_MOUSE_CLICK_4) {
+ 		mas.result.action = ACTION_BACK;
+ 	} else if (mouse & BROWSER_MOUSE_CLICK_5) {
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 807c96578..05ee26496 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -30,6 +30,7 @@
+ #include "netsurf/plot_style.h"
+ #include "content/content_protected.h"
+ #include "content/handlers/css/utils.h"
++#include "content/handlers/css/select.h"
+ 
+ 
+ struct gui_layout_table;
+@@ -160,6 +161,9 @@ typedef struct html_content {
+ 	void *box_conversion_context;
+ 	/** Box tree, or NULL. */
+ 	struct box *layout;
++	/** a rebuild for a change of :hover or :focus is scheduled
++	 * (VitaSurf) */
++	bool dynamic_relayout_pending;
+ 	/** Document background colour. */
+ 	colour background_colour;
+ 
+@@ -475,6 +479,38 @@ bool html_process_module_preload(html_content *c, dom_string *href);
+  */
+ nserror html_relayout(html_content *htmlc);
+ 
++/**
++ * Put an element in a :hover, :active, :focus or :target state and
++ * restyle what that changes (VitaSurf): in place when only paint
++ * changed, by a layout rebuild soon after otherwise.
++ *
++ * \param c        the document the element is in
++ * \param which    the state
++ * \param node     the element, or NULL to leave the state empty
++ * \param visible  for the focus, whether :focus-visible matches
++ */
++void html_set_dynamic(html_content *c, enum nscss_dynamic which,
++		struct dom_node *node, bool visible);
++
++/**
++ * Walk the painting order at a point without painting (VitaSurf): every
++ * box painted there gets its place in box->z_rank, with box->z_gen set
++ * to the value returned, so a hit test can tell which of the boxes
++ * under a tap is on top.
++ *
++ * \return the walk's generation, or 0 if there was none
++ */
++uint32_t html_redraw_rank(html_content *html, int x, int y);
++
++/**
++ * The box painted on top at a point, when it is not the one tree order
++ * finds last there (VitaSurf); NULL when it is, or when nothing is.
++ */
++struct box *html_topmost_box_at(html_content *html, int x, int y);
++
++/** Let go of a document's elements in any state, as it goes. */
++void html_drop_dynamic(html_content *c);
++
+ /* in html/forms.c */
+ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
+ /**
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 841ed9aee..9f449276c 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -3654,6 +3654,157 @@ static int html_sticky_offset_x(const html_content *html, struct box *box,
+ 	return dx;
+ }
+ 
++/*
++ * Painting order (VitaSurf).
++ *
++ * NetSurf painted the box tree in tree order, so z-index did nothing and
++ * a positioned box -- a dropdown, a menu, a badge over a picture -- was
++ * covered by whatever in-flow content came after it. Each stacking
++ * context now sets its positioned descendants aside as it meets them
++ * and paints them after its in-flow content, in z-index order and then
++ * tree order (CSS 2.1 appendix E, simplified). A negative z-index is
++ * painted where it stands, as before: it belongs under the in-flow
++ * content, and the painter does not look ahead to find it.
++ *
++ * A box that pushes a filter, an opacity or a transform in front of
++ * the plotters starts a stacking context of its own, as CSS says it
++ * does, which also keeps what it set aside inside those levels.
++ */
++struct html_z_entry {
++	struct box *box;
++	int x_parent, y_parent;
++	struct rect clip;
++	colour bg;
++	struct redraw_context ctx;
++	int32_t z;
++	uint32_t seq;
++};
++
++struct html_z_list {
++	struct box *root;
++	struct html_z_entry *e;
++	unsigned n, alloc;
++	uint32_t seq;
++};
++
++/** the stacking contexts being painted, innermost last; one nested deeper
++ * than this paints its positioned descendants in place, as before */
++#define HTML_Z_DEPTH 32
++static struct html_z_list html_z_stack[HTML_Z_DEPTH];
++static unsigned html_z_depth;
++static struct html_z_list *html_z_top;
++/** the set-aside box being painted now, which is not set aside again */
++static struct box *html_z_painting;
++
++/* the hit test's painting order (VitaSurf): see html_redraw_rank() */
++static bool html_probe_active;
++static uint32_t html_probe_gen;
++static uint32_t html_probe_count;
++
++/** A positioned box's z-index for painting order: auto counts as 0. */
++static int32_t html_z_index(const struct box *box)
++{
++	int32_t z = 0;
++
++	if (css_computed_z_index(box->style, &z) != CSS_Z_INDEX_SET)
++		z = 0;
++	return z;
++}
++
++/** Whether a box is set aside for its stacking context's later pass. */
++static bool html_z_deferrable(const struct box *box)
++{
++	uint8_t position;
++
++	if (box->style == NULL)
++		return false;
++	switch (box->type) {
++	case BOX_BLOCK:
++	case BOX_INLINE_BLOCK:
++	case BOX_FLEX:
++	case BOX_INLINE_FLEX:
++	case BOX_TABLE:
++		break;
++	default:
++		/* an inline's text is its siblings, and would be left
++		 * under its background */
++		return false;
++	}
++	position = css_computed_position(box->style);
++	if (position == CSS_POSITION_STATIC ||
++			position == CSS_POSITION_FIXED)
++		return false;
++	return html_z_index(box) >= 0;
++}
++
++static bool html_z_defer(struct box *box, int x_parent, int y_parent,
++		const struct rect *clip, colour bg,
++		const struct redraw_context *ctx)
++{
++	struct html_z_list *l = html_z_top;
++	struct html_z_entry *e;
++
++	if (l == NULL || box == l->root || box == html_z_painting ||
++			!html_z_deferrable(box))
++		return false;
++	if (l->n == l->alloc) {
++		unsigned grown = l->alloc > 0 ? l->alloc * 2 : 16;
++		struct html_z_entry *ne = realloc(l->e, grown * sizeof(*ne));
++
++		if (ne == NULL)
++			return false;	/* painted in place instead */
++		l->e = ne;
++		l->alloc = grown;
++	}
++	e = &l->e[l->n++];
++	e->box = box;
++	e->x_parent = x_parent;
++	e->y_parent = y_parent;
++	e->clip = *clip;
++	e->bg = bg;
++	e->ctx = *ctx;
++	e->z = html_z_index(box);
++	e->seq = l->seq++;
++	return true;
++}
++
++static int html_z_cmp(const void *a, const void *b)
++{
++	const struct html_z_entry *x = a, *y = b;
++
++	if (x->z != y->z)
++		return x->z < y->z ? -1 : 1;
++	return x->seq < y->seq ? -1 : (x->seq > y->seq ? 1 : 0);
++}
++
++/**
++ * Paint what a stacking context set aside, in order. A box painted
++ * here sets its own positioned descendants aside in the same list, so
++ * the rest is sorted again whenever it grows.
++ */
++static bool html_z_flush(const html_content *html, struct html_z_list *l,
++		float scale)
++{
++	unsigned i = 0, sorted = 0;
++	bool ok = true;
++
++	while (i < l->n) {
++		struct html_z_entry e;
++		struct box *was = html_z_painting;
++
++		if (sorted != l->n) {
++			qsort(l->e + i, l->n - i, sizeof(*l->e), html_z_cmp);
++			sorted = l->n;
++		}
++		e = l->e[i++];
++		html_z_painting = e.box;
++		ok &= html_redraw_box(html, e.box, e.x_parent, e.y_parent,
++				&e.clip, scale, e.bg, &e.ctx);
++		html_z_painting = was;
++	}
++	return ok;
++}
++
+ /**
+  * Recursively draw a box.
+  *
+@@ -3676,9 +3827,16 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	bool pushed = false;
+ 	int transformed;
+ 	bool ok;
++	bool context;
++	struct html_z_list *z_outer = html_z_top, *zl = NULL;
+ 
+ 	vitasurf_redraw_boxes++;
+ 
++	/* a positioned box waits for its stacking context (VitaSurf) */
++	if (html_z_defer(box, x_parent, y_parent, clip,
++			current_background_color, ctx))
++		return true;
++
+ 	if (box->style != NULL) {
+ 		css_fixed op = INTTOFIX(1);
+ 
+@@ -3729,9 +3887,37 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	if (transformed > 0)
+ 		clip = &tclip;
+ 
++	/* the root, a positioned box with a z-index, and one painted
++	 * through a level start a stacking context */
++	context = box == html->layout || pushed || transformed > 0 ||
++			(box->style != NULL &&
++			 css_computed_position(box->style) !=
++					CSS_POSITION_STATIC &&
++			 css_computed_z_index(box->style, &(int32_t){0}) ==
++					CSS_Z_INDEX_SET);
++	if (context && html_z_depth < HTML_Z_DEPTH) {
++		zl = &html_z_stack[html_z_depth++];
++		zl->root = box;
++		zl->n = 0;
++		zl->seq = 0;
++		html_z_top = zl;
++	} else if (context) {
++		/* too deep: its descendants are painted where they stand */
++		html_z_top = NULL;
++	}
++
+ 	ok = html_redraw_box_inner(html, box, x_parent, y_parent, clip, scale,
+ 			current_background_color, ctx);
+ 
++	if (zl != NULL) {
++		ok &= html_z_flush(html, zl, scale);
++		/* the entries' memory stays with the level for the next
++		 * context painted at this depth */
++		html_z_depth--;
++	}
++	if (context)
++		html_z_top = z_outer;
++
+ 	if (transformed > 0)
+ 		html_transform_depth--;
+ 	html_transform_box_level = NULL;
+@@ -3764,6 +3950,12 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 	dom_html_element_type tag_type;
+ 	bool transformed = (html_transform_box_level != NULL);
+ 
++	/* its place in the painting order, for a hit test (VitaSurf) */
++	if (html_probe_active) {
++		box->z_rank = ++html_probe_count;
++		box->z_gen = html_probe_gen;
++	}
++
+ 
+ 	if (html_redraw_printing && (box->flags & PRINTED))
+ 		return true;
+@@ -4781,6 +4973,122 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+  * x, y, clip_[xy][01] are in target coordinates.
+  */
+ 
++static nserror html_probe_clip(const struct redraw_context *ctx,
++		const struct rect *clip)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_arc(const struct redraw_context *ctx,
++		const plot_style_t *style, int x, int y, int radius, int angle1,
++		int angle2)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_disc(const struct redraw_context *ctx,
++		const plot_style_t *style, int x, int y, int radius)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_line(const struct redraw_context *ctx,
++		const plot_style_t *style, const struct rect *line)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_rectangle(const struct redraw_context *ctx,
++		const plot_style_t *style, const struct rect *rect)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_polygon(const struct redraw_context *ctx,
++		const plot_style_t *style, const int *p, unsigned int n)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_path(const struct redraw_context *ctx,
++		const plot_style_t *style, const float *p, unsigned int n,
++		const float transform[6])
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_bitmap(const struct redraw_context *ctx,
++		struct bitmap *bitmap, int x, int y, int width, int height,
++		colour bg, bitmap_flags_t flags)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_text(const struct redraw_context *ctx,
++		const plot_font_style_t *fstyle, int x, int y,
++		const char *text, size_t length)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_group_start(const struct redraw_context *ctx,
++		const char *name)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_group_end(const struct redraw_context *ctx)
++{
++	return NSERROR_OK;
++}
++static nserror html_probe_flush(const struct redraw_context *ctx)
++{
++	return NSERROR_OK;
++}
++
++/** Plotters that plot nothing, for walking the painting order. */
++static const struct plotter_table html_probe_plotters = {
++	.clip = html_probe_clip,
++	.arc = html_probe_arc,
++	.disc = html_probe_disc,
++	.line = html_probe_line,
++	.rectangle = html_probe_rectangle,
++	.polygon = html_probe_polygon,
++	.path = html_probe_path,
++	.bitmap = html_probe_bitmap,
++	.text = html_probe_text,
++	.group_start = html_probe_group_start,
++	.group_end = html_probe_group_end,
++	.flush = html_probe_flush,
++	.option_knockout = false,
++};
++
++/* exported interface documented in html/private.h */
++uint32_t html_redraw_rank(html_content *html, int x, int y)
++{
++	struct redraw_context ctx = {
++		.interactive = true,
++		.background_images = true,
++		.plot = &html_probe_plotters,
++		.priv = NULL,
++	};
++	struct rect clip = { x, y, x + 1, y + 1 };
++	int i;
++
++	if (html->layout == NULL || html_z_top != NULL)
++		return 0;
++
++	if (++html_probe_gen == 0)
++		html_probe_gen = 1;
++	html_probe_count = 0;
++	html_probe_active = true;
++
++	html->n_fixed = 0;
++	html->drawing_fixed = false;
++	html_redraw_box(html, html->layout, 0, 0, &clip, 1.0, 0xffffff,
++			&ctx);
++	html->drawing_fixed = true;
++	for (i = 0; i < html->n_fixed; i++) {
++		html_redraw_box(html, html->fixed_box[i], html->fixed_x[i],
++				html->fixed_y[i], &clip, 1.0, 0xffffff, &ctx);
++	}
++	html->drawing_fixed = false;
++	html->n_fixed = 0;
++
++	html_probe_active = false;
++	return html_probe_gen;
++}
++
+ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 		const struct rect *clip, const struct redraw_context *ctx)
+ {
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index 07e29c619..56a0d437b 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -267,6 +267,7 @@ CORESTRING_DOM_STRING(keypress);
+ CORESTRING_DOM_STRING(keyup);
+ CORESTRING_DOM_STRING(link);
+ CORESTRING_DOM_STRING(lang);
++CORESTRING_DOM_STRING(tabindex);
+ CORESTRING_DOM_STRING(languagechange);
+ CORESTRING_DOM_STRING(load);
+ CORESTRING_DOM_STRING(loadeddata);

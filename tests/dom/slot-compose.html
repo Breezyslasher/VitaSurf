@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!-- A shadow host's own children are drawn in its slots. Shadow DOM is
+     kept as light DOM here, so the boxes are built from the composed
+     tree: a child naming a slot is drawn inside that slot, the others
+     inside the unnamed one, and one naming no slot the host has is not
+     drawn. The host here renders the way Lit does, between a marker
+     comment and the node that was its first child.
+     Expected console output: five lines ending in "ok". -->
+<html><body>
+<x-card id=card><em id=plain>body</em><span id=named slot=title>Title</span><span id=nowhere slot=gone>x</span></x-card>
+<script>
+var card = document.getElementById('card'), first = card.firstChild;
+card.attachShadow({mode: 'open'});
+var marker = document.createComment('');
+card.insertBefore(marker, first);
+var head = document.createElement('h3'), hs = document.createElement('slot');
+hs.setAttribute('name', 'title'); head.appendChild(hs);
+var main = document.createElement('p'), ms = document.createElement('slot');
+main.appendChild(ms);
+card.insertBefore(head, first);
+card.insertBefore(main, first);
+card._$litPart$ = {_$startNode: marker, options: {renderBefore: first}};
+function R(n) { return n.getBoundingClientRect(); }
+function inside(a, b) { a = R(a); b = R(b); return a.width > 0 && a.left >= b.left && a.right <= b.right && a.top >= b.top && a.bottom <= b.bottom; }
+setTimeout(function () {
+  console.log("named child in its slot:", inside(document.getElementById('named'), head) ? "ok" : "FAIL " + JSON.stringify(R(document.getElementById('named'))) + ' ' + JSON.stringify(R(head)));
+  console.log("other child in the unnamed slot:", inside(document.getElementById('plain'), main) ? "ok" : "FAIL " + JSON.stringify(R(document.getElementById('plain'))));
+  console.log("slot title drawn first:", R(document.getElementById('named')).top < R(document.getElementById('plain')).top ? "ok" : "FAIL");
+  console.log("no slot, not drawn:", R(document.getElementById('nowhere')).width === 0 ? "ok" : "FAIL " + JSON.stringify(R(document.getElementById('nowhere'))));
+  console.log("assignedSlot:", document.getElementById('named').assignedSlot === hs && document.getElementById('nowhere').assignedSlot === null ? "ok" : "FAIL");
+}, 1000);
+</script></body></html>

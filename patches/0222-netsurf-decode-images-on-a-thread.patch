@@ -1,0 +1,806 @@
+diff --git a/content/handlers/image/image_cache.c b/content/handlers/image/image_cache.c
+index 92b30a3a2..025be8aa0 100644
+--- a/content/handlers/image/image_cache.c
++++ b/content/handlers/image/image_cache.c
+@@ -26,6 +26,7 @@
+ #include <stdbool.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <pthread.h>
+ 
+ #include "netsurf/inttypes.h"
+ #include "utils/utils.h"
+@@ -46,6 +47,9 @@
+ 
+ struct image_cache_entry_s;
+ static void image_cache_decode(struct image_cache_entry_s *centry);
++static void image_cache_decoder_forget(struct image_cache_entry_s *centry);
++static void image_cache_decoder_stop(void);
++static void image_cache_decoder_collect(void);
+ 
+ /**
+  * Age of an entry within the cache
+@@ -77,6 +81,11 @@ struct image_cache_entry_s {
+ 	cache_age bitmap_age; /**< Age of last conversion to a bitmap by cache*/
+ 
+ 	int conversion_count; /**< Number of times image has been converted */
++
++	/* the decode thread (VitaSurf) */
++	bool threadsafe; /**< convert may run on the decode thread */
++	bool queued;     /**< a decode job for it is outstanding */
++	bool decode_failed; /**< the thread's decode came back empty */
+ };
+ 
+ /**
+@@ -321,6 +330,11 @@ static void image_cache__free_entry(struct image_cache_entry_s *centry)
+ 		image_cache->total_unrendered++;
+ 	}
+ 
++	/* the decode thread must be done with its content first */
++	if (centry->queued) {
++		image_cache_decoder_forget(centry);
++	}
++
+ 	image_cache__free_bitmap(centry);
+ 
+ 	image_cache__unlink(centry);
+@@ -477,6 +491,8 @@ nserror image_cache_fini(void)
+ 	NSLOG(netsurf, INFO, "Size at finish %"PRIsizet" (in %d)",
+ 	      image_cache->total_bitmap_size, image_cache->bitmap_count);
+ 
++	image_cache_decoder_stop();
++
+ 	while (image_cache->entries != NULL) {
+ 		image_cache__free_entry(image_cache->entries);
+ 	}
+@@ -993,13 +1009,16 @@ static unsigned int decode_frame_n;
+ /* where skipped images were, merged into the last once full */
+ #define IMAGE_CACHE_DEFERRED_MAX 32
+ static struct rect deferred[IMAGE_CACHE_DEFERRED_MAX];
++static const void *deferred_key[IMAGE_CACHE_DEFERRED_MAX];
+ static int deferred_n;
+ static struct image_cache_decode_stats decode_stats;
+ static uint64_t decode_stats_us;
++static uint64_t decode_threaded_us;
+ 
+ /* exported interface documented in image_cache.h */
+ void image_cache_frame(bool hold, unsigned int budget_us)
+ {
++	image_cache_decoder_collect();
+ 	decode_hold = hold;
+ 	decode_budget_us = budget_us;
+ 	decode_frame_us = 0;
+@@ -1007,16 +1026,19 @@ void image_cache_frame(bool hold, unsigned int budget_us)
+ }
+ 
+ /* exported interface documented in image_cache.h */
+-int image_cache_take_deferred(struct rect *out, int max)
++int image_cache_take_deferred(struct rect *out, const void **key, int max)
+ {
+ 	int i, n = 0;
+ 
+ 	for (i = 0; i < deferred_n; i++) {
+ 		if (n < max) {
++			key[n] = deferred_key[i];
+ 			out[n++] = deferred[i];
+ 		} else {
+ 			struct rect *m = &out[max - 1];
+ 
++			/* a merged area waits for nothing in particular */
++			key[max - 1] = NULL;
+ 			if (deferred[i].x0 < m->x0) m->x0 = deferred[i].x0;
+ 			if (deferred[i].y0 < m->y0) m->y0 = deferred[i].y0;
+ 			if (deferred[i].x1 > m->x1) m->x1 = deferred[i].x1;
+@@ -1039,30 +1061,22 @@ void image_cache_take_decode_stats(struct image_cache_decode_stats *s)
+ {
+ 	*s = decode_stats;
+ 	s->ms = (unsigned int)(decode_stats_us / 1000);
++	s->threaded_ms = (unsigned int)(decode_threaded_us / 1000);
+ 	memset(&decode_stats, 0, sizeof(decode_stats));
+ 	decode_stats_us = 0;
++	decode_threaded_us = 0;
+ }
+ 
+ /**
+- * Whether an image may be decoded now, in an interactive redraw; if
+- * not, where it would have been drawn is recorded (VitaSurf).
++ * Record where an image would have been drawn, for it to be drawn again
++ * later (VitaSurf). key is what it waits for: the content, while the
++ * decode thread has it, or NULL when it only waits for its turn.
+  */
+-static bool image_cache_may_decode(const struct content *c,
+-		const struct content_redraw_data *data,
+-		const struct rect *clip)
++static void image_cache_defer(const struct content_redraw_data *data,
++		const struct rect *clip, const void *key)
+ {
+ 	struct rect r;
+ 
+-	if (decode_hold &&
+-	    (uint64_t)c->width * (uint64_t)c->height >
+-			IMAGE_CACHE_HOLD_PIXELS) {
+-		decode_stats.held++;
+-	} else if (image_cache_frame_spent()) {
+-		decode_stats.budgeted++;
+-	} else {
+-		return true;
+-	}
+-
+ 	/* a tiled background can cover the whole clip */
+ 	r = *clip;
+ 	if (!data->repeat_x) {
+@@ -1075,7 +1089,7 @@ static bool image_cache_may_decode(const struct content *c,
+ 	}
+ 	if (r.x1 <= r.x0 || r.y1 <= r.y0) {
+ 		/* nothing of it shows: nothing to come back for */
+-		return false;
++		return;
+ 	}
+ 	{
+ 		int i;
+@@ -1085,19 +1099,41 @@ static bool image_cache_may_decode(const struct content *c,
+ 		for (i = 0; i < deferred_n; i++) {
+ 			if (deferred[i].x0 == r.x0 && deferred[i].y0 == r.y0 &&
+ 			    deferred[i].x1 == r.x1 && deferred[i].y1 == r.y1) {
+-				return false;
++				return;
+ 			}
+ 		}
+ 		if (deferred_n < IMAGE_CACHE_DEFERRED_MAX) {
++			deferred_key[deferred_n] = key;
+ 			deferred[deferred_n++] = r;
+-			return false;
++			return;
+ 		}
+ 		m = &deferred[IMAGE_CACHE_DEFERRED_MAX - 1];
++		deferred_key[IMAGE_CACHE_DEFERRED_MAX - 1] = NULL;
+ 		if (r.x0 < m->x0) m->x0 = r.x0;
+ 		if (r.y0 < m->y0) m->y0 = r.y0;
+ 		if (r.x1 > m->x1) m->x1 = r.x1;
+ 		if (r.y1 > m->y1) m->y1 = r.y1;
+ 	}
++}
++
++/**
++ * Whether an image may be decoded now, in an interactive redraw; if
++ * not, where it would have been drawn is recorded (VitaSurf).
++ */
++static bool image_cache_may_decode(const struct content *c,
++		const struct content_redraw_data *data,
++		const struct rect *clip)
++{
++	if (decode_hold &&
++	    (uint64_t)c->width * (uint64_t)c->height >
++			IMAGE_CACHE_HOLD_PIXELS) {
++		decode_stats.held++;
++	} else if (image_cache_frame_spent()) {
++		decode_stats.budgeted++;
++	} else {
++		return true;
++	}
++	image_cache_defer(data, clip, NULL);
+ 	return false;
+ }
+ 
+@@ -1132,6 +1168,322 @@ static void image_cache_decode(struct image_cache_entry_s *centry)
+ 	}
+ }
+ 
++
++/*
++ * The decode thread (VitaSurf).
++ *
++ * Pacing decodes keeps several from piling into one frame, but a single
++ * large one still holds its frame for as long as it takes. A handler
++ * whose convert routine touches nothing but the content's source data
++ * and a new bitmap marks its entries threadsafe, and those are decoded
++ * on a thread of their own: the redraw queues the entry and draws
++ * nothing, the thread decodes, and the main thread takes the bitmap at
++ * the start of a frame and has the place drawn again. This is what
++ * Vita_Suwayomi does with its covers.
++ *
++ * Only the main thread touches the cache's entries. The thread sees a
++ * job: the content, whose source data stays put while the content
++ * lives, and the convert routine. An entry freed with a job still out
++ * takes the job back, or waits for the thread to finish it.
++ */
++
++/* jobs waiting at most; past it the oldest is dropped, and its image
++ * queued again if it is drawn again */
++#define DECODER_QUEUE_MAX 64
++/* the thread's stack: the decoders' own state is on the heap */
++#define DECODER_STACK_SIZE (256 * 1024)
++
++struct decode_job {
++	struct decode_job *next;
++	struct image_cache_entry_s *centry;
++	struct content *content;
++	image_cache_convert_fn *convert;
++	struct bitmap *result;
++	uint64_t us;
++};
++
++static pthread_mutex_t decoder_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t decoder_wake = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t decoder_idle = PTHREAD_COND_INITIALIZER;
++static pthread_t decoder_thread;
++static bool decoder_on;
++static bool decoder_quit;
++static struct decode_job *decoder_head, *decoder_tail;
++static unsigned int decoder_waiting;
++static struct decode_job *decoder_running;
++static struct decode_job *decoder_done;
++static void (*decoder_started)(void);
++
++static void *image_cache_decoder_main(void *arg)
++{
++	(void)arg;
++	if (decoder_started != NULL) {
++		decoder_started();
++	}
++	pthread_mutex_lock(&decoder_lock);
++	while (!decoder_quit) {
++		struct decode_job *job;
++		uint64_t t0;
++
++		if (decoder_head == NULL) {
++			pthread_cond_wait(&decoder_wake, &decoder_lock);
++			continue;
++		}
++		job = decoder_head;
++		decoder_head = job->next;
++		if (decoder_head == NULL) {
++			decoder_tail = NULL;
++		}
++		decoder_waiting--;
++		decoder_running = job;
++		pthread_mutex_unlock(&decoder_lock);
++
++		t0 = vitasurf_clock_us();
++		job->result = job->convert(job->content);
++		job->us = vitasurf_clock_us() - t0;
++
++		pthread_mutex_lock(&decoder_lock);
++		decoder_running = NULL;
++		job->next = decoder_done;
++		decoder_done = job;
++		pthread_cond_broadcast(&decoder_idle);
++	}
++	pthread_mutex_unlock(&decoder_lock);
++	return NULL;
++}
++
++/* exported interface documented in image_cache.h */
++bool image_cache_start_decoder(void (*started)(void))
++{
++	pthread_attr_t attr;
++	bool ok;
++
++	if (decoder_on) {
++		return true;
++	}
++	decoder_started = started;
++	decoder_quit = false;
++	if (pthread_attr_init(&attr) != 0) {
++		return false;
++	}
++	pthread_attr_setstacksize(&attr, DECODER_STACK_SIZE);
++	ok = pthread_create(&decoder_thread, &attr,
++			    image_cache_decoder_main, NULL) == 0;
++	pthread_attr_destroy(&attr);
++	decoder_on = ok;
++	return ok;
++}
++
++/** Stop the thread and throw away what it has not handed over. */
++static void image_cache_decoder_stop(void)
++{
++	struct decode_job *job;
++
++	if (!decoder_on) {
++		return;
++	}
++	pthread_mutex_lock(&decoder_lock);
++	decoder_quit = true;
++	pthread_cond_broadcast(&decoder_wake);
++	pthread_mutex_unlock(&decoder_lock);
++	pthread_join(decoder_thread, NULL);
++	decoder_on = false;
++
++	while ((job = decoder_head) != NULL) {
++		decoder_head = job->next;
++		job->centry->queued = false;
++		free(job);
++	}
++	decoder_tail = NULL;
++	decoder_waiting = 0;
++	while ((job = decoder_done) != NULL) {
++		decoder_done = job->next;
++		job->centry->queued = false;
++		if (job->result != NULL) {
++			guit->bitmap->destroy(job->result);
++		}
++		free(job);
++	}
++}
++
++/** Hand an entry to the thread; main thread, entry not queued. */
++static void image_cache_decoder_queue(struct image_cache_entry_s *centry)
++{
++	struct decode_job *job = calloc(1, sizeof(*job));
++	struct decode_job *dropped = NULL;
++
++	if (job == NULL) {
++		return;
++	}
++	job->centry = centry;
++	job->content = centry->content;
++	job->convert = centry->convert;
++	centry->queued = true;
++
++	pthread_mutex_lock(&decoder_lock);
++	if (decoder_waiting >= DECODER_QUEUE_MAX) {
++		/* the oldest is the least likely still to be in view */
++		dropped = decoder_head;
++		decoder_head = dropped->next;
++		if (decoder_head == NULL) {
++			decoder_tail = NULL;
++		}
++		decoder_waiting--;
++	}
++	if (decoder_tail != NULL) {
++		decoder_tail->next = job;
++	} else {
++		decoder_head = job;
++	}
++	decoder_tail = job;
++	decoder_waiting++;
++	pthread_cond_signal(&decoder_wake);
++	pthread_mutex_unlock(&decoder_lock);
++
++	if (dropped != NULL) {
++		dropped->centry->queued = false;
++		decode_stats.dropped++;
++		free(dropped);
++	}
++	decode_stats.queued++;
++}
++
++/**
++ * Take an entry's job back before the entry is freed: out of the
++ * queue, or out of the finished list once the thread has done with it.
++ */
++static void image_cache_decoder_forget(struct image_cache_entry_s *centry)
++{
++	struct decode_job **pp, *job, *prev = NULL;
++
++	pthread_mutex_lock(&decoder_lock);
++	for (job = decoder_head; job != NULL; prev = job, job = job->next) {
++		if (job->centry == centry) {
++			if (prev != NULL) {
++				prev->next = job->next;
++			} else {
++				decoder_head = job->next;
++			}
++			if (decoder_tail == job) {
++				decoder_tail = prev;
++			}
++			decoder_waiting--;
++			free(job);
++			break;
++		}
++	}
++	while (decoder_running != NULL && decoder_running->centry == centry) {
++		pthread_cond_wait(&decoder_idle, &decoder_lock);
++	}
++	for (pp = &decoder_done; *pp != NULL; pp = &(*pp)->next) {
++		if ((*pp)->centry == centry) {
++			job = *pp;
++			*pp = job->next;
++			if (job->result != NULL) {
++				guit->bitmap->destroy(job->result);
++			}
++			free(job);
++			break;
++		}
++	}
++	pthread_mutex_unlock(&decoder_lock);
++	centry->queued = false;
++}
++
++/** Take what the thread has finished; main thread, once a frame. */
++static void image_cache_decoder_collect(void)
++{
++	struct decode_job *job;
++
++	if (!decoder_on) {
++		return;
++	}
++	pthread_mutex_lock(&decoder_lock);
++	job = decoder_done;
++	decoder_done = NULL;
++	pthread_mutex_unlock(&decoder_lock);
++
++	while (job != NULL) {
++		struct decode_job *next = job->next;
++		struct image_cache_entry_s *centry = job->centry;
++		unsigned int ms = (unsigned int)(job->us / 1000);
++		unsigned int kpx = (unsigned int)
++			(((uint64_t)centry->content->width *
++			  (uint64_t)centry->content->height) / 1000);
++
++		centry->queued = false;
++		decode_stats.threaded++;
++		decode_threaded_us += job->us;
++		if (ms > decode_stats.threaded_max_ms) {
++			decode_stats.threaded_max_ms = ms;
++			decode_stats.threaded_max_kpixels = kpx;
++		}
++		if (ms >= IMAGE_CACHE_SLOW_DECODE_MS) {
++			const char *url = nsurl_access_leaf(
++					llcache_handle_get_url(
++						centry->content->llcache));
++
++			vita_log("images: the decode thread took %u ms "
++				 "for %dx%d %s", ms,
++				 centry->content->width,
++				 centry->content->height,
++				 url != NULL ? url : "?");
++		}
++		if (job->result == NULL) {
++			centry->decode_failed = true;
++		} else if (centry->bitmap != NULL) {
++			/* decoded meanwhile on this thread */
++			guit->bitmap->destroy(job->result);
++		} else {
++			centry->bitmap = job->result;
++			image_cache_stats_bitmap_add(centry, centry->bitmap);
++			image_cache->miss_count++;
++			image_cache->miss_size += centry->bitmap_size;
++		}
++		free(job);
++		job = next;
++	}
++}
++
++/* exported interface documented in image_cache.h */
++bool image_cache_decoder_busy(void)
++{
++	bool busy;
++
++	if (!decoder_on) {
++		return false;
++	}
++	pthread_mutex_lock(&decoder_lock);
++	busy = decoder_head != NULL || decoder_running != NULL ||
++		decoder_done != NULL;
++	pthread_mutex_unlock(&decoder_lock);
++	return busy;
++}
++
++/* exported interface documented in image_cache.h */
++bool image_cache_ready(const void *key)
++{
++	struct image_cache_entry_s *centry;
++
++	if (key == NULL) {
++		return true;
++	}
++	centry = image_cache__find(key);
++	/* gone, or dropped from the queue: drawing it again does no
++	 * harm, and queues it again if it is still wanted */
++	return centry == NULL || !centry->queued;
++}
++
++/* exported interface documented in image_cache.h */
++void image_cache_set_threadsafe(struct content *c)
++{
++	struct image_cache_entry_s *centry = image_cache__find(c);
++
++	if (centry != NULL) {
++		centry->threadsafe = true;
++	}
++}
++
+ /* exported interface documented in image_cache.h */
+ bool image_cache_redraw(struct content *c,
+ 			struct content_redraw_data *data,
+@@ -1149,7 +1501,24 @@ bool image_cache_redraw(struct content *c,
+ 	}
+ 
+ 	if (centry->bitmap == NULL) {
++		if (centry->decode_failed) {
++			image_cache->fail_count++;
++			return false;
++		}
+ 		if (centry->convert != NULL) {
++			/* a large one the decode thread can take goes
++			 * there, and is drawn as nothing until it is
++			 * back (VitaSurf) */
++			if (ctx->interactive && decoder_on &&
++			    centry->threadsafe &&
++			    (uint64_t)c->width * (uint64_t)c->height >
++					IMAGE_CACHE_HOLD_PIXELS) {
++				if (!centry->queued) {
++					image_cache_decoder_queue(centry);
++				}
++				image_cache_defer(data, clip, c);
++				return true;
++			}
+ 			/* on screen, decoding waits its turn and the
+ 			 * image is drawn as nothing meanwhile: it is not
+ 			 * broken, so this is not a failure (VitaSurf) */
+diff --git a/content/handlers/image/image_cache.h b/content/handlers/image/image_cache.h
+index 81b69c948..2e6b2d6c6 100644
+--- a/content/handlers/image/image_cache.h
++++ b/content/handlers/image/image_cache.h
+@@ -236,7 +236,36 @@ void image_cache_frame(bool hold, unsigned int budget_us);
+  * \param max Room in out, at least 1.
+  * \return how many were filled.
+  */
+-int image_cache_take_deferred(struct rect *out, int max);
++int image_cache_take_deferred(struct rect *out, const void **key, int max);
++
++/**
++ * Whether what a deferred image waits for is done, so that drawing its
++ * place again will draw it (VitaSurf).
++ *
++ * \param key The key image_cache_take_deferred() gave with it; NULL
++ *            waits only for decoding to be allowed, and is ready.
++ */
++bool image_cache_ready(const void *key);
++
++/**
++ * Start the decode thread (VitaSurf). Until it runs, every decode is on
++ * the calling thread, paced by image_cache_frame().
++ *
++ * \param started Called on the thread as it starts, to set its core
++ *                and priority; may be NULL.
++ * \return true if the thread is running.
++ */
++bool image_cache_start_decoder(void (*started)(void));
++
++/** Whether the decode thread has work queued, running or to hand over. */
++bool image_cache_decoder_busy(void);
++
++/**
++ * Let an image's decodes run on the decode thread (VitaSurf): for a
++ * handler whose convert routine touches only the content's source data
++ * and the bitmap it makes. Call after image_cache_add().
++ */
++void image_cache_set_threadsafe(struct content *c);
+ 
+ /** Whether this frame's decoding budget is spent. */
+ bool image_cache_frame_spent(void);
+@@ -250,6 +279,12 @@ struct image_cache_decode_stats {
+ 	unsigned int kpixels;      /**< pixels decoded, in thousands */
+ 	unsigned int held;         /**< draws skipped while the view moved */
+ 	unsigned int budgeted;     /**< draws skipped for the frame budget */
++	unsigned int queued;       /**< images given to the decode thread */
++	unsigned int dropped;      /**< of those, dropped as the queue filled */
++	unsigned int threaded;     /**< images the thread decoded */
++	unsigned int threaded_ms;  /**< its time decoding them */
++	unsigned int threaded_max_ms;      /**< its longest */
++	unsigned int threaded_max_kpixels; /**< that one's size */
+ };
+ 
+ /** Fill in the decoding figures since the last call, and reset them. */
+diff --git a/content/handlers/image/jpeg.c b/content/handlers/image/jpeg.c
+index dded52e19..601c8e391 100644
+--- a/content/handlers/image/jpeg.c
++++ b/content/handlers/image/jpeg.c
+@@ -467,6 +467,8 @@ static bool nsjpeg_convert(struct content *c)
+ 	jpeg_destroy_decompress(&cinfo);
+ 
+ 	image_cache_add(c, NULL, jpeg_cache_convert);
++	/* its convert reads only the source data (VitaSurf) */
++	image_cache_set_threadsafe(c);
+ 
+ 	/* set title text */
+ 	title = messages_get_buff("JPEGTitle",
+diff --git a/content/handlers/image/png.c b/content/handlers/image/png.c
+index 7fd3d514b..5d69930db 100644
+--- a/content/handlers/image/png.c
++++ b/content/handlers/image/png.c
+@@ -625,6 +625,8 @@ static bool nspng_convert(struct content *c)
+ 	}
+ 
+ 	image_cache_add(c, png_c->bitmap, png_cache_convert);
++	/* its convert reads only the source data (VitaSurf) */
++	image_cache_set_threadsafe(c);
+ 
+ 	content_set_ready(c);
+ 	content_set_done(c);
+diff --git a/content/handlers/image/webp.c b/content/handlers/image/webp.c
+index c04c0efd2..6dfc88921 100644
+--- a/content/handlers/image/webp.c
++++ b/content/handlers/image/webp.c
+@@ -201,6 +201,8 @@ static bool webp_convert(struct content *c)
+ 	c->size = c->width * c->height * 4;
+ 
+ 	image_cache_add(c, NULL, webp_cache_convert);
++	/* its convert reads only the source data (VitaSurf) */
++	image_cache_set_threadsafe(c);
+ 
+ 	content_set_ready(c);
+ 	content_set_done(c);
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 9bfd02974..03d05205f 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -107,6 +107,7 @@ struct browser_widget_s {
+ 	 * Each is drawn again, on its own, once decoding may go on.
+ 	 */
+ 	struct rect images_waiting[FB_IMAGES_WAITING_MAX];
++	const void *images_key[FB_IMAGES_WAITING_MAX]; /**< what each waits on */
+ 	int images_waiting_n;
+ 	bool images_flush; /**< the redraw is for them alone */
+ };
+@@ -257,6 +258,8 @@ widget_scroll_x(struct gui_window *gw, int x, bool abs)
+  */
+ #define FB_IMAGE_HOLD_US 100000
+ #define FB_IMAGE_BUDGET_US 8000
++/* how soon the loop looks again while the decode thread works (ms) */
++#define FB_DECODER_POLL_MS 16
+ #ifdef __vita__
+ static unsigned long long fb_last_move_us;
+ #endif
+@@ -274,7 +277,8 @@ static void fb_redraw(fbtk_widget_t *widget,
+ 
+ /** Add a waiting image's place, once (VitaSurf). */
+ static void
+-fb_images_add(struct browser_widget_s *bwidget, const struct rect *d)
++fb_images_add(struct browser_widget_s *bwidget, const struct rect *d,
++	      const void *key)
+ {
+ 	struct rect *m;
+ 	int j;
+@@ -284,13 +288,17 @@ fb_images_add(struct browser_widget_s *bwidget, const struct rect *d)
+ 
+ 		if (w->x0 == d->x0 && w->y0 == d->y0 &&
+ 		    w->x1 == d->x1 && w->y1 == d->y1) {
++			bwidget->images_key[j] = key;
+ 			return;
+ 		}
+ 	}
+ 	if (bwidget->images_waiting_n < FB_IMAGES_WAITING_MAX) {
++		bwidget->images_key[bwidget->images_waiting_n] = key;
+ 		bwidget->images_waiting[bwidget->images_waiting_n++] = *d;
+ 		return;
+ 	}
++	/* a merged area waits on nothing in particular */
++	bwidget->images_key[FB_IMAGES_WAITING_MAX - 1] = NULL;
+ 	m = &bwidget->images_waiting[FB_IMAGES_WAITING_MAX - 1];
+ 	if (d->x0 < m->x0) m->x0 = d->x0;
+ 	if (d->y0 < m->y0) m->y0 = d->y0;
+@@ -307,9 +315,10 @@ static void
+ fb_images_waited(struct browser_widget_s *bwidget, int ox, int oy)
+ {
+ 	struct rect r[FB_IMAGES_WAITING_MAX];
++	const void *key[FB_IMAGES_WAITING_MAX];
+ 	int n, i;
+ 
+-	n = image_cache_take_deferred(r, FB_IMAGES_WAITING_MAX);
++	n = image_cache_take_deferred(r, key, FB_IMAGES_WAITING_MAX);
+ 	for (i = 0; i < n; i++) {
+ 		struct rect d;
+ 
+@@ -317,7 +326,7 @@ fb_images_waited(struct browser_widget_s *bwidget, int ox, int oy)
+ 		d.y0 = r[i].y0 - oy;
+ 		d.x1 = r[i].x1 - ox;
+ 		d.y1 = r[i].y1 - oy;
+-		fb_images_add(bwidget, &d);
++		fb_images_add(bwidget, &d, key[i]);
+ 	}
+ }
+ 
+@@ -325,7 +334,10 @@ fb_images_waited(struct browser_widget_s *bwidget, int ox, int oy)
+  * Draw again the images that waited, one at a time, until this frame's
+  * decoding budget is spent (VitaSurf). One left off the screen by a
+  * scroll since is dropped: it is drawn, and decoded, when it comes
+- * back into view. What is not reached stays for the next frame.
++ * back into view. One the decode thread still has waits, and what is
++ * not reached stays for the next frame. Drawing a decoded image is
++ * not free either (a scaled copy is made the first time), so the
++ * redraws themselves stop after FB_IMAGE_BUDGET_US.
+  */
+ static void
+ fb_images_draw_waiting(fbtk_widget_t *widget,
+@@ -333,13 +345,17 @@ fb_images_draw_waiting(fbtk_widget_t *widget,
+ 		       struct browser_window *bw)
+ {
+ 	struct rect left[FB_IMAGES_WAITING_MAX];
++	const void *left_key[FB_IMAGES_WAITING_MAX];
+ 	int n = bwidget->images_waiting_n, i, kept = 0;
+ 	int width = fbtk_get_width(widget);
+ 	int height = fbtk_get_height(widget);
+ 	nsfb_bbox_t queued = bwidget->redraw_box;
+ 	bool queued_required = bwidget->redraw_required;
++	uint64_t t0 = vitasurf_clock_us();
++	bool drew = false;
+ 
+ 	memcpy(left, bwidget->images_waiting, sizeof(left[0]) * n);
++	memcpy(left_key, bwidget->images_key, sizeof(left_key[0]) * n);
+ 	bwidget->images_waiting_n = 0;
+ 	for (i = 0; i < n; i++) {
+ 		int x0 = left[i].x0 - bwidget->scrollx;
+@@ -354,8 +370,11 @@ fb_images_draw_waiting(fbtk_widget_t *widget,
+ 		if (x1 <= x0 || y1 <= y0) {
+ 			continue;
+ 		}
+-		if (image_cache_frame_spent()) {
++		if (!image_cache_ready(left_key[i]) ||
++		    image_cache_frame_spent() ||
++		    (drew && vitasurf_clock_us() - t0 >= FB_IMAGE_BUDGET_US)) {
+ 			/* for the next frame, with any this one adds */
++			left_key[kept] = left_key[i];
+ 			left[kept++] = left[i];
+ 			continue;
+ 		}
+@@ -364,9 +383,10 @@ fb_images_draw_waiting(fbtk_widget_t *widget,
+ 		bwidget->redraw_box.x1 = x1;
+ 		bwidget->redraw_box.y1 = y1;
+ 		fb_redraw(widget, bwidget, bw);
++		drew = true;
+ 	}
+ 	for (i = 0; i < kept; i++) {
+-		fb_images_add(bwidget, &left[i]);
++		fb_images_add(bwidget, &left[i], left_key[i]);
+ 	}
+ 	/* fb_redraw cleared these */
+ 	bwidget->redraw_box = queued;
+@@ -924,9 +944,18 @@ static void fb_images_ask_redraw(void)
+ 			continue;
+ 		}
+ 		bwidget = fbtk_get_userpw(gw->browser);
+-		if (bwidget != NULL && bwidget->images_waiting_n > 0) {
+-			bwidget->images_flush = true;
+-			fbtk_request_redraw(gw->browser);
++		if (bwidget != NULL) {
++			int i;
++
++			/* not while all still wait on the decode thread:
++			 * a redraw asked for would spin the loop */
++			for (i = 0; i < bwidget->images_waiting_n; i++) {
++				if (image_cache_ready(bwidget->images_key[i])) {
++					bwidget->images_flush = true;
++					fbtk_request_redraw(gw->browser);
++					break;
++				}
++			}
+ 		}
+ 	}
+ }
+@@ -977,6 +1006,10 @@ static void framebuffer_run(void)
+ 		sched_us += b - a;
+ 		if (fbtk_get_redraw_pending(fbtk)) {
+ 			timeout = 0;
++		} else if (image_cache_decoder_busy() &&
++			   (timeout < 0 || timeout > FB_DECODER_POLL_MS)) {
++			/* come back for what the decode thread finishes */
++			timeout = FB_DECODER_POLL_MS;
+ 		}
+ 		a = b;
+ #else
+@@ -2768,6 +2801,21 @@ main(int argc, char** argv)
+ 	if (ret != NSERROR_OK) {
+ 		fb_warn_user("Errorcode:", messages_get_errorcode(ret));
+ 	} else {
++#ifdef __vita__
++		/* large images decode beside the page (VitaSurf) */
++		if (!vita_decode_thread_wanted()) {
++			vita_log("images: decoding stays on the main thread "
++				 "(flag file %s)",
++				 VITASURF_NO_DECODE_THREAD_FLAG);
++		} else if (image_cache_start_decoder(
++				   vita_decode_thread_started)) {
++			vita_log("images: large JPEG, PNG and WebP images "
++				 "decode on their own thread");
++		} else {
++			vita_log("images: the decode thread could not be "
++				 "started; decoding stays on the main thread");
++		}
++#endif
+ 		framebuffer_run();
+ 
+ 		browser_window_destroy(bw);

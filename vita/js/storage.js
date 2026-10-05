@@ -29,9 +29,10 @@ function readStore(){
  if (store !== null) return store;
  store = { local: {}, idb: {} };
  try {
-  var text = load ? load() : null;
-  if (text) {
-   var got = JSON.parse(text);
+  /* the bindings parse it (vita/js/qjs.c), so the log can time it */
+  var got = load ? load() : null;
+  if (typeof got === 'string') got = JSON.parse(got);
+  if (got) {
    if (got && typeof got === 'object') {
     if (got.local && typeof got.local === 'object') store.local = got.local;
     if (got.idb && typeof got.idb === 'object') store.idb = got.idb;
@@ -57,7 +58,32 @@ W.addEventListener('pagehide', flush);
 W.addEventListener('beforeunload', flush);
 W.addEventListener('unload', flush);
 
+/*
+ * objectStoreNames and indexNames are DOMStringLists: an array to read,
+ * with contains() and item() besides. They were plain arrays, and the
+ * check every IndexedDB user makes before creating a store --
+ * db.objectStoreNames.contains(name) -- threw "not a function" out of
+ * the page's onsuccess on claude.ai.
+ */
+function stringList(names){
+ Object.defineProperty(names, 'contains', { configurable: true, writable: true,
+  value: function(n){ return this.indexOf(String(n)) >= 0; } });
+ Object.defineProperty(names, 'item', { configurable: true, writable: true,
+  value: function(i){ i = i >>> 0; return i < this.length ? this[i] : null; } });
+ return names;
+}
 /* ------------------------------------------------- the structured clone */
+
+/*
+ * CryptoKeys clone and store as keys (VitaSurf): a page keeps a
+ * non-extractable key in IndexedDB so that it cannot be read out, and
+ * cloning one as an ordinary object lost it. The hooks come from
+ * subtle.js through a registration the prelude takes away again before
+ * any page script runs, because they read a key's material.
+ */
+var keyHooks = null;
+Object.defineProperty(W, '__vitaRegisterKeyClone', { configurable: true,
+ value: function(h){ keyHooks = h; delete W.__vitaRegisterKeyClone; } });
 
 /*
  * IndexedDB stores values, not JSON: a Date comes back a Date, a
@@ -65,6 +91,15 @@ W.addEventListener('unload', flush);
  * is stored and read back still referring to itself. JSON alone loses
  * all three, so types it cannot carry are tagged and rebuilt.
  */
+/*
+ * What a value is, by its brand rather than by instanceof: a message from
+ * a frame carries that frame's Dates and Maps, which are not instances of
+ * this window's (VitaSurf).
+ */
+function brand(v){
+ return Object.prototype.toString.call(v).slice(8, -1);
+}
+
 function encode(value){
  var seen = [], out = [];
  function walk(v){
@@ -84,24 +119,26 @@ function encode(value){
   if (at >= 0) return { $: 'ref', i: at };
   seen.push(v); out.push(null);
   var slot = out.length - 1, enc;
-  if (v instanceof Date) {
+  if (keyHooks && keyHooks.is(v)) {
+   enc = { $: 'key', v: walk(keyHooks.pack(v)) };
+  } else if (brand(v) === 'Date') {
    enc = { $: 'date', v: v.getTime() };
-  } else if (v instanceof RegExp) {
+  } else if (brand(v) === 'RegExp') {
    enc = { $: 'regexp', s: v.source, f: v.flags };
-  } else if (typeof Blob === 'function' && v instanceof Blob) {
+  } else if (brand(v) === 'Blob' || brand(v) === 'File') {
    /* a Blob's bytes are not reachable synchronously here, so it is
       stored as its text, which is what a page that stores one wants */
    enc = { $: 'blob', t: v.type || '', v: v._t === undefined ? '' : String(v._t) };
-  } else if (v instanceof ArrayBuffer) {
+  } else if (brand(v) === 'ArrayBuffer') {
    enc = { $: 'ab', v: bytesToString(new Uint8Array(v)) };
   } else if (ArrayBuffer.isView(v)) {
    enc = { $: 'view', n: v.constructor.name,
            v: bytesToString(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) };
-  } else if (v instanceof Map) {
+  } else if (brand(v) === 'Map') {
    var pairs = [];
    v.forEach(function(val, key){ pairs.push([walk(key), walk(val)]); });
    enc = { $: 'map', v: pairs };
-  } else if (v instanceof Set) {
+  } else if (brand(v) === 'Set') {
    var items = [];
    v.forEach(function(item){ items.push(walk(item)); });
    enc = { $: 'set', v: items };
@@ -127,6 +164,8 @@ function decode(packed){
   var e = table[i], v;
   switch (e && e.$) {
    case 'date': v = new Date(e.v); built[i] = v; return v;
+   case 'key':
+    v = keyHooks ? keyHooks.unpack(take(e.v)) : null; built[i] = v; return v;
    case 'regexp': v = new RegExp(e.s, e.f); built[i] = v; return v;
    case 'blob':
     v = typeof Blob === 'function' ? new Blob([e.v], { type: e.t }) : e.v;
@@ -243,11 +282,16 @@ function fireStorage(key, oldValue, newValue){
 }
 
 W.Storage = Storage;
+/* The store is kept here, not on the window: it was window._ls, and Home
+   Assistant's page defines a global function _ls to load its scripts, so
+   localStorage came back as that function and the app stopped at
+   "not a function" (VitaSurf). */
+var localStore = null;
 Object.defineProperty(W, 'localStorage', {
  configurable: true,
  get: function(){
-  if (!this._ls) this._ls = new Storage(readStore().local, true);
-  return this._ls;
+  if (!localStore) localStore = new Storage(readStore().local, true);
+  return localStore;
  }
 });
 W.sessionStorage = new Storage({}, false);	/* by design, not persisted */
@@ -473,7 +517,7 @@ function IDBTransaction(db, names, mode){
  Target.call(this);
  this.db = db;
  this.mode = mode || 'readonly';
- this.objectStoreNames = names.slice().sort();
+ this.objectStoreNames = stringList(names.slice().sort());
  this.error = null;
  this.durability = 'default';
  this.oncomplete = null; this.onerror = null; this.onabort = null;
@@ -483,7 +527,19 @@ function IDBTransaction(db, names, mode){
  this._snapshot = null;
  if (this.mode !== 'readonly') {
   /* what to put back if this transaction is abandoned */
-  this._snapshot = JSON.stringify(db._data.stores);
+  if (this.mode === 'versionchange') {
+   this._snapshot = JSON.stringify(db._data.stores);
+  } else {
+   /* only the stores it may write, and only their record lists:
+      records are replaced, never changed in place, so a copy of the
+      list is enough to put back, where serialising every store made
+      each small write cost the whole database (VitaSurf) */
+   this._lists = {};
+   for (var i = 0; i < names.length; i++) {
+    var st = db._data.stores[names[i]];
+    if (st) this._lists[names[i]] = { records: st.records.slice(), nextKey: st.nextKey };
+   }
+  }
  }
  var self = this;
  /* The transaction is active for as long as script keeps adding to it,
@@ -545,6 +601,15 @@ IDBTransaction.prototype._abort = function(err){
  if (this._snapshot !== null) {
   try { this.db._data.stores = JSON.parse(this._snapshot); } catch (e) {}
   touch();
+ } else if (this._lists) {
+  var stores = this.db._data.stores, n;
+  for (n in this._lists) {
+   if (stores[n]) {
+    stores[n].records = this._lists[n].records;
+    stores[n].nextKey = this._lists[n].nextKey;
+   }
+  }
+  touch();
  }
  this.error = err || DOMEx('AbortError', 'this transaction was abandoned');
  /*
@@ -570,7 +635,7 @@ function IDBObjectStore(tx, name){
  if (!this._s) throw DOMEx('NotFoundError', 'no store ' + name);
  this.keyPath = this._s.keyPath === undefined ? null : this._s.keyPath;
  this.autoIncrement = !!this._s.autoIncrement;
- this.indexNames = Object.keys(this._s.indexes || {}).sort();
+ this.indexNames = stringList(Object.keys(this._s.indexes || {}).sort());
 }
 
 function recordsOf(s){ return s.records; }
@@ -584,11 +649,31 @@ function findAt(s, key){
  }
  return -(lo + 1);
 }
+/* the first record at or above key, or above it when open */
+function lowerAt(s, key, open){
+ var lo = 0, hi = s.records.length;
+ while (lo < hi) {
+  var mid = (lo + hi) >> 1, c = cmpKeys(decode(s.records[mid].k), key);
+  if (c < 0 || (c === 0 && open)) lo = mid + 1; else hi = mid;
+ }
+ return lo;
+}
+/*
+ * The records a range takes in, found by halving to its lower end and
+ * walking to its upper one. Checking every record against the range made
+ * a get() cost the whole store: Home Assistant's icon cache holds
+ * thousands, and its icon lookups spent 32 seconds here (VitaSurf).
+ */
 function inRange(s, range, desc){
- var out = [], i;
- for (i = 0; i < s.records.length; i++) {
-  var k = decode(s.records[i].k);
-  if (range.includes(k)) out.push({ key: k, rec: s.records[i] });
+ var out = [], recs = s.records, i = 0;
+ if (range.lower !== undefined) i = lowerAt(s, range.lower, range.lowerOpen);
+ for (; i < recs.length; i++) {
+  var k = decode(recs[i].k);
+  if (range.upper !== undefined) {
+   var d = cmpKeys(k, range.upper);
+   if (d > 0 || (d === 0 && range.upperOpen)) break;
+  }
+  out.push({ key: k, rec: recs[i] });
  }
  if (desc) out.reverse();
  return out;
@@ -730,7 +815,7 @@ IDBObjectStore.prototype = {
   this._s.indexes[String(name)] = {
    keyPath: keyPath, unique: !!options.unique, multiEntry: !!options.multiEntry
   };
-  this.indexNames = Object.keys(this._s.indexes).sort();
+  this.indexNames = stringList(Object.keys(this._s.indexes).sort());
   touch();
   return new IDBIndex(this, String(name));
  },
@@ -739,7 +824,7 @@ IDBObjectStore.prototype = {
    throw DOMEx('InvalidStateError', 'indexes are removed while upgrading');
   }
   delete this._s.indexes[String(name)];
-  this.indexNames = Object.keys(this._s.indexes).sort();
+  this.indexNames = stringList(Object.keys(this._s.indexes).sort());
   touch();
  },
  index: function(name){
@@ -937,11 +1022,16 @@ IDBCursor.prototype = {
  },
  update: function(value){
   if (this._tx.mode === 'readonly') throw DOMEx('ReadOnlyError', 'this transaction is read only');
-  var h = this._hits[this._at];
+  var h = this._hits[this._at], st = this.source._s || this.source.objectStore._s;
   var req = new IDBRequest(this.source, this._tx);
   var key = this.primaryKey;
   return this._tx._push(function(){
-   h.rec.v = encode(value);
+   /* a new record rather than a change to this one, which an
+      abandoned transaction's copy of the list still holds */
+   var at = st.records.indexOf(h.rec);
+   var rec = { k: h.rec.k, v: encode(value) };
+   if (at >= 0) st.records[at] = rec;
+   h.rec = rec;
    return key;
   }, req);
  },
@@ -990,7 +1080,7 @@ function IDBDatabase(name, data){
  this.name = name;
  this._data = data;
  this.version = data.version;
- this.objectStoreNames = Object.keys(data.stores).sort();
+ this.objectStoreNames = stringList(Object.keys(data.stores).sort());
  this.onversionchange = null; this.onclose = null;
  this._closed = false;
 }
@@ -1017,7 +1107,7 @@ IDBDatabase.prototype.createObjectStore = function(name, options){
   autoIncrement: !!options.autoIncrement,
   nextKey: 1, indexes: {}, records: []
  };
- this.objectStoreNames = Object.keys(this._data.stores).sort();
+ this.objectStoreNames = stringList(Object.keys(this._data.stores).sort());
  if (this._upgradeTx.objectStoreNames.indexOf(name) < 0) {
   this._upgradeTx.objectStoreNames.push(name);
   this._upgradeTx.objectStoreNames.sort();
@@ -1029,7 +1119,7 @@ IDBDatabase.prototype.createObjectStore = function(name, options){
 IDBDatabase.prototype.deleteObjectStore = function(name){
  if (!this._upgradeTx) throw DOMEx('InvalidStateError', 'stores are removed while upgrading');
  delete this._data.stores[String(name)];
- this.objectStoreNames = Object.keys(this._data.stores).sort();
+ this.objectStoreNames = stringList(Object.keys(this._data.stores).sort());
 };
 
 /* ---- the factory ---- */
@@ -1162,13 +1252,13 @@ IDBFactory.prototype = {
    if (!(k in Ctor.prototype)) Ctor.prototype[k] = props[k];
   });
  }
- shape(IDBDatabase, { name: '', version: 0, objectStoreNames: [],
+ shape(IDBDatabase, { name: '', version: 0, objectStoreNames: stringList([]),
                       onabort: null, onclose: null, onerror: null,
                       onversionchange: null });
  shape(IDBTransaction, { db: null, durability: 'default', error: null,
-                         mode: 'readonly', objectStoreNames: [],
+                         mode: 'readonly', objectStoreNames: stringList([]),
                          onabort: null, oncomplete: null, onerror: null });
- shape(IDBObjectStore, { autoIncrement: false, indexNames: [], keyPath: null,
+ shape(IDBObjectStore, { autoIncrement: false, indexNames: stringList([]), keyPath: null,
                          name: '', transaction: null });
  shape(IDBIndex, { keyPath: null, multiEntry: false, name: '',
                    objectStore: null, unique: false });

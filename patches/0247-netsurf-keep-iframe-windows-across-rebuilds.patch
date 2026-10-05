@@ -1,0 +1,448 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 185050257..66028b5c6 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1332,9 +1332,11 @@ static void html_relayout_done(html_content *c, bool success)
+ 	content__reformat(&c->base, false,
+ 			  c->base.available_width, c->base.available_height);
+ 
+-	/* the iframe boxes the window knew about went with the old tree */
++	/* the iframe boxes the window knew about went with the old tree;
++	   the windows stay, with their documents and script, for the
++	   elements still there */
+ 	if (c->bw != NULL && c->page == NULL) {
+-		browser_window_create_iframes(c->bw);
++		browser_window_rebuild_iframes(c->bw);
+ 	}
+ }
+ 
+@@ -1405,7 +1407,7 @@ nserror html_relayout(html_content *htmlc)
+ 
+ 	/* child windows point at iframe boxes in the tree about to go */
+ 	if (htmlc->bw != NULL && htmlc->page == NULL) {
+-		browser_window_destroy_iframes(htmlc->bw);
++		browser_window_detach_iframes(htmlc->bw);
+ 	}
+ 
+ 	html_clear_node_boxes(html);
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+index 40c3b43ce..0d9f975c7 100644
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -33,6 +33,7 @@ struct hlcache_handle;
+ struct gui_window;
+ struct selection;
+ struct nsurl;
++struct dom_node;
+ 
+ /**
+  * history entry page information
+@@ -245,9 +246,16 @@ struct browser_window {
+ 	struct browser_window *children;
+ 	struct browser_window *parent;
+ 
+-	/** [iframe_count] iframes */
++	/** [iframe_count] iframes, each its own allocation so that a
++	 * window can outlive the box tree it was made for (VitaSurf) */
+ 	int iframe_count;
+-	struct browser_window *iframes;
++	struct browser_window **iframes;
++
++	/** for an iframe window, the iframe element it shows, and the URL
++	 * the page last gave it; a rebuilt box tree keeps the window made
++	 * for the same element (VitaSurf) */
++	struct dom_node *frame_node;
++	struct nsurl *frame_src;
+ 
+ 	/** browser window child of root browser window which has input focus */
+ 	struct browser_window *focus;
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 3a64fe4da..db11e1740 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -380,7 +380,7 @@ static bool browser_window_check_throbber(struct browser_window *bw)
+ 
+ 	if (bw->iframes) {
+ 		for (index = 0; index < bw->iframe_count; index++) {
+-			if (browser_window_check_throbber(&bw->iframes[index]))
++			if (browser_window_check_throbber(bw->iframes[index]))
+ 				return true;
+ 		}
+ 	}
+@@ -1961,7 +1961,7 @@ browser_window_set_scale_internal(struct browser_window *bw, float scale)
+ 
+ 	/* scale iframes */
+ 	for (i = 0; i < bw->iframe_count; i++) {
+-		res = browser_window_set_scale_internal(&bw->iframes[i], scale);
++		res = browser_window_set_scale_internal(bw->iframes[i], scale);
+ 	}
+ 
+ 	return res;
+@@ -2021,7 +2021,7 @@ browser_window_find_target_internal(struct browser_window *bw,
+ 
+ 	if (bw->iframes != NULL) {
+ 		for (i = 0; i < bw->iframe_count; i++) {
+-			browser_window_find_target_internal(&bw->iframes[i],
++			browser_window_find_target_internal(bw->iframes[i],
+ 							    target,
+ 							    depth,
+ 							    page,
+@@ -4137,7 +4137,7 @@ void browser_window_stop(struct browser_window *bw)
+ 	if (bw->iframes) {
+ 		children = bw->iframe_count;
+ 		for (index = 0; index < children; index++)
+-			browser_window_stop(&bw->iframes[index]);
++			browser_window_stop(bw->iframes[index]);
+ 	}
+ 
+ 	if (bw->current_content != NULL) {
+diff --git a/desktop/frames.c b/desktop/frames.c
+index 85f18793e..3e23389a5 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -29,8 +29,11 @@
+ #include <time.h>
+ #include <math.h>
+ 
++#include <dom/dom.h>
++
+ #include "utils/log.h"
+ #include "utils/utils.h"
++#include "utils/nsurl.h"
+ #include "netsurf/content.h"
+ #include "content/hlcache.h"
+ #include "html/html.h"
+@@ -184,97 +187,181 @@ void browser_window_handle_scrollbars(struct browser_window *bw)
+ /* exported function documented in desktop/frames.h */
+ nserror browser_window_invalidate_iframe(struct browser_window *bw)
+ {
++	/* between a box tree going and the next, there is nothing to draw */
++	if (bw->box == NULL) {
++		return NSERROR_OK;
++	}
+ 	html_redraw_a_box(bw->parent->current_content, bw->box);
+ 	return NSERROR_OK;
+ }
+ 
++/**
++ * Make the window for one iframe (VitaSurf: its own allocation).
++ */
++static struct browser_window *
++iframe_window_new(struct browser_window *bw, struct content_html_iframe *cur)
++{
++	struct browser_window *window = calloc(1, sizeof(*window));
++
++	if (window == NULL) {
++		return NULL;
++	}
++	if (browser_window_initialise_common(BW_CREATE_NONE,
++			window, NULL) != NSERROR_OK) {
++		free(window);
++		return NULL;
++	}
++	window->browser_window_type = BROWSER_WINDOW_IFRAME;
++	window->no_resize = true;
++	window->scale = bw->scale;
++	if (cur->name != NULL) {
++		window->name = strdup(cur->name);
++	}
++	window->parent = bw;
++	if (cur->box->node != NULL) {
++		window->frame_node = dom_node_ref(cur->box->node);
++	}
++	return window;
++}
++
++/**
++ * Tie an iframe window to its box and give it the box's place.
++ */
++static void
++iframe_window_place(struct browser_window *window,
++		    struct content_html_iframe *cur)
++{
++	struct rect rect;
++
++	window->scrolling = cur->scrolling;
++	window->border = cur->border;
++	window->border_colour = cur->border_colour;
++	window->margin_width = cur->margin_width;
++	window->margin_height = cur->margin_height;
++	window->box = cur->box;
++	window->box->iframe = window;
++
++	box_bounds(window->box, &rect);
++	browser_window_set_position(window, rect.x0, rect.y0);
++	browser_window_set_dimensions(window, rect.x1 - rect.x0,
++			rect.y1 - rect.y0);
++}
++
++/**
++ * Destroy one iframe window and free it.
++ */
++static void iframe_window_free(struct browser_window *window)
++{
++	if (window->box != NULL) {
++		window->box->iframe = NULL;
++		window->box = NULL;
++	}
++	browser_window_destroy_internal(window);
++	if (window->frame_node != NULL) {
++		dom_node_unref(window->frame_node);
++		window->frame_node = NULL;
++	}
++	if (window->frame_src != NULL) {
++		nsurl_unref(window->frame_src);
++		window->frame_src = NULL;
++	}
++	free(window);
++}
++
+ /* exported function documented in desktop/frames.h */
+ nserror browser_window_create_iframes(struct browser_window *bw)
++{
++	/* no windows to keep: every iframe gets a new one */
++	return browser_window_rebuild_iframes(bw);
++}
++
++/* exported function documented in desktop/frames.h */
++nserror browser_window_rebuild_iframes(struct browser_window *bw)
+ {
+ 	nserror ret = NSERROR_OK;
+-	struct browser_window *window;
+-	struct content_html_iframe *cur;
+-	struct rect rect;
+-	int iframes = 0;
+-	int index;
+-	struct content_html_iframe *iframe;
++	struct browser_window **old = bw->iframes, **fresh = NULL;
++	int old_count = bw->iframe_count;
++	struct content_html_iframe *cur, *iframe = NULL;
++	bool *navigate = NULL;
++	int iframes = 0, n = 0, i, j;
+ 
++	bw->iframes = NULL;
+ 	bw->iframe_count = 0;
+ 
+ 	/* only html contents can have iframes */
+-	if (content_get_type(bw->current_content) != CONTENT_HTML) {
+-		return NSERROR_OK;
++	if (bw->current_content != NULL &&
++	    content_get_type(bw->current_content) == CONTENT_HTML) {
++		iframe = html_get_iframe(bw->current_content);
+ 	}
+-
+-	/* obtain the iframes for this content */
+-	iframe = html_get_iframe(bw->current_content);
+-	if (iframe == NULL) {
+-		return NSERROR_OK;
+-	}
+-
+-	/* Count iframe list and allocate enough space within the
+-	 * browser window.
+-	 */
+ 	for (cur = iframe; cur; cur = cur->next) {
+ 		iframes++;
+ 	}
+-	bw->iframes = calloc(iframes, sizeof(*bw));
+-	if (!bw->iframes) {
+-		return NSERROR_NOMEM;
++	if (iframes > 0) {
++		fresh = calloc(iframes, sizeof(*fresh));
++		navigate = calloc(iframes, sizeof(*navigate));
++		if (fresh == NULL || navigate == NULL) {
++			free(fresh);
++			free(navigate);
++			fresh = NULL;
++			navigate = NULL;
++			iframes = 0;
++			ret = NSERROR_NOMEM;
++		}
+ 	}
+-	bw->iframe_count = iframes;
+ 
+-	index = 0;
+-	for (cur = iframe; cur; cur = cur->next) {
+-		window = &(bw->iframes[index++]);
+-
+-		/* Initialise common parts */
+-		browser_window_initialise_common(BW_CREATE_NONE,
+-				window, NULL);
+-
+-		/* window characteristics */
+-		window->browser_window_type = BROWSER_WINDOW_IFRAME;
+-		window->scrolling = cur->scrolling;
+-		window->border = cur->border;
+-		window->border_colour = cur->border_colour;
+-		window->no_resize = true;
+-		window->margin_width = cur->margin_width;
+-		window->margin_height = cur->margin_height;
+-		window->scale = bw->scale;
+-		if (cur->name != NULL) {
+-			window->name = strdup(cur->name);
+-			if (window->name == NULL) {
+-				free(bw->iframes) ;
+-				bw->iframes = 0;
+-				bw->iframe_count = 0;
+-				return NSERROR_NOMEM;
++	for (cur = iframe; cur && n < iframes; cur = cur->next) {
++		struct browser_window *window = NULL;
++
++		/* the window made for the same element, if there was one */
++		for (j = 0; j < old_count && cur->box->node != NULL; j++) {
++			if (old[j] != NULL &&
++			    old[j]->frame_node == cur->box->node) {
++				window = old[j];
++				old[j] = NULL;
++				break;
+ 			}
+ 		}
++		if (window == NULL) {
++			window = iframe_window_new(bw, cur);
++			if (window == NULL) {
++				ret = NSERROR_NOMEM;
++				continue;
++			}
++		}
++		iframe_window_place(window, cur);
++		/* a new window, or the page gave the iframe a new src */
++		if (cur->url != NULL &&
++		    (window->frame_src == NULL ||
++		     !nsurl_compare(window->frame_src, cur->url,
++				    NSURL_COMPLETE))) {
++			if (window->frame_src != NULL) {
++				nsurl_unref(window->frame_src);
++			}
++			window->frame_src = nsurl_ref(cur->url);
++			navigate[n] = true;
++		}
++		fresh[n++] = window;
++	}
++	bw->iframes = fresh;
++	bw->iframe_count = n;
+ 
+-		/* linking */
+-		window->box = cur->box;
+-		window->parent = bw;
+-		window->box->iframe = window;
+-
+-		/* iframe dimensions */
+-		box_bounds(window->box, &rect);
+-
+-		browser_window_set_position(window, rect.x0, rect.y0);
+-		browser_window_set_dimensions(window, rect.x1 - rect.x0,
+-				rect.y1 - rect.y0);
++	/* windows whose elements went */
++	for (j = 0; j < old_count; j++) {
++		if (old[j] != NULL) {
++			iframe_window_free(old[j]);
++		}
+ 	}
++	free(old);
+ 
+ 	/* calculate dimensions */
+ 	browser_window_update_extent(bw);
+ 	browser_window_recalculate_iframes(bw);
+ 
+-	index = 0;
+-	for (cur = iframe; cur; cur = cur->next) {
+-		window = &(bw->iframes[index++]);
+-		if (cur->url) {
++	for (i = 0; i < n; i++) {
++		if (navigate[i]) {
+ 			/* fetch iframe's content */
+-			ret = browser_window_navigate(window,
+-				cur->url,
++			ret = browser_window_navigate(fresh[i],
++				fresh[i]->frame_src,
+ 				hlcache_handle_get_url(bw->current_content),
+ 				BW_NAVIGATE_UNVERIFIABLE,
+ 				NULL,
+@@ -282,10 +369,24 @@ nserror browser_window_create_iframes(struct browser_window *bw)
+ 				bw->current_content);
+ 		}
+ 	}
++	free(navigate);
+ 
+ 	return ret;
+ }
+ 
++/* exported function documented in desktop/frames.h */
++void browser_window_detach_iframes(struct browser_window *bw)
++{
++	int i;
++
++	for (i = 0; i < bw->iframe_count; i++) {
++		if (bw->iframes[i]->box != NULL) {
++			bw->iframes[i]->box->iframe = NULL;
++			bw->iframes[i]->box = NULL;
++		}
++	}
++}
++
+ 
+ /* exported function documented in desktop/frames.h */
+ void browser_window_recalculate_iframes(struct browser_window *bw)
+@@ -294,9 +395,9 @@ void browser_window_recalculate_iframes(struct browser_window *bw)
+ 	int index;
+ 
+ 	for (index = 0; index < bw->iframe_count; index++) {
+-		window = &(bw->iframes[index]);
++		window = bw->iframes[index];
+ 
+-		if (window != NULL) {
++		if (window != NULL && window->box != NULL) {
+ 			browser_window_handle_scrollbars(window);
+ 		}
+ 	}
+@@ -310,11 +411,7 @@ nserror browser_window_destroy_iframes(struct browser_window *bw)
+ 
+ 	if (bw->iframes != NULL) {
+ 		for (i = 0; i < bw->iframe_count; i++) {
+-			if (bw->iframes[i].box != NULL) {
+-				bw->iframes[i].box->iframe = NULL;
+-				bw->iframes[i].box = NULL;
+-			}
+-			browser_window_destroy_internal(&bw->iframes[i]);
++			iframe_window_free(bw->iframes[i]);
+ 		}
+ 		free(bw->iframes);
+ 		bw->iframes = NULL;
+@@ -1028,7 +1125,7 @@ static bool browser_window_resize_frames(struct browser_window *bw,
+ 	}
+ 	if (bw->iframes) {
+ 		for (i = 0; i < bw->iframe_count; i++)
+-			if (browser_window_resize_frames(&bw->iframes[i],
++			if (browser_window_resize_frames(bw->iframes[i],
+ 					mouse, x, y, pointer))
+ 				return true;
+ 	}
+diff --git a/desktop/frames.h b/desktop/frames.h
+index dda31824b..b7e3888b8 100644
+--- a/desktop/frames.h
++++ b/desktop/frames.h
+@@ -58,6 +58,25 @@ nserror browser_window_invalidate_iframe(struct browser_window *bw);
+  */
+ nserror browser_window_destroy_iframes(struct browser_window *bw);
+ 
++/**
++ * Let go of the boxes iframe windows point at, which a box tree about to
++ * be rebuilt takes with it, but keep the windows (VitaSurf).
++ *
++ * \param bw The browser window whose iframes lose their boxes.
++ */
++void browser_window_detach_iframes(struct browser_window *bw);
++
++/**
++ * Match a new box tree's iframes to the windows there were: a window
++ * made for the same element is kept, with the document and script in
++ * it; one whose element went is destroyed; a new element gets a new
++ * window (VitaSurf).
++ *
++ * \param bw The browser window whose content has a new box tree.
++ * \return NSERROR_OK or error code on faliure.
++ */
++nserror browser_window_rebuild_iframes(struct browser_window *bw);
++
+ /**
+  * Create and open a frameset for a browser window.
+  *

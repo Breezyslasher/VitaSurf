@@ -1,0 +1,117 @@
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 6ce4ec6f1..080fa852c 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -48,6 +48,19 @@
+ typedef bool (script_handler_t)(struct jsthread *jsthread, const uint8_t *data, size_t size, const char *name);
+ 
+ 
++/**
++ * Whether a script element's type is "module" (VitaSurf). The engine is
++ * told, through vitasurf_js_module_hint, so it compiles the source as a
++ * module at once: it compiled every script as a classic one first, and
++ * a Home Assistant dashboard threw away 2.8 s on 3.4 MB of modules that
++ * way, a parse each that could only fail.
++ */
++static bool script_type_is_module(dom_string *type)
++{
++	return type != NULL && dom_string_byte_length(type) == 6 &&
++		strncasecmp(dom_string_data(type), "module", 6) == 0;
++}
++
+ static script_handler_t *select_script_handler(content_type ctype)
+ {
+ 	if (ctype == CONTENT_JS) {
+@@ -113,8 +126,11 @@ nserror html_script_exec(html_content *c, bool allow_defer)
+ 				size_t size;
+ 				data = content_get_source_data(
+ 						s->data.handle, &size );
++				vitasurf_js_module_hint =
++					script_type_is_module(s->mimetype);
+ 				script_handler(c->jsthread, data, size,
+ 					       nsurl_access(hlcache_handle_get_url(s->data.handle)));
++				vitasurf_js_module_hint = false;
+ 				have_run_something = true;
+ 				/* We have to re-acquire this here since the
+ 				 * c->scripts array may have been reallocated
+@@ -659,8 +675,11 @@ convert_script_sync_cb(hlcache_handle *script,
+ 			size_t size;
+ 			data = content_get_source_data(s->data.handle, &size );
+ 			parent->script_depth++;
++			vitasurf_js_module_hint =
++				script_type_is_module(s->mimetype);
+ 			script_handler(parent->jsthread, data, size,
+ 				       nsurl_access(hlcache_handle_get_url(s->data.handle)));
++			vitasurf_js_module_hint = false;
+ 			parent->script_depth--;
+ 		} else {
+ 			/*
+@@ -930,6 +949,7 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ 	struct lwc_string_s *lwcmimetype;
+ 	script_handler_t *script_handler;
+ 	struct html_script *nscript;
++	bool is_module;
+ 
+ 	/* does not appear to be a src so script is inline content */
+ 	exc = dom_node_get_text_content(node, &script);
+@@ -953,9 +973,8 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ 	 * engine compiles a module as one once it meets import or export.
+ 	 * Looked up as the type they are, they found no handler and never
+ 	 * ran (VitaSurf). */
+-	if (dom_string_byte_length(mimetype) == 0 ||
+-	    (dom_string_byte_length(mimetype) == 6 &&
+-	     strncasecmp(dom_string_data(mimetype), "module", 6) == 0)) {
++	is_module = script_type_is_module(mimetype);
++	if (dom_string_byte_length(mimetype) == 0 || is_module) {
+ 		mimetype = corestring_dom_text_javascript;
+ 	}
+ 
+@@ -974,10 +993,12 @@ exec_inline_script(html_content *c, dom_node *node, dom_string *mimetype)
+ 		dom_node *outer = running_script;
+ 
+ 		running_script = node;
++		vitasurf_js_module_hint = is_module;
+ 		script_handler(c->jsthread,
+ 			       (const uint8_t *)dom_string_data(script),
+ 			       dom_string_byte_length(script),
+ 			       "?inline script?");
++		vitasurf_js_module_hint = false;
+ 		running_script = outer;
+ 	}
+ 	return DOM_HUBBUB_OK;
+diff --git a/utils/utils.c b/utils/utils.c
+index 89a67bb46..959323a1c 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -608,6 +608,8 @@ unsigned int vitasurf_js_import_compiles;
+ unsigned int vitasurf_js_import_kb;
+ unsigned int vitasurf_ms_js_reparse;
+ unsigned int vitasurf_js_reparses;
++bool vitasurf_js_module_hint;
++unsigned int vitasurf_js_module_first;
+ unsigned int vitasurf_js_reparse_kb;
+ unsigned int vitasurf_ms_js_import_cached;
+ unsigned int vitasurf_js_import_cache_hits;
+@@ -832,6 +834,7 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_js_import_kb = 0;
+ 	vitasurf_ms_js_reparse = 0;
+ 	vitasurf_js_reparses = 0;
++	vitasurf_js_module_first = 0;
+ 	vitasurf_js_reparse_kb = 0;
+ 	vitasurf_ms_js_import_cached = 0;
+ 	vitasurf_js_import_cache_hits = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index afe1c52b4..902f7b77c 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -161,6 +161,10 @@ extern unsigned int vitasurf_js_import_compiles;
+ extern unsigned int vitasurf_js_import_kb;
+ extern unsigned int vitasurf_ms_js_reparse;
+ extern unsigned int vitasurf_js_reparses;
++/** The script about to run came from a type="module" element. */
++extern bool vitasurf_js_module_hint;
++/** Scripts compiled as modules straight away for that. */
++extern unsigned int vitasurf_js_module_first;
+ extern unsigned int vitasurf_js_reparse_kb;
+ /* imports read back from the compiled script cache instead */
+ extern unsigned int vitasurf_ms_js_import_cached;

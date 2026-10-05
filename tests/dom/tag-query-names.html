@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<!-- A bare tag query of an element that has been asked twice while the
+     tree kept its shape is answered from the tag names under it. Every
+     way the tree can change must make it look again: each check asks
+     twice for a tag that is not there, changes the tree, and expects to
+     find the tag. -->
+<html><body><div id="r"><span>x</span><p><em>y</em></p></div>
+<svg id="s"><foreignObject><div>f</div></foreignObject></svg>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var r = document.getElementById('r');
+function warm(root, tag){ root.querySelector(tag); root.querySelector(tag); }
+function fresh(){ r.innerHTML = '<span>x</span><p><em>y</em></p>'; }
+
+warm(r, 'b'); ok("absent tag is absent", r.querySelector('b') === null);
+var b = document.createElement('b'); r.appendChild(b);
+ok("appendChild", r.querySelector('b') === b);
+
+fresh(); warm(r, 'i'); r.innerHTML = '<i>z</i>';
+ok("innerHTML", r.querySelector('i') !== null && r.querySelector('span') === null);
+
+fresh(); warm(r, 'u'); r.querySelector('em').appendChild(document.createElement('u'));
+ok("append below a descendant", r.querySelector('u') !== null);
+
+fresh(); warm(r, 'em'); ok("present tag found", r.querySelector('em') !== null);
+r.querySelector('p').removeChild(r.querySelector('em'));
+ok("removeChild", r.querySelector('em') === null);
+
+fresh(); warm(r, 'mark'); r.firstChild.insertAdjacentHTML('afterend', '<mark>m</mark>');
+ok("insertAdjacentHTML", r.querySelector('mark') !== null);
+
+fresh(); warm(r, 'small'); r.querySelector('em').replaceWith(document.createElement('small'));
+ok("replaceWith", r.querySelector('small') !== null && r.querySelector('em') === null);
+
+fresh(); warm(r, 'q'); r.append(document.createElement('q'));
+ok("append", r.querySelector('q') !== null);
+
+fresh(); warm(r, 'abbr'); r.prepend(document.createElement('abbr'));
+ok("prepend", r.querySelector('abbr') !== null);
+
+fresh(); warm(r, 'cite'); r.replaceChildren(document.createElement('cite'));
+ok("replaceChildren", r.querySelector('cite') !== null);
+
+fresh(); warm(r, 'dfn'); r.querySelector('p').before(document.createElement('dfn'));
+ok("before", r.querySelector('dfn') !== null);
+
+fresh(); warm(r, 'kbd'); r.querySelector('p').insertBefore(document.createElement('kbd'), r.querySelector('em'));
+ok("insertBefore", r.querySelector('kbd') !== null);
+
+fresh(); warm(r, 'var'); r.querySelector('p').outerHTML = '<var>v</var>';
+ok("outerHTML", r.querySelector('var') !== null);
+
+fresh(); warm(r, 'span'); r.textContent = 'plain';
+ok("textContent", r.querySelector('span') === null);
+
+fresh(); warm(r, 'sub'); var f = document.createDocumentFragment();
+f.appendChild(document.createElement('sub')); r.appendChild(f);
+ok("fragment", r.querySelector('sub') !== null);
+
+fresh(); warm(r, 'sup'); var c = document.createElement('div');
+c.innerHTML = '<sup>s</sup>'; r.appendChild(c.cloneNode(true));
+ok("cloneNode", r.querySelector('sup') !== null);
+
+var d = document.createElement('div'); warm(d, 'h2');
+d.appendChild(document.createElement('h2'));
+ok("detached root", d.querySelector('h2') !== null);
+
+fresh(); warm(r, 'time'); r.appendChild(document.createElement('time'));
+ok("querySelectorAll", r.querySelectorAll('time').length === 1 && r.querySelectorAll('nope').length === 0);
+
+fresh(); warm(r, 'EM'); ok("any ASCII case", r.querySelector('EM') !== null && r.querySelector('Em') !== null);
+
+var s = document.getElementById('s'); warm(s, 'foreignObject');
+ok("SVG name as written", s.querySelector('foreignObject') !== null);
+
+warm(document, 'late-thing'); ok("document: absent", document.querySelector('late-thing') === null);
+document.body.appendChild(document.createElement('late-thing'));
+ok("document: appended", document.querySelector('late-thing') !== null &&
+   document.querySelectorAll('late-thing').length === 1);
+
+var root2 = document.createElement('section'); r.appendChild(root2);
+warm(r, 'nav'); warm(root2, 'nav'); root2.appendChild(document.createElement('nav'));
+ok("another root asked in between", r.querySelector('nav') !== null && root2.querySelector('nav') !== null);
+
+fresh(); var t = document.createElement('template'); t.innerHTML = '<aside>a</aside>';
+warm(t.content, 'aside'); ok("template content", t.content.querySelector('aside') !== null);
+
+var tags = 0; r.innerHTML = '<p><b></b></p>';
+setTimeout(function(){
+  warm(r, 'i');
+  r.querySelector('b').innerHTML = '<i>later</i>';
+  ok("in a later task", r.querySelector('i') !== null);
+}, 10);
+</script></body></html>

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!-- Many MutationObservers, watched and dropped in any order. qjs.c keeps
+     the watches in a table keyed by node, and dropping one moves another
+     into its place; every observer must still hear exactly the changes
+     it asked for. -->
+<html><body><div id="box"></div>
+<script>
+var box = document.getElementById('box'), N = 300, els = [], obs = [], got = [];
+for (var i = 0; i < N; i++) {
+  var e = document.createElement('p');
+  box.appendChild(e);
+  els.push(e);
+}
+function make(k) {
+  return new MutationObserver(function(r){ got[k] += r.length; });
+}
+/* two observers per node, the second only for its own attribute */
+for (var k = 0; k < 2 * N; k++) {
+  got.push(0);
+  obs.push(make(k));
+  if (k < N) obs[k].observe(els[k], {attributes: true});
+  else obs[k].observe(els[k - N], {attributes: true, attributeFilter: ['data-b']});
+}
+/* drop every third, then watch some again, replacing an option */
+for (k = 0; k < 2 * N; k += 3) obs[k].disconnect();
+for (k = 0; k < 2 * N; k += 9) obs[k].observe(els[k % N], {attributes: true, attributeFilter: ['data-a']});
+/* one observer watching two places, only one of which asks for old values */
+var two = [], twoObs = new MutationObserver(function(r){ two = two.concat(r); });
+twoObs.observe(box, {attributes: true, subtree: true});
+twoObs.observe(els[5], {attributes: true, attributeOldValue: true});
+els[5].setAttribute('data-c', 'old');
+for (i = 0; i < N; i++) {
+  els[i].setAttribute('data-a', '1');
+  els[i].setAttribute('data-b', '1');
+}
+setTimeout(function(){
+  var bad = [];
+  for (k = 0; k < 2 * N; k++) {
+    var want;
+    if (k % 9 === 0) want = 1;           /* watched again, data-a only */
+    else if (k % 3 === 0) want = 0;      /* dropped */
+    else if (k < N) want = 2 + (k === 5 ? 1 : 0);
+    else want = 1;                       /* data-b only */
+    if (got[k] !== want) bad.push(k + ':' + got[k] + '/' + want);
+  }
+  console.log((bad.length ? 'FAIL' : 'PASS') + ' every observer heard what it asked for' +
+              (bad.length ? ' (' + bad.slice(0, 8).join(' ') + ')' : ''));
+  var r5 = two.filter(function(r){ return r.target === els[5] && r.attributeName === 'data-a'; });
+  console.log((two.length === 2 * N + 1 ? 'PASS' : 'FAIL') +
+              ' an observer watching two places hears each change once (' + two.length + ')');
+  console.log((r5.length === 1 && r5[0].oldValue === null ? 'PASS' : 'FAIL') +
+              ' and gets the old value when either watch asks for it');
+  els[5].setAttribute('data-c', 'new');
+  setTimeout(function(){
+    var last = two[two.length - 1];
+    console.log((last && last.oldValue === 'old' ? 'PASS' : 'FAIL') +
+                ' old value ' + (last && last.oldValue));
+    for (k = 0; k < 2 * N; k++) obs[k].disconnect();
+    twoObs.disconnect();
+    var late = new MutationObserver(function(r){ got[0] = -r.length; });
+    late.observe(els[0], {attributes: true});
+    els[0].setAttribute('data-z', '1');
+    setTimeout(function(){
+      console.log((got[0] === -1 ? 'PASS' : 'FAIL') + ' a watch added after all were dropped is heard');
+    }, 0);
+  }, 0);
+}, 0);
+</script></body></html>

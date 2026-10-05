@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!-- TextDecoder decodes valid UTF-8 in C and leaves anything else to the
+     prelude's decoder; instanceof Node, Element, Text and the rest test
+     the node type in C; customElements.get looks a name up as given. -->
+<html><head><title>native helpers</title></head><body><p id="p">t<!--c--></p>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var td=new TextDecoder(),FFFD=String.fromCharCode(0xfffd);
+function bytes(a){return new Uint8Array(a);}
+ok("ASCII", td.decode(bytes([104,105]))==="hi");
+ok("two, three and four byte forms", td.decode(bytes([0xc3,0xa9,0xe2,0x82,0xac,0xf0,0x9f,0x98,0x80]))===String.fromCharCode(0xe9,0x20ac,0xd83d,0xde00));
+ok("a byte order mark is dropped", td.decode(bytes([0xef,0xbb,0xbf,0x41]))==="A");
+ok("an empty array", td.decode(bytes([]))==="");
+ok("a NUL survives", td.decode(bytes([0x61,0,0x62])).length===3);
+ok("a lone continuation byte is U+FFFD", td.decode(bytes([0x61,0x80,0x62]))==="a"+FFFD+"b");
+ok("a cut-short sequence is U+FFFD", td.decode(bytes([0x61,0xe2,0x82]))==="a"+FFFD);
+ok("an overlong form is replaced", td.decode(bytes([0xc0,0xaf])).indexOf("/")<0);
+ok("a surrogate is replaced", td.decode(bytes([0xed,0xa0,0x80])).indexOf(FFFD)>=0);
+ok("a view into a larger buffer", td.decode(new Uint8Array(bytes([0x78,0x41,0x42,0x79]).buffer,1,2))==="AB");
+ok("a DataView", td.decode(new DataView(bytes([0x43,0x44]).buffer))==="CD");
+var p=document.getElementById('p');
+ok("an element is an Element and a Node", p instanceof Element && p instanceof Node);
+ok("a text node is Text and CharacterData, not Element", p.firstChild instanceof Text && p.firstChild instanceof CharacterData && !(p.firstChild instanceof Element));
+ok("a comment is a Comment", p.lastChild instanceof Comment && !(p.lastChild instanceof Text));
+ok("document is a Node", document instanceof Node);
+ok("plain objects and null are not", !({} instanceof Node) && !(null instanceof Element) && !({nodeType:'1'} instanceof Element));
+ok("an object with nodeType 1 counts, as before", ({nodeType:1}) instanceof Element);
+ok("a fragment is a DocumentFragment", document.createDocumentFragment() instanceof DocumentFragment);
+class XTest extends HTMLElement{}
+customElements.define('x-test',XTest);
+ok("customElements.get finds a defined name", customElements.get('x-test')===XTest);
+ok("an unknown name is undefined", customElements.get('x-nope')===undefined);
+ok("another spelling is undefined, as in a browser", customElements.get('X-TEST')===undefined);
+ok("an Object.prototype name is undefined", customElements.get('constructor')===undefined&&customElements.get('toString')===undefined);
+</script></body></html>

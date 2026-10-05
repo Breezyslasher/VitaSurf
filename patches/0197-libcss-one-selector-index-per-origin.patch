@@ -1,0 +1,1229 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index ba322d2..2964ce4 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -263,6 +263,20 @@ css_error css_select_ctx_remove_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet);
+ 
+ css_error css_select_ctx_count_sheets(css_select_ctx *ctx, uint32_t *count);
++
++/**
++ * Build the context's merged selector index now (VitaSurf).
++ *
++ * Selection builds it itself the first time it is needed after the
++ * sheet list changes; calling this lets the client time it and report
++ * it. It says how many sheets went in, counting imports, how many
++ * rules the index holds and roughly how many bytes it takes.
++ *
++ * eturn CSS_OK, or CSS_NOMEM, after which selection carries on sheet
++ *         by sheet.
++ */
++css_error css_select_ctx_build_index(css_select_ctx *ctx,
++		uint32_t *sheets, uint32_t *entries, uint32_t *bytes);
+ css_error css_select_ctx_get_sheet(css_select_ctx *ctx, uint32_t index,
+ 		const css_stylesheet **sheet);
+ 
+diff --git a/src/select/hash.c b/src/select/hash.c
+index d4b69b8..cc356cf 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -7,6 +7,7 @@
+ 
+ #include <assert.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include <libcss/hint.h>
+@@ -20,7 +21,11 @@
+ #undef PRINT_CHAIN_BLOOM_DETAILS
+ 
+ typedef struct hash_entry {
++	/* these two first, matching struct css_hash_entry_head (VitaSurf) */
+ 	const css_selector *sel;
++	/* which sheet of a merged hash the rule came from, 0 in a
++	 * sheet's own hash (VitaSurf) */
++	uint32_t seq;
+ 	css_bloom sel_chain_bloom[CSS_BLOOM_SIZE];
+ 	/* CSS_NODE_STATE_* the key compound needs, 0 for none (VitaSurf) */
+ 	uint32_t needs_state;
+@@ -97,6 +102,10 @@ struct css_selector_hash {
+ 	hash_entry universal_state;
+ 
+ 	size_t hash_size;
++
++	/* built by css__selector_hash_merge: sized once, never grown
++	 * (VitaSurf) */
++	bool merged;
+ };
+ 
+ static hash_entry empty_slot;
+@@ -249,6 +258,15 @@ static bool _attr_key(const css_selector *selector, uint32_t *key)
+ 	 (CSS_ATTR_BLOOM_EMPTY(&(e)->needs_attrs) || \
+ 	  CSS_ATTR_BLOOM_HAS(&(req)->attr_bloom, &(e)->needs_attrs)))
+ 
++/**
++ * Whether the sheet an entry came from applies to this selection
++ * (VitaSurf). A sheet's own hash has no such list and every entry is
++ * in play; a merged hash is handed one bit per sheet.
++ */
++#define ENTRY_ACTIVE(e, req) \
++	((req)->active == NULL || \
++	 (((req)->active[(e)->seq >> 5] >> ((e)->seq & 31)) & 1u) != 0)
++
+ static inline lwc_string *_class_name(const css_selector *selector);
+ static inline lwc_string *_id_name(const css_selector *selector);
+ static css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+@@ -655,7 +673,7 @@ static css_error _file(css_selector_hash *ctx, hash_t *h,
+ 		return error;
+ 
+ 	h->n_entries++;
+-	if (h->n_entries > h->n_slots * HASH_MAX_PER_SLOT)
++	if (h->n_entries > h->n_slots * HASH_MAX_PER_SLOT && !ctx->merged)
+ 		_grow(ctx, h);
+ 
+ 	return CSS_OK;
+@@ -875,7 +893,7 @@ css_error css__selector_hash_find(css_selector_hash *hash,
+ 			if (lerror != lwc_error_ok)
+ 				return css_error_from_lwc_error(lerror);
+ 
+-			if (match && RULE_HAS_BYTECODE(head)) {
++			if (match && ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head)) {
+ 				if (css_bloom_in_bloom(
+ 						head->sel_chain_bloom,
+ 						req->node_bloom) &&
+@@ -951,7 +969,7 @@ css_error css__selector_hash_find_by_class(css_selector_hash *hash,
+ 				if (lerror != lwc_error_ok)
+ 					return css_error_from_lwc_error(lerror);
+ 
+-				if (match && RULE_HAS_BYTECODE(head)) {
++				if (match && ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head)) {
+ 					if (css_bloom_in_bloom(
+ 							head->sel_chain_bloom,
+ 							req->node_bloom) &&
+@@ -1034,7 +1052,7 @@ css_error css__selector_hash_find_by_id(css_selector_hash *hash,
+ 				if (lerror != lwc_error_ok)
+ 					return css_error_from_lwc_error(lerror);
+ 
+-				if (match && RULE_HAS_BYTECODE(head)) {
++				if (match && ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head)) {
+ 					if (css_bloom_in_bloom(
+ 							head->sel_chain_bloom,
+ 							req->node_bloom) &&
+@@ -1103,7 +1121,7 @@ css_error css__selector_hash_find_by_attr(css_selector_hash *hash,
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_attr++;
+-			if (RULE_HAS_BYTECODE(head) &&
++			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+ 			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+ 			    css_bloom_in_bloom(
+ 					head->sel_chain_bloom,
+@@ -1151,7 +1169,7 @@ css_error css__selector_hash_find_by_state(css_selector_hash *hash,
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_universal++;
+-			if (RULE_HAS_BYTECODE(head) &&
++			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+ 			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+ 			    css_bloom_in_bloom(
+ 					head->sel_chain_bloom,
+@@ -1193,7 +1211,7 @@ css_error css__selector_hash_find_universal(css_selector_hash *hash,
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_universal++;
+-			if (RULE_HAS_BYTECODE(head) &&
++			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+ 			    /* a rule the node cannot satisfy is never
+ 			     * offered (VitaSurf) -- this loop finds the
+ 			     * first entry and _iterate_universal the
+@@ -1413,6 +1431,7 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ {
+ 	if (head->sel == NULL) {
+ 		head->sel = selector;
++		head->seq = 0;
+ 		head->next = NULL;
+ 		_chain_bloom_generate(selector, head->sel_chain_bloom);
+ 		head->needs_state = _state_needed(selector);
+@@ -1455,6 +1474,7 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ 		}
+ 
+ 		entry->sel = selector;
++		entry->seq = 0;
+ 		_chain_bloom_generate(selector, entry->sel_chain_bloom);
+ 		entry->needs_state = _state_needed(selector);
+ 		entry->needs_attrs = _attrs_needed(selector);
+@@ -1559,7 +1579,7 @@ css_error _iterate_elements(
+ 			if (lerror != lwc_error_ok)
+ 				return css_error_from_lwc_error(lerror);
+ 
+-			if (match && RULE_HAS_BYTECODE(head)) {
++			if (match && ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head)) {
+ 				if (css_bloom_in_bloom(
+ 						head->sel_chain_bloom,
+ 						req->node_bloom) &&
+@@ -1616,7 +1636,7 @@ css_error _iterate_classes(
+ 				if (lerror != lwc_error_ok)
+ 					return css_error_from_lwc_error(lerror);
+ 
+-				if (match && RULE_HAS_BYTECODE(head)) {
++				if (match && ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head)) {
+ 					if (css_bloom_in_bloom(
+ 							head->sel_chain_bloom,
+ 							req->node_bloom) &&
+@@ -1680,7 +1700,7 @@ css_error _iterate_ids(
+ 				if (lerror != lwc_error_ok)
+ 					return css_error_from_lwc_error(lerror);
+ 
+-				if (match && RULE_HAS_BYTECODE(head)) {
++				if (match && ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head)) {
+ 					if (css_bloom_in_bloom(
+ 							head->sel_chain_bloom,
+ 							req->node_bloom) &&
+@@ -1732,7 +1752,7 @@ css_error _iterate_attrs(
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_attr++;
+-			if (RULE_HAS_BYTECODE(head) &&
++			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+ 			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+ 			    css_bloom_in_bloom(
+ 					head->sel_chain_bloom,
+@@ -1767,7 +1787,7 @@ css_error _iterate_universal(
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
+ 			css_select_steps_universal++;
+-			if (RULE_HAS_BYTECODE(head) &&
++			if (ENTRY_ACTIVE(head, req) && RULE_HAS_BYTECODE(head) &&
+ 			    /* a rule the node cannot satisfy is never
+ 			     * offered (VitaSurf) */
+ 			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+@@ -1793,6 +1813,12 @@ css_error _iterate_universal(
+ }
+ 
+ 
++/* exported: see select/hash.h (VitaSurf) */
++uint32_t css__selector_hash_entry_seq(const css_selector **entry)
++{
++	return ((const struct css_hash_entry_head *) entry)->seq;
++}
++
+ /* exported: see select/hash.h (VitaSurf) */
+ uint32_t css__selector_hash_tables(const css_selector_hash *hash)
+ {
+@@ -1815,3 +1841,286 @@ uint32_t css__selector_hash_tables(const css_selector_hash *hash)
+ 
+ 	return mask;
+ }
++
++/*
++ * Merging several hashes into one (VitaSurf). See hash.h.
++ */
++
++/** Cascade order: specificity, then sheet, then rule. */
++static int _entry_order(const void *a, const void *b)
++{
++	const hash_entry *x = a, *y = b;
++
++	if (x->sel->specificity != y->sel->specificity)
++		return x->sel->specificity < y->sel->specificity ? -1 : 1;
++	if (x->seq != y->seq)
++		return x->seq < y->seq ? -1 : 1;
++	if (x->sel->rule->index != y->sel->rule->index)
++		return x->sel->rule->index < y->sel->rule->index ? -1 : 1;
++	return 0;
++}
++
++/**
++ * Put a chain in cascade order.
++ *
++ * The entries were pushed on unordered because inserting each in its
++ * place is a walk of the chain, and the chain of :host rules on a
++ * GitHub page is 5611 long. The nodes stay where they are and only
++ * their contents move, so the slot at the head stays the head.
++ */
++static css_error _sort_chain(hash_entry *head)
++{
++	hash_entry **nodes, *vals, *e;
++	size_t n = 0, k;
++
++	if (head->sel == NULL || head->next == NULL)
++		return CSS_OK;
++
++	for (e = head; e != NULL; e = e->next)
++		n++;
++
++	nodes = malloc(n * sizeof(*nodes));
++	vals = malloc(n * sizeof(*vals));
++	if (nodes == NULL || vals == NULL) {
++		free(nodes);
++		free(vals);
++		return CSS_NOMEM;
++	}
++
++	for (k = 0, e = head; e != NULL; e = e->next, k++) {
++		nodes[k] = e;
++		vals[k] = *e;
++	}
++
++	qsort(vals, n, sizeof(*vals), _entry_order);
++
++	for (k = 0; k < n; k++) {
++		*nodes[k] = vals[k];
++		nodes[k]->next = (k + 1 < n) ? nodes[k + 1] : NULL;
++	}
++
++	free(nodes);
++	free(vals);
++
++	return CSS_OK;
++}
++
++/** Size an empty table for the entries about to be filed in it. */
++static css_error _size_table(css_selector_hash *ctx, hash_t *h, size_t total)
++{
++	size_t want = DEFAULT_SLOTS;
++	hash_entry *fresh;
++
++	while (want * HASH_MAX_PER_SLOT < total)
++		want *= 2;
++	if (want == h->n_slots)
++		return CSS_OK;
++
++	fresh = calloc(want, sizeof(hash_entry));
++	if (fresh == NULL)
++		return CSS_NOMEM;
++
++	free(h->slots);
++	ctx->hash_size += (want - h->n_slots) * sizeof(hash_entry);
++	h->slots = fresh;
++	h->n_slots = want;
++
++	return CSS_OK;
++}
++
++/** Put a copy of an entry on a chain, in no particular order yet. */
++static css_error _push_copy(css_selector_hash *ctx, hash_entry *head,
++		const hash_entry *from, uint32_t seq)
++{
++	hash_entry *e;
++
++	if (head->sel == NULL) {
++		*head = *from;
++		head->seq = seq;
++		head->next = NULL;
++		return CSS_OK;
++	}
++
++	e = malloc(sizeof(*e));
++	if (e == NULL)
++		return CSS_NOMEM;
++
++	*e = *from;
++	e->seq = seq;
++	e->next = head->next;
++	head->next = e;
++	ctx->hash_size += sizeof(hash_entry);
++
++	return CSS_OK;
++}
++
++/**
++ * Copy one table's entries into another.
++ *
++ * The attribute table is fixed at CSS_SELECTOR_HASH_SLOTS in every
++ * hash and select.c works out the slot itself, so its entries keep
++ * their slot; the others are refiled by key, since the tables grow.
++ */
++static css_error _merge_table(css_selector_hash *ctx, hash_t *to,
++		const hash_t *from, uint32_t seq, bool same_slot)
++{
++	size_t i;
++
++	for (i = 0; i < from->n_slots; i++) {
++		const hash_entry *e = &from->slots[i];
++
++		if (e->sel == NULL)
++			continue;
++
++		for (; e != NULL; e = e->next) {
++			uint32_t slot = same_slot ? (uint32_t) i :
++					(_entry_key(to->kind, e->sel) &
++					 (uint32_t) (to->n_slots - 1));
++			css_error error = _push_copy(ctx, &to->slots[slot],
++					e, seq);
++
++			if (error != CSS_OK)
++				return error;
++			to->n_entries++;
++		}
++	}
++
++	return CSS_OK;
++}
++
++/** Copy one chain onto another. */
++static css_error _merge_chain(css_selector_hash *ctx, hash_entry *to,
++		const hash_entry *from, uint32_t seq)
++{
++	const hash_entry *e;
++
++	if (from->sel == NULL)
++		return CSS_OK;
++
++	for (e = from; e != NULL; e = e->next) {
++		css_error error = _push_copy(ctx, to, e, seq);
++
++		if (error != CSS_OK)
++			return error;
++	}
++
++	return CSS_OK;
++}
++
++/** Put every chain of a table in order. */
++static css_error _sort_table(hash_t *h)
++{
++	size_t i;
++
++	for (i = 0; i < h->n_slots; i++) {
++		css_error error = _sort_chain(&h->slots[i]);
++
++		if (error != CSS_OK)
++			return error;
++	}
++
++	return CSS_OK;
++}
++
++/* exported: see select/hash.h (VitaSurf) */
++css_error css__selector_hash_merge(css_selector_hash **out,
++		const css_selector_hash *const *parts, const uint32_t *seqs,
++		uint32_t n)
++{
++	css_selector_hash *h;
++	size_t te = 0, tc = 0, ti = 0;
++	uint32_t i;
++	css_error error;
++
++	if (out == NULL || (n > 0 && (parts == NULL || seqs == NULL)))
++		return CSS_BADPARM;
++
++	error = css__selector_hash_create(&h);
++	if (error != CSS_OK)
++		return error;
++	h->merged = true;
++
++	for (i = 0; i < n; i++) {
++		te += parts[i]->elements.n_entries;
++		tc += parts[i]->classes.n_entries;
++		ti += parts[i]->ids.n_entries;
++	}
++
++	error = _size_table(h, &h->elements, te);
++	if (error == CSS_OK)
++		error = _size_table(h, &h->classes, tc);
++	if (error == CSS_OK)
++		error = _size_table(h, &h->ids, ti);
++	if (error != CSS_OK)
++		goto fail;
++
++	for (i = 0; i < n; i++) {
++		const css_selector_hash *p = parts[i];
++
++		error = _merge_table(h, &h->elements, &p->elements,
++				seqs[i], false);
++		if (error == CSS_OK)
++			error = _merge_table(h, &h->classes, &p->classes,
++					seqs[i], false);
++		if (error == CSS_OK)
++			error = _merge_table(h, &h->ids, &p->ids,
++					seqs[i], false);
++		if (error == CSS_OK)
++			error = _merge_table(h, &h->attrs, &p->attrs,
++					seqs[i], true);
++		if (error == CSS_OK)
++			error = _merge_chain(h, &h->universal,
++					&p->universal, seqs[i]);
++		if (error == CSS_OK)
++			error = _merge_chain(h, &h->universal_state,
++					&p->universal_state, seqs[i]);
++		if (error != CSS_OK)
++			goto fail;
++	}
++
++	error = _sort_table(&h->elements);
++	if (error == CSS_OK)
++		error = _sort_table(&h->classes);
++	if (error == CSS_OK)
++		error = _sort_table(&h->ids);
++	if (error == CSS_OK)
++		error = _sort_table(&h->attrs);
++	if (error == CSS_OK)
++		error = _sort_chain(&h->universal);
++	if (error == CSS_OK)
++		error = _sort_chain(&h->universal_state);
++	if (error != CSS_OK)
++		goto fail;
++
++	*out = h;
++	return CSS_OK;
++
++fail:
++	css__selector_hash_destroy(h);
++	return error;
++}
++
++/* exported: see select/hash.h (VitaSurf) */
++void css__selector_hash_stats(const css_selector_hash *hash,
++		uint32_t *entries, uint32_t *bytes)
++{
++	uint32_t n = 0;
++	const hash_entry *e;
++
++	if (hash == NULL) {
++		*entries = 0;
++		*bytes = 0;
++		return;
++	}
++
++	n = (uint32_t) (hash->elements.n_entries + hash->classes.n_entries +
++			hash->ids.n_entries + hash->attrs.n_entries);
++	for (e = &hash->universal; e != NULL && e->sel != NULL; e = e->next)
++		n++;
++	for (e = &hash->universal_state; e != NULL && e->sel != NULL;
++			e = e->next)
++		n++;
++
++	*entries = n;
++	*bytes = (uint32_t) hash->hash_size;
++}
+diff --git a/src/select/hash.h b/src/select/hash.h
+index 37e1f96..b876124 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -97,8 +97,33 @@ struct css_hash_selection_requirments {
+ 	uint32_t node_state;		/* CSS_NODE_STATE_* the node is in */
+ 	css_attr_bloom attr_bloom;	/* names of the node's attributes */
+ 	uint32_t attr_slot;		/* attribute bucket to search */
++	/*
++	 * Which sheets of a merged index apply right now, one bit per
++	 * sheet sequence number, or NULL when every entry does
++	 * (VitaSurf).
++	 */
++	const uint32_t *active;
+ };
+ 
++/**
++ * What the front of every chain entry looks like (VitaSurf).
++ *
++ * A chain hands select.c a css_selector ** that is really a pointer to
++ * the entry, and select.c needs the entry's sheet sequence number to
++ * order rules from different chains, so the entry begins with this.
++ */
++struct css_hash_entry_head {
++	const struct css_selector *sel;
++	uint32_t seq;
++};
++
++/**
++ * The sheet sequence number of a chain entry, 0 in a sheet's own hash.
++ * Only for a pointer a chain handed out whose selector is not NULL: a
++ * bare null selector pointer has nothing behind it.
++ */
++uint32_t css__selector_hash_entry_seq(const struct css_selector **entry);
++
+ /**
+  * Which pseudo-class a universal rule leads with (VitaSurf).
+  *
+@@ -185,5 +210,32 @@ css_error css__selector_hash_size(css_selector_hash *hash, size_t *size);
+ #define CSS_HASH_HAS_STATE	(1u << 5)
+ uint32_t css__selector_hash_tables(const css_selector_hash *hash);
+ 
++/**
++ * Build one hash out of several (VitaSurf).
++ *
++ * Selection used to visit every sheet in the context for every element,
++ * and on a GitHub page that is 272 visits an element, 2,565,620 in all,
++ * each paying for its finds whether the sheet held anything for the
++ * node or not. The merged hash holds every sheet's entries at once,
++ * each tagged with its sheet's sequence number so that chains stay in
++ * cascade order -- specificity, then sheet, then rule -- and so that a
++ * sheet whose media do not apply can be stepped over with a bit test.
++ *
++ * \param out    Receives the new hash
++ * \param parts  The hashes to merge, in cascade order
++ * \param seqs   The sequence number to tag each part's entries with
++ * \param n      How many parts
++ * 
++eturn CSS_OK on success, CSS_NOMEM if out of memory (nothing is
++ *         left behind)
++ */
++css_error css__selector_hash_merge(css_selector_hash **out,
++		const css_selector_hash *const *parts, const uint32_t *seqs,
++		uint32_t n);
++
++/** How many entries a hash holds and how many bytes it takes. */
++void css__selector_hash_stats(const css_selector_hash *hash,
++		uint32_t *entries, uint32_t *bytes);
++
+ #endif
+ 
+diff --git a/src/select/select.c b/src/select/select.c
+index 055aa68..df5590e 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -8,6 +8,7 @@
+ #include <assert.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include <libwapcaplet/libwapcaplet.h>
+@@ -73,8 +74,50 @@ struct css_select_ctx {
+ 	 * parent had before each element; see css_select_ctx_set_parent.
+ 	 */
+ 	const css_custom_map *parent_custom;
++
++	/*
++	 * One selector index per origin, built from every sheet in the
++	 * context and every sheet those import (VitaSurf).
++	 *
++	 * Selection used to visit every sheet for every element -- 272
++	 * visits an element on a GitHub page, 2,565,620 in all, and at
++	 * about four microseconds a visit the largest single cost of
++	 * building the page. With the index an element visits at most
++	 * three, one per origin. The index is built the first time it is
++	 * wanted after the sheet list changes, or when the client asks.
++	 *
++	 * flat[] is the sheets in the order selection used to reach
++	 * them: a sheet's imports before the sheet itself. Each entry's
++	 * seq is its place in that order, and that is the number the
++	 * index tags its rules with. active[] has one bit per seq saying
++	 * whether the sheet applies to the media being selected for; it
++	 * is worked out once per media and unit context, not per element.
++	 */
++	struct css_select_flat *flat;
++	uint32_t n_flat;
++	css_selector_hash *index[CSS_ORIGIN_AUTHOR + 1];
++	bool index_valid;
++	bool index_failed;	/* out of memory: selection stays per sheet */
++	uint32_t *active;
++	bool active_valid;
++	css_media active_media;
++	css_unit_ctx active_unit;
++	uint32_t index_entries;
++	uint32_t index_bytes;
+ };
+ 
++/** One sheet of a context, top level or imported (VitaSurf). */
++typedef struct css_select_flat {
++	const css_stylesheet *sheet;
++	css_origin origin;
++	uint32_t seq;		/* place in cascade order */
++	uint32_t top;		/* index in ctx->sheets of the top-level sheet */
++	uint32_t parent;	/* index in flat[] of the importing sheet */
++	const css_rule_import *via;	/* the import rule, NULL at top level */
++	bool disabled;		/* the top-level sheet's flag when active[]
++				 * was last worked out */
++} css_select_flat;
++
+ /**
+  * Container for selected font faces
+  */
+@@ -161,6 +204,12 @@ unsigned int css_select_steps_attr;
+ unsigned int css_select_from_attr;
+ /* sheet visits that could offer nothing, skipped whole (VitaSurf) */
+ unsigned int css_select_sheets_empty;
++/* how the merged index fared (VitaSurf) */
++unsigned int css_select_index_builds;
++unsigned int css_select_index_entries;
++unsigned int css_select_index_bytes;
++unsigned int css_select_index_sheets;
++unsigned int css_select_index_failed;
+ /*
+  * And where a candidate dies (VitaSurf). 16.9 million are offered on a
+  * GitHub load and 99.6% come out of the universal chain, but only 1.07
+@@ -215,7 +264,12 @@ struct css_select_pseudo_name css_select_pseudo_names[PSEUDO_NAME_SLOTS];
+ unsigned int css_select_pseudo_unnamed;
+ 
+ static css_error match_selectors_in_sheet(css_select_ctx *ctx,
+-		const css_stylesheet *sheet, css_select_state *state);
++		css_selector_hash *hash, const uint32_t *active,
++		css_select_state *state);
++static void css__select_ctx_drop_index(css_select_ctx *ctx);
++static css_error css__select_ctx_build_index(css_select_ctx *ctx);
++static css_error css__select_ctx_refresh_active(css_select_ctx *ctx,
++		const css_unit_ctx *unit_ctx, const css_media *media);
+ static css_error match_selector_chain(css_select_ctx *ctx,
+ 		const css_selector *selector, css_select_state *state);
+ static css_error match_named_combinator(css_select_ctx *ctx,
+@@ -307,6 +361,14 @@ static css_error apply_animation_rest(css_select_ctx *ctx,
+  * rule further down has to be in hand before any var() is resolved, so
+  * they are gathered and dealt with once matching is done.
+  */
++/** The sheet a rule belongs to, through any @media it sits in. */
++static const css_stylesheet *_rule_sheet(const css_rule *rule)
++{
++	while (rule != NULL && rule->ptype != CSS_RULE_PARENT_STYLESHEET)
++		rule = rule->parent;
++	return rule != NULL ? (const css_stylesheet *) rule->parent : NULL;
++}
++
+ static css_error record_deferred(css_select_state *state,
+ 		const css_rule_selector *rs, css_pseudo_element pseudo)
+ {
+@@ -330,7 +392,9 @@ static css_error record_deferred(css_select_state *state,
+ 
+ 		m = &state->deferred[state->n_deferred++];
+ 		m->decl = &rs->deferred[i];
+-		m->sheet = state->sheet;
++		/* the rule's own sheet: with the merged index the state
++		 * has no current sheet (VitaSurf) */
++		m->sheet = _rule_sheet(&rs->base);
+ 		m->specificity = state->current_specificity;
+ 		m->origin = state->current_origin;
+ 		m->pseudo = pseudo;
+@@ -574,6 +638,8 @@ css_error css_select_ctx_destroy(css_select_ctx *ctx)
+ 		free(ctx->sheets);
+ 	}
+ 
++	css__select_ctx_drop_index(ctx);
++
+ 	css_calculator_unref(ctx->calc);
+ 
+ 	free(ctx);
+@@ -665,6 +731,8 @@ css_error css_select_ctx_insert_sheet(css_select_ctx *ctx,
+ 
+ 	ctx->n_sheets++;
+ 
++	css__select_ctx_drop_index(ctx);
++
+ 	return CSS_OK;
+ }
+ 
+@@ -698,6 +766,8 @@ css_error css_select_ctx_remove_sheet(css_select_ctx *ctx,
+ 	memmove(&ctx->sheets[index], &ctx->sheets[index + 1],
+ 			(ctx->n_sheets - index) * sizeof(css_select_sheet));
+ 
++	css__select_ctx_drop_index(ctx);
++
+ 	return CSS_OK;
+ 
+ }
+@@ -1569,6 +1639,263 @@ static css_error css__select_revert_property(
+ 	return CSS_OK;
+ }
+ 
++/*
++ * The merged selector index (VitaSurf). See the context struct.
++ */
++
++static void css__select_ctx_drop_index(css_select_ctx *ctx)
++{
++	css_origin o;
++
++	for (o = CSS_ORIGIN_UA; o <= CSS_ORIGIN_AUTHOR; o++) {
++		if (ctx->index[o] != NULL) {
++			css__selector_hash_destroy(ctx->index[o]);
++			ctx->index[o] = NULL;
++		}
++	}
++	free(ctx->flat);
++	ctx->flat = NULL;
++	ctx->n_flat = 0;
++	free(ctx->active);
++	ctx->active = NULL;
++	ctx->active_valid = false;
++	ctx->index_valid = false;
++	ctx->index_failed = false;
++	ctx->index_entries = 0;
++	ctx->index_bytes = 0;
++}
++
++/** Room for one more flat entry. */
++static css_error _flat_grow(css_select_ctx *ctx, uint32_t *alloc)
++{
++	css_select_flat *grown;
++	uint32_t want;
++
++	if (ctx->n_flat < *alloc)
++		return CSS_OK;
++
++	want = (*alloc == 0) ? 16 : *alloc * 2;
++	grown = realloc(ctx->flat, want * sizeof(*grown));
++	if (grown == NULL)
++		return CSS_NOMEM;
++	ctx->flat = grown;
++	*alloc = want;
++
++	return CSS_OK;
++}
++
++#define FLAT_IMPORT_DEPTH 32
++
++/**
++ * List a sheet and, before it, the sheets it imports, the way
++ * select_from_sheet reaches them. The list is in pre-order so that a
++ * sheet's parent is always listed before it; seq is handed out in
++ * post-order and is the cascade position.
++ */
++static css_error _flatten(css_select_ctx *ctx, uint32_t *alloc,
++		const css_stylesheet *sheet, css_origin origin, uint32_t top,
++		uint32_t parent, const css_rule_import *via, uint32_t *seq,
++		int depth)
++{
++	const css_rule *rule;
++	uint32_t me;
++	css_error error;
++
++	if (depth > FLAT_IMPORT_DEPTH)
++		return CSS_OK;	/* deeper than any real sheet goes */
++
++	error = _flat_grow(ctx, alloc);
++	if (error != CSS_OK)
++		return error;
++	me = ctx->n_flat++;
++	ctx->flat[me].sheet = sheet;
++	ctx->flat[me].origin = origin;
++	ctx->flat[me].top = top;
++	ctx->flat[me].parent = parent;
++	ctx->flat[me].via = via;
++	ctx->flat[me].disabled = false;
++
++	/* the imports at the head of the sheet, in order */
++	for (rule = sheet->rule_list; rule != NULL; rule = rule->next) {
++		const css_rule_import *import;
++
++		if (rule->type == CSS_RULE_CHARSET)
++			continue;
++		if (rule->type != CSS_RULE_IMPORT)
++			break;
++		import = (const css_rule_import *) rule;
++		if (import->sheet == NULL)
++			continue;
++		error = _flatten(ctx, alloc, import->sheet, origin, top, me,
++				import, seq, depth + 1);
++		if (error != CSS_OK)
++			return error;
++	}
++
++	ctx->flat[me].seq = (*seq)++;
++
++	return CSS_OK;
++}
++
++static css_error css__select_ctx_build_index(css_select_ctx *ctx)
++{
++	uint32_t alloc = 0, seq = 0, i;
++	const css_selector_hash **parts = NULL;
++	uint32_t *seqs = NULL;
++	css_origin o;
++	css_error error = CSS_OK;
++
++	css__select_ctx_drop_index(ctx);
++
++	for (i = 0; i < ctx->n_sheets; i++) {
++		if (ctx->sheets[i].sheet == NULL)
++			continue;
++		error = _flatten(ctx, &alloc, ctx->sheets[i].sheet,
++				ctx->sheets[i].origin, i, UINT32_MAX, NULL,
++				&seq, 0);
++		if (error != CSS_OK)
++			goto fail;
++	}
++
++	parts = malloc((ctx->n_flat + 1) * sizeof(*parts));
++	seqs = malloc((ctx->n_flat + 1) * sizeof(*seqs));
++	ctx->active = calloc((ctx->n_flat + 31) / 32 + 1, sizeof(uint32_t));
++	if (parts == NULL || seqs == NULL || ctx->active == NULL) {
++		error = CSS_NOMEM;
++		goto fail;
++	}
++
++	for (o = CSS_ORIGIN_UA; o <= CSS_ORIGIN_AUTHOR; o++) {
++		uint32_t n = 0;
++
++		for (i = 0; i < ctx->n_flat; i++) {
++			if (ctx->flat[i].origin != o)
++				continue;
++			parts[n] = ctx->flat[i].sheet->selectors;
++			seqs[n] = ctx->flat[i].seq;
++			n++;
++		}
++		if (n == 0)
++			continue;
++
++		error = css__selector_hash_merge(&ctx->index[o], parts,
++				seqs, n);
++		if (error != CSS_OK)
++			goto fail;
++	}
++
++	for (o = CSS_ORIGIN_UA; o <= CSS_ORIGIN_AUTHOR; o++) {
++		uint32_t entries, bytes;
++
++		css__selector_hash_stats(ctx->index[o], &entries, &bytes);
++		ctx->index_entries += entries;
++		ctx->index_bytes += bytes;
++	}
++	ctx->index_bytes += (uint32_t) (ctx->n_flat * sizeof(*ctx->flat));
++
++	free(parts);
++	free(seqs);
++	ctx->index_valid = true;
++	css_select_index_builds++;
++	css_select_index_entries = ctx->index_entries;
++	css_select_index_bytes = ctx->index_bytes;
++	css_select_index_sheets = ctx->n_flat;
++
++	return CSS_OK;
++
++fail:
++	free(parts);
++	free(seqs);
++	css__select_ctx_drop_index(ctx);
++	if (error == CSS_NOMEM) {
++		ctx->index_failed = true;
++		css_select_index_failed++;
++	}
++	return error;
++}
++
++/**
++ * Work out which sheets apply, once per media and unit context.
++ *
++ * The per-sheet walk asked every sheet's media query for every element.
++ * Here the answer is kept until the media, the unit context or a
++ * sheet's disabled flag changes, and the bits are what the chains test.
++ */
++static css_error css__select_ctx_refresh_active(css_select_ctx *ctx,
++		const css_unit_ctx *unit_ctx, const css_media *media)
++{
++	uint32_t i;
++	bool same = ctx->active_valid &&
++			memcmp(&ctx->active_media, media,
++					sizeof(*media)) == 0 &&
++			memcmp(&ctx->active_unit, unit_ctx,
++					sizeof(*unit_ctx)) == 0;
++
++	if (same) {
++		for (i = 0; i < ctx->n_flat; i++) {
++			const css_select_flat *f = &ctx->flat[i];
++
++			if (f->via == NULL &&
++					f->sheet->disabled != f->disabled) {
++				same = false;
++				break;
++			}
++		}
++	}
++	if (same)
++		return CSS_OK;
++
++	memset(ctx->active, 0,
++			((ctx->n_flat + 31) / 32 + 1) * sizeof(uint32_t));
++
++	for (i = 0; i < ctx->n_flat; i++) {
++		css_select_flat *f = &ctx->flat[i];
++		bool on;
++
++		if (f->via == NULL) {
++			f->disabled = f->sheet->disabled;
++			on = f->disabled == false &&
++				mq__list_match(ctx->sheets[f->top].media,
++						unit_ctx, media, &ctx->str);
++		} else {
++			const css_select_flat *p = &ctx->flat[f->parent];
++
++			on = ((ctx->active[p->seq >> 5] >> (p->seq & 31)) &
++					1u) != 0 &&
++				mq__list_match(f->via->media, unit_ctx, media,
++						&ctx->str);
++		}
++		if (on)
++			ctx->active[f->seq >> 5] |= 1u << (f->seq & 31);
++	}
++
++	ctx->active_media = *media;
++	memcpy(&ctx->active_unit, unit_ctx, sizeof(*unit_ctx));
++	ctx->active_valid = true;
++
++	return CSS_OK;
++}
++
++/* exported: see libcss/select.h (VitaSurf) */
++css_error css_select_ctx_build_index(css_select_ctx *ctx,
++		uint32_t *sheets, uint32_t *entries, uint32_t *bytes)
++{
++	css_error error;
++
++	if (ctx == NULL)
++		return CSS_BADPARM;
++
++	error = css__select_ctx_build_index(ctx);
++	if (sheets != NULL)
++		*sheets = ctx->n_flat;
++	if (entries != NULL)
++		*entries = ctx->index_entries;
++	if (bytes != NULL)
++		*bytes = ctx->index_bytes;
++
++	return error;
++}
++
+ /**
+  * Select a style for the given node
+  *
+@@ -1741,7 +2068,66 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	if (ctx->n_sheets > 0) {
+ 		origin = ctx->sheets[0].origin;
+ 	}
+-	for (i = 0; i < ctx->n_sheets; i++) {
++
++	/*
++	 * Through the merged index when there is one: one visit per
++	 * origin instead of one per sheet (VitaSurf). Without the memory
++	 * for it, selection goes sheet by sheet as it always did.
++	 */
++#ifndef __vita__
++	/* for measuring the index against the per-sheet walk natively */
++	if (getenv("VITASURF_NO_INDEX") != NULL && !ctx->index_failed) {
++		css__select_ctx_drop_index(ctx);
++		ctx->index_failed = true;
++	}
++#endif
++	if (ctx->n_sheets > 0 && !ctx->index_valid && !ctx->index_failed) {
++		error = css__select_ctx_build_index(ctx);
++		if (error != CSS_OK && error != CSS_NOMEM)
++			goto cleanup;
++	}
++	if (ctx->index_valid) {
++		css_origin o;
++		bool first = true;
++
++		error = css__select_ctx_refresh_active(ctx, unit_ctx, media);
++		if (error != CSS_OK)
++			goto cleanup;
++
++		for (o = CSS_ORIGIN_UA; o <= CSS_ORIGIN_AUTHOR; o++) {
++			if (ctx->index[o] == NULL)
++				continue;
++
++			if (first) {
++				origin = o;
++				first = false;
++			} else if (state.revert != NULL && o != origin) {
++				for (j = 0; j < CSS_PSEUDO_ELEMENT_COUNT; j++) {
++					if (state.results->styles[j] == NULL) {
++						continue;
++					}
++					error = css__computed_style_clone(
++						state.results->styles[j],
++						&state.revert[origin].style[j]);
++					if (error != CSS_OK) {
++						goto cleanup;
++					}
++					memcpy(state.revert[origin].props,
++					       state.props,
++					       sizeof(state.props));
++				}
++				origin = o;
++			}
++
++			state.sheet = NULL;
++			state.current_origin = o;
++			error = match_selectors_in_sheet(ctx, ctx->index[o],
++					ctx->active, &state);
++			if (error != CSS_OK)
++				goto cleanup;
++		}
++	}
++	for (i = 0; ctx->index_valid == false && i < ctx->n_sheets; i++) {
+ 		const css_select_sheet s = ctx->sheets[i];
+ 
+ 		if (state.revert != NULL && s.origin != origin) {
+@@ -2191,7 +2577,8 @@ css_error select_from_sheet(css_select_ctx *ctx, const css_stylesheet *sheet,
+ 			state->sheet = s;
+ 			state->current_origin = origin;
+ 
+-			error = match_selectors_in_sheet(ctx, s, state);
++			error = match_selectors_in_sheet(ctx, s->selectors,
++					NULL, state);
+ 			if (error != CSS_OK)
+ 				return error;
+ 
+@@ -2358,9 +2745,10 @@ static inline bool _selectors_pending(const css_selector **node,
+ 	return pending;
+ }
+ 
+-static inline bool _selector_less_specific(const css_selector *ref,
+-		const css_selector *cand)
++static inline bool _selector_less_specific(const css_selector **ref_entry,
++		const css_selector **cand_entry)
+ {
++	const css_selector *ref = *ref_entry, *cand = *cand_entry;
+ 	bool result = true;
+ 
+ 	if (cand == NULL)
+@@ -2375,11 +2763,23 @@ static inline bool _selector_less_specific(const css_selector *ref,
+ 	} else if (ref->specificity < cand->specificity) {
+ 		result = false;
+ 	} else {
+-		/* Then by rule index -- earliest wins */
+-		if (cand->rule->index < ref->rule->index)
++		/*
++		 * Then by sheet -- the chains of a merged index hold
++		 * rules from every sheet, and a rule's index counts only
++		 * within its own (VitaSurf). The entry is the pointer
++		 * the chain handed out, and its front says which sheet.
++		 */
++		uint32_t cseq = css__selector_hash_entry_seq(cand_entry);
++		uint32_t rseq = css__selector_hash_entry_seq(ref_entry);
++
++		if (cseq != rseq) {
++			result = cseq < rseq;
++		} else if (cand->rule->index < ref->rule->index) {
++			/* Then by rule index -- earliest wins */
+ 			result = true;
+-		else
++		} else {
+ 			result = false;
++		}
+ 	}
+ 
+ 	return result;
+@@ -2391,20 +2791,21 @@ static const css_selector *_selector_next(const css_selector **node,
+ 		const css_selector ***attrs, uint32_t n_attrs,
+ 		css_select_rule_source *src)
+ {
+-	const css_selector *ret = NULL;
++	static const css_selector *none = NULL;
++	const css_selector **ret = &none;
+ 
+-	if (_selector_less_specific(ret, *node)) {
+-		ret = *node;
++	if (_selector_less_specific(ret, node)) {
++		ret = node;
+ 		src->source = CSS_SELECT_RULE_SRC_ELEMENT;
+ 	}
+ 
+-	if (_selector_less_specific(ret, *id)) {
+-		ret = *id;
++	if (_selector_less_specific(ret, id)) {
++		ret = id;
+ 		src->source = CSS_SELECT_RULE_SRC_ID;
+ 	}
+ 
+-	if (_selector_less_specific(ret, *univ)) {
+-		ret = *univ;
++	if (_selector_less_specific(ret, univ)) {
++		ret = univ;
+ 		src->source = CSS_SELECT_RULE_SRC_UNIVERSAL;
+ 	}
+ 
+@@ -2412,8 +2813,8 @@ static const css_selector *_selector_next(const css_selector **node,
+ 		uint32_t i;
+ 
+ 		for (i = 0; i < n_classes; i++) {
+-			if (_selector_less_specific(ret, *(classes[i]))) {
+-				ret = *(classes[i]);
++			if (_selector_less_specific(ret, classes[i])) {
++				ret = classes[i];
+ 				src->source = CSS_SELECT_RULE_SRC_CLASS;
+ 				src->class = i;
+ 			}
+@@ -2424,19 +2825,20 @@ static const css_selector *_selector_next(const css_selector **node,
+ 		uint32_t i;
+ 
+ 		for (i = 0; i < n_attrs; i++) {
+-			if (_selector_less_specific(ret, *(attrs[i]))) {
+-				ret = *(attrs[i]);
++			if (_selector_less_specific(ret, attrs[i])) {
++				ret = attrs[i];
+ 				src->source = CSS_SELECT_RULE_SRC_ATTRIBUTE;
+ 				src->attr = i;
+ 			}
+ 		}
+ 	}
+ 
+-	return ret;
++	return *ret;
+ }
+ 
+ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+-		const css_stylesheet *sheet, css_select_state *state)
++		css_selector_hash *hash, const uint32_t *active,
++		css_select_state *state)
+ {
+ 	static const css_selector *empty_selector = NULL;
+ 	const uint32_t n_classes = state->n_classes;
+@@ -2472,7 +2874,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	 * is now the finds, and most of those hit an empty table in a
+ 	 * small sheet; a sheet with nothing costs nothing.
+ 	 */
+-	const uint32_t tables = css__selector_hash_tables(sheet->selectors);
++	const uint32_t tables = css__selector_hash_tables(hash);
+ 
+ 	if (tables == 0) {
+ 		css_select_sheets_empty++;
+@@ -2487,11 +2889,12 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	req.node_state = state->node_state;
+ 	req.attr_bloom = state->attr_bloom;
+ 	req.attr_slot = 0;
++	req.active = active;
+ 
+ 	/* Find hash chain that applies to current node */
+ 	req.qname = state->element;
+ 	if (tables & CSS_HASH_HAS_ELEMENTS) {
+-		error = css__selector_hash_find(sheet->selectors,
++		error = css__selector_hash_find(hash,
+ 				&req, &node_iterator,
+ 				&node_selectors);
+ 		if (error != CSS_OK)
+@@ -2515,7 +2918,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		for (i = 0; i < n_classes; i++) {
+ 			req.class = state->classes[i];
+ 			error = css__selector_hash_find_by_class(
+-					sheet->selectors, &req,
++					hash, &req,
+ 					&class_iterator, &class_selectors[i]);
+ 			if (error != CSS_OK)
+ 				goto cleanup;
+@@ -2525,7 +2928,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	if ((tables & CSS_HASH_HAS_IDS) && state->id != NULL) {
+ 		/* Find hash chain for node ID */
+ 		req.id = state->id;
+-		error = css__selector_hash_find_by_id(sheet->selectors,
++		error = css__selector_hash_find_by_id(hash,
+ 				&req, &id_iterator, &id_selectors);
+ 		if (error != CSS_OK)
+ 			goto cleanup;
+@@ -2533,7 +2936,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 
+ 	/* Find hash chain for universal selector */
+ 	if (tables & CSS_HASH_HAS_UNIVERSAL) {
+-		error = css__selector_hash_find_universal(sheet->selectors,
++		error = css__selector_hash_find_universal(hash,
+ 				&req, &univ_iterator, &univ_selectors);
+ 		if (error != CSS_OK)
+ 			goto cleanup;
+@@ -2544,7 +2947,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		n_attrs = 0;
+ 	for (i = 0; i < n_attrs; i++) {
+ 		req.attr_slot = state->attr_slots[i];
+-		error = css__selector_hash_find_by_attr(sheet->selectors,
++		error = css__selector_hash_find_by_attr(hash,
+ 				&req, &attr_iterator, &attr_selectors[i]);
+ 		if (error != CSS_OK)
+ 			goto cleanup;
+@@ -2557,7 +2960,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	 * this is a chain of thousands that is never touched.
+ 	 */
+ 	if ((tables & CSS_HASH_HAS_STATE) && state->node_state != 0) {
+-		error = css__selector_hash_find_by_state(sheet->selectors,
++		error = css__selector_hash_find_by_state(hash,
+ 				&req, &attr_iterator,
+ 				&attr_selectors[n_attrs]);
+ 		if (error != CSS_OK)

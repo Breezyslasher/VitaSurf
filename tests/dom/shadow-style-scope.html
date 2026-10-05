@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- A shadow root's <style> applies to its own component only. Shadow
+     DOM is kept as light DOM here, so the rules are scoped to the host's
+     tag: Home Assistant's checkbox brought input{opacity:0;
+     pointer-events:none} into the page and hid every text field from
+     taps. A host's child whose slot the component does not put out is
+     not drawn. Expected console output: five lines ending in "ok". -->
+<html><body>
+<input id=outer>
+<x-box id=box><span id=named slot=gone>hidden</span><span id=kept slot=here>shown</span></x-box>
+<script>
+var box = document.getElementById('box'), root = box.attachShadow({mode: 'open'});
+var st = document.createElement('style');
+st.textContent = 'input{display:none} :host{display:flex} ::slotted(span){color:rgb(0, 128, 0)}';
+root.appendChild(st);
+var inner = document.createElement('input'), slot = document.createElement('slot');
+slot.setAttribute('name', 'here');
+root.appendChild(inner);
+root.appendChild(slot);
+setTimeout(function () {
+  var outer = document.getElementById('outer');
+  console.log("outer input untouched:", getComputedStyle(outer).display !== 'none' ? "ok" : "FAIL " + getComputedStyle(outer).display);
+  console.log("inner input styled:", getComputedStyle(inner).display === 'none' ? "ok" : "FAIL " + getComputedStyle(inner).display);
+  console.log(":host is the host:", getComputedStyle(box).display === 'flex' ? "ok" : "FAIL " + getComputedStyle(box).display);
+  var g = document.getElementById('named'), k = document.getElementById('kept');
+  console.log("no slot, not drawn:", getComputedStyle(g).display === 'none' ? "ok" : "FAIL " + getComputedStyle(g).display);
+  console.log("slot, drawn:", getComputedStyle(k).display !== 'none' && getComputedStyle(k).color === 'rgb(0, 128, 0)' ? "ok" : "FAIL " + getComputedStyle(k).display + ' ' + getComputedStyle(k).color);
+}, 1000);
+</script></body></html>

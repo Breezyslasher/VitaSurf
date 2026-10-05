@@ -55,6 +55,19 @@ void vita_input_load_started(struct gui_window *gw);
 void vita_input_load_finished(struct gui_window *gw);
 
 /**
+ * Write the page's figures. Called when it finishes loading, and again
+ * if it keeps working afterwards, which a page that renders itself does.
+ */
+void vita_input_report_page(struct gui_window *gw, unsigned int ms);
+
+/**
+ * How busy the scheduler was over the last span, once a second from the
+ * frame loop, so a page that builds itself after it has loaded is
+ * reported once it settles.
+ */
+void vita_input_settled(unsigned int sched_ms, unsigned int span_ms);
+
+/**
  * Write the boxes of the page on screen to the log (VitaSurf).
  *
  * Does nothing unless the dumplayout flag file is there. The scripts

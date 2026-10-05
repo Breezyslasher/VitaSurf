@@ -1,0 +1,128 @@
+diff --git a/src/lex/lex.c b/src/lex/lex.c
+index 88dcb85..b840946 100644
+--- a/src/lex/lex.c
++++ b/src/lex/lex.c
+@@ -156,6 +156,23 @@ static css_error consumeUnicode(css_lexer *lexer, uint32_t ucs);
+ static css_error consumeURLChars(css_lexer *lexer);
+ static css_error consumeWChars(css_lexer *lexer);
+ 
++/* [a-zA-Z0-9_-], the ASCII name characters (VitaSurf) */
++static const uint8_t lex_ascii_nmchar[256] = {
++	['-'] = 1, ['_'] = 1,
++	['0'] = 1, ['1'] = 1, ['2'] = 1, ['3'] = 1, ['4'] = 1,
++	['5'] = 1, ['6'] = 1, ['7'] = 1, ['8'] = 1, ['9'] = 1,
++	['a'] = 1, ['b'] = 1, ['c'] = 1, ['d'] = 1, ['e'] = 1, ['f'] = 1,
++	['g'] = 1, ['h'] = 1, ['i'] = 1, ['j'] = 1, ['k'] = 1, ['l'] = 1,
++	['m'] = 1, ['n'] = 1, ['o'] = 1, ['p'] = 1, ['q'] = 1, ['r'] = 1,
++	['s'] = 1, ['t'] = 1, ['u'] = 1, ['v'] = 1, ['w'] = 1, ['x'] = 1,
++	['y'] = 1, ['z'] = 1,
++	['A'] = 1, ['B'] = 1, ['C'] = 1, ['D'] = 1, ['E'] = 1, ['F'] = 1,
++	['G'] = 1, ['H'] = 1, ['I'] = 1, ['J'] = 1, ['K'] = 1, ['L'] = 1,
++	['M'] = 1, ['N'] = 1, ['O'] = 1, ['P'] = 1, ['Q'] = 1, ['R'] = 1,
++	['S'] = 1, ['T'] = 1, ['U'] = 1, ['V'] = 1, ['W'] = 1, ['X'] = 1,
++	['Y'] = 1, ['Z'] = 1,
++};
++
+ static inline bool startNMChar(uint8_t c);
+ static inline bool startNMStart(uint8_t c);
+ static inline bool startStringChar(uint8_t c);
+@@ -1857,6 +1874,28 @@ css_error consumeNMChars(css_lexer *lexer)
+ 	/* nmchar = [a-zA-Z] | '-' | '_' | nonascii | escape */
+ 
+ 	do {
++		/*
++		 * A run of plain ASCII name characters in one step
++		 * (VitaSurf): each would have been peeked and appended a
++		 * byte at a time, and names are most of a style sheet --
++		 * 95 of the 843 million instructions GitHub's took.
++		 * Anything else, including a character that is not all in
++		 * the buffer yet, goes the old way below.
++		 */
++		{
++			const parserutils_buffer *utf8 = lexer->input->utf8;
++			size_t from = lexer->input->cursor +
++					lexer->bytesReadForToken;
++			size_t at = from;
++
++			while (at < utf8->length &&
++					lex_ascii_nmchar[utf8->data[at]])
++				at++;
++			if (at > from) {
++				APPEND(lexer, utf8->data + from, at - from);
++			}
++		}
++
+ 		perror = parserutils_inputstream_peek(lexer->input,
+ 				lexer->bytesReadForToken, &cptr, &clen);
+ 		if (perror != PARSERUTILS_OK && perror != PARSERUTILS_EOF)
+diff --git a/src/parse/language.c b/src/parse/language.c
+index e708acb..443aa44 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -621,12 +621,24 @@ static css_error deferDeclaration(css_rule *rule, lwc_string *property,
+ 		return CSS_OK;
+ 	}
+ 
+-	grown = realloc(rs->deferred,
+-			(rs->n_deferred + 1) * sizeof(*rs->deferred));
+-	if (grown == NULL) {
+-		return CSS_NOMEM;
++	/*
++	 * Room doubles, from 4, whenever the count reaches a power of two
++	 * (VitaSurf). Growing by one copied the whole list for every
++	 * declaration held over, and GitHub's :root holds 1,984 of them at
++	 * about a hundred bytes each: 35 million instructions of a
++	 * style sheet parse were those copies.
++	 */
++	if (rs->n_deferred == 0 || (rs->n_deferred >= 4 &&
++			(rs->n_deferred & (rs->n_deferred - 1)) == 0)) {
++		uint32_t room = (rs->n_deferred == 0) ? 4 :
++				rs->n_deferred * 2;
++
++		grown = realloc(rs->deferred, room * sizeof(*rs->deferred));
++		if (grown == NULL) {
++			return CSS_NOMEM;
++		}
++		rs->deferred = grown;
+ 	}
+-	rs->deferred = grown;
+ 
+ 	d = &rs->deferred[rs->n_deferred];
+ 	memset(d, 0, sizeof(*d));
+diff --git a/src/parse/nesting.c b/src/parse/nesting.c
+index a86a962..56cb902 100644
+--- a/src/parse/nesting.c
++++ b/src/parse/nesting.c
+@@ -174,6 +174,17 @@ static void nest_skip_leading(const char **p, size_t *n)
+ 	}
+ }
+ 
++/*
++ * The bytes the scan below has to stop at (VitaSurf). Everything else
++ * is stepped over in a tight loop: calling nest_step() for every byte of
++ * a large site's style sheets was 27 instructions a byte, 88 of the 1,173
++ * million a parse of GitHub's sheets took.
++ */
++static const unsigned char nest_special[256] = {
++	['{'] = 1, ['}'] = 1, [';'] = 1, ['\\'] = 1,
++	['"'] = 1, ['\''] = 1, ['/'] = 1,
++};
++
+ /* exported interface documented in parse/nesting.h */
+ bool css__source_has_nesting(const char *s, size_t n)
+ {
+@@ -187,7 +198,13 @@ bool css__source_has_nesting(const char *s, size_t n)
+ 	size_t i = 0, depth = 0, prelude_at = 0;
+ 
+ 	while (i < n) {
+-		char c = s[i];
++		char c;
++
++		while (i < n && nest_special[(unsigned char) s[i]] == 0)
++			i++;
++		if (i >= n)
++			break;
++		c = s[i];
+ 
+ 		if (c == '{') {
+ 			const char *pre = s + prelude_at;

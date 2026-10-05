@@ -1,0 +1,252 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 725ecfe32..154415794 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -151,6 +151,55 @@ static inline bool box_is_root(dom_node *n)
+ 	return true;
+ }
+ 
++vitasurf_composed_hook vitasurf_composed = NULL;
++
++/* A node's parent, first child and next sibling in the tree boxes are
++ * built from: the composed tree when the script engine keeps one, the
++ * DOM otherwise (VitaSurf). */
++static dom_exception
++composed_parent(html_content *c, dom_node *n, dom_node **out)
++{
++	if (vitasurf_composed != NULL &&
++	    vitasurf_composed(c, VITASURF_COMPOSED_PARENT, n, out))
++		return DOM_NO_ERR;
++	return dom_node_get_parent_node(n, out);
++}
++
++static dom_exception
++composed_first_child(html_content *c, dom_node *n, dom_node **out)
++{
++	if (vitasurf_composed != NULL &&
++	    vitasurf_composed(c, VITASURF_COMPOSED_FIRST_CHILD, n, out))
++		return DOM_NO_ERR;
++	return dom_node_get_first_child(n, out);
++}
++
++static dom_exception
++composed_next_sibling(html_content *c, dom_node *n, dom_node **out)
++{
++	if (vitasurf_composed != NULL &&
++	    vitasurf_composed(c, VITASURF_COMPOSED_NEXT_SIBLING, n, out))
++		return DOM_NO_ERR;
++	return dom_node_get_next_sibling(n, out);
++}
++
++static dom_exception
++composed_has_children(html_content *c, dom_node *n, bool *has)
++{
++	dom_node *first = NULL;
++	dom_exception err;
++
++	if (vitasurf_composed == NULL)
++		return dom_node_has_child_nodes(n, has);
++	err = composed_first_child(c, n, &first);
++	if (err != DOM_NO_ERR)
++		return err;
++	*has = (first != NULL);
++	if (first != NULL)
++		dom_node_unref(first);
++	return DOM_NO_ERR;
++}
++
+ /**
+  * Extract transient construction properties
+  *
+@@ -158,7 +207,8 @@ static inline bool box_is_root(dom_node *n)
+  * \param props  Property object to populate
+  */
+ static void
+-box_extract_properties(dom_node *n, struct box_construct_props *props)
++box_extract_properties(html_content *c, dom_node *n,
++		struct box_construct_props *props)
+ {
+ 	memset(props, 0, sizeof(*props));
+ 
+@@ -173,7 +223,7 @@ box_extract_properties(dom_node *n, struct box_construct_props *props)
+ 
+ 		/* Find ancestor node containing parent box */
+ 		while (true) {
+-			err = dom_node_get_parent_node(current_node,
++			err = composed_parent(c, current_node,
+ 					&parent_node);
+ 			if (err != DOM_NO_ERR || parent_node == NULL)
+ 				break;
+@@ -200,7 +250,7 @@ box_extract_properties(dom_node *n, struct box_construct_props *props)
+ 		while (true) {
+ 			struct box *b;
+ 
+-			err = dom_node_get_parent_node(current_node,
++			err = composed_parent(c, current_node,
+ 					&parent_node);
+ 			if (err != DOM_NO_ERR || parent_node == NULL) {
+ 				if (current_node != n)
+@@ -731,7 +781,7 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 
+ 	assert(ctx->n != NULL);
+ 
+-	box_extract_properties(ctx->n, &props);
++	box_extract_properties(ctx->content, ctx->n, &props);
+ 
+ 	if (props.containing_block != NULL) {
+ 		/* In case the containing block is a pre block, we clear
+@@ -1186,7 +1236,7 @@ static void box_construct_element_after(dom_node *n, html_content *content)
+ 
+ 	assert(box != NULL);
+ 
+-	box_extract_properties(n, &props);
++	box_extract_properties(content, n, &props);
+ 
+ 	if (box->type == BOX_INLINE || box->type == BOX_BR) {
+ 		/* Insert INLINE_END into containing block */
+@@ -1194,7 +1244,7 @@ static void box_construct_element_after(dom_node *n, html_content *content)
+ 		bool has_children;
+ 		dom_exception err;
+ 
+-		err = dom_node_has_child_nodes(n, &has_children);
++		err = composed_has_children(content, n, &has_children);
+ 		if (err != DOM_NO_ERR)
+ 			return;
+ 
+@@ -1279,21 +1329,21 @@ next_node(dom_node *n, html_content *content, bool convert_children)
+ 	bool has_children;
+ 	dom_exception err;
+ 
+-	err = dom_node_has_child_nodes(n, &has_children);
++	err = composed_has_children(content, n, &has_children);
+ 	if (err != DOM_NO_ERR) {
+ 		dom_node_unref(n);
+ 		return NULL;
+ 	}
+ 
+ 	if (convert_children && has_children) {
+-		err = dom_node_get_first_child(n, &next);
++		err = composed_first_child(content, n, &next);
+ 		if (err != DOM_NO_ERR) {
+ 			dom_node_unref(n);
+ 			return NULL;
+ 		}
+ 		dom_node_unref(n);
+ 	} else {
+-		err = dom_node_get_next_sibling(n, &next);
++		err = composed_next_sibling(content, n, &next);
+ 		if (err != DOM_NO_ERR) {
+ 			dom_node_unref(n);
+ 			return NULL;
+@@ -1311,7 +1361,7 @@ next_node(dom_node *n, html_content *content, bool convert_children)
+ 				dom_node *parent = NULL;
+ 				dom_node *parent_next = NULL;
+ 
+-				err = dom_node_get_parent_node(n, &parent);
++				err = composed_parent(content, n, &parent);
+ 				if (err != DOM_NO_ERR) {
+ 					dom_node_unref(n);
+ 					return NULL;
+@@ -1319,7 +1369,7 @@ next_node(dom_node *n, html_content *content, bool convert_children)
+ 
+ 				assert(parent != NULL);
+ 
+-				err = dom_node_get_next_sibling(parent,
++				err = composed_next_sibling(content, parent,
+ 						&parent_next);
+ 				if (err != DOM_NO_ERR) {
+ 					dom_node_unref(parent);
+@@ -1346,7 +1396,7 @@ next_node(dom_node *n, html_content *content, bool convert_children)
+ 			if (box_is_root(n) == false) {
+ 				dom_node *parent = NULL;
+ 
+-				err = dom_node_get_parent_node(n, &parent);
++				err = composed_parent(content, n, &parent);
+ 				if (err != DOM_NO_ERR) {
+ 					dom_node_unref(n);
+ 					return NULL;
+@@ -1354,7 +1404,7 @@ next_node(dom_node *n, html_content *content, bool convert_children)
+ 
+ 				assert(parent != NULL);
+ 
+-				err = dom_node_get_next_sibling(parent, &next);
++				err = composed_next_sibling(content, parent, &next);
+ 				if (err != DOM_NO_ERR) {
+ 					dom_node_unref(parent);
+ 					dom_node_unref(n);
+@@ -1530,7 +1580,7 @@ static bool box_construct_text(struct box_construct_ctx *ctx)
+ 
+ 	assert(ctx->n != NULL);
+ 
+-	box_extract_properties(ctx->n, &props);
++	box_extract_properties(ctx->content, ctx->n, &props);
+ 
+ 	assert(props.containing_block != NULL);
+ 
+@@ -1944,6 +1994,10 @@ dom_to_box(dom_node *n,
+ 
+ 	*box_conversion_context = ctx;
+ 
++	/* what goes in which slot, as of now (VitaSurf) */
++	if (vitasurf_composed != NULL)
++		vitasurf_composed(c, VITASURF_COMPOSED_PREPARE, n, NULL);
++
+ 	return guit->misc->schedule(0, (void *)convert_xml_to_box, ctx);
+ }
+ 
+@@ -1974,6 +2028,9 @@ dom_to_box_sync(dom_node *n, html_content *c, box_construct_complete_cb cb)
+ 	ctx->bctx = c->bctx;
+ 	ctx->sync = true;
+ 
++	if (vitasurf_composed != NULL)
++		vitasurf_composed(c, VITASURF_COMPOSED_PREPARE, n, NULL);
++
+ 	/* runs the whole conversion, calls cb, and frees ctx */
+ 	convert_xml_to_box(ctx);
+ 
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index 8937a4d66..87af8d7c6 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -124,4 +124,29 @@ struct box *box_for_node(struct dom_node *node);
+  */
+ bool box_extract_link(const struct html_content *content, const struct dom_string *dsrel, struct nsurl *base, struct nsurl **result);
+ 
++/**
++ * The tree boxes are built from, when it is not the DOM (VitaSurf).
++ *
++ * Shadow DOM is kept as light DOM by the script engine, so a component's
++ * own children sit beside what it rendered and would be drawn after it.
++ * The engine knows which of a host's children go into which of its
++ * <slot> elements, and which go nowhere; box construction asks it for a
++ * node's parent, first child and next sibling in that composed tree.
++ *
++ * PREPARE is asked once as a conversion starts, with n the root, so the
++ * engine can bring what it knows up to date. For the others the hook
++ * answers true and sets *out to a new reference, or NULL, when it has
++ * an answer, and false to have the DOM asked instead.
++ */
++enum vitasurf_composed_op {
++	VITASURF_COMPOSED_PREPARE,
++	VITASURF_COMPOSED_PARENT,
++	VITASURF_COMPOSED_FIRST_CHILD,
++	VITASURF_COMPOSED_NEXT_SIBLING
++};
++typedef bool (*vitasurf_composed_hook)(struct html_content *c,
++		enum vitasurf_composed_op op, struct dom_node *n,
++		struct dom_node **out);
++extern vitasurf_composed_hook vitasurf_composed;
++
+ #endif
+diff --git a/resources/default.css b/resources/default.css
+index 50db4bb5e..059fdbc5e 100644
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -168,7 +168,3 @@ mark {
+ dialog:not([open]) { display: none; }
+ datalist { display: none; }
+ input[type=hidden] { display: none; }
+-
+-/* A host's child whose slot the component does not put out, marked by
+- * the script prelude, which keeps shadow trees as light DOM (VitaSurf). */
+-[vitasurf-unslotted] { display: none !important; }

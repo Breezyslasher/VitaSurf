@@ -1,0 +1,176 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index c99e1124d..bd3b58bb0 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -506,7 +506,7 @@ content_type nscss_content_type(void)
+ static void nscss_report_gaps(struct content *c, css_stylesheet *sheet)
+ {
+ 	uint32_t gaps = css_stylesheet_gap_count(sheet);
+-	char line[256];
++	char line[512];
+ 	unsigned int at = 0;
+ 	uint32_t i;
+ 
+@@ -519,18 +519,25 @@ static void nscss_report_gaps(struct content *c, css_stylesheet *sheet)
+ 		lwc_string *name = NULL;
+ 		uint32_t count = 0;
+ 		uint32_t kind = 0;
++		const char *sample;
+ 		int n;
+ 
+ 		if (css_stylesheet_get_gap(sheet, i, &name, &count,
+ 				&kind) != CSS_OK) {
+ 			continue;
+ 		}
+-		n = snprintf(line + at, sizeof(line) - at, "%s%.*s%s x%u",
++		sample = kind == 1 ?
++			css_stylesheet_get_gap_sample(sheet, i) : NULL;
++		n = snprintf(line + at, sizeof(line) - at,
++			     "%s%.*s%s%s%s%s x%u",
+ 			     at == 0 ? "" : ", ",
+ 			     (int) lwc_string_length(name),
+ 			     lwc_string_data(name),
+-			     kind == 1 ? " (value)" :
++			     kind == 1 ? " (value" :
+ 			     kind == 2 ? " (no effect)" : "",
++			     sample != NULL ? " '" : "",
++			     sample != NULL ? sample : "",
++			     kind == 1 ? (sample != NULL ? "')" : ")") : "",
+ 			     (unsigned int) count);
+ 		if (n < 0 || (unsigned int) n >= sizeof(line) - at) {
+ 			break;
+diff --git a/content/handlers/css/dump.c b/content/handlers/css/dump.c
+index f525ac2bb..b36e6b32f 100644
+--- a/content/handlers/css/dump.c
++++ b/content/handlers/css/dump.c
+@@ -1436,6 +1436,9 @@ void nscss_dump_computed_style(FILE *stream, const css_computed_style *style)
+ 	case CSS_OVERFLOW_SCROLL:
+ 		fprintf(stream, "overflow-x: scroll ");
+ 		break;
++	case CSS_OVERFLOW_CLIP:
++		fprintf(stream, "overflow-x: clip ");
++		break;
+ 	case CSS_OVERFLOW_AUTO:
+ 		fprintf(stream, "overflow-x auto ");
+ 		break;
+@@ -1455,6 +1458,9 @@ void nscss_dump_computed_style(FILE *stream, const css_computed_style *style)
+ 	case CSS_OVERFLOW_SCROLL:
+ 		fprintf(stream, "overflow-y: scroll ");
+ 		break;
++	case CSS_OVERFLOW_CLIP:
++		fprintf(stream, "overflow-y: clip ");
++		break;
+ 	case CSS_OVERFLOW_AUTO:
+ 		fprintf(stream, "overflow-y: auto ");
+ 		break;
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+index 16dde0436..2af41350d 100644
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -50,6 +50,17 @@ static inline enum css_overflow_e box_overflow_y(const struct box *box)
+ 	return css_computed_overflow_y(box->style);
+ }
+ 
++/**
++ * Whether an overflow value makes the box a scroll container, and so a
++ * new block formatting context that margins do not collapse through
++ * (VitaSurf). clip cuts the content off as hidden does, but is neither.
++ */
++static inline bool box_overflow_contains(enum css_overflow_e overflow)
++{
++	return overflow != CSS_OVERFLOW_VISIBLE &&
++			overflow != CSS_OVERFLOW_CLIP;
++}
++
+ /**
+  * Find the absolute coordinates of a box.
+  *
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 6f0a907f3..d06d7443a 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1356,8 +1356,8 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 					box->border[TOP].width ||
+ 					box->padding[TOP] ||
+ 					(box->style &&
+-					box_overflow_y(box) !=
+-					CSS_OVERFLOW_VISIBLE) ||
++					box_overflow_contains(
++						box_overflow_y(box))) ||
+ 					(box->type == BOX_INLINE_CONTAINER &&
+ 					!box_is_first_child(box))) {
+ 				/* Collapse to this box; return it */
+@@ -1369,8 +1369,8 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 		/* Find next box */
+ 		if (box->type == BOX_BLOCK && !box->object && box->children &&
+ 				box->style &&
+-				box_overflow_y(box) ==
+-				CSS_OVERFLOW_VISIBLE) {
++				!box_overflow_contains(
++					box_overflow_y(box))) {
+ 			/* Down into children. */
+ 			box = box->children;
+ 		} else {
+@@ -4302,8 +4302,8 @@ bool layout_block_context_single(
+ 		    box->flags & IFRAME) {
+ 			if (lh__box_is_object(box) == false &&
+ 					box->style &&
+-					(overflow_x != CSS_OVERFLOW_VISIBLE ||
+-					 overflow_y != CSS_OVERFLOW_VISIBLE ||
++					(box_overflow_contains(overflow_x) ||
++					 box_overflow_contains(overflow_y) ||
+ 					 lh__box_is_multicol(box) ||
+ 					 box_vertical(box) != 0)) {
+ 				/* box establishes new block formatting context
+@@ -4415,8 +4415,8 @@ bool layout_block_context_single(
+ 		 * box (VitaSurf). */
+ 		if (box->type == BOX_FLEX ||
+ 				(box->type == BOX_BLOCK && box->style &&
+-				 (overflow_x != CSS_OVERFLOW_VISIBLE ||
+-				  overflow_y != CSS_OVERFLOW_VISIBLE ||
++				 (box_overflow_contains(overflow_x) ||
++				  box_overflow_contains(overflow_y) ||
+ 				  lh__box_is_multicol(box) ||
+ 				  box_vertical(box) != 0))) {
+ 
+@@ -6088,10 +6088,11 @@ static void layout_calculate_descendant_bboxes_inner(
+ 
+ 		layout_calculate_descendant_bboxes(unit_len_ctx, child);
+ 
+-		if (box->style && box_overflow_x(box) ==
+-				CSS_OVERFLOW_HIDDEN &&
+-				box_overflow_y(box) ==
+-				CSS_OVERFLOW_HIDDEN)
++		if (box->style && (box_overflow_x(box) ==
++				CSS_OVERFLOW_HIDDEN || box_overflow_x(box) ==
++				CSS_OVERFLOW_CLIP) &&
++				(box_overflow_y(box) == CSS_OVERFLOW_HIDDEN ||
++				 box_overflow_y(box) == CSS_OVERFLOW_CLIP))
+ 			continue;
+ 
+ 		layout_update_descendant_bbox(unit_len_ctx, box, child, 0, 0);
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 96656fc16..bf0f09025 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -634,15 +634,16 @@ static inline bool layout_flex__auto_minimum(
+ 		const struct flex_ctx *ctx,
+ 		const struct box *b)
+ {
++	/* not for a scroll container; clip is not one (VitaSurf) */
+ 	if (ctx->horizontal) {
+ 		return css_computed_min_width_is_auto(b->style) &&
+-				css_computed_overflow_x(b->style) ==
+-						CSS_OVERFLOW_VISIBLE;
++				!box_overflow_contains(
++					css_computed_overflow_x(b->style));
+ 	}
+ 
+ 	return css_computed_min_height_is_auto(b->style) &&
+-			css_computed_overflow_y(b->style) ==
+-					CSS_OVERFLOW_VISIBLE;
++			!box_overflow_contains(
++				css_computed_overflow_y(b->style));
+ }
+ 
+ 

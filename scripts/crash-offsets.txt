@@ -118,3 +118,38 @@
 #   of the curl string being freed.
 0x3b44f6
 0x1be85b
+# Build 475 (VitaSurf-extmem): data abort on claude.ai, main thread, just
+#   after a 56 KB script from s-cdn.anthropic.com ran; r0 = 0x7562202c,
+#   which is text (", bu"), read as a pointer. The extended memory build
+#   differs from the ordinary one only in the SFO and one eight-letter
+#   string, so these resolve against either. PC (ARM code), LR, then the
+#   return addresses on the stack, innermost first.
+0x6ba40
+0xdba4
+0x10d06
+0x16f3e0
+0x183ff0
+0x13d524
+0x141b9c
+0x40a8de
+0x40d634
+0x96608
+0x9a3ce
+0x9ad0c
+0x9b332
+0x4075b0
+# Build 478 (VitaSurf-extmem): data abort on claude.ai, main thread, while
+#   a frame's browser window was destroyed and its content aborted after
+#   the page went to /logout. PC (Thumb), LR, then the stack.
+0x19cf6
+0x10b130
+0x19e9c
+0x422a64
+0x422a74
+0x423edc
+
+# Build 557: data abort on m.youtube.com, main thread, box_construct_element
+#   reading props.containing_block->type (NULL) at the flex blockification
+#   check during a rebuild. Fixed by patch 0327: an element with no
+#   containing block is left out with its subtree.
+0x4391a

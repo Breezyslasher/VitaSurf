@@ -70,6 +70,7 @@ enum item {
 	ITEM_TOGGLE_BOOKMARK,
 	ITEM_HISTORY,
 	ITEM_DOWNLOADS,
+	ITEM_FILES,
 	ITEM_HOME,
 	ITEM_WIFI_LOGIN,
 	ITEM_ZOOM_IN,
@@ -335,8 +336,11 @@ static bool write_history_page(void)
 		struct tm *tm = localtime(&history[i].last_visit);
 		char when[32] = "";
 
-		if (strncmp(u, "file:", 5) == 0) {
-			continue; /* generated and bundled pages */
+		if (strncmp(u, "file:", 5) == 0 ||
+		    strncmp(u, "about:", 6) == 0) {
+			/* generated and bundled pages, and the browser's
+			 * own (the file browser refuses a link from here) */
+			continue;
 		}
 		if (tm != NULL) {
 			strftime(when, sizeof(when), "%Y-%m-%d %H:%M", tm);
@@ -832,6 +836,11 @@ static void activate(enum item item)
 			go(VITASURF_DOWNLOADS_URL);
 		}
 		break;
+	case ITEM_FILES:
+		/* the browser's own page, about:files (patch 0321) */
+		vita_menu_close();
+		go("about:files");
+		break;
 	case ITEM_HOME:
 		vita_menu_close();
 		go(nsoption_charp(homepage_url) != NULL ?
@@ -972,6 +981,9 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_DOWNLOADS:
 		snprintf(buf, len, "Downloads");
 		break;
+	case ITEM_FILES:
+		snprintf(buf, len, "Files (browse storage)");
+		break;
 	case ITEM_HOME:
 		snprintf(buf, len, "Home page");
 		break;
@@ -1038,15 +1050,25 @@ static bool build(void)
 {
 	int rw = fbtk_get_width(fbtk);
 	int rh = fbtk_get_height(fbtk);
-	int height = MENU_HEADER + ITEM_COUNT * MENU_ROW_HEIGHT + MENU_PAD;
+	int row_height = MENU_ROW_HEIGHT;
+	int height;
 	int x = (rw - MENU_WIDTH) / 2;
-	int y = (rh - height) / 2;
+	int y;
 	fbtk_widget_t *w;
 	int i;
 
 	if (menu != NULL) {
 		return true;
 	}
+
+	/* rows close up to fit the screen: seventeen of them at full
+	 * height were taller than it, and the header and the last row ran
+	 * off its edges */
+	if (MENU_HEADER + ITEM_COUNT * row_height + MENU_PAD > rh) {
+		row_height = (rh - MENU_HEADER - MENU_PAD) / ITEM_COUNT;
+	}
+	height = MENU_HEADER + ITEM_COUNT * row_height + MENU_PAD;
+	y = (rh - height) / 2;
 
 	bool dark = nsoption_bool(prefer_dark_mode);
 	colour bg = dark ? COLOUR_DARK_BG : COLOUR_BG;
@@ -1065,9 +1087,9 @@ static bool build(void)
 
 	for (i = 0; i < ITEM_COUNT; i++) {
 		rows[i] = fbtk_create_text_button(menu, MENU_PAD,
-						  MENU_HEADER + i * MENU_ROW_HEIGHT,
+						  MENU_HEADER + i * row_height,
 						  MENU_WIDTH - 2 * MENU_PAD,
-						  MENU_ROW_HEIGHT - 4,
+						  row_height - 4,
 						  row, row_text,
 						  row_click, (void *)(intptr_t)i);
 	}

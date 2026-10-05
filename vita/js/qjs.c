@@ -23,6 +23,7 @@
  * Licensed under the GNU General Public License version 2.
  */
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -31,6 +32,7 @@
 #include <strings.h>
 
 #include <quickjs.h>
+#include <libcss/libcss.h>
 
 #include "utils/errors.h"
 #include "utils/utils.h"
@@ -46,6 +48,9 @@
 #include "content/hlcache.h"
 #include "content/handlers/javascript/js.h"
 #include "content/handlers/javascript/content.h"
+#include "desktop/browser_private.h"
+#include "desktop/frames.h"
+#include "content/fetchers/curl.h"
 
 #include <dom/dom.h>
 #include <dom/bindings/hubbub/parser.h>
@@ -56,6 +61,11 @@
 #include "vita_platform.h"
 #include "vita_input.h"
 #include "canvas.h"
+#include "qjs_alloc.h"
+#include "subtle.h"
+#include "intl.h"
+#include "wasm.h"
+#include "websocket.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -74,6 +84,9 @@
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_construct.h"
 #include "content/handlers/html/box_inspect.h"
+#include "content/handlers/html/box_manipulate.h"
+#include "content/handlers/html/css.h"
+#include "content/handlers/html/frame_doc.h"
 #include "desktop/browser_private.h"
 #include "desktop/scrollbar.h"
 
@@ -82,6 +95,7 @@
 
 struct jsheap {
 	JSRuntime *rt;
+	struct qjs_pool *pool;  /**< the runtime's small-block allocator */
 	int timeout;          /**< script time budget, seconds */
 	bool pending_destroy;
 	int live_threads;
@@ -119,18 +133,91 @@ struct js_deferred {
  * and expando properties (el.style, el.dataset, handlers) survive. The
  * cache holds a reference; wrappers are released when the thread dies.
  */
-#define WRAPPER_BUCKETS 128
+/*
+ * One chain per 128 nodes was one chain per hundred (VitaSurf). Every
+ * crossing that hands JavaScript a node looks it up here, and a page of
+ * six thousand elements and seven thousand text nodes left about a
+ * hundred entries in each chain: a synthetic document of 13000 nodes
+ * walked 31,569,372 chain steps over 523,562 look-ups, sixty a look-up,
+ * and that was 294 ms on a host that is a dozen times quicker than the
+ * device. 4096 chains is 16 KB a thread and takes the same document to
+ * about three.
+ */
+#define WRAPPER_BUCKETS 4096
 struct js_wrapper {
 	struct dom_node *node;
 	JSValue obj;
 	struct js_wrapper *next;
 };
 
+/*
+ * The binding running now, for the profile (VitaSurf): every binding
+ * notes its own name on entry, one store, and the interrupt check clears
+ * it whenever script runs. Time the profile finds spent outside the
+ * interpreter is put down to the binding named here, or to a QuickJS
+ * built-in or a compile when none is.
+ */
+#define c_where vita_c_where
+#define C_WHERE const char *c_where_mark_ __attribute__((unused)) = \
+	(c_where = __func__)
+
+/* selector strings remembered by address; a power of two */
+#define SEL_RECENT 256
+
+/*
+ * Which of a shadow host's own children go into which of its slots
+ * (VitaSurf). The prelude works it out; box construction reads it
+ * through vitasurf_composed, so a child is drawn where its slot is
+ * rather than after everything the component rendered.
+ */
+struct slot_entry {
+	struct dom_node *node;	/**< a host's own child */
+	struct dom_node *host;	/**< its parent when this was recorded */
+	struct dom_node *slot;	/**< where it is drawn, NULL for nowhere */
+	int next;		/**< the next entry in the same slot, or -1 */
+};
+struct slot_head {
+	struct dom_node *slot;
+	int first;		/**< its first entry */
+};
+struct slot_map {
+	struct slot_entry *e;
+	unsigned n;
+	struct slot_head *h;
+	unsigned nh;
+	int *etab;		/**< node to entry, open addressing, -1 free */
+	int *htab;		/**< slot to head */
+	unsigned mask;		/**< both tables have mask + 1 buckets */
+};
+
 struct jsthread {
+	/** the busy sampling's phase when script was entered (VitaSurf) */
+	const char *phase_was;
+	/** the log has said this Home Assistant page gets a current
+	 * browser's user agent (VitaSurf) */
+	bool told_modern_ua;
 	jsheap *heap;
 	JSContext *ctx;
 	struct browser_window *win;
 	html_content *htmlc;
+	unsigned frames_logged;   /**< frame pages this page made, logged */
+	/*
+	 * Dedicated workers (VitaSurf). A worker is a realm of its own on
+	 * the page's runtime, run by the same scheduler: it shares the
+	 * page's window and content for fetching and base URLs, and has no
+	 * document. The page owns its workers and takes them down with it.
+	 */
+	bool is_worker;
+	bool worker_closing;      /**< its close is scheduled */
+	struct jsthread *owner;   /**< the page's thread, for a worker */
+	struct jsthread *workers; /**< a page's workers */
+	struct jsthread *worker_next;
+	/* The window's load, held until the page's frames have loaded */
+	bool load_deferred;
+	bool load_releasing;      /**< firing the held load: do not hold it */
+	uint64_t load_deferred_ms;
+	struct dom_document *load_doc;
+	bool frame_cap_said;      /**< the frame cap has been logged */
 	uint64_t deadline_ms;     /**< when the running script must stop */
 	/*
 	 * How the running script's overrun has been reported. QuickJS
@@ -141,6 +228,8 @@ struct jsthread {
 	 * thousand identical lines, each one flushed to the memory card.
 	 */
 	unsigned script_depth;    /**< nested entries from C into script */
+	bool draining;            /**< end_script is running promise jobs */
+	struct jsthread *all_next; /**< every live thread, for window events */
 	bool aborting;            /**< the budget is unwinding a script */
 	unsigned scripts_killed;  /**< scripts the budget stopped, this page */
 	unsigned overrun_count;   /**< interrupts past the deadline */
@@ -173,17 +262,44 @@ struct jsthread {
 	 * nothing at all.
 	 */
 	bool watch_mutations;
+	/*
+	 * What each MutationObserver watches, mirrored from the prelude
+	 * (VitaSurf): the node, what kinds of change, whether below it
+	 * too, and the attribute names it filters on. With it the C side
+	 * can tell whether any observer wants a change before calling
+	 * into JavaScript at all; see mo_wanted.
+	 */
+	struct mo_watch *mo;
+	unsigned mo_n, mo_alloc;
+	/* the watches by node: open addressing, each slot the head of a
+	 * chain through mo[].next (see mo_slot_find) */
+	struct mo_slot *mo_slots;
+	unsigned mo_slot_n, mo_slot_used;
 	struct js_timer *timers;       /**< live timers, cancelled on close */
 	struct js_wrapper *wrappers[WRAPPER_BUCKETS];
 	struct js_xhr *xhrs;           /**< requests in flight */
 	int next_xhr_id;
 	bool closed;
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
+	/*
+	 * What the changes since the last layout were (VitaSurf): if only
+	 * attributes, the elements are restyled in place rather than the
+	 * box tree being built again (html_restyle_attrs). tree_dirty is
+	 * set by anything else, and by a journal that has filled.
+	 */
+	bool tree_dirty;
+	struct html_attr_change *attr_changes;
+	unsigned attr_n, attr_alloc;
+	unsigned attr_restyles;   /**< batches applied in place, for the log */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
+	nsurl *nav_pending;       /**< where nav_callback will go, or NULL */
 	bool relayout_off;        /**< document too large to rebuild */
 	unsigned relayout_waits;  /**< retries spent waiting on fetches */
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
 	unsigned relayout_ms;     /**< how long the last rebuild took */
+	uint32_t relayout_due;    /**< now_ms() the pending rebuild runs at, low 32 bits */
+	struct slot_map slots;    /**< the composed tree's slots (VitaSurf) */
+	void *doc_obj;            /**< the document object, compared by address */
 	unsigned js_scripts;      /**< scripts executed for this page */
 	unsigned js_bytes;        /**< their total size */
 	unsigned js_compile_ms;   /**< time spent compiling them */
@@ -193,11 +309,51 @@ struct jsthread {
 	unsigned js_import_fetches; /**< chunks the loader went and fetched */
 	unsigned retry_delay_ms;  /**< how long before the next retry round */
 	struct js_deferred *deferred; /**< module scripts waiting on imports */
+	struct mod_deps *mod_deps[64]; /**< each module's imports, by URL */
+	struct sel_compiled *sel_cache[128]; /**< selectors answered in C */
+	unsigned int sel_cache_n;
+	/*
+	 * The selectors last asked for, by the script's string itself
+	 * (VitaSurf). A lazy loader asks the same few hundred strings
+	 * over and over, and each call copied the string out of the
+	 * engine and hashed it before it could look it up. Each entry
+	 * holds a reference to its string, so its address cannot be
+	 * reused for another while it is here.
+	 */
+	struct sel_recent {
+		const void *key;
+		JSValue str;
+		struct sel_compiled *s;
+	} sel_recent[SEL_RECENT];
+	/*
+	 * The tag names under one element, for a bare tag query to be
+	 * refused at once when no element of that name is there
+	 * (VitaSurf). GitHub's lazy loader asks each element it scans
+	 * for each of the tags it may load, and nearly all are not on
+	 * the page, so each walked the whole subtree to find nothing.
+	 * Built on the second such query of the same element while the
+	 * tree keeps its shape, so a query asked once still stops at
+	 * the first match; the names are ASCII-lowercased hashes, and
+	 * a hash that is there only means the walk goes ahead.
+	 */
+	struct dom_node *tags_root;
+	uint32_t tags_gen;
+	uint32_t tags_asks;
+	uint32_t *tags_set;       /**< open addressing, 0 is empty */
+	uint32_t tags_cap, tags_n;
+	bool tags_built;
+	struct id_entry **id_idx;  /**< getElementById answers, by id */
+	uint32_t id_idx_nb, id_idx_n; /**< buckets (a power of two), entries */
+	uint32_t id_idx_gen;      /**< vita_id_gen the index is exact for */
+	bool id_idx_built;
 	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
 				   *   JS_UNINITIALIZED before it is looked
 				   *   up and JS_UNDEFINED if there is none */
 	int event_depth;          /**< DOM event dispatches in progress */
+	int window_phase;         /**< eventPhase for window listeners run
+				   *   at target, 0 when libdom says */
+	bool stop_now_seen;       /**< stopImmediatePropagation was called */
 	int js_dispatch_depth;    /**< of which were started by dispatchEvent */
 	struct js_dispatch *dispatches; /**< events dispatchEvent is delivering */
 };
@@ -222,13 +378,15 @@ struct js_listener {
 	bool once;
 	bool passive;		/**< preventDefault from it is ignored */
 	bool dead;		/**< removed while its own call was running */
+	bool on_window;		/**< the window's: in no libdom list */
 };
 
 /* A scheduled setTimeout/setInterval callback. */
 struct js_timer {
 	struct js_timer *next;
 	struct jsthread *thread;
-	JSValue func;
+	JSValue func;         /**< a function, or a string of code */
+	JSValue args;         /**< array of extra arguments, or undefined */
 	int interval_ms;      /**< 0 for a one-shot timeout */
 	int handle;
 	bool dead;
@@ -279,13 +437,459 @@ static uint64_t now_ms(void)
 }
 
 /** Interrupt handler: stop a script that has run past its deadline. */
+/**
+ * The live JavaScript stack, as the text Error.stack would hold, or
+ * NULL. A malloc'd copy for the caller to free.
+ */
+static char *capture_stack(JSContext *c)
+{
+	JSValue global = JS_GetGlobalObject(c);
+	JSValue ector = JS_GetPropertyStr(c, global, "Error");
+	JSValue capture = JS_GetPropertyStr(c, ector, "captureStackTrace");
+	JSValue err = JS_NewError(c);
+	JSValue stack;
+	char *out = NULL;
+
+	if (JS_IsFunction(c, capture)) {
+		JSValue r = JS_Call(c, capture, ector, 1, &err);
+
+		if (JS_IsException(r)) {
+			JS_FreeValue(c, JS_GetException(c));
+		}
+		JS_FreeValue(c, r);
+	}
+	stack = JS_GetPropertyStr(c, err, "stack");
+	if (JS_IsString(stack)) {
+		const char *st = JS_ToCString(c, stack);
+
+		if (st != NULL) {
+			out = strdup(st);
+			JS_FreeCString(c, st);
+		}
+	}
+	JS_FreeValue(c, stack);
+	JS_FreeValue(c, err);
+	JS_FreeValue(c, capture);
+	JS_FreeValue(c, ector);
+	JS_FreeValue(c, global);
+	return out;
+}
+
+/*
+ * A sampling profile of the page's JavaScript (VitaSurf). The counters
+ * say how often the page called into us and what that cost, but a
+ * GitHub promise job of 11.6 s had 9 s that none of them covered: plain
+ * script, somewhere. Every PROF_INTERVAL_MS while script runs, the
+ * interrupt check notes the two innermost frames, and the page report
+ * names the places most often found running. Only script is sampled;
+ * time inside our bindings is not interruptible and is counted there.
+ */
+#define PROF_INTERVAL_MS 100
+#define PROF_SLOTS 128
+
+static struct {
+	char where[300];
+	unsigned int hits;
+} prof[PROF_SLOTS];
+static unsigned int prof_n, prof_samples, prof_other;
+static uint64_t prof_last_ms;
+static uint64_t prof_last_call_ms;	/* the interrupt check's last visit */
+static bool prof_busy;
+
+/* One frame of a stack text: "name (file:line:col)", the file's path cut
+ * to its last part. */
+static size_t prof_frame(const char *line, char *out, size_t outsz)
+{
+	const char *end = strchr(line, '\n'), *open, *slash;
+	size_t n, used = 0;
+
+	if (end == NULL) end = line + strlen(line);
+	while (line < end && (*line == ' ' || *line == '\t')) line++;
+	if (end - line >= 3 && memcmp(line, "at ", 3) == 0) line += 3;
+	open = memchr(line, '(', (size_t)(end - line));
+	if (open != NULL) {
+		/* the name, then the location's last path component */
+		n = (size_t)(open - line) + 1;
+		if (n >= outsz) n = outsz - 1;
+		memcpy(out, line, n);
+		used = n;
+		slash = open + 1;
+		{
+			const char *p;
+
+			for (p = open + 1; p < end; p++) {
+				if (*p == '/') slash = p + 1;
+			}
+		}
+		n = (size_t)(end - slash);
+		if (used + n >= outsz) n = outsz - 1 - used;
+		memcpy(out + used, slash, n);
+		used += n;
+	} else {
+		n = (size_t)(end - line);
+		if (n >= outsz) n = outsz - 1;
+		memcpy(out, line, n);
+		used = n;
+	}
+	out[used] = '\0';
+	return used;
+}
+
+/* Whether s[0..n) contains needle (newlib has no memmem). */
+static bool prof_has(const char *s, size_t n, const char *needle)
+{
+	size_t k = strlen(needle), i;
+
+	for (i = 0; i + k <= n; i++) {
+		if (memcmp(s + i, needle, k) == 0) return true;
+	}
+	return false;
+}
+
+/*
+ * weight is how many PROF_INTERVAL_MS slices have passed since the last
+ * sample. The interrupt check comes round every few microseconds while
+ * the interpreter runs, and not at all inside a binding or while code
+ * made by new Function() compiles: a long silence before this visit was
+ * time in C, and the frame on top now is the script that called there.
+ * Those are marked [after time in C] and weighted by the time they took:
+ * the frame named is the script that was running when the check came
+ * round again, just after the call into C.
+ */
+static void prof_add(const char *key, unsigned int weight)
+{
+	unsigned int i;
+
+	for (i = 0; i < prof_n; i++) {
+		if (strcmp(prof[i].where, key) == 0) {
+			prof[i].hits += weight;
+			return;
+		}
+	}
+	if (prof_n < PROF_SLOTS) {
+		snprintf(prof[prof_n].where, sizeof(prof[0].where), "%s", key);
+		prof[prof_n].hits = weight;
+		prof_n++;
+	} else {
+		prof_other += weight;
+	}
+}
+
+static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
+{
+	char *st, key[300], f2[100];
+	const char *l2;
+
+	if (prof_busy) return;
+	prof_busy = true;
+	st = capture_stack(ctx);
+	prof_busy = false;
+	if (st == NULL) return;
+	prof_samples += weight;
+	prof_frame(st, key, 100);
+	l2 = strchr(st, '\n');
+	if (l2 != NULL && l2[1] != '\0') {
+		prof_frame(l2 + 1, f2, sizeof(f2));
+		snprintf(key + strlen(key), sizeof(key) - strlen(key),
+			 " < %s", f2);
+		/* two frames of our own code: which page call led there */
+		if (strstr(key, "<prelude>") != NULL &&
+		    strstr(f2, "<prelude>") != NULL) {
+			const char *l = strchr(l2 + 1, '\n');
+
+			while (l != NULL && l[1] != '\0') {
+				const char *e = strchr(l + 1, '\n');
+				size_t n = e != NULL ? (size_t)(e - l) :
+					strlen(l);
+
+				if (!prof_has(l, n, "<prelude>") &&
+				    !prof_has(l, n, "(native)")) {
+					prof_frame(l + 1, f2, sizeof(f2));
+					snprintf(key + strlen(key),
+						 sizeof(key) - strlen(key),
+						 " from %s", f2);
+					break;
+				}
+				l = e;
+			}
+		}
+	}
+	free(st);
+	if (in_c) {
+		const char *w = c_where;
+
+		snprintf(key + strlen(key), sizeof(key) - strlen(key),
+			 " [after %s]", w != NULL ? w :
+			 "a built-in or a compile");
+	}
+	prof_add(key, weight);
+}
+
+/*
+ * The end of a script or a promise job: a silence since the interrupt
+ * check last came round was time in C with no script after it to be
+ * found in -- one long binding call, or a compile, at the very end.
+ */
+static void prof_tail(const char *what)
+{
+	uint64_t t = now_ms();
+
+	if (t - prof_last_call_ms >= PROF_INTERVAL_MS &&
+	    t - prof_last_ms >= PROF_INTERVAL_MS) {
+		char key[160];
+		uint64_t slices = (t - prof_last_ms) / PROF_INTERVAL_MS;
+
+		snprintf(key, sizeof(key), "%s [ended in %s]", what,
+			 c_where != NULL ? c_where : "a built-in or a compile");
+		prof_samples += slices > 600 ? 600u : (unsigned int)slices;
+		prof_add(key, slices > 600 ? 600u : (unsigned int)slices);
+	}
+	prof_last_ms = prof_last_call_ms = t;
+	c_where = NULL;
+}
+
+/* exported for the page report in vita/input/vita_input.c */
+/* getElementById, for the page report */
+static unsigned int id_calls, id_hits, id_exact, id_builds, id_build_ms;
+/* every live thread, newest first; see vita_js_scrolled */
+static struct jsthread *all_threads;
+/* image sources scripts set, for the scroll log line */
+static unsigned int img_src_sets;
+/* entries into script from C made while promise jobs were running */
+static unsigned int jobs_reentered;
+
+/*
+ * Which queries walk the most of the tree (VitaSurf). A build 507 log of
+ * a Home Assistant dashboard counts 21202 queries answered in C visiting
+ * 40 million elements, without saying which; this keeps the dearest few
+ * by what was asked, and the profile report names them.
+ */
+#define WALK_COST_SLOTS 24
+static struct walk_cost {
+	const char *kind;		/* a static string */
+	char what[48];
+	uint32_t calls, visits, from_top;
+} walk_costs[WALK_COST_SLOTS];
+static uint32_t find_visits;	/* elements find_in_subtree looked at */
+
+static void walk_cost_note(const char *kind, const char *what, size_t len,
+			   uint32_t visits, bool from_top)
+{
+	struct walk_cost *e = NULL, *least = NULL;
+	unsigned i;
+
+	if (len >= sizeof(e->what)) len = sizeof(e->what) - 1;
+	for (i = 0; i < WALK_COST_SLOTS; i++) {
+		struct walk_cost *c = &walk_costs[i];
+
+		if (c->kind == kind && strncmp(c->what, what, len) == 0 &&
+		    c->what[len] == '\0') {
+			e = c;
+			break;
+		}
+		if (least == NULL || c->visits < least->visits) least = c;
+	}
+	if (e == NULL) {
+		/* a new one displaces the cheapest only if it cost more */
+		if (least->kind != NULL && least->visits >= visits) return;
+		e = least;
+		e->kind = kind;
+		memcpy(e->what, what, len);
+		e->what[len] = '\0';
+		e->calls = e->visits = e->from_top = 0;
+	}
+	e->calls++;
+	e->visits += visits;
+	if (from_top) e->from_top++;
+}
+
+static struct dom_document *thread_document(jsthread *thread);
+static void ws_report(void);
+/* the first runtime made, the page's, for the memory report (VitaSurf) */
+static JSRuntime *qjs_memory_rt;
+static unsigned runtime_kb(JSRuntime *rt);
+
+/** Whether a walk began at the document or its root element. */
+static bool walk_from_top(jsthread *thread, struct dom_node *root)
+{
+	struct dom_node *doc = (struct dom_node *) thread_document(thread);
+	struct dom_node *up = NULL;
+	bool top;
+
+	if (root == doc) return true;
+	if (dom_node_get_parent_node(root, &up) != DOM_NO_ERR) return false;
+	top = up != NULL && up == doc;
+	if (up != NULL) dom_node_unref(up);
+	return top;
+}
+
+static int walk_cost_cmp(const void *a, const void *b)
+{
+	const struct walk_cost *x = a, *y = b;
+
+	return x->visits < y->visits ? 1 : x->visits > y->visits ? -1 : 0;
+}
+
+static void walk_cost_report(void)
+{
+	unsigned i;
+
+	qsort(walk_costs, WALK_COST_SLOTS, sizeof(walk_costs[0]),
+	      walk_cost_cmp);
+	for (i = 0; i < 8 && walk_costs[i].kind != NULL &&
+		    walk_costs[i].visits >= 10000; i++) {
+		vita_log("qjs: %s('%s') walked %u elements in %u calls, %u of "
+			 "them from the document or its root",
+			 walk_costs[i].kind, walk_costs[i].what,
+			 walk_costs[i].visits, walk_costs[i].calls,
+			 walk_costs[i].from_top);
+	}
+	memset(walk_costs, 0, sizeof(walk_costs));
+}
+
+void vita_js_report_profile(void);
+void vita_js_report_profile(void)
+{
+	unsigned int shown;
+
+	walk_cost_report();
+	ws_report();
+
+	/* what script's own allocator did since the last report (VitaSurf) */
+	{
+		struct qjs_pool_stats ps;
+
+		qjs_pool_stats(&ps);
+		if (ps.allocs + ps.large > 0) {
+			vita_log("qjs: script allocated %u small blocks from its "
+				 "pools and %u larger ones from malloc, freed %u "
+				 "and grew %u in place; the pools hold %u "
+				 "batches of 128 KB (%u at most) and gave %u back",
+				 ps.allocs, ps.large, ps.frees, ps.reallocs,
+				 ps.batches, ps.batches_peak, ps.batches_freed);
+			if (qjs_memory_rt != NULL)
+				vita_log("memory: script uses %u KB, and its "
+					 "pools hold %u KB",
+					 runtime_kb(qjs_memory_rt),
+					 ps.batches * 128);
+		}
+		qjs_pool_stats_reset();
+	}
+
+	if (id_calls > 0) {
+		vita_log("getElementById: %u calls, %u answered from the index, "
+			 "%u by it being current, %u walks of the document in "
+			 "%u ms", id_calls, id_hits, id_exact, id_builds,
+			 id_build_ms);
+		id_calls = id_hits = id_exact = id_builds = id_build_ms = 0;
+	}
+	if (jobs_reentered > 0) {
+		vita_log("qjs: promise jobs called back into script from C %u "
+			 "times (an event dispatched, a listener run), all "
+			 "under the drain's one budget", jobs_reentered);
+		jobs_reentered = 0;
+	}
+	if (prof_samples == 0) {
+		return;
+	}
+	vita_log("profile: %u slices of %u ms of script; where it was most "
+		 "often ([after X]: binding X, or a built-in or a compile, ran "
+		 "long just before this point):", prof_samples,
+		 (unsigned int)PROF_INTERVAL_MS);
+	for (shown = 0; shown < 12; shown++) {
+		unsigned int i, best = 0;
+		bool any = false;
+
+		for (i = 0; i < prof_n; i++) {
+			if (prof[i].hits > 0 &&
+			    (!any || prof[i].hits > prof[best].hits)) {
+				best = i;
+				any = true;
+			}
+		}
+		if (!any) break;
+		vita_log("profile: %3u%% %s",
+			 prof[best].hits * 100u / prof_samples,
+			 prof[best].where);
+		prof[best].hits = 0;
+	}
+	if (prof_other > 0) {
+		vita_log("profile: %u samples fell outside the %u places kept",
+			 prof_other, (unsigned int)PROF_SLOTS);
+	}
+	prof_n = 0;
+	prof_samples = 0;
+	prof_other = 0;
+}
+
+static int qjs_interrupt_body(jsthread *thread);
+
+/* the binding script called most recently, for the overrun line */
+static const char *last_binding;
+
 static int qjs_interrupt(JSRuntime *rt, void *opaque)
 {
 	jsthread *thread = opaque;
+	static bool inside;
+	int r;
 
 	(void)rt;
 	if (thread == NULL || thread->deadline_ms == 0) {
 		return 0;
+	}
+	/*
+	 * Not re-entered (VitaSurf). Taking a stack, for the profile or
+	 * for the overrun line, runs script, and that script reaches the
+	 * interrupt check too: the abort then fell inside our own stack
+	 * capture, which swallowed it, and what reached the page was a
+	 * plain null its catch could take. tests/budget/mutate.html left
+	 * its loop that way.
+	 */
+	if (inside) {
+		return 0;
+	}
+	inside = true;
+	r = qjs_interrupt_body(thread);
+	inside = false;
+	return r;
+}
+
+static int qjs_interrupt_body(jsthread *thread)
+{
+	/*
+	 * Keep transfers moving while script runs (VitaSurf). Nothing is
+	 * handed to the rest of NetSurf from here: see fetch_pump.
+	 */
+	fetch_pump();
+	/*
+	 * Circle, pressed over the busy overlay, stops the script the same
+	 * way the budget does (VitaSurf): the screen had stayed as it was
+	 * for as long as the page's script cared to run.
+	 */
+	{
+		uint64_t t = now_ms();
+		bool in_c = t - prof_last_call_ms >= PROF_INTERVAL_MS;
+
+		prof_last_call_ms = t;
+		if (t - prof_last_ms >= PROF_INTERVAL_MS && thread->ctx != NULL &&
+		    !thread->aborting) {
+			uint64_t slices = (t - prof_last_ms) / PROF_INTERVAL_MS;
+
+			prof_last_ms = t;
+			prof_sample(thread->ctx, slices > 600 ? 600u :
+				    (unsigned int)slices, in_c);
+		}
+		/* script is running again: no binding is */
+		if (c_where != NULL) {
+			last_binding = c_where;
+		}
+		c_where = NULL;
+	}
+	if (vita_busy_take_cancel()) {
+		vita_log("qjs: Circle stopped the running script: %s",
+			 thread->current_script != NULL ?
+			 thread->current_script : "?");
+		thread->deadline_ms = 1;
 	}
 	if (now_ms() > thread->deadline_ms) {
 		uint64_t now = now_ms();
@@ -298,9 +902,41 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 		 * and that is worth saying out loud, but only as often
 		 * as it takes to see it. */
 		if (thread->overrun_count == 1) {
+			int level;
+
 			vita_log("qjs: script exceeded its time budget: %s",
 				 thread->current_script != NULL ?
 				 thread->current_script : "?");
+			/*
+			 * And where it was when the axe fell (VitaSurf). The
+			 * abort itself throws null, which carries no stack,
+			 * and build 410 could name only the script: both
+			 * levels said <prelude>, which is our own code and
+			 * eleven thousand lines of it.
+			 *
+			 * Throwing an Error from C does not help: when the
+			 * current frame is bytecode the engine leaves the
+			 * backtrace to be added as the exception unwinds,
+			 * and taking it straight back means it never is.
+			 * Error.captureStackTrace builds the trace on the
+			 * spot from the live frames, so call that.
+			 */
+			{
+				char *st = capture_stack(thread->ctx);
+
+				/* no stack means no script frame to take it
+				   from: say which binding it last called */
+				if (st == NULL || st[0] == '\0') {
+					vita_log("qjs:   no stack; the last binding "
+						 "it called was %s",
+						 last_binding != NULL ?
+						 last_binding : "none");
+				}
+				if (st != NULL) {
+					vita_log("qjs:   %s", st);
+					free(st);
+				}
+			}
 			thread->overrun_said_ms = now;
 		} else if (now - thread->overrun_said_ms >= 30000) {
 			vita_log("qjs: script still over budget, aborted %u "
@@ -330,12 +966,16 @@ static bool qjs_budget_abort(JSContext *ctx)
 }
 
 /** QuickJS's own allocation total for the runtime, in KB. */
+/*
+ * What the runtime has allocated (VitaSurf). This walked every object
+ * in the runtime through JS_ComputeMemoryUsage to add the figure up, and
+ * a build 511 log has it doing that 17 times on one visit for 6880 ms,
+ * 640 ms at the worst, for a number in the log. QuickJS keeps the same
+ * figure as it allocates.
+ */
 static unsigned runtime_kb(JSRuntime *rt)
 {
-	JSMemoryUsage u;
-
-	JS_ComputeMemoryUsage(rt, &u);
-	return (unsigned)(u.malloc_size / 1024);
+	return (unsigned)(JS_GetMallocSize(rt) / 1024);
 }
 
 /**
@@ -397,6 +1037,8 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
 static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
+static bool is_budget_interrupt(JSContext *ctx, JSValueConst v);
+
 static void qjs_report_exception_src(JSContext *ctx, const char *name,
 				     const char *src, size_t len)
 {
@@ -415,6 +1057,17 @@ static void qjs_report_exception_src(JSContext *ctx, const char *name,
 		return;
 	}
 	exc = JS_GetException(ctx);
+	if (is_budget_interrupt(ctx, exc)) {
+		static unsigned hidden;
+
+		if ((hidden++ % 100) == 0) {
+			vita_log("qjs: a script stopped by the time budget "
+				 "surfaced again (%u so far), not reported "
+				 "to the page", hidden);
+		}
+		JS_FreeValue(ctx, exc);
+		return;
+	}
 	msg = JS_ToCString(ctx, exc);
 
 	vita_log("qjs: uncaught %s", msg != NULL ? msg : "(error)");
@@ -471,6 +1124,43 @@ static void qjs_report_exception(JSContext *ctx)
 	qjs_report_exception_src(ctx, NULL, NULL, 0);
 }
 
+/*
+ * Whether a value is the error the time budget stops a script with
+ * (VitaSurf). It reaches script after all when an interrupted async
+ * function's promise is rejected with it, and a page that reports its
+ * errors then does its reporting -- Home Assistant parses the stack with
+ * regular expressions -- which overran the budget in turn: 4554 of them
+ * on one dashboard, and the job queue grew until memory ran out. It is
+ * not the page's error, so it is not reported to the page.
+ */
+static bool is_budget_interrupt(JSContext *ctx, JSValueConst v)
+{
+	JSValue name, msg;
+	const char *n = NULL, *m = NULL;
+	bool yes = false;
+
+	if (!JS_IsObject(v)) {
+		return false;
+	}
+	name = JS_GetPropertyStr(ctx, v, "name");
+	msg = JS_GetPropertyStr(ctx, v, "message");
+	if (JS_IsString(name) && JS_IsString(msg)) {
+		n = JS_ToCString(ctx, name);
+		m = JS_ToCString(ctx, msg);
+		yes = n != NULL && m != NULL &&
+		      strcmp(n, "InternalError") == 0 &&
+		      strcmp(m, "interrupted") == 0;
+	}
+	if (n != NULL) JS_FreeCString(ctx, n);
+	if (m != NULL) JS_FreeCString(ctx, m);
+	JS_FreeValue(ctx, name);
+	JS_FreeValue(ctx, msg);
+	if (JS_HasException(ctx)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+	}
+	return yes;
+}
+
 /** True if err stringifies to something containing needle. */
 static bool qjs_error_mentions(JSContext *ctx, JSValueConst err,
 			       const char *needle)
@@ -508,6 +1198,24 @@ static void qjs_absorb_or_rethrow(JSContext *ctx)
 		return;		/* leave it pending, and uncatchable */
 	}
 	JS_FreeValue(ctx, JS_GetException(ctx));
+}
+
+/*
+ * What a binding that called back into script returns (VitaSurf). When
+ * the budget abort landed inside that call -- the page's mutation hook
+ * behind setAttribute, say -- qjs_absorb_or_rethrow leaves it pending,
+ * but a binding that then returns a value lets the script carry on with
+ * the exception still set, and it later surfaced as a plain null the
+ * page's own catch took: the runaway in tests/budget/mutate.html left
+ * its loop and kept going.
+ */
+static JSValue ret_or_abort(JSContext *ctx, JSValue r)
+{
+	if (qjs_budget_abort(ctx) && JS_HasException(ctx)) {
+		JS_FreeValue(ctx, r);
+		return JS_EXCEPTION;
+	}
+	return r;
 }
 
 /** A dom_string from a NUL-terminated C string, or NULL. */
@@ -550,6 +1258,12 @@ static dom_string *to_dom_string_len(const char *s, size_t len)
  * reference to the same node.
  */
 
+static const char *shown_url(const char *url);
+static void deferred_load_check(void *p);
+static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
+			     bool whole);
+static bool realm_room(const char *what);
+
 static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
@@ -560,13 +1274,44 @@ static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 	if (node == NULL) {
 		return JS_NULL;
 	}
-	h = (unsigned)(((uintptr_t)node) >> 4) % WRAPPER_BUCKETS;
-	if (thread != NULL) {
-		for (w = thread->wrappers[h]; w != NULL; w = w->next) {
-			if (w->node == node) {
-				return JS_DupValue(ctx, w->obj);
+	/*
+	 * The document node is the document object (VitaSurf). It had a
+	 * wrapper of its own, so documentElement.parentNode was not
+	 * document, and a loop walking up until it reached document never
+	 * did; ownerDocument already answered with the real one.
+	 */
+	if (thread != NULL &&
+	    node == (struct dom_node *) thread_document(thread)) {
+		JSValue global = JS_GetGlobalObject(ctx);
+		JSValue d = JS_GetPropertyStr(ctx, global, "document");
+
+		JS_FreeValue(ctx, global);
+		if (JS_IsObject(d)) {
+			return d;
+		}
+		JS_FreeValue(ctx, d);
+	}
+	/*
+	 * How long the chain is, and what the lookup costs (VitaSurf).
+	 * Every crossing that hands JavaScript a node comes through here.
+	 */
+	vitasurf_js_node_wraps++;
+	{
+		uint64_t w0 = now_ms();
+
+		h = (unsigned)(((uintptr_t)node) >> 4) % WRAPPER_BUCKETS;
+		if (thread != NULL) {
+			for (w = thread->wrappers[h]; w != NULL; w = w->next) {
+				vitasurf_js_wrap_steps++;
+				if (w->node == node) {
+					vitasurf_js_wrap_hits++;
+					vitasurf_ms_js_wrap +=
+						(unsigned)(now_ms() - w0);
+					return JS_DupValue(ctx, w->obj);
+				}
 			}
 		}
+		vitasurf_ms_js_wrap += (unsigned)(now_ms() - w0);
 	}
 	obj = JS_NewObjectClass(ctx, node_class_id);
 	if (JS_IsException(obj)) {
@@ -619,6 +1364,26 @@ static JSClassDef node_class = {
 
 static struct dom_node *this_node(JSContext *ctx, JSValueConst this_val)
 {
+	struct dom_node *node;
+	jsthread *thread;
+
+	vitasurf_js_binding_calls++;
+	node = JS_GetOpaque(this_val, node_class_id);
+	if (node != NULL) {
+		return node;
+	}
+	/*
+	 * The page's document object is a plain object with methods of
+	 * its own, not a wrapped node, so the node bindings refused it
+	 * and document had no childNodes, firstChild or appendChild
+	 * (VitaSurf). It stands for the document node here.
+	 */
+	thread = JS_GetContextOpaque(ctx);
+	if (thread != NULL && !thread->closed && JS_IsObject(this_val) &&
+	    thread->doc_obj != NULL &&
+	    JS_VALUE_GET_PTR(this_val) == thread->doc_obj) {
+		return (struct dom_node *)thread_document(thread);
+	}
 	return JS_GetOpaque2(ctx, this_val, node_class_id);
 }
 
@@ -645,6 +1410,7 @@ static struct dom_node *this_element(JSContext *ctx, JSValueConst this_val)
 {
 	struct dom_node *node = JS_GetOpaque2(ctx, this_val, node_class_id);
 
+	vitasurf_js_binding_calls++;
 	return node_is_element(node) ? node : NULL;
 }
 
@@ -658,6 +1424,16 @@ struct find_key {
 	char *id;         /**< id attribute to match, or NULL */
 	char **classes;   /**< class names that must all be present */
 	int nclasses;
+	/*
+	 * Attribute names that must be present (VitaSurf). A selector of
+	 * nothing but [data-action] used to hand JavaScript every element
+	 * under the root to test one by one, and GitHub's component
+	 * framework asks exactly that of every element it binds. Only a
+	 * necessary condition: the prelude still checks the value.
+	 */
+	dom_string **attrs;
+	dom_string **attrs_lc;	/* the same, lower cased, or NULL */
+	int nattrs;
 };
 
 static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
@@ -681,15 +1457,202 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
  * tree or an attribute bumps it, and so does the start of each script,
  * since the parser adds nodes between scripts.
  */
-static uint32_t vita_dom_gen;
+static uint32_t vita_gens[2];
+#define vita_dom_gen (vita_gens[0])
+/*
+ * The same for the tree's shape alone (VitaSurf): nodes in, out or
+ * moved, and the parser between scripts, but no attribute writes. A
+ * collection that only a node moving can change, el.children or
+ * getElementsByTagName, keeps its answer across attribute writes: a
+ * loop that read el.children[i] and set an attribute each step had
+ * the whole list built again every step.
+ */
+#define vita_tree_gen (vita_gens[1])
+/*
+ * Bumped by whatever can change which element an id names: a node going
+ * in or out, an id attribute set or removed, the parser adding nodes
+ * between scripts. Other attribute writes leave it, so a page setting
+ * classes between lookups keeps its id index.
+ */
+static uint32_t vita_id_gen;
+
+/*
+ * When each element's attributes last changed (VitaSurf). The prelude
+ * keeps an element's attributes map and used to throw it away whenever
+ * anything anywhere in the document changed: Alpine writes attributes
+ * as it walks the page, so every map went stale at once and every read
+ * of el.attributes built it again from here, 101 of the 152 frames of
+ * Yamtrack's seven-second start. A map now stays until its own
+ * element's attributes change.
+ *
+ * A small table by node; an entry pushed out raises the floor, so an
+ * element without an entry reads as changed at the floor, which is
+ * never earlier than its last real change.
+ */
+#define ATTR_STAMP_SLOTS 4096
+#define ATTR_STAMP_PROBE 8
+static struct attr_stamp {
+	struct dom_node *node;
+	uint32_t stamp;
+} attr_stamps[ATTR_STAMP_SLOTS];
+static uint32_t attr_stamp_clock = 1;
+static uint32_t attr_stamp_floor = 1;
+
+static unsigned int attr_stamp_slot(const struct dom_node *node)
+{
+	return (unsigned int)(((uintptr_t)node >> 3) * 2654435761u) >> 20;
+}
+
+/* An element's attributes have just changed. */
+static void attr_stamp_touch(struct dom_node *node)
+{
+	unsigned int h, i, free_i = ATTR_STAMP_SLOTS;
+
+	if (node == NULL) {
+		return;
+	}
+	attr_stamp_clock++;
+	h = attr_stamp_slot(node);
+	for (i = 0; i < ATTR_STAMP_PROBE; i++) {
+		struct attr_stamp *e = &attr_stamps[(h + i) % ATTR_STAMP_SLOTS];
+
+		if (e->node == node) {
+			e->stamp = attr_stamp_clock;
+			return;
+		}
+		if (e->node == NULL && free_i == ATTR_STAMP_SLOTS) {
+			free_i = (h + i) % ATTR_STAMP_SLOTS;
+		}
+	}
+	if (free_i == ATTR_STAMP_SLOTS) {
+		/* full here: the one pushed out moves the floor up */
+		free_i = h % ATTR_STAMP_SLOTS;
+		if (attr_stamps[free_i].stamp > attr_stamp_floor) {
+			attr_stamp_floor = attr_stamps[free_i].stamp;
+		}
+	}
+	attr_stamps[free_i].node = node;
+	attr_stamps[free_i].stamp = attr_stamp_clock;
+}
+
+/* When an element's attributes last changed, as far as can be told. */
+static uint32_t attr_stamp_of(const struct dom_node *node)
+{
+	unsigned int h = attr_stamp_slot(node), i;
+
+	for (i = 0; i < ATTR_STAMP_PROBE; i++) {
+		const struct attr_stamp *e =
+			&attr_stamps[(h + i) % ATTR_STAMP_SLOTS];
+
+		if (e->node == node) {
+			return e->stamp > attr_stamp_floor ?
+				e->stamp : attr_stamp_floor;
+		}
+	}
+	return attr_stamp_floor;
+}
+
+static JSValue node_attr_stamp(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	struct dom_node *node = JS_GetOpaque2(ctx, this_val, node_class_id);
+
+	(void)argc;
+	(void)argv;
+	if (node == NULL || !node_is_element(node)) {
+		return JS_NewInt32(ctx, -1);
+	}
+	return JS_NewUint32(ctx, attr_stamp_of(node) & 0x3fffffffu);
+}
 
 static void mark_dirty(JSContext *ctx)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	vita_dom_gen++;
+	vita_tree_gen++;
+	vita_id_gen++;
 	if (thread != NULL) {
 		thread->dom_dirty = true;
+		thread->tree_dirty = true;
+	}
+}
+
+/* the most attribute changes kept for one layout; past it, a rebuild */
+#define ATTR_JOURNAL_MAX 512
+
+static void attr_journal_clear(jsthread *thread)
+{
+	unsigned i;
+
+	for (i = 0; i < thread->attr_n; i++) {
+		struct html_attr_change *c = &thread->attr_changes[i];
+
+		dom_node_unref(c->node);
+		dom_string_unref(c->name);
+		if (c->old != NULL) {
+			dom_string_unref(c->old);
+		}
+	}
+	thread->attr_n = 0;
+}
+
+/* Note an attribute change for html_restyle_attrs (VitaSurf). The first
+   change to an element's attribute since the last layout keeps the value
+   it had then, which is what a changed class list is worked out from. */
+static void attr_journal_add(jsthread *thread, struct dom_node *node,
+			     dom_string *name, dom_string *old)
+{
+	struct html_attr_change *c;
+	unsigned i;
+
+	if (thread->tree_dirty || thread->closed || node == NULL ||
+	    name == NULL) {
+		return;
+	}
+	for (i = thread->attr_n; i-- > 0 && i + 64 >= thread->attr_n; ) {
+		c = &thread->attr_changes[i];
+		if (c->node == node && dom_string_isequal(c->name, name)) {
+			return;
+		}
+	}
+	if (thread->attr_n == ATTR_JOURNAL_MAX) {
+		thread->tree_dirty = true;
+		return;
+	}
+	if (thread->attr_n == thread->attr_alloc) {
+		unsigned want = thread->attr_alloc ? thread->attr_alloc * 2 : 32;
+		struct html_attr_change *grown = realloc(thread->attr_changes,
+				want * sizeof(*grown));
+
+		if (grown == NULL) {
+			thread->tree_dirty = true;
+			return;
+		}
+		thread->attr_changes = grown;
+		thread->attr_alloc = want;
+	}
+	c = &thread->attr_changes[thread->attr_n++];
+	c->node = dom_node_ref(node);
+	c->name = dom_string_ref(name);
+	c->old = old != NULL ? dom_string_ref(old) : NULL;
+}
+
+/* mark_dirty for an attribute write, which moves an id only when it is
+   the id attribute that changed. old is the value before, or NULL. */
+static void mark_attr_dirty(JSContext *ctx, struct dom_node *node,
+			    dom_string *key, dom_string *old)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *name = key != NULL ? dom_string_data(key) : NULL;
+
+	vita_dom_gen++;
+	if (name == NULL || strcasecmp(name, "id") == 0) {
+		vita_id_gen++;
+	}
+	if (thread != NULL) {
+		thread->dom_dirty = true;
+		attr_journal_add(thread, node, key, old);
 	}
 }
 
@@ -699,6 +1662,7 @@ static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_dom_gen(JSContext *ctx, JSValueConst this_val,
 				int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)this_val; (void)argc; (void)argv;
 	return JS_NewUint32(ctx, vita_dom_gen);
 }
@@ -720,6 +1684,7 @@ static JSValue str_result(JSContext *ctx, dom_string *s)
 
 static JSValue node_get_node_name(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -730,6 +1695,7 @@ static JSValue node_get_node_name(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_tag_name(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -743,6 +1709,7 @@ static JSValue node_get_tag_name(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_node_type(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_node_type type = 0;
 
@@ -753,12 +1720,18 @@ static JSValue node_get_node_type(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_text_content(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
+	vitasurf_js_text_reads++;
+	{ uint64_t y0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
 	if (node == NULL) return JS_EXCEPTION;
 	dom_node_get_text_content(node, &s);
+	vitasurf_ms_js_text_reads += (unsigned)(now_ms() - y0);
 	return str_result(ctx, s);
+	}
+
 }
 
 /*
@@ -766,12 +1739,489 @@ static JSValue node_get_text_content(JSContext *ctx, JSValueConst this_val)
  * "childList", "attributes" or "characterData"; the two extra values
  * mean different things per kind and the prelude sorts them out.
  */
+
+/*
+ * The MutationObserver watch list, kept in C (VitaSurf).
+ *
+ * Every mutation used to call __vitaMutation, which walked from the
+ * target to the root through parentNode -- a crossing into C and a
+ * wrapper for each of some thirty ancestors on GitHub -- only to find,
+ * mostly, that no observer wanted it: GitHub's observers filter on a
+ * few attribute names, and hydration sets class and aria-* thousands of
+ * times. 5000 attribute sets on a node thirty deep cost 3.7 s in the
+ * native harness, 87% of it in that call. The prelude now registers
+ * each watch here as well, and a change nobody wants never reaches
+ * JavaScript. One that does is handed the watched nodes found above it
+ * and their depths, instead of the whole chain.
+ */
+#define MO_SUBTREE	(1u << 0)
+#define MO_ATTRIBUTES	(1u << 1)
+#define MO_CHILDLIST	(1u << 2)
+#define MO_CHARDATA	(1u << 3)
+
+struct mo_watch {
+	uint32_t id;
+	struct dom_node *node;		/* a reference */
+	uint32_t flags;
+	char **filter;			/* lower case names, or NULL */
+	uint32_t n_filter;
+	uint32_t next;			/* next watch on the same node */
+};
+
+/*
+ * The watches indexed by node (VitaSurf). mo_wanted looked through every
+ * watch at every ancestor of a change, and a Home Assistant dashboard
+ * has card-mod put an observer on each card: build 507 spent 52 s in
+ * 24747 setAttribute calls, 2.1 ms each, most of it here. With 1200
+ * observers the native harness took 35 times as long per change as with
+ * two. Now each ancestor is one probe of a table keyed by node, and only
+ * the watches on that node are looked at.
+ */
+#define MO_NONE		UINT32_MAX
+#define MO_TOMB		((struct dom_node *) 1)
+
+struct mo_slot {
+	struct dom_node *node;		/* NULL empty, MO_TOMB removed */
+	uint32_t head;			/* first watch on it */
+};
+
+static unsigned mo_hash(const struct dom_node *node, unsigned mask)
+{
+	return ((unsigned) ((uintptr_t) node >> 3) * 2654435761u) & mask;
+}
+
+/** The slot holding node's watches, or NULL. */
+static struct mo_slot *mo_slot_find(jsthread *thread,
+				    const struct dom_node *node)
+{
+	unsigned mask, i;
+
+	if (thread->mo_slot_n == 0) return NULL;
+	mask = thread->mo_slot_n - 1;
+	for (i = mo_hash(node, mask); thread->mo_slots[i].node != NULL;
+	     i = (i + 1) & mask) {
+		if (thread->mo_slots[i].node == node) {
+			return &thread->mo_slots[i];
+		}
+	}
+	return NULL;
+}
+
+/** Rebuild the table from mo[], at a size fit for mo_n watches. */
+static bool mo_slots_rebuild(jsthread *thread)
+{
+	unsigned want = 16, i;
+	struct mo_slot *slots;
+
+	while (want < thread->mo_n * 2 + 2) want *= 2;
+	slots = calloc(want, sizeof(*slots));
+	if (slots == NULL) return false;
+	free(thread->mo_slots);
+	thread->mo_slots = slots;
+	thread->mo_slot_n = want;
+	thread->mo_slot_used = 0;
+	for (i = thread->mo_n; i-- > 0; ) {
+		struct mo_watch *w = &thread->mo[i];
+		unsigned mask = want - 1, j = mo_hash(w->node, mask);
+
+		while (slots[j].node != NULL && slots[j].node != w->node) {
+			j = (j + 1) & mask;
+		}
+		if (slots[j].node == NULL) {
+			slots[j].node = w->node;
+			slots[j].head = MO_NONE;
+			thread->mo_slot_used++;
+		}
+		w->next = slots[j].head;
+		slots[j].head = i;
+	}
+	return true;
+}
+
+/** File watch mo[i] under its node. */
+static bool mo_slot_add(jsthread *thread, uint32_t i)
+{
+	struct mo_watch *w = &thread->mo[i];
+	struct mo_slot *s;
+	unsigned mask, j;
+
+	if ((thread->mo_slot_used + 1) * 4 >= thread->mo_slot_n * 3) {
+		/* mo[i] is counted in mo_n already, so this files it */
+		return mo_slots_rebuild(thread);
+	}
+	s = mo_slot_find(thread, w->node);
+	if (s == NULL) {
+		mask = thread->mo_slot_n - 1;
+		for (j = mo_hash(w->node, mask);
+		     thread->mo_slots[j].node != NULL &&
+		     thread->mo_slots[j].node != MO_TOMB;
+		     j = (j + 1) & mask) {
+		}
+		if (thread->mo_slots[j].node == NULL) {
+			thread->mo_slot_used++;
+		}
+		s = &thread->mo_slots[j];
+		s->node = w->node;
+		s->head = MO_NONE;
+	}
+	w->next = s->head;
+	s->head = i;
+	return true;
+}
+
+/** Point whatever links to watch from at watch to instead. */
+static void mo_slot_relink(jsthread *thread, uint32_t from, uint32_t to,
+			   bool drop)
+{
+	struct mo_slot *s = mo_slot_find(thread, thread->mo[from].node);
+	uint32_t *link;
+
+	if (s == NULL) return;
+	for (link = &s->head; *link != MO_NONE; link = &thread->mo[*link].next) {
+		if (*link == from) {
+			*link = drop ? thread->mo[from].next : to;
+			break;
+		}
+	}
+	if (s->head == MO_NONE) {
+		/* the node has no watches left */
+		s->node = MO_TOMB;
+	}
+}
+
+static void mo_watch_free(struct mo_watch *w)
+{
+	uint32_t i;
+
+	if (w->node != NULL) {
+		dom_node_unref(w->node);
+	}
+	for (i = 0; i < w->n_filter; i++) {
+		free(w->filter[i]);
+	}
+	free(w->filter);
+}
+
+static uint32_t mo_kind_flag(const char *kind)
+{
+	if (strcmp(kind, "attributes") == 0) return MO_ATTRIBUTES;
+	if (strcmp(kind, "childList") == 0) return MO_CHILDLIST;
+	if (strcmp(kind, "characterData") == 0) return MO_CHARDATA;
+	return 0;
+}
+
+/** Whether watch w wants this kind of change at this depth. */
+static bool mo_watch_wants(const struct mo_watch *w, uint32_t kind,
+			   unsigned depth, const char *attr)
+{
+	uint32_t i;
+
+	if (depth > 0 && (w->flags & MO_SUBTREE) == 0) return false;
+	if ((w->flags & kind) == 0) return false;
+	if (kind == MO_ATTRIBUTES && w->filter != NULL) {
+		if (attr == NULL) return false;
+		for (i = 0; i < w->n_filter; i++) {
+			if (strcasecmp(w->filter[i], attr) == 0) return true;
+		}
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Whether any observer wants a change of this kind to target.
+ *
+ * \param matches  if not NULL, receives the ids of the watches that
+ *                 want it, the nearest to target first, for the
+ *                 prelude's __vitaMutation
+ */
+static bool mo_wanted(JSContext *ctx, jsthread *thread, uint32_t kind,
+		      struct dom_node *target, const char *attr,
+		      JSValue *matches)
+{
+	struct dom_node *n = target;
+	unsigned depth = 0;
+	bool any = false;
+	uint32_t out = 0;
+
+	if (thread == NULL || thread->mo_n == 0 || target == NULL) {
+		return false;
+	}
+	if (matches != NULL) {
+		*matches = JS_UNDEFINED;
+	}
+	dom_node_ref(n);
+	while (n != NULL) {
+		struct dom_node *up = NULL;
+		const struct mo_slot *s;
+		uint32_t i;
+
+		s = mo_slot_find(thread, n);
+		for (i = s != NULL ? s->head : MO_NONE; i != MO_NONE;
+		     i = thread->mo[i].next) {
+			const struct mo_watch *w = &thread->mo[i];
+
+			if (!mo_watch_wants(w, kind, depth, attr)) continue;
+			any = true;
+			if (matches == NULL) break;
+			if (JS_IsUndefined(*matches)) {
+				*matches = JS_NewArray(ctx);
+			}
+			JS_SetPropertyUint32(ctx, *matches, out++,
+					     JS_NewUint32(ctx, w->id));
+		}
+		if (any && matches == NULL) {
+			dom_node_unref(n);
+			return true;
+		}
+		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(n);
+		n = up;
+		depth++;
+	}
+	return any;
+}
+
+/** A snapshot of target's children, only if an observer could want it. */
+static JSValue children_snapshot(JSContext *ctx, struct dom_node *node);
+static JSValue target_snapshot(JSContext *ctx, struct dom_node *node)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	if (!mo_wanted(ctx, thread, MO_CHILDLIST, node, NULL, NULL)) {
+		return JS_UNDEFINED;
+	}
+	return children_snapshot(ctx, node);
+}
+
+
+/*
+ * __vitaConnected(node): whether a node is in this page's document
+ * (VitaSurf). The prelude's inDocument climbed parentNode in JavaScript,
+ * a crossing into C and a wrapper per ancestor, on every querySelector
+ * call; GitHub's component framework makes 160,000 of those binding what
+ * it finds, and a build 419 log has one timer spend 20 s there.
+ */
+static JSValue win_vita_connected(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *n, *doc;
+
+	(void)this_val;
+	if (thread == NULL || argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_FALSE;
+	}
+	doc = (struct dom_node *) thread_document(thread);
+	n = JS_GetOpaque(argv[0], node_class_id);
+	if (n == NULL) {
+		/* the document object is not a node wrapper */
+		JSValue global = JS_GetGlobalObject(ctx);
+		JSValue d = JS_GetPropertyStr(ctx, global, "document");
+		bool same = JS_IsObject(d) &&
+			JS_VALUE_GET_PTR(d) == JS_VALUE_GET_PTR(argv[0]);
+
+		JS_FreeValue(ctx, d);
+		JS_FreeValue(ctx, global);
+		return JS_NewBool(ctx, same && doc != NULL);
+	}
+	if (doc == NULL) {
+		return JS_FALSE;
+	}
+	dom_node_ref(n);
+	while (n != NULL) {
+		struct dom_node *up = NULL;
+
+		if (n == doc) {
+			dom_node_unref(n);
+			return JS_TRUE;
+		}
+		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(n);
+		n = up;
+	}
+	return JS_FALSE;
+}
+
+/*
+ * __vitaIsAncestor(a, n): whether a is n or one of its ancestors, true or
+ * false, or undefined when either is not a node (VitaSurf). Node.contains
+ * and the insertion checks climbed parentNode in JavaScript, a crossing
+ * into C and a wrapper per ancestor; card-mod inserts its styles into
+ * every card on every update, and that climb was a third of Home
+ * Assistant's script time.
+ */
+static struct dom_node *anc_node(JSContext *ctx, jsthread *thread,
+				 JSValueConst v)
+{
+	struct dom_node *n;
+	JSValue global, d;
+	bool same;
+
+	if (!JS_IsObject(v)) {
+		return NULL;
+	}
+	n = JS_GetOpaque(v, node_class_id);
+	if (n != NULL) {
+		return n;
+	}
+	/* the document object stands for the document node */
+	global = JS_GetGlobalObject(ctx);
+	d = JS_GetPropertyStr(ctx, global, "document");
+	same = JS_IsObject(d) && JS_VALUE_GET_PTR(d) == JS_VALUE_GET_PTR(v);
+	JS_FreeValue(ctx, d);
+	JS_FreeValue(ctx, global);
+	return same ? (struct dom_node *) thread_document(thread) : NULL;
+}
+
+static JSValue win_vita_is_ancestor(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *a, *n;
+	unsigned depth = 0;
+
+	(void)this_val;
+	if (thread == NULL || argc < 2) {
+		return JS_UNDEFINED;
+	}
+	a = anc_node(ctx, thread, argv[0]);
+	n = anc_node(ctx, thread, argv[1]);
+	if (a == NULL || n == NULL) {
+		return JS_UNDEFINED;
+	}
+	dom_node_ref(n);
+	while (n != NULL && depth++ < 100000) {
+		struct dom_node *up = NULL;
+
+		if (n == a) {
+			dom_node_unref(n);
+			return JS_TRUE;
+		}
+		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(n);
+		n = up;
+	}
+	if (n != NULL) {
+		dom_node_unref(n);
+	}
+	return JS_FALSE;
+}
+
+/* __vitaMOWatch(id, node, flags, filter): register one watch entry */
+static JSValue win_vita_mo_watch(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct mo_watch *w;
+	uint32_t id = 0, flags = 0, len = 0, i;
+
+	(void)this_val;
+	if (thread == NULL || argc < 3) return JS_UNDEFINED;
+	node = JS_GetOpaque(argv[1], node_class_id);
+	if (node == NULL) {
+		/* the document object is not a node wrapper */
+		JSValue global = JS_GetGlobalObject(ctx);
+		JSValue d = JS_GetPropertyStr(ctx, global, "document");
+
+		if (JS_IsObject(d) &&
+		    JS_VALUE_GET_PTR(d) == JS_VALUE_GET_PTR(argv[1])) {
+			node = (struct dom_node *) thread_document(thread);
+		}
+		JS_FreeValue(ctx, d);
+		JS_FreeValue(ctx, global);
+		if (node == NULL) {
+			return JS_UNDEFINED;
+		}
+	}
+	JS_ToUint32(ctx, &id, argv[0]);
+	JS_ToUint32(ctx, &flags, argv[2]);
+	if (thread->mo_n == thread->mo_alloc) {
+		unsigned want = thread->mo_alloc ? thread->mo_alloc * 2 : 8;
+		struct mo_watch *grown = realloc(thread->mo,
+						 want * sizeof(*grown));
+		if (grown == NULL) return JS_UNDEFINED;
+		thread->mo = grown;
+		thread->mo_alloc = want;
+	}
+	w = &thread->mo[thread->mo_n];
+	memset(w, 0, sizeof(*w));
+	w->id = id;
+	w->flags = flags;
+	w->node = node;
+	dom_node_ref(node);
+	if (argc > 3 && JS_IsArray(argv[3])) {
+		JSValue l = JS_GetPropertyStr(ctx, argv[3], "length");
+
+		JS_ToUint32(ctx, &len, l);
+		JS_FreeValue(ctx, l);
+		w->filter = calloc(len > 0 ? len : 1, sizeof(char *));
+		if (w->filter == NULL) {
+			/* no filter list: be told of every attribute */
+			len = 0;
+		}
+		for (i = 0; i < len; i++) {
+			JSValue v = JS_GetPropertyUint32(ctx, argv[3], i);
+			const char *c = JS_ToCString(ctx, v);
+
+			w->filter[w->n_filter++] = strdup(c != NULL ? c : "");
+			if (c != NULL) JS_FreeCString(ctx, c);
+			JS_FreeValue(ctx, v);
+		}
+	}
+	thread->mo_n++;
+	if (!mo_slot_add(thread, thread->mo_n - 1)) {
+		/* not filed, so never found: drop it again */
+		mo_watch_free(&thread->mo[--thread->mo_n]);
+	}
+	return JS_UNDEFINED;
+}
+
+/* __vitaMOUnwatch(id): drop one watch entry */
+static JSValue win_vita_mo_unwatch(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	uint32_t id = 0;
+	unsigned i;
+
+	(void)this_val;
+	if (thread == NULL || argc < 1) return JS_UNDEFINED;
+	JS_ToUint32(ctx, &id, argv[0]);
+	for (i = 0; i < thread->mo_n; i++) {
+		unsigned last = thread->mo_n - 1;
+
+		if (thread->mo[i].id != id) continue;
+		mo_slot_relink(thread, i, MO_NONE, true);
+		mo_watch_free(&thread->mo[i]);
+		if (i != last) {
+			/* the last watch moves into the hole */
+			mo_slot_relink(thread, last, i, false);
+			thread->mo[i] = thread->mo[last];
+		}
+		thread->mo_n--;
+		break;
+	}
+	return JS_UNDEFINED;
+}
+
 static void notify_mutation_ns(JSContext *ctx, const char *kind,
 			       struct dom_node *target,
 			       JSValue a, JSValue b, JSValue extra)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
-	JSValue global, fn;
+	JSValue global, fn, matches = JS_UNDEFINED;
 
 	if (thread == NULL || thread->watch_mutations == false ||
 	    thread->closed) {
@@ -780,24 +2230,47 @@ static void notify_mutation_ns(JSContext *ctx, const char *kind,
 		JS_FreeValue(ctx, extra);
 		return;
 	}
+	/* nobody wants it: nothing to tell JavaScript (VitaSurf) */
+	{
+		uint32_t k = mo_kind_flag(kind);
+		const char *attr = NULL;
+		bool wanted;
+
+		if (k == MO_ATTRIBUTES && JS_IsString(a)) {
+			attr = JS_ToCString(ctx, a);
+		}
+		wanted = mo_wanted(ctx, thread, k, target, attr, &matches);
+		if (attr != NULL) JS_FreeCString(ctx, attr);
+		if (!wanted) {
+			vitasurf_js_mutations_skipped++;
+			JS_FreeValue(ctx, a);
+			JS_FreeValue(ctx, b);
+			JS_FreeValue(ctx, extra);
+			return;
+		}
+	}
+	vitasurf_js_mutations_told++;
 	global = JS_GetGlobalObject(ctx);
 	fn = JS_GetPropertyStr(ctx, global, "__vitaMutation");
 	if (JS_IsFunction(ctx, fn)) {
-		JSValue args[5], r;
+		JSValue args[6], r;
 
 		args[0] = JS_NewString(ctx, kind);
 		args[1] = wrap_node(ctx, target);
 		args[2] = a;
 		args[3] = b;
 		args[4] = extra;
-		r = JS_Call(ctx, fn, global, 5, args);
+		args[5] = matches;
+		r = JS_Call(ctx, fn, global, 6, args);
 		if (JS_IsException(r)) {
 			qjs_absorb_or_rethrow(ctx);
 		}
 		JS_FreeValue(ctx, r);
 		JS_FreeValue(ctx, args[0]);
 		JS_FreeValue(ctx, args[1]);
+		JS_FreeValue(ctx, matches);
 	} else {
+		JS_FreeValue(ctx, matches);
 		JS_FreeValue(ctx, a);
 		JS_FreeValue(ctx, b);
 		JS_FreeValue(ctx, extra);
@@ -830,11 +2303,11 @@ static void notify_left_parent(JSContext *ctx, struct dom_node *node,
 	if (dom_node_get_parent_node(node, &old) != DOM_NO_ERR || old == NULL) {
 		return;
 	}
-	if (old != newparent) {
-		gone = JS_NewArray(ctx);
-		JS_SetPropertyUint32(ctx, gone, 0, wrap_node(ctx, node));
-		notify_mutation(ctx, "childList", old, JS_NULL, gone);
-	}
+	/* a move within the same parent is a removal too, as in a
+	 * browser, told while the node still sits where it was */
+	gone = JS_NewArray(ctx);
+	JS_SetPropertyUint32(ctx, gone, 0, wrap_node(ctx, node));
+	notify_mutation(ctx, "childList", old, JS_NULL, gone);
 	dom_node_unref(old);
 }
 
@@ -868,6 +2341,7 @@ static JSValue children_snapshot(JSContext *ctx, struct dom_node *node)
 static JSValue win_vita_watch_mutations(JSContext *ctx, JSValueConst this_val,
 					int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	(void)this_val;
@@ -880,6 +2354,7 @@ static JSValue win_vita_watch_mutations(JSContext *ctx, JSValueConst this_val,
 static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 				     JSValueConst val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	/* textContent is a nullable string, so null and undefined both mean
 	 * "no text", which empties the node rather than writing "null". */
@@ -895,7 +2370,7 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		dom_node_type type = DOM_ELEMENT_NODE;
 		JSValue olddata = JS_NULL;
 
-		JSValue before = children_snapshot(ctx, node);
+		JSValue before = target_snapshot(ctx, node);
 
 		dom_node_get_node_type(node, &type);
 		/* what the text said before, which a characterData record
@@ -955,17 +2430,18 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 			olddata = JS_NULL;
 		} else {
 			notify_mutation(ctx, "childList", node,
-					children_snapshot(ctx, node), before);
+					target_snapshot(ctx, node), before);
 		}
 		if (!JS_IsNull(olddata)) JS_FreeValue(ctx, olddata);
 	}
 	if (s != NULL) JS_FreeCString(ctx, s);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 static JSValue node_get_attr_prop(JSContext *ctx, JSValueConst this_val,
 				  const char *name)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	dom_string *key = to_dom_string(name);
 	dom_string *val = NULL;
@@ -981,17 +2457,20 @@ static JSValue node_get_attr_prop(JSContext *ctx, JSValueConst this_val,
 
 static JSValue node_get_id(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	return node_get_attr_prop(ctx, this_val, "id");
 }
 
 static JSValue node_get_class_name(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	return node_get_attr_prop(ctx, this_val, "class");
 }
 
 static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 				  const char *name, JSValueConst val)
 {
+	C_WHERE;
 	vita_dom_gen++;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *s = JS_ToCString(ctx, val);
@@ -1001,12 +2480,19 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 	if (node != NULL && key != NULL && dv != NULL) {
 		dom_string *old = NULL;
 		jsthread *th = JS_GetContextOpaque(ctx);
+		bool same;
 
-		if (th != NULL && th->watch_mutations) {
-			dom_element_get_attribute(node, key, &old);
-		}
+		dom_element_get_attribute(node, key, &old);
+		same = old != NULL && dom_string_isequal(old, dv);
 		dom_element_set_attribute(node, key, dv);
-		mark_dirty(ctx);
+		if (!same) {
+			attr_stamp_touch(node);
+			mark_attr_dirty(ctx, node, key, old);
+		}
+		if (th == NULL || !th->watch_mutations) {
+			if (old != NULL) dom_string_unref(old);
+			old = NULL;
+		}
 		/* className and id are the same attribute write as
 		 * setAttribute, and an observer watching class has to see
 		 * one: this path reported nothing at all, so a component
@@ -1022,22 +2508,27 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 	if (key != NULL) dom_string_unref(key);
 	if (dv != NULL) dom_string_unref(dv);
 	if (s != NULL) JS_FreeCString(ctx, s);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 static JSValue node_set_id(JSContext *ctx, JSValueConst this_val, JSValueConst v)
 {
+	C_WHERE;
 	return node_set_attr_prop(ctx, this_val, "id", v);
 }
 
 static JSValue node_set_class_name(JSContext *ctx, JSValueConst this_val,
 				   JSValueConst v)
 {
+	C_WHERE;
 	return node_set_attr_prop(ctx, this_val, "class", v);
 }
 
 static JSValue node_get_parent(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *p = NULL;
 	JSValue r;
@@ -1046,11 +2537,17 @@ static JSValue node_get_parent(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_parent_node(node, &p);
 	r = wrap_node(ctx, p);
 	if (p != NULL) dom_node_unref(p);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_first_child(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue r;
@@ -1059,11 +2556,17 @@ static JSValue node_get_first_child(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_first_child(node, &c);
 	r = wrap_node(ctx, c);
 	if (c != NULL) dom_node_unref(c);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_next_sibling(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue r;
@@ -1072,11 +2575,17 @@ static JSValue node_get_next_sibling(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_next_sibling(node, &c);
 	r = wrap_node(ctx, c);
 	if (c != NULL) dom_node_unref(c);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_last_child(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue r;
@@ -1085,11 +2594,17 @@ static JSValue node_get_last_child(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_last_child(node, &c);
 	r = wrap_node(ctx, c);
 	if (c != NULL) dom_node_unref(c);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
+	vitasurf_js_tree_reads++;
+	{ uint64_t w0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue r;
@@ -1098,7 +2613,10 @@ static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
 	dom_node_get_previous_sibling(node, &c);
 	r = wrap_node(ctx, c);
 	if (c != NULL) dom_node_unref(c);
+	vitasurf_ms_js_tree_reads += (unsigned)(now_ms() - w0);
 	return r;
+	}
+
 }
 
 /*
@@ -1111,12 +2629,18 @@ static JSValue node_get_previous_sibling(JSContext *ctx, JSValueConst this_val)
  */
 static JSValue node_get_child_nodes(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *c = NULL;
 	JSValue arr;
 	uint32_t i = 0;
 
+	uint64_t t0;
+
 	if (node == NULL) return JS_EXCEPTION;
+	/* rebuilt on every read, so count what that costs (VitaSurf) */
+	vitasurf_js_childnodes++;
+	t0 = now_ms();
 	arr = JS_NewArray(ctx);
 	if (dom_node_get_first_child(node, &c) != DOM_NO_ERR) {
 		c = NULL;
@@ -1131,11 +2655,14 @@ static JSValue node_get_child_nodes(JSContext *ctx, JSValueConst this_val)
 		dom_node_unref(c);
 		c = next;
 	}
+	vitasurf_js_childnodes_items += i;
+	vitasurf_ms_js_childnodes += (unsigned)(now_ms() - t0);
 	return arr;
 }
 
 static JSValue node_get_node_value(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -1155,6 +2682,7 @@ static JSValue node_get_node_value(JSContext *ctx, JSValueConst this_val)
 static JSValue node_set_node_value(JSContext *ctx, JSValueConst this_val,
 				   JSValueConst val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_node_type type = DOM_ELEMENT_NODE;
 
@@ -1173,6 +2701,9 @@ static JSValue node_set_node_value(JSContext *ctx, JSValueConst this_val,
 static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
+	vitasurf_js_attr_gets++;
+	{ uint64_t g0 = now_ms();
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key, *val = NULL;
@@ -1193,7 +2724,10 @@ static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
 	}
 	r = JS_NewStringLen(ctx, dom_string_data(val), dom_string_byte_length(val));
 	dom_string_unref(val);
+	vitasurf_ms_js_attr_get_time += (unsigned)(now_ms() - g0);
 	return r;
+	}
+
 }
 
 /*
@@ -1204,6 +2738,7 @@ static JSValue node_get_attribute(JSContext *ctx, JSValueConst this_val,
  */
 static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	struct dom_namednodemap *map = NULL;
 	JSValue arr = JS_NewArray(ctx);
@@ -1216,10 +2751,12 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 		return arr;
 	}
 	dom_namednodemap_get_length(map, &len);
+	vitasurf_js_attr_maps++;
+	vitasurf_js_attr_map_items += len;
 	for (i = 0; i < len; i++) {
 		struct dom_node *attr = NULL;
-		dom_string *name = NULL, *val = NULL;
-		JSValue entry;
+		dom_string *name = NULL, *val = NULL, *ns = NULL;
+		JSValue entry, jname;
 
 		if (dom_namednodemap_item(map, i, &attr) != DOM_NO_ERR ||
 		    attr == NULL) {
@@ -1227,40 +2764,54 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 		}
 		dom_node_get_node_name(attr, &name);
 		dom_node_get_node_value(attr, &val);
+		dom_node_get_namespace(attr, &ns);
 		entry = JS_NewObject(ctx);
-		JS_SetPropertyStr(ctx, entry, "name",
-				  name != NULL ?
-				  JS_NewStringLen(ctx, dom_string_data(name),
-						  dom_string_byte_length(name)) :
-				  JS_NewString(ctx, ""));
-		JS_SetPropertyStr(ctx, entry, "value",
+		jname = name != NULL ?
+			JS_NewStringLen(ctx, dom_string_data(name),
+					dom_string_byte_length(name)) :
+			JS_NewString(ctx, "");
+		/* defined, not set: a fresh object has no setters to find,
+		 * and Alpine asks for every element's attributes */
+		JS_DefinePropertyValueStr(ctx, entry, "name",
+					  JS_DupValue(ctx, jname), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, entry, "value",
 				  val != NULL ?
 				  JS_NewStringLen(ctx, dom_string_data(val),
 						  dom_string_byte_length(val)) :
-				  JS_NewString(ctx, ""));
-		JS_SetPropertyStr(ctx, entry, "specified", JS_TRUE);
-		{
-			dom_string *ns = NULL, *local = NULL, *prefix = NULL;
+				  JS_NewString(ctx, ""), JS_PROP_C_W_E);
+		JS_DefinePropertyValueStr(ctx, entry, "specified", JS_TRUE,
+					  JS_PROP_C_W_E);
+		if (ns == NULL) {
+			/* An attribute in no namespace has no prefix and is
+			 * its own local name: two libdom calls and a string
+			 * spared on nearly every attribute of a page. */
+			JS_DefinePropertyValueStr(ctx, entry, "namespace",
+						  JS_NULL, JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, entry, "localName",
+						  jname, JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, entry, "prefix",
+						  JS_NULL, JS_PROP_C_W_E);
+		} else {
+			dom_string *local = NULL, *prefix = NULL;
 
-			dom_node_get_namespace(attr, &ns);
+			JS_FreeValue(ctx, jname);
 			dom_node_get_local_name(attr, &local);
 			dom_node_get_prefix(attr, &prefix);
-			JS_SetPropertyStr(ctx, entry, "namespace",
-					  ns != NULL ?
+			JS_DefinePropertyValueStr(ctx, entry, "namespace",
 					  JS_NewStringLen(ctx, dom_string_data(ns),
-							  dom_string_byte_length(ns)) :
-					  JS_NULL);
-			JS_SetPropertyStr(ctx, entry, "localName",
+							  dom_string_byte_length(ns)),
+					  JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, entry, "localName",
 					  local != NULL ?
 					  JS_NewStringLen(ctx, dom_string_data(local),
 							  dom_string_byte_length(local)) :
-					  JS_NULL);
-			JS_SetPropertyStr(ctx, entry, "prefix",
+					  JS_NULL, JS_PROP_C_W_E);
+			JS_DefinePropertyValueStr(ctx, entry, "prefix",
 					  prefix != NULL ?
 					  JS_NewStringLen(ctx, dom_string_data(prefix),
 							  dom_string_byte_length(prefix)) :
-					  JS_NULL);
-			if (ns != NULL) dom_string_unref(ns);
+					  JS_NULL, JS_PROP_C_W_E);
+			dom_string_unref(ns);
 			if (local != NULL) dom_string_unref(local);
 			if (prefix != NULL) dom_string_unref(prefix);
 		}
@@ -1276,6 +2827,9 @@ static JSValue node_get_attributes(JSContext *ctx, JSValueConst this_val)
 static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
+	vitasurf_js_attr_sets++;
+	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name, *value;
 	dom_string *key, *val;
@@ -1288,12 +2842,32 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 	if (node != NULL && key != NULL && val != NULL) {
 		dom_string *old = NULL;
 		jsthread *th = JS_GetContextOpaque(ctx);
+		bool same;
 
-		if (th != NULL && th->watch_mutations) {
-			dom_element_get_attribute(node, key, &old);
-		}
+		/*
+		 * Writing the value an attribute already has changes
+		 * nothing on screen, so it asks for no rebuild (VitaSurf).
+		 * Observers still get a record, as the DOM says they do.
+		 * Bubble Card, on Home Assistant, puts the same classes
+		 * and icon back on every card each time any entity
+		 * changes, and each of those rebuilt the page's layout,
+		 * which on a dashboard takes the Vita a second.
+		 */
+		dom_element_get_attribute(node, key, &old);
+		same = old != NULL && dom_string_isequal(old, val);
 		dom_element_set_attribute(node, key, val);
-		mark_dirty(ctx);
+		if (!same) {
+			attr_stamp_touch(node);
+			mark_attr_dirty(ctx, node, key, old);
+		}
+		if (th == NULL || !th->watch_mutations) {
+			if (old != NULL) dom_string_unref(old);
+			old = NULL;
+		}
+		if (name != NULL && (strcasecmp(name, "src") == 0 ||
+				     strcasecmp(name, "srcset") == 0)) {
+			img_src_sets++;
+		}
 		notify_mutation(ctx, "attributes", node,
 				JS_NewString(ctx, name != NULL ? name : ""),
 				old != NULL ?
@@ -1306,12 +2880,16 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 	if (val) dom_string_unref(val);
 	if (name) JS_FreeCString(ctx, name);
 	if (value) JS_FreeCString(ctx, value);
-	return JS_UNDEFINED;
+	vitasurf_ms_js_attr_time += (unsigned)(now_ms() - t0);
+	return ret_or_abort(ctx, JS_UNDEFINED);
+	}
+
 }
 
 static JSValue node_has_attribute(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key;
@@ -1331,6 +2909,7 @@ static JSValue node_has_attribute(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *name;
 	dom_string *key;
@@ -1340,16 +2919,17 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 	key = to_dom_string(name);
 	if (key != NULL) {
 		dom_string *old = NULL;
-		jsthread *th = JS_GetContextOpaque(ctx);
-
 		bool had = false;
 
 		dom_element_has_attribute(node, key, &had);
-		if (th != NULL && th->watch_mutations) {
+		if (had) {
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_remove_attribute(node, key);
-		mark_dirty(ctx);
+		if (had) {
+			attr_stamp_touch(node);
+			mark_attr_dirty(ctx, node, key, old);
+		}
 		/* removing an attribute that was not there changes nothing,
 		 * and nothing is what an observer should see */
 		if (had) {
@@ -1364,7 +2944,7 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 		dom_string_unref(key);
 	}
 	if (name) JS_FreeCString(ctx, name);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 /*
@@ -1399,6 +2979,7 @@ static dom_string *ns_arg(JSContext *ctx, JSValueConst v, const char **held)
 static JSValue node_get_attribute_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *nsheld = NULL, *local;
 	dom_string *ns, *key, *val = NULL;
@@ -1424,6 +3005,7 @@ static JSValue node_get_attribute_ns(JSContext *ctx, JSValueConst this_val,
 static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *nsheld = NULL, *qname, *value;
 	dom_string *ns, *key, *val;
@@ -1449,6 +3031,7 @@ static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
 			}
 		}
 		dom_element_set_attribute_ns(node, ns, key, val);
+		attr_stamp_touch(node);
 		mark_dirty(ctx);
 		notify_mutation_ns(ctx, "attributes", node,
 				   JS_NewString(ctx, local != NULL ? local : ""),
@@ -1466,12 +3049,13 @@ static JSValue node_set_attribute_ns(JSContext *ctx, JSValueConst this_val,
 	if (nsheld) JS_FreeCString(ctx, nsheld);
 	if (qname) JS_FreeCString(ctx, qname);
 	if (value) JS_FreeCString(ctx, value);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 static JSValue node_has_attribute_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *nsheld = NULL, *local;
 	dom_string *ns, *key;
@@ -1494,6 +3078,7 @@ static JSValue node_has_attribute_ns(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 					int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_element(ctx, this_val);
 	const char *nsheld = NULL, *local;
 	dom_string *ns, *key;
@@ -1509,6 +3094,7 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 		dom_element_has_attribute_ns(node, ns, key, &had);
 		dom_element_get_attribute_ns(node, ns, key, &old);
 		dom_element_remove_attribute_ns(node, ns, key);
+		attr_stamp_touch(node);
 		mark_dirty(ctx);
 		if (had) {
 			notify_mutation_ns(ctx, "attributes", node,
@@ -1526,7 +3112,7 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 	if (ns != NULL) dom_string_unref(ns);
 	if (nsheld) JS_FreeCString(ctx, nsheld);
 	if (local) JS_FreeCString(ctx, local);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 /*
@@ -1550,6 +3136,7 @@ static JSValue node_remove_attribute_ns(JSContext *ctx, JSValueConst this_val,
 /* A doctype's publicId and systemId, which libdom holds on the node. */
 static JSValue node_get_public_id(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 	dom_node_type t = DOM_ELEMENT_NODE;
@@ -1568,6 +3155,7 @@ static JSValue node_get_public_id(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_system_id(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 	dom_node_type t = DOM_ELEMENT_NODE;
@@ -1589,6 +3177,7 @@ static JSValue node_get_system_id(JSContext *ctx, JSValueConst this_val)
  * an element made with a prefix keeps it. */
 static JSValue node_get_local_name(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -1601,6 +3190,7 @@ static JSValue node_get_local_name(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_prefix(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -1613,6 +3203,7 @@ static JSValue node_get_prefix(JSContext *ctx, JSValueConst this_val)
 
 static JSValue node_get_namespace_uri(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	dom_string *s = NULL;
 
@@ -1626,6 +3217,7 @@ static JSValue node_get_namespace_uri(JSContext *ctx, JSValueConst this_val)
 static JSValue win_vita_create_in(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *host, *made = NULL;
 	struct dom_document *doc;
 	const char *name = NULL;
@@ -1689,6 +3281,7 @@ static JSValue win_vita_create_in(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_parse_document(JSContext *ctx, JSValueConst this_val,
 				       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	dom_hubbub_parser_params params;
 	dom_hubbub_parser *parser = NULL;
 	struct dom_document *doc = NULL;
@@ -1756,6 +3349,9 @@ static JSValue inserted_nodes(JSContext *ctx, struct dom_node *child,
 static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
+	vitasurf_js_dom_edits++;
+	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *before = NULL, *ref = NULL;
 	JSValue added;
@@ -1779,12 +3375,16 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 		dom_node_unref(ref);
 	}
 	notify_mutation(ctx, "childList", node, added, JS_NULL);
-	return JS_DupValue(ctx, argv[0]);
+	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
+	return ret_or_abort(ctx, JS_DupValue(ctx, argv[0]));
+	}
+
 }
 
 static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *old, *ref = NULL;
 	JSValue added;
@@ -1802,12 +3402,517 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 	}
 	notify_mutation(ctx, "childList", node, added,
 			JS_DupValue(ctx, argv[1]));
-	return JS_DupValue(ctx, argv[1]);
+	return ret_or_abort(ctx, JS_DupValue(ctx, argv[1]));
+}
+
+static unsigned count_elements(struct dom_node *root);
+
+/*
+ * A clone that is worth a line of its own (VitaSurf). One cloneNode on
+ * a GitHub load took 879 ms and nothing said what it copied, so a slow
+ * one names the node and counts what came out of it: a single enormous
+ * subtree and a clone that is slow per node look the same in a total.
+ */
+#define CLONE_SLOW_MS 50
+
+static void clone_was_slow(struct dom_node *node, struct dom_node *copy,
+			   bool deep, unsigned took)
+{
+	dom_string *name = NULL;
+
+	if (dom_node_get_node_name(node, &name) != DOM_NO_ERR ||
+	    name == NULL) {
+		vita_log("qjs: a %s clone took %u ms for %u elements",
+			 deep ? "deep" : "shallow", took,
+			 count_elements(copy));
+		return;
+	}
+	vita_log("qjs: a %s clone of <%s> took %u ms for %u elements",
+		 deep ? "deep" : "shallow", dom_string_data(name), took,
+		 count_elements(copy));
+	dom_string_unref(name);
+}
+
+/*
+ * The prelude says whether a selector it was asked to use came out of
+ * its cache (VitaSurf), so the page report can put a number on the
+ * parser a GitHub hydration job spent 7.8 seconds in.
+ */
+static JSValue win_vita_selector(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int kind = 0, steps = 0;
+
+	(void)this_val;
+	if (argc >= 1) {
+		JS_ToInt32(ctx, &kind, argv[0]);
+	}
+	if (argc >= 2) {
+		JS_ToInt32(ctx, &steps, argv[1]);
+	}
+	/* 0 parsed, 1 from the cache, then one per API: the page
+	 * report says which call a page leans on */
+	switch (kind) {
+	case 0: vitasurf_js_selector_compiles++; break;
+	case 1:
+		/* the prelude batches its cache hits: steps is how many */
+		vitasurf_js_selector_hits += steps > 0 ? (unsigned int)steps : 1;
+		break;
+	case 2: vitasurf_js_sel_all++; break;
+	case 3: vitasurf_js_sel_one++; break;
+	case 4: vitasurf_js_sel_matches++; break;
+	case 5:
+		vitasurf_js_sel_closest++;
+		if (steps > 0) {
+			vitasurf_js_sel_closest_steps += (unsigned int)steps;
+		}
+		break;
+	case 6:
+		/* a selector the general path has now matched this often */
+		if (argc >= 3) {
+			const char *t = JS_ToCString(ctx, argv[2]);
+
+			if (t != NULL) {
+				vita_log("qjs: selector '%.120s' has taken "
+					 "the general path %d times", t,
+					 steps);
+				JS_FreeCString(ctx, t);
+			}
+		}
+		break;
+	default: break;
+	}
+	return JS_UNDEFINED;
+}
+
+/** Whether a dom_string holds exactly len bytes of s. */
+static bool dom_string_is(dom_string *d, const char *s, size_t len)
+{
+	return d != NULL && dom_string_byte_length(d) == len &&
+		memcmp(dom_string_data(d), s, len) == 0;
+}
+
+/*
+ * Whether element n is what a selector of one bare tag names: the name
+ * in any ASCII case for an element in the HTML namespace or none, the
+ * name exactly as written for any other -- the prelude's matchSimple.
+ * local is n's local name, already fetched by the caller.
+ */
+static bool tag_is(struct dom_node *n, dom_string *local,
+		   const char *tag, size_t tag_len)
+{
+	static const char html_ns[] = "http://www.w3.org/1999/xhtml";
+	dom_string *ns = NULL, *name = NULL;
+	bool html, hit;
+
+	if (local == NULL || dom_string_byte_length(local) != tag_len ||
+	    strncasecmp(dom_string_data(local), tag, tag_len) != 0) {
+		return false;	/* the common case: a different name */
+	}
+	dom_node_get_namespace(n, &ns);
+	html = ns == NULL || dom_string_is(ns, html_ns, sizeof(html_ns) - 1);
+	if (ns != NULL) dom_string_unref(ns);
+	if (html) {
+		return true;
+	}
+	if (dom_element_get_tag_name(n, &name) != DOM_NO_ERR) {
+		return false;
+	}
+	hit = dom_string_is(name, tag, tag_len);
+	if (name != NULL) dom_string_unref(name);
+	return hit;
+}
+
+/* A tag name's hash with ASCII folded to lower case; 0 is never one. */
+static uint32_t tag_hash_lower(const char *p, size_t n)
+{
+	uint32_t h = 2166136261u;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		unsigned char c = (unsigned char) p[i];
+
+		if (c >= 'A' && c <= 'Z') c = (unsigned char) (c + 32);
+		h = (h ^ c) * 16777619u;
+	}
+	return h | 1u;
+}
+
+static void tags_free(jsthread *thread)
+{
+	if (thread->tags_root != NULL) dom_node_unref(thread->tags_root);
+	thread->tags_root = NULL;
+	free(thread->tags_set);
+	thread->tags_set = NULL;
+	thread->tags_cap = thread->tags_n = 0;
+	thread->tags_built = false;
+}
+
+static bool tags_has(const jsthread *thread, uint32_t h)
+{
+	uint32_t mask = thread->tags_cap - 1, i;
+
+	if (thread->tags_cap == 0) return false;
+	for (i = h & mask; thread->tags_set[i] != 0; i = (i + 1) & mask) {
+		if (thread->tags_set[i] == h) return true;
+	}
+	return false;
+}
+
+static bool tags_add(jsthread *thread, uint32_t h)
+{
+	uint32_t mask, i;
+
+	if ((thread->tags_n + 1) * 2 > thread->tags_cap) {
+		uint32_t cap = thread->tags_cap ? thread->tags_cap * 2 : 128;
+		uint32_t *set = calloc(cap, sizeof(*set)), j;
+
+		if (set == NULL) return false;
+		for (j = 0; j < thread->tags_cap; j++) {
+			uint32_t v = thread->tags_set[j];
+
+			if (v == 0) continue;
+			for (i = v & (cap - 1); set[i] != 0;
+			     i = (i + 1) & (cap - 1)) {
+			}
+			set[i] = v;
+		}
+		free(thread->tags_set);
+		thread->tags_set = set;
+		thread->tags_cap = cap;
+	}
+	mask = thread->tags_cap - 1;
+	for (i = h & mask; thread->tags_set[i] != 0; i = (i + 1) & mask) {
+		if (thread->tags_set[i] == h) return true;
+	}
+	thread->tags_set[i] = h;
+	thread->tags_n++;
+	return true;
+}
+
+/* Every element name under root, root itself left out as a query
+ * leaves it out. False if there was no memory for them. */
+static bool tags_build(jsthread *thread, struct dom_node *root)
+{
+	struct dom_node *n = NULL;
+
+	vitasurf_js_sel_tag_sets++;
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+
+		dom_node_type type = 0;
+
+		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_string *local = NULL;
+			bool ok = true;
+
+			vitasurf_js_sel_tag_set_visits++;
+			dom_node_get_local_name(n, &local);
+			if (local != NULL) {
+				ok = tags_add(thread, tag_hash_lower(
+					dom_string_data(local),
+					dom_string_byte_length(local)));
+				dom_string_unref(local);
+			}
+			if (!ok) {
+				dom_node_unref(n);
+				return false;
+			}
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	return true;
+}
+
+/*
+ * Whether no element under root can have the name tag_hash_lower gave
+ * tag_hash, so that a bare tag query of root finds nothing without
+ * walking it (VitaSurf); see jsthread's tags_root. False means only
+ * that the walk must decide.
+ */
+static bool tags_absent(jsthread *thread, struct dom_node *root,
+			uint32_t tag_hash)
+{
+	if (thread->tags_root != root || thread->tags_gen != vita_tree_gen) {
+		if (thread->tags_root != NULL) {
+			dom_node_unref(thread->tags_root);
+		}
+		thread->tags_root = dom_node_ref(root);
+		thread->tags_gen = vita_tree_gen;
+		thread->tags_asks = 0;
+		thread->tags_built = false;
+		thread->tags_n = 0;
+		if (thread->tags_set != NULL) {
+			memset(thread->tags_set, 0,
+			       thread->tags_cap * sizeof(*thread->tags_set));
+		}
+	}
+	if (!thread->tags_built) {
+		if (++thread->tags_asks < 2) return false;
+		if (!tags_build(thread, root)) {
+			thread->tags_n = 0;
+			if (thread->tags_set != NULL) {
+				memset(thread->tags_set, 0, thread->tags_cap *
+				       sizeof(*thread->tags_set));
+			}
+			return false;
+		}
+		thread->tags_built = true;
+	}
+	if (tags_has(thread, tag_hash)) return false;
+	vitasurf_js_sel_tag_absent++;
+	return true;
+}
+
+/*
+ * __vitaTagQuery(node, tag, mode): a selector of one bare, ASCII tag
+ * name, answered in C (VitaSurf). mode 0 is matches(), 1 querySelector,
+ * 2 querySelectorAll. GitHub's lazy component loader asks each element
+ * added to the page for every tag it may load -- element.matches(tag),
+ * then element.querySelector(tag) -- 280,000 calls on one profile page,
+ * and through the general selector path that was 20 s of a timer the
+ * budget stopped. Returns undefined for anything that is not a node
+ * wrapper (a document object), and the prelude takes its own path.
+ */
+static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *root, *n = NULL;
+	const char *tag;
+	size_t tag_len;
+	int32_t mode = 0;
+	JSValue out = JS_NULL;
+	uint32_t out_n = 0, visits0;
+
+	(void)this_val;
+	if (argc < 3 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	root = JS_GetOpaque(argv[0], node_class_id);
+	if (root == NULL) {
+		return JS_UNDEFINED;
+	}
+	JS_ToInt32(ctx, &mode, argv[2]);
+	tag = JS_ToCStringLen(ctx, &tag_len, argv[1]);
+	if (tag == NULL) {
+		return JS_EXCEPTION;
+	}
+	vitasurf_js_sel_tag_fast++;
+	if (mode == 0) {
+		dom_node_type type = 0;
+		dom_string *local = NULL;
+		bool hit = false;
+
+		vitasurf_js_sel_matches++;
+		if (dom_node_get_node_type(root, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_node_get_local_name(root, &local);
+			hit = tag_is(root, local, tag, tag_len);
+			if (local != NULL) dom_string_unref(local);
+		}
+		JS_FreeCString(ctx, tag);
+		return JS_NewBool(ctx, hit);
+	}
+	if (mode == 2) {
+		vitasurf_js_sel_all++;
+		out = JS_NewArray(ctx);
+	} else {
+		vitasurf_js_sel_one++;
+	}
+	{
+		jsthread *thread = JS_GetContextOpaque(ctx);
+
+		if (thread != NULL && tags_absent(thread, root,
+				tag_hash_lower(tag, tag_len))) {
+			JS_FreeCString(ctx, tag);
+			return out;
+		}
+	}
+	visits0 = vitasurf_js_sel_tag_visits;
+	/* iterative pre-order walk; root itself is not a candidate */
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+		dom_node_type type = 0;
+
+		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_string *local = NULL;
+			bool hit;
+
+			vitasurf_js_sel_tag_visits++;
+			dom_node_get_local_name(n, &local);
+			hit = tag_is(n, local, tag, tag_len);
+			if (local != NULL) dom_string_unref(local);
+			if (hit) {
+				if (mode != 2) {
+					out = wrap_node(ctx, n);
+					dom_node_unref(n);
+					break;
+				}
+				JS_SetPropertyUint32(ctx, out, out_n++,
+						     wrap_node(ctx, n));
+			}
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	walk_cost_note(mode == 2 ? "querySelectorAll" : "querySelector",
+		       tag, tag_len, vitasurf_js_sel_tag_visits - visits0,
+		       walk_from_top(JS_GetContextOpaque(ctx), root));
+	JS_FreeCString(ctx, tag);
+	return out;
+}
+
+/*
+ * __vitaClosestTag(node, tag, tagUpper): closest() for a selector that
+ * is one bare tag name (VitaSurf). GitHub's component framework asks
+ * closest(tagName) of every element it binds; in JavaScript that was a
+ * wrapper and a matches() call per ancestor. The test is the prelude's
+ * matchSimple: tagUpper for an element in the HTML namespace or none,
+ * tag as written for any other.
+ */
+static JSValue win_vita_closest_tag(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	static const char html_ns[] = "http://www.w3.org/1999/xhtml";
+	struct dom_node *n;
+	const char *tag, *upper;
+	size_t tag_len, upper_len;
+	JSValue result = JS_NULL;
+	unsigned int steps = 0;
+
+	(void)this_val;
+	if (argc < 3 || !JS_IsObject(argv[0])) {
+		return JS_NULL;
+	}
+	n = JS_GetOpaque(argv[0], node_class_id);
+	if (n == NULL) {
+		return JS_NULL;
+	}
+	tag = JS_ToCStringLen(ctx, &tag_len, argv[1]);
+	if (tag == NULL) {
+		return JS_EXCEPTION;
+	}
+	upper = JS_ToCStringLen(ctx, &upper_len, argv[2]);
+	if (upper == NULL) {
+		JS_FreeCString(ctx, tag);
+		return JS_EXCEPTION;
+	}
+	vitasurf_js_sel_closest++;
+	vitasurf_js_sel_closest_native++;
+	dom_node_ref(n);
+	while (n != NULL) {
+		dom_node_type type = 0;
+		struct dom_node *up = NULL;
+
+		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+		    type != DOM_ELEMENT_NODE) {
+			break;
+		}
+		steps++;
+		{
+			dom_string *name = NULL, *ns = NULL;
+			bool html, hit;
+
+			dom_node_get_namespace(n, &ns);
+			html = ns == NULL ||
+				dom_string_is(ns, html_ns, sizeof(html_ns) - 1);
+			if (dom_element_get_tag_name(n, &name) != DOM_NO_ERR) {
+				name = NULL;
+			}
+			hit = html ? dom_string_is(name, upper, upper_len)
+				: dom_string_is(name, tag, tag_len);
+			if (name != NULL) dom_string_unref(name);
+			if (ns != NULL) dom_string_unref(ns);
+			if (hit) {
+				result = wrap_node(ctx, n);
+				break;
+			}
+		}
+		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(n);
+		n = up;
+	}
+	if (n != NULL) {
+		dom_node_unref(n);
+	}
+	vitasurf_js_sel_closest_steps += steps;
+	JS_FreeCString(ctx, upper);
+	JS_FreeCString(ctx, tag);
+	return result;
 }
 
 static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	C_WHERE;
+	vitasurf_js_clones++;
+	{ uint64_t y0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *copy = NULL;
 	bool deep = false;
@@ -1819,13 +3924,24 @@ static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	r = wrap_node(ctx, copy);
+	{
+		unsigned took = (unsigned)(now_ms() - y0);
+
+		if (took >= CLONE_SLOW_MS) {
+			clone_was_slow(node, copy, deep, took);
+		}
+		vitasurf_ms_js_clones += took;
+	}
 	dom_node_unref(copy);
 	return r;
+	}
+
 }
 
 static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_val,
 					     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	const char *name;
 
@@ -1853,7 +3969,13 @@ static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_v
 			k.tag[len] = 0;
 		}
 		JS_FreeCString(ctx, name);
+		len = find_visits;
 		out = find_in_subtree(ctx, node, &k, 1);
+		walk_cost_note("el.getElementsByTagName",
+			       k.tag != NULL ? k.tag : "*",
+			       strlen(k.tag != NULL ? k.tag : "*"),
+			       find_visits - (uint32_t) len,
+			       walk_from_top(JS_GetContextOpaque(ctx), node));
 		free(k.tag);
 		return out;
 	}
@@ -1875,6 +3997,7 @@ static struct dom_document *thread_document(jsthread *thread);
 
 static JSValue node_get_owner_document(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	struct dom_node *node = this_node(ctx, this_val);
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = NULL;
@@ -1903,6 +4026,9 @@ static JSValue node_get_owner_document(JSContext *ctx, JSValueConst this_val)
 static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
+	vitasurf_js_dom_edits++;
+	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *ref = NULL;
 	JSValue added;
@@ -1917,25 +4043,50 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 		dom_node_unref(ref);
 	}
 	notify_mutation(ctx, "childList", node, added, JS_NULL);
-	return JS_DupValue(ctx, argv[0]);
+	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
+	return ret_or_abort(ctx, JS_DupValue(ctx, argv[0]));
+	}
+
 }
 
 static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
+	vitasurf_js_dom_edits++;
+	{ uint64_t t0 = now_ms();
 	struct dom_node *node = this_node(ctx, this_val);
 	struct dom_node *child, *ref = NULL;
 
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
+	/* a page's own root and doctype stay (VitaSurf): layout reads the
+	 * page from its root. Any other document gives them up. */
+	{
+		dom_node_type ct = DOM_ELEMENT_NODE;
+		jsthread *t;
+
+		if (dom_node_get_node_type(child, &ct) == DOM_NO_ERR &&
+		    (ct == DOM_ELEMENT_NODE || ct == DOM_DOCUMENT_TYPE_NODE)) {
+			for (t = all_threads; t != NULL; t = t->all_next) {
+				if ((struct dom_node *)thread_document(t) ==
+				    node) {
+					return JS_DupValue(ctx, argv[0]);
+				}
+			}
+		}
+	}
 	mark_dirty(ctx);
 	if (dom_node_remove_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
 	}
 	notify_mutation(ctx, "childList", node,
 			JS_NULL, JS_DupValue(ctx, argv[0]));
-	return JS_DupValue(ctx, argv[0]);
+	vitasurf_ms_js_edit_time += (unsigned)(now_ms() - t0);
+	return ret_or_abort(ctx, JS_DupValue(ctx, argv[0]));
+	}
+
 }
 
 /* Replace the element's children with parsed HTML (innerHTML setter). */
@@ -1947,6 +4098,7 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	struct dom_document_fragment *fragment = NULL;
 	struct dom_node *child = NULL, *htmlnode = NULL, *body = NULL;
 	struct dom_nodelist *bodies = NULL;
+	uint64_t t_stage = now_ms();
 
 	if (dom_node_get_owner_document(node, &doc) != DOM_NO_ERR) {
 		return;
@@ -1972,8 +4124,21 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	params.enc = "UTF-8";
 	params.fix_enc = true;
 	params.enable_script = false;
+	/*
+	 * Parse quietly (VitaSurf). The fragment parser is created on the
+	 * page's own document, so every node it built raised two mutation
+	 * events into NetSurf's default action -- image, style and script
+	 * processing and the inline-handler hook -- for a subtree that is
+	 * not in the page yet. 415 KB of GitHub's markup took 870 ms to
+	 * parse that way. With the document quiet the nodes are marked
+	 * instead, and when they are moved into the target below, the
+	 * insert of each top-level node settles what its descendants are
+	 * owed, once.
+	 */
+	dom_document_quiet_mutations(doc, +1);
 	if (dom_hubbub_fragment_parser_create(&params, doc, &parser,
 					      &fragment) != DOM_HUBBUB_OK) {
+		dom_document_quiet_mutations(doc, -1);
 		goto out;
 	}
 	/*
@@ -1988,15 +4153,21 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	if (node != (struct dom_node *)doc &&
 	    dom_hubbub_parser_parse_chunk(parser, (const uint8_t *)"<body>",
 					  6) != DOM_HUBBUB_OK) {
+		dom_document_quiet_mutations(doc, -1);
 		goto out;
 	}
 	if (dom_hubbub_parser_parse_chunk(parser, (const uint8_t *)html,
 					  len) != DOM_HUBBUB_OK) {
+		dom_document_quiet_mutations(doc, -1);
 		goto out;
 	}
 	if (dom_hubbub_parser_completed(parser) != DOM_HUBBUB_OK) {
+		dom_document_quiet_mutations(doc, -1);
 		goto out;
 	}
+	dom_document_quiet_mutations(doc, -1);
+	vitasurf_ms_html_js_parse += (unsigned)(now_ms() - t_stage);
+	t_stage = now_ms();
 	/* empty the target */
 	dom_node_get_first_child(node, &child);
 	while (child != NULL) {
@@ -2029,6 +4200,8 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 	 * So walk the fragment's children: take an <html> element apart
 	 * section by section, and move anything else across as it stands.
 	 */
+	vitasurf_ms_html_js_empty += (unsigned)(now_ms() - t_stage);
+	t_stage = now_ms();
 	dom_node_get_first_child(fragment, &htmlnode);
 	while (htmlnode != NULL) {
 		struct dom_node *after = NULL, *cref = NULL;
@@ -2079,6 +4252,7 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 		dom_node_unref(htmlnode);
 		htmlnode = after;
 	}
+	vitasurf_ms_html_js_move += (unsigned)(now_ms() - t_stage);
 out:
 	if (parser) dom_hubbub_parser_destroy(parser);
 	if (doc) dom_node_unref(doc);
@@ -2091,6 +4265,8 @@ out:
 static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 				   JSValueConst val)
 {
+	C_WHERE;
+	vitasurf_js_html_sets++;
 	struct dom_node *node = this_node(ctx, this_val);
 	size_t len = 0;
 	const char *s;
@@ -2098,7 +4274,7 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 	JSValue before;
 
 	if (node == NULL) return JS_EXCEPTION;
-	before = children_snapshot(ctx, node);
+	before = target_snapshot(ctx, node);
 	/* innerHTML is [LegacyNullToEmptyString]: null empties the element
 	 * rather than writing the four letters of "null" into it. */
 	if (JS_IsNull(val)) {
@@ -2107,19 +4283,21 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 		s = JS_ToCStringLen(ctx, &len, val);
 	}
 	if (s != NULL) {
+		vitasurf_js_html_bytes += (unsigned) len;
 		set_inner_html(node, s, len);
 		JS_FreeCString(ctx, s);
 		mark_dirty(ctx);
 		notify_mutation(ctx, "childList", node,
-				children_snapshot(ctx, node), before);
+				target_snapshot(ctx, node), before);
 		before = JS_UNDEFINED;
 	}
 	JS_FreeValue(ctx, before);
-	return JS_UNDEFINED;
+	return ret_or_abort(ctx, JS_UNDEFINED);
 }
 
 static JSValue node_get_inner_html(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	/* Serialising the DOM back to HTML is not implemented; report empty. */
 	(void)this_val;
 	return JS_NewString(ctx, "");
@@ -2131,7 +4309,8 @@ static void listener_trampoline(struct dom_event *evt, void *pw);
 
 static struct dom_document *thread_document(jsthread *thread)
 {
-	if (thread == NULL || thread->htmlc == NULL) {
+	/* a worker has no document, though it shares its page's content */
+	if (thread == NULL || thread->is_worker || thread->htmlc == NULL) {
 		return NULL;
 	}
 	return thread->htmlc->document;
@@ -2369,9 +4548,21 @@ static void sweep_dead_listeners(jsthread *thread)
 }
 
 /** Register func as a listener for event type on node. */
+static JSValue add_listener_to(JSContext *ctx, struct dom_node *node,
+			       bool on_window, JSValueConst type_v,
+			       JSValueConst func, JSValueConst opts);
+
+/** Register func as a listener for event type on node. */
 static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 			    JSValueConst type_v, JSValueConst func,
 			    JSValueConst opts)
+{
+	return add_listener_to(ctx, node, false, type_v, func, opts);
+}
+
+static JSValue add_listener_to(JSContext *ctx, struct dom_node *node,
+			       bool on_window, JSValueConst type_v,
+			       JSValueConst func, JSValueConst opts)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *type;
@@ -2380,7 +4571,11 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	struct dom_event_listener *dl = NULL;
 	bool capture = false, once = false, passive = false;
 
-	if (node == NULL || thread == NULL || !JS_IsFunction(ctx, func)) {
+	/* a function, or an object with handleEvent (VitaSurf): Lit binds
+	 * every @event in its templates with the object form, and those
+	 * were dropped, so no Lit component heard its own clicks */
+	if ((node == NULL && !on_window) || thread == NULL ||
+	    !(JS_IsFunction(ctx, func) || JS_IsObject(func))) {
 		return JS_UNDEFINED;
 	}
 	sweep_dead_listeners(thread);
@@ -2426,7 +4621,9 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 		JS_FreeCString(ctx, type);
 		return JS_UNDEFINED;
 	}
-	if (dom_event_listener_create(listener_trampoline, l, &dl) != DOM_NO_ERR) {
+	/* the window's listeners are run by window_hook, not libdom */
+	if (!on_window &&
+	    dom_event_listener_create(listener_trampoline, l, &dl) != DOM_NO_ERR) {
 		free(l);
 		dom_string_unref(type_dom);
 		JS_FreeCString(ctx, type);
@@ -2434,7 +4631,8 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	}
 	l->thread = thread;
 	l->node = node;
-	dom_node_ref(node);
+	if (node != NULL) dom_node_ref(node);
+	l->on_window = on_window;
 	l->dom_listener = dl;
 	l->func = JS_DupValue(ctx, func);
 	l->type = dom_string_ref(type_dom);
@@ -2446,16 +4644,30 @@ static JSValue add_listener(JSContext *ctx, struct dom_node *node,
 	thread->listener_count++;
 	listener_hash_add(thread, l);
 
-	dom_event_target_add_event_listener(node, type_dom, dl, capture);
+	if (!on_window) {
+		dom_event_target_add_event_listener(node, type_dom, dl,
+						    capture);
+	}
 	dom_string_unref(type_dom);
 	JS_FreeCString(ctx, type);
 	return JS_UNDEFINED;
 }
 
 /** removeEventListener: take off the one that matches, if it is there. */
+static JSValue remove_listener_from(JSContext *ctx, struct dom_node *node,
+				    bool on_window, JSValueConst type_v,
+				    JSValueConst func, JSValueConst opts);
+
 static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 			       JSValueConst type_v, JSValueConst func,
 			       JSValueConst opts)
+{
+	return remove_listener_from(ctx, node, false, type_v, func, opts);
+}
+
+static JSValue remove_listener_from(JSContext *ctx, struct dom_node *node,
+				    bool on_window, JSValueConst type_v,
+				    JSValueConst func, JSValueConst opts)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *type;
@@ -2463,7 +4675,8 @@ static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 	struct js_listener *l;
 	bool capture = false;
 
-	if (node == NULL || thread == NULL || !JS_IsFunction(ctx, func)) {
+	if ((node == NULL && !on_window) || thread == NULL ||
+	    !(JS_IsFunction(ctx, func) || JS_IsObject(func))) {
 		return JS_UNDEFINED;
 	}
 	sweep_dead_listeners(thread);
@@ -2503,6 +4716,7 @@ static JSValue remove_listener(JSContext *ctx, struct dom_node *node,
 static JSValue node_add_event_listener(JSContext *ctx, JSValueConst this_val,
 				       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	if (argc < 2) return JS_UNDEFINED;
 	return add_listener(ctx, this_node(ctx, this_val), argv[0], argv[1],
 			    argc > 2 ? argv[2] : JS_UNDEFINED);
@@ -2511,6 +4725,7 @@ static JSValue node_add_event_listener(JSContext *ctx, JSValueConst this_val,
 static JSValue node_remove_event_listener(JSContext *ctx, JSValueConst this_val,
 					  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	if (argc < 2) return JS_UNDEFINED;
 	return remove_listener(ctx, this_node(ctx, this_val), argv[0], argv[1],
 			       argc > 2 ? argv[2] : JS_UNDEFINED);
@@ -2520,10 +4735,565 @@ static JSValue node_remove_event_listener(JSContext *ctx, JSValueConst this_val,
  * window and document listeners live on the document node: DOMContentLoaded
  * is dispatched there by NetSurf and load bubbles up to it from the body.
  */
+/* ------------------------------------------------------------------------ */
+/* Frames (VitaSurf)                                                        */
+
+/*
+ * An iframe's window runs its scripts in the runtime of the window at the
+ * top of its tree (js_newthread), so script in a frame and in the page
+ * around it can hold each other's objects. These hand prelude.js the raw
+ * global objects; it decides what a page may see of them, by origin.
+ */
+
+static jsthread *content_thread(struct hlcache_handle *h)
+{
+	struct content *c;
+	jsthread *t;
+
+	if (h == NULL || content_get_type(h) != CONTENT_HTML) {
+		return NULL;
+	}
+	c = hlcache_handle_get_content(h);
+	if (c == NULL) {
+		return NULL;
+	}
+	t = ((html_content *)c)->jsthread;
+	if (t == NULL || t->closed || t->ctx == NULL) {
+		return NULL;
+	}
+	return t;
+}
+
+/*
+ * The thread of the page a window shows, while its scripts are running:
+ * the page it is loading once that page has scripts, which is already so
+ * when the page's load event fires, before it replaces the one shown.
+ */
+static jsthread *window_thread(struct browser_window *bw)
+{
+	jsthread *t;
+
+	if (bw == NULL) {
+		return NULL;
+	}
+	t = content_thread(bw->loading_content);
+	return t != NULL ? t : content_thread(bw->current_content);
+}
+
+/*
+ * The page a frame's iframe element is in (VitaSurf). Its parent window
+ * can hold two pages while a new one loads over the one on screen, and
+ * picking by window gave a frame of either page the other as its parent:
+ * claude.ai's frames and the Cloudflare page loading over it held each
+ * other's objects, and a closed page's 70 MB stayed in use.
+ */
+static jsthread *frame_parent_thread(struct browser_window *bw)
+{
+	struct dom_document *doc = NULL;
+	jsthread *t = NULL;
+
+	if (bw == NULL || bw->parent == NULL) {
+		return NULL;
+	}
+	if (bw->frame_node != NULL &&
+	    dom_node_get_owner_document(bw->frame_node, &doc) == DOM_NO_ERR &&
+	    doc != NULL) {
+		jsthread *a = content_thread(bw->parent->loading_content);
+		jsthread *b = content_thread(bw->parent->current_content);
+
+		if (a != NULL && thread_document(a) == doc) {
+			t = a;
+		} else if (b != NULL && thread_document(b) == doc) {
+			t = b;
+		}
+		dom_node_unref(doc);
+		/* the element's page is neither: it is going */
+		return t;
+	}
+	return window_thread(bw->parent);
+}
+
+static JSValue window_global(struct browser_window *bw)
+{
+	jsthread *t = window_thread(bw);
+
+	return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
+}
+
+static struct browser_window *thread_window(JSContext *ctx)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	return thread != NULL ? thread->win : NULL;
+}
+
+/* __vitaFrameGlobal(iframe): the global of the page an iframe shows */
+static JSValue win_vita_frame_global(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	struct browser_window *bw = thread_window(ctx);
+	struct dom_node *node;
+	int i;
+
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1 || bw == NULL) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_NULL;
+	}
+	for (i = 0; i < bw->iframe_count; i++) {
+		if (bw->iframes[i]->frame_node == node) {
+			return window_global(bw->iframes[i]);
+		}
+	}
+	return JS_NULL;
+}
+
+static bool has_frame_window(struct browser_window *bw, struct dom_node *node)
+{
+	int i;
+
+	for (i = 0; i < bw->iframe_count; i++) {
+		if (bw->iframes[i] != NULL &&
+		    bw->iframes[i]->frame_node == node) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * __vitaFrameStart(iframe): the global of an iframe's page, making the
+ * frame's window if layout has not yet (VitaSurf). A frame with no src
+ * has its blank document, and so its global, on return; any other has
+ * only begun to load and gives null until its page has scripts.
+ */
+static JSValue win_vita_frame_start(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct browser_window *bw = thread_window(ctx), *frame = NULL;
+	struct dom_node *node;
+	uint64_t t0;
+	int before;
+
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1 || bw == NULL || thread == NULL) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_NULL;
+	}
+	if (!has_frame_window(bw, node)) {
+		struct browser_window *root = bw;
+
+		while (root->parent != NULL) {
+			root = root->parent;
+		}
+		/* each frame page is a realm: see the cap in frames.h */
+		if (browser_window_frame_count(root) >=
+		    BROWSER_WINDOW_FRAME_CAP) {
+			if (!thread->frame_cap_said) {
+				thread->frame_cap_said = true;
+				vita_log("qjs: %d frames already; script gets a "
+					 "stand-in for more",
+					 BROWSER_WINDOW_FRAME_CAP);
+			}
+			return JS_NULL;
+		}
+	}
+	t0 = now_ms();
+	before = bw->iframe_count;
+	if (browser_window_iframe_now(bw, node, &frame) != NSERROR_OK ||
+	    frame == NULL) {
+		return JS_NULL;
+	}
+	/* A frame's page is a whole realm with the prelude run in it: say
+	 * what one cost, for the first few a page makes. Counting the
+	 * runtime walks the heap, so not for every one. */
+	if (bw->iframe_count > before && window_thread(frame) != NULL &&
+	    thread->frames_logged < 8) {
+		thread->frames_logged++;
+		vita_log("qjs: an iframe's blank page, made for script in %u ms;"
+			 " runtime now %u KB",
+			 (unsigned)(now_ms() - t0), runtime_kb(thread->heap->rt));
+	}
+	return window_global(frame);
+}
+
+/*
+ * __vitaDocBase(): the document's base URL as NetSurf has it (VitaSurf).
+ * A srcdoc or blank frame document's is its parent's, which the page's
+ * own URL cannot tell it.
+ */
+static JSValue win_vita_doc_base(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (thread == NULL || thread->htmlc == NULL ||
+	    thread->htmlc->base_url == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	return JS_NewString(ctx, shown_url(nsurl_access(
+		thread->htmlc->base_url)));
+}
+
+/*
+ * Dedicated workers (VitaSurf). The most a page runs at once: each is a
+ * realm with the prelude in it, like a frame's page.
+ */
+#define WORKER_CAP 4
+
+/*
+ * __vitaWorkerNew(): a new worker's global, or null when the page has as
+ * many as it may, there is no room, or its prelude did not finish. The
+ * prelude's Worker then turns it into a worker's global and runs the
+ * script in it.
+ */
+static JSValue win_vita_worker_new(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *owner = JS_GetContextOpaque(ctx), *w;
+	unsigned int n = 0;
+	uint64_t t0;
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	/* a worker making a worker is not supported */
+	if (owner == NULL || owner->closed || owner->is_worker) {
+		return JS_NULL;
+	}
+	for (w = owner->workers; w != NULL; w = w->worker_next) {
+		if (!w->worker_closing) {
+			n++;
+		}
+	}
+	if (n >= WORKER_CAP) {
+		vita_log("qjs: %u workers already; no more", n);
+		return JS_NULL;
+	}
+	if (!realm_room("a worker")) {
+		return JS_NULL;
+	}
+	t0 = now_ms();
+	w = thread_make(owner->heap, owner->win, owner->htmlc, true);
+	if (w == NULL) {
+		return JS_NULL;
+	}
+	/* from here on it has no document */
+	w->is_worker = true;
+	w->owner = owner;
+	w->ready_state = "complete";
+	w->worker_next = owner->workers;
+	owner->workers = w;
+	vita_log("qjs: a worker's realm, made in %u ms; runtime now %u KB",
+		 (unsigned)(now_ms() - t0), runtime_kb(owner->heap->rt));
+	return JS_GetGlobalObject(w->ctx);
+}
+
+static void worker_unlink(jsthread *w)
+{
+	jsthread **pp;
+
+	if (w->owner == NULL) {
+		return;
+	}
+	for (pp = &w->owner->workers; *pp != NULL; pp = &(*pp)->worker_next) {
+		if (*pp == w) {
+			*pp = w->worker_next;
+			break;
+		}
+	}
+	w->owner = NULL;
+	w->worker_next = NULL;
+}
+
+static void worker_close_cb(void *p)
+{
+	jsthread *w = p;
+
+	worker_unlink(w);
+	js_destroythread(w);
+}
+
+/*
+ * __vitaWorkerClose(global): end the worker whose global this is, from
+ * its page (terminate) or from itself (close). Its realm goes at the
+ * next turn of the scheduler, not under the script calling this.
+ */
+static JSValue win_vita_worker_close(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *me = JS_GetContextOpaque(ctx), *owner, *w;
+
+	C_WHERE;
+	(void)this_val;
+	if (me == NULL || argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	owner = me->is_worker ? me->owner : me;
+	for (w = owner != NULL ? owner->workers : NULL; w != NULL;
+	     w = w->worker_next) {
+		JSValue g;
+		bool same;
+
+		if (w->worker_closing || w->closed) {
+			continue;
+		}
+		g = JS_GetGlobalObject(w->ctx);
+		same = JS_VALUE_GET_PTR(g) == JS_VALUE_GET_PTR(argv[0]);
+		JS_FreeValue(ctx, g);
+		if (same) {
+			w->worker_closing = true;
+			/* its timers stop now; the realm goes shortly */
+			guit->misc->schedule(0, worker_close_cb, w);
+			break;
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+struct sync_body {
+	char *data;
+	size_t len;
+	size_t cap;
+	bool over;
+};
+
+/* A script importScripts() waits for is at most this big. */
+#define SYNC_FETCH_MAX (8u * 1024u * 1024u)
+
+static size_t sync_write(char *p, size_t size, size_t n, void *ud)
+{
+	struct sync_body *b = ud;
+	size_t len = size * n;
+
+	if (b->len + len > SYNC_FETCH_MAX) {
+		b->over = true;
+		return 0;
+	}
+	if (b->len + len + 1 > b->cap) {
+		size_t cap = b->cap != 0 ? b->cap : 16384;
+		char *d;
+
+		while (cap < b->len + len + 1) {
+			cap *= 2;
+		}
+		d = realloc(b->data, cap);
+		if (d == NULL) {
+			return 0;
+		}
+		b->data = d;
+		b->cap = cap;
+	}
+	memcpy(b->data + b->len, p, len);
+	b->len += len;
+	b->data[b->len] = '\0';
+	return len;
+}
+
+/*
+ * __vitaFetchSync(url): [status, text] for a worker's importScripts(),
+ * or null if it could not be fetched. importScripts() is synchronous and
+ * NetSurf's fetches are not, so this is the one fetch that blocks: the
+ * whole browser waits for it, as a worker thread would in a browser. It
+ * starts from the same curl handle every fetch does.
+ */
+static JSValue win_vita_fetch_sync(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct sync_body body = { NULL, 0, 0, false };
+	const char *url;
+	CURL *c;
+	CURLcode rc;
+	long status = 0;
+	uint64_t t0;
+	JSValue r = JS_NULL;
+
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1 || thread == NULL) {
+		return JS_NULL;
+	}
+	url = JS_ToCString(ctx, argv[0]);
+	if (url == NULL) {
+		return JS_EXCEPTION;
+	}
+	c = fetch_curl_blank_dup();
+	if (c == NULL) {
+		c = curl_easy_init();
+	}
+	if (c == NULL) {
+		JS_FreeCString(ctx, url);
+		return JS_NULL;
+	}
+	t0 = now_ms();
+	curl_easy_setopt(c, CURLOPT_URL, url);
+	curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
+	curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(c, CURLOPT_MAXREDIRS, 10L);
+	curl_easy_setopt(c, CURLOPT_TIMEOUT, 20L);
+	curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+	curl_easy_setopt(c, CURLOPT_USERAGENT, user_agent_string());
+	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sync_write);
+	curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
+	curl_easy_setopt(c, CURLOPT_PRIVATE, NULL);
+	curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, NULL);
+	curl_easy_setopt(c, CURLOPT_PROGRESSFUNCTION, NULL);
+	curl_easy_setopt(c, CURLOPT_NOPROGRESS, 1L);
+	rc = curl_easy_perform(c);
+	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+	curl_easy_cleanup(c);
+	vita_log("qjs: a worker's script waited %u ms for %u KB (%s, "
+		 "status %d)",
+		 (unsigned)(now_ms() - t0), (unsigned)(body.len / 1024),
+		 rc == CURLE_OK ? "ok" : curl_easy_strerror(rc), (int)status);
+	if (rc == CURLE_OK && !body.over) {
+		/* a file: URL has no status; it read, so it is there */
+		if (status == 0) {
+			status = 200;
+		}
+		r = JS_NewArray(ctx);
+		JS_SetPropertyUint32(ctx, r, 0, JS_NewInt32(ctx, (int32_t)status));
+		JS_SetPropertyUint32(ctx, r, 1, JS_NewStringLen(ctx,
+			body.data != NULL ? body.data : "", body.len));
+	}
+	free(body.data);
+	JS_FreeCString(ctx, url);
+	return r;
+}
+
+/* __vitaParentGlobal(): the global of the page around this frame */
+static JSValue win_vita_parent_global(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	struct browser_window *bw = thread_window(ctx);
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	{
+		jsthread *t = frame_parent_thread(bw);
+
+		return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
+	}
+}
+
+/* __vitaTopGlobal(): the global of the page at the top of the tree */
+static JSValue win_vita_top_global(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	struct browser_window *bw = thread_window(ctx);
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (bw == NULL || bw->parent == NULL) {
+		return JS_NULL;
+	}
+	{
+		jsthread *t = NULL;
+
+		/* page by page up the iframe elements, as parent does */
+		while (bw->parent != NULL) {
+			t = frame_parent_thread(bw);
+			bw = bw->parent;
+		}
+		return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
+	}
+}
+
+/* __vitaFrameElement(): this frame's iframe element, in the parent page */
+static JSValue win_vita_frame_element(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	struct browser_window *bw = thread_window(ctx);
+	jsthread *t;
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (bw == NULL || bw->parent == NULL || bw->frame_node == NULL) {
+		return JS_NULL;
+	}
+	t = frame_parent_thread(bw);
+	return t != NULL ? wrap_node(t->ctx, bw->frame_node) : JS_NULL;
+}
+
+/*
+ * __vitaEntryGlobal(): the global of the page whose script was entered
+ * from outside, which for a message is the window that sent it.
+ */
+static JSValue win_vita_entry_global(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	jsthread *entry;
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (thread == NULL) {
+		return JS_NULL;
+	}
+	entry = thread->heap->interrupt_thread;
+	if (entry == NULL || entry->closed || entry->ctx == NULL) {
+		entry = thread;
+	}
+	return JS_GetGlobalObject(entry->ctx);
+}
+
+/*
+ * Whether libcss holds a supports condition, for CSS.supports()
+ * (VitaSurf). It was a stub that said no to everything, even to
+ * "color: red", which is how a page decides this browser cannot run it.
+ */
+static JSValue win_vita_css_supports(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	const char *text;
+	size_t len = 0;
+	bool yes = false;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_FALSE;
+	}
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (text == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (css_supports(text, len, &yes) != CSS_OK) {
+		yes = false;
+	}
+	JS_FreeCString(ctx, text);
+	return JS_NewBool(ctx, yes);
+}
+
 /* The same encoding, reachable from the prelude as a global. */
 static JSValue win_vita_encoding(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *enc = NULL;
 
@@ -2536,6 +5306,7 @@ static JSValue win_vita_encoding(JSContext *ctx, JSValueConst this_val,
 
 static JSValue doc_get_ready_state(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	(void)this_val;
@@ -2546,6 +5317,7 @@ static JSValue doc_get_ready_state(JSContext *ctx, JSValueConst this_val)
 static JSValue doc_add_event_listener(JSContext *ctx, JSValueConst this_val,
 				      int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	(void)this_val;
@@ -2559,6 +5331,7 @@ static JSValue doc_add_event_listener(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_remove_event_listener(JSContext *ctx, JSValueConst this_val,
 					 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 
 	(void)this_val;
@@ -2568,9 +5341,37 @@ static JSValue doc_remove_event_listener(JSContext *ctx, JSValueConst this_val,
 			       argc > 2 ? argv[2] : JS_UNDEFINED);
 }
 
+/*
+ * The window's listeners (VitaSurf). They lived on the document node, so
+ * the window's bubbling listeners ran among the document's in the order
+ * they were added -- before a document listener that could stop the
+ * event -- and a window's own event reached document listeners too.
+ */
+static JSValue win_add_event_listener(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	(void)this_val;
+	if (argc < 2) return JS_UNDEFINED;
+	return add_listener_to(ctx, NULL, true, argv[0], argv[1],
+			       argc > 2 ? argv[2] : JS_UNDEFINED);
+}
+
+static JSValue win_remove_event_listener(JSContext *ctx,
+					 JSValueConst this_val,
+					 int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	(void)this_val;
+	if (argc < 2) return JS_UNDEFINED;
+	return remove_listener_from(ctx, NULL, true, argv[0], argv[1],
+				    argc > 2 ? argv[2] : JS_UNDEFINED);
+}
+
 static JSValue noop(JSContext *ctx, JSValueConst this_val,
 		    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)ctx; (void)this_val; (void)argc; (void)argv;
 	return JS_UNDEFINED;
 }
@@ -2594,6 +5395,7 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CGETSET_DEF("childNodes", node_get_child_nodes, NULL),
 	JS_CGETSET_DEF("nodeValue", node_get_node_value, node_set_node_value),
 	JS_CGETSET_DEF("attributes", node_get_attributes, NULL),
+	JS_CFUNC_DEF("__vitaAttrStamp", 0, node_attr_stamp),
 	JS_CFUNC_DEF("getAttribute", 1, node_get_attribute),
 	JS_CFUNC_DEF("setAttribute", 2, node_set_attribute),
 	JS_CFUNC_DEF("hasAttribute", 1, node_has_attribute),
@@ -2620,35 +5422,252 @@ static const JSCFunctionListEntry node_proto[] = {
 /* ------------------------------------------------------------------------ */
 /* document                                                                 */
 
+/*
+ * getElementById by index (VitaSurf). libdom answers it by walking the
+ * document from the top, reading every element's id attribute on the
+ * way, and GitHub spent 5 s of one stall in those walks. The index maps
+ * each id to the first element carrying it, built by one walk. While
+ * vita_id_gen has not moved it is exact, misses included. After the
+ * tree has changed, an entry is still used when its element still has
+ * that id and is still in the document; only a miss walks again, and
+ * that walk rebuilds the whole index.
+ */
+struct id_entry {
+	struct id_entry *next;
+	dom_string *id;
+	struct dom_node *el;
+	uint32_t hash;
+};
+
+static void id_index_free(jsthread *thread)
+{
+	uint32_t b;
+
+	for (b = 0; b < thread->id_idx_nb; b++) {
+		while (thread->id_idx[b] != NULL) {
+			struct id_entry *e = thread->id_idx[b];
+
+			thread->id_idx[b] = e->next;
+			dom_string_unref(e->id);
+			dom_node_unref(e->el);
+			free(e);
+		}
+	}
+	free(thread->id_idx);
+	thread->id_idx = NULL;
+	thread->id_idx_nb = 0;
+	thread->id_idx_n = 0;
+	thread->id_idx_built = false;
+}
+
+static struct id_entry *id_index_find(jsthread *thread, dom_string *id,
+				      uint32_t h)
+{
+	struct id_entry *e;
+
+	if (thread->id_idx_nb == 0) {
+		return NULL;
+	}
+	for (e = thread->id_idx[h & (thread->id_idx_nb - 1)]; e != NULL;
+	     e = e->next) {
+		if (e->hash == h && dom_string_isequal(e->id, id)) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+static void id_index_grow(jsthread *thread)
+{
+	uint32_t nb = thread->id_idx_nb != 0 ? thread->id_idx_nb * 2 : 256;
+	struct id_entry **nt = calloc(nb, sizeof(*nt));
+	uint32_t b;
+
+	if (nt == NULL) {
+		return;
+	}
+	for (b = 0; b < thread->id_idx_nb; b++) {
+		while (thread->id_idx[b] != NULL) {
+			struct id_entry *e = thread->id_idx[b];
+
+			thread->id_idx[b] = e->next;
+			e->next = nt[e->hash & (nb - 1)];
+			nt[e->hash & (nb - 1)] = e;
+		}
+	}
+	free(thread->id_idx);
+	thread->id_idx = nt;
+	thread->id_idx_nb = nb;
+}
+
+/* Record el under id unless an earlier element already holds it. */
+static void id_index_add(jsthread *thread, dom_string *id, struct dom_node *el)
+{
+	uint32_t h = dom_string_hash(id);
+	struct id_entry *e;
+
+	if (id_index_find(thread, id, h) != NULL) {
+		return;
+	}
+	if (thread->id_idx_n >= thread->id_idx_nb) {
+		id_index_grow(thread);
+		if (thread->id_idx_nb == 0) {
+			return;
+		}
+	}
+	e = malloc(sizeof(*e));
+	if (e == NULL) {
+		return;
+	}
+	e->id = dom_string_ref(id);
+	e->el = dom_node_ref(el);
+	e->hash = h;
+	e->next = thread->id_idx[h & (thread->id_idx_nb - 1)];
+	thread->id_idx[h & (thread->id_idx_nb - 1)] = e;
+	thread->id_idx_n++;
+}
+
+/* One pre-order walk of the document, recording every id. */
+static void id_index_build(jsthread *thread, struct dom_node *root)
+{
+	uint64_t t0 = now_ms();
+	struct dom_node *n = NULL;
+
+	id_index_free(thread);
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+		dom_node_type type = DOM_TEXT_NODE;
+
+		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			dom_string *id = NULL;
+
+			dom_element_get_attribute(n, corestring_dom_id, &id);
+			if (id != NULL) {
+				if (dom_string_byte_length(id) > 0) {
+					id_index_add(thread, id, n);
+				}
+				dom_string_unref(id);
+			}
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	thread->id_idx_built = true;
+	thread->id_idx_gen = vita_id_gen;
+	id_builds++;
+	id_build_ms += (unsigned int)(now_ms() - t0);
+}
+
+/* Whether el still carries id and still hangs from doc. */
+static bool id_entry_holds(struct id_entry *e, struct dom_node *doc)
+{
+	dom_string *now = NULL;
+	struct dom_node *cur;
+	bool same;
+
+	dom_element_get_attribute(e->el, corestring_dom_id, &now);
+	if (now == NULL) {
+		return false;
+	}
+	same = dom_string_isequal(now, e->id);
+	dom_string_unref(now);
+	if (!same) {
+		return false;
+	}
+	cur = dom_node_ref(e->el);
+	while (cur != NULL) {
+		struct dom_node *parent = NULL;
+
+		if (cur == doc) {
+			dom_node_unref(cur);
+			return true;
+		}
+		if (dom_node_get_parent_node(cur, &parent) != DOM_NO_ERR) {
+			parent = NULL;
+		}
+		dom_node_unref(cur);
+		cur = parent;
+	}
+	return false;
+}
+
 static JSValue doc_get_element_by_id(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *id;
 	dom_string *key;
-	struct dom_element *el = NULL;
-	JSValue r;
+	struct id_entry *e;
+	uint32_t h;
+	JSValue r = JS_NULL;
 
 	(void)this_val;
 	if (doc == NULL || argc < 1) return JS_NULL;
 	id = JS_ToCString(ctx, argv[0]);
 	key = to_dom_string(id);
+	if (id) JS_FreeCString(ctx, id);
 	if (key == NULL) {
-		if (id) JS_FreeCString(ctx, id);
 		return JS_NULL;
 	}
-	dom_document_get_element_by_id(doc, key, &el);
+	id_calls++;
+	if (dom_string_byte_length(key) == 0) {
+		dom_string_unref(key);
+		return JS_NULL;
+	}
+	h = dom_string_hash(key);
+	e = thread->id_idx_built ? id_index_find(thread, key, h) : NULL;
+	if (thread->id_idx_built && thread->id_idx_gen == vita_id_gen) {
+		id_exact++;
+	} else if (e != NULL && id_entry_holds(e, (struct dom_node *)doc)) {
+		id_hits++;
+	} else {
+		id_index_build(thread, (struct dom_node *)doc);
+		e = id_index_find(thread, key, h);
+	}
+	if (e != NULL) {
+		r = wrap_node(ctx, e->el);
+	}
 	dom_string_unref(key);
-	JS_FreeCString(ctx, id);
-	r = wrap_node(ctx, (struct dom_node *)el);
-	if (el != NULL) dom_node_unref((struct dom_node *)el);
 	return r;
 }
 
 static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_val,
 					    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *name;
@@ -2676,7 +5695,12 @@ static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_va
 		k.tag[len] = 0;
 	}
 	JS_FreeCString(ctx, name);
+	len = find_visits;
 	out = find_in_subtree(ctx, (struct dom_node *)doc, &k, 1);
+	walk_cost_note("document.getElementsByTagName",
+		       k.tag != NULL ? k.tag : "*",
+		       strlen(k.tag != NULL ? k.tag : "*"),
+		       find_visits - (uint32_t) len, true);
 	free(k.tag);
 	return out;
 }
@@ -2684,6 +5708,7 @@ static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_va
 static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *name;
@@ -2710,6 +5735,7 @@ static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *text;
@@ -2745,6 +5771,7 @@ static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_element_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *nsheld = NULL, *qname;
@@ -2779,6 +5806,7 @@ static JSValue doc_create_element_ns(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_document(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	const char *ns = NULL, *qname = NULL;
 	struct dom_document_type *dt = NULL;
 	struct dom_document *doc = NULL;
@@ -2824,6 +5852,7 @@ static JSValue doc_create_document(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_doctype(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	const char *qname = NULL, *pub = NULL, *sys = NULL;
 	struct dom_document_type *dt = NULL;
 	JSValue r;
@@ -2861,6 +5890,7 @@ static JSValue doc_create_doctype(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_comment(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *text;
@@ -2888,6 +5918,7 @@ static JSValue doc_create_comment(JSContext *ctx, JSValueConst this_val,
 static JSValue doc_create_document_fragment(JSContext *ctx, JSValueConst this_val,
 					    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	struct dom_document_fragment *frag = NULL;
@@ -2908,6 +5939,7 @@ static JSValue doc_create_document_fragment(JSContext *ctx, JSValueConst this_va
  */
 static JSValue doc_get_current_script(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	struct dom_nodelist *list = NULL;
@@ -2956,6 +5988,7 @@ static JSValue doc_get_current_script(JSContext *ctx, JSValueConst this_val)
 
 static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	struct dom_html_element *body = NULL;
@@ -2971,6 +6004,7 @@ static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 
 static JSValue doc_get_title(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	dom_string *s = NULL;
@@ -2983,6 +6017,7 @@ static JSValue doc_get_title(JSContext *ctx, JSValueConst this_val)
 
 static JSValue doc_set_title(JSContext *ctx, JSValueConst this_val, JSValueConst v)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	const char *s = JS_ToCString(ctx, v);
@@ -3002,6 +6037,7 @@ static JSValue doc_set_title(JSContext *ctx, JSValueConst this_val, JSValueConst
 
 static JSValue doc_get_cookie(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	nsurl *url = NULL;
 	char *cookies;
@@ -3025,6 +6061,7 @@ static JSValue doc_get_cookie(JSContext *ctx, JSValueConst this_val)
 
 static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueConst v)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	nsurl *url = NULL;
 	const char *s = JS_ToCString(ctx, v);
@@ -3042,6 +6079,7 @@ static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueCons
 
 static JSValue doc_get_document_element(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_document *doc = thread_document(thread);
 	struct dom_element *el = NULL;
@@ -3081,6 +6119,7 @@ static const JSCFunctionListEntry document_proto[] = {
 static JSValue console_log(JSContext *ctx, JSValueConst this_val,
 			   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	int i;
 	char line[512];
 	size_t pos = 0;
@@ -3133,11 +6172,59 @@ static nsurl *script_page_url(jsthread *thread)
 }
 
 
+/*
+ * Go where a script asked, once it has returned (VitaSurf). Navigating
+ * from inside the script stopped the page there and then when it was
+ * still loading -- a stylesheet outstanding is enough -- which freed
+ * the context the script was running in and crashed on the way back
+ * out. A browser queues the navigation too; the last one asked wins.
+ */
+static void nav_callback(void *p)
+{
+	jsthread *thread = p;
+	nsurl *url = thread->nav_pending;
+
+	thread->nav_pending = NULL;
+	if (url == NULL) {
+		return;
+	}
+	if (thread->win != NULL && !thread->closed) {
+		/* may destroy this thread; do not touch it after */
+		browser_window_navigate(thread->win, url, NULL,
+					BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
+	}
+	nsurl_unref(url);
+}
+
+/* whether a URL is the browser's file browser, about:files */
+static bool is_file_browser(nsurl *url)
+{
+	lwc_string *scheme = nsurl_get_component(url, NSURL_SCHEME);
+	lwc_string *path = nsurl_get_component(url, NSURL_PATH);
+	bool about = false, files = false;
+
+	if (scheme != NULL) {
+		if (lwc_string_caseless_isequal(scheme, corestring_lwc_about,
+						&about) != lwc_error_ok) {
+			about = false;
+		}
+		lwc_string_unref(scheme);
+	}
+	if (path != NULL) {
+		files = lwc_string_length(path) == 5 &&
+			strncasecmp(lwc_string_data(path), "files", 5) == 0;
+		lwc_string_unref(path);
+	}
+	return about && files;
+}
+
 static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 {
 	nsurl *cur = NULL, *url = NULL;
 
-	if (thread == NULL || thread->win == NULL || href == NULL) {
+	/* a worker shares its page's window but cannot take it anywhere */
+	if (thread == NULL || thread->win == NULL || href == NULL ||
+	    thread->is_worker) {
 		return JS_UNDEFINED;
 	}
 	/*
@@ -3154,18 +6241,72 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 	} else {
 		nsurl_create(href, &url);
 	}
+	/*
+	 * The file browser (about:files) is the browser's own page: the
+	 * about: fetcher refuses a fetch a page made, but a script's
+	 * navigation carries no referer, so it is refused here (VitaSurf).
+	 */
+	if (url != NULL && is_file_browser(url)) {
+		vita_log("qjs: script may not navigate to %s",
+			 nsurl_access(url));
+		nsurl_unref(url);
+		url = NULL;
+	}
 	if (url != NULL) {
 		vita_log("qjs: script navigates to %s", nsurl_access(url));
-		browser_window_navigate(thread->win, url, NULL,
-					BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
-		nsurl_unref(url);
+		/* and from where: a page that sends itself somewhere
+		 * unexpected is otherwise a mystery in the log (VitaSurf) */
+		if (ctx != NULL) {
+			JSValue st = JS_Eval(ctx, "new Error().stack", 17,
+					     "<nav>", JS_EVAL_TYPE_GLOBAL);
+
+			if (JS_IsString(st)) {
+				const char *str = JS_ToCString(ctx, st);
+
+				if (str != NULL) {
+					vita_log("qjs: navigation from %.600s", str);
+					JS_FreeCString(ctx, str);
+				}
+			} else if (JS_IsException(st)) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+			}
+			JS_FreeValue(ctx, st);
+		}
+		if (thread->nav_pending != NULL) {
+			nsurl_unref(thread->nav_pending);
+		}
+		thread->nav_pending = url;
+		guit->misc->schedule(0, nav_callback, thread);
 	}
 	(void)ctx;
 	return JS_UNDEFINED;
 }
 
+/** Where the location object itself is kept, out of the page's way. */
+#define VITA_LOCATION_SLOT "__vitaLocation"
+
+/*
+ * The URL a page is told it has (VitaSurf). An iframe's srcdoc and blank
+ * documents load from about: URLs that name the frame, and carry a token
+ * other pages must not learn; the page sees about:srcdoc or about:blank,
+ * as in a browser.
+ */
+static const char *shown_url(const char *url)
+{
+	if (strncmp(url, "about:srcdoc?vitasurf-frame=",
+		    SLEN("about:srcdoc?vitasurf-frame=")) == 0) {
+		return "about:srcdoc";
+	}
+	if (strncmp(url, "about:blank?vitasurf-frame=",
+		    SLEN("about:blank?vitasurf-frame=")) == 0) {
+		return "about:blank";
+	}
+	return url;
+}
+
 static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	nsurl *page = script_page_url(thread);
 	nsurl *url = NULL;
@@ -3173,7 +6314,7 @@ static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 
 	(void)this_val;
 	if (page != NULL) {
-		return JS_NewString(ctx, nsurl_access(page));
+		return JS_NewString(ctx, shown_url(nsurl_access(page)));
 	}
 
 	if (thread == NULL || thread->win == NULL) return JS_NewString(ctx, "");
@@ -3181,13 +6322,14 @@ static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 	    url == NULL) {
 		return JS_NewString(ctx, "");
 	}
-	r = JS_NewString(ctx, nsurl_access(url));
+	r = JS_NewString(ctx, shown_url(nsurl_access(url)));
 	nsurl_unref(url);
 	return r;
 }
 
 static JSValue loc_set_href(JSContext *ctx, JSValueConst this_val, JSValueConst v)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *s = JS_ToCString(ctx, v);
 	JSValue r;
@@ -3198,9 +6340,66 @@ static JSValue loc_set_href(JSContext *ctx, JSValueConst this_val, JSValueConst 
 	return r;
 }
 
+/*
+ * Assigning to window.location or document.location itself, which is
+ * how a great many pages redirect (VitaSurf).
+ *
+ * It used to be a plain property holding the location object, so
+ * "window.location = url" replaced the object with a string and went
+ * nowhere: a PHP page titled REDIR sat there having done nothing, with
+ * no error and no line in the log to say why. The property is an
+ * accessor now, so the assignment navigates like location.href does.
+ * The getter hands back the object kept under a hidden name, so
+ * location.href and the rest are unchanged.
+ */
+static JSValue win_get_location(JSContext *ctx, JSValueConst this_val)
+{
+	C_WHERE;
+	return JS_GetPropertyStr(ctx, this_val, VITA_LOCATION_SLOT);
+}
+
+static JSValue win_set_location(JSContext *ctx, JSValueConst this_val,
+				JSValueConst v)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *s;
+	JSValue r;
+
+	(void)this_val;
+	/*
+	 * An object is what the page gets back from the getter, so
+	 * "location = location" must not be read as a URL.
+	 */
+	if (JS_IsObject(v)) {
+		return JS_UNDEFINED;
+	}
+	s = JS_ToCString(ctx, v);
+	r = win_navigate(ctx, thread, s);
+	if (s) JS_FreeCString(ctx, s);
+	return r;
+}
+
+/** Put the location object on an object under an accessor, so that
+ * assigning to it navigates. */
+static void install_location(JSContext *ctx, JSValueConst on, JSValue loc)
+{
+	JSAtom name = JS_NewAtom(ctx, "location");
+
+	JS_SetPropertyStr(ctx, on, VITA_LOCATION_SLOT, loc);
+	JS_DefinePropertyGetSet(ctx, on, name,
+		JS_NewCFunction2(ctx, (JSCFunction *)win_get_location,
+				 "get location", 0, JS_CFUNC_getter, 0),
+		JS_NewCFunction2(ctx, (JSCFunction *)win_set_location,
+				 "set location", 1, JS_CFUNC_setter, 0),
+		JS_PROP_ENUMERABLE);
+	JS_FreeAtom(ctx, name);
+}
+
 static JSValue loc_assign(JSContext *ctx, JSValueConst this_val,
 			  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *s;
 	JSValue r;
@@ -3219,9 +6418,51 @@ static const JSCFunctionListEntry location_proto[] = {
 	JS_CFUNC_DEF("replace", 1, loc_assign),
 };
 
+/*
+ * Home Assistant chooses its build in page script, from navigator.userAgent:
+ * Chrome 129 or later and the like get frontend_latest, and anything else,
+ * this device's own string included, gets frontend_es5, which is bigger and
+ * transpiled for engines older than QuickJS. A page that preloads
+ * /frontend_latest/ is Home Assistant's, and script on it is told a current
+ * Chrome. Requests keep the device's string (VitaSurf).
+ */
+static const char ha_modern_ua[] =
+	"Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36 "
+	"(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+
+static bool page_is_home_assistant(jsthread *thread)
+{
+	unsigned int i;
+
+	if (thread == NULL || thread->htmlc == NULL) {
+		return false;
+	}
+	for (i = 0; i < thread->htmlc->scripts_count; i++) {
+		struct html_script *sc = &thread->htmlc->scripts[i];
+
+		if (sc->type == HTML_SCRIPT_PRELOAD && sc->asked != NULL &&
+		    strstr(nsurl_access(sc->asked), "/frontend_latest/") !=
+				NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static JSValue nav_get_user_agent(JSContext *ctx, JSValueConst this_val)
 {
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
 	(void)this_val;
+	if (nsoption_bool(ha_latest) && page_is_home_assistant(thread)) {
+		if (!thread->told_modern_ua) {
+			thread->told_modern_ua = true;
+			vita_log("qjs: a Home Assistant page: script is told "
+				 "Chrome 140, so it loads frontend_latest");
+		}
+		return JS_NewString(ctx, ha_modern_ua);
+	}
 	return JS_NewString(ctx, user_agent_string());
 }
 
@@ -3240,13 +6481,37 @@ static void timer_callback(void *p);
 static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 			     int argc, JSValueConst *argv, int repeat)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_timer *t;
 	int32_t ms = 0;
 
+	JSValue code = JS_UNDEFINED;
+
 	(void)this_val;
-	if (thread == NULL || argc < 1 || !JS_IsFunction(ctx, argv[0])) {
+	if (thread == NULL || argc < 1) {
 		return JS_NewInt32(ctx, 0);
+	}
+	/*
+	 * A string is code to run when the timer fires (VitaSurf). Old
+	 * pages write setTimeout("go()", 500); a captive portal's
+	 * "Please wait" page redirected that way and sat there, because
+	 * anything but a function was dropped.
+	 */
+	if (!JS_IsFunction(ctx, argv[0])) {
+		const char *s;
+
+		code = JS_ToString(ctx, argv[0]);
+		if (JS_IsException(code)) {
+			return JS_EXCEPTION;
+		}
+		/* rare, and usually the redirect a stuck page wanted */
+		s = JS_ToCString(ctx, code);
+		if (s != NULL) {
+			vita_log("qjs: %s given code as a string: '%.100s'",
+				 repeat ? "setInterval" : "setTimeout", s);
+			JS_FreeCString(ctx, s);
+		}
 	}
 	if (argc >= 2) {
 		JS_ToInt32(ctx, &ms, argv[1]);
@@ -3255,10 +6520,26 @@ static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 
 	t = calloc(1, sizeof(*t));
 	if (t == NULL) {
+		JS_FreeValue(ctx, code);
 		return JS_NewInt32(ctx, 0);
 	}
 	t->thread = thread;
-	t->func = JS_DupValue(ctx, argv[0]);
+	t->func = JS_IsUndefined(code) ? JS_DupValue(ctx, argv[0]) : code;
+	t->args = JS_UNDEFINED;
+	/* setTimeout(fn, ms, a, b) calls fn(a, b) */
+	if (argc > 2 && JS_IsUndefined(code)) {
+		t->args = JS_NewArray(ctx);
+		if (!JS_IsException(t->args)) {
+			int i;
+
+			for (i = 2; i < argc; i++) {
+				JS_SetPropertyUint32(ctx, t->args, i - 2,
+						     JS_DupValue(ctx, argv[i]));
+			}
+		} else {
+			t->args = JS_UNDEFINED;
+		}
+	}
 	t->interval_ms = repeat ? ms : 0;
 	t->handle = next_timer_handle++;
 	t->next = thread->timers;
@@ -3271,18 +6552,21 @@ static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 static JSValue win_set_timeout(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	return win_set_timer(ctx, this_val, argc, argv, 0);
 }
 
 static JSValue win_set_interval(JSContext *ctx, JSValueConst this_val,
 				int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	return win_set_timer(ctx, this_val, argc, argv, 1);
 }
 
 static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_timer *t;
 	int32_t handle = 0;
@@ -3312,36 +6596,63 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
  * handler -- so a bundle that takes longer to compile than the whole
  * budget must not have that time charged against its run.
  */
+/*
+ * How many seconds the next piece of work gets. Less each time this
+ * page has had a script stopped.
+ *
+ * Twenty seconds is a long time to let a script run, and it is meant to
+ * be generous enough that a page doing real work on a slow processor is
+ * never cut off. A page that has already had a script stopped is not
+ * that page: on YouTube two scripts each ran the full twenty seconds
+ * and were killed, forty seconds of a hundred-and-six second load that
+ * produced nothing, and the page rendered anyway. So halve it after
+ * each one, down to five seconds, which bounds what a runaway costs
+ * without touching a page that never overruns -- and almost none do.
+ */
+static unsigned budget_secs(jsthread *thread)
+{
+	unsigned secs, halvings;
+
+	if (thread->heap->timeout <= 0) {
+		return 0;
+	}
+	secs = (unsigned)thread->heap->timeout;
+	halvings = thread->scripts_killed;
+	if (halvings > 2) {
+		halvings = 2;
+	}
+	secs >>= halvings;
+#ifdef __vita__
+	/* never below five seconds on the device, however many scripts
+	 * have been stopped; the native harness keeps what it was given
+	 * so a test can drive a budget of one second (VitaSurf) */
+	if (secs < 5) {
+		secs = 5;
+	}
+#endif
+	if (secs == 0) {
+		secs = 1;
+	}
+	return secs;
+}
+
 static void rearm_deadline(jsthread *thread)
 {
+	unsigned secs = budget_secs(thread);
+
+
 	thread->aborting = false;
 	thread->overrun_count = 0;
 	thread->overrun_said_ms = 0;
-	if (thread->heap->timeout > 0) {
-		/*
-		 * Less each time this page has had a script stopped.
-		 *
-		 * Twenty seconds is a long time to let a script run, and
-		 * it is meant to be generous enough that a page doing real
-		 * work on a slow processor is never cut off. A page that
-		 * has already had a script stopped is not that page: on
-		 * YouTube two scripts each ran the full twenty seconds and
-		 * were killed, forty seconds of a hundred-and-six second
-		 * load that produced nothing, and the page rendered anyway.
-		 * So halve it after each one, down to five seconds, which
-		 * bounds what a runaway costs without touching a page that
-		 * never overruns -- and almost none do.
-		 */
-		unsigned secs = (unsigned)thread->heap->timeout;
-		unsigned halvings = thread->scripts_killed;
-
-		if (halvings > 2) {
-			halvings = 2;
-		}
-		secs >>= halvings;
-		if (secs < 5) {
-			secs = 5;
-		}
+	/* The handler belongs to the heap, and whichever thread was made
+	 * last took it; a page's scripts run under their own (VitaSurf). */
+	if (thread->heap->interrupt_thread != thread) {
+		JS_SetInterruptHandler(thread->heap->rt, qjs_interrupt, thread);
+		thread->heap->interrupt_thread = thread;
+	}
+	/* the profile's clock starts with the script, not the idle before */
+	prof_last_ms = prof_last_call_ms = now_ms();
+	if (secs != 0) {
 		thread->deadline_ms = now_ms() + (uint64_t)secs * 1000;
 	} else {
 		thread->deadline_ms = 0;
@@ -3385,18 +6696,74 @@ enum script_why {
 };
 static enum script_why script_why;
 
+/*
+ * When script last ran, for the compiled script cache to write its
+ * entries out while nothing is (VitaSurf); see bc_flush_callback.
+ */
+static uint64_t bc_last_activity_ms;
+
 static void begin_script(jsthread *thread, enum script_why why)
 {
 	if (thread->script_depth++ > 0) {
+		if (thread->draining) {
+			jobs_reentered++;
+		}
 		return;
 	}
 	script_why = why;
+	/* for the busy sampling: what the frames are spent in (VitaSurf) */
+	thread->phase_was = vitasurf_phase;
+	vitasurf_phase = why == SCRIPT_TIMER ? "script: a timer" :
+			 why == SCRIPT_EVENT ? "script: an event" :
+			 why == SCRIPT_XHR ? "script: a fetch callback" :
+			 "script: a script element";
 	vita_dom_gen++;	/* the parser may have added nodes since */
+	vita_tree_gen++;
+	vita_id_gen++;
 	script_entered_ms = now_ms();
+	bc_last_activity_ms = script_entered_ms;
 	rearm_deadline(thread);
 }
 
 static void schedule_relayout(jsthread *thread, int ms);
+
+/** What the longest job did, so a job of twenty seconds names its own
+ * work rather than the work of whichever job ran before it. */
+static void job_max_deltas(unsigned b_finds, unsigned b_edits,
+			   unsigned b_html, unsigned b_attrs,
+			   unsigned b_styles, unsigned b_wraps,
+			   unsigned b_agets, unsigned b_cn, unsigned b_tr,
+			   unsigned b_bc, unsigned b_txt)
+{
+	vitasurf_job_max_finds = vitasurf_js_finds - b_finds;
+	vitasurf_job_max_edits = vitasurf_js_dom_edits - b_edits;
+	vitasurf_job_max_html = vitasurf_js_html_bytes - b_html;
+	vitasurf_job_max_attrs = vitasurf_js_attr_sets - b_attrs;
+	vitasurf_job_max_styles = vitasurf_js_style_reads - b_styles;
+	vitasurf_job_max_wraps = vitasurf_js_node_wraps - b_wraps;
+	vitasurf_job_max_attr_gets = vitasurf_js_attr_gets - b_agets;
+	vitasurf_job_max_childnodes = vitasurf_js_childnodes - b_cn;
+	vitasurf_job_max_tree_reads = vitasurf_js_tree_reads - b_tr;
+	vitasurf_job_max_bindings = vitasurf_js_binding_calls - b_bc;
+	vitasurf_job_max_text_reads = vitasurf_js_text_reads - b_txt;
+}
+
+/** Say what the budget stopped, since a job that is killed leaves no
+ * other trace of what it was doing (VitaSurf). */
+static void drain_job_killed(unsigned took, unsigned nth, unsigned drain_ms,
+			     unsigned b_edits, unsigned b_attrs,
+			     unsigned b_wraps, unsigned b_html)
+{
+	vita_log("qjs: the budget stopped job %u of this drain after %u ms, "
+		 "%u ms into the drain; it had made %u tree edits and %u "
+		 "attribute sets, was handed a node %u times and parsed %u "
+		 "bytes of HTML",
+		 nth, took, drain_ms,
+		 vitasurf_js_dom_edits - b_edits,
+		 vitasurf_js_attr_sets - b_attrs,
+		 vitasurf_js_node_wraps - b_wraps,
+		 vitasurf_js_html_bytes - b_html);
+}
 
 static void end_script(jsthread *thread)
 {
@@ -3404,6 +6771,14 @@ static void end_script(jsthread *thread)
 		return;
 	}
 	thread->script_depth = 0;
+	/* back out to NetSurf: no binding is running now, and the phase
+	 * is whatever called into script (VitaSurf) */
+	vitasurf_phase = thread->phase_was;
+	c_where = NULL;
+	prof_tail(script_why == SCRIPT_TIMER ? "a timer" :
+		  script_why == SCRIPT_EVENT ? "an event handler" :
+		  script_why == SCRIPT_XHR ? "a fetch callback" :
+		  "a script element");
 	if (script_entered_ms != 0) {
 		unsigned took = (unsigned)(now_ms() - script_entered_ms);
 
@@ -3432,9 +6807,7 @@ static void end_script(jsthread *thread)
 		thread->scripts_killed++;
 		vita_log("qjs: that script was stopped by the budget "
 			 "(%u on this page; the next gets %u seconds)",
-			 thread->scripts_killed,
-			 thread->scripts_killed >= 2 ? 5u :
-			 (unsigned)thread->heap->timeout / 2);
+			 thread->scripts_killed, budget_secs(thread));
 	}
 	/* The outermost call is over, so nothing is still unwinding. An
 	 * exception left pending here is one that was reported already, or
@@ -3460,8 +6833,30 @@ static void end_script(jsthread *thread)
 	 * the script's own run has already been accounted for above and a
 	 * deadline that has passed would stop the first job on a page that
 	 * did nothing wrong.
+	 *
+	 * One deadline for the whole drain, not one per job. Build 405
+	 * tried a budget per job on the grounds that a page should not be
+	 * punished for doing its work in several pieces rather than one,
+	 * and the device said that was the wrong reading: the job the old
+	 * budget cut off after 6844 ms was handed a full twenty seconds,
+	 * spent all of them, and was cut off anyway. It is a runaway. The
+	 * page cost 65642 ms instead of 59708 for exactly the same end
+	 * state, so the drain answers to one budget again.
 	 */
 	rearm_deadline(thread);
+	/*
+	 * The drain is still inside the script (VitaSurf). With the depth
+	 * at zero, a job that dispatched an event or ran a listener from C
+	 * entered script as a new outermost call: begin_script handed it a
+	 * fresh deadline, and its end_script drained the queue again and
+	 * then cleared the deadline, so the rest of the outer job ran with
+	 * no budget, no profile samples and no Circle. Yamtrack's Alpine
+	 * start-up ran 9242 ms that way and the profile could say only
+	 * "a promise job". Holding the depth at one makes those calls the
+	 * nested entries they are.
+	 */
+	thread->script_depth = 1;
+	thread->draining = true;
 	{
 		/*
 		 * What the microtask queue costs (VitaSurf). This runs
@@ -3471,13 +6866,81 @@ static void end_script(jsthread *thread)
 		 * actually run.
 		 */
 		uint64_t j0 = now_ms(), jlast = j0;
+		unsigned in_drain = 0;
+		unsigned b_finds = vitasurf_js_finds;
+		unsigned b_edits = vitasurf_js_dom_edits;
+		unsigned b_html = vitasurf_js_html_bytes;
+		unsigned b_attrs = vitasurf_js_attr_sets;
+		unsigned b_styles = vitasurf_js_style_reads;
+		unsigned b_wraps = vitasurf_js_node_wraps;
+		unsigned b_agets = vitasurf_js_attr_gets;
+		unsigned b_cn = vitasurf_js_childnodes;
+		unsigned b_tr = vitasurf_js_tree_reads;
+		unsigned b_bc = vitasurf_js_binding_calls;
+		unsigned b_txt = vitasurf_js_text_reads;
 
+		vitasurf_js_drains++;
+		vitasurf_phase = "promise jobs";
 		for (;;) {
 			JSContext *c = NULL;
-			int r = JS_ExecutePendingJob(thread->heap->rt, &c);
+			int r;
+			uint64_t d0 = now_ms();
+
+			r = JS_ExecutePendingJob(thread->heap->rt, &c);
+			bc_last_activity_ms = now_ms();
+			if (r != 0) {
+				prof_tail("a promise job");
+			}
 			if (r <= 0) {
-				if (r < 0 && c != NULL) {
-					qjs_report_exception(c);
+				unsigned took = (unsigned)(now_ms() - d0);
+
+				/*
+				 * A negative return is a job that ran and
+				 * threw, not an empty queue, and its time
+				 * is a job's time (VitaSurf). Counting the
+				 * two together reported 7205 ms across 68
+				 * drains for a call that does nothing.
+				 */
+				if (r < 0) {
+					if (thread->overrun_count > 0) {
+						vitasurf_js_jobs_budget++;
+						vitasurf_ms_js_jobs_budget +=
+							took;
+						drain_job_killed(took,
+							in_drain + 1,
+							(unsigned)(now_ms() -
+								   j0),
+							b_edits, b_attrs,
+							b_wraps, b_html);
+					} else {
+						vitasurf_js_jobs_threw++;
+						vitasurf_ms_js_jobs_threw +=
+							took;
+					}
+					vitasurf_ms_js_jobs_sum += took;
+					/*
+					 * and its own deltas if it is the
+					 * longest (VitaSurf). Build 405
+					 * set the time here and the
+					 * deltas only where a job
+					 * finishes, so a killed job of
+					 * 20047 ms was described by the
+					 * work of a shorter one.
+					 */
+					if (took > vitasurf_ms_js_job_max) {
+						vitasurf_ms_js_job_max = took;
+						job_max_deltas(b_finds,
+							b_edits, b_html,
+							b_attrs, b_styles,
+							b_wraps, b_agets,
+							b_cn, b_tr, b_bc,
+							b_txt);
+					}
+					if (c != NULL) {
+						qjs_report_exception(c);
+					}
+				} else {
+					vitasurf_ms_js_drain_tail += took;
 				}
 				break;
 			}
@@ -3487,24 +6950,56 @@ static void end_script(jsthread *thread)
 
 				if (took > vitasurf_ms_js_job_max) {
 					vitasurf_ms_js_job_max = took;
+					job_max_deltas(b_finds, b_edits,
+						b_html, b_attrs, b_styles,
+						b_wraps, b_agets, b_cn,
+						b_tr, b_bc, b_txt);
 				}
 				if (took >= 5) {
 					vitasurf_js_jobs_slow++;
 					vitasurf_ms_js_jobs_slow += took;
 				}
+				/*
+				 * Every job, so the drain total minus this
+				 * is what the loop itself costs: a GitHub
+				 * load reports 20440 ms of jobs where the
+				 * ones counted come to 15680, and nothing
+				 * says where the other 4760 went.
+				 */
+				vitasurf_ms_js_jobs_sum += took;
 				jlast = j1;
+				b_finds = vitasurf_js_finds;
+				b_edits = vitasurf_js_dom_edits;
+				b_html = vitasurf_js_html_bytes;
+				b_attrs = vitasurf_js_attr_sets;
+				b_styles = vitasurf_js_style_reads;
+				b_wraps = vitasurf_js_node_wraps;
+				b_agets = vitasurf_js_attr_gets;
+				b_cn = vitasurf_js_childnodes;
+				b_tr = vitasurf_js_tree_reads;
+				b_bc = vitasurf_js_binding_calls;
+				b_txt = vitasurf_js_text_reads;
 			}
 			vitasurf_js_jobs++;
+			in_drain++;
 		}
-		vitasurf_ms_js_jobs += (unsigned)(now_ms() - j0);
+		{
+			unsigned drain_ms = (unsigned)(now_ms() - j0);
+
+			vitasurf_ms_js_jobs += drain_ms;
+			if (drain_ms > vitasurf_ms_js_drain_max) {
+				vitasurf_ms_js_drain_max = drain_ms;
+				vitasurf_js_drain_max_jobs = in_drain;
+			}
+		}
 	}
+	thread->script_depth = 0;
+	thread->draining = false;
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;
 		vita_log("qjs: promise jobs stopped by the budget "
 			 "(%u on this page; the next gets %u seconds)",
-			 thread->scripts_killed,
-			 thread->scripts_killed >= 2 ? 5u :
-			 (unsigned)thread->heap->timeout / 2);
+			 thread->scripts_killed, budget_secs(thread));
 	}
 	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
@@ -3566,6 +7061,14 @@ static unsigned count_elements(struct dom_node *root)
 	return count;
 }
 
+/* The layout has caught up with the document, or never will. */
+static void relayout_forget(jsthread *thread)
+{
+	thread->dom_dirty = false;
+	thread->tree_dirty = false;
+	attr_journal_clear(thread);
+}
+
 static void relayout_callback(void *p)
 {
 	jsthread *thread = p;
@@ -3574,12 +7077,12 @@ static void relayout_callback(void *p)
 	uint64_t t0;
 
 	thread->relayout_pending = false;
-	if (thread->closed || !thread->dom_dirty || thread->relayout_off) {
+	if (thread->closed || !thread->dom_dirty) {
 		return;
 	}
 	htmlc = thread->htmlc;
 	if (htmlc == NULL) {
-		thread->dom_dirty = false;
+		relayout_forget(thread);
 		return;
 	}
 	if (htmlc->layout == NULL) {
@@ -3587,9 +7090,10 @@ static void relayout_callback(void *p)
 			/* being built from a document that just changed */
 			guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
 			thread->relayout_pending = true;
+			thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		} else {
 			/* the first conversion has not run yet; it will see the changes */
-			thread->dom_dirty = false;
+			relayout_forget(thread);
 		}
 		return;
 	}
@@ -3605,9 +7109,58 @@ static void relayout_callback(void *p)
 
 		if (h == NULL ||
 		    hlcache_handle_get_content(h) != (struct content *)htmlc) {
+			relayout_forget(thread);
+			return;
+		}
+	}
+
+	/*
+	 * Only attributes changed: restyle what they touch in place, which
+	 * needs neither the page to have finished loading nor a document
+	 * small enough to rebuild (VitaSurf).
+	 */
+	if (!thread->tree_dirty) {
+		int res = BOX_RESTYLE_SAME;
+		char why[160];
+		unsigned n = thread->attr_n, ms;
+
+		if (n == 0) {
 			thread->dom_dirty = false;
 			return;
 		}
+		t0 = now_ms();
+		if (!html_restyle_attrs(htmlc, thread->attr_changes, n, &res,
+					why, sizeof(why))) {
+			/* busy: being laid out, dragged or still built */
+			guit->misc->schedule(RELAYOUT_RETRY_MS,
+					     relayout_callback, thread);
+			thread->relayout_pending = true;
+			thread->relayout_due = (uint32_t)now_ms() +
+					       RELAYOUT_RETRY_MS;
+			return;
+		}
+		ms = (unsigned)(now_ms() - t0);
+		if (res != BOX_RESTYLE_LAYOUT) {
+			relayout_forget(thread);
+			thread->attr_restyles++;
+			if (thread->attr_restyles <= 10 || ms >= 100) {
+				vita_log("qjs: %u attribute changes put on the "
+					 "page in %u ms without rebuilding "
+					 "it (%s)", n, ms,
+					 res == BOX_RESTYLE_REFLOW ?
+					 "laid out again" :
+					 res == BOX_RESTYLE_PAINT ?
+					 "drawn again" : "nothing to draw");
+			}
+			return;
+		}
+		vita_log("qjs: %u attribute changes need the layout rebuilt "
+			 "after %u ms restyling: %s", n, ms, why);
+		thread->tree_dirty = true;
+	}
+	if (thread->relayout_off) {
+		relayout_forget(thread);
+		return;
 	}
 
 	/*
@@ -3627,6 +7180,7 @@ static void relayout_callback(void *p)
 		}
 		guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
 		thread->relayout_pending = true;
+		thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		return;
 	}
 	thread->relayout_waits = 0;
@@ -3654,7 +7208,7 @@ static void relayout_callback(void *p)
 			 thread->dom_elements,
 			 (unsigned)RELAYOUT_MAX_ELEMENTS);
 		thread->relayout_off = true;
-		thread->dom_dirty = false;
+		relayout_forget(thread);
 		return;
 	}
 	/*
@@ -3662,7 +7216,9 @@ static void relayout_callback(void *p)
 	 * laid out (VitaSurf). No measurement yet means no reason to
 	 * refuse.
 	 */
-	if (vitasurf_box_elements > 0) {
+	/* a rebuild this page already had is a better measure than
+	 * anything estimated from its first load (VitaSurf) */
+	if (vitasurf_box_elements > 0 && thread->relayout_ms == 0) {
 		unsigned per_element_us = (vitasurf_ms_boxes * 1000u) /
 					  vitasurf_box_elements;
 		unsigned estimate = (per_element_us *
@@ -3675,7 +7231,7 @@ static void relayout_callback(void *p)
 				 thread->dom_elements, per_element_us,
 				 estimate);
 			thread->relayout_off = true;
-			thread->dom_dirty = false;
+			relayout_forget(thread);
 			return;
 		}
 	}
@@ -3686,15 +7242,18 @@ static void relayout_callback(void *p)
 		/* busy, or a rebuild is already running */
 		guit->misc->schedule(RELAYOUT_RETRY_MS, relayout_callback, thread);
 		thread->relayout_pending = true;
+		thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		return;
 	}
-	thread->dom_dirty = false;
+	relayout_forget(thread);
 	/* the rebuild runs to completion here, so this is also how long
 	 * the page was frozen for */
 	thread->relayout_ms = (unsigned)(now_ms() - t0);
 	vita_log("qjs: layout rebuilt after script changes in %u ms "
-		 "(%u elements)%s",
+		 "(%u elements), %u images taken back and %u asked for "
+		 "again%s",
 		 thread->relayout_ms, thread->dom_elements,
+		 htmlc->relayout_reused, htmlc->relayout_fetched,
 		 err == NSERROR_OK ? "" : " (failed)");
 	/* what the page looks like once its scripts have built it, when
 	 * the flag file asks for it (VitaSurf) */
@@ -3707,12 +7266,76 @@ static void relayout_callback(void *p)
  * running makes html_relayout() ask to be called back later, so at most
  * one runs at a time.
  */
-static void schedule_relayout(jsthread *thread, int ms)
+/* whether a node is still in a document */
+static bool node_in_document(struct dom_node *node)
 {
-	if (thread->relayout_pending || thread->closed) {
+	struct dom_node *n = dom_node_ref(node), *p = NULL;
+	dom_node_type type = DOM_ELEMENT_NODE;
+
+	while (n != NULL) {
+		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+		    type == DOM_DOCUMENT_NODE) {
+			break;
+		}
+		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR) {
+			p = NULL;
+		}
+		dom_node_unref(n);
+		n = p;
+	}
+	if (n != NULL) {
+		dom_node_unref(n);
+		return type == DOM_DOCUMENT_NODE;
+	}
+	return false;
+}
+
+/*
+ * An iframe taken out of the document ends its page there and then, as a
+ * browser does, rather than when the next layout rebuild gets round to
+ * dropping its window, which a busy page puts off for seconds (VitaSurf).
+ * From the scheduler, so that no script of the frame is running.
+ */
+static void close_removed_frames(void *p)
+{
+	jsthread *thread = p;
+	struct browser_window *bw = thread->win;
+	int i;
+
+	if (bw == NULL) {
 		return;
 	}
-	if (thread->htmlc != NULL && thread->htmlc->base.active > 0 &&
+	for (i = 0; i < bw->iframe_count; i++) {
+		struct browser_window *f = bw->iframes[i];
+		jsthread *t;
+
+		if (f->frame_node == NULL || node_in_document(f->frame_node)) {
+			continue;
+		}
+		t = window_thread(f);
+		if (t != NULL) {
+			vita_log("qjs: an iframe left the document, and its "
+				 "page's scripts stop");
+			js_closethread(t);
+		}
+	}
+}
+
+static void schedule_relayout(jsthread *thread, int ms)
+{
+	uint32_t due;
+
+	if (thread->win != NULL && thread->win->iframe_count > 0 &&
+	    !thread->closed) {
+		guit->misc->schedule(0, close_removed_frames, thread);
+	}
+	if (thread->closed) {
+		return;
+	}
+	/* changes of attributes alone are restyled in place, which costs
+	 * little and does not wait for the page (VitaSurf) */
+	if (thread->tree_dirty && thread->htmlc != NULL &&
+	    thread->htmlc->base.active > 0 &&
 	    ms < RELAYOUT_MAX_DELAY_MS) {
 		ms = RELAYOUT_MAX_DELAY_MS;
 	}
@@ -3722,7 +7345,7 @@ static void schedule_relayout(jsthread *thread, int ms)
 	 * time frozen, and one measured at four and a half seconds should
 	 * not be asked again a moment later.
 	 */
-	if (thread->relayout_ms > 0) {
+	if (thread->tree_dirty && thread->relayout_ms > 0) {
 		unsigned floor_ms = thread->relayout_ms * 4;
 
 		if (floor_ms > RELAYOUT_MAX_DELAY_MS) {
@@ -3732,9 +7355,671 @@ static void schedule_relayout(jsthread *thread, int ms)
 			ms = (int)floor_ms;
 		}
 	}
+	/*
+	 * One already waiting stays unless this one is due sooner
+	 * (VitaSurf). A change made while the page was still fetching
+	 * waits the longest delay, and a change a script made once the
+	 * page had loaded waited with it: a component that marked what
+	 * it hides a quarter of a second after the load event was drawn
+	 * unhidden for eight seconds.
+	 */
+	due = (uint32_t)now_ms() + (uint32_t)ms;
+	if (thread->relayout_pending &&
+	    (int32_t)(due - thread->relayout_due) >= 0) {
+		return;
+	}
 	if (guit->misc->schedule(ms, relayout_callback, thread) == NSERROR_OK) {
 		thread->relayout_pending = true;
+		thread->relayout_due = due;
 	}
+}
+
+/* ------------------------------------------------------------------------ */
+/* Slots: the composed tree box construction is built from (VitaSurf)      */
+
+static void slot_map_free(struct slot_map *m)
+{
+	unsigned i;
+
+	for (i = 0; i < m->n; i++) {
+		dom_node_unref(m->e[i].node);
+		dom_node_unref(m->e[i].host);
+		if (m->e[i].slot != NULL) {
+			dom_node_unref(m->e[i].slot);
+		}
+	}
+	for (i = 0; i < m->nh; i++) {
+		dom_node_unref(m->h[i].slot);
+	}
+	free(m->e);
+	free(m->h);
+	free(m->etab);
+	free(m->htab);
+	memset(m, 0, sizeof(*m));
+}
+
+static unsigned slot_hash(const struct dom_node *n, unsigned mask)
+{
+	uintptr_t v = (uintptr_t)n >> 3;
+
+	return (unsigned)((v * 2654435761u) & mask);
+}
+
+static int slot_find_entry(const struct slot_map *m, const struct dom_node *n)
+{
+	unsigned i;
+
+	if (m->etab == NULL) {
+		return -1;
+	}
+	for (i = slot_hash(n, m->mask); m->etab[i] >= 0; i = (i + 1) & m->mask) {
+		if (m->e[m->etab[i]].node == n) {
+			return m->etab[i];
+		}
+	}
+	return -1;
+}
+
+static int slot_find_head(const struct slot_map *m, const struct dom_node *n)
+{
+	unsigned i;
+
+	if (m->htab == NULL) {
+		return -1;
+	}
+	for (i = slot_hash(n, m->mask); m->htab[i] >= 0; i = (i + 1) & m->mask) {
+		if (m->h[m->htab[i]].slot == n) {
+			return m->htab[i];
+		}
+	}
+	return -1;
+}
+
+/** Whether anc is n or one of its ancestors in the DOM. */
+static bool slot_dom_contains(struct dom_node *anc, struct dom_node *n)
+{
+	struct dom_node *cur = dom_node_ref(n), *up = NULL;
+	unsigned depth = 0;
+
+	while (cur != NULL && depth++ < 4096) {
+		if (cur == anc) {
+			dom_node_unref(cur);
+			return true;
+		}
+		if (dom_node_get_parent_node(cur, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(cur);
+		cur = up;
+	}
+	if (cur != NULL) {
+		dom_node_unref(cur);
+	}
+	return false;
+}
+
+/*
+ * Whether an entry still describes the tree. Scripts can move nodes
+ * between the prelude's pass and the boxes being built, and the three
+ * questions below must agree with each other or the walk would lose
+ * its way; so each asks this, and an entry that no longer holds is
+ * treated as an ordinary child where the DOM has it.
+ */
+static bool slot_entry_holds(const struct slot_entry *e)
+{
+	struct dom_node *parent = NULL;
+	bool same;
+
+	if (dom_node_get_parent_node(e->node, &parent) != DOM_NO_ERR) {
+		return false;
+	}
+	same = (parent == e->host);
+	if (parent != NULL) {
+		dom_node_unref(parent);
+	}
+	if (!same) {
+		return false;
+	}
+	if (e->slot == NULL) {
+		return true;
+	}
+	return slot_dom_contains(e->host, e->slot) &&
+		!slot_dom_contains(e->node, e->slot);
+}
+
+/** Whether a node is a host's own child that a slot draws, or nothing. */
+static bool slot_is_moved(const struct slot_map *m, struct dom_node *n)
+{
+	int i = slot_find_entry(m, n);
+
+	return i >= 0 && slot_entry_holds(&m->e[i]);
+}
+
+/** Step *p forward past the children that are drawn somewhere else. */
+static void slot_skip_moved(const struct slot_map *m, struct dom_node **p)
+{
+	struct dom_node *next = NULL;
+
+	while (*p != NULL && slot_is_moved(m, *p)) {
+		if (dom_node_get_next_sibling(*p, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		dom_node_unref(*p);
+		*p = next;
+	}
+}
+
+/** The first entry from i on that still holds, or -1. */
+static int slot_next_holding(const struct slot_map *m, int i)
+{
+	while (i >= 0 && !slot_entry_holds(&m->e[i])) {
+		i = m->e[i].next;
+	}
+	return i;
+}
+
+/** Ask the prelude which children go where; it calls __vitaSlots. */
+static void slot_pass(jsthread *thread)
+{
+	JSContext *ctx = thread->ctx;
+	JSValue global, fn, r;
+
+	if (ctx == NULL || thread->closed || thread->is_worker) {
+		return;
+	}
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaSlotPass");
+	if (JS_IsFunction(ctx, fn)) {
+		r = JS_Call(ctx, fn, global, 0, NULL);
+		if (JS_IsException(r)) {
+			qjs_absorb_or_rethrow(ctx);
+		}
+		JS_FreeValue(ctx, r);
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+}
+
+static bool composed_hook(struct html_content *c, enum vitasurf_composed_op op,
+			  struct dom_node *n, struct dom_node **out)
+{
+	jsthread *thread = (c != NULL) ? c->jsthread : NULL;
+	struct slot_map *m;
+	struct dom_node *d = NULL;
+	int i;
+
+	if (thread == NULL || thread->closed) {
+		return false;
+	}
+	if (op == VITASURF_COMPOSED_PREPARE) {
+		slot_pass(thread);
+		return true;
+	}
+	m = &thread->slots;
+	if (m->n == 0 || n == NULL || out == NULL) {
+		return false;
+	}
+	switch (op) {
+	case VITASURF_COMPOSED_PARENT:
+		i = slot_find_entry(m, n);
+		if (i >= 0 && m->e[i].slot != NULL &&
+		    slot_entry_holds(&m->e[i])) {
+			*out = dom_node_ref(m->e[i].slot);
+			return true;
+		}
+		return false;
+
+	case VITASURF_COMPOSED_FIRST_CHILD:
+		i = slot_find_head(m, n);
+		if (i >= 0) {
+			i = slot_next_holding(m, m->h[i].first);
+			if (i >= 0) {
+				*out = dom_node_ref(m->e[i].node);
+				return true;
+			}
+			/* nothing assigned now: the slot's own content */
+		}
+		if (dom_node_get_first_child(n, &d) != DOM_NO_ERR) {
+			return false;
+		}
+		slot_skip_moved(m, &d);
+		*out = d;
+		return true;
+
+	case VITASURF_COMPOSED_NEXT_SIBLING:
+		i = slot_find_entry(m, n);
+		if (i >= 0 && m->e[i].slot != NULL &&
+		    slot_entry_holds(&m->e[i])) {
+			i = slot_next_holding(m, m->e[i].next);
+			*out = (i >= 0) ? dom_node_ref(m->e[i].node) : NULL;
+			return true;
+		}
+		if (dom_node_get_next_sibling(n, &d) != DOM_NO_ERR) {
+			return false;
+		}
+		slot_skip_moved(m, &d);
+		*out = d;
+		return true;
+
+	default:
+		return false;
+	}
+}
+
+/* ------------------------------------------------------------------------ */
+/* WebSocket (VitaSurf): vita/js/websocket.c does the connections           */
+
+/*
+ * What the page's WebSocket messages cost (VitaSurf). Home Assistant
+ * sends its whole state over one connection -- every entity when it
+ * subscribes, then a message per change -- and a log could not say how
+ * big those were or how long the page took over them. Counted per
+ * page and reported with the profile; a message whose handling takes
+ * WS_SLOW_MS or more is named as it happens, by its type and size
+ * only, never its contents.
+ */
+#define WS_SLOW_MS 200
+static unsigned ws_msgs, ws_kb, ws_max_bytes, ws_max_ms;
+static unsigned ws_ms_handler, ws_ms_jobs, ws_slow;
+static unsigned ws_first_bytes, ws_first_handler, ws_first_jobs;
+
+/** The value of "type" near the start of a JSON message, for the log. */
+static void ws_msg_type(const char *data, size_t len, char *out, size_t n)
+{
+	size_t i, k = 0, lim = len < 96 ? len : 96;
+
+	out[0] = '\0';
+	for (i = 0; i + 8 < lim; i++) {
+		if (memcmp(data + i, "\"type\":\"", 8) == 0) {
+			for (i += 8; i < len && data[i] != '"' && k + 1 < n; i++) {
+				char c = data[i];
+
+				out[k++] = (isalnum((unsigned char) c) ||
+					    c == '_' || c == '/') ? c : '?';
+			}
+			out[k] = '\0';
+			return;
+		}
+	}
+}
+
+static void ws_note(size_t len, const char *data, bool text,
+		    unsigned handler_ms, unsigned jobs_ms)
+{
+	unsigned total = handler_ms + jobs_ms;
+
+	if (ws_msgs == 0) {
+		ws_first_bytes = (unsigned) len;
+		ws_first_handler = handler_ms;
+		ws_first_jobs = jobs_ms;
+	}
+	ws_msgs++;
+	ws_kb += (unsigned) (len / 1024);
+	ws_ms_handler += handler_ms;
+	ws_ms_jobs += jobs_ms;
+	if (len > ws_max_bytes) ws_max_bytes = (unsigned) len;
+	if (total > ws_max_ms) ws_max_ms = total;
+	if (total >= WS_SLOW_MS) {
+		char type[32];
+
+		ws_slow++;
+		type[0] = '\0';
+		if (text) ws_msg_type(data, len, type, sizeof(type));
+		vita_log("websocket: a %u KB message%s%s%s took %u ms in the "
+			 "page's handler and %u ms in the promise jobs after "
+			 "it", (unsigned) (len / 1024),
+			 type[0] ? " of type '" : "", type,
+			 type[0] ? "'" : "", handler_ms, jobs_ms);
+	}
+}
+
+static void ws_report(void)
+{
+	if (ws_msgs == 0) return;
+	vita_log("websocket: %u messages received, %u KB; the page's handlers "
+		 "took %u ms and the promise jobs after them %u ms; the "
+		 "largest was %u KB and the dearest %u ms, %u took %u ms or "
+		 "more", ws_msgs, ws_kb, ws_ms_handler, ws_ms_jobs,
+		 ws_max_bytes / 1024, ws_max_ms, ws_slow, WS_SLOW_MS);
+	vita_log("websocket: the first was %u KB, %u ms in its handler and "
+		 "%u ms in the jobs after it", ws_first_bytes / 1024,
+		 ws_first_handler, ws_first_jobs);
+	ws_msgs = ws_kb = ws_max_bytes = ws_max_ms = 0;
+	ws_ms_handler = ws_ms_jobs = ws_slow = 0;
+}
+
+/* An event on one of a page's connections, to the prelude's
+ * __vitaWsEvent(id, kind, data, code), run as script so the promise
+ * jobs a message handler queues run after it. */
+static void ws_event(void *owner, int id, enum vws_event ev,
+		     const char *data, size_t len, int code)
+{
+	jsthread *thread = owner;
+	JSContext *ctx;
+	JSValue global, fn, args[4], r;
+	int i;
+	uint64_t t0, t1 = 0;
+	bool message = (ev == VWS_TEXT || ev == VWS_BINARY);
+
+	if (thread == NULL || thread->closed || thread->ctx == NULL) {
+		return;
+	}
+	ctx = thread->ctx;
+	t0 = now_ms();
+	begin_script(thread, SCRIPT_XHR);
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaWsEvent");
+	if (JS_IsFunction(ctx, fn)) {
+		args[0] = JS_NewInt32(ctx, id);
+		args[1] = JS_NewInt32(ctx, (int)ev);
+		args[2] = (ev == VWS_BINARY) ?
+			JS_NewArrayBufferCopy(ctx, (const uint8_t *)data, len) :
+			JS_NewStringLen(ctx, data != NULL ? data : "", len);
+		args[3] = JS_NewInt32(ctx, code);
+		r = JS_Call(ctx, fn, global, 4, args);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		}
+		JS_FreeValue(ctx, r);
+		for (i = 0; i < 4; i++) {
+			JS_FreeValue(ctx, args[i]);
+		}
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	t1 = now_ms();
+	end_script(thread);
+	if (message && thread->script_depth == 0) {
+		ws_note(len, data, ev == VWS_TEXT, (unsigned) (t1 - t0),
+			(unsigned) (now_ms() - t1));
+	}
+}
+
+/* The cookies the page's http(s) URL of the same host would send. */
+static char *ws_cookie(const char *url)
+{
+	char *http;
+	nsurl *u = NULL;
+	char *cookie = NULL;
+	size_t n = strlen(url);
+
+	if (n < 5) {
+		return NULL;
+	}
+	http = malloc(n + 2);
+	if (http == NULL) {
+		return NULL;
+	}
+	if (strncasecmp(url, "wss:", 4) == 0) {
+		snprintf(http, n + 2, "https:%s", url + 4);
+	} else if (strncasecmp(url, "ws:", 3) == 0) {
+		snprintf(http, n + 2, "http:%s", url + 3);
+	} else {
+		free(http);
+		return NULL;
+	}
+	if (nsurl_create(http, &u) == NSERROR_OK) {
+		cookie = urldb_get_cookie(u, true);
+		nsurl_unref(u);
+	}
+	free(http);
+	return cookie;
+}
+
+/* __vitaWsOpen(url, protocols, origin): an id, or -1. */
+static JSValue win_vita_ws_open(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *url, *protocols = NULL, *origin = NULL;
+	char *cookie;
+	int id;
+
+	(void)this_val;
+	if (thread == NULL || thread->closed || argc < 1) {
+		return JS_NewInt32(ctx, -1);
+	}
+	url = JS_ToCString(ctx, argv[0]);
+	if (url == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (argc > 1 && JS_IsString(argv[1])) {
+		protocols = JS_ToCString(ctx, argv[1]);
+	}
+	if (argc > 2 && JS_IsString(argv[2])) {
+		origin = JS_ToCString(ctx, argv[2]);
+	}
+	cookie = ws_cookie(url);
+	id = vws_open(url, origin, protocols, cookie, ws_event, thread);
+	free(cookie);
+	JS_FreeCString(ctx, url);
+	if (protocols != NULL) {
+		JS_FreeCString(ctx, protocols);
+	}
+	if (origin != NULL) {
+		JS_FreeCString(ctx, origin);
+	}
+	return JS_NewInt32(ctx, id);
+}
+
+/* __vitaWsSend(id, data): data a string, or an ArrayBuffer or a view. */
+static JSValue win_vita_ws_send(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t id = 0;
+	bool ok = false;
+
+	(void)this_val;
+	if (argc < 2 || JS_ToInt32(ctx, &id, argv[0]) < 0) {
+		return JS_FALSE;
+	}
+	if (JS_IsString(argv[1])) {
+		size_t len = 0;
+		const char *str = JS_ToCStringLen(ctx, &len, argv[1]);
+
+		if (str == NULL) {
+			return JS_EXCEPTION;
+		}
+		ok = vws_send(id, str, len, false);
+		JS_FreeCString(ctx, str);
+	} else {
+		size_t len = 0, off = 0, bpe = 0;
+		uint8_t *buf = JS_GetArrayBuffer(ctx, &len, argv[1]);
+
+		if (buf == NULL) {
+			JSValue ab;
+
+			JS_FreeValue(ctx, JS_GetException(ctx));
+			ab = JS_GetTypedArrayBuffer(ctx, argv[1], &off, &len,
+						    &bpe);
+			if (JS_IsException(ab)) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+				return JS_FALSE;
+			}
+			{
+				size_t total = 0;
+				uint8_t *base = JS_GetArrayBuffer(ctx, &total, ab);
+
+				if (base != NULL && off + len <= total) {
+					ok = vws_send(id, base + off, len, true);
+				}
+			}
+			JS_FreeValue(ctx, ab);
+		} else {
+			ok = vws_send(id, buf, len, true);
+		}
+	}
+	return JS_NewBool(ctx, ok);
+}
+
+/* __vitaWsClose(id, code, reason) */
+static JSValue win_vita_ws_close(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t id = 0, code = 0;
+	size_t len = 0;
+	const char *reason = NULL;
+
+	(void)this_val;
+	if (argc < 1 || JS_ToInt32(ctx, &id, argv[0]) < 0) {
+		return JS_UNDEFINED;
+	}
+	if (argc > 1 && !JS_IsUndefined(argv[1]) &&
+	    JS_ToInt32(ctx, &code, argv[1]) < 0) {
+		return JS_EXCEPTION;
+	}
+	if (argc > 2 && JS_IsString(argv[2])) {
+		reason = JS_ToCStringLen(ctx, &len, argv[2]);
+	}
+	vws_close(id, code, reason, len);
+	if (reason != NULL) {
+		JS_FreeCString(ctx, reason);
+	}
+	return JS_UNDEFINED;
+}
+
+/* __vitaWsBuffered(id) */
+static JSValue win_vita_ws_buffered(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t id = 0;
+
+	(void)this_val;
+	if (argc < 1 || JS_ToInt32(ctx, &id, argv[0]) < 0) {
+		return JS_NewInt32(ctx, 0);
+	}
+	return JS_NewFloat64(ctx, (double)vws_buffered(id));
+}
+
+/*
+ * __vitaScriptURL(url, replace): the page gave itself a new address with
+ * history.pushState or replaceState (VitaSurf). The browser shows it,
+ * records it in the history and reloads it; see
+ * browser_window_set_script_url.
+ */
+static JSValue win_vita_script_url(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *s;
+	nsurl *url = NULL;
+	struct hlcache_handle *h;
+
+	(void)this_val;
+	if (thread == NULL || thread->closed || thread->is_worker ||
+	    thread->win == NULL || thread->win->parent != NULL || argc < 1) {
+		return JS_UNDEFINED;
+	}
+	/* only the page on screen names the window's address */
+	h = browser_window_get_content(thread->win);
+	if (h == NULL || hlcache_handle_get_content(h) !=
+	    (struct content *)thread->htmlc) {
+		return JS_UNDEFINED;
+	}
+	s = JS_ToCString(ctx, argv[0]);
+	if (s == NULL) {
+		return JS_EXCEPTION;
+	}
+	if (nsurl_create(s, &url) == NSERROR_OK) {
+		browser_window_set_script_url(thread->win, url,
+			argc > 1 && JS_ToBool(ctx, argv[1]));
+		nsurl_unref(url);
+	}
+	JS_FreeCString(ctx, s);
+	return JS_UNDEFINED;
+}
+
+/*
+ * __vitaSlots(nodes, slots): a host's own children, and for each the
+ * slot that draws it or null. Replaces what was known before.
+ */
+static JSValue win_vita_slots(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct slot_map m;
+	int64_t len64 = 0;
+	unsigned len, i, buckets;
+
+	(void)this_val;
+	if (thread == NULL || argc < 2) {
+		return JS_UNDEFINED;
+	}
+	slot_map_free(&thread->slots);
+	if (JS_GetLength(ctx, argv[0], &len64) < 0 || len64 <= 0) {
+		return JS_UNDEFINED;
+	}
+	len = (len64 > 200000) ? 200000u : (unsigned)len64;
+	memset(&m, 0, sizeof(m));
+	for (buckets = 16; buckets < len * 2; buckets <<= 1)
+		;
+	m.mask = buckets - 1;
+	m.e = calloc(len, sizeof(*m.e));
+	m.h = calloc(len, sizeof(*m.h));
+	m.etab = malloc(buckets * sizeof(int));
+	m.htab = malloc(buckets * sizeof(int));
+	if (m.e == NULL || m.h == NULL || m.etab == NULL || m.htab == NULL) {
+		slot_map_free(&m);
+		return JS_UNDEFINED;
+	}
+	memset(m.etab, 0xff, buckets * sizeof(int));
+	memset(m.htab, 0xff, buckets * sizeof(int));
+	for (i = 0; i < len; i++) {
+		JSValue nv = JS_GetPropertyUint32(ctx, argv[0], i);
+		JSValue sv = JS_GetPropertyUint32(ctx, argv[1], i);
+		struct dom_node *node = JS_GetOpaque(nv, node_class_id);
+		struct dom_node *slot = JS_GetOpaque(sv, node_class_id);
+		struct dom_node *host = NULL;
+		struct slot_entry *e;
+		unsigned b;
+		int hi;
+
+		JS_FreeValue(ctx, nv);
+		JS_FreeValue(ctx, sv);
+		if (node == NULL || slot_find_entry(&m, node) >= 0 ||
+		    dom_node_get_parent_node(node, &host) != DOM_NO_ERR ||
+		    host == NULL) {
+			continue;
+		}
+		e = &m.e[m.n];
+		e->node = dom_node_ref(node);
+		e->host = host;
+		e->slot = (slot != NULL) ? dom_node_ref(slot) : NULL;
+		e->next = -1;
+		for (b = slot_hash(node, m.mask); m.etab[b] >= 0;
+		     b = (b + 1) & m.mask)
+			;
+		m.etab[b] = (int)m.n;
+		if (slot != NULL) {
+			/* entries arrive in order; append to the slot's list */
+			hi = slot_find_head(&m, slot);
+			if (hi < 0) {
+				hi = (int)m.nh++;
+				m.h[hi].slot = dom_node_ref(slot);
+				m.h[hi].first = (int)m.n;
+				for (b = slot_hash(slot, m.mask);
+				     m.htab[b] >= 0; b = (b + 1) & m.mask)
+					;
+				m.htab[b] = hi;
+			} else {
+				int k = m.h[hi].first;
+
+				while (m.e[k].next >= 0) {
+					k = m.e[k].next;
+				}
+				m.e[k].next = (int)m.n;
+			}
+		}
+		m.n++;
+	}
+	thread->slots = m;
+	return JS_UNDEFINED;
 }
 
 /*
@@ -3768,7 +8053,73 @@ static void timer_callback(void *p)
 	ctx = thread->ctx;
 	begin_script(thread, SCRIPT_TIMER);
 	global = JS_GetGlobalObject(ctx);
-	ret = JS_Call(ctx, t->func, global, 0, NULL);
+	{
+		/*
+		 * How long this one took, and what it was (VitaSurf).
+		 * Wikipedia's 89 timers come to 23103 ms with almost no
+		 * DOM work in them, and an average cannot say whether
+		 * that is one enormous callback or a crowd of middling
+		 * ones; the name says which part of the page it is.
+		 */
+		uint64_t t0 = now_ms();
+		unsigned took;
+
+		if (JS_IsString(t->func)) {
+			size_t len = 0;
+			const char *src = JS_ToCStringLen(ctx, &len, t->func);
+
+			ret = src != NULL ?
+				JS_Eval(ctx, src, len, "<timer string>",
+					JS_EVAL_TYPE_GLOBAL) :
+				JS_EXCEPTION;
+			if (src != NULL) {
+				JS_FreeCString(ctx, src);
+			}
+		} else if (JS_IsObject(t->args)) {
+			JSValue av[8];
+			int64_t n = 0;
+			int i;
+
+			JS_GetLength(ctx, t->args, &n);
+			if (n > 8) n = 8;
+			for (i = 0; i < (int)n; i++) {
+				av[i] = JS_GetPropertyUint32(ctx, t->args,
+							     (uint32_t)i);
+			}
+			ret = JS_Call(ctx, t->func, global, (int)n, av);
+			for (i = 0; i < (int)n; i++) {
+				JS_FreeValue(ctx, av[i]);
+			}
+		} else {
+			ret = JS_Call(ctx, t->func, global, 0, NULL);
+		}
+		took = (unsigned)(now_ms() - t0);
+
+		if (took >= 50) {
+			vitasurf_js_timers_slow++;
+			vitasurf_ms_js_timers_slow += took;
+		}
+		if (took > vitasurf_ms_js_timer_max) {
+			JSValue nm = JS_GetPropertyStr(ctx, t->func, "name");
+			const char *ns = JS_ToCString(ctx, nm);
+
+			vitasurf_ms_js_timer_max = took;
+			if (ns != NULL && ns[0] != '\0') {
+				strncpy(vitasurf_js_timer_max_name, ns,
+					sizeof(vitasurf_js_timer_max_name) - 1);
+				vitasurf_js_timer_max_name[
+					sizeof(vitasurf_js_timer_max_name)
+						- 1] = '\0';
+			} else {
+				strcpy(vitasurf_js_timer_max_name,
+				       "(anonymous)");
+			}
+			if (ns != NULL) {
+				JS_FreeCString(ctx, ns);
+			}
+			JS_FreeValue(ctx, nm);
+		}
+	}
 	if (JS_IsException(ret)) {
 		qjs_report_exception(ctx);
 	}
@@ -3957,8 +8308,15 @@ static void xhr_fetch_callback(const fetch_msg *msg, void *p)
 
 		while (len > 0 && (h[len - 1] == '\r' || h[len - 1] == '\n')) len--;
 		if (len >= 5 && strncasecmp(h, "HTTP/", 5) == 0) {
+			/* the status line, with an end of its own: a
+			 * fetcher's buffer need not have one */
+			char line[64];
+			size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
 			int code = 0;
-			if (sscanf(h, "HTTP/%*[0-9.] %d", &code) == 1) {
+
+			memcpy(line, h, n);
+			line[n] = '\0';
+			if (sscanf(line, "HTTP/%*[0-9.] %d", &code) == 1) {
 				x->status = code;
 			}
 			/* a new status line (100 Continue, retries) restarts the headers */
@@ -4116,6 +8474,7 @@ static bool xhr_start(struct js_xhr *x)
 static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_xhr *x;
 	nsurl *page = NULL, *url = NULL;
@@ -4222,6 +8581,7 @@ static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_fetch_abort(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_xhr *x;
 	int32_t id = 0;
@@ -4262,6 +8622,7 @@ static void xhr_close_all(jsthread *thread)
 static JSValue ev_prevent_default(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)argc; (void)argv;
 	JS_SetPropertyStr(ctx, this_val, "defaultPrevented", JS_NewBool(ctx, true));
 	return JS_UNDEFINED;
@@ -4270,6 +8631,7 @@ static JSValue ev_prevent_default(JSContext *ctx, JSValueConst this_val,
 static JSValue ev_stop_propagation(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	(void)argc; (void)argv;
 	JS_SetPropertyStr(ctx, this_val, "cancelBubble", JS_NewBool(ctx, true));
 	return JS_UNDEFINED;
@@ -4392,6 +8754,66 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 	return obj;
 }
 
+/*
+ * The listeners of a destroyed thread, still registered with libdom,
+ * until no dispatch is walking a node's list (VitaSurf). Their nodes can
+ * outlive the thread: the page kept a frame's document, or a frame's
+ * script listened on the page's nodes. Freeing them with the thread left
+ * libdom calling freed memory, and build 478 crashed on claude.ai.
+ */
+static struct js_listener *orphan_listeners;
+static int trampoline_depth;
+static bool orphan_sweep_due;
+
+static void orphan_listener_free(struct js_listener *l)
+{
+	if (l->node != NULL && l->type != NULL && l->dom_listener != NULL) {
+		dom_event_target_remove_event_listener(l->node, l->type,
+						       l->dom_listener,
+						       l->capture);
+	}
+	if (l->dom_listener != NULL) dom_event_listener_unref(l->dom_listener);
+	if (l->type != NULL) dom_string_unref(l->type);
+	if (l->node != NULL) dom_node_unref(l->node);
+	free(l);
+}
+
+static void orphan_sweep_cb(void *p)
+{
+	(void)p;
+	orphan_sweep_due = false;
+	if (trampoline_depth > 0) {
+		orphan_sweep_due = true;
+		guit->misc->schedule(10, orphan_sweep_cb, NULL);
+		return;
+	}
+	while (orphan_listeners != NULL) {
+		struct js_listener *l = orphan_listeners;
+
+		orphan_listeners = l->next;
+		orphan_listener_free(l);
+	}
+}
+
+/** Unregister and free a destroyed thread's listener, now or later. */
+static void orphan_listener(struct js_listener *l)
+{
+	l->thread = NULL;
+	l->dead = true;
+	if (trampoline_depth == 0) {
+		orphan_listener_free(l);
+		return;
+	}
+	/* a dispatch is walking some node's list: taking l off it now
+	 * could corrupt that walk */
+	l->next = orphan_listeners;
+	orphan_listeners = l;
+	if (!orphan_sweep_due) {
+		orphan_sweep_due = true;
+		guit->misc->schedule(0, orphan_sweep_cb, NULL);
+	}
+}
+
 static void listener_trampoline(struct dom_event *evt, void *pw)
 {
 	struct js_listener *l = pw;
@@ -4408,10 +8830,12 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		return;
 	}
 	ctx = thread->ctx;
+	trampoline_depth++;
 	thread->event_depth++;
 	begin_script(thread, SCRIPT_EVENT);
-	/* this is the element the listener was added to */
-	global = wrap_node(ctx, l->node);
+	/* this is the element the listener was added to, or the window */
+	global = l->on_window ? JS_GetGlobalObject(ctx) :
+		wrap_node(ctx, l->node);
 	/* an event dispatchEvent created keeps its JS object (detail etc) */
 	for (d = thread->dispatches; d != NULL; d = d->next) {
 		if (d->evt == evt) {
@@ -4433,9 +8857,16 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	} else {
 		event_obj = wrap_event(ctx, evt);
 	}
+	if (l->on_window) {
+		JS_SetPropertyStr(ctx, event_obj, "currentTarget",
+				  JS_DupValue(ctx, global));
+	}
 	/* which phase the listener is being called in, which an event out
 	 * of dispatch does not have at all */
-	{
+	if (l->on_window && thread->window_phase != 0) {
+		JS_SetPropertyStr(ctx, event_obj, "eventPhase",
+				  JS_NewInt32(ctx, thread->window_phase));
+	} else {
 		dom_event_flow_phase phase = DOM_AT_TARGET;
 
 		if (dom_event_get_event_phase(evt, &phase) == DOM_NO_ERR) {
@@ -4448,7 +8879,30 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 	if (l->passive) {
 		JS_SetPropertyStr(ctx, event_obj, "__vitaPassive", JS_TRUE);
 	}
-	ret = JS_Call(ctx, l->func, global, 1, args);
+	/* window.event is the event while a listener has it (VitaSurf):
+	 * older code reads it instead of taking the argument */
+	{
+		JSValue win = JS_GetGlobalObject(ctx);
+		JSValue prev = JS_GetPropertyStr(ctx, win, "event");
+
+		JS_SetPropertyStr(ctx, win, "event",
+				  JS_DupValue(ctx, event_obj));
+		if (JS_IsFunction(ctx, l->func)) {
+			ret = JS_Call(ctx, l->func, global, 1, args);
+		} else {
+			/* an EventListener object: its handleEvent, with
+			 * the object as this, looked up at each call */
+			JSValue he = JS_GetPropertyStr(ctx, l->func,
+						       "handleEvent");
+
+			ret = JS_IsFunction(ctx, he) ?
+				JS_Call(ctx, he, l->func, 1, args) :
+				JS_UNDEFINED;
+			JS_FreeValue(ctx, he);
+		}
+		JS_SetPropertyStr(ctx, win, "event", prev);
+		JS_FreeValue(ctx, win);
+	}
 	if (l->passive) {
 		JS_SetPropertyStr(ctx, event_obj, "__vitaPassive", JS_FALSE);
 	}
@@ -4474,10 +8928,19 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		dom_event_stop_propagation(evt);
 	}
 	JS_FreeValue(ctx, flag);
+	/* stopImmediatePropagation: the rest on this target as well
+	 * (VitaSurf), which went on being called */
+	flag = JS_GetPropertyStr(ctx, event_obj, "__stopNow");
+	if (JS_ToBool(ctx, flag) == 1) {
+		dom_event_stop_immediate_propagation(evt);
+		thread->stop_now_seen = true;
+	}
+	JS_FreeValue(ctx, flag);
 	JS_FreeValue(ctx, event_obj);
 	JS_FreeValue(ctx, global);
 	end_script(thread);
 	thread->event_depth--;
+	trampoline_depth--;
 	/*
 	 * A once listener is spent. It cannot be freed here: libdom is
 	 * still inside the dispatch that is walking the list it is in, and
@@ -4489,6 +8952,70 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		if (l->thread != NULL) {
 			l->thread->dead_listeners++;
 		}
+	}
+}
+
+/*
+ * Run the window's listeners for evt (VitaSurf): which is 1 for the
+ * capturing ones, 3 for the bubbling ones and 2 for all of them, when
+ * the window is the target. They are collected first, as a listener may
+ * add or remove others.
+ */
+static void run_window_listeners(jsthread *thread, struct dom_event *evt,
+				 int which)
+{
+	struct js_listener *l, **run = NULL;
+	dom_string *type = NULL;
+	unsigned n = 0, cap = 0, i;
+
+	if (thread == NULL || thread->closed ||
+	    dom_event_get_type(evt, &type) != DOM_NO_ERR || type == NULL) {
+		return;
+	}
+	for (l = thread->listeners; l != NULL; l = l->next) {
+		if (!l->on_window || l->dead || l->type == NULL ||
+		    (which == 1 && !l->capture) ||
+		    (which == 3 && l->capture) ||
+		    !dom_string_isequal(l->type, type)) {
+			continue;
+		}
+		if (n == cap) {
+			struct js_listener **g;
+
+			cap = cap ? cap * 2 : 8;
+			g = realloc(run, cap * sizeof(*run));
+			if (g == NULL) break;
+			run = g;
+		}
+		run[n++] = l;
+	}
+	dom_string_unref(type);
+	/* registration order: the thread's list is newest first */
+	thread->stop_now_seen = false;
+	thread->event_depth++;
+	for (i = n; i > 0; i--) {
+		listener_trampoline(evt, run[i - 1]);
+		if (thread->closed || thread->stop_now_seen) break;
+	}
+	thread->event_depth--;
+	free(run);
+}
+
+/* libdom's window step: a dispatch in a page's document reaches here
+ * before its capture phase and after its bubbling phase */
+static void window_hook(struct dom_event *evt, struct dom_document *doc,
+			bool capture, void *pw)
+{
+	jsthread *t;
+
+	(void)pw;
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		if (!t->closed && !t->is_worker && thread_document(t) == doc) {
+			break;
+		}
+	}
+	if (t != NULL) {
+		run_window_listeners(t, evt, capture ? 1 : 3);
 	}
 }
 
@@ -4506,6 +9033,14 @@ static void free_keys(struct find_key *keys, int n)
 			free(keys[i].classes[j]);
 		}
 		free(keys[i].classes);
+		for (j = 0; j < keys[i].nattrs; j++) {
+			if (keys[i].attrs[j] != NULL)
+				dom_string_unref(keys[i].attrs[j]);
+			if (keys[i].attrs_lc[j] != NULL)
+				dom_string_unref(keys[i].attrs_lc[j]);
+		}
+		free(keys[i].attrs);
+		free(keys[i].attrs_lc);
 	}
 	free(keys);
 }
@@ -4572,6 +9107,48 @@ static struct find_key *build_keys(JSContext *ctx, JSValueConst arr, int *count)
 			}
 		}
 		JS_FreeValue(ctx, cls);
+		/* the attribute names the compound needs (VitaSurf) */
+		{
+			JSValue at = JS_GetPropertyStr(ctx, k, "attrs");
+			JSValue alen = JS_GetPropertyStr(ctx, at, "length");
+			uint32_t na = 0;
+
+			JS_ToUint32(ctx, &na, alen);
+			JS_FreeValue(ctx, alen);
+			if (na > 0 && na <= 16) {
+				keys[i].attrs = calloc(na, sizeof(dom_string *));
+				keys[i].attrs_lc = calloc(na, sizeof(dom_string *));
+			}
+			if (keys[i].attrs != NULL && keys[i].attrs_lc != NULL) {
+				for (j = 0; j < na; j++) {
+					JSValue av = JS_GetPropertyUint32(ctx, at, j);
+					char *nm = key_string(ctx, av, "name");
+
+					JS_FreeValue(ctx, av);
+					if (nm == NULL || nm[0] == '\0') {
+						free(nm);
+						continue;
+					}
+					keys[i].attrs[keys[i].nattrs] =
+						to_dom_string(nm);
+					{
+						char *c;
+
+						for (c = nm; *c; c++) {
+							if (*c >= 'A' && *c <= 'Z')
+								*c = (char) (*c + 32);
+						}
+					}
+					keys[i].attrs_lc[keys[i].nattrs] =
+						to_dom_string(nm);
+					free(nm);
+					if (keys[i].attrs[keys[i].nattrs] == NULL)
+						continue;
+					keys[i].nattrs++;
+				}
+			}
+			JS_FreeValue(ctx, at);
+		}
 		JS_FreeValue(ctx, k);
 	}
 	*count = (int)n;
@@ -4635,6 +9212,17 @@ static bool key_matches(struct dom_node *n, const struct find_key *k,
 			return false;
 		}
 	}
+	for (i = 0; i < k->nattrs; i++) {
+		bool has = false;
+
+		dom_element_has_attribute(n, k->attrs[i], &has);
+		if (!has && k->attrs_lc[i] != NULL) {
+			dom_element_has_attribute(n, k->attrs_lc[i], &has);
+		}
+		if (!has) {
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -4654,6 +9242,7 @@ static JSValue vita_find_impl(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 			     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	uint64_t t0 = now_ms();
 	JSValue r = vita_find_impl(ctx, this_val, argc, argv);
 
@@ -4665,6 +9254,7 @@ static JSValue win_vita_find(JSContext *ctx, JSValueConst this_val,
 static JSValue vita_find_impl(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *root = NULL;
 	struct find_key *keys;
@@ -4724,6 +9314,7 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
 		    type == DOM_ELEMENT_NODE) {
 			dom_string *tag = NULL, *id = NULL, *cls = NULL;
 
+			find_visits++;
 			/* The local name, as libdom's own tag lookup matched
 			 * it: getElementsByTagNameNS("ns", "body") finds the
 			 * element made as createElementNS("ns", "te:body"),
@@ -4783,6 +9374,1119 @@ static JSValue find_in_subtree(JSContext *ctx, struct dom_node *root,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Selectors answered in C (VitaSurf)                                        */
+
+/*
+ * GitHub's pages asked for about 400,000 selector matches in one load:
+ * catalyst's lazy loader asks every added element for each tag it may
+ * load, and selector-observer asks every added element whether it
+ * matches each of hundreds of selectors. Every call went through three
+ * or four JavaScript frames before any work was done, and on this CPU
+ * that overhead, not the matching, filled a 20 s timer the budget
+ * stopped.
+ *
+ * So matches, querySelector, querySelectorAll and closest are native
+ * functions. They answer in C any selector made only of type, #id,
+ * .class and [attribute] tests joined by descendant, >, + and ~, and
+ * hand everything else -- pseudo-classes, escapes, namespaces, anything
+ * this parser is unsure of -- to the prelude's engine unchanged. The
+ * parser is deliberately stricter than the prelude's, and the matching
+ * follows the prelude's rules (matchSimple, attrOk, matchAt) exactly, so
+ * a selector gets the same answer whichever side takes it.
+ */
+
+enum sel_op {
+	SOP_EXISTS, SOP_EQ, SOP_INCL, SOP_DASH, SOP_PREFIX, SOP_SUFFIX,
+	SOP_SUBSTR
+};
+
+struct sel_attr {
+	dom_string *name;
+	enum sel_op op;
+	char *val;
+	size_t vlen;
+};
+
+struct sel_compound {
+	char *tag;		/**< type selector, NULL for none or * */
+	size_t tag_len;
+	uint32_t tag_hash;	/**< tag_hash_lower of tag */
+	char *id;
+	size_t id_len;
+	char **classes;
+	int nclasses;
+	struct sel_attr *attrs;
+	int nattrs;
+	/* :not() of a compound, each of which must not match (VitaSurf) */
+	struct sel_compound *nots;
+	int nnots;
+	char comb;		/**< joins it to the one before: ' ' > + ~ */
+};
+
+struct sel_group {
+	struct sel_compound *parts;
+	int n;
+};
+
+struct sel_compiled {
+	struct sel_compiled *next;
+	char *text;
+	struct sel_group *groups;
+	int ngroups;		/**< -1: not one of ours */
+};
+
+#define SEL_CACHE_MAX 1024
+
+static void sel_free_compound(struct sel_compound *c)
+{
+	int i;
+
+	free(c->tag);
+	free(c->id);
+	for (i = 0; i < c->nclasses; i++) free(c->classes[i]);
+	free(c->classes);
+	for (i = 0; i < c->nattrs; i++) {
+		if (c->attrs[i].name != NULL) dom_string_unref(c->attrs[i].name);
+		free(c->attrs[i].val);
+	}
+	free(c->attrs);
+	for (i = 0; i < c->nnots; i++) sel_free_compound(&c->nots[i]);
+	free(c->nots);
+}
+
+static void sel_free(struct sel_compiled *s)
+{
+	int g, i;
+
+	for (g = 0; g < s->ngroups; g++) {
+		for (i = 0; i < s->groups[g].n; i++) {
+			sel_free_compound(&s->groups[g].parts[i]);
+		}
+		free(s->groups[g].parts);
+	}
+	free(s->groups);
+	free(s->text);
+	free(s);
+}
+
+/*
+ * Forget the strings sel_lookup remembers (VitaSurf): before the
+ * selectors they point at are freed, and before the context goes.
+ */
+static void sel_recent_free(jsthread *thread)
+{
+	unsigned i;
+
+	for (i = 0; i < SEL_RECENT; i++) {
+		struct sel_recent *r = &thread->sel_recent[i];
+
+		if (r->key != NULL && thread->ctx != NULL) {
+			JS_FreeValue(thread->ctx, r->str);
+		}
+		r->key = NULL;
+		r->s = NULL;
+	}
+}
+
+static void sel_cache_free(jsthread *thread)
+{
+	unsigned b;
+
+	sel_recent_free(thread);
+
+	for (b = 0; b < 128; b++) {
+		while (thread->sel_cache[b] != NULL) {
+			struct sel_compiled *next = thread->sel_cache[b]->next;
+
+			sel_free(thread->sel_cache[b]);
+			thread->sel_cache[b] = next;
+		}
+	}
+	thread->sel_cache_n = 0;
+}
+
+static bool sel_ident_char(char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
+static bool sel_ws(char c)
+{
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+}
+
+static char *sel_dup(const char *s, size_t n)
+{
+	char *d = malloc(n + 1);
+
+	if (d != NULL) {
+		memcpy(d, s, n);
+		d[n] = '\0';
+	}
+	return d;
+}
+
+/* An identifier run at *p; its length, 0 for none. */
+static size_t sel_ident(const char *p, const char *end)
+{
+	const char *q = p;
+
+	while (q < end && sel_ident_char(*q)) q++;
+	return (size_t)(q - p);
+}
+
+/*
+ * One compound, in the only order the prelude's SIMPLE_RE accepts:
+ * type? #id? .class* [attr]*. false for anything else.
+ */
+static bool sel_parse_compound(const char **pp, const char *end,
+			       struct sel_compound *c)
+{
+	const char *p = *pp;
+	size_t n;
+
+	if (p < end && *p == '*') {
+		p++;
+	} else if (p < end && ((*p >= 'a' && *p <= 'z') ||
+			       (*p >= 'A' && *p <= 'Z'))) {
+		n = sel_ident(p, end);
+		c->tag = sel_dup(p, n);
+		if (c->tag == NULL) return false;
+		c->tag_len = n;
+		c->tag_hash = tag_hash_lower(p, n);
+		p += n;
+	}
+	if (p < end && *p == '#') {
+		n = sel_ident(p + 1, end);
+		if (n == 0) return false;
+		c->id = sel_dup(p + 1, n);
+		if (c->id == NULL) return false;
+		c->id_len = n;
+		p += 1 + n;
+	}
+	while (p < end && *p == '.') {
+		char **grown;
+
+		n = sel_ident(p + 1, end);
+		if (n == 0) return false;
+		grown = realloc(c->classes, (size_t)(c->nclasses + 1) *
+				sizeof(*grown));
+		if (grown == NULL) return false;
+		c->classes = grown;
+		c->classes[c->nclasses] = sel_dup(p + 1, n);
+		if (c->classes[c->nclasses] == NULL) return false;
+		c->nclasses++;
+		p += 1 + n;
+	}
+	while (p < end && *p == '[') {
+		struct sel_attr a, *grown;
+		const char *name;
+		size_t nlen;
+		char *nm;
+
+		memset(&a, 0, sizeof(a));
+		p++;
+		while (p < end && sel_ws(*p)) p++;
+		name = p;
+		nlen = sel_ident(p, end);
+		if (nlen == 0) return false;
+		p += nlen;
+		while (p < end && sel_ws(*p)) p++;
+		if (p >= end) return false;
+		if (*p == ']') {
+			a.op = SOP_EXISTS;
+		} else {
+			if (*p == '=') {
+				a.op = SOP_EQ;
+				p++;
+			} else if (p + 1 < end && p[1] == '=') {
+				switch (*p) {
+				case '~': a.op = SOP_INCL; break;
+				case '|': a.op = SOP_DASH; break;
+				case '^': a.op = SOP_PREFIX; break;
+				case '$': a.op = SOP_SUFFIX; break;
+				case '*': a.op = SOP_SUBSTR; break;
+				default: return false;
+				}
+				p += 2;
+			} else {
+				return false;
+			}
+			while (p < end && sel_ws(*p)) p++;
+			if (p < end && (*p == '"' || *p == '\'')) {
+				char q = *p++;
+				const char *v = p;
+
+				while (p < end && *p != q) {
+					if (*p == '\\' || *p == '"' ||
+					    *p == '\'' || *p == ']' ||
+					    *p == '\n')
+						return false;
+					p++;
+				}
+				if (p >= end || p == v) return false;
+				a.val = sel_dup(v, (size_t)(p - v));
+				a.vlen = (size_t)(p - v);
+				p++;
+			} else {
+				n = sel_ident(p, end);
+				if (n == 0) return false;
+				a.val = sel_dup(p, n);
+				a.vlen = n;
+				p += n;
+			}
+			if (a.val == NULL) return false;
+			/* the prelude's ~= reads spaces in the value its
+			 * own way; leave those to it */
+			if (a.op == SOP_INCL) {
+				size_t k;
+
+				for (k = 0; k < a.vlen; k++) {
+					if (sel_ws(a.val[k])) {
+						free(a.val);
+						return false;
+					}
+				}
+			}
+			while (p < end && sel_ws(*p)) p++;
+			if (p >= end || *p != ']') {
+				free(a.val);
+				return false;
+			}
+		}
+		p++;	/* ] */
+		nm = sel_dup(name, nlen);
+		if (nm == NULL) {
+			free(a.val);
+			return false;
+		}
+		a.name = to_dom_string(nm);
+		free(nm);
+		if (a.name == NULL) {
+			free(a.val);
+			return false;
+		}
+		grown = realloc(c->attrs, (size_t)(c->nattrs + 1) *
+				sizeof(*grown));
+		if (grown == NULL) {
+			dom_string_unref(a.name);
+			free(a.val);
+			return false;
+		}
+		c->attrs = grown;
+		c->attrs[c->nattrs++] = a;
+	}
+	/*
+	 * :not() of one compound (VitaSurf). GitHub asks
+	 * '[data-deferred-details-content-url]:not([data-details-no-preload-
+	 * on-hover])' of every element its selector observer sees, over
+	 * 3,000 times a load, and each went through the prelude. A list,
+	 * a combinator or anything else inside is left to it.
+	 */
+	while (end - p > 5 && strncmp(p, ":not(", 5) == 0) {
+		const char *in = p + 5, *close = in, *q;
+		struct sel_compound inner, *grown;
+
+		while (close < end && *close != ')') {
+			if (*close == '(' || *close == ',') return false;
+			close++;
+		}
+		if (close >= end) return false;
+		while (in < close && sel_ws(*in)) in++;
+		q = close;
+		while (q > in && sel_ws(q[-1])) q--;
+		memset(&inner, 0, sizeof(inner));
+		if (in == q || !sel_parse_compound(&in, q, &inner) || in != q) {
+			sel_free_compound(&inner);
+			return false;
+		}
+		grown = realloc(c->nots, (size_t)(c->nnots + 1) *
+				sizeof(*grown));
+		if (grown == NULL) {
+			sel_free_compound(&inner);
+			return false;
+		}
+		c->nots = grown;
+		c->nots[c->nnots++] = inner;
+		p = close + 1;
+	}
+	/* a compound ends at white space, a combinator, a comma or the end */
+	if (p < end && !sel_ws(*p) && *p != '>' && *p != '+' && *p != '~' &&
+	    *p != ',') {
+		return false;
+	}
+	if (p == *pp) {
+		return false;	/* nothing at all */
+	}
+	*pp = p;
+	return true;
+}
+
+/* A selector list, or NULL when any part of it is not ours. */
+static struct sel_compiled *sel_parse(const char *text, size_t len)
+{
+	struct sel_compiled *s = calloc(1, sizeof(*s));
+	const char *p = text, *end = text + len;
+
+	if (s == NULL) return NULL;
+	for (;;) {
+		struct sel_group *gg;
+		struct sel_group *g;
+		char comb = 0;
+		bool need = true;	/* a compound must come next */
+
+		gg = realloc(s->groups, (size_t)(s->ngroups + 1) * sizeof(*gg));
+		if (gg == NULL) goto fail;
+		s->groups = gg;
+		g = &s->groups[s->ngroups++];
+		memset(g, 0, sizeof(*g));
+		while (p < end && sel_ws(*p)) p++;
+		for (;;) {
+			struct sel_compound *pa;
+			bool ws = false;
+
+			if (need) {
+				pa = realloc(g->parts, (size_t)(g->n + 1) *
+					     sizeof(*pa));
+				if (pa == NULL) goto fail;
+				g->parts = pa;
+				memset(&g->parts[g->n], 0, sizeof(*pa));
+				g->n++;
+				if (!sel_parse_compound(&p, end,
+							&g->parts[g->n - 1]))
+					goto fail;
+				g->parts[g->n - 1].comb = g->n == 1 ? 0 :
+					(comb != 0 ? comb : ' ');
+				need = false;
+				comb = 0;
+			}
+			while (p < end && sel_ws(*p)) {
+				p++;
+				ws = true;
+			}
+			if (p >= end || *p == ',') {
+				break;
+			}
+			if (*p == '>' || *p == '+' || *p == '~') {
+				comb = *p++;
+				while (p < end && sel_ws(*p)) p++;
+				if (p >= end || *p == ',' || *p == '>' ||
+				    *p == '+' || *p == '~')
+					goto fail;	/* dangling */
+				need = true;
+				continue;
+			}
+			if (!ws) goto fail;
+			need = true;	/* descendant */
+		}
+		if (p >= end) break;
+		p++;	/* , */
+		while (p < end && sel_ws(*p)) p++;
+		if (p >= end) goto fail;	/* trailing comma */
+	}
+	return s;
+fail:
+	sel_free(s);
+	return NULL;
+}
+
+static unsigned sel_bucket(const char *text, size_t len)
+{
+	unsigned h = 5381;
+	size_t i;
+
+	for (i = 0; i < len; i++) h = h * 33u + (unsigned char)text[i];
+	return h % 128u;
+}
+
+/* The compiled form of a selector, parsed once per page. */
+static struct sel_compiled *sel_get(jsthread *thread, const char *text,
+				    size_t len)
+{
+	unsigned b = sel_bucket(text, len);
+	struct sel_compiled *s;
+
+	for (s = thread->sel_cache[b]; s != NULL; s = s->next) {
+		if (strlen(s->text) == len && memcmp(s->text, text, len) == 0)
+			return s;
+	}
+	if (thread->sel_cache_n >= SEL_CACHE_MAX) {
+		sel_cache_free(thread);
+	}
+	s = len > 0 && memchr(text, '\0', len) == NULL ?
+		sel_parse(text, len) : NULL;
+	if (s == NULL) {
+		s = calloc(1, sizeof(*s));
+		if (s == NULL) return NULL;
+		s->ngroups = -1;
+	}
+	s->text = sel_dup(text, len);
+	if (s->text == NULL) {
+		sel_free(s);
+		return NULL;
+	}
+	s->next = thread->sel_cache[b];
+	thread->sel_cache[b] = s;
+	thread->sel_cache_n++;
+	return s;
+}
+
+static bool sel_is_element(struct dom_node *n)
+{
+	dom_node_type type = 0;
+
+	return n != NULL && dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+		type == DOM_ELEMENT_NODE;
+}
+
+/* The prelude's matchSimple, for the parts this side handles. */
+static bool sel_match_compound(struct dom_node *n, const struct sel_compound *c)
+{
+	int i;
+
+	if (c->tag != NULL) {
+		dom_string *local = NULL;
+		bool hit;
+
+		dom_node_get_local_name(n, &local);
+		hit = tag_is(n, local, c->tag, c->tag_len);
+		if (local != NULL) dom_string_unref(local);
+		if (!hit) return false;
+	}
+	if (c->id != NULL) {
+		dom_string *v = NULL;
+		bool hit;
+
+		dom_element_get_attribute(n, corestring_dom_id, &v);
+		hit = dom_string_is(v, c->id, c->id_len);
+		if (v != NULL) dom_string_unref(v);
+		if (!hit) return false;
+	}
+	if (c->nclasses > 0) {
+		dom_string *v = NULL;
+		bool hit = true;
+
+		dom_element_get_attribute(n, corestring_dom_class, &v);
+		if (v == NULL) return false;
+		for (i = 0; i < c->nclasses && hit; i++) {
+			hit = class_present(dom_string_data(v),
+					    dom_string_byte_length(v),
+					    c->classes[i]);
+		}
+		dom_string_unref(v);
+		if (!hit) return false;
+	}
+	for (i = 0; i < c->nattrs; i++) {
+		const struct sel_attr *a = &c->attrs[i];
+		dom_string *v = NULL;
+		const char *d;
+		size_t dl;
+		bool hit = false;
+
+		dom_element_get_attribute(n, a->name, &v);
+		if (v == NULL) return false;
+		d = dom_string_data(v);
+		dl = dom_string_byte_length(v);
+		switch (a->op) {
+		case SOP_EXISTS:
+			hit = true;
+			break;
+		case SOP_EQ:
+			hit = dl == a->vlen && memcmp(d, a->val, dl) == 0;
+			break;
+		case SOP_PREFIX:
+			hit = dl >= a->vlen && memcmp(d, a->val, a->vlen) == 0;
+			break;
+		case SOP_SUFFIX:
+			hit = dl >= a->vlen &&
+				memcmp(d + dl - a->vlen, a->val, a->vlen) == 0;
+			break;
+		case SOP_SUBSTR: {
+			size_t k;
+
+			for (k = 0; k + a->vlen <= dl && !hit; k++) {
+				hit = memcmp(d + k, a->val, a->vlen) == 0;
+			}
+			break;
+		}
+		case SOP_DASH:
+			hit = (dl == a->vlen && memcmp(d, a->val, dl) == 0) ||
+				(dl > a->vlen && memcmp(d, a->val, a->vlen) == 0
+				 && d[a->vlen] == '-');
+			break;
+		case SOP_INCL: {
+			/* (' '+v+' ').indexOf(' '+val+' '): a run of the
+			 * value between spaces or the ends */
+			size_t k;
+
+			for (k = 0; k + a->vlen <= dl && !hit; k++) {
+				if ((k == 0 || d[k - 1] == ' ') &&
+				    (k + a->vlen == dl || d[k + a->vlen] == ' ') &&
+				    memcmp(d + k, a->val, a->vlen) == 0)
+					hit = true;
+			}
+			break;
+		}
+		}
+		dom_string_unref(v);
+		if (!hit) return false;
+	}
+	for (i = 0; i < c->nnots; i++) {
+		if (sel_match_compound(n, &c->nots[i])) return false;
+	}
+	return true;
+}
+
+static struct dom_node *sel_parent_element(struct dom_node *n)
+{
+	struct dom_node *up = NULL;
+
+	if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) return NULL;
+	if (up != NULL && !sel_is_element(up)) {
+		dom_node_unref(up);
+		return NULL;
+	}
+	return up;
+}
+
+static struct dom_node *sel_prev_element(struct dom_node *n)
+{
+	struct dom_node *p = NULL;
+
+	if (dom_node_get_previous_sibling(n, &p) != DOM_NO_ERR) return NULL;
+	while (p != NULL && !sel_is_element(p)) {
+		struct dom_node *q = NULL;
+
+		dom_node_get_previous_sibling(p, &q);
+		dom_node_unref(p);
+		p = q;
+	}
+	return p;
+}
+
+/* The prelude's matchAt: parts[0..i], parts[i] applying to n. */
+static bool sel_match_at(struct dom_node *n, const struct sel_group *g, int i)
+{
+	struct dom_node *m, *next;
+	bool hit = false;
+
+	if (!sel_match_compound(n, &g->parts[i])) return false;
+	if (i == 0) return true;
+	switch (g->parts[i].comb) {
+	case '>':
+		m = sel_parent_element(n);
+		if (m == NULL) return false;
+		hit = sel_match_at(m, g, i - 1);
+		dom_node_unref(m);
+		return hit;
+	case '+':
+		m = sel_prev_element(n);
+		if (m == NULL) return false;
+		hit = sel_match_at(m, g, i - 1);
+		dom_node_unref(m);
+		return hit;
+	case '~':
+		for (m = sel_prev_element(n); m != NULL && !hit; m = next) {
+			hit = sel_match_at(m, g, i - 1);
+			next = hit ? NULL : sel_prev_element(m);
+			dom_node_unref(m);
+		}
+		return hit;
+	default:
+		for (m = sel_parent_element(n); m != NULL && !hit; m = next) {
+			hit = sel_match_at(m, g, i - 1);
+			next = hit ? NULL : sel_parent_element(m);
+			dom_node_unref(m);
+		}
+		return hit;
+	}
+}
+
+static bool sel_matches(struct dom_node *n, const struct sel_compiled *s)
+{
+	int g;
+
+	if (!sel_is_element(n)) return false;
+	for (g = 0; g < s->ngroups; g++) {
+		if (sel_match_at(n, &s->groups[g], s->groups[g].n - 1))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * The compiled selector for a script's string (VitaSurf), found by the
+ * string's own address when it was asked for lately; see jsthread's
+ * sel_recent. NULL with *failed set if the string could not be read.
+ */
+static struct sel_compiled *sel_lookup(JSContext *ctx, jsthread *thread,
+				       JSValueConst str, bool *failed)
+{
+	const void *key = JS_VALUE_GET_PTR(str);
+	struct sel_recent *r =
+		&thread->sel_recent[((uintptr_t) key >> 4) & (SEL_RECENT - 1)];
+	struct sel_compiled *s;
+	const char *text;
+	size_t len;
+
+	*failed = false;
+	if (key != NULL && r->key == key) {
+		vitasurf_js_sel_recent_hits++;
+		return r->s;
+	}
+	text = JS_ToCStringLen(ctx, &len, str);
+	if (text == NULL) {
+		*failed = true;
+		return NULL;
+	}
+	s = sel_get(thread, text, len);
+	JS_FreeCString(ctx, text);
+	if (s != NULL && key != NULL) {
+		if (r->key != NULL) JS_FreeValue(ctx, r->str);
+		r->key = key;
+		r->str = JS_DupValue(ctx, str);
+		r->s = s;
+	}
+	return s;
+}
+
+/* The one compound of a selector that is a bare tag and nothing else,
+ * or NULL. */
+static const struct sel_compound *sel_bare_tag(const struct sel_compiled *s)
+{
+	const struct sel_compound *c;
+
+	if (s->ngroups != 1 || s->groups[0].n != 1) return NULL;
+	c = &s->groups[0].parts[0];
+	if (c->tag == NULL || c->id != NULL || c->nclasses != 0 ||
+	    c->nattrs != 0 || c->nnots != 0) {
+		return NULL;
+	}
+	return c;
+}
+
+/*
+ * __vitaSelectorNative(kind, fallback): the native matches (0),
+ * querySelector (1), querySelectorAll (2) or closest (3), answering in C
+ * what it can and calling fallback with the same this and arguments for
+ * the rest.
+ */
+static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
+			  JSValueConst *argv, int magic, JSValue *data)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *root, *n = NULL;
+	struct sel_compiled *s = NULL;
+	const struct sel_compound *bare;
+	bool failed = false;
+	JSValue out = JS_NULL;
+	uint32_t out_n = 0, visits0;
+
+	if (thread == NULL || argc < 1 || !JS_IsString(argv[0]) ||
+	    (root = JS_GetOpaque(this_val, node_class_id)) == NULL) {
+		return JS_Call(ctx, data[0], this_val, argc, argv);
+	}
+	s = sel_lookup(ctx, thread, argv[0], &failed);
+	if (failed) return JS_EXCEPTION;
+	if (s == NULL || s->ngroups < 0) {
+		return JS_Call(ctx, data[0], this_val, argc, argv);
+	}
+	vitasurf_js_sel_tag_fast++;
+	switch (magic) {
+	case 0:
+		vitasurf_js_sel_matches++;
+		return JS_NewBool(ctx, sel_matches(root, s));
+	case 3:
+		vitasurf_js_sel_closest++;
+		vitasurf_js_sel_closest_native++;
+		n = sel_is_element(root) ? dom_node_ref(root) : NULL;
+		while (n != NULL) {
+			struct dom_node *up;
+
+			vitasurf_js_sel_closest_steps++;
+			if (sel_matches(n, s)) {
+				out = wrap_node(ctx, n);
+				dom_node_unref(n);
+				return out;
+			}
+			up = sel_parent_element(n);
+			dom_node_unref(n);
+			n = up;
+		}
+		return JS_NULL;
+	default:
+		break;
+	}
+	if (magic == 2) {
+		vitasurf_js_sel_all++;
+		out = JS_NewArray(ctx);
+	} else {
+		vitasurf_js_sel_one++;
+	}
+	bare = sel_bare_tag(s);
+	if (bare != NULL && tags_absent(thread, root, bare->tag_hash)) {
+		return out;
+	}
+	visits0 = vitasurf_js_sel_tag_visits;
+	/* iterative pre-order walk; root itself is not a candidate */
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+
+		if (sel_is_element(n)) {
+			vitasurf_js_sel_tag_visits++;
+			if (sel_matches(n, s)) {
+				if (magic == 1) {
+					out = wrap_node(ctx, n);
+					dom_node_unref(n);
+					break;
+				}
+				JS_SetPropertyUint32(ctx, out, out_n++,
+						     wrap_node(ctx, n));
+			}
+		}
+		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+			next = NULL;
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	if (s->text != NULL) {
+		walk_cost_note(magic == 2 ? "querySelectorAll" :
+			       "querySelector", s->text, strlen(s->text),
+			       vitasurf_js_sel_tag_visits - visits0,
+			       walk_from_top(thread, root));
+	}
+	return out;
+}
+
+/*
+ * __vitaUtf8Decode(u8): the text of a Uint8Array that is strictly valid
+ * UTF-8, with a leading byte order mark dropped, or undefined for
+ * anything else, which the prelude's own decoder then handles with its
+ * replacement-character rules (VitaSurf). The prelude decoded every
+ * fetched body a byte at a time in script: 5 % of GitHub's profile.
+ */
+static JSValue win_vita_utf8_decode(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	size_t n = 0, i = 0, start;
+	uint8_t *p;
+
+	(void)this_val;
+	if (argc < 1) return JS_UNDEFINED;
+	p = JS_GetUint8Array(ctx, &n, argv[0]);
+	if (p == NULL) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return JS_UNDEFINED;
+	}
+	if (n >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) i = 3;
+	start = i;
+	while (i < n) {
+		uint8_t c = p[i];
+		size_t need, k;
+		uint8_t lo = 0x80, hi = 0xBF;
+
+		if (c < 0x80) { i++; continue; }
+		if (c >= 0xC2 && c <= 0xDF) need = 1;
+		else if (c >= 0xE0 && c <= 0xEF) {
+			need = 2;
+			if (c == 0xE0) lo = 0xA0;
+			if (c == 0xED) hi = 0x9F;
+		} else if (c >= 0xF0 && c <= 0xF4) {
+			need = 3;
+			if (c == 0xF0) lo = 0x90;
+			if (c == 0xF4) hi = 0x8F;
+		} else {
+			return JS_UNDEFINED;
+		}
+		if (i + need >= n) {
+			return JS_UNDEFINED;	/* cut short */
+		}
+		if (p[i + 1] < lo || p[i + 1] > hi) return JS_UNDEFINED;
+		for (k = 2; k <= need; k++) {
+			if (p[i + k] < 0x80 || p[i + k] > 0xBF) {
+				return JS_UNDEFINED;
+			}
+		}
+		i += need + 1;
+	}
+	return JS_NewStringLen(ctx, (const char *)p + start, n - start);
+}
+
+/*
+ * The Symbol.hasInstance of Node, Element, Text and the other types
+ * told apart by nodeType: bit t of the mask is set for each type t
+ * that counts (VitaSurf). A node wrapper's type comes straight from
+ * the node; anything else is asked for its nodeType, as the prelude's
+ * test did. GitHub's catalyst asks element instanceof Element of every
+ * element it scans.
+ */
+static JSValue node_type_test(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv, int magic,
+			      JSValue *data)
+{
+	C_WHERE;
+	struct dom_node *n;
+	int32_t mask = 0, t = 0;
+
+	(void)this_val;
+	(void)magic;
+	if (argc < 1 || !JS_IsObject(argv[0])) return JS_FALSE;
+	JS_ToInt32(ctx, &mask, data[0]);
+	n = JS_GetOpaque(argv[0], node_class_id);
+	if (n != NULL) {
+		dom_node_type type = 0;
+
+		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR) {
+			return JS_FALSE;
+		}
+		t = (int32_t)type;
+	} else {
+		JSValue v = JS_GetPropertyStr(ctx, argv[0], "nodeType");
+
+		if (JS_IsException(v)) return JS_EXCEPTION;
+		if (!JS_IsNumber(v)) {
+			JS_FreeValue(ctx, v);
+			return JS_FALSE;
+		}
+		JS_ToInt32(ctx, &t, v);
+		JS_FreeValue(ctx, v);
+	}
+	return JS_NewBool(ctx, t > 0 && t < 31 && (mask & (1 << t)) != 0);
+}
+
+static JSValue win_vita_node_type_test(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1) return JS_UNDEFINED;
+	return JS_NewCFunctionData(ctx, node_type_test, 1, 0, 1, argv);
+}
+
+/*
+ * firstElementChild, lastElementChild, nextElementSibling and
+ * previousElementSibling, stepped in libdom (VitaSurf). The prelude
+ * built the whole children collection to answer firstElementChild, and
+ * walked nextSibling wrapping every text node on the way; Alpine starts
+ * a page by walking every element with exactly these two, and checks
+ * each one's ancestors through parentElement, magic 4. The magic is
+ * which of the five; data[0] is the JavaScript getter kept for anything
+ * that is not a libdom node.
+ */
+static JSValue element_step(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv, int magic,
+			    JSValue *data)
+{
+	C_WHERE;
+	struct dom_node *n = JS_GetOpaque(this_val, node_class_id);
+	struct dom_node *cur = NULL;
+	bool forward = magic == 0 || magic == 2;
+	JSValue r;
+
+	(void)argc;
+	(void)argv;
+	if (n == NULL) {
+		return JS_Call(ctx, data[0], this_val, 0, NULL);
+	}
+	vitasurf_js_tree_reads++;
+	switch (magic) {
+	case 0: dom_node_get_first_child(n, &cur); break;
+	case 1: dom_node_get_last_child(n, &cur); break;
+	case 2: dom_node_get_next_sibling(n, &cur); break;
+	case 3: dom_node_get_previous_sibling(n, &cur); break;
+	default:
+		dom_node_get_parent_node(n, &cur);
+		if (cur != NULL && !node_is_element(cur)) {
+			dom_node_unref(cur);
+			cur = NULL;
+		}
+		break;
+	}
+	while (cur != NULL) {
+		struct dom_node *next = NULL;
+		dom_node_type type = DOM_TEXT_NODE;
+
+		if (dom_node_get_node_type(cur, &type) == DOM_NO_ERR &&
+		    type == DOM_ELEMENT_NODE) {
+			break;
+		}
+		if (forward) {
+			dom_node_get_next_sibling(cur, &next);
+		} else {
+			dom_node_get_previous_sibling(cur, &next);
+		}
+		dom_node_unref(cur);
+		cur = next;
+	}
+	r = wrap_node(ctx, cur);
+	if (cur != NULL) dom_node_unref(cur);
+	return r;
+}
+
+/*
+ * __vitaCECandidates(root, withRoot): the elements under root, and root
+ * itself when asked, that could be custom elements -- a hyphen in the
+ * local name, or an is attribute -- in document order (VitaSurf). The
+ * prelude's upgrade walk visited every node of each inserted subtree
+ * for the few that are, and GitHub spent 9 % of its script there.
+ */
+static bool ce_candidate(struct dom_node *n)
+{
+	dom_string *name = NULL;
+	bool yes = false;
+
+	dom_node_get_local_name(n, &name);
+	if (name == NULL) {
+		dom_node_get_node_name(n, &name);
+	}
+	if (name != NULL) {
+		yes = memchr(dom_string_data(name), '-',
+			     dom_string_byte_length(name)) != NULL;
+		dom_string_unref(name);
+	}
+	if (!yes) {
+		static dom_string *is_name;
+
+		if (is_name == NULL) {
+			dom_string_create_interned((const uint8_t *)"is", 2,
+						   &is_name);
+		}
+		if (is_name != NULL) {
+			dom_element_has_attribute(n, is_name, &yes);
+		}
+	}
+	return yes;
+}
+
+static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *root, *n = NULL;
+	JSValue out = JS_NewArray(ctx);
+	uint32_t k = 0;
+
+	(void)this_val;
+	if (argc < 1 || !JS_IsObject(argv[0])) {
+		return out;
+	}
+	root = JS_GetOpaque(argv[0], node_class_id);
+	if (root == NULL) {
+		return out;
+	}
+	if (argc > 1 && JS_ToBool(ctx, argv[1]) && node_is_element(root) &&
+	    ce_candidate(root)) {
+		JS_SetPropertyUint32(ctx, out, k++, wrap_node(ctx, root));
+	}
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+
+		if (node_is_element(n)) {
+			if (ce_candidate(n)) {
+				JS_SetPropertyUint32(ctx, out, k++,
+						     wrap_node(ctx, n));
+			}
+			dom_node_get_first_child(n, &next);
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	return out;
+}
+
+static JSValue win_vita_element_step(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t kind = 0;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsFunction(ctx, argv[1])) {
+		return argc >= 2 ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
+	}
+	JS_ToInt32(ctx, &kind, argv[0]);
+	if (kind < 0 || kind > 4) {
+		return JS_DupValue(ctx, argv[1]);
+	}
+	return JS_NewCFunctionData(ctx, element_step, 0, kind, 1,
+				   (JSValueConst *)&argv[1]);
+}
+
+static JSValue win_vita_selector_native(JSContext *ctx, JSValueConst this_val,
+					int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	int32_t kind = 0;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsFunction(ctx, argv[1])) {
+		return argc >= 2 ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
+	}
+	JS_ToInt32(ctx, &kind, argv[0]);
+	if (kind < 0 || kind > 3) {
+		return JS_DupValue(ctx, argv[1]);
+	}
+	return JS_NewCFunctionData(ctx, sel_native, 1, kind, 1,
+				   (JSValueConst *)&argv[1]);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Geometry, scrolling and event dispatch                                   */
 
 static void set_index(JSContext *ctx, JSValue arr, int i, int v)
@@ -4799,7 +10503,8 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
 /*
  * __vitaStyle(node): the computed values a page is most likely to read
  * back, as [fontSize px, display, visibility, colour, background
- * colour]. Everything else getComputedStyle reports comes from the
+ * colour, colour alpha, background alpha, margins, padding, border
+ * widths]. Everything else getComputedStyle reports comes from the
  * prelude's defaults; these are the ones that actually vary and that
  * code branches on. A page doing its own rem arithmetic reads the root
  * font size, which is what sent YouTube into "cannot read property
@@ -4815,6 +10520,8 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
 static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
+	C_WHERE;
+	vitasurf_js_style_reads++;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node;
 	struct box *box;
@@ -4882,7 +10589,1084 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		set_index(ctx, arr, 4, -1);
 		set_index(ctx, arr, 6, -1);
 	}
+
+	/*
+	 * The margins, padding and border widths layout used, top, right,
+	 * bottom, left each, in slots 7 to 18: what a browser reports for
+	 * them, and what code measuring an element's content box reads.
+	 */
+	{
+		int side;
+
+		for (side = 0; side < 4; side++) {
+			int m = box->margin[side];
+
+			set_index(ctx, arr, 7 + side, m == INT_MIN ? 0 : m);
+			set_index(ctx, arr, 11 + side, box->padding[side]);
+			set_index(ctx, arr, 15 + side,
+					box->border[side].width);
+		}
+	}
 	return arr;
+}
+
+/*
+ * __vitaStyleMore(node, pseudo): the resolved values of the properties
+ * a page reads back through getComputedStyle, beyond the handful
+ * __vitaStyle gives, as an object of camel-cased names to the strings a
+ * browser reports: lengths in px, colours as rgb() or rgba(), keywords
+ * as written. \a pseudo, if given, is "::before", "::after",
+ * "::marker", "::first-line", "::first-letter" or "::placeholder", and
+ * the values are that pseudo element's. Null when the element (or the
+ * pseudo element) has no style, which the prelude answers from its
+ * defaults (VitaSurf).
+ */
+#define SM_BUF 256
+
+static void sm_number(char *buf, size_t len, css_fixed v)
+{
+	uint32_t a = v < 0 ? (uint32_t) -v : (uint32_t) v;
+	uint32_t ip = a >> CSS_RADIX_POINT;
+	uint32_t fp = ((a & ((1u << CSS_RADIX_POINT) - 1)) * 1000u +
+			(1u << (CSS_RADIX_POINT - 1))) >> CSS_RADIX_POINT;
+
+	if (fp >= 1000) {
+		ip++;
+		fp -= 1000;
+	}
+	if (fp == 0) {
+		snprintf(buf, len, "%s%u", v < 0 && ip != 0 ? "-" : "",
+				(unsigned) ip);
+	} else {
+		char f[4];
+		int n = 3;
+
+		snprintf(f, sizeof(f), "%03u", (unsigned) fp);
+		while (n > 1 && f[n - 1] == '0')
+			f[--n] = '\0';
+		snprintf(buf, len, "%s%u.%s", v < 0 ? "-" : "",
+				(unsigned) ip, f);
+	}
+}
+
+/** A length as a browser reports it: px, or a percentage kept as one. */
+static void sm_length(char *buf, size_t len, const css_computed_style *s,
+		const css_unit_ctx *uctx, css_fixed v, css_unit unit)
+{
+	size_t n;
+
+	if (unit == CSS_UNIT_PCT) {
+		sm_number(buf, len, v);
+		n = strlen(buf);
+		snprintf(buf + n, len - n, "%%");
+		return;
+	}
+	sm_number(buf, len, css_unit_len2css_px(s, uctx, v, unit));
+	n = strlen(buf);
+	snprintf(buf + n, len - n, "px");
+}
+
+static void sm_colour(char *buf, size_t len, css_color c)
+{
+	unsigned r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+	unsigned a = (c >> 24) & 0xff;
+	unsigned f;
+	char fs[8];
+
+	if (a == 255) {
+		snprintf(buf, len, "rgb(%u, %u, %u)", r, g, b);
+		return;
+	}
+	/* the shortest fraction that comes back to the same byte, as the
+	 * prelude's cssColour() does */
+	f = (a * 100 + 127) / 255;
+	if ((f * 255 + 50) / 100 == a) {
+		snprintf(fs, sizeof(fs), "%u.%02u", f / 100, f % 100);
+	} else {
+		f = (a * 1000 + 127) / 255;
+		snprintf(fs, sizeof(fs), "%u.%03u", f / 1000, f % 1000);
+	}
+	/* trim the zeros a browser leaves off: 0.50 is 0.5, 1.00 is 1 */
+	{
+		size_t n = strlen(fs);
+
+		while (n > 0 && fs[n - 1] == '0')
+			fs[--n] = '\0';
+		if (n > 0 && fs[n - 1] == '.')
+			fs[--n] = '\0';
+	}
+	snprintf(buf, len, "rgba(%u, %u, %u, %s)", r, g, b, fs);
+}
+
+static void sm_set(JSContext *ctx, JSValue obj, const char *name,
+		const char *value)
+{
+	JS_SetPropertyStr(ctx, obj, name, JS_NewString(ctx, value));
+}
+
+static void sm_enum(JSContext *ctx, JSValue obj, const char *name,
+		const char *const *tbl, unsigned n, unsigned v)
+{
+	if (v < n && tbl[v] != NULL)
+		sm_set(ctx, obj, name, tbl[v]);
+}
+
+#define SM_ENUM(name, tbl, v) \
+	sm_enum(ctx, obj, name, tbl, sizeof(tbl) / sizeof(tbl[0]), v)
+
+static const char *const sm_display[] = { NULL, "inline", "block",
+	"list-item", "run-in", "inline-block", "table", "inline-table",
+	"table-row-group", "table-header-group", "table-footer-group",
+	"table-row", "table-column-group", "table-column", "table-cell",
+	"table-caption", "none", "flex", "inline-flex", "grid",
+	"inline-grid", "contents" };
+static const char *const sm_position[] = { NULL, "static", "relative",
+	"absolute", "fixed", "sticky" };
+static const char *const sm_float[] = { NULL, "left", "right", "none" };
+static const char *const sm_clear[] = { NULL, "none", "left", "right",
+	"both" };
+static const char *const sm_overflow[] = { NULL, "visible", "hidden",
+	"scroll", "auto", "clip" };
+static const char *const sm_visibility[] = { NULL, "visible", "hidden",
+	"collapse" };
+static const char *const sm_font_style[] = { NULL, "normal", "italic",
+	"oblique" };
+static const char *const sm_font_variant[] = { NULL, "normal",
+	"small-caps" };
+static const char *const sm_font_weight[] = { NULL, "400", "700", "700",
+	"400", "100", "200", "300", "400", "500", "600", "700", "800",
+	"900" };
+static const char *const sm_text_align[] = { "start", "start", "left",
+	"right", "center", "justify", "start", "-webkit-left",
+	"-webkit-center", "-webkit-right", "end" };
+static const char *const sm_white_space[] = { NULL, "normal", "pre",
+	"nowrap", "pre-wrap", "pre-line" };
+static const char *const sm_box_sizing[] = { NULL, "content-box",
+	"border-box" };
+static const char *const sm_flex_direction[] = { NULL, "row",
+	"row-reverse", "column", "column-reverse" };
+static const char *const sm_flex_wrap[] = { NULL, "nowrap", "wrap",
+	"wrap-reverse" };
+static const char *const sm_justify_content[] = { NULL, "flex-start",
+	"flex-end", "center", "space-between", "space-around",
+	"space-evenly" };
+static const char *const sm_align_items[] = { NULL, "stretch",
+	"flex-start", "flex-end", "center", "baseline", "auto",
+	"anchor-center" };
+static const char *const sm_align_content[] = { NULL, "stretch",
+	"flex-start", "flex-end", "center", "space-between",
+	"space-around", "space-evenly" };
+static const char *const sm_text_transform[] = { NULL, "capitalize",
+	"uppercase", "lowercase", "none" };
+static const char *const sm_vertical_align[] = { NULL, "baseline", "sub",
+	"super", "top", "text-top", "middle", "bottom", "text-bottom" };
+static const char *const sm_direction[] = { NULL, "ltr", "rtl" };
+static const char *const sm_border_style[] = { NULL, "none", "hidden",
+	"dotted", "dashed", "solid", "double", "groove", "ridge", "inset",
+	"outset" };
+static const char *const sm_table_layout[] = { NULL, "auto", "fixed" };
+static const char *const sm_border_collapse[] = { NULL, "separate",
+	"collapse" };
+static const char *const sm_writing_mode[] = { NULL, "horizontal-tb",
+	"vertical-rl", "vertical-lr" };
+static const char *const sm_object_fit[] = { NULL, "fill", "contain",
+	"cover", "none", "scale-down" };
+static const char *const sm_text_overflow[] = { NULL, "clip",
+	"ellipsis" };
+static const char *const sm_word_break[] = { NULL, "normal", "break-all",
+	"keep-all" };
+static const char *const sm_overflow_wrap[] = { NULL, "normal",
+	"break-word", "anywhere" };
+static const char *const sm_pointer_events[] = { NULL, "auto", "none" };
+static const char *const sm_cursor[] = { NULL, "auto", "crosshair",
+	"default", "pointer", "move", "e-resize", "ne-resize", "nw-resize",
+	"n-resize", "se-resize", "sw-resize", "s-resize", "w-resize",
+	"text", "wait", "help", "progress", "none", "context-menu", "cell",
+	"vertical-text", "alias", "copy", "no-drop", "not-allowed", "grab",
+	"grabbing", "all-scroll", "col-resize", "row-resize", "ew-resize",
+	"ns-resize", "nesw-resize", "nwse-resize", "zoom-in", "zoom-out" };
+static const char *const sm_empty_cells[] = { NULL, "show", "hide" };
+static const char *const sm_caption_side[] = { NULL, "top", "bottom" };
+static const char *const sm_unicode_bidi[] = { NULL, "normal", "embed",
+	"bidi-override" };
+static const char *const sm_list_style_type[] = { NULL, "disc", "circle",
+	"square", "decimal", "decimal-leading-zero", "lower-roman",
+	"upper-roman", "lower-greek", "lower-latin", "upper-latin",
+	"armenian", "georgian", "lower-alpha", "upper-alpha", "none",
+	"binary", "octal", "lower-hexadecimal", "upper-hexadecimal",
+	"arabic-indic", "lower-armenian", "upper-armenian", "bengali",
+	"cambodian", "khmer", "cjk-decimal", "devanagari", "gujarati",
+	"gurmukhi", "hebrew", "kannada", "lao", "malayalam", "mongolian",
+	"myanmar", "oriya", "persian", "tamil", "telugu", "thai", "tibetan",
+	"cjk-earthly-branch", "cjk-heavenly-stem", "hiragana",
+	"hiragana-iroha", "katakana", "katakana-iroha", "japanese-informal",
+	"japanese-formal", "korean-hangul-formal", "korean-hanja-informal",
+	"korean-hanja-formal" };
+
+typedef uint8_t (*sm_len_fn)(const css_computed_style *, css_fixed *,
+		css_unit *);
+
+/** An offset or size that is a length, or a keyword for its other
+ * values: \a set is the value that means a length. */
+static void sm_len_prop(JSContext *ctx, JSValue obj, const char *name,
+		const css_computed_style *s, const css_unit_ctx *uctx,
+		sm_len_fn fn, uint8_t set, const char *other)
+{
+	css_fixed v = 0;
+	css_unit u = CSS_UNIT_PX;
+	char buf[SM_BUF];
+
+	if (fn(s, &v, &u) == set) {
+		sm_length(buf, sizeof(buf), s, uctx, v, u);
+		sm_set(ctx, obj, name, buf);
+	} else if (other != NULL) {
+		sm_set(ctx, obj, name, other);
+	}
+}
+
+/*
+ * An element's style when it has no box to read it from (VitaSurf):
+ * before the page's first layout, when a script asking in its load
+ * handler was told the defaults, or when it is display: none. It is
+ * selected as box construction would select it, from the nearest
+ * ancestor that has a style, or from the root, down to the element.
+ * The caller destroys the results.
+ */
+static css_select_results *select_without_box(jsthread *thread,
+		struct dom_node *node)
+{
+	html_content *htmlc = thread->htmlc;
+	struct dom_node *chain[64];
+	const css_computed_style *parent = NULL, *root = NULL;
+	css_select_results *above = NULL, *root_res = NULL, *res = NULL;
+	struct dom_node *n;
+	int depth = 0, i;
+	bool have_layout = layout_current(thread);
+
+	/* before conversion html_select_style uses the sheets loaded so
+	 * far */
+	if (htmlc == NULL)
+		return NULL;
+	/* the element and its element ancestors, nearest first */
+	n = dom_node_ref(node);
+	while (n != NULL) {
+		struct dom_node *up = NULL;
+		dom_node_type type = DOM_ELEMENT_NODE;
+
+		dom_node_get_node_type(n, &type);
+		if (type != DOM_ELEMENT_NODE) {
+			dom_node_unref(n);
+			break;
+		}
+		if (depth > 0 && have_layout) {
+			struct box *b = box_for_node(n);
+
+			if (b != NULL && b->style != NULL) {
+				parent = b->style;
+				dom_node_unref(n);
+				break;
+			}
+		}
+		if (depth == (int)(sizeof(chain) / sizeof(chain[0]))) {
+			dom_node_unref(n);
+			goto out;
+		}
+		chain[depth++] = n;
+		dom_node_get_parent_node(n, &up);
+		n = up;
+	}
+	if (depth == 0)
+		return NULL;
+	/* the root's style, which rem and some inheritance read, once
+	 * box construction has made it */
+	if (parent != NULL)
+		root = htmlc->unit_len_ctx.root_style;
+	for (i = depth - 1; i >= 0; i--) {
+		res = html_select_style(htmlc, parent, root, chain[i]);
+		if (res == NULL)
+			break;
+		if (res->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
+			css_select_results_destroy(res);
+			res = NULL;
+			break;
+		}
+		if (root == NULL) {
+			/* the outermost one selected is the root when no
+			 * ancestor had a style */
+			root_res = res;
+			root = res->styles[CSS_PSEUDO_ELEMENT_NONE];
+		} else if (above != NULL && above != root_res) {
+			css_select_results_destroy(above);
+		}
+		above = res;
+		parent = res->styles[CSS_PSEUDO_ELEMENT_NONE];
+		if (i > 0)
+			res = NULL;
+	}
+	if (res == NULL && above != NULL && above != root_res)
+		css_select_results_destroy(above);
+	if (root_res != NULL && root_res != res)
+		css_select_results_destroy(root_res);
+out:
+	for (i = 0; i < depth; i++)
+		dom_node_unref(chain[i]);
+	return res;
+}
+
+static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct box *box;
+	const css_computed_style *s;
+	const css_unit_ctx *uctx;
+	JSValue obj;
+	char buf[SM_BUF];
+	css_fixed v = 0, fs_px;
+	css_unit u = CSS_UNIT_PX;
+	css_color c = 0, colour = 0;
+	int32_t i32 = 0;
+	uint8_t t;
+	css_select_results *owned = NULL;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL || thread->htmlc == NULL)
+		return JS_NULL;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL)
+		return JS_NULL;
+	box = layout_current(thread) ? box_for_node(node) : NULL;
+	if (box != NULL && box->style != NULL) {
+		s = box->style;
+	} else {
+		/* no box yet, or none at all: select it (VitaSurf) */
+		box = NULL;
+		owned = select_without_box(thread, node);
+		if (owned == NULL)
+			return JS_NULL;
+		s = owned->styles[CSS_PSEUDO_ELEMENT_NONE];
+	}
+	if (argc > 1 && JS_IsString(argv[1])) {
+		const char *p = JS_ToCString(ctx, argv[1]);
+		int which = -1;
+
+		if (p != NULL) {
+			const char *q = p;
+
+			while (*q == ':')
+				q++;
+			if (*q == '\0')
+				which = CSS_PSEUDO_ELEMENT_NONE;
+			else if (strcasecmp(q, "before") == 0)
+				which = CSS_PSEUDO_ELEMENT_BEFORE;
+			else if (strcasecmp(q, "after") == 0)
+				which = CSS_PSEUDO_ELEMENT_AFTER;
+			else if (strcasecmp(q, "marker") == 0)
+				which = CSS_PSEUDO_ELEMENT_MARKER;
+			else if (strcasecmp(q, "first-line") == 0)
+				which = CSS_PSEUDO_ELEMENT_FIRST_LINE;
+			else if (strcasecmp(q, "first-letter") == 0)
+				which = CSS_PSEUDO_ELEMENT_FIRST_LETTER;
+			else if (strcasecmp(q, "placeholder") == 0)
+				which = CSS_PSEUDO_ELEMENT_PLACEHOLDER;
+			JS_FreeCString(ctx, p);
+		}
+		if (which < 0) {
+			if (owned != NULL)
+				css_select_results_destroy(owned);
+			return JS_NULL;
+		}
+		if (which != CSS_PSEUDO_ELEMENT_NONE) {
+			const css_select_results *r = box != NULL ?
+					box->styles : owned;
+
+			if (r == NULL || r->styles[which] == NULL) {
+				if (owned != NULL)
+					css_select_results_destroy(owned);
+				return JS_NULL;
+			}
+			s = r->styles[which];
+		}
+	}
+	uctx = &thread->htmlc->unit_len_ctx;
+	obj = JS_NewObject(ctx);
+
+	/* the font, which em and line-height resolve against */
+	css_computed_font_size(s, &v, &u);
+	fs_px = css_unit_len2css_px(s, uctx, v, u);
+	sm_number(buf, sizeof(buf), fs_px);
+	strncat(buf, "px", sizeof(buf) - strlen(buf) - 1);
+	sm_set(ctx, obj, "fontSize", buf);
+	SM_ENUM("fontStyle", sm_font_style, css_computed_font_style(s));
+	SM_ENUM("fontVariant", sm_font_variant, css_computed_font_variant(s));
+	SM_ENUM("fontWeight", sm_font_weight, css_computed_font_weight(s));
+	{
+		lwc_string **names = NULL;
+		size_t n = 0;
+
+		t = css_computed_font_family(s, &names);
+		buf[0] = '\0';
+		for (; names != NULL && *names != NULL; names++) {
+			const char *d = lwc_string_data(*names);
+			bool q = strchr(d, ' ') != NULL;
+
+			n = strlen(buf);
+			snprintf(buf + n, sizeof(buf) - n, "%s%s%s%s",
+					n > 0 ? ", " : "", q ? "\"" : "", d,
+					q ? "\"" : "");
+		}
+		if (t == CSS_FONT_FAMILY_SERIF || t == CSS_FONT_FAMILY_SANS_SERIF ||
+				t == CSS_FONT_FAMILY_CURSIVE ||
+				t == CSS_FONT_FAMILY_FANTASY ||
+				t == CSS_FONT_FAMILY_MONOSPACE) {
+			const char *g = t == CSS_FONT_FAMILY_SERIF ? "serif" :
+				t == CSS_FONT_FAMILY_SANS_SERIF ? "sans-serif" :
+				t == CSS_FONT_FAMILY_CURSIVE ? "cursive" :
+				t == CSS_FONT_FAMILY_FANTASY ? "fantasy" :
+				"monospace";
+
+			n = strlen(buf);
+			snprintf(buf + n, sizeof(buf) - n, "%s%s",
+					n > 0 ? ", " : "", g);
+		}
+		if (buf[0] != '\0')
+			sm_set(ctx, obj, "fontFamily", buf);
+	}
+	t = css_computed_line_height(s, &v, &u);
+	if (t == CSS_LINE_HEIGHT_NUMBER) {
+		sm_number(buf, sizeof(buf), FMUL(v, fs_px));
+		strncat(buf, "px", sizeof(buf) - strlen(buf) - 1);
+		sm_set(ctx, obj, "lineHeight", buf);
+	} else if (t == CSS_LINE_HEIGHT_DIMENSION) {
+		if (u == CSS_UNIT_PCT) {
+			sm_number(buf, sizeof(buf),
+					FDIV(FMUL(v, fs_px), INTTOFIX(100)));
+			strncat(buf, "px", sizeof(buf) - strlen(buf) - 1);
+		} else {
+			sm_length(buf, sizeof(buf), s, uctx, v, u);
+		}
+		sm_set(ctx, obj, "lineHeight", buf);
+	} else {
+		sm_set(ctx, obj, "lineHeight", "normal");
+	}
+
+	/* where the box is and how it lays out */
+	SM_ENUM("display", sm_display, css_computed_display_static(s));
+	SM_ENUM("position", sm_position, css_computed_position(s));
+	SM_ENUM("float", sm_float, css_computed_float(s));
+	SM_ENUM("cssFloat", sm_float, css_computed_float(s));
+	SM_ENUM("clear", sm_clear, css_computed_clear(s));
+	SM_ENUM("visibility", sm_visibility, css_computed_visibility(s));
+	SM_ENUM("overflowX", sm_overflow, css_computed_overflow_x(s));
+	SM_ENUM("overflowY", sm_overflow, css_computed_overflow_y(s));
+	if (css_computed_overflow_x(s) == css_computed_overflow_y(s)) {
+		SM_ENUM("overflow", sm_overflow, css_computed_overflow_x(s));
+	} else {
+		unsigned ox = css_computed_overflow_x(s);
+		unsigned oy = css_computed_overflow_y(s);
+
+		if (ox < 6 && oy < 6 && sm_overflow[ox] != NULL &&
+				sm_overflow[oy] != NULL) {
+			snprintf(buf, sizeof(buf), "%s %s", sm_overflow[ox],
+					sm_overflow[oy]);
+			sm_set(ctx, obj, "overflow", buf);
+		}
+	}
+	if (css_computed_z_index(s, &i32) == CSS_Z_INDEX_SET) {
+		/* libcss keeps the integer in fixed point */
+		snprintf(buf, sizeof(buf), "%d", (int) FIXTOINT(i32));
+		sm_set(ctx, obj, "zIndex", buf);
+	} else {
+		sm_set(ctx, obj, "zIndex", "auto");
+	}
+	v = INTTOFIX(1);
+	if (css_computed_opacity(s, &v) == CSS_OPACITY_SET) {
+		sm_number(buf, sizeof(buf), v);
+		sm_set(ctx, obj, "opacity", buf);
+	}
+	sm_len_prop(ctx, obj, "top", s, uctx, css_computed_top,
+			CSS_TOP_SET, "auto");
+	sm_len_prop(ctx, obj, "right", s, uctx, css_computed_right,
+			CSS_RIGHT_SET, "auto");
+	sm_len_prop(ctx, obj, "bottom", s, uctx, css_computed_bottom,
+			CSS_BOTTOM_SET, "auto");
+	sm_len_prop(ctx, obj, "left", s, uctx, css_computed_left,
+			CSS_LEFT_SET, "auto");
+	sm_len_prop(ctx, obj, "minWidth", s, uctx, css_computed_min_width,
+			CSS_MIN_WIDTH_SET, "auto");
+	sm_len_prop(ctx, obj, "minHeight", s, uctx, css_computed_min_height,
+			CSS_MIN_HEIGHT_SET, "auto");
+	sm_len_prop(ctx, obj, "maxWidth", s, uctx, css_computed_max_width,
+			CSS_MAX_WIDTH_SET, "none");
+	sm_len_prop(ctx, obj, "maxHeight", s, uctx, css_computed_max_height,
+			CSS_MAX_HEIGHT_SET, "none");
+	SM_ENUM("boxSizing", sm_box_sizing, css_computed_box_sizing(s));
+
+	/* flex */
+	SM_ENUM("flexDirection", sm_flex_direction,
+			css_computed_flex_direction(s));
+	SM_ENUM("flexWrap", sm_flex_wrap, css_computed_flex_wrap(s));
+	SM_ENUM("justifyContent", sm_justify_content,
+			css_computed_justify_content(s));
+	SM_ENUM("alignItems", sm_align_items, css_computed_align_items(s));
+	SM_ENUM("alignSelf", sm_align_items, css_computed_align_self(s));
+	SM_ENUM("justifySelf", sm_align_items, css_computed_justify_self(s));
+	SM_ENUM("alignContent", sm_align_content,
+			css_computed_align_content(s));
+	v = 0;
+	css_computed_flex_grow(s, &v);
+	sm_number(buf, sizeof(buf), v);
+	sm_set(ctx, obj, "flexGrow", buf);
+	v = INTTOFIX(1);
+	css_computed_flex_shrink(s, &v);
+	sm_number(buf, sizeof(buf), v);
+	sm_set(ctx, obj, "flexShrink", buf);
+	t = css_computed_flex_basis(s, &v, &u);
+	if (t == CSS_FLEX_BASIS_SET) {
+		sm_length(buf, sizeof(buf), s, uctx, v, u);
+		sm_set(ctx, obj, "flexBasis", buf);
+	} else {
+		sm_set(ctx, obj, "flexBasis", t == CSS_FLEX_BASIS_CONTENT ?
+				"content" : "auto");
+	}
+	i32 = 0;
+	css_computed_order(s, &i32);
+	snprintf(buf, sizeof(buf), "%d", (int) i32);
+	sm_set(ctx, obj, "order", buf);
+	sm_len_prop(ctx, obj, "rowGap", s, uctx, css_computed_row_gap,
+			CSS_ROW_GAP_SET, "normal");
+	sm_len_prop(ctx, obj, "columnGap", s, uctx, css_computed_column_gap,
+			CSS_COLUMN_GAP_SET, "normal");
+
+	/* text */
+	SM_ENUM("textAlign", sm_text_align, css_computed_text_align(s));
+	SM_ENUM("whiteSpace", sm_white_space, css_computed_white_space(s));
+	SM_ENUM("textTransform", sm_text_transform,
+			css_computed_text_transform(s));
+	SM_ENUM("direction", sm_direction, css_computed_direction(s));
+	SM_ENUM("unicodeBidi", sm_unicode_bidi, css_computed_unicode_bidi(s));
+	SM_ENUM("writingMode", sm_writing_mode, css_computed_writing_mode(s));
+	SM_ENUM("textOverflow", sm_text_overflow,
+			css_computed_text_overflow(s));
+	SM_ENUM("wordBreak", sm_word_break, css_computed_word_break(s));
+	SM_ENUM("overflowWrap", sm_overflow_wrap,
+			css_computed_overflow_wrap(s));
+	SM_ENUM("wordWrap", sm_overflow_wrap, css_computed_overflow_wrap(s));
+	sm_len_prop(ctx, obj, "letterSpacing", s, uctx,
+			css_computed_letter_spacing, CSS_LETTER_SPACING_SET,
+			"normal");
+	sm_len_prop(ctx, obj, "wordSpacing", s, uctx,
+			css_computed_word_spacing, CSS_WORD_SPACING_SET, "0px");
+	sm_len_prop(ctx, obj, "textIndent", s, uctx, css_computed_text_indent,
+			CSS_TEXT_INDENT_SET, "0px");
+	t = css_computed_vertical_align(s, &v, &u);
+	if (t == CSS_VERTICAL_ALIGN_SET) {
+		sm_length(buf, sizeof(buf), s, uctx, v, u);
+		sm_set(ctx, obj, "verticalAlign", buf);
+	} else {
+		SM_ENUM("verticalAlign", sm_vertical_align, t);
+	}
+	colour = 0;
+	css_computed_color(s, &colour);
+	sm_colour(buf, sizeof(buf), colour);
+	sm_set(ctx, obj, "color", buf);
+	{
+		uint8_t d = css_computed_text_decoration(s);
+		char line[64];
+
+		line[0] = '\0';
+		if (d & CSS_TEXT_DECORATION_UNDERLINE)
+			strcat(line, "underline");
+		if (d & CSS_TEXT_DECORATION_OVERLINE)
+			strcat(line, line[0] ? " overline" : "overline");
+		if (d & CSS_TEXT_DECORATION_LINE_THROUGH)
+			strcat(line, line[0] ? " line-through" :
+					"line-through");
+		if (line[0] == '\0')
+			strcpy(line, "none");
+		sm_set(ctx, obj, "textDecorationLine", line);
+		snprintf(buf, sizeof(buf), "%s solid ", line);
+		sm_colour(buf + strlen(buf), sizeof(buf) - strlen(buf),
+				colour);
+		sm_set(ctx, obj, "textDecoration", buf);
+	}
+	SM_ENUM("listStyleType", sm_list_style_type,
+			css_computed_list_style_type(s));
+
+	/* the box's paint */
+	c = 0;
+	if (css_computed_background_color(s, &c) ==
+			CSS_BACKGROUND_COLOR_COLOR) {
+		sm_colour(buf, sizeof(buf), c);
+		sm_set(ctx, obj, "backgroundColor", buf);
+	}
+	{
+		lwc_string *url = NULL;
+
+		if (css_computed_background_image(s, &url) ==
+				CSS_BACKGROUND_IMAGE_IMAGE && url != NULL) {
+			snprintf(buf, sizeof(buf), "url(\"%s\")",
+					lwc_string_data(url));
+			sm_set(ctx, obj, "backgroundImage", buf);
+		} else {
+			sm_set(ctx, obj, "backgroundImage", "none");
+		}
+	}
+	{
+		static const char *const side[4] = { "Top", "Right", "Bottom",
+			"Left" };
+		uint8_t st[4];
+		char cs[4][48];
+		int i;
+
+		st[0] = css_computed_border_top_style(s);
+		st[1] = css_computed_border_right_style(s);
+		st[2] = css_computed_border_bottom_style(s);
+		st[3] = css_computed_border_left_style(s);
+		for (i = 0; i < 4; i++) {
+			uint8_t ct;
+			char name[32];
+
+			c = colour;
+			switch (i) {
+			case 0: ct = css_computed_border_top_color(s, &c);
+				break;
+			case 1: ct = css_computed_border_right_color(s, &c);
+				break;
+			case 2: ct = css_computed_border_bottom_color(s, &c);
+				break;
+			default: ct = css_computed_border_left_color(s, &c);
+				break;
+			}
+			if (ct != CSS_BORDER_COLOR_COLOR)
+				c = colour;
+			sm_colour(cs[i], sizeof(cs[i]), c);
+			snprintf(name, sizeof(name), "border%sColor", side[i]);
+			sm_set(ctx, obj, name, cs[i]);
+			snprintf(name, sizeof(name), "border%sStyle", side[i]);
+			SM_ENUM(name, sm_border_style, st[i]);
+		}
+		if (st[0] == st[1] && st[0] == st[2] && st[0] == st[3])
+			SM_ENUM("borderStyle", sm_border_style, st[0]);
+		if (strcmp(cs[0], cs[1]) == 0 && strcmp(cs[0], cs[2]) == 0 &&
+				strcmp(cs[0], cs[3]) == 0)
+			sm_set(ctx, obj, "borderColor", cs[0]);
+	}
+	{
+		static const char *const corner[4] = { "TopLeft", "TopRight",
+			"BottomRight", "BottomLeft" };
+		char rs[4][64];
+		int i;
+
+		for (i = 0; i < 4; i++) {
+			css_fixed h = 0, vv = 0;
+			css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
+			uint8_t rt;
+			char name[40];
+
+			switch (i) {
+			case 0: rt = css_computed_border_top_left_radius(s,
+					&h, &hu, &vv, &vu);
+				break;
+			case 1: rt = css_computed_border_top_right_radius(s,
+					&h, &hu, &vv, &vu);
+				break;
+			case 2: rt = css_computed_border_bottom_right_radius(s,
+					&h, &hu, &vv, &vu);
+				break;
+			default: rt = css_computed_border_bottom_left_radius(s,
+					&h, &hu, &vv, &vu);
+				break;
+			}
+			if (rt != CSS_BORDER_RADIUS_SET) {
+				strcpy(rs[i], "0px");
+			} else {
+				char hb[32], vb[32];
+
+				sm_length(hb, sizeof(hb), s, uctx, h, hu);
+				sm_length(vb, sizeof(vb), s, uctx, vv, vu);
+				if (strcmp(hb, vb) == 0)
+					snprintf(rs[i], sizeof(rs[i]), "%s", hb);
+				else
+					snprintf(rs[i], sizeof(rs[i]), "%s %s",
+							hb, vb);
+			}
+			snprintf(name, sizeof(name), "border%sRadius",
+					corner[i]);
+			sm_set(ctx, obj, name, rs[i]);
+		}
+		if (strcmp(rs[0], rs[1]) == 0 && strcmp(rs[0], rs[2]) == 0 &&
+				strcmp(rs[0], rs[3]) == 0)
+			sm_set(ctx, obj, "borderRadius", rs[0]);
+		else {
+			snprintf(buf, sizeof(buf), "%s %s %s %s", rs[0], rs[1],
+					rs[2], rs[3]);
+			sm_set(ctx, obj, "borderRadius", buf);
+		}
+	}
+	{
+		uint8_t os = css_computed_outline_style(s);
+		uint8_t ot;
+
+		SM_ENUM("outlineStyle", sm_border_style, os);
+		ot = css_computed_outline_width(s, &v, &u);
+		if (os == CSS_OUTLINE_STYLE_NONE)
+			strcpy(buf, "0px");
+		else if (ot == CSS_OUTLINE_WIDTH_WIDTH)
+			sm_length(buf, sizeof(buf), s, uctx, v, u);
+		else
+			strcpy(buf, ot == CSS_OUTLINE_WIDTH_THIN ? "1px" :
+					ot == CSS_OUTLINE_WIDTH_THICK ? "5px" :
+					"3px");
+		sm_set(ctx, obj, "outlineWidth", buf);
+		c = colour;
+		if (css_computed_outline_color(s, &c) !=
+				CSS_OUTLINE_COLOR_COLOR)
+			c = colour;
+		sm_colour(buf, sizeof(buf), c);
+		sm_set(ctx, obj, "outlineColor", buf);
+	}
+	SM_ENUM("objectFit", sm_object_fit, css_computed_object_fit(s));
+	{
+		static const char *const bv[] = { NULL, "visible", "hidden" };
+
+		SM_ENUM("backfaceVisibility", bv,
+				css_computed_backface_visibility(s));
+	}
+	{
+		/* anchor positioning, as written */
+		lwc_string *as = NULL;
+
+		sm_set(ctx, obj, "anchorName",
+				css_computed_anchor_name(s, &as) ==
+					CSS_ANCHOR_NAME_SET && as != NULL ?
+				lwc_string_data(as) : "none");
+		as = NULL;
+		sm_set(ctx, obj, "positionAnchor",
+				css_computed_position_anchor(s, &as) ==
+					CSS_POSITION_ANCHOR_SET && as != NULL ?
+				lwc_string_data(as) : "auto");
+		as = NULL;
+		sm_set(ctx, obj, "positionArea",
+				css_computed_position_area(s, &as) ==
+					CSS_POSITION_AREA_SET && as != NULL ?
+				lwc_string_data(as) : "none");
+	}
+	{
+		static const char *const cv[] = { NULL, "visible", "auto",
+			"hidden" };
+
+		SM_ENUM("contentVisibility", cv,
+				css_computed_content_visibility(s));
+	}
+	SM_ENUM("pointerEvents", sm_pointer_events,
+			css_computed_pointer_events(s));
+	{
+		lwc_string **urls = NULL;
+
+		SM_ENUM("cursor", sm_cursor, css_computed_cursor(s, &urls));
+	}
+	SM_ENUM("tableLayout", sm_table_layout, css_computed_table_layout(s));
+	SM_ENUM("borderCollapse", sm_border_collapse,
+			css_computed_border_collapse(s));
+	SM_ENUM("emptyCells", sm_empty_cells, css_computed_empty_cells(s));
+	SM_ENUM("captionSide", sm_caption_side, css_computed_caption_side(s));
+
+	/* generated content, for a pseudo element */
+	{
+		const css_computed_content_item *item = NULL;
+
+		t = css_computed_content(s, &item);
+		if (t == CSS_CONTENT_NONE) {
+			sm_set(ctx, obj, "content", "none");
+		} else if (t != CSS_CONTENT_SET || item == NULL) {
+			sm_set(ctx, obj, "content", "normal");
+		} else {
+			buf[0] = '\0';
+			for (; item->type != CSS_COMPUTED_CONTENT_NONE;
+					item++) {
+				size_t n = strlen(buf);
+				const char *sep = n > 0 ? " " : "";
+
+				switch (item->type) {
+				case CSS_COMPUTED_CONTENT_STRING:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%s\"%s\"", sep,
+						lwc_string_data(
+							item->data.string));
+					break;
+				case CSS_COMPUTED_CONTENT_URI:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%surl(\"%s\")", sep,
+						lwc_string_data(
+							item->data.uri));
+					break;
+				case CSS_COMPUTED_CONTENT_ATTR:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sattr(%s)", sep,
+						lwc_string_data(
+							item->data.attr));
+					break;
+				case CSS_COMPUTED_CONTENT_COUNTER:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%scounter(%s)", sep,
+						lwc_string_data(
+						item->data.counter.name));
+					break;
+				case CSS_COMPUTED_CONTENT_COUNTERS:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%scounters(%s, \"%s\")", sep,
+						lwc_string_data(
+						item->data.counters.name),
+						lwc_string_data(
+						item->data.counters.sep));
+					break;
+				case CSS_COMPUTED_CONTENT_OPEN_QUOTE:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sopen-quote", sep);
+					break;
+				case CSS_COMPUTED_CONTENT_CLOSE_QUOTE:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sclose-quote", sep);
+					break;
+				case CSS_COMPUTED_CONTENT_NO_OPEN_QUOTE:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sno-open-quote", sep);
+					break;
+				case CSS_COMPUTED_CONTENT_NO_CLOSE_QUOTE:
+					snprintf(buf + n, sizeof(buf) - n,
+						"%sno-close-quote", sep);
+					break;
+				default:
+					break;
+				}
+			}
+			sm_set(ctx, obj, "content", buf);
+		}
+	}
+	if (owned != NULL)
+		css_select_results_destroy(owned);
+	return obj;
+}
+
+/*
+ * __vitaCustomProp(node, name): a custom property's value on an element,
+ * as getComputedStyle().getPropertyValue("--name") answers it, or ""
+ * when nothing declares it (VitaSurf). Theme code reads its colours this
+ * way: Home Assistant's cards ask for --primary-color and the like.
+ */
+static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct box *box;
+	const char *name;
+	lwc_string *lname = NULL;
+	char small[256];
+	char *buf = small;
+	size_t len = 0;
+	JSValue ret = JS_NewString(ctx, "");
+
+	(void)this_val;
+	if (argc < 2 || thread == NULL || thread->htmlc == NULL)
+		return ret;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !layout_current(thread))
+		return ret;
+	box = box_for_node(node);
+	if (box == NULL || box->style == NULL)
+		return ret;
+	name = JS_ToCString(ctx, argv[1]);
+	if (name == NULL)
+		return ret;
+	if (lwc_intern_string(name, strlen(name), &lname) != lwc_error_ok) {
+		JS_FreeCString(ctx, name);
+		return ret;
+	}
+	JS_FreeCString(ctx, name);
+	if (css_computed_custom_property(box->style, lname, buf,
+			sizeof(small), &len) == CSS_OK) {
+		if (len >= sizeof(small)) {
+			buf = malloc(len + 1);
+			if (buf != NULL && css_computed_custom_property(
+					box->style, lname, buf, len + 1,
+					&len) != CSS_OK) {
+				free(buf);
+				buf = NULL;
+			}
+		}
+		if (buf != NULL) {
+			JS_FreeValue(ctx, ret);
+			ret = JS_NewStringLen(ctx, buf, len);
+			if (buf != small)
+				free(buf);
+		}
+	}
+	lwc_string_unref(lname);
+	return ret;
+}
+
+/*
+ * __vitaScrollElement(node, x, y): scroll a box that scrolls its own
+ * content to x and y in CSS px, either null to leave that axis
+ * (VitaSurf). True when the box has a scrollbar for an axis it was
+ * asked to move. The scrollbar tells the page it moved, which redraws
+ * the box and places again what is anchored inside it.
+ */
+static JSValue win_vita_scroll_element(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct box *box;
+	bool done = false;
+	double v;
+
+	(void)this_val;
+	if (argc < 3 || thread == NULL || thread->htmlc == NULL)
+		return JS_FALSE;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !layout_current(thread))
+		return JS_FALSE;
+	box = box_for_node(node);
+	if (box == NULL || box->style == NULL)
+		return JS_FALSE;
+
+	/* the scrollbars are made when the box is first drawn; one not
+	 * drawn yet has them made now, as drawing would */
+	if (box->scroll_x == NULL && box->scroll_y == NULL) {
+		uint8_t ox = css_computed_overflow_x(box->style);
+		uint8_t oy = css_computed_overflow_y(box->style);
+		bool hx = ox == CSS_OVERFLOW_SCROLL ||
+				(ox == CSS_OVERFLOW_AUTO &&
+				 box_hscrollbar_present(box));
+		bool hy = oy == CSS_OVERFLOW_SCROLL ||
+				(oy == CSS_OVERFLOW_AUTO &&
+				 box_vscrollbar_present(box));
+
+		if ((hx || hy) && box_handle_scrollbars(
+				(struct content *) thread->htmlc, box, hx,
+				hy) != NSERROR_OK)
+			return JS_FALSE;
+	}
+	if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1]) &&
+			box->scroll_x != NULL &&
+			JS_ToFloat64(ctx, &v, argv[1]) == 0 && v == v) {
+		scrollbar_set(box->scroll_x, v < 0 ? 0 : (int) v, false);
+		done = true;
+	}
+	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]) &&
+			box->scroll_y != NULL &&
+			JS_ToFloat64(ctx, &v, argv[2]) == 0 && v == v) {
+		scrollbar_set(box->scroll_y, v < 0 ? 0 : (int) v, false);
+		done = true;
+	}
+	return JS_NewBool(ctx, done);
+}
+
+/*
+ * __vitaFocusControl(node): give the caret to a text field, for
+ * element.focus() (VitaSurf). On the Vita a caret placed within a moment
+ * of a tap opens the keyboard, so a component that focuses its input from
+ * its own click handler opens it as a tap on the input would.
+ */
+static JSValue win_vita_focus_control(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+
+	(void)this_val;
+	if (thread == NULL || thread->htmlc == NULL || argc < 1) {
+		return JS_FALSE;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_FALSE;
+	}
+	return JS_NewBool(ctx, html_focus_control(thread->htmlc, node));
+}
+
+/*
+ * __vitaSetSheetText(styleElement, text or null): what the engine reads
+ * for a <style>'s sheet in place of its text, after script changed the
+ * rules with insertRule() and the like (VitaSurf). The element need not
+ * be in the document; the prelude keeps one that is not for the
+ * document's adoptedStyleSheets.
+ */
+static JSValue win_vita_set_sheet_text(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	const char *text = NULL;
+	bool ok;
+
+	(void)this_val;
+	if (thread == NULL || thread->htmlc == NULL || argc < 2) {
+		return JS_FALSE;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_FALSE;
+	}
+	if (!JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
+		text = JS_ToCString(ctx, argv[1]);
+		if (text == NULL) {
+			return JS_EXCEPTION;
+		}
+	}
+	ok = html_css_set_style_text(thread->htmlc, node, text);
+	if (text != NULL) {
+		JS_FreeCString(ctx, text);
+	}
+	return JS_NewBool(ctx, ok);
+}
+
+/*
+ * __vitaSetFocus(node or null): the element that matches :focus in the
+ * style sheets (VitaSurf). focus() from script moves it as a tap does;
+ * a field that takes typing also matches :focus-visible, as in Chrome.
+ */
+static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node = NULL;
+	bool text = false;
+
+	(void)this_val;
+	if (thread == NULL || thread->htmlc == NULL) {
+		return JS_UNDEFINED;
+	}
+	if (argc > 0 && !JS_IsNull(argv[0])) {
+		node = JS_GetOpaque(argv[0], node_class_id);
+		if (node == NULL) {
+			return JS_UNDEFINED;
+		}
+	}
+	if (node != NULL) {
+		dom_string *name = NULL;
+
+		if (dom_node_get_node_name(node, &name) == DOM_NO_ERR &&
+		    name != NULL) {
+			text = strcasecmp(dom_string_data(name),
+					  "textarea") == 0 ||
+			       strcasecmp(dom_string_data(name),
+					  "input") == 0;
+			dom_string_unref(name);
+		}
+	}
+	html_set_dynamic(thread->htmlc, NSCSS_FOCUS, node, text);
+	return JS_UNDEFINED;
 }
 
 /*
@@ -4898,6 +11682,7 @@ static JSValue win_vita_element_from_point(JSContext *ctx,
 					   JSValueConst this_val,
 					   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct box *box, *found;
 	struct dom_node *node = NULL;
@@ -4927,10 +11712,14 @@ static JSValue win_vita_element_from_point(JSContext *ctx,
 	 * path does too.
 	 */
 	found = box;
+	/* the box painted on top, as a tap finds it (VitaSurf) */
+	box_at_point_limit = html_topmost_box_at(thread->htmlc, (int) x,
+						 (int) y);
 	while ((box = box_at_point(&thread->htmlc->unit_len_ctx, box,
 			(int) x, (int) y, &bx, &by)) != NULL) {
 		found = box;
 	}
+	box_at_point_limit = NULL;
 
 	/* the nearest ancestor that is an element, as the spec asks */
 	while (found != NULL && found->node == NULL) {
@@ -5073,6 +11862,7 @@ static void gap_report(void)
 static JSValue win_vita_gap(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	const char *name;
 	unsigned int i;
 
@@ -5337,6 +12127,7 @@ static bool canvas_image_of(JSContext *ctx, JSValueConst v,
 static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	struct vita_canvas_paint paint;
 	struct vita_canvas_stop *stops = NULL;
@@ -5427,6 +12218,7 @@ static JSValue win_vita_canvas_path(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_text(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	struct vita_canvas_paint paint;
 	struct vita_canvas_stop *stops = NULL;
@@ -5475,6 +12267,7 @@ static JSValue win_vita_canvas_text(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_measure(JSContext *ctx, JSValueConst this_val,
 				       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	const char *text;
 	size_t len = 0;
 	double size_px = 10, width;
@@ -5505,6 +12298,7 @@ static JSValue win_vita_canvas_measure(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_clear(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	double v[4] = { 0, 0, 0, 0 };
 	int i;
@@ -5535,6 +12329,7 @@ static JSValue win_vita_canvas_image_size(JSContext *ctx,
 					  JSValueConst this_val,
 					  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas_image img;
 	JSValue arr;
 
@@ -5560,6 +12355,7 @@ static JSValue win_vita_canvas_image_size(JSContext *ctx,
 static JSValue win_vita_canvas_image(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	struct vita_canvas_image img;
 	double s[4] = { 0, 0, 0, 0 };
@@ -5613,6 +12409,7 @@ static JSValue win_vita_canvas_image(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_read(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	unsigned char *pixels;
 	int32_t v[4] = { 0, 0, 0, 0 };
@@ -5661,6 +12458,7 @@ static JSValue win_vita_canvas_read(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_canvas_write(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	struct vita_canvas *canvas;
 	size_t byte_offset = 0, byte_length = 0, bytes_per = 0;
 	int32_t v[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -5704,6 +12502,7 @@ static JSValue win_vita_canvas_write(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node;
 	struct box *box;
@@ -5719,7 +12518,8 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	box = box_for_node(node);
-	if (box == NULL) {
+	if (box == NULL || (box->flags & DISPLAY_CONTENTS)) {
+		/* display: contents lays out nothing of its own */
 		return JS_NULL;
 	}
 	box_coords(box, &x, &y);
@@ -5768,6 +12568,7 @@ static struct gui_window *thread_gui_window(jsthread *thread)
 static JSValue win_vita_scroll(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct gui_window *gw = thread_gui_window(thread);
 	int sx = 0, sy = 0, vw = 0, vh = 0;
@@ -5809,6 +12610,7 @@ static JSValue win_vita_scroll(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_scroll_to(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct gui_window *gw = thread_gui_window(thread);
 	double x = 0, y = 0;
@@ -5842,6 +12644,7 @@ static JSValue win_vita_scroll_to(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node = NULL;
 	struct dom_event *evt = NULL;
@@ -5857,12 +12660,13 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	}
 	if (JS_IsObject(argv[0])) {
 		node = JS_GetOpaque(argv[0], node_class_id);
-	}
-	if (node == NULL) {
-		node = (struct dom_node *)thread_document(thread);
-	}
-	if (node == NULL) {
-		return JS_TRUE;
+		/* the document object is not a node wrapper */
+		if (node == NULL) {
+			node = (struct dom_node *)thread_document(thread);
+			if (node == NULL) {
+				return JS_TRUE;
+			}
+		}
 	}
 	v = JS_GetPropertyStr(ctx, argv[1], "type");
 	type = JS_ToCString(ctx, v);
@@ -5893,7 +12697,21 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	d.next = thread->dispatches;
 	thread->dispatches = &d;
 	thread->js_dispatch_depth++;
-	dom_event_target_dispatch_event(node, evt, &success);
+	if (node != NULL) {
+		dom_event_target_dispatch_event(node, evt, &success);
+	} else {
+		/* the window is the target: its listeners only (VitaSurf),
+		 * where the document's used to hear it as well */
+		JSValue global = JS_GetGlobalObject(ctx);
+		int was = thread->window_phase;
+
+		JS_SetPropertyStr(ctx, argv[1], "target",
+				  JS_DupValue(ctx, global));
+		JS_FreeValue(ctx, global);
+		thread->window_phase = 2;
+		run_window_listeners(thread, evt, 2);
+		thread->window_phase = was;
+	}
 	thread->js_dispatch_depth--;
 	thread->dispatches = d.next;
 	JS_FreeValue(ctx, d.obj);
@@ -5935,17 +12753,237 @@ static size_t prelude_bc_len;
  * (VitaSurf). The cache is keyed by URL and checks the source's hash, so
  * a build whose prelude has changed misses and compiles once more. It
  * carries no '<' because the cache uses that to mean a script with no
- * URL of its own, which is what the prelude used to count as.
+ * URL of its own, which is what the prelude used to count as. The
+ * name changed when the source text left the prelude's bytecode
+ * (prelude_strip_source), so a copy that still carries it is not read.
  */
-#define PRELUDE_URL "vitasurf:prelude"
+#define PRELUDE_URL "vitasurf:prelude-nosrc"
+static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
+				    const char *spec,
+				    JSValueConst *resolving_funcs,
+				    void *opaque);
 
 static JSValue bc_load(JSContext *ctx, const char *url,
 		       const char *src, size_t srclen);
 static void bc_store(JSContext *ctx, const char *url,
 		     const char *src, size_t srclen, JSValueConst fn);
+static JSValue bc_load_module(JSContext *ctx, const char *url,
+			      const char *src, size_t srclen);
+static void bc_store_module(JSContext *ctx, const char *url,
+			    const char *src, size_t srclen, JSValueConst fn);
+static void bc_index_flush(void);
 
-static void setup_globals(jsthread *thread)
+/*
+ * The prelude's compiled form without its source text (VitaSurf). The
+ * bytecode kept a copy of all 900 KB of it, for Function.prototype.
+ * toString, and every page and frame read that copy back into its own
+ * heap. Without it a prelude function prints as a built-in does in a
+ * browser, "function name() { [native code] }", which is what the
+ * functions it stands in for are. Line numbers stay, for the log.
+ */
+static JSValue prelude_strip_source(JSContext *ctx, JSValue fn)
 {
+	uint8_t *out;
+	size_t out_len = 0;
+	JSValue stripped;
+
+	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE |
+			     JS_WRITE_OBJ_STRIP_SOURCE);
+	if (out == NULL) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return fn;
+	}
+	stripped = JS_ReadObject(ctx, out, out_len, JS_READ_OBJ_BYTECODE);
+	js_free(ctx, out);
+	if (JS_IsException(stripped)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return fn;
+	}
+	JS_FreeValue(ctx, fn);
+	return stripped;
+}
+
+/*
+ * Units of the prelude that run the first time a page uses them
+ * (VitaSurf): vita/js/lazy.js leaves a lazy property where each would
+ * install something, and the first touch of one runs the unit. Each
+ * unit is compiled once a run, kept without its source like the
+ * prelude, and in the card's compiled script cache between runs.
+ */
+struct prelude_unit {
+	const char *name;	/**< what __vitaLoadUnit asks for */
+	const char *url;	/**< its name in the card's cache */
+	const char *file;	/**< its name in an error's stack */
+	const unsigned char *src;
+	size_t len;
+	uint8_t *bc;		/**< compiled, for the life of the process */
+	size_t bc_len;
+};
+
+static struct prelude_unit prelude_units[] = {
+	{ "intl", "vitasurf:intl-nosrc", "<intl>", prelude_intl_js,
+	  sizeof(prelude_intl_js) - 1, NULL, 0 },
+};
+
+/* run a unit in this context; reason is what the page touched */
+static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
+			     const char *reason)
+{
+	const char *src = (const char *)u->src;
+	const char *how = u->bc != NULL ? "bytecode" : "source";
+	uint64_t t0 = now_ms(), t1;
+	JSValue fn, r;
+	bool ok = true;
+
+	if (u->bc != NULL) {
+		fn = JS_ReadObject(ctx, u->bc, u->bc_len, JS_READ_OBJ_BYTECODE);
+	} else {
+		fn = bc_load(ctx, u->url, src, u->len);
+		if (JS_IsUndefined(fn)) {
+			fn = JS_Eval(ctx, src, u->len, u->file,
+				     JS_EVAL_TYPE_GLOBAL |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+			if (!JS_IsException(fn)) {
+				fn = prelude_strip_source(ctx, fn);
+				bc_store(ctx, u->url, src, u->len, fn);
+			}
+		} else {
+			how = "card";
+		}
+		/* in memory of its own: the runtime that wrote it, and its
+		 * allocator, end with this page */
+		if (!JS_IsException(fn)) {
+			size_t out_len = 0;
+			uint8_t *out = JS_WriteObject(ctx, &out_len, fn,
+						      JS_WRITE_OBJ_BYTECODE);
+
+			if (out != NULL) {
+				u->bc = malloc(out_len);
+				if (u->bc != NULL) {
+					memcpy(u->bc, out, out_len);
+					u->bc_len = out_len;
+				}
+				js_free(ctx, out);
+			}
+		}
+	}
+	if (JS_IsException(fn)) {
+		qjs_report_exception_src(ctx, u->file, src, u->len);
+		JS_FreeValue(ctx, fn);
+		ok = false;
+	} else {
+		r = JS_EvalFunction(ctx, fn);
+		if (JS_IsException(r)) {
+			qjs_report_exception_src(ctx, u->file, src, u->len);
+			ok = false;
+		}
+		JS_FreeValue(ctx, r);
+	}
+	t1 = now_ms();
+	vitasurf_ms_prelude += (unsigned int)(t1 - t0);
+	vita_log("qjs: %s %u KB ran in %u ms (%s), on first use of %s",
+		 u->name, (unsigned int)(u->len / 1024),
+		 (unsigned int)(t1 - t0), how, reason);
+	return ok;
+}
+
+/* __vitaLoadUnit(name, reason): run a unit of the prelude */
+static JSValue win_vita_load_unit(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	const char *name, *reason;
+	bool ok = false;
+	unsigned int i;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_FALSE;
+	}
+	name = JS_ToCString(ctx, argv[0]);
+	reason = argc > 1 ? JS_ToCString(ctx, argv[1]) : NULL;
+	for (i = 0; name != NULL &&
+		    i < sizeof(prelude_units) / sizeof(prelude_units[0]); i++) {
+		if (strcmp(name, prelude_units[i].name) == 0) {
+			ok = prelude_unit_run(ctx, &prelude_units[i],
+					      reason != NULL ? reason : "?");
+			break;
+		}
+	}
+	JS_FreeCString(ctx, name);
+	JS_FreeCString(ctx, reason);
+	return JS_NewBool(ctx, ok);
+}
+
+/* __vitaLazy(obj, name, flags, id): make obj's name a lazy property */
+static JSValue win_vita_lazy(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	JSAtom atom;
+	int32_t flags = 0;
+	uint32_t id = 0;
+	int r;
+
+	(void)this_val;
+	if (argc < 4 || !JS_IsObject(argv[0]) ||
+	    JS_ToInt32(ctx, &flags, argv[2]) ||
+	    JS_ToUint32(ctx, &id, argv[3])) {
+		return JS_FALSE;
+	}
+	atom = JS_ValueToAtom(ctx, argv[1]);
+	if (atom == JS_ATOM_NULL) {
+		return JS_EXCEPTION;
+	}
+	r = JS_DefineLazyProperty(ctx, argv[0], atom, flags, id);
+	JS_FreeAtom(ctx, atom);
+	return JS_NewBool(ctx, r == 0);
+}
+
+/* __vitaIsLazy(obj, name): whether it is still waiting for its unit */
+static JSValue win_vita_is_lazy(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	JSAtom atom;
+	bool r;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsObject(argv[0])) {
+		return JS_FALSE;
+	}
+	atom = JS_ValueToAtom(ctx, argv[1]);
+	if (atom == JS_ATOM_NULL) {
+		return JS_EXCEPTION;
+	}
+	r = JS_IsLazyProperty(ctx, argv[0], atom);
+	JS_FreeAtom(ctx, atom);
+	return JS_NewBool(ctx, r);
+}
+
+/*
+ * The runtime's handler of lazy properties: vita/js/lazy.js decides
+ * what a lazy property's value is, running its unit first if need be.
+ */
+static JSValue qjs_lazy_handler(JSContext *ctx, JSValueConst obj,
+				JSAtom prop, uint32_t id)
+{
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue init = JS_GetPropertyStr(ctx, global, "__vitaLazyInit");
+	JSValue arg = JS_NewUint32(ctx, id), r = JS_UNDEFINED;
+
+	(void)obj; (void)prop;
+	if (JS_IsException(init)) {
+		r = init;
+	} else if (JS_IsFunction(ctx, init)) {
+		r = JS_Call(ctx, init, global, 1, &arg);
+	}
+	JS_FreeValue(ctx, init);
+	JS_FreeValue(ctx, global);
+	return r;
+}
+
+static bool setup_globals(jsthread *thread)
+{
+	bool ok = true;
+
 	JSContext *ctx = thread->ctx;
 	JSValue global = JS_GetGlobalObject(ctx);
 	JSValue doc, console, nav, loc, node_proto_obj;
@@ -5964,6 +13002,7 @@ static void setup_globals(jsthread *thread)
 	doc = JS_NewObject(ctx);
 	JS_SetPropertyFunctionList(ctx, doc, document_proto,
 				   (int)(sizeof(document_proto) / sizeof(document_proto[0])));
+	thread->doc_obj = JS_VALUE_GET_PTR(doc);
 	JS_SetPropertyStr(ctx, global, "document", doc);
 
 	/* console */
@@ -5990,8 +13029,8 @@ static void setup_globals(jsthread *thread)
 	loc = JS_NewObject(ctx);
 	JS_SetPropertyFunctionList(ctx, loc, location_proto,
 				   (int)(sizeof(location_proto) / sizeof(location_proto[0])));
-	JS_SetPropertyStr(ctx, global, "location", JS_DupValue(ctx, loc));
-	JS_SetPropertyStr(ctx, doc, "location", loc);
+	install_location(ctx, global, JS_DupValue(ctx, loc));
+	install_location(ctx, doc, loc);
 
 	/* timers and window helpers */
 	JS_SetPropertyStr(ctx, global, "setTimeout",
@@ -6005,6 +13044,16 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "alert",
 			  JS_NewCFunction(ctx, console_log, "alert", 1));
 
+	/* the prelude's units that run on first use (vita/js/lazy.js) */
+	JS_SetPropertyStr(ctx, global, "__vitaLazy",
+			  JS_NewCFunction(ctx, win_vita_lazy, "__vitaLazy", 4));
+	JS_SetPropertyStr(ctx, global, "__vitaIsLazy",
+			  JS_NewCFunction(ctx, win_vita_is_lazy,
+					  "__vitaIsLazy", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaLoadUnit",
+			  JS_NewCFunction(ctx, win_vita_load_unit,
+					  "__vitaLoadUnit", 2));
+
 	/* transport for XMLHttpRequest and fetch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFetch",
 			  JS_NewCFunction(ctx, win_vita_fetch, "__vitaFetch", 6));
@@ -6014,11 +13063,59 @@ static void setup_globals(jsthread *thread)
 	/* layout geometry, scrolling and event dispatch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFind",
 			  JS_NewCFunction(ctx, win_vita_find, "__vitaFind", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaConnected",
+			  JS_NewCFunction(ctx, win_vita_connected,
+					  "__vitaConnected", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaIsAncestor",
+			  JS_NewCFunction(ctx, win_vita_is_ancestor,
+					  "__vitaIsAncestor", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaMOWatch",
+			  JS_NewCFunction(ctx, win_vita_mo_watch,
+					  "__vitaMOWatch", 4));
+	JS_SetPropertyStr(ctx, global, "__vitaMOUnwatch",
+			  JS_NewCFunction(ctx, win_vita_mo_unwatch,
+					  "__vitaMOUnwatch", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaUtf8Decode",
+			  JS_NewCFunction(ctx, win_vita_utf8_decode,
+					  "__vitaUtf8Decode", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaNodeTypeTest",
+			  JS_NewCFunction(ctx, win_vita_node_type_test,
+					  "__vitaNodeTypeTest", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCECandidates",
+			  JS_NewCFunction(ctx, win_vita_ce_candidates,
+					  "__vitaCECandidates", 2));
+	/* the tree generation itself, for the prelude to read without a
+	 * call: an ArrayBuffer over the static counter, never freed */
+	JS_SetPropertyStr(ctx, global, "__vitaGenBuf",
+			  JS_NewArrayBuffer(ctx, (uint8_t *)vita_gens,
+					    sizeof(vita_gens), NULL, NULL,
+					    false));
+	JS_SetPropertyStr(ctx, global, "__vitaElementStep",
+			  JS_NewCFunction(ctx, win_vita_element_step,
+					  "__vitaElementStep", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaSelectorNative",
+			  JS_NewCFunction(ctx, win_vita_selector_native,
+					  "__vitaSelectorNative", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaTagQuery",
+			  JS_NewCFunction(ctx, win_vita_tag_query,
+					  "__vitaTagQuery", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaClosestTag",
+			  JS_NewCFunction(ctx, win_vita_closest_tag,
+					  "__vitaClosestTag", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaSelector",
+			  JS_NewCFunction(ctx, win_vita_selector,
+					  "__vitaSelector", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaModuleState",
 			  JS_NewCFunction(ctx, win_vita_module_state,
 					  "__vitaModuleState", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaDomGen",
 			  JS_NewCFunction(ctx, win_vita_dom_gen, "__vitaDomGen", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaSetSheetText",
+			  JS_NewCFunction(ctx, win_vita_set_sheet_text,
+					  "__vitaSetSheetText", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaSetFocus",
+			  JS_NewCFunction(ctx, win_vita_set_focus,
+					  "__vitaSetFocus", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaCanvasPath",
@@ -6047,11 +13144,41 @@ static void setup_globals(jsthread *thread)
 					  "__vitaCanvasMeasure", 5));
 	JS_SetPropertyStr(ctx, global, "__vitaGap",
 			  JS_NewCFunction(ctx, win_vita_gap, "__vitaGap", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaWsOpen",
+			  JS_NewCFunction(ctx, win_vita_ws_open,
+					  "__vitaWsOpen", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaWsSend",
+			  JS_NewCFunction(ctx, win_vita_ws_send,
+					  "__vitaWsSend", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaWsClose",
+			  JS_NewCFunction(ctx, win_vita_ws_close,
+					  "__vitaWsClose", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaWsBuffered",
+			  JS_NewCFunction(ctx, win_vita_ws_buffered,
+					  "__vitaWsBuffered", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaScriptURL",
+			  JS_NewCFunction(ctx, win_vita_script_url,
+					  "__vitaScriptURL", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaSlots",
+			  JS_NewCFunction(ctx, win_vita_slots,
+					  "__vitaSlots", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaFocusControl",
+			  JS_NewCFunction(ctx, win_vita_focus_control,
+					  "__vitaFocusControl", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaElementFromPoint",
 			  JS_NewCFunction(ctx, win_vita_element_from_point,
 					  "__vitaElementFromPoint", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaStyle",
 			  JS_NewCFunction(ctx, win_vita_style, "__vitaStyle", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaScrollElement",
+			  JS_NewCFunction(ctx, win_vita_scroll_element,
+					  "__vitaScrollElement", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaCustomProp",
+			  JS_NewCFunction(ctx, win_vita_custom_prop,
+					  "__vitaCustomProp", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaStyleMore",
+			  JS_NewCFunction(ctx, win_vita_style_more,
+					  "__vitaStyleMore", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaScroll",
 			  JS_NewCFunction(ctx, win_vita_scroll, "__vitaScroll", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaEncoding",
@@ -6062,6 +13189,42 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaParseDocument",
 			  JS_NewCFunction(ctx, win_vita_parse_document,
 					  "__vitaParseDocument", 1));
+	vita_subtle_register(ctx, global);
+	vita_wasm_register(ctx, global);
+	vita_intl_register(ctx, global);
+	JS_SetPropertyStr(ctx, global, "__vitaFrameGlobal",
+			  JS_NewCFunction(ctx, win_vita_frame_global,
+					  "__vitaFrameGlobal", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaWorkerNew",
+			  JS_NewCFunction(ctx, win_vita_worker_new,
+					  "__vitaWorkerNew", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaWorkerClose",
+			  JS_NewCFunction(ctx, win_vita_worker_close,
+					  "__vitaWorkerClose", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaFetchSync",
+			  JS_NewCFunction(ctx, win_vita_fetch_sync,
+					  "__vitaFetchSync", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaDocBase",
+			  JS_NewCFunction(ctx, win_vita_doc_base,
+					  "__vitaDocBase", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaFrameStart",
+			  JS_NewCFunction(ctx, win_vita_frame_start,
+					  "__vitaFrameStart", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaParentGlobal",
+			  JS_NewCFunction(ctx, win_vita_parent_global,
+					  "__vitaParentGlobal", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaTopGlobal",
+			  JS_NewCFunction(ctx, win_vita_top_global,
+					  "__vitaTopGlobal", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaFrameElement",
+			  JS_NewCFunction(ctx, win_vita_frame_element,
+					  "__vitaFrameElement", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaEntryGlobal",
+			  JS_NewCFunction(ctx, win_vita_entry_global,
+					  "__vitaEntryGlobal", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaCSSSupports",
+			  JS_NewCFunction(ctx, win_vita_css_supports,
+					  "__vitaCSSSupports", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaCreateIn",
 			  JS_NewCFunction(ctx, win_vita_create_in,
 					  "__vitaCreateIn", 3));
@@ -6080,11 +13243,12 @@ static void setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaDispatch",
 			  JS_NewCFunction(ctx, win_vita_dispatch, "__vitaDispatch", 2));
 
-	/* window listeners live on the document node (see add_listener) */
+	/* the window's own listeners, which window_hook runs */
 	JS_SetPropertyStr(ctx, global, "addEventListener",
-			  JS_NewCFunction(ctx, doc_add_event_listener, "addEventListener", 2));
+			  JS_NewCFunction(ctx, win_add_event_listener,
+					  "addEventListener", 2));
 	JS_SetPropertyStr(ctx, global, "removeEventListener",
-			  JS_NewCFunction(ctx, doc_remove_event_listener,
+			  JS_NewCFunction(ctx, win_remove_event_listener,
 					  "removeEventListener", 2));
 
 	/* Node, Element and HTMLElement all share the node prototype */
@@ -6136,6 +13300,7 @@ static void setup_globals(jsthread *thread)
 					     JS_EVAL_TYPE_GLOBAL |
 					     JS_EVAL_FLAG_COMPILE_ONLY);
 				if (!JS_IsException(fn)) {
+					fn = prelude_strip_source(ctx, fn);
 					bc_store(ctx, PRELUDE_URL, src, len,
 						 fn);
 				}
@@ -6158,11 +13323,13 @@ static void setup_globals(jsthread *thread)
 		if (JS_IsException(fn)) {
 			qjs_report_exception_src(ctx, "<prelude>", src, len);
 			JS_FreeValue(ctx, fn);
+			ok = false;
 		} else {
 			r = JS_EvalFunction(ctx, fn);
 			if (JS_IsException(r)) {
 				qjs_report_exception_src(ctx, "<prelude>",
 							 src, len);
+				ok = false;
 			}
 			JS_FreeValue(ctx, r);
 		}
@@ -6177,6 +13344,7 @@ static void setup_globals(jsthread *thread)
 			 (unsigned int)(len / 1024),
 			 (unsigned int)(t1 - t0), how);
 	}
+	return ok;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -6193,19 +13361,30 @@ void js_initialise(void)
 	 */
 	err = javascript_init();
 	/*
-	 * The engine's version, because how large a compiled script is
-	 * depends on it: a host build of quickjs-ng 0.14 writes bytecode
-	 * three times the size of its source, keeping every function's
-	 * text so that toString can return it, where a build 362 log
-	 * cached 73 KB for 221 KB of source. Comparing a measurement
-	 * taken here against one taken on a host means knowing both.
+	 * The engine's version, and whether it is our build, because how
+	 * large a compiled script is depends on both. Stock quickjs-ng
+	 * keeps a copy of every function's text so that toString can
+	 * return it, and a nested function's text again inside each
+	 * function around it; ours (scripts/build-quickjs.sh) shares one
+	 * copy of the script between its functions. (A build 362 log
+	 * cached 73 KB for 221 KB of source, but that script was
+	 * YouTube's page data, nearly all literals and little function
+	 * text.)
 	 */
+	dom_event_set_window_hook(window_hook, NULL);
+	vitasurf_composed = composed_hook;
 #ifdef QJS_VERSION_MAJOR
 	vita_log("qjs: QuickJS engine initialised (content handler %s), "
-		 "quickjs-ng %d.%d.%d%s",
+		 "quickjs-ng %d.%d.%d%s, %s",
 		 err == NSERROR_OK ? "registered" : "FAILED",
 		 QJS_VERSION_MAJOR, QJS_VERSION_MINOR, QJS_VERSION_PATCH,
-		 QJS_VERSION_SUFFIX);
+		 QJS_VERSION_SUFFIX,
+#ifdef QJS_VITASURF_SHARED_SOURCE
+		 "functions share their script's source"
+#else
+		 "stock build, every function keeps its own source"
+#endif
+		 );
 #else
 	vita_log("qjs: QuickJS engine initialised (content handler %s), "
 		 "version not reported by the headers",
@@ -6235,6 +13414,10 @@ static void qjs_rejection_tracker(JSContext *ctx, JSValueConst promise,
 
 	(void)opaque;
 	if (ctx == NULL) {
+		return;
+	}
+	/* a job the time budget stopped, not the page's rejection */
+	if (!is_handled && is_budget_interrupt(ctx, reason)) {
 		return;
 	}
 	/*
@@ -6272,11 +13455,6 @@ nserror js_newheap(int timeout, jsheap **heap)
 	if (ret == NULL) {
 		return NSERROR_NOMEM;
 	}
-	ret->rt = JS_NewRuntime();
-	if (ret->rt == NULL) {
-		free(ret);
-		return NSERROR_NOMEM;
-	}
 	/*
 	 * The timeout is NetSurf's script_timeout option, in seconds, and 0
 	 * means no limit. The Vita runs script roughly 25 times slower than
@@ -6286,16 +13464,55 @@ nserror js_newheap(int timeout, jsheap **heap)
 	 * bundled one, so the floor rather than the option default is what
 	 * actually takes effect on a device that has been used.
 	 */
+#ifdef __vita__
 	if (timeout > 0 && timeout < SCRIPT_TIMEOUT_MIN) {
 		timeout = SCRIPT_TIMEOUT_MIN;
 	}
+#endif
+	/* the floor is the device's; the native harness keeps the option
+	 * as given so that a test can drive a budget of one second
+	 * (VitaSurf) */
 	ret->timeout = timeout;
 	/*
-	 * Keep a page's scripts within a sensible slice of the heap. The
-	 * newlib heap is 176 MB (VITASURF_HEAP_MB) and the rest of it holds
-	 * the document, the box tree and the image cache, so scripts get a
-	 * third of it. Large application bundles need most of this for
-	 * their bytecode alone.
+	 * The runtime itself is made when the window's first page wants a
+	 * thread (heap_start): an iframe's window runs its scripts in the
+	 * runtime of the window at the top of its tree, so that script in
+	 * the frame and in the page around it can reach each other's
+	 * objects, and a runtime of its own would go unused (VitaSurf).
+	 */
+	*heap = ret;
+	return NSERROR_OK;
+}
+
+/* make a heap's runtime, if it has none yet */
+static nserror heap_start(jsheap *ret)
+{
+	if (ret->rt != NULL) {
+		return NSERROR_OK;
+	}
+	/*
+	 * Script's small blocks come from pools of our own rather than
+	 * newlib's malloc, which takes a lock on every call; see
+	 * qjs_alloc.c (VitaSurf).
+	 */
+	ret->pool = qjs_pool_create();
+	ret->rt = JS_NewRuntime2(qjs_pool_functions(), ret->pool);
+	if (ret->rt == NULL) {
+		qjs_pool_destroy(ret->pool);
+		ret->pool = NULL;
+		return NSERROR_NOMEM;
+	}
+	if (qjs_memory_rt == NULL)
+		qjs_memory_rt = ret->rt;
+	/* the first touch of a lazy property runs its unit (lazy.js) */
+	JS_SetLazyPropertyHandler(ret->rt, qjs_lazy_handler);
+	/*
+	 * Keep a page's scripts within a sensible slice of the heap: 96 MB
+	 * of the 176 MB heap there used to be, the same share of the heap
+	 * there is now (it is sized at startup; see vita_heap.c), and never
+	 * less than 96 MB. The rest of the heap holds the document, the box
+	 * tree and the image cache. Large application bundles need most of
+	 * this for their bytecode alone.
 	 *
 	 * The stack limit is QuickJS's own recursion guard, measured against
 	 * the C stack. The main thread has 4 MB (VITASURF_STACK_KB) and
@@ -6305,8 +13522,19 @@ nserror js_newheap(int timeout, jsheap **heap)
 	 */
 	JS_SetModuleLoaderFunc(ret->rt, qjs_module_normalize,
 			       qjs_module_loader, NULL);
+	JS_SetDynamicImportHook(ret->rt, qjs_dynamic_import_hook);
 	JS_SetHostPromiseRejectionTracker(ret->rt, qjs_rejection_tracker, NULL);
-	JS_SetMemoryLimit(ret->rt, 96 * 1024 * 1024);
+	{
+		size_t limit = (size_t)vita_heap_size_kb() / 176 * 96 * 1024;
+
+		if (limit < (size_t)96 * 1024 * 1024) {
+			limit = (size_t)96 * 1024 * 1024;
+		}
+		JS_SetMemoryLimit(ret->rt, limit);
+		vita_log("qjs: script memory limit %u MB of a %u MB heap",
+			 (unsigned int)(limit / (1024 * 1024)),
+			 vita_heap_size_kb() / 1024);
+	}
 	{
 		/*
 		 * Measured against the stack the thread actually got, never
@@ -6337,7 +13565,6 @@ nserror js_newheap(int timeout, jsheap **heap)
 	/* register the shared node class once per runtime */
 	JS_NewClassID(ret->rt, &node_class_id);
 	JS_NewClass(ret->rt, node_class_id, &node_class);
-	*heap = ret;
 	return NSERROR_OK;
 }
 
@@ -6350,22 +13577,116 @@ void js_destroyheap(jsheap *heap)
 		heap->pending_destroy = true;
 		return;
 	}
-	JS_FreeRuntime(heap->rt);
+	if (heap->rt != NULL) {
+		if (qjs_memory_rt == heap->rt)
+			qjs_memory_rt = NULL;
+		JS_FreeRuntime(heap->rt);
+		qjs_pool_destroy(heap->pool);
+	}
 	free(heap);
 }
 
-nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
-		     jsthread **thread)
+/** Whether a space-separated list holds a token, ignoring ASCII case. */
+static bool has_token(const char *s, size_t len, const char *token)
 {
-	jsthread *ret = calloc(1, sizeof(*ret));
+	size_t tl = strlen(token), i = 0, start;
 
+	while (i < len) {
+		while (i < len && (s[i] == ' ' || s[i] == '\t' ||
+				   s[i] == '\n' || s[i] == '\r' ||
+				   s[i] == '\f')) {
+			i++;
+		}
+		start = i;
+		while (i < len && s[i] != ' ' && s[i] != '\t' &&
+		       s[i] != '\n' && s[i] != '\r' && s[i] != '\f') {
+			i++;
+		}
+		if (i - start == tl && strncasecmp(s + start, token, tl) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Whether a frame's sandbox attribute keeps its page from running script
+ * (VitaSurf). A sandboxed frame is meant to be its own opaque origin,
+ * which is not done here, so script runs only where the sandbox would
+ * not have isolated it anyway: with both allow-scripts and
+ * allow-same-origin. Anything else runs none. That is what keeps the
+ * scripts of an untrusted srcdoc -- an HTML mail, say -- out of the page
+ * showing it.
+ */
+static bool frame_sandbox_blocks_scripts(struct browser_window *bw)
+{
+	dom_string *name, *v = NULL;
+	bool blocked = false;
+
+	if (bw == NULL || bw->frame_node == NULL) {
+		return false;
+	}
+	if (dom_string_create((const uint8_t *)"sandbox", SLEN("sandbox"),
+			      &name) != DOM_NO_ERR) {
+		return true;
+	}
+	if (dom_element_get_attribute(bw->frame_node, name, &v) ==
+	    DOM_NO_ERR && v != NULL) {
+		const char *s = dom_string_data(v);
+		size_t len = dom_string_byte_length(v);
+
+		blocked = !(has_token(s, len, "allow-scripts") &&
+			    has_token(s, len, "allow-same-origin"));
+		dom_string_unref(v);
+	}
+	dom_string_unref(name);
+	return blocked;
+}
+
+/*
+ * The newlib heap a new realm needs left over (VitaSurf). A realm is the
+ * prelude's objects and then the page's own, 2.4 MB of the runtime before
+ * a line of the page runs. A build 472 log on claude.ai made the Google
+ * sign-in frame's page with 2.6 MB of the heap left: its prelude ran out
+ * of memory halfway, and the frame was left with half a window. A frame
+ * or a worker is refused a realm below this instead.
+ */
+#define REALM_MIN_FREE_KB (16 * 1024)
+
+static bool realm_room(const char *what)
+{
+	unsigned int free_kb = vita_heap_free_kb();
+
+	if (free_kb >= REALM_MIN_FREE_KB) {
+		return true;
+	}
+	vita_log("qjs: %s gets no script: %u KB of the heap left, under %u",
+		 what, free_kb, (unsigned int)REALM_MIN_FREE_KB);
+	return false;
+}
+
+/*
+ * Make a thread: a realm on the heap's runtime with the prelude run in it.
+ * whole: refuse one whose prelude did not finish, which a frame's page or
+ * a worker can do without (a top page keeps what it got, as before).
+ */
+static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
+			     bool whole)
+{
+	jsthread *ret, *running;
+	bool ok;
+
+	if (heap_start(heap) != NSERROR_OK) {
+		return NULL;
+	}
+	ret = calloc(1, sizeof(*ret));
 	if (ret == NULL) {
-		return NSERROR_NOMEM;
+		return NULL;
 	}
 	ret->ctx = JS_NewContext(heap->rt);
 	if (ret->ctx == NULL) {
 		free(ret);
-		return NSERROR_NOMEM;
+		return NULL;
 	}
 	ret->heap = heap;
 	ret->win = win_priv;
@@ -6374,10 +13695,75 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
 	 * "not looked up yet" marker import_map_of tests for. */
 	ret->import_map = JS_UNINITIALIZED;
 	JS_SetContextOpaque(ret->ctx, ret);
+	/*
+	 * A blank iframe's page, or a worker, is made the moment a script
+	 * asks for it, so this can run inside that script. Its budget is
+	 * still the one that counts: the handler goes back to it once the
+	 * new realm's globals are set up (VitaSurf).
+	 */
+	running = heap->interrupt_thread;
+	if (running != NULL && (running->closed || running->deadline_ms == 0)) {
+		running = NULL;
+	}
 	JS_SetInterruptHandler(heap->rt, qjs_interrupt, ret);
 	heap->interrupt_thread = ret;
-	setup_globals(ret);
+	ok = setup_globals(ret);
+	if (running != NULL) {
+		JS_SetInterruptHandler(heap->rt, qjs_interrupt, running);
+		heap->interrupt_thread = running;
+	} else if (!ok && whole) {
+		JS_SetInterruptHandler(heap->rt, NULL, NULL);
+		heap->interrupt_thread = NULL;
+	}
+	if (!ok && whole) {
+		vita_log("qjs: the prelude did not finish; the realm is "
+			 "thrown away");
+		JS_FreeContext(ret->ctx);
+		free(ret);
+		return NULL;
+	}
 	heap->live_threads++;
+	ret->all_next = all_threads;
+	all_threads = ret;
+	return ret;
+}
+
+nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
+		     jsthread **thread)
+{
+	jsthread *ret;
+	struct browser_window *bw = win_priv;
+	bool frame = bw != NULL && bw->parent != NULL;
+
+	if (frame_sandbox_blocks_scripts(bw) ||
+	    (frame && !realm_room("an iframe's page"))) {
+		/* and no asking again for every element it parses */
+		if (doc_priv != NULL) {
+			((html_content *)doc_priv)->enable_scripting = false;
+		}
+		if (frame_sandbox_blocks_scripts(bw)) {
+			vita_log("qjs: a sandboxed iframe's page runs no "
+				 "script");
+		}
+		return NSERROR_PERMISSION;
+	}
+
+	/* an iframe's scripts run in its top window's runtime */
+	if (frame) {
+		while (bw->parent != NULL) {
+			bw = bw->parent;
+		}
+		if (bw->jsheap != NULL) {
+			heap = bw->jsheap;
+		}
+	}
+	ret = thread_make(heap, win_priv, doc_priv, frame);
+	if (ret == NULL) {
+		if (frame && doc_priv != NULL) {
+			((html_content *)doc_priv)->enable_scripting = false;
+		}
+		return NSERROR_NOMEM;
+	}
 	*thread = ret;
 	vita_log("qjs: new thread win=%p doc=%p", win_priv, doc_priv);
 	return NSERROR_OK;
@@ -6408,9 +13794,32 @@ nserror js_closethread(jsthread *thread)
 	 */
 	t0 = now_ms();
 	thread->closed = true;
+	slot_map_free(&thread->slots);
+	vws_drop_owner(thread);
+	/* a navigation the page asked for goes with the page */
+	if (thread->nav_pending != NULL) {
+		guit->misc->schedule(-1, nav_callback, thread);
+		nsurl_unref(thread->nav_pending);
+		thread->nav_pending = NULL;
+	}
 	if (thread->relayout_pending) {
 		guit->misc->schedule(-1, relayout_callback, thread);
 		thread->relayout_pending = false;
+	}
+	attr_journal_clear(thread);
+	free(thread->attr_changes);
+	thread->attr_changes = NULL;
+	thread->attr_alloc = 0;
+	guit->misc->schedule(-1, close_removed_frames, thread);
+	guit->misc->schedule(-1, deferred_load_check, thread);
+	thread->load_deferred = false;
+	/* a page's workers stop with it */
+	{
+		jsthread *w;
+
+		for (w = thread->workers; w != NULL; w = w->worker_next) {
+			js_closethread(w);
+		}
 	}
 	/* drop module scripts still waiting on an import, and the
 	 * scheduler entry that would have retried them */
@@ -6423,6 +13832,8 @@ nserror js_closethread(jsthread *thread)
 		}
 		JS_FreeValue(thread->ctx, t->func);
 		t->func = JS_UNDEFINED;
+		JS_FreeValue(thread->ctx, t->args);
+		t->args = JS_UNDEFINED;
 	}
 	/*
 	 * Listener structs stay allocated: libdom still holds them as the
@@ -6440,6 +13851,13 @@ nserror js_closethread(jsthread *thread)
 		JS_FreeValue(thread->ctx, thread->import_map);
 		thread->import_map = JS_UNINITIALIZED;
 	}
+	/*
+	 * Not this thread any more: a function made here can outlive the
+	 * context, held by another page's listener or timer, and the
+	 * natives it calls find their thread through the context. Every
+	 * one of them takes NULL as "no page".
+	 */
+	JS_SetContextOpaque(thread->ctx, NULL);
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
 	JS_RunGC(thread->heap->rt);
@@ -6462,26 +13880,46 @@ void js_destroythread(jsthread *thread)
 		return;
 	}
 	t0 = now_ms();		/* the rest of the teardown; see above */
+	/* a page's workers go with it; a worker leaves its page's list */
+	while (thread->workers != NULL) {
+		jsthread *w = thread->workers;
+
+		guit->misc->schedule(-1, worker_close_cb, w);
+		worker_unlink(w);
+		js_destroythread(w);
+	}
+	if (thread->is_worker) {
+		guit->misc->schedule(-1, worker_close_cb, thread);
+		worker_unlink(thread);
+	}
 	js_free_deferred(thread);
 	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;
+	thread->listeners = NULL;
 	while (l != NULL) {
 		struct js_listener *next = l->next;
-		if (l->dom_listener != NULL) {
-			dom_event_listener_unref(l->dom_listener);
-		}
-		if (l->type != NULL) {
-			dom_string_unref(l->type);
-		}
-		if (l->node != NULL) {
-			dom_node_unref(l->node);
-		}
-		free(l);
+
+		/* off its node too: the node may outlive this thread */
+		orphan_listener(l);
 		l = next;
 	}
 	free(thread->node_hash);
 	thread->node_hash = NULL;
 	thread->node_hash_size = 0;
+	/* the MutationObserver watch list (VitaSurf) */
+	{
+		unsigned i;
+
+		for (i = 0; i < thread->mo_n; i++) {
+			mo_watch_free(&thread->mo[i]);
+		}
+		free(thread->mo);
+		thread->mo = NULL;
+		thread->mo_n = thread->mo_alloc = 0;
+		free(thread->mo_slots);
+		thread->mo_slots = NULL;
+		thread->mo_slot_n = thread->mo_slot_used = 0;
+	}
 	t = thread->timers;
 	while (t != NULL) {
 		struct js_timer *next = t->next;
@@ -6493,9 +13931,18 @@ void js_destroythread(jsthread *thread)
 		thread->heap->interrupt_thread = NULL;
 	}
 	thread->heap->live_threads--;
+	{
+		jsthread **pp = &all_threads;
+
+		while (*pp != NULL && *pp != thread) pp = &(*pp)->all_next;
+		if (*pp != NULL) *pp = thread->all_next;
+	}
 	if (thread->heap->pending_destroy && thread->heap->live_threads == 0) {
 		jsheap *heap = thread->heap;
+		if (qjs_memory_rt == heap->rt)
+			qjs_memory_rt = NULL;
 		JS_FreeRuntime(heap->rt);
+		qjs_pool_destroy(heap->pool);
 		free(heap);
 	}
 	free(thread);
@@ -6559,13 +14006,26 @@ void js_destroythread(jsthread *thread)
 
 #define BC_MAGIC      0x43425356u        /* 'VSBC' */
 #define BC_FORMAT     1u
+/*
+ * An ES module's entry (VitaSurf). Its bytecode names the modules it
+ * imports rather than holding them, so it can only be used once those
+ * are loaded; see bc_module_deps_ready.
+ */
+#define BC_FORMAT_MODULE 2u
 /* Below this, compiling is quicker than finding the file on the card. */
 #define BC_MIN_SRC    (128 * 1024)
+/*
+ * The same for a module. A build 416 log compiles GitHub's 35 imports,
+ * 1077 KB of source, at about 250 KB a second, so a 16 KB module costs
+ * some 60 ms to compile against a few to open a file.
+ */
+#define BC_MIN_MODULE_SRC (16 * 1024)
 /* One entry. Bytecode runs three to five times the size of its source. */
 #define BC_MAX_ENTRY  (48u * 1024 * 1024)
 /* The whole directory. An unbounded cache is a bug (see CLAUDE.md). */
 #define BC_BUDGET     (96u * 1024 * 1024)
-#define BC_MAX_ENTRIES 48
+/* GitHub alone is some forty modules. */
+#define BC_MAX_ENTRIES 256
 
 struct bc_header {
 	uint32_t magic;
@@ -6618,6 +14078,7 @@ static struct bc_entry bc_index[BC_MAX_ENTRIES];
 static unsigned bc_index_n;
 static uint32_t bc_stamp;
 static bool bc_index_read;
+static bool bc_index_dirty;
 
 static void bc_index_load(void)
 {
@@ -6667,6 +14128,15 @@ static void bc_index_save(void)
 			(unsigned)bc_index[i].stamp);
 	}
 	fclose(f);
+}
+
+/** Write the index if a hit has changed its use order (VitaSurf). */
+static void bc_index_flush(void)
+{
+	if (bc_index_dirty) {
+		bc_index_dirty = false;
+		bc_index_save();
+	}
 }
 
 static struct bc_entry *bc_index_find(const char *name)
@@ -6726,8 +14196,16 @@ static void bc_index_make_room(uint32_t bytes)
  * source it was built from, so a bundle that changed behind the same URL
  * is a miss rather than the wrong code.
  */
-static JSValue bc_load(JSContext *ctx, const char *url,
-		       const char *src, size_t srclen)
+static bool bc_module_deps_ready(JSContext *ctx, const char *url,
+				 const char *src, size_t srclen);
+static int module_graph_check(jsthread *thread, const char *root,
+			      const char *src, size_t len, char *waiting,
+			      size_t waiting_len);
+/** Set while a graph walk resolves specifiers, to keep the log quiet. */
+static bool normalize_quiet;
+
+static JSValue bc_load_kind(JSContext *ctx, const char *url,
+			    const char *src, size_t srclen, bool module)
 {
 	char path[256];
 	struct bc_header h;
@@ -6737,8 +14215,8 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	uint64_t hash;
 	uint64_t t_read0 = 0, t_read1 = 0, t_decode = 0;
 
-	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<' ||
-	    vitasurf_cache_disabled()) {
+	if (srclen < (module ? BC_MIN_MODULE_SRC : BC_MIN_SRC) ||
+	    url == NULL || url[0] == '<' || vitasurf_cache_disabled()) {
 		return JS_UNDEFINED;
 	}
 	bc_path(path, sizeof(path), url);
@@ -6749,7 +14227,8 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	/* before the first read, or it has no effect */
 	setvbuf(f, NULL, _IOFBF, BC_IO_BUF);
 	if (fread(&h, 1, sizeof(h), f) != sizeof(h) ||
-	    h.magic != BC_MAGIC || h.format != BC_FORMAT ||
+	    h.magic != BC_MAGIC ||
+	    h.format != (module ? BC_FORMAT_MODULE : BC_FORMAT) ||
 	    h.src_len != (uint32_t)srclen ||
 	    h.bc_len == 0 || h.bc_len > BC_MAX_ENTRY) {
 		fclose(f);
@@ -6759,6 +14238,15 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	if (h.src_hash_lo != (uint32_t)(hash & 0xffffffffu) ||
 	    h.src_hash_hi != (uint32_t)(hash >> 32)) {
 		fclose(f);		/* same URL, different bundle */
+		return JS_UNDEFINED;
+	}
+	/*
+	 * A module's bytecode can only be used once everything it imports
+	 * is loaded (VitaSurf). Checked before the entry is read, so a
+	 * page whose chunks are still arriving pays only for the check.
+	 */
+	if (module && !bc_module_deps_ready(ctx, url, src, srclen)) {
+		fclose(f);
 		return JS_UNDEFINED;
 	}
 	buf = malloc(h.bc_len);
@@ -6788,6 +14276,22 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 	 * older engine comes back as an exception here rather than as
 	 * something that runs. Treat it as a miss and compile.
 	 */
+#ifdef QJS_VITASURF_SHARED_SOURCE
+	/*
+	 * Our build still reads a stock stream (version 25, without the
+	 * high bit), because quickjs-ng's own built-ins are compiled in
+	 * as one. An entry a stock build wrote holds every function's
+	 * text over again, though, which is what the shared source build
+	 * is for: compile it again and write it the new way.
+	 */
+	if ((buf[0] & 0x80) == 0) {
+		free(buf);
+		remove(path);
+		vita_log("qjs: cache entry from the stock engine, compiling "
+			 "it again");
+		return JS_UNDEFINED;
+	}
+#endif
 	fn = JS_ReadObject(ctx, buf, h.bc_len, JS_READ_OBJ_BYTECODE);
 	nsu_getmonotonic_ms(&t_decode);
 	vita_log("qjs: cache entry %u KB: %u ms off the card at %u KB/s, "
@@ -6803,6 +14307,21 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 		remove(path);
 		return JS_UNDEFINED;
 	}
+	/*
+	 * The kind it was stored as is in the header, but what the
+	 * bytes turned into is what counts (VitaSurf). A module value is
+	 * never freed through JS_FreeValue, so a wrong one is left alone
+	 * and compiled over: a cached module whose stream decoded as
+	 * something else is only possible from a corrupt entry, and a
+	 * stray function is garbage the next collection takes.
+	 */
+	if ((JS_VALUE_GET_TAG(fn) == JS_TAG_MODULE) != module) {
+		if (JS_VALUE_GET_TAG(fn) != JS_TAG_MODULE) {
+			JS_FreeValue(ctx, fn);
+		}
+		remove(path);
+		return JS_UNDEFINED;
+	}
 	{
 		char nm[24];
 		struct bc_entry *e;
@@ -6811,38 +14330,61 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 		bc_index_load();
 		e = bc_index_find(nm);
 		if (e != NULL) {
+			/*
+			 * Written out later, once: forty module hits a
+			 * page each rewriting the index on the card cost
+			 * more than the hits save (VitaSurf).
+			 */
 			e->stamp = ++bc_stamp;
-			bc_index_save();
+			bc_index_dirty = true;
 		}
 	}
 	return fn;
 }
 
 /** Keep the compiled form of this source for the next visit. */
-static void bc_store(JSContext *ctx, const char *url,
-		     const char *src, size_t srclen, JSValueConst fn)
-{
-	char path[256], tmp[264], nm[24];
-	struct bc_header h;
-	uint8_t *out;
-	size_t out_len = 0;
-	FILE *f;
-	uint64_t hash;
-	struct bc_entry *e;
+/*
+ * Entries waiting to be written to the card (VitaSurf).
+ *
+ * Writing an entry as soon as its script compiled put the card in the
+ * middle of the page load: a build 418 log wrote 4730 KB of bytecode
+ * for GitHub's modules and the compile figure went from 2768 ms to
+ * 4626. Serialising has to happen then -- once a module has run,
+ * QuickJS has swapped its bytecode for a live function that cannot be
+ * written out -- but the bytes stand alone, so they wait here and go
+ * to the card one entry at a time once script has been quiet for a
+ * while. They outlive the page that made them. Held to a total so a
+ * page of large bundles cannot eat the heap; past it an entry is
+ * simply not kept, and compiles again next time.
+ */
+#define BC_QUEUE_BUDGET   (24u * 1024 * 1024)
+#define BC_QUIET_MS       1000
+#define BC_FIRST_WAIT_MS  2000
 
-	if (srclen < BC_MIN_SRC || url == NULL || url[0] == '<' ||
-	    vitasurf_cache_disabled()) {
-		return;
-	}
-	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE);
-	if (out == NULL) {
-		return;
-	}
-	if (out_len == 0 || out_len > BC_MAX_ENTRY) {
-		js_free(ctx, out);
-		return;
-	}
-	bc_path(path, sizeof(path), url);
+struct bc_pending {
+	struct bc_pending *next;
+	char path[256];
+	struct bc_header h;
+	uint8_t *out;		/* a plain malloc: the runtime that
+				 * serialised it goes with its page */
+	size_t out_len;
+};
+
+static struct bc_pending *bc_queue, **bc_queue_tail = &bc_queue;
+static size_t bc_queue_bytes;
+static bool bc_flush_scheduled;
+
+static void bc_flush_callback(void *p);
+
+/** Write one serialised entry to the card, beside the index. */
+static void bc_write_entry(const char *path, const struct bc_header *h,
+			   const uint8_t *out, size_t out_len, bool module)
+{
+	char tmp[264], nm[24];
+	FILE *f;
+	struct bc_entry *e;
+	uint64_t t0 = now_ms();
+
 	snprintf(nm, sizeof(nm), "%s", strrchr(path, '/') + 1);
 	bc_index_load();
 	e = bc_index_find(nm);
@@ -6852,16 +14394,8 @@ static void bc_store(JSContext *ctx, const char *url,
 	}
 	bc_index_make_room((uint32_t)out_len);
 	if (bc_index_n >= BC_MAX_ENTRIES) {
-		js_free(ctx, out);
 		return;
 	}
-	hash = bc_hash(src, srclen);
-	h.magic = BC_MAGIC;
-	h.format = BC_FORMAT;
-	h.src_len = (uint32_t)srclen;
-	h.src_hash_lo = (uint32_t)(hash & 0xffffffffu);
-	h.src_hash_hi = (uint32_t)(hash >> 32);
-	h.bc_len = (uint32_t)out_len;
 	/*
 	 * Written beside the entry and renamed over it, so a battery that
 	 * runs out mid-write leaves the old entry or no entry, never half
@@ -6870,19 +14404,16 @@ static void bc_store(JSContext *ctx, const char *url,
 	snprintf(tmp, sizeof(tmp), "%s.new", path);
 	f = fopen(tmp, "wb");
 	if (f == NULL) {
-		js_free(ctx, out);
 		return;
 	}
 	setvbuf(f, NULL, _IOFBF, BC_IO_BUF);
-	if (fwrite(&h, 1, sizeof(h), f) != sizeof(h) ||
+	if (fwrite(h, 1, sizeof(*h), f) != sizeof(*h) ||
 	    fwrite(out, 1, out_len, f) != out_len) {
 		fclose(f);
 		remove(tmp);
-		js_free(ctx, out);
 		return;
 	}
 	fclose(f);
-	js_free(ctx, out);
 	remove(path);
 	if (rename(tmp, path) != 0) {
 		remove(tmp);
@@ -6893,8 +14424,298 @@ static void bc_store(JSContext *ctx, const char *url,
 	bc_index[bc_index_n].stamp = ++bc_stamp;
 	bc_index_n++;
 	bc_index_save();
-	vita_log("qjs: cached %u KB of bytecode for %u KB of source",
-		 (unsigned)(out_len / 1024), (unsigned)(srclen / 1024));
+	vita_log("qjs: wrote %u KB of %s bytecode to the card in %u ms",
+		 (unsigned)(out_len / 1024), module ? "module" : "script",
+		 (unsigned)(now_ms() - t0));
+}
+
+/**
+ * Write the next waiting entry, once script has been quiet a while.
+ */
+static void bc_flush_callback(void *p)
+{
+	struct bc_pending *q;
+	uint64_t now = now_ms();
+
+	(void)p;
+	bc_flush_scheduled = false;
+	if (bc_queue == NULL) {
+		return;
+	}
+	if (now - bc_last_activity_ms < BC_QUIET_MS) {
+		bc_flush_scheduled = true;
+		guit->misc->schedule(BC_QUIET_MS / 2, bc_flush_callback, NULL);
+		return;
+	}
+	q = bc_queue;
+	bc_queue = q->next;
+	if (bc_queue == NULL) {
+		bc_queue_tail = &bc_queue;
+	}
+	bc_queue_bytes -= q->out_len;
+	bc_write_entry(q->path, &q->h, q->out, q->out_len,
+		       q->h.format == BC_FORMAT_MODULE);
+	free(q->out);
+	free(q);
+	if (bc_queue != NULL) {
+		bc_flush_scheduled = true;
+		guit->misc->schedule(20, bc_flush_callback, NULL);
+	}
+}
+
+/** Keep the compiled form of this source for the next visit. */
+static void bc_store_kind(JSContext *ctx, const char *url,
+			  const char *src, size_t srclen, JSValueConst fn,
+			  bool module)
+{
+	struct bc_pending *q;
+	uint8_t *out;
+	size_t out_len = 0;
+	uint64_t hash;
+	uint64_t t0;
+
+	if (srclen < (module ? BC_MIN_MODULE_SRC : BC_MIN_SRC) ||
+	    url == NULL || url[0] == '<' || vitasurf_cache_disabled()) {
+		return;
+	}
+	t0 = now_ms();
+	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE);
+	if (out == NULL) {
+		return;
+	}
+	if (out_len == 0 || out_len > BC_MAX_ENTRY ||
+	    bc_queue_bytes + out_len > BC_QUEUE_BUDGET) {
+		if (out_len != 0 && out_len <= BC_MAX_ENTRY) {
+			vita_log("qjs: not keeping %u KB of bytecode: %u KB "
+				 "already wait to be written",
+				 (unsigned)(out_len / 1024),
+				 (unsigned)(bc_queue_bytes / 1024));
+		}
+		js_free(ctx, out);
+		return;
+	}
+	q = calloc(1, sizeof(*q));
+	if (q != NULL) {
+		q->out = malloc(out_len);
+	}
+	if (q == NULL || q->out == NULL) {
+		free(q);
+		js_free(ctx, out);
+		return;
+	}
+	memcpy(q->out, out, out_len);
+	js_free(ctx, out);
+	bc_path(q->path, sizeof(q->path), url);
+	hash = bc_hash(src, srclen);
+	q->h.magic = BC_MAGIC;
+	q->h.format = module ? BC_FORMAT_MODULE : BC_FORMAT;
+	q->h.src_len = (uint32_t)srclen;
+	q->h.src_hash_lo = (uint32_t)(hash & 0xffffffffu);
+	q->h.src_hash_hi = (uint32_t)(hash >> 32);
+	q->h.bc_len = (uint32_t)out_len;
+	q->out_len = out_len;
+	*bc_queue_tail = q;
+	bc_queue_tail = &q->next;
+	bc_queue_bytes += out_len;
+	vitasurf_js_bc_queued_kb += (unsigned)(out_len / 1024);
+	vitasurf_ms_js_bc_serialise += (unsigned)(now_ms() - t0);
+	if (!bc_flush_scheduled) {
+		bc_flush_scheduled = true;
+		guit->misc->schedule(BC_FIRST_WAIT_MS, bc_flush_callback, NULL);
+	}
+}
+
+static JSValue bc_load(JSContext *ctx, const char *url,
+		       const char *src, size_t srclen)
+{
+	return bc_load_kind(ctx, url, src, srclen, false);
+}
+
+static void bc_store(JSContext *ctx, const char *url,
+		     const char *src, size_t srclen, JSValueConst fn)
+{
+	bc_store_kind(ctx, url, src, srclen, fn, false);
+}
+
+static JSValue bc_load_module(JSContext *ctx, const char *url,
+			      const char *src, size_t srclen)
+{
+	return bc_load_kind(ctx, url, src, srclen, true);
+}
+
+static void bc_store_module(JSContext *ctx, const char *url,
+			    const char *src, size_t srclen, JSValueConst fn)
+{
+	bc_store_kind(ctx, url, src, srclen, fn, true);
+}
+
+/*
+ * The static imports of a module's source (VitaSurf).
+ *
+ * Every static form names its module in a string that directly follows
+ * the keyword "from" or "import": import x from "a", import {x} from
+ * "a", import * as x from "a", import "a", export {x} from "a", export
+ * * from "a". Dynamic import() is followed by a parenthesis and is not
+ * resolved until it runs, so it is not one.
+ *
+ * What matters is never missing one: a missed import is a module the
+ * cached bytecode needs that was not checked for. So anything this
+ * cannot read with certainty -- a comment between the keyword and the
+ * string, an escape inside the string, a specifier with a space in it,
+ * more of them than fit -- gives up, and the caller compiles from source
+ * as it always did. A string that only looks like an import, inside a
+ * comment or another string, is harmless the other way: it is one more
+ * module asked for, and if nothing has it the cache is not used.
+ *
+ * Writes each specifier as its own import statement into out, and
+ * returns how many, or -1 to give up.
+ */
+#define BC_DEPS_MAX 256
+
+static bool bc_ident_char(char c)
+{
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') || c == '_' || c == '$' ||
+	       (unsigned char)c >= 0x80;
+}
+
+static int bc_scan_imports(const char *src, size_t len, char *out,
+			   size_t outsz)
+{
+	size_t i, used = 0;
+	int n = 0;
+
+	for (i = 0; i + 4 <= len; i++) {
+		size_t kw, j, k;
+		char q;
+
+		if (src[i] == 'f' && i + 4 <= len &&
+		    memcmp(src + i, "from", 4) == 0) {
+			kw = 4;
+		} else if (src[i] == 'i' && i + 6 <= len &&
+			   memcmp(src + i, "import", 6) == 0) {
+			kw = 6;
+		} else {
+			continue;
+		}
+		/* the whole word, and not a property: x.from, a.import */
+		if (i > 0 && (bc_ident_char(src[i - 1]) || src[i - 1] == '.')) {
+			continue;
+		}
+		j = i + kw;
+		if (j < len && bc_ident_char(src[j])) {
+			continue;
+		}
+		while (j < len && (src[j] == ' ' || src[j] == '\t' ||
+				   src[j] == '\n' || src[j] == '\r')) {
+			j++;
+		}
+		if (j >= len) {
+			break;
+		}
+		if (src[j] == '/') {
+			return -1;	/* a comment, or worse: cannot tell */
+		}
+		if (src[j] != '"' && src[j] != '\'') {
+			continue;	/* import( , import{ , from= ... */
+		}
+		q = src[j];
+		for (k = j + 1; k < len && src[k] != q; k++) {
+			if (src[k] == '\\' || src[k] == '\n' ||
+			    src[k] == ' ') {
+				return -1;
+			}
+		}
+		if (k >= len || k == j + 1) {
+			return -1;
+		}
+		/*
+		 * What follows the string decides whether it was an import.
+		 * A static import or export-from statement ends there, so
+		 * the next thing is a semicolon, a line break, the end, or
+		 * an import attribute clause; anything else on the same
+		 * line would be a syntax error. Prose in a string -- "moved
+		 * from 'fixed' to 'sticky'", which GitHub's React bundle
+		 * carries -- goes on with more words, and is not one.
+		 */
+		{
+			size_t t = k + 1;
+
+			while (t < len && (src[t] == ' ' || src[t] == '\t')) {
+				t++;
+			}
+			if (t < len && src[t] == '/') {
+				return -1;	/* a comment: cannot tell */
+			}
+			if (!(t >= len || src[t] == ';' || src[t] == '\n' ||
+			      src[t] == '\r' ||
+			      (t + 4 <= len && memcmp(src + t, "with", 4) == 0 &&
+			       (t + 4 == len || !bc_ident_char(src[t + 4]))) ||
+			      (t + 6 <= len &&
+			       memcmp(src + t, "assert", 6) == 0 &&
+			       (t + 6 == len || !bc_ident_char(src[t + 6]))))) {
+				i = k;
+				continue;
+			}
+		}
+		/* import "<spec>";\n */
+		if (n >= BC_DEPS_MAX || used + (k - j + 1) + 10 >= outsz) {
+			return -1;
+		}
+		memcpy(out + used, "import ", 7);
+		used += 7;
+		memcpy(out + used, src + j, k - j + 1);
+		used += k - j + 1;
+		out[used++] = ';';
+		out[used++] = '\n';
+		out[used] = '\0';
+		n++;
+		i = k;
+	}
+	return n;
+}
+
+/*
+ * Whether a cached module can be used now (VitaSurf).
+ *
+ * Bytecode read back from the card is a module that has not resolved its
+ * imports yet; QuickJS resolves them after the loader hands it over. If
+ * one of them cannot be found then, the module is left in the engine's
+ * list marked resolved with an empty slot where the import should be,
+ * and the next module that imports it links against the empty slot.
+ * Compiling from source never gets that far: a failed compile takes its
+ * module out of the list again.
+ *
+ * So the imports are resolved first, by compiling a module of nothing
+ * but those import statements, from source, under a name beside the
+ * real one so relative specifiers resolve the same. If that compiles,
+ * everything the cached bytecode names is loaded and resolved, and
+ * resolving the bytecode cannot fail. If it does not, the engine has
+ * cleaned up after it, and the caller compiles the real module from
+ * source, which fails or waits exactly as it did before there was a
+ * cache. The empty module stays loaded and is never run.
+ */
+static bool bc_module_deps_ready(JSContext *ctx, const char *url,
+				 const char *src, size_t srclen)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	/*
+	 * This compiled a module of nothing but the imports, from source,
+	 * which asked the loader for each of them -- and the loader read
+	 * each from the cache and checked its imports the same way. Two
+	 * modules that import each other went round that loop, reading
+	 * both from the card at every turn, until the stack ran out: on
+	 * build 422 GitHub's element registry was read 122 times in 3 s,
+	 * and every turn left a copy of it in the engine's module list.
+	 * The walk below reads the imports as text instead, and a module
+	 * already on the walk is not visited again. Only a graph whose
+	 * every module is here and readable counts (VitaSurf).
+	 */
+	if (thread == NULL) {
+		return false;
+	}
+	return module_graph_check(thread, url, src, srclen, NULL, 0) == 1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -7089,16 +14910,19 @@ static void store_index_note(const char *name, uint32_t bytes)
 static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	char path[256], *origin, *buf;
 	long len;
 	FILE *f;
 	JSValue out;
+	uint64_t t0, t1, t2;
 
 	(void)this_val; (void)argc; (void)argv;
 	if (thread == NULL || thread->htmlc == NULL) {
 		return JS_NULL;
 	}
+	t0 = now_ms();
 	origin = origin_of(thread->htmlc->base_url);
 	if (origin == NULL) {
 		return JS_NULL;
@@ -7128,8 +14952,24 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 	}
 	fclose(f);
 	buf[len] = 0;
-	out = JS_NewStringLen(ctx, buf, (size_t)len);
+	/*
+	 * Parsed here rather than handed over as text, so the log can say
+	 * what a site's storage costs (VitaSurf): a dashboard's first
+	 * promise job spent half a second inside this call and nothing
+	 * said whether the card or the parse was the slow part. The file
+	 * is the whole origin, localStorage and IndexedDB together.
+	 */
+	t1 = now_ms();
+	out = JS_ParseJSON(ctx, buf, (size_t)len, "<storage>");
 	free(buf);
+	if (JS_IsException(out)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		out = JS_NULL;
+	}
+	t2 = now_ms();
+	vita_log("storage: %u KB read in %u ms, parsed in %u ms",
+		 (unsigned)(len / 1024), (unsigned)(t1 - t0),
+		 (unsigned)(t2 - t1));
 	return out;
 }
 
@@ -7137,6 +14977,7 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	char path[256], tmp[264], *origin;
 	const char *text;
@@ -7358,7 +15199,18 @@ static char *map_lookup(JSContext *ctx, jsthread *thread, JSValueConst imports,
  * matches the importer first, longest first, then the top level imports.
  * Anything still unmatched is passed through for the loader to report.
  */
-static char *qjs_module_normalize(JSContext *ctx, const char *base,
+/**
+ * A blob: or data: URL: the module is in the page already, and nothing
+ * fetches it. NetSurf has no fetcher for blob:, and a modulepreload of
+ * one used to leave a script entry with no handle behind (build 475).
+ */
+static bool url_is_local(const char *url)
+{
+	return url != NULL && (strncmp(url, "blob:", 5) == 0 ||
+			       strncmp(url, "data:", 5) == 0);
+}
+
+static char *module_normalize_url(JSContext *ctx, const char *base,
 				  const char *name, void *opaque)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
@@ -7369,6 +15221,9 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base,
 	(void)opaque;
 	if (thread == NULL || name == NULL) {
 		return js_dup_cstr(ctx, name != NULL ? name : "");
+	}
+	if (url_is_local(name)) {
+		return js_dup_cstr(ctx, name);
 	}
 	if (name[0] == '.' || name[0] == '/' || strstr(name, "://") != NULL) {
 		return resolve_against(ctx, thread, base, name);
@@ -7448,8 +15303,63 @@ static char *qjs_module_normalize(JSContext *ctx, const char *base,
 	if (out == NULL) {
 		return js_dup_cstr(ctx, name);
 	}
-	vita_log("qjs: import map resolved '%s' to '%s'", name, out);
+	if (!normalize_quiet) {
+		vita_log("qjs: import map resolved '%s' to '%s'", name, out);
+	}
 	return out;
+}
+
+/*
+ * A module that answered with a redirect is known by where it ended up,
+ * as a browser's module map knows it: its own relative imports resolve
+ * against that, rather than each going through the redirect again, and
+ * whichever of the two URLs a module imports it by, it is the same
+ * module (VitaSurf).
+ */
+/* where a module fetched from url ended up, when a redirect took it
+   somewhere else and it has arrived; NULL otherwise */
+static const char *module_redirect_target(jsthread *thread, const char *url)
+{
+	unsigned int i;
+
+	if (url == NULL || thread == NULL || thread->htmlc == NULL) {
+		return NULL;
+	}
+	for (i = 0; i < thread->htmlc->scripts_count; i++) {
+		struct html_script *sc = &thread->htmlc->scripts[i];
+		const char *final;
+
+		if (sc->type == HTML_SCRIPT_INLINE || sc->data.handle == NULL ||
+		    sc->asked == NULL ||
+		    strcmp(nsurl_access(sc->asked), url) != 0 ||
+		    content_get_status(sc->data.handle) !=
+				CONTENT_STATUS_DONE) {
+			continue;
+		}
+		final = nsurl_access(hlcache_handle_get_url(sc->data.handle));
+		return strcmp(final, url) != 0 ? final : NULL;
+	}
+	return NULL;
+}
+
+static char *qjs_module_normalize(JSContext *ctx, const char *base,
+				  const char *name, void *opaque)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *moved = module_redirect_target(thread, base);
+	char *url = module_normalize_url(ctx, moved != NULL ? moved : base,
+					 name, opaque);
+
+	moved = module_redirect_target(thread, url);
+	if (moved != NULL) {
+		char *out = js_dup_cstr(ctx, moved);
+
+		if (out != NULL) {
+			js_free(ctx, url);
+			url = out;
+		}
+	}
+	return url;
 }
 
 /*
@@ -7514,129 +15424,399 @@ static const char *without_retry_suffix(const char *url, char *buf, size_t len)
 	return buf;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Whether a module's import graph is all here (VitaSurf)                    */
+
 /*
- * A dynamic import() in page code is rewritten to __vitaImport(base, spec)
- * before the source is compiled. QuickJS asks its loader for the module
- * synchronously, and the loader can only hand over source the page has
- * already received: a module still on its way (SvelteKit's bootstrap
- * imports two the head is preloading) failed on the spot, and nothing
- * retried it. The helper in the prelude asks __vitaModuleState until the
- * module has arrived and only then does the real import.
+ * QuickJS cannot take back a module compile that fails half way. It
+ * marks each module resolved as it starts on it, before its imports are
+ * found, and when one import cannot be had it frees only the module it
+ * was compiling. Anything else loaded on the way stays in the engine's
+ * list, marked resolved. When two modules import each other, the one
+ * that stays holds a pointer to the one that was freed, and the next
+ * attempt runs through it: a page whose chunks import each other and
+ * arrive out of order crashed when it finally had them all.
+ *
+ * So a module is not compiled until everything it imports, all the way
+ * down, has arrived. That is worked out from the text: each module's
+ * import statements are read once and kept, a walk visits every module
+ * once however they cycle, and a graph found whole is remembered as
+ * whole. The text is read with a heuristic (bc_scan_imports), so only
+ * a module that is actually on its way holds a compile back; one that
+ * cannot be found or read is left to the compile to judge, as before.
  */
-static bool is_ident_char(unsigned char c)
+
+struct mod_deps {
+	struct mod_deps *next;
+	char *url;
+	char **deps;	/**< its imports, resolved to URLs */
+	int n;		/**< how many, or -1 when they could not be read */
+	bool scanned;	/**< its source has been read; else only asked for */
+	bool asked;	/**< a fetch was started for it from here */
+	bool complete;	/**< everything under it was here */
+};
+
+enum mod_src { MOD_SRC_HERE, MOD_SRC_ARRIVING, MOD_SRC_NONE, MOD_SRC_FAILED };
+
+#define GRAPH_MAX_NODES 1024
+
+static unsigned mod_deps_bucket(const char *url)
 {
-	return isalnum(c) || c == '_' || c == '$' || c >= 0x80;
+	unsigned h = 5381;
+
+	while (*url != '\0') {
+		h = h * 33u + (unsigned char)*url++;
+	}
+	return h % 64u;
+}
+
+static struct mod_deps *mod_deps_find(jsthread *thread, const char *url)
+{
+	struct mod_deps *e = thread->mod_deps[mod_deps_bucket(url)];
+
+	while (e != NULL && strcmp(e->url, url) != 0) {
+		e = e->next;
+	}
+	return e;
+}
+
+static void mod_deps_free(jsthread *thread)
+{
+	unsigned b;
+
+	for (b = 0; b < 64; b++) {
+		struct mod_deps *e = thread->mod_deps[b];
+
+		while (e != NULL) {
+			struct mod_deps *next = e->next;
+			int i;
+
+			for (i = 0; i < e->n; i++) {
+				free(e->deps[i]);
+			}
+			free(e->deps);
+			free(e->url);
+			free(e);
+			e = next;
+		}
+		thread->mod_deps[b] = NULL;
+	}
+}
+
+/** Where the page stands with a module's source. */
+/*
+ * Whether a fetched script is the one at url: where it ended up, or where
+ * it was asked for. unpkg answers lit-html@^1.1.1 with a redirect to
+ * lit-html@1.4.1, and an import that only matched the second waited for
+ * a module it already had, fetching it again on every retry: 640 times
+ * on a Home Assistant dashboard (VitaSurf).
+ */
+static bool script_is(const struct html_script *sc, const char *url)
+{
+	if (sc->type == HTML_SCRIPT_INLINE || sc->data.handle == NULL) {
+		return false;
+	}
+	if (strcmp(nsurl_access(hlcache_handle_get_url(sc->data.handle)),
+		   url) == 0) {
+		return true;
+	}
+	return sc->asked != NULL && strcmp(nsurl_access(sc->asked), url) == 0;
+}
+
+static enum mod_src module_source(jsthread *thread, const char *url,
+				  const uint8_t **data, size_t *size)
+{
+	char stripped[1024];
+	const char *want = without_retry_suffix(url, stripped,
+						sizeof(stripped));
+	enum mod_src best = MOD_SRC_NONE;
+	unsigned int i;
+
+	if (thread->htmlc == NULL) {
+		return MOD_SRC_NONE;
+	}
+	for (i = 0; i < thread->htmlc->scripts_count; i++) {
+		struct html_script *sc = &thread->htmlc->scripts[i];
+		int st;
+
+		if (!script_is(sc, want)) {
+			continue;
+		}
+		st = (int)content_get_status(sc->data.handle);
+		if (st == CONTENT_STATUS_DONE) {
+			*data = content_get_source_data(sc->data.handle,
+							size);
+			if (*data != NULL && *size > 0) {
+				return MOD_SRC_HERE;
+			}
+			if (best == MOD_SRC_NONE) best = MOD_SRC_FAILED;
+		} else if (st == CONTENT_STATUS_ERROR) {
+			if (best == MOD_SRC_NONE) best = MOD_SRC_FAILED;
+		} else {
+			best = MOD_SRC_ARRIVING;
+		}
+	}
+	return best;
+}
+
+/** A module's imports, read from its source once and kept. */
+static struct mod_deps *mod_deps_get(jsthread *thread, const char *url,
+				     const char *src, size_t len)
+{
+	struct mod_deps *e = mod_deps_find(thread, url);
+	size_t outsz = 64 * 1024;
+	char *out, *p;
+	int n, i;
+	bool fresh = false;
+
+	if (e != NULL && e->scanned) {
+		return e;
+	}
+	if (e == NULL) {
+		e = calloc(1, sizeof(*e));
+		if (e == NULL) {
+			return NULL;
+		}
+		e->url = strdup(url);
+		if (e->url == NULL) {
+			free(e);
+			return NULL;
+		}
+		fresh = true;
+	}
+	e->scanned = true;
+	out = malloc(outsz);
+	n = out != NULL ? bc_scan_imports(src, len, out, outsz) : -1;
+	e->n = -1;
+	if (n > 0) {
+		e->deps = calloc((size_t)n, sizeof(char *));
+	}
+	if (n == 0) {
+		e->n = 0;
+	} else if (n > 0 && e->deps != NULL) {
+		/* out holds one  import "<spec>";  per line */
+		e->n = 0;
+		p = out;
+		for (i = 0; i < n && p != NULL; i++) {
+			char *q0 = strpbrk(p, "\"'"), *q1, *norm;
+
+			if (q0 == NULL) break;
+			q1 = strchr(q0 + 1, *q0);
+			if (q1 == NULL) break;
+			*q1 = '\0';
+			normalize_quiet = true;
+			norm = qjs_module_normalize(thread->ctx, url, q0 + 1,
+						    NULL);
+			normalize_quiet = false;
+			if (norm != NULL) {
+				e->deps[e->n] = strdup(norm);
+				js_free(thread->ctx, norm);
+				if (e->deps[e->n] != NULL) e->n++;
+			}
+			p = strchr(q1 + 1, '\n');
+		}
+	}
+	free(out);
+	if (fresh) {
+		e->next = thread->mod_deps[mod_deps_bucket(url)];
+		thread->mod_deps[mod_deps_bucket(url)] = e;
+	}
+	return e;
+}
+
+/** Note that a fetch was started for url, so it is not started again. */
+static void mod_deps_asked(jsthread *thread, const char *url)
+{
+	struct mod_deps *e = mod_deps_find(thread, url);
+
+	if (e == NULL) {
+		e = calloc(1, sizeof(*e));
+		if (e == NULL) {
+			return;
+		}
+		e->url = strdup(url);
+		if (e->url == NULL) {
+			free(e);
+			return;
+		}
+		e->n = -1;
+		e->next = thread->mod_deps[mod_deps_bucket(url)];
+		thread->mod_deps[mod_deps_bucket(url)] = e;
+	}
+	e->asked = true;
 }
 
 /*
- * Find the next "import (" that is code: not part of a longer name, and
- * not inside a string, a template or a comment. A regular expression
- * literal holding the word is not told apart, and is not expected.
- * Returns the offset of "import", with *paren the offset of the "(",
- * or len when there is none.
+ * The module root, whose source is src, and everything it imports:
+ * 1 when all of it is here, 0 when some of it is still arriving (a
+ * fetch is started for any that was never asked for; its URL is copied
+ * to waiting), -1 when the walk cannot tell.
  */
-static size_t next_dynamic_import(const char *src, size_t len, size_t from,
-				  size_t *paren)
+static int module_graph_check(jsthread *thread, const char *root,
+			      const char *src, size_t len, char *waiting,
+			      size_t waiting_len)
 {
-	size_t i = from;
+	struct mod_deps **queue, *e;
+	unsigned n = 0, i;
+	bool pending = false, unknown = false;
 
-	while (i < len) {
-		char c = src[i];
+	if (thread == NULL || thread->closed) {
+		return -1;
+	}
+	e = mod_deps_get(thread, root, src, len);
+	if (e == NULL) {
+		return -1;
+	}
+	if (e->complete) {
+		return 1;
+	}
+	queue = malloc(GRAPH_MAX_NODES * sizeof(*queue));
+	if (queue == NULL) {
+		return -1;
+	}
+	queue[n++] = e;
+	for (i = 0; i < n; i++) {
+		int j;
 
-		if (c == '"' || c == '\'' || c == '`') {
-			char q = c;
+		e = queue[i];
+		if (e->n < 0) {
+			unknown = true;
+			continue;
+		}
+		for (j = 0; j < e->n; j++) {
+			const char *d = e->deps[j];
+			struct mod_deps *de = mod_deps_find(thread, d);
+			const uint8_t *data = NULL;
+			size_t size = 0;
+			enum mod_src s;
+			unsigned k;
 
-			for (i++; i < len && src[i] != q; i++) {
-				if (src[i] == '\\') i++;
-			}
-			i++;
-		} else if (c == '/' && i + 1 < len && src[i + 1] == '/') {
-			while (i < len && src[i] != '\n') i++;
-		} else if (c == '/' && i + 1 < len && src[i + 1] == '*') {
-			/* newlib has no memmem */
-			for (i += 2; i + 1 < len; i++) {
-				if (src[i] == '*' && src[i + 1] == '/') {
-					break;
+			if (de == NULL || !de->scanned) {
+				bool asked = de != NULL && de->asked;
+
+				de = NULL;
+				s = module_source(thread, d, &data, &size);
+				if (s == MOD_SRC_HERE) {
+					de = mod_deps_get(thread, d,
+							  (const char *)data,
+							  size);
+				} else if (s == MOD_SRC_ARRIVING) {
+					if (!pending && waiting != NULL)
+						snprintf(waiting, waiting_len,
+							 "%s", d);
+					pending = true;
+					continue;
+				} else if (s == MOD_SRC_NONE && !asked &&
+					   thread->htmlc != NULL &&
+					   !url_is_local(d) &&
+					   strstr(d, "://") != NULL) {
+					/* once: a fetch that failed leaves it
+					 * to the compile, as before */
+					dom_string *href = to_dom_string(d);
+					bool started = href != NULL &&
+						html_process_module_preload(
+							thread->htmlc, href);
+
+					if (href != NULL)
+						dom_string_unref(href);
+					if (started) {
+						mod_deps_asked(thread, d);
+						thread->js_import_fetches++;
+						vita_log("qjs: fetching '%s', "
+							 "which '%s' imports",
+							 d, e->url);
+						if (!pending && waiting != NULL)
+							snprintf(waiting,
+								 waiting_len,
+								 "%s", d);
+						pending = true;
+						continue;
+					}
+				}
+				if (de == NULL) {
+					unknown = true;
+					continue;
 				}
 			}
-			i = i + 1 < len ? i + 2 : len;
-		} else if (c == 'i' && len - i >= 6 &&
-			   memcmp(src + i, "import", 6) == 0 &&
-			   (i == 0 || !is_ident_char((unsigned char)src[i - 1])) &&
-			   !(len - i > 6 && is_ident_char((unsigned char)src[i + 6]))) {
-			size_t q = i + 6;
-
-			while (q < len && (src[q] == ' ' || src[q] == '\t' ||
-					   src[q] == '\n' || src[q] == '\r')) {
-				q++;
+			if (de->complete) {
+				continue;
 			}
-			if (q < len && src[q] == '(') {
-				*paren = q;
-				return i;
+			for (k = 0; k < n && queue[k] != de; k++) {
 			}
-			i = q;
-		} else {
-			i++;
+			if (k < n) {
+				continue;	/* already on this walk */
+			}
+			if (n >= GRAPH_MAX_NODES) {
+				unknown = true;
+				continue;
+			}
+			queue[n++] = de;
 		}
 	}
-	return len;
+	if (!pending && !unknown) {
+		for (i = 0; i < n; i++) {
+			queue[i]->complete = true;
+		}
+	}
+	free(queue);
+	return pending ? 0 : unknown ? -1 : 1;
 }
 
-static char *rewrite_dynamic_imports(const char *src, size_t len,
-				     const char *name, size_t *outlen)
+/*
+ * Every import() is offered to this before QuickJS loads the module
+ * (VitaSurf). QuickJS asks its loader for a module synchronously, and
+ * the loader can only hand over source the page has already received: a
+ * module still on its way failed on the spot, and nothing retried it.
+ * So the import goes to __vitaImport in the prelude, which waits until
+ * the module and everything it imports have arrived and then imports it
+ * for real; that import() is the prelude's own, which loads at once.
+ *
+ * This used to be done by rewriting import( in each script's source to a
+ * call of the helper, which meant finding the calls in minified code by
+ * scanning it. A regular expression holding a quote threw the scan off,
+ * and Home Assistant's current build loads every one of its chunks with
+ * an import() the scan never found.
+ */
+static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
+				    const char *spec,
+				    JSValueConst *resolving_funcs,
+				    void *opaque)
 {
-	size_t count = 0, namelen, extra, o = 0, i, at, paren;
-	char *out, *ename;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue global, helper, args[2], promise, then, ret;
+	bool taken = false;
 
-	/* count first, so the copy is made in one piece */
-	for (at = next_dynamic_import(src, len, 0, &paren); at < len;
-	     at = next_dynamic_import(src, len, paren + 1, &paren)) {
-		count++;
+	(void)opaque;
+	if (thread == NULL || thread->closed || base == NULL ||
+	    strcmp(base, "<prelude>") == 0) {
+		return false;
 	}
-	if (count == 0) {
-		return NULL;
-	}
-	/* the base name, as a JS string literal */
-	namelen = strlen(name);
-	ename = malloc(namelen * 2 + 1);
-	if (ename == NULL) {
-		return NULL;
-	}
-	for (i = 0; i < namelen; i++) {
-		unsigned char c = (unsigned char)name[i];
-
-		if (c == '"' || c == '\\') {
-			ename[o++] = '\\';
-			ename[o++] = c;
-		} else if (c < 0x20) {
-			ename[o++] = ' ';
+	global = JS_GetGlobalObject(ctx);
+	helper = JS_GetPropertyStr(ctx, global, "__vitaImport");
+	if (JS_IsFunction(ctx, helper)) {
+		args[0] = JS_NewString(ctx, base);
+		args[1] = JS_NewString(ctx, spec);
+		promise = JS_Call(ctx, helper, global, 2, args);
+		JS_FreeValue(ctx, args[0]);
+		JS_FreeValue(ctx, args[1]);
+		if (JS_IsException(promise)) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
 		} else {
-			ename[o++] = c;
+			then = JS_GetPropertyStr(ctx, promise, "then");
+			ret = JS_Call(ctx, then, promise, 2, resolving_funcs);
+			if (JS_IsException(ret)) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+			} else {
+				taken = true;
+			}
+			JS_FreeValue(ctx, ret);
+			JS_FreeValue(ctx, then);
 		}
+		JS_FreeValue(ctx, promise);
 	}
-	ename[o] = 0;
-	/* "import(" -> "__vitaImport("<name>"," */
-	extra = strlen("__vitaImport(\"\",") + o;
-	out = malloc(len + count * extra + 1);
-	if (out == NULL) {
-		free(ename);
-		return NULL;
-	}
-	o = 0;
-	i = 0;
-	for (at = next_dynamic_import(src, len, 0, &paren); at < len;
-	     at = next_dynamic_import(src, len, paren + 1, &paren)) {
-		memcpy(out + o, src + i, at - i);
-		o += at - i;
-		o += (size_t)sprintf(out + o, "__vitaImport(\"%s\",", ename);
-		i = paren + 1;
-	}
-	memcpy(out + o, src + i, len - i);
-	o += len - i;
-	out[o] = 0;
-	*outlen = o;
-	free(ename);
-	return out;
+	JS_FreeValue(ctx, helper);
+	JS_FreeValue(ctx, global);
+	return taken;
 }
 
 /*
@@ -7648,6 +15828,7 @@ static char *rewrite_dynamic_imports(const char *src, size_t len,
 static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
+	C_WHERE;
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	const char *base = NULL, *spec = NULL, *state = "none";
 	char *url = NULL;
@@ -7673,10 +15854,7 @@ static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 		for (i = 0; i < thread->htmlc->scripts_count; i++) {
 			struct html_script *sc = &thread->htmlc->scripts[i];
 
-			if (sc->type == HTML_SCRIPT_INLINE ||
-			    sc->data.handle == NULL ||
-			    strcmp(nsurl_access(hlcache_handle_get_url(
-					sc->data.handle)), url) != 0) {
+			if (!script_is(sc, url)) {
 				continue;
 			}
 			found = true;
@@ -7684,7 +15862,8 @@ static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 				CONTENT_STATUS_DONE ? "done" : "arriving";
 			break;
 		}
-		if (!found && strstr(url, "://") != NULL) {
+		if (!found && !url_is_local(url) &&
+		    strstr(url, "://") != NULL) {
 			dom_string *href = to_dom_string(url);
 
 			if (href != NULL) {
@@ -7704,6 +15883,89 @@ static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+/*
+ * Whether a module compile must wait for its imports: true when some
+ * module under it is still arriving. Counted as a missed import, which
+ * is what the retry logic reads as "try again later", and logged.
+ */
+static bool module_graph_wait_for(jsthread *thread, const char *name,
+				  const char *src, size_t len, char *waiting,
+				  size_t waiting_len)
+{
+	waiting[0] = '\0';
+	if (module_graph_check(thread, name, src, len, waiting,
+			       waiting_len) != 0) {
+		return false;
+	}
+	thread->js_imports_missed++;
+	vita_log("qjs: module '%s' waits for '%s' before compiling", name,
+		 waiting);
+	return true;
+}
+
+static bool module_graph_wait(jsthread *thread, const char *name,
+			      const char *src, size_t len)
+{
+	char waiting[512];
+
+	return module_graph_wait_for(thread, name, src, len, waiting,
+				     sizeof(waiting));
+}
+
+/**
+ * Compile a module whose text the realm holds: an object URL made from a
+ * Blob, or a data: URL. The prelude's __vitaLocalModule has it.
+ */
+static JSModuleDef *local_module(JSContext *ctx, jsthread *thread,
+				 const char *name)
+{
+	JSValue global, get, text, fn;
+	const char *src;
+	size_t len;
+	JSModuleDef *m;
+
+	global = JS_GetGlobalObject(ctx);
+	get = JS_GetPropertyStr(ctx, global, "__vitaLocalModule");
+	text = JS_UNDEFINED;
+	if (JS_IsFunction(ctx, get)) {
+		JSValue arg = JS_NewString(ctx, name);
+
+		text = JS_Call(ctx, get, global, 1, &arg);
+		JS_FreeValue(ctx, arg);
+	}
+	JS_FreeValue(ctx, get);
+	JS_FreeValue(ctx, global);
+	if (JS_IsException(text)) {
+		return NULL;
+	}
+	if (!JS_IsString(text)) {
+		JS_FreeValue(ctx, text);
+		/* not "could not load module": the dynamic import helper
+		 * waits for a module named that to arrive */
+		JS_ThrowTypeError(ctx, "no module at '%.200s'", name);
+		return NULL;
+	}
+	src = JS_ToCStringLen(ctx, &len, text);
+	JS_FreeValue(ctx, text);
+	if (src == NULL) {
+		return NULL;
+	}
+	fn = JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_MODULE |
+		     JS_EVAL_FLAG_COMPILE_ONLY);
+	JS_FreeCString(ctx, src);
+	if (JS_IsException(fn)) {
+		vita_log("qjs: module at '%.80s' did not compile", name);
+		return NULL;
+	}
+	set_import_meta(ctx, fn, name);
+	m = JS_VALUE_GET_PTR(fn);
+	JS_FreeValue(ctx, fn);
+	thread->js_modules++;
+	vita_log("qjs: compiled module at '%.80s' (%u KB)", name,
+		 (unsigned)(len / 1024));
+	return m;
+}
+
 static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 				      void *opaque)
 {
@@ -7717,6 +15979,9 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 	if (thread == NULL || name == NULL) {
 		JS_ThrowReferenceError(ctx, "could not load module");
 		return NULL;
+	}
+	if (url_is_local(name)) {
+		return local_module(ctx, thread, name);
 	}
 	want = without_retry_suffix(name, stripped, sizeof(stripped));
 
@@ -7741,8 +16006,7 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 				continue;
 			}
 			fetched++;
-			if (strcmp(nsurl_access(hlcache_handle_get_url(
-					sc->data.handle)), want) != 0) {
+			if (!script_is(sc, want)) {
 				continue;
 			}
 			if (content_get_status(sc->data.handle) !=
@@ -7762,23 +16026,66 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 			}
 			memcpy(src, data, size);
 			src[size] = 0;
-			{
-				size_t rwlen = 0;
-				char *rw = rewrite_dynamic_imports(src, size,
-								   name, &rwlen);
+			/*
+			 * The compiled module from an earlier visit, if its
+			 * imports can all be had now (VitaSurf). Not under a
+			 * retry name: the bytecode carries the name it was
+			 * compiled under, and the engine files it by that.
+			 */
+			if (strcmp(name, want) == 0) {
+				uint64_t t_c0 = now_ms();
 
-				if (rw != NULL) {
+				fn = bc_load_module(ctx, name, src, size);
+				if (!JS_IsUndefined(fn)) {
 					free(src);
-					src = rw;
-					size = rwlen;
+					vitasurf_ms_js_import_cached +=
+						(unsigned)(now_ms() - t_c0);
+					vitasurf_js_import_cache_hits++;
+					vitasurf_js_import_cached_kb +=
+						(unsigned)(size / 1024);
+					set_import_meta(ctx, fn, name);
+					m = JS_VALUE_GET_PTR(fn);
+					JS_FreeValue(ctx, fn);
+					thread->js_modules++;
+					vita_log("qjs: module for import '%s' "
+						 "from the cache (%u KB) in "
+						 "%u ms", name,
+						 (unsigned)(size / 1024),
+						 (unsigned)(now_ms() - t_c0));
+					return m;
+				}
+			}
+			{
+				char waiting[512];
+
+				/* named for the one on its way: the dynamic
+				 * import helper waits for that and retries */
+				if (module_graph_wait_for(thread, name, src,
+							  size, waiting,
+							  sizeof(waiting))) {
+					free(src);
+					JS_ThrowReferenceError(ctx, "could not "
+						"load module '%s'", waiting);
+					return NULL;
 				}
 			}
 			{
 				unsigned missed = thread->js_imports_missed;
+				uint64_t t_c0 = now_ms();
 
 				fn = JS_Eval(ctx, src, size, name,
 					     JS_EVAL_TYPE_MODULE |
 					     JS_EVAL_FLAG_COMPILE_ONLY);
+				vitasurf_ms_js_import_compile +=
+					(unsigned)(now_ms() - t_c0);
+				vitasurf_js_import_compiles++;
+				vitasurf_js_import_kb +=
+					(unsigned)(size / 1024);
+				if (!JS_IsException(fn) &&
+				    strcmp(name, want) == 0) {
+					bc_store_module(ctx, name, src, size,
+							fn);
+				}
 				free(src);
 				if (JS_IsException(fn)) {
 					/* a static import of its own that is
@@ -7806,7 +16113,7 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 	 * retries the same chunk a few times a second apart when the
 	 * import fails. This one fails too, but the retry can find it.
 	 */
-	if (!unready && thread->htmlc != NULL &&
+	if (!unready && thread->htmlc != NULL && !url_is_local(want) &&
 	    strstr(want, "://") != NULL) {
 		dom_string *href = to_dom_string(want);
 
@@ -7845,6 +16152,11 @@ static JSValue settle_module(jsthread *thread, JSValue ret, const char *name)
 	for (;;) {
 		JSContext *c = NULL;
 		int r = JS_ExecutePendingJob(thread->heap->rt, &c);
+
+		bc_last_activity_ms = now_ms();
+		if (r != 0) {
+			prof_tail("a promise job");
+		}
 
 		if (r <= 0) {
 			if (r < 0 && c != NULL) {
@@ -7890,6 +16202,10 @@ static void js_free_deferred(jsthread *thread)
 		d = next;
 	}
 	thread->deferred = NULL;
+	mod_deps_free(thread);
+	sel_cache_free(thread);
+	tags_free(thread);
+	id_index_free(thread);
 	if (thread->deferred_scheduled) {
 		guit->misc->schedule(-1, module_retry_callback, thread);
 		thread->deferred_scheduled = false;
@@ -7941,8 +16257,33 @@ static void module_retry_callback(void *p)
 
 		begin_script(thread, SCRIPT_TIMER);
 		thread->current_script = d->name;
-		fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
-			     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+		/*
+		 * The compiled module from an earlier visit (VitaSurf),
+		 * once everything it imports is here; bc_load_module checks
+		 * that, so resolving it cannot fail.
+		 */
+		fn = bc_load_module(thread->ctx, d->name, d->src, d->len);
+		if (!JS_IsUndefined(fn) &&
+		    JS_ResolveModule(thread->ctx, fn) < 0) {
+			vita_log("qjs: cached module '%s' did not resolve",
+				 d->name);
+			fn = JS_EXCEPTION;
+		} else if (JS_IsUndefined(fn) &&
+			   module_graph_wait(thread, d->name, d->src,
+					     d->len)) {
+			fn = JS_ThrowReferenceError(thread->ctx,
+						    "imports still arriving");
+		} else if (JS_IsUndefined(fn)) {
+			fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
+				     JS_EVAL_TYPE_MODULE |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+			if (!JS_IsException(fn)) {
+				bc_store_module(thread->ctx, d->name, d->src,
+						d->len, fn);
+			}
+		} else {
+			vita_log("qjs: module '%s' from the cache", d->name);
+		}
 		if (!JS_IsException(fn)) {
 			JSValue ret;
 
@@ -8105,16 +16446,6 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	if (name == NULL) {
 		name = "<script>";
 	}
-	{
-		size_t rwlen = 0;
-		char *rw = rewrite_dynamic_imports(src, txtlen, name, &rwlen);
-
-		if (rw != NULL) {
-			free(src);
-			src = rw;
-			txtlen = rwlen;
-		}
-	}
 	begin_script(thread, SCRIPT_PAGE);
 	thread->current_script = name;
 	{
@@ -8125,7 +16456,11 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		 */
 		uint64_t t_start = now_ms(), t_compiled, t_done;
 		bool module = false, cached = false;
+		/* taken now, so nothing this script runs inherits it */
+		bool hinted = vitasurf_js_module_hint;
 		JSValue fn;
+
+		vitasurf_js_module_hint = false;
 
 		/*
 		 * Sites serve their own code as ES modules, which are not
@@ -8154,20 +16489,73 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 			cached = true;
 			goto compiled;
 		}
-		fn = JS_Eval(thread->ctx, src, txtlen, name,
-			     JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+		/*
+		 * Or a module's (VitaSurf). Bytecode read back has not
+		 * resolved its imports, which a compile does as it goes, so
+		 * that is done here; bc_load_module has already made sure
+		 * each of them can be found.
+		 */
+		fn = bc_load_module(thread->ctx, name, src, txtlen);
+		if (!JS_IsUndefined(fn)) {
+			if (JS_ResolveModule(thread->ctx, fn) < 0) {
+				vita_log("qjs: cached module '%s' did not "
+					 "resolve", name);
+				fn = JS_EXCEPTION;
+			} else {
+				set_import_meta(thread->ctx, fn, name);
+			}
+			module = true;
+			cached = true;
+			goto compiled;
+		}
+		/*
+		 * Unless the element said type="module" (VitaSurf): then
+		 * it goes straight to the module compile below, and back
+		 * to a classic one only if that fails.
+		 */
+		if (hinted) {
+			fn = JS_ThrowSyntaxError(thread->ctx,
+						 "a module script");
+		} else {
+			fn = JS_Eval(thread->ctx, src, txtlen, name,
+				     JS_EVAL_TYPE_GLOBAL |
+				     JS_EVAL_FLAG_COMPILE_ONLY);
+		}
 		if (!JS_IsException(fn)) {
 			bc_store(thread->ctx, name, src, txtlen, fn);
 		}
 		if (JS_IsException(fn)) {
 			JSValue script_err = JS_GetException(thread->ctx);
 			unsigned missed = thread->js_imports_missed;
-			JSValue as_module =
-				JS_Eval(thread->ctx, src, txtlen, name,
-					JS_EVAL_TYPE_MODULE |
-					JS_EVAL_FLAG_COMPILE_ONLY);
+			/* the classic parse that failed, and is thrown
+			 * away if this compiles as a module (VitaSurf) */
+			uint64_t t_reparse = now_ms();
+			unsigned wasted = (unsigned)(t_reparse - t_start);
+			JSValue as_module;
+
+			/* not while anything it imports is on its way;
+			 * see module_graph_check (VitaSurf) */
+			if (!module_graph_wait(thread, name, src, txtlen)) {
+				as_module = JS_Eval(thread->ctx, src, txtlen,
+						    name,
+						    JS_EVAL_TYPE_MODULE |
+						    JS_EVAL_FLAG_COMPILE_ONLY);
+			} else {
+				as_module = JS_ThrowReferenceError(
+					thread->ctx, "imports still arriving");
+			}
 
 			if (!JS_IsException(as_module)) {
+				bc_store_module(thread->ctx, name, src,
+						txtlen, as_module);
+				if (hinted) {
+					vitasurf_js_module_first++;
+				} else {
+					vitasurf_ms_js_reparse += wasted;
+					vitasurf_js_reparses++;
+					vitasurf_js_reparse_kb +=
+						(unsigned)(txtlen / 1024);
+				}
 				JS_FreeValue(thread->ctx, script_err);
 				fn = as_module;
 				module = true;
@@ -8186,12 +16574,32 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				JS_FreeValue(thread->ctx,
 					     JS_GetException(thread->ctx));
 				JS_FreeValue(thread->ctx, as_module);
+				/*
+				 * The source as compiled, with its dynamic
+				 * imports rewritten: txtlen is that text's
+				 * length now, and copying that much of the
+				 * original ran past its end whenever the
+				 * rewrite made it longer (VitaSurf).
+				 */
+				defer_module(thread, src, txtlen, name);
 				free(src);
-				defer_module(thread, (const char *)txt, txtlen,
-					     name);
 				thread->current_script = NULL;
 				end_script(thread);
 				return true;
+			} else if (hinted) {
+				/* labelled a module and not one: what it
+				 * is as a classic script decides */
+				JS_FreeValue(thread->ctx,
+					     JS_GetException(thread->ctx));
+				JS_FreeValue(thread->ctx, as_module);
+				JS_FreeValue(thread->ctx, script_err);
+				fn = JS_Eval(thread->ctx, src, txtlen, name,
+					     JS_EVAL_TYPE_GLOBAL |
+					     JS_EVAL_FLAG_COMPILE_ONLY);
+				if (!JS_IsException(fn)) {
+					bc_store(thread->ctx, name, src,
+						 txtlen, fn);
+				}
 			} else {
 				/* Not a module either: the first error is
 				 * the one that describes the source. */
@@ -8274,11 +16682,9 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		vitasurf_ms_js_run += (unsigned)(t_done - t_compiled);
 
 		/*
-		 * runtime_kb walks the whole runtime -- every object,
-		 * shape and string -- to add up what it holds, and asking
-		 * it once per script was 26 walks on a YouTube page
-		 * (VitaSurf). It is worth knowing after a script big
-		 * enough to move the number and not otherwise.
+		 * Logged after a script big enough to move the runtime's
+		 * memory, and not otherwise (VitaSurf): a line per script
+		 * was 26 on a YouTube page.
 		 */
 		if (txtlen > SCRIPT_LOG_BYTES) {
 			vita_log("qjs: script %u KB %s in %u ms, "
@@ -8287,8 +16693,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				 cached ? "read from cache" : "compiled",
 				 (unsigned)(t_compiled - t_start),
 				 (unsigned)(t_done - t_compiled),
-				 runtime_kb(thread->heap->rt),
-				 name);
+				 runtime_kb(thread->heap->rt), name);
 			vita_log_memory("after a large script");
 		} else if (vita_verbose_requested()) {
 			vita_log("qjs: script %u KB %s in %u ms, "
@@ -8324,16 +16729,176 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	return ok;
 }
 
+/*
+ * The page moved (VitaSurf). NetSurf scrolls without telling script, so
+ * nothing ever fired a scroll event: lazysizes, which unveils an image
+ * when a scroll, resize or click makes it check, left Yamtrack's posters
+ * as placeholders until something was clicked. vita/input calls this
+ * when the scroll position has changed, at most every 100 ms while it
+ * moves and once when it stops; the event goes to the document, where
+ * document and window listeners both hear it. A NULL window means every
+ * page, which is how the native harness drives it.
+ */
+void vita_js_scrolled(struct browser_window *bw);
+void vita_js_scrolled(struct browser_window *bw)
+{
+	jsthread *t;
+
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		if ((bw == NULL || t->win == bw) && !t->closed &&
+		    t->script_depth == 0) {
+			struct dom_document *doc = thread_document(t);
+
+			if (doc != NULL) {
+				static unsigned int fired;
+				unsigned int before = img_src_sets;
+				uint64_t t0 = now_ms();
+
+				js_fire_event(t, "scroll", NULL,
+					      (struct dom_node *)doc);
+				fired++;
+				/* what a scroll made the page do, when it did
+				 * anything: a lazy loader setting sources */
+				if (img_src_sets != before) {
+					vita_log("scroll: event %u set %u image "
+						 "sources, %u ms of script",
+						 fired, img_src_sets - before,
+						 (unsigned int)(now_ms() - t0));
+				}
+			}
+		}
+	}
+}
+
+/*
+ * A page's load waits for its frames, as in a browser (VitaSurf): an
+ * iframe in the page delays it until the frame's own load has fired.
+ * NetSurf fires the page's load as its document is converted, before
+ * layout has made the frames' windows at all, so an iframe with no
+ * window yet counts as loading until the page has been laid out once;
+ * after that one layout gave no window (past the frame cap, or with
+ * nothing to load) never will get one, and does not hold the page.
+ */
+#define LOAD_WAIT_POLL_MS 50
+#define LOAD_WAIT_MAX_MS 20000
+
+/** Whether a frame window's page has fired its load event. */
+static bool frame_loaded(struct browser_window *w)
+{
+	jsthread *t;
+
+	if (w->loading_content != NULL) {
+		t = content_thread(w->loading_content);
+		return t != NULL && t->ready_state != NULL &&
+			strcmp(t->ready_state, "complete") == 0;
+	}
+	t = content_thread(w->current_content);
+	/* a page without script (sandboxed, or not HTML) is loaded once
+	 * it is what the frame shows */
+	return t == NULL || (t->ready_state != NULL &&
+			     strcmp(t->ready_state, "complete") == 0);
+}
+
+struct frames_wait {
+	jsthread *thread;
+	bool laid_out;            /**< the page has had its first layout */
+	bool pending;
+};
+
+static bool frame_pending_visit(struct dom_node *node, bool *stop, void *pw)
+{
+	struct frames_wait *wait = pw;
+	struct browser_window *bw = wait->thread->win;
+	int i;
+
+	if (!node_in_document(node)) {
+		return true;
+	}
+	for (i = 0; i < bw->iframe_count; i++) {
+		if (bw->iframes[i] != NULL &&
+		    bw->iframes[i]->frame_node == node) {
+			if (!frame_loaded(bw->iframes[i])) {
+				wait->pending = true;
+				*stop = true;
+			}
+			return true;
+		}
+	}
+	if (!wait->laid_out) {
+		wait->pending = true;
+		*stop = true;
+	}
+	return true;
+}
+
+/** Whether any iframe in the thread's page is still loading. */
+static bool frames_pending(jsthread *thread)
+{
+	struct browser_window *bw = thread->win;
+	struct frames_wait wait;
+
+	if (bw == NULL || thread->htmlc == NULL) {
+		return false;
+	}
+	wait.thread = thread;
+	wait.pending = false;
+	wait.laid_out = bw->current_content != NULL &&
+		hlcache_handle_get_content(bw->current_content) ==
+		(struct content *)thread->htmlc;
+	html_frame_doc_each_iframe(thread->htmlc, frame_pending_visit, &wait);
+	return wait.pending;
+}
+
+static void deferred_load_check(void *p)
+{
+	jsthread *thread = p;
+	uint64_t waited;
+
+	if (thread == NULL || thread->closed || !thread->load_deferred) {
+		return;
+	}
+	waited = now_ms() - thread->load_deferred_ms;
+	if (frames_pending(thread) && waited < LOAD_WAIT_MAX_MS) {
+		guit->misc->schedule(LOAD_WAIT_POLL_MS, deferred_load_check,
+				     thread);
+		return;
+	}
+	if (waited >= LOAD_WAIT_MAX_MS) {
+		vita_log("qjs: a frame still loading after %u s; the page's "
+			 "load fires anyway", LOAD_WAIT_MAX_MS / 1000);
+	} else {
+		vita_log("qjs: the page's frames have loaded (%u ms); its "
+			 "load fires", (unsigned)waited);
+	}
+	thread->load_deferred = false;
+	thread->load_releasing = true;
+	js_fire_event(thread, "load", thread->load_doc, NULL);
+	thread->load_releasing = false;
+}
+
 bool js_fire_event(jsthread *thread, const char *type,
 		   struct dom_document *doc, struct dom_node *target)
 {
 	struct dom_event *evt;
-	struct dom_element *body = NULL;
 	dom_string *type_dom;
 	bool success = false;
 
 	if (thread == NULL || thread->closed) {
 		return true;
+	}
+	if (target == NULL && strcmp(type, "load") == 0 &&
+	    !thread->load_releasing) {
+		if (thread->load_deferred) {
+			return true;
+		}
+		if (frames_pending(thread)) {
+			thread->load_deferred = true;
+			thread->load_deferred_ms = now_ms();
+			thread->load_doc = doc;
+			guit->misc->schedule(LOAD_WAIT_POLL_MS,
+					     deferred_load_check, thread);
+			return true;
+		}
 	}
 	if (strcmp(type, "DOMContentLoaded") == 0) {
 		thread->ready_state = "interactive";
@@ -8341,6 +16906,7 @@ bool js_fire_event(jsthread *thread, const char *type,
 		thread->ready_state = "complete";
 	}
 	if (strcmp(type, "load") == 0) {
+		bc_index_flush();
 		vita_log("qjs: load event, runtime memory %u KB; "
 			 "%u scripts of %u KB compiled in %u ms, ran in %u ms"
 			 "; %u modules, %u import misses",
@@ -8362,21 +16928,82 @@ bool js_fire_event(jsthread *thread, const char *type,
 
 	if (target != NULL) {
 		dom_event_target_dispatch_event(target, evt, &success);
+	} else if (strcmp(type, "load") == 0 && thread->ctx != NULL) {
+		/*
+		 * The page's load is the window's (VitaSurf): its listeners
+		 * hear it, with the document as the target, and the
+		 * document's do not. It went to the document node, where
+		 * window listeners used to live.
+		 */
+		JSContext *ctx = thread->ctx;
+		JSValue global = JS_GetGlobalObject(ctx);
+		JSValue ctor = JS_GetPropertyStr(ctx, global, "Event");
+		JSValue name = JS_NewString(ctx, "load");
+		JSValue obj = JS_IsFunction(ctx, ctor) ?
+			JS_CallConstructor(ctx, ctor, 1, &name) : JS_UNDEFINED;
+		struct js_dispatch d;
+		int was = thread->window_phase;
+
+		JS_FreeValue(ctx, name);
+		JS_FreeValue(ctx, ctor);
+		if (JS_IsObject(obj)) {
+			JS_SetPropertyStr(ctx, obj, "target",
+				JS_GetPropertyStr(ctx, global, "document"));
+			d.evt = evt;
+			d.obj = obj;
+			d.next = thread->dispatches;
+			thread->dispatches = &d;
+			thread->window_phase = 2;
+			run_window_listeners(thread, evt, 2);
+			thread->window_phase = was;
+			thread->dispatches = d.next;
+		} else {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+		}
+		JS_FreeValue(ctx, obj);
+		JS_FreeValue(ctx, global);
 	} else if (doc != NULL) {
 		/*
-		 * Window-targetted events (load) go to the body element and
-		 * bubble up to the document node, where window and document
-		 * listeners are registered.
+		 * Window-targetted events (load) go to the document node,
+		 * where window and document listeners are registered. They
+		 * went to the body and bubbled up, which gave the body's own
+		 * listeners the window's load and every handler a target of
+		 * BODY where a browser says the document; body.onload is the
+		 * window's already.
 		 */
-		dom_html_document_get_body(doc, &body);
-		if (body != NULL) {
-			dom_event_target_dispatch_event(body, evt, &success);
-			dom_node_unref((struct dom_node *)body);
-		} else {
-			dom_event_target_dispatch_event(doc, evt, &success);
-		}
+		dom_event_target_dispatch_event(doc, evt, &success);
 	}
 	dom_event_unref(evt);
+	/*
+	 * A frame's window has loaded: its iframe element in the page
+	 * around it gets a load event too, which is how that page learns
+	 * the frame is ready (VitaSurf).
+	 */
+	if (target == NULL && strcmp(type, "load") == 0) {
+		struct browser_window *bw = thread->win;
+
+		if (bw != NULL && bw->parent != NULL &&
+		    bw->frame_node != NULL &&
+		    frame_parent_thread(bw) != NULL &&
+		    dom_event_create(&evt) == DOM_NO_ERR) {
+			type_dom = to_dom_string("load");
+			if (type_dom != NULL) {
+				dom_event_init(evt, type_dom, false, false);
+				dom_string_unref(type_dom);
+				dom_event_target_dispatch_event(
+					bw->frame_node, evt, &success);
+			}
+			dom_event_unref(evt);
+		}
+		/* the page around it may be waiting on this frame */
+		if (bw != NULL && bw->parent != NULL) {
+			jsthread *up = frame_parent_thread(bw);
+
+			if (up != NULL && up->load_deferred) {
+				guit->misc->schedule(0, deferred_load_check, up);
+			}
+		}
+	}
 	return true;
 }
 

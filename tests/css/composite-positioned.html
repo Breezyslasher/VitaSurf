@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>positioned boxes inside a box painted aside</title><style>
+ body { margin: 0; }
+ /* Bubble Card's button: a pill with rounded corners that clips, and
+    in it an absolute background at an opacity below one, and an icon
+    and a name that are positioned too */
+ .card { position: relative; width: 300px; height: 56px; margin: 20px;
+         border-radius: 28px; overflow: hidden; }
+ .button { position: absolute; inset: 0; display: flex; align-items: center; }
+ .bg { position: absolute; inset: 0; background: #e5e5e5; opacity: 0.79;
+       border-radius: 28px; }
+ .icon { position: relative; width: 42px; height: 42px; margin-left: 8px;
+         border-radius: 50%; background: #fff; }
+ .name { position: relative; margin-left: 10px; }
+</style></head>
+<body>
+<div class="card"><div class="button">
+ <div class="bg"></div>
+ <div class="icon"></div>
+ <div class="name">Alarmo</div>
+</div></div>
+<!-- The icon and name were set aside in the stacking context around the
+     card and painted after its bitmap was made: onto the screen, at the
+     bitmap's own coordinates, in the top left corner. With
+     VITASURF_TEST_RASTER=plots, the name's TEXT is inside the RASTER
+     block, and nothing is plotted at 0,0 outside one. -->
+</body></html>

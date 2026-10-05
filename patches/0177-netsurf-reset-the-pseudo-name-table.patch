@@ -1,0 +1,35 @@
+diff --git a/utils/utils.c b/utils/utils.c
+index c43fcab24..41720d14e 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -664,6 +664,14 @@ extern unsigned int css_select_pseudo_form;
+ extern unsigned int css_select_pseudo_has;
+ extern unsigned int css_select_pseudo_other;
+ extern unsigned int css_select_refused_negated;
++/* the named "other" pseudo-classes, cleared with the rest so a page's
++ * report is its own (VitaSurf) */
++struct css_select_pseudo_name {
++	struct lwc_string_s *name;
++	unsigned int count;
++};
++extern struct css_select_pseudo_name css_select_pseudo_names[8];
++extern unsigned int css_select_pseudo_unnamed;
+ 
+ unsigned int vitasurf_ms_select;
+ unsigned int vitasurf_box_elements;
+@@ -780,6 +788,15 @@ void vitasurf_profile_reset(void)
+ 	css_select_pseudo_has = 0;
+ 	css_select_pseudo_other = 0;
+ 	css_select_refused_negated = 0;
++	{
++		unsigned int i;
++
++		for (i = 0; i < 8; i++) {
++			css_select_pseudo_names[i].name = NULL;
++			css_select_pseudo_names[i].count = 0;
++		}
++	}
++	css_select_pseudo_unnamed = 0;
+ 	vitasurf_ms_select = 0;
+ 	vitasurf_box_elements = 0;
+ 	vitasurf_attr_interned_hits = 0;

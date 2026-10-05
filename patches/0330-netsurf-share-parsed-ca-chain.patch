@@ -1,0 +1,91 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index ca4622d0b..e8519ec07 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -338,6 +338,24 @@ static int curl_fetchers_registered = 0;
+ /** Flag for runtime detection of openssl usage */
+ static bool curl_with_openssl;
+ 
++#ifdef __vita__
++/**
++ * Whether connections take their trust anchors from the chain the
++ * platform parsed once (VitaSurf); see vita_tls_ca_shared().
++ */
++static bool curl_ca_shared;
++
++/** Put the shared CA chain in place of the one libcurl set up. */
++static CURLcode
++fetch_curl_vita_sslctx(CURL *curl_handle, void *ssl_config, void *parm)
++{
++	(void)curl_handle;
++	(void)parm;
++	vita_tls_ca_attach(ssl_config);
++	return CURLE_OK;
++}
++#endif
++
+ /** Error buffer for cURL. */
+ static char fetch_error_buffer[CURL_ERROR_SIZE];
+ 
+@@ -1331,6 +1349,14 @@ static CURLcode fetch_curl_set_options(struct curl_fetch_info *f)
+ 		/* do verification */
+ 		SETOPT(CURLOPT_SSL_VERIFYPEER, 1L);
+ 		SETOPT(CURLOPT_SSL_VERIFYHOST, 2L);
++#ifdef __vita__
++		/* set again each time, as the handle is reused */
++		if (curl_ca_shared) {
++			SETOPT(CURLOPT_SSL_CTX_FUNCTION,
++			       fetch_curl_vita_sslctx);
++			SETOPT(CURLOPT_SSL_CTX_DATA, NULL);
++		}
++#endif
+ #ifdef WITH_OPENSSL
+ 		if (curl_with_openssl) {
+ 			SETOPT(CURLOPT_SSL_CTX_FUNCTION, fetch_curl_sslctxfun);
+@@ -2466,8 +2492,31 @@ nserror fetch_curl_register(void)
+ 		{
+ 			struct curl_blob blob;
+ 			size_t len;
+-
+-			if (vita_read_file(nsoption_charp(ca_bundle),
++			const char *first;
++
++			/*
++			 * The bundle parsed once and shared (VitaSurf): curl
++			 * is given one certificate to parse, and the
++			 * callback puts the whole chain in its place. The
++			 * template handle carries the callback too, so the
++			 * handles copied from it -- WebSockets, a worker's
++			 * script -- trust the whole bundle as well.
++			 */
++			if (vita_tls_ca_shared(nsoption_charp(ca_bundle),
++					       &first, &len) &&
++			    curl_easy_setopt(fetch_blank_curl,
++					     CURLOPT_SSL_CTX_FUNCTION,
++					     fetch_curl_vita_sslctx) ==
++			    CURLE_OK) {
++				blob.data = (void *)first;
++				blob.len = len;
++				blob.flags = CURL_BLOB_COPY;
++				SETOPT(CURLOPT_CAINFO_BLOB, &blob);
++				SETOPT(CURLOPT_SSL_CTX_DATA, NULL);
++				curl_ca_shared = true;
++				NSLOG(netsurf, INFO,
++				      "ca_bundle: parsed once and shared");
++			} else if (vita_read_file(nsoption_charp(ca_bundle),
+ 					   (char **)&blob.data, &len) == 0) {
+ 				blob.len = len;
+ 				blob.flags = CURL_BLOB_COPY;
+@@ -2531,6 +2580,12 @@ nserror fetch_curl_register(void)
+ 
+ 	data = curl_version_info(CURLVERSION_NOW);
+ 
++	/* a default CA path would be parsed in every connect as well
++	 * (VitaSurf) */
++	NSLOG(netsurf, INFO, "curl default CA file '%s', CA path '%s'",
++	      data->cainfo != NULL ? data->cainfo : "(none)",
++	      data->capath != NULL ? data->capath : "(none)");
++
+ 	curl_fetch_ssl_hashmap = hashmap_create(&curl_fetch_ssl_hashmap_parameters);
+ 	if (curl_fetch_ssl_hashmap == NULL) {
+ 		NSLOG(netsurf, CRITICAL, "Unable to initialise SSL certificate hashmap");

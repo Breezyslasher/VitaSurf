@@ -1,0 +1,1192 @@
+diff --git a/content/handlers/html/Makefile b/content/handlers/html/Makefile
+index b90224f90..5c3bcada6 100644
+--- a/content/handlers/html/Makefile
++++ b/content/handlers/html/Makefile
+@@ -25,6 +25,7 @@ S_HTML := box_construct.c	\
+ 	scroll_anchor.c		\
+ 	bidi.c			\
+ 	object.c		\
++	preload.c		\
+ 	redraw.c		\
+ 	redraw_border.c		\
+ 	script.c		\
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index c2a616412..ea92593f6 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -340,6 +340,36 @@ dom_SCRIPT_showed_up(html_content *htmlc, dom_html_script_element *script)
+ 		return;
+ 	}
+ 
++	/*
++	 * A script is prepared once (VitaSurf). One inside a subtree put
++	 * in the document came here from the subtree's insertion and again
++	 * from its own, and ran twice; a copy of one that ran was run
++	 * again. One with neither a src nor any text is not started, as
++	 * the text it gets later runs.
++	 */
++	if (flags & DOM_HTML_SCRIPT_ELEMENT_FLAG_ALREADY_STARTED) {
++		return;
++	}
++	{
++		bool has_src = false;
++		dom_string *text = NULL;
++		bool started;
++
++		(void) dom_element_has_attribute(script, corestring_dom_src,
++						 &has_src);
++		started = has_src;
++		if (!started &&
++		    dom_node_get_text_content(script, &text) == DOM_NO_ERR &&
++		    text != NULL) {
++			started = dom_string_byte_length(text) > 0;
++			dom_string_unref(text);
++		}
++		if (started) {
++			(void) dom_html_script_element_set_flags(script,
++				flags | DOM_HTML_SCRIPT_ELEMENT_FLAG_ALREADY_STARTED);
++		}
++	}
++
+ 	res = html_process_script(htmlc, (dom_node *) script);
+ 	if (res == DOM_HUBBUB_OK) {
+ 		NSLOG(netsurf, DEEPDEBUG, "Inserted script has finished running");
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 6fd3df9e6..a4be36d41 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -65,6 +65,7 @@
+ #include "html/dom_event.h"
+ #include "css/select.h"
+ #include "html/css.h"
++#include "html/preload.h"
+ #include "html/object.h"
+ #include "html/html_save.h"
+ #include "html/interaction.h"
+@@ -946,6 +947,11 @@ html_process_encoding_change(struct content *c,
+ 
+ 	source_data = content__get_source_data(c, &source_size);
+ 
++	/* the new parser starts from the top, and so does the scanner
++	 * that follows it (VitaSurf) */
++	html->parser_paused = false;
++	html_preload_restart(html);
++
+ 	/* Reprocess all the data.  This is safe because
+ 	 * the encoding is now specified at parser start which means
+ 	 * it cannot be changed again.
+@@ -1014,6 +1020,10 @@ html_process_data(struct content *c, const char *data, unsigned int size)
+ 		 err = html_process_encoding_change(c, data, size);
+ 	}
+ 
++	/* what arrived while the parser waits on a script can be
++	 * fetched already (VitaSurf) */
++	html_preload_scan(html, html->parser_paused);
++
+ 	/* broadcast the error if necessary */
+ 	if (err != NSERROR_OK) {
+ 		content_broadcast_error(c, err, NULL);
+@@ -1286,6 +1296,9 @@ html_begin_conversion_inner(html_content *htmlc)
+ 		 * loading screen for ever (VitaSurf).
+ 		 */
+ 		(void) html_recover_dropped_scripts(htmlc);
++
++		/* the parser has asked for all it will (VitaSurf) */
++		html_preload_free(htmlc);
+ 	}
+ 
+ 	if (html_can_begin_conversion(htmlc) == false) {
+@@ -1970,6 +1983,9 @@ static void html_destroy(struct content *c)
+ 
+ 	html_live_remove(html);
+ 
++	/* fetches started ahead of its parser (VitaSurf) */
++	html_preload_free(html);
++
+ 	/* a web font still on its way must not lay this content out */
+ 	html_webfont_forget(html);
+ 
+diff --git a/content/handlers/html/preload.c b/content/handlers/html/preload.c
+new file mode 100644
+index 000000000..1b7a00ffa
+--- /dev/null
++++ b/content/handlers/html/preload.c
+@@ -0,0 +1,625 @@
++/*
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Fetching ahead of a paused parser (VitaSurf).
++ *
++ * The parser stops at a script it has to fetch, or at one waiting for
++ * the stylesheets before it, and reads no further until the script has
++ * run. Whatever the document names after that point is not asked for
++ * until then, so a page with its scripts one after another fetched them
++ * one after another. A browser runs a second, cheap tokenizer over the
++ * rest of the document while its parser waits, and starts the fetches
++ * that will be wanted; this is that.
++ *
++ * The scanner follows the document as it arrives, whether the parser
++ * is paused or not, so that it knows at every point whether it is in
++ * markup, a comment or the text of an element such as an inline
++ * script, whose "<script src" is a string and not a tag. It starts
++ * fetches only while the parser is paused. Each is an llcache handle
++ * held until the parse ends; the parser's own retrieval of the same URL
++ * joins it (LLCACHE_RETRIEVE_PRELOAD), cache or no cache, and receives
++ * what has arrived so far as though it had asked first.
++ *
++ * It fetches what the parser would: linked stylesheets (and those
++ * preloaded as a style), external scripts and module preloads. Not
++ * images, which are fetched when the boxes are built, and not what it
++ * cannot read with certainty -- an attribute with a character
++ * reference it does not know -- which is left to the parser.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++#include "utils/log.h"
++#include "utils/nsurl.h"
++#include "utils/nsoption.h"
++#include "utils/utils.h"
++#include "content/content_protected.h"
++#include "content/llcache.h"
++
++#include "html/private.h"
++#include "html/preload.h"
++
++/** Most fetches one document starts ahead of its parser */
++#define PRELOAD_MAX 32
++/** Longest attribute value read */
++#define PRELOAD_VALUE_MAX 2048
++
++struct html_preload {
++	size_t offset;		/**< scanned up to here */
++	/** inside the text of this element, awaiting its end tag, or "" */
++	char raw_end[12];
++	bool stopped;		/**< a plaintext element: nothing follows */
++	bool base_seen;		/**< the scanner met a base with an href */
++	nsurl *base;		/**< URL that base gives, or NULL */
++	unsigned int count;	/**< fetches started */
++	llcache_handle *handles[PRELOAD_MAX];
++};
++
++/** An attribute value, as it stands in the source */
++struct preload_attr {
++	const char *v;
++	size_t len;
++	bool present;
++};
++
++/** The attributes of a start tag the scanner reads */
++struct preload_tag {
++	struct preload_attr rel, href, src, as, type, media, disabled;
++};
++
++
++static nserror preload_cb(llcache_handle *handle, const llcache_event *event,
++			  void *pw)
++{
++	/* nothing to do: the parser's retrieval takes the data up */
++	(void) handle;
++	(void) event;
++	(void) pw;
++	return NSERROR_OK;
++}
++
++static bool is_space(char c)
++{
++	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
++}
++
++static bool is_alpha(char c)
++{
++	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
++}
++
++static bool is_alnum(char c)
++{
++	return is_alpha(c) || (c >= '0' && c <= '9');
++}
++
++/** Find needle, ASCII case-insensitively, in [p, end) */
++static const char *find_ci(const char *p, const char *end, const char *needle)
++{
++	size_t n = strlen(needle);
++
++	for (; p + n <= end; p++) {
++		if (strncasecmp(p, needle, n) == 0)
++			return p;
++	}
++	return NULL;
++}
++
++/**
++ * Decode an attribute value's character references into out.
++ *
++ * \return the length, or -1 for a value to leave to the parser
++ */
++static int decode_value(const struct preload_attr *a, char *out)
++{
++	const char *p = a->v, *end = a->v + a->len;
++	int n = 0;
++
++	while (p < end) {
++		char c = *p;
++
++		if (n >= PRELOAD_VALUE_MAX - 1)
++			return -1;
++		if (c != '&') {
++			out[n++] = c;
++			p++;
++			continue;
++		}
++		if (p + 1 < end && p[1] == '#') {
++			const char *q = p + 2;
++			unsigned long cp = 0;
++			bool hex = false, any = false;
++
++			if (q < end && (*q == 'x' || *q == 'X')) {
++				hex = true;
++				q++;
++			}
++			for (; q < end && cp < 0x110000; q++) {
++				char d = *q;
++
++				if (d >= '0' && d <= '9')
++					cp = cp * (hex ? 16 : 10) + (d - '0');
++				else if (hex && d >= 'a' && d <= 'f')
++					cp = cp * 16 + (d - 'a' + 10);
++				else if (hex && d >= 'A' && d <= 'F')
++					cp = cp * 16 + (d - 'A' + 10);
++				else
++					break;
++				any = true;
++			}
++			if (!any || cp < 0x20 || cp > 0x7e)
++				return -1;
++			if (q < end && *q == ';')
++				q++;
++			out[n++] = (char) cp;
++			p = q;
++			continue;
++		}
++		{
++			/* a named reference */
++			const char *q = p + 1;
++			size_t len;
++			char d = 0;
++
++			while (q < end && is_alnum(*q))
++				q++;
++			len = q - (p + 1);
++			if (len == 0) {
++				/* no name: a plain ampersand */
++				out[n++] = '&';
++				p++;
++				continue;
++			}
++			if (len == 3 && strncmp(p + 1, "amp", 3) == 0)
++				d = '&';
++			else if (len == 2 && strncmp(p + 1, "lt", 2) == 0)
++				d = '<';
++			else if (len == 2 && strncmp(p + 1, "gt", 2) == 0)
++				d = '>';
++			else if (len == 4 && strncmp(p + 1, "quot", 4) == 0)
++				d = '"';
++			else if (len == 4 && strncmp(p + 1, "apos", 4) == 0 &&
++				 q < end && *q == ';')
++				d = '\'';
++
++			if (q < end && *q == ';') {
++				if (d == 0)
++					return -1;
++				out[n++] = d;
++				p = q + 1;
++			} else if (q < end && *q == '=') {
++				/* "&name=" in an attribute is never a
++				 * reference: a query string */
++				out[n++] = '&';
++				p++;
++			} else if (d != 0) {
++				out[n++] = d;
++				p = q;
++			} else {
++				/*
++				 * "&name" and no semicolon: a reference only
++				 * when name is one of the legacy entities.
++				 * Which it is not usually is, "&v2" say, but
++				 * the list is long; leave it to the parser.
++				 */
++				return -1;
++			}
++		}
++	}
++	out[n] = '\0';
++	return n;
++}
++
++/** Whether a whitespace separated list holds a token */
++static bool has_token(const struct preload_attr *a, const char *token)
++{
++	size_t tl = strlen(token);
++	const char *p = a->v, *end = a->v + a->len;
++
++	while (p < end) {
++		const char *s;
++
++		while (p < end && is_space(*p))
++			p++;
++		s = p;
++		while (p < end && !is_space(*p))
++			p++;
++		if ((size_t)(p - s) == tl && strncasecmp(s, token, tl) == 0)
++			return true;
++	}
++	return false;
++}
++
++static bool value_is(const struct preload_attr *a, const char *s)
++{
++	return a->len == strlen(s) && strncasecmp(a->v, s, a->len) == 0;
++}
++
++/**
++ * Start fetching an attribute's URL.
++ */
++static void preload_fetch(html_content *c, struct html_preload *pl,
++			  const struct preload_attr *a, const char *kind)
++{
++	char value[PRELOAD_VALUE_MAX];
++	nsurl *url;
++	lwc_string *scheme;
++	llcache_handle *h = NULL;
++	nserror err;
++	bool web;
++	int len;
++	int i;
++
++	if (pl->count == PRELOAD_MAX)
++		return;
++	len = decode_value(a, value);
++	if (len <= 0)
++		return;
++	/* bytes of another encoding would be read as UTF-8 here, and
++	 * not as the parser reads them */
++	for (i = 0; i != len; i++) {
++		if ((unsigned char) value[i] >= 0x80 &&
++		    (c->encoding == NULL ||
++		     strcasecmp(c->encoding, "UTF-8") != 0))
++			return;
++	}
++
++	if (nsurl_join(pl->base != NULL ? pl->base : c->base_url, value,
++		       &url) != NSERROR_OK)
++		return;
++
++	/* only what goes over the network is worth starting early */
++	scheme = nsurl_get_component(url, NSURL_SCHEME);
++	web = scheme != NULL &&
++		(lwc_string_data(scheme)[0] == 'h' ||
++		 lwc_string_data(scheme)[0] == 'H') &&
++		(lwc_string_length(scheme) == 4 ||
++		 lwc_string_length(scheme) == 5);
++	if (scheme != NULL)
++		lwc_string_unref(scheme);
++	if (!web) {
++		nsurl_unref(url);
++		return;
++	}
++
++	err = llcache_handle_retrieve(url, LLCACHE_RETRIEVE_PRELOAD,
++				      content_get_url(&c->base), NULL,
++				      preload_cb, NULL, &h);
++	if (err == NSERROR_OK && h != NULL) {
++		pl->handles[pl->count++] = h;
++		vita_log("preload: %s %s", kind, nsurl_access(url));
++	}
++	nsurl_unref(url);
++}
++
++/**
++ * Act on a start tag the scanner has read.
++ */
++static void preload_tag(html_content *c, struct html_preload *pl,
++			const char *name, size_t nlen,
++			const struct preload_tag *t, bool fetch)
++{
++	if (nlen == 4 && strncasecmp(name, "base", 4) == 0) {
++		char value[PRELOAD_VALUE_MAX];
++
++		if (!t->href.present || pl->base_seen)
++			return;
++		pl->base_seen = true;
++		/* one the parser has met already is in base_url */
++		if (!nsurl_compare(c->base_url, content_get_url(&c->base),
++				   NSURL_COMPLETE))
++			return;
++		if (decode_value(&t->href, value) > 0) {
++			(void) nsurl_join(c->base_url, value, &pl->base);
++		}
++		return;
++	}
++	if (!fetch)
++		return;
++
++	if (nlen == 6 && strncasecmp(name, "script", 6) == 0) {
++		if (t->src.present)
++			preload_fetch(c, pl, &t->src, "script");
++		return;
++	}
++	if (nlen == 4 && strncasecmp(name, "link", 4) == 0) {
++		if (!t->rel.present || !t->href.present || t->disabled.present)
++			return;
++		/* as html_process_inserted_link has it */
++		if (has_token(&t->rel, "modulepreload") ||
++		    (has_token(&t->rel, "preload") && t->as.present &&
++		     value_is(&t->as, "script"))) {
++			preload_fetch(c, pl, &t->href, "module");
++			return;
++		}
++		/* as html_css_process_link has it */
++		if (has_token(&t->rel, "alternate"))
++			return;
++		if (!has_token(&t->rel, "stylesheet") &&
++		    !(has_token(&t->rel, "preload") && t->as.present &&
++		      value_is(&t->as, "style")))
++			return;
++		if (nsoption_bool(author_level_css) == false)
++			return;
++		if (t->type.present && !value_is(&t->type, "text/css"))
++			return;
++		/* a sheet for print is fetched all the same, but it
++		 * holds nothing up and need not go first */
++		if (t->media.present && value_is(&t->media, "print"))
++			return;
++		preload_fetch(c, pl, &t->href, "stylesheet");
++	}
++}
++
++/**
++ * The element whose text is skipped to its end tag, if name is one.
++ */
++static const char *raw_text_element(const char *name, size_t nlen)
++{
++	static const char *const raw[] = {
++		"script", "style", "textarea", "title", "xmp", "iframe",
++		"noembed", "noframes", "template", "svg", "math"
++	};
++	unsigned int i;
++
++	for (i = 0; i != sizeof(raw) / sizeof(raw[0]); i++) {
++		if (nlen == strlen(raw[i]) &&
++		    strncasecmp(name, raw[i], nlen) == 0)
++			return raw[i];
++	}
++	/* scripting is on whenever there is a scanner */
++	if (nlen == 8 && strncasecmp(name, "noscript", 8) == 0)
++		return "noscript";
++	return NULL;
++}
++
++/**
++ * Read a start tag from p, which is just past the "<" and at its name.
++ *
++ * \return where the tag ends, just past its ">", or NULL when the
++ *         data ends first
++ */
++static const char *read_tag(const char *p, const char *end,
++			    const char **name, size_t *nlen,
++			    struct preload_tag *t, bool *self_closing)
++{
++	*name = p;
++	while (p < end && !is_space(*p) && *p != '/' && *p != '>')
++		p++;
++	*nlen = p - *name;
++	memset(t, 0, sizeof(*t));
++	*self_closing = false;
++
++	while (p < end) {
++		const char *an;
++		size_t alen;
++		struct preload_attr *a = NULL;
++		struct preload_attr val = { NULL, 0, true };
++
++		while (p < end && (is_space(*p) || *p == '/')) {
++			*self_closing = (*p == '/');
++			p++;
++		}
++		if (p >= end)
++			return NULL;
++		if (*p == '>')
++			return p + 1;
++		*self_closing = false;
++
++		an = p;
++		/* an attribute name may start with "=" */
++		p++;
++		while (p < end && !is_space(*p) && *p != '/' && *p != '>' &&
++		       *p != '=')
++			p++;
++		alen = p - an;
++		while (p < end && is_space(*p))
++			p++;
++		if (p < end && *p == '=') {
++			p++;
++			while (p < end && is_space(*p))
++				p++;
++			if (p >= end)
++				return NULL;
++			if (*p == '"' || *p == '\'') {
++				const char *q = memchr(p + 1, *p, end - p - 1);
++
++				if (q == NULL)
++					return NULL;
++				val.v = p + 1;
++				val.len = q - p - 1;
++				p = q + 1;
++			} else {
++				val.v = p;
++				while (p < end && !is_space(*p) && *p != '>')
++					p++;
++				val.len = p - val.v;
++			}
++		} else {
++			val.v = an + alen;
++			val.len = 0;
++		}
++
++#define ATTR(field) \
++		if (alen == sizeof(#field) - 1 && \
++		    strncasecmp(an, #field, alen) == 0) \
++			a = &t->field;
++		ATTR(rel) ATTR(href) ATTR(src) ATTR(as) ATTR(type)
++		ATTR(media) ATTR(disabled)
++#undef ATTR
++		/* the first of a name counts */
++		if (a != NULL && !a->present)
++			*a = val;
++	}
++	return NULL;
++}
++
++/* exported interface documented in html/preload.h */
++void html_preload_scan(html_content *c, bool fetch)
++{
++	struct html_preload *pl = c->preload;
++	const char *data, *p, *end;
++	size_t size;
++
++	if (!c->enable_scripting || c->parse_completed || c->aborted)
++		return;
++	if (pl == NULL) {
++		pl = calloc(1, sizeof(*pl));
++		if (pl == NULL)
++			return;
++		c->preload = pl;
++	}
++	if (pl->stopped)
++		return;
++	data = (const char *) content__get_source_data(&c->base, &size);
++	if (data == NULL || size <= pl->offset)
++		return;
++	/* a two-byte encoding has none of the markup in single bytes */
++	if (c->encoding != NULL && (strstr(c->encoding, "16") != NULL ||
++				    strstr(c->encoding, "32") != NULL))
++		return;
++
++	p = data + pl->offset;
++	end = data + size;
++	while (p < end) {
++		const char *lt, *after;
++		const char *name;
++		size_t nlen;
++		struct preload_tag t;
++		bool self_closing;
++
++		if (pl->raw_end[0] != '\0') {
++			char close[16];
++			const char *q;
++			size_t clen;
++
++			clen = (size_t) snprintf(close, sizeof(close), "</%s",
++						 pl->raw_end);
++			q = find_ci(p, end, close);
++			/* "</scripts" does not end a script */
++			while (q != NULL && q + clen < end &&
++			       is_alnum(q[clen]))
++				q = find_ci(q + 1, end, close);
++			if (q != NULL && q + clen == end) {
++				/* what follows the name is still to come */
++				p = q;
++				break;
++			}
++			if (q == NULL) {
++				/* the end tag may be cut in two */
++				p = (size_t)(end - p) > clen ?
++					end - clen : p;
++				break;
++			}
++			pl->raw_end[0] = '\0';
++			p = q + clen;
++			continue;
++		}
++
++		lt = memchr(p, '<', end - p);
++		if (lt == NULL) {
++			p = end;
++			break;
++		}
++		p = lt;
++		if (end - p < 4) {
++			break;
++		}
++		if (strncmp(p, "<!--", 4) == 0) {
++			const char *q = find_ci(p + 4, end, "-->");
++
++			if (q == NULL)
++				break;
++			p = q + 3;
++			continue;
++		}
++		if (p[1] == '!' || p[1] == '?' || p[1] == '/') {
++			const char *q = memchr(p, '>', end - p);
++
++			if (q == NULL)
++				break;
++			p = q + 1;
++			continue;
++		}
++		if (!is_alpha(p[1])) {
++			p++;
++			continue;
++		}
++
++		after = read_tag(p + 1, end, &name, &nlen, &t, &self_closing);
++		if (after == NULL)
++			break;
++		preload_tag(c, pl, name, nlen, &t, fetch);
++		p = after;
++
++		if (nlen == 9 && strncasecmp(name, "plaintext", 9) == 0) {
++			pl->stopped = true;
++			break;
++		}
++		{
++			const char *raw = raw_text_element(name, nlen);
++
++			/* the slash means something only in svg and math */
++			if (raw != NULL && !(self_closing &&
++					     (strcmp(raw, "svg") == 0 ||
++					      strcmp(raw, "math") == 0)))
++				strcpy(pl->raw_end, raw);
++		}
++	}
++	pl->offset = p - data;
++}
++
++/* exported interface documented in html/preload.h */
++void html_preload_restart(html_content *c)
++{
++	struct html_preload *pl = c->preload;
++
++	if (pl == NULL)
++		return;
++	pl->offset = 0;
++	pl->raw_end[0] = '\0';
++	pl->stopped = false;
++	pl->base_seen = false;
++	if (pl->base != NULL) {
++		nsurl_unref(pl->base);
++		pl->base = NULL;
++	}
++}
++
++/* exported interface documented in html/preload.h */
++void html_preload_free(html_content *c)
++{
++	struct html_preload *pl = c->preload;
++	unsigned int i;
++
++	if (pl == NULL)
++		return;
++	c->preload = NULL;
++	for (i = 0; i != pl->count; i++) {
++		llcache_handle_release(pl->handles[i]);
++	}
++	if (pl->base != NULL) {
++		nsurl_unref(pl->base);
++	}
++	free(pl);
++}
+diff --git a/content/handlers/html/preload.h b/content/handlers/html/preload.h
+new file mode 100644
+index 000000000..0cc1b57af
+--- /dev/null
++++ b/content/handlers/html/preload.h
+@@ -0,0 +1,51 @@
++/*
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Fetching ahead of a paused parser (VitaSurf).
++ */
++
++#ifndef NETSURF_HTML_PRELOAD_H
++#define NETSURF_HTML_PRELOAD_H
++
++struct html_content;
++
++/**
++ * Follow the document as far as it has arrived.
++ *
++ * \param c      html content
++ * \param fetch  whether the parser is paused, and fetches start for
++ *               what the scanner meets
++ */
++void html_preload_scan(struct html_content *c, bool fetch);
++
++/**
++ * Follow the document from its start again, the parser having started
++ * again with another encoding.
++ *
++ * \param c  html content
++ */
++void html_preload_restart(struct html_content *c);
++
++/**
++ * Let go of the fetches the scanner started, the parse being over.
++ *
++ * \param c  html content
++ */
++void html_preload_free(struct html_content *c);
++
++#endif
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 4727fa5a8..332f6ec15 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -206,6 +206,10 @@ typedef struct html_content {
+ 	/** a parser script waiting for the stylesheets before it to load,
+ 	 * with the parser paused on it (VitaSurf) */
+ 	struct dom_node *blocked_script;
++	/** the parser is paused on a script (VitaSurf) */
++	bool parser_paused;
++	/** fetching ahead of the paused parser (VitaSurf) */
++	struct html_preload *preload;
+ 	struct html_script *scripts;
+ 	/** javascript thread in use */
+ 	struct jsthread *jsthread;
+diff --git a/content/handlers/html/script.c b/content/handlers/html/script.c
+index 358d75e39..cdd544a51 100644
+--- a/content/handlers/html/script.c
++++ b/content/handlers/html/script.c
+@@ -45,6 +45,7 @@
+ #include "html/html.h"
+ #include "html/private.h"
+ #include "html/css.h"
++#include "html/preload.h"
+ #include "netsurf/misc.h"
+ #include "desktop/gui_internal.h"
+ 
+@@ -421,6 +422,64 @@ static bool script_was_seen(dom_node *node)
+ }
+ 
+ 
++/**
++ * Mark a script element the parser hands over as started, so that a
++ * copy of it put in the document does not run it again (VitaSurf).
++ */
++static void script_mark_started(dom_node *node)
++{
++	dom_html_element_type tag;
++	dom_html_script_element_flags flags;
++
++	if (dom_html_element_get_tag_type(node, &tag) == DOM_NO_ERR &&
++	    tag == DOM_HTML_ELEMENT_TYPE_SCRIPT &&
++	    dom_html_script_element_get_flags(
++		    (dom_html_script_element *) node, &flags) == DOM_NO_ERR) {
++		(void) dom_html_script_element_set_flags(
++			(dom_html_script_element *) node,
++			flags | DOM_HTML_SCRIPT_ELEMENT_FLAG_ALREADY_STARTED);
++	}
++}
++
++/**
++ * Whether a script element is inside a template (VitaSurf).
++ *
++ * What a template holds is inert until a script puts a copy of it in
++ * the document: its scripts are neither fetched nor run. The parser
++ * here puts a template's children in the document itself, where the
++ * prelude takes them out into the content fragment only once a script
++ * asks, so the parser ran every script in every template as it read it.
++ */
++static bool script_in_template(dom_node *node)
++{
++	dom_node *n = NULL, *next = NULL;
++	bool inside = false;
++
++	if (dom_node_get_parent_node(node, &n) != DOM_NO_ERR)
++		return false;
++	while (n != NULL && !inside) {
++		dom_node_type type;
++		dom_string *name = NULL;
++
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++		    type == DOM_ELEMENT_NODE &&
++		    dom_node_get_node_name(n, &name) == DOM_NO_ERR &&
++		    name != NULL) {
++			inside = dom_string_byte_length(name) == 8 &&
++				strncasecmp(dom_string_data(name),
++					    "template", 8) == 0;
++			dom_string_unref(name);
++		}
++		if (dom_node_get_parent_node(n, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(n);
++		n = next;
++	}
++	if (n != NULL)
++		dom_node_unref(n);
++	return inside;
++}
++
+ unsigned int html_recover_dropped_scripts(html_content *c)
+ {
+ 	dom_nodelist *list = NULL;
+@@ -454,7 +513,7 @@ unsigned int html_recover_dropped_scripts(html_content *c)
+ 				node == NULL) {
+ 			continue;
+ 		}
+-		if (script_was_seen(node)) {
++		if (script_was_seen(node) || script_in_template(node)) {
+ 			dom_node_unref(node);
+ 			continue;
+ 		}
+@@ -724,6 +783,7 @@ convert_script_sync_cb(hlcache_handle *script,
+ 
+ 		/* continue parse */
+ 		if (parent->parser != NULL && active_sync_scripts == 0) {
++			parent->parser_paused = false;
+ 			parent->parsing++;
+ 			err = dom_hubbub_parser_pause(parent->parser, false);
+ 			parent->parsing--;
+@@ -772,6 +832,7 @@ convert_script_sync_cb(hlcache_handle *script,
+ 
+ 		/* continue parse */
+ 		if (parent->parser != NULL && active_sync_scripts == 0) {
++			parent->parser_paused = false;
+ 			parent->parsing++;
+ 			err = dom_hubbub_parser_pause(parent->parser, false);
+ 			parent->parsing--;
+@@ -1289,6 +1350,7 @@ static void html_script_run_blocked(html_content *c)
+ 	 * and lifts the pause itself once it has run */
+ 	if (err != (DOM_HUBBUB_HUBBUB_ERR | HUBBUB_PAUSED) &&
+ 	    c->parser != NULL) {
++		c->parser_paused = false;
+ 		c->parsing++;
+ 		dom_hubbub_parser_pause(c->parser, false);
+ 		c->parsing--;
+@@ -1331,7 +1393,11 @@ static bool script_runs_now(dom_node *node)
+ dom_hubbub_error html_process_script_parser(void *ctx, dom_node *node)
+ {
+ 	html_content *c = (html_content *) ctx;
++	dom_hubbub_error err;
+ 
++	if (script_in_template(node))
++		return DOM_HUBBUB_OK;
++	script_mark_started(node);
+ 	if (c->parser != NULL && !c->parse_completed &&
+ 	    c->blocked_script == NULL && c->script_depth == 0 &&
+ 	    script_runs_now(node) && html_css_blocks_scripts(c)) {
+@@ -1340,9 +1406,17 @@ dom_hubbub_error html_process_script_parser(void *ctx, dom_node *node)
+ 		c->blocked_script = dom_node_ref(node);
+ 		guit->misc->schedule(SCRIPT_CSS_WAIT_MS,
+ 				     html_script_css_timeout, c);
++		c->parser_paused = true;
++		html_preload_scan(c, true);
+ 		return DOM_HUBBUB_HUBBUB_ERR | HUBBUB_PAUSED;
+ 	}
+-	return html_process_script(ctx, node);
++	err = html_process_script(ctx, node);
++	if (err == (DOM_HUBBUB_HUBBUB_ERR | HUBBUB_PAUSED)) {
++		/* a script being fetched: fetch what follows it too */
++		c->parser_paused = true;
++		html_preload_scan(c, true);
++	}
++	return err;
+ }
+ 
+ /* exported internal interface documented in html/html_internal.h */
+diff --git a/content/llcache.c b/content/llcache.c
+index f8e18d266..e73b8426c 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -203,6 +203,12 @@ struct llcache_object {
+ 	llcache_header *headers;     /**< Fetch headers */
+ 	size_t num_headers;	     /**< Number of fetch headers */
+ 
++	/** URL a preload asked for: the next retrieval of it joins this
++	 * object (VitaSurf) */
++	nsurl *preload_url;
++	/** The fetch failed or was cut short: nobody may join it */
++	bool failed;
++
+ 	/* Instrumentation. These elements are strictly for information
+ 	 * to improve the cache performance and to provide performance
+ 	 * metrics. The values are non-authoritative and must not be used to
+@@ -381,6 +387,21 @@ static nserror llcache_object_remove_user(llcache_object *object,
+ 	return NSERROR_OK;
+ }
+ 
++/**
++ * Mark an object as one nobody may join, its fetch having failed or
++ * been cut short (VitaSurf).
++ *
++ * \param object  The object
++ */
++static void llcache_object_failed(llcache_object *object)
++{
++	object->failed = true;
++	if (object->preload_url != NULL) {
++		nsurl_unref(object->preload_url);
++		object->preload_url = NULL;
++	}
++}
++
+ /**
+  * Iterate the users of an object, calling their callbacks.
+  *
+@@ -394,6 +415,10 @@ static nserror llcache_send_event_to_users(llcache_object *object,
+ 	nserror error = NSERROR_OK;
+ 	llcache_object_user *user, *next_user;
+ 
++	if (event->type == LLCACHE_EVENT_ERROR) {
++		llcache_object_failed(object);
++	}
++
+ 	user = object->users;
+ 	while (user != NULL) {
+ 		bool was_target = user->iterator_target;
+@@ -1077,6 +1102,10 @@ static nserror llcache_object_destroy(llcache_object *object)
+ 
+ 	cert_chain_free(object->chain);
+ 
++	if (object->preload_url != NULL) {
++		nsurl_unref(object->preload_url);
++	}
++
+ 	if (object->source_data != NULL) {
+ 		if (object->store_state == LLCACHE_STATE_DISC) {
+ 			guit->llcache->release(object->url, BACKING_STORE_NONE);
+@@ -2089,6 +2118,47 @@ llcache_object_retrieve_from_cache(nsurl *url,
+ 	return NSERROR_OK;
+ }
+ 
++/**
++ * Find an object a preload started or can stand in for (VitaSurf).
++ *
++ * A document fetches ahead of its parser while the parser waits on a
++ * script. The retrieval the parser makes when it reaches the element
++ * then joins that fetch, which it would not do with the cache off,
++ * where every fetch is forced, nor for an object not yet fresh.
++ *
++ * \param url      URL asked for, without its fragment
++ * \param preload  Whether this is a preload asking whether anything
++ *                 already has the URL in hand
++ * \return the object, or NULL
++ */
++static llcache_object *llcache_preload_find(nsurl *url, bool preload)
++{
++	llcache_object *lists[2] = {
++		llcache->uncached_objects, llcache->cached_objects
++	};
++	llcache_object *obj;
++	unsigned int i;
++
++	for (i = 0; i != 2; i++) {
++		for (obj = lists[i]; obj != NULL; obj = obj->next) {
++			if (obj->users == NULL || obj->failed ||
++			    obj->fetch.post != NULL) {
++				continue;
++			}
++			if (obj->preload_url != NULL &&
++			    nsurl_compare(obj->preload_url, url,
++					  NSURL_COMPLETE)) {
++				return obj;
++			}
++			if (preload && nsurl_compare(obj->url, url,
++						     NSURL_COMPLETE)) {
++				return obj;
++			}
++		}
++	}
++	return NULL;
++}
++
+ /**
+  * Retrieve an object from the cache, fetching it if necessary.
+  *
+@@ -2124,6 +2194,22 @@ llcache_object_retrieve(nsurl *url,
+ 	if (error != NSERROR_OK)
+ 		return error;
+ 
++	/* one a preload fetched is taken up once (VitaSurf) */
++	if (post == NULL && redirect_count == 0 &&
++	    (flags & (LLCACHE_RETRIEVE_PRELOAD |
++		      LLCACHE_RETRIEVE_STREAM_DATA)) == 0) {
++		obj = llcache_preload_find(defragmented_url, false);
++		if (obj != NULL) {
++			NSLOG(llcache, INFO, "joining the preload of %s",
++			      nsurl_access(defragmented_url));
++			nsurl_unref(obj->preload_url);
++			obj->preload_url = NULL;
++			nsurl_unref(defragmented_url);
++			*result = obj;
++			return NSERROR_OK;
++		}
++	}
++
+ 	/* determine if content is cachable */
+ 	if ((flags & LLCACHE_RETRIEVE_FORCE_FETCH) != 0) {
+ 		/* Forced fetches are never cached */
+@@ -2168,6 +2254,11 @@ llcache_object_retrieve(nsurl *url,
+ 
+ 	NSLOG(llcache, DEBUG, "Retrieved %p", obj);
+ 
++	if ((flags & LLCACHE_RETRIEVE_PRELOAD) != 0 && redirect_count == 0 &&
++	    post == NULL && obj->preload_url == NULL) {
++		obj->preload_url = nsurl_ref(defragmented_url);
++	}
++
+ 	*result = obj;
+ 
+ 	nsurl_unref(defragmented_url);
+@@ -2462,6 +2553,13 @@ static nserror llcache_fetch_redirect(llcache_object *object,
+ 			llcache_object_add_user(dest, user);
+ 		}
+ 
++		/* whoever asks for the preloaded URL gets where it went
++		 * (VitaSurf) */
++		if (object->preload_url != NULL && dest->preload_url == NULL) {
++			dest->preload_url = object->preload_url;
++			object->preload_url = NULL;
++		}
++
+ 		/* Dest is now our object */
+ 		*replacement = dest;
+ 	}
+@@ -2509,6 +2607,13 @@ static nserror llcache_fetch_notmodified(llcache_object *object,
+ 			llcache_object_add_user(object->candidate, user);
+ 		}
+ 
++		/* (VitaSurf) */
++		if (object->preload_url != NULL &&
++		    object->candidate->preload_url == NULL) {
++			object->candidate->preload_url = object->preload_url;
++			object->preload_url = NULL;
++		}
++
+ 		/* Candidate is no longer a candidate for us */
+ 		object->candidate->candidate_count--;
+ 
+@@ -4118,6 +4223,28 @@ llcache_handle_retrieve(nsurl *url,
+ 		return NSERROR_NO_FETCH_HANDLER;
+ 	}
+ 
++	/* a preload of something in hand already has nothing to do
++	 * (VitaSurf) */
++	if ((flags & LLCACHE_RETRIEVE_PRELOAD) != 0) {
++		nsurl *defragmented;
++		llcache_object *held = NULL;
++
++		error = nsurl_defragment(hsts_url, &defragmented);
++		if (error != NSERROR_OK) {
++			nsurl_unref(hsts_url);
++			return error;
++		}
++		if (post == NULL) {
++			held = llcache_preload_find(defragmented, true);
++		}
++		nsurl_unref(defragmented);
++		if (held != NULL || post != NULL) {
++			nsurl_unref(hsts_url);
++			*result = NULL;
++			return NSERROR_OK;
++		}
++	}
++
+ 	/* Create a new object user */
+ 	error = llcache_object_user_new(cb, pw, &user);
+ 	if (error != NSERROR_OK) {
+@@ -4283,6 +4410,8 @@ nserror llcache_handle_abort(llcache_handle *handle)
+ 		if (object->fetch.fetch != NULL) {
+ 			fetch_abort(object->fetch.fetch);
+ 			object->fetch.fetch = NULL;
++			/* what it has is not the whole of it (VitaSurf) */
++			llcache_object_failed(object);
+ 		}
+ 
+ 		object->fetch.state = LLCACHE_FETCH_COMPLETE;
+diff --git a/content/llcache.h b/content/llcache.h
+index e882139b2..593d3ad7e 100644
+--- a/content/llcache.h
++++ b/content/llcache.h
+@@ -60,7 +60,14 @@ enum llcache_retrieve_flag {
+ 	/**< No error pages */
+ 	LLCACHE_RETRIEVE_NO_ERROR_PAGES = (1 << 2),
+ 	/**< Stream data (implies that object is not cacheable) */
+-	LLCACHE_RETRIEVE_STREAM_DATA    = (1 << 3)
++	LLCACHE_RETRIEVE_STREAM_DATA    = (1 << 3),
++	/**
++	 * Fetch ahead of the document asking for it: the next retrieval
++	 * of the same URL joins this fetch instead of starting another,
++	 * cached or not, and one of a URL already being fetched or held
++	 * for a user fetches nothing and gives no handle (VitaSurf)
++	 */
++	LLCACHE_RETRIEVE_PRELOAD        = (1 << 4)
+ };
+ 
+ /** Low-level cache event types */
+@@ -186,7 +193,8 @@ void llcache_clean(bool purge);
+  * \param post     POST data, or NULL for a GET request
+  * \param cb       Client callback for events
+  * \param pw       Pointer to client-specific data
+- * \param result   Pointer to location to recieve cache handle
++ * \param result   Pointer to location to recieve cache handle, which a
++ *                 preload with nothing to fetch sets to NULL
+  * \return NSERROR_OK on success, appropriate error otherwise
+  */
+ nserror llcache_handle_retrieve(nsurl *url, uint32_t flags,

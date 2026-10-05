@@ -9,11 +9,10 @@
 #   out/netsurf/resources/      Messages, CSS, internal HTML pages
 #
 # Set VITASURF_DEBUG=1 for a build with verbose logging compiled in, and
-# VITASURF_JS_ENGINE to quickjs (default), duktape or no to pick the
-# JavaScript engine; pass the same choice to CMake as -DVITASURF_JS_ENGINE.
+# VITASURF_JS_ENGINE to quickjs (default) or no to pick the JavaScript
+# engine; pass the same choice to CMake as -DVITASURF_JS_ENGINE.
 # VITASURF_JS=NO is still accepted and means VITASURF_JS_ENGINE=no.
-# Requires scripts/build-deps.sh to have run first (it also builds the
-# nsgenbind host tool the Duktape bindings need).
+# Requires scripts/build-deps.sh to have run first.
 set -euo pipefail
 
 VITASURF_JS_ENGINE="${VITASURF_JS_ENGINE:-quickjs}"
@@ -21,8 +20,8 @@ if [ "${VITASURF_JS:-YES}" = "NO" ]; then
     VITASURF_JS_ENGINE=no
 fi
 case "$VITASURF_JS_ENGINE" in
-    duktape|quickjs|no) ;;
-    *) echo "error: VITASURF_JS_ENGINE must be duktape, quickjs or no" >&2; exit 1 ;;
+    quickjs|no) ;;
+    *) echo "error: VITASURF_JS_ENGINE must be quickjs or no" >&2; exit 1 ;;
 esac
 
 . "$(dirname "${BASH_SOURCE[0]}")/vita-env.sh"

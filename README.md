@@ -30,10 +30,15 @@ default engine. Measured on hardware against Duktape, it runs the modern
 JavaScript that documentation sites, wikis and forums ship, where
 NetSurf's Duktape fails to parse it; it is somewhat slower on pages
 where it therefore does real work, and its own allocations stay under
-1 MB on such pages. Duktape remains selectable for comparison. Phase 7
+1 MB on such pages. The Duktape build has since been dropped. Phase 7
 (polish) is in progress: page zoom from the Start menu, downloads saved
-under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, and
-resume handling that stops stale fetches after a suspend.
+under `ux0:data/VitaSurf/downloads/` with a listing page in the menu, a
+file browser (Files in the Start menu, `about:files`) that lists every
+storage device the console can read and opens `.html` pages, which load
+the `.css` stylesheets they link to, and resume handling that stops stale fetches after a
+suspend. The file browser's types are a table in
+`content/fetchers/about/files.c` (patch 0321), so a new kind of file is
+one row; pages cannot open it, only the browser itself.
 
 Sites behind Cloudflare's browser check ("Just a moment...") cannot be
 passed by the browser itself. If you run
@@ -325,6 +330,8 @@ development packages for zlib and libpng (NetSurf builds a few host tools).
 
     vdpm zlib bzip2 libpng libjpeg-turbo freetype zstd mbedtls curl-mbedtls expat libvita2d quickjs-ng
     git submodule update --init --recursive
+    ./scripts/build-quickjs.sh
+    ./scripts/build-wamr.sh
     ./scripts/build-deps.sh
     ./scripts/build-netsurf.sh
     cmake -B build -DCMAKE_TOOLCHAIN_FILE=$VITASDK/share/vita.toolchain.cmake
@@ -335,15 +342,60 @@ Apache-2.0 or GPL-2.0-or-later) through vdpm's `curl-mbedtls` package. The
 OpenSSL 1.1.1 port was tried first: it creates a pthread read-write lock for
 every BIO and X509 object, and on hardware those allocations started failing
 after a few hundred locks, so curl could never load the CA bundle. mbedTLS
-only needs a handful of mutexes. Add `VITASURF_DEBUG=1` to the
+only needs a handful of mutexes. `crypto.subtle` (`vita/js/subtle.c`)
+uses the same mbedTLS for hashing, AES, ECDSA, ECDH and RSA, and takes
+Ed25519 and X25519, which mbedTLS lacks, from Monocypher 4.0.3
+(`deps/monocypher`, BSD-2-Clause or CC0). WebAssembly runs on WAMR's
+interpreter (WAMR 2.4.5 in `deps/wamr`, Apache-2.0 WITH LLVM-exception:
+the exception is what lets it be combined with GPLv2 code), built by
+`scripts/build-wamr.sh` on the platform layer in `vita/wasm/platform`,
+with the JS API in `vita/js/wasm.c` and `vita/js/wasm.js`. The Vita has
+no JIT, so modules are interpreted. Patch 0246 links a module's imports
+per instance, as the JS API needs. Not yet supported: a funcref table
+shared between instances, shared memory, SIMD, exception handling and
+memory64. An iframe with a src runs its page in a window of its own
+that shares the top page's JavaScript runtime, so same-origin frames reach
+each other directly and cross-origin ones only through `postMessage` and
+`location`. Patch 0247 keeps a frame's window across the layout rebuilds
+that used to replace it. Patch 0248 gives an iframe with no src a real
+blank document the moment script asks for it (NetSurf answers that one
+about: fetch synchronously), loads srcdoc as `about:srcdoc` with the
+parent's base URL, and keeps a frame that is not displayed. Patch 0249
+loads an iframe layout does not show (display: none, visibility: hidden)
+as a browser does, and a form can post into one by name. Each frame page
+is a realm of its own, about 2.4 MB, so there are at most eight frame
+windows under one page, except for frames that are shown: past that,
+script gets a stand-in and a hidden frame does not load. A page's load
+event waits for its frames' own loads, as in a browser, for at most 20
+seconds. A dedicated `Worker` is a realm of its own on the page's
+runtime, run by the same scheduler as the page (there are no threads), so
+its script shares the page's time budget: messages cross as clones, the
+worker has no document, and `importScripts` of a network URL blocks the
+browser until the script arrives, since NetSurf's fetches are
+asynchronous and that one cannot be (patch 0250 lends it the curl setup
+every fetch uses). Module workers, `blob:` workers and `terminate()` work;
+a worker making workers, shared and service workers do not. A page runs
+at most four. A frame's page or a worker is refused a realm when less than
+16 MB of the heap is left, rather than left half made, and the log says
+so. The heap itself is sized when the app starts, from the memory the
+system has given it less a 32 MB reserve for the screen, the GPU, the
+network stack and the system dialogs (`vita/platform/vita_heap.c`, which
+replaces newlib's own heap setup), and the script memory limit grows with
+it. Every build asks for the extended memory budget (365 MB in place of
+about 256), which gives it about 109 MB more heap; the startup line in
+the log says how much memory was free and how big the heap is. The log says
+what each frame script made cost. A sandboxed frame is not given an opaque origin
+yet, so its page runs script only when the sandbox allows both scripts
+and same-origin, and otherwise none. `document.write` works on a document that is not
+being parsed, which is how pages fill a blank iframe; a page's own script
+writing into itself during the parse still does nothing. Add
+`VITASURF_DEBUG=1` to the
 environment of `build-netsurf.sh` and `-DVITASURF_DEBUG=ON` to CMake for a
 build with verbose logging. The JavaScript engine is chosen with
 `VITASURF_JS_ENGINE` in the environment of `build-netsurf.sh` and the
 matching `-DVITASURF_JS_ENGINE=` for CMake: `quickjs` (default: quickjs-ng,
-MIT, with the hand-written bindings in `vita/js/qjs.c`), `duktape`
-(NetSurf's engine with nsgenbind bindings) or `no`. CI builds both engines;
-the Duktape VPK is the `VitaSurf-duktape` artifact and the startup line
-in the log names the engine. Creating an empty file named `verbose` in
+MIT, with the hand-written bindings in `vita/js/qjs.c`) or `no`. The
+startup line in the log names the engine. Creating an empty file named `verbose` in
 `ux0:data/VitaSurf/` turns NetSurf's verbose logging on at runtime in any
 build; the log also starts with a self-test of the path and clock
 assumptions the port relies on. A file named `dumplayout` in the same
@@ -404,7 +456,7 @@ fails for every charset, so libparserutils is built with its own codecs and
 | Tap or Cross on a text field | Opens the system keyboard for that field |
 | Square | Reload |
 | Select | Toggle pointer mode: the D-pad nudges the pointer instead |
-| Start | Menu: bookmarks, history, downloads, home, Wi-Fi sign-in, zoom, JavaScript, image and dark mode toggles, quit |
+| Start | Menu: bookmarks, history, downloads, files, home, Wi-Fi sign-in, zoom, JavaScript, image and dark mode toggles, quit |
 | Front touch | Tap to click, drag to scroll |
 | Select + Start | Quit |
 

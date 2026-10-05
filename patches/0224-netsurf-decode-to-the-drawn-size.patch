@@ -1,0 +1,300 @@
+diff --git a/content/content_protected.h b/content/content_protected.h
+index da846cae4..fb493a7f1 100644
+--- a/content/content_protected.h
++++ b/content/content_protected.h
+@@ -211,6 +211,13 @@ struct content {
+ 	 * (VitaSurf): an SVG with a viewBox and no width or height.
+ 	 */
+ 	bool ratio_only;
++	/**
++	 * The size an image is drawn at, for the decode thread to decode
++	 * it to (VitaSurf); 0 when not known. Written on the main thread
++	 * only while no decode of the image is outstanding.
++	 */
++	int decode_hint_width;
++	int decode_hint_height;
+ 	/**
+ 	 * Viewport width.
+ 	 */
+diff --git a/content/handlers/image/image_cache.c b/content/handlers/image/image_cache.c
+index 025be8aa0..44c7b3102 100644
+--- a/content/handlers/image/image_cache.c
++++ b/content/handlers/image/image_cache.c
+@@ -844,6 +844,27 @@ image_cache_snentryf(char *string,
+ 
+ 
+ /* exported interface documented in image_cache.h */
++bool image_cache_decode_size_for(const struct content *c, int width,
++				 int height, int *dest_width,
++				 int *dest_height)
++{
++	int w = width, h = height;
++
++	if (!image_cache_decode_size(width, height, &w, &h)) {
++		w = width;
++		h = height;
++	}
++	if (c != NULL && c->decode_hint_width > 0 &&
++	    c->decode_hint_height > 0 &&
++	    c->decode_hint_width < w && c->decode_hint_height < h) {
++		w = c->decode_hint_width;
++		h = c->decode_hint_height;
++	}
++	*dest_width = w;
++	*dest_height = h;
++	return w != width || h != height;
++}
++
+ bool image_cache_decode_size(int width, int height,
+ 			     int *dest_width, int *dest_height)
+ {
+@@ -1200,6 +1221,7 @@ struct decode_job {
+ 	image_cache_convert_fn *convert;
+ 	struct bitmap *result;
+ 	uint64_t us;
++	bool upgrade;  /**< a bigger decode to replace the bitmap there is */
+ };
+ 
+ static pthread_mutex_t decoder_lock = PTHREAD_MUTEX_INITIALIZER;
+@@ -1306,8 +1328,17 @@ static void image_cache_decoder_stop(void)
+ 	}
+ }
+ 
+-/** Hand an entry to the thread; main thread, entry not queued. */
+-static void image_cache_decoder_queue(struct image_cache_entry_s *centry)
++/**
++ * Hand an entry to the thread; main thread, entry not queued.
++ *
++ * \param width, height The size it is being drawn at: the thread
++ *        decodes it to that when it is smaller than the picture, so
++ *        the plot needs no scaled copy (VitaSurf).
++ * \param upgrade The entry has a bitmap, too small for how it is now
++ *        drawn, which the result replaces.
++ */
++static void image_cache_decoder_queue(struct image_cache_entry_s *centry,
++		int width, int height, bool upgrade)
+ {
+ 	struct decode_job *job = calloc(1, sizeof(*job));
+ 	struct decode_job *dropped = NULL;
+@@ -1315,6 +1346,13 @@ static void image_cache_decoder_queue(struct image_cache_entry_s *centry)
+ 	if (job == NULL) {
+ 		return;
+ 	}
++	/* read by the thread's convert, and nothing of this content is
++	 * on the thread now: the lock below publishes it */
++	if (width > 0 && height > 0) {
++		centry->content->decode_hint_width = width;
++		centry->content->decode_hint_height = height;
++	}
++	job->upgrade = upgrade;
+ 	job->centry = centry;
+ 	job->content = centry->content;
+ 	job->convert = centry->convert;
+@@ -1430,7 +1468,15 @@ static void image_cache_decoder_collect(void)
+ 				 url != NULL ? url : "?");
+ 		}
+ 		if (job->result == NULL) {
+-			centry->decode_failed = true;
++			/* a failed upgrade leaves the bitmap there is */
++			if (!job->upgrade) {
++				centry->decode_failed = true;
++			}
++		} else if (job->upgrade && centry->bitmap != NULL) {
++			image_cache__free_bitmap(centry);
++			centry->bitmap = job->result;
++			image_cache_stats_bitmap_add(centry, centry->bitmap);
++			decode_stats.upgraded++;
+ 		} else if (centry->bitmap != NULL) {
+ 			/* decoded meanwhile on this thread */
+ 			guit->bitmap->destroy(job->result);
+@@ -1445,6 +1491,28 @@ static void image_cache_decoder_collect(void)
+ 	}
+ }
+ 
++/**
++ * Whether a bitmap decoded for a drawn size is now drawn a quarter or
++ * more bigger than it, while the picture itself has more to give.
++ */
++static bool image_cache_wants_bigger(struct image_cache_entry_s *centry,
++		const struct content_redraw_data *data)
++{
++	int bw = guit->bitmap->get_width(centry->bitmap);
++	int bh = guit->bitmap->get_height(centry->bitmap);
++	int fw, fh;
++
++	if (data->width <= bw + bw / 4 && data->height <= bh + bh / 4) {
++		return false;
++	}
++	if (!image_cache_decode_size(centry->content->width,
++				     centry->content->height, &fw, &fh)) {
++		fw = centry->content->width;
++		fh = centry->content->height;
++	}
++	return bw < fw || bh < fh;
++}
++
+ /* exported interface documented in image_cache.h */
+ bool image_cache_decoder_busy(void)
+ {
+@@ -1514,7 +1582,9 @@ bool image_cache_redraw(struct content *c,
+ 			    (uint64_t)c->width * (uint64_t)c->height >
+ 					IMAGE_CACHE_HOLD_PIXELS) {
+ 				if (!centry->queued) {
+-					image_cache_decoder_queue(centry);
++					image_cache_decoder_queue(centry,
++						data->width, data->height,
++						false);
+ 				}
+ 				image_cache_defer(data, clip, c);
+ 				return true;
+@@ -1541,6 +1611,20 @@ bool image_cache_redraw(struct content *c,
+ 	} else {
+ 		image_cache->hit_count++;
+ 		image_cache->hit_size += centry->bitmap_size;
++		/* decoded for a smaller size than it is now drawn at:
++		 * decode it again for this one, drawing what there is
++		 * meanwhile (VitaSurf) */
++		if (ctx->interactive && decoder_on && centry->threadsafe &&
++		    !centry->queued && c->decode_hint_width > 0 &&
++		    image_cache_wants_bigger(centry, data)) {
++			image_cache_decoder_queue(centry,
++				data->width > c->decode_hint_width ?
++					data->width : c->decode_hint_width,
++				data->height > c->decode_hint_height ?
++					data->height : c->decode_hint_height,
++				true);
++			image_cache_defer(data, clip, c);
++		}
+ 	}
+ 
+ 
+diff --git a/content/handlers/image/image_cache.h b/content/handlers/image/image_cache.h
+index 2e6b2d6c6..237c52e51 100644
+--- a/content/handlers/image/image_cache.h
++++ b/content/handlers/image/image_cache.h
+@@ -193,6 +193,21 @@ int image_cache_snsummaryf(char *string, size_t size, const char *fmt);
+ bool image_cache_decode_size(int width, int height,
+ 			     int *dest_width, int *dest_height);
+ 
++/**
++ * The size an image should be decoded to, drawn size included
++ * (VitaSurf).
++ *
++ * As image_cache_decode_size(), and then, when the decode thread was
++ * told the size the image is drawn at and that is smaller both ways,
++ * exactly that size: a bitmap the size it is drawn needs no scaled copy
++ * made when it is plotted, and libjpeg can decode straight to it.
++ *
++ * \param c The content being decoded.
++ */
++bool image_cache_decode_size_for(const struct content *c, int width,
++				 int height, int *dest_width,
++				 int *dest_height);
++
+ /**
+  * A smaller copy of a bitmap, or NULL.
+  *
+@@ -285,6 +300,7 @@ struct image_cache_decode_stats {
+ 	unsigned int threaded_ms;  /**< its time decoding them */
+ 	unsigned int threaded_max_ms;      /**< its longest */
+ 	unsigned int threaded_max_kpixels; /**< that one's size */
++	unsigned int upgraded;     /**< decoded again for a bigger draw */
+ };
+ 
+ /** Fill in the decoding figures since the last call, and reset them. */
+diff --git a/content/handlers/image/jpeg.c b/content/handlers/image/jpeg.c
+index 601c8e391..ebeb9c088 100644
+--- a/content/handlers/image/jpeg.c
++++ b/content/handlers/image/jpeg.c
+@@ -344,8 +344,9 @@ jpeg_cache_convert(struct content *c)
+ 	 * the remainder afterwards. Sticking to 1/2, 1/4 and 1/8 keeps
+ 	 * to what every libjpeg can do, not just turbo. (VitaSurf)
+ 	 */
+-	if (image_cache_decode_size(cinfo.image_width, cinfo.image_height,
+-				    &want_width, &want_height)) {
++	if (image_cache_decode_size_for(c, cinfo.image_width,
++					cinfo.image_height,
++					&want_width, &want_height)) {
+ 		unsigned int num;
+ 
+ 		for (num = 1; num < 8; num <<= 1) {
+@@ -403,7 +404,8 @@ jpeg_cache_convert(struct content *c)
+ 	jpeg_finish_decompress(&cinfo);
+ 	jpeg_destroy_decompress(&cinfo);
+ 
+-	if (want_width > 0 && (int) cinfo.output_width > want_width) {
++	if (want_width > 0 && ((int) cinfo.output_width > want_width ||
++			       (int) cinfo.output_height > want_height)) {
+ 		struct bitmap *smaller = image_cache_shrink(bitmap,
+ 				want_width, want_height);
+ 
+diff --git a/content/handlers/image/png.c b/content/handlers/image/png.c
+index 5d69930db..87bd40251 100644
+--- a/content/handlers/image/png.c
++++ b/content/handlers/image/png.c
+@@ -556,7 +556,7 @@ png_cache_convert_error:
+ 	 * pass over the pixels; what it saves is what the image cache
+ 	 * then holds on to. (VitaSurf)
+ 	 */
+-		if (image_cache_decode_size(
++		if (image_cache_decode_size_for(c,
+ 				guit->bitmap->get_width((void *)bitmap),
+ 				guit->bitmap->get_height((void *)bitmap),
+ 				&want_width, &want_height)) {
+diff --git a/content/handlers/image/webp.c b/content/handlers/image/webp.c
+index 6dfc88921..67ddc8045 100644
+--- a/content/handlers/image/webp.c
++++ b/content/handlers/image/webp.c
+@@ -167,6 +167,27 @@ webp_cache_convert(struct content *c)
+ 	bitmap_format_to_client(bitmap, &webp_fmt);
+ 	guit->bitmap->modified(bitmap);
+ 
++	/*
++	 * No larger than the screen can show, or than it is drawn when
++	 * the decode thread knows that (VitaSurf): a bitmap the size it
++	 * is drawn at needs no scaled copy made on the main thread.
++	 */
++	{
++		int want_width, want_height;
++
++		if (image_cache_decode_size_for(c, webpfeatures.width,
++						webpfeatures.height,
++						&want_width, &want_height)) {
++			struct bitmap *smaller = image_cache_shrink(bitmap,
++					want_width, want_height);
++
++			if (smaller != NULL) {
++				guit->bitmap->destroy(bitmap);
++				bitmap = smaller;
++			}
++		}
++	}
++
+ 	return bitmap;
+ }
+ 
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 0908dc234..4033dbfdc 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -1103,7 +1103,9 @@ static void framebuffer_run(void)
+ 							 "(%u dropped) and "
+ 							 "finished %u in %u ms, "
+ 							 "the longest %u ms for "
+-							 "%u kpixels",
++							 "%u kpixels, %u of them "
++							 "again for a bigger "
++							 "draw",
+ 							 ds.decodes,
+ 							 ds.kpixels, ds.ms,
+ 							 ds.max_ms,
+@@ -1112,7 +1114,8 @@ static void framebuffer_run(void)
+ 							 ds.dropped, ds.threaded,
+ 							 ds.threaded_ms,
+ 							 ds.threaded_max_ms,
+-							 ds.threaded_max_kpixels);
++							 ds.threaded_max_kpixels,
++							 ds.upgraded);
+ 					}
+ 				}
+ 				fb_pan_whole = 0;

@@ -1,0 +1,460 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 023174467..c4911faa0 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -21,6 +21,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <strings.h>
++#include <nsutils/time.h>
+ 
+ #include "utils/nsoption.h"
+ #include "utils/corestrings.h"
+@@ -92,6 +93,8 @@ static css_error node_is_checked(void *pw, void *node, bool *match);
+ static css_error node_is_target(void *pw, void *node, bool *match);
+ static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
+ 		lwc_string *arg, bool *match);
++static css_error node_animation_start(void *pw, void *node,
++		lwc_string *name, uint32_t *start_ms);
+ static css_error node_is_lang(void *pw, void *node,
+ 		lwc_string *lang, bool *match);
+ static css_error ua_default_for_property(void *pw, uint32_t property,
+@@ -148,8 +151,67 @@ static css_select_handler selection_handler = {
+ 	next_sibling_node,
+ 	node_attribute_hashes,
+ 	node_is_pseudo,
++	node_animation_start,
+ };
+ 
++/*
++ * The animation clock (VitaSurf): milliseconds since animations were
++ * first run, and when each element's animation started on it. An
++ * element's start is noted the first time it is selected with that
++ * animation; the table holds a reference to each element so that its
++ * address is not reused while it is in the table, and the oldest entry
++ * makes way when the table is full, which starts that animation again.
++ */
++#define NSCSS_ANIM_STARTS 128
++
++static struct nscss_anim_start {
++	dom_node *node;
++	lwc_string *name;
++	uint32_t start;
++} nscss_anim_starts[NSCSS_ANIM_STARTS];
++static unsigned nscss_anim_next;
++static uint64_t nscss_anim_t0;
++
++static uint32_t nscss_anim_now(void)
++{
++	uint64_t now = 0;
++
++	nsu_getmonotonic_ms(&now);
++	if (nscss_anim_t0 == 0)
++		nscss_anim_t0 = now > 0 ? now : 1;
++	return (uint32_t) (now - nscss_anim_t0);
++}
++
++static css_error node_animation_start(void *pw, void *node,
++		lwc_string *name, uint32_t *start_ms)
++{
++	struct nscss_anim_start *e;
++	unsigned i;
++	bool match;
++
++	(void) pw;
++	for (i = 0; i < NSCSS_ANIM_STARTS; i++) {
++		e = &nscss_anim_starts[i];
++		if (e->node == node && e->name != NULL &&
++				lwc_string_isequal(e->name, name, &match) ==
++					lwc_error_ok && match) {
++			*start_ms = e->start;
++			return CSS_OK;
++		}
++	}
++	e = &nscss_anim_starts[nscss_anim_next];
++	nscss_anim_next = (nscss_anim_next + 1) % NSCSS_ANIM_STARTS;
++	if (e->node != NULL)
++		dom_node_unref(e->node);
++	if (e->name != NULL)
++		lwc_string_unref(e->name);
++	e->node = dom_node_ref((dom_node *) node);
++	e->name = lwc_string_ref(name);
++	e->start = nscss_anim_now();
++	*start_ms = e->start;
++	return CSS_OK;
++}
++
+ /**
+  * Create an inline style
+  *
+@@ -285,6 +347,11 @@ css_select_results *nscss_get_style(nscss_select_ctx *ctx, dom_node *n,
+ 	 * this element can be resolved against them (VitaSurf).
+ 	 */
+ 	css_select_ctx_set_parent(ctx->ctx, ctx->parent_style);
++	/* animations run at the clock, if they run at all (VitaSurf) */
++	if (nsoption_bool(css_animations))
++		css_select_ctx_set_clock(ctx->ctx, true, nscss_anim_now());
++	else
++		css_select_ctx_set_clock(ctx->ctx, false, 0);
+ 	/* libcss times its phases with our clock (VitaSurf) */
+ 	css_select_clock_us = vitasurf_clock_us;
+ 
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index d1a5166ee..f09367434 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -366,6 +366,10 @@ box_get_style(html_content *c,
+ 	if (inline_style != NULL)
+ 		css_stylesheet_destroy(inline_style);
+ 
++	/* an animation moving it wants the next frame (VitaSurf) */
++	if (styles != NULL && styles->animating)
++		html_animation_note(c, n);
++
+ 	return styles;
+ }
+ 
+@@ -2294,7 +2298,13 @@ static int restyle_old_destructor(css_select_results **held)
+ 
+ static void restyle_keep(html_content *c, css_select_results *old)
+ {
+-	css_select_results **held = talloc(c->bctx, css_select_results *);
++	css_select_results **held;
++
++	/* an animation frame's, for two frames (VitaSurf) */
++	if (c->anim_restyling && html_animation_hold(c, old))
++		return;
++
++	held = talloc(c->bctx, css_select_results *);
+ 
+ 	if (held == NULL) {
+ 		/* leaked rather than freed under a box still using it */
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 7b7871122..fadf81094 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1564,6 +1564,9 @@ static void html_destroy(struct content *c)
+ 	/* its elements under the pointer or with the focus (VitaSurf) */
+ 	html_drop_dynamic(html);
+ 
++	/* and those it was animating */
++	html_animation_drop(html);
++
+ 	/* the documents its iframes made for themselves */
+ 	html_frame_doc_release(html);
+ 
+@@ -2892,18 +2895,248 @@ static uint32_t dynamic_ancestor_bits(html_content *c)
+ 	return bits;
+ }
+ 
++/** What the relayouts an animation asked for took (VitaSurf) */
++static unsigned html_anim_relayout_ms;
++
+ static void html_dynamic_relayout(void *p)
+ {
+ 	html_content *c = p;
++	uint64_t t0 = 0, t1 = 0;
++	nserror res;
+ 
+ 	c->dynamic_relayout_pending = false;
+-	if (html_relayout(c) == NSERROR_INVALID) {
++	nsu_getmonotonic_ms(&t0);
++	res = html_relayout(c);
++	nsu_getmonotonic_ms(&t1);
++	if (c->n_anim > 0)
++		html_anim_relayout_ms += (unsigned) (t1 - t0);
++	if (res == NSERROR_INVALID) {
+ 		/* busy, or a field is being edited: try again */
+ 		c->dynamic_relayout_pending = true;
+ 		guit->misc->schedule(250, html_dynamic_relayout, c);
+ 	}
+ }
+ 
++/*
++ * Running animations (VitaSurf).
++ *
++ * libcss says, as it selects an element, whether an animation on it is
++ * still going at the clock css/select.c gives it. Such an element is
++ * held here, and each frame selects every one of them again: a change
++ * that only paints -- opacity, a transform, a colour -- is applied to
++ * the boxes in place and what they cover drawn again; a change to their
++ * size lays the document out again, which costs what it costs. The
++ * frame rate is css_animation_fps, and the log says every few seconds
++ * how many frames came, how many elements they moved and what
++ * selecting them took.
++ */
++
++/** Most elements animated at once; more wait for a free place. */
++#define HTML_ANIM_MAX 64
++
++static struct {
++	uint64_t since;
++	unsigned frames, elements, select_ms, worst_ms, relayouts;
++} html_anim_stats;
++
++static void html_animation_tick(void *p);
++
++static void html_animation_schedule(html_content *c)
++{
++	int fps = nsoption_int(css_animation_fps);
++
++	if (c->anim_scheduled)
++		return;
++	if (fps < 1)
++		fps = 1;
++	if (fps > 60)
++		fps = 60;
++	c->anim_scheduled = true;
++	guit->misc->schedule(1000 / fps, html_animation_tick, c);
++}
++
++/* exported interface documented in html/private.h */
++void html_animation_note(html_content *c, dom_node *node)
++{
++	unsigned i;
++
++	for (i = 0; i < c->n_anim; i++) {
++		if (c->anim[i] == node)
++			return;
++	}
++	if (c->anim == NULL) {
++		c->anim = calloc(HTML_ANIM_MAX, sizeof(*c->anim));
++		if (c->anim == NULL)
++			return;
++	}
++	if (c->n_anim >= HTML_ANIM_MAX)
++		return;
++	c->anim[c->n_anim++] = dom_node_ref(node);
++	html_animation_schedule(c);
++}
++
++/** Results held: enough for two frames of every element animated. */
++#define HTML_ANIM_HELD (2 * HTML_ANIM_MAX)
++
++/* exported interface documented in html/private.h */
++bool html_animation_hold(html_content *c, css_select_results *old)
++{
++	if (c->anim_held == NULL) {
++		c->anim_held = calloc(HTML_ANIM_HELD, sizeof(*c->anim_held));
++		if (c->anim_held == NULL)
++			return false;
++	}
++	if (c->anim_held[c->anim_held_next] != NULL)
++		css_select_results_destroy(c->anim_held[c->anim_held_next]);
++	c->anim_held[c->anim_held_next] = old;
++	c->anim_held_next = (c->anim_held_next + 1) % HTML_ANIM_HELD;
++	return true;
++}
++
++/* exported interface documented in html/private.h */
++void html_animation_drop(html_content *c)
++{
++	unsigned i;
++
++	if (c->anim_scheduled) {
++		guit->misc->schedule(-1, html_animation_tick, c);
++		c->anim_scheduled = false;
++	}
++	for (i = 0; i < c->n_anim; i++)
++		dom_node_unref(c->anim[i]);
++	c->n_anim = 0;
++	free(c->anim);
++	c->anim = NULL;
++	if (c->anim_held != NULL) {
++		for (i = 0; i < HTML_ANIM_HELD; i++) {
++			if (c->anim_held[i] != NULL)
++				css_select_results_destroy(c->anim_held[i]);
++		}
++		free(c->anim_held);
++		c->anim_held = NULL;
++	}
++}
++
++/** Add what an element's box covers to a rectangle, generously: a
++ * turned box reaches out past its own. */
++static void html_animation_area(dom_node *n, struct rect *area)
++{
++	struct box *box = NULL;
++	int x, y, w, h, reach;
++
++	if (dom_node_get_user_data(n, corestring_dom___ns_key_box_node_data,
++			(void *) &box) != DOM_NO_ERR || box == NULL)
++		return;
++	box_coords(box, &x, &y);
++	w = box->descendant_x1 - box->descendant_x0;
++	h = box->descendant_y1 - box->descendant_y0;
++	reach = (w > h ? w : h) / 2 + 8;
++	x += box->descendant_x0 - reach;
++	y += box->descendant_y0 - reach;
++	w += 2 * reach;
++	h += 2 * reach;
++	if (area->x0 > area->x1) {
++		area->x0 = x;
++		area->y0 = y;
++		area->x1 = x + w;
++		area->y1 = y + h;
++		return;
++	}
++	if (x < area->x0) area->x0 = x;
++	if (y < area->y0) area->y0 = y;
++	if (x + w > area->x1) area->x1 = x + w;
++	if (y + h > area->y1) area->y1 = y + h;
++}
++
++static void html_animation_tick(void *p)
++{
++	html_content *c = p;
++	dom_node *list[HTML_ANIM_MAX];
++	unsigned n, i, budget = 600, ms;
++	enum box_restyle result = BOX_RESTYLE_SAME, r;
++	struct rect area = { 1, 1, 0, 0 };
++	uint64_t t0 = 0, t1 = 0;
++
++	c->anim_scheduled = false;
++	if (!nsoption_bool(css_animations)) {
++		html_animation_drop(c);
++		return;
++	}
++	if (c->layout == NULL || c->bctx == NULL || c->reflowing ||
++			c->box_conversion_context != NULL) {
++		/* no tree to restyle yet: try on the next frame */
++		html_animation_schedule(c);
++		return;
++	}
++
++	/* each is noted again as it is selected, if it is still going */
++	n = c->n_anim;
++	memcpy(list, c->anim, n * sizeof(list[0]));
++	c->n_anim = 0;
++
++	nsu_getmonotonic_ms(&t0);
++	c->anim_restyling = true;
++	for (i = 0; i < n; i++) {
++		if (result != BOX_RESTYLE_LAYOUT) {
++			r = box_restyle(c, list[i], false, &budget);
++			if (r > result)
++				result = r;
++			html_animation_area(list[i], &area);
++		} else {
++			/* the relayout selects it again */
++			html_animation_note(c, list[i]);
++		}
++	}
++	c->anim_restyling = false;
++	nsu_getmonotonic_ms(&t1);
++	for (i = 0; i < n; i++)
++		dom_node_unref(list[i]);
++
++	if (result == BOX_RESTYLE_LAYOUT) {
++		html_anim_stats.relayouts++;
++		if (!c->dynamic_relayout_pending) {
++			c->dynamic_relayout_pending = true;
++			guit->misc->schedule(0, html_dynamic_relayout, c);
++		}
++	} else if (result == BOX_RESTYLE_PAINT && area.x0 < area.x1) {
++		content__request_redraw(&c->base, area.x0, area.y0,
++				area.x1 - area.x0, area.y1 - area.y0);
++	}
++
++	ms = (unsigned) (t1 - t0);
++	html_anim_stats.frames++;
++	html_anim_stats.elements += n;
++	html_anim_stats.select_ms += ms;
++	if (ms > html_anim_stats.worst_ms)
++		html_anim_stats.worst_ms = ms;
++	if (html_anim_stats.since == 0)
++		html_anim_stats.since = t1;
++	if (t1 - html_anim_stats.since >= 5000) {
++		unsigned span = (unsigned) (t1 - html_anim_stats.since);
++
++		vita_log("anim: %u frames in %u ms (%u a second), "
++				"%u elements a frame, selecting %u ms a "
++				"frame (worst %u), %u relayouts taking %u ms "
++				"each",
++				html_anim_stats.frames, span,
++				html_anim_stats.frames * 1000 / span,
++				html_anim_stats.elements /
++					html_anim_stats.frames,
++				html_anim_stats.select_ms /
++					html_anim_stats.frames,
++				html_anim_stats.worst_ms,
++				html_anim_stats.relayouts,
++				html_anim_stats.relayouts > 0 ?
++					html_anim_relayout_ms /
++					html_anim_stats.relayouts : 0);
++		memset(&html_anim_stats, 0, sizeof(html_anim_stats));
++		html_anim_relayout_ms = 0;
++	}
++
++	if (c->n_anim > 0)
++		html_animation_schedule(c);
++}
++
+ /** Whether a node is in a chain. */
+ static bool dynamic_in(dom_node *n, dom_node **chain, unsigned count)
+ {
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index d8ea6e2e3..fecacae53 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -301,6 +301,18 @@ typedef struct html_content {
+ 	 * positioned, so redraw looks ahead for such boxes (VitaSurf) */
+ 	bool neg_z;
+ 
++	/** The elements whose animations are running, each held, to be
++	 * selected again on the next frame (VitaSurf) */
++	struct dom_node **anim;
++	unsigned n_anim;
++	bool anim_scheduled;
++	/** a frame's restyles are under way: the results they replace are
++	 * held in anim_held, and freed two frames on, not kept with the
++	 * tree, which would hold every frame's until the page is left */
++	bool anim_restyling;
++	struct css_select_results **anim_held;
++	unsigned anim_held_next;
++
+ } html_content;
+ 
+ /**
+@@ -536,6 +548,23 @@ struct form *html_forms_get_forms(const char *docenc, dom_html_document *doc);
+  */
+ bool html_focus_control(struct html_content *html, struct dom_node *node);
+ 
++/**
++ * Note an element whose animation is running (VitaSurf): it is selected
++ * again, and what it covers drawn again, on the next frame.
++ */
++void html_animation_note(struct html_content *c, struct dom_node *node);
++
++/** Stop running a document's animations and let its elements go. */
++void html_animation_drop(struct html_content *c);
++
++/**
++ * Hold the selection results an animation frame replaced, for two frames
++ * (VitaSurf). \return false if they could not be held, and are the
++ * caller's still.
++ */
++bool html_animation_hold(struct html_content *c,
++		struct css_select_results *old);
++
+ struct form_control *html_forms_get_control_for_node(struct form *forms,
+ 		dom_node *node);
+ 
+diff --git a/desktop/options.h b/desktop/options.h
+index f25d45cea..7de475276 100644
+--- a/desktop/options.h
++++ b/desktop/options.h
+@@ -139,6 +139,13 @@ NSOPTION_INTEGER(max_image_height, 0)
+ /** Whether to execute javascript */
+ NSOPTION_BOOL(enable_javascript, false)
+ 
++/** Run CSS animations (VitaSurf); off, an animation shows where it
++ * comes to rest */
++NSOPTION_BOOL(css_animations, false)
++
++/** Frames a second animations are drawn at (VitaSurf) */
++NSOPTION_INTEGER(css_animation_fps, 30)
++
+ /** Whether to allow Author level CSS. */
+ NSOPTION_BOOL(author_level_css, true)
+ 

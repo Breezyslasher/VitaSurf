@@ -1,0 +1,122 @@
+diff --git a/content/handlers/html/redraw_border.c b/content/handlers/html/redraw_border.c
+index 79e55aa33..974d7164d 100644
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -22,6 +22,7 @@
+  * Redrawing CONTENT_HTML borders implementation.
+  */
+ 
++#include <math.h>
+ #include <stdbool.h>
+ #include <stdlib.h>
+ 
+@@ -1199,6 +1200,94 @@ rounded_rect_path(float *p,
+ /** The identity, which is what the path plotters want for an unrotated box. */
+ static const float rounded_transform[6] = { 1, 0, 0, 1, 0, 0 };
+ 
++/**
++ * Fill a rounded rectangle as horizontal spans (VitaSurf).
++ *
++ * The path the fill used to go through is flattened and filled scan
++ * line by scan line against every edge of every corner curve, and a
++ * page of rounded cards spent a third of each second of scrolling
++ * there: 3800 path fills a second on Yamtrack at about 90 us each. A
++ * rounded rectangle is one span per row, its ends on the corner
++ * ellipses, and the rows between the corners are all the same span:
++ * those come to one rectangle fill.
++ */
++static nserror
++rounded_fill_spans(const struct redraw_context *ctx,
++		   const plot_style_t *pstyle,
++		   const struct rect *r,
++		   const struct html_corner_radii *radii)
++{
++	plot_style_t style = *pstyle;
++	struct rect run;
++	int y, run_l = 0, run_r = 0;
++	bool open = false;
++
++	style.stroke_type = PLOT_OP_TYPE_NONE;
++	for (y = r->y0; y <= r->y1; y++) {
++		int l = 0, rr = 0;
++
++		if (y < r->y1) {
++			float yc = (float)y + 0.5f, left = (float)r->x0;
++			float right = (float)r->x1, d, e;
++
++			if (radii->tl_h > 0 && radii->tl_v > 0 &&
++			    yc < (float)(r->y0 + radii->tl_v)) {
++				d = ((float)(r->y0 + radii->tl_v) - yc) /
++					(float)radii->tl_v;
++				e = (float)r->x0 + (float)radii->tl_h *
++					(1.0f - sqrtf(1.0f - d * d));
++				if (e > left) left = e;
++			}
++			if (radii->bl_h > 0 && radii->bl_v > 0 &&
++			    yc > (float)(r->y1 - radii->bl_v)) {
++				d = (yc - (float)(r->y1 - radii->bl_v)) /
++					(float)radii->bl_v;
++				e = (float)r->x0 + (float)radii->bl_h *
++					(1.0f - sqrtf(1.0f - d * d));
++				if (e > left) left = e;
++			}
++			if (radii->tr_h > 0 && radii->tr_v > 0 &&
++			    yc < (float)(r->y0 + radii->tr_v)) {
++				d = ((float)(r->y0 + radii->tr_v) - yc) /
++					(float)radii->tr_v;
++				e = (float)r->x1 - (float)radii->tr_h *
++					(1.0f - sqrtf(1.0f - d * d));
++				if (e < right) right = e;
++			}
++			if (radii->br_h > 0 && radii->br_v > 0 &&
++			    yc > (float)(r->y1 - radii->br_v)) {
++				d = (yc - (float)(r->y1 - radii->br_v)) /
++					(float)radii->br_v;
++				e = (float)r->x1 - (float)radii->br_h *
++					(1.0f - sqrtf(1.0f - d * d));
++				if (e < right) right = e;
++			}
++			l = (int)(left + 0.5f);
++			rr = (int)(right + 0.5f);
++		}
++		/* a row like the last one extends the run */
++		if (open && y < r->y1 && l == run_l && rr == run_r) {
++			continue;
++		}
++		if (open && run_r > run_l) {
++			nserror res;
++
++			run.x0 = run_l;
++			run.x1 = run_r;
++			run.y1 = y;
++			res = ctx->plot->rectangle(ctx, &style, &run);
++			if (res != NSERROR_OK) {
++				return res;
++			}
++		}
++		open = true;
++		run_l = l;
++		run_r = rr;
++		run.y0 = y;
++	}
++	return NSERROR_OK;
++}
++
+ /**
+  * Fill a rounded rectangle.
+  */
+@@ -1212,6 +1301,14 @@ html_plot_rounded_fill(const struct redraw_context *ctx,
+ 	unsigned int n;
+ 	plot_style_t style = *pstyle;
+ 
++	/* a solid fill needs no path: spans are exact and far cheaper */
++	if (pstyle->fill_type != PLOT_OP_TYPE_NONE &&
++	    pstyle->stroke_type == PLOT_OP_TYPE_NONE &&
++	    border_box->x1 > border_box->x0 &&
++	    border_box->y1 > border_box->y0) {
++		return rounded_fill_spans(ctx, pstyle, border_box, radii);
++	}
++
+ 	n = rounded_rect_path(path, sizeof(path) / sizeof(path[0]),
+ 			      border_box, radii);
+ 	if (n == 0) {

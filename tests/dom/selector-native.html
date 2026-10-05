@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!-- Selectors of type, #id, .class and [attribute] tests joined by
+     descendant, >, + and ~ are answered in C by the native matches,
+     querySelector, querySelectorAll and closest. Each is checked against
+     the same selector with a no-op :not(.zz) on every group, which the C
+     side refuses and the prelude's engine answers. -->
+<html><head><title>selector native</title></head><body>
+<div id="root" class="box main" data-role="page" lang="en-GB">
+ <header class="top bar"><h1 id="t" class="title">T</h1><nav data-x="a b c"><a href="/one" class="nav-link active" rel="noopener external">1</a><a href="/two#frag" class="nav-link">2</a><span>s</span></nav></header>
+ <section class="list" data-hovercard-url="/users/x"><ul><li class="item first" data-id="1">one</li><li class="item" data-id="2">two</li><li class="item last odd" data-id="3"><b>three</b></li></ul>
+  <p class="note">n</p><p class="note second">m</p><div class="note">d</div></section>
+ <form id="f"><input type="text" name="q" value="x"><input type="checkbox" name="c" checked><button type="submit" class="btn btn-primary">go</button></form>
+ <svg id="svg"><g class="grp"><rect class="r" width="1"/><foreignObject id="fo"><p class="inner">i</p></foreignObject></g></svg>
+ <react-app data-target="react-app.root"><div class="deep"><span class="leaf" data-hovercard-url="/u">l</span></div></react-app>
+</div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function viaJs(sel){return sel.split(',').map(function(g){return g.trim()+':not(.zz)';}).join(',');}
+function same(a,b){if(a===b)return true;if(!a||!b||a.length!==b.length)return false;for(var i=0;i<a.length;i++)if(a[i]!==b[i])return false;return true;}
+var sels=['div','DIV','*','#t','.item','.item.last','li.item','ul > li','ul li','section p','li + li','li ~ li','p.note + p','p ~ div',
+ '[data-id]','[data-id="2"]',"[data-id='3']",'[data-id=1]','[href^="/t"]','[href$="frag"]','[href*="wo"]','[rel~="external"]','[lang|="en"]','[data-x~="b"]',
+ 'a[href].nav-link','header nav a','#root > header','#root section li b','.box.main [data-role]','div#root.box','[data-hovercard-url]','react-app .leaf','react-app > div > span',
+ 'g','rect','foreignObject','foreignobject','svg .r','.grp > .r','h1, .note','li:first-child','a[href="/one" i]','nope','input[type=checkbox]','form > button.btn-primary',
+ ' ul  >  li ','a,b','.nav-link ~ span','header > nav > a + a'];
+var all=document.getElementsByTagName('*'),roots=[document.getElementById('root'),document.body,document.getElementById('svg'),document.querySelector('ul')],els=[];
+for(var i=0;i<all.length;i++)els.push(all[i]);
+sels.forEach(function(s){
+ var bad=0,j;
+ for(j=0;j<els.length;j++)if(els[j].matches(s)!==els[j].matches(viaJs(s)))bad++;
+ ok("matches('"+s+"') agrees on every element ("+bad+" differ)",bad===0);
+ roots.forEach(function(r,ri){
+  ok("querySelectorAll('"+s+"') on root "+ri,same(r.querySelectorAll(s),r.querySelectorAll(viaJs(s))));
+  ok("querySelector('"+s+"') on root "+ri,r.querySelector(s)===r.querySelector(viaJs(s)));});
+ var leaf=document.querySelector('.leaf'),b=document.querySelector('b');
+ ok("closest('"+s+"')",leaf.closest(s)===leaf.closest(viaJs(s))&&b.closest(s)===b.closest(viaJs(s)));
+});
+var d=document.createElement('div');d.innerHTML='<p class="a"><i data-k="v">x</i></p><p class="a b"></p>';
+ok("a detached subtree is searched",d.querySelectorAll('p.a').length===2&&d.querySelector('p > i[data-k=v]')!==null);
+ok("document.querySelector still includes the root element",document.querySelector('html')===document.documentElement);
+ok("an element is its own closest",document.getElementById('t').closest('h1.title')===document.getElementById('t'));
+</script></body></html>

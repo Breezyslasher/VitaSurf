@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!-- :is(a, iframe) x expands to one selector per argument, each with
+     the type as an extra detail on a universal compound. Those are
+     filed under the type they name, so they must still match exactly
+     the elements they did when they sat in the universal chain. Each
+     span's left edge says which rules its element matched. -->
+<html><head><style>
+body { margin: 0 } div, p, ul, li { margin: 0; padding: 0; list-style: none }
+span { display: inline-block; width: 5px; height: 5px }
+:is(em, b) > span { margin-left: 10px }
+:is(p, li).k span { margin-left: 20px }
+#d :is(section, article) i span { margin-left: 30px }
+:where(u) span { margin-left: 40px }
+:is(s, *) > span.w { margin-left: 50px }
+:is(var):not(.no) > span { margin-left: 60px }
+:is(EM) > span.c { margin-left: 70px }
+:is(small, big):is(small) > span { margin-left: 80px }
+</style></head><body>
+<div id="a"><em><span></span></em><b><span></span></b><i><span></span></i></div>
+<div id="b"><p class="k"><span></span></p><p><span></span></p><ul><li class="k"><span></span></li><li><span></span></li></ul><div class="k"><span></span></div></div>
+<div id="d"><section><i><span></span></i></section><article><i><span></span></i></article><aside><i><span></span></i></aside></div>
+<div id="e"><i><span></span></i><section><i><span></span></i></section></div>
+<div id="f"><u><span></span></u><u><i><span></span></i></u><i><span></span></i></div>
+<div id="g"><s><span class="w"></span></s><i><span class="w"></span></i></div>
+<div id="h"><var><span></span></var><var class="no"><span></span></var></div>
+<div id="j"><em><span class="c"></span></em></div>
+<div id="k"><small><span></span></small><big><span></span></big></div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+function lefts(sel){ var r=[]; var s=document.querySelectorAll(sel);
+  for (var i=0;i<s.length;i++) r.push(Math.round(s[i].getBoundingClientRect().left - s[i].parentNode.getBoundingClientRect().left));
+  return r.join(","); }
+function check(name, got, want){ ok(name+" ("+got+")", got===want); }
+setTimeout(function(){
+ check("child of either type", lefts("#a span"), "10,10,0");
+ check("type with a class", lefts("#b span"), "20,0,20,0,0");
+ check("types as ancestors", lefts("#d span"), "30,30,0");
+ check("outside the id ancestor", lefts("#e span"), "0,0");
+ check(":where() type as an ancestor", lefts("#f span"), "40,40,0");
+ check(":is() with a universal argument", lefts("#g span"), "50,50");
+ check("type then a negation", lefts("#h span"), "60,0");
+ check("upper-case type", lefts("#j span"), "70");
+ check("two :is() types", lefts("#k span"), "80,0");
+}, 300);
+</script></body></html>

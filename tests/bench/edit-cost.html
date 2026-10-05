@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!-- The cost of one attribute set and one tree edit in a page shaped
+     like GitHub after its big render: a few thousand elements in the
+     document, observers on the whole document that want attributes and
+     children, and listeners on the document. Prints microseconds per
+     setAttribute and per appendChild moving a small subtree. -->
+<html><body><div id="app"></div>
+<script>
+var recs = 0;
+for (var o = 0; o < 4; o++)
+  new MutationObserver(function (r) { recs += r.length; })
+    .observe(document, {subtree: true, childList: true, attributes: true});
+for (var l = 0; l < 60; l++)
+  document.addEventListener(['click','keydown','focusin','input','change'][l % 5], function () {});
+setTimeout(function () {
+  var app = document.getElementById('app'), html = '';
+  for (var i = 0; i < 400; i++)
+    html += '<div class="Box-row d-flex" data-i="' + i + '"><span class="a">x</span>' +
+      '<a href="#' + i + '" class="Link">l</a><ul><li>1</li><li>2</li><li><b>3</b></li></ul></div>';
+  app.innerHTML = html;
+  var rows = Array.prototype.slice.call(app.children), t0 = performance.now();
+  for (var k = 0; k < 2000; k++)
+    rows[k % rows.length].setAttribute('aria-selected', k & 1 ? 'true' : 'false');
+  var t1 = performance.now();
+  var dst = document.createElement('section'); document.body.appendChild(dst);
+  for (var m = 0; m < 700; m++) dst.appendChild(rows[m % rows.length]);
+  var t2 = performance.now();
+  setTimeout(function () {
+    console.log('EDITS setAttribute ' + Math.round((t1 - t0) * 1000 / 2000) +
+      ' us each, appendChild ' + Math.round((t2 - t1) * 1000 / 700) +
+      ' us each, ' + recs + ' records');
+  }, 50);
+}, 100);
+</script></body></html>

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!-- CSS counters and quotes, checked in the plot output: numbered
+     sections "1. A", "2. B" with sub-sections "2.1", "2.2" through
+     counters(); list items numbered from list-item as "1)" "2)" "3)";
+     "iv" from lower-roman; counter-set jumping to "10"; a hidden
+     element that does not count, so "3. C" follows; and quotes nesting
+     as curly double outside single. -->
+<html><head><meta charset="utf-8"><style>
+body { margin: 0; font: 16px sans-serif; counter-reset: sec; }
+h2 { font-size: 16px; margin: 0; }
+h2::before { counter-increment: sec; content: counter(sec) ". "; }
+.sub { counter-reset: sub; }
+.sub p { margin: 0; }
+.sub p::before { counter-increment: sub; content: counters(sec, ".") "." counter(sub) " "; }
+ol.x { list-style: none; margin: 0; padding: 0; }
+ol.x li::before { content: counter(list-item) ") "; }
+.r { counter-reset: r 3; }
+.r span::before { counter-increment: r; content: counter(r, lower-roman); display: block; }
+.s { counter-reset: s; }
+.s i::before { counter-increment: s; content: "s" counter(s) " "; }
+.s i.jump { counter-set: s 9; }
+.hidden { display: none; }
+q { quotes: auto; }
+</style></head><body>
+<h2>A</h2>
+<h2>B</h2>
+<div class=sub><p>one</p><p>two</p></div>
+<h2 class=hidden>hidden</h2>
+<h2>C</h2>
+<ol class=x><li>a</li><li>b</li><li>c</li></ol>
+<div class=r><span></span></div>
+<div class=s><i>p</i> <i class=jump>q</i></div>
+<p><q>outer <q>inner</q> back</q></p>
+</body></html>

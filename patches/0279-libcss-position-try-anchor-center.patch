@@ -1,0 +1,300 @@
+diff --git a/include/libcss/properties.h b/include/libcss/properties.h
+index 069b07a..ca33f8e 100644
+--- a/include/libcss/properties.h
++++ b/include/libcss/properties.h
+@@ -253,7 +253,9 @@ enum css_align_self_e {
+ 	CSS_ALIGN_SELF_FLEX_END			= CSS_ALIGN_ITEMS_FLEX_END,
+ 	CSS_ALIGN_SELF_CENTER			= CSS_ALIGN_ITEMS_CENTER,
+ 	CSS_ALIGN_SELF_BASELINE			= CSS_ALIGN_ITEMS_BASELINE,
+-	CSS_ALIGN_SELF_AUTO			= 0x6
++	CSS_ALIGN_SELF_AUTO			= 0x6,
++	/* centred on its anchor (VitaSurf) */
++	CSS_ALIGN_SELF_ANCHOR_CENTER		= 0x7
+ };
+ 
+ enum css_background_attachment_e {
+@@ -720,7 +722,9 @@ enum css_justify_self_e {
+ 	CSS_JUSTIFY_SELF_FLEX_END		= 0x3,
+ 	CSS_JUSTIFY_SELF_CENTER			= 0x4,
+ 	CSS_JUSTIFY_SELF_BASELINE		= 0x5,
+-	CSS_JUSTIFY_SELF_AUTO			= 0x6
++	CSS_JUSTIFY_SELF_AUTO			= 0x6,
++	/* centred on its anchor (VitaSurf) */
++	CSS_JUSTIFY_SELF_ANCHOR_CENTER		= 0x7
+ };
+ 
+ enum css_text_shadow_e {
+diff --git a/include/libcss/stylesheet.h b/include/libcss/stylesheet.h
+index b1dde6b..9451d27 100644
+--- a/include/libcss/stylesheet.h
++++ b/include/libcss/stylesheet.h
+@@ -147,6 +147,15 @@ css_error css_stylesheet_destroy(css_stylesheet *sheet);
+  */
+ css_error css_supports(const char *condition, size_t len, bool *result);
+ 
++/**
++ * The declarations of the @position-try rule of a name (VitaSurf), as
++ * written in the last sheet that gave one, or NULL.
++ *
++ * \param name  the rule's name, with its leading "--"
++ * \param len   its length
++ */
++const char *css_position_try_rule(const char *name, size_t len);
++
+ css_error css_stylesheet_append_data(css_stylesheet *sheet,
+ 		const uint8_t *data, size_t len);
+ css_error css_stylesheet_data_done(css_stylesheet *sheet);
+diff --git a/src/bytecode/opcodes.h b/src/bytecode/opcodes.h
+index 65ec198..2c6720c 100644
+--- a/src/bytecode/opcodes.h
++++ b/src/bytecode/opcodes.h
+@@ -43,7 +43,8 @@ enum op_align_self {
+ 	ALIGN_SELF_FLEX_END		= ALIGN_ITEMS_FLEX_END,
+ 	ALIGN_SELF_CENTER		= ALIGN_ITEMS_CENTER,
+ 	ALIGN_SELF_BASELINE		= ALIGN_ITEMS_BASELINE,
+-	ALIGN_SELF_AUTO			= 0x0005
++	ALIGN_SELF_AUTO			= 0x0005,
++	ALIGN_SELF_ANCHOR_CENTER	= 0x0006	/* VitaSurf */
+ };
+ 
+ enum op_azimuth {
+@@ -1331,7 +1332,8 @@ enum op_justify_self {
+ 	JUSTIFY_SELF_FLEX_END		= JUSTIFY_ITEMS_FLEX_END,
+ 	JUSTIFY_SELF_CENTER		= JUSTIFY_ITEMS_CENTER,
+ 	JUSTIFY_SELF_BASELINE		= JUSTIFY_ITEMS_BASELINE,
+-	JUSTIFY_SELF_AUTO		= 0x0005
++	JUSTIFY_SELF_AUTO		= 0x0005,
++	JUSTIFY_SELF_ANCHOR_CENTER	= 0x0006	/* VitaSurf */
+ };
+ 
+ enum op_text_shadow {
+diff --git a/src/parse/nesting.c b/src/parse/nesting.c
+index 041a337..7e76e1f 100644
+--- a/src/parse/nesting.c
++++ b/src/parse/nesting.c
+@@ -37,6 +37,8 @@
+ #include <strings.h>
+ #include <stdlib.h>
+ 
++#include <libcss/stylesheet.h>
++
+ #include "parse/nesting.h"
+ 
+ /** Deepest nesting this will follow; beyond it the input is left alone. */
+@@ -1271,3 +1273,112 @@ css_error css__rewrite_scope(const char *src, size_t len,
+ 	*outlen = b.n;
+ 	return CSS_OK;
+ }
++
++
++/******************************************************************************
++ * @position-try (VitaSurf)                                                    *
++ ******************************************************************************/
++
++/*
++ * The @position-try rules the sheets have given, by name: what is in
++ * each block, as written. A later rule of a name replaces an earlier
++ * one. The client reads them when a box names one in
++ * position-try-fallbacks; libcss has nothing to cascade them into.
++ */
++#define POSITION_TRY_MAX 128
++
++static struct {
++	char name[64];
++	char *text;
++} position_try[POSITION_TRY_MAX];
++static unsigned n_position_try;
++
++static void position_try_put(const char *name, size_t nl, const char *body,
++		size_t bl)
++{
++	unsigned i;
++	char *t;
++
++	if (nl == 0 || nl >= sizeof(position_try[0].name))
++		return;
++	t = malloc(bl + 1);
++	if (t == NULL)
++		return;
++	memcpy(t, body, bl);
++	t[bl] = '\0';
++	for (i = 0; i < n_position_try; i++) {
++		if (strlen(position_try[i].name) == nl &&
++				memcmp(position_try[i].name, name, nl) == 0) {
++			free(position_try[i].text);
++			position_try[i].text = t;
++			return;
++		}
++	}
++	if (n_position_try == POSITION_TRY_MAX) {
++		free(t);
++		return;
++	}
++	memcpy(position_try[n_position_try].name, name, nl);
++	position_try[n_position_try].name[nl] = '\0';
++	position_try[n_position_try].text = t;
++	n_position_try++;
++}
++
++/* exported interface documented in parse/nesting.h */
++void css__note_position_try(const char *src, size_t len)
++{
++	size_t i = 0;
++
++	while (i + 13 < len) {
++		const char *at = memchr(src + i, '@', len - i);
++		size_t k, n0, n1, open, close;
++		int depth;
++
++		if (at == NULL)
++			return;
++		i = (size_t) (at - src) + 1;
++		if (len - (i - 1) < 13 ||
++				strncasecmp(at, "@position-try", 13) != 0 ||
++				(i - 1 + 13 < len && (isalnum((unsigned char)
++					at[13]) || at[13] == '-') &&
++				 at[13] != ' '))
++			continue;
++		k = i - 1 + 13;
++		while (k < len && sel_ws(src[k]))
++			k++;
++		n0 = k;
++		while (k < len && !sel_ws(src[k]) && src[k] != '{')
++			k++;
++		n1 = k;
++		while (k < len && src[k] != '{')
++			k++;
++		if (k >= len)
++			return;
++		open = k;
++		depth = 0;
++		for (close = open; close < len; close++) {
++			if (src[close] == '{')
++				depth++;
++			else if (src[close] == '}' && --depth == 0)
++				break;
++		}
++		if (close >= len)
++			return;
++		position_try_put(src + n0, n1 - n0, src + open + 1,
++				close - open - 1);
++		i = close + 1;
++	}
++}
++
++/* exported interface documented in libcss/stylesheet.h */
++const char *css_position_try_rule(const char *name, size_t len)
++{
++	unsigned i;
++
++	for (i = 0; i < n_position_try; i++) {
++		if (strlen(position_try[i].name) == len &&
++				memcmp(position_try[i].name, name, len) == 0)
++			return position_try[i].text;
++	}
++	return NULL;
++}
+diff --git a/src/parse/nesting.h b/src/parse/nesting.h
+index bfe1ccc..6915157 100644
+--- a/src/parse/nesting.h
++++ b/src/parse/nesting.h
+@@ -68,4 +68,10 @@ css_error css__rewrite_selectors(const char *src, size_t len,
+ css_error css__rewrite_scope(const char *src, size_t len,
+ 			     char **out, size_t *outlen);
+ 
++/**
++ * Note the @position-try rules in a sheet's source (VitaSurf), for
++ * css_position_try_rule().
++ */
++void css__note_position_try(const char *src, size_t len);
++
+ #endif
+diff --git a/src/parse/properties/properties.gen b/src/parse/properties/properties.gen
+index 1f6de93..814be2b 100644
+--- a/src/parse/properties/properties.gen
++++ b/src/parse/properties/properties.gen
+@@ -236,7 +236,7 @@ align_content:CSS_PROP_ALIGN_CONTENT IDENT:( INHERIT: INITIAL: REVERT: UNSET: ST
+ 
+ align_items:CSS_PROP_ALIGN_ITEMS IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_ITEMS_STRETCH FLEX_START:0,ALIGN_ITEMS_FLEX_START FLEX_END:0,ALIGN_ITEMS_FLEX_END CENTER:0,ALIGN_ITEMS_CENTER BASELINE:0,ALIGN_ITEMS_BASELINE IDENT:)
+ 
+-align_self:CSS_PROP_ALIGN_SELF IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_SELF_STRETCH FLEX_START:0,ALIGN_SELF_FLEX_START FLEX_END:0,ALIGN_SELF_FLEX_END CENTER:0,ALIGN_SELF_CENTER BASELINE:0,ALIGN_SELF_BASELINE AUTO:0,ALIGN_SELF_AUTO IDENT:)
++align_self:CSS_PROP_ALIGN_SELF IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,ALIGN_SELF_STRETCH FLEX_START:0,ALIGN_SELF_FLEX_START FLEX_END:0,ALIGN_SELF_FLEX_END CENTER:0,ALIGN_SELF_CENTER BASELINE:0,ALIGN_SELF_BASELINE AUTO:0,ALIGN_SELF_AUTO ANCHOR_CENTER:0,ALIGN_SELF_ANCHOR_CENTER IDENT:)
+ 
+ flex_basis:CSS_PROP_FLEX_BASIS IDENT:( INHERIT: INITIAL: REVERT: UNSET: AUTO:0,FLEX_BASIS_AUTO CONTENT:0,FLEX_BASIS_CONTENT MAX_CONTENT:0,FLEX_BASIS_MAX_CONTENT MIN_CONTENT:0,FLEX_BASIS_MIN_CONTENT FIT_CONTENT:0,FLEX_BASIS_FIT_CONTENT IDENT:) LENGTH_UNIT:( UNIT_PX:FLEX_BASIS_SET MASK:UNIT_MASK_FLEX_BASIS RANGE:<0 LENGTH_UNIT:) CALC:( UNIT_PX:FLEX_BASIS_CALC CALC:)
+ 
+@@ -255,7 +255,7 @@ line_clamp:CSS_PROP_LINE_CLAMP IDENT:( INHERIT: INITIAL: REVERT: UNSET: NONE:0,L
+ 
+ justify_items:CSS_PROP_JUSTIFY_ITEMS IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,JUSTIFY_ITEMS_STRETCH FLEX_START:0,JUSTIFY_ITEMS_FLEX_START FLEX_END:0,JUSTIFY_ITEMS_FLEX_END CENTER:0,JUSTIFY_ITEMS_CENTER BASELINE:0,JUSTIFY_ITEMS_BASELINE IDENT:)
+ 
+-justify_self:CSS_PROP_JUSTIFY_SELF IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,JUSTIFY_SELF_STRETCH FLEX_START:0,JUSTIFY_SELF_FLEX_START FLEX_END:0,JUSTIFY_SELF_FLEX_END CENTER:0,JUSTIFY_SELF_CENTER BASELINE:0,JUSTIFY_SELF_BASELINE AUTO:0,JUSTIFY_SELF_AUTO IDENT:)
++justify_self:CSS_PROP_JUSTIFY_SELF IDENT:( INHERIT: INITIAL: REVERT: UNSET: STRETCH:0,JUSTIFY_SELF_STRETCH FLEX_START:0,JUSTIFY_SELF_FLEX_START FLEX_END:0,JUSTIFY_SELF_FLEX_END CENTER:0,JUSTIFY_SELF_CENTER BASELINE:0,JUSTIFY_SELF_BASELINE AUTO:0,JUSTIFY_SELF_AUTO ANCHOR_CENTER:0,JUSTIFY_SELF_ANCHOR_CENTER IDENT:)
+ 
+ text_decoration_color:CSS_PROP_TEXT_DECORATION_COLOR IDENT:( INHERIT: INITIAL: REVERT: UNSET: IDENT:) COLOR:TEXT_DECORATION_COLOR_SET
+ 
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index 9c10a10..4b04ba3 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -848,6 +848,7 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+ 	SMAP("stretch"),
+ 	SMAP("inline-flex"),
+ 	SMAP("flex-start"),
++	SMAP("anchor-center"),
+ 	SMAP("flex-end"),
+ 	SMAP("space-between"),
+ 	SMAP("space-around"),
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index f71e81e..fa91269 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -303,7 +303,7 @@ enum {
+ 	INITIAL, REVERT, FORMAT, WOFF, TRUETYPE, OPENTYPE, EMBEDDED_OPENTYPE,
+ 	SVG, COLUMN, AVOID_PAGE, AVOID_COLUMN, BALANCE, HORIZONTAL_TB,
+ 	VERTICAL_RL, VERTICAL_LR, CONTENT_BOX, BORDER_BOX, STRETCH, INLINE_FLEX,
+-	FLEX_START, FLEX_END, SPACE_BETWEEN, SPACE_AROUND, SPACE_EVENLY, ROW,
++	FLEX_START, ANCHOR_CENTER, FLEX_END, SPACE_BETWEEN, SPACE_AROUND, SPACE_EVENLY, ROW,
+ 	ROW_REVERSE, COLUMN_REVERSE, WRAP_STRING, WRAP_REVERSE, AND, OR, ONLY,
+ 	INFINITE, INLINE_GRID, CONTENTS, STICKY, CALC, SPAN, DENSE, MIN_CONTENT,
+ 	MAX_CONTENT, FIT_CONTENT, MINMAX, AUTO_FILL, AUTO_FIT,
+diff --git a/src/select/properties/align_self.c b/src/select/properties/align_self.c
+index abdb3fe..8c69266 100644
+--- a/src/select/properties/align_self.c
++++ b/src/select/properties/align_self.c
+@@ -41,6 +41,9 @@ css_error css__cascade_align_self(uint32_t opv, css_style *style,
+ 		case ALIGN_SELF_AUTO:
+ 			value = CSS_ALIGN_SELF_AUTO;
+ 			break;
++		case ALIGN_SELF_ANCHOR_CENTER:
++			value = CSS_ALIGN_SELF_ANCHOR_CENTER;
++			break;
+ 		}
+ 	}
+ 
+diff --git a/src/select/properties/justify_self.c b/src/select/properties/justify_self.c
+index 8343450..3b3f051 100644
+--- a/src/select/properties/justify_self.c
++++ b/src/select/properties/justify_self.c
+@@ -41,6 +41,9 @@ css_error css__cascade_justify_self(uint32_t opv, css_style *style,
+ 		case JUSTIFY_SELF_AUTO:
+ 			value = CSS_JUSTIFY_SELF_AUTO;
+ 			break;
++		case JUSTIFY_SELF_ANCHOR_CENTER:
++			value = CSS_JUSTIFY_SELF_ANCHOR_CENTER;
++			break;
+ 		}
+ 	}
+ 
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index eabefca..8052989 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -387,6 +387,9 @@ css_error css_stylesheet_data_done(css_stylesheet *sheet)
+ 		char *scoped = NULL;
+ 		size_t scoped_len = 0;
+ 
++		/* the @position-try rules, which the client reads */
++		css__note_position_try(sheet->src, sheet->src_len);
++
+ 		/* @scope first, into nesting the next pass flattens */
+ 		error = css__rewrite_scope(sheet->src, sheet->src_len,
+ 					   &scoped, &scoped_len);

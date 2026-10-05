@@ -1,0 +1,899 @@
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 3cd121bf5..454f1b228 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -59,6 +59,7 @@
+ #include "html/form_internal.h"
+ #include "html/html.h"
+ #include "html/private.h"
++#include "html/layout_internal.h"
+ #include "html/imagemap.h"
+ #include "html/interaction.h"
+ 
+@@ -2038,6 +2039,16 @@ void html_overflow_scroll_callback(void *client_data,
+ 		}
+ 
+ 		html__redraw_a_box(html, box);
++
++		/* a box placed against an anchor in what scrolled goes
++		 * with it (VitaSurf) */
++		if (layout_anchor_again(html) && html->layout != NULL)
++			content__request_redraw((struct content *) html,
++					0, 0,
++					html->layout->x +
++					html->layout->descendant_x1,
++					html->layout->y +
++					html->layout->descendant_y1);
+ 		break;
+ 	case SCROLLBAR_MSG_SCROLL_START:
+ 	{
+diff --git a/content/handlers/html/layout_anchor.c b/content/handlers/html/layout_anchor.c
+index eacc27a5e..6738cf92e 100644
+--- a/content/handlers/html/layout_anchor.c
++++ b/content/handlers/html/layout_anchor.c
+@@ -37,11 +37,18 @@
+  * or a span of them, against the side it touches, centred along the
+  * anchor where it spans it. position-try-fallbacks flip-block,
+  * flip-inline and flip-start are tried in turn when the box would go
+- * past the page's edge.
+  *
+- * What this leaves out: named @position-try rules, anchor-center,
+- * anchors that move with a scroll after layout, and the size limits
+- * position-area puts on the box.
++ * past the edge of the page, or of the viewport for a fixed box; a
++ * fallback may also name an @position-try rule, whose insets, area,
++ * anchor and alignment are used over the box's own, or be an area of
++ * its own. anchor-center in align-self or justify-self centres the box
++ * on its anchor. An area no wider than the box needs gives an auto
++ * width no more than it. The boxes are placed again when a box that
++ * holds an anchor is scrolled, and before a redraw when the viewport
++ * has moved, for the fixed boxes that flip at its edges.
++ *
++ * What this leaves out: position-try-order, and the height an area
++ * would limit, which a box's content decides.
+  */
+ 
+ #include <assert.h>
+@@ -51,6 +58,7 @@
+ #include <strings.h>
+ 
+ #include <dom/dom.h>
++#include <libcss/libcss.h>
+ 
+ #include "utils/log.h"
+ #include "utils/utils.h"
+@@ -177,6 +185,11 @@ static bool anchor_wanted(const struct box *b)
+ 			css_computed_right(b->style, &l, &u) ==
+ 				CSS_RIGHT_AUTO))
+ 		return true;
++	if (css_computed_align_self(b->style) ==
++			CSS_ALIGN_SELF_ANCHOR_CENTER ||
++			css_computed_justify_self(b->style) ==
++			CSS_JUSTIFY_SELF_ANCHOR_CENTER)
++		return true;
+ 	if ((css_computed_anchor_width(b->style, &s) == CSS_ANCHOR_WIDTH_SET &&
+ 			css_computed_width(b->style, &l, &u) ==
+ 				CSS_WIDTH_AUTO) ||
+@@ -548,10 +561,10 @@ static bool anchor_sum(struct anchor_eval *e, const char **pp, int *out)
+ 	return any;
+ }
+ 
+-static bool anchor_eval_text(struct anchor_eval *e, lwc_string *text,
++static bool anchor_eval_text(struct anchor_eval *e, const char *text,
+ 		int *out)
+ {
+-	const char *p = lwc_string_data(text);
++	const char *p = text;
+ 
+ 	e->missing = false;
+ 	return anchor_sum(e, &p, out) && !e->missing;
+@@ -560,6 +573,152 @@ static bool anchor_eval_text(struct anchor_eval *e, lwc_string *text,
+ /* ------------------------------------------------------------------ */
+ /* Placing                                                              */
+ 
++enum { SIDE_TOP, SIDE_RIGHT, SIDE_BOTTOM, SIDE_LEFT };
++
++/**
++ * The rules a box is placed by: its own, or those of one of its
++ * fallbacks, a named @position-try rule overriding them.
++ */
++struct anchor_rules {
++	const char *side[4];	/**< anchor() text of each inset, or NULL */
++	const char *area;	/**< position-area, or NULL */
++	bool center_v;		/**< align-self: anchor-center */
++	bool center_h;		/**< justify-self: anchor-center */
++	struct box *def;	/**< the default anchor */
++	/** copies of what a @position-try rule said */
++	char buf[4][128];
++	char area_buf[64];
++};
++
++/** A box's own rules. */
++static void anchor_rules_own(struct anchor_ctx *a, struct box *b,
++		struct anchor_rules *r)
++{
++	lwc_string *s = NULL;
++	css_fixed l = 0;
++	css_unit u = CSS_UNIT_PX;
++
++	memset(r, 0, sizeof(*r));
++	r->def = anchor_default(a, b);
++	if (css_computed_top(b->style, &l, &u) == CSS_TOP_AUTO &&
++			css_computed_anchor_top(b->style, &s) ==
++				CSS_ANCHOR_TOP_SET && s != NULL)
++		r->side[SIDE_TOP] = lwc_string_data(s);
++	if (css_computed_bottom(b->style, &l, &u) == CSS_BOTTOM_AUTO &&
++			css_computed_anchor_bottom(b->style, &s) ==
++				CSS_ANCHOR_BOTTOM_SET && s != NULL)
++		r->side[SIDE_BOTTOM] = lwc_string_data(s);
++	if (css_computed_left(b->style, &l, &u) == CSS_LEFT_AUTO &&
++			css_computed_anchor_left(b->style, &s) ==
++				CSS_ANCHOR_LEFT_SET && s != NULL)
++		r->side[SIDE_LEFT] = lwc_string_data(s);
++	if (css_computed_right(b->style, &l, &u) == CSS_RIGHT_AUTO &&
++			css_computed_anchor_right(b->style, &s) ==
++				CSS_ANCHOR_RIGHT_SET && s != NULL)
++		r->side[SIDE_RIGHT] = lwc_string_data(s);
++	if (css_computed_position_area(b->style, &s) ==
++			CSS_POSITION_AREA_SET && s != NULL)
++		r->area = lwc_string_data(s);
++	r->center_v = css_computed_align_self(b->style) ==
++			CSS_ALIGN_SELF_ANCHOR_CENTER;
++	r->center_h = css_computed_justify_self(b->style) ==
++			CSS_JUSTIFY_SELF_ANCHOR_CENTER;
++}
++
++/**
++ * A @position-try rule's declarations over a box's rules: the insets,
++ * position-area, position-anchor and the self alignment it sets.
++ * An inset it gives as a length rather than an anchor() stops the
++ * box's own anchor() for that side.
++ */
++static void anchor_rules_try(struct anchor_ctx *a, struct box *b,
++		const char *text, struct anchor_rules *r)
++{
++	const char *p = text;
++
++	while (*p != '\0') {
++		const char *colon, *end, *start;
++		char prop[40], val[128];
++		size_t pl, vl;
++		int side = -1;
++
++		while (*p == ' ' || *p == '\n' || *p == '\t' || *p == ';' ||
++				*p == '\r')
++			p++;
++		if (*p == '\0')
++			break;
++		start = p;
++		colon = strchr(p, ':');
++		if (colon == NULL)
++			break;
++		end = strchr(colon, ';');
++		if (end == NULL)
++			end = colon + strlen(colon);
++		pl = (size_t) (colon - p);
++		while (pl > 0 && (p[pl - 1] == ' ' || p[pl - 1] == '\t'))
++			pl--;
++		vl = (size_t) (end - colon - 1);
++		p = colon + 1;
++		while (vl > 0 && (*p == ' ' || *p == '\t' || *p == '\n')) {
++			p++;
++			vl--;
++		}
++		while (vl > 0 && (p[vl - 1] == ' ' || p[vl - 1] == '\n' ||
++				p[vl - 1] == '\t' || p[vl - 1] == '\r'))
++			vl--;
++		if (pl >= sizeof(prop) || vl >= sizeof(val)) {
++			p = *end ? end + 1 : end;
++			continue;
++		}
++		memcpy(prop, start, pl);
++		prop[pl] = '\0';
++		memcpy(val, p, vl);
++		val[vl] = '\0';
++		p = *end ? end + 1 : end;
++
++		if (strcasecmp(prop, "top") == 0)
++			side = SIDE_TOP;
++		else if (strcasecmp(prop, "right") == 0)
++			side = SIDE_RIGHT;
++		else if (strcasecmp(prop, "bottom") == 0)
++			side = SIDE_BOTTOM;
++		else if (strcasecmp(prop, "left") == 0)
++			side = SIDE_LEFT;
++
++		if (side >= 0) {
++			if (strstr(val, "anchor(") != NULL) {
++				memcpy(r->buf[side], val, vl + 1);
++				r->side[side] = r->buf[side];
++			} else {
++				r->side[side] = NULL;
++			}
++		} else if (strcasecmp(prop, "inset") == 0 &&
++				strstr(val, "anchor(") == NULL) {
++			r->side[0] = r->side[1] = r->side[2] =
++					r->side[3] = NULL;
++		} else if (strcasecmp(prop, "position-area") == 0 ||
++				strcasecmp(prop, "inset-area") == 0) {
++			if (strcasecmp(val, "none") == 0) {
++				r->area = NULL;
++			} else if (vl < sizeof(r->area_buf)) {
++				memcpy(r->area_buf, val, vl + 1);
++				r->area = r->area_buf;
++			}
++		} else if (strcasecmp(prop, "position-anchor") == 0) {
++			r->def = strncmp(val, "--", 2) == 0 ?
++					anchor_find(a, val, vl, b) :
++					anchor_default(a, b);
++		} else if (strcasecmp(prop, "align-self") == 0 ||
++				strcasecmp(prop, "place-self") == 0) {
++			r->center_v = strstr(val, "anchor-center") != NULL;
++			if (prop[0] == 'p' || prop[0] == 'P')
++				r->center_h = r->center_v;
++		} else if (strcasecmp(prop, "justify-self") == 0) {
++			r->center_h = strstr(val, "anchor-center") != NULL;
++		}
++	}
++}
++
+ /** Lay a box out again at a new width, as layout would have. */
+ static void anchor_relayout(html_content *content, struct box *b)
+ {
+@@ -584,63 +743,91 @@ static void anchor_relayout(html_content *content, struct box *b)
+ 		b->height = 0;
+ }
+ 
+-/**
+- * Where a box goes along one axis from position-area: its margin box's
+- * start, from the anchor's start and length and its own margin box
+- * length. \a word is the area's keyword for this axis.
+- */
+-static int anchor_area_axis(const char *word, bool vertical, bool flip,
+-		int a0, int alen, int blen)
++enum area_kind { A_BEFORE, A_AFTER, A_CENTER, A_SPAN_BEFORE, A_SPAN_AFTER,
++	A_ALL };
++
++static enum area_kind anchor_area_kind(const char *word, bool vertical,
++		bool flip)
+ {
+-	enum { BEFORE, AFTER, CENTER, SPAN_BEFORE, SPAN_AFTER, ALL } k = ALL;
++	enum area_kind k = A_ALL;
+ 
+ 	if (word == NULL)
+-		k = ALL;
++		k = A_ALL;
+ 	else if (strcmp(word, vertical ? "top" : "left") == 0 ||
+ 			strcmp(word, vertical ? "block-start" :
+ 				"inline-start") == 0 ||
+ 			strcmp(word, "start") == 0 ||
+ 			strcmp(word, vertical ? "y-start" : "x-start") == 0)
+-		k = BEFORE;
++		k = A_BEFORE;
+ 	else if (strcmp(word, vertical ? "bottom" : "right") == 0 ||
+ 			strcmp(word, vertical ? "block-end" :
+ 				"inline-end") == 0 ||
+ 			strcmp(word, "end") == 0 ||
+ 			strcmp(word, vertical ? "y-end" : "x-end") == 0)
+-		k = AFTER;
++		k = A_AFTER;
+ 	else if (strcmp(word, "center") == 0)
+-		k = CENTER;
++		k = A_CENTER;
+ 	else if (strcmp(word, vertical ? "span-top" : "span-left") == 0 ||
+ 			strcmp(word, vertical ? "span-block-start" :
+ 				"span-inline-start") == 0 ||
+ 			strcmp(word, "span-start") == 0)
+-		k = SPAN_BEFORE;
++		k = A_SPAN_BEFORE;
+ 	else if (strcmp(word, vertical ? "span-bottom" : "span-right") ==
+ 			0 || strcmp(word, vertical ? "span-block-end" :
+ 				"span-inline-end") == 0 ||
+ 			strcmp(word, "span-end") == 0)
+-		k = SPAN_AFTER;
++		k = A_SPAN_AFTER;
+ 
+ 	if (flip) {
+-		if (k == BEFORE) k = AFTER;
+-		else if (k == AFTER) k = BEFORE;
+-		else if (k == SPAN_BEFORE) k = SPAN_AFTER;
+-		else if (k == SPAN_AFTER) k = SPAN_BEFORE;
++		if (k == A_BEFORE) k = A_AFTER;
++		else if (k == A_AFTER) k = A_BEFORE;
++		else if (k == A_SPAN_BEFORE) k = A_SPAN_AFTER;
++		else if (k == A_SPAN_AFTER) k = A_SPAN_BEFORE;
+ 	}
++	return k;
++}
++
++/**
++ * Where a box goes along one axis from position-area: its margin box's
++ * start, from the anchor's start and length and its own margin box
++ * length, against the side of its cell that touches the anchor.
++ */
++static int anchor_area_axis(enum area_kind k, int a0, int alen, int blen)
++{
+ 	switch (k) {
+-	case BEFORE:
++	case A_BEFORE:
+ 		return a0 - blen;
+-	case AFTER:
++	case A_AFTER:
+ 		return a0 + alen;
+-	case SPAN_BEFORE:
++	case A_SPAN_BEFORE:
+ 		return a0 + alen - blen;
+-	case SPAN_AFTER:
++	case A_SPAN_AFTER:
+ 		return a0;
+ 	default:
+ 		return a0 + (alen - blen) / 2;
+ 	}
+ }
+ 
++/** How much room the area gives along one axis, from the bounds. */
++static int anchor_area_room(enum area_kind k, int a0, int alen, int lo,
++		int hi)
++{
++	switch (k) {
++	case A_BEFORE:
++		return a0 - lo;
++	case A_AFTER:
++		return hi - (a0 + alen);
++	case A_CENTER:
++		return alen;
++	case A_SPAN_BEFORE:
++		return a0 + alen - lo;
++	case A_SPAN_AFTER:
++		return hi - a0;
++	default:
++		return hi - lo;
++	}
++}
++
+ /** Whether a keyword of position-area is for the vertical axis. */
+ static int anchor_area_axis_of(const char *w)
+ {
+@@ -653,46 +840,93 @@ static int anchor_area_axis_of(const char *w)
+ 	return -1;		/* center, span-all, start, end */
+ }
+ 
++/** Split position-area into its vertical and horizontal keywords. */
++static void anchor_area_words(const char *area, char *w1, char *w2,
++		const char **wv, const char **wh)
++{
++	w1[0] = w2[0] = '\0';
++	*wv = *wh = NULL;
++	if (sscanf(area, "%31s %31s", w1, w2) < 1)
++		return;
++	if (w2[0] == '\0') {
++		int ax = anchor_area_axis_of(w1);
++
++		if (ax == 1)
++			*wv = w1;
++		else if (ax == 0)
++			*wh = w1;
++		else
++			*wv = *wh = w1;		/* center, span-all */
++	} else {
++		/* the first is the block axis unless one says otherwise */
++		if (anchor_area_axis_of(w1) == 0 ||
++				anchor_area_axis_of(w2) == 1) {
++			*wh = w1;
++			*wv = w2;
++		} else {
++			*wv = w1;
++			*wh = w2;
++		}
++	}
++}
++
++/**
++ * The region a box must stay in to fit: the viewport for a fixed box,
++ * when it is known, else the page.
++ */
++static void anchor_bounds(struct anchor_ctx *a, struct box *b,
++		struct anchor_rect *r)
++{
++	html_content *c = a->content;
++
++	if (css_computed_position(b->style) == CSS_POSITION_FIXED &&
++			c->view_h > 0 && c->view_w > 0) {
++		r->x = c->view_x;
++		r->y = c->view_y;
++		r->w = c->view_w;
++		r->h = c->view_h;
++	} else {
++		r->x = 0;
++		r->y = 0;
++		r->w = a->doc_w;
++		r->h = a->doc_h;
++	}
++}
++
+ /**
+  * Place a box: its new border box's x and y, and whether each was
+- * given, for one try (flip_v, flip_h).
++ * given, for one set of rules and one try (flip_v, flip_h).
+  */
+ static bool anchor_place(struct anchor_ctx *a, struct box *b,
+-		struct box *def, bool flip_v, bool flip_h, int *nx, int *ny,
+-		bool *set_x, bool *set_y)
++		const struct anchor_rules *r, bool flip_v, bool flip_h,
++		int *nx, int *ny, bool *set_x, bool *set_y)
+ {
+-	lwc_string *s = NULL;
+-	css_fixed l = 0;
+-	css_unit u = CSS_UNIT_PX;
+ 	struct anchor_eval e;
+-	struct anchor_rect br;
++	struct anchor_rect br, ar, bounds;
+ 	int mt = b->margin[TOP], mb = b->margin[BOTTOM];
+ 	int ml = b->margin[LEFT], mr = b->margin[RIGHT];
+ 	int v;
+ 
+ 	anchor_border_rect(b, &br);
++	anchor_bounds(a, b, &bounds);
+ 	memset(&e, 0, sizeof(e));
+ 	e.a = a;
+ 	e.box = b;
+-	e.def = def;
++	e.def = r->def;
+ 	*set_x = *set_y = false;
+ 
+ 	/* the vertical insets; flipped, bottom's rule places the top */
+ 	e.vertical = true;
+ 	e.flip = flip_v;
+-	if (css_computed_top(b->style, &l, &u) == CSS_TOP_AUTO &&
+-			css_computed_anchor_top(b->style, &s) ==
+-				CSS_ANCHOR_TOP_SET && s != NULL) {
++	if (r->side[SIDE_TOP] != NULL) {
+ 		e.far = false;
+-		if (anchor_eval_text(&e, s, &v)) {
++		if (anchor_eval_text(&e, r->side[SIDE_TOP], &v)) {
+ 			*ny = flip_v ? v - br.h - mb : v + mt;
+ 			*set_y = true;
+ 		}
+-	} else if (css_computed_bottom(b->style, &l, &u) == CSS_BOTTOM_AUTO &&
+-			css_computed_anchor_bottom(b->style, &s) ==
+-				CSS_ANCHOR_BOTTOM_SET && s != NULL) {
++	} else if (r->side[SIDE_BOTTOM] != NULL) {
+ 		e.far = true;
+-		if (anchor_eval_text(&e, s, &v)) {
++		if (anchor_eval_text(&e, r->side[SIDE_BOTTOM], &v)) {
+ 			*ny = flip_v ? v + mt : v - br.h - mb;
+ 			*set_y = true;
+ 		}
+@@ -700,122 +934,163 @@ static bool anchor_place(struct anchor_ctx *a, struct box *b,
+ 
+ 	e.vertical = false;
+ 	e.flip = flip_h;
+-	if (css_computed_left(b->style, &l, &u) == CSS_LEFT_AUTO &&
+-			css_computed_anchor_left(b->style, &s) ==
+-				CSS_ANCHOR_LEFT_SET && s != NULL) {
++	if (r->side[SIDE_LEFT] != NULL) {
+ 		e.far = false;
+-		if (anchor_eval_text(&e, s, &v)) {
++		if (anchor_eval_text(&e, r->side[SIDE_LEFT], &v)) {
+ 			*nx = flip_h ? v - br.w - mr : v + ml;
+ 			*set_x = true;
+ 		}
+-	} else if (css_computed_right(b->style, &l, &u) == CSS_RIGHT_AUTO &&
+-			css_computed_anchor_right(b->style, &s) ==
+-				CSS_ANCHOR_RIGHT_SET && s != NULL) {
++	} else if (r->side[SIDE_RIGHT] != NULL) {
+ 		e.far = true;
+-		if (anchor_eval_text(&e, s, &v)) {
++		if (anchor_eval_text(&e, r->side[SIDE_RIGHT], &v)) {
+ 			*nx = flip_h ? v + ml : v - br.w - mr;
+ 			*set_x = true;
+ 		}
+ 	}
+ 
++	if (r->def == NULL)
++		return *set_x || *set_y;
++	anchor_border_rect(r->def, &ar);
++
+ 	/* position-area, for an axis the insets left alone */
+-	if (def != NULL && (!*set_x || !*set_y) &&
+-			css_computed_position_area(b->style, &s) ==
+-				CSS_POSITION_AREA_SET && s != NULL) {
+-		char w1[32] = "", w2[32] = "";
+-		const char *wv = NULL, *wh = NULL;
+-		struct anchor_rect ar;
+-
+-		if (sscanf(lwc_string_data(s), "%31s %31s", w1, w2) < 1)
+-			return *set_x || *set_y;
+-		if (w2[0] == '\0') {
+-			int ax = anchor_area_axis_of(w1);
+-
+-			if (ax == 1)
+-				wv = w1;
+-			else if (ax == 0)
+-				wh = w1;
+-			else
+-				wv = wh = w1;	/* center, span-all */
+-		} else {
+-			int a1 = anchor_area_axis_of(w1);
+-			int a2 = anchor_area_axis_of(w2);
+-
+-			/* the first is the block axis unless it says
+-			 * otherwise, or the second does */
+-			if (a1 == 0 || a2 == 1) {
+-				wh = w1;
+-				wv = w2;
+-			} else {
+-				wv = w1;
+-				wh = w2;
++	if ((!*set_x || !*set_y) && r->area != NULL) {
++		char w1[32], w2[32];
++		const char *wv, *wh;
++		enum area_kind kv, kh;
++
++		anchor_area_words(r->area, w1, w2, &wv, &wh);
++		kv = anchor_area_kind(wv, true, flip_v);
++		kh = anchor_area_kind(wh, false, flip_h);
++		if (!*set_x) {
++			/* an auto width is no wider than its area */
++			int room = anchor_area_room(kh, ar.x, ar.w,
++					bounds.x, bounds.x + bounds.w);
++			css_fixed l = 0;
++			css_unit u = CSS_UNIT_PX;
++
++			if (room > 0 && br.w + ml + mr > room &&
++					css_computed_width(b->style, &l, &u) ==
++						CSS_WIDTH_AUTO) {
++				int w = room - ml - mr - b->padding[LEFT] -
++						b->padding[RIGHT] -
++						b->border[LEFT].width -
++						b->border[RIGHT].width;
++
++				if (w > 0 && w < b->width) {
++					b->width = w;
++					anchor_relayout(a->content, b);
++					anchor_border_rect(b, &br);
++				}
+ 			}
+ 		}
+-		anchor_border_rect(def, &ar);
+ 		if (!*set_y) {
+-			*ny = anchor_area_axis(wv, true, flip_v, ar.y, ar.h,
++			*ny = anchor_area_axis(kv, ar.y, ar.h,
+ 					br.h + mt + mb) + mt;
+ 			*set_y = true;
+ 		}
+ 		if (!*set_x) {
+-			*nx = anchor_area_axis(wh, false, flip_h, ar.x, ar.w,
++			*nx = anchor_area_axis(kh, ar.x, ar.w,
+ 					br.w + ml + mr) + ml;
+ 			*set_x = true;
+ 		}
+ 	}
++
++	/* anchor-center: centred on the anchor, along an axis nothing
++	 * else placed it on */
++	if (!*set_y && r->center_v) {
++		*ny = ar.y + (ar.h - (br.h + mt + mb)) / 2 + mt;
++		*set_y = true;
++	}
++	if (!*set_x && r->center_h) {
++		*nx = ar.x + (ar.w - (br.w + ml + mr)) / 2 + ml;
++		*set_x = true;
++	}
+ 	return *set_x || *set_y;
+ }
+ 
+-/** Whether a box placed at x, y stays on the page. */
++/** Whether a box placed at x, y stays within its bounds. */
+ static bool anchor_fits(struct anchor_ctx *a, struct box *b, int x, int y,
+ 		bool set_x, bool set_y)
+ {
+-	struct anchor_rect br;
++	struct anchor_rect br, bounds;
+ 
+ 	anchor_border_rect(b, &br);
+-	if (set_x && (x < 0 || x + br.w > a->doc_w))
++	anchor_bounds(a, b, &bounds);
++	if (set_x && (x < bounds.x || x + br.w > bounds.x + bounds.w))
+ 		return false;
+-	if (set_y && (y < 0 || y + br.h > a->doc_h))
++	if (set_y && (y < bounds.y || y + br.h > bounds.y + bounds.h))
+ 		return false;
+ 	return true;
+ }
+ 
+-static void anchor_box(struct anchor_ctx *a, struct box *b)
++/** Make a box's ancestors' painted extents take in where it is now. */
++static void anchor_extend(struct box *b)
+ {
+-	struct box *def = anchor_default(a, b);
++	int x0 = b->descendant_x0, y0 = b->descendant_y0;
++	int x1 = b->descendant_x1, y1 = b->descendant_y1;
++	struct box *c = b;
++
++	while (c->parent != NULL) {
++		struct box *p = c->parent;
++
++		x0 += c->x;
++		x1 += c->x;
++		y0 += c->y;
++		y1 += c->y;
++		if (x0 < p->descendant_x0) p->descendant_x0 = x0;
++		if (y0 < p->descendant_y0) p->descendant_y0 = y0;
++		if (x1 > p->descendant_x1) p->descendant_x1 = x1;
++		if (y1 > p->descendant_y1) p->descendant_y1 = y1;
++		x0 = p->descendant_x0;
++		x1 = p->descendant_x1;
++		y0 = p->descendant_y0;
++		y1 = p->descendant_y1;
++		c = p;
++	}
++}
++
++/** Place a box; whether it moved. */
++static bool anchor_box(struct anchor_ctx *a, struct box *b)
++{
++	struct anchor_rules own;
+ 	lwc_string *s = NULL;
+ 	css_fixed l = 0;
+ 	css_unit u = CSS_UNIT_PX;
+ 	struct anchor_eval e;
+ 	struct anchor_rect br;
+-	int nx = 0, ny = 0, v;
++	int nx = 0, ny = 0, v, dx, dy;
+ 	bool sx = false, sy = false;
+ 
++	anchor_rules_own(a, b, &own);
+ 	memset(&e, 0, sizeof(e));
+ 	e.a = a;
+ 	e.box = b;
+-	e.def = def;
++	e.def = own.def;
+ 
+ 	/* its size first: anchor-size() in width and height */
+ 	if (css_computed_width(b->style, &l, &u) == CSS_WIDTH_AUTO &&
+ 			css_computed_anchor_width(b->style, &s) ==
+ 				CSS_ANCHOR_WIDTH_SET && s != NULL) {
+ 		e.vertical = false;
+-		if (anchor_eval_text(&e, s, &v) && v >= 0) {
++		if (anchor_eval_text(&e, lwc_string_data(s), &v) && v >= 0) {
+ 			if (css_computed_box_sizing(b->style) ==
+ 					CSS_BOX_SIZING_BORDER_BOX)
+ 				v -= b->padding[LEFT] + b->padding[RIGHT] +
+ 						b->border[LEFT].width +
+ 						b->border[RIGHT].width;
+-			b->width = v < 0 ? 0 : v;
+-			anchor_relayout(a->content, b);
++			if (v < 0)
++				v = 0;
++			if (v != b->width) {
++				b->width = v;
++				anchor_relayout(a->content, b);
++			}
+ 		}
+ 	}
+ 	if (css_computed_height(b->style, &l, &u) == CSS_HEIGHT_AUTO &&
+ 			css_computed_anchor_height(b->style, &s) ==
+ 				CSS_ANCHOR_HEIGHT_SET && s != NULL) {
+ 		e.vertical = true;
+-		if (anchor_eval_text(&e, s, &v) && v >= 0) {
++		if (anchor_eval_text(&e, lwc_string_data(s), &v) && v >= 0) {
+ 			if (css_computed_box_sizing(b->style) ==
+ 					CSS_BOX_SIZING_BORDER_BOX)
+ 				v -= b->padding[TOP] + b->padding[BOTTOM] +
+@@ -826,8 +1101,8 @@ static void anchor_box(struct anchor_ctx *a, struct box *b)
+ 	}
+ 
+ 	/* where it goes, trying the fallbacks when it would not fit */
+-	if (!anchor_place(a, b, def, false, false, &nx, &ny, &sx, &sy))
+-		return;
++	if (!anchor_place(a, b, &own, false, false, &nx, &ny, &sx, &sy))
++		return false;
+ 	if (!anchor_fits(a, b, nx, ny, sx, sy) &&
+ 			css_computed_position_try(b->style, &s) ==
+ 				CSS_POSITION_TRY_SET && s != NULL) {
+@@ -836,9 +1111,11 @@ static void anchor_box(struct anchor_ctx *a, struct box *b)
+ 		while (*p != '\0') {
+ 			size_t n = strcspn(p, ",");
+ 			char opt[96];
++			const char *name;
+ 			bool fv, fh;
+ 			int tx = 0, ty = 0;
+ 			bool tsx, tsy;
++			struct anchor_rules tr;
+ 
+ 			if (n >= sizeof(opt))
+ 				n = sizeof(opt) - 1;
+@@ -848,8 +1125,36 @@ static void anchor_box(struct anchor_ctx *a, struct box *b)
+ 					strstr(opt, "flip-start") != NULL;
+ 			fh = strstr(opt, "flip-inline") != NULL ||
+ 					strstr(opt, "flip-start") != NULL;
+-			if ((fv || fh) && anchor_place(a, b, def, fv, fh,
+-					&tx, &ty, &tsx, &tsy) &&
++			tr = own;
++			/* the pointers into own's copies stay valid, as
++			 * own is not changed while tr is used */
++			name = strstr(opt, "--");
++			if (name != NULL) {
++				size_t nl = strcspn(name, " ");
++				const char *text = css_position_try_rule(name,
++						nl);
++
++				if (text != NULL)
++					anchor_rules_try(a, b, text, &tr);
++			} else if (strncmp(opt, "top", 3) == 0 ||
++					strncmp(opt, "bottom", 6) == 0 ||
++					strncmp(opt, "left", 4) == 0 ||
++					strncmp(opt, "right", 5) == 0 ||
++					strncmp(opt, "center", 6) == 0 ||
++					strncmp(opt, "span-", 5) == 0 ||
++					strncmp(opt, "block-", 6) == 0 ||
++					strncmp(opt, "inline-", 7) == 0) {
++				/* a position-area as a fallback */
++				if (n < sizeof(tr.area_buf)) {
++					memcpy(tr.area_buf, opt, n + 1);
++					tr.area = tr.area_buf;
++					tr.side[0] = tr.side[1] =
++						tr.side[2] = tr.side[3] = NULL;
++				}
++			}
++			if ((name != NULL || fv || fh || tr.area != own.area) &&
++					anchor_place(a, b, &tr, fv, fh, &tx,
++						&ty, &tsx, &tsy) &&
+ 					anchor_fits(a, b, tx, ty, tsx, tsy)) {
+ 				nx = tx;
+ 				ny = ty;
+@@ -867,18 +1172,26 @@ static void anchor_box(struct anchor_ctx *a, struct box *b)
+ 
+ 	/* moved by the difference: its children go with it */
+ 	anchor_border_rect(b, &br);
+-	if (sx)
+-		b->x += nx - br.x;
+-	if (sy)
+-		b->y += ny - br.y;
++	dx = sx ? nx - br.x : 0;
++	dy = sy ? ny - br.y : 0;
++	b->x += dx;
++	b->y += dy;
+ 	b->flags |= ANCHORED;
++	return dx != 0 || dy != 0;
+ }
+ 
+-/* exported interface documented in html/layout_internal.h */
+-void layout_anchor(html_content *content, struct box *doc)
++/**
++ * Place every box that asks to be, from the laid-out anchors.
++ *
++ * \param extend  make the ancestors' painted extents take the boxes in,
++ *                which layout does itself when this runs within it
++ * \return whether any box moved
++ */
++static bool anchor_run(html_content *content, struct box *doc, bool extend)
+ {
+ 	struct anchor_ctx a;
+ 	unsigned i;
++	bool moved = false;
+ 
+ 	memset(&a, 0, sizeof(a));
+ 	a.content = content;
+@@ -891,10 +1204,32 @@ void layout_anchor(html_content *content, struct box *doc)
+ 
+ 	anchor_walk(&a, doc, 0);
+ 	/* in tree order, so a box placed first can be an anchor after */
+-	for (i = 0; i < a.n_anchored; i++)
+-		anchor_box(&a, a.anchored[i]);
++	for (i = 0; i < a.n_anchored; i++) {
++		if (anchor_box(&a, a.anchored[i]))
++			moved = true;
++		if (extend)
++			anchor_extend(a.anchored[i]);
++	}
++	content->anchored_any = a.n_anchored > 0;
++	content->anchor_view_x = content->view_x;
++	content->anchor_view_y = content->view_y;
+ 
+ 	free(a.names);
+ 	free(a.inv);
+ 	free(a.anchored);
++	return moved;
++}
++
++/* exported interface documented in html/layout_internal.h */
++void layout_anchor(html_content *content, struct box *doc)
++{
++	anchor_run(content, doc, false);
++}
++
++/* exported interface documented in html/layout_internal.h */
++bool layout_anchor_again(html_content *content)
++{
++	if (!content->anchored_any || content->layout == NULL)
++		return false;
++	return anchor_run(content, content->layout, true);
+ }
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index ad50d89cd..9a1a1aeca 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -89,6 +89,14 @@ bool layout_table(
+  */
+ void layout_anchor(struct html_content *content, struct box *doc);
+ 
++/**
++ * Place the anchored boxes again, after a scroll (VitaSurf).
++ *
++ * \param content  the document
++ * \return whether any box moved, and so wants drawing again
++ */
++bool layout_anchor_again(struct html_content *content);
++
+ bool layout_flex(
+ 		struct box *flex,
+ 		int available_width,
+@@ -424,6 +432,9 @@ static inline enum css_align_self_e lh__box_align_self(
+ 	if (align_self == CSS_ALIGN_SELF_AUTO) {
+ 		align_self = css_computed_align_items(flex->style);
+ 	}
++	/* anchor-center is centre in a flex line or grid area (VitaSurf) */
++	if (align_self == CSS_ALIGN_SELF_ANCHOR_CENTER)
++		align_self = CSS_ALIGN_SELF_CENTER;
+ 
+ 	return align_self;
+ }
+@@ -442,6 +453,8 @@ static inline enum css_justify_self_e lh__box_justify_self(
+ 		j = (enum css_justify_self_e)
+ 				css_computed_justify_items(grid->style);
+ 	}
++	if (j == CSS_JUSTIFY_SELF_ANCHOR_CENTER)
++		j = CSS_JUSTIFY_SELF_CENTER;
+ 
+ 	return j;
+ }
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 3f3f2f7fb..28e514598 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -324,6 +324,10 @@ typedef struct html_content {
+ 	/** the pieces of the blocks split across columns, in the
+ 	 * columns after the first, which are painted with each block's
+ 	 * background and side borders (VitaSurf) */
++	/** boxes were placed against anchors in the last layout, and
++	 * where the viewport was when they were (VitaSurf) */
++	bool anchored_any;
++	int anchor_view_x, anchor_view_y;
+ 	struct html_multicol_piece *mc_pieces;
+ 	unsigned int n_mc_pieces, mc_pieces_alloc;
+ 	struct html_container_size *csizes;
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 1cbf95b8d..44ddcc340 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -64,6 +64,7 @@
+ #include "html/font.h"
+ #include "html/form_internal.h"
+ #include "html/private.h"
++#include "html/layout_internal.h"
+ #include "html/layout.h"
+ #include "html/bidi.h"
+ 
+@@ -7088,6 +7089,20 @@ static bool html_redraw_content(struct content *c,
+ 	html->view_w = data->view_w;
+ 	html->view_origin_x = data->x;
+ 
++	/* a fixed box placed against an anchor flips at the viewport's
++	 * edges, so where the viewport is now may move it (VitaSurf) */
++	if (html->anchored_any && html->view_h > 0 && ctx->interactive &&
++			(html->view_x != html->anchor_view_x ||
++			 html->view_y != html->anchor_view_y) &&
++			html->reflowing == false &&
++			layout_anchor_again(html) && html->layout != NULL) {
++		content__request_redraw(c, 0, 0,
++				html->layout->x + html->layout->width +
++				html->layout->descendant_x1,
++				html->layout->y + html->layout->height +
++				html->layout->descendant_y1);
++	}
++
+ 	box = html->layout;
+ 	if (box == NULL) {
+ 		/* No box tree: a rebuild from a script-modified document is

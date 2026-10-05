@@ -1,0 +1,177 @@
+diff --git a/include/dom/core/document.h b/include/dom/core/document.h
+index 6b22cbd..b7ab8a0 100644
+--- a/include/dom/core/document.h
++++ b/include/dom/core/document.h
+@@ -476,4 +476,10 @@ static inline dom_exception dom_document_set_quirks_mode(
+ #define dom_document_set_quirks_mode(d, q) \
+ 	dom_document_set_quirks_mode((dom_document *) (d), (q))
+ 
++/**
++ * How many nodes alive the document owns (VitaSurf): in its tree or not,
++ * attributes included, itself included.
++ */
++uint32_t dom_document_owned_nodes(dom_document *doc);
++
+ #endif
+diff --git a/include/dom/core/node.h b/include/dom/core/node.h
+index 8d63b5e..9912b4c 100644
+--- a/include/dom/core/node.h
++++ b/include/dom/core/node.h
+@@ -175,6 +175,12 @@ typedef struct dom_node_vtable {
+ 
+ /* The ref/unref methods define */
+ 
++/**
++ * How many nodes of every document are alive (VitaSurf): created and
++ * not yet finalised, whether or not anything still uses them.
++ */
++uint32_t dom_node_live_count(void);
++
+ static inline dom_node *dom_node_ref(dom_node *node)
+ {
+ 	if (node != NULL)
+diff --git a/src/core/document.c b/src/core/document.c
+index 7671f6a..f98224d 100644
+--- a/src/core/document.c
++++ b/src/core/document.c
+@@ -132,6 +132,7 @@ dom_exception _dom_document_initialise(dom_document *doc,
+ 	}
+ 
+ 	doc->nodelists = NULL;
++	doc->owned_nodes = 0;
+ 
+ 	err = _dom_node_initialise(&doc->base, doc, DOM_DOCUMENT_NODE,
+ 			name, NULL, NULL, NULL);
+@@ -307,8 +308,11 @@ bool _dom_document_finalise(dom_document *doc)
+ 	/* Ensure list of nodes pending deletion is empty. If not,
+ 	 * then we can't yet destroy the document (its destruction will
+ 	 * have to wait until the pending nodes are destroyed) */
+-	if (doc->pending_nodes.next != &doc->pending_nodes)
++	if (doc->pending_nodes.next != &doc->pending_nodes) {
++		/* finalised again once they go: count it once (VitaSurf) */
++		_dom_node_live_unfinalise();
+ 		return false;
++	}
+ 
+ 	/* Ok, the document tree is empty, as is the list of nodes pending
+ 	 * deletion. Therefore, it is safe to destroy the document. */
+@@ -1567,3 +1571,9 @@ void dom_document_quiet_mutations(struct dom_document *doc, int delta)
+ 	else
+ 		doc->quiet_mutations += delta;
+ }
++
++/* exported interface documented in dom/core/document.h */
++uint32_t dom_document_owned_nodes(dom_document *doc)
++{
++	return doc != NULL ? doc->owned_nodes : 0;
++}
+diff --git a/src/core/document.h b/src/core/document.h
+index ea0f3ed..f3f0c1d 100644
+--- a/src/core/document.h
++++ b/src/core/document.h
+@@ -50,6 +50,8 @@ struct dom_document {
+ 	struct list_entry pending_nodes;
+ 			/**< The deletion pending list */
+ 
++	uint32_t owned_nodes;	/**< nodes alive it owns (VitaSurf) */
++
+ 	dom_string *id_name;		/**< The ID attribute's name */
+ 
+ 	dom_string *class_string;	/**< The string "class". */
+diff --git a/src/core/node.c b/src/core/node.c
+index 184755f..9a592fb 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -143,12 +143,31 @@ void _dom_node_destroy(struct dom_node_internal *node)
+  * ::name, ::value, ::namespace, and ::prefix  will have their reference 
+  * counts increased.
+  */
++/* nodes alive, for a client's memory report (VitaSurf) */
++static uint32_t dom_nodes_live;
++
++/* exported interface documented in dom/core/node.h */
++uint32_t dom_node_live_count(void)
++{
++	return dom_nodes_live;
++}
++
++/* A node finalised that will be finalised again (VitaSurf): a document
++ * with nodes still pending deletion is. */
++void _dom_node_live_unfinalise(void)
++{
++	dom_nodes_live++;
++}
++
+ dom_exception _dom_node_initialise(dom_node_internal *node,
+ 		struct dom_document *doc, dom_node_type type,
+ 		dom_string *name, dom_string *value,
+ 		dom_string *namespace, dom_string *prefix)
+ {
++	dom_nodes_live++;
+ 	node->owner = doc;
++	if (doc != NULL)
++		doc->owned_nodes++;
+ 
+ 	if (name != NULL)
+ 		node->name = dom_string_ref(name);
+@@ -228,6 +247,12 @@ void _dom_node_finalise(dom_node_internal *node)
+ 	struct dom_node_internal *p;
+ 	struct dom_node_internal *n = NULL;
+ 
++	dom_nodes_live--;
++	if (node->owner != NULL &&
++			node != (dom_node_internal *) node->owner &&
++			node->owner->owned_nodes > 0)
++		node->owner->owned_nodes--;
++
+ 	/* Destroy user data */
+ 	for (u = node->user_data; u != NULL; u = v) {
+ 		v = u->next;
+@@ -744,7 +769,10 @@ static void adopt_one(dom_node_internal *n, void *pw)
+ 	if (n->owner != to && n->type != DOM_DOCUMENT_NODE) {
+ 		if (pending)
+ 			list_del(&n->pending_list);
++		if (n->owner != NULL && n->owner->owned_nodes > 0)
++			n->owner->owned_nodes--;
+ 		n->owner = to;
++		to->owned_nodes++;
+ 		if (pending)
+ 			list_append(&to->pending_nodes, &n->pending_list);
+ 	}
+@@ -891,6 +919,7 @@ dom_exception _dom_node_insert_before(dom_node_internal *node,
+ 		/* See long comment in _dom_node_initialise as to why 
+ 		 * we don't ref the document here */
+ 		new_child->owner = (struct dom_document *) node;
++		((struct dom_document *) node)->owned_nodes++;
+ 	}
+ 
+ 	/** \todo Is it correct to return DocumentFragments? */
+@@ -1987,6 +2016,8 @@ dom_exception _dom_node_copy(dom_node_internal *old, dom_node_internal **copy)
+ dom_exception _dom_node_copy_internal(dom_node_internal *old, 
+ 		dom_node_internal *new)
+ {
++	/* a copy is finalised like any other node (VitaSurf) */
++	dom_nodes_live++;
+ 	new->base.vtable = old->base.vtable;
+ 	new->vtable = old->vtable;
+ 
+@@ -2004,6 +2035,7 @@ dom_exception _dom_node_copy_internal(dom_node_internal *old,
+ 	assert(old->owner != NULL);
+ 
+ 	new->owner = old->owner;
++	new->owner->owned_nodes++;
+ 
+ 	if (old->namespace != NULL)
+ 		new->namespace = dom_string_ref(old->namespace);
+diff --git a/src/core/node.h b/src/core/node.h
+index 91f0ec1..4d79edf 100644
+--- a/src/core/node.h
++++ b/src/core/node.h
+@@ -93,6 +93,7 @@ dom_exception _dom_node_initialise(struct dom_node_internal *node,
+ 		dom_string *namespace, dom_string *prefix);
+ 
+ void _dom_node_finalise(dom_node_internal *node);
++void _dom_node_live_unfinalise(void);
+ 
+ bool _dom_node_readonly_owner(const dom_node_internal *node);
+ bool _dom_node_readonly(const dom_node_internal *node);

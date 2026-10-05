@@ -38,18 +38,7 @@ TOOLCHAIN="$VITASDK/share/vita.toolchain.cmake"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# Anything the Vita links has to be ordinary position dependent code.
-# vita-elf-create reads the relocations the linker kept (-Wl,-q) and
-# knows only a fixed set of them; a GOT one stops it with "Invalid
-# relocation type 25", which is R_ARM_BASE_PREL, and no VPK is built.
-no_pic_relocations() {
-    if "$VITASDK/bin/arm-vita-eabi-readelf" -r "$1" |
-            grep -q 'R_ARM_GOT_BREL\|R_ARM_BASE_PREL'; then
-        echo "$(basename "$1") was built position independent; " \
-             "vita-elf-create will refuse its relocations" >&2
-        exit 1
-    fi
-}
+# no_pic_relocations comes from vita-env.sh.
 
 echo "==== brotli $BROTLI_TAG"
 git clone --depth 1 --branch "$BROTLI_TAG" https://github.com/google/brotli \

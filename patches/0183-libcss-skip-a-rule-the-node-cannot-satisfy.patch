@@ -1,0 +1,340 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 906d26c..70989ff 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -158,8 +158,37 @@ typedef struct css_select_handler {
+ 	 */
+ 	css_error (*first_child_node)(void *pw, void *node, void **child);
+ 	css_error (*next_sibling_node)(void *pw, void *node, void **sibling);
++	/**
++	 * The names of the attributes this node carries, as a bloom
++	 * (VitaSurf). A rule whose key compound needs an attribute
++	 * cannot match a node that has no such attribute, and a bloom
++	 * says so without a call per rule.
++	 *
++	 * Build the value by OR-ing css_attribute_bloom_bits() over
++	 * every attribute name on the node. Leave the pointer NULL, or
++	 * answer anything but CSS_OK, and no rule is skipped: the
++	 * filter is an optimisation and never a source of truth.
++	 *
++	 * At the end of the structure so a handler written against the
++	 * earlier layout still initialises.
++	 */
++	css_error (*node_attribute_bloom)(void *pw, void *node,
++			uint64_t *bloom);
+ } css_select_handler;
+ 
++/**
++ * The bits an attribute name contributes to the node bloom above.
++ *
++ * Case-insensitive over ASCII, since HTML attribute names are, and
++ * over the local name only, so a namespaced attribute lands with its
++ * unqualified twin and the filter errs towards keeping rules.
++ *
++ * \param name  The attribute's local name
++ * \param len   Its length in bytes
++ * \return the bits to OR into the node's bloom
++ */
++uint64_t css_attribute_bloom_bits(const char *name, size_t len);
++
+ /**
+  * Font face selection result set
+  */
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 7e8f8d3..74a42e8 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -9,6 +9,7 @@
+ #include <string.h>
+ 
+ #include <libcss/hint.h>
++#include <libcss/select.h>
+ 
+ #include "stylesheet.h"
+ #include "select/hash.h"
+@@ -22,6 +23,9 @@ typedef struct hash_entry {
+ 	css_bloom sel_chain_bloom[CSS_BLOOM_SIZE];
+ 	/* CSS_NODE_STATE_* the key compound needs, 0 for none (VitaSurf) */
+ 	uint32_t needs_state;
++	/* the attribute names the key compound needs, 0 for none
++	 * (VitaSurf) */
++	uint64_t needs_attrs;
+ 	struct hash_entry *next;
+ } hash_entry;
+ 
+@@ -46,6 +50,16 @@ struct css_selector_hash {
+ 
+ static hash_entry empty_slot;
+ 
++/*
++ * How many chain entries were looked at (VitaSurf). Defined in
++ * select.c beside the rest of the selection counters; declared here
++ * because the walking is done here.
++ */
++extern unsigned int css_select_steps_element;
++extern unsigned int css_select_steps_class;
++extern unsigned int css_select_steps_id;
++extern unsigned int css_select_steps_universal;
++
+ /**
+  * Whether a key compound can only match the document root (VitaSurf).
+  *
+@@ -75,6 +89,73 @@ static uint32_t _state_needed(const css_selector *selector)
+ 	return 0;
+ }
+ 
++/*
++ * The attribute names a rule's key compound insists on (VitaSurf).
++ *
++ * 94% of the candidates a GitHub page offers come out of the universal
++ * chain, where a rule like [data-view-component] is handed to every
++ * element there is and then refused on its first detail. The names it
++ * needs are known when it is filed, and the names a node has are asked
++ * for once per node, so most of that can be settled with an and.
++ *
++ * Every name in the compound is OR-ed in, because they must all be
++ * present for the compound to match, so the test stays "every bit the
++ * rule wants is a bit the node has". A negated detail asks for the
++ * absence of an attribute and so says nothing about what the node
++ * carries; those are left out.
++ */
++uint64_t css_attribute_bloom_bits(const char *name, size_t len)
++{
++	uint32_t h = 2166136261u;
++	size_t i;
++
++	for (i = 0; i < len; i++) {
++		unsigned char c = (unsigned char) name[i];
++
++		if (c >= 'A' && c <= 'Z')
++			c = (unsigned char) (c + ('a' - 'A'));
++		h ^= c;
++		h *= 16777619u;
++	}
++
++	return (1ull << (h & 63)) | (1ull << ((h >> 8) & 63));
++}
++
++static uint64_t _attrs_needed(const css_selector *selector)
++{
++	const css_selector_detail *d = &selector->data;
++	uint64_t bits = 0;
++
++	do {
++		switch (d->type) {
++		case CSS_SELECTOR_ATTRIBUTE:
++		case CSS_SELECTOR_ATTRIBUTE_EQUAL:
++		case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
++		case CSS_SELECTOR_ATTRIBUTE_INCLUDES:
++		case CSS_SELECTOR_ATTRIBUTE_PREFIX:
++		case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
++		case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
++			if (d->negate == 0 && d->qname.name != NULL) {
++				bits |= css_attribute_bloom_bits(
++					lwc_string_data(d->qname.name),
++					lwc_string_length(d->qname.name));
++			}
++			break;
++		default:
++			break;
++		}
++	} while (d->next != 0 && (d = d + 1) != NULL);
++
++	return bits;
++}
++
++/** Whether a filed rule can be skipped for this node outright. */
++#define RULE_WANTS_WHAT_NODE_HAS(e, req) \
++	(((e)->needs_state == 0 || \
++	  ((req)->node_state & (e)->needs_state) != 0) && \
++	 ((e)->needs_attrs == 0 || \
++	  ((req)->attr_bloom & (e)->needs_attrs) == (e)->needs_attrs))
++
+ static inline lwc_string *_class_name(const css_selector *selector);
+ static inline lwc_string *_id_name(const css_selector *selector);
+ static css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+@@ -452,6 +533,7 @@ css_error css__selector_hash_find(css_selector_hash *hash,
+ 	if (head->sel != NULL) {
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
++			css_select_steps_element++;
+ 			lwc_error lerror;
+ 			bool match = false;
+ 
+@@ -525,6 +607,7 @@ css_error css__selector_hash_find_by_class(css_selector_hash *hash,
+ 	if (head->sel != NULL) {
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
++			css_select_steps_class++;
+ 			lwc_error lerror;
+ 			lwc_string *n;
+ 			bool match = false;
+@@ -607,6 +690,7 @@ css_error css__selector_hash_find_by_id(css_selector_hash *hash,
+ 	if (head->sel != NULL) {
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
++			css_select_steps_id++;
+ 			lwc_error lerror;
+ 			lwc_string *n;
+ 			bool match = false;
+@@ -676,13 +760,13 @@ css_error css__selector_hash_find_universal(css_selector_hash *hash,
+ 	if (head->sel != NULL) {
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
++			css_select_steps_universal++;
+ 			if (RULE_HAS_BYTECODE(head) &&
+-			    /* only the root can match a :root compound
+-			     * (VitaSurf) -- this loop finds the first
+-			     * entry and _iterate_universal the rest, so
+-			     * both need the test */
+-			    (head->needs_state == 0 ||
+-			     (req->node_state & head->needs_state) != 0) &&
++			    /* a rule the node cannot satisfy is never
++			     * offered (VitaSurf) -- this loop finds the
++			     * first entry and _iterate_universal the
++			     * rest, so both need the test */
++			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+ 			    css_bloom_in_bloom(
+ 					head->sel_chain_bloom,
+ 					req->node_bloom) &&
+@@ -900,6 +984,7 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ 		head->next = NULL;
+ 		_chain_bloom_generate(selector, head->sel_chain_bloom);
+ 		head->needs_state = _state_needed(selector);
++		head->needs_attrs = _attrs_needed(selector);
+ 
+ #ifdef PRINT_CHAIN_BLOOM_DETAILS
+ 		print_chain_bloom_details(head->sel_chain_bloom);
+@@ -940,6 +1025,7 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ 		entry->sel = selector;
+ 		_chain_bloom_generate(selector, entry->sel_chain_bloom);
+ 		entry->needs_state = _state_needed(selector);
++		entry->needs_attrs = _attrs_needed(selector);
+ 
+ #ifdef PRINT_CHAIN_BLOOM_DETAILS
+ 		print_chain_bloom_details(entry->sel_chain_bloom);
+@@ -1023,6 +1109,7 @@ css_error _iterate_elements(
+ 	if (head != NULL && head->sel != NULL) {
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
++			css_select_steps_element++;
+ 			lerror = lwc_string_caseless_isequal(name,
+ 					head->sel->data.qname.name, &match);
+ 			if (lerror != lwc_error_ok)
+@@ -1076,6 +1163,7 @@ css_error _iterate_classes(
+ 	if (head != NULL && head->sel != NULL) {
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
++			css_select_steps_class++;
+ 			name = _class_name(head->sel);
+ 
+ 			if (name != NULL) {
+@@ -1139,6 +1227,7 @@ css_error _iterate_ids(
+ 	if (head != NULL && head->sel != NULL) {
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
++			css_select_steps_id++;
+ 			name = _id_name(head->sel);
+ 
+ 			if (name != NULL) {
+@@ -1197,11 +1286,11 @@ css_error _iterate_universal(
+ 	if (head != NULL && head->sel != NULL) {
+ 		/* Search through chain for first match */
+ 		while (head != NULL) {
++			css_select_steps_universal++;
+ 			if (RULE_HAS_BYTECODE(head) &&
+-			    /* only the root can match a :root compound
+-			     * (VitaSurf) */
+-			    (head->needs_state == 0 ||
+-			     (req->node_state & head->needs_state) != 0) &&
++			    /* a rule the node cannot satisfy is never
++			     * offered (VitaSurf) */
++			    RULE_WANTS_WHAT_NODE_HAS(head, req) &&
+ 			    css_bloom_in_bloom(
+ 					head->sel_chain_bloom,
+ 					req->node_bloom) &&
+diff --git a/src/select/hash.h b/src/select/hash.h
+index 2449748..3ccfd6a 100644
+--- a/src/select/hash.h
++++ b/src/select/hash.h
+@@ -61,6 +61,7 @@ struct css_hash_selection_requirments {
+ 	const css_unit_ctx *unit_ctx;	/* Document unit conversion context. */
+ 	const css_bloom *node_bloom;	/* Node's bloom filter */
+ 	uint32_t node_state;		/* CSS_NODE_STATE_* the node is in */
++	uint64_t attr_bloom;		/* names of the node's attributes */
+ };
+ 
+ typedef css_error (*css_selector_hash_iterator)(
+diff --git a/src/select/select.c b/src/select/select.c
+index f5f01c1..625a248 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -140,6 +140,21 @@ unsigned int css_select_from_element;
+ unsigned int css_select_from_class;
+ unsigned int css_select_from_id;
+ unsigned int css_select_from_universal;
++/*
++ * And how many entries had to be looked at to find them (VitaSurf).
++ * The chains are linked lists, and the universal one is walked from
++ * end to end for every element in every sheet, whether or not anything
++ * in it can match: a GitHub load files 6067 rules as universal and
++ * selects for 6270 elements, so if that is one list the walk alone is
++ * tens of millions of steps and no amount of filtering per entry can
++ * help -- only a narrower index can. Counting the steps beside the
++ * candidates says which it is: candidates near steps means the chain
++ * is doing its job, steps far above means the walk is the cost.
++ */
++unsigned int css_select_steps_element;
++unsigned int css_select_steps_class;
++unsigned int css_select_steps_id;
++unsigned int css_select_steps_universal;
+ /*
+  * And where a candidate dies (VitaSurf). 16.9 million are offered on a
+  * GitHub load and 99.6% come out of the universal chain, but only 1.07
+@@ -1592,6 +1607,20 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		}
+ 	}
+ 
++	/*
++	 * And the names of its attributes, for the same reason and at
++	 * the same cost of one call (VitaSurf). A handler that does not
++	 * offer them, or cannot answer, leaves every bit set so that
++	 * nothing is skipped.
++	 */
++	state.attr_bloom = ~(uint64_t) 0;
++	if (handler->node_attribute_bloom != NULL) {
++		uint64_t bloom = 0;
++
++		if (handler->node_attribute_bloom(pw, node, &bloom) == CSS_OK)
++			state.attr_bloom = bloom;
++	}
++
+ 	/* Fetch presentational hints */
+ 	error = handler->node_presentational_hint(pw, node, &nhints, &hints);
+ 	if (error != CSS_OK)
+@@ -2364,6 +2393,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 	req.node_bloom = state->node_data->bloom;
+ 	req.str = &ctx->str;
+ 	req.node_state = state->node_state;
++	req.attr_bloom = state->attr_bloom;
+ 
+ 	/* Find hash chain that applies to current node */
+ 	req.qname = state->element;
+diff --git a/src/select/select.h b/src/select/select.h
+index dc50753..e072336 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -72,6 +72,13 @@ typedef struct css_select_state {
+ 	/* CSS_NODE_STATE_*, asked once rather than per candidate
+ 	 * (VitaSurf) */
+ 	uint32_t node_state;
++	/*
++	 * The names of the node's attributes, as a bloom (VitaSurf).
++	 * Asked for once per node and handed to every sheet, so that a
++	 * rule needing an attribute the node has not got is never
++	 * offered. All ones when the handler cannot say.
++	 */
++	uint64_t attr_bloom;
+ 	const css_media *media;		/* Currently active media spec */
+ 	const css_unit_ctx *unit_ctx;	/* Unit conversion context. */
+ 	css_select_results *results;	/* Result set to populate */

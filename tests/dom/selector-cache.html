@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!-- The selector engine used to parse its selector string on every
+     call: querySelector, matches and closest each compiled afresh, and
+     closest did so once per ancestor. A GitHub hydration job spent its
+     whole budget in that parser. Compiled selectors are cached now.
+     Asserted on results, since a stale or shared cache entry would show
+     as a wrong answer; and timed, so the log carries a number. -->
+<html><head><meta charset="utf-8"><title>selector cache</title></head>
+<body>
+<div id="root" class="a">
+  <section data-x="1" class="b"><span class="c">1</span><span class="d">2</span></section>
+  <section data-x="2"><span class="c">3</span></section>
+</div>
+<script>
+function ok(n,c){console.log((c?"PASS ":"FAIL ")+n);}
+var root = document.getElementById("root");
+var spans = root.querySelectorAll("span");
+
+/* the same selector twice, and a different one between, must answer
+   the same each time */
+ok("querySelectorAll answers the same twice",
+   root.querySelectorAll("section[data-x] > .c").length === 2 &&
+   root.querySelectorAll(".d").length === 1 &&
+   root.querySelectorAll("section[data-x] > .c").length === 2);
+ok(":not() inside a cached selector still works",
+   root.querySelectorAll("span:not(.d)").length === 2);
+ok("matches through the cache",
+   spans[0].matches(".a section.b > .c") && !spans[2].matches(".a section.b > .c"));
+ok("closest through the cache",
+   spans[2].closest("section[data-x='2']") !== null &&
+   spans[0].closest("section[data-x='2']") === null);
+/* a selector that fails to parse must keep failing, not poison later
+   calls with the same text */
+var bad = 0; try { root.querySelectorAll("span:not(") } catch(e) { bad++; }
+ok("an unparsable selector is not cached as something else",
+   root.querySelectorAll("span").length === 3);
+
+/* and the cost: many calls with a handful of selectors, as a page does */
+var sels = [".a section.b > .c", "span:not(.d)", "section[data-x] > .c", ".d", "div.a > section"];
+var t0 = Date.now(), n = 0;
+for (var i = 0; i < 4000; i++) {
+  var s = sels[i % sels.length];
+  n += spans[i % 3].matches(s) ? 1 : 0;
+  n += spans[i % 3].closest(s) ? 1 : 0;
+}
+console.log("SELECTORMS " + (Date.now() - t0) + " for 8000 matches/closest calls (" + n + ")");
+console.log("SELCACHE DONE");
+</script>
+</body></html>

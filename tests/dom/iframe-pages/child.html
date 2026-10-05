@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<!-- The frame tests/dom/iframes.html loads. It reports to its parent
+     and answers messages; on its own it does nothing. -->
+<html><head><title>child</title></head><body><p id="c">child text</p>
+<script>
+var here = 'child';
+window.greet = function (n) { return 'hello ' + n + ' from ' + document.title; };
+if (window.parent !== window && window.parent.fromChild) {
+ window.parent.fromChild({
+  parentIsOther: window.parent !== window,
+  topIsParent: window.top === window.parent,
+  frameElementId: window.frameElement && window.frameElement.id,
+  parentTitle: window.parent.document.title
+ });
+ window.addEventListener('message', function (e) {
+  if (e.data && e.data.tick) { setInterval(function () { window.parent.ticks++; }, 20); return; }
+  e.source.postMessage({ reply: 'pong', n: e.data.n + 1, fromParent: e.source === window.parent,
+   isDate: e.data.d instanceof Date, time: e.data.d.getTime(), origin: e.origin }, '*');
+ });
+}
+</script></body></html>

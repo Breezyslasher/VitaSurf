@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!-- A page's load waits for its frames, as in a browser: each frame's
+     own load, and the load at its iframe element, come before the load of
+     the page holding it, and that page's readyState is not complete until
+     then. A hidden frame and a srcdoc count too; an iframe that loads
+     nothing (its src is this page) holds nothing up. -->
+<html><head><title>parent</title></head><body><div id="out"></div>
+<iframe id="nest" src="iframe-pages/order-nest.html"></iframe>
+<iframe id="hidden" src="iframe-pages/order-leaf.html" style="display:none"></iframe>
+<iframe id="self" src="iframe-load-order.html"></iframe>
+<iframe srcdoc="<script>top.order.push('srcdoc ran')</script>"></iframe>
+<script>
+function ok(n,c){var m=(c?"PASS ":"FAIL ")+n;console.log(m);var d=document.createElement("div");d.textContent=m;document.getElementById("out").appendChild(d);}
+var order = window.order = [], loaded = false;
+document.getElementById('nest').addEventListener('load', function () { order.push('nest element load'); });
+window.addEventListener('load', function () {
+ loaded = true;
+ order.push('page load, ' + document.readyState);
+ var at = function (s) { return order.indexOf(s); };
+ var leaves = order.filter(function (s) { return s.indexOf('leaf load') === 0; });
+ ok("both leaf frames loaded first (" + JSON.stringify(order) + ")", leaves.length === 2 && at('page load, complete') > order.indexOf(leaves[1]));
+ ok("while the page was not yet complete", leaves.every(function (s) { return s === 'leaf load, top interactive'; }));
+ ok("the frame holding a frame loaded after it", at('nest load') > order.indexOf(leaves[0]) || at('nest load') > order.indexOf(leaves[1]));
+ ok("its element's load before the page's", at('nest element load') > at('nest load') && at('nest element load') < at('page load, complete'));
+ ok("the srcdoc ran before the page loaded", at('srcdoc ran') >= 0 && at('srcdoc ran') < at('page load, complete'));
+});
+setTimeout(function () { if (!loaded) ok("the page loaded in time (" + JSON.stringify(order) + ")", false); }, 2800);
+</script></body></html>
