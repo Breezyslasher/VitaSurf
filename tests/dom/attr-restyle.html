@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!-- Attribute changes made by a script are put on the existing boxes
+     rather than the box tree being built again (VitaSurf): the element
+     is selected again, and what a sheet reaches from it -- the children
+     under ".open", the sibling after ".peer.on" -- and a change of size
+     lays the page out again without a rebuild. A :has() selector, an
+     attribute that content: attr() shows, and a change of display still
+     rebuild. Each case below must come out as it would after a rebuild:
+     A  red to green by class (paint only)
+     B  80px to 160px wide by class (layout, same boxes)
+     C  .open on the parent makes its child 40px tall (descendant)
+     D  .on on a sibling makes the next one blue (sibling combinator)
+     E  .has-on inside makes its parent 30px tall (:has())
+     F  data-label shown through ::after changes its text
+     G  display: none to block by class (rebuild)
+     H  id change picks up #h2's width
+     I  style attribute sets the width to 123px
+     J  src of an image changes and the new one is drawn
+     The log says how each batch was applied. -->
+<html><head><style>
+body { margin: 0; font: 12px sans-serif }
+div.t { height: 20px; margin: 2px 0; background: #ccc }
+.red { background: red !important } .green { background: green !important }
+.w80 { width: 80px } .w160 { width: 160px }
+.open .kid { height: 40px !important; background: #0a0 !important }
+.peer.on + .next { background: blue !important }
+.par:has(.has-on) { height: 30px !important }
+.lbl::after { content: attr(data-label) }
+.gone { display: none } .shown { display: block }
+#h1 { width: 50px } #h2 { width: 70px }
+img { width: 20px; height: 20px; display: block }
+</style></head><body>
+<div class="t red" id="a"></div>
+<div class="t w80" id="b"></div>
+<div id="c"><div class="t kid"></div></div>
+<div class="t peer" id="d"></div><div class="t next" id="d2"></div>
+<div class="t par" id="e"><span id="e2">x</span></div>
+<div class="t lbl" id="f" data-label="one"></div>
+<div class="t gone" id="g"></div>
+<div class="t" id="h1"></div>
+<div class="t" id="i"></div>
+<img id="j" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Crect width='20' height='20' fill='red'/%3E%3C/svg%3E">
+<script>
+function q(id) { return document.getElementById(id); }
+var steps = [
+ function(){ q('a').className = 't green'; },
+ function(){ q('b').className = 't w160'; },
+ function(){ q('c').className = 'open'; },
+ function(){ q('d').classList.add('on'); },
+ function(){ q('e2').className = 'has-on'; },
+ function(){ q('f').setAttribute('data-label', 'two'); },
+ function(){ q('g').className = 't shown'; },
+ function(){ q('h1').id = 'h2'; },
+ function(){ q('i').setAttribute('style', 'width:123px'); },
+ function(){ q('j').src = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Crect width='20' height='20' fill='lime'/%3E%3C/svg%3E"; }
+];
+var k = 0;
+function next() {
+ if (k < steps.length) { steps[k++](); setTimeout(next, 150); return; }
+ setTimeout(function(){
+  var r = {};
+  ['a','b','d2','e','f','g','h2','i'].forEach(function(id){
+   var b = q(id).getBoundingClientRect();
+   r[id] = [Math.round(b.width), Math.round(b.height)];
+  });
+  r.kid = Math.round(document.querySelector('.kid').getBoundingClientRect().height);
+  r.aBg = getComputedStyle(q('a')).backgroundColor;
+  r.d2Bg = getComputedStyle(q('d2')).backgroundColor;
+  console.log('XX ' + JSON.stringify(r));
+ }, 300);
+}
+window.addEventListener('load', function(){ setTimeout(next, 100); });
+</script>
+</body></html>

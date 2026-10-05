@@ -281,6 +281,16 @@ struct jsthread {
 	int next_xhr_id;
 	bool closed;
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
+	/*
+	 * What the changes since the last layout were (VitaSurf): if only
+	 * attributes, the elements are restyled in place rather than the
+	 * box tree being built again (html_restyle_attrs). tree_dirty is
+	 * set by anything else, and by a journal that has filled.
+	 */
+	bool tree_dirty;
+	struct html_attr_change *attr_changes;
+	unsigned attr_n, attr_alloc;
+	unsigned attr_restyles;   /**< batches applied in place, for the log */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
 	nsurl *nav_pending;       /**< where nav_callback will go, or NULL */
 	bool relayout_off;        /**< document too large to rebuild */
@@ -1564,14 +1574,77 @@ static void mark_dirty(JSContext *ctx)
 	vita_id_gen++;
 	if (thread != NULL) {
 		thread->dom_dirty = true;
+		thread->tree_dirty = true;
 	}
 }
 
+/* the most attribute changes kept for one layout; past it, a rebuild */
+#define ATTR_JOURNAL_MAX 512
+
+static void attr_journal_clear(jsthread *thread)
+{
+	unsigned i;
+
+	for (i = 0; i < thread->attr_n; i++) {
+		struct html_attr_change *c = &thread->attr_changes[i];
+
+		dom_node_unref(c->node);
+		dom_string_unref(c->name);
+		if (c->old != NULL) {
+			dom_string_unref(c->old);
+		}
+	}
+	thread->attr_n = 0;
+}
+
+/* Note an attribute change for html_restyle_attrs (VitaSurf). The first
+   change to an element's attribute since the last layout keeps the value
+   it had then, which is what a changed class list is worked out from. */
+static void attr_journal_add(jsthread *thread, struct dom_node *node,
+			     dom_string *name, dom_string *old)
+{
+	struct html_attr_change *c;
+	unsigned i;
+
+	if (thread->tree_dirty || thread->closed || node == NULL ||
+	    name == NULL) {
+		return;
+	}
+	for (i = thread->attr_n; i-- > 0 && i + 64 >= thread->attr_n; ) {
+		c = &thread->attr_changes[i];
+		if (c->node == node && dom_string_isequal(c->name, name)) {
+			return;
+		}
+	}
+	if (thread->attr_n == ATTR_JOURNAL_MAX) {
+		thread->tree_dirty = true;
+		return;
+	}
+	if (thread->attr_n == thread->attr_alloc) {
+		unsigned want = thread->attr_alloc ? thread->attr_alloc * 2 : 32;
+		struct html_attr_change *grown = realloc(thread->attr_changes,
+				want * sizeof(*grown));
+
+		if (grown == NULL) {
+			thread->tree_dirty = true;
+			return;
+		}
+		thread->attr_changes = grown;
+		thread->attr_alloc = want;
+	}
+	c = &thread->attr_changes[thread->attr_n++];
+	c->node = dom_node_ref(node);
+	c->name = dom_string_ref(name);
+	c->old = old != NULL ? dom_string_ref(old) : NULL;
+}
+
 /* mark_dirty for an attribute write, which moves an id only when it is
-   the id attribute that changed. */
-static void mark_attr_dirty(JSContext *ctx, const char *name)
+   the id attribute that changed. old is the value before, or NULL. */
+static void mark_attr_dirty(JSContext *ctx, struct dom_node *node,
+			    dom_string *key, dom_string *old)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *name = key != NULL ? dom_string_data(key) : NULL;
 
 	vita_dom_gen++;
 	if (name == NULL || strcasecmp(name, "id") == 0) {
@@ -1579,6 +1652,7 @@ static void mark_attr_dirty(JSContext *ctx, const char *name)
 	}
 	if (thread != NULL) {
 		thread->dom_dirty = true;
+		attr_journal_add(thread, node, key, old);
 	}
 }
 
@@ -2413,7 +2487,7 @@ static JSValue node_set_attr_prop(JSContext *ctx, JSValueConst this_val,
 		dom_element_set_attribute(node, key, dv);
 		if (!same) {
 			attr_stamp_touch(node);
-			mark_attr_dirty(ctx, name);
+			mark_attr_dirty(ctx, node, key, old);
 		}
 		if (th == NULL || !th->watch_mutations) {
 			if (old != NULL) dom_string_unref(old);
@@ -2784,7 +2858,7 @@ static JSValue node_set_attribute(JSContext *ctx, JSValueConst this_val,
 		dom_element_set_attribute(node, key, val);
 		if (!same) {
 			attr_stamp_touch(node);
-			mark_attr_dirty(ctx, name);
+			mark_attr_dirty(ctx, node, key, old);
 		}
 		if (th == NULL || !th->watch_mutations) {
 			if (old != NULL) dom_string_unref(old);
@@ -2845,18 +2919,16 @@ static JSValue node_remove_attribute(JSContext *ctx, JSValueConst this_val,
 	key = to_dom_string(name);
 	if (key != NULL) {
 		dom_string *old = NULL;
-		jsthread *th = JS_GetContextOpaque(ctx);
-
 		bool had = false;
 
 		dom_element_has_attribute(node, key, &had);
-		if (th != NULL && th->watch_mutations) {
+		if (had) {
 			dom_element_get_attribute(node, key, &old);
 		}
 		dom_element_remove_attribute(node, key);
 		if (had) {
 			attr_stamp_touch(node);
-			mark_attr_dirty(ctx, name);
+			mark_attr_dirty(ctx, node, key, old);
 		}
 		/* removing an attribute that was not there changes nothing,
 		 * and nothing is what an observer should see */
@@ -6989,6 +7061,14 @@ static unsigned count_elements(struct dom_node *root)
 	return count;
 }
 
+/* The layout has caught up with the document, or never will. */
+static void relayout_forget(jsthread *thread)
+{
+	thread->dom_dirty = false;
+	thread->tree_dirty = false;
+	attr_journal_clear(thread);
+}
+
 static void relayout_callback(void *p)
 {
 	jsthread *thread = p;
@@ -6997,12 +7077,12 @@ static void relayout_callback(void *p)
 	uint64_t t0;
 
 	thread->relayout_pending = false;
-	if (thread->closed || !thread->dom_dirty || thread->relayout_off) {
+	if (thread->closed || !thread->dom_dirty) {
 		return;
 	}
 	htmlc = thread->htmlc;
 	if (htmlc == NULL) {
-		thread->dom_dirty = false;
+		relayout_forget(thread);
 		return;
 	}
 	if (htmlc->layout == NULL) {
@@ -7013,7 +7093,7 @@ static void relayout_callback(void *p)
 			thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		} else {
 			/* the first conversion has not run yet; it will see the changes */
-			thread->dom_dirty = false;
+			relayout_forget(thread);
 		}
 		return;
 	}
@@ -7029,9 +7109,58 @@ static void relayout_callback(void *p)
 
 		if (h == NULL ||
 		    hlcache_handle_get_content(h) != (struct content *)htmlc) {
+			relayout_forget(thread);
+			return;
+		}
+	}
+
+	/*
+	 * Only attributes changed: restyle what they touch in place, which
+	 * needs neither the page to have finished loading nor a document
+	 * small enough to rebuild (VitaSurf).
+	 */
+	if (!thread->tree_dirty) {
+		int res = BOX_RESTYLE_SAME;
+		char why[160];
+		unsigned n = thread->attr_n, ms;
+
+		if (n == 0) {
 			thread->dom_dirty = false;
 			return;
 		}
+		t0 = now_ms();
+		if (!html_restyle_attrs(htmlc, thread->attr_changes, n, &res,
+					why, sizeof(why))) {
+			/* busy: being laid out, dragged or still built */
+			guit->misc->schedule(RELAYOUT_RETRY_MS,
+					     relayout_callback, thread);
+			thread->relayout_pending = true;
+			thread->relayout_due = (uint32_t)now_ms() +
+					       RELAYOUT_RETRY_MS;
+			return;
+		}
+		ms = (unsigned)(now_ms() - t0);
+		if (res != BOX_RESTYLE_LAYOUT) {
+			relayout_forget(thread);
+			thread->attr_restyles++;
+			if (thread->attr_restyles <= 10 || ms >= 100) {
+				vita_log("qjs: %u attribute changes put on the "
+					 "page in %u ms without rebuilding "
+					 "it (%s)", n, ms,
+					 res == BOX_RESTYLE_REFLOW ?
+					 "laid out again" :
+					 res == BOX_RESTYLE_PAINT ?
+					 "drawn again" : "nothing to draw");
+			}
+			return;
+		}
+		vita_log("qjs: %u attribute changes need the layout rebuilt "
+			 "after %u ms restyling: %s", n, ms, why);
+		thread->tree_dirty = true;
+	}
+	if (thread->relayout_off) {
+		relayout_forget(thread);
+		return;
 	}
 
 	/*
@@ -7079,7 +7208,7 @@ static void relayout_callback(void *p)
 			 thread->dom_elements,
 			 (unsigned)RELAYOUT_MAX_ELEMENTS);
 		thread->relayout_off = true;
-		thread->dom_dirty = false;
+		relayout_forget(thread);
 		return;
 	}
 	/*
@@ -7102,7 +7231,7 @@ static void relayout_callback(void *p)
 				 thread->dom_elements, per_element_us,
 				 estimate);
 			thread->relayout_off = true;
-			thread->dom_dirty = false;
+			relayout_forget(thread);
 			return;
 		}
 	}
@@ -7116,7 +7245,7 @@ static void relayout_callback(void *p)
 		thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		return;
 	}
-	thread->dom_dirty = false;
+	relayout_forget(thread);
 	/* the rebuild runs to completion here, so this is also how long
 	 * the page was frozen for */
 	thread->relayout_ms = (unsigned)(now_ms() - t0);
@@ -7203,7 +7332,10 @@ static void schedule_relayout(jsthread *thread, int ms)
 	if (thread->closed) {
 		return;
 	}
-	if (thread->htmlc != NULL && thread->htmlc->base.active > 0 &&
+	/* changes of attributes alone are restyled in place, which costs
+	 * little and does not wait for the page (VitaSurf) */
+	if (thread->tree_dirty && thread->htmlc != NULL &&
+	    thread->htmlc->base.active > 0 &&
 	    ms < RELAYOUT_MAX_DELAY_MS) {
 		ms = RELAYOUT_MAX_DELAY_MS;
 	}
@@ -7213,7 +7345,7 @@ static void schedule_relayout(jsthread *thread, int ms)
 	 * time frozen, and one measured at four and a half seconds should
 	 * not be asked again a moment later.
 	 */
-	if (thread->relayout_ms > 0) {
+	if (thread->tree_dirty && thread->relayout_ms > 0) {
 		unsigned floor_ms = thread->relayout_ms * 4;
 
 		if (floor_ms > RELAYOUT_MAX_DELAY_MS) {
@@ -13674,6 +13806,10 @@ nserror js_closethread(jsthread *thread)
 		guit->misc->schedule(-1, relayout_callback, thread);
 		thread->relayout_pending = false;
 	}
+	attr_journal_clear(thread);
+	free(thread->attr_changes);
+	thread->attr_changes = NULL;
+	thread->attr_alloc = 0;
 	guit->misc->schedule(-1, close_removed_frames, thread);
 	guit->misc->schedule(-1, deferred_load_check, thread);
 	thread->load_deferred = false;

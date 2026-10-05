@@ -1,0 +1,1260 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index c6026ec82..c90f615b8 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3068,6 +3068,98 @@ static bool restyle_results_equal(const css_select_results *a,
+ 	return true;
+ }
+ 
++/*
++ * Whether new styles build the same boxes as the old (VitaSurf), so that
++ * laying the tree out again is all a change of size needs. Box
++ * construction also read a replaced element's width and height (whether
++ * its size is known before its image is) and the overflow of the root
++ * and the body (whether they scroll the viewport), so those must stay.
++ */
++static bool restyle_same_boxes(const html_content *c, const struct box *box,
++		const css_select_results *a, const css_select_results *b)
++{
++	const css_computed_style *sa = a->styles[CSS_PSEUDO_ELEMENT_NONE];
++	const css_computed_style *sb = b->styles[CSS_PSEUDO_ELEMENT_NONE];
++	int i;
++
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		if ((a->styles[i] == NULL) != (b->styles[i] == NULL))
++			return false;
++		if (a->styles[i] != NULL && !css_computed_style_same_boxes(
++				a->styles[i], b->styles[i]))
++			return false;
++	}
++	if (sa == NULL || sb == NULL)
++		return sa == sb;
++	if ((box->flags & IS_REPLACED) != 0) {
++		css_fixed va = 0, vb = 0;
++		css_unit ua = CSS_UNIT_PX, ub = CSS_UNIT_PX;
++
++		if (css_computed_width(sa, &va, &ua) !=
++				css_computed_width(sb, &vb, &ub) ||
++				va != vb || ua != ub)
++			return false;
++		va = vb = 0;
++		ua = ub = CSS_UNIT_PX;
++		if (css_computed_height(sa, &va, &ua) !=
++				css_computed_height(sb, &vb, &ub) ||
++				va != vb || ua != ub)
++			return false;
++	}
++	if ((box->flags & OVERFLOW_VIEWPORT) != 0 || box == c->layout) {
++		if (css_computed_overflow_x(sa) != css_computed_overflow_x(sb) ||
++				css_computed_overflow_y(sa) !=
++				css_computed_overflow_y(sb))
++			return false;
++	}
++	return true;
++}
++
++/** Make a box measured and sized again by the next layout (VitaSurf). */
++static void restyle_unmeasure_one(struct box *b)
++{
++	b->max_width = UNKNOWN_MAX_WIDTH;
++	if (b->text != NULL && b->object == NULL) {
++		b->width = UNKNOWN_WIDTH;
++		b->space = UNKNOWN_WIDTH;
++		b->flags &= ~MEASURED;
++	}
++}
++
++/** The same for every box an element owns, as restyle_remap walks them. */
++static void restyle_unmeasure(struct box *owner, struct box *b)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->node != NULL && b->node != owner->node) {
++			if (b->type == BOX_INLINE && b->inline_end != NULL)
++				b = b->inline_end;
++			continue;
++		}
++		restyle_unmeasure_one(b);
++		if (b->list_marker != NULL)
++			restyle_unmeasure_one(b->list_marker);
++		restyle_unmeasure(owner, b->children);
++	}
++}
++
++/** Parse a box's filter again if its new style names another. */
++static void restyle_filter(struct box *box, const css_computed_style *old,
++		const css_computed_style *fresh)
++{
++	lwc_string *a = NULL, *b = NULL;
++
++	if (old == NULL || fresh == NULL)
++		return;
++	if (css_computed_filter(old, &a) != CSS_FILTER_SET)
++		a = NULL;
++	if (css_computed_filter(fresh, &b) != CSS_FILTER_SET)
++		b = NULL;
++	if (a == b)
++		return;
++	box->filter = b != NULL ? box_parse_filter(box, lwc_string_data(b)) :
++		NULL;
++}
++
+ /**
+  * Select an element's style again and apply it if only paint changed.
+  *
+@@ -3092,6 +3184,7 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 	struct box *box = box_for_node(n);
+ 	const css_computed_style *root_style;
+ 	css_select_results *fresh, *old;
++	bool reflow = false;
+ 	int i;
+ 
+ 	*changed = false;
+@@ -3142,14 +3235,21 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 	/* display: contents puts what it owns in its ancestors' boxes,
+ 	 * where it cannot be told apart; a form control's own drawing
+ 	 * keeps the colours it was made with, but its box takes the rest */
+-	if ((box->flags & DISPLAY_CONTENTS) != 0 ||
+-			!restyle_same_layout(old, fresh)) {
+-		restyle_why = (box->flags & DISPLAY_CONTENTS) != 0 ?
+-			"display: contents" :
+-			"the new style changes the layout";
++	if ((box->flags & DISPLAY_CONTENTS) != 0) {
++		restyle_why = "display: contents";
+ 		css_select_results_destroy(fresh);
+ 		return BOX_RESTYLE_LAYOUT;
+ 	}
++	/* a change of size or place lays the tree out again, but builds
++	 * it again only if the boxes themselves would differ (VitaSurf) */
++	if (!restyle_same_layout(old, fresh)) {
++		if (!restyle_same_boxes(c, box, old, fresh)) {
++			restyle_why = "the new style changes the boxes";
++			css_select_results_destroy(fresh);
++			return BOX_RESTYLE_LAYOUT;
++		}
++		reflow = true;
++	}
+ 
+ 	/* the element's own box, then what it owns */
+ 	restyle_remap_one(box, old, fresh);
+@@ -3178,12 +3278,44 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 		if (box->style == old->styles[i])
+ 			box->style = fresh->styles[i];
+ 	}
++	restyle_filter(box, old->styles[CSS_PSEUDO_ELEMENT_NONE],
++			fresh->styles[CSS_PSEUDO_ELEMENT_NONE]);
+ 	box->styles = fresh;
+ 	box->style = fresh->styles[CSS_PSEUDO_ELEMENT_NONE];
+ 	if (box == c->layout)
+ 		c->unit_len_ctx.root_style = box->style;
++	if (reflow) {
++		struct box *b;
++
++		/* what it owns is measured again, and every box that
++		 * holds it sized again around it */
++		restyle_unmeasure_one(box);
++		if (box->list_marker != NULL)
++			restyle_unmeasure_one(box->list_marker);
++		if (box->type == BOX_INLINE) {
++			for (b = box->next; b != NULL; b = b->next) {
++				if (b == box->inline_end) {
++					restyle_unmeasure_one(b);
++					break;
++				}
++				if (b->node != NULL && b->node != n) {
++					if (b->type == BOX_INLINE &&
++							b->inline_end != NULL)
++						b = b->inline_end;
++					continue;
++				}
++				restyle_unmeasure_one(b);
++			}
++		} else {
++			restyle_unmeasure(box, box->children);
++		}
++		for (b = box->parent; b != NULL; b = b->parent)
++			b->max_width = UNKNOWN_MAX_WIDTH;
++		/* a new weight or style may be another face */
++		html_webfont_request(c, box->style);
++	}
+ 	restyle_keep(c, old);
+-	return BOX_RESTYLE_PAINT;
++	return reflow ? BOX_RESTYLE_REFLOW : BOX_RESTYLE_PAINT;
+ }
+ 
+ static enum box_restyle restyle_worse(enum box_restyle a, enum box_restyle b)
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index e86fb7d29..bbcc2216b 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -153,6 +153,9 @@ extern vitasurf_composed_hook vitasurf_composed;
+ enum box_restyle {
+ 	BOX_RESTYLE_SAME = 0,	/**< nothing changed */
+ 	BOX_RESTYLE_PAINT,	/**< new styles are on the boxes; redraw */
++	/** new styles are on the boxes, which need laying out again but
++	 * not building again: content__reformat() */
++	BOX_RESTYLE_REFLOW,
+ 	BOX_RESTYLE_LAYOUT	/**< the layout has to be rebuilt */
+ };
+ 
+@@ -184,7 +187,8 @@ enum box_restyle box_restyle(struct html_content *c, struct dom_node *n,
+  * \param parent_style  the parent element's style, or NULL for the root
+  * \param root_style    the root element's style, or NULL for the root
+  * \param n             the element
+- * eturn the results, or NULL
++ * 
++eturn the results, or NULL
+  */
+ struct css_select_results *html_select_style(struct html_content *c,
+ 		const struct css_computed_style *parent_style,
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index a4be36d41..ed1ddedb2 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -3343,6 +3343,9 @@ static uint32_t dynamic_ancestor_bits(html_content *c)
+ /** What the relayouts an animation asked for took (VitaSurf) */
+ static unsigned html_anim_relayout_ms;
+ 
++/** What the last layout without a rebuild took (VitaSurf) */
++static unsigned html_reflow_ms_last;
++
+ /*
+  * How long the pointer has to rest before a change of :hover that needs
+  * the layout rebuilt is laid out (VitaSurf). GitHub shows a row's
+@@ -3355,6 +3358,48 @@ static unsigned html_anim_relayout_ms;
+ 
+ bool html_dynamic_pointer_moving;
+ 
++/* why the rebuild waiting for the pointer to rest was asked for */
++static const char *html_dynamic_why = "?";
++
++/*
++ * Lay the existing box tree out again after restyling changed sizes but
++ * not boxes (VitaSurf): a fraction of a rebuild, which also selects
++ * every element and builds every box again. False if the content cannot
++ * be laid out now.
++ */
++static bool html_reflow_now(html_content *c)
++{
++	uint64_t t0 = 0, t1 = 0;
++
++	if (c->layout == NULL || c->reflowing || c->base.locked ||
++			c->box_conversion_context != NULL ||
++			(c->base.status != CONTENT_STATUS_READY &&
++			 c->base.status != CONTENT_STATUS_DONE))
++		return false;
++	nsu_getmonotonic_ms(&t0);
++	content__reformat(&c->base, false, c->base.available_width,
++			c->base.available_height);
++	nsu_getmonotonic_ms(&t1);
++	html_reflow_ms_last = (unsigned) (t1 - t0);
++	return true;
++}
++
++static void html_dynamic_reflow(void *p)
++{
++	html_content *c = p;
++
++	c->dynamic_reflow_pending = false;
++	if (!html_reflow_now(c) && !c->dynamic_relayout_pending) {
++		/* busy: try again shortly */
++		c->dynamic_reflow_pending = true;
++		guit->misc->schedule(250, html_dynamic_reflow, c);
++		return;
++	}
++	vita_log("hover: the pointer rested, and the page was laid out "
++		 "again without rebuilding it in %u ms",
++		 html_reflow_ms_last);
++}
++
+ static void html_dynamic_relayout(void *p)
+ {
+ 	html_content *c = p;
+@@ -3370,7 +3415,13 @@ static void html_dynamic_relayout(void *p)
+ 	nsu_getmonotonic_ms(&t1);
+ 	if (rested && res != NSERROR_INVALID)
+ 		vita_log("hover: the pointer rested, and the page was laid out "
+-			 "again in %u ms", (unsigned) (t1 - t0));
++			 "again in %u ms: %s", (unsigned) (t1 - t0),
++			 html_dynamic_why);
++	if (res != NSERROR_INVALID && c->dynamic_reflow_pending) {
++		/* the rebuild laid it out */
++		guit->misc->schedule(-1, html_dynamic_reflow, c);
++		c->dynamic_reflow_pending = false;
++	}
+ 	if (c->n_anim > 0)
+ 		html_anim_relayout_ms += (unsigned) (t1 - t0);
+ 	if (res == NSERROR_INVALID) {
+@@ -3399,7 +3450,7 @@ static void html_dynamic_relayout(void *p)
+ 
+ static struct {
+ 	uint64_t since;
+-	unsigned frames, elements, select_ms, worst_ms, relayouts;
++	unsigned frames, elements, select_ms, worst_ms, relayouts, reflows;
+ } html_anim_stats;
+ 
+ static void html_animation_tick(void *p);
+@@ -3555,12 +3606,16 @@ static void html_animation_tick(void *p)
+ 	for (i = 0; i < n; i++)
+ 		dom_node_unref(list[i]);
+ 
++	if (result == BOX_RESTYLE_REFLOW && !html_reflow_now(c))
++		result = BOX_RESTYLE_LAYOUT;
+ 	if (result == BOX_RESTYLE_LAYOUT) {
+ 		html_anim_stats.relayouts++;
+ 		if (!c->dynamic_relayout_pending) {
+ 			c->dynamic_relayout_pending = true;
+ 			guit->misc->schedule(0, html_dynamic_relayout, c);
+ 		}
++	} else if (result == BOX_RESTYLE_REFLOW) {
++		html_anim_stats.reflows++;
+ 	} else if (result == BOX_RESTYLE_PAINT && area.x0 < area.x1) {
+ 		content__request_redraw(&c->base, area.x0, area.y0,
+ 				area.x1 - area.x0, area.y1 - area.y0);
+@@ -3579,7 +3634,8 @@ static void html_animation_tick(void *p)
+ 
+ 		vita_log("anim: %u frames in %u ms (%u a second), "
+ 				"%u elements a frame, selecting %u ms a "
+-				"frame (worst %u), %u relayouts taking %u ms "
++				"frame (worst %u), %u laid out again without "
++				"rebuilding, %u relayouts taking %u ms "
+ 				"each",
+ 				html_anim_stats.frames, span,
+ 				html_anim_stats.frames * 1000 / span,
+@@ -3588,6 +3644,7 @@ static void html_animation_tick(void *p)
+ 				html_anim_stats.select_ms /
+ 					html_anim_stats.frames,
+ 				html_anim_stats.worst_ms,
++				html_anim_stats.reflows,
+ 				html_anim_stats.relayouts,
+ 				html_anim_stats.relayouts > 0 ?
+ 					html_anim_relayout_ms /
+@@ -3696,6 +3753,7 @@ static bool dynamic_keyed(html_content *c, dom_node *n, uint32_t bit)
+ /** What the state changes that laid the page out again were (VitaSurf) */
+ static struct {
+ 	unsigned changes, rebuilds, restyled, subtrees, skipped, deferred;
++	unsigned reflows;
+ } dynamic_stats;
+ 
+ /* exported interface documented in html/private.h */
+@@ -3706,9 +3764,11 @@ void html_dynamic_report(void)
+ 	vita_log("hover: %u changes of state restyled %u elements, %u "
+ 		 "subtrees under an ancestor and %u ancestors passed over "
+ 		 "as no sheet asks about them; %u laid the page out again "
+-		 "at once and %u waited for the pointer to rest",
++		 "without rebuilding it, %u rebuilt it at once and %u "
++		 "waited for the pointer to rest to rebuild it",
+ 		 dynamic_stats.changes, dynamic_stats.restyled,
+ 		 dynamic_stats.subtrees, dynamic_stats.skipped,
++		 dynamic_stats.reflows,
+ 		 dynamic_stats.rebuilds, dynamic_stats.deferred);
+ 	memset(&dynamic_stats, 0, sizeof(dynamic_stats));
+ }
+@@ -3815,11 +3875,39 @@ void html_set_dynamic(html_content *c, enum nscss_dynamic which,
+ 			html_dynamic_pointer_moving)
+ 		guit->misc->schedule(DYNAMIC_REST_MS, html_dynamic_relayout, c);
+ 
++	/* the new sizes are on the boxes: laid out again now, or once
++	 * the pointer rests (VitaSurf) */
++	if (result == BOX_RESTYLE_REFLOW) {
++		dynamic_stats.reflows++;
++		if (c->dynamic_relayout_pending) {
++			/* a rebuild is coming anyway */
++		} else if (which == NSCSS_HOVER &&
++				html_dynamic_pointer_moving) {
++			c->dynamic_reflow_pending = true;
++			guit->misc->schedule(DYNAMIC_REST_MS,
++					html_dynamic_reflow, c);
++			/* the new colours show meanwhile */
++			content__request_redraw(&c->base, 0, 0,
++					c->base.width, c->base.height);
++		} else if (!html_reflow_now(c)) {
++			result = BOX_RESTYLE_LAYOUT;
++		} else if (c->dynamic_reflow_pending) {
++			guit->misc->schedule(-1, html_dynamic_reflow, c);
++			c->dynamic_reflow_pending = false;
++		}
++	} else if (c->dynamic_reflow_pending && which == NSCSS_HOVER &&
++			html_dynamic_pointer_moving) {
++		guit->misc->schedule(DYNAMIC_REST_MS, html_dynamic_reflow, c);
++	}
++
+ 	if (result == BOX_RESTYLE_LAYOUT && which == NSCSS_HOVER &&
+ 			html_dynamic_pointer_moving &&
+ 			(!c->dynamic_relayout_pending ||
+ 			 c->dynamic_relayout_resting)) {
+ 		dynamic_stats.deferred++;
++		html_dynamic_why = budget == 0 ?
++			"more than it may restyle in place" :
++			box_restyle_why();
+ 		c->dynamic_relayout_pending = true;
+ 		c->dynamic_relayout_resting = true;
+ 		guit->misc->schedule(DYNAMIC_REST_MS, html_dynamic_relayout, c);
+@@ -3851,6 +3939,432 @@ out:
+ 		dom_node_unref(old[i]);
+ }
+ 
++/* ------------------------------------------------------------------------ */
++/* Attribute changes made by scripts (VitaSurf)                             */
++
++/*
++ * A script that sets a class, a style or an image's src used to have the
++ * whole box tree built again, every element selected and every box made
++ * anew: a second and a half on the Vita for Yamtrack's 4500 elements,
++ * three times while it settled. Most such changes need much less. The
++ * element is selected again, and so is what a sheet can reach from it --
++ * what is under it if a sheet keys a descendant selector on the class
++ * that changed, its following siblings for a sibling selector -- and the
++ * new styles are put on the boxes in place. A change of colour is then
++ * drawn again, and a change of size laid out again; only a change to the
++ * boxes themselves (display, position, content, a :has() selector that
++ * reaches up the tree) still rebuilds.
++ */
++
++/** What changed, for matching against a sheet's reach keys. */
++struct html_reach_change {
++	lwc_string *classes[64];	/**< classes added or taken away */
++	uint32_t n_classes;
++	bool classes_lost;		/**< more than fit in classes */
++	dom_string *ids[2];		/**< the id before and after */
++	dom_string *attr;		/**< the attribute's name */
++};
++
++static bool html_reach_sheet_hit(const css_stylesheet *sheet,
++		uint32_t reach, const struct html_reach_change *ch)
++{
++	const css_dynamic_key *keys;
++	uint32_t n, i, j;
++	bool any = false;
++
++	css_stylesheet_reach_keys(sheet, reach, &keys, &n, &any);
++	if (any)
++		return true;
++	for (i = 0; i < n; i++) {
++		bool eq = false;
++
++		switch (keys[i].kind) {
++		case CSS_DYNAMIC_KEY_CLASS:
++			if (ch->classes_lost && n > 0)
++				return true;
++			for (j = 0; j < ch->n_classes; j++) {
++				if (lwc_string_caseless_isequal(ch->classes[j],
++						keys[i].name, &eq) ==
++						lwc_error_ok && eq)
++					return true;
++			}
++			break;
++		case CSS_DYNAMIC_KEY_ID:
++			for (j = 0; j < 2; j++) {
++				if (ch->ids[j] != NULL &&
++				    dom_string_caseless_lwc_isequal(
++						ch->ids[j], keys[i].name))
++					return true;
++			}
++			break;
++		case CSS_DYNAMIC_KEY_ATTRIBUTE:
++			if (ch->attr != NULL &&
++			    dom_string_caseless_lwc_isequal(ch->attr,
++					keys[i].name))
++				return true;
++			break;
++		default:
++			break;
++		}
++	}
++	return false;
++}
++
++/** Whether any of the document's sheets reaches that way on the change. */
++static bool html_reach_hit(html_content *c, uint32_t reach,
++		const struct html_reach_change *ch)
++{
++	uint32_t i, k;
++
++	for (i = 0; i < c->stylesheet_count; i++) {
++		struct hlcache_handle *h = c->stylesheets[i].sheet;
++		struct nscss_import *imports;
++		uint32_t ni = 0;
++
++		if (!dynamic_sheet_ready(h))
++			continue;
++		if (html_reach_sheet_hit(nscss_get_stylesheet(h), reach, ch))
++			return true;
++		imports = nscss_get_imports(h, &ni);
++		for (k = 0; k < ni; k++) {
++			if (dynamic_sheet_ready(imports[k].c) &&
++			    html_reach_sheet_hit(nscss_get_stylesheet(
++					imports[k].c), reach, ch))
++				return true;
++		}
++	}
++	return false;
++}
++
++/** Whether a class list holds a class, as whitespace separated words. */
++static bool html_class_in(const char *list, size_t list_len,
++		const char *word, size_t len)
++{
++	size_t i = 0;
++
++	while (i < list_len) {
++		size_t start;
++
++		while (i < list_len && ascii_is_space(list[i]))
++			i++;
++		start = i;
++		while (i < list_len && !ascii_is_space(list[i]))
++			i++;
++		if (i - start == len && memcmp(list + start, word, len) == 0)
++			return true;
++	}
++	return false;
++}
++
++/** Note the words of one class list missing from the other. */
++static void html_class_diff(struct html_reach_change *ch,
++		const char *a, size_t a_len, const char *b, size_t b_len)
++{
++	size_t i = 0;
++
++	while (i < a_len) {
++		size_t start;
++
++		while (i < a_len && ascii_is_space(a[i]))
++			i++;
++		start = i;
++		while (i < a_len && !ascii_is_space(a[i]))
++			i++;
++		if (i == start || html_class_in(b, b_len, a + start,
++				i - start))
++			continue;
++		if (ch->n_classes == sizeof(ch->classes) /
++				sizeof(ch->classes[0]) ||
++		    lwc_intern_string(a + start, i - start,
++				&ch->classes[ch->n_classes]) != lwc_error_ok) {
++			ch->classes_lost = true;
++			continue;
++		}
++		ch->n_classes++;
++	}
++}
++
++/** Whether generated content on the element shows an attribute. */
++static bool html_box_shows_attr(const struct box *box, dom_string *name)
++{
++	int i;
++
++	if (box->styles == NULL)
++		return false;
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		const css_computed_content_item *item = NULL;
++
++		if (box->styles->styles[i] == NULL ||
++		    css_computed_content(box->styles->styles[i], &item) !=
++				CSS_CONTENT_SET || item == NULL)
++			continue;
++		for (; item->type != CSS_COMPUTED_CONTENT_NONE; item++) {
++			if (item->type == CSS_COMPUTED_CONTENT_ATTR &&
++			    dom_string_caseless_lwc_isequal(name,
++					item->data.attr))
++				return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * Elements box construction reads attributes of besides class, style, id
++ * and title: links, images, form controls, frames, tables, lists. On
++ * these only the attributes in html_attr_any count as restyling alone.
++ */
++static const char *const html_attr_special_tags[] = {
++	"A", "AREA", "AUDIO", "BASE", "BODY", "BUTTON", "CANVAS", "COL",
++	"COLGROUP", "DETAILS", "DIALOG", "EMBED", "FIELDSET", "FORM",
++	"FRAME", "FRAMESET", "HTML", "IFRAME", "IMG", "INPUT", "LABEL",
++	"LEGEND", "LI", "LINK", "MAP", "META", "METER", "OBJECT", "OL",
++	"OPTGROUP", "OPTION", "PARAM", "PICTURE", "PROGRESS", "SCRIPT",
++	"SELECT", "SLOT", "SOURCE", "STYLE", "SUMMARY", "TABLE", "TBODY",
++	"TD", "TEXTAREA", "TFOOT", "TH", "THEAD", "TR", "TRACK", "UL",
++	"VIDEO", "NOSCRIPT", "PRE", "TEMPLATE", "SVG",
++};
++
++/* attributes nothing reads but selectors and the code below */
++static bool html_attr_any(const char *name)
++{
++	static const char *const names[] = {
++		"class", "style", "id", "title", "hidden", "role",
++		"tabindex", "lang", "dir", "draggable", "spellcheck",
++		"translate", "inert", "accesskey", "autofocus", "srcset",
++		"sizes", "loading", "decoding", "fetchpriority", "nonce",
++	};
++	size_t i;
++
++	if (strncasecmp(name, "data-", 5) == 0 ||
++			strncasecmp(name, "aria-", 5) == 0 ||
++			strncasecmp(name, "x-", 2) == 0 ||
++			name[0] == ':' || name[0] == '@')
++		return true;
++	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (strcasecmp(name, names[i]) == 0)
++			return true;
++	}
++	return false;
++}
++
++/** Whether an element is in the SVG namespace. */
++static bool html_node_is_svg(dom_node *n)
++{
++	dom_string *ns = NULL;
++	bool svg = false;
++
++	if (dom_node_get_namespace(n, &ns) == DOM_NO_ERR && ns != NULL) {
++		svg = dom_string_isequal(ns, corestring_dom_svg_namespace);
++		dom_string_unref(ns);
++	}
++	return svg;
++}
++
++/** Restyle an element's following siblings (and what is under them). */
++static enum box_restyle html_restyle_siblings(html_content *c, dom_node *n,
++		bool deep, unsigned *budget)
++{
++	enum box_restyle result = BOX_RESTYLE_SAME, r;
++	dom_node *sib = NULL, *next;
++
++	if (dom_node_get_next_sibling(n, &sib) != DOM_NO_ERR)
++		return BOX_RESTYLE_LAYOUT;
++	while (sib != NULL && result != BOX_RESTYLE_LAYOUT) {
++		dom_node_type type;
++
++		if (dom_node_get_node_type(sib, &type) == DOM_NO_ERR &&
++				type == DOM_ELEMENT_NODE) {
++			r = box_restyle(c, sib, deep, budget);
++			if (r > result)
++				result = r;
++		}
++		next = NULL;
++		if (dom_node_get_next_sibling(sib, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(sib);
++		sib = next;
++	}
++	if (sib != NULL)
++		dom_node_unref(sib);
++	return result;
++}
++
++/** How many elements one batch of changes may select again. */
++#define HTML_ATTR_BUDGET 3000
++
++/* exported interface documented in html/private.h */
++bool html_restyle_attrs(html_content *c,
++		const struct html_attr_change *changes, unsigned n,
++		int *result, char *why, size_t why_len)
++{
++	unsigned budget = HTML_ATTR_BUDGET, i;
++	enum box_restyle res = BOX_RESTYLE_SAME, r;
++
++	why[0] = '\0';
++	if (c->layout == NULL || c->bctx == NULL || c->reflowing ||
++			c->base.locked || c->box_conversion_context != NULL ||
++			(c->base.status != CONTENT_STATUS_READY &&
++			 c->base.status != CONTENT_STATUS_DONE))
++		return false;
++
++#define ATTR_WHY(...) snprintf(why, why_len, __VA_ARGS__)
++
++	for (i = 0; i < n && res != BOX_RESTYLE_LAYOUT; i++) {
++		const struct html_attr_change *ch = &changes[i];
++		struct html_reach_change rc;
++		const char *name = dom_string_data(ch->name);
++		dom_string *tag = NULL, *now = NULL;
++		struct box *box = box_for_node(ch->node);
++		bool special = false, is_img = false, subtree, sibs, deep;
++		size_t t;
++
++		if (dom_node_get_node_name(ch->node, &tag) == DOM_NO_ERR &&
++				tag != NULL) {
++			for (t = 0; t < sizeof(html_attr_special_tags) /
++					sizeof(html_attr_special_tags[0]); t++) {
++				if (strcasecmp(dom_string_data(tag),
++					html_attr_special_tags[t]) == 0) {
++					special = true;
++					break;
++				}
++			}
++			is_img = strcasecmp(dom_string_data(tag), "IMG") == 0;
++		}
++		if (html_node_is_svg(ch->node) ||
++				strcasecmp(name, "slot") == 0 ||
++				(special && !html_attr_any(name) &&
++				 !(is_img && strcasecmp(name, "src") == 0))) {
++			ATTR_WHY("%s on <%s>", name, tag != NULL ?
++					dom_string_data(tag) : "?");
++			if (tag != NULL)
++				dom_string_unref(tag);
++			res = BOX_RESTYLE_LAYOUT;
++			break;
++		}
++		if (box != NULL && strcasecmp(name, "class") != 0 &&
++				strcasecmp(name, "style") != 0 &&
++				html_box_shows_attr(box, ch->name)) {
++			ATTR_WHY("%s on <%s>, which content: attr() shows",
++					name, tag != NULL ?
++					dom_string_data(tag) : "?");
++			if (tag != NULL)
++				dom_string_unref(tag);
++			res = BOX_RESTYLE_LAYOUT;
++			break;
++		}
++
++		if (dom_element_get_attribute(ch->node, ch->name, &now) !=
++				DOM_NO_ERR)
++			now = NULL;
++
++		/* what a sheet could key on */
++		memset(&rc, 0, sizeof(rc));
++		rc.attr = ch->name;
++		if (strcasecmp(name, "class") == 0) {
++			const char *a = ch->old != NULL ?
++				dom_string_data(ch->old) : "";
++			const char *b = now != NULL ? dom_string_data(now) : "";
++			size_t al = ch->old != NULL ?
++				dom_string_byte_length(ch->old) : 0;
++			size_t bl = now != NULL ?
++				dom_string_byte_length(now) : 0;
++
++			html_class_diff(&rc, a, al, b, bl);
++			html_class_diff(&rc, b, bl, a, al);
++		} else if (strcasecmp(name, "id") == 0) {
++			rc.ids[0] = ch->old;
++			rc.ids[1] = now;
++		}
++
++		if (html_reach_hit(c, CSS_REACH_HAS, &rc)) {
++			ATTR_WHY("%s on <%s>, which a :has() selector asks "
++					"about", name, tag != NULL ?
++					dom_string_data(tag) : "?");
++			res = BOX_RESTYLE_LAYOUT;
++		} else {
++			subtree = html_reach_hit(c, CSS_REACH_DESCENDANTS, &rc);
++			deep = html_reach_hit(c, CSS_REACH_SIBLINGS_DEEP, &rc);
++			sibs = deep || html_reach_hit(c, CSS_REACH_SIBLINGS,
++					&rc);
++			r = box_restyle(c, ch->node, subtree, &budget);
++			if (r > res)
++				res = r;
++			if (sibs && res != BOX_RESTYLE_LAYOUT) {
++				r = html_restyle_siblings(c, ch->node, deep,
++						&budget);
++				if (r > res)
++					res = r;
++			}
++			if (res == BOX_RESTYLE_LAYOUT)
++				ATTR_WHY("%s on <%s>: %s", name,
++						tag != NULL ?
++						dom_string_data(tag) : "?",
++						budget == 0 ? "more than may "
++						"be restyled in place" :
++						box_restyle_why());
++		}
++		for (t = 0; t < rc.n_classes; t++)
++			lwc_string_unref(rc.classes[t]);
++		if (tag != NULL)
++			dom_string_unref(tag);
++		if (res == BOX_RESTYLE_LAYOUT) {
++			if (now != NULL)
++				dom_string_unref(now);
++			break;
++		}
++
++		/* what the box keeps of the attribute itself */
++		box = box_for_node(ch->node);
++		if (box != NULL && strcasecmp(name, "id") == 0) {
++			lwc_string *id = NULL;
++
++			if (now != NULL && dom_string_intern(now, &id) !=
++					DOM_NO_ERR)
++				id = NULL;
++			if (box->id != NULL)
++				lwc_string_unref(box->id);
++			box->id = id;
++		} else if (box != NULL && strcasecmp(name, "title") == 0) {
++			char *sq = now != NULL ?
++				squash_whitespace(dom_string_data(now)) : NULL;
++
++			box->title = sq != NULL ?
++				talloc_strdup(c->bctx, sq) : NULL;
++			free(sq);
++		} else if (box != NULL && is_img &&
++				strcasecmp(name, "src") == 0) {
++			nsurl *url = NULL;
++			int got = -1;
++
++			if (now != NULL && box_extract_link(c, now,
++					c->base_url, &url) && url != NULL) {
++				got = html_object_set_src(c, box, url);
++				nsurl_unref(url);
++			}
++			if (got < 0) {
++				ATTR_WHY("src on an <img> with no image "
++						"to replace");
++				res = BOX_RESTYLE_LAYOUT;
++			} else if (got > 0 && res < BOX_RESTYLE_PAINT) {
++				res = BOX_RESTYLE_PAINT;
++			}
++		}
++		if (now != NULL)
++			dom_string_unref(now);
++	}
++#undef ATTR_WHY
++
++	if (res == BOX_RESTYLE_REFLOW && !html_reflow_now(c)) {
++		snprintf(why, why_len, "the page could not be laid out now");
++		res = BOX_RESTYLE_LAYOUT;
++	}
++	if (res == BOX_RESTYLE_PAINT)
++		content__request_redraw(&c->base, 0, 0,
++				c->base.width, c->base.height);
++	*result = (int) res;
++	return true;
++}
++
+ /* exported interface documented in html/private.h */
+ void html_drop_dynamic(html_content *c)
+ {
+@@ -3861,6 +4375,10 @@ void html_drop_dynamic(html_content *c)
+ 		c->dynamic_relayout_pending = false;
+ 		c->dynamic_relayout_resting = false;
+ 	}
++	if (c->dynamic_reflow_pending) {
++		guit->misc->schedule(-1, html_dynamic_reflow, c);
++		c->dynamic_reflow_pending = false;
++	}
+ 	for (which = 0; which < NSCSS_DYNAMIC_COUNT; which++) {
+ 		dom_node *n = nscss_dynamic_node(which);
+ 		dom_document *doc = NULL;
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index c2e1e17c9..5de77c691 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -1063,6 +1063,50 @@ html_fetch_object_role(html_content *c,
+ 	return true;
+ }
+ 
++/* exported interface documented in html/object.h */
++int html_object_set_src(html_content *c, struct box *box, nsurl *url)
++{
++	struct content_html_object *o;
++	hlcache_child_context child;
++	nserror error;
++
++	for (o = c->object_list; o != NULL; o = o->next) {
++		if (o->box == box && !o->background && !o->mask)
++			break;
++	}
++	if (o == NULL)
++		return -1;
++	if (o->content != NULL &&
++	    nsurl_compare(hlcache_handle_get_url(o->content), url,
++			  NSURL_COMPLETE)) {
++		return 0;
++	}
++
++	if (o->content != NULL) {
++		if (content_get_status(o->content) != CONTENT_STATUS_DONE) {
++			c->base.active--;
++		}
++		hlcache_handle_release(o->content);
++		o->content = NULL;
++		box->object = NULL;
++	}
++
++	child.charset = c->encoding;
++	child.quirks = c->base.quirks;
++	error = hlcache_handle_retrieve(url, HLCACHE_RETRIEVE_SNIFF_TYPE,
++			content_get_url(&c->base), NULL,
++			html_object_callback, o, &child,
++			o->permitted_types, &o->content);
++	if (error != NSERROR_OK) {
++		o->content = NULL;
++		return -1;
++	}
++	if (o->permitted_types & CONTENT_IMAGE)
++		vitasurf_images_asked++;
++	c->base.active++;
++	return 1;
++}
++
+ /* exported interface documented in html/object.h */
+ bool
+ html_fetch_object(html_content *c,
+diff --git a/content/handlers/html/object.h b/content/handlers/html/object.h
+index e169a4675..904cf61ee 100644
+--- a/content/handlers/html/object.h
++++ b/content/handlers/html/object.h
+@@ -45,6 +45,20 @@ struct nsurl;
+  */
+ bool html_fetch_object(struct html_content *c, struct nsurl *url, struct box *box, content_type permitted_types, bool background);
+ 
++/**
++ * Show another image in a box that has one, for a script that changed
++ * an <img>'s src (VitaSurf). The old image goes at once and the new one
++ * is fetched as the first was, without the box tree being built again.
++ *
++ * \param c    the document
++ * \param box  the image's box
++ * \param url  where the image is now
++ * \return 1 if a fetch was started, 0 if the box shows that URL already,
++ *         -1 if the box has no image to replace or the fetch failed
++ */
++int html_object_set_src(struct html_content *c, struct box *box,
++		struct nsurl *url);
++
+ /**
+  * Start a fetch for a CSS mask image of a box (VitaSurf).
+  *
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 332f6ec15..6b4169d7c 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -169,6 +169,9 @@ typedef struct html_content {
+ 	bool dynamic_relayout_pending;
+ 	/** and it waits for the pointer to rest (VitaSurf) */
+ 	bool dynamic_relayout_resting;
++	/** html_dynamic_reflow is scheduled: restyled boxes wait to be
++	 * laid out again until the pointer rests (VitaSurf) */
++	bool dynamic_reflow_pending;
+ 	/** Document background colour. */
+ 	colour background_colour;
+ 
+@@ -562,6 +565,34 @@ dom_node *html_focused_node(html_content *html);
+ bool html_process_module_preload(html_content *c, dom_string *href);
+ 
+ 
++/** An attribute a script changed (VitaSurf). */
++struct html_attr_change {
++	struct dom_node *node;		/**< the element */
++	struct dom_string *name;	/**< the attribute */
++	/** its value before the first change since the last layout, or
++	 * NULL if it had none */
++	struct dom_string *old;
++};
++
++/**
++ * Put attribute changes on the box tree without building it again
++ * (VitaSurf): restyle the elements and what the sheets reach from them,
++ * swap an image whose src changed, and draw or lay out the page again.
++ *
++ * \param c        the document
++ * \param changes  what changed, oldest first
++ * \param n        how many
++ * \param result   set to an enum box_restyle: BOX_RESTYLE_LAYOUT if
++ *                 the tree has to be built again after all, else what
++ *                 was done
++ * \param why      set to why it has to, for the log
++ * \param why_len  the size of why
++ * \return false if the content cannot be restyled now; try later
++ */
++bool html_restyle_attrs(html_content *c,
++		const struct html_attr_change *changes, unsigned n,
++		int *result, char *why, size_t why_len);
++
+ /**
+  * Rebuild the box tree from the (script-modified) document and lay it
+  * out again (VitaSurf).
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 093db6f89..228e289a5 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -5490,6 +5490,7 @@ static void html_z_scan_one(const html_content *html, struct html_z_list *l,
+ 	struct rect inner;
+ 	int32_t z = 0;
+ 
++	vitasurf_redraw_zscan++;
+ 	if (c->style != NULL) {
+ 		enum css_overflow_e ox, oy;
+ 
+@@ -7278,6 +7279,9 @@ static bool html_redraw_content(struct content *c,
+ 		struct content_redraw_data *data,
+ 		const struct rect *clip, const struct redraw_context *ctx);
+ 
++/* html_redraw inside html_redraw: an iframe's or an object's */
++static unsigned html_redraw_nesting;
++
+ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 		const struct rect *clip, const struct redraw_context *ctx)
+ {
+@@ -7293,7 +7297,18 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 
+ 	/* the right-to-left runs drawn last time can go (VitaSurf) */
+ 	html_bidi_redraw_begin();
+-	result = html_redraw_content(c, data, clip, ctx);
++	if (html_redraw_nesting++ == 0) {
++		/* how long the page's own redraws take, beside the plot
++		 * calls they make (VitaSurf) */
++		uint64_t t0 = vitasurf_clock_us();
++
++		result = html_redraw_content(c, data, clip, ctx);
++		vitasurf_us_redraw_html += vitasurf_clock_us() - t0;
++		vitasurf_redraw_calls++;
++	} else {
++		result = html_redraw_content(c, data, clip, ctx);
++	}
++	html_redraw_nesting--;
+ 	html_bidi_redraw_end();
+ 	html_redraw_live = live;
+ 	return result;
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index d95f8ea5d..a7da425dd 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -1302,6 +1302,18 @@ static nserror timed_text(const struct redraw_context *ctx,
+ 						  length));
+ }
+ 
++/* exported interface documented in framebuffer/framebuffer.h */
++uint64_t fb_plot_us_now(void)
++{
++	uint64_t us = 0;
++	int k;
++
++	for (k = 0; k < FBP_KINDS; k++) {
++		us += fbp_us[k];
++	}
++	return us;
++}
++
+ /* exported interface documented in framebuffer/framebuffer.h */
+ void fb_plot_take_stats(char *buf, size_t len)
+ {
+@@ -1343,6 +1355,19 @@ void fb_plot_take_stats(char *buf, size_t len)
+ 						1000));
+ 
+ 		if (n > 0 && (size_t)n < len - at) at += (size_t)n;
++		if (at < len) {
++			n = snprintf(buf + at, len - at, "; the page redrew "
++				     "%u times in %u ms, %u boxes looked at "
++				     "for negative z-index",
++				     vitasurf_redraw_calls,
++				     (unsigned int)(vitasurf_us_redraw_html /
++						    1000),
++				     vitasurf_redraw_zscan);
++			if (n > 0 && (size_t)n < len - at) at += (size_t)n;
++		}
++		vitasurf_redraw_calls = 0;
++		vitasurf_us_redraw_html = 0;
++		vitasurf_redraw_zscan = 0;
+ 		vitasurf_redraw_boxes = 0;
+ 		vitasurf_redraw_copies = 0;
+ 		vitasurf_us_redraw_copies = 0;
+diff --git a/frontends/framebuffer/framebuffer.h b/frontends/framebuffer/framebuffer.h
+index 851008dde..7c95a4d7e 100644
+--- a/frontends/framebuffer/framebuffer.h
++++ b/frontends/framebuffer/framebuffer.h
+@@ -46,6 +46,10 @@ void framebuffer_scaled_forget(nsfb_t *src);
+  * area, as one line of text; the counts start again (VitaSurf).
+  */
+ void fb_plot_take_stats(char *buf, size_t len);
++
++/** The plot calls' time so far, in microseconds, without taking it
++ * (VitaSurf). */
++uint64_t fb_plot_us_now(void);
+ #endif
+ 
+ #endif
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 5d8d4c5e1..46f03e2e1 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -270,6 +270,17 @@ static unsigned long long fb_last_move_us;
+ #ifdef __vita__
+ static unsigned int fb_pan_moves, fb_pan_pinned_redraws, fb_pan_whole;
+ static unsigned long long fb_pan_move_us;
++/*
++ * Where the drawing part of a frame goes (VitaSurf): every fb_redraw, the
++ * area it covered and its putting the result on the screen, and those
++ * made for pinned boxes and for images that waited on the decoder.
++ */
++static unsigned int fb_redraws, fb_redraw_kpx;
++static unsigned long long fb_redraw_us, fb_update_us, fb_pinned_us;
++static unsigned long long fb_waiting_us;
++/* a redraw this slow is logged on its own, at most four a second */
++#define FB_SLOW_REDRAW_US 40000ull
++static unsigned long long fb_slow_logged_us;
+ #endif
+ static void fb_redraw(fbtk_widget_t *widget,
+ 		      struct browser_widget_s *bwidget,
+@@ -599,6 +610,9 @@ fb_pan(fbtk_widget_t *widget,
+ 	if (pinned_n > 0) {
+ 		nsfb_bbox_t queued = bwidget->redraw_box;
+ 		bool queued_required = bwidget->redraw_required;
++#ifdef __vita__
++		unsigned long long pinned_t0 = vita_now_us();
++#endif
+ 
+ 		for (i = 0; i < pinned_n; i++) {
+ 			struct rect *r = &pinned[i];
+@@ -629,6 +643,9 @@ fb_pan(fbtk_widget_t *widget,
+ 		/* fb_redraw cleared these: the strip is still to draw */
+ 		bwidget->redraw_box = queued;
+ 		bwidget->redraw_required = queued_required;
++#ifdef __vita__
++		fb_pinned_us += vita_now_us() - pinned_t0;
++#endif
+ 	}
+ 
+ 	bwidget->pan_required = false;
+@@ -651,10 +668,27 @@ fb_redraw(fbtk_widget_t *widget,
+ 		.plot = &fb_plotters
+ 	};
+ 	nsfb_t *nsfb = fbtk_get_nsfb(widget);
++#ifdef __vita__
++	unsigned long long redraw_t0 = vita_now_us(), update_t0, page_us;
++	uint64_t plot_t0 = fb_plot_us_now();
++	uint64_t html_t0 = vitasurf_us_redraw_html;
++	unsigned int boxes_t0 = vitasurf_redraw_boxes;
++	nsfb_bbox_t asked = bwidget->redraw_box;
++#endif
+ 
+ 	x = fbtk_get_absx(widget);
+ 	y = fbtk_get_absy(widget);
+ 
++#ifdef __vita__
++	fb_redraws++;
++	if (bwidget->redraw_box.x1 > bwidget->redraw_box.x0 &&
++	    bwidget->redraw_box.y1 > bwidget->redraw_box.y0) {
++		fb_redraw_kpx += (unsigned int)
++			((bwidget->redraw_box.x1 - bwidget->redraw_box.x0) *
++			 (bwidget->redraw_box.y1 - bwidget->redraw_box.y0) /
++			 1000);
++	}
++#endif
+ 	/* adjust clipping co-ordinates according to window location */
+ 	bwidget->redraw_box.y0 += y;
+ 	bwidget->redraw_box.y1 += y;
+@@ -710,7 +744,35 @@ fb_redraw(fbtk_widget_t *widget,
+ 		nsfb_plot_line(nsfb, &line, &pen);
+ 	}
+ 
++#ifdef __vita__
++	update_t0 = vita_now_us();
++#endif
+ 	nsfb_update(fbtk_get_nsfb(widget), &bwidget->redraw_box);
++#ifdef __vita__
++	fb_update_us += vita_now_us() - update_t0;
++	page_us = vita_now_us() - redraw_t0;
++	fb_redraw_us += page_us;
++	/*
++	 * One slow redraw, said on its own (VitaSurf): what it covered and
++	 * where its time went -- the page's redraw (and of that the plot
++	 * calls), and putting the result on the screen. A few a second at
++	 * most, so a scroll that stutters says why.
++	 */
++	if (page_us >= FB_SLOW_REDRAW_US &&
++	    vita_now_us() - fb_slow_logged_us >= 250000ull) {
++		fb_slow_logged_us = vita_now_us();
++		vita_log("draw: one redraw of %dx%d at %d,%d took %u ms: the "
++			 "page %u ms (plot calls %u ms, %u boxes), putting it "
++			 "on the screen %u ms",
++			 asked.x1 - asked.x0, asked.y1 - asked.y0,
++			 asked.x0, asked.y0, (unsigned)(page_us / 1000),
++			 (unsigned)((vitasurf_us_redraw_html - html_t0) /
++				    1000),
++			 (unsigned)((fb_plot_us_now() - plot_t0) / 1000),
++			 vitasurf_redraw_boxes - boxes_t0,
++			 (unsigned)((vita_now_us() - update_t0) / 1000));
++	}
++#endif
+ 
+ 	bwidget->redraw_box.y0 = bwidget->redraw_box.x0 = INT_MAX;
+ 	bwidget->redraw_box.y1 = bwidget->redraw_box.x1 = INT_MIN;
+@@ -744,8 +806,14 @@ fb_browser_window_redraw(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 		fb_redraw(widget, bwidget, gw->bw);
+ 	}
+ 	if (bwidget->images_flush) {
++#ifdef __vita__
++		unsigned long long waiting_t0 = vita_now_us();
++#endif
+ 		bwidget->images_flush = false;
+ 		fb_images_draw_waiting(widget, bwidget, gw->bw);
++#ifdef __vita__
++		fb_waiting_us += vita_now_us() - waiting_t0;
++#endif
+ 	}
+ 	return 0;
+ }
+@@ -1130,6 +1198,44 @@ static void framebuffer_run(void)
+ 							 ds.upgraded);
+ 					}
+ 				}
++				if (draw_us >= 300000) {
++					/* the pinned and image redraws are
++					 * fb_redraws, counted there */
++					unsigned long long known =
++						fb_pan_move_us + fb_redraw_us;
++
++					vita_log("draw time: %u ms drawing, "
++						 "%u redraws over %u kpixels "
++						 "in %u ms (%u ms of it putting "
++						 "them on the screen, %u ms for "
++						 "pinned boxes and %u ms for "
++						 "images drawn after "
++						 "decoding), moving the "
++						 "picture %u ms, the rest "
++						 "(toolbar, scrollbars, the "
++						 "loop) %u ms",
++						 (unsigned)(draw_us / 1000),
++						 fb_redraws, fb_redraw_kpx,
++						 (unsigned)(fb_redraw_us /
++							    1000),
++						 (unsigned)(fb_update_us /
++							    1000),
++						 (unsigned)(fb_pinned_us /
++							    1000),
++						 (unsigned)(fb_waiting_us /
++							    1000),
++						 (unsigned)(fb_pan_move_us /
++							    1000),
++						 draw_us > known ?
++						 (unsigned)((draw_us - known) /
++							    1000) : 0u);
++				}
++				fb_redraws = 0;
++				fb_redraw_kpx = 0;
++				fb_redraw_us = 0;
++				fb_update_us = 0;
++				fb_pinned_us = 0;
++				fb_waiting_us = 0;
+ 				fb_pan_whole = 0;
+ 				fb_pan_moves = 0;
+ 				fb_pan_move_us = 0;
+diff --git a/utils/utils.c b/utils/utils.c
+index fe629f9b3..768533a12 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -589,6 +589,9 @@ unsigned long long vita_now_us(void);
+ unsigned int vitasurf_redraw_boxes;
+ unsigned int vitasurf_redraw_copies;
+ uint64_t vitasurf_us_redraw_copies;
++unsigned int vitasurf_redraw_calls;
++uint64_t vitasurf_us_redraw_html;
++unsigned int vitasurf_redraw_zscan;
+ 
+ /* exported: see utils.h (VitaSurf) */
+ uint64_t vitasurf_clock_us(void)
+diff --git a/utils/utils.h b/utils/utils.h
+index 22d52414a..17abe71c1 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -148,6 +148,11 @@ uint64_t vitasurf_clock_us(void);
+ extern unsigned int vitasurf_redraw_boxes;
+ extern unsigned int vitasurf_redraw_copies;
+ extern uint64_t vitasurf_us_redraw_copies;
++/* the page redraws themselves, outermost only, and the boxes looked at
++ * for negative z-index boxes on the way (VitaSurf) */
++extern unsigned int vitasurf_redraw_calls;
++extern uint64_t vitasurf_us_redraw_html;
++extern unsigned int vitasurf_redraw_zscan;
+ /* composing selected styles with their parents' (VitaSurf) */
+ extern unsigned int vitasurf_us_compose;
+ /*

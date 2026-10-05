@@ -1,0 +1,610 @@
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index 73eb895..f21c369 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -140,6 +140,15 @@ css_error css_computed_style_destroy(css_computed_style *style);
+ bool css_computed_style_same_layout(const css_computed_style *a,
+ 		const css_computed_style *b);
+ 
++/**
++ * Whether two computed styles build the same boxes, differing at most in
++ * how they are sized and placed -- widths, margins, padding, flex and
++ * grid placement, font size -- or painted, so that laying the existing
++ * box tree out again is enough (VitaSurf).
++ */
++bool css_computed_style_same_boxes(const css_computed_style *a,
++		const css_computed_style *b);
++
+ css_error css_computed_style_compose(
+ 		const css_computed_style *restrict parent,
+ 		const css_computed_style *restrict child,
+diff --git a/include/libcss/stylesheet.h b/include/libcss/stylesheet.h
+index 77aeafe..2fce582 100644
+--- a/include/libcss/stylesheet.h
++++ b/include/libcss/stylesheet.h
+@@ -222,7 +222,9 @@ uint32_t css_stylesheet_dynamic_ancestor(const css_stylesheet *sheet);
+ enum css_dynamic_key_kind {
+ 	CSS_DYNAMIC_KEY_ELEMENT,
+ 	CSS_DYNAMIC_KEY_CLASS,
+-	CSS_DYNAMIC_KEY_ID
++	CSS_DYNAMIC_KEY_ID,
++	/** an attribute of that name (reach keys only) */
++	CSS_DYNAMIC_KEY_ATTRIBUTE
+ };
+ typedef struct css_dynamic_key {
+ 	uint32_t kind;		/**< a css_dynamic_key_kind */
+@@ -239,6 +241,39 @@ typedef struct css_dynamic_key {
+ void css_stylesheet_dynamic_keys(const css_stylesheet *sheet, uint32_t bit,
+ 		const css_dynamic_key **keys, uint32_t *n, bool *any);
+ 
++/*
++ * What a change to an element's attributes can restyle besides the
++ * element itself (VitaSurf). A script setting a class need not have the
++ * whole document selected again: only the element, and whatever a
++ * selector reaches from it. For each kind of reach, the classes, ids and
++ * attributes of the compounds that reach that way -- the ".open" of
++ * ".open .item", the ".peer" of ".peer:checked ~ .x" -- with *any set
++ * when one cannot be keyed, such as a pseudo-class no attribute list
++ * covers.
++ */
++enum css_reach {
++	/** what is under the element: ".open .item" */
++	CSS_REACH_DESCENDANTS,
++	/** the following siblings: ".a + .b" */
++	CSS_REACH_SIBLINGS,
++	/** and what is under them: ".a ~ .b .c" */
++	CSS_REACH_SIBLINGS_DEEP,
++	/** its ancestors, through :has() */
++	CSS_REACH_HAS,
++	CSS_REACH_COUNT
++};
++
++/**
++ * \param sheet  The stylesheet
++ * \param reach  A css_reach
++ * \param keys   Set to the keys, owned by the sheet; an id key's name is
++ *               the id, an attribute key's the attribute's name
++ * \param n      Set to how many
++ * \param any    Set to whether any change counts
++ */
++void css_stylesheet_reach_keys(const css_stylesheet *sheet, uint32_t reach,
++		const css_dynamic_key **keys, uint32_t *n, bool *any);
++
+ /**
+  * Read one of those (VitaSurf).
+  *
+diff --git a/src/select/arena.c b/src/select/arena.c
+index 6604015..93bced1 100644
+--- a/src/select/arena.c
++++ b/src/select/arena.c
+@@ -317,6 +317,88 @@ enum css_error css__arena_remove_style(struct css_computed_style *style)
+ }
+ 
+ 
++/* Give tmp b's value of every property that only paints (VitaSurf). */
++static void overlay_paint_only(css_computed_style *tmp,
++		const css_computed_style *b)
++{
++	overlay_animation_fill_mode(tmp, b);
++	overlay_animation_iteration_count(tmp, b);
++	overlay_animation_name(tmp, b);
++	overlay_background_attachment(tmp, b);
++	overlay_background_clip(tmp, b);
++	overlay_background_color(tmp, b);
++	overlay_background_position(tmp, b);
++	overlay_background_repeat(tmp, b);
++	overlay_background_size(tmp, b);
++	overlay_border_bottom_color(tmp, b);
++	overlay_border_left_color(tmp, b);
++	overlay_border_right_color(tmp, b);
++	overlay_border_top_color(tmp, b);
++	overlay_border_bottom_left_radius(tmp, b);
++	overlay_border_bottom_right_radius(tmp, b);
++	overlay_border_top_left_radius(tmp, b);
++	overlay_border_top_right_radius(tmp, b);
++	overlay_box_shadow(tmp, b);
++	overlay_box_shadow_2(tmp, b);
++	overlay_clip_path(tmp, b);
++	overlay_color(tmp, b);
++	overlay_column_rule_color(tmp, b);
++	overlay_cursor(tmp, b);
++	overlay_fill(tmp, b);
++	overlay_fill_opacity(tmp, b);
++	overlay_filter(tmp, b);
++	overlay_mask_position(tmp, b);
++	overlay_mask_size(tmp, b);
++	overlay_opacity(tmp, b);
++	overlay_outline_color(tmp, b);
++	overlay_outline_style(tmp, b);
++	overlay_outline_width(tmp, b);
++	overlay_pointer_events(tmp, b);
++	overlay_stroke(tmp, b);
++	overlay_stroke_opacity(tmp, b);
++	overlay_stroke_width(tmp, b);
++	overlay_text_decoration(tmp, b);
++	overlay_text_decoration_color(tmp, b);
++	overlay_text_decoration_style(tmp, b);
++	overlay_text_decoration_thickness(tmp, b);
++	overlay_text_shadow(tmp, b);
++	overlay_text_underline_offset(tmp, b);
++	overlay_outline_offset(tmp, b);
++	overlay_backdrop_filter(tmp, b);
++	overlay_mix_blend_mode(tmp, b);
++	overlay_border_image_source(tmp, b);
++	overlay_border_image_slice(tmp, b);
++	overlay_border_image_width(tmp, b);
++	overlay_border_image_outset(tmp, b);
++	overlay_animation_duration(tmp, b);
++	overlay_animation_delay(tmp, b);
++	overlay_animation_direction(tmp, b);
++	overlay_animation_timing_function(tmp, b);
++	overlay_content_visibility(tmp, b);
++	overlay_backface_visibility(tmp, b);
++	overlay_container_type(tmp, b);
++	overlay_container_name(tmp, b);
++	overlay_anchor_name(tmp, b);
++	overlay_position_anchor(tmp, b);
++	overlay_position_area(tmp, b);
++	overlay_position_try(tmp, b);
++	overlay_anchor_top(tmp, b);
++	overlay_anchor_right(tmp, b);
++	overlay_anchor_bottom(tmp, b);
++	overlay_anchor_left(tmp, b);
++	overlay_anchor_width(tmp, b);
++	overlay_anchor_height(tmp, b);
++	overlay_border_image_repeat(tmp, b);
++	overlay_transform(tmp, b);
++	overlay_translate(tmp, b);
++	overlay_rotate(tmp, b);
++	overlay_scale(tmp, b);
++	overlay_transform_origin(tmp, b);
++	overlay_visibility(tmp, b);
++	overlay_z_index(tmp, b);
++
++}
++
+ /*
+  * Whether two styles lay a box out the same way (VitaSurf).
+  *
+@@ -339,82 +421,7 @@ bool css_computed_style_same_layout(const css_computed_style *a,
+ 		return false;
+ 
+ 	tmp = *a;
+-	overlay_animation_fill_mode(&tmp, b);
+-	overlay_animation_iteration_count(&tmp, b);
+-	overlay_animation_name(&tmp, b);
+-	overlay_background_attachment(&tmp, b);
+-	overlay_background_clip(&tmp, b);
+-	overlay_background_color(&tmp, b);
+-	overlay_background_position(&tmp, b);
+-	overlay_background_repeat(&tmp, b);
+-	overlay_background_size(&tmp, b);
+-	overlay_border_bottom_color(&tmp, b);
+-	overlay_border_left_color(&tmp, b);
+-	overlay_border_right_color(&tmp, b);
+-	overlay_border_top_color(&tmp, b);
+-	overlay_border_bottom_left_radius(&tmp, b);
+-	overlay_border_bottom_right_radius(&tmp, b);
+-	overlay_border_top_left_radius(&tmp, b);
+-	overlay_border_top_right_radius(&tmp, b);
+-	overlay_box_shadow(&tmp, b);
+-	overlay_box_shadow_2(&tmp, b);
+-	overlay_clip_path(&tmp, b);
+-	overlay_color(&tmp, b);
+-	overlay_column_rule_color(&tmp, b);
+-	overlay_cursor(&tmp, b);
+-	overlay_fill(&tmp, b);
+-	overlay_fill_opacity(&tmp, b);
+-	overlay_filter(&tmp, b);
+-	overlay_mask_position(&tmp, b);
+-	overlay_mask_size(&tmp, b);
+-	overlay_opacity(&tmp, b);
+-	overlay_outline_color(&tmp, b);
+-	overlay_outline_style(&tmp, b);
+-	overlay_outline_width(&tmp, b);
+-	overlay_pointer_events(&tmp, b);
+-	overlay_stroke(&tmp, b);
+-	overlay_stroke_opacity(&tmp, b);
+-	overlay_stroke_width(&tmp, b);
+-	overlay_text_decoration(&tmp, b);
+-	overlay_text_decoration_color(&tmp, b);
+-	overlay_text_decoration_style(&tmp, b);
+-	overlay_text_decoration_thickness(&tmp, b);
+-	overlay_text_shadow(&tmp, b);
+-	overlay_text_underline_offset(&tmp, b);
+-	overlay_outline_offset(&tmp, b);
+-	overlay_backdrop_filter(&tmp, b);
+-	overlay_mix_blend_mode(&tmp, b);
+-	overlay_border_image_source(&tmp, b);
+-	overlay_border_image_slice(&tmp, b);
+-	overlay_border_image_width(&tmp, b);
+-	overlay_border_image_outset(&tmp, b);
+-	overlay_animation_duration(&tmp, b);
+-	overlay_animation_delay(&tmp, b);
+-	overlay_animation_direction(&tmp, b);
+-	overlay_animation_timing_function(&tmp, b);
+-	overlay_content_visibility(&tmp, b);
+-	overlay_backface_visibility(&tmp, b);
+-	overlay_container_type(&tmp, b);
+-	overlay_container_name(&tmp, b);
+-	overlay_anchor_name(&tmp, b);
+-	overlay_position_anchor(&tmp, b);
+-	overlay_position_area(&tmp, b);
+-	overlay_position_try(&tmp, b);
+-	overlay_anchor_top(&tmp, b);
+-	overlay_anchor_right(&tmp, b);
+-	overlay_anchor_bottom(&tmp, b);
+-	overlay_anchor_left(&tmp, b);
+-	overlay_anchor_width(&tmp, b);
+-	overlay_anchor_height(&tmp, b);
+-	overlay_border_image_repeat(&tmp, b);
+-	overlay_transform(&tmp, b);
+-	overlay_translate(&tmp, b);
+-	overlay_rotate(&tmp, b);
+-	overlay_scale(&tmp, b);
+-	overlay_transform_origin(&tmp, b);
+-	overlay_visibility(&tmp, b);
+-	overlay_z_index(&tmp, b);
+-
++	overlay_paint_only(&tmp, b);
+ 	/* the variables are inherited, not laid out; a child that uses
+ 	 * one is restyled and compared in its own right */
+ 	tmp.custom = b->custom;
+@@ -422,3 +429,102 @@ bool css_computed_style_same_layout(const css_computed_style *a,
+ 	return css__arena_style_is_equal(&tmp,
+ 			(struct css_computed_style *) b);
+ }
++
++/*
++ * Whether two styles build the same boxes (VitaSurf): what differs, if
++ * anything, sizes or places them, and laying the tree out again puts it
++ * right without building it again. As above, the list names what box
++ * construction does not read: display, position, float, content,
++ * counters, white-space, text-transform, the font family (it asks for
++ * web fonts) and every image are left to differ, and then the tree is
++ * built again.
++ */
++bool css_computed_style_same_boxes(const css_computed_style *a,
++		const css_computed_style *b)
++{
++	struct css_computed_style tmp;
++
++	if (a == b)
++		return true;
++	if (a == NULL || b == NULL)
++		return false;
++
++	tmp = *a;
++	overlay_paint_only(&tmp, b);
++	overlay_align_content(&tmp, b);
++	overlay_align_items(&tmp, b);
++	overlay_align_self(&tmp, b);
++	overlay_aspect_ratio(&tmp, b);
++	overlay_border_bottom_style(&tmp, b);
++	overlay_border_bottom_width(&tmp, b);
++	overlay_border_left_style(&tmp, b);
++	overlay_border_left_width(&tmp, b);
++	overlay_border_right_style(&tmp, b);
++	overlay_border_right_width(&tmp, b);
++	overlay_border_spacing(&tmp, b);
++	overlay_border_top_style(&tmp, b);
++	overlay_border_top_width(&tmp, b);
++	overlay_bottom(&tmp, b);
++	overlay_box_sizing(&tmp, b);
++	overlay_clear(&tmp, b);
++	overlay_column_gap(&tmp, b);
++	overlay_flex_basis(&tmp, b);
++	overlay_flex_direction(&tmp, b);
++	overlay_flex_grow(&tmp, b);
++	overlay_flex_shrink(&tmp, b);
++	overlay_flex_wrap(&tmp, b);
++	overlay_font_size(&tmp, b);
++	overlay_font_style(&tmp, b);
++	overlay_font_variant(&tmp, b);
++	overlay_font_weight(&tmp, b);
++	overlay_grid_auto_columns(&tmp, b);
++	overlay_grid_auto_flow(&tmp, b);
++	overlay_grid_auto_rows(&tmp, b);
++	overlay_grid_column_end(&tmp, b);
++	overlay_grid_column_start(&tmp, b);
++	overlay_grid_row_end(&tmp, b);
++	overlay_grid_row_start(&tmp, b);
++	overlay_grid_template_areas(&tmp, b);
++	overlay_grid_template_columns(&tmp, b);
++	overlay_grid_template_rows(&tmp, b);
++	overlay_height(&tmp, b);
++	overlay_justify_content(&tmp, b);
++	overlay_justify_items(&tmp, b);
++	overlay_justify_self(&tmp, b);
++	overlay_left(&tmp, b);
++	overlay_letter_spacing(&tmp, b);
++	overlay_line_clamp(&tmp, b);
++	overlay_line_height(&tmp, b);
++	overlay_margin_bottom(&tmp, b);
++	overlay_margin_left(&tmp, b);
++	overlay_margin_right(&tmp, b);
++	overlay_margin_top(&tmp, b);
++	overlay_max_height(&tmp, b);
++	overlay_max_width(&tmp, b);
++	overlay_min_height(&tmp, b);
++	overlay_min_width(&tmp, b);
++	overlay_object_fit(&tmp, b);
++	overlay_object_position(&tmp, b);
++	overlay_order(&tmp, b);
++	overlay_overflow_wrap(&tmp, b);
++	overlay_overflow_x(&tmp, b);
++	overlay_overflow_y(&tmp, b);
++	overlay_padding_bottom(&tmp, b);
++	overlay_padding_left(&tmp, b);
++	overlay_padding_right(&tmp, b);
++	overlay_padding_top(&tmp, b);
++	overlay_right(&tmp, b);
++	overlay_row_gap(&tmp, b);
++	overlay_text_align(&tmp, b);
++	overlay_text_indent(&tmp, b);
++	overlay_text_overflow(&tmp, b);
++	overlay_top(&tmp, b);
++	overlay_vertical_align(&tmp, b);
++	overlay_width(&tmp, b);
++	overlay_word_break(&tmp, b);
++	overlay_word_spacing(&tmp, b);
++	tmp.custom = b->custom;
++
++	return css__arena_style_is_equal(&tmp,
++			(struct css_computed_style *) b);
++}
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index e5a1f7c..276a15f 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -268,7 +268,7 @@ css_error css_stylesheet_destroy(css_stylesheet *sheet)
+ 		int k;
+ 		uint32_t j;
+ 
+-		for (k = 0; k < 4; k++) {
++		for (k = 0; k < 8; k++) {
+ 			for (j = 0; j < sheet->dynamic_keys[k].n; j++)
+ 				lwc_string_unref(
+ 					sheet->dynamic_keys[k].keys[j].name);
+@@ -1145,6 +1145,21 @@ void css_stylesheet_dynamic_keys(const css_stylesheet *sheet, uint32_t bit,
+ 	*any = sheet->dynamic_keys[i].any;
+ }
+ 
++/* exported function documented in libcss/stylesheet.h */
++void css_stylesheet_reach_keys(const css_stylesheet *sheet, uint32_t reach,
++		const css_dynamic_key **keys, uint32_t *n, bool *any)
++{
++	if (sheet == NULL || reach >= CSS_REACH_COUNT) {
++		*keys = NULL;
++		*n = 0;
++		*any = false;
++		return;
++	}
++	*keys = sheet->dynamic_keys[4 + reach].keys;
++	*n = sheet->dynamic_keys[4 + reach].n;
++	*any = sheet->dynamic_keys[4 + reach].any;
++}
++
+ uint32_t css_stylesheet_gap_count(const css_stylesheet *sheet)
+ {
+ 	return sheet == NULL ? 0 : sheet->n_gaps;
+@@ -2059,6 +2074,198 @@ static void dynamic_keys_note(css_stylesheet *sheet,
+ 	}
+ }
+ 
++/*
++ * What a change to an element's attributes can restyle besides the
++ * element itself (VitaSurf); see css_stylesheet_reach_keys.
++ */
++
++/** Add a key to one of the sheet's key sets, once. */
++static void reach_key_add(css_stylesheet *sheet, int set, uint32_t kind,
++		lwc_string *name)
++{
++	css_dynamic_key *k;
++	uint32_t j;
++
++	if (sheet->dynamic_keys[set].any)
++		return;
++	for (j = 0; j < sheet->dynamic_keys[set].n; j++) {
++		if (sheet->dynamic_keys[set].keys[j].kind == kind &&
++				sheet->dynamic_keys[set].keys[j].name == name)
++			return;
++	}
++	if (sheet->dynamic_keys[set].n == sheet->dynamic_keys[set].alloc) {
++		uint32_t want = sheet->dynamic_keys[set].alloc ?
++			sheet->dynamic_keys[set].alloc * 2 : 8;
++
++		k = realloc(sheet->dynamic_keys[set].keys, want * sizeof(*k));
++		if (k == NULL) {
++			sheet->dynamic_keys[set].any = true;
++			return;
++		}
++		sheet->dynamic_keys[set].keys = k;
++		sheet->dynamic_keys[set].alloc = want;
++	}
++	k = &sheet->dynamic_keys[set].keys[sheet->dynamic_keys[set].n++];
++	k->kind = kind;
++	k->name = lwc_string_ref(name);
++}
++
++/** Key an attribute by its name, as a C string. */
++static void reach_attr_add(css_stylesheet *sheet, int set, const char *name)
++{
++	lwc_string *s = NULL;
++
++	if (lwc_intern_string(name, strlen(name), &s) != lwc_error_ok) {
++		sheet->dynamic_keys[set].any = true;
++		return;
++	}
++	reach_key_add(sheet, set, CSS_DYNAMIC_KEY_ATTRIBUTE, s);
++	lwc_string_unref(s);
++}
++
++/*
++ * A pseudo-class an attribute decides, and which attributes. Those that
++ * no attribute changes -- the structural ones and the states of the
++ * pointer and focus -- have none; one not listed counts for every
++ * attribute.
++ */
++static const struct {
++	const char *name;
++	const char *attrs[3];
++} reach_pseudo[] = {
++	{ "first-child", { NULL } }, { "last-child", { NULL } },
++	{ "only-child", { NULL } }, { "nth-child", { NULL } },
++	{ "nth-last-child", { NULL } }, { "first-of-type", { NULL } },
++	{ "last-of-type", { NULL } }, { "only-of-type", { NULL } },
++	{ "nth-of-type", { NULL } }, { "nth-last-of-type", { NULL } },
++	{ "root", { NULL } }, { "empty", { NULL } }, { "scope", { NULL } },
++	{ "hover", { NULL } }, { "active", { NULL } }, { "focus", { NULL } },
++	{ "focus-within", { NULL } }, { "focus-visible", { NULL } },
++	{ "target", { NULL } }, { "target-within", { NULL } },
++	{ "visited", { NULL } }, { "defined", { NULL } },
++	{ "host", { NULL } },
++	{ "link", { "href", NULL } }, { "any-link", { "href", NULL } },
++	{ "checked", { "checked", "selected", NULL } },
++	{ "default", { "checked", "selected", NULL } },
++	{ "disabled", { "disabled", NULL } },
++	{ "enabled", { "disabled", NULL } },
++	{ "required", { "required", NULL } },
++	{ "optional", { "required", NULL } },
++	{ "read-only", { "readonly", "disabled", "contenteditable" } },
++	{ "read-write", { "readonly", "disabled", "contenteditable" } },
++	{ "placeholder-shown", { "placeholder", "value", NULL } },
++	{ "lang", { "lang", NULL } }, { "dir", { "dir", NULL } },
++	{ "open", { "open", NULL } },
++	{ "popover-open", { "popover", NULL } },
++};
++
++static void reach_compound(css_stylesheet *sheet,
++		const css_selector *sel, int set);
++
++/** Key every compound of a chain whose reach is past its subtree. */
++static void reach_chain(css_stylesheet *sheet, const css_selector *selector)
++{
++	const css_selector *sel, *prev = NULL;
++	bool deep = false;
++
++	for (sel = selector; sel != NULL; prev = sel, sel = sel->combinator) {
++		int set = -1;
++
++		if (prev != NULL) {
++			if (prev->data.comb == CSS_COMBINATOR_SIBLING ||
++					prev->data.comb ==
++					CSS_COMBINATOR_GENERIC_SIBLING) {
++				set = deep ? 4 + CSS_REACH_SIBLINGS_DEEP :
++					4 + CSS_REACH_SIBLINGS;
++			} else {
++				set = 4 + CSS_REACH_DESCENDANTS;
++				deep = true;
++			}
++		}
++		reach_compound(sheet, sel, set);
++	}
++}
++
++/** Key a compound's details in one set, or only its arguments if -1. */
++static void reach_compound(css_stylesheet *sheet,
++		const css_selector *sel, int set)
++{
++	const css_selector_detail *d = &sel->data;
++
++	for (;;) {
++		const char *n = lwc_string_data(d->qname.name);
++
++		if (d->type == CSS_SELECTOR_PSEUDO_CLASS &&
++				d->value_type ==
++				CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
++			/* each argument is one compound, the alternatives
++			 * chained through their combinators */
++			const css_selector *alt;
++			int inner = set;
++
++			if (strcasecmp(n, "has") == 0)
++				inner = 4 + CSS_REACH_HAS;
++			else if (strncasecmp(n, "nth-", 4) == 0)
++				inner = 4 + CSS_REACH_SIBLINGS;
++			for (alt = d->value.selector; alt != NULL;
++					alt = alt->combinator)
++				reach_compound(sheet, alt, inner);
++		} else if (set >= 0) {
++			switch (d->type) {
++			case CSS_SELECTOR_CLASS:
++				reach_key_add(sheet, set,
++						CSS_DYNAMIC_KEY_CLASS,
++						d->qname.name);
++				break;
++			case CSS_SELECTOR_ID:
++				reach_key_add(sheet, set,
++						CSS_DYNAMIC_KEY_ID,
++						d->qname.name);
++				break;
++			case CSS_SELECTOR_ATTRIBUTE:
++			case CSS_SELECTOR_ATTRIBUTE_EQUAL:
++			case CSS_SELECTOR_ATTRIBUTE_DASHMATCH:
++			case CSS_SELECTOR_ATTRIBUTE_INCLUDES:
++			case CSS_SELECTOR_ATTRIBUTE_PREFIX:
++			case CSS_SELECTOR_ATTRIBUTE_SUFFIX:
++			case CSS_SELECTOR_ATTRIBUTE_SUBSTRING:
++				reach_key_add(sheet, set,
++						CSS_DYNAMIC_KEY_ATTRIBUTE,
++						d->qname.name);
++				break;
++			case CSS_SELECTOR_PSEUDO_CLASS:
++			{
++				size_t i, a;
++
++				for (i = 0; i < sizeof(reach_pseudo) /
++						sizeof(reach_pseudo[0]); i++) {
++					if (strcasecmp(n,
++						reach_pseudo[i].name) == 0)
++						break;
++				}
++				if (i == sizeof(reach_pseudo) /
++						sizeof(reach_pseudo[0])) {
++					sheet->dynamic_keys[set].any = true;
++					break;
++				}
++				for (a = 0; a < 3 &&
++						reach_pseudo[i].attrs[a] !=
++						NULL; a++)
++					reach_attr_add(sheet, set,
++						reach_pseudo[i].attrs[a]);
++				break;
++			}
++			default:
++				/* element names and pseudo-elements */
++				break;
++			}
++		}
++		if (d->next == 0)
++			break;
++		d++;
++	}
++}
++
+ css_error css__stylesheet_rule_add_selector(css_stylesheet *sheet,
+ 		css_rule *rule, css_selector *selector)
+ {
+@@ -2074,6 +2281,7 @@ css_error css__stylesheet_rule_add_selector(css_stylesheet *sheet,
+ 	name_hidden_types(selector);
+ 	sheet->dynamic_ancestor |= dynamic_bits(selector->combinator, true);
+ 	dynamic_keys_note(sheet, selector);
++	reach_chain(sheet, selector);
+ 
+ 	sels = realloc(r->selectors,
+ 			(r->base.items + 1) * sizeof(css_selector *));
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index b3825de..6412807 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -313,7 +313,7 @@ struct css_stylesheet {
+ 		css_dynamic_key *keys;
+ 		uint32_t n, alloc;
+ 		bool any;
+-	} dynamic_keys[4];
++	} dynamic_keys[8];	/* 4 to 7: see css_stylesheet_reach_keys */
+ 
+ 	uint32_t rule_count;			/**< Number of rules in sheet */
+ 	css_rule *rule_list;			/**< List of rules in sheet */
