@@ -1,0 +1,672 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 264d55870..bfed658f4 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -43,6 +43,7 @@
+ #include "desktop/gui_internal.h"
+ 
+ #include "html/private.h"
++#include "html/html.h"
+ #include "html/object.h"
+ #include "html/box.h"
+ #include "html/box_manipulate.h"
+@@ -3018,6 +3019,10 @@ static dom_node *next_node_within(dom_node *n, dom_node *root,
+ 	}
+ }
+ 
++/** Set while box_rebuild_content builds: form controls, which belong to
++ * the document's forms, are then left to a rebuild of the tree. */
++static bool show_rebuilding;
++
+ /** Whether a subtree holds something with a life of its own -- a frame,
+  * an object, an embed -- or is too big to build in place; on the way,
+  * its elements' selection data is cleared for building. */
+@@ -3044,7 +3049,13 @@ static bool show_subtree_unsafe(html_content *c, dom_node *root)
+ 				  tag == DOM_HTML_ELEMENT_TYPE_FRAME ||
+ 				  tag == DOM_HTML_ELEMENT_TYPE_FRAMESET ||
+ 				  tag == DOM_HTML_ELEMENT_TYPE_OBJECT ||
+-				  tag == DOM_HTML_ELEMENT_TYPE_EMBED))) {
++				  tag == DOM_HTML_ELEMENT_TYPE_EMBED ||
++				  (show_rebuilding &&
++				   (tag == DOM_HTML_ELEMENT_TYPE_FORM ||
++				    tag == DOM_HTML_ELEMENT_TYPE_INPUT ||
++				    tag == DOM_HTML_ELEMENT_TYPE_SELECT ||
++				    tag == DOM_HTML_ELEMENT_TYPE_TEXTAREA ||
++				    tag == DOM_HTML_ELEMENT_TYPE_BUTTON))))) {
+ 				dom_node_unref(n);
+ 				return true;
+ 			}
+@@ -3122,50 +3133,16 @@ static void html_clear_box_nodes(struct box *b)
+ 	}
+ }
+ 
+-/** Build the boxes of an element that has just been shown, in place.
+- * False, with nothing changed, if it cannot be done safely. */
+-static bool box_show_element(html_content *c, dom_node *n,
+-		const css_select_results *fresh)
++/** Where an element's boxes go among its parent box pb's children:
++ * before the box of its next sibling with one, which has to be one of
++ * pb's own, or at the end (next_box NULL). False if neither will do:
++ * inline content follows, or pb's ::after would come before it. */
++static bool show_place(html_content *c, dom_node *n, struct box *pb,
++		struct box **next_box_out)
+ {
+-	struct box_construct_props props;
+-	struct box_construct_ctx ctx;
+-	struct box holder, *pb, *next_box = NULL, *old_last, *first, *b;
+-	dom_node *parent = NULL, *sib = NULL;
+-	const css_computed_style *style = fresh->styles[CSS_PSEUDO_ELEMENT_NONE];
+-	enum css_display_e display;
+-	bool convert_children = true, flex, built = true;
+-	unsigned n_counters = c->n_counters, i;
+-	int32_t *values = NULL;
+-	int quote_depth = c->quote_depth;
+-
+-	if (style == NULL || !show_hide_allowed(c))
+-		return false;
+-
+-	/* its parent's own box, holding block-level children */
+-	box_extract_properties(c, n, &props);
+-	pb = props.containing_block;
+-	if (pb == NULL || !show_block_container(pb) ||
+-			composed_parent(c, n, &parent) != DOM_NO_ERR ||
+-			parent == NULL)
+-		return false;
+-	b = box_for_node(parent);
+-	dom_node_unref(parent);
+-	if (b != pb)
+-		return false;
++	struct box *b, *next_box = NULL;
++	dom_node *sib = NULL;
+ 
+-	/* and itself block-level there, or a flex item */
+-	flex = pb->type == BOX_FLEX || pb->type == BOX_INLINE_FLEX;
+-	display = ns_computed_display(style, false);
+-	if (display == CSS_DISPLAY_NONE || display == CSS_DISPLAY_CONTENTS)
+-		return false;
+-	if (!flex && ((display != CSS_DISPLAY_BLOCK &&
+-			display != CSS_DISPLAY_FLEX &&
+-			display != CSS_DISPLAY_GRID) ||
+-			css_computed_float(style) != CSS_FLOAT_NONE))
+-		return false;
+-
+-	/* where it goes: before the next sibling with a box, which has
+-	 * to be one of the parent's own children */
+ 	if (composed_next_sibling(c, n, &sib) != DOM_NO_ERR)
+ 		return false;
+ 	while (sib != NULL) {
+@@ -3213,6 +3190,54 @@ static bool box_show_element(html_content *c, dom_node *n,
+ 		/* the parent's ::after would come before it */
+ 		return false;
+ 	}
++	*next_box_out = next_box;
++	return true;
++}
++
++/** Build the boxes of an element that has just been shown, in place.
++ * False, with nothing changed, if it cannot be done safely. */
++static bool box_show_element(html_content *c, dom_node *n,
++		const css_select_results *fresh)
++{
++	struct box_construct_props props;
++	struct box_construct_ctx ctx;
++	struct box holder, *pb, *next_box = NULL, *old_last, *first, *b;
++	dom_node *parent = NULL;
++	const css_computed_style *style = fresh->styles[CSS_PSEUDO_ELEMENT_NONE];
++	enum css_display_e display;
++	bool convert_children = true, flex, built = true;
++	unsigned n_counters = c->n_counters, i;
++	int32_t *values = NULL;
++	int quote_depth = c->quote_depth;
++
++	if (style == NULL || !show_hide_allowed(c))
++		return false;
++
++	/* its parent's own box, holding block-level children */
++	box_extract_properties(c, n, &props);
++	pb = props.containing_block;
++	if (pb == NULL || !show_block_container(pb) ||
++			composed_parent(c, n, &parent) != DOM_NO_ERR ||
++			parent == NULL)
++		return false;
++	b = box_for_node(parent);
++	dom_node_unref(parent);
++	if (b != pb)
++		return false;
++
++	/* and itself block-level there, or a flex item */
++	flex = pb->type == BOX_FLEX || pb->type == BOX_INLINE_FLEX;
++	display = ns_computed_display(style, false);
++	if (display == CSS_DISPLAY_NONE || display == CSS_DISPLAY_CONTENTS)
++		return false;
++	if (!flex && ((display != CSS_DISPLAY_BLOCK &&
++			display != CSS_DISPLAY_FLEX &&
++			display != CSS_DISPLAY_GRID) ||
++			css_computed_float(style) != CSS_FLOAT_NONE))
++		return false;
++
++	if (!show_place(c, n, pb, &next_box))
++		return false;
+ 	if (show_subtree_unsafe(c, n))
+ 		return false;
+ 
+@@ -3414,6 +3439,364 @@ static bool box_hide_element(html_content *c, struct box *box)
+ 	return true;
+ }
+ 
++/* ------------------------------------------------------------------------ */
++/* New text and children, built in place (VitaSurf)                         */
++
++static const char *restyle_why;
++
++/*
++ * A script that changes the text of a text node, or the children of an
++ * element, had the whole box tree built again. Bubble Card, on most Home
++ * Assistant dashboards, writes each sensor's new reading with innerHTML,
++ * and every message took a second or more on the Vita that way. Only the
++ * boxes of the nearest block around the change are built again instead,
++ * the way an element that is shown is built (box_show_element), and the
++ * page laid out again.
++ */
++
++/** Whether a set of styles counts or quotes. Built on its own, a subtree
++ * that does would start from the counters as the document left them,
++ * not as they were at its place. */
++static bool rebuild_results_count(const css_select_results *r)
++{
++	int i;
++
++	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		const css_computed_style *s = r->styles[i];
++		const css_computed_counter *k = NULL;
++		const css_computed_content_item *item = NULL;
++
++		if (s == NULL)
++			continue;
++		/* NAMED and NONE are one value; the list tells them apart */
++		if (css_computed_counter_reset(s, &k) ==
++				CSS_COUNTER_RESET_NAMED && k != NULL &&
++				k->name != NULL)
++			return true;
++		k = NULL;
++		if (css_computed_counter_increment(s, &k) ==
++				CSS_COUNTER_INCREMENT_NAMED && k != NULL &&
++				k->name != NULL)
++			return true;
++		k = NULL;
++		if (css_computed_counter_set(s, &k) ==
++				CSS_COUNTER_SET_NAMED && k != NULL &&
++				k->name != NULL)
++			return true;
++		if (css_computed_content(s, &item) != CSS_CONTENT_SET ||
++				item == NULL)
++			continue;
++		for (; item->type != CSS_COMPUTED_CONTENT_NONE; item++) {
++			switch (item->type) {
++			case CSS_COMPUTED_CONTENT_COUNTER:
++			case CSS_COMPUTED_CONTENT_COUNTERS:
++			case CSS_COMPUTED_CONTENT_OPEN_QUOTE:
++			case CSS_COMPUTED_CONTENT_CLOSE_QUOTE:
++			case CSS_COMPUTED_CONTENT_NO_OPEN_QUOTE:
++			case CSS_COMPUTED_CONTENT_NO_CLOSE_QUOTE:
++				return true;
++			default:
++				break;
++			}
++		}
++	}
++	return false;
++}
++
++/** The same for a box subtree, and whether it numbers list items. */
++static bool rebuild_subtree_counts(const struct box *b, unsigned *count)
++{
++	for (; b != NULL; b = b->next) {
++		if (++*count > 4000 || b->list_marker != NULL ||
++				(b->styles != NULL &&
++				 rebuild_results_count(b->styles)))
++			return true;
++		if (b->children != NULL &&
++				rebuild_subtree_counts(b->children, count))
++			return true;
++	}
++	return false;
++}
++
++/** Elements whose text is more than boxes: a sheet, a script, a title,
++ * a form control's value or options, markup parsed elsewhere. */
++static bool rebuild_text_special(dom_node *n)
++{
++	static const char *const tags[] = {
++		"STYLE", "SCRIPT", "TITLE", "TEXTAREA", "SELECT", "OPTION",
++		"OPTGROUP", "DATALIST", "BUTTON", "NOSCRIPT", "TEMPLATE",
++		"IFRAME", "OBJECT", "CANVAS", "VIDEO", "AUDIO", "HEAD",
++	};
++	dom_string *name = NULL, *ns = NULL;
++	bool special = false;
++	size_t i;
++
++	/* inline SVG is drawn from its markup as an image */
++	if (dom_node_get_namespace(n, &ns) == DOM_NO_ERR && ns != NULL) {
++		special = !dom_string_isequal(ns,
++				corestring_dom_html_namespace);
++		dom_string_unref(ns);
++		if (special)
++			return true;
++	}
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
++		return true;
++	for (i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
++		if (strcasecmp(dom_string_data(name), tags[i]) == 0) {
++			special = true;
++			break;
++		}
++	}
++	dom_string_unref(name);
++	return special;
++}
++
++/** Whether the element with box b can be taken out and built again
++ * where it is, as box_hide_element and box_show_element would. Sets
++ * give_up when what is inside it rules out building it, or any block
++ * around it, on its own. */
++static bool rebuild_root_ok(html_content *c, dom_node *e, struct box *b,
++		struct box **next_box, bool *give_up)
++{
++	struct box *pb = b->parent;
++	const css_computed_style *style;
++	dom_node *parent = NULL;
++	enum css_display_e display;
++	bool flex, same;
++	unsigned count = 0;
++
++	if (b->styles != NULL && rebuild_results_count(b->styles)) {
++		restyle_why = "a block around the change counts or quotes";
++		*give_up = true;
++		return false;
++	}
++	if (b->children != NULL && hide_subtree_unsafe(b->children, &count)) {
++		restyle_why = count > 4000 ? "the blocks around the change "
++				"are too big to build on their own" :
++				"a form control, frame or object is near the "
++				"change";
++		*give_up = true;
++		return false;
++	}
++	count = 0;
++	if (b->children != NULL && rebuild_subtree_counts(b->children,
++			&count)) {
++		restyle_why = count > 4000 ? "the blocks around the change "
++				"are too big to build on their own" :
++				"something near the change counts or quotes";
++		*give_up = true;
++		return false;
++	}
++	/* not the root or the body, whose boxes the viewport takes from */
++	if (pb == NULL || b == c->layout || pb == c->layout ||
++			!show_block_container(pb) || b->styles == NULL ||
++			(b->flags & (DISPLAY_CONTENTS | IS_REPLACED)) != 0)
++		return false;
++	switch (b->type) {
++	case BOX_BLOCK:
++	case BOX_FLEX:
++		break;
++	default:
++		return false;
++	}
++	style = b->styles->styles[CSS_PSEUDO_ELEMENT_NONE];
++	if (style == NULL)
++		return false;
++	if (composed_parent(c, e, &parent) != DOM_NO_ERR || parent == NULL)
++		return false;
++	same = box_for_node(parent) == pb;
++	dom_node_unref(parent);
++	if (!same)
++		return false;
++
++	flex = pb->type == BOX_FLEX || pb->type == BOX_INLINE_FLEX;
++	display = ns_computed_display(style, false);
++	if (display == CSS_DISPLAY_NONE || display == CSS_DISPLAY_CONTENTS)
++		return false;
++	if (!flex && ((display != CSS_DISPLAY_BLOCK &&
++			display != CSS_DISPLAY_FLEX &&
++			display != CSS_DISPLAY_GRID) ||
++			css_computed_float(style) != CSS_FLOAT_NONE))
++		return false;
++	return show_place(c, e, pb, next_box);
++}
++
++/** Free a box subtree taken out of the tree, and add up the text left
++ * behind in the tree's context, which goes only with the whole tree. */
++static void rebuild_free(struct box *b, unsigned *left)
++{
++	struct box *next;
++
++	for (; b != NULL; b = next) {
++		next = b->next;
++		if (b->children != NULL)
++			rebuild_free(b->children, left);
++		if (b->list_marker != NULL)
++			rebuild_free(b->list_marker, left);
++		*left += (unsigned) b->length + 16;
++		talloc_free(b);
++	}
++}
++
++/** Move the objects whose boxes are inside b off the document's list. */
++static struct content_html_object *rebuild_take_objects(html_content *c,
++		const struct box *b)
++{
++	struct content_html_object *o, **link = &c->object_list, *taken = NULL;
++
++	while ((o = *link) != NULL) {
++		if (o->box != NULL && box_within(o->box, b)) {
++			*link = o->next;
++			o->next = taken;
++			taken = o;
++			if (c->num_objects > 0)
++				c->num_objects--;
++		} else {
++			link = &o->next;
++		}
++	}
++	return taken;
++}
++
++/** How much box_rebuild_content may leave in a tree's context. */
++#define BOX_REBUILT_LEFT_MAX (512 * 1024)
++
++/* exported interface documented in html/box_construct.h */
++enum box_restyle box_rebuild_content(html_content *c, dom_node *n,
++		dom_node **done, unsigned *n_done, unsigned max_done)
++{
++	struct content_html_object *objects;
++	struct box *b = NULL, *next_box = NULL, *nb;
++	css_select_results *styles;
++	dom_node *e = NULL, *up;
++	dom_node_type type = DOM_ELEMENT_NODE;
++	unsigned depth, i, count = 0;
++	bool built, give_up = false;
++
++	if (!show_hide_allowed(c) || c->base.textsearch.context != NULL) {
++		restyle_why = "the page is busy";
++		return BOX_RESTYLE_LAYOUT;
++	}
++	/* what the boxes built this way leave behind in the tree's
++	 * context goes when the tree is built again, now and then */
++	if (c->rebuilt_left > BOX_REBUILT_LEFT_MAX) {
++		restyle_why = "boxes built in place have left enough behind "
++				"for the tree to be built again";
++		return BOX_RESTYLE_LAYOUT;
++	}
++
++	/* new text is in its parent; new children are in the element;
++	 * the document's own children are the whole tree */
++	if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
++			type == DOM_DOCUMENT_NODE) {
++		restyle_why = "the document's own children";
++		return BOX_RESTYLE_LAYOUT;
++	}
++	if (type == DOM_ELEMENT_NODE) {
++		e = dom_node_ref(n);
++	} else if (composed_parent(c, n, &e) != DOM_NO_ERR || e == NULL) {
++		return BOX_RESTYLE_SAME;	/* not in a tree */
++	}
++	if (dom_node_get_node_type(e, &type) != DOM_NO_ERR ||
++			type != DOM_ELEMENT_NODE) {
++		dom_node_unref(e);
++		return BOX_RESTYLE_SAME;	/* in a fragment */
++	}
++	if (rebuild_text_special(e)) {
++		dom_node_unref(e);
++		restyle_why = "content that is more than boxes";
++		return BOX_RESTYLE_LAYOUT;
++	}
++	/* an element with no box draws nothing inside it (VitaSurf builds
++	 * a box for display: contents too) */
++	if (box_for_node(e) == NULL) {
++		dom_node_unref(e);
++		return BOX_RESTYLE_SAME;
++	}
++
++	/* the nearest block around it that can be built on its own */
++	for (depth = 0; e != NULL && depth < 64 && !give_up; depth++) {
++		for (i = 0; i < *n_done; i++) {
++			if (done[i] == e) {
++				/* built already, with this in it */
++				dom_node_unref(e);
++				return BOX_RESTYLE_REFLOW;
++			}
++		}
++		b = box_for_node(e);
++		if (b != NULL && rebuild_root_ok(c, e, b, &next_box,
++				&give_up))
++			break;
++		b = NULL;
++		if (depth > 0 && rebuild_text_special(e))
++			break;
++		up = NULL;
++		if (composed_parent(c, e, &up) != DOM_NO_ERR)
++			up = NULL;
++		dom_node_unref(e);
++		e = up;
++	}
++	if (b == NULL) {
++		if (e != NULL)
++			dom_node_unref(e);
++		if (!give_up)
++			restyle_why = "no block around the change to build "
++					"on its own";
++		return BOX_RESTYLE_LAYOUT;
++	}
++
++	/* out, and built again from the document, taking back the images
++	 * it shows as a rebuild of the whole tree does */
++	styles = b->styles;
++	objects = rebuild_take_objects(c, b);
++	if (!box_hide_element(c, b)) {
++		/* cannot happen after rebuild_root_ok; the objects go back */
++		while (objects != NULL) {
++			struct content_html_object *o = objects;
++
++			objects = o->next;
++			o->next = c->object_list;
++			c->object_list = o;
++			c->num_objects++;
++		}
++		dom_node_unref(e);
++		restyle_why = "a block that cannot be taken out";
++		return BOX_RESTYLE_LAYOUT;
++	}
++	c->restyle_built = true;
++	html_object_reuse_begin(c, objects);
++	show_rebuilding = true;
++	built = box_show_element(c, e, styles);
++	show_rebuilding = false;
++	html_object_free_list(c, html_object_reuse_end(c));
++	(void) next_box;
++	/* the old boxes are no one's now: their objects went to the new
++	 * ones or were let go, and nothing else holds them */
++	rebuild_free(b, &c->rebuilt_left);
++
++	nb = built ? box_for_node(e) : NULL;
++	if (nb == NULL) {
++		dom_node_unref(e);
++		restyle_why = "a block that could not be built again";
++		return BOX_RESTYLE_LAYOUT;
++	}
++	/* what was put in may count, which the rest of the page sees */
++	if (rebuild_results_count(nb->styles) || (nb->children != NULL &&
++			rebuild_subtree_counts(nb->children, &count))) {
++		dom_node_unref(e);
++		restyle_why = "new content that counts or quotes";
++		return BOX_RESTYLE_LAYOUT;
++	}
++
++	/* changes elsewhere in it need nothing more */
++	if (*n_done < max_done) {
++		done[(*n_done)++] = e;
++	} else {
++		dom_node_unref(e);
++	}
++	return BOX_RESTYLE_REFLOW;
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* Restyling for a change of state (VitaSurf)                               */
+ 
+@@ -3648,6 +4031,23 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 		return BOX_RESTYLE_LAYOUT;
+ 	}
+ 
++	/* inside something not drawn -- out of the document, or under
++	 * display: none -- nothing it could become is drawn either
++	 * (VitaSurf): Home Assistant's hidden cards and pop-ups change
++	 * classes on every message, and had the tree built again for each */
++	if (box == NULL && !box_is_root(n)) {
++		dom_node *parent = NULL;
++		bool drawn = false;
++
++		if (composed_parent(c, n, &parent) == DOM_NO_ERR &&
++				parent != NULL) {
++			drawn = box_for_node(parent) != NULL;
++			dom_node_unref(parent);
++		}
++		if (!drawn)
++			return BOX_RESTYLE_SAME;
++	}
++
+ 	box_extract_properties(c, n, &props);
+ 	root_style = props.node_is_root ? NULL : c->layout->style;
+ 
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index bbcc2216b..9e429ef56 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -172,6 +172,26 @@ enum box_restyle {
+  *                 one, and none left is a BOX_RESTYLE_LAYOUT
+  * \return what the page needs now
+  */
++/**
++ * Build again the boxes around a text node whose text a script changed,
++ * or an element whose children it changed: those of the nearest block
++ * that can be built on its own (VitaSurf).
++ *
++ * \param c         the document
++ * \param n         the text node, or the element
++ * \param done      the blocks built in this batch, each holding a
++ *                  reference; one added here when there is room
++ * \param n_done    how many there are
++ * \param max_done  how many done can hold
++ * \return BOX_RESTYLE_REFLOW when built (or already built), the boxes
++ *         needing laying out; BOX_RESTYLE_SAME when the text is not
++ *         drawn; BOX_RESTYLE_LAYOUT when the tree has to be rebuilt,
++ *         box_restyle_why() saying why
++ */
++enum box_restyle box_rebuild_content(struct html_content *c,
++		struct dom_node *n, struct dom_node **done,
++		unsigned *n_done, unsigned max_done);
++
+ /** Why the last restyle asked for the layout, for the log (VitaSurf). */
+ const char *box_restyle_why(void);
+ 
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 575533a5f..0f24773c4 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1851,6 +1851,7 @@ nserror html_relayout(html_content *htmlc)
+ 	talloc_free(htmlc->bctx);
+ 	htmlc->bctx = NULL;
+ 	htmlc->layout = NULL;
++	htmlc->rebuilt_left = 0;
+ 	/* the root style went with it; the new root sets it again */
+ 	htmlc->unit_len_ctx.root_style = NULL;
+ 	htmlc->pinned_boxes = 0;
+@@ -4206,8 +4207,10 @@ bool html_restyle_attrs(html_content *c,
+ 		const struct html_attr_change *changes, unsigned n,
+ 		int *result, char *why, size_t why_len)
+ {
+-	unsigned budget = HTML_ATTR_BUDGET, i;
++	unsigned budget = HTML_ATTR_BUDGET, i, n_built = 0;
+ 	enum box_restyle res = BOX_RESTYLE_SAME, r;
++	/* the blocks built again for new text, each once (VitaSurf) */
++	dom_node *built[16];
+ 	/* what a paint-only change has to draw again: the changed
+ 	 * elements, unless a sibling selector reached past them */
+ 	struct rect area = { 1, 1, 0, 0 };
+@@ -4225,12 +4228,25 @@ bool html_restyle_attrs(html_content *c,
+ 	for (i = 0; i < n && res != BOX_RESTYLE_LAYOUT; i++) {
+ 		const struct html_attr_change *ch = &changes[i];
+ 		struct html_reach_change rc;
+-		const char *name = dom_string_data(ch->name);
++		const char *name;
+ 		dom_string *tag = NULL, *now = NULL;
+-		struct box *box = box_for_node(ch->node);
++		struct box *box;
+ 		bool special = false, is_img = false, subtree, sibs, deep;
+ 		size_t t;
+ 
++		if (ch->name == NULL) {
++			/* new text, or new children: the boxes around */
++			r = box_rebuild_content(c, ch->node, built, &n_built,
++					sizeof(built) / sizeof(built[0]));
++			if (r > res)
++				res = r;
++			if (res == BOX_RESTYLE_LAYOUT)
++				ATTR_WHY("new content: %s", box_restyle_why());
++			continue;
++		}
++		name = dom_string_data(ch->name);
++		box = box_for_node(ch->node);
++
+ 		if (dom_node_get_node_name(ch->node, &tag) == DOM_NO_ERR &&
+ 				tag != NULL) {
+ 			for (t = 0; t < sizeof(html_attr_special_tags) /
+@@ -4370,6 +4386,8 @@ bool html_restyle_attrs(html_content *c,
+ 			dom_string_unref(now);
+ 	}
+ #undef ATTR_WHY
++	while (n_built > 0)
++		dom_node_unref(built[--n_built]);
+ 
+ 	if (res == BOX_RESTYLE_REFLOW && !html_reflow_now(c)) {
+ 		snprintf(why, why_len, "the page could not be laid out now");
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 71772a470..41f2f880f 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -271,6 +271,11 @@ typedef struct html_content {
+ 	struct box **pinned;
+ 	int pinned_alloc;
+ 
++	/** Bytes of text the boxes built again in place left in bctx
++	 * (VitaSurf, box_rebuild_content); the whole tree is built again
++	 * past a limit, which lets them go. */
++	unsigned rebuilt_left;
++
+ 	/**
+ 	 * Fixed boxes met during a redraw, drawn after everything else
+ 	 * so nothing paints over them (VitaSurf). Beyond the list's
+@@ -571,8 +576,10 @@ bool html_process_module_preload(html_content *c, dom_string *href);
+ 
+ /** An attribute a script changed (VitaSurf). */
+ struct html_attr_change {
+-	struct dom_node *node;		/**< the element */
+-	struct dom_string *name;	/**< the attribute */
++	struct dom_node *node;		/**< the element, or text node */
++	/** the attribute, or NULL when what changed is the text of the
++	 * text node node, or the children of the element node (VitaSurf) */
++	struct dom_string *name;
+ 	/** its value before the first change since the last layout, or
+ 	 * NULL if it had none */
+ 	struct dom_string *old;
+@@ -581,7 +588,8 @@ struct html_attr_change {
+ /**
+  * Put attribute changes on the box tree without building it again
+  * (VitaSurf): restyle the elements and what the sheets reach from them,
+- * swap an image whose src changed, and draw or lay out the page again.
++ * swap an image whose src changed, build again the boxes around new
++ * text or children, and draw or lay out the page again.
+  *
+  * \param c        the document
+  * \param changes  what changed, oldest first

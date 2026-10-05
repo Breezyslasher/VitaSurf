@@ -288,8 +288,10 @@ struct jsthread {
 	 * set by anything else, and by a journal that has filled.
 	 */
 	bool tree_dirty;
+	char tree_why[96];        /**< the first such change, for the log */
 	struct html_attr_change *attr_changes;
 	unsigned attr_n, attr_alloc;
+	bool attr_slots;          /**< children changed where slots take them */
 	unsigned attr_restyles;   /**< batches applied in place, for the log */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
 	nsurl *nav_pending;       /**< where nav_callback will go, or NULL */
@@ -1573,9 +1575,227 @@ static void mark_dirty(JSContext *ctx)
 	vita_tree_gen++;
 	vita_id_gen++;
 	if (thread != NULL) {
+		/* what made the tree need building again, for the log */
+		if (!thread->tree_dirty && thread->tree_why[0] == '\0') {
+			snprintf(thread->tree_why, sizeof(thread->tree_why),
+				 "%s", c_where != NULL ? c_where : "?");
+		}
 		thread->dom_dirty = true;
 		thread->tree_dirty = true;
 	}
+}
+
+/* The name of a node for the log: its tag and first class. */
+static void tree_name(struct dom_node *n, char *out, size_t size)
+{
+	dom_string *s = NULL;
+	dom_node_type type = DOM_ELEMENT_NODE;
+	size_t used;
+
+	out[0] = '\0';
+	if (n == NULL) {
+		return;
+	}
+	dom_node_get_node_type(n, &type);
+	if (type != DOM_ELEMENT_NODE) {
+		snprintf(out, size, "%s", type == DOM_TEXT_NODE ? "#text" :
+			 type == DOM_COMMENT_NODE ? "#comment" :
+			 type == DOM_DOCUMENT_FRAGMENT_NODE ? "#fragment" :
+			 "#node");
+		return;
+	}
+	if (dom_node_get_node_name(n, &s) == DOM_NO_ERR && s != NULL) {
+		snprintf(out, size, "%s", dom_string_data(s));
+		dom_string_unref(s);
+	}
+	used = strlen(out);
+	s = NULL;
+	if (used + 2 < size &&
+	    dom_element_get_attribute(n, corestring_dom_class, &s) ==
+	    DOM_NO_ERR && s != NULL) {
+		const char *c = dom_string_data(s);
+		size_t k = 0;
+
+		while (c[k] == ' ') k++;
+		if (c[k] != '\0') {
+			size_t e = k;
+
+			while (c[e] != '\0' && c[e] != ' ') e++;
+			snprintf(out + used, size - used, ".%.*s",
+				 (int)(e - k), c + k);
+		}
+		dom_string_unref(s);
+	}
+}
+
+static void attr_journal_add(jsthread *thread, struct dom_node *node,
+			     dom_string *name, dom_string *old, bool slots);
+
+/* Whether a node is in the thread's document. */
+static bool node_in_page(jsthread *thread, struct dom_node *node)
+{
+	struct dom_node *doc = (struct dom_node *) thread_document(thread);
+	struct dom_node *cur, *up = NULL;
+	unsigned depth = 0;
+
+	if (doc == NULL || node == NULL) {
+		return false;
+	}
+	cur = dom_node_ref(node);
+	while (cur != NULL && cur != doc && depth++ < 4096) {
+		if (dom_node_get_parent_node(cur, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(cur);
+		cur = up;
+	}
+	if (cur == NULL) {
+		return false;
+	}
+	dom_node_unref(cur);
+	return cur == doc;
+}
+
+/* Whether a subtree is or holds a <slot>; a very big one is taken to. */
+static bool subtree_has_slot(struct dom_node *root)
+{
+	struct dom_node *n = dom_node_ref(root), *next;
+	unsigned count = 0;
+
+	while (n != NULL) {
+		dom_node_type type = DOM_TEXT_NODE;
+
+		if (++count > 4000) {
+			dom_node_unref(n);
+			return true;
+		}
+		dom_node_get_node_type(n, &type);
+		if (type == DOM_ELEMENT_NODE) {
+			dom_string *name = NULL;
+			bool slot = false;
+
+			if (dom_node_get_node_name(n, &name) == DOM_NO_ERR &&
+			    name != NULL) {
+				slot = strcasecmp(dom_string_data(name),
+						  "SLOT") == 0;
+				dom_string_unref(name);
+			}
+			if (slot) {
+				dom_node_unref(n);
+				return true;
+			}
+		}
+		next = NULL;
+		if (type == DOM_ELEMENT_NODE ||
+		    type == DOM_DOCUMENT_FRAGMENT_NODE) {
+			dom_node_get_first_child(n, &next);
+		}
+		while (next == NULL && n != root) {
+			struct dom_node *up = NULL;
+
+			if (dom_node_get_next_sibling(n, &next) != DOM_NO_ERR) {
+				next = NULL;
+			}
+			if (next != NULL) {
+				break;
+			}
+			if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR ||
+			    up == NULL) {
+				break;
+			}
+			dom_node_unref(n);
+			n = up;
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	return false;
+}
+
+/* Whether an element is a shadow host, which the prelude's attachShadow
+   marks: its children are then what its slots take. */
+static bool node_is_host(JSContext *ctx, struct dom_node *node)
+{
+	JSValue o = wrap_node(ctx, node), v;
+	bool host = false;
+
+	if (JS_IsObject(o)) {
+		v = JS_GetPropertyStr(ctx, o, "__shadow");
+		host = JS_ToBool(ctx, v) > 0;
+		JS_FreeValue(ctx, v);
+	}
+	JS_FreeValue(ctx, o);
+	return host;
+}
+
+/*
+ * mark_dirty for the children of parent about to change (VitaSurf):
+ * child going in or out, or, with child NULL, all of them replaced. When
+ * that is all that changed, the boxes around parent, and around where
+ * child comes from, are built again on their own (html_restyle_attrs).
+ * new_slots says the new children hold a <slot>.
+ */
+static void mark_tree_dirty(JSContext *ctx, const char *what,
+			    struct dom_node *parent, struct dom_node *child,
+			    bool new_slots)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *from = NULL;
+
+	if (thread != NULL && !thread->tree_dirty && !thread->closed &&
+	    parent != NULL) {
+		bool in = node_in_page(thread, parent), from_in = false;
+		bool slots = new_slots;
+
+		if (child != NULL &&
+		    dom_node_get_parent_node(child, &from) == DOM_NO_ERR &&
+		    from != NULL) {
+			from_in = from != parent &&
+				  node_in_page(thread, from);
+		}
+		if (in || from_in) {
+			/* slots may take other children now */
+			slots = slots || subtree_has_slot(child != NULL ?
+							  child : parent) ||
+				(in && node_is_host(ctx, parent)) ||
+				(from_in && node_is_host(ctx, from));
+		}
+		vita_dom_gen++;
+		vita_tree_gen++;
+		vita_id_gen++;
+		thread->dom_dirty = true;
+		if (in) {
+			attr_journal_add(thread, parent, NULL, NULL, slots);
+		}
+		if (from_in) {
+			attr_journal_add(thread, from, NULL, NULL, slots);
+		}
+		if (from != NULL) {
+			dom_node_unref(from);
+		}
+		if (thread->tree_dirty) {
+			/* the journal filled */
+			mark_dirty(ctx);
+		}
+		return;
+	}
+	if (thread != NULL && !thread->tree_dirty &&
+	    thread->tree_why[0] == '\0') {
+		char a[40], b[40];
+
+		tree_name(child, a, sizeof(a));
+		tree_name(parent, b, sizeof(b));
+		if (child == NULL) {
+			snprintf(thread->tree_why, sizeof(thread->tree_why),
+				 "%s of <%s>", what, b);
+		} else {
+			snprintf(thread->tree_why, sizeof(thread->tree_why),
+				 "%s %s %s <%s>", what, a,
+				 strcmp(what, "removeChild") == 0 ?
+				 "from" : "into", b);
+		}
+	}
+	mark_dirty(ctx);
 }
 
 /* the most attribute changes kept for one layout; past it, a rebuild */
@@ -1589,34 +1809,41 @@ static void attr_journal_clear(jsthread *thread)
 		struct html_attr_change *c = &thread->attr_changes[i];
 
 		dom_node_unref(c->node);
-		dom_string_unref(c->name);
+		if (c->name != NULL) {
+			dom_string_unref(c->name);
+		}
 		if (c->old != NULL) {
 			dom_string_unref(c->old);
 		}
 	}
 	thread->attr_n = 0;
+	thread->attr_slots = false;
 }
 
 /* Note an attribute change for html_restyle_attrs (VitaSurf). The first
    change to an element's attribute since the last layout keeps the value
-   it had then, which is what a changed class list is worked out from. */
+   it had then, which is what a changed class list is worked out from.
+   A NULL name notes new text in the text node node. */
 static void attr_journal_add(jsthread *thread, struct dom_node *node,
-			     dom_string *name, dom_string *old)
+			     dom_string *name, dom_string *old, bool slots)
 {
 	struct html_attr_change *c;
 	unsigned i;
 
-	if (thread->tree_dirty || thread->closed || node == NULL ||
-	    name == NULL) {
+	if (thread->tree_dirty || thread->closed || node == NULL) {
 		return;
 	}
 	for (i = thread->attr_n; i-- > 0 && i + 64 >= thread->attr_n; ) {
 		c = &thread->attr_changes[i];
-		if (c->node == node && dom_string_isequal(c->name, name)) {
+		if (c->node == node && (name == NULL ? c->name == NULL :
+		    c->name != NULL && dom_string_isequal(c->name, name))) {
+			thread->attr_slots = thread->attr_slots || slots;
 			return;
 		}
 	}
 	if (thread->attr_n == ATTR_JOURNAL_MAX) {
+		snprintf(thread->tree_why, sizeof(thread->tree_why),
+			 "more than %u changes", (unsigned)ATTR_JOURNAL_MAX);
 		thread->tree_dirty = true;
 		return;
 	}
@@ -1634,8 +1861,9 @@ static void attr_journal_add(jsthread *thread, struct dom_node *node,
 	}
 	c = &thread->attr_changes[thread->attr_n++];
 	c->node = dom_node_ref(node);
-	c->name = dom_string_ref(name);
+	c->name = name != NULL ? dom_string_ref(name) : NULL;
 	c->old = old != NULL ? dom_string_ref(old) : NULL;
+	thread->attr_slots = thread->attr_slots || slots;
 }
 
 /* mark_dirty for an attribute write, which moves an id only when it is
@@ -1652,8 +1880,42 @@ static void mark_attr_dirty(JSContext *ctx, struct dom_node *node,
 	}
 	if (thread != NULL) {
 		thread->dom_dirty = true;
-		attr_journal_add(thread, node, key, old);
+		attr_journal_add(thread, node, key, old, false);
 	}
+}
+
+/* mark_dirty for new text in a text node (VitaSurf): the boxes around it
+   are built again on their own (html_restyle_attrs). Text that goes from
+   blank to not, or back, changes what :empty matches, which can reach
+   anywhere, and has the whole tree built again. */
+static void mark_text_dirty(JSContext *ctx, struct dom_node *node,
+			    bool blank_changed)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	if (blank_changed) {
+		mark_dirty(ctx);
+		return;
+	}
+	vita_dom_gen++;
+	if (thread != NULL) {
+		thread->dom_dirty = true;
+		attr_journal_add(thread, node, NULL, NULL, false);
+	}
+}
+
+/* Whether a string is empty or white space alone. */
+static bool text_blank(const char *s, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		if (s[i] != ' ' && s[i] != '\t' && s[i] != '\n' &&
+		    s[i] != '\r' && s[i] != '\f') {
+			return false;
+		}
+	}
+	return true;
 }
 
 static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
@@ -2371,8 +2633,20 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		JSValue olddata = JS_NULL;
 
 		JSValue before = target_snapshot(ctx, node);
+		bool was_blank = true;
 
 		dom_node_get_node_type(node, &type);
+		if (type == DOM_TEXT_NODE || type == DOM_CDATA_SECTION_NODE) {
+			dom_string *was = NULL;
+
+			if (dom_characterdata_get_data(
+				    (dom_characterdata *)node, &was) ==
+			    DOM_NO_ERR && was != NULL) {
+				was_blank = text_blank(dom_string_data(was),
+					dom_string_byte_length(was));
+				dom_string_unref(was);
+			}
+		}
 		/* what the text said before, which a characterData record
 		 * carries when the observer asked for it */
 		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
@@ -2396,6 +2670,10 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		 * textContent = x on one aborted the browser outright.
 		 * Character data takes its value directly.
 		 */
+		if (type != DOM_TEXT_NODE && type != DOM_COMMENT_NODE &&
+		    type != DOM_CDATA_SECTION_NODE) {
+			mark_tree_dirty(ctx, "textContent", node, NULL, false);
+		}
 		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
 		    type == DOM_CDATA_SECTION_NODE) {
 			dom_characterdata_set_data((dom_characterdata *)node, d);
@@ -2421,7 +2699,15 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 			dom_node_set_text_content(node, d);
 		}
 		dom_string_unref(d);
-		mark_dirty(ctx);
+		if (type == DOM_TEXT_NODE || type == DOM_CDATA_SECTION_NODE) {
+			/* only the boxes around it, in place (VitaSurf) */
+			mark_text_dirty(ctx, node, was_blank !=
+					text_blank(s != NULL ? s : "",
+						   s != NULL ? len : 0));
+		} else if (type == DOM_COMMENT_NODE) {
+			/* nothing drawn changes */
+			vita_dom_gen++;
+		}
 		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
 		    type == DOM_CDATA_SECTION_NODE) {
 			JS_FreeValue(ctx, before);
@@ -3359,7 +3645,7 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
-	mark_dirty(ctx);
+	mark_tree_dirty(ctx, "insertBefore", node, child, false);
 	notify_left_parent(ctx, child, node);
 	added = inserted_nodes(ctx, child, argv[0]);
 	if (argc >= 2) {
@@ -3393,7 +3679,8 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 	child = JS_GetOpaque(argv[0], node_class_id);
 	old = JS_GetOpaque(argv[1], node_class_id);
 	if (child == NULL || old == NULL) return JS_UNDEFINED;
-	mark_dirty(ctx);
+	mark_tree_dirty(ctx, "replaceChild", node, child,
+			subtree_has_slot(old));
 	notify_left_parent(ctx, child, node);
 	added = inserted_nodes(ctx, child, argv[0]);
 	if (dom_node_replace_child(node, child, old, &ref) == DOM_NO_ERR &&
@@ -4036,7 +4323,7 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
-	mark_dirty(ctx);
+	mark_tree_dirty(ctx, "appendChild", node, child, false);
 	notify_left_parent(ctx, child, node);
 	added = inserted_nodes(ctx, child, argv[0]);
 	if (dom_node_append_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
@@ -4077,7 +4364,7 @@ static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 			}
 		}
 	}
-	mark_dirty(ctx);
+	mark_tree_dirty(ctx, "removeChild", node, child, false);
 	if (dom_node_remove_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
 	}
@@ -4284,9 +4571,10 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 	}
 	if (s != NULL) {
 		vitasurf_js_html_bytes += (unsigned) len;
+		mark_tree_dirty(ctx, "innerHTML", node, NULL,
+				strcasestr(s, "<slot") != NULL);
 		set_inner_html(node, s, len);
 		JS_FreeCString(ctx, s);
-		mark_dirty(ctx);
 		notify_mutation(ctx, "childList", node,
 				target_snapshot(ctx, node), before);
 		before = JS_UNDEFINED;
@@ -7066,8 +7354,11 @@ static void relayout_forget(jsthread *thread)
 {
 	thread->dom_dirty = false;
 	thread->tree_dirty = false;
+	thread->tree_why[0] = '\0';
 	attr_journal_clear(thread);
 }
+
+static void slot_pass(jsthread *thread);
 
 static void relayout_callback(void *p)
 {
@@ -7075,6 +7366,7 @@ static void relayout_callback(void *p)
 	html_content *htmlc;
 	nserror err;
 	uint64_t t0;
+	char why_now[sizeof(thread->tree_why)];
 
 	thread->relayout_pending = false;
 	if (thread->closed || !thread->dom_dirty) {
@@ -7129,6 +7421,19 @@ static void relayout_callback(void *p)
 			return;
 		}
 		t0 = now_ms();
+		/* which children slots take, as a rebuild of the tree asks
+		 * first; the pass is script, which may change more */
+		if (thread->attr_slots) {
+			slot_pass(thread);
+			thread->attr_slots = false;
+			n = thread->attr_n;
+			if (thread->closed) {
+				return;
+			}
+			if (thread->tree_dirty) {
+				goto rebuild;
+			}
+		}
 		if (!html_restyle_attrs(htmlc, thread->attr_changes, n, &res,
 					why, sizeof(why))) {
 			/* busy: being laid out, dragged or still built */
@@ -7144,9 +7449,9 @@ static void relayout_callback(void *p)
 			relayout_forget(thread);
 			thread->attr_restyles++;
 			if (thread->attr_restyles <= 10 || ms >= 100) {
-				vita_log("qjs: %u attribute changes put on the "
-					 "page in %u ms without rebuilding "
-					 "it (%s)", n, ms,
+				vita_log("qjs: %u attribute and text changes "
+					 "put on the page in %u ms without "
+					 "rebuilding it (%s)", n, ms,
 					 res == BOX_RESTYLE_REFLOW ?
 					 "laid out again" :
 					 res == BOX_RESTYLE_PAINT ?
@@ -7154,10 +7459,14 @@ static void relayout_callback(void *p)
 			}
 			return;
 		}
-		vita_log("qjs: %u attribute changes need the layout rebuilt "
-			 "after %u ms restyling: %s", n, ms, why);
+		vita_log("qjs: %u attribute and text changes need the "
+			 "layout rebuilt after %u ms restyling: %s", n, ms,
+			 why);
+		snprintf(thread->tree_why, sizeof(thread->tree_why), "%.90s",
+			 why);
 		thread->tree_dirty = true;
 	}
+rebuild:
 	if (thread->relayout_off) {
 		relayout_forget(thread);
 		return;
@@ -7245,16 +7554,18 @@ static void relayout_callback(void *p)
 		thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		return;
 	}
+	snprintf(why_now, sizeof(why_now), "%s",
+		 thread->tree_why[0] != '\0' ? thread->tree_why : "?");
 	relayout_forget(thread);
 	/* the rebuild runs to completion here, so this is also how long
 	 * the page was frozen for */
 	thread->relayout_ms = (unsigned)(now_ms() - t0);
 	vita_log("qjs: layout rebuilt after script changes in %u ms "
 		 "(%u elements), %u images taken back and %u asked for "
-		 "again%s",
+		 "again%s; the first change: %s",
 		 thread->relayout_ms, thread->dom_elements,
 		 htmlc->relayout_reused, htmlc->relayout_fetched,
-		 err == NSERROR_OK ? "" : " (failed)");
+		 err == NSERROR_OK ? "" : " (failed)", why_now);
 	/* what the page looks like once its scripts have built it, when
 	 * the flag file asks for it (VitaSurf) */
 	vita_input_dump_layout();
@@ -10450,6 +10761,94 @@ static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
 	return out;
 }
 
+/*
+ * __vitaFindById(root, id): the first element under root, in document
+ * order, whose id is id, or null (VitaSurf). A shadow root is its host
+ * here, so this.shadowRoot.getElementById walked the host's subtree in
+ * the prelude, a childNodes list per element; Home Assistant asks for
+ * its view that way on every state message.
+ */
+static JSValue win_vita_find_by_id(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *root, *n = NULL;
+	dom_string *want = NULL;
+	const char *s;
+	size_t len = 0;
+	JSValue r = JS_NULL;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsObject(argv[0])) {
+		return JS_NULL;
+	}
+	root = JS_GetOpaque(argv[0], node_class_id);
+	if (root == NULL) {
+		return JS_NULL;
+	}
+	s = JS_ToCStringLen(ctx, &len, argv[1]);
+	if (s == NULL) {
+		return JS_EXCEPTION;
+	}
+	want = to_dom_string_len(s, len);
+	JS_FreeCString(ctx, s);
+	if (want == NULL) {
+		return JS_NULL;
+	}
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+
+		if (node_is_element(n)) {
+			dom_string *id = NULL;
+			bool hit = false;
+
+			if (dom_element_get_attribute(n, corestring_dom_id,
+						      &id) == DOM_NO_ERR &&
+			    id != NULL) {
+				hit = dom_string_isequal(id, want);
+				dom_string_unref(id);
+			}
+			if (hit) {
+				r = wrap_node(ctx, n);
+				dom_node_unref(n);
+				break;
+			}
+			dom_node_get_first_child(n, &next);
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	dom_string_unref(want);
+	return r;
+}
+
 static JSValue win_vita_element_step(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
@@ -13090,6 +13489,9 @@ static bool setup_globals(jsthread *thread)
 			  JS_NewArrayBuffer(ctx, (uint8_t *)vita_gens,
 					    sizeof(vita_gens), NULL, NULL,
 					    false));
+	JS_SetPropertyStr(ctx, global, "__vitaFindById",
+			  JS_NewCFunction(ctx, win_vita_find_by_id,
+					  "__vitaFindById", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaElementStep",
 			  JS_NewCFunction(ctx, win_vita_element_step,
 					  "__vitaElementStep", 2));

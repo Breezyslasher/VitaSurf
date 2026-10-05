@@ -3589,12 +3589,28 @@ Object.defineProperty(TokenList.prototype,'value',{configurable:true,
  set:function(v){if(this._e)this._e.setAttribute(this._a,String(v));
   else this._own=splitWS(String(v)).filter(function(x){return x;});}});
 W.DOMTokenList=TokenList;
-/* A fresh list per read. A browser hands back the same object every time
-   and code occasionally compares them, but caching it here means the
-   indices go stale when the attribute is changed from elsewhere, and
-   wrong contents are worse than a wrong identity. */
+/* The same list on every read, as a browser hands back (VitaSurf). A
+   fresh one per read cost an object, a split and a property per class,
+   and Lit's classMap reads it for every class of every element it
+   updates. Its indices are brought up to date on each read when the
+   attribute has changed since, so they are no staler than a fresh
+   list's would be; the methods read the attribute itself. */
+TokenList.prototype._sync=function(){
+ var t=this._t(),i;
+ for(i=0;i<Math.max(t.length,this.length||0);i++){
+  if(i<t.length)this[i]=t[i];else delete this[i];}
+ this.length=t.length;};
+hide(TokenList.prototype,'_sync',TokenList.prototype._sync);
 Object.defineProperty(P,'classList',{configurable:true,
- get:function(){return new TokenList(this,'class');},
+ get:function(){
+  var v=this.getAttribute('class'),tl=this.__vsClassList;
+  if(tl===undefined){
+   tl=new TokenList(this,'class');
+   hide(tl,'_v',v);
+   hide(this,'__vsClassList',tl);
+   return tl;}
+  if(tl._v!==v){tl._sync();tl._v=v;}
+  return tl;},
  set:function(v){this.setAttribute('class',String(v));}});
 /* output.htmlFor is a token list; label.htmlFor is a string. Only
  * output's gets the list, which is what the specification says and what
@@ -5428,6 +5444,9 @@ if(typeof __vitaSelectorNative==='function'){
  P.querySelectorAll=__vitaSelectorNative(2,P.querySelectorAll);
  P.closest=__vitaSelectorNative(3,P.closest);}
 function docById(root,id){
+ /* in C where it can be: a walk in script read childNodes at every
+    element (VitaSurf) */
+ if(typeof __vitaFindById==='function')return __vitaFindById(root,String(id));
  var want=String(id),found=null;
  (function walk(n){
   var c=n.childNodes,i;
