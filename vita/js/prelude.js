@@ -225,7 +225,10 @@ P.click=function(){
  if(isDisabledControl(this))return true;
  var e=new MouseEvent('click',{bubbles:true,cancelable:true,composed:true});
  return this.dispatchEvent(e);};
-P.contains=function(n){while(n){if(n===this)return true;n=n.parentNode;}return false;};
+P.contains=function(n){
+ var f=typeof window.__vitaIsAncestor==='function'?window.__vitaIsAncestor(this,n):undefined;
+ if(f!==undefined)return f;
+ while(n){if(n===this)return true;n=n.parentNode;}return false;};
 /* jQuery sorts selector results with this, so a missing one takes out
    every script that uses jQuery's own selector engine. */
 P.compareDocumentPosition=function(other){
@@ -7636,10 +7639,17 @@ function needNode(v,fn,which){
  if(!isNode(v))throw new TypeError(
   "Failed to execute '"+fn+"': parameter "+which+
   " is not of type 'Node'. Got "+describe(v)+".");}
-/* A node cannot contain itself or anything it is inside. */
-function containsNode(parent,node){
- for(var n=parent;n;n=n.parentNode)if(n===node)return true;
+/* A node cannot contain itself or anything it is inside. The climb is
+   made in C where it can be (__vitaIsAncestor): in JavaScript it took a
+   wrapper per ancestor on every insertion. */
+var nativeAncestor=null;
+function isAncestor(a,n){
+ if(nativeAncestor===null)nativeAncestor=
+  typeof W.__vitaIsAncestor==='function'?W.__vitaIsAncestor:false;
+ if(nativeAncestor){var r=nativeAncestor(a,n);if(r!==undefined)return r;}
+ for(;n;n=n.parentNode)if(n===a)return true;
  return false;}
+function containsNode(parent,node){return isAncestor(node,parent);}
 var CAN_HAVE_CHILDREN={1:true,9:true,11:true};
 function preInsert(parent,node,child,fn,replacing){
  needNode(node,fn,1);
@@ -7727,6 +7737,51 @@ function documentRules(parent,node,child,replacing){
   if(child.parentNode!==this)throw new DOMException(
    'The node to be removed is not a child of this node.','NotFoundError');
   return removeC.call(this,child);};
+})();
+
+/* --- a host's children moved into its own shadow root -------------------
+ * A shadow root is its host here (attachShadow above), so moving the
+ * host's children into it moved each to the end of the host, and the
+ * host's firstChild was never null. card-mod does exactly that for every
+ * glance entity on every update, "while (div.firstChild)
+ * shadowRoot.append(div.firstChild)", and the loop ran until script
+ * memory ran out: seconds per Home Assistant update, and cards left
+ * unrendered when it threw (build 557). A child moved so is marked as
+ * shadow content, and that host's firstChild, childNodes and
+ * hasChildNodes -- its light-DOM view -- pass over the marked ones, as a
+ * real host's do. Only hosts this has happened to are changed. */
+(function(){
+ var app=P.appendChild,ins=P.insertBefore;
+ function getter(name){
+  for(var o=P;o;o=Object.getPrototypeOf(o)){
+   var d=Object.getOwnPropertyDescriptor(o,name);
+   if(d)return d.get||null;}
+  return null;}
+ var fcGet=getter('firstChild'),cnGet=getter('childNodes');
+ function light(l){
+  var r=[],i;
+  for(i=0;i<l.length;i++)if(!l[i].__vsShadowKid)r.push(l[i]);
+  if(typeof l.item==='function')r.item=function(i){return this[i]||null;};
+  return r;}
+ function view(host){
+  if(Object.prototype.hasOwnProperty.call(host,'__vsShadowView'))return;
+  Object.defineProperty(host,'__vsShadowView',{configurable:true,value:true});
+  if(fcGet)Object.defineProperty(host,'firstChild',{configurable:true,
+   get:function(){var n=fcGet.call(this);
+    while(n&&n.__vsShadowKid)n=n.nextSibling;return n||null;}});
+  if(cnGet)Object.defineProperty(host,'childNodes',{configurable:true,
+   get:function(){return light(cnGet.call(this));}});
+  Object.defineProperty(host,'hasChildNodes',{configurable:true,writable:true,
+   value:function(){return this.firstChild!==null;}});}
+ function mark(parent,node){
+  if(!node||typeof node!=='object')return;
+  if(parent&&parent.__shadow&&node.parentNode===parent){
+   Object.defineProperty(node,'__vsShadowKid',
+    {configurable:true,writable:true,value:true});
+   view(parent);}
+  else if(node.__vsShadowKid)node.__vsShadowKid=false;}
+ P.appendChild=function(node){mark(this,node);return app.apply(this,arguments);};
+ P.insertBefore=function(node,child){mark(this,node);return ins.apply(this,arguments);};
 })();
 
 /* --- instanceof, told apart ----------------------------------------------

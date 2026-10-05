@@ -1974,6 +1974,74 @@ static JSValue win_vita_connected(JSContext *ctx, JSValueConst this_val,
 	return JS_FALSE;
 }
 
+/*
+ * __vitaIsAncestor(a, n): whether a is n or one of its ancestors, true or
+ * false, or undefined when either is not a node (VitaSurf). Node.contains
+ * and the insertion checks climbed parentNode in JavaScript, a crossing
+ * into C and a wrapper per ancestor; card-mod inserts its styles into
+ * every card on every update, and that climb was a third of Home
+ * Assistant's script time.
+ */
+static struct dom_node *anc_node(JSContext *ctx, jsthread *thread,
+				 JSValueConst v)
+{
+	struct dom_node *n;
+	JSValue global, d;
+	bool same;
+
+	if (!JS_IsObject(v)) {
+		return NULL;
+	}
+	n = JS_GetOpaque(v, node_class_id);
+	if (n != NULL) {
+		return n;
+	}
+	/* the document object stands for the document node */
+	global = JS_GetGlobalObject(ctx);
+	d = JS_GetPropertyStr(ctx, global, "document");
+	same = JS_IsObject(d) && JS_VALUE_GET_PTR(d) == JS_VALUE_GET_PTR(v);
+	JS_FreeValue(ctx, d);
+	JS_FreeValue(ctx, global);
+	return same ? (struct dom_node *) thread_document(thread) : NULL;
+}
+
+static JSValue win_vita_is_ancestor(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *a, *n;
+	unsigned depth = 0;
+
+	(void)this_val;
+	if (thread == NULL || argc < 2) {
+		return JS_UNDEFINED;
+	}
+	a = anc_node(ctx, thread, argv[0]);
+	n = anc_node(ctx, thread, argv[1]);
+	if (a == NULL || n == NULL) {
+		return JS_UNDEFINED;
+	}
+	dom_node_ref(n);
+	while (n != NULL && depth++ < 100000) {
+		struct dom_node *up = NULL;
+
+		if (n == a) {
+			dom_node_unref(n);
+			return JS_TRUE;
+		}
+		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+			up = NULL;
+		}
+		dom_node_unref(n);
+		n = up;
+	}
+	if (n != NULL) {
+		dom_node_unref(n);
+	}
+	return JS_FALSE;
+}
+
 /* __vitaMOWatch(id, node, flags, filter): register one watch entry */
 static JSValue win_vita_mo_watch(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
@@ -12866,6 +12934,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaConnected",
 			  JS_NewCFunction(ctx, win_vita_connected,
 					  "__vitaConnected", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaIsAncestor",
+			  JS_NewCFunction(ctx, win_vita_is_ancestor,
+					  "__vitaIsAncestor", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaMOWatch",
 			  JS_NewCFunction(ctx, win_vita_mo_watch,
 					  "__vitaMOWatch", 4));
