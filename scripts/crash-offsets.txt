@@ -147,3 +147,9 @@
 0x422a64
 0x422a74
 0x423edc
+
+# Build 557: data abort on m.youtube.com, main thread, box_construct_element
+#   reading props.containing_block->type (NULL) at the flex blockification
+#   check during a rebuild. Fixed by patch 0327: an element with no
+#   containing block is left out with its subtree.
+0x4391a
