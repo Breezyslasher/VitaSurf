@@ -1,0 +1,31 @@
+diff --git a/include/svgtiny.h b/include/svgtiny.h
+index ad4e60a..6d4e527 100644
+--- a/include/svgtiny.h
++++ b/include/svgtiny.h
+@@ -32,6 +32,10 @@ struct svgtiny_shape {
+ 	svgtiny_colour fill;
+ 	svgtiny_colour stroke;
+ 	int stroke_width;
++	/** the stroke width before it was rounded to a whole pixel
++	 * (VitaSurf): a 2-unit line of a 24-unit icon drawn at 16 pixels
++	 * is 1.33 pixels, which a smooth stroke can draw */
++	float stroke_width_px;
+ };
+ 
+ struct svgtiny_diagram {
+diff --git a/src/svgtiny.c b/src/svgtiny.c
+index 8668583..8502604 100644
+--- a/src/svgtiny.c
++++ b/src/svgtiny.c
+@@ -1410,8 +1410,9 @@ struct svgtiny_shape *svgtiny_add_shape(struct svgtiny_parse_state *state)
+ 		shape->text = 0;
+ 		shape->fill = state->fill;
+ 		shape->stroke = state->stroke;
+-		shape->stroke_width = lroundf((float) state->stroke_width *
+-					      (state->ctm.a + state->ctm.d) / 2.0);
++		shape->stroke_width_px = (float) state->stroke_width *
++					      (state->ctm.a + state->ctm.d) / 2.0f;
++		shape->stroke_width = lroundf(shape->stroke_width_px);
+ 		if (0 < state->stroke_width && shape->stroke_width == 0)
+ 			shape->stroke_width = 1;
+ 	}

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!-- What yamtrack's header and search box need from layout, as
+     Tailwind v4 writes it. A flex row's gaps are part of its natural
+     width, so a pill of an icon and "455 items" with gap: 8px does not
+     wrap its text. An inset written as calc(), left-2 being
+     left: calc(var(--spacing) * 2), places an absolute box. A
+     translation written as calc(), -translate-y-1/2 being
+     calc(calc(1/2 * 100%) * -1), moves it. A button laid out as a
+     flex box keeps its icon, label and chevron on one line.
+     Expected: the pill one line high (19px here; 38 when its text
+     wrapped), the tag 8px in, and moved up by half its 20px height from
+     halfway down a 40px box, so 10px down; the button one line high
+     (24px). Before: pill 38, tag at 0, 0. -->
+<html><head><style>
+:root { --spacing: 0.25rem }
+body { margin: 0; font: 16px sans-serif }
+.pill { display: inline-flex; align-items: center; gap: 8px; height: auto }
+.ico { width: 16px; height: 16px; flex-shrink: 0; background: #00f }
+.box { position: relative; width: 300px; height: 40px; background: #eee }
+.tag { position: absolute; left: calc(var(--spacing) * 2); top: calc(1/2 * 100%);
+	height: 20px; width: 20px; background: #f00;
+	translate: 0 calc(calc(1/2 * 100%) * -1) }
+button.fx { display: flex; align-items: center; gap: 8px; font: 16px sans-serif;
+	padding: 0; border: 0; line-height: 24px }
+</style></head><body>
+<span class="pill" id="pill"><span class="ico"></span><span>455 items</span></span>
+<div class="box"><span class="tag" id="tag"></span></div>
+<button class="fx" id="btn"><span class="ico"></span><span>Completion</span><span class="ico"></span></button>
+<script>
+setTimeout(function(){
+ var b = document.getElementById('box') || document.querySelector('.box');
+ var o = b.getBoundingClientRect();
+ var p = document.getElementById('pill').getBoundingClientRect();
+ var t = document.getElementById('tag').getBoundingClientRect();
+ var n = document.getElementById('btn').getBoundingClientRect();
+ console.log('XX ' + JSON.stringify({pillH: p.height, tagLeft: t.left - o.left,
+   tagTop: t.top - o.top, btnH: n.height}));
+}, 100);
+</script></body></html>

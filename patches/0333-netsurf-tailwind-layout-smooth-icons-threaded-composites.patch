@@ -1,0 +1,800 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 1a9f3e602..c58eda9a2 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -826,7 +826,11 @@ box_button(dom_node *n,
+ 	box->flags |= IS_REPLACED;
+ 	gadget->box = box;
+ 
+-	if (box->type != BOX_BLOCK) {
++	/* a button laid out as a flex box stays one (VitaSurf): made an
++	 * inline block, the icon, label and chevron of a Tailwind
++	 * "flex items-center" button stood on three lines */
++	if (box->type != BOX_BLOCK && box->type != BOX_FLEX &&
++			box->type != BOX_INLINE_FLEX) {
+ 		box->type = BOX_INLINE_BLOCK;
+ 	}
+ 
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index d06d7443a..1bb175b75 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -944,6 +944,7 @@ static void layout_minmax_block(
+ 	bool using_min_border_box = false;
+ 	bool using_max_border_box = false;
+ 	bool child_has_height = false;
++	int flex_items = 0;
+ 
+ 	assert(block->type == BOX_BLOCK ||
+ 			block->type == BOX_FLEX ||
+@@ -1100,6 +1101,7 @@ static void layout_minmax_block(
+ 						min = child->min_width;
+ 				}
+ 				max += child->max_width;
++				flex_items++;
+ 
+ 			} else {
+ 				if (min < child->min_width)
+@@ -1113,6 +1115,25 @@ static void layout_minmax_block(
+ 		}
+ 	}
+ 
++	/*
++	 * The gaps between a row's items are part of its width
++	 * (VitaSurf). Left out, a pill of an icon and "455 items" with
++	 * gap: 8px came out 8px narrower than its content, and the text
++	 * wrapped to fit.
++	 */
++	if (flex_items > 1) {
++		int gap = 0;
++
++		if (css_computed_column_gap_px(block->style,
++				&content->unit_len_ctx, -1, &gap) ==
++				CSS_COLUMN_GAP_SET && gap > 0) {
++			max += gap * (flex_items - 1);
++			if (css_computed_flex_wrap(block->style) ==
++					CSS_FLEX_WRAP_NOWRAP)
++				min += gap * (flex_items - 1);
++		}
++	}
++
+ 	if (max < min) {
+ 		box_dump(stderr, block, 0, true);
+ 		assert(0);
+@@ -4836,72 +4857,59 @@ layout_compute_offsets(const css_unit_ctx *unit_len_ctx,
+ 		       int *bottom,
+ 		       int *left)
+ {
+-	uint32_t type;
+-	css_fixed value = 0;
+-	css_unit unit = CSS_UNIT_PX;
+-
+ 	assert(containing_block->width != UNKNOWN_WIDTH);
+ 	assert(containing_block->width != AUTO);
+ 	assert(containing_block->height != AUTO);
+ 
+-	/* left */
+-	type = css_computed_left(box->style, &value, &unit);
+-	if (type == CSS_LEFT_SET) {
+-		if (unit == CSS_UNIT_PCT) {
+-			*left = FPCT_OF_INT_TOINT(value,
+-					containing_block->width);
+-		} else {
+-			*left = FIXTOINT(css_unit_len2device_px(
+-					box->style, unit_len_ctx,
+-					value, unit));
+-		}
+-	} else {
++	/*
++	 * The _px readers resolve calc() as well as percentages
++	 * (VitaSurf): Tailwind v4 writes every inset as one, left-2 is
++	 * left: calc(var(--spacing) * 2), and the plain readers left them
++	 * all at auto, so an icon placed inside a search box stood after
++	 * it instead.
++	 */
++	if (css_computed_left_px(box->style, unit_len_ctx,
++			containing_block->width, left) != CSS_LEFT_SET)
+ 		*left = AUTO;
+-	}
+-
+-	/* right */
+-	type = css_computed_right(box->style, &value, &unit);
+-	if (type == CSS_RIGHT_SET) {
+-		if (unit == CSS_UNIT_PCT) {
+-			*right = FPCT_OF_INT_TOINT(value,
+-					containing_block->width);
+-		} else {
+-			*right = FIXTOINT(css_unit_len2device_px(
+-					box->style, unit_len_ctx,
+-					value, unit));
+-		}
+-	} else {
++	if (css_computed_right_px(box->style, unit_len_ctx,
++			containing_block->width, right) != CSS_RIGHT_SET)
+ 		*right = AUTO;
+-	}
++	if (css_computed_top_px(box->style, unit_len_ctx,
++			containing_block->height, top) != CSS_TOP_SET)
++		*top = AUTO;
++	if (css_computed_bottom_px(box->style, unit_len_ctx,
++			containing_block->height, bottom) != CSS_BOTTOM_SET)
++		*bottom = AUTO;
+ 
+-	/* top */
+-	type = css_computed_top(box->style, &value, &unit);
+-	if (type == CSS_TOP_SET) {
+-		if (unit == CSS_UNIT_PCT) {
+-			*top = FPCT_OF_INT_TOINT(value,
+-					containing_block->height);
++	/* the fix-ups css_computed_left() and the rest make, which the
++	 * _px readers leave out: CSS 2.1 9.3.2 and 9.4.3 */
++	switch (css_computed_position(box->style)) {
++	case CSS_POSITION_STATIC:
++		*top = *right = *bottom = *left = AUTO;
++		break;
++	case CSS_POSITION_RELATIVE:
++		if (*left == AUTO && *right == AUTO) {
++			*left = *right = 0;
++		} else if (*left == AUTO) {
++			*left = -*right;
++		} else if (*right == AUTO) {
++			*right = -*left;
++		} else if (css_computed_direction(box->style) ==
++				CSS_DIRECTION_RTL) {
++			*left = -*right;
+ 		} else {
+-			*top = FIXTOINT(css_unit_len2device_px(
+-					box->style, unit_len_ctx,
+-					value, unit));
++			*right = -*left;
+ 		}
+-	} else {
+-		*top = AUTO;
+-	}
+-
+-	/* bottom */
+-	type = css_computed_bottom(box->style, &value, &unit);
+-	if (type == CSS_BOTTOM_SET) {
+-		if (unit == CSS_UNIT_PCT) {
+-			*bottom = FPCT_OF_INT_TOINT(value,
+-					containing_block->height);
++		if (*top == AUTO && *bottom == AUTO) {
++			*top = *bottom = 0;
++		} else if (*top == AUTO) {
++			*top = -*bottom;
+ 		} else {
+-			*bottom = FIXTOINT(css_unit_len2device_px(
+-					box->style, unit_len_ctx,
+-					value, unit));
++			*bottom = -*top;
+ 		}
+-	} else {
+-		*bottom = AUTO;
++		break;
++	default:
++		break;
+ 	}
+ }
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index ade762877..093db6f89 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -67,6 +67,14 @@
+ #include "html/layout_internal.h"
+ #include "html/layout.h"
+ #include "html/bidi.h"
++#include "image/image_cache.h"
++
++/*
++ * Whether the redraw going on is the one on screen (VitaSurf), as the
++ * redraw contexts painting aside into bitmaps say they are not; see
++ * image_cache_raster_enter().
++ */
++static bool html_redraw_live;
+ 
+ 
+ bool html_redraw_debug = false;
+@@ -4183,9 +4191,16 @@ static bool html_composite_raster(const struct rect *area,
+ 	job.clip.x1 = w;
+ 	job.clip.y1 = h;
+ 
+-	if (vitasurf_raster(w, h, html_composite_trampoline, &job,
+-			out) != NSERROR_OK)
+-		*out = NULL;
++	{
++		struct image_cache_raster_state saved;
++
++		image_cache_raster_enter(html_redraw_live, job.ox, job.oy,
++				&saved);
++		if (vitasurf_raster(w, h, html_composite_trampoline, &job,
++				out) != NSERROR_OK)
++			*out = NULL;
++		image_cache_raster_leave(&saved);
++	}
+ 	*ox = job.ox;
+ 	*oy = job.oy;
+ 	return true;
+@@ -4597,10 +4612,12 @@ static bool html_redraw_placeholder(const html_content *html,
+ 	px = (int) (plot_style_fixed_to_float(fstyle.size) *
+ 			FIXTOFLT(nscss_screen_dpi) / 72.0f + 0.5f);
+ 
+-	/* the field's text starts four pixels in (box_textarea.c) */
+-	tx = x + 4 * scale;
++	/* where the field's own text starts: layout gives the textarea
++	 * the box's padding (layout.c), which Tailwind's pl-10 makes
++	 * room for an icon with */
++	tx = x + box->padding[LEFT] * scale;
+ 	if (box->gadget->type == GADGET_TEXTAREA)
+-		ty = y + 4 * scale + px;
++		ty = y + box->padding[TOP] * scale + px;
+ 	else
+ 		ty = y + (padding_height + px * 7 / 10) / 2;
+ 
+@@ -7265,11 +7282,20 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 		const struct rect *clip, const struct redraw_context *ctx)
+ {
+ 	bool result;
++	bool live = html_redraw_live;
++
++	/* a redraw inside a bitmap painted aside keeps what the one
++	 * around it was (VitaSurf) */
++	if (ctx->interactive)
++		html_redraw_live = true;
++	else if (!image_cache_in_raster())
++		html_redraw_live = false;
+ 
+ 	/* the right-to-left runs drawn last time can go (VitaSurf) */
+ 	html_bidi_redraw_begin();
+ 	result = html_redraw_content(c, data, clip, ctx);
+ 	html_bidi_redraw_end();
++	html_redraw_live = live;
+ 	return result;
+ }
+ 
+diff --git a/content/handlers/image/image_cache.c b/content/handlers/image/image_cache.c
+index 96155388b..5cdc8379b 100644
+--- a/content/handlers/image/image_cache.c
++++ b/content/handlers/image/image_cache.c
+@@ -1046,6 +1046,39 @@ void image_cache_frame(bool hold, unsigned int budget_us)
+ 	decode_frame_n = 0;
+ }
+ 
++/* painting aside, see image_cache_raster_enter() */
++static struct image_cache_raster_state raster;
++
++/* exported interface documented in image_cache.h */
++void image_cache_raster_enter(bool live, int ox, int oy,
++		struct image_cache_raster_state *saved)
++{
++	*saved = raster;
++	/* a bitmap painted inside another lands within that one */
++	raster.live = raster.active ? raster.live : live;
++	raster.ox = raster.ox + ox;
++	raster.oy = raster.oy + oy;
++	raster.active = true;
++}
++
++/* exported interface documented in image_cache.h */
++void image_cache_raster_leave(const struct image_cache_raster_state *saved)
++{
++	raster = *saved;
++}
++
++/* exported interface documented in image_cache.h */
++bool image_cache_in_raster(void)
++{
++	return raster.active;
++}
++
++/** Whether a redraw is the one on screen, or paints aside for it. */
++static inline bool image_cache_live(const struct redraw_context *ctx)
++{
++	return ctx->interactive || (raster.active && raster.live);
++}
++
+ /* exported interface documented in image_cache.h */
+ int image_cache_take_deferred(struct rect *out, const void **key, int max)
+ {
+@@ -1112,6 +1145,13 @@ static void image_cache_defer(const struct content_redraw_data *data,
+ 		/* nothing of it shows: nothing to come back for */
+ 		return;
+ 	}
++	if (raster.active) {
++		/* where the bitmap it was painted into lands */
++		r.x0 += raster.ox;
++		r.x1 += raster.ox;
++		r.y0 += raster.oy;
++		r.y1 += raster.oy;
++	}
+ 	{
+ 		int i;
+ 		struct rect *m;
+@@ -1616,7 +1656,7 @@ bool image_cache_redraw(struct content *c,
+ 			/* a large one the decode thread can take goes
+ 			 * there, and is drawn as nothing until it is
+ 			 * back (VitaSurf) */
+-			if (ctx->interactive && decoder_on &&
++			if (image_cache_live(ctx) && decoder_on &&
+ 			    centry->threadsafe &&
+ 			    (uint64_t)c->width * (uint64_t)c->height >
+ 					IMAGE_CACHE_HOLD_PIXELS) {
+@@ -1631,7 +1671,7 @@ bool image_cache_redraw(struct content *c,
+ 			/* on screen, decoding waits its turn and the
+ 			 * image is drawn as nothing meanwhile: it is not
+ 			 * broken, so this is not a failure (VitaSurf) */
+-			if (ctx->interactive &&
++			if (image_cache_live(ctx) &&
+ 			    !image_cache_may_decode(c, data, clip)) {
+ 				return true;
+ 			}
+@@ -1653,7 +1693,7 @@ bool image_cache_redraw(struct content *c,
+ 		/* decoded for a smaller size than it is now drawn at:
+ 		 * decode it again for this one, drawing what there is
+ 		 * meanwhile (VitaSurf) */
+-		if (ctx->interactive && decoder_on && centry->threadsafe &&
++		if (image_cache_live(ctx) && decoder_on && centry->threadsafe &&
+ 		    !centry->queued && c->decode_hint_width > 0 &&
+ 		    image_cache_wants_bigger(centry, data)) {
+ 			image_cache_decoder_queue(centry,
+diff --git a/content/handlers/image/image_cache.h b/content/handlers/image/image_cache.h
+index 1ccf4cf40..536ac07ec 100644
+--- a/content/handlers/image/image_cache.h
++++ b/content/handlers/image/image_cache.h
+@@ -253,6 +253,35 @@ void image_cache_frame(bool hold, unsigned int budget_us);
+  */
+ int image_cache_take_deferred(struct rect *out, const void **key, int max);
+ 
++/**
++ * Where a redraw is painting aside, into a bitmap (VitaSurf).
++ *
++ * A box cut to rounded corners, or seen through opacity or a filter,
++ * is painted into a bitmap first, through a redraw that is not the
++ * one on screen. An image in it was decoded there and then, on the
++ * main thread: a card of poster JPEGs held its frame for a third of a
++ * second each. Between enter and leave, an image the decode threads
++ * can take goes to them when the redraw around the bitmap is the one
++ * on screen, and where it is to be drawn again is moved by the
++ * bitmap's place on screen.
++ *
++ * \param live  whether the redraw around the bitmap is on screen
++ * \param ox    where the bitmap's left edge lands, in that redraw
++ * \param oy    where its top edge lands
++ * \param saved filled with what to give leave
++ */
++struct image_cache_raster_state {
++	bool active;
++	bool live;
++	int ox, oy;
++};
++void image_cache_raster_enter(bool live, int ox, int oy,
++		struct image_cache_raster_state *saved);
++void image_cache_raster_leave(const struct image_cache_raster_state *saved);
++
++/** Whether a redraw is painting aside now. */
++bool image_cache_in_raster(void);
++
+ /**
+  * Whether what a deferred image waits for is done, so that drawing its
+  * place again will draw it (VitaSurf).
+diff --git a/content/handlers/image/svg.c b/content/handlers/image/svg.c
+index 07a224dbd..d413874b6 100644
+--- a/content/handlers/image/svg.c
++++ b/content/handlers/image/svg.c
+@@ -564,8 +564,12 @@ svg_redraw_internal(svg_content *svg,
+ 				pstyle.stroke_colour = mask ? mask_colour :
+ 					BGR(diagram->shape[i].stroke);
+ 			}
+-			pstyle.stroke_width = plot_style_int_to_fixed(
+-					diagram->shape[i].stroke_width);
++			/* the width as drawn, fractions and all, which a
++			 * frontend that strokes smoothly can use
++			 * (VitaSurf) */
++			pstyle.stroke_width = (plot_style_fixed)
++				(diagram->shape[i].stroke_width_px *
++				 PLOT_STYLE_SCALE + 0.5f);
+ 
+ 			/* fill style */
+ 			if (diagram->shape[i].fill == svgtiny_TRANSPARENT) {
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index 8cf697e43..d95f8ea5d 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -18,6 +18,7 @@
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <math.h>
+ #include <stdio.h>
+ #include <stdbool.h>
+ #include <stdlib.h>
+@@ -284,6 +285,377 @@ static nsfb_colour_t fb_colour(colour c)
+ 			((0xffu - ((c >> 24) & 0xff)) << 24));
+ }
+ 
++/*
++ * Small paths drawn smooth (VitaSurf).
++ *
++ * libnsfb strokes a path as one-pixel steps and fills it with whole
++ * pixels, and its stroke width is a whole number: an icon drawn with a
++ * 1.33 pixel line -- a 24-unit Lucide icon at 16 pixels -- came out as
++ * a thin, jagged line one pixel wide, dim beside the same icon in any
++ * other browser. Its path also ran a line from the end of each subpath
++ * to the start of the next.
++ *
++ * A path whose box is small enough is drawn here instead: how much of
++ * each pixel the stroke or the fill covers is worked out, and the path
++ * is plotted as a bitmap of its colour with that much alpha. A stroke
++ * covers what lies within half its width of the line, which gives the
++ * round joins and caps the icon sets draw with; a fill is sampled at
++ * four heights a pixel, each span measured exactly across, by the
++ * nonzero rule SVG fills with. A larger path is left to libnsfb.
++ */
++#define FB_AA_MAX_AREA (256 * 256)
++#define FB_AA_MAX_POINTS 4096
++
++struct fb_aa_pt {
++	float x, y;
++};
++
++static struct fb_aa_pt fb_aa_pts[FB_AA_MAX_POINTS];
++static int fb_aa_sub_start[FB_AA_MAX_POINTS];
++static bool fb_aa_sub_closed[FB_AA_MAX_POINTS];
++static float *fb_aa_cov;
++static nsfb_colour_t *fb_aa_px;
++static float *fb_aa_cross;
++static int *fb_aa_dir;
++static int fb_aa_cap;	/* area the two buffers above hold */
++static int fb_aa_cross_cap;
++
++/** Flatten a path into subpaths of points, in device coordinates. */
++static bool fb_aa_flatten(const float *p, unsigned int n,
++		const float t[6], int *npts, int *nsub)
++{
++	unsigned int i = 0;
++	int pc = 0, sc = 0;
++	float cx = 0, cy = 0;
++
++#define AX(x, y) (t[0] * (x) + t[2] * (y) + t[4])
++#define AY(x, y) (t[1] * (x) + t[3] * (y) + t[5])
++	while (i < n) {
++		switch ((int)p[i]) {
++		case PLOTTER_PATH_MOVE:
++			if (i + 2 >= n || sc >= FB_AA_MAX_POINTS ||
++			    pc >= FB_AA_MAX_POINTS)
++				return false;
++			fb_aa_sub_start[sc] = pc;
++			fb_aa_sub_closed[sc] = false;
++			sc++;
++			cx = AX(p[i + 1], p[i + 2]);
++			cy = AY(p[i + 1], p[i + 2]);
++			fb_aa_pts[pc].x = cx;
++			fb_aa_pts[pc].y = cy;
++			pc++;
++			i += 3;
++			break;
++		case PLOTTER_PATH_LINE:
++			if (i + 2 >= n || sc == 0 || pc >= FB_AA_MAX_POINTS)
++				return false;
++			cx = AX(p[i + 1], p[i + 2]);
++			cy = AY(p[i + 1], p[i + 2]);
++			fb_aa_pts[pc].x = cx;
++			fb_aa_pts[pc].y = cy;
++			pc++;
++			i += 3;
++			break;
++		case PLOTTER_PATH_BEZIER: {
++			float x1, y1, x2, y2, x3, y3, len;
++			int k, steps;
++
++			if (i + 6 >= n || sc == 0)
++				return false;
++			x1 = AX(p[i + 1], p[i + 2]);
++			y1 = AY(p[i + 1], p[i + 2]);
++			x2 = AX(p[i + 3], p[i + 4]);
++			y2 = AY(p[i + 3], p[i + 4]);
++			x3 = AX(p[i + 5], p[i + 6]);
++			y3 = AY(p[i + 5], p[i + 6]);
++			/* the control polygon's length bounds the curve's */
++			len = sqrtf((x1 - cx) * (x1 - cx) +
++					(y1 - cy) * (y1 - cy)) +
++				sqrtf((x2 - x1) * (x2 - x1) +
++					(y2 - y1) * (y2 - y1)) +
++				sqrtf((x3 - x2) * (x3 - x2) +
++					(y3 - y2) * (y3 - y2));
++			steps = 2 + (int)(len / 3);
++			if (steps > 32)
++				steps = 32;
++			if (pc + steps > FB_AA_MAX_POINTS)
++				return false;
++			for (k = 1; k <= steps; k++) {
++				float u = (float)k / steps, v = 1 - u;
++				float a = v * v * v, b = 3 * v * v * u;
++				float c = 3 * v * u * u, d = u * u * u;
++
++				fb_aa_pts[pc].x = a * cx + b * x1 + c * x2 +
++						d * x3;
++				fb_aa_pts[pc].y = a * cy + b * y1 + c * y2 +
++						d * y3;
++				pc++;
++			}
++			cx = x3;
++			cy = y3;
++			i += 7;
++			break;
++		}
++		case PLOTTER_PATH_CLOSE:
++			if (sc > 0)
++				fb_aa_sub_closed[sc - 1] = true;
++			i += 1;
++			break;
++		default:
++			return false;
++		}
++	}
++#undef AX
++#undef AY
++	*npts = pc;
++	*nsub = sc;
++	return pc > 0;
++}
++
++/** The points of subpath s: first index, and one past its last. */
++static inline void fb_aa_sub(int s, int nsub, int npts, int *a, int *b)
++{
++	*a = fb_aa_sub_start[s];
++	*b = (s + 1 < nsub) ? fb_aa_sub_start[s + 1] : npts;
++}
++
++/** Cover what lies within hw of the segment, keeping the most of it. */
++static void fb_aa_segment(float *cov, int w, int h, float ox, float oy,
++		struct fb_aa_pt a, struct fb_aa_pt b, float hw)
++{
++	float dx = b.x - a.x, dy = b.y - a.y;
++	float l2 = dx * dx + dy * dy;
++	int x0 = (int)floorf((a.x < b.x ? a.x : b.x) - hw - 1 - ox);
++	int x1 = (int)ceilf((a.x > b.x ? a.x : b.x) + hw + 1 - ox);
++	int y0 = (int)floorf((a.y < b.y ? a.y : b.y) - hw - 1 - oy);
++	int y1 = (int)ceilf((a.y > b.y ? a.y : b.y) + hw + 1 - oy);
++	int x, y;
++
++	if (x0 < 0) x0 = 0;
++	if (y0 < 0) y0 = 0;
++	if (x1 > w) x1 = w;
++	if (y1 > h) y1 = h;
++	for (y = y0; y < y1; y++) {
++		float py = oy + y + 0.5f;
++
++		for (x = x0; x < x1; x++) {
++			float px = ox + x + 0.5f;
++			float u = 0, ex, ey, d, c;
++
++			if (l2 > 0) {
++				u = ((px - a.x) * dx + (py - a.y) * dy) / l2;
++				if (u < 0) u = 0;
++				if (u > 1) u = 1;
++			}
++			ex = px - (a.x + u * dx);
++			ey = py - (a.y + u * dy);
++			d = sqrtf(ex * ex + ey * ey);
++			c = hw + 0.5f - d;
++			if (c > 1) c = 1;
++			if (c > cov[y * w + x])
++				cov[y * w + x] = c;
++		}
++	}
++}
++
++/** Add an exact span [xa, xb) of one sub-row's weight to a row. */
++static void fb_aa_span(float *row, int w, float xa, float xb, float wt)
++{
++	int i0, i1, i;
++
++	if (xa < 0) xa = 0;
++	if (xb > w) xb = w;
++	if (xb <= xa)
++		return;
++	i0 = (int)xa;
++	i1 = (int)xb;
++	if (i0 == i1) {
++		row[i0] += (xb - xa) * wt;
++		return;
++	}
++	row[i0] += (i0 + 1 - xa) * wt;
++	for (i = i0 + 1; i < i1 && i < w; i++)
++		row[i] += wt;
++	if (i1 < w)
++		row[i1] += (xb - i1) * wt;
++}
++
++/** Cover what the path fills, by the nonzero rule. */
++static bool fb_aa_fill(float *cov, int w, int h, float ox, float oy,
++		int npts, int nsub)
++{
++	int y, k, s;
++
++	if (fb_aa_cross_cap < npts + nsub) {
++		float *c = realloc(fb_aa_cross,
++				(npts + nsub) * sizeof(*c));
++		int *d;
++
++		if (c == NULL)
++			return false;
++		fb_aa_cross = c;
++		d = realloc(fb_aa_dir, (npts + nsub) * sizeof(*d));
++		if (d == NULL)
++			return false;
++		fb_aa_dir = d;
++		fb_aa_cross_cap = npts + nsub;
++	}
++	for (y = 0; y < h; y++) {
++		for (k = 0; k < 4; k++) {
++			float sy = oy + y + (k + 0.5f) / 4;
++			int nc = 0, i, j, wind;
++
++			for (s = 0; s < nsub; s++) {
++				int a, b;
++
++				fb_aa_sub(s, nsub, npts, &a, &b);
++				/* every subpath is filled as closed */
++				for (i = a; i < b; i++) {
++					struct fb_aa_pt p0 = fb_aa_pts[i];
++					struct fb_aa_pt p1 = fb_aa_pts[
++						(i + 1 < b) ? i + 1 : a];
++
++					if ((p0.y <= sy) == (p1.y <= sy))
++						continue;
++					fb_aa_cross[nc] = p0.x + (sy - p0.y) *
++						(p1.x - p0.x) / (p1.y - p0.y);
++					fb_aa_dir[nc] = (p1.y > p0.y) ? 1 : -1;
++					nc++;
++				}
++			}
++			/* a few crossings a row: insertion sort */
++			for (i = 1; i < nc; i++) {
++				float cx = fb_aa_cross[i];
++				int cd = fb_aa_dir[i];
++
++				for (j = i; j > 0 && fb_aa_cross[j - 1] > cx;
++						j--) {
++					fb_aa_cross[j] = fb_aa_cross[j - 1];
++					fb_aa_dir[j] = fb_aa_dir[j - 1];
++				}
++				fb_aa_cross[j] = cx;
++				fb_aa_dir[j] = cd;
++			}
++			wind = 0;
++			for (i = 0; i < nc; i++) {
++				int was = wind;
++
++				wind += fb_aa_dir[i];
++				if (was != 0 && i > 0)
++					fb_aa_span(cov + y * w, w,
++						fb_aa_cross[i - 1] - ox,
++						fb_aa_cross[i] - ox, 0.25f);
++			}
++		}
++	}
++	return true;
++}
++
++/** Plot a coverage buffer in one colour, as alpha. */
++static bool fb_aa_plot(const float *cov, int w, int h, int ox, int oy,
++		nsfb_colour_t colour)
++{
++	unsigned int alpha = (colour >> 24) & 0xff;
++	nsfb_bbox_t loc;
++	int i;
++
++	for (i = 0; i < w * h; i++) {
++		float c = cov[i];
++		unsigned int a;
++
++		if (c <= 0) {
++			fb_aa_px[i] = 0;
++			continue;
++		}
++		if (c > 1)
++			c = 1;
++		a = (unsigned int)(c * alpha + 0.5f);
++		fb_aa_px[i] = (colour & 0x00ffffff) | (a << 24);
++	}
++	loc.x0 = ox;
++	loc.y0 = oy;
++	loc.x1 = ox + w;
++	loc.y1 = oy + h;
++	return nsfb_plot_bitmap(nsfb, &loc, fb_aa_px, w, h, w, true);
++}
++
++/**
++ * Draw a small path smooth.
++ *
++ * \return true if it was drawn, false to leave it to libnsfb
++ */
++static bool fb_aa_path(const plot_style_t *pstyle, const float *p,
++		unsigned int n, const float transform[6])
++{
++	float hw = 0, minx, miny, maxx, maxy;
++	int npts = 0, nsub = 0, i, s, w, h, ox, oy;
++
++	if (!fb_aa_flatten(p, n, transform, &npts, &nsub))
++		return false;
++	if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
++		hw = plot_style_fixed_to_float(pstyle->stroke_width) / 2;
++		if (hw < 0.5f)
++			hw = 0.5f;
++	}
++	minx = maxx = fb_aa_pts[0].x;
++	miny = maxy = fb_aa_pts[0].y;
++	for (i = 1; i < npts; i++) {
++		if (fb_aa_pts[i].x < minx) minx = fb_aa_pts[i].x;
++		if (fb_aa_pts[i].x > maxx) maxx = fb_aa_pts[i].x;
++		if (fb_aa_pts[i].y < miny) miny = fb_aa_pts[i].y;
++		if (fb_aa_pts[i].y > maxy) maxy = fb_aa_pts[i].y;
++	}
++	ox = (int)floorf(minx - hw - 1);
++	oy = (int)floorf(miny - hw - 1);
++	w = (int)ceilf(maxx + hw + 1) - ox;
++	h = (int)ceilf(maxy + hw + 1) - oy;
++	if (w <= 0 || h <= 0 || w * h > FB_AA_MAX_AREA)
++		return false;
++
++	if (fb_aa_cap < w * h) {
++		float *c = realloc(fb_aa_cov, w * h * sizeof(*c));
++		nsfb_colour_t *px;
++
++		if (c == NULL)
++			return false;
++		fb_aa_cov = c;
++		px = realloc(fb_aa_px, w * h * sizeof(*px));
++		if (px == NULL)
++			return false;
++		fb_aa_px = px;
++		fb_aa_cap = w * h;
++	}
++
++	if (pstyle->fill_type != PLOT_OP_TYPE_NONE) {
++		memset(fb_aa_cov, 0, w * h * sizeof(*fb_aa_cov));
++		if (!fb_aa_fill(fb_aa_cov, w, h, ox, oy, npts, nsub))
++			return false;
++		fb_aa_plot(fb_aa_cov, w, h, ox, oy,
++				fb_colour(pstyle->fill_colour));
++	}
++	if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
++		memset(fb_aa_cov, 0, w * h * sizeof(*fb_aa_cov));
++		for (s = 0; s < nsub; s++) {
++			int a, b;
++
++			fb_aa_sub(s, nsub, npts, &a, &b);
++			if (b - a == 1)
++				/* a dot: a zero-length segment */
++				fb_aa_segment(fb_aa_cov, w, h, ox, oy,
++					fb_aa_pts[a], fb_aa_pts[a], hw);
++			for (i = a; i + 1 < b; i++)
++				fb_aa_segment(fb_aa_cov, w, h, ox, oy,
++					fb_aa_pts[i], fb_aa_pts[i + 1], hw);
++			if (fb_aa_sub_closed[s] && b - a > 2)
++				fb_aa_segment(fb_aa_cov, w, h, ox, oy,
++					fb_aa_pts[b - 1], fb_aa_pts[a], hw);
++		}
++		fb_aa_plot(fb_aa_cov, w, h, ox, oy,
++				fb_colour(pstyle->stroke_colour));
++	}
++	return true;
++}
++
+ /**
+  * Plots a path.
+  *
+@@ -320,6 +692,11 @@ framebuffer_plot_path(const struct redraw_context *ctx,
+ 		return NSERROR_OK;
+ 	}
+ 
++	/* a small one is drawn smooth (VitaSurf) */
++	if (fb_aa_path(pstyle, p, n, transform)) {
++		return NSERROR_OK;
++	}
++
+ 	/* every element of p becomes at most one path operation */
+ 	ops = malloc(sizeof(*ops) * n);
+ 	if (ops == NULL) {
