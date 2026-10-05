@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<!-- Tailwind v4 registers its variables with @property and spends them
+     without fallbacks: -translate-x-full is
+     "--tw-translate-x: -100%; translate: var(--tw-translate-x)
+     var(--tw-translate-y)", and border is
+     "border-style: var(--tw-border-style)". Three things went wrong.
+     @property was dropped, so --tw-translate-y had no value and the
+     whole declaration with it. The nesting pass emptied every
+     @property (and @font-face) block in a sheet that used nesting. And
+     translate, rotate and scale were stored in transform's place, so
+     Tailwind's ".transform { transform: var(--tw-rotate-x,) ... }" on
+     the same element threw the translation away; yamtrack's sidebar
+     stayed on screen over the first column of cards.
+     Expected: the red bar is off the left edge and not drawn; the
+     green bar starts 50px left of the others; the blue box has a solid
+     3px black border; the yellow bar's child is not moved (inherits:
+     false); the magenta bar reads its registered initial colour; the
+     cyan bar is drawn twice as wide about its centre, and its 10px
+     translation, which comes after the scale, is doubled to 20px:
+     from x=70 to x=270. -->
+<html><head><style>
+@property --tw-translate-x { syntax: "*"; inherits: false; initial-value: 0 }
+@property --tw-translate-y { syntax: "*"; inherits: false; initial-value: 0 }
+@property --tw-border-style { syntax: "*"; inherits: false; initial-value: solid }
+@property --paint { syntax: "<color>"; inherits: true; initial-value: #f0f }
+body { margin: 0 0 0 100px; width: 400px }
+div { height: 20px; margin-bottom: 4px }
+.nest { color: black; @supports (color: red) { color: black; } }
+.full { width: 300px; background: #f00; position: fixed; top: 0; left: 0;
+	--tw-translate-x: -100%;
+	translate: var(--tw-translate-x) var(--tw-translate-y) }
+.transform { transform: var(--tw-rotate-x,) var(--tw-skew-x,) }
+.half { width: 100px; background: #0f0; --tw-translate-x: -50px;
+	translate: var(--tw-translate-x) var(--tw-translate-y) }
+.border { width: 100px; background: #00f; border-width: 3px;
+	border-color: #000; border-style: var(--tw-border-style) }
+.parent { width: 200px; background: #ff0; --tw-translate-x: 30px;
+	translate: var(--tw-translate-x) var(--tw-translate-y) }
+.child { width: 50px; background: #840; --tw-translate-y: 0px;
+	translate: var(--tw-translate-x) var(--tw-translate-y) }
+.paint { width: 100px; background: var(--paint) }
+.both { width: 100px; background: #0ff; transform: translateX(10px);
+	scale: 2 1 }
+</style></head><body>
+<div class="full transform nest"></div>
+<div style="height:30px"></div>
+<div class="half transform"></div>
+<div class="border"></div>
+<div class="parent"><div class="child"></div></div>
+<div class="paint"></div>
+<div class="both"></div>
+<script>
+setTimeout(function(){
+ var r = {};
+ ['full','half','border','parent','child','both'].forEach(function(c){
+  var b = document.querySelector('.'+c).getBoundingClientRect();
+  r[c] = [b.left, b.width];
+ });
+ r.paint = getComputedStyle(document.querySelector('.paint')).backgroundColor;
+ r.borderStyle = getComputedStyle(document.querySelector('.border')).borderTopStyle;
+ console.log('XX ' + JSON.stringify(r));
+}, 100);
+</script>
+</body></html>
