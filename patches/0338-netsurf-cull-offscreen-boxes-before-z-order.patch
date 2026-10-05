@@ -1,0 +1,221 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index ed1ddedb2..c4b848a6a 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -4199,6 +4199,10 @@ bool html_restyle_attrs(html_content *c,
+ {
+ 	unsigned budget = HTML_ATTR_BUDGET, i;
+ 	enum box_restyle res = BOX_RESTYLE_SAME, r;
++	/* what a paint-only change has to draw again: the changed
++	 * elements, unless a sibling selector reached past them */
++	struct rect area = { 1, 1, 0, 0 };
++	bool area_whole = false;
+ 
+ 	why[0] = '\0';
+ 	if (c->layout == NULL || c->bctx == NULL || c->reflowing ||
+@@ -4294,6 +4298,8 @@ bool html_restyle_attrs(html_content *c,
+ 						&budget);
+ 				if (r > res)
+ 					res = r;
++				if (r != BOX_RESTYLE_SAME)
++					area_whole = true;
+ 			}
+ 			if (res == BOX_RESTYLE_LAYOUT)
+ 				ATTR_WHY("%s on <%s>: %s", name,
+@@ -4315,6 +4321,8 @@ bool html_restyle_attrs(html_content *c,
+ 
+ 		/* what the box keeps of the attribute itself */
+ 		box = box_for_node(ch->node);
++		if (box != NULL)
++			html_animation_area(ch->node, &area);
+ 		if (box != NULL && strcasecmp(name, "id") == 0) {
+ 			lwc_string *id = NULL;
+ 
+@@ -4358,9 +4366,14 @@ bool html_restyle_attrs(html_content *c,
+ 		snprintf(why, why_len, "the page could not be laid out now");
+ 		res = BOX_RESTYLE_LAYOUT;
+ 	}
+-	if (res == BOX_RESTYLE_PAINT)
+-		content__request_redraw(&c->base, 0, 0,
+-				c->base.width, c->base.height);
++	if (res == BOX_RESTYLE_PAINT) {
++		if (area_whole || area.x0 >= area.x1)
++			content__request_redraw(&c->base, 0, 0,
++					c->base.width, c->base.height);
++		else
++			content__request_redraw(&c->base, area.x0, area.y0,
++					area.x1 - area.x0, area.y1 - area.y0);
++	}
+ 	*result = (int) res;
+ 	return true;
+ }
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 228e289a5..7c13c4dda 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -5410,6 +5410,40 @@ static int html_z_cmp(const void *a, const void *b)
+  * here sets its own positioned descendants aside in the same list, so
+  * the rest is sorted again whenever it grows.
+  */
++/*
++ * Sort what a painted box added to the end of a list and merge it into
++ * the sorted rest (VitaSurf), rather than sorting the whole rest again:
++ * every positioned card that set its own positioned children aside had
++ * the hundreds after it sorted once more.
++ */
++static void html_z_merge(struct html_z_list *l, unsigned from,
++		unsigned sorted)
++{
++	unsigned a = from, b = sorted, k = 0, n = l->n - from;
++	struct html_z_entry *tmp;
++
++	qsort(l->e + sorted, l->n - sorted, sizeof(*l->e), html_z_cmp);
++	if (sorted == from)
++		return;
++	tmp = malloc(n * sizeof(*tmp));
++	if (tmp == NULL) {
++		qsort(l->e + from, n, sizeof(*l->e), html_z_cmp);
++		return;
++	}
++	while (a < sorted && b < l->n) {
++		if (html_z_cmp(&l->e[b], &l->e[a]) < 0)
++			tmp[k++] = l->e[b++];
++		else
++			tmp[k++] = l->e[a++];
++	}
++	while (a < sorted)
++		tmp[k++] = l->e[a++];
++	while (b < l->n)
++		tmp[k++] = l->e[b++];
++	memcpy(l->e + from, tmp, n * sizeof(*tmp));
++	free(tmp);
++}
++
+ static bool html_z_flush(const html_content *html, struct html_z_list *l,
+ 		float scale)
+ {
+@@ -5421,7 +5455,7 @@ static bool html_z_flush(const html_content *html, struct html_z_list *l,
+ 		struct box *was = html_z_painting;
+ 
+ 		if (sorted != l->n) {
+-			qsort(l->e + i, l->n - i, sizeof(*l->e), html_z_cmp);
++			html_z_merge(l, i, sorted > i ? sorted : i);
+ 			sorted = l->n;
+ 		}
+ 		e = l->e[i++];
+@@ -5675,6 +5709,53 @@ static bool html_faces_away(const html_content *html, const struct box *box)
+ 	return away;
+ }
+ 
++/*
++ * Whether a box and everything in it lies outside what is being drawn
++ * (VitaSurf). Its descendant bbox covers its shadows, outline, blur and
++ * transform, so nothing of it can show. Asked before anything else: a
++ * positioned box was set aside for its stacking context first, sorted
++ * with the rest and only then found to be off screen, and on a page of
++ * 455 positioned cards every redraw of the sticky header's strip sorted
++ * all of them -- 30 ms a redraw on the Vita, a fifth of a second as the
++ * scroll went further down. Boxes whose place is decided while drawing
++ * (sticky, fixed, anchored, columns) are left to that.
++ */
++static bool html_box_culled(const html_content *html, const struct box *box,
++		int x_parent, int y_parent, const struct rect *clip,
++		float scale)
++{
++	int x0, y0, x1, y1;
++
++	if (box == html->layout || box == html_composite_active ||
++			box == html_z_painting)
++		return false;
++	switch (box->type) {
++	case BOX_BLOCK:
++	case BOX_INLINE_BLOCK:
++	case BOX_FLEX:
++	case BOX_INLINE_FLEX:
++	case BOX_TABLE:
++		break;
++	default:
++		return false;
++	}
++	if (box->flags & (ANCHORED | MULTICOL_PIECES))
++		return false;
++	if (box->style != NULL) {
++		uint8_t position = css_computed_position(box->style);
++
++		if (position == CSS_POSITION_STICKY ||
++				position == CSS_POSITION_FIXED)
++			return false;
++	}
++	x0 = (x_parent + box->x + box->descendant_x0) * scale - 2;
++	y0 = (y_parent + box->y + box->descendant_y0) * scale - 2;
++	x1 = (x_parent + box->x + box->descendant_x1) * scale + 2;
++	y1 = (y_parent + box->y + box->descendant_y1) * scale + 2;
++	return x1 <= clip->x0 || x0 >= clip->x1 ||
++			y1 <= clip->y0 || y0 >= clip->y1;
++}
++
+ bool html_redraw_box(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+@@ -5693,6 +5774,10 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	bool context;
+ 	struct html_z_list *z_outer = html_z_top, *zl = NULL;
+ 
++	if (html_box_culled(html, box, x_parent, y_parent, clip, scale)) {
++		vitasurf_redraw_culled++;
++		return true;
++	}
+ 	vitasurf_redraw_boxes++;
+ 
+ 	/* a positioned box waits for its stacking context (VitaSurf) */
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index a7da425dd..94a3b43bb 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -1358,16 +1358,19 @@ void fb_plot_take_stats(char *buf, size_t len)
+ 		if (at < len) {
+ 			n = snprintf(buf + at, len - at, "; the page redrew "
+ 				     "%u times in %u ms, %u boxes looked at "
+-				     "for negative z-index",
++				     "for negative z-index, %u passed over "
++				     "as off the redraw",
+ 				     vitasurf_redraw_calls,
+ 				     (unsigned int)(vitasurf_us_redraw_html /
+ 						    1000),
+-				     vitasurf_redraw_zscan);
++				     vitasurf_redraw_zscan,
++				     vitasurf_redraw_culled);
+ 			if (n > 0 && (size_t)n < len - at) at += (size_t)n;
+ 		}
+ 		vitasurf_redraw_calls = 0;
+ 		vitasurf_us_redraw_html = 0;
+ 		vitasurf_redraw_zscan = 0;
++		vitasurf_redraw_culled = 0;
+ 		vitasurf_redraw_boxes = 0;
+ 		vitasurf_redraw_copies = 0;
+ 		vitasurf_us_redraw_copies = 0;
+diff --git a/utils/utils.c b/utils/utils.c
+index 768533a12..78423ed2c 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -592,6 +592,7 @@ uint64_t vitasurf_us_redraw_copies;
+ unsigned int vitasurf_redraw_calls;
+ uint64_t vitasurf_us_redraw_html;
+ unsigned int vitasurf_redraw_zscan;
++unsigned int vitasurf_redraw_culled;
+ 
+ /* exported: see utils.h (VitaSurf) */
+ uint64_t vitasurf_clock_us(void)
+diff --git a/utils/utils.h b/utils/utils.h
+index 17abe71c1..56492ec78 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -153,6 +153,8 @@ extern uint64_t vitasurf_us_redraw_copies;
+ extern unsigned int vitasurf_redraw_calls;
+ extern uint64_t vitasurf_us_redraw_html;
+ extern unsigned int vitasurf_redraw_zscan;
++/* boxes passed over as wholly outside the redraw (VitaSurf) */
++extern unsigned int vitasurf_redraw_culled;
+ /* composing selected styles with their parents' (VitaSurf) */
+ extern unsigned int vitasurf_us_compose;
+ /*
