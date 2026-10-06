@@ -1452,6 +1452,9 @@ function cssColour(rgb,a){
  return 'rgba('+r+', '+g+', '+b+', '+f+')';
 }
 function computedStyle(el,pseudo){
+ /* rules put in with insertRule are written back to their sheet in a
+    microtask, so many come to one rewrite; a read wants them now */
+ if(sheetsDirty.length)sheetsWrite();
  /* A browser reports nothing for an element that is not in the document,
     and code tests the value it gets back. */
  if(el&&el.nodeType===1&&el.isConnected===false){
@@ -1512,6 +1515,7 @@ function computedStyle(el,pseudo){
   /* a custom property is the cascade's, read as the page wrote it */
   if(n.slice(0,2)==='--'){
    if(this[n]!==undefined)return String(this[n]);
+   if(sheetsDirty.length)sheetsWrite();
    return (el&&el.nodeType===1&&typeof __vitaCustomProp==='function')?
     __vitaCustomProp(el,n):'';}
   var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};

@@ -358,6 +358,18 @@ struct jsthread {
 	struct id_entry **id_idx;  /**< getElementById answers, by id */
 	uint32_t id_idx_nb, id_idx_n; /**< buckets (a power of two), entries */
 	uint32_t id_idx_gen;      /**< vita_id_gen the index is exact for */
+	/*
+	 * Styles selected for elements without a box, kept while nothing
+	 * that selection reads has changed (VitaSurf); see
+	 * select_without_box.
+	 */
+	struct style_memo *style_memo;
+	uint16_t *style_memo_slots; /**< open addressing, 0 is empty */
+	uint32_t style_memo_n;
+	uint32_t style_memo_dom_gen, style_memo_css_gen;
+	uint32_t style_memo_sheets, style_memo_done;
+	const void *style_memo_ctx, *style_memo_layout;
+	uint32_t style_memo_hits, style_memo_selected, style_memo_ms;
 	bool id_idx_built;
 	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
@@ -1063,6 +1075,7 @@ static void log_source_excerpt(const char *stack, const char *name,
  * is known (name, src, len), the offending source line is logged too.
  */
 static void js_free_deferred(jsthread *thread);
+static void style_memo_free(jsthread *thread);
 /* Persistent storage, defined with the rest of the on-disk code below. */
 static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
@@ -7230,6 +7243,9 @@ static void end_script(jsthread *thread)
 		unsigned b_tr = vitasurf_js_tree_reads;
 		unsigned b_bc = vitasurf_js_binding_calls;
 		unsigned b_txt = vitasurf_js_text_reads;
+		uint32_t b_sel = thread->style_memo_selected;
+		uint32_t b_hits = thread->style_memo_hits;
+		uint32_t b_sel_ms = thread->style_memo_ms;
 
 		vitasurf_js_drains++;
 		vitasurf_phase = "promise jobs";
@@ -7339,6 +7355,22 @@ static void end_script(jsthread *thread)
 			unsigned drain_ms = (unsigned)(now_ms() - j0);
 
 			vitasurf_ms_js_jobs += drain_ms;
+			/* what styles for elements without a box cost a
+			 * long drain (VitaSurf) */
+			if (drain_ms >= 1000 &&
+			    thread->style_memo_selected != b_sel) {
+				vita_log("qjs: a drain of %u ms selected %u "
+					 "styles for elements without a box "
+					 "in %u ms, and answered %u reads "
+					 "from ones already selected",
+					 drain_ms,
+					 (unsigned)(thread->style_memo_selected
+						    - b_sel),
+					 (unsigned)(thread->style_memo_ms -
+						    b_sel_ms),
+					 (unsigned)(thread->style_memo_hits -
+						    b_hits));
+			}
 			if (drain_ms > vitasurf_ms_js_drain_max) {
 				vitasurf_ms_js_drain_max = drain_ms;
 				vitasurf_js_drain_max_jobs = in_drain;
@@ -7356,6 +7388,9 @@ static void end_script(jsthread *thread)
 	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
 	thread->aborting = false;
+	/* the next script starts with a new count, so what was selected
+	 * for this one is only memory now */
+	style_memo_free(thread);
 	if (thread->dom_dirty) {
 		schedule_relayout(thread, RELAYOUT_DELAY_MS);
 	}
@@ -11306,24 +11341,164 @@ static void sm_len_prop(JSContext *ctx, JSValue obj, const char *name,
  * handler was told the defaults, or when it is display: none. It is
  * selected as box construction would select it, from the nearest
  * ancestor that has a style, or from the root, down to the element.
- * The caller destroys the results.
+ *
+ * What was selected is kept, the element's and each ancestor's, until
+ * anything selection reads changes: the tree or an attribute
+ * (vita_dom_gen, which the start of every script bumps too, so a
+ * layout or a :hover between scripts is seen), the sheets, or the box
+ * tree. Home Assistant's cards read theme colours from elements their
+ * script has just made, getComputedStyle and then one getPropertyValue
+ * per colour, and every read selected the whole chain again from the
+ * nearest box: a fifth of the 20 s promise jobs on the Vita that cost
+ * the dashboard its WebSocket. A read now selects only the levels no
+ * read before it has, and a sibling's read finds its ancestors here.
+ *
+ * The results belong to the memo; the caller must not destroy them,
+ * and must not run script while it holds them.
  */
-static css_select_results *select_without_box(jsthread *thread,
+#define STYLE_MEMO_MAX 384u          /* entries, then all are dropped */
+#define STYLE_MEMO_SLOTS 1024u       /* a power of two, over twice MAX */
+#define STYLE_MEMO_CHAIN 64          /* the deepest chain selected */
+
+struct style_memo {
+	struct dom_node *node;            /**< a reference */
+	css_select_results *res;
+	const css_computed_style *root;   /**< the root style it used */
+};
+
+static void style_memo_free(jsthread *thread)
+{
+	uint32_t i;
+
+	for (i = 0; i < thread->style_memo_n; i++) {
+		dom_node_unref(thread->style_memo[i].node);
+		css_select_results_destroy(thread->style_memo[i].res);
+	}
+	thread->style_memo_n = 0;
+	if (thread->style_memo_slots != NULL) {
+		memset(thread->style_memo_slots, 0, STYLE_MEMO_SLOTS *
+		       sizeof(thread->style_memo_slots[0]));
+	}
+}
+
+static uint32_t style_memo_hash(const struct dom_node *node)
+{
+	uint32_t h = (uint32_t)(uintptr_t)node;
+
+	h ^= h >> 4;
+	h *= 2654435761u;
+	return h >> 22;	/* ten bits, STYLE_MEMO_SLOTS */
+}
+
+static struct style_memo *style_memo_find(jsthread *thread,
+		const struct dom_node *node)
+{
+	uint32_t h = style_memo_hash(node);
+	uint16_t at;
+
+	if (thread->style_memo_n == 0)
+		return NULL;
+	while ((at = thread->style_memo_slots[h]) != 0) {
+		if (thread->style_memo[at - 1].node == node)
+			return &thread->style_memo[at - 1];
+		h = (h + 1) & (STYLE_MEMO_SLOTS - 1);
+	}
+	return NULL;
+}
+
+/* Keep a selection; false when there is no room, and then the caller
+ * still owns res. */
+static bool style_memo_add(jsthread *thread, struct dom_node *node,
+		css_select_results *res, const css_computed_style *root)
+{
+	uint32_t h = style_memo_hash(node);
+	struct style_memo *e;
+
+	if (thread->style_memo_n >= STYLE_MEMO_MAX)
+		return false;
+	while (thread->style_memo_slots[h] != 0)
+		h = (h + 1) & (STYLE_MEMO_SLOTS - 1);
+	e = &thread->style_memo[thread->style_memo_n++];
+	e->node = dom_node_ref(node);
+	e->res = res;
+	e->root = root;
+	thread->style_memo_slots[h] = (uint16_t)thread->style_memo_n;
+	return true;
+}
+
+/* Drop what was kept if anything it was selected from has changed,
+ * and make room for a whole chain. False when there is no memo. */
+static bool style_memo_check(jsthread *thread)
+{
+	html_content *htmlc = thread->htmlc;
+	uint32_t done = 0, i;
+
+	if (thread->style_memo == NULL) {
+		thread->style_memo = malloc(STYLE_MEMO_MAX *
+					    sizeof(thread->style_memo[0]));
+		thread->style_memo_slots = calloc(STYLE_MEMO_SLOTS,
+				sizeof(thread->style_memo_slots[0]));
+		if (thread->style_memo == NULL ||
+		    thread->style_memo_slots == NULL) {
+			free(thread->style_memo);
+			free(thread->style_memo_slots);
+			thread->style_memo = NULL;
+			thread->style_memo_slots = NULL;
+			return false;
+		}
+		thread->style_memo_n = 0;
+	}
+	/* a sheet that has arrived changes what an early selection uses */
+	for (i = 0; i < htmlc->stylesheet_count; i++) {
+		if (htmlc->stylesheets[i].sheet != NULL &&
+		    content_get_status(htmlc->stylesheets[i].sheet) ==
+				CONTENT_STATUS_DONE)
+			done++;
+	}
+	if (thread->style_memo_dom_gen != vita_dom_gen ||
+	    thread->style_memo_css_gen != htmlc->css_generation ||
+	    thread->style_memo_sheets != htmlc->stylesheet_count ||
+	    thread->style_memo_done != done ||
+	    thread->style_memo_ctx != (const void *)htmlc->select_ctx ||
+	    thread->style_memo_layout != (const void *)htmlc->layout ||
+	    thread->style_memo_n + STYLE_MEMO_CHAIN > STYLE_MEMO_MAX) {
+		style_memo_free(thread);
+		thread->style_memo_dom_gen = vita_dom_gen;
+		thread->style_memo_css_gen = htmlc->css_generation;
+		thread->style_memo_sheets = htmlc->stylesheet_count;
+		thread->style_memo_done = done;
+		thread->style_memo_ctx = htmlc->select_ctx;
+		thread->style_memo_layout = htmlc->layout;
+	}
+	return true;
+}
+
+static const css_select_results *select_without_box(jsthread *thread,
 		struct dom_node *node)
 {
 	html_content *htmlc = thread->htmlc;
-	struct dom_node *chain[64];
+	struct dom_node *chain[STYLE_MEMO_CHAIN];
 	const css_computed_style *parent = NULL, *root = NULL;
-	css_select_results *above = NULL, *root_res = NULL, *res = NULL;
+	const css_select_results *res = NULL;
+	struct style_memo *kept;
 	struct dom_node *n;
 	int depth = 0, i;
 	bool have_layout = layout_current(thread);
+	uint64_t t0;
 
 	/* before conversion html_select_style uses the sheets loaded so
 	 * far */
 	if (htmlc == NULL)
 		return NULL;
-	/* the element and its element ancestors, nearest first */
+	if (!style_memo_check(thread))
+		return NULL;
+	kept = style_memo_find(thread, node);
+	if (kept != NULL) {
+		thread->style_memo_hits++;
+		return kept->res;
+	}
+	/* the element and its element ancestors, nearest first, up to
+	 * one already selected or with a box */
 	n = dom_node_ref(node);
 	while (n != NULL) {
 		struct dom_node *up = NULL;
@@ -11334,16 +11509,28 @@ static css_select_results *select_without_box(jsthread *thread,
 			dom_node_unref(n);
 			break;
 		}
-		if (depth > 0 && have_layout) {
-			struct box *b = box_for_node(n);
+		if (depth > 0) {
+			struct box *b = have_layout ? box_for_node(n) : NULL;
 
 			if (b != NULL && b->style != NULL) {
 				parent = b->style;
+				/* the root's style, which rem and some
+				 * inheritance read, once box construction
+				 * has made it */
+				root = htmlc->unit_len_ctx.root_style;
+				dom_node_unref(n);
+				break;
+			}
+			kept = style_memo_find(thread, n);
+			if (kept != NULL) {
+				parent = kept->res->styles[
+						CSS_PSEUDO_ELEMENT_NONE];
+				root = kept->root;
 				dom_node_unref(n);
 				break;
 			}
 		}
-		if (depth == (int)(sizeof(chain) / sizeof(chain[0]))) {
+		if (depth == STYLE_MEMO_CHAIN) {
 			dom_node_unref(n);
 			goto out;
 		}
@@ -11353,36 +11540,35 @@ static css_select_results *select_without_box(jsthread *thread,
 	}
 	if (depth == 0)
 		return NULL;
-	/* the root's style, which rem and some inheritance read, once
-	 * box construction has made it */
-	if (parent != NULL)
-		root = htmlc->unit_len_ctx.root_style;
+	t0 = now_ms();
 	for (i = depth - 1; i >= 0; i--) {
-		res = html_select_style(htmlc, parent, root, chain[i]);
-		if (res == NULL)
-			break;
-		if (res->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
-			css_select_results_destroy(res);
+		css_select_results *got;
+
+		got = html_select_style(htmlc, parent, root, chain[i]);
+		thread->style_memo_selected++;
+		if (got == NULL) {
 			res = NULL;
 			break;
 		}
-		if (root == NULL) {
-			/* the outermost one selected is the root when no
-			 * ancestor had a style */
-			root_res = res;
-			root = res->styles[CSS_PSEUDO_ELEMENT_NONE];
-		} else if (above != NULL && above != root_res) {
-			css_select_results_destroy(above);
-		}
-		above = res;
-		parent = res->styles[CSS_PSEUDO_ELEMENT_NONE];
-		if (i > 0)
+		if (got->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
+			css_select_results_destroy(got);
 			res = NULL;
+			break;
+		}
+		/* the outermost one selected is the root when no ancestor
+		 * had a style */
+		if (root == NULL)
+			root = got->styles[CSS_PSEUDO_ELEMENT_NONE];
+		if (!style_memo_add(thread, chain[i], got, root)) {
+			/* style_memo_check left room for a whole chain */
+			css_select_results_destroy(got);
+			res = NULL;
+			break;
+		}
+		res = got;
+		parent = got->styles[CSS_PSEUDO_ELEMENT_NONE];
 	}
-	if (res == NULL && above != NULL && above != root_res)
-		css_select_results_destroy(above);
-	if (root_res != NULL && root_res != res)
-		css_select_results_destroy(root_res);
+	thread->style_memo_ms += (uint32_t)(now_ms() - t0);
 out:
 	for (i = 0; i < depth; i++)
 		dom_node_unref(chain[i]);
@@ -11405,7 +11591,7 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	css_color c = 0, colour = 0;
 	int32_t i32 = 0;
 	uint8_t t;
-	css_select_results *owned = NULL;
+	const css_select_results *owned = NULL;
 
 	(void)this_val;
 	if (argc < 1 || thread == NULL || thread->htmlc == NULL)
@@ -11450,8 +11636,6 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			JS_FreeCString(ctx, p);
 		}
 		if (which < 0) {
-			if (owned != NULL)
-				css_select_results_destroy(owned);
 			return JS_NULL;
 		}
 		if (which != CSS_PSEUDO_ELEMENT_NONE) {
@@ -11459,8 +11643,6 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 					box->styles : owned;
 
 			if (r == NULL || r->styles[which] == NULL) {
-				if (owned != NULL)
-					css_select_results_destroy(owned);
 				return JS_NULL;
 			}
 			s = r->styles[which];
@@ -11922,8 +12104,6 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			sm_set(ctx, obj, "content", buf);
 		}
 	}
-	if (owned != NULL)
-		css_select_results_destroy(owned);
 	return obj;
 }
 
@@ -12001,7 +12181,7 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 	struct dom_node *node;
 	struct box *box;
 	const css_computed_style *style;
-	css_select_results *owned = NULL;
+	const css_select_results *owned = NULL;
 	const char *name;
 	lwc_string *lname = NULL;
 	char small[256];
@@ -12015,6 +12195,16 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 	node = JS_GetOpaque(argv[0], node_class_id);
 	if (node == NULL)
 		return ret;
+	/* the name first: turning an object into a string runs the
+	 * page's code, which can drop the selections kept for reads */
+	name = JS_ToCString(ctx, argv[1]);
+	if (name == NULL)
+		return ret;
+	if (lwc_intern_string(name, strlen(name), &lname) != lwc_error_ok) {
+		JS_FreeCString(ctx, name);
+		return ret;
+	}
+	JS_FreeCString(ctx, name);
 	box = layout_current(thread) ? box_for_node(node) : NULL;
 	if (box != NULL && box->style != NULL) {
 		style = box->style;
@@ -12029,17 +12219,9 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 		 */
 		owned = select_without_box(thread, node);
 		if (owned == NULL)
-			return ret;
+			goto out;
 		style = owned->styles[CSS_PSEUDO_ELEMENT_NONE];
 	}
-	name = JS_ToCString(ctx, argv[1]);
-	if (name == NULL)
-		goto out;
-	if (lwc_intern_string(name, strlen(name), &lname) != lwc_error_ok) {
-		JS_FreeCString(ctx, name);
-		goto out;
-	}
-	JS_FreeCString(ctx, name);
 	if (css_computed_custom_property(style, lname, buf,
 			sizeof(small), &len) == CSS_OK) {
 		if (len >= sizeof(small)) {
@@ -12058,10 +12240,8 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 				free(buf);
 		}
 	}
-	lwc_string_unref(lname);
 out:
-	if (owned != NULL)
-		css_select_results_destroy(owned);
+	lwc_string_unref(lname);
 	return ret;
 }
 
@@ -12221,6 +12401,8 @@ static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 	html_set_dynamic(thread->htmlc, NSCSS_FOCUS, node, text);
+	/* :focus matches elsewhere now, for styles kept for reads */
+	vita_dom_gen++;
 	return JS_UNDEFINED;
 }
 
@@ -16769,6 +16951,11 @@ static void js_free_deferred(jsthread *thread)
 	thread->deferred = NULL;
 	mod_deps_free(thread);
 	sel_cache_free(thread);
+	style_memo_free(thread);
+	free(thread->style_memo);
+	free(thread->style_memo_slots);
+	thread->style_memo = NULL;
+	thread->style_memo_slots = NULL;
 	tags_free(thread);
 	id_index_free(thread);
 	if (thread->deferred_scheduled) {
