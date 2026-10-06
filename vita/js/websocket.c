@@ -48,6 +48,7 @@
  * drawing included, waiting until the backlog was gone. */
 #define POLL_BUDGET_MS 100
 #define CLOSE_WAIT_MS 3000	/**< how long a close waits for the server */
+#define LATE_MS 5000		/**< a look later than this is logged */
 #define MAX_MESSAGE (16u * 1024u * 1024u)
 #define MAX_SOCKETS 32		/**< a page that opens more gets errors */
 
@@ -112,10 +113,13 @@ static struct vws *find(int id)
 
 static void poll_cb(void *p);
 
+static uint64_t poll_due;	/**< when the next look was asked for */
+
 static void schedule_poll(void)
 {
 	if (!scheduled && sockets != NULL) {
 		scheduled = true;
+		poll_due = ms_now() + POLL_MS;
 		guit->misc->schedule(POLL_MS, poll_cb, NULL);
 	}
 }
@@ -279,8 +283,11 @@ static void poll_connecting(void)
 	}
 }
 
-/* Hand queued messages to the connection, as far as it takes them. */
-static bool flush_out(struct vws *s)
+/* Hand queued messages to the connection, as far as it takes them. A
+ * failure is reported unless quiet, which leaves it for the next look:
+ * send() must not fire the page's error and close events from inside
+ * the script that called it. */
+static bool flush_out_as(struct vws *s, bool quiet)
 {
 	while (s->out != NULL && s->state != ST_DONE) {
 		struct vws_out *o = s->out;
@@ -295,7 +302,9 @@ static bool flush_out(struct vws *s)
 			return true;
 		}
 		if (rc != CURLE_OK) {
-			failed(s, curl_easy_strerror(rc));
+			if (!quiet) {
+				failed(s, curl_easy_strerror(rc));
+			}
 			return false;
 		}
 		o->off += sent;
@@ -311,6 +320,11 @@ static bool flush_out(struct vws *s)
 		free(o);
 	}
 	return true;
+}
+
+static bool flush_out(struct vws *s)
+{
+	return flush_out_as(s, false);
 }
 
 /* Read what has arrived, message by message, until the deadline. */
@@ -420,10 +434,23 @@ static void poll_cb(void *p)
 {
 	struct vws *s, **pp;
 
-	uint64_t deadline = ms_now() + POLL_BUDGET_MS;
+	uint64_t now = ms_now();
+	uint64_t deadline = now + POLL_BUDGET_MS;
 
 	(void)p;
 	scheduled = false;
+	/* A look the page held up: messages, pings included, waited this
+	 * long in both directions. */
+	if (now > poll_due + LATE_MS) {
+		size_t waiting = 0;
+
+		for (s = sockets; s != NULL; s = s->next) {
+			waiting += s->buffered;
+		}
+		vita_log("websocket: looked %u ms late, with %u bytes still "
+			 "to send", (unsigned int)(now - poll_due),
+			 (unsigned int)waiting);
+	}
 	poll_connecting();
 	for (s = sockets; s != NULL; s = s->next) {
 		if (s->state == ST_OPEN || s->state == ST_CLOSING) {
@@ -613,7 +640,14 @@ bool vws_send(int id, const void *data, size_t len, bool binary)
 	}
 	s->out_last = o;
 	s->buffered += len;
-	/* sent at the next poll, not from inside the script */
+	/* Sent now, as far as the connection takes it, and the rest at the
+	 * next look. Waiting for the look held a message back for as long
+	 * as the page kept the browser busy after sending it: Home
+	 * Assistant's ping left during a long script only when it ended,
+	 * and its 15 s timer for the answer ran out first. */
+	if (s->out == o) {
+		(void)flush_out_as(s, true);
+	}
 	schedule_poll();
 	return true;
 }

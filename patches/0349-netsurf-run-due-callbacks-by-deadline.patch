@@ -1,0 +1,91 @@
+diff --git a/frontends/framebuffer/schedule.c b/frontends/framebuffer/schedule.c
+index 6201b8dda..09c37b1e7 100644
+--- a/frontends/framebuffer/schedule.c
++++ b/frontends/framebuffer/schedule.c
+@@ -152,6 +152,35 @@ nserror framebuffer_schedule(int tival, void (*callback)(void *p), void *p)
+ 	return NSERROR_OK;
+ }
+ 
++#ifdef __vita__
++/*
++ * VitaSurf: the callback that came due first, of those due by now; of
++ * two due at the same time, the one asked for first. The list is in the
++ * order callbacks were asked for, and after the page held the browser
++ * every callback is due at once, so walking it from the front ran them
++ * in that order rather than their times'. Home Assistant pings its
++ * server every 30 s and reconnects if no answer comes within 15 s: the
++ * 15 s timer, asked for after the WebSocket's next look, ran ahead of
++ * that look, with the answer already waiting, and the dashboard
++ * reconnected and loaded again from the start.
++ */
++static struct nscallback *
++earliest_due(const struct timeval *now, struct nscallback **prev_out)
++{
++	struct nscallback *cb, *prev = NULL, *best = NULL, *best_prev = NULL;
++
++	for (cb = schedule_list; cb != NULL; prev = cb, cb = cb->next) {
++		if (timercmp(now, &cb->tv, >) &&
++		    (best == NULL || timercmp(&cb->tv, &best->tv, <))) {
++			best = cb;
++			best_prev = prev;
++		}
++	}
++	*prev_out = best_prev;
++	return best;
++}
++#endif
++
+ /* exported function documented in framebuffer/schedule.h */
+ int schedule_run(void)
+ {
+@@ -175,6 +204,9 @@ int schedule_run(void)
+         while (cur_nscb != NULL) {
+                 if (timercmp(&tv, &cur_nscb->tv, >)) {
+                         /* scheduled time */
++#ifdef __vita__
++                        cur_nscb = earliest_due(&tv, &prev_nscb);
++#endif
+ 
+                         /* remove callback */
+                         unlnk_nscb = cur_nscb;
+diff --git a/frontends/monkey/schedule.c b/frontends/monkey/schedule.c
+index 9d3ab7af8..717e46d09 100644
+--- a/frontends/monkey/schedule.c
++++ b/frontends/monkey/schedule.c
+@@ -129,6 +129,28 @@ nserror monkey_schedule(int tival, void (*callback)(void *p), void *p)
+ 	return NSERROR_OK;
+ }
+ 
++/*
++ * VitaSurf: the callback that came due first, of those due by now, as
++ * the framebuffer frontend's runner picks it, so that the tests run
++ * callbacks in the order the Vita does. This list is newest first, so
++ * of two due at the same time the later in it was asked for first.
++ */
++static struct nscallback *
++earliest_due(const struct timeval *now, struct nscallback **prev_out)
++{
++	struct nscallback *cb, *prev = NULL, *best = NULL, *best_prev = NULL;
++
++	for (cb = schedule_list; cb != NULL; prev = cb, cb = cb->next) {
++		if (timercmp(now, &cb->tv, >) &&
++		    (best == NULL || !timercmp(&cb->tv, &best->tv, >))) {
++			best = cb;
++			best_prev = prev;
++		}
++	}
++	*prev_out = best_prev;
++	return best;
++}
++
+ /* exported function documented in monkey/schedule.h */
+ int monkey_schedule_run(void)
+ {
+@@ -152,6 +174,7 @@ int monkey_schedule_run(void)
+ 	while (cur_nscb != NULL) {
+ 		if (timercmp(&tv, &cur_nscb->tv, >)) {
+ 			/* scheduled time */
++			cur_nscb = earliest_due(&tv, &prev_nscb);
+ 
+ 			/* remove callback */
+ 			unlnk_nscb = cur_nscb;

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!-- Timers that all came due while a script held the browser run in the
+     order of their times, not the order they were set (VitaSurf). The
+     scheduler walked its list from the front, so after a long script
+     every timer ran in the order it was asked for: Home Assistant's 15 s
+     wait for a ping's answer ran ahead of the WebSocket look that had
+     the answer, and the dashboard reconnected. The cases: a later timer
+     with a shorter delay; timers with the same delay keep their order;
+     a nested timer set from one that ran late. Delays are 15 ms or
+     more, since timers here wait at least 10 ms. Expected lines are what
+     Chrome prints. -->
+<html><head><title>timer deadline order</title></head><body>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function hold(ms) { var t = Date.now(); while (Date.now() - t < ms) {} }
+var log = [];
+setTimeout(function () { log.push('a60'); }, 60);
+setTimeout(function () { log.push('b20'); }, 20);
+setTimeout(function () { log.push('c40'); }, 40);
+setTimeout(function () { log.push('d15'); }, 15);
+setTimeout(function () { log.push('e20'); }, 20);
+setTimeout(function () { log.push('f15'); }, 15);
+hold(300);
+setTimeout(function () {
+  T('after a long script', log.join(' '));
+  log = [];
+  setTimeout(function () { log.push('x40'); }, 40);
+  setTimeout(function () {
+    log.push('y15');
+    setTimeout(function () { log.push('z0'); }, 0);
+    hold(100);
+  }, 15);
+  setTimeout(function () { log.push('w20'); }, 20);
+  hold(200);
+  setTimeout(function () { T('set from a late timer', log.join(' ')); }, 200);
+}, 100);
+</script>
+</body></html>
