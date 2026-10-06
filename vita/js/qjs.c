@@ -6318,6 +6318,56 @@ static JSValue doc_get_current_script(JSContext *ctx, JSValueConst this_val)
 	return r;
 }
 
+/*
+ * The body element, as the spec has it: the first child of the root
+ * html element that is a body or a frameset, with a reference the caller
+ * drops (VitaSurf). libdom's answer is the first body anywhere in the
+ * document, found by counting every body there: a walk of the whole
+ * tree on each read of document.body, which Home Assistant's
+ * components make often enough that it was 1% of a dashboard's load.
+ */
+static struct dom_node *body_of(struct dom_document *doc)
+{
+	struct dom_element *root = NULL;
+	struct dom_node *n = NULL, *next;
+	dom_string *local = NULL;
+	bool html;
+
+	if (dom_document_get_document_element(doc, &root) != DOM_NO_ERR ||
+	    root == NULL) {
+		return NULL;
+	}
+	dom_node_get_local_name(root, &local);
+	html = tag_is((struct dom_node *)root, local, "html", 4);
+	if (local != NULL) dom_string_unref(local);
+	if (html) {
+		dom_node_get_first_child(root, &n);
+	}
+	dom_node_unref(root);
+	while (n != NULL) {
+		dom_node_type type = DOM_NODE_TYPE_COUNT;
+
+		dom_node_get_node_type(n, &type);
+		if (type == DOM_ELEMENT_NODE) {
+			bool hit;
+
+			local = NULL;
+			dom_node_get_local_name(n, &local);
+			hit = tag_is(n, local, "body", 4) ||
+			      tag_is(n, local, "frameset", 8);
+			if (local != NULL) dom_string_unref(local);
+			if (hit) {
+				return n;
+			}
+		}
+		next = NULL;
+		dom_node_get_next_sibling(n, &next);
+		dom_node_unref(n);
+		n = next;
+	}
+	return NULL;
+}
+
 static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 {
 	C_WHERE;
@@ -6328,7 +6378,7 @@ static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 
 	(void)this_val;
 	if (doc == NULL) return JS_NULL;
-	dom_html_document_get_body(doc, &body);
+	body = (struct dom_html_element *)body_of(doc);
 	r = wrap_node(ctx, (struct dom_node *)body);
 	if (body != NULL) dom_node_unref((struct dom_node *)body);
 	return r;

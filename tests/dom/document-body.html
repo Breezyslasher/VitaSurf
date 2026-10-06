@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!-- document.body is the first child of the root html element that is a
+     body or a frameset (VitaSurf). It was libdom's answer, the first
+     body anywhere in the document, found by walking the whole tree on
+     every read. The cases: the page's body; with it taken out; a body
+     deeper in the tree; a frameset; the body put back ahead of the
+     frameset; a new document. Expected lines are what Chrome prints. -->
+<html><head><title>document body</title></head><body>
+<pre id="out"></pre>
+<script>
+var lines = [];
+function T(n, v) { lines.push('XX ' + n + ': ' + v); }
+function name(e) { return e === null ? 'null' : e.tagName + (e.id ? '#' + e.id : ''); }
+var html = document.documentElement, body = document.body;
+T('the page', name(document.body) + ' ' + (document.body === body));
+html.removeChild(body);
+T('taken out', name(document.body));
+var div = document.createElement('div');
+var deep = document.createElement('body');
+deep.id = 'deep';
+div.appendChild(deep);
+html.appendChild(div);
+T('a body deeper down', name(document.body));
+var fs = document.createElement('frameset');
+fs.id = 'fs';
+html.appendChild(fs);
+T('a frameset', name(document.body));
+html.insertBefore(body, div);
+T('the body back ahead of it', name(document.body));
+html.removeChild(div);
+html.removeChild(fs);
+T('cleaned up', name(document.body));
+var d = document.implementation.createHTMLDocument('x');
+T('a new document', name(d.body) + ' ' + (d.body.parentNode === d.documentElement));
+var o = document.getElementById('out');
+lines.forEach(function (l) {
+  o.textContent += l + '\n';
+  try { console.log(l); } catch (e) {}
+});
+</script>
+</body></html>
