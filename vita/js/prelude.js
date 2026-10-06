@@ -4850,15 +4850,22 @@ function cssName(p){return String(p)
  * string or bracket (VitaSurf): a custom property may hold a block with
  * semicolons of its own. */
 function splitDecls(t){
- var out=[],st=0,depth=0,q='',i,c;
- for(i=0;i<t.length;i++){
-  c=t.charAt(i);
-  if(q){if(c==='\\')i++;else if(c===q)q='';continue;}
+ /* most style text has no bracket, string or escape at all, and a walk
+    over every character of it was 2% of a Home Assistant load's script
+    time; the rest is searched from one special character to the next */
+ if(!/[(\[{"'\\]/.test(t))return t.split(';');
+ var out=[],st=0,depth=0,q='',re=/[;()[\]{}"'\\]/g,m,c;
+ while((m=re.exec(t))){
+  c=m[0];
+  if(q){
+   if(c==='\\')re.lastIndex++;
+   else if(c===q)q='';
+   continue;}
   if(c==='"'||c==="'")q=c;
-  else if(c==='\\')i++;
+  else if(c==='\\')re.lastIndex++;
   else if(c==='('||c==='['||c==='{')depth++;
-  else if((c===')'||c===']'||c==='}')&&depth>0)depth--;
-  else if(c===';'&&depth===0){out.push(t.slice(st,i));st=i+1;}}
+  else if(c===';'){if(depth===0){out.push(t.slice(st,m.index));st=m.index+1;}}
+  else if(depth>0)depth--;}
  out.push(t.slice(st));
  return out;}
 /* A value as the style attribute can hold it (VitaSurf). A value set
