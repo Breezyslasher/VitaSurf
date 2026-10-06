@@ -17441,6 +17441,59 @@ static void deferred_load_check(void *p)
 	thread->load_releasing = false;
 }
 
+/*
+ * What a page that sends its visitor's session inline says about this
+ * browser (VitaSurf). Speedtest puts window.__CLIENT_CONFIG__ in the
+ * page, with a userSession holding the visitor's provider and location
+ * and whether access is allowed; on the Vita its provider panel never
+ * filled and GO did nothing, with no error and no request. This says
+ * only whether the session is there and what the flags are, never the
+ * address, provider or place in it.
+ */
+static void log_inline_session(JSContext *ctx)
+{
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue cfg = JS_GetPropertyStr(ctx, global, "__CLIENT_CONFIG__");
+
+	if (JS_IsObject(cfg)) {
+		JSValue us = JS_GetPropertyStr(ctx, cfg, "userSession");
+
+		if (JS_IsObject(us)) {
+			JSValue allowed = JS_GetPropertyStr(ctx, us,
+							    "accessAllowed");
+			JSValue logged = JS_GetPropertyStr(ctx, us, "loggedIn");
+			JSValue isp = JS_GetPropertyStr(ctx, us, "ispName");
+			JSValue loc = JS_GetPropertyStr(ctx, us, "location");
+
+			vita_log("qjs: the page's inline config has a visitor "
+				 "session: access allowed %s, logged in %s, "
+				 "provider %s, location %s",
+				 JS_IsBool(allowed) ?
+				 (JS_ToBool(ctx, allowed) ? "yes" : "no") :
+				 "not said",
+				 JS_IsBool(logged) ?
+				 (JS_ToBool(ctx, logged) ? "yes" : "no") :
+				 "not said",
+				 JS_IsString(isp) ? "given" : "missing",
+				 JS_IsObject(loc) ? "given" : "missing");
+			JS_FreeValue(ctx, allowed);
+			JS_FreeValue(ctx, logged);
+			JS_FreeValue(ctx, isp);
+			JS_FreeValue(ctx, loc);
+		} else {
+			vita_log("qjs: the page's inline config has no "
+				 "visitor session");
+		}
+		JS_FreeValue(ctx, us);
+	}
+	JS_FreeValue(ctx, cfg);
+	JS_FreeValue(ctx, global);
+	/* a getter that threw says nothing to the page */
+	if (JS_HasException(ctx)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+	}
+}
+
 bool js_fire_event(jsthread *thread, const char *type,
 		   struct dom_document *doc, struct dom_node *target)
 {
@@ -17479,6 +17532,9 @@ bool js_fire_event(jsthread *thread, const char *type,
 			 thread->js_scripts, thread->js_bytes / 1024,
 			 thread->js_compile_ms, thread->js_run_ms,
 			 thread->js_modules, thread->js_imports_missed);
+		if (thread->ctx != NULL) {
+			log_inline_session(thread->ctx);
+		}
 	}
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
