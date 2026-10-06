@@ -1,0 +1,39 @@
+diff --git a/src/svgtiny.c b/src/svgtiny.c
+index 8502604..9434f66 100644
+--- a/src/svgtiny.c
++++ b/src/svgtiny.c
+@@ -224,9 +224,10 @@ svgtiny_parse_paint_attributes(dom_element *node,
+ 			&state->stroke_grad,
+ 			&state->stroke
+ 		}, {
+-			/* stroke width */
++			/* stroke width, kept fractional: 1.5, which many
++			 * icon sets draw with, was cut to 1 (VitaSurf) */
+ 			state->interned_stroke_width,
+-			SVGTIOP_INTLENGTH,
++			SVGTIOP_LENGTH,
+ 			&state->viewport_width,
+ 			&state->stroke_width
+ 		},{
+@@ -1410,7 +1411,7 @@ struct svgtiny_shape *svgtiny_add_shape(struct svgtiny_parse_state *state)
+ 		shape->text = 0;
+ 		shape->fill = state->fill;
+ 		shape->stroke = state->stroke;
+-		shape->stroke_width_px = (float) state->stroke_width *
++		shape->stroke_width_px = state->stroke_width *
+ 					      (state->ctm.a + state->ctm.d) / 2.0f;
+ 		shape->stroke_width = lroundf(shape->stroke_width_px);
+ 		if (0 < state->stroke_width && shape->stroke_width == 0)
+diff --git a/src/svgtiny_internal.h b/src/svgtiny_internal.h
+index 36bfecc..a644292 100644
+--- a/src/svgtiny_internal.h
++++ b/src/svgtiny_internal.h
+@@ -78,7 +78,7 @@ struct svgtiny_parse_state {
+ 	/* paint attributes */
+ 	svgtiny_colour fill;
+ 	svgtiny_colour stroke;
+-	int stroke_width;
++	float stroke_width;	/* in user units, fractions kept (VitaSurf) */
+ 
+ 	/* gradients */
+ 	struct svgtiny_parse_state_gradient fill_grad;

@@ -1,0 +1,413 @@
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index dee467aff..c40d2f212 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -310,15 +310,52 @@ static nsfb_colour_t fb_colour(colour c)
+  * background, is still libnsfb's quicker solid fill.
+  */
+ #define FB_AA_MAX_AREA (256 * 256)
+-#define FB_AA_MAX_POINTS 4096
++#define FB_AA_MAX_POINTS 4096	/* the first size of the point buffer */
+ 
+ struct fb_aa_pt {
+ 	float x, y;
+ };
+ 
+-static struct fb_aa_pt fb_aa_pts[FB_AA_MAX_POINTS];
+-static int fb_aa_sub_start[FB_AA_MAX_POINTS];
+-static bool fb_aa_sub_closed[FB_AA_MAX_POINTS];
++static struct fb_aa_pt *fb_aa_pts;
++static int *fb_aa_sub_start;
++static bool *fb_aa_sub_closed;
++static int fb_aa_pts_cap;	/* points fb_aa_pts holds */
++static int fb_aa_sub_cap;	/* subpaths the other two hold */
++
++/** Room for want points, and as many subpaths, growing as needed. */
++static bool fb_aa_room(int want_pts, int want_sub)
++{
++	if (want_pts > fb_aa_pts_cap) {
++		int cap = fb_aa_pts_cap ? fb_aa_pts_cap : FB_AA_MAX_POINTS;
++		struct fb_aa_pt *p;
++
++		while (cap < want_pts)
++			cap *= 2;
++		p = realloc(fb_aa_pts, cap * sizeof(*p));
++		if (p == NULL)
++			return false;
++		fb_aa_pts = p;
++		fb_aa_pts_cap = cap;
++	}
++	if (want_sub > fb_aa_sub_cap) {
++		int cap = fb_aa_sub_cap ? fb_aa_sub_cap : 64;
++		int *st;
++		bool *cl;
++
++		while (cap < want_sub)
++			cap *= 2;
++		st = realloc(fb_aa_sub_start, cap * sizeof(*st));
++		if (st == NULL)
++			return false;
++		fb_aa_sub_start = st;
++		cl = realloc(fb_aa_sub_closed, cap * sizeof(*cl));
++		if (cl == NULL)
++			return false;
++		fb_aa_sub_closed = cl;
++		fb_aa_sub_cap = cap;
++	}
++	return true;
++}
+ static float *fb_aa_cov;
+ static nsfb_colour_t *fb_aa_px;
+ static float *fb_aa_cross;
+@@ -339,8 +376,7 @@ static bool fb_aa_flatten(const float *p, unsigned int n,
+ 	while (i < n) {
+ 		switch ((int)p[i]) {
+ 		case PLOTTER_PATH_MOVE:
+-			if (i + 2 >= n || sc >= FB_AA_MAX_POINTS ||
+-			    pc >= FB_AA_MAX_POINTS)
++			if (i + 2 >= n || !fb_aa_room(pc + 1, sc + 1))
+ 				return false;
+ 			fb_aa_sub_start[sc] = pc;
+ 			fb_aa_sub_closed[sc] = false;
+@@ -353,7 +389,7 @@ static bool fb_aa_flatten(const float *p, unsigned int n,
+ 			i += 3;
+ 			break;
+ 		case PLOTTER_PATH_LINE:
+-			if (i + 2 >= n || sc == 0 || pc >= FB_AA_MAX_POINTS)
++			if (i + 2 >= n || sc == 0 || !fb_aa_room(pc + 1, sc))
+ 				return false;
+ 			cx = AX(p[i + 1], p[i + 2]);
+ 			cy = AY(p[i + 1], p[i + 2]);
+@@ -384,7 +420,7 @@ static bool fb_aa_flatten(const float *p, unsigned int n,
+ 			steps = 2 + (int)(len / 3);
+ 			if (steps > 32)
+ 				steps = 32;
+-			if (pc + steps > FB_AA_MAX_POINTS)
++			if (!fb_aa_room(pc + steps, sc))
+ 				return false;
+ 			for (k = 1; k <= steps; k++) {
+ 				float u = (float)k / steps, v = 1 - u;
+@@ -425,18 +461,63 @@ static inline void fb_aa_sub(int s, int nsub, int npts, int *a, int *b)
+ 	*b = (s + 1 < nsub) ? fb_aa_sub_start[s + 1] : npts;
+ }
+ 
+-/** Cover what lies within hw of the segment, keeping the most of it. */
++/**
++ * How much of a pixel lies within t of its centre across a line whose
++ * unit normal has components a >= b >= 0: the distribution of a pixel's
++ * points along the normal is a trapezoid, and this is its integral.
++ */
++static float fb_aa_cdf(float t, float a, float b)
++{
++	float half = (a + b) / 2, flat = (a - b) / 2, q;
++
++	if (t <= -half)
++		return 0;
++	if (t >= half)
++		return 1;
++	if (b < 1e-4f)
++		return 0.5f + t / a;	/* square on to the line */
++	if (t < -flat) {
++		q = t + half;
++		return q * q / (2 * a * b);
++	}
++	if (t > flat) {
++		q = half - t;
++		return 1 - q * q / (2 * a * b);
++	}
++	return 0.5f + t / a;
++}
++
++/**
++ * Cover what lies within hw of the segment, keeping the most of it.
++ * Alongside the segment a pixel gets the area of it the stroke's band
++ * holds, exactly, at any angle; the distance alone over-covered a thin
++ * diagonal by a fifth. Past its ends, where the round caps and joins
++ * are, the distance to the end point stands in for the area.
++ */
+ static void fb_aa_segment(float *cov, int w, int h, float ox, float oy,
+ 		struct fb_aa_pt a, struct fb_aa_pt b, float hw)
+ {
+ 	float dx = b.x - a.x, dy = b.y - a.y;
+-	float l2 = dx * dx + dy * dy;
++	float l2 = dx * dx + dy * dy, na = 1, nb = 0;
+ 	int x0 = (int)floorf((a.x < b.x ? a.x : b.x) - hw - 1 - ox);
+ 	int x1 = (int)ceilf((a.x > b.x ? a.x : b.x) + hw + 1 - ox);
+ 	int y0 = (int)floorf((a.y < b.y ? a.y : b.y) - hw - 1 - oy);
+ 	int y1 = (int)ceilf((a.y > b.y ? a.y : b.y) + hw + 1 - oy);
+ 	int x, y;
+ 
++	if (l2 > 0) {
++		float l = sqrtf(l2);
++
++		/* the normal's components, larger first */
++		na = fabsf(dy) / l;
++		nb = fabsf(dx) / l;
++		if (nb > na) {
++			float t = na;
++
++			na = nb;
++			nb = t;
++		}
++	}
+ 	if (x0 < 0) x0 = 0;
+ 	if (y0 < 0) y0 = 0;
+ 	if (x1 > w) x1 = w;
+@@ -448,16 +529,23 @@ static void fb_aa_segment(float *cov, int w, int h, float ox, float oy,
+ 			float px = ox + x + 0.5f;
+ 			float u = 0, ex, ey, d, c;
+ 
+-			if (l2 > 0) {
++			if (l2 > 0)
+ 				u = ((px - a.x) * dx + (py - a.y) * dy) / l2;
++			if (l2 > 0 && u >= 0 && u <= 1) {
++				/* across the segment: the band's share */
++				d = fabsf((px - a.x) * dy - (py - a.y) * dx) /
++						sqrtf(l2);
++				c = fb_aa_cdf(hw - d, na, nb) -
++						fb_aa_cdf(-hw - d, na, nb);
++			} else {
+ 				if (u < 0) u = 0;
+ 				if (u > 1) u = 1;
++				ex = px - (a.x + u * dx);
++				ey = py - (a.y + u * dy);
++				d = sqrtf(ex * ex + ey * ey);
++				c = hw + 0.5f - d;
++				if (c > 1) c = 1;
+ 			}
+-			ex = px - (a.x + u * dx);
+-			ey = py - (a.y + u * dy);
+-			d = sqrtf(ex * ex + ey * ey);
+-			c = hw + 0.5f - d;
+-			if (c > 1) c = 1;
+ 			if (c > cov[y * w + x])
+ 				cov[y * w + x] = c;
+ 		}
+@@ -557,13 +645,19 @@ static bool fb_aa_fill(float *cov, int w, int h, float ox, float oy,
+ 	return true;
+ }
+ 
+-/** Plot a coverage buffer in one colour, as alpha. */
++/** Runs of whole cover at least this long are plotted as rectangles. */
++#define FB_AA_SOLID_RUN 16
++
++/** Plot a coverage buffer in one colour, as alpha. Where an opaque
++ * colour wholly covers a long run of a row, the run is a plain fill
++ * and only the rest is blended: a large shape costs about what a
++ * rectangle does, with its edges smooth. */
+ static bool fb_aa_plot(const float *cov, int w, int h, int ox, int oy,
+ 		nsfb_colour_t colour)
+ {
+ 	unsigned int alpha = (colour >> 24) & 0xff;
+ 	nsfb_bbox_t loc;
+-	int i;
++	int i, x, y;
+ 
+ 	for (i = 0; i < w * h; i++) {
+ 		float c = cov[i];
+@@ -578,6 +672,33 @@ static bool fb_aa_plot(const float *cov, int w, int h, int ox, int oy,
+ 		a = (unsigned int)(c * alpha + 0.5f);
+ 		fb_aa_px[i] = (colour & 0x00ffffff) | (a << 24);
+ 	}
++	if (alpha == 0xff) {
++		for (y = 0; y < h; y++) {
++			const float *row = cov + y * w;
++
++			for (x = 0; x < w; ) {
++				int e = x;
++
++				while (e < w && row[e] >= 0.999f)
++					e++;
++				if (e - x >= FB_AA_SOLID_RUN) {
++					nsfb_bbox_t r;
++
++					r.x0 = ox + x;
++					r.y0 = oy + y;
++					r.x1 = ox + e;
++					r.y1 = oy + y + 1;
++					/* libnsfb's own convention: the top
++					 * byte 0 is opaque */
++					nsfb_plot_rectangle_fill(nsfb, &r,
++						colour & 0x00ffffff);
++					for (i = x; i < e; i++)
++						fb_aa_px[y * w + i] = 0;
++				}
++				x = (e > x) ? e : x + 1;
++			}
++		}
++	}
+ 	loc.x0 = ox;
+ 	loc.y0 = oy;
+ 	loc.x1 = ox + w;
+@@ -617,12 +738,6 @@ static bool fb_aa_path(const plot_style_t *pstyle, const float *p,
+ 	x1 = (int)ceilf(maxx + hw + 1);
+ 	y1 = (int)ceilf(maxy + hw + 1);
+ 
+-	/* a large shape of one piece -- a rounded box's background -- is
+-	 * libnsfb's solid fill, which is quicker and draws it right; it
+-	 * is only several pieces that libnsfb runs together */
+-	if (nsub <= 1 && (x1 - ox) * (y1 - oy) > FB_AA_MAX_AREA)
+-		return false;
+-
+ 	/* what the clip shows of it */
+ 	if (nsfb_plot_get_clip(nsfb, &clip)) {
+ 		if (ox < clip.x0) ox = clip.x0;
+@@ -633,22 +748,22 @@ static bool fb_aa_path(const plot_style_t *pstyle, const float *p,
+ 	w = x1 - ox;
+ 	if (w <= 0 || y1 <= oy)
+ 		return true;	/* nothing of it shows */
+-	if (w > FB_AA_MAX_AREA)
+-		return false;
+ 	band = FB_AA_MAX_AREA / w;
++	if (band < 1)
++		band = 1;
+ 
+-	if (fb_aa_cap < FB_AA_MAX_AREA) {
+-		float *c = realloc(fb_aa_cov, FB_AA_MAX_AREA * sizeof(*c));
++	if (fb_aa_cap < w * band) {
++		float *c = realloc(fb_aa_cov, w * band * sizeof(*c));
+ 		nsfb_colour_t *px;
+ 
+ 		if (c == NULL)
+ 			return false;
+ 		fb_aa_cov = c;
+-		px = realloc(fb_aa_px, FB_AA_MAX_AREA * sizeof(*px));
++		px = realloc(fb_aa_px, w * band * sizeof(*px));
+ 		if (px == NULL)
+ 			return false;
+ 		fb_aa_px = px;
+-		fb_aa_cap = FB_AA_MAX_AREA;
++		fb_aa_cap = w * band;
+ 	}
+ 
+ 	for (by = oy; by < y1; by += band) {
+@@ -704,14 +819,6 @@ framebuffer_plot_path(const struct redraw_context *ctx,
+ 		unsigned int n,
+ 		const float transform[6])
+ {
+-	nsfb_plot_pathop_t *ops;
+-	nsfb_plot_pen_t pen;
+-	unsigned int i = 0;
+-	int count = 0;
+-	nsfb_point_t start = { 0, 0 };
+-	bool have_start = false;
+-	bool res;
+-
+ 	if (n == 0) {
+ 		return NSERROR_OK;
+ 	}
+@@ -720,106 +827,17 @@ framebuffer_plot_path(const struct redraw_context *ctx,
+ 		return NSERROR_OK;
+ 	}
+ 
+-	/* drawn smooth (VitaSurf) */
+-	if (fb_aa_path(pstyle, p, n, transform)) {
+-		return NSERROR_OK;
+-	}
+-
+-	/* every element of p becomes at most one path operation */
+-	ops = malloc(sizeof(*ops) * n);
+-	if (ops == NULL) {
+-		return NSERROR_NOMEM;
+-	}
+-
+ 	/*
+-	 * libnsfb expects a cubic as two control point entries followed by
+-	 * the end point marked CUBIC; it flattens the curve itself. Close
+-	 * becomes a line back to the start of the current subpath.
++	 * Every path is drawn smooth (VitaSurf). libnsfb's path drawing,
++	 * once the fallback for large ones, ran a path's subpaths into
++	 * each other and drew its edges jagged; it is no longer used.
+ 	 */
+-#define TX(x, y) ((int)(transform[0] * (x) + transform[2] * (y) + transform[4] + 0.5f))
+-#define TY(x, y) ((int)(transform[1] * (x) + transform[3] * (y) + transform[5] + 0.5f))
+-	while (i < n) {
+-		switch ((int)p[i]) {
+-		case PLOTTER_PATH_MOVE:
+-			if (i + 2 >= n) goto done;
+-			ops[count].operation = NFSB_PLOT_PATHOP_MOVE;
+-			ops[count].point.x = TX(p[i + 1], p[i + 2]);
+-			ops[count].point.y = TY(p[i + 1], p[i + 2]);
+-			start = ops[count].point;
+-			have_start = true;
+-			count++;
+-			i += 3;
+-			break;
+-		case PLOTTER_PATH_LINE:
+-			if (i + 2 >= n) goto done;
+-			ops[count].operation = NFSB_PLOT_PATHOP_LINE;
+-			ops[count].point.x = TX(p[i + 1], p[i + 2]);
+-			ops[count].point.y = TY(p[i + 1], p[i + 2]);
+-			count++;
+-			i += 3;
+-			break;
+-		case PLOTTER_PATH_BEZIER:
+-			if (i + 6 >= n) goto done;
+-			ops[count].operation = NFSB_PLOT_PATHOP_LINE;
+-			ops[count].point.x = TX(p[i + 1], p[i + 2]);
+-			ops[count].point.y = TY(p[i + 1], p[i + 2]);
+-			count++;
+-			ops[count].operation = NFSB_PLOT_PATHOP_LINE;
+-			ops[count].point.x = TX(p[i + 3], p[i + 4]);
+-			ops[count].point.y = TY(p[i + 3], p[i + 4]);
+-			count++;
+-			ops[count].operation = NFSB_PLOT_PATHOP_CUBIC;
+-			ops[count].point.x = TX(p[i + 5], p[i + 6]);
+-			ops[count].point.y = TY(p[i + 5], p[i + 6]);
+-			count++;
+-			i += 7;
+-			break;
+-		case PLOTTER_PATH_CLOSE:
+-			if (have_start) {
+-				ops[count].operation = NFSB_PLOT_PATHOP_LINE;
+-				ops[count].point = start;
+-				count++;
+-			}
+-			i += 1;
+-			break;
+-		default:
+-			NSLOG(netsurf, INFO, "bad path command %d", (int)p[i]);
+-			goto done;
+-		}
++	if (!fb_aa_path(pstyle, p, n, transform)) {
++		/* a malformed path, or no memory: it alone is left out,
++		 * and the rest of the page is still drawn */
++		NSLOG(netsurf, INFO, "path of %u elements not drawn", n);
+ 	}
+-done:
+-#undef TX
+-#undef TY
+-
+-	memset(&pen, 0, sizeof(pen));
+-	if (pstyle->fill_type != PLOT_OP_TYPE_NONE) {
+-		pen.fill_type = NFSB_PLOT_OPTYPE_SOLID;
+-		/*
+-		 * libnsfb wants the alpha the other way up, as the
+-		 * rectangle plot above hands it over: a rounded box is
+-		 * filled through this path, and passing NetSurf's own
+-		 * colour straight through painted every rgba() card
+-		 * solid (VitaSurf).
+-		 */
+-		pen.fill_colour = fb_colour(pstyle->fill_colour);
+-	} else {
+-		pen.fill_type = NFSB_PLOT_OPTYPE_NONE;
+-	}
+-	if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
+-		pen.stroke_type = NFSB_PLOT_OPTYPE_SOLID;
+-		pen.stroke_colour = fb_colour(pstyle->stroke_colour);
+-		pen.stroke_width = plot_style_fixed_to_int(pstyle->stroke_width);
+-		if (pen.stroke_width < 1) {
+-			pen.stroke_width = 1;
+-		}
+-	} else {
+-		pen.stroke_type = NFSB_PLOT_OPTYPE_NONE;
+-	}
+-
+-	res = (count < 2) ? true : nsfb_plot_path(nsfb, count, ops, &pen);
+-	free(ops);
+-
+-	return res ? NSERROR_OK : NSERROR_INVALID;
++	return NSERROR_OK;
+ }
+ 
+ 
