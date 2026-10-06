@@ -2540,8 +2540,21 @@ static void notify_mutation_ns(JSContext *ctx, const char *kind,
 			qjs_absorb_or_rethrow(ctx);
 		}
 		JS_FreeValue(ctx, r);
+		/*
+		 * The record's values are this function's to release, as on
+		 * the path that tells nobody (VitaSurf). They were kept, so
+		 * every change an observer was told of leaked its name, old
+		 * value and the arrays of added and removed nodes, and those
+		 * held the nodes' wrappers: closing a Home Assistant
+		 * dashboard left 65 MB of its script heap alive, and every
+		 * later page close spent a second and a half collecting
+		 * over it.
+		 */
 		JS_FreeValue(ctx, args[0]);
 		JS_FreeValue(ctx, args[1]);
+		JS_FreeValue(ctx, args[2]);
+		JS_FreeValue(ctx, args[3]);
+		JS_FreeValue(ctx, args[4]);
 		JS_FreeValue(ctx, matches);
 	} else {
 		JS_FreeValue(ctx, matches);
