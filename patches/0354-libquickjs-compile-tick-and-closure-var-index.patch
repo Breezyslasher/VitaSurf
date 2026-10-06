@@ -1,0 +1,277 @@
+diff --git a/quickjs.c b/quickjs.c
+index 2ec6ade..77e843c 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -312,6 +312,10 @@ struct JSRuntime {
+ 
+     JSInterruptHandler *interrupt_handler;
+     void *interrupt_opaque;
++    /* called every few thousand tokens while compiling (VitaSurf) */
++    JSCompileTickHandler *compile_tick;
++    void *compile_tick_opaque;
++    int compile_tick_count;
+ 
+     JSPromiseHook *promise_hook;
+     void *promise_hook_opaque;
+@@ -2136,6 +2140,21 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
+     rt->interrupt_opaque = opaque;
+ }
+ 
++/*
++ * A function the parser calls every few thousand tokens (VitaSurf).
++ * The interrupt handler is only ever called by the interpreter, so a
++ * compile of a large bundle, seconds on a slow machine, gave its
++ * embedder no chance to do anything else in that time. The handler
++ * cannot stop the compile.
++ */
++void JS_SetCompileTickHandler(JSRuntime *rt, JSCompileTickHandler *cb,
++                              void *opaque)
++{
++    rt->compile_tick = cb;
++    rt->compile_tick_opaque = opaque;
++    rt->compile_tick_count = JS_COMPILE_TICK_TOKENS;
++}
++
+ void JS_SetCanBlock(JSRuntime *rt, bool can_block)
+ {
+     rt->can_block = can_block;
+@@ -21643,6 +21662,13 @@ typedef struct JSFunctionDef {
+     int closure_var_count;
+     int closure_var_size;
+     JSClosureVar *closure_var;
++    /* indexes of closure_var (VitaSurf): by (var_idx, closure_type) and
++       by name, each giving the first entry, of cv_tab_count entries */
++    int *cv_ref_tab;
++    int *cv_name_tab;
++    int cv_tab_size;
++    int cv_tab_count;
++    int cv_first_special; /* first _var_, _arg_var_ or _with_ entry */
+ 
+     JumpSlot *jump_slots;
+     int jump_size;
+@@ -22415,11 +22441,17 @@ static __exception int next_token(JSParseState *s)
+     int c;
+     bool ident_has_escape;
+     JSAtom atom;
++    JSRuntime *rt = s->ctx->rt;
+ 
+-    if (js_check_stack_overflow(s->ctx->rt, 1000)) {
++    if (js_check_stack_overflow(rt, 1000)) {
+         JS_ThrowStackOverflow(s->ctx);
+         return -1;
+     }
++    if (unlikely(rt->compile_tick != NULL) &&
++        unlikely(--rt->compile_tick_count <= 0)) {
++        rt->compile_tick_count = JS_COMPILE_TICK_TOKENS;
++        rt->compile_tick(rt, rt->compile_tick_opaque);
++    }
+ 
+     free_token(s, &s->token);
+ 
+@@ -23061,11 +23093,18 @@ static __exception int json_next_token(JSParseState *s)
+     const uint8_t *p, *p_next;
+     int c;
+     JSAtom atom;
++    JSRuntime *rt = s->ctx->rt;
+ 
+-    if (js_check_stack_overflow(s->ctx->rt, 1000)) {
++    if (js_check_stack_overflow(rt, 1000)) {
+         JS_ThrowStackOverflow(s->ctx);
+         return -1;
+     }
++    /* JSON.parse of a large message is the same (VitaSurf) */
++    if (unlikely(rt->compile_tick != NULL) &&
++        unlikely(--rt->compile_tick_count <= 0)) {
++        rt->compile_tick_count = JS_COMPILE_TICK_TOKENS;
++        rt->compile_tick(rt, rt->compile_tick_opaque);
++    }
+ 
+     json_free_token(s, &s->token);
+ 
+@@ -32640,6 +32679,8 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
+         JS_FreeAtom(ctx, cv->var_name);
+     }
+     js_free(ctx, fd->closure_var);
++    js_free(ctx, fd->cv_ref_tab);
++    js_free(ctx, fd->cv_name_tab);
+ 
+     if (fd->scopes != fd->def_scope_array)
+         js_free(ctx, fd->scopes);
+@@ -33186,6 +33227,122 @@ static int find_closure_var(JSContext *ctx, JSFunctionDef *s,
+     return -1;
+ }
+ 
++/*
++ * Indexes of a function's closure variables (VitaSurf). Looking one up
++ * walked the whole list, for every reference to an outer variable and
++ * for every name left for the global scope: a bundle whose functions
++ * capture hundreds of variables spent over half its compile in those
++ * walks (Speedtest's 4 MB bundle, 13.9 s on the Vita). Each index gives
++ * the first entry with its key, as the walks found, and is brought up
++ * to date with the list when used: entries are only ever appended, and
++ * a list emptied and refilled is indexed again from the start. Short
++ * lists are still walked.
++ */
++#define CV_INDEX_MIN 24
++
++static inline bool cv_is_special(JSAtom name)
++{
++    return name == JS_ATOM__var_ || name == JS_ATOM__arg_var_ ||
++           name == JS_ATOM__with_;
++}
++
++static inline uint32_t cv_ref_key(int var_idx, int closure_type)
++{
++    return ((uint32_t)var_idx << 3) | (uint32_t)closure_type;
++}
++
++static inline uint32_t cv_mix(uint32_t k)
++{
++    return k * 2654435761u;
++}
++
++/* false if there is no index (too short, or no memory): walk instead */
++static bool cv_index_update(JSContext *ctx, JSFunctionDef *fd)
++{
++    int n = fd->closure_var_count, i;
++    uint32_t mask;
++
++    if (n < CV_INDEX_MIN)
++        return false;
++    if (fd->cv_tab_count > n || n * 2 > fd->cv_tab_size) {
++        int size = 64, *ref, *name;
++        while (size < n * 4)
++            size <<= 1;
++        ref = js_malloc(ctx, sizeof(int) * size);
++        name = js_malloc(ctx, sizeof(int) * size);
++        if (!ref || !name) {
++            js_free(ctx, ref);
++            js_free(ctx, name);
++            return false;
++        }
++        memset(ref, 0xff, sizeof(int) * size);
++        memset(name, 0xff, sizeof(int) * size);
++        js_free(ctx, fd->cv_ref_tab);
++        js_free(ctx, fd->cv_name_tab);
++        fd->cv_ref_tab = ref;
++        fd->cv_name_tab = name;
++        fd->cv_tab_size = size;
++        fd->cv_tab_count = 0;
++        fd->cv_first_special = INT32_MAX;
++    }
++    mask = fd->cv_tab_size - 1;
++    for (i = fd->cv_tab_count; i < n; i++) {
++        JSClosureVar *cv = &fd->closure_var[i];
++        uint32_t key = cv_ref_key(cv->var_idx, cv->closure_type), h;
++        int j;
++
++        for (h = cv_mix(key) & mask; (j = fd->cv_ref_tab[h]) >= 0;
++             h = (h + 1) & mask) {
++            if (cv_ref_key(fd->closure_var[j].var_idx,
++                           fd->closure_var[j].closure_type) == key)
++                break;
++        }
++        if (j < 0)
++            fd->cv_ref_tab[h] = i;
++        for (h = cv_mix(cv->var_name) & mask; (j = fd->cv_name_tab[h]) >= 0;
++             h = (h + 1) & mask) {
++            if (fd->closure_var[j].var_name == cv->var_name)
++                break;
++        }
++        if (j < 0)
++            fd->cv_name_tab[h] = i;
++        if (cv_is_special(cv->var_name) && i < fd->cv_first_special)
++            fd->cv_first_special = i;
++    }
++    fd->cv_tab_count = n;
++    return true;
++}
++
++/* the first entry with this var_idx and closure_type, or -1 */
++static int cv_find_ref(JSFunctionDef *fd, int var_idx, int closure_type)
++{
++    uint32_t key = cv_ref_key(var_idx, closure_type), mask, h;
++    int j;
++
++    mask = fd->cv_tab_size - 1;
++    for (h = cv_mix(key) & mask; (j = fd->cv_ref_tab[h]) >= 0;
++         h = (h + 1) & mask) {
++        if (cv_ref_key(fd->closure_var[j].var_idx,
++                       fd->closure_var[j].closure_type) == key)
++            return j;
++    }
++    return -1;
++}
++
++/* the first entry with this name, or -1 */
++static int cv_find_name(JSFunctionDef *fd, JSAtom var_name)
++{
++    uint32_t mask = fd->cv_tab_size - 1, h;
++    int j;
++
++    for (h = cv_mix(var_name) & mask; (j = fd->cv_name_tab[h]) >= 0;
++         h = (h + 1) & mask) {
++        if (fd->closure_var[j].var_name == var_name)
++            return j;
++    }
++    return -1;
++}
++
+ /* 'fd' must be a parent of 's'. Create in 's' a closure referencing
+    another one in 'fd' */
+ static int get_closure_var(JSContext *ctx, JSFunctionDef *s,
+@@ -33205,10 +33362,16 @@ static int get_closure_var(JSContext *ctx, JSFunctionDef *s,
+         if (closure_type != JS_CLOSURE_GLOBAL_REF)
+             closure_type = JS_CLOSURE_REF;
+     }
+-    for(i = 0; i < s->closure_var_count; i++) {
+-        JSClosureVar *cv = &s->closure_var[i];
+-        if (cv->var_idx == var_idx && cv->closure_type == closure_type)
++    if (cv_index_update(ctx, s)) {
++        i = cv_find_ref(s, var_idx, closure_type);
++        if (i >= 0)
+             return i;
++    } else {
++        for(i = 0; i < s->closure_var_count; i++) {
++            JSClosureVar *cv = &s->closure_var[i];
++            if (cv->var_idx == var_idx && cv->closure_type == closure_type)
++                return i;
++        }
+     }
+     return add_closure_var(ctx, s, closure_type, var_idx, var_name,
+                            is_const, is_lexical, var_kind);
+@@ -33814,8 +33977,17 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+     if (!fd)
+         fd = s;
+     if (var_idx < 0 && fd->is_eval) {
+-        int idx1;
+-        for (idx1 = 0; idx1 < fd->closure_var_count; idx1++) {
++        int idx1 = 0;
++        /* straight to the entry with the name when no special entry
++           comes before it, as the walk would have reached it
++           (VitaSurf) */
++        if (cv_index_update(ctx, fd)) {
++            int hit = cv_find_name(fd, var_name);
++            int stop = (hit >= 0) ? hit : fd->closure_var_count;
++            if (fd->cv_first_special >= stop)
++                idx1 = stop;
++        }
++        for (; idx1 < fd->closure_var_count; idx1++) {
+             JSClosureVar *cv = &fd->closure_var[idx1];
+             if (var_name == cv->var_name) {
+                 if (fd != s) {
+diff --git a/quickjs.h b/quickjs.h
+index d1d2323..a3cb34d 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1151,6 +1151,10 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
+ /* return != 0 if the JS code needs to be interrupted */
+ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
+ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
++/* VitaSurf: called every JS_COMPILE_TICK_TOKENS tokens the parser reads */
++#define JS_COMPILE_TICK_TOKENS 4096
++typedef void JSCompileTickHandler(JSRuntime *rt, void *opaque);
++JS_EXTERN void JS_SetCompileTickHandler(JSRuntime *rt, JSCompileTickHandler *cb, void *opaque);
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
+ /*

@@ -868,6 +868,21 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	return r;
 }
 
+/*
+ * Every few thousand tokens of a compile or a JSON.parse (VitaSurf).
+ * The interrupt handler only runs while bytecode does, so a bundle of a
+ * few megabytes, three or four seconds to compile on the Vita, held
+ * every transfer still for all of that time: handshakes stalled half
+ * way and the files the page would ask for next did not arrive. This
+ * keeps them moving as the interrupt does; nothing else is safe here.
+ */
+static void qjs_compile_tick(JSRuntime *rt, void *opaque)
+{
+	(void)rt;
+	(void)opaque;
+	fetch_pump();
+}
+
 static int qjs_interrupt_body(jsthread *thread)
 {
 	/*
@@ -14041,6 +14056,8 @@ static nserror heap_start(jsheap *ret)
 		qjs_memory_rt = ret->rt;
 	/* the first touch of a lazy property runs its unit (lazy.js) */
 	JS_SetLazyPropertyHandler(ret->rt, qjs_lazy_handler);
+	/* transfers keep moving through a long compile */
+	JS_SetCompileTickHandler(ret->rt, qjs_compile_tick, NULL);
 	/*
 	 * Keep a page's scripts within a sensible slice of the heap: 96 MB
 	 * of the 176 MB heap there used to be, the same share of the heap
