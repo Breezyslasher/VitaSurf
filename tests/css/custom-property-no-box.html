@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!-- getComputedStyle reads a custom property from an element with no box
+     (VitaSurf): one made in this script and not yet laid out, one under
+     display: none, and any before the page's first layout. Each read ""
+     where a browser selects the style; Home Assistant's cards read their
+     theme colours from elements they have just made. A variable's value
+     reads with its var()s substituted, and as nothing when one refers to
+     nothing or to itself. Expected lines are what Chrome prints. -->
+<html><head><title>custom property without a box</title><style>
+:root { --theme: rgb(1, 2, 3) }
+.card { --accent: var(--theme) }
+.hidden { display: none; --h: 7 }
+#subst { --a: var(--b); --b: var(--a); --fb: var(--nope, 9 px); --miss: x var(--nope);
+         --deep: f(var(--theme), var(--nope, var(--theme))) }
+</style></head><body>
+<div id="early" class="card" style="--own: 4"></div>
+<div id="subst"></div>
+<script>
+function T(n, v) { try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function p(e, n) { return '[' + getComputedStyle(e).getPropertyValue(n).trim() + ']'; }
+var early = document.getElementById('early');
+T('before the first layout', p(early, '--accent') + ' ' + p(early, '--own'));
+var made = document.createElement('div');
+made.className = 'card';
+made.style.setProperty('--own', '5');
+document.body.appendChild(made);
+T('made by script', p(made, '--accent') + ' ' + p(made, '--own'));
+var hid = document.createElement('div');
+hid.className = 'hidden';
+var kid = document.createElement('span');
+hid.appendChild(kid);
+document.body.appendChild(hid);
+T('under display none', p(hid, '--h') + ' ' + p(kid, '--h') + ' ' + p(kid, '--theme'));
+var loose = document.createElement('div');
+loose.className = 'card';
+T('not in the document', p(loose, '--accent'));
+var sb = document.getElementById('subst');
+T('substituted', p(sb, '--a') + ' ' + p(sb, '--fb') + ' ' + p(sb, '--miss') + ' ' + p(sb, '--deep'));
+setTimeout(function () {
+  T('after layout', p(early, '--accent') + ' ' + p(made, '--own') + ' ' + p(kid, '--h'));
+}, 100);
+</script></body></html>

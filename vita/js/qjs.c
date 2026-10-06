@@ -11972,6 +11972,8 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node;
 	struct box *box;
+	const css_computed_style *style;
+	css_select_results *owned = NULL;
 	const char *name;
 	lwc_string *lname = NULL;
 	char small[256];
@@ -11983,25 +11985,39 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 	if (argc < 2 || thread == NULL || thread->htmlc == NULL)
 		return ret;
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread))
+	if (node == NULL)
 		return ret;
-	box = box_for_node(node);
-	if (box == NULL || box->style == NULL)
-		return ret;
+	box = layout_current(thread) ? box_for_node(node) : NULL;
+	if (box != NULL && box->style != NULL) {
+		style = box->style;
+	} else {
+		/*
+		 * No box yet, or none at all (VitaSurf): select its style
+		 * as getComputedStyle's other properties do. An element made
+		 * in this script, one under display: none, or any before the
+		 * page's first layout read every variable as "", where a
+		 * browser selects the style: Home Assistant's cards read
+		 * their theme colours from elements they have just made.
+		 */
+		owned = select_without_box(thread, node);
+		if (owned == NULL)
+			return ret;
+		style = owned->styles[CSS_PSEUDO_ELEMENT_NONE];
+	}
 	name = JS_ToCString(ctx, argv[1]);
 	if (name == NULL)
-		return ret;
+		goto out;
 	if (lwc_intern_string(name, strlen(name), &lname) != lwc_error_ok) {
 		JS_FreeCString(ctx, name);
-		return ret;
+		goto out;
 	}
 	JS_FreeCString(ctx, name);
-	if (css_computed_custom_property(box->style, lname, buf,
+	if (css_computed_custom_property(style, lname, buf,
 			sizeof(small), &len) == CSS_OK) {
 		if (len >= sizeof(small)) {
 			buf = malloc(len + 1);
 			if (buf != NULL && css_computed_custom_property(
-					box->style, lname, buf, len + 1,
+					style, lname, buf, len + 1,
 					&len) != CSS_OK) {
 				free(buf);
 				buf = NULL;
@@ -12015,6 +12031,9 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 	lwc_string_unref(lname);
+out:
+	if (owned != NULL)
+		css_select_results_destroy(owned);
 	return ret;
 }
 
