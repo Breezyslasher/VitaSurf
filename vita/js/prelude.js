@@ -7284,8 +7284,12 @@ function describeThrown(v){
    out=(name&&msg)?name+': '+msg:(name||msg);
    if(!out){try{out=JSON.stringify(v).slice(0,200);}catch(e){out=String(v);}}
    if(v.stack){
-    /* the first frames: one alone often names only a helper */
-    var fr=String(v.stack).split('\n').slice(1,5).filter(function(f){return f.trim();});
+    /* the first frames: one alone often names only a helper. A stack
+       QuickJS made has no "Name: message" line ahead of them, and
+       skipping one there lost the frame that threw. */
+    var fr=String(v.stack).split('\n');
+    if(fr.length&&!/^\s*at /.test(fr[0]))fr=fr.slice(1);
+    fr=fr.slice(0,4).filter(function(f){return f.trim();});
     if(fr.length)out+=' | '+fr.map(function(f){return f.replace(/^\s+/,'').slice(0,160);}).join(' | ');}
    return out;}
   return String(v);
@@ -7942,6 +7946,29 @@ function documentRules(parent,node,child,replacing){
   else if(node.__vsShadowKid)node.__vsShadowKid=false;}
  P.appendChild=function(node){mark(this,node);return app.apply(this,arguments);};
  P.insertBefore=function(node,child){mark(this,node);return ins.apply(this,arguments);};
+})();
+/* --- where Lit renders in a host that already has children -------------
+ * LitElement renders before its new shadow root's firstChild, which in a
+ * browser is null. Here the root is the host, so it was the host's first
+ * light child, and once the page moved that child somewhere else, Lit's
+ * next render of anything new threw ("The node before which the new node
+ * is to be inserted is not a child of this node"). Home Assistant writes
+ * every unhandled rejection to its log with the stack mapped through the
+ * bundle's source map, which on the Vita was a multi-megabyte download
+ * and seconds of parsing inside the dashboard's longest promise jobs.
+ * Such a host gets an empty comment at its front for Lit to render
+ * before, which nothing but Lit moves. The slot pass reads Lit's range
+ * from renderBefore, so it sees the same light children as before. */
+(function(){
+ var attach=P.attachShadow;
+ P.attachShadow=function(){
+  var r=attach.apply(this,arguments),o=this.renderOptions,first,a;
+  if(r===this&&o&&typeof o==='object'&&o.renderBefore===undefined&&
+     (first=this.firstChild)){
+   a=(this.ownerDocument||D).createComment('');
+   this.insertBefore(a,first);
+   o.renderBefore=a;}
+  return r;};
 })();
 
 /* --- instanceof, told apart ----------------------------------------------

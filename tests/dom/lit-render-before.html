@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!-- Where a Lit element renders when its host already has children
+     (VitaSurf). LitElement renders before its new shadow root's
+     firstChild, null in a browser; a shadow root here is its host, so it
+     was the host's first light child, and once the page moved that
+     child away the element's next render threw NotFoundError. Home
+     Assistant sends each such rejection through its source-mapped error
+     log, seconds of work on the Vita. The element below does what
+     LitElement's createRenderRoot and render do, in plain script. The
+     cases: a host with no children; one whose light child stays; one
+     whose light child is taken out before the second render; one whose
+     light child moves to another element. Expected lines are what
+     Chrome prints. -->
+<html><head><title>lit render before</title></head><body>
+<pre id="out"></pre>
+<script>
+var lines = [];
+function T(n, v) { lines.push('XX ' + n + ': ' + v); }
+class XLit extends HTMLElement {
+  constructor() { super(); this.renderOptions = {host: this}; }
+  connectedCallback() {
+    var root = this.attachShadow({mode: 'open'});
+    this.renderOptions.renderBefore ??= root.firstChild;
+    this.root = root;
+    this.end = this.renderOptions.renderBefore;
+    this.start = root.insertBefore(document.createComment(''), this.end);
+  }
+  /* what ChildPart._insert does for a new value */
+  show(text) {
+    var b = document.createElement('b');
+    b.textContent = text;
+    this.start.parentNode.insertBefore(b, this.end);
+    return b;
+  }
+}
+customElements.define('x-lit', XLit);
+function attempt(name, el, text) {
+  try {
+    var b = el.show(text);
+    T(name, b.parentNode === el.root ? 'rendered' : 'rendered elsewhere');
+  } catch (e) {
+    T(name, 'threw ' + e.name);
+  }
+}
+var a = document.createElement('x-lit');
+document.body.appendChild(a);
+attempt('no children', a, 'a');
+var b = document.createElement('x-lit');
+var bl = document.createElement('i');
+b.appendChild(bl);
+document.body.appendChild(b);
+attempt('light child stays', b, 'b');
+T('light child stays, still there', bl.parentNode === b);
+var c = document.createElement('x-lit');
+var cl = document.createElement('i');
+c.appendChild(cl);
+document.body.appendChild(c);
+attempt('first render', c, 'c1');
+c.removeChild(cl);
+attempt('light child taken out', c, 'c2');
+var d = document.createElement('x-lit');
+var dl = document.createElement('i');
+d.appendChild(dl);
+document.body.appendChild(d);
+attempt('first render, then moved', d, 'd1');
+document.body.appendChild(dl);
+attempt('light child moved away', d, 'd2');
+var o = document.getElementById('out');
+lines.forEach(function (l) {
+  o.textContent += l + '\n';
+  try { console.log(l); } catch (e) {}
+});
+</script>
+</body></html>
