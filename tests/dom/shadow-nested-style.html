@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<!-- A <style> deeper in a shadow tree than the host's own children, or
+     one with an id, keeps its rules to that shadow tree (VitaSurf).
+     Neither was scoped, so its rules reached the whole page: Bubble
+     Card writes each card's own styles into a <style id="bubble-styles">
+     inside the card, and one card's sky-blue background painted every
+     button on a Home Assistant dashboard. The cases: a nested style, set
+     before and after it is in the tree; an id'd one; two cards with the
+     same text; a style's text changed; one emptied; a rule for the
+     element holding the style; a page element of the same class outside
+     every card. Expected lines are what Chrome prints. -->
+<html><head><title>shadow nested style</title></head><body>
+<div class="bg" id="page">page</div>
+<x-card id="a"></x-card><x-card id="b"></x-card><x-card id="c"></x-card>
+<x-card id="d"></x-card><x-card id="e"></x-card>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+customElements.define('x-card', class extends HTMLElement {
+  constructor() { super(); this.attachShadow({ mode: 'open' }); }
+});
+function build(id) {
+  var h = document.getElementById(id), r = h.shadowRoot;
+  var card = document.createElement('div');
+  card.className = 'card';
+  var bg = document.createElement('div');
+  bg.className = 'bg';
+  bg.textContent = id;
+  card.appendChild(bg);
+  r.appendChild(card);
+  return card;
+}
+var ca = build('a'), cb = build('b'), cc = build('c'), cd = build('d'), ce = build('e');
+// a: a nested style given its text once in the tree
+var sa = document.createElement('style');
+ca.appendChild(sa);
+sa.textContent = '.bg { background-color: rgb(135, 206, 235) }';
+// b: an id'd style, text set before it goes in
+var sb = document.createElement('style');
+sb.id = 'bubble-styles';
+sb.textContent = '.bg { color: rgb(200, 0, 0) } .card { padding-left: 3px }';
+cb.appendChild(sb);
+// c and d: the same text in both
+['c', 'd'].forEach(function (id) {
+  var s = document.createElement('style');
+  s.textContent = '.bg { border-left: 2px solid rgb(0, 128, 0) }';
+  (id === 'c' ? cc : cd).appendChild(s);
+});
+// e: a style whose text changes, then a second one emptied
+var se = document.createElement('style');
+ce.appendChild(se);
+se.textContent = '.bg { background-color: rgb(1, 2, 3) }';
+se.textContent = '.bg { background-color: rgb(4, 5, 6) }';
+var se2 = document.createElement('style');
+se2.id = 'gone';
+ce.appendChild(se2);
+se2.textContent = '.bg { color: rgb(9, 9, 9) }';
+se2.textContent = '';
+function look(el) {
+  var cs = getComputedStyle(el);
+  return cs.backgroundColor + ' / ' + cs.color + ' / ' + cs.borderLeftWidth;
+}
+function inner(id) { return document.getElementById(id).shadowRoot.querySelector('.bg'); }
+setTimeout(function () {
+  T('page element', look(document.getElementById('page')));
+  ['a', 'b', 'c', 'd', 'e'].forEach(function (id) { T('card ' + id, look(inner(id))); });
+  T('rule for the holder', getComputedStyle(cb).paddingLeft + ' ' +
+    getComputedStyle(ca).paddingLeft);
+}, 200);
+</script>
+</body></html>

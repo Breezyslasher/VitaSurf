@@ -2940,11 +2940,87 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   if(sc!==css){css=sc;if(rawText)rawText.call(n,css);else n.textContent=css;}
   if(live(css)){n.textContent='';park(n,css);return;}
   canon[css]=n;}
+ /* A <style> deeper in a shadow tree than the host's own children, or
+  * one with attributes, an id say (VitaSurf). Neither was scoped, so its
+  * rules reached the whole page: Bubble Card writes each card's own
+  * styles: template into a <style id="bubble-styles"> inside the card,
+  * and one card's "background-color: skyBlue !important" painted every
+  * button on the dashboard. Such a style is usually one instance's own,
+  * so its rules are kept to the nearest shadow host that holds it, by a
+  * key for its text in that host's data-vs-s: hosts holding the same
+  * text share the key, and the one sheet, as the tag scoping above
+  * lets every copy of a component share its sheet. A selector may also
+  * match the host itself, as the rules of an @scope match its root. */
+ var keyOf=Object.create(null),nkey=0,nkeys=0;
+ function owner(a){
+  for(;a&&a.nodeType===1;a=a.parentNode)if(a.__shadow)return a;
+  return null;}
+ function nested(p,n){
+  return !!(p&&n&&n.nodeType===1&&n.tagName==='STYLE'&&
+   !(p.__shadow&&styleNode(n))&&!n.hasAttribute('media')&&owner(p));}
+ function hostTokens(h,k,d){
+  var m=h.__vsKeys||(Object.defineProperty(h,'__vsKeys',{configurable:true,
+   value:Object.create(null),writable:true,enumerable:false}),h.__vsKeys),
+   out=[],x;
+  m[k]=(m[k]||0)+d;
+  if(m[k]<=0)delete m[k];
+  for(x in m)out.push(x);
+  if(typeof __vitaQuietAttr==='function')
+   __vitaQuietAttr(h,'data-vs-s',out.length?out.join(' '):null);}
+ function hostFirst(sel,at){
+  /* the selector with at put on its first compound, so it can match
+     the host itself */
+  var i,c,d=0,q;
+  if(/^:host/.test(sel)||!sel)return null;
+  for(i=0;i<sel.length;i++){
+   c=sel.charAt(i);
+   if(c==='"'||c==="'"){q=c;for(i++;i<sel.length&&sel.charAt(i)!==q;i++);continue;}
+   if(c==='('||c==='[')d++;
+   else if(c===')'||c===']')d--;
+   else if(d===0&&/[\s>+~]/.test(c))break;}
+  return sel.slice(0,i)+at+sel.slice(i);}
+ function scopeKeyed(css,k){
+  var at='[data-vs-s~="'+k+'"]',r;
+  try{
+   r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),at);
+   /* and each rule again, matching the host itself */
+   r=r.replace(/(^|\})([^{}@]+)\{/g,function(m,b,list){
+    var parts=splitList(list),extra=[],i,x,y;
+    for(i=0;i<parts.length;i++){
+     x=parts[i].replace(/^\s+|\s+$/g,'');
+     if(x.indexOf(at+' ')!==0)continue;
+     y=hostFirst(x.slice(at.length+1),at);
+     if(y)extra.push(y);}
+    return b+list+(extra.length?','+extra.join(','):'')+'{';});}
+  catch(x){r=css;}
+  return r;}
+ function takeNested(h,n,css){
+  var k,sc,old=n.__vsKey;
+  if(!css){
+   if(old){hostTokens(h,old,-1);n.__vsKey=undefined;}
+   return css;}
+  k=keyOf[css];
+  if(!k){
+   if(nkeys>=2000){keyOf=Object.create(null);nkeys=0;}
+   k=keyOf[css]='k'+(++nkey);nkeys++;}
+  if(old!==k){
+   if(old)hostTokens(h,old,-1);
+   hostTokens(h,k,1);
+   Object.defineProperty(n,'__vsKey',{configurable:true,value:k,
+    writable:true,enumerable:false});}
+  sc=scopeKeyed(css,k);
+  return sc;}
  function fix(host,n){
-  if(!host.__shadow||!n)return;
-  if(styleNode(n))take(host,n);
-  else if(n.nodeType===11)
-   for(var c=n.firstChild;c;c=c.nextSibling)if(styleNode(c))take(host,c);}
+  var c;
+  if(!n)return;
+  if(host.__shadow&&styleNode(n)){take(host,n);return;}
+  if(nested(host,n)&&n.textContent){
+   c=takeNested(owner(host),n,n.textContent);
+   if(rawText)rawText.call(n,c);else n.textContent=c;
+   return;}
+  if(n.nodeType===11)
+   for(c=n.firstChild;c;c=c.nextSibling)
+    if(host.__shadow&&styleNode(c))take(host,c);}
  var app=P.appendChild,ins=P.insertBefore;
  P.appendChild=function(n){fix(this,n);return app.apply(this,arguments);};
  P.insertBefore=function(n,r){fix(this,n);return ins.apply(this,arguments);};
@@ -2991,6 +3067,8 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
     if(canon[v]!==this){t.set.call(this,'');park(this,v);}
     return;}
    t.set.call(this,v);canon[v]=this;return;}
+  if(typeof v==='string'&&(p=this.parentNode)&&nested(p,this)){
+   t.set.call(this,takeNested(owner(p),this,v));return;}
   t.set.call(this,v);}});
 })();
 /* Slots (VitaSurf). A host's own children are drawn only through a

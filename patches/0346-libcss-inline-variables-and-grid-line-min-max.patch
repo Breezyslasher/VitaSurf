@@ -1,3 +1,17 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index bb2b7d2..649332e 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -1127,7 +1127,8 @@ static css_error appendSubstituted(css_language *c, const css_token *tokens,
+ 		}
+ 		/* what this var() resolved to, for the compile cache */
+ 		substNote(c, (p != NULL && p->n > 0) ? (uintptr_t) p->tokens :
+-				(ent != NULL) ? (uintptr_t) ent->tokens :
++				(ent != NULL) ? (ent->key != 0 ? ent->key :
++					(uintptr_t) ent->tokens) :
+ 				(reg != NULL && reg->n_initial > 0) ?
+ 					(uintptr_t) reg->initial :
+ 				(fb_to > fb_from) ? (uintptr_t) &tokens[fb_from] :
 diff --git a/src/parse/properties/grid.c b/src/parse/properties/grid.c
 index 9c0b5c0..250f6e7 100644
 --- a/src/parse/properties/grid.c
@@ -110,33 +124,127 @@ index 9c0b5c0..250f6e7 100644
  
  		if (int_calc_sum(vector, ctx, value, 1)) {
 diff --git a/src/select/custom.c b/src/select/custom.c
-index 191d208..9cbb45f 100644
+index 191d208..a5ccf86 100644
 --- a/src/select/custom.c
 +++ b/src/select/custom.c
-@@ -31,6 +31,22 @@ unsigned int css_custom_max_count;
+@@ -31,6 +31,116 @@ unsigned int css_custom_max_count;
  unsigned int css_custom_gets;
  unsigned int css_custom_get_steps;
  
-+/** Free an entry's own copy of its tokens, if it has one. */
-+static void _drop_tokens(css_custom_entry *e)
++/*
++ * Values from style attributes (VitaSurf). The attribute's sheet is
++ * freed once its element's style is selected, so the map keeps a copy;
++ * equal values share one, so cards that all say --column-size: 12 keep
++ * one copy and compare equal. Each copy has a serial for the compile
++ * cache, which names a value by its tokens' address: a freed copy's
++ * address is soon another value's, and a cache that took it for the
++ * old one handed every Bubble Card button the colour of the first.
++ */
++#define CUSTOM_INLINE_BUCKETS 256
++
++struct css_custom_inline {
++	struct css_custom_inline *next;
++	uint32_t hash;
++	uint32_t refs;
++	uintptr_t key;			/**< odd, so never an address */
++	uint32_t n;
++	css_token tokens[];
++};
++
++static struct css_custom_inline *_inline_table[CUSTOM_INLINE_BUCKETS];
++static uintptr_t _inline_serial;
++
++static uint32_t _inline_hash(const css_token *t, uint32_t n)
++{
++	uint32_t h = n * 0x9e3779b1u, i;
++
++	for (i = 0; i < n; i++) {
++		h = (h ^ (uint32_t) t[i].type) * 0x01000193u;
++		h = (h ^ (uint32_t) ((uintptr_t) t[i].idata >> 3)) *
++				0x01000193u;
++	}
++	return h;
++}
++
++/* Interned strings make a value equal when its types and strings are. */
++static bool _inline_same(const struct css_custom_inline *v,
++		const css_token *t, uint32_t n)
 +{
 +	uint32_t i;
 +
-+	if (!e->owned)
-+		return;
-+	for (i = 0; i < e->n_tokens; i++) {
-+		if (e->tokens[i].idata != NULL)
-+			lwc_string_unref(e->tokens[i].idata);
++	if (v->n != n)
++		return false;
++	for (i = 0; i < n; i++) {
++		if (v->tokens[i].type != t[i].type ||
++				v->tokens[i].idata != t[i].idata)
++			return false;
 +	}
-+	free(e->tokens);
-+	e->tokens = NULL;
-+	e->owned = false;
++	return true;
++}
++
++static struct css_custom_inline *_inline_get(const css_token *t, uint32_t n)
++{
++	uint32_t h = _inline_hash(t, n), i;
++	struct css_custom_inline **b =
++			&_inline_table[h & (CUSTOM_INLINE_BUCKETS - 1)];
++	struct css_custom_inline *v;
++
++	for (v = *b; v != NULL; v = v->next) {
++		if (v->hash == h && _inline_same(v, t, n)) {
++			v->refs++;
++			return v;
++		}
++	}
++	v = malloc(sizeof(*v) + n * sizeof(css_token));
++	if (v == NULL)
++		return NULL;
++	v->hash = h;
++	v->refs = 1;
++	v->n = n;
++	v->key = (++_inline_serial << 1) | 1;
++	for (i = 0; i < n; i++) {
++		v->tokens[i] = t[i];
++		if (v->tokens[i].idata != NULL)
++			lwc_string_ref(v->tokens[i].idata);
++	}
++	v->next = *b;
++	*b = v;
++	return v;
++}
++
++static void _inline_put(struct css_custom_inline *v)
++{
++	struct css_custom_inline **pp;
++	uint32_t i;
++
++	if (v == NULL || --v->refs > 0)
++		return;
++	for (pp = &_inline_table[v->hash & (CUSTOM_INLINE_BUCKETS - 1)];
++			*pp != NULL; pp = &(*pp)->next) {
++		if (*pp == v) {
++			*pp = v->next;
++			break;
++		}
++	}
++	for (i = 0; i < v->n; i++) {
++		if (v->tokens[i].idata != NULL)
++			lwc_string_unref(v->tokens[i].idata);
++	}
++	free(v);
++}
++
++/** Let go of an entry's interned value, if it has one. */
++static void _drop_tokens(css_custom_entry *e)
++{
++	_inline_put(e->inl);
++	e->inl = NULL;
++	e->key = 0;
 +}
 +
  css_custom_map *css__custom_map_ref(css_custom_map *map)
  {
  	if (map != NULL) {
-@@ -46,8 +62,10 @@ void css__custom_map_unref(css_custom_map *map)
+@@ -46,8 +156,10 @@ void css__custom_map_unref(css_custom_map *map)
  		uint32_t i;
  
  		for (i = 0; i < map->n_slots; i++) {
@@ -148,7 +256,7 @@ index 191d208..9cbb45f 100644
  		}
  		free(map->slots);
  		free(map);
-@@ -175,9 +193,10 @@ static css_error _grow(css_custom_map *map)
+@@ -175,9 +287,10 @@ static css_error _grow(css_custom_map *map)
  
  css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
  		css_token *tokens, uint32_t n_tokens,
@@ -156,11 +264,11 @@ index 191d208..9cbb45f 100644
 +		uint32_t specificity, bool important, bool copy)
  {
  	css_custom_entry *e;
-+	css_token *kept = tokens;
++	struct css_custom_inline *inl = NULL;
  	css_error error;
  	uint32_t i;
  
-@@ -200,18 +219,39 @@ css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
+@@ -200,18 +313,27 @@ css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
  	 * own declaration always shadows an inherited value.
  	 */
  	e = _find_own(*map, name);
@@ -171,68 +279,62 @@ index 191d208..9cbb45f 100644
 +		return CSS_OK;
 +	}
 +
-+	if (copy && n_tokens > 0) {
-+		kept = malloc(n_tokens * sizeof(*kept));
-+		if (kept == NULL) {
++	if (copy) {
++		inl = _inline_get(tokens, n_tokens);
++		if (inl == NULL) {
 +			return CSS_NOMEM;
  		}
--	} else {
--		if ((*map)->count >= CUSTOM_MAP_MAX) {
--			return CSS_OK;	/* silently dropped, see the cap */
-+		for (i = 0; i < n_tokens; i++) {
-+			kept[i] = tokens[i];
-+			if (kept[i].idata != NULL)
-+				lwc_string_ref(kept[i].idata);
- 		}
--		if (((*map)->count + 1) * 2 > (*map)->n_slots) {
--			error = _grow(*map);
--			if (error != CSS_OK)
--				return error;
 +	}
 +
 +	if (e != NULL) {
 +		_drop_tokens(e);
-+	} else {
+ 	} else {
+-		if ((*map)->count >= CUSTOM_MAP_MAX) {
+-			return CSS_OK;	/* silently dropped, see the cap */
+-		}
+-		if (((*map)->count + 1) * 2 > (*map)->n_slots) {
+-			error = _grow(*map);
+-			if (error != CSS_OK)
+-				return error;
 +		if ((*map)->count >= CUSTOM_MAP_MAX ||
 +				(((*map)->count + 1) * 2 > (*map)->n_slots &&
 +				_grow(*map) != CSS_OK)) {
 +			/* silently dropped, see the cap; or no memory */
-+			if (kept != tokens) {
-+				for (i = 0; i < n_tokens; i++) {
-+					if (kept[i].idata != NULL)
-+						lwc_string_unref(
-+							kept[i].idata);
-+				}
-+				free(kept);
-+			}
++			_inline_put(inl);
 +			return (*map)->count >= CUSTOM_MAP_MAX ?
 +					CSS_OK : CSS_NOMEM;
  		}
  		for (i = _slot_of(*map, name); (*map)->slots[i].name != NULL;
  				i = (i + 1) & ((*map)->n_slots - 1))
-@@ -223,7 +263,8 @@ css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
+@@ -223,7 +345,9 @@ css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
  			css_custom_max_count = (*map)->count;
  	}
  
 -	e->tokens = tokens;
-+	e->tokens = kept;
-+	e->owned = kept != tokens;
++	e->inl = inl;
++	e->key = (inl != NULL) ? inl->key : 0;
++	e->tokens = (inl != NULL) ? inl->tokens : tokens;
  	e->n_tokens = n_tokens;
  	e->specificity = specificity;
  	e->important = important;
 diff --git a/src/select/custom.h b/src/select/custom.h
-index 6d0a7d0..98ec55e 100644
+index 6d0a7d0..4868ede 100644
 --- a/src/select/custom.h
 +++ b/src/select/custom.h
-@@ -34,6 +34,7 @@ typedef struct css_custom_entry {
+@@ -34,6 +34,12 @@ typedef struct css_custom_entry {
  	uint32_t n_tokens;
  	uint32_t specificity;		/**< of the rule that declared it */
  	bool important;
-+	bool owned;			/**< tokens are the map's own copy */
++	/** A style attribute's value, interned (VitaSurf): tokens are
++	 * the shared copy, and key names its content for the compile
++	 * cache, never reused. 0, and NULL, for a sheet's own tokens,
++	 * which live as long as the sheet and are named by address. */
++	struct css_custom_inline *inl;
++	uintptr_t key;
  } css_custom_entry;
  
  typedef struct css_custom_map {
-@@ -59,10 +60,13 @@ void css__custom_map_unref(css_custom_map *map);
+@@ -59,10 +65,13 @@ void css__custom_map_unref(css_custom_map *map);
   * \param n_tokens     how many
   * \param specificity  of the rule that declared it
   * \param important    whether it was declared !important

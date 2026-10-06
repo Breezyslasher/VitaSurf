@@ -11900,6 +11900,66 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 }
 
 /*
+ * __vitaQuietAttr(element, name, value): set an attribute, or remove it
+ * when value is null, for the engine's own use (VitaSurf). The layout
+ * sees it as any attribute change; no MutationObserver hears of it, as
+ * the page did not make it. The prelude marks a shadow host with the
+ * styles it holds this way, so their rules can be kept to it.
+ */
+static JSValue win_vita_quiet_attr(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *node;
+	const char *name, *value = NULL;
+	dom_string *key, *val = NULL, *old = NULL;
+
+	(void)this_val;
+	if (argc < 3)
+		return JS_UNDEFINED;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL)
+		return JS_UNDEFINED;
+	{
+		dom_node_type t = DOM_TEXT_NODE;
+
+		if (dom_node_get_node_type(node, &t) != DOM_NO_ERR ||
+		    t != DOM_ELEMENT_NODE)
+			return JS_UNDEFINED;
+	}
+	name = JS_ToCString(ctx, argv[1]);
+	if (name == NULL)
+		return JS_UNDEFINED;
+	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]))
+		value = JS_ToCString(ctx, argv[2]);
+	key = to_dom_string(name);
+	if (value != NULL)
+		val = to_dom_string(value);
+	if (key != NULL) {
+		dom_element_get_attribute(node, key, &old);
+		if (val != NULL ? !(old != NULL &&
+				    dom_string_isequal(old, val)) :
+		    old != NULL) {
+			if (val != NULL)
+				dom_element_set_attribute(node, key, val);
+			else
+				dom_element_remove_attribute(node, key);
+			attr_stamp_touch(node);
+			mark_attr_dirty(ctx, node, key, old);
+		}
+		if (old != NULL)
+			dom_string_unref(old);
+		dom_string_unref(key);
+	}
+	if (val != NULL)
+		dom_string_unref(val);
+	if (value != NULL)
+		JS_FreeCString(ctx, value);
+	JS_FreeCString(ctx, name);
+	return JS_UNDEFINED;
+}
+
+/*
  * __vitaCustomProp(node, name): a custom property's value on an element,
  * as getComputedStyle().getPropertyValue("--name") answers it, or ""
  * when nothing declares it (VitaSurf). Theme code reads its colours this
@@ -13624,6 +13684,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaScrollElement",
 			  JS_NewCFunction(ctx, win_vita_scroll_element,
 					  "__vitaScrollElement", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaQuietAttr",
+			  JS_NewCFunction(ctx, win_vita_quiet_attr,
+					  "__vitaQuietAttr", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaCustomProp",
 			  JS_NewCFunction(ctx, win_vita_custom_prop,
 					  "__vitaCustomProp", 2));
