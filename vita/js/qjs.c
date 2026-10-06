@@ -421,6 +421,8 @@ static int next_timer_handle = 1;
  * this size therefore keep the layout they were parsed with.
  */
 #define RELAYOUT_MAX_ELEMENTS 6000
+/* elements a cost estimate must have been measured over (VitaSurf) */
+#define RELAYOUT_MIN_SAMPLE 200
 
 /*
  * And what it is expected to cost (VitaSurf).
@@ -7589,7 +7591,16 @@ rebuild:
 	 */
 	/* a rebuild this page already had is a better measure than
 	 * anything estimated from its first load (VitaSurf) */
-	if (vitasurf_box_elements > 0 && thread->relayout_ms == 0) {
+	/*
+	 * Only from a sample big enough to mean something (VitaSurf). The
+	 * counts are the browser's, reset when any page starts, so on
+	 * Speedtest, just after two small frames had loaded, a few
+	 * elements against a long time made 409 ms an element, the
+	 * estimate came to 345 s, and the page was never laid out again:
+	 * nothing it did after that reached the screen.
+	 */
+	if (vitasurf_box_elements >= RELAYOUT_MIN_SAMPLE &&
+	    thread->relayout_ms == 0) {
 		unsigned per_element_us = (vitasurf_ms_boxes * 1000u) /
 					  vitasurf_box_elements;
 		unsigned estimate = (per_element_us *
