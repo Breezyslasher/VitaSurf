@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<!-- The window's listeners are kept on a list of their own (VitaSurf), so
+     that the mutation events every DOM edit makes do not walk all of the
+     page's listeners. The cases: window listeners run in the order they
+     were added, among many on elements; a removed one stays removed; a
+     once listener runs once; one that removes another during dispatch
+     stops it; capture before bubble; and edits with a window listener
+     present still work. Expected lines are what Chrome and Firefox
+     print. -->
+<html><head><title>window listeners</title></head><body>
+<div id="d"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+var d = document.getElementById('d'), i, log = [];
+for (i = 0; i < 300; i++) {
+  var s = document.createElement('span');
+  s.addEventListener('ping', function () {});
+  s.addEventListener('click', function () {});
+  d.appendChild(s);
+}
+function a() { log.push('a'); }
+function b() { log.push('b'); }
+function c() { log.push('c'); }
+window.addEventListener('ping', a);
+window.addEventListener('ping', b);
+window.addEventListener('ping', c);
+window.dispatchEvent(new Event('ping'));
+T('order', log.join(''));
+log = [];
+window.removeEventListener('ping', b);
+window.dispatchEvent(new Event('ping'));
+T('after remove', log.join(''));
+log = [];
+window.addEventListener('ping', b, { once: true });
+window.dispatchEvent(new Event('ping'));
+window.dispatchEvent(new Event('ping'));
+T('once', log.join(''));
+log = [];
+function r() { log.push('r'); window.removeEventListener('ping', a); }
+window.removeEventListener('ping', a);
+window.removeEventListener('ping', c);
+window.addEventListener('ping', r);
+window.addEventListener('ping', a);
+window.dispatchEvent(new Event('ping'));
+window.dispatchEvent(new Event('ping'));
+T('removed during dispatch', log.join(''));
+log = [];
+window.addEventListener('pong', function () { log.push('bubble'); });
+window.addEventListener('pong', function () { log.push('capture'); }, true);
+d.firstChild.dispatchEvent(new Event('pong', { bubbles: true }));
+T('capture then bubble', log.join(' '));
+log = [];
+window.addEventListener('click', function () { log.push('click'); });
+for (i = 0; i < 50; i++) {
+  d.children[i].setAttribute('data-n', i);
+  d.appendChild(d.children[i]);
+}
+T('edits', d.children.length + ' ' + d.lastChild.getAttribute('data-n'));
+d.lastChild.click();
+T('click reaches the window', log.join(' '));
+</script>
+</body></html>

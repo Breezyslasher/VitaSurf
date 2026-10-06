@@ -237,6 +237,17 @@ struct jsthread {
 	const char *current_script; /**< URL of the script js_exec is running */
 	struct js_listener *listeners; /**< event listeners, freed on close */
 	/*
+	 * The window's listeners again, on a list of their own (VitaSurf).
+	 * libdom calls window_hook twice for every event it dispatches,
+	 * the mutation events every setAttribute and insertBefore make
+	 * among them, and walking all the page's listeners there for the
+	 * few on the window made each DOM edit cost more the more
+	 * listeners the page had: Home Assistant's dashboard spent most
+	 * of its setAttribute time in that walk.
+	 */
+	struct js_listener *win_listeners;
+	unsigned win_mutation;	/**< of them, those for a DOM mutation event */
+	/*
 	 * The listeners of one node, found without walking all of them
 	 * (VitaSurf). Adding a listener has to know whether the same one
 	 * is already there, and a page of any size registers thousands:
@@ -371,6 +382,7 @@ struct js_dispatch {
 struct js_listener {
 	struct js_listener *next;
 	struct js_listener *node_next;	/**< next listener on the same node */
+	struct js_listener *win_next;	/**< next of the window's listeners */
 	struct jsthread *thread;
 	struct dom_node *node;
 	struct dom_event_listener *dom_listener;
@@ -4785,6 +4797,18 @@ static bool listener_matches(JSContext *ctx, struct js_listener *l,
 		JS_IsStrictEqual(ctx, l->func, func);
 }
 
+/* Whether an event type is one of the DOM mutation events, which libdom
+   dispatches for every edit and which almost no page listens for on the
+   window: the ones named DOM..., less DOMContentLoaded. */
+static bool type_is_mutation(dom_string *type)
+{
+	const char *d = dom_string_data(type);
+	size_t len = dom_string_byte_length(type);
+
+	return len > 3 && memcmp(d, "DOM", 3) == 0 &&
+		!(len == 16 && memcmp(d, "DOMContentLoaded", 16) == 0);
+}
+
 /** Take l out of the thread's list, off the node, and free it. */
 static void drop_listener(jsthread *thread, struct js_listener *l)
 {
@@ -4802,6 +4826,19 @@ static void drop_listener(jsthread *thread, struct js_listener *l)
 				thread->listener_count--;
 			}
 			break;
+		}
+	}
+	if (l->on_window) {
+		for (pp = &thread->win_listeners; *pp != NULL;
+		     pp = &(*pp)->win_next) {
+			if (*pp == l) {
+				*pp = l->win_next;
+				break;
+			}
+		}
+		if (l->type != NULL && type_is_mutation(l->type) &&
+		    thread->win_mutation > 0) {
+			thread->win_mutation--;
 		}
 	}
 	listener_hash_remove(thread, l);
@@ -4930,6 +4967,13 @@ static JSValue add_listener_to(JSContext *ctx, struct dom_node *node,
 	l->next = thread->listeners;
 	thread->listeners = l;
 	thread->listener_count++;
+	if (on_window) {
+		l->win_next = thread->win_listeners;
+		thread->win_listeners = l;
+		if (type_is_mutation(type_dom)) {
+			thread->win_mutation++;
+		}
+	}
 	listener_hash_add(thread, l);
 
 	if (!on_window) {
@@ -9279,11 +9323,16 @@ static void run_window_listeners(jsthread *thread, struct dom_event *evt,
 	dom_string *type = NULL;
 	unsigned n = 0, cap = 0, i;
 
-	if (thread == NULL || thread->closed ||
+	if (thread == NULL || thread->closed || thread->win_listeners == NULL ||
 	    dom_event_get_type(evt, &type) != DOM_NO_ERR || type == NULL) {
 		return;
 	}
-	for (l = thread->listeners; l != NULL; l = l->next) {
+	if (thread->win_mutation == 0 && type_is_mutation(type)) {
+		/* each edit dispatches some; none is wanted here */
+		dom_string_unref(type);
+		return;
+	}
+	for (l = thread->win_listeners; l != NULL; l = l->win_next) {
 		if (!l->on_window || l->dead || l->type == NULL ||
 		    (which == 1 && !l->capture) ||
 		    (which == 3 && l->capture) ||
@@ -14298,6 +14347,8 @@ void js_destroythread(jsthread *thread)
 	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;
 	thread->listeners = NULL;
+	thread->win_listeners = NULL;
+	thread->win_mutation = 0;
 	while (l != NULL) {
 		struct js_listener *next = l->next;
 
