@@ -3935,7 +3935,7 @@ static bool tags_absent(jsthread *thread, struct dom_node *root,
 		}
 	}
 	if (!thread->tags_built) {
-		if (++thread->tags_asks < 2) return false;
+		if (thread->tags_asks < 2) return false;
 		if (!tags_build(thread, root)) {
 			thread->tags_n = 0;
 			if (thread->tags_set != NULL) {
@@ -3949,6 +3949,22 @@ static bool tags_absent(jsthread *thread, struct dom_node *root,
 	if (tags_has(thread, tag_hash)) return false;
 	vitasurf_js_sel_tag_absent++;
 	return true;
+}
+
+/*
+ * A bare tag query of root walked and found nothing (VitaSurf). The tag
+ * set answers only for names that are absent, so it is built once two
+ * walks of the same element have come back empty while the tree kept
+ * its shape: building it cost more than the walk it saves when the
+ * name is there, as Home Assistant's every card asking the body for
+ * the one <action-handler> is.
+ */
+static void tags_missed(jsthread *thread, struct dom_node *root)
+{
+	if (thread != NULL && thread->tags_root == root &&
+	    thread->tags_gen == vita_tree_gen) {
+		thread->tags_asks++;
+	}
 }
 
 /*
@@ -4037,6 +4053,9 @@ static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 			lwc_string_unref(name);
 		}
 		vitasurf_js_sel_tag_visits += seen;
+		if (out_n == 0 && JS_IsNull(out) == (mode != 2)) {
+			tags_missed(JS_GetContextOpaque(ctx), root);
+		}
 	}
 	walk_cost_note(mode == 2 ? "querySelectorAll" : "querySelector",
 		       tag, tag_len, vitasurf_js_sel_tag_visits - visits0,
@@ -10502,6 +10521,10 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 			lwc_string_unref(tag);
 		}
 		vitasurf_js_sel_tag_visits += seen;
+		if (bare != NULL && out_n == 0 &&
+		    JS_IsNull(out) == (magic != 2)) {
+			tags_missed(thread, root);
+		}
 	}
 	if (s->text != NULL) {
 		walk_cost_note(magic == 2 ? "querySelectorAll" :
