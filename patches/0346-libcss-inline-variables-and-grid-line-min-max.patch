@@ -1,0 +1,300 @@
+diff --git a/src/parse/properties/grid.c b/src/parse/properties/grid.c
+index 9c0b5c0..250f6e7 100644
+--- a/src/parse/properties/grid.c
++++ b/src/parse/properties/grid.c
+@@ -132,6 +132,71 @@ static bool token_to_integer(const css_token *token, int32_t *value)
+ static bool int_calc_sum(const parserutils_vector *vector, int32_t *ctx,
+ 		int32_t *out, int depth);
+ 
++/*
++ * Which math function a token opens, for an integer (VitaSurf): 1 calc,
++ * 2 min, 3 max, 4 clamp, or 0. Home Assistant's section grid spans each
++ * card min(var(--column-size,1), var(--grid-column-count)) columns.
++ */
++static int int_math_function(const css_token *token)
++{
++	static const char *const names[] = { "calc", "min", "max", "clamp" };
++	size_t len;
++	int i;
++
++	if (token == NULL || token->type != CSS_TOKEN_FUNCTION)
++		return 0;
++	len = lwc_string_length(token->idata);
++	for (i = 0; i < 4; i++) {
++		if (len == strlen(names[i]) &&
++				strncasecmp(lwc_string_data(token->idata),
++						names[i], len) == 0)
++			return i + 1;
++	}
++	return 0;
++}
++
++/* The arguments of min(), max() or clamp() and its closing bracket. */
++static bool int_calc_compare(const parserutils_vector *vector, int32_t *ctx,
++		int32_t *out, int depth, int fn)
++{
++	const css_token *token;
++	int32_t arg[3] = { 0, 0, 0 };
++	int n = 0;
++
++	for (;;) {
++		int32_t v;
++
++		if (int_calc_sum(vector, ctx, &v, depth + 1) == false)
++			return false;
++		if (n < 3)
++			arg[n] = v;
++		if (n > 0 && fn == 2 && v < arg[0])
++			arg[0] = v;
++		else if (n > 0 && fn == 3 && v > arg[0])
++			arg[0] = v;
++		n++;
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_iterate(vector, ctx);
++		if (token == NULL)
++			return false;
++		if (tokenIsChar(token, ')'))
++			break;
++		if (tokenIsChar(token, ',') == false)
++			return false;
++	}
++	if (fn == 4) {
++		/* clamp(min, value, max): max(min, min(value, max)) */
++		if (n != 3)
++			return false;
++		*out = arg[1] < arg[2] ? arg[1] : arg[2];
++		if (arg[0] > *out)
++			*out = arg[0];
++	} else {
++		*out = arg[0];
++	}
++	return true;
++}
++
+ static bool int_calc_factor(const parserutils_vector *vector, int32_t *ctx,
+ 		int32_t *out, int depth)
+ {
+@@ -149,11 +214,10 @@ static bool int_calc_factor(const parserutils_vector *vector, int32_t *ctx,
+ 		*out = -*out;
+ 		return true;
+ 	}
+-	if (tokenIsChar(token, '(') ||
+-			(token->type == CSS_TOKEN_FUNCTION &&
+-			 lwc_string_length(token->idata) == 4 &&
+-			 strncasecmp(lwc_string_data(token->idata),
+-					"calc", 4) == 0)) {
++	if (int_math_function(token) > 1)
++		return depth < 8 && int_calc_compare(vector, ctx, out, depth,
++				int_math_function(token));
++	if (tokenIsChar(token, '(') || int_math_function(token) == 1) {
+ 		if (int_calc_sum(vector, ctx, out, depth + 1) == false)
+ 			return false;
+ 		consumeWhitespace(vector, ctx);
+@@ -226,10 +290,14 @@ static bool token_to_integer_or_calc(const parserutils_vector *vector,
+ {
+ 	int32_t save = *ctx;
+ 
+-	if (token != NULL && token->type == CSS_TOKEN_FUNCTION &&
+-			lwc_string_length(token->idata) == 4 &&
+-			strncasecmp(lwc_string_data(token->idata), "calc",
+-					4) == 0) {
++	if (int_math_function(token) > 1) {
++		if (int_calc_compare(vector, ctx, value, 1,
++				int_math_function(token)))
++			return true;
++		*ctx = save;
++		return false;
++	}
++	if (int_math_function(token) == 1) {
+ 		const css_token *close;
+ 
+ 		if (int_calc_sum(vector, ctx, value, 1)) {
+diff --git a/src/select/custom.c b/src/select/custom.c
+index 191d208..9cbb45f 100644
+--- a/src/select/custom.c
++++ b/src/select/custom.c
+@@ -31,6 +31,22 @@ unsigned int css_custom_max_count;
+ unsigned int css_custom_gets;
+ unsigned int css_custom_get_steps;
+ 
++/** Free an entry's own copy of its tokens, if it has one. */
++static void _drop_tokens(css_custom_entry *e)
++{
++	uint32_t i;
++
++	if (!e->owned)
++		return;
++	for (i = 0; i < e->n_tokens; i++) {
++		if (e->tokens[i].idata != NULL)
++			lwc_string_unref(e->tokens[i].idata);
++	}
++	free(e->tokens);
++	e->tokens = NULL;
++	e->owned = false;
++}
++
+ css_custom_map *css__custom_map_ref(css_custom_map *map)
+ {
+ 	if (map != NULL) {
+@@ -46,8 +62,10 @@ void css__custom_map_unref(css_custom_map *map)
+ 		uint32_t i;
+ 
+ 		for (i = 0; i < map->n_slots; i++) {
+-			if (map->slots[i].name != NULL)
++			if (map->slots[i].name != NULL) {
+ 				lwc_string_unref(map->slots[i].name);
++				_drop_tokens(&map->slots[i]);
++			}
+ 		}
+ 		free(map->slots);
+ 		free(map);
+@@ -175,9 +193,10 @@ static css_error _grow(css_custom_map *map)
+ 
+ css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
+ 		css_token *tokens, uint32_t n_tokens,
+-		uint32_t specificity, bool important)
++		uint32_t specificity, bool important, bool copy)
+ {
+ 	css_custom_entry *e;
++	css_token *kept = tokens;
+ 	css_error error;
+ 	uint32_t i;
+ 
+@@ -200,18 +219,39 @@ css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
+ 	 * own declaration always shadows an inherited value.
+ 	 */
+ 	e = _find_own(*map, name);
+-	if (e != NULL) {
+-		if (e->important && !important) {
+-			return CSS_OK;
++	if (e != NULL && e->important && !important) {
++		return CSS_OK;
++	}
++
++	if (copy && n_tokens > 0) {
++		kept = malloc(n_tokens * sizeof(*kept));
++		if (kept == NULL) {
++			return CSS_NOMEM;
+ 		}
+-	} else {
+-		if ((*map)->count >= CUSTOM_MAP_MAX) {
+-			return CSS_OK;	/* silently dropped, see the cap */
++		for (i = 0; i < n_tokens; i++) {
++			kept[i] = tokens[i];
++			if (kept[i].idata != NULL)
++				lwc_string_ref(kept[i].idata);
+ 		}
+-		if (((*map)->count + 1) * 2 > (*map)->n_slots) {
+-			error = _grow(*map);
+-			if (error != CSS_OK)
+-				return error;
++	}
++
++	if (e != NULL) {
++		_drop_tokens(e);
++	} else {
++		if ((*map)->count >= CUSTOM_MAP_MAX ||
++				(((*map)->count + 1) * 2 > (*map)->n_slots &&
++				_grow(*map) != CSS_OK)) {
++			/* silently dropped, see the cap; or no memory */
++			if (kept != tokens) {
++				for (i = 0; i < n_tokens; i++) {
++					if (kept[i].idata != NULL)
++						lwc_string_unref(
++							kept[i].idata);
++				}
++				free(kept);
++			}
++			return (*map)->count >= CUSTOM_MAP_MAX ?
++					CSS_OK : CSS_NOMEM;
+ 		}
+ 		for (i = _slot_of(*map, name); (*map)->slots[i].name != NULL;
+ 				i = (i + 1) & ((*map)->n_slots - 1))
+@@ -223,7 +263,8 @@ css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
+ 			css_custom_max_count = (*map)->count;
+ 	}
+ 
+-	e->tokens = tokens;
++	e->tokens = kept;
++	e->owned = kept != tokens;
+ 	e->n_tokens = n_tokens;
+ 	e->specificity = specificity;
+ 	e->important = important;
+diff --git a/src/select/custom.h b/src/select/custom.h
+index 6d0a7d0..98ec55e 100644
+--- a/src/select/custom.h
++++ b/src/select/custom.h
+@@ -34,6 +34,7 @@ typedef struct css_custom_entry {
+ 	uint32_t n_tokens;
+ 	uint32_t specificity;		/**< of the rule that declared it */
+ 	bool important;
++	bool owned;			/**< tokens are the map's own copy */
+ } css_custom_entry;
+ 
+ typedef struct css_custom_map {
+@@ -59,10 +60,13 @@ void css__custom_map_unref(css_custom_map *map);
+  * \param n_tokens     how many
+  * \param specificity  of the rule that declared it
+  * \param important    whether it was declared !important
++ * \param copy         keep a copy of the tokens: a style attribute's
++ *                     sheet is freed once the element's style is
++ *                     selected, and the map outlives it
+  */
+ css_error css__custom_map_set(css_custom_map **map, lwc_string *name,
+ 		css_token *tokens, uint32_t n_tokens,
+-		uint32_t specificity, bool important);
++		uint32_t specificity, bool important, bool copy);
+ 
+ /**
+  * Find a variable, in this element's map or an ancestor's.
+diff --git a/src/select/select.c b/src/select/select.c
+index e5404b0..8b16c47 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -865,9 +865,12 @@ static css_error apply_deferred(css_select_ctx *ctx, css_select_state *state)
+ 		if (m->decl->custom == NULL) {
+ 			continue;
+ 		}
++		/* a style attribute's sheet goes once this element's
++		 * style is selected, and the map outlives it: copy */
+ 		error = css__custom_map_set(&state->custom, m->decl->custom,
+ 				m->decl->tokens, m->decl->n_tokens,
+-				m->specificity, m->decl->important);
++				m->specificity, m->decl->important,
++				m->sheet != NULL && m->sheet->inline_style);
+ 		if (error != CSS_OK) {
+ 			return error;
+ 		}
+@@ -3049,6 +3052,11 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 			goto cleanup;
+ 		}
+ 
++		/* An author declaration with the style attribute's own
++		 * specificity, whatever rule was matched last (VitaSurf) */
++		state.current_origin = CSS_ORIGIN_AUTHOR;
++		state.current_specificity = CSS_SPECIFICITY_A;
++
+ 		/* No bytecode if input was empty or wholly invalid */
+ 		if (sel->style != NULL) {
+ 			/* Inline style applies to base element only */
+@@ -3061,6 +3069,20 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 			if (error != CSS_OK)
+ 				goto cleanup;
+ 		}
++
++		/* and its variables, and the declarations that spend them,
++		 * which a rule's are held over for (VitaSurf): style="--n:6"
++		 * and style="width: var(--n)" were both dropped, so Home
++		 * Assistant's section grid, which sizes each card from a
++		 * --column-size in its style attribute, put every card in
++		 * one column of twelve */
++		if (sel->n_deferred > 0) {
++			state.current_layer = CSS_LAYER_NONE;
++			error = record_deferred(&state, sel,
++					CSS_PSEUDO_ELEMENT_NONE);
++			if (error != CSS_OK)
++				goto cleanup;
++		}
+ 	}
+ 
+ 	SELECT_PHASE(css_select_us_match);
