@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!-- A custom property's value may hold a {} block, with semicolons inside
+     it, in a sheet and in a style attribute; it is not a nested rule,
+     and what follows it is not lost (VitaSurf). A value set through
+     setProperty that leaves a bracket or a string open does not run on
+     over the declarations after it, as it did when they were all read
+     back from the one style attribute: Home Assistant's dark theme sets
+     such a value, and the hundred theme colours after it, the dark
+     backgrounds among them, were lost. A value with a closing bracket
+     that closes nothing is refused. Expected lines are what Chrome
+     prints. -->
+<html><head><title>custom property blocks</title><style>
+#s { --a: x{y;z}; --b: 2; --c: f(1;2) [3;4]; --d: 4 }
+</style></head><body>
+<div id="i" style="--a: x@layer q{@supports (a:b){.y{c:d;e:f}}}; --b: 2; --c: 3"></div>
+<div id="s"></div>
+<div id="j"></div>
+<div id="k"></div>
+<script>
+function T(n, v) { try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+var j = document.getElementById('j'), k = document.getElementById('k');
+j.style.setProperty('--a', 'v@layer w{.x{a:b;c:d}}');
+j.style.setProperty('--b', '7');
+k.style.setProperty('--b', '7');
+k.style.setProperty('--c', 'x"y');
+k.style.setProperty('--e', 'f(1');
+k.style.setProperty('--f', 'a}b');
+k.style.setProperty('--g', '[ 1');
+k.style.setProperty('--h', 'after');
+setTimeout(function () {
+  ['i', 's', 'j'].forEach(function (id) {
+    var cs = getComputedStyle(document.getElementById(id));
+    T(id, ['--a', '--b', '--c', '--d'].map(function (n) {
+      return n + '=[' + cs.getPropertyValue(n).trim() + ']'; }).join(' '));
+  });
+  var cs = getComputedStyle(k);
+  T('k set', ['--b', '--c', '--e', '--f', '--g', '--h'].map(function (n) {
+    return n + '=[' + k.style.getPropertyValue(n) + ']'; }).join(' '));
+  T('k computed', ['--b', '--f', '--h'].map(function (n) {
+    return n + '=[' + cs.getPropertyValue(n).trim() + ']'; }).join(' '));
+}, 100);
+</script></body></html>

@@ -2793,8 +2793,16 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  var canon=Object.create(null);
  /* the copy kept for a text is live while it is in the document and
     still holds that text: a page may give it other text later */
+ /* The text each kept copy was last given here (VitaSurf). Reading a
+    style's text back makes a string of it; the check every half second
+    below read every kept sheet's whole text that way, 6% of the script
+    time of a Home Assistant load. A copy whose text is set any other
+    way is no longer in it and is read as before. */
+ var given=new WeakMap();
  function live(css){var c=canon[css];
-  return !!c&&ceInDoc(c)&&c.textContent===css;}
+  if(!c||!ceInDoc(c))return false;
+  return given.get(c)===css||c.textContent===css;}
+ function keep(n,css){canon[css]=n;given.set(n,css);}
  /* The emptied copies, by text (VitaSurf). If the kept copy leaves the
     document, the components still in it would lose their styles, so
     while any are parked a check every half second, doing nothing unless
@@ -2821,7 +2829,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
      if(n.textContent===''&&ceInDoc(n)){
       l.splice(i,1);nparked--;
       if(rawText)rawText.call(n,css);else n.textContent=css;
-      canon[css]=n;
+      keep(n,css);
       break;}}}
    if(!l.length)delete parked[css];}
   if(nparked<=0&&timer!==null){ci.call(W,timer);timer=null;nparked=0;}}
@@ -2939,7 +2947,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   sc=scope(css,host);
   if(sc!==css){css=sc;if(rawText)rawText.call(n,css);else n.textContent=css;}
   if(live(css)){n.textContent='';park(n,css);return;}
-  canon[css]=n;}
+  keep(n,css);}
  /* A <style> deeper in a shadow tree than the host's own children, or
   * one with attributes, an id say (VitaSurf). Neither was scoped, so its
   * rules reached the whole page: Bubble Card writes each card's own
@@ -3049,7 +3057,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    var st=this.getElementsByTagName('style'),i,j;
    for(i=0;i<st.length;i++)for(j=0;j<fresh.length;j++)
     if(!canon[fresh[j]]||!live(fresh[j]))
-     if(st[i].textContent===fresh[j])canon[fresh[j]]=st[i];}
+     if(st[i].textContent===fresh[j])keep(st[i],fresh[j]);}
   return r;}});
  /* and the text given after the style is in: GitHub's <tool-tip>
   * appends an empty <style> to its shadow root and then sets its
@@ -3061,12 +3069,13 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  rawText=t.set;
  Object.defineProperty(P,'textContent',{configurable:true,get:t.get,set:function(v){
   var p;
+  given.delete(this);
   if(typeof v==='string'&&v&&(p=this.parentNode)&&p.__shadow&&styleNode(this)){
    v=scope(v,p);
    if(live(v)){
     if(canon[v]!==this){t.set.call(this,'');park(this,v);}
     return;}
-   t.set.call(this,v);canon[v]=this;return;}
+   t.set.call(this,v);keep(this,v);return;}
   if(typeof v==='string'&&(p=this.parentNode)&&nested(p,this)){
    t.set.call(this,takeNested(owner(p),this,v));return;}
   t.set.call(this,v);}});
@@ -4837,8 +4846,49 @@ W.StorageEvent.prototype.initStorageEvent=function(t,b,c,k,o,n,u,s){this.type=t;
 function cssName(p){return String(p)
  .replace(/^(webkit|moz|ms|epub)([A-Z])/,function(m,a,b){return '-'+a+'-'+b.toLowerCase();})
  .replace(/[A-Z]/g,function(c){return '-'+c.toLowerCase();});}
+/* The declarations of a style text, split at the semicolons outside any
+ * string or bracket (VitaSurf): a custom property may hold a block with
+ * semicolons of its own. */
+function splitDecls(t){
+ var out=[],st=0,depth=0,q='',i,c;
+ for(i=0;i<t.length;i++){
+  c=t.charAt(i);
+  if(q){if(c==='\\')i++;else if(c===q)q='';continue;}
+  if(c==='"'||c==="'")q=c;
+  else if(c==='\\')i++;
+  else if(c==='('||c==='['||c==='{')depth++;
+  else if((c===')'||c===']'||c==='}')&&depth>0)depth--;
+  else if(c===';'&&depth===0){out.push(t.slice(st,i));st=i+1;}}
+ out.push(t.slice(st));
+ return out;}
+/* A value as the style attribute can hold it (VitaSurf). A value set
+ * through the CSSOM is parsed on its own, where the end closes whatever
+ * it left open; the attribute holds every declaration in one text, and
+ * there a bracket or string left open runs on over all the ones after
+ * it. Home Assistant's dark theme sets a variable cut off at
+ * "@layer wa-utilities{@supports (scrollbar-gutter", and the hundred
+ * theme colours after it, the dark backgrounds among them, were lost.
+ * So what is open is closed. A closing bracket with nothing open makes
+ * the value invalid, and null is returned, as a browser drops it. */
+function closeValue(v){
+ var stack=[],q='',i,c,k;
+ for(i=0;i<v.length;i++){
+  c=v.charAt(i);
+  if(q){if(c==='\\')i++;else if(c===q)q='';continue;}
+  if(c==='"'||c==="'")q=c;
+  else if(c==='\\')i++;
+  else if(c==='(')stack.push(')');
+  else if(c==='[')stack.push(']');
+  else if(c==='{')stack.push('}');
+  else if(c===')'||c===']'||c==='}'){
+   if(!stack.length||stack[stack.length-1]!==c)return null;
+   stack.pop();}}
+ if(!q&&!stack.length)return v;
+ if(q)v+=q;
+ for(k=stack.length-1;k>=0;k--)v+=stack[k];
+ return v;}
 function parseDecl(t){var out=[];
- String(t||'').split(';').forEach(function(d){
+ splitDecls(String(t||'')).forEach(function(d){
   var i=d.indexOf(':');if(i<0)return;
   var n=d.slice(0,i).trim().toLowerCase(),v=d.slice(i+1).trim(),pr='';
   if(!n||!v)return;
@@ -4846,7 +4896,7 @@ function parseDecl(t){var out=[];
   out.push([n,v,pr]);});
  return out;}
 function serialDecl(list){return list.map(function(d){
- return d[0]+': '+d[1]+(d[2]?' !'+d[2]:'')+';';}).join(' ');}
+ return declText(d);}).join(' ');}
 function CSSStyleDeclaration(el){this._e=el;}
 /* The parsed style attribute of each element, while the attribute still
  * reads the same. Home Assistant's theme sets some 600 variables on one
@@ -4859,7 +4909,8 @@ function styleOf(e){
  var l=parseDecl(s),ix=new Map(),i;
  for(i=0;i<l.length;i++)ix.set(l[i][0],i);
  c={s:s,l:l,ix:ix};STYLE_PARSED.set(e,c);return c;}
-function declText(d){return d[0]+': '+d[1]+(d[2]?' !'+d[2]:'')+';';}
+function declText(d){var v=closeValue(d[1]);
+ return d[0]+': '+(v===null?d[1]:v)+(d[2]?' !'+d[2]:'')+';';}
 CSSStyleDeclaration.prototype._d=function(){
  return this._e?styleOf(this._e).l:(this._own||(this._own=[]));};
 CSSStyleDeclaration.prototype._w=function(list){
@@ -4877,6 +4928,7 @@ CSSStyleDeclaration.prototype.setProperty=function(n,v,pr){
  n=cssName(n);
  if(v===''||v===null||v===undefined)return this.removeProperty(n);
  var d=[n,String(v),pr||''];
+ if(closeValue(d[1])===null)return;
  if(!this._e){
   var own=this._d(),i;
   for(i=0;i<own.length;i++)if(own[i][0]===n){own[i]=d;return;}
