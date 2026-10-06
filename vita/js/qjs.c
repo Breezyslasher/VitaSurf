@@ -3897,59 +3897,16 @@ static bool tags_build(jsthread *thread, struct dom_node *root)
 	struct dom_node *n = NULL;
 
 	vitasurf_js_sel_tag_sets++;
-	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
-	while (n != NULL) {
-		struct dom_node *next = NULL;
+	/* borrowed nodes and names: nothing here runs script */
+	while ((n = dom_node_vita_next_element(root, n)) != NULL) {
+		dom_string *local = dom_node_vita_local_name(n);
 
-		dom_node_type type = 0;
-
-		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
-		    type == DOM_ELEMENT_NODE) {
-			dom_string *local = NULL;
-			bool ok = true;
-
-			vitasurf_js_sel_tag_set_visits++;
-			dom_node_get_local_name(n, &local);
-			if (local != NULL) {
-				ok = tags_add(thread, tag_hash_lower(
-					dom_string_data(local),
-					dom_string_byte_length(local)));
-				dom_string_unref(local);
-			}
-			if (!ok) {
-				dom_node_unref(n);
-				return false;
-			}
+		vitasurf_js_sel_tag_set_visits++;
+		if (local != NULL &&
+		    !tags_add(thread, tag_hash_lower(dom_string_data(local),
+					dom_string_byte_length(local)))) {
+			return false;
 		}
-		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
-			next = NULL;
-		}
-		if (next == NULL) {
-			struct dom_node *cur = dom_node_ref(n);
-
-			while (cur != NULL) {
-				struct dom_node *sib = NULL, *parent = NULL;
-
-				if (cur == root) {
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_next_sibling(cur, &sib) ==
-				    DOM_NO_ERR && sib != NULL) {
-					next = sib;
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_parent_node(cur, &parent) !=
-				    DOM_NO_ERR) {
-					parent = NULL;
-				}
-				dom_node_unref(cur);
-				cur = parent;
-			}
-		}
-		dom_node_unref(n);
-		n = next;
 	}
 	return true;
 }
@@ -4060,62 +4017,26 @@ static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 	visits0 = vitasurf_js_sel_tag_visits;
-	/* iterative pre-order walk; root itself is not a candidate */
-	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
-		n = NULL;
-	}
-	while (n != NULL) {
-		struct dom_node *next = NULL;
-		dom_node_type type = 0;
+	/* tree order, root itself not a candidate, the name compared
+	 * interned inside libdom on borrowed nodes; see sel_native */
+	{
+		lwc_string *name = NULL;
+		uint32_t seen = 0;
 
-		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
-		    type == DOM_ELEMENT_NODE) {
-			dom_string *local = NULL;
-			bool hit;
-
-			vitasurf_js_sel_tag_visits++;
-			dom_node_get_local_name(n, &local);
-			hit = tag_is(n, local, tag, tag_len);
-			if (local != NULL) dom_string_unref(local);
-			if (hit) {
+		if (lwc_intern_string(tag, tag_len, &name) == lwc_error_ok) {
+			n = NULL;
+			while ((n = dom_node_vita_find_tag(root, n, name,
+							   &seen)) != NULL) {
 				if (mode != 2) {
 					out = wrap_node(ctx, n);
-					dom_node_unref(n);
 					break;
 				}
 				JS_SetPropertyUint32(ctx, out, out_n++,
 						     wrap_node(ctx, n));
 			}
+			lwc_string_unref(name);
 		}
-		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
-			next = NULL;
-		}
-		if (next == NULL) {
-			struct dom_node *cur = dom_node_ref(n);
-
-			while (cur != NULL) {
-				struct dom_node *sib = NULL, *parent = NULL;
-
-				if (cur == root) {
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_next_sibling(cur, &sib) ==
-				    DOM_NO_ERR && sib != NULL) {
-					next = sib;
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_parent_node(cur, &parent) !=
-				    DOM_NO_ERR) {
-					parent = NULL;
-				}
-				dom_node_unref(cur);
-				cur = parent;
-			}
-		}
-		dom_node_unref(n);
-		n = next;
+		vitasurf_js_sel_tag_visits += seen;
 	}
 	walk_cost_note(mode == 2 ? "querySelectorAll" : "querySelector",
 		       tag, tag_len, vitasurf_js_sel_tag_visits - visits0,
@@ -10540,52 +10461,47 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 		return out;
 	}
 	visits0 = vitasurf_js_sel_tag_visits;
-	/* iterative pre-order walk; root itself is not a candidate */
-	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
-	while (n != NULL) {
-		struct dom_node *next = NULL;
+	/*
+	 * Tree order, root itself not a candidate, on borrowed nodes:
+	 * neither matching nor wrapping runs script or changes the tree.
+	 * A bare tag is compared by its interned name inside libdom.
+	 */
+	{
+		lwc_string *tag = NULL;
+		uint32_t seen = 0;
 
-		if (sel_is_element(n)) {
-			vitasurf_js_sel_tag_visits++;
-			if (sel_matches(n, s)) {
-				if (magic == 1) {
-					out = wrap_node(ctx, n);
-					dom_node_unref(n);
-					break;
+		if (bare != NULL &&
+		    lwc_intern_string(bare->tag, bare->tag_len, &tag) !=
+		    lwc_error_ok) {
+			tag = NULL;
+		}
+		n = NULL;
+		for (;;) {
+			if (tag != NULL) {
+				n = dom_node_vita_find_tag(root, n, tag, &seen);
+			} else {
+				n = dom_node_vita_next_element(root, n);
+				if (n != NULL) {
+					seen++;
 				}
-				JS_SetPropertyUint32(ctx, out, out_n++,
-						     wrap_node(ctx, n));
 			}
-		}
-		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
-			next = NULL;
-		}
-		if (next == NULL) {
-			struct dom_node *cur = dom_node_ref(n);
-
-			while (cur != NULL) {
-				struct dom_node *sib = NULL, *parent = NULL;
-
-				if (cur == root) {
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_next_sibling(cur, &sib) ==
-				    DOM_NO_ERR && sib != NULL) {
-					next = sib;
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_parent_node(cur, &parent) !=
-				    DOM_NO_ERR) {
-					parent = NULL;
-				}
-				dom_node_unref(cur);
-				cur = parent;
+			if (n == NULL) {
+				break;
 			}
+			if (tag == NULL && !sel_matches(n, s)) {
+				continue;
+			}
+			if (magic == 1) {
+				out = wrap_node(ctx, n);
+				break;
+			}
+			JS_SetPropertyUint32(ctx, out, out_n++,
+					     wrap_node(ctx, n));
 		}
-		dom_node_unref(n);
-		n = next;
+		if (tag != NULL) {
+			lwc_string_unref(tag);
+		}
+		vitasurf_js_sel_tag_visits += seen;
 	}
 	if (s->text != NULL) {
 		walk_cost_note(magic == 2 ? "querySelectorAll" :

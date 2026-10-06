@@ -375,8 +375,21 @@ static void *pa_malloc(void *opaque, size_t size)
 
 	(void) opaque;
 	if (size > MAX_SMALL) {
+		void *big = malloc(size);
+
 		pa.stats.large++;
-		return malloc(size);
+		/* the size question that follows, answered without a
+		 * search of the page table for a block not in it */
+		if (big != NULL) {
+			memo_ptr = big;
+			memo_ours = false;
+#ifdef __GLIBC__
+			memo_size = (uint32_t) malloc_usable_size(big);
+#else
+			memo_size = 0;
+#endif
+		}
+		return big;
 	}
 	c = pa.class_of[(size + 7) >> 3];
 	p = pa.classes[c].avail;
