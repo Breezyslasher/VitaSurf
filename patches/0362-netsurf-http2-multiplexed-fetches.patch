@@ -1,0 +1,308 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index 2c972a16b..6fa9ca6d6 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -104,6 +104,7 @@ struct fetch {
+ 	unsigned int queued_ms;	/**< when it was queued (VitaSurf) */
+ 	bool finishing;		/**< in ::finish_ring (VitaSurf) */
+ 	bool local;		/**< needs no network: see fetch_is_local */
++	bool extra_stream;	/**< beyond the slots: see fetch_host_multiplexes */
+ };
+ 
+ static struct fetch *fetch_ring = NULL;	/**< Ring of active fetches. */
+@@ -201,26 +202,99 @@ static bool fetch_is_local(lwc_string *scheme)
+ 	return true;
+ }
+ 
+-/** The fetches in the fetch ring that hold a network slot. */
+-static int fetch_count_network(lwc_string *host)
++/*
++ * Hosts that answered over HTTP/2 (VitaSurf). A fetch to one of them is
++ * another stream on the connection it already has, not another
++ * connection, so it need not wait for one of max_fetchers_per_host:
++ * GitHub asks its asset host for forty modules at once, and over
++ * HTTP/1.1 they went six at a time, each new connection a TLS handshake
++ * of a second on the Vita. Up to FETCH_MUX_PER_HOST run at once to such
++ * a host, the ones past the usual slots counted apart from max_fetchers
++ * up to FETCH_MUX_EXTRA in all, which bounds the memory the transfers
++ * hold. A host that turns out to answer over HTTP/1.1 after all has the
++ * extra fetches queued inside curl, behind its connection limit.
++ */
++#define FETCH_MUX_HOSTS 16
++#define FETCH_MUX_PER_HOST 24
++#define FETCH_MUX_EXTRA 32
++static lwc_string *fetch_mux_hosts[FETCH_MUX_HOSTS];
++static unsigned int fetch_mux_next;
++
++static bool fetch_host_is_mux(lwc_string *host)
++{
++	unsigned int i;
++	bool match;
++
++	for (i = 0; i < FETCH_MUX_HOSTS; i++) {
++		if (fetch_mux_hosts[i] != NULL &&
++		    lwc_string_isequal(fetch_mux_hosts[i], host, &match) ==
++		    lwc_error_ok && match)
++			return true;
++	}
++	return false;
++}
++
++/* exported interface documented in content/fetch.h */
++void fetch_host_multiplexes(lwc_string *host)
++{
++	if (host == NULL || fetch_host_is_mux(host))
++		return;
++	/* the oldest goes when the table is full */
++	if (fetch_mux_hosts[fetch_mux_next] != NULL)
++		lwc_string_unref(fetch_mux_hosts[fetch_mux_next]);
++	fetch_mux_hosts[fetch_mux_next] = lwc_string_ref(host);
++	fetch_mux_next = (fetch_mux_next + 1) % FETCH_MUX_HOSTS;
++}
++
++static void fetch_mux_hosts_free(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < FETCH_MUX_HOSTS; i++) {
++		if (fetch_mux_hosts[i] != NULL)
++			lwc_string_unref(fetch_mux_hosts[i]);
++		fetch_mux_hosts[i] = NULL;
++	}
++}
++
++/**
++ * The fetches in the fetch ring to one host that need the network, or
++ * with host NULL those holding one of max_fetchers, which extra streams
++ * do not; *extra, if given, counts the extra streams.
++ */
++static int fetch_count_network2(lwc_string *host, int *extra)
+ {
+ 	struct fetch *f = fetch_ring;
+ 	int count = 0;
+ 	bool match;
+ 
++	if (extra != NULL)
++		*extra = 0;
+ 	if (f == NULL)
+ 		return 0;
+ 	do {
+-		if (!f->local &&
+-		    (host == NULL ||
+-		     (lwc_string_isequal(f->host, host, &match) ==
+-		      lwc_error_ok && match)))
++		if (f->local) {
++			/* holds nothing */
++		} else if (host == NULL) {
++			if (!f->extra_stream)
++				count++;
++			else if (extra != NULL)
++				(*extra)++;
++		} else if (lwc_string_isequal(f->host, host, &match) ==
++			   lwc_error_ok && match) {
+ 			count++;
++		}
+ 		f = f->r_next;
+ 	} while (f != fetch_ring);
+ 	return count;
+ }
+ 
++/** The fetches in the fetch ring that hold a network slot. */
++static int fetch_count_network(lwc_string *host)
++{
++	return fetch_count_network2(host, NULL);
++}
++
+ /** Start every queued local fetch. */
+ static void fetch_dispatch_local(void)
+ {
+@@ -237,11 +311,13 @@ static void fetch_dispatch_local(void)
+ 	}
+ }
+ 
+-static bool fetch_choose_and_dispatch(void)
++static bool fetch_choose_and_dispatch(int all_active, int all_extra,
++				      bool *extra)
+ {
+ 	bool same_host;
+ 	struct fetch *queueitem;
+ 	queueitem = queue_ring;
++	*extra = false;
+ 	do {
+ 		/* We can dispatch the selected item if there is room in the
+ 		 * fetch ring
+@@ -249,8 +325,18 @@ static bool fetch_choose_and_dispatch(void)
+ 		int countbyhost;
+ 		countbyhost = queueitem->local ? 0 :
+ 			fetch_count_network(queueitem->host);
+-		if (countbyhost < nsoption_int(max_fetchers_per_host)) {
++		if (countbyhost < nsoption_int(max_fetchers_per_host) &&
++		    all_active < nsoption_int(max_fetchers)) {
+ 			/* We can dispatch this item in theory */
++			queueitem->extra_stream = false;
++			return fetch_dispatch_job(queueitem);
++		}
++		/* another stream on an HTTP/2 connection (VitaSurf) */
++		if (!queueitem->local && countbyhost < FETCH_MUX_PER_HOST &&
++		    all_extra < FETCH_MUX_EXTRA &&
++		    fetch_host_is_mux(queueitem->host)) {
++			queueitem->extra_stream = true;
++			*extra = true;
+ 			return fetch_dispatch_job(queueitem);
+ 		}
+ 		/* skip over other items with the same host */
+@@ -297,12 +383,13 @@ static void dump_rings(void)
+  */
+ static bool fetch_dispatch_jobs(void)
+ {
+-	int all_active;
++	int all_active, all_extra;
+ 	int all_queued;
++	bool extra;
+ 
+ 	fetch_dispatch_local();
+ 	RING_GETSIZE(struct fetch, queue_ring, all_queued);
+-	all_active = fetch_count_network(NULL);
++	all_active = fetch_count_network2(NULL, &all_extra);
+ 
+ 	NSLOG(fetch, DEBUG,
+ 	      "queue_ring %i, fetch_ring %i",
+@@ -311,10 +398,12 @@ static bool fetch_dispatch_jobs(void)
+ 	dump_rings();
+ 
+ 	while ((all_queued != 0) &&
+-	       (all_active < nsoption_int(max_fetchers)) &&
+-	       fetch_choose_and_dispatch()) {
++	       fetch_choose_and_dispatch(all_active, all_extra, &extra)) {
+ 			all_queued--;
+-			all_active++;
++			if (extra)
++				all_extra++;
++			else
++				all_active++;
+ 			NSLOG(fetch, DEBUG,
+ 			      "%d queued, %d fetching",
+ 			      all_queued,
+@@ -415,6 +504,8 @@ nserror fetcher_init(void)
+ void fetcher_quit(void)
+ {
+ 	int fetcherd; /* fetcher index */
++
++	fetch_mux_hosts_free();
+ 	for (fetcherd = 0; fetcherd < MAX_FETCHERS; fetcherd++) {
+ 		if (fetchers[fetcherd].refcount > 1) {
+ 			/* fetcher still has reference at quit. This
+diff --git a/content/fetch.h b/content/fetch.h
+index 38f61a15c..3090ea199 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -266,6 +266,13 @@ void fetch_remove_from_queues(struct fetch *fetch);
+  */
+ void fetch_transport_done(struct fetch *fetch);
+ 
++/**
++ * Note that a host answered over HTTP/2 (VitaSurf), so that its queued
++ * fetches can go to it as more streams on its connection instead of
++ * waiting for one of max_fetchers_per_host.
++ */
++void fetch_host_multiplexes(lwc_string *host);
++
+ /**
+  * Free a fetch structure and associated resources.
+  */
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 8e4d9301b..0362e6e9f 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1622,6 +1622,17 @@ static bool fetch_curl_process_headers(struct curl_fetch_info *f)
+ 	}
+ 	http_code = f->http_code;
+ 	NSLOG(netsurf, INFO, "HTTP status code %li", http_code);
++	/* the host's queued fetches can share this connection now */
++	{
++		long version = 0;
++
++		if (curl_easy_getinfo(f->curl_handle, CURLINFO_HTTP_VERSION,
++				      &version) == CURLE_OK &&
++		    version == CURL_HTTP_VERSION_2_0) {
++			fetch_host_multiplexes(f->host);
++			vitasurf_net_h2++;
++		}
++	}
+ 
+ 	if ((http_code == HTTP_RESPONSE_NOT_MODIFIED) &&
+ 	    (f->postdata->type==FETCH_POSTDATA_NONE)) {
+@@ -2490,6 +2501,8 @@ nserror fetch_curl_register(void)
+ 		SETOPT(CURLMOPT_MAXCONNECTS, (long)maxconnects);
+ 		SETOPT(CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)maxconnects);
+ 		SETOPT(CURLMOPT_MAX_HOST_CONNECTIONS, (long)nsoption_int(max_fetchers_per_host));
++		/* streams share an HTTP/2 connection (VitaSurf) */
++		SETOPT(CURLMOPT_PIPELINING, (long)CURLPIPE_MULTIPLEX);
+ 	}
+ #endif
+ 
+@@ -2513,13 +2526,28 @@ nserror fetch_curl_register(void)
+ 	SETOPT(CURLOPT_ERRORBUFFER, fetch_error_buffer);
+ 	SETOPT(CURLOPT_DEBUGFUNCTION, fetch_curl_debug);
+ 	if (nsoption_bool(suppress_curl_debug)) {
+-		SETOPT(CURLOPT_VERBOSE, 0);
++		SETOPT(CURLOPT_VERBOSE, 0L);
+ 	} else {
+-		SETOPT(CURLOPT_VERBOSE, 1);
++		SETOPT(CURLOPT_VERBOSE, 1L);
+ 	}
+ 
+-	/* Currently we explode if curl uses HTTP2, so force 1.1. */
+-	SETOPT(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
++	/*
++	 * HTTP/2 over TLS when the server offers it and libcurl has it
++	 * (VitaSurf). A page's requests to one host then share one
++	 * connection and one handshake instead of queueing six at a time
++	 * for connections of their own, each a TLS handshake of a second
++	 * on the Vita. PIPEWAIT has a request wait for the connection a
++	 * first one is opening, to learn whether it can share it, rather
++	 * than open another. Plain http stays on 1.1.
++	 */
++	if (curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP2) {
++		SETOPT(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
++		SETOPT(CURLOPT_PIPEWAIT, 1L);
++		NSLOG(netsurf, INFO, "HTTP/2 on for https");
++	} else {
++		SETOPT(CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
++		NSLOG(netsurf, INFO, "HTTP/2 off: libcurl was built without it");
++	}
+ 
+ 	SETOPT(CURLOPT_WRITEFUNCTION, fetch_curl_data);
+ 	SETOPT(CURLOPT_HEADERFUNCTION, fetch_curl_header);
+diff --git a/utils/utils.c b/utils/utils.c
+index 78423ed2c..784a5ab81 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -641,6 +641,7 @@ unsigned int vitasurf_ms_net_body;
+ unsigned int vitasurf_ms_net_body_max;
+ unsigned int vitasurf_net_kb;
+ unsigned int vitasurf_net_queued;
++unsigned int vitasurf_net_h2;
+ unsigned int vitasurf_ms_net_queue;
+ unsigned int vitasurf_ms_net_queue_max;
+ 
+@@ -916,6 +917,7 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_images_done = 0;
+ 	vitasurf_images_failed = 0;
+ 	vitasurf_net_transfers = 0;
++	vitasurf_net_h2 = 0;
+ 	vitasurf_net_connections = 0;
+ 	vitasurf_net_handshakes = 0;
+ 	vitasurf_ms_net_connect = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 56492ec78..390655e07 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -216,6 +216,7 @@ extern unsigned int vitasurf_ms_net_first_byte_max;
+ extern unsigned int vitasurf_ms_net_body; /**< first byte to last */
+ extern unsigned int vitasurf_ms_net_body_max;
+ extern unsigned int vitasurf_net_kb;
++extern unsigned int vitasurf_net_h2; /**< responses that came over HTTP/2 */
+ 
+ /**
+  * Add one finished transfer to those figures; times in microseconds

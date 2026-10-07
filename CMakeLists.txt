@@ -327,8 +327,10 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--start-group
     css dom hubbub parserutils wapcaplet nsutils nsbmp nsgif svgtiny nspsl nslog utf8proc
     ${VITASURF_JS_LIBS}
-    # libcurl pulls in zstd; the mbedTLS package is built with pthread mutexes.
-    curl mbedtls mbedx509 mbedcrypto zstd expat
+    # libcurl pulls in zstd and, for HTTP/2, nghttp2
+    # (scripts/build-curl-http2.sh); the mbedTLS package is built with
+    # pthread mutexes.
+    curl nghttp2 mbedtls mbedx509 mbedcrypto zstd expat
     # libvita2d (MIT) puts the page on screen through the GPU so that the
     # system IME dialog can draw over it.
     vita2d png jpeg freetype z bz2 pthread m

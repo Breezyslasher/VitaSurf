@@ -1992,10 +1992,12 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 			 vitasurf_images_asked, vitasurf_images_done,
 			 vitasurf_images_failed);
 		if (vitasurf_net_transfers > 0) {
-			vita_log("net: %u transfers, %u KB; %u new connections "
+			vita_log("net: %u transfers, %u KB, %u of them "
+				 "over HTTP/2; %u new connections "
 				 "(%u ms connecting), %u TLS handshakes (%u ms "
 				 "in all, longest %u ms)",
 				 vitasurf_net_transfers, vitasurf_net_kb,
+				 vitasurf_net_h2,
 				 vitasurf_net_connections,
 				 vitasurf_ms_net_connect,
 				 vitasurf_net_handshakes,
