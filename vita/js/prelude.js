@@ -7289,8 +7289,13 @@ function describeThrown(v){
        skipping one there lost the frame that threw. */
     var fr=String(v.stack).split('\n');
     if(fr.length&&!/^\s*at /.test(fr[0]))fr=fr.slice(1);
-    fr=fr.slice(0,4).filter(function(f){return f.trim();});
-    if(fr.length)out+=' | '+fr.map(function(f){return f.replace(/^\s+/,'').slice(0,160);}).join(' | ');}
+    fr=fr.filter(function(f){return f.trim();});
+    /* and past the prelude's own frames to the page's: a DOM call that
+       threw is three frames of the prelude before the code that made it */
+    var shown=fr.slice(0,3),page=0,i;
+    for(i=3;i<fr.length&&page<4;i++)
+     if(!/<prelude>|\(native\)/.test(fr[i])){shown.push(fr[i]);page++;}
+    if(shown.length)out+=' | '+shown.map(function(f){return f.replace(/^\s+/,'').slice(0,160);}).join(' | ');}
    return out;}
   return String(v);
  }catch(e2){return '(unprintable)';}
@@ -7815,16 +7820,41 @@ function isAncestor(a,n){
  return false;}
 function containsNode(parent,node){return isAncestor(node,parent);}
 var CAN_HAVE_CHILDREN={1:true,9:true,11:true};
+/* What an insertBefore that threw NotFoundError was given, for the log
+   (VitaSurf): which page code makes the call is in the stack, and what
+   the nodes were tells whether it is the page's own mistake or a place
+   where a shadow root being its host here put a node somewhere a
+   browser would not. Tag names and node kinds only. */
+var insertMisses=0;
+function missName(n){
+ if(!n)return 'nothing';
+ var t=n.nodeType===1?'<'+n.tagName+'>':n.nodeType===3?'text':
+  n.nodeType===8?'comment':n.nodeType===11?'fragment':'node '+n.nodeType;
+ if(n.nodeType===1&&n.__shadow)t+=' (a shadow host)';
+ return t;}
+function insertMiss(parent,node,child){
+ if(++insertMisses>8)return;
+ try{
+  var p=child.parentNode,o=parent.renderOptions,why=[];
+  if(o&&typeof o==='object'&&o.renderBefore===child)why.push('it is the renderBefore of the parent\'s Lit render');
+  if(child.__vsShadowKid)why.push('it was moved into a shadow root');
+  console.warn('insertBefore missed: putting '+missName(node)+' into '+
+   missName(parent)+' before '+missName(child)+', which is '+
+   (p?'in '+missName(p):'in nothing')+
+   (child.isConnected===false?' and not in the page':'')+
+   (why.length?'; '+why.join(', '):''));
+ }catch(e){}}
 function preInsert(parent,node,child,fn,replacing){
  needNode(node,fn,1);
  if(!CAN_HAVE_CHILDREN[parent.nodeType])
   throw hierarchy('This node type does not support this method.');
  if(containsNode(parent,node))
   throw hierarchy('The new child element contains the parent.');
- if(child!==null&&child!==undefined&&child.parentNode!==parent)
+ if(child!==null&&child!==undefined&&child.parentNode!==parent){
+  insertMiss(parent,node,child);
   throw new DOMException(
    'The node before which the new node is to be inserted is not a child '+
-   'of this node.','NotFoundError');
+   'of this node.','NotFoundError');}
  if(node.nodeType===3&&parent.nodeType===9)
   throw hierarchy('Nodes of type Text may not be inserted inside a Document.');
  if(node.nodeType===9)
