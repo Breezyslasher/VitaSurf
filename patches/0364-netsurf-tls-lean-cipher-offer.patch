@@ -1,0 +1,171 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 0362e6e9f..984e73cb9 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -355,13 +355,69 @@ static bool curl_with_openssl;
+  */
+ static bool curl_ca_shared;
+ 
+-/** Put the shared CA chain in place of the one libcurl set up. */
++/*
++ * Hosts whose server refused the lean TLS offer and are given mbedTLS's
++ * whole list of suites instead (VitaSurf); see vita_tls_lean_suites().
++ */
++#define TLS_FULL_HOSTS 8
++static lwc_string *tls_full_hosts[TLS_FULL_HOSTS];
++static unsigned int tls_full_next;
++
++static bool fetch_curl_tls_full(lwc_string *host)
++{
++	unsigned int i;
++	bool match;
++
++	if (host == NULL)
++		return false;
++	for (i = 0; i < TLS_FULL_HOSTS; i++) {
++		if (tls_full_hosts[i] != NULL &&
++		    lwc_string_caseless_isequal(tls_full_hosts[i], host,
++						&match) == lwc_error_ok && match)
++			return true;
++	}
++	return false;
++}
++
++static void fetch_curl_tls_full_add(lwc_string *host)
++{
++	if (host == NULL || fetch_curl_tls_full(host))
++		return;
++	if (tls_full_hosts[tls_full_next] != NULL)
++		lwc_string_unref(tls_full_hosts[tls_full_next]);
++	tls_full_hosts[tls_full_next] = lwc_string_ref(host);
++	tls_full_next = (tls_full_next + 1) % TLS_FULL_HOSTS;
++}
++
++/**
++ * Put the shared CA chain in place of the one libcurl set up, and offer
++ * the lean list of suites unless the host has refused it. The handle
++ * may be a WebSocket's or a worker's, copied from the template, so the
++ * host is taken from the URL being connected to.
++ */
+ static CURLcode
+ fetch_curl_vita_sslctx(CURL *curl_handle, void *ssl_config, void *parm)
+ {
+-	(void)curl_handle;
++	char *url = NULL;
++	bool full = false;
++
+ 	(void)parm;
+ 	vita_tls_ca_attach(ssl_config);
++	if (curl_easy_getinfo(curl_handle, CURLINFO_EFFECTIVE_URL, &url) ==
++	    CURLE_OK && url != NULL) {
++		nsurl *u;
++
++		if (nsurl_create(url, &u) == NSERROR_OK) {
++			lwc_string *host = nsurl_get_component(u, NSURL_HOST);
++
++			full = fetch_curl_tls_full(host);
++			if (host != NULL)
++				lwc_string_unref(host);
++			nsurl_unref(u);
++		}
++	}
++	if (!full)
++		vita_tls_lean_suites(ssl_config);
+ 	return CURLE_OK;
+ }
+ #endif
+@@ -1633,6 +1689,26 @@ static bool fetch_curl_process_headers(struct curl_fetch_info *f)
+ 			vitasurf_net_h2++;
+ 		}
+ 	}
++#ifdef __vita__
++	/* the cipher a new TLS connection agreed, for the page summary */
++	{
++		long connects = 0;
++		struct curl_tlssessioninfo *tls = NULL;
++
++		if (curl_easy_getinfo(f->curl_handle, CURLINFO_NUM_CONNECTS,
++				      &connects) == CURLE_OK && connects > 0 &&
++		    curl_easy_getinfo(f->curl_handle, CURLINFO_TLS_SSL_PTR,
++				      &tls) == CURLE_OK &&
++		    tls != NULL && tls->backend == CURLSSLBACKEND_MBEDTLS &&
++		    tls->internals != NULL) {
++			switch (vita_tls_cipher_kind(tls->internals)) {
++			case 0: vitasurf_net_tls_chacha++; break;
++			case 1: vitasurf_net_tls_aes++; break;
++			default: vitasurf_net_tls_other++; break;
++			}
++		}
++	}
++#endif
+ 
+ 	if ((http_code == HTTP_RESPONSE_NOT_MODIFIED) &&
+ 	    (f->postdata->type==FETCH_POSTDATA_NONE)) {
+@@ -1755,6 +1831,28 @@ static void fetch_curl_done(CURL *curl_handle, CURLcode result)
+ 	assert(code == CURLE_OK);
+ 
+ 	abort_fetch = f->abort;
++#ifdef __vita__
++	/*
++	 * A handshake that failed before any reply, to a server that may
++	 * have refused the lean TLS offer: once more, with mbedTLS's whole
++	 * list, which the host keeps from now on (VitaSurf).
++	 */
++	if (result == CURLE_SSL_CONNECT_ERROR && !abort_fetch &&
++	    !f->stopped && !f->had_headers && curl_ca_shared &&
++	    !fetch_curl_tls_full(f->host)) {
++		fetch_curl_tls_full_add(f->host);
++		NSLOG(netsurf, INFO, "TLS handshake failed (%s); again with "
++		      "every cipher suite: %s",
++		      fetch_error_buffer[0] != '\0' ? fetch_error_buffer :
++		      "no detail", nsurl_access(f->url));
++		vita_log("tls: %s refused the lean cipher offer; trying "
++			 "again with every suite", lwc_string_data(f->host));
++		curl_multi_remove_handle(fetch_curl_multi, curl_handle);
++		if (curl_multi_add_handle(fetch_curl_multi, curl_handle) ==
++		    CURLM_OK)
++			return;
++	}
++#endif
+ 	NSLOG(netsurf, INFO, "done %s", nsurl_access(f->url));
+ 	fetch_curl_note_times(curl_handle);
+ 
+diff --git a/utils/utils.c b/utils/utils.c
+index 784a5ab81..5f8f2d813 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -642,6 +642,9 @@ unsigned int vitasurf_ms_net_body_max;
+ unsigned int vitasurf_net_kb;
+ unsigned int vitasurf_net_queued;
+ unsigned int vitasurf_net_h2;
++unsigned int vitasurf_net_tls_chacha;
++unsigned int vitasurf_net_tls_aes;
++unsigned int vitasurf_net_tls_other;
+ unsigned int vitasurf_ms_net_queue;
+ unsigned int vitasurf_ms_net_queue_max;
+ 
+@@ -918,6 +921,9 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_images_failed = 0;
+ 	vitasurf_net_transfers = 0;
+ 	vitasurf_net_h2 = 0;
++	vitasurf_net_tls_chacha = 0;
++	vitasurf_net_tls_aes = 0;
++	vitasurf_net_tls_other = 0;
+ 	vitasurf_net_connections = 0;
+ 	vitasurf_net_handshakes = 0;
+ 	vitasurf_ms_net_connect = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 390655e07..895288132 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -217,6 +217,10 @@ extern unsigned int vitasurf_ms_net_body; /**< first byte to last */
+ extern unsigned int vitasurf_ms_net_body_max;
+ extern unsigned int vitasurf_net_kb;
+ extern unsigned int vitasurf_net_h2; /**< responses that came over HTTP/2 */
++/** the ciphers new TLS connections agreed: ChaCha20-Poly1305, AES, other */
++extern unsigned int vitasurf_net_tls_chacha;
++extern unsigned int vitasurf_net_tls_aes;
++extern unsigned int vitasurf_net_tls_other;
+ 
+ /**
+  * Add one finished transfer to those figures; times in microseconds

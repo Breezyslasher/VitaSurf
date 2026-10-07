@@ -2012,6 +2012,14 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_ms_net_body,
 				 vitasurf_ms_net_body_max);
 		}
+		if (vitasurf_net_tls_chacha + vitasurf_net_tls_aes +
+		    vitasurf_net_tls_other > 0) {
+			vita_log("net: new TLS connections agreed ChaCha20 "
+				 "%u, AES %u, other %u (ChaCha20 is the "
+				 "faster on the Vita)",
+				 vitasurf_net_tls_chacha, vitasurf_net_tls_aes,
+				 vitasurf_net_tls_other);
+		}
 		if (vitasurf_net_queued > 0) {
 			vita_log("net: %u fetches waited for a free slot in "
 				 "NetSurf's queue, %u ms in all, longest %u ms",
