@@ -1,5 +1,5 @@
 diff --git a/quickjs.c b/quickjs.c
-index 98bd74d..f9754c7 100644
+index 98bd74d..2b181a7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -316,6 +316,10 @@ struct JSRuntime {
@@ -467,7 +467,7 @@ index 98bd74d..f9754c7 100644
  
      remove_gc_object(&b->header);
      if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {
-@@ -37176,6 +37495,625 @@ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
+@@ -37176,6 +37495,663 @@ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
  
  /* func_name must be JS_ATOM_NULL for JS_PARSE_FUNC_STATEMENT and
     JS_PARSE_FUNC_EXPR, JS_PARSE_FUNC_ARROW and JS_PARSE_FUNC_VAR */
@@ -529,6 +529,53 @@ index 98bd74d..f9754c7 100644
 +    s->eval_ranges[s->eval_range_count++] = end;
 +}
 +
++/*
++ * Whether the token after a function's body, the current one, calls the
++ * function where it is written: "}(", "})(", "}).call(", "}).apply(" or
++ * "}.call(". Google's bundles are each one function ending
++ * "}).call(this, this._s)", and left for later it was parsed twice, the
++ * second time all of it at once when it ran. The current token stays.
++ */
++static bool js_lazy_called_here(JSParseState *s)
++{
++    JSParsePos pos;
++    bool called = false;
++
++    if (s->token.val == '(')
++        return true;
++    if (s->token.val != ')' && s->token.val != '.')
++        return false;
++    js_parse_get_pos(s, &pos);
++    if (s->token.val == ')') {
++        if (next_token(s))
++            goto fail;
++        called = (s->token.val == '(');
++    }
++    if (!called && s->token.val == '.') {
++        if (next_token(s))
++            goto fail;
++        char buf[ATOM_GET_STR_BUF_SIZE];
++
++        if (s->token.val == TOK_IDENT && !s->token.u.ident.has_escape &&
++            (s->token.u.ident.atom == JS_ATOM_apply ||
++             !strcmp(JS_AtomGetStr(s->ctx, buf, sizeof(buf),
++                                   s->token.u.ident.atom), "call"))) {
++            if (next_token(s))
++                goto fail;
++            called = (s->token.val == '(');
++        }
++    }
++    if (js_parse_seek_token(s, &pos))
++        goto fail;
++    return called;
++ fail:
++    /* parsing on reports it, if it is real */
++    JS_FreeValue(s->ctx, JS_GetException(s->ctx));
++    if (js_parse_seek_token(s, &pos))
++        JS_FreeValue(s->ctx, JS_GetException(s->ctx));
++    return false;
++}
++
 +/* whether fd, whose body has just been parsed, can be left for later;
 +   the token after its body is current */
 +static bool js_lazy_eligible(JSParseState *s, JSFunctionDef *fd)
@@ -550,10 +597,7 @@ index 98bd74d..f9754c7 100644
 +    if (fd->source_len < JS_LAZY_MIN_SOURCE || s->with_depth > 0 ||
 +        !fd->lazy_params || !fd->source_blob)
 +        return false;
-+    /* called where it is written: "(function(){...})()", "}(" */
-+    if (s->token.val == '(')
-+        return false;
-+    if (s->token.val == ')' && peek_token(s, false) == '(')
++    if (js_lazy_called_here(s))
 +        return false;
 +    /* a direct eval sees every variable around it */
 +    if (js_lazy_has_eval(fd))
@@ -883,7 +927,7 @@ index 98bd74d..f9754c7 100644
 +    size_t level = 0;
 +    int last_tok = '{', t;
 +    JSLazySet set;
-+    bool last_ctl = false, after_dot = false, last_unsure = false;
++    bool last_ctl = false, after_dot = false, last_unsure = false, called;
 +    char c;
 +
 +    switch (fd->func_type) {
@@ -1036,16 +1080,10 @@ index 98bd74d..f9754c7 100644
 +    js_parse_get_pos(s, &end_pos);
 +    if (next_token(s))
 +        goto give_up_error;
-+    t = s->token.val;
-+    if (t == ')') {
-+        if (next_token(s))
-+            goto give_up_error;
-+        if (s->token.val == '(')
-+            t = '(';
-+    }
++    called = js_lazy_called_here(s);
 +    if (js_parse_seek_token(s, &end_pos))
 +        goto fail;
-+    if (t == '(')
++    if (called)
 +        goto give_up;
 +    js_lazy_set_give(ctx, fd, &set);
 +    return 1;
@@ -1093,7 +1131,7 @@ index 98bd74d..f9754c7 100644
  static __exception int js_parse_function_decl2(JSParseState *s,
                                                 JSParseFunctionEnum func_type,
                                                 JSFunctionKindEnum func_kind,
-@@ -37192,10 +38130,19 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+@@ -37192,10 +38168,19 @@ static __exception int js_parse_function_decl2(JSParseState *s,
      int func_idx, lexical_func_idx = -1;
      bool has_opt_arg;
      bool create_func_var = false;
@@ -1113,7 +1151,7 @@ index 98bd74d..f9754c7 100644
      if (func_type == JS_PARSE_FUNC_STATEMENT ||
          func_type == JS_PARSE_FUNC_VAR ||
          func_type == JS_PARSE_FUNC_EXPR) {
-@@ -37296,6 +38243,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+@@ -37296,6 +38281,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
          }
      }
  
@@ -1121,7 +1159,7 @@ index 98bd74d..f9754c7 100644
      fd = js_new_function_def(ctx, fd, false, is_expr, s->filename,
                               function_line_num, function_col_num);
      if (!fd) {
-@@ -37353,6 +38301,21 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+@@ -37353,6 +38339,21 @@ static __exception int js_parse_function_decl2(JSParseState *s,
          emit_class_field_init(s);
      }
  
@@ -1143,7 +1181,7 @@ index 98bd74d..f9754c7 100644
      /* parse arguments */
      fd->has_simple_parameter_list = true;
      fd->has_parameter_expressions = false;
-@@ -37599,15 +38562,34 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+@@ -37599,15 +38600,34 @@ static __exception int js_parse_function_decl2(JSParseState *s,
      if (js_parse_function_check_names(s, fd, func_name))
          goto fail;
  
@@ -1180,7 +1218,7 @@ index 98bd74d..f9754c7 100644
      if (next_token(s)) {
          /* consume the '}' */
          goto fail;
-@@ -37617,6 +38599,12 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+@@ -37617,6 +38637,12 @@ static __exception int js_parse_function_decl2(JSParseState *s,
      if (js_is_live_code(s)) {
          emit_return(s, false);
      }
@@ -1193,7 +1231,7 @@ index 98bd74d..f9754c7 100644
  done:
      s->cur_func = fd->parent;
  
-@@ -37858,6 +38846,164 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
+@@ -37858,6 +38884,164 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
      return JS_EvalFunctionInternal(ctx, fun_obj, ctx->global_obj, NULL, NULL);
  }
  
@@ -1358,7 +1396,7 @@ index 98bd74d..f9754c7 100644
  #ifndef QJS_DISABLE_PARSER
  
  /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
-@@ -37874,12 +39020,20 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+@@ -37874,12 +39058,20 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
      JSFunctionBytecode *b;
      JSFunctionDef *fd;
      JSModuleDef *m;
@@ -1381,7 +1419,7 @@ index 98bd74d..f9754c7 100644
      m = NULL;
      if (eval_type == JS_EVAL_TYPE_DIRECT) {
          JSObject *p;
-@@ -37899,10 +39053,10 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+@@ -37899,10 +39091,10 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
          if (eval_type == JS_EVAL_TYPE_MODULE) {
              JSAtom module_name = JS_NewAtom(ctx, filename);
              if (module_name == JS_ATOM_NULL)
@@ -1394,7 +1432,7 @@ index 98bd74d..f9754c7 100644
              is_strict_mode = true;
          }
      }
-@@ -37941,8 +39095,16 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+@@ -37941,8 +39133,16 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
      push_scope(s); /* body scope */
      fd->body_scope = fd->scope_level;
  
@@ -1411,7 +1449,7 @@ index 98bd74d..f9754c7 100644
      /* the functions hold the shared text now; the parser is done with it */
      js_source_release(ctx->rt, s->source_blob, NULL);
      s->source_blob = NULL;
-@@ -37958,8 +39120,26 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+@@ -37958,8 +39158,26 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
  
      /* create the function object and all the enclosed functions */
      fun_obj = js_create_function(ctx, fd);
@@ -1439,7 +1477,7 @@ index 98bd74d..f9754c7 100644
      /* Could add a flag to avoid resolution if necessary */
      if (m) {
          m->func_obj = fun_obj;
-@@ -37974,6 +39154,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+@@ -37974,6 +39192,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
      }
      return ret_val;
   fail1:
@@ -1447,7 +1485,7 @@ index 98bd74d..f9754c7 100644
      /* XXX: should free all the unresolved dependencies */
      if (m)
          js_free_module_def(ctx, m);
-@@ -38224,7 +39405,10 @@ typedef enum BCTagEnum {
+@@ -38224,7 +39443,10 @@ typedef enum BCTagEnum {
     and refusing it made `typeof Array.fromAsync` throw, which claude.ai's
     browser check took for an out of date browser. */
  #define BC_VERSION_STOCK 25
@@ -1459,7 +1497,7 @@ index 98bd74d..f9754c7 100644
  
  typedef struct BCWriterState {
      JSContext *ctx;
-@@ -38413,10 +39597,12 @@ static int JS_WriteFunctionBytecode(BCWriterState *s,
+@@ -38413,10 +39635,12 @@ static int JS_WriteFunctionBytecode(BCWriterState *s,
      uint32_t val;
  
      bc_len = b->byte_code_len;
@@ -1474,7 +1512,7 @@ index 98bd74d..f9754c7 100644
  
      pos = 0;
      while (pos < bc_len) {
-@@ -38513,6 +39699,23 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -38513,6 +39737,23 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      uint32_t flags;
      int idx, i;
  
@@ -1498,7 +1536,7 @@ index 98bd74d..f9754c7 100644
      bc_put_u8(s, BC_TAG_FUNCTION_BYTECODE);
      flags = idx = 0;
      bc_set_flags(&flags, &idx, b->has_prototype, 1);
-@@ -38526,9 +39729,22 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -38526,9 +39767,22 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      bc_set_flags(&flags, &idx, b->arguments_allowed, 1);
      bc_set_flags(&flags, &idx, b->backtrace_barrier, 1);
      bc_set_flags(&flags, &idx, s->allow_debug, 1);
@@ -1521,7 +1559,7 @@ index 98bd74d..f9754c7 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -38675,6 +39891,17 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
+@@ -38675,6 +39929,17 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
  
      bc_put_u8(s, m->has_tla);
  
@@ -1539,7 +1577,7 @@ index 98bd74d..f9754c7 100644
      if (JS_WriteObjectRec(s, m->func_obj))
          goto fail;
      return 0;
-@@ -39471,10 +40698,11 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -39471,10 +40736,11 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
  {
      JSContext *ctx = s->ctx;
      JSFunctionBytecode bc, *b;
@@ -1552,7 +1590,7 @@ index 98bd74d..f9754c7 100644
      int function_size, cpool_offset, byte_code_offset;
      int closure_var_offset, vardefs_offset;
  
-@@ -39496,9 +40724,38 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -39496,9 +40762,38 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      bc.arguments_allowed = bc_get_flags(v16, &idx, 1);
      bc.backtrace_barrier = bc_get_flags(v16, &idx, 1);
      has_debug_info = bc_get_flags(v16, &idx, 1);
@@ -1591,7 +1629,7 @@ index 98bd74d..f9754c7 100644
      if (bc_get_atom(s, &bc.func_name))
          goto fail;
      if (bc_get_leb128_u16(s, &bc.arg_count))
-@@ -39537,6 +40794,15 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -39537,6 +40832,15 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      memcpy(b, &bc, sizeof(*b));
      bc.func_name = JS_ATOM_NULL;
      b->header.ref_count = 1;
@@ -1607,7 +1645,7 @@ index 98bd74d..f9754c7 100644
      if (local_count != 0) {
          b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
      }
-@@ -40316,7 +41582,8 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
+@@ -40316,7 +41620,8 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
  
      if (bc_get_u8(s, &v8))
          return -1;
