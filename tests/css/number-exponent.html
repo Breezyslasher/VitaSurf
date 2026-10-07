@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<!-- Numbers with an exponent (VitaSurf): CSS Syntax 3 reads "1e2px" as
+     100px, where CSS 2.1 read a unit "e2px" and the declaration was
+     dropped. Minifiers write very small or large values this way; Home
+     Assistant's "flex-basis: 1e-9px" was lost. "1em" and "2ex" are
+     still units. Expected lines are what Chrome prints:
+     XX width 1e2px: 100
+     XX width 1E2px: 100
+     XX width 1e+2px: 100
+     XX margin 2.5e1px: 25
+     XX opacity 5e-1: 0.5
+     XX flex-basis 1e-9px: 0
+     XX percent 5e1%: 50
+     XX em still a unit: true
+     XX ex still a unit: true -->
+<html><head><title>number exponent</title>
+<style>
+#a { width: 1e2px; }
+#b { width: 1E2px; }
+#c { width: 1e+2px; }
+#d { margin-left: 2.5e1px; width: 10px; }
+#e { opacity: 5e-1; }
+#f { display: flex; width: 300px; }
+#f > div { width: 50px; flex: 0 0 1e-9px; }
+#g { width: 200px; }
+#g > div { width: 5e1%; }
+#h { font-size: 20px; width: 2em; }
+#i { font-size: 20px; width: 2ex; }
+</style></head><body>
+<div id="a">a</div><div id="b">b</div><div id="c">c</div>
+<div id="d">d</div><div id="e">e</div>
+<div id="f"><div></div></div>
+<div id="g"><div>g</div></div>
+<div id="h">h</div><div id="i">i</div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function $(id) { return document.getElementById(id); }
+function w(el) { return Math.round(el.getBoundingClientRect().width); }
+function x(el) { return Math.round(el.getBoundingClientRect().left); }
+window.addEventListener('load', function () { setTimeout(function () {
+T('width 1e2px', w($('a')));
+T('width 1E2px', w($('b')));
+T('width 1e+2px', w($('c')));
+T('margin 2.5e1px', x($('d')) - x($('a')));
+T('opacity 5e-1', getComputedStyle($('e')).opacity);
+T('flex-basis 1e-9px', w($('f').firstElementChild));
+T('percent 5e1%', w($('g').firstElementChild));
+T('em still a unit', w($('h')) > 30 && w($('h')) < 50);
+T('ex still a unit', w($('i')) > 0 && w($('i')) < 40);
+}, 300); });
+</script>
+</body></html>

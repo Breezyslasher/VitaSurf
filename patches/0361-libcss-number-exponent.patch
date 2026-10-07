@@ -1,0 +1,139 @@
+diff --git a/src/lex/lex.c b/src/lex/lex.c
+index b840946..565721e 100644
+--- a/src/lex/lex.c
++++ b/src/lex/lex.c
+@@ -1065,7 +1065,7 @@ css_error NumberOrPercentageOrDimension(css_lexer *lexer, css_token **token)
+ 	css_error error;
+ 	parserutils_error perror;
+ 	enum { Initial = 0, Dot = 1, MoreDigits = 2,
+-		Suffix = 3, NMChars = 4, Escape = 5 };
++		Suffix = 3, NMChars = 4, Escape = 5, Exponent = 6 };
+ 
+ 	/* NUMBER = num = [-+]? ([0-9]+ | [0-9]* '.' [0-9]+)
+ 	 * PERCENTAGE = num '%'
+@@ -1151,6 +1151,49 @@ css_error NumberOrPercentageOrDimension(css_lexer *lexer, css_token **token)
+ 				lexer->context.first == '+'))
+ 			return emitToken(lexer, CSS_TOKEN_CHAR, token);
+ 
++		/*
++		 * An exponent, "1e3" or "1e-9px" (VitaSurf): CSS Syntax 3
++		 * reads it as part of the number, where CSS 2.1 read a
++		 * unit beginning with an 'e'. Minifiers write tiny lengths
++		 * this way; Home Assistant's "flex-basis: 1e-9px" was
++		 * dropped. Nothing is taken until the digit is seen, so
++		 * running out of input here comes back to the same place.
++		 */
++		if (c == 'e' || c == 'E') {
++			const uint8_t *p1, *p2;
++			size_t l1, l2;
++			bool sign, digit;
++
++			perror = parserutils_inputstream_peek(lexer->input,
++					lexer->bytesReadForToken + clen,
++					&p1, &l1);
++			if (perror != PARSERUTILS_OK &&
++					perror != PARSERUTILS_EOF)
++				return css_error_from_parserutils_error(perror);
++			sign = perror == PARSERUTILS_OK &&
++					(*p1 == '+' || *p1 == '-');
++			digit = perror == PARSERUTILS_OK && isDigit(*p1);
++			if (sign) {
++				perror = parserutils_inputstream_peek(
++						lexer->input,
++						lexer->bytesReadForToken +
++						clen + l1, &p2, &l2);
++				if (perror != PARSERUTILS_OK &&
++						perror != PARSERUTILS_EOF)
++					return css_error_from_parserutils_error(
++							perror);
++				digit = perror == PARSERUTILS_OK &&
++						isDigit(*p2);
++			}
++			if (digit) {
++				APPEND(lexer, cptr, clen);
++				if (sign)
++					APPEND(lexer, p1, l1);
++				goto exponent;
++			}
++		}
++
++	units:
+ 		if (c == '%') {
+ 			APPEND(lexer, cptr, clen);
+ 
+@@ -1195,6 +1238,24 @@ css_error NumberOrPercentageOrDimension(css_lexer *lexer, css_token **token)
+ 		}
+ 
+ 		goto nmchars;
++	case Exponent:
++	exponent:
++		lexer->substate = Exponent;
++
++		error = consumeDigits(lexer);
++		if (error != CSS_OK)
++			return error;
++
++		perror = parserutils_inputstream_peek(lexer->input,
++				lexer->bytesReadForToken, &cptr, &clen);
++		if (perror != PARSERUTILS_OK && perror != PARSERUTILS_EOF)
++			return css_error_from_parserutils_error(perror);
++
++		if (perror == PARSERUTILS_EOF)
++			return emitToken(lexer, CSS_TOKEN_NUMBER, token);
++
++		c = *cptr;
++		goto units;
+ 	}
+ 
+ 	return emitToken(lexer, CSS_TOKEN_DIMENSION, token);
+diff --git a/src/utils/utils.c b/src/utils/utils.c
+index 64409eb..e67bea8 100644
+--- a/src/utils/utils.c
++++ b/src/utils/utils.c
+@@ -101,6 +101,46 @@ css_fixed css__number_from_string(const uint8_t *data, size_t len,
+ 		}
+ 	}
+ 
++	/*
++	 * And an exponent (VitaSurf): CSS Syntax 3's numbers have one,
++	 * "1e3" or "1e-9px", which minifiers write for very small or large
++	 * values. The value is scaled in 22.10 fixed point, so a tiny one
++	 * comes out as 0 and a huge one is clamped below.
++	 */
++	if (int_only == false && len > 1 && (ptr[0] == 'e' || ptr[0] == 'E')) {
++		size_t i = 1;
++		int esign = 1, exp = 0;
++
++		if (ptr[1] == '+' || ptr[1] == '-') {
++			esign = ptr[1] == '-' ? -1 : 1;
++			i = 2;
++		}
++		if (i < len && '0' <= ptr[i] && ptr[i] <= '9') {
++			int64_t v = ((int64_t) intpart << 10) | fracpart;
++
++			while (i < len && '0' <= ptr[i] && ptr[i] <= '9') {
++				if (exp < 100)
++					exp = exp * 10 + (ptr[i] - '0');
++				i++;
++			}
++			ptr += i;
++			len -= i;
++			for (; exp > 0 && v != 0; exp--) {
++				if (esign > 0) {
++					v *= 10;
++					if (v >= ((int64_t) 1 << 32))
++						break;
++				} else {
++					v = (v + 5) / 10;
++				}
++			}
++			if (v >= ((int64_t) 1 << 32))
++				v = (int64_t) 1 << 32;
++			intpart = (int32_t) (v >> 10);
++			fracpart = (int32_t) (v & ((1 << 10) - 1));
++		}
++	}
++
+ 	*consumed = ptr - data;
+ 
+ 	if (sign > 0) {
