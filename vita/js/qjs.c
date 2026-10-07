@@ -319,6 +319,9 @@ struct jsthread {
 	unsigned js_run_ms;       /**< time spent running them */
 	unsigned js_modules;      /**< of those, compiled as ES modules */
 	unsigned js_imports_missed; /**< imports that resolved to nothing */
+	/** the runtime's functions compiled on their first call, and the
+	 * ms that took, when this page began (QJS_LAZY) */
+	uint32_t lazy_count0, lazy_ms0;
 	unsigned js_import_fetches; /**< chunks the loader went and fetched */
 	unsigned retry_delay_ms;  /**< how long before the next retry round */
 	struct js_deferred *deferred; /**< module scripts waiting on imports */
@@ -13500,10 +13503,25 @@ static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
 				    JSValueConst *resolving_funcs,
 				    void *opaque);
 
+/*
+ * A page's scripts and modules are compiled with their function bodies
+ * left for each function's first call (VitaSurf; JSLazyFunc in
+ * QuickJS). The whole script is still parsed, so a syntax error is
+ * reported when it loads, as in a browser; most of a large bundle is
+ * never called, and its bytecode was time and memory. Not the prelude,
+ * which is kept without its source.
+ */
+#ifndef QJS_LAZY
+#define QJS_LAZY JS_EVAL_FLAG_LAZY_FUNCTIONS
+#endif
+
 static JSValue bc_load(JSContext *ctx, const char *url,
 		       const char *src, size_t srclen);
 static void bc_store(JSContext *ctx, const char *url,
 		     const char *src, size_t srclen, JSValueConst fn);
+static void bc_store_now(JSContext *ctx, const char *url,
+			 const char *src, size_t srclen, JSValueConst fn);
+static void bc_serialise_context(JSContext *ctx);
 static JSValue bc_load_module(JSContext *ctx, const char *url,
 			      const char *src, size_t srclen);
 static void bc_store_module(JSContext *ctx, const char *url,
@@ -13582,7 +13600,7 @@ static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
 				     JS_EVAL_FLAG_COMPILE_ONLY);
 			if (!JS_IsException(fn)) {
 				fn = prelude_strip_source(ctx, fn);
-				bc_store(ctx, u->url, src, u->len, fn);
+				bc_store_now(ctx, u->url, src, u->len, fn);
 			}
 		} else {
 			how = "card";
@@ -14044,8 +14062,8 @@ static bool setup_globals(jsthread *thread)
 					     JS_EVAL_FLAG_COMPILE_ONLY);
 				if (!JS_IsException(fn)) {
 					fn = prelude_strip_source(ctx, fn);
-					bc_store(ctx, PRELUDE_URL, src, len,
-						 fn);
+					bc_store_now(ctx, PRELUDE_URL, src,
+						     len, fn);
 				}
 			} else {
 				how = "card";
@@ -14429,6 +14447,7 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 		return NULL;
 	}
 	ret->ctx = JS_NewContext(heap->rt);
+	JS_GetLazyCompileStats(heap->rt, &ret->lazy_count0, &ret->lazy_ms0);
 	if (ret->ctx == NULL) {
 		free(ret);
 		return NULL;
@@ -14526,6 +14545,7 @@ nserror js_closethread(jsthread *thread)
 	struct js_timer *t;
 	struct js_listener *l;
 	uint64_t t0 = 0, t1 = 0;
+	uint32_t lazy_n, lazy_ms;
 
 	if (thread == NULL || thread->closed) {
 		return NSERROR_OK;
@@ -14603,6 +14623,8 @@ nserror js_closethread(jsthread *thread)
 	 * one of them takes NULL as "no page".
 	 */
 	JS_SetContextOpaque(thread->ctx, NULL);
+	/* its scripts' cache entries, with what it compiled */
+	bc_serialise_context(thread->ctx);
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
 	JS_RunGC(thread->heap->rt);
@@ -14610,8 +14632,13 @@ nserror js_closethread(jsthread *thread)
 	vitasurf_ms_teardown += (unsigned)(t1 - t0);
 	gap_report();
 	gap_reset();
-	vita_log("qjs: page closed in %u ms, runtime memory now %u KB",
-		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt));
+	JS_GetLazyCompileStats(thread->heap->rt, &lazy_n, &lazy_ms);
+	vita_log("qjs: page closed in %u ms, runtime memory now %u KB; "
+		 "%u functions compiled when first called while it was "
+		 "open, in %u ms",
+		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt),
+		 (unsigned)(lazy_n - thread->lazy_count0),
+		 (unsigned)(lazy_ms - thread->lazy_ms0));
 	return NSERROR_OK;
 }
 
@@ -15115,6 +15142,10 @@ struct bc_pending {
 	uint8_t *out;		/* a plain malloc: the runtime that
 				 * serialised it goes with its page */
 	size_t out_len;
+	/* not serialised yet (QJS_LAZY): the compiled script or module,
+	 * in its page's context */
+	JSContext *ctx;
+	JSValue val;
 };
 
 static struct bc_pending *bc_queue, **bc_queue_tail = &bc_queue;
@@ -15122,6 +15153,7 @@ static size_t bc_queue_bytes;
 static bool bc_flush_scheduled;
 
 static void bc_flush_callback(void *p);
+static bool bc_pending_serialise(struct bc_pending *q);
 
 /** Write one serialised entry to the card, beside the index. */
 static void bc_write_entry(const char *path, const struct bc_header *h,
@@ -15199,36 +15231,40 @@ static void bc_flush_callback(void *p)
 	if (bc_queue == NULL) {
 		bc_queue_tail = &bc_queue;
 	}
+	if (q->ctx != NULL && !bc_pending_serialise(q)) {
+		free(q);
+		goto next;
+	}
 	bc_queue_bytes -= q->out_len;
 	bc_write_entry(q->path, &q->h, q->out, q->out_len,
 		       q->h.format == BC_FORMAT_MODULE);
 	free(q->out);
 	free(q);
+next:
 	if (bc_queue != NULL) {
 		bc_flush_scheduled = true;
 		guit->misc->schedule(20, bc_flush_callback, NULL);
 	}
 }
 
-/** Keep the compiled form of this source for the next visit. */
-static void bc_store_kind(JSContext *ctx, const char *url,
-			  const char *src, size_t srclen, JSValueConst fn,
-			  bool module)
+/**
+ * Serialise an entry kept as a value (QJS_LAZY): what the page has
+ * compiled by now. False if it is not to be kept after all.
+ */
+static bool bc_pending_serialise(struct bc_pending *q)
 {
-	struct bc_pending *q;
+	JSContext *ctx = q->ctx;
 	uint8_t *out;
 	size_t out_len = 0;
-	uint64_t hash;
-	uint64_t t0;
+	uint64_t t0 = now_ms();
 
-	if (srclen < (module ? BC_MIN_MODULE_SRC : BC_MIN_SRC) ||
-	    url == NULL || url[0] == '<' || vitasurf_cache_disabled()) {
-		return;
-	}
-	t0 = now_ms();
-	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE);
+	q->ctx = NULL;
+	out = JS_WriteObject(ctx, &out_len, q->val, JS_WRITE_OBJ_BYTECODE);
+	JS_FreeValue(ctx, q->val);
+	q->val = JS_UNDEFINED;
 	if (out == NULL) {
-		return;
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return false;
 	}
 	if (out_len == 0 || out_len > BC_MAX_ENTRY ||
 	    bc_queue_bytes + out_len > BC_QUEUE_BUDGET) {
@@ -15239,19 +15275,58 @@ static void bc_store_kind(JSContext *ctx, const char *url,
 				 (unsigned)(bc_queue_bytes / 1024));
 		}
 		js_free(ctx, out);
-		return;
+		return false;
 	}
-	q = calloc(1, sizeof(*q));
-	if (q != NULL) {
-		q->out = malloc(out_len);
-	}
-	if (q == NULL || q->out == NULL) {
-		free(q);
+	q->out = malloc(out_len);
+	if (q->out == NULL) {
 		js_free(ctx, out);
-		return;
+		return false;
 	}
 	memcpy(q->out, out, out_len);
 	js_free(ctx, out);
+	q->h.bc_len = (uint32_t)out_len;
+	q->out_len = out_len;
+	bc_queue_bytes += out_len;
+	vitasurf_js_bc_queued_kb += (unsigned)(out_len / 1024);
+	vitasurf_ms_js_bc_serialise += (unsigned)(now_ms() - t0);
+	return true;
+}
+
+/**
+ * Serialise every entry still kept as a value in ctx, which is about
+ * to go (QJS_LAZY), dropping those that are not to be kept.
+ */
+static void bc_serialise_context(JSContext *ctx)
+{
+	struct bc_pending **pq = &bc_queue, *q;
+
+	while ((q = *pq) != NULL) {
+		if (q->ctx == ctx && !bc_pending_serialise(q)) {
+			*pq = q->next;
+			free(q);
+			continue;
+		}
+		pq = &q->next;
+	}
+	bc_queue_tail = pq;
+}
+
+/** Keep the compiled form of this source for the next visit. */
+static void bc_store_kind(JSContext *ctx, const char *url,
+			  const char *src, size_t srclen, JSValueConst fn,
+			  bool module, bool later)
+{
+	struct bc_pending *q;
+	uint64_t hash;
+
+	if (srclen < (module ? BC_MIN_MODULE_SRC : BC_MIN_SRC) ||
+	    url == NULL || url[0] == '<' || vitasurf_cache_disabled()) {
+		return;
+	}
+	q = calloc(1, sizeof(*q));
+	if (q == NULL) {
+		return;
+	}
 	bc_path(q->path, sizeof(q->path), url);
 	hash = bc_hash(src, srclen);
 	q->h.magic = BC_MAGIC;
@@ -15259,13 +15334,22 @@ static void bc_store_kind(JSContext *ctx, const char *url,
 	q->h.src_len = (uint32_t)srclen;
 	q->h.src_hash_lo = (uint32_t)(hash & 0xffffffffu);
 	q->h.src_hash_hi = (uint32_t)(hash >> 32);
-	q->h.bc_len = (uint32_t)out_len;
-	q->out_len = out_len;
+	q->val = JS_UNDEFINED;
+	/*
+	 * A page's script, its functions compiled when they are first
+	 * called: serialised when it goes to the card, once the page has
+	 * been quiet a while, or when the page closes, so the functions it
+	 * called by then are kept compiled and the next visit does not
+	 * compile them again.
+	 */
+	q->ctx = ctx;
+	q->val = JS_DupValue(ctx, fn);
+	if (!later && !bc_pending_serialise(q)) {
+		free(q);
+		return;
+	}
 	*bc_queue_tail = q;
 	bc_queue_tail = &q->next;
-	bc_queue_bytes += out_len;
-	vitasurf_js_bc_queued_kb += (unsigned)(out_len / 1024);
-	vitasurf_ms_js_bc_serialise += (unsigned)(now_ms() - t0);
 	if (!bc_flush_scheduled) {
 		bc_flush_scheduled = true;
 		guit->misc->schedule(BC_FIRST_WAIT_MS, bc_flush_callback, NULL);
@@ -15281,7 +15365,14 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 static void bc_store(JSContext *ctx, const char *url,
 		     const char *src, size_t srclen, JSValueConst fn)
 {
-	bc_store_kind(ctx, url, src, srclen, fn, false);
+	bc_store_kind(ctx, url, src, srclen, fn, false, QJS_LAZY != 0);
+}
+
+/* the prelude's: it has no functions left for later */
+static void bc_store_now(JSContext *ctx, const char *url,
+			 const char *src, size_t srclen, JSValueConst fn)
+{
+	bc_store_kind(ctx, url, src, srclen, fn, false, false);
 }
 
 static JSValue bc_load_module(JSContext *ctx, const char *url,
@@ -15293,7 +15384,7 @@ static JSValue bc_load_module(JSContext *ctx, const char *url,
 static void bc_store_module(JSContext *ctx, const char *url,
 			    const char *src, size_t srclen, JSValueConst fn)
 {
-	bc_store_kind(ctx, url, src, srclen, fn, true);
+	bc_store_kind(ctx, url, src, srclen, fn, true, QJS_LAZY != 0);
 }
 
 /*
@@ -16698,7 +16789,7 @@ static JSModuleDef *local_module(JSContext *ctx, jsthread *thread,
 		return NULL;
 	}
 	fn = JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_MODULE |
-		     JS_EVAL_FLAG_COMPILE_ONLY);
+		     JS_EVAL_FLAG_COMPILE_ONLY | QJS_LAZY);
 	JS_FreeCString(ctx, src);
 	if (JS_IsException(fn)) {
 		vita_log("qjs: module at '%.80s' did not compile", name);
@@ -16822,7 +16913,8 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 
 				fn = JS_Eval(ctx, src, size, name,
 					     JS_EVAL_TYPE_MODULE |
-					     JS_EVAL_FLAG_COMPILE_ONLY);
+					     JS_EVAL_FLAG_COMPILE_ONLY |
+					     QJS_LAZY);
 				vitasurf_ms_js_import_compile +=
 					(unsigned)(now_ms() - t_c0);
 				vitasurf_js_import_compiles++;
@@ -17028,7 +17120,7 @@ static void module_retry_callback(void *p)
 		} else if (JS_IsUndefined(fn)) {
 			fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
 				     JS_EVAL_TYPE_MODULE |
-				     JS_EVAL_FLAG_COMPILE_ONLY);
+				     JS_EVAL_FLAG_COMPILE_ONLY | QJS_LAZY);
 			if (!JS_IsException(fn)) {
 				bc_store_module(thread->ctx, d->name, d->src,
 						d->len, fn);
@@ -17271,7 +17363,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		} else {
 			fn = JS_Eval(thread->ctx, src, txtlen, name,
 				     JS_EVAL_TYPE_GLOBAL |
-				     JS_EVAL_FLAG_COMPILE_ONLY);
+				     JS_EVAL_FLAG_COMPILE_ONLY | QJS_LAZY);
 		}
 		if (!JS_IsException(fn)) {
 			bc_store(thread->ctx, name, src, txtlen, fn);
@@ -17291,7 +17383,8 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				as_module = JS_Eval(thread->ctx, src, txtlen,
 						    name,
 						    JS_EVAL_TYPE_MODULE |
-						    JS_EVAL_FLAG_COMPILE_ONLY);
+						    JS_EVAL_FLAG_COMPILE_ONLY |
+						    QJS_LAZY);
 			} else {
 				as_module = JS_ThrowReferenceError(
 					thread->ctx, "imports still arriving");
@@ -17347,7 +17440,8 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				JS_FreeValue(thread->ctx, script_err);
 				fn = JS_Eval(thread->ctx, src, txtlen, name,
 					     JS_EVAL_TYPE_GLOBAL |
-					     JS_EVAL_FLAG_COMPILE_ONLY);
+					     JS_EVAL_FLAG_COMPILE_ONLY |
+					     QJS_LAZY);
 				if (!JS_IsException(fn)) {
 					bc_store(thread->ctx, name, src,
 						 txtlen, fn);
@@ -17398,7 +17492,8 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 					JSValue m = JS_Eval(thread->ctx, src,
 							    txtlen, name,
 							    JS_EVAL_TYPE_MODULE |
-							    JS_EVAL_FLAG_COMPILE_ONLY);
+							    JS_EVAL_FLAG_COMPILE_ONLY |
+							    QJS_LAZY);
 
 					if (!JS_IsException(m)) {
 						JS_FreeValue(thread->ctx, err);
@@ -17711,14 +17806,20 @@ bool js_fire_event(jsthread *thread, const char *type,
 		thread->ready_state = "complete";
 	}
 	if (strcmp(type, "load") == 0) {
+		uint32_t lazy_n, lazy_ms;
+
 		bc_index_flush();
+		JS_GetLazyCompileStats(thread->heap->rt, &lazy_n, &lazy_ms);
 		vita_log("qjs: load event, runtime memory %u KB; "
 			 "%u scripts of %u KB compiled in %u ms, ran in %u ms"
-			 "; %u modules, %u import misses",
+			 "; %u modules, %u import misses; %u functions "
+			 "compiled when first called, in %u ms",
 			 runtime_kb(thread->heap->rt),
 			 thread->js_scripts, thread->js_bytes / 1024,
 			 thread->js_compile_ms, thread->js_run_ms,
-			 thread->js_modules, thread->js_imports_missed);
+			 thread->js_modules, thread->js_imports_missed,
+			 (unsigned)(lazy_n - thread->lazy_count0),
+			 (unsigned)(lazy_ms - thread->lazy_ms0));
 		if (thread->ctx != NULL) {
 			log_inline_session(thread->ctx);
 		}
