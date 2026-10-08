@@ -1930,10 +1930,15 @@ static int vita_claim(nsfb_t *nsfb, nsfb_bbox_t *box)
 				 vs->claims, box->x0, box->y0, box->x1, box->y1);
 		}
 		/* something other than the page about to draw over the
-		 * view, which it takes to be in screen order */
+		 * view, which it takes to be in screen order. Overlapping,
+		 * not touching: libnsfb's test counts a shared edge, and
+		 * the scrollbar beside the view, drawn every step of a
+		 * scroll, put the view in order every step, 200 to 550 ms
+		 * of each second of scrolling Yamtrack on build 596 */
 		if (!vs->page_drawing && vs->ring_valid &&
 		    (vs->ring_ox != 0 || vs->ring_oy != 0) &&
-		    nsfb_plot_bbox_intersect(box, &vs->ring)) {
+		    box->x0 < vs->ring.x1 && box->x1 > vs->ring.x0 &&
+		    box->y0 < vs->ring.y1 && box->y1 > vs->ring.y0) {
 			unring(vs);
 		}
 	}

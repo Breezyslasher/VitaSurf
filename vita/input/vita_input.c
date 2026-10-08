@@ -2149,6 +2149,20 @@ static void tick(void *p)
 		st.drag_dx = st.drag_dy = 0;
 	}
 
+	/*
+	 * The stick held mostly one way scrolls only that way (VitaSurf),
+	 * as a phone locks a drag that is nearly straight. A thumb pushing
+	 * up is rarely dead straight, and on a page wider than the screen,
+	 * GitHub's, each step went sideways too: two strips uncovered, and
+	 * the redraw round both was the whole screen, three times a second.
+	 * Held well off the axis, it still scrolls both ways.
+	 */
+	if (abs(st.lx) * 2 < abs(st.ly)) {
+		st.lx = 0;
+	} else if (abs(st.ly) * 2 < abs(st.lx)) {
+		st.ly = 0;
+	}
+
 	/* stick: quadratic response so small deflections crawl */
 	if (st.lx != 0) {
 		dx += st.lx * abs(st.lx) * SCROLL_MAX / (127 * 127);

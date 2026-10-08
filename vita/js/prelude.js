@@ -1411,6 +1411,7 @@ var CS_DEFAULTS={
  ['Top','Right','Bottom','Left'].forEach(function(e){
   CS_DEFAULTS[b+e+(b==='border'?'Width':'')]='0px';});
  if(b!=='border')CS_DEFAULTS[b]='0px';});
+var CS_PROTO={};
 function dashToCamel(n){return String(n).replace(/-([a-z])/g,function(m,c){return c.toUpperCase();});}
 /* What the user agent stylesheet says an element is, for when libcss has
    no computed style to give -- a detached element, or one with no box.
@@ -1468,7 +1469,7 @@ function computedStyle(el,pseudo){
   return empty;}
  var st=(el&&el.nodeType===1&&typeof __vitaStyle==='function')?__vitaStyle(el):null;
  var box=(el&&el.nodeType===1&&typeof __vitaBox==='function')?__vitaBox(el):null;
- var cs={};
+ var cs=Object.create(CS_PROTO);
  for(var k in CS_DEFAULTS)cs[k]=CS_DEFAULTS[k];
  if(el&&el.nodeType===1&&UA_DISPLAY[el.tagName])cs.display=UA_DISPLAY[el.tagName];
  if(st){
@@ -1512,24 +1513,37 @@ function computedStyle(el,pseudo){
    if(more&&more[k]!==undefined)return;
    cs[k]=d[1];});
  }
- cs.getPropertyValue=function(n){n=String(n);
+ /* the methods are the prototype's and the names are listed when
+    asked for (VitaSurf): made for every call, with every property's
+    name turned to its dashed form by a regular expression, they were
+    nine tenths of a call, and lazysizes asks for an element's
+    visibility for each image near the view on every scroll check */
+ Object.defineProperty(cs,'__vitaEl',{value:el});
+ return cs;
+}
+function csNames(cs){
+ if(!Object.prototype.hasOwnProperty.call(cs,'__vitaNames'))
+  Object.defineProperty(cs,'__vitaNames',{configurable:true,value:
+   Object.keys(cs).filter(function(k){return typeof cs[k]==='string';}).map(function(k){
+    return k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});})});
+ return cs.__vitaNames;
+}
+Object.defineProperties(CS_PROTO,{
+ getPropertyValue:{configurable:true,writable:true,value:function(n){n=String(n);var el=this.__vitaEl;
   /* a custom property is the cascade's, read as the page wrote it */
   if(n.slice(0,2)==='--'){
-   if(this[n]!==undefined)return String(this[n]);
+   if(Object.prototype.hasOwnProperty.call(this,n))return String(this[n]);
    if(sheetsDirty.length)sheetsWrite();
    return (el&&el.nodeType===1&&typeof __vitaCustomProp==='function')?
     __vitaCustomProp(el,n):'';}
-  var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};
- cs.getPropertyPriority=function(){return '';};
- cs.setProperty=function(n,v){this[dashToCamel(n)]=String(v);};
- cs.removeProperty=function(n){var c=dashToCamel(n),v=this[c];delete this[c];return v===undefined?'':String(v);};
- var names=Object.keys(cs).filter(function(k){return typeof cs[k]==='string';}).map(function(k){
-  return k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});});
- cs.item=function(i){return names[i]||'';};
- Object.defineProperty(cs,'length',{configurable:true,get:function(){return names.length;}});
- cs.cssText='';
- return cs;
-}
+  var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);}},
+ getPropertyPriority:{configurable:true,writable:true,value:function(){return '';}},
+ setProperty:{configurable:true,writable:true,value:function(n,v){this[dashToCamel(n)]=String(v);delete this.__vitaNames;}},
+ removeProperty:{configurable:true,writable:true,value:function(n){var c=dashToCamel(n),v=this[c];delete this[c];delete this.__vitaNames;return v===undefined?'':String(v);}},
+ item:{configurable:true,writable:true,value:function(i){return csNames(this)[i]||'';}},
+ cssText:{configurable:true,writable:true,value:''},
+ length:{configurable:true,get:function(){return csNames(this).length;}}
+});
 W.getComputedStyle=function(el,pseudo){return computedStyle(el,pseudo);};
 /* A media query evaluator over the real viewport. Handles the features
    responsive sites actually branch on; anything else is false. */
