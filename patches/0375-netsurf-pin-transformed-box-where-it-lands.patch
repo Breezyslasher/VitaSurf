@@ -1,0 +1,35 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 7c7d2b740..42c66a14b 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -6936,10 +6936,26 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 					CSS_POSITION_STICKY ||
+ 			 css_computed_position(box->style) ==
+ 					CSS_POSITION_FIXED)) {
+-		box->pin_x0 = r.x0;
+-		box->pin_y0 = r.y0;
+-		box->pin_x1 = r.x1;
+-		box->pin_y1 = r.y1;
++		struct rect pin = r;
++
++		/* one painted through its own transform has r in its own
++		 * coordinates, as wide as the screen turned back through
++		 * it (or its border box, under an overflow clip); its
++		 * descendant bbox was grown at layout to where the
++		 * transform puts it, which is where it lands on screen.
++		 * Django's debug toolbar handle, a small tab turned on its
++		 * side, was pinned as half the screen, which a scroll drew
++		 * again at every step. */
++		if (transformed) {
++			pin.x0 = x + box->descendant_x0 * scale;
++			pin.y0 = y + box->descendant_y0 * scale;
++			pin.x1 = x + box->descendant_x1 * scale + 1;
++			pin.y1 = y + box->descendant_y1 * scale + 1;
++		}
++		box->pin_x0 = pin.x0;
++		box->pin_y0 = pin.y0;
++		box->pin_x1 = pin.x1;
++		box->pin_y1 = pin.y1;
+ 		box->pin_drawn = true;
+ 	}
+ 
