@@ -105,20 +105,52 @@ void vita_surface_take_copy_times(unsigned int *copy_ms,
 void vita_surface_set_focus_rect(const nsfb_bbox_t *rect);
 
 /**
- * The part of the screen in view is about to be moved by (dx, dy)
- * through nsfb_plot_copy() (VitaSurf). The surface moves its picture on
- * the GPU instead, by reading the view's part of the screen texture
- * from an offset, so the copy's update is not written to the texture;
- * only what is drawn afterwards is. Call vita_surface_scroll_done()
- * after the copy.
+ * Move the part of the screen in view by (dx, dy) (VitaSurf). The
+ * surface moves its picture by reading the view's part of the screen
+ * texture, and of the shadow buffer NetSurf draws into, from an offset:
+ * nothing is copied, and the caller must not copy the shadow buffer
+ * itself. Only what is drawn afterwards, through vita_surface_pieces()
+ * and vita_surface_aim(), is written. Call vita_surface_scroll_done()
+ * after.
  *
- * \return false when the move cannot be done that way: the copy is
- *         then written as usual, and scroll_done need not be called.
+ * \return false when the move cannot be done that way: the shadow
+ *         buffer is then in screen order, the caller copies it with
+ *         nsfb_plot_copy() as usual, and scroll_done need not be
+ *         called.
  */
 bool vita_surface_scroll(const nsfb_bbox_t *view, int dx, int dy);
 
 /** End a move vita_surface_scroll() started. */
 void vita_surface_scroll_done(void);
+
+/**
+ * Split a screen area into the pieces the shadow buffer holds whole,
+ * where the scrolled view wraps (VitaSurf): at most eight, one while
+ * the view is in order.
+ *
+ * \return the number of pieces written.
+ */
+int vita_surface_pieces(const nsfb_bbox_t *area, nsfb_bbox_t *pieces,
+			int max);
+
+/**
+ * Point the shadow buffer so that drawing at screen coordinates inside
+ * piece, one from vita_surface_pieces(), lands where the surface holds
+ * it; NULL points it back at screen order. Drawing must be clipped to
+ * the piece while it is aimed.
+ */
+void vita_surface_aim(const nsfb_bbox_t *piece);
+
+/**
+ * Around a redraw of the page that draws through vita_surface_aim()
+ * (VitaSurf). Anything else that claims part of the view has the view
+ * put back in screen order first, since it draws in screen order.
+ */
+void vita_surface_page_begin(void);
+void vita_surface_page_end(void);
+
+/** Put the view back in screen order, in the shadow and the texture. */
+void vita_surface_unring(void);
 
 /**
  * Scrolls moved on the GPU since the last call, the pixels those did not

@@ -1,0 +1,500 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 7908d5571..6935324f8 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -25,6 +25,7 @@
+  * Implementation of conversion from DOM tree to box tree.
+  */
+ 
++#include <stdio.h>
+ #include <string.h>
+ #include <dom/dom.h>
+ 
+@@ -3971,6 +3972,94 @@ static bool restyle_same_boxes(const html_content *c, const struct box *box,
+ 	return true;
+ }
+ 
++/*
++ * What made restyle_same_boxes() say no, and on what element (VitaSurf),
++ * for the log: a Yamtrack hover rebuilt the page in 1.6 s on the Vita
++ * with only "the new style changes the boxes" to go on.
++ */
++static char restyle_boxes_why[200];
++
++static const char *restyle_boxes_detail(const struct box *box,
++		const css_select_results *a, const css_select_results *b)
++{
++	const css_computed_style *sa = a->styles[CSS_PSEUDO_ELEMENT_NONE];
++	const css_computed_style *sb = b->styles[CSS_PSEUDO_ELEMENT_NONE];
++	const char *what = "a property the boxes are built from";
++	char name[24] = "?", cls[48] = "";
++	int i;
++
++	for (i = 1; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++		if ((a->styles[i] == NULL) != (b->styles[i] == NULL)) {
++			what = "a ::before, ::after or other pseudo-element "
++				"appears or goes";
++			break;
++		}
++	}
++	if (i == CSS_PSEUDO_ELEMENT_COUNT && sa != NULL && sb != NULL) {
++		lwc_string **fa = NULL, **fb = NULL;
++		lwc_string *ia = NULL, *ib = NULL;
++		const css_computed_content_item *ca = NULL, *cb = NULL;
++
++		if (ns_computed_display(sa, false) !=
++				ns_computed_display(sb, false))
++			what = "display";
++		else if (css_computed_position(sa) !=
++				css_computed_position(sb))
++			what = "position";
++		else if (css_computed_float(sa) != css_computed_float(sb))
++			what = "float";
++		else if (css_computed_white_space(sa) !=
++				css_computed_white_space(sb))
++			what = "white-space";
++		else if (css_computed_text_transform(sa) !=
++				css_computed_text_transform(sb))
++			what = "text-transform";
++		else if (css_computed_font_family(sa, &fa) !=
++				css_computed_font_family(sb, &fb) || fa != fb)
++			what = "font-family";
++		else if (css_computed_content(sa, &ca) !=
++				css_computed_content(sb, &cb) || ca != cb)
++			what = "content";
++		else if (css_computed_background_image(sa, &ia) !=
++				css_computed_background_image(sb, &ib) ||
++				ia != ib)
++			what = "background-image";
++		else if (css_computed_list_style_type(sa) !=
++				css_computed_list_style_type(sb))
++			what = "list-style-type";
++		else if (!css_computed_style_same_boxes(sa, sb))
++			what = "another property the boxes are built from";
++		else if ((box->flags & IS_REPLACED) != 0)
++			what = "a replaced element's width or height";
++		else
++			what = "the overflow of the root or the body";
++	}
++
++	if (box->node != NULL) {
++		dom_string *n = NULL, *c = NULL;
++
++		if (dom_node_get_node_name(box->node, &n) == DOM_NO_ERR &&
++				n != NULL) {
++			snprintf(name, sizeof(name), "%.*s",
++					(int) dom_string_byte_length(n),
++					dom_string_data(n));
++			dom_string_unref(n);
++		}
++		if (dom_element_get_attribute(box->node, corestring_dom_class,
++				&c) == DOM_NO_ERR && c != NULL) {
++			snprintf(cls, sizeof(cls), " class \"%.*s\"",
++					(int) dom_string_byte_length(c) > 40 ?
++					40 : (int) dom_string_byte_length(c),
++					dom_string_data(c));
++			dom_string_unref(c);
++		}
++	}
++	snprintf(restyle_boxes_why, sizeof(restyle_boxes_why),
++			"the new style changes the boxes (%s, on %s%s)",
++			what, name, cls);
++	return restyle_boxes_why;
++}
++
+ /** Make a box measured and sized again by the next layout (VitaSurf). */
+ static void restyle_unmeasure_one(struct box *b)
+ {
+@@ -4186,7 +4275,7 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 	 * it again only if the boxes themselves would differ (VitaSurf) */
+ 	if (!restyle_same_layout(old, fresh)) {
+ 		if (!restyle_same_boxes(c, box, old, fresh)) {
+-			restyle_why = "the new style changes the boxes";
++			restyle_why = restyle_boxes_detail(box, old, fresh);
+ 			css_select_results_destroy(fresh);
+ 			return BOX_RESTYLE_LAYOUT;
+ 		}
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index 1135979cd..7a11c205f 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -26,6 +26,7 @@
+ 
+ #include <libnsfb.h>
+ #include <libnsfb_plot.h>
++#include <libnsfb_plot_util.h>
+ #include <libnsfb_event.h>
+ #include <libnsfb_cursor.h>
+ 
+@@ -54,6 +55,30 @@ static nsfb_t *nsfb;
+  *              operations within.
+  * \return NSERROR_OK on success else error code.
+  */
++#ifdef __vita__
++/*
++ * The piece of the screen a page redraw may write to (VitaSurf). The
++ * Vita surface holds a scrolled view from an offset, and a piece of it
++ * is drawn with the buffer pointed where that piece lies: a write
++ * outside it lands on other rows of the view. Drawing a little past
++ * the redraw area used to rewrite pixels with what they already were,
++ * so every clip asked for on the screen is kept inside the piece.
++ */
++static nsfb_t *fb_clip_screen;
++static nsfb_bbox_t fb_clip_limit;
++
++/* exported interface documented in framebuffer/framebuffer.h */
++void framebuffer_limit_clip(const nsfb_bbox_t *limit)
++{
++	if (limit == NULL) {
++		fb_clip_screen = NULL;
++		return;
++	}
++	fb_clip_screen = nsfb;
++	fb_clip_limit = *limit;
++}
++#endif
++
+ static nserror
+ framebuffer_plot_clip(const struct redraw_context *ctx, const struct rect *clip)
+ {
+@@ -63,6 +88,18 @@ framebuffer_plot_clip(const struct redraw_context *ctx, const struct rect *clip)
+ 	nsfb_clip.x1 = clip->x1;
+ 	nsfb_clip.y1 = clip->y1;
+ 
++#ifdef __vita__
++	if (fb_clip_screen != NULL && nsfb == fb_clip_screen &&
++	    !nsfb_plot_clip(&fb_clip_limit, &nsfb_clip)) {
++		/* nothing of it in the piece: the clip in force, which is
++		 * inside the piece, is narrowed to nothing */
++		nsfb_clip.x0 = nsfb_clip.x1 = fb_clip_limit.x0;
++		nsfb_clip.y0 = nsfb_clip.y1 = fb_clip_limit.y0;
++		nsfb_plot_set_clip(nsfb, &nsfb_clip);
++		return NSERROR_OK;
++	}
++#endif
++
+ 	if (!nsfb_plot_set_clip(nsfb, &nsfb_clip)) {
+ 		return NSERROR_INVALID;
+ 	}
+diff --git a/frontends/framebuffer/framebuffer.h b/frontends/framebuffer/framebuffer.h
+index 7c95a4d7e..7659ac5d8 100644
+--- a/frontends/framebuffer/framebuffer.h
++++ b/frontends/framebuffer/framebuffer.h
+@@ -37,6 +37,14 @@ bool framebuffer_set_cursor(struct fbtk_bitmap *bm);
+  */
+ nsfb_t *framebuffer_set_surface(nsfb_t *new_nsfb);
+ 
++#ifdef __vita__
++/**
++ * Keep every clip set on the screen inside limit, or stop with NULL
++ * (VitaSurf): the piece of a scrolled view being drawn.
++ */
++void framebuffer_limit_clip(const nsfb_bbox_t *limit);
++#endif
++
+ /** Drop the scaled copies made of a bitmap: it changed or is going. */
+ void framebuffer_scaled_forget(nsfb_t *src);
+ 
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index c8afa3d05..19ebcfd83 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -405,27 +405,27 @@ fb_images_draw_waiting(fbtk_widget_t *widget,
+ }
+ 
+ /**
+- * Move part of the browser's picture for a pan. On the Vita the screen
+- * texture is moved by the GPU and only the shadow buffer is copied
+- * (VitaSurf): the copy used to be written into the texture as well,
+- * most of a screen at about 12 ms each step of scrolling.
++ * Move part of the browser's picture for a pan. On the Vita nothing is
++ * copied (VitaSurf): the screen texture and the shadow buffer are both
++ * read from an offset that the move changes. The texture copy used to
++ * be most of a screen at about 12 ms each step of scrolling, and the
++ * shadow buffer's two megabytes after it 160 to 300 ms of each second
++ * of scrolling Yamtrack.
+  */
+ static void
+ fb_pan_copy(nsfb_t *nsfb, nsfb_bbox_t *srcbox, nsfb_bbox_t *dstbox,
+ 	    const nsfb_bbox_t *view)
+ {
+ #ifdef __vita__
+-	bool gpu = vita_surface_scroll(view, dstbox->x0 - srcbox->x0,
+-				       dstbox->y0 - srcbox->y0);
++	if (vita_surface_scroll(view, dstbox->x0 - srcbox->x0,
++				dstbox->y0 - srcbox->y0)) {
++		vita_surface_scroll_done();
++		return;
++	}
+ #else
+ 	(void)view;
+ #endif
+ 	nsfb_plot_copy(nsfb, srcbox, nsfb, dstbox);
+-#ifdef __vita__
+-	if (gpu) {
+-		vita_surface_scroll_done();
+-	}
+-#endif
+ }
+ 
+ static void
+@@ -773,6 +773,10 @@ fb_redraw(fbtk_widget_t *widget,
+ 	bwidget->redraw_box.x0 += x;
+ 	bwidget->redraw_box.x1 += x;
+ 
++#ifdef __vita__
++	/* the page draws into the view as the surface holds it */
++	vita_surface_page_begin();
++#endif
+ 	nsfb_claim(nsfb, &bwidget->redraw_box);
+ 
+ 	/* redraw bounding box is relative to window */
+@@ -781,6 +785,25 @@ fb_redraw(fbtk_widget_t *widget,
+ 	clip.x1 = bwidget->redraw_box.x1;
+ 	clip.y1 = bwidget->redraw_box.y1;
+ 
++#ifdef __vita__
++	/*
++	 * In the pieces the surface holds whole (VitaSurf): a scrolled
++	 * view is held from an offset, which wraps, and each piece is
++	 * drawn with the shadow buffer pointed where that piece lies.
++	 */
++	{
++		nsfb_bbox_t piece[8];
++		int pieces, pi;
++
++		pieces = vita_surface_pieces(&bwidget->redraw_box, piece, 8);
++		for (pi = 0; pi < pieces; pi++) {
++		clip.x0 = piece[pi].x0;
++		clip.y0 = piece[pi].y0;
++		clip.x1 = piece[pi].x1;
++		clip.y1 = piece[pi].y1;
++		vita_surface_aim(&piece[pi]);
++		framebuffer_limit_clip(&piece[pi]);
++#endif
+ 	{
+ 		/*
+ 		 * Drawing, as opposed to laying out (VitaSurf). This is
+@@ -819,14 +842,25 @@ fb_redraw(fbtk_widget_t *widget,
+ 		pen.stroke_width = 1;
+ 		pen.stroke_colour = 0xFF0000FF;
+ 
++#ifdef __vita__
++		/* within the piece aimed at */
++		nsfb_plot_set_clip(nsfb, &piece[pi]);
++#endif
+ 		nsfb_plot_line(nsfb, &line, &pen);
+ 	}
++#ifdef __vita__
++		}
++		framebuffer_limit_clip(NULL);
++		vita_surface_aim(NULL);
++	}
++#endif
+ 
+ #ifdef __vita__
+ 	update_t0 = vita_now_us();
+ #endif
+ 	nsfb_update(fbtk_get_nsfb(widget), &bwidget->redraw_box);
+ #ifdef __vita__
++	vita_surface_page_end();
+ 	fb_update_us += vita_now_us() - update_t0;
+ 	page_us = vita_now_us() - redraw_t0;
+ 	fb_redraw_us += page_us;
+@@ -1136,7 +1170,16 @@ static void framebuffer_run(void)
+ 	unsigned long long sched_us = 0;
+ 	unsigned long long wait_us = 0;
+ 	unsigned long long draw_us = 0;
++	unsigned long long img_us = 0;
+ 	unsigned int rounds = 0;
++	/* the phase counters at the last report, for what the scheduler
++	 * spent its share of the second on (VitaSurf) */
++	unsigned int p_script = vitasurf_ms_script;
++	unsigned int p_jobs = vitasurf_ms_js_jobs;
++	unsigned int p_css = vitasurf_ms_css;
++	unsigned int p_boxes = vitasurf_ms_boxes;
++	unsigned int p_layout = vitasurf_ms_layout;
++	unsigned int p_image = vitasurf_ms_image;
+ #endif
+ 
+ 	while (fb_complete != true) {
+@@ -1150,6 +1193,7 @@ static void framebuffer_run(void)
+ 		if (!hold && !fbtk_get_redraw_pending(fbtk)) {
+ 			fb_images_ask_redraw();
+ 		}
++		img_us += vita_now_us() - a;
+ #endif
+ 		/* run the scheduler and discover how long to wait for
+ 		 * the next event.
+@@ -1319,6 +1363,40 @@ static void framebuffer_run(void)
+ 				fb_pan_move_us = 0;
+ 				fb_pan_pinned_redraws = 0;
+ 			}
++			/* what the scheduler's share was, when it was a good
++			 * part of the second: scrolling Yamtrack spent 300 to
++			 * 500 ms of each second in it with nothing to say on
++			 * what (VitaSurf) */
++			if (sched_us >= 200000) {
++				char top[200];
++
++				schedule_take_top(top, sizeof(top));
++				vita_log("scheduler: %u ms, %u of it image work "
++					 "before it; script %u, promise jobs %u, "
++					 "style sheets %u, boxes and styles %u, "
++					 "layout %u, images %u; the longest "
++					 "callbacks %s",
++					 (unsigned) (sched_us / 1000),
++					 (unsigned) (img_us / 1000),
++					 vitasurf_ms_script - p_script,
++					 vitasurf_ms_js_jobs - p_jobs,
++					 vitasurf_ms_css - p_css,
++					 vitasurf_ms_boxes - p_boxes,
++					 vitasurf_ms_layout - p_layout,
++					 vitasurf_ms_image - p_image,
++					 top[0] != '\0' ? top : "none");
++			} else {
++				char top[8];
++
++				schedule_take_top(top, sizeof(top));
++			}
++			p_script = vitasurf_ms_script;
++			p_jobs = vitasurf_ms_js_jobs;
++			p_css = vitasurf_ms_css;
++			p_boxes = vitasurf_ms_boxes;
++			p_layout = vitasurf_ms_layout;
++			p_image = vitasurf_ms_image;
++			img_us = 0;
+ 			/* a page that builds itself after it has loaded
+ 			 * is reported again once it goes quiet */
+ 			vita_input_settled((unsigned)(sched_us / 1000),
+diff --git a/frontends/framebuffer/schedule.c b/frontends/framebuffer/schedule.c
+index 09c37b1e7..1702ee31f 100644
+--- a/frontends/framebuffer/schedule.c
++++ b/frontends/framebuffer/schedule.c
+@@ -20,6 +20,7 @@
+ #include <stdlib.h>
+ 
+ #include <stdint.h>
++#include <stdio.h>
+ 
+ #include "utils/sys_time.h"
+ #include "utils/log.h"
+@@ -181,6 +182,84 @@ earliest_due(const struct timeval *now, struct nscallback **prev_out)
+ }
+ #endif
+ 
++#ifdef __vita__
++/*
++ * Where the scheduler's time went, by callback (VitaSurf). Scrolling
++ * Yamtrack spent 300 to 500 ms of each second in the scheduler and
++ * nothing said in what: callbacks slower than 200 ms are logged one
++ * by one, but this was many short ones. Reported once a second with
++ * the frame line while the scheduler takes a good part of it.
++ */
++#define SCHED_TOP_SLOTS 24
++
++static struct {
++	void (*callback)(void *p);
++	unsigned int us;
++	unsigned int calls;
++} sched_top[SCHED_TOP_SLOTS];
++
++static void sched_top_add(void (*callback)(void *p), unsigned int us)
++{
++	int i, low = 0;
++
++	for (i = 0; i < SCHED_TOP_SLOTS; i++) {
++		if (sched_top[i].callback == callback) {
++			sched_top[i].us += us;
++			sched_top[i].calls++;
++			return;
++		}
++		if (sched_top[i].us < sched_top[low].us) {
++			low = i;
++		}
++	}
++	/* a new one takes the place of the least, or an empty one */
++	sched_top[low].callback = callback;
++	sched_top[low].us = us;
++	sched_top[low].calls = 1;
++}
++
++/* exported function documented in framebuffer/schedule.h */
++void schedule_take_top(char *buf, size_t len)
++{
++	size_t used = 0;
++	int n, i;
++
++	if (len == 0) {
++		return;
++	}
++	buf[0] = '\0';
++	for (n = 0; n < 5; n++) {
++		int best = -1;
++		int w;
++
++		for (i = 0; i < SCHED_TOP_SLOTS; i++) {
++			if (sched_top[i].calls != 0 &&
++			    (best < 0 || sched_top[i].us > sched_top[best].us)) {
++				best = i;
++			}
++		}
++		if (best < 0 || sched_top[best].us < 1000) {
++			break;
++		}
++		w = snprintf(buf + used, len - used, "%s%08x %u ms in %u",
++			     n > 0 ? ", " : "",
++			     (unsigned int)(uintptr_t)sched_top[best].callback,
++			     sched_top[best].us / 1000,
++			     sched_top[best].calls);
++		if (w < 0 || (size_t)w >= len - used) {
++			break;
++		}
++		used += w;
++		sched_top[best].calls = 0;
++	}
++	for (i = 0; i < SCHED_TOP_SLOTS; i++) {
++		sched_top[i].callback = NULL;
++		sched_top[i].us = 0;
++		sched_top[i].calls = 0;
++	}
++}
++#endif
++
+ /* exported function documented in framebuffer/schedule.h */
+ int schedule_run(void)
+ {
+@@ -262,6 +341,13 @@ int schedule_run(void)
+                                          (c1.tv_usec - c0.tv_usec) / 1000);
+                                 vitasurf_sched_calls++;
+                                 vitasurf_ms_sched += took;
++#ifdef __vita__
++                                sched_top_add(unlnk_nscb->callback,
++                                              (unsigned int)
++                                              ((c1.tv_sec - c0.tv_sec) *
++                                               1000000 +
++                                               (c1.tv_usec - c0.tv_usec)));
++#endif
+                                 if (took > vitasurf_ms_sched_max) {
+                                         vitasurf_ms_sched_max = took;
+                                 }
+diff --git a/frontends/framebuffer/schedule.h b/frontends/framebuffer/schedule.h
+index 4e94da68e..b04cd28ee 100644
+--- a/frontends/framebuffer/schedule.h
++++ b/frontends/framebuffer/schedule.h
+@@ -42,4 +42,15 @@ int schedule_run(void);
+ 
+ void list_schedule(void);
+ 
++#ifdef __vita__
++#include <stddef.h>
++
++/**
++ * The callbacks that took longest since this was last asked (VitaSurf),
++ * at most five, as "address ms in calls", the rest of the tally
++ * cleared.
++ */
++void schedule_take_top(char *buf, size_t len);
++#endif
++
+ #endif
