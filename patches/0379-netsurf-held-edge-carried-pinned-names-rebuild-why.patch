@@ -1,0 +1,141 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 6935324f8..4372a9390 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3988,10 +3988,18 @@ static const char *restyle_boxes_detail(const struct box *box,
+ 	char name[24] = "?", cls[48] = "";
+ 	int i;
+ 
++	static const char *const pseudo[CSS_PSEUDO_ELEMENT_COUNT] = {
++		"", "::first-line", "::first-letter", "::before", "::after",
++		"::marker", "::placeholder"
++	};
++	char pseudo_what[48];
++
+ 	for (i = 1; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
+ 		if ((a->styles[i] == NULL) != (b->styles[i] == NULL)) {
+-			what = "a ::before, ::after or other pseudo-element "
+-				"appears or goes";
++			snprintf(pseudo_what, sizeof(pseudo_what), "%s %s",
++					pseudo[i], a->styles[i] == NULL ?
++					"appears" : "goes");
++			what = pseudo_what;
+ 			break;
+ 		}
+ 	}
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 908ac0ad9..32f892497 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -2933,6 +2933,62 @@ static bool html_box_paints(const struct box *b, int *budget)
+ 	return false;
+ }
+ 
++/*
++ * Say which boxes a scroll draws again at every step, once each time
++ * that set changes (VitaSurf): a GitHub log showed two such areas on
++ * each step of its profile, half its drawing time, and nothing named
++ * them. Called with each box as it is listed, then with NULL and the
++ * count.
++ */
++static void html_pinned_note(const struct box *b, int i)
++{
++	static const struct box *seen[8], *now[8];
++	static int seen_n = -1;
++	int k;
++
++	if (b != NULL) {
++		if (i < 8)
++			now[i] = b;
++		return;
++	}
++	if (i == seen_n && memcmp(seen, now, sizeof(seen[0]) *
++			(size_t) (i < 8 ? i : 8)) == 0)
++		return;
++	seen_n = i;
++	memcpy(seen, now, sizeof(seen));
++	for (k = 0; k < i && k < 8; k++) {
++		const struct box *x = now[k];
++		dom_string *name = NULL, *cls = NULL;
++		char n[16] = "?", c[64] = "";
++
++		if (x->node != NULL) {
++			if (dom_node_get_node_name(x->node, &name) ==
++					DOM_NO_ERR && name != NULL) {
++				snprintf(n, sizeof(n), "%.*s",
++						(int) dom_string_byte_length(
++							name),
++						dom_string_data(name));
++				dom_string_unref(name);
++			}
++			if (dom_element_get_attribute(x->node,
++					corestring_dom_class, &cls) ==
++					DOM_NO_ERR && cls != NULL) {
++				int l = (int) dom_string_byte_length(cls);
++
++				snprintf(c, sizeof(c), " class \"%.*s\"",
++						l > 48 ? 48 : l,
++						dom_string_data(cls));
++				dom_string_unref(cls);
++			}
++		}
++		vita_log("pinned: %d of %d drawn again at each scroll step: "
++			 "%s%s, %s, at %d,%d to %d,%d", k + 1, i, n, c,
++			 css_computed_position(x->style) ==
++				CSS_POSITION_STICKY ? "sticky" : "fixed",
++			 x->pin_x0, x->pin_y0, x->pin_x1, x->pin_y1);
++	}
++}
++
+ /* exported interface documented in html/html.h */
+ int html_pinned_rects(struct hlcache_handle *h, const struct rect *area,
+ 		struct rect *out, int max)
+@@ -2972,8 +3028,10 @@ int html_pinned_rects(struct hlcache_handle *h, const struct rect *area,
+ 		out[n].y0 = b->pin_y0;
+ 		out[n].x1 = b->pin_x1;
+ 		out[n].y1 = b->pin_y1;
++		html_pinned_note(b, n);
+ 		n++;
+ 	}
++	html_pinned_note(NULL, n);
+ 	return n;
+ }
+ 
+@@ -3714,8 +3772,12 @@ static void html_dynamic_relayout(void *p)
+ 	if (c->n_anim > 0)
+ 		html_anim_relayout_ms += (unsigned) (t1 - t0);
+ 	if (res == NSERROR_INVALID) {
+-		/* busy, or a field is being edited: try again */
++		/* busy, or a field is being edited: try again, still as
++		 * the pointer's rest, so the retry says why it rebuilt
++		 * (VitaSurf): a GitHub hover rebuilt the page with nothing
++		 * in the log to say what changed */
+ 		c->dynamic_relayout_pending = true;
++		c->dynamic_relayout_resting = rested;
+ 		guit->misc->schedule(250, html_dynamic_relayout, c);
+ 	}
+ }
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index ba3816f45..09002beb4 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -702,11 +702,17 @@ fb_pan(fbtk_widget_t *widget,
+ 					r->x1 == held_pin.x1 &&
+ 					r->y1 == held_pin.y1) {
+ 				/* held where it was: only the edge below it,
+-				 * its border and shadow over what moved */
++				 * its border and shadow over what moved, and
++				 * where the move carried them: the edge's rows
++				 * are the first of those that move, and a
++				 * scroll up of 15 px or more left a copy of
++				 * Yamtrack's header border on the page at
++				 * every step (VitaSurf) */
+ 				x0 = 0;
+ 				x1 = width;
+ 				y0 = hold;
+-				y1 = y1 + FB_PINNED_MARGIN;
++				y1 = (y1 > y1 - dy ? y1 : y1 - dy) +
++						FB_PINNED_MARGIN;
+ 			} else {
+ 				/* shadows and outlines reach past the box */
+ 				x0 = (x0 < x0 - dx ? x0 : x0 - dx) -

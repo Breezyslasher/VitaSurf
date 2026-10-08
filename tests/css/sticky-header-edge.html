@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<!-- A sticky header held still while the page scrolls under it
+     (VitaSurf), with a border and a shadow below it as Yamtrack's has.
+     Its bottom edge is drawn over the first rows that move, and each
+     step of a scroll up of 15 px or more left a copy of it behind on
+     the page: grey lines a step apart. Scroll down, then up quickly
+     with the stick: the stripes below must stay plain. -->
+<html><head><title>sticky header edge</title><style>
+body { margin: 0; background: #212529; color: #ddd; font: 16px sans-serif }
+header { position: sticky; top: 0; z-index: 10; height: 64px;
+  background: #1a1d20; border-bottom: 1px solid #2c3136;
+  box-shadow: 0 4px 6px -1px rgba(0,0,0,.4) }
+.row { height: 40px; margin: 0 20px; border-left: 4px solid #3b82f6;
+  padding-left: 8px; line-height: 40px }
+.row:nth-child(odd) { background: #262a2e }
+</style></head><body>
+<header>Header</header>
+<div id="rows"></div>
+<script>
+var r = document.getElementById('rows'), s = '';
+for (var i = 1; i <= 120; i++) s += '<div class="row">Row ' + i + '</div>';
+r.innerHTML = s;
+</script></body></html>
