@@ -1,0 +1,23 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 1bb175b75..d0ab1dace 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2570,7 +2570,9 @@ static void add_float_to_container(struct box *cont, struct box *b)
+  * over whatever is beside it, which is what sites ask to avoid with
+  * overflow-wrap and word-break. break-all allows a break anywhere;
+  * keep-all forbids one; overflow-wrap only matters once the word has
+- * been found not to fit, which is the only place this is asked.
++ * been found not to fit, which is the only place this is asked. The
++ * deprecated word-break: break-word is overflow-wrap: anywhere
++ * whatever overflow-wrap says (CSS Text 3, 5.2).
+  */
+ static bool layout_may_break_word(const struct box *box)
+ {
+@@ -2580,6 +2582,7 @@ static bool layout_may_break_word(const struct box *box)
+ 
+ 	switch (css_computed_word_break(box->style)) {
+ 	case CSS_WORD_BREAK_BREAK_ALL:
++	case CSS_WORD_BREAK_BREAK_WORD:
+ 		return true;
+ 	case CSS_WORD_BREAK_KEEP_ALL:
+ 		return false;

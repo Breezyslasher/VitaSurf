@@ -11288,7 +11288,7 @@ static const char *const sm_object_fit[] = { NULL, "fill", "contain",
 static const char *const sm_text_overflow[] = { NULL, "clip",
 	"ellipsis" };
 static const char *const sm_word_break[] = { NULL, "normal", "break-all",
-	"keep-all" };
+	"keep-all", "break-word" };
 static const char *const sm_overflow_wrap[] = { NULL, "normal",
 	"break-word", "anywhere" };
 static const char *const sm_pointer_events[] = { NULL, "auto", "none" };
