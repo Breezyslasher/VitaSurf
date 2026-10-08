@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<!-- GitHub's avatar (VitaSurf): border-width given as max(1px, .0625rem)
+     in the shorthand, which was dropped, and a "0 0 0 1px" box-shadow
+     round a circle with a translucent background, which was painted
+     as a square under it. Expected lines are what Chrome prints. -->
+<html><head><title>border-width max</title><style>
+body { margin: 0; font: 16px sans-serif; background: #0d1117 }
+#a { border-style: solid; border-width: max(1px, .0625rem); width: 20px; height: 10px }
+#b { border-style: solid; border-width: 2px calc(1px + 2px); width: 20px; height: 10px }
+#c { width: 100px; height: 100px; border-radius: 50%; background: #ffffff1a; box-shadow: 0 0 0 1px #3d444db3 }
+#d { pointer-events: all; white-space: break-spaces }
+</style></head><body>
+<div id="a"></div><div id="b"></div><div id="c"></div><div id="d">x</div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function cs(s, p) { return getComputedStyle(document.querySelector(s))[p]; }
+window.addEventListener('load', function () { setTimeout(function () {
+T('max() border width', cs('#a', 'borderTopWidth') + ' ' + cs('#a', 'borderLeftWidth'));
+T('calc() in the shorthand', cs('#b', 'borderTopWidth') + ' ' + cs('#b', 'borderRightWidth'));
+T('box size with max() border', document.querySelector('#a').getBoundingClientRect().width);
+T('pointer-events all', cs('#d', 'pointerEvents') !== '');
+}, 300); });
+</script>
+</body></html>

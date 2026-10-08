@@ -1,0 +1,634 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 16679a08e..908ac0ad9 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -2883,6 +2883,56 @@ const char *html_get_base_target(hlcache_handle *h)
+ }
+ 
+ 
++/**
++ * Whether anything in a box is painted (VitaSurf): a background, a
++ * border, a shadow, an outline, text or a replaced object anywhere in
++ * it. At most budget boxes are looked at; one too big to tell is taken
++ * to paint.
++ */
++static bool html_box_paints(const struct box *b, int *budget)
++{
++	const struct box *c;
++
++	if (--*budget <= 0)
++		return true;
++	if (b->object != NULL || b->gadget != NULL || b->iframe != NULL ||
++			(b->text != NULL && b->length > 0) ||
++			b->background != NULL)
++		return true;
++	if (b->style != NULL) {
++		css_color bg = 0;
++		lwc_string *img = NULL;
++		css_fixed f[4];
++		css_unit u[4];
++		css_color sc = 0;
++
++		css_computed_background_color(b->style, &bg);
++		if ((bg >> 24) != 0)
++			return true;
++		if (css_computed_background_image(b->style, &img) ==
++				CSS_BACKGROUND_IMAGE_IMAGE && img != NULL)
++			return true;
++		if (b->border[TOP].width || b->border[RIGHT].width ||
++				b->border[BOTTOM].width ||
++				b->border[LEFT].width)
++			return true;
++		if (css_computed_box_shadow(b->style, &f[0], &u[0], &f[1],
++				&u[1], &f[2], &u[2], &f[3], &u[3], &sc) !=
++				CSS_BOX_SHADOW_NONE)
++			return true;
++		if (css_computed_outline_style(b->style) !=
++				CSS_OUTLINE_STYLE_NONE)
++			return true;
++	}
++	if (b->list_marker != NULL)
++		return true;
++	for (c = b->children; c != NULL; c = c->next) {
++		if (html_box_paints(c, budget))
++			return true;
++	}
++	return false;
++}
++
+ /* exported interface documented in html/html.h */
+ int html_pinned_rects(struct hlcache_handle *h, const struct rect *area,
+ 		struct rect *out, int max)
+@@ -2907,6 +2957,15 @@ int html_pinned_rects(struct hlcache_handle *h, const struct rect *area,
+ 		if (b->pin_x1 <= area->x0 || b->pin_x0 >= area->x1 ||
+ 				b->pin_y1 <= area->y0 || b->pin_y0 >= area->y1)
+ 			continue;
++		/* nor one that paints nothing: Yamtrack keeps an empty fixed
++		 * bar for its messages across the screen, and each step of a
++		 * scroll drew again the strip of page under it */
++		{
++			int budget = 64;
++
++			if (!html_box_paints(b, &budget))
++				continue;
++		}
+ 		if (n == max)
+ 			return -1;
+ 		out[n].x0 = b->pin_x0;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 5c94712d0..b50054061 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -525,6 +525,14 @@ nserror html_plot_rounded_fill(const struct redraw_context *ctx,
+ 		const plot_style_t *pstyle, const struct rect *border_box,
+ 		const struct html_corner_radii *radii);
+ 
++/**
++ * Paint a ring of one width and colour inside a rounded rectangle
++ * (VitaSurf): r is its outer edge, radii its outer corners.
++ */
++nserror html_plot_rounded_ring(const struct redraw_context *ctx, colour c,
++		const struct rect *r, const struct html_corner_radii *radii,
++		int bw);
++
+ nserror html_plot_rounded_stroke(const struct redraw_context *ctx,
+ 		const plot_style_t *pstyle, const struct rect *rect,
+ 		const struct html_corner_radii *radii);
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 9267401e3..7c7d2b740 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -34,6 +34,7 @@
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ #include <math.h>
+ #include <dom/dom.h>
+ 
+@@ -42,6 +43,7 @@
+ #include "utils/utils.h"
+ #include "utils/nsoption.h"
+ #include "utils/corestrings.h"
++#include "utils/nsurl.h"
+ #include "netsurf/content.h"
+ #include "netsurf/browser_window.h"
+ #include "netsurf/plotters.h"
+@@ -2816,6 +2818,36 @@ static bool html_redraw_box_shadow_one(const html_content *html,
+ 	blur = px[2] < 0 ? 0 : px[2];
+ 	spread = px[3];
+ 
++	/*
++	 * A sharp shadow round a box with rounded corners (VitaSurf):
++	 * the shadow takes the box's corners, grown by the spread, and is
++	 * not painted under the box, as the specification has it. GitHub
++	 * rings each avatar with "0 0 0 1px", and the square it was
++	 * painted as showed through the avatar's translucent background:
++	 * a grey square round the circle.
++	 */
++	if (blur == 0 && spread > 0 && ox == 0 && oy == 0) {
++		struct rect bb = { bx0, by0, bx1, by1 };
++		struct html_corner_radii radii;
++
++		if (html_box_corner_radii(box, &bb, &html->unit_len_ctx,
++				scale, &radii)) {
++			struct rect o = {
++				bx0 - spread, by0 - spread,
++				bx1 + spread, by1 + spread
++			};
++#define GROW(v) do { if ((v) > 0) (v) += spread; } while (0)
++			GROW(radii.tl_h); GROW(radii.tl_v);
++			GROW(radii.tr_h); GROW(radii.tr_v);
++			GROW(radii.br_h); GROW(radii.br_v);
++			GROW(radii.bl_h); GROW(radii.bl_v);
++#undef GROW
++			return html_plot_rounded_ring(ctx,
++					nscss_color_to_ns(colour), &o,
++					&radii, spread) == NSERROR_OK;
++		}
++	}
++
+ 	return html_redraw_shadow_rings(bx0, by0, bx1, by1, ox, oy, blur,
+ 			spread, colour, false, ctx);
+ }
+@@ -2890,6 +2922,31 @@ static bool html_redraw_shadow_rings(int bx0, int by0, int bx1, int by1,
+ 		c = (colour & 0x00ffffff) | ((css_color) band_alpha << 24);
+ 		pstyle.fill_colour = nscss_color_to_ns(c);
+ 
++		if (blur == 0 && !inward) {
++			/* not under the box itself (VitaSurf): a shadow
++			 * showed through a translucent background */
++			struct rect strip[4] = {
++				{ o.x0, o.y0, o.x1, by0 },
++				{ o.x0, by1, o.x1, o.y1 },
++				{ o.x0, by0, bx0, by1 },
++				{ bx1, by0, o.x1, by1 },
++			};
++			int k;
++
++			for (k = 0; k < 4; k++) {
++				if (strip[k].y0 < o.y0) strip[k].y0 = o.y0;
++				if (strip[k].y1 > o.y1) strip[k].y1 = o.y1;
++				if (strip[k].x0 < o.x0) strip[k].x0 = o.x0;
++				if (strip[k].x1 > o.x1) strip[k].x1 = o.x1;
++				if (strip[k].x1 <= strip[k].x0 ||
++						strip[k].y1 <= strip[k].y0)
++					continue;
++				if (ctx->plot->rectangle(ctx, &pstyle,
++						&strip[k]) != NSERROR_OK)
++					return false;
++			}
++			continue;
++		}
+ 		if (blur == 0) {
+ 			if (ctx->plot->rectangle(ctx, &pstyle, &o) != NSERROR_OK)
+ 				return false;
+@@ -4567,20 +4624,6 @@ static bool html_plot_made(const struct redraw_context *ctx,
+ 	return res == NSERROR_OK;
+ }
+ 
+-/**
+- * Paint an area aside and plot it cut to a shape.
+- *
+- * \param ctx    the redraw context it is plotted through
+- * \param area   the area, device coordinates
+- * \param clip   the clip in force
+- * \param scale  the redraw's scale
+- * \param shape  the shape to cut to
+- * \param draw   paints what is in the area
+- * \param pw     passed to draw
+- * \param done   set to false if nothing was done and the caller is
+- *               to paint the area as it would have
+- * \return false on a plotting error
+- */
+ /**
+  * Whether any rounded corner of a shape lies in what is being drawn
+  * (VitaSurf). Where none does the shape cuts nothing off, and what is in
+@@ -4613,6 +4656,113 @@ static bool html_shape_corner_in(const struct html_shape *s,
+ 	return false;
+ }
+ 
++/** The part of a rectangle inside a clip; false if there is none. */
++static bool html_rect_in(const struct rect *a, const struct rect *clip,
++		struct rect *out)
++{
++	out->x0 = a->x0 > clip->x0 ? a->x0 : clip->x0;
++	out->y0 = a->y0 > clip->y0 ? a->y0 : clip->y0;
++	out->x1 = a->x1 < clip->x1 ? a->x1 : clip->x1;
++	out->y1 = a->y1 < clip->y1 ? a->y1 : clip->y1;
++	return out->x0 < out->x1 && out->y0 < out->y1;
++}
++
++/**
++ * Paint a rounded rectangle's content with only its corners painted
++ * aside (VitaSurf). The straight bands between the corners are painted
++ * in place, each clipped to its own rectangle, and only the squares the
++ * corners' curves lie in are painted into a bitmap and cut to the curve.
++ * Painting the whole card aside cost a bitmap the size of what was
++ * drawn of it, its poster scaled into it, for a cut of a few pixels at
++ * each corner: a fifth of a second of every second of scrolling
++ * Yamtrack on the Vita.
++ *
++ * \return true if it was painted this way, with *ok its result; false
++ *         if the corners are too big for it, and nothing was painted
++ */
++static bool html_composite_corners(const struct redraw_context *ctx,
++		const struct rect *clip, float scale,
++		const struct html_shape *s,
++		bool (*draw)(const struct redraw_context *ctx, void *pw,
++			int dx, int dy, int ox, int oy,
++			const struct rect *clip),
++		void *pw, bool *ok)
++{
++	const struct html_corner_radii *r = &s->r;
++	int top = r->tl_v > r->tr_v ? r->tl_v : r->tr_v;
++	int bottom = r->bl_v > r->br_v ? r->bl_v : r->br_v;
++	struct rect band[3], corner[4], in;
++	int i;
++
++	if (s->ellipse || r->tl_h + r->tr_h > s->x1 - s->x0 ||
++			r->bl_h + r->br_h > s->x1 - s->x0 ||
++			top + bottom > s->y1 - s->y0)
++		return false;
++
++	/* between the corners, painted where they are */
++	band[0].x0 = s->x0;            band[0].y0 = s->y0 + top;
++	band[0].x1 = s->x1;            band[0].y1 = s->y1 - bottom;
++	band[1].x0 = s->x0 + r->tl_h;  band[1].y0 = s->y0;
++	band[1].x1 = s->x1 - r->tr_h;  band[1].y1 = s->y0 + top;
++	band[2].x0 = s->x0 + r->bl_h;  band[2].y0 = s->y1 - bottom;
++	band[2].x1 = s->x1 - r->br_h;  band[2].y1 = s->y1;
++	/* the corners, painted aside and cut to their curves */
++	corner[0].x0 = s->x0;          corner[0].y0 = s->y0;
++	corner[0].x1 = s->x0 + r->tl_h; corner[0].y1 = s->y0 + top;
++	corner[1].x0 = s->x1 - r->tr_h; corner[1].y0 = s->y0;
++	corner[1].x1 = s->x1;          corner[1].y1 = s->y0 + top;
++	corner[2].x0 = s->x0;          corner[2].y0 = s->y1 - bottom;
++	corner[2].x1 = s->x0 + r->bl_h; corner[2].y1 = s->y1;
++	corner[3].x0 = s->x1 - r->br_h; corner[3].y0 = s->y1 - bottom;
++	corner[3].x1 = s->x1;          corner[3].y1 = s->y1;
++
++	*ok = true;
++	for (i = 0; i < 3 && *ok; i++) {
++		if (!html_rect_in(&band[i], clip, &in))
++			continue;
++		*ok = ctx->plot->clip(ctx, &in) == NSERROR_OK &&
++				draw(ctx, pw, 0, 0, 0, 0, &in);
++	}
++	for (i = 0; i < 4 && *ok; i++) {
++		struct bitmap *bm = NULL;
++		int ox = 0, oy = 0;
++
++		if (!html_rect_in(&corner[i], clip, &in))
++			continue;
++		if (ctx->plot->clip(ctx, &in) != NSERROR_OK) {
++			*ok = false;
++			break;
++		}
++		if (!html_composite_raster(&corner[i], &in, scale, draw, pw,
++				&bm, &ox, &oy))
++			continue;
++		if (bm == NULL) {
++			/* could not be painted aside: painted as it is */
++			*ok = draw(ctx, pw, 0, 0, 0, 0, &in);
++			continue;
++		}
++		html_shape_apply(bm, ox, oy, s);
++		*ok = html_plot_made(ctx, bm, ox, oy);
++	}
++	if (ctx->plot->clip(ctx, clip) != NSERROR_OK)
++		*ok = false;
++	return true;
++}
++
++/**
++ * Paint an area aside and plot it cut to a shape.
++ *
++ * \param ctx    the redraw context it is plotted through
++ * \param area   the area, device coordinates
++ * \param clip   the clip in force
++ * \param scale  the redraw's scale
++ * \param shape  the shape to cut to
++ * \param draw   paints what is in the area
++ * \param pw     passed to draw
++ * \param done   set to false if nothing was done and the caller is
++ *               to paint the area as it would have
++ * \return false on a plotting error
++ */
+ static bool html_composite(const struct redraw_context *ctx,
+ 		const struct rect *area, const struct rect *clip, float scale,
+ 		const struct html_shape *shape,
+@@ -4631,6 +4781,13 @@ static bool html_composite(const struct redraw_context *ctx,
+ 	if (shape != NULL && !html_shape_corner_in(shape, clip))
+ 		return true;
+ 	t0 = vitasurf_clock_us();
++	if (shape != NULL && html_composite_corners(ctx, clip, scale, shape,
++			draw, pw, &ok)) {
++		*done = true;
++		vitasurf_redraw_copies++;
++		vitasurf_us_redraw_copies += vitasurf_clock_us() - t0;
++		return ok;
++	}
+ 	if (!html_composite_raster(area, clip, scale, draw, pw, &bm, &ox,
+ 			&oy)) {
+ 		*done = true;
+@@ -4755,6 +4912,152 @@ static bool html_composite_object_draw(const struct redraw_context *ctx,
+ 	return content_redraw(o->object, &data, clip, ctx);
+ }
+ 
++/*
++ * Rounded images kept as they were cut (VitaSurf). An avatar with
++ * border-radius: 50% was painted aside and cut to its circle on every
++ * redraw that reached it: GitHub's profile picture, 255 pixels across,
++ * cost a tenth of a second each time, and a scroll redrew it at every
++ * step. The cut picture is kept and plotted again until the image, its
++ * size or its corners change. Animated images are not kept.
++ */
++#define HTML_CUT_CACHE_N 16
++#define HTML_CUT_CACHE_BYTES (2 * 1024 * 1024)
++
++struct html_cut_entry {
++	struct nsurl *url;		/**< the image's address, kept */
++	struct bitmap *src;		/**< the image's own bitmap */
++	struct bitmap *bm;		/**< the cut picture */
++	int w, h;			/**< its size */
++	int dx, dy, dw, dh;		/**< the image's place in it */
++	struct html_corner_radii r;
++	bool ellipse;
++	unsigned int used;		/**< for dropping the oldest */
++};
++
++static struct html_cut_entry html_cut_cache[HTML_CUT_CACHE_N];
++static unsigned int html_cut_clock;
++
++static void html_cut_drop(struct html_cut_entry *e)
++{
++	if (e->bm != NULL)
++		guit->bitmap->destroy(e->bm);
++	if (e->url != NULL)
++		nsurl_unref(e->url);
++	memset(e, 0, sizeof(*e));
++}
++
++/**
++ * Plot an image cut to a rounded shape from the kept pictures, making
++ * it if it is not kept (VitaSurf).
++ *
++ * \return true if it was plotted this way, with *ok its result; false
++ *         if it cannot be kept, and nothing was plotted
++ */
++static bool html_composite_object_kept(const struct redraw_context *ctx,
++		struct hlcache_handle *obj, const struct content_redraw_data *d,
++		const struct rect *area, float scale,
++		const struct html_shape *s, bool *ok)
++{
++	struct html_cut_entry *e = NULL;
++	struct bitmap *src;
++	struct nsurl *url;
++	lwc_string *mime;
++	int w = area->x1 - area->x0, h = area->y1 - area->y0;
++	size_t need = (size_t) w * h * 4;
++	int i;
++
++	if (!ctx->interactive || scale != 1.0f || w <= 0 || h <= 0 ||
++			need > HTML_CUT_CACHE_BYTES / 2)
++		return false;
++	src = content_get_bitmap(obj);
++	url = hlcache_handle_get_url(obj);
++	if (src == NULL || url == NULL)
++		return false;
++	mime = content_get_mime_type(obj);
++	if (mime != NULL) {
++		bool gif = lwc_string_length(mime) == 9 &&
++				strncasecmp(lwc_string_data(mime),
++					"image/gif", 9) == 0;
++
++		lwc_string_unref(mime);
++		if (gif)
++			return false;
++	}
++
++	/* kept already? */
++	for (i = 0; i < HTML_CUT_CACHE_N && e == NULL; i++) {
++		struct html_cut_entry *c = &html_cut_cache[i];
++
++		if (c->bm != NULL && c->src == src && c->w == w &&
++				c->h == h &&
++				c->dx == d->x - area->x0 &&
++				c->dy == d->y - area->y0 &&
++				c->dw == d->width && c->dh == d->height &&
++				c->ellipse == s->ellipse &&
++				memcmp(&c->r, &s->r, sizeof(c->r)) == 0 &&
++				nsurl_compare(c->url, url, NSURL_COMPLETE))
++			e = c;
++	}
++
++	if (e == NULL) {
++		struct html_composite_object ow = { obj, d };
++		struct bitmap *bm = NULL;
++		int ox = 0, oy = 0;
++
++		/* a free place and room for it, the oldest going first */
++		while (e == NULL) {
++			struct html_cut_entry *free_slot = NULL, *lru = NULL;
++			size_t held = 0;
++
++			for (i = 0; i < HTML_CUT_CACHE_N; i++) {
++				struct html_cut_entry *c = &html_cut_cache[i];
++
++				if (c->bm == NULL) {
++					if (free_slot == NULL)
++						free_slot = c;
++					continue;
++				}
++				held += (size_t) c->w * c->h * 4;
++				if (lru == NULL || c->used < lru->used)
++					lru = c;
++			}
++			if (free_slot != NULL &&
++					held + need <= HTML_CUT_CACHE_BYTES) {
++				e = free_slot;
++			} else if (lru != NULL) {
++				html_cut_drop(lru);
++			} else {
++				return false;
++			}
++		}
++		if (!html_composite_raster(area, area, scale,
++				html_composite_object_draw, &ow, &bm, &ox,
++				&oy) || bm == NULL)
++			return false;
++		html_shape_apply(bm, ox, oy, s);
++		e->url = nsurl_ref(url);
++		e->src = src;
++		e->bm = bm;
++		e->w = w;
++		e->h = h;
++		e->dx = d->x - area->x0;
++		e->dy = d->y - area->y0;
++		e->dw = d->width;
++		e->dh = d->height;
++		e->r = s->r;
++		e->ellipse = s->ellipse;
++	}
++	e->used = ++html_cut_clock;
++
++	*ok = ctx->plot->bitmap(ctx, e->bm, area->x0, area->y0, w, h, 0,
++			BITMAPF_NONE) == NSERROR_OK;
++	/* plotted now, while it is surely kept */
++	if (ctx->plot->flush != NULL)
++		ctx->plot->flush(ctx);
++	return true;
++}
++
++
+ /** A box's children, or the box itself, painted aside (VitaSurf). */
+ struct html_composite_boxes {
+ 	const html_content *html;
+@@ -7413,8 +7716,19 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				oshape.x0, oshape.y0, oshape.x1, oshape.y1
+ 			};
+ 
+-			if (!html_composite(ctx, &oarea, &r, scale, &oshape,
+-					html_composite_object_draw, &ow, &odone))
++			bool kept_ok = true;
++
++			if (html_shape_corner_in(&oshape, &r) &&
++					html_composite_object_kept(ctx,
++						box->object, &obj_data,
++						&oarea, scale, &oshape,
++						&kept_ok)) {
++				if (!kept_ok)
++					return false;
++				odone = true;
++			} else if (!html_composite(ctx, &oarea, &r, scale,
++					&oshape, html_composite_object_draw, &ow,
++					&odone))
+ 				return false;
+ 		}
+ 
+diff --git a/content/handlers/html/redraw_border.c b/content/handlers/html/redraw_border.c
+index fe89e650b..d694f7e27 100644
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -1627,6 +1627,39 @@ rounded_ring_smooth(const struct redraw_context *ctx, colour c,
+ }
+ #undef CORNER
+ 
++/* exported interface documented in html/private.h */
++nserror
++html_plot_rounded_ring(const struct redraw_context *ctx, colour c,
++		       const struct rect *r,
++		       const struct html_corner_radii *radii, int bw)
++{
++	nserror res = NSERROR_OK;
++	plot_style_t style = {
++		.stroke_type = PLOT_OP_TYPE_SOLID,
++		.fill_type = PLOT_OP_TYPE_NONE,
++		.stroke_colour = c,
++		.stroke_width = plot_style_int_to_fixed(bw),
++	};
++	struct rect centre;
++	struct html_corner_radii mid = *radii;
++
++	if (bw <= 0)
++		return NSERROR_OK;
++	if (rounded_ring_smooth(ctx, c, r, radii, bw, &res))
++		return res;
++
++	/* a stroke along the middle of the ring */
++	centre.x0 = r->x0 + bw / 2;
++	centre.y0 = r->y0 + bw / 2;
++	centre.x1 = r->x1 - (bw - bw / 2);
++	centre.y1 = r->y1 - (bw - bw / 2);
++#define MID(v) do { (v) -= bw / 2; if ((v) < 0) (v) = 0; } while (0)
++	MID(mid.tl_h); MID(mid.tl_v); MID(mid.tr_h); MID(mid.tr_v);
++	MID(mid.br_h); MID(mid.br_v); MID(mid.bl_h); MID(mid.bl_v);
++#undef MID
++	return html_plot_rounded_stroke(ctx, &style, &centre, &mid);
++}
++
+ /**
+  * Fill a rounded rectangle.
+  */
+diff --git a/content/handlers/image/image_cache.c b/content/handlers/image/image_cache.c
+index 5cdc8379b..c2d411caf 100644
+--- a/content/handlers/image/image_cache.c
++++ b/content/handlers/image/image_cache.c
+@@ -1145,6 +1145,19 @@ static void image_cache_defer(const struct content_redraw_data *data,
+ 		/* nothing of it shows: nothing to come back for */
+ 		return;
+ 	}
++	/*
++	 * The whole image is come back for, not the strip this redraw
++	 * covered (VitaSurf). Scrolling draws the page a strip at a time,
++	 * so a poster still being decoded was left out in a dozen strips,
++	 * and each was drawn again on its own once it was ready, over as
++	 * many frames: the poster came in a band at a time.
++	 */
++	if (!data->repeat_x && !data->repeat_y) {
++		r.x0 = data->x;
++		r.y0 = data->y;
++		r.x1 = data->x + data->width;
++		r.y1 = data->y + data->height;
++	}
+ 	if (raster.active) {
+ 		/* where the bitmap it was painted into lands */
+ 		r.x0 += raster.ox;
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index eabdb3afb..c8afa3d05 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -672,6 +672,15 @@ fb_pan(fbtk_widget_t *widget,
+ 			int x0 = r->x0 - x, y0 = r->y0 - y;
+ 			int x1 = r->x1 - x, y1 = r->y1 - y;
+ 
++			/* one that reaches the screen by a pixel at most, as
++			 * Yamtrack's sidebar does when moved off to the left,
++			 * shows nothing there: drawing it again drew a strip
++			 * of the page as tall as the screen (VitaSurf) */
++			if ((x1 < width ? x1 : width) - (x0 > 0 ? x0 : 0) <= 1 ||
++			    (y1 < height ? y1 : height) - (y0 > 0 ? y0 : 0) <=
++					1) {
++				continue;
++			}
+ 			if (hold > 0 && r->x0 == held_pin.x0 &&
+ 					r->y0 == held_pin.y0 &&
+ 					r->x1 == held_pin.x1 &&
+diff --git a/frontends/monkey/browser.c b/frontends/monkey/browser.c
+index 6ca0452b7..4ca0836b9 100644
+--- a/frontends/monkey/browser.c
++++ b/frontends/monkey/browser.c
+@@ -745,6 +745,32 @@ monkey_window_handle_command(int argc, char **argv)
+ 		}
+ 		browser_window_mouse_track(gw->bw, 0, atoi(argv[5]),
+ 				atoi(argv[7]));
++	} else if (strcmp(argv[1], "PINS") == 0) {
++		/* `WINDOW PINS WIN` _%id%_: where the pinned boxes were
++		 * last drawn (VitaSurf) */
++		struct gui_window *gw;
++		struct rect area, r[32];
++		int i, n;
++
++		if (argc != 4) {
++			moutf(MOUT_ERROR, "WINDOW PINS ARGS BAD\n");
++			return;
++		}
++		gw = monkey_find_window_by_num(atoi(argv[3]));
++		if (gw == NULL) {
++			moutf(MOUT_ERROR, "WINDOW NUM BAD");
++			return;
++		}
++		area.x0 = -100;
++		area.y0 = -100;
++		area.x1 = gw->width + 100;
++		area.y1 = gw->height + 100;
++		n = html_pinned_rects(browser_window_get_content(gw->bw),
++				&area, r, 32);
++		moutf(MOUT_WINDOW, "PINS WIN %d COUNT %d", gw->win_num, n);
++		for (i = 0; i < n; i++)
++			moutf(MOUT_WINDOW, "PIN %d %d %d %d", r[i].x0,
++					r[i].y0, r[i].x1, r[i].y1);
+ 	} else if (strcmp(argv[1], "HELD") == 0) {
+ 		/* `WINDOW HELD WIN` _%id%_ `DY` _%num%_: whether a pan by
+ 		 * DY could leave a pinned header's pixels in place, and
