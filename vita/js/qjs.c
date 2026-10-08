@@ -1084,6 +1084,8 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
 static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
+static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv);
 static bool is_budget_interrupt(JSContext *ctx, JSValueConst v);
 
 static void qjs_report_exception_src(JSContext *ctx, const char *name,
@@ -13883,6 +13885,9 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaModuleState", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaDomGen",
 			  JS_NewCFunction(ctx, win_vita_dom_gen, "__vitaDomGen", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaSourceExcerpt",
+			  JS_NewCFunction(ctx, win_vita_source_excerpt,
+					  "__vitaSourceExcerpt", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaSetSheetText",
 			  JS_NewCFunction(ctx, win_vita_set_sheet_text,
 					  "__vitaSetSheetText", 2));
@@ -16374,6 +16379,81 @@ static bool script_is(const struct html_script *sc, const char *url)
 		return true;
 	}
 	return sc->asked != NULL && strcmp(nsurl_access(sc->asked), url) == 0;
+}
+
+/*
+ * The source around a position in one of the page's scripts, for the log
+ * (VitaSurf): __vitaSourceExcerpt(url, line, column). An error thrown in
+ * a timer or an event handler is reported with its stack alone, and the
+ * frame names in a minified script say nothing; the code around the
+ * column says what the failing line was doing. "" when the script is not
+ * the page's or the position is not in it.
+ */
+static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *url;
+	uint32_t line = 0, col = 0;
+	const uint8_t *src = NULL;
+	size_t len = 0, i, start = 0, pos, from, to, n = 0;
+	char buf[200];
+	unsigned int k;
+
+	(void)this_val;
+	if (argc < 3 || thread == NULL || thread->htmlc == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	if (JS_ToUint32(ctx, &line, argv[1]) < 0 ||
+	    JS_ToUint32(ctx, &col, argv[2]) < 0 || line == 0) {
+		return JS_NewString(ctx, "");
+	}
+	url = JS_ToCString(ctx, argv[0]);
+	if (url == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	for (k = 0; k < thread->htmlc->scripts_count && src == NULL; k++) {
+		struct html_script *sc = &thread->htmlc->scripts[k];
+
+		if (script_is(sc, url) &&
+		    content_get_status(sc->data.handle) ==
+				CONTENT_STATUS_DONE) {
+			src = content_get_source_data(sc->data.handle, &len);
+		}
+	}
+	JS_FreeCString(ctx, url);
+	if (src == NULL || len == 0) {
+		return JS_NewString(ctx, "");
+	}
+	for (i = 0; i < len && line > 1; i++) {
+		if (src[i] == '\n') {
+			line--;
+			start = i + 1;
+		}
+	}
+	if (line > 1) {
+		return JS_NewString(ctx, "");
+	}
+	pos = start + (col > 0 ? col - 1 : 0);
+	if (pos > len) {
+		return JS_NewString(ctx, "");
+	}
+	from = pos > 100 ? pos - 100 : 0;
+	if (from < start) from = start;
+	to = pos + 60 < len ? pos + 60 : len;
+	for (i = from; i < to && n < sizeof(buf) - 8; i++) {
+		char c = (char)src[i];
+
+		if (c == '\n') break;
+		if (i == pos) {
+			/* where the column points */
+			buf[n++] = '>';
+			buf[n++] = '>';
+		}
+		buf[n++] = (c == '\t' || c == '\r') ? ' ' : c;
+	}
+	buf[n] = 0;
+	return JS_NewString(ctx, buf);
 }
 
 static enum mod_src module_source(jsthread *thread, const char *url,

@@ -7315,6 +7315,9 @@ function describeThrown(v){
   return String(v);
  }catch(e2){return '(unprintable)';}
 }
+/* kept here and not left on window, where no browser has it */
+var SRC_EXCERPT=null;
+try{SRC_EXCERPT=W.__vitaSourceExcerpt||null;delete W.__vitaSourceExcerpt;}catch(e){}
 W.__vitaReportError=function(err,where){
  var msg='';
  try{msg=(err&&err.message)?String(err.message):String(err);}catch(e){msg='Script error.';}
@@ -7347,8 +7350,13 @@ W.__vitaReportError=function(err,where){
   try{var w=where?String(where):'';
    if(w&&w.indexOf('://')<0&&w.charAt(0)!=='/'&&w!==String(location.href))from=w;
   }catch(e7){}
+  /* the code the position points into (VitaSurf), for an error from a
+     timer or a handler, whose stack alone names only minified frames */
+  var near='';
+  try{if(line&&SRC_EXCERPT){
+   near=SRC_EXCERPT(file,line,col);if(near)near=' | near: '+near;}}catch(e8){}
   try{console.error('uncaught'+(from?' in '+from:'')+': '+describeThrown(err)+
-   (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}}
+   (file?' ('+file+':'+line+':'+col+')':'')+near);}catch(e6){}}
  return handled;};
 /* An unhandled promise rejection, reported the same way. QuickJS hands
  * these to the tracker qjs.c installs.
