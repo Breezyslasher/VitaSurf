@@ -1394,7 +1394,8 @@ W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:fal
 /* Indexed by the libcss enum, which starts its values at 1. */
 var CS_DISPLAY=['','inline','block','list-item','run-in','inline-block','table','inline-table',
  'table-row-group','table-header-group','table-footer-group','table-row','table-column-group',
- 'table-column','table-cell','table-caption','none','flex','inline-flex','grid','inline-grid','contents'];
+ 'table-column','table-cell','table-caption','none','flex','inline-flex','grid','inline-grid','contents',
+ 'flow-root','-webkit-box','-webkit-inline-box'];
 var CS_VIS=['','visible','hidden','collapse'];
 var CS_DEFAULTS={
  display:'block',visibility:'visible',opacity:'1',position:'static',float:'none',clear:'none',

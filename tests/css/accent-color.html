@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- accent-color (VitaSurf): a checked checkbox is filled with it and
+     marked in white or black, whichever stands out; a checked radio's
+     dot takes it. auto keeps the browser's own look. -->
+<html><head><title>accent-color</title><style>
+.g { accent-color: #0a0 } .y { accent-color: #fd0 } .c { color: #c00; accent-color: currentcolor }
+</style></head><body>
+<input type="checkbox" checked> auto
+<input type="checkbox" class="g" checked> green
+<input type="checkbox" class="y" checked> yellow
+<input type="checkbox" class="g"> unchecked
+<input type="radio" class="g" checked> radio
+<input type="radio" class="c" checked> current
+</body></html>

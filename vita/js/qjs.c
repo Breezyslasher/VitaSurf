@@ -11233,7 +11233,8 @@ static const char *const sm_display[] = { NULL, "inline", "block",
 	"table-row-group", "table-header-group", "table-footer-group",
 	"table-row", "table-column-group", "table-column", "table-cell",
 	"table-caption", "none", "flex", "inline-flex", "grid",
-	"inline-grid", "contents" };
+	"inline-grid", "contents", "flow-root", "-webkit-box",
+	"-webkit-inline-box" };
 static const char *const sm_position[] = { NULL, "static", "relative",
 	"absolute", "fixed", "sticky" };
 static const char *const sm_float[] = { NULL, "left", "right", "none" };

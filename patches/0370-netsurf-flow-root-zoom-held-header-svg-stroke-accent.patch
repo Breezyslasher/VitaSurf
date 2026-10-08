@@ -1,0 +1,1051 @@
+diff --git a/content/handlers/css/utils.h b/content/handlers/css/utils.h
+index cc75f9eb0..9fe8c3e5f 100644
+--- a/content/handlers/css/utils.h
++++ b/content/handlers/css/utils.h
+@@ -26,6 +26,34 @@
+ /** DPI of the screen, in fixed point units */
+ extern css_fixed nscss_screen_dpi;
+ 
++/**
++ * The display a box is laid out with, for the values libcss keeps apart
++ * but layout treats as others (VitaSurf): flow-root is a block, which
++ * box_construct makes a formatting context of its own, and the old
++ * WebKit box is a flex container, or with -webkit-line-clamp the
++ * clamped block that pattern means in every browser.
++ */
++static inline uint8_t ns_display_for_layout(
++		const css_computed_style *style, uint8_t value)
++{
++	css_fixed clamp;
++
++	switch (value) {
++	case CSS_DISPLAY_FLOW_ROOT:
++		return CSS_DISPLAY_BLOCK;
++	case CSS_DISPLAY_WEBKIT_BOX:
++		return css_computed_line_clamp(style, &clamp) ==
++				CSS_LINE_CLAMP_SET ? CSS_DISPLAY_BLOCK :
++				CSS_DISPLAY_FLEX;
++	case CSS_DISPLAY_WEBKIT_INLINE_BOX:
++		return css_computed_line_clamp(style, &clamp) ==
++				CSS_LINE_CLAMP_SET ? CSS_DISPLAY_INLINE_BLOCK :
++				CSS_DISPLAY_INLINE_FLEX;
++	default:
++		return value;
++	}
++}
++
+ /**
+  * Temporary helper wrappers for for libcss computed style getter, while
+  * we don't support all values of display.
+@@ -36,7 +64,7 @@ static inline uint8_t ns_computed_display(
+ 	uint8_t value = css_computed_display(style, root);
+ 
+ 	/* VitaSurf lays out grid and inline-grid (layout_grid.c) */
+-	return value;
++	return ns_display_for_layout(style, value);
+ }
+ 
+ /**
+@@ -49,7 +77,7 @@ static inline uint8_t ns_computed_display_static(
+ 	uint8_t value = css_computed_display_static(style);
+ 
+ 	/* VitaSurf lays out grid and inline-grid (layout_grid.c) */
+-	return value;
++	return ns_display_for_layout(style, value);
+ }
+ 
+ static inline uint8_t ns_computed_min_height(
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index c58eda9a2..9a9f16b08 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -45,6 +45,7 @@
+ #include "utils/nsurl.h"
+ #include "netsurf/plot_style.h"
+ #include "css/hints.h"
++#include "css/utils.h"
+ #include "desktop/frame_types.h"
+ #include "content/content_factory.h"
+ 
+@@ -566,7 +567,7 @@ static bool
+ box_input_text(html_content *html, struct box *box, struct dom_node *node)
+ {
+ 	struct box *inline_container, *inline_box;
+-	uint8_t display = css_computed_display_static(box->style);
++	uint8_t display = ns_computed_display_static(box->style);
+ 
+ 	switch (display) {
+ 	case CSS_DISPLAY_GRID:
+@@ -2101,6 +2102,85 @@ static bool svg_paint_value(uint8_t type, css_color colour,
+ 	return true;
+ }
+ 
++/* the stroke geometry a style can write over the markup's (VitaSurf) */
++static const char *const svg_geometry_names[] = {
++	"stroke-dasharray", "stroke-dashoffset", "stroke-linecap",
++	"stroke-linejoin", "stroke-miterlimit"
++};
++#define SVG_GEOMETRY_N 5
++
++/**
++ * Write the stroke geometry the stylesheet gives, each bit of *wrote
++ * saying which (VitaSurf). Initial values are left out, as stroke-width's
++ * is: a style that never mentioned them reads the same, and the
++ * markup's own attribute then stands.
++ */
++static void svg_geometry_attributes(struct svg_buf *b,
++				    const css_computed_style *style,
++				    unsigned int *wrote)
++{
++	static const char *const caps[] = { NULL, "butt", "round", "square" };
++	static const char *const joins[] = { NULL, "miter", "round", "bevel",
++		"miter-clip", "arcs" };
++	lwc_string *dashes = NULL;
++	css_fixed v = 0;
++	css_unit unit = CSS_UNIT_PX;
++	uint8_t t;
++	char w[64];
++
++	if (css_computed_stroke_dasharray(style, &dashes) ==
++			CSS_STROKE_DASHARRAY_SET && dashes != NULL) {
++		svg_buf_lit(b, " stroke-dasharray=\"");
++		svg_buf_escaped(b, lwc_string_data(dashes),
++				lwc_string_length(dashes));
++		svg_buf_lit(b, "\"");
++		*wrote |= 1u << 0;
++	}
++	if (css_computed_stroke_dashoffset(style, &v, &unit) ==
++			CSS_STROKE_DASHOFFSET_SET && v != 0 &&
++			unit == CSS_UNIT_PX) {
++		snprintf(w, sizeof(w), " stroke-dashoffset=\"%s%d.%03d\"",
++				v < 0 ? "-" : "", abs(FIXTOINT(v)),
++				(int) ((abs(v) & 0x3ff) * 1000 / 1024));
++		svg_buf_lit(b, w);
++		*wrote |= 1u << 1;
++	}
++	t = css_computed_stroke_linecap(style);
++	if (t > CSS_STROKE_LINECAP_BUTT && t <= CSS_STROKE_LINECAP_SQUARE) {
++		snprintf(w, sizeof(w), " stroke-linecap=\"%s\"", caps[t]);
++		svg_buf_lit(b, w);
++		*wrote |= 1u << 2;
++	}
++	t = css_computed_stroke_linejoin(style);
++	if (t > CSS_STROKE_LINEJOIN_MITER && t <= CSS_STROKE_LINEJOIN_ARCS) {
++		snprintf(w, sizeof(w), " stroke-linejoin=\"%s\"", joins[t]);
++		svg_buf_lit(b, w);
++		*wrote |= 1u << 3;
++	}
++	if (css_computed_stroke_miterlimit(style, &v) ==
++			CSS_STROKE_MITERLIMIT_SET && v != INTTOFIX(4)) {
++		snprintf(w, sizeof(w), " stroke-miterlimit=\"%d.%03d\"",
++				FIXTOINT(v), (int) ((v & 0x3ff) * 1000 / 1024));
++		svg_buf_lit(b, w);
++		*wrote |= 1u << 4;
++	}
++}
++
++/** Whether an attribute is one of the stroke geometry written (VitaSurf). */
++static bool svg_geometry_written(const char *name, size_t len,
++				 unsigned int wrote)
++{
++	int i;
++
++	for (i = 0; i < SVG_GEOMETRY_N; i++) {
++		if ((wrote & (1u << i)) &&
++		    strlen(svg_geometry_names[i]) == len &&
++		    strncmp(svg_geometry_names[i], name, len) == 0)
++			return true;
++	}
++	return false;
++}
++
+ /** Write fill and stroke from the style, and say which ones it wrote. */
+ static void svg_paint_attributes(struct svg_buf *b,
+ 				 const css_computed_style *style,
+@@ -2210,6 +2290,7 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 	uint32_t i, n = 0;
+ 	bool wrote_fill = false, wrote_stroke = false;
+ 	bool wrote_stroke_width = false;
++	unsigned int wrote_geometry = 0;
+ 
+ 	if (root) {
+ 		/*
+@@ -2224,6 +2305,8 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 			       " xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+ 		svg_paint_attributes(b, style, &wrote_fill, &wrote_stroke,
+ 				     &wrote_stroke_width);
++		if (style != NULL)
++			svg_geometry_attributes(b, style, &wrote_geometry);
+ 	}
+ 
+ 	exc = dom_node_get_attributes(node, &attrs);
+@@ -2256,7 +2339,8 @@ static void svg_serialise_attributes(struct svg_buf *b, dom_node *node,
+ 			    !(wrote_stroke && nl == 6 &&
+ 			      strncmp(nd, "stroke", 6) == 0) &&
+ 			    !(wrote_stroke_width && nl == 12 &&
+-			      strncmp(nd, "stroke-width", 12) == 0)) {
++			      strncmp(nd, "stroke-width", 12) == 0) &&
++			    !svg_geometry_written(nd, nl, wrote_geometry)) {
+ 				svg_buf_lit(b, " ");
+ 				svg_buf_append(b, nd, nl);
+ 				svg_buf_lit(b, "=\"");
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 0f24773c4..16679a08e 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -2918,6 +2918,234 @@ int html_pinned_rects(struct hlcache_handle *h, const struct rect *area,
+ 	return n;
+ }
+ 
++/** Whether a box has rounded corners (VitaSurf). */
++static bool html_held_rounded(const css_computed_style *style)
++{
++	uint8_t (*get[4])(const css_computed_style *, css_fixed *,
++			css_unit *, css_fixed *, css_unit *) = {
++		css_computed_border_top_left_radius,
++		css_computed_border_top_right_radius,
++		css_computed_border_bottom_right_radius,
++		css_computed_border_bottom_left_radius
++	};
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		css_fixed h = 0, v = 0;
++		css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
++
++		get[i](style, &h, &hu, &v, &vu);
++		if (h != 0 || v != 0)
++			return true;
++	}
++	return false;
++}
++
++/**
++ * Whether a box is painted as it is laid out, with nothing between it
++ * and the screen (VitaSurf): no opacity, filter, transform, blend, clip
++ * or mask, and no stacking context of its own other than a z-index.
++ */
++static bool html_held_plain(html_content *c, const struct box *b)
++{
++	const css_computed_style *style = b->style;
++	css_fixed op = INTTOFIX(1);
++	lwc_string *str = NULL;
++	css_fixed f[4];
++	css_unit u[4];
++	float m[4];
++	int ox, oy;
++
++	if (css_computed_opacity(style, &op) == CSS_OPACITY_SET &&
++			op < INTTOFIX(1))
++		return false;
++	if (b->filter != NULL)
++		return false;
++	if (box_transform(&c->unit_len_ctx, b, m, &ox, &oy))
++		return false;
++	if (css_computed_mix_blend_mode(style) != CSS_MIX_BLEND_MODE_NORMAL &&
++			css_computed_mix_blend_mode(style) !=
++					CSS_MIX_BLEND_MODE_INHERIT)
++		return false;
++	if (css_computed_backdrop_filter(style, &str) ==
++			CSS_BACKDROP_FILTER_SET)
++		return false;
++	str = NULL;
++	if (css_computed_mask_image(style, &str) != CSS_MASK_IMAGE_NONE &&
++			str != NULL)
++		return false;
++	if (css_computed_clip_path(style, &f[0], &u[0], &f[1], &u[1],
++			&f[2], &u[2], &f[3], &u[3]) != CSS_CLIP_PATH_NONE)
++		return false;
++	return true;
++}
++
++/**
++ * Whether anything outside box b could be painted over it (VitaSurf): a
++ * positioned box with a z-index as high as its own among the root's
++ * layers. Asked of the whole tree, since a positioned box takes its
++ * place there wherever it is in it, unless a stacking context round it
++ * keeps it in its own: Yamtrack's cards hold z-10 buttons inside an
++ * overlay at opacity 0, which stay under its z-10 header.
++ */
++static bool html_held_covered(html_content *c, const struct box *b,
++		int32_t z)
++{
++	struct box *x = c->layout;
++
++	while (x != NULL) {
++		bool skip = (x == b);
++
++		if (!skip && x->style != NULL) {
++			uint8_t pos = css_computed_position(x->style);
++			int32_t xz = 0;
++
++			if (pos != CSS_POSITION_STATIC &&
++					css_computed_z_index(x->style, &xz) ==
++						CSS_Z_INDEX_SET) {
++				/* a pinned one is drawn again where it is */
++				if (xz >= z && pos != CSS_POSITION_STICKY &&
++						pos != CSS_POSITION_FIXED)
++					return true;
++				skip = true;
++			} else if (x != c->layout && !html_held_plain(c, x)) {
++				/* a context of its own, among the root's
++				 * layers at zero */
++				skip = true;
++			}
++		}
++		if (!skip && x->children != NULL) {
++			x = x->children;
++		} else {
++			while (x != NULL && x->next == NULL)
++				x = x->parent;
++			if (x != NULL)
++				x = x->next;
++		}
++	}
++	return false;
++}
++
++/* exported interface documented in html/html.h */
++bool html_pinned_held(struct hlcache_handle *h, const struct rect *view,
++		int scroll_y, int dy, struct rect *held, struct rect *pin)
++{
++	html_content *c;
++	int i;
++
++	if (h == NULL || content_get_type(h) != CONTENT_HTML || dy == 0)
++		return false;
++	c = (html_content *) hlcache_handle_get_content(h);
++	if (c == NULL || c->layout == NULL || c->reflowing ||
++			c->visible_select_menu != NULL ||
++			c->pinned_boxes > c->pinned_alloc)
++		return false;
++
++	for (i = 0; i < c->pinned_boxes; i++) {
++		struct box *b = c->pinned[i];
++		const struct box *a;
++		css_color bg = 0;
++		lwc_string *img = NULL;
++		uint8_t pos;
++		int32_t z = 0;
++		int px, py, top;
++
++		if (b == NULL || !b->pin_drawn || b->style == NULL ||
++				(b->flags & ANCHORED) || b->parent == NULL)
++			continue;
++		/* drawn across the top edge of the view, and all of it */
++		if (b->pin_x0 > view->x0 || b->pin_x1 < view->x1 ||
++				b->pin_y0 > view->y0 || b->pin_y1 <= view->y0)
++			continue;
++		if (b->type != BOX_BLOCK && b->type != BOX_FLEX)
++			continue;
++
++		/* above the page's own layers */
++		pos = css_computed_position(b->style);
++		if (css_computed_z_index(b->style, &z) != CSS_Z_INDEX_SET ||
++				z <= 0)
++			continue;
++
++		/* an opaque background over the whole border box, and no
++		 * top border to fall between */
++		css_computed_background_color(b->style, &bg);
++		if ((bg >> 24) != 0xff || b->background != NULL ||
++				(css_computed_background_image(b->style, &img) !=
++					CSS_BACKGROUND_IMAGE_NONE &&
++				 img != NULL) ||
++				b->border[TOP].width != 0 ||
++				html_held_rounded(b->style) ||
++				!html_held_plain(c, b))
++			continue;
++
++		/* nothing round it that turns, fades or scrolls */
++		for (a = b->parent; a != NULL; a = a->parent) {
++			uint8_t apos;
++			int32_t az = 0;
++
++			if (a->style == NULL)
++				continue;
++			apos = css_computed_position(a->style);
++			if (apos == CSS_POSITION_STICKY ||
++					apos == CSS_POSITION_FIXED ||
++					(apos != CSS_POSITION_STATIC &&
++					 css_computed_z_index(a->style, &az) ==
++						CSS_Z_INDEX_SET) ||
++					scrollbar_get_offset(a->scroll_y) != 0 ||
++					scrollbar_get_offset(a->scroll_x) != 0 ||
++					!html_held_plain(c, a))
++				break;
++		}
++		if (a != NULL)
++			continue;
++
++		/* where the scroll leaves it: a fixed box stays; a sticky
++		 * one stays while it is held at its offset either side of
++		 * the move */
++		if (pos == CSS_POSITION_STICKY) {
++			int now, then;
++
++			box_coords(b->parent, &px, &py);
++			now = html_sticky_shift_at(c, b, py, scroll_y,
++					view->y1 - view->y0);
++			then = html_sticky_shift_at(c, b, py, scroll_y + dy,
++					view->y1 - view->y0);
++			if (now == 0 || then - now != dy)
++				continue;
++		} else if (pos != CSS_POSITION_FIXED) {
++			continue;
++		}
++
++		if (html_held_covered(c, b, z))
++			continue;
++
++		/* the rows its background fills: the pin rectangle is
++		 * where its descendants reach, so its padding box is
++		 * worked out from where it was drawn */
++		top = b->pin_y0 + (box_overflow_y(b) != CSS_OVERFLOW_VISIBLE ?
++				0 : -b->descendant_y0);
++		if (box_overflow_y(b) != CSS_OVERFLOW_VISIBLE)
++			top += b->border[TOP].width;
++		if (top > view->y0)
++			continue;
++		held->x0 = view->x0;
++		held->x1 = view->x1;
++		held->y0 = view->y0;
++		held->y1 = top + b->padding[TOP] + b->height +
++				b->padding[BOTTOM];
++		if (held->y1 > view->y1)
++			held->y1 = view->y1;
++		if (held->y1 <= held->y0)
++			continue;
++		pin->x0 = b->pin_x0;
++		pin->y0 = b->pin_y0;
++		pin->x1 = b->pin_x1;
++		pin->y1 = b->pin_y1;
++		return true;
++	}
++	return false;
++}
++
+ bool html_pins_to_viewport(hlcache_handle *h)
+ {
+ 	html_content *c;
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index d93748a79..e1ecaf689 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -236,6 +236,25 @@ bool html_pins_to_viewport(struct hlcache_handle *h);
+ int html_pinned_rects(struct hlcache_handle *h, const struct rect *area,
+ 		struct rect *out, int max);
+ 
++/**
++ * Whether scrolling by dy can leave a pinned box's pixels where they
++ * are (VitaSurf): an opaque box across the top of the view, painted
++ * over everything that moves, that the scroll does not move. A pan
++ * then moves only what is below it, and draws again only the edge it
++ * casts its shadow over, instead of the box and all that lies under it.
++ *
++ * \param h         The content
++ * \param view      The view, in screen coordinates
++ * \param scroll_y  The scroll offset before the move
++ * \param dy        The move, in content px
++ * \param held      Set to the rows of the screen that stay as they are
++ * \param pin       Set to where the box was last drawn, as
++ *                  html_pinned_rects() gives it
++ * \return true if a box is held
++ */
++bool html_pinned_held(struct hlcache_handle *h, const struct rect *view,
++		int scroll_y, int dy, struct rect *held, struct rect *pin);
++
+ /**
+  * set filename on a file gadget
+  *
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index d0ab1dace..33066ccef 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1379,6 +1379,7 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 					(box->style &&
+ 					box_overflow_contains(
+ 						box_overflow_y(box))) ||
++					lh__box_is_flow_root(box) ||
+ 					(box->type == BOX_INLINE_CONTAINER &&
+ 					!box_is_first_child(box))) {
+ 				/* Collapse to this box; return it */
+@@ -1391,7 +1392,8 @@ layout_next_margin_block(const css_unit_ctx *unit_len_ctx,
+ 		if (box->type == BOX_BLOCK && !box->object && box->children &&
+ 				box->style &&
+ 				!box_overflow_contains(
+-					box_overflow_y(box))) {
++					box_overflow_y(box)) &&
++				!lh__box_is_flow_root(box)) {
+ 			/* Down into children. */
+ 			box = box->children;
+ 		} else {
+@@ -4328,6 +4330,7 @@ bool layout_block_context_single(
+ 					box->style &&
+ 					(box_overflow_contains(overflow_x) ||
+ 					 box_overflow_contains(overflow_y) ||
++					 lh__box_is_flow_root(box) ||
+ 					 lh__box_is_multicol(box) ||
+ 					 box_vertical(box) != 0)) {
+ 				/* box establishes new block formatting context
+@@ -4441,6 +4444,7 @@ bool layout_block_context_single(
+ 				(box->type == BOX_BLOCK && box->style &&
+ 				 (box_overflow_contains(overflow_x) ||
+ 				  box_overflow_contains(overflow_y) ||
++				  lh__box_is_flow_root(box) ||
+ 				  lh__box_is_multicol(box) ||
+ 				  box_vertical(box) != 0))) {
+ 
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index d8db895aa..20492cbd9 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -247,6 +247,19 @@ static inline bool lh__box_is_multicol(const struct box *b)
+ 			CSS_COLUMN_WIDTH_SET;
+ }
+ 
++/**
++ * Layout helper: whether a block is display: flow-root (VitaSurf), a
++ * block that is its own formatting context, as overflow other than
++ * visible makes one: it holds its floats, and its children's margins do
++ * not collapse through it. It replaced the clearfix hack.
++ */
++static inline bool lh__box_is_flow_root(const struct box *b)
++{
++	return b->type == BOX_BLOCK && b->style != NULL &&
++			css_computed_display_static(b->style) ==
++			CSS_DISPLAY_FLOW_ROOT;
++}
++
+ /** Layout helper: Check whether box is a grid container (VitaSurf). */
+ static inline bool lh__box_is_grid_container(const struct box *b)
+ {
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index d1b0a0d53..5c94712d0 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -796,4 +796,18 @@ void html_scroll_anchor_free(html_content *htmlc);
+  */
+ css_select_ctx *html_select_ctx_early(html_content *c);
+ 
++/**
++ * How far a position: sticky box is shifted down with the viewport at
++ * view_y (VitaSurf), as it is drawn there; see html_sticky_offset().
++ *
++ * \param html      Content the box belongs to
++ * \param box       The sticky box
++ * \param y_parent  Top of the parent's padding box, in content px
++ * \param view_y    Top of the viewport, in content px
++ * \param view_h    Height of the viewport
++ * \return the shift to add to box->y, in content px
++ */
++int html_sticky_shift_at(const html_content *html, struct box *box,
++		int y_parent, int view_y, int view_h);
++
+ #endif
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index c23432c5e..9267401e3 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -413,12 +413,72 @@ text_redraw(const char *utf8_text,
+  * \return true if successful, false otherwise
+  */
+ 
++/**
++ * The accent-color a checked control is drawn in (VitaSurf), or false for
++ * auto, which keeps the frontend's own look.
++ */
++static bool html_accent(const struct box *box, colour *accent)
++{
++	css_color c = 0;
++	uint8_t t;
++
++	if (box->style == NULL)
++		return false;
++	t = css_computed_accent_color(box->style, &c);
++	if (t == CSS_ACCENT_COLOR_CURRENT_COLOR)
++		css_computed_color(box->style, &c);
++	else if (t != CSS_ACCENT_COLOR_COLOR)
++		return false;
++	if (nscss_color_is_transparent(c))
++		return false;
++	*accent = nscss_color_to_ns(c);
++	return true;
++}
++
++/** Black or white, whichever stands out on c (VitaSurf). */
++static colour html_accent_mark(colour c)
++{
++	unsigned lum = (red_from_colour(c) * 299 + green_from_colour(c) * 587 +
++			blue_from_colour(c) * 114) / 1000;
++
++	return lum < 160 ? 0xffffff : 0x000000;
++}
++
+ static bool html_redraw_checkbox(int x, int y, int width, int height,
+-		bool selected, const struct redraw_context *ctx)
++		bool selected, const colour *accent,
++		const struct redraw_context *ctx)
+ {
+ 	double z;
+ 	nserror res;
+ 	struct rect rect;
++	plot_style_t afill = {
++		.fill_type = PLOT_OP_TYPE_SOLID,
++	};
++	plot_style_t amark = {
++		.stroke_type = PLOT_OP_TYPE_SOLID,
++		.stroke_width = plot_style_int_to_fixed(2),
++	};
++	const plot_style_t *mark = plot_style_stroke_wblobc;
++	const plot_style_t *blob = plot_style_fill_wblobc;
++
++	/* a checked box in the page's accent colour, the mark across it
++	 * in black or white (VitaSurf) */
++	if (selected && accent != NULL) {
++		afill.fill_colour = *accent;
++		amark.stroke_colour = html_accent_mark(*accent);
++		rect.x0 = x;
++		rect.y0 = y;
++		rect.x1 = x + width + 1;
++		rect.y1 = y + height + 1;
++		res = ctx->plot->rectangle(ctx, &afill, &rect);
++		if (res != NSERROR_OK) {
++			return false;
++		}
++		afill.fill_colour = amark.stroke_colour;
++		mark = &amark;
++		blob = &afill;
++		goto mark;
++	}
+ 
+ 	z = width * 0.15;
+ 	if (z == 0) {
+@@ -465,6 +525,11 @@ static bool html_redraw_checkbox(int x, int y, int width, int height,
+ 		return false;
+ 	}
+ 
++mark:
++	z = width * 0.15;
++	if (z == 0) {
++		z = 1;
++	}
+ 	if (selected) {
+ 		if (width < 12 || height < 12) {
+ 			/* render a solid box instead of a tick */
+@@ -472,7 +537,7 @@ static bool html_redraw_checkbox(int x, int y, int width, int height,
+ 			rect.y0 = y + z + z;
+ 			rect.x1 = x + width - z;
+ 			rect.y1 = y + height - z;
+-			res = ctx->plot->rectangle(ctx, plot_style_fill_wblobc, &rect);
++			res = ctx->plot->rectangle(ctx, blob, &rect);
+ 			if (res != NSERROR_OK) {
+ 				return false;
+ 			}
+@@ -482,7 +547,7 @@ static bool html_redraw_checkbox(int x, int y, int width, int height,
+ 			rect.y0 = y + z;
+ 			rect.x1 = x + (z * 3);
+ 			rect.y1 = y + height - z;
+-			res = ctx->plot->line(ctx, plot_style_stroke_wblobc, &rect);
++			res = ctx->plot->line(ctx, mark, &rect);
+ 			if (res != NSERROR_OK) {
+ 				return false;
+ 			}
+@@ -491,7 +556,7 @@ static bool html_redraw_checkbox(int x, int y, int width, int height,
+ 			rect.y0 = y + height - z;
+ 			rect.x1 = x + z + z;
+ 			rect.y1 = y + (height / 2);
+-			res = ctx->plot->line(ctx, plot_style_stroke_wblobc, &rect);
++			res = ctx->plot->line(ctx, mark, &rect);
+ 			if (res != NSERROR_OK) {
+ 				return false;
+ 			}
+@@ -513,9 +578,13 @@ static bool html_redraw_checkbox(int x, int y, int width, int height,
+  * \return true if successful, false otherwise
+  */
+ static bool html_redraw_radio(int x, int y, int width, int height,
+-		bool selected, const struct redraw_context *ctx)
++		bool selected, const colour *accent,
++		const struct redraw_context *ctx)
+ {
+ 	nserror res;
++	plot_style_t ablob = {
++		.fill_type = PLOT_OP_TYPE_SOLID,
++	};
+ 
+ 	/* plot background of radio button */
+ 	res = ctx->plot->disc(ctx,
+@@ -552,9 +621,13 @@ static bool html_redraw_radio(int x, int y, int width, int height,
+ 	}
+ 
+ 	if (selected) {
+-		/* plot selection blob */
++		/* plot selection blob, in the accent colour if there is
++		 * one (VitaSurf) */
++		if (accent != NULL)
++			ablob.fill_colour = *accent;
+ 		res = ctx->plot->disc(ctx,
+-				      plot_style_fill_wblobc,
++				      accent != NULL ? &ablob :
++						plot_style_fill_wblobc,
+ 				      x + width * 0.5,
+ 				      y + height * 0.5,
+ 				      width * 0.3 - 1);
+@@ -2125,6 +2198,22 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 			&fstyle);
+ 	fstyle.background = current_background_color;
+ 
++	/*
++	 * -webkit-text-fill-color (VitaSurf): the glyphs are filled with
++	 * it in place of the colour. A transparent one is left to the
++	 * colour: with background-clip: text it is replaced below, and
++	 * otherwise it goes with -webkit-text-stroke, which is not drawn
++	 * here, so the text would vanish.
++	 */
++	if (box_text_style(box) != NULL) {
++		css_color fill = 0;
++
++		if (css_computed_webkit_text_fill_color(box_text_style(box),
++				&fill) == CSS_WEBKIT_TEXT_FILL_COLOR_COLOR &&
++				!nscss_color_is_transparent(fill))
++			fstyle.foreground = nscss_color_to_ns(fill);
++	}
++
+ 	/* the text's direction (VitaSurf): its element's, which is the
+ 	 * block's unless an inline element it is in set one of its own */
+ 	text_redraw_rtl = box->style != NULL ?
+@@ -2227,8 +2316,11 @@ static bool html_redraw_text_box_runs(const html_content *html,
+ 		css_color col = 0;
+ 
+ 		/* a text box carries its element's style, so the clip and
+-		 * the colour are read straight from it */
+-		css_computed_color(box->style, &col);
++		 * the colour are read straight from it; a fill colour
++		 * stands for it when there is one (VitaSurf) */
++		if (css_computed_webkit_text_fill_color(box->style, &col) !=
++				CSS_WEBKIT_TEXT_FILL_COLOR_COLOR)
++			css_computed_color(box->style, &col);
+ 		if (nscss_color_is_transparent(col)) {
+ 			css_color bgcol = 0;
+ 
+@@ -2458,34 +2550,40 @@ static bool html_redraw_box_children(const html_content *html, struct box *box,
+  */
+ static int html_sticky_offset(const html_content *html, struct box *box,
+ 		int y_parent)
++{
++	/* y_parent is where the parent was plotted; the content's own
++	 * origin was plotted at view_origin_y */
++	return html_sticky_shift_at(html, box, y_parent - html->view_origin_y,
++			html->view_y, html->view_h);
++}
++
++/* exported interface documented in html/private.h */
++int html_sticky_shift_at(const html_content *html, struct box *box,
++		int y_parent, int view_y, int view_h)
+ {
+ 	struct box *parent = box->parent;
+ 	int top_px = 0, bottom_px = 0;
+ 	int box_top, box_bottom, dy = 0;
+ 
+-	if (html->view_h <= 0 || parent == NULL)
++	if (view_h <= 0 || parent == NULL)
+ 		return 0;
+ 
+-	/* y_parent is where the parent was plotted; the content's own
+-	 * origin was plotted at view_origin_y */
+-	y_parent -= html->view_origin_y;
+-
+ 	/* the border edges of the box, as laid out */
+ 	box_top = y_parent + box->y - box->border[TOP].width;
+ 	box_bottom = y_parent + box->y + box->padding[TOP] + box->height +
+ 			box->padding[BOTTOM] + box->border[BOTTOM].width;
+ 
+ 	if (css_computed_top_px(box->style, &html->unit_len_ctx,
+-			html->view_h, &top_px) == CSS_TOP_SET) {
+-		int want = html->view_y + top_px;
++			view_h, &top_px) == CSS_TOP_SET) {
++		int want = view_y + top_px;
+ 
+ 		if (box_top < want)
+ 			dy = want - box_top;
+ 	}
+ 	if (dy == 0 && css_computed_bottom_px(box->style,
+-			&html->unit_len_ctx, html->view_h, &bottom_px) ==
++			&html->unit_len_ctx, view_h, &bottom_px) ==
+ 			CSS_BOTTOM_SET) {
+-		int want = html->view_y + html->view_h - bottom_px;
++		int want = view_y + view_h - bottom_px;
+ 
+ 		if (box_bottom > want)
+ 			dy = want - box_bottom;
+@@ -4483,6 +4581,38 @@ static bool html_plot_made(const struct redraw_context *ctx,
+  *               to paint the area as it would have
+  * \return false on a plotting error
+  */
++/**
++ * Whether any rounded corner of a shape lies in what is being drawn
++ * (VitaSurf). Where none does the shape cuts nothing off, and what is in
++ * it can be painted as it is, clipped to its straight edges: a strip of
++ * a card's middle, which is what each step of a scroll draws, has no
++ * corner to cut.
++ */
++static bool html_shape_corner_in(const struct html_shape *s,
++		const struct rect *clip)
++{
++	struct rect c[4];
++	int i;
++
++	if (s->ellipse)
++		return true;
++	c[0].x0 = s->x0; c[0].y0 = s->y0;
++	c[0].x1 = s->x0 + s->r.tl_h; c[0].y1 = s->y0 + s->r.tl_v;
++	c[1].x0 = s->x1 - s->r.tr_h; c[1].y0 = s->y0;
++	c[1].x1 = s->x1; c[1].y1 = s->y0 + s->r.tr_v;
++	c[2].x0 = s->x1 - s->r.br_h; c[2].y0 = s->y1 - s->r.br_v;
++	c[2].x1 = s->x1; c[2].y1 = s->y1;
++	c[3].x0 = s->x0; c[3].y0 = s->y1 - s->r.bl_v;
++	c[3].x1 = s->x0 + s->r.bl_h; c[3].y1 = s->y1;
++	for (i = 0; i < 4; i++) {
++		if (c[i].x1 > c[i].x0 && c[i].y1 > c[i].y0 &&
++				c[i].x0 < clip->x1 && c[i].x1 > clip->x0 &&
++				c[i].y0 < clip->y1 && c[i].y1 > clip->y0)
++			return true;
++	}
++	return false;
++}
++
+ static bool html_composite(const struct redraw_context *ctx,
+ 		const struct rect *area, const struct rect *clip, float scale,
+ 		const struct html_shape *shape,
+@@ -4493,8 +4623,14 @@ static bool html_composite(const struct redraw_context *ctx,
+ {
+ 	struct bitmap *bm;
+ 	int ox = 0, oy = 0;
++	uint64_t t0;
++	bool ok;
+ 
+ 	*done = false;
++	/* no corner in view: the caller paints it as it is */
++	if (shape != NULL && !html_shape_corner_in(shape, clip))
++		return true;
++	t0 = vitasurf_clock_us();
+ 	if (!html_composite_raster(area, clip, scale, draw, pw, &bm, &ox,
+ 			&oy)) {
+ 		*done = true;
+@@ -4504,7 +4640,12 @@ static bool html_composite(const struct redraw_context *ctx,
+ 		return true;
+ 	html_shape_apply(bm, ox, oy, shape);
+ 	*done = true;
+-	return html_plot_made(ctx, bm, ox, oy);
++	ok = html_plot_made(ctx, bm, ox, oy);
++	/* counted with the other pictures painted aside, for the draw
++	 * log (VitaSurf) */
++	vitasurf_redraw_copies++;
++	vitasurf_us_redraw_copies += vitasurf_clock_us() - t0;
++	return ok;
+ }
+ 
+ /** The padding box of a box with rounded corners, as a shape: the
+@@ -7334,13 +7475,21 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				y + padding_top, &r, ctx);
+ 
+ 	} else if (box->gadget && box->gadget->type == GADGET_CHECKBOX) {
++		colour accent = 0;
++		bool has = html_accent(box, &accent);
++
+ 		if (!html_redraw_checkbox(x + padding_left, y + padding_top,
+-				width, height, box->gadget->selected, ctx))
++				width, height, box->gadget->selected,
++				has ? &accent : NULL, ctx))
+ 			return false;
+ 
+ 	} else if (box->gadget && box->gadget->type == GADGET_RADIO) {
++		colour accent = 0;
++		bool has = html_accent(box, &accent);
++
+ 		if (!html_redraw_radio(x + padding_left, y + padding_top,
+-				width, height, box->gadget->selected, ctx))
++				width, height, box->gadget->selected,
++				has ? &accent : NULL, ctx))
+ 			return false;
+ 
+ 	} else if (box->gadget && box->gadget->type == GADGET_FILE) {
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index c40d2f212..1135979cd 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -1394,7 +1394,8 @@ void fb_plot_take_stats(char *buf, size_t len)
+ 	if (at < len) {
+ 		int n = snprintf(buf + at, len - at, "; plot calls %u ms in "
+ 				 "all, %u boxes visited, %u image copies for "
+-				 "opacity, filters or transforms in %u ms",
++				 "opacity, filters, transforms or rounded "
++				 "corners in %u ms",
+ 				 (unsigned int)(plot_us / 1000),
+ 				 vitasurf_redraw_boxes, vitasurf_redraw_copies,
+ 				 (unsigned int)(vitasurf_us_redraw_copies /
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 46f03e2e1..eabdb3afb 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -443,6 +443,8 @@ fb_pan(fbtk_widget_t *widget,
+ 	struct rect pinned[FB_PINNED_MAX];
+ 	int pinned_n;
+ 	int dx, dy, i;
++	struct rect held, held_pin;
++	int hold = 0;	/* rows at the top that stay as they are */
+ #ifdef __vita__
+ 	unsigned long long move_t0 = vita_now_us();
+ 
+@@ -507,7 +509,58 @@ fb_pan(fbtk_widget_t *widget,
+ 		return;
+ 	}
+ 
+-	if (bwidget->pany < 0) {
++	/*
++	 * An opaque header held at the top of the view, painted over all
++	 * that moves (VitaSurf): only the rows under it move, and its own
++	 * pixels are left where they are. Drawn again on every step of
++	 * the scroll it took 50 ms on the Vita, most of it the posters
++	 * and card shadows under it that it then covered; Yamtrack's
++	 * header held scrolling there to 12 frames a second.
++	 */
++	if (pinned_n > 0 && bwidget->panx == 0 && bwidget->pany != 0) {
++		struct rect vr;
++
++		vr.x0 = x;
++		vr.y0 = y;
++		vr.x1 = x + width;
++		vr.y1 = y + height;
++		if (html_pinned_held(browser_window_get_content(bw), &vr,
++				bwidget->scrolly, bwidget->pany, &held,
++				&held_pin)) {
++			hold = held.y1 - y;
++			if (hold + abs(bwidget->pany) >= height)
++				hold = 0;
++		}
++	}
++
++	if (hold > 0) {
++		nsfb_bbox_t moving = view;
++
++		moving.y0 = y + hold;
++		if (bwidget->pany > 0) {
++			srcbox.y0 = y + hold + bwidget->pany;
++			srcbox.y1 = y + height;
++			dstbox.y0 = y + hold;
++			dstbox.y1 = y + height - bwidget->pany;
++		} else {
++			srcbox.y0 = y + hold;
++			srcbox.y1 = y + height + bwidget->pany;
++			dstbox.y0 = y + hold - bwidget->pany;
++			dstbox.y1 = y + height;
++		}
++		srcbox.x0 = dstbox.x0 = x;
++		srcbox.x1 = dstbox.x1 = x + width;
++		fb_pan_copy(nsfb, &srcbox, &dstbox, &moving);
++
++		bwidget->scrolly += bwidget->pany;
++		if (bwidget->pany > 0) {
++			fb_queue_redraw(widget, 0, height - bwidget->pany,
++					width, height);
++		} else {
++			fb_queue_redraw(widget, 0, hold, width,
++					hold - bwidget->pany);
++		}
++	} else if (bwidget->pany < 0) {
+ 		/* pan up by less then viewport height */
+ 		srcbox.x0 = x;
+ 		srcbox.y0 = y;
+@@ -619,11 +672,27 @@ fb_pan(fbtk_widget_t *widget,
+ 			int x0 = r->x0 - x, y0 = r->y0 - y;
+ 			int x1 = r->x1 - x, y1 = r->y1 - y;
+ 
+-			/* shadows and outlines reach past the box */
+-			x0 = (x0 < x0 - dx ? x0 : x0 - dx) - FB_PINNED_MARGIN;
+-			y0 = (y0 < y0 - dy ? y0 : y0 - dy) - FB_PINNED_MARGIN;
+-			x1 = (x1 > x1 - dx ? x1 : x1 - dx) + FB_PINNED_MARGIN;
+-			y1 = (y1 > y1 - dy ? y1 : y1 - dy) + FB_PINNED_MARGIN;
++			if (hold > 0 && r->x0 == held_pin.x0 &&
++					r->y0 == held_pin.y0 &&
++					r->x1 == held_pin.x1 &&
++					r->y1 == held_pin.y1) {
++				/* held where it was: only the edge below it,
++				 * its border and shadow over what moved */
++				x0 = 0;
++				x1 = width;
++				y0 = hold;
++				y1 = y1 + FB_PINNED_MARGIN;
++			} else {
++				/* shadows and outlines reach past the box */
++				x0 = (x0 < x0 - dx ? x0 : x0 - dx) -
++						FB_PINNED_MARGIN;
++				y0 = (y0 < y0 - dy ? y0 : y0 - dy) -
++						FB_PINNED_MARGIN;
++				x1 = (x1 > x1 - dx ? x1 : x1 - dx) +
++						FB_PINNED_MARGIN;
++				y1 = (y1 > y1 - dy ? y1 : y1 - dy) +
++						FB_PINNED_MARGIN;
++			}
+ 			if (x0 < 0) x0 = 0;
+ 			if (y0 < 0) y0 = 0;
+ 			if (x1 > width) x1 = width;
+diff --git a/frontends/monkey/browser.c b/frontends/monkey/browser.c
+index c86c2156e..6ca0452b7 100644
+--- a/frontends/monkey/browser.c
++++ b/frontends/monkey/browser.c
+@@ -31,6 +31,7 @@
+ #include "netsurf/window.h"
+ #include "netsurf/browser_window.h"
+ #include "netsurf/plotters.h"
++#include "html/html.h"
+ 
+ #include "monkey/output.h"
+ #include "monkey/browser.h"
+@@ -595,7 +596,9 @@ monkey_window_handle_redraw(int argc, char **argv)
+ 
+ 	NSLOG(netsurf, INFO, "Issue redraw");
+ 	moutf(MOUT_WINDOW, "REDRAW WIN %d START", atoi(argv[2]));
+-	browser_window_redraw(gw->bw, gw->scrollx, gw->scrolly, &clip, &ctx);
++	/* the document is drawn moved up by the scroll, as the other
++	 * frontends draw it (VitaSurf) */
++	browser_window_redraw(gw->bw, -gw->scrollx, -gw->scrolly, &clip, &ctx);
+ 	moutf(MOUT_WINDOW, "REDRAW WIN %d STOP", atoi(argv[2]));
+ }
+ 
+@@ -742,6 +745,35 @@ monkey_window_handle_command(int argc, char **argv)
+ 		}
+ 		browser_window_mouse_track(gw->bw, 0, atoi(argv[5]),
+ 				atoi(argv[7]));
++	} else if (strcmp(argv[1], "HELD") == 0) {
++		/* `WINDOW HELD WIN` _%id%_ `DY` _%num%_: whether a pan by
++		 * DY could leave a pinned header's pixels in place, and
++		 * the rows it would (VitaSurf) */
++		struct gui_window *gw;
++		struct rect view, held, pin;
++
++		if (argc != 6) {
++			moutf(MOUT_ERROR, "WINDOW HELD ARGS BAD\n");
++			return;
++		}
++		gw = monkey_find_window_by_num(atoi(argv[3]));
++		if (gw == NULL) {
++			moutf(MOUT_ERROR, "WINDOW NUM BAD");
++			return;
++		}
++		view.x0 = 0;
++		view.y0 = 0;
++		view.x1 = gw->width;
++		view.y1 = gw->height;
++		if (html_pinned_held(browser_window_get_content(gw->bw),
++				&view, gw->scrolly, atoi(argv[5]), &held,
++				&pin)) {
++			moutf(MOUT_WINDOW, "HELD WIN %d ROWS %d %d PIN %d %d",
++					gw->win_num, held.y0, held.y1,
++					pin.y0, pin.y1);
++		} else {
++			moutf(MOUT_WINDOW, "HELD WIN %d NONE", gw->win_num);
++		}
+ 	} else {
+ 		moutf(MOUT_ERROR, "WINDOW COMMAND UNKNOWN %s\n", argv[1]);
+ 	}

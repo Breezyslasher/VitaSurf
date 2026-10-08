@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!-- The halves of white-space (VitaSurf): text-wrap (Tailwind's
+     text-nowrap), text-wrap-mode and white-space-collapse were ignored,
+     so text that asked not to wrap did. Each sets one half and keeps the
+     other from white-space or the parent. Expected lines are what
+     Chrome prints. -->
+<html><head><title>text-wrap-mode</title><style>
+body { font: 16px sans-serif }
+div { width: 120px }
+#a { text-wrap: nowrap }
+#b { white-space: nowrap; text-wrap: balance }
+#c { white-space: pre; text-wrap-mode: wrap }
+#d { text-wrap-mode: nowrap }
+#e { white-space-collapse: preserve }
+#f { white-space: pre-wrap } #f > span { text-wrap-mode: nowrap }
+#g { text-wrap: nowrap } #g > span { white-space-collapse: preserve }
+</style></head><body>
+<div id="a">one two three four five six seven</div>
+<div id="b">one two three four five six seven</div>
+<div id="c">one two three four five six seven</div>
+<div id="d">one two three four five six seven</div>
+<div id="e">a   b</div>
+<div id="f"><span>x   y</span></div>
+<div id="g"><span>x   y</span></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function ws(s) { return getComputedStyle(document.querySelector(s)).whiteSpace; }
+function one(s) { return document.querySelector(s).getBoundingClientRect().height < 30; }
+window.addEventListener('load', function () { setTimeout(function () {
+T('text-wrap: nowrap stays on one line', one('#a'));
+T('text-wrap: balance after nowrap wraps again', !one('#b'));
+T('pre with text-wrap-mode: wrap', ws('#c'));
+T('text-wrap-mode: nowrap', ws('#d'));
+T('white-space-collapse: preserve', ws('#e'));
+T('pre-wrap parent, nowrap child', ws('#f > span'));
+T('nowrap parent, preserve child', ws('#g > span'));
+}, 300); });
+</script>
+</body></html>
