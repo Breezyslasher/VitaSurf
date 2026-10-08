@@ -97,6 +97,7 @@ Each phase must work on real hardware before the next one starts.
 - Rendering: blit only damaged regions reported through libnsfb updates. Avoid uploading the full screen every frame when nothing changed.
 - Suspend/resume: network connections drop on resume. Fail in-flight fetches cleanly and allow retry rather than hanging.
 - Fonts: bundle a license-compatible TTF (for example DejaVu Sans). Keep NetSurf's internal bitmap font as a fallback.
+- Units: the build uses 96 dpi and a 12pt (16px) default font, as browsers do (`content/handlers/css/css.c`, `desktop/options.h`). NetSurf's 90 dpi made em and rem sizes 15/16 of what pages asked while px came out right, and a rem inside calc() 17px. A variable web font is set to the weight asked for (`font_freetype.c`); its default instance can be its thinnest.
 
 ## Default controls
 

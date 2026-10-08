@@ -13293,6 +13293,20 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 	set_index(ctx, arr, 9, sh);
 	set_index(ctx, arr, 10, box->scroll_x != NULL ? scrollbar_get_offset(box->scroll_x) : 0);
 	set_index(ctx, arr, 11, box->scroll_y != NULL ? scrollbar_get_offset(box->scroll_y) : 0);
+	/* whether it is pinned to the viewport: it, or a box it is in, is
+	 * position: fixed, so the page's scroll does not move it */
+	{
+		const struct box *f;
+		int pinned = 0;
+
+		for (f = box; f != NULL && !pinned; f = f->parent) {
+			if (f->style != NULL && !(f->flags & ANCHORED) &&
+			    css_computed_position(f->style) ==
+					CSS_POSITION_FIXED)
+				pinned = 1;
+		}
+		set_index(ctx, arr, 12, pinned);
+	}
 	return arr;
 }
 

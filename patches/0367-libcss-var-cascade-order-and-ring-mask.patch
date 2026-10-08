@@ -1,0 +1,362 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index 649332e..a84201c 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -889,6 +889,7 @@ static css_error deferDeclaration(css_rule *rule, lwc_string *property,
+ 	d->property = (property != NULL) ? lwc_string_ref(property) : NULL;
+ 	d->custom = (custom != NULL) ? lwc_string_ref(custom) : NULL;
+ 	d->important = important;
++	d->at = (rs->style != NULL) ? rs->style->used : 0;
+ 	d->n_tokens = n;
+ 	d->tokens = malloc(n * sizeof(css_token));
+ 	if (d->tokens == NULL) {
+@@ -910,6 +911,21 @@ static css_error deferDeclaration(css_rule *rule, lwc_string *property,
+ }
+ 
+ 
++/**
++ * Place the declaration just held over after whatever was compiled for
++ * it against the root table (VitaSurf), so that in the cascade it
++ * replaces that, and the declarations written after it still win.
++ */
++static void deferredEndsHere(css_rule *rule)
++{
++	css_rule_selector *rs = (css_rule_selector *) rule;
++
++	if (rule->type == CSS_RULE_SELECTOR && rs->n_deferred > 0) {
++		rs->deferred[rs->n_deferred - 1].at =
++				(rs->style != NULL) ? rs->style->used : 0;
++	}
++}
++
+ /** Keep the value tokens of a --name declaration; a later one replaces it. */
+ static css_error storeCustomProperty(lwc_string *name,
+ 		const parserutils_vector *vector, int32_t ctx)
+@@ -2835,6 +2851,9 @@ css_error handleDeclaration(css_language *c, const parserutils_vector *vector)
+ 			return CSS_OK; /* the cascade may still resolve it */
+ 		error = parseProperty(c, ident, subst, &sctx, rule);
+ 		parserutils_vector_destroy(subst);
++		/* the held-over declaration replaces what was compiled
++		 * here, so it comes after it in the cascade */
++		deferredEndsHere(rule);
+ 		if (error != CSS_OK)
+ 			return CSS_OK;
+ 	} else {
+diff --git a/src/parse/properties/mask.c b/src/parse/properties/mask.c
+index 0b1a28f..d40015e 100644
+--- a/src/parse/properties/mask.c
++++ b/src/parse/properties/mask.c
+@@ -353,6 +353,10 @@ css_error css__parse_mask(css_language *c,
+ 			*size_style = NULL;
+ 	bool image = true, position = true, size = true;
+ 	bool none = false;
++	/* the first layer is a gradient clipped to the content or padding
++	 * box, and another follows (VitaSurf) */
++	bool gradient = false;
++	const char *inner = NULL, *ring = NULL;
+ 	css_error error;
+ 
+ 	token = parserutils_vector_peek(vector, *ctx);
+@@ -402,7 +406,17 @@ css_error css__parse_mask(css_language *c,
+ 			break;
+ 
+ 		if (tokenIsChar(token, ',')) {
+-			/* further layers are not painted */
++			/*
++			 * Further layers are not painted, but one pair is
++			 * understood: a solid layer clipped to the content
++			 * (or padding) box over one that covers the box is
++			 * the "gradient border" idiom, which with
++			 * mask-composite: exclude leaves only the ring
++			 * between the two. Speedtest's Download button is
++			 * outlined that way, and came out filled in.
++			 */
++			if (gradient && inner != NULL && image == false)
++				ring = inner;
+ 			css__skip_background_layers(vector, ctx);
+ 			break;
+ 		}
+@@ -429,6 +443,7 @@ css_error css__parse_mask(css_language *c,
+ 					image_style);
+ 			if (error == CSS_OK) {
+ 				image = false;
++				gradient = token->type == CSS_TOKEN_FUNCTION;
+ 				continue;
+ 			}
+ 			*ctx = before;
+@@ -444,6 +459,15 @@ css_error css__parse_mask(css_language *c,
+ 		}
+ 		if (token->type == CSS_TOKEN_IDENT) {
+ 			/* repeat, mode, composite and geometry box keywords */
++			if (lwc_string_caseless_isequal(token->idata,
++					c->strings[CONTENT_BOX], &none) ==
++					lwc_error_ok && none)
++				inner = "ring:content";
++			else if (lwc_string_caseless_isequal(token->idata,
++					c->strings[PADDING_BOX], &none) ==
++					lwc_error_ok && none)
++				inner = "ring:padding";
++			none = false;
+ 			parserutils_vector_iterate(vector, ctx);
+ 			continue;
+ 		}
+@@ -453,6 +477,33 @@ css_error css__parse_mask(css_language *c,
+ 	if (image && position && size)
+ 		goto invalid;
+ 
++	if (ring != NULL) {
++		/* the mask is the ring, named for the renderer */
++		lwc_string *name;
++		uint32_t snumber;
++
++		css__stylesheet_style_destroy(image_style);
++		image_style = NULL;
++		error = css__stylesheet_style_create(c->sheet, &image_style);
++		if (error != CSS_OK)
++			goto cleanup;
++		if (lwc_intern_string(ring, strlen(ring), &name) !=
++				lwc_error_ok) {
++			error = CSS_NOMEM;
++			goto cleanup;
++		}
++		error = css__stylesheet_string_add(c->sheet, name, &snumber);
++		if (error != CSS_OK)
++			goto cleanup;
++		error = css__stylesheet_style_appendOPV(image_style,
++				CSS_PROP_MASK_IMAGE, 0, MASK_IMAGE_URI);
++		if (error == CSS_OK)
++			error = css__stylesheet_style_append(image_style,
++					snumber);
++		if (error != CSS_OK)
++			goto cleanup;
++	}
++
+ 	if (image) {
+ 		error = css__stylesheet_style_appendOPV(image_style,
+ 				CSS_PROP_MASK_IMAGE, 0, MASK_IMAGE_NONE);
+diff --git a/src/select/select.c b/src/select/select.c
+index 8b16c47..71ccae8 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -802,7 +802,8 @@ static const css_stylesheet *_rule_sheet(const css_rule *rule)
+ }
+ 
+ static css_error record_deferred(css_select_state *state,
+-		const css_rule_selector *rs, css_pseudo_element pseudo)
++		const css_rule_selector *rs, css_pseudo_element pseudo,
++		uint32_t base)
+ {
+ 	uint32_t i;
+ 
+@@ -828,6 +829,8 @@ static css_error record_deferred(css_select_state *state,
+ 		 * has no current sheet (VitaSurf) */
+ 		m->sheet = _rule_sheet(&rs->base);
+ 		m->specificity = state->current_specificity;
++		/* just ahead of the declaration it was written before */
++		m->order = base + 2 * rs->deferred[i].at;
+ 		m->layer = state->current_layer;
+ 		m->origin = state->current_origin;
+ 		m->pseudo = pseudo;
+@@ -843,11 +846,12 @@ static css_error record_deferred(css_select_state *state,
+  * var() sees the value that won wherever it was declared, and only then
+  * are the declarations that spend them compiled and cascaded.
+  *
+- * They are cascaded after everything else, so one that spends a
+- * variable beats an ordinary declaration of the same specificity that
+- * came later in the sheet. That is the wrong way round, and it is the
+- * price of not being able to compile the value until the element is
+- * known; a themed declaration is usually the only one for its property.
++ * They are cascaded after everything else, but each keeps the place
++ * it was written in, so an ordinary declaration of the same
++ * specificity that came after it in its rule or in a later rule still
++ * wins, as it does in a browser: MUI's "background-image:
++ * var(--Paper-overlay); background-image: none" was drawn with the
++ * overlay.
+  */
+ /* The most sheets of one selection searched for @property (VitaSurf) */
+ #define REGISTERED_SHEETS_MAX 16
+@@ -916,10 +920,13 @@ static css_error apply_deferred(css_select_ctx *ctx, css_select_state *state)
+ 		state->current_origin = m->origin;
+ 		state->current_pseudo = m->pseudo;
+ 		state->computed = state->results->styles[m->pseudo];
++		state->current_order = m->order;
++		state->order_fixed = true;
+ 
+ 		/* the declaration owns the bytecode now and keeps it for
+ 		 * the next element that resolves it the same (VitaSurf) */
+ 		error = cascade_style(style, state);
++		state->order_fixed = false;
+ 		if (error != CSS_OK) {
+ 			result = error;
+ 			break;
+@@ -3043,6 +3050,8 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	if (inline_style != NULL) {
+ 		css_rule_selector *sel =
+ 				(css_rule_selector *) inline_style->rule_list;
++		/* where the attribute's declarations start (VitaSurf) */
++		uint32_t inline_base = state.order_base;
+ 
+ 		/* Sanity check style */
+ 		if (inline_style->rule_count != 1 ||
+@@ -3079,7 +3088,7 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 		if (sel->n_deferred > 0) {
+ 			state.current_layer = CSS_LAYER_NONE;
+ 			error = record_deferred(&state, sel,
+-					CSS_PSEUDO_ELEMENT_NONE);
++					CSS_PSEUDO_ELEMENT_NONE, inline_base);
+ 			if (error != CSS_OK)
+ 				goto cleanup;
+ 		}
+@@ -3419,6 +3428,7 @@ css_error set_hint(css_select_state *state, css_hint *hint)
+ 	/* Keep selection state in sync with reality */
+ 	existing->set = 1;
+ 	existing->specificity = 0;
++	existing->order = 0;
+ 	existing->origin = CSS_ORIGIN_AUTHOR;
+ 	existing->important = 0;
+ 	existing->explicit_default = (hint->status == 0) ?
+@@ -4131,12 +4141,16 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 	state->computed = state->results->styles[pseudo];
+ 
+ 	error = record_deferred(state,
+-			(css_rule_selector *) selector->rule, pseudo);
++			(css_rule_selector *) selector->rule, pseudo,
++			state->order_base);
+ 	if (error != CSS_OK)
+ 		return error;
+ 
+-	if (((css_rule_selector *) selector->rule)->style == NULL)
++	if (((css_rule_selector *) selector->rule)->style == NULL) {
++		/* past its held-over declarations */
++		state->order_base += 2;
+ 		return CSS_OK;
++	}
+ 
+ 	return cascade_style(((css_rule_selector *) selector->rule)->style,
+ 			state);
+@@ -5424,12 +5438,18 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ css_error cascade_style(const css_style *style, css_select_state *state)
+ {
+ 	css_style s = *style;
++	uint32_t base = state->order_base;
+ 
+ 	while (s.used > 0) {
+ 		opcode_t op;
+ 		css_error error;
+ 		css_code_t opv = *s.bytecode;
+ 
++		/* its place in the cascade (VitaSurf) */
++		if (!state->order_fixed)
++			state->current_order = base +
++					2 * (style->used - s.used) + 1;
++
+ 		advance_bytecode(&s, sizeof(opv));
+ 
+ 		op = getOpcode(opv);
+@@ -5439,6 +5459,9 @@ css_error cascade_style(const css_style *style, css_select_state *state)
+ 			return error;
+ 	}
+ 
++	if (!state->order_fixed)
++		state->order_base = base + 2 * (style->used + 1);
++
+ 	return CSS_OK;
+ }
+ 
+@@ -5504,8 +5527,12 @@ bool css__outranks_existing(uint16_t op, bool important, css_select_state *state
+ 			 * for UA stylesheets, when specificity is always
+ 			 * considered (as importance is meaningless) */
+ 			if (existing->origin == CSS_ORIGIN_UA) {
+-				if (state->current_specificity >=
+-						existing->specificity) {
++				if (state->current_specificity >
++						existing->specificity ||
++						(state->current_specificity ==
++						existing->specificity &&
++						state->current_order >=
++						existing->order)) {
+ 					outranks = true;
+ 				}
+ 			} else if (existing->important == 0 && important) {
+@@ -5526,9 +5553,16 @@ bool css__outranks_existing(uint16_t op, bool important, css_select_state *state
+ 						existing->layer)
+ 					outranks = true;
+ 			} else {
+-				/* Same importance, consider specificity */
+-				if (state->current_specificity >=
+-						existing->specificity) {
++				/* Same importance, consider specificity,
++				 * then which came later: the cascade runs in
++				 * order, except for declarations held over
++				 * for their var()s (VitaSurf) */
++				if (state->current_specificity >
++						existing->specificity ||
++						(state->current_specificity ==
++						existing->specificity &&
++						state->current_order >=
++						existing->order)) {
+ 					outranks = true;
+ 				}
+ 			}
+@@ -5548,6 +5582,7 @@ bool css__outranks_existing(uint16_t op, bool important, css_select_state *state
+ 		 * Update our state to reflect this. */
+ 		existing->set = 1;
+ 		existing->specificity = state->current_specificity;
++		existing->order = state->current_order;
+ 		existing->layer = state->current_layer;
+ 		existing->origin = state->current_origin;
+ 		existing->important = important;
+diff --git a/src/select/select.h b/src/select/select.h
+index 0319a55..32b4d0d 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -28,6 +28,8 @@ typedef struct reject_item {
+ typedef struct prop_state {
+ 	uint32_t specificity;                 /* Specificity of property in result */
+ 	uint16_t layer;                       /* Its rule's layer rank (VitaSurf) */
++	uint32_t order;                       /* Where its declaration came in
++					       * the cascade (VitaSurf) */
+ 	unsigned int    set              : 1, /* Whether property is set in result */
+ 	                origin           : 2, /* Origin of property in result */
+ 	                important        : 1; /* Importance of property in result */
+@@ -188,6 +190,17 @@ typedef struct css_select_state {
+ 	css_origin current_origin;	/* Origin of current sheet */
+ 	uint32_t current_specificity;	/* Specificity of current rule */
+ 	uint16_t current_layer;		/* Its layer rank (VitaSurf) */
++	/*
++	 * Where the declaration being cascaded comes in the cascade
++	 * (VitaSurf): every rule cascaded moves order_base on past its
++	 * declarations, which take the odd numbers after it, and a
++	 * declaration held over for its var()s takes the even number
++	 * before the one it was written ahead of. order_fixed keeps
++	 * current_order while a held-over one is cascaded.
++	 */
++	uint32_t order_base;
++	uint32_t current_order;
++	bool order_fixed;
+ 
+ 	css_qname element;		/* Element we're selecting for */
+ 	lwc_string *id;			/* Node id, if any */
+@@ -236,6 +249,7 @@ typedef struct css_deferred_match {
+ 	const css_deferred_decl *decl;
+ 	const css_stylesheet *sheet;
+ 	uint32_t specificity;
++	uint32_t order;		/**< where it comes in the cascade */
+ 	uint16_t layer;
+ 	css_origin origin;
+ 	css_pseudo_element pseudo;
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 6412807..914d6d2 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -158,6 +158,10 @@ typedef struct css_deferred_decl {
+ 	css_token *tokens;	/**< the value as written */
+ 	uint32_t n_tokens;
+ 	bool important;
++	/** the length of its rule's bytecode once it was read, with
++	 * the value compiled for it from the root table, which places
++	 * it among the rule's other declarations (VitaSurf) */
++	uint32_t at;
+ 	/*
+ 	 * What compiling it last produced (VitaSurf). A declaration is
+ 	 * compiled once per element that matches its rule, and on a
