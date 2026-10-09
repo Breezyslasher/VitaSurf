@@ -201,6 +201,7 @@ struct jsthread {
 	struct browser_window *win;
 	html_content *htmlc;
 	unsigned frames_logged;   /**< frame pages this page made, logged */
+	unsigned throws_logged;   /**< engine errors logged, caught or not */
 	/*
 	 * Dedicated workers (VitaSurf). A worker is a realm of its own on
 	 * the page's runtime, run by the same scheduler: it shares the
@@ -12642,6 +12643,115 @@ static void qjs_miss_seq_copy(JSContext *ctx, char *out, size_t size)
 	}
 }
 
+/*
+ * An own data property of an object as a C string, or NULL (VitaSurf).
+ * A getter is not called and a proxy is not asked: the throw hook must
+ * not run script.
+ */
+static const char *own_data_cstring(JSContext *ctx, JSValueConst obj,
+				    const char *name)
+{
+	JSPropertyDescriptor desc;
+	JSAtom atom;
+	const char *s = NULL;
+	int r;
+
+	if (!JS_IsObject(obj) || JS_IsProxy(obj)) {
+		return NULL;
+	}
+	atom = JS_NewAtom(ctx, name);
+	if (atom == JS_ATOM_NULL) {
+		return NULL;
+	}
+	r = JS_GetOwnProperty(ctx, &desc, obj, atom);
+	JS_FreeAtom(ctx, atom);
+	if (r <= 0) {
+		return NULL;
+	}
+	if (!(desc.flags & JS_PROP_GETSET) && JS_IsString(desc.value)) {
+		s = JS_ToCString(ctx, desc.value);
+	}
+	JS_FreeValue(ctx, desc.value);
+	JS_FreeValue(ctx, desc.getter);
+	JS_FreeValue(ctx, desc.setter);
+	return s;
+}
+
+/*
+ * Each error the engine raises itself, whether or not the page catches
+ * it (VitaSurf). A script that catches its own failures -- a site's
+ * browser check reporting to its server, say -- left no trace in the
+ * log; this names the error and where it was raised, a page's first 40
+ * and not the same one twice running.
+ */
+#define THROWS_LOGGED_MAX 40
+static void qjs_throw_hook(JSContext *ctx, JSValueConst error)
+{
+	static bool busy;
+	static char last[160];
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *msg, *stack, *name = NULL;
+	JSValue proto;
+	char where[300], key[160];
+	size_t n = 0;
+	const char *p;
+	int lines = 0;
+
+	if (busy || thread == NULL ||
+	    thread->throws_logged >= THROWS_LOGGED_MAX ||
+	    JS_IsUncatchableError(error)) {
+		return;
+	}
+	busy = true;
+	msg = own_data_cstring(ctx, error, "message");
+	stack = own_data_cstring(ctx, error, "stack");
+	proto = JS_GetPrototype(ctx, error);
+	if (!JS_IsException(proto)) {
+		name = own_data_cstring(ctx, proto, "name");
+		JS_FreeValue(ctx, proto);
+	}
+	/* the first three frames of the stack, on one line */
+	where[0] = '\0';
+	for (p = stack; p != NULL && *p != '\0' && lines < 3; lines++) {
+		const char *e = strchr(p, '\n');
+		size_t len = e != NULL ? (size_t)(e - p) : strlen(p);
+
+		while (len > 0 && *p == ' ') {
+			p++;
+			len--;
+		}
+		if (len > 0 && n + len + 3 < sizeof(where)) {
+			memcpy(where + n, " | ", 3);
+			memcpy(where + n + 3, p, len);
+			n += len + 3;
+			where[n] = '\0';
+		}
+		p = e != NULL ? e + 1 : NULL;
+	}
+	snprintf(key, sizeof(key), "%s%s", msg != NULL ? msg : "",
+		 where);
+	/* the module loader's own, which says what it could not load on
+	   lines of its own */
+	if (msg != NULL && (strcmp(msg, "a module script") == 0 ||
+			    strcmp(msg, "imports still arriving") == 0 ||
+			    strncmp(msg, "could not load module", 21) == 0)) {
+		key[0] = '\0';
+	}
+	if (key[0] != '\0' && strcmp(key, last) != 0) {
+		memcpy(last, key, sizeof(last));
+		thread->throws_logged++;
+		vita_log("qjs: the engine threw %s: %s%s%s",
+			 name != NULL ? name : "Error",
+			 msg != NULL ? msg : "", where,
+			 thread->throws_logged == THROWS_LOGGED_MAX ?
+			 " (the last this page logs)" : "");
+	}
+	if (msg != NULL) JS_FreeCString(ctx, msg);
+	if (stack != NULL) JS_FreeCString(ctx, stack);
+	if (name != NULL) JS_FreeCString(ctx, name);
+	busy = false;
+}
+
 static void qjs_miss_hook(JSContext *ctx, JSValueConst obj, JSAtom prop)
 {
 	void *p;
@@ -14707,6 +14817,7 @@ static nserror heap_start(jsheap *ret)
 	ret->rt = JS_NewRuntime2(qjs_pool_functions(), ret->pool);
 	if (ret->rt != NULL) {
 		JS_SetPropertyMissHook(ret->rt, qjs_miss_hook);
+		JS_SetEngineThrowHook(ret->rt, qjs_throw_hook);
 	}
 	if (ret->rt == NULL) {
 		qjs_pool_destroy(ret->pool);
