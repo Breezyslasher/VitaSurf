@@ -383,6 +383,7 @@ struct jsthread {
 	int event_depth;          /**< DOM event dispatches in progress */
 	unsigned shadow_notes;    /**< shadow root lines logged for this
 				       page, which stop at SHADOW_NOTES */
+	unsigned message_notes;   /**< and postMessage lines */
 	int window_phase;         /**< eventPhase for window listeners run
 				   *   at target, 0 when libdom says */
 	bool stop_now_seen;       /**< stopImmediatePropagation was called */
@@ -13282,6 +13283,48 @@ static JSValue win_vita_shadow_note(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+/*
+ * __vitaMessageNote(text): the first messages a window is sent, and
+ * what became of each (VitaSurf). A page and the frames it talks to by
+ * postMessage say nothing when a message goes astray: one dropped for
+ * its target origin, or sent before anyone listens, just waits forever.
+ */
+#define MESSAGE_NOTES 16
+
+static JSValue win_vita_message_note(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *text;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL ||
+	    thread->message_notes >= MESSAGE_NOTES) {
+		return JS_UNDEFINED;
+	}
+	text = JS_ToCString(ctx, argv[0]);
+	if (text != NULL) {
+		unsigned listening = 0;
+		struct js_listener *l;
+
+		/* who on this window hears it */
+		for (l = thread->win_listeners; l != NULL; l = l->win_next) {
+			if (l->on_window && !l->dead && l->type != NULL &&
+			    dom_string_byte_length(l->type) == 7 &&
+			    memcmp(dom_string_data(l->type), "message",
+				   7) == 0) {
+				listening++;
+			}
+		}
+		thread->message_notes++;
+		vita_log("message: %s, %u listening%s", text, listening,
+			 thread->message_notes == MESSAGE_NOTES ?
+			 " (no more of these for this page)" : "");
+		JS_FreeCString(ctx, text);
+	}
+	return JS_UNDEFINED;
+}
+
 static JSValue win_vita_attach_shadow(JSContext *ctx, JSValueConst this_val,
 				      int argc, JSValueConst *argv)
 {
@@ -14874,6 +14917,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaSetSheetText",
 			  JS_NewCFunction(ctx, win_vita_set_sheet_text,
 					  "__vitaSetSheetText", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaMessageNote",
+			  JS_NewCFunction(ctx, win_vita_message_note,
+					  "__vitaMessageNote", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaShadowNote",
 			  JS_NewCFunction(ctx, win_vita_shadow_note,
 					  "__vitaShadowNote", 1));

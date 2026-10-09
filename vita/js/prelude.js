@@ -2097,20 +2097,61 @@ Event.prototype.composedPath=function(){
  * because a real browser clamps nested timeouts and does not clamp this.
  * A timer is the honest equivalent here -- delivery stays asynchronous
  * and ordered, which is what the schedulers depend on. */
-function MessagePort(){this._peer=null;this._l=[];this.onmessage=null;}
-MessagePort.prototype.postMessage=function(data){
- var p=this._peer;if(!p)return;
+/* As the HTML standard has them (VitaSurf): what a port is sent waits in
+ * its queue until the port is started, which setting onmessage does and
+ * addEventListener does not, so a message sent before the other side
+ * listens is not lost; ports can be handed on in a transfer list, and
+ * arrive in the event's ports. */
+function portList(t){
+ var out=[],i;
+ if(t&&typeof t.length==='number')
+  for(i=0;i<t.length;i++)if(t[i]&&t[i].__vsPort)out.push(t[i]);
+ return out;}
+/* a transferred port arrives as a new port of the receiving realm, which
+   takes over the old one's entanglement and queue; the old one is left
+   neutered, as a transfer leaves it */
+function portMove(list,Ctor){
+ return list.map(function(o){
+  var n=new Ctor();
+  n._peer=o._peer;if(o._peer)o._peer._peer=n;
+  n._q=o._q;o._peer=null;o._q=[];o._l=[];o._on=null;
+  return n;});}
+function MessagePort(){
+ Object.defineProperties(this,{_peer:{value:null,writable:true},
+  _l:{value:[],writable:true},_q:{value:[],writable:true},
+  _on:{value:null,writable:true},_started:{value:false,writable:true},
+  __vsPort:{value:true}});}
+MessagePort.prototype._flush=function(){
+ var p=this;
+ if(!p._started||!p._q.length)return;
  setTimeout(function(){
-  var e={data:data,type:'message',target:p,currentTarget:p,source:null,origin:'',ports:[],
-         preventDefault:function(){},stopPropagation:function(){}};
-  if(typeof p.onmessage==='function'){try{p.onmessage(e);}catch(x){console.error(x);}}
-  p._l.slice().forEach(function(f){try{f.call(p,e);}catch(x){console.error(x);}});
- },0);
-};
-MessagePort.prototype.addEventListener=function(t,f){if(t==='message'&&typeof f==='function')this._l.push(f);};
+  var m=p._q.shift(),e;
+  if(!m)return;
+  e={data:m.data,type:'message',target:p,currentTarget:p,source:null,origin:'',
+   ports:m.ports,lastEventId:'',preventDefault:function(){},
+   stopPropagation:function(){},stopImmediatePropagation:function(){}};
+  if(typeof p._on==='function'){try{p._on.call(p,e);}catch(x){console.error(x);}}
+  p._l.slice().forEach(function(f){
+   try{typeof f==='function'?f.call(p,e):f.handleEvent(e);}catch(x){console.error(x);}});
+  p._flush();},0);};
+MessagePort.prototype.postMessage=function(data,transfer){
+ var p=this._peer,ports;
+ if(!p)return;
+ ports=portList(transfer&&!Array.isArray(transfer)&&transfer.transfer?transfer.transfer:transfer);
+ if(!ports.length){try{data=W.structuredClone(data);}catch(e){}}
+ else ports=portMove(ports,p.constructor);
+ p._q.push({data:data,ports:ports});
+ p._flush();};
+Object.defineProperty(MessagePort.prototype,'onmessage',{configurable:true,
+ get:function(){return this._on;},
+ set:function(f){this._on=typeof f==='function'?f:null;this.start();}});
+MessagePort.prototype.addEventListener=function(t,f){
+ if(t==='message'&&f&&this._l.indexOf(f)<0)this._l.push(f);};
 MessagePort.prototype.removeEventListener=function(t,f){this._l=this._l.filter(function(g){return g!==f;});};
-MessagePort.prototype.start=function(){};
-MessagePort.prototype.close=function(){this._peer=null;this._l=[];this.onmessage=null;};
+MessagePort.prototype.start=function(){this._started=true;this._flush();};
+MessagePort.prototype.close=function(){
+ if(this._peer)this._peer._peer=null;
+ this._peer=null;this._q=[];};
 MessagePort.prototype.dispatchEvent=function(){return true;};
 function MessageChannel(){this.port1=new MessagePort();this.port2=new MessagePort();this.port1._peer=this.port2;this.port2._peer=this.port1;}
 W.MessageChannel=MessageChannel;W.MessagePort=MessagePort;
@@ -4479,17 +4520,43 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   if(arguments.length<1)
    throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
   var to=(options!==null&&typeof options==='object')?options.targetOrigin:options,
-   src=call(NX)||W,data,ev;
+   src=call(NX)||W,data,ev,ports;
+  /* the ports handed over: postMessage(m, origin, [port]) or
+     postMessage(m, {targetOrigin, transfer: [port]}) */
+  ports=portList(options!==null&&typeof options==='object'?options.transfer:arguments[2]);
   to=to===undefined?'/':String(to);
   if(to==='/')to=originOf(src);
   else if(to!=='*'){
    try{to=new URL(to).origin;}
    catch(e){throw new DOMException("Invalid target origin '"+to+"' in a call to 'postMessage'.",'SyntaxError');}}
-  data=W.structuredClone(message);
-  if(to!=='*'&&to!==originOf(W))return;
+  if(ports.length)data=message;
+  else data=W.structuredClone(message);
+  if(to!=='*'&&to!==originOf(W)){
+   msgNote(src,message,'dropped: its target origin is not this window\'s');
+   return;}
+  if(ports.length)ports=portMove(ports,W.MessagePort);
   ev=new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
-   source:view(src),ports:[]});
-  setTimeout(function(){__vitaDispatch(null,ev);},0);};
+   source:view(src),ports:ports});
+  setTimeout(function(){
+   msgNote(src,message,'delivered'+(to==='*'?' (to any origin)':''));
+   __vitaDispatch(null,ev);},0);};
+ /* the log's line for a message: where from, and its kind when the data
+    names one with a short word, as {event: "ready"} does; nothing else
+    of the data is written */
+ var MN=W.__vitaMessageNote;
+ try{delete W.__vitaMessageNote;}catch(e){}
+ function msgNote(src,m,what){
+  var k='',w;
+  if(typeof MN!=='function')return;
+  try{
+   if(m&&typeof m==='object'){
+    w=typeof m.event==='string'?m.event:typeof m.type==='string'?m.type:'';
+    if(/^[\w.:-]{1,24}$/.test(w))k=' "'+w+'"';}
+   else if(typeof m==='string')k=' (a string of '+m.length+')';}
+  catch(e){}
+  try{MN('a message'+k+' '+(src===W?'from this window':
+   keyOf(src)===myKey()?'from a window of this origin':
+   'from a window of another origin')+', '+what);}catch(e){}}
  var FRAMES=new WeakMap();
  function sameOrigin(el){
   var src=el.getAttribute('src');
