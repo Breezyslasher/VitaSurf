@@ -12526,25 +12526,115 @@ static char miss_watch_label[MISS_WATCH][16];
 static unsigned miss_watch_next;
 static char miss_ring[MISS_RING][64];
 static unsigned miss_ring_next;
-/* the same reads in the order they came, repeats and all, the last
-   MISS_SEQ of them; and a copy taken when new Proxy was handed a
-   non-object, which says what the page read just before it */
-#define MISS_SEQ 12
-static char miss_seq[MISS_SEQ][64];
-static unsigned miss_seq_next;
-static char miss_seq_at_proxy[MISS_SEQ * 66];
+/* Every read that found nothing, on any object, in the order they came:
+   the last MISS_ANY, each its runtime, its property, as an atom held
+   until the slot is reused or the runtime goes, and the object's class
+   or its label if it is watched. When new Proxy is handed a non-object
+   they are written out, and that says what the page read just before
+   it, wherever it read it. */
+#define MISS_ANY 32
+static struct {
+	JSRuntime *rt;
+	JSAtom prop;
+	JSClassID cls;
+	int label;
+} miss_any[MISS_ANY];
+static unsigned miss_any_next;
+/* set while this browser reads a page's globals for its own log */
+static bool miss_quiet;
+static char miss_seq_at_proxy[MISS_ANY * 70];
 
-static void qjs_miss_seq_copy(char *out, size_t size)
+/* Let go of the atoms a runtime about to be freed holds here. */
+static void qjs_miss_drop(JSRuntime *rt)
 {
+	unsigned i;
+
+	for (i = 0; i < MISS_ANY; i++) {
+		if (miss_any[i].rt != NULL && miss_any[i].rt == rt) {
+			JS_FreeAtomRT(rt, miss_any[i].prop);
+			miss_any[i].rt = NULL;
+		}
+	}
+}
+
+static void qjs_miss_any_add(JSContext *ctx, JSValueConst obj, JSAtom prop,
+			     int label)
+{
+	JSRuntime *rt = JS_GetRuntime(ctx);
+	JSClassID cls = JS_GetClassID(obj);
+	unsigned last = (miss_any_next + MISS_ANY - 1) % MISS_ANY;
+	unsigned slot;
+
+	/* the same read again at once is one entry */
+	if (miss_any_next > 0 && miss_any[last].rt == rt &&
+	    miss_any[last].prop == prop && miss_any[last].cls == cls &&
+	    miss_any[last].label == label) {
+		return;
+	}
+	slot = miss_any_next++ % MISS_ANY;
+	if (miss_any[slot].rt != NULL) {
+		JS_FreeAtomRT(miss_any[slot].rt, miss_any[slot].prop);
+	}
+	miss_any[slot].rt = rt;
+	miss_any[slot].prop = JS_DupAtom(ctx, prop);
+	miss_any[slot].cls = cls;
+	miss_any[slot].label = label;
+}
+
+/* A name this browser's own code reads, not the page's: its helpers,
+   the prelude's event flags and its handler slots. */
+static bool qjs_miss_ours(const char *name)
+{
+	return strncmp(name, "__vita", 6) == 0 ||
+		strncmp(name, "__on_", 5) == 0 ||
+		strncmp(name, "__onw_", 6) == 0 ||
+		strcmp(name, "__stopNow") == 0 ||
+		strcmp(name, "__cancelBubble") == 0;
+}
+
+/* The reads kept, oldest first, as "label.name" or "Class.name". */
+static void qjs_miss_seq_copy(JSContext *ctx, char *out, size_t size)
+{
+	JSRuntime *rt = JS_GetRuntime(ctx);
 	size_t n = 0;
 	unsigned i, start;
 
 	out[0] = '\0';
-	start = miss_seq_next > MISS_SEQ ? miss_seq_next - MISS_SEQ : 0;
-	for (i = start; i < miss_seq_next; i++) {
-		int w = snprintf(out + n, size - n, "%s%s", n > 0 ? ", " : "",
-				 miss_seq[i % MISS_SEQ]);
+	start = miss_any_next > MISS_ANY ? miss_any_next - MISS_ANY : 0;
+	for (i = start; i < miss_any_next; i++) {
+		unsigned k = i % MISS_ANY;
+		const char *name, *cname = NULL;
+		JSAtom catom = JS_ATOM_NULL;
+		int w;
 
+		if (miss_any[k].rt != rt) {
+			continue;
+		}
+		name = JS_AtomToCString(ctx, miss_any[k].prop);
+		if (name == NULL) {
+			continue;
+		}
+		if (qjs_miss_ours(name)) {
+			JS_FreeCString(ctx, name);
+			continue;
+		}
+		if (miss_any[k].label < 0) {
+			catom = JS_GetClassName(rt, miss_any[k].cls);
+			if (catom != JS_ATOM_NULL) {
+				cname = JS_AtomToCString(ctx, catom);
+			}
+		}
+		w = snprintf(out + n, size - n, "%s%s.%s", n > 0 ? ", " : "",
+			     miss_any[k].label >= 0 ?
+			     miss_watch_label[miss_any[k].label] :
+			     (cname != NULL ? cname : "?"), name);
+		JS_FreeCString(ctx, name);
+		if (cname != NULL) {
+			JS_FreeCString(ctx, cname);
+		}
+		if (catom != JS_ATOM_NULL) {
+			JS_FreeAtom(ctx, catom);
+		}
 		if (w < 0 || (size_t)w >= size - n) {
 			break;
 		}
@@ -12557,12 +12647,21 @@ static void qjs_miss_hook(JSContext *ctx, JSValueConst obj, JSAtom prop)
 	void *p;
 	unsigned i;
 
+	if (miss_quiet) {
+		return;
+	}
 	if (prop == JS_ATOM_NULL) {
 		/* new Proxy was handed a non-object */
-		qjs_miss_seq_copy(miss_seq_at_proxy, sizeof(miss_seq_at_proxy));
+		qjs_miss_seq_copy(ctx, miss_seq_at_proxy,
+				  sizeof(miss_seq_at_proxy));
 		return;
 	}
 	p = JS_VALUE_GET_PTR(obj);
+	for (i = 0; i < MISS_WATCH; i++) {
+		if (miss_watch_obj[i] == p && p != NULL)
+			break;
+	}
+	qjs_miss_any_add(ctx, obj, prop, i < MISS_WATCH ? (int)i : -1);
 
 	for (i = 0; i < MISS_WATCH; i++) {
 		const char *name;
@@ -12573,16 +12672,14 @@ static void qjs_miss_hook(JSContext *ctx, JSValueConst obj, JSAtom prop)
 		name = JS_AtomToCString(ctx, prop);
 		if (name == NULL)
 			return;
-		/* this browser's own helpers are not what a page wants */
-		if (strncmp(name, "__vita", 6) == 0) {
+		/* this browser's own reads are not what a page wants */
+		if (qjs_miss_ours(name)) {
 			JS_FreeCString(ctx, name);
 			return;
 		}
 		snprintf(entry, sizeof(entry), "%s.%s", miss_watch_label[i],
 			 name);
 		JS_FreeCString(ctx, name);
-		memcpy(miss_seq[miss_seq_next++ % MISS_SEQ], entry,
-		       sizeof(entry));
 		/* each name once: a page's feature checks repeat */
 		for (i = 0; i < MISS_RING; i++) {
 			if (strcmp(miss_ring[i], entry) == 0)
@@ -12623,7 +12720,7 @@ static JSValue win_vita_watch_misses(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_misses(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
-	char out[MISS_RING * 66 + MISS_SEQ * 66 + 64];
+	char out[MISS_RING * 66 + MISS_ANY * 70 + 64];
 	size_t n = 0;
 	unsigned i, start;
 
@@ -12649,7 +12746,7 @@ static JSValue win_vita_misses(JSContext *ctx, JSValueConst this_val,
 		size_t n = strlen(out);
 
 		snprintf(out + n, sizeof(out) - n,
-			 "%s| last before new Proxy failed, oldest first: %s",
+			 "%s| read just before new Proxy failed, on anything, oldest first: %s",
 			 n > 0 ? " " : "", miss_seq_at_proxy);
 		miss_seq_at_proxy[0] = '\0';
 	}
@@ -14696,6 +14793,7 @@ void js_destroyheap(jsheap *heap)
 	if (heap->rt != NULL) {
 		if (qjs_memory_rt == heap->rt)
 			qjs_memory_rt = NULL;
+		qjs_miss_drop(heap->rt);
 		JS_FreeRuntime(heap->rt);
 		qjs_pool_destroy(heap->pool);
 	}
@@ -15068,6 +15166,7 @@ void js_destroythread(jsthread *thread)
 		jsheap *heap = thread->heap;
 		if (qjs_memory_rt == heap->rt)
 			qjs_memory_rt = NULL;
+		qjs_miss_drop(heap->rt);
 		JS_FreeRuntime(heap->rt);
 		qjs_pool_destroy(heap->pool);
 		free(heap);
@@ -18249,7 +18348,9 @@ bool js_fire_event(jsthread *thread, const char *type,
 			 (unsigned)(lazy_n - thread->lazy_count0),
 			 (unsigned)(lazy_ms - thread->lazy_ms0));
 		if (thread->ctx != NULL) {
+			miss_quiet = true;
 			log_inline_session(thread->ctx);
+			miss_quiet = false;
 		}
 	}
 	type_dom = to_dom_string(type);

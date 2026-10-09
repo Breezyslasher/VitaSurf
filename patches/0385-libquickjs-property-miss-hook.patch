@@ -1,5 +1,5 @@
 diff --git a/quickjs.c b/quickjs.c
-index e90ab0a..c79af05 100644
+index e90ab0a..151dd0f 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -268,6 +268,8 @@ struct JSRuntime {
@@ -23,6 +23,15 @@ index e90ab0a..c79af05 100644
  void JS_SetCanBlock(JSRuntime *rt, bool can_block)
  {
      rt->can_block = can_block;
+@@ -3912,7 +3919,7 @@ bool JS_IsRegisteredClass(JSRuntime *rt, JSClassID class_id)
+ JSAtom JS_GetClassName(JSRuntime *rt, JSClassID class_id)
+ {
+     if (JS_IsRegisteredClass(rt, class_id)) {
+-        return JS_DupAtomRT(rt, rt->class_array[class_id].class_id);
++        return JS_DupAtomRT(rt, rt->class_array[class_id].class_name);
+     } else {
+         return JS_ATOM_NULL;
+     }
 @@ -8984,6 +8991,9 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
          if (!p)
              break;
