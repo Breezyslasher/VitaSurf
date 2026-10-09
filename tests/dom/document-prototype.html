@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<!-- The document's prototype chain (VitaSurf). The document carried every
+     method itself, over an empty prototype shared by Document and
+     HTMLDocument, with no Node or EventTarget in its chain, so
+     Document.prototype.querySelector was undefined. claude.ai's
+     Cloudflare check hands that method to new Proxy and stopped on
+     "Cannot create proxy with a non-object as target". Expected console
+     output (Chrome gives the same): lines ending in "ok". -->
+<html><head><title>document prototype</title></head><body>
+<div id=a class=c>a</div>
+<script>
+function ok(name, cond, got) {
+  console.log('XX ' + name + ': ' + (cond ? 'ok' : 'FAIL ' + got));
+}
+function chain(o) {
+  var a = [];
+  while (o) {
+    a.push(Object.prototype.hasOwnProperty.call(o, 'constructor') ?
+      o.constructor.name : '-');
+    o = Object.getPrototypeOf(o);
+  }
+  return a.join('>');
+}
+var DP = Document.prototype;
+ok('document chain', chain(document) ===
+   '->HTMLDocument>Document>Node>EventTarget>Object', chain(document));
+ok('element interfaces named', Object.prototype.hasOwnProperty.call(
+   Element.prototype, 'constructor') && Element.prototype.constructor ===
+   Element && Node.prototype.constructor === Node &&
+   EventTarget.prototype.constructor === EventTarget, chain(document.body));
+ok('only location is the document\'s own',
+   Object.getOwnPropertyNames(document).join() === 'location',
+   Object.getOwnPropertyNames(document).length);
+ok('HTMLDocument.prototype is empty',
+   Object.getOwnPropertyNames(HTMLDocument.prototype).join() === 'constructor',
+   Object.getOwnPropertyNames(HTMLDocument.prototype).join());
+ok('Document.prototype has the methods', ['querySelector', 'querySelectorAll',
+   'getElementById', 'getElementsByClassName', 'getElementsByTagName',
+   'createElement', 'createTextNode'].every(function (k) {
+     return typeof Object.getOwnPropertyDescriptor(DP, k).value === 'function';
+   }), Object.getOwnPropertyNames(DP).length);
+ok('Document.prototype has the accessors', ['body', 'title', 'cookie',
+   'readyState', 'documentElement'].every(function (k) {
+     return typeof Object.getOwnPropertyDescriptor(DP, k).get === 'function';
+   }), 'missing');
+ok('instanceof', document instanceof HTMLDocument &&
+   document instanceof Document && document instanceof Node &&
+   document instanceof EventTarget, 'not');
+ok('toString', Object.prototype.toString.call(document) ===
+   '[object HTMLDocument]' && Object.prototype.toString.call(DP) ===
+   '[object Document]', Object.prototype.toString.call(DP));
+
+/* a method wrapped in a Proxy and put back, as the check does */
+var calls = 0, orig = DP.querySelector;
+DP.querySelector = new Proxy(orig, {
+  apply: function (t, self, args) { calls++; return Reflect.apply(t, self, args); }
+});
+var got = document.querySelector('#a');
+DP.querySelector = orig;
+ok('proxied querySelector runs', got && got.id === 'a' && calls === 1,
+   calls + ' ' + got);
+var qsa = new Proxy(DP.querySelectorAll, {});
+ok('proxied querySelectorAll', qsa.call(document, '.c').length === 1, 'none');
+
+/* what the document still does as before; its nodes are the doctype,
+   the comment above and html */
+var t = document.title;
+document.title = 'changed';
+ok('title through the prototype', document.title === 'changed', document.title);
+document.title = t;
+var seen = 0;
+function h() { seen++; }
+document.addEventListener('x', h);
+document.dispatchEvent(new Event('x'));
+document.removeEventListener('x', h);
+document.dispatchEvent(new Event('x'));
+ok('document events', seen === 1, seen);
+document.foo = 1;
+ok('a page\'s own property', Object.prototype.hasOwnProperty.call(document,
+   'foo') && !Object.prototype.hasOwnProperty.call(DP, 'foo'), 'shared');
+delete document.foo;
+ok('getElementById', document.getElementById('a').textContent === 'a', 'none');
+ok('childNodes', document.childNodes.length === 3 &&
+   document.firstChild.nodeType === 10, document.childNodes.length);
+</script></body></html>

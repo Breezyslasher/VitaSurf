@@ -8402,6 +8402,11 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   if(W.EventTarget)W.EventTarget.prototype=T;
   if(W.Node)W.Node.prototype=N;
   if(W.Element)W.Element.prototype=E;
+  /* each interface's prototype names it, as a browser's does; a node
+     still answers its own through P's constructor getter */
+  [[T,W.EventTarget],[N,W.Node],[E,W.Element]].forEach(function(p){
+   if(p[1])Object.defineProperty(p[0],'constructor',{configurable:true,
+    writable:true,value:p[1]});});
   if(W.CharacterData)W.CharacterData.prototype=N;
  }catch(e){}
 })();
@@ -8439,6 +8444,37 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   get:function(){
    return liveCollection(function(){return listOf(dkids.get.call(D));},
     null,true);}});
+})();
+
+/* The document's interfaces in a browser's order (VitaSurf). The page's
+ * document carried every one of its methods and accessors itself, over
+ * an empty HTMLDocument.prototype that Document.prototype was the same
+ * object as, with no Node or EventTarget in the chain. So
+ * Document.prototype.querySelector was undefined where a browser has a
+ * function, and claude.ai's Cloudflare check, which reads it and hands
+ * it to new Proxy, stopped on "Cannot create proxy with a non-object as
+ * target". The chain is now document > HTMLDocument.prototype >
+ * Document.prototype > Node.prototype > EventTarget.prototype, and what
+ * the document had of its own is on Document.prototype, except location,
+ * which a browser keeps on the document. State the prelude keeps on the
+ * document, which cannot be reconfigured, stays where it is. */
+(function(){
+ var HD=Object.getPrototypeOf(D),N=W.Node&&W.Node.prototype;
+ if(!N||!W.Document||HD===Object.prototype)return;
+ var DP=Object.create(N);
+ Object.defineProperty(DP,'constructor',{configurable:true,writable:true,
+  value:W.Document});
+ Object.defineProperty(DP,Symbol.toStringTag,{configurable:true,
+  value:'Document'});
+ Object.defineProperty(HD,Symbol.toStringTag,{configurable:true,
+  value:'HTMLDocument'});
+ Reflect.ownKeys(D).forEach(function(k){
+  if(k==='location')return;
+  var d=Object.getOwnPropertyDescriptor(D,k);
+  if(!d||!d.configurable)return;
+  try{Object.defineProperty(DP,k,d);delete D[k];}catch(e){}});
+ Object.setPrototypeOf(HD,DP);
+ W.Document.prototype=DP;
 })();
 
 /* --- dedicated workers (VitaSurf) --------------------------------------
