@@ -1737,7 +1737,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
 var t0=Date.now();var perf=W.performance||{};W.performance=perf;if(!perf.now)perf.now=function(){return Date.now()-t0;};perf.timing={navigationStart:t0,unloadEventStart:0,unloadEventEnd:0,redirectStart:0,redirectEnd:0,secureConnectionStart:0,fetchStart:t0,domainLookupStart:t0,domainLookupEnd:t0,connectStart:t0,connectEnd:t0,requestStart:t0,responseStart:t0,responseEnd:t0,domLoading:t0,domInteractive:t0,domContentLoadedEventStart:t0,domContentLoadedEventEnd:t0,domComplete:t0,loadEventStart:t0,loadEventEnd:t0};perf.navigation={type:0,redirectCount:0};perf.mark=perf.measure=perf.clearMarks=perf.clearMeasures=function(){};perf.getEntries=perf.getEntriesByType=perf.getEntriesByName=function(){return [];};
 navigator.language='en-US';navigator.languages=['en-US','en'];navigator.cookieEnabled=true;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};
 location.reload=function(){location.href=location.href;};
-['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:(m[1]||'')+'//'+(m[2]||'')}[k];}});});
+['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:m[1]?m[1]+'//'+(m[2]||''):'null'}[k];}});});
 location.toString=function(){return location.href;};
 function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();}
 /* A passive listener cannot cancel: preventDefault from inside one does
@@ -2126,6 +2126,11 @@ Object.defineProperties(URL.prototype,{
  /* A file URL has no host, and its origin serialises as the scheme
   * alone rather than as null. */
  origin:{configurable:true,get:function(){
+  /* a blob URL's is the origin of the URL inside it */
+  if(this.protocol==='blob:'){
+   try{var in_=new URL(this.href.slice(5).replace(/#.*$/,''));
+    return /^(https?|file):$/.test(in_.protocol)?in_.origin:'null';}
+   catch(e){return 'null';}}
   if(this.hostname)return this.protocol+'//'+this.host;
   return this.protocol==='file:'?'file://':'null';}},
  href:{configurable:true,
@@ -6526,6 +6531,20 @@ W.OffscreenCanvas=function(w,h){this.width=w|0;this.height=h|0;
  * with a blob: scheme it cannot handle.
  */
 var blobURLs={},blobSeq=0;
+/* Object URLs are one table for an origin's windows, as a browser keeps
+ * them: one made in a frame of the page's origin -- a blank one among
+ * them -- is fetched or started as a worker by the page, and the other
+ * way round. Each window kept its own, so claude.ai's challenge, which
+ * makes its worker's object URL with one window's URL and starts it with
+ * another's Worker, was told "Failed to load the worker's script". The
+ * table is the topmost same-origin window's. */
+try{Object.defineProperty(W,'__vitaBlobURLs',{value:blobURLs});}catch(e){}
+function blobTable(){
+ var w=W,p,t;
+ try{
+  for(;;){p=w.parent;if(!p||p===w||p.origin!==W.origin)break;w=p;}
+  t=w.__vitaBlobURLs;}catch(e){}
+ return t||blobURLs;}
 /* A blob holds bytes. It used to hold a string, so a blob made from a
    buffer was decoded as text on the way in and re-encoded on the way
    out, which does not survive anything that is not text. */
@@ -6605,15 +6624,20 @@ FileReader.prototype.abort=function(){this.readyState=2;this._fire('abort');};
 W.FileReader=FileReader;
 W.FileReaderSync=function(){};
 W.FileReaderSync.prototype.readAsText=function(b){return b?b._t||'':'';};
-URL.createObjectURL=function(o){var u='blob:'+String(location.href)+'/'+(++blobSeq);
- blobURLs[u]=o;return u;};
-URL.revokeObjectURL=function(u){delete blobURLs[u];};
+/* blob:, the origin and a UUID, as a browser makes it: the page's whole
+   address with a counter was a URL whose origin read as null */
+URL.createObjectURL=function(o){
+ var c=W.crypto,id=c&&typeof c.randomUUID==='function'?c.randomUUID():
+  String(++blobSeq);
+ var u='blob:'+W.origin+'/'+id;
+ blobTable()[u]=o;return u;};
+URL.revokeObjectURL=function(u){delete blobTable()[String(u)];};
 /* A module imported from an object URL or a data: URL has nothing to
    fetch: qjs.c asks here for its text, or null if there is none. */
 W.__vitaLocalModule=function(u){
  u=String(u);
  if(u.indexOf('blob:')===0){
-  var b=blobURLs[u];
+  var b=blobTable()[u];
   return b===undefined?null:(b._t!==undefined?b._t:String(b));}
  var m=/^data:([^,]*),/i.exec(u);
  if(!m)return null;
@@ -6766,7 +6790,7 @@ W.CSS.supports=function(a,b){
  W.fetch=function(input,init){
   var u=String((input&&input.url)||input||'');
   if(u.indexOf('blob:')===0){
-   var b=blobURLs[u];
+   var b=blobTable()[u];
    if(b===undefined)return Promise.reject(new TypeError('Failed to fetch'));
    return Promise.resolve(new Response(b._t!==undefined?b._t:String(b),
     {status:200,statusText:'OK',url:u}));}
@@ -8578,7 +8602,7 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
       f.lineno+')');},0);},
    close:function(){me.terminate();},
    blobText:function(u){
-    var b=blobURLs[u];
+    var b=blobTable()[u];
     return b===undefined?null:(b._t!==undefined?b._t:String(b));}});
   if(type==='module'){st.port.runModule();return;}
   /* fetch does not read files; the fetch importScripts uses does */

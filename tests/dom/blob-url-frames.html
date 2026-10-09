@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!-- Object URLs across same-origin windows (VitaSurf). Each window kept
+     its own table, so a URL made with a blank frame's URL could not be
+     fetched or started as a worker by the page, nor the page's by the
+     frame: claude.ai's challenge did that and was told "Failed to load the
+     worker's script". The URL is blob:, the origin and a UUID, and its
+     origin is the page's. Expected console output (Chrome gives the same):
+     lines ending in "ok". -->
+<html><head><title>blob URL frames</title></head><body><script>
+function ok(name, cond, got) {
+  console.log('XX ' + name + ': ' + (cond ? 'ok' : 'FAIL ' + got));
+}
+var src = 'onmessage=function(e){postMessage(e.data*2)}';
+var mine = URL.createObjectURL(new Blob([src], {type: 'text/javascript'}));
+ok('url form', mine.indexOf('blob:' + self.origin + '/') === 0 &&
+   /\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+   .test(mine), mine);
+ok('url origin', new URL(mine).origin === new URL(location.href).origin,
+   new URL(mine).origin);
+ok('opaque blob origin', new URL('blob:null/x').origin === 'null' &&
+   new URL('blob:about:blank').origin === 'null', 'not null');
+
+var f = document.createElement('iframe');
+document.body.appendChild(f);
+var fw = f.contentWindow;
+ok('blank frame location origin', fw.location.origin === 'null',
+   fw.location.origin);
+var theirs = fw.URL.createObjectURL(new fw.Blob([src],
+  {type: 'text/javascript'}));
+ok('frame url has the page origin', theirs.indexOf('blob:' + self.origin +
+   '/') === 0, theirs);
+
+var pending = 4, results = {};
+function done(k, v) {
+  results[k] = v;
+  if (--pending) return;
+  ok('page fetches frame url', results.f1 === true, results.f1);
+  ok('frame fetches page url', results.f2 === true, results.f2);
+  ok('page worker from frame url', results.w1 === 8, results.w1);
+  ok('frame worker from page url', results.w2 === 6, results.w2);
+}
+fetch(theirs).then(function (r) { return r.text(); }).then(
+  function (t) { done('f1', t === src); }, function (e) { done('f1', String(e)); });
+fw.fetch(mine).then(function (r) { return r.text(); }).then(
+  function (t) { done('f2', t === src); }, function (e) { done('f2', String(e)); });
+var w1 = new Worker(theirs);
+w1.onmessage = function (e) { done('w1', e.data); w1.terminate(); };
+w1.onerror = function () { done('w1', 'error'); };
+w1.postMessage(4);
+var w2 = new fw.Worker(mine);
+w2.onmessage = function (e) { done('w2', e.data); w2.terminate(); };
+w2.onerror = function () { done('w2', 'error'); };
+w2.postMessage(3);
+</script></body></html>
