@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<!-- isTrusted as a browser has it: true for the events the browser fires
+     -- a message another window sent, an invalid event from checking a
+     form -- and false for one a script made or sent with dispatchEvent,
+     or with click(); and each event's own, so a page cannot redefine it.
+     It read false for every event, and the claude.ai challenge's widget,
+     which takes no message a page could have forged, never answered its
+     frame. Expected lines are what Chrome prints. -->
+<html><head><title>event trust</title></head><body><div id=c></div><button id=b>b</button><form id=f><input name=x required></form><script>
+var out=[];function L(s){out.push(s);}
+function tag(e){return Object.prototype.toString.call(e);}
+var f=document.createElement('iframe');f.src='data:text/html,'+encodeURIComponent('<script>parent.postMessage({event:"hi"},"*")<\/script>');document.getElementById('c').appendChild(f);
+window.addEventListener('message',function(e){L('message from frame trusted '+e.isTrusted+' '+tag(e));});
+var made=new Event('x');L('new Event trusted '+made.isTrusted+' '+tag(made));
+var ce=new CustomEvent('y',{detail:1});L('CustomEvent '+ce.isTrusted+' '+tag(ce));
+var me=new MessageEvent('message',{data:1});L('new MessageEvent '+me.isTrusted+' '+tag(me));
+var b=document.getElementById('b');
+b.addEventListener('click',function(e){L('click() trusted '+e.isTrusted+', a MouseEvent '+(e instanceof MouseEvent));});
+b.click();
+var seen=null;document.addEventListener('zz',function(e){seen=e.isTrusted;});document.dispatchEvent(new Event('zz'));L('dispatched script event '+seen);
+var inp=document.querySelector('input');inp.addEventListener('invalid',function(e){L('invalid trusted '+e.isTrusted);});document.getElementById('f').checkValidity();
+try{Object.defineProperty(made,'isTrusted',{value:true});}catch(e){L('cannot redefine own: '+e.name);}
+L('own defined '+made.isTrusted);
+setTimeout(function(){out.forEach(function(l){console.log('XX '+l);});},1200);
+</script></body></html>

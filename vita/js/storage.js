@@ -18,6 +18,9 @@
 'use strict';
 var W = window;
 var load = W.__vitaStoreLoad, save = W.__vitaStoreSave;
+/* the events this file fires are the browser's, so trusted (VitaSurf) */
+var uaEvent = W.__vitaUaEvent || function(e){ return e; };
+try { delete W.__vitaUaEvent; } catch (e) {}
 
 /* ------------------------------------------------------- the backing store */
 
@@ -401,7 +404,7 @@ Object.defineProperty(Storage.prototype, 'length', {
 function fireStorage(key, oldValue, newValue){
  if (typeof StorageEvent !== 'function' && typeof Event !== 'function') return;
  try {
-  var e = new Event('storage');
+  var e = uaEvent(new Event('storage'));
   e.key = key; e.oldValue = oldValue; e.newValue = newValue;
   e.url = W.location ? String(W.location.href) : '';
   e.storageArea = W.localStorage;
@@ -603,7 +606,7 @@ function report(err, where){
 }
 function mkEvent(type){
  var e;
- try { e = new Event(type); } catch (x) { e = { type: type }; }
+ try { e = uaEvent(new Event(type)); } catch (x) { e = { type: type, isTrusted: true }; }
  return e;
 }
 

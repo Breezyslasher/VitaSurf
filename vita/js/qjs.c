@@ -9341,6 +9341,10 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 	dom_string *type = NULL;
 	struct dom_event_target *target = NULL;
 
+	/* an event this browser made and sent, not one a page made: those
+	 * reach listeners as the page's own objects (VitaSurf) */
+	JS_SetPropertyStr(ctx, obj, "isTrusted", JS_TRUE);
+
 	if (dom_event_get_type(evt, &type) == DOM_NO_ERR && type != NULL) {
 		JS_SetPropertyStr(ctx, obj, "type",
 			JS_NewStringLen(ctx, dom_string_data(type),

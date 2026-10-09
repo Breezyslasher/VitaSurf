@@ -217,6 +217,20 @@ P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=viewport
 /* A disabled form control is not clickable: click() on one dispatches
    nothing at all. Dispatching a click at it explicitly still works,
    which is the difference the tests turn on. */
+/* The events this browser fires itself are trusted, as a browser's are,
+   and the ones a page makes are not (VitaSurf). isTrusted said false for
+   every event, so a page that only answers the browser -- the claude.ai
+   challenge's widget takes no message a page could have forged -- heard
+   nothing. Kept here, where no page can add to it. */
+var TRUSTED=new WeakSet();
+function uaEvent(e){try{TRUSTED.add(e);}catch(x){}return e;}
+/* each event's own, and not to be redefined, as [LegacyUnforgeable] has
+   it: a page cannot make its own event claim to be the browser's */
+function trustedGet(){return TRUSTED.has(this);}
+function ownTrust(e){
+ try{Object.defineProperty(e,'isTrusted',{get:trustedGet,enumerable:true,
+  configurable:false});}catch(x){}}
+
 var FORM_CONTROLS=' BUTTON INPUT SELECT TEXTAREA FIELDSET OPTGROUP OPTION ';
 function isDisabledControl(el){
  return !!el&&el.nodeType===1&&
@@ -1012,8 +1026,8 @@ function goTo(url){
    (D.getElementById(decodeURIComponent(hash.slice(1)))||null):null;}catch(e){}
   if(target&&target.scrollIntoView)try{target.scrollIntoView();}catch(e){}
   setTimeout(function(){
-   var ev=new W.HashChangeEvent('hashchange',
-    {bubbles:false,cancelable:false});
+   var ev=uaEvent(new W.HashChangeEvent('hashchange',
+    {bubbles:false,cancelable:false}));
    ev.oldURL=oldURL;ev.newURL=abs;
    try{W.dispatchEvent?W.dispatchEvent(ev):__vitaDispatch(null,ev);}catch(e){}
   },0);
@@ -1082,7 +1096,7 @@ function fireAfterActivate(was){
  fireSimple(was.el,'input');
  fireSimple(was.el,'change');}
 function fireSimple(el,type){
- var e=new Event(type,{bubbles:true,cancelable:false,composed:type==='input'});
+ var e=uaEvent(new Event(type,{bubbles:true,cancelable:false,composed:type==='input'}));
  try{el.dispatchEvent(e);}catch(err){}}
 P.dispatchEvent=function(e){
  var act=null,r;
@@ -1174,7 +1188,6 @@ D.createEvent=function(t){
  /* an event made this way is uninitialised until initEvent is called */
  ev.type='';ev.target=null;ev.currentTarget=null;ev.eventPhase=0;
  ev.bubbles=false;ev.cancelable=false;ev.defaultPrevented=false;
- ev.isTrusted=false;
  return ev;};D.dispatchEvent=function(e){return __vitaDispatch(D,e);};
 /* window.event: undefined outside a dispatch; the listener call sets it */
 if(!Object.prototype.hasOwnProperty.call(window,'event'))window.event=undefined;
@@ -1261,7 +1274,7 @@ window.reportError=function(e){try{console.error(e);}catch(x){}};
  * message event, asynchronously and in order, like a real one. */
 window.postMessage=function(data){
  setTimeout(function(){
-  var e=new Event('message');e.data=data;e.origin=location.origin||'';e.source=window;e.ports=[];
+  var e=uaEvent(new Event('message'));e.data=data;e.origin=location.origin||'';e.source=window;e.ports=[];
   __vitaDispatch(null,e);
  },0);
 };
@@ -1414,6 +1427,9 @@ D.getElementsByName=function(n){return D.querySelectorAll('[name='+n+']').filter
 D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};
 ['onload','onreadystatechange','onclick','onkeydown','onkeyup','onmousemove','ontouchstart'].forEach(function(h){Object.defineProperty(D,h,{configurable:true,get:function(){return D['__'+h]||null;},set:function(f){D['__'+h]=f;if(typeof f==='function')D.addEventListener(h.slice(2),f);}});});
 var W=window;
+/* storage.js fires the storage and IndexedDB events, and takes this away
+   before any page script runs */
+Object.defineProperty(W,'__vitaUaEvent',{configurable:true,value:uaEvent});
 /* The tree generation, read straight out of the C counter through a
    typed array over it (VitaSurf): __vitaDomGen() was a call into C on
    every read, and the attribute cache reads it once per attribute. */
@@ -1759,6 +1775,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
    var ev;
    try{ ev=new W.PopStateEvent('popstate',{bubbles:false,cancelable:false}); }
    catch(err){ ev=new Event('popstate'); }
+   uaEvent(ev);
    try{ ev.state=e.state; }catch(err){}
    try{ W.dispatchEvent?W.dispatchEvent(ev):__vitaDispatch(null,ev); }catch(err){}
   },0);
@@ -1801,7 +1818,7 @@ navigator.language='en-US';navigator.languages=['en-US','en'];navigator.cookieEn
 location.reload=function(){location.href=location.href;};
 ['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:m[1]?m[1]+'//'+(m[2]||''):'null'}[k];}});});
 location.toString=function(){return location.href;};
-function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();
+function Event(type,init){ownTrust(this);this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();
  /* whether it leaves a shadow tree for the host (VitaSurf) */
  Object.defineProperty(this,'__vsComposed',{configurable:true,value:!!(init&&init.composed)});}
 /* A passive listener cannot cancel: preventDefault from inside one does
@@ -2089,7 +2106,8 @@ KeyboardEventC.prototype.initKeyboardEvent=function(t,b,c){this.initEvent(t,b,c)
 Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,
  get:function(){return this._phase===undefined?0:this._phase;},
  set:function(v){shadowProp(this,'_phase',v|0);}});
-Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,get:function(){return false;}});
+Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,
+ get:function(){return TRUSTED.has(this);}});
 /* one a script made says what it was made with; the browser's own
    events leave shadow trees */
 Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){
@@ -2157,7 +2175,7 @@ MessagePort.prototype._flush=function(){
   var m=p._q.shift(),e;
   if(!m)return;
   e={data:m.data,type:'message',target:p,currentTarget:p,source:null,origin:'',
-   ports:m.ports,lastEventId:'',preventDefault:function(){},
+   ports:m.ports,lastEventId:'',isTrusted:true,preventDefault:function(){},
    stopPropagation:function(){},stopImmediatePropagation:function(){}};
   if(typeof p._on==='function'){try{p._on.call(p,e);}catch(x){console.error(x);}}
   p._l.slice().forEach(function(f){
@@ -2187,6 +2205,11 @@ W.MessageChannel=MessageChannel;W.MessagePort=MessagePort;
 W.MessageEvent=W.MessageEvent||Event;
 /* The three with real fields; the aliases above stay plain Events. */
 W.UIEvent=UIEventC;W.MouseEvent=MouseEventC;W.KeyboardEvent=KeyboardEventC;
+/* their names, for Object.prototype.toString, as a browser's give */
+[['Event',Event],['CustomEvent',CustomEvent],['UIEvent',UIEventC],
+ ['MouseEvent',MouseEventC],['KeyboardEvent',KeyboardEventC]].forEach(function(p){
+ if(!Object.prototype.hasOwnProperty.call(p[1].prototype,Symbol.toStringTag))
+  Object.defineProperty(p[1].prototype,Symbol.toStringTag,{configurable:true,value:p[0]});});
 /* These carry a mouse's or a key's fields, so give them those. */
 W.WheelEvent=W.PointerEvent=W.DragEvent=MouseEventC;
 W.FocusEvent=UIEventC;W.InputEvent=UIEventC;
@@ -2450,8 +2473,8 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
    var me=this;
    st.state=3;
    setTimeout(function(){
-    fire(me,new Event('error'));
-    fire(me,new CloseEvent('close',{wasClean:false,code:1006,reason:''}));},0);
+    fire(me,uaEvent(new Event('error')));
+    fire(me,uaEvent(new CloseEvent('close',{wasClean:false,code:1006,reason:''})));},0);
    return;}
   socks[st.id]=this;}
  WebSocket.prototype=Object.create(ETP);
@@ -2508,18 +2531,18 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
    if(kind===1){
     if(s.state!==0)return;
     s.state=1;s.protocol=data||'';
-    fire(ws,new Event('open'));}
+    fire(ws,uaEvent(new Event('open')));}
    else if(kind===2||kind===3){
     if(s.state!==1)return;
     d=data;
     if(kind===3&&s.binaryType==='blob'&&W.Blob)d=new W.Blob([data]);
-    fire(ws,new MessageEvent('message',{data:d,origin:new URL(s.url).origin}));}
+    fire(ws,uaEvent(new MessageEvent('message',{data:d,origin:new URL(s.url).origin})));}
    else if(kind===4){
-    fire(ws,new Event('error'));}
+    fire(ws,uaEvent(new Event('error')));}
    else if(kind===5){
     delete socks[id];
     s.state=3;
-    fire(ws,new CloseEvent('close',{wasClean:code!==1006,code:code,reason:data||''}));}}});
+    fire(ws,uaEvent(new CloseEvent('close',{wasClean:code!==1006,code:code,reason:data||''})));}}});
  W.WebSocket=WebSocket;
 })();
 
@@ -3486,7 +3509,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
     if(same(now,old))continue;
     Object.defineProperty(ss[j],'__vsSeen',{configurable:true,writable:true,
      enumerable:false,value:now});
-    try{ss[j].dispatchEvent(new Event('slotchange',{bubbles:true}));}catch(e){}}}}
+    try{ss[j].dispatchEvent(uaEvent(new Event('slotchange',{bubbles:true})));}catch(e){}}}}
  var ael=P.addEventListener;
  if(ael)P.addEventListener=function(t){
   if(t==='slotchange')watch=true;
@@ -3831,7 +3854,7 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
  EP.checkValidity=function(){
   var el=this._el;
   if(!this.willValidate||this.validity.valid)return true;
-  el.dispatchEvent(new Event('invalid',{bubbles:false,cancelable:true}));
+  el.dispatchEvent(uaEvent(new Event('invalid',{bubbles:false,cancelable:true})));
   return false;};
  EP.reportValidity=function(){return this.checkValidity();};
  /* the ARIA a custom element sets on itself through its internals */
@@ -3900,21 +3923,21 @@ function popQueueToggle(el,oldS,newS){
  t={oldState:oldS,newState:newS};POPTOGGLE.set(el,t);
  setTimeout(function(){
   POPTOGGLE.delete(el);
-  try{el.dispatchEvent(new ToggleEvent('toggle',
-   {oldState:t.oldState,newState:t.newState}));}catch(e){}},0);}
+  try{el.dispatchEvent(uaEvent(new ToggleEvent('toggle',
+   {oldState:t.oldState,newState:t.newState})));}catch(e){}},0);}
 function popSet(el,open){if(POPN)POPN(el,open);}
 P.showPopover=function(){
  if(!popValid(this,true))return;
- if(!this.dispatchEvent(new ToggleEvent('beforetoggle',
-   {oldState:'closed',newState:'open',cancelable:true})))return;
+ if(!this.dispatchEvent(uaEvent(new ToggleEvent('beforetoggle',
+   {oldState:'closed',newState:'open',cancelable:true}))))return;
  /* a listener may have changed things */
  if(!popValid(this,true))return;
  popSet(this,true);
  popQueueToggle(this,'closed','open');};
 P.hidePopover=function(){
  if(!popValid(this,false))return;
- this.dispatchEvent(new ToggleEvent('beforetoggle',
-  {oldState:'open',newState:'closed'}));
+ this.dispatchEvent(uaEvent(new ToggleEvent('beforetoggle',
+  {oldState:'open',newState:'closed'})));
  if(!popShown(this))return;
  popSet(this,false);
  popQueueToggle(this,'open','closed');};
@@ -4239,7 +4262,7 @@ P.checkValidity=function(){
  if(this.tagName==='FORM')return listOf(this.elements).every(function(c){return c.checkValidity();});
  if(!this.willValidate)return true;
  if(this.validity.valid)return true;
- this.dispatchEvent(new Event('invalid',{bubbles:false,cancelable:true}));
+ this.dispatchEvent(uaEvent(new Event('invalid',{bubbles:false,cancelable:true})));
  return false;};
 P.reportValidity=function(){return this.checkValidity();};
 /* Text selection inside a control. Nothing here has a caret, so the
@@ -4251,7 +4274,7 @@ Object.defineProperty(P,'selectionDirection',{configurable:true,
  get:function(){return this.__selectionDirection||'none';},
  set:function(v){this.__selectionDirection=String(v);}});
 P.setSelectionRange=function(s,e,d){this.selectionStart=s;this.selectionEnd=e;
- this.selectionDirection=d||'none';this.dispatchEvent(new Event('select'));};
+ this.selectionDirection=d||'none';this.dispatchEvent(uaEvent(new Event('select')));};
 P.setRangeText=function(rep,s,e){var v=String(this.value||'');
  if(s===undefined){s=this.selectionStart;e=this.selectionEnd;}
  this.value=v.slice(0,s)+String(rep)+v.slice(e);};
@@ -4358,7 +4381,7 @@ Object.defineProperty(P,'index',{configurable:true,get:function(){
    if(t==='TEXTAREA'){this.textContent=String(v);return;}
    d.set.call(this,v);}});})();
 P.requestSubmit=function(submitter){
- if(!this.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})))return;
+ if(!this.dispatchEvent(uaEvent(new Event('submit',{bubbles:true,cancelable:true}))))return;
  this.submit(submitter);};
 /* The window a form or link target names (VitaSurf): _self, _parent,
    _top, or a frame by name, looked for here, then in the frames around
@@ -4409,7 +4432,7 @@ P.submit=function(submitter){
  }catch(e){}};
 P.reset=function(){
  if(this.tagName!=='FORM')return;
- if(!this.dispatchEvent(new Event('reset',{bubbles:true,cancelable:true})))return;
+ if(!this.dispatchEvent(uaEvent(new Event('reset',{bubbles:true,cancelable:true}))))return;
  listOf(this.elements).forEach(function(c){
   if(c.tagName==='SELECT'){c.selectedIndex=0;return;}
   if(c.type==='checkbox'||c.type==='radio'){c.checked=c.defaultChecked;return;}
@@ -4610,8 +4633,8 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
    msgNote(src,message,'dropped: its target origin is not this window\'s');
    return;}
   if(ports.length)ports=portMove(ports,W.MessagePort);
-  ev=new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
-   source:view(src),ports:ports});
+  ev=uaEvent(new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
+   source:view(src),ports:ports}));
   setTimeout(function(){
    var tr=msgTraceStart(src,ev,data,ports);
    msgNote(src,message,'delivered'+(to==='*'?' (to any origin)':''));
@@ -5907,6 +5930,7 @@ function eventClass(name,fields,base){
  for(k in fields)all[k]=fields[k];
  var C=function(type,init){
   init=(init===undefined||init===null)?{}:init;
+  ownTrust(this);
   this.type=String(type);
   this.bubbles=!!init.bubbles;this.cancelable=!!init.cancelable;
   Object.defineProperty(this,'__vsComposed',{configurable:true,value:!!init.composed});
@@ -5915,6 +5939,8 @@ function eventClass(name,fields,base){
    this[kk]=init[kk]!==undefined?init[kk]:all[kk];},this);};
  C.prototype=Object.create((base||Event).prototype);
  C.prototype.constructor=C;
+ /* what Object.prototype.toString calls it, as a browser's are named */
+ Object.defineProperty(C.prototype,Symbol.toStringTag,{configurable:true,value:name});
  C.__vitaFields=all;
  EVENT_FIELDS[name]=all;
  W[name]=C;
@@ -6353,10 +6379,10 @@ P.deleteCell=function(i){var c=this.cells||[];if(c[i])c[i].remove();};
  * default style keys off. */
 P.show=function(){this.setAttribute('open','');};
 P.showModal=function(){this.setAttribute('open','');
- this.dispatchEvent(new Event('beforetoggle'));};
+ this.dispatchEvent(uaEvent(new Event('beforetoggle')));};
 P.close=function(v){if(v!==undefined)this.returnValue=String(v);
- this.removeAttribute('open');this.dispatchEvent(new Event('close'));};
-P.requestClose=function(v){if(this.dispatchEvent(new Event('cancel',{cancelable:true})))this.close(v);};
+ this.removeAttribute('open');this.dispatchEvent(uaEvent(new Event('close')));};
+P.requestClose=function(v){if(this.dispatchEvent(uaEvent(new Event('cancel',{cancelable:true}))))this.close(v);};
 Object.defineProperty(P,'returnValue',{configurable:true,
  get:function(){return this.__returnValue||'';},set:function(v){this.__returnValue=String(v);}});
 Object.defineProperty(P,'closedBy',{configurable:true,
@@ -6425,9 +6451,9 @@ P.assignedElements=function(o){return this.assignedNodes(o).filter(function(n){r
  P.load=function(){this.__ended=false;this.__paused=true;};
  P.play=function(){var self=this;self.__paused=false;
   setTimeout(function(){self.__paused=true;self.__ended=true;
-   self.dispatchEvent(new Event('ended'));},0);
+   self.dispatchEvent(uaEvent(new Event('ended')));},0);
   return Promise.reject(new Error('NotSupportedError: no media decoder'));};
- P.pause=function(){this.__paused=true;this.dispatchEvent(new Event('pause'));};
+ P.pause=function(){this.__paused=true;this.dispatchEvent(uaEvent(new Event('pause')));};
  P.fastSeek=function(t){this.currentTime=t;};
  P.canPlayType=function(){return '';};
  P.getStartDate=function(){return new Date(NaN);};
@@ -6484,7 +6510,7 @@ function focusable(el){
  var ce=el.getAttribute('contenteditable');
  return ce!==null&&ce!=='false';}
 function focusEvent(el,type,bubbles,related){
- var e=new Event(type,{bubbles:bubbles,cancelable:false,composed:true});
+ var e=uaEvent(new Event(type,{bubbles:bubbles,cancelable:false,composed:true}));
  try{e.relatedTarget=related||null;}catch(x){}
  try{el.dispatchEvent(e);}catch(x){}}
 function moveFocus(el,caret){
@@ -8035,6 +8061,7 @@ W.__vitaReportError=function(err,where){
   colno:col,error:err,bubbles:false,cancelable:true});}
  catch(e3){ev={type:'error',message:msg,filename:file,lineno:line,colno:col,
   error:err,defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
+ uaEvent(ev);
  var handled=false;
  try{
   if(typeof W.onerror==='function'){
@@ -8086,6 +8113,7 @@ function flushRejections(){
    {reason:entry.r,promise:entry.p,cancelable:true});}
   catch(e){ev={type:'unhandledrejection',reason:entry.r,promise:entry.p,
    defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
+  uaEvent(ev);
   try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
   try{__vitaDispatch(null,ev);}catch(e3){}
   /* Say so, as a browser does. A page whose async work fails and whose
@@ -9097,7 +9125,7 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    st.g=null;st.port=null;
    setTimeout(function(){
     if(st.dead)return;
-    var ev=new ErrorEvent('error',{message:message,filename:abs,cancelable:true});
+    var ev=uaEvent(new ErrorEvent('error',{message:message,filename:abs,cancelable:true}));
     if(me.dispatchEvent(ev))console.error('Worker '+abs+': '+message);},0);}
   try{g=NW?NW():null;}catch(e){g=null;}
   if(!g||typeof g.__vitaBecomeWorker!=='function'){
@@ -9109,14 +9137,14 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
     var d;
     try{d=W.structuredClone(data);}
     catch(e){setTimeout(function(){if(!st.dead)
-     me.dispatchEvent(new MessageEvent('messageerror',{}));},0);return;}
+     me.dispatchEvent(uaEvent(new MessageEvent('messageerror',{})));},0);return;}
     setTimeout(function(){if(!st.dead)
-     me.dispatchEvent(new MessageEvent('message',{data:d}));},0);},
+     me.dispatchEvent(uaEvent(new MessageEvent('message',{data:d})));},0);},
    error:function(f){
     setTimeout(function(){
      if(st.dead)return;
-     var ev=new ErrorEvent('error',{message:f.message,filename:f.filename,
-      lineno:f.lineno,colno:f.colno,cancelable:true});
+     var ev=uaEvent(new ErrorEvent('error',{message:f.message,filename:f.filename,
+      lineno:f.lineno,colno:f.colno,cancelable:true}));
      if(me.dispatchEvent(ev))console.error(f.message+' ('+f.filename+':'+
       f.lineno+')');},0);},
    close:function(){me.terminate();},
@@ -9211,8 +9239,8 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    if(reporting){console.error(f.message);return;}
    reporting=true;
    try{
-    ev=new ErrorEvent('error',{message:f.message,filename:f.filename,
-     lineno:f.lineno,colno:f.colno,error:err,cancelable:true});
+    ev=uaEvent(new ErrorEvent('error',{message:f.message,filename:f.filename,
+     lineno:f.lineno,colno:f.colno,error:err,cancelable:true}));
     if(W.dispatchEvent(ev))owner.error(f);}
    finally{reporting=false;}};
   listens(W,function(e){W.__vitaReportError(e);});
@@ -9246,9 +9274,9 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    var d;
    try{d=structuredClone(message);}
    catch(e){setTimeout(function(){
-    W.dispatchEvent(new MessageEvent('messageerror',{}));},0);return;}
+    W.dispatchEvent(uaEvent(new MessageEvent('messageerror',{})));},0);return;}
    setTimeout(function(){
-    if(!closing)W.dispatchEvent(new MessageEvent('message',{data:d}));},0);}
+    if(!closing)W.dispatchEvent(uaEvent(new MessageEvent('message',{data:d})));},0);}
   function begin(){started=true;queue.splice(0).forEach(deliver);}
   return {
    receive:function(message){
