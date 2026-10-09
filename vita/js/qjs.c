@@ -12792,8 +12792,9 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 	vita_log("console: that was said from%s", n > 0 ? where :
 		 " nowhere script can see");
 	for (k = 0; k < 3; k++) {
-		JSValue args[3], code;
+		JSValue args[4], code;
 		const char *text;
+		char head[64];
 
 		if (at_line[k] == 0) {
 			continue;
@@ -12801,12 +12802,16 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 		args[0] = JS_NewString(ctx, at_url[k]);
 		args[1] = JS_NewUint32(ctx, at_line[k]);
 		args[2] = JS_NewUint32(ctx, at_col[k]);
-		code = win_vita_source_excerpt(ctx, JS_UNDEFINED, 3, args);
+		/* far enough back to take in the test that led here */
+		args[3] = JS_NewUint32(ctx, 350);
+		code = win_vita_source_excerpt(ctx, JS_UNDEFINED, 4, args);
 		JS_FreeValue(ctx, args[0]);
 		text = JS_IsString(code) ? JS_ToCString(ctx, code) : NULL;
 		if (text != NULL && text[0] != '\0') {
-			vita_log("console: frame %d, the code at column %u: %s",
-				 k + 1, at_col[k], text);
+			snprintf(head, sizeof(head),
+				 "console: frame %d, the code at column %u: ",
+				 k + 1, at_col[k]);
+			log_in_pieces(head, text);
 		}
 		if (text != NULL) JS_FreeCString(ctx, text);
 		JS_FreeValue(ctx, code);
@@ -17078,12 +17083,19 @@ static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
 	uint32_t line = 0, col = 0;
 	const uint8_t *src = NULL;
 	size_t len = 0, i, start = 0, pos, from, to, n = 0;
-	char buf[200];
+	uint32_t before = 100;
+	char buf[480];
 	unsigned int k;
 
 	(void)this_val;
 	if (argc < 3 || thread == NULL || thread->htmlc == NULL) {
 		return JS_NewString(ctx, "");
+	}
+	/* how much to show before the position: a fourth argument, for a
+	   check that sits further back than an error's own expression */
+	if (argc > 3 && JS_ToUint32(ctx, &before, argv[3]) == 0 &&
+	    before > 400) {
+		before = 400;
 	}
 	if (JS_ToUint32(ctx, &line, argv[1]) < 0 ||
 	    JS_ToUint32(ctx, &col, argv[2]) < 0 || line == 0) {
@@ -17119,7 +17131,7 @@ static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
 	if (pos > len) {
 		return JS_NewString(ctx, "");
 	}
-	from = pos > 100 ? pos - 100 : 0;
+	from = pos > before ? pos - before : 0;
 	if (from < start) from = start;
 	to = pos + 60 < len ? pos + 60 : len;
 	for (i = from; i < to && n < sizeof(buf) - 8; i++) {
