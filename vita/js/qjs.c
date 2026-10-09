@@ -8550,6 +8550,22 @@ static bool layout_current(jsthread *thread)
 	return htmlc != NULL && htmlc->layout != NULL;
 }
 
+/*
+ * Whether the boxes' styles may be behind the document (VitaSurf): it
+ * changed since they were made, or a sheet did. The restyle runs from
+ * the scheduler, and until it has, a style read selects again from the
+ * document and the sheets as they are, as a browser's style recalc
+ * would. Reading the boxes said a class just set had changed nothing.
+ */
+static bool style_stale(jsthread *thread)
+{
+	html_content *htmlc = thread->htmlc;
+
+	if (htmlc == NULL || htmlc->select_ctx == NULL)
+		return false;
+	return thread->dom_dirty || !html_select_ctx_current(htmlc);
+}
+
 static void timer_callback(void *p)
 {
 	struct js_timer *t = p;
@@ -11163,6 +11179,76 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
  * showing, and answering with the stylesheet's default said every page
  * was black on transparent.
  */
+static const css_select_results *select_without_box(jsthread *thread,
+		struct dom_node *node);
+static const css_unit_ctx *fresh_uctx(jsthread *thread,
+		struct dom_node *node, css_unit_ctx *local);
+
+/*
+ * One side's margin, padding and border width from a style (VitaSurf),
+ * through libcss's px accessors, which resolve calc() as layout does; a
+ * percentage needs layout, and keeps what the caller had.
+ */
+typedef uint8_t (*bm_len_fn)(const css_computed_style *, css_fixed *,
+		css_unit *);
+typedef uint8_t (*bm_px_fn)(const css_computed_style *,
+		const css_unit_ctx *, int, int *);
+
+static void bm_side(const css_computed_style *style,
+		const css_unit_ctx *uctx, bm_len_fn len_fn, bm_px_fn px_fn,
+		uint8_t set, int *out)
+{
+	css_fixed len = 0;
+	css_unit unit = CSS_UNIT_PX;
+	int px = 0;
+
+	if (len_fn(style, &len, &unit) != set || unit == CSS_UNIT_PCT)
+		return;
+	if (px_fn(style, uctx, -1, &px) == set)
+		*out = px;
+}
+
+static void box_model_from_style(const css_computed_style *style,
+		const css_unit_ctx *uctx, int side, int *m, int *p, int *b)
+{
+	static const bm_len_fn margin[4] = { css_computed_margin_top,
+		css_computed_margin_right, css_computed_margin_bottom,
+		css_computed_margin_left };
+	static const bm_px_fn margin_px[4] = { css_computed_margin_top_px,
+		css_computed_margin_right_px, css_computed_margin_bottom_px,
+		css_computed_margin_left_px };
+	static const bm_len_fn padding[4] = { css_computed_padding_top,
+		css_computed_padding_right, css_computed_padding_bottom,
+		css_computed_padding_left };
+	static const bm_px_fn padding_px[4] = { css_computed_padding_top_px,
+		css_computed_padding_right_px, css_computed_padding_bottom_px,
+		css_computed_padding_left_px };
+	static const bm_len_fn border[4] = { css_computed_border_top_width,
+		css_computed_border_right_width,
+		css_computed_border_bottom_width,
+		css_computed_border_left_width };
+	static const bm_px_fn border_px[4] = {
+		css_computed_border_top_width_px,
+		css_computed_border_right_width_px,
+		css_computed_border_bottom_width_px,
+		css_computed_border_left_width_px };
+	static uint8_t (*const border_style[4])(const css_computed_style *) = {
+		css_computed_border_top_style, css_computed_border_right_style,
+		css_computed_border_bottom_style,
+		css_computed_border_left_style };
+	uint8_t bs;
+
+	bm_side(style, uctx, margin[side], margin_px[side], CSS_MARGIN_SET, m);
+	bm_side(style, uctx, padding[side], padding_px[side],
+		CSS_PADDING_SET, p);
+	bs = border_style[side](style);
+	if (bs == CSS_BORDER_STYLE_NONE || bs == CSS_BORDER_STYLE_HIDDEN)
+		*b = 0;
+	else
+		bm_side(style, uctx, border[side], border_px[side],
+			CSS_BORDER_WIDTH_WIDTH, b);
+}
+
 static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
@@ -11174,6 +11260,10 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	css_fixed len = 0;
 	css_unit unit = CSS_UNIT_PX;
 	css_color colour = 0;
+	const css_computed_style *style = NULL;
+	const css_unit_ctx *uctx = &thread->htmlc->unit_len_ctx;
+	css_unit_ctx local_uctx;
+	bool fresh = false;
 	JSValue arr;
 	int px;
 
@@ -11182,11 +11272,31 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread)) {
+	if (node == NULL) {
 		return JS_NULL;
 	}
-	box = box_for_node(node);
-	if (box == NULL || box->style == NULL) {
+	/* before the first layout there are no boxes, but there is a
+	 * style to select (VitaSurf) */
+	box = layout_current(thread) ? box_for_node(node) : NULL;
+	/* changed since it was styled: what it is now, from a fresh
+	 * selection (VitaSurf) */
+	if (!layout_current(thread) || style_stale(thread)) {
+		const css_select_results *sel = select_without_box(thread,
+								   node);
+
+		if (sel != NULL &&
+		    sel->styles[CSS_PSEUDO_ELEMENT_NONE] != NULL) {
+			style = sel->styles[CSS_PSEUDO_ELEMENT_NONE];
+			fresh = true;
+			uctx = fresh_uctx(thread, node, &local_uctx);
+		}
+	}
+	if (style == NULL && box != NULL)
+		style = box->style;
+	if (style == NULL && !layout_current(thread)) {
+		return JS_NULL;
+	}
+	if (style == NULL) {
 		/*
 		 * Laid out, but this element got no box. That is what
 		 * display:none looks like from here, and reporting it
@@ -11203,23 +11313,21 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		set_index(ctx, arr, 6, -1);
 		return arr;
 	}
-	css_computed_font_size(box->style, &len, &unit);
-	px = FIXTOINT(css_unit_len2device_px(box->style,
-					     &thread->htmlc->unit_len_ctx,
-					     len, unit));
+	css_computed_font_size(style, &len, &unit);
+	px = FIXTOINT(css_unit_len2device_px(style, uctx, len, unit));
 	if (px <= 0) px = 16;
 
 	arr = JS_NewArray(ctx);
 	set_index(ctx, arr, 0, px);
-	set_index(ctx, arr, 1, (int)css_computed_display_static(box->style));
-	set_index(ctx, arr, 2, (int)css_computed_visibility(box->style));
+	set_index(ctx, arr, 1, (int)css_computed_display_static(style));
+	set_index(ctx, arr, 2, (int)css_computed_visibility(style));
 
 	/*
 	 * set_index takes an int, and a colour with the alpha byte set
 	 * does not fit one on a 32-bit target, so the alpha is split off
 	 * and the prelude puts the two back together.
 	 */
-	if (css_computed_color(box->style, &colour) == CSS_COLOR_COLOR) {
+	if (css_computed_color(style, &colour) == CSS_COLOR_COLOR) {
 		set_index(ctx, arr, 3, (int)(colour & 0xffffff));
 		set_index(ctx, arr, 5, (int)((colour >> 24) & 0xff));
 	} else {
@@ -11227,7 +11335,7 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		set_index(ctx, arr, 5, -1);
 	}
 	colour = 0;
-	if (css_computed_background_color(box->style, &colour) ==
+	if (css_computed_background_color(style, &colour) ==
 			CSS_BACKGROUND_COLOR_COLOR) {
 		set_index(ctx, arr, 4, (int)(colour & 0xffffff));
 		set_index(ctx, arr, 6, (int)((colour >> 24) & 0xff));
@@ -11241,16 +11349,28 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	 * bottom, left each, in slots 7 to 18: what a browser reports for
 	 * them, and what code measuring an element's content box reads.
 	 */
-	{
+	/* from a fresh selection, those of them that are lengths come
+	 * from it: the box's are from before the change, and a new
+	 * element has no box (VitaSurf) */
+	if (box != NULL || fresh) {
 		int side;
 
 		for (side = 0; side < 4; side++) {
-			int m = box->margin[side];
+			int m = 0, p = 0, b = 0;
 
-			set_index(ctx, arr, 7 + side, m == INT_MIN ? 0 : m);
-			set_index(ctx, arr, 11 + side, box->padding[side]);
-			set_index(ctx, arr, 15 + side,
-					box->border[side].width);
+			if (box != NULL) {
+				m = box->margin[side];
+				if (m == INT_MIN)
+					m = 0;
+				p = box->padding[side];
+				b = box->border[side].width;
+			}
+			if (fresh)
+				box_model_from_style(style, uctx, side,
+						     &m, &p, &b);
+			set_index(ctx, arr, 7 + side, m);
+			set_index(ctx, arr, 11 + side, p);
+			set_index(ctx, arr, 15 + side, b);
 		}
 	}
 	return arr;
@@ -11650,7 +11770,9 @@ static const css_select_results *select_without_box(jsthread *thread,
 	struct style_memo *kept;
 	struct dom_node *n;
 	int depth = 0, i;
-	bool have_layout = layout_current(thread);
+	bool stale = style_stale(thread);
+	bool have_layout = layout_current(thread) && !stale;
+	css_select_ctx *now = NULL, *kept_ctx = NULL;
 	uint64_t t0;
 
 	/* before conversion html_select_style uses the sheets loaded so
@@ -11718,6 +11840,15 @@ static const css_select_results *select_without_box(jsthread *thread,
 	if (depth == 0)
 		return NULL;
 	t0 = now_ms();
+	/* the sheets as they are now, when the page's context is behind
+	 * them; lent to the selections below and put back after */
+	if (stale) {
+		now = html_select_ctx_now(htmlc);
+		if (now != NULL && now != htmlc->select_ctx) {
+			kept_ctx = htmlc->select_ctx;
+			htmlc->select_ctx = now;
+		}
+	}
 	for (i = depth - 1; i >= 0; i--) {
 		css_select_results *got;
 
@@ -11745,11 +11876,30 @@ static const css_select_results *select_without_box(jsthread *thread,
 		res = got;
 		parent = got->styles[CSS_PSEUDO_ELEMENT_NONE];
 	}
+	if (kept_ctx != NULL)
+		htmlc->select_ctx = kept_ctx;
 	thread->style_memo_ms += (uint32_t)(now_ms() - t0);
 out:
 	for (i = 0; i < depth; i++)
 		dom_node_unref(chain[i]);
 	return res;
+}
+
+/*
+ * The unit context a selected style's lengths resolve in (VitaSurf): the
+ * page's, with the root style the selection itself reached. The page's
+ * holds the root's style from the last box construction, so a rem read
+ * after the root's font size changed came out in the old size.
+ */
+static const css_unit_ctx *fresh_uctx(jsthread *thread,
+		struct dom_node *node, css_unit_ctx *local)
+{
+	struct style_memo *kept = style_memo_find(thread, node);
+
+	memcpy(local, &thread->htmlc->unit_len_ctx, sizeof(*local));
+	if (kept != NULL && kept->root != NULL)
+		local->root_style = kept->root;
+	return local;
 }
 
 static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
@@ -11769,6 +11919,7 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	int32_t i32 = 0;
 	uint8_t t;
 	const css_select_results *owned = NULL;
+	css_unit_ctx local_uctx;
 
 	(void)this_val;
 	if (argc < 1 || thread == NULL || thread->htmlc == NULL)
@@ -11777,10 +11928,11 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL)
 		return JS_NULL;
 	box = layout_current(thread) ? box_for_node(node) : NULL;
-	if (box != NULL && box->style != NULL) {
+	if (box != NULL && box->style != NULL && !style_stale(thread)) {
 		s = box->style;
 	} else {
-		/* no box yet, or none at all: select it (VitaSurf) */
+		/* no box yet, or none at all, or the document has changed
+		 * since it was styled: select it (VitaSurf) */
 		box = NULL;
 		owned = select_without_box(thread, node);
 		if (owned == NULL)
@@ -11825,7 +11977,8 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			s = r->styles[which];
 		}
 	}
-	uctx = &thread->htmlc->unit_len_ctx;
+	uctx = owned != NULL ? fresh_uctx(thread, node, &local_uctx) :
+			&thread->htmlc->unit_len_ctx;
 	obj = JS_NewObject(ctx);
 
 	/* the font, which em and line-height resolve against */
@@ -11929,6 +12082,29 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			CSS_BOTTOM_SET, "auto");
 	sm_len_prop(ctx, obj, "left", s, uctx, css_computed_left,
 			CSS_LEFT_SET, "auto");
+	/*
+	 * width and height when there is no up to date box to measure
+	 * (VitaSurf): no box at all, or one from before the style changed.
+	 * A length is its own answer, in px; a percentage or auto needs
+	 * layout, and the prelude answers from the box or with auto.
+	 */
+	if (box == NULL) {
+		css_fixed lv = 0;
+		css_unit lu = CSS_UNIT_PX;
+
+		if (css_computed_width(s, &lv, &lu) == CSS_WIDTH_SET &&
+		    lu != CSS_UNIT_PCT && lu != CSS_UNIT_CALC) {
+			sm_length(buf, sizeof(buf), s, uctx, lv, lu);
+			sm_set(ctx, obj, "width", buf);
+		}
+		lv = 0;
+		lu = CSS_UNIT_PX;
+		if (css_computed_height(s, &lv, &lu) == CSS_HEIGHT_SET &&
+		    lu != CSS_UNIT_PCT && lu != CSS_UNIT_CALC) {
+			sm_length(buf, sizeof(buf), s, uctx, lv, lu);
+			sm_set(ctx, obj, "height", buf);
+		}
+	}
 	sm_len_prop(ctx, obj, "minWidth", s, uctx, css_computed_min_width,
 			CSS_MIN_WIDTH_SET, "auto");
 	sm_len_prop(ctx, obj, "minHeight", s, uctx, css_computed_min_height,
@@ -12449,7 +12625,7 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 	}
 	JS_FreeCString(ctx, name);
 	box = layout_current(thread) ? box_for_node(node) : NULL;
-	if (box != NULL && box->style != NULL) {
+	if (box != NULL && box->style != NULL && !style_stale(thread)) {
 		style = box->style;
 	} else {
 		/*

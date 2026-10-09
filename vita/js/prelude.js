@@ -1473,6 +1473,19 @@ var CS_DEFAULTS={
   CS_DEFAULTS[b+e+(b==='border'?'Width':'')]='0px';});
  if(b!=='border')CS_DEFAULTS[b]='0px';});
 var CS_PROTO={};
+/* the dashed names a declaration also answers to, cs['padding-left']
+   beside cs.paddingLeft, as accessors on the prototype made once for
+   each name met (VitaSurf): they read undefined */
+var CS_DASHED={};
+function csDashed(k){
+ var d;
+ CS_DASHED[k]=1;
+ if(!/[A-Z]/.test(k)&&k!=='cssFloat')return;
+ d=k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});
+ if(/^(webkit|moz|ms)-/.test(d))d='-'+d;
+ if(Object.prototype.hasOwnProperty.call(CS_PROTO,d))return;
+ Object.defineProperty(CS_PROTO,d,{configurable:true,
+  get:function(){return this[k];},set:function(v){this[k]=v;}});}
 function dashToCamel(n){return String(n).replace(/-([a-z])/g,function(m,c){return c.toUpperCase();});}
 /* What the user agent stylesheet says an element is, for when libcss has
    no computed style to give -- a detached element, or one with no box.
@@ -1554,7 +1567,7 @@ function computedStyle(el,pseudo){
     text, as a browser reports them. */
  var more=(el&&el.nodeType===1&&typeof __vitaStyleMore==='function')?
   __vitaStyleMore(el,typeof pseudo==='string'&&pseudo?pseudo:null):null;
- if(more)for(var mk in more)cs[mk]=more[mk];
+ if(more)for(var mk in more){cs[mk]=more[mk];if(!CS_DASHED[mk])csDashed(mk);}
  /* a ::before or ::after that is not there still answers, with no content */
  if(typeof pseudo==='string'&&/^::?(before|after)$/i.test(pseudo)&&
   (!more||more.content===undefined))cs.content='none';
@@ -1572,7 +1585,7 @@ function computedStyle(el,pseudo){
    var k=dashToCamel(d[0]);
    if(st&&(RESOLVED[k]||(st.length>18&&BOX_RESOLVED.test(k))))return;
    if(more&&more[k]!==undefined)return;
-   cs[k]=d[1];});
+   cs[k]=d[1];if(!CS_DASHED[k])csDashed(k);});
  }
  /* the methods are the prototype's and the names are listed when
     asked for (VitaSurf): made for every call, with every property's
@@ -1605,6 +1618,7 @@ Object.defineProperties(CS_PROTO,{
  cssText:{configurable:true,writable:true,value:''},
  length:{configurable:true,get:function(){return csNames(this).length;}}
 });
+for(var csk in CS_DEFAULTS)csDashed(csk);csDashed('width');csDashed('height');
 W.getComputedStyle=function(el,pseudo){return computedStyle(el,pseudo);};
 /* A media query evaluator over the real viewport. Handles the features
    responsive sites actually branch on; anything else is false. */
@@ -5703,7 +5717,9 @@ function adoptWrite(target){
  var list=adoptedOf.get(target)||[],text=list.map(function(s){return s._text();}).join('\n');
  var el=adoptEl.get(target);
  if(target===D){
-  if(!el){el=D.createElement('style');adoptEl.set(target,el);}
+  /* marked so the engine keeps it in the cascade though it is not
+     in the document, as no other <style> out of it is */
+  if(!el){el=D.createElement('style');el.setAttribute('data-adopted','document');adoptEl.set(target,el);}
   if(W.__vitaSetSheetText)try{W.__vitaSetSheetText(el,text);}catch(e){}
  }else{
   if(!el){el=D.createElement('style');el.setAttribute('data-adopted','');adoptEl.set(target,el);}

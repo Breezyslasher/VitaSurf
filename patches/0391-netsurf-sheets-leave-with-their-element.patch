@@ -1,0 +1,371 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index ba7ad95bf..7929eb161 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -157,6 +157,65 @@ static dom_string *sheet_attribute(dom_node *node, dom_string *attr,
+  * \param name   the attribute being changed, or NULL
+  * \param value  that attribute's new value, or NULL
+  */
++/**
++ * Whether a node is in the document (VitaSurf): its tree's root is the
++ * document, or a shadow root whose host is in it.
++ */
++static bool css_node_connected(dom_node *node)
++{
++	dom_node *n = dom_node_ref(node), *up = NULL;
++	dom_node_type type;
++	bool connected = false;
++
++	for (;;) {
++		dom_element *host = NULL;
++
++		while (dom_node_get_parent_node(n, &up) == DOM_NO_ERR &&
++				up != NULL) {
++			dom_node_unref(n);
++			n = up;
++		}
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR)
++			break;
++		if (type == DOM_DOCUMENT_NODE) {
++			connected = true;
++			break;
++		}
++		if (type != DOM_DOCUMENT_FRAGMENT_NODE ||
++		    dom_document_fragment_get_host(
++				(dom_document_fragment *) n, &host) !=
++				DOM_NO_ERR || host == NULL)
++			break;
++		dom_node_unref(n);
++		n = (dom_node *) host;
++	}
++	dom_node_unref(n);
++	return connected;
++}
++
++/**
++ * Whether a STYLE carries the document's adoptedStyleSheets (VitaSurf):
++ * the prelude keeps them in one it never puts in the document, marked
++ * data-adopted="document".
++ */
++static bool css_adopted_by_document(dom_node *node)
++{
++	dom_string *name = NULL, *value = NULL;
++	bool adopted = false;
++
++	if (dom_string_create((const uint8_t *) "data-adopted", 12,
++			&name) != DOM_NO_ERR)
++		return false;
++	if (dom_element_get_attribute(node, name, &value) == DOM_NO_ERR &&
++	    value != NULL) {
++		adopted = dom_string_byte_length(value) == 8 &&
++			memcmp(dom_string_data(value), "document", 8) == 0;
++		dom_string_unref(value);
++	}
++	dom_string_unref(name);
++	return adopted;
++}
++
+ static bool css_sheet_unused(dom_node *node, dom_string *name,
+ 			     dom_string *value)
+ {
+@@ -167,6 +226,13 @@ static bool css_sheet_unused(dom_node *node, dom_string *name,
+ 		return false;
+ 	}
+ 
++	/* a STYLE or LINK out of the document has no sheet in its
++	 * cascade, as CSSOM has it (VitaSurf): one a script removed went
++	 * on styling the page */
++	if (!css_node_connected(node) && !css_adopted_by_document(node)) {
++		return true;
++	}
++
+ 	media = sheet_attribute(node, corestring_dom_media, name, value);
+ 	unused = media_excludes_screen(media);
+ 	if (media != NULL) {
+@@ -246,14 +312,20 @@ static void html_css_late_rebuild(void *pw)
+ {
+ 	html_content *c = pw;
+ 	css_select_ctx *fresh = NULL;
++	unsigned int gen;
+ 	nserror err;
+ 
+ 	if (c->select_ctx == NULL || c->aborted) {
+ 		return;
+ 	}
+ 	/* other late sheets still arriving: the last one's arrival
+-	 * schedules this again, so one rebuild serves them all */
++	 * schedules this again, so one rebuild serves them all. A sheet
++	 * that left with the tree has nothing to arrive, and what is
++	 * active may be an image, so look again later (VitaSurf). */
+ 	if (c->base.active != 0) {
++		if (c->late_css_retries++ < 100) {
++			guit->misc->schedule(200, html_css_late_rebuild, c);
++		}
+ 		return;
+ 	}
+ 	/* a box conversion in progress reads the context it started with */
+@@ -263,11 +335,13 @@ static void html_css_late_rebuild(void *pw)
+ 		}
+ 		return;
+ 	}
++	gen = c->css_generation;
+ 	if (html_css_new_selection_context(c, &fresh) != NSERROR_OK) {
+ 		return;
+ 	}
+ 	css_select_ctx_destroy(c->select_ctx);
+ 	c->select_ctx = fresh;
++	c->select_ctx_gen = gen;
+ 
+ 	err = html_relayout(c);
+ 	if (err == NSERROR_INVALID && c->late_css_retries++ < 30) {
+@@ -438,6 +512,7 @@ void html_css_link_changed(html_content *c, dom_node *node, dom_string *name,
+ 		 * widens its media from print to all.
+ 		 */
+ 		s->unused = unused;
++		c->css_generation++;
+ 		if (c->select_ctx != NULL) {
+ 			c->late_css_retries = 0;
+ 			guit->misc->schedule(0, html_css_late_rebuild, c);
+@@ -661,6 +736,7 @@ html_create_style_element(html_content *c, dom_node *style)
+ 	c->stylesheets[c->stylesheet_count].unused = false;
+ 	c->stylesheets[c->stylesheet_count].is_link = false;
+ 	c->stylesheets[c->stylesheet_count].blocks_scripts = false;
++	c->stylesheets[c->stylesheet_count].disconnected = false;
+ 	c->stylesheets[c->stylesheet_count].override = NULL;
+ 	c->stylesheet_count++;
+ 
+@@ -765,6 +841,74 @@ bool html_css_update_style(html_content *c, dom_node *style)
+ }
+ 
+ 
++/**
++ * Take a sheet out of the cascade, or put it back, when its element has
++ * left the document or come back since last looked (VitaSurf). The page
++ * is styled again when one has.
++ */
++static void html_css_check_connected(html_content *c)
++{
++	unsigned int i;
++	bool changed = false;
++
++	if (!c->css_connect_check)
++		return;
++	c->css_connect_check = false;
++	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
++		struct html_stylesheet *s = &c->stylesheets[i];
++		bool gone;
++
++		if (s->node == NULL)
++			continue;
++		gone = !css_node_connected(s->node) &&
++		       !css_adopted_by_document(s->node);
++		if (gone != s->disconnected) {
++			s->disconnected = gone;
++			changed = true;
++		}
++	}
++	if (changed) {
++		c->css_generation++;
++		if (c->select_ctx != NULL) {
++			c->late_css_retries = 0;
++			guit->misc->schedule(0, html_css_late_rebuild, c);
++		}
++	}
++}
++
++static void html_css_check_connected_cb(void *pw)
++{
++	html_css_check_connected(pw);
++}
++
++/* exported function documented in html/css.h */
++void html_css_note_tree_change(html_content *c)
++{
++	if (c->css_connect_check || c->stylesheet_count <= STYLESHEET_START)
++		return;
++	c->css_connect_check = true;
++	guit->misc->schedule(0, html_css_check_connected_cb, c);
++}
++
++/* exported function documented in html/css.h */
++bool html_select_ctx_current(html_content *c)
++{
++	unsigned int i;
++
++	html_css_check_connected(c);
++	if (c->select_ctx == NULL || c->select_ctx_gen != c->css_generation)
++		return false;
++	for (i = STYLESHEET_START; i < c->stylesheet_count; i++) {
++		const struct html_stylesheet *s = &c->stylesheets[i];
++
++		if (s->disconnected || s->node == NULL || s->is_link)
++			continue;
++		if (s->modified || html_css_in_flight(s))
++			return false;
++	}
++	return true;
++}
++
+ /* exported function documented in html/css.h */
+ bool html_css_set_style_text(html_content *c, dom_node *style,
+ 		const char *text)
+@@ -926,6 +1070,7 @@ bool html_css_process_link(html_content *htmlc, dom_node *node)
+ 	htmlc->stylesheets[htmlc->stylesheet_count].blocks_scripts =
+ 			htmlc->parsing > 0 && htmlc->script_depth == 0;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].override = NULL;
++	htmlc->stylesheets[htmlc->stylesheet_count].disconnected = false;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].modified = false;
+ 	htmlc->stylesheets[htmlc->stylesheet_count].unused =
+ 			css_sheet_unused(node, NULL, NULL);
+@@ -997,6 +1142,8 @@ nserror html_css_free_stylesheets(html_content *html)
+ 	unsigned int i;
+ 
+ 	guit->misc->schedule(-1, html_css_process_modified_styles, html);
++	guit->misc->schedule(-1, html_css_check_connected_cb, html);
++	guit->misc->schedule(-1, html_css_late_rebuild, html);
+ 
+ 	for (i = 0; i != html->stylesheet_count; i++) {
+ 		if (html->stylesheets[i].sheet != NULL) {
+@@ -1395,8 +1542,12 @@ html_css_build_selection_context(html_content *c,
+ 		 * to read yet, and asking asserts. It joins the context
+ 		 * built when it finishes.
+ 		 */
++		/* early, a STYLE whose text changed since its sheet was
++		 * read is read again from the text (VitaSurf) */
+ 		if (hsheet->sheet != NULL &&
+-		    content_get_status(hsheet->sheet) == CONTENT_STATUS_DONE) {
++		    content_get_status(hsheet->sheet) == CONTENT_STATUS_DONE &&
++		    !(early && hsheet->modified && hsheet->node != NULL &&
++		      !hsheet->is_link)) {
+ 			sheet = nscss_get_stylesheet(hsheet->sheet);
+ 		} else if (early) {
+ 			sheet = html_css_sheet_now(c, i);
+diff --git a/content/handlers/html/css.h b/content/handlers/html/css.h
+index 11a095e6d..985b56146 100644
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -150,6 +150,20 @@ bool html_css_process_style(struct html_content *htmlc, dom_node *node);
+  */
+ bool html_css_update_style(struct html_content *htmlc, dom_node *node);
+ 
++/**
++ * Note that the tree changed (VitaSurf): an element whose sheet is in the
++ * cascade may have left the document, or come back to it. Cheap; the
++ * check runs before the next style read, or from the scheduler.
++ */
++void html_css_note_tree_change(struct html_content *htmlc);
++
++/**
++ * Whether the page's selection context is up to date with its sheets
++ * (VitaSurf): none changed, added, removed or still being re-read since
++ * it was built.
++ */
++bool html_select_ctx_current(struct html_content *htmlc);
++
+ /**
+  * Give a STYLE element's sheet the text script made of it with
+  * insertRule(), deleteRule() or replaceSync(), read instead of the
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index 21966b4d9..a4ae20c54 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -824,6 +824,9 @@ dom_default_action_DOMNodeInserted_cb(struct dom_event *evt, void *pw)
+ 	dom_exception exc;
+ 	html_content *htmlc = pw;
+ 
++	/* a STYLE or LINK may have come back into the document */
++	html_css_note_tree_change(htmlc);
++
+ 	exc = dom_event_get_target(evt, &node);
+ 	if ((exc != DOM_NO_ERR) || (node == NULL)) {
+ 		/* failed to obtain the event target node */
+@@ -888,6 +891,10 @@ dom_default_action_DOMSubtreeModified_cb(struct dom_event *evt, void *pw)
+ 	dom_exception exc;
+ 	html_content *htmlc = pw;
+ 
++	/* fired at the parent once a child has gone: a STYLE or LINK may
++	 * have left the document with it (VitaSurf) */
++	html_css_note_tree_change(htmlc);
++
+ 	exc = dom_event_get_target(evt, &node);
+ 	if ((exc == DOM_NO_ERR) && (node != NULL)) {
+ 		if (htmlc->title == (dom_node *)node) {
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index a2d154596..1b0df39d7 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -377,10 +377,19 @@ static void html_drop_early_select_ctx(html_content *c)
+ 
+ /* exported function documented in html/private.h */
+ css_select_ctx *html_select_ctx_early(html_content *c)
++{
++	if (c->select_ctx != NULL)
++		return c->select_ctx;
++	return html_select_ctx_now(c);
++}
++
++/* exported function documented in html/private.h */
++css_select_ctx *html_select_ctx_now(html_content *c)
+ {
+ 	unsigned int done = 0, i;
+ 
+-	if (c->select_ctx != NULL)
++	/* this also takes out the sheets whose elements have gone */
++	if (html_select_ctx_current(c))
+ 		return c->select_ctx;
+ 	for (i = 0; i < c->stylesheet_count; i++) {
+ 		if (c->stylesheets[i].sheet != NULL &&
+@@ -444,6 +453,7 @@ void html_finish_conversion(html_content *htmlc)
+ 	html_drop_early_select_ctx(htmlc);
+ 
+ 	/* create new css selection context */
++	htmlc->select_ctx_gen = htmlc->css_generation;
+ 	error = html_css_new_selection_context(htmlc, &htmlc->select_ctx);
+ 	if (error != NSERROR_OK) {
+ 		content_broadcast_error(&htmlc->base, error, NULL);
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index e1ecaf689..26343fee6 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -67,6 +67,9 @@ struct html_stylesheet {
+ 	/** what script made of a STYLE's sheet through insertRule and
+ 	 * the like, read instead of its text; malloc'd (VitaSurf) */
+ 	char *override;
++	/** its element was out of the document when last looked, which
++	 * takes the sheet out of the cascade (VitaSurf) */
++	bool disconnected;
+ };
+ 
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index b50054061..2844f3988 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -236,6 +236,11 @@ typedef struct html_content {
+ 	unsigned int early_select_gen;
+ 	/** bumped whenever a sheet is added or its text changes */
+ 	unsigned int css_generation;
++	/** the css_generation select_ctx was built from (VitaSurf) */
++	unsigned int select_ctx_gen;
++	/** the tree changed, so a sheet's element may have left it or
++	 * come back (VitaSurf) */
++	bool css_connect_check;
+ 	/** the sheets parsed for it, its STYLEs still fetching */
+ 	struct css_stylesheet **early_owned;
+ 	unsigned int early_n_owned;
+@@ -804,6 +809,15 @@ void html_scroll_anchor_free(html_content *htmlc);
+  */
+ css_select_ctx *html_select_ctx_early(html_content *c);
+ 
++/**
++ * The selection context for a style read now (VitaSurf): the page's own
++ * when it is up to date with the sheets, else one built from them as
++ * they are, with STYLE text changed or still on its way parsed there and
++ * then. A script that changes the sheets and reads a style back gets
++ * the new answer, as it would in a browser.
++ */
++css_select_ctx *html_select_ctx_now(html_content *c);
++
+ /**
+  * How far a position: sticky box is shifted down with the viewport at
+  * view_y (VitaSurf), as it is drawn there; see html_sticky_offset().
