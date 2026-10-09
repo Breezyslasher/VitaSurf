@@ -2056,10 +2056,11 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 
 	/*
 	 * Cloudflare's browser check ("Just a moment...") runs a script that
-	 * fingerprints a full desktop browser and never passes here. With a
-	 * FlareSolverr server configured the check is handed to it and the
-	 * page reloaded with its cookies; otherwise say so in the status bar
-	 * rather than leaving a page that looks stuck.
+	 * takes a while on the Vita. With a FlareSolverr server configured
+	 * the check is handed to it and the page reloaded with its cookies;
+	 * otherwise say in the status bar that the check is still running,
+	 * rather than leaving a page that looks stuck. It used to say the
+	 * check could not be passed, when it had only just started.
 	 */
 	{
 		const char *title = browser_window_get_title(gw->bw);
@@ -2074,9 +2075,9 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				/* let that status reach the screen first */
 				framebuffer_schedule(300, flaresolverr_run, gw);
 			} else if (guit->window->set_status != NULL) {
-				vita_log("page: Cloudflare browser check; it cannot be passed by this browser");
+				vita_log("page: Cloudflare browser check, still running");
 				guit->window->set_status(gw,
-					"This site's Cloudflare browser check cannot be passed by VitaSurf");
+					"Cloudflare browser check running, please wait...");
 			}
 		}
 	}
