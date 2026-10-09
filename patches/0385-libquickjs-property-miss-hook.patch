@@ -1,0 +1,83 @@
+diff --git a/quickjs.c b/quickjs.c
+index e90ab0a..4db9e8a 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -268,6 +268,8 @@ struct JSRuntime {
+     JSMallocFunctions mf;
+     /* the handler of lazy properties (VitaSurf), or NULL */
+     JSLazyPropertyHandler *lazy_handler;
++    /* told of a read that found nothing (VitaSurf), or NULL */
++    JSPropertyMissHook *miss_hook;
+     JSMallocState malloc_state;
+     const char *rt_info;
+ 
+@@ -2237,6 +2239,11 @@ void JS_SetCompileTickHandler(JSRuntime *rt, JSCompileTickHandler *cb,
+     rt->compile_tick_count = JS_COMPILE_TICK_TOKENS;
+ }
+ 
++void JS_SetPropertyMissHook(JSRuntime *rt, JSPropertyMissHook *hook)
++{
++    rt->miss_hook = hook;
++}
++
+ void JS_SetCanBlock(JSRuntime *rt, bool can_block)
+ {
+     rt->can_block = can_block;
+@@ -8984,6 +8991,9 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
+         if (!p)
+             break;
+     }
++    if (unlikely(ctx->rt->miss_hook != NULL) &&
++        JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
++        ctx->rt->miss_hook(ctx, obj, prop);
+     if (unlikely(throw_ref_error)) {
+         return JS_ThrowReferenceErrorNotDefined(ctx, prop);
+     } else {
+@@ -17883,6 +17893,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                         }
+                         p = p->shape->proto;
+                         if (!p) {
++                            /* told of the miss too (VitaSurf) */
++                            if (unlikely(ctx->rt->miss_hook != NULL))
++                                ctx->rt->miss_hook(ctx, obj, atom);
+                             val = JS_UNDEFINED;
+                             break;
+                         }
+@@ -19092,6 +19105,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                         }
+                         p = p->shape->proto;
+                         if (!p) {
++                            /* told of the miss too (VitaSurf) */
++                            if (unlikely(ctx->rt->miss_hook != NULL))
++                                ctx->rt->miss_hook(ctx, obj, atom);
+                             val = JS_UNDEFINED;
+                             break;
+                         }
+@@ -19140,6 +19156,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                         }
+                         p = p->shape->proto;
+                         if (!p) {
++                            /* told of the miss too (VitaSurf) */
++                            if (unlikely(ctx->rt->miss_hook != NULL))
++                                ctx->rt->miss_hook(ctx, obj, atom);
+                             val = JS_UNDEFINED;
+                             break;
+                         }
+diff --git a/quickjs.h b/quickjs.h
+index 4fe5bca..142a943 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1166,6 +1166,13 @@ typedef void JSCompileTickHandler(JSRuntime *rt, void *opaque);
+ JS_EXTERN void JS_SetCompileTickHandler(JSRuntime *rt, JSCompileTickHandler *cb, void *opaque);
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
++/* Told when a property read on an object walks the whole prototype chain
++   and finds nothing, before undefined is returned or a ReferenceError
++   thrown (VitaSurf): a browser's log can then say which property a page
++   wanted that is not here. It must not run script. */
++typedef void JSPropertyMissHook(JSContext *ctx, JSValueConst obj,
++                                JSAtom prop);
++JS_EXTERN void JS_SetPropertyMissHook(JSRuntime *rt, JSPropertyMissHook *hook);
+ /*
+  * Lazy properties (VitaSurf). A lazy property looks like the data
+  * property it is defined as -- its attributes are the given flags -- and

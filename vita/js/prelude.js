@@ -7390,6 +7390,25 @@ function describeThrown(v){
 /* kept here and not left on window, where no browser has it */
 var SRC_EXCERPT=null;
 try{SRC_EXCERPT=W.__vitaSourceExcerpt||null;delete W.__vitaSourceExcerpt;}catch(e){}
+/* The properties a page read on window, navigator, document, screen,
+   location, history and performance that are not here (VitaSurf): an
+   uncaught error's report lists the last of them, which is how a log
+   says what a page wanted that this browser lacks. */
+var MISSES=null;
+try{
+ MISSES=W.__vitaMisses||null;
+ (function(watch){
+  if(!watch)return;
+  try{watch(W,'window');}catch(e){}
+  try{watch(W.navigator,'navigator');}catch(e){}
+  try{watch(W.document,'document');}catch(e){}
+  try{watch(W.screen,'screen');}catch(e){}
+  try{watch(W.location,'location');}catch(e){}
+  try{watch(W.history,'history');}catch(e){}
+  try{watch(W.performance,'performance');}catch(e){}
+ })(W.__vitaWatchMisses);
+ delete W.__vitaMisses;delete W.__vitaWatchMisses;
+}catch(e){}
 W.__vitaReportError=function(err,where){
  var msg='';
  try{msg=(err&&err.message)?String(err.message):String(err);}catch(e){msg='Script error.';}
@@ -7430,7 +7449,12 @@ W.__vitaReportError=function(err,where){
    (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}
   /* a line of its own: a log line holds 512 characters, and a long
      stack of long URLs had already filled the one above */
-  if(near)try{console.error('uncaught, the code at column '+col+': '+near);}catch(e9){}}
+  if(near)try{console.error('uncaught, the code at column '+col+': '+near);}catch(e9){}
+  /* and what it looked for before, that was not here */
+  try{var missed=MISSES?String(MISSES()):'';
+   while(missed){
+    console.error('uncaught, read before it and not here: '+missed.slice(0,400));
+    missed=missed.slice(400);}}catch(e10){}}
  return handled;};
 /* An unhandled promise rejection, reported the same way. QuickJS hands
  * these to the tracker qjs.c installs.

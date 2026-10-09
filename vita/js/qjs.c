@@ -12509,6 +12509,110 @@ static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+/*
+ * Reads that found nothing on window, navigator, document and the like
+ * (VitaSurf). QuickJS tells qjs_miss_hook of every read that walks a
+ * whole prototype chain without finding the property; the ones on these
+ * objects are kept, the last MISS_RING of them, and an uncaught error's
+ * report names them, so a log says which property a page wanted that is
+ * not here instead of leaving it to be guessed. A page's realm registers
+ * its objects with __vitaWatchMisses; pages come and go, so the oldest
+ * registration gives way to the newest.
+ */
+#define MISS_WATCH 48
+#define MISS_RING 24
+static void *miss_watch_obj[MISS_WATCH];
+static char miss_watch_label[MISS_WATCH][16];
+static unsigned miss_watch_next;
+static char miss_ring[MISS_RING][64];
+static unsigned miss_ring_next;
+
+static void qjs_miss_hook(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+	void *p = JS_VALUE_GET_PTR(obj);
+	unsigned i;
+
+	for (i = 0; i < MISS_WATCH; i++) {
+		const char *name;
+		char entry[64];
+
+		if (miss_watch_obj[i] != p || p == NULL)
+			continue;
+		name = JS_AtomToCString(ctx, prop);
+		if (name == NULL)
+			return;
+		/* this browser's own helpers are not what a page wants */
+		if (strncmp(name, "__vita", 6) == 0) {
+			JS_FreeCString(ctx, name);
+			return;
+		}
+		snprintf(entry, sizeof(entry), "%s.%s", miss_watch_label[i],
+			 name);
+		JS_FreeCString(ctx, name);
+		/* each name once: a page's feature checks repeat */
+		for (i = 0; i < MISS_RING; i++) {
+			if (strcmp(miss_ring[i], entry) == 0)
+				return;
+		}
+		memcpy(miss_ring[miss_ring_next % MISS_RING], entry,
+		       sizeof(entry));
+		miss_ring_next++;
+		return;
+	}
+}
+
+/* __vitaWatchMisses(obj, label): note reads on obj that find nothing */
+static JSValue win_vita_watch_misses(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	const char *label;
+	unsigned slot;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	label = JS_ToCString(ctx, argv[1]);
+	if (label == NULL) {
+		return JS_EXCEPTION;
+	}
+	slot = miss_watch_next++ % MISS_WATCH;
+	miss_watch_obj[slot] = JS_VALUE_GET_PTR(argv[0]);
+	snprintf(miss_watch_label[slot], sizeof(miss_watch_label[slot]),
+		 "%s", label);
+	JS_FreeCString(ctx, label);
+	return JS_UNDEFINED;
+}
+
+/* __vitaMisses(): the reads kept, oldest first, comma separated; and
+   forget them, so the next report has only its own */
+static JSValue win_vita_misses(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	char out[MISS_RING * 66];
+	size_t n = 0;
+	unsigned i, start;
+
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	out[0] = '\0';
+	start = miss_ring_next > MISS_RING ? miss_ring_next - MISS_RING : 0;
+	for (i = start; i < miss_ring_next; i++) {
+		const char *e = miss_ring[i % MISS_RING];
+		int w = snprintf(out + n, sizeof(out) - n, "%s%s",
+				 n > 0 ? ", " : "", e);
+
+		if (w < 0 || (size_t)w >= sizeof(out) - n) {
+			break;
+		}
+		n += (size_t)w;
+	}
+	memset(miss_ring, 0, sizeof(miss_ring));
+	miss_ring_next = 0;
+	return JS_NewString(ctx, out);
+}
+
 /* What marks a popover shown: libdom user data under this key, which
    nscss's :popover-open reads (VitaSurf). */
 static int popover_mark;
@@ -14068,6 +14172,12 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaSetFocus",
 			  JS_NewCFunction(ctx, win_vita_set_focus,
 					  "__vitaSetFocus", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaWatchMisses",
+			  JS_NewCFunction(ctx, win_vita_watch_misses,
+					  "__vitaWatchMisses", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaMisses",
+			  JS_NewCFunction(ctx, win_vita_misses,
+					  "__vitaMisses", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaPopover",
 			  JS_NewCFunction(ctx, win_vita_popover,
 					  "__vitaPopover", 2));
@@ -14455,6 +14565,9 @@ static nserror heap_start(jsheap *ret)
 	 */
 	ret->pool = qjs_pool_create();
 	ret->rt = JS_NewRuntime2(qjs_pool_functions(), ret->pool);
+	if (ret->rt != NULL) {
+		JS_SetPropertyMissHook(ret->rt, qjs_miss_hook);
+	}
 	if (ret->rt == NULL) {
 		qjs_pool_destroy(ret->pool);
 		ret->pool = NULL;
