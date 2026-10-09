@@ -12718,8 +12718,8 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 	JSValue err;
 	const char *first, *stack;
 	char seq[MISS_ANY * 70];
-	char where[300], at_url[3][256];
-	unsigned at_line[3] = {0, 0, 0}, at_col[3] = {0, 0, 0};
+	char where[400], at_url[4][256];
+	unsigned at_line[4] = {0, 0, 0, 0}, at_col[4] = {0, 0, 0, 0};
 	int k;
 	size_t n = 0;
 	const char *p;
@@ -12743,7 +12743,7 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 	err = JS_NewError(ctx);
 	stack = JS_IsException(err) ? NULL :
 		own_data_cstring(ctx, err, "stack");
-	for (p = stack; p != NULL && *p != '\0' && lines < 4; ) {
+	for (p = stack; p != NULL && *p != '\0' && lines < 5; ) {
 		const char *e = strchr(p, '\n');
 		size_t len = e != NULL ? (size_t)(e - p) : strlen(p);
 
@@ -12755,7 +12755,7 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 		    !prof_has(p, len, "(native)")) {
 			/* each page frame's position, for its code: the
 			   first is often a page's own logging helper */
-			if (lines < 3 && len > 2 && p[len - 1] == ')') {
+			if (lines < 4 && len > 2 && p[len - 1] == ')') {
 				const char *o = p + len - 1, *c2 = NULL,
 					*c1 = NULL;
 
@@ -12791,7 +12791,7 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 	JS_FreeValue(ctx, err);
 	vita_log("console: that was said from%s", n > 0 ? where :
 		 " nowhere script can see");
-	for (k = 0; k < 3; k++) {
+	for (k = 0; k < 4; k++) {
 		JSValue args[4], code;
 		const char *text;
 		char head[64];
@@ -12802,8 +12802,10 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 		args[0] = JS_NewString(ctx, at_url[k]);
 		args[1] = JS_NewUint32(ctx, at_line[k]);
 		args[2] = JS_NewUint32(ctx, at_col[k]);
-		/* far enough back to take in the test that led here */
-		args[3] = JS_NewUint32(ctx, 350);
+		/* far enough back to take in the test that led here: for a
+		   page's first warning, the whole of a minified function */
+		args[3] = JS_NewUint32(ctx, thread->warns_explained == 1 ?
+				       1500 : 350);
 		code = win_vita_source_excerpt(ctx, JS_UNDEFINED, 4, args);
 		JS_FreeValue(ctx, args[0]);
 		text = JS_IsString(code) ? JS_ToCString(ctx, code) : NULL;
@@ -17084,7 +17086,8 @@ static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
 	const uint8_t *src = NULL;
 	size_t len = 0, i, start = 0, pos, from, to, n = 0;
 	uint32_t before = 100;
-	char buf[480];
+	char *buf;
+	JSValue out;
 	unsigned int k;
 
 	(void)this_val;
@@ -17094,8 +17097,8 @@ static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
 	/* how much to show before the position: a fourth argument, for a
 	   check that sits further back than an error's own expression */
 	if (argc > 3 && JS_ToUint32(ctx, &before, argv[3]) == 0 &&
-	    before > 400) {
-		before = 400;
+	    before > 1500) {
+		before = 1500;
 	}
 	if (JS_ToUint32(ctx, &line, argv[1]) < 0 ||
 	    JS_ToUint32(ctx, &col, argv[2]) < 0 || line == 0) {
@@ -17134,7 +17137,11 @@ static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
 	from = pos > before ? pos - before : 0;
 	if (from < start) from = start;
 	to = pos + 60 < len ? pos + 60 : len;
-	for (i = from; i < to && n < sizeof(buf) - 8; i++) {
+	buf = malloc((size_t)before + 80);
+	if (buf == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	for (i = from; i < to && n < (size_t)before + 72; i++) {
 		char c = (char)src[i];
 
 		if (c == '\n') break;
@@ -17146,7 +17153,9 @@ static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
 		buf[n++] = (c == '\t' || c == '\r') ? ' ' : c;
 	}
 	buf[n] = 0;
-	return JS_NewString(ctx, buf);
+	out = JS_NewString(ctx, buf);
+	free(buf);
+	return out;
 }
 
 static enum mod_src module_source(jsthread *thread, const char *url,
