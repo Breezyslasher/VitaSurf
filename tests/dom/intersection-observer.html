@@ -1,63 +1,46 @@
 <!DOCTYPE html>
-<!-- IntersectionObserver took an observe() and never called back, so a
-     page that renders a list only when it scrolls into view rendered
-     nothing: openmediavault's dashboard widgets and Audiobookshelf's
-     shelves both wait on it, and both came up empty. It answers from
-     the page's own geometry now, and re-checks when the page scrolls,
-     is resized, or changes.
-     Expected: three boxes, the first two reported as on screen and the
-     far one only after a scroll, and PASS lines in the log. -->
-<html><head><style>
-body { margin: 0; font: 16px/20px sans-serif }
-.b { height: 120px; background: #cde; margin: 8px }
-#spacer { height: 2000px }
-</style></head><body>
-<div class="b" id="one">one</div>
-<div class="b" id="two">two</div>
-<div id="spacer"></div>
-<div class="b" id="far">far</div>
+<!-- IntersectionObserver reports after layout, as a browser's rendering
+     update does: one first record for each target, measured, and a new
+     one only when a threshold is crossed. Ours reported a new target as
+     zero sized and out of view, from before its first layout, and again
+     once laid out. A detached target has no root bounds and an
+     unrendered one empty ones. Sizes are left out, as the two browsers'
+     fonts and scrollbars differ. Expected lines are what Chrome prints. -->
+<html><head><title>intersection observer</title></head><body><div id="c"></div>
+<div style="height:3000px"></div><div id="far">far</div>
+<pre id="out"></pre>
 <script>
-var seen = {}, calls = 0;
-function report(ok, what, got, want) {
- console.log((ok ? 'PASS ' : 'FAIL ') + what +
-             (ok ? '' : ' got ' + got + ', wanted ' + want));
+var out = [], calls = {};
+function L(s) { out.push(s); }
+function rb(e) { return e.rootBounds === null ? 'null' : e.rootBounds.width > 0 ? 'some' : 'empty'; }
+function obs(name, el, opts) {
+  calls[name] = 0;
+  new IntersectionObserver(function (es) {
+    es.forEach(function (e) {
+      calls[name]++;
+      L(name + ': intersecting ' + e.isIntersecting + ', ratio ' + e.intersectionRatio +
+        ', rect ' + (e.boundingClientRect.width > 0 ? 'sized' : 'empty') + ', root ' + rb(e));
+    });
+  }, opts).observe(el);
 }
-var io = new IntersectionObserver(function(entries){
- calls++;
- for (var i = 0; i < entries.length; i++) {
-  var e = entries[i];
-  seen[e.target.id] = e.isIntersecting;
-  if (e.target.id === 'one' && !seen.oneShape) {
-   seen.oneShape = (e.intersectionRatio > 0.9 &&
-                    e.boundingClientRect.height === 120 &&
-                    e.rootBounds !== null &&
-                    typeof e.time === 'number');
-  }
- }
-}, { threshold: [0, 0.5, 1] });
-
-io.observe(document.getElementById('one'));
-io.observe(document.getElementById('two'));
-io.observe(document.getElementById('far'));
-
-setTimeout(function(){
- report(calls > 0, 'the callback runs at all', calls + ' calls', 'at least one');
- report(seen.one === true, 'a box on screen is reported as intersecting',
-        String(seen.one), 'true');
- report(seen.far === false, 'a box far below is reported as not',
-        String(seen.far), 'false');
- report(seen.oneShape === true, 'the entry carries a rect, a ratio and a time',
-        String(seen.oneShape), 'true');
-
- /* scrolling it into view must report it without another observe */
- document.getElementById('far').scrollIntoView();
- setTimeout(function(){
-  report(seen.far === true, 'scrolling a box into view reports it',
-         String(seen.far), 'true');
-  io.disconnect();
-  report(io.takeRecords().length === 0, 'takeRecords is empty once delivered',
-         io.takeRecords().length, 0);
- }, 700);
-}, 400);
-</script>
-</body></html>
+var hidden = document.createElement('div'); hidden.style.display = 'none'; document.body.appendChild(hidden); obs('display none', hidden);
+var v = document.createElement('div'); v.textContent = 'v'; document.getElementById('c').appendChild(v); obs('visible', v);
+obs('below the fold', document.getElementById('far'));
+obs('detached', document.createElement('div'));
+var h = document.createElement('div'), r = h.attachShadow({mode: 'open'}), g = document.createElement('span');
+g.textContent = 'g'; r.appendChild(g); document.getElementById('c').appendChild(h); obs('in a shadow root', g);
+window.addEventListener('load', function () {
+  setTimeout(function () {
+    var late = document.createElement('p'); late.textContent = 'late';
+    document.getElementById('c').appendChild(late); obs('added after load', late);
+  }, 50);
+});
+setTimeout(function () {
+  /* each target's own lines; the order between observers is not
+     something a page can lean on */
+  out.sort();
+  Object.keys(calls).sort().forEach(function (k) { L(k + ': ' + calls[k] + ' callback(s)'); });
+  out.forEach(function (l) { console.log('XX ' + l); });
+  document.getElementById('out').textContent = out.join('\n');
+}, 1500);
+</script></body></html>

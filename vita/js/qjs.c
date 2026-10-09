@@ -5640,6 +5640,32 @@ static JSValue win_vita_frame_of(JSContext *ctx, JSValueConst this_val,
 	return JS_NULL;
 }
 
+/*
+ * __vitaLayoutState(): [whether a layout is still to catch up with the
+ * document, how many layout passes there have been] (VitaSurf). The
+ * IntersectionObserver reports after layout, as a browser's does in its
+ * rendering update, and looks again when a pass has run.
+ */
+static JSValue win_vita_layout_state(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue arr;
+	bool pending;
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	pending = thread == NULL || thread->htmlc == NULL ||
+		  thread->htmlc->layout == NULL || thread->dom_dirty;
+	arr = JS_NewArray(ctx);
+	JS_SetPropertyUint32(ctx, arr, 0, JS_NewBool(ctx, pending));
+	JS_SetPropertyUint32(ctx, arr, 1,
+			     JS_NewUint32(ctx, vitasurf_layout_runs));
+	return arr;
+}
+
 /* __vitaFrameElement(): this frame's iframe element, in the parent page */
 static JSValue win_vita_frame_element(JSContext *ctx, JSValueConst this_val,
 				      int argc, JSValueConst *argv)
@@ -15567,6 +15593,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaTopGlobal",
 			  JS_NewCFunction(ctx, win_vita_top_global,
 					  "__vitaTopGlobal", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaLayoutState",
+			  JS_NewCFunction(ctx, win_vita_layout_state,
+					  "__vitaLayoutState", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaFrameOf",
 			  JS_NewCFunction(ctx, win_vita_frame_of,
 					  "__vitaFrameOf", 1));

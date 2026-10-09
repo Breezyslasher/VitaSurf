@@ -6514,7 +6514,18 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
    between them cover every reason an element's visibility can change
    without a poll running all the time. */
 (function(){
- var observers=[],timer=null,lastScroll='',lastGen=-1;
+ var observers=[],timer=null,lastScroll='',lastGen=-1,lastLayout=-1;
+ /* whether layout has caught up with the document, and its pass count:
+    the observer reports after layout, as a browser does in its
+    rendering update, and not from the layout before a change (VitaSurf).
+    It reported a new target as zero sized and out of view, from before
+    its first layout, and again once laid out. */
+ var LS=W.__vitaLayoutState;
+ try{delete W.__vitaLayoutState;}catch(e){}
+ function layoutState(){try{return LS?LS():[false,0];}catch(e){return [false,0];}}
+ /* how long a first report waits for layout: a page whose rebuild waits
+    for its loading to finish still hears, from the layout it has */
+ var FIRST_WAIT_MS=2000;
 
  function parseMargin(m){
   /* one to four lengths, as the CSS margin shorthand is written; a
@@ -6558,7 +6569,11 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   var bounds={left:rl,top:rt,width:rr-rl,height:rb-rt};
 
   for(i=0;i<o.__targets.length;i++){
-   var t=o.__targets[i],r=rectOf(t.el);
+   var t=o.__targets[i],r=rectOf(t.el),rb_=box(bounds);
+   /* not in the document: no root to be in, as in Chrome; not
+      rendered: an empty one */
+   if(!t.el.isConnected)rb_=null;
+   else if(!r)rb_=box({left:0,top:0,width:0,height:0});
    if(!r){ r={left:0,top:0,width:0,height:0}; }
    var ix=Math.max(r.left,rl),iy=Math.max(r.top,rt);
    var ax=Math.min(r.left+r.width,rr),ay=Math.min(r.top+r.height,rb);
@@ -6575,7 +6590,7 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
    t.step=step;t.hit=hit;
    records.push({target:t.el,time:(W.performance&&performance.now)?
      performance.now():Date.now(),
-    rootBounds:box(bounds),boundingClientRect:box(r),
+    rootBounds:rb_,boundingClientRect:box(r),
     intersectionRect:box({left:hit?ix:0,top:hit?iy:0,
      width:iw,height:ih}),
     intersectionRatio:ratio,isIntersecting:hit});}
@@ -6597,9 +6612,12 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
 
   for(i=0;i<observers.length;i++)live+=observers[i].__targets.length;
   if(live===0){ if(timer!==null){clearInterval(timer);timer=null;} return; }
+  /* a change still to be laid out is looked at once it has been */
+  var ls=layoutState();
+  if(ls[0])return;
   /* nothing that could move anything has happened */
-  if(key===lastScroll&&g===lastGen)return;
-  lastScroll=key;lastGen=g;
+  if(key===lastScroll&&g===lastGen&&ls[1]===lastLayout)return;
+  lastScroll=key;lastGen=g;lastLayout=ls[1];
   checkAll(false);}
 
  function wake(){
@@ -6634,8 +6652,12 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   /* the specification delivers a first record for a new target without
      waiting for anything to move, and a page that builds its list from
      that first call depends on it */
-  var self=this;
-  setTimeout(function(){ check(self,false); },0);};
+  var self=this,t0=Date.now();
+  function first(){
+   if(layoutState()[0]&&Date.now()-t0<FIRST_WAIT_MS){
+    setTimeout(first,50);return;}
+   check(self,false);}
+  setTimeout(first,0);};
 
  IntersectionObserver.prototype.unobserve=function(el){
   for(var i=0;i<this.__targets.length;i++){
