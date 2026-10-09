@@ -13284,6 +13284,178 @@ static JSValue win_vita_shadow_note(JSContext *ctx, JSValueConst this_val,
 }
 
 /*
+ * __vitaAtob(s) and __vitaBtoa(s): the work of atob() and btoa(), which
+ * the prelude wraps to throw its DOMException when these answer null
+ * (VitaSurf). In script, atob was a quarter of the six seconds Cloudflare's
+ * challenge spent in script on the Vita: a loop of indexOf and string
+ * appends for every character of what it decodes.
+ */
+static int b64_value(unsigned char c)
+{
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+
+/* forgiving-base64 decode, as the HTML standard has it */
+static JSValue win_vita_atob(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	const char *in;
+	size_t len, i, n = 0, o = 0;
+	unsigned char *clean = NULL, *out = NULL;
+	uint32_t bits = 0;
+	int nbits = 0;
+	JSValue ret = JS_NULL;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	in = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (in == NULL) {
+		return JS_EXCEPTION;
+	}
+	clean = js_malloc(ctx, len + 1);
+	if (clean == NULL) {
+		JS_FreeCString(ctx, in);
+		return JS_EXCEPTION;
+	}
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)in[i];
+
+		if (c == ' ' || c == '\t' || c == '\n' || c == '\f' ||
+		    c == '\r') {
+			continue;
+		}
+		clean[n++] = c;
+	}
+	JS_FreeCString(ctx, in);
+	if (n % 4 == 0 && n > 0 && clean[n - 1] == '=') {
+		n--;
+		if (n > 0 && clean[n - 1] == '=') {
+			n--;
+		}
+	}
+	if (n % 4 == 1) {
+		goto done;
+	}
+	/* every byte of a non-ASCII character is refused here too */
+	for (i = 0; i < n; i++) {
+		if (b64_value(clean[i]) < 0) {
+			goto done;
+		}
+	}
+	/* each byte at or above 0x80 is two bytes of UTF-8 */
+	out = js_malloc(ctx, (n / 4 + 1) * 6 + 1);
+	if (out == NULL) {
+		js_free(ctx, clean);
+		return JS_EXCEPTION;
+	}
+	for (i = 0; i < n; i++) {
+		bits = (bits << 6) | (uint32_t)b64_value(clean[i]);
+		nbits += 6;
+		if (nbits >= 8) {
+			unsigned b;
+
+			nbits -= 8;
+			b = (bits >> nbits) & 0xffu;
+			if (b < 0x80) {
+				out[o++] = (unsigned char)b;
+			} else {
+				out[o++] = (unsigned char)(0xc0 | (b >> 6));
+				out[o++] = (unsigned char)(0x80 | (b & 0x3f));
+			}
+		}
+	}
+	ret = JS_NewStringLen(ctx, (const char *)out, o);
+done:
+	js_free(ctx, out);
+	js_free(ctx, clean);
+	return ret;
+}
+
+static JSValue win_vita_btoa(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				"abcdefghijklmnopqrstuvwxyz0123456789+/";
+	const char *in;
+	size_t len, i, n = 0, o = 0;
+	unsigned char *bytes;
+	char *out;
+	JSValue ret = JS_NULL;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	in = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (in == NULL) {
+		return JS_EXCEPTION;
+	}
+	bytes = js_malloc(ctx, len + 1);
+	if (bytes == NULL) {
+		JS_FreeCString(ctx, in);
+		return JS_EXCEPTION;
+	}
+	/* back from UTF-8 to code units, each of which must be Latin-1 */
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)in[i];
+
+		if (c < 0x80) {
+			bytes[n++] = c;
+		} else if ((c == 0xc2 || c == 0xc3) && i + 1 < len) {
+			bytes[n++] = (unsigned char)(((c & 0x1f) << 6) |
+					((unsigned char)in[i + 1] & 0x3f));
+			i++;
+		} else {
+			JS_FreeCString(ctx, in);
+			js_free(ctx, bytes);
+			return JS_NULL;
+		}
+	}
+	JS_FreeCString(ctx, in);
+	out = js_malloc(ctx, (n + 2) / 3 * 4 + 1);
+	if (out == NULL) {
+		js_free(ctx, bytes);
+		return JS_EXCEPTION;
+	}
+	for (i = 0; i + 2 < n; i += 3) {
+		uint32_t v = ((uint32_t)bytes[i] << 16) |
+			     ((uint32_t)bytes[i + 1] << 8) | bytes[i + 2];
+
+		out[o++] = A[(v >> 18) & 63];
+		out[o++] = A[(v >> 12) & 63];
+		out[o++] = A[(v >> 6) & 63];
+		out[o++] = A[v & 63];
+	}
+	if (n - i == 1) {
+		uint32_t v = (uint32_t)bytes[i] << 16;
+
+		out[o++] = A[(v >> 18) & 63];
+		out[o++] = A[(v >> 12) & 63];
+		out[o++] = '=';
+		out[o++] = '=';
+	} else if (n - i == 2) {
+		uint32_t v = ((uint32_t)bytes[i] << 16) |
+			     ((uint32_t)bytes[i + 1] << 8);
+
+		out[o++] = A[(v >> 18) & 63];
+		out[o++] = A[(v >> 12) & 63];
+		out[o++] = A[(v >> 6) & 63];
+		out[o++] = '=';
+	}
+	ret = JS_NewStringLen(ctx, out, o);
+	js_free(ctx, out);
+	js_free(ctx, bytes);
+	return ret;
+}
+
+/*
  * __vitaMessageNote(text): the first messages a window is sent, and
  * what became of each (VitaSurf). A page and the frames it talks to by
  * postMessage say nothing when a message goes astray: one dropped for
@@ -14920,6 +15092,10 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaMessageNote",
 			  JS_NewCFunction(ctx, win_vita_message_note,
 					  "__vitaMessageNote", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaAtob",
+			  JS_NewCFunction(ctx, win_vita_atob, "__vitaAtob", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaBtoa",
+			  JS_NewCFunction(ctx, win_vita_btoa, "__vitaBtoa", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaShadowNote",
 			  JS_NewCFunction(ctx, win_vita_shadow_note,
 					  "__vitaShadowNote", 1));

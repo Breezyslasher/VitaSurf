@@ -2176,7 +2176,19 @@ W.PerformanceObserver.prototype=W.ResizeObserver.prototype;
    state from a query string whose parser drops the "=" padding, and the
    old decoder turned the missing padding into NUL bytes, so JSON.parse
    of the state threw and the app never asked for its token. */
+/* the decoding and encoding are done in C where the natives are there
+   (VitaSurf): this loop was a quarter of Cloudflare's challenge script
+   on the Vita */
+var ATOB=W.__vitaAtob,BTOA=W.__vitaBtoa;
+try{delete W.__vitaAtob;delete W.__vitaBtoa;}catch(e){}
 W.atob=function(s){
+ if(arguments.length<1)
+  throw new TypeError("Failed to execute 'atob' on 'Window': 1 argument required, but only 0 present.");
+ if(typeof ATOB==='function'){
+  var r=ATOB(String(s));
+  if(r===null)
+   throw new DOMException("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.",'InvalidCharacterError');
+  return r;}
  var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',
      o='',i,n=0,bits=0,c;
  s=String(s).replace(/[\t\n\f\r ]/g,'');
@@ -2188,7 +2200,14 @@ W.atob=function(s){
   n=(n<<6)|c;bits+=6;
   if(bits>=8){bits-=8;o+=String.fromCharCode((n>>bits)&255);}}
  return o;};
-W.btoa=function(s){s=String(s);if(/[^\u0000-\u00ff]/.test(s))throw new DOMException("Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",'InvalidCharacterError');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
+W.btoa=function(s){
+ if(arguments.length<1)
+  throw new TypeError("Failed to execute 'btoa' on 'Window': 1 argument required, but only 0 present.");
+ s=String(s);
+ if(typeof BTOA==='function'){
+  var r=BTOA(s);
+  if(r!==null)return r;}
+ if(/[^\u0000-\u00ff]/.test(s))throw new DOMException("Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",'InvalidCharacterError');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
 function Image(){return document.createElement('img');}W.Image=Image;
 /* The other two legacy element constructors. new Audio() is how a page
    makes a sound without markup, and a page that calls it and gets a

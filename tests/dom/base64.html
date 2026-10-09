@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!-- atob and btoa by the forgiving-base64 rules of the HTML standard:
+     ASCII whitespace dropped, padding optional, anything else wrong
+     throws; btoa refuses anything outside Latin-1. Expected lines are
+     what Chrome prints. -->
+<html><head><title>base64</title></head><body><script>
+function t(n,f){var v;try{v=f();}catch(e){v='throws '+e.name;}console.log('XX '+n+'='+JSON.stringify(v));}
+t('leak',function(){return [typeof ATOB,typeof BTOA,typeof portList,typeof __vitaAtob];});
+t('basic',function(){return atob('aGVsbG8=');});
+t('nopad',function(){return atob('aGVsbG8');});
+t('ws',function(){return atob(' aG\tVs\nbG8= ');});
+t('high',function(){var s=atob('/+7dzLuqmYh3ZlVEMyIRAA==');return Array.from(s).map(function(c){return c.charCodeAt(0);}).join();});
+t('bad1',function(){return atob('a');});
+t('bad=',function(){return atob('aGVs=bG8');});
+t('3pad',function(){return atob('aGU===');});
+t('nonascii',function(){return atob('aGVsbGé8=');});
+t('nbsp',function(){return atob('aGVs bG8=');});
+t('undef',function(){return atob(undefined);});
+t('null',function(){return atob(null);});
+t('none',function(){return atob();});
+t('empty',function(){return atob('');});
+t('leftover',function(){return atob('YQ');});
+t('leftover2',function(){return atob('YR');});
+t('btoa',function(){return btoa('hello');});
+t('btoa1',function(){return btoa('a');});
+t('btoa2',function(){return btoa('ab');});
+t('btoahigh',function(){var s='';for(var i=0;i<256;i++)s+=String.fromCharCode(i);return btoa(s);});
+t('btoanul',function(){return btoa('\0a\0');});
+t('btoabad',function(){return btoa('Ā');});
+t('btoasur',function(){return btoa('\ud800');});
+t('btoanone',function(){return btoa();});
+t('roundtrip',function(){var s='';for(var i=0;i<1000;i++)s+=String.fromCharCode((i*37)&255);return atob(btoa(s))===s;});
+</script></body></html>
