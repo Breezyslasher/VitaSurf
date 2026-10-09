@@ -1,5 +1,5 @@
 diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
-index 5aa0cc442..74eaeb510 100644
+index 5aa0cc442..6a82cf526 100644
 --- a/content/handlers/css/select.c
 +++ b/content/handlers/css/select.c
 @@ -49,6 +49,13 @@ static css_error named_sibling_node(void *pw, void *node,
@@ -283,7 +283,90 @@ index 5aa0cc442..74eaeb510 100644
  /**
   * Callback to retrieve the preceding sibling of a node.
   *
-@@ -2632,7 +2839,17 @@ static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
+@@ -1896,6 +2103,9 @@ css_error node_is_visited(void *pw, void *node, bool *match)
+ 
+ static struct {
+ 	dom_node *chain[DYNAMIC_CHAIN_MAX];
++	/* reached from the top of a shadow tree: a host, which matches
++	   :focus while what has focus is in its tree (VitaSurf) */
++	bool host[DYNAMIC_CHAIN_MAX];
+ 	unsigned n;
+ } dynamic[NSCSS_DYNAMIC_COUNT];
+ 
+@@ -1941,20 +2151,42 @@ bool nscss_set_dynamic(enum nscss_dynamic which, dom_node *node,
+ 		dom_node_unref(dynamic[which].chain[i]);
+ 	dynamic[which].n = 0;
+ 
+-	for (n = node != NULL ? dom_node_ref(node) : NULL; n != NULL; ) {
+-		dom_node *parent = NULL;
+-		dom_node_type type;
++	/* up through the shadow roots on the way, to their hosts, as
++	   :hover and :focus-within reach in a browser (VitaSurf) */
++	{
++		bool crossed = false;
+ 
+-		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+-				type != DOM_ELEMENT_NODE ||
+-				dynamic[which].n == DYNAMIC_CHAIN_MAX) {
+-			dom_node_unref(n);
+-			break;
++		for (n = node != NULL ? dom_node_ref(node) : NULL;
++				n != NULL; ) {
++			dom_node *parent = NULL;
++			dom_node_type type;
++
++			if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++					type == DOM_DOCUMENT_FRAGMENT_NODE) {
++				dom_element *host = NULL;
++
++				dom_document_fragment_get_host(
++						(dom_document_fragment *) n,
++						&host);
++				dom_node_unref(n);
++				n = (dom_node *) host;
++				crossed = true;
++				continue;
++			}
++			if (type != DOM_ELEMENT_NODE ||
++					dynamic[which].n ==
++						DYNAMIC_CHAIN_MAX) {
++				dom_node_unref(n);
++				break;
++			}
++			dynamic[which].host[dynamic[which].n] = crossed;
++			dynamic[which].chain[dynamic[which].n++] = n;
++			crossed = false;
++			if (dom_node_get_parent_node(n, &parent) !=
++					DOM_NO_ERR)
++				parent = NULL;
++			n = parent;
+ 		}
+-		dynamic[which].chain[dynamic[which].n++] = n;
+-		if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR)
+-			parent = NULL;
+-		n = parent;
+ 	}
+ 	return true;
+ }
+@@ -2005,9 +2237,17 @@ css_error node_is_active(void *pw, void *node, bool *match)
+  */
+ css_error node_is_focus(void *pw, void *node, bool *match)
+ {
++	unsigned i;
++
+ 	(void)pw;
+ 	*match = (dynamic[NSCSS_FOCUS].n > 0 &&
+ 		  dynamic[NSCSS_FOCUS].chain[0] == node);
++	/* a shadow host, while focus is in its tree */
++	for (i = 1; !*match && i < dynamic[NSCSS_FOCUS].n; i++) {
++		if (dynamic[NSCSS_FOCUS].chain[i] == node &&
++				dynamic[NSCSS_FOCUS].host[i])
++			*match = true;
++	}
+ 	return CSS_OK;
+ }
+ 
+@@ -2632,7 +2872,17 @@ static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
  	(void)pw;
  	*match = false;
  

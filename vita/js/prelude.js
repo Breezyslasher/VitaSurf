@@ -397,6 +397,16 @@ function hasDescendant(el,groups){
    :popover-open in the style sheets reads it too (VitaSurf). */
 var POPQ=typeof window!=='undefined'&&typeof window.__vitaPopover==='function'?
  window.__vitaPopover:null;
+function focusIn(el,within){
+ var f=typeof focused!=='undefined'?focused:null,n,p,h;
+ if(!f||!ceInDoc(f))return false;
+ if(f===el)return true;
+ for(n=f;n;){
+  p=n.parentNode;
+  if(!p){h=shadowHost(n);if(h===el)return true;n=h;continue;}
+  if(within&&p===el)return true;
+  n=p;}
+ return false;}
 function popoverShown(el){
  return !!POPQ&&el.hasAttribute('popover')&&POPQ(el)===true;}
 function pseudoOk(el,p){
@@ -435,8 +445,15 @@ function pseudoOk(el,p){
  case 'popover-open':return popoverShown(el);
  case 'open':
   return (el.tagName==='DETAILS'||el.tagName==='DIALOG')&&el.hasAttribute('open');
- /* Nothing here has a pointer, a focus ring or a history. */
- case 'hover':case 'focus':case 'focus-within':case 'focus-visible':
+ /* what has focus, which a shadow host matches :focus for while it is
+    in its tree, as the style sheets have it */
+ case 'focus':return focusIn(el,false);
+ case 'focus-within':return focusIn(el,true);
+ case 'focus-visible':
+  return focusIn(el,false)&&focused===el&&(el.tagName==='TEXTAREA'||
+   (el.tagName==='INPUT'&&!/^(button|submit|reset|checkbox|radio|image|file|range|color)$/i.test(el.type||'')));
+ /* Nothing here has a pointer or a history. */
+ case 'hover':
  case 'active':case 'visited':case 'target':case 'indeterminate':
   return false;
  default:return true;}}
@@ -1213,11 +1230,23 @@ D.open=function(){return D;};D.close=function(){};D.writeln=D.writeln||function(
 /* The hit test a tap uses, so a sheet marked pointer-events: none is
    seen through here as a finger would see through it. The point is
    given in client coordinates, so the scroll offset goes back on. */
-D.elementFromPoint=function(x,y){
+/* The element hit, as the tree asked sees it: in a shadow tree, its
+   host in the document's own tree (VitaSurf). */
+function hitAt(x,y){
  if(!W.__vitaElementFromPoint)return null;
- var s=viewport();
- return W.__vitaElementFromPoint(Math.round(x)+s[0],Math.round(y)+s[1])||null;};
+ var s=viewport(),e=W.__vitaElementFromPoint(Math.round(x)+s[0],Math.round(y)+s[1])||null;
+ while(e&&e.nodeType!==1)e=e.parentNode||shadowHost(e);
+ return e;}
+function fromPoint(scope,x,y){
+ var e=hitAt(x,y);
+ if(!e)return null;
+ e=retarget(e,scope);
+ return treeRoot(e)===scope?e:null;}
+D.elementFromPoint=function(x,y){return fromPoint(D,x,y);};
 D.elementsFromPoint=function(x,y){var e=D.elementFromPoint(x,y);return e?[e]:[];};
+P.elementFromPoint=function(x,y){
+ return this.nodeType===11&&shadowHost(this)?fromPoint(this,x,y):null;};
+P.elementsFromPoint=function(x,y){var e=this.elementFromPoint(x,y);return e?[e]:[];};
 D.importNode=function(n,deep){return n&&n.cloneNode?n.cloneNode(!!deep):n;};
 D.adoptNode=function(n){return n;};
 D.execCommand=function(){return false;};
@@ -1745,7 +1774,7 @@ location.reload=function(){location.href=location.href;};
 location.toString=function(){return location.href;};
 function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();
  /* whether it leaves a shadow tree for the host (VitaSurf) */
- if(init&&init.composed)Object.defineProperty(this,'__vsComposed',{configurable:true,value:true});}
+ Object.defineProperty(this,'__vsComposed',{configurable:true,value:!!(init&&init.composed)});}
 /* A passive listener cannot cancel: preventDefault from inside one does
    nothing at all, so defaultPrevented stays false even while it runs.
    The dispatch marks the event while a passive listener is on it. */
@@ -2032,7 +2061,10 @@ Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,
  get:function(){return this._phase===undefined?0:this._phase;},
  set:function(v){shadowProp(this,'_phase',v|0);}});
 Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,get:function(){return false;}});
-Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){return this.__vsComposed===true;}});
+/* one a script made says what it was made with; the browser's own
+   events leave shadow trees */
+Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){
+ return this.__vsComposed!==undefined?this.__vsComposed:true;}});
 Object.defineProperty(Event.prototype,'srcElement',{configurable:true,get:function(){return this.target;}});
 Object.defineProperty(Event.prototype,'returnValue',{configurable:true,
  get:function(){return !this.defaultPrevented;},set:function(v){if(!v)this.preventDefault();}});
@@ -2043,9 +2075,19 @@ Object.defineProperty(Event.prototype,'returnValue',{configurable:true,
 Object.defineProperty(Event.prototype,'cancelBubble',{configurable:true,
  get:function(){return !!this.__cancelBubble;},
  set:function(v){if(v)this.__cancelBubble=true;}});
+/* From the node the event was sent to, which a listener outside its
+   shadow tree sees as the host, out through the shadow roots it leaves.
+   A closed tree's nodes are left out for a listener outside it. */
 Event.prototype.composedPath=function(){
- var out=[],n=this.target;
- while(n){out.push(n);n=n.parentNode||(this.composed?shadowHost(n):null);}
+ var out=[],n=this.__vsOrigin||this.target,ct=this.currentTarget,h,x;
+ function inside(c,r){for(;c;c=c.parentNode||shadowHost(c))if(c===r)return true;return false;}
+ while(n){
+  out.push(n);
+  if(n.nodeType===11&&(h=shadowHost(n))){
+   if(!this.composed)break;
+   if(SH_HOST(n,true)&&!inside(ct,n))out=[];
+   n=h;}
+  else n=n.parentNode;}
  if(out[out.length-1]!==D&&out[out.length-1]===D.documentElement)out.push(D);
  if(out[out.length-1]===D)out.push(W);
  return out;};
@@ -2821,9 +2863,46 @@ function sweepTemplates(){
    usually to query the document and the parser may have read a template
    since the last one. Touching content a second time costs nothing: the
    fragment is already there. */
-W.__vitaBeforeScript=sweepTemplates;
+/* Declarative shadow DOM (VitaSurf): a <template shadowrootmode> the
+   parser read becomes its parent's shadow root, its content the root's,
+   and the template leaves the tree, as the HTML standard's parser has
+   it. libdom's parser counts the ones it makes, so the page is looked
+   at only when there are new ones. One that cannot be attached (a host
+   with a root already, or an element that takes none) stays a template. */
+var SH_TPL=W.__vitaShadowTemplates,shTplSeen=0;
+try{delete W.__vitaShadowTemplates;}catch(e){}
+function declarativeShadows(root){
+ var t=root.querySelectorAll('template[shadowrootmode]'),i;
+ for(i=0;i<t.length;i++)declarativeShadow(t[i]);}
+function declarativeShadow(t){
+ var host=t.parentNode,mode=String(t.getAttribute('shadowrootmode')||'').toLowerCase(),r,f;
+ if(mode!=='open'&&mode!=='closed')return;
+ if(!host||host.nodeType!==1||SH_ROOT(host))return;
+ try{r=host.attachShadow({mode:mode,
+  delegatesFocus:t.hasAttribute('shadowrootdelegatesfocus'),
+  clonable:t.hasAttribute('shadowrootclonable'),
+  serializable:t.hasAttribute('shadowrootserializable'),
+  slotAssignment:String(t.getAttribute('shadowrootslotassignment')||'').toLowerCase()==='manual'?'manual':'named'});}
+ catch(e){return;}
+ f=t.content;
+ host.removeChild(t);
+ r.appendChild(f);
+ declarativeShadows(r);}
+function beforeScript(){
+ var n;
+ if(typeof SH_TPL==='function'&&(n=SH_TPL())!==shTplSeen){
+  shTplSeen=n;declarativeShadows(D);}
+ sweepTemplates();}
+W.__vitaBeforeScript=beforeScript;
+/* setHTMLUnsafe and parseHTMLUnsafe take declarative shadow roots too;
+   innerHTML leaves them as templates */
+if(W.DOMParser&&W.Document&&!W.Document.parseHTMLUnsafe)
+ W.Document.parseHTMLUnsafe=function(h){
+  var d=new W.DOMParser().parseFromString(String(h),'text/html');
+  try{declarativeShadows(d);}catch(e){}
+  return d;};
 W.addEventListener('DOMContentLoaded',function(){
- sweepTemplates();
+ beforeScript();
  if(CEn)ceConnectTree(D.documentElement,true,false);});
 W.addEventListener('load',function(){
  sweepTemplates();
@@ -2869,8 +2948,16 @@ var CE_RESERVED=' annotation-xml color-profile font-face font-face-src '+
 function ceValidName(n){
  return /^[a-z][a-z0-9._\u00b7\u00c0-\uffff-]*-[a-z0-9._\u00b7\u00c0-\uffff-]*$/.test(n)&&
   CE_RESERVED.indexOf(' '+n+' ')<0;}
+var SH_NOTE=W.__vitaShadowNote;
+try{delete W.__vitaShadowNote;}catch(e){}
+function shNote(t){if(typeof SH_NOTE==='function')try{SH_NOTE(t);}catch(e){}}
 P.attachShadow=function(init){
  if(this.nodeType!==1)throw new TypeError("Illegal invocation");
+ var ok=false;
+ try{var r0=attachShadowChecked.call(this,init);ok=true;return r0;}
+ finally{if(!ok)shNote('<'+this.localName+'> was refused a shadow root'+
+  (SH_ROOT(this)?', having one already':''));}};
+function attachShadowChecked(init){
  var mode=init&&typeof init==='object'?init.mode:undefined,r,ln=this.localName;
  if(mode!=='open'&&mode!=='closed')
   throw new TypeError("Failed to execute 'attachShadow' on 'Element': "+
@@ -3233,20 +3320,23 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    if(HOSTS.length<4096||ceInDoc(h))live.push(h);
    if(!ceInDoc(h))continue;
    r=SH_ROOT(h);
-   if(!r||(r.__vsInit&&r.__vsInit.slotAssignment==='manual'))continue;
+   if(!r)continue;
    l=[];
    for(c=h.firstChild;c;c=c.nextSibling)
     if(c.nodeType===1||c.nodeType===3)l.push(c);
    if(!l.length)continue;
    byName=Object.create(null);
-   ss=r.querySelectorAll('slot');
-   for(j=0;j<ss.length;j++){
-    name=ss[j].getAttribute('name')||'';
-    if(!(name in byName))byName[name]=ss[j];}
+   if(!manual(r)){
+    ss=r.querySelectorAll('slot');
+    for(j=0;j<ss.length;j++){
+     name=ss[j].getAttribute('name')||'';
+     if(!(name in byName))byName[name]=ss[j];}}
    for(j=0;j<l.length;j++){
     c=l[j];
-    name=c.nodeType===1?(c.getAttribute('slot')||''):'';
-    s=byName[name]||null;
+    if(manual(r))s=manualSlot(c,r);
+    else{
+     name=c.nodeType===1?(c.getAttribute('slot')||''):'';
+     s=byName[name]||null;}
     nodes.push(c);slots.push(s);
     if(c.__vsSlot!==s)Object.defineProperty(c,'__vsSlot',
      {configurable:true,writable:true,enumerable:false,value:s});}}
@@ -3262,10 +3352,117 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  if(typeof __vitaSlots==='function')
   Object.defineProperty(W,'__vitaSlotPass',{configurable:true,writable:true,
    enumerable:false,value:function(){try{pass();}catch(e){}}});
+ function manual(r){return !!(r&&r.__vsInit&&r.__vsInit.slotAssignment==='manual');}
+ /* the slot a child of a host in manual mode was assigned to, if that
+    slot is in the host's tree and still lists it */
+ function manualSlot(c,r){
+  var s=c.__vsManualSlot;
+  return s&&treeRoot(s)===r&&s.__vsManual&&s.__vsManual.indexOf(c)>=0?s:null;}
+ /* slotchange (VitaSurf). A slot whose assigned nodes change hears it in
+    the microtask after the change, as the DOM standard signals it. Only
+    hosts a change touched are looked at, and only once some listener
+    wants the event: Home Assistant has hundreds of hosts. */
+ var dirty=new Set(),queued=false,watch=false;
+ function touch(p){
+  var r,h;
+  if(!watch||!p)return;
+  if(p.nodeType===1&&SH_ROOT(p))dirty.add(p);
+  r=treeRoot(p);
+  if(r&&r.nodeType===11&&(h=shadowHost(r)))dirty.add(h);
+  if(!queued){queued=true;Promise.resolve().then(run);}}
+ function same(a,b){
+  if(a.length!==b.length)return false;
+  for(var i=0;i<a.length;i++)if(a[i]!==b[i])return false;
+  return true;}
+ function run(){
+  var hs=[],i,j,r,ss,now,old;
+  queued=false;
+  dirty.forEach(function(h){hs.push(h);});dirty.clear();
+  for(i=0;i<hs.length;i++){
+   r=SH_ROOT(hs[i]);
+   if(!r)continue;
+   ss=r.querySelectorAll('slot');
+   for(j=0;j<ss.length;j++){
+    now=ss[j].assignedNodes();old=ss[j].__vsSeen||[];
+    if(same(now,old))continue;
+    Object.defineProperty(ss[j],'__vsSeen',{configurable:true,writable:true,
+     enumerable:false,value:now});
+    try{ss[j].dispatchEvent(new Event('slotchange',{bubbles:true}));}catch(e){}}}}
+ var ael=P.addEventListener;
+ if(ael)P.addEventListener=function(t){
+  if(t==='slotchange')watch=true;
+  return ael.apply(this,arguments);};
+ ['appendChild','insertBefore','removeChild','replaceChild'].forEach(function(k){
+  var f=P[k];
+  if(!f)return;
+  P[k]=function(n){
+   var from=n&&n.parentNode,r=f.apply(this,arguments);
+   if(watch){touch(this);if(from&&from!==this)touch(from);
+    if(k==='replaceChild'&&arguments[1])touch(this);}
+   return r;};});
+ var sa=P.setAttribute,ra=P.removeAttribute;
+ P.setAttribute=function(n,v){
+  var r=sa.apply(this,arguments);
+  if(watch&&(n==='slot'||n==='name'))touch(this.parentNode||this);
+  return r;};
+ if(ra)P.removeAttribute=function(n){
+  var r=ra.apply(this,arguments);
+  if(watch&&(n==='slot'||n==='name'))touch(this.parentNode||this);
+  return r;};
+ var ih=Object.getOwnPropertyDescriptor(P,'innerHTML');
+ if(ih&&ih.set)Object.defineProperty(P,'innerHTML',{configurable:true,get:ih.get,
+  set:function(v){ih.set.call(this,v);if(watch)touch(this);}});
+ /* slot.assign(...nodes), for a tree made with slotAssignment manual */
+ P.assign=function(){
+  if(this.tagName!=='SLOT')return;
+  var list=[],i,n,o;
+  for(i=0;i<arguments.length;i++){
+   n=arguments[i];
+   if(!n||(n.nodeType!==1&&n.nodeType!==3))
+    throw new TypeError("Failed to execute 'assign' on 'HTMLSlotElement': parameter is not of type 'Element' or 'Text'.");
+   if(list.indexOf(n)<0)list.push(n);}
+  for(i=0;i<(this.__vsManual||[]).length;i++){
+   o=this.__vsManual[i];
+   if(list.indexOf(o)<0&&o.__vsManualSlot===this)o.__vsManualSlot=null;
+   if(o.parentNode)touch(o.parentNode);}
+  for(i=0;i<list.length;i++){
+   n=list[i];o=n.__vsManualSlot;
+   if(o&&o!==this&&o.__vsManual)o.__vsManual=o.__vsManual.filter(function(x){return x!==n;});
+   Object.defineProperty(n,'__vsManualSlot',{configurable:true,writable:true,
+    enumerable:false,value:this});
+   if(n.parentNode)touch(n.parentNode);}
+  Object.defineProperty(this,'__vsManual',{configurable:true,writable:true,
+   enumerable:false,value:list});
+  touch(this);};
+ W.__vsManualSlot=manualSlot;W.__vsManualRoot=manual;
+ /* the iframes in shadow trees, for the log: where each is and whether
+    it has a box, a few seconds after a page makes shadow roots */
+ var ifSeen=0,ifScans=0,ifPending=false;
+ function iframeScan(){
+  var i,j,r,fs,f,b,src,o,n=0;
+  ifPending=false;
+  for(i=0;i<HOSTS.length&&i<256;i++){
+   r=SH_ROOT(HOSTS[i]);
+   if(!r)continue;
+   fs=r.querySelectorAll('iframe');
+   for(j=0;j<fs.length;j++){
+    f=fs[j];
+    if(++n<=ifSeen)continue;
+    b=f.getBoundingClientRect();src=f.getAttribute('src')||'';
+    try{o=src?(new URL(src,location.href).origin===location.origin?
+     'from this origin':'from another origin'):'with no src';}
+    catch(e){o='with a src that is not a URL';}
+    shNote('an <iframe> '+o+' in <'+HOSTS[i].localName+'>\'s '+
+     (SH_HOST(r,true)?'closed':'open')+' tree, '+
+     (ceInDoc(f)?'in the page':'not in the page')+', '+
+     (b.width>0||b.height>0?Math.round(b.width)+'x'+Math.round(b.height):'no box')+
+     (f.contentWindow?'':', no window'));}}
+  if(n>ifSeen)ifSeen=n;}
  var att=P.attachShadow;
  P.attachShadow=function(){
   var r=att.apply(this,arguments);
   HOSTS.push(this);
+  if(!ifPending&&ifScans<4){ifPending=true;ifScans++;setTimeout(iframeScan,4000);}
   return r;};
  Object.defineProperty(P,'assignedSlot',{configurable:true,
   get:function(){
@@ -3275,7 +3472,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    var h=this.parentNode,r,s=null,name,ss,j;
    if(!h||h.nodeType!==1||(this.nodeType!==1&&this.nodeType!==3)||
       !(r=SH_ROOT(h)))return null;
-   if(r.__vsInit&&r.__vsInit.slotAssignment==='manual')s=this.__vsSlot||null;
+   if(manual(r))s=manualSlot(this,r);
    else{
     name=this.nodeType===1?(this.getAttribute('slot')||''):'';
     ss=r.querySelectorAll('slot');
@@ -4563,7 +4760,8 @@ D.caretRangeFromPoint=function(){return null;};
  D[k]=P[k]=function(p){return p;};});
 P.getBoxQuads=function(){return [this.getBoundingClientRect()];};
 P.getHTML=function(){return this.innerHTML;};
-P.setHTML=P.setHTMLUnsafe=function(h){this.innerHTML=String(h);};
+P.setHTML=function(h){this.innerHTML=String(h);};
+P.setHTMLUnsafe=function(h){this.innerHTML=String(h);declarativeShadows(this);};
 P.moveBefore=function(n,ref){return this.insertBefore(n,ref||null);};
 /* An attribute node, which getAttributeNode used to fake with an object
  * literal. Sanitizers walk these and read ownerElement off them. */
@@ -5390,7 +5588,8 @@ W.CSSMediaRule=CSSMediaRule;W.CSSSupportsRule=CSSSupportsRule;W.CSSKeyframesRule
 W.CSSFontFaceRule=CSSFontFaceRule;W.CSSImportRule=CSSImportRule;W.MediaList=MediaList;
 W.CSSStyleSheet=CSSStyleSheet;W.StyleSheet=CSSStyleSheet;
 W.CSSRuleList=W.CSSRuleList||function CSSRuleList(){};
-function inDoc(n){while(n&&n.parentNode)n=n.parentNode;return n===D;}
+/* connected, in the document's own tree or a shadow tree in it */
+function inDoc(n){for(;n;n=n.parentNode||shadowHost(n))if(n===D)return true;return false;}
 Object.defineProperty(D,'styleSheets',{configurable:true,get:function(){
  var l=D.querySelectorAll('style,link[rel~="stylesheet"]').map(elementSheet);
  l.item=function(i){return this[i]||null;};
@@ -5509,7 +5708,7 @@ function eventClass(name,fields,base){
   init=(init===undefined||init===null)?{}:init;
   this.type=String(type);
   this.bubbles=!!init.bubbles;this.cancelable=!!init.cancelable;
-  if(init.composed)Object.defineProperty(this,'__vsComposed',{configurable:true,value:true});
+  Object.defineProperty(this,'__vsComposed',{configurable:true,value:!!init.composed});
   this.defaultPrevented=false;this.target=init.target||null;this.currentTarget=null;
   Object.keys(all).forEach(function(kk){
    this[kk]=init[kk]!==undefined?init[kk]:all[kk];},this);};
@@ -5797,7 +5996,24 @@ D.cloneNode=function(deep){return cloneDocument(D,!!deep);};
 (function(){var c=P.cloneNode;
  P.cloneNode=function(deep){
   if(isDoc(this))return cloneDocument(this,!!deep);
-  return c.apply(this,arguments);};})();
+  var k=c.apply(this,arguments);
+  if(k&&this.nodeType===1)cloneShadows(this,k,!!deep);
+  return k;};
+ /* a shadow root made clonable goes with its host, and so do those of
+    the hosts a deep clone copies */
+ function cloneShadows(a,b,deep){
+  var r=SH_ROOT(a),i,nr,x,y;
+  if(r&&r.__vsInit&&r.__vsInit.clonable&&!SH_ROOT(b)){
+   i=r.__vsInit;
+   try{
+    nr=b.attachShadow({mode:SH_HOST(r,true)?'closed':'open',
+     delegatesFocus:i.delegatesFocus,slotAssignment:i.slotAssignment,
+     clonable:true,serializable:i.serializable});
+    for(x=r.firstChild;x;x=x.nextSibling)nr.appendChild(x.cloneNode(true));}
+   catch(e){}}
+  if(!deep)return;
+  for(x=a.firstChild,y=b.firstChild;x&&y;x=x.nextSibling,y=y.nextSibling)
+   if(x.nodeType===1)cloneShadows(x,y,true);}})();
 /* Each document has its own implementation: what it creates belongs to
    it, and the tests check exactly that. */
 Object.defineProperty(P,'implementation',{configurable:true,
@@ -5947,20 +6163,34 @@ Object.defineProperty(P,'closedBy',{configurable:true,
  set:function(v){this.setAttribute('closedby',String(v));}});
 /* A slot with no shadow tree shows whatever was assigned to it in the
  * light DOM, which here is the host's children with a matching slot. */
-P.assignedNodes=function(){
- if(this.tagName!=='SLOT')return [];
- var name=this.getAttribute('name')||'',root=this.getRootNode(),
-  host=shadowHost(root),first,self=this;
+function slotAssigned(slot){
+ var name=slot.getAttribute('name')||'',root=slot.getRootNode(),
+  host=shadowHost(root),first;
  if(!host)return [];
+ if(W.__vsManualRoot&&W.__vsManualRoot(root))
+  return (slot.__vsManual||[]).filter(function(n){
+   return n.parentNode===host&&W.__vsManualSlot(n,root)===slot;});
  /* only the first slot of a name takes what has that name */
  first=root.querySelectorAll('slot').filter(function(s){
   return (s.getAttribute('name')||'')===name;})[0];
- if(first!==self)return [];
+ if(first!==slot)return [];
  return host.childNodes.filter(function(n){
   if(n.nodeType===3)return name==='';
-  return n.nodeType===1&&(n.getAttribute('slot')||'')===name;});};
-P.assignedElements=function(){return this.assignedNodes().filter(function(n){return n.nodeType===1;});};
-P.assign=function(){};
+  return n.nodeType===1&&(n.getAttribute('slot')||'')===name;});}
+/* {flatten: true}: a slot with nothing assigned gives its own children,
+   and a slot among what is given gives what it is given in turn */
+function slotFlat(slot,out){
+ var l=slotAssigned(slot),i,n;
+ if(!l.length)l=slot.childNodes.filter(function(c){return c.nodeType===1||c.nodeType===3;});
+ for(i=0;i<l.length;i++){
+  n=l[i];
+  if(n.nodeType===1&&n.tagName==='SLOT'&&shadowHost(n.getRootNode()))slotFlat(n,out);
+  else out.push(n);}
+ return out;}
+P.assignedNodes=function(o){
+ if(this.tagName!=='SLOT')return [];
+ return o&&o.flatten?slotFlat(this,[]):slotAssigned(this);};
+P.assignedElements=function(o){return this.assignedNodes(o).filter(function(n){return n.nodeType===1;});};
 /* Media elements. There is no decoder here, so a play resolves and the
  * element reports that it ended: code that waits on a promise or on the
  * ended event keeps going rather than hanging on a video that never
@@ -6019,6 +6249,30 @@ Object.defineProperty(P,'mode',{configurable:true,get:function(){
  * The element with focus is kept here; a text field gets the caret as
  * well, which on the Vita opens the keyboard when a tap led to it. */
 var focused=null;
+/* the DOM standard's retargeting: a, or the host of the shadow tree it
+   is in, outwards until b is in the same tree or one inside it */
+function treeRoot(n){while(n&&n.parentNode)n=n.parentNode;return n;}
+function retarget(a,b){
+ var r,x;
+ for(;;){
+  r=treeRoot(a);
+  if(!r||r.nodeType!==11||!shadowHost(r))return a;
+  for(x=b;x;x=x.parentNode||shadowHost(x))if(x===r)return a;
+  a=shadowHost(r);}}
+/* the first focusable element in a shadow tree, trees inside it too */
+function firstFocusable(root){
+ var w=[root],n,c,r;
+ while(w.length){
+  n=w.shift();
+  for(c=n.firstElementChild;c;c=c.nextElementSibling){
+   if(focusable(c))return c;
+   r=SH_ROOT(c);
+   if(r)w.push(r);
+   w.push(c);}}
+ return null;}
+function delegates(el){
+ var r=el&&el.nodeType===1&&SH_ROOT(el);
+ return !!(r&&r.__vsInit&&r.__vsInit.delegatesFocus);}
 function focusable(el){
  if(!el||el.nodeType!==1||el.disabled)return false;
  var t=el.tagName;
@@ -6044,16 +6298,34 @@ function moveFocus(el,caret){
   if(caret&&W.__vitaFocusControl&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'))
    try{W.__vitaFocusControl(el);}catch(x){}
   focusEvent(el,'focus',false,prev);focusEvent(el,'focusin',true,prev);}}
-P.focus=function(){if(focusable(this)&&ceInDoc(this))moveFocus(this,true);};
+P.focus=function(){
+ var el=this;
+ /* a host whose tree takes focus for it */
+ if(delegates(el)){
+  if(focused&&ceInDoc(focused)&&retarget(focused,el)===el&&focused!==el)return;
+  el=firstFocusable(SH_ROOT(el));
+  if(!el)return;}
+ if(focusable(el)&&ceInDoc(el))moveFocus(el,true);};
 P.blur=function(){if(focused===this)moveFocus(null,false);};
-function activeEl(){return focused&&ceInDoc(focused)?focused:D.body;}
+/* what has focus as the document sees it: the host of the shadow tree
+   it is in, and that host's host, out to the document's own tree */
+function activeEl(){return focused&&ceInDoc(focused)?retarget(focused,D):D.body;}
 Object.defineProperty(D,'activeElement',{configurable:true,get:activeEl});
 Object.defineProperty(P,'activeElement',{configurable:true,
- get:function(){return isDoc(this)?activeEl():undefined;}});
-/* a tap on a control focuses it too */
+ get:function(){
+  if(isDoc(this))return activeEl();
+  if(this.nodeType!==11||!shadowHost(this))return undefined;
+  if(!focused||!ceInDoc(focused))return null;
+  var c=retarget(focused,this);
+  return treeRoot(c)===this?c:null;}});
+/* a tap on a control focuses it too, one inside a shadow tree as well:
+   the path starts from what was tapped, not from its host */
 W.addEventListener('click',function(e){
- var t=e&&e.target,n=t;
- while(n&&n.nodeType===1&&!focusable(n))n=n.parentNode;
+ var p=e&&e.composedPath?e.composedPath():[],n=p.length?p[0]:e&&e.target;
+ while(n&&!(n.nodeType===1&&(focusable(n)||delegates(n))))
+  n=n.parentNode||shadowHost(n);
+ if(n&&n.nodeType===1&&delegates(n)&&!focusable(n)){
+  n.focus();return;}
  if(n&&n.nodeType===1&&focused!==n)moveFocus(n,false);},true);
 /* what a shadow root was made with */
 ['delegatesFocus','slotAssignment','clonable','serializable'].forEach(function(k){
@@ -6061,8 +6333,14 @@ W.addEventListener('click',function(e){
   if(this.nodeType!==11||!shadowHost(this))return undefined;
   var i=this.__vsInit;
   return i?i[k]:(k==='slotAssignment'?'named':false);}});});
+/* a shadow root's own sheets: its <style> and stylesheet <link>
+   elements, in tree order */
 Object.defineProperty(P,'styleSheets',{configurable:true,get:function(){
- var l=[];l.item=function(i){return this[i]||null;};return l;}});
+ var l=[],e,i,sh;
+ if(this.nodeType===11&&shadowHost(this)){
+  e=this.querySelectorAll('style:not([data-adopted]),link[rel~="stylesheet"]');
+  for(i=0;i<e.length;i++){sh=e[i].sheet;if(sh)l.push(sh);}}
+ l.item=function(i){return this[i]||null;};return l;}});
 Object.defineProperty(P,'adoptedStyleSheets',adoptedAccessor());
 reflectString([['shadowRootMode','shadowrootmode'],['shadowRootSlotAssignment','shadowrootslotassignment']]);
 reflectBool([['shadowRootDelegatesFocus','shadowrootdelegatesfocus'],
@@ -7267,7 +7545,21 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
   attrList(n).forEach(function(a){s+=' '+a.name+'="'+escAttr(a.value)+'"';});
   s+='>';
   if(VOID.indexOf(' '+tag+' ')>=0)return s;
-  return s+inner(n)+'</'+tag+'>';}
+  return s+shadowPart(n)+inner(n)+'</'+tag+'>';}
+ /* getHTML's options: a shadow root it may write out, as the
+    declarative <template> that would make it again */
+ var shOpt=null;
+ function shadowPart(n){
+  var r=shOpt&&SH_ROOT(n),i,s;
+  if(!r)return '';
+  i=r.__vsInit||{};
+  if(!((shOpt.serializableShadowRoots&&i.serializable)||
+     (shOpt.shadowRoots&&[].indexOf.call(shOpt.shadowRoots,r)>=0)))return '';
+  s='<template shadowrootmode="'+(SH_HOST(r,true)?'closed':'open')+'"';
+  if(i.delegatesFocus)s+=' shadowrootdelegatesfocus=""';
+  if(i.serializable)s+=' shadowrootserializable=""';
+  if(i.clonable)s+=' shadowrootclonable=""';
+  return s+'>'+inner(r)+'</template>';}
  /* A template's innerHTML is its content's, not its own: the children
   * were moved into the content fragment, so serialising the element
   * gave the empty string and assigning to it left the content alone. */
@@ -7297,7 +7589,12 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
    var f=parseInContext(p,h===null?'':String(h));
    p.insertBefore(f,this);
    p.removeChild(this);}});
- P.getHTML=function(){return this.innerHTML;};
+ P.getHTML=function(o){
+  if(!o||(!o.serializableShadowRoots&&!(o.shadowRoots&&o.shadowRoots.length)))
+   return this.innerHTML;
+  var prev=shOpt;shOpt=o;
+  try{return (this.nodeType===1?shadowPart(this):'')+inner(isTemplate(this)?this.content:this);}
+  finally{shOpt=prev;}};
  W.XMLSerializer.prototype.serializeToString=function(n){
   return n&&n.nodeType!==undefined?ser(n):String(n);};
 })();

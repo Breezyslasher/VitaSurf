@@ -1,3 +1,87 @@
+diff --git a/bindings/hubbub/parser.c b/bindings/hubbub/parser.c
+index 432bd54..4b6e676 100644
+--- a/bindings/hubbub/parser.c
++++ b/bindings/hubbub/parser.c
+@@ -9,6 +9,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include <hubbub/errors.h>
+ #include <hubbub/hubbub.h>
+@@ -52,8 +53,17 @@ struct dom_hubbub_parser {
+ 	dom_script script;      /**< Script callback function */
+ 
+ 	void *mctx;		/**< Pointer to client data */
++
++	bool fragment;		/**< parsing for innerHTML and the like,
++				     which leaves shadow root templates as
++				     templates (VitaSurf) */
+ };
+ 
++/* <template shadowrootmode> elements a document's parser has made
++ * (VitaSurf): the client turns each into its parent's shadow root, as
++ * the HTML standard's parser does, before the next script runs. */
++unsigned int dom_hubbub_shadow_templates;
++
+ /* Forward declaration to break reference loop */
+ /* prefix + ":" + local, for an attribute the tokeniser split apart */
+ static bool name_is(dom_string *s, const char *want)
+@@ -255,6 +265,22 @@ static hubbub_error create_element(void *parser, const hubbub_tag *tag,
+ 			goto clean1;
+ 	}
+ 
++	if (!dom_parser->fragment && tag->ns == HUBBUB_NS_HTML &&
++			tag->name.len == 8 &&
++			memcmp(tag->name.ptr, "template", 8) == 0) {
++		uint32_t i;
++
++		for (i = 0; i < tag->n_attributes; i++) {
++			if (tag->attributes[i].name.len == 14 &&
++					strncasecmp((const char *)
++						tag->attributes[i].name.ptr,
++						"shadowrootmode", 14) == 0) {
++				dom_hubbub_shadow_templates++;
++				break;
++			}
++		}
++	}
++
+ 	/* Now do some special per-element-type handling */
+ 	dom_html_element_type tag_type;
+ 	err = dom_html_element_get_tag_type(element, &tag_type);
+@@ -827,6 +853,7 @@ dom_hubbub_parser_create(dom_hubbub_parser_params *params,
+ 	}
+ 
+ 	binding->complete = false;
++	binding->fragment = false;
+ 
+ 	if (params->msg == NULL) {
+ 		binding->msg = dom_hubbub_parser_default_msg;
+@@ -958,6 +985,7 @@ dom_hubbub_fragment_parser_create(dom_hubbub_parser_params *params,
+ 	}
+ 
+ 	binding->complete = false;
++	binding->fragment = true;
+ 
+ 	if (params->msg == NULL) {
+ 		binding->msg = dom_hubbub_parser_default_msg;
+diff --git a/bindings/hubbub/parser.h b/bindings/hubbub/parser.h
+index 5a95a91..ff42297 100644
+--- a/bindings/hubbub/parser.h
++++ b/bindings/hubbub/parser.h
+@@ -66,6 +66,10 @@ typedef struct dom_hubbub_parser_params {
+ } dom_hubbub_parser_params;
+ 
+ /* Create a Hubbub parser instance */
++/* <template shadowrootmode> elements document parsers have made, for
++ * the client to turn into shadow roots (VitaSurf) */
++extern unsigned int dom_hubbub_shadow_templates;
++
+ dom_hubbub_error dom_hubbub_parser_create(dom_hubbub_parser_params *params,
+ 		dom_hubbub_parser **parser,
+ 		dom_document **document);
 diff --git a/include/dom/core/doc_fragment.h b/include/dom/core/doc_fragment.h
 index fdd10f7..040190f 100644
 --- a/include/dom/core/doc_fragment.h
@@ -49,16 +133,21 @@ index 7ed12e2..e84f36c 100644
  
  #endif
 diff --git a/include/dom/events/event.h b/include/dom/events/event.h
-index aba9655..3365b97 100644
+index aba9655..dfbbf3b 100644
 --- a/include/dom/events/event.h
 +++ b/include/dom/events/event.h
-@@ -113,4 +113,8 @@ dom_exception _dom_event_set_is_trusted(dom_event *evt, bool trusted);
+@@ -113,4 +113,13 @@ dom_exception _dom_event_set_is_trusted(dom_event *evt, bool trusted);
  #define dom_event_set_is_trusted(e,t) _dom_event_set_is_trusted(	\
  		(dom_event *) (e), (bool) (t))
  
 +dom_exception _dom_event_set_composed(dom_event *evt, bool composed);
 +#define dom_event_set_composed(e,c) _dom_event_set_composed(	\
 +		(dom_event *) (e), (bool) (c))
++
++dom_exception _dom_event_get_origin(dom_event *evt,
++		dom_event_target **origin);
++#define dom_event_get_origin(e,o) _dom_event_get_origin(	\
++		(dom_event *) (e), (dom_event_target **) (o))
 +
  #endif
 diff --git a/src/core/doc_fragment.c b/src/core/doc_fragment.c
@@ -367,7 +456,7 @@ index 3befb85..c93d7c3 100644
  
  dom_exception _dom_element_create(struct dom_document *doc,
 diff --git a/src/core/node.c b/src/core/node.c
-index c1c4e41..c1ce580 100644
+index c1c4e41..54af8e1 100644
 --- a/src/core/node.c
 +++ b/src/core/node.c
 @@ -2714,6 +2714,11 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
@@ -412,7 +501,7 @@ index c1c4e41..c1ce580 100644
  
  		if (le == NULL || (target->eti.type_mask & type_bit) == 0) {
  			/* This event target isn't listening to anything,
-@@ -2781,13 +2802,27 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+@@ -2781,18 +2802,33 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
  		/* The event target is listening for this event type,
  		 * so add it to the array. */
  		if (ntargets == ntargets_allocated) {
@@ -440,7 +529,13 @@ index c1c4e41..c1ce580 100644
  		targets[ntargets++] = (dom_event_target *)dom_node_ref(target);
  	}
  
-@@ -2801,8 +2836,19 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	/* Fill the target of the event */
+ 	evt->target = et;
++	evt->origin = et;
+ 	evt->phase = DOM_CAPTURING_PHASE;
+ 
+ 	/* The window is on the path when the target is in its document,
+@@ -2801,8 +2837,19 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
  	if (window_hook != NULL) {
  		dom_node_internal *root = (dom_node_internal *) et;
  
@@ -462,7 +557,7 @@ index c1c4e41..c1ce580 100644
  		to_window = root == (dom_node_internal *) doc &&
  			!(dom_string_byte_length(evt->type) == 4 &&
  			  memcmp(dom_string_data(evt->type), "load", 4) == 0);
-@@ -2822,7 +2868,9 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+@@ -2822,7 +2869,9 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
  	/* The window first (VitaSurf) */
  	if (to_window) {
  		evt->current = NULL;
@@ -472,7 +567,7 @@ index c1c4e41..c1ce580 100644
  		if (evt->stop_now == true || evt->stop == true)
  			goto cleanup;
  	}
-@@ -2832,8 +2880,15 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+@@ -2832,8 +2881,15 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
  		dom_node_internal *node =
  			(dom_node_internal *) targets[targetnr - 1];
  
@@ -488,7 +583,7 @@ index c1c4e41..c1ce580 100644
  		if (err != DOM_NO_ERR) {
  			ret = err;
  			goto cleanup;
-@@ -2863,11 +2918,23 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+@@ -2863,11 +2919,23 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
  	 * time with the document still loading. */
  	evt->phase = DOM_BUBBLING_PHASE;
  
@@ -513,7 +608,7 @@ index c1c4e41..c1ce580 100644
  		if (err != DOM_NO_ERR) {
  			ret = err;
  			goto cleanup;
-@@ -2881,7 +2948,9 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+@@ -2881,7 +2949,9 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
  	/* and the window last (VitaSurf) */
  	if (to_window && evt->bubble) {
  		evt->current = NULL;
@@ -523,11 +618,12 @@ index c1c4e41..c1ce580 100644
  	}
  
  	if (dei->actions == NULL)
-@@ -2925,12 +2994,15 @@ cleanup:
+@@ -2925,12 +2995,16 @@ cleanup:
  		*success = false;
  	}
  
 +	evt->target = et;
++	evt->origin = NULL;
  	while (ntargets--) {
  		dom_node_unref(targets[ntargets]);
 +		dom_node_unref(retargets[ntargets]);
@@ -539,7 +635,7 @@ index c1c4e41..c1ce580 100644
  
  	if (dei != NULL && dei->actions != NULL) {
  		dom_default_action_callback cb = dei->actions(evt->type,
-@@ -2983,3 +3055,25 @@ dom_exception _dom_node_dispatch_node_change_event(dom_document *doc,
+@@ -2983,3 +3057,25 @@ dom_exception _dom_node_dispatch_node_change_event(dom_document *doc,
  	return DOM_NO_ERR;
  }
  
@@ -581,18 +677,19 @@ index 4d79edf..21629bc 100644
  		dom_node_internal *node, dom_node_internal *related,
  		dom_mutation_type change, bool *success);
 diff --git a/src/events/event.c b/src/events/event.c
-index b518040..cb54d41 100644
+index b518040..bc4444a 100644
 --- a/src/events/event.c
 +++ b/src/events/event.c
-@@ -56,6 +56,7 @@ dom_exception _dom_event_initialise(dom_event *evt)
+@@ -56,6 +56,8 @@ dom_exception _dom_event_initialise(dom_event *evt)
  	evt->refcnt = 1;
  	evt->vtable = vtable;
  	evt->is_trusted = true;
 +	evt->composed = true;
++	evt->origin = NULL;
  
  	return DOM_NO_ERR;
  }
-@@ -394,3 +395,11 @@ dom_exception _dom_event_set_is_trusted(dom_event *evt, bool trusted)
+@@ -394,3 +396,21 @@ dom_exception _dom_event_set_is_trusted(dom_event *evt, bool trusted)
  
  	return DOM_NO_ERR;
  }
@@ -604,11 +701,21 @@ index b518040..cb54d41 100644
 +
 +	return DOM_NO_ERR;
 +}
++
++/* The node it was sent to, unreferenced, while it is being dispatched,
++ * and NULL otherwise (VitaSurf) */
++dom_exception _dom_event_get_origin(dom_event *evt,
++		dom_event_target **origin)
++{
++	*origin = evt->origin;
++
++	return DOM_NO_ERR;
++}
 diff --git a/src/events/event.h b/src/events/event.h
-index 7cada7b..435d0bc 100644
+index 7cada7b..2d6d45d 100644
 --- a/src/events/event.h
 +++ b/src/events/event.h
-@@ -50,6 +50,10 @@ struct dom_event {
+@@ -50,6 +50,14 @@ struct dom_event {
  	bool in_dispatch;	/**< Whether this event is in dispatch */
  	bool is_initialised;	/**< Whether this event is initialised */
  	bool is_trusted;	/**< Whether this event is trusted */
@@ -616,6 +723,10 @@ index 7cada7b..435d0bc 100644
 +	 * own events do, an event a script makes does only when it asks
 +	 * (VitaSurf) */
 +	bool composed;
++	/** the node it was sent to, while it is being dispatched: what
++	 * composedPath starts from, whatever a listener sees as the target
++	 * (VitaSurf) */
++	dom_event_target *origin;
  };
  
  /* Destructor */

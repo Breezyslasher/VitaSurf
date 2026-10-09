@@ -381,6 +381,8 @@ struct jsthread {
 				   *   JS_UNINITIALIZED before it is looked
 				   *   up and JS_UNDEFINED if there is none */
 	int event_depth;          /**< DOM event dispatches in progress */
+	unsigned shadow_notes;    /**< shadow root lines logged for this
+				       page, which stop at SHADOW_NOTES */
 	int window_phase;         /**< eventPhase for window listeners run
 				   *   at target, 0 when libdom says */
 	bool stop_now_seen;       /**< stopImmediatePropagation was called */
@@ -9372,6 +9374,18 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		JS_SetPropertyStr(ctx, event_obj, "currentTarget",
 				  JS_DupValue(ctx, global));
 	}
+	/* the node it was sent to, which composedPath starts from when the
+	 * target this listener sees is a shadow host */
+	{
+		struct dom_event_target *origin = NULL;
+
+		if (dom_event_get_origin(evt, &origin) == DOM_NO_ERR &&
+		    origin != NULL) {
+			JS_SetPropertyStr(ctx, event_obj, "__vsOrigin",
+					  wrap_node(ctx,
+						(struct dom_node *)origin));
+		}
+	}
 	/* which phase the listener is being called in, which an event out
 	 * of dispatch does not have at all */
 	if (l->on_window && thread->window_phase != 0) {
@@ -12598,6 +12612,21 @@ static JSValue win_vita_set_sheet_text(JSContext *ctx, JSValueConst this_val,
  * style sheets (VitaSurf). focus() from script moves it as a tap does;
  * a field that takes typing also matches :focus-visible, as in Chrome.
  */
+/*
+ * __vitaShadowTemplates(): how many <template shadowrootmode> elements
+ * the document parsers have made, which the prelude turns into shadow
+ * roots when the count moves (VitaSurf).
+ */
+static JSValue win_vita_shadow_templates(JSContext *ctx,
+					 JSValueConst this_val,
+					 int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	return JS_NewUint32(ctx, dom_hubbub_shadow_templates);
+}
+
 static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
@@ -13214,6 +13243,45 @@ static JSValue win_vita_popover(JSContext *ctx, JSValueConst this_val,
  * __vitaAttachShadow(element, closed): the new root, or null when the
  * element has one already.
  */
+/*
+ * The first few shadow roots a page makes, and what became of iframes put
+ * in them, in the log (VitaSurf): a widget that renders into a closed
+ * shadow root says nothing when it gives up, and the log is all there is
+ * to see it by on the Vita.
+ */
+#define SHADOW_NOTES 12
+
+static void shadow_note(jsthread *thread, const char *text)
+{
+	if (thread == NULL || thread->shadow_notes >= SHADOW_NOTES) {
+		return;
+	}
+	thread->shadow_notes++;
+	vita_log("shadow: %s%s", text,
+		 thread->shadow_notes == SHADOW_NOTES ?
+		 " (no more of these for this page)" : "");
+}
+
+/* __vitaShadowNote(text): a line for the above, from the prelude */
+static JSValue win_vita_shadow_note(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *text;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL ||
+	    thread->shadow_notes >= SHADOW_NOTES) {
+		return JS_UNDEFINED;
+	}
+	text = JS_ToCString(ctx, argv[0]);
+	if (text != NULL) {
+		shadow_note(thread, text);
+		JS_FreeCString(ctx, text);
+	}
+	return JS_UNDEFINED;
+}
+
 static JSValue win_vita_attach_shadow(JSContext *ctx, JSValueConst this_val,
 				      int argc, JSValueConst *argv)
 {
@@ -13234,6 +13302,30 @@ static JSValue win_vita_attach_shadow(JSContext *ctx, JSValueConst this_val,
 				      argc > 1 && JS_ToBool(ctx, argv[1]) == 1,
 				      &root) != DOM_NO_ERR || root == NULL) {
 		return JS_NULL;
+	}
+	{
+		jsthread *thread = JS_GetContextOpaque(ctx);
+
+		if (thread != NULL && thread->shadow_notes < SHADOW_NOTES) {
+			dom_string *name = NULL;
+			char line[96];
+
+			if (dom_node_get_node_name(node, &name) != DOM_NO_ERR)
+				name = NULL;
+			snprintf(line, sizeof(line),
+				 "<%.*s> has %s shadow root, %s",
+				 name != NULL ? (int) (dom_string_byte_length(
+					name) < 40 ? dom_string_byte_length(
+					name) : 40) : 1,
+				 name != NULL ? dom_string_data(name) : "?",
+				 argc > 1 && JS_ToBool(ctx, argv[1]) == 1 ?
+				 "a closed" : "an open",
+				 node_in_page(thread, node) ?
+				 "in the page" : "not in the page yet");
+			if (name != NULL)
+				dom_string_unref(name);
+			shadow_note(thread, line);
+		}
 	}
 	/* the host's children are no longer what is drawn in it */
 	mark_tree_dirty(ctx, "attachShadow", node, NULL, true);
@@ -14782,6 +14874,12 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaSetSheetText",
 			  JS_NewCFunction(ctx, win_vita_set_sheet_text,
 					  "__vitaSetSheetText", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaShadowNote",
+			  JS_NewCFunction(ctx, win_vita_shadow_note,
+					  "__vitaShadowNote", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaShadowTemplates",
+			  JS_NewCFunction(ctx, win_vita_shadow_templates,
+					  "__vitaShadowTemplates", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaSetFocus",
 			  JS_NewCFunction(ctx, win_vita_set_focus,
 					  "__vitaSetFocus", 1));
