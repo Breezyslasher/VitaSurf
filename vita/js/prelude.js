@@ -1397,7 +1397,10 @@ function treeGen(){return GEN&&GEN.length>1?GEN[1]:-1;}
 W.dispatchEvent=function(e){return __vitaDispatch(null,e);};
 /* Viewport and scroll position come from the window itself, so a script
    that measures the page sees what is really on screen. */
-[['innerWidth',2],['outerWidth',2],['innerHeight',3],['outerHeight',3],['scrollX',0],['pageXOffset',0],['scrollY',1],['pageYOffset',1]].forEach(function(e){Object.defineProperty(W,e[0],{get:function(){return viewport()[e[1]];}});});
+/* Replaceable, as a browser's are: enumerable, configurable, and a
+   page's assignment puts its own value in their place. They could not
+   be taken off a worker's global, which has none of them. */
+[['innerWidth',2],['outerWidth',2],['innerHeight',3],['outerHeight',3],['scrollX',0],['pageXOffset',0],['scrollY',1],['pageYOffset',1]].forEach(function(e){Object.defineProperty(W,e[0],{configurable:true,enumerable:true,get:function(){return viewport()[e[1]];},set:function(v){Object.defineProperty(W,e[0],{configurable:true,enumerable:true,writable:true,value:v});}});});
 W.devicePixelRatio=1;
 /* Frame relationships. Scripts test self !== top to find out whether they
    are framed, and a missing top is a ReferenceError that takes the script
@@ -8647,7 +8650,8 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   ['document','window','parent','top','frames','frameElement','opener',
    'localStorage','sessionStorage','alert','confirm','prompt','print','open',
    'history','customElements','Worker','SharedWorker','external','screen',
-   'visualViewport','scrollX','scrollY','innerWidth','innerHeight'
+   'visualViewport','scrollX','scrollY','innerWidth','innerHeight',
+   'outerWidth','outerHeight','pageXOffset','pageYOffset'
   ].forEach(function(k){
    try{delete W[k];}catch(e){}
    if(k in W)try{Object.defineProperty(W,k,{value:undefined,

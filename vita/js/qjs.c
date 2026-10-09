@@ -202,6 +202,7 @@ struct jsthread {
 	html_content *htmlc;
 	unsigned frames_logged;   /**< frame pages this page made, logged */
 	unsigned throws_logged;   /**< engine errors logged, caught or not */
+	unsigned warns_explained; /**< warnings logged with where they came from */
 	/*
 	 * Dedicated workers (VitaSurf). A worker is a realm of its own on
 	 * the page's runtime, run by the same scheduler: it shares the
@@ -12587,6 +12588,8 @@ static void qjs_miss_any_add(JSContext *ctx, JSValueConst obj, JSAtom prop,
 static bool qjs_miss_ours(const char *name)
 {
 	return strncmp(name, "__vita", 6) == 0 ||
+		strncmp(name, "__vs", 4) == 0 ||
+		strcmp(name, "__shadow") == 0 ||
 		strncmp(name, "__on_", 5) == 0 ||
 		strncmp(name, "__onw_", 6) == 0 ||
 		strcmp(name, "__stopNow") == 0 ||
@@ -12685,6 +12688,132 @@ static const char *own_data_cstring(JSContext *ctx, JSValueConst obj,
  * and not the same one twice running.
  */
 #define THROWS_LOGGED_MAX 40
+/* A line of the log at most this long, in pieces (VitaSurf). */
+static void log_in_pieces(const char *head, const char *text)
+{
+	size_t len = strlen(text), at = 0;
+
+	while (at < len) {
+		size_t n = len - at > 400 ? 400 : len - at;
+
+		vita_log("%s%.*s", head, (int)n, text + at);
+		at += n;
+	}
+}
+
+/*
+ * console.warn and console.error (VitaSurf): the message, and for a
+ * page's first five, where it was said from and what was read just
+ * before that found nothing. A warning a site's own code prints when
+ * it gives up -- "Cannot find Widget" from claude.ai's check -- said
+ * neither, so what it had looked for could not be told. The prelude's
+ * own report of an uncaught error says both already.
+ */
+#define WARNS_EXPLAINED_MAX 5
+static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue r = console_log(ctx, this_val, argc, argv);
+	JSValue err;
+	const char *first, *stack;
+	char seq[MISS_ANY * 70];
+	char where[300], at_url[256];
+	unsigned at_line = 0, at_col = 0;
+	size_t n = 0;
+	const char *p;
+	int lines = 0;
+	bool ours;
+
+	if (thread == NULL || argc < 1 ||
+	    thread->warns_explained >= WARNS_EXPLAINED_MAX) {
+		return r;
+	}
+	first = JS_ToCString(ctx, argv[0]);
+	ours = first == NULL || strncmp(first, "uncaught", 8) == 0;
+	if (first != NULL) JS_FreeCString(ctx, first);
+	if (ours) {
+		return r;
+	}
+	thread->warns_explained++;
+	/* the page's frames: an error made here has the stack of its
+	   caller, below this function and the prelude's wrapper */
+	where[0] = '\0';
+	err = JS_NewError(ctx);
+	stack = JS_IsException(err) ? NULL :
+		own_data_cstring(ctx, err, "stack");
+	for (p = stack; p != NULL && *p != '\0' && lines < 4; ) {
+		const char *e = strchr(p, '\n');
+		size_t len = e != NULL ? (size_t)(e - p) : strlen(p);
+
+		while (len > 0 && *p == ' ') {
+			p++;
+			len--;
+		}
+		if (len > 0 && !prof_has(p, len, "<prelude>") &&
+		    !prof_has(p, len, "(native)")) {
+			/* the first page frame's position, for its code */
+			if (lines == 0 && len > 2 && p[len - 1] == ')') {
+				const char *o = p + len - 1, *c2 = NULL,
+					*c1 = NULL;
+
+				while (o > p && *o != '(') {
+					if (*o == ':') {
+						if (c2 == NULL) c2 = o;
+						else if (c1 == NULL) c1 = o;
+					}
+					o--;
+				}
+				if (*o == '(' && c1 != NULL &&
+				    (size_t)(c1 - o - 1) < sizeof(at_url)) {
+					memcpy(at_url, o + 1,
+					       (size_t)(c1 - o - 1));
+					at_url[c1 - o - 1] = '\0';
+					at_line = (unsigned)strtoul(c1 + 1,
+								    NULL, 10);
+					at_col = (unsigned)strtoul(c2 + 1,
+								   NULL, 10);
+				}
+			}
+			if (n + len + 3 < sizeof(where)) {
+				memcpy(where + n, " | ", 3);
+				memcpy(where + n + 3, p, len);
+				n += len + 3;
+				where[n] = '\0';
+			}
+			lines++;
+		}
+		p = e != NULL ? e + 1 : NULL;
+	}
+	if (stack != NULL) JS_FreeCString(ctx, stack);
+	JS_FreeValue(ctx, err);
+	vita_log("console: that was said from%s", n > 0 ? where :
+		 " nowhere script can see");
+	if (at_line > 0) {
+		JSValue args[3], code;
+		const char *text;
+
+		args[0] = JS_NewString(ctx, at_url);
+		args[1] = JS_NewUint32(ctx, at_line);
+		args[2] = JS_NewUint32(ctx, at_col);
+		code = win_vita_source_excerpt(ctx, JS_UNDEFINED, 3, args);
+		JS_FreeValue(ctx, args[0]);
+		text = JS_IsString(code) ? JS_ToCString(ctx, code) : NULL;
+		if (text != NULL && text[0] != '\0') {
+			vita_log("console: the code there, column %u: %s",
+				 at_col, text);
+		}
+		if (text != NULL) JS_FreeCString(ctx, text);
+		JS_FreeValue(ctx, code);
+	}
+	qjs_miss_seq_copy(ctx, seq, sizeof(seq));
+	if (seq[0] != '\0') {
+		log_in_pieces("console: read just before it and not here, "
+			      "oldest first: ", seq);
+	}
+	return r;
+}
+
 static void qjs_throw_hook(JSContext *ctx, JSValueConst error)
 {
 	static bool busy;
@@ -14310,9 +14439,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, console, "log",
 			  JS_NewCFunction(ctx, console_log, "log", 1));
 	JS_SetPropertyStr(ctx, console, "warn",
-			  JS_NewCFunction(ctx, console_log, "warn", 1));
+			  JS_NewCFunction(ctx, console_warn, "warn", 1));
 	JS_SetPropertyStr(ctx, console, "error",
-			  JS_NewCFunction(ctx, console_log, "error", 1));
+			  JS_NewCFunction(ctx, console_warn, "error", 1));
 	JS_SetPropertyStr(ctx, console, "info",
 			  JS_NewCFunction(ctx, console_log, "info", 1));
 	JS_SetPropertyStr(ctx, console, "debug",
@@ -14643,7 +14772,11 @@ static bool setup_globals(jsthread *thread)
 			JS_FreeValue(ctx, fn);
 			ok = false;
 		} else {
+			/* its own reads that find nothing are not the
+			   page's */
+			miss_quiet = true;
 			r = JS_EvalFunction(ctx, fn);
+			miss_quiet = false;
 			if (JS_IsException(r)) {
 				qjs_report_exception_src(ctx, "<prelude>",
 							 src, len);
