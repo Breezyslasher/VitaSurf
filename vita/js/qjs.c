@@ -11177,6 +11177,37 @@ static void sm_length(char *buf, size_t len, const css_computed_style *s,
 		snprintf(buf + n, len - n, "%%");
 		return;
 	}
+	if (unit == CSS_UNIT_EXPR) {
+		/* a held math function (VitaSurf): one of lengths alone
+		 * is its length below; one with a percentage reads as
+		 * calc(P% + Lpx), as browsers give a sum, its parts found
+		 * by resolving it against two sizes */
+		int a = 0, b = 0;
+		css_fixed per = css_unit_len2device_px(s, uctx, INTTOFIX(1),
+				CSS_UNIT_PX);
+
+		if (!css_computed_expr_px(s, uctx, -1, v, &a)) {
+			css_fixed pct, px;
+			char ps[24], ls[24];
+
+			if (per <= 0 ||
+			    !css_computed_expr_px(s, uctx, 0, v, &a) ||
+			    !css_computed_expr_px(s, uctx, 10000, v, &b)) {
+				snprintf(buf, len, "0px");
+				return;
+			}
+			pct = FDIV(INTTOFIX(b - a), INTTOFIX(100));
+			px = FDIV(INTTOFIX(a), per);
+			sm_number(ps, sizeof(ps), pct);
+			sm_number(ls, sizeof(ls), px < 0 ? -px : px);
+			if (px == 0)
+				snprintf(buf, len, "%s%%", ps);
+			else
+				snprintf(buf, len, "calc(%s%% %c %spx)", ps,
+						px < 0 ? '-' : '+', ls);
+			return;
+		}
+	}
 	sm_number(buf, len, css_unit_len2css_px(s, uctx, v, unit));
 	n = strlen(buf);
 	snprintf(buf + n, len - n, "px");
@@ -11969,6 +12000,72 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 					rs[2], rs[3]);
 			sm_set(ctx, obj, "borderRadius", buf);
 		}
+	}
+	{
+		/* lengths a page reads back, each as browsers resolve it, a
+		 * calc() of lengths to pixels and one with a percentage as
+		 * calc(P% + Lpx) (VitaSurf) */
+		css_fixed h = 0, vv = 0;
+		css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
+		char hb[48], vb[48];
+
+		if (css_computed_outline_offset(s, &h, &hu) !=
+				CSS_OUTLINE_OFFSET_SET)
+			h = 0, hu = CSS_UNIT_PX;
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_set(ctx, obj, "outlineOffset", hb);
+
+		h = vv = 0;
+		hu = vu = CSS_UNIT_PCT;
+		css_computed_background_position(s, &h, &hu, &vv, &vu);
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_length(vb, sizeof(vb), s, uctx, vv, vu);
+		snprintf(buf, sizeof(buf), "%s %s", hb, vb);
+		sm_set(ctx, obj, "backgroundPosition", buf);
+
+		h = vv = 0;
+		hu = vu = CSS_UNIT_PX;
+		css_computed_border_spacing(s, &h, &hu, &vv, &vu);
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_length(vb, sizeof(vb), s, uctx, vv, vu);
+		snprintf(buf, sizeof(buf), "%s %s", hb, vb);
+		sm_set(ctx, obj, "borderSpacing", buf);
+
+		if (css_computed_object_position(s, &h, &hu, &vv, &vu) !=
+				CSS_OBJECT_POSITION_SET) {
+			h = vv = INTTOFIX(50);
+			hu = vu = CSS_UNIT_PCT;
+		}
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_length(vb, sizeof(vb), s, uctx, vv, vu);
+		snprintf(buf, sizeof(buf), "%s %s", hb, vb);
+		sm_set(ctx, obj, "objectPosition", buf);
+
+		if (css_computed_text_decoration_thickness(s, &h, &hu) ==
+				CSS_TEXT_DECORATION_THICKNESS_SET) {
+			sm_length(hb, sizeof(hb), s, uctx, h, hu);
+			sm_set(ctx, obj, "textDecorationThickness", hb);
+		} else {
+			sm_set(ctx, obj, "textDecorationThickness", "auto");
+		}
+		if (css_computed_text_underline_offset(s, &h, &hu) ==
+				CSS_TEXT_UNDERLINE_OFFSET_SET) {
+			sm_length(hb, sizeof(hb), s, uctx, h, hu);
+			sm_set(ctx, obj, "textUnderlineOffset", hb);
+		} else {
+			sm_set(ctx, obj, "textUnderlineOffset", "auto");
+		}
+
+		if (css_computed_stroke_width(s, &h, &hu) !=
+				CSS_STROKE_WIDTH_SET)
+			h = INTTOFIX(1), hu = CSS_UNIT_PX;
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_set(ctx, obj, "strokeWidth", hb);
+		if (css_computed_stroke_dashoffset(s, &h, &hu) !=
+				CSS_STROKE_DASHOFFSET_SET)
+			h = 0, hu = CSS_UNIT_PX;
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_set(ctx, obj, "strokeDashoffset", hb);
 	}
 	{
 		uint8_t os = css_computed_outline_style(s);
