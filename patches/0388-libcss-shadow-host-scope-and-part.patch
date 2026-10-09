@@ -1,8 +1,8 @@
 diff --git a/include/libcss/select.h b/include/libcss/select.h
-index 7ead79b..fa6e69d 100644
+index 7ead79b..00eb41a 100644
 --- a/include/libcss/select.h
 +++ b/include/libcss/select.h
-@@ -233,6 +233,32 @@ typedef struct css_select_handler {
+@@ -233,6 +233,41 @@ typedef struct css_select_handler {
  	css_error (*node_container_size)(void *pw, void *node,
  			lwc_string *name, css_fixed *width, css_fixed *height,
  			uint8_t *status);
@@ -32,11 +32,35 @@ index 7ead79b..fa6e69d 100644
 +	css_error (*part_host)(void *pw, void *node,
 +			lwc_string *const *names, uint32_t n_names,
 +			void *prev, void **host);
++
++	/**
++	 * The tree \a node is in (VitaSurf): NULL for the document's own,
++	 * or what the client gave css_select_ctx_append_sheet_scoped for
++	 * the sheets of that shadow tree. An author rule matches only the
++	 * elements of its sheet's tree, or, for X::part(), an X there.
++	 * NULL here keeps every rule to every tree.
++	 */
++	css_error (*node_tree_scope)(void *pw, void *node, void **scope);
  } css_select_handler;
  
  /** How many attribute names a node can name before every bucket is
+@@ -307,6 +342,14 @@ css_error css_select_ctx_destroy(css_select_ctx *ctx);
+ css_error css_select_ctx_append_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet,
+ 		css_origin origin, const char *media);
++/**
++ * Append a sheet whose author rules are for one tree (VitaSurf): \a scope
++ * is NULL for the document's, or the client's value for a shadow tree,
++ * as node_tree_scope gives it for the tree's elements.
++ */
++css_error css_select_ctx_append_sheet_scoped(css_select_ctx *ctx,
++		const css_stylesheet *sheet, css_origin origin,
++		const char *media, const void *scope);
+ css_error css_select_ctx_insert_sheet(css_select_ctx *ctx,
+ 		const css_stylesheet *sheet, uint32_t index,
+ 		css_origin origin, const char *media);
 diff --git a/src/parse/language.c b/src/parse/language.c
-index a84201c..039388a 100644
+index a84201c..e08e070 100644
 --- a/src/parse/language.c
 +++ b/src/parse/language.c
 @@ -3387,11 +3387,16 @@ static const char *const known_classes[] = {
@@ -58,7 +82,7 @@ index a84201c..039388a 100644
  };
  
  static const char *const known_elements[] = {
-@@ -4772,6 +4777,46 @@ css_error parseCombinator(css_language *c, const parserutils_vector *vector,
+@@ -4772,6 +4777,50 @@ css_error parseCombinator(css_language *c, const parserutils_vector *vector,
  	return CSS_OK;
  }
  
@@ -80,14 +104,18 @@ index a84201c..039388a 100644
 +				name, n) == 0;
 +}
 +
-+static void markHostCompounds(css_selector *s)
++static void markHostCompounds(css_selector *subject)
 +{
++	css_selector *s = subject;
++
 +	for (; s != NULL; s = s->combinator) {
 +		const css_selector_detail *d = &s->data;
 +
 +		for (;;) {
-+			if (detailIs(d, "-vita-host"))
++			if (detailIs(d, "-vita-host")) {
 +				s->data.cross = 1;
++				subject->data.host_rule = 1;
++			}
 +			/* X::part(a), rewritten as X :-vita-part(a): the
 +			 * step to X is to the host the part belongs to */
 +			if (detailIs(d, "-vita-part") &&
@@ -105,7 +133,7 @@ index a84201c..039388a 100644
  css_error parseSelector(css_language *c, const parserutils_vector *vector,
  		int32_t *ctx, css_selector **result)
  {
-@@ -4850,6 +4895,9 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+@@ -4850,6 +4899,9 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
  		selector = other;
  	}
  
@@ -183,10 +211,29 @@ index 9cd147b..59155bd 100644
  			do {
  				if (d->negate == 0) {
 diff --git a/src/select/select.c b/src/select/select.c
-index 0267ae7..8ef2523 100644
+index 0267ae7..118685f 100644
 --- a/src/select/select.c
 +++ b/src/select/select.c
-@@ -311,6 +311,9 @@ static css_error match_universal_combinator(css_select_ctx *ctx,
+@@ -49,6 +49,9 @@ typedef struct css_select_sheet {
+ 	const css_stylesheet *sheet;	/**< Stylesheet */
+ 	css_origin origin;		/**< Stylesheet origin */
+ 	css_mq_query *media;		/**< Applicable media */
++	/** the tree its rules are for: NULL for the document, or the
++	 * client's shadow root the sheet's element is in (VitaSurf) */
++	const void *scope;
+ } css_select_sheet;
+ 
+ /**
+@@ -102,6 +105,8 @@ struct css_select_ctx {
+ 	 */
+ 	struct css_select_flat *flat;
+ 	uint32_t n_flat;
++	/* each seq's top-level sheet's scope (VitaSurf) */
++	const void **seq_scope;
+ 	css_selector_hash *index[CSS_ORIGIN_AUTHOR + 1];
+ 	bool index_valid;
+ 	bool index_failed;	/* out of memory: selection stays per sheet */
+@@ -311,6 +316,9 @@ static css_error match_universal_combinator(css_select_ctx *ctx,
  		css_combinator type, const css_selector *selector,
  		css_select_state *state, void *node, bool may_optimise,
  		bool *rejected_by_cache, void **next_node);
@@ -196,7 +243,64 @@ index 0267ae7..8ef2523 100644
  static css_error match_details(css_select_ctx *ctx, void *node,
  		const css_selector_detail *detail, css_select_state *state,
  		bool *match, css_pseudo_element *pseudo_element);
-@@ -2813,7 +2816,11 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+@@ -1132,6 +1140,23 @@ css_error css_select_ctx_append_sheet(css_select_ctx *ctx,
+ 			origin, media);
+ }
+ 
++/* exported interface documented in libcss/select.h (VitaSurf) */
++css_error css_select_ctx_append_sheet_scoped(css_select_ctx *ctx,
++		const css_stylesheet *sheet, css_origin origin,
++		const char *media, const void *scope)
++{
++	css_error error;
++
++	if (ctx == NULL || sheet == NULL)
++		return CSS_BADPARM;
++
++	error = css_select_ctx_insert_sheet(ctx, sheet, ctx->n_sheets,
++			origin, media);
++	if (error == CSS_OK)
++		ctx->sheets[ctx->n_sheets - 1].scope = scope;
++	return error;
++}
++
+ /**
+  * Insert a stylesheet into a selection context
+  *
+@@ -1191,6 +1216,7 @@ css_error css_select_ctx_insert_sheet(css_select_ctx *ctx,
+ 	ctx->sheets[index].sheet = sheet;
+ 	ctx->sheets[index].origin = origin;
+ 	ctx->sheets[index].media = mq;
++	ctx->sheets[index].scope = NULL;
+ 
+ 	ctx->uses_revert |= sheet->uses_revert;
+ 
+@@ -2254,6 +2280,8 @@ static void css__select_ctx_drop_index(css_select_ctx *ctx)
+ 	free(ctx->flat);
+ 	ctx->flat = NULL;
+ 	ctx->n_flat = 0;
++	free(ctx->seq_scope);
++	ctx->seq_scope = NULL;
+ 	free(ctx->active);
+ 	ctx->active = NULL;
+ 	ctx->active_valid = false;
+@@ -2504,6 +2532,15 @@ static css_error css__select_ctx_build_index(css_select_ctx *ctx)
+ 
+ 	select_ctx_rank_layers(ctx);
+ 
++	ctx->seq_scope = malloc((ctx->n_flat + 1) * sizeof(*ctx->seq_scope));
++	if (ctx->seq_scope == NULL) {
++		error = CSS_NOMEM;
++		goto fail;
++	}
++	for (i = 0; i < ctx->n_flat; i++)
++		ctx->seq_scope[ctx->flat[i].seq] =
++				ctx->sheets[ctx->flat[i].top].scope;
++
+ 	parts = malloc((ctx->n_flat + 1) * sizeof(*parts));
+ 	seqs = malloc((ctx->n_flat + 1) * sizeof(*seqs));
+ 	ctx->active = calloc((ctx->n_flat + 31) / 32 + 1, sizeof(uint32_t));
+@@ -2813,7 +2850,11 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
  	    handler->handler_version != CSS_SELECT_HANDLER_VERSION_1)
  		return CSS_BADPARM;
  
@@ -209,7 +313,72 @@ index 0267ae7..8ef2523 100644
  	if (error != CSS_OK)
  		return error;
  
-@@ -4056,7 +4063,17 @@ css_error match_selector_chain(css_select_ctx *ctx,
+@@ -3011,8 +3052,10 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 
+ 			state.sheet = NULL;
+ 			state.current_origin = o;
++			state.seq_scope = ctx->seq_scope;
+ 			error = match_selectors_in_sheet(ctx, ctx->index[o],
+ 					ctx->active, &state);
++			state.seq_scope = NULL;
+ 			if (error != CSS_OK)
+ 				goto cleanup;
+ 		}
+@@ -3039,6 +3082,7 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 
+ 		if (mq__list_match(s.media, unit_ctx, media, &ctx->str) &&
+ 				s.sheet->disabled == false) {
++			state.rule_scope = s.scope;
+ 			error = select_from_sheet(ctx, s.sheet,
+ 					s.origin, &state);
+ 			if (error != CSS_OK)
+@@ -3720,7 +3764,7 @@ static const css_selector *_selector_next(const css_selector **node,
+ 		const css_selector **id, const css_selector ***classes,
+ 		uint32_t n_classes, const css_selector **univ,
+ 		const css_selector ***attrs, uint32_t n_attrs,
+-		css_select_rule_source *src)
++		css_select_rule_source *src, const css_selector ***entry)
+ {
+ 	static const css_selector *none = NULL;
+ 	const css_selector **ret = &none;
+@@ -3764,6 +3808,7 @@ static const css_selector *_selector_next(const css_selector **node,
+ 		}
+ 	}
+ 
++	*entry = ret;
+ 	return *ret;
+ }
+ 
+@@ -3906,6 +3951,7 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 			class_selectors, n_classes, univ_selectors,
+ 			attr_selectors, n_attrs)) {
+ 		const css_selector *selector;
++		const css_selector **entry = NULL;
+ 
+ 
+ 		/* Selectors must be matched in ascending order of specificity
+@@ -3915,7 +3961,11 @@ css_error match_selectors_in_sheet(css_select_ctx *ctx,
+ 		 */
+ 		selector = _selector_next(node_selectors, id_selectors,
+ 				class_selectors, n_classes, univ_selectors,
+-				attr_selectors, n_attrs, &src);
++				attr_selectors, n_attrs, &src, &entry);
++		/* the tree its sheet is for (VitaSurf) */
++		if (state->seq_scope != NULL)
++			state->rule_scope = state->seq_scope[
++				css__selector_hash_entry_seq(entry)];
+ 
+ 		/* We know there are selectors pending, so should have a
+ 		 * selector here */
+@@ -4022,6 +4072,7 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ {
+ 	const css_selector *s = selector;
+ 	void *node = state->node;
++	void *scoped = state->node;
+ 	const css_selector_detail *detail = &s->data;
+ 	bool match = false, may_optimise = true;
+ 	bool rejected_by_cache;
+@@ -4056,7 +4107,19 @@ css_error match_selector_chain(css_select_ctx *ctx,
  		void *next_node = NULL;
  
  		/* Consider any combinator on this selector */
@@ -224,11 +393,54 @@ index 0267ae7..8ef2523 100644
 +				css_select_cand_comb_failed++;
 +				return CSS_OK;
 +			}
++			/* X::part(a): X is the one in the rule's tree */
++			scoped = next_node;
 +		} else if (s->data.comb != CSS_COMBINATOR_NONE &&
  				s->combinator->data.qname.name !=
  					ctx->str.universal) {
  			/* Named combinator */
-@@ -4171,14 +4188,24 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+@@ -4106,6 +4169,40 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 		node = next_node;
+ 	} while (s != NULL);
+ 
++	/*
++	 * A page's rule is for the elements of its own tree, and a rule
++	 * in a shadow tree's sheet for those of that tree (VitaSurf): the
++	 * DOM's trees are kept apart by the cascade, not by the selectors.
++	 * The rules a shadow tree's own <style> was rewritten into name
++	 * the host they reach out to, and are their own guard.
++	 */
++	if (state->current_origin == CSS_ORIGIN_AUTHOR &&
++			!selector->data.host_rule &&
++			state->handler->node_tree_scope != NULL) {
++		void *tree = NULL;
++
++		if (scoped == state->node) {
++			if (!state->node_scope_known) {
++				error = state->handler->node_tree_scope(
++						state->pw, state->node,
++						&state->node_scope);
++				if (error != CSS_OK)
++					return error;
++				state->node_scope_known = true;
++			}
++			tree = state->node_scope;
++		} else {
++			error = state->handler->node_tree_scope(state->pw,
++					scoped, &tree);
++			if (error != CSS_OK)
++				return error;
++		}
++		if (tree != state->rule_scope) {
++			css_select_cand_comb_failed++;
++			return CSS_OK;
++		}
++	}
++
+ 	/* If we got here, then the entire selector chain matched, so cascade */
+ 	css_select_cand_matched++;
+ 	state->current_specificity = selector->specificity;
+@@ -4171,14 +4268,24 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
  		/* Find candidate node */
  		switch (type) {
  		case CSS_COMBINATOR_ANCESTOR:
@@ -257,7 +469,7 @@ index 0267ae7..8ef2523 100644
  			if (error != CSS_OK)
  				return error;
  			break;
-@@ -4203,6 +4230,7 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+@@ -4203,6 +4310,7 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
  						CSS_NODE_FLAGS_TAINT_SIBLING;
  			}
  		case CSS_COMBINATOR_NONE:
@@ -265,19 +477,58 @@ index 0267ae7..8ef2523 100644
  			break;
  		}
  
-@@ -4308,7 +4336,10 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
+@@ -4267,6 +4375,7 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
+ 	const css_selector_detail *next_detail = NULL;
+ 	void *n = node;
+ 	css_error error;
++	bool crossed = false;
+ 
+ 	if (detail->next)
+ 		next_detail = detail + 1;
+@@ -4308,9 +4417,39 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
  		switch (type) {
  		case CSS_COMBINATOR_ANCESTOR:
  		case CSS_COMBINATOR_PARENT:
 -			error = state->handler->parent_node(state->pw, n, &n);
-+			error = (selector->data.cross &&
-+				state->handler->parent_node_cross != NULL ?
-+				state->handler->parent_node_cross :
-+				state->handler->parent_node)(state->pw, n, &n);
- 			if (error != CSS_OK)
- 				return error;
+-			if (error != CSS_OK)
+-				return error;
++			if (crossed) {
++				/* the host of the tree it started in was
++				 * the last there was to try (VitaSurf) */
++				n = NULL;
++				break;
++			}
++			if (selector->data.cross &&
++					state->handler->parent_node_cross !=
++						NULL) {
++				/* within the tree, then its host: a shadow
++				 * tree's rules reach their own host, not
++				 * the host of a tree around it (VitaSurf) */
++				void *up = NULL;
++
++				error = state->handler->parent_node(
++						state->pw, n, &up);
++				if (error != CSS_OK)
++					return error;
++				if (up == NULL) {
++					error = state->handler->
++						parent_node_cross(state->pw,
++							n, &up);
++					if (error != CSS_OK)
++						return error;
++					crossed = true;
++				}
++				n = up;
++			} else {
++				error = state->handler->parent_node(
++						state->pw, n, &n);
++				if (error != CSS_OK)
++					return error;
++			}
  			break;
-@@ -4321,6 +4352,7 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
+ 		case CSS_COMBINATOR_SIBLING:
+ 		case CSS_COMBINATOR_GENERIC_SIBLING:
+@@ -4321,6 +4460,7 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
  					CSS_NODE_FLAGS_TAINT_SIBLING);
  			break;
  		case CSS_COMBINATOR_NONE:
@@ -285,7 +536,7 @@ index 0267ae7..8ef2523 100644
  			break;
  		}
  
-@@ -4852,6 +4884,59 @@ static css_error match_has_compound(css_select_ctx *ctx, void *n,
+@@ -4852,6 +4992,59 @@ static css_error match_has_compound(css_select_ctx *ctx, void *n,
  	return match_details(ctx, n, &sub->data, state, match, NULL);
  }
  
@@ -345,7 +596,7 @@ index 0267ae7..8ef2523 100644
  /**
   * Whether a node matches any compound of a chain (VitaSurf).
   */
-@@ -4889,7 +4974,11 @@ static css_error match_chain_at(css_select_ctx *ctx, const css_selector *s,
+@@ -4889,7 +5082,11 @@ static css_error match_chain_at(css_select_ctx *ctx, const css_selector *s,
  	while (s->data.comb != CSS_COMBINATOR_NONE && s->combinator != NULL) {
  		void *next_node = NULL;
  
@@ -358,7 +609,7 @@ index 0267ae7..8ef2523 100644
  			error = match_named_combinator(ctx, s->data.comb,
  					s->combinator, state, node,
  					&next_node);
-@@ -5352,6 +5441,9 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+@@ -5352,6 +5549,9 @@ css_error match_detail(css_select_ctx *ctx, void *node,
  			error = match_chain_at(ctx, detail->value.selector,
  					node, state, match);
  			*match = !*match;
@@ -368,7 +619,7 @@ index 0267ae7..8ef2523 100644
  		} else if (state->handler->node_is_pseudo != NULL) {
  			/* the ones the parser knows only by name, answered
  			 * by the client (VitaSurf) */
-@@ -5610,6 +5702,8 @@ void dump_chain(const css_selector *selector)
+@@ -5610,6 +5810,8 @@ void dump_chain(const css_selector *selector)
  		fprintf(stderr, " + ");
  	else if (selector->data.comb == CSS_COMBINATOR_PARENT)
  		fprintf(stderr, " > ");
@@ -377,19 +628,39 @@ index 0267ae7..8ef2523 100644
  
  	do {
  		switch (detail->type) {
+diff --git a/src/select/select.h b/src/select/select.h
+index 32b4d0d..4de3286 100644
+--- a/src/select/select.h
++++ b/src/select/select.h
+@@ -241,6 +241,14 @@ typedef struct css_select_state {
+ 	/* and of the rotate property last cascaded */
+ 	css_fixed rotate_angle;
+ 
++	/* The tree the rule being matched is for, from its sheet, and
++	 * each seq's while the index is matched (VitaSurf) */
++	const void *rule_scope;
++	const void **seq_scope;
++	/* and the tree the node is in, asked once */
++	void *node_scope;
++	bool node_scope_known;
++
+ 	prop_state props[CSS_N_PROPERTIES][CSS_PSEUDO_ELEMENT_COUNT];
+ } css_select_state;
+ 
 diff --git a/src/stylesheet.c b/src/stylesheet.c
-index 58a4ad4..7089b7e 100644
+index 58a4ad4..ee7816c 100644
 --- a/src/stylesheet.c
 +++ b/src/stylesheet.c
-@@ -1550,6 +1550,7 @@ css_error css__stylesheet_selector_detail_init(css_stylesheet *sheet,
+@@ -1550,6 +1550,8 @@ css_error css__stylesheet_selector_detail_init(css_stylesheet *sheet,
  	detail->value = value;
  	detail->value_type = value_type;
  	detail->negate = negate;
 +	detail->cross = 0;
++	detail->host_rule = 0;
  
  	return CSS_OK;
  }
-@@ -1615,6 +1616,13 @@ css_error css__stylesheet_selector_append_specific(css_stylesheet *sheet,
+@@ -1615,6 +1617,13 @@ css_error css__stylesheet_selector_append_specific(css_stylesheet *sheet,
  			/* @scope adds no specificity (VitaSurf) */
  			break;
  		}
@@ -404,7 +675,7 @@ index 58a4ad4..7089b7e 100644
  			/* :has() counts as its most specific argument */
  			const css_selector *s;
 diff --git a/src/stylesheet.h b/src/stylesheet.h
-index 75eaf14..7750e6b 100644
+index 75eaf14..2160df5 100644
 --- a/src/stylesheet.h
 +++ b/src/stylesheet.h
 @@ -53,7 +53,10 @@ typedef enum css_combinator {
@@ -419,7 +690,7 @@ index 75eaf14..7750e6b 100644
  } css_combinator;
  
  typedef enum css_selector_detail_value_type {
-@@ -87,7 +90,12 @@ typedef struct css_selector_detail {
+@@ -87,7 +90,17 @@ typedef struct css_selector_detail {
  		     next       : 1,		/**< Another selector detail
  						 * follows */
  		     value_type : 2,		/**< Type of value field */
@@ -429,7 +700,12 @@ index 75eaf14..7750e6b 100644
 +		      * names a shadow host with :-vita-host, and the
 +		      * step to it may go on from the top of that host's
 +		      * shadow tree (VitaSurf) */
-+		     cross      : 1;
++		     cross      : 1,
++		     /** on a chain's subject: some compound names a
++		      * shadow host with :-vita-host, so the rule is a
++		      * shadow tree's own and not kept to one tree by
++		      * the cascade (VitaSurf) */
++		     host_rule  : 1;
  } css_selector_detail;
  
  struct css_selector {

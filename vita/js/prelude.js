@@ -3147,12 +3147,22 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    i=e+1;}
   return out;}
  function scope(css,host){
-  var tag=host&&host.localName,k,r;
+  var tag=host&&host.localName,k,r,kk;
   if(!css||!tag||tag==='html'||tag==='body')return css;
   /* the host as its shadow tree names it: only a rule naming one may
      reach from inside the tree to it, where a page's rules stop at
-     the shadow root as in a browser */
-  tag+=':-vita-host';
+     the shadow root as in a browser. A custom element's tag is its
+     component, every copy of which shares the sheet; a <div> or a
+     <span> can host anything, so it is named by a key for the text
+     instead, which the hosts holding that text carry (VitaSurf). */
+  if(ceValidName(tag))tag+=':-vita-host';
+  else{
+   kk=keyOf[css];
+   if(!kk){
+    if(nkeys>=2000){keyOf=Object.create(null);nkeys=0;}
+    kk=keyOf[css]='k'+(++nkey);nkeys++;}
+   if(!(host.__vsKeys&&host.__vsKeys[kk]))hostTokens(host,kk,1);
+   tag='[data-vs-s~="'+kk+'"]:-vita-host';}
   k=tag+'\n'+css;r=scoped[k];
   if(r!==undefined)return r;
   try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}

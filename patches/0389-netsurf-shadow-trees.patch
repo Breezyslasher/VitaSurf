@@ -1,8 +1,8 @@
 diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
-index 5aa0cc442..6a82cf526 100644
+index 5aa0cc442..a98e9432b 100644
 --- a/content/handlers/css/select.c
 +++ b/content/handlers/css/select.c
-@@ -49,6 +49,13 @@ static css_error named_sibling_node(void *pw, void *node,
+@@ -49,6 +49,14 @@ static css_error named_sibling_node(void *pw, void *node,
  static css_error named_generic_sibling_node(void *pw, void *node,
  		const css_qname *qname, void **sibling);
  static css_error parent_node(void *pw, void *node, void **parent);
@@ -13,10 +13,11 @@ index 5aa0cc442..6a82cf526 100644
 +static css_error parent_node_cross(void *pw, void *node, void **parent);
 +static css_error part_host(void *pw, void *node, lwc_string *const *names,
 +		uint32_t n_names, void *prev, void **host);
++static css_error node_tree_scope(void *pw, void *node, void **scope);
  static css_error sibling_node(void *pw, void *node, void **sibling);
  static css_error first_child_node(void *pw, void *node, void **child);
  static css_error next_sibling_node(void *pw, void *node, void **sibling);
-@@ -156,6 +163,10 @@ static css_select_handler selection_handler = {
+@@ -156,6 +164,11 @@ static css_select_handler selection_handler = {
  	node_is_pseudo,
  	node_animation_start,
  	node_container_size,
@@ -24,10 +25,11 @@ index 5aa0cc442..6a82cf526 100644
 +	named_parent_node_cross,
 +	parent_node_cross,
 +	part_host,
++	node_tree_scope,
  };
  
  /* The size of a node's container, for @container (VitaSurf) */
-@@ -604,29 +615,6 @@ css_error named_ancestor_node(void *pw, void *node,
+@@ -604,29 +617,6 @@ css_error named_ancestor_node(void *pw, void *node,
  css_error named_parent_node(void *pw, void *node,
  		const css_qname *qname, void **parent)
  {
@@ -57,7 +59,7 @@ index 5aa0cc442..6a82cf526 100644
  	dom_element_named_parent_node(node, qname->name,
  			(struct dom_element **)parent);
  	dom_node_unref(*parent);
-@@ -784,6 +772,225 @@ css_error parent_node(void *pw, void *node, void **parent)
+@@ -784,6 +774,256 @@ css_error parent_node(void *pw, void *node, void **parent)
  	return CSS_OK;
  }
  
@@ -280,10 +282,41 @@ index 5aa0cc442..6a82cf526 100644
 +	return CSS_OK;
 +}
 +
++/* exported interface documented in css/select.h */
++void *nscss_tree_scope(dom_node *node)
++{
++	dom_node *n = dom_node_ref(node), *up = NULL;
++	dom_node_type type;
++	dom_element *host = NULL;
++	void *scope = NULL;
++
++	while (dom_node_get_parent_node(n, &up) == DOM_NO_ERR && up != NULL) {
++		dom_node_unref(n);
++		n = up;
++	}
++	if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++			type == DOM_DOCUMENT_FRAGMENT_NODE &&
++			dom_document_fragment_get_host(
++				(dom_document_fragment *) n, &host) ==
++				DOM_NO_ERR && host != NULL) {
++		dom_node_unref(host);
++		scope = n;
++	}
++	dom_node_unref(n);
++	return scope;
++}
++
++static css_error node_tree_scope(void *pw, void *node, void **scope)
++{
++	(void)pw;
++	*scope = nscss_tree_scope(node);
++	return CSS_OK;
++}
++
  /**
   * Callback to retrieve the preceding sibling of a node.
   *
-@@ -1896,6 +2103,9 @@ css_error node_is_visited(void *pw, void *node, bool *match)
+@@ -1896,6 +2136,9 @@ css_error node_is_visited(void *pw, void *node, bool *match)
  
  static struct {
  	dom_node *chain[DYNAMIC_CHAIN_MAX];
@@ -293,7 +326,7 @@ index 5aa0cc442..6a82cf526 100644
  	unsigned n;
  } dynamic[NSCSS_DYNAMIC_COUNT];
  
-@@ -1941,20 +2151,42 @@ bool nscss_set_dynamic(enum nscss_dynamic which, dom_node *node,
+@@ -1941,20 +2184,42 @@ bool nscss_set_dynamic(enum nscss_dynamic which, dom_node *node,
  		dom_node_unref(dynamic[which].chain[i]);
  	dynamic[which].n = 0;
  
@@ -348,7 +381,7 @@ index 5aa0cc442..6a82cf526 100644
  	}
  	return true;
  }
-@@ -2005,9 +2237,17 @@ css_error node_is_active(void *pw, void *node, bool *match)
+@@ -2005,9 +2270,17 @@ css_error node_is_active(void *pw, void *node, bool *match)
   */
  css_error node_is_focus(void *pw, void *node, bool *match)
  {
@@ -366,7 +399,7 @@ index 5aa0cc442..6a82cf526 100644
  	return CSS_OK;
  }
  
-@@ -2632,7 +2872,17 @@ static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
+@@ -2632,7 +2905,17 @@ static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
  	(void)pw;
  	*match = false;
  
@@ -385,6 +418,24 @@ index 5aa0cc442..6a82cf526 100644
  		*match = focus_visible && dynamic[NSCSS_FOCUS].n > 0 &&
  			dynamic[NSCSS_FOCUS].chain[0] == node;
  	} else if (pseudo_named(name, "focus-within")) {
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index 434df8646..de2954974 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -72,6 +72,13 @@ css_error node_is_visited(void *pw, void *node, bool *match);
+  */
+ void nscss_clear_node_data(dom_node *n);
+ 
++/**
++ * The tree a node is in, as the cascade keeps rules to trees (VitaSurf):
++ * the shadow root at the top of it, unreferenced, or NULL for the
++ * document's own tree and for anything not in a shadow tree.
++ */
++void *nscss_tree_scope(dom_node *n);
++
+ /**
+  * Take the selection data libcss cached on a node off it, without
+  * destroying it, so the node can be selected for again and the data put
 diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
 index 4372a9390..59333d6ed 100644
 --- a/content/handlers/html/box_construct.c
@@ -414,6 +465,36 @@ index 4372a9390..59333d6ed 100644
  	if (parent != NULL)
  		kept_parent = nscss_take_node_data(parent);
  	kept = nscss_take_node_data(n);
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index ee1ce1382..ba7ad95bf 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -48,6 +48,7 @@
+ #include "html/private.h"
+ #include "html/css.h"
+ #include "css/internal.h"
++#include "css/select.h"
+ #include "desktop/system_colour.h"
+ #include "utils/file.h"
+ #include "content/fetchers/resource.h"
+@@ -1418,10 +1419,13 @@ html_css_build_selection_context(html_content *c,
+ 			/* TODO: Pass the sheet's full media query, instead of
+ 			 *       "screen".
+ 			 */
+-			css_ret = css_select_ctx_append_sheet(select_ctx,
+-							      sheet,
+-							      origin,
+-							      "screen");
++			/* an author sheet styles the tree its element is
++			   in: the document's, or a shadow tree (VitaSurf) */
++			css_ret = css_select_ctx_append_sheet_scoped(
++					select_ctx, sheet, origin, "screen",
++					origin == CSS_ORIGIN_AUTHOR &&
++					hsheet->node != NULL ?
++					nscss_tree_scope(hsheet->node) : NULL);
+ 			if (css_ret != CSS_OK) {
+ 				css_select_ctx_destroy(select_ctx);
+ 				if (early)
 diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
 index ead5236bf..21966b4d9 100644
 --- a/content/handlers/html/dom_event.c
@@ -467,3 +548,37 @@ index 32f892497..a2d154596 100644
  		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
  			next = NULL;
  		}
+diff --git a/desktop/frames.c b/desktop/frames.c
+index 4e5b3f737..ad00dd752 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -245,9 +245,27 @@ frame_node_page(struct browser_window *bw, struct dom_node *node)
+ 	dom_node_type type;
+ 	int i;
+ 
+-	while (dom_node_get_parent_node(n, &p) == DOM_NO_ERR && p != NULL) {
++	/* up to the document, through the host of any shadow tree on the
++	 * way: an iframe in a shadow tree is in the page when its host is,
++	 * and a widget that renders into a closed shadow root keeps its
++	 * frame there, hidden until it is needed (VitaSurf) */
++	for (;;) {
++		dom_element *host = NULL;
++
++		while (dom_node_get_parent_node(n, &p) == DOM_NO_ERR &&
++		       p != NULL) {
++			dom_node_unref(n);
++			n = p;
++		}
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
++		    type != DOM_DOCUMENT_FRAGMENT_NODE ||
++		    dom_document_fragment_get_host(
++			    (dom_document_fragment *) n, &host) !=
++			    DOM_NO_ERR || host == NULL) {
++			break;
++		}
+ 		dom_node_unref(n);
+-		n = p;
++		n = (dom_node *) host;
+ 	}
+ 	if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+ 	    type == DOM_DOCUMENT_NODE) {

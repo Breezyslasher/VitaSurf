@@ -5,7 +5,7 @@
      as the host and delegatesFocus passes inward; manual slot
      assignment, slotchange and flattened slots; composedPath from
      outside an open tree and a closed one; hit testing retargeted to
-     the host. Reads that need layout wait for it. Expected lines are
+     the host; a hidden frame in a closed tree, which loads. Reads that need layout wait for it. Expected lines are
      what Chrome prints. -->
 <html><head><title>shadow root more</title></head><body>
 <div id="dsd"><template shadowrootmode="open" shadowrootserializable><span id="in">d</span><slot></slot></template><b>light</b></div>
@@ -80,6 +80,16 @@ t('click retargeted', function () { var tg; document.addEventListener('click', f
 t('ui event composed', function () { var c; document.addEventListener('click', function (e) { c = e.composed; }, {once: true}); r4.getElementById('si').click(); return c; });
 t('script event not composed', function () { return new Event('x').composed; });
 
+/* a frame in a closed shadow tree, hidden: it loads all the same */
+var frameMsgs = [];
+window.addEventListener('message', function (e) { if (e.data && e.data.indexOf && e.data.indexOf('frame:') === 0) frameMsgs.push(e.data); });
+(function () {
+  var h = document.createElement('div'), r = h.attachShadow({mode: 'closed'}), f = document.createElement('iframe');
+  f.style.display = 'none';
+  f.srcdoc = '<script>parent.postMessage("frame: hidden in a closed tree", "*")<\/script>';
+  r.appendChild(f); document.body.appendChild(h);
+})();
+
 /* styles that come from a shadow tree's own <style>, once laid out */
 var h2 = document.getElementById('h2'); h2.className = 'ctx'; var r2 = h2.attachShadow({mode: 'open'});
 r2.innerHTML = '<style>:host{display:block;padding-left:3px} :host(.ctx){padding-top:4px} ::slotted(b){margin-left:5px} :host-context(body) p{margin-top:6px}</style><p>p</p><slot></slot>';
@@ -108,6 +118,8 @@ setTimeout(function () {
     var b = h2.getBoundingClientRect();
     t('elementFromPoint on a host', function () { var e = document.elementFromPoint(b.left + 1, b.top + 1); return e === h2 ? 'host' : e && e.localName; });
     t('elementFromPoint outside', function () { return r2.elementFromPoint(1, b.bottom + 400); });
+    out.push('[frames]');
+    t('a hidden frame in a closed tree loads', function () { return frameMsgs.join(); });
     out.forEach(function (l) { console.log('XX ' + l); });
     document.getElementById('out').textContent = out.join('\n');
   }, 300);
