@@ -1,5 +1,5 @@
 diff --git a/quickjs.c b/quickjs.c
-index e90ab0a..4db9e8a 100644
+index e90ab0a..c79af05 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -268,6 +268,8 @@ struct JSRuntime {
@@ -63,18 +63,31 @@ index e90ab0a..4db9e8a 100644
                              val = JS_UNDEFINED;
                              break;
                          }
+@@ -54185,6 +54204,10 @@ JSValue JS_NewProxy(JSContext *ctx, JSValueConst target, JSValueConst handler)
+         case JS_TAG_BIG_INT: what = "a bigint"; break;
+         default: what = "a number"; break;
+         }
++        /* now, so the misses just before this one can be kept: the
++           hook is told of no object and no property (VitaSurf) */
++        if (ctx->rt->miss_hook != NULL)
++            ctx->rt->miss_hook(ctx, JS_UNDEFINED, JS_ATOM_NULL);
+         return JS_ThrowTypeError(ctx, "Cannot create proxy with a "
+                                  "non-object as %s: it was %s",
+                                  t ? "target" : "handler", what);
 diff --git a/quickjs.h b/quickjs.h
-index 4fe5bca..142a943 100644
+index 4fe5bca..b499ada 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1166,6 +1166,13 @@ typedef void JSCompileTickHandler(JSRuntime *rt, void *opaque);
+@@ -1166,6 +1166,15 @@ typedef void JSCompileTickHandler(JSRuntime *rt, void *opaque);
  JS_EXTERN void JS_SetCompileTickHandler(JSRuntime *rt, JSCompileTickHandler *cb, void *opaque);
  /* if can_block is true, Atomics.wait() can be used */
  JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 +/* Told when a property read on an object walks the whole prototype chain
 +   and finds nothing, before undefined is returned or a ReferenceError
 +   thrown (VitaSurf): a browser's log can then say which property a page
-+   wanted that is not here. It must not run script. */
++   wanted that is not here. It must not run script. It is also told, with
++   undefined and JS_ATOM_NULL, when new Proxy is handed a non-object, so
++   that the reads just before can be kept. */
 +typedef void JSPropertyMissHook(JSContext *ctx, JSValueConst obj,
 +                                JSAtom prop);
 +JS_EXTERN void JS_SetPropertyMissHook(JSRuntime *rt, JSPropertyMissHook *hook);

@@ -12526,11 +12526,43 @@ static char miss_watch_label[MISS_WATCH][16];
 static unsigned miss_watch_next;
 static char miss_ring[MISS_RING][64];
 static unsigned miss_ring_next;
+/* the same reads in the order they came, repeats and all, the last
+   MISS_SEQ of them; and a copy taken when new Proxy was handed a
+   non-object, which says what the page read just before it */
+#define MISS_SEQ 12
+static char miss_seq[MISS_SEQ][64];
+static unsigned miss_seq_next;
+static char miss_seq_at_proxy[MISS_SEQ * 66];
+
+static void qjs_miss_seq_copy(char *out, size_t size)
+{
+	size_t n = 0;
+	unsigned i, start;
+
+	out[0] = '\0';
+	start = miss_seq_next > MISS_SEQ ? miss_seq_next - MISS_SEQ : 0;
+	for (i = start; i < miss_seq_next; i++) {
+		int w = snprintf(out + n, size - n, "%s%s", n > 0 ? ", " : "",
+				 miss_seq[i % MISS_SEQ]);
+
+		if (w < 0 || (size_t)w >= size - n) {
+			break;
+		}
+		n += (size_t)w;
+	}
+}
 
 static void qjs_miss_hook(JSContext *ctx, JSValueConst obj, JSAtom prop)
 {
-	void *p = JS_VALUE_GET_PTR(obj);
+	void *p;
 	unsigned i;
+
+	if (prop == JS_ATOM_NULL) {
+		/* new Proxy was handed a non-object */
+		qjs_miss_seq_copy(miss_seq_at_proxy, sizeof(miss_seq_at_proxy));
+		return;
+	}
+	p = JS_VALUE_GET_PTR(obj);
 
 	for (i = 0; i < MISS_WATCH; i++) {
 		const char *name;
@@ -12549,6 +12581,8 @@ static void qjs_miss_hook(JSContext *ctx, JSValueConst obj, JSAtom prop)
 		snprintf(entry, sizeof(entry), "%s.%s", miss_watch_label[i],
 			 name);
 		JS_FreeCString(ctx, name);
+		memcpy(miss_seq[miss_seq_next++ % MISS_SEQ], entry,
+		       sizeof(entry));
 		/* each name once: a page's feature checks repeat */
 		for (i = 0; i < MISS_RING; i++) {
 			if (strcmp(miss_ring[i], entry) == 0)
@@ -12589,7 +12623,7 @@ static JSValue win_vita_watch_misses(JSContext *ctx, JSValueConst this_val,
 static JSValue win_vita_misses(JSContext *ctx, JSValueConst this_val,
 			       int argc, JSValueConst *argv)
 {
-	char out[MISS_RING * 66];
+	char out[MISS_RING * 66 + MISS_SEQ * 66 + 64];
 	size_t n = 0;
 	unsigned i, start;
 
@@ -12610,6 +12644,15 @@ static JSValue win_vita_misses(JSContext *ctx, JSValueConst this_val,
 	}
 	memset(miss_ring, 0, sizeof(miss_ring));
 	miss_ring_next = 0;
+	/* and the reads just before a failed new Proxy, when there was one */
+	if (miss_seq_at_proxy[0] != '\0') {
+		size_t n = strlen(out);
+
+		snprintf(out + n, sizeof(out) - n,
+			 "%s| last before new Proxy failed, oldest first: %s",
+			 n > 0 ? " " : "", miss_seq_at_proxy);
+		miss_seq_at_proxy[0] = '\0';
+	}
 	return JS_NewString(ctx, out);
 }
 
