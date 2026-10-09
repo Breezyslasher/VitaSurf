@@ -4541,6 +4541,7 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   var self,loc=Object.create(null),fns={
    postMessage:function postMessage(m,o,t){
     var g=cur();
+    msgSent(m,el?'its frame':'another window');
     /* before its page is there the frame's blank start has no one
        listening, and the message goes nowhere */
     if(g)return g.postMessage.apply(g,arguments);},
@@ -4612,8 +4613,51 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   ev=new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
    source:view(src),ports:ports});
   setTimeout(function(){
+   var tr=msgTraceStart(src,ev,data,ports);
    msgNote(src,message,'delivered'+(to==='*'?' (to any origin)':''));
-   __vitaDispatch(null,ev);},0);};
+   __vitaDispatch(null,ev);
+   if(tr)setTimeout(function(){msgTraceEnd(tr);},50);},0);};
+ /* What a page did with the first few messages another window sent it
+    (VitaSurf): which of the event's fields and which of the data's keys
+    it read, and what it sent on in the next moment. Names only. The
+    claude.ai challenge's widget sends its page "init" and asks for its
+    parameters, and the page never answers; this says how far its
+    handling got. */
+ var TRACE_LEFT=4,SENT=null;
+ function msgKind(m){
+  try{var w=m&&typeof m==='object'?(typeof m.event==='string'?m.event:
+   typeof m.type==='string'?m.type:''):'';
+   return /^[\w.:-]{1,24}$/.test(w)?w:'';}catch(e){return '';}}
+ function msgTraceStart(src,ev,data,ports){
+  var tr,kind=msgKind(data);
+  if(TRACE_LEFT<=0||src===W||!kind||ports.length||!data||typeof data!=='object'||
+   Array.isArray(data))return null;
+  if(kind==='meow'||kind==='food')return null;
+  TRACE_LEFT--;
+  tr={kind:kind,read:[],sent:[]};
+  function note(n){if(tr.read.indexOf(n)<0&&tr.read.length<40)tr.read.push(n);}
+  ['source','origin','data','ports','lastEventId'].forEach(function(k){
+   var v=ev[k];
+   try{Object.defineProperty(ev,k,{configurable:true,enumerable:true,
+    get:function(){note('event.'+k);return v;}});}catch(e){}});
+  Object.keys(data).forEach(function(k){
+   var v=data[k];
+   if(!/^[\w$-]{1,32}$/.test(k))return;
+   try{Object.defineProperty(data,k,{configurable:true,enumerable:true,
+    get:function(){note('data.'+k);return v;},
+    set:function(x){v=x;}});}catch(e){}});
+  SENT=tr.sent;
+  return tr;}
+ function msgTraceEnd(tr){
+  if(SENT===tr.sent)SENT=null;
+  if(typeof MN!=='function')return;
+  try{MN('the page\'s handling of "'+tr.kind+'" read '+
+   (tr.read.length?tr.read.join(', '):'nothing of it')+'; it sent '+
+   (tr.sent.length?tr.sent.join(', '):'nothing')+' in the next 50 ms');}catch(e){}}
+ function msgSent(m,where){
+  if(!SENT||SENT.length>=8)return;
+  var k=msgKind(m);
+  SENT.push((k?'"'+k+'"':'a message')+' to '+where);}
  /* the log's line for a message: where from, and its kind when the data
     names one with a short word, as {event: "ready"} does; nothing else
     of the data is written */
