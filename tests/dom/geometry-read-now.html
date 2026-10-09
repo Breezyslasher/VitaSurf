@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!-- A geometry read straight after a change measures the change, as a
+     browser lays the page out for it: rows added and then measured, a
+     class that sets a width, an element hidden, a span just made, and
+     reads inside a MutationObserver callback and a promise job. Reads
+     answered from the layout before the change. Expected lines are what
+     Chrome prints. -->
+<html><head><title>geometry read now</title><style>
+body{margin:0;font:16px/20px sans-serif} .row{height:20px} .wide{width:300px} #list{width:200px}
+</style></head><body><div id=list></div><div id=box style="width:100px;height:10px"></div><script>
+var out=[];function L(s){out.push(s);}
+window.addEventListener('load',function(){setTimeout(function(){
+ var list=document.getElementById('list'),box=document.getElementById('box');
+ L('start list '+list.offsetHeight+' box top '+box.offsetTop);
+ for(var i=0;i<3;i++){var r=document.createElement('div');r.className='row';r.textContent='r'+i;list.appendChild(r);}
+ L('after 3 rows list '+list.offsetHeight+' box top '+box.offsetTop+' rect '+Math.round(box.getBoundingClientRect().top));
+ box.className='wide';box.style.width='';
+ L('class width '+box.offsetWidth+' cs '+getComputedStyle(box).width);
+ var hs=[];for(var j=0;j<5;j++){var r2=document.createElement('div');r2.className='row';list.appendChild(r2);hs.push(list.offsetHeight);}
+ L('interleaved '+hs.join(','));
+ list.style.display='none';L('hidden '+list.offsetHeight+' box top '+box.offsetTop);
+ list.style.display='';
+ var sp=document.createElement('span');sp.textContent='hello';document.body.appendChild(sp);
+ L('new span width>0 '+(sp.offsetWidth>0));
+ var mo=new MutationObserver(function(){L('in observer list '+list.offsetHeight);mo.disconnect();});
+ mo.observe(list,{childList:true});list.appendChild(document.createElement('div')).className='row';
+ Promise.resolve().then(function(){var r3=document.createElement('div');r3.className='row';list.appendChild(r3);L('in promise list '+list.offsetHeight);});
+ setTimeout(function(){out.forEach(function(l){console.log('XX '+l);});},300);
+},50);});
+</script></body></html>

@@ -294,6 +294,16 @@ struct jsthread {
 	int next_xhr_id;
 	bool closed;
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
+	/** the outermost entry into script came from the scheduler, where no
+	 * NetSurf code holds box pointers, so a geometry read may lay the
+	 * page out there and then (VitaSurf) */
+	bool entry_safe;
+	bool flushing;            /**< a forced layout is running */
+	unsigned flush_ms;        /**< forced layout time in this entry */
+	unsigned flushes;         /**< forced layouts on this page */
+	unsigned flush_total_ms;  /**< and what they cost */
+	unsigned flush_waited;    /**< ones that found the page still loading */
+	unsigned flush_refused;   /**< geometry reads answered stale */
 	/*
 	 * What the changes since the last layout were (VitaSurf): if only
 	 * attributes, the elements are restyled in place rather than the
@@ -7113,6 +7123,9 @@ enum script_why {
 	SCRIPT_XHR		/**< a fetch or XHR settling */
 };
 static enum script_why script_why;
+/* the next event entry comes from a callback of our own scheduling, with
+   nothing of NetSurf's under it (VitaSurf) */
+static bool next_event_safe;
 
 /*
  * When script last ran, for the compiled script cache to write its
@@ -7129,6 +7142,8 @@ static void begin_script(jsthread *thread, enum script_why why)
 		return;
 	}
 	script_why = why;
+	thread->entry_safe = why != SCRIPT_EVENT || next_event_safe;
+	thread->flush_ms = 0;
 	/* for the busy sampling: what the frames are spent in (VitaSurf) */
 	thread->phase_was = vitasurf_phase;
 	vitasurf_phase = why == SCRIPT_TIMER ? "script: a timer" :
@@ -7730,6 +7745,67 @@ rebuild:
 	/* what the page looks like once its scripts have built it, when
 	 * the flag file asks for it (VitaSurf) */
 	vita_input_dump_layout();
+}
+
+/*
+ * Lay the page out now, for a geometry read (VitaSurf). A browser answers
+ * offsetWidth or getBoundingClientRect after a change with the layout the
+ * change makes, and code that measures what it has just built -- a menu
+ * placing itself, a list sizing its rows -- got the layout from before.
+ * The scheduled relayout runs here instead, when it is safe: the
+ * outermost entry into script came from a timer, a fetch or a script
+ * element, so nothing of NetSurf's up the stack holds a box, a form
+ * control or a layout it would use after the script returns. An event
+ * NetSurf dispatches from input keeps the old answer, as the click
+ * handler's form submission reads the control it found. What a script
+ * spends here is bounded per entry, so one that alternates writing and
+ * measuring does not freeze the page: past the budget it reads the
+ * last layout, as before.
+ */
+#define FLUSH_BUDGET_MS 400
+#define FLUSH_LOGGED 3
+/* a rebuild of the whole tree is forced only on a page whose last one
+   cost no more than this; past it the read answers from the last layout
+   and the rebuild keeps its place in the scheduler, where changes are
+   coalesced (Home Assistant's take hundreds of ms on the Vita) */
+#define FLUSH_REBUILD_MAX_MS 60
+
+static void layout_flush(jsthread *thread)
+{
+	uint64_t t0;
+	unsigned took;
+
+	if (!thread->dom_dirty || thread->closed || thread->flushing ||
+	    thread->htmlc == NULL || thread->htmlc->layout == NULL) {
+		return;
+	}
+	if (!thread->entry_safe || thread->flush_ms >= FLUSH_BUDGET_MS ||
+	    (thread->tree_dirty &&
+	     thread->relayout_ms > FLUSH_REBUILD_MAX_MS)) {
+		thread->flush_refused++;
+		return;
+	}
+	t0 = now_ms();
+	thread->flushing = true;
+	guit->misc->schedule(-1, relayout_callback, thread);
+	thread->relayout_pending = false;
+	relayout_callback(thread);
+	thread->flushing = false;
+	took = (unsigned)(now_ms() - t0);
+	thread->flush_ms += took;
+	thread->flush_total_ms += took;
+	if (thread->dom_dirty) {
+		/* a rebuild waits for the page to finish loading, as it
+		 * does from the scheduler; what could be restyled in place
+		 * was */
+		thread->flush_waited++;
+		return;
+	}
+	thread->flushes++;
+	if (thread->flushes <= FLUSH_LOGGED) {
+		vita_log("qjs: a geometry read laid the page out first, in "
+			 "%u ms", took);
+	}
 }
 
 /*
@@ -12685,7 +12761,10 @@ static JSValue win_vita_scroll_element(JSContext *ctx, JSValueConst this_val,
 	if (argc < 3 || thread == NULL || thread->htmlc == NULL)
 		return JS_FALSE;
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread))
+	if (node == NULL)
+		return JS_FALSE;
+	layout_flush(thread);
+	if (!layout_current(thread))
 		return JS_FALSE;
 	box = box_for_node(node);
 	if (box == NULL || box->style == NULL)
@@ -13842,6 +13921,7 @@ static JSValue win_vita_element_from_point(JSContext *ctx,
 	    JS_ToInt32(ctx, &y, argv[1]) != 0) {
 		return JS_NULL;
 	}
+	layout_flush(thread);
 	if (!layout_current(thread)) {
 		return JS_NULL;
 	}
@@ -14659,7 +14739,15 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread)) {
+	if (node == NULL) {
+		return JS_NULL;
+	}
+	/* a second argument that is true reads the layout as it is: the
+	 * IntersectionObserver's own polling, which must not force one */
+	if (argc < 2 || !JS_ToBool(ctx, argv[1])) {
+		layout_flush(thread);
+	}
+	if (!layout_current(thread)) {
 		return JS_NULL;
 	}
 	box = box_for_node(node);
@@ -16102,6 +16190,16 @@ nserror js_closethread(jsthread *thread)
 	gap_reset();
 	JS_GetLazyCompileStats(thread->heap->rt, &lazy_n, &lazy_ms);
 	miss_ring_report();
+	if (thread->flushes > 0 || thread->flush_refused > 0 ||
+	    thread->flush_waited > 0) {
+		vita_log("qjs: %u geometry reads laid the page out first "
+			 "and %u found a rebuild waiting for the page to "
+			 "load, %u ms in all; %u answered from the last "
+			 "layout (from an input event, past the budget, or "
+			 "on a page whose rebuild costs too much)",
+			 thread->flushes, thread->flush_waited,
+			 thread->flush_total_ms, thread->flush_refused);
+	}
 	vita_log("qjs: page closed in %u ms, runtime memory now %u KB; "
 		 "%u functions compiled when first called while it was "
 		 "open, in %u ms",
@@ -19278,7 +19376,9 @@ static void deferred_load_check(void *p)
 	}
 	thread->load_deferred = false;
 	thread->load_releasing = true;
+	next_event_safe = true;
 	js_fire_event(thread, "load", thread->load_doc, NULL);
+	next_event_safe = false;
 	thread->load_releasing = false;
 }
 

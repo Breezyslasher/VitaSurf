@@ -1542,7 +1542,6 @@ function computedStyle(el,pseudo){
   empty.width='';empty.height='';
   return empty;}
  var st=(el&&el.nodeType===1&&typeof __vitaStyle==='function')?__vitaStyle(el):null;
- var box=(el&&el.nodeType===1&&typeof __vitaBox==='function')?__vitaBox(el):null;
  var cs=Object.create(CS_PROTO);
  for(var k in CS_DEFAULTS)cs[k]=CS_DEFAULTS[k];
  if(el&&el.nodeType===1&&UA_DISPLAY[el.tagName])cs.display=UA_DISPLAY[el.tagName];
@@ -1560,8 +1559,6 @@ function computedStyle(el,pseudo){
    cs[g[0]+g[2]]=v[0]===v[1]&&v[0]===v[2]&&v[0]===v[3]?v[0]:
     v[1]===v[3]?(v[0]===v[2]?v[0]+' '+v[1]:v[0]+' '+v[1]+' '+v[2]):v.join(' ');});
  }
- if(box){cs.width=box[4]+'px';cs.height=box[5]+'px';}
- else{cs.width='auto';cs.height='auto';}
  /* The rest of the cascade's answers, and a pseudo element's own: what
     the element is positioned and laid out with, its font, borders and
     text, as a browser reports them. */
@@ -1585,6 +1582,8 @@ function computedStyle(el,pseudo){
    var k=dashToCamel(d[0]);
    if(st&&(RESOLVED[k]||(st.length>18&&BOX_RESOLVED.test(k))))return;
    if(more&&more[k]!==undefined)return;
+   /* the used size is layout's, which the getters below ask for */
+   if(k==='width'||k==='height')return;
    cs[k]=d[1];if(!CS_DASHED[k])csDashed(k);});
  }
  /* the methods are the prototype's and the names are listed when
@@ -1598,10 +1597,26 @@ function computedStyle(el,pseudo){
 function csNames(cs){
  if(!Object.prototype.hasOwnProperty.call(cs,'__vitaNames'))
   Object.defineProperty(cs,'__vitaNames',{configurable:true,value:
-   Object.keys(cs).filter(function(k){return typeof cs[k]==='string';}).map(function(k){
+   Object.keys(cs).concat(['width','height'].filter(function(k){
+    return !Object.prototype.hasOwnProperty.call(cs,k);})).filter(function(k){return typeof cs[k]==='string';}).map(function(k){
     return k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});})});
  return cs.__vitaNames;
 }
+/* width and height are the used sizes layout gives, asked for only when
+   read (VitaSurf): a read lays the page out first when it has changed,
+   as a browser's does, and a style read that never looks at them does
+   not. A length the element has with no box to measure is its own
+   property, set from the cascade, and answers before these. */
+function csSize(cs,i){
+ var el=cs.__vitaEl,b;
+ if(!el||el.nodeType!==1||typeof __vitaBox!=='function')return 'auto';
+ b=__vitaBox(el);
+ return b?b[i]+'px':'auto';}
+['width','height'].forEach(function(k,i){
+ Object.defineProperty(CS_PROTO,k,{configurable:true,
+  get:function(){return csSize(this,4+i);},
+  set:function(v){Object.defineProperty(this,k,{configurable:true,
+   enumerable:true,writable:true,value:v});}});});
 Object.defineProperties(CS_PROTO,{
  getPropertyValue:{configurable:true,writable:true,value:function(n){n=String(n);var el=this.__vitaEl;
   /* a custom property is the cascade's, read as the page wrote it */
@@ -6487,12 +6502,14 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
  function rootRect(o){
   var s=viewport();
   if(o.root&&o.root.nodeType===1){
-   var b=__vitaBox(o.root);
+   var b=__vitaBox(o.root,true);
    if(b)return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
   return {left:0,top:0,width:s[2],height:s[3]};}
 
  function rectOf(el){
-  var b=__vitaBox(el);
+  /* the layout as it is: the observer is told after layout, never
+     the cause of one */
+  var b=__vitaBox(el,true);
   if(!b)return null;
   var s=viewport();
   return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
