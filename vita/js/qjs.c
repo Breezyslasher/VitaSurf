@@ -12718,8 +12718,9 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 	JSValue err;
 	const char *first, *stack;
 	char seq[MISS_ANY * 70];
-	char where[300], at_url[256];
-	unsigned at_line = 0, at_col = 0;
+	char where[300], at_url[3][256];
+	unsigned at_line[3] = {0, 0, 0}, at_col[3] = {0, 0, 0};
+	int k;
 	size_t n = 0;
 	const char *p;
 	int lines = 0;
@@ -12752,8 +12753,9 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 		}
 		if (len > 0 && !prof_has(p, len, "<prelude>") &&
 		    !prof_has(p, len, "(native)")) {
-			/* the first page frame's position, for its code */
-			if (lines == 0 && len > 2 && p[len - 1] == ')') {
+			/* each page frame's position, for its code: the
+			   first is often a page's own logging helper */
+			if (lines < 3 && len > 2 && p[len - 1] == ')') {
 				const char *o = p + len - 1, *c2 = NULL,
 					*c1 = NULL;
 
@@ -12765,14 +12767,14 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 					o--;
 				}
 				if (*o == '(' && c1 != NULL &&
-				    (size_t)(c1 - o - 1) < sizeof(at_url)) {
-					memcpy(at_url, o + 1,
+				    (size_t)(c1 - o - 1) < sizeof(at_url[0])) {
+					memcpy(at_url[lines], o + 1,
 					       (size_t)(c1 - o - 1));
-					at_url[c1 - o - 1] = '\0';
-					at_line = (unsigned)strtoul(c1 + 1,
-								    NULL, 10);
-					at_col = (unsigned)strtoul(c2 + 1,
-								   NULL, 10);
+					at_url[lines][c1 - o - 1] = '\0';
+					at_line[lines] = (unsigned)strtoul(
+						c1 + 1, NULL, 10);
+					at_col[lines] = (unsigned)strtoul(
+						c2 + 1, NULL, 10);
 				}
 			}
 			if (n + len + 3 < sizeof(where)) {
@@ -12789,19 +12791,22 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 	JS_FreeValue(ctx, err);
 	vita_log("console: that was said from%s", n > 0 ? where :
 		 " nowhere script can see");
-	if (at_line > 0) {
+	for (k = 0; k < 3; k++) {
 		JSValue args[3], code;
 		const char *text;
 
-		args[0] = JS_NewString(ctx, at_url);
-		args[1] = JS_NewUint32(ctx, at_line);
-		args[2] = JS_NewUint32(ctx, at_col);
+		if (at_line[k] == 0) {
+			continue;
+		}
+		args[0] = JS_NewString(ctx, at_url[k]);
+		args[1] = JS_NewUint32(ctx, at_line[k]);
+		args[2] = JS_NewUint32(ctx, at_col[k]);
 		code = win_vita_source_excerpt(ctx, JS_UNDEFINED, 3, args);
 		JS_FreeValue(ctx, args[0]);
 		text = JS_IsString(code) ? JS_ToCString(ctx, code) : NULL;
 		if (text != NULL && text[0] != '\0') {
-			vita_log("console: the code there, column %u: %s",
-				 at_col, text);
+			vita_log("console: frame %d, the code at column %u: %s",
+				 k + 1, at_col[k], text);
 		}
 		if (text != NULL) JS_FreeCString(ctx, text);
 		JS_FreeValue(ctx, code);
