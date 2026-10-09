@@ -1,25 +1,18 @@
 <!DOCTYPE html>
-<!-- A shadow host's own children are drawn in its slots. Shadow DOM is
-     kept as light DOM here, so the boxes are built from the composed
-     tree: a child naming a slot is drawn inside that slot, the others
-     inside the unnamed one, and one naming no slot the host has is not
-     drawn. The host here renders the way Lit does, between a marker
-     comment and the node that was its first child.
-     Expected console output: five lines ending in "ok". -->
+<!-- A shadow host's own children are drawn in its shadow tree's slots:
+     a child naming a slot is drawn inside that slot, the others inside
+     the unnamed one, and one naming no slot the tree has is not drawn.
+     Expected console output: five lines ending in "ok", as in Chrome. -->
 <html><body>
 <x-card id=card><em id=plain>body</em><span id=named slot=title>Title</span><span id=nowhere slot=gone>x</span></x-card>
 <script>
-var card = document.getElementById('card'), first = card.firstChild;
-card.attachShadow({mode: 'open'});
-var marker = document.createComment('');
-card.insertBefore(marker, first);
+var card = document.getElementById('card'), root = card.attachShadow({mode: 'open'});
 var head = document.createElement('h3'), hs = document.createElement('slot');
 hs.setAttribute('name', 'title'); head.appendChild(hs);
 var main = document.createElement('p'), ms = document.createElement('slot');
 main.appendChild(ms);
-card.insertBefore(head, first);
-card.insertBefore(main, first);
-card._$litPart$ = {_$startNode: marker, options: {renderBefore: first}};
+root.appendChild(head);
+root.appendChild(main);
 function R(n) { return n.getBoundingClientRect(); }
 function inside(a, b) { a = R(a); b = R(b); return a.width > 0 && a.left >= b.left && a.right <= b.right && a.top >= b.top && a.bottom <= b.bottom; }
 setTimeout(function () {

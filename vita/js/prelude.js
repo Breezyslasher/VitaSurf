@@ -945,7 +945,8 @@ function activationTarget(target){
     through where they are drawn: the label text of a checkbox sits in
     a slot inside the component's label (VitaSurf) */
  if(n&&n.nodeType===3)n=n.__vsSlot||n.parentNode;
- while(n&&n.nodeType===1){
+ while(n&&(n.nodeType===1||n.nodeType===11)){
+  if(n.nodeType===11){n=shadowHost(n);continue;}
   a=otherActivation(n);
   if(a)return a;
   a=preActivate(n);
@@ -1064,7 +1065,7 @@ function fireAfterActivate(was){
  fireSimple(was.el,'input');
  fireSimple(was.el,'change');}
 function fireSimple(el,type){
- var e=new Event(type,{bubbles:true,cancelable:false});
+ var e=new Event(type,{bubbles:true,cancelable:false,composed:type==='input'});
  try{el.dispatchEvent(e);}catch(err){}}
 P.dispatchEvent=function(e){
  var act=null,r;
@@ -1742,7 +1743,9 @@ navigator.language='en-US';navigator.languages=['en-US','en'];navigator.cookieEn
 location.reload=function(){location.href=location.href;};
 ['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:m[1]?m[1]+'//'+(m[2]||''):'null'}[k];}});});
 location.toString=function(){return location.href;};
-function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();}
+function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();
+ /* whether it leaves a shadow tree for the host (VitaSurf) */
+ if(init&&init.composed)Object.defineProperty(this,'__vsComposed',{configurable:true,value:true});}
 /* A passive listener cannot cancel: preventDefault from inside one does
    nothing at all, so defaultPrevented stays false even while it runs.
    The dispatch marks the event while a passive listener is on it. */
@@ -2029,7 +2032,7 @@ Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,
  get:function(){return this._phase===undefined?0:this._phase;},
  set:function(v){shadowProp(this,'_phase',v|0);}});
 Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,get:function(){return false;}});
-Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){return false;}});
+Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){return this.__vsComposed===true;}});
 Object.defineProperty(Event.prototype,'srcElement',{configurable:true,get:function(){return this.target;}});
 Object.defineProperty(Event.prototype,'returnValue',{configurable:true,
  get:function(){return !this.defaultPrevented;},set:function(v){if(!v)this.preventDefault();}});
@@ -2041,7 +2044,11 @@ Object.defineProperty(Event.prototype,'cancelBubble',{configurable:true,
  get:function(){return !!this.__cancelBubble;},
  set:function(v){if(v)this.__cancelBubble=true;}});
 Event.prototype.composedPath=function(){
- var out=[],n=this.target;while(n){out.push(n);n=n.parentNode;}out.push(D);out.push(W);return out;};
+ var out=[],n=this.target;
+ while(n){out.push(n);n=n.parentNode||(this.composed?shadowHost(n):null);}
+ if(out[out.length-1]!==D&&out[out.length-1]===D.documentElement)out.push(D);
+ if(out[out.length-1]===D)out.push(W);
+ return out;};
 
 /* MessageChannel, which schedulers use to get a macrotask: React and
  * YouTube's player both post to a port instead of calling setTimeout(0),
@@ -2612,9 +2619,21 @@ function ceDefOf(el){
 
 function ceSet(el,k,v){Object.defineProperty(el,k,{value:v,writable:true,enumerable:false,configurable:true});}
 
+/* Elements waiting for their definition, by name (VitaSurf): what define()
+   upgrades. Looking them up by tag in the document missed every one in a
+   shadow tree, and Home Assistant's are nearly all in one. A browser
+   keeps such a list too; this one forgets an element once it is
+   upgraded, and stops growing at CE_PENDING_MAX. */
+var CEpending=Object.create(null),CEpendingN=0,CE_PENDING_MAX=20000;
+function cePend(el){
+ if(el.__cePending||CEpendingN>=CE_PENDING_MAX)return;
+ var t=el.tagName;if(!t)return;t=t.toLowerCase();
+ if(t.indexOf('-')<0){var is=el.getAttribute('is');if(!is)return;t=String(is).toLowerCase();}
+ (CEpending[t]||(CEpending[t]=[])).push(el);CEpendingN++;
+ ceSet(el,'__cePending',true);}
 function ceUpgrade(el,inDoc){
  if(el.__ceState)return;
- var d=ceDefOf(el);if(!d)return;
+ var d=ceDefOf(el);if(!d){cePend(el);return;}
  ceSet(el,'__ceState',1);ceSet(el,'__ceDef',d);
  try{
   /* A class that does not extend HTMLElement would otherwise lose every
@@ -2645,7 +2664,7 @@ function ceConnectTree(n,inDoc,skipSelf){
   for(k=0;k<l.length;k++){
    e=l[k];
    if(domGen()!==g){
-    for(up=e;up&&up!==n;up=up.parentNode);
+    for(up=e;up&&up!==n;up=treeUp(up));
     if(!up)continue;}
    if(!e.__ceState)ceUpgrade(e,inDoc);
    else if(e.__ceState===2&&!e.__ceConn&&inDoc){ceSet(e,'__ceConn',true);ceCall(e,'connectedCallback');}}
@@ -2684,9 +2703,16 @@ W.customElements={
   try{var a=ctor.observedAttributes;if(a)for(var i=0;i<a.length;i++)obs.push(String(a[i]).toLowerCase());}catch(e){}
   CE[name]={ctor:ctor,obs:obs,ext:opts&&opts['extends']?String(opts['extends']).toLowerCase():null};
   CEn++;
-  /* upgrade what the parser already built */
-  var list=D.getElementsByTagName(CE[name].ext||name);
-  for(var j=0;j<list.length;j++)ceUpgrade(list[j]);
+  /* upgrade what the parser already built, and what waits in a shadow
+     tree or out of the page */
+  var list=D.getElementsByTagName(CE[name].ext||name),j,wait=CEpending[name];
+  for(j=0;j<list.length;j++)ceUpgrade(list[j]);
+  if(wait){
+   delete CEpending[name];CEpendingN-=wait.length;
+   for(j=0;j<wait.length;j++){
+    ceSet(wait[j],'__cePending',false);
+    /* one made outside the page stays as it is until it goes in */
+    if(ceInDoc(wait[j]))ceUpgrade(wait[j]);}}
   var w=CEwait[name];
   if(w){delete CEwait[name];for(var k=0;k<w.length;k++)w[k](ctor);}
  },
@@ -2821,19 +2847,66 @@ function namedAccess(){
 W.addEventListener('DOMContentLoaded',namedAccess);
 W.addEventListener('load',namedAccess);
 
-/* Shadow DOM, as light DOM. A shadow root is the element itself, so
- * there is no style or selector scoping, which is the point: content put
- * in a shadow root still lays out and still renders, where an
- * unimplemented attachShadow renders nothing at all. shadowRoot stays
- * null until attachShadow is called, because components test it to find
- * out whether they have already built themselves. */
-P.attachShadow=function(){Object.defineProperty(this,'__shadow',{configurable:true,value:true,writable:true,enumerable:false});return this;};
-P.getRootNode=function(){var n=this;while(n.parentNode)n=n.parentNode;return n===D.documentElement?D:n;};
-Object.defineProperty(P,'shadowRoot',{configurable:true,get:function(){return this.__shadow?this:null;}});
-/* An element has no host of its own. Its shadow root is the element
- * itself here, so giving it one would be the element, and code that
- * climbs e.host || e.parentNode would never leave it (card-mod does). */
-Object.defineProperty(P,'host',{configurable:true,get:function(){return undefined;}});
+/* Shadow DOM (VitaSurf). A shadow root is a document fragment its host
+ * holds: a tree of its own, which the document's lookups do not enter,
+ * drawn in the host's place, whose events go on to the host. It used to
+ * be the host itself, so shadow content was the host's own children and
+ * a root was no ShadowRoot: claude.ai's Turnstile checks that the root
+ * it was given is one before every heartbeat, and dropped its widget. */
+var SH_ATTACH=W.__vitaAttachShadow,SH_ROOT=W.__vitaShadowRoot,
+ SH_HOST=W.__vitaShadowHost;
+try{delete W.__vitaAttachShadow;delete W.__vitaShadowRoot;
+ delete W.__vitaShadowHost;}catch(e){}
+/* the host of a shadow root, or null for anything else */
+function shadowHost(n){return n&&n.nodeType===11&&SH_HOST?SH_HOST(n):null;}
+/* a node's parent, or for a shadow root its host */
+function treeUp(n){return n.parentNode||shadowHost(n);}
+/* the elements the specification lets have one, besides custom ones */
+var SHADOW_TAGS=' article aside blockquote body div footer h1 h2 h3 h4 h5 h6 '+
+ 'header main nav p section span ';
+var CE_RESERVED=' annotation-xml color-profile font-face font-face-src '+
+ 'font-face-uri font-face-format font-face-name missing-glyph ';
+function ceValidName(n){
+ return /^[a-z][a-z0-9._\u00b7\u00c0-\uffff-]*-[a-z0-9._\u00b7\u00c0-\uffff-]*$/.test(n)&&
+  CE_RESERVED.indexOf(' '+n+' ')<0;}
+P.attachShadow=function(init){
+ if(this.nodeType!==1)throw new TypeError("Illegal invocation");
+ var mode=init&&typeof init==='object'?init.mode:undefined,r,ln=this.localName;
+ if(mode!=='open'&&mode!=='closed')
+  throw new TypeError("Failed to execute 'attachShadow' on 'Element': "+
+   (init&&typeof init==='object'?"Failed to read the 'mode' property from 'ShadowRootInit': The provided value '"+mode+
+    "' is not a valid enum value of type ShadowRootMode.":
+    "The provided value is not of type 'ShadowRootInit'."));
+ if(this.namespaceURI!==HTML_NS||
+    !(SHADOW_TAGS.indexOf(' '+ln+' ')>=0||ceValidName(ln)))
+  throw new DOMException("Failed to execute 'attachShadow' on 'Element': "+
+   "This element does not support attachShadow",'NotSupportedError');
+ if(SH_ROOT(this))
+  throw new DOMException("Failed to execute 'attachShadow' on 'Element': "+
+   "Shadow root cannot be created on a host which already hosts a shadow tree.",
+   'NotSupportedError');
+ r=SH_ATTACH(this,mode==='closed');
+ if(!r)throw new DOMException("Failed to execute 'attachShadow' on 'Element': "+
+  "This element does not support attachShadow",'NotSupportedError');
+ Object.defineProperty(r,'__vsInit',{configurable:true,value:{
+  delegatesFocus:!!init.delegatesFocus,clonable:!!init.clonable,
+  serializable:!!init.serializable,
+  slotAssignment:init.slotAssignment==='manual'?'manual':'named'}});
+ return r;};
+P.getRootNode=function(o){
+ var n=this,p;
+ for(;;){
+  while((p=n.parentNode))n=p;
+  if(n===D.documentElement)return D;
+  if(o&&o.composed&&(p=shadowHost(n))){n=p;continue;}
+  return n;}};
+/* the open one; a closed root is its host's own business */
+Object.defineProperty(P,'shadowRoot',{configurable:true,get:function(){
+ if(this.nodeType!==1)return undefined;
+ var r=SH_ROOT(this);return r&&!SH_HOST(r,true)?r:null;}});
+/* a shadow root's host; nothing else has one but a link (below) */
+Object.defineProperty(P,'host',{configurable:true,get:function(){
+ return this.nodeType===11?shadowHost(this)||undefined:undefined;}});
 Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return ceInDoc(this);}});
 /* A shadow root's <style>, once per text (VitaSurf). With shadow DOM as
  * light DOM, every component that puts a style in its shadow root put a
@@ -2989,6 +3062,10 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  function scope(css,host){
   var tag=host&&host.localName,k,r;
   if(!css||!tag||tag==='html'||tag==='body')return css;
+  /* the host as its shadow tree names it: only a rule naming one may
+     reach from inside the tree to it, where a page's rules stop at
+     the shadow root as in a browser */
+  tag+=':-vita-host';
   k=tag+'\n'+css;r=scoped[k];
   if(r!==undefined)return r;
   try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}
@@ -3016,11 +3093,12 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   * match the host itself, as the rules of an @scope match its root. */
  var keyOf=Object.create(null),nkey=0,nkeys=0;
  function owner(a){
-  for(;a&&a.nodeType===1;a=a.parentNode)if(a.__shadow)return a;
+  /* the host of the shadow tree a is in */
+  for(;a;a=a.parentNode)if(a.nodeType===11)return shadowHost(a);
   return null;}
  function nested(p,n){
   return !!(p&&n&&n.nodeType===1&&n.tagName==='STYLE'&&
-   !(p.__shadow&&styleNode(n))&&!n.hasAttribute('media')&&owner(p));}
+   !(shadowHost(p)&&styleNode(n))&&!n.hasAttribute('media')&&owner(p));}
  function hostTokens(h,k,d){
   var m=h.__vsKeys||(Object.defineProperty(h,'__vsKeys',{configurable:true,
    value:Object.create(null),writable:true,enumerable:false}),h.__vsKeys),
@@ -3043,7 +3121,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    else if(d===0&&/[\s>+~]/.test(c))break;}
   return sel.slice(0,i)+at+sel.slice(i);}
  function scopeKeyed(css,k){
-  var at='[data-vs-s~="'+k+'"]',r;
+  var at='[data-vs-s~="'+k+'"]:-vita-host',r;
   try{
    r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),at);
    /* and each rule again, matching the host itself */
@@ -3073,17 +3151,19 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
     writable:true,enumerable:false});}
   sc=scopeKeyed(css,k);
   return sc;}
- function fix(host,n){
-  var c;
+ function fix(p,n){
+  /* p is where n goes: a shadow root's own <style> is scoped to its
+     host's tag */
+  var c,host=shadowHost(p);
   if(!n)return;
-  if(host.__shadow&&styleNode(n)){take(host,n);return;}
-  if(nested(host,n)&&n.textContent){
-   c=takeNested(owner(host),n,n.textContent);
+  if(host&&styleNode(n)){take(host,n);return;}
+  if(nested(p,n)&&n.textContent){
+   c=takeNested(owner(p),n,n.textContent);
    if(rawText)rawText.call(n,c);else n.textContent=c;
    return;}
-  if(n.nodeType===11)
+  if(n.nodeType===11&&host)
    for(c=n.firstChild;c;c=c.nextSibling)
-    if(host.__shadow&&styleNode(c))take(host,c);}
+    if(styleNode(c))take(host,c);}
  var app=P.appendChild,ins=P.insertBefore;
  P.appendChild=function(n){fix(this,n);return app.apply(this,arguments);};
  P.insertBefore=function(n,r){fix(this,n);return ins.apply(this,arguments);};
@@ -3091,8 +3171,8 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  if(!d||!d.set)return;
  Object.defineProperty(P,'innerHTML',{configurable:true,get:d.get,set:function(v){
   var fresh=[],emptied=[];
-  if(this.__shadow&&typeof v==='string'&&v.indexOf('<style')>=0)
-   {var host=this;
+  if(shadowHost(this)&&typeof v==='string'&&v.indexOf('<style')>=0)
+   {var host=shadowHost(this);
    v=v.replace(/<style>([\s\S]*?)<\/style>/gi,function(m,css){
     var sc=scope(css,host);
     if(sc!==css){css=sc;m='<style>'+sc+'</style>';}
@@ -3125,8 +3205,8 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  Object.defineProperty(P,'textContent',{configurable:true,get:t.get,set:function(v){
   var p;
   given.delete(this);
-  if(typeof v==='string'&&v&&(p=this.parentNode)&&p.__shadow&&styleNode(this)){
-   v=scope(v,p);
+  if(typeof v==='string'&&v&&(p=this.parentNode)&&shadowHost(p)&&styleNode(this)){
+   v=scope(v,shadowHost(p));
    if(live(v)){
     if(canon[v]!==this){t.set.call(this,'');park(this,v);}
     return;}
@@ -3136,87 +3216,41 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   t.set.call(this,v);}});
 })();
 /* Slots (VitaSurf). A host's own children are drawn only through a
- * <slot> in its shadow tree: the one whose name matches their slot
- * attribute, or the unnamed one. With shadow DOM kept as light DOM they
- * sat after everything the component rendered, so Home Assistant's Log
- * in button had its label under it, the checkbox its text below the
- * box, and the password field its eye icon under the field; and what a
- * component puts out no slot for, which it means to hide, was drawn.
- *
- * Before boxes are built the engine calls __vitaSlotPass, which works
- * out each host's own children and where each goes, and hands that to
- * __vitaSlots; box construction then walks the composed tree.
- *
- * Which children are the host's own: a Lit component renders between
- * a marker comment and the node that was its first child when it first
- * rendered (renderBefore), and whatever lies outside that range is the
- * page's. For any other component only the children that name a slot
- * are counted, which is all that could be told apart before. */
+ * <slot> in its shadow tree: the first whose name matches their slot
+ * attribute, or the first unnamed one for a child without one; a child
+ * no slot takes is not drawn. Before boxes are built the engine calls
+ * __vitaSlotPass, which works out where each goes and hands that to
+ * __vitaSlots; box construction then walks the composed tree, the
+ * host's shadow tree in its place and each slot's children in it. */
 (function(){
  var HOSTS=[],last=-1,lastLen=-1,had=false,prev=[];
- function partRange(h){
-  var c=h,p,k,v,start,end;
-  while(c){
-   p=c._$litPart$;
-   if(p&&typeof p==='object'){
-    start=null;
-    for(k in p){v=p[k];
-     if(v&&typeof v==='object'&&v.nodeType===8&&v.parentNode===h){start=v;break;}}
-    if(start){
-     end=p.options&&p.options.renderBefore;
-     if(end===undefined&&p._$endNode!==undefined)end=p._$endNode;
-     if(!end||end.parentNode!==h)end=null;
-     return {start:start,end:end};}}
-   c=(c===h)?h.firstChild:c.nextSibling;}
-  return null;}
- function lightOf(h){
-  var out=[],r=partRange(h),c,state=0;
-  if(r){
-   for(c=h.firstChild;c;c=c.nextSibling){
-    if(c===r.start)state=1;
-    else if(state===1&&c===r.end)state=2;
-    if(state!==1&&c.nodeType!==8)out.push(c);}
-   return out;}
-  for(c=h.firstChild;c;c=c.nextSibling)
-   if(c.nodeType===1&&c.hasAttribute('slot'))out.push(c);
-  return out;}
  function pass(){
-  var g=domGen(),i,j,h,l,light=new Set(),perHost=[],nodes=[],slots=[],
-      ss,s,n,p,name,byName,live=[];
+  var g=domGen(),i,j,h,r,l,c,nodes=[],slots=[],ss,s,name,byName,live=[];
   if(g>=0&&g===last&&HOSTS.length===lastLen)return;
   last=g;
   for(i=0;i<HOSTS.length;i++){
    h=HOSTS[i];
-   if(!h.__shadow)continue;
-   if(!ceInDoc(h)){if(HOSTS.length<4096)live.push(h);continue;}
-   live.push(h);
-   l=lightOf(h);
-   for(j=0;j<l.length;j++)light.add(l[j]);
-   perHost.push([h,l]);}
-  HOSTS=live;lastLen=HOSTS.length;
-  for(i=0;i<perHost.length;i++){
-   h=perHost[i][0];l=perHost[i][1];
+   if(HOSTS.length<4096||ceInDoc(h))live.push(h);
+   if(!ceInDoc(h))continue;
+   r=SH_ROOT(h);
+   if(!r||(r.__vsInit&&r.__vsInit.slotAssignment==='manual'))continue;
+   l=[];
+   for(c=h.firstChild;c;c=c.nextSibling)
+    if(c.nodeType===1||c.nodeType===3)l.push(c);
    if(!l.length)continue;
-   /* the host's own slots: those whose nearest host, climbing past
-      any host they are a page child of, is this one */
    byName=Object.create(null);
-   ss=h.getElementsByTagName('slot');
+   ss=r.querySelectorAll('slot');
    for(j=0;j<ss.length;j++){
-    s=ss[j];n=s;
-    for(;;){p=n.parentNode;
-     if(!p||p.nodeType!==1){p=null;break;}
-     if(p.__shadow&&!light.has(n))break;
-     n=p;}
-    if(p!==h)continue;
-    name=s.getAttribute('name')||'';
-    if(!(name in byName))byName[name]=s;}
+    name=ss[j].getAttribute('name')||'';
+    if(!(name in byName))byName[name]=ss[j];}
    for(j=0;j<l.length;j++){
-    n=l[j];
-    name=n.nodeType===1?(n.getAttribute('slot')||''):'';
+    c=l[j];
+    name=c.nodeType===1?(c.getAttribute('slot')||''):'';
     s=byName[name]||null;
-    nodes.push(n);slots.push(s);
-    if(n.__vsSlot!==s)Object.defineProperty(n,'__vsSlot',
+    nodes.push(c);slots.push(s);
+    if(c.__vsSlot!==s)Object.defineProperty(c,'__vsSlot',
      {configurable:true,writable:true,enumerable:false,value:s});}}
+  HOSTS=live;lastLen=HOSTS.length;
   /* what was drawn in a slot and no longer is */
   if(prev.length){
    var now=new Set(nodes);
@@ -3230,10 +3264,26 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    enumerable:false,value:function(){try{pass();}catch(e){}}});
  var att=P.attachShadow;
  P.attachShadow=function(){
-  if(!this.__shadow)HOSTS.push(this);
-  return att.apply(this,arguments);};
+  var r=att.apply(this,arguments);
+  HOSTS.push(this);
+  return r;};
  Object.defineProperty(P,'assignedSlot',{configurable:true,
-  get:function(){return this.__vsSlot||null;}});
+  get:function(){
+   /* found when asked, as the DOM standard's "find a slot" is: the
+      first slot in the host's tree with the name, or the pass's for
+      manual assignment */
+   var h=this.parentNode,r,s=null,name,ss,j;
+   if(!h||h.nodeType!==1||(this.nodeType!==1&&this.nodeType!==3)||
+      !(r=SH_ROOT(h)))return null;
+   if(r.__vsInit&&r.__vsInit.slotAssignment==='manual')s=this.__vsSlot||null;
+   else{
+    name=this.nodeType===1?(this.getAttribute('slot')||''):'';
+    ss=r.querySelectorAll('slot');
+    for(j=0;j<ss.length;j++)
+     if((ss[j].getAttribute('name')||'')===name){s=ss[j];break;}}
+   /* a closed shadow tree's slot is its own business */
+   if(s&&SH_HOST(r,true))return null;
+   return s;}});
 })();
 /* <template>. libdom parses the children into the template element, so
  * content used to be the element itself -- and stamping a template then
@@ -3290,13 +3340,16 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   if(CEn&&c)ceConnectTree(c,false,false);
   return c;};
 })();
-/* No shadow tree exists here (attachShadow hands the host back), so
- * nothing may be an instance of ShadowRoot. When it was the base of every
- * element, Alpine's tree walk, which asks each node whether it is one and
- * then visits only its children, descended through the whole page without
- * processing a single directive. */
+/* A shadow root is the one kind of fragment an element holds. Only those
+ * are instances of ShadowRoot: when every element was, Alpine's tree
+ * walk, which asks each node whether it is one and then visits only its
+ * children, descended through the whole page without processing a
+ * single directive. */
 W.ShadowRoot=function ShadowRoot(){throw new TypeError('Illegal constructor');};
 W.ShadowRoot.prototype=Object.create(P);
+Object.defineProperty(W.ShadowRoot,Symbol.hasInstance,{configurable:true,
+ value:function(v){return !!v&&typeof v==='object'&&v.nodeType===11&&
+  !!shadowHost(v);}});
 
 /* --- reflected content attributes ---------------------------------------
  * Most element properties in the HTML specification are nothing but a
@@ -3441,7 +3494,7 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
  var EP=ElementInternals.prototype;
  Object.defineProperties(EP,{
   shadowRoot:{configurable:true,get:function(){
-   var el=this._el;return el.__shadow?el:null;}},
+   return SH_ROOT(this._el)||null;}},
   form:{configurable:true,get:function(){
    needForm(this,'form');return formOwner(this._el);}},
   labels:{configurable:true,get:function(){
@@ -3835,7 +3888,9 @@ Object.defineProperty(P,'origin',{configurable:true,get:function(){
  if(!isURLEl(this))return '';var u=urlOf(this);return u?u.origin:'';}});
 /* host is a link's URL host; no other element has one (see above). */
 Object.defineProperty(P,'host',{configurable:true,
- get:function(){if(!isURLEl(this))return undefined;
+ get:function(){
+  if(this.nodeType===11)return shadowHost(this)||undefined;
+  if(!isURLEl(this))return undefined;
   var u=urlOf(this);return u?u.host:'';},
  set:function(v){
   if(!isURLEl(this))return shadowProp(this,'host',v);
@@ -5453,7 +5508,8 @@ function eventClass(name,fields,base){
  var C=function(type,init){
   init=(init===undefined||init===null)?{}:init;
   this.type=String(type);
-  this.bubbles=!!init.bubbles;this.cancelable=!!init.cancelable;this.composed=!!init.composed;
+  this.bubbles=!!init.bubbles;this.cancelable=!!init.cancelable;
+  if(init.composed)Object.defineProperty(this,'__vsComposed',{configurable:true,value:true});
   this.defaultPrevented=false;this.target=init.target||null;this.currentTarget=null;
   Object.keys(all).forEach(function(kk){
    this[kk]=init[kk]!==undefined?init[kk]:all[kk];},this);};
@@ -5893,10 +5949,16 @@ Object.defineProperty(P,'closedBy',{configurable:true,
  * light DOM, which here is the host's children with a matching slot. */
 P.assignedNodes=function(){
  if(this.tagName!=='SLOT')return [];
- var name=this.name||'',host=this.parentNode;
+ var name=this.getAttribute('name')||'',root=this.getRootNode(),
+  host=shadowHost(root),first,self=this;
  if(!host)return [];
+ /* only the first slot of a name takes what has that name */
+ first=root.querySelectorAll('slot').filter(function(s){
+  return (s.getAttribute('name')||'')===name;})[0];
+ if(first!==self)return [];
  return host.childNodes.filter(function(n){
-  return n.nodeType!==1?name==='':(n.getAttribute('slot')||'')===name;});};
+  if(n.nodeType===3)return name==='';
+  return n.nodeType===1&&(n.getAttribute('slot')||'')===name;});};
 P.assignedElements=function(){return this.assignedNodes().filter(function(n){return n.nodeType===1;});};
 P.assign=function(){};
 /* Media elements. There is no decoder here, so a play resolves and the
@@ -5947,7 +6009,9 @@ P.assign=function(){};
 })();
 
 /* --- the shadow root, the template and the observers -------------------- */
-Object.defineProperty(P,'mode',{configurable:true,get:function(){return this.__shadow?'open':undefined;}});
+Object.defineProperty(P,'mode',{configurable:true,get:function(){
+ if(!shadowHost(this))return undefined;
+ return SH_HOST(this,true)?'closed':'open';}});
 /* --- focus ---------------------------------------------------------------
  * focus() did nothing and activeElement was always the body. A login page
  * that focuses its first field, a component that focuses its input when
@@ -5991,10 +6055,12 @@ W.addEventListener('click',function(e){
  var t=e&&e.target,n=t;
  while(n&&n.nodeType===1&&!focusable(n))n=n.parentNode;
  if(n&&n.nodeType===1&&focused!==n)moveFocus(n,false);},true);
-Object.defineProperty(P,'delegatesFocus',{configurable:true,get:function(){return false;}});
-Object.defineProperty(P,'slotAssignment',{configurable:true,get:function(){return 'named';}});
-Object.defineProperty(P,'clonable',{configurable:true,get:function(){return false;}});
-Object.defineProperty(P,'serializable',{configurable:true,get:function(){return false;}});
+/* what a shadow root was made with */
+['delegatesFocus','slotAssignment','clonable','serializable'].forEach(function(k){
+ Object.defineProperty(P,k,{configurable:true,get:function(){
+  if(this.nodeType!==11||!shadowHost(this))return undefined;
+  var i=this.__vsInit;
+  return i?i[k]:(k==='slotAssignment'?'named':false);}});});
 Object.defineProperty(P,'styleSheets',{configurable:true,get:function(){
  var l=[];l.item=function(i){return this[i]||null;};return l;}});
 Object.defineProperty(P,'adoptedStyleSheets',adoptedAccessor());
@@ -6701,12 +6767,8 @@ P.stop=function(){};
  * has no getElementById at all: code tells a document from an element
  * by asking whether it has one. */
 P.getElementById=function(id){
- if(this.nodeType===9)return docById(this,id);
- /* a shadow root is its host here, and Home Assistant's dashboard
-    finds its view with this.shadowRoot.getElementById("view") */
- if(this.nodeType===1)return this.__shadow?docById(this,id):null;
- if(this.nodeType!==11)return null;
- return docById(this,id);};
+ if(this.nodeType===9||this.nodeType===11)return docById(this,id);
+ return null;};
 
 /* --- the interfaces a feature-patching loop reads ----------------------- */
 W.XMLSerializer=function(){};
@@ -7978,14 +8040,14 @@ function missName(n){
  if(!n)return 'nothing';
  var t=n.nodeType===1?'<'+n.tagName+'>':n.nodeType===3?'text':
   n.nodeType===8?'comment':n.nodeType===11?'fragment':'node '+n.nodeType;
- if(n.nodeType===1&&n.__shadow)t+=' (a shadow host)';
+ if(n.nodeType===1&&SH_ROOT(n))t+=' (a shadow host)';
+ if(n.nodeType===11&&shadowHost(n))t='a shadow root';
  return t;}
 function insertMiss(parent,node,child){
  if(++insertMisses>8)return;
  try{
   var p=child.parentNode,o=parent.renderOptions,why=[];
   if(o&&typeof o==='object'&&o.renderBefore===child)why.push('it is the renderBefore of the parent\'s Lit render');
-  if(child.__vsShadowKid)why.push('it was moved into a shadow root');
   console.warn('insertBefore missed: putting '+missName(node)+' into '+
    missName(parent)+' before '+missName(child)+', which is '+
    (p?'in '+missName(p):'in nothing')+
@@ -8079,74 +8141,6 @@ function documentRules(parent,node,child,replacing){
   if(child.parentNode!==this)throw new DOMException(
    'The node to be removed is not a child of this node.','NotFoundError');
   return removeC.call(this,child);};
-})();
-
-/* --- a host's children moved into its own shadow root -------------------
- * A shadow root is its host here (attachShadow above), so moving the
- * host's children into it moved each to the end of the host, and the
- * host's firstChild was never null. card-mod does exactly that for every
- * glance entity on every update, "while (div.firstChild)
- * shadowRoot.append(div.firstChild)", and the loop ran until script
- * memory ran out: seconds per Home Assistant update, and cards left
- * unrendered when it threw (build 557). A child moved so is marked as
- * shadow content, and that host's firstChild, childNodes and
- * hasChildNodes -- its light-DOM view -- pass over the marked ones, as a
- * real host's do. Only hosts this has happened to are changed. */
-(function(){
- var app=P.appendChild,ins=P.insertBefore;
- function getter(name){
-  for(var o=P;o;o=Object.getPrototypeOf(o)){
-   var d=Object.getOwnPropertyDescriptor(o,name);
-   if(d)return d.get||null;}
-  return null;}
- var fcGet=getter('firstChild'),cnGet=getter('childNodes');
- function light(l){
-  var r=[],i;
-  for(i=0;i<l.length;i++)if(!l[i].__vsShadowKid)r.push(l[i]);
-  if(typeof l.item==='function')r.item=function(i){return this[i]||null;};
-  return r;}
- function view(host){
-  if(Object.prototype.hasOwnProperty.call(host,'__vsShadowView'))return;
-  Object.defineProperty(host,'__vsShadowView',{configurable:true,value:true});
-  if(fcGet)Object.defineProperty(host,'firstChild',{configurable:true,
-   get:function(){var n=fcGet.call(this);
-    while(n&&n.__vsShadowKid)n=n.nextSibling;return n||null;}});
-  if(cnGet)Object.defineProperty(host,'childNodes',{configurable:true,
-   get:function(){return light(cnGet.call(this));}});
-  Object.defineProperty(host,'hasChildNodes',{configurable:true,writable:true,
-   value:function(){return this.firstChild!==null;}});}
- function mark(parent,node){
-  if(!node||typeof node!=='object')return;
-  if(parent&&parent.__shadow&&node.parentNode===parent){
-   Object.defineProperty(node,'__vsShadowKid',
-    {configurable:true,writable:true,value:true});
-   view(parent);}
-  else if(node.__vsShadowKid)node.__vsShadowKid=false;}
- P.appendChild=function(node){mark(this,node);return app.apply(this,arguments);};
- P.insertBefore=function(node,child){mark(this,node);return ins.apply(this,arguments);};
-})();
-/* --- where Lit renders in a host that already has children -------------
- * LitElement renders before its new shadow root's firstChild, which in a
- * browser is null. Here the root is the host, so it was the host's first
- * light child, and once the page moved that child somewhere else, Lit's
- * next render of anything new threw ("The node before which the new node
- * is to be inserted is not a child of this node"). Home Assistant writes
- * every unhandled rejection to its log with the stack mapped through the
- * bundle's source map, which on the Vita was a multi-megabyte download
- * and seconds of parsing inside the dashboard's longest promise jobs.
- * Such a host gets an empty comment at its front for Lit to render
- * before, which nothing but Lit moves. The slot pass reads Lit's range
- * from renderBefore, so it sees the same light children as before. */
-(function(){
- var attach=P.attachShadow;
- P.attachShadow=function(){
-  var r=attach.apply(this,arguments),o=this.renderOptions,first,a;
-  if(r===this&&o&&typeof o==='object'&&o.renderBefore===undefined&&
-     (first=this.firstChild)){
-   a=(this.ownerDocument||D).createComment('');
-   this.insertBefore(a,first);
-   o.renderBefore=a;}
-  return r;};
 })();
 
 /* --- instanceof, told apart ----------------------------------------------
@@ -8323,7 +8317,7 @@ stampConsts(P);
     n=BY_TAG[this.tagName];
     if(!n)n=HTML_TAGS.indexOf(' '+this.tagName+' ')>=0?'HTMLElement'
                                                       :'HTMLUnknownElement';
-   }else n=BY_TYPE[t];
+   }else n=t===11&&shadowHost(this)?'ShadowRoot':BY_TYPE[t];
    return (n&&W[n])||W.Node;},
   set:function(v){shadowProp(this,'constructor',v);}});
  /* What Object.prototype.toString says a node is (VitaSurf). It said

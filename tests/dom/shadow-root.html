@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<!-- Shadow roots as their own trees. attachShadow gives a ShadowRoot
+     (a DocumentFragment, nodeType 11) whose children the document's own
+     lookups do not see; getRootNode, isConnected and contains answer
+     across it as the DOM standard has them; a closed root is hidden from
+     the host's shadowRoot. An event from inside leaves the tree only
+     when composed, and outside it is retargeted to the host. ::part()
+     styles a part of the host's own tree, and one further in only when
+     exportparts passes it on. Expected lines are what Chrome prints. -->
+<html><head><title>shadow root</title><style>
+x-outer::part(lbl) { color: rgb(0, 128, 0); }
+x-outer::part(inner-b) { color: rgb(0, 0, 255); }
+x-outer::part(b) { color: rgb(255, 0, 0); }
+#ph span { color: rgb(255, 0, 0); }
+</style></head><body><div id="c"></div>
+<x-outer id="ph"></x-outer>
+<x-card id="card"><i id="named" slot="title">t</i><b id="plain">p</b></x-card>
+<pre id="out"></pre>
+<script>
+var out = [];
+function t(name, f) { var v; try { v = f(); } catch (e) { v = 'throws ' + e.name; } out.push(name + '=' + v); }
+['open', 'closed'].forEach(function (mode) {
+  var host = document.createElement('div');
+  document.getElementById('c').appendChild(host);
+  var sr = host.attachShadow({mode: mode});
+  var f = document.createElement('iframe');
+  f.id = 'w-' + mode; f.src = 'about:blank';
+  var wrap = document.createElement('div');
+  sr.appendChild(wrap); wrap.appendChild(f);
+  out.push('[' + mode + ']');
+  t('host.shadowRoot', function () { return host.shadowRoot === sr ? 'sr' : host.shadowRoot; });
+  t('sr.getElementById', function () { return sr.getElementById(f.id) === f; });
+  t('sr.querySelector', function () { return sr.querySelector('#' + f.id) === f; });
+  t('doc.getElementById', function () { return document.getElementById(f.id); });
+  t('doc.querySelector', function () { return document.querySelector('#' + f.id); });
+  t('doc.getElementsByTagName', function () { return document.getElementsByTagName('iframe').length; });
+  t('isConnected', function () { return f.isConnected; });
+  t('doc.contains', function () { return document.contains(f); });
+  t('host.contains', function () { return host.contains(f); });
+  t('sr.contains', function () { return sr.contains(f); });
+  t('getRootNode', function () { return f.getRootNode() === sr; });
+  t('getRootNode composed', function () { return f.getRootNode({composed: true}) === document; });
+  t('parentNode', function () { return wrap.parentNode === sr; });
+  t('parentElement', function () { return wrap.parentElement; });
+  t('sr.parentNode', function () { return sr.parentNode; });
+  t('sr.host', function () { return sr.host === host; });
+  t('contentWindow.parent', function () { return f.contentWindow && f.contentWindow.parent === window; });
+  t('sr.children', function () { return sr.children.length; });
+  t('sr.mode', function () { return sr.mode; });
+  t('sr.nodeType', function () { return sr.nodeType; });
+  t('instanceof ShadowRoot', function () { return sr instanceof ShadowRoot; });
+  t('instanceof DocumentFragment', function () { return sr instanceof DocumentFragment; });
+  t('toString', function () { return Object.prototype.toString.call(sr); });
+  t('attach again', function () { host.attachShadow({mode: 'open'}); return 'no'; });
+});
+out.push('[attach]');
+t('on an a', function () { document.createElement('a').attachShadow({mode: 'open'}); return 'no'; });
+t('no mode', function () { document.createElement('div').attachShadow({}); return 'no'; });
+t('custom element', function () { return document.createElement('x-y').attachShadow({mode: 'open'}).nodeType; });
+t('fragment not a ShadowRoot', function () { return document.createDocumentFragment() instanceof ShadowRoot; });
+
+/* events */
+out.push('[events]');
+(function () {
+  var host = document.createElement('div'), sr = host.attachShadow({mode: 'open'});
+  var inner = document.createElement('span');
+  sr.appendChild(inner);
+  document.body.appendChild(host);
+  var seen = [];
+  document.addEventListener('ping', function (e) { seen.push('doc:' + (e.target === host ? 'host' : e.target === inner ? 'inner' : e.target)); });
+  sr.addEventListener('ping', function (e) { seen.push('sr:' + (e.target === inner ? 'inner' : e.target)); });
+  host.addEventListener('ping', function (e) { seen.push('host:' + (e.target === host ? 'host' : 'inner') + ':' + e.eventPhase); });
+  var ev = new Event('ping', {bubbles: true, composed: true});
+  inner.dispatchEvent(ev);
+  t('composed', function () { return seen.join(' '); });
+  t('target after dispatch', function () { return ev.target === host ? 'host' : ev.target === inner ? 'inner' : ev.target; });
+  t('composed flag', function () { return ev.composed; });
+  seen = [];
+  inner.dispatchEvent(new Event('ping', {bubbles: true}));
+  t('not composed', function () { return seen.join(' '); });
+  var path = null;
+  inner.addEventListener('pong', function (e) { path = e.composedPath().map(function (n) { return n === sr ? '#shadow' : n === window ? 'window' : n === document ? '#document' : n.localName; }).join(','); });
+  inner.dispatchEvent(new Event('pong', {bubbles: true, composed: true}));
+  t('composedPath', function () { return path; });
+  inner.dispatchEvent(new Event('pong', {bubbles: true}));
+  t('composedPath not composed', function () { return path; });
+})();
+
+/* slots */
+out.push('[slots]');
+(function () {
+  var card = document.getElementById('card'), sr = card.attachShadow({mode: 'open'});
+  sr.innerHTML = '<h3><slot name="title"></slot></h3><p><slot></slot></p>';
+  var ts = sr.querySelector('slot[name=title]'), ds = sr.querySelector('slot:not([name])');
+  t('assignedSlot', function () { return document.getElementById('named').assignedSlot === ts; });
+  t('assignedNodes', function () { return ts.assignedNodes().length + ' ' + ds.assignedNodes().length; });
+  t('assignedElements', function () { return ds.assignedElements().map(function (e) { return e.id; }).join(); });
+  t('light children', function () { return card.children.length; });
+})();
+
+/* ::part */
+out.push('[part]');
+customElements.define('x-inner', class extends HTMLElement { constructor() { super(); this.attachShadow({mode: 'open'}).innerHTML = '<span part="b" id="b">b</span>'; } });
+customElements.define('x-outer', class extends HTMLElement { constructor() { super(); this.attachShadow({mode: 'open'}).innerHTML = '<span part="lbl" id="l">l</span><span id="s">s</span><x-inner id="i" exportparts="b: inner-b"></x-inner><x-inner id="j"></x-inner>'; } });
+(function () {
+  var r = document.getElementById('ph').shadowRoot;
+  function c(e) { return getComputedStyle(e).color; }
+  t('a part of the host', function () { return c(r.getElementById('l')); });
+  t('not a part', function () { return c(r.getElementById('s')); });
+  t('exported under a new name', function () { return c(r.getElementById('i').shadowRoot.getElementById('b')); });
+  t('not exported', function () { return c(r.getElementById('j').shadowRoot.getElementById('b')); });
+})();
+
+setTimeout(function () {
+  out.forEach(function (l) { console.log('XX ' + l); });
+  document.getElementById('out').textContent = out.join('\n');
+}, 300);
+</script></body></html>

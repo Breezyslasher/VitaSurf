@@ -1,0 +1,435 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 7ead79b..fa6e69d 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -233,6 +233,32 @@ typedef struct css_select_handler {
+ 	css_error (*node_container_size)(void *pw, void *node,
+ 			lwc_string *name, css_fixed *width, css_fixed *height,
+ 			uint8_t *status);
++
++	/**
++	 * The parent walks again, for a selector that may go on from the
++	 * top of a shadow tree to its host (VitaSurf): one written for a
++	 * shadow tree's own rules, which name the host with :-vita-host.
++	 * The ones above stop at a shadow root, so a page's rules do not
++	 * reach into a component. NULL uses the ones above.
++	 */
++	css_error (*named_ancestor_node_cross)(void *pw, void *node,
++			const css_qname *qname, void **ancestor);
++	css_error (*named_parent_node_cross)(void *pw, void *node,
++			const css_qname *qname, void **parent);
++	css_error (*parent_node_cross)(void *pw, void *node, void **parent);
++
++	/**
++	 * For X::part(a b) (VitaSurf): set \a host to the next shadow
++	 * host out from \a prev (from \a node, for NULL) of which
++	 * \a node is a part under every one of \a names. That is the
++	 * host of the tree \a node is in, if its part attribute names
++	 * them all, or one further out that the hosts on the way pass
++	 * them to with exportparts. NULL when there is none, and NULL
++	 * here matches no ::part() rule.
++	 */
++	css_error (*part_host)(void *pw, void *node,
++			lwc_string *const *names, uint32_t n_names,
++			void *prev, void **host);
+ } css_select_handler;
+ 
+ /** How many attribute names a node can name before every bucket is
+diff --git a/src/parse/language.c b/src/parse/language.c
+index a84201c..039388a 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -3387,11 +3387,16 @@ static const char *const known_classes[] = {
+ 	"popover-open", "open", "closed", "playing", "paused", "seeking",
+ 	"buffering", "stalled", "muted", "volume-locked",
+ 	"picture-in-picture", "scope", "blank", "past", "current",
+-	"future", "has-slotted", "xr-overlay", NULL
++	"future", "has-slotted", "xr-overlay",
++	/* a shadow host, as the shadow tree's own rules name it once
++	   rewritten (VitaSurf) */
++	"-vita-host", NULL
+ };
+ 
+ static const char *const known_class_functions[] = {
+-	"dir", "state", "current", "nth-col", "nth-last-col", NULL
++	"dir", "state", "current", "nth-col", "nth-last-col",
++	/* one per name in X::part(a b), as rewritten (VitaSurf) */
++	"-vita-part", NULL
+ };
+ 
+ static const char *const known_elements[] = {
+@@ -4772,6 +4777,46 @@ css_error parseCombinator(css_language *c, const parserutils_vector *vector,
+ 	return CSS_OK;
+ }
+ 
++/**
++ * Mark each compound of a chain that names a shadow host with :-vita-host
++ * (VitaSurf): the spelling the shadow tree rewrite gives :host. Only the
++ * step to such a compound may go on from the top of a shadow tree to
++ * its host, so a shadow tree's own rules reach the host and a page's,
++ * and the steps between other compounds, stop at a shadow root.
++ */
++static bool detailIs(const css_selector_detail *d, const char *name)
++{
++	size_t n = strlen(name);
++
++	return d->type == CSS_SELECTOR_PSEUDO_CLASS &&
++			d->qname.name != NULL &&
++			lwc_string_length(d->qname.name) == n &&
++			strncasecmp(lwc_string_data(d->qname.name),
++				name, n) == 0;
++}
++
++static void markHostCompounds(css_selector *s)
++{
++	for (; s != NULL; s = s->combinator) {
++		const css_selector_detail *d = &s->data;
++
++		for (;;) {
++			if (detailIs(d, "-vita-host"))
++				s->data.cross = 1;
++			/* X::part(a), rewritten as X :-vita-part(a): the
++			 * step to X is to the host the part belongs to */
++			if (detailIs(d, "-vita-part") &&
++					s->combinator != NULL &&
++					s->data.comb ==
++						CSS_COMBINATOR_ANCESTOR)
++				s->data.comb = CSS_COMBINATOR_PART;
++			if (!d->next)
++				break;
++			d++;
++		}
++	}
++}
++
+ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+ 		int32_t *ctx, css_selector **result)
+ {
+@@ -4850,6 +4895,9 @@ css_error parseSelector(css_language *c, const parserutils_vector *vector,
+ 		selector = other;
+ 	}
+ 
++	/* the compounds that name a shadow host (VitaSurf) */
++	markHostCompounds(selector);
++
+ 	*result = selector;
+ 
+ 	return CSS_OK;
+diff --git a/src/parse/nesting.c b/src/parse/nesting.c
+index 7dfc054..86fbdb0 100644
+--- a/src/parse/nesting.c
++++ b/src/parse/nesting.c
+@@ -888,12 +888,13 @@ static void sel_rewrite_prelude(struct sbuf *b, const char *s, size_t n)
+ 		}
+ 		/*
+ 		 * X::part(a b) is the element in X's shadow tree whose part
+-		 * attribute names a and b. Shadow trees are X's descendants
+-		 * here, so it is read as X [part~="a"][part~="b"]: Web
++		 * attribute names a and b, or one in a tree further in that
++		 * the hosts on the way export to X's under those names. Web
+ 		 * Awesome's and Shoelace's components are sized and themed
+ 		 * through it, Home Assistant's icon buttons among them
+-		 * (VitaSurf). Parts a nested component exports are matched
+-		 * too, as if exportparts had named them.
++		 * (VitaSurf). It is read as X :-vita-part(a):-vita-part(b),
++		 * and the parser makes the step to X one from a part to its
++		 * host (CSS_COMBINATOR_PART).
+ 		 *
+ 		 * A rule from outside a shadow tree beats the tree's own
+ 		 * rules whatever their specificity, and here both are
+@@ -908,7 +909,11 @@ static void sel_rewrite_prelude(struct sbuf *b, const char *s, size_t n)
+ 				sb_put(b, s + i, n - i);
+ 				return;
+ 			}
+-			sb_put(b, " :is(", 5);
++			/* ::part(a) on its own is *::part(a) */
++			if (b->n == 0 || strchr(" \t\n\r\f,>+~(){};",
++					b->p[b->n - 1]) != NULL)
++				sb_put(b, "*", 1);
++			sb_put(b, " :is([part],#-vita-part)", 24);
+ 			for (j = i + 7; j < end - 1; ) {
+ 				while (j < end - 1 && sel_ws(s[j]))
+ 					j++;
+@@ -916,12 +921,11 @@ static void sel_rewrite_prelude(struct sbuf *b, const char *s, size_t n)
+ 				while (j < end - 1 && !sel_ws(s[j]))
+ 					j++;
+ 				if (j > a) {
+-					sb_put(b, "[part~=\"", 8);
++					sb_put(b, ":-vita-part(", 12);
+ 					sb_put(b, s + a, j - a);
+-					sb_put(b, "\"]", 2);
++					sb_put(b, ")", 1);
+ 				}
+ 			}
+-			sb_put(b, ",#-vita-part)", 13);
+ 			i = end;
+ 			continue;
+ 		}
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 9cd147b..59155bd 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -1366,8 +1366,11 @@ static void _chain_bloom_generate(const css_selector *s,
+ 	/* Work back through selector chain... */
+ 	do {
+ 		/* ...looking for Ancestor/Parent combinators */
++		/* a part's host is one of the element's ancestors across
++		   its shadow roots, as the bloom holds them (VitaSurf) */
+ 		if (s->data.comb == CSS_COMBINATOR_ANCESTOR ||
+-				 s->data.comb == CSS_COMBINATOR_PARENT) {
++				 s->data.comb == CSS_COMBINATOR_PARENT ||
++				 s->data.comb == CSS_COMBINATOR_PART) {
+ 			const css_selector_detail *d = &s->combinator->data;
+ 			do {
+ 				if (d->negate == 0) {
+diff --git a/src/select/select.c b/src/select/select.c
+index 0267ae7..8ef2523 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -311,6 +311,9 @@ static css_error match_universal_combinator(css_select_ctx *ctx,
+ 		css_combinator type, const css_selector *selector,
+ 		css_select_state *state, void *node, bool may_optimise,
+ 		bool *rejected_by_cache, void **next_node);
++static css_error match_part_combinator(css_select_ctx *ctx,
++		const css_selector *s, css_select_state *state, void *node,
++		void **next_node);
+ static css_error match_details(css_select_ctx *ctx, void *node,
+ 		const css_selector_detail *detail, css_select_state *state,
+ 		bool *match, css_pseudo_element *pseudo_element);
+@@ -2813,7 +2816,11 @@ css_error css_select_style(css_select_ctx *ctx, void *node,
+ 	    handler->handler_version != CSS_SELECT_HANDLER_VERSION_1)
+ 		return CSS_BADPARM;
+ 
+-	error = handler->parent_node(pw, node, &parent);
++	/* the parent across a shadow root, whose bloom holds every
++	   ancestor a rule of either kind may name (VitaSurf) */
++	error = (handler->parent_node_cross != NULL ?
++			handler->parent_node_cross :
++			handler->parent_node)(pw, node, &parent);
+ 	if (error != CSS_OK)
+ 		return error;
+ 
+@@ -4056,7 +4063,17 @@ css_error match_selector_chain(css_select_ctx *ctx,
+ 		void *next_node = NULL;
+ 
+ 		/* Consider any combinator on this selector */
+-		if (s->data.comb != CSS_COMBINATOR_NONE &&
++		if (s->data.comb == CSS_COMBINATOR_PART) {
++			may_optimise = false;
++			error = match_part_combinator(ctx, s, state, node,
++					&next_node);
++			if (error != CSS_OK)
++				return error;
++			if (next_node == NULL) {
++				css_select_cand_comb_failed++;
++				return CSS_OK;
++			}
++		} else if (s->data.comb != CSS_COMBINATOR_NONE &&
+ 				s->combinator->data.qname.name !=
+ 					ctx->str.universal) {
+ 			/* Named combinator */
+@@ -4171,14 +4188,24 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+ 		/* Find candidate node */
+ 		switch (type) {
+ 		case CSS_COMBINATOR_ANCESTOR:
+-			error = state->handler->named_ancestor_node(state->pw,
+-					n, &selector->data.qname, &n);
++			error = (selector->data.cross &&
++				state->handler->named_ancestor_node_cross !=
++					NULL ?
++				state->handler->named_ancestor_node_cross :
++				state->handler->named_ancestor_node)(
++					state->pw, n, &selector->data.qname,
++					&n);
+ 			if (error != CSS_OK)
+ 				return error;
+ 			break;
+ 		case CSS_COMBINATOR_PARENT:
+-			error = state->handler->named_parent_node(state->pw,
+-					n, &selector->data.qname, &n);
++			error = (selector->data.cross &&
++				state->handler->named_parent_node_cross !=
++					NULL ?
++				state->handler->named_parent_node_cross :
++				state->handler->named_parent_node)(
++					state->pw, n, &selector->data.qname,
++					&n);
+ 			if (error != CSS_OK)
+ 				return error;
+ 			break;
+@@ -4203,6 +4230,7 @@ css_error match_named_combinator(css_select_ctx *ctx, css_combinator type,
+ 						CSS_NODE_FLAGS_TAINT_SIBLING;
+ 			}
+ 		case CSS_COMBINATOR_NONE:
++		case CSS_COMBINATOR_PART:
+ 			break;
+ 		}
+ 
+@@ -4308,7 +4336,10 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
+ 		switch (type) {
+ 		case CSS_COMBINATOR_ANCESTOR:
+ 		case CSS_COMBINATOR_PARENT:
+-			error = state->handler->parent_node(state->pw, n, &n);
++			error = (selector->data.cross &&
++				state->handler->parent_node_cross != NULL ?
++				state->handler->parent_node_cross :
++				state->handler->parent_node)(state->pw, n, &n);
+ 			if (error != CSS_OK)
+ 				return error;
+ 			break;
+@@ -4321,6 +4352,7 @@ css_error match_universal_combinator(css_select_ctx *ctx, css_combinator type,
+ 					CSS_NODE_FLAGS_TAINT_SIBLING);
+ 			break;
+ 		case CSS_COMBINATOR_NONE:
++		case CSS_COMBINATOR_PART:
+ 			break;
+ 		}
+ 
+@@ -4852,6 +4884,59 @@ static css_error match_has_compound(css_select_ctx *ctx, void *n,
+ 	return match_details(ctx, n, &sub->data, state, match, NULL);
+ }
+ 
++/**
++ * The step from a part to the host in X::part(a b) (VitaSurf): \a s is
++ * the part's compound, which carries a :-vita-part() for each name,
++ * and the host the client finds for those names must match the
++ * compound before it, X. Hosts further out are tried in turn, since a
++ * part can be exported to more than one under the same name.
++ */
++static css_error match_part_combinator(css_select_ctx *ctx,
++		const css_selector *s, css_select_state *state, void *node,
++		void **next_node)
++{
++	const css_selector_detail *d = &s->data;
++	lwc_string *names[8];
++	uint32_t n = 0;
++	void *host = NULL;
++	bool match = false;
++	css_error error;
++
++	*next_node = NULL;
++	if (state->handler->part_host == NULL)
++		return CSS_OK;
++	for (;;) {
++		if (d->type == CSS_SELECTOR_PSEUDO_CLASS &&
++				d->value_type ==
++					CSS_SELECTOR_DETAIL_VALUE_STRING &&
++				d->value.string != NULL &&
++				lwc_is(d->qname.name, "-vita-part")) {
++			if (n == N_ELEMENTS(names))
++				return CSS_OK;
++			names[n++] = d->value.string;
++		}
++		if (!d->next)
++			break;
++		d++;
++	}
++	if (n == 0)
++		return CSS_OK;
++	for (;;) {
++		error = state->handler->part_host(state->pw, node, names, n,
++				host, &host);
++		if (error != CSS_OK || host == NULL)
++			return error;
++		error = match_has_compound(ctx, host, s->combinator, state,
++				&match);
++		if (error != CSS_OK)
++			return error;
++		if (match) {
++			*next_node = host;
++			return CSS_OK;
++		}
++	}
++}
++
+ /**
+  * Whether a node matches any compound of a chain (VitaSurf).
+  */
+@@ -4889,7 +4974,11 @@ static css_error match_chain_at(css_select_ctx *ctx, const css_selector *s,
+ 	while (s->data.comb != CSS_COMBINATOR_NONE && s->combinator != NULL) {
+ 		void *next_node = NULL;
+ 
+-		if (s->combinator->data.qname.name != ctx->str.universal) {
++		if (s->data.comb == CSS_COMBINATOR_PART) {
++			error = match_part_combinator(ctx, s, state, node,
++					&next_node);
++		} else if (s->combinator->data.qname.name !=
++				ctx->str.universal) {
+ 			error = match_named_combinator(ctx, s->data.comb,
+ 					s->combinator, state, node,
+ 					&next_node);
+@@ -5352,6 +5441,9 @@ css_error match_detail(css_select_ctx *ctx, void *node,
+ 			error = match_chain_at(ctx, detail->value.selector,
+ 					node, state, match);
+ 			*match = !*match;
++		} else if (lwc_is(detail->qname.name, "-vita-part")) {
++			/* X::part(a): the step to X tests the names */
++			*match = true;
+ 		} else if (state->handler->node_is_pseudo != NULL) {
+ 			/* the ones the parser knows only by name, answered
+ 			 * by the client (VitaSurf) */
+@@ -5610,6 +5702,8 @@ void dump_chain(const css_selector *selector)
+ 		fprintf(stderr, " + ");
+ 	else if (selector->data.comb == CSS_COMBINATOR_PARENT)
+ 		fprintf(stderr, " > ");
++	else if (selector->data.comb == CSS_COMBINATOR_PART)
++		fprintf(stderr, " ::part ");
+ 
+ 	do {
+ 		switch (detail->type) {
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 58a4ad4..7089b7e 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -1550,6 +1550,7 @@ css_error css__stylesheet_selector_detail_init(css_stylesheet *sheet,
+ 	detail->value = value;
+ 	detail->value_type = value_type;
+ 	detail->negate = negate;
++	detail->cross = 0;
+ 
+ 	return CSS_OK;
+ }
+@@ -1615,6 +1616,13 @@ css_error css__stylesheet_selector_append_specific(css_stylesheet *sheet,
+ 			/* @scope adds no specificity (VitaSurf) */
+ 			break;
+ 		}
++		if (lwc_string_length(detail->qname.name) == 10 &&
++				strncasecmp(lwc_string_data(detail->qname.name),
++					"-vita-part", 10) == 0) {
++			/* nor do the names of a ::part(), which the :is()
++			   written next to them weighs (VitaSurf) */
++			break;
++		}
+ 		if (detail->value_type == CSS_SELECTOR_DETAIL_VALUE_SELECTOR) {
+ 			/* :has() counts as its most specific argument */
+ 			const css_selector *s;
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 75eaf14..7750e6b 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -53,7 +53,10 @@ typedef enum css_combinator {
+ 	CSS_COMBINATOR_ANCESTOR,
+ 	CSS_COMBINATOR_PARENT,
+ 	CSS_COMBINATOR_SIBLING,
+-	CSS_COMBINATOR_GENERIC_SIBLING
++	CSS_COMBINATOR_GENERIC_SIBLING,
++	/** X::part(a): from a part to the shadow host it is a part of
++	 * under the names the compound's :-vita-part() give (VitaSurf) */
++	CSS_COMBINATOR_PART
+ } css_combinator;
+ 
+ typedef enum css_selector_detail_value_type {
+@@ -87,7 +90,12 @@ typedef struct css_selector_detail {
+ 		     next       : 1,		/**< Another selector detail
+ 						 * follows */
+ 		     value_type : 2,		/**< Type of value field */
+-		     negate     : 1;		/**< Detail match is inverted */
++		     negate     : 1,		/**< Detail match is inverted */
++		     /** on a compound's first detail: the compound
++		      * names a shadow host with :-vita-host, and the
++		      * step to it may go on from the top of that host's
++		      * shadow tree (VitaSurf) */
++		     cross      : 1;
+ } css_selector_detail;
+ 
+ struct css_selector {

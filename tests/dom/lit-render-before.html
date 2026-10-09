@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <!-- Where a Lit element renders when its host already has children
      (VitaSurf). LitElement renders before its new shadow root's
-     firstChild, null in a browser; a shadow root here is its host, so it
-     was the host's first light child, and once the page moved that
+     firstChild, null in a browser; when a shadow root here was its host
+     it was the host's first light child, and once the page moved that
      child away the element's next render threw NotFoundError. Home
      Assistant sends each such rejection through its source-mapped error
      log, seconds of work on the Vita. The element below does what

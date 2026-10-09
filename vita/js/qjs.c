@@ -1681,6 +1681,53 @@ static void attr_journal_add(jsthread *thread, struct dom_node *node,
 			     dom_string *name, dom_string *old, bool slots);
 
 /* Whether a node is in the thread's document. */
+/* A shadow root's host, referenced, or NULL (VitaSurf). */
+static struct dom_node *shadow_host_of(struct dom_node *n)
+{
+	dom_node_type type = DOM_ELEMENT_NODE;
+	struct dom_element *host = NULL;
+
+	if (n == NULL || dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+	    type != DOM_DOCUMENT_FRAGMENT_NODE ||
+	    dom_document_fragment_get_host((dom_document_fragment *) n,
+					   &host) != DOM_NO_ERR) {
+		return NULL;
+	}
+	return (struct dom_node *) host;
+}
+
+/* An element's shadow root, open or closed, referenced, or NULL. */
+static struct dom_node *shadow_root_of(struct dom_node *n)
+{
+	dom_node_type type = DOM_TEXT_NODE;
+	dom_document_fragment *root = NULL;
+
+	if (n == NULL || dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+	    type != DOM_ELEMENT_NODE ||
+	    dom_element_get_shadow_root((struct dom_element *) n, &root) !=
+	    DOM_NO_ERR) {
+		return NULL;
+	}
+	return (struct dom_node *) root;
+}
+
+/*
+ * A node's parent, referenced, or for a shadow root its host (VitaSurf):
+ * a shadow tree is in the page when its host is.
+ */
+static struct dom_node *tree_up(struct dom_node *n)
+{
+	struct dom_node *up = NULL;
+
+	if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+		up = NULL;
+	}
+	if (up == NULL) {
+		up = shadow_host_of(n);
+	}
+	return up;
+}
+
 static bool node_in_page(jsthread *thread, struct dom_node *node)
 {
 	struct dom_node *doc = (struct dom_node *) thread_document(thread);
@@ -1692,9 +1739,7 @@ static bool node_in_page(jsthread *thread, struct dom_node *node)
 	}
 	cur = dom_node_ref(node);
 	while (cur != NULL && cur != doc && depth++ < 4096) {
-		if (dom_node_get_parent_node(cur, &up) != DOM_NO_ERR) {
-			up = NULL;
-		}
+		up = tree_up(cur);
 		dom_node_unref(cur);
 		cur = up;
 	}
@@ -1761,20 +1806,18 @@ static bool subtree_has_slot(struct dom_node *root)
 	return false;
 }
 
-/* Whether an element is a shadow host, which the prelude's attachShadow
-   marks: its children are then what its slots take. */
+/* Whether an element is a shadow host: its children are then what its
+   slots take. */
 static bool node_is_host(JSContext *ctx, struct dom_node *node)
 {
-	JSValue o = wrap_node(ctx, node), v;
-	bool host = false;
+	struct dom_node *root = shadow_root_of(node);
 
-	if (JS_IsObject(o)) {
-		v = JS_GetPropertyStr(ctx, o, "__shadow");
-		host = JS_ToBool(ctx, v) > 0;
-		JS_FreeValue(ctx, v);
+	(void)ctx;
+	if (root == NULL) {
+		return false;
 	}
-	JS_FreeValue(ctx, o);
-	return host;
+	dom_node_unref(root);
+	return true;
 }
 
 /*
@@ -2350,9 +2393,9 @@ static JSValue win_vita_connected(JSContext *ctx, JSValueConst this_val,
 			dom_node_unref(n);
 			return JS_TRUE;
 		}
-		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
-			up = NULL;
-		}
+		/* through a shadow root to its host: a shadow tree is
+		   connected when its host is */
+		up = tree_up(n);
 		dom_node_unref(n);
 		n = up;
 	}
@@ -7703,9 +7746,7 @@ static bool node_in_document(struct dom_node *node)
 		    type == DOM_DOCUMENT_NODE) {
 			break;
 		}
-		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR) {
-			p = NULL;
-		}
+		p = tree_up(n);
 		dom_node_unref(n);
 		n = p;
 	}
@@ -7909,8 +7950,16 @@ static bool slot_entry_holds(const struct slot_entry *e)
 	if (e->slot == NULL) {
 		return true;
 	}
-	return slot_dom_contains(e->host, e->slot) &&
-		!slot_dom_contains(e->node, e->slot);
+	/* the slot is still in the host's shadow tree */
+	{
+		struct dom_node *root = shadow_root_of(e->host);
+		bool in = root != NULL && slot_dom_contains(root, e->slot);
+
+		if (root != NULL) {
+			dom_node_unref(root);
+		}
+		return in;
+	}
 }
 
 /** Whether a node is a host's own child that a slot draws, or nothing. */
@@ -7982,20 +8031,52 @@ static bool composed_hook(struct html_content *c, enum vitasurf_composed_op op,
 		return true;
 	}
 	m = &thread->slots;
-	if (m->n == 0 || n == NULL || out == NULL) {
+	if (n == NULL || out == NULL) {
 		return false;
 	}
 	switch (op) {
 	case VITASURF_COMPOSED_PARENT:
-		i = slot_find_entry(m, n);
-		if (i >= 0 && m->e[i].slot != NULL &&
-		    slot_entry_holds(&m->e[i])) {
-			*out = dom_node_ref(m->e[i].slot);
-			return true;
+		if (m->n > 0) {
+			i = slot_find_entry(m, n);
+			if (i >= 0 && m->e[i].slot != NULL &&
+			    slot_entry_holds(&m->e[i])) {
+				*out = dom_node_ref(m->e[i].slot);
+				return true;
+			}
+		}
+		/* the top of a shadow tree is drawn in its host */
+		if (dom_node_get_parent_node(n, &d) == DOM_NO_ERR &&
+		    d != NULL) {
+			struct dom_node *host = shadow_host_of(d);
+
+			dom_node_unref(d);
+			if (host != NULL) {
+				*out = host;
+				return true;
+			}
 		}
 		return false;
 
-	case VITASURF_COMPOSED_FIRST_CHILD:
+	case VITASURF_COMPOSED_FIRST_CHILD: {
+		/* a host draws its shadow tree, and its own children only
+		   where a slot takes them */
+		struct dom_node *root = shadow_root_of(n);
+
+		if (root != NULL) {
+			if (dom_node_get_first_child(root, &d) !=
+			    DOM_NO_ERR) {
+				d = NULL;
+			}
+			dom_node_unref(root);
+			if (m->n > 0) {
+				slot_skip_moved(m, &d);
+			}
+			*out = d;
+			return true;
+		}
+		if (m->n == 0) {
+			return false;
+		}
 		i = slot_find_head(m, n);
 		if (i >= 0) {
 			i = slot_next_holding(m, m->h[i].first);
@@ -8011,8 +8092,12 @@ static bool composed_hook(struct html_content *c, enum vitasurf_composed_op op,
 		slot_skip_moved(m, &d);
 		*out = d;
 		return true;
+	}
 
 	case VITASURF_COMPOSED_NEXT_SIBLING:
+		if (m->n == 0) {
+			return false;
+		}
 		i = slot_find_entry(m, n);
 		if (i >= 0 && m->e[i].slot != NULL &&
 		    slot_entry_holds(&m->e[i])) {
@@ -10817,26 +10902,18 @@ static bool ce_candidate(struct dom_node *n)
 	return yes;
 }
 
-static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
-				      int argc, JSValueConst *argv)
+/*
+ * The candidates under root, in shadow-including tree order: an element's
+ * shadow tree comes after it and before its children (VitaSurf). A
+ * component's own elements are in its shadow tree, and they connect and
+ * disconnect with the page as the host does. depth bounds the shadow
+ * trees inside shadow trees it follows.
+ */
+static void ce_collect(JSContext *ctx, JSValue out, uint32_t *k,
+		       struct dom_node *root, unsigned depth)
 {
-	C_WHERE;
-	struct dom_node *root, *n = NULL;
-	JSValue out = JS_NewArray(ctx);
-	uint32_t k = 0;
+	struct dom_node *n = NULL;
 
-	(void)this_val;
-	if (argc < 1 || !JS_IsObject(argv[0])) {
-		return out;
-	}
-	root = JS_GetOpaque(argv[0], node_class_id);
-	if (root == NULL) {
-		return out;
-	}
-	if (argc > 1 && JS_ToBool(ctx, argv[1]) && node_is_element(root) &&
-	    ce_candidate(root)) {
-		JS_SetPropertyUint32(ctx, out, k++, wrap_node(ctx, root));
-	}
 	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
 		n = NULL;
 	}
@@ -10844,9 +10921,16 @@ static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
 		struct dom_node *next = NULL;
 
 		if (node_is_element(n)) {
+			struct dom_node *sr;
+
 			if (ce_candidate(n)) {
-				JS_SetPropertyUint32(ctx, out, k++,
+				JS_SetPropertyUint32(ctx, out, (*k)++,
 						     wrap_node(ctx, n));
+			}
+			sr = depth < 64 ? shadow_root_of(n) : NULL;
+			if (sr != NULL) {
+				ce_collect(ctx, out, k, sr, depth + 1);
+				dom_node_unref(sr);
 			}
 			dom_node_get_first_child(n, &next);
 		}
@@ -10877,6 +10961,35 @@ static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
 		dom_node_unref(n);
 		n = next;
 	}
+}
+
+static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *root, *sr;
+	JSValue out = JS_NewArray(ctx);
+	uint32_t k = 0;
+
+	(void)this_val;
+	if (argc < 1 || !JS_IsObject(argv[0])) {
+		return out;
+	}
+	root = JS_GetOpaque(argv[0], node_class_id);
+	if (root == NULL) {
+		return out;
+	}
+	if (argc > 1 && JS_ToBool(ctx, argv[1]) && node_is_element(root) &&
+	    ce_candidate(root)) {
+		JS_SetPropertyUint32(ctx, out, k++, wrap_node(ctx, root));
+	}
+	/* a host's own shadow tree first, as for one found inside */
+	sr = shadow_root_of(root);
+	if (sr != NULL) {
+		ce_collect(ctx, out, &k, sr, 1);
+		dom_node_unref(sr);
+	}
+	ce_collect(ctx, out, &k, root, 0);
 	return out;
 }
 
@@ -11575,6 +11688,16 @@ static const css_select_results *select_without_box(jsthread *thread,
 		}
 		chain[depth++] = n;
 		dom_node_get_parent_node(n, &up);
+		/* from the top of a shadow tree to its host, whose style
+		 * the tree inherits */
+		{
+			struct dom_node *host = shadow_host_of(up);
+
+			if (host != NULL) {
+				dom_node_unref(up);
+				up = host;
+			}
+		}
 		n = up;
 	}
 	if (depth == 0)
@@ -13082,6 +13205,99 @@ static JSValue win_vita_popover(JSContext *ctx, JSValueConst this_val,
 }
 
 /*
+ * Shadow roots (VitaSurf). A shadow root is a document fragment the host
+ * holds: its children are a tree of their own, which the page's
+ * document lookups do not enter, which is drawn in the host's place, and
+ * whose events go on to the host. The prelude checks what the
+ * specification asks of attachShadow before it calls this.
+ *
+ * __vitaAttachShadow(element, closed): the new root, or null when the
+ * element has one already.
+ */
+static JSValue win_vita_attach_shadow(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *node;
+	dom_document_fragment *root = NULL;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !node_is_element(node)) {
+		return JS_NULL;
+	}
+	if (dom_element_attach_shadow((struct dom_element *) node,
+				      argc > 1 && JS_ToBool(ctx, argv[1]) == 1,
+				      &root) != DOM_NO_ERR || root == NULL) {
+		return JS_NULL;
+	}
+	/* the host's children are no longer what is drawn in it */
+	mark_tree_dirty(ctx, "attachShadow", node, NULL, true);
+	vita_dom_gen++;
+	r = wrap_node(ctx, (struct dom_node *) root);
+	dom_node_unref(root);
+	return r;
+}
+
+/* __vitaShadowRoot(element): its shadow root, open or closed, or null */
+static JSValue win_vita_shadow_root(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *node, *root;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	root = shadow_root_of(node);
+	if (root == NULL) {
+		return JS_NULL;
+	}
+	r = wrap_node(ctx, root);
+	dom_node_unref(root);
+	return r;
+}
+
+/* __vitaShadowHost(fragment): the host of a shadow root, or null; with a
+   second argument true, whether its mode is "closed" instead */
+static JSValue win_vita_shadow_host(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *node, *host;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	host = shadow_host_of(node);
+	if (argc > 1 && JS_ToBool(ctx, argv[1]) == 1) {
+		bool closed = host != NULL && dom_document_fragment_is_closed(
+				(dom_document_fragment *) node);
+
+		if (host != NULL) {
+			dom_node_unref(host);
+		}
+		return JS_NewBool(ctx, closed);
+	}
+	if (host == NULL) {
+		return JS_NULL;
+	}
+	r = wrap_node(ctx, host);
+	dom_node_unref(host);
+	return r;
+}
+
+/*
  * __vitaElementFromPoint(x, y): the element at a point in the page, in
  * CSS pixels from the top left of the document.
  *
@@ -14077,7 +14293,7 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	dom_string *type_dom;
 	const char *type;
 	JSValue v;
-	bool bubbles, cancelable, success = false, prevented;
+	bool bubbles, cancelable, composed, success = false, prevented;
 	struct js_dispatch d;
 
 	(void)this_val;
@@ -14111,11 +14327,17 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	v = JS_GetPropertyStr(ctx, argv[1], "cancelable");
 	cancelable = JS_ToBool(ctx, v) == 1;
 	JS_FreeValue(ctx, v);
+	/* whether it leaves a shadow tree: a script's event only when it
+	   says so, as the browser's own say (VitaSurf) */
+	v = JS_GetPropertyStr(ctx, argv[1], "composed");
+	composed = JS_ToBool(ctx, v) == 1;
+	JS_FreeValue(ctx, v);
 	if (dom_event_create(&evt) != DOM_NO_ERR) {
 		dom_string_unref(type_dom);
 		return JS_TRUE;
 	}
 	dom_event_init(evt, type_dom, bubbles, cancelable);
+	dom_event_set_composed(evt, composed);
 	dom_string_unref(type_dom);
 
 	d.evt = evt;
@@ -14569,6 +14791,15 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaMisses",
 			  JS_NewCFunction(ctx, win_vita_misses,
 					  "__vitaMisses", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaAttachShadow",
+			  JS_NewCFunction(ctx, win_vita_attach_shadow,
+					  "__vitaAttachShadow", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaShadowRoot",
+			  JS_NewCFunction(ctx, win_vita_shadow_root,
+					  "__vitaShadowRoot", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaShadowHost",
+			  JS_NewCFunction(ctx, win_vita_shadow_host,
+					  "__vitaShadowHost", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaPopover",
 			  JS_NewCFunction(ctx, win_vita_popover,
 					  "__vitaPopover", 2));
