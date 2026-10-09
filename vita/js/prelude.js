@@ -4449,9 +4449,11 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
  */
 (function(){
  var NF=W.__vitaFrameGlobal,NP=W.__vitaParentGlobal,NT=W.__vitaTopGlobal,
-  NE=W.__vitaFrameElement,NX=W.__vitaEntryGlobal,NS=W.__vitaFrameStart;
+  NE=W.__vitaFrameElement,NX=W.__vitaEntryGlobal,NS=W.__vitaFrameStart,
+  NO=W.__vitaFrameOf;
  ['__vitaFrameGlobal','__vitaParentGlobal','__vitaTopGlobal',
-  '__vitaFrameElement','__vitaEntryGlobal','__vitaFrameStart'].forEach(
+  '__vitaFrameElement','__vitaEntryGlobal','__vitaFrameStart',
+  '__vitaFrameOf'].forEach(
   function(k){delete W[k];});
  function call(f,a){try{return f?f(a):null;}catch(e){return null;}}
  /* an iframe's page, its window made now if layout has not made it: a
@@ -4506,36 +4508,60 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   try{return new URL(h).origin;}catch(e){return 'null';}}
  var CROSS=new WeakMap();
  /* a raw global as this page may see it */
+ /* A frame of another origin is seen through one window for as long as
+    the frame lives, whatever page it shows, as a browser's WindowProxy
+    is (VitaSurf): keyed by its iframe element and reaching the page it
+    shows now. It was one per page, so the window a page took from the
+    frame when it was made, still blank, was not the source of the
+    messages its page later sent, and a page that matches the two --
+    the claude.ai challenge's widget does -- never heard its frame. */
+ var CROSS_EL=new WeakMap();
+ function frameView(el){
+  var r=CROSS_EL.get(el);
+  if(!r){r=crossWindow(function(){return call(NF,el);},el);CROSS_EL.set(el,r);}
+  return r;}
  function view(g){
   if(!g||g===W)return g?W:null;
   if(keyOf(g)===myKey())return g;
+  var el=call(NO,g);
+  if(el)return frameView(el);
   var r=CROSS.get(g);
-  if(!r){r=crossWindow(g);CROSS.set(g,r);}
+  if(!r){r=crossWindow(function(){return g;},null);CROSS.set(g,r);}
   return r;}
  function deny(k){
   throw new DOMException('Blocked a frame from accessing a cross-origin frame'+
    (typeof k==='string'?' (property "'+k+'")':'')+'.','SecurityError');}
- function crossWindow(g){
+ /* cur() is the page the window shows now, or null before its frame has
+    one; el its iframe, when it is one of this page's frames */
+ function crossWindow(cur,el){
+  function nav(v){
+   var g=cur();
+   if(g)g.location.href=String(v);
+   else if(el)el.setAttribute('src',String(v));}
   var self,loc=Object.create(null),fns={
-   postMessage:function postMessage(m,o,t){return g.postMessage(m,o,t);},
+   postMessage:function postMessage(m,o,t){
+    var g=cur();
+    /* before its page is there the frame's blank start has no one
+       listening, and the message goes nowhere */
+    if(g)return g.postMessage.apply(g,arguments);},
    close:function close(){},focus:function focus(){},blur:function blur(){}};
   Object.defineProperty(loc,'href',{get:function(){deny('href');},
-   set:function(v){g.location.href=String(v);}});
-  loc.replace=function(v){g.location.replace(String(v));};
+   set:function(v){nav(v);}});
+  loc.replace=function(v){var g=cur();if(g)g.location.replace(String(v));else nav(v);};
   self=new Proxy(Object.create(null),{
    get:function(t,k){
     if(Object.prototype.hasOwnProperty.call(fns,k))return fns[k];
     if(k==='closed')return false;
     if(k==='window'||k==='self'||k==='frames')return self;
     if(k==='top')return view(call(NT)||W);
-    if(k==='parent')return g===call(NP)?view(call(NT)||W):W;
+    if(k==='parent')return cur()===call(NP)?view(call(NT)||W):W;
     if(k==='opener')return null;
     if(k==='length')return 0;
     if(k==='location')return loc;
     if(k==='then'||typeof k==='symbol')return undefined;
     deny(k);},
    set:function(t,k,v){
-    if(k==='location'){g.location.href=String(v);return true;}
+    if(k==='location'){nav(v);return true;}
     deny(k);},
    has:function(t,k){return k in fns||k==='closed'||k==='location';},
    ownKeys:function(){return [];},
@@ -4678,6 +4704,10 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
   if(!this.isConnected)return null;
   var g=frameGlobal(this);
+  /* another origin's frame is the same window before its page comes as
+     after -- while the blank start made for script stands in, which is
+     of this origin -- and through every page it goes on to show */
+  if(!sameOrigin(this)||(g&&keyOf(g)!==myKey()))return frameView(this);
   return g?view(g):frameWindow(this);}});
  Object.defineProperty(P,'contentDocument',{configurable:true,get:function(){
   if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;

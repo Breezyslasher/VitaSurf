@@ -5597,6 +5597,49 @@ static JSValue win_vita_top_global(JSContext *ctx, JSValueConst this_val,
 	}
 }
 
+/*
+ * __vitaFrameOf(global): the iframe element in this page whose frame
+ * shows that global's page, or null (VitaSurf). A frame's window is one
+ * object for as long as the frame lives, whatever page it shows, as a
+ * browser's WindowProxy is; the prelude keys it by this element. It was
+ * keyed by the page's global, so the window a page kept from the frame's
+ * blank start was not the one its later messages came from.
+ */
+static JSValue win_vita_frame_of(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	jsthread *t;
+	void *want;
+
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1 || thread == NULL || !JS_IsObject(argv[0])) {
+		return JS_NULL;
+	}
+	want = JS_VALUE_GET_PTR(argv[0]);
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		JSValue g;
+		bool same;
+
+		if (t->closed || t->ctx == NULL || t->win == NULL) {
+			continue;
+		}
+		g = JS_GetGlobalObject(t->ctx);
+		same = JS_VALUE_GET_PTR(g) == want;
+		JS_FreeValue(ctx, g);
+		if (!same) {
+			continue;
+		}
+		if (t->win->parent == NULL || t->win->frame_node == NULL ||
+		    frame_parent_thread(t->win) != thread) {
+			return JS_NULL;
+		}
+		return wrap_node(ctx, t->win->frame_node);
+	}
+	return JS_NULL;
+}
+
 /* __vitaFrameElement(): this frame's iframe element, in the parent page */
 static JSValue win_vita_frame_element(JSContext *ctx, JSValueConst this_val,
 				      int argc, JSValueConst *argv)
@@ -15524,6 +15567,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaTopGlobal",
 			  JS_NewCFunction(ctx, win_vita_top_global,
 					  "__vitaTopGlobal", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaFrameOf",
+			  JS_NewCFunction(ctx, win_vita_frame_of,
+					  "__vitaFrameOf", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaFrameElement",
 			  JS_NewCFunction(ctx, win_vita_frame_element,
 					  "__vitaFrameElement", 0));
