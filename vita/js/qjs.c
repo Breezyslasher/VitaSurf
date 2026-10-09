@@ -12412,6 +12412,83 @@ static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+/* What marks a popover shown: libdom user data under this key, which
+   nscss's :popover-open reads (VitaSurf). */
+static int popover_mark;
+
+static dom_string *popover_key(void)
+{
+	static dom_string *key;
+
+	if (key == NULL &&
+	    dom_string_create_interned((const uint8_t *)"__ns_key_popover_open",
+				       21, &key) != DOM_NO_ERR) {
+		key = NULL;
+	}
+	return key;
+}
+
+/*
+ * __vitaPopover(el, open): show or hide a popover (VitaSurf), and with
+ * el alone, answer whether it is shown. The state
+ * is the element's own, as a browser keeps it, and not an attribute the
+ * page could read or watch: :popover-open in the style sheets matches
+ * it, and the UA sheet's [popover]:not(:popover-open) hides a popover
+ * that is not shown. The popover attribute is noted as changed, with the
+ * value it has, so the rules naming :popover-open are matched again in
+ * place rather than the tree being built again.
+ */
+static JSValue win_vita_popover(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	dom_string *key = popover_key();
+	void *prev = NULL;
+	bool open;
+
+	(void)this_val;
+	if (argc < 1 || key == NULL) {
+		return JS_FALSE;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !node_is_element(node)) {
+		return JS_FALSE;
+	}
+	if (argc < 2) {
+		if (dom_node_get_user_data(node, key, &prev) != DOM_NO_ERR) {
+			prev = NULL;
+		}
+		return JS_NewBool(ctx, prev != NULL);
+	}
+	open = JS_ToBool(ctx, argv[1]);
+	if (dom_node_set_user_data(node, key, open ? &popover_mark : NULL,
+				   NULL, &prev) != DOM_NO_ERR ||
+	    (prev != NULL) == open) {
+		return JS_UNDEFINED;
+	}
+	vita_dom_gen++;
+	if (thread != NULL) {
+		dom_string *attr = NULL, *value = NULL;
+
+		if (dom_string_create_interned((const uint8_t *)"popover", 7,
+					       &attr) == DOM_NO_ERR) {
+			if (dom_element_get_attribute(node, attr, &value) !=
+			    DOM_NO_ERR) {
+				value = NULL;
+			}
+			thread->dom_dirty = true;
+			attr_journal_add(thread, node, attr, value, false);
+			if (value != NULL) {
+				dom_string_unref(value);
+			}
+			dom_string_unref(attr);
+		}
+	}
+	return JS_UNDEFINED;
+}
+
 /*
  * __vitaElementFromPoint(x, y): the element at a point in the page, in
  * CSS pixels from the top left of the document.
@@ -13894,6 +13971,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaSetFocus",
 			  JS_NewCFunction(ctx, win_vita_set_focus,
 					  "__vitaSetFocus", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaPopover",
+			  JS_NewCFunction(ctx, win_vita_popover,
+					  "__vitaPopover", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaCanvasPath",

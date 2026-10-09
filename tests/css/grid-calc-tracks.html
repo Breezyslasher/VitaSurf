@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<!-- Math functions as grid track sizes (VitaSurf). GitHub's profile lays
+     out as grid-template-columns: auto 0 minmax(0, calc(100% -
+     var(--Layout-sidebar-width) - var(--Layout-gutter))); the whole
+     declaration was dropped, and the main column came out 1020px wide in
+     a 938px window. Each track's calc() is kept as an expression and
+     resolved against the grid at layout, so em, vw, min(), max() and
+     clamp() work in it too. Expected lines are what Chrome prints:
+       XX a 272-890 | b 272-890 | c 272-890
+       XX m 272-890 m2 272-890
+       XX e 0-160 | f 176-474 | g 490-890 -->
+<html><head><title>grid calc tracks</title><style>
+body { margin: 0; width: 890px; font: 16px sans-serif }
+.g { display: grid; gap: 16px; margin-bottom: 4px }
+.g > div { height: 8px; background: #999 }
+#a { grid-template-columns: auto minmax(0, 618px) }
+#b { grid-template-columns: auto calc(100% - 272px) }
+#c { grid-template-columns: auto minmax(0, calc(100% - 272px)) }
+.s { width: 256px }
+.L { --sw: 256px; --g: 16px; display: grid; grid-auto-flow: column;
+     grid-template-columns: auto 0 minmax(0, calc(100% - var(--sw) - var(--g)));
+     grid-gap: var(--g) }
+.L .s { grid-column: 1; height: 20px; background: #ccc }
+.m { grid-column: 2 / span 2 }
+.wide { overflow: auto }
+.wide div { width: 1000px; height: 10px; background: #393 }
+.L2 { display: grid; grid-template-columns: auto minmax(0, calc(100% - 272px)); gap: 16px }
+#h { display: grid; gap: 16px;
+     grid-template-columns: calc(10em) minmax(max(100px, 10%), 1fr) fit-content(clamp(100px, 50%, 2000px)) }
+#h > div { height: 8px; background: #66c }
+</style></head><body>
+<div class="g" id="a"><div class="s"></div><div></div></div>
+<div class="g" id="b"><div class="s"></div><div></div></div>
+<div class="g" id="c"><div class="s"></div><div></div></div>
+<div class="L"><div class="s"></div><div class="m" id="m"><div class="wide"><div></div></div></div></div>
+<div class="L2"><div class="s"></div><div id="m2"><div class="wide"><div></div></div></div></div>
+<div id="h"><div id="e"></div><div id="f"></div><div id="g"><div style="width:400px"></div></div></div>
+<script>
+function W(id, child) {
+  var e = document.getElementById(id);
+  var r = (child ? e.children[1] : e).getBoundingClientRect();
+  return Math.round(r.left) + '-' + Math.round(r.right);
+}
+setTimeout(function () {
+  console.log('XX ' + ['a', 'b', 'c'].map(function (id) {
+    return id + ' ' + W(id, true); }).join(' | '));
+  console.log('XX m ' + W('m') + ' m2 ' + W('m2'));
+  console.log('XX ' + ['e', 'f', 'g'].map(function (id) {
+    return id + ' ' + W(id); }).join(' | '));
+}, 50);
+</script></body></html>

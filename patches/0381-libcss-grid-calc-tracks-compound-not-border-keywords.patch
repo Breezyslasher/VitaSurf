@@ -1,0 +1,6068 @@
+diff --git a/include/libcss/computed.h b/include/libcss/computed.h
+index 99c447e..b8afec4 100644
+--- a/include/libcss/computed.h
++++ b/include/libcss/computed.h
+@@ -109,6 +109,11 @@ typedef struct css_computed_grid_track {
+ 	css_unit max_unit;
+ 	css_fixed min_value;
+ 	css_fixed max_value;
++	/* a LENGTH or FIT_CONTENT breadth whose unit is CSS_UNIT_CALC is a
++	 * calc() expression (VitaSurf), which css_computed_calc_px()
++	 * resolves against the grid's size in the axis */
++	lwc_string *min_calc;
++	lwc_string *max_calc;
+ 	/* the names of the line before this track -- after the last one,
+ 	 * in the terminator -- as css_grid_line_name() ids, 0 for none
+ 	 * (VitaSurf) */
+@@ -658,6 +663,25 @@ uint8_t css_computed_max_width(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);
+ 
++/**
++ * Resolve a calc() expression a computed value holds outside a property's
++ * own value (VitaSurf), as a grid track's, to device pixels.
++ *
++ * \param[in]  style         The computed style the expression came from.
++ * \param[in]  unit_ctx      Unit conversion context.
++ * \param[in]  available_px  What a percentage is of, or -1 if unknown.
++ * \param[in]  calc          The expression.
++ * \param[out] px_out        Returns the length in pixels on success.
++ * \return false if the expression did not resolve, as one with a
++ *         percentage does when available_px is -1.
++ */
++bool css_computed_calc_px(
++		const css_computed_style *style,
++		const css_unit_ctx *unit_ctx,
++		int available_px,
++		lwc_string *calc,
++		int *px_out);
++
+ /**
+  * Get the width property value in device pixels.
+  *
+diff --git a/src/bytecode/opcodes.h b/src/bytecode/opcodes.h
+index ba9fa20..3815822 100644
+--- a/src/bytecode/opcodes.h
++++ b/src/bytecode/opcodes.h
+@@ -116,6 +116,12 @@ enum op_grid_track {
+ 	GRID_TRACK_MIN_CONTENT		= 0x0004,
+ 	GRID_TRACK_MAX_CONTENT		= 0x0005,
+ 	GRID_TRACK_FIT_CONTENT		= 0x0006,
++	/* calc() of a percentage and a length: percentage, length, units
++	 * (VitaSurf) */
++	/* a math function: the data word is the expression's string
++	 * (VitaSurf); as a length, or as fit-content()'s limit */
++	GRID_TRACK_CALC			= 0x0007,
++	GRID_TRACK_FIT_CONTENT_CALC	= 0x0008,
+ 	/* not a track: the next data word names the line before the
+ 	 * next track, or after the last (VitaSurf) */
+ 	GRID_TRACK_LINE_NAME		= 0x00fe,
+@@ -140,6 +146,9 @@ static inline uint32_t css__grid_breadth_data_words(uint32_t type)
+ 		return 2; /* length + units */
+ 	case GRID_TRACK_FR:
+ 		return 1; /* number */
++	case GRID_TRACK_CALC:
++	case GRID_TRACK_FIT_CONTENT_CALC:
++		return 1; /* expression */
+ 	case GRID_TRACK_LINE_NAME:
+ 		return 1; /* name id */
+ 	default:
+diff --git a/src/parse/nesting.c b/src/parse/nesting.c
+index 4035725..7dfc054 100644
+--- a/src/parse/nesting.c
++++ b/src/parse/nesting.c
+@@ -782,6 +782,44 @@ static bool sel_has_combinator(const char *s, size_t n)
+ 	return false;
+ }
+ 
++/**
++ * Whether a compound holds more than one simple selector, as dialog[open]
++ * or .a.b do: libcss's own :not() takes one, so such a compound goes the
++ * way of a complex selector (VitaSurf).
++ */
++static bool sel_is_compound(const char *s, size_t n)
++{
++	size_t i;
++	int depth = 0, parts = 0;
++
++	for (i = 0; i < n; i++) {
++		char c = s[i];
++
++		if (c == '\\') {
++			if (i == 0)
++				parts++;
++			i++;
++			continue;
++		}
++		if (depth == 0 && (c == '.' || c == '#' || c == '[' ||
++				(c == ':' && (i == 0 || s[i - 1] != ':')) ||
++				(i == 0 && c != ':')))
++			parts++;
++		if (c == '(' || c == '[')
++			depth++;
++		else if (c == ')' || c == ']')
++			depth--;
++		else if (c == '"' || c == '\'') {
++			char q = c;
++
++			for (i++; i < n && s[i] != q; i++)
++				if (s[i] == '\\')
++					i++;
++		}
++	}
++	return parts > 1;
++}
++
+ /** Split a list at its top-level commas; items are trimmed. */
+ static int sel_split(const char *s, size_t n, const char **it, size_t *il,
+ 		     int max)
+@@ -931,7 +969,8 @@ static void sel_rewrite_prelude(struct sbuf *b, const char *s, size_t n)
+ 				bool complex = false;
+ 
+ 				for (j = 0; j < k && ok; j++) {
+-					if (sel_has_combinator(it[j], il[j]))
++					if (sel_has_combinator(it[j], il[j]) ||
++					    sel_is_compound(it[j], il[j]))
+ 						complex = true;
+ 					/* a nested :is() list in an item
+ 					 * is left as it is */
+@@ -949,11 +988,13 @@ static void sel_rewrite_prelude(struct sbuf *b, const char *s, size_t n)
+ 			}
+ 			if (ok && total > 0) {
+ 				/* each item its own :not(), and one with a
+-				 * combinator in it :-vita-not(), which
+-				 * takes a complex selector (VitaSurf) */
++				 * combinator in it, or more than one simple
++				 * selector, :-vita-not(), which takes a
++				 * complex selector (VitaSurf) */
+ 				for (j = 0; j < k; j++) {
+ 					bool cx = sel_has_combinator(it[j],
+-							il[j]);
++							il[j]) ||
++						sel_is_compound(it[j], il[j]);
+ 
+ 					if (cx)
+ 						sb_put(b, ":-vita-not(", 11);
+diff --git a/src/parse/properties/grid.c b/src/parse/properties/grid.c
+index 250f6e7..96e70b4 100644
+--- a/src/parse/properties/grid.c
++++ b/src/parse/properties/grid.c
+@@ -29,7 +29,7 @@
+  * Track lists are expanded at parse time: repeat(<n>, ...) is unrolled,
+  * repeat(auto-fill | auto-fit, ...) is emitted once with a flag on each
+  * of its tracks.  Bracketed line names are skipped.  The expanded list
+- * is capped at GRID_MAX_TRACKS entries.
++ * is capped at GRID_MAX_ENTRIES entries, line names included.
+  */
+ 
+ #include <assert.h>
+@@ -44,6 +44,9 @@
+ #include "parse/properties/utils.h"
+ 
+ #define GRID_MAX_TRACKS 128
++/* entries in a parsed list: tracks and the line names between them,
++ * so that [a] repeat(64, 1px 2px) [b] fits as browsers take it */
++#define GRID_MAX_ENTRIES (2 * GRID_MAX_TRACKS)
+ 
+ /**
+  * A track size as parsed, before it is written out as bytecode
+@@ -59,6 +62,21 @@ struct grid_track_parse {
+ 	uint32_t max_unit;	/* bytecode unit (UNIT_*) */
+ };
+ 
++/**
++ * The tracks among n parsed entries, leaving out the line names
++ */
++static uint32_t grid_count_tracks(const struct grid_track_parse *tracks,
++		uint32_t n)
++{
++	uint32_t i, count = 0;
++
++	for (i = 0; i < n; i++) {
++		if (tracks[i].min_type != GRID_TRACK_LINE_NAME)
++			count++;
++	}
++	return count;
++}
++
+ static bool token_is_ident(css_language *c, const css_token *token,
+ 		int str)
+ {
+@@ -312,6 +330,32 @@ static bool token_to_integer_or_calc(const parserutils_vector *vector,
+ 	return token_to_integer(token, value);
+ }
+ 
++/**
++ * Parse a math function's arguments as a track breadth's expression.
++ * The function token is at ctx. \a value receives the expression's
++ * string index.
++ */
++static css_error parse_track_calc(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		css_fixed *value)
++{
++	uint32_t expr_index = 0;
++	css_error error;
++
++	/* the function's token: the expression parser looks back at it */
++	parserutils_vector_iterate(vector, ctx);
++
++	/* every grid track property takes the same units */
++	error = css__parse_calc_expr(c, vector, ctx,
++			CSS_PROP_GRID_TEMPLATE_COLUMNS, &expr_index);
++	if (error != CSS_OK)
++		return error;
++
++	*value = (css_fixed) expr_index;
++
++	return CSS_OK;
++}
++
+ /**
+  * Parse a <track-breadth>:
+  *   <length-percentage> | <flex> | auto | min-content | max-content |
+@@ -358,25 +402,54 @@ static css_error parse_track_breadth(css_language *c,
+ 
+ 	if (token_is_function(c, token, FIT_CONTENT)) {
+ 		parserutils_vector_iterate(vector, ctx);
++		consumeWhitespace(vector, ctx);
+ 
+-		error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX,
+-				value, unit);
+-		if (error != CSS_OK) {
+-			*ctx = orig_ctx;
+-			return CSS_INVALID;
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token != NULL && token->type == CSS_TOKEN_FUNCTION &&
++				css__is_math_function(token->idata)) {
++			/* fit-content(calc(...)) (VitaSurf) */
++			if (parse_track_calc(c, vector, ctx, value) !=
++					CSS_OK) {
++				*ctx = orig_ctx;
++				return CSS_INVALID;
++			}
++			*type = GRID_TRACK_FIT_CONTENT_CALC;
++		} else {
++			error = css__parse_unit_specifier(c, vector, ctx,
++					UNIT_PX, value, unit);
++			if (error != CSS_OK) {
++				*ctx = orig_ctx;
++				return CSS_INVALID;
++			}
++
++			if ((*unit & (UNIT_LENGTH | UNIT_PCT)) == 0 ||
++					*value < 0) {
++				*ctx = orig_ctx;
++				return CSS_INVALID;
++			}
++
++			*type = GRID_TRACK_FIT_CONTENT;
+ 		}
+ 
+-		if ((*unit & (UNIT_LENGTH | UNIT_PCT)) == 0 || *value < 0) {
++		if (expect_char(vector, ctx, ')') != CSS_OK) {
+ 			*ctx = orig_ctx;
+ 			return CSS_INVALID;
+ 		}
+ 
+-		if (expect_char(vector, ctx, ')') != CSS_OK) {
++		return CSS_OK;
++	}
++
++	if (token->type == CSS_TOKEN_FUNCTION &&
++			css__is_math_function(token->idata)) {
++		/* calc(), min(), max(), clamp() and the rest: kept as an
++		 * expression and resolved against the grid at layout, as
++		 * GitHub's calc(100% - var(--Layout-sidebar-width) -
++		 * var(--Layout-gutter)) (VitaSurf) */
++		if (parse_track_calc(c, vector, ctx, value) != CSS_OK) {
+ 			*ctx = orig_ctx;
+ 			return CSS_INVALID;
+ 		}
+-
+-		*type = GRID_TRACK_FIT_CONTENT;
++		*type = GRID_TRACK_CALC;
+ 
+ 		return CSS_OK;
+ 	}
+@@ -567,7 +640,7 @@ static css_error parse_line_names(const parserutils_vector *vector,
+ 			continue;
+ 		if (token->type != CSS_TOKEN_IDENT)
+ 			break;
+-		if (*n_tracks < GRID_MAX_TRACKS) {
++		if (*n_tracks < GRID_MAX_ENTRIES) {
+ 			struct grid_track_parse *t = &tracks[(*n_tracks)++];
+ 
+ 			memset(t, 0, sizeof(*t));
+@@ -658,7 +731,10 @@ static css_error parse_repeat(css_language *c,
+ 
+ 		if ((uint32_t) count > GRID_MAX_TRACKS ||
+ 				start + group * (uint32_t) count >
+-				GRID_MAX_TRACKS) {
++				GRID_MAX_ENTRIES ||
++				grid_count_tracks(tracks, start) +
++				grid_count_tracks(tracks + start, group) *
++				(uint32_t) count > GRID_MAX_TRACKS) {
+ 			*ctx = orig_ctx;
+ 			return CSS_INVALID;
+ 		}
+@@ -751,7 +827,9 @@ static css_error parse_track_list(css_language *c,
+ 				return error;
+ 			}
+ 
+-			if (*n_tracks >= GRID_MAX_TRACKS) {
++			if (*n_tracks >= GRID_MAX_ENTRIES ||
++					grid_count_tracks(tracks, *n_tracks) >=
++					GRID_MAX_TRACKS) {
+ 				*ctx = orig_ctx;
+ 				return CSS_INVALID;
+ 			}
+@@ -790,6 +868,9 @@ static css_error append_breadth(css_style *result, uint8_t type,
+ 			return error;
+ 		error = css__stylesheet_style_append(result, unit);
+ 		break;
++	case GRID_TRACK_CALC:
++	case GRID_TRACK_FIT_CONTENT_CALC:
++		/* the expression's string index */
+ 	case GRID_TRACK_FR:
+ 		error = css__stylesheet_style_append(result, value);
+ 		break;
+@@ -861,7 +942,7 @@ static css_error parse_grid_template_value(css_language *c,
+ 	int32_t orig_ctx = *ctx;
+ 	const css_token *token;
+ 	css_error error;
+-	struct grid_track_parse tracks[GRID_MAX_TRACKS];
++	struct grid_track_parse tracks[GRID_MAX_ENTRIES];
+ 	uint32_t n_tracks = 0;
+ 	bool seen_auto_repeat = false;
+ 
+@@ -1905,7 +1986,7 @@ static css_error parse_grid_template_areas_form(css_language *c,
+ 		css_style *result)
+ {
+ 	int32_t orig_ctx = *ctx;
+-	struct grid_track_parse rows[GRID_MAX_TRACKS];
++	struct grid_track_parse rows[GRID_MAX_ENTRIES];
+ 	uint32_t n_rows = 0, n_strings = 0;
+ 	char buf[GRID_AREAS_MAX];
+ 	size_t len = 0;
+@@ -1931,7 +2012,7 @@ static css_error parse_grid_template_areas_form(css_language *c,
+ 			goto invalid;
+ 		n_strings++;
+ 
+-		if (n_rows >= GRID_MAX_TRACKS)
++		if (n_rows >= GRID_MAX_ENTRIES)
+ 			goto invalid;
+ 		consumeWhitespace(vector, ctx);
+ 		token = parserutils_vector_peek(vector, *ctx);
+diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
+index 9de8ad9..c990ada 100644
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -3555,21 +3555,17 @@ css__parse_calc_sum(css_language *c,
+ }
+ 
+ /* Documented in utils.h */
+-css_error css__parse_calc(css_language *c,
+-		const parserutils_vector *vector, int *ctx,
+-		css_style *result,
+-		css_code_t OPV,
+-		uint32_t unit)
++/* exported interface documented in parse/properties/utils.h */
++css_error css__parse_calc_expr(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		enum css_properties_e property, uint32_t *expr_index)
+ {
+-	int orig_ctx = *ctx;
++	int32_t orig_ctx = *ctx;
+ 	const css_token *token;
+ 	css_error error = CSS_OK;
+-	css_style *calc_style = NULL;
+ 	parserutils_buffer *calc_buffer = NULL;
+ 	lwc_string *calc_expr = NULL;
+-	uint32_t expr_index = 0;
+ 	css_code_t finish = CALC_FINISH;
+-	enum css_properties_e property = getOpcode(OPV);
+ 
+ 	consumeWhitespace(vector, ctx);
+ 
+@@ -3585,18 +3581,6 @@ css_error css__parse_calc(css_language *c,
+ 		return CSS_NOMEM;
+ 	}
+ 
+-	error = css__stylesheet_style_create(c->sheet, &calc_style);
+-	if (error != CSS_OK)
+-		goto cleanup;
+-
+-	error = css__stylesheet_style_append(calc_style, OPV);
+-	if (error != CSS_OK)
+-		goto cleanup;
+-
+-	error = css__stylesheet_style_append(calc_style, (css_code_t) unit);
+-	if (error != CSS_OK)
+-		goto cleanup;
+-
+ 	/*
+ 	 * The function's own token was consumed by the caller, so it is
+ 	 * the one just behind us; which one it was decides how the
+@@ -3646,19 +3630,8 @@ css_error css__parse_calc(css_language *c,
+ 		goto cleanup;
+ 
+ 	/* This always takes ownership of calc_expr, so we should not use after this */
+-	error = css__stylesheet_string_add(calc_style->sheet, calc_expr, &expr_index);
+-	if (error != CSS_OK)
+-		goto cleanup;
+-
+-	error = css__stylesheet_style_append(calc_style,
+-			(css_code_t) expr_index);
+-	if (error != CSS_OK) {
+-		goto cleanup;
+-	}
+-
+-	error = css__stylesheet_merge_style(result, calc_style);
++	error = css__stylesheet_string_add(c->sheet, calc_expr, expr_index);
+ cleanup:
+-	css__stylesheet_style_destroy(calc_style);
+ 	parserutils_buffer_destroy(calc_buffer);
+ 	/* We do not need to clean up calc_expr, it will never leak */
+ 	if (error != CSS_OK) {
+@@ -3668,6 +3641,31 @@ cleanup:
+ 	return error;
+ }
+ 
++css_error css__parse_calc(css_language *c,
++		const parserutils_vector *vector, int *ctx,
++		css_style *result,
++		css_code_t OPV,
++		uint32_t unit)
++{
++	uint32_t expr_index = 0;
++	css_error error;
++
++	error = css__parse_calc_expr(c, vector, ctx, getOpcode(OPV),
++			&expr_index);
++	if (error != CSS_OK)
++		return error;
++
++	error = css__stylesheet_style_append(result, OPV);
++	if (error == CSS_OK)
++		error = css__stylesheet_style_append(result,
++				(css_code_t) unit);
++	if (error == CSS_OK)
++		error = css__stylesheet_style_append(result,
++				(css_code_t) expr_index);
++
++	return error;
++}
++
+ /*
+  * A calc() reduced to one length at parse time (VitaSurf), for the
+  * properties that hold a length and a unit and not an expression: a
+@@ -3882,3 +3880,4 @@ css_error css__parse_calc_reduced(css_language *c,
+ 	*unit = t.unit;
+ 	return CSS_OK;
+ }
++
+diff --git a/src/parse/properties/utils.h b/src/parse/properties/utils.h
+index bac98b6..72f05f2 100644
+--- a/src/parse/properties/utils.h
++++ b/src/parse/properties/utils.h
+@@ -260,6 +260,19 @@ css_error css__parse_calc(css_language *c,
+ 		css_style *result,
+ 		css_code_t OPV,
+ 		uint32_t unit);
++/**
++ * Parse the arguments of a math function -- calc(), min(), max(), clamp()
++ * and the rest -- into an expression the calculator resolves at layout
++ * (VitaSurf), for a property that keeps the expression somewhere other
++ * than its opcode's value, as a grid track list does. The function's
++ * token has been consumed. \a property's units are the ones allowed.
++ * On success \a *expr_index is the expression's index in the sheet's
++ * strings; on failure ctx is left unchanged.
++ */
++css_error css__parse_calc_expr(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx,
++		enum css_properties_e property, uint32_t *expr_index);
++
+ /**
+  * Parse a calc() and reduce it to one length (VitaSurf), for a property
+  * that holds a length and not an expression. ctx is at the function.
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index beb74e2..ab6c200 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -1215,5 +1215,9 @@ void css__propstrings_unref(void)
+ 
+ 		for (i = 0; i < LAST_KNOWN; i++)
+ 			lwc_string_unref(css__propstrings.strings[i]);
++
++		/* the last sheet has gone, and the grid line names with
++		 * it (VitaSurf) */
++		css__grid_names_release();
+ 	}
+ }
+diff --git a/src/select/arena.c b/src/select/arena.c
+index 693b6f0..01eb9b1 100644
+--- a/src/select/arena.c
++++ b/src/select/arena.c
+@@ -131,14 +131,20 @@ static inline bool arena__compare_grid_tracks(
+ 				a->min_unit != b->min_unit ||
+ 				a->max_unit != b->max_unit ||
+ 				a->min_value != b->min_value ||
+-				a->max_value != b->max_value) {
++				a->max_value != b->max_value ||
++				a->min_calc != b->min_calc ||
++				a->max_calc != b->max_calc ||
++				a->line_name != b->line_name ||
++				a->line_name2 != b->line_name2) {
+ 			return false;
+ 		}
+ 		a++;
+ 		b++;
+ 	}
+ 
+-	return a->min_type == b->min_type;
++	return a->min_type == b->min_type &&
++			a->line_name == b->line_name &&
++			a->line_name2 == b->line_name2;
+ }
+ 
+ static inline bool css__arena_style_is_equal(
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 8c9da43..5047ca2 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -615,7 +615,7 @@ uint8_t css_computed_outline_width(const css_computed_style *style,
+ 	/* This property is in the uncommon block, so we need to handle
+ 	 * absolute value calculation for initial value (medium) here. */
+ 	if (get_outline_width_fixed(style, length, unit) == CSS_BORDER_WIDTH_MEDIUM) {
+-		*length = INTTOFIX(2);
++		*length = INTTOFIX(3);
+ 		*unit = CSS_UNIT_PX;
+ 	}
+ 
+@@ -1648,6 +1648,22 @@ static bool css__length_to_px(
+ 	return true;
+ }
+ 
++/* exported function documented in public libcss/computed.h */
++bool css_computed_calc_px(
++		const css_computed_style *style,
++		const css_unit_ctx *unit_ctx,
++		int available_px,
++		lwc_string *calc,
++		int *px_out)
++{
++	css_fixed_or_calc value;
++
++	value.calc = calc;
++
++	return css__length_to_px(style, unit_ctx, available_px, value,
++			CSS_UNIT_CALC, px_out);
++}
++
+ /* The px accessors below are the only way to read a property whose computed
+  * value may be a calc() expression: resolving one needs both the client unit
+  * context and the containing block size, neither of which the plain accessors
+@@ -2153,7 +2169,7 @@ uint8_t css_computed_column_rule_width(const css_computed_style *style,
+ 	 * absolute value calculation for initial value (medium) here. */
+ 	if (get_column_rule_width_fixed(style, length, unit) ==
+ 			CSS_BORDER_WIDTH_MEDIUM) {
+-		*length = INTTOFIX(2);
++		*length = INTTOFIX(3);
+ 		*unit = CSS_UNIT_PX;
+ 	}
+ 
+@@ -2886,16 +2902,18 @@ css_error compute_absolute_border_side_width(css_computed_style *style,
+ 	css_unit unit;
+ 
+ 	switch (get(style, &length, &unit)) {
++	/* 1px, 3px and 5px, as CSS Backgrounds defines the keywords and
++	 * browsers draw them; these were 1, 2 and 4 (VitaSurf) */
+ 	case CSS_BORDER_WIDTH_THIN:
+ 		length.value = INTTOFIX(1);
+ 		unit = CSS_UNIT_PX;
+ 		break;
+ 	case CSS_BORDER_WIDTH_MEDIUM:
+-		length.value = INTTOFIX(2);
++		length.value = INTTOFIX(3);
+ 		unit = CSS_UNIT_PX;
+ 		break;
+ 	case CSS_BORDER_WIDTH_THICK:
+-		length.value = INTTOFIX(4);
++		length.value = INTTOFIX(5);
+ 		unit = CSS_UNIT_PX;
+ 		break;
+ 	case CSS_BORDER_WIDTH_WIDTH:
+diff --git a/src/select/properties/helpers.c b/src/select/properties/helpers.c
+index fd06c28..a27acd0 100644
+--- a/src/select/properties/helpers.c
++++ b/src/select/properties/helpers.c
+@@ -612,13 +612,28 @@ css_error css__cascade_counter_increment_reset(uint32_t opv, css_style *style,
+ /**
+  * Read the data words for one grid track breadth
+  */
+-static void css__read_grid_breadth(css_style *style, uint8_t type,
+-		css_fixed *value, css_unit *unit)
++static void css__read_grid_breadth(css_style *style, uint8_t *type,
++		css_fixed *value, css_unit *unit, lwc_string **calc)
+ {
+ 	*value = 0;
+ 	*unit = CSS_UNIT_PX;
+-
+-	switch (type) {
++	*calc = NULL;
++
++	switch (*type) {
++	case GRID_TRACK_CALC:
++	case GRID_TRACK_FIT_CONTENT_CALC:
++	{
++		/* a math function: a length, or fit-content()'s limit,
++		 * resolved at layout (VitaSurf) */
++		uint32_t snum = *((uint32_t *) style->bytecode);
++
++		advance_bytecode(style, sizeof(snum));
++		css__stylesheet_string_get(style->sheet, snum, calc);
++		*unit = CSS_UNIT_CALC;
++		*type = (*type == GRID_TRACK_CALC) ? CSS_GRID_TRACK_LENGTH :
++				CSS_GRID_TRACK_FIT_CONTENT;
++		break;
++	}
+ 	case GRID_TRACK_LENGTH:
+ 	case GRID_TRACK_FIT_CONTENT:
+ 		*value = *((css_fixed *) style->bytecode);
+@@ -720,17 +735,21 @@ css_error css__cascade_grid_tracks(uint32_t opv, css_style *style,
+ 				t->flags = (head >> GRID_TRACK_FLAGS_SHIFT) &
+ 						0xff;
+ 
+-				css__read_grid_breadth(style, t->min_type,
+-						&t->min_value, &t->min_unit);
++				css__read_grid_breadth(style, &t->min_type,
++						&t->min_value, &t->min_unit,
++						&t->min_calc);
+ 
+ 				if (head & GRID_TRACK_MINMAX) {
+ 					css__read_grid_breadth(style,
+-							t->max_type,
++							&t->max_type,
+ 							&t->max_value,
+-							&t->max_unit);
++							&t->max_unit,
++							&t->max_calc);
+ 				} else {
+ 					t->max_value = t->min_value;
+ 					t->max_unit = t->min_unit;
++					t->max_type = t->min_type;
++					t->max_calc = t->min_calc;
+ 				}
+ 
+ 				n_tracks++;
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index 276a15f..3eae477 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -1094,6 +1094,17 @@ uint32_t css__grid_name_id(const char *name, size_t len)
+ 	return n_grid_names;
+ }
+ 
++void css__grid_names_release(void)
++{
++	uint32_t i;
++
++	for (i = 0; i < n_grid_names; i++)
++		lwc_string_unref(grid_names[i]);
++	free(grid_names);
++	grid_names = NULL;
++	n_grid_names = 0;
++}
++
+ lwc_string *css_grid_line_name(uint32_t id)
+ {
+ 	return (id >= 1 && id <= n_grid_names) ? grid_names[id - 1] : NULL;
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 914d6d2..2400c4f 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -484,6 +484,8 @@ uint16_t css__stylesheet_layer_id(css_stylesheet *sheet, const char *name,
+ 		size_t len);
+ 
+ uint32_t css__grid_name_id(const char *name, size_t len);
++/** Forget the grid line names, once no sheet is left to use them. */
++void css__grid_names_release(void);
+ css_error css__stylesheet_rule_destroy(css_stylesheet *sheet, css_rule *rule);
+ 
+ css_error css__stylesheet_rule_add_selector(css_stylesheet *sheet,
+diff --git a/test/data/parse2/grid.dat b/test/data/parse2/grid.dat
+index 1784409..92331d9 100644
+--- a/test/data/parse2/grid.dat
++++ b/test/data/parse2/grid.dat
+@@ -204,8 +204,8 @@
+ | *
+ |  grid-column-start: span 2
+ |  grid-column-end: -2
+-|  grid-row-start: auto
+-|  grid-row-end: 4
++|  grid-row-start: named
++|  grid-row-end: name
+ #reset
+ 
+ #data
+@@ -394,7 +394,7 @@
+ |  grid-row-start: 2
+ |  grid-column-start: span 3
+ |  grid-row-end: -1
+-|  grid-column-end: auto
++|  grid-column-end: foo
+ #reset
+ 
+ #data
+@@ -431,6 +431,7 @@
+ #errors
+ #expected
+ | *
++|  grid-template-areas: none
+ |  grid-template-rows: none
+ |  grid-template-columns: none
+ #reset
+@@ -440,6 +441,7 @@
+ #errors
+ #expected
+ | *
++|  grid-template-areas: none
+ |  grid-template-rows: 100px 1fr
+ |  grid-template-columns: auto auto auto
+ #reset
+@@ -449,6 +451,7 @@
+ #errors
+ #expected
+ | *
++|  grid-template-areas: none
+ |  grid-template-rows: none
+ |  grid-template-columns: 1fr
+ #reset
+@@ -460,6 +463,7 @@
+ | *
+ |  grid-template-rows: initial
+ |  grid-template-columns: initial
++|  grid-template-areas: initial
+ #reset
+ 
+ #data
+@@ -474,6 +478,9 @@
+ #errors
+ #expected
+ | *
++|  grid-template-rows: 1fr
++|  grid-template-columns: 1fr
++|  grid-template-areas: 'a b'
+ #reset
+ 
+ #data
+@@ -481,6 +488,7 @@
+ #errors
+ #expected
+ | *
++|  grid-template-areas: none
+ |  grid-template-rows: 100px
+ |  grid-template-columns: 1fr
+ |  grid-auto-rows: auto
+@@ -493,6 +501,7 @@
+ #errors
+ #expected
+ | *
++|  grid-template-areas: none
+ |  grid-template-rows: none
+ |  grid-template-columns: none
+ |  grid-auto-rows: auto
+@@ -510,6 +519,7 @@
+ |  grid-auto-rows: inherit
+ |  grid-auto-columns: inherit
+ |  grid-auto-flow: inherit
++|  grid-template-areas: inherit
+ #reset
+ 
+ #data
+@@ -531,6 +541,7 @@
+ #errors
+ #expected
+ | *
++|  grid-template-areas: 'a b|c d'
+ |  color: #ffff0000
+ #reset
+ 
+@@ -539,6 +550,7 @@
+ #errors
+ #expected
+ | *
++|  grid-template-areas: none
+ |  color: #ffff0000
+ #reset
+ 
+@@ -547,6 +559,7 @@
+ #errors
+ #expected
+ | *
++|  grid-template-areas: inherit
+ |  color: #ffff0000
+ #reset
+ 
+@@ -565,3 +578,35 @@
+ | *
+ |  color: #ffff0000
+ #reset
++
++#data
++* { grid-template-columns: auto 0 minmax(0, calc(100% - 296px - 24px)); }
++#errors
++#expected
++| *
++|  grid-template-columns: auto 0px minmax(0px, calc(100% 296px - 24px - =))
++#reset
++
++#data
++* { grid-template-columns: 1fr calc(100% - 20px) fit-content(calc(1em + 10%)) minmax(0, max(10px, 5vw)); }
++#errors
++#expected
++| *
++|  grid-template-columns: 1fr calc(100% 20px - =) fit-content(calc(1em 10% + =)) minmax(0px, calc(10px 5vw max =))
++#reset
++
++#data
++* { grid-auto-rows: clamp(2em, 10vh, 200px); }
++#errors
++#expected
++| *
++|  grid-auto-rows: calc(2em 10vh 200px min max =)
++#reset
++
++#data
++* { grid-template-columns: calc(10deg) 1fr; color: red; }
++#errors
++#expected
++| *
++|  color: #ffff0000
++#reset
+diff --git a/test/data/select/calc.dat b/test/data/select/calc.dat
+index 130ceff..08f1ca6 100644
+--- a/test/data/select/calc.dat
++++ b/test/data/select/calc.dat
+@@ -24,10 +24,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -42,7 +42,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -93,7 +93,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+diff --git a/test/data/select/counter.dat b/test/data/select/counter.dat
+index 5ee8685..63163df 100644
+--- a/test/data/select/counter.dat
++++ b/test/data/select/counter.dat
+@@ -28,10 +28,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -46,7 +46,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -97,7 +97,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -154,10 +154,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -172,7 +172,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -223,7 +223,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+diff --git a/test/data/select/defaulting.dat b/test/data/select/defaulting.dat
+index 44dcbe6..aeeabdd 100644
+--- a/test/data/select/defaulting.dat
++++ b/test/data/select/defaulting.dat
+@@ -22,10 +22,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -40,7 +40,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -91,7 +91,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -145,10 +145,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -163,7 +163,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -214,7 +214,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -269,10 +269,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -287,7 +287,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -338,7 +338,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -394,10 +394,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -412,7 +412,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -463,7 +463,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -515,10 +515,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -533,7 +533,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -584,7 +584,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -640,10 +640,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -658,7 +658,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -709,7 +709,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -764,10 +764,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -782,7 +782,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -833,7 +833,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -888,10 +888,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -906,7 +906,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -957,7 +957,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1012,10 +1012,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1030,7 +1030,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1081,7 +1081,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1133,10 +1133,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1151,7 +1151,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1202,7 +1202,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1257,10 +1257,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1275,7 +1275,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1326,7 +1326,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1383,10 +1383,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1401,7 +1401,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1452,7 +1452,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1509,10 +1509,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1527,7 +1527,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1578,7 +1578,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+diff --git a/test/data/select/grid.dat b/test/data/select/grid.dat
+index 047186c..0df5615 100644
+--- a/test/data/select/grid.dat
++++ b/test/data/select/grid.dat
+@@ -28,10 +28,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -46,7 +46,7 @@ column-fill: balance
+ column-gap: 2%
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -97,7 +97,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -155,10 +155,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -173,7 +173,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -224,7 +224,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -282,10 +282,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -300,7 +300,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -351,7 +351,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+diff --git a/test/data/select/has.dat b/test/data/select/has.dat
+index 5ad8c62..0198eaf 100644
+--- a/test/data/select/has.dat
++++ b/test/data/select/has.dat
+@@ -27,10 +27,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -45,7 +45,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff00ff00
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -96,7 +96,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+diff --git a/test/data/select/tests1.dat b/test/data/select/tests1.dat
+index aaf585e..dcaa0a9 100644
+--- a/test/data/select/tests1.dat
++++ b/test/data/select/tests1.dat
+@@ -24,10 +24,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -42,7 +42,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -93,7 +93,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -147,10 +147,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -165,7 +165,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -216,7 +216,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -273,10 +273,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -291,7 +291,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -342,7 +342,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -403,10 +403,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -421,7 +421,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ffff0000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -472,7 +472,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -534,10 +534,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -552,7 +552,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ffff0000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -603,7 +603,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -665,10 +665,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -683,7 +683,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ffffffff
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -734,7 +734,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -796,10 +796,10 @@ border-top-style: solid
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -814,7 +814,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ffffffff
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -865,7 +865,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -917,10 +917,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -935,7 +935,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -986,7 +986,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1039,10 +1039,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1057,7 +1057,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1108,7 +1108,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1161,10 +1161,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1179,7 +1179,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1230,7 +1230,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1282,10 +1282,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1300,7 +1300,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1351,7 +1351,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1408,10 +1408,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1426,7 +1426,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1477,7 +1477,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1534,10 +1534,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1552,7 +1552,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1603,7 +1603,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1661,10 +1661,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1679,7 +1679,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1730,7 +1730,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1791,10 +1791,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1809,7 +1809,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1860,7 +1860,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -1920,10 +1920,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -1938,7 +1938,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -1989,7 +1989,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -2055,10 +2055,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -2073,7 +2073,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -2124,7 +2124,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -2190,10 +2190,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -2208,7 +2208,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -2259,7 +2259,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -2325,10 +2325,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -2343,7 +2343,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -2394,7 +2394,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -2465,8 +2465,8 @@ border-right-style: hidden
+ border-bottom-style: dotted
+ border-left-style: dashed
+ border-top-width: 1px
+-border-right-width: 2px
+-border-bottom-width: 4px
++border-right-width: 3px
++border-bottom-width: 5px
+ border-left-width: 2px
+ bottom: auto
+ box-sizing: content-box
+@@ -2482,7 +2482,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -2533,7 +2533,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -2604,8 +2604,8 @@ border-bottom-style: groove
+ border-left-style: ridge
+ border-top-width: 0px
+ border-right-width: 2em
+-border-bottom-width: 4px
+-border-left-width: 2px
++border-bottom-width: 5px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -2620,7 +2620,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -2671,7 +2671,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -2738,10 +2738,10 @@ border-top-style: inset
+ border-right-style: outset
+ border-bottom-style: inset
+ border-left-style: outset
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -2756,7 +2756,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -2807,7 +2807,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -2873,10 +2873,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -2891,7 +2891,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -2942,7 +2942,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -3008,10 +3008,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -3026,7 +3026,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -3077,7 +3077,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -3143,10 +3143,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -3161,7 +3161,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -3212,7 +3212,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -3278,10 +3278,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -3296,7 +3296,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -3347,7 +3347,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -3413,10 +3413,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -3431,7 +3431,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -3482,7 +3482,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -3548,10 +3548,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -3566,7 +3566,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -3617,7 +3617,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -3683,10 +3683,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -3701,7 +3701,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -3752,7 +3752,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -3818,10 +3818,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -3836,7 +3836,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -3887,7 +3887,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -3953,10 +3953,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -3971,7 +3971,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -4022,7 +4022,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -4088,10 +4088,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -4106,7 +4106,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -4157,7 +4157,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -4223,10 +4223,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -4241,7 +4241,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -4292,7 +4292,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -4358,10 +4358,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -4376,7 +4376,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -4427,7 +4427,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -4493,10 +4493,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -4511,7 +4511,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -4562,7 +4562,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -4628,10 +4628,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -4646,7 +4646,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -4697,7 +4697,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -4763,10 +4763,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -4781,7 +4781,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -4832,7 +4832,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -4898,10 +4898,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -4916,7 +4916,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -4967,7 +4967,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -5033,10 +5033,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -5051,7 +5051,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -5102,7 +5102,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -5168,10 +5168,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -5186,7 +5186,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -5237,7 +5237,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -5303,10 +5303,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -5321,7 +5321,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -5372,7 +5372,7 @@ opacity: 0.500
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -5438,10 +5438,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -5456,7 +5456,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -5507,7 +5507,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -5566,10 +5566,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -5584,7 +5584,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -5635,7 +5635,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -5694,10 +5694,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -5712,7 +5712,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -5763,7 +5763,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -5822,10 +5822,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -5840,7 +5840,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -5891,7 +5891,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -5947,10 +5947,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -5960,7 +5960,7 @@ caption-side: top
+ clear: none
+ clip: auto
+ color: #ff000000
+-column-count: 2048
++column-count: 2
+ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ffbbbbcc
+@@ -6016,7 +6016,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -6073,10 +6073,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: avoid
+@@ -6091,7 +6091,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -6142,7 +6142,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -6199,10 +6199,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: avoid-page
+@@ -6217,7 +6217,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -6268,7 +6268,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -6325,10 +6325,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: avoid-page
+@@ -6343,7 +6343,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -6394,7 +6394,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -6447,10 +6447,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -6465,7 +6465,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -6516,7 +6516,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -6570,10 +6570,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: border-box
+ break-after: auto
+@@ -6588,7 +6588,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -6639,7 +6639,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -6692,10 +6692,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -6710,7 +6710,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -6761,7 +6761,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -6814,10 +6814,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -6832,7 +6832,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -6883,7 +6883,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -6936,10 +6936,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -6954,7 +6954,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7005,7 +7005,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -7058,10 +7058,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -7076,7 +7076,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7127,7 +7127,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -7180,10 +7180,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -7198,7 +7198,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7249,7 +7249,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -7304,10 +7304,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -7322,7 +7322,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7373,7 +7373,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -7426,10 +7426,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -7444,7 +7444,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7495,7 +7495,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -7548,10 +7548,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -7566,7 +7566,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7617,7 +7617,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -7671,10 +7671,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -7689,7 +7689,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7740,7 +7740,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -7793,10 +7793,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -7811,7 +7811,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7862,7 +7862,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -7915,10 +7915,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -7933,7 +7933,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -7984,7 +7984,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -8037,10 +8037,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -8055,7 +8055,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -8106,7 +8106,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -8159,10 +8159,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -8177,7 +8177,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -8228,7 +8228,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -8281,10 +8281,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -8299,7 +8299,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -8350,7 +8350,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -8403,10 +8403,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -8421,7 +8421,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -8472,7 +8472,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -8525,10 +8525,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -8543,7 +8543,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -8594,7 +8594,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -8646,10 +8646,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -8664,7 +8664,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -8677,7 +8677,7 @@ empty-cells: show
+ fill-opacity: 1.000
+ flex-basis: 3px
+ flex-direction: row
+-flex-grow: 0.000
++flex-grow: 1.000
+ flex-shrink: 1.000
+ flex-wrap: nowrap
+ float: none
+@@ -8715,7 +8715,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -8767,10 +8767,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -8785,7 +8785,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -8836,7 +8836,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -8888,10 +8888,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -8906,7 +8906,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -8957,7 +8957,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9011,10 +9011,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -9029,7 +9029,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -9080,7 +9080,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9134,10 +9134,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -9152,7 +9152,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -9203,7 +9203,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9255,10 +9255,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -9273,7 +9273,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -9324,7 +9324,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9378,10 +9378,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -9396,7 +9396,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -9447,7 +9447,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9501,10 +9501,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -9519,7 +9519,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -9570,7 +9570,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9624,10 +9624,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -9642,7 +9642,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -9693,7 +9693,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9745,10 +9745,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -9763,7 +9763,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -9814,7 +9814,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9866,10 +9866,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -9884,7 +9884,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -9935,7 +9935,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -9987,10 +9987,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10005,7 +10005,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -10056,7 +10056,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -10108,10 +10108,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10126,7 +10126,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -10177,7 +10177,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -10229,10 +10229,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10247,7 +10247,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -10298,7 +10298,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -10350,10 +10350,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10368,7 +10368,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -10419,7 +10419,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -10471,10 +10471,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10489,7 +10489,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -10540,7 +10540,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -10592,10 +10592,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10610,7 +10610,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -10661,7 +10661,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -10715,10 +10715,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10733,7 +10733,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -10784,7 +10784,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -10838,10 +10838,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10856,7 +10856,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -10907,7 +10907,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -10959,10 +10959,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -10977,7 +10977,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -11028,7 +11028,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -11080,10 +11080,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -11098,7 +11098,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -11149,7 +11149,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -11201,10 +11201,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -11219,7 +11219,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -11270,7 +11270,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -11322,10 +11322,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -11340,7 +11340,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -11391,7 +11391,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -11443,10 +11443,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -11461,7 +11461,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -11512,7 +11512,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -11564,10 +11564,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -11582,7 +11582,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -11633,7 +11633,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -11685,10 +11685,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -11703,7 +11703,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -11754,7 +11754,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -11808,10 +11808,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -11826,7 +11826,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -11877,7 +11877,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -11931,10 +11931,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -11949,7 +11949,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12000,7 +12000,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -12052,10 +12052,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -12070,7 +12070,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12121,7 +12121,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -12173,10 +12173,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -12191,7 +12191,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12242,7 +12242,7 @@ opacity: 1.000
+ order: 5
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -12294,10 +12294,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -12312,7 +12312,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12363,7 +12363,7 @@ opacity: 1.000
+ order: -5
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -12417,10 +12417,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -12435,7 +12435,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12486,7 +12486,7 @@ opacity: 1.000
+ order: 7
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -12538,10 +12538,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -12556,7 +12556,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12607,7 +12607,7 @@ opacity: 1.000
+ order: -1
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -12661,10 +12661,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -12679,7 +12679,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12730,7 +12730,7 @@ opacity: 1.000
+ order: -1
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -12782,10 +12782,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -12800,7 +12800,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12851,7 +12851,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -12903,10 +12903,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -12921,7 +12921,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -12972,7 +12972,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13024,10 +13024,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -13042,7 +13042,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -13093,7 +13093,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13145,10 +13145,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -13163,7 +13163,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -13214,7 +13214,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13266,10 +13266,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -13284,7 +13284,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -13335,7 +13335,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13387,10 +13387,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -13405,7 +13405,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -13456,7 +13456,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13508,10 +13508,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -13526,7 +13526,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -13577,7 +13577,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13629,10 +13629,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -13647,7 +13647,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -13698,7 +13698,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13750,10 +13750,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -13768,7 +13768,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -13819,7 +13819,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13871,10 +13871,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -13889,7 +13889,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -13940,7 +13940,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -13992,10 +13992,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14010,7 +14010,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -14061,7 +14061,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -14113,10 +14113,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14131,7 +14131,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -14182,7 +14182,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -14234,10 +14234,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14252,7 +14252,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -14303,7 +14303,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -14355,10 +14355,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14373,7 +14373,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -14424,7 +14424,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -14476,10 +14476,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14494,7 +14494,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -14545,7 +14545,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -14597,10 +14597,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14615,7 +14615,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -14666,7 +14666,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -14718,10 +14718,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14736,7 +14736,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -14787,7 +14787,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -14839,10 +14839,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14857,7 +14857,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -14908,7 +14908,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -14960,10 +14960,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -14978,7 +14978,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -15029,7 +15029,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -15081,10 +15081,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -15099,7 +15099,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -15150,7 +15150,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -15202,10 +15202,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -15220,7 +15220,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -15271,7 +15271,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -15323,10 +15323,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -15341,7 +15341,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -15392,7 +15392,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -15444,10 +15444,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -15462,7 +15462,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -15513,7 +15513,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -15584,10 +15584,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -15602,7 +15602,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -15653,7 +15653,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -15705,10 +15705,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -15723,7 +15723,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -15774,7 +15774,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -15826,10 +15826,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -15844,7 +15844,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -15895,7 +15895,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+diff --git a/test/data/select2/calc.dat b/test/data/select2/calc.dat
+index 3cba926..340f54e 100644
+--- a/test/data/select2/calc.dat
++++ b/test/data/select2/calc.dat
+@@ -24,10 +24,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -42,7 +42,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -93,7 +93,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+@@ -145,10 +145,10 @@ border-top-style: none
+ border-right-style: none
+ border-bottom-style: none
+ border-left-style: none
+-border-top-width: 2px
+-border-right-width: 2px
+-border-bottom-width: 2px
+-border-left-width: 2px
++border-top-width: 3px
++border-right-width: 3px
++border-bottom-width: 3px
++border-left-width: 3px
+ bottom: auto
+ box-sizing: content-box
+ break-after: auto
+@@ -163,7 +163,7 @@ column-fill: balance
+ column-gap: normal
+ column-rule-color: #ff000000
+ column-rule-style: none
+-column-rule-width: 2px
++column-rule-width: 3px
+ column-span: none
+ column-width: auto
+ content: normal
+@@ -214,7 +214,7 @@ opacity: 1.000
+ order: 0
+ outline-color: invert
+ outline-style: none
+-outline-width: 2px
++outline-width: 3px
+ overflow-x: visible
+ overflow-y: visible
+ padding-top: 0px
+diff --git a/test/dump.h b/test/dump.h
+index e22774c..c57c60f 100644
+--- a/test/dump.h
++++ b/test/dump.h
+@@ -796,10 +796,65 @@ static void dump_unit(css_fixed val, uint32_t unit, char **ptr)
+ 	}
+ }
+ 
++/**
++ * Dump a calc() expression's bytecode
++ */
++static void dump_calc_expr(lwc_string *calc_expr, char **ptr)
++{
++	const uint8_t *codeptr = (const uint8_t *)lwc_string_data(calc_expr);
++	css_code_t calc_opcode;
++
++	*ptr += sprintf(*ptr, "calc(");
++	while ((calc_opcode = *((css_code_t *)(void *)codeptr)) != CALC_FINISH) {
++		codeptr += sizeof(calc_opcode);
++		switch (calc_opcode) {
++		case CALC_ADD:
++			*ptr += sprintf(*ptr, "+ ");
++			break;
++		case CALC_SUBTRACT:
++			*ptr += sprintf(*ptr, "- ");
++			break;
++		case CALC_MULTIPLY:
++			*ptr += sprintf(*ptr, "* ");
++			break;
++		case CALC_DIVIDE:
++			*ptr += sprintf(*ptr, "/ ");
++			break;
++		case CALC_MIN:
++			*ptr += sprintf(*ptr, "min ");
++			break;
++		case CALC_MAX:
++			*ptr += sprintf(*ptr, "max ");
++			break;
++		case CALC_PUSH_VALUE: {
++			css_fixed num = *((css_fixed *)(void *)codeptr);
++			codeptr += sizeof(num);
++			uint32_t unit = *((uint32_t *)(void *)codeptr);
++			codeptr += sizeof(unit);
++			dump_unit(num, unit, ptr);
++			*ptr += sprintf(*ptr, " ");
++			break;
++		}
++		case CALC_PUSH_NUMBER: {
++			css_fixed num = *((css_fixed *)(void *)codeptr);
++			codeptr += sizeof(num);
++			dump_number(num, ptr);
++			*ptr += sprintf(*ptr, " ");
++			break;
++		}
++		default:
++			*ptr += sprintf(*ptr, "??%d ", calc_opcode);
++			break;
++		}
++	}
++	*ptr += sprintf(*ptr, "=)");
++}
++
+ /**
+  * Dump one grid track breadth, advancing *bc past its data words
+  */
+-static void dump_grid_breadth(uint32_t type, const uint8_t **bc, char **ptr)
++static void dump_grid_breadth(const css_style *style, uint32_t type,
++		const uint8_t **bc, char **ptr)
+ {
+ 	css_fixed val;
+ 	uint32_t unit;
+@@ -826,6 +881,21 @@ static void dump_grid_breadth(uint32_t type, const uint8_t **bc, char **ptr)
+ 		if (type == GRID_TRACK_FIT_CONTENT)
+ 			*ptr += sprintf(*ptr, ")");
+ 		break;
++	case GRID_TRACK_CALC:
++	case GRID_TRACK_FIT_CONTENT_CALC:
++	{
++		lwc_string *calc_expr = NULL;
++		uint32_t snum = *((const uint32_t *) *bc);
++
++		*bc += sizeof(snum);
++		css__stylesheet_string_get(style->sheet, snum, &calc_expr);
++		if (type == GRID_TRACK_FIT_CONTENT_CALC)
++			*ptr += sprintf(*ptr, "fit-content(");
++		dump_calc_expr(calc_expr, ptr);
++		if (type == GRID_TRACK_FIT_CONTENT_CALC)
++			*ptr += sprintf(*ptr, ")");
++		break;
++	}
+ 	case GRID_TRACK_FR:
+ 		val = *((const css_fixed *) *bc);
+ 		*bc += sizeof(val);
+@@ -841,7 +911,8 @@ static void dump_grid_breadth(uint32_t type, const uint8_t **bc, char **ptr)
+ /**
+  * Dump a grid track list, returning the number of bytes consumed
+  */
+-static size_t dump_grid_track_list(const void *bytecode, char **ptr)
++static size_t dump_grid_track_list(const css_style *style,
++		const void *bytecode, char **ptr)
+ {
+ 	const uint8_t *bc = bytecode;
+ 	uint32_t head = *((const uint32_t *) bc);
+@@ -856,6 +927,14 @@ static size_t dump_grid_track_list(const void *bytecode, char **ptr)
+ 				GRID_TRACK_TYPE_MASK;
+ 		uint32_t flags = (head >> GRID_TRACK_FLAGS_SHIFT) & 0xff;
+ 
++		if (min_type == GRID_TRACK_LINE_NAME) {
++			/* a line's name: not dumped */
++			bc += sizeof(uint32_t);
++			head = *((const uint32_t *) bc);
++			bc += sizeof(head);
++			continue;
++		}
++
+ 		if (flags != in_repeat) {
+ 			if (in_repeat != 0) {
+ 				*ptr += sprintf(*ptr, ")");
+@@ -877,12 +956,12 @@ static size_t dump_grid_track_list(const void *bytecode, char **ptr)
+ 
+ 		if (head & GRID_TRACK_MINMAX) {
+ 			*ptr += sprintf(*ptr, "minmax(");
+-			dump_grid_breadth(min_type, &bc, ptr);
++			dump_grid_breadth(style, min_type, &bc, ptr);
+ 			*ptr += sprintf(*ptr, ", ");
+-			dump_grid_breadth(max_type, &bc, ptr);
++			dump_grid_breadth(style, max_type, &bc, ptr);
+ 			*ptr += sprintf(*ptr, ")");
+ 		} else {
+-			dump_grid_breadth(min_type, &bc, ptr);
++			dump_grid_breadth(style, min_type, &bc, ptr);
+ 		}
+ 
+ 		head = *((const uint32_t *) bc);
+@@ -1050,8 +1129,6 @@ void dump_bytecode(css_style *style, char **ptr, uint32_t depth)
+ 			*ptr += sprintf(*ptr, "unset");
+ 		} else if (isCalc(opv)) {
+ 			lwc_string *calc_expr = NULL;
+-			const uint8_t *codeptr = NULL;
+-			css_code_t calc_opcode;
+ 			uint32_t unit, snum;
+ 			/* First entry is a unit */
+ 			unit = *((uint32_t *)bytecode);
+@@ -1060,53 +1137,10 @@ void dump_bytecode(css_style *style, char **ptr, uint32_t depth)
+ 			snum = *((uint32_t *)bytecode);
+ 			ADVANCE(sizeof(snum));
+ 			css__stylesheet_string_get(style->sheet, snum, &calc_expr);
+-			codeptr = (const uint8_t *)lwc_string_data(calc_expr);
+ 			*ptr += sprintf(*ptr, "/* -> ");
+ 			dump_unit(0, unit, ptr);
+-			*ptr += sprintf(*ptr, " */ calc(");
+-			while ((calc_opcode = *((css_code_t *)(void *)codeptr)) != CALC_FINISH) {
+-				codeptr += sizeof(calc_opcode);
+-				switch (calc_opcode) {
+-				case CALC_ADD:
+-					*ptr += sprintf(*ptr, "+ ");
+-					break;
+-				case CALC_SUBTRACT:
+-					*ptr += sprintf(*ptr, "- ");
+-					break;
+-				case CALC_MULTIPLY:
+-					*ptr += sprintf(*ptr, "* ");
+-					break;
+-				case CALC_DIVIDE:
+-					*ptr += sprintf(*ptr, "/ ");
+-					break;
+-				case CALC_MIN:
+-					*ptr += sprintf(*ptr, "min ");
+-					break;
+-				case CALC_MAX:
+-					*ptr += sprintf(*ptr, "max ");
+-					break;
+-				case CALC_PUSH_VALUE: {
+-					css_fixed num = *((css_fixed *)(void *)codeptr);
+-					codeptr += sizeof(num);
+-					uint32_t unit = *((uint32_t *)(void *)codeptr);
+-					codeptr += sizeof(unit);
+-					dump_unit(num, unit, ptr);
+-					*ptr += sprintf(*ptr, " ");
+-					break;
+-				}
+-				case CALC_PUSH_NUMBER: {
+-					css_fixed num = *((css_fixed *)(void *)codeptr);
+-					codeptr += sizeof(num);
+-					dump_number(num, ptr);
+-					*ptr += sprintf(*ptr, " ");
+-					break;
+-				}
+-				default:
+-					*ptr += sprintf(*ptr, "??%d ", calc_opcode);
+-					break;
+-				}
+-			}
+-			*ptr += sprintf(*ptr, "=)");
++			*ptr += sprintf(*ptr, " */ ");
++			dump_calc_expr(calc_expr, ptr);
+ 		} else {
+ 			value = getValue(opv);
+ 
+@@ -3958,7 +3992,7 @@ void dump_bytecode(css_style *style, char **ptr, uint32_t depth)
+ 					break;
+ 				case GRID_TEMPLATE_SET:
+ 				{
+-					size_t n = dump_grid_track_list(bytecode, ptr);
++					size_t n = dump_grid_track_list(style, bytecode, ptr);
+ 					ADVANCE(n);
+ 				}
+ 					break;
+@@ -3972,12 +4006,28 @@ void dump_bytecode(css_style *style, char **ptr, uint32_t depth)
+ 					break;
+ 				case GRID_AUTO_TRACK_SET:
+ 				{
+-					size_t n = dump_grid_track_list(bytecode, ptr);
++					size_t n = dump_grid_track_list(style, bytecode, ptr);
+ 					ADVANCE(n);
+ 				}
+ 					break;
+ 				}
+ 				break;
++			case CSS_PROP_GRID_TEMPLATE_AREAS:
++				if (value == GRID_TEMPLATE_AREAS_SET) {
++					/* the rows, joined by '|' */
++					uint32_t snum = *((uint32_t *) bytecode);
++					lwc_string *areas = NULL;
++
++					ADVANCE(sizeof(snum));
++					css__stylesheet_string_get(style->sheet,
++							snum, &areas);
++					*ptr += sprintf(*ptr, "'%.*s'",
++							(int) lwc_string_length(areas),
++							lwc_string_data(areas));
++				} else {
++					*ptr += sprintf(*ptr, "none");
++				}
++				break;
+ 			case CSS_PROP_GRID_AUTO_FLOW:
+ 				switch (value) {
+ 				case GRID_AUTO_FLOW_ROW:
+@@ -4009,7 +4059,22 @@ void dump_bytecode(css_style *style, char **ptr, uint32_t depth)
+ 					ADVANCE(sizeof(val));
+ 					if (value == GRID_LINE_SPAN)
+ 						*ptr += sprintf(*ptr, "span ");
+-					dump_number(val, ptr);
++					if (FIXTOINT(val) >=
++							CSS_GRID_LINE_NAME_BASE) {
++						/* a line or area name */
++						lwc_string *name =
++							css_grid_line_name(
++							FIXTOINT(val) -
++							CSS_GRID_LINE_NAME_BASE);
++
++						*ptr += sprintf(*ptr, "%.*s",
++							name == NULL ? 1 :
++							(int) lwc_string_length(name),
++							name == NULL ? "?" :
++							lwc_string_data(name));
++					} else {
++						dump_number(val, ptr);
++					}
+ 				}
+ 					break;
+ 				}
+diff --git a/test/select.c b/test/select.c
+index 2eea898..c15489e 100644
+--- a/test/select.c
++++ b/test/select.c
+@@ -876,6 +876,12 @@ static css_select_handler select_handler = {
+ 
+ 	first_child_node,
+ 	next_sibling_node,
++
++	/* VitaSurf's additions, which the tests leave to libcss */
++	.node_attribute_hashes = NULL,
++	.node_is_pseudo = NULL,
++	.node_animation_start = NULL,
++	.node_container_size = NULL,
+ };
+ 
+ static css_error resolve_url(void *pw,

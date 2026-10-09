@@ -393,6 +393,12 @@ function hasDescendant(el,groups){
   if(c[i].nodeType!==1)continue;
   if(anyGroup(c[i],groups)||hasDescendant(c[i],groups))return true;}
  return false;}
+/* Whether a popover is shown: the element's own state, kept in C where
+   :popover-open in the style sheets reads it too (VitaSurf). */
+var POPQ=typeof window!=='undefined'&&typeof window.__vitaPopover==='function'?
+ window.__vitaPopover:null;
+function popoverShown(el){
+ return !!POPQ&&el.hasAttribute('popover')&&POPQ(el)===true;}
 function pseudoOk(el,p){
  if(p.element)return false;
  switch(p.name){
@@ -426,6 +432,9 @@ function pseudoOk(el,p){
   return (el.tagName==='A'||el.tagName==='AREA')&&el.hasAttribute('href');
  case 'defined':return true;
  case 'scope':return true;
+ case 'popover-open':return popoverShown(el);
+ case 'open':
+  return (el.tagName==='DETAILS'||el.tagName==='DIALOG')&&el.hasAttribute('open');
  /* Nothing here has a pointer, a focus ring or a history. */
  case 'hover':case 'focus':case 'focus-within':case 'focus-visible':
  case 'active':case 'visited':case 'target':case 'indeterminate':
@@ -890,6 +899,13 @@ function otherActivation(el){
   t=String(el.type||'').toLowerCase();
   if(tag==='BUTTON'&&t==='')t='submit';
   form=el.form;
+  /* a button that names a popover shows or hides it, unless it
+     submits a form (VitaSurf) */
+  if(el.hasAttribute('popovertarget')&&(tag==='BUTTON'||
+     /^(button|submit|reset|image)$/.test(t))&&
+     !(form&&(t==='submit'||t==='image'))){
+   n=D.getElementById(el.getAttribute('popovertarget'));
+   if(n&&n.hasAttribute('popover'))return {kind:'popover',el:el,target:n};}
   if(!form)return null;
   if(t==='submit'||t==='image')
    return {kind:'submit',form:form,submitter:el};
@@ -1025,6 +1041,16 @@ function runActivation(a){
  if(a.kind==='label'){
   /* the label passes the click on to the control it names */
   if(a.control&&a.control.click)a.control.click();return;}
+ if(a.kind==='popover'){
+  /* popovertargetaction: toggle, show or hide */
+  var how=String(a.el.getAttribute('popovertargetaction')||'').toLowerCase(),
+      shown=a.target.matches(':popover-open');
+  if(how!=='show'&&how!=='hide')how='toggle';
+  try{
+   if(shown&&how!=='show')a.target.hidePopover();
+   else if(!shown&&how!=='hide')a.target.showPopover();}
+  catch(err){if(W.__vitaReportError)W.__vitaReportError(err);}
+  return;}
  if(a.kind==='link')goTo(a.el.getAttribute('href'));}
 function cancelActivate(was){
  var i;
@@ -1068,6 +1094,8 @@ window.addEventListener('click',function(e){
  var a,c,t;
  if(!e||e.__vitaActivated||e.defaultPrevented)return;
  a=activationTarget(e.target);
+ /* a tapped popover button, as a script's click runs it above */
+ if(a&&a.kind==='popover'){runActivation(a);return;}
  if(!a||a.kind!=='label'||!(c=a.control)||c===e.target)return;
  if(c.disabled)return;
  t=String(c.type||'').toLowerCase();
@@ -3487,14 +3515,58 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
   var s=INTERNALS.get(el);
   return s&&formAssociated(el)?s.value:undefined;};
 })();
-/* Popovers, as a plain show and hide: there is no top layer here, so an
- * open popover is a visible element and a closed one is hidden. */
-P.showPopover=function(){this.removeAttribute('hidden');this.__popopen=true;
- this.dispatchEvent(new Event('beforetoggle'));};
-P.hidePopover=function(){this.setAttribute('hidden','');this.__popopen=false;
- this.dispatchEvent(new Event('beforetoggle'));};
-P.togglePopover=function(force){var open=force===undefined?!this.__popopen:!!force;
- if(open)this.showPopover();else this.hidePopover();return open;};
+/* Popovers (VitaSurf). Whether one is shown is the element's own state,
+ * kept in C: :popover-open matches it, and the UA sheet's
+ * [popover]:not(:popover-open) rule hides one that is not shown, as
+ * GitHub's tooltips are until they are wanted. There is no top layer,
+ * so a shown popover is drawn where its own styles put it. The steps
+ * follow HTML's: the validity checks, a cancelable beforetoggle before
+ * showing, and a toggle event queued after, merged with one still
+ * pending (which fires even when it comes back to where it started, as
+ * HTML has it and Chrome does). Light dismiss of popover=auto is not done. */
+var POPN=typeof W.__vitaPopover==='function'?W.__vitaPopover:null;
+try{delete W.__vitaPopover;}catch(e){}
+function popShown(el){return !!POPN&&POPN(el)===true;}
+function popValid(el,showing){
+ if(!el.hasAttribute('popover'))
+  throw new DOMException('Not supported on elements that do not have a valid value for the popover attribute','NotSupportedError');
+ if(popShown(el)===showing)return false;
+ if(!el.isConnected)
+  throw new DOMException('Invalid on disconnected popover elements','InvalidStateError');
+ if(el.tagName==='DIALOG'&&el.hasAttribute('open'))
+  throw new DOMException('The dialog is already open as a dialog','InvalidStateError');
+ return true;}
+var POPTOGGLE=new WeakMap();
+function popQueueToggle(el,oldS,newS){
+ var t=POPTOGGLE.get(el);
+ if(t){t.newState=newS;return;}
+ t={oldState:oldS,newState:newS};POPTOGGLE.set(el,t);
+ setTimeout(function(){
+  POPTOGGLE.delete(el);
+  try{el.dispatchEvent(new ToggleEvent('toggle',
+   {oldState:t.oldState,newState:t.newState}));}catch(e){}},0);}
+function popSet(el,open){if(POPN)POPN(el,open);}
+P.showPopover=function(){
+ if(!popValid(this,true))return;
+ if(!this.dispatchEvent(new ToggleEvent('beforetoggle',
+   {oldState:'closed',newState:'open',cancelable:true})))return;
+ /* a listener may have changed things */
+ if(!popValid(this,true))return;
+ popSet(this,true);
+ popQueueToggle(this,'closed','open');};
+P.hidePopover=function(){
+ if(!popValid(this,false))return;
+ this.dispatchEvent(new ToggleEvent('beforetoggle',
+  {oldState:'open',newState:'closed'}));
+ if(!popShown(this))return;
+ popSet(this,false);
+ popQueueToggle(this,'open','closed');};
+P.togglePopover=function(opt){
+ var force=opt!==null&&typeof opt==='object'?opt.force:opt;
+ if(popShown(this)&&(force===undefined||!force))this.hidePopover();
+ else if(force===undefined||force)this.showPopover();
+ else popValid(this,false);
+ return popShown(this);};
 Object.defineProperty(P,'popoverTargetElement',{configurable:true,
  get:function(){var id=this.getAttribute('popovertarget');return id?D.getElementById(id):null;},
  set:function(v){if(v&&v.id)this.setAttribute('popovertarget',v.id);
@@ -7353,10 +7425,12 @@ W.__vitaReportError=function(err,where){
   /* the code the position points into (VitaSurf), for an error from a
      timer or a handler, whose stack alone names only minified frames */
   var near='';
-  try{if(line&&SRC_EXCERPT){
-   near=SRC_EXCERPT(file,line,col);if(near)near=' | near: '+near;}}catch(e8){}
+  try{if(line&&SRC_EXCERPT)near=SRC_EXCERPT(file,line,col);}catch(e8){}
   try{console.error('uncaught'+(from?' in '+from:'')+': '+describeThrown(err)+
-   (file?' ('+file+':'+line+':'+col+')':'')+near);}catch(e6){}}
+   (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}
+  /* a line of its own: a log line holds 512 characters, and a long
+     stack of long URLs had already filled the one above */
+  if(near)try{console.error('uncaught, the code at column '+col+': '+near);}catch(e9){}}
  return handled;};
 /* An unhandled promise rejection, reported the same way. QuickJS hands
  * these to the tracker qjs.c installs.
