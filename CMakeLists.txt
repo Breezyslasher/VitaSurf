@@ -110,6 +110,9 @@ add_executable(${PROJECT_NAME}
     vita/platform/vita_file.c
     # SceNet and SceNetCtl bring-up.
     vita/platform/vita_net.c
+    # Host name lookups on threads of their own, for the fetcher and
+    # WebSockets, so that no lookup holds the browser up.
+    vita/platform/vita_resolve.c
     # NetSurf download table: files saved under ux0:data/VitaSurf/downloads.
     vita/platform/vita_download.c
     # Optional FlareSolverr client for Cloudflare browser checks.

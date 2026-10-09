@@ -40,6 +40,11 @@
 
 #include "vita_platform.h"
 #include "websocket.h"
+#if defined(__vita__) || defined(VITASURF_RESOLVE_TEST)
+#include "utils/nsoption.h"
+#include "vita_resolve.h"
+#define VWS_RESOLVE 1
+#endif
 
 #define POLL_MS 20		/**< how often a connection is looked at */
 /** How long one look may spend handing messages to the page. A page that
@@ -83,6 +88,10 @@ struct vws {
 	struct vws_out *out, *out_last;
 	size_t buffered;
 	uint64_t close_started;
+#ifdef VWS_RESOLVE
+	bool waiting;		/**< for its host's address, not yet curl's */
+	struct curl_slist *resolve; /**< that address, for CURLOPT_RESOLVE */
+#endif
 	struct vws *next;
 };
 
@@ -153,6 +162,13 @@ static void finish(struct vws *s)
 		curl_slist_free_all(s->headers);
 		s->headers = NULL;
 	}
+#ifdef VWS_RESOLVE
+	if (s->resolve != NULL) {
+		curl_slist_free_all(s->resolve);
+		s->resolve = NULL;
+	}
+	s->waiting = false;
+#endif
 	free_out(s);
 	free(s->msg);
 	s->msg = NULL;
@@ -233,6 +249,68 @@ static void send_close_frame(struct vws *s, int code, const char *reason,
 }
 
 /* The handshakes in progress. */
+#ifdef VWS_RESOLVE
+/*
+ * Connect once the host's address is known (VitaSurf). curl would look
+ * the name up inside curl_multi_perform and hold the browser up until
+ * the answer came, as the fetcher's transfers did (fetch_curl_resolve_try
+ * in NetSurf's curl.c); vita_resolve looks it up on a thread instead,
+ * and curl gets the address with CURLOPT_RESOLVE.
+ *
+ * Returns 1 once curl has the connection, 0 while the lookup goes on,
+ * and -1 with why filled in if it cannot be made.
+ */
+static int connect_resolved(struct vws *s, char *why, size_t why_len)
+{
+	CURLU *u = curl_url();
+	char *host = NULL, *port = NULL;
+	char addrs[16], entry[300];
+	int r = 1;
+
+	if (u == NULL ||
+	    curl_url_set(u, CURLUPART_URL, s->url,
+			 CURLU_NON_SUPPORT_SCHEME) != CURLUE_OK ||
+	    curl_url_get(u, CURLUPART_HOST, &host, 0) != CURLUE_OK ||
+	    curl_url_get(u, CURLUPART_PORT, &port,
+			 CURLU_DEFAULT_PORT) != CURLUE_OK ||
+	    host[0] == '[' || strspn(host, "0123456789.") == strlen(host) ||
+	    strcasecmp(host, "localhost") == 0 ||
+	    (nsoption_bool(http_proxy) &&
+	     nsoption_charp(http_proxy_host) != NULL)) {
+		/* curl reads the URL, or connects to an address or a
+		 * proxy, itself */
+		goto add;
+	}
+	switch (vita_resolve(host, addrs, sizeof(addrs), why, why_len)) {
+	case VITA_RESOLVE_PENDING:
+		r = 0;
+		goto out;
+	case VITA_RESOLVE_FAILED:
+		r = -1;
+		goto out;
+	default:
+		break;
+	}
+	snprintf(entry, sizeof(entry), "+%s:%s:%s", host, port, addrs);
+	s->resolve = curl_slist_append(NULL, entry);
+	if (s->resolve != NULL) {
+		curl_easy_setopt(s->h, CURLOPT_RESOLVE, s->resolve);
+	}
+add:
+	if (curl_multi_add_handle(multi, s->h) != CURLM_OK) {
+		snprintf(why, why_len, "the connection could not be started");
+		r = -1;
+	} else {
+		s->waiting = false;
+	}
+out:
+	curl_free(host);
+	curl_free(port);
+	curl_url_cleanup(u);
+	return r;
+}
+#endif
+
 static void poll_connecting(void)
 {
 	int running = 0, left = 0;
@@ -241,6 +319,21 @@ static void poll_connecting(void)
 	if (multi == NULL) {
 		return;
 	}
+#ifdef VWS_RESOLVE
+	{
+		struct vws *s;
+		char why[96];
+
+		/* a failure tells the page, which may open or close
+		 * sockets; those it opens go on the front of the list */
+		for (s = sockets; s != NULL; s = s->next) {
+			if (s->state == ST_CONNECTING && s->waiting &&
+			    connect_resolved(s, why, sizeof(why)) < 0) {
+				failed(s, why);
+			}
+		}
+	}
+#endif
 	curl_multi_perform(multi, &running);
 	while ((m = curl_multi_info_read(multi, &left)) != NULL) {
 		struct vws *s;
@@ -592,12 +685,23 @@ int vws_open(const char *url, const char *origin, const char *protocols,
 	if (cookie != NULL && cookie[0] != '\0') {
 		curl_easy_setopt(s->h, CURLOPT_COOKIE, cookie);
 	}
+#ifdef VWS_RESOLVE
+	/* curl has it once the host's address is known; a failure is the
+	 * poll's to report, as any failure to connect is */
+	s->waiting = true;
+	{
+		char why[96];
+
+		(void)connect_resolved(s, why, sizeof(why));
+	}
+#else
 	if (curl_multi_add_handle(multi, s->h) != CURLM_OK) {
 		finish(s);
 		free(s->url);
 		free(s);
 		return -1;
 	}
+#endif
 	s->id = next_id++;
 	if (next_id <= 0) {
 		next_id = 1;

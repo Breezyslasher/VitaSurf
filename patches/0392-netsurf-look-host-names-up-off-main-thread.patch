@@ -1,0 +1,277 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 984e73cb9..ea3332694 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -64,6 +64,12 @@
+ #ifdef __vita__
+ #include "vita_platform.h"
+ #endif
++#if defined(__vita__) || defined(VITASURF_RESOLVE_TEST)
++/* host names are looked up off the main thread (VitaSurf): see
++ * fetch_curl_resolve_try */
++#include "vita_resolve.h"
++#define FETCH_CURL_RESOLVE 1
++#endif
+ 
+ /**
+  * maximum number of progress notifications per second
+@@ -271,6 +277,13 @@ struct curl_fetch_info {
+ 	bool done_pending;
+ 	CURLcode done_result;
+ 	struct curl_fetch_info *done_next; /**< in done_fetches */
++#ifdef FETCH_CURL_RESOLVE
++	/* waiting for its host's address, not yet curl's (VitaSurf) */
++	bool resolving;
++	bool outside_curl;	/**< its handle has not been given to curl */
++	struct curl_fetch_info *resolve_next; /**< in resolving_fetches */
++	struct curl_slist *resolve; /**< the address, for CURLOPT_RESOLVE */
++#endif
+ };
+ 
+ /*
+@@ -299,6 +312,12 @@ struct curl_held {
+ 
+ static bool curl_holding;
+ static struct curl_fetch_info *held_fetches;
++#ifdef FETCH_CURL_RESOLVE
++/** fetches waiting for their host's address (VitaSurf) */
++static struct curl_fetch_info *resolving_fetches;
++static void fetch_curl_done(CURL *curl_handle, CURLcode result);
++static void fetch_curl_stop(struct curl_fetch_info *f);
++#endif
+ /* transfers the pump saw end, oldest first, for the next poll */
+ static struct curl_fetch_info *done_fetches, *done_fetches_tail;
+ static size_t curl_held_bytes;
+@@ -600,6 +619,12 @@ static struct curl_fetch_info *fetch_alloc(void)
+ 	fetch->done_pending = false;
+ 	fetch->done_result = CURLE_OK;
+ 	fetch->done_next = NULL;
++#ifdef FETCH_CURL_RESOLVE
++	fetch->resolving = false;
++	fetch->outside_curl = false;
++	fetch->resolve_next = NULL;
++	fetch->resolve = NULL;
++#endif
+ 
+ 	return fetch;
+ }
+@@ -1440,6 +1465,138 @@ static CURLcode fetch_curl_set_options(struct curl_fetch_info *f)
+ 	return CURLE_OK;
+ }
+ 
++#ifdef FETCH_CURL_RESOLVE
++/*
++ * Looking host names up off the main thread (VitaSurf).
++ *
++ * curl is built without its threaded resolver, so it looked each new
++ * host up inside curl_multi_perform and the browser stopped until the
++ * answer came: on claude.ai a Cloudflare host that never answered held
++ * everything for 32 s, from inside a script that was keeping transfers
++ * moving. A fetch to a host name now waits on vita_resolve, which looks
++ * it up on a thread of its own, and goes to curl with the address in
++ * CURLOPT_RESOLVE, so curl finds it in its DNS cache and never asks. The
++ * fetch holds its place in the fetch ring while it waits, so the queue
++ * and the poll treat it as the transfer it is about to be.
++ */
++
++/** Whether curl would look this fetch's host up, rather than connect to
++ * an address or a proxy. */
++static bool fetch_curl_resolve_wanted(struct curl_fetch_info *f)
++{
++	const char *host = lwc_string_data(f->host);
++	size_t len = lwc_string_length(f->host);
++
++	if (len == 0 || host[0] == '[' ||
++	    strspn(host, "0123456789.") == len ||
++	    strcasecmp(host, "localhost") == 0) {
++		return false;
++	}
++	/* through a proxy, curl looks up the proxy's name, not this */
++	if (nsoption_bool(http_proxy) &&
++	    nsoption_charp(http_proxy_host) != NULL) {
++		return false;
++	}
++	return true;
++}
++
++/**
++ * Give the fetch to curl if its host's address is known.
++ *
++ * 
++eturn 1 if curl has it now, 0 while the lookup goes on, -1 if the
++ *	   host has no address (fetch_error_buffer says why).
++ */
++static int fetch_curl_resolve_try(struct curl_fetch_info *f)
++{
++	const char *host = lwc_string_data(f->host);
++	char addrs[16], why[64], entry[300];
++	lwc_string *port;
++	long portnum;
++	CURLMcode codem;
++
++	switch (vita_resolve(host, addrs, sizeof addrs, why, sizeof why)) {
++	case VITA_RESOLVE_PENDING:
++		return 0;
++	case VITA_RESOLVE_FAILED:
++		snprintf(fetch_error_buffer, sizeof fetch_error_buffer,
++			 "Could not resolve host: %s (%s)", host, why);
++		return -1;
++	default:
++		break;
++	}
++	port = nsurl_get_component(f->url, NSURL_PORT);
++	if (port != NULL) {
++		portnum = strtol(lwc_string_data(port), NULL, 10);
++		lwc_string_unref(port);
++	} else {
++		portnum = nsurl_get_scheme_type(f->url) == NSURL_SCHEME_HTTPS ?
++			443 : 80;
++	}
++	/* "+" so that curl lets it go when its own DNS cache would */
++	snprintf(entry, sizeof entry, "+%s:%ld:%s", host, portnum, addrs);
++	f->resolve = curl_slist_append(NULL, entry);
++	if (f->resolve != NULL) {
++		curl_easy_setopt(f->curl_handle, CURLOPT_RESOLVE, f->resolve);
++	}
++	codem = curl_multi_add_handle(fetch_curl_multi, f->curl_handle);
++	assert(codem == CURLM_OK || codem == CURLM_CALL_MULTI_PERFORM);
++	f->outside_curl = false;
++	return 1;
++}
++
++/** Take a fetch off the resolving list. */
++static void fetch_curl_resolve_unlink(struct curl_fetch_info *f)
++{
++	struct curl_fetch_info **pp;
++
++	for (pp = &resolving_fetches; *pp != NULL; pp = &(*pp)->resolve_next) {
++		if (*pp == f) {
++			*pp = f->resolve_next;
++			break;
++		}
++	}
++	f->resolve_next = NULL;
++	f->resolving = false;
++}
++
++/**
++ * Hand curl the fetches whose hosts have addresses now. Only the poll
++ * may finish one whose host has none: that reaches the rest of NetSurf,
++ * which the pump must not.
++ */
++static void fetch_curl_resolve_poll(bool may_finish)
++{
++	struct curl_fetch_info **pp, *f;
++	int r;
++
++again:
++	pp = &resolving_fetches;
++	while ((f = *pp) != NULL) {
++		if (f->abort) {
++			/* aborted while the poll ran: nothing to tell */
++			fetch_curl_resolve_unlink(f);
++			fetch_curl_stop(f);
++			fetch_free(f->fetch_handle);
++			continue;
++		}
++		r = fetch_curl_resolve_try(f);
++		if (r == 0 || (r < 0 && !may_finish)) {
++			pp = &f->resolve_next;
++			continue;
++		}
++		fetch_curl_resolve_unlink(f);
++		if (r < 0) {
++			/* as curl would have said it; the callbacks this
++			 * makes may change the list, so start again */
++			fetch_curl_done(f->curl_handle,
++					CURLE_COULDNT_RESOLVE_HOST);
++			goto again;
++		}
++	}
++}
++#endif
++
+ /**
+  * Initiate a fetch from the queue.
+  *
+@@ -1465,6 +1622,20 @@ fetch_curl_initiate_fetch(struct curl_fetch_info *fetch, CURL *handle)
+ 		return false;
+ 	}
+ 
++#ifdef FETCH_CURL_RESOLVE
++	/* curl has it once its host's address is known; nothing may be
++	 * said to the caller from here, so a failure waits for the poll */
++	if (fetch_curl_resolve_wanted(fetch)) {
++		fetch->outside_curl = true;
++		if (fetch_curl_resolve_try(fetch) != 1) {
++			fetch->resolving = true;
++			fetch->resolve_next = resolving_fetches;
++			resolving_fetches = fetch;
++		}
++		return true;
++	}
++#endif
++
+ 	/* add to the global curl multi handle */
+ 	codem = curl_multi_add_handle(fetch_curl_multi, fetch->curl_handle);
+ 	assert(codem == CURLM_OK || codem == CURLM_CALL_MULTI_PERFORM);
+@@ -1572,6 +1743,13 @@ static void fetch_curl_stop(struct curl_fetch_info *f)
+ 
+ 	if (f->curl_handle) {
+ 		/* remove from curl multi handle */
++#ifdef FETCH_CURL_RESOLVE
++		/* not one it was ever given, whose host had no address or
++		 * which was stopped while that was being looked up */
++		if (f->outside_curl) {
++			codem = CURLM_OK;
++		} else
++#endif
+ 		codem = curl_multi_remove_handle(fetch_curl_multi,
+ 				f->curl_handle);
+ 		assert(codem == CURLM_OK);
+@@ -1617,6 +1795,11 @@ static void fetch_curl_free(void *vf)
+ 	int i;
+ 
+ 	fetch_curl_drop_held(f);
++#ifdef FETCH_CURL_RESOLVE
++	if (f->resolving) {
++		fetch_curl_resolve_unlink(f);
++	}
++#endif
+ 	if (f->done_pending) {
+ 		struct curl_fetch_info **pp, *prev = NULL;
+ 
+@@ -1643,6 +1826,11 @@ static void fetch_curl_free(void *vf)
+ 	if (f->headers) {
+ 		curl_slist_free_all(f->headers);
+ 	}
++#ifdef FETCH_CURL_RESOLVE
++	if (f->resolve) {
++		curl_slist_free_all(f->resolve);
++	}
++#endif
+ 	fetch_curl_free_postdata(f->postdata);
+ 	NSCURL_POSTDATA_FREE(f->curl_postdata);
+ 
+@@ -2002,6 +2190,9 @@ static void fetch_curl_poll(lwc_string *scheme_ignored)
+ 	/* first what arrived while a script ran, then the transfers that
+ 	 * ended then (VitaSurf) */
+ 	fetch_curl_flush_held();
++#ifdef FETCH_CURL_RESOLVE
++	fetch_curl_resolve_poll(true);
++#endif
+ 	while (done_fetches != NULL) {
+ 		struct curl_fetch_info *f = done_fetches;
+ 
+@@ -2469,6 +2660,11 @@ bool fetch_curl_pump(void)
+ 	    curl_held_bytes >= CURL_HELD_MAX) {
+ 		return false;
+ 	}
++#ifdef FETCH_CURL_RESOLVE
++	/* a fetch whose host's address came while a script ran starts
++	 * now; one whose host has none waits for the poll to say so */
++	fetch_curl_resolve_poll(false);
++#endif
+ 	nsu_getmonotonic_ms(&t0);
+ 	inside_curl = true;
+ 	curl_holding = true;

@@ -91,7 +91,7 @@ Each phase must work on real hardware before the next one starts.
 ## Browser-specific notes
 
 - Paths: NetSurf assumes POSIX-style paths. Put all translation to `app0:` and `ux0:` in `vita/platform/`, not scattered through the code.
-- Networking: initialize SceNet before any curl call. Point curl at the bundled CA file through NetSurf's `ca_bundle` option.
+- Networking: initialize SceNet before any curl call. Point curl at the bundled CA file through NetSurf's `ca_bundle` option. curl has no threaded resolver (vdpm's options), so it must never look a name up itself: `vita/platform/vita_resolve.c` looks hosts up on threads of their own, and the fetcher (patch 0392) and WebSockets hold a connection back until the address is known and hand it to curl with `CURLOPT_RESOLVE`. The log's "dns:" lines say which lookups were slow or failed, and the SceNet error.
 - Caches: set NetSurf's cache options (such as `memory_cache_size`) low by default and make them configurable.
 - Main loop: NetSurf runs a single-threaded scheduler with poll-based fetching. Do not add threads unless there's a measured need. If you add any, set their stack sizes explicitly.
 - Rendering: blit only damaged regions reported through libnsfb updates. Avoid uploading the full screen every frame when nothing changed.

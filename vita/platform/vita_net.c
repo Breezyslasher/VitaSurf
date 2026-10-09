@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "vita_platform.h"
+#include "vita_resolve.h"
 
 /*
  * SceNet takes its socket and buffer memory from this pool. It has to
@@ -104,6 +105,8 @@ void vita_net_fini(void)
 	if (!net_up) {
 		return;
 	}
+	/* a lookup still running uses SceNet until it ends */
+	vita_resolve_fini();
 	sceNetCtlTerm();
 	sceNetTerm();
 	sceSysmoduleUnloadModule(SCE_SYSMODULE_NET);
