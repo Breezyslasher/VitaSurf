@@ -13333,6 +13333,40 @@ static JSValue win_vita_misses(JSContext *ctx, JSValueConst this_val,
 	return JS_NewString(ctx, out);
 }
 
+/*
+ * The reads on window, navigator, document and the like that found
+ * nothing, written out when a page closes (VitaSurf). They were only
+ * written with an uncaught error, and a page that waits for what is not
+ * here throws nothing: the claude.ai challenge's widget asked its page
+ * for parameters and the page never answered, with nothing in the log
+ * to say what it was looking for. Names only, the last MISS_RING, from
+ * whichever pages read them since the last report.
+ */
+static void log_in_pieces(const char *head, const char *text);
+
+static void miss_ring_report(void)
+{
+	char out[MISS_RING * 66 + 8];
+	size_t n = 0;
+	unsigned i, start;
+
+	if (miss_ring_next == 0)
+		return;
+	out[0] = '\0';
+	start = miss_ring_next > MISS_RING ? miss_ring_next - MISS_RING : 0;
+	for (i = start; i < miss_ring_next; i++) {
+		int w = snprintf(out + n, sizeof(out) - n, "%s%s",
+				 n > 0 ? ", " : "", miss_ring[i % MISS_RING]);
+
+		if (w < 0 || (size_t)w >= sizeof(out) - n)
+			break;
+		n += (size_t)w;
+	}
+	memset(miss_ring, 0, sizeof(miss_ring));
+	miss_ring_next = 0;
+	log_in_pieces("qjs: read and not found here, oldest first: ", out);
+}
+
 /* What marks a popover shown: libdom user data under this key, which
    nscss's :popover-open reads (VitaSurf). */
 static int popover_mark;
@@ -16067,6 +16101,7 @@ nserror js_closethread(jsthread *thread)
 	gap_report();
 	gap_reset();
 	JS_GetLazyCompileStats(thread->heap->rt, &lazy_n, &lazy_ms);
+	miss_ring_report();
 	vita_log("qjs: page closed in %u ms, runtime memory now %u KB; "
 		 "%u functions compiled when first called while it was "
 		 "open, in %u ms",

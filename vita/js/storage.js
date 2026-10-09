@@ -224,7 +224,135 @@ function stringToBytes(s){
  return u8;
 }
 
-W.structuredClone = function(value){ return decode(encode(value)); };
+/*
+ * structuredClone, and the copy postMessage makes, as the HTML standard's
+ * serialisation has them (VitaSurf): straight from value to copy rather
+ * than through the stored form above, which is JSON's shape and lost an
+ * Error's type, a boxed primitive, an array's length and its other
+ * properties, and a Blob's, a File's or an ImageData's kind; and which
+ * copied what a browser refuses to: a node, an event, a promise, a URL.
+ */
+var CLONE_ERRORS = { Error: 1, EvalError: 1, RangeError: 1, ReferenceError: 1,
+ SyntaxError: 1, TypeError: 1, URIError: 1 };
+/* what an object the prelude implements is, for the clone: one of the
+   serialisable kinds it rebuilds, or one a browser refuses to copy */
+var CLONE_REFUSED = ['Node', 'Event', 'EventTarget', 'URL', 'URLSearchParams',
+ 'MessagePort', 'Location', 'History', 'Navigator', 'Storage', 'CSSStyleDeclaration',
+ 'Request', 'Response', 'Headers', 'AbortSignal', 'AbortController', 'FormData',
+ 'CSSStyleSheet', 'MediaQueryList', 'Worker', 'WebSocket', 'XMLHttpRequest'];
+function platformBrand(v, b){
+ var i;
+ if (typeof W.DOMException === 'function' && v instanceof W.DOMException)
+  return 'DOMException';
+ if (typeof W.ImageData === 'function' && v instanceof W.ImageData)
+  return 'ImageData';
+ if (v === W || v === W.location || v === W.navigator) return 'Window';
+ for (i = 0; i < CLONE_REFUSED.length; i++) {
+  var C = W[CLONE_REFUSED[i]];
+  if (typeof C === 'function' && C.prototype && v instanceof C)
+   return CLONE_REFUSED[i];
+ }
+ /* a node from another frame's realm */
+ if (typeof v.nodeType === 'number' && typeof v.nodeName === 'string' &&
+     typeof v.appendChild === 'function') return 'Node';
+ return b;
+}
+function cloneFail(what){
+ throw new DOMException(what + ' could not be cloned.', 'DataCloneError');
+}
+function clone(value){
+ var seen = new Map();
+ function walk(v){
+  var t = typeof v;
+  if (v === null || t === 'undefined' || t === 'boolean' || t === 'number' ||
+      t === 'string' || t === 'bigint') return v;
+  if (t === 'function') cloneFail(String(v).slice(0, 40));
+  if (t === 'symbol') cloneFail(String(v));
+  if (seen.has(v)) return seen.get(v);
+  var b = brand(v), c, k, i;
+  /* this browser's own platform objects mostly have no brand of their
+     own, so ask what they are */
+  if (b === 'Object' || b === 'Error') b = platformBrand(v, b);
+  if (keyHooks && keyHooks.is(v)) {
+   c = keyHooks.unpack(keyHooks.pack(v)); seen.set(v, c); return c;
+  }
+  switch (b) {
+  case 'Boolean': c = Object(Boolean.prototype.valueOf.call(v)); break;
+  case 'Number': c = Object(Number.prototype.valueOf.call(v)); break;
+  case 'String': c = Object(String.prototype.valueOf.call(v)); break;
+  case 'BigInt': c = Object(BigInt.prototype.valueOf.call(v)); break;
+  case 'Date': c = new Date(Date.prototype.getTime.call(v)); break;
+  case 'RegExp': c = new RegExp(v.source, v.flags); break;
+  case 'ArrayBuffer': c = v.slice(0); break;
+  case 'Map':
+   c = new Map(); seen.set(v, c);
+   Map.prototype.forEach.call(v, function(val, key){ c.set(walk(key), walk(val)); });
+   return c;
+  case 'Set':
+   c = new Set(); seen.set(v, c);
+   Set.prototype.forEach.call(v, function(item){ c.add(walk(item)); });
+   return c;
+  case 'Blob':
+   c = new W.Blob([v], { type: v.type }); break;
+  case 'File':
+   c = new W.File([v], v.name, { type: v.type, lastModified: v.lastModified }); break;
+  case 'ImageData':
+   c = new W.ImageData(new Uint8ClampedArray(v.data), v.width, v.height); break;
+  case 'DOMException':
+   c = new W.DOMException(v.message, v.name); break;
+  case 'Error':
+   /* the standard's own error types keep theirs; any other is an Error */
+   k = CLONE_ERRORS[v.name] ? v.name : 'Error';
+   c = new W[k](v.message === undefined ? undefined : String(v.message));
+   if (typeof v.stack === 'string') {
+    try { Object.defineProperty(c, 'stack', { value: v.stack, writable: true,
+     configurable: true }); } catch (e) {}
+   }
+   seen.set(v, c);
+   if (v.cause !== undefined && Object.prototype.hasOwnProperty.call(v, 'cause'))
+    c.cause = walk(v.cause);
+   return c;
+  case 'Window': case 'Node': case 'Event': case 'EventTarget': case 'URL':
+  case 'URLSearchParams': case 'MessagePort': case 'Location': case 'History':
+  case 'Navigator': case 'Storage': case 'CSSStyleDeclaration': case 'Request':
+  case 'Response': case 'Headers': case 'AbortSignal': case 'AbortController':
+  case 'FormData': case 'CSSStyleSheet': case 'MediaQueryList': case 'Worker':
+  case 'WebSocket': case 'XMLHttpRequest':
+   cloneFail(b);
+  default:
+   if (ArrayBuffer.isView(v)) {
+    var buf = seen.has(v.buffer) ? seen.get(v.buffer) : v.buffer.slice(0);
+    seen.set(v.buffer, buf);
+    c = b === 'DataView' ? new DataView(buf, v.byteOffset, v.byteLength)
+                         : new (W[b] || v.constructor)(buf, v.byteOffset, v.length);
+    break;
+   }
+   if (Array.isArray(v)) {
+    c = new Array(v.length); seen.set(v, c);
+    for (k in v) {
+     if (Object.prototype.hasOwnProperty.call(v, k)) c[k] = walk(v[k]);
+    }
+    return c;
+   }
+   /* an ordinary object, whatever its class; a platform object or one
+      of the language's own that carries no data is refused */
+   if (b !== 'Object' && b !== 'Arguments') cloneFail(b);
+   c = {}; seen.set(v, c);
+   var keys = Object.keys(v);
+   for (i = 0; i < keys.length; i++) c[keys[i]] = walk(v[keys[i]]);
+   return c;
+  }
+  seen.set(v, c);
+  return c;
+ }
+ return walk(value);
+}
+
+W.structuredClone = function(value){
+ if (arguments.length < 1)
+  throw new TypeError("Failed to execute 'structuredClone' on 'Window': 1 argument required, but only 0 present.");
+ return clone(value);
+};
 
 /* ------------------------------------------------------------- Storage */
 
