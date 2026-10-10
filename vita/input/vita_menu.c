@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -80,6 +81,7 @@ enum item {
 	ITEM_IMAGES,
 	ITEM_DARK_MODE,
 	ITEM_CACHE,
+	ITEM_CLEAR_COOKIES,
 	ITEM_LOG,
 	ITEM_DUMP_LAYOUT,
 	ITEM_QUIT,
@@ -811,6 +813,118 @@ static void toggle_bookmark(void)
 	free(url);
 }
 
+/*
+ * Clear the cookies a request to this page's host would carry, as a
+ * browser's "clear this site's cookies" does: its own, and the domain
+ * cookies of the domains above it. A stale one otherwise stays a year,
+ * and goes out ahead of the one that replaced it.
+ */
+struct site_cookie {
+	char *domain;
+	char *path;
+	char *name;
+};
+
+static struct site_cookie *site_cookies;
+static int nsite_cookies;
+static int site_cookies_cap;
+static const char *site_cookies_host;
+
+static bool cookie_domain_covers(const char *domain, const char *host)
+{
+	size_t dl, hl;
+
+	if (domain[0] != '.') {
+		return strcasecmp(domain, host) == 0;
+	}
+	domain++;
+	dl = strlen(domain);
+	hl = strlen(host);
+	if (hl == dl) {
+		return strcasecmp(domain, host) == 0;
+	}
+	return hl > dl && host[hl - dl - 1] == '.' &&
+	       strcasecmp(host + hl - dl, domain) == 0;
+}
+
+static bool site_cookie_collect(const struct cookie_data *c)
+{
+	struct site_cookie *sc;
+
+	if (c->domain == NULL || c->path == NULL || c->name == NULL ||
+	    !cookie_domain_covers(c->domain, site_cookies_host)) {
+		return true;
+	}
+	if (nsite_cookies == site_cookies_cap) {
+		int cap = site_cookies_cap ? site_cookies_cap * 2 : 32;
+		struct site_cookie *n = realloc(site_cookies,
+						sizeof(*n) * (size_t)cap);
+
+		if (n == NULL) {
+			return false;
+		}
+		site_cookies = n;
+		site_cookies_cap = cap;
+	}
+	sc = &site_cookies[nsite_cookies];
+	sc->domain = strdup(c->domain);
+	sc->path = strdup(c->path);
+	sc->name = strdup(c->name);
+	if (sc->domain == NULL || sc->path == NULL || sc->name == NULL) {
+		free(sc->domain);
+		free(sc->path);
+		free(sc->name);
+		return false;
+	}
+	nsite_cookies++;
+	return true;
+}
+
+static void clear_site_cookies(void)
+{
+	struct gui_window *gw = vita_input_window();
+	nsurl *url = NULL;
+	lwc_string *host;
+	int i;
+
+	if (gw == NULL ||
+	    browser_window_get_url(gw->bw, false, &url) != NSERROR_OK ||
+	    url == NULL) {
+		return;
+	}
+	host = nsurl_get_component(url, NSURL_HOST);
+	nsurl_unref(url);
+	if (host == NULL) {
+		vita_log("menu: this page has no host, so no cookies to clear");
+		return;
+	}
+	site_cookies_host = lwc_string_data(host);
+	nsite_cookies = 0;
+	/* collected first: deleting inside the walk would free the
+	 * cookie it is standing on */
+	urldb_iterate_cookies(site_cookie_collect);
+	for (i = 0; i < nsite_cookies; i++) {
+		vita_log("menu: cleared cookie %s (domain %s, path %s) for %s",
+			 site_cookies[i].name, site_cookies[i].domain,
+			 site_cookies[i].path, site_cookies_host);
+		urldb_delete_cookie(site_cookies[i].domain,
+				    site_cookies[i].path,
+				    site_cookies[i].name);
+		free(site_cookies[i].domain);
+		free(site_cookies[i].path);
+		free(site_cookies[i].name);
+	}
+	vita_log("menu: cleared %d cookies for %s", nsite_cookies,
+		 site_cookies_host);
+	free(site_cookies);
+	site_cookies = NULL;
+	nsite_cookies = 0;
+	site_cookies_cap = 0;
+	site_cookies_host = NULL;
+	lwc_string_unref(host);
+	urldb_save_cookies(VITASURF_COOKIES_PATH);
+}
+
 static void activate(enum item item)
 {
 	switch (item) {
@@ -909,6 +1023,10 @@ static void activate(enum item item)
 		 */
 		vitasurf_set_cache_disabled(!vitasurf_cache_disabled());
 		update_labels();
+		break;
+	case ITEM_CLEAR_COOKIES:
+		clear_site_cookies();
+		vita_menu_close();
 		break;
 	case ITEM_LOG:
 		vita_menu_close();
@@ -1015,6 +1133,9 @@ static void item_label(enum item item, char *buf, size_t len)
 		snprintf(buf, len, "Cache: %s",
 			 vitasurf_cache_disabled() ?
 			 "off, every fetch goes to the network" : "on");
+		break;
+	case ITEM_CLEAR_COOKIES:
+		snprintf(buf, len, "Clear this site's cookies");
 		break;
 	case ITEM_LOG:
 		snprintf(buf, len, "Log: where the last page load went");
