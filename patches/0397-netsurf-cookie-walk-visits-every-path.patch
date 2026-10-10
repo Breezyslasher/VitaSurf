@@ -1,0 +1,40 @@
+diff --git a/content/urldb.c b/content/urldb.c
+index c5acccfd4..7a62131fd 100644
+--- a/content/urldb.c
++++ b/content/urldb.c
+@@ -588,6 +588,35 @@ urldb_iterate_entries_path(const struct path_data *parent,
+ 	const struct path_data *p = parent;
+ 	const struct cookie_data *c;
+ 
++	if (url_callback == NULL && cookie_callback != NULL) {
++		/* Any node may hold cookies, not only the leaves: the
++		 * host's own holds its domain cookies, and a node with
++		 * URLs below it those set with its Path. So visit every
++		 * node, each before its children. */
++		do {
++			c = (const struct cookie_data *)p->cookies;
++			for (; c != NULL; c = c->next) {
++				if (!cookie_callback(c))
++					return false;
++			}
++
++			if (p->children != NULL) {
++				p = p->children;
++				continue;
++			}
++
++			while (p != parent) {
++				if (p->next != NULL) {
++					p = p->next;
++					break;
++				}
++				p = p->parent;
++			}
++		} while (p != parent);
++
++		return true;
++	}
++
+ 	do {
+ 		if (p->children != NULL) {
+ 			/* Drill down into children */
