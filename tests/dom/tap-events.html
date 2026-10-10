@@ -1,0 +1,26 @@
+<!doctype html>
+<title>tap events</title>
+<!-- What a tap sends, against Chrome. Tap the grey box, then the words
+     of the label (the monkey: WINDOW CLICK at 40,20, then at 60,60).
+     Expected, as Chrome prints for a mouse click:
+       BOX PointerEvent trusted client=40,20 view=true detail=1 same=true
+       BOX pointerdown,mousedown,pointerup,mouseup,click
+       LABEL click@SPAN+,click@INPUT+,input+,change+ checked=true -->
+<style>html,body{margin:0;font:16px sans-serif}#b{width:200px;height:50px;background:#ccc}</style>
+<div id=b>tap</div>
+<label><input type=checkbox id=c><span id=s>Verify you are human</span></label>
+<script>
+var b=document.getElementById('b'),c=document.getElementById('c'),seq=[],first=null,lab=[];
+['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){
+ b.addEventListener(t,function(e){seq.push(t);
+  if(t==='click'){first=e;
+   console.log('BOX '+Object.prototype.toString.call(e).slice(8,-1)+(e.isTrusted?' trusted':' untrusted')+
+    ' client='+e.clientX+','+e.clientY+' view='+(e.view===window)+' detail='+e.detail);}});});
+document.addEventListener('click',function(e){
+ if(e.target===b)console.log('BOX same='+(e===first));
+ else lab.push('click@'+e.target.tagName+(e.isTrusted?'+':'-'));});
+c.addEventListener('input',function(e){lab.push('input'+(e.isTrusted?'+':'-'));});
+c.addEventListener('change',function(e){lab.push('change'+(e.isTrusted?'+':'-'));});
+setTimeout(function(){console.log('BOX '+seq.join(','));
+ console.log('LABEL '+lab.join(',')+' checked='+c.checked);},6000);
+</script>

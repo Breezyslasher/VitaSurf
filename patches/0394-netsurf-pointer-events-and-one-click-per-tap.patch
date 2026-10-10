@@ -1,0 +1,320 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 1b0df39d7..ec64cbafc 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -135,6 +135,43 @@ bool fire_generic_dom_event(dom_string *type, dom_node *target,
+ 	return result;
+ }
+ 
++/* exported interface, see private.h (VitaSurf) */
++struct html_pointer_event html_pointer_current;
++
++/* Exported interface, see private.h (VitaSurf) */
++bool fire_dom_pointer_event(const char *type, dom_node *target,
++		int x, int y, int button, int buttons, int detail)
++{
++	struct html_pointer_event saved = html_pointer_current;
++	dom_string *t = NULL;
++	dom_event *evt = NULL;
++	bool result = true;
++
++	if (target == NULL ||
++	    dom_string_create((const uint8_t *) type, strlen(type), &t) !=
++			DOM_NO_ERR) {
++		return true;
++	}
++	if (dom_event_create(&evt) != DOM_NO_ERR) {
++		dom_string_unref(t);
++		return true;
++	}
++	if (dom_event_init(evt, t, true, true) == DOM_NO_ERR) {
++		html_pointer_current.evt = evt;
++		html_pointer_current.x = x;
++		html_pointer_current.y = y;
++		html_pointer_current.button = button;
++		html_pointer_current.buttons = buttons;
++		html_pointer_current.detail = detail;
++		result = fire_dom_event(evt, target);
++		/* a listener may have made one of its own meanwhile */
++		html_pointer_current = saved;
++	}
++	dom_event_unref(evt);
++	dom_string_unref(t);
++	return result;
++}
++
+ /* Exported interface, see html_internal.h */
+ bool fire_dom_keyboard_event(dom_string *type, dom_node *target,
+ 		bool bubbles, bool cancelable, uint32_t key)
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index c7c39d5a7..14ddafc89 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -716,6 +716,7 @@ get_mouse_action_node(html_content *html,
+ 	struct box *box;
+ 	int box_x = 0;
+ 	int box_y = 0;
++	struct dom_node *text_node = NULL;
+ 
+ 	/* initialise the mouse action state data */
+ 	memset(man, 0, sizeof(struct mouse_action_state));
+@@ -852,6 +853,7 @@ get_mouse_action_node(html_content *html,
+ 		if (box->text && !box->object) {
+ 			man->text.box = box;
+ 			man->text.box_x = box_x;
++			text_node = man->node;
+ 		}
+ 
+ 	next_box:
+@@ -861,6 +863,35 @@ get_mouse_action_node(html_content *html,
+ 
+ 	box_at_point_limit = NULL;
+ 
++	/*
++	 * The element the text under the pointer is in (VitaSurf). A text
++	 * box has no node of its own, so a click on a word of a span or a
++	 * label went to the block around it, which is where a browser's
++	 * goes only when the text is the block's own. An inline element's
++	 * text follows its INLINE box among the container's children, up
++	 * to its INLINE_END, so the innermost one still open before the
++	 * text box is the element it is in.
++	 */
++	if (man->text.box != NULL && man->text.box->node == NULL &&
++	    man->node == text_node) {
++		struct box *b;
++		int depth = 0;
++
++		for (b = man->text.box->prev; b != NULL; b = b->prev) {
++			if (b->type == BOX_INLINE_END) {
++				depth++;
++			} else if (b->type == BOX_INLINE) {
++				if (depth == 0) {
++					if (b->node != NULL) {
++						man->node = b->node;
++					}
++					break;
++				}
++				depth--;
++			}
++		}
++	}
++
+ 	/* use of box_x, box_y, or content below this point is probably a
+ 	 * mistake; they will refer to the last box returned by box_at_point */
+ 
+@@ -1588,6 +1619,28 @@ void html_focus_at_point(struct content *c, int x, int y)
+ 		dom_node_unref(n);
+ }
+ 
++/*
++ * The pointer's own events (VitaSurf). A tap sent the page nothing but a
++ * click, and that a bare Event with no position; a browser sends
++ * pointerdown and mousedown when the button goes down, pointerup and
++ * mouseup when it comes up, and then the click, all from where the
++ * pointer is. A page cancelling pointerdown keeps the mouse events
++ * from being sent, as in a browser; the click still is.
++ */
++static html_content *pointer_pressed;	/**< the document pressed in */
++static bool pointer_down_cancelled;	/**< its pointerdown was cancelled */
++
++static void
++pointer_press(html_content *html, dom_node *node, int x, int y)
++{
++	pointer_pressed = html;
++	pointer_down_cancelled = !fire_dom_pointer_event("pointerdown", node,
++							 x, y, 0, 1, 0);
++	if (!pointer_down_cancelled) {
++		fire_dom_pointer_event("mousedown", node, x, y, 0, 1, 1);
++	}
++}
++
+ static nserror
+ mouse_action_drag_none(html_content *html,
+ 		       struct browser_window *bw,
+@@ -1602,14 +1655,24 @@ mouse_action_drag_none(html_content *html,
+ 	/**
+ 	 * computed state
+ 	 *
+-	 * not on heap to avoid allocation or stack because it is large
++	 * On the stack, not static (VitaSurf): a click in an iframe comes
++	 * back here for the frame's document, and a static state was then
++	 * overwritten with the frame's node, so the outer call fired a
++	 * second click at it. A checkbox in a frame was clicked twice by
++	 * one tap. The state is a hundred-odd bytes.
+ 	 */
+-	static struct mouse_action_state mas;
++	struct mouse_action_state mas;
++	bool gadget_was;
++	bool clicked;
+ 
+ 	res = get_mouse_action_node(html, x, y, &mas);
+ 	if (res != NSERROR_OK) {
+ 		return res;
+ 	}
++	/* whether a checkbox or radio was set before this, so its change
++	 * can be told to the page once the click has been (VitaSurf) */
++	gadget_was = (mas.gadget.control != NULL) ?
++			mas.gadget.control->selected : false;
+ 
+ 	html_track_dynamic(html, mouse, mas.node);
+ 
+@@ -1669,8 +1732,16 @@ mouse_action_drag_none(html_content *html,
+ 		content_broadcast(c, CONTENT_MSG_POINTER, &msg_data);
+ 	}
+ 
+-	/* fire dom click event */
+-	if (mouse & BROWSER_MOUSE_CLICK_1) {
++	/* the button going down, in the document it went down in; one in a
++	 * frame is the frame document's to send (VitaSurf) */
++	if ((mouse & BROWSER_MOUSE_PRESS_1) && mas.iframe == NULL &&
++	    mas.node != NULL) {
++		pointer_press(html, mas.node, x, y);
++	}
++
++	/* fire dom click event; one in a frame was the frame document's
++	 * to fire, and its window's, not the iframe element's (VitaSurf) */
++	if ((mouse & BROWSER_MOUSE_CLICK_1) && mas.iframe == NULL) {
+ 		/*
+ 		 * What the click was taken as (VitaSurf): a click that
+ 		 * leads nowhere leaves nothing else in the log to say
+@@ -1700,7 +1771,66 @@ mouse_action_drag_none(html_content *html,
+ 			if (tag != NULL) dom_string_unref(tag);
+ 			if (cls != NULL) dom_string_unref(cls);
+ 		}
+-		fire_generic_dom_event(corestring_dom_click, mas.node, true, true);
++		/* the button coming up, then the click, from where the
++		 * pointer is: a click with no press before it (the monkey's)
++		 * still has one (VitaSurf) */
++		if (mas.node != NULL) {
++			if (pointer_pressed != html) {
++				pointer_press(html, mas.node, x, y);
++			}
++			fire_dom_pointer_event("pointerup", mas.node,
++					       x, y, 0, 0, 0);
++			if (!pointer_down_cancelled) {
++				fire_dom_pointer_event("mouseup", mas.node,
++						       x, y, 0, 0, 1);
++			}
++		}
++		pointer_pressed = NULL;
++		pointer_down_cancelled = false;
++		clicked = fire_dom_pointer_event("click", mas.node,
++						 x, y, 0, 0, 1);
++
++		/*
++		 * A checkbox or radio the click set (VitaSurf). A click on
++		 * its label, which is where the box is drawn often enough,
++		 * is passed on to it as a click of its own; then the page
++		 * hears input and change, as in a browser, or, when it
++		 * cancelled a click, the box goes back to what it was.
++		 */
++		if (mas.gadget.control != NULL &&
++		    (mas.gadget.control->type == GADGET_CHECKBOX ||
++		     mas.gadget.control->type == GADGET_RADIO) &&
++		    mas.gadget.control->selected != gadget_was) {
++			struct form_control *fc = mas.gadget.control;
++			dom_node *cn = fc->node;
++
++			if (clicked && cn != NULL && cn != mas.node) {
++				clicked = fire_dom_pointer_event("click", cn,
++							x, y, 0, 0, 1);
++			}
++			if (!clicked && fc->type == GADGET_CHECKBOX) {
++				fc->selected = gadget_was;
++				dom_html_input_element_set_checked(
++					(dom_html_input_element *) cn,
++					gadget_was);
++				html__redraw_a_box(html, mas.gadget.box);
++			} else if (clicked && cn != NULL) {
++				fire_generic_dom_event(corestring_dom_input,
++						       cn, true, false);
++				fire_generic_dom_event(corestring_dom_change,
++						       cn, true, false);
++			}
++		} else if (clicked && mas.node != NULL &&
++			   mas.gadget.control == NULL &&
++			   mas.link.url == NULL &&
++			   (mas.result.action == ACTION_NONE ||
++			    mas.result.action == ACTION_NOSEND) &&
++			   html->jsthread != NULL) {
++			/* what NetSurf does not do itself: a label passes
++			 * the click to its control, a summary opens its
++			 * details (VitaSurf) */
++			js_activate(html->jsthread, mas.node, x, y);
++		}
+ 	}
+ 
+ 	/* deferred actions that can cause this browser_window to be destroyed
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 2844f3988..81a683a69 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -760,6 +760,31 @@ bool fire_generic_dom_event(dom_string *type, dom_node *target,
+ bool fire_dom_keyboard_event(dom_string *type, dom_node *target,
+ 		bool bubbles, bool cancelable, uint32_t key);
+ 
++/**
++ * The pointer behind the event being dispatched (VitaSurf). libdom's
++ * events cannot say what kind they are, so the script side reads the
++ * pointer's state from here, for this one event only, to make the
++ * MouseEvent or PointerEvent a browser hands its listeners.
++ */
++struct html_pointer_event {
++	struct dom_event *evt; /**< the event this describes, or NULL */
++	int x, y;	/**< where, in document coordinates */
++	int button;	/**< which button changed: 0 the main one */
++	int buttons;	/**< which are down: 1 the main one */
++	int detail;	/**< the click count; 0 for pointer events */
++};
++extern struct html_pointer_event html_pointer_current;
++
++/**
++ * Construct a pointer or mouse event at a place and fire it at the DOM.
++ * It bubbles, can be cancelled and leaves shadow trees, as every one a
++ * browser sends from its pointer does.
++ *
++ * eturn false if a listener cancelled it
++ */
++bool fire_dom_pointer_event(const char *type, dom_node *target,
++		int x, int y, int button, int buttons, int detail);
++
+ /* Useful dom_string pointers */
+ struct dom_string;
+ 
+diff --git a/content/handlers/javascript/js.h b/content/handlers/javascript/js.h
+index 55f8e22ef..ce1c554c0 100644
+--- a/content/handlers/javascript/js.h
++++ b/content/handlers/javascript/js.h
+@@ -133,6 +133,17 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
+  */
+ bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc, struct dom_node *target);
+ 
++/**
++ * Run the activation behaviour of a click the browser sent and the page
++ * did not cancel, where the browser has none of its own: a label passes
++ * the click to its control, a summary opens its details (VitaSurf).
++ *
++ * \param thread The script thread of the clicked document.
++ * \param target What was clicked.
++ * \param x, y   Where, in document coordinates.
++ */
++void js_activate(jsthread *thread, struct dom_node *target, int x, int y);
++
+ bool
+ js_dom_event_add_listener(jsthread *thread,
+ 			  struct dom_document *document,
+diff --git a/content/handlers/javascript/none/none.c b/content/handlers/javascript/none/none.c
+index 12dbc9a02..5db06a4ad 100644
+--- a/content/handlers/javascript/none/none.c
++++ b/content/handlers/javascript/none/none.c
+@@ -71,6 +71,10 @@ bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc,
+ 	return true;
+ }
+ 
++void js_activate(jsthread *thread, struct dom_node *target, int x, int y)
++{
++}
++
+ void js_handle_new_element(jsthread *thread, struct dom_element *node)
+ {
+ }

@@ -1114,27 +1114,82 @@ P.dispatchEvent=function(e){
   else fireAfterActivate(act);}
  else if(act&&!e.defaultPrevented)runActivation(act);
  return r;};
-/* A tap inside a label (VitaSurf). NetSurf follows links and toggles its
- * own form gadgets itself, but knows nothing of labels, and the
- * activation above runs only for a click a script dispatched. Home
- * Assistant's "Keep me logged in" is a label around a checkbox the page
- * keeps invisible and untappable, so a tap on its box or its text did
- * nothing. Last on the window, after the page's own listeners, a real
- * click that nothing cancelled and that lands in a label clicks the
- * control the label is for, or focuses it when it is a text field. */
-window.addEventListener('click',function(e){
- var a,c,t;
- if(!e||e.__vitaActivated||e.defaultPrevented)return;
- a=activationTarget(e.target);
- /* a tapped popover button, as a script's click runs it above */
- if(a&&a.kind==='popover'){runActivation(a);return;}
- if(!a||a.kind!=='label'||!(c=a.control)||c===e.target)return;
- if(c.disabled)return;
- t=String(c.type||'').toLowerCase();
- if(c.tagName==='TEXTAREA'||c.tagName==='SELECT'||(c.tagName==='INPUT'&&
-    !/^(checkbox|radio|submit|reset|button|image|file|color|range)$/.test(t))){
-  if(c.focus)c.focus();return;}
- if(c.click)c.click();});P.getContext=function(){return null;};
+/* Where a tap was, as a pointer or mouse event's fields (VitaSurf): x
+   and y come in document coordinates, and the client ones are taken
+   from the view's scroll. */
+function pointerInit(x,y,button,buttons,detail){
+ var sx=W.scrollX||W.pageXOffset||0,sy=W.scrollY||W.pageYOffset||0;
+ return {bubbles:true,cancelable:true,composed:true,view:W,detail:detail,
+  clientX:x-sx,clientY:y-sy,screenX:x-sx,screenY:y-sy,
+  button:button,buttons:buttons,pointerId:1,pointerType:'mouse',
+  isPrimary:true,width:1,height:1,pressure:buttons?0.5:0};}
+function pointerPlace(e,x,y){
+ try{e.pageX=x;e.pageY=y;e.layerX=x;e.layerY=y;}catch(err){}
+ return e;}
+/* What a tap does once nothing cancelled its click, where NetSurf does
+   nothing itself (VitaSurf). qjs.c calls this when the click's dispatch
+   is over (js_activate), as a browser runs activation behaviour then:
+   a label passes the click to its control as a click of the browser's
+   own, or focuses it when it is a text field, and a summary or popover
+   button does what a script's click of it does. Home Assistant's "Keep
+   me logged in" is a label around a checkbox the page keeps invisible
+   and untappable. */
+Object.defineProperty(window,'__vitaActivate',{configurable:true,
+ value:function(n,x,y){
+  var a=activationTarget(n),c,t,ev;
+  if(!a)return;
+  if(a.kind==='details'||a.kind==='popover'){runActivation(a);return;}
+  if(a.kind!=='label'||!(c=a.control)||c===n||c.disabled)return;
+  t=String(c.type||'').toLowerCase();
+  if(c.tagName==='TEXTAREA'||c.tagName==='SELECT'||(c.tagName==='INPUT'&&
+     !/^(checkbox|radio|submit|reset|button|image|file|color|range)$/.test(t))){
+   if(c.focus)c.focus();return;}
+  ev=uaEvent(pointerPlace(new (W.PointerEvent||W.MouseEvent)('click',
+   pointerInit(x|0,y|0,0,0,1)),x|0,y|0));
+  P.dispatchEvent.call(c,ev);}});
+/* The object an event the browser sends reaches its listeners as
+   (VitaSurf): qjs.c reads the event and hands it here once per
+   dispatch, and every listener gets what this returns. A click,
+   auxclick or contextmenu is a PointerEvent as in Chrome, the mouse's
+   own events MouseEvents, keys KeyboardEvents, focus FocusEvents. */
+var NATIVE_POINTER=' click auxclick contextmenu pointerdown pointerup pointermove '+
+ 'pointerover pointerout pointerenter pointerleave pointercancel ';
+var NATIVE_MOUSE=' dblclick mousedown mouseup mousemove mouseover mouseout '+
+ 'mouseenter mouseleave ';
+var NATIVE_KEY=' keydown keyup keypress ';
+var NATIVE_FOCUS=' focus blur focusin focusout ';
+var NATIVE_INPUT=' input beforeinput ';
+Object.defineProperty(window,'__vitaNativeEvent',{configurable:true,
+ value:function(p){
+  var t=String(p.type),k=' '+t+' ',q=p.__vsPointer,C,init,e,i,f;
+  if(q&&(NATIVE_POINTER.indexOf(k)>=0||NATIVE_MOUSE.indexOf(k)>=0)){
+   init=pointerInit(q.x,q.y,q.button,q.buttons,q.detail);
+   C=NATIVE_POINTER.indexOf(k)>=0&&W.PointerEvent?W.PointerEvent:W.MouseEvent;
+  }else{
+   init={bubbles:!!p.bubbles,cancelable:!!p.cancelable,
+    composed:NATIVE_KEY.indexOf(k)>=0||NATIVE_FOCUS.indexOf(k)>=0||
+     NATIVE_INPUT.indexOf(k)>=0||NATIVE_MOUSE.indexOf(k)>=0||
+     NATIVE_POINTER.indexOf(k)>=0};
+   if(NATIVE_KEY.indexOf(k)>=0){
+    C=W.KeyboardEvent;init.view=W;
+    f=['key','code','keyCode','which','charCode','ctrlKey','shiftKey',
+       'altKey','metaKey','repeat','isComposing'];
+    for(i=0;i<f.length;i++)if(p[f[i]]!==undefined)init[f[i]]=p[f[i]];
+   }else if(NATIVE_FOCUS.indexOf(k)>=0){C=W.FocusEvent;init.view=W;}
+   else if(NATIVE_INPUT.indexOf(k)>=0&&W.InputEvent){C=W.InputEvent;init.view=W;}
+   else if(NATIVE_POINTER.indexOf(k)>=0||NATIVE_MOUSE.indexOf(k)>=0){
+    C=NATIVE_POINTER.indexOf(k)>=0&&W.PointerEvent?W.PointerEvent:W.MouseEvent;
+    init.view=W;}
+   else C=Event;}
+  if(typeof C!=='function')C=Event;
+  e=new C(t,init);
+  if(q)pointerPlace(e,q.x,q.y);
+  /* the legacy key numbers, which a KeyboardEvent built from a
+     dictionary does not take */
+  if(NATIVE_KEY.indexOf(k)>=0&&p.which!==undefined){
+   try{e.which=p.which;}catch(err){}}
+  if(p.target)e.target=p.target;
+  return uaEvent(e);}});P.getContext=function(){return null;};
 P.add=function(o,before){this.insertBefore(o,before||null);};
 Object.defineProperty(P,'options',{configurable:true,get:function(){return this.getElementsByTagName('option');}});
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){var o=this.options;for(var i=0;i<o.length;i++)if(o[i].hasAttribute('selected'))return i;return o.length?0:-1;},set:function(i){var o=this.options;for(var j=0;j<o.length;j++){if(j===i)o[j].setAttribute('selected','');else o[j].removeAttribute('selected');}}});

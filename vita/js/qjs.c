@@ -190,6 +190,9 @@ struct slot_map {
 	unsigned mask;		/**< both tables have mask + 1 buckets */
 };
 
+/* events being dispatched at once, nested, whose objects are kept */
+#define NATIVE_EVENTS 4
+
 struct jsthread {
 	/** the busy sampling's phase when script was entered (VitaSurf) */
 	const char *phase_was;
@@ -238,6 +241,11 @@ struct jsthread {
 	uint64_t overrun_said_ms; /**< when that was last logged */
 	const char *current_script; /**< URL of the script js_exec is running */
 	struct js_listener *listeners; /**< event listeners, freed on close */
+	/* the object each event NetSurf is dispatching reaches its
+	 * listeners as, one per event as in a browser (VitaSurf) */
+	struct dom_event *native_evt[NATIVE_EVENTS];
+	JSValue native_obj[NATIVE_EVENTS];
+	unsigned native_next;
 	/*
 	 * The window's listeners again, on a list of their own (VitaSurf).
 	 * libdom calls window_hook twice for every event it dispatches,
@@ -9437,6 +9445,36 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 		JS_SetPropertyStr(ctx, obj, "isComposing", JS_NewBool(ctx, false));
 	}
 
+	/* what the event is, for the prelude to make the object a
+	 * browser would hand over (VitaSurf) */
+	{
+		bool flag = false;
+
+		if (dom_event_get_bubbles(evt, &flag) != DOM_NO_ERR) {
+			flag = false;
+		}
+		JS_SetPropertyStr(ctx, obj, "bubbles", JS_NewBool(ctx, flag));
+		if (dom_event_get_cancelable(evt, &flag) != DOM_NO_ERR) {
+			flag = false;
+		}
+		JS_SetPropertyStr(ctx, obj, "cancelable", JS_NewBool(ctx, flag));
+	}
+	/* and where the pointer was, when it was the pointer */
+	if (html_pointer_current.evt == evt) {
+		JSValue p = JS_NewObject(ctx);
+
+		JS_SetPropertyStr(ctx, p, "x",
+				  JS_NewInt32(ctx, html_pointer_current.x));
+		JS_SetPropertyStr(ctx, p, "y",
+				  JS_NewInt32(ctx, html_pointer_current.y));
+		JS_SetPropertyStr(ctx, p, "button",
+				  JS_NewInt32(ctx, html_pointer_current.button));
+		JS_SetPropertyStr(ctx, p, "buttons",
+				  JS_NewInt32(ctx, html_pointer_current.buttons));
+		JS_SetPropertyStr(ctx, p, "detail",
+				  JS_NewInt32(ctx, html_pointer_current.detail));
+		JS_SetPropertyStr(ctx, obj, "__vsPointer", p);
+	}
 	JS_SetPropertyStr(ctx, obj, "defaultPrevented", JS_NewBool(ctx, false));
 	JS_SetPropertyStr(ctx, obj, "cancelBubble", JS_NewBool(ctx, false));
 	JS_SetPropertyStr(ctx, obj, "preventDefault",
@@ -9446,6 +9484,80 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 	JS_SetPropertyStr(ctx, obj, "stopImmediatePropagation",
 			  JS_NewCFunction(ctx, ev_stop_propagation, "stopImmediatePropagation", 0));
 	return obj;
+}
+
+/*
+ * The object a native event reaches script as (VitaSurf). NetSurf's own
+ * events -- a click, a key, focus -- were a plain object made afresh for
+ * each listener: not an Event, no position, and what one listener set
+ * on it the next did not see. A browser hands every listener the same
+ * MouseEvent, PointerEvent or KeyboardEvent, so the prelude makes one of
+ * those from what wrap_event read, and it is kept until the dispatch is
+ * over (js_event_cleanup), holding a reference so the address cannot
+ * come back as another event meanwhile.
+ */
+static JSValue native_event(jsthread *thread, struct dom_event *evt)
+{
+	JSContext *ctx = thread->ctx;
+	JSValue obj, global, fn, r;
+	unsigned i;
+
+	for (i = 0; i < NATIVE_EVENTS; i++) {
+		if (thread->native_evt[i] == evt) {
+			return JS_DupValue(ctx, thread->native_obj[i]);
+		}
+	}
+	obj = wrap_event(ctx, evt);
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaNativeEvent");
+	if (JS_IsFunction(ctx, fn)) {
+		r = JS_Call(ctx, fn, global, 1, &obj);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		} else if (JS_IsObject(r)) {
+			JS_FreeValue(ctx, obj);
+			obj = r;
+			r = JS_UNDEFINED;
+		}
+		JS_FreeValue(ctx, r);
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	i = thread->native_next++ % NATIVE_EVENTS;
+	if (thread->native_evt[i] != NULL) {
+		dom_event_unref(thread->native_evt[i]);
+		JS_FreeValue(ctx, thread->native_obj[i]);
+	}
+	dom_event_ref(evt);
+	thread->native_evt[i] = evt;
+	thread->native_obj[i] = JS_DupValue(ctx, obj);
+	return obj;
+}
+
+/* Let a dispatched event's object go. */
+static void native_event_drop(jsthread *thread, struct dom_event *evt)
+{
+	unsigned i;
+
+	for (i = 0; i < NATIVE_EVENTS; i++) {
+		if (thread->native_evt[i] == evt) {
+			dom_event_unref(evt);
+			JS_FreeValue(thread->ctx, thread->native_obj[i]);
+			thread->native_evt[i] = NULL;
+			thread->native_obj[i] = JS_UNDEFINED;
+		}
+	}
+}
+
+static void native_events_free(jsthread *thread)
+{
+	unsigned i;
+
+	for (i = 0; i < NATIVE_EVENTS; i++) {
+		if (thread->native_evt[i] != NULL) {
+			native_event_drop(thread, thread->native_evt[i]);
+		}
+	}
 }
 
 /*
@@ -9549,7 +9661,7 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		JS_SetPropertyStr(ctx, event_obj, "currentTarget",
 				  JS_DupValue(ctx, global));
 	} else {
-		event_obj = wrap_event(ctx, evt);
+		event_obj = native_event(thread, evt);
 	}
 	if (l->on_window) {
 		JS_SetPropertyStr(ctx, event_obj, "currentTarget",
@@ -16261,6 +16373,7 @@ nserror js_closethread(jsthread *thread)
 	}
 	xhr_close_all(thread);
 	free_wrappers(thread);
+	native_events_free(thread);
 	if (!JS_IsUninitialized(thread->import_map)) {
 		JS_FreeValue(thread->ctx, thread->import_map);
 		thread->import_map = JS_UNINITIALIZED;
@@ -19791,6 +19904,41 @@ void js_handle_new_element(jsthread *thread, struct dom_element *node)
 
 void js_event_cleanup(jsthread *thread, struct dom_event *evt)
 {
-	(void)thread;
-	(void)evt;
+	/* the dispatch is over: its object goes (VitaSurf) */
+	if (thread != NULL && !thread->closed && thread->ctx != NULL) {
+		native_event_drop(thread, evt);
+	}
+}
+
+/* exported interface documented in js.h (VitaSurf) */
+void js_activate(jsthread *thread, struct dom_node *target, int x, int y)
+{
+	JSContext *ctx;
+	JSValue global, fn, args[3], r;
+	int i;
+
+	if (thread == NULL || thread->closed || thread->ctx == NULL ||
+	    target == NULL) {
+		return;
+	}
+	ctx = thread->ctx;
+	begin_script(thread, SCRIPT_EVENT);
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaActivate");
+	if (JS_IsFunction(ctx, fn)) {
+		args[0] = wrap_node(ctx, target);
+		args[1] = JS_NewInt32(ctx, x);
+		args[2] = JS_NewInt32(ctx, y);
+		r = JS_Call(ctx, fn, global, 3, args);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		}
+		JS_FreeValue(ctx, r);
+		for (i = 0; i < 3; i++) {
+			JS_FreeValue(ctx, args[i]);
+		}
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	end_script(thread);
 }
