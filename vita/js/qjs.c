@@ -6540,6 +6540,27 @@ static JSValue doc_set_title(JSContext *ctx, JSValueConst this_val, JSValueConst
 	return JS_UNDEFINED;
 }
 
+static nsurl *script_page_url(jsthread *thread);
+
+/*
+ * The SameSite context of what a document's script does with cookies of
+ * target: same-site when target's site is the document's site for
+ * cookies, which a frame of another site than its top window has none
+ * of (RFC 6265bis 5.2), so it sees only SameSite=None cookies there.
+ */
+static void js_cookie_context(nsurl *doc, nsurl *target,
+			      struct urldb_cookie_context *cc)
+{
+	char sfc[256], site[256];
+
+	cc->top_level = false;
+	cc->safe_method = true;
+	cc->strict_ok = true;
+	cc->same_site = !fetch_cookie_site(doc, sfc, sizeof(sfc)) ? false :
+		(urldb_site(target, site, sizeof(site)) &&
+		 strcmp(sfc, site) == 0);
+}
+
 static JSValue doc_get_cookie(JSContext *ctx, JSValueConst this_val)
 {
 	C_WHERE;
@@ -6550,11 +6571,21 @@ static JSValue doc_get_cookie(JSContext *ctx, JSValueConst this_val)
 
 	(void)this_val;
 	if (thread == NULL || thread->win == NULL) return JS_NewString(ctx, "");
-	if (browser_window_get_url(thread->win, false, &url) != NSERROR_OK ||
-	    url == NULL) {
+	/* the page the script is in, which while it loads is not yet the
+	 * window's (script_page_url) */
+	url = script_page_url(thread);
+	if (url != NULL) {
+		url = nsurl_ref(url);
+	} else if (browser_window_get_url(thread->win, false, &url) !=
+		   NSERROR_OK || url == NULL) {
 		return JS_NewString(ctx, "");
 	}
-	cookies = urldb_get_cookie(url, false);
+	{
+		struct urldb_cookie_context cc;
+
+		js_cookie_context(url, url, &cc);
+		cookies = urldb_get_cookie_for(url, false, &cc);
+	}
 	nsurl_unref(url);
 	if (cookies == NULL) {
 		return JS_NewString(ctx, "");
@@ -6573,9 +6604,18 @@ static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueCons
 
 	(void)this_val;
 	if (thread != NULL && thread->win != NULL && s != NULL &&
-	    browser_window_get_url(thread->win, false, &url) == NSERROR_OK &&
-	    url != NULL) {
-		urldb_set_cookie_from_script(s, url);
+	    script_page_url(thread) != NULL) {
+		url = nsurl_ref(script_page_url(thread));
+	} else if (thread != NULL && thread->win != NULL && s != NULL &&
+		   browser_window_get_url(thread->win, false, &url) !=
+		   NSERROR_OK) {
+		url = NULL;
+	}
+	if (url != NULL) {
+		struct urldb_cookie_context cc;
+
+		js_cookie_context(url, url, &cc);
+		urldb_set_cookie_from_script(s, url, &cc);
 		nsurl_unref(url);
 	}
 	if (s) JS_FreeCString(ctx, s);
@@ -6694,9 +6734,19 @@ static void nav_callback(void *p)
 		return;
 	}
 	if (thread->win != NULL && !thread->closed) {
+		/* the page navigating is the referrer, as browsers send it,
+		 * and what decides whether SameSite=Strict cookies go */
+		nsurl *from = script_page_url(thread);
+
+		if (from != NULL) {
+			from = nsurl_ref(from);
+		}
 		/* may destroy this thread; do not touch it after */
-		browser_window_navigate(thread->win, url, NULL,
+		browser_window_navigate(thread->win, url, from,
 					BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
+		if (from != NULL) {
+			nsurl_unref(from);
+		}
 	}
 	nsurl_unref(url);
 }
@@ -8417,8 +8467,9 @@ static void ws_event(void *owner, int id, enum vws_event ev,
 	}
 }
 
-/* The cookies the page's http(s) URL of the same host would send. */
-static char *ws_cookie(const char *url)
+/* The cookies the page's http(s) URL of the same host would send, as
+ * a request from the page's document (SameSite). */
+static char *ws_cookie(jsthread *thread, const char *url)
 {
 	char *http;
 	nsurl *u = NULL;
@@ -8441,7 +8492,23 @@ static char *ws_cookie(const char *url)
 		return NULL;
 	}
 	if (nsurl_create(http, &u) == NSERROR_OK) {
-		cookie = urldb_get_cookie(u, true);
+		nsurl *doc = NULL;
+		struct urldb_cookie_context cc;
+
+		if (thread != NULL && script_page_url(thread) != NULL) {
+			doc = nsurl_ref(script_page_url(thread));
+		} else if (thread != NULL && thread->win != NULL &&
+			   browser_window_get_url(thread->win, false, &doc) !=
+			   NSERROR_OK) {
+			doc = NULL;
+		}
+		if (doc != NULL) {
+			js_cookie_context(doc, u, &cc);
+			cookie = urldb_get_cookie_for(u, true, &cc);
+			nsurl_unref(doc);
+		} else {
+			cookie = urldb_get_cookie(u, true);
+		}
 		nsurl_unref(u);
 	}
 	free(http);
@@ -8472,7 +8539,7 @@ static JSValue win_vita_ws_open(JSContext *ctx, JSValueConst this_val,
 	if (argc > 2 && JS_IsString(argv[2])) {
 		origin = JS_ToCString(ctx, argv[2]);
 	}
-	cookie = ws_cookie(url);
+	cookie = ws_cookie(thread, url);
 	id = vws_open(url, origin, protocols, cookie, ws_event, thread);
 	free(cookie);
 	JS_FreeCString(ctx, url);
@@ -9154,7 +9221,7 @@ static bool xhr_start(struct js_xhr *x)
 	}
 	hdrs[n] = NULL;
 	err = fetch_start(x->url, x->referer, xhr_fetch_callback, x, false,
-			  x->post, NULL, true, false, hdrs, &x->fetch);
+			  x->post, NULL, true, false, false, hdrs, &x->fetch);
 	free(origin_hdr);
 	free(hdrs);
 	if (err != NSERROR_OK) {
