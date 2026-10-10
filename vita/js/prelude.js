@@ -2455,7 +2455,7 @@ _set:function(s){this.readyState=s;this._emit('readystatechange');},
 _body:function(b){var type=null,data;
  if(b===undefined||b===null)data=null;
  else if(b instanceof URLSearchParams){type='application/x-www-form-urlencoded;charset=UTF-8';data=b.toString();}
- else if(b instanceof FormData){type='application/x-www-form-urlencoded;charset=UTF-8';data=b._urlencoded();}
+ else if(b instanceof FormData){var mp=formMultipart(b._p);type=mp.type;data=mp.body;}
  /* bytes go to the network layer as an ArrayBuffer, every byte as it
     is; a string goes as its UTF-8 */
  else if(W.Blob&&b instanceof W.Blob){if(b.type)type=b.type;var u=b._u;data=u.buffer.slice(u.byteOffset,u.byteOffset+u.length);}
@@ -2620,8 +2620,6 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
  W.WebSocket=WebSocket;
 })();
 
-function FormData(form){this._p=[];if(form&&form.getElementsByTagName){['input','select','textarea'].forEach(function(t){var els=form.getElementsByTagName(t);for(var i=0;i<els.length;i++){var e=els[i],n=e.getAttribute('name');if(!n||e.disabled)continue;var ty=(e.getAttribute('type')||'').toLowerCase();if(ty==='checkbox'||ty==='radio'){if(e.checked)this._p.push([n,e.value||'on']);}else if(ty!=='submit'&&ty!=='button'&&ty!=='file')this._p.push([n,e.value]);}},this);
- if(W.__vitaFaceSeen)faceEntries(form).forEach(function(p){this._p.push(p);},this);}}
 /* the entries form-associated custom elements give their form: a string,
    a File, or a FormData of their own (VitaSurf) */
 function faceEntries(form){
@@ -2634,11 +2632,137 @@ function faceEntries(form){
    v.forEach(function(val,k){out.push([k,val]);});return;}
   if(n)out.push([n,typeof v==='object'?v:String(v)]);});
  return out;}
-FormData.prototype={append:function(k,v){this._p.push([String(k),String(v)]);},set:function(k,v){this['delete'](k);this.append(k,v);},get:function(k){for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},
-getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},has:function(k){return this.get(k)!==null;},'delete':function(k){this._p=this._p.filter(function(p){return p[0]!==k;});},
-forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},
-_urlencoded:function(){return this._p.map(function(p){return encodeURIComponent(p[0])+'='+encodeURIComponent(p[1]);}).join('&');}};
-FormData.prototype[Symbol.iterator]=FormData.prototype.entries;W.FormData=FormData;
+/* --- forms: the entry list and its encodings, as the HTML standard has
+   them (VitaSurf). FormData holds strings and Files; a form's entries are
+   its controls in tree order, the submitter alone of its buttons, and
+   what the formdata event's listeners add. */
+function FormData(form,submitter){
+ this._p=[];
+ if(form===undefined||form===null)return;
+ if(!form||form.tagName!=='FORM')throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+ if(submitter!==undefined&&submitter!==null){
+  if(!isSubmitButton(submitter))throw new TypeError("Failed to construct 'FormData': The specified element is not a submit button.");
+  if(submitter.form!==form)throw new DOMException("The specified element is not owned by this form element.",'NotFoundError');}
+ var list=formEntryList(form,submitter||null);
+ if(list===null)throw new DOMException('The form is already building its entry list.','InvalidStateError');
+ this._p=list;}
+function isSubmitButton(e){
+ if(!e||!e.tagName)return false;
+ var t=String(e.getAttribute('type')||'').toLowerCase();
+ if(e.tagName==='BUTTON')return t===''||t==='submit'||(t!=='reset'&&t!=='button');
+ return e.tagName==='INPUT'&&(t==='submit'||t==='image');}
+/* a Blob is held as a File: its own name, the one given, or "blob" */
+function formValue(v,filename){
+ if(W.Blob&&v instanceof W.Blob){
+  if(v instanceof W.File&&filename===undefined)return v;
+  return new W.File([v],filename!==undefined?String(filename):
+   (v instanceof W.File?v.name:'blob'),{type:v.type,lastModified:v.lastModified});}
+ return String(v);}
+FormData.prototype={
+ append:function(k,v,filename){this._p.push([String(k),formValue(v,filename)]);},
+ set:function(k,v,filename){k=String(k);var e=[k,formValue(v,filename)],at=-1;
+  this._p=this._p.filter(function(p,i){if(p[0]!==k)return true;if(at<0){at=i;return true;}return false;});
+  if(at<0)this._p.push(e);else this._p[at]=e;},
+ get:function(k){k=String(k);for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},
+ getAll:function(k){k=String(k);return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},
+ has:function(k){k=String(k);return this._p.some(function(p){return p[0]===k;});},
+ 'delete':function(k){k=String(k);this._p=this._p.filter(function(p){return p[0]!==k;});},
+ forEach:function(f,t){this._p.slice().forEach(function(p){f.call(t,p[1],p[0],this);},this);},
+ entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},
+ keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},
+ values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},
+ _urlencoded:function(){return formUrlencoded(this._p,false);}};
+FormData.prototype[Symbol.iterator]=FormData.prototype.entries;
+Object.defineProperty(FormData.prototype,Symbol.toStringTag,{configurable:true,value:'FormData'});
+W.FormData=FormData;
+function closestTag(e,tag){for(e=e.parentNode;e&&e.tagName;e=e.parentNode)if(e.tagName===tag)return e;return null;}
+/* disabled itself, or in a disabled fieldset other than in its first
+   legend */
+function controlDisabled(e){
+ if(e.hasAttribute('disabled'))return true;
+ for(var c=e,f=e.parentNode;f&&f.tagName;c=f,f=f.parentNode){
+  if(f.tagName==='FIELDSET'&&f.hasAttribute('disabled')){
+   var lg=null,k;for(k=f.firstElementChild;k;k=k.nextElementSibling)if(k.tagName==='LEGEND'){lg=k;break;}
+   if(!(lg&&(c===lg||lg.contains(c))))return true;}}
+ return false;}
+/* constructing the entry list: null while the form is already building
+   one (a formdata listener that asks again) */
+function formEntryList(form,submitter){
+ if(form.__vsBuilding)return null;
+ var out=[];
+ listOf(form.elements).forEach(function(e){
+  var tag=e.tagName,t=String(e.getAttribute('type')||'').toLowerCase(),n;
+  if(!tag||tag==='FIELDSET'||tag==='OUTPUT'||tag==='OBJECT')return;
+  if(e.localName.indexOf('-')>0)return;   /* form-associated custom elements: below */
+  if(closestTag(e,'DATALIST')||controlDisabled(e))return;
+  if(tag==='BUTTON'||(tag==='INPUT'&&(t==='submit'||t==='image'||t==='reset'||t==='button'))){
+   if(e!==submitter||!isSubmitButton(e))return;}
+  if(tag==='INPUT'&&(t==='checkbox'||t==='radio')&&!e.checked)return;
+  if(tag==='INPUT'&&t==='image'){
+   n=e.getAttribute('name')||'';var pre=n?n+'.':'';
+   out.push([pre+'x','0'],[pre+'y','0']);return;}
+  n=e.getAttribute('name');
+  if(n===null||n==='')return;
+  if(tag==='SELECT'){listOf(e.options).forEach(function(o){
+    if(o.selected&&!o.disabled)out.push([n,o.value]);});return;}
+  if(tag==='INPUT'&&(t==='checkbox'||t==='radio')){
+   out.push([n,e.hasAttribute('value')?e.getAttribute('value'):'on']);return;}
+  if(tag==='INPUT'&&t==='file'){
+   var fl=listOf(e.files);
+   if(!fl.length)out.push([n,new W.File([],'',{type:'application/octet-stream'})]);
+   else fl.forEach(function(f){out.push([n,f]);});
+   return;}
+  if(tag==='INPUT'&&t==='hidden'&&n.toLowerCase()==='_charset_'){out.push([n,'UTF-8']);return;}
+  out.push([n,String(e.value)]);
+  var dn=e.getAttribute('dirname');
+  if(dn&&(tag==='TEXTAREA'||(tag==='INPUT'&&/^(|text|search|tel|url|email|password)$/.test(t))))
+   out.push([dn,'ltr']);});
+ if(W.__vitaFaceSeen)faceEntries(form).forEach(function(p){
+  out.push([p[0],formValue(p[1])]);});
+ /* the formdata event: its listeners may add to what is sent */
+ var fd=new FormData();fd._p=out;
+ form.__vsBuilding=true;
+ try{form.dispatchEvent(uaEvent(new W.FormDataEvent('formdata',{bubbles:true,formData:fd})));}
+ finally{form.__vsBuilding=false;}
+ return fd._p;}
+/* newlines as CRLF, as each encoding has a form's names and values */
+function formCRLF(s){return String(s).replace(/\r\n|\r|\n/g,'\r\n');}
+/* application/x-www-form-urlencoded: UTF-8, spaces as +, and every byte
+   but letters, digits and *-._ escaped; a File is its name */
+function formUrlencoded(list,crlf){
+ var enc=new TextEncoder(),hex='0123456789ABCDEF';
+ function one(s){var b=enc.encode(crlf?formCRLF(s):s),o='',i,c;
+  for(i=0;i<b.length;i++){c=b[i];
+   if(c===0x20)o+='+';
+   else if((c>=0x30&&c<=0x39)||(c>=0x41&&c<=0x5a)||(c>=0x61&&c<=0x7a)||c===0x2a||c===0x2d||c===0x2e||c===0x5f)o+=String.fromCharCode(c);
+   else o+='%'+hex[c>>4]+hex[c&15];}
+  return o;}
+ return list.map(function(p){var v=p[1];
+  return one(p[0])+'='+one(W.File&&v instanceof W.File?v.name:v);}).join('&');}
+/* multipart/form-data, with a boundary as Chrome makes one */
+function formMultipart(list){
+ var chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB',
+  r=new Uint8Array(16),bd='----WebKitFormBoundary',i,enc=new TextEncoder(),parts=[],total=0;
+ try{W.crypto.getRandomValues(r);}catch(e){for(i=0;i<16;i++)r[i]=Math.random()*256|0;}
+ for(i=0;i<16;i++)bd+=chars[r[i]&63];
+ function esc(s){return s.replace(/\n/g,'%0A').replace(/\r/g,'%0D').replace(/"/g,'%22');}
+ function add(u){parts.push(u);total+=u.length;}
+ list.forEach(function(p){
+  var v=p[1],h='--'+bd+'\r\nContent-Disposition: form-data; name="'+esc(formCRLF(p[0]))+'"';
+  if(W.File&&v instanceof W.File){
+   add(enc.encode(h+'; filename="'+esc(v.name)+'"\r\nContent-Type: '+
+    (v.type||'application/octet-stream')+'\r\n\r\n'));
+   add(v._u);add(enc.encode('\r\n'));}
+  else add(enc.encode(h+'\r\n\r\n'+formCRLF(v)+'\r\n'));});
+ add(enc.encode('--'+bd+'--\r\n'));
+ var all=new Uint8Array(total),at=0;
+ parts.forEach(function(u){all.set(u,at);at+=u.length;});
+ return {body:all.buffer,type:'multipart/form-data; boundary='+bd};}
+/* text/plain: name=value lines; a File is its name */
+function formTextPlain(list){
+ return list.map(function(p){var v=p[1];
+  return formCRLF(p[0])+'='+formCRLF(W.File&&v instanceof W.File?v.name:v)+'\r\n';}).join('');}
+
 /* HeadersInit as the Fetch standard reads it: anything iterable (an array,
    our Headers, another library's) is a list of name and value pairs, and
    any other object a record of its own keys, so a polyfill's methods and
@@ -4465,10 +4589,24 @@ Object.defineProperty(P,'index',{configurable:true,get:function(){
   set:function(v){var t=this.tagName;
    if(t==='SELECT'){var o=this.options;for(var i=0;i<o.length;i++)o[i].selected=(o[i].value===String(v));return;}
    if(t==='TEXTAREA'){this.textContent=String(v);return;}
+   if(t==='INPUT'){
+    /* value sanitization: a one-line field holds no line breaks, and an
+       address none around it either (HTML standard) */
+    var ty=String(this.getAttribute('type')||'text').toLowerCase();
+    if(/^(text|search|tel|password|url|email)$/.test(ty)||
+       !/^(hidden|checkbox|radio|file|submit|image|reset|button|number|range|color|date|month|week|time|datetime-local)$/.test(ty)){
+     v=String(v).replace(/[\r\n]/g,'');
+     if(ty==='url'||ty==='email')v=v.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'');}}
    d.set.call(this,v);}});})();
+/* requestSubmit fires submit (a SubmitEvent naming its submitter) and
+   goes on unless it is cancelled; submit() does neither */
 P.requestSubmit=function(submitter){
- if(!this.dispatchEvent(uaEvent(new Event('submit',{bubbles:true,cancelable:true}))))return;
- this.submit(submitter);};
+ if(this.tagName!=='FORM')return;
+ if(submitter!==undefined&&submitter!==null){
+  if(!isSubmitButton(submitter))throw new TypeError("Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not a submit button.");
+  if(submitter.form!==this)throw new DOMException("Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not owned by this form element.",'NotFoundError');}
+ else submitter=null;
+ formSubmit(this,submitter,false);};
 /* The window a form or link target names (VitaSurf): _self, _parent,
    _top, or a frame by name, looked for here, then in the frames around
    this one. A name found nowhere, and _blank, stay here: there is one
@@ -4491,31 +4629,58 @@ function targetWindow(name){
   var r=find(w);if(r)return r;
   if(w===w.parent)break;w=w.parent;}
  return W;}
-P.submit=function(submitter){
- if(this.tagName!=='FORM')return;
- var target=(submitter&&submitter.getAttribute&&submitter.getAttribute('formtarget'))||
-  this.getAttribute('target');
+P.submit=function(){if(this.tagName==='FORM')formSubmit(this,null,true);};
+/* The HTML standard's form submission (VitaSurf): the method, action,
+   enctype and target, the submitter's own formmethod and the rest first;
+   a GET puts the entries in the query, a POST to http or https sends
+   them as the body its enctype names, and a dialog form closes its
+   dialog. */
+function formSubmit(form,submitter,fromMethod){
+ if(!inDocument(form)||form.__vsBuilding)return;
+ if(!fromMethod){
+  if(form.__vsFiring)return;
+  var go;form.__vsFiring=true;
+  try{go=form.dispatchEvent(uaEvent(new W.SubmitEvent('submit',
+   {bubbles:true,cancelable:true,submitter:submitter})));}
+  finally{form.__vsFiring=false;}
+  if(!go)return;}
+ function attr(n,sn){return submitter&&submitter.hasAttribute(sn)?
+  submitter.getAttribute(sn):form.getAttribute(n);}
+ var method=String(attr('method','formmethod')||'').toLowerCase();
+ if(method!=='post'&&method!=='dialog')method='get';
+ if(method==='dialog'){
+  var dlg=closestTag(form,'DIALOG');
+  if(!dlg||typeof dlg.close!=='function')return;
+  if(submitter&&!(submitter.tagName==='INPUT'&&
+     String(submitter.getAttribute('type')).toLowerCase()==='image'))
+   dlg.close(String(submitter.value));
+  else dlg.close();
+  return;}
+ var list=formEntryList(form,submitter);
+ if(list===null||!inDocument(form))return;
+ var action=attr('action','formaction'),u;
+ try{u=new URL(action===null||action===''?D.URL:action,D.baseURI);}catch(e){return;}
+ var enctype=String(attr('enctype','formenctype')||'').toLowerCase();
+ if(enctype!=='multipart/form-data'&&enctype!=='text/plain')
+  enctype='application/x-www-form-urlencoded';
+ var target=attr('target','formtarget');
  if(target===null||target===''){var bt=D.querySelector('base[target]');
   target=bt?bt.getAttribute('target'):'';}
- var method=String(this.getAttribute('method')||'get').toLowerCase();
- var action=this.action||D.baseURI;
- if(method!=='get')return;   /* a navigation cannot carry a body here */
- var q=new URLSearchParams('');
- listOf(this.elements).forEach(function(c){
-  if(c.localName&&c.localName.indexOf('-')>0)return;
-  var n=c.name;if(!n||c.disabled)return;
-  var t=String(c.type||'').toLowerCase();
-  if(t==='submit'||t==='button'||t==='reset'||t==='file')return;
-  if((t==='checkbox'||t==='radio')&&!c.checked)return;
-  q.append(n,c.value===undefined?'':c.value);});
- if(W.__vitaFaceSeen)faceEntries(this).forEach(function(p){
-  if(typeof p[1]==='string')q.append(p[0],p[1]);});
+ var win=targetWindow(target),scheme=u.protocol,href=u.href,body=null,type=null;
+ if(method==='post'&&(scheme==='http:'||scheme==='https:')){
+  if(enctype==='multipart/form-data'){var mp=formMultipart(list);body=mp.body;type=mp.type;}
+  else if(enctype==='text/plain'){body=formTextPlain(list);type='text/plain';}
+  else{body=formUrlencoded(list,true);type='application/x-www-form-urlencoded';}}
+ else if(method==='get'&&/^(https?|ftp|data|file):$/.test(scheme)){
+  /* the entries replace the action's query, whatever the enctype */
+  var pre=href.split('#')[0],q=pre.indexOf('?');
+  if(q>=0)pre=pre.slice(0,q);
+  href=pre+'?'+formUrlencoded(list,true)+u.hash;}
  /* Navigating in the middle of a dispatch tears down the page the
     dispatch is walking; let the current task finish first. */
- try{var u=new URL(action,D.baseURI);u.search=q.toString();
-  var href=u.href,win=targetWindow(target);
-  setTimeout(function(){try{win.location.href=href;}catch(e){}},0);
- }catch(e){}};
+ setTimeout(function(){try{
+  if(body!==null)win.__vitaNavigatePost(href,body,type);
+  else win.location.href=href;}catch(e){}},0);}
 P.reset=function(){
  if(this.tagName!=='FORM')return;
  if(!this.dispatchEvent(uaEvent(new Event('reset',{bubbles:true,cancelable:true}))))return;

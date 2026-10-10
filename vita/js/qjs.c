@@ -329,6 +329,11 @@ struct jsthread {
 	/** that navigation was asked for from the user's input, not from a
 	 * timer, a fetch or a script element (Fetch Metadata's -User) */
 	bool nav_user;
+	/** that navigation's POST body, which a form submitted from script
+	 * built, or NULL for a GET; with its length and Content-Type */
+	char *nav_body;
+	size_t nav_body_len;
+	char *nav_type;
 	bool relayout_off;        /**< document too large to rebuild */
 	unsigned relayout_waits;  /**< retries spent waiting on fetches */
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
@@ -6727,13 +6732,30 @@ static nsurl *script_page_url(jsthread *thread)
  * the context the script was running in and crashed on the way back
  * out. A browser queues the navigation too; the last one asked wins.
  */
+/* Forget a pending navigation's POST body. */
+static void nav_clear_body(jsthread *thread)
+{
+	free(thread->nav_body);
+	free(thread->nav_type);
+	thread->nav_body = NULL;
+	thread->nav_type = NULL;
+	thread->nav_body_len = 0;
+}
+
 static void nav_callback(void *p)
 {
 	jsthread *thread = p;
 	nsurl *url = thread->nav_pending;
+	char *body = thread->nav_body, *type = thread->nav_type;
+	size_t body_len = thread->nav_body_len;
 
 	thread->nav_pending = NULL;
+	thread->nav_body = NULL;
+	thread->nav_type = NULL;
+	thread->nav_body_len = 0;
 	if (url == NULL) {
+		free(body);
+		free(type);
 		return;
 	}
 	if (thread->win != NULL && !thread->closed) {
@@ -6744,16 +6766,25 @@ static void nav_callback(void *p)
 		if (from != NULL) {
 			from = nsurl_ref(from);
 		}
+		enum browser_window_nav_flags flags = BW_NAVIGATE_HISTORY |
+			(thread->nav_user ? 0 : BW_NAVIGATE_SCRIPT);
+
 		/* may destroy this thread; do not touch it after */
-		browser_window_navigate(thread->win, url, from,
-					BW_NAVIGATE_HISTORY |
-					(thread->nav_user ? 0 : BW_NAVIGATE_SCRIPT),
-					NULL, NULL, NULL);
+		if (body != NULL) {
+			browser_window_navigate_post(thread->win, url, from,
+						     flags, body, body_len,
+						     type);
+		} else {
+			browser_window_navigate(thread->win, url, from, flags,
+						NULL, NULL, NULL);
+		}
 		if (from != NULL) {
 			nsurl_unref(from);
 		}
 	}
 	nsurl_unref(url);
+	free(body);
+	free(type);
 }
 
 /* whether a URL is the browser's file browser, about:files */
@@ -6835,11 +6866,83 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 		if (thread->nav_pending != NULL) {
 			nsurl_unref(thread->nav_pending);
 		}
+		/* the last navigation asked for wins, with its own body */
+		nav_clear_body(thread);
 		thread->nav_pending = url;
 		thread->nav_user = !thread->entry_safe;
 		guit->misc->schedule(0, nav_callback, thread);
 	}
 	(void)ctx;
+	return JS_UNDEFINED;
+}
+
+/*
+ * __vitaNavigatePost(url, body, type): a form submitted from script with
+ * method POST (prelude.js). The body is the form's data as the HTML
+ * standard encodes it -- an ArrayBuffer of multipart or text/plain, or a
+ * urlencoded string -- and goes as it is, with its Content-Type, or the
+ * urlencoded one when type is null.
+ */
+static JSValue win_vita_navigate_post(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *href, *type = NULL, *str = NULL;
+	const uint8_t *bytes = NULL;
+	size_t len = 0;
+	char *copy;
+
+	(void)this_val;
+	if (argc < 3 || thread == NULL) {
+		return JS_UNDEFINED;
+	}
+	href = JS_ToCString(ctx, argv[0]);
+	if (href == NULL) {
+		return JS_EXCEPTION;
+	}
+	win_navigate(ctx, thread, href);
+	JS_FreeCString(ctx, href);
+	if (thread->nav_pending == NULL) {
+		/* refused, or nowhere to go */
+		return JS_UNDEFINED;
+	}
+
+	if (JS_IsArrayBuffer(argv[1])) {
+		bytes = JS_GetArrayBuffer(ctx, &len, argv[1]);
+		if (bytes == NULL) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+			len = 0;
+		}
+	} else {
+		str = JS_ToCStringLen(ctx, &len, argv[1]);
+		if (str == NULL) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+			len = 0;
+		}
+		bytes = (const uint8_t *)str;
+	}
+	copy = malloc(len + 1);
+	if (copy != NULL) {
+		if (len > 0) {
+			memcpy(copy, bytes, len);
+		}
+		copy[len] = '\0';
+	}
+	if (str != NULL) {
+		JS_FreeCString(ctx, str);
+	}
+	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) {
+		type = JS_ToCString(ctx, argv[2]);
+	}
+	thread->nav_body = copy;
+	thread->nav_body_len = len;
+	thread->nav_type = type != NULL ? strdup(type) : NULL;
+	if (type != NULL) {
+		JS_FreeCString(ctx, type);
+	}
+	vita_log("qjs: the navigation is a POST of %u bytes (%s)",
+		 (unsigned int)len, thread->nav_type != NULL ?
+		 thread->nav_type : "urlencoded");
 	return JS_UNDEFINED;
 }
 
@@ -15660,6 +15763,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaLanguages",
 			  JS_NewCFunction(ctx, win_vita_languages,
 					  "__vitaLanguages", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaNavigatePost",
+			  JS_NewCFunction(ctx, win_vita_navigate_post,
+					  "__vitaNavigatePost", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaFetchAbort",
 			  JS_NewCFunction(ctx, win_vita_fetch_abort, "__vitaFetchAbort", 1));
 
@@ -16463,6 +16569,7 @@ nserror js_closethread(jsthread *thread)
 		nsurl_unref(thread->nav_pending);
 		thread->nav_pending = NULL;
 	}
+	nav_clear_body(thread);
 	if (thread->relayout_pending) {
 		guit->misc->schedule(-1, relayout_callback, thread);
 		thread->relayout_pending = false;
