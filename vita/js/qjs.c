@@ -8931,6 +8931,7 @@ struct js_xhr {
 	nsurl *url;
 	nsurl *referer;      /**< the page; also the origin for CORS */
 	char *post;          /**< request body, NULL for GET */
+	size_t post_len;     /**< its bytes, any of which may be zero */
 	char **headers;      /**< NULL-terminated "Name: value" strings */
 	int status;
 	char *rheaders;
@@ -9158,6 +9159,7 @@ static void xhr_fetch_callback(const fetch_msg *msg, void *p)
 		/* redirected requests are re-issued as GET, as browsers do for 30x */
 		free(x->post);
 		x->post = NULL;
+		x->post_len = 0;
 		x->status = 0;
 		x->rheaders_len = 0;
 		x->body_len = 0;
@@ -9236,7 +9238,7 @@ static bool xhr_start(struct js_xhr *x)
 	}
 	hdrs[n] = NULL;
 	err = fetch_start(x->url, x->referer, xhr_fetch_callback, x, false,
-			  x->post, NULL, true, false,
+			  x->post, x->post_len, NULL, true, false,
 			  FETCH_DEST_EMPTY << FETCH_META_DEST, hdrs, &x->fetch);
 	free(origin_hdr);
 	free(referer_hdr);
@@ -9281,6 +9283,9 @@ static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 	struct js_xhr *x;
 	nsurl *page = NULL, *url = NULL;
 	const char *url_s, *method = NULL, *body = NULL;
+	uint8_t *bytes = NULL;
+	size_t body_len = 0;
+	bool is_bytes = false;
 	int32_t timeout = 0;
 	const char *scheme;
 
@@ -9334,13 +9339,36 @@ static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 	x->cross_origin = !same_origin(url, page);
 
 	method = JS_ToCString(ctx, argv[1]);
-	if (!JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) {
-		body = JS_ToCString(ctx, argv[3]);
+	/* the body: an ArrayBuffer is its bytes as they are, a string its
+	 * UTF-8, each with its length, so a zero byte does not end it */
+	if (JS_IsArrayBuffer(argv[3])) {
+		bytes = JS_GetArrayBuffer(ctx, &body_len, argv[3]);
+		if (bytes == NULL) {
+			/* detached, or empty */
+			JS_FreeValue(ctx, JS_GetException(ctx));
+			body_len = 0;
+		}
+		is_bytes = true;
+	} else if (!JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) {
+		body = JS_ToCStringLen(ctx, &body_len, argv[3]);
 	}
 	if (method != NULL && strcasecmp(method, "GET") != 0 &&
 	    strcasecmp(method, "HEAD") != 0) {
 		/* the fetch layer knows GET and POST; other verbs go as POST */
-		x->post = strdup(body != NULL ? body : "");
+		const void *from = is_bytes ? (const void *)bytes :
+			(const void *)body;
+
+		if (from == NULL) {
+			body_len = 0;
+		}
+		x->post = malloc(body_len + 1);
+		if (x->post != NULL) {
+			if (body_len > 0) {
+				memcpy(x->post, from, body_len);
+			}
+			x->post[body_len] = '\0';
+			x->post_len = body_len;
+		}
 		if (strcasecmp(method, "POST") != 0) {
 			vita_log("xhr: %s sent as POST (fetch layer limit)", method);
 		}

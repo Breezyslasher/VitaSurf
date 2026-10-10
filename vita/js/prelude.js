@@ -2456,8 +2456,11 @@ _body:function(b){var type=null,data;
  if(b===undefined||b===null)data=null;
  else if(b instanceof URLSearchParams){type='application/x-www-form-urlencoded;charset=UTF-8';data=b.toString();}
  else if(b instanceof FormData){type='application/x-www-form-urlencoded;charset=UTF-8';data=b._urlencoded();}
- else if(W.Blob&&b instanceof W.Blob){if(b.type)type=b.type;data=b._t;}
- else if(b instanceof ArrayBuffer||ArrayBuffer.isView(b)){var v=ArrayBuffer.isView(b)?new Uint8Array(b.buffer,b.byteOffset,b.byteLength):new Uint8Array(b),s='';for(var i=0;i<v.length;i++)s+=String.fromCharCode(v[i]);data=s;}
+ /* bytes go to the network layer as an ArrayBuffer, every byte as it
+    is; a string goes as its UTF-8 */
+ else if(W.Blob&&b instanceof W.Blob){if(b.type)type=b.type;var u=b._u;data=u.buffer.slice(u.byteOffset,u.byteOffset+u.length);}
+ else if(b instanceof ArrayBuffer)data=b.slice(0);
+ else if(ArrayBuffer.isView(b))data=b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength);
  else{type='text/plain;charset=UTF-8';data=String(b);}
  if(this._m!=='GET'&&this._m!=='HEAD'&&!this._has('Content-Type')){
   /* an empty value takes the network layer's own default away */

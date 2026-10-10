@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Script request test: the Content-Type a body implies, the headers a page
+r"""Script request test: the Content-Type a body implies, the headers a page
 gives in each form HeadersInit takes, and those it may not set.
 
     python3 tests/headers/body-server.py 8003
@@ -14,6 +14,10 @@ VitaSurf:
     /blob      application/json (the Blob's type), body {"a":1}
     /usp       application/x-www-form-urlencoded;charset=UTF-8
     /ab        no Content-Type (bytes)
+    /bytes     no Content-Type, body b'\x00\x01\x80\xff\x00A' (every byte)
+    /view      body b'\x80\xff\x00' (the view's bytes alone)
+    /blob-bytes application/octet-stream, body as /bytes
+    /nul-text  text/plain;charset=UTF-8, body b'a\x00b\xc3\xa9' (UTF-8)
     /twice     x-a "1, 2" (a repeated name is combined)
     /forbidden x-ok 1 alone: the page's Referer, Cookie and Sec-Fetch-Site
                are dropped
@@ -53,6 +57,11 @@ post('/nohdr', body);
 post('/blob', new Blob([body], {type: 'application/json'}));
 post('/usp', new URLSearchParams('a=1'));
 post('/ab', new Uint8Array([65, 66]).buffer);
+var raw = new Uint8Array([0, 1, 128, 255, 0, 65]);
+post('/bytes', raw.buffer);
+post('/view', raw.subarray(2, 5));
+post('/blob-bytes', new Blob([raw], {type: 'application/octet-stream'}));
+post('/nul-text', 'a\\u0000b\\u00e9');
 var y = new XMLHttpRequest(); y.open('POST', '/twice');
 y.setRequestHeader('X-A', '1'); y.setRequestHeader('x-a', '2'); y.send('t');
 post('/forbidden', 'f', {'Referer': 'http://elsewhere.invalid/',
@@ -83,7 +92,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path not in ("/", "/favicon.ico"):
             self.report()
         self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         self.wfile.write(PAGE if self.path == "/" else b"ok")
 
