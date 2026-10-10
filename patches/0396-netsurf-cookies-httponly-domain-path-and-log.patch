@@ -1,0 +1,312 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index ea3332694..3966b9699 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1866,6 +1866,39 @@ static bool fetch_curl_process_headers(struct curl_fetch_info *f)
+ 	}
+ 	http_code = f->http_code;
+ 	NSLOG(netsurf, INFO, "HTTP status code %li", http_code);
++	if (http_code == 401 || http_code == 403 || http_code == 429 ||
++	    http_code == 503) {
++		/* which cookies went with a refused request: names only */
++		char names[256];
++		size_t at = 0;
++		const char *s = f->cookie_string;
++
++		names[0] = '\0';
++		while (s != NULL && *s != '\0' && at + 2 < sizeof(names)) {
++			const char *eq = strchr(s, '=');
++			const char *semi = strchr(s, ';');
++			size_t n;
++
++			while (*s == ' ')
++				s++;
++			if (eq == NULL || (semi != NULL && semi < eq))
++				eq = semi != NULL ? semi : s + strlen(s);
++			n = (size_t)(eq - s);
++			if (at + n + 3 >= sizeof(names))
++				n = sizeof(names) - at - 3;
++			if (at > 0) {
++				names[at++] = ',';
++				names[at++] = ' ';
++			}
++			memcpy(names + at, s, n);
++			at += n;
++			names[at] = '\0';
++			s = semi != NULL ? semi + 1 : NULL;
++		}
++		NSLOG(netsurf, INFO, "cookie: a request answered %li sent %s%s",
++		      http_code, at > 0 ? "cookies " : "no cookies",
++		      names);
++	}
+ 	/* the host's queued fetches can share this connection now */
+ 	{
+ 		long version = 0;
+diff --git a/content/urldb.c b/content/urldb.c
+index 950c37061..c5acccfd4 100644
+--- a/content/urldb.c
++++ b/content/urldb.c
+@@ -1696,6 +1696,49 @@ urldb_search_insert(struct search_node *root, const struct host_part *data)
+ }
+ 
+ 
++/** Whether the cookie being set came from script (document.cookie) */
++static bool urldb_cookie_script = false;
++
++/**
++ * Log what became of a cookie a response or a script set: its name and
++ * where it applies, never its value.
++ *
++ * \param what What happened to it
++ * \param c    The cookie, NULL if it could not be parsed
++ * \param host The host whose response or document set it
++ */
++static void
++urldb_cookie_note(const char *what,
++		  const struct cookie_internal_data *c,
++		  lwc_string *host)
++{
++	char life[48];
++
++	if (c == NULL) {
++		NSLOG(netsurf, INFO, "cookie: %s%s from %s",
++		      urldb_cookie_script ? "script " : "", what,
++		      lwc_string_data(host));
++		return;
++	}
++	if (c->expires == -1) {
++		snprintf(life, sizeof(life), "for the session");
++	} else if (c->expires < time(NULL)) {
++		snprintf(life, sizeof(life), "already expired");
++	} else {
++		snprintf(life, sizeof(life), "for %ld s",
++			 (long)(c->expires - time(NULL)));
++	}
++	NSLOG(netsurf, INFO, "cookie: %s%s %s from %s, domain %s path %s, %s%s%s",
++	      urldb_cookie_script ? "script " : "", what,
++	      c->name != NULL ? c->name : "(no name)",
++	      lwc_string_data(host),
++	      c->domain != NULL ? c->domain : "?",
++	      c->path != NULL ? c->path : "?", life,
++	      c->secure ? ", secure" : "",
++	      c->http_only ? ", HttpOnly" : "");
++}
++
++
+ /**
+  * Parse a cookie avpair
+  *
+@@ -1754,6 +1797,17 @@ urldb_parse_avpair(struct cookie_internal_data *c,
+ 			c->domain = strdup(v);
+ 			if (!c->domain)
+ 				return false;
++		} else if (v[0] != '\0' && !urldb__host_is_ip_address(v)) {
++			/* RFC 6265 5.2.3: without its leading dot it is the
++			 * same domain, and still covers the subdomains */
++			size_t dlen = strlen(v);
++
++			c->domain_from_set = true;
++			c->domain = malloc(dlen + 2);
++			if (!c->domain)
++				return false;
++			c->domain[0] = '.';
++			memcpy(c->domain + 1, v, dlen + 1);
+ 		}
+ 	} else if (strcasecmp(n, "Max-Age") == 0) {
+ 		int temp = atoi(v);
+@@ -2312,6 +2366,15 @@ urldb_insert_cookie(struct cookie_internal_data *c,
+ 			break;
+ 	}
+ 
++	if (d && urldb_cookie_script && d->http_only) {
++		/* RFC 6265 5.3 step 11: script cannot replace or remove a
++		 * cookie it cannot see */
++		NSLOG(netsurf, INFO, "cookie: script's %s dropped: the one "
++		      "it would replace is HttpOnly", c->name);
++		urldb_free_cookie(c);
++		return false;
++	}
++
+ 	if (d) {
+ 		if (c->expires != -1 && c->expires < now) {
+ 			/* remove cookie */
+@@ -4012,6 +4075,8 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 			if (*hptr == '\0' ||
+ 			    (dot = strchr(hptr + 1, '.')) == NULL ||
+ 			    *(dot + 1) == '\0') {
++				urldb_cookie_note("refused, a third party's,",
++						  NULL, host);
+ 				lwc_string_unref(rhost);
+ 				goto error;
+ 			}
+@@ -4025,7 +4090,6 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 	do {
+ 		struct cookie_internal_data *c;
+ 		char *dot;
+-		size_t len;
+ #ifdef WITH_NSPSL
+ 		const char *suffix;
+ #endif
+@@ -4033,6 +4097,7 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 		c = urldb_parse_cookie(url, &cur);
+ 		if (!c) {
+ 			/* failed => stop parsing */
++			urldb_cookie_note("could not read a cookie", NULL, host);
+ 			goto error;
+ 		}
+ 
+@@ -4040,15 +4105,19 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 
+ 		/* 4.2.2:i Cookie must have NAME and VALUE */
+ 		if (!c->name || !c->value) {
++			urldb_cookie_note("refused, no name or value,", c, host);
+ 			urldb_free_cookie(c);
+ 			goto error;
+ 		}
+ 
+-		/* 4.3.2:i Cookie path must be a prefix of URL path */
+-		len = strlen(c->path);
+-		if (len > lwc_string_length(path) ||
+-		    strncmp(c->path, lwc_string_data(path),
+-			    len) != 0) {
++		/* RFC 2109 4.3.2:i made the path a prefix of the URL's.
++		 * RFC 6265 has no such rule, and browsers keep the cookie:
++		 * its path only decides which requests send it. */
++
++		/* RFC 6265 5.3 step 10: script cannot set HttpOnly */
++		if (urldb_cookie_script && c->http_only) {
++			urldb_cookie_note("refused, HttpOnly from script,", c,
++					  host);
+ 			urldb_free_cookie(c);
+ 			goto error;
+ 		}
+@@ -4061,8 +4130,8 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 		}
+ 		suffix = nspsl_getpublicsuffix(dot);
+ 		if (suffix == NULL) {
+-			NSLOG(netsurf, INFO,
+-			      "domain %s was a public suffix domain", dot);
++			urldb_cookie_note("refused, a public suffix's,", c,
++					  host);
+ 			urldb_free_cookie(c);
+ 			goto error;
+ 		}
+@@ -4071,6 +4140,8 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 		dot = strchr(c->domain + 1, '.');
+ 		if (!dot || *(dot + 1) == '\0') {
+ 			/* no embedded dots */
++			urldb_cookie_note("refused, a top-level domain's,", c,
++					  host);
+ 			urldb_free_cookie(c);
+ 			goto error;
+ 		}
+@@ -4098,6 +4169,8 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 			/* 4.3.2:iii */
+ 			if (urldb__host_is_ip_address(lwc_string_data(host))) {
+ 				/* IP address, so no partial match */
++				urldb_cookie_note("refused, another domain's,",
++						  c, host);
+ 				urldb_free_cookie(c);
+ 				goto error;
+ 			}
+@@ -4107,6 +4180,8 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 
+ 			if (hlen <= dlen && hlen != dlen - 1) {
+ 				/* Partial match not possible */
++				urldb_cookie_note("refused, another domain's,",
++						  c, host);
+ 				urldb_free_cookie(c);
+ 				goto error;
+ 			}
+@@ -4120,6 +4195,8 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 
+ 			if (strcasecmp(lwc_string_data(host) + (hlen - dlen),
+ 				       domain)) {
++				urldb_cookie_note("refused, another domain's,",
++						  c, host);
+ 				urldb_free_cookie(c);
+ 				goto error;
+ 			}
+@@ -4148,6 +4225,7 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 		}
+ 
+ 		/* Now insert into database */
++		urldb_cookie_note("set", c, host);
+ 		if (!urldb_insert_cookie(c, scheme, urlt))
+ 			goto error;
+ 	} while (cur < end);
+@@ -4169,6 +4247,19 @@ error:
+ }
+ 
+ 
++/* exported interface documented in content/urldb.h */
++bool urldb_set_cookie_from_script(const char *cookie, nsurl *url)
++{
++	bool ret;
++
++	urldb_cookie_script = true;
++	ret = urldb_set_cookie(cookie, url, NULL);
++	urldb_cookie_script = false;
++
++	return ret;
++}
++
++
+ /* exported interface documented in content/urldb.h */
+ char *urldb_get_cookie(nsurl *url, bool include_http_only)
+ {
+@@ -4294,6 +4385,10 @@ char *urldb_get_cookie(nsurl *url, bool include_http_only)
+ 					 * => ignore */
+ 					continue;
+ 
++				if (c->http_only && !include_http_only)
++					/* Ignore HttpOnly */
++					continue;
++
+ 				matched_cookies[count++] = c;
+ 
+ 				GROW_MATCHED_COOKIES;
+@@ -4338,6 +4433,10 @@ char *urldb_get_cookie(nsurl *url, bool include_http_only)
+ 				 * => ignore */
+ 				continue;
+ 
++			if (c->http_only && !include_http_only)
++				/* Ignore HttpOnly */
++				continue;
++
+ 			matched_cookies[count++] = c;
+ 
+ 			GROW_MATCHED_COOKIES;
+@@ -4372,6 +4471,10 @@ char *urldb_get_cookie(nsurl *url, bool include_http_only)
+ 				/* secure cookie for insecure host. ignore */
+ 				continue;
+ 
++			if (c->http_only && !include_http_only)
++				/* Ignore HttpOnly */
++				continue;
++
+ 			matched_cookies[count++] = c;
+ 
+ 			GROW_MATCHED_COOKIES;
+diff --git a/content/urldb.h b/content/urldb.h
+index c68c2a611..f40de4f1b 100644
+--- a/content/urldb.h
++++ b/content/urldb.h
+@@ -142,6 +142,17 @@ bool urldb_get_cert_permissions(struct nsurl *url);
+ bool urldb_set_cookie(const char *header, struct nsurl *url, struct nsurl *referrer);
+ 
+ 
++/**
++ * Set a cookie from script (document.cookie), which may neither set an
++ * HttpOnly cookie nor replace one.
++ *
++ * \param cookie The string script assigned
++ * \param url URL of the document
++ * \return true on success, false otherwise
++ */
++bool urldb_set_cookie_from_script(const char *cookie, struct nsurl *url);
++
++
+ /**
+  * Retrieve cookies for an URL
+  *

@@ -6575,7 +6575,7 @@ static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueCons
 	if (thread != NULL && thread->win != NULL && s != NULL &&
 	    browser_window_get_url(thread->win, false, &url) == NSERROR_OK &&
 	    url != NULL) {
-		urldb_set_cookie(s, url, NULL);
+		urldb_set_cookie_from_script(s, url);
 		nsurl_unref(url);
 	}
 	if (s) JS_FreeCString(ctx, s);
