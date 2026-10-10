@@ -7084,8 +7084,13 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 /* ------------------------------------------------------------------------ */
 /* Deadline management around calls into script                             */
 
-/* Lower bound on script_timeout, in seconds. See js_newheap(). */
-#define SCRIPT_TIMEOUT_MIN 20
+/*
+ * The deadline of a script with no time limit (VitaSurf): one that never
+ * comes, rather than none, so that the interrupt still keeps transfers
+ * moving, takes profile samples and lets Circle stop the script. A
+ * deadline of zero means no script is running and skips all of that.
+ */
+#define DEADLINE_NEVER UINT64_MAX
 
 /*
  * Arm the deadline afresh without opening a nesting level. Compiling is
@@ -7152,7 +7157,7 @@ static void rearm_deadline(jsthread *thread)
 	if (secs != 0) {
 		thread->deadline_ms = now_ms() + (uint64_t)secs * 1000;
 	} else {
-		thread->deadline_ms = 0;
+		thread->deadline_ms = DEADLINE_NEVER;
 	}
 }
 
@@ -7307,9 +7312,14 @@ static void end_script(jsthread *thread)
 	}
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;
-		vita_log("qjs: that script was stopped by the budget "
-			 "(%u on this page; the next gets %u seconds)",
-			 thread->scripts_killed, budget_secs(thread));
+		if (budget_secs(thread) != 0) {
+			vita_log("qjs: that script was stopped by the budget "
+				 "(%u on this page; the next gets %u seconds)",
+				 thread->scripts_killed, budget_secs(thread));
+		} else {
+			vita_log("qjs: that script was stopped (%u on this "
+				 "page)", thread->scripts_killed);
+		}
 	}
 	/* The outermost call is over, so nothing is still unwinding. An
 	 * exception left pending here is one that was reported already, or
@@ -7518,9 +7528,14 @@ static void end_script(jsthread *thread)
 	thread->draining = false;
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;
-		vita_log("qjs: promise jobs stopped by the budget "
-			 "(%u on this page; the next gets %u seconds)",
-			 thread->scripts_killed, budget_secs(thread));
+		if (budget_secs(thread) != 0) {
+			vita_log("qjs: promise jobs stopped by the budget "
+				 "(%u on this page; the next gets %u seconds)",
+				 thread->scripts_killed, budget_secs(thread));
+		} else {
+			vita_log("qjs: promise jobs stopped (%u on this page)",
+				 thread->scripts_killed);
+		}
 	}
 	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
@@ -15848,21 +15863,20 @@ nserror js_newheap(int timeout, jsheap **heap)
 	}
 	/*
 	 * The timeout is NetSurf's script_timeout option, in seconds, and 0
-	 * means no limit. The Vita runs script roughly 25 times slower than
-	 * a desktop, so a budget short enough to be useful there stops work
-	 * a page legitimately needs here; raise anything below the floor.
-	 * A Choices file written by an earlier build is read after the
-	 * bundled one, so the floor rather than the option default is what
-	 * actually takes effect on a device that has been used.
+	 * means no limit. On the device there is none (VitaSurf): a browser
+	 * does not stop a page's script by itself, it says the page is busy
+	 * and lets the user choose, and the busy overlay does that here,
+	 * Circle stopping the script. A limit stopped real work: the Vita
+	 * runs script some 25 times slower than a desktop, and claude.ai's
+	 * Cloudflare check computed for more than the 20 s it allowed and
+	 * then reported its widget crashed. A Choices file written by an
+	 * earlier build carries script_timeout:20, so the option is not
+	 * read. The native harness keeps it, so that a test can drive a
+	 * budget of one second.
 	 */
 #ifdef __vita__
-	if (timeout > 0 && timeout < SCRIPT_TIMEOUT_MIN) {
-		timeout = SCRIPT_TIMEOUT_MIN;
-	}
+	timeout = 0;
 #endif
-	/* the floor is the device's; the native harness keeps the option
-	 * as given so that a test can drive a budget of one second
-	 * (VitaSurf) */
 	ret->timeout = timeout;
 	/*
 	 * The runtime itself is made when the window's first page wants a
