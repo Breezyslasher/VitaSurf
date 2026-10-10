@@ -1,0 +1,533 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index d28def5c7..99b4b3295 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -93,6 +93,8 @@ struct fetch {
+ 	nsurl *referer;		/**< Referer URL. */
+ 	bool verifiable;	/**< Transaction is verifiable */
+ 	bool top_level;		/**< navigates a top-level window (VitaSurf) */
++	bool user;		/**< a navigation the user started (VitaSurf) */
++	unsigned int dest;	/**< FETCH_DEST_* (VitaSurf) */
+ 	bool unsafe_method;	/**< not GET or HEAD (VitaSurf) */
+ 	void *p;		/**< Private data for callback. */
+ 	lwc_string *host;	/**< Host part of URL, interned */
+@@ -641,7 +643,7 @@ fetch_start(nsurl *url,
+ 	    const struct fetch_multipart_data *post_multipart,
+ 	    bool verifiable,
+ 	    bool downgrade_tls,
+-	    bool top_level,
++	    unsigned int meta,
+ 	    const char *headers[],
+ 	    struct fetch **fetch_out)
+ {
+@@ -672,7 +674,9 @@ fetch_start(nsurl *url,
+ 	fetch->callback = callback;
+ 	fetch->url = nsurl_ref(url);
+ 	fetch->verifiable = verifiable;
+-	fetch->top_level = top_level;
++	fetch->top_level = (meta & FETCH_META_TOP_LEVEL) != 0;
++	fetch->user = (meta & FETCH_META_USER) != 0;
++	fetch->dest = (meta >> FETCH_META_DEST) & 0x0f;
+ 	fetch->unsafe_method = (post_urlenc != NULL || post_multipart != NULL);
+ 	fetch->p = p;
+ 	fetch->host = nsurl_get_component(url, NSURL_HOST);
+@@ -1082,6 +1086,75 @@ char *fetch_get_cookie_string(struct fetch *fetch)
+ 	return urldb_get_cookie_for(fetch->url, true, &ctx);
+ }
+ 
++/* exported interface documented in content/fetch.h */
++int fetch_metadata_headers(struct fetch *fetch, char lines[][160], int max,
++			   bool want_accept)
++{
++	static const char *const dests[] = {
++		"empty", "document", "iframe", "image", "style", "script",
++		"font", "object"
++	};
++	const char *accept = NULL, *mode, *site;
++	unsigned int dest = fetch->dest < 8 ? fetch->dest : FETCH_DEST_EMPTY;
++	bool nav = (dest == FETCH_DEST_DOCUMENT || dest == FETCH_DEST_IFRAME);
++	char a[256], b[256];
++	int n = 0;
++
++	/* the Fetch standard's Accept for each destination */
++	switch (dest) {
++	case FETCH_DEST_DOCUMENT:
++	case FETCH_DEST_IFRAME:
++		accept = "text/html,application/xhtml+xml,application/xml;"
++			"q=0.9,*/*;q=0.8";
++		break;
++	case FETCH_DEST_IMAGE:
++		accept = "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5";
++		break;
++	case FETCH_DEST_STYLE:
++		accept = "text/css,*/*;q=0.1";
++		break;
++	default:
++		accept = "*/*";
++		break;
++	}
++
++	/* the mode a browser fetches each destination in */
++	if (nav)
++		mode = "navigate";
++	else if (dest == FETCH_DEST_FONT || dest == FETCH_DEST_EMPTY)
++		mode = "cors";
++	else
++		mode = "no-cors";
++
++	/* the initiator against the request: the user's own, the same
++	 * origin, the same site or another */
++	if (fetch->referer == NULL) {
++		site = "none";
++	} else if (nsurl_compare(fetch->referer, fetch->url,
++				 NSURL_SCHEME | NSURL_HOST | NSURL_PORT)) {
++		site = "same-origin";
++	} else if (urldb_site(fetch->referer, a, sizeof(a)) &&
++		   urldb_site(fetch->url, b, sizeof(b)) && strcmp(a, b) == 0) {
++		site = "same-site";
++	} else {
++		site = "cross-site";
++	}
++
++	if (want_accept && n < max)
++		snprintf(lines[n++], 160, "Accept: %s", accept);
++	if (n < max)
++		snprintf(lines[n++], 160, "Sec-Fetch-Site: %s", site);
++	if (n < max)
++		snprintf(lines[n++], 160, "Sec-Fetch-Mode: %s", mode);
++	if (n < max)
++		snprintf(lines[n++], 160, "Sec-Fetch-Dest: %s", dests[dest]);
++	if (nav && fetch->user && n < max)
++		snprintf(lines[n++], 160, "Sec-Fetch-User: ?1");
++	if (nav && n < max)
++		snprintf(lines[n++], 160, "Upgrade-Insecure-Requests: 1");
++	return n;
++}
++
+ /* exported interface documented in content/fetch.h */
+ void fetch_set_cookie(struct fetch *fetch, const char *data)
+ {
+diff --git a/content/fetch.h b/content/fetch.h
+index e2b1f4e2f..ec6dfb685 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -161,7 +161,7 @@ typedef void (*fetch_callback)(const fetch_msg *msg, void *p);
+  * \param post_multipart
+  * \param verifiable
+  * \param downgrade_tls
+- * \param top_level The fetch navigates a top-level window (VitaSurf)
++ * \param meta What the fetch is for: FETCH_META_* (VitaSurf)
+  * \param headers
+  * \param fetch_out ponter to recive new fetch object.
+  * \return NSERROR_OK and fetch_out updated else appropriate error code
+@@ -169,9 +169,40 @@ typedef void (*fetch_callback)(const fetch_msg *msg, void *p);
+ nserror fetch_start(nsurl *url, nsurl *referer, fetch_callback callback,
+ 		    void *p, bool only_2xx, const char *post_urlenc,
+ 		    const struct fetch_multipart_data *post_multipart,
+-		    bool verifiable, bool downgrade_tls, bool top_level,
++		    bool verifiable, bool downgrade_tls, unsigned int meta,
+ 		    const char *headers[], struct fetch **fetch_out);
+ 
++/*
++ * What a fetch is for, as Fetch Metadata names it (VitaSurf): the meta
++ * argument to fetch_start is a FETCH_DEST_* shifted by FETCH_META_DEST,
++ * with FETCH_META_TOP_LEVEL and FETCH_META_USER.
++ */
++#define FETCH_META_TOP_LEVEL 0x01 /**< navigates a top-level window */
++#define FETCH_META_USER      0x02 /**< a navigation the user started */
++#define FETCH_META_DEST      4    /**< shift of the destination */
++#define FETCH_DEST_EMPTY     0    /**< fetch(), XMLHttpRequest, unknown */
++#define FETCH_DEST_DOCUMENT  1
++#define FETCH_DEST_IFRAME    2
++#define FETCH_DEST_IMAGE     3
++#define FETCH_DEST_STYLE     4
++#define FETCH_DEST_SCRIPT    5
++#define FETCH_DEST_FONT      6
++#define FETCH_DEST_OBJECT    7
++
++/**
++ * The request headers a browser sends for what a fetch is for (VitaSurf):
++ * Accept for its destination, and Fetch Metadata's Sec-Fetch-Site, -Mode,
++ * -Dest and -User, with Upgrade-Insecure-Requests on a navigation.
++ *
++ * \param fetch The fetch
++ * \param lines Receives up to max header lines
++ * \param max How many lines fit
++ * \param want_accept Whether to give an Accept line
++ * \return how many lines
++ */
++int fetch_metadata_headers(struct fetch *fetch, char lines[][160], int max,
++			   bool want_accept);
++
+ /**
+  * The cookies a fetch carries, as its SameSite context allows
+  * (VitaSurf).
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index e09310058..133353bd7 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -36,6 +36,7 @@
+ #include <stdbool.h>
+ #include <string.h>
+ #include <strings.h>
++#include <ctype.h>
+ #include <time.h>
+ #include <sys/stat.h>
+ 
+@@ -695,12 +696,50 @@ fetch_curl_setup(struct fetch *parent_fetch,
+ 	 * which fails with lighttpd, so disable it (see bug 1429054) */
+ 	APPEND(fetch->headers, "Expect:");
+ 
+-	if ((nsoption_charp(accept_language) != NULL) &&
+-	    (nsoption_charp(accept_language)[0] != '\0')) {
+-		char s[80];
+-		snprintf(s, sizeof s, "Accept-Language: %s, *;q=0.1",
+-			 nsoption_charp(accept_language));
+-		s[sizeof s - 1] = 0;
++	{
++		/* the languages the reader reads, as a browser sends them:
++		 * "fr-FR,fr;q=0.9", from the option when it is set, else
++		 * the device's (VitaSurf); NetSurf sent none unless asked */
++		const char *list = NULL;
++		char s[128];
++		size_t at;
++		int i = 0;
++
++		if (nsoption_charp(accept_language) != NULL &&
++		    nsoption_charp(accept_language)[0] != '\0') {
++			list = nsoption_charp(accept_language);
++		} else if (vitasurf_languages != NULL) {
++			list = vitasurf_languages();
++		}
++		if (list == NULL || list[0] == '\0') {
++			list = "en-US,en";
++		}
++		at = (size_t)snprintf(s, sizeof s, "Accept-Language: ");
++		while (*list != '\0' && at + 16 < sizeof s) {
++			size_t n = strcspn(list, ",");
++
++			while (*list == ' ' && n > 0) {
++				list++;
++				n--;
++			}
++			if (n > 0 && at + n + 12 < sizeof s) {
++				if (i > 0) {
++					s[at++] = ',';
++				}
++				memcpy(s + at, list, n);
++				at += n;
++				if (i > 0 && i < 9) {
++					at += (size_t)snprintf(s + at, sizeof s - at,
++							       ";q=0.%d", 10 - i);
++				}
++				i++;
++			}
++			list += n;
++			if (*list == ',') {
++				list++;
++			}
++		}
++		s[at < sizeof s ? at : sizeof s - 1] = '\0';
+ 		APPEND(fetch->headers, s);
+ 	}
+ 
+@@ -717,6 +756,24 @@ fetch_curl_setup(struct fetch *parent_fetch,
+ 		APPEND(fetch->headers, "DNT: 1");
+ 	}
+ 
++	{
++		/* Accept for what the fetch is for, unless the page's
++		 * script set its own, and Fetch Metadata (VitaSurf) */
++		char meta[6][160];
++		bool caller_accept = false;
++		int k, nmeta;
++
++		for (i = 0; headers[i] != NULL; i++) {
++			if (strncasecmp(headers[i], "Accept:", 7) == 0)
++				caller_accept = true;
++		}
++		nmeta = fetch_metadata_headers(parent_fetch, meta, 6,
++					       !caller_accept);
++		for (k = 0; k < nmeta; k++) {
++			APPEND(fetch->headers, meta[k]);
++		}
++	}
++
+ 	/* And add any headers specified by the caller */
+ 	for (i = 0; headers[i] != NULL; i++) {
+ 		APPEND(fetch->headers, headers[i]);
+@@ -1845,6 +1902,64 @@ static void fetch_curl_free(void *vf)
+ }
+ 
+ 
++
++/**
++ * Log what a refused request sent and what the refusal said (VitaSurf):
++ * the request's headers, but for the value of any that may carry a
++ * secret, and a challenge's cf-mitigated header.
++ */
++static void fetch_curl_log_refused(struct curl_fetch_info *f, long code)
++{
++	char line[1024];
++	size_t at = 0;
++	struct curl_slist *h;
++	struct curl_header *ch = NULL;
++
++	line[0] = '\0';
++	for (h = f->headers; h != NULL && at + 4 < sizeof line; h = h->next) {
++		const char *d = h->data;
++		const char *colon = strchr(d, ':');
++		size_t nl = colon != NULL ? (size_t)(colon - d) : strlen(d);
++		bool secret = false;
++		char name[64];
++		size_t k;
++
++		if (colon == NULL || colon[1] == '\0') {
++			/* "Pragma:" and the like take a curl default off */
++			continue;
++		}
++		if (nl >= sizeof name)
++			nl = sizeof name - 1;
++		for (k = 0; k < nl; k++)
++			name[k] = (char)tolower((unsigned char)d[k]);
++		name[nl] = '\0';
++		if (strstr(name, "auth") || strstr(name, "token") ||
++		    strstr(name, "key") || strstr(name, "csrf") ||
++		    strstr(name, "secret") || strstr(name, "cookie") ||
++		    strstr(name, "session"))
++			secret = true;
++		at += (size_t)snprintf(line + at, sizeof line - at, "%s%.*s%s",
++				       at > 0 ? " | " : "", secret ? (int)nl :
++				       (int)strlen(d), d, secret ? ": (value not logged)" : "");
++		if (at >= sizeof line)
++			at = sizeof line - 1;
++	}
++	{
++		char *method = NULL;
++
++		if (curl_easy_getinfo(f->curl_handle, CURLINFO_EFFECTIVE_METHOD,
++				      &method) != CURLE_OK || method == NULL)
++			method = (char *)"a request";
++		NSLOG(netsurf, INFO, "refused: the %li answer to %s, which "
++		      "sent %s", code, method, line);
++	}
++	if (curl_easy_header(f->curl_handle, "cf-mitigated", 0, CURLH_HEADER,
++			     -1, &ch) == CURLHE_OK && ch != NULL) {
++		NSLOG(netsurf, INFO, "refused: cf-mitigated: %s", ch->value);
++	}
++}
++
++
+ /**
+  * Find the status code and content type and inform the caller.
+  *
+@@ -1866,8 +1981,8 @@ static bool fetch_curl_process_headers(struct curl_fetch_info *f)
+ 	}
+ 	http_code = f->http_code;
+ 	NSLOG(netsurf, INFO, "HTTP status code %li", http_code);
+-	if (http_code == 401 || http_code == 403 || http_code == 429 ||
+-	    http_code == 503) {
++	if (http_code == 400 || http_code == 401 || http_code == 403 ||
++	    http_code == 429 || http_code == 503) {
+ 		/* which cookies went with a refused request: names only */
+ 		char names[256];
+ 		size_t at = 0;
+@@ -1898,6 +2013,7 @@ static bool fetch_curl_process_headers(struct curl_fetch_info *f)
+ 		NSLOG(netsurf, INFO, "cookie: a request answered %li sent %s%s",
+ 		      http_code, at > 0 ? "cookies " : "no cookies",
+ 		      names);
++		fetch_curl_log_refused(f, http_code);
+ 	}
+ 	/* the host's queued fetches can share this connection now */
+ 	{
+@@ -2881,7 +2997,9 @@ nserror fetch_curl_register(void)
+ 	SETOPT(NSCURLOPT_PROGRESS_FUNCTION, fetch_curl_progress);
+ 	SETOPT(CURLOPT_NOPROGRESS, 0L);
+ 	SETOPT(CURLOPT_USERAGENT, user_agent_string());
+-	SETOPT(CURLOPT_ENCODING, "gzip");
++	/* every encoding this curl decodes, as a browser names all of its
++	 * own; it was gzip alone (VitaSurf) */
++	SETOPT(CURLOPT_ENCODING, "");
+ 	SETOPT(CURLOPT_LOW_SPEED_LIMIT, 1L);
+ 	SETOPT(CURLOPT_LOW_SPEED_TIME, 180L);
+ 	SETOPT(CURLOPT_NOSIGNAL, 1L);
+diff --git a/content/handlers/html/preload.c b/content/handlers/html/preload.c
+index 1b7a00ffa..7074107c0 100644
+--- a/content/handlers/html/preload.c
++++ b/content/handlers/html/preload.c
+@@ -55,6 +55,7 @@
+ #include "utils/utils.h"
+ #include "content/content_protected.h"
+ #include "content/llcache.h"
++#include "content/fetch.h"
+ 
+ #include "html/private.h"
+ #include "html/preload.h"
+@@ -266,6 +267,7 @@ static void preload_fetch(html_content *c, struct html_preload *pl,
+ 	lwc_string *scheme;
+ 	llcache_handle *h = NULL;
+ 	nserror err;
++	unsigned int dest;
+ 	bool web;
+ 	int len;
+ 	int i;
+@@ -302,7 +304,12 @@ static void preload_fetch(html_content *c, struct html_preload *pl,
+ 		return;
+ 	}
+ 
+-	err = llcache_handle_retrieve(url, LLCACHE_RETRIEVE_PRELOAD,
++	/* what the document would fetch it as, for Fetch Metadata */
++	dest = strcmp(kind, "stylesheet") == 0 ? FETCH_DEST_STYLE :
++		strcmp(kind, "image") == 0 ? FETCH_DEST_IMAGE :
++		strcmp(kind, "font") == 0 ? FETCH_DEST_FONT : FETCH_DEST_SCRIPT;
++	err = llcache_handle_retrieve(url, LLCACHE_RETRIEVE_PRELOAD |
++				      (dest << LLCACHE_RETRIEVE_DEST_SHIFT),
+ 				      content_get_url(&c->base), NULL,
+ 				      preload_cb, NULL, &h);
+ 	if (err == NSERROR_OK && h != NULL) {
+diff --git a/content/handlers/html/webfont.c b/content/handlers/html/webfont.c
+index 2b9da058a..09df535fe 100644
+--- a/content/handlers/html/webfont.c
++++ b/content/handlers/html/webfont.c
+@@ -49,6 +49,7 @@
+ #include "netsurf/layout.h"
+ #include "content/content_protected.h"
+ #include "content/llcache.h"
++#include "content/fetch.h"
+ #include "desktop/gui_internal.h"
+ 
+ #include "html/private.h"
+@@ -413,7 +414,9 @@ static void webfont_fetch(struct html_content *html, const char *family,
+ 	wf->next = webfonts;
+ 	webfonts = wf;
+ 
+-	err = llcache_handle_retrieve(nurl, 0, content_get_url(&html->base),
++	err = llcache_handle_retrieve(nurl,
++			FETCH_DEST_FONT << LLCACHE_RETRIEVE_DEST_SHIFT,
++			content_get_url(&html->base),
+ 			NULL, webfont_callback, wf, &wf->fetch);
+ 	nsurl_unref(nurl);
+ 	if (err != NSERROR_OK) {
+diff --git a/content/hlcache.c b/content/hlcache.c
+index b68441223..f14113101 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -37,6 +37,7 @@
+ 
+ #include "content/mimesniff.h"
+ #include "content/hlcache.h"
++#include "content/fetch.h"
+ // Note, this is *ONLY* so that we can abort cleanly during shutdown of the cache
+ #include "content/content_protected.h"
+ #include "content/content_factory.h"
+@@ -756,6 +757,23 @@ hlcache_handle_retrieve(nsurl *url,
+ 	ctx->handle->cb = cb;
+ 	ctx->handle->pw = pw;
+ 
++	/* what the fetch is for, from what it may become, for Accept and
++	 * Fetch Metadata, unless the caller said (VitaSurf) */
++	if ((flags & LLCACHE_RETRIEVE_DEST_MASK) == 0) {
++		unsigned int dest = FETCH_DEST_EMPTY;
++
++		if (accepted_types == CONTENT_IMAGE)
++			dest = FETCH_DEST_IMAGE;
++		else if (accepted_types == CONTENT_CSS)
++			dest = FETCH_DEST_STYLE;
++		else if (accepted_types == CONTENT_SCRIPT)
++			dest = FETCH_DEST_SCRIPT;
++		else if (accepted_types != CONTENT_ANY &&
++			 (accepted_types & (CONTENT_HTML | CONTENT_PLUGIN)))
++			dest = FETCH_DEST_OBJECT;
++		flags |= dest << LLCACHE_RETRIEVE_DEST_SHIFT;
++	}
++
+ 	error = llcache_handle_retrieve(url, flags, referer, post,
+ 			hlcache_llcache_callback, ctx,
+ 			&ctx->llcache);
+diff --git a/content/llcache.c b/content/llcache.c
+index 459b74cc7..99cfa100e 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -1026,7 +1026,12 @@ static nserror llcache_object_refetch(llcache_object *object)
+ 			  multipart,
+ 			  object->fetch.flags & LLCACHE_RETRIEVE_VERIFIABLE,
+ 			  object->fetch.tried_with_tls_downgrade,
+-			  object->fetch.flags & LLCACHE_RETRIEVE_TOP_LEVEL,
++			  ((object->fetch.flags & LLCACHE_RETRIEVE_TOP_LEVEL) ?
++			   FETCH_META_TOP_LEVEL : 0) |
++			  ((object->fetch.flags & LLCACHE_RETRIEVE_USER) ?
++			   FETCH_META_USER : 0) |
++			  (((object->fetch.flags & LLCACHE_RETRIEVE_DEST_MASK) >>
++			    LLCACHE_RETRIEVE_DEST_SHIFT) << FETCH_META_DEST),
+ 			  (const char **)headers,
+ 			  &object->fetch.fetch);
+ 
+diff --git a/content/llcache.h b/content/llcache.h
+index b2e97e0d9..0e3f1a5f9 100644
+--- a/content/llcache.h
++++ b/content/llcache.h
+@@ -70,7 +70,13 @@ enum llcache_retrieve_flag {
+ 	LLCACHE_RETRIEVE_PRELOAD        = (1 << 4),
+ 	/** Navigates a top-level window: SameSite cookies treat it as
+ 	 * same-site (VitaSurf) */
+-	LLCACHE_RETRIEVE_TOP_LEVEL      = (1 << 5)
++	LLCACHE_RETRIEVE_TOP_LEVEL      = (1 << 5),
++	/** A navigation the user started, not script (VitaSurf) */
++	LLCACHE_RETRIEVE_USER           = (1 << 6),
++	/** What the fetch is for: a FETCH_DEST_* in four bits from
++	 * here, for Accept and Fetch Metadata (VitaSurf) */
++	LLCACHE_RETRIEVE_DEST_SHIFT     = 7,
++	LLCACHE_RETRIEVE_DEST_MASK      = (0x0f << 7)
+ };
+ 
+ /** Low-level cache event types */
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index e11117195..1ad045001 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -3873,6 +3873,12 @@ navigate_internal_real(struct browser_window *bw,
+ 		 * same-site (VitaSurf) */
+ 		fetch_flags |= LLCACHE_RETRIEVE_TOP_LEVEL;
+ 	}
++	/* a document or a frame's, and whether the user asked for it, for
++	 * Accept and Fetch Metadata (VitaSurf) */
++	fetch_flags |= (bw->parent == NULL ? FETCH_DEST_DOCUMENT :
++			FETCH_DEST_IFRAME) << LLCACHE_RETRIEVE_DEST_SHIFT;
++	if (!(params->flags & (BW_NAVIGATE_UNVERIFIABLE | BW_NAVIGATE_SCRIPT)))
++		fetch_flags |= LLCACHE_RETRIEVE_USER;
+ 
+ 	if (params->post_multipart != NULL) {
+ 		post.type = LLCACHE_POST_MULTIPART;
+diff --git a/include/netsurf/browser_window.h b/include/netsurf/browser_window.h
+index e092adad0..85c3334c0 100644
+--- a/include/netsurf/browser_window.h
++++ b/include/netsurf/browser_window.h
+@@ -144,7 +144,11 @@ enum browser_window_nav_flags {
+ 	BW_NAVIGATE_NO_TERMINAL_HISTORY_UPDATE = (1 << 3),
+ 
+ 	/** Internal navigation (set only by core features using such) */
+-	BW_NAVIGATE_INTERNAL            = (1 << 4)
++	BW_NAVIGATE_INTERNAL            = (1 << 4),
++
++	/** A script asked, outside the user's input: not a navigation the
++	 * user started, for Fetch Metadata (VitaSurf) */
++	BW_NAVIGATE_SCRIPT              = (1 << 5)
+ };
+ 
+ /**
+diff --git a/utils/utils.h b/utils/utils.h
+index daeeea231..6ecd07975 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -729,4 +729,11 @@ void vita_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+  */
+ extern bool vitasurf_cache_disabled(void) __attribute__((weak));
+ 
++/**
++ * The languages of the device's system setting, best first, as BCP 47
++ * tags separated by commas ("fr-FR,fr"), for Accept-Language and
++ * navigator.languages (VitaSurf). Weak, as vitasurf_cache_disabled.
++ */
++extern const char *vitasurf_languages(void) __attribute__((weak));
++
+ #endif

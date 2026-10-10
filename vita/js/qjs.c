@@ -326,6 +326,9 @@ struct jsthread {
 	unsigned attr_restyles;   /**< batches applied in place, for the log */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
 	nsurl *nav_pending;       /**< where nav_callback will go, or NULL */
+	/** that navigation was asked for from the user's input, not from a
+	 * timer, a fetch or a script element (Fetch Metadata's -User) */
+	bool nav_user;
 	bool relayout_off;        /**< document too large to rebuild */
 	unsigned relayout_waits;  /**< retries spent waiting on fetches */
 	unsigned dom_elements;    /**< elements in the document, 0 if not counted */
@@ -6743,7 +6746,9 @@ static void nav_callback(void *p)
 		}
 		/* may destroy this thread; do not touch it after */
 		browser_window_navigate(thread->win, url, from,
-					BW_NAVIGATE_HISTORY, NULL, NULL, NULL);
+					BW_NAVIGATE_HISTORY |
+					(thread->nav_user ? 0 : BW_NAVIGATE_SCRIPT),
+					NULL, NULL, NULL);
 		if (from != NULL) {
 			nsurl_unref(from);
 		}
@@ -6831,6 +6836,7 @@ static JSValue win_navigate(JSContext *ctx, jsthread *thread, const char *href)
 			nsurl_unref(thread->nav_pending);
 		}
 		thread->nav_pending = url;
+		thread->nav_user = !thread->entry_safe;
 		guit->misc->schedule(0, nav_callback, thread);
 	}
 	(void)ctx;
@@ -9221,7 +9227,8 @@ static bool xhr_start(struct js_xhr *x)
 	}
 	hdrs[n] = NULL;
 	err = fetch_start(x->url, x->referer, xhr_fetch_callback, x, false,
-			  x->post, NULL, true, false, false, hdrs, &x->fetch);
+			  x->post, NULL, true, false,
+			  FETCH_DEST_EMPTY << FETCH_META_DEST, hdrs, &x->fetch);
 	free(origin_hdr);
 	free(hdrs);
 	if (err != NSERROR_OK) {
@@ -9233,6 +9240,26 @@ static bool xhr_start(struct js_xhr *x)
 		x->timer_set = true;
 	}
 	return true;
+}
+
+/* __vitaLanguages() -> "fr-FR,fr": the languages Accept-Language names,
+ * for navigator.languages and so Intl's default locale */
+static JSValue win_vita_languages(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	const char *list = NULL;
+
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (nsoption_charp(accept_language) != NULL &&
+	    nsoption_charp(accept_language)[0] != '\0') {
+		list = nsoption_charp(accept_language);
+	} else if (vitasurf_languages != NULL) {
+		list = vitasurf_languages();
+	}
+	return JS_NewString(ctx, list != NULL && list[0] != '\0' ?
+			    list : "en-US,en");
 }
 
 /* __vitaFetch(url, method, headers[], body, timeoutMs, callback) -> id */
@@ -15592,6 +15619,9 @@ static bool setup_globals(jsthread *thread)
 	/* transport for XMLHttpRequest and fetch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFetch",
 			  JS_NewCFunction(ctx, win_vita_fetch, "__vitaFetch", 6));
+	JS_SetPropertyStr(ctx, global, "__vitaLanguages",
+			  JS_NewCFunction(ctx, win_vita_languages,
+					  "__vitaLanguages", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaFetchAbort",
 			  JS_NewCFunction(ctx, win_vita_fetch_abort, "__vitaFetchAbort", 1));
 

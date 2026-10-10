@@ -278,6 +278,9 @@ void vita_decode_thread_started(int index);
  */
 bool vitasurf_cache_disabled(void);
 
+/* The system language's tags, best first: "fr-FR,fr" (utils/utils.h) */
+const char *vitasurf_languages(void);
+
 /** Turn the caches off or on, and remember which across runs. */
 void vitasurf_set_cache_disabled(bool off);
 

@@ -418,6 +418,34 @@ int vita_verbose_requested(void)
  */
 static int cache_off = -1;
 
+/*
+ * The system language, as the languages a browser on this device says
+ * it reads: Accept-Language and navigator.languages, and so the default
+ * locale of Intl. A tag with a region, then the bare language, as a
+ * browser set to it sends.
+ */
+static const char *const system_languages[] = {
+	"ja-JP,ja", "en-US,en", "fr-FR,fr", "es-ES,es", "de-DE,de",
+	"it-IT,it", "nl-NL,nl", "pt-PT,pt", "ru-RU,ru", "ko-KR,ko",
+	"zh-TW,zh", "zh-CN,zh", "fi-FI,fi", "sv-SE,sv", "da-DK,da",
+	"nb-NO,nb", "pl-PL,pl", "pt-BR,pt", "en-GB,en", "tr-TR,tr",
+};
+static const char *languages = "en-US,en";
+
+const char *vitasurf_languages(void)
+{
+	return languages;
+}
+
+static void set_system_language(int lang)
+{
+	if (lang >= 0 && lang < (int)(sizeof system_languages /
+				      sizeof system_languages[0])) {
+		languages = system_languages[lang];
+	}
+	vita_log("languages: %s (system language %d)", languages, lang);
+}
+
 bool vitasurf_cache_disabled(void)
 {
 	if (cache_off < 0) {
@@ -931,6 +959,7 @@ int vita_platform_init(void)
 	sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_LANG, &lang);
 	sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_ENTER_BUTTON, &enter);
 	dialog_config.language = (SceSystemParamLang)lang;
+	set_system_language(lang);
 	dialog_config.enterButtonAssign = (SceSystemParamEnterButtonAssign)enter;
 	ret = sceCommonDialogSetConfigParam(&dialog_config);
 	if (ret < 0) {
