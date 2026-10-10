@@ -7,15 +7,20 @@ with a web page whose images name each case.
 answers DNS on 127.0.0.1:5353 (UDP and TCP) and serves http on :8001.
 Run the native harness with VITASURF_DNS_SERVER=127.0.0.1:5353 and load
 http://a.test:8001/. The web server should see a.test, alias.test (an
-alias with its address), alias2.test (an alias alone, asked again) and
-big.test (truncated over UDP, asked over TCP); the log should say
+alias with its address), alias2.test (an alias alone, asked again),
+big.test (truncated over UDP, asked over TCP) and refused1.test (refused
+once, then answered: a refusal is a reason to ask again, as glibc and
+Chrome do); the log should say
 
     dns: nx.test failed after N ms: no such name (rcode 3 from 127.0.0.1)
     dns: v6only.test failed after N ms: no IPv4 address, only IPv6, ...
+    dns: refused.test: VitaSurf's own query was refused (rcode 5, last
+         from 127.0.0.1) after N ms (3 sent to 1 server), so the system
+         resolver was asked
     dns: slow.test: VitaSurf's own query had no answer after 4500 ms
          (3 sent), so the system resolver was asked
 
-the first two at once rather than after a resolver's timeout.
+the first three at once rather than after a resolver's timeout.
 """
 import http.server
 import socket, struct, threading
@@ -34,12 +39,14 @@ def parse_q(d):
 def rr(name, t, rdata):
     return name_bytes(name) + struct.pack('>HHIH', t, 1, 60, len(rdata)) + rdata
 LOCAL = socket.inet_aton('127.0.0.1')
+asked = {}
 def answer(d, tcp):
     qid = d[:2]; name, qtype, q = parse_q(d)
     rcode = 0; ans = []; tc = False
     print('Q %s %d %s' % (name, qtype, 'tcp' if tcp else 'udp'), flush=True)
     if name == 'slow.test':
         return None
+    asked[name, qtype] = asked.get((name, qtype), 0) + 1
     if name == 'a.test' and qtype == 1:
         ans = [rr(name, 1, LOCAL)]
     elif name == 'alias.test' and qtype == 1:
@@ -51,6 +58,13 @@ def answer(d, tcp):
             ans = [rr(name, 28, socket.inet_pton(socket.AF_INET6, '2001:db8::1'))]
     elif name == 'nx.test':
         rcode = 3
+    elif name == 'refused.test':
+        rcode = 5
+    elif name == 'refused1.test' and qtype == 1:
+        if asked[name, qtype] == 1:
+            rcode = 5
+        else:
+            ans = [rr(name, 1, LOCAL)]
     elif name == 'big.test' and qtype == 1:
         if not tcp:
             tc = True
@@ -85,7 +99,8 @@ class Web(http.server.BaseHTTPRequestHandler):
             body = b'<!doctype html><p>dns</p>' + b''.join(
                 b'<img src="http://%s:8001/x.gif">' % h for h in
                 [b'alias.test', b'alias2.test', b'v6only.test', b'nx.test',
-                 b'big.test', b'slow.test'])
+                 b'big.test', b'refused.test', b'refused1.test',
+                 b'slow.test'])
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.end_headers()

@@ -645,10 +645,20 @@ static int ask_tcp(uint32_t server, uint16_t port, const uint8_t *q, int qlen,
 	return want;
 }
 
+/* The rcodes after which a resolver asks the next server, as glibc's
+ * res_send and Chrome's DnsTransaction do: the server could not or would
+ * not answer, which says nothing about the name. */
+static bool rcode_next_server(int rcode)
+{
+	return rcode == 2 /* SERVFAIL */ || rcode == 4 /* NOTIMP */ ||
+		rcode == 5 /* REFUSED */;
+}
+
 /*
  * Ask the servers, in turn, for name's qtype records, until one answers.
- * Returns VITA_DNS_OK with an answer, or VITA_DNS_TIMEOUT, ERROR or
- * BADREPLY.
+ * A server that fails or refuses the query is passed over for the next
+ * try at once. Returns VITA_DNS_OK with an answer, or VITA_DNS_SERVFAIL
+ * when every try was failed or refused, TIMEOUT, ERROR or BADREPLY.
  */
 static int ask(const char *name, uint16_t qtype, const uint32_t *servers,
 	       int nservers, uint16_t port, struct answer *a,
@@ -657,6 +667,7 @@ static int ask(const char *name, uint16_t qtype, const uint32_t *servers,
 	uint8_t q[12 + 256 + 4];
 	uint8_t buf[DNS_UDP_MAX];
 	bool sent = false;
+	int refused = -1; /* the last such rcode, or -1 */
 	int qlen, t;
 
 	for (t = 0; t < DNS_TRIES; t++) {
@@ -696,8 +707,12 @@ static int ask(const char *name, uint16_t qtype, const uint32_t *servers,
 				 * before: this one's may yet come */
 				continue;
 			}
-			sock_close(s);
 			r->server = server;
+			if (rcode_next_server(a->rcode)) {
+				refused = a->rcode;
+				break;
+			}
+			sock_close(s);
 			if (a->truncated) {
 				uint8_t *big = NULL;
 				int bl = ask_tcp(server, port, q, qlen, &big);
@@ -713,6 +728,10 @@ static int ask(const char *name, uint16_t qtype, const uint32_t *servers,
 			return VITA_DNS_OK;
 		}
 		sock_close(s);
+	}
+	if (refused >= 0) {
+		r->rcode = refused;
+		return VITA_DNS_SERVFAIL;
 	}
 	return sent ? VITA_DNS_TIMEOUT : VITA_DNS_ERROR;
 }
@@ -731,6 +750,7 @@ void vita_dns_lookup(const char *host, struct vita_dns_result *r)
 		r->status = VITA_DNS_ERROR;
 		return;
 	}
+	r->servers = n;
 	snprintf(name, sizeof name, "%s", host);
 	for (hop = 0; hop <= DNS_MAX_CNAMES; hop++) {
 		st = ask(name, DNS_TYPE_A, servers, n, port, &a, r);

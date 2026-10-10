@@ -128,7 +128,8 @@ static void slot_set_state(struct slot *s, int state)
  * settled the lookup, with an address or with a server's answer that
  * there is none; false to ask the system resolver, as for a name with
  * no dot, which only it may know (a LAN name, a search domain), or when
- * no server answered.
+ * no server answered or every answer was a failure or a refusal, as
+ * Chrome falls back to the system's resolver when its own fails.
  */
 static bool lookup_own(struct slot *s)
 {
@@ -147,7 +148,6 @@ static bool lookup_own(struct slot *s)
 		return true;
 	case VITA_DNS_NXDOMAIN:
 	case VITA_DNS_NODATA:
-	case VITA_DNS_SERVFAIL:
 		s->fail = FAIL_DNS;
 		return true;
 	default:
@@ -463,7 +463,18 @@ static void slot_report(struct slot *s, int state)
 {
 	uint32_t waited = s->done_ms - s->asked_ms;
 
-	if (s->fell_back) {
+	if (s->fell_back && s->dns.status == VITA_DNS_SERVFAIL) {
+		const unsigned char *b = (const unsigned char *)&s->dns.server;
+
+		vita_log("dns: %s: VitaSurf's own query was %s (rcode %d, "
+			 "last from %u.%u.%u.%u) after %u ms (%d sent to %d "
+			 "server%s), so the system resolver was asked",
+			 s->host, s->dns.rcode == 5 ? "refused" :
+			 "failed by the DNS server", s->dns.rcode,
+			 b[0], b[1], b[2], b[3], (unsigned int)s->dns_ms,
+			 s->dns.tries, s->dns.servers,
+			 s->dns.servers == 1 ? "" : "s");
+	} else if (s->fell_back) {
 		vita_log("dns: %s: VitaSurf's own query %s after %u ms (%d "
 			 "sent), so the system resolver was asked", s->host,
 			 s->dns.status == VITA_DNS_TIMEOUT ? "had no answer" :
