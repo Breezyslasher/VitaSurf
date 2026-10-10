@@ -1110,6 +1110,8 @@ static void dump_box_paint(struct box *box, char *out, size_t size)
  * it ended up and how big it is. The count is capped, since a page of
  * any size has thousands of boxes and the log is read by a person.
  */
+static void dump_frame(struct browser_window *bw, unsigned int depth);
+
 static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 {
 	char what[96];
@@ -1148,6 +1150,59 @@ static void dump_box(struct box *box, unsigned int depth, unsigned int *left)
 	     child = child->next_float) {
 		dump_box(child, depth + 1, left);
 	}
+	if (box->iframe != NULL) {
+		dump_frame(box->iframe, depth + 1);
+	}
+}
+
+/* boxes each frame's document may write, and how deep frames nest */
+#define FRAME_DUMP_BOXES 300
+#define FRAME_DUMP_LEVELS 4
+static unsigned int frame_dump_level;
+
+/**
+ * Write the document in a frame under the frame's box (VitaSurf).
+ *
+ * The page's dump stopped at the iframe, so a widget in a frame -- the
+ * claude.ai Cloudflare check is one -- could not be read from a log at
+ * all. Its boxes follow the frame's, in the frame's own coordinates,
+ * with a count of their own so that a long page cannot leave them out.
+ */
+static void dump_frame(struct browser_window *bw, unsigned int depth)
+{
+	struct hlcache_handle *h = browser_window_get_content(bw);
+	struct box *root = NULL;
+	unsigned int left = FRAME_DUMP_BOXES;
+	nsurl *url;
+
+	if (frame_dump_level >= FRAME_DUMP_LEVELS) {
+		vita_log("layout: %*sframe: nested too deep to write",
+			 (int)(depth * 2), "");
+		return;
+	}
+	if (h == NULL) {
+		vita_log("layout: %*sframe: no document yet",
+			 (int)(depth * 2), "");
+		return;
+	}
+	if (content_get_type(h) == CONTENT_HTML) {
+		root = html_get_box_tree(h);
+	}
+	url = hlcache_handle_get_url(h);
+	if (root == NULL) {
+		vita_log("layout: %*sframe: %s, not laid out",
+			 (int)(depth * 2), "",
+			 url != NULL ? nsurl_access(url) : "?");
+		return;
+	}
+	vita_log("layout: %*sframe document %s, in its own coordinates",
+		 (int)(depth * 2), "",
+		 url != NULL ? nsurl_access(url) : "?");
+	frame_dump_level++;
+	dump_box(root, depth, &left);
+	frame_dump_level--;
+	vita_log("layout: %*send of the frame%s", (int)(depth * 2), "",
+		 left == 0 ? " (there are more)" : "");
 }
 
 
@@ -1259,7 +1314,7 @@ static void dump_under_pointer(struct gui_window *gw, html_content *html,
 	nsfb_bbox_t loc;
 	struct box *b = root, *deepest = root, *around;
 	int sx, sy, vw, vh, px, py, bx = 0, by = 0, x, y;
-	unsigned int depth = 0, left = 200, up;
+	unsigned int depth = 0, left = 200, up, level;
 	float scale;
 	char what[96];
 	char paint[64];
@@ -1273,28 +1328,59 @@ static void dump_under_pointer(struct gui_window *gw, html_content *html,
 	py = (int)((loc.y0 - fbtk_get_absy(gw->browser) + sy) / scale);
 	vita_log("layout: the boxes under the pointer at %d,%d on the page",
 		 px, py);
-	while ((b = box_at_point(&html->unit_len_ctx, b,
-				 px, py, &bx, &by)) != NULL) {
-		deepest = b;
-	}
-	/* the chain from the page down, outermost first */
-	for (b = deepest; b != NULL; b = b->parent) {
-		depth++;
-	}
-	while (depth > 0) {
-		unsigned int i;
+	for (level = 0; ; level++) {
+		struct hlcache_handle *fh;
+		struct browser_window *frame;
+		int fx = 0, fy = 0;
+		float fscale;
 
-		b = deepest;
-		for (i = 1; i < depth; i++) {
-			b = b->parent;
+		b = root;
+		deepest = root;
+		bx = by = 0;
+		depth = 0;
+		while ((b = box_at_point(&html->unit_len_ctx, b,
+					 px, py, &bx, &by)) != NULL) {
+			deepest = b;
 		}
-		box_coords(b, &x, &y);
-		dump_box_name(b, what, sizeof(what));
-		dump_box_paint(b, paint, sizeof(paint));
-		vita_log("layout: under %s%s%s %dx%d at %d,%d%s",
-			 dump_box_type(b->type), what, dump_box_position(b),
-			 b->width, b->height, x, y, paint);
-		depth--;
+		/* the chain from the page down, outermost first */
+		for (b = deepest; b != NULL; b = b->parent) {
+			depth++;
+		}
+		while (depth > 0) {
+			unsigned int i;
+
+			b = deepest;
+			for (i = 1; i < depth; i++) {
+				b = b->parent;
+			}
+			box_coords(b, &x, &y);
+			dump_box_name(b, what, sizeof(what));
+			dump_box_paint(b, paint, sizeof(paint));
+			vita_log("layout: under %s%s%s %dx%d at %d,%d%s",
+				 dump_box_type(b->type), what,
+				 dump_box_position(b), b->width, b->height,
+				 x, y, paint);
+			depth--;
+		}
+		/* on into a frame under the pointer, where its document
+		 * puts the point, as a click there would (VitaSurf) */
+		frame = deepest->iframe;
+		if (frame == NULL || level + 1 >= FRAME_DUMP_LEVELS) {
+			break;
+		}
+		fh = browser_window_get_content(frame);
+		if (fh == NULL || content_get_type(fh) != CONTENT_HTML ||
+		    html_get_box_tree(fh) == NULL) {
+			break;
+		}
+		fscale = browser_window_get_scale(frame);
+		browser_window_get_position(frame, false, &fx, &fy);
+		px = (int)(px * fscale) - fx;
+		py = (int)(py * fscale) - fy;
+		html = (html_content *)hlcache_handle_get_content(fh);
+		root = html_get_box_tree(fh);
+		vita_log("layout: into the frame's document, at %d,%d in it",
+			 px, py);
 	}
 	/* then what is around it: enough levels up to take in a card */
 	around = deepest;
