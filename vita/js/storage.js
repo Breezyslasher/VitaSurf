@@ -1079,11 +1079,11 @@ IDBIndex.prototype = {
  },
  openCursor: function(query, direction){
   return openCursor(this.objectStore, this.objectStore._s, asRange(query),
-                    direction, true, this._i);
+                    direction, true, this);
  },
  openKeyCursor: function(query, direction){
   return openCursor(this.objectStore, this.objectStore._s, asRange(query),
-                    direction, false, this._i);
+                    direction, false, this);
  }
 };
 
@@ -1181,9 +1181,12 @@ function IDBCursorWithValue(){ IDBCursor.apply(this, arguments); }
 IDBCursorWithValue.prototype = Object.create(IDBCursor.prototype);
 IDBCursorWithValue.prototype.constructor = IDBCursorWithValue;
 
-function openCursor(objStore, s, range, direction, withValue, idx){
- var tx = objStore.transaction;
- var req = new IDBRequest(idx ? new IDBIndex(objStore, '') : objStore, tx);
+/* index is the IDBIndex a cursor walks, which is its source and its
+   request's, or null for the store's own records */
+function openCursor(objStore, s, range, direction, withValue, index){
+ var tx = objStore.transaction, idx = index ? index._i : null;
+ var source = index || objStore;
+ var req = new IDBRequest(source, tx);
  direction = direction || 'next';
  var desc = direction === 'prev' || direction === 'prevunique';
  return tx._push(function(){
@@ -1198,7 +1201,7 @@ function openCursor(objStore, s, range, direction, withValue, idx){
    hits = uniq;
   }
   var Ctor = withValue ? IDBCursorWithValue : IDBCursor;
-  var cur = new Ctor(idx ? objStore : objStore, req, hits, withValue, tx);
+  var cur = new Ctor(source, req, hits, withValue, tx);
   cur.direction = direction;
   return cur._step(1) ? cur : null;
  }, req);
