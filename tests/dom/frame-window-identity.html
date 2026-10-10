@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!-- A frame's window is one object for the frame's whole life, as a
+     browser's WindowProxy is: the contentWindow a page takes when it
+     makes a frame of another origin, before its page has loaded, is the
+     source of the messages that page sends, and of the next page's
+     after the frame navigates. Ours was one object per page, so a page
+     matching the two -- Cloudflare Turnstile's widget, kept in a closed
+     shadow root, does -- never heard its frame. Expected lines are what
+     Chrome prints. -->
+<html><head><title>frame window identity</title></head><body><div id="c"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function L(s) { out.push(s); }
+function child(n) {
+  return 'data:text/html,' + encodeURIComponent('<script>parent.postMessage("page ' + n + '", "*");<\/script>');
+}
+var h = document.createElement('div'), r = h.attachShadow({mode: 'closed'}), f = document.createElement('iframe');
+f.style.display = 'none';
+f.src = child(1);
+r.appendChild(f);
+document.getElementById('c').appendChild(h);
+var early = f.contentWindow;
+var n = 0;
+window.addEventListener('message', function (e) {
+  n++;
+  L(e.data + ': source is the early window ' + (e.source === early) +
+    ', is contentWindow now ' + (e.source === f.contentWindow) + ', origin ' + e.origin);
+  if (n === 1) f.src = child(2);
+});
+setTimeout(function () {
+  L('contentWindow the same at the end ' + (early === f.contentWindow));
+  out.forEach(function (l) { console.log('XX ' + l); });
+  document.getElementById('out').textContent = out.join('\n');
+}, 1500);
+</script></body></html>

@@ -1,0 +1,23 @@
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 8d1794b98..c7c39d5a7 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -969,9 +969,17 @@ gadget_mouse_action(html_content *html,
+ 				     BROWSER_MOUSE_CLICK_2)) {
+ 				mas->result.action = ACTION_SUBMIT;
+ 			}
+-		} else {
++		}
++#ifndef __vita__
++		else {
+ 			mas->result.status = messages_get("FormBadSubmit");
+ 		}
++#endif
++		/* VitaSurf: a <button> outside any form is a submit button
++		 * with nothing to submit, and a browser says nothing about
++		 * it: its click goes to the page's script, as Speedtest's GO
++		 * button's does. "form can not be submitted" read as if the
++		 * button had failed. */
+ 		break;
+ 
+ 	case GADGET_TEXTBOX:

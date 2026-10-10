@@ -1,0 +1,15 @@
+<!doctype html>
+<title>iframe viewport overflow</title>
+<!-- A frame's scrollbars follow the overflow its document gives the
+     viewport (the root's, or the body's when the root's is visible).
+     Expected, as in Chrome: frame A and frame C have no scrollbars,
+     frame B has both, frame D has a vertical one though it fits. -->
+<style>iframe{width:300px;height:65px;border:1px solid #888;display:block;margin:4px}</style>
+<p>A: body overflow hidden</p>
+<iframe srcdoc="<style>body{margin:0;overflow:hidden}</style><div style='width:340px;height:90px;background:#cde'>A wide, tall widget</div>"></iframe>
+<p>B: overflow visible (scrollbars)</p>
+<iframe srcdoc="<style>body{margin:0}</style><div style='width:340px;height:90px;background:#edc'>B wide, tall widget</div>"></iframe>
+<p>C: html overflow hidden</p>
+<iframe srcdoc="<style>html{overflow:hidden}body{margin:0}</style><div style='width:340px;height:90px;background:#dec'>C wide, tall widget</div>"></iframe>
+<p>D: body overflow-y scroll</p>
+<iframe srcdoc="<style>body{margin:0;overflow-y:scroll}</style><div style='height:20px;background:#ecd'>D small</div>"></iframe>

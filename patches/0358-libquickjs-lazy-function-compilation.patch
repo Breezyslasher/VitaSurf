@@ -1,0 +1,1684 @@
+diff --git a/quickjs.c b/quickjs.c
+index 98bd74d..2b181a7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -316,6 +316,10 @@ struct JSRuntime {
+     JSCompileTickHandler *compile_tick;
+     void *compile_tick_opaque;
+     int compile_tick_count;
++    /* functions compiled on their first call, and the time it took
++       (VitaSurf; JSLazyFunc) */
++    uint32_t lazy_count;
++    uint64_t lazy_ns;
+ 
+     JSPromiseHook *promise_hook;
+     void *promise_hook_opaque;
+@@ -487,6 +491,9 @@ struct JSContext {
+     JSGCObjectHeader header; /* must come first */
+     JSRuntime *rt;
+     struct list_head link;
++    /* a lazy function's closure needs what only an eager compile
++       handles; compile the script again without them (VitaSurf) */
++    bool lazy_retry;
+ 
+     uint16_t binary_object_count;
+     uint32_t binary_object_size : 31;
+@@ -816,8 +823,40 @@ typedef struct JSFunctionBytecode {
+     uint8_t *pc2line_buf;
+     char *source;
+     struct JSSourceBlob *source_blob; /* holds source, or NULL if it owns it */
++    /* not compiled yet, or NULL (VitaSurf); see js_lazy_compile */
++    struct JSLazyFunc *lazy;
+ } JSFunctionBytecode;
+ 
++/*
++ * A function whose body is compiled the first time it is called
++ * (VitaSurf). The script was parsed whole, so its syntax errors are
++ * reported when it loads, but the body's bytecode was thrown away: a
++ * function's JSFunctionBytecode is then only what creating it needs,
++ * its name, flags, source and closure variables, the last exactly the
++ * ones its compiled form uses, in the same order. Most of a large
++ * bundle is never called, three quarters of Home Assistant's, and its
++ * bytecode was both compile time and memory.
++ *
++ * The body is compiled again from source, with an eval-like parent
++ * whose closure variables are this function's, so each name finds the
++ * variable it found the first time. What the tokenizer had at the
++ * parameters is kept so lines and columns come out the same.
++ */
++typedef struct JSLazyFunc {
++    struct JSFunctionBytecode *real; /* the compiled function, once it is */
++    int params_off;     /* the first token of the parameters, from source */
++    int mark_off;       /* the tokenizer's mark and end of line there */
++    int eol_off;
++    int params_line;
++    uint8_t func_type;  /* JSParseFunctionEnum */
++    /* what the enclosing function was, where the tokens depend on it */
++    uint8_t parent_func_type;
++    uint8_t parent_func_kind;
++    uint8_t init_strict : 1;  /* strict before its own directives */
++    uint8_t parent_in_body : 1;
++    uint8_t is_module : 1;
++} JSLazyFunc;
++
+ /*
+  * The text of one script, shared by every function compiled from it
+  * (VitaSurf). Each function used to keep its own copy of its source for
+@@ -1229,6 +1268,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
+ static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
+                                       JSValueConst this_obj,
+                                       int argc, JSValueConst *argv, int flags);
++static JSFunctionBytecode *js_lazy_ready(JSContext *ctx, JSObject *p);
+ static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+                                int argc, JSValueConst *argv, int flags);
+@@ -6942,6 +6982,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
+             }
+             if (b->realm)
+                 mark_func(rt, &b->realm->header);
++            if (b->lazy && b->lazy->real)
++                mark_func(rt, &b->lazy->real->header);
+         }
+         break;
+     case JS_GC_OBJ_TYPE_VAR_REF:
+@@ -17671,6 +17713,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                          argv, flags);
+     }
+     b = p->u.func.function_bytecode;
++    if (unlikely(b->lazy)) {
++        b = js_lazy_ready(caller_ctx, p);
++        if (!b)
++            return JS_EXCEPTION;
++    }
+ 
+     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
+         arg_allocated_size = b->arg_count;
+@@ -20487,6 +20534,11 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
+     sf = &s->frame;
+     p = JS_VALUE_GET_OBJ(func_obj);
+     b = p->u.func.function_bytecode;
++    if (unlikely(b->lazy)) {
++        b = js_lazy_ready(ctx, p);
++        if (!b)
++            return -1;
++    }
+     sf->is_strict_mode = b->is_strict_mode;
+     sf->cur_pc = b->byte_code_buf;
+     arg_buf_len = max_int(b->arg_count, argc);
+@@ -21605,6 +21657,7 @@ typedef struct JSFunctionDef {
+     bool need_home_object : 1;
+     bool use_short_opcodes : 1; /* true if short opcodes are used in byte_code */
+     bool has_await : 1; /* true if await is used (used in module eval) */
++    bool is_lazy : 1; /* body parsed and dropped, compiled when called (VitaSurf) */
+ 
+     JSFunctionKindEnum func_kind : 8;
+     JSParseFunctionEnum func_type : 7;
+@@ -21697,6 +21750,27 @@ typedef struct JSFunctionDef {
+     JSSourceBlob *source_blob; /* holds source, or NULL if it owns it */
+ 
+     JSModuleDef *module; /* != NULL when parsing a module */
++
++    /* lazy compilation (VitaSurf): where the parameters began and what
++       the tokenizer and the enclosing function were there */
++    const uint8_t *lazy_params;
++    const uint8_t *lazy_mark;
++    const uint8_t *lazy_eol;
++    int lazy_params_off; /* the same, from the start of its source */
++    int lazy_mark_off;
++    int lazy_eol_off;
++    int lazy_params_line;
++    uint8_t lazy_init_strict;
++    uint8_t lazy_parent_func_type;
++    uint8_t lazy_parent_func_kind;
++    uint8_t lazy_parent_in_body;
++    uint8_t lazy_is_module;
++    /* the names used inside it that it does not declare itself, with
++       lazy_private[i] set for a #name */
++    JSAtom *lazy_names;
++    uint8_t *lazy_private;
++    int lazy_name_count;
++    int lazy_name_size;
+ } JSFunctionDef;
+ 
+ typedef struct JSToken {
+@@ -21745,6 +21819,21 @@ typedef struct JSParseState {
+     bool is_module; /* parsing a module */
+     bool allow_html_comments;
+     JSSourceBlob *source_blob; /* the input, once a function wants it */
++    /* lazy compilation (VitaSurf): on for this parse, the 'with' bodies
++       being parsed (nothing in one is lazy), and when compiling a lazy
++       function, it and the stand-in for its parent */
++    bool lazy;
++    int with_depth;
++    JSFunctionBytecode *reparse;
++    JSFunctionDef *reparse_parent;
++    /* the tokens are only skipped: strings and templates are read to
++       their end without making their values */
++    bool skip_values;
++    /* the source of the functions that call eval, as start and end
++       pairs: nothing in one is left for later. Kept from a compile
++       that found one too late, for the compile again */
++    const uint8_t **eval_ranges;
++    int eval_range_count, eval_range_size;
+     /* what js_parse_skip_parens_token found for the brackets it has
+        already scanned, by the bracket's place in the source (VitaSurf) */
+     struct JSSkipMemo *skip_memo;
+@@ -22018,6 +22107,41 @@ static __exception int js_parse_template_part(JSParseState *s,
+     JSValue str;
+ 
+     /* p points to the first byte of the template part */
++    if (s->skip_values) {
++        /* skipped (VitaSurf): what follows, without the value; a byte
++           of a longer character is none of these */
++        for(;;) {
++            if (p >= s->buf_end)
++                goto unexpected_eof;
++            c = *p++;
++            if (c == '`')
++                break;
++            if (c == '$' && *p == '{') {
++                p++;
++                break;
++            }
++            if (c == '\\') {
++                if (p >= s->buf_end)
++                    goto unexpected_eof;
++                c = *p++;
++            }
++            if (c == '\r') {
++                if (*p == '\n')
++                    p++;
++                c = '\n';
++            }
++            if (c == '\n') {
++                s->line_num++;
++                s->eol = &p[-1];
++                s->mark = p;
++            }
++        }
++        s->token.val = TOK_TEMPLATE;
++        s->token.u.str.sep = c;
++        s->token.u.str.str = JS_UNDEFINED;
++        s->buf_ptr = p;
++        return 0;
++    }
+     if (string_buffer_init(s->ctx, b, 32))
+         goto fail;
+     for(;;) {
+@@ -22088,6 +22212,35 @@ static __exception int js_parse_string(JSParseState *s, int sep,
+     JSValue str;
+ 
+     /* string */
++    if (s->skip_values && sep != '`') {
++        /* skipped (VitaSurf): its end, and the lines it continues
++           over, without the value */
++        for(;;) {
++            if (p >= s->buf_end)
++                goto invalid_char;
++            c = *p++;
++            if (c == sep)
++                break;
++            if (c == '\\') {
++                c = *p;
++                if (c == '\r' || c == '\n') {
++                    if (c == '\r' && p[1] == '\n')
++                        p++;
++                    p++;
++                    s->line_num++;
++                    s->eol = &p[-1];
++                    s->mark = p;
++                } else if (p < s->buf_end) {
++                    p++;
++                }
++            }
++        }
++        token->val = TOK_STRING;
++        token->u.str.sep = c;
++        token->u.str.str = JS_UNDEFINED;
++        *pp = p;
++        return 0;
++    }
+     if (string_buffer_init(s->ctx, b, 32))
+         goto fail;
+     for(;;) {
+@@ -29938,8 +30091,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+             emit_u16(s, with_idx);
+ 
+             set_eval_ret_undefined(s);
+-            if (js_parse_statement(s))
++            s->with_depth++;
++            if (js_parse_statement(s)) {
++                s->with_depth--;
+                 goto fail;
++            }
++            s->with_depth--;
+ 
+             /* Popping scope drops lexical context for the with object variable */
+             pop_scope(s);
+@@ -32695,6 +32852,11 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
+ 
+     js_source_release(ctx->rt, fd->source_blob, fd->source);
+ 
++    for(i = 0; i < fd->lazy_name_count; i++)
++        JS_FreeAtom(ctx, fd->lazy_names[i]);
++    js_free(ctx, fd->lazy_names);
++    js_free(ctx, fd->lazy_private);
++
+     if (fd->parent) {
+         /* remove in parent list */
+         list_del(&fd->link);
+@@ -36747,14 +36909,10 @@ static int add_module_variables(JSContext *ctx, JSFunctionDef *fd)
+ /* create a function object from a function definition. The function
+    definition is freed. All the child functions are also created. It
+    must be done this way to resolve all the variables. */
+-static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
++/* link every variable into the chains of the scopes that see it */
++static void js_relink_scopes(JSFunctionDef *fd)
+ {
+-    JSValue func_obj;
+-    JSFunctionBytecode *b;
+-    struct list_head *el, *el1;
+-    int stack_size, scope, idx;
+-    int function_size, byte_code_offset, cpool_offset;
+-    int closure_var_offset, vardefs_offset;
++    int scope, idx;
+ 
+     /* recompute scope linkage */
+     for (scope = 0; scope < fd->scope_count; scope++) {
+@@ -36781,6 +36939,23 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+             vd->scope_next = fd->scopes[scope].first;
+         }
+     }
++}
++
++static JSValue js_create_lazy_function(JSContext *ctx, JSFunctionDef *fd);
++
++static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
++{
++    JSValue func_obj;
++    JSFunctionBytecode *b;
++    struct list_head *el, *el1;
++    int stack_size;
++    int function_size, byte_code_offset, cpool_offset;
++    int closure_var_offset, vardefs_offset;
++
++    if (fd->is_lazy)
++        return js_create_lazy_function(ctx, fd);
++
++    js_relink_scopes(fd);
+     /* nothing relinks a scope from here on (VitaSurf) */
+     fd->chains_final = true;
+ 
+@@ -36955,6 +37130,144 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     return JS_EXCEPTION;
+ }
+ 
++/*
++ * A lazy function's JSFunctionBytecode (VitaSurf): what creating it
++ * needs, and the closure variables its body will use. Each name its
++ * body uses from outside is looked up from where the function is, as
++ * the compile of the body would, which makes the variables it finds
++ * captured and gives them the same entries. A name that is not a
++ * variable around it is a global and makes no entry.
++ */
++static JSValue js_create_lazy_function(JSContext *ctx, JSFunctionDef *fd)
++{
++    JSFunctionBytecode *b;
++    JSLazyFunc *lz;
++    DynBuf bc;
++    int i, n;
++
++    js_dbuf_init(ctx, &bc);
++    for (i = 0; i < fd->lazy_name_count; i++) {
++        JSAtom name = fd->lazy_names[i];
++        if (fd->lazy_private[i]) {
++            int idx, var_kind;
++            bool is_ref;
++
++            /* the entry is given the field's kind, which the compile
++               of the body reads from it, and a setter's name its own */
++            idx = resolve_scope_private_field1(ctx, &is_ref, &var_kind, fd,
++                                               name, 0);
++            if (idx < 0) {
++                dbuf_free(&bc);
++                goto fail;
++            }
++            fd->closure_var[idx].var_kind = var_kind;
++            if (var_kind == JS_VAR_PRIVATE_SETTER ||
++                var_kind == JS_VAR_PRIVATE_GETTER_SETTER) {
++                JSAtom setter_name = get_private_setter_name(ctx, name);
++                if (setter_name == JS_ATOM_NULL) {
++                    dbuf_free(&bc);
++                    goto fail;
++                }
++                idx = resolve_scope_private_field1(ctx, &is_ref, &var_kind,
++                                                   fd, setter_name, 0);
++                JS_FreeAtom(ctx, setter_name);
++                if (idx < 0) {
++                    dbuf_free(&bc);
++                    goto fail;
++                }
++                fd->closure_var[idx].var_kind = var_kind;
++            }
++        } else {
++            resolve_scope_var(ctx, fd, name, 0, OP_scope_get_var, &bc,
++                              NULL, NULL, 0);
++        }
++        free_bytecode_atoms(ctx->rt, bc.buf, bc.size, false);
++        bc.size = 0;
++        if (bc.error) {
++            dbuf_free(&bc);
++            JS_ThrowOutOfMemory(ctx);
++            goto fail;
++        }
++    }
++    dbuf_free(&bc);
++
++    n = fd->closure_var_count;
++    for (i = 0; i < n; i++) {
++        JSAtom name = fd->closure_var[i].var_name;
++        if (name == JS_ATOM__var_ || name == JS_ATOM__arg_var_ ||
++            name == JS_ATOM__with_) {
++            /* the names go through an eval's variables or a with
++               object first; only compiling the body now gets their
++               order right */
++            ctx->lazy_retry = true;
++            JS_ThrowInternalError(ctx, "lazy function in reach of eval");
++            goto fail;
++        }
++    }
++
++    b = js_mallocz(ctx, sizeof(*b) + n * sizeof(JSClosureVar));
++    if (!b)
++        goto fail;
++    lz = js_mallocz(ctx, sizeof(*lz));
++    if (!lz) {
++        js_free(ctx, b);
++        goto fail;
++    }
++    b->header.ref_count = 1;
++    b->lazy = lz;
++    if (n) {
++        b->closure_var = (void *)((uint8_t *)b + sizeof(*b));
++        memcpy(b->closure_var, fd->closure_var, n * sizeof(JSClosureVar));
++        b->closure_var_count = n;
++    }
++    js_free(ctx, fd->closure_var);
++    fd->closure_var = NULL;
++    fd->closure_var_count = 0;
++    b->func_name = fd->func_name;
++    fd->func_name = JS_ATOM_NULL;
++    b->defined_arg_count = fd->defined_arg_count;
++    b->filename = fd->filename;
++    fd->filename = JS_ATOM_NULL;
++    b->line_num = fd->line_num;
++    b->col_num = fd->col_num;
++    b->source = fd->source;
++    b->source_len = fd->source_len;
++    b->source_blob = fd->source_blob;
++    fd->source = NULL;
++    fd->source_blob = NULL;
++    b->has_prototype = fd->has_prototype;
++    b->has_simple_parameter_list = fd->has_simple_parameter_list;
++    b->is_strict_mode = fd->is_strict_mode;
++    b->is_derived_class_constructor = fd->is_derived_class_constructor;
++    b->func_kind = fd->func_kind;
++    /* whether the body uses super is not known yet: a function that
++       has a home object is given it */
++    b->need_home_object = (fd->home_object_var_idx >= 0 ||
++                           fd->need_home_object || fd->has_home_object);
++    b->new_target_allowed = fd->new_target_allowed;
++    b->super_call_allowed = fd->super_call_allowed;
++    b->super_allowed = fd->super_allowed;
++    b->arguments_allowed = fd->arguments_allowed;
++    b->backtrace_barrier = fd->backtrace_barrier;
++    b->realm = JS_DupContext(ctx);
++    lz->params_off = fd->lazy_params_off;
++    lz->mark_off = fd->lazy_mark_off;
++    lz->eol_off = fd->lazy_eol_off;
++    lz->params_line = fd->lazy_params_line;
++    lz->func_type = fd->func_type;
++    lz->parent_func_type = fd->lazy_parent_func_type;
++    lz->parent_func_kind = fd->lazy_parent_func_kind;
++    lz->init_strict = fd->lazy_init_strict;
++    lz->parent_in_body = fd->lazy_parent_in_body;
++    lz->is_module = fd->lazy_is_module;
++    add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
++    js_free_function_def(ctx, fd);
++    return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
++ fail:
++    js_free_function_def(ctx, fd);
++    return JS_EXCEPTION;
++}
++
+ #endif // QJS_DISABLE_PARSER
+ 
+ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+@@ -36983,6 +37296,12 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+     JS_FreeAtomRT(rt, b->filename);
+     js_free_rt(rt, b->pc2line_buf);
+     js_source_release(rt, b->source_blob, b->source);
++    if (b->lazy) {
++        if (b->lazy->real)
++            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE,
++                                        b->lazy->real));
++        js_free_rt(rt, b->lazy);
++    }
+ 
+     remove_gc_object(&b->header);
+     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {
+@@ -37176,6 +37495,663 @@ static JSFunctionDef *js_parse_function_class_fields_init(JSParseState *s)
+ 
+ /* func_name must be JS_ATOM_NULL for JS_PARSE_FUNC_STATEMENT and
+    JS_PARSE_FUNC_EXPR, JS_PARSE_FUNC_ARROW and JS_PARSE_FUNC_VAR */
++/*
++ * Lazy compilation (VitaSurf): leaving a function's body for its first
++ * call. See JSLazyFunc.
++ */
++
++/* functions this short are compiled with the script */
++#define JS_LAZY_MIN_SOURCE 128
++
++static bool js_lazy_has_eval(JSFunctionDef *fd)
++{
++    struct list_head *el;
++
++    if (fd->has_eval_call)
++        return true;
++    list_for_each(el, &fd->child_list) {
++        JSFunctionDef *fd1 = list_entry(el, JSFunctionDef, link);
++        /* a lazy function was checked when it was left */
++        if (!fd1->is_lazy && js_lazy_has_eval(fd1))
++            return true;
++    }
++    return false;
++}
++
++/* whether a direct eval may see fd's variables' names: one in a
++   function around it, or, on a compile again, one found anywhere in a
++   function around it the first time */
++static bool js_lazy_in_eval_reach(JSParseState *s, JSFunctionDef *fd,
++                                  const uint8_t *start)
++{
++    JSFunctionDef *p;
++    int i;
++
++    for (p = fd->parent; p != NULL; p = p->parent) {
++        if (p->has_eval_call)
++            return true;
++    }
++    for (i = 0; i < s->eval_range_count; i += 2) {
++        if (start >= s->eval_ranges[i] && start < s->eval_ranges[i + 1])
++            return true;
++    }
++    return false;
++}
++
++/* note fd's source as a function that calls eval (see eval_ranges) */
++static void js_lazy_note_eval(JSParseState *s, const uint8_t *start,
++                              const uint8_t *end)
++{
++    if (js_resize_array(s->ctx, (void **)&s->eval_ranges,
++                        sizeof(s->eval_ranges[0]), &s->eval_range_size,
++                        s->eval_range_count + 2)) {
++        /* without it, the compile again is all eager */
++        JS_FreeValue(s->ctx, JS_GetException(s->ctx));
++        return;
++    }
++    s->eval_ranges[s->eval_range_count++] = start;
++    s->eval_ranges[s->eval_range_count++] = end;
++}
++
++/*
++ * Whether the token after a function's body, the current one, calls the
++ * function where it is written: "}(", "})(", "}).call(", "}).apply(" or
++ * "}.call(". Google's bundles are each one function ending
++ * "}).call(this, this._s)", and left for later it was parsed twice, the
++ * second time all of it at once when it ran. The current token stays.
++ */
++static bool js_lazy_called_here(JSParseState *s)
++{
++    JSParsePos pos;
++    bool called = false;
++
++    if (s->token.val == '(')
++        return true;
++    if (s->token.val != ')' && s->token.val != '.')
++        return false;
++    js_parse_get_pos(s, &pos);
++    if (s->token.val == ')') {
++        if (next_token(s))
++            goto fail;
++        called = (s->token.val == '(');
++    }
++    if (!called && s->token.val == '.') {
++        if (next_token(s))
++            goto fail;
++        char buf[ATOM_GET_STR_BUF_SIZE];
++
++        if (s->token.val == TOK_IDENT && !s->token.u.ident.has_escape &&
++            (s->token.u.ident.atom == JS_ATOM_apply ||
++             !strcmp(JS_AtomGetStr(s->ctx, buf, sizeof(buf),
++                                   s->token.u.ident.atom), "call"))) {
++            if (next_token(s))
++                goto fail;
++            called = (s->token.val == '(');
++        }
++    }
++    if (js_parse_seek_token(s, &pos))
++        goto fail;
++    return called;
++ fail:
++    /* parsing on reports it, if it is real */
++    JS_FreeValue(s->ctx, JS_GetException(s->ctx));
++    if (js_parse_seek_token(s, &pos))
++        JS_FreeValue(s->ctx, JS_GetException(s->ctx));
++    return false;
++}
++
++/* whether fd, whose body has just been parsed, can be left for later;
++   the token after its body is current */
++static bool js_lazy_eligible(JSParseState *s, JSFunctionDef *fd)
++{
++    switch (fd->func_type) {
++    case JS_PARSE_FUNC_STATEMENT:
++    case JS_PARSE_FUNC_VAR:
++    case JS_PARSE_FUNC_EXPR:
++    case JS_PARSE_FUNC_ARROW:
++    case JS_PARSE_FUNC_METHOD:
++    case JS_PARSE_FUNC_GETTER:
++    case JS_PARSE_FUNC_SETTER:
++        break;
++    default:
++        /* a constructor or static block is built with its class */
++        return false;
++    }
++    /* the source must be the parse's own, for the offsets */
++    if (fd->source_len < JS_LAZY_MIN_SOURCE || s->with_depth > 0 ||
++        !fd->lazy_params || !fd->source_blob)
++        return false;
++    if (js_lazy_called_here(s))
++        return false;
++    /* a direct eval sees every variable around it */
++    if (js_lazy_has_eval(fd))
++        return false;
++    return !js_lazy_in_eval_reach(s, fd, fd->lazy_params);
++}
++
++/* whether name, used at scope_level of d, is a variable of d's own;
++   what resolve_scope_var looks at before it leaves d */
++static bool js_lazy_bound_in(JSContext *ctx, JSFunctionDef *d, JSAtom name,
++                             int scope_level, bool is_private)
++{
++    bool with;
++    int idx;
++
++    if (is_private)
++        return find_private_class_field_all(ctx, d, name, scope_level) >= 0;
++    idx = scope_chain_find(ctx, d, scope_level, name, &with);
++    if (idx >= 0)
++        return true;
++    if (idx != ARG_SCOPE_END && find_var(ctx, d, name) >= 0)
++        return true;
++    if ((name == JS_ATOM_home_object || name == JS_ATOM_this_active_func ||
++         name == JS_ATOM_new_target || name == JS_ATOM_this) &&
++        d->has_this_binding)
++        return true;
++    if (name == JS_ATOM_arguments && d->has_arguments_binding)
++        return true;
++    if (d->is_func_expr && d->func_name == name)
++        return true;
++    return false;
++}
++
++/* a set of names, each with whether it is a #name */
++typedef struct JSLazySet {
++    JSAtom *names;
++    uint8_t *priv;
++    int count, size;
++    int *hash;
++    int hash_size;
++} JSLazySet;
++
++static void js_lazy_set_free(JSContext *ctx, JSLazySet *set)
++{
++    int i;
++
++    for (i = 0; i < set->count; i++)
++        JS_FreeAtom(ctx, set->names[i]);
++    js_free(ctx, set->names);
++    js_free(ctx, set->priv);
++    js_free(ctx, set->hash);
++    memset(set, 0, sizeof(*set));
++}
++
++static int js_lazy_set_add(JSContext *ctx, JSLazySet *set, JSAtom name,
++                           bool is_private)
++{
++    int i, j, n, *t;
++    uint32_t h;
++
++    if ((set->count + 1) * 2 > set->hash_size) {
++        /* at most half full, with the names the set may already have
++           without a table (js_lazy_set_take) */
++        n = set->hash_size ? set->hash_size * 2 : 64;
++        while ((set->count + 1) * 2 > n)
++            n *= 2;
++        t = js_malloc(ctx, sizeof(int) * n);
++        if (!t)
++            return -1;
++        memset(t, 0xff, sizeof(int) * n);
++        for (i = 0; i < set->count; i++) {
++            h = (set->names[i] * 2654435761u) & (n - 1);
++            while (t[h] >= 0)
++                h = (h + 1) & (n - 1);
++            t[h] = i;
++        }
++        js_free(ctx, set->hash);
++        set->hash = t;
++        set->hash_size = n;
++    }
++    h = (name * 2654435761u) & (set->hash_size - 1);
++    while ((j = set->hash[h]) >= 0) {
++        if (set->names[j] == name && set->priv[j] == is_private)
++            return 0;
++        h = (h + 1) & (set->hash_size - 1);
++    }
++    if (set->count >= set->size) {
++        JSAtom *names;
++        uint8_t *priv;
++
++        n = set->size ? set->size * 2 : 16;
++        names = js_realloc(ctx, set->names, sizeof(JSAtom) * n);
++        if (!names)
++            return -1;
++        set->names = names;
++        priv = js_realloc(ctx, set->priv, n);
++        if (!priv)
++            return -1;
++        set->priv = priv;
++        set->size = n;
++    }
++    set->hash[h] = set->count;
++    set->names[set->count] = JS_DupAtom(ctx, name);
++    set->priv[set->count] = is_private;
++    set->count++;
++    return 0;
++}
++
++/* add name, used at scope_level of d, unless it is a variable of d */
++static int js_lazy_use(JSContext *ctx, JSLazySet *out, JSFunctionDef *d,
++                       JSAtom name, int scope_level, bool is_private)
++{
++    if (js_lazy_bound_in(ctx, d, name, scope_level, is_private))
++        return 0;
++    return js_lazy_set_add(ctx, out, name, is_private);
++}
++
++/* the names d and the functions in it use that d does not declare,
++   each name once however often it is used */
++static int js_lazy_free_names(JSContext *ctx, JSFunctionDef *d,
++                              JSLazySet *out)
++{
++    const uint8_t *bc = d->byte_code.buf;
++    int pos = 0, len = d->byte_code.size, op, i, r;
++    bool is_private;
++    struct list_head *el;
++    /* the uses just looked at: a name is mostly used where it was
++       used last */
++    uint32_t seen[64];
++
++    memset(seen, 0, sizeof(seen));
++    /* d is whole: link its scopes as they will be, and remember the
++       lookups, as js_create_function would */
++    js_relink_scopes(d);
++    d->chains_final = true;
++    while (pos < len) {
++        int scope_pos;
++        uint32_t key;
++
++        op = bc[pos];
++        switch (op) {
++        case OP_scope_get_var_undef:
++        case OP_scope_get_var:
++        case OP_scope_put_var:
++        case OP_scope_delete_var:
++        case OP_scope_get_ref:
++        case OP_scope_put_var_init:
++            scope_pos = 5;
++            is_private = false;
++            goto use;
++        case OP_scope_make_ref:
++            scope_pos = 9;
++            is_private = false;
++            goto use;
++        case OP_scope_get_private_field:
++        case OP_scope_get_private_field2:
++        case OP_scope_put_private_field:
++        case OP_scope_in_private_field:
++            scope_pos = 5;
++            is_private = true;
++        use:
++            key = get_u32(bc + pos + 1) * 4 + is_private +
++                (get_u16(bc + pos + scope_pos) << 20) + 1;
++            if (seen[(key ^ (key >> 7)) & 63] == key)
++                break;
++            seen[(key ^ (key >> 7)) & 63] = key;
++            if (js_lazy_use(ctx, out, d, get_u32(bc + pos + 1),
++                            get_u16(bc + pos + scope_pos), is_private))
++                return -1;
++            break;
++        }
++        pos += opcode_info[op].size;
++    }
++    list_for_each(el, &d->child_list) {
++        JSFunctionDef *c = list_entry(el, JSFunctionDef, link);
++        if (c->is_lazy) {
++            /* left already: what it uses from outside itself */
++            for (i = 0; i < c->lazy_name_count; i++) {
++                if (js_lazy_use(ctx, out, d, c->lazy_names[i],
++                                c->parent_scope_level, c->lazy_private[i]))
++                    return -1;
++            }
++        } else {
++            JSLazySet tmp;
++
++            memset(&tmp, 0, sizeof(tmp));
++            r = js_lazy_free_names(ctx, c, &tmp);
++            for (i = 0; i < tmp.count && !r; i++) {
++                r = js_lazy_use(ctx, out, d, tmp.names[i],
++                                c->parent_scope_level, tmp.priv[i]);
++            }
++            js_lazy_set_free(ctx, &tmp);
++            if (r)
++                return -1;
++        }
++    }
++    return 0;
++}
++
++/* fd's names from a set, which is left empty */
++static void js_lazy_set_give(JSContext *ctx, JSFunctionDef *fd, JSLazySet *set)
++{
++    int i;
++
++    for (i = 0; i < fd->lazy_name_count; i++)
++        JS_FreeAtom(ctx, fd->lazy_names[i]);
++    js_free(ctx, fd->lazy_names);
++    js_free(ctx, fd->lazy_private);
++    fd->lazy_names = set->names;
++    fd->lazy_private = set->priv;
++    fd->lazy_name_count = set->count;
++    fd->lazy_name_size = set->size;
++    js_free(ctx, set->hash);
++    memset(set, 0, sizeof(*set));
++}
++
++/* a set holding fd's names, which fd gives up */
++static void js_lazy_set_take(JSFunctionDef *fd, JSLazySet *set)
++{
++    memset(set, 0, sizeof(*set));
++    set->names = fd->lazy_names;
++    set->priv = fd->lazy_private;
++    set->count = fd->lazy_name_count;
++    set->size = fd->lazy_name_size;
++    fd->lazy_names = NULL;
++    fd->lazy_private = NULL;
++    fd->lazy_name_count = fd->lazy_name_size = 0;
++}
++
++/* leave fd's body for its first call: note the names it uses from
++   outside, then drop its code, its variables and the functions in it */
++static int js_lazy_collapse(JSParseState *s, JSFunctionDef *fd)
++{
++    JSContext *ctx = s->ctx;
++    struct list_head *el, *el1;
++    JSLazySet set;
++    int i, r;
++    const uint8_t *start;
++
++    /* with any its body's skip found */
++    js_lazy_set_take(fd, &set);
++    r = js_lazy_free_names(ctx, fd, &set);
++    js_lazy_set_give(ctx, fd, &set);
++    if (r)
++        return -1;
++
++    list_for_each_safe(el, el1, &fd->child_list) {
++        js_free_function_def(ctx, list_entry(el, JSFunctionDef, link));
++    }
++    free_bytecode_atoms(ctx->rt, fd->byte_code.buf, fd->byte_code.size,
++                        fd->use_short_opcodes);
++    dbuf_free(&fd->byte_code);
++    dbuf_free(&fd->pc2line);
++    js_free(ctx, fd->jump_slots);
++    fd->jump_slots = NULL;
++    fd->jump_size = fd->jump_count = 0;
++    js_free(ctx, fd->label_slots);
++    fd->label_slots = NULL;
++    fd->label_size = fd->label_count = 0;
++    js_free(ctx, fd->source_loc_slots);
++    fd->source_loc_slots = NULL;
++    fd->source_loc_size = fd->source_loc_count = 0;
++    for (i = 0; i < fd->cpool_count; i++)
++        JS_FreeValue(ctx, fd->cpool[i]);
++    js_free(ctx, fd->cpool);
++    fd->cpool = NULL;
++    fd->cpool_count = fd->cpool_size = 0;
++    for (i = 0; i < fd->var_count; i++)
++        JS_FreeAtom(ctx, fd->vars[i].var_name);
++    js_free(ctx, fd->vars);
++    js_free(ctx, fd->vars_htab);
++    fd->vars = NULL;
++    fd->vars_htab = NULL;
++    fd->var_count = fd->var_size = 0;
++    for (i = 0; i < fd->arg_count; i++)
++        JS_FreeAtom(ctx, fd->args[i].var_name);
++    js_free(ctx, fd->args);
++    fd->args = NULL;
++    fd->arg_count = fd->arg_size = 0;
++    js_free(ctx, fd->chain_memo);
++    fd->chain_memo = NULL;
++    fd->chain_memo_size = fd->chain_memo_count = 0;
++    fd->chains_final = false;
++    if (fd->scopes != fd->def_scope_array)
++        js_free(ctx, fd->scopes);
++    fd->scopes = fd->def_scope_array;
++    fd->scope_size = countof(fd->def_scope_array);
++    fd->scope_count = 1;
++    fd->scopes[0].first = -1;
++    fd->scopes[0].parent = -1;
++    fd->scope_level = 0;
++    fd->scope_first = -1;
++    fd->has_parameter_expressions = false;
++
++    /* where the parameters are, from the start of its source */
++    start = s->buf_start + (fd->source - fd->source_blob->data);
++    fd->lazy_params_off = fd->lazy_params - start;
++    fd->lazy_mark_off = fd->lazy_mark - start;
++    fd->lazy_eol_off = fd->lazy_eol - start;
++    fd->is_lazy = true;
++    return 0;
++}
++
++static int js_lazy_skip_add(JSParseState *s, JSFunctionDef *fd,
++                            JSLazySet *set, JSAtom name, bool is_private)
++{
++    return js_lazy_use(s->ctx, set, fd, name, fd->body_scope, is_private);
++}
++
++/*
++ * Compiling a lazy function: leave the function fd inside it for later
++ * without parsing its body (VitaSurf). The source was parsed whole when
++ * it loaded, so it is known to be well formed and the body need only be
++ * read to its end, by the tokenizer, noting the names in it. Whether a
++ * '/' starts a regular expression is the one thing a tokenizer cannot
++ * tell by itself: after a ')' it does only when the parentheses were an
++ * if, while, for or with's, which is followed here, and anything not
++ * certain gives up and the body is parsed. fd's body's first token is
++ * current; 1 with its closing '}' current, or 0 with nothing changed.
++ */
++static int js_lazy_skip_body(JSParseState *s, JSFunctionDef *fd,
++                             const uint8_t *src_start)
++{
++    JSContext *ctx = s->ctx;
++    JSParsePos body_pos, end_pos;
++    char state[256];
++    size_t level = 0;
++    int last_tok = '{', t;
++    JSLazySet set;
++    bool last_ctl = false, after_dot = false, last_unsure = false, called;
++    char c;
++
++    switch (fd->func_type) {
++    case JS_PARSE_FUNC_STATEMENT:
++    case JS_PARSE_FUNC_VAR:
++    case JS_PARSE_FUNC_EXPR:
++    case JS_PARSE_FUNC_ARROW:
++    case JS_PARSE_FUNC_METHOD:
++    case JS_PARSE_FUNC_GETTER:
++    case JS_PARSE_FUNC_SETTER:
++        break;
++    default:
++        return 0;
++    }
++    if (s->with_depth > 0 || !fd->lazy_params || js_lazy_has_eval(fd) ||
++        js_lazy_in_eval_reach(s, fd, src_start))
++        return 0;
++
++    memset(&set, 0, sizeof(set));
++    js_parse_get_pos(s, &body_pos);
++    s->skip_values = true;
++    state[level++] = '{';
++    for (;;) {
++        bool ctl = false, unsure = false;
++
++        t = s->token.val;
++        switch (t) {
++        case '(':
++            if (level >= sizeof(state))
++                goto give_up;
++            /* "for await (" is a for's too: not known which */
++            state[level++] = (last_tok == TOK_IF || last_tok == TOK_WHILE ||
++                              last_tok == TOK_FOR || last_tok == TOK_WITH) ?
++                'c' : (last_tok == TOK_AWAIT) ? 'u' : '(';
++            break;
++        case '[':
++        case '{':
++            if (level >= sizeof(state))
++                goto give_up;
++            state[level++] = t;
++            break;
++        case ')':
++            c = state[--level];
++            if (c != '(' && c != 'c' && c != 'u')
++                goto give_up;
++            ctl = (c == 'c');
++            unsure = (c == 'u');
++            break;
++        case ']':
++            if (state[--level] != '[')
++                goto give_up;
++            break;
++        case '}':
++            c = state[--level];
++            if (c == '`') {
++                /* the rest of the template */
++                free_token(s, &s->token);
++                s->got_lf = false;
++                s->last_line_num = s->token.line_num;
++                s->last_col_num = s->token.col_num;
++                if (js_parse_template_part(s, s->buf_ptr))
++                    goto give_up_error;
++                goto handle_template;
++            }
++            if (c != '{')
++                goto give_up;
++            if (level == 0)
++                goto done;
++            break;
++        case TOK_TEMPLATE:
++        handle_template:
++            if (s->token.u.str.sep != '`') {
++                if (level >= sizeof(state))
++                    goto give_up;
++                state[level++] = '`';
++            }
++            break;
++        case TOK_EOF:
++        case TOK_WITH:
++            goto give_up;
++        case '/':
++        case TOK_DIV_ASSIGN:
++            if (last_tok == '}' || last_unsure)
++                goto give_up;
++            if (last_tok == ')' ? last_ctl : is_regexp_allowed(last_tok)) {
++                s->buf_ptr -= (t == '/') ? 1 : 2;
++                if (js_parse_regexp(s))
++                    goto give_up_error;
++                t = TOK_REGEXP;
++            }
++            break;
++        case TOK_IDENT:
++            if (after_dot)
++                break;
++            /* a direct eval needs what only parsing finds out */
++            if (s->token.u.ident.atom == JS_ATOM_eval)
++                goto give_up;
++            if (js_lazy_skip_add(s, fd, &set, s->token.u.ident.atom, false))
++                goto fail;
++            break;
++        case TOK_AWAIT:
++        case TOK_YIELD:
++            /* a name in a function inside, read here as a keyword */
++            if (!after_dot &&
++                js_lazy_skip_add(s, fd, &set, s->token.u.ident.atom, false))
++                goto fail;
++            break;
++        case TOK_PRIVATE_NAME:
++            if (js_lazy_skip_add(s, fd, &set, s->token.u.ident.atom, true))
++                goto fail;
++            break;
++        case TOK_THIS:
++            if (!after_dot &&
++                js_lazy_skip_add(s, fd, &set, JS_ATOM_this, false))
++                goto fail;
++            break;
++        case TOK_SUPER:
++            if (!after_dot &&
++                (js_lazy_skip_add(s, fd, &set, JS_ATOM_home_object, false) ||
++                 js_lazy_skip_add(s, fd, &set, JS_ATOM_this, false) ||
++                 js_lazy_skip_add(s, fd, &set, JS_ATOM_this_active_func,
++                                  false) ||
++                 js_lazy_skip_add(s, fd, &set, JS_ATOM_new_target, false)))
++                goto fail;
++            break;
++        case '.':
++            /* new.target */
++            if (last_tok == TOK_NEW &&
++                js_lazy_skip_add(s, fd, &set, JS_ATOM_new_target, false))
++                goto fail;
++            break;
++        }
++        after_dot = (t == '.' || t == TOK_QUESTION_MARK_DOT);
++        last_ctl = ctl;
++        /* a '/' after these could be either */
++        last_unsure = (unsure || t == TOK_AWAIT || t == TOK_YIELD ||
++                       token_reads_by_function(&s->token) ||
++                       (t == TOK_IDENT &&
++                        s->token.u.ident.atom == JS_ATOM_of));
++        last_tok = t;
++        if (next_token(s))
++            goto give_up_error;
++    }
++ done:
++    s->skip_values = false;
++    /* at the body's '}': short, or called where it is written, and it
++       is compiled now */
++    if (s->token.ptr + 1 - src_start < JS_LAZY_MIN_SOURCE)
++        goto give_up;
++    js_parse_get_pos(s, &end_pos);
++    if (next_token(s))
++        goto give_up_error;
++    called = js_lazy_called_here(s);
++    if (js_parse_seek_token(s, &end_pos))
++        goto fail;
++    if (called)
++        goto give_up;
++    js_lazy_set_give(ctx, fd, &set);
++    return 1;
++
++ give_up_error:
++    /* the full parse will report it, if it is real */
++    JS_FreeValue(ctx, JS_GetException(ctx));
++ give_up:
++    s->skip_values = false;
++    js_lazy_set_free(ctx, &set);
++    if (js_parse_seek_token(s, &body_pos))
++        return -1;
++    return 0;
++ fail:
++    s->skip_values = false;
++    js_lazy_set_free(ctx, &set);
++    return -1;
++}
++
++/* compiling a lazy function: its closure variables are the ones it was
++   given, in the same order, each reaching the stand-in parent's entry
++   of the same index */
++static int js_lazy_reparse_closure(JSParseState *s, JSFunctionDef *fd)
++{
++    JSFunctionBytecode *b = s->reparse;
++    int i, n = b->closure_var_count;
++
++    if (n == 0)
++        return 0;
++    fd->closure_var = js_malloc(s->ctx, sizeof(fd->closure_var[0]) * n);
++    if (!fd->closure_var)
++        return -1;
++    fd->closure_var_size = n;
++    for (i = 0; i < n; i++) {
++        JSClosureVar *cv = &fd->closure_var[i];
++        *cv = b->closure_var[i];
++        cv->closure_type = JS_CLOSURE_REF;
++        cv->var_idx = i;
++        cv->var_name = JS_DupAtom(s->ctx, cv->var_name);
++    }
++    fd->closure_var_count = n;
++    return 0;
++}
++
+ static __exception int js_parse_function_decl2(JSParseState *s,
+                                                JSParseFunctionEnum func_type,
+                                                JSFunctionKindEnum func_kind,
+@@ -37192,10 +38168,19 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+     int func_idx, lexical_func_idx = -1;
+     bool has_opt_arg;
+     bool create_func_var = false;
++    int skipped = 0;
++    /* compiling a lazy function: the name and what declaring it did to
++       the enclosing function were done the first time (VitaSurf) */
++    bool reparse = (s->reparse_parent != NULL && fd == s->reparse_parent);
+ 
+     is_expr = (func_type != JS_PARSE_FUNC_STATEMENT &&
+                func_type != JS_PARSE_FUNC_VAR);
+ 
++    if (reparse) {
++        func_name = JS_DupAtom(ctx, func_name);
++        goto header_done;
++    }
++
+     if (func_type == JS_PARSE_FUNC_STATEMENT ||
+         func_type == JS_PARSE_FUNC_VAR ||
+         func_type == JS_PARSE_FUNC_EXPR) {
+@@ -37296,6 +38281,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+         }
+     }
+ 
++header_done:
+     fd = js_new_function_def(ctx, fd, false, is_expr, s->filename,
+                              function_line_num, function_col_num);
+     if (!fd) {
+@@ -37353,6 +38339,21 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+         emit_class_field_init(s);
+     }
+ 
++    if (reparse && js_lazy_reparse_closure(s, fd))
++        goto fail;
++    if (s->lazy) {
++        /* where to start compiling it if it is left for later */
++        fd->lazy_params = s->token.ptr;
++        fd->lazy_mark = s->mark;
++        fd->lazy_eol = s->eol;
++        fd->lazy_params_line = s->token.line_num;
++        fd->lazy_init_strict = fd->is_strict_mode;
++        fd->lazy_parent_func_type = fd->parent->func_type;
++        fd->lazy_parent_func_kind = fd->parent->func_kind;
++        fd->lazy_parent_in_body = fd->parent->in_function_body;
++        fd->lazy_is_module = s->is_module;
++    }
++
+     /* parse arguments */
+     fd->has_simple_parameter_list = true;
+     fd->has_parameter_expressions = false;
+@@ -37599,15 +38600,34 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+     if (js_parse_function_check_names(s, fd, func_name))
+         goto fail;
+ 
+-    while (s->token.val != '}') {
+-        if (js_parse_source_element(s))
++    /* compiling a lazy function: one inside it can be left for later
++       without parsing its body (VitaSurf) */
++    skipped = 0;
++    if (s->reparse && !reparse && s->lazy) {
++        skipped = js_lazy_skip_body(s, fd, ptr);
++        if (skipped < 0)
+             goto fail;
+     }
++    if (!skipped) {
++        while (s->token.val != '}') {
++            if (js_parse_source_element(s))
++                goto fail;
++        }
++    }
+ 
+     /* save the function source code */
+     if (js_parse_save_source(s, fd, ptr, s->buf_ptr - ptr))
+         goto fail;
+ 
++    if (reparse) {
++        /* what follows belongs to the enclosing function, which is
++           not being compiled */
++        if (js_is_live_code(s))
++            emit_return(s, false);
++        s->cur_func = fd->parent;
++        return 0;
++    }
++
+     if (next_token(s)) {
+         /* consume the '}' */
+         goto fail;
+@@ -37617,6 +38637,12 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+     if (js_is_live_code(s)) {
+         emit_return(s, false);
+     }
++    if (s->lazy && fd->has_eval_call)
++        js_lazy_note_eval(s, ptr, s->last_ptr);
++    if (skipped || (s->lazy && js_lazy_eligible(s, fd))) {
++        if (js_lazy_collapse(s, fd))
++            goto fail;
++    }
+ done:
+     s->cur_func = fd->parent;
+ 
+@@ -37858,6 +38884,164 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
+     return JS_EvalFunctionInternal(ctx, fun_obj, ctx->global_obj, NULL, NULL);
+ }
+ 
++#ifndef QJS_DISABLE_PARSER
++/*
++ * Compile a lazy function's body (VitaSurf), on its first call. It is
++ * parsed again from its parameters, as the child of a stand-in for the
++ * function around it: an eval-like function with no variables of its
++ * own whose closure variables are the lazy function's, so every name
++ * finds the variable it found the first time, through the entry of the
++ * same index. Functions inside it may be left for later in turn.
++ */
++static int js_lazy_compile(JSContext *ctx, JSFunctionBytecode *b)
++{
++    JSLazyFunc *lz = b->lazy;
++    JSParseState s1, *s = &s1;
++    JSFunctionDef *e, *fd;
++    JSFunctionBytecode *rb;
++    JSValue func_obj;
++    const char *base, *filename;
++    size_t len;
++    int i, attempt, n = b->closure_var_count;
++
++    if (!b->source || lz->params_off < 0 ||
++        lz->params_off >= b->source_len) {
++        JS_ThrowInternalError(ctx, "lazy function without its source");
++        return -1;
++    }
++    if (b->source_blob) {
++        base = b->source_blob->data;
++        len = b->source_blob->len;
++    } else {
++        base = b->source;
++        len = b->source_len;
++    }
++    filename = JS_AtomToCString(ctx, b->filename);
++    if (!filename)
++        return -1;
++    for (attempt = 0; attempt < 2; attempt++) {
++        js_parse_init(ctx, s, base, len, filename, lz->params_line);
++        s->buf_ptr = (const uint8_t *)b->source + lz->params_off;
++        s->mark = (const uint8_t *)b->source + lz->mark_off;
++        s->eol = (const uint8_t *)b->source + lz->eol_off;
++        s->is_module = lz->is_module;
++        s->allow_html_comments = !lz->is_module;
++        /* the functions inside it can wait too, unless they need what
++           only an eager compile does (see js_create_lazy_function) */
++        s->lazy = (attempt == 0);
++        s->reparse = b;
++        if (b->source_blob) {
++            b->source_blob->ref_count++;
++            s->source_blob = b->source_blob;
++        }
++        fd = NULL;
++        func_obj = JS_EXCEPTION;
++        e = js_new_function_def(ctx, NULL, true, false, filename,
++                                b->line_num, b->col_num);
++        if (!e)
++            goto fail;
++        e->eval_type = JS_EVAL_TYPE_DIRECT;
++        e->is_strict_mode = lz->init_strict;
++        e->func_kind = lz->parent_func_kind;
++        e->func_type = lz->parent_func_type;
++        e->in_function_body = lz->parent_in_body;
++        e->new_target_allowed = b->new_target_allowed;
++        e->super_call_allowed = b->super_call_allowed;
++        e->super_allowed = b->super_allowed;
++        e->arguments_allowed = b->arguments_allowed;
++        if (n) {
++            e->closure_var = js_malloc(ctx, sizeof(e->closure_var[0]) * n);
++            if (!e->closure_var)
++                goto fail;
++            e->closure_var_size = n;
++            for (i = 0; i < n; i++) {
++                JSClosureVar *cv = &e->closure_var[i];
++                *cv = b->closure_var[i];
++                cv->closure_type = JS_CLOSURE_REF;
++                cv->var_idx = i;
++                cv->var_name = JS_DupAtom(ctx, cv->var_name);
++            }
++            e->closure_var_count = n;
++        }
++        s->reparse_parent = e;
++        s->cur_func = e;
++        if (next_token(s))
++            goto fail;
++        if (js_parse_function_decl2(s, lz->func_type, b->func_kind,
++                                    b->func_name,
++                                    (const uint8_t *)b->source,
++                                    b->line_num, b->col_num,
++                                    JS_PARSE_EXPORT_NONE, &fd))
++            goto fail;
++        ctx->lazy_retry = false;
++        func_obj = js_create_function(ctx, fd);
++    fail:
++        free_token(s, &s->token);
++        skip_memo_free(s);
++        js_free(ctx, s->eval_ranges);
++        js_source_release(ctx->rt, s->source_blob, NULL);
++        if (e)
++            js_free_function_def(ctx, e);
++        if (!JS_IsException(func_obj) || !ctx->lazy_retry)
++            break;
++        /* again, with everything inside it compiled now */
++        ctx->lazy_retry = false;
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    }
++    JS_FreeCString(ctx, filename);
++    if (JS_IsException(func_obj))
++        return -1;
++    rb = JS_VALUE_GET_PTR(func_obj);
++    if (rb->closure_var_count != n) {
++        JS_FreeValue(ctx, func_obj);
++        JS_ThrowInternalError(ctx, "lazy function: closure mismatch");
++        return -1;
++    }
++    /* the same variables as the ones it was created with, reached the
++       same way: the compiled form can stand in for it anywhere */
++    for (i = 0; i < n; i++) {
++        rb->closure_var[i].closure_type = b->closure_var[i].closure_type;
++        rb->closure_var[i].var_idx = b->closure_var[i].var_idx;
++    }
++    lz->real = rb;
++    return 0;
++}
++#endif // QJS_DISABLE_PARSER
++
++void JS_GetLazyCompileStats(JSRuntime *rt, uint32_t *pcount, uint32_t *pms)
++{
++    *pcount = rt->lazy_count;
++    *pms = (uint32_t)(rt->lazy_ns / 1000000);
++}
++
++/* a function object's bytecode, compiled now if it was left for later
++   (VitaSurf); the object holds the compiled form from then on */
++static JSFunctionBytecode *js_lazy_ready(JSContext *ctx, JSObject *p)
++{
++    JSFunctionBytecode *b = p->u.func.function_bytecode, *rb;
++
++    rb = b->lazy->real;
++    if (!rb) {
++#ifndef QJS_DISABLE_PARSER
++        uint64_t t0 = js__hrtime_ns();
++        int ret = js_lazy_compile(b->realm, b);
++
++        ctx->rt->lazy_count++;
++        ctx->rt->lazy_ns += js__hrtime_ns() - t0;
++        if (ret)
++            return NULL;
++        rb = b->lazy->real;
++#else
++        JS_ThrowInternalError(ctx, "function was not compiled");
++        return NULL;
++#endif
++    }
++    js_dup(JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, rb));
++    p->u.func.function_bytecode = rb;
++    JS_FreeValueRT(ctx->rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b));
++    return rb;
++}
++
+ #ifndef QJS_DISABLE_PARSER
+ 
+ /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
+@@ -37874,12 +39058,20 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+     JSFunctionBytecode *b;
+     JSFunctionDef *fd;
+     JSModuleDef *m;
+-    bool is_strict_mode;
++    bool is_strict_mode, lazy, lazy_again = false;
++    const uint8_t **eval_ranges = NULL;
++    int eval_range_count = 0, eval_range_size = 0;
+ 
++    eval_type = flags & JS_EVAL_TYPE_MASK;
++    lazy = ((flags & JS_EVAL_FLAG_LAZY_FUNCTIONS) &&
++            (eval_type == JS_EVAL_TYPE_GLOBAL ||
++             eval_type == JS_EVAL_TYPE_MODULE));
++ retry:
+     js_parse_init(ctx, s, input, input_len, filename, line);
+     skip_shebang(&s->buf_ptr, s->buf_end);
++    s->lazy = lazy;
++    ctx->lazy_retry = false;
+ 
+-    eval_type = flags & JS_EVAL_TYPE_MASK;
+     m = NULL;
+     if (eval_type == JS_EVAL_TYPE_DIRECT) {
+         JSObject *p;
+@@ -37899,10 +39091,10 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+         if (eval_type == JS_EVAL_TYPE_MODULE) {
+             JSAtom module_name = JS_NewAtom(ctx, filename);
+             if (module_name == JS_ATOM_NULL)
+-                return JS_EXCEPTION;
++                goto fail1;
+             m = js_new_module_def(ctx, module_name);
+             if (!m)
+-                return JS_EXCEPTION;
++                goto fail1;
+             is_strict_mode = true;
+         }
+     }
+@@ -37941,8 +39133,16 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+     push_scope(s); /* body scope */
+     fd->body_scope = fd->scope_level;
+ 
++    s->eval_ranges = eval_ranges;
++    s->eval_range_count = eval_range_count;
++    s->eval_range_size = eval_range_size;
+     err = js_parse_program(s);
+     skip_memo_free(s);
++    /* kept for a compile again (VitaSurf) */
++    eval_ranges = s->eval_ranges;
++    eval_range_count = s->eval_range_count;
++    eval_range_size = s->eval_range_size;
++    s->eval_ranges = NULL;
+     /* the functions hold the shared text now; the parser is done with it */
+     js_source_release(ctx->rt, s->source_blob, NULL);
+     s->source_blob = NULL;
+@@ -37958,8 +39158,26 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+ 
+     /* create the function object and all the enclosed functions */
+     fun_obj = js_create_function(ctx, fd);
+-    if (JS_IsException(fun_obj))
++    if (JS_IsException(fun_obj)) {
++        if (lazy && ctx->lazy_retry) {
++            /* a function left for later is in reach of a direct eval
++               that came after it in the source: compile the script
++               again with the functions that call one known from the
++               start, and then, if that is not enough, all of it now
++               (VitaSurf) */
++            ctx->lazy_retry = false;
++            JS_FreeValue(ctx, JS_GetException(ctx));
++            if (m)
++                js_free_module_def(ctx, m);
++            if (lazy_again || eval_range_count == 0)
++                lazy = false;
++            lazy_again = true;
++            goto retry;
++        }
+         goto fail1;
++    }
++    js_free(ctx, eval_ranges);
++    eval_ranges = NULL;
+     /* Could add a flag to avoid resolution if necessary */
+     if (m) {
+         m->func_obj = fun_obj;
+@@ -37974,6 +39192,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+     }
+     return ret_val;
+  fail1:
++    js_free(ctx, eval_ranges);
+     /* XXX: should free all the unresolved dependencies */
+     if (m)
+         js_free_module_def(ctx, m);
+@@ -38224,7 +39443,10 @@ typedef enum BCTagEnum {
+    and refusing it made `typeof Array.fromAsync` throw, which claude.ai's
+    browser check took for an out of date browser. */
+ #define BC_VERSION_STOCK 25
+-#define BC_VERSION (BC_VERSION_STOCK | 0x80)
++#define BC_VERSION_SHARED (BC_VERSION_STOCK | 0x80)
++/* and one more for functions left uncompiled (JSLazyFunc), so that an
++   older build takes a stream that has them for one it cannot read */
++#define BC_VERSION (BC_VERSION_SHARED + 1)
+ 
+ typedef struct BCWriterState {
+     JSContext *ctx;
+@@ -38413,10 +39635,12 @@ static int JS_WriteFunctionBytecode(BCWriterState *s,
+     uint32_t val;
+ 
+     bc_len = b->byte_code_len;
+-    bc_buf = js_malloc(s->ctx, bc_len);
++    /* none for a lazy function (VitaSurf) */
++    bc_buf = js_malloc(s->ctx, max_int(bc_len, 1));
+     if (!bc_buf)
+         return -1;
+-    memcpy(bc_buf, b->byte_code_buf, bc_len);
++    if (bc_len)
++        memcpy(bc_buf, b->byte_code_buf, bc_len);
+ 
+     pos = 0;
+     while (pos < bc_len) {
+@@ -38513,6 +39737,23 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+     uint32_t flags;
+     int idx, i;
+ 
++    if (b->lazy) {
++        /* a lazy function is written as it is, its compiled form once
++           it has one, and compiled now if it is to go without the
++           source it is compiled from (VitaSurf) */
++        if (!b->lazy->real && !(s->allow_debug && s->allow_source)) {
++#ifndef QJS_DISABLE_PARSER
++            if (js_lazy_compile(b->realm, b))
++                goto fail;
++#else
++            JS_ThrowInternalError(s->ctx, "function was not compiled");
++            goto fail;
++#endif
++        }
++        if (b->lazy->real)
++            b = b->lazy->real;
++    }
++
+     bc_put_u8(s, BC_TAG_FUNCTION_BYTECODE);
+     flags = idx = 0;
+     bc_set_flags(&flags, &idx, b->has_prototype, 1);
+@@ -38526,9 +39767,22 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+     bc_set_flags(&flags, &idx, b->arguments_allowed, 1);
+     bc_set_flags(&flags, &idx, b->backtrace_barrier, 1);
+     bc_set_flags(&flags, &idx, s->allow_debug, 1);
++    bc_set_flags(&flags, &idx, b->lazy != NULL, 1);
+     assert(idx <= 16);
+     bc_put_u16(s, flags);
+     bc_put_u8(s, b->is_strict_mode);
++    if (b->lazy) {
++        JSLazyFunc *lz = b->lazy;
++        bc_put_leb128(s, lz->params_off);
++        bc_put_sleb128(s, lz->mark_off);
++        bc_put_sleb128(s, lz->eol_off);
++        bc_put_leb128(s, lz->params_line);
++        bc_put_u8(s, lz->func_type);
++        bc_put_u8(s, lz->parent_func_type);
++        bc_put_u8(s, lz->parent_func_kind);
++        bc_put_u8(s, lz->init_strict | (lz->parent_in_body << 1) |
++                  (lz->is_module << 2));
++    }
+     bc_put_atom(s, b->func_name);
+ 
+     bc_put_leb128(s, b->arg_count);
+@@ -38675,6 +39929,17 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
+ 
+     bc_put_u8(s, m->has_tla);
+ 
++    /* once it is linked its function is a live one: write the bytecode
++       it was made from, which running it has not changed (VitaSurf) */
++    if (JS_VALUE_GET_TAG(m->func_obj) == JS_TAG_OBJECT) {
++        JSObject *p = JS_VALUE_GET_OBJ(m->func_obj);
++        if (p->class_id == JS_CLASS_BYTECODE_FUNCTION) {
++            if (JS_WriteObjectRec(s, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE,
++                                              p->u.func.function_bytecode)))
++                goto fail;
++            return 0;
++        }
++    }
+     if (JS_WriteObjectRec(s, m->func_obj))
+         goto fail;
+     return 0;
+@@ -39471,10 +40736,11 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+ {
+     JSContext *ctx = s->ctx;
+     JSFunctionBytecode bc, *b;
++    JSLazyFunc lz;
+     JSValue obj = JS_UNDEFINED;
+     uint16_t v16;
+     uint8_t v8;
+-    int idx, i, local_count, has_debug_info;
++    int idx, i, local_count, has_debug_info, is_lazy;
+     int function_size, cpool_offset, byte_code_offset;
+     int closure_var_offset, vardefs_offset;
+ 
+@@ -39496,9 +40762,38 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+     bc.arguments_allowed = bc_get_flags(v16, &idx, 1);
+     bc.backtrace_barrier = bc_get_flags(v16, &idx, 1);
+     has_debug_info = bc_get_flags(v16, &idx, 1);
++    is_lazy = bc_get_flags(v16, &idx, 1);
+     if (bc_get_u8(s, &v8))
+         goto fail;
+     bc.is_strict_mode = (v8 > 0);
++    memset(&lz, 0, sizeof(lz));
++    if (is_lazy) {
++        /* a function to compile when it is called (VitaSurf) */
++        uint8_t ft, pft, pfk, bits;
++        int32_t mark_off, eol_off;
++
++        if (bc_get_leb128_int(s, &lz.params_off) ||
++            bc_get_sleb128(s, &mark_off) ||
++            bc_get_sleb128(s, &eol_off) ||
++            bc_get_leb128_int(s, &lz.params_line) ||
++            bc_get_u8(s, &ft) || bc_get_u8(s, &pft) ||
++            bc_get_u8(s, &pfk) || bc_get_u8(s, &bits))
++            goto fail;
++        if (ft > JS_PARSE_FUNC_METHOD ||
++            pft > JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
++            pfk > JS_FUNC_ASYNC_GENERATOR) {
++            JS_ThrowSyntaxError(ctx, "invalid lazy function");
++            goto fail;
++        }
++        lz.mark_off = mark_off;
++        lz.eol_off = eol_off;
++        lz.func_type = ft;
++        lz.parent_func_type = pft;
++        lz.parent_func_kind = pfk;
++        lz.init_strict = bits & 1;
++        lz.parent_in_body = (bits >> 1) & 1;
++        lz.is_module = (bits >> 2) & 1;
++    }
+     if (bc_get_atom(s, &bc.func_name))
+         goto fail;
+     if (bc_get_leb128_u16(s, &bc.arg_count))
+@@ -39537,6 +40832,15 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+     memcpy(b, &bc, sizeof(*b));
+     bc.func_name = JS_ATOM_NULL;
+     b->header.ref_count = 1;
++    if (is_lazy) {
++        b->lazy = js_malloc(ctx, sizeof(*b->lazy));
++        if (!b->lazy) {
++            JS_FreeAtom(ctx, b->func_name);
++            js_free(ctx, b);
++            goto fail;
++        }
++        *b->lazy = lz;
++    }
+     if (local_count != 0) {
+         b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
+     }
+@@ -40316,7 +41620,8 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
+ 
+     if (bc_get_u8(s, &v8))
+         return -1;
+-    if (v8 != BC_VERSION && v8 != BC_VERSION_STOCK) {
++    if (v8 != BC_VERSION && v8 != BC_VERSION_SHARED &&
++        v8 != BC_VERSION_STOCK) {
+         JS_ThrowSyntaxError(s->ctx, "invalid version (%d expected=%d)",
+                             v8, BC_VERSION);
+         return -1;
+diff --git a/quickjs.h b/quickjs.h
+index a3cb34d..4fe5bca 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -463,6 +463,11 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
+ /* allow top-level await in normal script. JS_Eval() returns a
+    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
+ #define JS_EVAL_FLAG_ASYNC (1 << 7)
++/* compile a function's body the first time it is called (VitaSurf).
++   The whole script is still parsed, so its syntax errors are reported
++   as before; a function that is never called never gets bytecode. Only
++   for JS_EVAL_TYPE_GLOBAL and JS_EVAL_TYPE_MODULE. */
++#define JS_EVAL_FLAG_LAZY_FUNCTIONS (1 << 8)
+ 
+ typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+ typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
+@@ -1022,6 +1027,10 @@ JS_EXTERN JSValue JS_CallConstructor2(JSContext *ctx, JSValueConst func_obj,
+  */
+ JS_EXTERN bool JS_DetectModule(const char *input, size_t input_len);
+ /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
++/* functions compiled on their first call so far (JS_EVAL_FLAG_LAZY_FUNCTIONS),
++   and the milliseconds that took (VitaSurf) */
++JS_EXTERN void JS_GetLazyCompileStats(JSRuntime *rt, uint32_t *pcount,
++                                      uint32_t *pms);
+ JS_EXTERN JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
+                           const char *filename, int eval_flags);
+ JS_EXTERN JSValue JS_Eval2(JSContext *ctx, const char *input, size_t input_len,

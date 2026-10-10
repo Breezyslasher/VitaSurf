@@ -1,0 +1,19 @@
+<!doctype html>
+<title>iframe click once</title>
+<!-- One click inside a frame is one click: the frame's document hears it
+     once and the iframe element in this document not at all. A tap on
+     the label's text ticks the box. Expected, as in Chrome, after a
+     click on "Verify" at 40,10:
+       FRAME clicks=2 (span, then input via the label) changes=1 checked=true
+       PARENT iframe clicks=0 -->
+<style>html,body{margin:0}iframe{border:0;width:300px;height:65px;display:block}</style>
+<iframe id=f srcdoc="<style>html,body{margin:0;font:16px sans-serif}</style><label id=l><input type=checkbox id=c><span id=s>Verify</span></label><script>
+var clicks=0,changes=0,c=document.getElementById('c');
+document.addEventListener('click',function(){clicks++;},true);
+c.addEventListener('change',function(){changes++;});
+setTimeout(function(){parent.postMessage('FRAME clicks='+clicks+' changes='+changes+' checked='+c.checked,'*');},5000);
+</script>"></iframe>
+<script>
+var n=0;document.getElementById('f').addEventListener('click',function(){n++;});
+addEventListener('message',function(e){console.log(e.data);console.log('PARENT iframe clicks='+n);});
+</script>

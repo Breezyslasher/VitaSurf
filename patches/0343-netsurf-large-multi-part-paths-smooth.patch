@@ -1,0 +1,150 @@
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index 94a3b43bb..dee467aff 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -295,13 +295,19 @@ static nsfb_colour_t fb_colour(colour c)
+  * other browser. Its path also ran a line from the end of each subpath
+  * to the start of the next.
+  *
+- * A path whose box is small enough is drawn here instead: how much of
+- * each pixel the stroke or the fill covers is worked out, and the path
+- * is plotted as a bitmap of its colour with that much alpha. A stroke
+- * covers what lies within half its width of the line, which gives the
+- * round joins and caps the icon sets draw with; a fill is sampled at
+- * four heights a pixel, each span measured exactly across, by the
+- * nonzero rule SVG fills with. A larger path is left to libnsfb.
++ * Every path is drawn here instead: how much of each pixel the stroke
++ * or the fill covers is worked out, and the path is plotted as a bitmap
++ * of its colour with that much alpha. A stroke covers what lies within
++ * half its width of the line, which gives the round joins and caps the
++ * icon sets draw with; a fill is sampled at four heights a pixel, each
++ * span measured exactly across, by the nonzero rule SVG fills with.
++ *
++ * Only what the clip shows is worked out, a band of rows at a time
++ * that fits the buffers. A large path of several subpaths used to be
++ * left to libnsfb, which ran them together: Material Design's web icon,
++ * drawn screen-sized on a Home Assistant dashboard, came out as a globe
++ * of black triangles. A large one of one piece, a rounded box's
++ * background, is still libnsfb's quicker solid fill.
+  */
+ #define FB_AA_MAX_AREA (256 * 256)
+ #define FB_AA_MAX_POINTS 4096
+@@ -580,7 +586,7 @@ static bool fb_aa_plot(const float *cov, int w, int h, int ox, int oy,
+ }
+ 
+ /**
+- * Draw a small path smooth.
++ * Draw a path smooth.
+  *
+  * \return true if it was drawn, false to leave it to libnsfb
+  */
+@@ -588,7 +594,8 @@ static bool fb_aa_path(const plot_style_t *pstyle, const float *p,
+ 		unsigned int n, const float transform[6])
+ {
+ 	float hw = 0, minx, miny, maxx, maxy;
+-	int npts = 0, nsub = 0, i, s, w, h, ox, oy;
++	int npts = 0, nsub = 0, i, s, w, h, ox, oy, x1, y1, by, band;
++	nsfb_bbox_t clip;
+ 
+ 	if (!fb_aa_flatten(p, n, transform, &npts, &nsub))
+ 		return false;
+@@ -607,33 +614,54 @@ static bool fb_aa_path(const plot_style_t *pstyle, const float *p,
+ 	}
+ 	ox = (int)floorf(minx - hw - 1);
+ 	oy = (int)floorf(miny - hw - 1);
+-	w = (int)ceilf(maxx + hw + 1) - ox;
+-	h = (int)ceilf(maxy + hw + 1) - oy;
+-	if (w <= 0 || h <= 0 || w * h > FB_AA_MAX_AREA)
++	x1 = (int)ceilf(maxx + hw + 1);
++	y1 = (int)ceilf(maxy + hw + 1);
++
++	/* a large shape of one piece -- a rounded box's background -- is
++	 * libnsfb's solid fill, which is quicker and draws it right; it
++	 * is only several pieces that libnsfb runs together */
++	if (nsub <= 1 && (x1 - ox) * (y1 - oy) > FB_AA_MAX_AREA)
++		return false;
++
++	/* what the clip shows of it */
++	if (nsfb_plot_get_clip(nsfb, &clip)) {
++		if (ox < clip.x0) ox = clip.x0;
++		if (oy < clip.y0) oy = clip.y0;
++		if (x1 > clip.x1) x1 = clip.x1;
++		if (y1 > clip.y1) y1 = clip.y1;
++	}
++	w = x1 - ox;
++	if (w <= 0 || y1 <= oy)
++		return true;	/* nothing of it shows */
++	if (w > FB_AA_MAX_AREA)
+ 		return false;
++	band = FB_AA_MAX_AREA / w;
+ 
+-	if (fb_aa_cap < w * h) {
+-		float *c = realloc(fb_aa_cov, w * h * sizeof(*c));
++	if (fb_aa_cap < FB_AA_MAX_AREA) {
++		float *c = realloc(fb_aa_cov, FB_AA_MAX_AREA * sizeof(*c));
+ 		nsfb_colour_t *px;
+ 
+ 		if (c == NULL)
+ 			return false;
+ 		fb_aa_cov = c;
+-		px = realloc(fb_aa_px, w * h * sizeof(*px));
++		px = realloc(fb_aa_px, FB_AA_MAX_AREA * sizeof(*px));
+ 		if (px == NULL)
+ 			return false;
+ 		fb_aa_px = px;
+-		fb_aa_cap = w * h;
++		fb_aa_cap = FB_AA_MAX_AREA;
+ 	}
+ 
+-	if (pstyle->fill_type != PLOT_OP_TYPE_NONE) {
+-		memset(fb_aa_cov, 0, w * h * sizeof(*fb_aa_cov));
+-		if (!fb_aa_fill(fb_aa_cov, w, h, ox, oy, npts, nsub))
+-			return false;
+-		fb_aa_plot(fb_aa_cov, w, h, ox, oy,
+-				fb_colour(pstyle->fill_colour));
+-	}
+-	if (pstyle->stroke_type != PLOT_OP_TYPE_NONE) {
++	for (by = oy; by < y1; by += band) {
++		h = (y1 - by < band) ? y1 - by : band;
++		if (pstyle->fill_type != PLOT_OP_TYPE_NONE) {
++			memset(fb_aa_cov, 0, w * h * sizeof(*fb_aa_cov));
++			if (!fb_aa_fill(fb_aa_cov, w, h, ox, by, npts, nsub))
++				return by > oy;
++			fb_aa_plot(fb_aa_cov, w, h, ox, by,
++					fb_colour(pstyle->fill_colour));
++		}
++		if (pstyle->stroke_type == PLOT_OP_TYPE_NONE)
++			continue;
+ 		memset(fb_aa_cov, 0, w * h * sizeof(*fb_aa_cov));
+ 		for (s = 0; s < nsub; s++) {
+ 			int a, b;
+@@ -641,16 +669,16 @@ static bool fb_aa_path(const plot_style_t *pstyle, const float *p,
+ 			fb_aa_sub(s, nsub, npts, &a, &b);
+ 			if (b - a == 1)
+ 				/* a dot: a zero-length segment */
+-				fb_aa_segment(fb_aa_cov, w, h, ox, oy,
++				fb_aa_segment(fb_aa_cov, w, h, ox, by,
+ 					fb_aa_pts[a], fb_aa_pts[a], hw);
+ 			for (i = a; i + 1 < b; i++)
+-				fb_aa_segment(fb_aa_cov, w, h, ox, oy,
++				fb_aa_segment(fb_aa_cov, w, h, ox, by,
+ 					fb_aa_pts[i], fb_aa_pts[i + 1], hw);
+ 			if (fb_aa_sub_closed[s] && b - a > 2)
+-				fb_aa_segment(fb_aa_cov, w, h, ox, oy,
++				fb_aa_segment(fb_aa_cov, w, h, ox, by,
+ 					fb_aa_pts[b - 1], fb_aa_pts[a], hw);
+ 		}
+-		fb_aa_plot(fb_aa_cov, w, h, ox, oy,
++		fb_aa_plot(fb_aa_cov, w, h, ox, by,
+ 				fb_colour(pstyle->stroke_colour));
+ 	}
+ 	return true;
+@@ -692,7 +720,7 @@ framebuffer_plot_path(const struct redraw_context *ctx,
+ 		return NSERROR_OK;
+ 	}
+ 
+-	/* a small one is drawn smooth (VitaSurf) */
++	/* drawn smooth (VitaSurf) */
+ 	if (fb_aa_path(pstyle, p, n, transform)) {
+ 		return NSERROR_OK;
+ 	}

@@ -1,0 +1,28 @@
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 12fe311c5..53021c831 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -847,11 +847,21 @@ nserror html_object_free_list(html_content *html,
+ 				guit->misc->schedule(-1, html_object_refresh,
+ 						     victim);
+ 			}
+-			if (content_get_status(victim->content) !=
++			/* no callback will arrive for it now. Only an
++			 * object with a box was counted: the speculative
++			 * fetch for a script-made <img> took one off too
++			 * when a rebuild let it go before the image had
++			 * arrived, and when the boxed fetch for it ended
++			 * the count wrapped below zero. Every rebuild
++			 * after that waited for fetches that would never
++			 * end (VitaSurf). */
++			if (victim->box != NULL &&
++			    content_get_status(victim->content) !=
+ 					CONTENT_STATUS_DONE &&
+ 			    html->base.active > 0) {
+-				/* no callback will arrive for it now */
+ 				html->base.active--;
++				NSLOG(netsurf, INFO, "%d fetches active",
++				      html->base.active);
+ 			}
+ 			hlcache_handle_release(victim->content);
+ 		}

@@ -210,13 +210,27 @@ Object.defineProperty(P,'offsetParent',{configurable:true,get:function(){var n=t
  else if(typeof __vitaScrollElement==='function')__vitaScrollElement(this,n===1?Number(v)||0:null,n===1?null:Number(v)||0);}});});
 P.tabIndex=0;
 ['onclick','onchange','onsubmit','oninput','onkeydown','onkeyup','onkeypress','onmousedown','onmouseup','onmouseover','onmouseout','onfocus','onblur','onload','onerror','ontouchstart','ontouchend'].forEach(function(h){Object.defineProperty(P,h,{configurable:true,get:function(){return this['__'+h]||null;},set:function(f){this['__'+h]=f;if(typeof f==='function')this.addEventListener(h.slice(2),function(e){return f.call(this,e);});}});});
-P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};var s=viewport(),x=b[0]-s[0],y=b[1]-s[1];return {x:x,y:y,left:x,top:y,width:b[2],height:b[3],right:x+b[2],bottom:y+b[3]};};
+P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};var s=b[12]?[0,0]:viewport(),x=b[0]-s[0],y=b[1]-s[1];return {x:x,y:y,left:x,top:y,width:b[2],height:b[3],right:x+b[2],bottom:y+b[3]};};
 P.getClientRects=function(){var r=this.getBoundingClientRect();return r.width||r.height?[r]:[];};
 P.focus=P.blur=P.select=function(){};
 P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=viewport(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
 /* A disabled form control is not clickable: click() on one dispatches
    nothing at all. Dispatching a click at it explicitly still works,
    which is the difference the tests turn on. */
+/* The events this browser fires itself are trusted, as a browser's are,
+   and the ones a page makes are not (VitaSurf). isTrusted said false for
+   every event, so a page that only answers the browser -- the claude.ai
+   challenge's widget takes no message a page could have forged -- heard
+   nothing. Kept here, where no page can add to it. */
+var TRUSTED=new WeakSet();
+function uaEvent(e){try{TRUSTED.add(e);}catch(x){}return e;}
+/* each event's own, and not to be redefined, as [LegacyUnforgeable] has
+   it: a page cannot make its own event claim to be the browser's */
+function trustedGet(){return TRUSTED.has(this);}
+function ownTrust(e){
+ try{Object.defineProperty(e,'isTrusted',{get:trustedGet,enumerable:true,
+  configurable:false});}catch(x){}}
+
 var FORM_CONTROLS=' BUTTON INPUT SELECT TEXTAREA FIELDSET OPTGROUP OPTION ';
 function isDisabledControl(el){
  return !!el&&el.nodeType===1&&
@@ -393,6 +407,22 @@ function hasDescendant(el,groups){
   if(c[i].nodeType!==1)continue;
   if(anyGroup(c[i],groups)||hasDescendant(c[i],groups))return true;}
  return false;}
+/* Whether a popover is shown: the element's own state, kept in C where
+   :popover-open in the style sheets reads it too (VitaSurf). */
+var POPQ=typeof window!=='undefined'&&typeof window.__vitaPopover==='function'?
+ window.__vitaPopover:null;
+function focusIn(el,within){
+ var f=typeof focused!=='undefined'?focused:null,n,p,h;
+ if(!f||!ceInDoc(f))return false;
+ if(f===el)return true;
+ for(n=f;n;){
+  p=n.parentNode;
+  if(!p){h=shadowHost(n);if(h===el)return true;n=h;continue;}
+  if(within&&p===el)return true;
+  n=p;}
+ return false;}
+function popoverShown(el){
+ return !!POPQ&&el.hasAttribute('popover')&&POPQ(el)===true;}
 function pseudoOk(el,p){
  if(p.element)return false;
  switch(p.name){
@@ -426,8 +456,18 @@ function pseudoOk(el,p){
   return (el.tagName==='A'||el.tagName==='AREA')&&el.hasAttribute('href');
  case 'defined':return true;
  case 'scope':return true;
- /* Nothing here has a pointer, a focus ring or a history. */
- case 'hover':case 'focus':case 'focus-within':case 'focus-visible':
+ case 'popover-open':return popoverShown(el);
+ case 'open':
+  return (el.tagName==='DETAILS'||el.tagName==='DIALOG')&&el.hasAttribute('open');
+ /* what has focus, which a shadow host matches :focus for while it is
+    in its tree, as the style sheets have it */
+ case 'focus':return focusIn(el,false);
+ case 'focus-within':return focusIn(el,true);
+ case 'focus-visible':
+  return focusIn(el,false)&&focused===el&&(el.tagName==='TEXTAREA'||
+   (el.tagName==='INPUT'&&!/^(button|submit|reset|checkbox|radio|image|file|range|color)$/i.test(el.type||'')));
+ /* Nothing here has a pointer or a history. */
+ case 'hover':
  case 'active':case 'visited':case 'target':case 'indeterminate':
   return false;
  default:return true;}}
@@ -890,6 +930,13 @@ function otherActivation(el){
   t=String(el.type||'').toLowerCase();
   if(tag==='BUTTON'&&t==='')t='submit';
   form=el.form;
+  /* a button that names a popover shows or hides it, unless it
+     submits a form (VitaSurf) */
+  if(el.hasAttribute('popovertarget')&&(tag==='BUTTON'||
+     /^(button|submit|reset|image)$/.test(t))&&
+     !(form&&(t==='submit'||t==='image'))){
+   n=D.getElementById(el.getAttribute('popovertarget'));
+   if(n&&n.hasAttribute('popover'))return {kind:'popover',el:el,target:n};}
   if(!form)return null;
   if(t==='submit'||t==='image')
    return {kind:'submit',form:form,submitter:el};
@@ -929,7 +976,8 @@ function activationTarget(target){
     through where they are drawn: the label text of a checkbox sits in
     a slot inside the component's label (VitaSurf) */
  if(n&&n.nodeType===3)n=n.__vsSlot||n.parentNode;
- while(n&&n.nodeType===1){
+ while(n&&(n.nodeType===1||n.nodeType===11)){
+  if(n.nodeType===11){n=shadowHost(n);continue;}
   a=otherActivation(n);
   if(a)return a;
   a=preActivate(n);
@@ -978,8 +1026,8 @@ function goTo(url){
    (D.getElementById(decodeURIComponent(hash.slice(1)))||null):null;}catch(e){}
   if(target&&target.scrollIntoView)try{target.scrollIntoView();}catch(e){}
   setTimeout(function(){
-   var ev=new W.HashChangeEvent('hashchange',
-    {bubbles:false,cancelable:false});
+   var ev=uaEvent(new W.HashChangeEvent('hashchange',
+    {bubbles:false,cancelable:false}));
    ev.oldURL=oldURL;ev.newURL=abs;
    try{W.dispatchEvent?W.dispatchEvent(ev):__vitaDispatch(null,ev);}catch(e){}
   },0);
@@ -1025,6 +1073,16 @@ function runActivation(a){
  if(a.kind==='label'){
   /* the label passes the click on to the control it names */
   if(a.control&&a.control.click)a.control.click();return;}
+ if(a.kind==='popover'){
+  /* popovertargetaction: toggle, show or hide */
+  var how=String(a.el.getAttribute('popovertargetaction')||'').toLowerCase(),
+      shown=a.target.matches(':popover-open');
+  if(how!=='show'&&how!=='hide')how='toggle';
+  try{
+   if(shown&&how!=='show')a.target.hidePopover();
+   else if(!shown&&how!=='hide')a.target.showPopover();}
+  catch(err){if(W.__vitaReportError)W.__vitaReportError(err);}
+  return;}
  if(a.kind==='link')goTo(a.el.getAttribute('href'));}
 function cancelActivate(was){
  var i;
@@ -1038,7 +1096,7 @@ function fireAfterActivate(was){
  fireSimple(was.el,'input');
  fireSimple(was.el,'change');}
 function fireSimple(el,type){
- var e=new Event(type,{bubbles:true,cancelable:false});
+ var e=uaEvent(new Event(type,{bubbles:true,cancelable:false,composed:type==='input'}));
  try{el.dispatchEvent(e);}catch(err){}}
 P.dispatchEvent=function(e){
  var act=null,r;
@@ -1056,25 +1114,82 @@ P.dispatchEvent=function(e){
   else fireAfterActivate(act);}
  else if(act&&!e.defaultPrevented)runActivation(act);
  return r;};
-/* A tap inside a label (VitaSurf). NetSurf follows links and toggles its
- * own form gadgets itself, but knows nothing of labels, and the
- * activation above runs only for a click a script dispatched. Home
- * Assistant's "Keep me logged in" is a label around a checkbox the page
- * keeps invisible and untappable, so a tap on its box or its text did
- * nothing. Last on the window, after the page's own listeners, a real
- * click that nothing cancelled and that lands in a label clicks the
- * control the label is for, or focuses it when it is a text field. */
-window.addEventListener('click',function(e){
- var a,c,t;
- if(!e||e.__vitaActivated||e.defaultPrevented)return;
- a=activationTarget(e.target);
- if(!a||a.kind!=='label'||!(c=a.control)||c===e.target)return;
- if(c.disabled)return;
- t=String(c.type||'').toLowerCase();
- if(c.tagName==='TEXTAREA'||c.tagName==='SELECT'||(c.tagName==='INPUT'&&
-    !/^(checkbox|radio|submit|reset|button|image|file|color|range)$/.test(t))){
-  if(c.focus)c.focus();return;}
- if(c.click)c.click();});P.getContext=function(){return null;};
+/* Where a tap was, as a pointer or mouse event's fields (VitaSurf): x
+   and y come in document coordinates, and the client ones are taken
+   from the view's scroll. */
+function pointerInit(x,y,button,buttons,detail){
+ var sx=W.scrollX||W.pageXOffset||0,sy=W.scrollY||W.pageYOffset||0;
+ return {bubbles:true,cancelable:true,composed:true,view:W,detail:detail,
+  clientX:x-sx,clientY:y-sy,screenX:x-sx,screenY:y-sy,
+  button:button,buttons:buttons,pointerId:1,pointerType:'mouse',
+  isPrimary:true,width:1,height:1,pressure:buttons?0.5:0};}
+function pointerPlace(e,x,y){
+ try{e.pageX=x;e.pageY=y;e.layerX=x;e.layerY=y;}catch(err){}
+ return e;}
+/* What a tap does once nothing cancelled its click, where NetSurf does
+   nothing itself (VitaSurf). qjs.c calls this when the click's dispatch
+   is over (js_activate), as a browser runs activation behaviour then:
+   a label passes the click to its control as a click of the browser's
+   own, or focuses it when it is a text field, and a summary or popover
+   button does what a script's click of it does. Home Assistant's "Keep
+   me logged in" is a label around a checkbox the page keeps invisible
+   and untappable. */
+Object.defineProperty(window,'__vitaActivate',{configurable:true,
+ value:function(n,x,y){
+  var a=activationTarget(n),c,t,ev;
+  if(!a)return;
+  if(a.kind==='details'||a.kind==='popover'){runActivation(a);return;}
+  if(a.kind!=='label'||!(c=a.control)||c===n||c.disabled)return;
+  t=String(c.type||'').toLowerCase();
+  if(c.tagName==='TEXTAREA'||c.tagName==='SELECT'||(c.tagName==='INPUT'&&
+     !/^(checkbox|radio|submit|reset|button|image|file|color|range)$/.test(t))){
+   if(c.focus)c.focus();return;}
+  ev=uaEvent(pointerPlace(new (W.PointerEvent||W.MouseEvent)('click',
+   pointerInit(x|0,y|0,0,0,1)),x|0,y|0));
+  P.dispatchEvent.call(c,ev);}});
+/* The object an event the browser sends reaches its listeners as
+   (VitaSurf): qjs.c reads the event and hands it here once per
+   dispatch, and every listener gets what this returns. A click,
+   auxclick or contextmenu is a PointerEvent as in Chrome, the mouse's
+   own events MouseEvents, keys KeyboardEvents, focus FocusEvents. */
+var NATIVE_POINTER=' click auxclick contextmenu pointerdown pointerup pointermove '+
+ 'pointerover pointerout pointerenter pointerleave pointercancel ';
+var NATIVE_MOUSE=' dblclick mousedown mouseup mousemove mouseover mouseout '+
+ 'mouseenter mouseleave ';
+var NATIVE_KEY=' keydown keyup keypress ';
+var NATIVE_FOCUS=' focus blur focusin focusout ';
+var NATIVE_INPUT=' input beforeinput ';
+Object.defineProperty(window,'__vitaNativeEvent',{configurable:true,
+ value:function(p){
+  var t=String(p.type),k=' '+t+' ',q=p.__vsPointer,C,init,e,i,f;
+  if(q&&(NATIVE_POINTER.indexOf(k)>=0||NATIVE_MOUSE.indexOf(k)>=0)){
+   init=pointerInit(q.x,q.y,q.button,q.buttons,q.detail);
+   C=NATIVE_POINTER.indexOf(k)>=0&&W.PointerEvent?W.PointerEvent:W.MouseEvent;
+  }else{
+   init={bubbles:!!p.bubbles,cancelable:!!p.cancelable,
+    composed:NATIVE_KEY.indexOf(k)>=0||NATIVE_FOCUS.indexOf(k)>=0||
+     NATIVE_INPUT.indexOf(k)>=0||NATIVE_MOUSE.indexOf(k)>=0||
+     NATIVE_POINTER.indexOf(k)>=0};
+   if(NATIVE_KEY.indexOf(k)>=0){
+    C=W.KeyboardEvent;init.view=W;
+    f=['key','code','keyCode','which','charCode','ctrlKey','shiftKey',
+       'altKey','metaKey','repeat','isComposing'];
+    for(i=0;i<f.length;i++)if(p[f[i]]!==undefined)init[f[i]]=p[f[i]];
+   }else if(NATIVE_FOCUS.indexOf(k)>=0){C=W.FocusEvent;init.view=W;}
+   else if(NATIVE_INPUT.indexOf(k)>=0&&W.InputEvent){C=W.InputEvent;init.view=W;}
+   else if(NATIVE_POINTER.indexOf(k)>=0||NATIVE_MOUSE.indexOf(k)>=0){
+    C=NATIVE_POINTER.indexOf(k)>=0&&W.PointerEvent?W.PointerEvent:W.MouseEvent;
+    init.view=W;}
+   else C=Event;}
+  if(typeof C!=='function')C=Event;
+  e=new C(t,init);
+  if(q)pointerPlace(e,q.x,q.y);
+  /* the legacy key numbers, which a KeyboardEvent built from a
+     dictionary does not take */
+  if(NATIVE_KEY.indexOf(k)>=0&&p.which!==undefined){
+   try{e.which=p.which;}catch(err){}}
+  if(p.target)e.target=p.target;
+  return uaEvent(e);}});P.getContext=function(){return null;};
 P.add=function(o,before){this.insertBefore(o,before||null);};
 Object.defineProperty(P,'options',{configurable:true,get:function(){return this.getElementsByTagName('option');}});
 Object.defineProperty(P,'selectedIndex',{configurable:true,get:function(){var o=this.options;for(var i=0;i<o.length;i++)if(o[i].hasAttribute('selected'))return i;return o.length?0:-1;},set:function(i){var o=this.options;for(var j=0;j<o.length;j++){if(j===i)o[j].setAttribute('selected','');else o[j].removeAttribute('selected');}}});
@@ -1128,7 +1243,6 @@ D.createEvent=function(t){
  /* an event made this way is uninitialised until initEvent is called */
  ev.type='';ev.target=null;ev.currentTarget=null;ev.eventPhase=0;
  ev.bubbles=false;ev.cancelable=false;ev.defaultPrevented=false;
- ev.isTrusted=false;
  return ev;};D.dispatchEvent=function(e){return __vitaDispatch(D,e);};
 /* window.event: undefined outside a dispatch; the listener call sets it */
 if(!Object.prototype.hasOwnProperty.call(window,'event'))window.event=undefined;
@@ -1184,11 +1298,23 @@ D.open=function(){return D;};D.close=function(){};D.writeln=D.writeln||function(
 /* The hit test a tap uses, so a sheet marked pointer-events: none is
    seen through here as a finger would see through it. The point is
    given in client coordinates, so the scroll offset goes back on. */
-D.elementFromPoint=function(x,y){
+/* The element hit, as the tree asked sees it: in a shadow tree, its
+   host in the document's own tree (VitaSurf). */
+function hitAt(x,y){
  if(!W.__vitaElementFromPoint)return null;
- var s=viewport();
- return W.__vitaElementFromPoint(Math.round(x)+s[0],Math.round(y)+s[1])||null;};
+ var s=viewport(),e=W.__vitaElementFromPoint(Math.round(x)+s[0],Math.round(y)+s[1])||null;
+ while(e&&e.nodeType!==1)e=e.parentNode||shadowHost(e);
+ return e;}
+function fromPoint(scope,x,y){
+ var e=hitAt(x,y);
+ if(!e)return null;
+ e=retarget(e,scope);
+ return treeRoot(e)===scope?e:null;}
+D.elementFromPoint=function(x,y){return fromPoint(D,x,y);};
 D.elementsFromPoint=function(x,y){var e=D.elementFromPoint(x,y);return e?[e]:[];};
+P.elementFromPoint=function(x,y){
+ return this.nodeType===11&&shadowHost(this)?fromPoint(this,x,y):null;};
+P.elementsFromPoint=function(x,y){var e=this.elementFromPoint(x,y);return e?[e]:[];};
 D.importNode=function(n,deep){return n&&n.cloneNode?n.cloneNode(!!deep):n;};
 D.adoptNode=function(n){return n;};
 D.execCommand=function(){return false;};
@@ -1203,7 +1329,7 @@ window.reportError=function(e){try{console.error(e);}catch(x){}};
  * message event, asynchronously and in order, like a real one. */
 window.postMessage=function(data){
  setTimeout(function(){
-  var e=new Event('message');e.data=data;e.origin=location.origin||'';e.source=window;e.ports=[];
+  var e=uaEvent(new Event('message'));e.data=data;e.origin=location.origin||'';e.source=window;e.ports=[];
   __vitaDispatch(null,e);
  },0);
 };
@@ -1356,6 +1482,9 @@ D.getElementsByName=function(n){return D.querySelectorAll('[name='+n+']').filter
 D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};
 ['onload','onreadystatechange','onclick','onkeydown','onkeyup','onmousemove','ontouchstart'].forEach(function(h){Object.defineProperty(D,h,{configurable:true,get:function(){return D['__'+h]||null;},set:function(f){D['__'+h]=f;if(typeof f==='function')D.addEventListener(h.slice(2),f);}});});
 var W=window;
+/* storage.js fires the storage and IndexedDB events, and takes this away
+   before any page script runs */
+Object.defineProperty(W,'__vitaUaEvent',{configurable:true,value:uaEvent});
 /* The tree generation, read straight out of the C counter through a
    typed array over it (VitaSurf): __vitaDomGen() was a call into C on
    every read, and the attribute cache reads it once per attribute. */
@@ -1369,7 +1498,10 @@ function treeGen(){return GEN&&GEN.length>1?GEN[1]:-1;}
 W.dispatchEvent=function(e){return __vitaDispatch(null,e);};
 /* Viewport and scroll position come from the window itself, so a script
    that measures the page sees what is really on screen. */
-[['innerWidth',2],['outerWidth',2],['innerHeight',3],['outerHeight',3],['scrollX',0],['pageXOffset',0],['scrollY',1],['pageYOffset',1]].forEach(function(e){Object.defineProperty(W,e[0],{get:function(){return viewport()[e[1]];}});});
+/* Replaceable, as a browser's are: enumerable, configurable, and a
+   page's assignment puts its own value in their place. They could not
+   be taken off a worker's global, which has none of them. */
+[['innerWidth',2],['outerWidth',2],['innerHeight',3],['outerHeight',3],['scrollX',0],['pageXOffset',0],['scrollY',1],['pageYOffset',1]].forEach(function(e){Object.defineProperty(W,e[0],{configurable:true,enumerable:true,get:function(){return viewport()[e[1]];},set:function(v){Object.defineProperty(W,e[0],{configurable:true,enumerable:true,writable:true,value:v});}});});
 W.devicePixelRatio=1;
 /* Frame relationships. Scripts test self !== top to find out whether they
    are framed, and a missing top is a ReferenceError that takes the script
@@ -1394,7 +1526,8 @@ W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:fal
 /* Indexed by the libcss enum, which starts its values at 1. */
 var CS_DISPLAY=['','inline','block','list-item','run-in','inline-block','table','inline-table',
  'table-row-group','table-header-group','table-footer-group','table-row','table-column-group',
- 'table-column','table-cell','table-caption','none','flex','inline-flex','grid','inline-grid','contents'];
+ 'table-column','table-cell','table-caption','none','flex','inline-flex','grid','inline-grid','contents',
+ 'flow-root','-webkit-box','-webkit-inline-box'];
 var CS_VIS=['','visible','hidden','collapse'];
 var CS_DEFAULTS={
  display:'block',visibility:'visible',opacity:'1',position:'static',float:'none',clear:'none',
@@ -1410,6 +1543,20 @@ var CS_DEFAULTS={
  ['Top','Right','Bottom','Left'].forEach(function(e){
   CS_DEFAULTS[b+e+(b==='border'?'Width':'')]='0px';});
  if(b!=='border')CS_DEFAULTS[b]='0px';});
+var CS_PROTO={};
+/* the dashed names a declaration also answers to, cs['padding-left']
+   beside cs.paddingLeft, as accessors on the prototype made once for
+   each name met (VitaSurf): they read undefined */
+var CS_DASHED={};
+function csDashed(k){
+ var d;
+ CS_DASHED[k]=1;
+ if(!/[A-Z]/.test(k)&&k!=='cssFloat')return;
+ d=k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});
+ if(/^(webkit|moz|ms)-/.test(d))d='-'+d;
+ if(Object.prototype.hasOwnProperty.call(CS_PROTO,d))return;
+ Object.defineProperty(CS_PROTO,d,{configurable:true,
+  get:function(){return this[k];},set:function(v){this[k]=v;}});}
 function dashToCamel(n){return String(n).replace(/-([a-z])/g,function(m,c){return c.toUpperCase();});}
 /* What the user agent stylesheet says an element is, for when libcss has
    no computed style to give -- a detached element, or one with no box.
@@ -1452,6 +1599,9 @@ function cssColour(rgb,a){
  return 'rgba('+r+', '+g+', '+b+', '+f+')';
 }
 function computedStyle(el,pseudo){
+ /* rules put in with insertRule are written back to their sheet in a
+    microtask, so many come to one rewrite; a read wants them now */
+ if(sheetsDirty.length)sheetsWrite();
  /* A browser reports nothing for an element that is not in the document,
     and code tests the value it gets back. */
  if(el&&el.nodeType===1&&el.isConnected===false){
@@ -1463,8 +1613,7 @@ function computedStyle(el,pseudo){
   empty.width='';empty.height='';
   return empty;}
  var st=(el&&el.nodeType===1&&typeof __vitaStyle==='function')?__vitaStyle(el):null;
- var box=(el&&el.nodeType===1&&typeof __vitaBox==='function')?__vitaBox(el):null;
- var cs={};
+ var cs=Object.create(CS_PROTO);
  for(var k in CS_DEFAULTS)cs[k]=CS_DEFAULTS[k];
  if(el&&el.nodeType===1&&UA_DISPLAY[el.tagName])cs.display=UA_DISPLAY[el.tagName];
  if(st){
@@ -1481,14 +1630,12 @@ function computedStyle(el,pseudo){
    cs[g[0]+g[2]]=v[0]===v[1]&&v[0]===v[2]&&v[0]===v[3]?v[0]:
     v[1]===v[3]?(v[0]===v[2]?v[0]+' '+v[1]:v[0]+' '+v[1]+' '+v[2]):v.join(' ');});
  }
- if(box){cs.width=box[4]+'px';cs.height=box[5]+'px';}
- else{cs.width='auto';cs.height='auto';}
  /* The rest of the cascade's answers, and a pseudo element's own: what
     the element is positioned and laid out with, its font, borders and
     text, as a browser reports them. */
  var more=(el&&el.nodeType===1&&typeof __vitaStyleMore==='function')?
   __vitaStyleMore(el,typeof pseudo==='string'&&pseudo?pseudo:null):null;
- if(more)for(var mk in more)cs[mk]=more[mk];
+ if(more)for(var mk in more){cs[mk]=more[mk];if(!CS_DASHED[mk])csDashed(mk);}
  /* a ::before or ::after that is not there still answers, with no content */
  if(typeof pseudo==='string'&&/^::?(before|after)$/i.test(pseudo)&&
   (!more||more.content===undefined))cs.content='none';
@@ -1506,25 +1653,58 @@ function computedStyle(el,pseudo){
    var k=dashToCamel(d[0]);
    if(st&&(RESOLVED[k]||(st.length>18&&BOX_RESOLVED.test(k))))return;
    if(more&&more[k]!==undefined)return;
-   cs[k]=d[1];});
+   /* the used size is layout's, which the getters below ask for */
+   if(k==='width'||k==='height')return;
+   cs[k]=d[1];if(!CS_DASHED[k])csDashed(k);});
  }
- cs.getPropertyValue=function(n){n=String(n);
-  /* a custom property is the cascade's, read as the page wrote it */
-  if(n.slice(0,2)==='--'){
-   if(this[n]!==undefined)return String(this[n]);
-   return (el&&el.nodeType===1&&typeof __vitaCustomProp==='function')?
-    __vitaCustomProp(el,n):'';}
-  var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);};
- cs.getPropertyPriority=function(){return '';};
- cs.setProperty=function(n,v){this[dashToCamel(n)]=String(v);};
- cs.removeProperty=function(n){var c=dashToCamel(n),v=this[c];delete this[c];return v===undefined?'':String(v);};
- var names=Object.keys(cs).filter(function(k){return typeof cs[k]==='string';}).map(function(k){
-  return k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});});
- cs.item=function(i){return names[i]||'';};
- Object.defineProperty(cs,'length',{configurable:true,get:function(){return names.length;}});
- cs.cssText='';
+ /* the methods are the prototype's and the names are listed when
+    asked for (VitaSurf): made for every call, with every property's
+    name turned to its dashed form by a regular expression, they were
+    nine tenths of a call, and lazysizes asks for an element's
+    visibility for each image near the view on every scroll check */
+ Object.defineProperty(cs,'__vitaEl',{value:el});
  return cs;
 }
+function csNames(cs){
+ if(!Object.prototype.hasOwnProperty.call(cs,'__vitaNames'))
+  Object.defineProperty(cs,'__vitaNames',{configurable:true,value:
+   Object.keys(cs).concat(['width','height'].filter(function(k){
+    return !Object.prototype.hasOwnProperty.call(cs,k);})).filter(function(k){return typeof cs[k]==='string';}).map(function(k){
+    return k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});})});
+ return cs.__vitaNames;
+}
+/* width and height are the used sizes layout gives, asked for only when
+   read (VitaSurf): a read lays the page out first when it has changed,
+   as a browser's does, and a style read that never looks at them does
+   not. A length the element has with no box to measure is its own
+   property, set from the cascade, and answers before these. */
+function csSize(cs,i){
+ var el=cs.__vitaEl,b;
+ if(!el||el.nodeType!==1||typeof __vitaBox!=='function')return 'auto';
+ b=__vitaBox(el);
+ return b?b[i]+'px':'auto';}
+['width','height'].forEach(function(k,i){
+ Object.defineProperty(CS_PROTO,k,{configurable:true,
+  get:function(){return csSize(this,4+i);},
+  set:function(v){Object.defineProperty(this,k,{configurable:true,
+   enumerable:true,writable:true,value:v});}});});
+Object.defineProperties(CS_PROTO,{
+ getPropertyValue:{configurable:true,writable:true,value:function(n){n=String(n);var el=this.__vitaEl;
+  /* a custom property is the cascade's, read as the page wrote it */
+  if(n.slice(0,2)==='--'){
+   if(Object.prototype.hasOwnProperty.call(this,n))return String(this[n]);
+   if(sheetsDirty.length)sheetsWrite();
+   return (el&&el.nodeType===1&&typeof __vitaCustomProp==='function')?
+    __vitaCustomProp(el,n):'';}
+  var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);}},
+ getPropertyPriority:{configurable:true,writable:true,value:function(){return '';}},
+ setProperty:{configurable:true,writable:true,value:function(n,v){this[dashToCamel(n)]=String(v);delete this.__vitaNames;}},
+ removeProperty:{configurable:true,writable:true,value:function(n){var c=dashToCamel(n),v=this[c];delete this[c];delete this.__vitaNames;return v===undefined?'':String(v);}},
+ item:{configurable:true,writable:true,value:function(i){return csNames(this)[i]||'';}},
+ cssText:{configurable:true,writable:true,value:''},
+ length:{configurable:true,get:function(){return csNames(this).length;}}
+});
+for(var csk in CS_DEFAULTS)csDashed(csk);csDashed('width');csDashed('height');
 W.getComputedStyle=function(el,pseudo){return computedStyle(el,pseudo);};
 /* A media query evaluator over the real viewport. Handles the features
    responsive sites actually branch on; anything else is false. */
@@ -1650,6 +1830,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
    var ev;
    try{ ev=new W.PopStateEvent('popstate',{bubbles:false,cancelable:false}); }
    catch(err){ ev=new Event('popstate'); }
+   uaEvent(ev);
    try{ ev.state=e.state; }catch(err){}
    try{ W.dispatchEvent?W.dispatchEvent(ev):__vitaDispatch(null,ev); }catch(err){}
   },0);
@@ -1690,9 +1871,11 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
 var t0=Date.now();var perf=W.performance||{};W.performance=perf;if(!perf.now)perf.now=function(){return Date.now()-t0;};perf.timing={navigationStart:t0,unloadEventStart:0,unloadEventEnd:0,redirectStart:0,redirectEnd:0,secureConnectionStart:0,fetchStart:t0,domainLookupStart:t0,domainLookupEnd:t0,connectStart:t0,connectEnd:t0,requestStart:t0,responseStart:t0,responseEnd:t0,domLoading:t0,domInteractive:t0,domContentLoadedEventStart:t0,domContentLoadedEventEnd:t0,domComplete:t0,loadEventStart:t0,loadEventEnd:t0};perf.navigation={type:0,redirectCount:0};perf.mark=perf.measure=perf.clearMarks=perf.clearMeasures=function(){};perf.getEntries=perf.getEntriesByType=perf.getEntriesByName=function(){return [];};
 navigator.language='en-US';navigator.languages=['en-US','en'];navigator.cookieEnabled=true;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};
 location.reload=function(){location.href=location.href;};
-['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:(m[1]||'')+'//'+(m[2]||'')}[k];}});});
+['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:m[1]?m[1]+'//'+(m[2]||''):'null'}[k];}});});
 location.toString=function(){return location.href;};
-function Event(type,init){this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();}
+function Event(type,init){ownTrust(this);this.type=String(type);this.bubbles=!!(init&&init.bubbles);this.cancelable=!!(init&&init.cancelable);this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.timeStamp=Date.now();
+ /* whether it leaves a shadow tree for the host (VitaSurf) */
+ Object.defineProperty(this,'__vsComposed',{configurable:true,value:!!(init&&init.composed)});}
 /* A passive listener cannot cancel: preventDefault from inside one does
    nothing at all, so defaultPrevented stays false even while it runs.
    The dispatch marks the event while a passive listener is on it. */
@@ -1978,8 +2161,12 @@ KeyboardEventC.prototype.initKeyboardEvent=function(t,b,c){this.initEvent(t,b,c)
 Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,
  get:function(){return this._phase===undefined?0:this._phase;},
  set:function(v){shadowProp(this,'_phase',v|0);}});
-Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,get:function(){return false;}});
-Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){return false;}});
+Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,
+ get:function(){return TRUSTED.has(this);}});
+/* one a script made says what it was made with; the browser's own
+   events leave shadow trees */
+Object.defineProperty(Event.prototype,'composed',{configurable:true,get:function(){
+ return this.__vsComposed!==undefined?this.__vsComposed:true;}});
 Object.defineProperty(Event.prototype,'srcElement',{configurable:true,get:function(){return this.target;}});
 Object.defineProperty(Event.prototype,'returnValue',{configurable:true,
  get:function(){return !this.defaultPrevented;},set:function(v){if(!v)this.preventDefault();}});
@@ -1990,34 +2177,94 @@ Object.defineProperty(Event.prototype,'returnValue',{configurable:true,
 Object.defineProperty(Event.prototype,'cancelBubble',{configurable:true,
  get:function(){return !!this.__cancelBubble;},
  set:function(v){if(v)this.__cancelBubble=true;}});
+/* From the node the event was sent to, which a listener outside its
+   shadow tree sees as the host, out through the shadow roots it leaves.
+   A closed tree's nodes are left out for a listener outside it. */
 Event.prototype.composedPath=function(){
- var out=[],n=this.target;while(n){out.push(n);n=n.parentNode;}out.push(D);out.push(W);return out;};
+ var out=[],n=this.__vsOrigin||this.target,ct=this.currentTarget,h,x;
+ function inside(c,r){for(;c;c=c.parentNode||shadowHost(c))if(c===r)return true;return false;}
+ while(n){
+  out.push(n);
+  if(n.nodeType===11&&(h=shadowHost(n))){
+   if(!this.composed)break;
+   if(SH_HOST(n,true)&&!inside(ct,n))out=[];
+   n=h;}
+  else n=n.parentNode;}
+ if(out[out.length-1]!==D&&out[out.length-1]===D.documentElement)out.push(D);
+ if(out[out.length-1]===D)out.push(W);
+ return out;};
 
 /* MessageChannel, which schedulers use to get a macrotask: React and
  * YouTube's player both post to a port instead of calling setTimeout(0),
  * because a real browser clamps nested timeouts and does not clamp this.
  * A timer is the honest equivalent here -- delivery stays asynchronous
  * and ordered, which is what the schedulers depend on. */
-function MessagePort(){this._peer=null;this._l=[];this.onmessage=null;}
-MessagePort.prototype.postMessage=function(data){
- var p=this._peer;if(!p)return;
+/* As the HTML standard has them (VitaSurf): what a port is sent waits in
+ * its queue until the port is started, which setting onmessage does and
+ * addEventListener does not, so a message sent before the other side
+ * listens is not lost; ports can be handed on in a transfer list, and
+ * arrive in the event's ports. */
+function portList(t){
+ var out=[],i;
+ if(t&&typeof t.length==='number')
+  for(i=0;i<t.length;i++)if(t[i]&&t[i].__vsPort)out.push(t[i]);
+ return out;}
+/* a transferred port arrives as a new port of the receiving realm, which
+   takes over the old one's entanglement and queue; the old one is left
+   neutered, as a transfer leaves it */
+function portMove(list,Ctor){
+ return list.map(function(o){
+  var n=new Ctor();
+  n._peer=o._peer;if(o._peer)o._peer._peer=n;
+  n._q=o._q;o._peer=null;o._q=[];o._l=[];o._on=null;
+  return n;});}
+function MessagePort(){
+ Object.defineProperties(this,{_peer:{value:null,writable:true},
+  _l:{value:[],writable:true},_q:{value:[],writable:true},
+  _on:{value:null,writable:true},_started:{value:false,writable:true},
+  __vsPort:{value:true}});}
+MessagePort.prototype._flush=function(){
+ var p=this;
+ if(!p._started||!p._q.length)return;
  setTimeout(function(){
-  var e={data:data,type:'message',target:p,currentTarget:p,source:null,origin:'',ports:[],
-         preventDefault:function(){},stopPropagation:function(){}};
-  if(typeof p.onmessage==='function'){try{p.onmessage(e);}catch(x){console.error(x);}}
-  p._l.slice().forEach(function(f){try{f.call(p,e);}catch(x){console.error(x);}});
- },0);
-};
-MessagePort.prototype.addEventListener=function(t,f){if(t==='message'&&typeof f==='function')this._l.push(f);};
+  var m=p._q.shift(),e;
+  if(!m)return;
+  e={data:m.data,type:'message',target:p,currentTarget:p,source:null,origin:'',
+   ports:m.ports,lastEventId:'',isTrusted:true,preventDefault:function(){},
+   stopPropagation:function(){},stopImmediatePropagation:function(){}};
+  if(typeof p._on==='function'){try{p._on.call(p,e);}catch(x){console.error(x);}}
+  p._l.slice().forEach(function(f){
+   try{typeof f==='function'?f.call(p,e):f.handleEvent(e);}catch(x){console.error(x);}});
+  p._flush();},0);};
+MessagePort.prototype.postMessage=function(data,transfer){
+ var p=this._peer,ports;
+ if(!p)return;
+ ports=portList(transfer&&!Array.isArray(transfer)&&transfer.transfer?transfer.transfer:transfer);
+ if(!ports.length){try{data=W.structuredClone(data);}catch(e){}}
+ else ports=portMove(ports,p.constructor);
+ p._q.push({data:data,ports:ports});
+ p._flush();};
+Object.defineProperty(MessagePort.prototype,'onmessage',{configurable:true,
+ get:function(){return this._on;},
+ set:function(f){this._on=typeof f==='function'?f:null;this.start();}});
+MessagePort.prototype.addEventListener=function(t,f){
+ if(t==='message'&&f&&this._l.indexOf(f)<0)this._l.push(f);};
 MessagePort.prototype.removeEventListener=function(t,f){this._l=this._l.filter(function(g){return g!==f;});};
-MessagePort.prototype.start=function(){};
-MessagePort.prototype.close=function(){this._peer=null;this._l=[];this.onmessage=null;};
+MessagePort.prototype.start=function(){this._started=true;this._flush();};
+MessagePort.prototype.close=function(){
+ if(this._peer)this._peer._peer=null;
+ this._peer=null;this._q=[];};
 MessagePort.prototype.dispatchEvent=function(){return true;};
 function MessageChannel(){this.port1=new MessagePort();this.port2=new MessagePort();this.port1._peer=this.port2;this.port2._peer=this.port1;}
 W.MessageChannel=MessageChannel;W.MessagePort=MessagePort;
 W.MessageEvent=W.MessageEvent||Event;
 /* The three with real fields; the aliases above stay plain Events. */
 W.UIEvent=UIEventC;W.MouseEvent=MouseEventC;W.KeyboardEvent=KeyboardEventC;
+/* their names, for Object.prototype.toString, as a browser's give */
+[['Event',Event],['CustomEvent',CustomEvent],['UIEvent',UIEventC],
+ ['MouseEvent',MouseEventC],['KeyboardEvent',KeyboardEventC]].forEach(function(p){
+ if(!Object.prototype.hasOwnProperty.call(p[1].prototype,Symbol.toStringTag))
+  Object.defineProperty(p[1].prototype,Symbol.toStringTag,{configurable:true,value:p[0]});});
 /* These carry a mouse's or a key's fields, so give them those. */
 W.WheelEvent=W.PointerEvent=W.DragEvent=MouseEventC;
 W.FocusEvent=UIEventC;W.InputEvent=UIEventC;
@@ -2036,7 +2283,19 @@ W.PerformanceObserver.prototype=W.ResizeObserver.prototype;
    state from a query string whose parser drops the "=" padding, and the
    old decoder turned the missing padding into NUL bytes, so JSON.parse
    of the state threw and the app never asked for its token. */
+/* the decoding and encoding are done in C where the natives are there
+   (VitaSurf): this loop was a quarter of Cloudflare's challenge script
+   on the Vita */
+var ATOB=W.__vitaAtob,BTOA=W.__vitaBtoa;
+try{delete W.__vitaAtob;delete W.__vitaBtoa;}catch(e){}
 W.atob=function(s){
+ if(arguments.length<1)
+  throw new TypeError("Failed to execute 'atob' on 'Window': 1 argument required, but only 0 present.");
+ if(typeof ATOB==='function'){
+  var r=ATOB(String(s));
+  if(r===null)
+   throw new DOMException("Failed to execute 'atob' on 'Window': The string to be decoded is not correctly encoded.",'InvalidCharacterError');
+  return r;}
  var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',
      o='',i,n=0,bits=0,c;
  s=String(s).replace(/[\t\n\f\r ]/g,'');
@@ -2048,7 +2307,14 @@ W.atob=function(s){
   n=(n<<6)|c;bits+=6;
   if(bits>=8){bits-=8;o+=String.fromCharCode((n>>bits)&255);}}
  return o;};
-W.btoa=function(s){s=String(s);if(/[^\u0000-\u00ff]/.test(s))throw new DOMException("Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",'InvalidCharacterError');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
+W.btoa=function(s){
+ if(arguments.length<1)
+  throw new TypeError("Failed to execute 'btoa' on 'Window': 1 argument required, but only 0 present.");
+ s=String(s);
+ if(typeof BTOA==='function'){
+  var r=BTOA(s);
+  if(r!==null)return r;}
+ if(/[^\u0000-\u00ff]/.test(s))throw new DOMException("Failed to execute 'btoa' on 'Window': The string to be encoded contains characters outside of the Latin1 range.",'InvalidCharacterError');var A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',o='',i=0;while(i<s.length){var a=s.charCodeAt(i++),b=s.charCodeAt(i++),c=s.charCodeAt(i++);var n=(a<<16)|((b||0)<<8)|(c||0);o+=A.charAt((n>>18)&63)+A.charAt((n>>12)&63)+(isNaN(b)?'=':A.charAt((n>>6)&63))+(isNaN(c)?'=':A.charAt(n&63));}return o;};
 function Image(){return document.createElement('img');}W.Image=Image;
 /* The other two legacy element constructors. new Audio() is how a page
    makes a sound without markup, and a page that calls it and gets a
@@ -2079,6 +2345,11 @@ Object.defineProperties(URL.prototype,{
  /* A file URL has no host, and its origin serialises as the scheme
   * alone rather than as null. */
  origin:{configurable:true,get:function(){
+  /* a blob URL's is the origin of the URL inside it */
+  if(this.protocol==='blob:'){
+   try{var in_=new URL(this.href.slice(5).replace(/#.*$/,''));
+    return /^(https?|file):$/.test(in_.protocol)?in_.origin:'null';}
+   catch(e){return 'null';}}
   if(this.hostname)return this.protocol+'//'+this.host;
   return this.protocol==='file:'?'file://':'null';}},
  href:{configurable:true,
@@ -2257,8 +2528,8 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
    var me=this;
    st.state=3;
    setTimeout(function(){
-    fire(me,new Event('error'));
-    fire(me,new CloseEvent('close',{wasClean:false,code:1006,reason:''}));},0);
+    fire(me,uaEvent(new Event('error')));
+    fire(me,uaEvent(new CloseEvent('close',{wasClean:false,code:1006,reason:''})));},0);
    return;}
   socks[st.id]=this;}
  WebSocket.prototype=Object.create(ETP);
@@ -2315,18 +2586,18 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
    if(kind===1){
     if(s.state!==0)return;
     s.state=1;s.protocol=data||'';
-    fire(ws,new Event('open'));}
+    fire(ws,uaEvent(new Event('open')));}
    else if(kind===2||kind===3){
     if(s.state!==1)return;
     d=data;
     if(kind===3&&s.binaryType==='blob'&&W.Blob)d=new W.Blob([data]);
-    fire(ws,new MessageEvent('message',{data:d,origin:new URL(s.url).origin}));}
+    fire(ws,uaEvent(new MessageEvent('message',{data:d,origin:new URL(s.url).origin})));}
    else if(kind===4){
-    fire(ws,new Event('error'));}
+    fire(ws,uaEvent(new Event('error')));}
    else if(kind===5){
     delete socks[id];
     s.state=3;
-    fire(ws,new CloseEvent('close',{wasClean:code!==1006,code:code,reason:data||''}));}}});
+    fire(ws,uaEvent(new CloseEvent('close',{wasClean:code!==1006,code:code,reason:data||''})));}}});
  W.WebSocket=WebSocket;
 })();
 
@@ -2557,9 +2828,21 @@ function ceDefOf(el){
 
 function ceSet(el,k,v){Object.defineProperty(el,k,{value:v,writable:true,enumerable:false,configurable:true});}
 
+/* Elements waiting for their definition, by name (VitaSurf): what define()
+   upgrades. Looking them up by tag in the document missed every one in a
+   shadow tree, and Home Assistant's are nearly all in one. A browser
+   keeps such a list too; this one forgets an element once it is
+   upgraded, and stops growing at CE_PENDING_MAX. */
+var CEpending=Object.create(null),CEpendingN=0,CE_PENDING_MAX=20000;
+function cePend(el){
+ if(el.__cePending||CEpendingN>=CE_PENDING_MAX)return;
+ var t=el.tagName;if(!t)return;t=t.toLowerCase();
+ if(t.indexOf('-')<0){var is=el.getAttribute('is');if(!is)return;t=String(is).toLowerCase();}
+ (CEpending[t]||(CEpending[t]=[])).push(el);CEpendingN++;
+ ceSet(el,'__cePending',true);}
 function ceUpgrade(el,inDoc){
  if(el.__ceState)return;
- var d=ceDefOf(el);if(!d)return;
+ var d=ceDefOf(el);if(!d){cePend(el);return;}
  ceSet(el,'__ceState',1);ceSet(el,'__ceDef',d);
  try{
   /* A class that does not extend HTMLElement would otherwise lose every
@@ -2590,7 +2873,7 @@ function ceConnectTree(n,inDoc,skipSelf){
   for(k=0;k<l.length;k++){
    e=l[k];
    if(domGen()!==g){
-    for(up=e;up&&up!==n;up=up.parentNode);
+    for(up=e;up&&up!==n;up=treeUp(up));
     if(!up)continue;}
    if(!e.__ceState)ceUpgrade(e,inDoc);
    else if(e.__ceState===2&&!e.__ceConn&&inDoc){ceSet(e,'__ceConn',true);ceCall(e,'connectedCallback');}}
@@ -2629,9 +2912,16 @@ W.customElements={
   try{var a=ctor.observedAttributes;if(a)for(var i=0;i<a.length;i++)obs.push(String(a[i]).toLowerCase());}catch(e){}
   CE[name]={ctor:ctor,obs:obs,ext:opts&&opts['extends']?String(opts['extends']).toLowerCase():null};
   CEn++;
-  /* upgrade what the parser already built */
-  var list=D.getElementsByTagName(CE[name].ext||name);
-  for(var j=0;j<list.length;j++)ceUpgrade(list[j]);
+  /* upgrade what the parser already built, and what waits in a shadow
+     tree or out of the page */
+  var list=D.getElementsByTagName(CE[name].ext||name),j,wait=CEpending[name];
+  for(j=0;j<list.length;j++)ceUpgrade(list[j]);
+  if(wait){
+   delete CEpending[name];CEpendingN-=wait.length;
+   for(j=0;j<wait.length;j++){
+    ceSet(wait[j],'__cePending',false);
+    /* one made outside the page stays as it is until it goes in */
+    if(ceInDoc(wait[j]))ceUpgrade(wait[j]);}}
   var w=CEwait[name];
   if(w){delete CEwait[name];for(var k=0;k<w.length;k++)w[k](ctor);}
  },
@@ -2740,9 +3030,46 @@ function sweepTemplates(){
    usually to query the document and the parser may have read a template
    since the last one. Touching content a second time costs nothing: the
    fragment is already there. */
-W.__vitaBeforeScript=sweepTemplates;
+/* Declarative shadow DOM (VitaSurf): a <template shadowrootmode> the
+   parser read becomes its parent's shadow root, its content the root's,
+   and the template leaves the tree, as the HTML standard's parser has
+   it. libdom's parser counts the ones it makes, so the page is looked
+   at only when there are new ones. One that cannot be attached (a host
+   with a root already, or an element that takes none) stays a template. */
+var SH_TPL=W.__vitaShadowTemplates,shTplSeen=0;
+try{delete W.__vitaShadowTemplates;}catch(e){}
+function declarativeShadows(root){
+ var t=root.querySelectorAll('template[shadowrootmode]'),i;
+ for(i=0;i<t.length;i++)declarativeShadow(t[i]);}
+function declarativeShadow(t){
+ var host=t.parentNode,mode=String(t.getAttribute('shadowrootmode')||'').toLowerCase(),r,f;
+ if(mode!=='open'&&mode!=='closed')return;
+ if(!host||host.nodeType!==1||SH_ROOT(host))return;
+ try{r=host.attachShadow({mode:mode,
+  delegatesFocus:t.hasAttribute('shadowrootdelegatesfocus'),
+  clonable:t.hasAttribute('shadowrootclonable'),
+  serializable:t.hasAttribute('shadowrootserializable'),
+  slotAssignment:String(t.getAttribute('shadowrootslotassignment')||'').toLowerCase()==='manual'?'manual':'named'});}
+ catch(e){return;}
+ f=t.content;
+ host.removeChild(t);
+ r.appendChild(f);
+ declarativeShadows(r);}
+function beforeScript(){
+ var n;
+ if(typeof SH_TPL==='function'&&(n=SH_TPL())!==shTplSeen){
+  shTplSeen=n;declarativeShadows(D);}
+ sweepTemplates();}
+W.__vitaBeforeScript=beforeScript;
+/* setHTMLUnsafe and parseHTMLUnsafe take declarative shadow roots too;
+   innerHTML leaves them as templates */
+if(W.DOMParser&&W.Document&&!W.Document.parseHTMLUnsafe)
+ W.Document.parseHTMLUnsafe=function(h){
+  var d=new W.DOMParser().parseFromString(String(h),'text/html');
+  try{declarativeShadows(d);}catch(e){}
+  return d;};
 W.addEventListener('DOMContentLoaded',function(){
- sweepTemplates();
+ beforeScript();
  if(CEn)ceConnectTree(D.documentElement,true,false);});
 W.addEventListener('load',function(){
  sweepTemplates();
@@ -2766,19 +3093,74 @@ function namedAccess(){
 W.addEventListener('DOMContentLoaded',namedAccess);
 W.addEventListener('load',namedAccess);
 
-/* Shadow DOM, as light DOM. A shadow root is the element itself, so
- * there is no style or selector scoping, which is the point: content put
- * in a shadow root still lays out and still renders, where an
- * unimplemented attachShadow renders nothing at all. shadowRoot stays
- * null until attachShadow is called, because components test it to find
- * out whether they have already built themselves. */
-P.attachShadow=function(){Object.defineProperty(this,'__shadow',{configurable:true,value:true,writable:true,enumerable:false});return this;};
-P.getRootNode=function(){var n=this;while(n.parentNode)n=n.parentNode;return n===D.documentElement?D:n;};
-Object.defineProperty(P,'shadowRoot',{configurable:true,get:function(){return this.__shadow?this:null;}});
-/* An element has no host of its own. Its shadow root is the element
- * itself here, so giving it one would be the element, and code that
- * climbs e.host || e.parentNode would never leave it (card-mod does). */
-Object.defineProperty(P,'host',{configurable:true,get:function(){return undefined;}});
+/* Shadow DOM (VitaSurf). A shadow root is a document fragment its host
+ * holds: a tree of its own, which the document's lookups do not enter,
+ * drawn in the host's place, whose events go on to the host. It used to
+ * be the host itself, so shadow content was the host's own children and
+ * a root was no ShadowRoot: claude.ai's Turnstile checks that the root
+ * it was given is one before every heartbeat, and dropped its widget. */
+var SH_ATTACH=W.__vitaAttachShadow,SH_ROOT=W.__vitaShadowRoot,
+ SH_HOST=W.__vitaShadowHost;
+try{delete W.__vitaAttachShadow;delete W.__vitaShadowRoot;
+ delete W.__vitaShadowHost;}catch(e){}
+/* the host of a shadow root, or null for anything else */
+function shadowHost(n){return n&&n.nodeType===11&&SH_HOST?SH_HOST(n):null;}
+/* a node's parent, or for a shadow root its host */
+function treeUp(n){return n.parentNode||shadowHost(n);}
+/* the elements the specification lets have one, besides custom ones */
+var SHADOW_TAGS=' article aside blockquote body div footer h1 h2 h3 h4 h5 h6 '+
+ 'header main nav p section span ';
+var CE_RESERVED=' annotation-xml color-profile font-face font-face-src '+
+ 'font-face-uri font-face-format font-face-name missing-glyph ';
+function ceValidName(n){
+ return /^[a-z][a-z0-9._\u00b7\u00c0-\uffff-]*-[a-z0-9._\u00b7\u00c0-\uffff-]*$/.test(n)&&
+  CE_RESERVED.indexOf(' '+n+' ')<0;}
+var SH_NOTE=W.__vitaShadowNote;
+try{delete W.__vitaShadowNote;}catch(e){}
+function shNote(t){if(typeof SH_NOTE==='function')try{SH_NOTE(t);}catch(e){}}
+P.attachShadow=function(init){
+ if(this.nodeType!==1)throw new TypeError("Illegal invocation");
+ var ok=false;
+ try{var r0=attachShadowChecked.call(this,init);ok=true;return r0;}
+ finally{if(!ok)shNote('<'+this.localName+'> was refused a shadow root'+
+  (SH_ROOT(this)?', having one already':''));}};
+function attachShadowChecked(init){
+ var mode=init&&typeof init==='object'?init.mode:undefined,r,ln=this.localName;
+ if(mode!=='open'&&mode!=='closed')
+  throw new TypeError("Failed to execute 'attachShadow' on 'Element': "+
+   (init&&typeof init==='object'?"Failed to read the 'mode' property from 'ShadowRootInit': The provided value '"+mode+
+    "' is not a valid enum value of type ShadowRootMode.":
+    "The provided value is not of type 'ShadowRootInit'."));
+ if(this.namespaceURI!==HTML_NS||
+    !(SHADOW_TAGS.indexOf(' '+ln+' ')>=0||ceValidName(ln)))
+  throw new DOMException("Failed to execute 'attachShadow' on 'Element': "+
+   "This element does not support attachShadow",'NotSupportedError');
+ if(SH_ROOT(this))
+  throw new DOMException("Failed to execute 'attachShadow' on 'Element': "+
+   "Shadow root cannot be created on a host which already hosts a shadow tree.",
+   'NotSupportedError');
+ r=SH_ATTACH(this,mode==='closed');
+ if(!r)throw new DOMException("Failed to execute 'attachShadow' on 'Element': "+
+  "This element does not support attachShadow",'NotSupportedError');
+ Object.defineProperty(r,'__vsInit',{configurable:true,value:{
+  delegatesFocus:!!init.delegatesFocus,clonable:!!init.clonable,
+  serializable:!!init.serializable,
+  slotAssignment:init.slotAssignment==='manual'?'manual':'named'}});
+ return r;};
+P.getRootNode=function(o){
+ var n=this,p;
+ for(;;){
+  while((p=n.parentNode))n=p;
+  if(n===D.documentElement)return D;
+  if(o&&o.composed&&(p=shadowHost(n))){n=p;continue;}
+  return n;}};
+/* the open one; a closed root is its host's own business */
+Object.defineProperty(P,'shadowRoot',{configurable:true,get:function(){
+ if(this.nodeType!==1)return undefined;
+ var r=SH_ROOT(this);return r&&!SH_HOST(r,true)?r:null;}});
+/* a shadow root's host; nothing else has one but a link (below) */
+Object.defineProperty(P,'host',{configurable:true,get:function(){
+ return this.nodeType===11?shadowHost(this)||undefined:undefined;}});
 Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return ceInDoc(this);}});
 /* A shadow root's <style>, once per text (VitaSurf). With shadow DOM as
  * light DOM, every component that puts a style in its shadow root put a
@@ -2793,8 +3175,16 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  var canon=Object.create(null);
  /* the copy kept for a text is live while it is in the document and
     still holds that text: a page may give it other text later */
+ /* The text each kept copy was last given here (VitaSurf). Reading a
+    style's text back makes a string of it; the check every half second
+    below read every kept sheet's whole text that way, 6% of the script
+    time of a Home Assistant load. A copy whose text is set any other
+    way is no longer in it and is read as before. */
+ var given=new WeakMap();
  function live(css){var c=canon[css];
-  return !!c&&ceInDoc(c)&&c.textContent===css;}
+  if(!c||!ceInDoc(c))return false;
+  return given.get(c)===css||c.textContent===css;}
+ function keep(n,css){canon[css]=n;given.set(n,css);}
  /* The emptied copies, by text (VitaSurf). If the kept copy leaves the
     document, the components still in it would lose their styles, so
     while any are parked a check every half second, doing nothing unless
@@ -2821,7 +3211,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
      if(n.textContent===''&&ceInDoc(n)){
       l.splice(i,1);nparked--;
       if(rawText)rawText.call(n,css);else n.textContent=css;
-      canon[css]=n;
+      keep(n,css);
       break;}}}
    if(!l.length)delete parked[css];}
   if(nparked<=0&&timer!==null){ci.call(W,timer);timer=null;nparked=0;}}
@@ -2924,8 +3314,22 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    i=e+1;}
   return out;}
  function scope(css,host){
-  var tag=host&&host.localName,k,r;
+  var tag=host&&host.localName,k,r,kk;
   if(!css||!tag||tag==='html'||tag==='body')return css;
+  /* the host as its shadow tree names it: only a rule naming one may
+     reach from inside the tree to it, where a page's rules stop at
+     the shadow root as in a browser. A custom element's tag is its
+     component, every copy of which shares the sheet; a <div> or a
+     <span> can host anything, so it is named by a key for the text
+     instead, which the hosts holding that text carry (VitaSurf). */
+  if(ceValidName(tag))tag+=':-vita-host';
+  else{
+   kk=keyOf[css];
+   if(!kk){
+    if(nkeys>=2000){keyOf=Object.create(null);nkeys=0;}
+    kk=keyOf[css]='k'+(++nkey);nkeys++;}
+   if(!(host.__vsKeys&&host.__vsKeys[kk]))hostTokens(host,kk,1);
+   tag='[data-vs-s~="'+kk+'"]:-vita-host';}
   k=tag+'\n'+css;r=scoped[k];
   if(r!==undefined)return r;
   try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}
@@ -2939,12 +3343,91 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   sc=scope(css,host);
   if(sc!==css){css=sc;if(rawText)rawText.call(n,css);else n.textContent=css;}
   if(live(css)){n.textContent='';park(n,css);return;}
-  canon[css]=n;}
- function fix(host,n){
-  if(!host.__shadow||!n)return;
-  if(styleNode(n))take(host,n);
-  else if(n.nodeType===11)
-   for(var c=n.firstChild;c;c=c.nextSibling)if(styleNode(c))take(host,c);}
+  keep(n,css);}
+ /* A <style> deeper in a shadow tree than the host's own children, or
+  * one with attributes, an id say (VitaSurf). Neither was scoped, so its
+  * rules reached the whole page: Bubble Card writes each card's own
+  * styles: template into a <style id="bubble-styles"> inside the card,
+  * and one card's "background-color: skyBlue !important" painted every
+  * button on the dashboard. Such a style is usually one instance's own,
+  * so its rules are kept to the nearest shadow host that holds it, by a
+  * key for its text in that host's data-vs-s: hosts holding the same
+  * text share the key, and the one sheet, as the tag scoping above
+  * lets every copy of a component share its sheet. A selector may also
+  * match the host itself, as the rules of an @scope match its root. */
+ var keyOf=Object.create(null),nkey=0,nkeys=0;
+ function owner(a){
+  /* the host of the shadow tree a is in */
+  for(;a;a=a.parentNode)if(a.nodeType===11)return shadowHost(a);
+  return null;}
+ function nested(p,n){
+  return !!(p&&n&&n.nodeType===1&&n.tagName==='STYLE'&&
+   !(shadowHost(p)&&styleNode(n))&&!n.hasAttribute('media')&&owner(p));}
+ function hostTokens(h,k,d){
+  var m=h.__vsKeys||(Object.defineProperty(h,'__vsKeys',{configurable:true,
+   value:Object.create(null),writable:true,enumerable:false}),h.__vsKeys),
+   out=[],x;
+  m[k]=(m[k]||0)+d;
+  if(m[k]<=0)delete m[k];
+  for(x in m)out.push(x);
+  if(typeof __vitaQuietAttr==='function')
+   __vitaQuietAttr(h,'data-vs-s',out.length?out.join(' '):null);}
+ function hostFirst(sel,at){
+  /* the selector with at put on its first compound, so it can match
+     the host itself */
+  var i,c,d=0,q;
+  if(/^:host/.test(sel)||!sel)return null;
+  for(i=0;i<sel.length;i++){
+   c=sel.charAt(i);
+   if(c==='"'||c==="'"){q=c;for(i++;i<sel.length&&sel.charAt(i)!==q;i++);continue;}
+   if(c==='('||c==='[')d++;
+   else if(c===')'||c===']')d--;
+   else if(d===0&&/[\s>+~]/.test(c))break;}
+  return sel.slice(0,i)+at+sel.slice(i);}
+ function scopeKeyed(css,k){
+  var at='[data-vs-s~="'+k+'"]:-vita-host',r;
+  try{
+   r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),at);
+   /* and each rule again, matching the host itself */
+   r=r.replace(/(^|\})([^{}@]+)\{/g,function(m,b,list){
+    var parts=splitList(list),extra=[],i,x,y;
+    for(i=0;i<parts.length;i++){
+     x=parts[i].replace(/^\s+|\s+$/g,'');
+     if(x.indexOf(at+' ')!==0)continue;
+     y=hostFirst(x.slice(at.length+1),at);
+     if(y)extra.push(y);}
+    return b+list+(extra.length?','+extra.join(','):'')+'{';});}
+  catch(x){r=css;}
+  return r;}
+ function takeNested(h,n,css){
+  var k,sc,old=n.__vsKey;
+  if(!css){
+   if(old){hostTokens(h,old,-1);n.__vsKey=undefined;}
+   return css;}
+  k=keyOf[css];
+  if(!k){
+   if(nkeys>=2000){keyOf=Object.create(null);nkeys=0;}
+   k=keyOf[css]='k'+(++nkey);nkeys++;}
+  if(old!==k){
+   if(old)hostTokens(h,old,-1);
+   hostTokens(h,k,1);
+   Object.defineProperty(n,'__vsKey',{configurable:true,value:k,
+    writable:true,enumerable:false});}
+  sc=scopeKeyed(css,k);
+  return sc;}
+ function fix(p,n){
+  /* p is where n goes: a shadow root's own <style> is scoped to its
+     host's tag */
+  var c,host=shadowHost(p);
+  if(!n)return;
+  if(host&&styleNode(n)){take(host,n);return;}
+  if(nested(p,n)&&n.textContent){
+   c=takeNested(owner(p),n,n.textContent);
+   if(rawText)rawText.call(n,c);else n.textContent=c;
+   return;}
+  if(n.nodeType===11&&host)
+   for(c=n.firstChild;c;c=c.nextSibling)
+    if(styleNode(c))take(host,c);}
  var app=P.appendChild,ins=P.insertBefore;
  P.appendChild=function(n){fix(this,n);return app.apply(this,arguments);};
  P.insertBefore=function(n,r){fix(this,n);return ins.apply(this,arguments);};
@@ -2952,8 +3435,8 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  if(!d||!d.set)return;
  Object.defineProperty(P,'innerHTML',{configurable:true,get:d.get,set:function(v){
   var fresh=[],emptied=[];
-  if(this.__shadow&&typeof v==='string'&&v.indexOf('<style')>=0)
-   {var host=this;
+  if(shadowHost(this)&&typeof v==='string'&&v.indexOf('<style')>=0)
+   {var host=shadowHost(this);
    v=v.replace(/<style>([\s\S]*?)<\/style>/gi,function(m,css){
     var sc=scope(css,host);
     if(sc!==css){css=sc;m='<style>'+sc+'</style>';}
@@ -2973,7 +3456,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    var st=this.getElementsByTagName('style'),i,j;
    for(i=0;i<st.length;i++)for(j=0;j<fresh.length;j++)
     if(!canon[fresh[j]]||!live(fresh[j]))
-     if(st[i].textContent===fresh[j])canon[fresh[j]]=st[i];}
+     if(st[i].textContent===fresh[j])keep(st[i],fresh[j]);}
   return r;}});
  /* and the text given after the style is in: GitHub's <tool-tip>
   * appends an empty <style> to its shadow root and then sets its
@@ -2985,96 +3468,56 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  rawText=t.set;
  Object.defineProperty(P,'textContent',{configurable:true,get:t.get,set:function(v){
   var p;
-  if(typeof v==='string'&&v&&(p=this.parentNode)&&p.__shadow&&styleNode(this)){
-   v=scope(v,p);
+  given.delete(this);
+  if(typeof v==='string'&&v&&(p=this.parentNode)&&shadowHost(p)&&styleNode(this)){
+   v=scope(v,shadowHost(p));
    if(live(v)){
     if(canon[v]!==this){t.set.call(this,'');park(this,v);}
     return;}
-   t.set.call(this,v);canon[v]=this;return;}
+   t.set.call(this,v);keep(this,v);return;}
+  if(typeof v==='string'&&(p=this.parentNode)&&nested(p,this)){
+   t.set.call(this,takeNested(owner(p),this,v));return;}
   t.set.call(this,v);}});
 })();
 /* Slots (VitaSurf). A host's own children are drawn only through a
- * <slot> in its shadow tree: the one whose name matches their slot
- * attribute, or the unnamed one. With shadow DOM kept as light DOM they
- * sat after everything the component rendered, so Home Assistant's Log
- * in button had its label under it, the checkbox its text below the
- * box, and the password field its eye icon under the field; and what a
- * component puts out no slot for, which it means to hide, was drawn.
- *
- * Before boxes are built the engine calls __vitaSlotPass, which works
- * out each host's own children and where each goes, and hands that to
- * __vitaSlots; box construction then walks the composed tree.
- *
- * Which children are the host's own: a Lit component renders between
- * a marker comment and the node that was its first child when it first
- * rendered (renderBefore), and whatever lies outside that range is the
- * page's. For any other component only the children that name a slot
- * are counted, which is all that could be told apart before. */
+ * <slot> in its shadow tree: the first whose name matches their slot
+ * attribute, or the first unnamed one for a child without one; a child
+ * no slot takes is not drawn. Before boxes are built the engine calls
+ * __vitaSlotPass, which works out where each goes and hands that to
+ * __vitaSlots; box construction then walks the composed tree, the
+ * host's shadow tree in its place and each slot's children in it. */
 (function(){
  var HOSTS=[],last=-1,lastLen=-1,had=false,prev=[];
- function partRange(h){
-  var c=h,p,k,v,start,end;
-  while(c){
-   p=c._$litPart$;
-   if(p&&typeof p==='object'){
-    start=null;
-    for(k in p){v=p[k];
-     if(v&&typeof v==='object'&&v.nodeType===8&&v.parentNode===h){start=v;break;}}
-    if(start){
-     end=p.options&&p.options.renderBefore;
-     if(end===undefined&&p._$endNode!==undefined)end=p._$endNode;
-     if(!end||end.parentNode!==h)end=null;
-     return {start:start,end:end};}}
-   c=(c===h)?h.firstChild:c.nextSibling;}
-  return null;}
- function lightOf(h){
-  var out=[],r=partRange(h),c,state=0;
-  if(r){
-   for(c=h.firstChild;c;c=c.nextSibling){
-    if(c===r.start)state=1;
-    else if(state===1&&c===r.end)state=2;
-    if(state!==1&&c.nodeType!==8)out.push(c);}
-   return out;}
-  for(c=h.firstChild;c;c=c.nextSibling)
-   if(c.nodeType===1&&c.hasAttribute('slot'))out.push(c);
-  return out;}
  function pass(){
-  var g=domGen(),i,j,h,l,light=new Set(),perHost=[],nodes=[],slots=[],
-      ss,s,n,p,name,byName,live=[];
+  var g=domGen(),i,j,h,r,l,c,nodes=[],slots=[],ss,s,name,byName,live=[];
   if(g>=0&&g===last&&HOSTS.length===lastLen)return;
   last=g;
   for(i=0;i<HOSTS.length;i++){
    h=HOSTS[i];
-   if(!h.__shadow)continue;
-   if(!ceInDoc(h)){if(HOSTS.length<4096)live.push(h);continue;}
-   live.push(h);
-   l=lightOf(h);
-   for(j=0;j<l.length;j++)light.add(l[j]);
-   perHost.push([h,l]);}
-  HOSTS=live;lastLen=HOSTS.length;
-  for(i=0;i<perHost.length;i++){
-   h=perHost[i][0];l=perHost[i][1];
+   if(HOSTS.length<4096||ceInDoc(h))live.push(h);
+   if(!ceInDoc(h))continue;
+   r=SH_ROOT(h);
+   if(!r)continue;
+   l=[];
+   for(c=h.firstChild;c;c=c.nextSibling)
+    if(c.nodeType===1||c.nodeType===3)l.push(c);
    if(!l.length)continue;
-   /* the host's own slots: those whose nearest host, climbing past
-      any host they are a page child of, is this one */
    byName=Object.create(null);
-   ss=h.getElementsByTagName('slot');
-   for(j=0;j<ss.length;j++){
-    s=ss[j];n=s;
-    for(;;){p=n.parentNode;
-     if(!p||p.nodeType!==1){p=null;break;}
-     if(p.__shadow&&!light.has(n))break;
-     n=p;}
-    if(p!==h)continue;
-    name=s.getAttribute('name')||'';
-    if(!(name in byName))byName[name]=s;}
+   if(!manual(r)){
+    ss=r.querySelectorAll('slot');
+    for(j=0;j<ss.length;j++){
+     name=ss[j].getAttribute('name')||'';
+     if(!(name in byName))byName[name]=ss[j];}}
    for(j=0;j<l.length;j++){
-    n=l[j];
-    name=n.nodeType===1?(n.getAttribute('slot')||''):'';
-    s=byName[name]||null;
-    nodes.push(n);slots.push(s);
-    if(n.__vsSlot!==s)Object.defineProperty(n,'__vsSlot',
+    c=l[j];
+    if(manual(r))s=manualSlot(c,r);
+    else{
+     name=c.nodeType===1?(c.getAttribute('slot')||''):'';
+     s=byName[name]||null;}
+    nodes.push(c);slots.push(s);
+    if(c.__vsSlot!==s)Object.defineProperty(c,'__vsSlot',
      {configurable:true,writable:true,enumerable:false,value:s});}}
+  HOSTS=live;lastLen=HOSTS.length;
   /* what was drawn in a slot and no longer is */
   if(prev.length){
    var now=new Set(nodes);
@@ -3086,12 +3529,135 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  if(typeof __vitaSlots==='function')
   Object.defineProperty(W,'__vitaSlotPass',{configurable:true,writable:true,
    enumerable:false,value:function(){try{pass();}catch(e){}}});
+ function manual(r){return !!(r&&r.__vsInit&&r.__vsInit.slotAssignment==='manual');}
+ /* the slot a child of a host in manual mode was assigned to, if that
+    slot is in the host's tree and still lists it */
+ function manualSlot(c,r){
+  var s=c.__vsManualSlot;
+  return s&&treeRoot(s)===r&&s.__vsManual&&s.__vsManual.indexOf(c)>=0?s:null;}
+ /* slotchange (VitaSurf). A slot whose assigned nodes change hears it in
+    the microtask after the change, as the DOM standard signals it. Only
+    hosts a change touched are looked at, and only once some listener
+    wants the event: Home Assistant has hundreds of hosts. */
+ var dirty=new Set(),queued=false,watch=false;
+ function touch(p){
+  var r,h;
+  if(!watch||!p)return;
+  if(p.nodeType===1&&SH_ROOT(p))dirty.add(p);
+  r=treeRoot(p);
+  if(r&&r.nodeType===11&&(h=shadowHost(r)))dirty.add(h);
+  if(!queued){queued=true;Promise.resolve().then(run);}}
+ function same(a,b){
+  if(a.length!==b.length)return false;
+  for(var i=0;i<a.length;i++)if(a[i]!==b[i])return false;
+  return true;}
+ function run(){
+  var hs=[],i,j,r,ss,now,old;
+  queued=false;
+  dirty.forEach(function(h){hs.push(h);});dirty.clear();
+  for(i=0;i<hs.length;i++){
+   r=SH_ROOT(hs[i]);
+   if(!r)continue;
+   ss=r.querySelectorAll('slot');
+   for(j=0;j<ss.length;j++){
+    now=ss[j].assignedNodes();old=ss[j].__vsSeen||[];
+    if(same(now,old))continue;
+    Object.defineProperty(ss[j],'__vsSeen',{configurable:true,writable:true,
+     enumerable:false,value:now});
+    try{ss[j].dispatchEvent(uaEvent(new Event('slotchange',{bubbles:true})));}catch(e){}}}}
+ var ael=P.addEventListener;
+ if(ael)P.addEventListener=function(t){
+  if(t==='slotchange')watch=true;
+  return ael.apply(this,arguments);};
+ ['appendChild','insertBefore','removeChild','replaceChild'].forEach(function(k){
+  var f=P[k];
+  if(!f)return;
+  P[k]=function(n){
+   var from=n&&n.parentNode,r=f.apply(this,arguments);
+   if(watch){touch(this);if(from&&from!==this)touch(from);
+    if(k==='replaceChild'&&arguments[1])touch(this);}
+   return r;};});
+ var sa=P.setAttribute,ra=P.removeAttribute;
+ P.setAttribute=function(n,v){
+  var r=sa.apply(this,arguments);
+  if(watch&&(n==='slot'||n==='name'))touch(this.parentNode||this);
+  return r;};
+ if(ra)P.removeAttribute=function(n){
+  var r=ra.apply(this,arguments);
+  if(watch&&(n==='slot'||n==='name'))touch(this.parentNode||this);
+  return r;};
+ var ih=Object.getOwnPropertyDescriptor(P,'innerHTML');
+ if(ih&&ih.set)Object.defineProperty(P,'innerHTML',{configurable:true,get:ih.get,
+  set:function(v){ih.set.call(this,v);if(watch)touch(this);}});
+ /* slot.assign(...nodes), for a tree made with slotAssignment manual */
+ P.assign=function(){
+  if(this.tagName!=='SLOT')return;
+  var list=[],i,n,o;
+  for(i=0;i<arguments.length;i++){
+   n=arguments[i];
+   if(!n||(n.nodeType!==1&&n.nodeType!==3))
+    throw new TypeError("Failed to execute 'assign' on 'HTMLSlotElement': parameter is not of type 'Element' or 'Text'.");
+   if(list.indexOf(n)<0)list.push(n);}
+  for(i=0;i<(this.__vsManual||[]).length;i++){
+   o=this.__vsManual[i];
+   if(list.indexOf(o)<0&&o.__vsManualSlot===this)o.__vsManualSlot=null;
+   if(o.parentNode)touch(o.parentNode);}
+  for(i=0;i<list.length;i++){
+   n=list[i];o=n.__vsManualSlot;
+   if(o&&o!==this&&o.__vsManual)o.__vsManual=o.__vsManual.filter(function(x){return x!==n;});
+   Object.defineProperty(n,'__vsManualSlot',{configurable:true,writable:true,
+    enumerable:false,value:this});
+   if(n.parentNode)touch(n.parentNode);}
+  Object.defineProperty(this,'__vsManual',{configurable:true,writable:true,
+   enumerable:false,value:list});
+  touch(this);};
+ W.__vsManualSlot=manualSlot;W.__vsManualRoot=manual;
+ /* the iframes in shadow trees, for the log: where each is and whether
+    it has a box, a few seconds after a page makes shadow roots */
+ var ifSeen=0,ifScans=0,ifPending=false;
+ function iframeScan(){
+  var i,j,r,fs,f,b,src,o,n=0;
+  ifPending=false;
+  for(i=0;i<HOSTS.length&&i<256;i++){
+   r=SH_ROOT(HOSTS[i]);
+   if(!r)continue;
+   fs=r.querySelectorAll('iframe');
+   for(j=0;j<fs.length;j++){
+    f=fs[j];
+    if(++n<=ifSeen)continue;
+    b=f.getBoundingClientRect();src=f.getAttribute('src')||'';
+    try{o=src?(new URL(src,location.href).origin===location.origin?
+     'from this origin':'from another origin'):'with no src';}
+    catch(e){o='with a src that is not a URL';}
+    shNote('an <iframe> '+o+' in <'+HOSTS[i].localName+'>\'s '+
+     (SH_HOST(r,true)?'closed':'open')+' tree, '+
+     (ceInDoc(f)?'in the page':'not in the page')+', '+
+     (b.width>0||b.height>0?Math.round(b.width)+'x'+Math.round(b.height):'no box')+
+     (f.contentWindow?'':', no window'));}}
+  if(n>ifSeen)ifSeen=n;}
  var att=P.attachShadow;
  P.attachShadow=function(){
-  if(!this.__shadow)HOSTS.push(this);
-  return att.apply(this,arguments);};
+  var r=att.apply(this,arguments);
+  HOSTS.push(this);
+  if(!ifPending&&ifScans<4){ifPending=true;ifScans++;setTimeout(iframeScan,4000);}
+  return r;};
  Object.defineProperty(P,'assignedSlot',{configurable:true,
-  get:function(){return this.__vsSlot||null;}});
+  get:function(){
+   /* found when asked, as the DOM standard's "find a slot" is: the
+      first slot in the host's tree with the name, or the pass's for
+      manual assignment */
+   var h=this.parentNode,r,s=null,name,ss,j;
+   if(!h||h.nodeType!==1||(this.nodeType!==1&&this.nodeType!==3)||
+      !(r=SH_ROOT(h)))return null;
+   if(manual(r))s=manualSlot(this,r);
+   else{
+    name=this.nodeType===1?(this.getAttribute('slot')||''):'';
+    ss=r.querySelectorAll('slot');
+    for(j=0;j<ss.length;j++)
+     if((ss[j].getAttribute('name')||'')===name){s=ss[j];break;}}
+   /* a closed shadow tree's slot is its own business */
+   if(s&&SH_HOST(r,true))return null;
+   return s;}});
 })();
 /* <template>. libdom parses the children into the template element, so
  * content used to be the element itself -- and stamping a template then
@@ -3148,13 +3714,16 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   if(CEn&&c)ceConnectTree(c,false,false);
   return c;};
 })();
-/* No shadow tree exists here (attachShadow hands the host back), so
- * nothing may be an instance of ShadowRoot. When it was the base of every
- * element, Alpine's tree walk, which asks each node whether it is one and
- * then visits only its children, descended through the whole page without
- * processing a single directive. */
+/* A shadow root is the one kind of fragment an element holds. Only those
+ * are instances of ShadowRoot: when every element was, Alpine's tree
+ * walk, which asks each node whether it is one and then visits only its
+ * children, descended through the whole page without processing a
+ * single directive. */
 W.ShadowRoot=function ShadowRoot(){throw new TypeError('Illegal constructor');};
 W.ShadowRoot.prototype=Object.create(P);
+Object.defineProperty(W.ShadowRoot,Symbol.hasInstance,{configurable:true,
+ value:function(v){return !!v&&typeof v==='object'&&v.nodeType===11&&
+  !!shadowHost(v);}});
 
 /* --- reflected content attributes ---------------------------------------
  * Most element properties in the HTML specification are nothing but a
@@ -3299,7 +3868,7 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
  var EP=ElementInternals.prototype;
  Object.defineProperties(EP,{
   shadowRoot:{configurable:true,get:function(){
-   var el=this._el;return el.__shadow?el:null;}},
+   return SH_ROOT(this._el)||null;}},
   form:{configurable:true,get:function(){
    needForm(this,'form');return formOwner(this._el);}},
   labels:{configurable:true,get:function(){
@@ -3340,7 +3909,7 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
  EP.checkValidity=function(){
   var el=this._el;
   if(!this.willValidate||this.validity.valid)return true;
-  el.dispatchEvent(new Event('invalid',{bubbles:false,cancelable:true}));
+  el.dispatchEvent(uaEvent(new Event('invalid',{bubbles:false,cancelable:true})));
   return false;};
  EP.reportValidity=function(){return this.checkValidity();};
  /* the ARIA a custom element sets on itself through its internals */
@@ -3381,14 +3950,58 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
   var s=INTERNALS.get(el);
   return s&&formAssociated(el)?s.value:undefined;};
 })();
-/* Popovers, as a plain show and hide: there is no top layer here, so an
- * open popover is a visible element and a closed one is hidden. */
-P.showPopover=function(){this.removeAttribute('hidden');this.__popopen=true;
- this.dispatchEvent(new Event('beforetoggle'));};
-P.hidePopover=function(){this.setAttribute('hidden','');this.__popopen=false;
- this.dispatchEvent(new Event('beforetoggle'));};
-P.togglePopover=function(force){var open=force===undefined?!this.__popopen:!!force;
- if(open)this.showPopover();else this.hidePopover();return open;};
+/* Popovers (VitaSurf). Whether one is shown is the element's own state,
+ * kept in C: :popover-open matches it, and the UA sheet's
+ * [popover]:not(:popover-open) rule hides one that is not shown, as
+ * GitHub's tooltips are until they are wanted. There is no top layer,
+ * so a shown popover is drawn where its own styles put it. The steps
+ * follow HTML's: the validity checks, a cancelable beforetoggle before
+ * showing, and a toggle event queued after, merged with one still
+ * pending (which fires even when it comes back to where it started, as
+ * HTML has it and Chrome does). Light dismiss of popover=auto is not done. */
+var POPN=typeof W.__vitaPopover==='function'?W.__vitaPopover:null;
+try{delete W.__vitaPopover;}catch(e){}
+function popShown(el){return !!POPN&&POPN(el)===true;}
+function popValid(el,showing){
+ if(!el.hasAttribute('popover'))
+  throw new DOMException('Not supported on elements that do not have a valid value for the popover attribute','NotSupportedError');
+ if(popShown(el)===showing)return false;
+ if(!el.isConnected)
+  throw new DOMException('Invalid on disconnected popover elements','InvalidStateError');
+ if(el.tagName==='DIALOG'&&el.hasAttribute('open'))
+  throw new DOMException('The dialog is already open as a dialog','InvalidStateError');
+ return true;}
+var POPTOGGLE=new WeakMap();
+function popQueueToggle(el,oldS,newS){
+ var t=POPTOGGLE.get(el);
+ if(t){t.newState=newS;return;}
+ t={oldState:oldS,newState:newS};POPTOGGLE.set(el,t);
+ setTimeout(function(){
+  POPTOGGLE.delete(el);
+  try{el.dispatchEvent(uaEvent(new ToggleEvent('toggle',
+   {oldState:t.oldState,newState:t.newState})));}catch(e){}},0);}
+function popSet(el,open){if(POPN)POPN(el,open);}
+P.showPopover=function(){
+ if(!popValid(this,true))return;
+ if(!this.dispatchEvent(uaEvent(new ToggleEvent('beforetoggle',
+   {oldState:'closed',newState:'open',cancelable:true}))))return;
+ /* a listener may have changed things */
+ if(!popValid(this,true))return;
+ popSet(this,true);
+ popQueueToggle(this,'closed','open');};
+P.hidePopover=function(){
+ if(!popValid(this,false))return;
+ this.dispatchEvent(uaEvent(new ToggleEvent('beforetoggle',
+  {oldState:'open',newState:'closed'})));
+ if(!popShown(this))return;
+ popSet(this,false);
+ popQueueToggle(this,'open','closed');};
+P.togglePopover=function(opt){
+ var force=opt!==null&&typeof opt==='object'?opt.force:opt;
+ if(popShown(this)&&(force===undefined||!force))this.hidePopover();
+ else if(force===undefined||force)this.showPopover();
+ else popValid(this,false);
+ return popShown(this);};
 Object.defineProperty(P,'popoverTargetElement',{configurable:true,
  get:function(){var id=this.getAttribute('popovertarget');return id?D.getElementById(id):null;},
  set:function(v){if(v&&v.id)this.setAttribute('popovertarget',v.id);
@@ -3589,12 +4202,28 @@ Object.defineProperty(TokenList.prototype,'value',{configurable:true,
  set:function(v){if(this._e)this._e.setAttribute(this._a,String(v));
   else this._own=splitWS(String(v)).filter(function(x){return x;});}});
 W.DOMTokenList=TokenList;
-/* A fresh list per read. A browser hands back the same object every time
-   and code occasionally compares them, but caching it here means the
-   indices go stale when the attribute is changed from elsewhere, and
-   wrong contents are worse than a wrong identity. */
+/* The same list on every read, as a browser hands back (VitaSurf). A
+   fresh one per read cost an object, a split and a property per class,
+   and Lit's classMap reads it for every class of every element it
+   updates. Its indices are brought up to date on each read when the
+   attribute has changed since, so they are no staler than a fresh
+   list's would be; the methods read the attribute itself. */
+TokenList.prototype._sync=function(){
+ var t=this._t(),i;
+ for(i=0;i<Math.max(t.length,this.length||0);i++){
+  if(i<t.length)this[i]=t[i];else delete this[i];}
+ this.length=t.length;};
+hide(TokenList.prototype,'_sync',TokenList.prototype._sync);
 Object.defineProperty(P,'classList',{configurable:true,
- get:function(){return new TokenList(this,'class');},
+ get:function(){
+  var v=this.getAttribute('class'),tl=this.__vsClassList;
+  if(tl===undefined){
+   tl=new TokenList(this,'class');
+   hide(tl,'_v',v);
+   hide(this,'__vsClassList',tl);
+   return tl;}
+  if(tl._v!==v){tl._sync();tl._v=v;}
+  return tl;},
  set:function(v){this.setAttribute('class',String(v));}});
 /* output.htmlFor is a token list; label.htmlFor is a string. Only
  * output's gets the list, which is what the specification says and what
@@ -3633,7 +4262,9 @@ Object.defineProperty(P,'origin',{configurable:true,get:function(){
  if(!isURLEl(this))return '';var u=urlOf(this);return u?u.origin:'';}});
 /* host is a link's URL host; no other element has one (see above). */
 Object.defineProperty(P,'host',{configurable:true,
- get:function(){if(!isURLEl(this))return undefined;
+ get:function(){
+  if(this.nodeType===11)return shadowHost(this)||undefined;
+  if(!isURLEl(this))return undefined;
   var u=urlOf(this);return u?u.host:'';},
  set:function(v){
   if(!isURLEl(this))return shadowProp(this,'host',v);
@@ -3686,7 +4317,7 @@ P.checkValidity=function(){
  if(this.tagName==='FORM')return listOf(this.elements).every(function(c){return c.checkValidity();});
  if(!this.willValidate)return true;
  if(this.validity.valid)return true;
- this.dispatchEvent(new Event('invalid',{bubbles:false,cancelable:true}));
+ this.dispatchEvent(uaEvent(new Event('invalid',{bubbles:false,cancelable:true})));
  return false;};
 P.reportValidity=function(){return this.checkValidity();};
 /* Text selection inside a control. Nothing here has a caret, so the
@@ -3698,7 +4329,7 @@ Object.defineProperty(P,'selectionDirection',{configurable:true,
  get:function(){return this.__selectionDirection||'none';},
  set:function(v){this.__selectionDirection=String(v);}});
 P.setSelectionRange=function(s,e,d){this.selectionStart=s;this.selectionEnd=e;
- this.selectionDirection=d||'none';this.dispatchEvent(new Event('select'));};
+ this.selectionDirection=d||'none';this.dispatchEvent(uaEvent(new Event('select')));};
 P.setRangeText=function(rep,s,e){var v=String(this.value||'');
  if(s===undefined){s=this.selectionStart;e=this.selectionEnd;}
  this.value=v.slice(0,s)+String(rep)+v.slice(e);};
@@ -3805,7 +4436,7 @@ Object.defineProperty(P,'index',{configurable:true,get:function(){
    if(t==='TEXTAREA'){this.textContent=String(v);return;}
    d.set.call(this,v);}});})();
 P.requestSubmit=function(submitter){
- if(!this.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})))return;
+ if(!this.dispatchEvent(uaEvent(new Event('submit',{bubbles:true,cancelable:true}))))return;
  this.submit(submitter);};
 /* The window a form or link target names (VitaSurf): _self, _parent,
    _top, or a frame by name, looked for here, then in the frames around
@@ -3856,7 +4487,7 @@ P.submit=function(submitter){
  }catch(e){}};
 P.reset=function(){
  if(this.tagName!=='FORM')return;
- if(!this.dispatchEvent(new Event('reset',{bubbles:true,cancelable:true})))return;
+ if(!this.dispatchEvent(uaEvent(new Event('reset',{bubbles:true,cancelable:true}))))return;
  listOf(this.elements).forEach(function(c){
   if(c.tagName==='SELECT'){c.selectedIndex=0;return;}
   if(c.type==='checkbox'||c.type==='radio'){c.checked=c.defaultChecked;return;}
@@ -3896,9 +4527,11 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
  */
 (function(){
  var NF=W.__vitaFrameGlobal,NP=W.__vitaParentGlobal,NT=W.__vitaTopGlobal,
-  NE=W.__vitaFrameElement,NX=W.__vitaEntryGlobal,NS=W.__vitaFrameStart;
+  NE=W.__vitaFrameElement,NX=W.__vitaEntryGlobal,NS=W.__vitaFrameStart,
+  NO=W.__vitaFrameOf;
  ['__vitaFrameGlobal','__vitaParentGlobal','__vitaTopGlobal',
-  '__vitaFrameElement','__vitaEntryGlobal','__vitaFrameStart'].forEach(
+  '__vitaFrameElement','__vitaEntryGlobal','__vitaFrameStart',
+  '__vitaFrameOf'].forEach(
   function(k){delete W[k];});
  function call(f,a){try{return f?f(a):null;}catch(e){return null;}}
  /* an iframe's page, its window made now if layout has not made it: a
@@ -3953,36 +4586,61 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   try{return new URL(h).origin;}catch(e){return 'null';}}
  var CROSS=new WeakMap();
  /* a raw global as this page may see it */
+ /* A frame of another origin is seen through one window for as long as
+    the frame lives, whatever page it shows, as a browser's WindowProxy
+    is (VitaSurf): keyed by its iframe element and reaching the page it
+    shows now. It was one per page, so the window a page took from the
+    frame when it was made, still blank, was not the source of the
+    messages its page later sent, and a page that matches the two --
+    the claude.ai challenge's widget does -- never heard its frame. */
+ var CROSS_EL=new WeakMap();
+ function frameView(el){
+  var r=CROSS_EL.get(el);
+  if(!r){r=crossWindow(function(){return call(NF,el);},el);CROSS_EL.set(el,r);}
+  return r;}
  function view(g){
   if(!g||g===W)return g?W:null;
   if(keyOf(g)===myKey())return g;
+  var el=call(NO,g);
+  if(el)return frameView(el);
   var r=CROSS.get(g);
-  if(!r){r=crossWindow(g);CROSS.set(g,r);}
+  if(!r){r=crossWindow(function(){return g;},null);CROSS.set(g,r);}
   return r;}
  function deny(k){
   throw new DOMException('Blocked a frame from accessing a cross-origin frame'+
    (typeof k==='string'?' (property "'+k+'")':'')+'.','SecurityError');}
- function crossWindow(g){
+ /* cur() is the page the window shows now, or null before its frame has
+    one; el its iframe, when it is one of this page's frames */
+ function crossWindow(cur,el){
+  function nav(v){
+   var g=cur();
+   if(g)g.location.href=String(v);
+   else if(el)el.setAttribute('src',String(v));}
   var self,loc=Object.create(null),fns={
-   postMessage:function postMessage(m,o,t){return g.postMessage(m,o,t);},
+   postMessage:function postMessage(m,o,t){
+    var g=cur();
+    msgSent(m,el?'its frame':'another window');
+    /* before its page is there the frame's blank start has no one
+       listening, and the message goes nowhere */
+    if(g)return g.postMessage.apply(g,arguments);},
    close:function close(){},focus:function focus(){},blur:function blur(){}};
   Object.defineProperty(loc,'href',{get:function(){deny('href');},
-   set:function(v){g.location.href=String(v);}});
-  loc.replace=function(v){g.location.replace(String(v));};
+   set:function(v){nav(v);}});
+  loc.replace=function(v){var g=cur();if(g)g.location.replace(String(v));else nav(v);};
   self=new Proxy(Object.create(null),{
    get:function(t,k){
     if(Object.prototype.hasOwnProperty.call(fns,k))return fns[k];
     if(k==='closed')return false;
     if(k==='window'||k==='self'||k==='frames')return self;
     if(k==='top')return view(call(NT)||W);
-    if(k==='parent')return g===call(NP)?view(call(NT)||W):W;
+    if(k==='parent')return cur()===call(NP)?view(call(NT)||W):W;
     if(k==='opener')return null;
     if(k==='length')return 0;
     if(k==='location')return loc;
     if(k==='then'||typeof k==='symbol')return undefined;
     deny(k);},
    set:function(t,k,v){
-    if(k==='location'){g.location.href=String(v);return true;}
+    if(k==='location'){nav(v);return true;}
     deny(k);},
    has:function(t,k){return k in fns||k==='closed'||k==='location';},
    ownKeys:function(){return [];},
@@ -4015,17 +4673,86 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   if(arguments.length<1)
    throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
   var to=(options!==null&&typeof options==='object')?options.targetOrigin:options,
-   src=call(NX)||W,data,ev;
+   src=call(NX)||W,data,ev,ports;
+  /* the ports handed over: postMessage(m, origin, [port]) or
+     postMessage(m, {targetOrigin, transfer: [port]}) */
+  ports=portList(options!==null&&typeof options==='object'?options.transfer:arguments[2]);
   to=to===undefined?'/':String(to);
   if(to==='/')to=originOf(src);
   else if(to!=='*'){
    try{to=new URL(to).origin;}
    catch(e){throw new DOMException("Invalid target origin '"+to+"' in a call to 'postMessage'.",'SyntaxError');}}
-  data=W.structuredClone(message);
-  if(to!=='*'&&to!==originOf(W))return;
-  ev=new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
-   source:view(src),ports:[]});
-  setTimeout(function(){__vitaDispatch(null,ev);},0);};
+  if(ports.length)data=message;
+  else data=W.structuredClone(message);
+  if(to!=='*'&&to!==originOf(W)){
+   msgNote(src,message,'dropped: its target origin is not this window\'s');
+   return;}
+  if(ports.length)ports=portMove(ports,W.MessagePort);
+  ev=uaEvent(new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
+   source:view(src),ports:ports}));
+  setTimeout(function(){
+   var tr=msgTraceStart(src,ev,data,ports);
+   msgNote(src,message,'delivered'+(to==='*'?' (to any origin)':''));
+   __vitaDispatch(null,ev);
+   if(tr)setTimeout(function(){msgTraceEnd(tr);},50);},0);};
+ /* What a page did with the first few messages another window sent it
+    (VitaSurf): which of the event's fields and which of the data's keys
+    it read, and what it sent on in the next moment. Names only. The
+    claude.ai challenge's widget sends its page "init" and asks for its
+    parameters, and the page never answers; this says how far its
+    handling got. */
+ var TRACE_LEFT=4,SENT=null;
+ function msgKind(m){
+  try{var w=m&&typeof m==='object'?(typeof m.event==='string'?m.event:
+   typeof m.type==='string'?m.type:''):'';
+   return /^[\w.:-]{1,24}$/.test(w)?w:'';}catch(e){return '';}}
+ function msgTraceStart(src,ev,data,ports){
+  var tr,kind=msgKind(data);
+  if(TRACE_LEFT<=0||src===W||!kind||ports.length||!data||typeof data!=='object'||
+   Array.isArray(data))return null;
+  if(kind==='meow'||kind==='food')return null;
+  TRACE_LEFT--;
+  tr={kind:kind,read:[],sent:[]};
+  function note(n){if(tr.read.indexOf(n)<0&&tr.read.length<40)tr.read.push(n);}
+  ['source','origin','data','ports','lastEventId'].forEach(function(k){
+   var v=ev[k];
+   try{Object.defineProperty(ev,k,{configurable:true,enumerable:true,
+    get:function(){note('event.'+k);return v;}});}catch(e){}});
+  Object.keys(data).forEach(function(k){
+   var v=data[k];
+   if(!/^[\w$-]{1,32}$/.test(k))return;
+   try{Object.defineProperty(data,k,{configurable:true,enumerable:true,
+    get:function(){note('data.'+k);return v;},
+    set:function(x){v=x;}});}catch(e){}});
+  SENT=tr.sent;
+  return tr;}
+ function msgTraceEnd(tr){
+  if(SENT===tr.sent)SENT=null;
+  if(typeof MN!=='function')return;
+  try{MN('the page\'s handling of "'+tr.kind+'" read '+
+   (tr.read.length?tr.read.join(', '):'nothing of it')+'; it sent '+
+   (tr.sent.length?tr.sent.join(', '):'nothing')+' in the next 50 ms');}catch(e){}}
+ function msgSent(m,where){
+  if(!SENT||SENT.length>=8)return;
+  var k=msgKind(m);
+  SENT.push((k?'"'+k+'"':'a message')+' to '+where);}
+ /* the log's line for a message: where from, and its kind when the data
+    names one with a short word, as {event: "ready"} does; nothing else
+    of the data is written */
+ var MN=W.__vitaMessageNote;
+ try{delete W.__vitaMessageNote;}catch(e){}
+ function msgNote(src,m,what){
+  var k='',w;
+  if(typeof MN!=='function')return;
+  try{
+   if(m&&typeof m==='object'){
+    w=typeof m.event==='string'?m.event:typeof m.type==='string'?m.type:'';
+    if(/^[\w.:-]{1,24}$/.test(w))k=' "'+w+'"';}
+   else if(typeof m==='string')k=' (a string of '+m.length+')';}
+  catch(e){}
+  try{MN('a message'+k+' '+(src===W?'from this window':
+   keyOf(src)===myKey()?'from a window of this origin':
+   'from a window of another origin')+', '+what);}catch(e){}}
  var FRAMES=new WeakMap();
  function sameOrigin(el){
   var src=el.getAttribute('src');
@@ -4099,6 +4826,10 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
   if(!this.isConnected)return null;
   var g=frameGlobal(this);
+  /* another origin's frame is the same window before its page comes as
+     after -- while the blank start made for script stands in, which is
+     of this origin -- and through every page it goes on to show */
+  if(!sameOrigin(this)||(g&&keyOf(g)!==myKey()))return frameView(this);
   return g?view(g):frameWindow(this);}});
  Object.defineProperty(P,'contentDocument',{configurable:true,get:function(){
   if(!isFrame(this))return this.tagName==='OBJECT'?null:undefined;
@@ -4306,7 +5037,8 @@ D.caretRangeFromPoint=function(){return null;};
  D[k]=P[k]=function(p){return p;};});
 P.getBoxQuads=function(){return [this.getBoundingClientRect()];};
 P.getHTML=function(){return this.innerHTML;};
-P.setHTML=P.setHTMLUnsafe=function(h){this.innerHTML=String(h);};
+P.setHTML=function(h){this.innerHTML=String(h);};
+P.setHTMLUnsafe=function(h){this.innerHTML=String(h);declarativeShadows(this);};
 P.moveBefore=function(n,ref){return this.insertBefore(n,ref||null);};
 /* An attribute node, which getAttributeNode used to fake with an object
  * literal. Sanitizers walk these and read ownerElement off them. */
@@ -4743,8 +5475,56 @@ W.StorageEvent.prototype.initStorageEvent=function(t,b,c,k,o,n,u,s){this.type=t;
 function cssName(p){return String(p)
  .replace(/^(webkit|moz|ms|epub)([A-Z])/,function(m,a,b){return '-'+a+'-'+b.toLowerCase();})
  .replace(/[A-Z]/g,function(c){return '-'+c.toLowerCase();});}
+/* The declarations of a style text, split at the semicolons outside any
+ * string or bracket (VitaSurf): a custom property may hold a block with
+ * semicolons of its own. */
+function splitDecls(t){
+ /* most style text has no bracket, string or escape at all, and a walk
+    over every character of it was 2% of a Home Assistant load's script
+    time; the rest is searched from one special character to the next */
+ if(!/[(\[{"'\\]/.test(t))return t.split(';');
+ var out=[],st=0,depth=0,q='',re=/[;()[\]{}"'\\]/g,m,c;
+ while((m=re.exec(t))){
+  c=m[0];
+  if(q){
+   if(c==='\\')re.lastIndex++;
+   else if(c===q)q='';
+   continue;}
+  if(c==='"'||c==="'")q=c;
+  else if(c==='\\')re.lastIndex++;
+  else if(c==='('||c==='['||c==='{')depth++;
+  else if(c===';'){if(depth===0){out.push(t.slice(st,m.index));st=m.index+1;}}
+  else if(depth>0)depth--;}
+ out.push(t.slice(st));
+ return out;}
+/* A value as the style attribute can hold it (VitaSurf). A value set
+ * through the CSSOM is parsed on its own, where the end closes whatever
+ * it left open; the attribute holds every declaration in one text, and
+ * there a bracket or string left open runs on over all the ones after
+ * it. Home Assistant's dark theme sets a variable cut off at
+ * "@layer wa-utilities{@supports (scrollbar-gutter", and the hundred
+ * theme colours after it, the dark backgrounds among them, were lost.
+ * So what is open is closed. A closing bracket with nothing open makes
+ * the value invalid, and null is returned, as a browser drops it. */
+function closeValue(v){
+ var stack=[],q='',i,c,k;
+ for(i=0;i<v.length;i++){
+  c=v.charAt(i);
+  if(q){if(c==='\\')i++;else if(c===q)q='';continue;}
+  if(c==='"'||c==="'")q=c;
+  else if(c==='\\')i++;
+  else if(c==='(')stack.push(')');
+  else if(c==='[')stack.push(']');
+  else if(c==='{')stack.push('}');
+  else if(c===')'||c===']'||c==='}'){
+   if(!stack.length||stack[stack.length-1]!==c)return null;
+   stack.pop();}}
+ if(!q&&!stack.length)return v;
+ if(q)v+=q;
+ for(k=stack.length-1;k>=0;k--)v+=stack[k];
+ return v;}
 function parseDecl(t){var out=[];
- String(t||'').split(';').forEach(function(d){
+ splitDecls(String(t||'')).forEach(function(d){
   var i=d.indexOf(':');if(i<0)return;
   var n=d.slice(0,i).trim().toLowerCase(),v=d.slice(i+1).trim(),pr='';
   if(!n||!v)return;
@@ -4752,7 +5532,7 @@ function parseDecl(t){var out=[];
   out.push([n,v,pr]);});
  return out;}
 function serialDecl(list){return list.map(function(d){
- return d[0]+': '+d[1]+(d[2]?' !'+d[2]:'')+';';}).join(' ');}
+ return declText(d);}).join(' ');}
 function CSSStyleDeclaration(el){this._e=el;}
 /* The parsed style attribute of each element, while the attribute still
  * reads the same. Home Assistant's theme sets some 600 variables on one
@@ -4765,7 +5545,8 @@ function styleOf(e){
  var l=parseDecl(s),ix=new Map(),i;
  for(i=0;i<l.length;i++)ix.set(l[i][0],i);
  c={s:s,l:l,ix:ix};STYLE_PARSED.set(e,c);return c;}
-function declText(d){return d[0]+': '+d[1]+(d[2]?' !'+d[2]:'')+';';}
+function declText(d){var v=closeValue(d[1]);
+ return d[0]+': '+(v===null?d[1]:v)+(d[2]?' !'+d[2]:'')+';';}
 CSSStyleDeclaration.prototype._d=function(){
  return this._e?styleOf(this._e).l:(this._own||(this._own=[]));};
 CSSStyleDeclaration.prototype._w=function(list){
@@ -4783,6 +5564,7 @@ CSSStyleDeclaration.prototype.setProperty=function(n,v,pr){
  n=cssName(n);
  if(v===''||v===null||v===undefined)return this.removeProperty(n);
  var d=[n,String(v),pr||''];
+ if(closeValue(d[1])===null)return;
  if(!this._e){
   var own=this._d(),i;
   for(i=0;i<own.length;i++)if(own[i][0]===n){own[i]=d;return;}
@@ -5083,7 +5865,8 @@ W.CSSMediaRule=CSSMediaRule;W.CSSSupportsRule=CSSSupportsRule;W.CSSKeyframesRule
 W.CSSFontFaceRule=CSSFontFaceRule;W.CSSImportRule=CSSImportRule;W.MediaList=MediaList;
 W.CSSStyleSheet=CSSStyleSheet;W.StyleSheet=CSSStyleSheet;
 W.CSSRuleList=W.CSSRuleList||function CSSRuleList(){};
-function inDoc(n){while(n&&n.parentNode)n=n.parentNode;return n===D;}
+/* connected, in the document's own tree or a shadow tree in it */
+function inDoc(n){for(;n;n=n.parentNode||shadowHost(n))if(n===D)return true;return false;}
 Object.defineProperty(D,'styleSheets',{configurable:true,get:function(){
  var l=D.querySelectorAll('style,link[rel~="stylesheet"]').map(elementSheet);
  l.item=function(i){return this[i]||null;};
@@ -5101,7 +5884,9 @@ function adoptWrite(target){
  var list=adoptedOf.get(target)||[],text=list.map(function(s){return s._text();}).join('\n');
  var el=adoptEl.get(target);
  if(target===D){
-  if(!el){el=D.createElement('style');adoptEl.set(target,el);}
+  /* marked so the engine keeps it in the cascade though it is not
+     in the document, as no other <style> out of it is */
+  if(!el){el=D.createElement('style');el.setAttribute('data-adopted','document');adoptEl.set(target,el);}
   if(W.__vitaSetSheetText)try{W.__vitaSetSheetText(el,text);}catch(e){}
  }else{
   if(!el){el=D.createElement('style');el.setAttribute('data-adopted','');adoptEl.set(target,el);}
@@ -5200,13 +5985,17 @@ function eventClass(name,fields,base){
  for(k in fields)all[k]=fields[k];
  var C=function(type,init){
   init=(init===undefined||init===null)?{}:init;
+  ownTrust(this);
   this.type=String(type);
-  this.bubbles=!!init.bubbles;this.cancelable=!!init.cancelable;this.composed=!!init.composed;
+  this.bubbles=!!init.bubbles;this.cancelable=!!init.cancelable;
+  Object.defineProperty(this,'__vsComposed',{configurable:true,value:!!init.composed});
   this.defaultPrevented=false;this.target=init.target||null;this.currentTarget=null;
   Object.keys(all).forEach(function(kk){
    this[kk]=init[kk]!==undefined?init[kk]:all[kk];},this);};
  C.prototype=Object.create((base||Event).prototype);
  C.prototype.constructor=C;
+ /* what Object.prototype.toString calls it, as a browser's are named */
+ Object.defineProperty(C.prototype,Symbol.toStringTag,{configurable:true,value:name});
  C.__vitaFields=all;
  EVENT_FIELDS[name]=all;
  W[name]=C;
@@ -5428,6 +6217,9 @@ if(typeof __vitaSelectorNative==='function'){
  P.querySelectorAll=__vitaSelectorNative(2,P.querySelectorAll);
  P.closest=__vitaSelectorNative(3,P.closest);}
 function docById(root,id){
+ /* in C where it can be: a walk in script read childNodes at every
+    element (VitaSurf) */
+ if(typeof __vitaFindById==='function')return __vitaFindById(root,String(id));
  var want=String(id),found=null;
  (function walk(n){
   var c=n.childNodes,i;
@@ -5486,7 +6278,24 @@ D.cloneNode=function(deep){return cloneDocument(D,!!deep);};
 (function(){var c=P.cloneNode;
  P.cloneNode=function(deep){
   if(isDoc(this))return cloneDocument(this,!!deep);
-  return c.apply(this,arguments);};})();
+  var k=c.apply(this,arguments);
+  if(k&&this.nodeType===1)cloneShadows(this,k,!!deep);
+  return k;};
+ /* a shadow root made clonable goes with its host, and so do those of
+    the hosts a deep clone copies */
+ function cloneShadows(a,b,deep){
+  var r=SH_ROOT(a),i,nr,x,y;
+  if(r&&r.__vsInit&&r.__vsInit.clonable&&!SH_ROOT(b)){
+   i=r.__vsInit;
+   try{
+    nr=b.attachShadow({mode:SH_HOST(r,true)?'closed':'open',
+     delegatesFocus:i.delegatesFocus,slotAssignment:i.slotAssignment,
+     clonable:true,serializable:i.serializable});
+    for(x=r.firstChild;x;x=x.nextSibling)nr.appendChild(x.cloneNode(true));}
+   catch(e){}}
+  if(!deep)return;
+  for(x=a.firstChild,y=b.firstChild;x&&y;x=x.nextSibling,y=y.nextSibling)
+   if(x.nodeType===1)cloneShadows(x,y,true);}})();
 /* Each document has its own implementation: what it creates belongs to
    it, and the tests check exactly that. */
 Object.defineProperty(P,'implementation',{configurable:true,
@@ -5625,10 +6434,10 @@ P.deleteCell=function(i){var c=this.cells||[];if(c[i])c[i].remove();};
  * default style keys off. */
 P.show=function(){this.setAttribute('open','');};
 P.showModal=function(){this.setAttribute('open','');
- this.dispatchEvent(new Event('beforetoggle'));};
+ this.dispatchEvent(uaEvent(new Event('beforetoggle')));};
 P.close=function(v){if(v!==undefined)this.returnValue=String(v);
- this.removeAttribute('open');this.dispatchEvent(new Event('close'));};
-P.requestClose=function(v){if(this.dispatchEvent(new Event('cancel',{cancelable:true})))this.close(v);};
+ this.removeAttribute('open');this.dispatchEvent(uaEvent(new Event('close')));};
+P.requestClose=function(v){if(this.dispatchEvent(uaEvent(new Event('cancel',{cancelable:true}))))this.close(v);};
 Object.defineProperty(P,'returnValue',{configurable:true,
  get:function(){return this.__returnValue||'';},set:function(v){this.__returnValue=String(v);}});
 Object.defineProperty(P,'closedBy',{configurable:true,
@@ -5636,14 +6445,34 @@ Object.defineProperty(P,'closedBy',{configurable:true,
  set:function(v){this.setAttribute('closedby',String(v));}});
 /* A slot with no shadow tree shows whatever was assigned to it in the
  * light DOM, which here is the host's children with a matching slot. */
-P.assignedNodes=function(){
- if(this.tagName!=='SLOT')return [];
- var name=this.name||'',host=this.parentNode;
+function slotAssigned(slot){
+ var name=slot.getAttribute('name')||'',root=slot.getRootNode(),
+  host=shadowHost(root),first;
  if(!host)return [];
+ if(W.__vsManualRoot&&W.__vsManualRoot(root))
+  return (slot.__vsManual||[]).filter(function(n){
+   return n.parentNode===host&&W.__vsManualSlot(n,root)===slot;});
+ /* only the first slot of a name takes what has that name */
+ first=root.querySelectorAll('slot').filter(function(s){
+  return (s.getAttribute('name')||'')===name;})[0];
+ if(first!==slot)return [];
  return host.childNodes.filter(function(n){
-  return n.nodeType!==1?name==='':(n.getAttribute('slot')||'')===name;});};
-P.assignedElements=function(){return this.assignedNodes().filter(function(n){return n.nodeType===1;});};
-P.assign=function(){};
+  if(n.nodeType===3)return name==='';
+  return n.nodeType===1&&(n.getAttribute('slot')||'')===name;});}
+/* {flatten: true}: a slot with nothing assigned gives its own children,
+   and a slot among what is given gives what it is given in turn */
+function slotFlat(slot,out){
+ var l=slotAssigned(slot),i,n;
+ if(!l.length)l=slot.childNodes.filter(function(c){return c.nodeType===1||c.nodeType===3;});
+ for(i=0;i<l.length;i++){
+  n=l[i];
+  if(n.nodeType===1&&n.tagName==='SLOT'&&shadowHost(n.getRootNode()))slotFlat(n,out);
+  else out.push(n);}
+ return out;}
+P.assignedNodes=function(o){
+ if(this.tagName!=='SLOT')return [];
+ return o&&o.flatten?slotFlat(this,[]):slotAssigned(this);};
+P.assignedElements=function(o){return this.assignedNodes(o).filter(function(n){return n.nodeType===1;});};
 /* Media elements. There is no decoder here, so a play resolves and the
  * element reports that it ended: code that waits on a promise or on the
  * ended event keeps going rather than hanging on a video that never
@@ -5677,9 +6506,9 @@ P.assign=function(){};
  P.load=function(){this.__ended=false;this.__paused=true;};
  P.play=function(){var self=this;self.__paused=false;
   setTimeout(function(){self.__paused=true;self.__ended=true;
-   self.dispatchEvent(new Event('ended'));},0);
+   self.dispatchEvent(uaEvent(new Event('ended')));},0);
   return Promise.reject(new Error('NotSupportedError: no media decoder'));};
- P.pause=function(){this.__paused=true;this.dispatchEvent(new Event('pause'));};
+ P.pause=function(){this.__paused=true;this.dispatchEvent(uaEvent(new Event('pause')));};
  P.fastSeek=function(t){this.currentTime=t;};
  P.canPlayType=function(){return '';};
  P.getStartDate=function(){return new Date(NaN);};
@@ -5692,7 +6521,9 @@ P.assign=function(){};
 })();
 
 /* --- the shadow root, the template and the observers -------------------- */
-Object.defineProperty(P,'mode',{configurable:true,get:function(){return this.__shadow?'open':undefined;}});
+Object.defineProperty(P,'mode',{configurable:true,get:function(){
+ if(!shadowHost(this))return undefined;
+ return SH_HOST(this,true)?'closed':'open';}});
 /* --- focus ---------------------------------------------------------------
  * focus() did nothing and activeElement was always the body. A login page
  * that focuses its first field, a component that focuses its input when
@@ -5700,6 +6531,30 @@ Object.defineProperty(P,'mode',{configurable:true,get:function(){return this.__s
  * The element with focus is kept here; a text field gets the caret as
  * well, which on the Vita opens the keyboard when a tap led to it. */
 var focused=null;
+/* the DOM standard's retargeting: a, or the host of the shadow tree it
+   is in, outwards until b is in the same tree or one inside it */
+function treeRoot(n){while(n&&n.parentNode)n=n.parentNode;return n;}
+function retarget(a,b){
+ var r,x;
+ for(;;){
+  r=treeRoot(a);
+  if(!r||r.nodeType!==11||!shadowHost(r))return a;
+  for(x=b;x;x=x.parentNode||shadowHost(x))if(x===r)return a;
+  a=shadowHost(r);}}
+/* the first focusable element in a shadow tree, trees inside it too */
+function firstFocusable(root){
+ var w=[root],n,c,r;
+ while(w.length){
+  n=w.shift();
+  for(c=n.firstElementChild;c;c=c.nextElementSibling){
+   if(focusable(c))return c;
+   r=SH_ROOT(c);
+   if(r)w.push(r);
+   w.push(c);}}
+ return null;}
+function delegates(el){
+ var r=el&&el.nodeType===1&&SH_ROOT(el);
+ return !!(r&&r.__vsInit&&r.__vsInit.delegatesFocus);}
 function focusable(el){
  if(!el||el.nodeType!==1||el.disabled)return false;
  var t=el.tagName;
@@ -5710,7 +6565,7 @@ function focusable(el){
  var ce=el.getAttribute('contenteditable');
  return ce!==null&&ce!=='false';}
 function focusEvent(el,type,bubbles,related){
- var e=new Event(type,{bubbles:bubbles,cancelable:false,composed:true});
+ var e=uaEvent(new Event(type,{bubbles:bubbles,cancelable:false,composed:true}));
  try{e.relatedTarget=related||null;}catch(x){}
  try{el.dispatchEvent(e);}catch(x){}}
 function moveFocus(el,caret){
@@ -5725,23 +6580,49 @@ function moveFocus(el,caret){
   if(caret&&W.__vitaFocusControl&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'))
    try{W.__vitaFocusControl(el);}catch(x){}
   focusEvent(el,'focus',false,prev);focusEvent(el,'focusin',true,prev);}}
-P.focus=function(){if(focusable(this)&&ceInDoc(this))moveFocus(this,true);};
+P.focus=function(){
+ var el=this;
+ /* a host whose tree takes focus for it */
+ if(delegates(el)){
+  if(focused&&ceInDoc(focused)&&retarget(focused,el)===el&&focused!==el)return;
+  el=firstFocusable(SH_ROOT(el));
+  if(!el)return;}
+ if(focusable(el)&&ceInDoc(el))moveFocus(el,true);};
 P.blur=function(){if(focused===this)moveFocus(null,false);};
-function activeEl(){return focused&&ceInDoc(focused)?focused:D.body;}
+/* what has focus as the document sees it: the host of the shadow tree
+   it is in, and that host's host, out to the document's own tree */
+function activeEl(){return focused&&ceInDoc(focused)?retarget(focused,D):D.body;}
 Object.defineProperty(D,'activeElement',{configurable:true,get:activeEl});
 Object.defineProperty(P,'activeElement',{configurable:true,
- get:function(){return isDoc(this)?activeEl():undefined;}});
-/* a tap on a control focuses it too */
+ get:function(){
+  if(isDoc(this))return activeEl();
+  if(this.nodeType!==11||!shadowHost(this))return undefined;
+  if(!focused||!ceInDoc(focused))return null;
+  var c=retarget(focused,this);
+  return treeRoot(c)===this?c:null;}});
+/* a tap on a control focuses it too, one inside a shadow tree as well:
+   the path starts from what was tapped, not from its host */
 W.addEventListener('click',function(e){
- var t=e&&e.target,n=t;
- while(n&&n.nodeType===1&&!focusable(n))n=n.parentNode;
+ var p=e&&e.composedPath?e.composedPath():[],n=p.length?p[0]:e&&e.target;
+ while(n&&!(n.nodeType===1&&(focusable(n)||delegates(n))))
+  n=n.parentNode||shadowHost(n);
+ if(n&&n.nodeType===1&&delegates(n)&&!focusable(n)){
+  n.focus();return;}
  if(n&&n.nodeType===1&&focused!==n)moveFocus(n,false);},true);
-Object.defineProperty(P,'delegatesFocus',{configurable:true,get:function(){return false;}});
-Object.defineProperty(P,'slotAssignment',{configurable:true,get:function(){return 'named';}});
-Object.defineProperty(P,'clonable',{configurable:true,get:function(){return false;}});
-Object.defineProperty(P,'serializable',{configurable:true,get:function(){return false;}});
+/* what a shadow root was made with */
+['delegatesFocus','slotAssignment','clonable','serializable'].forEach(function(k){
+ Object.defineProperty(P,k,{configurable:true,get:function(){
+  if(this.nodeType!==11||!shadowHost(this))return undefined;
+  var i=this.__vsInit;
+  return i?i[k]:(k==='slotAssignment'?'named':false);}});});
+/* a shadow root's own sheets: its <style> and stylesheet <link>
+   elements, in tree order */
 Object.defineProperty(P,'styleSheets',{configurable:true,get:function(){
- var l=[];l.item=function(i){return this[i]||null;};return l;}});
+ var l=[],e,i,sh;
+ if(this.nodeType===11&&shadowHost(this)){
+  e=this.querySelectorAll('style:not([data-adopted]),link[rel~="stylesheet"]');
+  for(i=0;i<e.length;i++){sh=e[i].sheet;if(sh)l.push(sh);}}
+ l.item=function(i){return this[i]||null;};return l;}});
 Object.defineProperty(P,'adoptedStyleSheets',adoptedAccessor());
 reflectString([['shadowRootMode','shadowrootmode'],['shadowRootSlotAssignment','shadowrootslotassignment']]);
 reflectBool([['shadowRootDelegatesFocus','shadowrootdelegatesfocus'],
@@ -5758,7 +6639,18 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
    between them cover every reason an element's visibility can change
    without a poll running all the time. */
 (function(){
- var observers=[],timer=null,lastScroll='',lastGen=-1;
+ var observers=[],timer=null,lastScroll='',lastGen=-1,lastLayout=-1;
+ /* whether layout has caught up with the document, and its pass count:
+    the observer reports after layout, as a browser does in its
+    rendering update, and not from the layout before a change (VitaSurf).
+    It reported a new target as zero sized and out of view, from before
+    its first layout, and again once laid out. */
+ var LS=W.__vitaLayoutState;
+ try{delete W.__vitaLayoutState;}catch(e){}
+ function layoutState(){try{return LS?LS():[false,0];}catch(e){return [false,0];}}
+ /* how long a first report waits for layout: a page whose rebuild waits
+    for its loading to finish still hears, from the layout it has */
+ var FIRST_WAIT_MS=2000;
 
  function parseMargin(m){
   /* one to four lengths, as the CSS margin shorthand is written; a
@@ -5776,12 +6668,14 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
  function rootRect(o){
   var s=viewport();
   if(o.root&&o.root.nodeType===1){
-   var b=__vitaBox(o.root);
+   var b=__vitaBox(o.root,true);
    if(b)return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
   return {left:0,top:0,width:s[2],height:s[3]};}
 
  function rectOf(el){
-  var b=__vitaBox(el);
+  /* the layout as it is: the observer is told after layout, never
+     the cause of one */
+  var b=__vitaBox(el,true);
   if(!b)return null;
   var s=viewport();
   return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
@@ -5800,7 +6694,11 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   var bounds={left:rl,top:rt,width:rr-rl,height:rb-rt};
 
   for(i=0;i<o.__targets.length;i++){
-   var t=o.__targets[i],r=rectOf(t.el);
+   var t=o.__targets[i],r=rectOf(t.el),rb_=box(bounds);
+   /* not in the document: no root to be in, as in Chrome; not
+      rendered: an empty one */
+   if(!t.el.isConnected)rb_=null;
+   else if(!r)rb_=box({left:0,top:0,width:0,height:0});
    if(!r){ r={left:0,top:0,width:0,height:0}; }
    var ix=Math.max(r.left,rl),iy=Math.max(r.top,rt);
    var ax=Math.min(r.left+r.width,rr),ay=Math.min(r.top+r.height,rb);
@@ -5817,7 +6715,7 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
    t.step=step;t.hit=hit;
    records.push({target:t.el,time:(W.performance&&performance.now)?
      performance.now():Date.now(),
-    rootBounds:box(bounds),boundingClientRect:box(r),
+    rootBounds:rb_,boundingClientRect:box(r),
     intersectionRect:box({left:hit?ix:0,top:hit?iy:0,
      width:iw,height:ih}),
     intersectionRatio:ratio,isIntersecting:hit});}
@@ -5839,9 +6737,12 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
 
   for(i=0;i<observers.length;i++)live+=observers[i].__targets.length;
   if(live===0){ if(timer!==null){clearInterval(timer);timer=null;} return; }
+  /* a change still to be laid out is looked at once it has been */
+  var ls=layoutState();
+  if(ls[0])return;
   /* nothing that could move anything has happened */
-  if(key===lastScroll&&g===lastGen)return;
-  lastScroll=key;lastGen=g;
+  if(key===lastScroll&&g===lastGen&&ls[1]===lastLayout)return;
+  lastScroll=key;lastGen=g;lastLayout=ls[1];
   checkAll(false);}
 
  function wake(){
@@ -5876,8 +6777,12 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   /* the specification delivers a first record for a new target without
      waiting for anything to move, and a page that builds its list from
      that first call depends on it */
-  var self=this;
-  setTimeout(function(){ check(self,false); },0);};
+  var self=this,t0=Date.now();
+  function first(){
+   if(layoutState()[0]&&Date.now()-t0<FIRST_WAIT_MS){
+    setTimeout(first,50);return;}
+   check(self,false);}
+  setTimeout(first,0);};
 
  IntersectionObserver.prototype.unobserve=function(el){
   for(var i=0;i<this.__targets.length;i++){
@@ -6279,6 +7184,20 @@ W.OffscreenCanvas=function(w,h){this.width=w|0;this.height=h|0;
  * with a blob: scheme it cannot handle.
  */
 var blobURLs={},blobSeq=0;
+/* Object URLs are one table for an origin's windows, as a browser keeps
+ * them: one made in a frame of the page's origin -- a blank one among
+ * them -- is fetched or started as a worker by the page, and the other
+ * way round. Each window kept its own, so claude.ai's challenge, which
+ * makes its worker's object URL with one window's URL and starts it with
+ * another's Worker, was told "Failed to load the worker's script". The
+ * table is the topmost same-origin window's. */
+try{Object.defineProperty(W,'__vitaBlobURLs',{value:blobURLs});}catch(e){}
+function blobTable(){
+ var w=W,p,t;
+ try{
+  for(;;){p=w.parent;if(!p||p===w||p.origin!==W.origin)break;w=p;}
+  t=w.__vitaBlobURLs;}catch(e){}
+ return t||blobURLs;}
 /* A blob holds bytes. It used to hold a string, so a blob made from a
    buffer was decoded as text on the way in and re-encoded on the way
    out, which does not survive anything that is not text. */
@@ -6358,15 +7277,20 @@ FileReader.prototype.abort=function(){this.readyState=2;this._fire('abort');};
 W.FileReader=FileReader;
 W.FileReaderSync=function(){};
 W.FileReaderSync.prototype.readAsText=function(b){return b?b._t||'':'';};
-URL.createObjectURL=function(o){var u='blob:'+String(location.href)+'/'+(++blobSeq);
- blobURLs[u]=o;return u;};
-URL.revokeObjectURL=function(u){delete blobURLs[u];};
+/* blob:, the origin and a UUID, as a browser makes it: the page's whole
+   address with a counter was a URL whose origin read as null */
+URL.createObjectURL=function(o){
+ var c=W.crypto,id=c&&typeof c.randomUUID==='function'?c.randomUUID():
+  String(++blobSeq);
+ var u='blob:'+W.origin+'/'+id;
+ blobTable()[u]=o;return u;};
+URL.revokeObjectURL=function(u){delete blobTable()[String(u)];};
 /* A module imported from an object URL or a data: URL has nothing to
    fetch: qjs.c asks here for its text, or null if there is none. */
 W.__vitaLocalModule=function(u){
  u=String(u);
  if(u.indexOf('blob:')===0){
-  var b=blobURLs[u];
+  var b=blobTable()[u];
   return b===undefined?null:(b._t!==undefined?b._t:String(b));}
  var m=/^data:([^,]*),/i.exec(u);
  if(!m)return null;
@@ -6427,12 +7351,8 @@ P.stop=function(){};
  * has no getElementById at all: code tells a document from an element
  * by asking whether it has one. */
 P.getElementById=function(id){
- if(this.nodeType===9)return docById(this,id);
- /* a shadow root is its host here, and Home Assistant's dashboard
-    finds its view with this.shadowRoot.getElementById("view") */
- if(this.nodeType===1)return this.__shadow?docById(this,id):null;
- if(this.nodeType!==11)return null;
- return docById(this,id);};
+ if(this.nodeType===9||this.nodeType===11)return docById(this,id);
+ return null;};
 
 /* --- the interfaces a feature-patching loop reads ----------------------- */
 W.XMLSerializer=function(){};
@@ -6519,7 +7439,7 @@ W.CSS.supports=function(a,b){
  W.fetch=function(input,init){
   var u=String((input&&input.url)||input||'');
   if(u.indexOf('blob:')===0){
-   var b=blobURLs[u];
+   var b=blobTable()[u];
    if(b===undefined)return Promise.reject(new TypeError('Failed to fetch'));
    return Promise.resolve(new Response(b._t!==undefined?b._t:String(b),
     {status:200,statusText:'OK',url:u}));}
@@ -6931,7 +7851,21 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
   attrList(n).forEach(function(a){s+=' '+a.name+'="'+escAttr(a.value)+'"';});
   s+='>';
   if(VOID.indexOf(' '+tag+' ')>=0)return s;
-  return s+inner(n)+'</'+tag+'>';}
+  return s+shadowPart(n)+inner(n)+'</'+tag+'>';}
+ /* getHTML's options: a shadow root it may write out, as the
+    declarative <template> that would make it again */
+ var shOpt=null;
+ function shadowPart(n){
+  var r=shOpt&&SH_ROOT(n),i,s;
+  if(!r)return '';
+  i=r.__vsInit||{};
+  if(!((shOpt.serializableShadowRoots&&i.serializable)||
+     (shOpt.shadowRoots&&[].indexOf.call(shOpt.shadowRoots,r)>=0)))return '';
+  s='<template shadowrootmode="'+(SH_HOST(r,true)?'closed':'open')+'"';
+  if(i.delegatesFocus)s+=' shadowrootdelegatesfocus=""';
+  if(i.serializable)s+=' shadowrootserializable=""';
+  if(i.clonable)s+=' shadowrootclonable=""';
+  return s+'>'+inner(r)+'</template>';}
  /* A template's innerHTML is its content's, not its own: the children
   * were moved into the content fragment, so serialising the element
   * gave the empty string and assigning to it left the content alone. */
@@ -6961,7 +7895,12 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
    var f=parseInContext(p,h===null?'':String(h));
    p.insertBefore(f,this);
    p.removeChild(this);}});
- P.getHTML=function(){return this.innerHTML;};
+ P.getHTML=function(o){
+  if(!o||(!o.serializableShadowRoots&&!(o.shadowRoots&&o.shadowRoots.length)))
+   return this.innerHTML;
+  var prev=shOpt;shOpt=o;
+  try{return (this.nodeType===1?shadowPart(this):'')+inner(isTemplate(this)?this.content:this);}
+  finally{shOpt=prev;}};
  W.XMLSerializer.prototype.serializeToString=function(n){
   return n&&n.nodeType!==undefined?ser(n):String(n);};
 })();
@@ -7124,13 +8063,44 @@ function describeThrown(v){
    out=(name&&msg)?name+': '+msg:(name||msg);
    if(!out){try{out=JSON.stringify(v).slice(0,200);}catch(e){out=String(v);}}
    if(v.stack){
-    /* the first frames: one alone often names only a helper */
-    var fr=String(v.stack).split('\n').slice(1,5).filter(function(f){return f.trim();});
-    if(fr.length)out+=' | '+fr.map(function(f){return f.replace(/^\s+/,'').slice(0,160);}).join(' | ');}
+    /* the first frames: one alone often names only a helper. A stack
+       QuickJS made has no "Name: message" line ahead of them, and
+       skipping one there lost the frame that threw. */
+    var fr=String(v.stack).split('\n');
+    if(fr.length&&!/^\s*at /.test(fr[0]))fr=fr.slice(1);
+    fr=fr.filter(function(f){return f.trim();});
+    /* and past the prelude's own frames to the page's: a DOM call that
+       threw is three frames of the prelude before the code that made it */
+    var shown=fr.slice(0,3),page=0,i;
+    for(i=3;i<fr.length&&page<4;i++)
+     if(!/<prelude>|\(native\)/.test(fr[i])){shown.push(fr[i]);page++;}
+    if(shown.length)out+=' | '+shown.map(function(f){return f.replace(/^\s+/,'').slice(0,160);}).join(' | ');}
    return out;}
   return String(v);
  }catch(e2){return '(unprintable)';}
 }
+/* kept here and not left on window, where no browser has it */
+var SRC_EXCERPT=null;
+try{SRC_EXCERPT=W.__vitaSourceExcerpt||null;delete W.__vitaSourceExcerpt;}catch(e){}
+/* The properties a page read on window, navigator, document, screen,
+   location, history and performance that are not here (VitaSurf): an
+   uncaught error's report lists the last of them, which is how a log
+   says what a page wanted that this browser lacks. */
+var MISSES=null;
+try{
+ MISSES=W.__vitaMisses||null;
+ (function(watch){
+  if(!watch)return;
+  try{watch(W,'window');}catch(e){}
+  try{watch(W.navigator,'navigator');}catch(e){}
+  try{watch(W.document,'document');}catch(e){}
+  try{watch(W.screen,'screen');}catch(e){}
+  try{watch(W.location,'location');}catch(e){}
+  try{watch(W.history,'history');}catch(e){}
+  try{watch(W.performance,'performance');}catch(e){}
+ })(W.__vitaWatchMisses);
+ delete W.__vitaMisses;delete W.__vitaWatchMisses;
+}catch(e){}
 W.__vitaReportError=function(err,where){
  var msg='';
  try{msg=(err&&err.message)?String(err.message):String(err);}catch(e){msg='Script error.';}
@@ -7146,6 +8116,7 @@ W.__vitaReportError=function(err,where){
   colno:col,error:err,bubbles:false,cancelable:true});}
  catch(e3){ev={type:'error',message:msg,filename:file,lineno:line,colno:col,
   error:err,defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
+ uaEvent(ev);
  var handled=false;
  try{
   if(typeof W.onerror==='function'){
@@ -7163,8 +8134,20 @@ W.__vitaReportError=function(err,where){
   try{var w=where?String(where):'';
    if(w&&w.indexOf('://')<0&&w.charAt(0)!=='/'&&w!==String(location.href))from=w;
   }catch(e7){}
+  /* the code the position points into (VitaSurf), for an error from a
+     timer or a handler, whose stack alone names only minified frames */
+  var near='';
+  try{if(line&&SRC_EXCERPT)near=SRC_EXCERPT(file,line,col);}catch(e8){}
   try{console.error('uncaught'+(from?' in '+from:'')+': '+describeThrown(err)+
-   (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}}
+   (file?' ('+file+':'+line+':'+col+')':''));}catch(e6){}
+  /* a line of its own: a log line holds 512 characters, and a long
+     stack of long URLs had already filled the one above */
+  if(near)try{console.error('uncaught, the code at column '+col+': '+near);}catch(e9){}
+  /* and what it looked for before, that was not here */
+  try{var missed=MISSES?String(MISSES()):'';
+   while(missed){
+    console.error('uncaught, read before it and not here: '+missed.slice(0,400));
+    missed=missed.slice(400);}}catch(e10){}}
  return handled;};
 /* An unhandled promise rejection, reported the same way. QuickJS hands
  * these to the tracker qjs.c installs.
@@ -7185,6 +8168,7 @@ function flushRejections(){
    {reason:entry.r,promise:entry.p,cancelable:true});}
   catch(e){ev={type:'unhandledrejection',reason:entry.r,promise:entry.p,
    defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
+  uaEvent(ev);
   try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
   try{__vitaDispatch(null,ev);}catch(e3){}
   /* Say so, as a browser does. A page whose async work fails and whose
@@ -7651,16 +8635,41 @@ function isAncestor(a,n){
  return false;}
 function containsNode(parent,node){return isAncestor(node,parent);}
 var CAN_HAVE_CHILDREN={1:true,9:true,11:true};
+/* What an insertBefore that threw NotFoundError was given, for the log
+   (VitaSurf): which page code makes the call is in the stack, and what
+   the nodes were tells whether it is the page's own mistake or a place
+   where a shadow root being its host here put a node somewhere a
+   browser would not. Tag names and node kinds only. */
+var insertMisses=0;
+function missName(n){
+ if(!n)return 'nothing';
+ var t=n.nodeType===1?'<'+n.tagName+'>':n.nodeType===3?'text':
+  n.nodeType===8?'comment':n.nodeType===11?'fragment':'node '+n.nodeType;
+ if(n.nodeType===1&&SH_ROOT(n))t+=' (a shadow host)';
+ if(n.nodeType===11&&shadowHost(n))t='a shadow root';
+ return t;}
+function insertMiss(parent,node,child){
+ if(++insertMisses>8)return;
+ try{
+  var p=child.parentNode,o=parent.renderOptions,why=[];
+  if(o&&typeof o==='object'&&o.renderBefore===child)why.push('it is the renderBefore of the parent\'s Lit render');
+  console.warn('insertBefore missed: putting '+missName(node)+' into '+
+   missName(parent)+' before '+missName(child)+', which is '+
+   (p?'in '+missName(p):'in nothing')+
+   (child.isConnected===false?' and not in the page':'')+
+   (why.length?'; '+why.join(', '):''));
+ }catch(e){}}
 function preInsert(parent,node,child,fn,replacing){
  needNode(node,fn,1);
  if(!CAN_HAVE_CHILDREN[parent.nodeType])
   throw hierarchy('This node type does not support this method.');
  if(containsNode(parent,node))
   throw hierarchy('The new child element contains the parent.');
- if(child!==null&&child!==undefined&&child.parentNode!==parent)
+ if(child!==null&&child!==undefined&&child.parentNode!==parent){
+  insertMiss(parent,node,child);
   throw new DOMException(
    'The node before which the new node is to be inserted is not a child '+
-   'of this node.','NotFoundError');
+   'of this node.','NotFoundError');}
  if(node.nodeType===3&&parent.nodeType===9)
   throw hierarchy('Nodes of type Text may not be inserted inside a Document.');
  if(node.nodeType===9)
@@ -7737,51 +8746,6 @@ function documentRules(parent,node,child,replacing){
   if(child.parentNode!==this)throw new DOMException(
    'The node to be removed is not a child of this node.','NotFoundError');
   return removeC.call(this,child);};
-})();
-
-/* --- a host's children moved into its own shadow root -------------------
- * A shadow root is its host here (attachShadow above), so moving the
- * host's children into it moved each to the end of the host, and the
- * host's firstChild was never null. card-mod does exactly that for every
- * glance entity on every update, "while (div.firstChild)
- * shadowRoot.append(div.firstChild)", and the loop ran until script
- * memory ran out: seconds per Home Assistant update, and cards left
- * unrendered when it threw (build 557). A child moved so is marked as
- * shadow content, and that host's firstChild, childNodes and
- * hasChildNodes -- its light-DOM view -- pass over the marked ones, as a
- * real host's do. Only hosts this has happened to are changed. */
-(function(){
- var app=P.appendChild,ins=P.insertBefore;
- function getter(name){
-  for(var o=P;o;o=Object.getPrototypeOf(o)){
-   var d=Object.getOwnPropertyDescriptor(o,name);
-   if(d)return d.get||null;}
-  return null;}
- var fcGet=getter('firstChild'),cnGet=getter('childNodes');
- function light(l){
-  var r=[],i;
-  for(i=0;i<l.length;i++)if(!l[i].__vsShadowKid)r.push(l[i]);
-  if(typeof l.item==='function')r.item=function(i){return this[i]||null;};
-  return r;}
- function view(host){
-  if(Object.prototype.hasOwnProperty.call(host,'__vsShadowView'))return;
-  Object.defineProperty(host,'__vsShadowView',{configurable:true,value:true});
-  if(fcGet)Object.defineProperty(host,'firstChild',{configurable:true,
-   get:function(){var n=fcGet.call(this);
-    while(n&&n.__vsShadowKid)n=n.nextSibling;return n||null;}});
-  if(cnGet)Object.defineProperty(host,'childNodes',{configurable:true,
-   get:function(){return light(cnGet.call(this));}});
-  Object.defineProperty(host,'hasChildNodes',{configurable:true,writable:true,
-   value:function(){return this.firstChild!==null;}});}
- function mark(parent,node){
-  if(!node||typeof node!=='object')return;
-  if(parent&&parent.__shadow&&node.parentNode===parent){
-   Object.defineProperty(node,'__vsShadowKid',
-    {configurable:true,writable:true,value:true});
-   view(parent);}
-  else if(node.__vsShadowKid)node.__vsShadowKid=false;}
- P.appendChild=function(node){mark(this,node);return app.apply(this,arguments);};
- P.insertBefore=function(node,child){mark(this,node);return ins.apply(this,arguments);};
 })();
 
 /* --- instanceof, told apart ----------------------------------------------
@@ -7958,7 +8922,7 @@ stampConsts(P);
     n=BY_TAG[this.tagName];
     if(!n)n=HTML_TAGS.indexOf(' '+this.tagName+' ')>=0?'HTMLElement'
                                                       :'HTMLUnknownElement';
-   }else n=BY_TYPE[t];
+   }else n=t===11&&shadowHost(this)?'ShadowRoot':BY_TYPE[t];
    return (n&&W[n])||W.Node;},
   set:function(v){shadowProp(this,'constructor',v);}});
  /* What Object.prototype.toString says a node is (VitaSurf). It said
@@ -8064,6 +9028,11 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   if(W.EventTarget)W.EventTarget.prototype=T;
   if(W.Node)W.Node.prototype=N;
   if(W.Element)W.Element.prototype=E;
+  /* each interface's prototype names it, as a browser's does; a node
+     still answers its own through P's constructor getter */
+  [[T,W.EventTarget],[N,W.Node],[E,W.Element]].forEach(function(p){
+   if(p[1])Object.defineProperty(p[0],'constructor',{configurable:true,
+    writable:true,value:p[1]});});
   if(W.CharacterData)W.CharacterData.prototype=N;
  }catch(e){}
 })();
@@ -8101,6 +9070,37 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   get:function(){
    return liveCollection(function(){return listOf(dkids.get.call(D));},
     null,true);}});
+})();
+
+/* The document's interfaces in a browser's order (VitaSurf). The page's
+ * document carried every one of its methods and accessors itself, over
+ * an empty HTMLDocument.prototype that Document.prototype was the same
+ * object as, with no Node or EventTarget in the chain. So
+ * Document.prototype.querySelector was undefined where a browser has a
+ * function, and claude.ai's Cloudflare check, which reads it and hands
+ * it to new Proxy, stopped on "Cannot create proxy with a non-object as
+ * target". The chain is now document > HTMLDocument.prototype >
+ * Document.prototype > Node.prototype > EventTarget.prototype, and what
+ * the document had of its own is on Document.prototype, except location,
+ * which a browser keeps on the document. State the prelude keeps on the
+ * document, which cannot be reconfigured, stays where it is. */
+(function(){
+ var HD=Object.getPrototypeOf(D),N=W.Node&&W.Node.prototype;
+ if(!N||!W.Document||HD===Object.prototype)return;
+ var DP=Object.create(N);
+ Object.defineProperty(DP,'constructor',{configurable:true,writable:true,
+  value:W.Document});
+ Object.defineProperty(DP,Symbol.toStringTag,{configurable:true,
+  value:'Document'});
+ Object.defineProperty(HD,Symbol.toStringTag,{configurable:true,
+  value:'HTMLDocument'});
+ Reflect.ownKeys(D).forEach(function(k){
+  if(k==='location')return;
+  var d=Object.getOwnPropertyDescriptor(D,k);
+  if(!d||!d.configurable)return;
+  try{Object.defineProperty(DP,k,d);delete D[k];}catch(e){}});
+ Object.setPrototypeOf(HD,DP);
+ W.Document.prototype=DP;
 })();
 
 /* --- dedicated workers (VitaSurf) --------------------------------------
@@ -8180,7 +9180,7 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    st.g=null;st.port=null;
    setTimeout(function(){
     if(st.dead)return;
-    var ev=new ErrorEvent('error',{message:message,filename:abs,cancelable:true});
+    var ev=uaEvent(new ErrorEvent('error',{message:message,filename:abs,cancelable:true}));
     if(me.dispatchEvent(ev))console.error('Worker '+abs+': '+message);},0);}
   try{g=NW?NW():null;}catch(e){g=null;}
   if(!g||typeof g.__vitaBecomeWorker!=='function'){
@@ -8192,19 +9192,19 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
     var d;
     try{d=W.structuredClone(data);}
     catch(e){setTimeout(function(){if(!st.dead)
-     me.dispatchEvent(new MessageEvent('messageerror',{}));},0);return;}
+     me.dispatchEvent(uaEvent(new MessageEvent('messageerror',{})));},0);return;}
     setTimeout(function(){if(!st.dead)
-     me.dispatchEvent(new MessageEvent('message',{data:d}));},0);},
+     me.dispatchEvent(uaEvent(new MessageEvent('message',{data:d})));},0);},
    error:function(f){
     setTimeout(function(){
      if(st.dead)return;
-     var ev=new ErrorEvent('error',{message:f.message,filename:f.filename,
-      lineno:f.lineno,colno:f.colno,cancelable:true});
+     var ev=uaEvent(new ErrorEvent('error',{message:f.message,filename:f.filename,
+      lineno:f.lineno,colno:f.colno,cancelable:true}));
      if(me.dispatchEvent(ev))console.error(f.message+' ('+f.filename+':'+
       f.lineno+')');},0);},
    close:function(){me.terminate();},
    blobText:function(u){
-    var b=blobURLs[u];
+    var b=blobTable()[u];
     return b===undefined?null:(b._t!==undefined?b._t:String(b));}});
   if(type==='module'){st.port.runModule();return;}
   /* fetch does not read files; the fetch importScripts uses does */
@@ -8249,7 +9249,8 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   ['document','window','parent','top','frames','frameElement','opener',
    'localStorage','sessionStorage','alert','confirm','prompt','print','open',
    'history','customElements','Worker','SharedWorker','external','screen',
-   'visualViewport','scrollX','scrollY','innerWidth','innerHeight'
+   'visualViewport','scrollX','scrollY','innerWidth','innerHeight',
+   'outerWidth','outerHeight','pageXOffset','pageYOffset'
   ].forEach(function(k){
    try{delete W[k];}catch(e){}
    if(k in W)try{Object.defineProperty(W,k,{value:undefined,
@@ -8293,8 +9294,8 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    if(reporting){console.error(f.message);return;}
    reporting=true;
    try{
-    ev=new ErrorEvent('error',{message:f.message,filename:f.filename,
-     lineno:f.lineno,colno:f.colno,error:err,cancelable:true});
+    ev=uaEvent(new ErrorEvent('error',{message:f.message,filename:f.filename,
+     lineno:f.lineno,colno:f.colno,error:err,cancelable:true}));
     if(W.dispatchEvent(ev))owner.error(f);}
    finally{reporting=false;}};
   listens(W,function(e){W.__vitaReportError(e);});
@@ -8328,9 +9329,9 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    var d;
    try{d=structuredClone(message);}
    catch(e){setTimeout(function(){
-    W.dispatchEvent(new MessageEvent('messageerror',{}));},0);return;}
+    W.dispatchEvent(uaEvent(new MessageEvent('messageerror',{})));},0);return;}
    setTimeout(function(){
-    if(!closing)W.dispatchEvent(new MessageEvent('message',{data:d}));},0);}
+    if(!closing)W.dispatchEvent(uaEvent(new MessageEvent('message',{data:d})));},0);}
   function begin(){started=true;queue.splice(0).forEach(deliver);}
   return {
    receive:function(message){

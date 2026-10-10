@@ -2,7 +2,8 @@
 <!-- A component that puts the same <style> in every shadow root parses
      it once: later copies are empty while the first is in the document,
      and a copy takes over when the first leaves. The text is scoped to
-     the component's tag, so each kind of component keeps its own copy. -->
+     the component's tag, so each kind of component keeps its own copy;
+     a built-in host such as a <div> is named by a key for the text. -->
 <html><head><title>shadow style once</title></head><body>
 <div id="box"></div>
 <script>
@@ -19,12 +20,14 @@ class TipApp extends HTMLElement{connectedCallback(){
 customElements.define('tip-app',TipApp);
 var box=document.getElementById('box'),i;
 for(i=0;i<50;i++)box.appendChild(document.createElement('tip-el'));
-function S(tag){return tag+'{display:block;color:rgb(1,2,3)} '+tag+' .tip{width:10px}';}
-function full(tag){var st=document.getElementsByTagName('style'),n=0;
+function S(tag){return tag+':-vita-host{display:block;color:rgb(1,2,3)} '+tag+':-vita-host .tip{width:10px}';}
+/* the <style> elements in the document and in every shadow tree */
+function allStyles(){var out=[];(function w(n){for(var c=n.firstElementChild;c;c=c.nextElementSibling){if(c.localName==='style')out.push(c);if(c.shadowRoot)w(c.shadowRoot);w(c);}})(document);return out;}
+function full(tag){var st=allStyles(),n=0;
  tag=tag||'tip-el';
  for(var k=0;k<st.length;k++)if(st[k].textContent===S(tag))n++;return n;}
 ok("fifty components leave one full copy, scoped to the tag", full()===1);
-ok("the other copies are empty <style> elements", document.getElementsByTagName('style').length===50);
+ok("the other copies are empty <style> elements", allStyles().length===50);
 box.removeChild(box.firstChild);
 box.appendChild(document.createElement('tip-el'));
 ok("with the first gone, a new copy is kept full", full()===1);
@@ -44,9 +47,9 @@ var CSS2=':host{color:rgb(4,5,6)}';
 var lone=document.createElement('div');lone.attachShadow({mode:'open'});
 var ls=lone.shadowRoot.appendChild(document.createElement('style'));
 document.body.appendChild(lone);ls.textContent=CSS2;
-ok("a new text set that way is kept", ls.textContent==='div{color:rgb(4,5,6)}');
+ok("a new text set that way is kept", /^\[data-vs-s~="k\d+"\]:-vita-host\{color:rgb\(4,5,6\)\}$/.test(ls.textContent));
 ls.textContent=CSS2;
-ok("setting the kept copy's own text again keeps it", ls.textContent==='div{color:rgb(4,5,6)}');
+ok("setting the kept copy's own text again keeps it", /^\[data-vs-s~="k\d+"\]:-vita-host\{color:rgb\(4,5,6\)\}$/.test(ls.textContent));
 var m=document.createElement('div');m.attachShadow({mode:'open'});
 var ms=document.createElement('style');ms.setAttribute('media','print');ms.textContent=CSS;m.shadowRoot.appendChild(ms);
 ok("a style with attributes is left alone", ms.textContent===CSS);
@@ -54,12 +57,12 @@ var plain=document.createElement('style');plain.textContent=CSS;document.body.ap
 ok("a style outside any shadow root is untouched", plain.textContent===CSS);
 plain.parentNode.removeChild(plain);
 /* the kept copy leaving: another copy has to take over */
-function keeper(){var st=document.getElementsByTagName('style');
+function keeper(){var st=allStyles();
  for(var k=0;k<st.length;k++)if(st[k].textContent===S('tip-el'))return st[k];return null;}
-var gone=keeper().parentNode;gone.parentNode.removeChild(gone);
+var gone=keeper().getRootNode().host;gone.parentNode.removeChild(gone);
 ok("with the kept copy's component removed, no full copy is left for now", full()===0);
 setTimeout(function(){
- ok("half a second later a parked copy has its text back", full()===1&&keeper().parentNode!==gone);
+ ok("half a second later a parked copy has its text back", full()===1&&keeper().getRootNode().host!==gone);
  /* the kept copy given other text: the old text comes back elsewhere */
  var k2=keeper();k2.textContent=':host{color:rgb(9,9,9)}';
  setTimeout(function(){

@@ -1,0 +1,274 @@
+diff --git a/src/parse/properties/border_width.c b/src/parse/properties/border_width.c
+index b11ca05..9fb28b8 100644
+--- a/src/parse/properties/border_width.c
++++ b/src/parse/properties/border_width.c
+@@ -31,18 +31,31 @@ css_error css__parse_border_width(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		css_style *result)
+ {
+-	int32_t orig_ctx = *ctx;
+-	int prev_ctx;
++	/*
++	 * Each value is parsed by the longhand's own parser, as margin's
++	 * are (VitaSurf), so whatever it takes the shorthand takes too:
++	 * GitHub sets its borders to max(1px, .0625rem), which the old
++	 * unit-specifier loop refused, and every bordered box on the page
++	 * drew with no border. A first pass over a scratch style counts
++	 * the values, then each side is parsed again into the result
++	 * from the value that is its own.
++	 */
++	static const enum css_properties_e side[4] = {
++		CSS_PROP_BORDER_TOP_WIDTH, CSS_PROP_BORDER_RIGHT_WIDTH,
++		CSS_PROP_BORDER_BOTTOM_WIDTH, CSS_PROP_BORDER_LEFT_WIDTH
++	};
++	static const uint8_t pick[5][4] = {
++		{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1},
++		{0, 1, 2, 3}
++	};
++	int32_t orig_ctx = *ctx, end, at[4];
++	uint32_t n = 0, i;
+ 	const css_token *token;
+-	uint16_t side_val[4];
+-	css_fixed side_length[4];
+-	uint32_t side_unit[4];
+-	uint32_t side_count = 0;
+-	bool match;
+-	css_error error;
++	css_style *scratch = NULL;
+ 	enum flag_value flag_value;
++	css_error error;
+ 
+-	/* Firstly, handle inherit */
++	/* Firstly, handle inherit and the other keywords */
+ 	token = parserutils_vector_peek(vector, *ctx);
+ 	if (token == NULL)
+ 		return CSS_INVALID;
+@@ -50,128 +63,56 @@ css_error css__parse_border_width(css_language *c,
+ 	flag_value = get_css_flag_value(c, token);
+ 
+ 	if (flag_value != FLAG_VALUE__NONE) {
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_BORDER_TOP_WIDTH);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_BORDER_RIGHT_WIDTH);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_BORDER_BOTTOM_WIDTH);
+-		if (error != CSS_OK)
+-			return error;
+-
+-		error = css_stylesheet_style_flag_value(result, flag_value,
+-				CSS_PROP_BORDER_LEFT_WIDTH);
+-		if (error == CSS_OK)
+-			parserutils_vector_iterate(vector, ctx);
+-
+-		return error;
++		for (i = 0; i < 4; i++) {
++			error = css_stylesheet_style_flag_value(result,
++					flag_value, side[i]);
++			if (error != CSS_OK)
++				return error;
++		}
++		parserutils_vector_iterate(vector, ctx);
++		return CSS_OK;
+ 	}
+ 
+-	/* Attempt to parse up to 4 widths */
+-	do {
+-		prev_ctx = *ctx;
++	error = css__stylesheet_style_create(c->sheet, &scratch);
++	if (error != CSS_OK)
++		return error;
+ 
+-		if ((token != NULL) && is_css_inherit(c, token)) {
++	/* Count the values, up to four */
++	while (n < 4) {
++		consumeWhitespace(vector, ctx);
++		token = parserutils_vector_peek(vector, *ctx);
++		if (token == NULL || tokenIsChar(token, '!'))
++			break;
++		if (is_css_inherit(c, token)) {
++			css__stylesheet_style_destroy(scratch);
+ 			*ctx = orig_ctx;
+ 			return CSS_INVALID;
+ 		}
+-
+-		if ((token->type == CSS_TOKEN_IDENT) && (lwc_string_caseless_isequal(token->idata, c->strings[THIN], &match) == lwc_error_ok && match)) {
+-			side_val[side_count] =  BORDER_WIDTH_THIN;
+-			parserutils_vector_iterate(vector, ctx);
+-			error = CSS_OK;
+-		} else if ((token->type == CSS_TOKEN_IDENT) && (lwc_string_caseless_isequal(token->idata, c->strings[MEDIUM], &match) == lwc_error_ok && match)) {
+-			side_val[side_count] =  BORDER_WIDTH_MEDIUM;
+-			parserutils_vector_iterate(vector, ctx);
+-			error = CSS_OK;
+-		} else if ((token->type == CSS_TOKEN_IDENT) && (lwc_string_caseless_isequal(token->idata, c->strings[THICK], &match) == lwc_error_ok && match)) {
+-			parserutils_vector_iterate(vector, ctx);
+-			error = CSS_OK;
+-			side_val[side_count] =  BORDER_WIDTH_THICK;
+-		} else {
+-			side_val[side_count] = BORDER_WIDTH_SET;
+-
+-			error = css__parse_unit_specifier(c, vector, ctx, UNIT_PX, &side_length[side_count], &side_unit[side_count]);
+-			if (error == CSS_OK) {
+-				if (side_unit[side_count] == UNIT_PCT ||
+-				    side_unit[side_count] & UNIT_ANGLE ||
+-				    side_unit[side_count] & UNIT_TIME ||
+-				    side_unit[side_count] & UNIT_FREQ) {
+-					*ctx = orig_ctx;
+-					return CSS_INVALID;
+-				}
+-
+-				if (side_length[side_count] < 0) {
+-					*ctx = orig_ctx;
+-					return CSS_INVALID;
+-				}
+-			}
+-		}
+-
+-		if (error == CSS_OK) {
+-			side_count++;
+-
+-			consumeWhitespace(vector, ctx);
+-
+-			token = parserutils_vector_peek(vector, *ctx);
+-		} else {
+-			/* Forcibly cause loop to exit */
+-			token = NULL;
+-		}
+-	} while ((*ctx != prev_ctx) && (token != NULL) && (side_count < 4));
+-
+-
+-#define SIDE_APPEND(OP,NUM)								\
+-	error = css__stylesheet_style_appendOPV(result, (OP), 0, side_val[(NUM)]);	\
+-	if (error != CSS_OK)								\
+-		break;									\
+-	if (side_val[(NUM)] == BORDER_WIDTH_SET) {					\
+-		error = css__stylesheet_style_append(result, side_length[(NUM)]);	\
+-		if (error != CSS_OK)							\
+-			break;								\
+-		error = css__stylesheet_style_append(result, side_unit[(NUM)]);		\
+-		if (error != CSS_OK)							\
+-			break;								\
++		at[n] = *ctx;
++		if (css__parse_border_side_width(c, vector, ctx, scratch,
++				side[0]) != CSS_OK)
++			break;
++		n++;
+ 	}
++	css__stylesheet_style_destroy(scratch);
+ 
+-	switch (side_count) {
+-	case 1:
+-		SIDE_APPEND(CSS_PROP_BORDER_TOP_WIDTH, 0);
+-		SIDE_APPEND(CSS_PROP_BORDER_RIGHT_WIDTH, 0);
+-		SIDE_APPEND(CSS_PROP_BORDER_BOTTOM_WIDTH, 0);
+-		SIDE_APPEND(CSS_PROP_BORDER_LEFT_WIDTH, 0);
+-		break;
+-	case 2:
+-		SIDE_APPEND(CSS_PROP_BORDER_TOP_WIDTH, 0);
+-		SIDE_APPEND(CSS_PROP_BORDER_RIGHT_WIDTH, 1);
+-		SIDE_APPEND(CSS_PROP_BORDER_BOTTOM_WIDTH, 0);
+-		SIDE_APPEND(CSS_PROP_BORDER_LEFT_WIDTH, 1);
+-		break;
+-	case 3:
+-		SIDE_APPEND(CSS_PROP_BORDER_TOP_WIDTH, 0);
+-		SIDE_APPEND(CSS_PROP_BORDER_RIGHT_WIDTH, 1);
+-		SIDE_APPEND(CSS_PROP_BORDER_BOTTOM_WIDTH, 2);
+-		SIDE_APPEND(CSS_PROP_BORDER_LEFT_WIDTH, 1);
+-		break;
+-	case 4:
+-		SIDE_APPEND(CSS_PROP_BORDER_TOP_WIDTH, 0);
+-		SIDE_APPEND(CSS_PROP_BORDER_RIGHT_WIDTH, 1);
+-		SIDE_APPEND(CSS_PROP_BORDER_BOTTOM_WIDTH, 2);
+-		SIDE_APPEND(CSS_PROP_BORDER_LEFT_WIDTH, 3);
+-		break;
+-	default:
+-		error = CSS_INVALID;
+-		break;
++	if (n == 0) {
++		*ctx = orig_ctx;
++		return CSS_INVALID;
+ 	}
++	end = *ctx;
+ 
+-	if (error != CSS_OK)
+-		*ctx = orig_ctx;
++	for (i = 0; i < 4; i++) {
++		*ctx = at[pick[n][i]];
++		error = css__parse_border_side_width(c, vector, ctx, result,
++				side[i]);
++		if (error != CSS_OK) {
++			*ctx = orig_ctx;
++			return error;
++		}
++	}
++	*ctx = end;
+ 
+-	return error;
++	return CSS_OK;
+ }
++
+diff --git a/src/parse/properties/properties.gen b/src/parse/properties/properties.gen
+index 47c8d49..8cddb96 100644
+--- a/src/parse/properties/properties.gen
++++ b/src/parse/properties/properties.gen
+@@ -188,7 +188,7 @@ visibility:CSS_PROP_VISIBILITY IDENT:( INHERIT: INITIAL: REVERT: UNSET: VISIBLE:
+ 
+ volume:CSS_PROP_VOLUME IDENT:( INHERIT: INITIAL: REVERT: UNSET: SILENT:0,VOLUME_SILENT X_SOFT:0,VOLUME_X_SOFT SOFT:0,VOLUME_SOFT MEDIUM:0,VOLUME_MEDIUM LOUD:0,VOLUME_LOUD X_LOUD:0,VOLUME_X_LOUD IDENT:) NUMBER:( false:VOLUME_NUMBER RANGE:num<0||num>F_100 NUMBER:) LENGTH_UNIT:( UNIT_PX:VOLUME_DIMENSION MASK:UNIT_MASK_VOLUME RANGE:<0 LENGTH_UNIT:) CALC:( ANY:VOLUME_CALC CALC:)
+ 
+-white_space:CSS_PROP_WHITE_SPACE IDENT:( INHERIT: INITIAL: REVERT: UNSET: NORMAL:0,WHITE_SPACE_NORMAL PRE:0,WHITE_SPACE_PRE NOWRAP:0,WHITE_SPACE_NOWRAP PRE_WRAP:0,WHITE_SPACE_PRE_WRAP PRE_LINE:0,WHITE_SPACE_PRE_LINE  IDENT:)
++white_space:CSS_PROP_WHITE_SPACE IDENT:( INHERIT: INITIAL: REVERT: UNSET: NORMAL:0,WHITE_SPACE_NORMAL PRE:0,WHITE_SPACE_PRE NOWRAP:0,WHITE_SPACE_NOWRAP PRE_WRAP:0,WHITE_SPACE_PRE_WRAP PRE_LINE:0,WHITE_SPACE_PRE_LINE BREAK_SPACES:0,WHITE_SPACE_PRE_WRAP IDENT:)
+ 
+ widows:CSS_PROP_WIDOWS IDENT:( INHERIT: INITIAL: REVERT: UNSET: IDENT:) NUMBER:( true:WIDOWS_SET RANGE:num<0 NUMBER:) CALC:( NUMBER:WIDOWS_CALC CALC:)
+ 
+@@ -227,7 +227,7 @@ writing_mode:CSS_PROP_WRITING_MODE IDENT:( INHERIT: INITIAL: REVERT: UNSET: HORI
+ word_break:CSS_PROP_WORD_BREAK IDENT:( INHERIT: INITIAL: REVERT: UNSET: NORMAL:0,WORD_BREAK_NORMAL BREAK_ALL:0,WORD_BREAK_BREAK_ALL KEEP_ALL:0,WORD_BREAK_KEEP_ALL BREAK_WORD:0,WORD_BREAK_BREAK_WORD IDENT:)
+ overflow_wrap:CSS_PROP_OVERFLOW_WRAP IDENT:( INHERIT: INITIAL: REVERT: UNSET: NORMAL:0,OVERFLOW_WRAP_NORMAL BREAK_WORD:0,OVERFLOW_WRAP_BREAK_WORD ANYWHERE:0,OVERFLOW_WRAP_ANYWHERE IDENT:)
+ object_fit:CSS_PROP_OBJECT_FIT IDENT:( INHERIT: INITIAL: REVERT: UNSET: LIBCSS_FILL:0,OBJECT_FIT_FILL CONTAIN:0,OBJECT_FIT_CONTAIN COVER:0,OBJECT_FIT_COVER NONE:0,OBJECT_FIT_NONE SCALE_DOWN:0,OBJECT_FIT_SCALE_DOWN IDENT:)
+-pointer_events:CSS_PROP_POINTER_EVENTS IDENT:( INHERIT: INITIAL: REVERT: UNSET: AUTO:0,POINTER_EVENTS_AUTO NONE:0,POINTER_EVENTS_NONE IDENT:)
++pointer_events:CSS_PROP_POINTER_EVENTS IDENT:( INHERIT: INITIAL: REVERT: UNSET: AUTO:0,POINTER_EVENTS_AUTO NONE:0,POINTER_EVENTS_NONE ALL:0,POINTER_EVENTS_AUTO VISIBLE:0,POINTER_EVENTS_AUTO IDENT:)
+ text_overflow:CSS_PROP_TEXT_OVERFLOW IDENT:( INHERIT: INITIAL: REVERT: UNSET: CLIP:0,TEXT_OVERFLOW_CLIP ELLIPSIS:0,TEXT_OVERFLOW_ELLIPSIS IDENT:)
+ box_sizing:CSS_PROP_BOX_SIZING IDENT:( INHERIT: INITIAL: REVERT: UNSET: CONTENT_BOX:0,BOX_SIZING_CONTENT_BOX BORDER_BOX:0,BOX_SIZING_BORDER_BOX IDENT:)
+ 
+diff --git a/test/data/parse2/border.dat b/test/data/parse2/border.dat
+index 787727e..ab89da2 100644
+--- a/test/data/parse2/border.dat
++++ b/test/data/parse2/border.dat
+@@ -1781,3 +1781,32 @@
+ 
+ 
+ 
++
++#data
++* { border-width: max(1px, 2px); }
++#errors
++#expected
++| *
++|  border-top-width: /* -> 0px */ calc(1px 2px max =)
++|  border-right-width: /* -> 0px */ calc(1px 2px max =)
++|  border-bottom-width: /* -> 0px */ calc(1px 2px max =)
++|  border-left-width: /* -> 0px */ calc(1px 2px max =)
++#reset
++
++#data
++* { border-width: thin 2px; }
++#errors
++#expected
++| *
++|  border-top-width: thin
++|  border-right-width: 2px
++|  border-bottom-width: thin
++|  border-left-width: 2px
++#reset
++
++#data
++* { border-width: 1px inherit; }
++#errors
++#expected
++| *
++#reset

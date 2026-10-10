@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!-- element.classList is the same object on every read, as in a browser,
+     and its indices and length follow the class attribute when it is
+     changed from elsewhere (VitaSurf). Before, each read made a fresh
+     list. Expected lines are what Chrome and Firefox print. -->
+<html><head><title>classList identity</title></head><body>
+<div id="d" class="a b"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+var d = document.getElementById('d');
+var cl = d.classList;
+T('same object', cl === d.classList);
+T('length', cl.length + ' ' + cl[0] + ' ' + cl[1]);
+d.setAttribute('class', 'x y z');
+T('after setAttribute', d.classList.length + ' ' + d.classList[2]);
+T('held list sees it', cl.length + ' ' + cl[0]);
+d.className = 'q';
+T('after className', d.classList.length + ' ' + d.classList[0] + ' ' + d.classList[1]);
+cl.add('r');
+T('add through held list', d.getAttribute('class') + ' ' + d.classList.length);
+cl.remove('q');
+T('remove', d.getAttribute('class') + ' ' + d.classList.contains('q'));
+d.removeAttribute('class');
+T('no attribute', d.classList.length + ' ' + d.classList.value);
+T('toggle', d.classList.toggle('t') + ' ' + d.className);
+var e = document.createElement('span');
+T('new element', e.classList.length + ' ' + (e.classList === e.classList));
+T('other element differs', e.classList !== d.classList);
+</script>
+</body></html>

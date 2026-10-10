@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<!-- A card whose hover shows a hidden row and hides a visible one, as
+     Yamtrack's ".hover-tap:hover .parent-hover-tap\:flex" does (VitaSurf).
+     The boxes are built or taken out in place rather than the whole tree
+     rebuilt. With the pointer over the first card: its "shown" row is a
+     flex row of two buttons and its "default" row is gone, and the card
+     below has moved down by the difference. -->
+<html><head><style>
+body { margin: 0; font: 12px sans-serif }
+.card { width: 200px; margin: 4px; padding: 4px; background: #234; color: #fff }
+.shown { display: none; gap: 4px }
+.card:hover .shown { display: flex }
+.card:hover .default { display: none }
+.shown span { width: 40px; height: 16px; background: #69f }
+.default { height: 12px; background: #888 }
+</style></head><body>
+<div class="card" id="a">Card A<div class="default"></div><div class="shown"><span></span><span></span></div></div>
+<div class="card" id="b">Card B<div class="default"></div><div class="shown"><span></span><span></span></div></div>
+</body></html>

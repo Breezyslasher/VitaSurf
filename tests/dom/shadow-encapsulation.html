@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<!-- The cascade keeps each tree's rules to that tree: a page's rules do
+     not style the elements in a shadow tree, though the host and the
+     children the page puts in its slots are the page's; a shadow tree's
+     <style> and <link> sheets style that tree and nothing outside it,
+     nor a shadow tree inside it; ::part() is how the page reaches in;
+     and inheritance still runs from the host into its tree. Expected
+     lines are what Chrome prints. -->
+<html><head><title>shadow encapsulation</title><style>
+span { color: rgb(255, 0, 0); }
+* { letter-spacing: 3px; }
+#h1 em { color: rgb(255, 0, 255); }
+div.host { padding-left: 4px; color: rgb(0, 128, 0); }
+i { margin-left: 7px; }
+x-btn::part(lbl) { color: rgb(0, 0, 255); }
+.lk { margin-top: 13px; }
+</style></head><body>
+<div id="h1" class="host"><i id="light">light</i></div>
+<span id="pagespan">page</span>
+<b id="pageb">page b</b>
+<x-btn id="btn"></x-btn>
+<pre id="out"></pre>
+<script>
+var out = [];
+function t(n, f) { var v; try { v = f(); } catch (e) { v = 'throws ' + e.name; } out.push(n + '=' + v); }
+function cs(e, p) { return getComputedStyle(e)[p]; }
+var h1 = document.getElementById('h1'), r1 = h1.attachShadow({mode: 'open'});
+r1.innerHTML = '<style>em { font-weight: 700; } p { margin-left: 9px; }</style>' +
+  '<link rel="stylesheet" href="shadow-encapsulation.css">' +
+  '<span id="s">s</span><em id="e">e</em><p id="p">p</p><b id="b" class="lk">b</b><slot></slot><div id="inner"></div>';
+var inner = r1.getElementById('inner'), r2 = inner.attachShadow({mode: 'open'});
+r2.innerHTML = '<em id="e2">e2</em><p id="p2">p2</p><b id="b2">b2</b>';
+customElements.define('x-btn', class extends HTMLElement { constructor() { super(); this.attachShadow({mode: 'open'}).innerHTML = '<span part="lbl" id="l">l</span><span id="n">n</span>'; } });
+setTimeout(function () {
+  var S = function (id) { return r1.getElementById(id); }, S2 = function (id) { return r2.getElementById(id); };
+  out.push('[the page into a shadow tree]');
+  t('type rule', function () { return cs(S('s'), 'color'); });
+  t('universal rule', function () { return cs(S('s'), 'letterSpacing'); });
+  t('descendant from the host', function () { return cs(S('e'), 'color'); });
+  t('inherited from the host', function () { return cs(S('p'), 'color'); });
+  t('the host itself', function () { return cs(h1, 'paddingLeft'); });
+  t('a slotted child', function () { return cs(document.getElementById('light'), 'marginLeft'); });
+  t('::part', function () { return cs(document.getElementById('btn').shadowRoot.getElementById('l'), 'color'); });
+  t('not a part', function () { return cs(document.getElementById('btn').shadowRoot.getElementById('n'), 'color'); });
+  out.push('[a shadow tree to itself]');
+  t('its <style>', function () { return cs(S('e'), 'fontWeight') + ' ' + cs(S('p'), 'marginLeft'); });
+  t('its <link>', function () { return cs(S('b'), 'color') + ' ' + cs(S('b'), 'marginLeft'); });
+  t('page rule on a class in it', function () { return cs(S('b'), 'marginTop'); });
+  out.push('[a shadow tree to the page]');
+  t('<style> stays in', function () { return cs(document.querySelector('#pagespan'), 'fontWeight'); });
+  t('<link> stays in', function () { return cs(document.getElementById('pageb'), 'color'); });
+  out.push('[a shadow tree to one inside it]');
+  t('<style>', function () { return cs(S2('e2'), 'fontWeight') + ' ' + cs(S2('p2'), 'marginLeft'); });
+  t('<link>', function () { return cs(S2('b2'), 'color'); });
+  t('the page', function () { return cs(S2('e2'), 'letterSpacing'); });
+  out.forEach(function (l) { console.log('XX ' + l); });
+  document.getElementById('out').textContent = out.join('\n');
+}, 600);
+</script></body></html>

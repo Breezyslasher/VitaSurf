@@ -1,0 +1,215 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 33066ccef..c025691a2 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -2832,7 +2832,11 @@ static bool layout_float(struct box *b, int width, html_content *content)
+ 	       b->type == BOX_FLEX ||
+ 	       b->type == BOX_INLINE_FLEX);
+ 	layout_float_find_dimensions(&content->unit_len_ctx, width, b->style, b);
+-	if (b->type == BOX_TABLE || b->type == BOX_INLINE_FLEX) {
++	/* a floated flex or grid container is laid out as one, not as a
++	 * block (VitaSurf): GitHub's "Less [squares] More" legend floats
++	 * right with d-flex, and its squares came out in a column */
++	if (b->type == BOX_TABLE || b->type == BOX_INLINE_FLEX ||
++			b->type == BOX_FLEX) {
+ 		if (b->type == BOX_TABLE) {
+ 			if (!layout_table(b, width, content))
+ 				return false;
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 5de77c691..dfeb80c9e 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -146,10 +146,34 @@ html_object_done(struct box *box,
+  * reformats almost at once, and one where it costs a sixth of a second
+  * does not spend all its time doing it.
+  */
++/*
++ * How long the view has to have been still before arriving objects lay
++ * the page out again (VitaSurf). Yamtrack's posters arrive as the page
++ * is scrolled, and each batch laid the whole page out again, 176 ms on
++ * the Vita, in the middle of the scroll. Their boxes are drawn with the
++ * pictures meanwhile at the size they were laid out at; the layout
++ * follows once scrolling stops.
++ */
++#define HTML_OBJECT_STILL_MS 300
++
++static bool html_object_view_moving(uint64_t ms_now)
++{
++	return vitasurf_view_moved_ms != 0 &&
++		ms_now - vitasurf_view_moved_ms < HTML_OBJECT_STILL_MS;
++}
++
+ static void html_object_reformat(void *pw)
+ {
+ 	html_content *c = pw;
++	uint64_t ms_now;
+ 
++	nsu_getmonotonic_ms(&ms_now);
++	if (html_object_view_moving(ms_now)) {
++		/* still pending: free_objects cancels it */
++		guit->misc->schedule(HTML_OBJECT_STILL_MS,
++				html_object_reformat, c);
++		return;
++	}
+ 	c->object_reformat_pending = false;
+ 
+ 	if (c->layout == NULL) {
+@@ -606,7 +630,15 @@ html_object_callback(hlcache_handle *object,
+ 		 */
+ 		uint64_t ms_now;
+ 		nsu_getmonotonic_ms(&ms_now);
+-		if (ms_now > c->base.reformat_time) {
++		if (ms_now > c->base.reformat_time &&
++		    html_object_view_moving(ms_now)) {
++			/* not while the page is scrolled (VitaSurf) */
++			if (!c->object_reformat_pending) {
++				c->object_reformat_pending = true;
++				guit->misc->schedule(HTML_OBJECT_STILL_MS,
++						html_object_reformat, c);
++			}
++		} else if (ms_now > c->base.reformat_time) {
+ 			/* The time since the previous reformat is
+ 			 *  more than the configured minimum time
+ 			 *  between reformats so reformat the page to
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 42c66a14b..18c2312d9 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -5003,6 +5003,7 @@ static bool html_composite_object_kept(const struct redraw_context *ctx,
+ 		struct html_composite_object ow = { obj, d };
+ 		struct bitmap *bm = NULL;
+ 		int ox = 0, oy = 0;
++		unsigned int deferred = image_cache_deferred_serial();
+ 
+ 		/* a free place and room for it, the oldest going first */
+ 		while (e == NULL) {
+@@ -5035,6 +5036,21 @@ static bool html_composite_object_kept(const struct redraw_context *ctx,
+ 				&oy) || bm == NULL)
+ 			return false;
+ 		html_shape_apply(bm, ox, oy, s);
++		if (image_cache_deferred_serial() != deferred) {
++			/*
++			 * The image was not decoded yet, and was drawn as
++			 * nothing, to be drawn again once it is: kept, the
++			 * empty picture stood in for it from then on, in the
++			 * strips a scroll drew, and Yamtrack's posters came
++			 * in sections with the card's colour between.
++			 */
++			*ok = ctx->plot->bitmap(ctx, bm, area->x0, area->y0,
++					w, h, 0, BITMAPF_NONE) == NSERROR_OK;
++			if (ctx->plot->flush != NULL)
++				ctx->plot->flush(ctx);
++			guit->bitmap->destroy(bm);
++			return true;
++		}
+ 		e->url = nsurl_ref(url);
+ 		e->src = src;
+ 		e->bm = bm;
+diff --git a/content/handlers/image/image_cache.c b/content/handlers/image/image_cache.c
+index c2d411caf..71e935a7e 100644
+--- a/content/handlers/image/image_cache.c
++++ b/content/handlers/image/image_cache.c
+@@ -1032,6 +1032,14 @@ static unsigned int decode_frame_n;
+ static struct rect deferred[IMAGE_CACHE_DEFERRED_MAX];
+ static const void *deferred_key[IMAGE_CACHE_DEFERRED_MAX];
+ static int deferred_n;
++/* every image drawn as nothing, counted (VitaSurf) */
++static unsigned int deferred_serial;
++
++/* exported interface documented in image_cache.h */
++unsigned int image_cache_deferred_serial(void)
++{
++	return deferred_serial;
++}
+ static struct image_cache_decode_stats decode_stats;
+ static uint64_t decode_stats_us;
+ static uint64_t decode_threaded_us;
+@@ -1131,6 +1139,7 @@ static void image_cache_defer(const struct content_redraw_data *data,
+ {
+ 	struct rect r;
+ 
++	deferred_serial++;
+ 	/* a tiled background can cover the whole clip */
+ 	r = *clip;
+ 	if (!data->repeat_x) {
+diff --git a/content/handlers/image/image_cache.h b/content/handlers/image/image_cache.h
+index 536ac07ec..9433131b3 100644
+--- a/content/handlers/image/image_cache.h
++++ b/content/handlers/image/image_cache.h
+@@ -253,6 +253,13 @@ void image_cache_frame(bool hold, unsigned int budget_us);
+  */
+ int image_cache_take_deferred(struct rect *out, const void **key, int max);
+ 
++/**
++ * How many times an image has been drawn as nothing so far (VitaSurf):
++ * a picture made aside while this changed is missing an image, and is
++ * not to be kept.
++ */
++unsigned int image_cache_deferred_serial(void);
++
+ /**
+  * Where a redraw is painting aside, into a bitmap (VitaSurf).
+  *
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 19ebcfd83..ba3816f45 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -449,6 +449,9 @@ fb_pan(fbtk_widget_t *widget,
+ 	unsigned long long move_t0 = vita_now_us();
+ 
+ 	fb_last_move_us = move_t0;
++	/* for the page: an arriving image's layout waits for the view
++	 * to stop (VitaSurf) */
++	nsu_getmonotonic_ms(&vitasurf_view_moved_ms);
+ #endif
+ 
+ 	nsfb_t *nsfb = fbtk_get_nsfb(widget);
+@@ -600,6 +603,19 @@ fb_pan(fbtk_widget_t *widget,
+ 				width, height);
+ 	}
+ 
++#ifdef __vita__
++	/*
++	 * A move both ways uncovers a strip along the bottom or top and
++	 * one along a side (VitaSurf). Queued together they were drawn as
++	 * the one box round both, which is the whole view: on GitHub,
++	 * wider than the screen, a stick held a little off straight drew
++	 * the whole page, 80 ms, three times a second. The first strip is
++	 * drawn on its own before the second is queued.
++	 */
++	if (bwidget->panx != 0 && bwidget->redraw_required) {
++		fb_redraw(widget, bwidget, bw);
++	}
++#endif
+ 	if (bwidget->panx < 0) {
+ 		/* pan left by less then viewport width */
+ 		srcbox.x0 = x;
+diff --git a/utils/utils.c b/utils/utils.c
+index 5f8f2d813..48fba1812 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -696,6 +696,7 @@ void vitasurf_net_queue_wait(unsigned int ms)
+ 
+ unsigned int vitasurf_ms_boxes;
+ unsigned int vitasurf_ms_layout;
++uint64_t vitasurf_view_moved_ms;
+ const char *volatile vitasurf_phase;
+ unsigned int vitasurf_layout_runs;
+ unsigned int vitasurf_font_calls;
+diff --git a/utils/utils.h b/utils/utils.h
+index 895288132..daeeea231 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -247,6 +247,12 @@ void vitasurf_net_queue_wait(unsigned int ms);
+ 
+ extern unsigned int vitasurf_ms_boxes;
+ extern unsigned int vitasurf_ms_layout;
++/**
++ * When the view on a page last moved, by nsu_getmonotonic_ms(), or 0
++ * if the frontend does not say (VitaSurf): laying a page out again
++ * for an image that arrived waits until scrolling stops.
++ */
++extern uint64_t vitasurf_view_moved_ms;
+ /*
+  * What the main thread is doing, for the Vita's busy sampling (VitaSurf):
+  * the overlay thread reads it on every frame the page holds the screen

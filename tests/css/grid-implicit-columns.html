@@ -1,0 +1,30 @@
+<!doctype html><title>grid implicit columns</title>
+<!-- Implicit grid columns and item alignment, against Chrome. Each line
+     gives a span's left edge, width and height. Chrome 140, 14px
+     sans-serif, the text 132px wide:
+       t1 x=84 w=216 h=16
+       t2 x=96 w=204 h=24
+       t3 x=0 w=300 h=16
+       t4 x=96 w=204 h=24
+       t5 x=132 w=132 h=16
+       t6 x=84 w=132 h=16
+       t7 x=96 w=204 h=24
+       t8 x=132 w=132 h=24
+     With other text widths the rule is the same: the spare width is
+     shared equally between the auto columns, a centred item sits in the
+     middle of its column, and no text is in a column of no width (the
+     claude.ai Cloudflare widget's "Verify you are human" came out one
+     word per line). -->
+<style>body{margin:0;font:14px sans-serif}.g{display:grid;width:300px;margin-bottom:4px}i{width:24px;height:24px;background:#888}</style>
+<div class=g><span id=t1 style="grid-column:2">Verify you are human</span></div>
+<div class=g><i style="grid-column:1"></i><span id=t2 style="grid-column:2">Verify you are human</span></div>
+<div class=g><i style="grid-area:1/1"></i><span id=t3>Verify you are human</span></div>
+<div class=g><i style="grid-area:1/1"></i><span id=t4 style="grid-column:2">Verify you are human</span></div>
+<div class=g style="place-items:center"><i style="grid-column:1"></i><span id=t5 style="grid-column:2">Verify you are human</span></div>
+<div class=g style="justify-items:center"><i></i><span id=t6>Verify you are human</span></div>
+<div class=g style="grid-template-columns:auto auto"><i></i><span id=t7>Verify you are human</span></div>
+<div class=g style="grid-template-columns:auto auto;justify-items:center"><i></i><span id=t8>Verify you are human</span></div>
+<script>
+setTimeout(function(){for(var i=1;i<=8;i++){var t=document.getElementById('t'+i),r=t.getBoundingClientRect();
+ console.log('XX t'+i+' x='+Math.round(r.left)+' w='+Math.round(r.width)+' h='+Math.round(r.height));}},500);
+</script>

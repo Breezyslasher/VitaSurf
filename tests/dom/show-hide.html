@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<!-- An element going from display: none to shown, or back, gets its boxes
+     built or taken out in place (VitaSurf), where before the whole box
+     tree was built again. The cases: a flex item shown between two
+     others; a block with text, a list and an image shown in the middle of
+     a block; one shown at the end of its parent; one hidden, then shown
+     again, then hidden; a hidden block inside a shown one; a block shown
+     before inline text, which cannot go in place and is rebuilt. Each
+     must measure as a full rebuild would make it. -->
+<html><head><style>
+body { margin: 0; font: 12px sans-serif }
+.hide { display: none !important }
+.row { display: flex; gap: 4px; width: 400px }
+.row > div { width: 50px; height: 20px; background: #ccc }
+.col > div { height: 15px; margin: 2px 0; background: #ddd }
+.panel { background: #9cf; padding: 4px }
+.panel ol { margin: 0; padding-left: 20px }
+img { width: 16px; height: 16px; display: block }
+.tail { height: 10px; background: #f99 }
+</style></head><body>
+<div class="row" id="row"><div id="r1"></div><div id="r2" class="hide"></div><div id="r3"></div></div>
+<div class="col" id="col"><div id="c1"></div><div id="c2" class="panel hide">Some text in the panel
+ <ol><li>one</li><li>two</li></ol>
+ <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='green'/%3E%3C/svg%3E">
+ <div id="inner" class="hide" style="height:7px;background:#000"></div></div><div id="c3"></div></div>
+<div id="end"><div class="tail" id="e1"></div><div class="tail hide" id="e2"></div></div>
+<div id="flip"><div class="tail" id="f1"></div><div class="tail" id="f2"></div><div class="tail" id="f3"></div></div>
+<div id="mixed"><div class="tail hide" id="m1"></div>inline text after</div>
+<script>
+function q(id) { return document.getElementById(id); }
+function r(id) { var b = q(id).getBoundingClientRect(); return [Math.round(b.left), Math.round(b.top), Math.round(b.width), Math.round(b.height)]; }
+var steps = [
+ function(){ q('r2').className = ''; },
+ function(){ q('c2').className = 'panel'; },
+ function(){ q('e2').className = 'tail'; },
+ function(){ q('f2').className = 'tail hide'; },
+ function(){ q('f2').className = 'tail'; },
+ function(){ q('f2').className = 'tail hide'; },
+ function(){ q('inner').className = ''; },
+ function(){ q('m1').className = 'tail'; }
+];
+var k = 0;
+function next() {
+ if (k < steps.length) { steps[k++](); setTimeout(next, 120); return; }
+ setTimeout(function(){
+  var out = {};
+  ['r1','r2','r3','c1','c2','c3','inner','e1','e2','f1','f3','m1','mixed'].forEach(function(id){ out[id] = r(id); });
+  out.f2 = getComputedStyle(q('f2')).display;
+  out.h = document.body.getBoundingClientRect().height;
+  console.log('XX ' + JSON.stringify(out));
+ }, 300);
+}
+window.addEventListener('load', function(){ setTimeout(next, 100); });
+</script>
+</body></html>

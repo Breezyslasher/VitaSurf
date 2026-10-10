@@ -1,0 +1,699 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index bd3b58bb0..6483e41e7 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -41,7 +41,18 @@
+ #undef NSCSS_IMPORT_TRACE
+ 
+ /** Screen DPI in fixed point units: defaults to 90, which RISC OS uses */
++#if defined(__vita__) || defined(VITASURF)
++/*
++ * 96, which is what a CSS pixel is defined against and what every
++ * other browser uses (VitaSurf). At 90 a length in px came out right
++ * only because the pixels per unit were rounded to a whole number,
++ * while one in em or rem was 15/16 of what the page asked: text set
++ * at 16px was drawn at 15, and a rem inside calc() was 17px.
++ */
++css_fixed nscss_screen_dpi = F_96;
++#else
+ css_fixed nscss_screen_dpi = F_90;
++#endif
+ 
+ struct content_css_data;
+ 
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index a8eb918ac..7908d5571 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1873,6 +1873,8 @@ box_construct_element(struct box_construct_ctx *ctx, bool *convert_children)
+ 			CSS_MASK_IMAGE_IMAGE && maskimage_uri != NULL &&
+ 			strncmp(lwc_string_data(maskimage_uri), "gradient:",
+ 					9) != 0 /* painted, not fetched */ &&
++			strncmp(lwc_string_data(maskimage_uri), "ring:",
++					5) != 0 /* a shape, see redraw.c */ &&
+ 			nsoption_bool(background_images) == true) {
+ 		nsurl *url;
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 41f2f880f..d1b0a0d53 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -509,6 +509,18 @@ bool html_box_corner_radii(const struct box *box,
+ 		const css_unit_ctx *unit_len_ctx, float scale,
+ 		struct html_corner_radii *radii);
+ 
++/**
++ * Where a rounded rectangle crosses one row of pixels, or one column
++ * (VitaSurf): from *x0 up to *x1, or *y0 up to *y1, which is empty when
++ * the row misses it.
++ */
++void html_rounded_row_span(const struct rect *r,
++		const struct html_corner_radii *radii, int y,
++		int *x0, int *x1);
++void html_rounded_col_span(const struct rect *r,
++		const struct html_corner_radii *radii, int x,
++		int *y0, int *y1);
++
+ nserror html_plot_rounded_fill(const struct redraw_context *ctx,
+ 		const plot_style_t *pstyle, const struct rect *border_box,
+ 		const struct html_corner_radii *radii);
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 488a2d6ba..c23432c5e 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -652,6 +652,10 @@ static bool html_box_masked(struct box *box)
+ 			css_computed_mask_image(box->style, &uri) !=
+ 					CSS_MASK_IMAGE_IMAGE || uri == NULL)
+ 		return false;
++	/* a ring is a shape the background is painted in, not a mask
++	 * laid over the element (see html_mask_ring) */
++	if (strncmp(lwc_string_data(uri), "ring:", 5) == 0)
++		return false;
+ 	/* text shares its element's style, and a gradient mask, which is
+ 	 * painted over the element, is not painted again over its text */
+ 	return box->type != BOX_TEXT ||
+@@ -676,6 +680,65 @@ static const char *html_mask_gradient(struct box *box)
+ 	return lwc_string_data(uri) + 9;
+ }
+ 
++/**
++ * The hole a box's ring mask leaves (VitaSurf): libcss names the
++ * "gradient border" idiom, a solid mask layer in the content (or
++ * padding) box excluded from one over the whole box, as "ring:content"
++ * (or "ring:padding"), and the background is painted only between the
++ * border box and that box. Its corners are the border box's, less the
++ * distance in, as a background clipped to that box would have.
++ *
++ * \param box         the box
++ * \param border_box  its border box, in device pixels
++ * \param radii       its corners, or NULL for square ones
++ * \param scale       device pixels to a CSS pixel
++ * \param hole        set to the hole
++ * \param hole_radii  set to its corners
++ * \return true if the box has a ring mask
++ */
++static bool html_mask_ring(struct box *box, const struct rect *border_box,
++		const struct html_corner_radii *radii, float scale,
++		struct rect *hole, struct html_corner_radii *hole_radii)
++{
++	lwc_string *uri = NULL;
++	bool content;
++	int l, t, r, b;
++
++	if (box->type == BOX_TEXT || box->style == NULL ||
++			border_box == NULL ||
++			css_computed_mask_image(box->style, &uri) !=
++			CSS_MASK_IMAGE_IMAGE || uri == NULL ||
++			strncmp(lwc_string_data(uri), "ring:", 5) != 0)
++		return false;
++	content = strcmp(lwc_string_data(uri) + 5, "content") == 0;
++	l = box->border[LEFT].width + (content ? box->padding[LEFT] : 0);
++	t = box->border[TOP].width + (content ? box->padding[TOP] : 0);
++	r = box->border[RIGHT].width + (content ? box->padding[RIGHT] : 0);
++	b = box->border[BOTTOM].width + (content ? box->padding[BOTTOM] : 0);
++	l = (int) (l * scale);
++	t = (int) (t * scale);
++	r = (int) (r * scale);
++	b = (int) (b * scale);
++	hole->x0 = border_box->x0 + l;
++	hole->y0 = border_box->y0 + t;
++	hole->x1 = border_box->x1 - r;
++	hole->y1 = border_box->y1 - b;
++	memset(hole_radii, 0, sizeof(*hole_radii));
++	if (radii != NULL) {
++#define INNER(v, d) ((v) > (d) ? (v) - (d) : 0)
++		hole_radii->tl_h = INNER(radii->tl_h, l);
++		hole_radii->tl_v = INNER(radii->tl_v, t);
++		hole_radii->tr_h = INNER(radii->tr_h, r);
++		hole_radii->tr_v = INNER(radii->tr_v, t);
++		hole_radii->br_h = INNER(radii->br_h, r);
++		hole_radii->br_v = INNER(radii->br_v, b);
++		hole_radii->bl_h = INNER(radii->bl_h, l);
++		hole_radii->bl_v = INNER(radii->bl_v, b);
++#undef INNER
++	}
++	return true;
++}
++
+ /**
+  * Copy a gradient spec with every stop in one colour, keeping each
+  * stop's alpha scaled by the colour's (VitaSurf). A gradient mask is a
+@@ -1026,16 +1089,130 @@ static void html_gradient_lengths(int *pos, const int *px, int n, int len,
+  * A radial or conic gradient, which strips cannot draw, is painted as
+  * the average of its stops.
+  *
++ * With radii, the gradient fills the area's rounded shape rather than
++ * all of it, as a background does in a box with rounded corners: a
++ * linear gradient's strips are cut to the curve a row (or column) at a
++ * time where the corners are, and the average is a rounded fill.
++ * Speedtest's GO button is a dark disc on a gradient disc 2px larger,
++ * and the gradient was a square.
++ *
+  * \param spec   The gradient string, after "gradient:"
+  * \param area   The box the gradient spans, in device pixels
+  * \param clip   Where painting may go
+  * \param scale  Device pixels to a CSS pixel, for stops given as lengths
++ * \param radii  The area's corners, or NULL for square ones
+  * \param ctx    Redraw context
+  * \return true on success, false on plotter error
+  */
++/** Where a gradient is painted when that is not its whole area. */
++struct html_paint_shape {
++	const struct html_corner_radii *radii;	/**< the area's corners */
++	const struct rect *hole;		/**< left out, or NULL */
++	const struct html_corner_radii *hole_radii;
++};
++
++static bool html_redraw_gradient_shaped(const char *spec,
++		const struct rect *area, const struct rect *clip, float scale,
++		const struct html_paint_shape *shape,
++		const struct redraw_context *ctx);
++
+ static bool html_redraw_gradient(const char *spec, const struct rect *area,
+ 		const struct rect *clip, float scale,
+ 		const struct redraw_context *ctx)
++{
++	return html_redraw_gradient_shaped(spec, area, clip, scale, NULL,
++			ctx);
++}
++
++/**
++ * Fill the part of a gradient strip inside a rounded shape (VitaSurf),
++ * a row at a time across a strip that runs along x, a column at a time
++ * across one that runs along y, each run of rows or columns with the
++ * same ends being one rectangle: between the corners that is the whole
++ * strip at once.
++ */
++static bool html_gradient_rounded_strip(const struct redraw_context *ctx,
++		const plot_style_t *style, const struct rect *strip,
++		const struct rect *area, const struct html_paint_shape *shape,
++		bool rows)
++{
++	static const struct html_corner_radii square;
++	const struct html_corner_radii *radii =
++			shape->radii != NULL ? shape->radii : &square;
++	int from = rows ? strip->y0 : strip->x0;
++	int to = rows ? strip->y1 : strip->x1;
++	int lo = rows ? strip->x0 : strip->y0;
++	int hi = rows ? strip->x1 : strip->y1;
++	int i, k, run_start = from;
++	int run[4] = { 0, 0, 0, 0 };
++	bool open = false;
++
++	for (i = from; i <= to; i++) {
++		int seg[4] = { 0, 0, 0, 0 };	/* up to two spans */
++
++		if (i < to) {
++			int a, b;
++
++			if (rows)
++				html_rounded_row_span(area, radii, i, &a, &b);
++			else
++				html_rounded_col_span(area, radii, i, &a, &b);
++			if (a < lo) a = lo;
++			if (b > hi) b = hi;
++			if (b < a) b = a;
++			seg[0] = a; seg[1] = b;
++			/* less the hole, where this line crosses it */
++			if (shape->hole != NULL && (rows ?
++					(i >= shape->hole->y0 &&
++					 i < shape->hole->y1) :
++					(i >= shape->hole->x0 &&
++					 i < shape->hole->x1))) {
++				int ha, hb;
++
++				if (rows)
++					html_rounded_row_span(shape->hole,
++						shape->hole_radii, i, &ha, &hb);
++				else
++					html_rounded_col_span(shape->hole,
++						shape->hole_radii, i, &ha, &hb);
++				if (hb > ha && hb > a && ha < b) {
++					seg[1] = ha > a ? ha : a;
++					seg[2] = hb < b ? hb : b;
++					seg[3] = b;
++				}
++			}
++			if (open && memcmp(seg, run, sizeof(seg)) == 0)
++				continue;
++		}
++		if (open) {
++			for (k = 0; k < 4; k += 2) {
++				struct rect q;
++
++				if (run[k + 1] <= run[k])
++					continue;
++				if (rows) {
++					q.x0 = run[k]; q.x1 = run[k + 1];
++					q.y0 = run_start; q.y1 = i;
++				} else {
++					q.y0 = run[k]; q.y1 = run[k + 1];
++					q.x0 = run_start; q.x1 = i;
++				}
++				if (ctx->plot->rectangle(ctx, style, &q) !=
++						NSERROR_OK)
++					return false;
++			}
++		}
++		open = true;
++		run_start = i;
++		memcpy(run, seg, sizeof(run));
++	}
++	return true;
++}
++
++static bool html_redraw_gradient_shaped(const char *spec,
++		const struct rect *area, const struct rect *clip, float scale,
++		const struct html_paint_shape *shape,
++		const struct redraw_context *ctx)
+ {
+ 	uint32_t colour[16];
+ 	int pos[16], px[16];
+@@ -1153,6 +1330,12 @@ static bool html_redraw_gradient(const char *spec, const struct rect *area,
+ 		}
+ 		style.fill_colour = ((0xff - a / n) << 24) |
+ 				((b / n) << 16) | ((g / n) << 8) | (r / n);
++		if (shape != NULL) {
++			struct rect all = *clip;
++
++			return html_gradient_rounded_strip(ctx, &style, &all,
++					area, shape, true);
++		}
+ 		return ctx->plot->rectangle(ctx, &style, clip) == NSERROR_OK;
+ 	}
+ 
+@@ -1218,6 +1401,13 @@ static bool html_redraw_gradient(const char *spec, const struct rect *area,
+ 
+ 		style.fill_colour = ((0xff - a) << 24) | (b << 16) |
+ 				(g << 8) | r;
++		if (shape != NULL) {
++			/* strips across x are cut a row at a time */
++			if (!html_gradient_rounded_strip(ctx, &style, &strip,
++					area, shape, !along_x))
++				return false;
++			continue;
++		}
+ 		if (ctx->plot->rectangle(ctx, &style, &strip) != NSERROR_OK)
+ 			return false;
+ 	}
+@@ -1240,6 +1430,16 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 	struct html_corner_radii radii;
+ 	bool rounded = (border_box != NULL) && html_box_corner_radii(
+ 			background, border_box, unit_len_ctx, scale, &radii);
++	/* and the hole a ring mask leaves in it (VitaSurf) */
++	struct rect hole;
++	struct html_corner_radii hole_radii;
++	bool ringed = html_mask_ring(box, border_box,
++			rounded ? &radii : NULL, scale, &hole, &hole_radii);
++	struct html_paint_shape shape = {
++		.radii = rounded ? &radii : NULL,
++		.hole = ringed ? &hole : NULL,
++		.hole_radii = &hole_radii,
++	};
+ 	bool repeat_x = false;
+ 	bool repeat_y = false;
+ 	bool plot_colour = true;
+@@ -1390,7 +1590,17 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 			*background_colour = nscss_color_to_ns(bgcol);
+ 			pstyle_fill_bg.fill_colour = *background_colour;
+ 			if (plot_colour) {
+-				if (rounded) {
++				if (ringed) {
++					/* only in the ring (VitaSurf) */
++					if (ctx->plot->clip(ctx, &r) !=
++							NSERROR_OK)
++						return false;
++					res = html_gradient_rounded_strip(ctx,
++							&pstyle_fill_bg, &r,
++							border_box, &shape,
++							true) ? NSERROR_OK :
++							NSERROR_INVALID;
++				} else if (rounded) {
+ 					if (ctx->plot->clip(ctx, &r) !=
+ 							NSERROR_OK) {
+ 						return false;
+@@ -1422,9 +1632,14 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 
+ 				if (ctx->plot->clip(ctx, &r) != NSERROR_OK)
+ 					return false;
+-				if (!html_redraw_gradient(
++				/* in the rounded box, when it has corners,
++				 * and only in its ring if it has one */
++				if (!html_redraw_gradient_shaped(
+ 						lwc_string_data(bg_uri) + 9,
+-						area, &r, scale, ctx))
++						area, &r, scale,
++						((rounded || ringed) &&
++						 area == border_box) ?
++						&shape : NULL, ctx))
+ 					return false;
+ 			}
+ 		}
+@@ -5673,6 +5888,23 @@ static void html_z_neg_release(struct html_z_list *l)
+ 	l->n_neg = 0;
+ }
+ 
++/**
++ * Whether a box is inside a box pinned to the viewport (VitaSurf), one
++ * that is position: fixed and not placed against an anchor.
++ */
++static bool html_in_fixed(const struct box *box)
++{
++	const struct box *a;
++
++	for (a = box->parent; a != NULL; a = a->parent) {
++		if (a->style != NULL && !(a->flags & ANCHORED) &&
++				css_computed_position(a->style) ==
++				CSS_POSITION_FIXED)
++			return true;
++	}
++	return false;
++}
++
+ /**
+  * Recursively draw a box.
+  *
+@@ -6079,9 +6311,13 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			box->sticky_dx = html_sticky_offset_x(html, box,
+ 					x_parent);
+ 		} else if (position == CSS_POSITION_FIXED &&
+-				!(box->flags & ANCHORED)) {
++				!(box->flags & ANCHORED) &&
++				!html_in_fixed(box)) {
+ 			/* one placed against an anchor stays with it in the
+-			 * page (VitaSurf) */
++			 * page (VitaSurf); one inside a fixed box is pinned
++			 * with it, the scroll already added once: speedtest's
++			 * gradient line under its fixed header slid down the
++			 * page as it scrolled */
+ 			html_content *mh = (html_content *) html;
+ 
+ 			/* drawn after the rest of the document, so that
+diff --git a/content/handlers/html/redraw_border.c b/content/handlers/html/redraw_border.c
+index 5b0b074ec..fe89e650b 100644
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -1215,6 +1215,65 @@ rounded_rect_path(float *p,
+ 
+ #undef PUSH
+ 
++/* exported function documented in html/private.h */
++void html_rounded_row_span(const struct rect *r,
++		const struct html_corner_radii *radii, int y,
++		int *x0, int *x1)
++{
++	float yc = (float)y + 0.5f, left = (float)r->x0;
++	float right = (float)r->x1, d, e;
++
++	if (radii->tl_h > 0 && radii->tl_v > 0 &&
++	    yc < (float)(r->y0 + radii->tl_v)) {
++		d = ((float)(r->y0 + radii->tl_v) - yc) / (float)radii->tl_v;
++		e = (float)r->x0 + (float)radii->tl_h *
++			(1.0f - sqrtf(1.0f - d * d));
++		if (e > left) left = e;
++	}
++	if (radii->bl_h > 0 && radii->bl_v > 0 &&
++	    yc > (float)(r->y1 - radii->bl_v)) {
++		d = (yc - (float)(r->y1 - radii->bl_v)) / (float)radii->bl_v;
++		e = (float)r->x0 + (float)radii->bl_h *
++			(1.0f - sqrtf(1.0f - d * d));
++		if (e > left) left = e;
++	}
++	if (radii->tr_h > 0 && radii->tr_v > 0 &&
++	    yc < (float)(r->y0 + radii->tr_v)) {
++		d = ((float)(r->y0 + radii->tr_v) - yc) / (float)radii->tr_v;
++		e = (float)r->x1 - (float)radii->tr_h *
++			(1.0f - sqrtf(1.0f - d * d));
++		if (e < right) right = e;
++	}
++	if (radii->br_h > 0 && radii->br_v > 0 &&
++	    yc > (float)(r->y1 - radii->br_v)) {
++		d = (yc - (float)(r->y1 - radii->br_v)) / (float)radii->br_v;
++		e = (float)r->x1 - (float)radii->br_h *
++			(1.0f - sqrtf(1.0f - d * d));
++		if (e < right) right = e;
++	}
++	*x0 = (int)(left + 0.5f);
++	*x1 = (int)(right + 0.5f);
++}
++
++/* exported function documented in html/private.h */
++void html_rounded_col_span(const struct rect *r,
++		const struct html_corner_radii *radii, int x,
++		int *y0, int *y1)
++{
++	/* a column of the box is a row of it turned about its diagonal,
++	 * which swaps each corner's radii and the top right corner with
++	 * the bottom left */
++	struct rect t = { r->y0, r->x0, r->y1, r->x1 };
++	struct html_corner_radii s = {
++		radii->tl_v, radii->tl_h,
++		radii->bl_v, radii->bl_h,
++		radii->br_v, radii->br_h,
++		radii->tr_v, radii->tr_h,
++	};
++
++	html_rounded_row_span(&t, &s, x, y0, y1);
++}
++
+ /** The identity, which is what the path plotters want for an unrotated box. */
+ static const float rounded_transform[6] = { 1, 0, 0, 1, 0, 0 };
+ 
+@@ -1245,43 +1304,7 @@ rounded_fill_spans(const struct redraw_context *ctx,
+ 		int l = 0, rr = 0;
+ 
+ 		if (y < r->y1) {
+-			float yc = (float)y + 0.5f, left = (float)r->x0;
+-			float right = (float)r->x1, d, e;
+-
+-			if (radii->tl_h > 0 && radii->tl_v > 0 &&
+-			    yc < (float)(r->y0 + radii->tl_v)) {
+-				d = ((float)(r->y0 + radii->tl_v) - yc) /
+-					(float)radii->tl_v;
+-				e = (float)r->x0 + (float)radii->tl_h *
+-					(1.0f - sqrtf(1.0f - d * d));
+-				if (e > left) left = e;
+-			}
+-			if (radii->bl_h > 0 && radii->bl_v > 0 &&
+-			    yc > (float)(r->y1 - radii->bl_v)) {
+-				d = (yc - (float)(r->y1 - radii->bl_v)) /
+-					(float)radii->bl_v;
+-				e = (float)r->x0 + (float)radii->bl_h *
+-					(1.0f - sqrtf(1.0f - d * d));
+-				if (e > left) left = e;
+-			}
+-			if (radii->tr_h > 0 && radii->tr_v > 0 &&
+-			    yc < (float)(r->y0 + radii->tr_v)) {
+-				d = ((float)(r->y0 + radii->tr_v) - yc) /
+-					(float)radii->tr_v;
+-				e = (float)r->x1 - (float)radii->tr_h *
+-					(1.0f - sqrtf(1.0f - d * d));
+-				if (e < right) right = e;
+-			}
+-			if (radii->br_h > 0 && radii->br_v > 0 &&
+-			    yc > (float)(r->y1 - radii->br_v)) {
+-				d = (yc - (float)(r->y1 - radii->br_v)) /
+-					(float)radii->br_v;
+-				e = (float)r->x1 - (float)radii->br_h *
+-					(1.0f - sqrtf(1.0f - d * d));
+-				if (e < right) right = e;
+-			}
+-			l = (int)(left + 0.5f);
+-			rr = (int)(right + 0.5f);
++			html_rounded_row_span(r, radii, y, &l, &rr);
+ 		}
+ 		/* a row like the last one extends the run */
+ 		if (open && y < r->y1 && l == run_l && rr == run_r) {
+diff --git a/desktop/options.h b/desktop/options.h
+index f695b46ab..0bb4a3997 100644
+--- a/desktop/options.h
++++ b/desktop/options.h
+@@ -64,7 +64,13 @@ NSOPTION_STRING(http_proxy_noproxy, "localhost")
+ NSOPTION_INTEGER(treeview_font_size, 110)
+ 
+ /** Default font size (unit: 0.1pt) */
++#if defined(__vita__) || defined(VITASURF)
++/* 12pt, 16px at 96 dpi as in every other browser (VitaSurf); 12.8pt
++ * was 16px at the 90 dpi NetSurf used to assume */
++NSOPTION_INTEGER(font_size, 120)
++#else
+ NSOPTION_INTEGER(font_size, 128)
++#endif
+ 
+ /** Minimum font size. */
+ NSOPTION_INTEGER(font_min_size, 85)
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index c8fd10fad..61e482a68 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -28,6 +28,7 @@
+ #include <ft2build.h>
+ #include FT_CACHE_H
+ #include FT_TRUETYPE_TABLES_H
++#include FT_MULTIPLE_MASTERS_H
+ 
+ #include "netsurf/inttypes.h"
+ #include "utils/filepath.h"
+@@ -50,7 +51,7 @@
+ 
+ #define BOLD_WEIGHT 700
+ 
+-static FT_Library library; 
++static FT_Library library;
+ static FTC_Manager ft_cmanager;
+ static FTC_CMapCache ft_cmap_cache ;
+ static FTC_ImageCache ft_image_cache;
+@@ -130,6 +131,15 @@ typedef struct fb_faceid_s {
+ 	 * without this every space in a paragraph went looking.
+ 	 */
+ 	uint8_t liga_start_char[128 / 8];
++	/*
++	 * A variable font (VitaSurf): whether the face has a weight axis,
++	 * and the weight this one is set to, or 0 for the font's own
++	 * default. Montserrat's default is its thinnest, 100, so
++	 * speedtest's text was drawn in hairlines wherever it asked for
++	 * 400 or 500.
++	 */
++	bool variable;
++	int var_weight;
+ } fb_faceid_t;
+ 
+ /**
+@@ -143,6 +153,9 @@ struct fb_webface {
+ 	int weight;
+ 	bool italic;
+ 	fb_faceid_t *face;
++	/** a variable face at each weight from 100 to 900, made when
++	 * first wanted; they share the face's bytes (VitaSurf) */
++	fb_faceid_t *at_weight[9];
+ 	struct fb_webface *next;
+ };
+ 
+@@ -229,6 +242,59 @@ static void fb_face_read_file(fb_faceid_t *fb_face)
+ }
+ 
+ 
++/** The tag of the weight axis of a variable font. */
++#define FB_WGHT_TAG FT_MAKE_TAG('w', 'g', 'h', 't')
++
++/**
++ * Whether a face is a variable font with a weight axis (VitaSurf).
++ */
++static bool fb_face_has_weight_axis(FT_Library library, FT_Face face)
++{
++	FT_MM_Var *mm;
++	bool found = false;
++	FT_UInt i;
++
++	if (!FT_HAS_MULTIPLE_MASTERS(face) || FT_Get_MM_Var(face, &mm) != 0)
++		return false;
++	for (i = 0; i < mm->num_axis; i++) {
++		if (mm->axis[i].tag == FB_WGHT_TAG)
++			found = true;
++	}
++	FT_Done_MM_Var(library, mm);
++	return found;
++}
++
++/**
++ * Set a variable font's weight axis (VitaSurf), clamped to its range,
++ * every other axis left at its default.
++ */
++static void fb_face_set_weight(FT_Library library, FT_Face face, int weight)
++{
++	FT_MM_Var *mm;
++	FT_Fixed coords[16];
++	FT_UInt i, n;
++
++	if (!FT_HAS_MULTIPLE_MASTERS(face) || FT_Get_MM_Var(face, &mm) != 0)
++		return;
++	n = mm->num_axis < 16 ? mm->num_axis : 16;
++	for (i = 0; i < n; i++) {
++		coords[i] = mm->axis[i].def;
++		if (mm->axis[i].tag == FB_WGHT_TAG) {
++			FT_Fixed w = (FT_Fixed) weight * 65536;
++
++			if (w < mm->axis[i].minimum)
++				w = mm->axis[i].minimum;
++			if (w > mm->axis[i].maximum)
++				w = mm->axis[i].maximum;
++			coords[i] = w;
++		}
++	}
++	if (FT_Set_Var_Design_Coordinates(face, n, coords) != 0) {
++		NSLOG(netsurf, INFO, "could not set weight %d", weight);
++	}
++	FT_Done_MM_Var(library, mm);
++}
++
+ /**
+  * map cache manager handle to face id
+  */
+@@ -261,6 +327,11 @@ ft_face_requester(FTC_FaceID face_id,
+         if (error) {
+                 NSLOG(netsurf, INFO, "Could not find font (code %d)", error);
+         } else {
++		/* a variable face at the weight it was made for (VitaSurf) */
++		if (fb_face->var_weight > 0) {
++			fb_face_set_weight(library, *face,
++					fb_face->var_weight);
++		}
+ 
+                 error = FT_Select_Charmap(*face, FT_ENCODING_UNICODE);
+                 if (error) {
+@@ -325,6 +396,7 @@ static nserror fb_font_add_face(const char *family, int weight, bool italic,
+ 	wf->weight = weight;
+ 	wf->italic = italic;
+ 	wf->face = newf;
++	newf->variable = fb_face_has_weight_axis(library, aface);
+ 	wf->next = fb_webfaces;
+ 	fb_webfaces = wf;
+ 
+@@ -333,6 +405,38 @@ static nserror fb_font_add_face(const char *family, int weight, bool italic,
+ 	return NSERROR_OK;
+ }
+ 
++/**
++ * A web face at a weight (VitaSurf): the face itself, unless it is a
++ * variable font, when it is an instance of it set to the nearest
++ * hundred, sharing its bytes. Each has its own entry in FreeType's
++ * cache, so its glyphs are kept apart from the other weights'.
++ */
++static fb_faceid_t *fb_web_face_weighted(struct fb_webface *wf, int weight)
++{
++	fb_faceid_t *f;
++	int slot;
++
++	if (!wf->face->variable)
++		return wf->face;
++	slot = (weight + 50) / 100;
++	if (slot < 1)
++		slot = 1;
++	if (slot > 9)
++		slot = 9;
++	if (wf->at_weight[slot - 1] != NULL)
++		return wf->at_weight[slot - 1];
++	f = calloc(1, sizeof(*f));
++	if (f == NULL)
++		return wf->face;
++	f->data = wf->face->data;
++	f->len = wf->face->len;
++	f->index = wf->face->index;
++	f->variable = true;
++	f->var_weight = slot * 100;
++	wf->at_weight[slot - 1] = f;
++	return f;
++}
++
+ /**
+  * The web face a style's family list names, if any (VitaSurf): the
+  * first family with a face, and of its faces the one closest in weight
+@@ -365,7 +469,7 @@ static fb_faceid_t *fb_web_face_for(const plot_font_style_t *fstyle)
+ 			}
+ 		}
+ 		if (best != NULL)
+-			return best->face;
++			return fb_web_face_weighted(best, fstyle->weight);
+ 	}
+ 
+ 	return NULL;

@@ -165,19 +165,25 @@ var __vitaIntlTags = function (W, N, C, X) {
 
 	/* ---- canonical form ---- */
 
-	var RULES = null;
+	var RULES = Object.create(null);
 
-	/* the language aliases, as rules: by language (und for any), with
-	 * the region and variants they also match */
-	function rules() {
-		var l, k, p, r, list;
+	/* the language aliases for one language (und for any), as rules,
+	 * with the region and variants they also match. Built for the
+	 * languages asked about only (VitaSurf): splitting and sorting
+	 * every alias in the table was 2% of a Home Assistant load's
+	 * script time, for the two or three languages a page uses. */
+	function rulesFor(lang) {
+		var l, k, kl, p, r, list, out;
 
-		if (RULES)
-			return RULES;
-		RULES = {};
+		if (RULES[lang])
+			return RULES[lang];
+		out = RULES[lang] = [];
 		l = data('aliases').l;
 		for (k in l) {
-			p = k.toLowerCase().split('-');
+			kl = k.toLowerCase();
+			if (kl !== lang && kl.lastIndexOf(lang + '-', 0) !== 0)
+				continue;
+			p = kl.split('-');
 			r = { lang: p[0], region: null, variants: [], to: l[k] };
 			list = p.slice(1);
 			if (list.length && isScript(list[0]))
@@ -185,16 +191,14 @@ var __vitaIntlTags = function (W, N, C, X) {
 			if (list.length && isRegion(list[0]))
 				r.region = list.shift();
 			r.variants = list;
-			(RULES[r.lang] || (RULES[r.lang] = [])).push(r);
+			out.push(r);
 		}
 		/* the more a rule asks of a tag, the sooner it is tried */
-		for (k in RULES) {
-			RULES[k].sort(function (a, b) {
-				return (b.variants.length * 2 + (b.region ? 1 : 0)) -
-					(a.variants.length * 2 + (a.region ? 1 : 0));
-			});
-		}
-		return RULES;
+		out.sort(function (a, b) {
+			return (b.variants.length * 2 + (b.region ? 1 : 0)) -
+				(a.variants.length * 2 + (a.region ? 1 : 0));
+		});
+		return out;
 	}
 
 	function matchRule(t, list) {
@@ -242,11 +246,12 @@ var __vitaIntlTags = function (W, N, C, X) {
 
 	/* ICU's AliasReplacer on a language id, till nothing changes */
 	function replaceAliases(t) {
-		var a = data('aliases'), all = rules(), n, r, changed, i, rep;
+		var a = data('aliases'), n, r, changed, i, rep;
 
 		for (n = 0; n < 10; n++) {
 			changed = false;
-			r = matchRule(t, all[t.lang]) || matchRule(t, all.und);
+			r = matchRule(t, rulesFor(t.lang)) ||
+				matchRule(t, rulesFor('und'));
 			if (r && applyLanguageRule(t, r))
 				continue;
 			rep = t.region && own(a.r, t.region.toUpperCase());

@@ -1,0 +1,47 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 62d0efff8..8e4d9301b 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1681,6 +1681,42 @@ static void fetch_curl_note_times(CURL *curl_handle)
+ 	curl_easy_getinfo(curl_handle, CURLINFO_TOTAL_TIME_T, &total);
+ 	curl_easy_getinfo(curl_handle, CURLINFO_SIZE_DOWNLOAD_T, &bytes);
+ 	vitasurf_net_note(connects, connect, tls, request, first, total, bytes);
++	/*
++	 * Where a slow transfer's time went (VitaSurf). The page's figures
++	 * only add up waits, and a build 581 log had TLS handshakes of 14 s
++	 * and 156 KB taking 5 s while the browser sat idle, with nothing to
++	 * say whether the name lookup, the connection, the handshake, the
++	 * server or the download was slow.
++	 */
++	if (total >= 3000000) {
++		curl_off_t dns = 0;
++		char **urlp = NULL;
++		struct curl_fetch_info *f = NULL;
++		unsigned int body_ms;
++
++		curl_easy_getinfo(curl_handle, CURLINFO_NAMELOOKUP_TIME_T, &dns);
++		urlp = (char **) (void *) &f;
++		if (curl_easy_getinfo(curl_handle, CURLINFO_PRIVATE, urlp) !=
++		    CURLE_OK) {
++			f = NULL;
++		}
++		body_ms = (unsigned int) ((total - first) / 1000);
++		NSLOG(netsurf, INFO,
++		      "slow transfer: %u KB in %u ms (name lookup %u, "
++		      "connecting %u, TLS %u, server %u, body %u ms at %u "
++		      "KB/s), %u new connections: %s",
++		      (unsigned int) (bytes / 1024),
++		      (unsigned int) (total / 1000),
++		      (unsigned int) (dns / 1000),
++		      (unsigned int) (connect > dns ? (connect - dns) / 1000 : 0),
++		      (unsigned int) (tls > connect ? (tls - connect) / 1000 : 0),
++		      (unsigned int) (first > request ? (first - request) / 1000 : 0),
++		      body_ms,
++		      (unsigned int) (body_ms > 0 ?
++				      (bytes / 1024) * 1000 / body_ms : 0),
++		      (unsigned int) connects,
++		      f != NULL ? nsurl_access(f->url) : "?");
++	}
+ #else
+ 	(void)curl_handle;
+ #endif

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<!-- calc() in the properties that hold a length and a unit (VitaSurf):
+     corner radii, shadows, outline-offset, background and mask
+     positions and sizes, object-position, transform-origin, text
+     decoration, stroke lengths, border-spacing, clip-path inset() and
+     border-image widths. Each took only a calc() that reduced to one
+     length when the CSS was read; calc(1em + 2px), calc(10% + 2px) and
+     min()/max() dropped the whole declaration. A math function that
+     does not reduce is now kept and resolved where it is used. Expected
+     lines are what Chrome prints:
+       XX borderTopLeftRadius=calc(10% + 2px) | outlineOffset=18px
+       XX backgroundPosition=calc(10% + 2px) calc(50% - 16px)
+       XX textDecorationThickness=5px | textUnderlineOffset=4px
+       XX borderTopLeftRadius=calc(50% - 10px) 20px
+       XX borderSpacing=18px 4px
+       XX objectPosition=calc(100% - 4px) 18px
+       XX strokeWidth=18px | strokeDashoffset=28px -->
+<html><head><title>calc held</title><style>
+body { margin: 0; font: 16px sans-serif }
+#t { width: 100px; height: 100px; background: #ccc url(data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==) no-repeat;
+     border-radius: calc(10% + 2px);
+     outline: 1px solid red; outline-offset: calc(1em + 2px);
+     box-shadow: calc(1em + 2px) max(2px, 0.5em) 0 red;
+     text-shadow: calc(1em + 2px) 0 blue;
+     background-position: calc(10% + 2px) calc(50% - 1em);
+     background-size: calc(50% + 2px) auto;
+     transform-origin: calc(10% + 2px) calc(1em + 2px);
+     text-decoration: underline;
+     text-decoration-thickness: calc(0.25em + 1px);
+     text-underline-offset: calc(1em - 12px);
+     clip-path: inset(calc(10% + 2px));
+     -webkit-mask-position: calc(10% + 2px) 0 }
+#r { border-top-left-radius: calc(50% - 10px) calc(1em + 4px); width: 60px; height: 40px }
+table { border-collapse: separate; border-spacing: calc(1em + 2px) max(1px, 0.25em) }
+img { object-position: calc(100% - 4px) calc(1em + 2px); width: 20px; height: 20px }
+svg { stroke-width: calc(1em + 2px); stroke-dashoffset: calc(2em - 4px) }
+</style></head><body>
+<div id="t">text</div><div id="r"></div>
+<table id="tb"><tr><td>a</td></tr></table>
+<img id="im" src="data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==">
+<svg id="sv" width="10" height="10"><line x1="0" y1="0" x2="10" y2="10" stroke="black"/></svg>
+<script>
+function C(id, props) {
+  var cs = getComputedStyle(document.getElementById(id));
+  return props.map(function (p) { return p + '=' + cs[p]; }).join(' | ');
+}
+setTimeout(function () {
+  console.log('XX ' + C('t', ['borderTopLeftRadius', 'outlineOffset']));
+  console.log('XX ' + C('t', ['backgroundPosition']));
+  console.log('XX ' + C('t', ['textDecorationThickness',
+    'textUnderlineOffset']));
+  console.log('XX ' + C('r', ['borderTopLeftRadius']));
+  console.log('XX ' + C('tb', ['borderSpacing']));
+  console.log('XX ' + C('im', ['objectPosition']));
+  console.log('XX ' + C('sv', ['strokeWidth', 'strokeDashoffset']));
+}, 50);
+</script></body></html>

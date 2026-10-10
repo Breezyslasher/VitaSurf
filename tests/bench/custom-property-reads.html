@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!-- The cost of reading theme colours from elements a script has just
+     made, as Home Assistant's cards and charts do: 120 elements 37
+     levels down, none of them laid out yet, each asked for eight custom
+     properties through getComputedStyle; then the same with an
+     attribute set on each before its reads, as a render does. Prints
+     the milliseconds for each. -->
+<html><head><style>
+:root{--primary-color:#03a9f4;--text:#212121;--card:#fff;--a:1px;--b:2px;--c:3px;--d:red;--e:blue}
+.lv{padding:1px}.lv .lv .lv span{--d:green}
+div:nth-child(2n) > .lv{--e:yellow}
+</style></head><body><script>
+var root=document.body, n=root;
+for(var i=0;i<35;i++){var d=document.createElement('div');d.className='lv';n.appendChild(d);n=d;}
+var leaves=[];
+for(var j=0;j<120;j++){var w=document.createElement('div');var s=document.createElement('span');w.appendChild(s);n.appendChild(w);leaves.push(s);}
+var names=['--primary-color','--text','--card','--a','--b','--c','--d','--e'];
+var t=Date.now(),acc=0;
+leaves.forEach(function(s){var cs=getComputedStyle(s);names.forEach(function(k){acc+=cs.getPropertyValue(k).length;});});
+var t1=Date.now()-t;
+/* interleaved with a write per leaf, as a render does */
+t=Date.now();
+leaves.forEach(function(s,i){s.setAttribute('data-i',i);var cs=getComputedStyle(s);names.forEach(function(k){acc+=cs.getPropertyValue(k).length;});});
+var t2=Date.now()-t;
+console.log('XX reads only '+t1+' ms, with a write each '+t2+' ms, acc '+acc);
+</script></body></html>

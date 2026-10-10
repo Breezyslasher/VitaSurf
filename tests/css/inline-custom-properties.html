@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<!-- Custom properties declared in a style attribute, and declarations
+     there that use var(), take effect (VitaSurf): both were dropped, and
+     reading one back crashed once the attribute's sheet was freed. An
+     integer in a grid line may be min(), max() or clamp() as well as
+     calc(). Home Assistant's section grid needs both: each card's style
+     attribute says --column-size, and its rule spans
+     min(var(--column-size,1), var(--grid-column-count)) columns. Before,
+     every card took one column of twelve. Values changed later from
+     script, as Bubble Card sets each button's colour, must each read
+     their own: a freed value's memory reused by the next made every
+     button take the first one's colour. Expected lines are what Chrome
+     prints. -->
+<html><head><title>inline custom properties</title><style>
+body { margin: 0 }
+.g { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr));
+     width: 600px; --grid-column-count: calc(4 * 3) }
+.g > div { height: 4px }
+.card { grid-column: span min(var(--column-size, 1), var(--grid-column-count)) }
+.k { width: calc(var(--n, 1) * 10px); height: 4px }
+#x.y.z { color: rgb(0, 0, 255); --v: 9 }
+.m { width: calc(var(--v, 1) * 10px); height: 4px }
+.sw { height: 4px; background-color: var(--sw) }
+#s1 { grid-column: span max(2, 5) }
+#s2 { grid-column: span clamp(1, 20, 6) }
+#s3 { grid-column: span min(calc(2 * 2), 9) }
+#s4 { grid-column: min(3, 4) / max(5, 7) }
+#s5 { grid-column: span clamp(1, 2) }
+#s6 { grid-column: span min(0, 3) }
+</style></head><body>
+<div class="g"><div id="c1" class="card" style="--column-size:12;;"></div></div>
+<div class="g"><div id="c2" class="card" style="--column-size: 6"></div></div>
+<div class="g"><div id="c3" class="card" style="--column-size: 30"></div></div>
+<div class="g"><div id="c4" class="card"></div></div>
+<div id="a1" class="k" style="--n:6"></div>
+<div id="a2" style="--n:6; width: calc(var(--n, 1) * 10px); height: 4px"></div>
+<div id="a3" class="k" style="--n:6; --n:7"></div>
+<div id="p" style="--n:4"><div id="a4" class="k"></div></div>
+<div id="x" class="y z m" style="color: rgb(255, 0, 0); --v: 3"></div>
+<div class="g"><div id="s1"></div></div>
+<div class="g"><div id="s2"></div></div>
+<div class="g"><div id="s3"></div></div>
+<div class="g"><div id="s4"></div></div>
+<div class="g"><div id="s5"></div></div>
+<div class="g"><div id="s6"></div></div>
+<div id="later" class="k"></div>
+<div id="sw"><div class="sw"></div><div class="sw"></div><div class="sw"></div><div class="sw"></div><div class="sw"></div><div class="sw"></div></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function box(id) { var r = document.getElementById(id).getBoundingClientRect();
+  return Math.round(r.left) + ' ' + Math.round(r.width); }
+function prop(id, n) { return '[' + getComputedStyle(document.getElementById(id))
+  .getPropertyValue(n).trim() + ']'; }
+var dyn = document.createElement('div');
+dyn.className = 'card';
+dyn.setAttribute('style', '--column-size:12;;');
+var g = document.createElement('div');
+g.className = 'g';
+g.appendChild(dyn);
+document.body.insertBefore(g, document.getElementById('later'));
+var sw = document.querySelectorAll('.sw');
+function swatches() {
+  var r = [];
+  for (var i = 0; i < sw.length; i++) r.push(getComputedStyle(sw[i]).backgroundColor);
+  return r.join(' ');
+}
+for (var i = 0; i < sw.length; i++)
+  sw[i].style.setProperty('--sw', 'rgb(' + (40 * i) + ', 100, 200)');
+setTimeout(function () {
+  document.getElementById('later').setAttribute('style', '--n: 9');
+  T('values set from script', swatches());
+  for (var i = 0; i < sw.length; i++)
+    sw[i].style.setProperty('--sw', i % 2 ? 'rgba(0, 0, 0, 0)' : 'rgb(' + i + ', 0, 0)');
+  setTimeout(function () {
+    ['c1', 'c2', 'c3', 'c4'].forEach(function (id) {
+      T('card ' + id, box(id) + ' ' + prop(id, '--column-size'));
+    });
+    T('card added by script', Math.round(dyn.getBoundingClientRect().width));
+    ['a1', 'a2', 'a3', 'a4'].forEach(function (id) {
+      T('width ' + id, box(id) + ' ' + prop(id, '--n'));
+    });
+    T('inline beats a more specific rule', box('x') + ' ' +
+      getComputedStyle(document.getElementById('x')).color + ' ' +
+      prop('x', '--v'));
+    ['s1', 's2', 's3', 's4', 's5', 's6'].forEach(function (id) {
+      T('line ' + id, box(id));
+    });
+    T('style set later', box('later') + ' ' + prop('later', '--n'));
+    T('values changed from script', swatches());
+  }, 200);
+}, 200);
+</script>
+</body></html>

@@ -1,0 +1,584 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 5aa0cc442..a98e9432b 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -49,6 +49,14 @@ static css_error named_sibling_node(void *pw, void *node,
+ static css_error named_generic_sibling_node(void *pw, void *node,
+ 		const css_qname *qname, void **sibling);
+ static css_error parent_node(void *pw, void *node, void **parent);
++static css_error named_ancestor_node_cross(void *pw, void *node,
++		const css_qname *qname, void **ancestor);
++static css_error named_parent_node_cross(void *pw, void *node,
++		const css_qname *qname, void **parent);
++static css_error parent_node_cross(void *pw, void *node, void **parent);
++static css_error part_host(void *pw, void *node, lwc_string *const *names,
++		uint32_t n_names, void *prev, void **host);
++static css_error node_tree_scope(void *pw, void *node, void **scope);
+ static css_error sibling_node(void *pw, void *node, void **sibling);
+ static css_error first_child_node(void *pw, void *node, void **child);
+ static css_error next_sibling_node(void *pw, void *node, void **sibling);
+@@ -156,6 +164,11 @@ static css_select_handler selection_handler = {
+ 	node_is_pseudo,
+ 	node_animation_start,
+ 	node_container_size,
++	named_ancestor_node_cross,
++	named_parent_node_cross,
++	parent_node_cross,
++	part_host,
++	node_tree_scope,
+ };
+ 
+ /* The size of a node's container, for @container (VitaSurf) */
+@@ -604,29 +617,6 @@ css_error named_ancestor_node(void *pw, void *node,
+ css_error named_parent_node(void *pw, void *node,
+ 		const css_qname *qname, void **parent)
+ {
+-	dom_string *name = NULL;
+-
+-	/*
+-	 * A slot's parent is its shadow root, which no selector names, so
+-	 * "host > *" from outside never reaches it (VitaSurf). Here the
+-	 * shadow tree is the host's own children, and Home Assistant's
+-	 * hui-view-container>*{display:flex;flex:100%} made the slot in it
+-	 * a flex item as wide as the view, in place of display: contents.
+-	 * The shadow's own rules are scoped as "host descendant", which
+-	 * still reaches it.
+-	 */
+-	*parent = NULL;
+-	if (dom_node_get_node_name(node, &name) == DOM_NO_ERR &&
+-			name != NULL) {
+-		bool slot = dom_string_byte_length(name) == 4 &&
+-				strncasecmp(dom_string_data(name), "slot",
+-						4) == 0;
+-
+-		dom_string_unref(name);
+-		if (slot)
+-			return CSS_OK;
+-	}
+-
+ 	dom_element_named_parent_node(node, qname->name,
+ 			(struct dom_element **)parent);
+ 	dom_node_unref(*parent);
+@@ -784,6 +774,256 @@ css_error parent_node(void *pw, void *node, void **parent)
+ 	return CSS_OK;
+ }
+ 
++/*
++ * The parent walks for a rule a shadow tree's own <style> was rewritten
++ * into (VitaSurf): these go on from the top of a shadow tree to its
++ * host, which such a rule names. The ones above stop at a shadow root,
++ * as a browser's do for the page's own rules: Home Assistant's
++ * hui-view-container>*{display:flex} reached into the component and
++ * drew a <style> of card-mod's as text.
++ */
++static css_error named_ancestor_node_cross(void *pw, void *node,
++		const css_qname *qname, void **ancestor)
++{
++	(void)pw;
++	dom_element_named_ancestor_node_cross(node, qname->name,
++			(struct dom_element **)ancestor);
++	dom_node_unref(*ancestor);
++
++	return CSS_OK;
++}
++
++static css_error named_parent_node_cross(void *pw, void *node,
++		const css_qname *qname, void **parent)
++{
++	(void)pw;
++	dom_element_named_parent_node_cross(node, qname->name,
++			(struct dom_element **)parent);
++	dom_node_unref(*parent);
++
++	return CSS_OK;
++}
++
++static css_error parent_node_cross(void *pw, void *node, void **parent)
++{
++	(void)pw;
++	dom_element_parent_node_cross(node, (struct dom_element **)parent);
++	dom_node_unref(*parent);
++
++	return CSS_OK;
++}
++
++/*
++ * X::part(a b) (VitaSurf). A part's names at the host of its own tree
++ * are its part attribute's; a host passes them on to the host of the
++ * tree it is in through its exportparts attribute, "a" or "a: b", a
++ * comma between each. Names are matched with case.
++ */
++#define PART_NAMES 16
++#define PART_NAME_LEN 64
++
++struct part_names {
++	unsigned n;
++	char name[PART_NAMES][PART_NAME_LEN];
++};
++
++static void part_names_add(struct part_names *set, const char *s, size_t len)
++{
++	if (len == 0 || len >= PART_NAME_LEN || set->n == PART_NAMES)
++		return;
++	memcpy(set->name[set->n], s, len);
++	set->name[set->n][len] = '\0';
++	set->n++;
++}
++
++static bool part_names_has(const struct part_names *set, const char *s,
++		size_t len)
++{
++	unsigned i;
++
++	for (i = 0; i < set->n; i++) {
++		if (strlen(set->name[i]) == len &&
++				memcmp(set->name[i], s, len) == 0)
++			return true;
++	}
++	return false;
++}
++
++static dom_string *part_attr_name(int which)
++{
++	static dom_string *names[2];
++
++	if (names[which] == NULL) {
++		const char *s = which == 0 ? "part" : "exportparts";
++
++		if (dom_string_create_interned((const uint8_t *) s,
++				strlen(s), &names[which]) != DOM_NO_ERR)
++			names[which] = NULL;
++	}
++	return names[which];
++}
++
++static bool part_is_ws(char c)
++{
++	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
++}
++
++/* The host of the shadow tree \a node is in, unreferenced, or NULL. */
++static dom_node *part_tree_host(dom_node *node)
++{
++	dom_node *n = dom_node_ref(node), *up = NULL;
++	dom_node_type type;
++	dom_element *host = NULL;
++
++	while (dom_node_get_parent_node(n, &up) == DOM_NO_ERR && up != NULL) {
++		dom_node_unref(n);
++		n = up;
++	}
++	if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++			type == DOM_DOCUMENT_FRAGMENT_NODE &&
++			dom_document_fragment_get_host(
++				(dom_document_fragment *) n, &host) ==
++				DOM_NO_ERR && host != NULL)
++		dom_node_unref(host);
++	else
++		host = NULL;
++	dom_node_unref(n);
++	return (dom_node *) host;
++}
++
++static css_error part_host(void *pw, void *node, lwc_string *const *names,
++		uint32_t n_names, void *prev, void **host)
++{
++	struct part_names set, next;
++	dom_string *attr = NULL, *name;
++	dom_node *n = node, *h;
++	bool past = (prev == NULL);
++	const char *s;
++	size_t len, i, a;
++	uint32_t k;
++
++	(void)pw;
++	*host = NULL;
++
++	name = part_attr_name(0);
++	if (name == NULL || dom_element_get_attribute(n, name, &attr) !=
++			DOM_NO_ERR || attr == NULL)
++		return CSS_OK;
++	set.n = 0;
++	s = dom_string_data(attr);
++	len = dom_string_byte_length(attr);
++	for (i = 0; i < len; ) {
++		while (i < len && part_is_ws(s[i]))
++			i++;
++		a = i;
++		while (i < len && !part_is_ws(s[i]))
++			i++;
++		part_names_add(&set, s + a, i - a);
++	}
++	dom_string_unref(attr);
++
++	while (set.n > 0 && (h = part_tree_host(n)) != NULL) {
++		if (past) {
++			for (k = 0; k < n_names; k++) {
++				if (!part_names_has(&set,
++						lwc_string_data(names[k]),
++						lwc_string_length(names[k])))
++					break;
++			}
++			if (k == n_names) {
++				*host = h;
++				return CSS_OK;
++			}
++		}
++		if (h == prev)
++			past = true;
++
++		/* the names h passes on to the host of its own tree */
++		name = part_attr_name(1);
++		attr = NULL;
++		if (name == NULL || dom_element_get_attribute(h, name,
++				&attr) != DOM_NO_ERR || attr == NULL)
++			break;
++		next.n = 0;
++		s = dom_string_data(attr);
++		len = dom_string_byte_length(attr);
++		for (i = 0; i < len; ) {
++			size_t inner, inner_len, outer, outer_len;
++
++			while (i < len && part_is_ws(s[i]))
++				i++;
++			inner = i;
++			while (i < len && s[i] != ',' && s[i] != ':' &&
++					!part_is_ws(s[i]))
++				i++;
++			inner_len = i - inner;
++			while (i < len && part_is_ws(s[i]))
++				i++;
++			outer = inner;
++			outer_len = inner_len;
++			if (i < len && s[i] == ':') {
++				i++;
++				while (i < len && part_is_ws(s[i]))
++					i++;
++				outer = i;
++				while (i < len && s[i] != ',' &&
++						!part_is_ws(s[i]))
++					i++;
++				outer_len = i - outer;
++				while (i < len && part_is_ws(s[i]))
++					i++;
++			}
++			/* a malformed entry is dropped up to its comma */
++			if (i < len && s[i] != ',') {
++				while (i < len && s[i] != ',')
++					i++;
++				inner_len = 0;
++			}
++			if (i < len)
++				i++;
++			if (inner_len > 0 && outer_len > 0 &&
++					part_names_has(&set, s + inner,
++						inner_len))
++				part_names_add(&next, s + outer, outer_len);
++		}
++		dom_string_unref(attr);
++		set = next;
++		n = h;
++	}
++	return CSS_OK;
++}
++
++/* exported interface documented in css/select.h */
++void *nscss_tree_scope(dom_node *node)
++{
++	dom_node *n = dom_node_ref(node), *up = NULL;
++	dom_node_type type;
++	dom_element *host = NULL;
++	void *scope = NULL;
++
++	while (dom_node_get_parent_node(n, &up) == DOM_NO_ERR && up != NULL) {
++		dom_node_unref(n);
++		n = up;
++	}
++	if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++			type == DOM_DOCUMENT_FRAGMENT_NODE &&
++			dom_document_fragment_get_host(
++				(dom_document_fragment *) n, &host) ==
++				DOM_NO_ERR && host != NULL) {
++		dom_node_unref(host);
++		scope = n;
++	}
++	dom_node_unref(n);
++	return scope;
++}
++
++static css_error node_tree_scope(void *pw, void *node, void **scope)
++{
++	(void)pw;
++	*scope = nscss_tree_scope(node);
++	return CSS_OK;
++}
++
+ /**
+  * Callback to retrieve the preceding sibling of a node.
+  *
+@@ -1896,6 +2136,9 @@ css_error node_is_visited(void *pw, void *node, bool *match)
+ 
+ static struct {
+ 	dom_node *chain[DYNAMIC_CHAIN_MAX];
++	/* reached from the top of a shadow tree: a host, which matches
++	   :focus while what has focus is in its tree (VitaSurf) */
++	bool host[DYNAMIC_CHAIN_MAX];
+ 	unsigned n;
+ } dynamic[NSCSS_DYNAMIC_COUNT];
+ 
+@@ -1941,20 +2184,42 @@ bool nscss_set_dynamic(enum nscss_dynamic which, dom_node *node,
+ 		dom_node_unref(dynamic[which].chain[i]);
+ 	dynamic[which].n = 0;
+ 
+-	for (n = node != NULL ? dom_node_ref(node) : NULL; n != NULL; ) {
+-		dom_node *parent = NULL;
+-		dom_node_type type;
++	/* up through the shadow roots on the way, to their hosts, as
++	   :hover and :focus-within reach in a browser (VitaSurf) */
++	{
++		bool crossed = false;
+ 
+-		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+-				type != DOM_ELEMENT_NODE ||
+-				dynamic[which].n == DYNAMIC_CHAIN_MAX) {
+-			dom_node_unref(n);
+-			break;
++		for (n = node != NULL ? dom_node_ref(node) : NULL;
++				n != NULL; ) {
++			dom_node *parent = NULL;
++			dom_node_type type;
++
++			if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++					type == DOM_DOCUMENT_FRAGMENT_NODE) {
++				dom_element *host = NULL;
++
++				dom_document_fragment_get_host(
++						(dom_document_fragment *) n,
++						&host);
++				dom_node_unref(n);
++				n = (dom_node *) host;
++				crossed = true;
++				continue;
++			}
++			if (type != DOM_ELEMENT_NODE ||
++					dynamic[which].n ==
++						DYNAMIC_CHAIN_MAX) {
++				dom_node_unref(n);
++				break;
++			}
++			dynamic[which].host[dynamic[which].n] = crossed;
++			dynamic[which].chain[dynamic[which].n++] = n;
++			crossed = false;
++			if (dom_node_get_parent_node(n, &parent) !=
++					DOM_NO_ERR)
++				parent = NULL;
++			n = parent;
+ 		}
+-		dynamic[which].chain[dynamic[which].n++] = n;
+-		if (dom_node_get_parent_node(n, &parent) != DOM_NO_ERR)
+-			parent = NULL;
+-		n = parent;
+ 	}
+ 	return true;
+ }
+@@ -2005,9 +2270,17 @@ css_error node_is_active(void *pw, void *node, bool *match)
+  */
+ css_error node_is_focus(void *pw, void *node, bool *match)
+ {
++	unsigned i;
++
+ 	(void)pw;
+ 	*match = (dynamic[NSCSS_FOCUS].n > 0 &&
+ 		  dynamic[NSCSS_FOCUS].chain[0] == node);
++	/* a shadow host, while focus is in its tree */
++	for (i = 1; !*match && i < dynamic[NSCSS_FOCUS].n; i++) {
++		if (dynamic[NSCSS_FOCUS].chain[i] == node &&
++				dynamic[NSCSS_FOCUS].host[i])
++			*match = true;
++	}
+ 	return CSS_OK;
+ }
+ 
+@@ -2632,7 +2905,17 @@ static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
+ 	(void)pw;
+ 	*match = false;
+ 
+-	if (pseudo_named(name, "focus-visible")) {
++	if (pseudo_named(name, "-vita-host")) {
++		/* a shadow host, as the rewrite of its shadow tree's rules
++		 * names it (VitaSurf) */
++		dom_document_fragment *root = NULL;
++
++		if (dom_element_get_shadow_root((dom_element *) n, &root) ==
++				DOM_NO_ERR && root != NULL) {
++			*match = true;
++			dom_node_unref(root);
++		}
++	} else if (pseudo_named(name, "focus-visible")) {
+ 		*match = focus_visible && dynamic[NSCSS_FOCUS].n > 0 &&
+ 			dynamic[NSCSS_FOCUS].chain[0] == node;
+ 	} else if (pseudo_named(name, "focus-within")) {
+diff --git a/content/handlers/css/select.h b/content/handlers/css/select.h
+index 434df8646..de2954974 100644
+--- a/content/handlers/css/select.h
++++ b/content/handlers/css/select.h
+@@ -72,6 +72,13 @@ css_error node_is_visited(void *pw, void *node, bool *match);
+  */
+ void nscss_clear_node_data(dom_node *n);
+ 
++/**
++ * The tree a node is in, as the cascade keeps rules to trees (VitaSurf):
++ * the shadow root at the top of it, unreferenced, or NULL for the
++ * document's own tree and for anything not in a shadow tree.
++ */
++void *nscss_tree_scope(dom_node *n);
++
+ /**
+  * Take the selection data libcss cached on a node off it, without
+  * destroying it, so the node can be selected for again and the data put
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 4372a9390..59333d6ed 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -403,8 +403,23 @@ css_select_results *html_select_style(html_content *c,
+ 	}
+ 	/* libcss keeps what it selected on the node, and on its parent
+ 	 * when that had nothing, and box construction insists on finding
+-	 * nothing there: put back what was there on both */
++	 * nothing there: put back what was there on both. The parent is
++	 * libcss's, which goes from the top of a shadow tree to its
++	 * host. */
+ 	dom_node_get_parent_node(n, &parent);
++	if (parent != NULL) {
++		dom_node_type type;
++		dom_element *host = NULL;
++
++		if (dom_node_get_node_type(parent, &type) == DOM_NO_ERR &&
++				type == DOM_DOCUMENT_FRAGMENT_NODE) {
++			dom_document_fragment_get_host(
++					(dom_document_fragment *) parent,
++					&host);
++			dom_node_unref(parent);
++			parent = (dom_node *) host;
++		}
++	}
+ 	if (parent != NULL)
+ 		kept_parent = nscss_take_node_data(parent);
+ 	kept = nscss_take_node_data(n);
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index ee1ce1382..ba7ad95bf 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -48,6 +48,7 @@
+ #include "html/private.h"
+ #include "html/css.h"
+ #include "css/internal.h"
++#include "css/select.h"
+ #include "desktop/system_colour.h"
+ #include "utils/file.h"
+ #include "content/fetchers/resource.h"
+@@ -1418,10 +1419,13 @@ html_css_build_selection_context(html_content *c,
+ 			/* TODO: Pass the sheet's full media query, instead of
+ 			 *       "screen".
+ 			 */
+-			css_ret = css_select_ctx_append_sheet(select_ctx,
+-							      sheet,
+-							      origin,
+-							      "screen");
++			/* an author sheet styles the tree its element is
++			   in: the document's, or a shadow tree (VitaSurf) */
++			css_ret = css_select_ctx_append_sheet_scoped(
++					select_ctx, sheet, origin, "screen",
++					origin == CSS_ORIGIN_AUTHOR &&
++					hsheet->node != NULL ?
++					nscss_tree_scope(hsheet->node) : NULL);
+ 			if (css_ret != CSS_OK) {
+ 				css_select_ctx_destroy(select_ctx);
+ 				if (early)
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index ead5236bf..21966b4d9 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -765,6 +765,19 @@ static void html_process_quiet_descendants(html_content *htmlc,
+ 				type == DOM_ELEMENT_NODE) {
+ 			html_process_inserted_element(htmlc, n);
+ 		}
++		/* and the shadow tree an element holds (VitaSurf) */
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++				type == DOM_ELEMENT_NODE) {
++			dom_document_fragment *shadow = NULL;
++
++			if (dom_element_get_shadow_root((dom_element *) n,
++					&shadow) == DOM_NO_ERR &&
++					shadow != NULL) {
++				html_process_quiet_descendants(htmlc,
++						(dom_node *) shadow);
++				dom_node_unref(shadow);
++			}
++		}
+ 
+ 		/* depth first, without recursion */
+ 		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 32f892497..a2d154596 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -1707,11 +1707,24 @@ static void html_clear_node_boxes(dom_node *root)
+ 	while (n != NULL) {
+ 		dom_node *next = NULL;
+ 		void *old = NULL;
++		dom_document_fragment *shadow = NULL;
++		dom_node_type type;
+ 
+ 		dom_node_set_user_data(n, corestring_dom___ns_key_box_node_data,
+ 				NULL, NULL, &old);
+ 		nscss_clear_node_data(n);
+ 
++		/* and the shadow tree an element holds, which is drawn in
++		 * its place (VitaSurf) */
++		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
++				type == DOM_ELEMENT_NODE &&
++				dom_element_get_shadow_root((dom_element *) n,
++					&shadow) == DOM_NO_ERR &&
++				shadow != NULL) {
++			html_clear_node_boxes((dom_node *) shadow);
++			dom_node_unref(shadow);
++		}
++
+ 		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
+ 			next = NULL;
+ 		}
+diff --git a/desktop/frames.c b/desktop/frames.c
+index 4e5b3f737..ad00dd752 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -245,9 +245,27 @@ frame_node_page(struct browser_window *bw, struct dom_node *node)
+ 	dom_node_type type;
+ 	int i;
+ 
+-	while (dom_node_get_parent_node(n, &p) == DOM_NO_ERR && p != NULL) {
++	/* up to the document, through the host of any shadow tree on the
++	 * way: an iframe in a shadow tree is in the page when its host is,
++	 * and a widget that renders into a closed shadow root keeps its
++	 * frame there, hidden until it is needed (VitaSurf) */
++	for (;;) {
++		dom_element *host = NULL;
++
++		while (dom_node_get_parent_node(n, &p) == DOM_NO_ERR &&
++		       p != NULL) {
++			dom_node_unref(n);
++			n = p;
++		}
++		if (dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
++		    type != DOM_DOCUMENT_FRAGMENT_NODE ||
++		    dom_document_fragment_get_host(
++			    (dom_document_fragment *) n, &host) !=
++			    DOM_NO_ERR || host == NULL) {
++			break;
++		}
+ 		dom_node_unref(n);
+-		n = p;
++		n = (dom_node *) host;
+ 	}
+ 	if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+ 	    type == DOM_DOCUMENT_NODE) {

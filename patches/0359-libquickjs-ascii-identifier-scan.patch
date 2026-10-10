@@ -1,0 +1,27 @@
+diff --git a/quickjs.c b/quickjs.c
+index 2b181a7..41c0476 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22555,6 +22555,22 @@ static JSAtom parse_ident(JSParseState *s, const uint8_t **pp,
+     JSAtom atom = JS_ATOM_NULL;
+ 
+     p = *pp;
++    /*
++     * A plain ASCII name, nearly every one (VitaSurf): it is in the
++     * source as it is, so it is looked up there rather than copied out a
++     * character at a time first. Reading names was a fifth of compiling.
++     */
++    if (!is_private && !*pident_has_escape && c < 0x80 && p[-1] == c) {
++        const uint8_t *q = p;
++
++        while ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
++               (*q >= '0' && *q <= '9') || *q == '_' || *q == '$')
++            q++;
++        if (*q != '\\' && *q < 0x80) {
++            *pp = q;
++            return JS_NewAtomLen(s->ctx, (const char *)(p - 1), q - (p - 1));
++        }
++    }
+     buf = ident_buf;
+     ident_size = sizeof(ident_buf);
+     ident_pos = 0;

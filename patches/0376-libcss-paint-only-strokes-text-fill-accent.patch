@@ -1,0 +1,20 @@
+diff --git a/src/select/arena.c b/src/select/arena.c
+index 0709a46..693b6f0 100644
+--- a/src/select/arena.c
++++ b/src/select/arena.c
+@@ -410,6 +410,15 @@ static void overlay_paint_only(css_computed_style *tmp,
+ 	overlay_transform_origin(tmp, b);
+ 	overlay_visibility(tmp, b);
+ 	overlay_z_index(tmp, b);
++	/* SVG strokes, painted as fill and stroke are; the text's fill
++	 * and a control's accent colour, painted over what is laid out */
++	overlay_stroke_dasharray(tmp, b);
++	overlay_stroke_dashoffset(tmp, b);
++	overlay_stroke_linecap(tmp, b);
++	overlay_stroke_linejoin(tmp, b);
++	overlay_stroke_miterlimit(tmp, b);
++	overlay_webkit_text_fill_color(tmp, b);
++	overlay_accent_color(tmp, b);
+ 
+ }
+ 

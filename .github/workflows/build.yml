@@ -92,6 +92,9 @@ jobs:
       - name: Build libjpeg-turbo with NEON
         run: ./scripts/build-libjpeg-simd.sh
 
+      - name: Build libcurl with HTTP/2
+        run: ./scripts/build-curl-http2.sh
+
       - name: Build QuickJS with shared function source
         run: ./scripts/build-quickjs.sh
 

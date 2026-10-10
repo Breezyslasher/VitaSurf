@@ -1,0 +1,129 @@
+diff --git a/include/dom/core/node.h b/include/dom/core/node.h
+index 9912b4c..75c851e 100644
+--- a/include/dom/core/node.h
++++ b/include/dom/core/node.h
+@@ -326,6 +326,26 @@ static inline dom_exception dom_node_get_attributes(struct dom_node *node,
+  */
+ bool dom_node_take_quiet(struct dom_node *node);
+ 
++/**
++ * Walks of the subtree under root, root left out, in tree order
++ * (VitaSurf). The nodes and names they return are borrowed: no reference
++ * is taken, so the caller must run no script and change no tree while
++ * it holds one.
++ *
++ * dom_node_vita_next_element: the element after `after`, or the first
++ * if `after` is NULL; NULL when there are no more.
++ * dom_node_vita_find_tag: the same, for elements a selector of the one
++ * bare tag `tag` matches (any ASCII case in the HTML namespace or none,
++ * the tag name exactly in any other), adding the elements it looked at
++ * to *visits if visits is not NULL.
++ * dom_node_vita_local_name: an element's local name, or NULL.
++ */
++struct dom_node *dom_node_vita_next_element(struct dom_node *root,
++		struct dom_node *after);
++struct dom_node *dom_node_vita_find_tag(struct dom_node *root,
++		struct dom_node *after, lwc_string *tag, uint32_t *visits);
++dom_string *dom_node_vita_local_name(struct dom_node *node);
++
+ #define dom_node_get_attributes(n, r) dom_node_get_attributes( \
+ 		(dom_node *) (n), (struct dom_namednodemap **) (r))
+ 
+diff --git a/src/core/node.c b/src/core/node.c
+index 44fbdf2..c1c4e41 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -20,6 +20,7 @@
+ #include <dom/core/implementation.h>
+ #include <dom/core/document_type.h>
+ #include <dom/events/events.h>
++#include <dom/dom.h>
+ 
+ #include "core/string.h"
+ #include "core/namednodemap.h"
+@@ -1213,6 +1214,85 @@ bool dom_node_take_quiet(struct dom_node *node)
+ 	return was;
+ }
+ 
++/*
++ * Walks of a subtree that hand out borrowed nodes (VitaSurf). The walk
++ * through the public interface took and dropped a reference at every
++ * step and went through the vtable for each child, sibling, parent,
++ * type and name: on a Home Assistant dashboard, where every card asks
++ * the body for its <action-handler> and the dashboard's components all
++ * sit in the light tree, that was 8% of the load. These follow the
++ * links directly. Nothing they return is referenced, so the caller must
++ * run no script and change no tree while it holds one.
++ */
++
++/* The node after n in tree order, within root (root itself first comes
++ * up as n), or NULL at the end. */
++static inline dom_node_internal *vita_next(dom_node_internal *root,
++		dom_node_internal *n)
++{
++	if (n->first_child != NULL)
++		return n->first_child;
++	while (n != root) {
++		if (n->next != NULL)
++			return n->next;
++		n = n->parent;
++	}
++	return NULL;
++}
++
++dom_node *dom_node_vita_next_element(dom_node *root, dom_node *after)
++{
++	dom_node_internal *r = (dom_node_internal *) root;
++	dom_node_internal *n = after != NULL ? (dom_node_internal *) after : r;
++
++	for (n = vita_next(r, n); n != NULL; n = vita_next(r, n)) {
++		if (n->type == DOM_ELEMENT_NODE)
++			return (dom_node *) n;
++	}
++	return NULL;
++}
++
++dom_string *dom_node_vita_local_name(dom_node *node)
++{
++	dom_node_internal *n = (dom_node_internal *) node;
++
++	return n->type == DOM_ELEMENT_NODE ? n->name : NULL;
++}
++
++/*
++ * Whether element n is what a selector of the one bare tag names: the
++ * name in any ASCII case for an element in the HTML namespace or none,
++ * and for any other its tag name exactly.
++ */
++static inline bool vita_tag_is(dom_node_internal *n, lwc_string *tag)
++{
++	if (n->name == NULL || !dom_string_caseless_lwc_isequal(n->name, tag))
++		return false;
++	if (n->namespace == NULL || dom_string_isequal(n->namespace,
++			dom_namespaces[DOM_NAMESPACE_HTML]))
++		return true;
++	return n->prefix == NULL && dom_string_lwc_isequal(n->name, tag);
++}
++
++dom_node *dom_node_vita_find_tag(dom_node *root, dom_node *after,
++		lwc_string *tag, uint32_t *visits)
++{
++	dom_node_internal *r = (dom_node_internal *) root;
++	dom_node_internal *n = after != NULL ? (dom_node_internal *) after : r;
++	uint32_t seen = 0;
++
++	for (n = vita_next(r, n); n != NULL; n = vita_next(r, n)) {
++		if (n->type != DOM_ELEMENT_NODE)
++			continue;
++		seen++;
++		if (vita_tag_is(n, tag))
++			break;
++	}
++	if (visits != NULL)
++		*visits += seen;
++	return (dom_node *) n;
++}
++
+ dom_exception _dom_node_clone_node(dom_node_internal *node, bool deep,
+ 		dom_node_internal **result)
+ {

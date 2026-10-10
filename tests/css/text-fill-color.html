@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!-- -webkit-text-fill-color (VitaSurf): glyphs are filled with it in
+     place of the colour, and it inherits. In Chrome: A blue, B blue
+     (inherited past the child's red), C green (currentcolor stays a
+     keyword and follows the child's colour), D red (none set). -->
+<html><head><title>text fill</title><style>
+body { font: 16px sans-serif }
+#a { color: red; -webkit-text-fill-color: blue }
+#b { -webkit-text-fill-color: blue } #b span { color: red }
+#c { -webkit-text-fill-color: currentcolor; color: red } #c span { color: green }
+#d { color: red }
+</style></head><body>
+<p id="a">AAA</p>
+<p id="b"><span>BBB</span></p>
+<p id="c"><span>CCC</span></p>
+<p id="d">DDD</p>
+</body></html>

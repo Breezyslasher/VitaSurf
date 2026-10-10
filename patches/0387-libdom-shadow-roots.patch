@@ -1,0 +1,760 @@
+diff --git a/bindings/hubbub/parser.c b/bindings/hubbub/parser.c
+index 432bd54..4b6e676 100644
+--- a/bindings/hubbub/parser.c
++++ b/bindings/hubbub/parser.c
+@@ -9,6 +9,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <strings.h>
+ 
+ #include <hubbub/errors.h>
+ #include <hubbub/hubbub.h>
+@@ -52,8 +53,17 @@ struct dom_hubbub_parser {
+ 	dom_script script;      /**< Script callback function */
+ 
+ 	void *mctx;		/**< Pointer to client data */
++
++	bool fragment;		/**< parsing for innerHTML and the like,
++				     which leaves shadow root templates as
++				     templates (VitaSurf) */
+ };
+ 
++/* <template shadowrootmode> elements a document's parser has made
++ * (VitaSurf): the client turns each into its parent's shadow root, as
++ * the HTML standard's parser does, before the next script runs. */
++unsigned int dom_hubbub_shadow_templates;
++
+ /* Forward declaration to break reference loop */
+ /* prefix + ":" + local, for an attribute the tokeniser split apart */
+ static bool name_is(dom_string *s, const char *want)
+@@ -255,6 +265,22 @@ static hubbub_error create_element(void *parser, const hubbub_tag *tag,
+ 			goto clean1;
+ 	}
+ 
++	if (!dom_parser->fragment && tag->ns == HUBBUB_NS_HTML &&
++			tag->name.len == 8 &&
++			memcmp(tag->name.ptr, "template", 8) == 0) {
++		uint32_t i;
++
++		for (i = 0; i < tag->n_attributes; i++) {
++			if (tag->attributes[i].name.len == 14 &&
++					strncasecmp((const char *)
++						tag->attributes[i].name.ptr,
++						"shadowrootmode", 14) == 0) {
++				dom_hubbub_shadow_templates++;
++				break;
++			}
++		}
++	}
++
+ 	/* Now do some special per-element-type handling */
+ 	dom_html_element_type tag_type;
+ 	err = dom_html_element_get_tag_type(element, &tag_type);
+@@ -827,6 +853,7 @@ dom_hubbub_parser_create(dom_hubbub_parser_params *params,
+ 	}
+ 
+ 	binding->complete = false;
++	binding->fragment = false;
+ 
+ 	if (params->msg == NULL) {
+ 		binding->msg = dom_hubbub_parser_default_msg;
+@@ -958,6 +985,7 @@ dom_hubbub_fragment_parser_create(dom_hubbub_parser_params *params,
+ 	}
+ 
+ 	binding->complete = false;
++	binding->fragment = true;
+ 
+ 	if (params->msg == NULL) {
+ 		binding->msg = dom_hubbub_parser_default_msg;
+diff --git a/bindings/hubbub/parser.h b/bindings/hubbub/parser.h
+index 5a95a91..ff42297 100644
+--- a/bindings/hubbub/parser.h
++++ b/bindings/hubbub/parser.h
+@@ -66,6 +66,10 @@ typedef struct dom_hubbub_parser_params {
+ } dom_hubbub_parser_params;
+ 
+ /* Create a Hubbub parser instance */
++/* <template shadowrootmode> elements document parsers have made, for
++ * the client to turn into shadow roots (VitaSurf) */
++extern unsigned int dom_hubbub_shadow_templates;
++
+ dom_hubbub_error dom_hubbub_parser_create(dom_hubbub_parser_params *params,
+ 		dom_hubbub_parser **parser,
+ 		dom_document **document);
+diff --git a/include/dom/core/doc_fragment.h b/include/dom/core/doc_fragment.h
+index fdd10f7..040190f 100644
+--- a/include/dom/core/doc_fragment.h
++++ b/include/dom/core/doc_fragment.h
+@@ -7,6 +7,27 @@
+ #ifndef dom_core_documentfragment_h_
+ #define dom_core_documentfragment_h_
+ 
++#include <stdbool.h>
++
++#include <dom/core/exceptions.h>
++
+ typedef struct dom_document_fragment dom_document_fragment;
+ 
++struct dom_element;
++
++/*
++ * Shadow roots (VitaSurf). A shadow root is a document fragment that an
++ * element holds as its shadow tree. Its children are a tree of their own:
++ * the fragment has no parent, so the DOM's own walks stop at it. Only the
++ * walks that build the page -- selector matching and the event path --
++ * go on from it to its host.
++ */
++dom_exception dom_element_attach_shadow(struct dom_element *element,
++		bool closed, dom_document_fragment **root);
++dom_exception dom_element_get_shadow_root(struct dom_element *element,
++		dom_document_fragment **root);
++dom_exception dom_document_fragment_get_host(dom_document_fragment *frag,
++		struct dom_element **host);
++bool dom_document_fragment_is_closed(dom_document_fragment *frag);
++
+ #endif
+diff --git a/include/dom/core/element.h b/include/dom/core/element.h
+index 7ed12e2..e84f36c 100644
+--- a/include/dom/core/element.h
++++ b/include/dom/core/element.h
+@@ -356,5 +356,13 @@ dom_exception dom_element_named_parent_node(dom_element *element,
+ 		lwc_string *name, dom_element **parent);
+ dom_exception dom_element_parent_node(dom_element *element,
+ 		dom_element **parent);
++/* The same, going on from the top of a shadow tree to its host
++   (VitaSurf) */
++dom_exception dom_element_named_ancestor_node_cross(dom_element *element,
++		lwc_string *name, dom_element **ancestor);
++dom_exception dom_element_named_parent_node_cross(dom_element *element,
++		lwc_string *name, dom_element **parent);
++dom_exception dom_element_parent_node_cross(dom_element *element,
++		dom_element **parent);
+ 
+ #endif
+diff --git a/include/dom/events/event.h b/include/dom/events/event.h
+index aba9655..dfbbf3b 100644
+--- a/include/dom/events/event.h
++++ b/include/dom/events/event.h
+@@ -113,4 +113,13 @@ dom_exception _dom_event_set_is_trusted(dom_event *evt, bool trusted);
+ #define dom_event_set_is_trusted(e,t) _dom_event_set_is_trusted(	\
+ 		(dom_event *) (e), (bool) (t))
+ 
++dom_exception _dom_event_set_composed(dom_event *evt, bool composed);
++#define dom_event_set_composed(e,c) _dom_event_set_composed(	\
++		(dom_event *) (e), (bool) (c))
++
++dom_exception _dom_event_get_origin(dom_event *evt,
++		dom_event_target **origin);
++#define dom_event_get_origin(e,o) _dom_event_get_origin(	\
++		(dom_event *) (e), (dom_event_target **) (o))
++
+ #endif
+diff --git a/src/core/doc_fragment.c b/src/core/doc_fragment.c
+index 9e10a1a..d781b4f 100644
+--- a/src/core/doc_fragment.c
++++ b/src/core/doc_fragment.c
+@@ -12,6 +12,7 @@
+ 
+ #include "core/document.h"
+ #include "core/doc_fragment.h"
++#include "core/element.h"
+ #include "core/node.h"
+ #include "utils/utils.h"
+ 
+@@ -20,6 +21,9 @@
+  */
+ struct dom_document_fragment {
+ 	dom_node_internal base;		/**< Base node */
++	/** the element whose shadow root this is, unowned (VitaSurf) */
++	struct dom_element *shadow_host;
++	bool shadow_closed;		/**< attached with mode "closed" */
+ };
+ 
+ static const struct dom_node_vtable df_vtable = {
+@@ -60,6 +64,8 @@ dom_exception _dom_document_fragment_create(dom_document *doc,
+ 
+ 	f->base.base.vtable = &df_vtable;
+ 	f->base.vtable = &df_protect_vtable;
++	f->shadow_host = NULL;
++	f->shadow_closed = false;
+ 
+ 	/* And initialise the node */
+ 	err = _dom_document_fragment_initialise(&f->base, doc, 
+@@ -115,9 +121,106 @@ dom_exception _dom_df_copy(dom_node_internal *old, dom_node_internal **copy)
+ 		free(new_f);
+ 		return err;
+ 	}
++	/* a copy of a shadow root is no element's shadow root */
++	new_f->shadow_host = NULL;
++	new_f->shadow_closed = false;
+ 
+ 	*copy = (dom_node_internal *) new_f;
+ 
+ 	return DOM_NO_ERR;
+ }
+ 
++
++/*-----------------------------------------------------------------------*/
++
++/* Shadow roots (VitaSurf) */
++
++struct dom_element *_dom_document_fragment_host(
++		const dom_document_fragment *frag)
++{
++	return frag->shadow_host;
++}
++
++void _dom_document_fragment_drop_host(dom_document_fragment *frag)
++{
++	frag->shadow_host = NULL;
++}
++
++/**
++ * Give an element a shadow root
++ *
++ * \param element  The element, which has none yet
++ * \param closed   Whether the root was asked for with mode "closed"
++ * \param root     Pointer to location to receive the root, referenced
++ * 
++eturn DOM_NO_ERR, DOM_NOT_SUPPORTED_ERR if the element has one, or
++ *         DOM_NO_MEM_ERR.
++ *
++ * The element holds the root for as long as it lives; the root names the
++ * element as its host until then.
++ */
++dom_exception dom_element_attach_shadow(struct dom_element *element,
++		bool closed, dom_document_fragment **root)
++{
++	dom_node_internal *el = (dom_node_internal *) element;
++	dom_document_fragment *f = NULL;
++	dom_exception err;
++
++	*root = NULL;
++	if (element->shadow_root != NULL)
++		return DOM_NOT_SUPPORTED_ERR;
++
++	err = _dom_document_create_document_fragment(el->owner, &f);
++	if (err != DOM_NO_ERR)
++		return err;
++
++	f->shadow_host = element;
++	f->shadow_closed = closed;
++	/* the element's reference, given back when it goes */
++	element->shadow_root = f;
++	*root = (dom_document_fragment *) dom_node_ref(f);
++
++	return DOM_NO_ERR;
++}
++
++/**
++ * An element's shadow root, open or closed
++ *
++ * \param element  The element
++ * \param root     Pointer to location to receive the root, referenced,
++ *                 or NULL when it has none
++ * 
++eturn DOM_NO_ERR.
++ */
++dom_exception dom_element_get_shadow_root(struct dom_element *element,
++		dom_document_fragment **root)
++{
++	*root = element->shadow_root;
++	if (*root != NULL)
++		dom_node_ref(*root);
++	return DOM_NO_ERR;
++}
++
++/**
++ * The host of a shadow root
++ *
++ * \param frag  The fragment
++ * \param host  Pointer to location to receive the host, referenced, or
++ *              NULL when the fragment is no shadow root or its host is
++ *              gone
++ * 
++eturn DOM_NO_ERR.
++ */
++dom_exception dom_document_fragment_get_host(dom_document_fragment *frag,
++		struct dom_element **host)
++{
++	*host = frag->shadow_host;
++	if (*host != NULL)
++		dom_node_ref(*host);
++	return DOM_NO_ERR;
++}
++
++bool dom_document_fragment_is_closed(dom_document_fragment *frag)
++{
++	return frag->shadow_closed;
++}
+diff --git a/src/core/doc_fragment.h b/src/core/doc_fragment.h
+index 944516f..befb1b4 100644
+--- a/src/core/doc_fragment.h
++++ b/src/core/doc_fragment.h
+@@ -17,6 +17,12 @@ dom_exception _dom_document_fragment_create(dom_document *doc,
+ 
+ void _dom_document_fragment_destroy(dom_document_fragment *frag);
+ 
++/* the host of a shadow root, unowned, or NULL (VitaSurf) */
++struct dom_element *_dom_document_fragment_host(
++		const dom_document_fragment *frag);
++/* a host going away lets go of its shadow root (VitaSurf) */
++void _dom_document_fragment_drop_host(dom_document_fragment *frag);
++
+ #define _dom_document_fragment_initialise	_dom_node_initialise
+ #define _dom_document_fragment_finalise		_dom_node_finalise
+ 
+diff --git a/src/core/element.c b/src/core/element.c
+index 659a579..04b57e1 100644
+--- a/src/core/element.c
++++ b/src/core/element.c
+@@ -24,6 +24,7 @@
+ #include "core/attr.h"
+ #include "core/document.h"
+ #include "core/element.h"
++#include "core/doc_fragment.h"
+ #include "core/node.h"
+ #include "core/namednodemap.h"
+ #include "utils/validate.h"
+@@ -621,6 +622,7 @@ dom_exception _dom_element_initialise(struct dom_document *doc,
+ 
+ 	el->n_classes = 0;
+ 	el->classes = NULL;
++	el->shadow_root = NULL;
+ 
+ 	return DOM_NO_ERR;
+ }
+@@ -645,6 +647,15 @@ void _dom_element_finalise(struct dom_element *ele)
+ 	/* Destroy the pre-separated class names */
+ 	_dom_element_destroy_classes(ele);
+ 
++	/* Let go of the shadow root, which may outlive it (VitaSurf) */
++	if (ele->shadow_root != NULL) {
++		dom_document_fragment *root = ele->shadow_root;
++
++		ele->shadow_root = NULL;
++		_dom_document_fragment_drop_host(root);
++		dom_node_unref(root);
++	}
++
+ 	/* Finalise base class */
+ 	_dom_node_finalise(&ele->base);
+ }
+@@ -1592,6 +1603,9 @@ dom_exception _dom_element_copy_internal(dom_element *old, dom_element *new)
+ 		new->classes = NULL;
+ 	}
+ 
++	/* a copy has no shadow root of its own (VitaSurf) */
++	new->shadow_root = NULL;
++
+ 	err = dom_node_copy_internal(old, new);
+ 	if (err != DOM_NO_ERR) {
+ 		goto error;
+@@ -2453,3 +2467,89 @@ bool attributes_equal(void *p1, void *p2)
+ }
+ /*------------------ End of namednodemap functions -----------------------*/
+ 
++/*
++ * The same walks, going on from the top of a shadow tree to its host
++ * (VitaSurf): for a selector a shadow tree's own rules were rewritten
++ * into, which names the host. A page's own rules use the walks above,
++ * which stop at a shadow root, as they stop at the top of a
++ * document.
++ */
++dom_exception dom_element_named_ancestor_node_cross(dom_element *element,
++		lwc_string *name, dom_element **ancestor)
++{
++	dom_node_internal *node = (dom_node_internal *)element;
++
++	*ancestor = NULL;
++
++	/* within the tree, then into the host of the first shadow root
++	 * on the way, only when it is the one named: a shadow tree's
++	 * rules reach their own host, not the host of a tree around it */
++	for (node = node->parent; node != NULL; node = node->parent) {
++		if (node->type == DOM_DOCUMENT_FRAGMENT_NODE) {
++			dom_node_internal *host = (dom_node_internal *)
++				_dom_document_fragment_host(
++					(dom_document_fragment *) node);
++
++			if (host != NULL && host->name != NULL &&
++					dom_string_caseless_lwc_isequal(
++						host->name, name))
++				*ancestor = (dom_element *)
++					dom_node_ref(host);
++			break;
++		}
++		if (node->type != DOM_ELEMENT_NODE)
++			continue;
++
++		assert(node->name != NULL);
++
++		if (dom_string_caseless_lwc_isequal(node->name, name)) {
++			*ancestor = (dom_element *)dom_node_ref(node);
++			break;
++		}
++	}
++
++	return DOM_NO_ERR;
++}
++
++dom_exception dom_element_named_parent_node_cross(dom_element *element,
++		lwc_string *name, dom_element **parent)
++{
++	dom_node_internal *node = (dom_node_internal *)element;
++
++	*parent = NULL;
++
++	for (node = _dom_node_flat_parent(node); node != NULL;
++			node = _dom_node_flat_parent(node)) {
++		if (node->type != DOM_ELEMENT_NODE)
++			continue;
++
++		assert(node->name != NULL);
++
++		if (dom_string_caseless_lwc_isequal(node->name, name)) {
++			*parent = (dom_element *)dom_node_ref(node);
++		}
++		break;
++	}
++
++	return DOM_NO_ERR;
++}
++
++dom_exception dom_element_parent_node_cross(dom_element *element,
++		dom_element **parent)
++{
++	dom_node_internal *node = (dom_node_internal *)element;
++
++	*parent = NULL;
++
++	for (node = _dom_node_flat_parent(node); node != NULL;
++			node = _dom_node_flat_parent(node)) {
++		if (node->type != DOM_ELEMENT_NODE)
++			continue;
++
++		*parent = (dom_element *)dom_node_ref(node);
++		break;
++	}
++
++	return DOM_NO_ERR;
++}
++
+diff --git a/src/core/element.h b/src/core/element.h
+index 3befb85..c93d7c3 100644
+--- a/src/core/element.h
++++ b/src/core/element.h
+@@ -39,6 +39,9 @@ struct dom_element {
+ 
+ 	lwc_string **classes;
+ 	uint32_t n_classes;
++
++	/** its shadow root, held by it, or NULL (VitaSurf) */
++	struct dom_document_fragment *shadow_root;
+ };
+ 
+ dom_exception _dom_element_create(struct dom_document *doc,
+diff --git a/src/core/node.c b/src/core/node.c
+index c1c4e41..54af8e1 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -2714,6 +2714,11 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	dom_document *doc;
+ 	dom_document_event_internal *dei = NULL;
+ 	dom_event_target **targets;
++	/* what each of those sees as the target: the node it was sent to,
++	   or the host of the shadow tree it is in, for a target outside
++	   that tree (VitaSurf) */
++	dom_node_internal **retargets = NULL;
++	dom_node_internal *seen_as = (dom_node_internal *) et, *next;
+ 	uint32_t ntargets, ntargets_allocated, targetnr;
+ 	uint32_t type_bit;
+ 	void *pw;
+@@ -2752,11 +2757,27 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	ntargets_allocated = 0;
+ 	ntargets = 0;
+ 
+-	/* Add interested event listeners to array */
++	/* Add interested event listeners to array. The path goes on from
++	 * a shadow root to its host, for the browser's own events and for
++	 * one a script made composed; one that is not stays in the tree it
++	 * was sent in (VitaSurf). */
+ 	type_bit = _dom_event_type_bit(evt->type);
+-	for (; target != NULL; target = target->parent) {
++	for (; target != NULL; target = next) {
+ 		struct listener_entry *le = target->eti.listeners;
+ 		bool target_has_listener = false;
++		dom_node_internal *from = seen_as;
++
++		next = target->parent;
++		if (target->type == DOM_DOCUMENT_FRAGMENT_NODE) {
++			struct dom_element *host = _dom_document_fragment_host(
++					(dom_document_fragment *) target);
++
++			if (host != NULL) {
++				next = evt->composed ?
++					(dom_node_internal *) host : NULL;
++				seen_as = next != NULL ? next : seen_as;
++			}
++		}
+ 
+ 		if (le == NULL || (target->eti.type_mask & type_bit) == 0) {
+ 			/* This event target isn't listening to anything,
+@@ -2781,18 +2802,33 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 		/* The event target is listening for this event type,
+ 		 * so add it to the array. */
+ 		if (ntargets == ntargets_allocated) {
++			dom_node_internal **more;
++
+ 			err = _dom_event_targets_expand(&ntargets_allocated,
+ 					&targets);
+ 			if (err != DOM_NO_ERR) {
+ 				ret = err;
+ 				goto cleanup;
+ 			}
++			more = realloc(retargets, ntargets_allocated *
++					sizeof(*retargets));
++			if (more == NULL) {
++				ret = DOM_NO_MEM_ERR;
++				goto cleanup;
++			}
++			retargets = more;
+ 		}
++		/* the target as this one sees it: a shadow root is in the
++		   tree it holds, so it sees what was there (VitaSurf) */
++		retargets[ntargets] = (dom_node_internal *) dom_node_ref(
++				target->type == DOM_DOCUMENT_FRAGMENT_NODE ?
++				from : seen_as);
+ 		targets[ntargets++] = (dom_event_target *)dom_node_ref(target);
+ 	}
+ 
+ 	/* Fill the target of the event */
+ 	evt->target = et;
++	evt->origin = et;
+ 	evt->phase = DOM_CAPTURING_PHASE;
+ 
+ 	/* The window is on the path when the target is in its document,
+@@ -2801,8 +2837,19 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	if (window_hook != NULL) {
+ 		dom_node_internal *root = (dom_node_internal *) et;
+ 
+-		while (root->parent != NULL)
+-			root = root->parent;
++		/* through any shadow roots, for an event that leaves them */
++		for (;;) {
++			while (root->parent != NULL)
++				root = root->parent;
++			if (!evt->composed ||
++			    root->type != DOM_DOCUMENT_FRAGMENT_NODE ||
++			    _dom_document_fragment_host(
++				(dom_document_fragment *) root) == NULL)
++				break;
++			root = (dom_node_internal *)
++				_dom_document_fragment_host(
++					(dom_document_fragment *) root);
++		}
+ 		to_window = root == (dom_node_internal *) doc &&
+ 			!(dom_string_byte_length(evt->type) == 4 &&
+ 			  memcmp(dom_string_data(evt->type), "load", 4) == 0);
+@@ -2822,7 +2869,9 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	/* The window first (VitaSurf) */
+ 	if (to_window) {
+ 		evt->current = NULL;
++		evt->target = (dom_event_target *) seen_as;
+ 		window_hook(evt, doc, true, window_hook_pw);
++		evt->target = et;
+ 		if (evt->stop_now == true || evt->stop == true)
+ 			goto cleanup;
+ 	}
+@@ -2832,8 +2881,15 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 		dom_node_internal *node =
+ 			(dom_node_internal *) targets[targetnr - 1];
+ 
++		evt->target = (dom_event_target *) retargets[targetnr - 1];
++		/* a host the event is retargeted to is its target here */
++		evt->phase = evt->target == targets[targetnr - 1] &&
++				targets[targetnr - 1] != et ?
++				DOM_AT_TARGET : DOM_CAPTURING_PHASE;
+ 		err = _dom_event_target_dispatch(targets[targetnr - 1],
+ 				&node->eti, evt, DOM_CAPTURING_PHASE, success);
++		evt->target = et;
++		evt->phase = DOM_CAPTURING_PHASE;
+ 		if (err != DOM_NO_ERR) {
+ 			ret = err;
+ 			goto cleanup;
+@@ -2863,11 +2919,23 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	 * time with the document still loading. */
+ 	evt->phase = DOM_BUBBLING_PHASE;
+ 
+-	for (targetnr = 0; evt->bubble && targetnr < ntargets; ++targetnr) {
++	for (targetnr = 0; targetnr < ntargets; ++targetnr) {
+ 		dom_node_internal *node =
+ 			(dom_node_internal *) targets[targetnr];
++		evt->target = (dom_event_target *) retargets[targetnr];
++		/* a host the event is retargeted to hears it whether it
++		   bubbles or not, as its target */
++		if (evt->target == targets[targetnr] &&
++				targets[targetnr] != et) {
++			evt->phase = DOM_AT_TARGET;
++		} else if (!evt->bubble) {
++			evt->target = et;
++			continue;
++		}
+ 		err = _dom_event_target_dispatch(targets[targetnr],
+ 				&node->eti, evt, DOM_BUBBLING_PHASE, success);
++		evt->target = et;
++		evt->phase = DOM_BUBBLING_PHASE;
+ 		if (err != DOM_NO_ERR) {
+ 			ret = err;
+ 			goto cleanup;
+@@ -2881,7 +2949,9 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	/* and the window last (VitaSurf) */
+ 	if (to_window && evt->bubble) {
+ 		evt->current = NULL;
++		evt->target = (dom_event_target *) seen_as;
+ 		window_hook(evt, doc, false, window_hook_pw);
++		evt->target = et;
+ 	}
+ 
+ 	if (dei->actions == NULL)
+@@ -2925,12 +2995,16 @@ cleanup:
+ 		*success = false;
+ 	}
+ 
++	evt->target = et;
++	evt->origin = NULL;
+ 	while (ntargets--) {
+ 		dom_node_unref(targets[ntargets]);
++		dom_node_unref(retargets[ntargets]);
+ 	}
+ 	if (targets != NULL) {
+ 		free(targets);
+ 	}
++	free(retargets);
+ 
+ 	if (dei != NULL && dei->actions != NULL) {
+ 		dom_default_action_callback cb = dei->actions(evt->type,
+@@ -2983,3 +3057,25 @@ dom_exception _dom_node_dispatch_node_change_event(dom_document *doc,
+ 	return DOM_NO_ERR;
+ }
+ 
++
++/**
++ * The parent of a node in the tree the page is built from (VitaSurf)
++ *
++ * \param node  The node
++ * \return its parent, unowned; for a child of a shadow root, the root's
++ *         host. The DOM's own walks stop at a shadow root; selector
++ *         matching and the event path go on to its host.
++ */
++dom_node_internal *_dom_node_flat_parent(dom_node_internal *node)
++{
++	dom_node_internal *p = node->parent;
++	struct dom_element *host;
++
++	if (p != NULL && p->type == DOM_DOCUMENT_FRAGMENT_NODE) {
++		host = _dom_document_fragment_host(
++				(dom_document_fragment *) p);
++		if (host != NULL)
++			return (dom_node_internal *) host;
++	}
++	return p;
++}
+diff --git a/src/core/node.h b/src/core/node.h
+index 4d79edf..21629bc 100644
+--- a/src/core/node.h
++++ b/src/core/node.h
+@@ -303,6 +303,10 @@ void _dom_node_remove_pending(dom_node_internal *node);
+ #define dom_node_remove_pending(n) _dom_node_remove_pending(\
+ 		(dom_node_internal *) (n))
+ 
++/* A node's parent, or for the top of a shadow tree its host: what
++   selector matching and the event path walk (VitaSurf) */
++dom_node_internal *_dom_node_flat_parent(dom_node_internal *node);
++
+ dom_exception _dom_node_dispatch_node_change_event(dom_document *doc,
+ 		dom_node_internal *node, dom_node_internal *related,
+ 		dom_mutation_type change, bool *success);
+diff --git a/src/events/event.c b/src/events/event.c
+index b518040..bc4444a 100644
+--- a/src/events/event.c
++++ b/src/events/event.c
+@@ -56,6 +56,8 @@ dom_exception _dom_event_initialise(dom_event *evt)
+ 	evt->refcnt = 1;
+ 	evt->vtable = vtable;
+ 	evt->is_trusted = true;
++	evt->composed = true;
++	evt->origin = NULL;
+ 
+ 	return DOM_NO_ERR;
+ }
+@@ -394,3 +396,21 @@ dom_exception _dom_event_set_is_trusted(dom_event *evt, bool trusted)
+ 
+ 	return DOM_NO_ERR;
+ }
++
++/* Whether the event leaves a shadow tree for its host (VitaSurf) */
++dom_exception _dom_event_set_composed(dom_event *evt, bool composed)
++{
++	evt->composed = composed;
++
++	return DOM_NO_ERR;
++}
++
++/* The node it was sent to, unreferenced, while it is being dispatched,
++ * and NULL otherwise (VitaSurf) */
++dom_exception _dom_event_get_origin(dom_event *evt,
++		dom_event_target **origin)
++{
++	*origin = evt->origin;
++
++	return DOM_NO_ERR;
++}
+diff --git a/src/events/event.h b/src/events/event.h
+index 7cada7b..2d6d45d 100644
+--- a/src/events/event.h
++++ b/src/events/event.h
+@@ -50,6 +50,14 @@ struct dom_event {
+ 	bool in_dispatch;	/**< Whether this event is in dispatch */
+ 	bool is_initialised;	/**< Whether this event is initialised */
+ 	bool is_trusted;	/**< Whether this event is trusted */
++	/** whether it leaves a shadow tree for its host; the browser's
++	 * own events do, an event a script makes does only when it asks
++	 * (VitaSurf) */
++	bool composed;
++	/** the node it was sent to, while it is being dispatched: what
++	 * composedPath starts from, whatever a listener sees as the target
++	 * (VitaSurf) */
++	dom_event_target *origin;
+ };
+ 
+ /* Destructor */
+diff --git a/src/events/event_target.c b/src/events/event_target.c
+index 2e52951..1f3fe2c 100644
+--- a/src/events/event_target.c
++++ b/src/events/event_target.c
+@@ -297,13 +297,20 @@ dom_exception _dom_event_target_dispatch(dom_event_target *et,
+ 			/* A listener on the target itself belongs to
+ 			 * the at-target phase only: firing it in the
+ 			 * capture or bubble phase as well called it
+-			 * twice for one event (VitaSurf). */
++			 * twice for one event (VitaSurf). A shadow host
++			 * an event from its tree is retargeted to is
++			 * on the capture and bubble passes with the
++			 * event's phase at-target, and hears it there,
++			 * its capturing listeners on the first and the
++			 * others on the second. */
+ 			if ((snapshot[i].capture &&
+ 					phase == DOM_CAPTURING_PHASE &&
+-					evt->target != evt->current) ||
++					(evt->target != evt->current ||
++					 evt->phase == DOM_AT_TARGET)) ||
+ 			    (snapshot[i].capture == false &&
+ 					phase == DOM_BUBBLING_PHASE &&
+-					evt->target != evt->current) ||
++					(evt->target != evt->current ||
++					 evt->phase == DOM_AT_TARGET)) ||
+ 			    (evt->target == evt->current &&
+ 					phase == DOM_AT_TARGET)) {
+ 				snapshot[i].listener->handler(evt,

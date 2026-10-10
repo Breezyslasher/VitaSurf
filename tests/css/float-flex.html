@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!-- A floated flex container (VitaSurf): GitHub's contribution legend,
+     "Less [squares] More", floats right with display: flex, and was laid
+     out as a block, its items one under another. Expected lines are what
+     Chrome prints. -->
+<html><head><title>float flex</title><style>
+body { margin: 0; font: 12px sans-serif; width: 600px }
+.fr { float: right; display: flex; align-items: center }
+.fl { float: left; display: flex; flex-direction: column }
+.sq { width: 10px; height: 10px; margin: 0 2px; background: #2da44e }
+span { line-height: 14px }
+</style></head><body>
+<div style="overflow: hidden"><div class="fr" id="a"><span>Less</span>
+<div class="sq"></div><div class="sq"></div><div class="sq"></div>
+<div class="sq"></div><span>More</span></div></div>
+<div style="overflow: hidden"><div class="fl" id="b"><span>one</span>
+<span>two</span></div></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+window.addEventListener('load', function () { setTimeout(function () {
+  var a = document.getElementById('a').getBoundingClientRect();
+  var b = document.getElementById('b').getBoundingClientRect();
+  T('row flex float height', Math.round(a.height));
+  T('row flex float right edge', Math.round(a.right));
+  T('column flex float height', Math.round(b.height));
+}, 50); });
+</script></body></html>

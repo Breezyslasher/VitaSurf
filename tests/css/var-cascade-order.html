@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!-- A declaration that spends a var() keeps its place in the cascade
+     (VitaSurf). It was compiled once the element was known and cascaded
+     after everything else, so it beat a declaration of the same
+     specificity written after it: MUI's header, "background-image:
+     var(--Paper-overlay); background-image: none", was drawn with the
+     overlay on speedtest.net. Every line should say PASS, as in Chrome. -->
+<html><head><title>var() cascade order</title>
+<style>
+#a { --c: red; color: var(--c); color: green; }
+#b { --bg: linear-gradient(red, red); background-image: var(--bg); background-image: none; }
+#c { color: var(--c2, red); } #c { color: green; }
+#d { color: red; } #d { color: var(--nope, green); }
+#e { color: var(--g, green) !important; } #e { color: red; }
+div#g { color: var(--n, green); } #g { color: red; }
+#h { color: red; color: var(--n, green); }
+#j { color: var(--n, red); }
+</style></head><body>
+<div id="a">a</div><div id="b">b</div><div id="c">c</div><div id="d">d</div>
+<div id="e">e</div><div id="f" style="color: var(--n, red); color: green">f</div>
+<div id="g">g</div><div id="h">h</div><div id="j" style="color: green">j</div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + n +
+  ': ' + got + (got === want ? '' : ' (expected ' + want + ')');
+  o.textContent += l + '\n'; try { console.log(l); } catch (e) {} }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+var G = 'rgb(0, 128, 0)';
+T('a later plain declaration in the rule wins', cs('a').color, G);
+T('a later "none" wins over an earlier var()', cs('b').backgroundImage, 'none');
+T('a later rule wins over an earlier var()', cs('c').color, G);
+T('a later var() rule wins', cs('d').color, G);
+T('an !important var() wins over a later plain one', cs('e').color, G);
+T('the style attribute keeps its order', cs('f').color, G);
+T('a more specific var() rule wins', cs('g').color, G);
+T('a later var() in the rule wins', cs('h').color, G);
+T('the style attribute beats a var() rule', cs('j').color, G);
+</script>
+</body></html>

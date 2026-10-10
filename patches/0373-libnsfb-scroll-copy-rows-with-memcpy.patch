@@ -1,0 +1,39 @@
+diff --git a/src/plot/generic.c b/src/plot/generic.c
+index fe0a968..5571dc0 100644
+--- a/src/plot/generic.c
++++ b/src/plot/generic.c
+@@ -602,7 +602,33 @@ copy(nsfb_t *nsfb, nsfb_bbox_t *srcbox, nsfb_bbox_t *dstbox)
+ 			  ((dstx * nsfb->bpp) / 8));
+ 
+ 
+-	if (width == nsfb->width) {
++	if (srcy != dsty && (width * nsfb->bpp) / 8 <= nsfb->linelen) {
++		/*
++		 * A move up or down (VitaSurf): no row overlaps another,
++		 * so each is copied with memcpy, which newlib has in
++		 * optimised assembler, where memmove copies a word at a
++		 * time. The rows are taken in the order that reads each
++		 * before it is written over. Scrolling copied most of a
++		 * screen this way on every step, at 7 ms on the Vita.
++		 */
++		size_t row = (width * nsfb->bpp) / 8;
++
++		if (srcy > dsty) {
++			for (hloop = height; hloop > 0; hloop--) {
++				memcpy(dstptr, srcptr, row);
++				srcptr += nsfb->linelen;
++				dstptr += nsfb->linelen;
++			}
++		} else {
++			srcptr += height * nsfb->linelen;
++			dstptr += height * nsfb->linelen;
++			for (hloop = height; hloop > 0; hloop--) {
++				srcptr -= nsfb->linelen;
++				dstptr -= nsfb->linelen;
++				memcpy(dstptr, srcptr, row);
++			}
++		}
++	} else if (width == nsfb->width) {
+ 		/* take shortcut and use memmove */
+ 		memmove(dstptr, srcptr, (width * height * nsfb->bpp) / 8);
+ 	} else {

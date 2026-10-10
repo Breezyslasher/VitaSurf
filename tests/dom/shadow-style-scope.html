@@ -1,9 +1,8 @@
 <!DOCTYPE html>
-<!-- A shadow root's <style> applies to its own component only. Shadow
-     DOM is kept as light DOM here, so the rules are scoped to the host's
-     tag: Home Assistant's checkbox brought input{opacity:0;
-     pointer-events:none} into the page and hid every text field from
-     taps. A host's child whose slot the component does not put out is
+<!-- A shadow root's <style> applies to its own component only. Its
+     rules are scoped to the host's tag: Home Assistant's checkbox
+     brought input{opacity:0; pointer-events:none} into the page and hid
+     every text field from taps. A host's child whose slot the component does not put out is
      not drawn. Expected console output: five lines ending in "ok". -->
 <html><body>
 <input id=outer>

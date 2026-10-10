@@ -1,0 +1,145 @@
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index 8710be48a..5aa0cc442 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -2698,6 +2698,20 @@ static css_error node_is_pseudo(void *pw, void *node, lwc_string *name,
+ 		*match = (pseudo_tag_is(n, "details") ||
+ 				pseudo_tag_is(n, "dialog")) &&
+ 			pseudo_has(n, PA_OPEN);
++	} else if (pseudo_named(name, "popover-open")) {
++		/* a popover the page has shown: the script keeps the state
++		 * as user data, not as an attribute (VitaSurf) */
++		static dom_string *key;
++		void *open = NULL;
++
++		if (key == NULL && dom_string_create_interned(
++				(const uint8_t *) "__ns_key_popover_open", 21,
++				&key) != DOM_NO_ERR)
++			key = NULL;
++		if (key != NULL && dom_node_get_user_data(n, key, &open) ==
++				DOM_NO_ERR && open != NULL)
++			dom_element_has_attribute(n, corestring_dom_popover,
++					match);
+ 	} else if (pseudo_named(name, "closed")) {
+ 		*match = (pseudo_tag_is(n, "details") ||
+ 				pseudo_tag_is(n, "dialog")) &&
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index 79f5e0171..0adf2ce42 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -222,7 +222,8 @@ static bool grid_build_subgrid(const struct grid_subgrid_req *req, int axis,
+  * Resolve one libcss track sizing function into device pixels.
+  */
+ static void grid_resolve_sizing(const struct grid_ctx *ctx,
+-		uint8_t type, css_fixed value, css_unit unit, int axis_avail,
++		uint8_t type, css_fixed value, css_unit unit,
++		lwc_string *calc, int axis_avail,
+ 		enum grid_sizing *out_type, int *out_fixed, float *out_fr)
+ {
+ 	*out_fixed = 0;
+@@ -230,7 +231,18 @@ static void grid_resolve_sizing(const struct grid_ctx *ctx,
+ 
+ 	switch (type) {
+ 	case CSS_GRID_TRACK_LENGTH:
+-		if (unit == CSS_UNIT_PCT) {
++		if (unit == CSS_UNIT_CALC) {
++			/* a calc() resolves against the grid's size in the
++			 * axis; one with a percentage, while that size is
++			 * not known, is auto, as a percentage is */
++			if (calc == NULL || css_computed_calc_px(
++					ctx->grid->style, ctx->unit_len_ctx,
++					axis_avail == AUTO ? -1 : axis_avail,
++					calc, out_fixed) == false) {
++				*out_type = GS_AUTO;
++				return;
++			}
++		} else if (unit == CSS_UNIT_PCT) {
+ 			if (axis_avail == AUTO) {
+ 				*out_type = GS_AUTO;
+ 				return;
+@@ -260,7 +272,18 @@ static void grid_resolve_sizing(const struct grid_ctx *ctx,
+ 		*out_type = GS_MAX_CONTENT;
+ 		return;
+ 	case CSS_GRID_TRACK_FIT_CONTENT:
+-		if (unit == CSS_UNIT_PCT) {
++		if (unit == CSS_UNIT_CALC) {
++			if (calc == NULL || css_computed_calc_px(
++					ctx->grid->style, ctx->unit_len_ctx,
++					axis_avail == AUTO ? -1 : axis_avail,
++					calc, out_fixed) == false) {
++				*out_type = GS_MAX_CONTENT;
++				return;
++			}
++			if (*out_fixed < 0) {
++				*out_fixed = 0;
++			}
++		} else if (unit == CSS_UNIT_PCT) {
+ 			if (axis_avail == AUTO) {
+ 				*out_type = GS_MAX_CONTENT;
+ 				return;
+@@ -296,6 +319,7 @@ static void grid_track_init(const struct grid_ctx *ctx,
+ 		return;
+ 	}
+ 	grid_resolve_sizing(ctx, def->min_type, def->min_value, def->min_unit,
++			def->min_calc,
+ 			axis_avail, &t->min_type, &t->min_fixed, &fr);
+ 	if (t->min_type == GS_FR) {
+ 		/* A flexible minimum is treated as auto (spec) */
+@@ -305,6 +329,7 @@ static void grid_track_init(const struct grid_ctx *ctx,
+ 		t->min_type = GS_AUTO;
+ 	}
+ 	grid_resolve_sizing(ctx, def->max_type, def->max_value, def->max_unit,
++			def->max_calc,
+ 			axis_avail, &t->max_type, &t->max_fixed, &t->fr);
+ 	t->auto_repeat = (def->flags & (CSS_GRID_TRACK_FLAG_AUTO_FILL |
+ 			CSS_GRID_TRACK_FLAG_AUTO_FIT)) != 0;
+diff --git a/resources/default.css b/resources/default.css
+index e344107b8..07bb056e3 100644
+--- a/resources/default.css
++++ b/resources/default.css
+@@ -131,7 +131,7 @@ input[align=right] { float: right; }
+ 
+ select { background-color: #d9d9d9; color: #000; text-align: left;
+ 	font-family: sans-serif; width: auto; height: auto; overflow: hidden;
+-	border: medium inset #d9d9d9; padding: 1px 3px 1px 2px;
++	border: 2px inset #d9d9d9; padding: 1px 3px 1px 2px;
+ 	white-space: nowrap; margin: 0; }
+ select:after { content: "\25bc"; border-left: 2px ridge #d9d9d9; }
+ 
+@@ -167,6 +167,24 @@ mark {
+  * outright is closer to what the page intends than showing it. */
+ [hidden] { display: none; }
+ dialog:not([open]) { display: none; }
++/* A popover that is not shown has no box, and one that is gets the UA's
++ * popover styles, as HTML's rendering rules have them (VitaSurf); there
++ * is no top layer here. GitHub keeps each tooltip in the page as a
++ * closed popover, and drawn, "Change your avatar" sat over the profile
++ * name under the avatar. */
++[popover] {
++	position: fixed;
++	inset: 0;
++	width: fit-content;
++	height: fit-content;
++	margin: auto;
++	border: solid;
++	padding: 0.25em;
++	overflow: auto;
++	color: CanvasText;
++	background-color: Canvas;
++}
++[popover]:not(:popover-open):not(dialog[open]) { display: none; }
+ datalist { display: none; }
+ input[type=hidden] { display: none; }
+ /* a slot is where its assigned nodes go, with no box of its own, as in
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index 807ea01c0..f9f556035 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -300,6 +300,7 @@ CORESTRING_DOM_STRING(pause);
+ CORESTRING_DOM_STRING(placeholder);
+ CORESTRING_DOM_STRING(play);
+ CORESTRING_DOM_STRING(playing);
++CORESTRING_DOM_STRING(popover);
+ CORESTRING_DOM_STRING(popovertarget);
+ CORESTRING_DOM_STRING(popstate);
+ CORESTRING_DOM_STRING(progress);

@@ -1,0 +1,89 @@
+diff --git a/libregexp.c b/libregexp.c
+index ec558a4..4b9b03a 100644
+--- a/libregexp.c
++++ b/libregexp.c
+@@ -2491,6 +2491,72 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
+     }
+ }
+ 
++/*
++ * VitaSurf: a search whose pattern must begin with one particular
++ * character. A pattern that is not sticky starts with a loop that tries
++ * it at every position in turn; when the first thing it matches is a
++ * single character, no other position can match, so look for that
++ * character and try the pattern only there, in the same order. Home
++ * Assistant's error log runs /\/\/[#@] ?sourceMappingURL=.../gm over
++ * each of its bundles, megabytes on the Vita, where every position cost
++ * a trip through the interpreter. Returns false when the pattern is not
++ * of that kind and the ordinary search should run.
++ */
++static bool lre_first_char_search(REExecContext *s, uint8_t **capture,
++                                  StackInt *stack_buf, const uint8_t *bc_buf,
++                                  int cindex, int clen, int *pret)
++{
++    const uint8_t *pc = bc_buf + RE_HEADER_LEN, *body, *first;
++    int re_flags = lre_get_flags(bc_buf);
++    uint32_t ch;
++    int pos, i, ret;
++
++    if ((re_flags & LRE_FLAG_STICKY) || s->ignore_case)
++        return false;
++    /* split_goto_first, any, goto: the loop lre_compile puts first */
++    if (pc[0] != REOP_split_goto_first || pc[5] != REOP_any ||
++        pc[6] != REOP_goto || pc[11] != REOP_save_start)
++        return false;
++    body = pc + 11;
++    first = body + 2;
++    if (first[0] == REOP_char8)
++        ch = first[1];
++    else if (first[0] == REOP_char16)
++        ch = get_u16(first + 1);
++    else
++        return false;
++    if (ch >= 0xD800 && ch <= 0xDFFF)
++        return false;
++    if (s->cbuf_type == 0 && ch > 0xff) {
++        *pret = 0;  /* a Latin-1 string cannot hold it */
++        return true;
++    }
++    ret = 0;
++    for (pos = cindex; pos < clen; pos++) {
++        if (s->cbuf_type == 0) {
++            const uint8_t *p = memchr(s->cbuf + pos, (int)ch, clen - pos);
++            if (!p)
++                break;
++            pos = p - s->cbuf;
++        } else {
++            const uint16_t *p = (const uint16_t *)s->cbuf;
++            while (pos < clen && p[pos] != ch)
++                pos++;
++            if (pos >= clen)
++                break;
++        }
++        for (i = 0; i < s->capture_count * 2; i++)
++            capture[i] = NULL;
++        ret = lre_exec_backtrack(s, capture, stack_buf, 0, body,
++                                 s->cbuf + (pos << (s->cbuf_type == 0 ? 0 : 1)),
++                                 false);
++        if (ret != 0)
++            break;
++    }
++    *pret = ret;
++    return true;
++}
++
+ /* Return 1 if match, 0 if not match or < 0 if error (see LRE_RET_x). cindex is the
+    starting position of the match and must be such as 0 <= cindex <=
+    clen. */
+@@ -2527,6 +2593,11 @@ int lre_exec(uint8_t **capture,
+         capture[i] = NULL;
+     alloca_size = s->stack_size_max * sizeof(stack_buf[0]);
+     stack_buf = alloca(alloca_size);
++    if (lre_first_char_search(s, capture, stack_buf, bc_buf, cindex, clen,
++                              &ret)) {
++        lre_realloc(s->opaque, s->state_stack, 0);
++        return ret;
++    }
+     ret = lre_exec_backtrack(s, capture, stack_buf, 0, bc_buf + RE_HEADER_LEN,
+                              cbuf + (cindex << cbuf_type), false);
+     lre_realloc(s->opaque, s->state_stack, 0);

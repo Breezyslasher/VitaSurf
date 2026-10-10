@@ -1,0 +1,391 @@
+diff --git a/content/handlers/css/dump.c b/content/handlers/css/dump.c
+index f7645ab8d..5136a6366 100644
+--- a/content/handlers/css/dump.c
++++ b/content/handlers/css/dump.c
+@@ -151,6 +151,9 @@ static void dump_css_unit(FILE *stream, css_fixed val, css_unit unit)
+ 	case CSS_UNIT_CALC:
+ 		fprintf(stream, "calc()");
+ 		break;
++	case CSS_UNIT_EXPR:
++		fprintf(stream, "expr");
++		break;
+ 	}
+ }
+ 
+diff --git a/content/handlers/css/utils.h b/content/handlers/css/utils.h
+index 9fe8c3e5f..e952edf98 100644
+--- a/content/handlers/css/utils.h
++++ b/content/handlers/css/utils.h
+@@ -148,4 +148,22 @@ static inline uint8_t ns_computed_min_width_px(
+ 	return value;
+ }
+ 
++/**
++ * A held math function (CSS_UNIT_EXPR) in device pixels (VitaSurf), with
++ * what a percentage in it is of, already in device pixels at \a scale;
++ * -1 when there is nothing. The lengths in it are scaled, as the caller
++ * scales the ones it converts with css_unit_len2device_px().
++ */
++static inline int ns_expr_device_px(const css_computed_style *style,
++		const css_unit_ctx *unit_len_ctx, css_fixed id, int basis,
++		float scale)
++{
++	int px = 0;
++
++	if (!css_computed_expr_px(style, unit_len_ctx,
++			basis < 0 ? -1 : (int) (basis / scale), id, &px))
++		return 0;
++	return (int) (px * scale);
++}
++
+ #endif
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 276483217..6cee969d1 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -847,12 +847,16 @@ bool box_transform(const css_unit_ctx *unit_len_ctx, const struct box *box,
+ 
+ 	if (hu == CSS_UNIT_PCT)
+ 		*ox = FPCT_OF_INT_TOINT(hl, bw);
++	else if (hu == CSS_UNIT_EXPR)
++		*ox = ns_expr_device_px(box->style, unit_len_ctx, hl, bw, 1.0f);
+ 	else
+ 		*ox = FIXTOINT(css_unit_len2device_px(box->style, unit_len_ctx,
+ 				hl, hu));
+ 
+ 	if (vu == CSS_UNIT_PCT)
+ 		*oy = FPCT_OF_INT_TOINT(vl, bh);
++	else if (vu == CSS_UNIT_EXPR)
++		*oy = ns_expr_device_px(box->style, unit_len_ctx, vl, bh, 1.0f);
+ 	else
+ 		*oy = FIXTOINT(css_unit_len2device_px(box->style, unit_len_ctx,
+ 				vl, vu));
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 9a9f16b08..f454977dd 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -1906,6 +1906,8 @@ struct svg_buf {
+ 	 * libsvgtiny does not know the keyword and painted it black. */
+ 	bool have_current;
+ 	char current[8];
++	/* for the stylesheet's stroke lengths in em or calc() (VitaSurf) */
++	const css_unit_ctx *unit_len_ctx;
+ };
+ 
+ static void svg_buf_append(struct svg_buf *b, const char *s, size_t n)
+@@ -1943,6 +1945,31 @@ static void svg_buf_lit(struct svg_buf *b, const char *s)
+ }
+ 
+ /** Append text with the five XML metacharacters escaped. */
++/**
++ * A stroke length from the stylesheet in user units, which are CSS
++ * pixels (VitaSurf): em and a calc() of lengths are worked out here,
++ * where they were written as their bare number. A percentage, or a
++ * calc() with one, is of the drawing's viewport, which is not known
++ * here, so it is left to the markup.
++ */
++static bool svg_user_units(const struct svg_buf *b,
++		const css_computed_style *style, css_fixed *v, css_unit *unit)
++{
++	if (*unit == CSS_UNIT_PX)
++		return true;
++	if (*unit == CSS_UNIT_PCT || b->unit_len_ctx == NULL)
++		return false;
++	if (*unit == CSS_UNIT_EXPR) {
++		int px = 0;
++
++		if (!css_computed_expr_px(style, b->unit_len_ctx, -1, *v, &px))
++			return false;
++	}
++	*v = css_unit_len2css_px(style, b->unit_len_ctx, *v, *unit);
++	*unit = CSS_UNIT_PX;
++	return true;
++}
++
+ static void svg_buf_escaped(struct svg_buf *b, const char *s, size_t n)
+ {
+ 	size_t i, run = 0;
+@@ -2137,8 +2164,8 @@ static void svg_geometry_attributes(struct svg_buf *b,
+ 		*wrote |= 1u << 0;
+ 	}
+ 	if (css_computed_stroke_dashoffset(style, &v, &unit) ==
+-			CSS_STROKE_DASHOFFSET_SET && v != 0 &&
+-			unit == CSS_UNIT_PX) {
++			CSS_STROKE_DASHOFFSET_SET &&
++			svg_user_units(b, style, &v, &unit) && v != 0) {
+ 		snprintf(w, sizeof(w), " stroke-dashoffset=\"%s%d.%03d\"",
+ 				v < 0 ? "-" : "", abs(FIXTOINT(v)),
+ 				(int) ((abs(v) & 0x3ff) * 1000 / 1024));
+@@ -2245,8 +2272,9 @@ static void svg_paint_attributes(struct svg_buf *b,
+ 		css_unit unit = CSS_UNIT_PX;
+ 
+ 		if (css_computed_stroke_width(style, &width, &unit) ==
+-				CSS_STROKE_WIDTH_SET && unit != CSS_UNIT_PCT &&
+-		    !(width == INTTOFIX(1) && unit == CSS_UNIT_PX)) {
++				CSS_STROKE_WIDTH_SET &&
++		    !(width == INTTOFIX(1) && unit == CSS_UNIT_PX) &&
++		    svg_user_units(b, style, &width, &unit)) {
+ 			char w[48];
+ 
+ 			snprintf(w, sizeof(w), " stroke-width=\"%d.%03d\"",
+@@ -2770,7 +2798,8 @@ box_svg(dom_node *n,
+ 	struct box *box,
+ 	bool *convert_children)
+ {
+-	struct svg_buf buf = { NULL, 0, 0, false, false, "" };
++	struct svg_buf buf = { NULL, 0, 0, false, false, "",
++			&content->unit_len_ctx };
+ 	enum css_width_e wtype;
+ 	enum css_height_e htype;
+ 	css_fixed value = 0;
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index c025691a2..119ec0ae5 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5561,6 +5561,9 @@ static void layout_compute_transform_offset(
+ 
+ 	if (hunit == CSS_UNIT_PCT) {
+ 		*x = FPCT_OF_INT_TOINT(hlength, border_width);
++	} else if (hunit == CSS_UNIT_EXPR) {
++		*x = ns_expr_device_px(box->style, unit_len_ctx, hlength,
++				border_width, 1.0f);
+ 	} else {
+ 		*x = FIXTOINT(css_unit_len2device_px(box->style, unit_len_ctx,
+ 				hlength, hunit));
+@@ -5568,6 +5571,9 @@ static void layout_compute_transform_offset(
+ 
+ 	if (vunit == CSS_UNIT_PCT) {
+ 		*y = FPCT_OF_INT_TOINT(vlength, border_height);
++	} else if (vunit == CSS_UNIT_EXPR) {
++		*y = ns_expr_device_px(box->style, unit_len_ctx, vlength,
++				border_height, 1.0f);
+ 	} else {
+ 		*y = FIXTOINT(css_unit_len2device_px(box->style, unit_len_ctx,
+ 				vlength, vunit));
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index dfeb80c9e..12fe311c5 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -397,6 +397,10 @@ html_object_callback(hlcache_handle *object,
+ 				w = content_get_width(box->background);
+ 				if (hunit == CSS_UNIT_PCT) {
+ 					l = (width - w) * hpos / INTTOFIX(100);
++				} else if (hunit == CSS_UNIT_EXPR) {
++					l = ns_expr_device_px(box->style,
++							&c->unit_len_ctx,
++							hpos, width - w, 1.0f);
+ 				} else {
+ 					l = FIXTOINT(css_unit_len2device_px(
+ 							box->style,
+@@ -407,6 +411,10 @@ html_object_callback(hlcache_handle *object,
+ 				h = content_get_height(box->background);
+ 				if (vunit == CSS_UNIT_PCT) {
+ 					t = (height - h) * vpos / INTTOFIX(100);
++				} else if (vunit == CSS_UNIT_EXPR) {
++					t = ns_expr_device_px(box->style,
++							&c->unit_len_ctx,
++							vpos, height - h, 1.0f);
+ 				} else {
+ 					t = FIXTOINT(css_unit_len2device_px(
+ 							box->style,
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 18c2312d9..5d2cac16e 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -923,11 +923,17 @@ static bool html_mask_place(int x, int y, int pw, int ph, struct box *box,
+ 
+ 			if (hu == CSS_UNIT_PCT)
+ 				w = (int) (pw * FIXTOFLT(hl) / 100);
++			else if (hu == CSS_UNIT_EXPR)
++				w = ns_expr_device_px(box->style,
++						unit_len_ctx, hl, pw, scale);
+ 			else if (hl != 0)
+ 				w = FIXTOINT(css_unit_len2device_px(box->style,
+ 						unit_len_ctx, hl, hu)) * scale;
+ 			if (vu == CSS_UNIT_PCT)
+ 				h = (int) (ph * FIXTOFLT(vl) / 100);
++			else if (vu == CSS_UNIT_EXPR)
++				h = ns_expr_device_px(box->style,
++						unit_len_ctx, vl, ph, scale);
+ 			else if (vl != 0)
+ 				h = FIXTOINT(css_unit_len2device_px(box->style,
+ 						unit_len_ctx, vl, vu)) * scale;
+@@ -967,6 +973,9 @@ static bool html_mask_place(int x, int y, int pw, int ph, struct box *box,
+ 			if (hu == CSS_UNIT_PCT)
+ 				data->x = x + (int) ((pw - mw) * FIXTOFLT(hl) /
+ 						100);
++			else if (hu == CSS_UNIT_EXPR)
++				data->x = x + ns_expr_device_px(box->style,
++						unit_len_ctx, hl, pw - mw, scale);
+ 			else
+ 				data->x = x + FIXTOINT(css_unit_len2device_px(
+ 						box->style, unit_len_ctx, hl,
+@@ -974,6 +983,9 @@ static bool html_mask_place(int x, int y, int pw, int ph, struct box *box,
+ 			if (vu == CSS_UNIT_PCT)
+ 				data->y = y + (int) ((ph - mh) * FIXTOFLT(vl) /
+ 						100);
++			else if (vu == CSS_UNIT_EXPR)
++				data->y = y + ns_expr_device_px(box->style,
++						unit_len_ctx, vl, ph - mh, scale);
+ 			else
+ 				data->y = y + FIXTOINT(css_unit_len2device_px(
+ 						box->style, unit_len_ctx, vl,
+@@ -1089,12 +1101,18 @@ static void html_background_size(const struct box *box,
+ 
+ 		if (hu == CSS_UNIT_PCT) {
+ 			w = (int) (box_w * FIXTOFLT(hl) / 100);
++		} else if (hu == CSS_UNIT_EXPR) {
++			w = ns_expr_device_px(box->style, unit_len_ctx, hl,
++					box_w, 1.0f);
+ 		} else if (hl != 0) {
+ 			w = FIXTOINT(css_unit_len2device_px(box->style,
+ 					unit_len_ctx, hl, hu));
+ 		}
+ 		if (vu == CSS_UNIT_PCT) {
+ 			h = (int) (box_h * FIXTOFLT(vl) / 100);
++		} else if (vu == CSS_UNIT_EXPR) {
++			h = ns_expr_device_px(box->style, unit_len_ctx, vl,
++					box_h, 1.0f);
+ 		} else if (vl != 0) {
+ 			h = FIXTOINT(css_unit_len2device_px(box->style,
+ 					unit_len_ctx, vl, vu));
+@@ -1588,6 +1606,12 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 			x += (width -
+ 				content_get_width(background->background)) *
+ 				scale * FIXTOFLT(hpos) / 100.;
++		} else if (hunit == CSS_UNIT_EXPR) {
++			x += ns_expr_device_px(background->style,
++					unit_len_ctx, hpos, (int) ((width -
++					content_get_width(
++					background->background)) * scale),
++					scale);
+ 		} else {
+ 			x += (int) (FIXTOFLT(css_unit_len2device_px(
+ 					background->style, unit_len_ctx,
+@@ -1598,6 +1622,12 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 			y += (height -
+ 				content_get_height(background->background)) *
+ 				scale * FIXTOFLT(vpos) / 100.;
++		} else if (vunit == CSS_UNIT_EXPR) {
++			y += ns_expr_device_px(background->style,
++					unit_len_ctx, vpos, (int) ((height -
++					content_get_height(
++					background->background)) * scale),
++					scale);
+ 		} else {
+ 			y += (int) (FIXTOFLT(css_unit_len2device_px(
+ 					background->style, unit_len_ctx,
+@@ -1858,6 +1888,10 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 					(hpos > 98 && !last))){
+ 				plot_content = false;
+ 			}
++		} else if (hunit == CSS_UNIT_EXPR) {
++			x += ns_expr_device_px(box->style, unit_len_ctx, hpos,
++					(int) (b.x1 - b.x0 - content_get_width(
++					box->background) * scale), scale);
+ 		} else {
+ 			x += (int) (FIXTOFLT(css_unit_len2device_px(
+ 					box->style, unit_len_ctx,
+@@ -1868,6 +1902,10 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 			y += (b.y1 - b.y0 -
+ 					content_get_height(box->background) *
+ 					scale) * FIXTOFLT(vpos) / 100.;
++		} else if (vunit == CSS_UNIT_EXPR) {
++			y += ns_expr_device_px(box->style, unit_len_ctx, vpos,
++					(int) (b.y1 - b.y0 - content_get_height(
++					box->background) * scale), scale);
+ 		} else {
+ 			y += (int) (FIXTOFLT(css_unit_len2device_px(
+ 					box->style, unit_len_ctx,
+@@ -2087,7 +2125,8 @@ static bool html_redraw_text_decoration(const html_content *html,
+ 
+ 	if (css_computed_text_decoration_thickness(box->style, &len, &unit) ==
+ 			CSS_TEXT_DECORATION_THICKNESS_SET) {
+-		if (unit == CSS_UNIT_PCT) {
++		if (unit == CSS_UNIT_PCT || unit == CSS_UNIT_EXPR) {
++			/* a percentage is of the font size */
+ 			css_fixed fsize = 0;
+ 			css_unit funit = CSS_UNIT_PX;
+ 			int fpx;
+@@ -2096,7 +2135,11 @@ static bool html_redraw_text_decoration(const html_content *html,
+ 			fpx = FIXTOINT(css_unit_len2device_px(box->style,
+ 					&html->unit_len_ctx, fsize,
+ 					funit));
+-			thickness = FPCT_OF_INT_TOINT(len, fpx);
++			thickness = unit == CSS_UNIT_PCT ?
++					FPCT_OF_INT_TOINT(len, fpx) :
++					ns_expr_device_px(box->style,
++						&html->unit_len_ctx, len,
++						fpx, 1.0f);
+ 		} else {
+ 			thickness = FIXTOINT(css_unit_len2device_px(box->style,
+ 					&html->unit_len_ctx, len, unit));
+@@ -5145,6 +5188,9 @@ static float html_clip_radius(const html_content *html,
+ 		return farthest;
+ 	if (u == CSS_UNIT_PCT)
+ 		return basis * FIXTOFLT(v) / 100.0f;
++	if (u == CSS_UNIT_EXPR)
++		return (float) ns_expr_device_px(box->style,
++				&html->unit_len_ctx, v, (int) basis, scale);
+ 	return FIXTOFLT(css_unit_len2device_px(box->style,
+ 			&html->unit_len_ctx, v, u)) * scale;
+ }
+@@ -7100,6 +7146,10 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 					px[i] = FIXTOINT(FMUL(in[i],
+ 						INTTOFIX((i & 1) ? bw : bh)))
+ 						/ 100;
++				} else if (inu[i] == CSS_UNIT_EXPR) {
++					px[i] = ns_expr_device_px(box->style,
++						&html->unit_len_ctx, in[i],
++						(i & 1) ? bw : bh, scale);
+ 				} else {
+ 					px[i] = FIXTOINT(css_unit_len2device_px(
+ 						box->style,
+@@ -7708,6 +7758,11 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 						int room = width - nw;
+ 
+ 						ox = FPCT_OF_INT_TOINT(hl, room);
++					} else if (hu == CSS_UNIT_EXPR) {
++						ox = ns_expr_device_px(
++							box->style,
++							&html->unit_len_ctx,
++							hl, width - nw, scale);
+ 					} else {
+ 						ox = FIXTOINT(css_unit_len2device_px(
+ 							box->style,
+@@ -7718,6 +7773,11 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 						int room = height - nh;
+ 
+ 						oy = FPCT_OF_INT_TOINT(vl, room);
++					} else if (vu == CSS_UNIT_EXPR) {
++						oy = ns_expr_device_px(
++							box->style,
++							&html->unit_len_ctx,
++							vl, height - nh, scale);
+ 					} else {
+ 						oy = FIXTOINT(css_unit_len2device_px(
+ 							box->style,
+diff --git a/content/handlers/html/redraw_border.c b/content/handlers/html/redraw_border.c
+index d694f7e27..0737d4c0b 100644
+--- a/content/handlers/html/redraw_border.c
++++ b/content/handlers/html/redraw_border.c
+@@ -36,6 +36,7 @@
+ 
+ #include "html/box.h"
+ #include "html/private.h"
++#include "css/utils.h"
+ 
+ 
+ static bool rounded_ring_smooth(const struct redraw_context *ctx, colour c,
+@@ -1053,6 +1054,11 @@ radius_device_px(const struct box *box,
+ 		/* already device pixels, so no further scaling */
+ 		return (int) (percent_basis * FIXTOFLT(value) / 100.0);
+ 	}
++	if (unit == CSS_UNIT_EXPR) {
++		/* calc(50% - 4px) and the like, against the same side */
++		return ns_expr_device_px(box->style, unit_len_ctx, value,
++				percent_basis, scale);
++	}
+ 
+ 	return (int) (FIXTOFLT(css_unit_len2device_px(box->style,
+ 			unit_len_ctx, value, unit)) * scale);

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<!-- The old WebKit flexbox and display: flow-root (VitaSurf).
+     display: -webkit-box was laid out as a block, so its children
+     stacked where they should sit in a row; its -webkit-box-*
+     properties were ignored; display: flow-root was dropped.
+     position: -webkit-sticky is Safari's alone, and Chrome drops it. A -webkit-box with
+     -webkit-line-clamp is still the clamped block that pattern means.
+     Expected lines are what Chrome prints. -->
+<html><head><title>webkit box and flow-root</title><style>
+body { margin: 0; font: 16px sans-serif }
+.b > div { width: 50px; height: 20px; background: #39c }
+#row { display: -webkit-box; width: 300px }
+#col { display: -webkit-box; -webkit-box-orient: vertical; width: 300px }
+#pack { display: -webkit-box; -webkit-box-pack: center; width: 300px }
+#align { display: -webkit-box; -webkit-box-align: center; height: 60px; width: 300px }
+#grow { display: -webkit-box; width: 300px }
+#grow > div:first-child { -webkit-box-flex: 1 }
+#ord { display: -webkit-box; width: 300px }
+#ord > div:first-child { -webkit-box-ordinal-group: 2 }
+#inl { display: -webkit-inline-box }
+#clamp { display: -webkit-box; -webkit-box-orient: vertical;
+         -webkit-line-clamp: 2; overflow: hidden; width: 120px;
+         line-height: 20px }
+#fr { display: flow-root; background: #eee }
+#fr > div { float: left; width: 40px; height: 50px; background: #c93 }
+#st { position: -webkit-sticky; top: 0 }
+</style></head><body>
+<div class="b" id="row"><div></div><div></div></div>
+<div class="b" id="col"><div></div><div></div></div>
+<div class="b" id="pack"><div></div></div>
+<div class="b" id="align"><div></div></div>
+<div class="b" id="grow"><div></div><div></div></div>
+<div class="b" id="ord"><div id="o1"></div><div id="o2"></div></div>
+<span class="b" id="inl"><div></div><div></div></span>
+<div id="clamp">one two three four five six seven eight nine ten eleven twelve thirteen fourteen</div>
+<div id="fr"><div></div></div>
+<div id="st">sticky</div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function R(s) { return document.querySelector(s).getBoundingClientRect(); }
+function kids(id) { var c = document.getElementById(id).children, a = [];
+  for (var i = 0; i < c.length; i++) { var r = c[i].getBoundingClientRect();
+    a.push(Math.round(r.left) + ',' + Math.round(r.top - R('#' + id).top) + ' ' + Math.round(r.width)); }
+  return a.join(' | '); }
+window.addEventListener('load', function () { setTimeout(function () {
+T('row', kids('row'));
+T('col', kids('col'));
+T('pack', kids('pack'));
+T('align', kids('align'));
+T('grow', kids('grow'));
+T('ordinal', Math.round(R('#o1').left) + ' ' + Math.round(R('#o2').left));
+T('inline box', kids('inl'));
+T('clamp height', Math.round(R('#clamp').height));
+T('flow-root holds its float', Math.round(R('#fr').height));
+T('display', getComputedStyle(document.getElementById('row')).display + ' ' + getComputedStyle(document.getElementById('fr')).display);
+T('position', getComputedStyle(document.getElementById('st')).position);
+}, 300); });
+</script>
+</body></html>

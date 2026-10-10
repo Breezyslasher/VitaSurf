@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<!-- A fixed tab turned on its side (VitaSurf), as Django's debug toolbar
+     draws its handle: translateY(-100%) rotate(-90deg) about its bottom
+     right corner. Chrome places it at x 929-960, y 265-342 in a 960x544
+     view. Its pinned area was the whole view turned through the
+     transform, about 280x266 px of the right of the screen, which every
+     scroll step drew again; it is now the tab. Scroll: the tab stays at
+     the right edge with no trails, and the stripes move smoothly. -->
+<html><head><title>fixed turned tab</title><style>
+body { margin: 0; font: 16px sans-serif; height: 4000px;
+  background: repeating-linear-gradient(#fff 0 40px, #dde 40px 80px) }
+#h { position: fixed; transform: translateY(-100%) rotate(-90deg);
+  transform-origin: right bottom; background: #fff; border: 1px solid #111;
+  border-bottom: 0; top: 265px; right: 0; opacity: .75 }
+#b { display: block; padding: 0 5px; border: 4px solid #fff;
+  border-bottom-width: 0; color: #fff; font: bold 22px sans-serif;
+  background: #000; opacity: .6 }
+</style></head><body>
+<div id="h"><div id="b">DJDT</div></div>
+<p>Scroll this page. The black tab at the right edge stays put.</p>
+</body></html>

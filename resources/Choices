@@ -27,12 +27,12 @@ max_fetchers_per_host:6
 # FreeType glyph cache for the bundled DejaVu fonts, in KB.
 fb_font_cachesize:2048
 
-# JavaScript: QuickJS, an interpreter, so scripts get a time budget
-# (seconds) before they are stopped. Large sites ship bundles that need
-# most of this; qjs.c enforces the same value as a floor, because a
-# Choices file written by an earlier build overrides this one.
+# JavaScript: QuickJS. No script is stopped by a time limit on the
+# Vita, as a browser stops none: the busy overlay lets Circle stop one.
+# qjs.c ignores this option there, since a Choices file written by an
+# earlier build overrides this one; the native test harness reads it.
 enable_javascript:1
-script_timeout:20
+script_timeout:0
 
 # Networking (phase 2). Certificates come from the bundled Mozilla CA file.
 ca_bundle:app0:resources/cacert.pem

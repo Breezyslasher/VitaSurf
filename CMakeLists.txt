@@ -110,6 +110,9 @@ add_executable(${PROJECT_NAME}
     vita/platform/vita_file.c
     # SceNet and SceNetCtl bring-up.
     vita/platform/vita_net.c
+    # Host name lookups on threads of their own, for the fetcher and
+    # WebSockets, so that no lookup holds the browser up.
+    vita/platform/vita_resolve.c
     # NetSurf download table: files saved under ux0:data/VitaSurf/downloads.
     vita/platform/vita_download.c
     # Optional FlareSolverr client for Cloudflare browser checks.
@@ -327,8 +330,10 @@ target_link_libraries(${PROJECT_NAME}
     -Wl,--start-group
     css dom hubbub parserutils wapcaplet nsutils nsbmp nsgif svgtiny nspsl nslog utf8proc
     ${VITASURF_JS_LIBS}
-    # libcurl pulls in zstd; the mbedTLS package is built with pthread mutexes.
-    curl mbedtls mbedx509 mbedcrypto zstd expat
+    # libcurl pulls in zstd and, for HTTP/2, nghttp2
+    # (scripts/build-curl-http2.sh); the mbedTLS package is built with
+    # pthread mutexes.
+    curl nghttp2 mbedtls mbedx509 mbedcrypto zstd expat
     # libvita2d (MIT) puts the page on screen through the GPU so that the
     # system IME dialog can draw over it.
     vita2d png jpeg freetype z bz2 pthread m

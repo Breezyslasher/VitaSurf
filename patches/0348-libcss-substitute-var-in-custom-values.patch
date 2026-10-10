@@ -1,0 +1,263 @@
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 50ed96f..e7c83ed 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <string.h>
++#include <strings.h>
+ 
+ #include "select/arena.h"
+ #include "select/calc.h"
+@@ -3144,28 +3145,38 @@ static void custom_put(char *buf, size_t size, size_t *at,
+ 	*at += len;
+ }
+ 
+-/* exported interface documented in libcss/computed.h */
+-css_error css_computed_custom_property(const css_computed_style *style,
+-		lwc_string *name, char *buffer, size_t buffer_length,
+-		size_t *value_length)
++/* Is the token a var( function? */
++static bool custom_is_var(const css_token *t)
+ {
+-	const css_custom_entry *ent = NULL;
+-	const css_token *t = NULL;
+-	uint32_t n = 0, i;
+-	size_t at = 0;
+-	bool space = false;
++	return t->type == CSS_TOKEN_FUNCTION && t->idata != NULL &&
++			lwc_string_length(t->idata) == 3 &&
++			strncasecmp(lwc_string_data(t->idata), "var", 3) == 0;
++}
+ 
+-	if (style == NULL || name == NULL || value_length == NULL)
+-		return CSS_BADPARM;
++/* Is the token the one-character delimiter \a c? */
++static bool custom_is_char(const css_token *t, char c)
++{
++	return t->type == CSS_TOKEN_CHAR && t->idata != NULL &&
++			lwc_string_length(t->idata) == 1 &&
++			lwc_string_data(t->idata)[0] == c;
++}
+ 
+-	if (style->custom != NULL)
+-		ent = css__custom_map_get(style->custom, name);
+-	if (ent != NULL) {
+-		t = ent->tokens;
+-		n = ent->n_tokens;
+-	} else if (!css__custom_root_get(name, &t, &n)) {
+-		return CSS_PROPERTY_NOT_SET;
+-	}
++/* The deepest var() inside var() followed; past it, a cycle is assumed */
++#define CUSTOM_SUBST_DEPTH 32
++
++/*
++ * Write tokens as text, with each var() replaced by what it refers to
++ * (VitaSurf): a custom property's computed value has its var()s
++ * substituted, so getComputedStyle reads "--accent: var(--theme)" as
++ * the theme's colour, as a browser does, not as the reference. A var()
++ * that refers to nothing, with no fallback, or a cycle, makes the whole
++ * value invalid, which reads as nothing.
++ */
++static bool custom_emit(const css_computed_style *style,
++		const css_token *t, uint32_t n, char *buffer,
++		size_t buffer_length, size_t *at, bool *space, int depth)
++{
++	uint32_t i;
+ 
+ 	for (i = 0; i < n; i++) {
+ 		const char *d = t[i].idata != NULL ?
+@@ -3176,75 +3187,164 @@ css_error css_computed_custom_property(const css_computed_style *style,
+ 
+ 		if (t[i].type == CSS_TOKEN_S ||
+ 				t[i].type == CSS_TOKEN_COMMENT) {
+-			space = at > 0;
++			*space = *at > 0;
++			continue;
++		}
++		if (custom_is_var(&t[i])) {
++			const css_custom_entry *ent = NULL;
++			const css_token *vt = NULL;
++			uint32_t vn = 0, j = i + 1, nest = 0, fb_from = 0,
++					fb_to = 0;
++			lwc_string *name;
++
++			while (j < n && t[j].type == CSS_TOKEN_S)
++				j++;
++			if (j >= n || t[j].type != CSS_TOKEN_IDENT ||
++					t[j].idata == NULL)
++				return false;
++			name = t[j].idata;
++			/* the fallback, if any, runs to the matching ')' */
++			for (j++; j < n; j++) {
++				if (t[j].type == CSS_TOKEN_FUNCTION ||
++						custom_is_char(&t[j], '(')) {
++					nest++;
++				} else if (custom_is_char(&t[j], ')')) {
++					if (nest == 0)
++						break;
++					nest--;
++				} else if (nest == 0 && fb_from == 0 &&
++						custom_is_char(&t[j], ',')) {
++					fb_from = j + 1;
++				}
++			}
++			if (j >= n)
++				return false;
++			if (fb_from != 0)
++				fb_to = j;
++			if (depth >= CUSTOM_SUBST_DEPTH)
++				return false;
++			if (style->custom != NULL)
++				ent = css__custom_map_get(style->custom, name);
++			if (ent != NULL) {
++				vt = ent->tokens;
++				vn = ent->n_tokens;
++			} else if (!css__custom_root_get(name, &vt, &vn)) {
++				vt = NULL;
++			}
++			if (vt != NULL) {
++				if (!custom_emit(style, vt, vn, buffer,
++						buffer_length, at, space,
++						depth + 1))
++					return false;
++			} else if (fb_from != 0) {
++				if (!custom_emit(style, t + fb_from,
++						fb_to - fb_from, buffer,
++						buffer_length, at, space,
++						depth + 1))
++					return false;
++			} else {
++				return false;
++			}
++			i = j;	/* past the ')' */
+ 			continue;
+ 		}
+ 		if (d == NULL)
+ 			dl = 0;
+-		if (space) {
+-			custom_put(buffer, buffer_length, &at, " ", 1);
+-			space = false;
++		if (*space) {
++			custom_put(buffer, buffer_length, at, " ", 1);
++			*space = false;
+ 		}
+ 		switch (t[i].type) {
+ 		case CSS_TOKEN_ATKEYWORD:
+-			custom_put(buffer, buffer_length, &at, "@", 1);
+-			custom_put(buffer, buffer_length, &at, d, dl);
++			custom_put(buffer, buffer_length, at, "@", 1);
++			custom_put(buffer, buffer_length, at, d, dl);
+ 			break;
+ 		case CSS_TOKEN_HASH:
+-			custom_put(buffer, buffer_length, &at, "#", 1);
+-			custom_put(buffer, buffer_length, &at, d, dl);
++			custom_put(buffer, buffer_length, at, "#", 1);
++			custom_put(buffer, buffer_length, at, d, dl);
+ 			break;
+ 		case CSS_TOKEN_FUNCTION:
+-			custom_put(buffer, buffer_length, &at, d, dl);
+-			custom_put(buffer, buffer_length, &at, "(", 1);
++			custom_put(buffer, buffer_length, at, d, dl);
++			custom_put(buffer, buffer_length, at, "(", 1);
+ 			break;
+ 		case CSS_TOKEN_STRING:
+ 		case CSS_TOKEN_INVALID_STRING:
+-			custom_put(buffer, buffer_length, &at, "\"", 1);
+-			custom_put(buffer, buffer_length, &at, d, dl);
+-			custom_put(buffer, buffer_length, &at, "\"", 1);
++			custom_put(buffer, buffer_length, at, "\"", 1);
++			custom_put(buffer, buffer_length, at, d, dl);
++			custom_put(buffer, buffer_length, at, "\"", 1);
+ 			break;
+ 		case CSS_TOKEN_URI:
+-			custom_put(buffer, buffer_length, &at, "url(", 4);
+-			custom_put(buffer, buffer_length, &at, d, dl);
+-			custom_put(buffer, buffer_length, &at, ")", 1);
++			custom_put(buffer, buffer_length, at, "url(", 4);
++			custom_put(buffer, buffer_length, at, d, dl);
++			custom_put(buffer, buffer_length, at, ")", 1);
+ 			break;
+ 		case CSS_TOKEN_UNICODE_RANGE:
+-			custom_put(buffer, buffer_length, &at, "U+", 2);
+-			custom_put(buffer, buffer_length, &at, d, dl);
++			custom_put(buffer, buffer_length, at, "U+", 2);
++			custom_put(buffer, buffer_length, at, d, dl);
+ 			break;
+ 		case CSS_TOKEN_PERCENTAGE:
+-			custom_put(buffer, buffer_length, &at, d, dl);
+-			custom_put(buffer, buffer_length, &at, "%", 1);
++			custom_put(buffer, buffer_length, at, d, dl);
++			custom_put(buffer, buffer_length, at, "%", 1);
+ 			break;
+ 		case CSS_TOKEN_INCLUDES:
+-			custom_put(buffer, buffer_length, &at, "~=", 2);
++			custom_put(buffer, buffer_length, at, "~=", 2);
+ 			break;
+ 		case CSS_TOKEN_DASHMATCH:
+-			custom_put(buffer, buffer_length, &at, "|=", 2);
++			custom_put(buffer, buffer_length, at, "|=", 2);
+ 			break;
+ 		case CSS_TOKEN_PREFIXMATCH:
+-			custom_put(buffer, buffer_length, &at, "^=", 2);
++			custom_put(buffer, buffer_length, at, "^=", 2);
+ 			break;
+ 		case CSS_TOKEN_SUFFIXMATCH:
+-			custom_put(buffer, buffer_length, &at, "$=", 2);
++			custom_put(buffer, buffer_length, at, "$=", 2);
+ 			break;
+ 		case CSS_TOKEN_SUBSTRINGMATCH:
+-			custom_put(buffer, buffer_length, &at, "*=", 2);
++			custom_put(buffer, buffer_length, at, "*=", 2);
+ 			break;
+ 		case CSS_TOKEN_CDO:
+-			custom_put(buffer, buffer_length, &at, "<!--", 4);
++			custom_put(buffer, buffer_length, at, "<!--", 4);
+ 			break;
+ 		case CSS_TOKEN_CDC:
+-			custom_put(buffer, buffer_length, &at, "-->", 3);
++			custom_put(buffer, buffer_length, at, "-->", 3);
+ 			break;
+ 		case CSS_TOKEN_EOF:
+ 			break;
+ 		default:
+-			custom_put(buffer, buffer_length, &at, d, dl);
++			custom_put(buffer, buffer_length, at, d, dl);
+ 			break;
+ 		}
+ 	}
++	return true;
++}
++
++/* exported interface documented in libcss/computed.h */
++css_error css_computed_custom_property(const css_computed_style *style,
++		lwc_string *name, char *buffer, size_t buffer_length,
++		size_t *value_length)
++{
++	const css_custom_entry *ent = NULL;
++	const css_token *t = NULL;
++	uint32_t n = 0;
++	size_t at = 0;
++	bool space = false;
++
++	if (style == NULL || name == NULL || value_length == NULL)
++		return CSS_BADPARM;
++
++	if (style->custom != NULL)
++		ent = css__custom_map_get(style->custom, name);
++	if (ent != NULL) {
++		t = ent->tokens;
++		n = ent->n_tokens;
++	} else if (!css__custom_root_get(name, &t, &n)) {
++		return CSS_PROPERTY_NOT_SET;
++	}
++
++	if (!custom_emit(style, t, n, buffer, buffer_length, &at, &space,
++			0)) {
++		/* invalid at computed-value time: it reads as nothing */
++		at = 0;
++	}
+ 	/* terminated when it fits */
+ 	if (at < buffer_length)
+ 		buffer[at] = '\0';

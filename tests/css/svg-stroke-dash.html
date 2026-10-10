@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- SVG stroke dashes (VitaSurf): from the markup, from a <style> in the
+     SVG, and from the page's stylesheet on the root. Each line is 100
+     units long; the first is cut into seven dashes, the second into
+     five, the third into ten; the circle shows a quarter. -->
+<html><head><style>
+svg { display: block; margin: 8px; }
+svg.css { stroke-dasharray: 5 5; stroke-linecap: round; }
+</style></head><body>
+<svg width="120" height="20" viewBox="0 0 120 20"><path d="M10 10 H110" stroke="#000" stroke-width="2" stroke-dasharray="10 5"/></svg>
+<svg width="120" height="20" viewBox="0 0 120 20"><style>.d { stroke-dasharray: 12 8; stroke-dashoffset: 4 }</style><path class="d" d="M10 10 H110" stroke="#c00" stroke-width="2"/></svg>
+<svg class="css" width="120" height="20" viewBox="0 0 120 20"><path d="M10 10 H110" stroke="#00c" stroke-width="2"/></svg>
+<svg width="60" height="60" viewBox="0 0 60 60"><circle cx="30" cy="30" r="20" fill="none" stroke="#080" stroke-width="4" stroke-dasharray="31.4 94.2"/></svg>
+</body></html>

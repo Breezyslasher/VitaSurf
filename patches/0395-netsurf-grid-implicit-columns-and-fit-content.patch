@@ -1,0 +1,187 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 119ec0ae5..0289a63da 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1115,6 +1115,22 @@ static void layout_minmax_block(
+ 		}
+ 	}
+ 
++	/*
++	 * A grid's widths are its columns' (VitaSurf). Summing every
++	 * item as if they all sat side by side made a grid whose items
++	 * share a cell, as a checkbox and the box drawn over it do, or
++	 * stack in rows, far wider than its content; centred in that, a
++	 * checkbox's label moved off its box.
++	 */
++	if (lh__box_is_grid_container(block)) {
++		int gmin, gmax;
++
++		if (layout_grid_minmax(block, content, &gmin, &gmax)) {
++			min = gmin;
++			max = gmax < gmin ? gmin : gmax;
++		}
++	}
++
+ 	/*
+ 	 * The gaps between a row's items are part of its width
+ 	 * (VitaSurf). Left out, a pill of an icon and "455 items" with
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index 0adf2ce42..3fa471dae 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -844,8 +844,16 @@ static bool grid_place_items(struct grid_ctx *ctx)
+ 		int nspan = item_minor_span(ctx, it);
+ 
+ 		if (maj < 0 || min < 0) {
+-			if ((unsigned) nspan > n_minor) {
+-				n_minor = nspan;
++			/* the implicit grid takes in every definite position
++			 * in the minor axis too, not just the widest span
++			 * (CSS Grid 8.5): an item placed in column 2 of a grid
++			 * with no template had no column of its own, so it
++			 * was laid out at no width at all (VitaSurf) */
++			unsigned need = min >= 0 ? (unsigned) (min + nspan) :
++					(unsigned) nspan;
++
++			if (need > n_minor) {
++				n_minor = need;
+ 			}
+ 			continue;
+ 		}
+@@ -1515,7 +1523,26 @@ static bool grid_layout_item(struct grid_ctx *ctx, struct grid_item *it,
+ 	bool success;
+ 
+ 	if (b->width == AUTO) {
++		enum css_justify_self_e j = lh__box_justify_self(ctx->grid, b);
++
+ 		b->width = area_w - lh__delta_outer_width(b);
++		/* only a stretched item fills its area; one aligned
++		 * otherwise, or with an auto margin, is as wide as its
++		 * content wants up to the area (CSS Box Alignment 6.1,
++		 * Grid 6.2), and justify-items: center left every item a
++		 * column wide (VitaSurf) */
++		if (j != CSS_JUSTIFY_SELF_STRETCH ||
++		    b->margin[LEFT] == AUTO || b->margin[RIGHT] == AUTO) {
++			int fit = b->max_width;
++
++			if (fit == UNKNOWN_MAX_WIDTH || fit < b->min_width) {
++				fit = b->min_width;
++			}
++			fit -= lh__delta_outer_width(b);
++			if (fit >= 0 && fit < b->width) {
++				b->width = fit;
++			}
++		}
+ 		if (it->max_width >= 0 && b->width > it->max_width) {
+ 			b->width = it->max_width;
+ 		}
+@@ -1816,6 +1843,85 @@ static int grid_gap(const struct grid_ctx *ctx, css_len_px_func get,
+ 	return gap > 0 ? gap : 0;
+ }
+ 
++/* exported function, documented in html/layout_internal.h (VitaSurf) */
++bool layout_grid_minmax(struct box *grid, const html_content *content,
++		int *min, int *max)
++{
++	struct grid_ctx ctx;
++	const css_computed_grid_track *tmpl;
++	uint8_t flow;
++	unsigned i;
++	bool ok = false;
++
++	memset(&ctx, 0, sizeof(ctx));
++	/* nothing is laid out here, so no content to lay out into */
++	ctx.content = NULL;
++	ctx.unit_len_ctx = &content->unit_len_ctx;
++	ctx.grid = grid;
++	/* the widths it takes at no width and at any width */
++	ctx.avail_w = AUTO;
++	ctx.avail_h = AUTO;
++	ctx.col_gap = grid_gap(&ctx, css_computed_column_gap_px, AUTO);
++	ctx.row_gap = grid_gap(&ctx, css_computed_row_gap_px, AUTO);
++
++	flow = css_computed_grid_auto_flow(grid->style);
++	ctx.column_flow = (flow == CSS_GRID_AUTO_FLOW_COLUMN ||
++			flow == CSS_GRID_AUTO_FLOW_COLUMN_DENSE);
++	ctx.dense = (flow == CSS_GRID_AUTO_FLOW_ROW_DENSE ||
++			flow == CSS_GRID_AUTO_FLOW_COLUMN_DENSE);
++
++	/* a subgrid's columns are its parent's: not known here */
++	tmpl = NULL;
++	if (css_computed_grid_template_columns(grid->style, &tmpl) !=
++			CSS_GRID_TEMPLATE_SET) {
++		tmpl = NULL;
++	}
++	if (grid_tmpl_is_subgrid(tmpl) ||
++	    !grid_build_explicit(&ctx, tmpl, AUTO, ctx.col_gap,
++			&ctx.cols, &ctx.n_explicit_cols, &ctx.col_names,
++			&ctx.n_col_names)) {
++		goto cleanup;
++	}
++	tmpl = NULL;
++	if (css_computed_grid_template_rows(grid->style, &tmpl) !=
++			CSS_GRID_TEMPLATE_SET || grid_tmpl_is_subgrid(tmpl)) {
++		tmpl = NULL;
++	}
++	if (!grid_build_explicit(&ctx, tmpl, AUTO, ctx.row_gap,
++			&ctx.rows, &ctx.n_explicit_rows, &ctx.row_names,
++			&ctx.n_row_names)) {
++		goto cleanup;
++	}
++	grid_read_areas(&ctx);
++	if (!grid_collect_items(&ctx) || !grid_place_items(&ctx) ||
++	    !grid_extend_tracks(&ctx, true) ||
++	    !grid_extend_tracks(&ctx, false)) {
++		goto cleanup;
++	}
++	grid_collapse_empty(&ctx, true);
++	if (!grid_size_axis(&ctx, true)) {
++		goto cleanup;
++	}
++	/* at its narrowest each column is its base size; at its widest,
++	 * its growth limit, which is the widest of its items' content */
++	*min = *max = ctx.col_gap * grid_gap_count(ctx.cols, ctx.n_cols);
++	for (i = 0; i < ctx.n_cols; i++) {
++		const struct grid_track *t = &ctx.cols[i];
++
++		if (t->collapsed) {
++			continue;
++		}
++		*min += t->base;
++		*max += (t->limit == GRID_INF || t->limit < t->base) ?
++				t->base : t->limit;
++	}
++	ok = true;
++
++cleanup:
++	grid_ctx_destroy(&ctx);
++	return ok;
++}
++
+ /* exported function, documented in html/layout_internal.h */
+ bool layout_grid(struct box *grid, int available_width,
+ 		html_content *content)
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index 20492cbd9..981c49525 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -115,6 +115,19 @@ bool layout_grid(
+ 		int available_width,
+ 		html_content *content);
+ 
++/**
++ * A grid container's narrowest and widest content widths (VitaSurf): its
++ * columns sized with no width to fit, from its items' own minimum and
++ * maximum widths, which must be known already.
++ *
++ * \return false if they could not be found (a subgrid, or no memory)
++ */
++bool layout_grid_minmax(
++		struct box *grid,
++		const html_content *content,
++		int *min,
++		int *max);
++
+ typedef uint8_t (*css_len_func)(
+ 		const css_computed_style *style,
+ 		css_fixed *length, css_unit *unit);

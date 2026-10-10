@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<!-- Popovers: a closed one has no box, showPopover() gives it one and
+     :popover-open matches it, beforetoggle can cancel the showing, toggle
+     comes after with the states merged, and a button's popovertarget
+     shows and hides one. The state is the element's, not an attribute.
+     GitHub keeps each tooltip as a closed popover; drawn, the avatar's
+     "Change your avatar" sat over the profile name. Expected console
+     output (Chrome gives the same): lines ending in "ok". -->
+<html><head><style>
+body { margin: 0 }
+#tip { position: absolute; top: 0; left: 0; width: 80px; height: 20px }
+#tip:popover-open { background-color: rgb(0, 128, 0) }
+</style></head><body>
+<div id=tip popover=manual>tip</div>
+<div id=plain>plain</div>
+<button id=btn popovertarget=tip>toggle</button>
+<button id=hide popovertarget=tip popovertargetaction=hide>hide</button>
+<script>
+function ok(name, cond, got) {
+  console.log('XX ' + name + ': ' + (cond ? 'ok' : 'FAIL ' + got));
+}
+var tip = document.getElementById('tip');
+function disp() { return getComputedStyle(tip).display; }
+ok('closed has no box', disp() === 'none', disp());
+ok('closed does not match', !tip.matches(':popover-open'), 'matched');
+ok('closed attribute left alone', !tip.hasAttribute('hidden') &&
+   tip.getAttribute('popover') === 'manual', tip.outerHTML);
+
+var events = [];
+tip.addEventListener('beforetoggle', function (e) {
+  events.push('before ' + e.oldState + '>' + e.newState);
+});
+tip.addEventListener('toggle', function (e) {
+  events.push('toggle ' + e.oldState + '>' + e.newState);
+});
+
+tip.showPopover();
+ok('shown has a box', disp() === 'block', disp());
+ok('shown matches', tip.matches(':popover-open'), 'no match');
+ok('shown styled', getComputedStyle(tip).backgroundColor ===
+   'rgb(0, 128, 0)', getComputedStyle(tip).backgroundColor);
+ok('no attribute changed', !tip.hasAttribute('hidden') &&
+   tip.attributes.length === 2, tip.outerHTML);
+tip.showPopover();
+ok('showing twice is quiet', events.length === 1, events.join());
+
+tip.hidePopover();
+ok('hidden again', disp() === 'none', disp());
+ok('toggle returns state', tip.togglePopover() === true &&
+   tip.togglePopover(false) === false && tip.togglePopover({force: true}) ===
+   true, tip.matches(':popover-open'));
+tip.hidePopover();
+
+var threw = '';
+try { document.getElementById('plain').showPopover(); }
+catch (e) { threw = e.name; }
+ok('no popover attribute throws', threw === 'NotSupportedError', threw);
+
+function cancel(e) { e.preventDefault(); }
+tip.addEventListener('beforetoggle', cancel);
+tip.showPopover();
+ok('cancelled beforetoggle keeps it closed', !tip.matches(':popover-open'),
+   'opened');
+tip.removeEventListener('beforetoggle', cancel);
+
+document.getElementById('btn').click();
+ok('popovertarget button shows', tip.matches(':popover-open'), 'closed');
+document.getElementById('btn').click();
+ok('popovertarget button hides', !tip.matches(':popover-open'), 'open');
+document.getElementById('btn').click();
+document.getElementById('hide').click();
+ok('popovertargetaction=hide hides', !tip.matches(':popover-open'), 'open');
+document.getElementById('hide').click();
+ok('hide on a closed one is quiet', !tip.matches(':popover-open'), 'open');
+
+setTimeout(function () {
+  /* every show and hide above fired beforetoggle; their toggle events
+     were merged into one, from the first state to the last, which
+     fires even though both are closed */
+  var toggles = events.filter(function (e) { return e.indexOf('toggle ') === 0; });
+  ok('toggle merged and late', toggles.join() === 'toggle closed>closed' &&
+     events[events.length - 1] === 'toggle closed>closed', toggles.join());
+  ok('beforetoggle each time', events.length === 12, events.length + ' ' +
+     events.join());
+  /* the box's size, once laid out: 20px, the UA's 0.25em padding and
+     its medium border, which is 3px */
+  ok('closed is 0px tall', tip.offsetHeight === 0, tip.offsetHeight);
+  tip.showPopover();
+  setTimeout(function () {
+    ok('shown is 34px tall', tip.offsetHeight === 34, tip.offsetHeight);
+    tip.hidePopover();
+  }, 50);
+}, 50);
+</script></body></html>

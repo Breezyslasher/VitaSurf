@@ -1,0 +1,211 @@
+diff --git a/quickjs.c b/quickjs.c
+index 77e843c..98bd74d 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -919,7 +919,11 @@ typedef struct JSAsyncFunctionState {
+    JS_TAG_ASYNC_FUNCTION tag for the GC */
+ typedef struct JSAsyncFunctionData {
+     JSGCObjectHeader header; /* must come first */
+-    JSValue resolving_funcs[2];
++    /* the promise the call returned, settled directly when the function
++       returns or throws (VitaSurf): it had a pair of resolving
++       functions made for it on every call, most of the cost of calling
++       an async function that returns before it awaits */
++    JSValue promise;
+     bool is_active; /* true if the async function state is valid */
+     JSAsyncFunctionState func_state;
+ } JSAsyncFunctionData;
+@@ -1434,6 +1438,9 @@ static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv);
+ static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
+                                                int argc, JSValueConst *argv);
++static void js_promise_settle(JSContext *ctx, JSValueConst promise,
++                              JSValueConst resolution, bool is_reject);
++static JSValue js_promise_new_bare(JSContext *ctx, JSValueConst new_target);
+ static bool js_string_eq(JSString *p1, JSString *p2);
+ static int js_string_compare(JSString *p1, JSString *p2);
+ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+@@ -6950,8 +6957,7 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
+             JSAsyncFunctionData *s = (JSAsyncFunctionData *)gp;
+             if (s->is_active)
+                 async_func_mark(rt, &s->func_state, mark_func);
+-            JS_MarkValue(rt, s->resolving_funcs[0], mark_func);
+-            JS_MarkValue(rt, s->resolving_funcs[1], mark_func);
++            JS_MarkValue(rt, s->promise, mark_func);
+         }
+         break;
+     case JS_GC_OBJ_TYPE_SHAPE:
+@@ -20753,8 +20759,7 @@ static void js_async_function_terminate(JSRuntime *rt, JSAsyncFunctionData *s)
+ static void js_async_function_free0(JSRuntime *rt, JSAsyncFunctionData *s)
+ {
+     js_async_function_terminate(rt, s);
+-    JS_FreeValueRT(rt, s->resolving_funcs[0]);
+-    JS_FreeValueRT(rt, s->resolving_funcs[1]);
++    JS_FreeValueRT(rt, s->promise);
+     remove_gc_object(&s->header);
+     js_free_rt(rt, s);
+ }
+@@ -20821,9 +20826,9 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
+             is_success = false;
+         } else {
+             JSValue error = JS_GetException(ctx);
+-            ret2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
+-                           1, vc(&error));
++            js_promise_settle(ctx, s->promise, error, true);
+             JS_FreeValue(ctx, error);
++            ret2 = JS_UNDEFINED;
+         resolved:
+             if (unlikely(JS_IsException(ret2))) {
+                 if (JS_IsUncatchableError(ctx->rt->current_exception)) {
+@@ -20841,9 +20846,9 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
+         s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
+         if (JS_IsUndefined(func_ret)) {
+             /* function returned */
+-            ret2 = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED,
+-                           1, vc(&value));
++            js_promise_settle(ctx, s->promise, value, false);
+             JS_FreeValue(ctx, value);
++            ret2 = JS_UNDEFINED;
+             goto resolved;
+         } else {
+             JSValue promise, resolving_funcs[2], resolving_funcs1[2];
+@@ -20918,12 +20923,12 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
+     s->header.ref_count = 1;
+     add_gc_object(ctx->rt, &s->header, JS_GC_OBJ_TYPE_ASYNC_FUNCTION);
+     s->is_active = false;
+-    s->resolving_funcs[0] = JS_UNDEFINED;
+-    s->resolving_funcs[1] = JS_UNDEFINED;
++    s->promise = JS_UNDEFINED;
+ 
+-    promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
++    promise = js_promise_new_bare(ctx, JS_UNDEFINED);
+     if (JS_IsException(promise))
+         goto fail;
++    s->promise = js_dup(promise);
+ 
+     if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
+     fail:
+@@ -54722,6 +54727,41 @@ static void js_promise_resolve_function_mark(JSRuntime *rt, JSValueConst val,
+     }
+ }
+ 
++/* What a promise's resolve or reject function does once it has not
++   already been used: reject, fulfill with a value that is not a
++   thenable, or queue the job that follows a thenable. */
++static void js_promise_settle(JSContext *ctx, JSValueConst promise,
++                              JSValueConst resolution, bool is_reject)
++{
++    JSValueConst args[3];
++    JSValue then;
++
++    if (is_reject || !JS_IsObject(resolution)) {
++        goto done;
++    } else if (js_same_value(ctx, resolution, promise)) {
++        JS_ThrowTypeError(ctx, "promise self resolution");
++        goto fail_reject;
++    }
++    then = JS_GetProperty(ctx, resolution, JS_ATOM_then);
++    if (JS_IsException(then)) {
++        JSValue error;
++    fail_reject:
++        error = JS_GetException(ctx);
++        fulfill_or_reject_promise(ctx, promise, error, true);
++        JS_FreeValue(ctx, error);
++    } else if (!JS_IsFunction(ctx, then)) {
++        JS_FreeValue(ctx, then);
++    done:
++        fulfill_or_reject_promise(ctx, promise, resolution, is_reject);
++    } else {
++        args[0] = promise;
++        args[1] = resolution;
++        args[2] = then;
++        JS_EnqueueJob(ctx, js_promise_resolve_thenable_job, 3, args);
++        JS_FreeValue(ctx, then);
++    }
++}
++
+ static JSValue js_promise_resolve_function_call(JSContext *ctx,
+                                                 JSValueConst func_obj,
+                                                 JSValueConst this_val,
+@@ -54730,9 +54770,7 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
+ {
+     JSObject *p = JS_VALUE_GET_OBJ(func_obj);
+     JSPromiseFunctionData *s;
+-    JSValueConst args[3];
+     JSValueConst resolution;
+-    JSValue then;
+     bool is_reject;
+ 
+     s = p->u.promise_function_data;
+@@ -54751,30 +54789,7 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
+         printf("\n");
+     }
+ #endif
+-    if (is_reject || !JS_IsObject(resolution)) {
+-        goto done;
+-    } else if (js_same_value(ctx, resolution, s->promise)) {
+-        JS_ThrowTypeError(ctx, "promise self resolution");
+-        goto fail_reject;
+-    }
+-    then = JS_GetProperty(ctx, resolution, JS_ATOM_then);
+-    if (JS_IsException(then)) {
+-        JSValue error;
+-    fail_reject:
+-        error = JS_GetException(ctx);
+-        fulfill_or_reject_promise(ctx, s->promise, error, true);
+-        JS_FreeValue(ctx, error);
+-    } else if (!JS_IsFunction(ctx, then)) {
+-        JS_FreeValue(ctx, then);
+-    done:
+-        fulfill_or_reject_promise(ctx, s->promise, resolution, is_reject);
+-    } else {
+-        args[0] = s->promise;
+-        args[1] = resolution;
+-        args[2] = then;
+-        JS_EnqueueJob(ctx, js_promise_resolve_thenable_job, 3, args);
+-        JS_FreeValue(ctx, then);
+-    }
++    js_promise_settle(ctx, s->promise, resolution, is_reject);
+     return JS_UNDEFINED;
+ }
+ 
+@@ -54818,6 +54833,39 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
+     JS_MarkValue(rt, s->promise_result, mark_func);
+ }
+ 
++/* A new pending promise with no resolving functions (VitaSurf): an
++   async function settles its own with js_promise_settle. */
++static JSValue js_promise_new_bare(JSContext *ctx, JSValueConst new_target)
++{
++    JSValue obj;
++    JSPromiseData *s;
++    JSRuntime *rt;
++
++    obj = js_create_from_ctor(ctx, new_target, JS_CLASS_PROMISE);
++    if (JS_IsException(obj))
++        return JS_EXCEPTION;
++    s = js_mallocz(ctx, sizeof(*s));
++    if (!s) {
++        JS_FreeValue(ctx, obj);
++        return JS_EXCEPTION;
++    }
++    s->promise_state = JS_PROMISE_PENDING;
++    s->is_handled = false;
++    init_list_head(&s->promise_reactions[0]);
++    init_list_head(&s->promise_reactions[1]);
++    s->promise_result = JS_UNDEFINED;
++    JS_SetOpaqueInternal(obj, s);
++    rt = ctx->rt;
++    if (rt->promise_hook) {
++        JSValueConst parent_promise = JS_UNDEFINED;
++        if (rt->parent_promise)
++            parent_promise = rt->parent_promise->value;
++        rt->promise_hook(ctx, JS_PROMISE_HOOK_INIT, obj, parent_promise,
++                         rt->promise_hook_opaque);
++    }
++    return obj;
++}
++
+ /* Create a new promise object with resolving functions. Returns the promise
+    and sets resolving_funcs[0] (resolve) and resolving_funcs[1] (reject). */
+ static JSValue js_promise_new(JSContext *ctx, JSValueConst new_target,

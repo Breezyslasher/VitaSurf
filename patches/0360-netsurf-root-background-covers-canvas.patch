@@ -1,0 +1,54 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 7c13c4dda..488a2d6ba 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -6234,6 +6234,20 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		}
+ 	}
+ 
++	/*
++	 * The root's background is the canvas's (CSS 2.1 14.2): it covers
++	 * all of the canvas being drawn, not only the root's own box
++	 * (VitaSurf). Home Assistant gives the root its theme colour and
++	 * a height of 100vh, and below the first screen of a longer page
++	 * the browser's white showed through.
++	 */
++	if (box->parent == NULL && !transformed) {
++		if (clip->x0 < r.x0) r.x0 = clip->x0;
++		if (clip->y0 < r.y0) r.y0 = clip->y0;
++		if (r.x1 < clip->x1) r.x1 = clip->x1;
++		if (r.y1 < clip->y1) r.y1 = clip->y1;
++	}
++
+ 	/* where a pinned box is on screen, for a frontend that pans
+ 	 * (VitaSurf); a thumbnail's redraw is in other coordinates */
+ 	if (ctx->interactive && box->style != NULL &&
+@@ -6485,24 +6499,10 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		p.y1 = y + padding_height + border_bottom < r.y1 ?
+ 				y + padding_height + border_bottom : r.y1;
+ 		if (!box->parent) {
+-			/* Root element, special case:
+-			 * background covers margins too */
+-			int m_left, m_top, m_right, m_bottom;
+-			if (scale == 1.0) {
+-				m_left = box->margin[LEFT];
+-				m_top = box->margin[TOP];
+-				m_right = box->margin[RIGHT];
+-				m_bottom = box->margin[BOTTOM];
+-			} else {
+-				m_left = box->margin[LEFT] * scale;
+-				m_top = box->margin[TOP] * scale;
+-				m_right = box->margin[RIGHT] * scale;
+-				m_bottom = box->margin[BOTTOM] * scale;
+-			}
+-			p.x0 = p.x0 - m_left < r.x0 ? r.x0 : p.x0 - m_left;
+-			p.y0 = p.y0 - m_top < r.y0 ? r.y0 : p.y0 - m_top;
+-			p.x1 = p.x1 + m_right < r.x1 ? p.x1 + m_right : r.x1;
+-			p.y1 = p.y1 + m_bottom < r.y1 ? p.y1 + m_bottom : r.y1;
++			/* Root element, special case: its background is
++			 * the canvas's, so it covers all of r, which is all
++			 * of the canvas being drawn (see above) */
++			p = r;
+ 		}
+ 		/* valid clipping rectangles only */
+ 		if ((p.x0 < p.x1) && (p.y0 < p.y1)) {

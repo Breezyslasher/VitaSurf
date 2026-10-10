@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<!-- A style read straight after a change sees it, as a browser's style
+     recalc has it: a class, an attribute, the style attribute, a <style>
+     added, changed, removed or given a rule, an element just made, a
+     shadow tree's own sheet, and rem after the root's font size. Reads
+     the boxes answered said nothing had changed until the page was laid
+     out again, and a removed <style> went on styling the page for good.
+     Layout geometry read the same way (offsetWidth) is not covered yet.
+     Expected lines are what Chrome prints. -->
+<html><head><title>style read now</title><style>
+.red { color: rgb(255, 0, 0); }
+[data-k=on] { color: rgb(0, 0, 255); }
+#box { width: 100px; }
+</style></head><body><div id="box">x</div><div id="host"></div><script>
+function t(n,f){var v;try{v=f();}catch(e){v='throws '+e.name+' '+e.message;}console.log('XX '+n+'='+JSON.stringify(v));}
+function cs(e,p){return getComputedStyle(e)[p];}
+window.addEventListener('load',function(){setTimeout(function(){
+var b=document.getElementById('box');
+t('initial width',function(){return cs(b,'width');});
+b.style.width='50px';
+t('inline width',function(){return cs(b,'width');});
+b.className='red';
+t('class color',function(){return cs(b,'color');});
+b.className='';
+t('class removed',function(){return cs(b,'color');});
+b.setAttribute('data-k','on');
+t('attr color',function(){return cs(b,'color');});
+b.removeAttribute('data-k');
+var s=document.createElement('style');s.textContent='#box{color:rgb(0,128,0)} .late{margin-left:7px}';document.head.appendChild(s);
+t('new style element',function(){return cs(b,'color');});
+s.textContent='#box{color:rgb(1,2,3)}';
+t('style text changed',function(){return cs(b,'color');});
+s.sheet.insertRule('#box{padding-left:3px}',0);
+t('insertRule',function(){return cs(b,'padding-left');});
+s.remove();
+t('style removed',function(){return cs(b,'color');});
+var n=document.createElement('p');n.className='late red';document.body.appendChild(n);
+t('new element',function(){return cs(n,'color')+' '+cs(n,'margin-left');});
+var d=document.createElement('span');d.className='red';
+t('detached',function(){return cs(d,'color');});
+var s2=document.createElement('style');s2.textContent='.late{margin-left:9px}';document.head.appendChild(s2);
+t('new element new sheet',function(){return cs(n,'margin-left');});
+b.style.display='none';
+t('display none',function(){return cs(b,'display');});
+b.style.display='';
+var h=document.getElementById('host'),r=h.attachShadow({mode:'open'});
+r.innerHTML='<style>i{color:rgb(9,9,9)}</style><i>i</i>';
+t('shadow style',function(){return cs(r.querySelector('i'),'color');});
+r.querySelector('style').textContent='i{color:rgb(8,8,8)}';
+t('shadow style changed',function(){return cs(r.querySelector('i'),'color');});
+document.documentElement.style.fontSize='20px';
+t('rem on root change',function(){b.style.width='2rem';return cs(b,'width');});
+document.documentElement.style.fontSize='';
+var p=document.createElement('div');p.style.color='rgb(4,5,6)';var c=document.createElement('b');p.appendChild(c);document.body.appendChild(p);
+t('inherited new',function(){return cs(c,'color');});
+p.style.color='rgb(7,7,7)';
+t('inherited changed',function(){return cs(c,'color');});
+},50);});
+setTimeout(function(){t('later class',function(){b.className='red';return cs(b,'color');});},400);
+</script></body></html>

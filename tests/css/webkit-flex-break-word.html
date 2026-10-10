@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!-- Two legacy values sites still write (VitaSurf). "display:
+     -webkit-flex" and "-webkit-inline-flex" are flex and inline-flex
+     (the Compat standard); they were dropped, so a rule giving only the
+     prefixed value laid its children out as blocks. "word-break:
+     break-word" is word-break: normal with overflow-wrap: anywhere (CSS
+     Text 3, 5.2); it was dropped, so a long word ran out of its box.
+     Speedtest.net's style sheets have both. Expected lines are what
+     Chrome prints:
+     XX -webkit-flex display: flex
+     XX -webkit-flex children side by side: true
+     XX -webkit-inline-flex display: inline-flex
+     XX break-word computed: break-word
+     XX break-word stays in its box: true
+     XX break-word wraps onto lines: true -->
+<html><head><title>webkit flex and break-word</title>
+<style>
+#f { display: -webkit-flex; width: 300px; }
+#f > div { width: 50px; height: 20px; background: #39c; }
+#i { display: -webkit-inline-flex; }
+#w { width: 100px; word-break: break-word; font-size: 16px; }
+</style></head><body>
+<div id="f"><div id="a"></div><div id="b"></div></div>
+<span id="i">i</span>
+<div id="w">Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function $(id) { return document.getElementById(id); }
+window.addEventListener('load', function () { setTimeout(function () {
+var a = $('a').getBoundingClientRect(), b = $('b').getBoundingClientRect();
+var w = $('w').getBoundingClientRect();
+T('-webkit-flex display', getComputedStyle($('f')).display);
+T('-webkit-flex children side by side',
+  Math.round(b.left - a.left) === 50 && Math.round(b.top) === Math.round(a.top));
+T('-webkit-inline-flex display', getComputedStyle($('i')).display);
+T('break-word computed', getComputedStyle($('w')).wordBreak);
+T('break-word stays in its box', $('w').scrollWidth <= 101);
+T('break-word wraps onto lines', w.height > 30);
+}, 300); });
+</script>
+</body></html>

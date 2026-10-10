@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<!-- The root element's background is the canvas's (CSS 2.1 14.2): it
+     covers the whole page, not only the root's own box (VitaSurf).
+     Home Assistant gives the root its theme colour and a height of
+     100vh; below the first screen of a longer page the browser's white
+     showed through. Here the root is 100px tall and dark blue, the
+     body has no background, and the content runs to 2000px. Expected:
+     dark blue everywhere around the text, at the top and after
+     scrolling to the bottom, as in Chrome; never white. The second
+     block has a background of its own and keeps it. -->
+<html style="background: #123; height: 100px; color: #eee">
+<head><title>root background canvas</title></head>
+<body style="margin: 8px">
+<p>Top of the page. The background around this text is dark blue.</p>
+<div style="height: 1800px"></div>
+<p style="background: #363">A block with its own green background.</p>
+<p>Bottom of the page. The background here is dark blue too.</p>
+</body></html>

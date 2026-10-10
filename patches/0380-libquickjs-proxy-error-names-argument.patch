@@ -1,0 +1,31 @@
+diff --git a/quickjs.c b/quickjs.c
+index 501fd3a..e90ab0a 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -54169,7 +54169,25 @@ JSValue JS_NewProxy(JSContext *ctx, JSValueConst target, JSValueConst handler)
+ 
+     if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT ||
+         JS_VALUE_GET_TAG(handler) != JS_TAG_OBJECT) {
+-        return JS_ThrowTypeErrorNotAnObject(ctx);
++        /* which of the two, and what it was (VitaSurf): "not an
++           object" alone left a page's failing Proxy unexplained */
++        bool t = JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT;
++        JSValueConst v = t ? target : handler;
++        const char *what;
++
++        switch (JS_VALUE_GET_TAG(v)) {
++        case JS_TAG_UNDEFINED: what = "undefined"; break;
++        case JS_TAG_NULL: what = "null"; break;
++        case JS_TAG_BOOL: what = "a boolean"; break;
++        case JS_TAG_STRING: what = "a string"; break;
++        case JS_TAG_SYMBOL: what = "a symbol"; break;
++        case JS_TAG_SHORT_BIG_INT:
++        case JS_TAG_BIG_INT: what = "a bigint"; break;
++        default: what = "a number"; break;
++        }
++        return JS_ThrowTypeError(ctx, "Cannot create proxy with a "
++                                 "non-object as %s: it was %s",
++                                 t ? "target" : "handler", what);
+     }
+     obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROXY);
+     if (JS_IsException(obj))

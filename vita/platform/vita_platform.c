@@ -38,6 +38,7 @@
 
 #include <mbedtls/error.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/ssl_ciphersuites.h>
 #include <mbedtls/version.h>
 #include <mbedtls/x509_crt.h>
 
@@ -633,6 +634,74 @@ void vita_tls_ca_attach(void *mbedtls_ssl_config)
 		mbedtls_ssl_conf_ca_chain(
 			(struct mbedtls_ssl_config *)mbedtls_ssl_config,
 			&ca_chain, NULL);
+}
+
+/*
+ * The suites offered by default (VitaSurf): TLS 1.3's ChaCha20-Poly1305
+ * and AES-128-GCM, then mbedTLS's TLS 1.2 list as it is. See
+ * vita_tls_lean_suites().
+ */
+static int tls_lean[256];
+static int tls_lean_state;	/* 0 not built, 1 built, -1 left alone */
+
+static void tls_lean_build(void)
+{
+	const int *all = mbedtls_ssl_list_ciphersuites();
+	int n = 0, j;
+	bool chacha = false, aes128 = false;
+
+	tls_lean_state = -1;
+	for (j = 0; all[j] != 0; j++) {
+		if (all[j] == MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256)
+			chacha = true;
+		if (all[j] == MBEDTLS_TLS1_3_AES_128_GCM_SHA256)
+			aes128 = true;
+	}
+	/* both, or the list stays mbedTLS's own */
+	if (!chacha || !aes128)
+		return;
+	tls_lean[n++] = MBEDTLS_TLS1_3_CHACHA20_POLY1305_SHA256;
+	tls_lean[n++] = MBEDTLS_TLS1_3_AES_128_GCM_SHA256;
+	for (j = 0; all[j] != 0; j++) {
+		/* TLS 1.3's suites are 0x1301 to 0x1305 */
+		if (all[j] >= 0x1301 && all[j] <= 0x1305)
+			continue;
+		if (n >= (int)(sizeof(tls_lean) / sizeof(tls_lean[0])) - 1)
+			return;
+		tls_lean[n++] = all[j];
+	}
+	tls_lean[n] = 0;
+	tls_lean_state = 1;
+}
+
+/* exported interface documented in vita_platform.h */
+void vita_tls_lean_suites(void *mbedtls_ssl_config)
+{
+	if (tls_lean_state == 0)
+		tls_lean_build();
+	if (tls_lean_state == 1 && mbedtls_ssl_config != NULL)
+		mbedtls_ssl_conf_ciphersuites(
+			(struct mbedtls_ssl_config *)mbedtls_ssl_config,
+			tls_lean);
+}
+
+/* exported interface documented in vita_platform.h */
+int vita_tls_cipher_kind(const void *ssl)
+{
+	const mbedtls_ssl_ciphersuite_t *cs;
+	const char *name;
+
+	if (ssl == NULL)
+		return 2;
+	cs = mbedtls_ssl_ciphersuite_from_id(
+		mbedtls_ssl_get_ciphersuite_id_from_ssl(
+			(const mbedtls_ssl_context *)ssl));
+	name = (cs != NULL) ? mbedtls_ssl_ciphersuite_get_name(cs) : NULL;
+	if (name != NULL && strstr(name, "CHACHA20") != NULL)
+		return 0;
+	if (name != NULL && strstr(name, "AES") != NULL)
+		return 1;
+	return 2;
 }
 
 /**

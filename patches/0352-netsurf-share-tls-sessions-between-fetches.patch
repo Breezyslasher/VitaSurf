@@ -1,0 +1,56 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index e8519ec07..62d0efff8 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -328,6 +328,16 @@ CURLM *fetch_curl_multi;
+ 
+ /** Curl handle with default options set; not used for transfers. */
+ static CURL *fetch_blank_curl;
++#ifdef __vita__
++/*
++ * One TLS session cache for every fetch (VitaSurf). Each easy handle
++ * kept its own, and a fetch often gets a fresh handle, so a connection
++ * to a server already talked to did the whole handshake again: twelve
++ * of them on one site in a build 581 log, 6.8 s on the Vita. With the
++ * cache shared, a later connection resumes the session.
++ */
++static CURLSH *fetch_curl_share;
++#endif
+ 
+ /** Ring of cached handles */
+ static struct cache_handle *curl_handle_ring = 0;
+@@ -402,6 +412,12 @@ static void fetch_curl_finalise(lwc_string *scheme)
+ 		if (codem != CURLM_OK)
+ 			NSLOG(netsurf, INFO,
+ 			      "curl_multi_cleanup failed: ignoring");
++#ifdef __vita__
++		if (fetch_curl_share != NULL) {
++			(void) curl_share_cleanup(fetch_curl_share);
++			fetch_curl_share = NULL;
++		}
++#endif
+ 
+ 		curl_global_cleanup();
+ 
+@@ -2576,6 +2592,21 @@ nserror fetch_curl_register(void)
+ 	NSLOG(netsurf, INFO, "cURL %slinked against openssl",
+ 	      curl_with_openssl ? "" : "not ");
+ 
++#ifdef __vita__
++	fetch_curl_share = curl_share_init();
++	if (fetch_curl_share != NULL &&
++	    (curl_share_setopt(fetch_curl_share, CURLSHOPT_SHARE,
++			       CURL_LOCK_DATA_SSL_SESSION) != CURLSHE_OK ||
++	     curl_easy_setopt(fetch_blank_curl, CURLOPT_SHARE,
++			      fetch_curl_share) != CURLE_OK)) {
++		(void) curl_easy_setopt(fetch_blank_curl, CURLOPT_SHARE, NULL);
++		curl_share_cleanup(fetch_curl_share);
++		fetch_curl_share = NULL;
++	}
++	NSLOG(netsurf, INFO, "TLS sessions %s shared between fetches",
++	      fetch_curl_share != NULL ? "are" : "are not");
++#endif
++
+ 	/* cURL initialised okay, register the fetchers */
+ 
+ 	data = curl_version_info(CURLVERSION_NOW);

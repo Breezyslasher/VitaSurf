@@ -40,6 +40,11 @@
 
 #include "vita_platform.h"
 #include "websocket.h"
+#if defined(__vita__) || defined(VITASURF_RESOLVE_TEST)
+#include "utils/nsoption.h"
+#include "vita_resolve.h"
+#define VWS_RESOLVE 1
+#endif
 
 #define POLL_MS 20		/**< how often a connection is looked at */
 /** How long one look may spend handing messages to the page. A page that
@@ -48,6 +53,7 @@
  * drawing included, waiting until the backlog was gone. */
 #define POLL_BUDGET_MS 100
 #define CLOSE_WAIT_MS 3000	/**< how long a close waits for the server */
+#define LATE_MS 5000		/**< a look later than this is logged */
 #define MAX_MESSAGE (16u * 1024u * 1024u)
 #define MAX_SOCKETS 32		/**< a page that opens more gets errors */
 
@@ -82,6 +88,10 @@ struct vws {
 	struct vws_out *out, *out_last;
 	size_t buffered;
 	uint64_t close_started;
+#ifdef VWS_RESOLVE
+	bool waiting;		/**< for its host's address, not yet curl's */
+	struct curl_slist *resolve; /**< that address, for CURLOPT_RESOLVE */
+#endif
 	struct vws *next;
 };
 
@@ -112,10 +122,13 @@ static struct vws *find(int id)
 
 static void poll_cb(void *p);
 
+static uint64_t poll_due;	/**< when the next look was asked for */
+
 static void schedule_poll(void)
 {
 	if (!scheduled && sockets != NULL) {
 		scheduled = true;
+		poll_due = ms_now() + POLL_MS;
 		guit->misc->schedule(POLL_MS, poll_cb, NULL);
 	}
 }
@@ -149,6 +162,13 @@ static void finish(struct vws *s)
 		curl_slist_free_all(s->headers);
 		s->headers = NULL;
 	}
+#ifdef VWS_RESOLVE
+	if (s->resolve != NULL) {
+		curl_slist_free_all(s->resolve);
+		s->resolve = NULL;
+	}
+	s->waiting = false;
+#endif
 	free_out(s);
 	free(s->msg);
 	s->msg = NULL;
@@ -229,6 +249,68 @@ static void send_close_frame(struct vws *s, int code, const char *reason,
 }
 
 /* The handshakes in progress. */
+#ifdef VWS_RESOLVE
+/*
+ * Connect once the host's address is known (VitaSurf). curl would look
+ * the name up inside curl_multi_perform and hold the browser up until
+ * the answer came, as the fetcher's transfers did (fetch_curl_resolve_try
+ * in NetSurf's curl.c); vita_resolve looks it up on a thread instead,
+ * and curl gets the address with CURLOPT_RESOLVE.
+ *
+ * Returns 1 once curl has the connection, 0 while the lookup goes on,
+ * and -1 with why filled in if it cannot be made.
+ */
+static int connect_resolved(struct vws *s, char *why, size_t why_len)
+{
+	CURLU *u = curl_url();
+	char *host = NULL, *port = NULL;
+	char addrs[16], entry[300];
+	int r = 1;
+
+	if (u == NULL ||
+	    curl_url_set(u, CURLUPART_URL, s->url,
+			 CURLU_NON_SUPPORT_SCHEME) != CURLUE_OK ||
+	    curl_url_get(u, CURLUPART_HOST, &host, 0) != CURLUE_OK ||
+	    curl_url_get(u, CURLUPART_PORT, &port,
+			 CURLU_DEFAULT_PORT) != CURLUE_OK ||
+	    host[0] == '[' || strspn(host, "0123456789.") == strlen(host) ||
+	    strcasecmp(host, "localhost") == 0 ||
+	    (nsoption_bool(http_proxy) &&
+	     nsoption_charp(http_proxy_host) != NULL)) {
+		/* curl reads the URL, or connects to an address or a
+		 * proxy, itself */
+		goto add;
+	}
+	switch (vita_resolve(host, addrs, sizeof(addrs), why, why_len)) {
+	case VITA_RESOLVE_PENDING:
+		r = 0;
+		goto out;
+	case VITA_RESOLVE_FAILED:
+		r = -1;
+		goto out;
+	default:
+		break;
+	}
+	snprintf(entry, sizeof(entry), "+%s:%s:%s", host, port, addrs);
+	s->resolve = curl_slist_append(NULL, entry);
+	if (s->resolve != NULL) {
+		curl_easy_setopt(s->h, CURLOPT_RESOLVE, s->resolve);
+	}
+add:
+	if (curl_multi_add_handle(multi, s->h) != CURLM_OK) {
+		snprintf(why, why_len, "the connection could not be started");
+		r = -1;
+	} else {
+		s->waiting = false;
+	}
+out:
+	curl_free(host);
+	curl_free(port);
+	curl_url_cleanup(u);
+	return r;
+}
+#endif
+
 static void poll_connecting(void)
 {
 	int running = 0, left = 0;
@@ -237,6 +319,21 @@ static void poll_connecting(void)
 	if (multi == NULL) {
 		return;
 	}
+#ifdef VWS_RESOLVE
+	{
+		struct vws *s;
+		char why[96];
+
+		/* a failure tells the page, which may open or close
+		 * sockets; those it opens go on the front of the list */
+		for (s = sockets; s != NULL; s = s->next) {
+			if (s->state == ST_CONNECTING && s->waiting &&
+			    connect_resolved(s, why, sizeof(why)) < 0) {
+				failed(s, why);
+			}
+		}
+	}
+#endif
 	curl_multi_perform(multi, &running);
 	while ((m = curl_multi_info_read(multi, &left)) != NULL) {
 		struct vws *s;
@@ -279,8 +376,11 @@ static void poll_connecting(void)
 	}
 }
 
-/* Hand queued messages to the connection, as far as it takes them. */
-static bool flush_out(struct vws *s)
+/* Hand queued messages to the connection, as far as it takes them. A
+ * failure is reported unless quiet, which leaves it for the next look:
+ * send() must not fire the page's error and close events from inside
+ * the script that called it. */
+static bool flush_out_as(struct vws *s, bool quiet)
 {
 	while (s->out != NULL && s->state != ST_DONE) {
 		struct vws_out *o = s->out;
@@ -295,7 +395,9 @@ static bool flush_out(struct vws *s)
 			return true;
 		}
 		if (rc != CURLE_OK) {
-			failed(s, curl_easy_strerror(rc));
+			if (!quiet) {
+				failed(s, curl_easy_strerror(rc));
+			}
 			return false;
 		}
 		o->off += sent;
@@ -311,6 +413,11 @@ static bool flush_out(struct vws *s)
 		free(o);
 	}
 	return true;
+}
+
+static bool flush_out(struct vws *s)
+{
+	return flush_out_as(s, false);
 }
 
 /* Read what has arrived, message by message, until the deadline. */
@@ -420,10 +527,23 @@ static void poll_cb(void *p)
 {
 	struct vws *s, **pp;
 
-	uint64_t deadline = ms_now() + POLL_BUDGET_MS;
+	uint64_t now = ms_now();
+	uint64_t deadline = now + POLL_BUDGET_MS;
 
 	(void)p;
 	scheduled = false;
+	/* A look the page held up: messages, pings included, waited this
+	 * long in both directions. */
+	if (now > poll_due + LATE_MS) {
+		size_t waiting = 0;
+
+		for (s = sockets; s != NULL; s = s->next) {
+			waiting += s->buffered;
+		}
+		vita_log("websocket: looked %u ms late, with %u bytes still "
+			 "to send", (unsigned int)(now - poll_due),
+			 (unsigned int)waiting);
+	}
 	poll_connecting();
 	for (s = sockets; s != NULL; s = s->next) {
 		if (s->state == ST_OPEN || s->state == ST_CLOSING) {
@@ -565,12 +685,23 @@ int vws_open(const char *url, const char *origin, const char *protocols,
 	if (cookie != NULL && cookie[0] != '\0') {
 		curl_easy_setopt(s->h, CURLOPT_COOKIE, cookie);
 	}
+#ifdef VWS_RESOLVE
+	/* curl has it once the host's address is known; a failure is the
+	 * poll's to report, as any failure to connect is */
+	s->waiting = true;
+	{
+		char why[96];
+
+		(void)connect_resolved(s, why, sizeof(why));
+	}
+#else
 	if (curl_multi_add_handle(multi, s->h) != CURLM_OK) {
 		finish(s);
 		free(s->url);
 		free(s);
 		return -1;
 	}
+#endif
 	s->id = next_id++;
 	if (next_id <= 0) {
 		next_id = 1;
@@ -613,7 +744,14 @@ bool vws_send(int id, const void *data, size_t len, bool binary)
 	}
 	s->out_last = o;
 	s->buffered += len;
-	/* sent at the next poll, not from inside the script */
+	/* Sent now, as far as the connection takes it, and the rest at the
+	 * next look. Waiting for the look held a message back for as long
+	 * as the page kept the browser busy after sending it: Home
+	 * Assistant's ping left during a long script only when it ended,
+	 * and its 15 s timer for the answer ran out first. */
+	if (s->out == o) {
+		(void)flush_out_as(s, true);
+	}
 	schedule_poll();
 	return true;
 }

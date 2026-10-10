@@ -1,0 +1,69 @@
+diff --git a/quickjs.c b/quickjs.c
+index 151dd0f..8db66c3 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -270,6 +270,8 @@ struct JSRuntime {
+     JSLazyPropertyHandler *lazy_handler;
+     /* told of a read that found nothing (VitaSurf), or NULL */
+     JSPropertyMissHook *miss_hook;
++    /* told of each error the engine raises (VitaSurf), or NULL */
++    JSEngineThrowHook *throw_hook;
+     JSMallocState malloc_state;
+     const char *rt_info;
+ 
+@@ -2244,6 +2246,11 @@ void JS_SetPropertyMissHook(JSRuntime *rt, JSPropertyMissHook *hook)
+     rt->miss_hook = hook;
+ }
+ 
++void JS_SetEngineThrowHook(JSRuntime *rt, JSEngineThrowHook *hook)
++{
++    rt->throw_hook = hook;
++}
++
+ void JS_SetCanBlock(JSRuntime *rt, bool can_block)
+ {
+     rt->can_block = can_block;
+@@ -8132,6 +8139,10 @@ JS_ThrowError2(JSContext *ctx, JSErrorEnum error_num, bool add_backtrace,
+     if (unlikely(JS_IsException(obj))) {
+         /* out of memory: throw JS_NULL to avoid recursing */
+         obj = JS_NULL;
++    } else if (add_backtrace && unlikely(ctx->rt->throw_hook != NULL)) {
++        /* its stack is set; one from bytecode is told of below, once the
++           interpreter has set its stack (VitaSurf) */
++        ctx->rt->throw_hook(ctx, obj);
+     }
+     return JS_Throw(ctx, obj);
+ }
+@@ -20348,9 +20359,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+  exception:
+     if (needs_backtrace(rt->current_exception)
+     || JS_IsUndefined(ctx->error_back_trace)) {
++        bool fresh = needs_backtrace(rt->current_exception);
+         sf->cur_pc = pc;
+         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
+                         NULL, 0, 0, 0);
++        /* an error the engine raised in this bytecode (VitaSurf) */
++        if (fresh && unlikely(rt->throw_hook != NULL) &&
++            !rt->in_out_of_memory)
++            rt->throw_hook(ctx, rt->current_exception);
+     }
+     if (!JS_IsUncatchableError(rt->current_exception)) {
+         while (sp > stack_buf) {
+diff --git a/quickjs.h b/quickjs.h
+index b499ada..3328a2f 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1175,6 +1175,13 @@ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
+ typedef void JSPropertyMissHook(JSContext *ctx, JSValueConst obj,
+                                 JSAtom prop);
+ JS_EXTERN void JS_SetPropertyMissHook(JSRuntime *rt, JSPropertyMissHook *hook);
++/* Told of each error the engine raises itself -- a TypeError for a call
++   of undefined, a ReferenceError, a RangeError -- once its stack is set,
++   whether or not script goes on to catch it (VitaSurf). A page that
++   catches its own failures leaves no other trace of them. It must not
++   run script. */
++typedef void JSEngineThrowHook(JSContext *ctx, JSValueConst error);
++JS_EXTERN void JS_SetEngineThrowHook(JSRuntime *rt, JSEngineThrowHook *hook);
+ /*
+  * Lazy properties (VitaSurf). A lazy property looks like the data
+  * property it is defined as -- its attributes are the given flags -- and

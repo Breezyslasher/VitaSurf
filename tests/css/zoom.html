@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!-- zoom (VitaSurf): the standard property, now in every browser,
+     scales an element's lengths and its text, and its children's with
+     it; it was ignored. Expected lines are what Chrome prints. -->
+<html><head><title>zoom</title><style>
+body { margin: 0; font: 16px sans-serif }
+#a { zoom: 2; width: 50px; height: 10px; background: #39c }
+#b { zoom: 1.5 } #b > div { width: 40px; height: 10px; margin-left: 10px; background: #c93 }
+#c { zoom: 50%; font-size: 20px } #c > div { width: 4em; height: 1em; background: #3c9 }
+#d { zoom: 2 } #d > div { zoom: 0.5; width: 30px; height: 4px; background: #999 }
+#e { zoom: 1; width: 30px; height: 4px }
+#f { zoom: 2; width: calc(1em + 10px); height: 4px; font-size: 10px }
+</style></head><body>
+<div id="a"></div>
+<div id="b"><div></div></div>
+<div id="c"><div></div></div>
+<div id="d"><div></div></div>
+<div id="e"></div>
+<div id="f"></div>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function r(s) { var b = document.querySelector(s).getBoundingClientRect();
+  return Math.round(b.left) + ',' + Math.round(b.width) + 'x' + Math.round(b.height); }
+window.addEventListener('load', function () { setTimeout(function () {
+T('zoom 2', r('#a'));
+T('zoom 1.5 child with margin', r('#b > div'));
+T('zoom 50% em sizes', r('#c > div'));
+T('nested 2 and 0.5', r('#d > div'));
+T('zoom 1', r('#e'));
+T('calc with em', r('#f'));
+}, 300); });
+</script>
+</body></html>

@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<!-- More of shadow DOM, as Chrome has it: declarative shadow roots from
+     the parser and setHTMLUnsafe; clonable and serializable roots;
+     :host, ::slotted and :host-context; focus, which the document sees
+     as the host and delegatesFocus passes inward; manual slot
+     assignment, slotchange and flattened slots; composedPath from
+     outside an open tree and a closed one; hit testing retargeted to
+     the host; a hidden frame in a closed tree, which loads. Reads that need layout wait for it. Expected lines are
+     what Chrome prints. -->
+<html><head><title>shadow root more</title></head><body>
+<div id="dsd"><template shadowrootmode="open" shadowrootserializable><span id="in">d</span><slot></slot></template><b>light</b></div>
+<div id="h1"></div><div id="h2"></div><div id="h3"></div><div id="h4"></div><div id="h5"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function t(n, f) { var v; try { v = f(); } catch (e) { v = 'throws ' + e.name; } out.push(n + '=' + v); }
+function cs(e, p) { return getComputedStyle(e)[p]; }
+out.push('[declarative]');
+var d = document.getElementById('dsd');
+t('shadowRoot', function () { return !!d.shadowRoot && d.shadowRoot.getElementById('in').textContent; });
+t('template gone', function () { return d.querySelector('template') === null && d.children.length; });
+t('serializable', function () { return d.shadowRoot.serializable; });
+t('setHTMLUnsafe', function () { var x = document.createElement('div'); x.setHTMLUnsafe('<p><template shadowrootmode="open"><i>z</i></template></p>'); return !!x.firstChild.shadowRoot; });
+t('innerHTML leaves a template', function () { var x = document.createElement('div'); x.innerHTML = '<p><template shadowrootmode="open"><i>z</i></template></p>'; return !!x.firstChild.shadowRoot; });
+
+out.push('[clone and serialise]');
+var h1 = document.getElementById('h1'), r1 = h1.attachShadow({mode: 'open'});
+r1.innerHTML = '<span class="x">x</span><slot></slot>';
+t('cloneNode', function () { return h1.cloneNode(true).shadowRoot; });
+t('importNode', function () { return document.importNode(h1, true).shadowRoot; });
+var c1 = document.createElement('div'); c1.attachShadow({mode: 'open', clonable: true}).innerHTML = '<i>c</i>';
+t('clonable', function () { var c = c1.cloneNode(true); return c.shadowRoot && c.shadowRoot.innerHTML; });
+t('clonable deep', function () { var w = document.createElement('div'); w.appendChild(c1); var c = w.cloneNode(true); return c.firstChild.shadowRoot && c.firstChild.shadowRoot.innerHTML; });
+t('init', function () { var s = document.createElement('div').attachShadow({mode: 'open', delegatesFocus: true, slotAssignment: 'manual'}); return [s.delegatesFocus, s.slotAssignment, s.clonable, s.serializable].join(); });
+t('getHTML', function () { var x = document.createElement('div'); x.attachShadow({mode: 'open', serializable: true}).innerHTML = '<p>s</p>'; x.innerHTML = '<i>l</i>'; return x.getHTML({serializableShadowRoots: true}); });
+t('getHTML plain', function () { var x = document.createElement('div'); x.attachShadow({mode: 'open', serializable: true}).innerHTML = '<p>s</p>'; x.innerHTML = '<i>l</i>'; return x.getHTML(); });
+
+out.push('[focus]');
+var h4 = document.getElementById('h4'), r4 = h4.attachShadow({mode: 'open'});
+r4.innerHTML = '<input id="si">';
+r4.getElementById('si').focus();
+t('document.activeElement', function () { return document.activeElement === h4 ? 'host' : document.activeElement && document.activeElement.localName; });
+t('shadowRoot.activeElement', function () { return r4.activeElement && r4.activeElement.id; });
+t('host :focus', function () { return h4.matches(':focus'); });
+t('host :focus-within', function () { return h4.matches(':focus-within'); });
+t('input :focus', function () { return r4.getElementById('si').matches(':focus'); });
+var h5 = document.getElementById('h5'), r5 = h5.attachShadow({mode: 'open', delegatesFocus: true});
+r5.innerHTML = '<span>s</span><input id="dz">';
+h5.focus();
+t('delegatesFocus', function () { return r5.activeElement && r5.activeElement.id; });
+t('focus left the other tree', function () { return r4.activeElement; });
+
+out.push('[slots]');
+var sc = 0, h6 = document.createElement('div'), r6 = h6.attachShadow({mode: 'open'});
+r6.innerHTML = '<slot></slot>'; document.body.appendChild(h6);
+r6.querySelector('slot').addEventListener('slotchange', function (e) { sc++; });
+h6.appendChild(document.createElement('em'));
+var h7 = document.createElement('div'), r7 = h7.attachShadow({mode: 'open', slotAssignment: 'manual'});
+r7.innerHTML = '<slot id="a"></slot><slot id="b"></slot>';
+var e7 = document.createElement('u'); h7.appendChild(e7); document.body.appendChild(h7);
+t('manual, unassigned', function () { return e7.assignedSlot; });
+t('assign()', function () { r7.getElementById('a').assign(e7); return e7.assignedSlot === r7.getElementById('a'); });
+t('assign() elsewhere', function () { r7.getElementById('b').assign(e7); return e7.assignedSlot.id + ' ' + r7.getElementById('a').assignedNodes().length; });
+t('flatten', function () { var x = document.createElement('div'), r = x.attachShadow({mode: 'open'}); r.innerHTML = '<slot><b>fallback</b></slot>'; return r.querySelector('slot').assignedNodes().length + ' ' + r.querySelector('slot').assignedNodes({flatten: true}).map(function (n) { return n.textContent; }).join(); });
+
+out.push('[events]');
+t('composedPath from the document', function () {
+  var h = document.createElement('div'), r = h.attachShadow({mode: 'open'}), s = document.createElement('p'), p;
+  r.appendChild(s); document.body.appendChild(h);
+  document.addEventListener('zo', function (e) { p = e.composedPath().map(function (n) { return n === r ? '#shadow' : n === window ? 'window' : n === document ? '#document' : n.localName; }).join(); }, {once: true});
+  s.dispatchEvent(new Event('zo', {bubbles: true, composed: true}));
+  return p; });
+t('composedPath closed', function () {
+  var h = document.createElement('div'), r = h.attachShadow({mode: 'closed'}), s = document.createElement('p'), p;
+  r.appendChild(s); document.body.appendChild(h);
+  document.addEventListener('zz', function (e) { p = e.composedPath().length; }, {once: true});
+  s.dispatchEvent(new Event('zz', {bubbles: true, composed: true}));
+  return p; });
+t('click retargeted', function () { var tg; document.addEventListener('click', function (e) { tg = e.target; }, {once: true}); r4.getElementById('si').click(); return tg === h4 ? 'host' : tg && tg.localName; });
+t('ui event composed', function () { var c; document.addEventListener('click', function (e) { c = e.composed; }, {once: true}); r4.getElementById('si').click(); return c; });
+t('script event not composed', function () { return new Event('x').composed; });
+
+/* a frame in a closed shadow tree, hidden: it loads all the same */
+var frameMsgs = [];
+window.addEventListener('message', function (e) { if (e.data && e.data.indexOf && e.data.indexOf('frame:') === 0) frameMsgs.push(e.data); });
+(function () {
+  var h = document.createElement('div'), r = h.attachShadow({mode: 'closed'}), f = document.createElement('iframe');
+  f.style.display = 'none';
+  f.srcdoc = '<script>parent.postMessage("frame: hidden in a closed tree", "*")<\/script>';
+  r.appendChild(f); document.body.appendChild(h);
+})();
+
+/* styles that come from a shadow tree's own <style>, once laid out */
+var h2 = document.getElementById('h2'); h2.className = 'ctx'; var r2 = h2.attachShadow({mode: 'open'});
+r2.innerHTML = '<style>:host{display:block;padding-left:3px} :host(.ctx){padding-top:4px} ::slotted(b){margin-left:5px} :host-context(body) p{margin-top:6px}</style><p>p</p><slot></slot>';
+var h2b = document.createElement('div'); document.body.appendChild(h2b);
+h2b.attachShadow({mode: 'open'}).innerHTML = '<style>:host{display:block;padding-left:3px}</style>b';
+h2b.style.paddingLeft = '9px';
+var hb = document.createElement('b'); hb.textContent = 'sl'; h2.appendChild(hb);
+var h3 = document.getElementById('h3'), r3 = h3.attachShadow({mode: 'open'});
+r3.innerHTML = '<style>i{color:rgb(1,2,3)}</style><i>a</i>';
+var sh = new CSSStyleSheet(); sh.replaceSync('i{font-weight:700}'); r3.adoptedStyleSheets = [sh];
+h1.style.color = 'rgb(0, 128, 0)';
+setTimeout(function () {
+  out.push('[styles]');
+  t(':host', function () { return cs(h2, 'paddingLeft'); });
+  t(':host(.ctx)', function () { return cs(h2, 'paddingTop'); });
+  t('::slotted', function () { return cs(hb, 'marginLeft'); });
+  t(':host-context', function () { return cs(r2.querySelector('p'), 'marginTop'); });
+  t('a rule on the host beats :host', function () { return cs(h2b, 'paddingLeft'); });
+  t('inherits from the host', function () { return cs(r1.querySelector('span'), 'color'); });
+  t('adoptedStyleSheets', function () { return cs(r3.querySelector('i'), 'fontWeight') + ' ' + cs(r3.querySelector('i'), 'color'); });
+  t('shadowRoot.styleSheets', function () { return r3.styleSheets.length; });
+  t('document.styleSheets', function () { return document.styleSheets.length; });
+  t('slotchange', function () { return sc; });
+  setTimeout(function () {
+    out.push('[hit testing]');
+    var b = h2.getBoundingClientRect();
+    t('elementFromPoint on a host', function () { var e = document.elementFromPoint(b.left + 1, b.top + 1); return e === h2 ? 'host' : e && e.localName; });
+    t('elementFromPoint outside', function () { return r2.elementFromPoint(1, b.bottom + 400); });
+    out.push('[frames]');
+    t('a hidden frame in a closed tree loads', function () { return frameMsgs.join(); });
+    out.forEach(function (l) { console.log('XX ' + l); });
+    document.getElementById('out').textContent = out.join('\n');
+  }, 300);
+}, 300);
+</script></body></html>

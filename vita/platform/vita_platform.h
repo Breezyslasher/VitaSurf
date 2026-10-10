@@ -209,6 +209,30 @@ int vita_tls_ca_shared(const char *path, const char **first_pem,
  */
 void vita_tls_ca_attach(void *mbedtls_ssl_config);
 
+/**
+ * Offer TLS 1.3's ChaCha20-Poly1305 and AES-128-GCM and not its other
+ * suites, the TLS 1.2 ones as mbedTLS lists them (VitaSurf).
+ *
+ * The Vita's Cortex-A9 has no AES instructions, and in mbedTLS's C
+ * ChaCha20-Poly1305 runs about 2.7 times as fast as AES-GCM: at Vita
+ * speed AES-GCM holds an HTTPS download to a few MB/s on a link that
+ * gives 12. mbedTLS offers ChaCha20 first, but a server built on
+ * OpenSSL takes its own order, AES-256-GCM first, then ChaCha20; left
+ * out of the offer, AES-256 cannot be chosen and ChaCha20 is. Every
+ * TLS 1.3 server has AES-128-GCM. A server that refuses the offer
+ * anyway gets mbedTLS's whole list on a second try (the fetcher keeps
+ * which hosts need it).
+ */
+void vita_tls_lean_suites(void *mbedtls_ssl_config);
+
+/**
+ * Which cipher a TLS connection agreed (ssl, an mbedtls_ssl_context): 0 for
+ * ChaCha20-Poly1305, 1 for AES, 2 for anything else; for the page
+ * summary, which counts how many still end on AES (see
+ * vita_tls_lean_suites()).
+ */
+int vita_tls_cipher_kind(const void *ssl);
+
 /** True when the user created the verbose flag file in the data directory. */
 int vita_verbose_requested(void);
 

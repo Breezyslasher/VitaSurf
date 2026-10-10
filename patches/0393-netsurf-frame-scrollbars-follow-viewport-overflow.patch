@@ -1,0 +1,77 @@
+diff --git a/desktop/frames.c b/desktop/frames.c
+index ad00dd752..dd4ca1681 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -104,6 +104,43 @@ void browser_window_scroll_callback(void *client_data,
+ 	}
+ }
+ 
++/**
++ * The overflow a frame's document gives its viewport (VitaSurf): the
++ * root element's, or the body's when the root's is visible, which is
++ * where box construction leaves them (CSS 2.1 section 11.1.1). The
++ * frame's scrollbars were chosen from the size of its content alone, so
++ * a document that hides its overflow, as a widget sized to its frame
++ * does, still had both, and they took its room.
++ */
++static void
++browser_window_viewport_overflow(struct hlcache_handle *h,
++				 uint8_t *ox, uint8_t *oy)
++{
++	const css_computed_style *style;
++	struct box *root, *b;
++
++	*ox = *oy = CSS_OVERFLOW_VISIBLE;
++	if (content_get_type(h) != CONTENT_HTML) {
++		return;
++	}
++	root = html_get_box_tree(h);
++	if (root == NULL || root->style == NULL) {
++		return;
++	}
++	style = root->style;
++	if (css_computed_overflow_x(style) == CSS_OVERFLOW_VISIBLE &&
++	    css_computed_overflow_y(style) == CSS_OVERFLOW_VISIBLE) {
++		for (b = root->children; b != NULL; b = b->next) {
++			if ((b->flags & OVERFLOW_VIEWPORT) && b->style != NULL) {
++				style = b->style;
++				break;
++			}
++		}
++	}
++	*ox = css_computed_overflow_x(style);
++	*oy = css_computed_overflow_y(style);
++}
++
+ /* exported interface, documented in browser.h */
+ void browser_window_handle_scrollbars(struct browser_window *bw)
+ {
+@@ -127,6 +164,7 @@ void browser_window_handle_scrollbars(struct browser_window *bw)
+ 			bw->current_content) {
+ 		int bw_width = bw->width;
+ 		int bw_height = bw->height;
++		uint8_t ox, oy;
+ 
+ 		/* subtract existing scrollbar width */
+ 		bw_width -= bw->scroll_y ? SCROLLBAR_WIDTH : 0;
+@@ -134,6 +172,20 @@ void browser_window_handle_scrollbars(struct browser_window *bw)
+ 
+ 		scroll_y = (c_height > bw_height) ? true : false;
+ 		scroll_x = (c_width > bw_width) ? true : false;
++
++		/* as the document's viewport overflow says (VitaSurf):
++		 * hidden and clip have none, scroll always has one */
++		browser_window_viewport_overflow(h, &ox, &oy);
++		if (ox == CSS_OVERFLOW_HIDDEN || ox == CSS_OVERFLOW_CLIP) {
++			scroll_x = false;
++		} else if (ox == CSS_OVERFLOW_SCROLL) {
++			scroll_x = true;
++		}
++		if (oy == CSS_OVERFLOW_HIDDEN || oy == CSS_OVERFLOW_CLIP) {
++			scroll_y = false;
++		} else if (oy == CSS_OVERFLOW_SCROLL) {
++			scroll_y = true;
++		}
+ 	} else {
+ 		/* No scrollbars */
+ 		scroll_x = false;

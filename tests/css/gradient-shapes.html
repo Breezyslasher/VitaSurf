@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!-- Gradients keep to a box's shape (VitaSurf).
+     1. A gradient background follows border-radius as a colour does:
+        speedtest.net's GO button is a dark disc on a gradient disc 2px
+        larger, and the gradient was painted as a square behind it.
+        Expected: a dark circle with a thin cyan-to-blue ring, no
+        coloured corners.
+     2. The "gradient border": a gradient background masked with a
+        content-box layer excluded from a border-box one leaves only the
+        padding ring. Speedtest's Download button is outlined this way
+        and was filled in. Expected: a pill with a 2px gradient outline
+        and dark inside, as in Chrome.
+     3. Square corners and a ring: a 4px gradient frame. -->
+<html><head><title>gradient shapes</title><style>
+body { background: #000; color: #fff; font: 16px sans-serif }
+.go { width: 180px; height: 180px; border-radius: 50%;
+      background-image: linear-gradient(to bottom, #2de5d1, #1fa4e9);
+      display: flex; align-items: center; justify-content: center }
+.go > div { width: 176px; height: 176px; border-radius: 50%;
+            background: #000; display: flex; align-items: center;
+            justify-content: center; font-size: 40px }
+.pill { position: relative; display: inline-flex; height: 44px;
+        padding: 0 20px; align-items: center; border-radius: 9999px;
+        margin-top: 20px }
+.ring { position: absolute; inset: 0; border-radius: inherit;
+        padding: 2px;
+        background-image: linear-gradient(270deg, #1cbfff 0%, #6afff3 48%, #bf71ff 100%);
+        -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor;
+        mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+        mask-composite: exclude }
+.pill > span { position: relative }
+.frame { position: relative; width: 200px; height: 60px; margin-top: 20px }
+.frame .ring { border-radius: 0; padding: 4px }
+</style></head><body>
+<div class="go"><div>GO</div></div>
+<div class="pill"><div class="ring"></div><span>Download</span></div>
+<div class="frame"><div class="ring"></div></div>
+</body></html>

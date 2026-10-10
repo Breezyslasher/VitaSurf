@@ -1,0 +1,166 @@
+diff --git a/src/parse/nesting.c b/src/parse/nesting.c
+index 2ae2978..4035725 100644
+--- a/src/parse/nesting.c
++++ b/src/parse/nesting.c
+@@ -189,6 +189,55 @@ static const unsigned char nest_special[256] = {
+ 	['"'] = 1, ['\''] = 1, ['/'] = 1,
+ };
+ 
++/**
++ * Is the text before a '{' a custom property's name and the start of its
++ * value (VitaSurf)? Such a value may hold blocks, "--x: a{b;c}", and the
++ * brace is part of it, not a nested rule. Home Assistant's dark theme
++ * writes one whose value runs on into "@layer wa-utilities{...}"; taken
++ * for a rule, it took the whole style attribute apart and with it every
++ * theme colour after it.
++ */
++static bool nest_custom_decl(const char *pre, size_t pren)
++{
++	size_t i;
++
++	nest_skip_leading(&pre, &pren);
++	if (pren < 3 || pre[0] != '-' || pre[1] != '-')
++		return false;
++	for (i = 2; i < pren; i++) {
++		if (pre[i] == ':')
++			return true;
++		if (pre[i] == ' ' || pre[i] == '\t' || pre[i] == '\n' ||
++				pre[i] == '\r' || pre[i] == ';')
++			break;
++	}
++	while (i < pren && (pre[i] == ' ' || pre[i] == '\t' ||
++			pre[i] == '\n' || pre[i] == '\r'))
++		i++;
++	return i < pren && pre[i] == ':';
++}
++
++/** Past the brace that closes the one at \a i, strings and comments
++ *  stepped over; or the end. */
++static size_t nest_skip_block(const char *s, size_t n, size_t i)
++{
++	size_t depth = 0;
++
++	while (i < n) {
++		if (s[i] == '{') {
++			depth++;
++		} else if (s[i] == '}') {
++			if (--depth == 0)
++				return i + 1;
++		} else {
++			i = nest_step(s, n, i);
++			continue;
++		}
++		i++;
++	}
++	return n;
++}
++
+ /* exported interface documented in parse/nesting.h */
+ bool css__source_has_nesting(const char *s, size_t n)
+ {
+@@ -218,6 +267,12 @@ bool css__source_has_nesting(const char *s, size_t n)
+ 			nest_skip_leading(&pre, &pren);
+ 			is_at = (pren > 0 && pre[0] == '@');
+ 
++			/* a custom property's value holding a block */
++			if (nest_custom_decl(pre, pren)) {
++				i = nest_skip_block(s, n, i);
++				continue;
++			}
++
+ 			/* anything at all inside a style rule is nesting */
+ 			if (depth > 0 && in_at[depth - 1] == false) {
+ 				return true;
+@@ -467,6 +522,12 @@ static void flatten_block(nscan *sc, const char *par, size_t parn,
+ 			size_t pren = sc->i - start;
+ 
+ 			trim(&pre, &pren);
++			/* a custom property's value holding a block: part of
++			 * the declaration, which goes on to its ';' */
++			if (nest_custom_decl(pre, pren)) {
++				sc->i = nest_skip_block(sc->s, sc->n, sc->i);
++				continue;
++			}
+ 			sc->i++;
+ 
+ 			if (depth >= NEST_MAX_DEPTH) {
+diff --git a/src/parse/parse.c b/src/parse/parse.c
+index f661236..eb1f824 100644
+--- a/src/parse/parse.c
++++ b/src/parse/parse.c
+@@ -1858,7 +1858,7 @@ css_error parseValue0(css_parser *parser)
+ 
+ css_error parseValue(css_parser *parser)
+ {
+-	enum { Initial = 0, WS = 1 };
++	enum { Initial = 0, WS = 1, InBlock = 2 };
+ 	parser_state *state = parserutils_stack_get_current(parser->states);
+ 	const css_token *token;
+ 	css_error error;
+@@ -1868,6 +1868,49 @@ css_error parseValue(css_parser *parser)
+ 	 *        -> ATKEYWORD ws
+ 	 */
+ 
++	/*
++	 * A block in a value is part of the value (VitaSurf): its tokens
++	 * stay with the declaration, up to the brace that closes it, and
++	 * a ';' inside it does not end the declaration. It was parsed as a
++	 * block of its own, which threw away the tokens before it and,
++	 * in a style attribute, every declaration after it: Home
++	 * Assistant's dark theme writes a variable whose value runs on
++	 * into "@layer wa-utilities{...}" and then three hundred more, the
++	 * background colours among them. The depth lives in the substate,
++	 * InBlock and up, as the input may run out part way.
++	 */
++	if (state->substate >= InBlock) {
++		while (1) {
++			error = getToken(parser, &token);
++			if (error != CSS_OK)
++				return error;
++
++			if (token->type == CSS_TOKEN_EOF) {
++				error = pushBack(parser, token);
++				if (error != CSS_OK)
++					return error;
++				return done(parser);
++			}
++			if (token->type == CSS_TOKEN_CHAR &&
++					lwc_string_length(token->idata) == 1) {
++				char c = lwc_string_data(token->idata)[0];
++
++				if (c == '{' && state->substate < 0xffff) {
++					state->substate++;
++				} else if (c == '}') {
++					if (--state->substate < InBlock) {
++						state->substate = WS;
++						break;
++					}
++				}
++			}
++		}
++		error = eatWS(parser);
++		if (error != CSS_OK)
++			return error;
++		return done(parser);
++	}
++
+ 	switch (state->substate) {
+ 	case Initial:
+ 		error = getToken(parser, &token);
+@@ -1879,14 +1922,8 @@ css_error parseValue(css_parser *parser)
+ 		} else if (token->type == CSS_TOKEN_CHAR &&
+ 				lwc_string_length(token->idata) == 1 &&
+ 				lwc_string_data(token->idata)[0] == '{') {
+-			/* Grammar ambiguity. Assume block. */
+-			parser_state to = { sBlock, Initial };
+-
+-			error = pushBack(parser, token);
+-			if (error != CSS_OK)
+-				return error;
+-
+-			return transitionNoRet(parser, to);
++			state->substate = InBlock;
++			return parseValue(parser);
+ 		} else {
+ 			parser_state to = { sAny, Initial };
+ 

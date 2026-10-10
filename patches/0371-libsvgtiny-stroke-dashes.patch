@@ -1,0 +1,366 @@
+diff --git a/src/svgtiny.c b/src/svgtiny.c
+index 9434f66..de5a7b4 100644
+--- a/src/svgtiny.c
++++ b/src/svgtiny.c
+@@ -230,6 +230,17 @@ svgtiny_parse_paint_attributes(dom_element *node,
+ 			SVGTIOP_LENGTH,
+ 			&state->viewport_width,
+ 			&state->stroke_width
++		}, {
++			/* dashes (VitaSurf) */
++			state->interned_stroke_dasharray,
++			SVGTIOP_DASHARRAY,
++			&state->viewport_width,
++			state
++		}, {
++			state->interned_stroke_dashoffset,
++			SVGTIOP_LENGTH,
++			&state->viewport_width,
++			&state->dash_offset
+ 		},{
+ 			NULL, SVGTIOP_NONE, NULL, NULL
+ 		},
+@@ -294,11 +305,212 @@ svgtiny_parse_transform_attributes(dom_element *node,
+ }
+ 
+ 
++/** Room for want more floats in a dashed path being built (VitaSurf). */
++static bool svgtiny_dash_room(float **out, unsigned int *len,
++		unsigned int *cap, unsigned int want)
++{
++	float *p;
++	unsigned int c;
++
++	if (*len + want <= *cap)
++		return true;
++	c = *cap ? *cap * 2 : 64;
++	while (c < *len + want)
++		c *= 2;
++	p = realloc(*out, c * sizeof(float));
++	if (p == NULL)
++		return false;
++	*out = p;
++	*cap = c;
++	return true;
++}
++
++/**
++ * The dashes of a path (VitaSurf): what of it the stroke's dash pattern
++ * draws, as open subpaths of lines, curves flattened. The pattern starts
++ * again at each subpath, dash_offset into it. Returns NULL with *len 0
++ * when nothing of it is drawn, or when memory runs out (*len 1).
++ */
++static float *svgtiny_dash_path(const float *p, unsigned int n,
++		const struct svgtiny_parse_state *state, unsigned int *len)
++{
++	float *out = NULL;
++	unsigned int cap = 0, i = 0;
++	float total = 0, phase0;
++	float cx = 0, cy = 0, sx = 0, sy = 0;
++	int di = 0;		/* the dash being walked */
++	float left = 0;		/* of it */
++	bool pen = false;	/* the last point put down is where we are */
++	int k;
++
++	*len = 0;
++	for (k = 0; k < state->dash_n; k++)
++		total += state->dash[k];
++	phase0 = fmodf(state->dash_offset, total);
++	if (phase0 < 0)
++		phase0 += total;
++
++#define DASH_RESTART() do { \
++		float ph = phase0; \
++		di = 0; \
++		while (ph >= state->dash[di]) { \
++			ph -= state->dash[di]; \
++			di = (di + 1) % state->dash_n; \
++		} \
++		left = state->dash[di] - ph; \
++		pen = false; \
++	} while (0)
++
++	DASH_RESTART();
++
++	while (i < n) {
++		float pts[2 * 17];
++		int np = 0, j;
++		int cmd = (int) p[i];
++
++		switch (cmd) {
++		case svgtiny_PATH_MOVE:
++			cx = sx = p[i + 1];
++			cy = sy = p[i + 2];
++			i += 3;
++			DASH_RESTART();
++			continue;
++		case svgtiny_PATH_CLOSE:
++			pts[0] = sx;
++			pts[1] = sy;
++			np = 1;
++			i += 1;
++			break;
++		case svgtiny_PATH_LINE:
++			pts[0] = p[i + 1];
++			pts[1] = p[i + 2];
++			np = 1;
++			i += 3;
++			break;
++		case svgtiny_PATH_BEZIER:
++			for (j = 1; j <= 16; j++) {
++				float t = j / 16.0f, u = 1 - t;
++
++				pts[2 * (j - 1)] = u * u * u * cx +
++					3 * u * u * t * p[i + 1] +
++					3 * u * t * t * p[i + 3] +
++					t * t * t * p[i + 5];
++				pts[2 * (j - 1) + 1] = u * u * u * cy +
++					3 * u * u * t * p[i + 2] +
++					3 * u * t * t * p[i + 4] +
++					t * t * t * p[i + 6];
++			}
++			np = 16;
++			i += 7;
++			break;
++		default:
++			free(out);
++			*len = 0;
++			return NULL;
++		}
++
++		for (j = 0; j < np; j++) {
++			float x1 = pts[2 * j], y1 = pts[2 * j + 1];
++			float dx = x1 - cx, dy = y1 - cy;
++			float seg = sqrtf(dx * dx + dy * dy), done = 0;
++
++			while (seg - done > 0) {
++				float step = left < seg - done ? left :
++						seg - done;
++				float t0 = done / seg, t1 = (done + step) / seg;
++				bool on = (di % 2) == 0;
++
++				if (on) {
++					if (!svgtiny_dash_room(&out, len, &cap,
++							6)) {
++						free(out);
++						*len = 1;
++						return NULL;
++					}
++					if (!pen) {
++						out[(*len)++] =
++							svgtiny_PATH_MOVE;
++						out[(*len)++] = cx + dx * t0;
++						out[(*len)++] = cy + dy * t0;
++					}
++					out[(*len)++] = svgtiny_PATH_LINE;
++					out[(*len)++] = cx + dx * t1;
++					out[(*len)++] = cy + dy * t1;
++					pen = true;
++				} else {
++					pen = false;
++				}
++				done += step;
++				left -= step;
++				if (left <= 0) {
++					di = (di + 1) % state->dash_n;
++					left = state->dash[di];
++					if ((di % 2) == 0)
++						pen = false;
++				}
++			}
++			cx = x1;
++			cy = y1;
++		}
++		if (cmd == svgtiny_PATH_CLOSE)
++			pen = false;
++	}
++#undef DASH_RESTART
++
++	return out;
++}
++
++static svgtiny_code svgtiny_add_path_shape(float *p, unsigned int n,
++		struct svgtiny_parse_state *state);
++
+ /**
+  * Add a path to the svgtiny_diagram.
+  */
+ static svgtiny_code
+ svgtiny_add_path(float *p, unsigned int n, struct svgtiny_parse_state *state)
++{
++	svgtiny_code res = svgtiny_OK;
++
++	/* a dashed stroke (VitaSurf): the fill is the whole path, and the
++	 * stroke is drawn along its dashes */
++	if (state->dash_n > 0 && state->stroke != svgtiny_TRANSPARENT &&
++			state->stroke != svgtiny_LINEAR_GRADIENT &&
++			state->fill != svgtiny_LINEAR_GRADIENT) {
++		svgtiny_colour fill = state->fill, stroke = state->stroke;
++		unsigned int dn = 0;
++		float *d = svgtiny_dash_path(p, n, state, &dn);
++
++		if (d == NULL && dn == 1) {
++			free(p);
++			return svgtiny_OUT_OF_MEMORY;
++		}
++		if (fill != svgtiny_TRANSPARENT) {
++			state->stroke = svgtiny_TRANSPARENT;
++			res = svgtiny_add_path_shape(p, n, state);
++			state->stroke = stroke;
++			p = NULL;
++		} else {
++			free(p);
++		}
++		if (res != svgtiny_OK || d == NULL) {
++			free(d);
++			return res;
++		}
++		state->fill = svgtiny_TRANSPARENT;
++		res = svgtiny_add_path_shape(d, dn, state);
++		state->fill = fill;
++		return res;
++	}
++
++	return svgtiny_add_path_shape(p, n, state);
++}
++
++/**
++ * Add a path to the svgtiny_diagram as it is.
++ */
++static svgtiny_code
++svgtiny_add_path_shape(float *p, unsigned int n,
++		struct svgtiny_parse_state *state)
+ {
+ 	struct svgtiny_shape *shape;
+ 	svgtiny_code res = svgtiny_OK;
+@@ -1294,6 +1506,8 @@ initialise_parse_state(struct svgtiny_parse_state *state,
+ 	state->fill = 0x000000;
+ 	state->stroke = svgtiny_TRANSPARENT;
+ 	state->stroke_width = 1;
++	state->dash_n = 0;
++	state->dash_offset = 0;
+ 	return svgtiny_OK;
+ }
+ 
+diff --git a/src/svgtiny_internal.h b/src/svgtiny_internal.h
+index a644292..e624436 100644
+--- a/src/svgtiny_internal.h
++++ b/src/svgtiny_internal.h
+@@ -79,6 +79,13 @@ struct svgtiny_parse_state {
+ 	svgtiny_colour fill;
+ 	svgtiny_colour stroke;
+ 	float stroke_width;	/* in user units, fractions kept (VitaSurf) */
++	/* the stroke's dashes, in user units, as long again as given
++	 * when there is an odd number of them; none when dash_n is 0
++	 * (VitaSurf) */
++#define SVGTINY_DASH_MAX 16
++	float dash[SVGTINY_DASH_MAX];
++	int dash_n;
++	float dash_offset;
+ 
+ 	/* gradients */
+ 	struct svgtiny_parse_state_gradient fill_grad;
+@@ -105,6 +112,7 @@ struct svgtiny_parse_internal_operation {
+ 		SVGTIOP_LENGTH,
+ 		SVGTIOP_INTLENGTH,
+ 		SVGTIOP_OFFSET,
++		SVGTIOP_DASHARRAY,
+ 	} operation;
+ 	void *param;
+ 	void *value;
+diff --git a/src/svgtiny_parse.c b/src/svgtiny_parse.c
+index 56944cb..87e7836 100644
+--- a/src/svgtiny_parse.c
++++ b/src/svgtiny_parse.c
+@@ -1012,6 +1012,65 @@ svgtiny_parse_offset(const char *text, size_t textlen, float *offset)
+ }
+ 
+ 
++/**
++ * Parse a stroke-dasharray (VitaSurf): none, or lengths separated by
++ * commas, white space or both. An odd number of them is repeated, as
++ * the specification has it; a negative one makes the value an error,
++ * and lengths that are all zero draw the stroke solid.
++ */
++static svgtiny_code
++svgtiny_parse_dasharray(const char *text, size_t textlen, int viewport_size,
++			struct svgtiny_parse_state *state)
++{
++	float dash[SVGTINY_DASH_MAX];
++	float sum = 0;
++	int n = 0, i;
++	size_t at = 0;
++
++	while (at < textlen && strchr(" \t\r\n", text[at]) != NULL)
++		at++;
++	if (textlen - at >= 4 && strncmp(text + at, "none", 4) == 0) {
++		state->dash_n = 0;
++		return svgtiny_OK;
++	}
++
++	while (at < textlen) {
++		size_t end = at;
++		float len;
++		svgtiny_code res;
++
++		while (end < textlen && strchr(" \t\r\n,", text[end]) == NULL)
++			end++;
++		if (end > at) {
++			if (n == SVGTINY_DASH_MAX / 2)
++				return svgtiny_SVG_ERROR;
++			res = svgtiny_parse_length(text + at, end - at,
++					viewport_size, &len);
++			if (res != svgtiny_OK || len < 0)
++				return svgtiny_SVG_ERROR;
++			dash[n++] = len;
++			sum += len;
++		}
++		at = end;
++		while (at < textlen && strchr(" \t\r\n,", text[at]) != NULL)
++			at++;
++	}
++
++	if (n == 0 || sum <= 0) {
++		state->dash_n = 0;
++		return svgtiny_OK;
++	}
++	if (n % 2 == 1) {
++		for (i = 0; i < n; i++)
++			dash[n + i] = dash[i];
++		n *= 2;
++	}
++	memcpy(state->dash, dash, n * sizeof(dash[0]));
++	state->dash_n = n;
++	return svgtiny_OK;
++}
++
++
+ /**
+  * dispatch parse operation
+  */
+@@ -1063,6 +1122,12 @@ dispatch_op(const char *value,
+ 	case SVGTIOP_OFFSET:
+ 		res = svgtiny_parse_offset(value, value_len, styleop->value);
+ 		break;
++
++	case SVGTIOP_DASHARRAY:
++		res = svgtiny_parse_dasharray(value, value_len,
++				(int) *((float *)styleop->param),
++				styleop->value);
++		break;
+ 	}
+ 	return res;
+ }
+diff --git a/src/svgtiny_strings.h b/src/svgtiny_strings.h
+index 8e87afc..84369cd 100644
+--- a/src/svgtiny_strings.h
++++ b/src/svgtiny_strings.h
+@@ -54,6 +54,8 @@ SVGTINY_STRING_ACTION(use)
+ SVGTINY_STRING_ACTION(class)
+ SVGTINY_STRING_ACTION(id)
+ SVGTINY_STRING_ACTION2(stroke_width,stroke-width)
++SVGTINY_STRING_ACTION2(stroke_dasharray,stroke-dasharray)
++SVGTINY_STRING_ACTION2(stroke_dashoffset,stroke-dashoffset)
+ SVGTINY_STRING_ACTION2(stop_color,stop-color)
+ SVGTINY_STRING_ACTION2(zero_percent,0%)
+ SVGTINY_STRING_ACTION2(hundred_percent,100%)

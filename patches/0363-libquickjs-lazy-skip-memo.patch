@@ -1,0 +1,344 @@
+diff --git a/quickjs.c b/quickjs.c
+index 41c0476..501fd3a 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -866,17 +866,52 @@ typedef struct JSLazyFunc {
+  * copied once, the first time a function needs it, and each function
+  * points into that copy.
+  */
++/*
++ * What skipping one function's body found, kept from the script's first
++ * parse (VitaSurf). Compiling a lazy function skips each function inside
++ * it to its end with the tokenizer, collecting the names it uses, and a
++ * function nested n deep had its text tokenized again by each of the n
++ * compiles around it: compiling every function of a bundle that way cost
++ * 1.3 to 1.8 times compiling it whole. The first parse reads every body
++ * anyway, so where each one ends and the names it uses from outside are
++ * kept here, for a function inside a lazy one, and a skip looks them up.
++ */
++typedef struct JSLazyMemo {
++    uint32_t start;             /* the function's source, from the script's start */
++    uint32_t ptr, eol, mark;    /* its body's closing '}', and the tokenizer there */
++    int line_num, col_num, last_line_num, last_col_num;
++    uint32_t names;             /* in the blob's memo_names, what it uses
++                                   from outside, as a skip finds */
++    int16_t got_lf;
++    int16_t pad;
++    int name_count;             /* -1: not left for later, so parsed */
++} JSLazyMemo;
++
+ typedef struct JSSourceBlob {
+     int ref_count;
+     int len;
++    JSLazyMemo *memo;           /* sorted by start once memo_sorted */
++    int memo_count, memo_size;
++    JSAtom *memo_names;         /* every entry's names, one after another */
++    uint8_t *memo_priv;         /* whether each is a private name */
++    int memo_name_count, memo_name_size;
++    bool memo_sorted;
+     char data[];
+ } JSSourceBlob;
+ 
+ static void js_source_release(JSRuntime *rt, JSSourceBlob *blob, char *source)
+ {
+     if (blob) {
+-        if (--blob->ref_count == 0)
++        if (--blob->ref_count == 0) {
++            int i;
++
++            for (i = 0; i < blob->memo_name_count; i++)
++                JS_FreeAtomRT(rt, blob->memo_names[i]);
++            js_free_rt(rt, blob->memo_names);
++            js_free_rt(rt, blob->memo_priv);
++            js_free_rt(rt, blob->memo);
+             js_free_rt(rt, blob);
++        }
+     } else {
+         js_free_rt(rt, source);
+     }
+@@ -21757,6 +21792,12 @@ typedef struct JSFunctionDef {
+     const uint8_t *lazy_mark;
+     const uint8_t *lazy_eol;
+     int lazy_params_off; /* the same, from the start of its source */
++    /* its body's closing '}' as the first parse found it, for the
++       script's skip memo (see JSLazyMemo) */
++    const uint8_t *lazy_end_ptr, *lazy_end_eol, *lazy_end_mark;
++    int lazy_end_line, lazy_end_col, lazy_end_last_line, lazy_end_last_col;
++    bool lazy_end_got_lf;
++    bool lazy_end_valid;
+     int lazy_mark_off;
+     int lazy_eol_off;
+     int lazy_params_line;
+@@ -21925,6 +21966,12 @@ static int js_parse_save_source(JSParseState *s, JSFunctionDef *fd,
+             return -1;
+         blob->ref_count = 1; /* the parser's own hold */
+         blob->len = n;
++        blob->memo = NULL;
++        blob->memo_count = blob->memo_size = 0;
++        blob->memo_names = NULL;
++        blob->memo_priv = NULL;
++        blob->memo_name_count = blob->memo_name_size = 0;
++        blob->memo_sorted = false;
+         memcpy(blob->data, s->buf_start, n);
+         blob->data[n] = '\0';
+         s->source_blob = blob;
+@@ -37869,6 +37916,200 @@ static void js_lazy_set_take(JSFunctionDef *fd, JSLazySet *set)
+ 
+ /* leave fd's body for its first call: note the names it uses from
+    outside, then drop its code, its variables and the functions in it */
++/*
++ * fd, a lazy function's parse, is about to be thrown away: keep, in the
++ * script's skip memo, what each function in it will need when fd is
++ * compiled (VitaSurf). One left for later is skipped, with the names it
++ * uses, which move from the child, freed with fd. One that was not, too
++ * short or called where it is written, is parsed again, and the memo
++ * says so before a skip reads it to its end to find out; the functions
++ * inside it are skipped in turn, so they are kept as well. A short one
++ * is skipped no faster from the memo than by reading it, and has nothing
++ * long inside it, so nothing is kept for it.
++ */
++static int js_lazy_memo_harvest(JSParseState *s, JSFunctionDef *fd)
++{
++    JSContext *ctx = s->ctx;
++    JSSourceBlob *blob = s->source_blob;
++    struct list_head *el;
++
++    list_for_each(el, &fd->child_list) {
++        JSFunctionDef *c = list_entry(el, JSFunctionDef, link);
++        JSLazyMemo *m;
++
++        if (!c->lazy_end_valid || c->source_blob != blob || !c->source ||
++            c->source_len < JS_LAZY_MIN_SOURCE)
++            continue;
++        if (!c->is_lazy && js_lazy_memo_harvest(s, c))
++            return -1;
++        if (blob->memo_count >= blob->memo_size) {
++            int n = blob->memo_size ? blob->memo_size * 2 : 64;
++            JSLazyMemo *t = js_realloc(ctx, blob->memo, sizeof(*t) * n);
++            if (!t)
++                return -1;
++            blob->memo = t;
++            blob->memo_size = n;
++        }
++        m = &blob->memo[blob->memo_count++];
++        m->start = c->source - blob->data;
++        m->ptr = c->lazy_end_ptr - s->buf_start;
++        m->eol = c->lazy_end_eol - s->buf_start;
++        m->mark = c->lazy_end_mark - s->buf_start;
++        m->line_num = c->lazy_end_line;
++        m->col_num = c->lazy_end_col;
++        m->last_line_num = c->lazy_end_last_line;
++        m->last_col_num = c->lazy_end_last_col;
++        m->got_lf = c->lazy_end_got_lf;
++        m->pad = 0;
++        m->names = blob->memo_name_count;
++        m->name_count = -1;
++        if (c->is_lazy) {
++            int i, n = c->lazy_name_count;
++
++            if (blob->memo_name_count + n > blob->memo_name_size) {
++                int size = blob->memo_name_size ? blob->memo_name_size : 256;
++                JSAtom *names;
++                uint8_t *priv;
++
++                while (blob->memo_name_count + n > size)
++                    size *= 2;
++                names = js_realloc(ctx, blob->memo_names,
++                                   sizeof(JSAtom) * size);
++                if (!names) {
++                    blob->memo_count--;
++                    return -1;
++                }
++                blob->memo_names = names;
++                priv = js_realloc(ctx, blob->memo_priv, size);
++                if (!priv) {
++                    blob->memo_count--;
++                    return -1;
++                }
++                blob->memo_priv = priv;
++                blob->memo_name_size = size;
++            }
++            /* the child is freed with fd: its names move */
++            for (i = 0; i < n; i++) {
++                blob->memo_names[blob->memo_name_count + i] =
++                    c->lazy_names[i];
++                blob->memo_priv[blob->memo_name_count + i] =
++                    c->lazy_private[i];
++            }
++            blob->memo_name_count += n;
++            m->name_count = n;
++            js_free(ctx, c->lazy_names);
++            js_free(ctx, c->lazy_private);
++            c->lazy_names = NULL;
++            c->lazy_private = NULL;
++            c->lazy_name_count = c->lazy_name_size = 0;
++        }
++        blob->memo_sorted = false;
++    }
++    return 0;
++}
++
++static int js_lazy_memo_cmp(const void *a, const void *b)
++{
++    uint32_t x = ((const JSLazyMemo *)a)->start;
++    uint32_t y = ((const JSLazyMemo *)b)->start;
++    return x < y ? -1 : x > y;
++}
++
++/*
++ * Skip fd's body from the script's skip memo (VitaSurf); see
++ * js_lazy_skip_body, whose result this gives without reading the body:
++ * 1 with its closing '}' current and the names it uses given to fd, 0
++ * with nothing changed and *found telling whether the memo knew it.
++ */
++static int js_lazy_skip_memo(JSParseState *s, JSFunctionDef *fd,
++                             const uint8_t *src_start, bool *found)
++{
++    JSContext *ctx = s->ctx;
++    JSSourceBlob *blob = s->source_blob;
++    JSLazyMemo *m = NULL;
++    JSParsePos body_pos, end_pos;
++    JSLazySet set;
++    uint32_t key;
++    int lo, hi, i;
++    bool called;
++
++    *found = false;
++    if (!blob || !blob->memo_count ||
++        s->buf_start != (const uint8_t *)blob->data ||
++        src_start < s->buf_start)
++        return 0;
++    if (!blob->memo_sorted) {
++        qsort(blob->memo, blob->memo_count, sizeof(blob->memo[0]),
++              js_lazy_memo_cmp);
++        blob->memo_sorted = true;
++    }
++    key = src_start - s->buf_start;
++    lo = 0;
++    hi = blob->memo_count - 1;
++    while (lo <= hi) {
++        int mid = (lo + hi) >> 1;
++        if (blob->memo[mid].start == key) {
++            m = &blob->memo[mid];
++            break;
++        }
++        if (blob->memo[mid].start < key)
++            lo = mid + 1;
++        else
++            hi = mid - 1;
++    }
++    if (!m || m->ptr <= key || m->ptr >= (uint32_t)blob->len)
++        return 0;
++    *found = true;
++    /* short or called where it is written, as js_lazy_skip_body would
++       find at its end */
++    if (m->name_count < 0 || m->ptr + 1 - key < JS_LAZY_MIN_SOURCE)
++        return 0;
++    js_parse_get_pos(s, &body_pos);
++    end_pos.last_line_num = m->last_line_num;
++    end_pos.last_col_num = m->last_col_num;
++    end_pos.line_num = m->line_num;
++    end_pos.col_num = m->col_num;
++    end_pos.got_lf = m->got_lf;
++    end_pos.ptr = s->buf_start + m->ptr;
++    end_pos.eol = s->buf_start + m->eol;
++    end_pos.mark = s->buf_start + m->mark;
++    if (js_parse_seek_token(s, &end_pos))
++        goto give_up_error;
++    if (s->token.val != '}')
++        goto give_up;
++    /* called where it is written: compiled now */
++    if (next_token(s))
++        goto give_up_error;
++    called = js_lazy_called_here(s);
++    if (js_parse_seek_token(s, &end_pos))
++        return -1;
++    if (called)
++        goto give_up;
++    memset(&set, 0, sizeof(set));
++    if (m->name_count) {
++        set.names = js_malloc(ctx, sizeof(JSAtom) * m->name_count);
++        set.priv = js_malloc(ctx, m->name_count);
++        if (!set.names || !set.priv) {
++            js_free(ctx, set.names);
++            js_free(ctx, set.priv);
++            return -1;
++        }
++        for (i = 0; i < m->name_count; i++) {
++            set.names[i] = JS_DupAtom(ctx, blob->memo_names[m->names + i]);
++            set.priv[i] = blob->memo_priv[m->names + i];
++        }
++        set.count = set.size = m->name_count;
++    }
++    js_lazy_set_give(ctx, fd, &set);
++    return 1;
++ give_up_error:
++    JS_FreeValue(ctx, JS_GetException(ctx));
++ give_up:
++    if (js_parse_seek_token(s, &body_pos))
++        return -1;
++    return 0;
++}
++
+ static int js_lazy_collapse(JSParseState *s, JSFunctionDef *fd)
+ {
+     JSContext *ctx = s->ctx;
+@@ -37883,6 +38124,9 @@ static int js_lazy_collapse(JSParseState *s, JSFunctionDef *fd)
+     js_lazy_set_give(ctx, fd, &set);
+     if (r)
+         return -1;
++    /* what compiling it will need to skip the functions in it */
++    if (!s->reparse && s->source_blob && js_lazy_memo_harvest(s, fd))
++        return -1;
+ 
+     list_for_each_safe(el, el1, &fd->child_list) {
+         js_free_function_def(ctx, list_entry(el, JSFunctionDef, link));
+@@ -37985,6 +38229,13 @@ static int js_lazy_skip_body(JSParseState *s, JSFunctionDef *fd,
+     if (s->with_depth > 0 || !fd->lazy_params || js_lazy_has_eval(fd) ||
+         js_lazy_in_eval_reach(s, fd, src_start))
+         return 0;
++    {
++        bool found;
++        int r = js_lazy_skip_memo(s, fd, src_start, &found);
++
++        if (r || found)
++            return r;
++    }
+ 
+     memset(&set, 0, sizeof(set));
+     js_parse_get_pos(s, &body_pos);
+@@ -38630,6 +38881,21 @@ header_done:
+                 goto fail;
+         }
+     }
++    /* where the body ends, for the script's skip memo (VitaSurf) */
++    if (s->lazy && !s->reparse) {
++        JSParsePos end;
++
++        js_parse_get_pos(s, &end);
++        fd->lazy_end_ptr = end.ptr;
++        fd->lazy_end_eol = end.eol;
++        fd->lazy_end_mark = end.mark;
++        fd->lazy_end_line = end.line_num;
++        fd->lazy_end_col = end.col_num;
++        fd->lazy_end_last_line = end.last_line_num;
++        fd->lazy_end_last_col = end.last_col_num;
++        fd->lazy_end_got_lf = end.got_lf;
++        fd->lazy_end_valid = true;
++    }
+ 
+     /* save the function source code */
+     if (js_parse_save_source(s, fd, ptr, s->buf_ptr - ptr))
+@@ -41039,6 +41305,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+                     goto fail;
+                 blob->ref_count = 1; /* the reader's hold */
+                 blob->len = blen;
++                blob->memo = NULL;
++                blob->memo_count = blob->memo_size = 0;
++                blob->memo_names = NULL;
++                blob->memo_priv = NULL;
++                blob->memo_name_count = blob->memo_name_size = 0;
++                blob->memo_sorted = false;
+                 s->src_tab[s->src_tab_len++] = blob;
+                 if (s->ptr_last)
+                     s->ptr_last += blen;

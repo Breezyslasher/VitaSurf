@@ -1,0 +1,109 @@
+diff --git a/src/core/node.c b/src/core/node.c
+index 9a592fb..44fbdf2 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -2635,6 +2635,7 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	dom_document_event_internal *dei = NULL;
+ 	dom_event_target **targets;
+ 	uint32_t ntargets, ntargets_allocated, targetnr;
++	uint32_t type_bit;
+ 	void *pw;
+ 	bool to_window = false;
+ 
+@@ -2672,12 +2673,14 @@ dom_exception _dom_node_dispatch_event(dom_event_target *et,
+ 	ntargets = 0;
+ 
+ 	/* Add interested event listeners to array */
++	type_bit = _dom_event_type_bit(evt->type);
+ 	for (; target != NULL; target = target->parent) {
+ 		struct listener_entry *le = target->eti.listeners;
+ 		bool target_has_listener = false;
+ 
+-		if (le == NULL) {
+-			/* This event target isn't listening to anything */
++		if (le == NULL || (target->eti.type_mask & type_bit) == 0) {
++			/* This event target isn't listening to anything,
++			 * or to nothing of this type (VitaSurf) */
+ 			continue;
+ 		}
+ 
+diff --git a/src/events/event_target.c b/src/events/event_target.c
+index 70178f4..2e52951 100644
+--- a/src/events/event_target.c
++++ b/src/events/event_target.c
+@@ -44,6 +44,7 @@ dom_exception _dom_event_target_internal_initialise(
+ 		dom_event_target_internal *eti)
+ {
+ 	eti->listeners = NULL;
++	eti->type_mask = 0;
+ 
+ 	return DOM_NO_ERR;
+ }
+@@ -55,6 +56,27 @@ void _dom_event_target_internal_finalise(dom_event_target_internal *eti)
+ 		event_target_destroy_listeners(eti->listeners);
+ 		eti->listeners = NULL;
+ 	}
++	eti->type_mask = 0;
++}
++
++/*
++ * The bit an event type sets in a target's type_mask (VitaSurf). Every
++ * event dispatched to a node, the mutation events libdom sends itself on
++ * each change included, looked through the listeners of each ancestor
++ * that had any, comparing each one's type: on a Home Assistant
++ * dashboard, whose components listen for many things high in the tree,
++ * that was a hundred string comparisons an event and 1% of the load.
++ * An ancestor whose mask lacks the event's bit is passed over.
++ */
++uint32_t _dom_event_type_bit(dom_string *type)
++{
++	const unsigned char *d = (const unsigned char *) dom_string_data(type);
++	size_t len = dom_string_byte_length(type);
++
++	if (len == 0)
++		return 1;
++	return (uint32_t) 1 << ((len + d[0] * 7u + d[len - 1] * 13u +
++			d[len / 2] * 3u) & 31);
+ }
+ 
+ /*-------------------------------------------------------------------------*/
+@@ -92,6 +114,7 @@ dom_exception _dom_event_target_add_event_listener(
+ 	} else {
+ 		list_append(&eti->listeners->list, &le->list);
+ 	}
++	eti->type_mask |= _dom_event_type_bit(type);
+ 
+ 	return DOM_NO_ERR;
+ }
+@@ -128,6 +151,7 @@ dom_exception _dom_event_target_remove_event_listener(
+ 			if (matches) {
+ 				if (le->list.next == &le->list) {
+ 					eti->listeners = NULL;
++					eti->type_mask = 0;
+ 				} else {
+ 					eti->listeners =
+ 						(struct listener_entry *)
+diff --git a/src/events/event_target.h b/src/events/event_target.h
+index 4415a2a..5d42774 100644
+--- a/src/events/event_target.h
++++ b/src/events/event_target.h
+@@ -36,6 +36,9 @@ struct listener_entry {
+ struct dom_event_target_internal {
+ 	struct listener_entry *listeners;	
+ 			/**< The listeners of this EventTarget. */
++	uint32_t type_mask;
++			/**< _dom_event_type_bit of every listener's type,
++			 * and perhaps of some removed since (VitaSurf) */
+ };
+ 
+ typedef struct dom_event_target_internal dom_event_target_internal;
+@@ -52,6 +55,9 @@ typedef struct dom_event_target_entry {
+  * no constructor and destructor for it.
+  */
+ 
++/* The bit an event type sets in a target's type_mask (VitaSurf) */
++uint32_t _dom_event_type_bit(dom_string *type);
++
+ /* Initialise this EventTarget */
+ dom_exception _dom_event_target_internal_initialise(
+ 		dom_event_target_internal *eti);

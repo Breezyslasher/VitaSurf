@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!-- A fixed box inside a fixed box stays where it is put, pinned with
+     its parent (VitaSurf). The scroll was added to it twice, so a line
+     at top: 64px inside a fixed header slid down the screen at the
+     speed of the scroll; speedtest.net's gradient line under its header
+     did. The page scrolls itself by 300px. Expected: the magenta line
+     sits just under the dark header at the top of the screen, and the
+     lines below say what Chrome does:
+     XX header top: 0
+     XX line top: 64
+     XX lone fixed top: 100 -->
+<html><head><title>fixed in fixed</title><style>
+body { margin: 0; height: 3000px }
+header { position: fixed; top: 0; left: 0; right: 0; height: 64px;
+         background: #123; z-index: 5 }
+.line { position: fixed; top: 64px; left: 0; right: 0; height: 2px;
+        background: #f0f }
+.solo { position: fixed; top: 100px; left: 0; width: 50px; height: 3px;
+        background: #0f0 }
+pre { margin-top: 200px }
+</style></head><body>
+<header><div class="line"></div></header><div class="solo"></div>
+<pre id="out"></pre>
+<script>
+window.addEventListener('load', function () { setTimeout(function () {
+  window.scrollTo(0, 300);
+  var o = document.getElementById('out');
+  function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+    try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+  function top(s) { return Math.round(document.querySelector(s).getBoundingClientRect().top); }
+  T('header top', top('header'));
+  T('line top', top('.line'));
+  T('lone fixed top', top('.solo'));
+}, 300); });
+</script>
+</body></html>

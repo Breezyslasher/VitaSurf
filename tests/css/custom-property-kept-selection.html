@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<!-- A style selected for an element without a box is kept for the reads
+     that follow, until something it was selected from changes
+     (VitaSurf). Home Assistant's cards read one theme colour after
+     another from elements their script has just made, and each read
+     selected the whole chain of ancestors again. The cases, each read
+     in the same script as the change before it: an ancestor's class;
+     a new style element; a rule put in with insertRule; the element's
+     own style attribute; the element moved; a sibling's read; the
+     colour read through getComputedStyle; and the same after the
+     page's layout, under display: none. A rule put in with insertRule
+     reached the sheet in a microtask, so a read in the same script did
+     not see it; a read now writes back the rules first. Expected lines
+     are what Chrome prints. -->
+<html><head><title>custom property kept selection</title>
+<style>
+.a { --c: one; color: rgb(1, 2, 3); }
+.b { --c: two; color: rgb(4, 5, 6); }
+.a > .x { --d: under-a; }
+.hide { display: none; }
+</style>
+<style id="extra"></style>
+</head><body>
+<pre id="out"></pre>
+<script>
+var o = document.getElementById('out');
+function T(n, v) { o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function v(el, n) { return getComputedStyle(el).getPropertyValue(n).trim(); }
+var outer = document.createElement('div');
+outer.className = 'a';
+var mid = document.createElement('section');
+var el = document.createElement('span');
+el.className = 'x';
+var sib = document.createElement('span');
+mid.appendChild(el);
+mid.appendChild(sib);
+outer.appendChild(mid);
+document.body.appendChild(outer);
+T('first', v(el, '--c') + ' ' + v(el, '--d') + ' ' + v(el, '--c'));
+T('a sibling', v(sib, '--c') + ' ' + v(sib, '--d'));
+outer.className = 'b';
+T('the ancestor class changed', v(el, '--c') + ' ' + v(el, '--d'));
+document.getElementById('extra').textContent = '.b span { --c: three; }';
+T('a new style element', v(el, '--c') + ' ' + v(sib, '--c'));
+var sheet = document.getElementById('extra').sheet;
+sheet.insertRule('.b .x { --c: four; }', sheet.cssRules.length);
+T('insertRule', v(el, '--c') + ' ' + v(sib, '--c'));
+el.setAttribute('style', '--c: five');
+T('its own style', v(el, '--c') + ' ' + v(sib, '--c'));
+el.removeAttribute('style');
+var other = document.createElement('div');
+other.className = 'a';
+document.body.appendChild(other);
+other.appendChild(el);
+T('moved', v(el, '--c') + ' ' + v(el, '--d'));
+T('colour', getComputedStyle(el).color + ' ' +
+  getComputedStyle(sib).color);
+setTimeout(function () {
+  var h = document.createElement('div');
+  h.className = 'hide';
+  var k = document.createElement('i');
+  k.className = 'x';
+  h.appendChild(k);
+  other.appendChild(h);
+  T('laid out, hidden', v(k, '--c') + ' ' + v(k, '--d'));
+  other.className = 'b';
+  T('laid out, hidden, class changed', v(k, '--c') + ' ' + v(k, '--d'));
+}, 300);
+</script>
+</body></html>

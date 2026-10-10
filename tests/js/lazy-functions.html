@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<!-- Functions compiled on their first call (VitaSurf). A page's scripts
+     are parsed whole when they load, but a function's body gets bytecode
+     only when it is first called, compiled again from its source with
+     the variables around it it uses; a function inside one that is being
+     compiled is skipped to its end without being parsed. Every case
+     below must behave as if it had been compiled with the script: the
+     variables a body reaches, this, arguments, new.target and super in
+     arrows, private names, generators and async functions, a sloppy
+     direct eval or a with around a function, and the line numbers of
+     code after a skipped body with multi-line templates and strings in
+     it. The bodies are padded past the size a function must have to be
+     left for later. Expected lines are what Chrome prints. -->
+<html><head><title>lazy functions</title></head><body>
+<pre id="out"></pre>
+<script>
+var lines = [];
+function T(n, v) { lines.push('XX ' + n + ': ' + v); }
+function attempt(n, f) {
+  try { T(n, f()); } catch (e) { T(n, 'threw ' + e.name); }
+}
+
+function outer(a, b) {
+  var x = 10; let y = 20; const z = 30;
+  function inner(q) {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    return a + b + x + y + z + q + (typeof undeclaredName) + globalName;
+  }
+  const arrow = (k) => {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    return [this === undefined || this === window, arguments.length, k,
+            inner(1)].join(',');
+  };
+  y = 21;
+  return arrow;
+}
+var globalName = 'G';
+attempt('closure', function () { return outer(1, 2)(5); });
+
+function counter() {
+  var n = 0;
+  return {
+    up() {
+      // padding padding padding padding padding padding padding padding
+      // padding padding padding padding padding padding padding padding
+      return ++n;
+    },
+    get value() {
+      // padding padding padding padding padding padding padding padding
+      // padding padding padding padding padding padding padding padding
+      return n;
+    }
+  };
+}
+attempt('shared variable', function () {
+  var c = counter(), d = counter();
+  c.up(); c.up(); d.up();
+  return c.value + ' ' + d.value;
+});
+
+class Base {
+  who() { return 'base'; }
+  static kind() { return 'static base'; }
+}
+class Derived extends Base {
+  #secret = 42;
+  label = () => {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    return 'field arrow ' + this.#secret;
+  };
+  #m() { return 'private method'; }
+  get #acc() { return this.#secret + 1; }
+  set #acc(v) { this.#secret = v; }
+  constructor() {
+    super();
+    this.cb = () => {
+      // padding padding padding padding padding padding padding padding
+      // padding padding padding padding padding padding padding padding
+      return super.who() + ' ' + this.#m() + ' ' + this.#acc + ' ' +
+        (#secret in this) + ' ' + typeof new.target;
+    };
+  }
+  run() {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    this.#acc = 7;
+    return this.cb() + ' / ' + super.who() + ' / ' + this.label();
+  }
+  static kind() {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    return super.kind() + ' via derived';
+  }
+  static {
+    this.fromBlock = (function () {
+      // padding padding padding padding padding padding padding padding
+      // padding padding padding padding padding padding padding padding
+      return 'static block';
+    })();
+  }
+}
+attempt('class', function () { return new Derived().run(); });
+attempt('static super', function () { return Derived.kind() + ', ' + Derived.fromBlock; });
+
+function named() {
+  var inner = function rec(n) {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    return n <= 0 ? 'done' : rec(n - 1);
+  };
+  return inner(3) + ' ' + typeof rec;
+}
+attempt('named function expression', named);
+
+attempt('temporal dead zone', function () {
+  function early() {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    try { return later; } catch (e) { return e.name; }
+  }
+  var r = early();
+  let later = 1;
+  return r + ' ' + early();
+});
+
+const fixed = 1;
+attempt('assign to const', function () {
+  function assign() {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    fixed = 2;
+  }
+  assign();
+});
+
+function defaults(a, b = () => {
+  // padding padding padding padding padding padding padding padding
+  // padding padding padding padding padding padding padding padding
+  return a * 2;
+}, { c, d: [e] } = { c: 3, d: [4] }) {
+  // padding padding padding padding padding padding padding padding
+  return [b(), c, e, defaults.length].join(',');
+}
+attempt('parameters', function () { return defaults(5); });
+
+function* gen() {
+  const inner = function* () {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    yield* [1, 2];
+  };
+  yield* inner();
+  yield 3;
+}
+attempt('generator', function () { return [...gen()].join(); });
+
+function sloppyEval() {
+  eval('var made = 5');
+  function g() {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    return typeof made === 'number' ? made : 'none';
+  }
+  return g();
+}
+attempt('direct eval around it', sloppyEval);
+
+function laterEval(src) {
+  function h() {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    return typeof w;
+  }
+  var before = h();
+  eval(src);
+  return before + ' ' + h();
+}
+attempt('direct eval after it', function () { return laterEval('var w = 1'); });
+
+var bag = { inWith: 'from with', n: 2 };
+with (bag) {
+  var withFn = function () {
+    // padding padding padding padding padding padding padding padding
+    // padding padding padding padding padding padding padding padding
+    return inWith + n;
+  };
+}
+attempt('with around it', function () {
+  var first = withFn();
+  bag.inWith = 'changed';
+  return first + ' ' + withFn();
+});
+
+function lineReference() { return new Error('reference').stack; }
+function lineAfterSkip() {
+  function skipped() {
+    // padding padding padding padding padding padding padding padding
+    var t = `one
+two ${'x' + `nested
+  ${1}`} three`;
+    var s = 'continued \
+here' + "and \
+here";
+    /* a comment
+       over lines */ var r = /}/g, q = (t.length) / 2;
+    if (q) /x\/y/.test(t);
+    return t.length + s.length;
+  }
+  skipped();
+  return new Error('here').stack;
+}
+attempt('lines after a skipped body', function () {
+  var a = /lineReference \(.*:(\d+):\d+\)/.exec(lineReference());
+  var b = /lineAfterSkip \(.*:(\d+):\d+\)/.exec(lineAfterSkip());
+  return a && b ? b[1] - a[1] : 'no line';
+});
+
+function shown(a, b) {
+  // padding padding padding padding padding padding padding padding
+  // padding padding padding padding padding padding padding padding
+  return a + b;
+}
+attempt('toString and length', function () {
+  return shown.toString().slice(0, 18) + ' ' + shown.length + ' ' + shown.name;
+});
+
+async function later() {
+  // padding padding padding padding padding padding padding padding
+  // padding padding padding padding padding padding padding padding
+  await null;
+  return 'async';
+}
+async function* agen() {
+  // padding padding padding padding padding padding padding padding
+  // padding padding padding padding padding padding padding padding
+  yield await Promise.resolve('async generator');
+}
+Promise.all([later(), agen().next()]).then(function (r) {
+  T('async', r[0] + ', ' + r[1].value);
+  var o = document.getElementById('out');
+  lines.forEach(function (l) {
+    o.textContent += l + '\n';
+    try { console.log(l); } catch (e) {}
+  });
+});
+</script>
+</body></html>

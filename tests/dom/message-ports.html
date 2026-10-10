@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!-- MessageChannel as the HTML standard has it. A port's messages wait
+     until it is started, which setting onmessage does and
+     addEventListener does not; data is cloned; a closed port sends
+     nothing. A port handed to a frame in postMessage's transfer list
+     (either form) arrives in the event's ports as a port of the frame's
+     own realm, here a frame inside a closed shadow root, and stays
+     entangled with the sender's. Expected lines are what Chrome prints. -->
+<html><head><title>message ports</title></head><body><div id="c"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function L(s) { out.push(s); }
+var ch = new MessageChannel();
+ch.port1.postMessage('early');
+setTimeout(function () { ch.port2.onmessage = function (e) { L('onmessage set late got ' + e.data + ', ports ' + e.ports.length); }; }, 50);
+var ch2 = new MessageChannel(), got2 = [];
+ch2.port2.addEventListener('message', function (e) { got2.push(e.data); });
+ch2.port1.postMessage('a');
+setTimeout(function () {
+  L('addEventListener without start got [' + got2.join() + ']');
+  ch2.port2.start();
+  setTimeout(function () { L('after start got [' + got2.join() + ']'); }, 50);
+}, 50);
+var o3 = {x: 1}, ch3 = new MessageChannel();
+ch3.port2.onmessage = function (e) { L('cloned ' + (e.data !== o3) + ' x=' + e.data.x); };
+ch3.port1.postMessage(o3);
+var ch4 = new MessageChannel();
+ch4.port2.onmessage = function (e) { L('closed port sent ' + e.data); };
+ch4.port1.close(); ch4.port1.postMessage('x');
+
+var child = '<script>window.addEventListener("message", function (e) {' +
+  ' var p = e.ports[0]; if (!p) return;' +
+  ' setTimeout(function () {' +
+  '  p.onmessage = function (m) { p.postMessage("frame got " + m.data); };' +
+  '  p.postMessage(e.data + ", ports " + e.ports.length + ", a port of the frame " + (p instanceof MessagePort)); }, 100); });<\/script>';
+var h = document.createElement('div'), r = h.attachShadow({mode: 'closed'}), f = document.createElement('iframe');
+f.srcdoc = child; r.appendChild(f); document.getElementById('c').appendChild(h);
+f.addEventListener('load', function () {
+  var c = new MessageChannel();
+  c.port1.onmessage = function (e) { L('page port got ' + e.data); };
+  f.contentWindow.postMessage('hello', '*', [c.port2]);
+  c.port1.postMessage('first');
+  var d = new MessageChannel();
+  d.port1.onmessage = function (e) { L('options form: ' + e.data); };
+  f.contentWindow.postMessage('hello2', {targetOrigin: '*', transfer: [d.port2]});
+  L('sender port after transfer ' + (c.port2 instanceof MessagePort));
+});
+setTimeout(function () {
+  out.forEach(function (l) { console.log('XX ' + l); });
+  document.getElementById('out').textContent = out.join('\n');
+}, 1200);
+</script></body></html>

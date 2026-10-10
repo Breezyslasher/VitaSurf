@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<!-- New text, or new children, put on the page by building again only the
+     boxes of the nearest block around the change (VitaSurf), where before
+     the whole box tree was built again. The cases: a text node's text
+     changed in a flex item, as Bubble Card writes a reading; innerHTML of
+     a flex item; a longer text that wraps; text in a span in a paragraph;
+     a child appended, one removed, a fragment inserted before a child;
+     text under display: none; text in a list item, whose numbering the
+     rest of the list sees and which is rebuilt whole; text changed in an
+     element not in the document; text from blank to not, which :empty
+     sees. Each must measure, and draw, as a full rebuild would make it. -->
+<html><head><style>
+body { margin: 0; font: 12px sans-serif }
+.card { display: flex; gap: 4px; width: 300px; background: #eee }
+.card > div { background: #cde }
+.state:empty { height: 9px; background: #f00 }
+p { width: 120px; margin: 4px 0 }
+.box { background: #9cf; margin: 2px 0 }
+.hide { display: none }
+.add { height: 6px; background: #0a0 }
+ol { margin: 0 }
+</style></head><body>
+<div class="card"><div id="name">Kitchen</div><div id="state">21.5 °C</div></div>
+<div class="card"><div id="html">off</div><div>after</div></div>
+<div id="wrap" class="box">short</div>
+<p id="para">Some text with <span id="span">a word</span> in it.</p>
+<div id="list" class="box"><div id="l1" class="add"></div><div id="l2" class="add"></div></div>
+<div id="frag" class="box"><div id="f1" class="add"></div></div>
+<div class="hide"><div id="hidden">not drawn</div></div>
+<ol><li id="li1">one</li><li id="li2">two</li></ol>
+<div class="card"><div id="empty" class="state"></div><div>x</div></div>
+<script>
+function q(id) { return document.getElementById(id); }
+function r(id) { var b = q(id).getBoundingClientRect(); return [Math.round(b.left), Math.round(b.top), Math.round(b.width), Math.round(b.height)]; }
+var loose = document.createElement('div');
+loose.textContent = 'loose';
+var steps = [
+ function(){ q('state').firstChild.data = '22.75 °C, rising'; },
+ function(){ q('html').innerHTML = '<b>on</b> since <i>noon</i>'; },
+ function(){ q('wrap').firstChild.data = 'a much longer text that wraps onto more than one line of the block'; },
+ function(){ q('span').firstChild.data = 'several more words'; },
+ function(){ var d = document.createElement('div'); d.className = 'add'; d.id = 'l3'; q('list').appendChild(d); },
+ function(){ q('list').removeChild(q('l1')); },
+ function(){ var f = document.createDocumentFragment(), a = document.createElement('div'), b = document.createElement('div'); a.className = b.className = 'add'; a.id = 'f0'; b.textContent = 'text'; f.appendChild(a); f.appendChild(b); q('frag').insertBefore(f, q('f1')); },
+ function(){ q('hidden').firstChild.data = 'still not drawn'; },
+ function(){ q('li1').firstChild.data = 'one, longer'; },
+ function(){ loose.firstChild.data = 'loose, changed'; },
+ function(){ q('empty').textContent = 'now'; }
+];
+var k = 0;
+function next() {
+ if (k < steps.length) { steps[k++](); setTimeout(next, 120); return; }
+ setTimeout(function(){
+  var out = {};
+  ['name','state','html','wrap','para','span','list','l2','l3','frag','f0','f1','li1','li2','empty'].forEach(function(id){ out[id] = r(id); });
+  out.h = document.body.getBoundingClientRect().height;
+  console.log('XX ' + JSON.stringify(out));
+ }, 300);
+}
+window.addEventListener('load', function(){ setTimeout(next, 100); });
+</script>
+</body></html>

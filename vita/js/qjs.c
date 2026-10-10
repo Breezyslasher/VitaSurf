@@ -190,6 +190,9 @@ struct slot_map {
 	unsigned mask;		/**< both tables have mask + 1 buckets */
 };
 
+/* events being dispatched at once, nested, whose objects are kept */
+#define NATIVE_EVENTS 4
+
 struct jsthread {
 	/** the busy sampling's phase when script was entered (VitaSurf) */
 	const char *phase_was;
@@ -201,6 +204,8 @@ struct jsthread {
 	struct browser_window *win;
 	html_content *htmlc;
 	unsigned frames_logged;   /**< frame pages this page made, logged */
+	unsigned throws_logged;   /**< engine errors logged, caught or not */
+	unsigned warns_explained; /**< warnings logged with where they came from */
 	/*
 	 * Dedicated workers (VitaSurf). A worker is a realm of its own on
 	 * the page's runtime, run by the same scheduler: it shares the
@@ -236,6 +241,22 @@ struct jsthread {
 	uint64_t overrun_said_ms; /**< when that was last logged */
 	const char *current_script; /**< URL of the script js_exec is running */
 	struct js_listener *listeners; /**< event listeners, freed on close */
+	/* the object each event NetSurf is dispatching reaches its
+	 * listeners as, one per event as in a browser (VitaSurf) */
+	struct dom_event *native_evt[NATIVE_EVENTS];
+	JSValue native_obj[NATIVE_EVENTS];
+	unsigned native_next;
+	/*
+	 * The window's listeners again, on a list of their own (VitaSurf).
+	 * libdom calls window_hook twice for every event it dispatches,
+	 * the mutation events every setAttribute and insertBefore make
+	 * among them, and walking all the page's listeners there for the
+	 * few on the window made each DOM edit cost more the more
+	 * listeners the page had: Home Assistant's dashboard spent most
+	 * of its setAttribute time in that walk.
+	 */
+	struct js_listener *win_listeners;
+	unsigned win_mutation;	/**< of them, those for a DOM mutation event */
 	/*
 	 * The listeners of one node, found without walking all of them
 	 * (VitaSurf). Adding a listener has to know whether the same one
@@ -281,6 +302,16 @@ struct jsthread {
 	int next_xhr_id;
 	bool closed;
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
+	/** the outermost entry into script came from the scheduler, where no
+	 * NetSurf code holds box pointers, so a geometry read may lay the
+	 * page out there and then (VitaSurf) */
+	bool entry_safe;
+	bool flushing;            /**< a forced layout is running */
+	unsigned flush_ms;        /**< forced layout time in this entry */
+	unsigned flushes;         /**< forced layouts on this page */
+	unsigned flush_total_ms;  /**< and what they cost */
+	unsigned flush_waited;    /**< ones that found the page still loading */
+	unsigned flush_refused;   /**< geometry reads answered stale */
 	/*
 	 * What the changes since the last layout were (VitaSurf): if only
 	 * attributes, the elements are restyled in place rather than the
@@ -288,8 +319,10 @@ struct jsthread {
 	 * set by anything else, and by a journal that has filled.
 	 */
 	bool tree_dirty;
+	char tree_why[96];        /**< the first such change, for the log */
 	struct html_attr_change *attr_changes;
 	unsigned attr_n, attr_alloc;
+	bool attr_slots;          /**< children changed where slots take them */
 	unsigned attr_restyles;   /**< batches applied in place, for the log */
 	bool relayout_pending;    /**< relayout_callback is scheduled */
 	nsurl *nav_pending;       /**< where nav_callback will go, or NULL */
@@ -306,6 +339,9 @@ struct jsthread {
 	unsigned js_run_ms;       /**< time spent running them */
 	unsigned js_modules;      /**< of those, compiled as ES modules */
 	unsigned js_imports_missed; /**< imports that resolved to nothing */
+	/** the runtime's functions compiled on their first call, and the
+	 * ms that took, when this page began (QJS_LAZY) */
+	uint32_t lazy_count0, lazy_ms0;
 	unsigned js_import_fetches; /**< chunks the loader went and fetched */
 	unsigned retry_delay_ms;  /**< how long before the next retry round */
 	struct js_deferred *deferred; /**< module scripts waiting on imports */
@@ -345,12 +381,27 @@ struct jsthread {
 	struct id_entry **id_idx;  /**< getElementById answers, by id */
 	uint32_t id_idx_nb, id_idx_n; /**< buckets (a power of two), entries */
 	uint32_t id_idx_gen;      /**< vita_id_gen the index is exact for */
+	/*
+	 * Styles selected for elements without a box, kept while nothing
+	 * that selection reads has changed (VitaSurf); see
+	 * select_without_box.
+	 */
+	struct style_memo *style_memo;
+	uint16_t *style_memo_slots; /**< open addressing, 0 is empty */
+	uint32_t style_memo_n;
+	uint32_t style_memo_dom_gen, style_memo_css_gen;
+	uint32_t style_memo_sheets, style_memo_done;
+	const void *style_memo_ctx, *style_memo_layout;
+	uint32_t style_memo_hits, style_memo_selected, style_memo_ms;
 	bool id_idx_built;
 	bool deferred_scheduled;
 	JSValue import_map;       /**< parsed <script type="importmap">, or
 				   *   JS_UNINITIALIZED before it is looked
 				   *   up and JS_UNDEFINED if there is none */
 	int event_depth;          /**< DOM event dispatches in progress */
+	unsigned shadow_notes;    /**< shadow root lines logged for this
+				       page, which stop at SHADOW_NOTES */
+	unsigned message_notes;   /**< and postMessage lines */
 	int window_phase;         /**< eventPhase for window listeners run
 				   *   at target, 0 when libdom says */
 	bool stop_now_seen;       /**< stopImmediatePropagation was called */
@@ -369,6 +420,7 @@ struct js_dispatch {
 struct js_listener {
 	struct js_listener *next;
 	struct js_listener *node_next;	/**< next listener on the same node */
+	struct js_listener *win_next;	/**< next of the window's listeners */
 	struct jsthread *thread;
 	struct dom_node *node;
 	struct dom_event_listener *dom_listener;
@@ -407,6 +459,8 @@ static int next_timer_handle = 1;
  * this size therefore keep the layout they were parsed with.
  */
 #define RELAYOUT_MAX_ELEMENTS 6000
+/* elements a cost estimate must have been measured over (VitaSurf) */
+#define RELAYOUT_MIN_SAMPLE 200
 
 /*
  * And what it is expected to cost (VitaSurf).
@@ -854,6 +908,21 @@ static int qjs_interrupt(JSRuntime *rt, void *opaque)
 	return r;
 }
 
+/*
+ * Every few thousand tokens of a compile or a JSON.parse (VitaSurf).
+ * The interrupt handler only runs while bytecode does, so a bundle of a
+ * few megabytes, three or four seconds to compile on the Vita, held
+ * every transfer still for all of that time: handshakes stalled half
+ * way and the files the page would ask for next did not arrive. This
+ * keeps them moving as the interrupt does; nothing else is safe here.
+ */
+static void qjs_compile_tick(JSRuntime *rt, void *opaque)
+{
+	(void)rt;
+	(void)opaque;
+	fetch_pump();
+}
+
 static int qjs_interrupt_body(jsthread *thread)
 {
 	/*
@@ -1032,11 +1101,14 @@ static void log_source_excerpt(const char *stack, const char *name,
  * is known (name, src, len), the offending source line is logged too.
  */
 static void js_free_deferred(jsthread *thread);
+static void style_memo_free(jsthread *thread);
 /* Persistent storage, defined with the rest of the on-disk code below. */
 static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
 static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv);
+static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv);
 static bool is_budget_interrupt(JSContext *ctx, JSValueConst v);
 
 static void qjs_report_exception_src(JSContext *ctx, const char *name,
@@ -1573,9 +1645,270 @@ static void mark_dirty(JSContext *ctx)
 	vita_tree_gen++;
 	vita_id_gen++;
 	if (thread != NULL) {
+		/* what made the tree need building again, for the log */
+		if (!thread->tree_dirty && thread->tree_why[0] == '\0') {
+			snprintf(thread->tree_why, sizeof(thread->tree_why),
+				 "%s", c_where != NULL ? c_where : "?");
+		}
 		thread->dom_dirty = true;
 		thread->tree_dirty = true;
 	}
+}
+
+/* The name of a node for the log: its tag and first class. */
+static void tree_name(struct dom_node *n, char *out, size_t size)
+{
+	dom_string *s = NULL;
+	dom_node_type type = DOM_ELEMENT_NODE;
+	size_t used;
+
+	out[0] = '\0';
+	if (n == NULL) {
+		return;
+	}
+	dom_node_get_node_type(n, &type);
+	if (type != DOM_ELEMENT_NODE) {
+		snprintf(out, size, "%s", type == DOM_TEXT_NODE ? "#text" :
+			 type == DOM_COMMENT_NODE ? "#comment" :
+			 type == DOM_DOCUMENT_FRAGMENT_NODE ? "#fragment" :
+			 "#node");
+		return;
+	}
+	if (dom_node_get_node_name(n, &s) == DOM_NO_ERR && s != NULL) {
+		snprintf(out, size, "%s", dom_string_data(s));
+		dom_string_unref(s);
+	}
+	used = strlen(out);
+	s = NULL;
+	if (used + 2 < size &&
+	    dom_element_get_attribute(n, corestring_dom_class, &s) ==
+	    DOM_NO_ERR && s != NULL) {
+		const char *c = dom_string_data(s);
+		size_t k = 0;
+
+		while (c[k] == ' ') k++;
+		if (c[k] != '\0') {
+			size_t e = k;
+
+			while (c[e] != '\0' && c[e] != ' ') e++;
+			snprintf(out + used, size - used, ".%.*s",
+				 (int)(e - k), c + k);
+		}
+		dom_string_unref(s);
+	}
+}
+
+static void attr_journal_add(jsthread *thread, struct dom_node *node,
+			     dom_string *name, dom_string *old, bool slots);
+
+/* Whether a node is in the thread's document. */
+/* A shadow root's host, referenced, or NULL (VitaSurf). */
+static struct dom_node *shadow_host_of(struct dom_node *n)
+{
+	dom_node_type type = DOM_ELEMENT_NODE;
+	struct dom_element *host = NULL;
+
+	if (n == NULL || dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+	    type != DOM_DOCUMENT_FRAGMENT_NODE ||
+	    dom_document_fragment_get_host((dom_document_fragment *) n,
+					   &host) != DOM_NO_ERR) {
+		return NULL;
+	}
+	return (struct dom_node *) host;
+}
+
+/* An element's shadow root, open or closed, referenced, or NULL. */
+static struct dom_node *shadow_root_of(struct dom_node *n)
+{
+	dom_node_type type = DOM_TEXT_NODE;
+	dom_document_fragment *root = NULL;
+
+	if (n == NULL || dom_node_get_node_type(n, &type) != DOM_NO_ERR ||
+	    type != DOM_ELEMENT_NODE ||
+	    dom_element_get_shadow_root((struct dom_element *) n, &root) !=
+	    DOM_NO_ERR) {
+		return NULL;
+	}
+	return (struct dom_node *) root;
+}
+
+/*
+ * A node's parent, referenced, or for a shadow root its host (VitaSurf):
+ * a shadow tree is in the page when its host is.
+ */
+static struct dom_node *tree_up(struct dom_node *n)
+{
+	struct dom_node *up = NULL;
+
+	if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
+		up = NULL;
+	}
+	if (up == NULL) {
+		up = shadow_host_of(n);
+	}
+	return up;
+}
+
+static bool node_in_page(jsthread *thread, struct dom_node *node)
+{
+	struct dom_node *doc = (struct dom_node *) thread_document(thread);
+	struct dom_node *cur, *up = NULL;
+	unsigned depth = 0;
+
+	if (doc == NULL || node == NULL) {
+		return false;
+	}
+	cur = dom_node_ref(node);
+	while (cur != NULL && cur != doc && depth++ < 4096) {
+		up = tree_up(cur);
+		dom_node_unref(cur);
+		cur = up;
+	}
+	if (cur == NULL) {
+		return false;
+	}
+	dom_node_unref(cur);
+	return cur == doc;
+}
+
+/* Whether a subtree is or holds a <slot>; a very big one is taken to. */
+static bool subtree_has_slot(struct dom_node *root)
+{
+	struct dom_node *n = dom_node_ref(root), *next;
+	unsigned count = 0;
+
+	while (n != NULL) {
+		dom_node_type type = DOM_TEXT_NODE;
+
+		if (++count > 4000) {
+			dom_node_unref(n);
+			return true;
+		}
+		dom_node_get_node_type(n, &type);
+		if (type == DOM_ELEMENT_NODE) {
+			dom_string *name = NULL;
+			bool slot = false;
+
+			if (dom_node_get_node_name(n, &name) == DOM_NO_ERR &&
+			    name != NULL) {
+				slot = strcasecmp(dom_string_data(name),
+						  "SLOT") == 0;
+				dom_string_unref(name);
+			}
+			if (slot) {
+				dom_node_unref(n);
+				return true;
+			}
+		}
+		next = NULL;
+		if (type == DOM_ELEMENT_NODE ||
+		    type == DOM_DOCUMENT_FRAGMENT_NODE) {
+			dom_node_get_first_child(n, &next);
+		}
+		while (next == NULL && n != root) {
+			struct dom_node *up = NULL;
+
+			if (dom_node_get_next_sibling(n, &next) != DOM_NO_ERR) {
+				next = NULL;
+			}
+			if (next != NULL) {
+				break;
+			}
+			if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR ||
+			    up == NULL) {
+				break;
+			}
+			dom_node_unref(n);
+			n = up;
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	return false;
+}
+
+/* Whether an element is a shadow host: its children are then what its
+   slots take. */
+static bool node_is_host(JSContext *ctx, struct dom_node *node)
+{
+	struct dom_node *root = shadow_root_of(node);
+
+	(void)ctx;
+	if (root == NULL) {
+		return false;
+	}
+	dom_node_unref(root);
+	return true;
+}
+
+/*
+ * mark_dirty for the children of parent about to change (VitaSurf):
+ * child going in or out, or, with child NULL, all of them replaced. When
+ * that is all that changed, the boxes around parent, and around where
+ * child comes from, are built again on their own (html_restyle_attrs).
+ * new_slots says the new children hold a <slot>.
+ */
+static void mark_tree_dirty(JSContext *ctx, const char *what,
+			    struct dom_node *parent, struct dom_node *child,
+			    bool new_slots)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *from = NULL;
+
+	if (thread != NULL && !thread->tree_dirty && !thread->closed &&
+	    parent != NULL) {
+		bool in = node_in_page(thread, parent), from_in = false;
+		bool slots = new_slots;
+
+		if (child != NULL &&
+		    dom_node_get_parent_node(child, &from) == DOM_NO_ERR &&
+		    from != NULL) {
+			from_in = from != parent &&
+				  node_in_page(thread, from);
+		}
+		if (in || from_in) {
+			/* slots may take other children now */
+			slots = slots || subtree_has_slot(child != NULL ?
+							  child : parent) ||
+				(in && node_is_host(ctx, parent)) ||
+				(from_in && node_is_host(ctx, from));
+		}
+		vita_dom_gen++;
+		vita_tree_gen++;
+		vita_id_gen++;
+		thread->dom_dirty = true;
+		if (in) {
+			attr_journal_add(thread, parent, NULL, NULL, slots);
+		}
+		if (from_in) {
+			attr_journal_add(thread, from, NULL, NULL, slots);
+		}
+		if (from != NULL) {
+			dom_node_unref(from);
+		}
+		if (thread->tree_dirty) {
+			/* the journal filled */
+			mark_dirty(ctx);
+		}
+		return;
+	}
+	if (thread != NULL && !thread->tree_dirty &&
+	    thread->tree_why[0] == '\0') {
+		char a[40], b[40];
+
+		tree_name(child, a, sizeof(a));
+		tree_name(parent, b, sizeof(b));
+		if (child == NULL) {
+			snprintf(thread->tree_why, sizeof(thread->tree_why),
+				 "%s of <%s>", what, b);
+		} else {
+			snprintf(thread->tree_why, sizeof(thread->tree_why),
+				 "%s %s %s <%s>", what, a,
+				 strcmp(what, "removeChild") == 0 ?
+				 "from" : "into", b);
+		}
+	}
+	mark_dirty(ctx);
 }
 
 /* the most attribute changes kept for one layout; past it, a rebuild */
@@ -1589,34 +1922,41 @@ static void attr_journal_clear(jsthread *thread)
 		struct html_attr_change *c = &thread->attr_changes[i];
 
 		dom_node_unref(c->node);
-		dom_string_unref(c->name);
+		if (c->name != NULL) {
+			dom_string_unref(c->name);
+		}
 		if (c->old != NULL) {
 			dom_string_unref(c->old);
 		}
 	}
 	thread->attr_n = 0;
+	thread->attr_slots = false;
 }
 
 /* Note an attribute change for html_restyle_attrs (VitaSurf). The first
    change to an element's attribute since the last layout keeps the value
-   it had then, which is what a changed class list is worked out from. */
+   it had then, which is what a changed class list is worked out from.
+   A NULL name notes new text in the text node node. */
 static void attr_journal_add(jsthread *thread, struct dom_node *node,
-			     dom_string *name, dom_string *old)
+			     dom_string *name, dom_string *old, bool slots)
 {
 	struct html_attr_change *c;
 	unsigned i;
 
-	if (thread->tree_dirty || thread->closed || node == NULL ||
-	    name == NULL) {
+	if (thread->tree_dirty || thread->closed || node == NULL) {
 		return;
 	}
 	for (i = thread->attr_n; i-- > 0 && i + 64 >= thread->attr_n; ) {
 		c = &thread->attr_changes[i];
-		if (c->node == node && dom_string_isequal(c->name, name)) {
+		if (c->node == node && (name == NULL ? c->name == NULL :
+		    c->name != NULL && dom_string_isequal(c->name, name))) {
+			thread->attr_slots = thread->attr_slots || slots;
 			return;
 		}
 	}
 	if (thread->attr_n == ATTR_JOURNAL_MAX) {
+		snprintf(thread->tree_why, sizeof(thread->tree_why),
+			 "more than %u changes", (unsigned)ATTR_JOURNAL_MAX);
 		thread->tree_dirty = true;
 		return;
 	}
@@ -1634,8 +1974,9 @@ static void attr_journal_add(jsthread *thread, struct dom_node *node,
 	}
 	c = &thread->attr_changes[thread->attr_n++];
 	c->node = dom_node_ref(node);
-	c->name = dom_string_ref(name);
+	c->name = name != NULL ? dom_string_ref(name) : NULL;
 	c->old = old != NULL ? dom_string_ref(old) : NULL;
+	thread->attr_slots = thread->attr_slots || slots;
 }
 
 /* mark_dirty for an attribute write, which moves an id only when it is
@@ -1652,8 +1993,42 @@ static void mark_attr_dirty(JSContext *ctx, struct dom_node *node,
 	}
 	if (thread != NULL) {
 		thread->dom_dirty = true;
-		attr_journal_add(thread, node, key, old);
+		attr_journal_add(thread, node, key, old, false);
 	}
+}
+
+/* mark_dirty for new text in a text node (VitaSurf): the boxes around it
+   are built again on their own (html_restyle_attrs). Text that goes from
+   blank to not, or back, changes what :empty matches, which can reach
+   anywhere, and has the whole tree built again. */
+static void mark_text_dirty(JSContext *ctx, struct dom_node *node,
+			    bool blank_changed)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	if (blank_changed) {
+		mark_dirty(ctx);
+		return;
+	}
+	vita_dom_gen++;
+	if (thread != NULL) {
+		thread->dom_dirty = true;
+		attr_journal_add(thread, node, NULL, NULL, false);
+	}
+}
+
+/* Whether a string is empty or white space alone. */
+static bool text_blank(const char *s, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		if (s[i] != ' ' && s[i] != '\t' && s[i] != '\n' &&
+		    s[i] != '\r' && s[i] != '\f') {
+			return false;
+		}
+	}
+	return true;
 }
 
 static JSValue win_vita_module_state(JSContext *ctx, JSValueConst this_val,
@@ -2039,9 +2414,9 @@ static JSValue win_vita_connected(JSContext *ctx, JSValueConst this_val,
 			dom_node_unref(n);
 			return JS_TRUE;
 		}
-		if (dom_node_get_parent_node(n, &up) != DOM_NO_ERR) {
-			up = NULL;
-		}
+		/* through a shadow root to its host: a shadow tree is
+		   connected when its host is */
+		up = tree_up(n);
 		dom_node_unref(n);
 		n = up;
 	}
@@ -2266,8 +2641,21 @@ static void notify_mutation_ns(JSContext *ctx, const char *kind,
 			qjs_absorb_or_rethrow(ctx);
 		}
 		JS_FreeValue(ctx, r);
+		/*
+		 * The record's values are this function's to release, as on
+		 * the path that tells nobody (VitaSurf). They were kept, so
+		 * every change an observer was told of leaked its name, old
+		 * value and the arrays of added and removed nodes, and those
+		 * held the nodes' wrappers: closing a Home Assistant
+		 * dashboard left 65 MB of its script heap alive, and every
+		 * later page close spent a second and a half collecting
+		 * over it.
+		 */
 		JS_FreeValue(ctx, args[0]);
 		JS_FreeValue(ctx, args[1]);
+		JS_FreeValue(ctx, args[2]);
+		JS_FreeValue(ctx, args[3]);
+		JS_FreeValue(ctx, args[4]);
 		JS_FreeValue(ctx, matches);
 	} else {
 		JS_FreeValue(ctx, matches);
@@ -2371,8 +2759,20 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		JSValue olddata = JS_NULL;
 
 		JSValue before = target_snapshot(ctx, node);
+		bool was_blank = true;
 
 		dom_node_get_node_type(node, &type);
+		if (type == DOM_TEXT_NODE || type == DOM_CDATA_SECTION_NODE) {
+			dom_string *was = NULL;
+
+			if (dom_characterdata_get_data(
+				    (dom_characterdata *)node, &was) ==
+			    DOM_NO_ERR && was != NULL) {
+				was_blank = text_blank(dom_string_data(was),
+					dom_string_byte_length(was));
+				dom_string_unref(was);
+			}
+		}
 		/* what the text said before, which a characterData record
 		 * carries when the observer asked for it */
 		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
@@ -2396,6 +2796,10 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 		 * textContent = x on one aborted the browser outright.
 		 * Character data takes its value directly.
 		 */
+		if (type != DOM_TEXT_NODE && type != DOM_COMMENT_NODE &&
+		    type != DOM_CDATA_SECTION_NODE) {
+			mark_tree_dirty(ctx, "textContent", node, NULL, false);
+		}
 		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
 		    type == DOM_CDATA_SECTION_NODE) {
 			dom_characterdata_set_data((dom_characterdata *)node, d);
@@ -2421,7 +2825,15 @@ static JSValue node_set_text_content(JSContext *ctx, JSValueConst this_val,
 			dom_node_set_text_content(node, d);
 		}
 		dom_string_unref(d);
-		mark_dirty(ctx);
+		if (type == DOM_TEXT_NODE || type == DOM_CDATA_SECTION_NODE) {
+			/* only the boxes around it, in place (VitaSurf) */
+			mark_text_dirty(ctx, node, was_blank !=
+					text_blank(s != NULL ? s : "",
+						   s != NULL ? len : 0));
+		} else if (type == DOM_COMMENT_NODE) {
+			/* nothing drawn changes */
+			vita_dom_gen++;
+		}
 		if (type == DOM_TEXT_NODE || type == DOM_COMMENT_NODE ||
 		    type == DOM_CDATA_SECTION_NODE) {
 			JS_FreeValue(ctx, before);
@@ -3359,7 +3771,7 @@ static JSValue node_insert_before(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
-	mark_dirty(ctx);
+	mark_tree_dirty(ctx, "insertBefore", node, child, false);
 	notify_left_parent(ctx, child, node);
 	added = inserted_nodes(ctx, child, argv[0]);
 	if (argc >= 2) {
@@ -3393,7 +3805,8 @@ static JSValue node_replace_child(JSContext *ctx, JSValueConst this_val,
 	child = JS_GetOpaque(argv[0], node_class_id);
 	old = JS_GetOpaque(argv[1], node_class_id);
 	if (child == NULL || old == NULL) return JS_UNDEFINED;
-	mark_dirty(ctx);
+	mark_tree_dirty(ctx, "replaceChild", node, child,
+			subtree_has_slot(old));
 	notify_left_parent(ctx, child, node);
 	added = inserted_nodes(ctx, child, argv[0]);
 	if (dom_node_replace_child(node, child, old, &ref) == DOM_NO_ERR &&
@@ -3598,59 +4011,16 @@ static bool tags_build(jsthread *thread, struct dom_node *root)
 	struct dom_node *n = NULL;
 
 	vitasurf_js_sel_tag_sets++;
-	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
-	while (n != NULL) {
-		struct dom_node *next = NULL;
+	/* borrowed nodes and names: nothing here runs script */
+	while ((n = dom_node_vita_next_element(root, n)) != NULL) {
+		dom_string *local = dom_node_vita_local_name(n);
 
-		dom_node_type type = 0;
-
-		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
-		    type == DOM_ELEMENT_NODE) {
-			dom_string *local = NULL;
-			bool ok = true;
-
-			vitasurf_js_sel_tag_set_visits++;
-			dom_node_get_local_name(n, &local);
-			if (local != NULL) {
-				ok = tags_add(thread, tag_hash_lower(
-					dom_string_data(local),
-					dom_string_byte_length(local)));
-				dom_string_unref(local);
-			}
-			if (!ok) {
-				dom_node_unref(n);
-				return false;
-			}
+		vitasurf_js_sel_tag_set_visits++;
+		if (local != NULL &&
+		    !tags_add(thread, tag_hash_lower(dom_string_data(local),
+					dom_string_byte_length(local)))) {
+			return false;
 		}
-		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
-			next = NULL;
-		}
-		if (next == NULL) {
-			struct dom_node *cur = dom_node_ref(n);
-
-			while (cur != NULL) {
-				struct dom_node *sib = NULL, *parent = NULL;
-
-				if (cur == root) {
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_next_sibling(cur, &sib) ==
-				    DOM_NO_ERR && sib != NULL) {
-					next = sib;
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_parent_node(cur, &parent) !=
-				    DOM_NO_ERR) {
-					parent = NULL;
-				}
-				dom_node_unref(cur);
-				cur = parent;
-			}
-		}
-		dom_node_unref(n);
-		n = next;
 	}
 	return true;
 }
@@ -3679,7 +4049,7 @@ static bool tags_absent(jsthread *thread, struct dom_node *root,
 		}
 	}
 	if (!thread->tags_built) {
-		if (++thread->tags_asks < 2) return false;
+		if (thread->tags_asks < 2) return false;
 		if (!tags_build(thread, root)) {
 			thread->tags_n = 0;
 			if (thread->tags_set != NULL) {
@@ -3693,6 +4063,22 @@ static bool tags_absent(jsthread *thread, struct dom_node *root,
 	if (tags_has(thread, tag_hash)) return false;
 	vitasurf_js_sel_tag_absent++;
 	return true;
+}
+
+/*
+ * A bare tag query of root walked and found nothing (VitaSurf). The tag
+ * set answers only for names that are absent, so it is built once two
+ * walks of the same element have come back empty while the tree kept
+ * its shape: building it cost more than the walk it saves when the
+ * name is there, as Home Assistant's every card asking the body for
+ * the one <action-handler> is.
+ */
+static void tags_missed(jsthread *thread, struct dom_node *root)
+{
+	if (thread != NULL && thread->tags_root == root &&
+	    thread->tags_gen == vita_tree_gen) {
+		thread->tags_asks++;
+	}
 }
 
 /*
@@ -3761,62 +4147,29 @@ static JSValue win_vita_tag_query(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 	visits0 = vitasurf_js_sel_tag_visits;
-	/* iterative pre-order walk; root itself is not a candidate */
-	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
-		n = NULL;
-	}
-	while (n != NULL) {
-		struct dom_node *next = NULL;
-		dom_node_type type = 0;
+	/* tree order, root itself not a candidate, the name compared
+	 * interned inside libdom on borrowed nodes; see sel_native */
+	{
+		lwc_string *name = NULL;
+		uint32_t seen = 0;
 
-		if (dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
-		    type == DOM_ELEMENT_NODE) {
-			dom_string *local = NULL;
-			bool hit;
-
-			vitasurf_js_sel_tag_visits++;
-			dom_node_get_local_name(n, &local);
-			hit = tag_is(n, local, tag, tag_len);
-			if (local != NULL) dom_string_unref(local);
-			if (hit) {
+		if (lwc_intern_string(tag, tag_len, &name) == lwc_error_ok) {
+			n = NULL;
+			while ((n = dom_node_vita_find_tag(root, n, name,
+							   &seen)) != NULL) {
 				if (mode != 2) {
 					out = wrap_node(ctx, n);
-					dom_node_unref(n);
 					break;
 				}
 				JS_SetPropertyUint32(ctx, out, out_n++,
 						     wrap_node(ctx, n));
 			}
+			lwc_string_unref(name);
 		}
-		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
-			next = NULL;
+		vitasurf_js_sel_tag_visits += seen;
+		if (out_n == 0 && JS_IsNull(out) == (mode != 2)) {
+			tags_missed(JS_GetContextOpaque(ctx), root);
 		}
-		if (next == NULL) {
-			struct dom_node *cur = dom_node_ref(n);
-
-			while (cur != NULL) {
-				struct dom_node *sib = NULL, *parent = NULL;
-
-				if (cur == root) {
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_next_sibling(cur, &sib) ==
-				    DOM_NO_ERR && sib != NULL) {
-					next = sib;
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_parent_node(cur, &parent) !=
-				    DOM_NO_ERR) {
-					parent = NULL;
-				}
-				dom_node_unref(cur);
-				cur = parent;
-			}
-		}
-		dom_node_unref(n);
-		n = next;
 	}
 	walk_cost_note(mode == 2 ? "querySelectorAll" : "querySelector",
 		       tag, tag_len, vitasurf_js_sel_tag_visits - visits0,
@@ -4036,7 +4389,7 @@ static JSValue node_append_child(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL || argc < 1) return JS_UNDEFINED;
 	child = JS_GetOpaque(argv[0], node_class_id);
 	if (child == NULL) return JS_UNDEFINED;
-	mark_dirty(ctx);
+	mark_tree_dirty(ctx, "appendChild", node, child, false);
 	notify_left_parent(ctx, child, node);
 	added = inserted_nodes(ctx, child, argv[0]);
 	if (dom_node_append_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
@@ -4077,7 +4430,7 @@ static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 			}
 		}
 	}
-	mark_dirty(ctx);
+	mark_tree_dirty(ctx, "removeChild", node, child, false);
 	if (dom_node_remove_child(node, child, &ref) == DOM_NO_ERR && ref != NULL) {
 		dom_node_unref(ref);
 	}
@@ -4284,9 +4637,10 @@ static JSValue node_set_inner_html(JSContext *ctx, JSValueConst this_val,
 	}
 	if (s != NULL) {
 		vitasurf_js_html_bytes += (unsigned) len;
+		mark_tree_dirty(ctx, "innerHTML", node, NULL,
+				strcasestr(s, "<slot") != NULL);
 		set_inner_html(node, s, len);
 		JS_FreeCString(ctx, s);
-		mark_dirty(ctx);
 		notify_mutation(ctx, "childList", node,
 				target_snapshot(ctx, node), before);
 		before = JS_UNDEFINED;
@@ -4497,6 +4851,18 @@ static bool listener_matches(JSContext *ctx, struct js_listener *l,
 		JS_IsStrictEqual(ctx, l->func, func);
 }
 
+/* Whether an event type is one of the DOM mutation events, which libdom
+   dispatches for every edit and which almost no page listens for on the
+   window: the ones named DOM..., less DOMContentLoaded. */
+static bool type_is_mutation(dom_string *type)
+{
+	const char *d = dom_string_data(type);
+	size_t len = dom_string_byte_length(type);
+
+	return len > 3 && memcmp(d, "DOM", 3) == 0 &&
+		!(len == 16 && memcmp(d, "DOMContentLoaded", 16) == 0);
+}
+
 /** Take l out of the thread's list, off the node, and free it. */
 static void drop_listener(jsthread *thread, struct js_listener *l)
 {
@@ -4514,6 +4880,19 @@ static void drop_listener(jsthread *thread, struct js_listener *l)
 				thread->listener_count--;
 			}
 			break;
+		}
+	}
+	if (l->on_window) {
+		for (pp = &thread->win_listeners; *pp != NULL;
+		     pp = &(*pp)->win_next) {
+			if (*pp == l) {
+				*pp = l->win_next;
+				break;
+			}
+		}
+		if (l->type != NULL && type_is_mutation(l->type) &&
+		    thread->win_mutation > 0) {
+			thread->win_mutation--;
 		}
 	}
 	listener_hash_remove(thread, l);
@@ -4642,6 +5021,13 @@ static JSValue add_listener_to(JSContext *ctx, struct dom_node *node,
 	l->next = thread->listeners;
 	thread->listeners = l;
 	thread->listener_count++;
+	if (on_window) {
+		l->win_next = thread->win_listeners;
+		thread->win_listeners = l;
+		if (type_is_mutation(type_dom)) {
+			thread->win_mutation++;
+		}
+	}
 	listener_hash_add(thread, l);
 
 	if (!on_window) {
@@ -5217,6 +5603,75 @@ static JSValue win_vita_top_global(JSContext *ctx, JSValueConst this_val,
 		}
 		return t != NULL ? JS_GetGlobalObject(t->ctx) : JS_NULL;
 	}
+}
+
+/*
+ * __vitaFrameOf(global): the iframe element in this page whose frame
+ * shows that global's page, or null (VitaSurf). A frame's window is one
+ * object for as long as the frame lives, whatever page it shows, as a
+ * browser's WindowProxy is; the prelude keys it by this element. It was
+ * keyed by the page's global, so the window a page kept from the frame's
+ * blank start was not the one its later messages came from.
+ */
+static JSValue win_vita_frame_of(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	jsthread *t;
+	void *want;
+
+	C_WHERE;
+	(void)this_val;
+	if (argc < 1 || thread == NULL || !JS_IsObject(argv[0])) {
+		return JS_NULL;
+	}
+	want = JS_VALUE_GET_PTR(argv[0]);
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		JSValue g;
+		bool same;
+
+		if (t->closed || t->ctx == NULL || t->win == NULL) {
+			continue;
+		}
+		g = JS_GetGlobalObject(t->ctx);
+		same = JS_VALUE_GET_PTR(g) == want;
+		JS_FreeValue(ctx, g);
+		if (!same) {
+			continue;
+		}
+		if (t->win->parent == NULL || t->win->frame_node == NULL ||
+		    frame_parent_thread(t->win) != thread) {
+			return JS_NULL;
+		}
+		return wrap_node(ctx, t->win->frame_node);
+	}
+	return JS_NULL;
+}
+
+/*
+ * __vitaLayoutState(): [whether a layout is still to catch up with the
+ * document, how many layout passes there have been] (VitaSurf). The
+ * IntersectionObserver reports after layout, as a browser's does in its
+ * rendering update, and looks again when a pass has run.
+ */
+static JSValue win_vita_layout_state(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue arr;
+	bool pending;
+
+	C_WHERE;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	pending = thread == NULL || thread->htmlc == NULL ||
+		  thread->htmlc->layout == NULL || thread->dom_dirty;
+	arr = JS_NewArray(ctx);
+	JS_SetPropertyUint32(ctx, arr, 0, JS_NewBool(ctx, pending));
+	JS_SetPropertyUint32(ctx, arr, 1,
+			     JS_NewUint32(ctx, vitasurf_layout_runs));
+	return arr;
 }
 
 /* __vitaFrameElement(): this frame's iframe element, in the parent page */
@@ -5986,6 +6441,56 @@ static JSValue doc_get_current_script(JSContext *ctx, JSValueConst this_val)
 	return r;
 }
 
+/*
+ * The body element, as the spec has it: the first child of the root
+ * html element that is a body or a frameset, with a reference the caller
+ * drops (VitaSurf). libdom's answer is the first body anywhere in the
+ * document, found by counting every body there: a walk of the whole
+ * tree on each read of document.body, which Home Assistant's
+ * components make often enough that it was 1% of a dashboard's load.
+ */
+static struct dom_node *body_of(struct dom_document *doc)
+{
+	struct dom_element *root = NULL;
+	struct dom_node *n = NULL, *next;
+	dom_string *local = NULL;
+	bool html;
+
+	if (dom_document_get_document_element(doc, &root) != DOM_NO_ERR ||
+	    root == NULL) {
+		return NULL;
+	}
+	dom_node_get_local_name(root, &local);
+	html = tag_is((struct dom_node *)root, local, "html", 4);
+	if (local != NULL) dom_string_unref(local);
+	if (html) {
+		dom_node_get_first_child(root, &n);
+	}
+	dom_node_unref(root);
+	while (n != NULL) {
+		dom_node_type type = DOM_NODE_TYPE_COUNT;
+
+		dom_node_get_node_type(n, &type);
+		if (type == DOM_ELEMENT_NODE) {
+			bool hit;
+
+			local = NULL;
+			dom_node_get_local_name(n, &local);
+			hit = tag_is(n, local, "body", 4) ||
+			      tag_is(n, local, "frameset", 8);
+			if (local != NULL) dom_string_unref(local);
+			if (hit) {
+				return n;
+			}
+		}
+		next = NULL;
+		dom_node_get_next_sibling(n, &next);
+		dom_node_unref(n);
+		n = next;
+	}
+	return NULL;
+}
+
 static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 {
 	C_WHERE;
@@ -5996,7 +6501,7 @@ static JSValue doc_get_body(JSContext *ctx, JSValueConst this_val)
 
 	(void)this_val;
 	if (doc == NULL) return JS_NULL;
-	dom_html_document_get_body(doc, &body);
+	body = (struct dom_html_element *)body_of(doc);
 	r = wrap_node(ctx, (struct dom_node *)body);
 	if (body != NULL) dom_node_unref((struct dom_node *)body);
 	return r;
@@ -6070,7 +6575,7 @@ static JSValue doc_set_cookie(JSContext *ctx, JSValueConst this_val, JSValueCons
 	if (thread != NULL && thread->win != NULL && s != NULL &&
 	    browser_window_get_url(thread->win, false, &url) == NSERROR_OK &&
 	    url != NULL) {
-		urldb_set_cookie(s, url, NULL);
+		urldb_set_cookie_from_script(s, url);
 		nsurl_unref(url);
 	}
 	if (s) JS_FreeCString(ctx, s);
@@ -6587,8 +7092,13 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 /* ------------------------------------------------------------------------ */
 /* Deadline management around calls into script                             */
 
-/* Lower bound on script_timeout, in seconds. See js_newheap(). */
-#define SCRIPT_TIMEOUT_MIN 20
+/*
+ * The deadline of a script with no time limit (VitaSurf): one that never
+ * comes, rather than none, so that the interrupt still keeps transfers
+ * moving, takes profile samples and lets Circle stop the script. A
+ * deadline of zero means no script is running and skips all of that.
+ */
+#define DEADLINE_NEVER UINT64_MAX
 
 /*
  * Arm the deadline afresh without opening a nesting level. Compiling is
@@ -6655,7 +7165,7 @@ static void rearm_deadline(jsthread *thread)
 	if (secs != 0) {
 		thread->deadline_ms = now_ms() + (uint64_t)secs * 1000;
 	} else {
-		thread->deadline_ms = 0;
+		thread->deadline_ms = DEADLINE_NEVER;
 	}
 }
 
@@ -6695,6 +7205,9 @@ enum script_why {
 	SCRIPT_XHR		/**< a fetch or XHR settling */
 };
 static enum script_why script_why;
+/* the next event entry comes from a callback of our own scheduling, with
+   nothing of NetSurf's under it (VitaSurf) */
+static bool next_event_safe;
 
 /*
  * When script last ran, for the compiled script cache to write its
@@ -6711,6 +7224,8 @@ static void begin_script(jsthread *thread, enum script_why why)
 		return;
 	}
 	script_why = why;
+	thread->entry_safe = why != SCRIPT_EVENT || next_event_safe;
+	thread->flush_ms = 0;
 	/* for the busy sampling: what the frames are spent in (VitaSurf) */
 	thread->phase_was = vitasurf_phase;
 	vitasurf_phase = why == SCRIPT_TIMER ? "script: a timer" :
@@ -6805,9 +7320,14 @@ static void end_script(jsthread *thread)
 	}
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;
-		vita_log("qjs: that script was stopped by the budget "
-			 "(%u on this page; the next gets %u seconds)",
-			 thread->scripts_killed, budget_secs(thread));
+		if (budget_secs(thread) != 0) {
+			vita_log("qjs: that script was stopped by the budget "
+				 "(%u on this page; the next gets %u seconds)",
+				 thread->scripts_killed, budget_secs(thread));
+		} else {
+			vita_log("qjs: that script was stopped (%u on this "
+				 "page)", thread->scripts_killed);
+		}
 	}
 	/* The outermost call is over, so nothing is still unwinding. An
 	 * exception left pending here is one that was reported already, or
@@ -6878,6 +7398,9 @@ static void end_script(jsthread *thread)
 		unsigned b_tr = vitasurf_js_tree_reads;
 		unsigned b_bc = vitasurf_js_binding_calls;
 		unsigned b_txt = vitasurf_js_text_reads;
+		uint32_t b_sel = thread->style_memo_selected;
+		uint32_t b_hits = thread->style_memo_hits;
+		uint32_t b_sel_ms = thread->style_memo_ms;
 
 		vitasurf_js_drains++;
 		vitasurf_phase = "promise jobs";
@@ -6987,6 +7510,22 @@ static void end_script(jsthread *thread)
 			unsigned drain_ms = (unsigned)(now_ms() - j0);
 
 			vitasurf_ms_js_jobs += drain_ms;
+			/* what styles for elements without a box cost a
+			 * long drain (VitaSurf) */
+			if (drain_ms >= 1000 &&
+			    thread->style_memo_selected != b_sel) {
+				vita_log("qjs: a drain of %u ms selected %u "
+					 "styles for elements without a box "
+					 "in %u ms, and answered %u reads "
+					 "from ones already selected",
+					 drain_ms,
+					 (unsigned)(thread->style_memo_selected
+						    - b_sel),
+					 (unsigned)(thread->style_memo_ms -
+						    b_sel_ms),
+					 (unsigned)(thread->style_memo_hits -
+						    b_hits));
+			}
 			if (drain_ms > vitasurf_ms_js_drain_max) {
 				vitasurf_ms_js_drain_max = drain_ms;
 				vitasurf_js_drain_max_jobs = in_drain;
@@ -6997,13 +7536,21 @@ static void end_script(jsthread *thread)
 	thread->draining = false;
 	if (thread->overrun_count > 0) {
 		thread->scripts_killed++;
-		vita_log("qjs: promise jobs stopped by the budget "
-			 "(%u on this page; the next gets %u seconds)",
-			 thread->scripts_killed, budget_secs(thread));
+		if (budget_secs(thread) != 0) {
+			vita_log("qjs: promise jobs stopped by the budget "
+				 "(%u on this page; the next gets %u seconds)",
+				 thread->scripts_killed, budget_secs(thread));
+		} else {
+			vita_log("qjs: promise jobs stopped (%u on this page)",
+				 thread->scripts_killed);
+		}
 	}
 	thread->overrun_count = 0;
 	thread->deadline_ms = 0;
 	thread->aborting = false;
+	/* the next script starts with a new count, so what was selected
+	 * for this one is only memory now */
+	style_memo_free(thread);
 	if (thread->dom_dirty) {
 		schedule_relayout(thread, RELAYOUT_DELAY_MS);
 	}
@@ -7066,8 +7613,11 @@ static void relayout_forget(jsthread *thread)
 {
 	thread->dom_dirty = false;
 	thread->tree_dirty = false;
+	thread->tree_why[0] = '\0';
 	attr_journal_clear(thread);
 }
+
+static void slot_pass(jsthread *thread);
 
 static void relayout_callback(void *p)
 {
@@ -7075,6 +7625,7 @@ static void relayout_callback(void *p)
 	html_content *htmlc;
 	nserror err;
 	uint64_t t0;
+	char why_now[sizeof(thread->tree_why)];
 
 	thread->relayout_pending = false;
 	if (thread->closed || !thread->dom_dirty) {
@@ -7129,6 +7680,19 @@ static void relayout_callback(void *p)
 			return;
 		}
 		t0 = now_ms();
+		/* which children slots take, as a rebuild of the tree asks
+		 * first; the pass is script, which may change more */
+		if (thread->attr_slots) {
+			slot_pass(thread);
+			thread->attr_slots = false;
+			n = thread->attr_n;
+			if (thread->closed) {
+				return;
+			}
+			if (thread->tree_dirty) {
+				goto rebuild;
+			}
+		}
 		if (!html_restyle_attrs(htmlc, thread->attr_changes, n, &res,
 					why, sizeof(why))) {
 			/* busy: being laid out, dragged or still built */
@@ -7144,9 +7708,9 @@ static void relayout_callback(void *p)
 			relayout_forget(thread);
 			thread->attr_restyles++;
 			if (thread->attr_restyles <= 10 || ms >= 100) {
-				vita_log("qjs: %u attribute changes put on the "
-					 "page in %u ms without rebuilding "
-					 "it (%s)", n, ms,
+				vita_log("qjs: %u attribute and text changes "
+					 "put on the page in %u ms without "
+					 "rebuilding it (%s)", n, ms,
 					 res == BOX_RESTYLE_REFLOW ?
 					 "laid out again" :
 					 res == BOX_RESTYLE_PAINT ?
@@ -7154,10 +7718,14 @@ static void relayout_callback(void *p)
 			}
 			return;
 		}
-		vita_log("qjs: %u attribute changes need the layout rebuilt "
-			 "after %u ms restyling: %s", n, ms, why);
+		vita_log("qjs: %u attribute and text changes need the "
+			 "layout rebuilt after %u ms restyling: %s", n, ms,
+			 why);
+		snprintf(thread->tree_why, sizeof(thread->tree_why), "%.90s",
+			 why);
 		thread->tree_dirty = true;
 	}
+rebuild:
 	if (thread->relayout_off) {
 		relayout_forget(thread);
 		return;
@@ -7218,7 +7786,16 @@ static void relayout_callback(void *p)
 	 */
 	/* a rebuild this page already had is a better measure than
 	 * anything estimated from its first load (VitaSurf) */
-	if (vitasurf_box_elements > 0 && thread->relayout_ms == 0) {
+	/*
+	 * Only from a sample big enough to mean something (VitaSurf). The
+	 * counts are the browser's, reset when any page starts, so on
+	 * Speedtest, just after two small frames had loaded, a few
+	 * elements against a long time made 409 ms an element, the
+	 * estimate came to 345 s, and the page was never laid out again:
+	 * nothing it did after that reached the screen.
+	 */
+	if (vitasurf_box_elements >= RELAYOUT_MIN_SAMPLE &&
+	    thread->relayout_ms == 0) {
 		unsigned per_element_us = (vitasurf_ms_boxes * 1000u) /
 					  vitasurf_box_elements;
 		unsigned estimate = (per_element_us *
@@ -7245,19 +7822,82 @@ static void relayout_callback(void *p)
 		thread->relayout_due = (uint32_t)now_ms() + RELAYOUT_RETRY_MS;
 		return;
 	}
+	snprintf(why_now, sizeof(why_now), "%s",
+		 thread->tree_why[0] != '\0' ? thread->tree_why : "?");
 	relayout_forget(thread);
 	/* the rebuild runs to completion here, so this is also how long
 	 * the page was frozen for */
 	thread->relayout_ms = (unsigned)(now_ms() - t0);
 	vita_log("qjs: layout rebuilt after script changes in %u ms "
 		 "(%u elements), %u images taken back and %u asked for "
-		 "again%s",
+		 "again%s; the first change: %s",
 		 thread->relayout_ms, thread->dom_elements,
 		 htmlc->relayout_reused, htmlc->relayout_fetched,
-		 err == NSERROR_OK ? "" : " (failed)");
+		 err == NSERROR_OK ? "" : " (failed)", why_now);
 	/* what the page looks like once its scripts have built it, when
 	 * the flag file asks for it (VitaSurf) */
 	vita_input_dump_layout();
+}
+
+/*
+ * Lay the page out now, for a geometry read (VitaSurf). A browser answers
+ * offsetWidth or getBoundingClientRect after a change with the layout the
+ * change makes, and code that measures what it has just built -- a menu
+ * placing itself, a list sizing its rows -- got the layout from before.
+ * The scheduled relayout runs here instead, when it is safe: the
+ * outermost entry into script came from a timer, a fetch or a script
+ * element, so nothing of NetSurf's up the stack holds a box, a form
+ * control or a layout it would use after the script returns. An event
+ * NetSurf dispatches from input keeps the old answer, as the click
+ * handler's form submission reads the control it found. What a script
+ * spends here is bounded per entry, so one that alternates writing and
+ * measuring does not freeze the page: past the budget it reads the
+ * last layout, as before.
+ */
+#define FLUSH_BUDGET_MS 400
+#define FLUSH_LOGGED 3
+/* a rebuild of the whole tree is forced only on a page whose last one
+   cost no more than this; past it the read answers from the last layout
+   and the rebuild keeps its place in the scheduler, where changes are
+   coalesced (Home Assistant's take hundreds of ms on the Vita) */
+#define FLUSH_REBUILD_MAX_MS 60
+
+static void layout_flush(jsthread *thread)
+{
+	uint64_t t0;
+	unsigned took;
+
+	if (!thread->dom_dirty || thread->closed || thread->flushing ||
+	    thread->htmlc == NULL || thread->htmlc->layout == NULL) {
+		return;
+	}
+	if (!thread->entry_safe || thread->flush_ms >= FLUSH_BUDGET_MS ||
+	    (thread->tree_dirty &&
+	     thread->relayout_ms > FLUSH_REBUILD_MAX_MS)) {
+		thread->flush_refused++;
+		return;
+	}
+	t0 = now_ms();
+	thread->flushing = true;
+	guit->misc->schedule(-1, relayout_callback, thread);
+	thread->relayout_pending = false;
+	relayout_callback(thread);
+	thread->flushing = false;
+	took = (unsigned)(now_ms() - t0);
+	thread->flush_ms += took;
+	thread->flush_total_ms += took;
+	if (thread->dom_dirty) {
+		/* a rebuild waits for the page to finish loading, as it
+		 * does from the scheduler; what could be restyled in place
+		 * was */
+		thread->flush_waited++;
+		return;
+	}
+	thread->flushes++;
+	if (thread->flushes <= FLUSH_LOGGED) {
+		vita_log("qjs: a geometry read laid the page out first, in "
+			 "%u ms", took);
+	}
 }
 
 /*
@@ -7277,9 +7917,7 @@ static bool node_in_document(struct dom_node *node)
 		    type == DOM_DOCUMENT_NODE) {
 			break;
 		}
-		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR) {
-			p = NULL;
-		}
+		p = tree_up(n);
 		dom_node_unref(n);
 		n = p;
 	}
@@ -7483,8 +8121,16 @@ static bool slot_entry_holds(const struct slot_entry *e)
 	if (e->slot == NULL) {
 		return true;
 	}
-	return slot_dom_contains(e->host, e->slot) &&
-		!slot_dom_contains(e->node, e->slot);
+	/* the slot is still in the host's shadow tree */
+	{
+		struct dom_node *root = shadow_root_of(e->host);
+		bool in = root != NULL && slot_dom_contains(root, e->slot);
+
+		if (root != NULL) {
+			dom_node_unref(root);
+		}
+		return in;
+	}
 }
 
 /** Whether a node is a host's own child that a slot draws, or nothing. */
@@ -7556,20 +8202,52 @@ static bool composed_hook(struct html_content *c, enum vitasurf_composed_op op,
 		return true;
 	}
 	m = &thread->slots;
-	if (m->n == 0 || n == NULL || out == NULL) {
+	if (n == NULL || out == NULL) {
 		return false;
 	}
 	switch (op) {
 	case VITASURF_COMPOSED_PARENT:
-		i = slot_find_entry(m, n);
-		if (i >= 0 && m->e[i].slot != NULL &&
-		    slot_entry_holds(&m->e[i])) {
-			*out = dom_node_ref(m->e[i].slot);
-			return true;
+		if (m->n > 0) {
+			i = slot_find_entry(m, n);
+			if (i >= 0 && m->e[i].slot != NULL &&
+			    slot_entry_holds(&m->e[i])) {
+				*out = dom_node_ref(m->e[i].slot);
+				return true;
+			}
+		}
+		/* the top of a shadow tree is drawn in its host */
+		if (dom_node_get_parent_node(n, &d) == DOM_NO_ERR &&
+		    d != NULL) {
+			struct dom_node *host = shadow_host_of(d);
+
+			dom_node_unref(d);
+			if (host != NULL) {
+				*out = host;
+				return true;
+			}
 		}
 		return false;
 
-	case VITASURF_COMPOSED_FIRST_CHILD:
+	case VITASURF_COMPOSED_FIRST_CHILD: {
+		/* a host draws its shadow tree, and its own children only
+		   where a slot takes them */
+		struct dom_node *root = shadow_root_of(n);
+
+		if (root != NULL) {
+			if (dom_node_get_first_child(root, &d) !=
+			    DOM_NO_ERR) {
+				d = NULL;
+			}
+			dom_node_unref(root);
+			if (m->n > 0) {
+				slot_skip_moved(m, &d);
+			}
+			*out = d;
+			return true;
+		}
+		if (m->n == 0) {
+			return false;
+		}
 		i = slot_find_head(m, n);
 		if (i >= 0) {
 			i = slot_next_holding(m, m->h[i].first);
@@ -7585,8 +8263,12 @@ static bool composed_hook(struct html_content *c, enum vitasurf_composed_op op,
 		slot_skip_moved(m, &d);
 		*out = d;
 		return true;
+	}
 
 	case VITASURF_COMPOSED_NEXT_SIBLING:
+		if (m->n == 0) {
+			return false;
+		}
 		i = slot_find_entry(m, n);
 		if (i >= 0 && m->e[i].slot != NULL &&
 		    slot_entry_holds(&m->e[i])) {
@@ -8034,6 +8716,22 @@ static bool layout_current(jsthread *thread)
 	html_content *htmlc = thread->htmlc;
 
 	return htmlc != NULL && htmlc->layout != NULL;
+}
+
+/*
+ * Whether the boxes' styles may be behind the document (VitaSurf): it
+ * changed since they were made, or a sheet did. The restyle runs from
+ * the scheduler, and until it has, a style read selects again from the
+ * document and the sheets as they are, as a browser's style recalc
+ * would. Reading the boxes said a class just set had changed nothing.
+ */
+static bool style_stale(jsthread *thread)
+{
+	html_content *htmlc = thread->htmlc;
+
+	if (htmlc == NULL || htmlc->select_ctx == NULL)
+		return false;
+	return thread->dom_dirty || !html_select_ctx_current(htmlc);
 }
 
 static void timer_callback(void *p)
@@ -8666,6 +9364,10 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 	dom_string *type = NULL;
 	struct dom_event_target *target = NULL;
 
+	/* an event this browser made and sent, not one a page made: those
+	 * reach listeners as the page's own objects (VitaSurf) */
+	JS_SetPropertyStr(ctx, obj, "isTrusted", JS_TRUE);
+
 	if (dom_event_get_type(evt, &type) == DOM_NO_ERR && type != NULL) {
 		JS_SetPropertyStr(ctx, obj, "type",
 			JS_NewStringLen(ctx, dom_string_data(type),
@@ -8743,6 +9445,36 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 		JS_SetPropertyStr(ctx, obj, "isComposing", JS_NewBool(ctx, false));
 	}
 
+	/* what the event is, for the prelude to make the object a
+	 * browser would hand over (VitaSurf) */
+	{
+		bool flag = false;
+
+		if (dom_event_get_bubbles(evt, &flag) != DOM_NO_ERR) {
+			flag = false;
+		}
+		JS_SetPropertyStr(ctx, obj, "bubbles", JS_NewBool(ctx, flag));
+		if (dom_event_get_cancelable(evt, &flag) != DOM_NO_ERR) {
+			flag = false;
+		}
+		JS_SetPropertyStr(ctx, obj, "cancelable", JS_NewBool(ctx, flag));
+	}
+	/* and where the pointer was, when it was the pointer */
+	if (html_pointer_current.evt == evt) {
+		JSValue p = JS_NewObject(ctx);
+
+		JS_SetPropertyStr(ctx, p, "x",
+				  JS_NewInt32(ctx, html_pointer_current.x));
+		JS_SetPropertyStr(ctx, p, "y",
+				  JS_NewInt32(ctx, html_pointer_current.y));
+		JS_SetPropertyStr(ctx, p, "button",
+				  JS_NewInt32(ctx, html_pointer_current.button));
+		JS_SetPropertyStr(ctx, p, "buttons",
+				  JS_NewInt32(ctx, html_pointer_current.buttons));
+		JS_SetPropertyStr(ctx, p, "detail",
+				  JS_NewInt32(ctx, html_pointer_current.detail));
+		JS_SetPropertyStr(ctx, obj, "__vsPointer", p);
+	}
 	JS_SetPropertyStr(ctx, obj, "defaultPrevented", JS_NewBool(ctx, false));
 	JS_SetPropertyStr(ctx, obj, "cancelBubble", JS_NewBool(ctx, false));
 	JS_SetPropertyStr(ctx, obj, "preventDefault",
@@ -8752,6 +9484,80 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 	JS_SetPropertyStr(ctx, obj, "stopImmediatePropagation",
 			  JS_NewCFunction(ctx, ev_stop_propagation, "stopImmediatePropagation", 0));
 	return obj;
+}
+
+/*
+ * The object a native event reaches script as (VitaSurf). NetSurf's own
+ * events -- a click, a key, focus -- were a plain object made afresh for
+ * each listener: not an Event, no position, and what one listener set
+ * on it the next did not see. A browser hands every listener the same
+ * MouseEvent, PointerEvent or KeyboardEvent, so the prelude makes one of
+ * those from what wrap_event read, and it is kept until the dispatch is
+ * over (js_event_cleanup), holding a reference so the address cannot
+ * come back as another event meanwhile.
+ */
+static JSValue native_event(jsthread *thread, struct dom_event *evt)
+{
+	JSContext *ctx = thread->ctx;
+	JSValue obj, global, fn, r;
+	unsigned i;
+
+	for (i = 0; i < NATIVE_EVENTS; i++) {
+		if (thread->native_evt[i] == evt) {
+			return JS_DupValue(ctx, thread->native_obj[i]);
+		}
+	}
+	obj = wrap_event(ctx, evt);
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaNativeEvent");
+	if (JS_IsFunction(ctx, fn)) {
+		r = JS_Call(ctx, fn, global, 1, &obj);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		} else if (JS_IsObject(r)) {
+			JS_FreeValue(ctx, obj);
+			obj = r;
+			r = JS_UNDEFINED;
+		}
+		JS_FreeValue(ctx, r);
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	i = thread->native_next++ % NATIVE_EVENTS;
+	if (thread->native_evt[i] != NULL) {
+		dom_event_unref(thread->native_evt[i]);
+		JS_FreeValue(ctx, thread->native_obj[i]);
+	}
+	dom_event_ref(evt);
+	thread->native_evt[i] = evt;
+	thread->native_obj[i] = JS_DupValue(ctx, obj);
+	return obj;
+}
+
+/* Let a dispatched event's object go. */
+static void native_event_drop(jsthread *thread, struct dom_event *evt)
+{
+	unsigned i;
+
+	for (i = 0; i < NATIVE_EVENTS; i++) {
+		if (thread->native_evt[i] == evt) {
+			dom_event_unref(evt);
+			JS_FreeValue(thread->ctx, thread->native_obj[i]);
+			thread->native_evt[i] = NULL;
+			thread->native_obj[i] = JS_UNDEFINED;
+		}
+	}
+}
+
+static void native_events_free(jsthread *thread)
+{
+	unsigned i;
+
+	for (i = 0; i < NATIVE_EVENTS; i++) {
+		if (thread->native_evt[i] != NULL) {
+			native_event_drop(thread, thread->native_evt[i]);
+		}
+	}
 }
 
 /*
@@ -8855,11 +9661,23 @@ static void listener_trampoline(struct dom_event *evt, void *pw)
 		JS_SetPropertyStr(ctx, event_obj, "currentTarget",
 				  JS_DupValue(ctx, global));
 	} else {
-		event_obj = wrap_event(ctx, evt);
+		event_obj = native_event(thread, evt);
 	}
 	if (l->on_window) {
 		JS_SetPropertyStr(ctx, event_obj, "currentTarget",
 				  JS_DupValue(ctx, global));
+	}
+	/* the node it was sent to, which composedPath starts from when the
+	 * target this listener sees is a shadow host */
+	{
+		struct dom_event_target *origin = NULL;
+
+		if (dom_event_get_origin(evt, &origin) == DOM_NO_ERR &&
+		    origin != NULL) {
+			JS_SetPropertyStr(ctx, event_obj, "__vsOrigin",
+					  wrap_node(ctx,
+						(struct dom_node *)origin));
+		}
 	}
 	/* which phase the listener is being called in, which an event out
 	 * of dispatch does not have at all */
@@ -8968,11 +9786,16 @@ static void run_window_listeners(jsthread *thread, struct dom_event *evt,
 	dom_string *type = NULL;
 	unsigned n = 0, cap = 0, i;
 
-	if (thread == NULL || thread->closed ||
+	if (thread == NULL || thread->closed || thread->win_listeners == NULL ||
 	    dom_event_get_type(evt, &type) != DOM_NO_ERR || type == NULL) {
 		return;
 	}
-	for (l = thread->listeners; l != NULL; l = l->next) {
+	if (thread->win_mutation == 0 && type_is_mutation(type)) {
+		/* each edit dispatches some; none is wanted here */
+		dom_string_unref(type);
+		return;
+	}
+	for (l = thread->win_listeners; l != NULL; l = l->win_next) {
 		if (!l->on_window || l->dead || l->type == NULL ||
 		    (which == 1 && !l->capture) ||
 		    (which == 3 && l->capture) ||
@@ -10130,52 +10953,51 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 		return out;
 	}
 	visits0 = vitasurf_js_sel_tag_visits;
-	/* iterative pre-order walk; root itself is not a candidate */
-	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) n = NULL;
-	while (n != NULL) {
-		struct dom_node *next = NULL;
+	/*
+	 * Tree order, root itself not a candidate, on borrowed nodes:
+	 * neither matching nor wrapping runs script or changes the tree.
+	 * A bare tag is compared by its interned name inside libdom.
+	 */
+	{
+		lwc_string *tag = NULL;
+		uint32_t seen = 0;
 
-		if (sel_is_element(n)) {
-			vitasurf_js_sel_tag_visits++;
-			if (sel_matches(n, s)) {
-				if (magic == 1) {
-					out = wrap_node(ctx, n);
-					dom_node_unref(n);
-					break;
+		if (bare != NULL &&
+		    lwc_intern_string(bare->tag, bare->tag_len, &tag) !=
+		    lwc_error_ok) {
+			tag = NULL;
+		}
+		n = NULL;
+		for (;;) {
+			if (tag != NULL) {
+				n = dom_node_vita_find_tag(root, n, tag, &seen);
+			} else {
+				n = dom_node_vita_next_element(root, n);
+				if (n != NULL) {
+					seen++;
 				}
-				JS_SetPropertyUint32(ctx, out, out_n++,
-						     wrap_node(ctx, n));
 			}
-		}
-		if (dom_node_get_first_child(n, &next) != DOM_NO_ERR) {
-			next = NULL;
-		}
-		if (next == NULL) {
-			struct dom_node *cur = dom_node_ref(n);
-
-			while (cur != NULL) {
-				struct dom_node *sib = NULL, *parent = NULL;
-
-				if (cur == root) {
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_next_sibling(cur, &sib) ==
-				    DOM_NO_ERR && sib != NULL) {
-					next = sib;
-					dom_node_unref(cur);
-					break;
-				}
-				if (dom_node_get_parent_node(cur, &parent) !=
-				    DOM_NO_ERR) {
-					parent = NULL;
-				}
-				dom_node_unref(cur);
-				cur = parent;
+			if (n == NULL) {
+				break;
 			}
+			if (tag == NULL && !sel_matches(n, s)) {
+				continue;
+			}
+			if (magic == 1) {
+				out = wrap_node(ctx, n);
+				break;
+			}
+			JS_SetPropertyUint32(ctx, out, out_n++,
+					     wrap_node(ctx, n));
 		}
-		dom_node_unref(n);
-		n = next;
+		if (tag != NULL) {
+			lwc_string_unref(tag);
+		}
+		vitasurf_js_sel_tag_visits += seen;
+		if (bare != NULL && out_n == 0 &&
+		    JS_IsNull(out) == (magic != 2)) {
+			tags_missed(thread, root);
+		}
 	}
 	if (s->text != NULL) {
 		walk_cost_note(magic == 2 ? "querySelectorAll" :
@@ -10387,26 +11209,18 @@ static bool ce_candidate(struct dom_node *n)
 	return yes;
 }
 
-static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
-				      int argc, JSValueConst *argv)
+/*
+ * The candidates under root, in shadow-including tree order: an element's
+ * shadow tree comes after it and before its children (VitaSurf). A
+ * component's own elements are in its shadow tree, and they connect and
+ * disconnect with the page as the host does. depth bounds the shadow
+ * trees inside shadow trees it follows.
+ */
+static void ce_collect(JSContext *ctx, JSValue out, uint32_t *k,
+		       struct dom_node *root, unsigned depth)
 {
-	C_WHERE;
-	struct dom_node *root, *n = NULL;
-	JSValue out = JS_NewArray(ctx);
-	uint32_t k = 0;
+	struct dom_node *n = NULL;
 
-	(void)this_val;
-	if (argc < 1 || !JS_IsObject(argv[0])) {
-		return out;
-	}
-	root = JS_GetOpaque(argv[0], node_class_id);
-	if (root == NULL) {
-		return out;
-	}
-	if (argc > 1 && JS_ToBool(ctx, argv[1]) && node_is_element(root) &&
-	    ce_candidate(root)) {
-		JS_SetPropertyUint32(ctx, out, k++, wrap_node(ctx, root));
-	}
 	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
 		n = NULL;
 	}
@@ -10414,9 +11228,16 @@ static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
 		struct dom_node *next = NULL;
 
 		if (node_is_element(n)) {
+			struct dom_node *sr;
+
 			if (ce_candidate(n)) {
-				JS_SetPropertyUint32(ctx, out, k++,
+				JS_SetPropertyUint32(ctx, out, (*k)++,
 						     wrap_node(ctx, n));
+			}
+			sr = depth < 64 ? shadow_root_of(n) : NULL;
+			if (sr != NULL) {
+				ce_collect(ctx, out, k, sr, depth + 1);
+				dom_node_unref(sr);
 			}
 			dom_node_get_first_child(n, &next);
 		}
@@ -10447,7 +11268,124 @@ static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
 		dom_node_unref(n);
 		n = next;
 	}
+}
+
+static JSValue win_vita_ce_candidates(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *root, *sr;
+	JSValue out = JS_NewArray(ctx);
+	uint32_t k = 0;
+
+	(void)this_val;
+	if (argc < 1 || !JS_IsObject(argv[0])) {
+		return out;
+	}
+	root = JS_GetOpaque(argv[0], node_class_id);
+	if (root == NULL) {
+		return out;
+	}
+	if (argc > 1 && JS_ToBool(ctx, argv[1]) && node_is_element(root) &&
+	    ce_candidate(root)) {
+		JS_SetPropertyUint32(ctx, out, k++, wrap_node(ctx, root));
+	}
+	/* a host's own shadow tree first, as for one found inside */
+	sr = shadow_root_of(root);
+	if (sr != NULL) {
+		ce_collect(ctx, out, &k, sr, 1);
+		dom_node_unref(sr);
+	}
+	ce_collect(ctx, out, &k, root, 0);
 	return out;
+}
+
+/*
+ * __vitaFindById(root, id): the first element under root, in document
+ * order, whose id is id, or null (VitaSurf). A shadow root is its host
+ * here, so this.shadowRoot.getElementById walked the host's subtree in
+ * the prelude, a childNodes list per element; Home Assistant asks for
+ * its view that way on every state message.
+ */
+static JSValue win_vita_find_by_id(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *root, *n = NULL;
+	dom_string *want = NULL;
+	const char *s;
+	size_t len = 0;
+	JSValue r = JS_NULL;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsObject(argv[0])) {
+		return JS_NULL;
+	}
+	root = JS_GetOpaque(argv[0], node_class_id);
+	if (root == NULL) {
+		return JS_NULL;
+	}
+	s = JS_ToCStringLen(ctx, &len, argv[1]);
+	if (s == NULL) {
+		return JS_EXCEPTION;
+	}
+	want = to_dom_string_len(s, len);
+	JS_FreeCString(ctx, s);
+	if (want == NULL) {
+		return JS_NULL;
+	}
+	if (dom_node_get_first_child(root, &n) != DOM_NO_ERR) {
+		n = NULL;
+	}
+	while (n != NULL) {
+		struct dom_node *next = NULL;
+
+		if (node_is_element(n)) {
+			dom_string *id = NULL;
+			bool hit = false;
+
+			if (dom_element_get_attribute(n, corestring_dom_id,
+						      &id) == DOM_NO_ERR &&
+			    id != NULL) {
+				hit = dom_string_isequal(id, want);
+				dom_string_unref(id);
+			}
+			if (hit) {
+				r = wrap_node(ctx, n);
+				dom_node_unref(n);
+				break;
+			}
+			dom_node_get_first_child(n, &next);
+		}
+		if (next == NULL) {
+			struct dom_node *cur = dom_node_ref(n);
+
+			while (cur != NULL) {
+				struct dom_node *sib = NULL, *parent = NULL;
+
+				if (cur == root) {
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_next_sibling(cur, &sib) ==
+				    DOM_NO_ERR && sib != NULL) {
+					next = sib;
+					dom_node_unref(cur);
+					break;
+				}
+				if (dom_node_get_parent_node(cur, &parent) !=
+				    DOM_NO_ERR) {
+					parent = NULL;
+				}
+				dom_node_unref(cur);
+				cur = parent;
+			}
+		}
+		dom_node_unref(n);
+		n = next;
+	}
+	dom_string_unref(want);
+	return r;
 }
 
 static JSValue win_vita_element_step(JSContext *ctx, JSValueConst this_val,
@@ -10517,6 +11455,76 @@ static void set_index(JSContext *ctx, JSValue arr, int i, int v)
  * showing, and answering with the stylesheet's default said every page
  * was black on transparent.
  */
+static const css_select_results *select_without_box(jsthread *thread,
+		struct dom_node *node);
+static const css_unit_ctx *fresh_uctx(jsthread *thread,
+		struct dom_node *node, css_unit_ctx *local);
+
+/*
+ * One side's margin, padding and border width from a style (VitaSurf),
+ * through libcss's px accessors, which resolve calc() as layout does; a
+ * percentage needs layout, and keeps what the caller had.
+ */
+typedef uint8_t (*bm_len_fn)(const css_computed_style *, css_fixed *,
+		css_unit *);
+typedef uint8_t (*bm_px_fn)(const css_computed_style *,
+		const css_unit_ctx *, int, int *);
+
+static void bm_side(const css_computed_style *style,
+		const css_unit_ctx *uctx, bm_len_fn len_fn, bm_px_fn px_fn,
+		uint8_t set, int *out)
+{
+	css_fixed len = 0;
+	css_unit unit = CSS_UNIT_PX;
+	int px = 0;
+
+	if (len_fn(style, &len, &unit) != set || unit == CSS_UNIT_PCT)
+		return;
+	if (px_fn(style, uctx, -1, &px) == set)
+		*out = px;
+}
+
+static void box_model_from_style(const css_computed_style *style,
+		const css_unit_ctx *uctx, int side, int *m, int *p, int *b)
+{
+	static const bm_len_fn margin[4] = { css_computed_margin_top,
+		css_computed_margin_right, css_computed_margin_bottom,
+		css_computed_margin_left };
+	static const bm_px_fn margin_px[4] = { css_computed_margin_top_px,
+		css_computed_margin_right_px, css_computed_margin_bottom_px,
+		css_computed_margin_left_px };
+	static const bm_len_fn padding[4] = { css_computed_padding_top,
+		css_computed_padding_right, css_computed_padding_bottom,
+		css_computed_padding_left };
+	static const bm_px_fn padding_px[4] = { css_computed_padding_top_px,
+		css_computed_padding_right_px, css_computed_padding_bottom_px,
+		css_computed_padding_left_px };
+	static const bm_len_fn border[4] = { css_computed_border_top_width,
+		css_computed_border_right_width,
+		css_computed_border_bottom_width,
+		css_computed_border_left_width };
+	static const bm_px_fn border_px[4] = {
+		css_computed_border_top_width_px,
+		css_computed_border_right_width_px,
+		css_computed_border_bottom_width_px,
+		css_computed_border_left_width_px };
+	static uint8_t (*const border_style[4])(const css_computed_style *) = {
+		css_computed_border_top_style, css_computed_border_right_style,
+		css_computed_border_bottom_style,
+		css_computed_border_left_style };
+	uint8_t bs;
+
+	bm_side(style, uctx, margin[side], margin_px[side], CSS_MARGIN_SET, m);
+	bm_side(style, uctx, padding[side], padding_px[side],
+		CSS_PADDING_SET, p);
+	bs = border_style[side](style);
+	if (bs == CSS_BORDER_STYLE_NONE || bs == CSS_BORDER_STYLE_HIDDEN)
+		*b = 0;
+	else
+		bm_side(style, uctx, border[side], border_px[side],
+			CSS_BORDER_WIDTH_WIDTH, b);
+}
+
 static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
@@ -10528,6 +11536,10 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	css_fixed len = 0;
 	css_unit unit = CSS_UNIT_PX;
 	css_color colour = 0;
+	const css_computed_style *style = NULL;
+	const css_unit_ctx *uctx = &thread->htmlc->unit_len_ctx;
+	css_unit_ctx local_uctx;
+	bool fresh = false;
 	JSValue arr;
 	int px;
 
@@ -10536,11 +11548,31 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread)) {
+	if (node == NULL) {
 		return JS_NULL;
 	}
-	box = box_for_node(node);
-	if (box == NULL || box->style == NULL) {
+	/* before the first layout there are no boxes, but there is a
+	 * style to select (VitaSurf) */
+	box = layout_current(thread) ? box_for_node(node) : NULL;
+	/* changed since it was styled: what it is now, from a fresh
+	 * selection (VitaSurf) */
+	if (!layout_current(thread) || style_stale(thread)) {
+		const css_select_results *sel = select_without_box(thread,
+								   node);
+
+		if (sel != NULL &&
+		    sel->styles[CSS_PSEUDO_ELEMENT_NONE] != NULL) {
+			style = sel->styles[CSS_PSEUDO_ELEMENT_NONE];
+			fresh = true;
+			uctx = fresh_uctx(thread, node, &local_uctx);
+		}
+	}
+	if (style == NULL && box != NULL)
+		style = box->style;
+	if (style == NULL && !layout_current(thread)) {
+		return JS_NULL;
+	}
+	if (style == NULL) {
 		/*
 		 * Laid out, but this element got no box. That is what
 		 * display:none looks like from here, and reporting it
@@ -10557,23 +11589,21 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		set_index(ctx, arr, 6, -1);
 		return arr;
 	}
-	css_computed_font_size(box->style, &len, &unit);
-	px = FIXTOINT(css_unit_len2device_px(box->style,
-					     &thread->htmlc->unit_len_ctx,
-					     len, unit));
+	css_computed_font_size(style, &len, &unit);
+	px = FIXTOINT(css_unit_len2device_px(style, uctx, len, unit));
 	if (px <= 0) px = 16;
 
 	arr = JS_NewArray(ctx);
 	set_index(ctx, arr, 0, px);
-	set_index(ctx, arr, 1, (int)css_computed_display_static(box->style));
-	set_index(ctx, arr, 2, (int)css_computed_visibility(box->style));
+	set_index(ctx, arr, 1, (int)css_computed_display_static(style));
+	set_index(ctx, arr, 2, (int)css_computed_visibility(style));
 
 	/*
 	 * set_index takes an int, and a colour with the alpha byte set
 	 * does not fit one on a 32-bit target, so the alpha is split off
 	 * and the prelude puts the two back together.
 	 */
-	if (css_computed_color(box->style, &colour) == CSS_COLOR_COLOR) {
+	if (css_computed_color(style, &colour) == CSS_COLOR_COLOR) {
 		set_index(ctx, arr, 3, (int)(colour & 0xffffff));
 		set_index(ctx, arr, 5, (int)((colour >> 24) & 0xff));
 	} else {
@@ -10581,7 +11611,7 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 		set_index(ctx, arr, 5, -1);
 	}
 	colour = 0;
-	if (css_computed_background_color(box->style, &colour) ==
+	if (css_computed_background_color(style, &colour) ==
 			CSS_BACKGROUND_COLOR_COLOR) {
 		set_index(ctx, arr, 4, (int)(colour & 0xffffff));
 		set_index(ctx, arr, 6, (int)((colour >> 24) & 0xff));
@@ -10595,16 +11625,28 @@ static JSValue win_vita_style(JSContext *ctx, JSValueConst this_val,
 	 * bottom, left each, in slots 7 to 18: what a browser reports for
 	 * them, and what code measuring an element's content box reads.
 	 */
-	{
+	/* from a fresh selection, those of them that are lengths come
+	 * from it: the box's are from before the change, and a new
+	 * element has no box (VitaSurf) */
+	if (box != NULL || fresh) {
 		int side;
 
 		for (side = 0; side < 4; side++) {
-			int m = box->margin[side];
+			int m = 0, p = 0, b = 0;
 
-			set_index(ctx, arr, 7 + side, m == INT_MIN ? 0 : m);
-			set_index(ctx, arr, 11 + side, box->padding[side]);
-			set_index(ctx, arr, 15 + side,
-					box->border[side].width);
+			if (box != NULL) {
+				m = box->margin[side];
+				if (m == INT_MIN)
+					m = 0;
+				p = box->padding[side];
+				b = box->border[side].width;
+			}
+			if (fresh)
+				box_model_from_style(style, uctx, side,
+						     &m, &p, &b);
+			set_index(ctx, arr, 7 + side, m);
+			set_index(ctx, arr, 11 + side, p);
+			set_index(ctx, arr, 15 + side, b);
 		}
 	}
 	return arr;
@@ -10660,6 +11702,37 @@ static void sm_length(char *buf, size_t len, const css_computed_style *s,
 		n = strlen(buf);
 		snprintf(buf + n, len - n, "%%");
 		return;
+	}
+	if (unit == CSS_UNIT_EXPR) {
+		/* a held math function (VitaSurf): one of lengths alone
+		 * is its length below; one with a percentage reads as
+		 * calc(P% + Lpx), as browsers give a sum, its parts found
+		 * by resolving it against two sizes */
+		int a = 0, b = 0;
+		css_fixed per = css_unit_len2device_px(s, uctx, INTTOFIX(1),
+				CSS_UNIT_PX);
+
+		if (!css_computed_expr_px(s, uctx, -1, v, &a)) {
+			css_fixed pct, px;
+			char ps[24], ls[24];
+
+			if (per <= 0 ||
+			    !css_computed_expr_px(s, uctx, 0, v, &a) ||
+			    !css_computed_expr_px(s, uctx, 10000, v, &b)) {
+				snprintf(buf, len, "0px");
+				return;
+			}
+			pct = FDIV(INTTOFIX(b - a), INTTOFIX(100));
+			px = FDIV(INTTOFIX(a), per);
+			sm_number(ps, sizeof(ps), pct);
+			sm_number(ls, sizeof(ls), px < 0 ? -px : px);
+			if (px == 0)
+				snprintf(buf, len, "%s%%", ps);
+			else
+				snprintf(buf, len, "calc(%s%% %c %spx)", ps,
+						px < 0 ? '-' : '+', ls);
+			return;
+		}
 	}
 	sm_number(buf, len, css_unit_len2css_px(s, uctx, v, unit));
 	n = strlen(buf);
@@ -10719,7 +11792,8 @@ static const char *const sm_display[] = { NULL, "inline", "block",
 	"table-row-group", "table-header-group", "table-footer-group",
 	"table-row", "table-column-group", "table-column", "table-cell",
 	"table-caption", "none", "flex", "inline-flex", "grid",
-	"inline-grid", "contents" };
+	"inline-grid", "contents", "flow-root", "-webkit-box",
+	"-webkit-inline-box" };
 static const char *const sm_position[] = { NULL, "static", "relative",
 	"absolute", "fixed", "sticky" };
 static const char *const sm_float[] = { NULL, "left", "right", "none" };
@@ -10774,7 +11848,7 @@ static const char *const sm_object_fit[] = { NULL, "fill", "contain",
 static const char *const sm_text_overflow[] = { NULL, "clip",
 	"ellipsis" };
 static const char *const sm_word_break[] = { NULL, "normal", "break-all",
-	"keep-all" };
+	"keep-all", "break-word" };
 static const char *const sm_overflow_wrap[] = { NULL, "normal",
 	"break-word", "anywhere" };
 static const char *const sm_pointer_events[] = { NULL, "auto", "none" };
@@ -10830,24 +11904,166 @@ static void sm_len_prop(JSContext *ctx, JSValue obj, const char *name,
  * handler was told the defaults, or when it is display: none. It is
  * selected as box construction would select it, from the nearest
  * ancestor that has a style, or from the root, down to the element.
- * The caller destroys the results.
+ *
+ * What was selected is kept, the element's and each ancestor's, until
+ * anything selection reads changes: the tree or an attribute
+ * (vita_dom_gen, which the start of every script bumps too, so a
+ * layout or a :hover between scripts is seen), the sheets, or the box
+ * tree. Home Assistant's cards read theme colours from elements their
+ * script has just made, getComputedStyle and then one getPropertyValue
+ * per colour, and every read selected the whole chain again from the
+ * nearest box: a fifth of the 20 s promise jobs on the Vita that cost
+ * the dashboard its WebSocket. A read now selects only the levels no
+ * read before it has, and a sibling's read finds its ancestors here.
+ *
+ * The results belong to the memo; the caller must not destroy them,
+ * and must not run script while it holds them.
  */
-static css_select_results *select_without_box(jsthread *thread,
+#define STYLE_MEMO_MAX 384u          /* entries, then all are dropped */
+#define STYLE_MEMO_SLOTS 1024u       /* a power of two, over twice MAX */
+#define STYLE_MEMO_CHAIN 64          /* the deepest chain selected */
+
+struct style_memo {
+	struct dom_node *node;            /**< a reference */
+	css_select_results *res;
+	const css_computed_style *root;   /**< the root style it used */
+};
+
+static void style_memo_free(jsthread *thread)
+{
+	uint32_t i;
+
+	for (i = 0; i < thread->style_memo_n; i++) {
+		dom_node_unref(thread->style_memo[i].node);
+		css_select_results_destroy(thread->style_memo[i].res);
+	}
+	thread->style_memo_n = 0;
+	if (thread->style_memo_slots != NULL) {
+		memset(thread->style_memo_slots, 0, STYLE_MEMO_SLOTS *
+		       sizeof(thread->style_memo_slots[0]));
+	}
+}
+
+static uint32_t style_memo_hash(const struct dom_node *node)
+{
+	uint32_t h = (uint32_t)(uintptr_t)node;
+
+	h ^= h >> 4;
+	h *= 2654435761u;
+	return h >> 22;	/* ten bits, STYLE_MEMO_SLOTS */
+}
+
+static struct style_memo *style_memo_find(jsthread *thread,
+		const struct dom_node *node)
+{
+	uint32_t h = style_memo_hash(node);
+	uint16_t at;
+
+	if (thread->style_memo_n == 0)
+		return NULL;
+	while ((at = thread->style_memo_slots[h]) != 0) {
+		if (thread->style_memo[at - 1].node == node)
+			return &thread->style_memo[at - 1];
+		h = (h + 1) & (STYLE_MEMO_SLOTS - 1);
+	}
+	return NULL;
+}
+
+/* Keep a selection; false when there is no room, and then the caller
+ * still owns res. */
+static bool style_memo_add(jsthread *thread, struct dom_node *node,
+		css_select_results *res, const css_computed_style *root)
+{
+	uint32_t h = style_memo_hash(node);
+	struct style_memo *e;
+
+	if (thread->style_memo_n >= STYLE_MEMO_MAX)
+		return false;
+	while (thread->style_memo_slots[h] != 0)
+		h = (h + 1) & (STYLE_MEMO_SLOTS - 1);
+	e = &thread->style_memo[thread->style_memo_n++];
+	e->node = dom_node_ref(node);
+	e->res = res;
+	e->root = root;
+	thread->style_memo_slots[h] = (uint16_t)thread->style_memo_n;
+	return true;
+}
+
+/* Drop what was kept if anything it was selected from has changed,
+ * and make room for a whole chain. False when there is no memo. */
+static bool style_memo_check(jsthread *thread)
+{
+	html_content *htmlc = thread->htmlc;
+	uint32_t done = 0, i;
+
+	if (thread->style_memo == NULL) {
+		thread->style_memo = malloc(STYLE_MEMO_MAX *
+					    sizeof(thread->style_memo[0]));
+		thread->style_memo_slots = calloc(STYLE_MEMO_SLOTS,
+				sizeof(thread->style_memo_slots[0]));
+		if (thread->style_memo == NULL ||
+		    thread->style_memo_slots == NULL) {
+			free(thread->style_memo);
+			free(thread->style_memo_slots);
+			thread->style_memo = NULL;
+			thread->style_memo_slots = NULL;
+			return false;
+		}
+		thread->style_memo_n = 0;
+	}
+	/* a sheet that has arrived changes what an early selection uses */
+	for (i = 0; i < htmlc->stylesheet_count; i++) {
+		if (htmlc->stylesheets[i].sheet != NULL &&
+		    content_get_status(htmlc->stylesheets[i].sheet) ==
+				CONTENT_STATUS_DONE)
+			done++;
+	}
+	if (thread->style_memo_dom_gen != vita_dom_gen ||
+	    thread->style_memo_css_gen != htmlc->css_generation ||
+	    thread->style_memo_sheets != htmlc->stylesheet_count ||
+	    thread->style_memo_done != done ||
+	    thread->style_memo_ctx != (const void *)htmlc->select_ctx ||
+	    thread->style_memo_layout != (const void *)htmlc->layout ||
+	    thread->style_memo_n + STYLE_MEMO_CHAIN > STYLE_MEMO_MAX) {
+		style_memo_free(thread);
+		thread->style_memo_dom_gen = vita_dom_gen;
+		thread->style_memo_css_gen = htmlc->css_generation;
+		thread->style_memo_sheets = htmlc->stylesheet_count;
+		thread->style_memo_done = done;
+		thread->style_memo_ctx = htmlc->select_ctx;
+		thread->style_memo_layout = htmlc->layout;
+	}
+	return true;
+}
+
+static const css_select_results *select_without_box(jsthread *thread,
 		struct dom_node *node)
 {
 	html_content *htmlc = thread->htmlc;
-	struct dom_node *chain[64];
+	struct dom_node *chain[STYLE_MEMO_CHAIN];
 	const css_computed_style *parent = NULL, *root = NULL;
-	css_select_results *above = NULL, *root_res = NULL, *res = NULL;
+	const css_select_results *res = NULL;
+	struct style_memo *kept;
 	struct dom_node *n;
 	int depth = 0, i;
-	bool have_layout = layout_current(thread);
+	bool stale = style_stale(thread);
+	bool have_layout = layout_current(thread) && !stale;
+	css_select_ctx *now = NULL, *kept_ctx = NULL;
+	uint64_t t0;
 
 	/* before conversion html_select_style uses the sheets loaded so
 	 * far */
 	if (htmlc == NULL)
 		return NULL;
-	/* the element and its element ancestors, nearest first */
+	if (!style_memo_check(thread))
+		return NULL;
+	kept = style_memo_find(thread, node);
+	if (kept != NULL) {
+		thread->style_memo_hits++;
+		return kept->res;
+	}
+	/* the element and its element ancestors, nearest first, up to
+	 * one already selected or with a box */
 	n = dom_node_ref(node);
 	while (n != NULL) {
 		struct dom_node *up = NULL;
@@ -10858,59 +12074,108 @@ static css_select_results *select_without_box(jsthread *thread,
 			dom_node_unref(n);
 			break;
 		}
-		if (depth > 0 && have_layout) {
-			struct box *b = box_for_node(n);
+		if (depth > 0) {
+			struct box *b = have_layout ? box_for_node(n) : NULL;
 
 			if (b != NULL && b->style != NULL) {
 				parent = b->style;
+				/* the root's style, which rem and some
+				 * inheritance read, once box construction
+				 * has made it */
+				root = htmlc->unit_len_ctx.root_style;
+				dom_node_unref(n);
+				break;
+			}
+			kept = style_memo_find(thread, n);
+			if (kept != NULL) {
+				parent = kept->res->styles[
+						CSS_PSEUDO_ELEMENT_NONE];
+				root = kept->root;
 				dom_node_unref(n);
 				break;
 			}
 		}
-		if (depth == (int)(sizeof(chain) / sizeof(chain[0]))) {
+		if (depth == STYLE_MEMO_CHAIN) {
 			dom_node_unref(n);
 			goto out;
 		}
 		chain[depth++] = n;
 		dom_node_get_parent_node(n, &up);
+		/* from the top of a shadow tree to its host, whose style
+		 * the tree inherits */
+		{
+			struct dom_node *host = shadow_host_of(up);
+
+			if (host != NULL) {
+				dom_node_unref(up);
+				up = host;
+			}
+		}
 		n = up;
 	}
 	if (depth == 0)
 		return NULL;
-	/* the root's style, which rem and some inheritance read, once
-	 * box construction has made it */
-	if (parent != NULL)
-		root = htmlc->unit_len_ctx.root_style;
-	for (i = depth - 1; i >= 0; i--) {
-		res = html_select_style(htmlc, parent, root, chain[i]);
-		if (res == NULL)
-			break;
-		if (res->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
-			css_select_results_destroy(res);
-			res = NULL;
-			break;
+	t0 = now_ms();
+	/* the sheets as they are now, when the page's context is behind
+	 * them; lent to the selections below and put back after */
+	if (stale) {
+		now = html_select_ctx_now(htmlc);
+		if (now != NULL && now != htmlc->select_ctx) {
+			kept_ctx = htmlc->select_ctx;
+			htmlc->select_ctx = now;
 		}
-		if (root == NULL) {
-			/* the outermost one selected is the root when no
-			 * ancestor had a style */
-			root_res = res;
-			root = res->styles[CSS_PSEUDO_ELEMENT_NONE];
-		} else if (above != NULL && above != root_res) {
-			css_select_results_destroy(above);
-		}
-		above = res;
-		parent = res->styles[CSS_PSEUDO_ELEMENT_NONE];
-		if (i > 0)
-			res = NULL;
 	}
-	if (res == NULL && above != NULL && above != root_res)
-		css_select_results_destroy(above);
-	if (root_res != NULL && root_res != res)
-		css_select_results_destroy(root_res);
+	for (i = depth - 1; i >= 0; i--) {
+		css_select_results *got;
+
+		got = html_select_style(htmlc, parent, root, chain[i]);
+		thread->style_memo_selected++;
+		if (got == NULL) {
+			res = NULL;
+			break;
+		}
+		if (got->styles[CSS_PSEUDO_ELEMENT_NONE] == NULL) {
+			css_select_results_destroy(got);
+			res = NULL;
+			break;
+		}
+		/* the outermost one selected is the root when no ancestor
+		 * had a style */
+		if (root == NULL)
+			root = got->styles[CSS_PSEUDO_ELEMENT_NONE];
+		if (!style_memo_add(thread, chain[i], got, root)) {
+			/* style_memo_check left room for a whole chain */
+			css_select_results_destroy(got);
+			res = NULL;
+			break;
+		}
+		res = got;
+		parent = got->styles[CSS_PSEUDO_ELEMENT_NONE];
+	}
+	if (kept_ctx != NULL)
+		htmlc->select_ctx = kept_ctx;
+	thread->style_memo_ms += (uint32_t)(now_ms() - t0);
 out:
 	for (i = 0; i < depth; i++)
 		dom_node_unref(chain[i]);
 	return res;
+}
+
+/*
+ * The unit context a selected style's lengths resolve in (VitaSurf): the
+ * page's, with the root style the selection itself reached. The page's
+ * holds the root's style from the last box construction, so a rem read
+ * after the root's font size changed came out in the old size.
+ */
+static const css_unit_ctx *fresh_uctx(jsthread *thread,
+		struct dom_node *node, css_unit_ctx *local)
+{
+	struct style_memo *kept = style_memo_find(thread, node);
+
+	memcpy(local, &thread->htmlc->unit_len_ctx, sizeof(*local));
+	if (kept != NULL && kept->root != NULL)
+		local->root_style = kept->root;
+	return local;
 }
 
 static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
@@ -10929,7 +12194,8 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	css_color c = 0, colour = 0;
 	int32_t i32 = 0;
 	uint8_t t;
-	css_select_results *owned = NULL;
+	const css_select_results *owned = NULL;
+	css_unit_ctx local_uctx;
 
 	(void)this_val;
 	if (argc < 1 || thread == NULL || thread->htmlc == NULL)
@@ -10938,10 +12204,11 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	if (node == NULL)
 		return JS_NULL;
 	box = layout_current(thread) ? box_for_node(node) : NULL;
-	if (box != NULL && box->style != NULL) {
+	if (box != NULL && box->style != NULL && !style_stale(thread)) {
 		s = box->style;
 	} else {
-		/* no box yet, or none at all: select it (VitaSurf) */
+		/* no box yet, or none at all, or the document has changed
+		 * since it was styled: select it (VitaSurf) */
 		box = NULL;
 		owned = select_without_box(thread, node);
 		if (owned == NULL)
@@ -10974,8 +12241,6 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			JS_FreeCString(ctx, p);
 		}
 		if (which < 0) {
-			if (owned != NULL)
-				css_select_results_destroy(owned);
 			return JS_NULL;
 		}
 		if (which != CSS_PSEUDO_ELEMENT_NONE) {
@@ -10983,14 +12248,13 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 					box->styles : owned;
 
 			if (r == NULL || r->styles[which] == NULL) {
-				if (owned != NULL)
-					css_select_results_destroy(owned);
 				return JS_NULL;
 			}
 			s = r->styles[which];
 		}
 	}
-	uctx = &thread->htmlc->unit_len_ctx;
+	uctx = owned != NULL ? fresh_uctx(thread, node, &local_uctx) :
+			&thread->htmlc->unit_len_ctx;
 	obj = JS_NewObject(ctx);
 
 	/* the font, which em and line-height resolve against */
@@ -11094,6 +12358,29 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			CSS_BOTTOM_SET, "auto");
 	sm_len_prop(ctx, obj, "left", s, uctx, css_computed_left,
 			CSS_LEFT_SET, "auto");
+	/*
+	 * width and height when there is no up to date box to measure
+	 * (VitaSurf): no box at all, or one from before the style changed.
+	 * A length is its own answer, in px; a percentage or auto needs
+	 * layout, and the prelude answers from the box or with auto.
+	 */
+	if (box == NULL) {
+		css_fixed lv = 0;
+		css_unit lu = CSS_UNIT_PX;
+
+		if (css_computed_width(s, &lv, &lu) == CSS_WIDTH_SET &&
+		    lu != CSS_UNIT_PCT && lu != CSS_UNIT_CALC) {
+			sm_length(buf, sizeof(buf), s, uctx, lv, lu);
+			sm_set(ctx, obj, "width", buf);
+		}
+		lv = 0;
+		lu = CSS_UNIT_PX;
+		if (css_computed_height(s, &lv, &lu) == CSS_HEIGHT_SET &&
+		    lu != CSS_UNIT_PCT && lu != CSS_UNIT_CALC) {
+			sm_length(buf, sizeof(buf), s, uctx, lv, lu);
+			sm_set(ctx, obj, "height", buf);
+		}
+	}
 	sm_len_prop(ctx, obj, "minWidth", s, uctx, css_computed_min_width,
 			CSS_MIN_WIDTH_SET, "auto");
 	sm_len_prop(ctx, obj, "minHeight", s, uctx, css_computed_min_height,
@@ -11307,6 +12594,72 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 	{
+		/* lengths a page reads back, each as browsers resolve it, a
+		 * calc() of lengths to pixels and one with a percentage as
+		 * calc(P% + Lpx) (VitaSurf) */
+		css_fixed h = 0, vv = 0;
+		css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
+		char hb[48], vb[48];
+
+		if (css_computed_outline_offset(s, &h, &hu) !=
+				CSS_OUTLINE_OFFSET_SET)
+			h = 0, hu = CSS_UNIT_PX;
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_set(ctx, obj, "outlineOffset", hb);
+
+		h = vv = 0;
+		hu = vu = CSS_UNIT_PCT;
+		css_computed_background_position(s, &h, &hu, &vv, &vu);
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_length(vb, sizeof(vb), s, uctx, vv, vu);
+		snprintf(buf, sizeof(buf), "%s %s", hb, vb);
+		sm_set(ctx, obj, "backgroundPosition", buf);
+
+		h = vv = 0;
+		hu = vu = CSS_UNIT_PX;
+		css_computed_border_spacing(s, &h, &hu, &vv, &vu);
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_length(vb, sizeof(vb), s, uctx, vv, vu);
+		snprintf(buf, sizeof(buf), "%s %s", hb, vb);
+		sm_set(ctx, obj, "borderSpacing", buf);
+
+		if (css_computed_object_position(s, &h, &hu, &vv, &vu) !=
+				CSS_OBJECT_POSITION_SET) {
+			h = vv = INTTOFIX(50);
+			hu = vu = CSS_UNIT_PCT;
+		}
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_length(vb, sizeof(vb), s, uctx, vv, vu);
+		snprintf(buf, sizeof(buf), "%s %s", hb, vb);
+		sm_set(ctx, obj, "objectPosition", buf);
+
+		if (css_computed_text_decoration_thickness(s, &h, &hu) ==
+				CSS_TEXT_DECORATION_THICKNESS_SET) {
+			sm_length(hb, sizeof(hb), s, uctx, h, hu);
+			sm_set(ctx, obj, "textDecorationThickness", hb);
+		} else {
+			sm_set(ctx, obj, "textDecorationThickness", "auto");
+		}
+		if (css_computed_text_underline_offset(s, &h, &hu) ==
+				CSS_TEXT_UNDERLINE_OFFSET_SET) {
+			sm_length(hb, sizeof(hb), s, uctx, h, hu);
+			sm_set(ctx, obj, "textUnderlineOffset", hb);
+		} else {
+			sm_set(ctx, obj, "textUnderlineOffset", "auto");
+		}
+
+		if (css_computed_stroke_width(s, &h, &hu) !=
+				CSS_STROKE_WIDTH_SET)
+			h = INTTOFIX(1), hu = CSS_UNIT_PX;
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_set(ctx, obj, "strokeWidth", hb);
+		if (css_computed_stroke_dashoffset(s, &h, &hu) !=
+				CSS_STROKE_DASHOFFSET_SET)
+			h = 0, hu = CSS_UNIT_PX;
+		sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		sm_set(ctx, obj, "strokeDashoffset", hb);
+	}
+	{
 		uint8_t os = css_computed_outline_style(s);
 		uint8_t ot;
 
@@ -11446,9 +12799,67 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			sm_set(ctx, obj, "content", buf);
 		}
 	}
-	if (owned != NULL)
-		css_select_results_destroy(owned);
 	return obj;
+}
+
+/*
+ * __vitaQuietAttr(element, name, value): set an attribute, or remove it
+ * when value is null, for the engine's own use (VitaSurf). The layout
+ * sees it as any attribute change; no MutationObserver hears of it, as
+ * the page did not make it. The prelude marks a shadow host with the
+ * styles it holds this way, so their rules can be kept to it.
+ */
+static JSValue win_vita_quiet_attr(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *node;
+	const char *name, *value = NULL;
+	dom_string *key, *val = NULL, *old = NULL;
+
+	(void)this_val;
+	if (argc < 3)
+		return JS_UNDEFINED;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL)
+		return JS_UNDEFINED;
+	{
+		dom_node_type t = DOM_TEXT_NODE;
+
+		if (dom_node_get_node_type(node, &t) != DOM_NO_ERR ||
+		    t != DOM_ELEMENT_NODE)
+			return JS_UNDEFINED;
+	}
+	name = JS_ToCString(ctx, argv[1]);
+	if (name == NULL)
+		return JS_UNDEFINED;
+	if (!JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]))
+		value = JS_ToCString(ctx, argv[2]);
+	key = to_dom_string(name);
+	if (value != NULL)
+		val = to_dom_string(value);
+	if (key != NULL) {
+		dom_element_get_attribute(node, key, &old);
+		if (val != NULL ? !(old != NULL &&
+				    dom_string_isequal(old, val)) :
+		    old != NULL) {
+			if (val != NULL)
+				dom_element_set_attribute(node, key, val);
+			else
+				dom_element_remove_attribute(node, key);
+			attr_stamp_touch(node);
+			mark_attr_dirty(ctx, node, key, old);
+		}
+		if (old != NULL)
+			dom_string_unref(old);
+		dom_string_unref(key);
+	}
+	if (val != NULL)
+		dom_string_unref(val);
+	if (value != NULL)
+		JS_FreeCString(ctx, value);
+	JS_FreeCString(ctx, name);
+	return JS_UNDEFINED;
 }
 
 /*
@@ -11464,6 +12875,8 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct dom_node *node;
 	struct box *box;
+	const css_computed_style *style;
+	const css_select_results *owned = NULL;
 	const char *name;
 	lwc_string *lname = NULL;
 	char small[256];
@@ -11475,11 +12888,10 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 	if (argc < 2 || thread == NULL || thread->htmlc == NULL)
 		return ret;
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread))
+	if (node == NULL)
 		return ret;
-	box = box_for_node(node);
-	if (box == NULL || box->style == NULL)
-		return ret;
+	/* the name first: turning an object into a string runs the
+	 * page's code, which can drop the selections kept for reads */
 	name = JS_ToCString(ctx, argv[1]);
 	if (name == NULL)
 		return ret;
@@ -11488,12 +12900,29 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 		return ret;
 	}
 	JS_FreeCString(ctx, name);
-	if (css_computed_custom_property(box->style, lname, buf,
+	box = layout_current(thread) ? box_for_node(node) : NULL;
+	if (box != NULL && box->style != NULL && !style_stale(thread)) {
+		style = box->style;
+	} else {
+		/*
+		 * No box yet, or none at all (VitaSurf): select its style
+		 * as getComputedStyle's other properties do. An element made
+		 * in this script, one under display: none, or any before the
+		 * page's first layout read every variable as "", where a
+		 * browser selects the style: Home Assistant's cards read
+		 * their theme colours from elements they have just made.
+		 */
+		owned = select_without_box(thread, node);
+		if (owned == NULL)
+			goto out;
+		style = owned->styles[CSS_PSEUDO_ELEMENT_NONE];
+	}
+	if (css_computed_custom_property(style, lname, buf,
 			sizeof(small), &len) == CSS_OK) {
 		if (len >= sizeof(small)) {
 			buf = malloc(len + 1);
 			if (buf != NULL && css_computed_custom_property(
-					box->style, lname, buf, len + 1,
+					style, lname, buf, len + 1,
 					&len) != CSS_OK) {
 				free(buf);
 				buf = NULL;
@@ -11506,6 +12935,7 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 				free(buf);
 		}
 	}
+out:
 	lwc_string_unref(lname);
 	return ret;
 }
@@ -11531,7 +12961,10 @@ static JSValue win_vita_scroll_element(JSContext *ctx, JSValueConst this_val,
 	if (argc < 3 || thread == NULL || thread->htmlc == NULL)
 		return JS_FALSE;
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread))
+	if (node == NULL)
+		return JS_FALSE;
+	layout_flush(thread);
+	if (!layout_current(thread))
 		return JS_FALSE;
 	box = box_for_node(node);
 	if (box == NULL || box->style == NULL)
@@ -11635,6 +13068,21 @@ static JSValue win_vita_set_sheet_text(JSContext *ctx, JSValueConst this_val,
  * style sheets (VitaSurf). focus() from script moves it as a tap does;
  * a field that takes typing also matches :focus-visible, as in Chrome.
  */
+/*
+ * __vitaShadowTemplates(): how many <template shadowrootmode> elements
+ * the document parsers have made, which the prelude turns into shadow
+ * roots when the count moves (VitaSurf).
+ */
+static JSValue win_vita_shadow_templates(JSContext *ctx,
+					 JSValueConst this_val,
+					 int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	return JS_NewUint32(ctx, dom_hubbub_shadow_templates);
+}
+
 static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
@@ -11666,7 +13114,983 @@ static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 	html_set_dynamic(thread->htmlc, NSCSS_FOCUS, node, text);
+	/* :focus matches elsewhere now, for styles kept for reads */
+	vita_dom_gen++;
 	return JS_UNDEFINED;
+}
+
+/*
+ * Reads that found nothing on window, navigator, document and the like
+ * (VitaSurf). QuickJS tells qjs_miss_hook of every read that walks a
+ * whole prototype chain without finding the property; the ones on these
+ * objects are kept, the last MISS_RING of them, and an uncaught error's
+ * report names them, so a log says which property a page wanted that is
+ * not here instead of leaving it to be guessed. A page's realm registers
+ * its objects with __vitaWatchMisses; pages come and go, so the oldest
+ * registration gives way to the newest.
+ */
+#define MISS_WATCH 48
+#define MISS_RING 24
+static void *miss_watch_obj[MISS_WATCH];
+static char miss_watch_label[MISS_WATCH][16];
+static unsigned miss_watch_next;
+static char miss_ring[MISS_RING][64];
+static unsigned miss_ring_next;
+/* Every read that found nothing, on any object, in the order they came:
+   the last MISS_ANY, each its runtime, its property, as an atom held
+   until the slot is reused or the runtime goes, and the object's class
+   or its label if it is watched. When new Proxy is handed a non-object
+   they are written out, and that says what the page read just before
+   it, wherever it read it. */
+#define MISS_ANY 32
+static struct {
+	JSRuntime *rt;
+	JSAtom prop;
+	JSClassID cls;
+	int label;
+} miss_any[MISS_ANY];
+static unsigned miss_any_next;
+/* set while this browser reads a page's globals for its own log */
+static bool miss_quiet;
+static char miss_seq_at_proxy[MISS_ANY * 70];
+
+/* Let go of the atoms a runtime about to be freed holds here. */
+static void qjs_miss_drop(JSRuntime *rt)
+{
+	unsigned i;
+
+	for (i = 0; i < MISS_ANY; i++) {
+		if (miss_any[i].rt != NULL && miss_any[i].rt == rt) {
+			JS_FreeAtomRT(rt, miss_any[i].prop);
+			miss_any[i].rt = NULL;
+		}
+	}
+}
+
+static void qjs_miss_any_add(JSContext *ctx, JSValueConst obj, JSAtom prop,
+			     int label)
+{
+	JSRuntime *rt = JS_GetRuntime(ctx);
+	JSClassID cls = JS_GetClassID(obj);
+	unsigned last = (miss_any_next + MISS_ANY - 1) % MISS_ANY;
+	unsigned slot;
+
+	/* the same read again at once is one entry */
+	if (miss_any_next > 0 && miss_any[last].rt == rt &&
+	    miss_any[last].prop == prop && miss_any[last].cls == cls &&
+	    miss_any[last].label == label) {
+		return;
+	}
+	slot = miss_any_next++ % MISS_ANY;
+	if (miss_any[slot].rt != NULL) {
+		JS_FreeAtomRT(miss_any[slot].rt, miss_any[slot].prop);
+	}
+	miss_any[slot].rt = rt;
+	miss_any[slot].prop = JS_DupAtom(ctx, prop);
+	miss_any[slot].cls = cls;
+	miss_any[slot].label = label;
+}
+
+/* A name this browser's own code reads, not the page's: its helpers,
+   the prelude's event flags and its handler slots. */
+static bool qjs_miss_ours(const char *name)
+{
+	return strncmp(name, "__vita", 6) == 0 ||
+		strncmp(name, "__vs", 4) == 0 ||
+		strcmp(name, "__shadow") == 0 ||
+		strncmp(name, "__on_", 5) == 0 ||
+		strncmp(name, "__onw_", 6) == 0 ||
+		strcmp(name, "__stopNow") == 0 ||
+		strcmp(name, "__cancelBubble") == 0;
+}
+
+/* The reads kept, oldest first, as "label.name" or "Class.name". */
+static void qjs_miss_seq_copy(JSContext *ctx, char *out, size_t size)
+{
+	JSRuntime *rt = JS_GetRuntime(ctx);
+	size_t n = 0;
+	unsigned i, start;
+
+	out[0] = '\0';
+	start = miss_any_next > MISS_ANY ? miss_any_next - MISS_ANY : 0;
+	for (i = start; i < miss_any_next; i++) {
+		unsigned k = i % MISS_ANY;
+		const char *name, *cname = NULL;
+		JSAtom catom = JS_ATOM_NULL;
+		int w;
+
+		if (miss_any[k].rt != rt) {
+			continue;
+		}
+		name = JS_AtomToCString(ctx, miss_any[k].prop);
+		if (name == NULL) {
+			continue;
+		}
+		if (qjs_miss_ours(name)) {
+			JS_FreeCString(ctx, name);
+			continue;
+		}
+		if (miss_any[k].label < 0) {
+			catom = JS_GetClassName(rt, miss_any[k].cls);
+			if (catom != JS_ATOM_NULL) {
+				cname = JS_AtomToCString(ctx, catom);
+			}
+		}
+		w = snprintf(out + n, size - n, "%s%s.%s", n > 0 ? ", " : "",
+			     miss_any[k].label >= 0 ?
+			     miss_watch_label[miss_any[k].label] :
+			     (cname != NULL ? cname : "?"), name);
+		JS_FreeCString(ctx, name);
+		if (cname != NULL) {
+			JS_FreeCString(ctx, cname);
+		}
+		if (catom != JS_ATOM_NULL) {
+			JS_FreeAtom(ctx, catom);
+		}
+		if (w < 0 || (size_t)w >= size - n) {
+			break;
+		}
+		n += (size_t)w;
+	}
+}
+
+/*
+ * An own data property of an object as a C string, or NULL (VitaSurf).
+ * A getter is not called and a proxy is not asked: the throw hook must
+ * not run script.
+ */
+static const char *own_data_cstring(JSContext *ctx, JSValueConst obj,
+				    const char *name)
+{
+	JSPropertyDescriptor desc;
+	JSAtom atom;
+	const char *s = NULL;
+	int r;
+
+	if (!JS_IsObject(obj) || JS_IsProxy(obj)) {
+		return NULL;
+	}
+	atom = JS_NewAtom(ctx, name);
+	if (atom == JS_ATOM_NULL) {
+		return NULL;
+	}
+	r = JS_GetOwnProperty(ctx, &desc, obj, atom);
+	JS_FreeAtom(ctx, atom);
+	if (r <= 0) {
+		return NULL;
+	}
+	if (!(desc.flags & JS_PROP_GETSET) && JS_IsString(desc.value)) {
+		s = JS_ToCString(ctx, desc.value);
+	}
+	JS_FreeValue(ctx, desc.value);
+	JS_FreeValue(ctx, desc.getter);
+	JS_FreeValue(ctx, desc.setter);
+	return s;
+}
+
+/*
+ * Each error the engine raises itself, whether or not the page catches
+ * it (VitaSurf). A script that catches its own failures -- a site's
+ * browser check reporting to its server, say -- left no trace in the
+ * log; this names the error and where it was raised, a page's first 40
+ * and not the same one twice running.
+ */
+#define THROWS_LOGGED_MAX 40
+/* A line of the log at most this long, in pieces (VitaSurf). */
+static void log_in_pieces(const char *head, const char *text)
+{
+	size_t len = strlen(text), at = 0;
+
+	while (at < len) {
+		size_t n = len - at > 400 ? 400 : len - at;
+
+		vita_log("%s%.*s", head, (int)n, text + at);
+		at += n;
+	}
+}
+
+/*
+ * console.warn and console.error (VitaSurf): the message, and for a
+ * page's first five, where it was said from and what was read just
+ * before that found nothing. A warning a site's own code prints when
+ * it gives up -- "Cannot find Widget" from claude.ai's check -- said
+ * neither, so what it had looked for could not be told. The prelude's
+ * own report of an uncaught error says both already.
+ */
+#define WARNS_EXPLAINED_MAX 5
+static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue r = console_log(ctx, this_val, argc, argv);
+	JSValue err;
+	const char *first, *stack;
+	char seq[MISS_ANY * 70];
+	char where[400], at_url[4][256];
+	unsigned at_line[4] = {0, 0, 0, 0}, at_col[4] = {0, 0, 0, 0};
+	int k;
+	size_t n = 0;
+	const char *p;
+	int lines = 0;
+	bool ours;
+
+	if (thread == NULL || argc < 1 ||
+	    thread->warns_explained >= WARNS_EXPLAINED_MAX) {
+		return r;
+	}
+	first = JS_ToCString(ctx, argv[0]);
+	ours = first == NULL || strncmp(first, "uncaught", 8) == 0;
+	if (first != NULL) JS_FreeCString(ctx, first);
+	if (ours) {
+		return r;
+	}
+	thread->warns_explained++;
+	/* the page's frames: an error made here has the stack of its
+	   caller, below this function and the prelude's wrapper */
+	where[0] = '\0';
+	err = JS_NewError(ctx);
+	stack = JS_IsException(err) ? NULL :
+		own_data_cstring(ctx, err, "stack");
+	for (p = stack; p != NULL && *p != '\0' && lines < 5; ) {
+		const char *e = strchr(p, '\n');
+		size_t len = e != NULL ? (size_t)(e - p) : strlen(p);
+
+		while (len > 0 && *p == ' ') {
+			p++;
+			len--;
+		}
+		if (len > 0 && !prof_has(p, len, "<prelude>") &&
+		    !prof_has(p, len, "(native)")) {
+			/* each page frame's position, for its code: the
+			   first is often a page's own logging helper */
+			if (lines < 4 && len > 2 && p[len - 1] == ')') {
+				const char *o = p + len - 1, *c2 = NULL,
+					*c1 = NULL;
+
+				while (o > p && *o != '(') {
+					if (*o == ':') {
+						if (c2 == NULL) c2 = o;
+						else if (c1 == NULL) c1 = o;
+					}
+					o--;
+				}
+				if (*o == '(' && c1 != NULL &&
+				    (size_t)(c1 - o - 1) < sizeof(at_url[0])) {
+					memcpy(at_url[lines], o + 1,
+					       (size_t)(c1 - o - 1));
+					at_url[lines][c1 - o - 1] = '\0';
+					at_line[lines] = (unsigned)strtoul(
+						c1 + 1, NULL, 10);
+					at_col[lines] = (unsigned)strtoul(
+						c2 + 1, NULL, 10);
+				}
+			}
+			if (n + len + 3 < sizeof(where)) {
+				memcpy(where + n, " | ", 3);
+				memcpy(where + n + 3, p, len);
+				n += len + 3;
+				where[n] = '\0';
+			}
+			lines++;
+		}
+		p = e != NULL ? e + 1 : NULL;
+	}
+	if (stack != NULL) JS_FreeCString(ctx, stack);
+	JS_FreeValue(ctx, err);
+	vita_log("console: that was said from%s", n > 0 ? where :
+		 " nowhere script can see");
+	for (k = 0; k < 4; k++) {
+		JSValue args[4], code;
+		const char *text;
+		char head[64];
+
+		if (at_line[k] == 0) {
+			continue;
+		}
+		args[0] = JS_NewString(ctx, at_url[k]);
+		args[1] = JS_NewUint32(ctx, at_line[k]);
+		args[2] = JS_NewUint32(ctx, at_col[k]);
+		/* far enough back to take in the test that led here: for a
+		   page's first warning, the whole of a minified function */
+		args[3] = JS_NewUint32(ctx, thread->warns_explained == 1 ?
+				       1500 : 350);
+		code = win_vita_source_excerpt(ctx, JS_UNDEFINED, 4, args);
+		JS_FreeValue(ctx, args[0]);
+		text = JS_IsString(code) ? JS_ToCString(ctx, code) : NULL;
+		if (text != NULL && text[0] != '\0') {
+			snprintf(head, sizeof(head),
+				 "console: frame %d, the code at column %u: ",
+				 k + 1, at_col[k]);
+			log_in_pieces(head, text);
+		}
+		if (text != NULL) JS_FreeCString(ctx, text);
+		JS_FreeValue(ctx, code);
+	}
+	qjs_miss_seq_copy(ctx, seq, sizeof(seq));
+	if (seq[0] != '\0') {
+		log_in_pieces("console: read just before it and not here, "
+			      "oldest first: ", seq);
+	}
+	return r;
+}
+
+static void qjs_throw_hook(JSContext *ctx, JSValueConst error)
+{
+	static bool busy;
+	static char last[160];
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *msg, *stack, *name = NULL;
+	JSValue proto;
+	char where[300], key[160];
+	size_t n = 0;
+	const char *p;
+	int lines = 0;
+
+	if (busy || thread == NULL ||
+	    thread->throws_logged >= THROWS_LOGGED_MAX ||
+	    JS_IsUncatchableError(error)) {
+		return;
+	}
+	busy = true;
+	msg = own_data_cstring(ctx, error, "message");
+	stack = own_data_cstring(ctx, error, "stack");
+	proto = JS_GetPrototype(ctx, error);
+	if (!JS_IsException(proto)) {
+		name = own_data_cstring(ctx, proto, "name");
+		JS_FreeValue(ctx, proto);
+	}
+	/* the first three frames of the stack, on one line */
+	where[0] = '\0';
+	for (p = stack; p != NULL && *p != '\0' && lines < 3; lines++) {
+		const char *e = strchr(p, '\n');
+		size_t len = e != NULL ? (size_t)(e - p) : strlen(p);
+
+		while (len > 0 && *p == ' ') {
+			p++;
+			len--;
+		}
+		if (len > 0 && n + len + 3 < sizeof(where)) {
+			memcpy(where + n, " | ", 3);
+			memcpy(where + n + 3, p, len);
+			n += len + 3;
+			where[n] = '\0';
+		}
+		p = e != NULL ? e + 1 : NULL;
+	}
+	snprintf(key, sizeof(key), "%s%s", msg != NULL ? msg : "",
+		 where);
+	/* the module loader's own, which says what it could not load on
+	   lines of its own */
+	if (msg != NULL && (strcmp(msg, "a module script") == 0 ||
+			    strcmp(msg, "imports still arriving") == 0 ||
+			    strncmp(msg, "could not load module", 21) == 0)) {
+		key[0] = '\0';
+	}
+	if (key[0] != '\0' && strcmp(key, last) != 0) {
+		memcpy(last, key, sizeof(last));
+		thread->throws_logged++;
+		vita_log("qjs: the engine threw %s: %s%s%s",
+			 name != NULL ? name : "Error",
+			 msg != NULL ? msg : "", where,
+			 thread->throws_logged == THROWS_LOGGED_MAX ?
+			 " (the last this page logs)" : "");
+	}
+	if (msg != NULL) JS_FreeCString(ctx, msg);
+	if (stack != NULL) JS_FreeCString(ctx, stack);
+	if (name != NULL) JS_FreeCString(ctx, name);
+	busy = false;
+}
+
+static void qjs_miss_hook(JSContext *ctx, JSValueConst obj, JSAtom prop)
+{
+	void *p;
+	unsigned i;
+
+	if (miss_quiet) {
+		return;
+	}
+	if (prop == JS_ATOM_NULL) {
+		/* new Proxy was handed a non-object */
+		qjs_miss_seq_copy(ctx, miss_seq_at_proxy,
+				  sizeof(miss_seq_at_proxy));
+		return;
+	}
+	p = JS_VALUE_GET_PTR(obj);
+	for (i = 0; i < MISS_WATCH; i++) {
+		if (miss_watch_obj[i] == p && p != NULL)
+			break;
+	}
+	qjs_miss_any_add(ctx, obj, prop, i < MISS_WATCH ? (int)i : -1);
+
+	for (i = 0; i < MISS_WATCH; i++) {
+		const char *name;
+		char entry[64];
+
+		if (miss_watch_obj[i] != p || p == NULL)
+			continue;
+		name = JS_AtomToCString(ctx, prop);
+		if (name == NULL)
+			return;
+		/* this browser's own reads are not what a page wants */
+		if (qjs_miss_ours(name)) {
+			JS_FreeCString(ctx, name);
+			return;
+		}
+		snprintf(entry, sizeof(entry), "%s.%s", miss_watch_label[i],
+			 name);
+		JS_FreeCString(ctx, name);
+		/* each name once: a page's feature checks repeat */
+		for (i = 0; i < MISS_RING; i++) {
+			if (strcmp(miss_ring[i], entry) == 0)
+				return;
+		}
+		memcpy(miss_ring[miss_ring_next % MISS_RING], entry,
+		       sizeof(entry));
+		miss_ring_next++;
+		return;
+	}
+}
+
+/* __vitaWatchMisses(obj, label): note reads on obj that find nothing */
+static JSValue win_vita_watch_misses(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	const char *label;
+	unsigned slot;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	label = JS_ToCString(ctx, argv[1]);
+	if (label == NULL) {
+		return JS_EXCEPTION;
+	}
+	slot = miss_watch_next++ % MISS_WATCH;
+	miss_watch_obj[slot] = JS_VALUE_GET_PTR(argv[0]);
+	snprintf(miss_watch_label[slot], sizeof(miss_watch_label[slot]),
+		 "%s", label);
+	JS_FreeCString(ctx, label);
+	return JS_UNDEFINED;
+}
+
+/* __vitaMisses(): the reads kept, oldest first, comma separated; and
+   forget them, so the next report has only its own */
+static JSValue win_vita_misses(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	char out[MISS_RING * 66 + MISS_ANY * 70 + 64];
+	size_t n = 0;
+	unsigned i, start;
+
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	out[0] = '\0';
+	start = miss_ring_next > MISS_RING ? miss_ring_next - MISS_RING : 0;
+	for (i = start; i < miss_ring_next; i++) {
+		const char *e = miss_ring[i % MISS_RING];
+		int w = snprintf(out + n, sizeof(out) - n, "%s%s",
+				 n > 0 ? ", " : "", e);
+
+		if (w < 0 || (size_t)w >= sizeof(out) - n) {
+			break;
+		}
+		n += (size_t)w;
+	}
+	memset(miss_ring, 0, sizeof(miss_ring));
+	miss_ring_next = 0;
+	/* and the reads just before a failed new Proxy, when there was one */
+	if (miss_seq_at_proxy[0] != '\0') {
+		size_t n = strlen(out);
+
+		snprintf(out + n, sizeof(out) - n,
+			 "%s| read just before new Proxy failed, on anything, oldest first: %s",
+			 n > 0 ? " " : "", miss_seq_at_proxy);
+		miss_seq_at_proxy[0] = '\0';
+	}
+	return JS_NewString(ctx, out);
+}
+
+/*
+ * The reads on window, navigator, document and the like that found
+ * nothing, written out when a page closes (VitaSurf). They were only
+ * written with an uncaught error, and a page that waits for what is not
+ * here throws nothing: the claude.ai challenge's widget asked its page
+ * for parameters and the page never answered, with nothing in the log
+ * to say what it was looking for. Names only, the last MISS_RING, from
+ * whichever pages read them since the last report.
+ */
+static void log_in_pieces(const char *head, const char *text);
+
+static void miss_ring_report(void)
+{
+	char out[MISS_RING * 66 + 8];
+	size_t n = 0;
+	unsigned i, start;
+
+	if (miss_ring_next == 0)
+		return;
+	out[0] = '\0';
+	start = miss_ring_next > MISS_RING ? miss_ring_next - MISS_RING : 0;
+	for (i = start; i < miss_ring_next; i++) {
+		int w = snprintf(out + n, sizeof(out) - n, "%s%s",
+				 n > 0 ? ", " : "", miss_ring[i % MISS_RING]);
+
+		if (w < 0 || (size_t)w >= sizeof(out) - n)
+			break;
+		n += (size_t)w;
+	}
+	memset(miss_ring, 0, sizeof(miss_ring));
+	miss_ring_next = 0;
+	log_in_pieces("qjs: read and not found here, oldest first: ", out);
+}
+
+/* What marks a popover shown: libdom user data under this key, which
+   nscss's :popover-open reads (VitaSurf). */
+static int popover_mark;
+
+static dom_string *popover_key(void)
+{
+	static dom_string *key;
+
+	if (key == NULL &&
+	    dom_string_create_interned((const uint8_t *)"__ns_key_popover_open",
+				       21, &key) != DOM_NO_ERR) {
+		key = NULL;
+	}
+	return key;
+}
+
+/*
+ * __vitaPopover(el, open): show or hide a popover (VitaSurf), and with
+ * el alone, answer whether it is shown. The state
+ * is the element's own, as a browser keeps it, and not an attribute the
+ * page could read or watch: :popover-open in the style sheets matches
+ * it, and the UA sheet's [popover]:not(:popover-open) hides a popover
+ * that is not shown. The popover attribute is noted as changed, with the
+ * value it has, so the rules naming :popover-open are matched again in
+ * place rather than the tree being built again.
+ */
+static JSValue win_vita_popover(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	dom_string *key = popover_key();
+	void *prev = NULL;
+	bool open;
+
+	(void)this_val;
+	if (argc < 1 || key == NULL) {
+		return JS_FALSE;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !node_is_element(node)) {
+		return JS_FALSE;
+	}
+	if (argc < 2) {
+		if (dom_node_get_user_data(node, key, &prev) != DOM_NO_ERR) {
+			prev = NULL;
+		}
+		return JS_NewBool(ctx, prev != NULL);
+	}
+	open = JS_ToBool(ctx, argv[1]);
+	if (dom_node_set_user_data(node, key, open ? &popover_mark : NULL,
+				   NULL, &prev) != DOM_NO_ERR ||
+	    (prev != NULL) == open) {
+		return JS_UNDEFINED;
+	}
+	vita_dom_gen++;
+	if (thread != NULL) {
+		dom_string *attr = NULL, *value = NULL;
+
+		if (dom_string_create_interned((const uint8_t *)"popover", 7,
+					       &attr) == DOM_NO_ERR) {
+			if (dom_element_get_attribute(node, attr, &value) !=
+			    DOM_NO_ERR) {
+				value = NULL;
+			}
+			thread->dom_dirty = true;
+			attr_journal_add(thread, node, attr, value, false);
+			if (value != NULL) {
+				dom_string_unref(value);
+			}
+			dom_string_unref(attr);
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+/*
+ * Shadow roots (VitaSurf). A shadow root is a document fragment the host
+ * holds: its children are a tree of their own, which the page's
+ * document lookups do not enter, which is drawn in the host's place, and
+ * whose events go on to the host. The prelude checks what the
+ * specification asks of attachShadow before it calls this.
+ *
+ * __vitaAttachShadow(element, closed): the new root, or null when the
+ * element has one already.
+ */
+/*
+ * The first few shadow roots a page makes, and what became of iframes put
+ * in them, in the log (VitaSurf): a widget that renders into a closed
+ * shadow root says nothing when it gives up, and the log is all there is
+ * to see it by on the Vita.
+ */
+#define SHADOW_NOTES 12
+
+static void shadow_note(jsthread *thread, const char *text)
+{
+	if (thread == NULL || thread->shadow_notes >= SHADOW_NOTES) {
+		return;
+	}
+	thread->shadow_notes++;
+	vita_log("shadow: %s%s", text,
+		 thread->shadow_notes == SHADOW_NOTES ?
+		 " (no more of these for this page)" : "");
+}
+
+/* __vitaShadowNote(text): a line for the above, from the prelude */
+static JSValue win_vita_shadow_note(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *text;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL ||
+	    thread->shadow_notes >= SHADOW_NOTES) {
+		return JS_UNDEFINED;
+	}
+	text = JS_ToCString(ctx, argv[0]);
+	if (text != NULL) {
+		shadow_note(thread, text);
+		JS_FreeCString(ctx, text);
+	}
+	return JS_UNDEFINED;
+}
+
+/*
+ * __vitaAtob(s) and __vitaBtoa(s): the work of atob() and btoa(), which
+ * the prelude wraps to throw its DOMException when these answer null
+ * (VitaSurf). In script, atob was a quarter of the six seconds Cloudflare's
+ * challenge spent in script on the Vita: a loop of indexOf and string
+ * appends for every character of what it decodes.
+ */
+static int b64_value(unsigned char c)
+{
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+
+/* forgiving-base64 decode, as the HTML standard has it */
+static JSValue win_vita_atob(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	const char *in;
+	size_t len, i, n = 0, o = 0;
+	unsigned char *clean = NULL, *out = NULL;
+	uint32_t bits = 0;
+	int nbits = 0;
+	JSValue ret = JS_NULL;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	in = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (in == NULL) {
+		return JS_EXCEPTION;
+	}
+	clean = js_malloc(ctx, len + 1);
+	if (clean == NULL) {
+		JS_FreeCString(ctx, in);
+		return JS_EXCEPTION;
+	}
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)in[i];
+
+		if (c == ' ' || c == '\t' || c == '\n' || c == '\f' ||
+		    c == '\r') {
+			continue;
+		}
+		clean[n++] = c;
+	}
+	JS_FreeCString(ctx, in);
+	if (n % 4 == 0 && n > 0 && clean[n - 1] == '=') {
+		n--;
+		if (n > 0 && clean[n - 1] == '=') {
+			n--;
+		}
+	}
+	if (n % 4 == 1) {
+		goto done;
+	}
+	/* every byte of a non-ASCII character is refused here too */
+	for (i = 0; i < n; i++) {
+		if (b64_value(clean[i]) < 0) {
+			goto done;
+		}
+	}
+	/* each byte at or above 0x80 is two bytes of UTF-8 */
+	out = js_malloc(ctx, (n / 4 + 1) * 6 + 1);
+	if (out == NULL) {
+		js_free(ctx, clean);
+		return JS_EXCEPTION;
+	}
+	for (i = 0; i < n; i++) {
+		bits = (bits << 6) | (uint32_t)b64_value(clean[i]);
+		nbits += 6;
+		if (nbits >= 8) {
+			unsigned b;
+
+			nbits -= 8;
+			b = (bits >> nbits) & 0xffu;
+			if (b < 0x80) {
+				out[o++] = (unsigned char)b;
+			} else {
+				out[o++] = (unsigned char)(0xc0 | (b >> 6));
+				out[o++] = (unsigned char)(0x80 | (b & 0x3f));
+			}
+		}
+	}
+	ret = JS_NewStringLen(ctx, (const char *)out, o);
+done:
+	js_free(ctx, out);
+	js_free(ctx, clean);
+	return ret;
+}
+
+static JSValue win_vita_btoa(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				"abcdefghijklmnopqrstuvwxyz0123456789+/";
+	const char *in;
+	size_t len, i, n = 0, o = 0;
+	unsigned char *bytes;
+	char *out;
+	JSValue ret = JS_NULL;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	in = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (in == NULL) {
+		return JS_EXCEPTION;
+	}
+	bytes = js_malloc(ctx, len + 1);
+	if (bytes == NULL) {
+		JS_FreeCString(ctx, in);
+		return JS_EXCEPTION;
+	}
+	/* back from UTF-8 to code units, each of which must be Latin-1 */
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)in[i];
+
+		if (c < 0x80) {
+			bytes[n++] = c;
+		} else if ((c == 0xc2 || c == 0xc3) && i + 1 < len) {
+			bytes[n++] = (unsigned char)(((c & 0x1f) << 6) |
+					((unsigned char)in[i + 1] & 0x3f));
+			i++;
+		} else {
+			JS_FreeCString(ctx, in);
+			js_free(ctx, bytes);
+			return JS_NULL;
+		}
+	}
+	JS_FreeCString(ctx, in);
+	out = js_malloc(ctx, (n + 2) / 3 * 4 + 1);
+	if (out == NULL) {
+		js_free(ctx, bytes);
+		return JS_EXCEPTION;
+	}
+	for (i = 0; i + 2 < n; i += 3) {
+		uint32_t v = ((uint32_t)bytes[i] << 16) |
+			     ((uint32_t)bytes[i + 1] << 8) | bytes[i + 2];
+
+		out[o++] = A[(v >> 18) & 63];
+		out[o++] = A[(v >> 12) & 63];
+		out[o++] = A[(v >> 6) & 63];
+		out[o++] = A[v & 63];
+	}
+	if (n - i == 1) {
+		uint32_t v = (uint32_t)bytes[i] << 16;
+
+		out[o++] = A[(v >> 18) & 63];
+		out[o++] = A[(v >> 12) & 63];
+		out[o++] = '=';
+		out[o++] = '=';
+	} else if (n - i == 2) {
+		uint32_t v = ((uint32_t)bytes[i] << 16) |
+			     ((uint32_t)bytes[i + 1] << 8);
+
+		out[o++] = A[(v >> 18) & 63];
+		out[o++] = A[(v >> 12) & 63];
+		out[o++] = A[(v >> 6) & 63];
+		out[o++] = '=';
+	}
+	ret = JS_NewStringLen(ctx, out, o);
+	js_free(ctx, out);
+	js_free(ctx, bytes);
+	return ret;
+}
+
+/*
+ * __vitaMessageNote(text): the first messages a window is sent, and
+ * what became of each (VitaSurf). A page and the frames it talks to by
+ * postMessage say nothing when a message goes astray: one dropped for
+ * its target origin, or sent before anyone listens, just waits forever.
+ */
+#define MESSAGE_NOTES 16
+
+static JSValue win_vita_message_note(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *text;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL ||
+	    thread->message_notes >= MESSAGE_NOTES) {
+		return JS_UNDEFINED;
+	}
+	text = JS_ToCString(ctx, argv[0]);
+	if (text != NULL) {
+		unsigned listening = 0;
+		struct js_listener *l;
+
+		/* who on this window hears it */
+		for (l = thread->win_listeners; l != NULL; l = l->win_next) {
+			if (l->on_window && !l->dead && l->type != NULL &&
+			    dom_string_byte_length(l->type) == 7 &&
+			    memcmp(dom_string_data(l->type), "message",
+				   7) == 0) {
+				listening++;
+			}
+		}
+		thread->message_notes++;
+		vita_log("message: %s, %u listening%s", text, listening,
+			 thread->message_notes == MESSAGE_NOTES ?
+			 " (no more of these for this page)" : "");
+		JS_FreeCString(ctx, text);
+	}
+	return JS_UNDEFINED;
+}
+
+static JSValue win_vita_attach_shadow(JSContext *ctx, JSValueConst this_val,
+				      int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *node;
+	dom_document_fragment *root = NULL;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL || !node_is_element(node)) {
+		return JS_NULL;
+	}
+	if (dom_element_attach_shadow((struct dom_element *) node,
+				      argc > 1 && JS_ToBool(ctx, argv[1]) == 1,
+				      &root) != DOM_NO_ERR || root == NULL) {
+		return JS_NULL;
+	}
+	{
+		jsthread *thread = JS_GetContextOpaque(ctx);
+
+		if (thread != NULL && thread->shadow_notes < SHADOW_NOTES) {
+			dom_string *name = NULL;
+			char line[96];
+
+			if (dom_node_get_node_name(node, &name) != DOM_NO_ERR)
+				name = NULL;
+			snprintf(line, sizeof(line),
+				 "<%.*s> has %s shadow root, %s",
+				 name != NULL ? (int) (dom_string_byte_length(
+					name) < 40 ? dom_string_byte_length(
+					name) : 40) : 1,
+				 name != NULL ? dom_string_data(name) : "?",
+				 argc > 1 && JS_ToBool(ctx, argv[1]) == 1 ?
+				 "a closed" : "an open",
+				 node_in_page(thread, node) ?
+				 "in the page" : "not in the page yet");
+			if (name != NULL)
+				dom_string_unref(name);
+			shadow_note(thread, line);
+		}
+	}
+	/* the host's children are no longer what is drawn in it */
+	mark_tree_dirty(ctx, "attachShadow", node, NULL, true);
+	vita_dom_gen++;
+	r = wrap_node(ctx, (struct dom_node *) root);
+	dom_node_unref(root);
+	return r;
+}
+
+/* __vitaShadowRoot(element): its shadow root, open or closed, or null */
+static JSValue win_vita_shadow_root(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *node, *root;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	root = shadow_root_of(node);
+	if (root == NULL) {
+		return JS_NULL;
+	}
+	r = wrap_node(ctx, root);
+	dom_node_unref(root);
+	return r;
+}
+
+/* __vitaShadowHost(fragment): the host of a shadow root, or null; with a
+   second argument true, whether its mode is "closed" instead */
+static JSValue win_vita_shadow_host(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	struct dom_node *node, *host;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	host = shadow_host_of(node);
+	if (argc > 1 && JS_ToBool(ctx, argv[1]) == 1) {
+		bool closed = host != NULL && dom_document_fragment_is_closed(
+				(dom_document_fragment *) node);
+
+		if (host != NULL) {
+			dom_node_unref(host);
+		}
+		return JS_NewBool(ctx, closed);
+	}
+	if (host == NULL) {
+		return JS_NULL;
+	}
+	r = wrap_node(ctx, host);
+	dom_node_unref(host);
+	return r;
 }
 
 /*
@@ -11697,6 +14121,7 @@ static JSValue win_vita_element_from_point(JSContext *ctx,
 	    JS_ToInt32(ctx, &y, argv[1]) != 0) {
 		return JS_NULL;
 	}
+	layout_flush(thread);
 	if (!layout_current(thread)) {
 		return JS_NULL;
 	}
@@ -12514,7 +14939,15 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	node = JS_GetOpaque(argv[0], node_class_id);
-	if (node == NULL || !layout_current(thread)) {
+	if (node == NULL) {
+		return JS_NULL;
+	}
+	/* a second argument that is true reads the layout as it is: the
+	 * IntersectionObserver's own polling, which must not force one */
+	if (argc < 2 || !JS_ToBool(ctx, argv[1])) {
+		layout_flush(thread);
+	}
+	if (!layout_current(thread)) {
 		return JS_NULL;
 	}
 	box = box_for_node(node);
@@ -12553,6 +14986,20 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 	set_index(ctx, arr, 9, sh);
 	set_index(ctx, arr, 10, box->scroll_x != NULL ? scrollbar_get_offset(box->scroll_x) : 0);
 	set_index(ctx, arr, 11, box->scroll_y != NULL ? scrollbar_get_offset(box->scroll_y) : 0);
+	/* whether it is pinned to the viewport: it, or a box it is in, is
+	 * position: fixed, so the page's scroll does not move it */
+	{
+		const struct box *f;
+		int pinned = 0;
+
+		for (f = box; f != NULL && !pinned; f = f->parent) {
+			if (f->style != NULL && !(f->flags & ANCHORED) &&
+			    css_computed_position(f->style) ==
+					CSS_POSITION_FIXED)
+				pinned = 1;
+		}
+		set_index(ctx, arr, 12, pinned);
+	}
 	return arr;
 }
 
@@ -12651,7 +15098,7 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	dom_string *type_dom;
 	const char *type;
 	JSValue v;
-	bool bubbles, cancelable, success = false, prevented;
+	bool bubbles, cancelable, composed, success = false, prevented;
 	struct js_dispatch d;
 
 	(void)this_val;
@@ -12685,11 +15132,17 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	v = JS_GetPropertyStr(ctx, argv[1], "cancelable");
 	cancelable = JS_ToBool(ctx, v) == 1;
 	JS_FreeValue(ctx, v);
+	/* whether it leaves a shadow tree: a script's event only when it
+	   says so, as the browser's own say (VitaSurf) */
+	v = JS_GetPropertyStr(ctx, argv[1], "composed");
+	composed = JS_ToBool(ctx, v) == 1;
+	JS_FreeValue(ctx, v);
 	if (dom_event_create(&evt) != DOM_NO_ERR) {
 		dom_string_unref(type_dom);
 		return JS_TRUE;
 	}
 	dom_event_init(evt, type_dom, bubbles, cancelable);
+	dom_event_set_composed(evt, composed);
 	dom_string_unref(type_dom);
 
 	d.evt = evt;
@@ -12763,10 +15216,25 @@ static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
 				    JSValueConst *resolving_funcs,
 				    void *opaque);
 
+/*
+ * A page's scripts and modules are compiled with their function bodies
+ * left for each function's first call (VitaSurf; JSLazyFunc in
+ * QuickJS). The whole script is still parsed, so a syntax error is
+ * reported when it loads, as in a browser; most of a large bundle is
+ * never called, and its bytecode was time and memory. Not the prelude,
+ * which is kept without its source.
+ */
+#ifndef QJS_LAZY
+#define QJS_LAZY JS_EVAL_FLAG_LAZY_FUNCTIONS
+#endif
+
 static JSValue bc_load(JSContext *ctx, const char *url,
 		       const char *src, size_t srclen);
 static void bc_store(JSContext *ctx, const char *url,
 		     const char *src, size_t srclen, JSValueConst fn);
+static void bc_store_now(JSContext *ctx, const char *url,
+			 const char *src, size_t srclen, JSValueConst fn);
+static void bc_serialise_context(JSContext *ctx);
 static JSValue bc_load_module(JSContext *ctx, const char *url,
 			      const char *src, size_t srclen);
 static void bc_store_module(JSContext *ctx, const char *url,
@@ -12845,7 +15313,7 @@ static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
 				     JS_EVAL_FLAG_COMPILE_ONLY);
 			if (!JS_IsException(fn)) {
 				fn = prelude_strip_source(ctx, fn);
-				bc_store(ctx, u->url, src, u->len, fn);
+				bc_store_now(ctx, u->url, src, u->len, fn);
 			}
 		} else {
 			how = "card";
@@ -13010,9 +15478,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, console, "log",
 			  JS_NewCFunction(ctx, console_log, "log", 1));
 	JS_SetPropertyStr(ctx, console, "warn",
-			  JS_NewCFunction(ctx, console_log, "warn", 1));
+			  JS_NewCFunction(ctx, console_warn, "warn", 1));
 	JS_SetPropertyStr(ctx, console, "error",
-			  JS_NewCFunction(ctx, console_log, "error", 1));
+			  JS_NewCFunction(ctx, console_warn, "error", 1));
 	JS_SetPropertyStr(ctx, console, "info",
 			  JS_NewCFunction(ctx, console_log, "info", 1));
 	JS_SetPropertyStr(ctx, console, "debug",
@@ -13090,6 +15558,9 @@ static bool setup_globals(jsthread *thread)
 			  JS_NewArrayBuffer(ctx, (uint8_t *)vita_gens,
 					    sizeof(vita_gens), NULL, NULL,
 					    false));
+	JS_SetPropertyStr(ctx, global, "__vitaFindById",
+			  JS_NewCFunction(ctx, win_vita_find_by_id,
+					  "__vitaFindById", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaElementStep",
 			  JS_NewCFunction(ctx, win_vita_element_step,
 					  "__vitaElementStep", 2));
@@ -13110,12 +15581,46 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaModuleState", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaDomGen",
 			  JS_NewCFunction(ctx, win_vita_dom_gen, "__vitaDomGen", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaSourceExcerpt",
+			  JS_NewCFunction(ctx, win_vita_source_excerpt,
+					  "__vitaSourceExcerpt", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaSetSheetText",
 			  JS_NewCFunction(ctx, win_vita_set_sheet_text,
 					  "__vitaSetSheetText", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaMessageNote",
+			  JS_NewCFunction(ctx, win_vita_message_note,
+					  "__vitaMessageNote", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaAtob",
+			  JS_NewCFunction(ctx, win_vita_atob, "__vitaAtob", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaBtoa",
+			  JS_NewCFunction(ctx, win_vita_btoa, "__vitaBtoa", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaShadowNote",
+			  JS_NewCFunction(ctx, win_vita_shadow_note,
+					  "__vitaShadowNote", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaShadowTemplates",
+			  JS_NewCFunction(ctx, win_vita_shadow_templates,
+					  "__vitaShadowTemplates", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaSetFocus",
 			  JS_NewCFunction(ctx, win_vita_set_focus,
 					  "__vitaSetFocus", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaWatchMisses",
+			  JS_NewCFunction(ctx, win_vita_watch_misses,
+					  "__vitaWatchMisses", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaMisses",
+			  JS_NewCFunction(ctx, win_vita_misses,
+					  "__vitaMisses", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaAttachShadow",
+			  JS_NewCFunction(ctx, win_vita_attach_shadow,
+					  "__vitaAttachShadow", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaShadowRoot",
+			  JS_NewCFunction(ctx, win_vita_shadow_root,
+					  "__vitaShadowRoot", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaShadowHost",
+			  JS_NewCFunction(ctx, win_vita_shadow_host,
+					  "__vitaShadowHost", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaPopover",
+			  JS_NewCFunction(ctx, win_vita_popover,
+					  "__vitaPopover", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaCanvasPath",
@@ -13173,6 +15678,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaScrollElement",
 			  JS_NewCFunction(ctx, win_vita_scroll_element,
 					  "__vitaScrollElement", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaQuietAttr",
+			  JS_NewCFunction(ctx, win_vita_quiet_attr,
+					  "__vitaQuietAttr", 3));
 	JS_SetPropertyStr(ctx, global, "__vitaCustomProp",
 			  JS_NewCFunction(ctx, win_vita_custom_prop,
 					  "__vitaCustomProp", 2));
@@ -13216,6 +15724,12 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaTopGlobal",
 			  JS_NewCFunction(ctx, win_vita_top_global,
 					  "__vitaTopGlobal", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaLayoutState",
+			  JS_NewCFunction(ctx, win_vita_layout_state,
+					  "__vitaLayoutState", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaFrameOf",
+			  JS_NewCFunction(ctx, win_vita_frame_of,
+					  "__vitaFrameOf", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaFrameElement",
 			  JS_NewCFunction(ctx, win_vita_frame_element,
 					  "__vitaFrameElement", 0));
@@ -13301,8 +15815,8 @@ static bool setup_globals(jsthread *thread)
 					     JS_EVAL_FLAG_COMPILE_ONLY);
 				if (!JS_IsException(fn)) {
 					fn = prelude_strip_source(ctx, fn);
-					bc_store(ctx, PRELUDE_URL, src, len,
-						 fn);
+					bc_store_now(ctx, PRELUDE_URL, src,
+						     len, fn);
 				}
 			} else {
 				how = "card";
@@ -13325,7 +15839,11 @@ static bool setup_globals(jsthread *thread)
 			JS_FreeValue(ctx, fn);
 			ok = false;
 		} else {
+			/* its own reads that find nothing are not the
+			   page's */
+			miss_quiet = true;
 			r = JS_EvalFunction(ctx, fn);
+			miss_quiet = false;
 			if (JS_IsException(r)) {
 				qjs_report_exception_src(ctx, "<prelude>",
 							 src, len);
@@ -13457,21 +15975,20 @@ nserror js_newheap(int timeout, jsheap **heap)
 	}
 	/*
 	 * The timeout is NetSurf's script_timeout option, in seconds, and 0
-	 * means no limit. The Vita runs script roughly 25 times slower than
-	 * a desktop, so a budget short enough to be useful there stops work
-	 * a page legitimately needs here; raise anything below the floor.
-	 * A Choices file written by an earlier build is read after the
-	 * bundled one, so the floor rather than the option default is what
-	 * actually takes effect on a device that has been used.
+	 * means no limit. On the device there is none (VitaSurf): a browser
+	 * does not stop a page's script by itself, it says the page is busy
+	 * and lets the user choose, and the busy overlay does that here,
+	 * Circle stopping the script. A limit stopped real work: the Vita
+	 * runs script some 25 times slower than a desktop, and claude.ai's
+	 * Cloudflare check computed for more than the 20 s it allowed and
+	 * then reported its widget crashed. A Choices file written by an
+	 * earlier build carries script_timeout:20, so the option is not
+	 * read. The native harness keeps it, so that a test can drive a
+	 * budget of one second.
 	 */
 #ifdef __vita__
-	if (timeout > 0 && timeout < SCRIPT_TIMEOUT_MIN) {
-		timeout = SCRIPT_TIMEOUT_MIN;
-	}
+	timeout = 0;
 #endif
-	/* the floor is the device's; the native harness keeps the option
-	 * as given so that a test can drive a budget of one second
-	 * (VitaSurf) */
 	ret->timeout = timeout;
 	/*
 	 * The runtime itself is made when the window's first page wants a
@@ -13497,6 +16014,10 @@ static nserror heap_start(jsheap *ret)
 	 */
 	ret->pool = qjs_pool_create();
 	ret->rt = JS_NewRuntime2(qjs_pool_functions(), ret->pool);
+	if (ret->rt != NULL) {
+		JS_SetPropertyMissHook(ret->rt, qjs_miss_hook);
+		JS_SetEngineThrowHook(ret->rt, qjs_throw_hook);
+	}
 	if (ret->rt == NULL) {
 		qjs_pool_destroy(ret->pool);
 		ret->pool = NULL;
@@ -13506,6 +16027,8 @@ static nserror heap_start(jsheap *ret)
 		qjs_memory_rt = ret->rt;
 	/* the first touch of a lazy property runs its unit (lazy.js) */
 	JS_SetLazyPropertyHandler(ret->rt, qjs_lazy_handler);
+	/* transfers keep moving through a long compile */
+	JS_SetCompileTickHandler(ret->rt, qjs_compile_tick, NULL);
 	/*
 	 * Keep a page's scripts within a sensible slice of the heap: 96 MB
 	 * of the 176 MB heap there used to be, the same share of the heap
@@ -13580,6 +16103,7 @@ void js_destroyheap(jsheap *heap)
 	if (heap->rt != NULL) {
 		if (qjs_memory_rt == heap->rt)
 			qjs_memory_rt = NULL;
+		qjs_miss_drop(heap->rt);
 		JS_FreeRuntime(heap->rt);
 		qjs_pool_destroy(heap->pool);
 	}
@@ -13684,6 +16208,7 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 		return NULL;
 	}
 	ret->ctx = JS_NewContext(heap->rt);
+	JS_GetLazyCompileStats(heap->rt, &ret->lazy_count0, &ret->lazy_ms0);
 	if (ret->ctx == NULL) {
 		free(ret);
 		return NULL;
@@ -13781,6 +16306,7 @@ nserror js_closethread(jsthread *thread)
 	struct js_timer *t;
 	struct js_listener *l;
 	uint64_t t0 = 0, t1 = 0;
+	uint32_t lazy_n, lazy_ms;
 
 	if (thread == NULL || thread->closed) {
 		return NSERROR_OK;
@@ -13847,6 +16373,7 @@ nserror js_closethread(jsthread *thread)
 	}
 	xhr_close_all(thread);
 	free_wrappers(thread);
+	native_events_free(thread);
 	if (!JS_IsUninitialized(thread->import_map)) {
 		JS_FreeValue(thread->ctx, thread->import_map);
 		thread->import_map = JS_UNINITIALIZED;
@@ -13858,6 +16385,8 @@ nserror js_closethread(jsthread *thread)
 	 * one of them takes NULL as "no page".
 	 */
 	JS_SetContextOpaque(thread->ctx, NULL);
+	/* its scripts' cache entries, with what it compiled */
+	bc_serialise_context(thread->ctx);
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
 	JS_RunGC(thread->heap->rt);
@@ -13865,8 +16394,24 @@ nserror js_closethread(jsthread *thread)
 	vitasurf_ms_teardown += (unsigned)(t1 - t0);
 	gap_report();
 	gap_reset();
-	vita_log("qjs: page closed in %u ms, runtime memory now %u KB",
-		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt));
+	JS_GetLazyCompileStats(thread->heap->rt, &lazy_n, &lazy_ms);
+	miss_ring_report();
+	if (thread->flushes > 0 || thread->flush_refused > 0 ||
+	    thread->flush_waited > 0) {
+		vita_log("qjs: %u geometry reads laid the page out first "
+			 "and %u found a rebuild waiting for the page to "
+			 "load, %u ms in all; %u answered from the last "
+			 "layout (from an input event, past the budget, or "
+			 "on a page whose rebuild costs too much)",
+			 thread->flushes, thread->flush_waited,
+			 thread->flush_total_ms, thread->flush_refused);
+	}
+	vita_log("qjs: page closed in %u ms, runtime memory now %u KB; "
+		 "%u functions compiled when first called while it was "
+		 "open, in %u ms",
+		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt),
+		 (unsigned)(lazy_n - thread->lazy_count0),
+		 (unsigned)(lazy_ms - thread->lazy_ms0));
 	return NSERROR_OK;
 }
 
@@ -13896,6 +16441,8 @@ void js_destroythread(jsthread *thread)
 	js_closethread(thread); /* releases the context if still open */
 	l = thread->listeners;
 	thread->listeners = NULL;
+	thread->win_listeners = NULL;
+	thread->win_mutation = 0;
 	while (l != NULL) {
 		struct js_listener *next = l->next;
 
@@ -13941,6 +16488,7 @@ void js_destroythread(jsthread *thread)
 		jsheap *heap = thread->heap;
 		if (qjs_memory_rt == heap->rt)
 			qjs_memory_rt = NULL;
+		qjs_miss_drop(heap->rt);
 		JS_FreeRuntime(heap->rt);
 		qjs_pool_destroy(heap->pool);
 		free(heap);
@@ -14368,6 +16916,10 @@ struct bc_pending {
 	uint8_t *out;		/* a plain malloc: the runtime that
 				 * serialised it goes with its page */
 	size_t out_len;
+	/* not serialised yet (QJS_LAZY): the compiled script or module,
+	 * in its page's context */
+	JSContext *ctx;
+	JSValue val;
 };
 
 static struct bc_pending *bc_queue, **bc_queue_tail = &bc_queue;
@@ -14375,6 +16927,7 @@ static size_t bc_queue_bytes;
 static bool bc_flush_scheduled;
 
 static void bc_flush_callback(void *p);
+static bool bc_pending_serialise(struct bc_pending *q);
 
 /** Write one serialised entry to the card, beside the index. */
 static void bc_write_entry(const char *path, const struct bc_header *h,
@@ -14452,36 +17005,40 @@ static void bc_flush_callback(void *p)
 	if (bc_queue == NULL) {
 		bc_queue_tail = &bc_queue;
 	}
+	if (q->ctx != NULL && !bc_pending_serialise(q)) {
+		free(q);
+		goto next;
+	}
 	bc_queue_bytes -= q->out_len;
 	bc_write_entry(q->path, &q->h, q->out, q->out_len,
 		       q->h.format == BC_FORMAT_MODULE);
 	free(q->out);
 	free(q);
+next:
 	if (bc_queue != NULL) {
 		bc_flush_scheduled = true;
 		guit->misc->schedule(20, bc_flush_callback, NULL);
 	}
 }
 
-/** Keep the compiled form of this source for the next visit. */
-static void bc_store_kind(JSContext *ctx, const char *url,
-			  const char *src, size_t srclen, JSValueConst fn,
-			  bool module)
+/**
+ * Serialise an entry kept as a value (QJS_LAZY): what the page has
+ * compiled by now. False if it is not to be kept after all.
+ */
+static bool bc_pending_serialise(struct bc_pending *q)
 {
-	struct bc_pending *q;
+	JSContext *ctx = q->ctx;
 	uint8_t *out;
 	size_t out_len = 0;
-	uint64_t hash;
-	uint64_t t0;
+	uint64_t t0 = now_ms();
 
-	if (srclen < (module ? BC_MIN_MODULE_SRC : BC_MIN_SRC) ||
-	    url == NULL || url[0] == '<' || vitasurf_cache_disabled()) {
-		return;
-	}
-	t0 = now_ms();
-	out = JS_WriteObject(ctx, &out_len, fn, JS_WRITE_OBJ_BYTECODE);
+	q->ctx = NULL;
+	out = JS_WriteObject(ctx, &out_len, q->val, JS_WRITE_OBJ_BYTECODE);
+	JS_FreeValue(ctx, q->val);
+	q->val = JS_UNDEFINED;
 	if (out == NULL) {
-		return;
+		JS_FreeValue(ctx, JS_GetException(ctx));
+		return false;
 	}
 	if (out_len == 0 || out_len > BC_MAX_ENTRY ||
 	    bc_queue_bytes + out_len > BC_QUEUE_BUDGET) {
@@ -14492,19 +17049,58 @@ static void bc_store_kind(JSContext *ctx, const char *url,
 				 (unsigned)(bc_queue_bytes / 1024));
 		}
 		js_free(ctx, out);
-		return;
+		return false;
 	}
-	q = calloc(1, sizeof(*q));
-	if (q != NULL) {
-		q->out = malloc(out_len);
-	}
-	if (q == NULL || q->out == NULL) {
-		free(q);
+	q->out = malloc(out_len);
+	if (q->out == NULL) {
 		js_free(ctx, out);
-		return;
+		return false;
 	}
 	memcpy(q->out, out, out_len);
 	js_free(ctx, out);
+	q->h.bc_len = (uint32_t)out_len;
+	q->out_len = out_len;
+	bc_queue_bytes += out_len;
+	vitasurf_js_bc_queued_kb += (unsigned)(out_len / 1024);
+	vitasurf_ms_js_bc_serialise += (unsigned)(now_ms() - t0);
+	return true;
+}
+
+/**
+ * Serialise every entry still kept as a value in ctx, which is about
+ * to go (QJS_LAZY), dropping those that are not to be kept.
+ */
+static void bc_serialise_context(JSContext *ctx)
+{
+	struct bc_pending **pq = &bc_queue, *q;
+
+	while ((q = *pq) != NULL) {
+		if (q->ctx == ctx && !bc_pending_serialise(q)) {
+			*pq = q->next;
+			free(q);
+			continue;
+		}
+		pq = &q->next;
+	}
+	bc_queue_tail = pq;
+}
+
+/** Keep the compiled form of this source for the next visit. */
+static void bc_store_kind(JSContext *ctx, const char *url,
+			  const char *src, size_t srclen, JSValueConst fn,
+			  bool module, bool later)
+{
+	struct bc_pending *q;
+	uint64_t hash;
+
+	if (srclen < (module ? BC_MIN_MODULE_SRC : BC_MIN_SRC) ||
+	    url == NULL || url[0] == '<' || vitasurf_cache_disabled()) {
+		return;
+	}
+	q = calloc(1, sizeof(*q));
+	if (q == NULL) {
+		return;
+	}
 	bc_path(q->path, sizeof(q->path), url);
 	hash = bc_hash(src, srclen);
 	q->h.magic = BC_MAGIC;
@@ -14512,13 +17108,22 @@ static void bc_store_kind(JSContext *ctx, const char *url,
 	q->h.src_len = (uint32_t)srclen;
 	q->h.src_hash_lo = (uint32_t)(hash & 0xffffffffu);
 	q->h.src_hash_hi = (uint32_t)(hash >> 32);
-	q->h.bc_len = (uint32_t)out_len;
-	q->out_len = out_len;
+	q->val = JS_UNDEFINED;
+	/*
+	 * A page's script, its functions compiled when they are first
+	 * called: serialised when it goes to the card, once the page has
+	 * been quiet a while, or when the page closes, so the functions it
+	 * called by then are kept compiled and the next visit does not
+	 * compile them again.
+	 */
+	q->ctx = ctx;
+	q->val = JS_DupValue(ctx, fn);
+	if (!later && !bc_pending_serialise(q)) {
+		free(q);
+		return;
+	}
 	*bc_queue_tail = q;
 	bc_queue_tail = &q->next;
-	bc_queue_bytes += out_len;
-	vitasurf_js_bc_queued_kb += (unsigned)(out_len / 1024);
-	vitasurf_ms_js_bc_serialise += (unsigned)(now_ms() - t0);
 	if (!bc_flush_scheduled) {
 		bc_flush_scheduled = true;
 		guit->misc->schedule(BC_FIRST_WAIT_MS, bc_flush_callback, NULL);
@@ -14534,7 +17139,14 @@ static JSValue bc_load(JSContext *ctx, const char *url,
 static void bc_store(JSContext *ctx, const char *url,
 		     const char *src, size_t srclen, JSValueConst fn)
 {
-	bc_store_kind(ctx, url, src, srclen, fn, false);
+	bc_store_kind(ctx, url, src, srclen, fn, false, QJS_LAZY != 0);
+}
+
+/* the prelude's: it has no functions left for later */
+static void bc_store_now(JSContext *ctx, const char *url,
+			 const char *src, size_t srclen, JSValueConst fn)
+{
+	bc_store_kind(ctx, url, src, srclen, fn, false, false);
 }
 
 static JSValue bc_load_module(JSContext *ctx, const char *url,
@@ -14546,7 +17158,7 @@ static JSValue bc_load_module(JSContext *ctx, const char *url,
 static void bc_store_module(JSContext *ctx, const char *url,
 			    const char *src, size_t srclen, JSValueConst fn)
 {
-	bc_store_kind(ctx, url, src, srclen, fn, true);
+	bc_store_kind(ctx, url, src, srclen, fn, true, QJS_LAZY != 0);
 }
 
 /*
@@ -15523,6 +18135,95 @@ static bool script_is(const struct html_script *sc, const char *url)
 	return sc->asked != NULL && strcmp(nsurl_access(sc->asked), url) == 0;
 }
 
+/*
+ * The source around a position in one of the page's scripts, for the log
+ * (VitaSurf): __vitaSourceExcerpt(url, line, column). An error thrown in
+ * a timer or an event handler is reported with its stack alone, and the
+ * frame names in a minified script say nothing; the code around the
+ * column says what the failing line was doing. "" when the script is not
+ * the page's or the position is not in it.
+ */
+static JSValue win_vita_source_excerpt(JSContext *ctx, JSValueConst this_val,
+				       int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	const char *url;
+	uint32_t line = 0, col = 0;
+	const uint8_t *src = NULL;
+	size_t len = 0, i, start = 0, pos, from, to, n = 0;
+	uint32_t before = 100;
+	char *buf;
+	JSValue out;
+	unsigned int k;
+
+	(void)this_val;
+	if (argc < 3 || thread == NULL || thread->htmlc == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	/* how much to show before the position: a fourth argument, for a
+	   check that sits further back than an error's own expression */
+	if (argc > 3 && JS_ToUint32(ctx, &before, argv[3]) == 0 &&
+	    before > 1500) {
+		before = 1500;
+	}
+	if (JS_ToUint32(ctx, &line, argv[1]) < 0 ||
+	    JS_ToUint32(ctx, &col, argv[2]) < 0 || line == 0) {
+		return JS_NewString(ctx, "");
+	}
+	url = JS_ToCString(ctx, argv[0]);
+	if (url == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	for (k = 0; k < thread->htmlc->scripts_count && src == NULL; k++) {
+		struct html_script *sc = &thread->htmlc->scripts[k];
+
+		if (script_is(sc, url) &&
+		    content_get_status(sc->data.handle) ==
+				CONTENT_STATUS_DONE) {
+			src = content_get_source_data(sc->data.handle, &len);
+		}
+	}
+	JS_FreeCString(ctx, url);
+	if (src == NULL || len == 0) {
+		return JS_NewString(ctx, "");
+	}
+	for (i = 0; i < len && line > 1; i++) {
+		if (src[i] == '\n') {
+			line--;
+			start = i + 1;
+		}
+	}
+	if (line > 1) {
+		return JS_NewString(ctx, "");
+	}
+	pos = start + (col > 0 ? col - 1 : 0);
+	if (pos > len) {
+		return JS_NewString(ctx, "");
+	}
+	from = pos > before ? pos - before : 0;
+	if (from < start) from = start;
+	to = pos + 60 < len ? pos + 60 : len;
+	buf = malloc((size_t)before + 80);
+	if (buf == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	for (i = from; i < to && n < (size_t)before + 72; i++) {
+		char c = (char)src[i];
+
+		if (c == '\n') break;
+		if (i == pos) {
+			/* where the column points */
+			buf[n++] = '>';
+			buf[n++] = '>';
+		}
+		buf[n++] = (c == '\t' || c == '\r') ? ' ' : c;
+	}
+	buf[n] = 0;
+	out = JS_NewString(ctx, buf);
+	free(buf);
+	return out;
+}
+
 static enum mod_src module_source(jsthread *thread, const char *url,
 				  const uint8_t **data, size_t *size)
 {
@@ -15951,7 +18652,7 @@ static JSModuleDef *local_module(JSContext *ctx, jsthread *thread,
 		return NULL;
 	}
 	fn = JS_Eval(ctx, src, len, name, JS_EVAL_TYPE_MODULE |
-		     JS_EVAL_FLAG_COMPILE_ONLY);
+		     JS_EVAL_FLAG_COMPILE_ONLY | QJS_LAZY);
 	JS_FreeCString(ctx, src);
 	if (JS_IsException(fn)) {
 		vita_log("qjs: module at '%.80s' did not compile", name);
@@ -16075,7 +18776,8 @@ static JSModuleDef *qjs_module_loader(JSContext *ctx, const char *name,
 
 				fn = JS_Eval(ctx, src, size, name,
 					     JS_EVAL_TYPE_MODULE |
-					     JS_EVAL_FLAG_COMPILE_ONLY);
+					     JS_EVAL_FLAG_COMPILE_ONLY |
+					     QJS_LAZY);
 				vitasurf_ms_js_import_compile +=
 					(unsigned)(now_ms() - t_c0);
 				vitasurf_js_import_compiles++;
@@ -16204,6 +18906,11 @@ static void js_free_deferred(jsthread *thread)
 	thread->deferred = NULL;
 	mod_deps_free(thread);
 	sel_cache_free(thread);
+	style_memo_free(thread);
+	free(thread->style_memo);
+	free(thread->style_memo_slots);
+	thread->style_memo = NULL;
+	thread->style_memo_slots = NULL;
 	tags_free(thread);
 	id_index_free(thread);
 	if (thread->deferred_scheduled) {
@@ -16276,7 +18983,7 @@ static void module_retry_callback(void *p)
 		} else if (JS_IsUndefined(fn)) {
 			fn = JS_Eval(thread->ctx, d->src, d->len, d->name,
 				     JS_EVAL_TYPE_MODULE |
-				     JS_EVAL_FLAG_COMPILE_ONLY);
+				     JS_EVAL_FLAG_COMPILE_ONLY | QJS_LAZY);
 			if (!JS_IsException(fn)) {
 				bc_store_module(thread->ctx, d->name, d->src,
 						d->len, fn);
@@ -16519,7 +19226,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		} else {
 			fn = JS_Eval(thread->ctx, src, txtlen, name,
 				     JS_EVAL_TYPE_GLOBAL |
-				     JS_EVAL_FLAG_COMPILE_ONLY);
+				     JS_EVAL_FLAG_COMPILE_ONLY | QJS_LAZY);
 		}
 		if (!JS_IsException(fn)) {
 			bc_store(thread->ctx, name, src, txtlen, fn);
@@ -16539,7 +19246,8 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				as_module = JS_Eval(thread->ctx, src, txtlen,
 						    name,
 						    JS_EVAL_TYPE_MODULE |
-						    JS_EVAL_FLAG_COMPILE_ONLY);
+						    JS_EVAL_FLAG_COMPILE_ONLY |
+						    QJS_LAZY);
 			} else {
 				as_module = JS_ThrowReferenceError(
 					thread->ctx, "imports still arriving");
@@ -16595,7 +19303,8 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 				JS_FreeValue(thread->ctx, script_err);
 				fn = JS_Eval(thread->ctx, src, txtlen, name,
 					     JS_EVAL_TYPE_GLOBAL |
-					     JS_EVAL_FLAG_COMPILE_ONLY);
+					     JS_EVAL_FLAG_COMPILE_ONLY |
+					     QJS_LAZY);
 				if (!JS_IsException(fn)) {
 					bc_store(thread->ctx, name, src,
 						 txtlen, fn);
@@ -16646,7 +19355,8 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 					JSValue m = JS_Eval(thread->ctx, src,
 							    txtlen, name,
 							    JS_EVAL_TYPE_MODULE |
-							    JS_EVAL_FLAG_COMPILE_ONLY);
+							    JS_EVAL_FLAG_COMPILE_ONLY |
+							    QJS_LAZY);
 
 					if (!JS_IsException(m)) {
 						JS_FreeValue(thread->ctx, err);
@@ -16872,8 +19582,63 @@ static void deferred_load_check(void *p)
 	}
 	thread->load_deferred = false;
 	thread->load_releasing = true;
+	next_event_safe = true;
 	js_fire_event(thread, "load", thread->load_doc, NULL);
+	next_event_safe = false;
 	thread->load_releasing = false;
+}
+
+/*
+ * What a page that sends its visitor's session inline says about this
+ * browser (VitaSurf). Speedtest puts window.__CLIENT_CONFIG__ in the
+ * page, with a userSession holding the visitor's provider and location
+ * and whether access is allowed; on the Vita its provider panel never
+ * filled and GO did nothing, with no error and no request. This says
+ * only whether the session is there and what the flags are, never the
+ * address, provider or place in it.
+ */
+static void log_inline_session(JSContext *ctx)
+{
+	JSValue global = JS_GetGlobalObject(ctx);
+	JSValue cfg = JS_GetPropertyStr(ctx, global, "__CLIENT_CONFIG__");
+
+	if (JS_IsObject(cfg)) {
+		JSValue us = JS_GetPropertyStr(ctx, cfg, "userSession");
+
+		if (JS_IsObject(us)) {
+			JSValue allowed = JS_GetPropertyStr(ctx, us,
+							    "accessAllowed");
+			JSValue logged = JS_GetPropertyStr(ctx, us, "loggedIn");
+			JSValue isp = JS_GetPropertyStr(ctx, us, "ispName");
+			JSValue loc = JS_GetPropertyStr(ctx, us, "location");
+
+			vita_log("qjs: the page's inline config has a visitor "
+				 "session: access allowed %s, logged in %s, "
+				 "provider %s, location %s",
+				 JS_IsBool(allowed) ?
+				 (JS_ToBool(ctx, allowed) ? "yes" : "no") :
+				 "not said",
+				 JS_IsBool(logged) ?
+				 (JS_ToBool(ctx, logged) ? "yes" : "no") :
+				 "not said",
+				 JS_IsString(isp) ? "given" : "missing",
+				 JS_IsObject(loc) ? "given" : "missing");
+			JS_FreeValue(ctx, allowed);
+			JS_FreeValue(ctx, logged);
+			JS_FreeValue(ctx, isp);
+			JS_FreeValue(ctx, loc);
+		} else {
+			vita_log("qjs: the page's inline config has no "
+				 "visitor session");
+		}
+		JS_FreeValue(ctx, us);
+	}
+	JS_FreeValue(ctx, cfg);
+	JS_FreeValue(ctx, global);
+	/* a getter that threw says nothing to the page */
+	if (JS_HasException(ctx)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+	}
 }
 
 bool js_fire_event(jsthread *thread, const char *type,
@@ -16906,14 +19671,25 @@ bool js_fire_event(jsthread *thread, const char *type,
 		thread->ready_state = "complete";
 	}
 	if (strcmp(type, "load") == 0) {
+		uint32_t lazy_n, lazy_ms;
+
 		bc_index_flush();
+		JS_GetLazyCompileStats(thread->heap->rt, &lazy_n, &lazy_ms);
 		vita_log("qjs: load event, runtime memory %u KB; "
 			 "%u scripts of %u KB compiled in %u ms, ran in %u ms"
-			 "; %u modules, %u import misses",
+			 "; %u modules, %u import misses; %u functions "
+			 "compiled when first called, in %u ms",
 			 runtime_kb(thread->heap->rt),
 			 thread->js_scripts, thread->js_bytes / 1024,
 			 thread->js_compile_ms, thread->js_run_ms,
-			 thread->js_modules, thread->js_imports_missed);
+			 thread->js_modules, thread->js_imports_missed,
+			 (unsigned)(lazy_n - thread->lazy_count0),
+			 (unsigned)(lazy_ms - thread->lazy_ms0));
+		if (thread->ctx != NULL) {
+			miss_quiet = true;
+			log_inline_session(thread->ctx);
+			miss_quiet = false;
+		}
 	}
 	type_dom = to_dom_string(type);
 	if (type_dom == NULL) {
@@ -17128,6 +19904,41 @@ void js_handle_new_element(jsthread *thread, struct dom_element *node)
 
 void js_event_cleanup(jsthread *thread, struct dom_event *evt)
 {
-	(void)thread;
-	(void)evt;
+	/* the dispatch is over: its object goes (VitaSurf) */
+	if (thread != NULL && !thread->closed && thread->ctx != NULL) {
+		native_event_drop(thread, evt);
+	}
+}
+
+/* exported interface documented in js.h (VitaSurf) */
+void js_activate(jsthread *thread, struct dom_node *target, int x, int y)
+{
+	JSContext *ctx;
+	JSValue global, fn, args[3], r;
+	int i;
+
+	if (thread == NULL || thread->closed || thread->ctx == NULL ||
+	    target == NULL) {
+		return;
+	}
+	ctx = thread->ctx;
+	begin_script(thread, SCRIPT_EVENT);
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, "__vitaActivate");
+	if (JS_IsFunction(ctx, fn)) {
+		args[0] = wrap_node(ctx, target);
+		args[1] = JS_NewInt32(ctx, x);
+		args[2] = JS_NewInt32(ctx, y);
+		r = JS_Call(ctx, fn, global, 3, args);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		}
+		JS_FreeValue(ctx, r);
+		for (i = 0; i < 3; i++) {
+			JS_FreeValue(ctx, args[i]);
+		}
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	end_script(thread);
 }

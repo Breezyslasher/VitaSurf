@@ -1,0 +1,158 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index bfed658f4..a8eb918ac 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3023,6 +3023,9 @@ static dom_node *next_node_within(dom_node *n, dom_node *root,
+  * the document's forms, are then left to a rebuild of the tree. */
+ static bool show_rebuilding;
+ 
++/** Why box_show_element last could not build in place, for the log. */
++static const char *show_why = "?";
++
+ /** Whether a subtree holds something with a life of its own -- a frame,
+  * an object, an embed -- or is too big to build in place; on the way,
+  * its elements' selection data is cleared for building. */
+@@ -3143,8 +3146,10 @@ static bool show_place(html_content *c, dom_node *n, struct box *pb,
+ 	struct box *b, *next_box = NULL;
+ 	dom_node *sib = NULL;
+ 
+-	if (composed_next_sibling(c, n, &sib) != DOM_NO_ERR)
++	if (composed_next_sibling(c, n, &sib) != DOM_NO_ERR) {
++		show_why = "its next sibling could not be found";
+ 		return false;
++	}
+ 	while (sib != NULL) {
+ 		dom_node *next = NULL;
+ 		dom_node_type type;
+@@ -3183,11 +3188,14 @@ static bool show_place(html_content *c, dom_node *n, struct box *pb,
+ 	}
+ 	if (sib != NULL) {
+ 		dom_node_unref(sib);
+-		if (next_box == NULL)
+-			return false;	/* inline content follows */
++		if (next_box == NULL) {
++			show_why = "inline content follows it";
++			return false;
++		}
+ 	} else if (pb->styles != NULL &&
+ 			pb->styles->styles[CSS_PSEUDO_ELEMENT_AFTER] != NULL) {
+ 		/* the parent's ::after would come before it */
++		show_why = "its parent has ::after content";
+ 		return false;
+ 	}
+ 	*next_box_out = next_box;
+@@ -3210,26 +3218,31 @@ static bool box_show_element(html_content *c, dom_node *n,
+ 	int32_t *values = NULL;
+ 	int quote_depth = c->quote_depth;
+ 
++	show_why = "the page is busy";
+ 	if (style == NULL || !show_hide_allowed(c))
+ 		return false;
+ 
+ 	/* its parent's own box, holding block-level children */
+ 	box_extract_properties(c, n, &props);
+ 	pb = props.containing_block;
++	show_why = "its parent's box does not hold blocks";
+ 	if (pb == NULL || !show_block_container(pb) ||
+ 			composed_parent(c, n, &parent) != DOM_NO_ERR ||
+ 			parent == NULL)
+ 		return false;
+ 	b = box_for_node(parent);
+ 	dom_node_unref(parent);
++	show_why = "its parent has no box of its own";
+ 	if (b != pb)
+ 		return false;
+ 
+ 	/* and itself block-level there, or a flex item */
+ 	flex = pb->type == BOX_FLEX || pb->type == BOX_INLINE_FLEX;
+ 	display = ns_computed_display(style, false);
++	show_why = "display: contents";
+ 	if (display == CSS_DISPLAY_NONE || display == CSS_DISPLAY_CONTENTS)
+ 		return false;
++	show_why = "it is not block-level";
+ 	if (!flex && ((display != CSS_DISPLAY_BLOCK &&
+ 			display != CSS_DISPLAY_FLEX &&
+ 			display != CSS_DISPLAY_GRID) ||
+@@ -3238,8 +3251,11 @@ static bool box_show_element(html_content *c, dom_node *n,
+ 
+ 	if (!show_place(c, n, pb, &next_box))
+ 		return false;
++	show_why = "a frame, object or form control is inside it, or it "
++			"is too big";
+ 	if (show_subtree_unsafe(c, n))
+ 		return false;
++	show_why = "it could not be built";
+ 
+ 	/* the counters and quotes as they are, to put back after */
+ 	if (n_counters > 0) {
+@@ -4015,6 +4031,49 @@ const char *box_restyle_why(void)
+ 	return restyle_why;
+ }
+ 
++/** Whether a node is an element in the SVG namespace. */
++static bool restyle_in_svg(dom_node *n)
++{
++	dom_string *ns = NULL;
++	bool svg = false;
++
++	if (dom_node_get_namespace(n, &ns) == DOM_NO_ERR && ns != NULL) {
++		svg = dom_string_isequal(ns, corestring_dom_svg_namespace);
++		dom_string_unref(ns);
++	}
++	return svg;
++}
++
++/** Say which hidden element could not be shown in place, and why. */
++static void restyle_show_why(dom_node *n)
++{
++	static char buf[128];
++	dom_string *name = NULL, *cls = NULL;
++	const char *c = "";
++	size_t k = 0, e;
++
++	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR)
++		name = NULL;
++	if (dom_element_get_attribute(n, corestring_dom_class, &cls) !=
++			DOM_NO_ERR)
++		cls = NULL;
++	if (cls != NULL) {
++		c = dom_string_data(cls);
++		while (c[k] == ' ')
++			k++;
++	}
++	for (e = k; c[e] != '\0' && c[e] != ' '; e++)
++		;
++	snprintf(buf, sizeof(buf), "a hidden <%s%s%.*s> is shown, and "
++			"%s", name != NULL ? dom_string_data(name) : "?",
++			e > k ? "." : "", (int) (e - k), c + k, show_why);
++	if (name != NULL)
++		dom_string_unref(name);
++	if (cls != NULL)
++		dom_string_unref(cls);
++	restyle_why = buf;
++}
++
+ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 		bool *changed)
+ {
+@@ -4042,6 +4101,11 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 		if (composed_parent(c, n, &parent) == DOM_NO_ERR &&
+ 				parent != NULL) {
+ 			drawn = box_for_node(parent) != NULL;
++			/* inside an inline <svg>, which is drawn from its
++			 * markup and its own style alone: what the sheets
++			 * say of a <g> or a <path> draws nothing more */
++			if (drawn && restyle_in_svg(parent))
++				drawn = false;
+ 			dom_node_unref(parent);
+ 		}
+ 		if (!drawn)
+@@ -4079,7 +4143,7 @@ static enum box_restyle restyle_element(html_content *c, dom_node *n,
+ 				c->restyle_built = true;
+ 				return BOX_RESTYLE_REFLOW;
+ 			}
+-			restyle_why = "a hidden element is shown";
++			restyle_show_why(n);
+ 			return BOX_RESTYLE_LAYOUT;
+ 		}
+ 		css_select_results_destroy(fresh);
