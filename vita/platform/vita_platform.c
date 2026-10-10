@@ -437,6 +437,33 @@ const char *vitasurf_languages(void)
 	return languages;
 }
 
+/* Called from NetSurf's fetch code (utils/utils.h): the pages the browser
+ * writes for its own menus, and the bundled ones such as the start page,
+ * where following a link is the user's own navigation. */
+bool vitasurf_browser_page(const char *url)
+{
+	static const char *const pages[] = {
+		VITASURF_BOOKMARKS_URL, VITASURF_HISTORY_URL,
+		VITASURF_DOWNLOADS_URL, VITASURF_LOG_URL
+	};
+	size_t i, n;
+
+	if (url == NULL) {
+		return false;
+	}
+	if (strncmp(url, "file:///resources/", 18) == 0) {
+		return true;
+	}
+	for (i = 0; i < sizeof pages / sizeof pages[0]; i++) {
+		n = strlen(pages[i]);
+		if (strncmp(url, pages[i], n) == 0 &&
+		    (url[n] == '\0' || url[n] == '?' || url[n] == '#')) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void set_system_language(int lang)
 {
 	if (lang >= 0 && lang < (int)(sizeof system_languages /

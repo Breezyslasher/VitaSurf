@@ -9203,17 +9203,26 @@ static void xhr_timeout_cb(void *p)
 static bool xhr_start(struct js_xhr *x)
 {
 	const char **hdrs;
-	char *origin_hdr = NULL;
+	char *origin_hdr = NULL, *referer_hdr = NULL;
 	int n = 0, i;
 	nserror err;
 
 	while (x->headers != NULL && x->headers[n] != NULL) n++;
-	hdrs = calloc((size_t)n + 2, sizeof(*hdrs));
+	hdrs = calloc((size_t)n + 3, sizeof(*hdrs));
 	if (hdrs == NULL) {
 		return false;
 	}
 	for (i = 0; i < n; i++) hdrs[i] = x->headers[i];
-	if (x->cross_origin) {
+	/* the page's address, as the default referrer policy gives it, and
+	 * Origin on a request across origins or one that is not a GET, as
+	 * browsers send them */
+	if (nsoption_bool(send_referer)) {
+		referer_hdr = fetch_referer_header(x->url, x->referer);
+		if (referer_hdr != NULL) {
+			hdrs[n++] = referer_hdr;
+		}
+	}
+	if (x->cross_origin || x->post != NULL) {
 		char *origin = url_origin(x->referer);
 		if (origin != NULL) {
 			size_t l = strlen(origin) + 9;
@@ -9230,6 +9239,7 @@ static bool xhr_start(struct js_xhr *x)
 			  x->post, NULL, true, false,
 			  FETCH_DEST_EMPTY << FETCH_META_DEST, hdrs, &x->fetch);
 	free(origin_hdr);
+	free(referer_hdr);
 	free(hdrs);
 	if (err != NSERROR_OK) {
 		x->fetch = NULL;

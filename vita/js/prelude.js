@@ -2438,16 +2438,32 @@ function XMLHttpRequest(){this.readyState=0;this.status=0;this.statusText='';thi
 XMLHttpRequest.prototype={
 UNSENT:0,OPENED:1,HEADERS_RECEIVED:2,LOADING:3,DONE:4,
 open:function(m,u){this._m=String(m||'GET').toUpperCase();this._u=String(u);this._h={};this._set(1);},
-setRequestHeader:function(k,v){this._h[String(k)]=String(v);},
+setRequestHeader:function(k,v){k=String(k);v=String(v).trim();var l=k.toLowerCase();
+ /* the browser's own: a page may not set them (the Fetch standard's
+    forbidden request headers), and is not told */
+ if(/^(accept-charset|accept-encoding|access-control-request-headers|access-control-request-method|connection|content-length|cookie|cookie2|date|dnt|expect|host|keep-alive|origin|referer|set-cookie|te|trailer|transfer-encoding|upgrade|via)$/.test(l)||/^(proxy-|sec-)/.test(l))return;
+ for(var o in this._h)if(o.toLowerCase()===l){this._h[o]+=', '+v;return;}this._h[k]=v;},
+_has:function(k){k=k.toLowerCase();for(var o in this._h)if(o.toLowerCase()===k)return true;return false;},
 addEventListener:function(t,f){(this._l[t]=this._l[t]||[]).push(f);},
 removeEventListener:function(t,f){if(this._l[t])this._l[t]=this._l[t].filter(function(g){return g!==f;});},
 dispatchEvent:function(e){this._emit(e.type);return true;},
 _emit:function(t){var e={type:t,target:this,currentTarget:this,lengthComputable:false,loaded:0,total:0,preventDefault:function(){},stopPropagation:function(){}};var f=this['on'+t];if(typeof f==='function')f.call(this,e);(this._l[t]||[]).forEach(function(g){if(typeof g==='function')g.call(this,e);else if(g&&g.handleEvent)g.handleEvent(e);},this);},
 _set:function(s){this.readyState=s;this._emit('readystatechange');},
-_body:function(b){if(b===undefined||b===null)return null;if(typeof b==='string')return b;if(b instanceof URLSearchParams){if(!this._h['Content-Type'])this._h['Content-Type']='application/x-www-form-urlencoded;charset=UTF-8';return b.toString();}
- if(b instanceof FormData){if(!this._h['Content-Type'])this._h['Content-Type']='application/x-www-form-urlencoded;charset=UTF-8';return b._urlencoded();}
- if(b instanceof ArrayBuffer||ArrayBuffer.isView(b)){var v=new Uint8Array(b.buffer||b),s='';for(var i=0;i<v.length;i++)s+=String.fromCharCode(v[i]);return s;}return String(b);},
-send:function(body){var self=this;if(this.readyState!==1)return;var data=this._body(body);var hs=[];for(var k in this._h)hs.push(k+': '+this._h[k]);
+/* the body and the Content-Type it implies, as the Fetch standard
+   extracts a body: text is text/plain, a blob its own type, bytes none;
+   the page's own Content-Type wins */
+_body:function(b){var type=null,data;
+ if(b===undefined||b===null)data=null;
+ else if(b instanceof URLSearchParams){type='application/x-www-form-urlencoded;charset=UTF-8';data=b.toString();}
+ else if(b instanceof FormData){type='application/x-www-form-urlencoded;charset=UTF-8';data=b._urlencoded();}
+ else if(W.Blob&&b instanceof W.Blob){if(b.type)type=b.type;data=b._t;}
+ else if(b instanceof ArrayBuffer||ArrayBuffer.isView(b)){var v=ArrayBuffer.isView(b)?new Uint8Array(b.buffer,b.byteOffset,b.byteLength):new Uint8Array(b),s='';for(var i=0;i<v.length;i++)s+=String.fromCharCode(v[i]);data=s;}
+ else{type='text/plain;charset=UTF-8';data=String(b);}
+ if(this._m!=='GET'&&this._m!=='HEAD'&&!this._has('Content-Type')){
+  /* an empty value takes the network layer's own default away */
+  this._h['Content-Type']=type||'';}
+ return data;},
+send:function(body){var self=this;if(this.readyState!==1)return;var data=this._body(body);var hs=[];for(var k in this._h)hs.push(this._h[k]===''?k+':':k+': '+this._h[k]);
  this._emit('loadstart');
  /* the body arrives as bytes; text is a decode of them, and a
     response that is not text keeps every byte it was sent */
@@ -2620,7 +2636,19 @@ getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(func
 forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},
 _urlencoded:function(){return this._p.map(function(p){return encodeURIComponent(p[0])+'='+encodeURIComponent(p[1]);}).join('&');}};
 FormData.prototype[Symbol.iterator]=FormData.prototype.entries;W.FormData=FormData;
-function Headers(init){this._m={};if(init){if(init instanceof Headers)init.forEach(function(v,k){this.append(k,v);},this);else if(Array.isArray(init))init.forEach(function(p){this.append(p[0],p[1]);},this);else for(var k in init)this.append(k,init[k]);}}
+/* HeadersInit as the Fetch standard reads it: anything iterable (an array,
+   our Headers, another library's) is a list of name and value pairs, and
+   any other object a record of its own keys, so a polyfill's methods and
+   fields are not sent as headers */
+function Headers(init){this._m={};if(init===undefined||init===null)return;
+ if(typeof init!=='object'&&typeof init!=='function')throw new TypeError("Failed to construct 'Headers': The provided value is not of type 'HeadersInit'.");
+ if(typeof init[Symbol.iterator]==='function'){
+  for(var it=init[Symbol.iterator](),r=it.next();!r.done;r=it.next()){
+   var p=r.value;if(p===null||typeof p!=='object'||typeof p[Symbol.iterator]!=='function')throw new TypeError("Failed to construct 'Headers': The provided value cannot be converted to a sequence.");
+   p=Array.prototype.slice.call(Array.from(p));
+   if(p.length!==2)throw new TypeError("Failed to construct 'Headers': Invalid value");
+   this.append(p[0],p[1]);}}
+ else Object.keys(init).forEach(function(k){this.append(k,init[k]);},this);}
 Headers.prototype={append:function(k,v){k=String(k).toLowerCase();this._m[k]=(k in this._m)?this._m[k]+', '+String(v):String(v);},set:function(k,v){this._m[String(k).toLowerCase()]=String(v);},get:function(k){k=String(k).toLowerCase();return k in this._m?this._m[k]:null;},
 has:function(k){return String(k).toLowerCase() in this._m;},'delete':function(k){delete this._m[String(k).toLowerCase()];},forEach:function(f,t){for(var k in this._m)f.call(t,this._m[k],k,this);},
 keys:function(){return Object.keys(this._m)[Symbol.iterator]();},values:function(){var m=this._m;return Object.keys(m).map(function(k){return m[k];})[Symbol.iterator]();},entries:function(){var m=this._m;return Object.keys(m).map(function(k){return [k,m[k]];})[Symbol.iterator]();}};

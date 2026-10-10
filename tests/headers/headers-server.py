@@ -8,7 +8,9 @@ The page loads a same-origin image, style sheet and script, an image and
 a frame from localhost (another site), fetches /api, and a second later
 a timer sends the window to /next, which fetches /deny (a 403 carrying
 cf-mitigated: challenge). The server prints, for each path, the Accept,
-Accept-Language and Fetch Metadata headers it got. Chrome's Sec-Fetch-*
+Accept-Language, Referer and Fetch Metadata headers it got: the Referer
+is the page's URL to the same origin and its origin alone to another, as
+the default referrer policy has it. Chrome's Sec-Fetch-*
 values are listed by each case below; its Accept values are its own,
 VitaSurf's those of the Fetch standard, as Firefox's are.
 
@@ -24,8 +26,9 @@ VitaSurf's those of the Fetch standard, as Firefox's are.
 import http.server, sys
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8002
-WANT = ("accept", "accept-language", "sec-fetch-site", "sec-fetch-mode",
-        "sec-fetch-dest", "sec-fetch-user", "upgrade-insecure-requests")
+WANT = ("accept", "accept-language", "referer", "sec-fetch-site",
+        "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user",
+        "upgrade-insecure-requests")
 PAGE = ("""<!doctype html><html><head><link rel=stylesheet href=/s.css>
 <script src=/j.js></script></head><body><img src=/i.png>
 <img src="http://localhost:%d/x.png">
