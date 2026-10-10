@@ -20152,6 +20152,64 @@ void js_event_cleanup(jsthread *thread, struct dom_event *evt)
 	}
 }
 
+/*
+ * Call a prelude function with nodes and numbers, from the user's input;
+ * true when it returned true (VitaSurf).
+ */
+static bool js_call_input_hook(jsthread *thread, const char *name,
+			       struct dom_node *a, struct dom_node *b,
+			       int x, int y, int argc)
+{
+	JSContext *ctx;
+	JSValue global, fn, args[4], r;
+	bool took = false;
+	int i;
+
+	if (thread == NULL || thread->closed || thread->ctx == NULL ||
+	    a == NULL) {
+		return false;
+	}
+	ctx = thread->ctx;
+	begin_script(thread, SCRIPT_EVENT);
+	global = JS_GetGlobalObject(ctx);
+	fn = JS_GetPropertyStr(ctx, global, name);
+	if (JS_IsFunction(ctx, fn)) {
+		args[0] = wrap_node(ctx, a);
+		args[1] = b != NULL ? wrap_node(ctx, b) : JS_NULL;
+		args[2] = JS_NewInt32(ctx, x);
+		args[3] = JS_NewInt32(ctx, y);
+		r = JS_Call(ctx, fn, global, argc, args);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		} else {
+			took = JS_ToBool(ctx, r) > 0;
+		}
+		JS_FreeValue(ctx, r);
+		for (i = 0; i < 4; i++) {
+			JS_FreeValue(ctx, args[i]);
+		}
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	end_script(thread);
+	return took;
+}
+
+/* exported interface documented in js.h (VitaSurf) */
+bool js_submit(jsthread *thread, struct dom_node *form,
+	       struct dom_node *submitter, int x, int y)
+{
+	return js_call_input_hook(thread, "__vitaSubmit", form, submitter,
+				  x, y, 4);
+}
+
+/* exported interface documented in js.h (VitaSurf) */
+bool js_implicit_submit(jsthread *thread, struct dom_node *form)
+{
+	return js_call_input_hook(thread, "__vitaImplicitSubmit", form, NULL,
+				  0, 0, 1);
+}
+
 /* exported interface documented in js.h (VitaSurf) */
 void js_activate(jsthread *thread, struct dom_node *target, int x, int y)
 {

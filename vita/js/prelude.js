@@ -2699,8 +2699,8 @@ function formEntryList(form,submitter){
    if(e!==submitter||!isSubmitButton(e))return;}
   if(tag==='INPUT'&&(t==='checkbox'||t==='radio')&&!e.checked)return;
   if(tag==='INPUT'&&t==='image'){
-   n=e.getAttribute('name')||'';var pre=n?n+'.':'';
-   out.push([pre+'x','0'],[pre+'y','0']);return;}
+   n=e.getAttribute('name')||'';var pre=n?n+'.':'',xy=e.__vsImageXY||[0,0];
+   out.push([pre+'x',String(xy[0])],[pre+'y',String(xy[1])]);return;}
   n=e.getAttribute('name');
   if(n===null||n==='')return;
   if(tag==='SELECT'){listOf(e.options).forEach(function(o){
@@ -4630,6 +4630,27 @@ function targetWindow(name){
   if(w===w.parent)break;w=w.parent;}
  return W;}
 P.submit=function(){if(this.tagName==='FORM')formSubmit(this,null,true);};
+/* A form the user submitted, with a tap on a button or Enter in a field,
+   goes the same way (js_submit, js_implicit_submit in qjs.c): an image
+   button brings where it was clicked. */
+W.__vitaSubmit=function(form,submitter,x,y){
+ if(!form||form.tagName!=='FORM')return false;
+ if(submitter&&!isSubmitButton(submitter))submitter=null;
+ if(submitter&&submitter.tagName==='INPUT')submitter.__vsImageXY=[x|0,y|0];
+ formSubmit(form,submitter,false);
+ return true;};
+/* implicit submission: the default button is clicked, if it is not
+   disabled; with none, the form goes when only one field could take
+   Enter */
+W.__vitaImplicitSubmit=function(form){
+ if(!form||form.tagName!=='FORM')return false;
+ var els=listOf(form.elements),def=null,blocking=0,i,e;
+ for(i=0;i<els.length;i++){e=els[i];
+  if(!def&&isSubmitButton(e))def=e;
+  if(e.tagName==='INPUT'&&/^(text|search|url|tel|email|password|date|month|week|time|datetime-local|number)$/.test(String(e.getAttribute('type')||'text').toLowerCase()))blocking++;}
+ if(def){if(!controlDisabled(def))def.click();return true;}
+ if(blocking<=1)formSubmit(form,null,false);
+ return true;};
 /* The HTML standard's form submission (VitaSurf): the method, action,
    enctype and target, the submitter's own formmethod and the rest first;
    a GET puts the entries in the query, a POST to http or https sends
