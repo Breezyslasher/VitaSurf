@@ -40,6 +40,7 @@
 #endif
 
 #include "vita_resolve.h"
+#include "vita_dns.h"
 
 #ifdef __vita__
 #include "vita_platform.h"
@@ -76,6 +77,7 @@ void vita_log(const char *fmt, ...);
 #define FAIL_LOOKUP 2 /* the lookup said no */
 #define FAIL_THREAD 3 /* no thread to run it on */
 #define FAIL_TEST   4 /* the native harness was told to fail it */
+#define FAIL_DNS    5 /* a DNS server answered: no such name, no IPv4 */
 
 struct slot {
 	char host[256];
@@ -86,6 +88,10 @@ struct slot {
 	int fail;           /* FAIL_*, or 0 */
 	int err;            /* what the call that failed returned */
 	uint32_t took_ms;   /* how long the lookup itself took */
+	struct vita_dns_result dns; /* what VitaSurf's own query found */
+	bool asked_dns;     /* the own query was made */
+	bool fell_back;     /* it had no answer: the system resolver asked */
+	uint32_t dns_ms;    /* how long the own query took */
 	uint32_t done_ms;   /* when it answered */
 	/* the main thread's */
 	uint32_t asked_ms;  /* when the lookup was asked for */
@@ -115,6 +121,39 @@ static int slot_state(struct slot *s)
 static void slot_set_state(struct slot *s, int state)
 {
 	__atomic_store_n(&s->state, state, __ATOMIC_RELEASE);
+}
+
+/*
+ * Ask the network's DNS servers directly (vita_dns.c). True when that
+ * settled the lookup, with an address or with a server's answer that
+ * there is none; false to ask the system resolver, as for a name with
+ * no dot, which only it may know (a LAN name, a search domain), or when
+ * no server answered.
+ */
+static bool lookup_own(struct slot *s)
+{
+	uint32_t t0;
+
+	if (strchr(s->host, '.') == NULL) {
+		return false;
+	}
+	t0 = now_ms();
+	s->asked_dns = true;
+	vita_dns_lookup(s->host, &s->dns);
+	s->dns_ms = now_ms() - t0;
+	switch (s->dns.status) {
+	case VITA_DNS_OK:
+		s->addr = s->dns.addr;
+		return true;
+	case VITA_DNS_NXDOMAIN:
+	case VITA_DNS_NODATA:
+	case VITA_DNS_SERVFAIL:
+		s->fail = FAIL_DNS;
+		return true;
+	default:
+		s->fell_back = true;
+		return false;
+	}
 }
 
 #ifdef __vita__
@@ -149,6 +188,9 @@ static void lookup(struct slot *s)
 	SceNetInAddr addr;
 	int rid, ret;
 
+	if (lookup_own(s)) {
+		return;
+	}
 	rid = sceNetResolverCreate("vitasurf_dns", NULL, 0);
 	if (rid < 0) {
 		s->fail = FAIL_CREATE;
@@ -223,6 +265,10 @@ static void lookup(struct slot *s)
 	}
 	if (fail != NULL && strcmp(fail, s->host) == 0) {
 		s->fail = FAIL_TEST;
+		return;
+	}
+	/* the own client against a test's DNS server */
+	if (getenv("VITASURF_DNS_SERVER") != NULL && lookup_own(s)) {
 		return;
 	}
 	memset(&hints, 0, sizeof hints);
@@ -315,6 +361,10 @@ static void slot_ask(struct slot *s, const char *host, uint32_t now)
 	s->fail = 0;
 	s->err = 0;
 	s->rid = 0;
+	memset(&s->dns, 0, sizeof s->dns);
+	s->asked_dns = false;
+	s->fell_back = false;
+	s->dns_ms = 0;
 	s->asked_ms = now;
 	s->used_ms = now;
 	s->told = false;
@@ -369,6 +419,29 @@ static void slot_why(struct slot *s, char *why, size_t len)
 	case FAIL_TEST:
 		snprintf(why, len, "no such host (test)");
 		return;
+	case FAIL_DNS: {
+		const unsigned char *b = (const unsigned char *)&s->dns.server;
+		const char *what;
+
+		switch (s->dns.status) {
+		case VITA_DNS_NXDOMAIN:
+			what = "no such name";
+			break;
+		case VITA_DNS_NODATA:
+			what = s->dns.has_ipv6 ?
+				"no IPv4 address, only IPv6, which the Vita "
+				"has no route for" : "no IPv4 address";
+			break;
+		default:
+			what = "the DNS server failed";
+			break;
+		}
+		snprintf(why, len, "%s (rcode %d from %u.%u.%u.%u%s%s)", what,
+			 s->dns.rcode, b[0], b[1], b[2], b[3],
+			 s->dns.cnames > 0 ? ", after an alias" : "",
+			 s->dns.tcp ? ", over TCP" : "");
+		return;
+	}
 	default:
 		break;
 	}
@@ -390,8 +463,16 @@ static void slot_report(struct slot *s, int state)
 {
 	uint32_t waited = s->done_ms - s->asked_ms;
 
+	if (s->fell_back) {
+		vita_log("dns: %s: VitaSurf's own query %s after %u ms (%d "
+			 "sent), so the system resolver was asked", s->host,
+			 s->dns.status == VITA_DNS_TIMEOUT ? "had no answer" :
+			 s->dns.status == VITA_DNS_ERROR ? "could not be sent" :
+			 "had an answer it could not read",
+			 (unsigned int)s->dns_ms, s->dns.tries);
+	}
 	if (state == SLOT_FAILED) {
-		char why[64];
+		char why[128];
 
 		slot_why(s, why, sizeof why);
 		vita_log("dns: %s failed after %u ms: %s", s->host,

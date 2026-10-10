@@ -113,6 +113,7 @@ add_executable(${PROJECT_NAME}
     # Host name lookups on threads of their own, for the fetcher and
     # WebSockets, so that no lookup holds the browser up.
     vita/platform/vita_resolve.c
+    vita/platform/vita_dns.c
     # NetSurf download table: files saved under ux0:data/VitaSurf/downloads.
     vita/platform/vita_download.c
     # Optional FlareSolverr client for Cloudflare browser checks.

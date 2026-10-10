@@ -1,0 +1,13 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 345fae69d..e09310058 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1510,7 +1510,7 @@ eturn 1 if curl has it now, 0 while the lookup goes on, -1 if the
+ static int fetch_curl_resolve_try(struct curl_fetch_info *f)
+ {
+ 	const char *host = lwc_string_data(f->host);
+-	char addrs[16], why[64], entry[300];
++	char addrs[16], why[160], entry[300];
+ 	lwc_string *port;
+ 	long portnum;
+ 	CURLMcode codem;
