@@ -28,8 +28,9 @@
 'use strict';
 var W=window;
 var ROWS='EventTarget<Object Node<EventTarget Element<Node HTMLElement<Element HTMLMediaElement<HTMLElement CharacterData<Node Text<CharacterData CDATASection<Text Comment<CharacterData Document<Node DocumentFragment<Node DocumentType<Node HTMLAnchorElement<HTMLElement HTMLAreaElement<HTMLElement HTMLAudioElement<HTMLMediaElement HTMLBRElement<HTMLElement HTMLBaseElement<HTMLElement HTMLBodyElement<HTMLElement HTMLButtonElement<HTMLElement HTMLCanvasElement<HTMLElement HTMLDListElement<HTMLElement HTMLDataElement<HTMLElement HTMLDataListElement<HTMLElement HTMLDetailsElement<HTMLElement HTMLDialogElement<HTMLElement HTMLDirectoryElement<HTMLElement HTMLDivElement<HTMLElement HTMLEmbedElement<HTMLElement HTMLFieldSetElement<HTMLElement HTMLFontElement<HTMLElement HTMLFormElement<HTMLElement HTMLFrameElement<HTMLElement HTMLFrameSetElement<HTMLElement HTMLHRElement<HTMLElement HTMLHeadElement<HTMLElement HTMLHeadingElement<HTMLElement HTMLHtmlElement<HTMLElement HTMLIFrameElement<HTMLElement HTMLImageElement<HTMLElement HTMLInputElement<HTMLElement HTMLLIElement<HTMLElement HTMLLabelElement<HTMLElement HTMLLegendElement<HTMLElement HTMLLinkElement<HTMLElement HTMLMapElement<HTMLElement HTMLMarqueeElement<HTMLElement HTMLMenuElement<HTMLElement HTMLMetaElement<HTMLElement HTMLMeterElement<HTMLElement HTMLModElement<HTMLElement HTMLOListElement<HTMLElement HTMLObjectElement<HTMLElement HTMLOptGroupElement<HTMLElement HTMLOptionElement<HTMLElement HTMLOutputElement<HTMLElement HTMLParagraphElement<HTMLElement HTMLParamElement<HTMLElement HTMLPictureElement<HTMLElement HTMLPreElement<HTMLElement HTMLProgressElement<HTMLElement HTMLQuoteElement<HTMLElement HTMLScriptElement<HTMLElement HTMLSelectElement<HTMLElement HTMLSlotElement<HTMLElement HTMLSourceElement<HTMLElement HTMLSpanElement<HTMLElement HTMLStyleElement<HTMLElement HTMLTableCaptionElement<HTMLElement HTMLTableCellElement<HTMLElement HTMLTableColElement<HTMLElement HTMLTableElement<HTMLElement HTMLTableRowElement<HTMLElement HTMLTableSectionElement<HTMLElement HTMLTemplateElement<HTMLElement HTMLTextAreaElement<HTMLElement HTMLTimeElement<HTMLElement HTMLTitleElement<HTMLElement HTMLTrackElement<HTMLElement HTMLUListElement<HTMLElement HTMLUnknownElement<HTMLElement HTMLVideoElement<HTMLMediaElement ProcessingInstruction<CharacterData SVGElement<Element SVGGraphicsElement<SVGElement SVGSVGElement<SVGGraphicsElement ShadowRoot<DocumentFragment'.split(' ').map(function(r){return r.split('<');});
-/* each member's interfaces, as indexes into ROWS */
-var PLACE=JSON.parse(`{
+/* each member's interfaces, as indexes into ROWS, which C reads
+   (__vitaPlaceMembers, vita/js/ifaces.c) */
+var PLACE=`{
 "addEventListener":[0],"dispatchEvent":[0],"removeEventListener":[0],
 "when":[0],"ATTRIBUTE_NODE":[1],"CDATA_SECTION_NODE":[1],
 "COMMENT_NODE":[1],"DOCUMENT_FRAGMENT_NODE":[1],"DOCUMENT_NODE":[1],
@@ -316,19 +317,20 @@ var PLACE=JSON.parse(`{
 "unsuspendRedrawAll":[84],"viewBox":[84],"zoomAndPan":[84],
 "clonable":[85],"delegatesFocus":[85],"mode":[85],"serializable":[85],
 "slotAssignment":[85]
-}`);
+}`;
 var T=W.EventTarget&&W.EventTarget.prototype,N=W.Node&&W.Node.prototype,
  E=W.Element&&W.Element.prototype,P=W.HTMLElement&&W.HTMLElement.prototype,
  setProtos=NV.__vitaNodeProtos,byTag=NV.__vitaByTag||{},
- HTML_TAGS=NV.__vitaHtmlTags||'';
+ HTML_TAGS=NV.__vitaHtmlTags||'',placeMembers=NV.__vitaPlaceMembers;
 delete NV.__vitaNodeProtos;delete NV.__vitaByTag;delete NV.__vitaHtmlTags;
-if(!T||!N||!E||!P||typeof setProtos!=='function')return;
+delete NV.__vitaPlaceMembers;
+if(!T||!N||!E||!P||typeof setProtos!=='function'||
+   typeof placeMembers!=='function')return;
 var own=Object.prototype.hasOwnProperty;
 function define(o,k,d){try{Object.defineProperty(o,k,d);}catch(e){}}
 var PROTO=Object.create(null),AT=Object.create(null);
 PROTO.EventTarget=T;PROTO.Node=N;PROTO.Element=E;PROTO.HTMLElement=P;
 ROWS.forEach(function(r,i){AT[r[0]]=i;});
-function has(k,name){return own.call(PLACE,k)&&PLACE[k].indexOf(AT[name])>=0;}
 /* a document other than the window's: what it had of P's that is a
    document's, or this browser's own, over Element's (place below) */
 var DOCP=Object.create(E);
@@ -354,28 +356,14 @@ ROWS.forEach(function(r){
   define(F,'name',{value:name,configurable:true});}
  if(F.prototype!==o)define(F,'prototype',{value:o,writable:true});});
 /* each member where Chrome has it: an interface's own goes to it, and one
-   of a mixin goes to each interface that includes it */
-function place(k){
- var at=own.call(PLACE,k)?PLACE[k]:null,
-  d=Object.getOwnPropertyDescriptor(P,k),stay=false,i,o;
- if(!at||at.indexOf(AT.Document)>=0)define(DOCP,k,d);
- if(!at)return;
- /* WebIDL's attributes and operations are enumerable */
- if(d.configurable)d.enumerable=true;
- for(i=0;i<at.length;i++){
-  if(at[i]===AT.HTMLElement){stay=true;continue;}
-  o=PROTO[ROWS[at[i]][0]];
-  if(o)define(o,k,d);}
- if(!stay)delete P[k];
- else if(d.configurable)define(P,k,d);}
-Reflect.ownKeys(P).forEach(function(k){
- if(typeof k==='string'&&k!=='constructor')place(k);});
-/* the levels above held copies, for code that looked there: what is not
-   theirs in Chrome goes */
-[[E,'Element'],[N,'Node'],[T,'EventTarget']].forEach(function(l){
- Reflect.ownKeys(l[0]).forEach(function(k){
-  if(typeof k!=='string'||k==='constructor'||!own.call(PLACE,k))return;
-  if(!has(k,l[1]))delete l[0][k];});});
+   of a mixin goes to each interface that includes it, enumerable as
+   WebIDL's attributes and operations are; what is HTMLElement's stays on
+   P, and a document other than the window's gets what is a document's or
+   this browser's own. The levels above held copies, for code that looked
+   there: what is not theirs in Chrome goes, and what is is enumerable.
+   Done in C (vita/js/ifaces.c): it was a tenth of the prelude's time */
+placeMembers(P,DOCP,PLACE,ROWS.map(function(r){return PROTO[r[0]];}),
+ AT.HTMLElement,AT.Document,[[E,AT.Element],[N,AT.Node],[T,AT.EventTarget]]);
 /* EventTarget's methods serve every kind of target: a node through the
    bindings, and anything else (new EventTarget(), a class that extends
    it, screen, visualViewport) through the prelude's own listeners. They
@@ -406,15 +394,6 @@ if(tag&&tag.get)['SVGElement','SVGGraphicsElement'].forEach(function(n){
  var DT=function DocumentType(){throw new TypeError('Illegal constructor');};
  DT.prototype=PROTO.DocumentType;
  W.DocumentType=DT;})();
-/* and those the levels above had of their own */
-[[E,'Element'],[N,'Node'],[T,'EventTarget']].forEach(function(r){
- var o=r[0];
- Reflect.ownKeys(o).forEach(function(k){
-  var d;
-  if(typeof k!=='string'||k==='constructor'||!own.call(PLACE,k)||
-     !has(k,r[1]))return;
-  d=Object.getOwnPropertyDescriptor(o,k);
-  if(d&&d.configurable&&!d.enumerable){d.enumerable=true;define(o,k,d);}});});
 /*
  * ARIA's reflection (ARIAMixin), which Element has in a browser and
  * this did not: ariaLabel is the aria-label attribute, null when it is

@@ -202,9 +202,10 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # websocket.c runs WebSocket connections on libcurl's ws API
     # intl.c reads the locale data Intl is built on, resources/intl.pak
     # url.c is the URL Standard's parser, which URL is built on
+    # ifaces.c gives the interfaces their WebIDL shapes for the prelude
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
         vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c
-        vita/js/intl.c vita/js/url.c)
+        vita/js/intl.c vita/js/url.c vita/js/ifaces.c)
     # subtle.c takes Ed25519 and X25519 from Monocypher, which mbedTLS
     # does not have
     target_sources(${PROJECT_NAME} PRIVATE

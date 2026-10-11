@@ -109,11 +109,12 @@ def main():
         cur += part
     lines.append(cur)
     block = ("var ROWS='" + rows_js + "'.split(' ').map(function(r){return r.split('<');});\n"
-             "/* each member's interfaces, as indexes into ROWS */\n"
-             "var PLACE=JSON.parse(`{\n" + '\n'.join(lines) + "\n}`);\n")
+             "/* each member's interfaces, as indexes into ROWS, which C reads\n"
+             "   (__vitaPlaceMembers, vita/js/ifaces.c) */\n"
+             "var PLACE=`{\n" + '\n'.join(lines) + "\n}`;\n")
     nodes = open(NODES, encoding='utf-8').read()
     a = nodes.index("var ROWS='")
-    b = nodes.index('}`);\n', a) + len('}`);\n')
+    b = nodes.index('}`;\n', a) + len('}`;\n')
     if nodes[a:b] != block:
         print('nodes.js: ROWS/PLACE change (%d interfaces, %d members)'
               % (len(names), len(place)))

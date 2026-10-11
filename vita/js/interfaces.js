@@ -338,139 +338,73 @@ XPathExpression|Object|i|0|1|
 XPathResult|Object|i|0|1|ANY_TYPE=0,NUMBER_TYPE=1,STRING_TYPE=2,BOOLEAN_TYPE=3,UNORDERED_NODE_ITERATOR_TYPE=4,ORDERED_NODE_ITERATOR_TYPE=5,UNORDERED_NODE_SNAPSHOT_TYPE=6,ORDERED_NODE_SNAPSHOT_TYPE=7,ANY_UNORDERED_NODE_TYPE=8,FIRST_ORDERED_NODE_TYPE=9`;
 var NODEP=W.Node&&W.Node.prototype;
 var fromPrelude=NV.__vitaFromPrelude||function(){return false;};
+var SHAPE=NV.__vitaShapeInterfaces;
+delete NV.__vitaShapeInterfaces;
+if(typeof SHAPE!=='function')return;
 var ORIG=Object.create(null);
 NV.__vitaOrig=ORIG;
-var DONE=Object.create(null),CLAIMED=new Map();
-var SKIP={length:1,name:1,prototype:1,caller:1,arguments:1};
-/* the language's own prototypes are never an interface's: TouchList was
-   once Array itself, and giving Array.prototype TouchList's constructor
-   made every array's slice() an illegal construction */
+function define(o,k,d){try{Object.defineProperty(o,k,d);}catch(e){}}
+/* each interface object that is not a node's: the prelude makes its own
+   objects through the same names, and is let through what a page is
+   refused (__vitaFromPrelude) */
+function mk(C,name,len,kind){
+ if(kind==='i')return function(){
+  if(!fromPrelude())throw new TypeError("Failed to construct '"+name+
+   "': Illegal constructor");
+  return new.target?Reflect.construct(C,arguments,new.target)
+                   :C.apply(this,arguments);};
+ return function(){
+  if(!new.target){
+   if(fromPrelude())return C.apply(this,arguments);
+   throw new TypeError("Failed to construct '"+name+
+    "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");}
+  if(arguments.length<len&&!fromPrelude())
+   throw new TypeError("Failed to construct '"+name+"': "+len+
+    " argument"+(len>1?'s':'')+" required, but only "+
+    arguments.length+" present.");
+  return Reflect.construct(C,arguments,new.target);};}
+/*
+ * The rest is done in C (__vitaShapeInterfaces, vita/js/ifaces.c), row by
+ * row in TABLE's order, which the script here did and which cost a tenth
+ * of the prelude's time:
+ *
+ *  - an interface that is a node, by WebIDL's inheritance or by sharing
+ *    the nodes' prototype, keeps its constructor and prototype, and gets
+ *    its length;
+ *  - any other gets mk's wrapper, with its name and length, the
+ *    implementation's statics, a prototype that says its constructor and
+ *    toStringTag, under its parent's where it inherited from nothing or
+ *    from an interface further up that its parent sits below;
+ *  - a prototype already taken (by the language, or by an interface
+ *    earlier in the table) is not shared: the second interface gets one
+ *    of its own. One constructor under the names of an interface and one
+ *    under it (StyleSheet and CSSStyleSheet) leaves the prototype with
+ *    the name the function has, and failing that the one furthest down;
+ *  - its interface object is under its parent's, its constants are on it
+ *    and on its prototype, and the global is writable, configurable and
+ *    not enumerable.
+ *
+ * The language's own prototypes are never an interface's: TouchList was
+ * once Array itself, and giving Array.prototype TouchList's constructor
+ * made every array's slice() an illegal construction. A global still
+ * waiting for its unit (lazy.js) is not read, which would run the unit:
+ * it is shaped when the unit has run.
+ */
+var ST={win:W,done:Object.create(null),orig:ORIG,claimed:[],nodeP:NODEP,
+ mk:mk,later:Object.create(null)};
 ['Object','Function','Array','Error','Map','Set','WeakMap','WeakSet',
  'Promise','Date','RegExp','String','Number','Boolean','Symbol','BigInt',
  'ArrayBuffer','DataView','Uint8Array','Proxy'].forEach(function(n){
- var c=globalThis[n];if(c&&c.prototype)CLAIMED.set(c.prototype,n);});
-/* the interfaces that are nodes, by WebIDL's inheritance or by sharing the
-   nodes' prototype: their constructors and prototypes stay as they are */
-var PARENT=Object.create(null);
-TABLE.split('\n').forEach(function(r){var f=r.split('|');PARENT[f[0]]=f[1];});
-function isNode(name,P){
- var n=name;
- if(P&&NODEP&&(P===NODEP||NODEP.isPrototypeOf(P)))return true;
- while(n){if(n==='Node')return true;n=PARENT[n];}
- return false;}
-function define(o,k,d){try{Object.defineProperty(o,k,d);}catch(e){}}
-/* one constructor under the names of an interface and one under it
-   (StyleSheet and CSSStyleSheet): the name the function itself has is
-   what it makes, so that one keeps the prototype, and failing that the
-   one furthest down; the others get one of their own. Sheets the prelude
-   made were no instances of CSSStyleSheet */
-var OWNER=new Map();
-/* a global still waiting for its unit (lazy.js) is not read here, which
-   would run the unit: it is shaped when the unit has run */
-var isLazy=NV.__vitaIsLazy,LATER=null;
-function waits(n){
- if(typeof isLazy!=='function'||!isLazy(W,n))return false;
- (LATER||(LATER=Object.create(null)))[n]=true;
- return true;}
-function owners(rows){
- function depth(n){var d=0;while(n&&PARENT[n]){n=PARENT[n];d++;}return d;}
- rows.forEach(function(r){
-  var n=r.slice(0,r.indexOf('|')),C,P,o;
-  if(waits(n))return;
-  C=W[n];P=typeof C==='function'?C.prototype:null;
-  if(!P||typeof P!=='object')return;
-  o=OWNER.get(P);
-  if(o===undefined||(o!==C.name&&(n===C.name||depth(n)>depth(o))))
-   OWNER.set(P,n);});}
-owners(TABLE.split('\n'));
-function shape(row){
- var f=row.split('|'),name=f[0],parent=f[1],kind=f[2],len=+f[3],
-  tag=f[4]==='1'?name:f[4]==='0'?'':f[4],consts=f[5],
-  C,P,F,pF=parent&&DONE[parent],k,i,keys,d,pP;
- if(waits(name))return;
- C=W[name];
- if(typeof C!=='function')return;
- P=C.prototype;
- ORIG[name]=C;
- if(isNode(name,P)){
-  /* the interface object alone */
-  F=C;
-  define(F,'length',{value:len,configurable:true});
- }else{
-  /* the prelude makes its own objects through the same names, and is
-     let through what a page is refused (__vitaFromPrelude) */
-  if(kind==='i'){
-   F=function(){
-    if(!fromPrelude())throw new TypeError("Failed to construct '"+name+
-     "': Illegal constructor");
-    return new.target?Reflect.construct(C,arguments,new.target)
-                     :C.apply(this,arguments);};
-  }else{
-   F=function(){
-    if(!new.target){
-     if(fromPrelude())return C.apply(this,arguments);
-     throw new TypeError("Failed to construct '"+name+
-      "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");}
-    if(arguments.length<len&&!fromPrelude())
-     throw new TypeError("Failed to construct '"+name+"': "+len+
-      " argument"+(len>1?'s':'')+" required, but only "+
-      arguments.length+" present.");
-    return Reflect.construct(C,arguments,new.target);};
-  }
-  define(F,'name',{value:name,configurable:true});
-  define(F,'length',{value:len,configurable:true});
-  /* one prototype under two names: the second gets a prototype of its
-     own, so each says its own constructor */
-  if(!P||typeof P!=='object'||CLAIMED.has(P)||
-     (OWNER.has(P)&&OWNER.get(P)!==name)){
-   pP=pF?pF.prototype:Object.prototype;
-   P=Object.create(pP);
-  }
-  CLAIMED.set(P,name);
-  define(F,'prototype',{value:P,writable:false,enumerable:false,
-   configurable:false});
-  /* what the implementation carried: its statics */
-  keys=Reflect.ownKeys(C);
-  for(i=0;i<keys.length;i++){k=keys[i];
-   if(typeof k==='string'&&SKIP[k])continue;
-   d=Object.getOwnPropertyDescriptor(C,k);
-   if(d)define(F,k,d);}
-  /* under its parent: where it inherited from nothing, or from an
-     interface further up that its parent sits below */
-  if(pF&&P!==pF.prototype){
-   var cur=Object.getPrototypeOf(P);
-   if(cur!==pF.prototype&&(cur===Object.prototype||
-      (cur&&cur.isPrototypeOf(pF.prototype))))
-    try{Object.setPrototypeOf(P,pF.prototype);}catch(e){}}
-  define(P,'constructor',{value:F,writable:true,enumerable:false,
-   configurable:true});
-  if(tag&&!Object.prototype.hasOwnProperty.call(P,Symbol.toStringTag))
-   define(P,Symbol.toStringTag,{value:tag,configurable:true});
- }
- if(pF)try{Object.setPrototypeOf(F,pF);}catch(e){}
- if(consts)consts.split(',').forEach(function(c){
-  var kv=c.split('='),v=+kv[1];
-  define(F,kv[0],{value:v,writable:false,enumerable:true,configurable:false});
-  if(!isNode(name,F.prototype))
-   define(F.prototype,kv[0],{value:v,writable:false,enumerable:true,
-    configurable:false});});
- define(W,name,{value:F,writable:true,enumerable:false,configurable:true});
- DONE[name]=F;}
+ var c=globalThis[n];if(c&&c.prototype)ST.claimed.push(c.prototype);});
 /* parents WebIDL puts between interfaces this prelude has: they carry
    nothing of their own here, and are what the chain passes through */
 ['AnimationTimeline','CSSConditionRule'].forEach(function(n){
  if(typeof W[n]!=='function')W[n]=function(){};});
-TABLE.split('\n').forEach(shape);
+SHAPE(TABLE,ST);
 /* the interfaces of a unit that has run since (lazy.js) */
-if(LATER)Object.defineProperty(NV,'__vitaShapeLater',{value:function(){
- var rows;
- if(!LATER)return;
- rows=TABLE.split('\n').filter(function(r){
-  var n=r.slice(0,r.indexOf('|'));
-  return LATER[n]&&!isLazy(W,n);});
- rows.forEach(function(r){delete LATER[r.slice(0,r.indexOf('|'))];});
- owners(rows);
- rows.forEach(shape);}});
+if(Object.keys(ST.later).length)
+ Object.defineProperty(NV,'__vitaShapeLater',{value:function(){
+  if(Object.keys(ST.later).length)SHAPE(TABLE,ST,true);}});
 /* the same interface under its old name, as in a browser */
 if(W.MutationObserver)define(W,'WebKitMutationObserver',{value:W.MutationObserver,
  writable:true,enumerable:false,configurable:true});

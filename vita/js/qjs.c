@@ -68,6 +68,7 @@
 #include "wasm.h"
 #include "websocket.h"
 #include "url.h"
+#include "ifaces.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -16903,6 +16904,8 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaFromPrelude",
 			  JS_NewCFunction(ctx, win_vita_from_prelude,
 					  "__vitaFromPrelude", 0));
+	/* the interfaces' shapes, for interfaces.js and nodes.js */
+	ifaces_register(ctx, global);
 	JS_SetPropertyStr(ctx, global, "__vitaNativesOf",
 			  JS_NewCFunction(ctx, win_vita_natives_of,
 					  "__vitaNativesOf", 1));
