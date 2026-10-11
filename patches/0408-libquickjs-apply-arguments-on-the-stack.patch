@@ -1,0 +1,182 @@
+diff --git a/quickjs.c b/quickjs.c
+index 8db66c3..4a133b3 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1548,9 +1548,11 @@ static __exception int js_get_length64(JSContext *ctx, int64_t *pres,
+                                        JSValueConst obj);
+ static __exception int js_set_length64(JSContext *ctx, JSValueConst obj,
+                                        int64_t len);
+-static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len);
++static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len,
++                          JSValue *buf);
+ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
+-                               JSValueConst array_arg);
++                               JSValueConst array_arg,
++                               JSValue *buf, uint32_t buf_len);
+ static JSValue js_create_array(JSContext *ctx, int len, JSValueConst *tab);
+ static bool js_get_fast_array(JSContext *ctx, JSValue obj,
+                               JSValue **arrpp, uint32_t *countp);
+@@ -7843,6 +7845,7 @@ fail:
+     return b->line_num;
+ }
+ 
++
+ /* in order to avoid executing arbitrary code during the stack trace
+    generation, we only look at simple 'name' properties containing a
+    string. */
+@@ -18411,7 +18414,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 scope_idx = get_u16(pc) - 1;
+                 pc += 2;
+                 sf->cur_pc = pc;
+-                tab = build_arg_list(ctx, &len, sp[-1]);
++                tab = build_arg_list(ctx, &len, sp[-1], NULL, 0);
+                 if (!tab)
+                     goto exception;
+                 if (js_same_value(ctx, sp[-2], ctx->eval_obj)) {
+@@ -18424,7 +18427,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 } else {
+                     ret_val = JS_Call(ctx, sp[-2], JS_UNDEFINED, len, vc(tab));
+                 }
+-                free_arg_list(ctx, tab, len);
++                free_arg_list(ctx, tab, len, NULL);
+                 if (unlikely(JS_IsException(ret_val)))
+                     goto exception;
+                 JS_FreeValue(ctx, sp[-2]);
+@@ -43878,18 +43881,27 @@ static __exception int js_set_length64(JSContext *ctx, JSValueConst obj,
+     return JS_SetProperty(ctx, obj, JS_ATOM_length, js_int64(len));
+ }
+ 
+-static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len)
++/* VitaSurf: an argument list of up to this many values is built on the
++   caller's stack, not in a block from the allocator: apply() is how
++   obfuscated scripts call their opcode handlers, once per instruction. */
++#define ARG_LIST_BUF 16
++
++static void free_arg_list(JSContext *ctx, JSValue *tab, uint32_t len,
++                          JSValue *buf)
+ {
+     uint32_t i;
+     for(i = 0; i < len; i++) {
+         JS_FreeValue(ctx, tab[i]);
+     }
+-    js_free(ctx, tab);
++    if (tab != buf)
++        js_free(ctx, tab);
+ }
+ 
+ /* XXX: should use ValueArray */
++/* buf, of buf_len values, holds a list that fits it (VitaSurf) */
+ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
+-                               JSValueConst array_arg)
++                               JSValueConst array_arg,
++                               JSValue *buf, uint32_t buf_len)
+ {
+     uint32_t len, i;
+     JSValue *tab, ret;
+@@ -43899,19 +43911,29 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
+         JS_ThrowTypeError(ctx, "not a object");
+         return NULL;
+     }
+-    if (js_get_length32(ctx, &len, array_arg))
++    p = JS_VALUE_GET_OBJ(array_arg);
++    /* a fast array keeps its length in its first property: read it
++       there rather than look "length" up (VitaSurf) */
++    if (p->class_id == JS_CLASS_ARRAY && p->fast_array &&
++        JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT) {
++        len = JS_VALUE_GET_INT(p->prop[0].u.value);
++    } else if (js_get_length32(ctx, &len, array_arg)) {
+         return NULL;
++    }
+     if (len > JS_MAX_LOCAL_VARS) {
+         // XXX: check for stack overflow?
+         JS_ThrowRangeError(ctx, "too many arguments in function call (only %d allowed)",
+                            JS_MAX_LOCAL_VARS);
+         return NULL;
+     }
+-    /* avoid allocating 0 bytes */
+-    tab = js_mallocz(ctx, sizeof(tab[0]) * max_uint32(1, len));
+-    if (!tab)
+-        return NULL;
+-    p = JS_VALUE_GET_OBJ(array_arg);
++    if (buf != NULL && len <= buf_len) {
++        tab = buf;
++    } else {
++        /* avoid allocating 0 bytes */
++        tab = js_mallocz(ctx, sizeof(tab[0]) * max_uint32(1, len));
++        if (!tab)
++            return NULL;
++    }
+     if ((p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS) &&
+         p->fast_array &&
+         len == p->u.array.count) {
+@@ -43922,7 +43944,7 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
+         for(i = 0; i < len; i++) {
+             ret = JS_GetPropertyUint32(ctx, array_arg, i);
+             if (JS_IsException(ret)) {
+-                free_arg_list(ctx, tab, i);
++                free_arg_list(ctx, tab, i, buf);
+                 return NULL;
+             }
+             tab[i] = ret;
+@@ -43939,7 +43961,7 @@ static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
+ {
+     JSValueConst this_arg, array_arg;
+     uint32_t len;
+-    JSValue *tab, ret;
++    JSValue *tab, ret, buf[ARG_LIST_BUF];
+ 
+     if (check_function(ctx, this_val))
+         return JS_EXCEPTION;
+@@ -43949,7 +43971,7 @@ static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
+          JS_VALUE_GET_TAG(array_arg) == JS_TAG_NULL) && magic != 2) {
+         return JS_Call(ctx, this_val, this_arg, 0, NULL);
+     }
+-    tab = build_arg_list(ctx, &len, array_arg);
++    tab = build_arg_list(ctx, &len, array_arg, buf, ARG_LIST_BUF);
+     if (!tab)
+         return JS_EXCEPTION;
+     if (magic & 1) {
+@@ -43957,7 +43979,7 @@ static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
+     } else {
+         ret = JS_Call(ctx, this_val, this_arg, len, vc(tab));
+     }
+-    free_arg_list(ctx, tab, len);
++    free_arg_list(ctx, tab, len, buf);
+     return ret;
+ }
+ 
+@@ -53186,7 +53208,7 @@ static JSValue js_reflect_construct(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+ {
+     JSValueConst func, array_arg, new_target;
+-    JSValue *tab, ret;
++    JSValue *tab, ret, buf[ARG_LIST_BUF];
+     uint32_t len;
+ 
+     func = argv[0];
+@@ -53198,11 +53220,11 @@ static JSValue js_reflect_construct(JSContext *ctx, JSValueConst this_val,
+     } else {
+         new_target = func;
+     }
+-    tab = build_arg_list(ctx, &len, array_arg);
++    tab = build_arg_list(ctx, &len, array_arg, buf, ARG_LIST_BUF);
+     if (!tab)
+         return JS_EXCEPTION;
+     ret = JS_CallConstructor2(ctx, func, new_target, len, vc(tab));
+-    free_arg_list(ctx, tab, len);
++    free_arg_list(ctx, tab, len, buf);
+     return ret;
+ }
+ 
+diff --git a/quickjs.h b/quickjs.h
+index 3328a2f..b0fd937 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1479,6 +1479,7 @@ JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
+    text instead of each keeping its own (see JSSourceBlob). */
+ #define QJS_VITASURF_SHARED_SOURCE 1
+ 
++
+ JS_EXTERN const char* JS_GetVersion(void);
+ 
+ /* Integration point for quickjs-libc.c, not for public use. */

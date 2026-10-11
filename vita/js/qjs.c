@@ -551,6 +551,9 @@ static char *capture_stack(JSContext *c)
 
 static struct {
 	char where[300];
+	/* the page's own code there, as QuickJS kept its source: a
+	   position in minified script says nothing by itself */
+	char code[100];
 	unsigned int hits;
 } prof[PROF_SLOTS];
 static unsigned int prof_n, prof_samples, prof_other;
@@ -618,18 +621,30 @@ static bool prof_has(const char *s, size_t n, const char *needle)
  * the frame named is the script that was running when the check came
  * round again, just after the call into C.
  */
-static void prof_add(const char *key, unsigned int weight)
+static int prof_find(const char *key)
 {
 	unsigned int i;
 
 	for (i = 0; i < prof_n; i++) {
 		if (strcmp(prof[i].where, key) == 0) {
-			prof[i].hits += weight;
-			return;
+			return (int)i;
 		}
+	}
+	return -1;
+}
+
+static void prof_add(const char *key, unsigned int weight, const char *code)
+{
+	int i = prof_find(key);
+
+	if (i >= 0) {
+		prof[i].hits += weight;
+		return;
 	}
 	if (prof_n < PROF_SLOTS) {
 		snprintf(prof[prof_n].where, sizeof(prof[0].where), "%s", key);
+		snprintf(prof[prof_n].code, sizeof(prof[0].code), "%s",
+			 code != NULL ? code : "");
 		prof[prof_n].hits = weight;
 		prof_n++;
 	} else {
@@ -639,7 +654,7 @@ static void prof_add(const char *key, unsigned int weight)
 
 static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
 {
-	char *st, key[300], f2[100];
+	char *st, key[300], f2[100], code[100];
 	const char *l2;
 
 	if (prof_busy) return;
@@ -684,7 +699,12 @@ static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
 			 " [after %s]", w != NULL ? w :
 			 "a built-in or a compile");
 	}
-	prof_add(key, weight);
+	/* the code at a place seen for the first time */
+	code[0] = '\0';
+	if (prof_find(key) < 0) {
+		JS_GetSourceExcerpt(ctx, code, sizeof(code), 30);
+	}
+	prof_add(key, weight, code);
 }
 
 /*
@@ -704,7 +724,7 @@ static void prof_tail(const char *what)
 		snprintf(key, sizeof(key), "%s [ended in %s]", what,
 			 c_where != NULL ? c_where : "a built-in or a compile");
 		prof_samples += slices > 600 ? 600u : (unsigned int)slices;
-		prof_add(key, slices > 600 ? 600u : (unsigned int)slices);
+		prof_add(key, slices > 600 ? 600u : (unsigned int)slices, NULL);
 	}
 	prof_last_ms = prof_last_call_ms = t;
 	c_where = NULL;
@@ -838,6 +858,25 @@ void vita_js_report_profile(void)
 		qjs_pool_stats_reset();
 	}
 
+	/* and how much of the time was the cycle collector's (VitaSurf):
+	   script that makes cyclic garbage fast pays for it in full
+	   collections of everything live */
+	if (qjs_memory_rt != NULL) {
+		static uint32_t gc_runs_seen;
+		static uint64_t gc_ns_seen;
+		uint32_t runs;
+		uint64_t ns;
+
+		JS_GetGCStats(qjs_memory_rt, &runs, &ns);
+		if (runs >= gc_runs_seen && runs != gc_runs_seen) {
+			vita_log("qjs: %u garbage collections took %u ms",
+				 (unsigned int)(runs - gc_runs_seen),
+				 (unsigned int)((ns - gc_ns_seen) / 1000000u));
+		}
+		gc_runs_seen = runs;
+		gc_ns_seen = ns;
+	}
+
 	if (id_calls > 0) {
 		vita_log("getElementById: %u calls, %u answered from the index, "
 			 "%u by it being current, %u walks of the document in "
@@ -873,6 +912,9 @@ void vita_js_report_profile(void)
 		vita_log("profile: %3u%% %s",
 			 prof[best].hits * 100u / prof_samples,
 			 prof[best].where);
+		if (prof[best].code[0] != '\0') {
+			vita_log("profile:       here: %s", prof[best].code);
+		}
 		prof[best].hits = 0;
 	}
 	if (prof_other > 0) {

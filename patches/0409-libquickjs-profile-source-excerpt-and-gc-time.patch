@@ -1,0 +1,121 @@
+diff --git a/quickjs.c b/quickjs.c
+index 4a133b3..8dc1858 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -296,6 +296,10 @@ struct JSRuntime {
+     struct list_head tmp_obj_list; /* used during GC */
+     JSGCPhaseEnum gc_phase : 8;
+     size_t malloc_gc_threshold;
++    /* VitaSurf: collections run and the time they took, for the page
++       report; see JS_GetGCStats */
++    uint32_t vita_gc_runs;
++    uint64_t vita_gc_ns;
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     struct list_head string_list; /* list of JSString.link */
+ #endif
+@@ -7194,6 +7198,8 @@ static void gc_free_cycles(JSRuntime *rt)
+ 
+ void JS_RunGC(JSRuntime *rt)
+ {
++    uint64_t t0 = js__hrtime_ns();
++
+     /* decrement the reference of the children of each object. mark =
+        1 after this pass. */
+     gc_decref(rt);
+@@ -7203,6 +7209,16 @@ void JS_RunGC(JSRuntime *rt)
+ 
+     /* free the GC objects in a cycle */
+     gc_free_cycles(rt);
++
++    rt->vita_gc_runs++;
++    rt->vita_gc_ns += js__hrtime_ns() - t0;
++}
++
++/* VitaSurf: see quickjs.h */
++void JS_GetGCStats(JSRuntime *rt, uint32_t *runs, uint64_t *ns)
++{
++    *runs = rt->vita_gc_runs;
++    *ns = rt->vita_gc_ns;
+ }
+ 
+ /* Return false if not an object or if the object has already been
+@@ -7845,6 +7861,58 @@ fail:
+     return b->line_num;
+ }
+ 
++/* VitaSurf: the source around where the innermost script frame is, for
++   the profiler to show what a hot position is; see quickjs.h */
++int JS_GetSourceExcerpt(JSContext *ctx, char *buf, int buf_len, int before)
++{
++    JSStackFrame *sf = ctx->rt->current_stack_frame;
++    JSFunctionBytecode *b;
++    JSObject *p;
++    int line, col, l, c, i, pos, start, n;
++
++    if (!sf || !buf || buf_len < 2)
++        return 0;
++    buf[0] = '\0';
++    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(sf->cur_func);
++    if (!js_class_has_bytecode(p->class_id))
++        return 0;
++    b = p->u.func.function_bytecode;
++    if (!b || b->lazy || !b->source || b->source_len <= 0 || !sf->cur_pc)
++        return 0;
++    line = find_line_num(ctx, b, sf->cur_pc - b->byte_code_buf - 1, &col);
++    if (line < 0)
++        return 0;
++    /* walk the function's own text from where it starts to there */
++    l = b->line_num;
++    c = b->col_num;
++    pos = -1;
++    for (i = 0; i < b->source_len; i++) {
++        if (l > line || (l == line && c >= col)) {
++            pos = i;
++            break;
++        }
++        if (b->source[i] == '\n') {
++            l++;
++            c = 1;
++        } else {
++            c++;
++        }
++    }
++    if (pos < 0)
++        return 0;
++    start = pos > before ? pos - before : 0;
++    n = b->source_len - start;
++    if (n > buf_len - 1)
++        n = buf_len - 1;
++    for (i = 0; i < n; i++) {
++        unsigned char ch = (unsigned char)b->source[start + i];
++        buf[i] = (ch < 0x20 || ch == 0x7f) ? ' ' : (char)ch;
++    }
++    buf[n] = '\0';
++    return n;
++}
+ 
+ /* in order to avoid executing arbitrary code during the stack trace
+    generation, we only look at simple 'name' properties containing a
+diff --git a/quickjs.h b/quickjs.h
+index b0fd937..63c3cbc 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1479,6 +1479,16 @@ JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
+    text instead of each keeping its own (see JSSourceBlob). */
+ #define QJS_VITASURF_SHARED_SOURCE 1
+ 
++/* VitaSurf: up to buf_len - 1 bytes of the source where the innermost
++   frame is, starting up to before bytes ahead of it, for a profiler to
++   show what a hot position is; 0 when that frame is not script or its
++   source is not kept. */
++JS_EXTERN int JS_GetSourceExcerpt(JSContext *ctx, char *buf, int buf_len,
++                                  int before);
++
++/* VitaSurf: how many cycle collections the runtime has run, and the
++   nanoseconds they took in all. */
++JS_EXTERN void JS_GetGCStats(JSRuntime *rt, uint32_t *runs, uint64_t *ns);
+ 
+ JS_EXTERN const char* JS_GetVersion(void);
+ 
