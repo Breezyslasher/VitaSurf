@@ -4,9 +4,9 @@
 
 VitaSurf (working name) is a PS Vita port of the NetSurf web browser. It uses NetSurf's framebuffer frontend with a Vita-specific libnsfb surface. JavaScript starts with NetSurf's existing Duktape engine; replacing it with QuickJS is a later phase.
 
-Goal: usable browsing of ordinary sites (docs, wikis, forums, simple interactive pages) at 960x544 with buttons and touch.
+Goal: usable browsing of as many websites as possible, including script-heavy sites and web apps, at 960x544 with buttons and touch, with every page loaded and usable in under 20 seconds on real hardware. A site that does not work, or takes longer, is a bug to fix by making the browser faster or more correct, never by tailoring it to that site.
 
-Non-goals: heavy single-page web apps, WebGL, and DRM/EME. Do not add, stub, or work around DRM.
+Non-goals: WebGL and DRM/EME. Do not add, stub, or work around DRM.
 
 License: NetSurf is GPLv2, so this project is GPLv2. Every added library must be GPLv2-compatible (QuickJS is MIT, which is fine).
 
