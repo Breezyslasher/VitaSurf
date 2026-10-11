@@ -140,6 +140,7 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # natives-close.js, which make the whole one function (see them).
     set(PRELUDE_PARTS
         vita/js/natives-open.js
+        vita/js/url.js
         vita/js/prelude.js
         vita/js/streams.js
         vita/js/performance.js
@@ -190,9 +191,10 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # engine hands over as flattened paths
     # websocket.c runs WebSocket connections on libcurl's ws API
     # intl.c reads the locale data Intl is built on, resources/intl.pak
+    # url.c is the URL Standard's parser, which URL is built on
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
         vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c
-        vita/js/intl.c)
+        vita/js/intl.c vita/js/url.c)
     # subtle.c takes Ed25519 and X25519 from Monocypher, which mbedTLS
     # does not have
     target_sources(${PROJECT_NAME} PRIVATE

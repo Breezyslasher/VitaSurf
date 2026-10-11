@@ -67,6 +67,7 @@
 #include "intl.h"
 #include "wasm.h"
 #include "websocket.h"
+#include "url.h"
 
 /* JavaScript's share of the C stack: see js_newheap. */
 #define JS_STACK_DEFAULT (1024 * 1024)
@@ -7421,6 +7422,203 @@ static JSValue win_vita_natives_of(JSContext *ctx, JSValueConst this_val,
 		}
 	}
 	return JS_UNDEFINED;
+}
+
+/* --- URL (VitaSurf): the URL Standard's parser, url.c ------------------ */
+
+/* a JS string as UTF-8; a lone surrogate comes out as WTF-8, which url.c
+   reads as U+FFFD */
+static const char *url_arg(JSContext *ctx, JSValueConst v, size_t *len)
+{
+	return JS_ToCStringLen(ctx, len, v);
+}
+
+static JSValue url_str(JSContext *ctx, const struct url_buf *b)
+{
+	return JS_NewStringLen(ctx, b->p != NULL ? b->p : "", b->n);
+}
+
+/*
+ * What a URL object reads, as an array: href, scheme, username,
+ * password, host (null for none), port ("" for none), pathname, query
+ * (null for none), fragment (null for none).
+ */
+static JSValue url_parts(JSContext *ctx, const struct url *u)
+{
+	struct url_buf b = { NULL, 0, 0 };
+	JSValue a = JS_NewArray(ctx);
+	char port[12];
+
+	if (JS_IsException(a)) return a;
+	if (!url_serialize(u, &b, false)) {
+		url_buf_free(&b);
+		JS_FreeValue(ctx, a);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	JS_SetPropertyUint32(ctx, a, 0, url_str(ctx, &b));
+	JS_SetPropertyUint32(ctx, a, 1, url_str(ctx, &u->scheme));
+	JS_SetPropertyUint32(ctx, a, 2, url_str(ctx, &u->username));
+	JS_SetPropertyUint32(ctx, a, 3, url_str(ctx, &u->password));
+	JS_SetPropertyUint32(ctx, a, 4, u->host_null ? JS_NULL :
+			     url_str(ctx, &u->host));
+	port[0] = '\0';
+	if (u->port >= 0) snprintf(port, sizeof(port), "%d", u->port);
+	JS_SetPropertyUint32(ctx, a, 5, JS_NewString(ctx, port));
+	if (!url_pathname(u, &b)) {
+		url_buf_free(&b);
+		JS_FreeValue(ctx, a);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	JS_SetPropertyUint32(ctx, a, 6, url_str(ctx, &b));
+	JS_SetPropertyUint32(ctx, a, 7, u->query_null ? JS_NULL :
+			     url_str(ctx, &u->query));
+	JS_SetPropertyUint32(ctx, a, 8, u->fragment_null ? JS_NULL :
+			     url_str(ctx, &u->fragment));
+	url_buf_free(&b);
+	return a;
+}
+
+/* __vitaURLParse(input, base): the parts, or null when it is no URL */
+static JSValue win_vita_url_parse(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	struct url base, u;
+	const char *in, *bs;
+	size_t n, bn;
+	int rc = URL_OK;
+	bool has_base = argc > 1 && !JS_IsUndefined(argv[1]);
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) return JS_NULL;
+	url_init(&base);
+	url_init(&u);
+	if (has_base) {
+		bs = url_arg(ctx, argv[1], &bn);
+		if (bs == NULL) return JS_EXCEPTION;
+		rc = url_parse(bs, bn, NULL, &base);
+		JS_FreeCString(ctx, bs);
+	}
+	if (rc == URL_OK) {
+		in = url_arg(ctx, argv[0], &n);
+		if (in == NULL) {
+			url_free(&base);
+			return JS_EXCEPTION;
+		}
+		rc = url_parse(in, n, has_base ? &base : NULL, &u);
+		JS_FreeCString(ctx, in);
+	}
+	url_free(&base);
+	if (rc == URL_NOMEM) {
+		url_free(&u);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	r = rc == URL_OK ? url_parts(ctx, &u) : JS_NULL;
+	url_free(&u);
+	return r;
+}
+
+/* __vitaURLSet(href, part, value): the parts after that part's setter */
+static JSValue win_vita_url_set(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	struct url u;
+	const char *h, *v;
+	size_t hn, vn;
+	int32_t part = 0;
+	int rc;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 3 || JS_ToInt32(ctx, &part, argv[1]) < 0) return JS_EXCEPTION;
+	h = url_arg(ctx, argv[0], &hn);
+	if (h == NULL) return JS_EXCEPTION;
+	url_init(&u);
+	rc = url_parse(h, hn, NULL, &u);
+	JS_FreeCString(ctx, h);
+	if (rc != URL_OK) {
+		url_free(&u);
+		return JS_NULL;
+	}
+	v = url_arg(ctx, argv[2], &vn);
+	if (v == NULL) {
+		url_free(&u);
+		return JS_EXCEPTION;
+	}
+	rc = url_set(&u, (enum url_part)part, v, vn);
+	JS_FreeCString(ctx, v);
+	if (rc == URL_NOMEM) {
+		url_free(&u);
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	r = url_parts(ctx, &u);
+	url_free(&u);
+	return r;
+}
+
+/*
+ * __vitaURLForm(query): the name-value pairs of an
+ * application/x-www-form-urlencoded string, as one flat array.
+ */
+static JSValue win_vita_url_form(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	const char *s, *p, *end, *amp, *eq;
+	size_t n;
+	uint32_t k = 0;
+	struct url_buf b = { NULL, 0, 0 };
+	JSValue a;
+
+	(void)this_val;
+	if (argc < 1) return JS_NewArray(ctx);
+	s = url_arg(ctx, argv[0], &n);
+	if (s == NULL) return JS_EXCEPTION;
+	a = JS_NewArray(ctx);
+	for (p = s, end = s + n; p < end && !JS_IsException(a); p = amp + 1) {
+		amp = memchr(p, '&', (size_t)(end - p));
+		if (amp == NULL) amp = end;
+		if (amp == p) continue;
+		eq = memchr(p, '=', (size_t)(amp - p));
+		if (eq == NULL) eq = amp;
+		if (!url_form_decode(p, (size_t)(eq - p), &b)) break;
+		JS_SetPropertyUint32(ctx, a, k++, url_str(ctx, &b));
+		if (!url_form_decode(eq < amp ? eq + 1 : amp,
+				     eq < amp ? (size_t)(amp - eq - 1) : 0, &b)) break;
+		JS_SetPropertyUint32(ctx, a, k++, url_str(ctx, &b));
+	}
+	url_buf_free(&b);
+	JS_FreeCString(ctx, s);
+	return a;
+}
+
+/* __vitaURLFormString(list): the serialisation of a flat name-value array */
+static JSValue win_vita_url_form_string(JSContext *ctx, JSValueConst this_val,
+					int argc, JSValueConst *argv)
+{
+	struct url_buf b = { NULL, 0, 0 };
+	int64_t len = 0, i;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1 || JS_GetLength(ctx, argv[0], &len) < 0) return JS_EXCEPTION;
+	for (i = 0; i < len; i++) {
+		JSValue v = JS_GetPropertyInt64(ctx, argv[0], i);
+		const char *s;
+		size_t n;
+		bool ok;
+
+		if (JS_IsException(v)) { url_buf_free(&b); return v; }
+		s = JS_ToCStringLen(ctx, &n, v);
+		JS_FreeValue(ctx, v);
+		if (s == NULL) { url_buf_free(&b); return JS_EXCEPTION; }
+		ok = (i == 0 || url_buf_append(&b, i % 2 ? "=" : "&", 1)) &&
+			url_form_encode(s, n, &b);
+		JS_FreeCString(ctx, s);
+		if (!ok) { url_buf_free(&b); return JS_ThrowOutOfMemory(ctx); }
+	}
+	r = url_str(ctx, &b);
+	url_buf_free(&b);
+	return r;
 }
 
 /* __vitaIsNode(v): whether v is a node wrapper (VitaSurf) */
@@ -16698,6 +16896,18 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaNativesOf",
 			  JS_NewCFunction(ctx, win_vita_natives_of,
 					  "__vitaNativesOf", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaURLParse",
+			  JS_NewCFunction(ctx, win_vita_url_parse,
+					  "__vitaURLParse", 2));
+	JS_SetPropertyStr(ctx, global, "__vitaURLSet",
+			  JS_NewCFunction(ctx, win_vita_url_set,
+					  "__vitaURLSet", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaURLForm",
+			  JS_NewCFunction(ctx, win_vita_url_form,
+					  "__vitaURLForm", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaURLFormString",
+			  JS_NewCFunction(ctx, win_vita_url_form_string,
+					  "__vitaURLFormString", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaIsNode",
 			  JS_NewCFunction(ctx, win_vita_is_node,
 					  "__vitaIsNode", 1));

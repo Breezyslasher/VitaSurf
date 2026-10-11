@@ -7,6 +7,10 @@
  * This file is part of VitaSurf, a PS Vita port of NetSurf.
  * Licensed under the GNU General Public License version 2.
  */
+/* URL and URLSearchParams are vita/js/url.js's, on the URL Standard's
+   parser in C; the prelude's own uses reach them here, not through the
+   interface object a page sees */
+var URL=window.URL,URLSearchParams=window.URLSearchParams;
 /* BEGIN regexp-split (VitaSurf)
  *
  * String.prototype.split with a regular expression, the way the
@@ -2329,41 +2333,7 @@ function Audio(src){var a=document.createElement('audio');
  if(src!==undefined&&src!==null)a.setAttribute('src',String(src));
  return a;}
 W.Audio=Audio;
-function URLSearchParams(init){this._p=[];if(typeof init==='string'){init.replace(/^\?/,'').split('&').forEach(function(kv){if(!kv)return;var i=kv.indexOf('=');var k=i<0?kv:kv.slice(0,i),v=i<0?'':kv.slice(i+1);this._p.push([decodeURIComponent(k.replace(/\+/g,' ')),decodeURIComponent(v.replace(/\+/g,' '))]);},this);}else if(init&&typeof init==='object'){var self=this;(init._p?init._p:Object.keys(init).map(function(k){return [k,init[k]];})).forEach(function(kv){self._p.push([String(kv[0]),String(kv[1])]);});}}
-URLSearchParams.prototype={get:function(k){for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},has:function(k){return this.get(k)!==null;},set:function(k,v){var d=false;this._p=this._p.filter(function(p){if(p[0]!==k)return true;if(d)return false;p[1]=String(v);d=true;return true;});if(!d)this._p.push([k,String(v)]);},append:function(k,v){this._p.push([k,String(v)]);},'delete':function(k){this._p=this._p.filter(function(p){return p[0]!==k;});},forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},toString:function(){return this._p.map(function(p){return encodeURIComponent(p[0])+'='+encodeURIComponent(p[1]);}).join('&');},sort:function(){this._p.sort(function(a,b){return a[0]<b[0]?-1:a[0]>b[0]?1:0;});}};
-URLSearchParams.prototype[Symbol.iterator]=URLSearchParams.prototype.entries;Object.defineProperty(URLSearchParams.prototype,'size',{get:function(){return this._p.length;}});
-var URL_RE=/^([a-z][a-z0-9+.-]*:)?(?:\/\/(?:([^:@\/?#]*)(?::([^@\/?#]*))?@)?([^:\/?#]*)(?::(\d+))?)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
-function URL(url,base){url=String(url);var m=URL_RE.exec(url);if(!m)throw new TypeError('Invalid URL');if(!m[1]){if(base===undefined)throw new TypeError('Invalid URL');var b=new URL(String(base));var path=m[6];if(url.indexOf('//')===0){m[1]=b.protocol;m=URL_RE.exec(b.protocol+url);}else{m[1]=b.protocol;m[2]=b.username;m[3]=b.password;m[4]=b.hostname;m[5]=b.port;if(path===''){m[6]=b.pathname;if(!m[7])m[7]=b.search;}else if(path.charAt(0)!=='/'){var dir=b.pathname.replace(/[^\/]*$/,'');m[6]=dir+path;}var segs=[];m[6].split('/').forEach(function(sg){if(sg==='..')segs.pop();else if(sg!=='.')segs.push(sg);});m[6]=segs.join('/');if(m[6].charAt(0)!=='/')m[6]='/'+m[6];}}this.protocol=(m[1]||'').toLowerCase();this.username=m[2]||'';this.password=m[3]||'';this.hostname=(m[4]||'').toLowerCase();this.port=m[5]||'';this.pathname=m[6]||(this.hostname?'/':'');this.hash=m[8]&&m[8]!=='#'?m[8]:'';this.searchParams=new URLSearchParams(m[7]&&m[7]!=='?'?m[7]:'');}
-/* search reads through searchParams rather than beside it: they used to
- * be two copies of the same thing, and setting one left the other to be
- * the one href was built from. Setting any part rewrites href. */
-Object.defineProperties(URL.prototype,{
- search:{configurable:true,
-  get:function(){var q=this.searchParams.toString();return q?'?'+q:'';},
-  set:function(v){this.searchParams=new URLSearchParams(String(v));}},
- host:{configurable:true,
-  get:function(){return this.hostname+(this.port?':'+this.port:'');},
-  set:function(v){v=String(v);var i=v.indexOf(':');
-   if(i<0){this.hostname=v.toLowerCase();this.port='';}
-   else{this.hostname=v.slice(0,i).toLowerCase();this.port=v.slice(i+1);}}},
- /* A file URL has no host, and its origin serialises as the scheme
-  * alone rather than as null. */
- origin:{configurable:true,get:function(){
-  /* a blob URL's is the origin of the URL inside it */
-  if(this.protocol==='blob:'){
-   try{var in_=new URL(this.href.slice(5).replace(/#.*$/,''));
-    return /^(https?|file):$/.test(in_.protocol)?in_.origin:'null';}
-   catch(e){return 'null';}}
-  if(this.hostname)return this.protocol+'//'+this.host;
-  return this.protocol==='file:'?'file://':'null';}},
- href:{configurable:true,
-  get:function(){var auth=this.username?this.username+(this.password?':'+this.password:'')+'@':'';
-   return this.protocol+(this.hostname||this.protocol==='file:'?'//':'')+auth+this.host+this.pathname+this.search+this.hash;},
-  set:function(v){var u=new URL(String(v));var self=this;
-   ['protocol','username','password','hostname','port','pathname','hash'].forEach(function(k){self[k]=u[k];});
-   this.searchParams=u.searchParams;}}});
-URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=GAP('URL.createObjectURL',function(){return 'blob:';});URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};URL.parse=function(u,b){try{return new URL(u,b);}catch(e){return null;}};
-W.URL=URL;W.URLSearchParams=URLSearchParams;
+URL.createObjectURL=GAP('URL.createObjectURL',function(){return 'blob:';});URL.revokeObjectURL=function(){};
 /* A dynamic import() in page code arrives here (qjs.c's import hook
  * passes the importing script's name as base). QuickJS loads modules
  * synchronously and can only compile source that has arrived, so wait
