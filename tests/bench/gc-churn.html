@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Cyclic garbage over a live heap</title></head>
+<body><pre id="out"></pre>
+<script>
+/* What the cycle collector costs a script that makes cyclic garbage fast
+   while a large heap stays live, as an obfuscated virtual machine does:
+   each collection walks everything live, so how often one runs decides
+   most of it. The log's "garbage collections took" line says how many
+   ran and for how long. ?live=N sets how many objects stay live. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+var LIVE = +(/[?&]live=(\d+)/.exec(location.search) || [0, 150000])[1];
+var live = [], i, t0 = performance.now();
+for (i = 0; i < LIVE; i++) live.push({ i: i, s: 'k' + i, a: [i, i + 1], f: function () { return i; } });
+T('live heap built in', Math.round(performance.now() - t0) + ' ms');
+t0 = performance.now();
+var sum = 0;
+for (i = 0; i < 400000; i++) {
+  var a = { n: i, list: [] }, b = { up: a, v: [i, i * 2] };
+  a.list.push(b);                       /* a cycle: only the collector frees it */
+  var c = function () { return c; };    /* and a closure that holds itself */
+  sum += b.v[1] + (c() === c ? 1 : 0);
+}
+T('churn in', Math.round(performance.now() - t0) + ' ms');
+T('it ran (true)', sum > 0);
+</script>
+</body></html>

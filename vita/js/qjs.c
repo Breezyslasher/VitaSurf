@@ -17278,7 +17278,20 @@ static nserror heap_start(jsheap *ret)
 			limit = (size_t)96 * 1024 * 1024;
 		}
 		JS_SetMemoryLimit(ret->rt, limit);
-		vita_log("qjs: script memory limit %u MB of a %u MB heap",
+		/*
+		 * A cycle collection walks everything live, and QuickJS
+		 * ran the next once the heap was half again what the last
+		 * left, from 256 KB: script that makes cyclic garbage fast,
+		 * as an obfuscated virtual machine does, paid for a walk of
+		 * the whole heap every few megabytes (VitaSurf). Three times
+		 * what is left, at least 8 MB more and at most 32 MB more,
+		 * and short of the limit, which also keeps at least the old
+		 * half: tests/bench/gc-churn.html?live=30000 ran 9
+		 * collections in 210 ms where it ran 28 in 330, and with
+		 * 150000 objects live 9 where it ran 14, in the same time.
+		 */
+		JS_SetGCGrowth(ret->rt, 200, (size_t)8 * 1024 * 1024,
+			       (size_t)32 * 1024 * 1024);		vita_log("qjs: script memory limit %u MB of a %u MB heap",
 			 (unsigned int)(limit / (1024 * 1024)),
 			 vita_heap_size_kb() / 1024);
 	}
