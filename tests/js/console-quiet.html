@@ -32,7 +32,7 @@ delete Error.prepareStackTrace;
 T('traps run by the console (none)', hits.length ? hits.join(', ') : 'none');
 T('console.log as a browser has it (log 0)', console.log.name + ' ' + console.log.length);
 T('console.assert and trace are functions (function function)', typeof console.assert + ' ' + typeof console.trace);
-T('Performance (function true Illegal constructor)', typeof Performance + ' ' +
+T("Performance (function true Failed to construct 'Performance': Illegal constructor)", typeof Performance + ' ' +
   (performance instanceof Performance) + ' ' + (function () { try { new Performance(); } catch (e) { return e.message; } })());
 T('now on the prototype (false true)', Object.prototype.hasOwnProperty.call(performance, 'now') + ' ' +
   ('now' in Performance.prototype));
@@ -48,9 +48,26 @@ T('measure from options (3 6)', (function () { var x = performance.measure('qo',
 T('measure of a missing mark (SyntaxError)', (function () { try { performance.measure('qx', 'nope'); return 'no throw'; } catch (e) { return e.name; } })());
 T('measure with only detail (TypeError)', (function () { try { performance.measure('qd', { detail: 1 }); return 'no throw'; } catch (e) { return e.name; } })());
 T('mark named after PerformanceTiming (SyntaxError)', (function () { try { performance.mark('navigationStart'); return 'no throw'; } catch (e) { return e.name; } })());
-T('entries by type (qa,qb qm,qo)', performance.getEntriesByType('mark').map(function (e) { return e.name; }).join(',') + ' ' +
+T('entries by type, by start time (qa,qb qo,qm)', performance.getEntriesByType('mark').map(function (e) { return e.name; }).join(',') + ' ' +
   performance.getEntriesByType('measure').map(function (e) { return e.name; }).join(','));
 performance.clearMarks(); performance.clearMeasures();
-T('cleared (0)', performance.getEntries().length);
+T('cleared (0)', performance.getEntriesByType('mark').length + performance.getEntriesByType('measure').length);
+T('performance has nothing of its own (0 function)', Object.getOwnPropertyNames(performance).length + ' ' +
+  typeof Object.getOwnPropertyDescriptor(window, 'performance').get);
+var tm = performance.timing;
+T('timing (true 0 true 0)', (tm instanceof PerformanceTiming) + ' ' + Object.keys(tm).length + ' ' +
+  (tm.navigationStart === tm.fetchStart) + ' ' + tm.loadEventEnd);
+T('navigation (true {"type":0,"redirectCount":0} 1 1)', (performance.navigation instanceof PerformanceNavigation) + ' ' +
+  JSON.stringify(performance.navigation) + ' ' + PerformanceNavigation.TYPE_RELOAD + ' ' + performance.navigation.TYPE_RELOAD);
+T('toJSON (timeOrigin,timing,navigation)', Object.keys(performance.toJSON()).join());
+addEventListener('load', function () { setTimeout(function () {
+  var t = performance.timing, k = ['navigationStart', 'domInteractive', 'domContentLoadedEventStart',
+    'domContentLoadedEventEnd', 'domComplete', 'loadEventStart', 'loadEventEnd'], ok = true;
+  for (var i = 1; i < k.length; i++) if (!(t[k[i]] >= t[k[i - 1]])) ok = k[i];
+  T('milestones in order once loaded (true)', ok && t.domInteractive > 0);
+  var n = performance.getEntriesByType('navigation')[0];
+  T('navigation entry (navigation true true)', n.entryType + ' ' + (n.loadEventEnd >= n.domInteractive) +
+    ' ' + (Math.abs(n.loadEventEnd - (t.loadEventEnd - t.navigationStart)) < 1));
+}, 0); });
 </script>
 </body></html>

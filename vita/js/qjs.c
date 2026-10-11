@@ -14016,6 +14016,49 @@ static JSValue win_vita_inspect(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+/*
+ * __vitaFromPrelude() -> whether the function that called the caller is
+ * the prelude's own code (VitaSurf). An interface whose constructor a
+ * page may not call -- "Illegal constructor" -- is still how the
+ * prelude makes its objects, through the same global name, so the
+ * public constructor asks before it refuses. Frames of native functions
+ * between (Reflect.construct, apply) are passed over. Only a
+ * construction that is about to be refused asks, so it costs nothing
+ * on any other path.
+ */
+static JSValue win_vita_from_prelude(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	char buf[1024];
+	const char *p = buf, *e;
+	int line = 0;
+
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	JS_GetBacktraceText(ctx, buf, (int)sizeof(buf), 6);
+	/* line 0 is this native, line 1 the constructor that asks */
+	while (p != NULL && *p != '\0') {
+		char one[256];
+		size_t n;
+
+		e = strchr(p, '\n');
+		n = e != NULL ? (size_t)(e - p) : strlen(p);
+		if (n >= sizeof(one)) {
+			n = sizeof(one) - 1;
+		}
+		memcpy(one, p, n);
+		one[n] = '\0';
+		if (line >= 2 && strstr(one, "(native)") == NULL) {
+			return JS_NewBool(ctx, strstr(one, "(<prelude>") != NULL ||
+					  strstr(one, "(<intl>") != NULL);
+		}
+		line++;
+		p = e != NULL ? e + 1 : NULL;
+	}
+	return JS_FALSE;
+}
+
 /* __vitaStackText() -> the stack as Error.stack shows it, made without
  * running the page's Error.prepareStackTrace or any getter */
 static JSValue win_vita_stack_text(JSContext *ctx, JSValueConst this_val,
@@ -16318,6 +16361,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaSetLocation",
 			  JS_NewCFunction(ctx, win_vita_set_location,
 					  "__vitaSetLocation", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaFromPrelude",
+			  JS_NewCFunction(ctx, win_vita_from_prelude,
+					  "__vitaFromPrelude", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaNativesOf",
 			  JS_NewCFunction(ctx, win_vita_natives_of,
 					  "__vitaNativesOf", 1));

@@ -147,6 +147,7 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/subtle.js
         vita/js/wasm.js
         vita/js/lazy.js
+        vita/js/interfaces.js
         vita/js/natives-close.js)
     # Intl, the largest part, is a unit of its own that runs the first
     # time a page uses it (vita/js/lazy.js): most pages never do, and it
