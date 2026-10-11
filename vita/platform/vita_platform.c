@@ -250,10 +250,38 @@ unsigned int vita_heap_free_kb(void)
 	return used_kb < size_kb ? size_kb - used_kb : 0;
 }
 
+/*
+ * Raise the clocks to their maximum (VitaSurf). Script, layout and CSS
+ * are CPU bound, and an app runs at 333 MHz unless it asks for 444. The
+ * request was never checked, so say what the clocks are, and ask again
+ * when they are lower: at startup, after a resume, and at every page
+ * load, which logs them.
+ */
+static void set_clocks(const char *what)
+{
+	int arm = scePowerGetArmClockFrequency();
+	int bus = scePowerGetBusClockFrequency();
+
+	if (arm >= 444 && bus >= 222)
+		return;
+	scePowerSetArmClockFrequency(444);
+	scePowerSetBusClockFrequency(222);
+	scePowerSetGpuClockFrequency(222);
+	scePowerSetGpuXbarClockFrequency(166);
+	vita_log("cpu (%s): ARM was %d MHz and bus %d MHz, now %d and %d",
+		 what, arm, bus, scePowerGetArmClockFrequency(),
+		 scePowerGetBusClockFrequency());
+}
+
 void vita_log_memory(const char *what)
 {
 	SceKernelFreeMemorySizeInfo info;
 	struct mallinfo mi;
+
+	vita_log("cpu (%s): ARM %d MHz, bus %d MHz", what,
+		 scePowerGetArmClockFrequency(),
+		 scePowerGetBusClockFrequency());
+	set_clocks(what);
 
 	memset(&info, 0, sizeof(info));
 	info.size = sizeof(info);
@@ -334,6 +362,8 @@ int vita_platform_poll_resume(void)
 			resumed = 1;
 		}
 	}
+	if (resumed)
+		set_clocks("resume");
 	return resumed;
 }
 
@@ -995,10 +1025,7 @@ int vita_platform_init(void)
 	}
 
 	/* Layout and CSS are CPU bound; run at the maximum clocks. */
-	scePowerSetArmClockFrequency(444);
-	scePowerSetBusClockFrequency(222);
-	scePowerSetGpuClockFrequency(222);
-	scePowerSetGpuXbarClockFrequency(166);
+	set_clocks("startup");
 
 	/* Networking must be up before NetSurf registers the curl fetcher. */
 	vita_net_init();

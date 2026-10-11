@@ -1,0 +1,246 @@
+diff --git a/quickjs.c b/quickjs.c
+index 7a1c5b1..2bb6786 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -14181,6 +14181,58 @@ int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val)
+ }
+ 
+ /* return (<0, 0) in case of exception */
++#if defined(__GNUC__) || defined(__clang__)
++#define js_always_inline inline __attribute__((always_inline))
++#else
++#define js_always_inline inline
++#endif
++
++static js_always_inline int32_t js_float64_to_int32(double d)
++{
++    JSFloat64Union u;
++    int32_t ret;
++    int e;
++    u.d = d;
++    /* we avoid doing fmod(x, 2^32) */
++    e = (u.u64 >> 52) & 0x7ff;
++    if (likely(e <= (1023 + 30))) {
++        /* fast case */
++        ret = (int32_t)d;
++    } else if (e <= (1023 + 30 + 53)) {
++        uint64_t v;
++        /* remainder modulo 2^32 */
++        v = (u.u64 & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
++        v = v << ((e - 1023) - 52 + 32);
++        ret = v >> 32;
++        /* take the sign into account */
++        if (u.u64 >> 63)
++            if (ret != INT32_MIN)
++                ret = -ret;
++    } else {
++        ret = 0; /* also handles NaN and +inf */
++    }
++    return ret;
++}
++
++/* ToInt32 of a value that is already a number, with no call and nothing
++   to free (VitaSurf): obfuscated scripts put float constants into their
++   bitwise arithmetic (x & 255.46, y | .56, a ^ 20478.82), and each such
++   operator took the generic conversion for both operands. */
++static js_always_inline bool js_number_to_int32(JSValueConst v,
++                                                uint32_t *pres)
++{
++    uint32_t tag = JS_VALUE_GET_TAG(v);
++    if (tag == JS_TAG_INT) {
++        *pres = JS_VALUE_GET_INT(v);
++        return true;
++    }
++    if (JS_TAG_IS_FLOAT64(tag)) {
++        *pres = js_float64_to_int32(JS_VALUE_GET_FLOAT64(v));
++        return true;
++    }
++    return false;
++}
++
+ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
+ {
+     uint32_t tag;
+@@ -14196,31 +14248,7 @@ static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
+         ret = JS_VALUE_GET_INT(val);
+         break;
+     case JS_TAG_FLOAT64:
+-        {
+-            JSFloat64Union u;
+-            double d;
+-            int e;
+-            d = JS_VALUE_GET_FLOAT64(val);
+-            u.d = d;
+-            /* we avoid doing fmod(x, 2^32) */
+-            e = (u.u64 >> 52) & 0x7ff;
+-            if (likely(e <= (1023 + 30))) {
+-                /* fast case */
+-                ret = (int32_t)d;
+-            } else if (e <= (1023 + 30 + 53)) {
+-                uint64_t v;
+-                /* remainder modulo 2^32 */
+-                v = (u.u64 & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
+-                v = v << ((e - 1023) - 52 + 32);
+-                ret = v >> 32;
+-                /* take the sign into account */
+-                if (u.u64 >> 63)
+-                    if (ret != INT32_MIN)
+-                        ret = -ret;
+-            } else {
+-                ret = 0; /* also handles NaN and +inf */
+-            }
+-        }
++        ret = js_float64_to_int32(JS_VALUE_GET_FLOAT64(val));
+         break;
+     default:
+         val = JS_ToNumberFree(ctx, val);
+@@ -15207,8 +15235,13 @@ static __exception int js_post_inc_slow(JSContext *ctx,
+ static no_inline int js_not_slow(JSContext *ctx, JSValue *sp)
+ {
+     JSValue op1;
++    uint32_t v1;
+ 
+     op1 = sp[-1];
++    if (js_number_to_int32(op1, &v1)) {
++        sp[-1] = js_int32(~v1);
++        return 0;
++    }
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1))
+         goto exception;
+@@ -15556,6 +15589,8 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
+ 
+     op1 = sp[-2];
+     op2 = sp[-1];
++    if (js_number_to_int32(op1, &v1) && js_number_to_int32(op2, &v2))
++        goto number_op;
+     tag1 = JS_VALUE_GET_NORM_TAG(op1);
+     tag2 = JS_VALUE_GET_NORM_TAG(op2);
+ 
+@@ -15679,6 +15714,7 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
+         }
+         if (unlikely(JS_ToInt32Free(ctx, (int32_t *)&v2, op2)))
+             goto exception;
++    number_op:
+         switch(op) {
+         case OP_shl:
+             r = v1 << (v2 & 0x1f);
+@@ -16072,6 +16108,10 @@ static no_inline int js_shr_slow(JSContext *ctx, JSValue *sp)
+ 
+     op1 = sp[-2];
+     op2 = sp[-1];
++    if (js_number_to_int32(op1, &v1) && js_number_to_int32(op2, &v2)) {
++        sp[-2] = js_uint32(v1 >> (v2 & 0x1f));
++        return 0;
++    }
+     op1 = JS_ToNumericFree(ctx, op1);
+     if (JS_IsException(op1)) {
+         JS_FreeValue(ctx, op2);
+@@ -20085,6 +20125,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_shl):
+             {
+                 JSValue op1, op2;
++                uint32_t n1, n2;
+                 op1 = sp[-2];
+                 op2 = sp[-1];
+                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+@@ -20093,6 +20134,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     v2 = JS_VALUE_GET_INT(op2) & 0x1f;
+                     sp[-2] = js_int32(v1 << v2);
+                     sp--;
++                } else if (js_number_to_int32(op1, &n1) &&
++                           js_number_to_int32(op2, &n2)) {
++                    sp[-2] = js_int32(n1 << (n2 & 0x1f));
++                    sp--;
+                 } else {
+                     sf->cur_pc = pc;
+                     if (js_binary_logic_slow(ctx, sp, opcode))
+@@ -20104,6 +20149,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_shr):
+             {
+                 JSValue op1, op2;
++                uint32_t n1, n2;
+                 op1 = sp[-2];
+                 op2 = sp[-1];
+                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+@@ -20112,6 +20158,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     v2 &= 0x1f;
+                     sp[-2] = js_uint32((uint32_t)JS_VALUE_GET_INT(op1) >> v2);
+                     sp--;
++                } else if (js_number_to_int32(op1, &n1) &&
++                           js_number_to_int32(op2, &n2)) {
++                    sp[-2] = js_uint32(n1 >> (n2 & 0x1f));
++                    sp--;
+                 } else {
+                     sf->cur_pc = pc;
+                     if (js_shr_slow(ctx, sp))
+@@ -20123,6 +20173,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_sar):
+             {
+                 JSValue op1, op2;
++                uint32_t n1, n2;
+                 op1 = sp[-2];
+                 op2 = sp[-1];
+                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+@@ -20133,6 +20184,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     }
+                     sp[-2] = js_int32((int)JS_VALUE_GET_INT(op1) >> v2);
+                     sp--;
++                } else if (js_number_to_int32(op1, &n1) &&
++                           js_number_to_int32(op2, &n2)) {
++                    sp[-2] = js_int32((int)n1 >> (n2 & 0x1f));
++                    sp--;
+                 } else {
+                     sf->cur_pc = pc;
+                     if (js_binary_logic_slow(ctx, sp, opcode))
+@@ -20144,11 +20199,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_and):
+             {
+                 JSValue op1, op2;
++                uint32_t n1, n2;
+                 op1 = sp[-2];
+                 op2 = sp[-1];
+                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                     sp[-2] = js_int32(JS_VALUE_GET_INT(op1) & JS_VALUE_GET_INT(op2));
+                     sp--;
++                } else if (js_number_to_int32(op1, &n1) &&
++                           js_number_to_int32(op2, &n2)) {
++                    sp[-2] = js_int32(n1 & n2);
++                    sp--;
+                 } else {
+                     sf->cur_pc = pc;
+                     if (js_binary_logic_slow(ctx, sp, opcode))
+@@ -20160,11 +20220,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_or):
+             {
+                 JSValue op1, op2;
++                uint32_t n1, n2;
+                 op1 = sp[-2];
+                 op2 = sp[-1];
+                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                     sp[-2] = js_int32(JS_VALUE_GET_INT(op1) | JS_VALUE_GET_INT(op2));
+                     sp--;
++                } else if (js_number_to_int32(op1, &n1) &&
++                           js_number_to_int32(op2, &n2)) {
++                    sp[-2] = js_int32(n1 | n2);
++                    sp--;
+                 } else {
+                     sf->cur_pc = pc;
+                     if (js_binary_logic_slow(ctx, sp, opcode))
+@@ -20176,11 +20241,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_xor):
+             {
+                 JSValue op1, op2;
++                uint32_t n1, n2;
+                 op1 = sp[-2];
+                 op2 = sp[-1];
+                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {
+                     sp[-2] = js_int32(JS_VALUE_GET_INT(op1) ^ JS_VALUE_GET_INT(op2));
+                     sp--;
++                } else if (js_number_to_int32(op1, &n1) &&
++                           js_number_to_int32(op2, &n2)) {
++                    sp[-2] = js_int32(n1 ^ n2);
++                    sp--;
+                 } else {
+                     sf->cur_pc = pc;
+                     if (js_binary_logic_slow(ctx, sp, opcode))

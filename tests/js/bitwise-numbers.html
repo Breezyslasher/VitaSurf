@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Bitwise operators on numbers that are not integers</title></head>
+<body><pre id="out"></pre>
+<script>
+/* A bitwise operator on a number that is not a small integer (x & 255.46,
+   y | .56, 1e20 >>> 3) converts it in line rather than through the
+   generic conversion (VitaSurf, patch 0411). Every operator over every
+   pair of awkward values must give what the spec gives. Each line gives
+   the browser's answer in brackets. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+var vals = [0, -0, 1, -1, 0.5, -0.5, 1.5, -1.5, 255.46, 2147483647, 2147483648, -2147483648, -2147483649,
+  4294967295, 4294967296, 4294967301.7, -4294967301.7, 1e20, -1e20, 2 ** 53, 2 ** 53 + 2, -(2 ** 60), 1e300,
+  NaN, Infinity, -Infinity, 33, 31.9, 32, -1e-300, 5e-324];
+var ops = {
+  and: function (a, b) { return a & b; }, or: function (a, b) { return a | b; },
+  xor: function (a, b) { return a ^ b; }, shl: function (a, b) { return a << b; },
+  sar: function (a, b) { return a >> b; }, shr: function (a, b) { return a >>> b; }
+};
+var h = 0, n = 0;
+for (var k in ops) for (var i = 0; i < vals.length; i++) for (var j = 0; j < vals.length; j++) {
+  var r = ops[k](vals[i], vals[j]);
+  h = (h * 31 + (r | 0) + (r < 0 ? 7 : 0) + (Object.is(r, -0) ? 13 : 0)) | 0; n++;
+}
+T('every pair (5766 -1837250562)', n + ' ' + h);
+T('not (-1,-1,-2,0,-1,-1,-2,0,-256,-2147483648,2147483647,2147483647,-2147483648,0,-1,-6,4,-1661992961,1661992959,-1,-3,-1,-1,-1,-1,-1,-34,-32,-33,-1,-1)',
+  vals.map(function (v) { return ~v; }).join(','));
+var order = [];
+var A = { valueOf: function () { order.push('a'); return 6.7; } }, B = { valueOf: function () { order.push('b'); return 3.2; } };
+var mixed = [A & B, A | B, A ^ B, A << B, A >> B, A >>> B, ~A, '7.9' & 3, true | 2.5, null ^ 1.5, undefined >>> 0.5, [5.5] & 3];
+T('objects, strings and others (2,7,5,48,0,0,-7,3,3,1,0,1 ababababababa)', mixed.join(',') + ' ' + order.join(''));
+T('BigInt (1,7,6,40,-5,-6)', [5n & 3n, 5n | 3n, 5n ^ 3n, 5n << 3n, -40n >> 3n, ~5n].join(','));
+var err = [];
+try { 1.5 & 1n; } catch (e) { err.push(e.name); }
+try { 1.5 >>> 1n; } catch (e) { err.push(e.name); }
+try { 2n >>> 1n; } catch (e) { err.push(e.name); }
+T('mixing BigInt throws (TypeError,TypeError,TypeError)', err.join(','));
+var l1 = 0.5; l1 |= 3.7; var l2 = 7.9; l2 &= 6.1; var l3 = -9.5; l3 >>>= 1.9;
+T('compound assignment (3,6,2147483643)', [l1, l2, l3].join(','));
+</script>
+</body></html>
