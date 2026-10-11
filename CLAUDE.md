@@ -6,7 +6,7 @@ VitaSurf (working name) is a PS Vita port of the NetSurf web browser. It uses Ne
 
 Goal: usable browsing of as many websites as possible, including script-heavy sites and web apps, at 960x544 with buttons and touch, with every page loaded and usable in under 20 seconds on real hardware. A site that does not work, or takes longer, is a bug to fix by making the browser faster or more correct, never by tailoring it to that site.
 
-Non-goals: WebGL and DRM/EME. Do not add, stub, or work around DRM.
+Non-goals: DRM/EME. Do not add, stub, or work around DRM. WebGL is not a non-goal: it is phase 8.
 
 License: NetSurf is GPLv2, so this project is GPLv2. Every added library must be GPLv2-compatible (QuickJS is MIT, which is fine).
 
@@ -79,6 +79,7 @@ Each phase must work on real hardware before the next one starts.
 5. Persistence: cookies, history, bookmarks, and Choices under `ux0:data/VitaSurf/`.
 6. QuickJS: add QuickJS bindings (a new nsgenbind output or hand-written bindings). Done; the Duktape build was kept for comparison until QuickJS was clearly better, and has been removed.
 7. Polish: bundled TrueType font via FreeType, page zoom, downloads, suspend/resume handling.
+8. WebGL 1, after the load-time goal: WebGL 1 is OpenGL ES 2.0, which the Vita's GPU runs (through vitaGL or the system's GLES driver via PVR_PSP2). Pages' GLSL needs a runtime shader compiler (`libshacccg.suprx`, which users extract from their own console, or vitaGL's translator), and a WebGL canvas must reach the screen without a GPU readback every frame. WebGL 2 (OpenGL ES 3.0) is beyond this GPU.
 
 ## Vita gotchas from earlier projects
 
