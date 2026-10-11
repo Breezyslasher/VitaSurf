@@ -1,0 +1,123 @@
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 5c6ee7595..5720489e2 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1960,12 +1960,38 @@ static void fetch_curl_log_refused(struct curl_fetch_info *f, long code)
+ 	}
+ 	{
+ 		char *method = NULL;
++		char body[96];
+ 
+ 		if (curl_easy_getinfo(f->curl_handle, CURLINFO_EFFECTIVE_METHOD,
+ 				      &method) != CURLE_OK || method == NULL)
+ 			method = (char *)"a request";
++		/* and the body it carried, and as what: a refusal of a POST
++		 * is as often about its body as its headers (VitaSurf) */
++		body[0] = '\0';
++		if (f->postdata != NULL &&
++		    f->postdata->type == FETCH_POSTDATA_URLENC) {
++			const char *type = "curl's form type";
++
++			for (h = f->headers; h != NULL; h = h->next) {
++				if (strncasecmp(h->data, "Content-Type:",
++						13) == 0) {
++					type = h->data[13] == '\0' ?
++						"no Content-Type" :
++						"the Content-Type above";
++				}
++			}
++			snprintf(body, sizeof body, ", and a body of %u bytes "
++				 "with %s", (unsigned int)
++				 (f->postdata->length > 0 ?
++				  f->postdata->length :
++				  strlen(f->postdata->data.urlenc)), type);
++		} else if (f->postdata != NULL &&
++			   f->postdata->type == FETCH_POSTDATA_MULTIPART) {
++			snprintf(body, sizeof body, ", and a form's multipart "
++				 "body");
++		}
+ 		NSLOG(netsurf, INFO, "refused: the %li answer to %s, which "
+-		      "sent %s", code, method, line);
++		      "sent %s%s", code, method, line, body);
+ 	}
+ 	if (curl_easy_header(f->curl_handle, "cf-mitigated", 0, CURLH_HEADER,
+ 			     -1, &ch) == CURLHE_OK && ch != NULL) {
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 09002beb4..d7d2e5722 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -1400,12 +1400,12 @@ static void framebuffer_run(void)
+ 					 "callbacks %s",
+ 					 (unsigned) (sched_us / 1000),
+ 					 (unsigned) (img_us / 1000),
+-					 vitasurf_ms_script - p_script,
+-					 vitasurf_ms_js_jobs - p_jobs,
+-					 vitasurf_ms_css - p_css,
+-					 vitasurf_ms_boxes - p_boxes,
+-					 vitasurf_ms_layout - p_layout,
+-					 vitasurf_ms_image - p_image,
++					 vitasurf_since(vitasurf_ms_script, p_script),
++					 vitasurf_since(vitasurf_ms_js_jobs, p_jobs),
++					 vitasurf_since(vitasurf_ms_css, p_css),
++					 vitasurf_since(vitasurf_ms_boxes, p_boxes),
++					 vitasurf_since(vitasurf_ms_layout, p_layout),
++					 vitasurf_since(vitasurf_ms_image, p_image),
+ 					 top[0] != '\0' ? top : "none");
+ 			} else {
+ 				char top[8];
+diff --git a/frontends/framebuffer/schedule.c b/frontends/framebuffer/schedule.c
+index 1702ee31f..232754ff5 100644
+--- a/frontends/framebuffer/schedule.c
++++ b/frontends/framebuffer/schedule.c
+@@ -362,17 +362,17 @@ int schedule_run(void)
+                                               "images %u, drawing %u",
+                                               (unsigned int)(uintptr_t)
+                                               unlnk_nscb->callback, took,
+-                                              vitasurf_ms_script - s_script,
+-                                              vitasurf_ms_js_jobs - s_jobs,
+-                                              vitasurf_css_parsed - s_sheets,
+-                                              vitasurf_ms_css - s_css,
+-                                              vitasurf_ms_inline_style - s_inl,
+-                                              vitasurf_ms_css_index - s_index,
+-                                              vitasurf_ms_boxes - s_boxes,
+-                                              vitasurf_layout_runs - s_runs,
+-                                              vitasurf_ms_layout - s_layout,
+-                                              vitasurf_ms_image - s_image,
+-                                              vitasurf_ms_draw - s_draw);
++                                              vitasurf_since(vitasurf_ms_script, s_script),
++                                              vitasurf_since(vitasurf_ms_js_jobs, s_jobs),
++                                              vitasurf_since(vitasurf_css_parsed, s_sheets),
++                                              vitasurf_since(vitasurf_ms_css, s_css),
++                                              vitasurf_since(vitasurf_ms_inline_style, s_inl),
++                                              vitasurf_since(vitasurf_ms_css_index, s_index),
++                                              vitasurf_since(vitasurf_ms_boxes, s_boxes),
++                                              vitasurf_since(vitasurf_layout_runs, s_runs),
++                                              vitasurf_since(vitasurf_ms_layout, s_layout),
++                                              vitasurf_since(vitasurf_ms_image, s_image),
++                                              vitasurf_since(vitasurf_ms_draw, s_draw));
+                                 }
+                         }
+ 
+diff --git a/utils/utils.h b/utils/utils.h
+index 1e2213fa3..641eae9fe 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -736,6 +736,18 @@ extern bool vitasurf_cache_disabled(void) __attribute__((weak));
+  */
+ extern const char *vitasurf_languages(void) __attribute__((weak));
+ 
++/**
++ * How far a VitaSurf counter moved since an earlier reading of it. The
++ * counters go back to zero when a page starts loading, which can happen
++ * in the middle of the span being measured (a frame navigating inside a
++ * timed callback), so a reading below the earlier one counts from the
++ * reset rather than wrapping round to four thousand million (VitaSurf).
++ */
++static inline unsigned int vitasurf_since(unsigned int now, unsigned int then)
++{
++	return now >= then ? now - then : now;
++}
++
+ /**
+  * Whether a URL is one of the browser's own pages, such as its history or
+  * bookmarks, so that following a link there is the user's own navigation
