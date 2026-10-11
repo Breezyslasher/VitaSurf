@@ -142,11 +142,10 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/natives-open.js
         vita/js/url.js
         vita/js/prelude.js
-        vita/js/streams.js
+        vita/js/streams-use.js
         vita/js/performance.js
         vita/js/storage.js
         vita/js/subtle.js
-        vita/js/wasm.js
         vita/js/lazy.js
         vita/js/geometry.js
         vita/js/nodes.js
@@ -171,7 +170,16 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/intl_range.js
         vita/js/intl.js
         vita/js/natives-close.js)
-    foreach(unit PRELUDE PRELUDE_INTL)
+    # Streams, IndexedDB and WebAssembly are units the same way.
+    set(PRELUDE_STREAMS_PARTS vita/js/natives-open.js vita/js/streams.js
+        vita/js/natives-close.js)
+    set(PRELUDE_IDB_PARTS vita/js/natives-open.js vita/js/idb.js
+        vita/js/natives-close.js)
+    set(PRELUDE_WASM_PARTS vita/js/natives-open.js vita/js/wasm.js
+        vita/js/natives-close.js)
+    set(PRELUDE_UNITS PRELUDE PRELUDE_INTL PRELUDE_STREAMS PRELUDE_IDB
+        PRELUDE_WASM)
+    foreach(unit ${PRELUDE_UNITS})
         set(${unit}_BYTES "")
         foreach(part ${${unit}_PARTS})
             set(full "${CMAKE_SOURCE_DIR}/${part}")
@@ -183,10 +191,12 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
             set(${unit}_BYTES "${${unit}_BYTES}${part_bytes}0x0a,")
         endforeach()
     endforeach()
-    file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
-        "/* generated from ${PRELUDE_PARTS} and ${PRELUDE_INTL_PARTS} */\n"
-        "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n"
-        "static const unsigned char prelude_intl_js[] = {${PRELUDE_INTL_BYTES}0x00};\n")
+    set(PRELUDE_H "/* generated from the parts of ${PRELUDE_UNITS} */\n")
+    foreach(unit ${PRELUDE_UNITS})
+        string(TOLOWER "${unit}" array)
+        set(PRELUDE_H "${PRELUDE_H}static const unsigned char ${array}_js[] = {${${unit}_BYTES}0x00};\n")
+    endforeach()
+    file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h" "${PRELUDE_H}")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
     # websocket.c runs WebSocket connections on libcurl's ws API

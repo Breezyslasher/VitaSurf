@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Units of the prelude run on first use</title></head>
+<body><pre id="out"></pre>
+<script>
+/* Streams, IndexedDB and WebAssembly (and Intl) are units of VitaSurf's
+   prelude that run the first time a page touches what they install
+   (vita/js/lazy.js). What a page sees must not tell: each global has its
+   interface's attributes and shape before and after, Blob.stream() and
+   response.body work before the globals are touched, and a worker has
+   Intl and streams. Every line ends "ok" in Chrome and here. */
+var o = document.getElementById('out'), pending = 0;
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function ok(n, c){ T(n, c ? 'ok' : 'FAILED'); }
+function attrs(o, n){ var d = Object.getOwnPropertyDescriptor(o, n);
+  return d ? (d.writable ? 'w' : '') + (d.enumerable ? 'e' : '') + (d.configurable ? 'c' : '') : 'none'; }
+/* before any of them is read: the keys are there, as in a browser */
+var names = Object.getOwnPropertyNames(window);
+['ReadableStream', 'WritableStream', 'TransformStream', 'TextDecoderStream',
+ 'indexedDB', 'IDBFactory', 'IDBKeyRange', 'WebAssembly'].forEach(function (n) {
+  ok('own property ' + n, names.indexOf(n) >= 0); });
+/* a body stream works before ReadableStream is named */
+pending++;
+new Blob(['abc']).stream().getReader().read().then(function (r) {
+  ok('Blob.stream() before the globals', r.value && r.value.length === 3); done(); });
+pending++;
+new Response('hello').text().then(function (t) { ok('Response text', t === 'hello'); done(); });
+/* the interfaces have WebIDL's attributes and shape */
+['ReadableStream', 'WritableStream', 'TransformStream', 'IDBFactory', 'IDBRequest',
+ 'IDBOpenDBRequest', 'IDBVersionChangeEvent', 'WebAssembly'].forEach(function (n) {
+  ok(n + ' is writable and configurable, not enumerable', attrs(window, n) === 'wc'); });
+ok('indexedDB attributes', attrs(window, 'indexedDB') === 'wec' || attrs(window, 'indexedDB') === 'ec');
+ok('ReadableStream is a function', typeof ReadableStream === 'function');
+ok('ReadableStream.prototype.constructor', ReadableStream.prototype.constructor === ReadableStream);
+ok('ReadableStream toStringTag', Object.prototype.toString.call(new ReadableStream()) === '[object ReadableStream]');
+ok('ReadableStream needs new', (function () { try { ReadableStream(); return false; } catch (e) { return e instanceof TypeError; } })());
+ok('IDBFactory is illegal to construct', (function () { try { new IDBFactory(); return false; } catch (e) { return e instanceof TypeError; } })());
+ok('indexedDB is an IDBFactory', indexedDB instanceof IDBFactory);
+ok('IDBOpenDBRequest under IDBRequest', Object.getPrototypeOf(IDBOpenDBRequest) === IDBRequest);
+ok('an IDBRequest is an EventTarget', IDBRequest.prototype instanceof EventTarget);
+ok('IDBVersionChangeEvent under Event', Object.getPrototypeOf(IDBVersionChangeEvent) === Event);
+ok('IDBKeyRange.only', IDBKeyRange.only(3).lower === 3);
+ok('WebAssembly toStringTag', Object.prototype.toString.call(WebAssembly) === '[object WebAssembly]');
+ok('WebAssembly.validate', WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0])) === true);
+/* a page's own ReadableStream does not change what a body is */
+var Real = ReadableStream;
+window.ReadableStream = function () {};
+ok('a body stream is the real one', new Response('x').body instanceof Real);
+window.ReadableStream = Real;
+/* IndexedDB opens */
+pending++;
+var req = indexedDB.open('lazy-units-test', 1);
+req.onupgradeneeded = function () { req.result.createObjectStore('s'); };
+req.onsuccess = function () { ok('indexedDB.open', req.result.objectStoreNames.contains('s')); req.result.close(); done(); };
+req.onerror = function () { ok('indexedDB.open', false); done(); };
+/* a worker has Intl and streams */
+pending++;
+var w = new Worker(URL.createObjectURL(new Blob([
+  'var r = [];' +
+  'try { r.push(typeof Intl.DateTimeFormat === "function" && new Intl.NumberFormat("en").format(1234.5) === "1,234.5"); } catch (e) { r.push("" + e); }' +
+  'try { r.push(typeof ReadableStream === "function" && new ReadableStream() instanceof ReadableStream); } catch (e) { r.push("" + e); }' +
+  'try { r.push(typeof indexedDB === "object" && typeof WebAssembly === "object"); } catch (e) { r.push("" + e); }' +
+  'postMessage(r);'], { type: 'text/javascript' })));
+w.onmessage = function (e) {
+  ok('worker Intl', e.data[0] === true); ok('worker ReadableStream', e.data[1] === true);
+  ok('worker indexedDB and WebAssembly', e.data[2] === true); done(); };
+w.onerror = function (e) { T('worker', 'error ' + (e.message || e)); done(); };
+function done(){ if (--pending === 0) T('done', 'ok'); }
+</script>
+</body></html>

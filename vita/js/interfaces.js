@@ -365,19 +365,30 @@ function define(o,k,d){try{Object.defineProperty(o,k,d);}catch(e){}}
    one furthest down; the others get one of their own. Sheets the prelude
    made were no instances of CSSStyleSheet */
 var OWNER=new Map();
-(function(){
+/* a global still waiting for its unit (lazy.js) is not read here, which
+   would run the unit: it is shaped when the unit has run */
+var isLazy=NV.__vitaIsLazy,LATER=null;
+function waits(n){
+ if(typeof isLazy!=='function'||!isLazy(W,n))return false;
+ (LATER||(LATER=Object.create(null)))[n]=true;
+ return true;}
+function owners(rows){
  function depth(n){var d=0;while(n&&PARENT[n]){n=PARENT[n];d++;}return d;}
- TABLE.split('\n').forEach(function(r){
-  var n=r.slice(0,r.indexOf('|')),C=W[n],P=typeof C==='function'?C.prototype:null,o;
+ rows.forEach(function(r){
+  var n=r.slice(0,r.indexOf('|')),C,P,o;
+  if(waits(n))return;
+  C=W[n];P=typeof C==='function'?C.prototype:null;
   if(!P||typeof P!=='object')return;
   o=OWNER.get(P);
   if(o===undefined||(o!==C.name&&(n===C.name||depth(n)>depth(o))))
-   OWNER.set(P,n);});
-})();
+   OWNER.set(P,n);});}
+owners(TABLE.split('\n'));
 function shape(row){
  var f=row.split('|'),name=f[0],parent=f[1],kind=f[2],len=+f[3],
   tag=f[4]==='1'?name:f[4]==='0'?'':f[4],consts=f[5],
-  C=W[name],P,F,pF=parent&&DONE[parent],k,i,keys,d,pP;
+  C,P,F,pF=parent&&DONE[parent],k,i,keys,d,pP;
+ if(waits(name))return;
+ C=W[name];
  if(typeof C!=='function')return;
  P=C.prototype;
  ORIG[name]=C;
@@ -450,6 +461,16 @@ function shape(row){
 ['AnimationTimeline','CSSConditionRule'].forEach(function(n){
  if(typeof W[n]!=='function')W[n]=function(){};});
 TABLE.split('\n').forEach(shape);
+/* the interfaces of a unit that has run since (lazy.js) */
+if(LATER)Object.defineProperty(NV,'__vitaShapeLater',{value:function(){
+ var rows;
+ if(!LATER)return;
+ rows=TABLE.split('\n').filter(function(r){
+  var n=r.slice(0,r.indexOf('|'));
+  return LATER[n]&&!isLazy(W,n);});
+ rows.forEach(function(r){delete LATER[r.slice(0,r.indexOf('|'))];});
+ owners(rows);
+ rows.forEach(shape);}});
 /* the same interface under its old name, as in a browser */
 if(W.MutationObserver)define(W,'WebKitMutationObserver',{value:W.MutationObserver,
  writable:true,enumerable:false,configurable:true});

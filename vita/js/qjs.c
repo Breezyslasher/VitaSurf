@@ -706,8 +706,8 @@ static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
 		snprintf(key + strlen(key), sizeof(key) - strlen(key),
 			 " < %s", f2);
 		/* two frames of our own code: which page call led there */
-		if (strstr(key, "<prelude>") != NULL &&
-		    strstr(f2, "<prelude>") != NULL) {
+		if (strstr(key, "<prelude") != NULL &&
+		    strstr(f2, "<prelude") != NULL) {
 			const char *l = strchr(l2 + 1, '\n');
 
 			while (l != NULL && l[1] != '\0') {
@@ -715,7 +715,7 @@ static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
 				size_t n = e != NULL ? (size_t)(e - l) :
 					strlen(l);
 
-				if (!prof_has(l, n, "<prelude>") &&
+				if (!prof_has(l, n, "<prelude") &&
 				    !prof_has(l, n, "(native)")) {
 					prof_frame(l + 1, f2, sizeof(f2));
 					snprintf(key + strlen(key),
@@ -14579,7 +14579,7 @@ static JSValue win_vita_from_prelude(JSContext *ctx, JSValueConst this_val,
 		memcpy(one, p, n);
 		one[n] = '\0';
 		if (line >= 2 && strstr(one, "(native)") == NULL) {
-			return JS_NewBool(ctx, strstr(one, "(<prelude>") != NULL ||
+			return JS_NewBool(ctx, strstr(one, "(<prelude") != NULL ||
 					  strstr(one, "(<intl>") != NULL);
 		}
 		line++;
@@ -14676,7 +14676,7 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 			p++;
 			len--;
 		}
-		if (len > 0 && !prof_has(p, len, "<prelude>") &&
+		if (len > 0 && !prof_has(p, len, "<prelude") &&
 		    !prof_has(p, len, "(native)")) {
 			/* each page frame's position, for its code: the
 			   first is often a page's own logging helper */
@@ -16606,6 +16606,12 @@ struct prelude_unit {
 static struct prelude_unit prelude_units[] = {
 	{ "intl", "vitasurf:intl-nosrc", "<intl>", prelude_intl_js,
 	  sizeof(prelude_intl_js) - 1, NULL, 0 },
+	{ "streams", "vitasurf:streams-nosrc", "<prelude-streams>",
+	  prelude_streams_js, sizeof(prelude_streams_js) - 1, NULL, 0 },
+	{ "idb", "vitasurf:idb-nosrc", "<prelude-idb>",
+	  prelude_idb_js, sizeof(prelude_idb_js) - 1, NULL, 0 },
+	{ "wasm", "vitasurf:wasm-nosrc", "<prelude-wasm>",
+	  prelude_wasm_js, sizeof(prelude_wasm_js) - 1, NULL, 0 },
 };
 
 /* run a unit in this context; reason is what the page touched */
@@ -16661,8 +16667,12 @@ static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
 			jsthread *thread = JS_GetContextOpaque(ctx);
 			JSValue f = r, nat = thread != NULL ?
 				JS_DupValue(ctx, thread->natives) : JS_UNDEFINED;
+			/* the global is its window, which a worker's global
+			   no longer names once it is a worker's */
+			JSValue global = JS_GetGlobalObject(ctx);
 
-			r = JS_Call(ctx, f, JS_UNDEFINED, 1, &nat);
+			r = JS_Call(ctx, f, global, 1, &nat);
+			JS_FreeValue(ctx, global);
 			JS_FreeValue(ctx, nat);
 			JS_FreeValue(ctx, f);
 		}
@@ -17207,7 +17217,7 @@ static bool setup_globals(jsthread *thread)
 	{
 		const char *src = (const char *)prelude_js;
 		size_t len = sizeof(prelude_js) - 1;
-		uint64_t t0 = 0, t1 = 0;
+		uint64_t t0 = 0, t1 = 0, tr = 0;
 		JSValue fn, r;
 		const char *how = prelude_bc != NULL ? "bytecode" : "source";
 
@@ -17261,6 +17271,8 @@ static bool setup_globals(jsthread *thread)
 				}
 			}
 		}
+		/* reading or compiling it, apart from running it */
+		nsu_getmonotonic_ms(&tr);
 		if (JS_IsException(fn)) {
 			qjs_report_exception_src(ctx, "<prelude>", src, len);
 			JS_FreeValue(ctx, fn);
@@ -17272,10 +17284,11 @@ static bool setup_globals(jsthread *thread)
 			r = JS_EvalFunction(ctx, fn);
 			/* the prelude is one function of N, the natives */
 			if (!JS_IsException(r) && JS_IsFunction(ctx, r)) {
-				JSValue f = r;
+				JSValue f = r, g = JS_GetGlobalObject(ctx);
 
-				r = JS_Call(ctx, f, JS_UNDEFINED, 1,
-					    &thread->natives);
+				/* this is the global, which is its window */
+				r = JS_Call(ctx, f, g, 1, &thread->natives);
+				JS_FreeValue(ctx, g);
 				JS_FreeValue(ctx, f);
 			}
 			miss_quiet = false;
@@ -17293,9 +17306,9 @@ static bool setup_globals(jsthread *thread)
 		 * it was in none of the buckets.
 		 */
 		vitasurf_ms_prelude += (unsigned int)(t1 - t0);
-		vita_log("qjs: prelude %u KB ran in %u ms (%s)",
-			 (unsigned int)(len / 1024),
-			 (unsigned int)(t1 - t0), how);
+		vita_log("qjs: prelude %u KB ran in %u ms (%s, %u ms of it "
+			 "reading)", (unsigned int)(len / 1024),
+			 (unsigned int)(t1 - t0), how, (unsigned int)(tr - t0));
 	}
 	return ok;
 }
@@ -19954,7 +19967,7 @@ static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
 
 	(void)opaque;
 	if (thread == NULL || thread->closed || base == NULL ||
-	    strcmp(base, "<prelude>") == 0) {
+	    strncmp(base, "<prelude", 8) == 0) {
 		return false;
 	}
 	global = JS_GetGlobalObject(ctx);

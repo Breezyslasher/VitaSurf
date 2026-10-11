@@ -7061,7 +7061,7 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   /* body and textStream used to be defined here as getters returning
      null, which is worse than leaving them out: a page that tests for
      response.body stops taking its fallback and then calls getReader()
-     on null. streams.js gives Response a real ReadableStream. */});
+     on null. streams-use.js gives Response a real ReadableStream. */});
  if(W.Request){var rp=W.Request.prototype;
   ['destination','referrer','referrerPolicy','integrity','duplex'].forEach(function(k){
    if(!(k in rp))rp[k]='';});
@@ -7470,7 +7470,7 @@ Blob.prototype.slice=function(a,b,type){
  a=a===undefined?0:(a<0?Math.max(n+a,0):Math.min(a,n));
  b=b===undefined?n:(b<0?Math.max(n+b,0):Math.min(b,n));
  return new Blob([u.subarray(a,Math.max(a,b))],{type:type||''});};
-/* Blob.prototype.stream is a real ReadableStream; see streams.js. */
+/* Blob.prototype.stream is a real ReadableStream; see streams-use.js. */
 Object.defineProperty(Blob.prototype,Symbol.toStringTag,{configurable:true,value:'Blob'});
 W.Blob=Blob;
 function File(parts,name,opts){Blob.call(this,parts,opts);
@@ -7776,7 +7776,7 @@ if(W.OffscreenCanvas){W.OffscreenCanvas.prototype.oncontextlost=null;
 CanvasRenderingContext2D.prototype.lang='inherit';
 CanvasRenderingContext2D.prototype.isContextLost=function(){return false;};
 ImageData.prototype.pixelFormat='rgba-unorm8';
-/* Blob.prototype.textStream is a real ReadableStream; see streams.js. */
+/* Blob.prototype.textStream is a real ReadableStream; see streams-use.js. */
 /* The rest of the console. Only log, warn, error, info and debug came
  * from the bindings, and a page that calls one of the others got
  * "not a function" -- claude.ai opens its entry chunk with
@@ -7887,41 +7887,6 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
     !('fullscreenElement' in W.ShadowRoot.prototype)){
   try{Object.defineProperty(W.ShadowRoot.prototype,'fullscreenElement',
    {configurable:true,get:function(){return null;}});}catch(e){}}
-})();
-
-(function(){
- /* IndexedDB. There is no store behind this, so every request fails --
-    but it fails the way a request fails, asynchronously and through
-    onerror, so a page that opens a database and waits is told no
-    instead of waiting for ever. Pages that keep their state here fall
-    back to memory, which is what claude.ai already reports doing. */
- function Request(){
-  this.readyState='pending';this.result=undefined;
-  this.error=new DOMException('IndexedDB is not available here.',
-   'UnknownError');
-  this.source=null;this.transaction=null;
-  this.onsuccess=null;this.onerror=null;this.onblocked=null;
-  this.onupgradeneeded=null;
-  var self=this;
-  setTimeout(function(){
-   self.readyState='done';
-   var e={type:'error',target:self,currentTarget:self,
-    preventDefault:function(){},stopPropagation:function(){}};
-   if(typeof self.onerror==='function'){try{self.onerror(e);}catch(x){}}
-  },0);}
- Request.prototype.addEventListener=function(t,f){
-  if(t==='error')this.onerror=f;
-  else if(t==='success')this.onsuccess=f;};
- Request.prototype.removeEventListener=function(){};
- Request.prototype.dispatchEvent=function(){return true;};
- function IDBFactory(){}
- IDBFactory.prototype.open=function(){return new Request();};
- IDBFactory.prototype.deleteDatabase=function(){return new Request();};
- IDBFactory.prototype.databases=function(){return Promise.resolve([]);};
- IDBFactory.prototype.cmp=function(a,b){return a<b?-1:a>b?1:0;};
- W.IDBFactory=IDBFactory;
- W.IDBRequest=Request;
- W.indexedDB=new IDBFactory();
 })();
 
 (function(){
