@@ -1868,7 +1868,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
    var e=new Event(type,init); e.state=(init&&init.state)||null; return e; };
  }
 })();
-var t0=Date.now();var perf=W.performance||{};W.performance=perf;if(!perf.now)perf.now=function(){return Date.now()-t0;};perf.timing={navigationStart:t0,unloadEventStart:0,unloadEventEnd:0,redirectStart:0,redirectEnd:0,secureConnectionStart:0,fetchStart:t0,domainLookupStart:t0,domainLookupEnd:t0,connectStart:t0,connectEnd:t0,requestStart:t0,responseStart:t0,responseEnd:t0,domLoading:t0,domInteractive:t0,domContentLoadedEventStart:t0,domContentLoadedEventEnd:t0,domComplete:t0,loadEventStart:t0,loadEventEnd:t0};perf.navigation={type:0,redirectCount:0};perf.mark=perf.measure=perf.clearMarks=perf.clearMeasures=function(){};perf.getEntries=perf.getEntriesByType=perf.getEntriesByName=function(){return [];};
+var t0=Date.now();var hr0=typeof __vitaNow==='function'?__vitaNow():0;var perf=W.performance||{};W.performance=perf;if(!perf.now)perf.now=function(){return Date.now()-t0;};perf.timing={navigationStart:t0,unloadEventStart:0,unloadEventEnd:0,redirectStart:0,redirectEnd:0,secureConnectionStart:0,fetchStart:t0,domainLookupStart:t0,domainLookupEnd:t0,connectStart:t0,connectEnd:t0,requestStart:t0,responseStart:t0,responseEnd:t0,domLoading:t0,domInteractive:t0,domContentLoadedEventStart:t0,domContentLoadedEventEnd:t0,domComplete:t0,loadEventStart:t0,loadEventEnd:t0};perf.navigation={type:0,redirectCount:0};perf.mark=perf.measure=perf.clearMarks=perf.clearMeasures=function(){};perf.getEntries=perf.getEntriesByType=perf.getEntriesByName=function(){return [];};
 (function(){var l=String(typeof __vitaLanguages==='function'?__vitaLanguages():'en-US,en').split(',').map(function(t){return t.trim();}).filter(Boolean);if(!l.length)l=['en-US','en'];navigator.language=l[0];navigator.languages=Object.freeze(l);})();navigator.cookieEnabled=true;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};
 location.reload=function(){location.href=location.href;};
 ['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:m[1]?m[1]+'//'+(m[2]||''):'null'}[k];}});});
@@ -7753,6 +7753,146 @@ W.PerformanceNavigation=function(){};
 if(W.performance&&W.performance.navigation){
  W.performance.navigation.toJSON=function(){return {type:this.type,redirectCount:this.redirectCount};};
  Object.setPrototypeOf(W.performance.navigation,W.PerformanceNavigation.prototype);}
+/* Performance as the interface it is (VitaSurf). performance was a plain
+ * object whose methods were its own properties, now() moved in whole
+ * milliseconds (Date.now() less the start), mark() and measure() did
+ * nothing and returned nothing, and there was no Performance, which a
+ * check that looks for it reads as something else standing in. Now
+ * now() is the native monotonic clock to 0.1 ms, as a browser that is
+ * not cross-origin isolated gives it, the members are on the prototype,
+ * and User Timing keeps its marks and measures as the specification
+ * says, with its errors. There are no navigation or resource entries:
+ * nothing here records them. */
+(function(){
+ var perf=W.performance,hrnow=W.__vitaNow,timing=perf&&perf.timing,
+     nav=perf&&perf.navigation,ET=W.EventTarget,DE=W.DOMException;
+ if(!perf)return;
+ function nowf(){return typeof hrnow==='function'?
+  Math.max(0,Math.round((hrnow()-hr0)*10)/10):Date.now()-t0;}
+ function illegal(){throw new TypeError('Illegal constructor');}
+ function named(f,n){Object.defineProperty(f,'name',{value:n,configurable:true});return f;}
+ function method(o,n,f){Object.defineProperty(o,n,{value:named(f,n),writable:true,
+  enumerable:true,configurable:true});}
+ function getter(o,n,f){Object.defineProperty(o,n,{get:named(f,'get '+n),
+  enumerable:true,configurable:true});}
+ var Performance=named(function(){illegal();},'Performance');
+ Performance.prototype=Object.create(ET?ET.prototype:Object.prototype);
+ Object.defineProperty(Performance.prototype,'constructor',{value:Performance,
+  writable:true,configurable:true});
+ Object.defineProperty(Performance.prototype,Symbol.toStringTag,{value:'Performance',
+  configurable:true});
+ /* entries */
+ var ENTRY=Symbol('entry');
+ var PerformanceEntry=named(function(){illegal();},'PerformanceEntry');
+ ['name','entryType','startTime','duration'].forEach(function(k){
+  getter(PerformanceEntry.prototype,k,function(){var d=this&&this[ENTRY];
+   if(!d)throw new TypeError('Illegal invocation');return d[k];});});
+ method(PerformanceEntry.prototype,'toJSON',function(){var d=this[ENTRY],o=
+  {name:d.name,entryType:d.entryType,startTime:d.startTime,duration:d.duration};
+  if('detail' in d)o.detail=d.detail;return o;});
+ Object.defineProperty(PerformanceEntry.prototype,Symbol.toStringTag,
+  {value:'PerformanceEntry',configurable:true});
+ var TIMING=['navigationStart','unloadEventStart','unloadEventEnd','redirectStart',
+  'redirectEnd','fetchStart','domainLookupStart','domainLookupEnd','connectStart',
+  'connectEnd','secureConnectionStart','requestStart','responseStart','responseEnd',
+  'domLoading','domInteractive','domContentLoadedEventStart',
+  'domContentLoadedEventEnd','domComplete','loadEventStart','loadEventEnd'];
+ function syntax(m){return DE?new DE(m,'SyntaxError'):new SyntaxError(m);}
+ function clone(v){return v===undefined||v===null?null:
+  (typeof W.structuredClone==='function'?W.structuredClone(v):v);}
+ function make(proto,d){var e=Object.create(proto);
+  Object.defineProperty(e,ENTRY,{value:d});return e;}
+ var PerformanceMark=named(function(name,options){
+  if(!new.target)throw new TypeError("Failed to construct 'PerformanceMark': Please use the 'new' operator");
+  name=`${name}`;
+  if(TIMING.indexOf(name)>=0)throw syntax(`'${name}' is part of the PerformanceTiming interface, and cannot be used as a mark name.`);
+  var st=options&&options.startTime!==undefined?+options.startTime:nowf();
+  if(st<0)throw new TypeError("'"+name+"' cannot have a negative start time.");
+  var d={name:name,entryType:'mark',startTime:st,duration:0,
+   detail:clone(options?options.detail:null)};
+  Object.defineProperty(this,ENTRY,{value:d});},'PerformanceMark');
+ PerformanceMark.prototype=Object.create(PerformanceEntry.prototype);
+ Object.defineProperty(PerformanceMark.prototype,'constructor',{value:PerformanceMark,
+  writable:true,configurable:true});
+ getter(PerformanceMark.prototype,'detail',function(){return this[ENTRY].detail;});
+ Object.defineProperty(PerformanceMark.prototype,Symbol.toStringTag,
+  {value:'PerformanceMark',configurable:true});
+ var PerformanceMeasure=named(function(){illegal();},'PerformanceMeasure');
+ PerformanceMeasure.prototype=Object.create(PerformanceEntry.prototype);
+ Object.defineProperty(PerformanceMeasure.prototype,'constructor',
+  {value:PerformanceMeasure,writable:true,configurable:true});
+ getter(PerformanceMeasure.prototype,'detail',function(){return this[ENTRY].detail;});
+ Object.defineProperty(PerformanceMeasure.prototype,Symbol.toStringTag,
+  {value:'PerformanceMeasure',configurable:true});
+ /* the buffer of marks and measures */
+ var buffer=[];
+ function byStart(list){return list.slice().sort(function(a,b){
+  return a[ENTRY].startTime-b[ENTRY].startTime;});}
+ function toTimestamp(v){
+  if(typeof v==='number'){if(v<0)throw new TypeError('Negative timestamp');return v;}
+  v=`${v}`;
+  if(TIMING.indexOf(v)>=0){var t=timing?timing[v]:0;
+   if(!t)throw DE?new DE(`'${v}' is empty: either the event hasn't happened yet, or it would provide cross-origin timing information.`,'InvalidAccessError'):new TypeError(v);
+   return t-timing.navigationStart;}
+  for(var i=buffer.length-1;i>=0;i--){var d=buffer[i][ENTRY];
+   if(d.entryType==='mark'&&d.name===v)return d.startTime;}
+  throw syntax(`The mark '${v}' does not exist.`);}
+ var P=Performance.prototype;
+ method(P,'now',function(){return nowf();});
+ getter(P,'timeOrigin',function(){return t0;});
+ getter(P,'timing',function(){return timing;});
+ getter(P,'navigation',function(){return nav;});
+ Object.defineProperty(P,'onresourcetimingbufferfull',{value:null,writable:true,
+  enumerable:true,configurable:true});
+ method(P,'toJSON',function(){return {timeOrigin:t0,
+  timing:timing&&timing.toJSON?timing.toJSON():timing,
+  navigation:nav&&nav.toJSON?nav.toJSON():nav};});
+ method(P,'mark',function(name,options){
+  if(arguments.length<1)throw new TypeError("Failed to execute 'mark' on 'Performance': 1 argument required, but only 0 present.");
+  var m=new PerformanceMark(name,options);buffer.push(m);return m;});
+ method(P,'measure',function(name,start,end){
+  if(arguments.length<1)throw new TypeError("Failed to execute 'measure' on 'Performance': 1 argument required, but only 0 present.");
+  name=`${name}`;
+  var opts=start!==null&&typeof start==='object'?start:null,s,e;
+  if(opts&&(opts.start!==undefined||opts.end!==undefined||
+     opts.duration!==undefined||opts.detail!==undefined)){
+   if(end!==undefined)throw new TypeError("If a non-empty PerformanceMeasureOptions object was passed, |end_mark| must not be passed.");
+   if(opts.start===undefined&&opts.end===undefined)throw new TypeError("If a non-empty PerformanceMeasureOptions object was passed, at least one of its 'start' or 'end' properties must be present.");
+   if(opts.start!==undefined&&opts.end!==undefined&&opts.duration!==undefined)throw new TypeError("If a non-empty PerformanceMeasureOptions object was passed, it must not have all of its 'start', 'duration', and 'end' properties defined");
+  }else if(opts){opts=null;start=undefined;}
+  if(end!==undefined)e=toTimestamp(end);
+  else if(opts&&opts.end!==undefined)e=toTimestamp(opts.end);
+  else if(opts&&opts.start!==undefined&&opts.duration!==undefined)
+   e=toTimestamp(opts.start)+toTimestamp(opts.duration);
+  else e=nowf();
+  if(opts&&opts.start!==undefined)s=toTimestamp(opts.start);
+  else if(opts&&opts.duration!==undefined&&opts.end!==undefined)
+   s=e-toTimestamp(opts.duration);
+  else if(start!==undefined&&!opts)s=toTimestamp(start);
+  else s=0;
+  var m=make(PerformanceMeasure.prototype,{name:name,entryType:'measure',startTime:s,
+   duration:e-s,detail:clone(opts?opts.detail:null)});
+  buffer.push(m);return m;});
+ function clearer(type){return function(name){
+  buffer=buffer.filter(function(x){var d=x[ENTRY];
+   return d.entryType!==type||(name!==undefined&&d.name!==`${name}`);});};}
+ method(P,'clearMarks',clearer('mark'));
+ method(P,'clearMeasures',clearer('measure'));
+ method(P,'clearResourceTimings',function(){});
+ method(P,'setResourceTimingBufferSize',function(){});
+ method(P,'getEntries',function(){return byStart(buffer);});
+ method(P,'getEntriesByType',function(type){type=`${type}`;
+  return byStart(buffer.filter(function(x){return x[ENTRY].entryType===type;}));});
+ method(P,'getEntriesByName',function(name,type){name=`${name}`;
+  return byStart(buffer.filter(function(x){var d=x[ENTRY];
+   return d.name===name&&(type===undefined||d.entryType===`${type}`);}));});
+ ['now','mark','measure','clearMarks','clearMeasures','getEntries',
+  'getEntriesByType','getEntriesByName','toJSON','timing','navigation']
+  .forEach(function(k){delete perf[k];});
+ Object.setPrototypeOf(perf,P);
+ W.Performance=Performance;W.PerformanceEntry=PerformanceEntry;
+ W.PerformanceMark=PerformanceMark;W.PerformanceMeasure=PerformanceMeasure;
+})();
 /* The navigation object gains the rest of its surface. */
 (function(){var n=W.navigation;if(!n)return;
  n.activation=null;n.transition=null;
@@ -7779,90 +7919,34 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
 (function(){
  var C=W.console;
  if(!C)return;
- /* What an argument says, rather than what String() makes of it.
-    An object goes to the log as "[object Object]", which is how
-    claude.ai's "IndexedDB state read rejected [object Object]" told us
-    nothing at all about which error it had caught. A browser shows the
-    contents; this shows enough of them to name the fault. */
- function describe(v,depth){
-  var t=typeof v;
-  if(v===null||v===undefined||t==='string'||t==='number'||t==='boolean')
-   return String(v);
-  if(t==='function')return 'function '+(v.name||'');
-  if(t==='symbol')return String(v);
-  try{
-   if(v instanceof Error||
-      (v.name!==undefined&&v.message!==undefined&&typeof v.stack==='string')){
-    var head=(v.name||'Error')+': '+(v.message||'');
-    if(v.stack){var f=String(v.stack).split('\n')[1];
-     if(f)head+=' | at'+f.replace(/^\s*at/,'');}
-    return head;}
-   if(v.name!==undefined&&v.message!==undefined)
-    return String(v.name)+': '+String(v.message);
-  }catch(e){}
-  if(depth>2)return Array.isArray(v)?'[...]':'{...}';
-  try{
-   if(Array.isArray(v)){
-    var parts=v.slice(0,8).map(function(x){return describe(x,depth+1);});
-    if(v.length>8)parts.push('... '+v.length+' in all');
-    return '['+parts.join(', ')+']';}
-   if(v instanceof Date)return v.toISOString();
-   var keys=Object.keys(v),body=keys.slice(0,8).map(function(k){
-    return k+': '+describe(v[k],depth+1);});
-   if(keys.length>8)body.push('... '+keys.length+' keys');
-   var str=String(v);
-   if(str!=='[object Object]'&&body.length===0)return str;
-   return '{'+body.join(', ')+'}';
-  }catch(e){return '[object]';}
- }
- ['log','warn','error','info','debug'].forEach(function(k){
-  var real=C[k];
-  if(typeof real!=='function')return;
-  C[k]=function(){
-   var a=Array.prototype.map.call(arguments,function(v){
-    return typeof v==='string'?v:describe(v,0);});
-   return real.apply(C,a);};});
- function out(kind,args){
-  try{(C[kind]||C.log).apply(C,args);}catch(e){}}
+ /* log, info, debug, warn, error, assert, trace, group, dir and table
+    are native (qjs.c): a browser with its developer tools closed never
+    looks at what is logged, and a page that logs an object with a
+    toString, a getter or a proxy of its own and sees it called takes
+    the tools to be open. These kept a description in JavaScript that
+    called String(), Object.keys, v.message and v.stack for every
+    argument. What is left here touches nothing of the page's but the
+    label, which the console standard converts as a browser does. */
+ var log=C.log,now=Date.now;
  function def(n,f){if(typeof C[n]!=='function')C[n]=f;}
- def('assert',function(ok){
-  if(ok)return;
-  var a=Array.prototype.slice.call(arguments,1);
-  a.unshift('Assertion failed:');
-  out('error',a);});
- def('trace',function(){
-  var a=Array.prototype.slice.call(arguments);
-  a.unshift('console.trace');
-  try{a.push('\n'+(new Error()).stack);}catch(e){}
-  out('log',a);});
- var groups=0;
- function group(){
-  out('log',Array.prototype.slice.call(arguments));
-  groups++;}
- def('group',group);
- def('groupCollapsed',group);
- def('groupEnd',function(){if(groups>0)groups--;});
- def('dir',function(v){out('log',[v]);});
- def('dirxml',function(v){out('log',[v]);});
- def('table',function(v){out('log',[v]);});
- var timers={};
- def('time',function(label){timers[String(label===undefined?'default':label)]=Date.now();});
+ def('groupEnd',function(){});
+ var timers=Object.create(null),counts=Object.create(null);
+ function key(label){return label===undefined?'default':`${label}`;}
+ def('time',function(label){timers[key(label)]=now();});
  def('timeLog',function(label){
-  var k=String(label===undefined?'default':label);
+  var k=key(label);
   if(!(k in timers))return;
-  out('log',[k+': '+(Date.now()-timers[k])+'ms']);});
+  log(k+': '+(now()-timers[k])+'ms');});
  def('timeEnd',function(label){
-  var k=String(label===undefined?'default':label);
+  var k=key(label);
   if(!(k in timers))return;
-  out('log',[k+': '+(Date.now()-timers[k])+'ms']);
+  log(k+': '+(now()-timers[k])+'ms');
   delete timers[k];});
- var counts={};
  def('count',function(label){
-  var k=String(label===undefined?'default':label);
+  var k=key(label);
   counts[k]=(counts[k]||0)+1;
-  out('log',[k+': '+counts[k]]);});
- def('countReset',function(label){
-  delete counts[String(label===undefined?'default':label)];});
+  log(k+': '+counts[k]);});
+ def('countReset',function(label){delete counts[key(label)];});
  def('clear',function(){});
  def('timeStamp',function(){});
  def('profile',function(){});

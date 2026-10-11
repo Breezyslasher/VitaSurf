@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 #include <quickjs.h>
 #include <libcss/libcss.h>
@@ -502,39 +503,22 @@ static uint64_t now_ms(void)
 /**
  * The live JavaScript stack, as the text Error.stack would hold, or
  * NULL. A malloc'd copy for the caller to free.
+ *
+ * Read from the engine's frames, running no script (VitaSurf). It made
+ * an Error and called the page's Error.captureStackTrace, which ran the
+ * page's Error.prepareStackTrace, converted its Error.stackTraceLimit
+ * and read stack through any getter it had put there -- every profile
+ * sample, so a page could count our samples. A browser's profiler, off
+ * or on, leaves no trace a page can see.
  */
 static char *capture_stack(JSContext *c)
 {
-	JSValue global = JS_GetGlobalObject(c);
-	JSValue ector = JS_GetPropertyStr(c, global, "Error");
-	JSValue capture = JS_GetPropertyStr(c, ector, "captureStackTrace");
-	JSValue err = JS_NewError(c);
-	JSValue stack;
-	char *out = NULL;
+	char buf[4096];
 
-	if (JS_IsFunction(c, capture)) {
-		JSValue r = JS_Call(c, capture, ector, 1, &err);
-
-		if (JS_IsException(r)) {
-			JS_FreeValue(c, JS_GetException(c));
-		}
-		JS_FreeValue(c, r);
+	if (JS_GetBacktraceText(c, buf, (int)sizeof(buf), 16) <= 0) {
+		return NULL;
 	}
-	stack = JS_GetPropertyStr(c, err, "stack");
-	if (JS_IsString(stack)) {
-		const char *st = JS_ToCString(c, stack);
-
-		if (st != NULL) {
-			out = strdup(st);
-			JS_FreeCString(c, st);
-		}
-	}
-	JS_FreeValue(c, stack);
-	JS_FreeValue(c, err);
-	JS_FreeValue(c, capture);
-	JS_FreeValue(c, ector);
-	JS_FreeValue(c, global);
-	return out;
+	return strdup(buf);
 }
 
 /*
@@ -6711,29 +6695,84 @@ static const JSCFunctionListEntry document_proto[] = {
 /* ------------------------------------------------------------------------ */
 /* window: console, navigator, location, timers                            */
 
-static JSValue console_log(JSContext *ctx, JSValueConst this_val,
-			   int argc, JSValueConst *argv)
+static char *inspect_text(JSContext *ctx, JSValueConst v);
+
+/*
+ * Print what a console method was given (VitaSurf). A string is printed
+ * as it is and anything else as inspect_text describes it, so nothing of
+ * the page's runs: JS_ToCString called an object's toString.
+ */
+static void console_say(JSContext *ctx, const char *prefix, int argc,
+			JSValueConst *argv)
 {
-	C_WHERE;
 	int i;
 	char line[512];
 	size_t pos = 0;
 
-	(void)this_val;
 	/* console.log() with nothing to say still reaches vita_log, which
 	 * read whatever was on the stack. */
 	line[0] = 0;
-	for (i = 0; i < argc; i++) {
-		const char *s = JS_ToCString(ctx, argv[i]);
-		if (s != NULL) {
-			int n = snprintf(line + pos, sizeof(line) - pos,
-					 "%s%s", i ? " " : "", s);
-			if (n > 0) pos += (size_t)n;
-			JS_FreeCString(ctx, s);
-			if (pos >= sizeof(line)) break;
+	if (prefix != NULL) {
+		int n = snprintf(line, sizeof(line), "%s", prefix);
+		if (n > 0) pos = (size_t)n;
+	}
+	for (i = 0; i < argc && pos < sizeof(line); i++) {
+		const char *s = NULL;
+		char *own = NULL;
+		int n;
+
+		if (JS_IsString(argv[i])) {
+			s = JS_ToCString(ctx, argv[i]);
+		} else {
+			own = inspect_text(ctx, argv[i]);
 		}
+		n = snprintf(line + pos, sizeof(line) - pos, "%s%s",
+			     pos > 0 && (i > 0 || prefix != NULL) ? " " : "",
+			     s != NULL ? s : own != NULL ? own : "");
+		if (n > 0) pos += (size_t)n;
+		if (s != NULL) JS_FreeCString(ctx, s);
+		free(own);
 	}
 	vita_log("console: %s", line);
+}
+
+static JSValue console_log(JSContext *ctx, JSValueConst this_val,
+			   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+
+	(void)this_val;
+	console_say(ctx, NULL, argc, argv);
+	return JS_UNDEFINED;
+}
+
+/* console.assert, trace, group, groupCollapsed, dir, dirxml and table:
+ * native, as a browser's are, so that none of them runs page code */
+enum { CONSOLE_ASSERT, CONSOLE_TRACE, CONSOLE_PRINT };
+static JSValue console_misc(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv, int magic)
+{
+	char stack[2048];
+
+	(void)this_val;
+	switch (magic) {
+	case CONSOLE_ASSERT:
+		if (argc > 0 && JS_ToBool(ctx, argv[0]) > 0) {
+			return JS_UNDEFINED;
+		}
+		console_say(ctx, "Assertion failed:", argc > 0 ? argc - 1 : 0,
+			    argv + 1);
+		break;
+	case CONSOLE_TRACE:
+		console_say(ctx, "console.trace", argc, argv);
+		stack[0] = '\0';
+		JS_GetBacktraceText(ctx, stack, (int)sizeof(stack), 10);
+		vita_log("console: %s", stack);
+		break;
+	default:
+		console_say(ctx, NULL, argc, argv);
+		break;
+	}
 	return JS_UNDEFINED;
 }
 
@@ -9088,6 +9127,21 @@ struct js_xhr {
 	int redirects;
 	int timeout_ms;
 	bool timer_set;
+	/*
+	 * Where the timeout stands (VitaSurf). A browser's network runs
+	 * beside its script, so a request made from a script that then
+	 * runs on for thirty seconds is sent and answered meanwhile and
+	 * only delivered late. Here nothing reaches the network until the
+	 * main loop is free again, and the timer had counted all of that
+	 * script: Cloudflare's check sent chl_api_m from inside a 33 second
+	 * run and it timed out 0.2 s after the run ended, never having had
+	 * its time. So the clock starts when the loop is first free after
+	 * send(), and when it runs out one more short turn lets the
+	 * fetcher hand over an answer that has come but not been read.
+	 */
+	enum { XHR_TIMER_ARM, XHR_TIMER_WAIT, XHR_TIMER_GRACE } timer_stage;
+	uint64_t sent_ms;     /**< when send() was called */
+	uint64_t armed_ms;    /**< when the loop was first free after it */
 	struct js_xhr *next;
 };
 
@@ -9339,6 +9393,27 @@ static void xhr_timeout_cb(void *p)
 {
 	struct js_xhr *x = p;
 
+	switch (x->timer_stage) {
+	case XHR_TIMER_ARM:
+		x->timer_stage = XHR_TIMER_WAIT;
+		x->armed_ms = now_ms();
+		guit->misc->schedule(x->timeout_ms, xhr_timeout_cb, x);
+		return;
+	case XHR_TIMER_WAIT:
+		/* after the fetcher's next poll, which runs every 10 ms
+		   while a transfer is active */
+		x->timer_stage = XHR_TIMER_GRACE;
+		guit->misc->schedule(30, xhr_timeout_cb, x);
+		return;
+	default:
+		break;
+	}
+	vita_log("xhr: %s timed out: %u ms after the loop was first free "
+		 "to send it (%u after send(), %u of it waiting on script); "
+		 "the timeout is %d ms", nsurl_access(x->url),
+		 (unsigned int)(now_ms() - x->armed_ms),
+		 (unsigned int)(now_ms() - x->sent_ms),
+		 (unsigned int)(x->armed_ms - x->sent_ms), x->timeout_ms);
 	x->timer_set = false;
 	if (x->fetch != NULL) {
 		fetch_abort(x->fetch);
@@ -9393,7 +9468,11 @@ static bool xhr_start(struct js_xhr *x)
 		return false;
 	}
 	if (x->timeout_ms > 0 && !x->timer_set) {
-		guit->misc->schedule(x->timeout_ms, xhr_timeout_cb, x);
+		/* the clock starts when the loop is next free: see
+		   timer_stage */
+		x->timer_stage = XHR_TIMER_ARM;
+		x->sent_ms = x->armed_ms = now_ms();
+		guit->misc->schedule(0, xhr_timeout_cb, x);
 		x->timer_set = true;
 	}
 	return true;
@@ -13566,6 +13645,312 @@ static const char *own_data_cstring(JSContext *ctx, JSValueConst obj,
 }
 
 /*
+ * What the console prints for a value, found without running script
+ * (VitaSurf). The prelude made it in JavaScript, with String(), getters,
+ * Object.keys and toString, and a page sees all of those: logging an
+ * object whose toString or whose message getter notes the call is how a
+ * page tells whether developer tools are open, since a browser with
+ * them closed never looks at what is logged. Cloudflare's check logs
+ * just such objects. Here an own data property is read straight from
+ * the object, a getter is named and not called, and a proxy is not
+ * asked anything.
+ */
+struct inspect_buf {
+	char *s;
+	size_t len, cap;
+};
+
+static void ib_put(struct inspect_buf *b, const char *t, size_t n)
+{
+	if (b->len + n + 1 > b->cap) {
+		size_t cap = b->cap ? b->cap * 2 : 256;
+		char *ns;
+
+		while (cap < b->len + n + 1) cap *= 2;
+		if (cap > 64 * 1024) {
+			if (b->len + 4 < b->cap) {
+				memcpy(b->s + b->len, "...", 3);
+				b->len += 3;
+				b->s[b->len] = '\0';
+			}
+			return;
+		}
+		ns = realloc(b->s, cap);
+		if (ns == NULL) return;
+		b->s = ns;
+		b->cap = cap;
+	}
+	memcpy(b->s + b->len, t, n);
+	b->len += n;
+	b->s[b->len] = '\0';
+}
+
+static void ib_str(struct inspect_buf *b, const char *t)
+{
+	ib_put(b, t, strlen(t));
+}
+
+/** An own data property, or JS_UNDEFINED; a getter is not called. */
+static JSValue own_data_value(JSContext *ctx, JSValueConst obj, JSAtom atom,
+			      bool *getter)
+{
+	JSPropertyDescriptor desc;
+	int r;
+
+	*getter = false;
+	if (!JS_IsObject(obj) || JS_IsProxy(obj)) {
+		return JS_UNDEFINED;
+	}
+	r = JS_GetOwnProperty(ctx, &desc, obj, atom);
+	if (r <= 0) {
+		if (r < 0) JS_FreeValue(ctx, JS_GetException(ctx));
+		return JS_UNDEFINED;
+	}
+	JS_FreeValue(ctx, desc.getter);
+	JS_FreeValue(ctx, desc.setter);
+	if (desc.flags & JS_PROP_GETSET) {
+		*getter = true;
+		JS_FreeValue(ctx, desc.value);
+		return JS_UNDEFINED;
+	}
+	return desc.value;
+}
+
+/** The name of the constructor an object's prototypes name, or NULL. */
+static const char *inspect_class_name(JSContext *ctx, JSValueConst obj)
+{
+	JSValue p = JS_DupValue(ctx, obj);
+	JSAtom ca = JS_NewAtom(ctx, "constructor");
+	const char *name = NULL;
+	int steps;
+
+	for (steps = 0; steps < 8 && name == NULL; steps++) {
+		JSValue next, ctor;
+		bool g;
+
+		if (!JS_IsObject(p) || JS_IsProxy(p)) {
+			break;
+		}
+		ctor = own_data_value(ctx, p, ca, &g);
+		if (JS_IsFunction(ctx, ctor) && !JS_IsProxy(ctor)) {
+			name = own_data_cstring(ctx, ctor, "name");
+		}
+		JS_FreeValue(ctx, ctor);
+		next = JS_GetPrototype(ctx, p);
+		JS_FreeValue(ctx, p);
+		if (JS_IsException(next)) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+			JS_FreeAtom(ctx, ca);
+			return name;
+		}
+		p = next;
+	}
+	JS_FreeValue(ctx, p);
+	JS_FreeAtom(ctx, ca);
+	return name;
+}
+
+static void inspect_value(JSContext *ctx, struct inspect_buf *b,
+			  JSValueConst v, int depth)
+{
+	const char *t;
+
+	if (JS_IsSymbol(v)) {
+		JSAtom a = JS_ValueToAtom(ctx, v);
+
+		t = a != JS_ATOM_NULL ? JS_AtomToCString(ctx, a) : NULL;
+		ib_str(b, "Symbol(");
+		if (t != NULL) ib_str(b, t);
+		ib_str(b, ")");
+		JS_FreeCString(ctx, t);
+		JS_FreeAtom(ctx, a);
+		return;
+	}
+	if (!JS_IsObject(v)) {
+		/* a primitive: converting it runs nothing */
+		t = JS_ToCString(ctx, v);
+		if (t != NULL) {
+			ib_str(b, t);
+			JS_FreeCString(ctx, t);
+			if (JS_IsBigInt(v)) ib_str(b, "n");
+		} else {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+		}
+		return;
+	}
+	if (JS_IsProxy(v)) {
+		ib_str(b, "Proxy");
+		return;
+	}
+	if (JS_IsFunction(ctx, v)) {
+		t = own_data_cstring(ctx, v, "name");
+		ib_str(b, "function ");
+		if (t != NULL) {
+			ib_str(b, t);
+			JS_FreeCString(ctx, t);
+		}
+		return;
+	}
+	if (JS_IsError(v)) {
+		const char *name = NULL, *msg = own_data_cstring(ctx, v,
+							"message");
+		const char *stack = own_data_cstring(ctx, v, "stack");
+		JSValue p = JS_GetPrototype(ctx, v);
+
+		if (!JS_IsException(p)) {
+			name = own_data_cstring(ctx, p, "name");
+			JS_FreeValue(ctx, p);
+		} else {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+		}
+		ib_str(b, name != NULL ? name : "Error");
+		ib_str(b, ": ");
+		if (msg != NULL) ib_str(b, msg);
+		if (stack != NULL) {
+			/* the first frame, where it was made */
+			const char *l = strstr(stack, "at ");
+			const char *e;
+
+			if (l != NULL) {
+				e = strchr(l, '\n');
+				ib_str(b, " | ");
+				ib_put(b, l, e != NULL ? (size_t)(e - l) :
+				       strlen(l));
+			}
+		}
+		JS_FreeCString(ctx, name);
+		JS_FreeCString(ctx, msg);
+		JS_FreeCString(ctx, stack);
+		return;
+	}
+	{
+		JSPropertyEnum *tab = NULL;
+		uint32_t len = 0, i, shown = 0;
+		const char *cname = inspect_class_name(ctx, v);
+		bool array = JS_IsArray(v) == 1, plain;
+
+		plain = cname == NULL || strcmp(cname, "Object") == 0;
+		if (depth > 2) {
+			ib_str(b, array ? "[...]" : "{...}");
+			JS_FreeCString(ctx, cname);
+			return;
+		}
+		if (JS_GetOwnPropertyNames(ctx, &tab, &len, v,
+					   JS_GPN_STRING_MASK |
+					   JS_GPN_ENUM_ONLY) < 0) {
+			JS_FreeValue(ctx, JS_GetException(ctx));
+			tab = NULL;
+			len = 0;
+		}
+		if (!array && !plain && len == 0) {
+			ib_str(b, "[object ");
+			ib_str(b, cname);
+			ib_str(b, "]");
+		} else {
+			if (!array && !plain) {
+				ib_str(b, cname);
+				ib_str(b, " ");
+			}
+			ib_str(b, array ? "[" : "{");
+			for (i = 0; i < len && shown < 8; i++) {
+				bool g;
+				JSValue pv = own_data_value(ctx, v,
+							    tab[i].atom, &g);
+
+				if (shown > 0) ib_str(b, ", ");
+				if (!array) {
+					t = JS_AtomToCString(ctx, tab[i].atom);
+					if (t != NULL) ib_str(b, t);
+					JS_FreeCString(ctx, t);
+					ib_str(b, ": ");
+				}
+				if (g) {
+					ib_str(b, "[Getter]");
+				} else {
+					inspect_value(ctx, b, pv, depth + 1);
+				}
+				JS_FreeValue(ctx, pv);
+				shown++;
+			}
+			if (len > shown) {
+				char more[40];
+
+				snprintf(more, sizeof(more), ", ... %u in all",
+					 (unsigned)len);
+				ib_str(b, more);
+			}
+			ib_str(b, array ? "]" : "}");
+		}
+		if (tab != NULL) JS_FreePropertyEnum(ctx, tab, len);
+		JS_FreeCString(ctx, cname);
+	}
+}
+
+static char *inspect_text(JSContext *ctx, JSValueConst v)
+{
+	struct inspect_buf b = { NULL, 0, 0 };
+
+	inspect_value(ctx, &b, v, 0);
+	return b.s;
+}
+
+/*
+ * __vitaNow() -> a monotonic clock in milliseconds, to a tenth of one
+ * (VitaSurf). performance.now() was Date.now() less the page's start,
+ * so it moved in whole milliseconds, which no browser's does: they give
+ * fractions, coarsened to 0.1 ms where a page is not cross-origin
+ * isolated, as here.
+ */
+static JSValue win_vita_now(JSContext *ctx, JSValueConst this_val,
+			    int argc, JSValueConst *argv)
+{
+	struct timespec ts;
+	uint64_t tenths;
+
+	(void)ctx;
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return JS_NewFloat64(ctx, (double)now_ms());
+	}
+	tenths = (uint64_t)ts.tv_sec * 10000u +
+		(uint64_t)ts.tv_nsec / 100000u;
+	return JS_NewFloat64(ctx, (double)tenths / 10.0);
+}
+
+/* __vitaInspect(value) -> what the console prints for it */
+static JSValue win_vita_inspect(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	struct inspect_buf b = { NULL, 0, 0 };
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1) {
+		return JS_NewString(ctx, "undefined");
+	}
+	inspect_value(ctx, &b, argv[0], 0);
+	r = JS_NewString(ctx, b.s != NULL ? b.s : "");
+	free(b.s);
+	return r;
+}
+
+/* __vitaStackText() -> the stack as Error.stack shows it, made without
+ * running the page's Error.prepareStackTrace or any getter */
+static JSValue win_vita_stack_text(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	char buf[2048];
+
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	JS_GetBacktraceText(ctx, buf, (int)sizeof(buf), 10);
+	return JS_NewString(ctx, buf);
+}
+
+/*
  * Each error the engine raises itself, whether or not the page catches
  * it (VitaSurf). A script that catches its own failures -- a site's
  * browser check reporting to its server, say -- left no trace in the
@@ -13600,8 +13985,8 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	JSValue r = console_log(ctx, this_val, argc, argv);
-	JSValue err;
 	const char *first, *stack;
+	char stack_buf[2048];
 	char seq[MISS_ANY * 70];
 	char where[400], at_url[4][256];
 	unsigned at_line[4] = {0, 0, 0, 0}, at_col[4] = {0, 0, 0, 0};
@@ -13615,19 +14000,22 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 	    thread->warns_explained >= WARNS_EXPLAINED_MAX) {
 		return r;
 	}
-	first = JS_ToCString(ctx, argv[0]);
-	ours = first == NULL || strncmp(first, "uncaught", 8) == 0;
+	/* only a string: converting anything else runs the page's code */
+	first = JS_IsString(argv[0]) ? JS_ToCString(ctx, argv[0]) : NULL;
+	ours = first != NULL && strncmp(first, "uncaught", 8) == 0;
 	if (first != NULL) JS_FreeCString(ctx, first);
 	if (ours) {
 		return r;
 	}
 	thread->warns_explained++;
-	/* the page's frames: an error made here has the stack of its
-	   caller, below this function and the prelude's wrapper */
+	/* the page's frames, below this function and the prelude's
+	   wrapper; read from the engine, so the page's
+	   Error.prepareStackTrace and stack getters are not run for our
+	   log */
 	where[0] = '\0';
-	err = JS_NewError(ctx);
-	stack = JS_IsException(err) ? NULL :
-		own_data_cstring(ctx, err, "stack");
+	stack_buf[0] = '\0';
+	JS_GetBacktraceText(ctx, stack_buf, (int)sizeof(stack_buf), 10);
+	stack = stack_buf;
 	for (p = stack; p != NULL && *p != '\0' && lines < 5; ) {
 		const char *e = strchr(p, '\n');
 		size_t len = e != NULL ? (size_t)(e - p) : strlen(p);
@@ -13672,8 +14060,6 @@ static JSValue console_warn(JSContext *ctx, JSValueConst this_val,
 		}
 		p = e != NULL ? e + 1 : NULL;
 	}
-	if (stack != NULL) JS_FreeCString(ctx, stack);
-	JS_FreeValue(ctx, err);
 	vita_log("console: that was said from%s", n > 0 ? where :
 		 " nowhere script can see");
 	for (k = 0; k < 4; k++) {
@@ -15752,16 +16138,37 @@ static bool setup_globals(jsthread *thread)
 
 	/* console */
 	console = JS_NewObject(ctx);
+	/* length 0, as a browser's console methods have */
 	JS_SetPropertyStr(ctx, console, "log",
-			  JS_NewCFunction(ctx, console_log, "log", 1));
+			  JS_NewCFunction(ctx, console_log, "log", 0));
 	JS_SetPropertyStr(ctx, console, "warn",
-			  JS_NewCFunction(ctx, console_warn, "warn", 1));
+			  JS_NewCFunction(ctx, console_warn, "warn", 0));
 	JS_SetPropertyStr(ctx, console, "error",
-			  JS_NewCFunction(ctx, console_warn, "error", 1));
+			  JS_NewCFunction(ctx, console_warn, "error", 0));
 	JS_SetPropertyStr(ctx, console, "info",
-			  JS_NewCFunction(ctx, console_log, "info", 1));
+			  JS_NewCFunction(ctx, console_log, "info", 0));
 	JS_SetPropertyStr(ctx, console, "debug",
-			  JS_NewCFunction(ctx, console_log, "debug", 1));
+			  JS_NewCFunction(ctx, console_log, "debug", 0));
+	{
+		static const struct { const char *name; int magic; } misc[] = {
+			{ "assert", CONSOLE_ASSERT },
+			{ "trace", CONSOLE_TRACE },
+			{ "group", CONSOLE_PRINT },
+			{ "groupCollapsed", CONSOLE_PRINT },
+			{ "dir", CONSOLE_PRINT },
+			{ "dirxml", CONSOLE_PRINT },
+			{ "table", CONSOLE_PRINT },
+		};
+		size_t m;
+
+		for (m = 0; m < sizeof(misc) / sizeof(misc[0]); m++) {
+			JS_SetPropertyStr(ctx, console, misc[m].name,
+					  JS_NewCFunctionMagic(ctx,
+						console_misc, misc[m].name, 0,
+						JS_CFUNC_generic_magic,
+						misc[m].magic));
+		}
+	}
 	JS_SetPropertyStr(ctx, global, "console", console);
 
 	/* navigator */
@@ -15805,6 +16212,14 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaLanguages",
 			  JS_NewCFunction(ctx, win_vita_languages,
 					  "__vitaLanguages", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaNow",
+			  JS_NewCFunction(ctx, win_vita_now, "__vitaNow", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaInspect",
+			  JS_NewCFunction(ctx, win_vita_inspect,
+					  "__vitaInspect", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaStackText",
+			  JS_NewCFunction(ctx, win_vita_stack_text,
+					  "__vitaStackText", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaNavigatePost",
 			  JS_NewCFunction(ctx, win_vita_navigate_post,
 					  "__vitaNavigatePost", 3));

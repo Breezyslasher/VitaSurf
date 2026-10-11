@@ -1,0 +1,87 @@
+diff --git a/quickjs.c b/quickjs.c
+index 2bb6786..31f8a36 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7969,6 +7969,63 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
+     return JS_ToCString(ctx, val);
+ }
+ 
++/* VitaSurf: see quickjs.h */
++int JS_GetBacktraceText(JSContext *ctx, char *buf, int buf_len,
++                        int max_frames)
++{
++    JSStackFrame *sf;
++    int n = 0, frames = 0, w;
++
++    if (buf_len <= 0)
++        return 0;
++    buf[0] = '\0';
++    for (sf = ctx->rt->current_stack_frame;
++         sf != NULL && frames < max_frames && n < buf_len - 1;
++         sf = sf->prev_frame) {
++        JSObject *p;
++        JSFunctionBytecode *b = NULL;
++        const char *name, *file = NULL;
++        int line = -1, col = 0;
++
++        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++            continue;
++        p = JS_VALUE_GET_OBJ(sf->cur_func);
++        if (js_class_has_bytecode(p->class_id))
++            b = p->u.func.function_bytecode;
++        name = get_func_name(ctx, sf->cur_func);
++        if (b && sf->cur_pc) {
++            line = find_line_num(ctx, b,
++                                 sf->cur_pc - b->byte_code_buf - 1, &col);
++            file = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
++        }
++        if (b && sf->cur_pc && line != -1)
++            w = snprintf(buf + n, buf_len - n, "    at %s (%s:%d:%d)\n",
++                         name && name[0] ? name : "<anonymous>",
++                         file ? file : "<null>", line, col);
++        else if (b && sf->cur_pc)
++            w = snprintf(buf + n, buf_len - n, "    at %s (%s)\n",
++                         name && name[0] ? name : "<anonymous>",
++                         file ? file : "<null>");
++        else
++            w = snprintf(buf + n, buf_len - n, "    at %s (%s)\n",
++                         name && name[0] ? name : "<anonymous>",
++                         b ? "missing" : "native");
++        JS_FreeCString(ctx, name);
++        JS_FreeCString(ctx, file);
++        if (w < 0)
++            break;
++        n += w;
++        if (n >= buf_len - 1) {
++            n = buf_len - 1;
++            buf[n] = '\0';
++        }
++        frames++;
++        if (b && b->backtrace_barrier)
++            break;
++    }
++    return n;
++}
++
+ /* Note: it is important that no exception is returned by this function */
+ static bool can_add_backtrace(JSValueConst obj)
+ {
+diff --git a/quickjs.h b/quickjs.h
+index 63c3cbc..151e395 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1490,6 +1490,14 @@ JS_EXTERN int JS_GetSourceExcerpt(JSContext *ctx, char *buf, int buf_len,
+    nanoseconds they took in all. */
+ JS_EXTERN void JS_GetGCStats(JSRuntime *rt, uint32_t *runs, uint64_t *ns);
+ 
++/* VitaSurf: the live stack as Error.stack would show it, one
++   "    at name (file:line:col)" line a frame, innermost first, up to
++   max_frames, in buf; the length written. Unlike making an Error it runs
++   no script: no Error.prepareStackTrace, no Error.stackTraceLimit
++   conversion, no getter, so a page cannot tell it was taken. */
++JS_EXTERN int JS_GetBacktraceText(JSContext *ctx, char *buf, int buf_len,
++                                  int max_frames);
++
+ JS_EXTERN const char* JS_GetVersion(void);
+ 
+ /* Integration point for quickjs-libc.c, not for public use. */

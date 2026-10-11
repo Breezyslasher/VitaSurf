@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>The console runs nothing of the page's</title></head>
+<body><pre id="out"></pre>
+<script>
+/* A browser with its developer tools closed never looks at what is
+   logged, so a page that logs objects with traps of its own (a toString,
+   a getter, a proxy, Error.prepareStackTrace) sees none of them run, and
+   takes the tools to be closed (VitaSurf: the console is native and
+   describes values without running script). Also Performance as the
+   interface it is. Each line gives the browser's answer in brackets. */
+var o = document.getElementById('out');
+var hits = [];
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n'; }
+function trap(n) { return function () { hits.push(n); return 'x'; }; }
+var a = { toString: trap('toString') };
+var b = {}; Object.defineProperty(b, 'id', { get: trap('getter'), enumerable: true });
+var re = /./; re.toString = trap('regexp toString');
+var err = new Error('m'); Object.defineProperty(err, 'message', { get: trap('message') });
+var p = new Proxy({}, { get: trap('proxy get'), ownKeys: function () { hits.push('proxy ownKeys'); return []; },
+  getPrototypeOf: function () { hits.push('proxy proto'); return null; } });
+var f = function () {}; f.toString = trap('function toString');
+var el = document.createElement('a'); Object.defineProperty(el, 'id', { get: trap('element id') });
+var d = new Date(0); d.toISOString = trap('toISOString');
+Error.prepareStackTrace = trap('prepareStackTrace');
+console.log(a, b, re, err, p, f, el, d, Symbol('s'), 1n);
+console.log('%c%d', 'font-size:0', a);
+console.warn(a); console.error(err); console.info(p); console.debug(re);
+console.dir(b); console.table([a]); console.group(a); console.groupEnd();
+console.assert(false, a); console.trace(a);
+delete Error.prepareStackTrace;
+T('traps run by the console (none)', hits.length ? hits.join(', ') : 'none');
+T('console.log as a browser has it (log 0)', console.log.name + ' ' + console.log.length);
+T('console.assert and trace are functions (function function)', typeof console.assert + ' ' + typeof console.trace);
+T('Performance (function true Illegal constructor)', typeof Performance + ' ' +
+  (performance instanceof Performance) + ' ' + (function () { try { new Performance(); } catch (e) { return e.message; } })());
+T('now on the prototype (false true)', Object.prototype.hasOwnProperty.call(performance, 'now') + ' ' +
+  ('now' in Performance.prototype));
+var t1 = performance.now(), t2, n = 0;
+do { t2 = performance.now(); n++; } while (t2 === t1 && n < 100000);
+T('now moves in less than a millisecond (true)', t2 - t1 < 1);
+var m = performance.mark('qa', { startTime: 10, detail: { k: 1 } });
+T('mark (mark qa 10 0 {"k":1})', m.entryType + ' ' + m.name + ' ' + m.startTime + ' ' + m.duration + ' ' + JSON.stringify(m.detail));
+performance.mark('qb', { startTime: 25 });
+var me = performance.measure('qm', 'qa', 'qb');
+T('measure (measure 10 15)', me.entryType + ' ' + me.startTime + ' ' + me.duration);
+T('measure from options (3 6)', (function () { var x = performance.measure('qo', { start: 3, end: 9 }); return x.startTime + ' ' + x.duration; })());
+T('measure of a missing mark (SyntaxError)', (function () { try { performance.measure('qx', 'nope'); return 'no throw'; } catch (e) { return e.name; } })());
+T('measure with only detail (TypeError)', (function () { try { performance.measure('qd', { detail: 1 }); return 'no throw'; } catch (e) { return e.name; } })());
+T('mark named after PerformanceTiming (SyntaxError)', (function () { try { performance.mark('navigationStart'); return 'no throw'; } catch (e) { return e.name; } })());
+T('entries by type (qa,qb qm,qo)', performance.getEntriesByType('mark').map(function (e) { return e.name; }).join(',') + ' ' +
+  performance.getEntriesByType('measure').map(function (e) { return e.name; }).join(','));
+performance.clearMarks(); performance.clearMeasures();
+T('cleared (0)', performance.getEntries().length);
+</script>
+</body></html>
