@@ -27,11 +27,11 @@
  *
  * Written so that it runs under Node too, to be held against ICU there
  * with the cases scripts/gen-intl-number-tests.mjs makes:
- * __vitaIntlNumber(W, N, C, install) builds the two constructors onto
+ * NV.__vitaIntlNumber(W, N, C, install) builds the two constructors onto
  * W.Intl, reading the pack through N.pak. Without the pack the prelude's
  * stand-ins stay.
  */
-var __vitaIntlNumber = function (W, N, C, install) {
+NV.__vitaIntlNumber = function (W, N, C, install) {
 	'use strict';
 
 	var Intl = W.Intl;
@@ -1879,11 +1879,11 @@ var __vitaIntlNumber = function (W, N, C, install) {
 	return shared;
 };
 
-if (typeof window !== 'undefined' && window.__vitaIntl &&
-    window.__vitaIntl.has && window.__vitaIntl.has('index') &&
-    window.__vitaIntlCore && window.Intl)
-	window.__vitaIntl.number = __vitaIntlNumber(window, window.__vitaIntl,
-						   window.__vitaIntlCore, true);
+if (typeof window !== 'undefined' && NV.__vitaIntl &&
+    NV.__vitaIntl.has && NV.__vitaIntl.has('index') &&
+    NV.__vitaIntlCore && window.Intl)
+	NV.__vitaIntl.number = NV.__vitaIntlNumber(window, NV.__vitaIntl,
+						   NV.__vitaIntlCore, true);
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlNumber;
+	module.exports = NV.__vitaIntlNumber;

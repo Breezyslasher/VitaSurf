@@ -10,7 +10,8 @@
    interface it is. Each line gives the browser's answer in brackets. */
 var o = document.getElementById('out');
 var hits = [];
-function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n'; }
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
 function trap(n) { return function () { hits.push(n); return 'x'; }; }
 var a = { toString: trap('toString') };
 var b = {}; Object.defineProperty(b, 'id', { get: trap('getter'), enumerable: true });

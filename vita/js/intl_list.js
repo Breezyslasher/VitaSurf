@@ -18,9 +18,9 @@
  * vita/js/intl_number.js's NumberFormat and joined as a unit list.
  *
  * Runs under Node too, to be held against ICU with the cases
- * scripts/gen-intl-list-tests.mjs makes: __vitaIntlList(W, C, X).
+ * scripts/gen-intl-list-tests.mjs makes: NV.__vitaIntlList(W, C, X).
  */
-var __vitaIntlList = function (W, C, X) {
+NV.__vitaIntlList = function (W, C, X) {
 	'use strict';
 
 	var Intl = W.Intl, getOption = X.getOption, method = X.method;
@@ -650,10 +650,10 @@ var __vitaIntlList = function (W, C, X) {
 	Intl.DurationFormat = DurationFormat;
 };
 
-if (typeof window !== 'undefined' && window.__vitaIntl &&
-    window.__vitaIntl.number && window.__vitaIntl.has &&
-    window.__vitaIntl.has('l:und') && window.__vitaIntlCore)
-	__vitaIntlList(window, window.__vitaIntlCore, window.__vitaIntl.number);
+if (typeof window !== 'undefined' && NV.__vitaIntl &&
+    NV.__vitaIntl.number && NV.__vitaIntl.has &&
+    NV.__vitaIntl.has('l:und') && NV.__vitaIntlCore)
+	NV.__vitaIntlList(window, NV.__vitaIntlCore, NV.__vitaIntl.number);
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlList;
+	module.exports = NV.__vitaIntlList;

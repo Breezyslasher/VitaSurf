@@ -215,6 +215,17 @@ struct jsthread {
 	 */
 	bool is_worker;
 	bool worker_closing;      /**< its close is scheduled */
+	/*
+	 * The natives the prelude calls and the functions it leaves for C
+	 * (VitaSurf): every __vita* the bindings made, taken off the global
+	 * before the prelude runs and handed to it as N, so a page sees
+	 * none of them on window -- which no browser has, and which said
+	 * at once to a page looking that this is not one.
+	 */
+	JSValue natives;
+	/** what window.location and document.location give (VitaSurf);
+	 * kept here rather than under a property a page could see */
+	JSValue location_obj;
 	struct jsthread *owner;   /**< the page's thread, for a worker */
 	struct jsthread *workers; /**< a page's workers */
 	struct jsthread *worker_next;
@@ -491,6 +502,27 @@ static int next_timer_handle = 1;
 
 /* ------------------------------------------------------------------------ */
 /* Small helpers                                                            */
+
+/** One of the prelude's private functions (see jsthread.natives), or
+ * undefined. A new reference. */
+static JSValue natives_get(JSContext *ctx, const char *name)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	if (thread == NULL || !JS_IsObject(thread->natives)) {
+		return JS_UNDEFINED;
+	}
+	return JS_GetPropertyStr(ctx, thread->natives, name);
+}
+
+/*
+ * __vitaNativesOf(win) -> another window's or a worker's private object,
+ * for the prelude's work across realms: navigating a frame, its blob
+ * URLs, a worker's start. undefined for anything that is not a global
+ * of this runtime. (VitaSurf)
+ */
+static JSValue win_vita_natives_of(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv);
 
 static uint64_t now_ms(void)
 {
@@ -1202,7 +1234,7 @@ static void qjs_report_exception_src(JSContext *ctx, const char *name,
 	 */
 	{
 		JSValue global = JS_GetGlobalObject(ctx);
-		JSValue fn = JS_GetPropertyStr(ctx, global, "__vitaReportError");
+		JSValue fn = natives_get(ctx, "__vitaReportError");
 
 		if (JS_IsFunction(ctx, fn)) {
 			JSValue args[2], r;
@@ -2660,7 +2692,7 @@ static void notify_mutation_ns(JSContext *ctx, const char *kind,
 	}
 	vitasurf_js_mutations_told++;
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global, "__vitaMutation");
+	fn = natives_get(ctx, "__vitaMutation");
 	if (JS_IsFunction(ctx, fn)) {
 		JSValue args[6], r;
 
@@ -5884,7 +5916,6 @@ static const JSCFunctionListEntry node_proto[] = {
 	JS_CGETSET_DEF("childNodes", node_get_child_nodes, NULL),
 	JS_CGETSET_DEF("nodeValue", node_get_node_value, node_set_node_value),
 	JS_CGETSET_DEF("attributes", node_get_attributes, NULL),
-	JS_CFUNC_DEF("__vitaAttrStamp", 0, node_attr_stamp),
 	JS_CFUNC_DEF("getAttribute", 1, node_get_attribute),
 	JS_CFUNC_DEF("setAttribute", 2, node_set_attribute),
 	JS_CFUNC_DEF("hasAttribute", 1, node_has_attribute),
@@ -6682,8 +6713,6 @@ static const JSCFunctionListEntry document_proto[] = {
 	JS_CFUNC_DEF("getElementsByTagName", 1, doc_get_elements_by_tag_name),
 	JS_CFUNC_DEF("createElement", 1, doc_create_element),
 	JS_CFUNC_DEF("createElementNS", 2, doc_create_element_ns),
-	JS_CFUNC_DEF("__vitaCreateDoctype", 3, doc_create_doctype),
-	JS_CFUNC_DEF("__vitaCreateDocument", 3, doc_create_document),
 	JS_CFUNC_DEF("createTextNode", 1, doc_create_text_node),
 	JS_CFUNC_DEF("createComment", 1, doc_create_comment),
 	JS_CFUNC_DEF("createDocumentFragment", 0, doc_create_document_fragment),
@@ -7027,8 +7056,6 @@ static JSValue win_vita_navigate_post(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
-/** Where the location object itself is kept, out of the page's way. */
-#define VITA_LOCATION_SLOT "__vitaLocation"
 
 /*
  * The URL a page is told it has (VitaSurf). An iframe's srcdoc and blank
@@ -7100,7 +7127,55 @@ static JSValue loc_set_href(JSContext *ctx, JSValueConst this_val, JSValueConst 
 static JSValue win_get_location(JSContext *ctx, JSValueConst this_val)
 {
 	C_WHERE;
-	return JS_GetPropertyStr(ctx, this_val, VITA_LOCATION_SLOT);
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	(void)this_val;
+	if (thread == NULL) {
+		return JS_UNDEFINED;
+	}
+	return JS_DupValue(ctx, thread->location_obj);
+}
+
+static JSValue win_vita_natives_of(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	jsthread *t;
+
+	(void)this_val;
+	if (argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		JSValue g;
+		bool same;
+
+		if (t->ctx == NULL || t->closed) {
+			continue;
+		}
+		g = JS_GetGlobalObject(t->ctx);
+		same = JS_VALUE_GET_PTR(g) == JS_VALUE_GET_PTR(argv[0]);
+		JS_FreeValue(t->ctx, g);
+		if (same) {
+			return JS_DupValue(ctx, t->natives);
+		}
+	}
+	return JS_UNDEFINED;
+}
+
+/* __vitaSetLocation(loc): what location gives from now on, for a worker,
+ * whose location is a WorkerLocation */
+static JSValue win_vita_set_location(JSContext *ctx, JSValueConst this_val,
+				     int argc, JSValueConst *argv)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx);
+
+	(void)this_val;
+	if (thread == NULL || argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	JS_FreeValue(ctx, thread->location_obj);
+	thread->location_obj = JS_DupValue(ctx, argv[0]);
+	return JS_UNDEFINED;
 }
 
 static JSValue win_set_location(JSContext *ctx, JSValueConst this_val,
@@ -7130,8 +7205,13 @@ static JSValue win_set_location(JSContext *ctx, JSValueConst this_val,
 static void install_location(JSContext *ctx, JSValueConst on, JSValue loc)
 {
 	JSAtom name = JS_NewAtom(ctx, "location");
+	jsthread *thread = JS_GetContextOpaque(ctx);
 
-	JS_SetPropertyStr(ctx, on, VITA_LOCATION_SLOT, loc);
+	if (thread != NULL && JS_IsUndefined(thread->location_obj)) {
+		thread->location_obj = loc;
+	} else {
+		JS_FreeValue(ctx, loc);
+	}
 	JS_DefinePropertyGetSet(ctx, on, name,
 		JS_NewCFunction2(ctx, (JSCFunction *)win_get_location,
 				 "get location", 0, JS_CFUNC_getter, 0),
@@ -8414,7 +8494,7 @@ static void slot_pass(jsthread *thread)
 		return;
 	}
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global, "__vitaSlotPass");
+	fn = natives_get(ctx, "__vitaSlotPass");
 	if (JS_IsFunction(ctx, fn)) {
 		r = JS_Call(ctx, fn, global, 0, NULL);
 		if (JS_IsException(r)) {
@@ -8630,7 +8710,7 @@ static void ws_event(void *owner, int id, enum vws_event ev,
 	t0 = now_ms();
 	begin_script(thread, SCRIPT_XHR);
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global, "__vitaWsEvent");
+	fn = natives_get(ctx, "__vitaWsEvent");
 	if (JS_IsFunction(ctx, fn)) {
 		args[0] = JS_NewInt32(ctx, id);
 		args[1] = JS_NewInt32(ctx, (int)ev);
@@ -9865,7 +9945,7 @@ static JSValue native_event(jsthread *thread, struct dom_event *evt)
 	}
 	obj = wrap_event(ctx, evt);
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global, "__vitaNativeEvent");
+	fn = natives_get(ctx, "__vitaNativeEvent");
 	if (JS_IsFunction(ctx, fn)) {
 		r = JS_Call(ctx, fn, global, 1, &obj);
 		if (JS_IsException(r)) {
@@ -16004,6 +16084,16 @@ static bool prelude_unit_run(JSContext *ctx, struct prelude_unit *u,
 		ok = false;
 	} else {
 		r = JS_EvalFunction(ctx, fn);
+		/* a unit is one function of N, as the prelude is */
+		if (!JS_IsException(r) && JS_IsFunction(ctx, r)) {
+			jsthread *thread = JS_GetContextOpaque(ctx);
+			JSValue f = r, nat = thread != NULL ?
+				JS_DupValue(ctx, thread->natives) : JS_UNDEFINED;
+
+			r = JS_Call(ctx, f, JS_UNDEFINED, 1, &nat);
+			JS_FreeValue(ctx, nat);
+			JS_FreeValue(ctx, f);
+		}
 		if (JS_IsException(r)) {
 			qjs_report_exception_src(ctx, u->file, src, u->len);
 			ok = false;
@@ -16097,7 +16187,7 @@ static JSValue qjs_lazy_handler(JSContext *ctx, JSValueConst obj,
 				JSAtom prop, uint32_t id)
 {
 	JSValue global = JS_GetGlobalObject(ctx);
-	JSValue init = JS_GetPropertyStr(ctx, global, "__vitaLazyInit");
+	JSValue init = natives_get(ctx, "__vitaLazyInit");
 	JSValue arg = JS_NewUint32(ctx, id), r = JS_UNDEFINED;
 
 	(void)obj; (void)prop;
@@ -16214,6 +16304,23 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaLanguages", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaNow",
 			  JS_NewCFunction(ctx, win_vita_now, "__vitaNow", 0));
+	/* called with a node or the document as this; they were methods
+	 * a page could see on every element and on document */
+	JS_SetPropertyStr(ctx, global, "__vitaAttrStamp",
+			  JS_NewCFunction(ctx, node_attr_stamp,
+					  "__vitaAttrStamp", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaCreateDoctype",
+			  JS_NewCFunction(ctx, doc_create_doctype,
+					  "__vitaCreateDoctype", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaCreateDocument",
+			  JS_NewCFunction(ctx, doc_create_document,
+					  "__vitaCreateDocument", 3));
+	JS_SetPropertyStr(ctx, global, "__vitaSetLocation",
+			  JS_NewCFunction(ctx, win_vita_set_location,
+					  "__vitaSetLocation", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaNativesOf",
+			  JS_NewCFunction(ctx, win_vita_natives_of,
+					  "__vitaNativesOf", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaInspect",
 			  JS_NewCFunction(ctx, win_vita_inspect,
 					  "__vitaInspect", 1));
@@ -16473,6 +16580,35 @@ static bool setup_globals(jsthread *thread)
 		JS_SetPropertyStr(ctx, global, "HTMLElement", JS_DupValue(ctx, ctor));
 		JS_SetPropertyStr(ctx, global, "EventTarget", ctor);
 	}
+	/* every __vita* off the global, for the prelude alone: see
+	 * jsthread.natives */
+	{
+		JSPropertyEnum *tab = NULL;
+		uint32_t n = 0, i;
+
+		thread->natives = JS_NewObjectProto(ctx, JS_NULL);
+		if (JS_GetOwnPropertyNames(ctx, &tab, &n, global,
+					   JS_GPN_STRING_MASK) == 0) {
+			for (i = 0; i < n; i++) {
+				const char *name = JS_AtomToCString(ctx,
+								    tab[i].atom);
+
+				if (name != NULL &&
+				    strncmp(name, "__vita", 6) == 0) {
+					JSValue v = JS_GetProperty(ctx, global,
+								   tab[i].atom);
+
+					JS_DefinePropertyValue(ctx,
+						thread->natives, tab[i].atom, v,
+						JS_PROP_C_W_E);
+					JS_DeleteProperty(ctx, global,
+							  tab[i].atom, 0);
+				}
+				JS_FreeCString(ctx, name);
+			}
+			JS_FreePropertyEnum(ctx, tab, n);
+		}
+	}
 	JS_FreeValue(ctx, global);
 
 	{
@@ -16541,6 +16677,14 @@ static bool setup_globals(jsthread *thread)
 			   page's */
 			miss_quiet = true;
 			r = JS_EvalFunction(ctx, fn);
+			/* the prelude is one function of N, the natives */
+			if (!JS_IsException(r) && JS_IsFunction(ctx, r)) {
+				JSValue f = r;
+
+				r = JS_Call(ctx, f, JS_UNDEFINED, 1,
+					    &thread->natives);
+				JS_FreeValue(ctx, f);
+			}
 			miss_quiet = false;
 			if (JS_IsException(r)) {
 				qjs_report_exception_src(ctx, "<prelude>",
@@ -16643,9 +16787,8 @@ static void qjs_rejection_tracker(JSContext *ctx, JSValueConst promise,
 	 * the list rather than being called an error.
 	 */
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global,
-			       is_handled ? "__vitaRejectionHandled"
-					  : "__vitaReportRejection");
+	fn = natives_get(ctx, is_handled ? "__vitaRejectionHandled"
+				       : "__vitaReportRejection");
 	if (JS_IsFunction(ctx, fn)) {
 		JSValue args[2], r;
 
@@ -16917,6 +17060,8 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 	/* calloc leaves this as a zeroed JSValue, which is not the
 	 * "not looked up yet" marker import_map_of tests for. */
 	ret->import_map = JS_UNINITIALIZED;
+	ret->natives = JS_UNDEFINED;
+	ret->location_obj = JS_UNDEFINED;
 	JS_SetContextOpaque(ret->ctx, ret);
 	/*
 	 * A blank iframe's page, or a worker, is made the moment a script
@@ -16941,6 +17086,8 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 	if (!ok && whole) {
 		vita_log("qjs: the prelude did not finish; the realm is "
 			 "thrown away");
+		JS_FreeValue(ret->ctx, ret->natives);
+		JS_FreeValue(ret->ctx, ret->location_obj);
 		JS_FreeContext(ret->ctx);
 		free(ret);
 		return NULL;
@@ -17077,6 +17224,10 @@ nserror js_closethread(jsthread *thread)
 		JS_FreeValue(thread->ctx, thread->import_map);
 		thread->import_map = JS_UNINITIALIZED;
 	}
+	JS_FreeValue(thread->ctx, thread->natives);
+	thread->natives = JS_UNDEFINED;
+	JS_FreeValue(thread->ctx, thread->location_obj);
+	thread->location_obj = JS_UNDEFINED;
 	/*
 	 * Not this thread any more: a function made here can outlive the
 	 * context, held by another page's listener or timer, and the
@@ -19192,7 +19343,7 @@ static bool qjs_dynamic_import_hook(JSContext *ctx, const char *base,
 		return false;
 	}
 	global = JS_GetGlobalObject(ctx);
-	helper = JS_GetPropertyStr(ctx, global, "__vitaImport");
+	helper = natives_get(ctx, "__vitaImport");
 	if (JS_IsFunction(ctx, helper)) {
 		args[0] = JS_NewString(ctx, base);
 		args[1] = JS_NewString(ctx, spec);
@@ -19325,7 +19476,7 @@ static JSModuleDef *local_module(JSContext *ctx, jsthread *thread,
 	JSModuleDef *m;
 
 	global = JS_GetGlobalObject(ctx);
-	get = JS_GetPropertyStr(ctx, global, "__vitaLocalModule");
+	get = natives_get(ctx, "__vitaLocalModule");
 	text = JS_UNDEFINED;
 	if (JS_IsFunction(ctx, get)) {
 		JSValue arg = JS_NewString(ctx, name);
@@ -19803,8 +19954,7 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 	 */
 	{
 		JSValue global = JS_GetGlobalObject(thread->ctx);
-		JSValue fn = JS_GetPropertyStr(thread->ctx, global,
-					       "__vitaBeforeScript");
+		JSValue fn = natives_get(thread->ctx, "__vitaBeforeScript");
 		if (JS_IsFunction(thread->ctx, fn)) {
 			JSValue r = JS_Call(thread->ctx, fn, global, 0, NULL);
 			if (JS_IsException(r)) {
@@ -20629,7 +20779,7 @@ static bool js_call_input_hook(jsthread *thread, const char *name,
 	ctx = thread->ctx;
 	begin_script(thread, SCRIPT_EVENT);
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global, name);
+	fn = natives_get(ctx, name);
 	if (JS_IsFunction(ctx, fn)) {
 		args[0] = wrap_node(ctx, a);
 		args[1] = b != NULL ? wrap_node(ctx, b) : JS_NULL;
@@ -20681,7 +20831,7 @@ void js_activate(jsthread *thread, struct dom_node *target, int x, int y)
 	ctx = thread->ctx;
 	begin_script(thread, SCRIPT_EVENT);
 	global = JS_GetGlobalObject(ctx);
-	fn = JS_GetPropertyStr(ctx, global, "__vitaActivate");
+	fn = natives_get(ctx, "__vitaActivate");
 	if (JS_IsFunction(ctx, fn)) {
 		args[0] = wrap_node(ctx, target);
 		args[1] = JS_NewInt32(ctx, x);

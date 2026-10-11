@@ -17,10 +17,10 @@
  * z, v, O and V fields of vita/js/intl.js. V8's way of reading a time
  * zone option, and of writing the one it resolved, is here too.
  *
- * __vitaIntlZone(N, P) takes the pack reader and vita/js/intl_pattern.js
+ * NV.__vitaIntlZone(N, P) takes the pack reader and vita/js/intl_pattern.js
  * and has no browser dependencies, so that it runs under Node.
  */
-var __vitaIntlZone = function (N, P) {
+NV.__vitaIntlZone = function (N, P) {
 	'use strict';
 
 	var DAY = 86400000, HOUR = 3600000, MINUTE = 60000;
@@ -1077,4 +1077,4 @@ var __vitaIntlZone = function (N, P) {
 };
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlZone;
+	module.exports = NV.__vitaIntlZone;

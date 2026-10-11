@@ -17,10 +17,10 @@
 (function(){
 'use strict';
 var W = window;
-var load = W.__vitaStoreLoad, save = W.__vitaStoreSave;
+var load = NV.__vitaStoreLoad, save = NV.__vitaStoreSave;
 /* the events this file fires are the browser's, so trusted (VitaSurf) */
-var uaEvent = W.__vitaUaEvent || function(e){ return e; };
-try { delete W.__vitaUaEvent; } catch (e) {}
+var uaEvent = NV.__vitaUaEvent || function(e){ return e; };
+try { delete NV.__vitaUaEvent; } catch (e) {}
 
 /* ------------------------------------------------------- the backing store */
 
@@ -85,8 +85,8 @@ function stringList(names){
  * any page script runs, because they read a key's material.
  */
 var keyHooks = null;
-Object.defineProperty(W, '__vitaRegisterKeyClone', { configurable: true,
- value: function(h){ keyHooks = h; delete W.__vitaRegisterKeyClone; } });
+Object.defineProperty(NV,'__vitaRegisterKeyClone', { configurable: true,
+ value: function(h){ keyHooks = h; delete NV.__vitaRegisterKeyClone; } });
 
 /*
  * IndexedDB stores values, not JSON: a Date comes back a Date, a
@@ -601,7 +601,7 @@ Target.prototype = {
  */
 function report(err, where){
  var label = 'indexedDB ' + (where || 'event handler');
- if (W.__vitaReportError) W.__vitaReportError(err, label);
+ if (NV.__vitaReportError) NV.__vitaReportError(err, label);
  else if (W.console && console.error) console.error(label, err);
 }
 function mkEvent(type){

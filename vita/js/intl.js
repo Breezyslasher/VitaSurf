@@ -21,12 +21,12 @@
  * Where V8 and ICU write something, so does this, ICU's failures and
  * all, except where V8 itself fails.
  *
- * Runs under Node too, to be held against V8: __vitaIntlDate(W, N, C, X,
+ * Runs under Node too, to be held against V8: NV.__vitaIntlDate(W, N, C, X,
  * P, Z, K, R) builds DateTimeFormat onto W.Intl from the pack reader (N),
- * vita/js/intl_core.js (C), what __vitaIntlNumber returned (X), the
+ * vita/js/intl_core.js (C), what NV.__vitaIntlNumber returned (X), the
  * pattern, zone and calendar modules, and the range module's factory.
  */
-var __vitaIntlDate = function (W, N, C, X, P, Z, K, R) {
+NV.__vitaIntlDate = function (W, N, C, X, P, Z, K, R) {
 	'use strict';
 
 	var Intl = W.Intl, getOption = X.getOption, method = X.method;
@@ -1336,20 +1336,20 @@ var __vitaIntlDate = function (W, N, C, X, P, Z, K, R) {
 		formatParts: formatParts, create: create };
 };
 
-if (typeof window !== 'undefined' && window.__vitaIntl &&
-    window.__vitaIntl.number && window.__vitaIntl.has &&
-    window.__vitaIntl.has('dt:index') && window.__vitaIntl.has('tz:index') &&
-    window.__vitaIntlCore && typeof __vitaIntlPattern !== 'undefined' &&
-    typeof __vitaIntlZone !== 'undefined' &&
-    typeof __vitaIntlCalendar !== 'undefined') {
+if (typeof window !== 'undefined' && NV.__vitaIntl &&
+    NV.__vitaIntl.number && NV.__vitaIntl.has &&
+    NV.__vitaIntl.has('dt:index') && NV.__vitaIntl.has('tz:index') &&
+    NV.__vitaIntlCore && typeof NV.__vitaIntlPattern !== 'undefined' &&
+    typeof NV.__vitaIntlZone !== 'undefined' &&
+    typeof NV.__vitaIntlCalendar !== 'undefined') {
 	(function (N) {
-		var P = __vitaIntlPattern(N);
+		var P = NV.__vitaIntlPattern(N);
 
-		N.date = __vitaIntlDate(window, N, window.__vitaIntlCore, N.number,
-			P, __vitaIntlZone(N, P), __vitaIntlCalendar(N),
-			typeof __vitaIntlRange !== 'undefined' ? __vitaIntlRange : null);
-	})(window.__vitaIntl);
+		N.date = NV.__vitaIntlDate(window, N, NV.__vitaIntlCore, N.number,
+			P, NV.__vitaIntlZone(N, P), NV.__vitaIntlCalendar(N),
+			typeof NV.__vitaIntlRange !== 'undefined' ? NV.__vitaIntlRange : null);
+	})(NV.__vitaIntl);
 }
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlDate;
+	module.exports = NV.__vitaIntlDate;

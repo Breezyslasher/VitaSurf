@@ -20,11 +20,11 @@
  * aliases. The same lookup gives intl.js the names DateFormatSymbols
  * reads and the range patterns DateIntervalInfo reads.
  *
- * __vitaIntlPattern(N) takes what reads the pack (N.pak) and has no
+ * NV.__vitaIntlPattern(N) takes what reads the pack (N.pak) and has no
  * browser dependencies, so that the generators and tests can run it
  * under Node.
  */
-var __vitaIntlPattern = function (N) {
+NV.__vitaIntlPattern = function (N) {
 	'use strict';
 
 	/* ---- ICU's resource bundles ---- */
@@ -1367,4 +1367,4 @@ var __vitaIntlPattern = function (N) {
 };
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlPattern;
+	module.exports = NV.__vitaIntlPattern;

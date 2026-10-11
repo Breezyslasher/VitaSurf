@@ -136,19 +136,23 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # 300 KB as one, which is more than anyone can hold in their head; a
     # self-contained area of the platform belongs in its own file. Order
     # matters only where one file runs code at load time that another
-    # defines, so keep prelude.js first.
+    # defines, so keep prelude.js first, inside natives-open.js and
+    # natives-close.js, which make the whole one function (see them).
     set(PRELUDE_PARTS
+        vita/js/natives-open.js
         vita/js/prelude.js
         vita/js/streams.js
         vita/js/performance.js
         vita/js/storage.js
         vita/js/subtle.js
         vita/js/wasm.js
-        vita/js/lazy.js)
+        vita/js/lazy.js
+        vita/js/natives-close.js)
     # Intl, the largest part, is a unit of its own that runs the first
     # time a page uses it (vita/js/lazy.js): most pages never do, and it
     # was a fifth of the prelude every page paid for.
     set(PRELUDE_INTL_PARTS
+        vita/js/natives-open.js
         vita/js/intl_core.js
         vita/js/intl_number.js
         vita/js/intl_names.js
@@ -160,7 +164,8 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/intl_zone.js
         vita/js/intl_calendar.js
         vita/js/intl_range.js
-        vita/js/intl.js)
+        vita/js/intl.js
+        vita/js/natives-close.js)
     foreach(unit PRELUDE PRELUDE_INTL)
         set(${unit}_BYTES "")
         foreach(part ${${unit}_PARTS})

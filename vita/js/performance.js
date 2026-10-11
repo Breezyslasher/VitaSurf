@@ -159,7 +159,7 @@ function record(entry){
    if (o._buffer.length === 0) return;
    var list = o._buffer; o._buffer = [];
    try { o._callback(new PerformanceObserverEntryList(list), o); }
-   catch (e) { if (W.__vitaReportError) W.__vitaReportError(e); }
+   catch (e) { if (NV.__vitaReportError) NV.__vitaReportError(e); }
   });
  });
 }
@@ -195,7 +195,7 @@ PerformanceObserver.prototype = {
      if (me._buffer.length === 0) return;
      var list = me._buffer; me._buffer = [];
      try { me._callback(new PerformanceObserverEntryList(list), me); }
-     catch (e) { if (W.__vitaReportError) W.__vitaReportError(e); }
+     catch (e) { if (NV.__vitaReportError) NV.__vitaReportError(e); }
     });
    }
   }

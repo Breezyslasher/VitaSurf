@@ -26,10 +26,10 @@
  * Japanese first year), with ICU's own rules from resources/intl.pak and
  * as much of RuleBasedNumberFormat as those rules use.
  *
- * __vitaIntlCalendar(N) takes the pack reader and has no browser
+ * NV.__vitaIntlCalendar(N) takes the pack reader and has no browser
  * dependencies, so that it runs under Node.
  */
-var __vitaIntlCalendar = function (N) {
+NV.__vitaIntlCalendar = function (N) {
 	'use strict';
 
 	var DAY = 86400000, EPOCH_JD = 2440588;
@@ -1162,4 +1162,4 @@ var __vitaIntlCalendar = function (N) {
 };
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlCalendar;
+	module.exports = NV.__vitaIntlCalendar;

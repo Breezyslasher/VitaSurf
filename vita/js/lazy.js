@@ -24,8 +24,8 @@
  * the prelude used to run it.
  */
 (function(){
-var W=window,lazy=W.__vitaLazy,load=W.__vitaLoadUnit,isLazy=W.__vitaIsLazy;
-var N=W.__vitaIntl,I=W.Intl;
+var W=window,lazy=NV.__vitaLazy,load=NV.__vitaLoadUnit,isLazy=NV.__vitaIsLazy;
+var N=NV.__vitaIntl,I=W.Intl;
 if(typeof load!=='function')return;
 var KEYS=['index','aliases','k:meta','g:meta','l:und','dt:index','tz:index'];
 if(typeof lazy!=='function'||typeof isLazy!=='function'||!I||!N||
@@ -54,7 +54,7 @@ PROPS.forEach(function(p){
  if(lazy(o,n,p[2],LAZY.length))LAZY.push(e);});
 /* the bindings call this with a lazy property's number; what it returns
    is the property's value, unless it has already been given another */
-Object.defineProperty(W,'__vitaLazyInit',{value:function(id){
+Object.defineProperty(NV,'__vitaLazyInit',{value:function(id){
  var e=LAZY[id];
  if(!e)return undefined;
  if(state===1)return e.orig;

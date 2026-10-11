@@ -14,7 +14,7 @@
  * Plain script with no browser dependencies, so that the generators and
  * tests can load it under Node.
  */
-var __vitaIntlCore = (function () {
+NV.__vitaIntlCore = (function () {
 	'use strict';
 
 	var LANGTAG = /^[a-z]{2,3}(-[a-z]{4})?(-([a-z]{2}|\d{3}))?(-([a-z\d]{5,8}|\d[a-z\d]{3}))*(-[a-wyz\d](-[a-z\d]{2,8})+)*(-x(-[a-z\d]{1,8})+)?$/i;
@@ -144,4 +144,4 @@ var __vitaIntlCore = (function () {
 })();
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlCore;
+	module.exports = NV.__vitaIntlCore;

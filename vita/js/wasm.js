@@ -15,8 +15,8 @@
  * (WebAssembly.Tag and Exception) and memory64.
  */
 (function(){
-var W=window,N=W.__vitaWasm;
-delete W.__vitaWasm;
+var W=window,N=NV.__vitaWasm;
+delete NV.__vitaWasm;
 if(!N)return;
 
 /* ---- errors ---- */

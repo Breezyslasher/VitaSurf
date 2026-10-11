@@ -16,8 +16,8 @@
  * that long.
  */
 (function(){
-var W=window,N=W.__vitaSubtle;
-if(!N){delete W.__vitaRegisterKeyClone;return;}
+var W=window,N=NV.__vitaSubtle;
+if(!N){delete NV.__vitaRegisterKeyClone;return;}
 
 function err(msg,name){return new DOMException(msg,name);}
 function notSupported(what){return err(what+' is not supported','NotSupportedError');}
@@ -650,7 +650,7 @@ W.Crypto=Crypto;W.SubtleCrypto=SubtleCrypto;W.CryptoKey=CryptoKey;
 
 /* structuredClone, postMessage and IndexedDB carry a key as a key; see
    storage.js. What is packed is the key's slot, material included. */
-if(typeof W.__vitaRegisterKeyClone==='function')W.__vitaRegisterKeyClone({
+if(typeof NV.__vitaRegisterKeyClone==='function')NV.__vitaRegisterKeyClone({
  is:function(v){return !!v&&typeof v==='object'&&SLOTS.has(v);},
  pack:function(k){var s=SLOTS.get(k),a={},m={};
   Object.keys(s.algorithm).forEach(function(n){var x=s.algorithm[n];
