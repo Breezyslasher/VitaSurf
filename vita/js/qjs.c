@@ -145,6 +145,23 @@ struct js_deferred {
  * about three.
  */
 #define WRAPPER_BUCKETS 4096
+/*
+ * The prototypes a node is given by what it is (VitaSurf): an element
+ * by its namespace and name, any other node by its type. The prelude
+ * makes them and hands them over (__vitaNodeProtos); until it does,
+ * every node has the class's.
+ */
+enum {
+	NP_ELEMENT,	/* an element in no namespace this knows */
+	NP_HTML,	/* an HTML element without an interface of its own */
+	NP_UNKNOWN,	/* an HTML element of a name HTML does not have */
+	NP_SVG,		/* an SVG element without an interface of its own */
+	NP_TEXT, NP_CDATA, NP_COMMENT, NP_PI,
+	NP_FRAGMENT, NP_SHADOW, NP_DOCTYPE,
+	NP_DOCUMENT,	/* a document other than the window's */
+	NP_BYNAME,	/* "DIV", "svg:svg": the ones with their own */
+	NP_COUNT
+};
 struct js_wrapper {
 	struct dom_node *node;
 	JSValue obj;
@@ -226,6 +243,8 @@ struct jsthread {
 	/** what window.location and document.location give (VitaSurf);
 	 * kept here rather than under a property a page could see */
 	JSValue location_obj;
+	/** what each kind of node inherits from, or JS_UNDEFINED */
+	JSValue node_protos[NP_COUNT];
 	struct jsthread *owner;   /**< the page's thread, for a worker */
 	struct jsthread *workers; /**< a page's workers */
 	struct jsthread *worker_next;
@@ -1402,12 +1421,190 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 			     bool whole);
 static bool realm_room(const char *what);
 
+static struct dom_node *shadow_host_of(struct dom_node *n);
+static bool dom_string_is(dom_string *d, const char *s, size_t len);
+
+/* An ASCII copy of a dom_string, upper-cased if asked; false if it
+   does not fit */
+static bool name_copy(dom_string *d, char *out, size_t size, bool upper)
+{
+	size_t n, i;
+	const char *p;
+
+	if (d == NULL) {
+		return false;
+	}
+	n = dom_string_byte_length(d);
+	if (n + 1 > size) {
+		return false;
+	}
+	p = dom_string_data(d);
+	for (i = 0; i < n; i++) {
+		char c = p[i];
+
+		if (upper && c >= 'a' && c <= 'z') {
+			c = (char)(c - 32);
+		}
+		out[i] = c;
+	}
+	out[n] = '\0';
+	return true;
+}
+
+/*
+ * What a node inherits from (VitaSurf), referenced, or JS_UNDEFINED for
+ * the class's own. Every node shared one prototype that carried every
+ * member of every interface, so a text node had a value and a href, an
+ * anchor was the same object's instance as an input, and an element's
+ * prototype was not HTMLAnchorElement.prototype, as a page that walks
+ * the chain, or patches one interface, expects.
+ */
+static JSValue node_proto_for(JSContext *ctx, jsthread *thread,
+			      struct dom_node *node)
+{
+	static const char html_ns[] = "http://www.w3.org/1999/xhtml";
+	static const char svg_ns[] = "http://www.w3.org/2000/svg";
+	dom_node_type type;
+	dom_string *ns = NULL, *local = NULL;
+	struct dom_node *host;
+	char name[48];
+	int which = -1;
+	JSValue v;
+
+	if (thread == NULL || JS_IsUndefined(thread->node_protos[NP_ELEMENT]) ||
+	    dom_node_get_node_type(node, &type) != DOM_NO_ERR) {
+		return JS_UNDEFINED;
+	}
+	switch (type) {
+	case DOM_TEXT_NODE: which = NP_TEXT; break;
+	case DOM_CDATA_SECTION_NODE: which = NP_CDATA; break;
+	case DOM_COMMENT_NODE: which = NP_COMMENT; break;
+	case DOM_PROCESSING_INSTRUCTION_NODE: which = NP_PI; break;
+	case DOM_DOCUMENT_TYPE_NODE: which = NP_DOCTYPE; break;
+	case DOM_DOCUMENT_NODE: which = NP_DOCUMENT; break;
+	case DOM_DOCUMENT_FRAGMENT_NODE:
+		host = shadow_host_of(node);
+		which = host != NULL ? NP_SHADOW : NP_FRAGMENT;
+		if (host != NULL) {
+			dom_node_unref(host);
+		}
+		break;
+	case DOM_ELEMENT_NODE:
+		break;
+	default:
+		return JS_UNDEFINED;
+	}
+	if (which >= 0) {
+		return JS_DupValue(ctx, thread->node_protos[which]);
+	}
+	dom_node_get_namespace(node, &ns);
+	dom_node_get_local_name(node, &local);
+	which = NP_ELEMENT;
+	v = JS_UNDEFINED;
+	if (ns == NULL || dom_string_is(ns, html_ns, sizeof(html_ns) - 1)) {
+		which = NP_UNKNOWN;
+		if (name_copy(local, name, sizeof(name), true)) {
+			v = JS_GetPropertyStr(ctx, thread->node_protos[NP_BYNAME],
+					      name);
+			/* a custom element's name, defined or not */
+			if (!JS_IsObject(v) && strchr(name, '-') != NULL) {
+				which = NP_HTML;
+			}
+		} else if (local != NULL &&
+			   memchr(dom_string_data(local), '-',
+				  dom_string_byte_length(local)) != NULL) {
+			which = NP_HTML;
+		}
+	} else if (dom_string_is(ns, svg_ns, sizeof(svg_ns) - 1)) {
+		which = NP_SVG;
+		name[0] = 's'; name[1] = 'v'; name[2] = 'g'; name[3] = ':';
+		if (name_copy(local, name + 4, sizeof(name) - 4, false)) {
+			v = JS_GetPropertyStr(ctx, thread->node_protos[NP_BYNAME],
+					      name);
+		}
+	}
+	if (ns != NULL) dom_string_unref(ns);
+	if (local != NULL) dom_string_unref(local);
+	if (JS_IsObject(v)) {
+		return v;
+	}
+	if (JS_IsException(v)) {
+		JS_FreeValue(ctx, JS_GetException(ctx));
+	} else {
+		JS_FreeValue(ctx, v);
+	}
+	return JS_DupValue(ctx, thread->node_protos[which]);
+}
+
+static void node_protos_free(jsthread *thread)
+{
+	int i;
+
+	for (i = 0; i < NP_COUNT; i++) {
+		JS_FreeValue(thread->ctx, thread->node_protos[i]);
+		thread->node_protos[i] = JS_UNDEFINED;
+	}
+}
+
+/* A node's wrapper in a thread's cache, or NULL. */
+static struct js_wrapper *wrapper_of(jsthread *t, struct dom_node *node,
+				     unsigned h)
+{
+	struct js_wrapper *w;
+
+	for (w = t->wrappers[h]; w != NULL; w = w->next) {
+		vitasurf_js_wrap_steps++;
+		if (w->node == node) {
+			return w;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The window a node belongs to (VitaSurf): its node document's, when
+ * that is another window's on the same runtime, else the one asking. A
+ * browser makes a node in its node document's realm, so a frame's
+ * createTextNode applied to the top document makes a node of the top
+ * window, with that window's prototypes.
+ */
+static jsthread *node_home(jsthread *thread, struct dom_node *node)
+{
+	struct dom_document *doc = NULL;
+	dom_node_type type = DOM_ELEMENT_NODE;
+	jsthread *t, *home = thread;
+
+	if (dom_node_get_node_type(node, &type) != DOM_NO_ERR) {
+		return thread;
+	}
+	if (type == DOM_DOCUMENT_NODE) {
+		doc = (struct dom_document *) node;
+	} else if (dom_node_get_owner_document(node, &doc) != DOM_NO_ERR ||
+		   doc == NULL) {
+		return thread;
+	} else {
+		dom_node_unref(doc);	/* the node still holds it */
+	}
+	if (doc == thread_document(thread)) {
+		return thread;
+	}
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		if (t != thread && t->ctx != NULL && !t->closed &&
+		    !t->is_worker && t->heap == thread->heap &&
+		    thread_document(t) == doc) {
+			home = t;
+			break;
+		}
+	}
+	return home;
+}
+
 static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 {
 	jsthread *thread = JS_GetContextOpaque(ctx);
 	struct js_wrapper *w;
 	unsigned h;
-	JSValue obj;
+	JSValue obj, proto;
 
 	if (node == NULL) {
 		return JS_NULL;
@@ -1438,20 +1635,58 @@ static JSValue wrap_node(JSContext *ctx, struct dom_node *node)
 		uint64_t w0 = now_ms();
 
 		h = (unsigned)(((uintptr_t)node) >> 4) % WRAPPER_BUCKETS;
-		if (thread != NULL) {
-			for (w = thread->wrappers[h]; w != NULL; w = w->next) {
-				vitasurf_js_wrap_steps++;
-				if (w->node == node) {
-					vitasurf_js_wrap_hits++;
+		w = thread != NULL ? wrapper_of(thread, node, h) : NULL;
+		/*
+		 * With another window on the runtime (a frame), a node has
+		 * one wrapper among all of them, made in its node
+		 * document's window (VitaSurf). Without, nothing changes.
+		 */
+		if (w == NULL && thread != NULL && all_threads != NULL &&
+		    all_threads->all_next != NULL) {
+			jsthread *t;
+
+			for (t = all_threads; t != NULL && w == NULL;
+			     t = t->all_next) {
+				if (t != thread && t->ctx != NULL &&
+				    !t->closed && t->heap == thread->heap) {
+					w = wrapper_of(t, node, h);
+				}
+			}
+			if (w == NULL) {
+				t = node_home(thread, node);
+				if (t != thread && node == (struct dom_node *)
+				    thread_document(t)) {
+					/* another window's document is
+					   that window's document object */
+					JSValue g = JS_GetGlobalObject(t->ctx);
+					JSValue d = JS_GetPropertyStr(t->ctx,
+							g, "document");
+
+					JS_FreeValue(t->ctx, g);
 					vitasurf_ms_js_wrap +=
 						(unsigned)(now_ms() - w0);
-					return JS_DupValue(ctx, w->obj);
+					return d;
+				}
+				if (t != thread) {
+					thread = t;
+					ctx = t->ctx;
 				}
 			}
 		}
+		if (w != NULL) {
+			vitasurf_js_wrap_hits++;
+			vitasurf_ms_js_wrap += (unsigned)(now_ms() - w0);
+			return JS_DupValue(ctx, w->obj);
+		}
 		vitasurf_ms_js_wrap += (unsigned)(now_ms() - w0);
 	}
-	obj = JS_NewObjectClass(ctx, node_class_id);
+	proto = node_proto_for(ctx, thread, node);
+	if (JS_IsObject(proto)) {
+		obj = JS_NewObjectProtoClass(ctx, proto, node_class_id);
+	} else {
+		obj = JS_NewObjectClass(ctx, node_class_id);
+	}
+	JS_FreeValue(ctx, proto);
 	if (JS_IsException(obj)) {
 		return obj;
 	}
@@ -6225,18 +6460,51 @@ static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_va
 	return out;
 }
 
+/*
+ * The document a document method was called on (VitaSurf): this
+ * window's document object, another window's, or a document node. The
+ * methods took this window's document whatever they were called on, so
+ * a frame's createTextNode applied to the top document made a node of
+ * the frame's. Anything else is this window's document, as before.
+ */
+static struct dom_document *this_document(JSContext *ctx, JSValueConst this_val)
+{
+	jsthread *thread = JS_GetContextOpaque(ctx), *t;
+	struct dom_node *n;
+	dom_node_type type = DOM_ELEMENT_NODE;
+	void *p;
+
+	if (thread == NULL || !JS_IsObject(this_val)) {
+		return thread_document(thread);
+	}
+	p = JS_VALUE_GET_PTR(this_val);
+	if (p == thread->doc_obj) {
+		return thread_document(thread);
+	}
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		if (t != thread && t->ctx != NULL && !t->closed &&
+		    t->heap == thread->heap && t->doc_obj == p) {
+			return thread_document(t);
+		}
+	}
+	n = JS_GetOpaque(this_val, node_class_id);
+	if (n != NULL && dom_node_get_node_type(n, &type) == DOM_NO_ERR &&
+	    type == DOM_DOCUMENT_NODE) {
+		return (struct dom_document *) n;
+	}
+	return thread_document(thread);
+}
+
 static JSValue doc_create_element(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
 	C_WHERE;
-	jsthread *thread = JS_GetContextOpaque(ctx);
-	struct dom_document *doc = thread_document(thread);
+	struct dom_document *doc = this_document(ctx, this_val);
 	const char *name;
 	dom_string *key;
 	struct dom_element *el = NULL;
 	JSValue r;
 
-	(void)this_val;
 	if (doc == NULL || argc < 1) return JS_NULL;
 	name = JS_ToCString(ctx, argv[0]);
 	key = to_dom_string(name);
@@ -6256,15 +6524,13 @@ static JSValue doc_create_text_node(JSContext *ctx, JSValueConst this_val,
 				    int argc, JSValueConst *argv)
 {
 	C_WHERE;
-	jsthread *thread = JS_GetContextOpaque(ctx);
-	struct dom_document *doc = thread_document(thread);
+	struct dom_document *doc = this_document(ctx, this_val);
 	const char *text;
 	size_t len = 0;
 	dom_string *d;
 	struct dom_text *node = NULL;
 	JSValue r;
 
-	(void)this_val;
 	if (doc == NULL || argc < 1) return JS_NULL;
 	/* by length: a page may put a NUL inside the text, and strlen
 	 * would cut the node short there */
@@ -6292,14 +6558,12 @@ static JSValue doc_create_element_ns(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
 	C_WHERE;
-	jsthread *thread = JS_GetContextOpaque(ctx);
-	struct dom_document *doc = thread_document(thread);
+	struct dom_document *doc = this_document(ctx, this_val);
 	const char *nsheld = NULL, *qname;
 	dom_string *ns, *q;
 	struct dom_element *el = NULL;
 	JSValue r;
 
-	(void)this_val;
 	if (doc == NULL || argc < 2) return JS_NULL;
 	ns = ns_arg(ctx, argv[0], &nsheld);
 	qname = JS_ToCString(ctx, argv[1]);
@@ -6411,15 +6675,13 @@ static JSValue doc_create_comment(JSContext *ctx, JSValueConst this_val,
 				  int argc, JSValueConst *argv)
 {
 	C_WHERE;
-	jsthread *thread = JS_GetContextOpaque(ctx);
-	struct dom_document *doc = thread_document(thread);
+	struct dom_document *doc = this_document(ctx, this_val);
 	const char *text;
 	size_t len = 0;
 	dom_string *d;
 	struct dom_comment *node = NULL;
 	JSValue r;
 
-	(void)this_val;
 	if (doc == NULL) return JS_NULL;
 	text = argc > 0 ? JS_ToCStringLen(ctx, &len, argv[0]) : NULL;
 	d = to_dom_string_len(text != NULL ? text : "", text != NULL ? len : 0);
@@ -6439,12 +6701,11 @@ static JSValue doc_create_document_fragment(JSContext *ctx, JSValueConst this_va
 					    int argc, JSValueConst *argv)
 {
 	C_WHERE;
-	jsthread *thread = JS_GetContextOpaque(ctx);
-	struct dom_document *doc = thread_document(thread);
+	struct dom_document *doc = this_document(ctx, this_val);
 	struct dom_document_fragment *frag = NULL;
 	JSValue r;
 
-	(void)this_val; (void)argc; (void)argv;
+	(void)argc; (void)argv;
 	if (doc == NULL) return JS_NULL;
 	dom_document_create_document_fragment(doc, &frag);
 	r = wrap_node(ctx, (struct dom_node *)frag);
@@ -7162,6 +7423,74 @@ static JSValue win_vita_natives_of(JSContext *ctx, JSValueConst this_val,
 	return JS_UNDEFINED;
 }
 
+/* __vitaIsNode(v): whether v is a node wrapper (VitaSurf) */
+static JSValue win_vita_is_node(JSContext *ctx, JSValueConst this_val,
+				int argc, JSValueConst *argv)
+{
+	(void)ctx;
+	(void)this_val;
+	return JS_NewBool(ctx, argc > 0 &&
+			  JS_GetOpaque(argv[0], node_class_id) != NULL);
+}
+
+/*
+ * __vitaNodeProtos(table): the prototypes each kind of node is given
+ * (VitaSurf; see node_proto_for), from vita/js/nodes.js. The nodes the
+ * prelude had already been handed still have the class's prototype, and
+ * take theirs now; one a script has given another (an upgraded custom
+ * element) keeps it.
+ */
+static JSValue win_vita_node_protos(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	static const char *const keys[NP_COUNT] = {
+		"element", "html", "unknown", "svg", "text", "cdata",
+		"comment", "pi", "fragment", "shadow", "doctype", "document",
+		"byName"
+	};
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	JSValue v, cls, cur, p;
+	unsigned h;
+	int i;
+	struct js_wrapper *w;
+
+	(void)this_val;
+	if (thread == NULL || argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_FALSE;
+	}
+	for (i = 0; i < NP_COUNT; i++) {
+		v = JS_GetPropertyStr(ctx, argv[0], keys[i]);
+		if (JS_IsException(v)) {
+			return v;
+		}
+		if (!JS_IsObject(v)) {
+			JS_FreeValue(ctx, v);
+			node_protos_free(thread);
+			return JS_ThrowTypeError(ctx, "node prototype %s missing",
+						 keys[i]);
+		}
+		JS_FreeValue(ctx, thread->node_protos[i]);
+		thread->node_protos[i] = v;
+	}
+	cls = JS_GetClassProto(ctx, node_class_id);
+	for (h = 0; h < WRAPPER_BUCKETS; h++) {
+		for (w = thread->wrappers[h]; w != NULL; w = w->next) {
+			cur = JS_GetPrototype(ctx, w->obj);
+			if (JS_IsObject(cur) &&
+			    JS_VALUE_GET_PTR(cur) == JS_VALUE_GET_PTR(cls)) {
+				p = node_proto_for(ctx, thread, w->node);
+				if (JS_IsObject(p)) {
+					JS_SetPrototype(ctx, w->obj, p);
+				}
+				JS_FreeValue(ctx, p);
+			}
+			JS_FreeValue(ctx, cur);
+		}
+	}
+	JS_FreeValue(ctx, cls);
+	return JS_TRUE;
+}
+
 /* __vitaSetLocation(loc): what location gives from now on, for a worker,
  * whose location is a WorkerLocation */
 static JSValue win_vita_set_location(JSContext *ctx, JSValueConst this_val,
@@ -7293,10 +7622,12 @@ static JSValue nav_get_user_agent(JSContext *ctx, JSValueConst this_val)
 
 static const JSCFunctionListEntry navigator_proto[] = {
 	JS_CGETSET_DEF("userAgent", nav_get_user_agent, NULL),
-	JS_PROP_STRING_DEF("appName", "Netscape", 0),
-	JS_PROP_STRING_DEF("appCodeName", "Mozilla", 0),
-	JS_PROP_STRING_DEF("platform", "PlayStation Vita", 0),
-	JS_PROP_STRING_DEF("product", "Gecko", 0),
+	/* configurable, so vita/js/singletons.js can move them to
+	   Navigator.prototype, where a browser has them */
+	JS_PROP_STRING_DEF("appName", "Netscape", JS_PROP_CONFIGURABLE),
+	JS_PROP_STRING_DEF("appCodeName", "Mozilla", JS_PROP_CONFIGURABLE),
+	JS_PROP_STRING_DEF("platform", "PlayStation Vita", JS_PROP_CONFIGURABLE),
+	JS_PROP_STRING_DEF("product", "Gecko", JS_PROP_CONFIGURABLE),
 };
 
 /* --- timers --- */
@@ -16367,6 +16698,12 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaNativesOf",
 			  JS_NewCFunction(ctx, win_vita_natives_of,
 					  "__vitaNativesOf", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaIsNode",
+			  JS_NewCFunction(ctx, win_vita_is_node,
+					  "__vitaIsNode", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaNodeProtos",
+			  JS_NewCFunction(ctx, win_vita_node_protos,
+					  "__vitaNodeProtos", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaInspect",
 			  JS_NewCFunction(ctx, win_vita_inspect,
 					  "__vitaInspect", 1));
@@ -17108,6 +17445,13 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 	ret->import_map = JS_UNINITIALIZED;
 	ret->natives = JS_UNDEFINED;
 	ret->location_obj = JS_UNDEFINED;
+	{
+		int i;
+
+		for (i = 0; i < NP_COUNT; i++) {
+			ret->node_protos[i] = JS_UNDEFINED;
+		}
+	}
 	JS_SetContextOpaque(ret->ctx, ret);
 	/*
 	 * A blank iframe's page, or a worker, is made the moment a script
@@ -17134,6 +17478,7 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 			 "thrown away");
 		JS_FreeValue(ret->ctx, ret->natives);
 		JS_FreeValue(ret->ctx, ret->location_obj);
+		node_protos_free(ret);
 		JS_FreeContext(ret->ctx);
 		free(ret);
 		return NULL;
@@ -17274,6 +17619,7 @@ nserror js_closethread(jsthread *thread)
 	thread->natives = JS_UNDEFINED;
 	JS_FreeValue(thread->ctx, thread->location_obj);
 	thread->location_obj = JS_UNDEFINED;
+	node_protos_free(thread);
 	/*
 	 * Not this thread any more: a function made here can outlive the
 	 * context, held by another page's listener or timer, and the
@@ -20002,7 +20348,12 @@ bool js_exec(jsthread *thread, const uint8_t *txt, size_t txtlen, const char *na
 		JSValue global = JS_GetGlobalObject(thread->ctx);
 		JSValue fn = natives_get(thread->ctx, "__vitaBeforeScript");
 		if (JS_IsFunction(thread->ctx, fn)) {
-			JSValue r = JS_Call(thread->ctx, fn, global, 0, NULL);
+			/* whether a script is running already: one a script
+			 * put in the document runs from inside that call,
+			 * with the tree part way through the change */
+			JSValue nested = JS_NewBool(thread->ctx,
+						    thread->script_depth > 0);
+			JSValue r = JS_Call(thread->ctx, fn, global, 1, &nested);
 			if (JS_IsException(r)) {
 				qjs_report_exception(thread->ctx);
 			}

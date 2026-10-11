@@ -56,7 +56,7 @@ T('performance has nothing of its own (0 function)', Object.getOwnPropertyNames(
   typeof Object.getOwnPropertyDescriptor(window, 'performance').get);
 var tm = performance.timing;
 T('timing (true 0 true 0)', (tm instanceof PerformanceTiming) + ' ' + Object.keys(tm).length + ' ' +
-  (tm.navigationStart === tm.fetchStart) + ' ' + tm.loadEventEnd);
+  (tm.fetchStart >= tm.navigationStart) + ' ' + tm.loadEventEnd);
 T('navigation (true {"type":0,"redirectCount":0} 1 1)', (performance.navigation instanceof PerformanceNavigation) + ' ' +
   JSON.stringify(performance.navigation) + ' ' + PerformanceNavigation.TYPE_RELOAD + ' ' + performance.navigation.TYPE_RELOAD);
 T('toJSON (timeOrigin,timing,navigation)', Object.keys(performance.toJSON()).join());

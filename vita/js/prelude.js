@@ -1803,7 +1803,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
  * read, and fires popstate when the page walks the stack. */
 (function(){
  function here(){ try{ return location.href; }catch(e){ return ''; } }
- var stack=[{state:null,url:here()}], at=0;
+ var stack=[{state:null,url:here()}], at=0, state=null;
  function resolve(url){
   if(url===undefined||url===null||url==='')return here();
   try{ return new URL(String(url), here()).href; }catch(e){ return here(); }
@@ -1824,7 +1824,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
   var e=stack[i];
   at=i;
   NV.__vitaHref=e.url;
-  H.state=e.state;
+  state=e.state;
   if(!fire)return;
   setTimeout(function(){
    var ev;
@@ -1837,7 +1837,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
  }
  var H={
   get length(){ return stack.length; },
-  state:null,
+  get state(){ return state; },
   scrollRestoration:'auto',
   pushState:function(state,title,url){
    stack.length=at+1;
@@ -1930,6 +1930,9 @@ EventTarget.prototype.dispatchEvent=function(e){
  return !(e.cancelable&&e.defaultPrevented);};
 try{Object.setPrototypeOf(P,EventTarget.prototype);}catch(e){}
 W.EventTarget=EventTarget;
+/* what an EventTarget that is not a node does; nodes.js joins it to the
+   node methods EventTarget.prototype ends up with */
+NV.__vitaEventTargetJS=EventTarget.prototype;
 /* The event interfaces. A page names one to say what kind of event a
  * handler takes -- YouTube annotates a wheel handler with WheelEvent --
  * so the name has to exist even where nothing here will ever construct
@@ -1971,14 +1974,14 @@ Object.defineProperty(DocumentProto,'constructor',
 /* Set once the real ones are defined, further down. Anything that runs
    before that sees the array, which is what it used to be. */
 W.NodeList=W.HTMLCollection=Array;
-['CharacterData','Text','Comment','CDATASection','ProcessingInstruction','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});
+['CharacterData','Text','Comment','CDATASection','ProcessingInstruction','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLDirectoryElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});
 /* Interfaces that polyfills enumerate and read .prototype from. They
  * carry no behaviour here; what matters is that window[name] exists so a
  * feature-patching loop does not stop the page at its first entry. */
 ['DOMTokenList','NamedNodeMap','NodeIterator','TreeWalker','Range','StaticRange','AbstractRange',
  'StyleSheet','CSSStyleSheet','CSSStyleDeclaration','CSSRule','CSSRuleList','MediaList',
- 'XMLDocument','DOMImplementation','DOMStringMap','MutationRecord','DOMRect','DOMRectReadOnly',
- 'DOMPoint','DOMMatrix','Selection','XPathResult','AnimationEvent','TransitionEvent',
+ 'XMLDocument','DOMImplementation','DOMStringMap','MutationRecord',
+ 'Selection','XPathResult','AnimationEvent','TransitionEvent',
  'HTMLAllCollection','RadioNodeList','ValidityState'].forEach(function(n){if(W[n]===undefined)W[n]=function(){};});
 var WindowProto={};Object.setPrototypeOf(W,WindowProto);
 /* window.constructor.name is Window, which code reads to tell a window
@@ -3211,8 +3214,12 @@ function declarativeShadow(t){
  host.removeChild(t);
  r.appendChild(f);
  declarativeShadows(r);}
-function beforeScript(){
+function beforeScript(nested){
  var n;
+ /* a frame the parser has made is window[n] to the script after it; a
+    script another script inserted runs inside that insertion, while the
+    tree is part way through it, which is no time to look through it */
+ if(!nested&&NV.__vitaSyncFrames)NV.__vitaSyncFrames();
  if(typeof SH_TPL==='function'&&(n=SH_TPL())!==shTplSeen){
   shTplSeen=n;declarativeShadows(D);}
  sweepTemplates();}
@@ -3603,13 +3610,13 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   /* the empty ones it made, in order, when they can be told from any
      the page wrote empty itself */
   if(emptied.length){
-   var es=this.getElementsByTagName('style'),k,e=[];
+   var es=this.querySelectorAll('style'),k,e=[];
    for(k=0;k<es.length;k++)
     if(styleNode(es[k])&&es[k].textContent==='')e.push(es[k]);
    if(e.length===emptied.length)
     for(k=0;k<e.length;k++)park(e[k],emptied[k]);}
   if(fresh.length){
-   var st=this.getElementsByTagName('style'),i,j;
+   var st=this.querySelectorAll('style'),i,j;
    for(i=0;i<st.length;i++)for(j=0;j<fresh.length;j++)
     if(!canon[fresh[j]]||!live(fresh[j]))
      if(st[i].textContent===fresh[j])keep(st[i],fresh[j]);}
@@ -3965,8 +3972,29 @@ Object.defineProperty(P,'isContentEditable',{configurable:true,get:function(){
   if(v==='true'||v==='plaintext-only')return true;if(v==='false')return false;}
  return D.designMode==='on';}});
 Object.defineProperty(P,'accessKeyLabel',{configurable:true,get:function(){return '';}});
+/* outerText replaces the element with its text, a line break as a <br>,
+   and joins the text that ends up beside another text node, as the HTML
+   standard has it; it set innerText, keeping the element */
 Object.defineProperty(P,'outerText',{configurable:true,
- get:function(){return this.innerText;},set:function(v){this.innerText=v;}});
+ get:function(){return this.innerText;},
+ set:function(v){
+  var parent=this.parentNode,doc=this.ownerDocument||D,next,prev,frag,s;
+  if(!parent)throw new W.DOMException("Failed to set the 'outerText' property on 'HTMLElement': The element has no parent.",
+   'NoModificationAllowedError');
+  next=this.nextSibling;prev=this.previousSibling;
+  s=v===null?'':String(v);
+  frag=doc.createDocumentFragment();
+  if(s==='')frag.appendChild(doc.createTextNode(''));
+  else s.split(/\r\n|\r|\n/).forEach(function(part,i){
+   if(i)frag.appendChild(doc.createElement('br'));
+   if(part)frag.appendChild(doc.createTextNode(part));});
+  parent.replaceChild(frag,this);
+  function merge(t){
+   var n=t&&t.nextSibling;
+   if(!t||t.nodeType!==3||!n||n.nodeType!==3)return;
+   t.data+=n.data;parent.removeChild(n);}
+  if(next&&next.previousSibling)merge(next.previousSibling);
+  if(prev)merge(prev);}});
 Object.defineProperty(P,'attributeStyleMap',{configurable:true,get:function(){return this.computedStyleMap();}});
 Object.defineProperty(P,'currentCSSZoom',{configurable:true,get:function(){return 1;}});
 Object.defineProperty(P,'scrollParent',{configurable:true,get:function(){return D.scrollingElement;}});
@@ -4883,14 +4911,18 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
  /* window[n] is the nth frame's window. A browser's window has as many
     of these as it has frames, and none when it has none; ten were made
     for every page, which Object.keys(window) showed. They follow the
-    frames now: when the page loads, when window.length is read and when
-    a frame's window is made or asked for. */
+    frames now: when the page loads, before each script runs, when
+    window.length is read and when a frame's window is made or asked for;
+    a tree that has not changed since is not looked through again. */
  function frameEls(){return D.querySelectorAll('iframe,frame');}
- var indexed=0;
+ var indexed=0,syncedAt=-2;
  function indexGetter(n){return function(){
   var e=frameEls()[n];return e?e.contentWindow:undefined;};}
  function syncIndexes(){
-  var count=frameEls().length,n;
+  var g=domGen(),count,n;
+  if(g>=0&&g===syncedAt)return indexed;
+  syncedAt=g;
+  count=frameEls().length;
   if(count>100)count=100;
   for(n=indexed;n<count;n++)
    Object.defineProperty(W,n,{configurable:true,get:indexGetter(n)});
@@ -5629,7 +5661,7 @@ Object.defineProperty(W.HTMLOptionsCollection.prototype,'selectedIndex',{
  configurable:true,
  get:function(){var o=this.__vitaOwner;return o?o.selectedIndex:-1;},
  set:function(v){var o=this.__vitaOwner;if(o)o.selectedIndex=v;}});
-W.HTMLFormControlsCollection=HTMLCollection;W.HTMLAllCollection=HTMLCollection;
+W.HTMLFormControlsCollection=FormControls;W.HTMLAllCollection=HTMLCollection;
 
 W.closed=false;
 W.name=W.name||'';
@@ -7649,11 +7681,6 @@ Object.defineProperty(W.XMLHttpRequest.prototype,'responseXML',{configurable:tru
 W.RadioNodeList=function(){};
 Object.defineProperty(W.RadioNodeList.prototype,'value',{configurable:true,
  get:function(){return '';},set:function(){}});
-W.DocumentType=function(){this.name='html';this.publicId='';this.systemId='';
- this.nodeType=10;this.nodeName='html';};
-['before','after','replaceWith','remove'].forEach(function(k){
- W.DocumentType.prototype[k]=function(){};});
-Object.defineProperty(D,'doctype',{configurable:true,get:function(){return new W.DocumentType();}});
 if(!W.CSS)W.CSS={};
 W.CSS.escape=W.CSS.escape||function(s){return String(s).replace(/([^\w-])/g,'\\$1');};
 /* CSS.supports(property, value) and CSS.supports(condition), answered
@@ -8677,31 +8704,36 @@ D.textContent=null;
  * everything a doctype is asked for -- nodeName, nodeType, its owner --
  * was undefined.
  */
+/* The parser's doctypes are node wrappers, and DocumentType.prototype is
+ * theirs (vita/js/nodes.js puts Node under it): one made here, when the
+ * bindings cannot make a node, has what it answers as its own, which
+ * the node accessors it inherits would refuse. */
 function DocumentType(name,publicId,systemId){
- this.name=String(name);
- this.publicId=publicId===undefined?'':String(publicId);
- this.systemId=systemId===undefined?'':String(systemId);
- this.nodeName=this.name;
- this.nodeType=10;
- this.nodeValue=null;
- this.textContent=null;
- this.childNodes=[];
- this.parentNode=null;
- this.ownerDocument=D;}
-DocumentType.prototype.before=DocumentType.prototype.after=
- DocumentType.prototype.replaceWith=DocumentType.prototype.remove=function(){};
-DocumentType.prototype.cloneNode=function(){
- return new DocumentType(this.name,this.publicId,this.systemId);};
-DocumentType.prototype.isEqualNode=function(o){
- return !!o&&o.nodeType===10&&o.name===this.name&&
-  o.publicId===this.publicId&&o.systemId===this.systemId;};
+ var self=this;
+ name=String(name);
+ [['name',name],
+  ['publicId',publicId===undefined?'':String(publicId)],
+  ['systemId',systemId===undefined?'':String(systemId)],
+  ['nodeName',name],['nodeType',10],['nodeValue',null],['textContent',null],
+  ['childNodes',[]],['parentNode',null],['ownerDocument',D],
+  ['before',noop],['after',noop],['replaceWith',noop],['remove',noop],
+  ['cloneNode',function(){
+   return new DocumentType(self.name,self.publicId,self.systemId);}],
+  ['isEqualNode',function(o){
+   return !!o&&o.nodeType===10&&o.name===self.name&&
+    o.publicId===self.publicId&&o.systemId===self.systemId;}]
+ ].forEach(function(p){shadowProp(self,p[0],p[1]);});}
+function noop(){}
 W.DocumentType=DocumentType;
 /* a doctype the parser made is a node wrapper, not one of these */
 try{Object.defineProperty(DocumentType,Symbol.hasInstance,{configurable:true,
  value:function(o){return !!o&&typeof o==='object'&&o.nodeType===10;}});}catch(e){}
+/* the document's doctype node, or null when it has none, as a browser
+   answers: it was always a made-up html doctype */
 Object.defineProperty(D,'doctype',{configurable:true,
- get:function(){return priv(D,'__doctype',function(){
-  return new DocumentType('html','','');});}});
+ get:function(){
+  for(var n=D.firstChild;n;n=n.nextSibling)if(n.nodeType===10)return n;
+  return null;}});
 /* What the name may contain. Browsers are far looser here than the XML
    Name production reads: 1foo, @foo, ~ and } are all accepted, and only
    a character that could never appear in markup -- a space, an angle
@@ -9037,7 +9069,8 @@ stampConsts(P);
   HTMLBaseElement:'BASE',HTMLBodyElement:'BODY',HTMLBRElement:'BR',
   HTMLButtonElement:'BUTTON',HTMLCanvasElement:'CANVAS',HTMLDataElement:'DATA',
   HTMLDataListElement:'DATALIST',HTMLDetailsElement:'DETAILS',
-  HTMLDialogElement:'DIALOG',HTMLDivElement:'DIV',HTMLDListElement:'DL',
+  HTMLDialogElement:'DIALOG',HTMLDirectoryElement:'DIR',HTMLDivElement:'DIV',
+  HTMLDListElement:'DL',
   HTMLEmbedElement:'EMBED',HTMLFieldSetElement:'FIELDSET',
   HTMLFontElement:'FONT',HTMLFormElement:'FORM',HTMLFrameElement:'FRAME',
   HTMLFrameSetElement:'FRAMESET',HTMLHeadElement:'HEAD',
@@ -9061,6 +9094,8 @@ stampConsts(P);
   HTMLTimeElement:'TIME',HTMLTitleElement:'TITLE',HTMLTrackElement:'TRACK',
   HTMLUListElement:'UL',HTMLVideoElement:'VIDEO'};
  stampConsts(CEBase);
+ /* for nodes.js, which gives each of these its own prototype */
+ NV.__vitaByTag=byTag;NV.__vitaHtmlTags=HTML_TAGS;
  /* Document keeps its own prototype, which polyfills patch, so it is
     not replaced -- but it can still answer instanceof honestly. */
  try{Object.defineProperty(W.Document,Symbol.hasInstance,

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Geometry interfaces</title></head>
+<body><pre id="out"></pre><div id="box" style="width:50px;height:20px"></div>
+<script>
+/* DOMPoint, DOMRect, DOMQuad and DOMMatrix as the Geometry Interfaces
+   specification has them, and boxes as DOMRects (VitaSurf:
+   vita/js/geometry.js). They were empty functions and plain objects.
+   Each line gives the browser's answer in brackets. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function err(f){ try { f(); return 'no throw'; } catch (e) { return e.name; } }
+var p = new DOMPoint(1, 2);
+T('a point (1 2 0 1)', [p.x, p.y, p.z, p.w].join(' '));
+p.x = 5;
+T('it writes (5 {"x":5,"y":2,"z":0,"w":1})', p.x + ' ' + JSON.stringify(p));
+var ro = new DOMPointReadOnly(1, 2); ro.x = 9;
+T('a read-only one does not (1 false)', ro.x + ' ' + ('set' in Object.getOwnPropertyDescriptor(DOMPointReadOnly.prototype, 'x') &&
+  !!Object.getOwnPropertyDescriptor(DOMPointReadOnly.prototype, 'x').set));
+T('fromPoint (true 3 0)', (DOMPoint.fromPoint({ x: 3 }) instanceof DOMPoint) + ' ' + DOMPoint.fromPoint({ x: 3 }).x + ' ' +
+  DOMPoint.fromPoint({ x: 3 }).y);
+T('nothing of its own ( true)', Object.keys(p).join() + ' ' + ('x' in p));
+var r = new DOMRect(1, 2, -3, 4);
+T('a rectangle (-2 1 2 6)', [r.left, r.right, r.top, r.bottom].join(' '));
+T('its JSON ({"x":1,"y":2,"width":3,"height":4,"top":2,"right":4,"bottom":6,"left":1})', JSON.stringify(new DOMRect(1, 2, 3, 4)));
+T('fromRect (5 0)', DOMRect.fromRect({ width: 5 }).width + ' ' + DOMRect.fromRect({ width: 5 }).x);
+/* once laid out */
+addEventListener('load', function () { setTimeout(function () {
+  var box = document.getElementById('box');
+  T('an element\'s box (true 50 20)', (box.getBoundingClientRect() instanceof DOMRect) + ' ' + box.getBoundingClientRect().width + ' ' +
+    box.getBoundingClientRect().height);
+  var list = box.getClientRects();
+  T('its fragments (true 1 true true)', (list instanceof DOMRectList) + ' ' + list.length + ' ' + (list.item(0) instanceof DOMRect) +
+    ' ' + (list[0] === list.item(0)));
+}, 0); });
+var m = new DOMMatrix();
+T('identity (true true matrix(1, 0, 0, 1, 0, 0))', m.isIdentity + ' ' + m.is2D + ' ' + m);
+T('from a list of 6 (matrix(1, 2, 3, 4, 5, 6))', String(new DOMMatrix([1, 2, 3, 4, 5, 6])));
+T('from 16 (false 16)', new DOMMatrix([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]).is2D + ' ' + new DOMMatrix([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]).toFloat32Array().length);
+T('from CSS (matrix(2, 0, 0, 2, 10, 20))', String(new DOMMatrix('translate(10px, 20px) scale(2)')));
+T('none (true)', new DOMMatrix('none').isIdentity);
+T('rotate 90 (matrix(0, 1, -1, 0, 0, 0))', String(new DOMMatrix('rotate(90deg)')));
+T('rotate(30) a and b (0.866025 0.500000)', (function () { var x = new DOMMatrix().rotate(30); return x.a.toFixed(6) + ' ' + x.b.toFixed(6); })());
+T('bad CSS (SyntaxError SyntaxError)', err(function () { new DOMMatrix('foo'); }) + ' ' + err(function () { new DOMMatrix('translate(1em)'); }));
+T('a list of 2 (TypeError)', err(function () { new DOMMatrix([1, 2]); }));
+T('translate and transformPoint (11 21)', (function () { var q = new DOMMatrix().translate(10, 20).transformPoint({ x: 1, y: 1 });
+  return q.x + ' ' + q.y; })());
+T('scale and inverse (2 0.5)', new DOMMatrix().scale(2).a + ' ' + new DOMMatrix().scale(2).inverse().a);
+T('multiply (matrix(2, 0, 0, 2, 10, 0))', String(new DOMMatrix().translate(10).multiply(new DOMMatrix().scale(2))));
+T('self methods change it (true 3)', (function () { var x = new DOMMatrix(); var y = x.translateSelf(3); return (x === y) + ' ' + x.e; })());
+T('a 3D value makes it 3D (false)', (function () { var x = new DOMMatrix(); x.m13 = 1; return x.is2D; })());
+T('setting a writes m11 too (4 4)', (function () { var x = new DOMMatrix(); x.a = 4; return x.a + ' ' + x.m11; })());
+T('a singular inverse (NaN false)', (function () { var x = new DOMMatrix([0, 0, 0, 0, 0, 0]).inverse(); return x.a + ' ' + x.is2D; })());
+T('fromMatrix (3 TypeError)', DOMMatrix.fromMatrix({ m11: 3 }).a + ' ' + err(function () { DOMMatrix.fromMatrix({ a: 2, m11: 3 }); }));
+T('skewX(45) c (1.000000)', new DOMMatrix().skewX(45).c.toFixed(6));
+T('rotateFromVector(0, 1) b (1.000000)', new DOMMatrix().rotateFromVector(0, 1).b.toFixed(6));
+T('flipX (-1)', new DOMMatrix().flipX().a);
+T('a 3D one serialises (matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 5, 1))', String(new DOMMatrix().translate(0, 0, 5)));
+T('setMatrixValue (7)', new DOMMatrix().setMatrixValue('translateX(7px)').e);
+T('WebKitCSSMatrix is DOMMatrix (true)', WebKitCSSMatrix === DOMMatrix);
+T('a point through a matrix (12 20)', (function () { var q = new DOMPoint(1, 0).matrixTransform(new DOMMatrix().scale(2).translate(5, 10));
+  return q.x + ' ' + q.y; })());
+T('a quad\'s bounds ({"x":0,"y":0,"width":2,"height":3,"top":0,"right":2,"bottom":3,"left":0})',
+  JSON.stringify(new DOMQuad({ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 3 }, { x: 0, y: 3 }).getBounds()));
+T('DOMQuad.fromRect p3 ({"x":3,"y":4,"z":0,"w":1})', JSON.stringify(DOMQuad.fromRect({ x: 1, y: 1, width: 2, height: 3 }).p3));
+T('a getter on another object (TypeError)', err(function () { Object.getOwnPropertyDescriptor(DOMRectReadOnly.prototype, 'x').get.call({}); }));
+T('DOMRectList is not constructed (TypeError)', err(function () { new DOMRectList(); }));
+T('members are enumerable (true true)', Object.getOwnPropertyDescriptor(DOMMatrixReadOnly.prototype, 'translate').enumerable + ' ' +
+  Object.getOwnPropertyDescriptor(DOMRectReadOnly.prototype, 'top').enumerable);
+</script>
+</body></html>

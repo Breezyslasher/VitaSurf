@@ -359,44 +359,103 @@ W.structuredClone = function(value){
 
 /* ------------------------------------------------------------- Storage */
 
-function Storage(backing, persist){
- Object.defineProperty(this, '_d', { value: backing, enumerable: false });
- Object.defineProperty(this, '_p', { value: !!persist, enumerable: false });
+/*
+ * A Storage is what WebIDL makes of an interface with named properties:
+ * localStorage.theme reads the item, localStorage.theme = 'dark' sets
+ * it, delete removes it and Object.keys lists the keys. The object a page
+ * holds is a proxy over the instance that does that (VitaSurf). The
+ * items were not properties at all, so a page that stores with an
+ * assignment, as many do, kept its value on the object until it was
+ * gone, and the store and the flag that says whether it is saved were
+ * the instance's own properties _d and _p, where a page could see them.
+ */
+var STORAGE = new WeakMap();	/* the instance or its proxy: { d, p } */
+function backingOf(s, what){
+ var b = STORAGE.get(s);
+ if (!b) throw new TypeError("Failed to execute '" + what +
+                             "' on 'Storage': Illegal invocation");
+ return b;
 }
-Storage.prototype = {
- constructor: Storage,
- getItem: function(k){
-  k = String(k);
-  return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null;
- },
- setItem: function(k, v){
-  var key = String(k), old = this.getItem(key), val = String(v);
-  this._d[key] = val;
-  if (this._p) touch();
-  fireStorage(key, old, val);
- },
- removeItem: function(k){
-  var key = String(k), old = this.getItem(key);
-  delete this._d[key];
-  if (this._p) touch();
-  if (old !== null) fireStorage(key, old, null);
- },
- clear: function(){
-  var self = this;
-  Object.keys(this._d).forEach(function(k){ delete self._d[k]; });
-  if (this._p) touch();
-  fireStorage(null, null, null);
- },
- key: function(i){
-  var keys = Object.keys(this._d);
-  i = Number(i) || 0;
-  return i >= 0 && i < keys.length ? keys[i] : null;
- }
-};
-Object.defineProperty(Storage.prototype, 'length', {
- configurable: true,
- get: function(){ return Object.keys(this._d).length; }
+function Storage(){ throw new TypeError('Illegal constructor'); }
+function makeStorage(backing, persist){
+ var self = Object.create(Storage.prototype), b = { d: backing, p: !!persist },
+  has = Object.prototype.hasOwnProperty, px;
+ STORAGE.set(self, b);
+ function item(k){ return typeof k === 'string' && has.call(b.d, k); }
+ px = new Proxy(self, {
+  get: function(t, k){
+   if (item(k) && !(k in t)) return b.d[k];
+   return Reflect.get(t, k, px);
+  },
+  set: function(t, k, v){
+   if (typeof k !== 'string') return Reflect.set(t, k, v, t);
+   Storage.prototype.setItem.call(px, k, v);
+   return true;
+  },
+  has: function(t, k){ return item(k) || k in t; },
+  deleteProperty: function(t, k){
+   if (item(k)) Storage.prototype.removeItem.call(px, k);
+   else if (typeof k !== 'string') return Reflect.deleteProperty(t, k);
+   return true;
+  },
+  ownKeys: function(t){ return Object.keys(b.d).concat(Reflect.ownKeys(t)); },
+  getOwnPropertyDescriptor: function(t, k){
+   if (item(k) && !(k in t))
+    return { value: b.d[k], writable: true, enumerable: true,
+             configurable: true };
+   return Reflect.getOwnPropertyDescriptor(t, k);
+  },
+  defineProperty: function(t, k, d){
+   if (typeof k !== 'string') return Reflect.defineProperty(t, k, d);
+   Storage.prototype.setItem.call(px, k, d.value);
+   return true;
+  }
+ });
+ STORAGE.set(px, b);
+ return px;
+}
+function method(name, length, f){
+ Object.defineProperty(f, 'name', { value: name });
+ Object.defineProperty(f, 'length', { value: length });
+ Object.defineProperty(Storage.prototype, name, { value: f, writable: true,
+  enumerable: true, configurable: true });
+}
+method('getItem', 1, function(k){
+ var b = backingOf(this, 'getItem');
+ k = String(k);
+ return Object.prototype.hasOwnProperty.call(b.d, k) ? b.d[k] : null;
 });
+method('setItem', 2, function(k, v){
+ var b = backingOf(this, 'setItem'), key = String(k),
+  old = this.getItem(key), val = String(v);
+ b.d[key] = val;
+ if (b.p) touch();
+ fireStorage(key, old, val);
+});
+method('removeItem', 1, function(k){
+ var b = backingOf(this, 'removeItem'), key = String(k),
+  old = this.getItem(key);
+ delete b.d[key];
+ if (b.p) touch();
+ if (old !== null) fireStorage(key, old, null);
+});
+method('clear', 0, function(){
+ var b = backingOf(this, 'clear');
+ Object.keys(b.d).forEach(function(k){ delete b.d[k]; });
+ if (b.p) touch();
+ fireStorage(null, null, null);
+});
+method('key', 1, function(i){
+ var keys = Object.keys(backingOf(this, 'key').d);
+ i = Number(i) || 0;
+ return i >= 0 && i < keys.length ? keys[i] : null;
+});
+Object.defineProperty(Storage.prototype, 'length', {
+ configurable: true, enumerable: true,
+ get: function length(){ return Object.keys(backingOf(this, 'length').d).length; }
+});
+Object.defineProperty(Storage.prototype, 'constructor', { value: Storage,
+ writable: true, configurable: true });
 
 /* The storage event. A real browser sends it to other tabs; there is one
    page here, so it goes to this one, which is what a page listening for
@@ -421,11 +480,11 @@ var localStore = null;
 Object.defineProperty(W, 'localStorage', {
  configurable: true,
  get: function(){
-  if (!localStore) localStore = new Storage(readStore().local, true);
+  if (!localStore) localStore = makeStorage(readStore().local, true);
   return localStore;
  }
 });
-W.sessionStorage = new Storage({}, false);	/* by design, not persisted */
+W.sessionStorage = makeStorage({}, false);	/* by design, not persisted */
 
 /* ---------------------------------------------------------- IndexedDB */
 

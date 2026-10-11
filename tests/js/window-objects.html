@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>The window's objects and their interfaces</title></head>
+<body><pre id="out"></pre>
+<script>
+/* navigator, screen, history, visualViewport, crypto, location and the
+   storages are instances of their interfaces, whose prototypes have the
+   members (VitaSurf: vita/js/singletons.js, Storage in storage.js). They
+   were plain objects with every member their own. EventTarget works for
+   any object, not only nodes. Each line gives the browser's answer in
+   brackets. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function tag(x){ return Object.prototype.toString.call(x).slice(8, -1); }
+var objs = [navigator, screen, screen.orientation, history, visualViewport, crypto, location, localStorage];
+T('what each is (Navigator Screen ScreenOrientation History VisualViewport Crypto Location Storage)',
+  objs.map(tag).join(' '));
+T('instances (true true true true true true true true)', [[navigator, Navigator], [screen, Screen],
+  [screen.orientation, ScreenOrientation], [history, History], [visualViewport, VisualViewport],
+  [crypto, Crypto], [location, Location], [localStorage, Storage]].map(function (p) { return p[0] instanceof p[1]; }).join(' '));
+T('nothing of their own (0 0 0 0 0 0)', [navigator, screen, history, visualViewport, crypto, sessionStorage]
+  .map(function (x) { return Object.getOwnPropertyNames(x).length; }).join(' '));
+T('location keeps its own (true)', Object.keys(location).indexOf('href') >= 0);
+T('members on the prototype (true true true true)', [
+  typeof Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent').get,
+  typeof Object.getOwnPropertyDescriptor(Screen.prototype, 'width').get,
+  typeof Object.getOwnPropertyDescriptor(History.prototype, 'pushState').value,
+  typeof Object.getOwnPropertyDescriptor(Crypto.prototype, 'getRandomValues').value]
+  .map(function (t) { return t === 'function'; }).join(' '));
+T('enumerable (true true)', Object.getOwnPropertyDescriptor(Navigator.prototype, 'language').enumerable + ' ' +
+  Object.getOwnPropertyDescriptor(History.prototype, 'back').enumerable);
+T('values (string number string number)', typeof navigator.userAgent + ' ' + typeof screen.width + ' ' +
+  typeof navigator.language + ' ' + typeof visualViewport.width);
+T('read-only (string)', (function () { var was = navigator.userAgent; navigator.userAgent = 'x';
+  return navigator.userAgent === was ? 'string' : 'changed'; })());
+T('not constructed (TypeError TypeError TypeError)', [Navigator, Screen, History].map(function (C) {
+  try { new C(); return 'made'; } catch (e) { return e.name; } }).join(' '));
+T('a getter on another object (TypeError)', (function () {
+  try { Object.getOwnPropertyDescriptor(Navigator.prototype, 'language').get.call({}); return 'read'; }
+  catch (e) { return e.name; } })());
+T('EventTargets (true true true false)', (screen instanceof EventTarget) + ' ' + (visualViewport instanceof EventTarget) + ' ' +
+  (screen.orientation instanceof EventTarget) + ' ' + (navigator instanceof EventTarget));
+T('their handlers (null function)', (function () { var r = [screen.onchange]; screen.onchange = function () {};
+  r.push(typeof screen.onchange); screen.onchange = null; return r.map(String).join(' '); })());
+T('new EventTarget hears what it is sent (1 true)', (function () {
+  var t = new EventTarget(), n = 0, same = false;
+  t.addEventListener('ping', function (e) { n++; same = e.target === t; });
+  t.dispatchEvent(new Event('ping')); return n + ' ' + same; })());
+T('and a class that extends it (2)', (function () {
+  class Bus extends EventTarget {}
+  var b = new Bus(), n = 0;
+  b.addEventListener('x', function () { n++; }); b.addEventListener('y', { handleEvent: function () { n++; } });
+  b.dispatchEvent(new Event('x')); b.dispatchEvent(new Event('y')); return n; })());
+T('history.state follows pushState (null 1)', (function () {
+  var r = [history.state]; history.replaceState({ a: 1 }, '', location.href); r.push(history.state.a);
+  history.replaceState(null, '', location.href); return r.map(String).join(' '); })());
+T('scrollRestoration takes its two values (manual manual auto)', (function () {
+  var r = []; history.scrollRestoration = 'manual'; r.push(history.scrollRestoration);
+  history.scrollRestoration = 'sideways'; r.push(history.scrollRestoration);
+  history.scrollRestoration = 'auto'; r.push(history.scrollRestoration); return r.join(' '); })());
+T('crypto (16 object 36)', crypto.getRandomValues(new Uint8Array(16)).length + ' ' + typeof crypto.subtle + ' ' +
+  crypto.randomUUID().length);
+T('storage items as properties (dark dark k true 1)', (function () {
+  sessionStorage.clear(); sessionStorage.k = 'dark';
+  var r = [sessionStorage.getItem('k'), sessionStorage.k, Object.keys(sessionStorage).join(), 'k' in sessionStorage,
+    sessionStorage.length];
+  delete sessionStorage.k; return r.join(' '); })());
+T('a method is not shadowed by an item (function)', (function () {
+  sessionStorage.setItem('getItem', 'v'); var t = typeof sessionStorage.getItem; sessionStorage.clear(); return t; })());
+T('visualViewport is one object (true)', window.visualViewport === window.visualViewport);
+T('clientInformation (true)', window.clientInformation === navigator);
+</script>
+</body></html>

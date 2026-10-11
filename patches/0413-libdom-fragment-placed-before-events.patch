@@ -1,0 +1,82 @@
+diff --git a/src/core/node.c b/src/core/node.c
+index 54af8e1..9f55986 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -887,8 +887,15 @@ dom_exception _dom_node_insert_before(dom_node_internal *node,
+ 				return DOM_HIERARCHY_REQUEST_ERR;
+ 
+ 		if (new_child->first_child != NULL) {
+-			err = _dom_node_attach_range(new_child->first_child,
+-					new_child->last_child, 
++			/* The fragment is empty before anything hears of
++			 * its children arriving (VitaSurf): a script among
++			 * them runs from the first one's event. */
++			dom_node_internal *first = new_child->first_child;
++			dom_node_internal *last = new_child->last_child;
++
++			new_child->first_child = NULL;
++			new_child->last_child = NULL;
++			err = _dom_node_attach_range(first, last,
+ 					node, 
+ 					ref_child == NULL ? node->last_child 
+ 							  : ref_child->previous,
+@@ -896,9 +903,6 @@ dom_exception _dom_node_insert_before(dom_node_internal *node,
+ 							  : ref_child);
+ 			if (err != DOM_NO_ERR)
+ 				return err;
+-
+-			new_child->first_child = NULL;
+-			new_child->last_child = NULL;
+ 		}
+ 	} else {
+ 		err = _dom_node_attach(new_child, 
+@@ -2364,11 +2368,44 @@ dom_exception _dom_node_attach_range(dom_node_internal *first,
+ 		return DOM_NO_ERR;
+ 	}
+ 
+-	for (n = first; n != last->next; n = n->next) {
+-		n->parent = parent;
+-		/* Dispatch a DOMNodeInserted event */
+-		err = dom_node_dispatch_node_change_event(parent->owner, 
+-				n, parent, DOM_MUTATION_ADDITION, &success);
++	/*
++	 * Every node is in the tree before any event about one is sent
++	 * (VitaSurf), as the DOM's insert has it: the first node's event
++	 * runs a <script> among them, and the nodes after it still had the
++	 * fragment for a parent, so a script that walked the document
++	 * followed them back into the fragment and the walk crashed. The
++	 * events go to a list of the nodes taken first, each held, so a
++	 * script that moves or removes one cannot break the walk along
++	 * them; one no longer under the parent hears nothing.
++	 */
++	{
++		dom_node_internal **list, *one[8];
++		size_t count = 0, i;
++
++		for (n = first; n != last->next; n = n->next) {
++			n->parent = parent;
++			count++;
++		}
++		list = count <= 8 ? one : malloc(count * sizeof(*list));
++		if (list == NULL)
++			return DOM_NO_MEM_ERR;
++		i = 0;
++		for (n = first; n != last->next; n = n->next) {
++			dom_node_ref(n);
++			list[i++] = n;
++		}
++		err = DOM_NO_ERR;
++		for (i = 0; i < count; i++) {
++			if (err == DOM_NO_ERR && list[i]->parent == parent) {
++				/* Dispatch a DOMNodeInserted event */
++				err = dom_node_dispatch_node_change_event(
++						parent->owner, list[i], parent,
++						DOM_MUTATION_ADDITION, &success);
++			}
++			dom_node_unref(list[i]);
++		}
++		if (list != one)
++			free(list);
+ 		if (err != DOM_NO_ERR)
+ 			return err;
+ 	}
