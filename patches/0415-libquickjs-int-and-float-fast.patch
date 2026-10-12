@@ -1,0 +1,79 @@
+diff --git a/quickjs.c b/quickjs.c
+index 39d4828..be9320e 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -15378,10 +15378,16 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
+     op2 = sp[-1];
+     tag1 = JS_VALUE_GET_NORM_TAG(op1);
+     tag2 = JS_VALUE_GET_NORM_TAG(op2);
+-    /* fast path for float operations */
+-    if (tag1 == JS_TAG_FLOAT64 && tag2 == JS_TAG_FLOAT64) {
+-        d1 = JS_VALUE_GET_FLOAT64(op1);
+-        d2 = JS_VALUE_GET_FLOAT64(op2);
++    /* fast path for float operations, and for an int with a float64
++       (VitaSurf): such operands have a float64 result below, after
++       ToNumeric on each, which cost some 150 instructions more */
++    if ((tag1 == JS_TAG_FLOAT64 || tag1 == JS_TAG_INT) &&
++        (tag2 == JS_TAG_FLOAT64 || tag2 == JS_TAG_INT) &&
++        (tag1 != JS_TAG_INT || tag2 != JS_TAG_INT)) {
++        d1 = tag1 == JS_TAG_INT ? JS_VALUE_GET_INT(op1) :
++            JS_VALUE_GET_FLOAT64(op1);
++        d2 = tag2 == JS_TAG_INT ? JS_VALUE_GET_INT(op2) :
++            JS_VALUE_GET_FLOAT64(op2);
+         goto handle_float64;
+     }
+     /* fast path for short big int operations */
+@@ -15572,11 +15578,16 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
+ 
+     tag1 = JS_VALUE_GET_NORM_TAG(op1);
+     tag2 = JS_VALUE_GET_NORM_TAG(op2);
+-    /* fast path for float64 */
+-    if (tag1 == JS_TAG_FLOAT64 && tag2 == JS_TAG_FLOAT64) {
++    /* fast path for float64, and for an int with a float64 (VitaSurf),
++       whose sum is the float64 below after ToNumeric on each */
++    if ((tag1 == JS_TAG_FLOAT64 || tag1 == JS_TAG_INT) &&
++        (tag2 == JS_TAG_FLOAT64 || tag2 == JS_TAG_INT) &&
++        (tag1 != JS_TAG_INT || tag2 != JS_TAG_INT)) {
+         double d1, d2;
+-        d1 = JS_VALUE_GET_FLOAT64(op1);
+-        d2 = JS_VALUE_GET_FLOAT64(op2);
++        d1 = tag1 == JS_TAG_INT ? JS_VALUE_GET_INT(op1) :
++            JS_VALUE_GET_FLOAT64(op1);
++        d2 = tag2 == JS_TAG_INT ? JS_VALUE_GET_INT(op2) :
++            JS_VALUE_GET_FLOAT64(op2);
+         sp[-2] = js_float64(d1 + d2);
+         return 0;
+     }
+@@ -15948,6 +15959,32 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
+     op2 = sp[-1];
+     tag1 = JS_VALUE_GET_NORM_TAG(op1);
+     tag2 = JS_VALUE_GET_NORM_TAG(op2);
++    /* two numbers, a float64 among them, compare as doubles (VitaSurf),
++       which is what they come to below after ToPrimitive on each */
++    if ((tag1 == JS_TAG_FLOAT64 || tag1 == JS_TAG_INT) &&
++        (tag2 == JS_TAG_FLOAT64 || tag2 == JS_TAG_INT)) {
++        double d1, d2;
++        d1 = tag1 == JS_TAG_INT ? JS_VALUE_GET_INT(op1) :
++            JS_VALUE_GET_FLOAT64(op1);
++        d2 = tag2 == JS_TAG_INT ? JS_VALUE_GET_INT(op2) :
++            JS_VALUE_GET_FLOAT64(op2);
++        switch(op) {
++        case OP_lt:
++            res = d1 < d2;
++            break;
++        case OP_lte:
++            res = d1 <= d2;
++            break;
++        case OP_gt:
++            res = d1 > d2;
++            break;
++        default:
++            res = d1 >= d2;
++            break;
++        }
++        sp[-2] = js_bool(res);
++        return 0;
++    }
+ 
+     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NUMBER);
+     if (JS_IsException(op1)) {
