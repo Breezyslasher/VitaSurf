@@ -1094,6 +1094,267 @@ static JSValue win_place_members(JSContext *ctx, JSValueConst this_val,
 	return JS_TRUE;
 }
 
+/* --------------------------------------------------------- accessors */
+
+/*
+ * Accessors that hand their property's name to one function of script's
+ * (VitaSurf). The prelude made a getter and a setter closure for each of
+ * several hundred properties -- the CSS properties' camel-cased names,
+ * the event handler properties, the setters that let a page assign to a
+ * read-only member -- and defined them one at a time: a fifth of the
+ * prelude's time. These are made in C, each a function that calls the
+ * shared one with the name it was made for (data[1]) before anything
+ * it was given.
+ */
+static JSValue fwd_get(JSContext *ctx, JSValueConst this_val, int argc,
+		       JSValueConst *argv, int magic, JSValueConst *data)
+{
+	(void)argc; (void)argv; (void)magic;
+	return JS_Call(ctx, data[0], this_val, 1, &data[1]);
+}
+
+static JSValue fwd_set(JSContext *ctx, JSValueConst this_val, int argc,
+		       JSValueConst *argv, int magic, JSValueConst *data)
+{
+	JSValueConst args[2];
+	JSValue r;
+
+	(void)magic;
+	args[0] = data[1];
+	args[1] = argc > 0 ? argv[0] : JS_UNDEFINED;
+	r = JS_Call(ctx, data[0], this_val, 2, args);
+	if (JS_IsException(r)) {
+		return r;
+	}
+	JS_FreeValue(ctx, r);
+	return JS_UNDEFINED;
+}
+
+/* a forwarding accessor's function, named as script's were */
+static JSValue fwd_fn(JSContext *ctx, bool set, JSValueConst fn,
+		      JSValueConst arg)
+{
+	JSValueConst data[2];
+
+	data[0] = fn;
+	data[1] = arg;
+	return JS_NewCFunctionData2(ctx, set ? fwd_set : fwd_get,
+				    set ? "set" : "get", set ? 1 : 0, 0, 2,
+				    data);
+}
+
+/*
+ * __vitaAccessors(obj, keys, args, get, set, flags): for each keys[i],
+ * an accessor on obj whose getter is get.call(this, arg) and whose
+ * setter is set.call(this, arg, value), arg being args[i] (or the key
+ * when args is not an array); either may be absent. flags are QuickJS's
+ * (configurable 1, enumerable 4), for all of them or, an array, for each.
+ */
+static JSValue win_accessors(JSContext *ctx, JSValueConst this_val,
+			     int argc, JSValueConst *argv)
+{
+	JSValueConst obj, keys, args, get, set;
+	int32_t flags = 0;
+	uint32_t n = 0, i;
+	bool has_args, has_get, has_set, each_flags;
+	JSValue v;
+
+	(void)this_val;
+	if (argc < 6 || !JS_IsObject(argv[0]) || !JS_IsObject(argv[1])) {
+		return JS_FALSE;
+	}
+	obj = argv[0];
+	keys = argv[1];
+	args = argv[2];
+	get = argv[3];
+	set = argv[4];
+	each_flags = JS_IsObject(argv[5]);
+	if (!each_flags && JS_ToInt32(ctx, &flags, argv[5]) < 0) {
+		return JS_EXCEPTION;
+	}
+	has_args = JS_IsObject(args);
+	has_get = JS_IsFunction(ctx, get);
+	has_set = JS_IsFunction(ctx, set);
+	v = get_str(ctx, keys, "length");
+	if (JS_ToUint32(ctx, &n, v) < 0) {
+		JS_FreeValue(ctx, v);
+		return JS_EXCEPTION;
+	}
+	JS_FreeValue(ctx, v);
+	for (i = 0; i < n; i++) {
+		JSValue key = JS_GetPropertyUint32(ctx, keys, i);
+		JSValue arg = has_args ? JS_GetPropertyUint32(ctx, args, i) :
+			JS_DupValue(ctx, key);
+		JSValue g = JS_UNDEFINED, s = JS_UNDEFINED;
+		JSAtom a = JS_ValueToAtom(ctx, key);
+		int r = -1;
+
+		if (each_flags) {
+			JSValue f = JS_GetPropertyUint32(ctx, argv[5], i);
+
+			if (JS_ToInt32(ctx, &flags, f) < 0) {
+				JS_FreeValue(ctx, JS_GetException(ctx));
+				flags = 0;
+			}
+			JS_FreeValue(ctx, f);
+		}
+		if (a != JS_ATOM_NULL && !JS_IsException(arg)) {
+			if (has_get) {
+				g = fwd_fn(ctx, false, get, arg);
+			}
+			if (has_set) {
+				s = fwd_fn(ctx, true, set, arg);
+			}
+			if (!JS_IsException(g) && !JS_IsException(s)) {
+				r = JS_DefineProperty(ctx, obj, a, JS_UNDEFINED,
+						      g, s, JS_PROP_HAS_GET |
+						      JS_PROP_HAS_SET |
+						      JS_PROP_HAS_CONFIGURABLE |
+						      JS_PROP_HAS_ENUMERABLE |
+						      (flags & (JS_PROP_CONFIGURABLE |
+								JS_PROP_ENUMERABLE)));
+			}
+		}
+		if (a != JS_ATOM_NULL) {
+			JS_FreeAtom(ctx, a);
+		}
+		JS_FreeValue(ctx, g);
+		JS_FreeValue(ctx, s);
+		JS_FreeValue(ctx, arg);
+		JS_FreeValue(ctx, key);
+		if (r < 0) {
+			return JS_EXCEPTION;
+		}
+	}
+	return JS_TRUE;
+}
+
+/*
+ * __vitaAddSetters(obj, skip, set): each own accessor of obj with a
+ * getter, no setter and configurable, whose name is not in skip (" a b "),
+ * gets the setter set.call(this, name, value), keeping the rest.
+ */
+static JSValue win_add_setters(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	JSPropertyEnum *tab;
+	const char *skip;
+	uint32_t n = 0, i;
+
+	(void)this_val;
+	if (argc < 3 || !JS_IsObject(argv[0]) ||
+	    !JS_IsFunction(ctx, argv[2])) {
+		return JS_FALSE;
+	}
+	skip = JS_ToCString(ctx, argv[1]);
+	if (skip == NULL) {
+		return JS_EXCEPTION;
+	}
+	tab = string_keys(ctx, argv[0], &n);
+	for (i = 0; i < n; i++) {
+		JSAtom k = tab[i].atom;
+		JSPropertyDescriptor d;
+		const char *name;
+		bool skipped = false;
+
+		if (get_own(ctx, &d, argv[0], k) <= 0) {
+			continue;
+		}
+		if (!(d.flags & JS_PROP_GETSET) || !JS_IsFunction(ctx, d.getter) ||
+		    !JS_IsUndefined(d.setter) ||
+		    !(d.flags & JS_PROP_CONFIGURABLE)) {
+			JS_FreeValue(ctx, d.value);
+			JS_FreeValue(ctx, d.getter);
+			JS_FreeValue(ctx, d.setter);
+			continue;
+		}
+		name = JS_AtomToCString(ctx, k);
+		if (name != NULL) {
+			size_t len = strlen(name);
+			const char *p = skip;
+
+			while ((p = strstr(p, name)) != NULL) {
+				if (p > skip && p[-1] == ' ' && p[len] == ' ') {
+					skipped = true;
+					break;
+				}
+				p++;
+			}
+		}
+		if (name != NULL && !skipped) {
+			JSValue key = JS_AtomToValue(ctx, k);
+
+			JS_FreeValue(ctx, d.setter);
+			d.setter = fwd_fn(ctx, true, argv[2], key);
+			JS_FreeValue(ctx, key);
+			if (JS_IsException(d.setter)) {
+				d.setter = JS_UNDEFINED;
+				JS_FreeValue(ctx, JS_GetException(ctx));
+			}
+			define_desc(ctx, argv[0], k, &d);
+		} else {
+			JS_FreeValue(ctx, d.value);
+			JS_FreeValue(ctx, d.getter);
+			JS_FreeValue(ctx, d.setter);
+		}
+		JS_FreeCString(ctx, name);
+	}
+	if (tab != NULL) {
+		JS_FreePropertyEnum(ctx, tab, n);
+	}
+	JS_FreeCString(ctx, skip);
+	return JS_TRUE;
+}
+
+/*
+ * __vitaCopyProps(target, source): each of source's own properties,
+ * strings and symbols, onto target with its attributes, but for a
+ * function's own length, name, prototype, caller and arguments. The
+ * prelude's node interfaces each took a score of them through
+ * Object.defineProperties, which reads a descriptor object for each.
+ */
+static JSValue win_copy_props(JSContext *ctx, JSValueConst this_val,
+			      int argc, JSValueConst *argv)
+{
+	JSPropertyEnum *tab = NULL;
+	uint32_t n = 0, i;
+	JSAtom skip[5];
+	static const char *const skip_names[5] = {
+		"length", "name", "prototype", "caller", "arguments"
+	};
+	int k;
+
+	(void)this_val;
+	if (argc < 2 || !JS_IsObject(argv[0]) || !JS_IsObject(argv[1])) {
+		return JS_FALSE;
+	}
+	if (JS_GetOwnPropertyNames(ctx, &tab, &n, argv[1],
+				   JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0) {
+		return JS_EXCEPTION;
+	}
+	for (k = 0; k < 5; k++) {
+		skip[k] = JS_NewAtom(ctx, skip_names[k]);
+	}
+	for (i = 0; i < n; i++) {
+		JSPropertyDescriptor d;
+		bool skipped = false;
+
+		for (k = 0; k < 5; k++) {
+			if (tab[i].atom == skip[k]) {
+				skipped = true;
+			}
+		}
+		if (!skipped && get_own(ctx, &d, argv[1], tab[i].atom) > 0) {
+			define_desc(ctx, argv[0], tab[i].atom, &d);
+		}
+	}
+	for (k = 0; k < 5; k++) {
+		JS_FreeAtom(ctx, skip[k]);
+	}
+	JS_FreePropertyEnum(ctx, tab, n);
+	return JS_TRUE;
+}
+
 void ifaces_register(JSContext *ctx, JSValueConst obj)
 {
 	JS_SetPropertyStr(ctx, obj, "__vitaShapeInterfaces",
@@ -1102,4 +1363,13 @@ void ifaces_register(JSContext *ctx, JSValueConst obj)
 	JS_SetPropertyStr(ctx, obj, "__vitaPlaceMembers",
 			  JS_NewCFunction(ctx, win_place_members,
 					  "__vitaPlaceMembers", 7));
+	JS_SetPropertyStr(ctx, obj, "__vitaAccessors",
+			  JS_NewCFunction(ctx, win_accessors,
+					  "__vitaAccessors", 6));
+	JS_SetPropertyStr(ctx, obj, "__vitaAddSetters",
+			  JS_NewCFunction(ctx, win_add_setters,
+					  "__vitaAddSetters", 3));
+	JS_SetPropertyStr(ctx, obj, "__vitaCopyProps",
+			  JS_NewCFunction(ctx, win_copy_props,
+					  "__vitaCopyProps", 2));
 }

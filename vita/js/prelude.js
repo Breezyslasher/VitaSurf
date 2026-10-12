@@ -2031,35 +2031,37 @@ var WINDOW_HANDLERS=('afterprint beforeprint beforeunload hashchange languagecha
 'storage unhandledrejection unload').split(' ');
 var DOCUMENT_HANDLERS=['readystatechange','visibilitychange'];
 var HANDLER_NAMES={};
-function defineHandler(obj,type){
- HANDLER_NAMES['on'+type]=true;
- var prop='on'+type, slot='__on_'+type, wrapped='__onw_'+type;
- /* enumerable, as an IDL attribute is: code walks an element with
-    for..in to find the event surface, and these were invisible to it */
- Object.defineProperty(obj,prop,{configurable:true,enumerable:true,
-  get:function(){return this[slot]||null;},
-  set:function(f){
-   var self=this;
-   if(!Object.prototype.hasOwnProperty.call(this,wrapped)){
-    var w=function(e){
-     var h=self[slot];
-     if(typeof h!=='function')return;
-     var r=h.call(self,e);
-     /* a handler property that returns false cancels the event, the
-        same as an inline handler that does: form.onsubmit = () => false
-        submitted anyway without this */
-     if(r===false&&e&&e.preventDefault)e.preventDefault();
-     return r;};
-    Object.defineProperty(this,wrapped,{value:w,writable:true,enumerable:false,configurable:true});
-    if(typeof this.addEventListener==='function')this.addEventListener(type,w);
-   }
-   Object.defineProperty(this,slot,
-    {value:(typeof f==='function'?f:null),writable:true,enumerable:false,configurable:true});
-  }});
-}
-EVENT_HANDLERS.forEach(function(t){defineHandler(P,t);defineHandler(D,t);defineHandler(W,t);});
-WINDOW_HANDLERS.forEach(function(t){defineHandler(W,t);defineHandler(P,t);});
-DOCUMENT_HANDLERS.forEach(function(t){defineHandler(D,t);});
+/* each property's getter and setter are made in C and pass its type to
+   these (__vitaAccessors, vita/js/ifaces.c): a closure pair for each of
+   three hundred properties was a tenth of the prelude */
+function handlerGet(type){return this['__on_'+type]||null;}
+function handlerSet(type,f){
+ var self=this,slot='__on_'+type,wrapped='__onw_'+type;
+ if(!Object.prototype.hasOwnProperty.call(this,wrapped)){
+  var w=function(e){
+   var h=self[slot];
+   if(typeof h!=='function')return;
+   var r=h.call(self,e);
+   /* a handler property that returns false cancels the event, the
+      same as an inline handler that does: form.onsubmit = () => false
+      submitted anyway without this */
+   if(r===false&&e&&e.preventDefault)e.preventDefault();
+   return r;};
+  Object.defineProperty(this,wrapped,{value:w,writable:true,enumerable:false,configurable:true});
+  if(typeof this.addEventListener==='function')this.addEventListener(type,w);
+ }
+ Object.defineProperty(this,slot,
+  {value:(typeof f==='function'?f:null),writable:true,enumerable:false,configurable:true});}
+/* enumerable, as an IDL attribute is: code walks an element with for..in
+   to find the event surface, and these were invisible to it */
+function defineHandlers(obj,types){
+ var keys=types.map(function(t){HANDLER_NAMES['on'+t]=true;return 'on'+t;});
+ NV.__vitaAccessors(obj,keys,types,handlerGet,handlerSet,5);}
+function defineHandler(obj,type){defineHandlers(obj,[type]);}
+defineHandlers(P,EVENT_HANDLERS);defineHandlers(D,EVENT_HANDLERS);
+defineHandlers(W,EVENT_HANDLERS);
+defineHandlers(W,WINDOW_HANDLERS);defineHandlers(P,WINDOW_HANDLERS);
+defineHandlers(D,DOCUMENT_HANDLERS);
 /* An on-something content attribute set after parsing compiles into a
    handler too. Only the ones present at parse time were wired up, so
    el.setAttribute('onclick', '...') set a string and nothing else, and
@@ -5844,6 +5846,7 @@ CSSStyleDeclaration.prototype.toString=function(){return this.cssText;};
 /* The camel-cased property names. Anything outside this list still works
  * through setProperty, which is what libraries that set unusual
  * properties use anyway. */
+var CSS_KEYS=[],CSS_ARGS=[],CSS_FLAGS=[];
 ('align-content align-items align-self all animation animation-delay animation-direction '+
  'animation-duration animation-fill-mode animation-iteration-count animation-name '+
  'animation-play-state animation-timing-function appearance aspect-ratio backdrop-filter '+
@@ -5875,12 +5878,14 @@ CSSStyleDeclaration.prototype.toString=function(){return this.cssText;};
  'vertical-align visibility white-space width will-change word-break word-spacing word-wrap '+
  'writing-mode z-index zoom').split(' ').forEach(function(n){
  var camel=n.replace(/-([a-z])/g,function(_,c){return c.toUpperCase();});
- Object.defineProperty(CSSStyleDeclaration.prototype,camel,{configurable:true,enumerable:true,
-  get:function(){return this.getPropertyValue(n);},
-  set:function(v){this.setProperty(n,v);}});
- if(camel!==n)Object.defineProperty(CSSStyleDeclaration.prototype,n,{configurable:true,
-  get:function(){return this.getPropertyValue(n);},
-  set:function(v){this.setProperty(n,v);}});});
+ CSS_KEYS.push(camel);CSS_ARGS.push(n);CSS_FLAGS.push(5);
+ if(camel!==n){CSS_KEYS.push(n);CSS_ARGS.push(n);CSS_FLAGS.push(1);}});
+/* each a getter and setter made in C that pass the property's name to
+   these (__vitaAccessors, vita/js/ifaces.c): a closure pair for each of
+   four hundred names was a tenth of the prelude */
+NV.__vitaAccessors(CSSStyleDeclaration.prototype,CSS_KEYS,CSS_ARGS,
+ function(n){return this.getPropertyValue(n);},
+ function(n,v){this.setProperty(n,v);},CSS_FLAGS);
 Object.defineProperty(CSSStyleDeclaration.prototype,'cssFloat',{configurable:true,
  get:function(){return this.getPropertyValue('float');},
  set:function(v){this.setProperty('float',v);}});
@@ -7683,8 +7688,8 @@ W.CSS.supports=function(a,b){
  * has one from a callback or a collection. They carry the members the
  * specification lists and the values this port can honestly give.
  */
-['webkitanimationstart','webkitanimationend','webkitanimationiteration','webkittransitionend']
- .forEach(function(t){defineHandler(P,t);defineHandler(D,t);defineHandler(W,t);});
+(function(t){defineHandlers(P,t);defineHandlers(D,t);defineHandlers(W,t);})(
+ ['webkitanimationstart','webkitanimationend','webkitanimationiteration','webkittransitionend']);
 reflectLong([['headingReset','headingreset',0]]);
 function iface(name,proto){
  var C=W[name];
@@ -8057,12 +8062,9 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
  var KEEP=' isConnected children parentElement firstElementChild '+
   'lastElementChild childNodes parentNode firstChild lastChild nextSibling '+
   'previousSibling nodeType nodeName tagName attributes classList ownerDocument ';
- Object.getOwnPropertyNames(P).forEach(function(k){
-  if(KEEP.indexOf(' '+k+' ')>=0)return;
-  var d=Object.getOwnPropertyDescriptor(P,k);
-  if(!d||!d.get||d.set||!d.configurable)return;
-  Object.defineProperty(P,k,{configurable:true,enumerable:d.enumerable,get:d.get,
-   set:function(v){shadowProp(this,k,v);}});});
+ /* each setter is made in C and passes its name to this
+    (__vitaAddSetters, vita/js/ifaces.c) */
+ NV.__vitaAddSetters(P,KEEP,function(k,v){shadowProp(this,k,v);});
 })();
 
 /* --- what the browser comparison found ---------------------------------
@@ -8956,6 +8958,10 @@ stampConsts(P);
    var was=d[k];
    d[k]={configurable:true,enumerable:true,value:NODE_CONSTS[k]};
    if(was&&'value' in was)d[k].writable=was.writable;});
+  /* as an object that has them, which C copies onto each interface
+     (__vitaCopyProps, vita/js/ifaces.c) without reading a descriptor
+     object for each */
+  d=Object.defineProperties({},d);
   CARRIED.push([from,d]);
   return d;}
  function iface(name,test,from,make){
@@ -8968,7 +8974,7 @@ stampConsts(P);
   /* keep whatever the old constructor carried -- Node.ELEMENT_NODE and
      the rest of the node type constants live there, and code reads
      them by name */
-  try{Object.defineProperties(F,carried(from));}
+  try{NV.__vitaCopyProps(F,carried(from));}
   catch(e){
    if(from)Object.getOwnPropertyNames(from).forEach(function(k){
     if(k==='prototype'||k==='length'||k==='name'||k==='caller'||
