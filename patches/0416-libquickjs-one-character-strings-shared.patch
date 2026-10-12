@@ -1,0 +1,65 @@
+diff --git a/quickjs.c b/quickjs.c
+index be9320e..bcb3681 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -313,6 +313,9 @@ struct JSRuntime {
+     uintptr_t stack_limit; /* lower stack limit */
+ 
+     JSValue current_exception;
++    /* the strings of one Latin-1 character, made on first use and kept
++       for the runtime's life (VitaSurf) */
++    JSString *char_strings[256];
+     /* true if inside an out of memory error, to avoid recursing */
+     bool in_out_of_memory;
+     /* true if inside build_backtrace, to avoid recursing */
+@@ -2475,6 +2478,12 @@ void JS_FreeRuntime(JSRuntime *rt)
+ 
+     rt->in_free = true;
+     JS_FreeValueRT(rt, rt->current_exception);
++    for(i = 0; i < 256; i++) {
++        if (rt->char_strings[i]) {
++            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, rt->char_strings[i]));
++            rt->char_strings[i] = NULL;
++        }
++    }
+ 
+     list_for_each_safe(el, el1, &rt->job_list) {
+         JSJobEntry *e = list_entry(el, JSJobEntry, link);
+@@ -4115,11 +4124,27 @@ static JSValue js_new_string16_len(JSContext *ctx, const uint16_t *buf, int len)
+     return JS_MKPTR(JS_TAG_STRING, str);
+ }
+ 
++/* A string of one character. One of Latin-1 is made once a runtime and
++   shared (VitaSurf): String.fromCharCode, charAt, str[i] and a split
++   into characters each made a new one, an allocation and a free for
++   every character a decoding loop handles. The runtime's reference
++   keeps a shared one from being appended to in place. */
+ static JSValue js_new_string_char(JSContext *ctx, uint16_t c)
+ {
+     if (c < 0x100) {
++        JSRuntime *rt = ctx->rt;
++        JSString *p = rt->char_strings[c];
+         char ch8 = c;
+-        return js_new_string8_len(ctx, &ch8, 1);
++        JSValue v;
++
++        if (p != NULL)
++            return js_dup(JS_MKPTR(JS_TAG_STRING, p));
++        v = js_new_string8_len(ctx, &ch8, 1);
++        if (!JS_IsException(v) && !rt->in_free) {
++            rt->char_strings[c] = JS_VALUE_GET_STRING(v);
++            js_dup(v);
++        }
++        return v;
+     } else {
+         uint16_t ch16 = c;
+         return js_new_string16_len(ctx, &ch16, 1);
+@@ -4139,6 +4164,8 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
+     if (len <= 0) {
+         return js_empty_string(ctx->rt);
+     }
++    if (len == 1)
++        return js_new_string_char(ctx, string_get(p, start));
+     if (len > (JS_STRING_SLICE_LEN_MAX >> p->is_wide_char)) {
+         if (p->kind == JS_STRING_KIND_SLICE) {
+             slice = (void *)&p[1];

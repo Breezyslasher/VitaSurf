@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Strings of one character</title></head>
+<body><pre id="out"></pre>
+<script>
+/* A string of one Latin-1 character is made once and shared (VitaSurf,
+   patch 0416): String.fromCharCode, charAt, str[i], slice, substring,
+   substr and a split into characters all hand out the same one. Each
+   must still be its own value: appending to one, using it as a key and
+   comparing it give what they always did. Each line gives the browser's
+   answer in brackets. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+var s = 'héllo wörld €ÿĀ abc', out = [];
+for (var i = 0; i < s.length; i++) out.push(s[i], s.charAt(i), String.fromCharCode(s.charCodeAt(i)),
+  s.slice(i, i + 1), s.substring(i, i + 1), s.substr(i, 1));
+out.push(s.split('').join('|'), [...s].join('/'));
+var a = String.fromCharCode(97), b = a; a += 'bc'; out.push(a, b, String.fromCharCode(97));
+var t = ''; for (i = 0; i < 1000; i++) t += String.fromCharCode(97 + i % 26); out.push(t.length, t.slice(0, 30));
+var k = {}; k[String.fromCharCode(120)] = 1; k['x']++; out.push(JSON.stringify(k));
+var h = 0, j = out.join(','); for (i = 0; i < j.length; i++) h = (h * 31 + j.charCodeAt(i)) | 0;
+T('every way of making one (355 -57292402)', j.length + ' ' + h);
+T('one appended to stays itself (abc a a)', a + ' ' + b + ' ' + String.fromCharCode(97));
+T('the same character is equal (true true)', (s[1] === 'é') + ' ' + (String.fromCharCode(233) === s.charAt(1)));
+</script>
+</body></html>
