@@ -189,6 +189,16 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
             # a newline between parts, so a file that ends in a comment cannot
             # swallow the first line of the next one
             set(${unit}_BYTES "${${unit}_BYTES}${part_bytes}0x0a,")
+            # after each of the prelude's own parts, the time it took, for
+            # the log (__vitaPartDone in vita/js/qjs.c)
+            get_filename_component(stem "${part}" NAME_WE)
+            if(unit STREQUAL "PRELUDE" AND NOT stem MATCHES "^natives-")
+                set(mark "${CMAKE_BINARY_DIR}/generated/mark-${stem}.js")
+                file(WRITE "${mark}" "NV.__vitaPartDone&&NV.__vitaPartDone('${stem}');\n")
+                file(READ "${mark}" mark_hex HEX)
+                string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," mark_bytes "${mark_hex}")
+                set(${unit}_BYTES "${${unit}_BYTES}${mark_bytes}")
+            endif()
         endforeach()
     endforeach()
     set(PRELUDE_H "/* generated from the parts of ${PRELUDE_UNITS} */\n")

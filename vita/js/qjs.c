@@ -14511,6 +14511,47 @@ static char *inspect_text(JSContext *ctx, JSValueConst v)
  * fractions, coarsened to 0.1 ms where a page is not cross-origin
  * isolated, as here.
  */
+/* the monotonic clock in tenths of a millisecond */
+static uint64_t now_tenths(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return now_ms() * 10u;
+	}
+	return (uint64_t)ts.tv_sec * 10000u + (uint64_t)ts.tv_nsec / 100000u;
+}
+
+/*
+ * What each part of the prelude cost (VitaSurf): CMake puts a call to
+ * __vitaPartDone(name) after each part, and setup_globals logs the line,
+ * so a log from the device says where the prelude's time goes.
+ */
+static char prelude_parts_line[640];
+static uint64_t prelude_part_t;
+
+static JSValue win_vita_part_done(JSContext *ctx, JSValueConst this_val,
+				  int argc, JSValueConst *argv)
+{
+	uint64_t t = now_tenths(), d = t - prelude_part_t;
+	size_t n = strlen(prelude_parts_line);
+	const char *name;
+
+	(void)this_val;
+	if (argc < 1 || prelude_part_t == 0) {
+		return JS_UNDEFINED;
+	}
+	name = JS_ToCString(ctx, argv[0]);
+	if (name != NULL && n + 40 < sizeof(prelude_parts_line)) {
+		snprintf(prelude_parts_line + n, sizeof(prelude_parts_line) - n,
+			 "%s%s %u.%u", n > 0 ? ", " : "", name,
+			 (unsigned int)(d / 10), (unsigned int)(d % 10));
+	}
+	JS_FreeCString(ctx, name);
+	prelude_part_t = t;
+	return JS_UNDEFINED;
+}
+
 static JSValue win_vita_now(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
@@ -16887,6 +16928,9 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaLanguages", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaNow",
 			  JS_NewCFunction(ctx, win_vita_now, "__vitaNow", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaPartDone",
+			  JS_NewCFunction(ctx, win_vita_part_done,
+					  "__vitaPartDone", 1));
 	/* called with a node or the document as this; they were methods
 	 * a page could see on every element and on document */
 	JS_SetPropertyStr(ctx, global, "__vitaAttrStamp",
@@ -17276,6 +17320,8 @@ static bool setup_globals(jsthread *thread)
 		}
 		/* reading or compiling it, apart from running it */
 		nsu_getmonotonic_ms(&tr);
+		prelude_parts_line[0] = '\0';
+		prelude_part_t = now_tenths();
 		if (JS_IsException(fn)) {
 			qjs_report_exception_src(ctx, "<prelude>", src, len);
 			JS_FreeValue(ctx, fn);
@@ -17312,6 +17358,11 @@ static bool setup_globals(jsthread *thread)
 		vita_log("qjs: prelude %u KB ran in %u ms (%s, %u ms of it "
 			 "reading)", (unsigned int)(len / 1024),
 			 (unsigned int)(t1 - t0), how, (unsigned int)(tr - t0));
+		if (prelude_parts_line[0] != '\0') {
+			vita_log("qjs: prelude by part (ms): %s",
+				 prelude_parts_line);
+		}
+		prelude_part_t = 0;
 	}
 	return ok;
 }

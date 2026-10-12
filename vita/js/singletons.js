@@ -133,7 +133,13 @@ if(W.location&&typeof W.location==='object'){
    d.enumerable=true;define(loc,k,d);}});}
 
 /* crypto */
-if(W.crypto&&typeof W.crypto==='object')adopt(W.crypto,iface('Crypto'),'');
+/* subtle.js makes it a Crypto already, its members on the prototype,
+   where adopting it into a fresh interface took them all away
+   (getRandomValues was not a function); the prelude's plain one, without
+   subtle's natives, is adopted */
+if(W.crypto&&typeof W.crypto==='object'&&!(typeof W.Crypto==='function'&&
+   Object.getPrototypeOf(W.crypto)===W.Crypto.prototype))
+ adopt(W.crypto,iface('Crypto'),'');
 
 /* visualViewport: one object, read live from the scroll position */
 if(ET){
