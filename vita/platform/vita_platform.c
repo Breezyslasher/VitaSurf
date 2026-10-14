@@ -474,7 +474,8 @@ bool vitasurf_browser_page(const char *url)
 {
 	static const char *const pages[] = {
 		VITASURF_BOOKMARKS_URL, VITASURF_HISTORY_URL,
-		VITASURF_DOWNLOADS_URL, VITASURF_LOG_URL
+		VITASURF_DOWNLOADS_URL, VITASURF_LOG_URL,
+		VITASURF_SITETEST_URL
 	};
 	size_t i, n;
 

@@ -42,6 +42,7 @@
 #include "vita_surface.h"
 #include "vita_input.h"
 #include "vita_menu.h"
+#include "vita_sitetest.h"
 
 extern fbtk_widget_t *fbtk;
 
@@ -82,6 +83,7 @@ enum item {
 	ITEM_DARK_MODE,
 	ITEM_CACHE,
 	ITEM_CLEAR_COOKIES,
+	ITEM_SITE_TEST,
 	ITEM_LOG,
 	ITEM_DUMP_LAYOUT,
 	ITEM_QUIT,
@@ -1028,6 +1030,14 @@ static void activate(enum item item)
 		clear_site_cookies();
 		vita_menu_close();
 		break;
+	case ITEM_SITE_TEST:
+		vita_menu_close();
+		if (vita_sitetest_running(NULL, NULL)) {
+			vita_sitetest_stop();
+		} else {
+			vita_sitetest_start();
+		}
+		break;
 	case ITEM_LOG:
 		vita_menu_close();
 		if (write_log_page()) {
@@ -1137,6 +1147,17 @@ static void item_label(enum item item, char *buf, size_t len)
 	case ITEM_CLEAR_COOKIES:
 		snprintf(buf, len, "Clear this site's cookies");
 		break;
+	case ITEM_SITE_TEST: {
+		int done, total;
+
+		if (vita_sitetest_running(&done, &total)) {
+			snprintf(buf, len, "Site test: stop (%d of %d)",
+				 done + 1, total);
+		} else {
+			snprintf(buf, len, "Site test: load the list, log each");
+		}
+		break;
+	}
 	case ITEM_LOG:
 		snprintf(buf, len, "Log: where the last page load went");
 		break;

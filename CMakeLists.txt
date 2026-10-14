@@ -122,6 +122,7 @@ add_executable(${PROJECT_NAME}
     vita/input/vita_input.c
     vita/input/vita_ime.c
     vita/input/vita_menu.c
+    vita/input/vita_sitetest.c
 )
 if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/quickjs.h")

@@ -73,6 +73,7 @@
 #include "vita_input.h"
 #include "vita_ime.h"
 #include "vita_menu.h"
+#include "vita_sitetest.h"
 
 /* root toolkit widget, defined in the framebuffer frontend's gui.c */
 extern fbtk_widget_t *fbtk;
@@ -1516,10 +1517,13 @@ void vita_input_load_finished(struct gui_window *gw)
 	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
-		nsurl_unref(url);
-		url = NULL;
 	}
 	vita_input_report_page(gw, ms);
+	/* after the report, so a site test's line follows its figures */
+	vita_sitetest_load_finished(url != NULL ? nsurl_access(url) : NULL, ms);
+	if (url != NULL) {
+		nsurl_unref(url);
+	}
 }
 
 /* The figures for the page as it stands, written when it loads and
