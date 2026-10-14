@@ -86,6 +86,21 @@ grep -q '^#define H2_STREAM_WINDOW_SIZE_MAX   (10 \* 1024 \* 1024)' "$h2c" || {
 sed -i -e 's/^#define H2_CONN_WINDOW_SIZE     (10 \* 1024 \* 1024)/#define H2_CONN_WINDOW_SIZE     (2 * 1024 * 1024)/' \
        -e 's/^#define H2_STREAM_WINDOW_SIZE_MAX   (10 \* 1024 \* 1024)/#define H2_STREAM_WINDOW_SIZE_MAX   (1024 * 1024)/' \
     "$h2c"
+# A server that ends its answer by closing the connection without TLS's
+# close_notify: mbedtls_ssl_read() says so by returning 0, and curl's
+# mbedTLS code took that for an error ("ssl_read returned: (-0x0000)",
+# code 56), so www.craigslist.org, whose body runs to the close, was a
+# fetch error. curl on OpenSSL, Chrome and Firefox take it as the end of
+# the input, and HTTP's framing then says whether the body was whole
+# (Content-Length or chunked cut short is still curl's partial file,
+# code 18). tests/tls/eof-server.py.
+mbc="$work/curl-$CURL_VER/lib/vtls/mbedtls.c"
+[ "$(grep -c '^    case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:$' "$mbc")" = 1 ] || {
+    echo "curl $CURL_VER's mbedTLS read is not as this script expects;" \
+         "check lib/vtls/mbedtls.c" >&2
+    exit 1
+}
+sed -i 's|^    case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:$|    case 0: /* closed under the TLS, no close_notify */\n&|' "$mbc"
 # vdpm's curl-mbedtls options, with nghttp2 required rather than looked
 # for, and brotli left out: the sysroot has brotli's decoder now
 # (build-freetype-woff2.sh), and curl would pick it up and want it
