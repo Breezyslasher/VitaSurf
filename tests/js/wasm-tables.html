@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>WebAssembly tables</title></head>
+<body>
+<!--
+ A module with two tables, the second exported: its export is that
+ table, as the specification and Chrome have it. VitaSurf read only a
+ module's first table and threw reading the export of the second
+ (nytimes.com, build 670). Chrome gives each line as PASS, then "done".
+-->
+<pre id="out"></pre>
+<script>
+var out=[];
+function check(n,ok,x){out.push((ok?'PASS ':'FAIL ')+n+(ok?'':' '+(x||'')));}
+var bytes=new Uint8Array([0,0x61,0x73,0x6d,1,0,0,0,
+ /* tables: funcref min 1; externref min 2 max 5 */
+ 4,8,2,0x70,0,1,0x6f,1,2,5,
+ /* exports: "t0" table 0, "t1" table 1 */
+ 7,11,2,2,0x74,0x30,1,0,2,0x74,0x31,1,1]);
+try{
+ var m=new WebAssembly.Module(bytes),i=new WebAssembly.Instance(m,{});
+ check('exports',WebAssembly.Module.exports(m).map(function(e){return e.name+':'+e.kind;}).join()==='t0:table,t1:table');
+ check('first table',i.exports.t0 instanceof WebAssembly.Table&&i.exports.t0.length===1);
+ check('second table',i.exports.t1 instanceof WebAssembly.Table&&i.exports.t1.length===2,
+  i.exports.t1&&i.exports.t1.length);
+ check('second table grows to its maximum only',(function(){
+  try{i.exports.t1.grow(3);}catch(e){return false;}
+  try{i.exports.t1.grow(1);return false;}catch(e){return e instanceof RangeError;}})());
+}catch(e){check('module',false,String(e));}
+out.push('done');
+document.getElementById('out').textContent=out.join('\n');
+out.forEach(function(l){console.log('wasm-tables: '+l);});
+</script>
+</body></html>
