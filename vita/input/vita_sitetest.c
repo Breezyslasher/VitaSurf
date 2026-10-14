@@ -104,6 +104,9 @@ static struct site sites[MAX_SITES];
 static int nsites;
 static int current = -1;	/* the site being loaded, -1 when not running */
 static bool waiting;		/* for the current site to finish loading */
+/* whether a load began after the site was asked for: going to it stops
+ * the page before, and that load's end is not this site's */
+static bool started;
 static uint64_t site_started_ms;
 static uint64_t run_started_ms;
 
@@ -417,6 +420,7 @@ static void start_site(void)
 		state_line(line);
 	}
 	waiting = true;
+	started = false;
 	site_started_ms = now_ms();
 	framebuffer_schedule(SITE_LIMIT_MS, site_limit, NULL);
 	navigate(sites[current].url);
@@ -532,11 +536,18 @@ bool vita_sitetest_running(int *done, int *total)
 	return current >= 0;
 }
 
+void vita_sitetest_load_started(void)
+{
+	if (current >= 0 && waiting) {
+		started = true;
+	}
+}
+
 void vita_sitetest_load_finished(const char *url, unsigned int ms)
 {
 	struct site *s;
 
-	if (current < 0 || !waiting) {
+	if (current < 0 || !waiting || !started) {
 		return;
 	}
 	waiting = false;

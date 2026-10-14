@@ -24,6 +24,9 @@ bool vita_sitetest_resumable(void);
 /** Whether a run is going, and how far it has got. */
 bool vita_sitetest_running(int *done, int *total);
 
+/** The window has begun loading a page. */
+void vita_sitetest_load_started(void);
+
 /** The window's page has finished loading, in ms, at url (may be NULL). */
 void vita_sitetest_load_finished(const char *url, unsigned int ms);
 
