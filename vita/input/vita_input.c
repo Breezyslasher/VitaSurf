@@ -931,7 +931,11 @@ void vita_input_caret_removed(struct gui_window *gw)
 
 void vita_input_load_started(struct gui_window *gw)
 {
-	if (gw == the_gw) {
+	/* NetSurf says so again whenever a frame starts loading, and a
+	 * page still loading is one load: starting again there made an
+	 * iframe's start, 35 s into youtube.com, the start of the page,
+	 * which then "loaded in 441 ms" with its figures thrown away */
+	if (gw == the_gw && load_started_us == 0) {
 		load_started_us = sceKernelGetProcessTimeWide();
 		vitasurf_profile_reset();
 		vita_sitetest_load_started();
