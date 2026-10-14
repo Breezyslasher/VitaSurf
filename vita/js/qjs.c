@@ -7118,6 +7118,29 @@ static void nav_clear_body(jsthread *thread)
 	thread->nav_body_len = 0;
 }
 
+/*
+ * Whether the window is loading a page the browser itself went to --
+ * typed, chosen from a menu or bookmark, or reached through history, so
+ * made by no page and sent with no referrer -- and the page asking is
+ * not that one (VitaSurf). A page's script navigating without the
+ * user's gesture does not cancel such a load, as Chrome has it: the
+ * page being left kept running its timers while the next one loaded,
+ * and a login page that sent itself somewhere every few seconds took
+ * the window back from the address the user gave. The page being
+ * loaded may still send itself on, from its own scripts as they parse.
+ */
+static bool browser_started_load(jsthread *thread)
+{
+	struct browser_window *bw = thread->win;
+
+	return bw->loading_content != NULL &&
+	       bw->loading_parameters.url != NULL &&
+	       bw->loading_parameters.referrer == NULL &&
+	       (bw->loading_parameters.flags & BW_NAVIGATE_SCRIPT) == 0 &&
+	       hlcache_handle_get_content(bw->loading_content) !=
+			(struct content *)thread->htmlc;
+}
+
 static void nav_callback(void *p)
 {
 	jsthread *thread = p;
@@ -7134,7 +7157,13 @@ static void nav_callback(void *p)
 		free(type);
 		return;
 	}
-	if (thread->win != NULL && !thread->closed) {
+	if (thread->win != NULL && !thread->closed &&
+	    !thread->nav_user && browser_started_load(thread)) {
+		vita_log("navigate: %.120s ignored: the page asked for it "
+			 "while the browser was loading %.120s",
+			 nsurl_access(url),
+			 nsurl_access(thread->win->loading_parameters.url));
+	} else if (thread->win != NULL && !thread->closed) {
 		/* the page navigating is the referrer, as browsers send it,
 		 * and what decides whether SameSite=Strict cookies go */
 		nsurl *from = script_page_url(thread);
