@@ -153,3 +153,15 @@
 #   check during a rebuild. Fixed by patch 0327: an element with no
 #   containing block is left out with its subtree.
 0x4391a
+
+# Build 662: data abort on www.google.com during the site test, main
+#   thread, css_computed_height(NULL) at its first load, from
+#   layout_find_dimensions for a flex item (layout_flex.c:389). The dump's
+#   memory showed the tree: an inline container, a float box, then the
+#   flex container, whose item named a float. Taken as a float, the item
+#   looked for its containing block at parent->parent->parent, the
+#   inline container, which has no style. Fixed by patch 0417: a flex
+#   item's float does nothing. PC, LR, then the flex layout.
+0x10cdd4
+0x7a027
+0x7a84b
