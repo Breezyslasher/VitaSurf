@@ -10874,10 +10874,19 @@ static struct find_key *build_keys(JSContext *ctx, JSValueConst arr, int *count)
 		JSValue cls, clen;
 		uint32_t c = 0, j;
 
+		/* a key need not have every part, and reading length from
+		 * one that is missing would throw and leave the exception
+		 * pending behind a value returned as if all were well:
+		 * getElementsByClassName's key has only classes */
+		if (!JS_IsObject(k)) {
+			JS_FreeValue(ctx, k);
+			continue;
+		}
 		keys[i].tag = key_string(ctx, k, "tag");
 		keys[i].id = key_string(ctx, k, "id");
 		cls = JS_GetPropertyStr(ctx, k, "classes");
-		clen = JS_GetPropertyStr(ctx, cls, "length");
+		clen = JS_IsObject(cls) ?
+			JS_GetPropertyStr(ctx, cls, "length") : JS_UNDEFINED;
 		JS_ToUint32(ctx, &c, clen);
 		JS_FreeValue(ctx, clen);
 		if (c > 0 && c <= 16) {
@@ -10899,7 +10908,8 @@ static struct find_key *build_keys(JSContext *ctx, JSValueConst arr, int *count)
 		/* the attribute names the compound needs (VitaSurf) */
 		{
 			JSValue at = JS_GetPropertyStr(ctx, k, "attrs");
-			JSValue alen = JS_GetPropertyStr(ctx, at, "length");
+			JSValue alen = JS_IsObject(at) ?
+				JS_GetPropertyStr(ctx, at, "length") : JS_UNDEFINED;
 			uint32_t na = 0;
 
 			JS_ToUint32(ctx, &na, alen);
