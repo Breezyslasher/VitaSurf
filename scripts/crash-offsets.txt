@@ -186,3 +186,16 @@
 0x484dde
 0x5a251
 0x6a5bf
+
+# Build 673: data abort on www.bbc.com during the site test, main
+#   thread, in css__selector_hash_find (match_selectors_in_sheet,
+#   css_select_style), reading " mar" -- style sheet text -- as a
+#   pointer. A script had changed a <style>'s text: NetSurf released the
+#   old sheet at once, while the selection context, made again only
+#   when the page had nothing left to fetch, still held it; the cache
+#   freed it eleven seconds later, and the next selection read freed
+#   memory. Fixed by patch 0422: a replaced sheet is kept until the
+#   context is made again, and the rebuild no longer waits for fetches
+#   past twenty seconds. PC, LR.
+0x113702
+0x11856f
