@@ -165,3 +165,11 @@
 0x10cdd4
 0x7a027
 0x7a84b
+
+# Build 666: assertion on www.weather.gov during the site test, main
+#   thread: "imagemap.c:711 imagemap_point_in_poly: xpt != NULL", reached
+#   from the pointer tracking over the page's map of the country. A
+#   polygon <area> whose coords gave no pair had no points. Fixed by
+#   patch 0419, which reads coords as HTML does. PC, LR.
+0x48452e
+0x4844fb
