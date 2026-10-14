@@ -3719,7 +3719,9 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   * the same way; @keyframes, @font-face and the like are left as
   * they are. The tag, not the host, so every copy of a component
   * gets the same text and the folding below still works. */
- var scoped=Object.create(null),nscoped=0;
+ var scoped=Object.create(null),nscoped=0,scopedChars=0,
+  /* a character no style sheet holds, where the host goes */
+  MARK='\u0000',SCOPED_CHARS=4194304;
  function closeAt(t,i,open,close){
   /* index of the bracket closing the one at i, strings skipped */
   var d=0,c,q;
@@ -3814,13 +3816,25 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
     kk=keyOf[css]='k'+(++nkey);nkeys++;}
    if(!(host.__vsKeys&&host.__vsKeys[kk]))hostTokens(host,kk,1);
    tag='[data-vs-s~="'+kk+'"]:-vita-host';}
-  k=tag+'\n'+css;r=scoped[k];
-  if(r!==undefined)return r;
-  try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}
-  catch(x){r=css;}
-  if(nscoped>=400){scoped=Object.create(null);nscoped=0;}
-  scoped[k]=r;nscoped++;
-  return r;}
+  /* The rules are rewritten once for a text, with a mark where the
+     host goes, and each host's tag is put in its place (VitaSurf): the
+     rewriting runs a character at a time, and a component library
+     that gives the same large sheet to a hundred components rewrote
+     it once for each of their tags, a fifth of reddit.com's two
+     minutes of script. */
+  r=scoped[css];
+  if(r===undefined){
+   if(css.indexOf(MARK)>=0)r=null;
+   else{
+    try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),MARK).split(MARK);}
+    catch(x){r=null;}}
+   if(nscoped>=400||scopedChars+css.length>SCOPED_CHARS){
+    scoped=Object.create(null);nscoped=0;scopedChars=0;}
+   scoped[css]=r;nscoped++;scopedChars+=css.length;}
+  if(r===null){
+   try{return scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}
+   catch(x){return css;}}
+  return r.length===1?r[0]:r.join(tag);}
  function take(host,n){
   var css=n.textContent,sc;
   if(!css)return;
@@ -6331,6 +6345,11 @@ CSSStyleRule.prototype=Object.create(CSSRule.prototype);CSSStyleRule.prototype.c
 CSSStyleRule.prototype.type=1;
 Object.defineProperty(CSSStyleRule.prototype,'cssText',{configurable:true,get:function(){
  var b=this.style.cssText;return this.selectorText+' {'+(b?' '+b+' ':' ')+'}';}});
+/* an accessor, as a browser's is, so that setting it marks the sheet
+   changed like every other change to a rule */
+Object.defineProperty(CSSStyleRule.prototype,'selectorText',{configurable:true,
+ get:function(){return this._sel===undefined?'':this._sel;},
+ set:function(v){this._sel=String(v);sheetDirty(this);}});
 function CSSGroupingRule(){CSSRule.call(this);}
 CSSGroupingRule.prototype=Object.create(CSSRule.prototype);CSSGroupingRule.prototype.constructor=CSSGroupingRule;
 CSSGroupingRule.prototype.insertRule=function(text,index){return rulesInsert(this.cssRules,this.parentStyleSheet,this,text,index);};
@@ -6375,7 +6394,7 @@ function makeRule(text,sheet,parent){
   else{r=new CSSOtherRule();r.type=0;}
   r._text=t;r.parentStyleSheet=sheet;r.parentRule=parent;return r;}
  r=new CSSStyleRule();r.parentStyleSheet=sheet;r.parentRule=parent;
- r.selectorText=brace<0?t:t.slice(0,brace).trim();
+ r._sel=brace<0?t:t.slice(0,brace).trim();
  r.style=ruleStyleProxy(new RuleStyle(r,brace<0?'':t.slice(brace+1,t.lastIndexOf('}'))));
  return r;}
 function rulesInsert(list,sheet,parent,text,index){
@@ -6408,7 +6427,8 @@ function CSSStyleSheet(opts){
  this.disabled=false;this.type='text/css';
  this.href=owner&&owner.tagName==='LINK'?owner.href:null;this.title=owner?owner.title||null:null;
  this.media=new MediaList(owner?owner.getAttribute('media'):(opts&&opts.media)||'');
- this._constructed=!owner;this._rules=owner?null:[];this._src=null;this._adopters=[];}
+ this._constructed=!owner;this._rules=owner?null:[];this._src=null;this._adopters=[];
+ this._ver=0;this._tv=-1;this._tc='';}
 Object.defineProperty(CSSStyleSheet.prototype,'cssRules',{configurable:true,get:function(){
  var o=this.ownerNode;
  if(o&&o.tagName==='STYLE'){var t=o.textContent||'';
@@ -6434,12 +6454,22 @@ CSSStyleSheet.prototype.replace=function(text){var s=this;
  try{s.replaceSync(text);}catch(e){return Promise.reject(e);}
  return Promise.resolve(s);};
 CSSStyleSheet.prototype._text=function(){
- return this.disabled?'':this.cssRules.map(function(r){return r.cssText;}).join('\n');};
+ /* A constructed sheet's text is kept until it changes (VitaSurf): every
+    shadow root that adopts the sheet writes it out, and a component
+    library adopts the same large sheet in each of hundreds of
+    components, which had made the text again from every rule each
+    time. Every change goes through sheetDirty, which moves _ver on. */
+ if(this.disabled)return '';
+ if(this._constructed&&this._tv===this._ver)return this._tc;
+ var t=this.cssRules.map(function(r){return r.cssText;}).join('\n');
+ if(this._constructed){this._tv=this._ver;this._tc=t;}
+ return t;};
 var sheetsDirty=[],sheetsFlush=false;
 function sheetDirty(r){
  /* a rule or a sheet: find the sheet and write it back soon */
  var s=r;while(s&&!(s instanceof CSSStyleSheet))s=s.parentStyleSheet||null;
  if(!s)return;
+ s._ver=(s._ver|0)+1;
  if(s.ownerNode&&s.ownerNode.tagName==='STYLE')s._src=s.ownerNode.textContent||'';
  if(sheetsDirty.indexOf(s)<0)sheetsDirty.push(s);
  if(!sheetsFlush){sheetsFlush=true;Promise.resolve().then(sheetsWrite);}}
@@ -7346,12 +7376,7 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   if(typeof cb!=='function')
    throw new TypeError('IntersectionObserver needs a callback');
   opts=opts||{};
-  var th=opts.threshold;
-  if(th==null)th=[0];
-  if(typeof th==='number')th=[th];
-  th=Array.prototype.slice.call(th).map(Number).filter(function(n){
-   return n>=0&&n<=1;}).sort(function(a,b){return a-b;});
-  if(th.length===0)th=[0];
+  var th=thresholds(opts.threshold);
   this.root=opts.root||null;
   this.rootMargin=String(opts.rootMargin==null?'0px':opts.rootMargin);
   this.scrollMargin=String(opts.scrollMargin==null?'0px':opts.scrollMargin);
@@ -7360,13 +7385,39 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   this.trackVisibility=!!opts.trackVisibility;
   this.__cb=cb;this.__targets=[];this.__queue=[];
   this.__margin=parseMargin(this.rootMargin);
-  observers.push(this);}
+  this.__listed=false;}
+ /* the observers that watch something, which the checks walk; one that
+    watches nothing is not kept, so a page that makes one for every
+    component and drops it does not leave them all to be walked and
+    held for good (VitaSurf) */
+ function list(o){if(!o.__listed){o.__listed=true;observers.push(o);}}
+ function unlist(o){
+  if(!o.__listed||o.__targets.length)return;
+  var i=observers.indexOf(o);
+  if(i>=0)observers.splice(i,1);
+  o.__listed=false;}
+ /* the thresholds, sorted and in range, as a frozen array; worked out
+    once for each array a page passes, which a component library
+    passes to every observer it makes (VitaSurf) */
+ var TH=new WeakMap(),ZERO=Object.freeze([0]);
+ function thresholds(th){
+  var c,v;
+  if(th==null)return ZERO;
+  if(typeof th==='object'){
+   c=TH.get(th);
+   if(c&&c.n===th.length&&c.a===th[0]&&c.z===th[th.length-1])return c.v;}
+  v=(typeof th==='number'?[th]:Array.prototype.slice.call(th)).map(Number)
+   .filter(function(n){return n>=0&&n<=1;}).sort(function(a,b){return a-b;});
+  v=v.length?Object.freeze(v):ZERO;
+  if(typeof th==='object')TH.set(th,{n:th.length,a:th[0],z:th[th.length-1],v:v});
+  return v;}
 
  IntersectionObserver.prototype.observe=function(el){
   if(!el||el.nodeType!==1)return;
   for(var i=0;i<this.__targets.length;i++)
    if(this.__targets[i].el===el)return;
   this.__targets.push({el:el,step:-1,hit:null});
+  list(this);
   wake();
   /* the specification delivers a first record for a new target without
      waiting for anything to move, and a page that builds its list from
@@ -7380,10 +7431,10 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
 
  IntersectionObserver.prototype.unobserve=function(el){
   for(var i=0;i<this.__targets.length;i++){
-   if(this.__targets[i].el===el){this.__targets.splice(i,1);return;}}};
+   if(this.__targets[i].el===el){this.__targets.splice(i,1);unlist(this);return;}}};
 
  IntersectionObserver.prototype.disconnect=function(){
-  this.__targets.length=0;};
+  this.__targets.length=0;unlist(this);};
 
  IntersectionObserver.prototype.takeRecords=function(){
   var q=this.__queue;this.__queue=[];return q;};
