@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Trusted Types</title></head>
+<body>
+<!--
+ Trusted Types as Chrome has them, with no Content-Security-Policy
+ asking for them. Chrome gives each line below as PASS, then "done".
+-->
+<pre id="out"></pre>
+<div id="sink"></div>
+<script>
+var out=[];
+function check(name,ok,extra){out.push((ok?'PASS ':'FAIL ')+name+(ok?'':' '+(extra||'')));}
+function throws(f,type){try{f();}catch(e){return !type||e instanceof type;}return false;}
+var tt=window.trustedTypes;
+check('trustedTypes',tt instanceof TrustedTypePolicyFactory&&
+ Object.prototype.toString.call(tt)==='[object TrustedTypePolicyFactory]');
+check('interfaces are illegal to construct',throws(function(){new TrustedHTML();},TypeError)&&
+ throws(function(){new TrustedTypePolicyFactory();},TypeError));
+var calls=[];
+var p=tt.createPolicy('mine',{createHTML:function(s,extra){calls.push(extra);return s.replace(/</g,'&lt;');},
+ createScriptURL:function(s){return s+'?ok';}});
+check('policy',p instanceof TrustedTypePolicy&&p.name==='mine');
+var h=p.createHTML('<b>x</b>','arg');
+check('createHTML',h instanceof TrustedHTML&&String(h)==='&lt;b>x&lt;/b>'&&
+ h.toJSON()==='&lt;b>x&lt;/b>'&&calls[0]==='arg');
+check('isHTML',tt.isHTML(h)&&!tt.isHTML('x')&&!tt.isScript(h));
+var u=p.createScriptURL('/a.js');
+check('createScriptURL',u instanceof TrustedScriptURL&&String(u)==='/a.js?ok'&&tt.isScriptURL(u));
+check('a member the options lack throws',throws(function(){p.createScript('1');},TypeError));
+var n=tt.createPolicy('nulls',{createHTML:function(){return null;}});
+check('null is empty',String(n.createHTML('x'))==='');
+check('same name twice is allowed',!!tt.createPolicy('mine',{}));
+check('no default policy at first',tt.defaultPolicy===null);
+var d=tt.createPolicy('default',{});
+check('default policy',tt.defaultPolicy===d);
+check('a second default throws',throws(function(){tt.createPolicy('default',{});},TypeError));
+check('empty values',tt.isHTML(tt.emptyHTML)&&String(tt.emptyHTML)===''&&
+ tt.isScript(tt.emptyScript)&&tt.emptyHTML===tt.emptyHTML);
+check('a sink takes one',(document.getElementById('sink').innerHTML=p.createHTML('<i>i</i>'),
+ document.getElementById('sink').innerHTML==='&lt;i&gt;i&lt;/i&gt;'),document.getElementById('sink').innerHTML);
+check('getAttributeType',tt.getAttributeType('script','src')==='TrustedScriptURL'&&
+ tt.getAttributeType('IFRAME','srcdoc')==='TrustedHTML'&&
+ tt.getAttributeType('div','onclick')==='TrustedScript'&&
+ tt.getAttributeType('div','title')===null&&tt.getAttributeType('div','onfoo')===null);
+check('getPropertyType',tt.getPropertyType('div','innerHTML')==='TrustedHTML'&&
+ tt.getPropertyType('script','textContent')==='TrustedScript'&&
+ tt.getPropertyType('script','src')==='TrustedScriptURL'&&
+ tt.getPropertyType('div','title')===null);
+check('toString needs its own kind',throws(function(){TrustedHTML.prototype.toString.call(u);},TypeError));
+out.push('done');
+document.getElementById('out').textContent=out.join('\n');
+out.forEach(function(l){console.log('trusted-types: '+l);});
+</script>
+</body></html>

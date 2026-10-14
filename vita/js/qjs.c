@@ -9784,10 +9784,25 @@ struct js_xhr {
 	enum { XHR_TIMER_ARM, XHR_TIMER_WAIT, XHR_TIMER_GRACE } timer_stage;
 	uint64_t sent_ms;     /**< when send() was called */
 	uint64_t armed_ms;    /**< when the loop was first free after it */
+	/*
+	 * A streamed request (VitaSurf), for EventSource: progress is
+	 * called with (status, headersText, bytes) once the headers are in
+	 * and again with what has come since, from the scheduler rather
+	 * than from inside the fetcher's callback, and the body is not
+	 * kept. callback still ends it, with what was not yet handed on.
+	 */
+	JSValue progress;
+	bool stream;
+	bool stream_sched;    /**< xhr_stream_cb is scheduled */
+	bool headers_done;    /**< a 2xx response's headers have all come */
+	int busy;             /**< calls into script under way with it */
+	bool doomed;          /**< freed while busy: free when they end */
+	bool release_pending; /**< its script values, likewise */
 	struct js_xhr *next;
 };
 
 static void xhr_timeout_cb(void *p);
+static void xhr_stream_cb(void *p);
 
 /** scheme://host:port of a URL, malloc'd, or NULL. */
 static char *url_origin(nsurl *url)
@@ -9825,15 +9840,42 @@ static void xhr_unlink(struct js_xhr *x)
 	}
 }
 
+/* what a request holds in script, given back when it ends */
+static void xhr_release_values(JSContext *ctx, struct js_xhr *x)
+{
+	/* not under a call to one of them: the function being run would
+	 * be freed while it ran */
+	if (x->busy > 0) {
+		x->release_pending = true;
+		return;
+	}
+	x->release_pending = false;
+	JS_FreeValue(ctx, x->callback);
+	x->callback = JS_UNDEFINED;
+	JS_FreeValue(ctx, x->progress);
+	x->progress = JS_UNDEFINED;
+}
+
 static void xhr_free(struct js_xhr *x)
 {
 	int i;
 
 	if (x->timer_set) {
 		guit->misc->schedule(-1, xhr_timeout_cb, x);
+		x->timer_set = false;
+	}
+	if (x->stream_sched) {
+		guit->misc->schedule(-1, xhr_stream_cb, x);
+		x->stream_sched = false;
 	}
 	if (x->fetch != NULL) {
 		fetch_abort(x->fetch);
+		x->fetch = NULL;
+	}
+	/* script it called is still running: the rest when it returns */
+	if (x->busy > 0) {
+		x->doomed = true;
+		return;
 	}
 	if (x->headers != NULL) {
 		for (i = 0; x->headers[i] != NULL; i++) free(x->headers[i]);
@@ -9848,6 +9890,24 @@ static void xhr_free(struct js_xhr *x)
 	free(x);
 }
 
+/** Whether a response may be handed to the page: same origin, or one
+ * Access-Control-Allow-Origin lets it have. */
+static bool xhr_origin_allowed(struct js_xhr *x)
+{
+	char *origin;
+	bool ok;
+
+	if (!x->cross_origin) {
+		return true;
+	}
+	origin = url_origin(x->referer);
+	ok = x->acao != NULL &&
+	     (strcmp(x->acao, "*") == 0 ||
+	      (origin != NULL && strcasecmp(x->acao, origin) == 0));
+	free(origin);
+	return ok;
+}
+
 /** Deliver the result to the JS callback and free the request. */
 static void xhr_complete(struct js_xhr *x, const char *err)
 {
@@ -9858,15 +9918,12 @@ static void xhr_complete(struct js_xhr *x, const char *err)
 		guit->misc->schedule(-1, xhr_timeout_cb, x);
 		x->timer_set = false;
 	}
-	if (err == NULL && x->cross_origin) {
-		char *origin = url_origin(x->referer);
-
-		if (x->acao == NULL ||
-		    (strcmp(x->acao, "*") != 0 &&
-		     (origin == NULL || strcasecmp(x->acao, origin) != 0))) {
-			err = "cross-origin response not allowed by the server";
-		}
-		free(origin);
+	if (x->stream_sched) {
+		guit->misc->schedule(-1, xhr_stream_cb, x);
+		x->stream_sched = false;
+	}
+	if (err == NULL && !xhr_origin_allowed(x)) {
+		err = "cross-origin response not allowed by the server";
 	}
 	xhr_unlink(x);
 	if (thread != NULL && !thread->closed) {
@@ -9895,17 +9952,80 @@ static void xhr_complete(struct js_xhr *x, const char *err)
 				x->body != NULL ? x->body_len : 0);
 		args[3] = err != NULL ? JS_NewString(ctx, err) : JS_NULL;
 		args[4] = JS_NewString(ctx, nsurl_access(x->url));
+		x->busy++;
 		ret = JS_Call(ctx, x->callback, JS_UNDEFINED, 5, args);
+		x->busy--;
 		if (JS_IsException(ret)) {
 			qjs_report_exception(ctx);
 		}
 		JS_FreeValue(ctx, ret);
 		for (i = 0; i < 5; i++) JS_FreeValue(ctx, args[i]);
-		JS_FreeValue(ctx, x->callback);
+		xhr_release_values(ctx, x);
 		end_script(thread);
 	}
 	x->thread = NULL;
+	x->doomed = false;
 	xhr_free(x);
+}
+
+/* a streamed request has something to hand on: see js_xhr.progress */
+static void xhr_stream_soon(struct js_xhr *x)
+{
+	if (x->stream && x->headers_done && !x->stream_sched) {
+		x->stream_sched = true;
+		guit->misc->schedule(0, xhr_stream_cb, x);
+	}
+}
+
+static void xhr_stream_cb(void *p)
+{
+	struct js_xhr *x = p;
+	jsthread *thread = x->thread;
+	JSContext *ctx;
+	JSValue args[3], ret;
+	int i;
+
+	x->stream_sched = false;
+	if (thread == NULL || thread->closed) {
+		return;
+	}
+	if (!xhr_origin_allowed(x)) {
+		/* nothing of it reaches the page */
+		if (x->fetch != NULL) {
+			fetch_abort(x->fetch);
+			x->fetch = NULL;
+		}
+		x->body_len = 0;
+		xhr_complete(x, "cross-origin response not allowed by the "
+			     "server");
+		return;
+	}
+	ctx = thread->ctx;
+	begin_script(thread, SCRIPT_XHR);
+	args[0] = JS_NewInt32(ctx, x->status);
+	args[1] = JS_NewStringLen(ctx, x->rheaders != NULL ? x->rheaders : "",
+				  x->rheaders_len);
+	args[2] = JS_NewArrayBufferCopy(ctx,
+			(const uint8_t *)(x->body != NULL ? x->body : ""),
+			x->body != NULL ? x->body_len : 0);
+	x->body_len = 0;
+	x->busy++;
+	ret = JS_Call(ctx, x->progress, JS_UNDEFINED, 3, args);
+	x->busy--;
+	if (JS_IsException(ret)) {
+		qjs_report_exception(ctx);
+	}
+	JS_FreeValue(ctx, ret);
+	for (i = 0; i < 3; i++) JS_FreeValue(ctx, args[i]);
+	if (x->release_pending && x->busy == 0) {
+		xhr_release_values(ctx, x);
+	}
+	end_script(thread);
+	/* aborted from inside the call */
+	if (x->doomed && x->busy == 0) {
+		x->doomed = false;
+		xhr_free(x);
+	}
 }
 
 static bool xhr_start(struct js_xhr *x);
@@ -9920,6 +10040,11 @@ static void xhr_fetch_callback(const fetch_msg *msg, void *p)
 		size_t len = msg->data.header_or_data.len;
 
 		while (len > 0 && (h[len - 1] == '\r' || h[len - 1] == '\n')) len--;
+		if (len == 0 && x->status >= 200 && x->status < 300) {
+			/* the blank line after a final answer's headers */
+			x->headers_done = true;
+			xhr_stream_soon(x);
+		}
 		if (len >= 5 && strncasecmp(h, "HTTP/", 5) == 0) {
 			/* the status line, with an end of its own: a
 			 * fetcher's buffer need not have one */
@@ -9934,6 +10059,7 @@ static void xhr_fetch_callback(const fetch_msg *msg, void *p)
 			}
 			/* a new status line (100 Continue, retries) restarts the headers */
 			x->rheaders_len = 0;
+			x->headers_done = false;
 			free(x->acao);
 			x->acao = NULL;
 		} else if (len > 0 && x->rheaders_len + len + 2 <= XHR_MAX_HEADERS) {
@@ -9980,6 +10106,10 @@ static void xhr_fetch_callback(const fetch_msg *msg, void *p)
 		memcpy(x->body + x->body_len, msg->data.header_or_data.buf, len);
 		x->body_len += len;
 		x->body[x->body_len] = '\0';
+		if (x->stream && x->status >= 200 && x->status < 300) {
+			x->headers_done = true;
+			xhr_stream_soon(x);
+		}
 		break;
 	}
 	case FETCH_REDIRECT: {
@@ -10004,6 +10134,7 @@ static void xhr_fetch_callback(const fetch_msg *msg, void *p)
 		x->status = 0;
 		x->rheaders_len = 0;
 		x->body_len = 0;
+		x->headers_done = false;
 		free(x->acao);
 		x->acao = NULL;
 		x->cross_origin = !same_origin(x->url, x->referer);
@@ -10140,7 +10271,8 @@ static JSValue win_vita_languages(JSContext *ctx, JSValueConst this_val,
 			    list : "en-US,en");
 }
 
-/* __vitaFetch(url, method, headers[], body, timeoutMs, callback) -> id */
+/* __vitaFetch(url, method, headers[], body, timeoutMs, callback
+ * [, progress]) -> id; with progress, the response is streamed */
 static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 			      int argc, JSValueConst *argv)
 {
@@ -10200,6 +10332,11 @@ static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 	x->url = url;
 	x->referer = page;
 	x->callback = JS_DupValue(ctx, argv[5]);
+	x->progress = JS_UNDEFINED;
+	if (argc >= 7 && JS_IsFunction(ctx, argv[6])) {
+		x->progress = JS_DupValue(ctx, argv[6]);
+		x->stream = true;
+	}
 	JS_ToInt32(ctx, &timeout, argv[4]);
 	x->timeout_ms = timeout > 0 ? timeout : 0;
 	x->cross_origin = !same_origin(url, page);
@@ -10266,7 +10403,7 @@ static JSValue win_vita_fetch(JSContext *ctx, JSValueConst this_val,
 	thread->xhrs = x;
 	if (!xhr_start(x)) {
 		xhr_unlink(x);
-		JS_FreeValue(ctx, x->callback);
+		xhr_release_values(ctx, x);
 		x->thread = NULL;
 		xhr_free(x);
 		return JS_NewInt32(ctx, 0);
@@ -10288,7 +10425,7 @@ static JSValue win_vita_fetch_abort(JSContext *ctx, JSValueConst this_val,
 	for (x = thread->xhrs; x != NULL; x = x->next) {
 		if (x->id == id) {
 			xhr_unlink(x);
-			JS_FreeValue(ctx, x->callback);
+			xhr_release_values(ctx, x);
 			x->thread = NULL;
 			xhr_free(x); /* aborts the fetch; no callback follows */
 			break;
@@ -10305,7 +10442,7 @@ static void xhr_close_all(jsthread *thread)
 	thread->xhrs = NULL;
 	while (x != NULL) {
 		struct js_xhr *next = x->next;
-		JS_FreeValue(thread->ctx, x->callback);
+		xhr_release_values(thread->ctx, x);
 		x->thread = NULL;
 		xhr_free(x);
 		x = next;
@@ -16964,7 +17101,7 @@ static bool setup_globals(jsthread *thread)
 
 	/* transport for XMLHttpRequest and fetch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFetch",
-			  JS_NewCFunction(ctx, win_vita_fetch, "__vitaFetch", 6));
+			  JS_NewCFunction(ctx, win_vita_fetch, "__vitaFetch", 7));
 	JS_SetPropertyStr(ctx, global, "__vitaLanguages",
 			  JS_NewCFunction(ctx, win_vita_languages,
 					  "__vitaLanguages", 0));

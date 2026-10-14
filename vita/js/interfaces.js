@@ -36,10 +36,11 @@
  */
 (function(){
 var W=window;
-/* 291 interfaces, parents first */
+/* 297 interfaces, parents first */
 var TABLE=`AbortController|Object|c|0|1|
 EventTarget|Object|c|0|1|
 AbortSignal|EventTarget|i|0|1|
+EventSource|EventTarget|r|1|1|CONNECTING=0,OPEN=1,CLOSED=2
 AbstractRange|Object|i|0|1|
 Animation|EventTarget|c|0|1|
 AnimationEffect|Object|i|0|1|
@@ -336,7 +337,12 @@ XMLHttpRequestUpload|XMLHttpRequestEventTarget|i|0|1|
 XMLSerializer|Object|c|0|1|
 XPathEvaluator|Object|c|0|1|
 XPathExpression|Object|i|0|1|
-XPathResult|Object|i|0|1|ANY_TYPE=0,NUMBER_TYPE=1,STRING_TYPE=2,BOOLEAN_TYPE=3,UNORDERED_NODE_ITERATOR_TYPE=4,ORDERED_NODE_ITERATOR_TYPE=5,UNORDERED_NODE_SNAPSHOT_TYPE=6,ORDERED_NODE_SNAPSHOT_TYPE=7,ANY_UNORDERED_NODE_TYPE=8,FIRST_ORDERED_NODE_TYPE=9`;
+XPathResult|Object|i|0|1|ANY_TYPE=0,NUMBER_TYPE=1,STRING_TYPE=2,BOOLEAN_TYPE=3,UNORDERED_NODE_ITERATOR_TYPE=4,ORDERED_NODE_ITERATOR_TYPE=5,UNORDERED_NODE_SNAPSHOT_TYPE=6,ORDERED_NODE_SNAPSHOT_TYPE=7,ANY_UNORDERED_NODE_TYPE=8,FIRST_ORDERED_NODE_TYPE=9
+TrustedHTML|Object|i|0|1|
+TrustedScript|Object|i|0|1|
+TrustedScriptURL|Object|i|0|1|
+TrustedTypePolicy|Object|i|0|1|
+TrustedTypePolicyFactory|Object|i|0|1|`;
 var NODEP=W.Node&&W.Node.prototype;
 var fromPrelude=NV.__vitaFromPrelude||function(){return false;};
 var SHAPE=NV.__vitaShapeInterfaces;

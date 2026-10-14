@@ -2665,6 +2665,285 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
    if(l.length)open.set(s.key,l);else open.delete(s.key);}};
  W.BroadcastChannel=BroadcastChannel;
 })();
+/* EventSource (VitaSurf), server-sent events as the HTML standard has
+ * them: a GET with Accept: text/event-stream whose answer is read as it
+ * comes (__vitaFetch's progress), parsed into events line by line, and
+ * opened again after the server's retry time when the connection ends,
+ * with the last event's id in Last-Event-ID. An answer that is not a
+ * 200 of type text/event-stream fails the connection for good. */
+(function(){
+ var FETCH=NV.__vitaFetch,ABORT=NV.__vitaFetchAbort;
+ if(typeof FETCH!=='function')return;
+ var ETP=EventTarget.prototype,ST=new WeakMap();
+ function st(es){
+  var s=ST.get(es);
+  if(!s)throw new TypeError('Illegal invocation');
+  return s;}
+ function fire(es,e){
+  var h=st(es)['on'+e.type];
+  try{e.target=es;e.currentTarget=es;}catch(x){}
+  if(typeof h==='function'){
+   try{h.call(es,e);}catch(err){if(NV.__vitaReportError)NV.__vitaReportError(err);}}
+  ETP.dispatchEvent.call(es,e);}
+ /* where an incomplete UTF-8 sequence starts at the end of u, which the
+    next bytes will finish, or u.length */
+ function utf8Cut(u){
+  var n=u.length,i,c,need;
+  for(i=n-1;i>=0&&i>=n-3;i--){
+   c=u[i];
+   if(c<0x80)return n;
+   if(c>=0xc0){
+    need=c>=0xf0?4:c>=0xe0?3:2;
+    return n-i<need?i:n;}}
+  return n;}
+ function header(text,name){
+  var lines=String(text||'').split('\n'),p=name+':',i;
+  for(i=0;i<lines.length;i++)
+   if(lines[i].toLowerCase().indexOf(p)===0)return lines[i].slice(p.length).trim();
+  return null;}
+ function EventSource(url,init){
+  if(!(this instanceof EventSource))throw new TypeError(
+   "Failed to construct 'EventSource': Please use the 'new' operator, this "+
+   'DOM object constructor cannot be called as a function.');
+  if(arguments.length<1)throw new TypeError("Failed to construct "+
+   "'EventSource': 1 argument required, but only 0 present.");
+  var abs;
+  try{abs=new URL(String(url),D.baseURI).href;}
+  catch(e){throw new DOMException("Failed to construct 'EventSource': Cannot "+
+   "open an EventSource to '"+url+"'. The URL is invalid.",'SyntaxError');}
+  ST.set(this,{url:abs,cred:!!(init&&typeof init==='object'&&init.withCredentials),
+   state:0,id:0,timer:0,retry:3000,lastId:'',origin:new URL(abs).origin,
+   onopen:null,onmessage:null,onerror:null});
+  connect(this);}
+ EventSource.prototype=Object.create(ETP);
+ EventSource.prototype.constructor=EventSource;
+ ['CONNECTING','OPEN','CLOSED'].forEach(function(k,i){
+  Object.defineProperty(EventSource,k,{value:i,enumerable:true});
+  Object.defineProperty(EventSource.prototype,k,{value:i,enumerable:true});});
+ Object.defineProperties(EventSource.prototype,{
+  url:{configurable:true,enumerable:true,get:function(){return st(this).url;}},
+  withCredentials:{configurable:true,enumerable:true,get:function(){return st(this).cred;}},
+  readyState:{configurable:true,enumerable:true,get:function(){return st(this).state;}}});
+ ['onopen','onmessage','onerror'].forEach(function(k){
+  Object.defineProperty(EventSource.prototype,k,{configurable:true,enumerable:true,
+   get:function(){return st(this)[k];},
+   set:function(f){st(this)[k]=typeof f==='function'||(f&&typeof f==='object')?f:null;}});});
+ EventSource.prototype.close=function(){
+  var s=st(this);
+  s.state=2;
+  if(s.timer){clearTimeout(s.timer);s.timer=0;}
+  if(s.id){ABORT(s.id);s.id=0;}};
+
+ function connect(es){
+  var s=st(es),hs=['Accept: text/event-stream','Cache-Control: no-cache'],
+   p={es:es,opened:false,failed:false,rest:null,text:'',bom:true,cr:false,
+      data:'',type:'',idBuf:s.lastId};
+  if(s.lastId!=='')hs.push('Last-Event-ID: '+s.lastId);
+  function open(status,headers){
+   if(p.opened||p.failed||s.state===2)return p.opened;
+   var type=header(headers,'content-type');
+   type=type?type.split(';')[0].trim().toLowerCase():'';
+   if(status!==200||type!=='text/event-stream'){fail();return false;}
+   p.opened=true;s.state=1;
+   fire(es,uaEvent(new Event('open')));
+   return true;}
+  function fail(){
+   p.failed=true;
+   if(s.id){ABORT(s.id);s.id=0;}
+   if(s.state===2)return;
+   s.state=2;
+   fire(es,uaEvent(new Event('error')));}
+  function dispatch(){
+   s.lastId=p.idBuf;
+   if(p.data===''){p.type='';return;}
+   var d=p.data.charAt(p.data.length-1)==='\n'?p.data.slice(0,-1):p.data,
+    ev=uaEvent(new W.MessageEvent(p.type||'message',
+     {data:d,origin:s.origin,lastEventId:s.lastId}));
+   p.data='';p.type='';
+   if(s.state!==2)fire(es,ev);}
+  function line(l){
+   if(l===''){dispatch();return;}
+   if(l.charAt(0)===':')return;
+   var i=l.indexOf(':'),f,v;
+   if(i<0){f=l;v='';}
+   else{f=l.slice(0,i);v=l.slice(i+1);if(v.charAt(0)===' ')v=v.slice(1);}
+   if(f==='event')p.type=v;
+   else if(f==='data')p.data+=v+'\n';
+   else if(f==='id'){if(v.indexOf('\0')<0)p.idBuf=v;}
+   else if(f==='retry'){if(/^[0-9]+$/.test(v))s.retry=parseInt(v,10);}}
+  function feed(bytes){
+   var u=new Uint8Array(bytes),cut,t,i,c,start;
+   if(p.rest){var m=new Uint8Array(p.rest.length+u.length);
+    m.set(p.rest);m.set(u,p.rest.length);u=m;p.rest=null;}
+   cut=utf8Cut(u);
+   if(cut<u.length){p.rest=u.slice(cut);u=u.subarray(0,cut);}
+   if(!u.length)return;
+   t=new TextDecoder().decode(u);
+   /* a leading byte order mark is the stream's, not its text's */
+   if(p.bom){p.bom=false;if(t.charCodeAt(0)===0xfeff)t=t.slice(1);}
+   /* lines end at CRLF, LF or CR; a CR at the end of one piece may
+      have its LF at the start of the next */
+   if(p.cr&&t.charAt(0)==='\n')t=t.slice(1);
+   p.cr=false;
+   t=p.text+t;start=0;
+   for(i=0;i<t.length&&s.state!==2;i++){
+    c=t.charCodeAt(i);
+    if(c===10||c===13){
+     line(t.slice(start,i));
+     if(c===13){
+      if(i+1<t.length){if(t.charCodeAt(i+1)===10)i++;}
+      else p.cr=true;}
+     start=i+1;}}
+   p.text=s.state===2?'':t.slice(start);}
+  function progress(status,headers,bytes){
+   if(s.state===2||p.failed)return;
+   if(!open(status,headers))return;
+   if(bytes&&bytes.byteLength)feed(bytes);}
+  function done(status,headers,bytes,err){
+   s.id=0;
+   if(s.state===2||p.failed)return;
+   if(!err){
+    if(!open(status,headers))return;
+    if(bytes&&bytes.byteLength)feed(bytes);}
+   else if(!p.opened&&/cross-origin/.test(String(err))){fail();return;}
+   if(s.state===2)return;
+   /* the connection ended: announce it and open it again, after the
+      retry time, unless the page closes it first */
+   s.state=0;
+   fire(es,uaEvent(new Event('error')));
+   if(s.state!==0)return;
+   s.timer=setTimeout(function(){
+    s.timer=0;
+    if(s.state===0)connect(es);},s.retry);}
+  s.id=FETCH(s.url,'GET',hs,null,0,done,progress);
+  if(!s.id)setTimeout(function(){done(0,'',null,'request refused');},0);}
+ W.EventSource=EventSource;
+})();
+/* Trusted Types (VitaSurf), as the W3C specification and Chrome have
+ * them: window.trustedTypes makes policies, and a policy turns a string
+ * through its own callbacks into a TrustedHTML, TrustedScript or
+ * TrustedScriptURL, which stands for that string anywhere one goes.
+ * Nothing here enforces them -- that is for a Content-Security-Policy's
+ * require-trusted-types-for, which this browser does not apply -- so a
+ * sink takes a plain string as well. Pages ask for a policy before
+ * using one, and youtube.com's embed script threw reading createPolicy
+ * of undefined. */
+(function(){
+ var VAL=new WeakMap(),KIND=new WeakMap(),POL=new WeakMap(),
+  FACTORY=null,defaultPolicy=null,empty={};
+ function illegal(){throw new TypeError('Illegal constructor');}
+ function TrustedHTML(){illegal();}
+ function TrustedScript(){illegal();}
+ function TrustedScriptURL(){illegal();}
+ function TrustedTypePolicy(){illegal();}
+ function TrustedTypePolicyFactory(){illegal();}
+ var TYPES={TrustedHTML:TrustedHTML,TrustedScript:TrustedScript,
+  TrustedScriptURL:TrustedScriptURL};
+ function make(kind,v){
+  var o=Object.create(TYPES[kind].prototype);
+  VAL.set(o,v);KIND.set(o,kind);
+  return o;}
+ Object.keys(TYPES).forEach(function(kind){
+  var C=TYPES[kind];
+  ['toString','toJSON'].forEach(function(m){
+   Object.defineProperty(C.prototype,m,{configurable:true,writable:true,
+    value:function(){
+     if(KIND.get(this)!==kind)throw new TypeError('Illegal invocation');
+     return VAL.get(this);}});});});
+ var MEMBER={TrustedHTML:'createHTML',TrustedScript:'createScript',
+  TrustedScriptURL:'createScriptURL'};
+ Object.keys(MEMBER).forEach(function(kind){
+  var m=MEMBER[kind];
+  Object.defineProperty(TrustedTypePolicy.prototype,m,{configurable:true,
+   writable:true,enumerable:true,value:function(input){
+    var p=POL.get(this);
+    if(!p)throw new TypeError('Illegal invocation');
+    var f=p.options[m];
+    if(typeof f!=='function')throw new TypeError("Failed to execute '"+m+
+     "' on 'TrustedTypePolicy': Policy "+p.name+"'s TrustedTypePolicyOptions "+
+     "did not specify a '"+m+"' member.");
+    var args=[String(input)].concat(Array.prototype.slice.call(arguments,1)),
+     v=f.apply(undefined,args);
+    return make(kind,v===null||v===undefined?'':String(v));}});});
+ Object.defineProperty(TrustedTypePolicy.prototype,'name',{configurable:true,
+  enumerable:true,get:function(){
+   var p=POL.get(this);
+   if(!p)throw new TypeError('Illegal invocation');
+   return p.name;}});
+ function factory(o){if(o!==FACTORY)throw new TypeError('Illegal invocation');}
+ var FP=TrustedTypePolicyFactory.prototype;
+ FP.createPolicy=function(name,options){
+  factory(this);
+  if(arguments.length<1)throw new TypeError("Failed to execute 'createPolicy' "+
+   "on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present.");
+  name=String(name);
+  if(name==='default'&&defaultPolicy)throw new TypeError("Failed to execute "+
+   "'createPolicy' on 'TrustedTypePolicyFactory': Policy with name \"default\" "+
+   "already exists.");
+  var o={};
+  if(options!==undefined&&options!==null){
+   if(typeof options!=='object'&&typeof options!=='function')throw new TypeError(
+    "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': The "+
+    "provided value is not of type 'TrustedTypePolicyOptions'.");
+   ['createHTML','createScript','createScriptURL'].forEach(function(m){
+    var f=options[m];
+    if(f!==undefined&&f!==null){
+     if(typeof f!=='function')throw new TypeError("Failed to execute "+
+      "'createPolicy' on 'TrustedTypePolicyFactory': Failed to read the '"+m+
+      "' property from 'TrustedTypePolicyOptions': The provided value is not "+
+      "a function.");
+     o[m]=f;}});}
+  var pol=Object.create(TrustedTypePolicy.prototype);
+  POL.set(pol,{name:name,options:o});
+  if(name==='default')defaultPolicy=pol;
+  return pol;};
+ FP.isHTML=function(v){factory(this);return KIND.get(v)==='TrustedHTML';};
+ FP.isScript=function(v){factory(this);return KIND.get(v)==='TrustedScript';};
+ FP.isScriptURL=function(v){factory(this);return KIND.get(v)==='TrustedScriptURL';};
+ Object.defineProperties(FP,{
+  emptyHTML:{configurable:true,enumerable:true,get:function(){factory(this);
+   return empty.h||(empty.h=make('TrustedHTML',''));}},
+  emptyScript:{configurable:true,enumerable:true,get:function(){factory(this);
+   return empty.s||(empty.s=make('TrustedScript',''));}},
+  defaultPolicy:{configurable:true,enumerable:true,get:function(){factory(this);
+   return defaultPolicy;}}});
+ var HTML_NS='http://www.w3.org/1999/xhtml',SVG_NS='http://www.w3.org/2000/svg';
+ function handlerName(a){
+  if(a.slice(0,2)!=='on')return false;
+  var t=a.slice(2),lists=[EVENT_HANDLERS,WINDOW_HANDLERS,DOCUMENT_HANDLERS],i;
+  for(i=0;i<lists.length;i++)if(lists[i]&&lists[i].indexOf(t)>=0)return true;
+  return false;}
+ /* the sinks Chrome names, by element and attribute or property */
+ FP.getAttributeType=function(tag,attr,elNs,attrNs){
+  factory(this);
+  tag=String(tag).toLowerCase();attr=String(attr).toLowerCase();
+  elNs=elNs===undefined||elNs===null||elNs===''?HTML_NS:String(elNs);
+  attrNs=attrNs===undefined||attrNs===null||attrNs===''?null:String(attrNs);
+  if(attrNs===null&&handlerName(attr))return 'TrustedScript';
+  if(attrNs!==null)return null;
+  if(elNs===HTML_NS){
+   if(tag==='iframe'&&attr==='srcdoc')return 'TrustedHTML';
+   if(tag==='script'&&attr==='src')return 'TrustedScriptURL';}
+  if(elNs===SVG_NS&&tag==='script'&&attr==='href')return 'TrustedScriptURL';
+  return null;};
+ FP.getPropertyType=function(tag,prop,elNs){
+  factory(this);
+  tag=String(tag).toLowerCase();prop=String(prop);
+  elNs=elNs===undefined||elNs===null||elNs===''?HTML_NS:String(elNs);
+  if(prop==='innerHTML'||prop==='outerHTML')return 'TrustedHTML';
+  if(elNs!==HTML_NS)return null;
+  if(tag==='iframe'&&prop==='srcdoc')return 'TrustedHTML';
+  if(tag==='script'){
+   if(prop==='innerText'||prop==='textContent'||prop==='text')return 'TrustedScript';
+   if(prop==='src')return 'TrustedScriptURL';}
+  return null;};
+ FACTORY=Object.create(FP);
+ Object.keys(TYPES).forEach(function(k){W[k]=TYPES[k];});
+ W.TrustedTypePolicy=TrustedTypePolicy;
+ W.TrustedTypePolicyFactory=TrustedTypePolicyFactory;
+ Object.defineProperty(W,'trustedTypes',{configurable:true,enumerable:true,
+  get:function(){return FACTORY;}});
+})();
 
 /* the entries form-associated custom elements give their form: a string,
    a File, or a FormData of their own (VitaSurf) */
