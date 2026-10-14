@@ -1,0 +1,20 @@
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 6cee969d1..10da2f992 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -551,8 +551,13 @@ void box_coords(struct box *box, int *x, int *y)
+ 	*x = box->x + box->sticky_dx;
+ 	*y = box->y + box->sticky_dy;
+ 	while (box->parent) {
+-		if (box_is_float(box)) {
+-			assert(box->float_container);
++		/* A float's position is from its float container, which
++		 * layout gives it when it places the float. One that layout
++		 * has not reached -- built since the last layout, as script
++		 * changing a page between layouts makes them -- has none
++		 * yet, and is placed from its parent until it does
++		 * (VitaSurf): espn.com asserted here. */
++		if (box_is_float(box) && box->float_container != NULL) {
+ 			box = box->float_container;
+ 		} else {
+ 			box = box->parent;

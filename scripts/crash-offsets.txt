@@ -173,3 +173,16 @@
 #   patch 0419, which reads coords as HTML does. PC, LR.
 0x48452e
 0x4844fb
+
+# Build 670: assertion on www.espn.com during the site test, main thread:
+#   "box_inspect.c:555 in box_coords: box->float_container". Resolved
+#   against build 670's ELF: a script's setAttribute on a text field
+#   (node_set_attribute, DOMSubtreeModified) updated its text and asked
+#   for a redraw of its box (html_texty_element_update,
+#   html__redraw_a_box, box_bounds), and the box sat in a float that
+#   layout had not placed since the page changed. Fixed by patch 0421:
+#   a float layout has not reached is placed from its parent. PC, then
+#   box_bounds and html__redraw_a_box.
+0x484dde
+0x5a251
+0x6a5bf
