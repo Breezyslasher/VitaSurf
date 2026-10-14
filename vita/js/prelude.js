@@ -1414,15 +1414,28 @@ D.createTreeWalker=function(root,what,filter){
 /* The base every relative URL in the document resolves against: the
  * first <base href>, or the document's own address. Read with
  * getAttribute, never through the href property, which resolves against
- * this and would call straight back into it. */
-Object.defineProperty(D,'baseURI',{configurable:true,get:function(){
- var b=D.getElementsByTagName('base');
- for(var i=0;i<b.length;i++){var h=b[i].getAttribute('href');
-  if(h){try{return new URL(h,location.href).href;}catch(e){}}}
- /* the document's own base: a srcdoc or blank frame's is its parent's */
- var n=NV.__vitaDocBase?NV.__vitaDocBase():'';
- return n||location.href;
-}});
+ * this and would call straight back into it.
+ *
+ * Kept until the document or its address changes (VitaSurf): every
+ * a.href, link.href and img.src read resolves against it, and finding
+ * the <base> is a walk of the whole document. A module preloader that
+ * compares each module with every <link>'s href walked a document of
+ * 6,400 elements 39,459 times on nytimes.com, four minutes of script. */
+(function(){
+ var gen=-1,here=null,val='';
+ function find(){
+  var b=D.getElementsByTagName('base');
+  for(var i=0;i<b.length;i++){var h=b[i].getAttribute('href');
+   if(h){try{return new URL(h,location.href).href;}catch(e){}}}
+  /* the document's own base: a srcdoc or blank frame's is its parent's */
+  var n=NV.__vitaDocBase?NV.__vitaDocBase():'';
+  return n||location.href;}
+ Object.defineProperty(D,'baseURI',{configurable:true,get:function(){
+  var g=domGen(),h=location.href;
+  if(g<0||g!==gen||h!==here){val=find();gen=g;here=h;}
+  return val;
+ }});
+})();
 Object.defineProperty(D,'URL',{configurable:true,get:function(){return location.href;}});Object.defineProperty(D,'documentURI',{configurable:true,get:function(){return location.href;}});
 Object.defineProperty(D,'activeElement',{configurable:true,get:function(){return D.body;}});
 /* createComment is a real comment node from qjs.c now. */D.write=D.writeln=function(){};

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>document.baseURI</title></head>
+<body>
+<!--
+ document.baseURI, and every URL resolved against it (a.href, link.href,
+ img.src), follows the first <base href> and the document's address
+ through every change, though the answer is kept between reads. Chrome
+ gives each line below as PASS.
+-->
+<pre id="out"></pre>
+<script>
+var out=[],here=location.href;
+function check(name,got,want){out.push((got===want?'PASS ':'FAIL ')+name+(got===want?'':' got '+got+' want '+want));}
+var a=document.createElement('a');a.setAttribute('href','x/y');document.body.appendChild(a);
+check('no base',document.baseURI,here);
+check('href without base',a.href,new URL('x/y',here).href);
+var b=document.createElement('base');b.setAttribute('href','http://example.com/one/');
+document.head.appendChild(b);
+check('base added',document.baseURI,'http://example.com/one/');
+check('href with base',a.href,'http://example.com/one/x/y');
+b.setAttribute('href','http://example.com/two/');
+check('base href set',a.href,'http://example.com/two/x/y');
+b.href='http://example.com/three/';
+check('base href property',document.baseURI,'http://example.com/three/');
+var b0=document.createElement('base');document.head.insertBefore(b0,b);
+check('first base without href is passed over',document.baseURI,'http://example.com/three/');
+b0.setAttribute('href','http://example.com/zero/');
+check('first base gains href',document.baseURI,'http://example.com/zero/');
+b0.removeAttribute('href');
+check('first base loses href',document.baseURI,'http://example.com/three/');
+b.remove();b0.remove();
+check('base removed',document.baseURI,here);
+history.pushState(null,'','sub/page.html');
+check('pushState moves the base',a.href,new URL('sub/x/y',here).href);
+history.replaceState(null,'',here);
+check('replaceState moves it back',a.href,new URL('x/y',here).href);
+/* many reads of a document that does not change cost one walk */
+var d=document.createElement('div');
+for(var i=0;i<3000;i++)d.appendChild(document.createElement('span'));
+document.body.appendChild(d);
+var links=[];
+for(i=0;i<40;i++){var l=document.createElement('link');l.setAttribute('href','m'+i+'.js');document.head.appendChild(l);links.push(l);}
+var t0=performance.now(),n=0;
+for(var k=0;k<50;k++)for(i=0;i<links.length;i++)if(links[i].href.length)n++;
+var ms=performance.now()-t0;
+check('2000 href reads',n,2000);
+out.push('INFO 2000 href reads over 3000 elements took '+Math.round(ms)+' ms');
+document.getElementById('out').textContent=out.join('\n');
+out.forEach(function(l){console.log('base-uri: '+l);});
+</script>
+</body></html>

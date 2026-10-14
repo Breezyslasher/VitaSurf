@@ -5616,9 +5616,12 @@ static JSValue win_vita_frame_start(JSContext *ctx, JSValueConst this_val,
 }
 
 /*
- * __vitaDocBase(): the document's base URL as NetSurf has it (VitaSurf).
- * A srcdoc or blank frame document's is its parent's, which the page's
- * own URL cannot tell it.
+ * __vitaDocBase(): the document's own base, the one it has without a
+ * <base> element (VitaSurf): a srcdoc or blank frame document's is its
+ * parent's, which the page's own URL cannot tell it, and any other's is
+ * its address, for which this gives "" and the prelude reads location,
+ * as pushState leaves it. NetSurf's base_url is no use here: a <base>
+ * element overwrites it, and it kept the removed element's href.
  */
 static JSValue win_vita_doc_base(JSContext *ctx, JSValueConst this_val,
 				 int argc, JSValueConst *argv)
@@ -5630,11 +5633,11 @@ static JSValue win_vita_doc_base(JSContext *ctx, JSValueConst this_val,
 	(void)argc;
 	(void)argv;
 	if (thread == NULL || thread->htmlc == NULL ||
-	    thread->htmlc->base_url == NULL) {
+	    thread->htmlc->inherited_base == NULL) {
 		return JS_NewString(ctx, "");
 	}
 	return JS_NewString(ctx, shown_url(nsurl_access(
-		thread->htmlc->base_url)));
+		thread->htmlc->inherited_base)));
 }
 
 /*
