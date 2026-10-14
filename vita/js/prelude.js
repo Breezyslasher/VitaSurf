@@ -1887,7 +1887,7 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
 })();
 /* performance is made in performance.js; it measures from here */
 var t0=Date.now();NV.__vitaT0=t0;NV.__vitaHr0=typeof NV.__vitaNow==='function'?NV.__vitaNow():0;
-(function(){var l=String(typeof NV.__vitaLanguages==='function'?NV.__vitaLanguages():'en-US,en').split(',').map(function(t){return t.trim();}).filter(Boolean);if(!l.length)l=['en-US','en'];navigator.language=l[0];navigator.languages=Object.freeze(l);})();navigator.cookieEnabled=true;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};
+(function(){var l=String(typeof NV.__vitaLanguages==='function'?NV.__vitaLanguages():'en-US,en').split(',').map(function(t){return t.trim();}).filter(Boolean);if(!l.length)l=['en-US','en'];navigator.language=l[0];navigator.languages=Object.freeze(l);})();navigator.cookieEnabled=true;navigator.webdriver=false;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};
 location.reload=function(){location.href=location.href;};
 ['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:m[1]?m[1]+'//'+(m[2]||''):'null'}[k];}});});
 location.toString=function(){return location.href;};
@@ -2607,6 +2607,63 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
     s.state=3;
     fire(ws,uaEvent(new CloseEvent('close',{wasClean:code!==1006,code:code,reason:data||''})));}}});
  W.WebSocket=WebSocket;
+})();
+/* BroadcastChannel (VitaSurf), as the HTML standard has it: a message
+ * posted on one goes, cloned, to every other open channel of the same
+ * name and origin, each in a task of its own. Pages that keep their tabs
+ * in step use it, and stackoverflow.com stopped at "BroadcastChannel is
+ * not defined". This browser has one tab, so the channels it reaches
+ * are those of this realm: the page's, or a worker's own. */
+(function(){
+ var ETP=EventTarget.prototype,ST=new WeakMap(),open=new Map();
+ function st(c){
+  var s=ST.get(c);
+  if(!s)throw new TypeError('Illegal invocation');
+  return s;}
+ function fire(c,e){
+  var h=st(c)['on'+e.type];
+  try{e.target=c;e.currentTarget=c;}catch(x){}
+  if(typeof h==='function'){
+   try{h.call(c,e);}catch(err){if(NV.__vitaReportError)NV.__vitaReportError(err);}}
+  ETP.dispatchEvent.call(c,e);}
+ function BroadcastChannel(name){
+  if(!(this instanceof BroadcastChannel))throw new TypeError(
+   "Failed to construct 'BroadcastChannel': Please use the 'new' operator, "+
+   'this DOM object constructor cannot be called as a function.');
+  var n=String(name),key=location.origin+' '+n;
+  ST.set(this,{name:n,key:key,closed:false,onmessage:null,onmessageerror:null});
+  if(!open.has(key))open.set(key,[]);
+  open.get(key).push(this);}
+ BroadcastChannel.prototype=Object.create(ETP);
+ BroadcastChannel.prototype.constructor=BroadcastChannel;
+ Object.defineProperty(BroadcastChannel.prototype,'name',{configurable:true,
+  enumerable:true,get:function(){return st(this).name;}});
+ ['onmessage','onmessageerror'].forEach(function(k){
+  Object.defineProperty(BroadcastChannel.prototype,k,{configurable:true,
+   enumerable:true,get:function(){return st(this)[k];},
+   set:function(f){st(this)[k]=typeof f==='function'||(f&&typeof f==='object')?f:null;}});});
+ BroadcastChannel.prototype.postMessage=function(message){
+  var s=st(this),me=this,data,list;
+  if(arguments.length<1)throw new TypeError("Failed to execute 'postMessage' on "+
+   "'BroadcastChannel': 1 argument required, but only 0 present.");
+  if(s.closed)throw new DOMException("Failed to execute 'postMessage' on "+
+   "'BroadcastChannel': Channel is closed",'InvalidStateError');
+  /* cloned now, so what cannot be cloned throws here */
+  data=W.structuredClone(message);
+  list=(open.get(s.key)||[]).filter(function(c){return c!==me;});
+  list.forEach(function(c){
+   setTimeout(function(){
+    var t=ST.get(c),d;
+    if(!t||t.closed)return;
+    try{d=W.structuredClone(data);}
+    catch(e){fire(c,uaEvent(new W.MessageEvent('messageerror',{origin:location.origin})));return;}
+    fire(c,uaEvent(new W.MessageEvent('message',{data:d,origin:location.origin})));},0);});};
+ BroadcastChannel.prototype.close=function(){
+  var s=st(this),me=this,l=open.get(s.key);
+  s.closed=true;
+  if(l){l=l.filter(function(c){return c!==me;});
+   if(l.length)open.set(s.key,l);else open.delete(s.key);}};
+ W.BroadcastChannel=BroadcastChannel;
 })();
 
 /* the entries form-associated custom elements give their form: a string,

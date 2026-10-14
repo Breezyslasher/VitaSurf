@@ -500,8 +500,12 @@ static void shape_row(struct shape_state *s, int ri)
 		if (tab != NULL) {
 			JS_FreePropertyEnum(ctx, tab, n);
 		}
-		/* under its parent: where it inherited from nothing, or from
-		 * an interface further up that its parent sits below */
+		/* under its parent: where it inherited from nothing, from
+		 * an interface further up that its parent sits below, or
+		 * from an object its parent's prototype is not on the chain
+		 * of -- WebSocket and BroadcastChannel were made on the
+		 * EventTarget.prototype a later part of the prelude replaces,
+		 * and were not instances of EventTarget */
 		if (JS_IsObject(pF)) {
 			pFP = get_str(ctx, pF, "prototype");
 			if (!same(P, pFP)) {
@@ -510,7 +514,9 @@ static void shape_row(struct shape_state *s, int ri)
 				if (!same(cur, pFP) &&
 				    (same(cur, s->objproto) ||
 				     (JS_IsObject(cur) &&
-				      is_proto_of(ctx, cur, pFP)))) {
+				      is_proto_of(ctx, cur, pFP)) ||
+				     (JS_IsObject(pFP) &&
+				      !is_proto_of(ctx, pFP, P)))) {
 					swallow(ctx, JS_SetPrototype(ctx, P,
 								     pFP));
 				}

@@ -36,7 +36,7 @@
  */
 (function(){
 var W=window;
-/* 290 interfaces, parents first */
+/* 291 interfaces, parents first */
 var TABLE=`AbortController|Object|c|0|1|
 EventTarget|Object|c|0|1|
 AbortSignal|EventTarget|i|0|1|
@@ -55,6 +55,7 @@ Audio|HTMLMediaElement|c|0|HTMLAudioElement|
 BarProp|Object|i|0|1|
 BeforeUnloadEvent|Event|i|0|1|
 Blob|Object|c|0|1|
+BroadcastChannel|EventTarget|r|1|1|
 ByteLengthQueuingStrategy|Object|r|1|1|
 CharacterData|Node|i|0|1|
 Text|CharacterData|c|0|1|
