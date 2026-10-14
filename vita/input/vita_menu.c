@@ -1153,6 +1153,8 @@ static void item_label(enum item item, char *buf, size_t len)
 		if (vita_sitetest_running(&done, &total)) {
 			snprintf(buf, len, "Site test: stop (%d of %d)",
 				 done + 1, total);
+		} else if (vita_sitetest_resumable()) {
+			snprintf(buf, len, "Site test: carry on after the crash");
 		} else {
 			snprintf(buf, len, "Site test: load the list, log each");
 		}

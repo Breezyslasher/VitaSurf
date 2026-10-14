@@ -11,11 +11,15 @@
 
 #include <stdbool.h>
 
-/** Start a run over the list in ux0:data/VitaSurf/sitetest.txt. */
+/** Start a run over the list in ux0:data/VitaSurf/sitetest.txt, or
+ * carry on with one the browser ended in the middle of. */
 void vita_sitetest_start(void);
 
 /** Stop a run and write the results so far. */
 void vita_sitetest_stop(void);
+
+/** Whether a run ended without finishing, to be carried on. */
+bool vita_sitetest_resumable(void);
 
 /** Whether a run is going, and how far it has got. */
 bool vita_sitetest_running(int *done, int *total);
