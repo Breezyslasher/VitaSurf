@@ -282,6 +282,12 @@ void vita_decode_thread_started(int index);
  */
 bool vitasurf_cache_disabled(void);
 
+/**
+ * Put UTF-8 text on the console's clipboard as well (vita_clipboard.c),
+ * when the system clipboard module could be loaded.
+ */
+void vita_clipboard_set(const char *text, size_t length);
+
 /* The system language's tags, best first: "fr-FR,fr" (utils/utils.h) */
 const char *vitasurf_languages(void);
 

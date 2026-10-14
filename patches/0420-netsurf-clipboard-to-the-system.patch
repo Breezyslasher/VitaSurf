@@ -1,0 +1,25 @@
+diff --git a/frontends/framebuffer/clipboard.c b/frontends/framebuffer/clipboard.c
+index 20a00e038..92a564f90 100644
+--- a/frontends/framebuffer/clipboard.c
++++ b/frontends/framebuffer/clipboard.c
+@@ -31,6 +31,9 @@
+ 
+ #include "framebuffer/gui.h"
+ #include "framebuffer/clipboard.h"
++#ifdef __vita__
++#include "vita_platform.h"
++#endif
+ 
+ 
+ static struct gui_clipboard {
+@@ -95,6 +98,10 @@ static void gui_set_clipboard(const char *buffer, size_t length,
+ 	memcpy(gui_clipboard.buffer, buffer, length);
+ 	gui_clipboard.length = length;
+ 	gui_clipboard.buffer[gui_clipboard.length] = '\0';
++#ifdef __vita__
++	/* and on the console's, to be pasted outside the browser */
++	vita_clipboard_set(gui_clipboard.buffer, gui_clipboard.length);
++#endif
+ }
+ 
+ static struct gui_clipboard_table clipboard_table = {

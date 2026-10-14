@@ -77,6 +77,7 @@
 
 /* guit->misc->schedule lives behind the core's gui table. */
 #include "desktop/gui_internal.h"
+#include "netsurf/clipboard.h"
 #include "netsurf/misc.h"
 
 /* html_content, for the document node and browser window. */
@@ -10251,6 +10252,33 @@ static bool xhr_start(struct js_xhr *x)
 	return true;
 }
 
+/*
+ * __vitaClipboardWrite(text): put text on the browser's clipboard, the
+ * one selecting and copying in a page uses (VitaSurf), for the Async
+ * Clipboard API's write and writeText. A page may write to it, as a
+ * focused page may in Chrome; reading it back is refused in the prelude,
+ * since that is asked of the user and there is no asking here.
+ */
+static JSValue win_vita_clipboard_write(JSContext *ctx, JSValueConst this_val,
+					int argc, JSValueConst *argv)
+{
+	const char *text;
+	size_t len = 0;
+
+	(void)this_val;
+	if (argc < 1 || guit == NULL || guit->clipboard == NULL ||
+	    guit->clipboard->set == NULL) {
+		return JS_FALSE;
+	}
+	text = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (text == NULL) {
+		return JS_EXCEPTION;
+	}
+	guit->clipboard->set(text, len, NULL, 0);
+	JS_FreeCString(ctx, text);
+	return JS_TRUE;
+}
+
 /* __vitaLanguages() -> "fr-FR,fr": the languages Accept-Language names,
  * for navigator.languages and so Intl's default locale */
 static JSValue win_vita_languages(JSContext *ctx, JSValueConst this_val,
@@ -17102,6 +17130,9 @@ static bool setup_globals(jsthread *thread)
 	/* transport for XMLHttpRequest and fetch (prelude.js) */
 	JS_SetPropertyStr(ctx, global, "__vitaFetch",
 			  JS_NewCFunction(ctx, win_vita_fetch, "__vitaFetch", 7));
+	JS_SetPropertyStr(ctx, global, "__vitaClipboardWrite",
+			  JS_NewCFunction(ctx, win_vita_clipboard_write,
+					  "__vitaClipboardWrite", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaLanguages",
 			  JS_NewCFunction(ctx, win_vita_languages,
 					  "__vitaLanguages", 0));

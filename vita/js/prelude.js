@@ -8254,19 +8254,184 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
   persisted:function(){return Promise.resolve(false);},
   getDirectory:function(){return Promise.reject(new DOMException(
    'No origin private file system here.','SecurityError'));}};
- /* Clipboard: there is no clipboard to reach, so it refuses rather
-    than pretending to have copied something. */
- if(!n.clipboard)n.clipboard={
-  read:function(){return Promise.reject(new DOMException(
-   'The clipboard is not available.','NotAllowedError'));},
-  readText:function(){return Promise.reject(new DOMException(
-   'The clipboard is not available.','NotAllowedError'));},
-  write:function(){return Promise.reject(new DOMException(
-   'The clipboard is not available.','NotAllowedError'));},
-  writeText:function(){return Promise.reject(new DOMException(
-   'The clipboard is not available.','NotAllowedError'));},
-  addEventListener:function(){},removeEventListener:function(){},
-  dispatchEvent:function(){return true;}};
+})();
+/* --- the clipboard and permissions (VitaSurf) ---------------------------
+ * The Async Clipboard API over the browser's clipboard, which copying a
+ * selection uses and the console's own clipboard mirrors (vita/platform/
+ * vita_clipboard.c): a page may write text to it, as a focused page may
+ * in Chrome, and a ClipboardItem's text/plain, or the text of its
+ * text/html, is what goes. Reading it is asked of the user in a browser,
+ * and there is no asking here, so a read is refused, and the permission
+ * says so. The Permissions API answers from what this browser has:
+ * clipboard-write is granted, notifications are what Notification says,
+ * and what it cannot do at all is denied. */
+(function(){
+ var n=W.navigator,WRITE=NV.__vitaClipboardWrite,ETP=EventTarget.prototype;
+ if(!n)return;
+ function illegal(){throw new TypeError('Illegal constructor');}
+ function rejectWith(e){return Promise.reject(e);}
+ function failed(op,iface,msg,name){
+  var text="Failed to execute '"+op+"' on '"+iface+"': "+msg;
+  return name?new DOMException(text,name):new TypeError(text);}
+ function handlerProp(proto,ST,k){
+  Object.defineProperty(proto,k,{configurable:true,enumerable:true,
+   get:function(){var s=ST.get(this);if(!s)throw new TypeError('Illegal invocation');return s[k];},
+   set:function(f){var s=ST.get(this);if(!s)throw new TypeError('Illegal invocation');
+    s[k]=typeof f==='function'||(f&&typeof f==='object')?f:null;}});}
+
+ /* Permissions */
+ var NAMES=('accelerometer ambient-light-sensor background-fetch background-sync '+
+  'camera captured-surface-control clipboard-read clipboard-write display-capture '+
+  'fullscreen geolocation gyroscope idle-detection keyboard-lock local-fonts '+
+  'magnetometer microphone midi nfc notifications payment-handler '+
+  'periodic-background-sync persistent-storage pointer-lock push screen-wake-lock '+
+  'speaker-selection storage-access system-wake-lock top-level-storage-access '+
+  'window-management').split(' ');
+ function stateOf(name){
+  switch(name){
+  case 'clipboard-write':return typeof WRITE==='function'?'granted':'denied';
+  case 'notifications':case 'push':
+   var p=W.Notification&&W.Notification.permission;
+   return p==='granted'?'granted':p==='default'?'prompt':'denied';
+  case 'geolocation':return n.geolocation?'prompt':'denied';
+  default:return 'denied';}}
+ var PS=new WeakMap();
+ function PermissionStatus(){illegal();}
+ PermissionStatus.prototype=Object.create(ETP);
+ PermissionStatus.prototype.constructor=PermissionStatus;
+ ['state','name'].forEach(function(k){
+  Object.defineProperty(PermissionStatus.prototype,k,{configurable:true,enumerable:true,
+   get:function(){var s=PS.get(this);if(!s)throw new TypeError('Illegal invocation');return s[k];}});});
+ handlerProp(PermissionStatus.prototype,PS,'onchange');
+ var PERMS;
+ function Permissions(){illegal();}
+ Permissions.prototype.query=function(desc){
+  if(this!==PERMS)return rejectWith(new TypeError('Illegal invocation'));
+  if(arguments.length<1)return rejectWith(failed('query','Permissions',
+   '1 argument required, but only 0 present.'));
+  if(desc===null||(typeof desc!=='object'&&typeof desc!=='function'))
+   return rejectWith(failed('query','Permissions',
+    "The provided value is not of type 'PermissionDescriptor'."));
+  var name=desc.name;
+  if(name===undefined)return rejectWith(failed('query','Permissions',
+   "Failed to read the 'name' property from 'PermissionDescriptor': Required "+
+   'member is undefined.'));
+  name=String(name);
+  if(NAMES.indexOf(name)<0)return rejectWith(failed('query','Permissions',
+   "Failed to read the 'name' property from 'PermissionDescriptor': The "+
+   "provided value '"+name+"' is not a valid enum value of type PermissionName."));
+  if(name==='push'&&!desc.userVisibleOnly)return rejectWith(failed('query',
+   'Permissions',"Push Permission without userVisibleOnly:true isn't supported yet.",
+   'NotSupportedError'));
+  var st=Object.create(PermissionStatus.prototype);
+  PS.set(st,{name:name,state:stateOf(name),onchange:null});
+  return Promise.resolve(st);};
+ PERMS=Object.create(Permissions.prototype);
+ W.Permissions=Permissions;W.PermissionStatus=PermissionStatus;
+ n.permissions=PERMS;
+
+ /* ClipboardItem */
+ var CI=new WeakMap(),STYLES=['unspecified','inline','attachment'];
+ function ClipboardItem(items,options){
+  if(!(this instanceof ClipboardItem))throw new TypeError(
+   "Failed to construct 'ClipboardItem': Please use the 'new' operator, this "+
+   'DOM object constructor cannot be called as a function.');
+  if(arguments.length<1)throw new TypeError("Failed to construct "+
+   "'ClipboardItem': 1 argument required, but only 0 present.");
+  if(items===null||(typeof items!=='object'&&typeof items!=='function'))
+   throw new TypeError("Failed to construct 'ClipboardItem': The provided "+
+    "value is not of type 'record<DOMString, (Blob or DOMString or "+
+    "Promise<(Blob or DOMString)>)>'.");
+  var types=Object.keys(items),data={},style='unspecified';
+  if(!types.length)throw new TypeError("Failed to construct 'ClipboardItem': "+
+   'Empty dictionary argument');
+  types.forEach(function(t){data[t]=items[t];});
+  if(options!==undefined&&options!==null&&options.presentationStyle!==undefined){
+   style=String(options.presentationStyle);
+   if(STYLES.indexOf(style)<0)throw new TypeError("Failed to construct "+
+    "'ClipboardItem': Failed to read the 'presentationStyle' property from "+
+    "'ClipboardItemOptions': The provided value '"+style+"' is not a valid "+
+    "enum value of type PresentationStyle.");}
+  CI.set(this,{types:Object.freeze(types.slice()),data:data,style:style});}
+ function ci(o){var s=CI.get(o);if(!s)throw new TypeError('Illegal invocation');return s;}
+ Object.defineProperties(ClipboardItem.prototype,{
+  types:{configurable:true,enumerable:true,get:function(){return ci(this).types;}},
+  presentationStyle:{configurable:true,enumerable:true,get:function(){return ci(this).style;}}});
+ ClipboardItem.prototype.getType=function(type){
+  var s;
+  try{s=ci(this);}catch(e){return rejectWith(e);}
+  type=String(type);
+  if(s.types.indexOf(type)<0)return rejectWith(failed('getType','ClipboardItem',
+   'The type was not found','NotFoundError'));
+  return Promise.resolve(s.data[type]).then(function(v){
+   return v instanceof W.Blob?v:new W.Blob([String(v)],{type:type});});};
+ /* what can be written: this clipboard holds text */
+ ClipboardItem.supports=function(type){
+  if(arguments.length<1)throw new TypeError("Failed to execute 'supports' on "+
+   "'ClipboardItem': 1 argument required, but only 0 present.");
+  type=String(type);
+  return type==='text/plain'||type==='text/html';};
+ W.ClipboardItem=ClipboardItem;
+
+ /* Clipboard */
+ var CLIP;
+ function Clipboard(){illegal();}
+ Clipboard.prototype=Object.create(ETP);
+ Clipboard.prototype.constructor=Clipboard;
+ function mine(o,op){
+  if(o!==CLIP)throw new TypeError('Illegal invocation');
+  if(typeof WRITE!=='function')throw failed(op,'Clipboard',
+   'Write permission denied.','NotAllowedError');}
+ function put(text){
+  if(!WRITE(String(text)))throw new DOMException('Write permission denied.',
+   'NotAllowedError');}
+ Clipboard.prototype.readText=function(){
+  if(this!==CLIP)return rejectWith(new TypeError('Illegal invocation'));
+  return rejectWith(failed('readText','Clipboard','Read permission denied.',
+   'NotAllowedError'));};
+ Clipboard.prototype.read=function(){
+  if(this!==CLIP)return rejectWith(new TypeError('Illegal invocation'));
+  return rejectWith(failed('read','Clipboard','Read permission denied.',
+   'NotAllowedError'));};
+ Clipboard.prototype.writeText=function(data){
+  try{
+   mine(this,'writeText');
+   if(arguments.length<1)throw failed('writeText','Clipboard',
+    '1 argument required, but only 0 present.');
+   put(String(data));
+  }catch(e){return rejectWith(e);}
+  return Promise.resolve();};
+ function textOfHTML(html){
+  var t=D.createElement('template');
+  t.innerHTML=html;
+  return t.content?t.content.textContent:t.textContent;}
+ Clipboard.prototype.write=function(items){
+  var list,item,s,i;
+  try{
+   mine(this,'write');
+   if(arguments.length<1)throw failed('write','Clipboard',
+    '1 argument required, but only 0 present.');
+   if(items===null||typeof items!=='object'||typeof items[Symbol.iterator]!=='function')
+    throw failed('write','Clipboard',
+     'The provided value cannot be converted to a sequence.');
+   list=Array.from(items);
+   for(i=0;i<list.length;i++)if(!CI.get(list[i]))throw failed('write','Clipboard',
+    "Failed to convert value to 'ClipboardItem'.");
+   if(list.length>1)throw failed('write','Clipboard',
+    'Support for multiple ClipboardItems is not implemented.','NotAllowedError');
+   if(!list.length){put('');return Promise.resolve();}
+   item=list[0];s=CI.get(item);
+   for(i=0;i<s.types.length;i++)if(!ClipboardItem.supports(s.types[i]))
+    throw failed('write','Clipboard','Type '+s.types[i]+' not supported on write.',
+     'NotAllowedError');
+  }catch(e){return rejectWith(e);}
+  var plain=s.types.indexOf('text/plain')>=0;
+  return item.getType(plain?'text/plain':'text/html').then(function(b){
+   return b.text();}).then(function(text){
+   put(plain?text:textOfHTML(text));});};
+ CLIP=Object.create(Clipboard.prototype);
+ W.Clipboard=Clipboard;
+ n.clipboard=CLIP;
 })();
 /* --- gamepads, battery, vibration, entry types (VitaSurf) ---------------
  * The second batch. The Vita has buttons and a battery, but neither is

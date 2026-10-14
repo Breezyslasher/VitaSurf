@@ -36,7 +36,7 @@
  */
 (function(){
 var W=window;
-/* 297 interfaces, parents first */
+/* 301 interfaces, parents first */
 var TABLE=`AbortController|Object|c|0|1|
 EventTarget|Object|c|0|1|
 AbortSignal|EventTarget|i|0|1|
@@ -342,7 +342,11 @@ TrustedHTML|Object|i|0|1|
 TrustedScript|Object|i|0|1|
 TrustedScriptURL|Object|i|0|1|
 TrustedTypePolicy|Object|i|0|1|
-TrustedTypePolicyFactory|Object|i|0|1|`;
+TrustedTypePolicyFactory|Object|i|0|1|
+Permissions|Object|i|0|1|
+PermissionStatus|EventTarget|i|0|1|
+Clipboard|EventTarget|i|0|1|
+ClipboardItem|Object|r|1|1|`;
 var NODEP=W.Node&&W.Node.prototype;
 var fromPrelude=NV.__vitaFromPrelude||function(){return false;};
 var SHAPE=NV.__vitaShapeInterfaces;

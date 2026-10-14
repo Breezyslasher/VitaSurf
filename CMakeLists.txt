@@ -110,6 +110,7 @@ add_executable(${PROJECT_NAME}
     vita/platform/vita_file.c
     # SceNet and SceNetCtl bring-up.
     vita/platform/vita_net.c
+    vita/platform/vita_clipboard.c
     # Host name lookups on threads of their own, for the fetcher and
     # WebSockets, so that no lookup holds the browser up.
     vita/platform/vita_resolve.c
@@ -388,6 +389,8 @@ target_link_libraries(${PROJECT_NAME}
     SceProcessmgr_stub
     SceSysmem_stub
     SceAppMgr_stub
+    # the system clipboard (vita/platform/vita_clipboard.c)
+    SceClipboard_stub
 )
 
 # ---------------------------------------------------------------------------
