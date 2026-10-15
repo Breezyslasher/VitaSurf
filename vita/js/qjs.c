@@ -593,8 +593,24 @@ static struct {
 	   position in minified script says nothing by itself */
 	char code[100];
 	unsigned int hits;
+	/* what it took over from the place it displaced: hits less this
+	   are certainly its own */
+	unsigned int err;
 } prof[PROF_SLOTS];
 static unsigned int prof_n, prof_samples, prof_other;
+
+/*
+ * The same samples by script (VitaSurf): the innermost frame of the
+ * page's own code, its file. A page whose time is spread thin over a
+ * large bundle has no one place that stands out, and still has the
+ * script it is in.
+ */
+#define PROF_SCRIPTS 16
+static struct {
+	char file[100];
+	unsigned int hits, err;
+} prof_script[PROF_SCRIPTS];
+static unsigned int prof_script_n;
 static uint64_t prof_last_ms;
 static uint64_t prof_last_call_ms;	/* the interrupt check's last visit */
 static bool prof_busy;
@@ -671,23 +687,96 @@ static int prof_find(const char *key)
 	return -1;
 }
 
+/*
+ * A place not kept yet takes the slot of the least seen once the table
+ * is full, and that one's count with it (the Space-Saving count):
+ * the first 128 places were kept for good, so a page whose busiest code
+ * ran after another script had filled the table -- reddit.com's own
+ * bundle, after reCAPTCHA -- had its time counted nowhere.
+ */
 static void prof_add(const char *key, unsigned int weight, const char *code)
 {
 	int i = prof_find(key);
+	unsigned int least, j;
 
 	if (i >= 0) {
 		prof[i].hits += weight;
 		return;
 	}
 	if (prof_n < PROF_SLOTS) {
-		snprintf(prof[prof_n].where, sizeof(prof[0].where), "%s", key);
-		snprintf(prof[prof_n].code, sizeof(prof[0].code), "%s",
-			 code != NULL ? code : "");
-		prof[prof_n].hits = weight;
-		prof_n++;
+		least = prof_n++;
+		prof[least].hits = prof[least].err = 0;
 	} else {
-		prof_other += weight;
+		least = 0;
+		for (j = 1; j < PROF_SLOTS; j++) {
+			if (prof[j].hits < prof[least].hits) least = j;
+		}
+		prof[least].err = prof[least].hits;
+		prof_other++;
 	}
+	snprintf(prof[least].where, sizeof(prof[0].where), "%s", key);
+	snprintf(prof[least].code, sizeof(prof[0].code), "%s",
+		 code != NULL ? code : "");
+	prof[least].hits += weight;
+}
+
+/* The same count by script file. */
+static void prof_add_script(const char *file, size_t len, unsigned int weight)
+{
+	unsigned int i, least = 0;
+
+	if (len >= sizeof(prof_script[0].file))
+		len = sizeof(prof_script[0].file) - 1;
+	for (i = 0; i < prof_script_n; i++) {
+		if (strncmp(prof_script[i].file, file, len) == 0 &&
+		    prof_script[i].file[len] == '\0') {
+			prof_script[i].hits += weight;
+			return;
+		}
+		if (prof_script[i].hits < prof_script[least].hits) least = i;
+	}
+	if (prof_script_n < PROF_SCRIPTS) {
+		least = prof_script_n++;
+		prof_script[least].hits = prof_script[least].err = 0;
+	} else {
+		prof_script[least].err = prof_script[least].hits;
+	}
+	memcpy(prof_script[least].file, file, len);
+	prof_script[least].file[len] = '\0';
+	prof_script[least].hits += weight;
+}
+
+/* The file of the innermost frame that is the page's own code, from a
+ * stack text: "at name (file:line:col)" lines. */
+static void prof_note_script(const char *st, unsigned int weight)
+{
+	const char *l = st;
+
+	while (l != NULL && *l != '\0') {
+		const char *e = strchr(l, '\n');
+		size_t n = e != NULL ? (size_t)(e - l) : strlen(l);
+		const char *open = memchr(l, '(', n);
+
+		if (open != NULL && !prof_has(l, n, "<prelude") &&
+		    !prof_has(l, n, "(native)") &&
+		    !prof_has(l, n, "(missing)")) {
+			const char *end = l + n, *colon;
+			int colons = 0;
+
+			/* drop ":line:col)" from the end */
+			for (colon = end; colon > open && colons < 2; colon--) {
+				if (colon[-1] == ':') colons++;
+			}
+			if (colons == 2 && colon > open + 1) {
+				prof_add_script(open + 1,
+						(size_t)(colon - open - 1),
+						weight);
+				return;
+			}
+		}
+		l = e != NULL ? e + 1 : NULL;
+	}
+	prof_add_script("(no page script on the stack)", 29, weight);
 }
 
 static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
@@ -701,6 +790,7 @@ static void prof_sample(JSContext *ctx, unsigned int weight, bool in_c)
 	prof_busy = false;
 	if (st == NULL) return;
 	prof_samples += weight;
+	prof_note_script(st, weight);
 	prof_frame(st, key, 100);
 	l2 = strchr(st, '\n');
 	if (l2 != NULL && l2[1] != '\0') {
@@ -947,18 +1037,50 @@ void vita_js_report_profile(void)
 			}
 		}
 		if (!any) break;
-		vita_log("profile: %3u%% %s",
-			 prof[best].hits * 100u / prof_samples,
-			 prof[best].where);
+		if (prof[best].err > 0) {
+			vita_log("profile: %3u%%-%u%% %s",
+				 (prof[best].hits - prof[best].err) * 100u /
+				 prof_samples,
+				 prof[best].hits * 100u / prof_samples,
+				 prof[best].where);
+		} else {
+			vita_log("profile: %3u%% %s",
+				 prof[best].hits * 100u / prof_samples,
+				 prof[best].where);
+		}
 		if (prof[best].code[0] != '\0') {
 			vita_log("profile:       here: %s", prof[best].code);
 		}
 		prof[best].hits = 0;
 	}
 	if (prof_other > 0) {
-		vita_log("profile: %u samples fell outside the %u places kept",
+		vita_log("profile: %u places were seen after the %u kept were "
+			 "full, each taking the least seen one's slot and count "
+			 "(a range is what is certainly its own, and at most)",
 			 prof_other, (unsigned int)PROF_SLOTS);
 	}
+	/* and by script */
+	for (shown = 0; shown < 6; shown++) {
+		unsigned int i, best = 0;
+		bool any = false;
+
+		for (i = 0; i < prof_script_n; i++) {
+			if (prof_script[i].hits > 0 &&
+			    (!any || prof_script[i].hits >
+					prof_script[best].hits)) {
+				best = i;
+				any = true;
+			}
+		}
+		if (!any) break;
+		vita_log("profile: by script %3u%%%s %.100s",
+			 (prof_script[best].hits - prof_script[best].err) *
+				 100u / prof_samples,
+			 prof_script[best].err > 0 ? " or more" : "",
+			 prof_script[best].file);
+		prof_script[best].hits = 0;
+	}
+	prof_script_n = 0;
 	prof_n = 0;
 	prof_samples = 0;
 	prof_other = 0;

@@ -1,0 +1,158 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 1653353c3..45f067cd8 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -49,6 +49,8 @@
+ #include "netsurf/layout.h"
+ #include "netsurf/misc.h"
+ #include "content/hlcache.h"
++#include "content/llcache.h"
++#include "image/image_cache.h"
+ #include "content/content_factory.h"
+ #include "content/textsearch.h"
+ #include "desktop/frames.h"
+@@ -679,13 +681,30 @@ void html_memory_report(void)
+ 		unsigned in_doc = html_live_nodes((dom_node *) c->document);
+ 		unsigned own = dom_document_owned_nodes(c->document);
+ 
++		unsigned i, sheets = 0;
++		size_t sheet_bytes = 0;
++
++		/* the style sheets it has, parsed: a page of components
++		 * that each bring their own can hold a great many */
++		for (i = 0; i != c->stylesheet_count; i++) {
++			struct content *sc = c->stylesheets[i].sheet != NULL ?
++				hlcache_handle_get_content(
++					c->stylesheets[i].sheet) : NULL;
++
++			if (sc != NULL) {
++				sheets++;
++				sheet_bytes += sc->size;
++			}
++		}
+ 		nodes += in_doc;
+ 		owned += own;
+ 		vita_log("memory:   %.60s: %u nodes in its tree of %u it owns, "
+-			 "boxes %u KB, %s, %u users, %s", url, in_doc, own,
++			 "boxes %u KB, %u style sheets %u KB, %s, %u users, %s",
++			 url, in_doc, own,
+ 			 c->bctx != NULL ?
+ 				(unsigned) (talloc_total_size(c->bctx) / 1024) :
+ 				0,
++			 sheets, (unsigned) (sheet_bytes / 1024),
+ 			 c->jsthread != NULL ? "script running" : "no script",
+ 			 content_count_users(&c->base),
+ 			 c->base.status == CONTENT_STATUS_DONE ? "done" :
+@@ -700,6 +719,19 @@ void html_memory_report(void)
+ 		 nodes, owned > nodes ? owned - nodes : 0,
+ 		 (unsigned) dom_node_live_count() > owned ?
+ 			(unsigned) dom_node_live_count() - owned : 0);
++
++	/* and what the caches under every page hold */
++	{
++		uint32_t fetched = 0, objects = 0;
++		unsigned int bitmaps = 0;
++		size_t bitmap_bytes = image_cache_bitmap_bytes(&bitmaps);
++
++		llcache_memory(&fetched, &objects);
++		vita_log("memory: the fetch cache holds %u KB in %u objects, "
++			 "and decoded images %u KB in %u bitmaps",
++			 (unsigned) (fetched / 1024), (unsigned) objects,
++			 (unsigned) (bitmap_bytes / 1024), bitmaps);
++	}
+ }
+ 
+ static nserror
+diff --git a/content/handlers/image/image_cache.c b/content/handlers/image/image_cache.c
+index 71e935a7e..c074cec7c 100644
+--- a/content/handlers/image/image_cache.c
++++ b/content/handlers/image/image_cache.c
+@@ -1773,3 +1773,15 @@ content_type image_cache_content_type(void)
+ {
+ 	return CONTENT_IMAGE;
+ }
++
++/* exported interface documented in image_cache.h */
++size_t image_cache_bitmap_bytes(unsigned int *count)
++{
++	if (image_cache == NULL) {
++		*count = 0;
++		return 0;
++	}
++	*count = image_cache->bitmap_count > 0 ?
++		(unsigned int) image_cache->bitmap_count : 0;
++	return image_cache->total_bitmap_size;
++}
+diff --git a/content/handlers/image/image_cache.h b/content/handlers/image/image_cache.h
+index 9433131b3..b41b17bd2 100644
+--- a/content/handlers/image/image_cache.h
++++ b/content/handlers/image/image_cache.h
+@@ -69,6 +69,14 @@ struct image_cache_parameters {
+ nserror image_cache_init(const struct image_cache_parameters *image_cache_parameters);
+ nserror image_cache_fini(void);
+ 
++/**
++ * The bitmaps decoded images hold now (VitaSurf), for the memory report.
++ *
++ * \param count  Updated to the number of them
++ * \return their size in bytes
++ */
++size_t image_cache_bitmap_bytes(unsigned int *count);
++
+ /** adds an image content to be cached. 
+  * 
+  * @param content The content handle used as a key
+diff --git a/content/llcache.c b/content/llcache.c
+index 43e39f068..22fa6c3be 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -3931,6 +3931,29 @@ static void llcache_users_not_caught_up(void)
+  * Public API								      *
+  ******************************************************************************/
+ 
++/* exported interface documented in llcache.h */
++void llcache_memory(uint32_t *bytes, uint32_t *objects)
++{
++	llcache_object *object;
++	uint32_t b = 0, n = 0;
++	int pass;
++
++	if (llcache != NULL) {
++		for (pass = 0; pass < 2; pass++) {
++			object = pass == 0 ? llcache->cached_objects :
++				llcache->uncached_objects;
++			for (; object != NULL; object = object->next) {
++				b += sizeof(*object);
++				if (object->source_data != NULL)
++					b += object->source_alloc;
++				n++;
++			}
++		}
++	}
++	*bytes = b;
++	*objects = n;
++}
++
+ /*
+  * Attempt to clean the cache
+  *
+diff --git a/content/llcache.h b/content/llcache.h
+index 7afedb5de..ae8dfa226 100644
+--- a/content/llcache.h
++++ b/content/llcache.h
+@@ -200,6 +200,15 @@ void llcache_finalise(void);
+  */
+ void llcache_clean(bool purge);
+ 
++/**
++ * What the low-level cache holds (VitaSurf): every object, cached or
++ * not, and the buffers their fetched data is in, for the memory report.
++ *
++ * \param bytes    Updated to the bytes held
++ * \param objects  Updated to the number of objects
++ */
++void llcache_memory(uint32_t *bytes, uint32_t *objects);
++
+ /**
+  * Retrieve a handle for a low-level cache object
+  *
