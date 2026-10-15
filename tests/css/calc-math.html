@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<!--
+  CSS math functions, as the Values and Units specification has them and
+  Chrome gives them (VitaSurf).
+
+  libcss's fixed-point add and subtract took every sum of a negative and
+  a positive, and every difference of two negatives, for an overflow and
+  answered INT_MAX: calc(-10px + 30px) was 2097151px, and MDN laid its
+  page out that wide, with nothing on the screen but its header. Each
+  line must say PASS. The box is 400px wide, its font 20px, the root's
+  16px; vw is read from the window.
+-->
+<html><head><meta charset="utf-8"><title>CSS math functions</title>
+<style>
+html { font-size: 16px; }
+body { margin: 0; }
+#box { position: relative; width: 400px; font-size: 20px; }
+#box > div { height: 4px; }
+.grid { display: grid; width: 400px; }
+</style></head>
+<body>
+<div id="box"></div>
+<pre id="out"></pre>
+<script>
+var W = window.innerWidth, vw = W / 100;
+/* [expression, expected px] as margin-left, which may be negative */
+var margins = [
+  ['calc(10px + 20px)', 30],
+  ['calc(10px - 30px)', -20],
+  ['calc(-10px + 30px)', 20],
+  ['calc(-10px - 5px)', -15],
+  ['calc(-10px - -5px)', -5],
+  ['calc(50% - 250px)', -50],
+  ['calc(50% - 250px + 1rem)', -34],
+  ['calc(2 * 15px)', 30],
+  ['calc(15px * -2)', -30],
+  ['calc(100px / 4)', 25],
+  ['calc(-100px / 4 + 50px)', 25],
+  ['calc(1em + 1rem)', 36],
+  ['calc(1em - 2rem)', -12],
+  ['calc((10px + 20px) * 2)', 60],
+  ['calc(10px + 20px * 2)', 50],
+  ['calc(10px - (5px - 20px))', 25],
+  ['calc(-1 * (10px - 30px))', 20],
+  ['calc(100% - (2 * 1rem + 10px))', 358],
+  ['calc(0.5 * 100%)', 200],
+  ['min(10px, 20px)', 10],
+  ['min(-10px, 5px)', -10],
+  ['max(-10px, -20px)', -10],
+  ['max(1rem, calc(-50px + 1rem))', 16],
+  ['min(50%, 100px + 50px)', 150],
+  ['clamp(10px, 50%, 100px)', 100],
+  ['clamp(10px, -5px, 100px)', 10],
+  ['clamp(-20px, -50px, 100px)', -20],
+  ['calc(min(10px, 5%) + max(-5px, -10px))', 5],
+  ['abs(-30px)', 30],
+  ['calc(10px * sign(-5px))', -10],
+  ['mod(-18px, 5px)', 2],
+  ['rem(-18px, 5px)', -3],
+  ['round(17px, 5px)', 15],
+  ['round(up, 17px, 5px)', 20],
+  ['round(down, -17px, 5px)', -20],
+  ['round(to-zero, -17px, 5px)', -15],
+  ['calc(50vw - 720px + 1rem)', Math.floor(W / 2 - 720 + 16)],
+  ['max(1rem, calc(50vw - 720px + 1rem))', Math.max(16, Math.floor(W / 2 - 720 + 16))],
+  ['calc(-50vw + 10px + 50vw)', 10]
+];
+/* as a width, which a negative result leaves at 0 */
+var widths = [
+  ['calc(-10px + 30px)', 20],
+  ['calc(10px - 30px)', 0],
+  ['calc(-10px - -45px)', 35],
+  ['max(-10px, calc(-5px + 25px))', 20]
+];
+var box = document.getElementById('box'), rows = [];
+margins.forEach(function (m) {
+  var d = document.createElement('div');
+  d.style.cssText = 'margin-left:' + m[0];
+  box.appendChild(d); rows.push(['margin-left: ' + m[0], d, m[1], 'left']);
+});
+widths.forEach(function (m) {
+  var d = document.createElement('div');
+  d.style.cssText = 'width:' + m[0];
+  box.appendChild(d); rows.push(['width: ' + m[0], d, m[1], 'width']);
+});
+/* a font size, read back from the computed style */
+var f = document.createElement('div');
+f.style.cssText = 'font-size:calc(-2px + 18px)';
+box.appendChild(f);
+/* grid tracks */
+var tracks = [['calc(-10px + 30px) 1fr', 20], ['max(16px, calc(50vw - 720px + 16px)) 1fr', Math.max(16, Math.floor(W / 2 - 720 + 16))],
+              ['calc(100% - 350px) 1fr', 50]];
+tracks.forEach(function (t) {
+  var g = document.createElement('div'), c = document.createElement('div'), c2 = document.createElement('div');
+  g.className = 'grid'; g.style.gridTemplateColumns = t[0];
+  g.appendChild(c); g.appendChild(c2); document.body.insertBefore(g, document.getElementById('out'));
+  rows.push(['grid track ' + t[0], c2, t[1], 'gridleft']);
+});
+setTimeout(function () {
+  var out = [], left = box.getBoundingClientRect().left;
+  rows.forEach(function (r) {
+    var b = r[1].getBoundingClientRect(), got;
+    if (r[3] === 'left') got = Math.round(b.left - left);
+    else if (r[3] === 'width') got = Math.round(b.width);
+    else got = Math.round(b.left - r[1].parentNode.getBoundingClientRect().left);
+    out.push((got === r[2] ? 'PASS ' : 'FAIL ') + r[0] + (got === r[2] ? '' : ': ' + got + ', want ' + r[2]));
+  });
+  var fs = getComputedStyle(f).fontSize;
+  out.push((fs === '16px' ? 'PASS ' : 'FAIL ') + 'font-size: calc(-2px + 18px)' + (fs === '16px' ? '' : ': ' + fs));
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('calc-math: ' + l); });
+  console.log('calc-math: done');
+}, 300);
+</script>
+</body></html>

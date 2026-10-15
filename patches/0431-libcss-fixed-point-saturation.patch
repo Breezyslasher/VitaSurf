@@ -1,0 +1,55 @@
+diff --git a/include/libcss/fpmath.h b/include/libcss/fpmath.h
+index a080fc1..7173801 100644
+--- a/include/libcss/fpmath.h
++++ b/include/libcss/fpmath.h
+@@ -22,11 +22,19 @@ extern "C"
+ /* type for fixed point numbers */
+ typedef int32_t css_fixed;
+ 
++/*
++ * Saturating add and subtract. The arithmetic is unsigned, as the
++ * idiom needs (VitaSurf): with int32_t, ux >> 31 is -1 for a negative x,
++ * so the "overflowed result" lost x's sign bit, and every sum of a
++ * negative and a positive (calc(50vw - 720px + 1rem) at 800px) and
++ * every difference of two negatives was taken for an overflow and came
++ * out as INT_MAX - 1. MDN laid its page out 2097151px wide.
++ */
+ static inline css_fixed
+ css_add_fixed(const css_fixed x, const css_fixed y) {
+-	int32_t ux = x;
+-	int32_t uy = y;
+-	int32_t res = ux + uy;
++	uint32_t ux = (uint32_t) x;
++	uint32_t uy = (uint32_t) y;
++	uint32_t res = ux + uy;
+ 
+ 	/* Calculate overflowed result. (Don't change the sign bit of ux) */
+ 	ux = (ux >> 31) + INT_MAX;
+@@ -36,14 +44,14 @@ css_add_fixed(const css_fixed x, const css_fixed y) {
+ 		res = ux;
+ 	}
+ 
+-	return res;
++	return (css_fixed) res;
+ }
+ 
+ static inline css_fixed
+ css_subtract_fixed(const css_fixed x, const css_fixed y) {
+-	int32_t ux = x;
+-	int32_t uy = y;
+-	int32_t res = ux - uy;
++	uint32_t ux = (uint32_t) x;
++	uint32_t uy = (uint32_t) y;
++	uint32_t res = ux - uy;
+ 
+ 	ux = (ux >> 31) + INT_MAX;
+ 
+@@ -52,7 +60,7 @@ css_subtract_fixed(const css_fixed x, const css_fixed y) {
+ 		res = ux;
+ 	}
+ 
+-	return res;
++	return (css_fixed) res;
+ }
+ 
+ static inline css_fixed
