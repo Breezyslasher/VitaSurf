@@ -1,0 +1,63 @@
+diff --git a/quickjs.c b/quickjs.c
+index bcb3681..fd2491b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -18003,6 +18003,9 @@ static bool needs_backtrace(JSValue exc)
+     return !find_own_property1(p, JS_ATOM_stack);
+ }
+ 
++static JSValue js_string_charCodeAt(JSContext *ctx, JSValueConst this_val,
++                                     int argc, JSValueConst *argv);
++
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+@@ -18545,6 +18548,48 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 call_argc = get_u16(pc);
+                 pc += 2;
+                 call_argv = sp - call_argc;
++                /*
++                 * str.charCodeAt(i) with the built-in itself, a flat
++                 * string and an integer index, read here (VitaSurf):
++                 * through the call it was half the time of a loop that
++                 * hashes or decodes a string a character at a time,
++                 * which styled-components, reCAPTCHA and every
++                 * obfuscated decoder do. Anything else takes the call.
++                 */
++                if (call_argc == 1 && opcode == OP_call_method &&
++                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_INT &&
++                    JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
++                    (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_STRING ||
++                     JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_STRING_ROPE)) {
++                    JSObject *fo = JS_VALUE_GET_OBJ(call_argv[-1]);
++                    JSValueConst sv = call_argv[-2];
++
++                    /* a rope flattened once keeps the flat string on
++                       its left and an empty one on its right */
++                    if (JS_VALUE_GET_TAG(sv) == JS_TAG_STRING_ROPE) {
++                        JSStringRope *rp = JS_VALUE_GET_STRING_ROPE(sv);
++
++                        if (JS_VALUE_GET_TAG(rp->left) == JS_TAG_STRING &&
++                            JS_VALUE_GET_TAG(rp->right) == JS_TAG_STRING &&
++                            JS_VALUE_GET_STRING(rp->right)->len == 0)
++                            sv = rp->left;
++                    }
++                    if (JS_VALUE_GET_TAG(sv) == JS_TAG_STRING &&
++                        fo->class_id == JS_CLASS_C_FUNCTION &&
++                        fo->u.cfunc.c_function.generic ==
++                        (JSCFunction *)js_string_charCodeAt) {
++                        JSString *str = JS_VALUE_GET_STRING(sv);
++                        int idx = JS_VALUE_GET_INT(call_argv[0]);
++
++                        ret_val = (idx < 0 || idx >= str->len) ? JS_NAN :
++                            js_int32(string_get(str, idx));
++                        JS_FreeValue(ctx, call_argv[-1]);
++                        JS_FreeValue(ctx, call_argv[-2]);
++                        sp -= 3;
++                        *sp++ = ret_val;
++                        BREAK;
++                    }
++                }
+                 sf->cur_pc = pc;
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                           JS_UNDEFINED, call_argc,
