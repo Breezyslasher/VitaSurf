@@ -16,6 +16,15 @@ within the six seconds: the ticks come back, and the log says "carries
 on after N ms frozen". Chrome unloads /a once /b commits, so its ticks
 stop the same way; it shows /b's start where NetSurf keeps /a on the
 screen until /b is ready.
+
+/slow waits four seconds before it answers at all, so nothing commits
+until then. Go to /a, then to /slow: the browser began that load, and /a
+is frozen from its start, not its commit, so the ticks stop within a
+quarter of a second of "slow asked" and none come before "slow answered"
+(NetSurf runs a page's script on the one thread the new load needs).
+Go to /a-self instead, a page whose own script sends it to /slow after
+a second: the ticks go on through the four seconds, since a navigation a
+page asked for leaves it running until the commit, as Chrome does.
 """
 import http.server, socketserver, sys, time
 
@@ -30,6 +39,9 @@ setInterval(function () {
   fetch('/tick?n=' + n).catch(function () {});
 }, 100);
 </script>'''
+
+
+A_SELF = A.replace(b'</script>', b'setTimeout(function () { location.href = "/slow"; }, 1000);\n</script>')
 
 
 class H(http.server.BaseHTTPRequestHandler):
@@ -51,6 +63,22 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(A)))
             self.end_headers()
             self.wfile.write(A)
+        elif path == '/a-self':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', str(len(A_SELF)))
+            self.end_headers()
+            self.wfile.write(A_SELF)
+        elif path == '/slow':
+            print('%.2f slow asked' % (time.time() - T0), flush=True)
+            time.sleep(4)
+            print('%.2f slow answered' % (time.time() - T0), flush=True)
+            body = b'<!DOCTYPE html><title>Slow</title><p>slow page'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif path == '/b':
             print('%.2f b asked' % (time.time() - T0), flush=True)
             self.send_response(200)

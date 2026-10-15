@@ -1,0 +1,46 @@
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+index 59d771acd..5f492d28b 100644
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -464,7 +464,10 @@ nserror browser_window__reload_current_parameters(struct browser_window *bw);
+  * on the screen; NetSurf keeps it current until the next page is ready,
+  * and its timers, sockets and requests went on running through the
+  * whole of that page's load. Frozen, they wait; if the load is given up
+- * and the page stays, they carry on.
++ * and the page stays, they carry on. A load the browser began itself
++ * (no referrer, not a page's script) freezes the page from its start,
++ * not its commit: the page is going, and its script would hold the one
++ * thread the new page's load runs on.
+  *
+  * \param bw  the window the page's script belongs to
+  * \param c   the page's content
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 461e0b307..acc9643c1 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -5292,6 +5292,25 @@ bool browser_window_scripts_frozen(struct browser_window *bw,
+ 		    hlcache_handle_get_content(w->loading_content) != c) {
+ 			return true;
+ 		}
++		/*
++		 * From the start of a load the browser began itself --
++		 * typed, a menu, a bookmark, history: no referrer, and no
++		 * page's script -- not only from its commit (VitaSurf). The
++		 * page being left goes whatever it does, and here it runs
++		 * on the one thread the load needs: nytimes.com, left for
++		 * github.com, ran a timer of 59 s before the new page's
++		 * answer could be read, and five sites in a row timed out
++		 * behind it. A navigation a page's script asked for leaves
++		 * it running until the commit, as before.
++		 */
++		if (w->loading_content != NULL &&
++		    w->loading_parameters.url != NULL &&
++		    w->loading_parameters.referrer == NULL &&
++		    (w->loading_parameters.flags & BW_NAVIGATE_SCRIPT) == 0 &&
++		    w->current_content != NULL &&
++		    hlcache_handle_get_content(w->loading_content) != c) {
++			return true;
++		}
+ 	}
+ 	return false;
+ }
