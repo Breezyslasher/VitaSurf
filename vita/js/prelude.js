@@ -152,10 +152,32 @@ var GLOBAL_ATTRS=(' accessKey autocapitalize autocorrect autofocus contentEditab
 function GAP(name,fn){return function(){
  try{if(typeof NV.__vitaGap==='function')NV.__vitaGap(name);}catch(e){}
  return fn?fn.apply(this,arguments):undefined;};}
+/* both answers kept by name (VitaSurf): each was a search of a long
+   string, at every read of href or src */
+var REFLECT_PROP=Object.create(null),REFLECT_TAG=Object.create(null);
 function reflectsOn(el,prop){
- if(GLOBAL_ATTRS.indexOf(' '+prop+' ')>=0)return true;
+ var r=REFLECT_PROP[prop];
+ if(r===undefined)r=REFLECT_PROP[prop]=GLOBAL_ATTRS.indexOf(' '+prop+' ')>=0;
+ if(r)return true;
  var t=el.tagName;
- return t!==undefined&&HTML_TAGS.indexOf(' '+t+' ')>=0;}
+ if(t===undefined)return false;
+ r=REFLECT_TAG[t];
+ if(r===undefined)r=REFLECT_TAG[t]=HTML_TAGS.indexOf(' '+t+' ')>=0;
+ return r;}
+/* A URL attribute's value resolved against the base, kept while the base
+ * is the same (VitaSurf). A module preloader compares each module with
+ * every <link>'s href, and each read parsed the URL again: nytimes.com
+ * read hrefs for a fifth of its script. At most 4096 kept. */
+var URL_RESOLVED=new Map(),URL_RESOLVED_BASE=null;
+function resolveURL(v){
+ var b=D.baseURI,r;
+ if(b!==URL_RESOLVED_BASE){URL_RESOLVED.clear();URL_RESOLVED_BASE=b;}
+ r=URL_RESOLVED.get(v);
+ if(r!==undefined)return r;
+ try{r=new URL(v,b).href;}catch(e){r=v;}
+ if(URL_RESOLVED.size>=4096)URL_RESOLVED.clear();
+ URL_RESOLVED.set(v,r);
+ return r;}
 Object.defineProperty(P,'style',{configurable:true,get:function(){return priv(this,'__style',function(){return {getPropertyValue:function(){return '';},setProperty:function(){},removeProperty:function(){},cssText:''};});}});
 Object.defineProperty(P,'dataset',{configurable:true,get:function(){return priv(this,'__dataset',function(){return {};});}});
 Object.defineProperty(P,'classList',{configurable:true,get:function(){var el=this;return {contains:function(c){return (' '+el.className+' ').indexOf(' '+c+' ')>=0;},add:function(){for(var i=0;i<arguments.length;i++){if(!this.contains(arguments[i]))el.className=(el.className?el.className+' ':'')+arguments[i];}},remove:function(){for(var i=0;i<arguments.length;i++){el.className=(' '+el.className+' ').split(' '+arguments[i]+' ').join(' ').trim();}},toggle:function(c,f){var h=this.contains(c);if(f===undefined)f=!h;if(f&&!h)this.add(c);else if(!f&&h)this.remove(c);return f;},get length(){return el.className?el.className.split(/\s+/).length:0;}};}});
@@ -197,7 +219,7 @@ var NUMERIC_SIZE=' CANVAS IMG VIDEO ';
   if(!reflectsOn(this,a))return undefined;
   var v=this.getAttribute(a);
   if(v===null||v==='')return '';
-  try{return new URL(v,D.baseURI).href;}catch(e){return v;}
+  return resolveURL(v);
  },set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(a,String(v));}});});
 ['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{configurable:true,get:function(){if(!reflectsOn(this,a))return undefined;return this.hasAttribute(attr);},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
 /* Layout geometry. NV.__vitaBox(node) (qjs.c) returns the element's laid-out
@@ -5951,12 +5973,19 @@ HTMLCollection.prototype[Symbol.iterator]=function(){
 /* Only these tags answer to their name attribute in a collection. */
 var NAMED_TAGS=(' A APPLET AREA EMBED FORM FRAME FRAMESET IFRAME IMG '+
  'OBJECT ');
+/* an array index, by its characters (VitaSurf): a regular expression
+   at every read of a collection's item was a good part of a loop over
+   one */
 function indexKey(k){
  if(typeof k!=='string')return -1;
- if(k==='0')return 0;
- if(!/^[1-9][0-9]*$/.test(k))return -1;
- var n=+k;
- return n<=0xfffffffe?n:-1;}
+ var n=k.length,c,i;
+ if(n===0||n>10)return -1;
+ c=k.charCodeAt(0);
+ if(c===48)return n===1?0:-1;
+ if(c<49||c>57)return -1;
+ for(i=1;i<n;i++){c=k.charCodeAt(i);if(c<48||c>57)return -1;}
+ c=+k;
+ return c<=0xfffffffe?c:-1;}
 /* The collection is a proxy so that an index or a name is resolved when
    it is read, which is what makes it live. */
 function liveCollection(items,proto,shapeOnly){
