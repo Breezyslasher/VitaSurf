@@ -4704,15 +4704,23 @@ function splitWS(v){
   return v.split(' ');
  return v.split(/[ \t\r\n\f]+/);}
 /* The attribute as an ordered set: split on whitespace, first occurrence
-   of each token wins. */
-TokenList.prototype._t=function(){
+   of each token wins. Kept with the text it came from (VitaSurf): every
+   contains(), add() and remove() read the attribute and split it again,
+   and that was a fifth of cnn.com's script. _tok() is the kept list,
+   not to be changed; _t() a copy the caller may change. */
+TokenList.prototype._tok=function(){
  if(!this._e)return this._own||(this._own=[]);
  var v=this._e.getAttribute(this._a);
- var out=[],seen={},parts=v?splitWS(String(v)):[],i;
+ if(this._ks===v&&this._kt)return this._kt;
+ var out=[],seen=new Set(),parts=v?splitWS(String(v)):[],i;
  for(i=0;i<parts.length;i++){
-  if(parts[i]===''||Object.prototype.hasOwnProperty.call(seen,parts[i]))continue;
-  seen[parts[i]]=1;out.push(parts[i]);}
+  if(parts[i]===''||seen.has(parts[i]))continue;
+  seen.add(parts[i]);out.push(parts[i]);}
+ if(this._kt===undefined){hide(this,'_ks',v);hide(this,'_kt',out);}
+ else{this._ks=v;this._kt=out;}
  return out;};
+TokenList.prototype._t=function(){
+ var t=this._tok();return this._e?t.slice():t;};
 /* The update steps write the attribute whether or not the set changed,
    and an observer sees a record for each write. The one case that
    writes nothing is an element that has no such attribute and no tokens
@@ -4730,8 +4738,8 @@ TokenList.prototype._w=function(t){
   if(i<t.length)this[i]=t[i];else delete this[i];}
  this.length=t.length;};
 TokenList.prototype.item=function(i){
- var t=this._t();i=Number(i)||0;return t[i]===undefined?null:t[i];};
-TokenList.prototype.contains=function(c){return this._t().indexOf(String(c))>=0;};
+ var t=this._tok();i=Number(i)||0;return t[i]===undefined?null:t[i];};
+TokenList.prototype.contains=function(c){return this._tok().indexOf(String(c))>=0;};
 TokenList.prototype.add=function(){
  var i,t;
  for(i=0;i<arguments.length;i++)tokenCheck(arguments[i]);
@@ -4797,6 +4805,7 @@ TokenList.prototype.entries=function(){return this._t().map(function(v,i){return
 TokenList.prototype[Symbol.iterator]=TokenList.prototype.values;
 TokenList.prototype.toString=function(){return this.value;};
 hide(TokenList.prototype,'_t',TokenList.prototype._t);
+hide(TokenList.prototype,'_tok',TokenList.prototype._tok);
 hide(TokenList.prototype,'_w',TokenList.prototype._w);
 Object.defineProperty(TokenList.prototype,'value',{configurable:true,
  get:function(){return this._e?(this._e.getAttribute(this._a)||''):this._t().join(' ');},
@@ -6232,8 +6241,15 @@ function styleOf(e){
  var l=parseDecl(s),ix=new Map(),i;
  for(i=0;i<l.length;i++)ix.set(l[i][0],i);
  c={s:s,l:l,ix:ix};STYLE_PARSED.set(e,c);return c;}
-function declText(d){var v=closeValue(d[1]);
- return d[0]+': '+(v===null?d[1]:v)+(d[2]?' !'+d[2]:'')+';';}
+/* A declaration's text, kept on it (VitaSurf): a value changed in place
+   writes the attribute out again, every declaration of it, and each was
+   read a character at a time to close what it left open; an element
+   holding a theme's hundreds of variables did that for every one set.
+   A declaration is replaced, not changed, so what is kept stays true. */
+function declText(d){
+ if(d[3]!==undefined)return d[3];
+ var v=closeValue(d[1]);
+ return d[3]=d[0]+': '+(v===null?d[1]:v)+(d[2]?' !'+d[2]:'')+';';}
 CSSStyleDeclaration.prototype._d=function(){
  return this._e?styleOf(this._e).l:(this._own||(this._own=[]));};
 CSSStyleDeclaration.prototype._w=function(list){
@@ -6401,7 +6417,7 @@ RuleStyle.prototype.setProperty=function(p,v,pri){p=String(p);if(p.slice(0,2)!==
  v=v==null?'':String(v);
  if(v===''){this.removeProperty(p);return;}
  var imp=String(pri||'').toLowerCase()==='important';
- for(var i=0;i<this._d.length;i++)if(this._d[i][0]===p){this._d[i][1]=v;this._d[i][2]=imp;sheetDirty(this._rule);return;}
+ for(var i=0;i<this._d.length;i++)if(this._d[i][0]===p){this._d[i][1]=v;this._d[i][2]=imp;this._d[i][3]=undefined;sheetDirty(this._rule);return;}
  this._d.push([p,v,imp]);sheetDirty(this._rule);};
 RuleStyle.prototype.removeProperty=function(p){p=String(p);var old=this.getPropertyValue(p);
  var before=this._d.length;this._d=this._d.filter(function(d){return d[0]!==p;});

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<!--
+  Computed style before the first layout, from STYLEs a script adds and
+  changes (VitaSurf).
+
+  Before the page's first layout getComputedStyle selects against an
+  early context built from the sheets so far, and every STYLE not yet
+  converted is parsed for it from its text. Each context was built from
+  nothing, every such STYLE parsed again; they are kept now from one
+  context to the next while their text is unchanged (html_css_sheet_now's
+  early cache). A STYLE whose text changes, that leaves the document, or
+  whose media no longer applies must still be read as it is now. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Early computed style</title></head>
+<body>
+<div id="t" class="a">t</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+var t = document.getElementById('t');
+function colour() { return getComputedStyle(t).color; }
+var s1 = document.createElement('style');
+s1.textContent = '.a { color: rgb(10, 0, 0) }';
+document.head.appendChild(s1);
+ok('a STYLE a script adds applies', colour(), 'rgb(10, 0, 0)');
+var s2 = document.createElement('style');
+s2.textContent = '.a { margin-left: 7px }';
+document.head.appendChild(s2);
+ok('the first still applies once a second is added', colour(), 'rgb(10, 0, 0)');
+ok('and the second', getComputedStyle(t).marginLeft, '7px');
+s1.textContent = '.a { color: rgb(20, 0, 0) }';
+ok('a STYLE whose text changed is read as it is now', colour(), 'rgb(20, 0, 0)');
+s1.firstChild.data = '.a { color: rgb(30, 0, 0) }';
+ok('and when its text node changes', colour(), 'rgb(30, 0, 0)');
+s1.remove();
+ok('a STYLE that left the document no longer applies', colour(), 'rgb(0, 0, 0)');
+document.head.appendChild(s1);
+ok('and applies again when it comes back', colour(), 'rgb(30, 0, 0)');
+s1.media = 'print';
+ok('nor when its media no longer applies', colour(), 'rgb(0, 0, 0)');
+s1.media = '';
+for (var i = 0; i < 30; i++) {
+  var s = document.createElement('style');
+  s.textContent = '.a { color: rgb(' + (100 + i) + ', 0, 0) }';
+  document.head.appendChild(s);
+  if (colour() !== 'rgb(' + (100 + i) + ', 0, 0)') break;
+}
+ok('thirty more, each read as it is added', i, 30);
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('early-style-cache: ' + l); });
+console.log('early-style-cache: done');
+</script>
+</body></html>

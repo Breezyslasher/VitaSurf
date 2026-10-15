@@ -1,0 +1,238 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 4a520ad97..cc001c762 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -1501,14 +1501,111 @@ read_file:
+  * and a built-in sheet whose data has arrived. A LINK still loading is
+  * left out, as it has nothing to read yet.
+  */
+-static css_stylesheet *html_css_sheet_now(html_content *c, uint32_t i)
++/**
++ * A STYLE parsed for an early selection context, kept for the next
++ * (VitaSurf). Each context was built from nothing, every STYLE still
++ * waiting to be converted parsed again from its text: those are every
++ * one a long script adds, since the conversions wait for the scheduler,
++ * and reddit.com's computed style reads took 1.6 s each, 19% of its
++ * script. A sheet is kept while its element's text is what it was
++ * parsed from, and let go by the first build that does not use it.
++ */
++struct html_early_sheet {
++	struct dom_node *node;
++	char *text;
++	size_t len;
++	css_stylesheet *sheet;
++	bool used;
++};
++
++static void early_sheet_free(struct html_early_sheet *e)
++{
++	css_stylesheet_destroy(e->sheet);
++	free(e->text);
++	dom_node_unref(e->node);
++}
++
++/** The element's sheet parsed from this text, kept or parsed now. */
++static css_stylesheet *early_sheet(html_content *c, struct dom_node *node,
++		const uint8_t *data, size_t len)
++{
++	struct html_early_sheet *e;
++	css_stylesheet *sheet;
++	unsigned int k;
++
++	for (k = 0; k < c->early_cache_n; k++) {
++		e = &c->early_cache[k];
++		if (e->node != node)
++			continue;
++		if (e->len == len && memcmp(e->text, data, len) == 0) {
++			e->used = true;
++			return e->sheet;
++		}
++		/* its text changed: no context holds the old sheet, as the
++		 * last one was dropped before this build */
++		early_sheet_free(e);
++		c->early_cache[k] = c->early_cache[--c->early_cache_n];
++		break;
++	}
++
++	sheet = html_css_parse_now(c, data, len);
++	if (sheet == NULL)
++		return NULL;
++	if (c->early_cache_n == c->early_cache_alloc) {
++		unsigned int n = c->early_cache_alloc ?
++				c->early_cache_alloc * 2 : 16;
++		struct html_early_sheet *grown = realloc(c->early_cache,
++				n * sizeof(*grown));
++
++		if (grown == NULL) {
++			css_stylesheet_destroy(sheet);
++			return NULL;
++		}
++		c->early_cache = grown;
++		c->early_cache_alloc = n;
++	}
++	e = &c->early_cache[c->early_cache_n];
++	e->text = malloc(len > 0 ? len : 1);
++	if (e->text == NULL) {
++		css_stylesheet_destroy(sheet);
++		return NULL;
++	}
++	memcpy(e->text, data, len);
++	e->len = len;
++	e->node = dom_node_ref(node);
++	e->sheet = sheet;
++	e->used = true;
++	c->early_cache_n++;
++	return sheet;
++}
++
++/* exported function documented in html/css.h */
++void html_css_early_cache_free(struct html_content *c)
++{
++	unsigned int k;
++
++	for (k = 0; k < c->early_cache_n; k++)
++		early_sheet_free(&c->early_cache[k]);
++	free(c->early_cache);
++	c->early_cache = NULL;
++	c->early_cache_n = c->early_cache_alloc = 0;
++}
++
++/**
++ * Parse sheet i now, for an early selection context. *kept says the
++ * sheet is the early cache's, not the caller's to destroy.
++ */
++static css_stylesheet *html_css_sheet_now(html_content *c, uint32_t i,
++		bool *kept)
+ {
+ 	const struct html_stylesheet *hsheet = &c->stylesheets[i];
+ 	css_stylesheet *sheet = NULL;
+ 
++	*kept = false;
+ 	if (hsheet->node != NULL && !hsheet->is_link) {
++		*kept = true;
+ 		if (hsheet->override != NULL) {
+-			sheet = html_css_parse_now(c,
++			sheet = early_sheet(c, hsheet->node,
+ 					(const uint8_t *) hsheet->override,
+ 					strlen(hsheet->override));
+ 		} else {
+@@ -1516,7 +1613,7 @@ static css_stylesheet *html_css_sheet_now(html_content *c, uint32_t i)
+ 
+ 			if (dom_node_get_text_content(hsheet->node, &text) ==
+ 					DOM_NO_ERR && text != NULL) {
+-				sheet = html_css_parse_now(c,
++				sheet = early_sheet(c, hsheet->node,
+ 						(const uint8_t *)
+ 						dom_string_data(text),
+ 						dom_string_byte_length(text));
+@@ -1554,9 +1651,13 @@ html_css_build_selection_context(html_content *c,
+ 	css_select_ctx *select_ctx;
+ 
+ 	if (early) {
++		unsigned int k;
++
+ 		*owned = NULL;
+ 		*n_owned = 0;
+ 		html_css_set_root_hints(c);
++		for (k = 0; k < c->early_cache_n; k++)
++			c->early_cache[k].used = false;
+ 	}
+ 
+ 	/* check that the base stylesheet loaded; layout fails without it */
+@@ -1606,8 +1707,10 @@ html_css_build_selection_context(html_content *c,
+ 		      !hsheet->is_link)) {
+ 			sheet = nscss_get_stylesheet(hsheet->sheet);
+ 		} else if (early) {
+-			sheet = html_css_sheet_now(c, i);
+-			if (sheet != NULL) {
++			bool kept = false;
++
++			sheet = html_css_sheet_now(c, i, &kept);
++			if (sheet != NULL && !kept) {
+ 				css_stylesheet **grown = realloc(*owned,
+ 						(*n_owned + 1) *
+ 						sizeof(**owned));
+@@ -1642,6 +1745,21 @@ html_css_build_selection_context(html_content *c,
+ 		}
+ 	}
+ 
++	/* the kept sheets this context did not take: their STYLEs are
++	   converted now, or gone */
++	if (early) {
++		unsigned int k = 0;
++
++		while (k < c->early_cache_n) {
++			if (c->early_cache[k].used) {
++				k++;
++				continue;
++			}
++			early_sheet_free(&c->early_cache[k]);
++			c->early_cache[k] = c->early_cache[--c->early_cache_n];
++		}
++	}
++
+ 	/*
+ 	 * Build the merged selector index now rather than on the first
+ 	 * element, so that its cost is timed and logged (VitaSurf). If
+diff --git a/content/handlers/html/css.h b/content/handlers/html/css.h
+index 985b56146..586fa8121 100644
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -84,6 +84,12 @@ unsigned int html_css_unused_in_flight(struct html_content *c);
+ /** Destroy the sheets html_css_early_selection_context parsed (VitaSurf). */
+ void html_css_free_owned(css_stylesheet **owned, unsigned int n_owned);
+ 
++/**
++ * Let go of the STYLEs parsed for early selection contexts (VitaSurf),
++ * once no early context is left that holds them.
++ */
++void html_css_early_cache_free(struct html_content *c);
++
+ /**
+  * Initialise core stylesheets for a content
+  *
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index a026b7270..5817aff85 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -555,6 +555,7 @@ void html_finish_conversion(html_content *htmlc)
+ 
+ 	/* the early one was only for scripts until now (VitaSurf) */
+ 	html_drop_early_select_ctx(htmlc);
++	html_css_early_cache_free(htmlc);
+ 
+ 	/* create new css selection context */
+ 	htmlc->select_ctx_gen = htmlc->css_generation;
+@@ -2323,6 +2324,7 @@ static void html_destroy(struct content *c)
+ 		html->select_ctx = NULL;
+ 	}
+ 	html_drop_early_select_ctx(html);
++	html_css_early_cache_free(html);
+ 
+ 	lwc_string_unref(html->universal);
+ 	html->universal = NULL;
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 05457288e..70c980aa8 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -275,6 +275,10 @@ typedef struct html_content {
+ 	/** the sheets parsed for it, its STYLEs still fetching */
+ 	struct css_stylesheet **early_owned;
+ 	unsigned int early_n_owned;
++	/** the STYLEs parsed for those contexts, kept by element and text
++	 * from one to the next (VitaSurf); see html_css_sheet_now */
++	struct html_early_sheet *early_cache;
++	unsigned int early_cache_n, early_cache_alloc;
+ 	/** retries of the rebuild a late stylesheet asks for (VitaSurf) */
+ 	unsigned late_css_retries;
+ 	/**< Style selection media specification */
+@@ -682,7 +686,8 @@ nserror html_relayout(html_content *htmlc);
+  * NetSurf's runs inside the script.
+  *
+  * \param htmlc html content
+- * eturn true if the content now has a layout
++ * 
++eturn true if the content now has a layout
+  */
+ bool html_layout_early(html_content *htmlc);
+ 
