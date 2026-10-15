@@ -56,6 +56,7 @@
 #include "netsurf/mouse.h"
 #include "netsurf/window.h"
 #include "desktop/browser_history.h"
+#include "desktop/browser_private.h"
 #include "desktop/gui_internal.h"
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_inspect.h"
@@ -1509,6 +1510,17 @@ void vita_input_load_finished(struct gui_window *gw)
 	unsigned int ms;
 
 	if (gw != the_gw || load_started_us == 0) {
+		return;
+	}
+	/*
+	 * The page being left stopped, with the next one still loading
+	 * (VitaSurf): its fetches end when the window goes elsewhere, and
+	 * that clears the window's busy flag while the new load runs on. A
+	 * site test took it for the new site's end, and the Guardian
+	 * "loaded in 94 ms" while it was still loading. The new page's
+	 * own end comes as another stop.
+	 */
+	if (gw->bw != NULL && gw->bw->loading_content != NULL) {
 		return;
 	}
 	ms = (unsigned int)((sceKernelGetProcessTimeWide() - load_started_us) / 1000);
