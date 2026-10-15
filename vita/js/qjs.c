@@ -179,8 +179,19 @@ struct js_wrapper {
  * built-in or a compile when none is.
  */
 #define c_where vita_c_where
-#define C_WHERE const char *c_where_mark_ __attribute__((unused)) = \
-	(c_where = __func__)
+/*
+ * And how long each binding took, from its entry to its return
+ * (VitaSurf): the profile names the binding that ran before a stretch
+ * outside the interpreter, but not whether the time was in it or in
+ * what followed, and a reddit.com log has a fifth of its script put
+ * down to promise jobs that "ended in" one binding or another with
+ * nothing to say which. The time includes any script the binding ran.
+ */
+static const char *c_where_enter(const char *name);
+static void c_where_leave(const char *const *mark);
+#define C_WHERE const char *c_where_mark_ \
+	__attribute__((unused, cleanup(c_where_leave))) = \
+	c_where_enter(__func__)
 
 /* selector strings remembered by address; a power of two */
 #define SEL_RECENT 256
@@ -571,6 +582,105 @@ static uint64_t now_ms(void)
 	uint64_t ms = 0;
 	nsu_getmonotonic_ms(&ms);
 	return ms;
+}
+
+/* time in each binding, for the page report (VitaSurf); see C_WHERE */
+#define BIND_DEPTH_MAX 32
+#define BIND_SLOTS 128
+static struct {
+	const char *name;
+	uint64_t us;
+	unsigned int calls;
+} bind_time[BIND_SLOTS];
+static uint64_t bind_start[BIND_DEPTH_MAX];
+static unsigned int bind_depth;
+
+static uint64_t bind_now_us(void)
+{
+#ifdef __vita__
+	return vita_now_us();
+#else
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#endif
+}
+
+static const char *c_where_enter(const char *name)
+{
+	c_where = name;
+	if (bind_depth < BIND_DEPTH_MAX) {
+		bind_start[bind_depth] = bind_now_us();
+	}
+	bind_depth++;
+	return name;
+}
+
+static void c_where_leave(const char *const *mark)
+{
+	const char *name = *mark;
+	uint64_t took;
+	unsigned int h, k;
+
+	if (bind_depth == 0) {
+		return;
+	}
+	bind_depth--;
+	if (bind_depth >= BIND_DEPTH_MAX) {
+		return;
+	}
+	took = bind_now_us() - bind_start[bind_depth];
+	/* by the name's address, which is a constant string */
+	h = (unsigned int)(((uintptr_t)name >> 3) * 2654435761u) % BIND_SLOTS;
+	for (k = 0; k < BIND_SLOTS; k++) {
+		unsigned int i = (h + k) % BIND_SLOTS;
+
+		if (bind_time[i].name == name || bind_time[i].name == NULL) {
+			bind_time[i].name = name;
+			bind_time[i].us += took;
+			bind_time[i].calls++;
+			return;
+		}
+	}
+}
+
+/** The bindings that took longest since the last report, and clear. */
+static void bind_time_report(void)
+{
+	char line[700];
+	size_t at = 0;
+	unsigned int n, i;
+
+	line[0] = '\0';
+	for (n = 0; n < 12; n++) {
+		int best = -1;
+		int w;
+
+		for (i = 0; i < BIND_SLOTS; i++) {
+			if (bind_time[i].name != NULL &&
+			    (best < 0 || bind_time[i].us > bind_time[best].us)) {
+				best = (int)i;
+			}
+		}
+		if (best < 0 || bind_time[best].us < 50000) {
+			break;
+		}
+		w = snprintf(line + at, sizeof(line) - at, "%s%s %u ms in %u",
+			     at == 0 ? "" : ", ", bind_time[best].name,
+			     (unsigned int)(bind_time[best].us / 1000),
+			     bind_time[best].calls);
+		bind_time[best].us = 0;
+		if (w < 0 || (size_t)w >= sizeof(line) - at) {
+			break;
+		}
+		at += (size_t)w;
+	}
+	if (line[0] != '\0') {
+		vita_log("profile: time in bindings, with any script they ran: "
+			 "%s", line);
+	}
+	memset(bind_time, 0, sizeof(bind_time));
 }
 
 /** Interrupt handler: stop a script that has run past its deadline. */
@@ -990,6 +1100,7 @@ void vita_js_report_profile(void)
 
 	walk_cost_report();
 	ws_report();
+	bind_time_report();
 
 	/* what script's own allocator did since the last report (VitaSurf) */
 	{
