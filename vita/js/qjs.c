@@ -496,8 +496,12 @@ struct js_timer {
 	struct jsthread *thread;
 	JSValue func;         /**< a function, or a string of code */
 	JSValue args;         /**< array of extra arguments, or undefined */
-	int interval_ms;      /**< 0 for a one-shot timeout */
+	bool repeat;          /**< setInterval: set again after each run */
+	int asked_ms;         /**< the delay asked for, before any clamp */
 	int handle;
+	int level;            /**< the HTML standard's timer nesting level */
+	bool task;            /**< a task of the prelude's: no clamp, no level */
+	bool running;         /**< its callback is on the stack */
 	bool dead;
 };
 
@@ -8009,6 +8013,50 @@ static const JSCFunctionListEntry navigator_proto[] = {
 
 static void timer_callback(void *p);
 
+/*
+ * The nesting level of the timer whose callback is running, 0 when none
+ * is (VitaSurf). The HTML standard waits at least 4 ms only for a timer
+ * set more than five timers deep; every timer had waited at least 10 ms,
+ * so a chain of zero timers, or of the MessageChannel messages React's
+ * scheduler yields with, idled 10 ms a step, and one set for 1 ms ran
+ * after one set for 3 ms before it. tests/js/timers.html.
+ */
+static int timer_level_now;
+
+/* how long a timer of this level, asked for this delay, waits */
+static int timer_wait(int asked_ms, int level)
+{
+	if (asked_ms < 0) {
+		asked_ms = 0;
+	}
+	if (level > 5 && asked_ms < 4) {
+		asked_ms = 4;
+	}
+	return asked_ms;
+}
+
+/*
+ * Let a timer go once it is spent or cleared (VitaSurf). They stayed on
+ * the thread's list with their callbacks and arguments, and so whatever
+ * those closed over, until the page closed: a page that sets a timer a
+ * frame held every one it had ever set, and clearTimeout walked them all.
+ */
+static void timer_free(jsthread *thread, struct js_timer *t)
+{
+	struct js_timer **pp;
+
+	for (pp = &thread->timers; *pp != NULL; pp = &(*pp)->next) {
+		if (*pp == t) {
+			*pp = t->next;
+			break;
+		}
+	}
+	guit->misc->schedule(-1, timer_callback, t);
+	JS_FreeValue(thread->ctx, t->func);
+	JS_FreeValue(thread->ctx, t->args);
+	free(t);
+}
+
 static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 			     int argc, JSValueConst *argv, int repeat)
 {
@@ -8022,6 +8070,11 @@ static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 	(void)this_val;
 	if (thread == NULL || argc < 1) {
 		return JS_NewInt32(ctx, 0);
+	}
+	/* the delay as WebIDL's long has it: a NaN is 0, and a valueOf
+	   that throws throws here */
+	if (argc >= 2 && JS_ToInt32(ctx, &ms, argv[1]) < 0) {
+		return JS_EXCEPTION;
 	}
 	/*
 	 * A string is code to run when the timer fires (VitaSurf). Old
@@ -8044,11 +8097,6 @@ static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 			JS_FreeCString(ctx, s);
 		}
 	}
-	if (argc >= 2) {
-		JS_ToInt32(ctx, &ms, argv[1]);
-	}
-	if (ms < 10) ms = 10;
-
 	t = calloc(1, sizeof(*t));
 	if (t == NULL) {
 		JS_FreeValue(ctx, code);
@@ -8071,13 +8119,49 @@ static JSValue win_set_timer(JSContext *ctx, JSValueConst this_val,
 			t->args = JS_UNDEFINED;
 		}
 	}
-	t->interval_ms = repeat ? ms : 0;
+	t->asked_ms = ms;
+	t->level = timer_level_now + 1;
+	ms = timer_wait(ms, timer_level_now);
+	t->repeat = repeat != 0;
 	t->handle = next_timer_handle++;
 	t->next = thread->timers;
 	thread->timers = t;
 
 	guit->misc->schedule(ms, timer_callback, t);
 	return JS_NewInt32(ctx, t->handle);
+}
+
+/*
+ * __vitaQueueTask(fn): run fn as a task of its own, as soon as the
+ * browser is free (VitaSurf). The prelude delivers MessageChannel and
+ * postMessage messages this way: a browser queues them as tasks, with no
+ * timer's wait and no timer nesting, and through the page's setTimeout
+ * they went through whatever the page had put in its place.
+ */
+static JSValue win_vita_queue_task(JSContext *ctx, JSValueConst this_val,
+				   int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct js_timer *t;
+
+	(void)this_val;
+	if (thread == NULL || argc < 1 || !JS_IsFunction(ctx, argv[0])) {
+		return JS_UNDEFINED;
+	}
+	t = calloc(1, sizeof(*t));
+	if (t == NULL) {
+		return JS_ThrowOutOfMemory(ctx);
+	}
+	t->thread = thread;
+	t->func = JS_DupValue(ctx, argv[0]);
+	t->args = JS_UNDEFINED;
+	t->task = true;
+	t->handle = -1;
+	t->next = thread->timers;
+	thread->timers = t;
+	guit->misc->schedule(0, timer_callback, t);
+	return JS_UNDEFINED;
 }
 
 static JSValue win_set_timeout(JSContext *ctx, JSValueConst this_val,
@@ -8104,11 +8188,21 @@ static JSValue win_clear_timer(JSContext *ctx, JSValueConst this_val,
 
 	(void)this_val;
 	if (thread == NULL || argc < 1) return JS_UNDEFINED;
-	JS_ToInt32(ctx, &handle, argv[0]);
+	if (JS_ToInt32(ctx, &handle, argv[0]) < 0) {
+		return JS_EXCEPTION;
+	}
+	if (handle <= 0) {
+		return JS_UNDEFINED;
+	}
 	for (t = thread->timers; t != NULL; t = t->next) {
-		if (t->handle == handle) {
+		if (t->handle == handle && !t->dead) {
 			t->dead = true;
-			guit->misc->schedule(-1, timer_callback, t);
+			if (t->running) {
+				/* its callback lets it go when it returns */
+				guit->misc->schedule(-1, timer_callback, t);
+			} else {
+				timer_free(thread, t);
+			}
 			break;
 		}
 	}
@@ -9996,6 +10090,7 @@ static void timer_callback(void *p)
 	jsthread *thread;
 	JSContext *ctx;
 	JSValue global, ret;
+	int level_was;
 
 	if (t->dead) {
 		return;
@@ -10009,6 +10104,11 @@ static void timer_callback(void *p)
 		return;
 	}
 	ctx = thread->ctx;
+	t->running = true;
+	level_was = timer_level_now;
+	/* a timer set from here is one deeper; one set from a task is not
+	   nested in a timer at all */
+	timer_level_now = t->task ? 0 : t->level;
 	begin_script(thread, SCRIPT_TIMER);
 	global = JS_GetGlobalObject(ctx);
 	{
@@ -10034,12 +10134,19 @@ static void timer_callback(void *p)
 				JS_FreeCString(ctx, src);
 			}
 		} else if (JS_IsObject(t->args)) {
-			JSValue av[8];
+			JSValue few[8], *av = few;
 			int64_t n = 0;
 			int i;
 
 			JS_GetLength(ctx, t->args, &n);
-			if (n > 8) n = 8;
+			if (n > 65535) n = 65535;
+			if (n > 8) {
+				av = malloc(sizeof(JSValue) * (size_t)n);
+				if (av == NULL) {
+					av = few;
+					n = 8;
+				}
+			}
 			for (i = 0; i < (int)n; i++) {
 				av[i] = JS_GetPropertyUint32(ctx, t->args,
 							     (uint32_t)i);
@@ -10047,6 +10154,9 @@ static void timer_callback(void *p)
 			ret = JS_Call(ctx, t->func, global, (int)n, av);
 			for (i = 0; i < (int)n; i++) {
 				JS_FreeValue(ctx, av[i]);
+			}
+			if (av != few) {
+				free(av);
 			}
 		} else {
 			ret = JS_Call(ctx, t->func, global, 0, NULL);
@@ -10084,11 +10194,22 @@ static void timer_callback(void *p)
 	JS_FreeValue(ctx, ret);
 	JS_FreeValue(ctx, global);
 	end_script(thread);
+	timer_level_now = level_was;
+	t->running = false;
 
-	if (t->interval_ms > 0 && !t->dead) {
-		guit->misc->schedule(t->interval_ms, timer_callback, t);
+	/* closed while it ran: js_closethread has its list */
+	if (thread->closed) {
+		t->dead = true;
+		return;
+	}
+	if (t->repeat && !t->dead) {
+		/* set again from inside itself, so one level deeper */
+		guit->misc->schedule(timer_wait(t->asked_ms, t->level),
+				     timer_callback, t);
+		t->level++;
 	} else {
 		t->dead = true;
+		timer_free(thread, t);
 	}
 }
 
@@ -17524,6 +17645,9 @@ static bool setup_globals(jsthread *thread)
 			  JS_NewCFunction(ctx, win_clear_timer, "clearTimeout", 1));
 	JS_SetPropertyStr(ctx, global, "clearInterval",
 			  JS_NewCFunction(ctx, win_clear_timer, "clearInterval", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaQueueTask",
+			  JS_NewCFunction(ctx, win_vita_queue_task,
+					  "__vitaQueueTask", 1));
 	JS_SetPropertyStr(ctx, global, "alert",
 			  JS_NewCFunction(ctx, console_log, "alert", 1));
 

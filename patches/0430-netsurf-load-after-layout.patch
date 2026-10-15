@@ -1,0 +1,41 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 45f067cd8..9807cb90b 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -335,6 +335,21 @@ static void html_box_convert_done(html_content *c, bool success)
+ 
+ 	content_set_ready(&c->base);
+ 
++	/*
++	 * fire a simple event named load at the Document's Window
++	 * object, but with its target set to the Document object (and
++	 * the currentTarget set to the Window object)
++	 *
++	 * Once the page has its boxes and has been laid out, which
++	 * content_set_ready has its window do (VitaSurf). It was fired
++	 * before the boxes were built, so a load handler, and a zero
++	 * timer it set, measured every element as 0 by 0 where a browser
++	 * gives the laid out size: tests/js/geometry.html.
++	 */
++	if (c->jsthread != NULL && !c->aborted) {
++		js_fire_event(c->jsthread, "load", c->document, NULL);
++	}
++
+ 	html_proceed_to_done(c);
+ 
+ 	dom_node_unref(html);
+@@ -501,14 +516,6 @@ void html_finish_conversion(html_content *htmlc)
+ 	}
+ 
+ 
+-	/* fire a simple event named load at the Document's Window
+-	 * object, but with its target set to the Document object (and
+-	 * the currentTarget set to the Window object)
+-	 */
+-	if (htmlc->jsthread != NULL) {
+-		js_fire_event(htmlc->jsthread, "load", htmlc->document, NULL);
+-	}
+-
+ 	/* convert dom tree to box tree */
+ 	NSLOG(netsurf, INFO, "DOM to box (%p)", htmlc);
+ 	content_set_status(&htmlc->base, messages_get("Processing"));

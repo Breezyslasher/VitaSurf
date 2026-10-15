@@ -11,6 +11,10 @@
    parser in C; the prelude's own uses reach them here, not through the
    interface object a page sees */
 var URL=window.URL,URLSearchParams=window.URLSearchParams;
+/* the browser's own timers, which a page that replaces window.setTimeout
+   (a test's fake clock, zone.js) does not see or change (VitaSurf) */
+var setTimeout=window.setTimeout,clearTimeout=window.clearTimeout,
+    setInterval=window.setInterval,clearInterval=window.clearInterval;
 /* BEGIN regexp-split (VitaSurf)
  *
  * String.prototype.split with a regular expression, the way the
@@ -1531,7 +1535,36 @@ function scrollArgs(a,b){if(a&&typeof a==='object')return [Number(a.left)||0,Num
 W.scrollTo=W.scroll=function(a,b){var p=scrollArgs(a,b);NV.__vitaScrollTo(p[0],p[1]);};
 W.scrollBy=function(a,b){var p=scrollArgs(a,b),s=viewport();NV.__vitaScrollTo(s[0]+p[0],s[1]+p[1]);};
 W.confirm=function(){return false;};W.prompt=function(){return null;};
-W.requestAnimationFrame=function(f){return setTimeout(function(){f(Date.now());},16);};W.cancelAnimationFrame=function(h){clearTimeout(h);};
+/*
+ * requestAnimationFrame as the HTML standard runs it (VitaSurf): the
+ * callbacks asked for before a frame run together, in the order asked,
+ * each given the frame's time on performance.now()'s clock, and one
+ * asked for during a frame waits for the next. Each had been a timer of
+ * its own given Date.now(), so code measuring from performance.now()
+ * found a frame forty years on, and two callbacks of a frame disagreed
+ * on its time. A callback that throws is reported and the rest run.
+ * tests/js/timers.html.
+ */
+(function(){
+ var queue=[],live={},next=1,armed=false;
+ function frame(){
+  var list=queue,i,c,t=typeof NV.__vitaNow==='function'?
+   Math.max(0,Math.round((NV.__vitaNow()-(NV.__vitaHr0||0))*10)/10):Date.now();
+  queue=[];armed=false;
+  for(i=0;i<list.length;i++){
+   c=list[i];
+   if(!live[c.id])continue;
+   delete live[c.id];
+   try{c.f.call(undefined,t);}
+   catch(e){if(NV.__vitaReportError)NV.__vitaReportError(e);}}}
+ W.requestAnimationFrame=function requestAnimationFrame(f){
+  if(typeof f!=='function')throw new TypeError("Failed to execute 'requestAnimationFrame' on 'Window': parameter 1 is not of type 'Function'.");
+  var id=next++;
+  queue.push({id:id,f:f});live[id]=true;
+  if(!armed){armed=true;setTimeout(frame,16);}
+  return id;};
+ W.cancelAnimationFrame=function cancelAnimationFrame(id){delete live[id];};
+})();
 W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:false,timeRemaining:function(){return 10;}});},50);};W.cancelIdleCallback=function(h){clearTimeout(h);};
 /* getComputedStyle. The values are mostly defaults -- there is no style
  * resolution exposed here beyond what NV.__vitaStyle reports and what the
@@ -2220,8 +2253,9 @@ Event.prototype.composedPath=function(){
 /* MessageChannel, which schedulers use to get a macrotask: React and
  * YouTube's player both post to a port instead of calling setTimeout(0),
  * because a real browser clamps nested timeouts and does not clamp this.
- * A timer is the honest equivalent here -- delivery stays asynchronous
- * and ordered, which is what the schedulers depend on. */
+ * Each message is a task of its own (NV.__vitaQueueTask), with no
+ * timer's wait: delivery stays asynchronous and ordered, which is what
+ * the schedulers depend on, and each had waited a timer's 10 ms. */
 /* As the HTML standard has them (VitaSurf): what a port is sent waits in
  * its queue until the port is started, which setting onmessage does and
  * addEventListener does not, so a message sent before the other side
@@ -2249,7 +2283,7 @@ function MessagePort(){
 MessagePort.prototype._flush=function(){
  var p=this;
  if(!p._started||!p._q.length)return;
- setTimeout(function(){
+ NV.__vitaQueueTask(function(){
   var m=p._q.shift(),e;
   if(!m)return;
   e={data:m.data,type:'message',target:p,currentTarget:p,source:null,origin:'',
@@ -2258,7 +2292,7 @@ MessagePort.prototype._flush=function(){
   if(typeof p._on==='function'){try{p._on.call(p,e);}catch(x){console.error(x);}}
   p._l.slice().forEach(function(f){
    try{typeof f==='function'?f.call(p,e):f.handleEvent(e);}catch(x){console.error(x);}});
-  p._flush();},0);};
+  p._flush();});};
 MessagePort.prototype.postMessage=function(data,transfer){
  var p=this._peer,ports;
  if(!p)return;
@@ -5343,11 +5377,11 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   if(ports.length)ports=portMove(ports,W.MessagePort);
   ev=uaEvent(new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
    source:view(src),ports:ports}));
-  setTimeout(function(){
+  NV.__vitaQueueTask(function(){
    var tr=msgTraceStart(src,ev,data,ports);
    msgNote(src,message,'delivered'+(to==='*'?' (to any origin)':''));
    NV.__vitaDispatch(null,ev);
-   if(tr)setTimeout(function(){msgTraceEnd(tr);},50);},0);};
+   if(tr)setTimeout(function(){msgTraceEnd(tr);},50);});};
  /* What a page did with the first few messages another window sent it
     (VitaSurf): which of the event's fields and which of the data's keys
     it read, and what it sent on in the next moment. Names only. The

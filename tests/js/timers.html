@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<!--
+  Timers as the HTML standard has them (VitaSurf).
+
+  setTimeout and setInterval wait what they are asked, from 0, and only a
+  timer nested more than five deep in other timers waits at least 4 ms;
+  every timer had waited at least 10 ms, so one asked for 1 ms ran after
+  one asked for 3 ms that was set before it, and a chain of zero timers
+  or MessageChannel messages, which is how React's scheduler and others
+  yield, waited 10 ms a step. requestAnimationFrame gives every callback
+  of a frame the same time on performance.now()'s clock, where it gave
+  each its own Date.now(). The browser's own scheduling does not go
+  through a window.setTimeout the page replaced. Each line must say PASS;
+  Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Timers</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [], waiting = 0, last = null;
+function ok(name, good, got) {
+  out.push((good ? 'PASS ' : 'FAIL ') + name + (good ? '' : ': ' + got));
+}
+function start() { waiting++; }
+function done() {
+  if (--waiting > 0) return;
+  if (last) { var l = last; last = null; waiting++; l(); return; }
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('timers: ' + l); });
+  console.log('timers: done');
+}
+
+/* order by when each is due, not when each was set */
+start();
+(function () {
+  var order = [];
+  setTimeout(function () { order.push('3 ms'); }, 3);
+  setTimeout(function () { order.push('1 ms'); }, 1);
+  setTimeout(function () { order.push('-5 ms'); }, -5);
+  setTimeout(function () { order.push('0 ms'); }, 0);
+  setTimeout(function () { order.push('none'); });
+  setTimeout(function () {
+    ok('timers run in the order they come due, ties in the order set',
+       order.join() === '-5 ms,0 ms,none,1 ms,3 ms', order.join());
+    done();
+  }, 30);
+})();
+
+/* more than five deep, a zero timer waits 4 ms */
+start();
+(function () {
+  var t0 = performance.now(), n = 0;
+  function step() {
+    if (++n < 20) { setTimeout(step, 0); return; }
+    var took = performance.now() - t0;
+    ok('a chain of 20 zero timers is held to 4 ms a step past the fifth',
+       took >= 50, took.toFixed(1) + ' ms');
+    done();
+  }
+  setTimeout(step, 0);
+})();
+
+/* every argument after the delay reaches the callback */
+start();
+setTimeout(function () {
+  var a = [].slice.call(arguments);
+  ok('ten extra arguments reach the callback', a.join() === '1,2,3,4,5,6,7,8,9,10', a.join());
+  done();
+}, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+
+/* an interval cleared from inside its own callback stops */
+start();
+(function () {
+  var runs = 0, id = setInterval(function () {
+    if (++runs !== 3) return;
+    clearInterval(id);
+    /* had it gone on, three more runs would come in this time */
+    setTimeout(function () {
+      ok('an interval cleared from its own callback stops', runs === 3, runs);
+      clearTimeout(id);          /* a handle already cleared */
+      clearTimeout(123456789);   /* and one never given */
+      ok('the handles are positive integers', id > 0 && id === Math.floor(id), id);
+      done();
+    }, 20);
+  }, 1);
+})();
+
+/* a timer cleared before it is due never runs, and one set from a
+   callback can be cleared by the next */
+start();
+(function () {
+  var ran = false, id = setTimeout(function () { ran = true; }, 5);
+  clearTimeout(id);
+  setTimeout(function () {
+    ok('a cleared timer does not run', !ran, ran);
+    done();
+  }, 20);
+})();
+
+/* requestAnimationFrame */
+start();
+(function () {
+  var stamps = {}, before = performance.now(), cancelled = false, threw = 0;
+  addEventListener('error', function (e) {
+    if (e.message && e.message.indexOf('frame callback threw') >= 0) { threw++; e.preventDefault(); }
+  });
+  requestAnimationFrame(function (t) { stamps.a = t; });
+  requestAnimationFrame(function () { throw new Error('frame callback threw'); });
+  var c = requestAnimationFrame(function () { cancelled = true; });
+  requestAnimationFrame(function (t) {
+    stamps.b = t;
+    requestAnimationFrame(function (t2) {
+      stamps.next = t2;
+      ok('a frame\'s time is on performance.now()\'s clock',
+         stamps.a >= before - 1 && stamps.a <= performance.now(), stamps.a + ' vs ' + before);
+      ok('every callback of a frame gets the same time', stamps.a === stamps.b, stamps.a + ' ' + stamps.b);
+      ok('a callback asked for in a frame runs in the next', stamps.next > stamps.b, stamps.next + ' ' + stamps.b);
+      ok('a cancelled callback does not run', !cancelled, cancelled);
+      ok('a callback that throws is reported and the rest still run', threw === 1 && stamps.b !== undefined, threw);
+      ok('the handles are positive integers', c > 0 && c === Math.floor(c), c);
+      done();
+    });
+  });
+  cancelAnimationFrame(c);
+})();
+
+/* a MessageChannel message is a task of its own, not a clamped timer */
+start();
+(function () {
+  var ch = new MessageChannel(), n = 0, t0 = performance.now();
+  ch.port1.onmessage = function () {
+    if (++n < 50) { ch.port2.postMessage(n); return; }
+    var took = performance.now() - t0;
+    ok('fifty messages in a chain are not held to a timer\'s wait',
+       took < 250, took.toFixed(1) + ' ms');
+    done();
+  };
+  ch.port2.postMessage(0);
+})();
+
+/* the browser's own scheduling does not go through the page's setTimeout:
+   last, once nothing else here is calling it */
+last = function () {
+  var mine = window.setTimeout, calls = 0;
+  window.setTimeout = function () { calls++; return mine.apply(this, arguments); };
+  var ch = new MessageChannel();
+  ch.port1.onmessage = function () {
+    requestAnimationFrame(function () {
+      window.setTimeout = mine;
+      ok('a page\'s own setTimeout does not see the browser\'s calls', calls === 0, calls);
+      done();
+    });
+  };
+  ch.port2.postMessage('x');
+};
+</script>
+</body></html>
