@@ -3722,31 +3722,46 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  var scoped=Object.create(null),nscoped=0,scopedChars=0,
   /* a character no style sheet holds, where the host goes */
   MARK='\u0000',SCOPED_CHARS=4194304;
+ /* The scanners jump from one character that matters to the next with
+    a global regular expression, which runs in C, where they had looked
+    at every character in script: a component library's shared sheet
+    of a few hundred kilobytes took seconds to rewrite on the Vita, and
+    old.reddit's login page rewrote two dozen (VitaSurf). */
+ var RE_DQ=/["\\]/g,RE_SQ=/['\\]/g,RE_CB=/["'{}]/g,RE_PA=/["'()]/g,
+  RE_LIST=/["'\\()[\],]/g,RE_HEAD=/["'{;]/g,RE_NOWS=/\S/g;
+ function skipStr(t,i){
+  /* the index of the quote closing the one at i, or the end */
+  var re=t.charAt(i)==='"'?RE_DQ:RE_SQ,m;
+  re.lastIndex=i+1;
+  while((m=re.exec(t))!==null){
+   if(m[0]==='\\'){re.lastIndex=m.index+2;continue;}
+   return m.index;}
+  return t.length;}
  function closeAt(t,i,open,close){
   /* index of the bracket closing the one at i, strings skipped */
-  var d=0,c,q;
-  for(;i<t.length;i++){
-   c=t.charAt(i);
-   if(c==='"'||c==="'"){q=c;for(i++;i<t.length&&t.charAt(i)!==q;i++)
-    if(t.charAt(i)==='\\')i++;continue;}
+  var re=open==='{'?RE_CB:RE_PA,d=0,m,c,at;
+  re.lastIndex=i;
+  while((m=re.exec(t))!==null){
+   c=m[0];at=m.index;
+   if(c==='"'||c==="'"){re.lastIndex=skipStr(t,at)+1;continue;}
    if(c===open)d++;
-   else if(c===close&&--d===0)return i;}
+   else if(--d===0)return at;}
   return -1;}
  function splitList(t){
-  var out=[],d=0,st=0,i,c,q;
-  for(i=0;i<t.length;i++){
-   c=t.charAt(i);
-   if(c==='"'||c==="'"){q=c;for(i++;i<t.length&&t.charAt(i)!==q;i++)
-    if(t.charAt(i)==='\\')i++;continue;}
-   if(c==='\\'){i++;continue;}
+  var out=[],d=0,st=0,m,c,at;
+  RE_LIST.lastIndex=0;
+  while((m=RE_LIST.exec(t))!==null){
+   c=m[0];at=m.index;
+   if(c==='"'||c==="'"){RE_LIST.lastIndex=skipStr(t,at)+1;continue;}
+   if(c==='\\'){RE_LIST.lastIndex=at+2;continue;}
    if(c==='('||c==='[')d++;
    else if(c===')'||c===']')d--;
-   else if(c===','&&d===0){out.push(t.slice(st,i));st=i+1;}}
+   else if(d===0){out.push(t.slice(st,at));st=at+1;}}
   out.push(t.slice(st));
   return out;}
  function scopeSel(s,tag){
   var m,e,x;
-  s=s.replace(/^\s+|\s+$/g,'');
+  s=s.trim();
   if(!s)return s;
   /* slot[name=a]::slotted(X): an X the page put in slot a, which is a
      child of the host with slot="a". Read as any X inside the tag, Home
@@ -3760,12 +3775,14 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
     var hp=/^:host(\([^)]*\))?/.exec(s),arg=s.slice(x+10,e).replace(/^\s+|\s+$/g,'')||'*';
     s=(hp?hp[0]:'')+' > '+arg+'[slot="'+m[1]+'"]'+s.slice(e+1);
     if(!hp)return tag+s;}}
-  s=s.replace(/[^\s>+~]*::slotted\(/g,function(){return ' ::slotted(';});
+  if(s.indexOf('::slotted(')>=0)
+   s=s.replace(/[^\s>+~]*::slotted\(/g,function(){return ' ::slotted(';});
   while((x=s.indexOf('::slotted('))>=0){
    e=closeAt(s,x+9,'(',')');
    if(e<0)break;
    s=s.slice(0,x)+s.slice(x+10,e)+s.slice(e+1);}
-  s=s.replace(/^\s+/,'');
+  s=s.trimStart();
+  if(s.charAt(0)!==':')return tag+' '+s;
   if((m=/^:host-context\(/.exec(s))){
    e=closeAt(s,m[0].length-1,'(',')');
    if(e>0)return s.slice(m[0].length,e)+' '+tag+s.slice(e+1);}
@@ -3777,45 +3794,64 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   if(/^:host(?![\w-])/.test(s))return tag+s.slice(5);
   return tag+' '+s;}
  function scopeRules(t,tag){
-  var out='',i=0,b,e,pre,at;
-  while(i<t.length){
+  var out=[],i=0,b,e,pre,at,m,n=t.length;
+  while(i<n){
    b=-1;
-   while(i<t.length&&/\s/.test(t.charAt(i)))out+=t.charAt(i++);
-   for(e=i;e<t.length;e++){
-    var c=t.charAt(e);
-    if(c==='"'||c==="'"){var q=c;for(e++;e<t.length&&t.charAt(e)!==q;e++)
-     if(t.charAt(e)==='\\')e++;continue;}
-    if(c==='{'){b=e;break;}
-    if(c===';'&&t.charAt(i)==='@'){break;}}
-   if(b<0){out+=t.slice(i,e+1);i=e+1;continue;}
+   RE_NOWS.lastIndex=i;
+   m=RE_NOWS.exec(t);
+   e=m!==null?m.index:n;
+   if(e>i){out.push(t.slice(i,e));i=e;}
+   if(i>=n)break;
+   RE_HEAD.lastIndex=i;
+   e=n;
+   while((m=RE_HEAD.exec(t))!==null){
+    if(m[0]==='"'||m[0]==="'"){RE_HEAD.lastIndex=skipStr(t,m.index)+1;continue;}
+    if(m[0]==='{'){b=e=m.index;break;}
+    if(t.charAt(i)==='@'){e=m.index;break;}}
+   if(b<0){out.push(t.slice(i,e+1));i=e+1;continue;}
    e=closeAt(t,b,'{','}');
-   if(e<0){out+=t.slice(i);break;}
+   if(e<0){out.push(t.slice(i));break;}
    pre=t.slice(i,b);at=/^\s*@([\w-]+)/.exec(pre);
    if(at){
     if(/^(media|supports|container|layer|document|-moz-document)$/i.test(at[1]))
-     out+=pre+'{'+scopeRules(t.slice(b+1,e),tag)+'}';
-    else out+=t.slice(i,e+1);}
-   else out+=splitList(pre).map(function(x){return scopeSel(x,tag);}).join(',')+
-    t.slice(b,e+1);
+     out.push(pre+'{'+scopeRules(t.slice(b+1,e),tag)+'}');
+    else out.push(t.slice(i,e+1));}
+   else out.push(splitList(pre).map(function(x){return scopeSel(x,tag);}).join(',')+
+    t.slice(b,e+1));
    i=e+1;}
-  return out;}
- function scope(css,host){
+  return out.join('');}
+ /* The key a shadow root's <style> holds its host to, counted on the
+    host (VitaSurf): a style given other text, or replaced, gives its
+    old key up, so its host is not held to rules it no longer has. */
+ function holdKey(host,n,kk){
+  var old=n?n.__vsHeld:undefined;
+  if(old===kk)return;
+  if(old&&n.__vsHost)hostTokens(n.__vsHost,old,-1);
+  if(n){
+   Object.defineProperty(n,'__vsHeld',{configurable:true,value:kk,
+    writable:true,enumerable:false});
+   Object.defineProperty(n,'__vsHost',{configurable:true,value:kk?host:undefined,
+    writable:true,enumerable:false});}
+  if(kk)hostTokens(host,kk,1);}
+ function scope(css,host,n){
   var tag=host&&host.localName,k,r,kk;
   if(!css||!tag||tag==='html'||tag==='body')return css;
   /* the host as its shadow tree names it: only a rule naming one may
      reach from inside the tree to it, where a page's rules stop at
-     the shadow root as in a browser. A custom element's tag is its
-     component, every copy of which shares the sheet; a <div> or a
-     <span> can host anything, so it is named by a key for the text
-     instead, which the hosts holding that text carry (VitaSurf). */
-  if(ceValidName(tag))tag+=':-vita-host';
-  else{
-   kk=keyOf[css];
-   if(!kk){
-    if(nkeys>=2000){keyOf=Object.create(null);nkeys=0;}
-    kk=keyOf[css]='k'+(++nkey);nkeys++;}
-   if(!(host.__vsKeys&&host.__vsKeys[kk]))hostTokens(host,kk,1);
-   tag='[data-vs-s~="'+kk+'"]:-vita-host';}
+     the shadow root as in a browser. It is named by a key for the
+     text, which the hosts holding that text carry, so every host with
+     the same sheet shares one parse of it (VitaSurf). A custom
+     element's tag had named it, which shared the sheet among copies
+     of one component only: old.reddit.com's login page gave the same
+     250 KB sheet to fourteen kinds of component, and parsed it for
+     each, 41347 rules in the index from 24 sheets. */
+  kk=keyOf[css];
+  if(!kk){
+   if(nkeys>=2000){keyOf=Object.create(null);nkeys=0;}
+   kk=keyOf[css]='k'+(++nkey);nkeys++;}
+  if(n)holdKey(host,n,kk);
+  else if(n!==false&&!(host.__vsKeys&&host.__vsKeys[kk]))hostTokens(host,kk,1);
+  tag='[data-vs-s~="'+kk+'"]:-vita-host';
   /* The rules are rewritten once for a text, with a mark where the
      host goes, and each host's tag is put in its place (VitaSurf): the
      rewriting runs a character at a time, and a component library
@@ -3838,7 +3874,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  function take(host,n){
   var css=n.textContent,sc;
   if(!css)return;
-  sc=scope(css,host);
+  sc=scope(css,host,n);
   if(sc!==css){css=sc;if(rawText)rawText.call(n,css);else n.textContent=css;}
   if(live(css)){n.textContent='';park(n,css);return;}
   keep(n,css);}
@@ -3932,16 +3968,28 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  var d=Object.getOwnPropertyDescriptor(P,'innerHTML');
  if(!d||!d.set)return;
  Object.defineProperty(P,'innerHTML',{configurable:true,get:d.get,set:function(v){
-  var fresh=[],emptied=[];
-  if(shadowHost(this)&&typeof v==='string'&&v.indexOf('<style')>=0)
-   {var host=shadowHost(this);
+  var fresh=[],emptied=[],keys=null,host=shadowHost(this),old,o;
+  /* the styles it replaces give their keys up */
+  if(host){
+   old=this.querySelectorAll('style');
+   for(o=0;o<old.length;o++)if(old[o].__vsHeld)holdKey(host,old[o],undefined);}
+  if(host&&typeof v==='string'&&v.indexOf('<style')>=0)
+   {keys=[];
    v=v.replace(/<style>([\s\S]*?)<\/style>/gi,function(m,css){
-    var sc=scope(css,host);
+    var sc=scope(css,host,false);
+    keys.push(css&&keyOf[css]);
     if(sc!==css){css=sc;m='<style>'+sc+'</style>';}
     if(css&&live(css)){emptied.push(css);return '<style></style>';}
     if(css)fresh.push(css);
     return m;});}
   var r=d.set.call(this,v);
+  /* and the ones it made take theirs, each style its own, or the host
+     all of them when the styles cannot be told apart */
+  if(keys&&keys.length){
+   var ns=this.querySelectorAll('style'),q;
+   for(q=0;q<keys.length;q++)if(keys[q]){
+    if(ns.length===keys.length)holdKey(host,ns[q],keys[q]);
+    else if(!(host.__vsKeys&&host.__vsKeys[keys[q]]))hostTokens(host,keys[q],1);}}
   /* the empty ones it made, in order, when they can be told from any
      the page wrote empty itself */
   if(emptied.length){
@@ -3968,7 +4016,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   var p;
   given.delete(this);
   if(typeof v==='string'&&v&&(p=this.parentNode)&&shadowHost(p)&&styleNode(this)){
-   v=scope(v,shadowHost(p));
+   v=scope(v,shadowHost(p),this);
    if(live(v)){
     if(canon[v]!==this){t.set.call(this,'');park(this,v);}
     return;}
