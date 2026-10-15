@@ -333,6 +333,17 @@ struct jsthread {
 	struct js_timer *timers;       /**< live timers, cancelled on close */
 	struct js_wrapper *wrappers[WRAPPER_BUCKETS];
 	struct js_xhr *xhrs;           /**< requests in flight */
+	/*
+	 * Frozen while the page replacing it loads (VitaSurf): see
+	 * browser_window_scripts_frozen. Socket messages are held in
+	 * order, and what waited is counted for the log.
+	 */
+	struct ws_held *ws_held, **ws_held_tail;
+	size_t ws_held_bytes;
+	bool ws_held_sched;
+	bool ws_held_dropped;
+	uint64_t frozen_ms;            /**< when it was first found frozen */
+	unsigned frozen_timers, frozen_msgs, frozen_xhrs;
 	int next_xhr_id;
 	bool closed;
 	bool dom_dirty;           /**< scripts changed the DOM since the last layout */
@@ -915,6 +926,12 @@ static void walk_cost_note(const char *kind, const char *what, size_t len,
 
 static struct dom_document *thread_document(jsthread *thread);
 static void ws_report(void);
+/* what a frozen page held back, for the log (VitaSurf) */
+enum frozen_what { FROZEN_TIMER, FROZEN_MSG, FROZEN_XHR, FROZEN_ASK };
+static bool thread_frozen(jsthread *thread, enum frozen_what what);
+static const char *thread_url(jsthread *thread);
+/* how often a frozen page looks again */
+#define FROZEN_POLL_MS 250
 /* the first runtime made, the page's, for the memory report (VitaSurf) */
 static JSRuntime *qjs_memory_rt;
 static unsigned runtime_kb(JSRuntime *rt);
@@ -9378,8 +9395,8 @@ static void ws_report(void)
 /* An event on one of a page's connections, to the prelude's
  * __vitaWsEvent(id, kind, data, code), run as script so the promise
  * jobs a message handler queues run after it. */
-static void ws_event(void *owner, int id, enum vws_event ev,
-		     const char *data, size_t len, int code)
+static void ws_deliver(void *owner, int id, enum vws_event ev,
+		       const char *data, size_t len, int code)
 {
 	jsthread *thread = owner;
 	JSContext *ctx;
@@ -9420,6 +9437,114 @@ static void ws_event(void *owner, int id, enum vws_event ev,
 		ws_note(len, data, ev == VWS_TEXT, (unsigned) (t1 - t0),
 			(unsigned) (now_ms() - t1));
 	}
+}
+
+/*
+ * A socket event for a frozen page (VitaSurf), kept in order until it
+ * may run again. Past WS_HELD_MAX of messages the rest are let go: a
+ * page frozen that long is almost always one that will be closed.
+ */
+#define WS_HELD_MAX (4u * 1024u * 1024u)
+
+struct ws_held {
+	struct ws_held *next;
+	int id;
+	enum vws_event ev;
+	int code;
+	size_t len;
+	char data[];
+};
+
+static void ws_held_cb(void *p);
+
+static void ws_hold(jsthread *thread, int id, enum vws_event ev,
+		    const char *data, size_t len, int code)
+{
+	struct ws_held *h;
+	bool message = (ev == VWS_TEXT || ev == VWS_BINARY);
+
+	if (message && thread->ws_held_bytes + len > WS_HELD_MAX) {
+		if (!thread->ws_held_dropped) {
+			thread->ws_held_dropped = true;
+			vita_log("websocket: %.80s is frozen with %u KB of "
+				 "messages held: the rest are let go",
+				 thread_url(thread),
+				 (unsigned int)(thread->ws_held_bytes / 1024));
+		}
+		return;
+	}
+	h = malloc(sizeof(*h) + len + 1);
+	if (h == NULL) return;
+	h->next = NULL;
+	h->id = id;
+	h->ev = ev;
+	h->code = code;
+	h->len = len;
+	if (len > 0 && data != NULL) memcpy(h->data, data, len);
+	h->data[len] = '\0';
+	if (thread->ws_held == NULL) thread->ws_held_tail = &thread->ws_held;
+	*thread->ws_held_tail = h;
+	thread->ws_held_tail = &h->next;
+	thread->ws_held_bytes += len;
+	if (!thread->ws_held_sched) {
+		thread->ws_held_sched = true;
+		guit->misc->schedule(FROZEN_POLL_MS, ws_held_cb, thread);
+	}
+}
+
+static void ws_held_cb(void *p)
+{
+	jsthread *thread = p;
+	struct ws_held *h;
+
+	thread->ws_held_sched = false;
+	while ((h = thread->ws_held) != NULL) {
+		if (thread->closed) return;
+		if (thread_frozen(thread, FROZEN_ASK)) {
+			thread->ws_held_sched = true;
+			guit->misc->schedule(FROZEN_POLL_MS, ws_held_cb, thread);
+			return;
+		}
+		thread->ws_held = h->next;
+		thread->ws_held_bytes -= h->len;
+		ws_deliver(thread, h->id, h->ev, h->data, h->len, h->code);
+		free(h);
+	}
+	thread->ws_held_dropped = false;
+}
+
+/* what is held goes with the page */
+static void ws_held_free(jsthread *thread)
+{
+	struct ws_held *h;
+
+	if (thread->ws_held_sched) {
+		guit->misc->schedule(-1, ws_held_cb, thread);
+		thread->ws_held_sched = false;
+	}
+	while ((h = thread->ws_held) != NULL) {
+		thread->ws_held = h->next;
+		free(h);
+	}
+	thread->ws_held_bytes = 0;
+}
+
+/* The connection's events, held while the page is frozen and while
+ * anything held is still to be handed on, so they keep their order. */
+static void ws_event(void *owner, int id, enum vws_event ev,
+		     const char *data, size_t len, int code)
+{
+	jsthread *thread = owner;
+
+	if (thread == NULL || thread->closed || thread->ctx == NULL) {
+		return;
+	}
+	if (thread->ws_held != NULL ||
+	    thread_frozen(thread, FROZEN_MSG)) {
+		ws_hold(thread, id, ev, data, len, code);
+		return;
+	}
+	ws_deliver(owner, id, ev, data, len, code);
 }
 
 /* The cookies the page's http(s) URL of the same host would send, as
@@ -9756,6 +9881,50 @@ static bool style_stale(jsthread *thread)
 	return thread->dom_dirty || !html_select_ctx_current(htmlc);
 }
 
+static const char *thread_url(jsthread *thread)
+{
+	nsurl *u = thread->htmlc != NULL ?
+		content_get_url(&thread->htmlc->base) : NULL;
+
+	return u != NULL ? nsurl_access(u) : "?";
+}
+
+/*
+ * Whether this page's script is to wait (VitaSurf), a worker's as its
+ * page's: the navigation away from it has committed and the next page
+ * is loading. The first time says so in the log, and the first time it
+ * may run again says how long it waited and what for.
+ */
+static bool thread_frozen(jsthread *thread, enum frozen_what what)
+{
+	jsthread *t = thread;
+	bool frozen;
+
+	if (t->is_worker && t->owner != NULL) t = t->owner;
+	if (t->closed || t->win == NULL || t->htmlc == NULL) return false;
+	frozen = browser_window_scripts_frozen(t->win, &t->htmlc->base);
+	if (frozen) {
+		if (t->frozen_ms == 0) {
+			t->frozen_ms = now_ms();
+			vita_log("qjs: %.80s waits while the page replacing it "
+				 "loads: its timers, sockets and requests are "
+				 "held", thread_url(t));
+		}
+		if (what == FROZEN_TIMER) t->frozen_timers++;
+		else if (what == FROZEN_MSG) t->frozen_msgs++;
+		else if (what == FROZEN_XHR) t->frozen_xhrs++;
+	} else if (t->frozen_ms != 0) {
+		vita_log("qjs: %.80s carries on after %u ms frozen: the page "
+			 "replacing it did not; %u timer runs, %u socket "
+			 "messages and %u answers waited", thread_url(t),
+			 (unsigned int)(now_ms() - t->frozen_ms),
+			 t->frozen_timers, t->frozen_msgs, t->frozen_xhrs);
+		t->frozen_ms = 0;
+		t->frozen_timers = t->frozen_msgs = t->frozen_xhrs = 0;
+	}
+	return frozen;
+}
+
 static void timer_callback(void *p)
 {
 	struct js_timer *t = p;
@@ -9768,6 +9937,10 @@ static void timer_callback(void *p)
 	}
 	thread = t->thread;
 	if (thread == NULL || thread->closed) {
+		return;
+	}
+	if (thread_frozen(thread, FROZEN_TIMER)) {
+		guit->misc->schedule(FROZEN_POLL_MS, timer_callback, t);
 		return;
 	}
 	ctx = thread->ctx;
@@ -9921,11 +10094,16 @@ struct js_xhr {
 	int busy;             /**< calls into script under way with it */
 	bool doomed;          /**< freed while busy: free when they end */
 	bool release_pending; /**< its script values, likewise */
+	/* its page is frozen: the answer is handed over when it is not
+	   (VitaSurf), with the error it came with */
+	bool frozen_wait;
+	char *frozen_err;
 	struct js_xhr *next;
 };
 
 static void xhr_timeout_cb(void *p);
 static void xhr_stream_cb(void *p);
+static void xhr_frozen_cb(void *p);
 
 /** scheme://host:port of a URL, malloc'd, or NULL. */
 static char *url_origin(nsurl *url)
@@ -9991,6 +10169,12 @@ static void xhr_free(struct js_xhr *x)
 		guit->misc->schedule(-1, xhr_stream_cb, x);
 		x->stream_sched = false;
 	}
+	if (x->frozen_wait) {
+		guit->misc->schedule(-1, xhr_frozen_cb, x);
+		x->frozen_wait = false;
+	}
+	free(x->frozen_err);
+	x->frozen_err = NULL;
 	if (x->fetch != NULL) {
 		fetch_abort(x->fetch);
 		x->fetch = NULL;
@@ -10045,6 +10229,16 @@ static void xhr_complete(struct js_xhr *x, const char *err)
 		guit->misc->schedule(-1, xhr_stream_cb, x);
 		x->stream_sched = false;
 	}
+	/* the page is frozen: the answer waits, the fetch being done */
+	if (thread != NULL && !thread->closed &&
+	    thread_frozen(thread, x->frozen_wait ? FROZEN_ASK : FROZEN_XHR)) {
+		if (!x->frozen_wait) {
+			x->frozen_wait = true;
+			x->frozen_err = err != NULL ? strdup(err) : NULL;
+		}
+		guit->misc->schedule(FROZEN_POLL_MS, xhr_frozen_cb, x);
+		return;
+	}
 	if (err == NULL && !xhr_origin_allowed(x)) {
 		err = "cross-origin response not allowed by the server";
 	}
@@ -10091,6 +10285,24 @@ static void xhr_complete(struct js_xhr *x, const char *err)
 	xhr_free(x);
 }
 
+/* An answer that waited for its page to thaw (VitaSurf). */
+static void xhr_frozen_cb(void *p)
+{
+	struct js_xhr *x = p;
+	char *err;
+
+	if (x->thread != NULL && !x->thread->closed &&
+	    thread_frozen(x->thread, FROZEN_ASK)) {
+		guit->misc->schedule(FROZEN_POLL_MS, xhr_frozen_cb, x);
+		return;
+	}
+	err = x->frozen_err;
+	x->frozen_err = NULL;
+	x->frozen_wait = false;
+	xhr_complete(x, err);
+	free(err);
+}
+
 /* a streamed request has something to hand on: see js_xhr.progress */
 static void xhr_stream_soon(struct js_xhr *x)
 {
@@ -10110,6 +10322,11 @@ static void xhr_stream_cb(void *p)
 
 	x->stream_sched = false;
 	if (thread == NULL || thread->closed) {
+		return;
+	}
+	if (thread_frozen(thread, FROZEN_ASK)) {
+		x->stream_sched = true;
+		guit->misc->schedule(FROZEN_POLL_MS, xhr_stream_cb, x);
 		return;
 	}
 	if (!xhr_origin_allowed(x)) {
@@ -10303,6 +10520,12 @@ static void xhr_timeout_cb(void *p)
 		return;
 	default:
 		break;
+	}
+	/* a frozen page's request does not time out while it is frozen */
+	if (x->thread != NULL && !x->thread->closed &&
+	    thread_frozen(x->thread, FROZEN_ASK)) {
+		guit->misc->schedule(FROZEN_POLL_MS, xhr_timeout_cb, x);
+		return;
 	}
 	vita_log("xhr: %s timed out: %u ms after the loop was first free "
 		 "to send it (%u after send(), %u of it waiting on script); "
@@ -18180,6 +18403,16 @@ nserror js_closethread(jsthread *thread)
 	thread->closed = true;
 	slot_map_free(&thread->slots);
 	vws_drop_owner(thread);
+	ws_held_free(thread);
+	if (thread->frozen_ms != 0) {
+		vita_log("qjs: %.80s closed after %u ms frozen; %u timer runs, "
+			 "%u socket messages and %u answers waited and did not "
+			 "run", thread_url(thread),
+			 (unsigned int)(now_ms() - thread->frozen_ms),
+			 thread->frozen_timers, thread->frozen_msgs,
+			 thread->frozen_xhrs);
+		thread->frozen_ms = 0;
+	}
 	/* a navigation the page asked for goes with the page */
 	if (thread->nav_pending != NULL) {
 		guit->misc->schedule(-1, nav_callback, thread);

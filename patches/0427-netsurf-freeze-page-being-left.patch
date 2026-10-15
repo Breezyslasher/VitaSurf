@@ -1,0 +1,89 @@
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+index fe64aded9..e663ce522 100644
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -34,6 +34,7 @@ struct gui_window;
+ struct selection;
+ struct nsurl;
+ struct dom_node;
++struct content;
+ 
+ /**
+  * history entry page information
+@@ -125,6 +126,11 @@ struct browser_window {
+ 	 * if no page is being loaded.
+ 	 */
+ 	struct hlcache_handle *loading_content;
++	/**
++	 * The loading content has made its script realm (VitaSurf): the
++	 * navigation has committed, and the page it replaces is frozen.
++	 */
++	bool loading_committed;
+ 
+ 	/**
+ 	 * The fetch parameters for the loading content
+@@ -447,4 +453,21 @@ typedef nserror (*browser_window_query_callback)(bool proceed, void *pw);
+  */
+ nserror browser_window__reload_current_parameters(struct browser_window *bw);
+ 
++/**
++ * Whether a page's script is frozen (VitaSurf): this window, or one it
++ * is a frame of, has a page loading that has committed -- it has made
++ * its script realm -- and the page is not that one. Chrome unloads a
++ * page once the navigation away from it commits, while it may still be
++ * on the screen; NetSurf keeps it current until the next page is ready,
++ * and its timers, sockets and requests went on running through the
++ * whole of that page's load. Frozen, they wait; if the load is given up
++ * and the page stays, they carry on.
++ *
++ * \param bw  the window the page's script belongs to
++ * \param c   the page's content
++ * \return true when the page's script is to wait
++ */
++bool browser_window_scripts_frozen(struct browser_window *bw,
++				   struct content *c);
++
+ #endif
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index cb679af47..ac9bdca6e 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -1731,6 +1731,10 @@ browser_window_callback(hlcache_handle *c, const hlcache_event *event, void *pw)
+ 			jsthread *thread;
+ 			assert(bw->loading_content == c);
+ 
++			/* the navigation commits: the page it replaces, and
++			 * its frames, are frozen from here (VitaSurf) */
++			bw->loading_committed = true;
++
+ 			if (js_newthread(bw->jsheap,
+ 					 bw,
+ 					 hlcache_handle_get_content(c),
+@@ -3976,6 +3980,7 @@ navigate_internal_real(struct browser_window *bw,
+ 	switch (res) {
+ 	case NSERROR_OK:
+ 		bw->loading_content = c;
++		bw->loading_committed = false;
+ 		browser_window_start_throbber(bw);
+ 		if (bw->window != NULL) {
+ 			guit->window->set_icon(bw->window, NULL);
+@@ -5256,3 +5261,19 @@ nserror browser_window_show_certificates(struct browser_window *bw)
+ 
+ 	return res;
+ }
++
++
++/* exported interface documented in desktop/browser_private.h */
++bool browser_window_scripts_frozen(struct browser_window *bw,
++				   struct content *c)
++{
++	struct browser_window *w;
++
++	for (w = bw; w != NULL; w = w->parent) {
++		if (w->loading_content != NULL && w->loading_committed &&
++		    hlcache_handle_get_content(w->loading_content) != c) {
++			return true;
++		}
++	}
++	return false;
++}
