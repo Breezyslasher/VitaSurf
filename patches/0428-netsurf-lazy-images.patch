@@ -1,0 +1,402 @@
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index f454977dd..60c0acdf2 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -1155,6 +1155,21 @@ box_iframe(dom_node *n,
+ }
+ 
+ 
++/** Whether an <img> says loading=lazy (VitaSurf). */
++static bool box_image_lazy(dom_node *n)
++{
++	dom_string *v = NULL;
++	bool lazy = false;
++
++	if (dom_element_get_attribute(n, corestring_dom_loading, &v) ==
++			DOM_NO_ERR && v != NULL) {
++		lazy = dom_string_byte_length(v) == 4 &&
++			strncasecmp(dom_string_data(v), "lazy", 4) == 0;
++		dom_string_unref(v);
++	}
++	return lazy;
++}
++
+ /**
+  * Embedded image [13.2].
+  */
+@@ -1217,9 +1232,13 @@ box_image(dom_node *n,
+ 	if (url == NULL)
+ 		return true;
+ 
+-	/* start fetch */
++	/* start fetch: a lazy one when it comes near the viewport
++	 * (VitaSurf) */
+ 	box->flags |= IS_REPLACED;
+-	ok = html_fetch_object(content, url, box, image_types, false);
++	if (box_image_lazy(n))
++		ok = html_fetch_object_lazy(content, url, box, image_types);
++	else
++		ok = html_fetch_object(content, url, box, image_types, false);
+ 	nsurl_unref(url);
+ 
+ 	wtype = css_computed_width(box->style, &value, &wunit);
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index a4ae20c54..d06acbdcc 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include <string.h>
++#include <strings.h>
+ 
+ #include "utils/config.h"
+ #include "utils/utils.h"
+@@ -132,6 +133,19 @@ static bool html_process_inserted_img(html_content *htmlc, dom_node *node)
+ 		return true;
+ 	}
+ 
++	/* a lazy one waits for its box to come near the viewport
++	 * (VitaSurf) */
++	exc = dom_element_get_attribute(node, corestring_dom_loading, &src);
++	if (exc == DOM_NO_ERR && src != NULL) {
++		bool lazy = dom_string_byte_length(src) == 4 &&
++			strncasecmp(dom_string_data(src), "lazy", 4) == 0;
++
++		dom_string_unref(src);
++		if (lazy) {
++			return true;
++		}
++	}
++
+ 	exc = dom_element_get_attribute(node, corestring_dom_src, &src);
+ 	if (exc != DOM_NO_ERR || src == NULL) {
+ 		return true;
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 26343fee6..d9a920b27 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -128,6 +128,9 @@ struct content_html_object {
+ 	/** next in the rebuild's table of objects to take back (VitaSurf) */
+ 	struct content_html_object *reuse_next;
+ 	bool reused;      /**< taken back by the rebuilt tree (VitaSurf) */
++	/** an <img loading=lazy> not asked for yet: what it will ask
++	 * for once it is near the viewport (VitaSurf) */
++	struct nsurl *lazy_url;
+ };
+ 
+ 
+diff --git a/content/handlers/html/object.c b/content/handlers/html/object.c
+index 53021c831..db5b17d67 100644
+--- a/content/handlers/html/object.c
++++ b/content/handlers/html/object.c
+@@ -162,6 +162,8 @@ static bool html_object_view_moving(uint64_t ms_now)
+ 		ms_now - vitasurf_view_moved_ms < HTML_OBJECT_STILL_MS;
+ }
+ 
++static void html_object_lazy_check(void *p);
++
+ static void html_object_reformat(void *pw)
+ {
+ 	html_content *c = pw;
+@@ -842,6 +844,12 @@ nserror html_object_free_list(html_content *html,
+ 
+ 		objects = victim->next;
+ 
++		if (victim->lazy_url != NULL) {
++			nsurl_unref(victim->lazy_url);
++			victim->lazy_url = NULL;
++			if (html->lazy_pending > 0)
++				html->lazy_pending--;
++		}
+ 		if (victim->content != NULL) {
+ 			if (content_get_type(victim->content) == CONTENT_HTML) {
+ 				guit->misc->schedule(-1, html_object_refresh,
+@@ -878,10 +886,18 @@ nserror html_object_free_objects(html_content *html)
+ 	/* a pending reformat must not outlive the content (VitaSurf) */
+ 	guit->misc->schedule(-1, html_object_reformat, html);
+ 	html->object_reformat_pending = false;
++	guit->misc->schedule(-1, html_object_lazy_check, html);
++	html->lazy_sched = false;
++	html->lazy_pending = 0;
+ 
+ 	while (html->object_list != NULL) {
+ 		struct content_html_object *victim = html->object_list;
+ 
++		if (victim->lazy_url != NULL) {
++			nsurl_unref(victim->lazy_url);
++			victim->lazy_url = NULL;
++		}
++
+ 		if (victim->content != NULL) {
+ 			NSLOG(netsurf, INFO, "object %p", victim->content);
+ 
+@@ -1020,13 +1036,88 @@ html_object_reuse_take(html_content *c, nsurl *url,
+ 	return NULL;
+ }
+ 
++/*
++ * Lazy images (VitaSurf). An <img loading=lazy> is asked for once it
++ * comes within LAZY_MARGIN of the rows a redraw showed, as Chrome asks
++ * at 1250 px on a fast network, and the page's load does not wait for
++ * one not yet asked for. Every image had been fetched as its box was
++ * made: cnn.com's carousels asked for two hundred at once, most of them
++ * far below the screen, and the page's own images queued behind them
++ * for half a minute.
++ */
++#define LAZY_MARGIN 1250
++
++/** Ask for one lazy image now. */
++static void html_object_lazy_start(html_content *c,
++				   struct content_html_object *o)
++{
++	hlcache_child_context child;
++	nsurl *url = o->lazy_url;
++	nserror error;
++
++	o->lazy_url = NULL;
++	if (c->lazy_pending > 0)
++		c->lazy_pending--;
++	child.charset = c->encoding;
++	child.quirks = c->base.quirks;
++	error = hlcache_handle_retrieve(url, HLCACHE_RETRIEVE_SNIFF_TYPE,
++			content_get_url(&c->base), NULL,
++			html_object_callback, o, &child,
++			o->permitted_types, &o->content);
++	nsurl_unref(url);
++	if (error != NSERROR_OK) {
++		o->content = NULL;
++		return;
++	}
++	if (o->permitted_types & CONTENT_IMAGE)
++		vitasurf_images_asked++;
++	c->base.active++;
++}
++
++static void html_object_lazy_check(void *p)
++{
++	html_content *c = p;
++	struct content_html_object *o;
++	int top = c->lazy_top - LAZY_MARGIN;
++	int bottom = c->lazy_bottom + LAZY_MARGIN;
++
++	c->lazy_sched = false;
++	if (c->lazy_pending == 0 || c->layout == NULL || c->aborted)
++		return;
++	for (o = c->object_list; o != NULL && c->lazy_pending > 0;
++	     o = o->next) {
++		int x, y, h;
++
++		if (o->lazy_url == NULL || o->box == NULL)
++			continue;
++		box_coords(o->box, &x, &y);
++		h = o->box->padding[TOP] + o->box->height +
++			o->box->padding[BOTTOM] + o->box->border[TOP].width +
++			o->box->border[BOTTOM].width;
++		if (y + h >= top && y <= bottom)
++			html_object_lazy_start(c, o);
++	}
++}
++
++/* exported interface documented in html/object.h */
++void html_object_lazy_seen(html_content *html, int top, int bottom)
++{
++	html->lazy_top = top;
++	html->lazy_bottom = bottom;
++	if (html->lazy_pending == 0 || html->lazy_sched)
++		return;
++	html->lazy_sched = true;
++	guit->misc->schedule(0, html_object_lazy_check, html);
++}
++
+ static bool
+ html_fetch_object_role(html_content *c,
+ 		  nsurl *url,
+ 		  struct box *box,
+ 		  content_type permitted_types,
+ 		  bool background,
+-		  bool mask)
++		  bool mask,
++		  bool lazy)
+ {
+ 	struct content_html_object *object;
+ 	hlcache_handle_callback object_callback;
+@@ -1060,6 +1151,24 @@ html_fetch_object_role(html_content *c,
+ 		}
+ 	}
+ 
++	/* an <img loading=lazy> waits until it is near the viewport, and
++	 * the page's load does not wait for it (VitaSurf) */
++	if (lazy && box != NULL && !background && !mask) {
++		object = calloc(1, sizeof(struct content_html_object));
++		if (object == NULL) {
++			return false;
++		}
++		object->parent = (struct content *) c;
++		object->box = box;
++		object->permitted_types = permitted_types;
++		object->lazy_url = nsurl_ref(url);
++		object->next = c->object_list;
++		c->object_list = object;
++		c->num_objects++;
++		c->lazy_pending++;
++		return true;
++	}
++
+ 	child.charset = c->encoding;
+ 	child.quirks = c->base.quirks;
+ 
+@@ -1126,6 +1235,15 @@ int html_object_set_src(html_content *c, struct box *box, nsurl *url)
+ 	}
+ 	if (o == NULL)
+ 		return -1;
++	/* one still waiting waits for its new address (VitaSurf) */
++	if (o->lazy_url != NULL) {
++		if (nsurl_compare(o->lazy_url, url, NSURL_COMPLETE))
++			return 0;
++		nsurl_unref(o->lazy_url);
++		o->lazy_url = nsurl_ref(url);
++		html_object_lazy_seen(c, c->lazy_top, c->lazy_bottom);
++		return 1;
++	}
+ 	if (o->content != NULL &&
+ 	    nsurl_compare(hlcache_handle_get_url(o->content), url,
+ 			  NSURL_COMPLETE)) {
+@@ -1166,14 +1284,25 @@ html_fetch_object(html_content *c,
+ 		  bool background)
+ {
+ 	return html_fetch_object_role(c, url, box, permitted_types,
+-				      background, false);
++				      background, false, false);
++}
++
++/* exported interface documented in html/object.h */
++bool
++html_fetch_object_lazy(html_content *c,
++		       nsurl *url,
++		       struct box *box,
++		       content_type permitted_types)
++{
++	return html_fetch_object_role(c, url, box, permitted_types,
++				      false, false, true);
+ }
+ 
+ /* exported interface documented in html/object.h */
+ bool
+ html_fetch_mask(html_content *c, nsurl *url, struct box *box)
+ {
+-	return html_fetch_object_role(c, url, box, CONTENT_IMAGE, false, true);
++	return html_fetch_object_role(c, url, box, CONTENT_IMAGE, false, true, false);
+ }
+ 
+ /* exported interface documented in html/object.h */
+@@ -1181,5 +1310,5 @@ bool
+ html_fetch_border_image(html_content *c, nsurl *url, struct box *box)
+ {
+ 	/* both roles at once mark a border image (VitaSurf) */
+-	return html_fetch_object_role(c, url, box, CONTENT_IMAGE, true, true);
++	return html_fetch_object_role(c, url, box, CONTENT_IMAGE, true, true, false);
+ }
+diff --git a/content/handlers/html/object.h b/content/handlers/html/object.h
+index 904cf61ee..ab726a201 100644
+--- a/content/handlers/html/object.h
++++ b/content/handlers/html/object.h
+@@ -45,6 +45,18 @@ struct nsurl;
+  */
+ bool html_fetch_object(struct html_content *c, struct nsurl *url, struct box *box, content_type permitted_types, bool background);
+ 
++/**
++ * An <img loading=lazy>'s image (VitaSurf): asked for once its box comes
++ * near the viewport, and not waited for by the page's load.
++ *
++ * \param c content of type CONTENT_HTML
++ * \param url URL of the image
++ * \param box the image's box
++ * \param permitted_types bitmap of acceptable types
++ * \return true on success, false on memory exhaustion
++ */
++bool html_fetch_object_lazy(struct html_content *c, struct nsurl *url, struct box *box, content_type permitted_types);
++
+ /**
+  * Show another image in a box that has one, for a script that changed
+  * an <img>'s src (VitaSurf). The old image goes at once and the new one
+@@ -110,6 +122,15 @@ void html_object_reuse_begin(struct html_content *html,
+  */
+ struct content_html_object *html_object_reuse_end(struct html_content *html);
+ 
++/**
++ * Ask for the lazy images near the rows a redraw showed (VitaSurf).
++ *
++ * \param html    the content
++ * \param top     the first row shown, in the content's coordinates
++ * \param bottom  the row after the last shown
++ */
++void html_object_lazy_seen(struct html_content *html, int top, int bottom);
++
+ nserror html_object_free_list(struct html_content *html,
+ 			      struct content_html_object *objects);
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 7c056674b..8069667f8 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -144,6 +144,14 @@ typedef struct html_content {
+ 	 * burst of arrivals into a single pass.
+ 	 */
+ 	bool object_reformat_pending;
++	/**
++	 * Lazy images (VitaSurf): how many objects wait to be near the
++	 * viewport, whether a look is scheduled, and the content rows the
++	 * last redraw showed.
++	 */
++	unsigned int lazy_pending;
++	bool lazy_sched;
++	int lazy_top, lazy_bottom;
+ 	/**
+ 	 * A layout rebuild's old objects, by URL, for the new tree to take
+ 	 * back rather than ask for again (VitaSurf); NULL outside one.
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 5d2cac16e..cd867c89d 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -66,6 +66,7 @@
+ #include "html/font.h"
+ #include "html/form_internal.h"
+ #include "html/private.h"
++#include "html/object.h"
+ #include "html/layout_internal.h"
+ #include "html/layout.h"
+ #include "html/bidi.h"
+@@ -8212,6 +8213,20 @@ static bool html_redraw_content(struct content *c,
+ 	html->view_w = data->view_w;
+ 	html->view_origin_x = data->x;
+ 
++	/* the lazy images near what is shown are asked for (VitaSurf): the
++	 * viewport when it is known, else the rows this redraw covers */
++	if (ctx->interactive && html->lazy_pending > 0) {
++		float sc = data->scale > 0 ? data->scale : 1;
++
++		if (html->view_h > 0)
++			html_object_lazy_seen(html, html->view_y,
++					      html->view_y + html->view_h);
++		else
++			html_object_lazy_seen(html,
++					(int) ((clip->y0 - data->y) / sc),
++					(int) ((clip->y1 - data->y) / sc));
++	}
++
+ 	/* a fixed box placed against an anchor flips at the viewport's
+ 	 * edges, so where the viewport is now may move it (VitaSurf) */
+ 	if (html->anchored_any && html->view_h > 0 && ctx->interactive &&
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index f9f556035..ec840e9d4 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -275,6 +275,7 @@ CORESTRING_DOM_STRING(load);
+ CORESTRING_DOM_STRING(loadeddata);
+ CORESTRING_DOM_STRING(loadedmetadata);
+ CORESTRING_DOM_STRING(loadstart);
++CORESTRING_DOM_STRING(loading);
+ CORESTRING_DOM_STRING(map);
+ CORESTRING_DOM_STRING(marginheight);
+ CORESTRING_DOM_STRING(marginwidth);
