@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!--
+  Script in a frame entered from the page's own script (VitaSurf).
+
+  The page dispatches an event on its frame's document, and the frame's
+  own listener runs: the frame's realm is entered from C while the
+  page's script is still on the stack. Its return ran a microtask
+  checkpoint, so the page's promise jobs ran in the middle of the
+  page's script, which the HTML standard runs only once the stack is
+  empty, and it left the interrupt handler with the frame, so the rest
+  of the page's script ran with no time budget, no profile and no
+  transfers moving. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Entering a frame's script</title></head>
+<body>
+<pre id="out"></pre>
+<iframe id="f" srcdoc="<script>document.addEventListener('ping', function (e) { parent.heard.push(e.type); Promise.resolve().then(function () { parent.order.push('frame job'); }); });</script>"></iframe>
+<script>
+var out = [], order = [], heard = [];
+function ok(name, good, got) {
+  out.push((good ? 'PASS ' : 'FAIL ') + name + (good ? '' : ': ' + got));
+}
+function report() {
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('frame-entry: ' + l); });
+  console.log('frame-entry: done');
+}
+document.getElementById('f').addEventListener('load', function () {
+  var fd = this.contentDocument;
+  Promise.resolve().then(function () { order.push('page job'); });
+  fd.dispatchEvent(new Event('ping'));
+  order.push('after the dispatch');
+  fd.dispatchEvent(new Event('ping'));
+  order.push('after the second');
+  ok('the frame\'s listener ran twice', heard.length === 2, heard.join());
+  ok('no promise job ran while the page\'s script was running',
+     order.join() === 'after the dispatch,after the second', order.join());
+  setTimeout(function () {
+    ok('the jobs ran once the script was done, in the order queued',
+       order.join() === 'after the dispatch,after the second,page job,frame job,frame job',
+       order.join());
+    report();
+  }, 50);
+});
+</script>
+</body></html>

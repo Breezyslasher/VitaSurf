@@ -268,6 +268,10 @@ struct jsthread {
 	 */
 	unsigned script_depth;    /**< nested entries from C into script */
 	bool draining;            /**< end_script is running promise jobs */
+	/** this entry came from another realm's running script: a frame's
+	 * listener the page dispatched to (see begin_script) */
+	bool entered_inside;
+	struct jsthread *entered_over; /**< that realm, while it lives */
 	struct jsthread *all_next; /**< every live thread, for window events */
 	bool aborting;            /**< the budget is unwinding a script */
 	unsigned scripts_killed;  /**< scripts the budget stopped, this page */
@@ -8239,10 +8243,43 @@ static uint64_t bc_last_activity_ms;
 
 static void begin_script(jsthread *thread, enum script_why why)
 {
+	jsthread *outer;
+
 	if (thread->script_depth++ > 0) {
 		if (thread->draining) {
 			jobs_reentered++;
 		}
+		return;
+	}
+	/*
+	 * Entered from another realm's script, which is still running:
+	 * the page dispatched an event its frame listens for, or put a
+	 * script into the frame's document (VitaSurf). That is part of
+	 * the outer script's work, as a nested entry into the same realm
+	 * is: it runs to the outer deadline, and its end is not where
+	 * script finishes. As an outermost entry its end_script drained
+	 * the promise jobs in the middle of the page's script, which the
+	 * HTML standard does only once the stack is empty, and left the
+	 * interrupt handler with the frame, its deadline cleared, so the
+	 * rest of the page's script ran with no budget, no profile and
+	 * no transfers moving: reddit.com ran 40 s of a 90 s load that
+	 * way. tests/js/frame-entry.html, tests/budget/frame-entry.html.
+	 */
+	outer = thread->heap->interrupt_thread;
+	if (outer != NULL && outer != thread && !outer->closed &&
+	    outer->script_depth > 0) {
+		thread->entered_inside = true;
+		thread->entered_over = outer;
+		thread->entry_safe = outer->entry_safe;
+		thread->flush_ms = outer->flush_ms;
+		thread->aborting = false;
+		thread->overrun_count = 0;
+		thread->overrun_said_ms = 0;
+		thread->deadline_ms = outer->deadline_ms;
+		/* the handler follows the innermost realm, as the entry
+		   global and the profile's stack want */
+		JS_SetInterruptHandler(thread->heap->rt, qjs_interrupt, thread);
+		thread->heap->interrupt_thread = thread;
 		return;
 	}
 	script_why = why;
@@ -8308,6 +8345,34 @@ static void end_script(jsthread *thread)
 		return;
 	}
 	thread->script_depth = 0;
+	if (thread->entered_inside) {
+		/* back to the realm whose script entered this one */
+		jsthread *outer = thread->entered_over;
+		bool aborting = thread->aborting;
+
+		thread->entered_inside = false;
+		thread->entered_over = NULL;
+		if (thread->overrun_count > 0) {
+			thread->scripts_killed++;
+		}
+		thread->overrun_count = 0;
+		thread->deadline_ms = 0;
+		thread->aborting = false;
+		if (outer != NULL) {
+			JS_SetInterruptHandler(thread->heap->rt,
+					       qjs_interrupt, outer);
+			thread->heap->interrupt_thread = outer;
+			outer->flush_ms = thread->flush_ms;
+			/* the budget's abort unwinds into the outer script */
+			if (aborting) {
+				outer->aborting = true;
+			}
+		} else if (thread->heap->interrupt_thread == thread) {
+			JS_SetInterruptHandler(thread->heap->rt, NULL, NULL);
+			thread->heap->interrupt_thread = NULL;
+		}
+		return;
+	}
 	/* back out to NetSurf: no binding is running now, and the phase
 	 * is whatever called into script (VitaSurf) */
 	vitasurf_phase = thread->phase_was;
@@ -18573,6 +18638,17 @@ void js_destroythread(jsthread *thread)
 	if (thread->heap->interrupt_thread == thread) {
 		JS_SetInterruptHandler(thread->heap->rt, NULL, NULL);
 		thread->heap->interrupt_thread = NULL;
+	}
+	{
+		/* a realm this one's script entered must not hand the
+		   handler back to it */
+		jsthread *t;
+
+		for (t = all_threads; t != NULL; t = t->all_next) {
+			if (t->entered_over == thread) {
+				t->entered_over = NULL;
+			}
+		}
 	}
 	thread->heap->live_threads--;
 	{
