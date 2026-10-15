@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!--
+  Geometry read before the first layout (VitaSurf).
+
+  NetSurf builds a page's boxes only after the parse, a few elements at a
+  time from the scheduler, so DOMContentLoaded, and a timer that ran
+  before the boxes were done, measured every element as 0 by 0, where a
+  browser lays the document out there and then. A read now builds the
+  boxes and lays the page out at once (html_layout_early); the page is
+  made ready, and its load fires, from the scheduler after. An element
+  added after that read is measured too, and a form's controls are its
+  own. Each line must say PASS; Chrome passes them all. A read from an
+  inline script, or a timer, while the parse is still going answers 0
+  here, which this page does not test. geometry-early-timer.html reads
+  from a timer while the boxes are being built.
+-->
+<html><head><meta charset="utf-8"><title>Geometry before the first layout</title>
+<style>#box { width: 50px; height: 20px; } #late { width: 30px; height: 10px; }</style></head>
+<body>
+<div id="box">x</div>
+<form id="f" action="about:blank"><input id="i" name="q" style="width:120px"></form>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, good, got) { out.push((good ? 'PASS ' : 'FAIL ') + name + (good ? '' : ': ' + got)); }
+function size(id) { var r = document.getElementById(id).getBoundingClientRect(); return Math.round(r.width) + 'x' + Math.round(r.height); }
+addEventListener('DOMContentLoaded', function () {
+  ok('DOMContentLoaded measures the laid out box', size('box') === '50x20', size('box'));
+  ok('and the offset size agrees', document.getElementById('box').offsetWidth === 50, document.getElementById('box').offsetWidth);
+  ok('the document is as wide as the window', document.documentElement.clientWidth > 0, document.documentElement.clientWidth);
+  var late = document.createElement('div');
+  late.id = 'late';
+  document.body.insertBefore(late, document.getElementById('out'));
+});
+addEventListener('load', function () {
+  ok('load measures the box', size('box') === '50x20', size('box'));
+  setTimeout(function () {
+    ok('an element added after the early layout is measured', size('late') === '30x10', size('late'));
+    ok('the form control is laid out', document.getElementById('i').getBoundingClientRect().width >= 120,
+       document.getElementById('i').getBoundingClientRect().width);
+    ok('and belongs to its form', document.getElementById('i').form === document.getElementById('f') &&
+       document.getElementById('f').elements.length === 1, document.getElementById('f').elements.length);
+    document.getElementById('out').textContent = out.join('\n');
+    out.forEach(function (l) { console.log('geometry-early: ' + l); });
+    console.log('geometry-early: done');
+  }, 200);
+});
+</script>
+</body></html>

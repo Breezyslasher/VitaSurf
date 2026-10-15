@@ -358,6 +358,7 @@ struct jsthread {
 	bool flushing;            /**< a forced layout is running */
 	unsigned flush_ms;        /**< forced layout time in this entry */
 	unsigned flushes;         /**< forced layouts on this page */
+	unsigned early_layouts;   /**< of them, before the first (VitaSurf) */
 	unsigned flush_total_ms;  /**< and what they cost */
 	unsigned flush_waited;    /**< ones that found the page still loading */
 	unsigned flush_refused;   /**< geometry reads answered stale */
@@ -9048,6 +9049,34 @@ static void layout_flush(jsthread *thread)
 	uint64_t t0;
 	unsigned took;
 
+	/*
+	 * No boxes yet (VitaSurf): the page is read from DOMContentLoaded,
+	 * or a timer before the first layout, and every element measured 0
+	 * by 0, where a browser lays the document out there and then. Once
+	 * the parse is over and the style sheets are in, the boxes are
+	 * built now and the page laid out; nothing can hold a box when
+	 * there are none, so any entry may. Still parsing, a page's own
+	 * inline script reads 0 as before. tests/js/geometry-early.html.
+	 */
+	if (thread->htmlc != NULL && thread->htmlc->layout == NULL &&
+	    !thread->closed && !thread->flushing &&
+	    thread->htmlc->conversion_begun) {
+		bool built;
+
+		t0 = now_ms();
+		thread->flushing = true;
+		built = html_layout_early(thread->htmlc);
+		thread->flushing = false;
+		took = (unsigned)(now_ms() - t0);
+		thread->flush_ms += took;
+		thread->flush_total_ms += took;
+		if (built && thread->early_layouts++ == 0) {
+			vita_log("qjs: a geometry read before the first layout "
+				 "built the boxes and laid the page out, in "
+				 "%u ms", took);
+		}
+		return;
+	}
 	if (!thread->dom_dirty || thread->closed || thread->flushing ||
 	    thread->htmlc == NULL || thread->htmlc->layout == NULL) {
 		return;

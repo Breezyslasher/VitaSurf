@@ -1,0 +1,341 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 59333d6ed..f8beea298 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -2877,6 +2877,18 @@ dom_to_box_sync(dom_node *n, html_content *c, box_construct_complete_cb cb)
+ }
+ 
+ 
++/* exported function documented in html/box_construct.h */
++void finish_dom_to_box(void *box_conversion_context)
++{
++	struct box_construct_ctx *ctx = box_conversion_context;
++
++	/* the rest of the document now, in one go, and the callback */
++	guit->misc->schedule(-1, (void *)convert_xml_to_box, ctx);
++	ctx->sync = true;
++	convert_xml_to_box(ctx);
++}
++
++
+ /* exported function documented in html/box_construct.h */
+ nserror cancel_dom_to_box(void *box_conversion_context)
+ {
+diff --git a/content/handlers/html/box_construct.h b/content/handlers/html/box_construct.h
+index 9e429ef56..4e5d7461c 100644
+--- a/content/handlers/html/box_construct.h
++++ b/content/handlers/html/box_construct.h
+@@ -103,6 +103,13 @@ nserror dom_to_box_sync(struct dom_node *n, struct html_content *c, box_construc
+  */
+ nserror cancel_dom_to_box(void *box_conversion_context);
+ 
++/**
++ * Run a box construction begun by dom_to_box() to its end now, callback
++ * and all, instead of a few elements at a time from the scheduler
++ * (VitaSurf): a script's geometry read wants the boxes.
++ */
++void finish_dom_to_box(void *box_conversion_context);
++
+ 
+ /**
+  * Retrieve the box for a dom node, if there is one
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 9807cb90b..a026b7270 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -273,6 +273,31 @@ bool fire_dom_keyboard_event(dom_string *type, dom_node *target,
+  * \param c        HTML content to complete conversion of
+  * \param success  Whether box tree construction was successful
+  */
++static void html_reformat(struct content *c, int width, int height);
++
++/**
++ * The end of html_box_convert_done for boxes a geometry read finished
++ * early (VitaSurf), from the scheduler.
++ */
++static void html_ready_deferred(void *p)
++{
++	html_content *c = p;
++
++	c->ready_deferred = false;
++	if (c->parser != NULL) {
++		dom_hubbub_parser_destroy(c->parser);
++		c->parser = NULL;
++	}
++	if (c->aborted) {
++		return;
++	}
++	content_set_ready(&c->base);
++	if (c->jsthread != NULL) {
++		js_fire_event(c->jsthread, "load", c->document, NULL);
++	}
++	html_proceed_to_done(c);
++}
++
+ static void html_box_convert_done(html_content *c, bool success)
+ {
+ 	nserror err;
+@@ -329,6 +354,31 @@ static void html_box_convert_done(html_content *c, bool success)
+ 	}
+ 	/*imagemap_dump(c);*/
+ 
++	if (c->layout_early) {
++		/*
++		 * Finished for a script's geometry read (VitaSurf): lay the
++		 * page out at the window's size for it now, and leave the
++		 * rest -- the parser, which the end of the parse may still
++		 * be using, the window taking the content, the load event --
++		 * to the scheduler, outside the script.
++		 */
++		unsigned w = 0, h = 0;
++		union content_msg_data dims = {
++			.getdims = {
++				.viewport_width = &w,
++				.viewport_height = &h,
++			},
++		};
++
++		c->layout_early = false;
++		content_broadcast(&c->base, CONTENT_MSG_GETDIMS, &dims);
++		html_reformat(&c->base, (int)w, (int)h);
++		c->ready_deferred = true;
++		guit->misc->schedule(0, html_ready_deferred, c);
++		dom_node_unref(html);
++		return;
++	}
++
+ 	/* Destroy the parser binding */
+ 	dom_hubbub_parser_destroy(c->parser);
+ 	c->parser = NULL;
+@@ -1277,6 +1327,113 @@ static bool html_forms_from_dom(html_content *htmlc)
+ static bool html_begin_conversion_inner(html_content *htmlc);
+ 
+ /* exported interface documented in html/private.h */
++/**
++ * Take the encoding and the forms, and check the root is html, before
++ * the boxes are built: once, whether the parse's end or a geometry read
++ * gets here first (VitaSurf).
++ *
++ * 
++eturn false on an error, already broadcast
++ */
++static bool html_conversion_prepare(html_content *htmlc)
++{
++	dom_exception exc; /* returned by libdom functions */
++	dom_string *node_name;
++	dom_node *html;
++
++	if (htmlc->conversion_prepared) {
++		return true;
++	}
++
++	/* get encoding */
++	if (htmlc->encoding == NULL) {
++		const char *encoding;
++
++		encoding = dom_hubbub_parser_get_encoding(htmlc->parser,
++					&htmlc->encoding_source);
++		if (encoding == NULL) {
++			content_broadcast_error(&htmlc->base,
++						NSERROR_NOMEM,
++						NULL);
++			return false;
++		}
++
++		htmlc->encoding = strdup(encoding);
++		if (htmlc->encoding == NULL) {
++			content_broadcast_error(&htmlc->base,
++						NSERROR_NOMEM,
++						NULL);
++			return false;
++		}
++	}
++
++	/* locate root element and ensure it is html */
++	exc = dom_document_get_document_element(htmlc->document, (void *) &html);
++	if ((exc != DOM_NO_ERR) || (html == NULL)) {
++		NSLOG(netsurf, INFO, "error retrieving html element from dom");
++		content_broadcast_error(&htmlc->base, NSERROR_DOM, NULL);
++		return false;
++	}
++
++	exc = dom_node_get_node_name(html, &node_name);
++	if ((exc != DOM_NO_ERR) ||
++	    (node_name == NULL) ||
++	    (!dom_string_caseless_lwc_isequal(node_name,
++			corestring_lwc_html))) {
++		NSLOG(netsurf, INFO, "root element not html");
++		content_broadcast_error(&htmlc->base, NSERROR_DOM, NULL);
++		if (node_name != NULL) {
++			dom_string_unref(node_name);
++		}
++		dom_node_unref(html);
++		return false;
++	}
++	dom_string_unref(node_name);
++
++	/* Retrieve forms from parser */
++	if (html_forms_from_dom(htmlc) == false) {
++		dom_node_unref(html);
++		return false;
++	}
++
++	dom_node_unref(html);
++	htmlc->conversion_prepared = true;
++
++	return true;
++}
++
++/* exported function documented in html/private.h */
++bool html_layout_early(html_content *htmlc)
++{
++	if (htmlc->layout != NULL) {
++		return true;
++	}
++	/* still parsing, gone, or already waiting to be made ready */
++	if (htmlc->aborted || !htmlc->conversion_begun ||
++	    htmlc->parser == NULL || htmlc->ready_deferred) {
++		return false;
++	}
++	if (htmlc->box_conversion_context == NULL) {
++		/* not begun: the style sheets must be in, as they must for
++		 * the boxes to be begun at all; a selection context with no
++		 * conversion is a content past this point */
++		if (htmlc->select_ctx != NULL ||
++		    html_can_begin_conversion(htmlc) == false ||
++		    html_conversion_prepare(htmlc) == false) {
++			return false;
++		}
++		html_finish_conversion(htmlc);
++		if (htmlc->box_conversion_context == NULL) {
++			return htmlc->layout != NULL;
++		}
++	}
++	htmlc->layout_early = true;
++	finish_dom_to_box(htmlc->box_conversion_context);
++	htmlc->layout_early = false;
++
++	return htmlc->layout != NULL;
++}
++
+ bool
+ html_begin_conversion(html_content *htmlc)
+ {
+@@ -1302,9 +1459,6 @@ html_begin_conversion(html_content *htmlc)
+ static bool
+ html_begin_conversion_inner(html_content *htmlc)
+ {
+-	dom_node *html;
+-	dom_exception exc; /* returned by libdom functions */
+-	dom_string *node_name = NULL;
+ 	dom_hubbub_error error;
+ 
+ 	/*
+@@ -1433,56 +1587,10 @@ html_begin_conversion_inner(html_content *htmlc)
+ 			      (struct dom_node *) htmlc->document);
+ 	}
+ 
+-	/* get encoding */
+-	if (htmlc->encoding == NULL) {
+-		const char *encoding;
+-
+-		encoding = dom_hubbub_parser_get_encoding(htmlc->parser,
+-					&htmlc->encoding_source);
+-		if (encoding == NULL) {
+-			content_broadcast_error(&htmlc->base,
+-						NSERROR_NOMEM,
+-						NULL);
+-			return false;
+-		}
+-
+-		htmlc->encoding = strdup(encoding);
+-		if (htmlc->encoding == NULL) {
+-			content_broadcast_error(&htmlc->base,
+-						NSERROR_NOMEM,
+-						NULL);
+-			return false;
+-		}
+-	}
+-
+-	/* locate root element and ensure it is html */
+-	exc = dom_document_get_document_element(htmlc->document, (void *) &html);
+-	if ((exc != DOM_NO_ERR) || (html == NULL)) {
+-		NSLOG(netsurf, INFO, "error retrieving html element from dom");
+-		content_broadcast_error(&htmlc->base, NSERROR_DOM, NULL);
++	if (html_conversion_prepare(htmlc) == false) {
+ 		return false;
+ 	}
+ 
+-	exc = dom_node_get_node_name(html, &node_name);
+-	if ((exc != DOM_NO_ERR) ||
+-	    (node_name == NULL) ||
+-	    (!dom_string_caseless_lwc_isequal(node_name,
+-			corestring_lwc_html))) {
+-		NSLOG(netsurf, INFO, "root element not html");
+-		content_broadcast_error(&htmlc->base, NSERROR_DOM, NULL);
+-		dom_node_unref(html);
+-		return false;
+-	}
+-	dom_string_unref(node_name);
+-
+-	/* Retrieve forms from parser */
+-	if (html_forms_from_dom(htmlc) == false) {
+-		dom_node_unref(html);
+-		return false;
+-	}
+-
+-	dom_node_unref(html);
+-
+ 	if (html_fetches_settled(htmlc)) {
+ 		html_finish_conversion(htmlc);
+ 	}
+@@ -2093,6 +2201,9 @@ static void html_destroy(struct content *c)
+ 
+ 	html_live_remove(html);
+ 
++	/* made ready from the scheduler, after a geometry read (VitaSurf) */
++	guit->misc->schedule(-1, html_ready_deferred, html);
++
+ 	/* fetches started ahead of its parser (VitaSurf) */
+ 	html_preload_free(html);
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 8069667f8..05457288e 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -101,6 +101,15 @@ typedef struct html_content {
+ 	dom_hubbub_parser *parser; /**< Parser object handle */
+ 	bool parse_completed; /**< Whether the parse has been completed */
+ 	bool conversion_begun; /**< Whether or not the conversion has begun */
++	/** the encoding and forms are taken, before the boxes are built
++	 * (VitaSurf) */
++	bool conversion_prepared;
++	/** the boxes are being finished for a script's geometry read: the
++	 * content is laid out at once, and made ready from the scheduler
++	 * (VitaSurf) */
++	bool layout_early;
++	/** html_ready_deferred is scheduled (VitaSurf) */
++	bool ready_deferred;
+ 
+ 	/** Document tree */
+ 	dom_document *document;
+@@ -664,6 +673,19 @@ bool html_restyle_attrs(html_content *c,
+  */
+ nserror html_relayout(html_content *htmlc);
+ 
++/**
++ * Build the boxes and lay the page out now, for a script's geometry
++ * read before its first layout (VitaSurf). Once the parse has finished
++ * and the style sheets are in, the box construction is begun, or run to
++ * its end if begun, and the page laid out at the window's size; the
++ * content's ready and load wait for the scheduler, so nothing of
++ * NetSurf's runs inside the script.
++ *
++ * \param htmlc html content
++ * eturn true if the content now has a layout
++ */
++bool html_layout_early(html_content *htmlc);
++
+ /**
+  * Put an element in a :hover, :active, :focus or :target state and
+  * restyle what that changes (VitaSurf): in place when only paint
