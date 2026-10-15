@@ -1,0 +1,74 @@
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index acc9643c1..f732b8c6d 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -485,6 +485,37 @@ static nserror browser_window_start_throbber(struct browser_window *bw)
+ }
+ 
+ 
++/**
++ * Stop what the page a navigation is leaving still loads (VitaSurf).
++ *
++ * Called when the navigation commits, which is where the HTML standard
++ * unloads the old document and aborts its child navigables' loads.
++ * NetSurf keeps the page on the screen until the next is ready, and
++ * the frames its script made after the navigation began loaded on:
++ * BBC's offer iframe, left for lite.cnn.com, parsed and ran 1 MB of
++ * jQuery and Angular there, 2 s, while the new page waited.
++ *
++ * \param bw browser window whose navigation commits
++ */
++static void browser_window_stop_left(struct browser_window *bw)
++{
++	int index;
++
++	if (bw->current_content != NULL &&
++	    content_get_status(bw->current_content) == CONTENT_STATUS_READY) {
++		hlcache_handle_abort(bw->current_content);
++	}
++	if (bw->children != NULL) {
++		for (index = 0; index < bw->rows * bw->cols; index++) {
++			browser_window_stop(&bw->children[index]);
++		}
++	}
++	for (index = 0; index < bw->iframe_count; index++) {
++		browser_window_stop(bw->iframes[index]);
++	}
++}
++
++
+ /**
+  * Stop the busy indicator.
+  *
+@@ -1050,10 +1081,20 @@ browser_window_content_done(struct browser_window *bw)
+ 
+ 	browser_window_update(bw, false);
+ 	browser_window_set_status(bw, content_get_status_message(bw->current_content));
+-	browser_window_stop_throbber(bw);
+-	browser_window_update_favicon(bw->current_content, bw, NULL);
++	/*
++	 * The page being left can finish while the next one loads, its last
++	 * fetches ended by the navigation (VitaSurf): the window is still
++	 * busy, its icon is the next page's to set, and it is not scrolled
++	 * to where it was left. The throbber had stopped, and the site test
++	 * took the Guardian for loaded in 94 ms.
++	 */
++	if (bw->loading_content == NULL) {
++		browser_window_stop_throbber(bw);
++		browser_window_update_favicon(bw->current_content, bw, NULL);
++	}
+ 
+-	if (browser_window_history_get_scroll(bw, &sx, &sy) == NSERROR_OK) {
++	if (bw->loading_content == NULL &&
++	    browser_window_history_get_scroll(bw, &sx, &sy) == NSERROR_OK) {
+ 		scrollx = (int)((float)content_get_width(bw->current_content) * sx);
+ 		scrolly = (int)((float)content_get_height(bw->current_content) * sy);
+ 		rect.x0 = rect.x1 = scrollx;
+@@ -1740,6 +1781,7 @@ browser_window_callback(hlcache_handle *c, const hlcache_event *event, void *pw)
+ 			/* the navigation commits: the page it replaces, and
+ 			 * its frames, are frozen from here (VitaSurf) */
+ 			bw->frozen_current = bw->current_content;
++			browser_window_stop_left(bw);
+ 
+ 			if (js_newthread(bw->jsheap,
+ 					 bw,

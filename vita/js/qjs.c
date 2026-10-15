@@ -111,6 +111,9 @@ struct jsheap {
 	 * until the next page installs its own.
 	 */
 	struct jsthread *interrupt_thread;
+	/* pages closed since the runtime was last collected (VitaSurf):
+	 * heap_collect_cb runs once for all of them */
+	unsigned int closed_uncollected;
 };
 
 struct js_listener;
@@ -1054,6 +1057,7 @@ static const char *thread_url(jsthread *thread);
 /* the first runtime made, the page's, for the memory report (VitaSurf) */
 static JSRuntime *qjs_memory_rt;
 static unsigned runtime_kb(JSRuntime *rt);
+static void heap_collect_cb(void *p);
 
 /** Whether a walk began at the document or its root element. */
 static bool walk_from_top(jsthread *thread, struct dom_node *root)
@@ -8956,6 +8960,18 @@ static void relayout_callback(void *p)
 			relayout_forget(thread);
 			return;
 		}
+	}
+	/*
+	 * Nor is a page the next one is replacing (VitaSurf): it waits as
+	 * its timers do, and is laid out if it stays. BBC, left for
+	 * lite.cnn.com, rebuilt its 1421 elements twice, 1 s, while the
+	 * new page's boxes waited behind it.
+	 */
+	if (thread_frozen(thread, FROZEN_ASK)) {
+		guit->misc->schedule(FROZEN_POLL_MS, relayout_callback, thread);
+		thread->relayout_pending = true;
+		thread->relayout_due = (uint32_t)now_ms() + FROZEN_POLL_MS;
+		return;
 	}
 
 	/*
@@ -18498,6 +18514,9 @@ void js_destroyheap(jsheap *heap)
 		heap->pending_destroy = true;
 		return;
 	}
+	if (heap->closed_uncollected > 0) {
+		guit->misc->schedule(-1, heap_collect_cb, heap);
+	}
 	if (heap->rt != NULL) {
 		if (qjs_memory_rt == heap->rt)
 			qjs_memory_rt = NULL;
@@ -18711,6 +18730,22 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
  * page's scripts can hold tens of MB and the runtime's memory limit is
  * shared by every page in the window.
  */
+/** Collect what the pages closed since the last collection left. */
+static void heap_collect_cb(void *p)
+{
+	jsheap *heap = p;
+	uint64_t t0 = now_ms();
+	unsigned int before = runtime_kb(heap->rt), ms;
+
+	JS_RunGC(heap->rt);
+	ms = (unsigned int)(now_ms() - t0);
+	vitasurf_ms_teardown += ms;
+	vita_log("qjs: collected what %u closed pages left in %u ms, "
+		 "runtime memory %u KB, was %u KB",
+		 heap->closed_uncollected, ms, runtime_kb(heap->rt), before);
+	heap->closed_uncollected = 0;
+}
+
 nserror js_closethread(jsthread *thread)
 {
 	struct js_timer *t;
@@ -18815,7 +18850,17 @@ nserror js_closethread(jsthread *thread)
 	bc_serialise_context(thread->ctx);
 	JS_FreeContext(thread->ctx);
 	thread->ctx = NULL;
-	JS_RunGC(thread->heap->rt);
+	/*
+	 * What it left is collected once every page closing with it has
+	 * closed (VitaSurf). A page and its frames share the top window's
+	 * runtime and close one after another when the next page is shown,
+	 * and each close collected the whole runtime while the others still
+	 * held what it left: BBC and its three frames were four
+	 * collections, 2761 ms, the first three freeing almost nothing.
+	 */
+	if (thread->heap->closed_uncollected++ == 0) {
+		guit->misc->schedule(0, heap_collect_cb, thread->heap);
+	}
 	t1 = now_ms();
 	vitasurf_ms_teardown += (unsigned)(t1 - t0);
 	gap_report();
@@ -18832,7 +18877,8 @@ nserror js_closethread(jsthread *thread)
 			 thread->flushes, thread->flush_waited,
 			 thread->flush_total_ms, thread->flush_refused);
 	}
-	vita_log("qjs: page closed in %u ms, runtime memory now %u KB; "
+	vita_log("qjs: page closed in %u ms, runtime memory %u KB before "
+		 "it is collected; "
 		 "%u functions compiled when first called while it was "
 		 "open, in %u ms",
 		 (unsigned)(t1 - t0), runtime_kb(thread->heap->rt),

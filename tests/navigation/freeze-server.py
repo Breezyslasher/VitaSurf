@@ -25,6 +25,15 @@ quarter of a second of "slow asked" and none come before "slow answered"
 Go to /a-self instead, a page whose own script sends it to /slow after
 a second: the ticks go on through the four seconds, since a navigation a
 page asked for leaves it running until the commit, as Chrome does.
+
+/a-frame sends itself to /b-late after half a second, and a tenth of a
+second later, the navigation under way, adds an iframe whose script the
+server keeps three seconds. /b-late answers after a second and commits,
+and the HTML standard unloads /a-frame there, its frame's load with it:
+the server prints "frame script asked" but never "frame ran", and the
+log never compiles /frame.js. NetSurf had loaded and run the frames the
+page it was leaving made after the navigation began (BBC's offer
+iframe, left for lite.cnn.com, 2 s of jQuery and Angular).
 """
 import http.server, socketserver, sys, time
 
@@ -41,6 +50,21 @@ setInterval(function () {
 </script>'''
 
 
+A_FRAME = (b'<!DOCTYPE html><title>A frame</title><p>page A with a frame'
+           b'<script>setTimeout(function () {'
+           b'  location.href = "/b-late";'
+           b'  setTimeout(function () {'
+           b'    var f = document.createElement("iframe");'
+           b'    f.src = "/frame";'
+           b'    document.body.appendChild(f);'
+           b'  }, 100);'
+           b'}, 500);</script>')
+
+FRAME = b'<!DOCTYPE html><title>Frame</title><p>frame<script src="/frame.js"></script><p>after'
+
+FRAME_JS = b"fetch('/tick?frame=ran').catch(function () {});"
+
+
 A_SELF = A.replace(b'</script>', b'setTimeout(function () { location.href = "/slow"; }, 1000);\n</script>')
 
 
@@ -53,7 +77,9 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split('?')[0]
         if path == '/tick':
-            print('%.2f tick %s' % (time.time() - T0, self.path), flush=True)
+            print('%.2f %s %s' % (time.time() - T0,
+                                  'frame ran' if 'frame' in self.path else 'tick',
+                                  self.path), flush=True)
             self.send_response(204)
             self.send_header('Content-Length', '0')
             self.end_headers()
@@ -69,6 +95,24 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(A_SELF)))
             self.end_headers()
             self.wfile.write(A_SELF)
+        elif path in ('/a-frame', '/frame'):
+            body = A_FRAME if path == '/a-frame' else FRAME
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == '/frame.js':
+            print('%.2f frame script asked' % (time.time() - T0), flush=True)
+            time.sleep(3)
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/javascript')
+            self.send_header('Content-Length', str(len(FRAME_JS)))
+            self.end_headers()
+            try:
+                self.wfile.write(FRAME_JS)
+            except OSError:
+                pass
         elif path == '/slow':
             print('%.2f slow asked' % (time.time() - T0), flush=True)
             time.sleep(4)
@@ -79,8 +123,10 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif path == '/b':
+        elif path in ('/b', '/b-late'):
             print('%.2f b asked' % (time.time() - T0), flush=True)
+            if path == '/b-late':
+                time.sleep(1)
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.send_header('Connection', 'close')
