@@ -217,3 +217,12 @@
 0x6cb0f
 0x41e4d
 0x9daed
+# Build 680: data abort on duckduckgo.com in the second site test run,
+#   main thread, in css_node_connected (css_sheet_unused,
+#   html_convert_css_callback), taking 0x19 for the element of a sheet.
+#   The sheet's load event ran a listener that added sheets, the array
+#   of the page's sheets was reallocated, and the callback read its
+#   entry from the freed copy. Fixed by patch 0425. PC, LR, caller.
+0x60ce8
+0x60ec5
+0x61119

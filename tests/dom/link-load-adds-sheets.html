@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!--
+  A stylesheet's load event adding more stylesheets (netsurf patch 0425).
+
+  After the page is styled, a <link> is added; its load listener adds
+  eight more links and thirty <style> elements, which grows NetSurf's
+  list of the page's sheets. The callback that fired the load event then
+  read the first link's entry from the list as it was before it moved:
+  duckduckgo.com crashed on the Vita there, and valgrind reports an
+  invalid read in html_convert_css_callback for this page without the
+  fix. Run it under valgrind; each line must say PASS.
+-->
+<html><head><meta charset="utf-8"><title>Sheets added from a sheet's load event</title>
+<link rel="stylesheet" href="data:text/css,p.c0%7Bcolor:rgb(1,0,0)%7D">
+<script>
+function sheet(i) {
+  var l = document.createElement('link');
+  l.rel = 'stylesheet';
+  l.href = 'data:text/css,p.c' + i + '%7Bcolor:rgb(' + i + ',0,0)%7D';
+  return l;
+}
+function report(lines) {
+  document.getElementById('out').textContent = lines.join('\n');
+  lines.forEach(function (l) { console.log('link-load-adds-sheets: ' + l); });
+}
+function more() {
+  for (var i = 2; i < 10; i++)
+    document.head.appendChild(sheet(i));
+  for (var j = 0; j < 30; j++) {
+    var st = document.createElement('style');
+    st.textContent = 'p.x' + j + '{margin-left:' + j + 'px}';
+    document.head.appendChild(st);
+  }
+  setTimeout(function () {
+    var p = document.querySelector('p.c9.x29');
+    var cs = getComputedStyle(p);
+    report([
+      (cs.color === 'rgb(9, 0, 0)' ? 'PASS' : 'FAIL') +
+        ' a sheet added from the load event applies (' + cs.color + ')',
+      (cs.marginLeft === '29px' ? 'PASS' : 'FAIL') +
+        ' a style added from the load event applies (' + cs.marginLeft + ')',
+      'done'
+    ]);
+  }, 500);
+}
+addEventListener('load', function () {
+  setTimeout(function () {
+    var l = sheet(1);
+    l.onload = more;
+    document.head.appendChild(l);
+  }, 50);
+});
+</script></head>
+<body><p class="c9 x29">x</p><pre id="out"></pre></body></html>

@@ -1,0 +1,20 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 3533b9c81..4a520ad97 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -465,6 +465,15 @@ html_convert_css_callback(hlcache_handle *css,
+ 		html_script_css_settled(parent);
+ 	}
+ 
++	/*
++	 * The load or error event above, and a parser script that was
++	 * waiting for the sheets, ran script, which may have added sheets
++	 * and so moved the array (VitaSurf): duckduckgo.com's crashed
++	 * reading this one's element from the freed copy. Sheets are only
++	 * ever appended, so its index still finds it.
++	 */
++	s = &parent->stylesheets[i];
++
+ 	if (parent->select_ctx != NULL) {
+ 		/*
+ 		 * The page was styled and laid out already: this sheet is
