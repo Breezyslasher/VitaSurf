@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<!--
+  Freeing a page whose elements have shadow roots (libdom patch 0424).
+
+  Run it in the harness under valgrind and quit, or leave the page on the
+  Vita for the cache to free it:
+
+    valgrind -q ./nsmonkey   (WINDOW GO this page, then QUIT)
+
+  When the document was torn down, an element let go of its shadow root,
+  the shadow root left the document's pending list, and that asked for
+  the document to be destroyed again: the tree was torn down a second
+  time from inside the first, over elements already freed. bbc.com
+  crashed on the Vita as reddit.com's page was freed, and valgrind
+  reported an invalid read in _dom_node_finalise for this page. With the
+  fix valgrind reports nothing and the document is not leaked.
+-->
+<html><head><meta charset="utf-8"><title>Shadow roots freed with their page</title></head>
+<body>
+<div id="h">host</div>
+<section id="nest">nested host</section>
+<x-card></x-card>
+<pre id="out"></pre>
+<script>
+var r = document.getElementById('h').attachShadow({mode: 'open'});
+r.innerHTML = '<p>inside</p><span>more</span>';
+var n = document.getElementById('nest').attachShadow({mode: 'closed'});
+n.innerHTML = '<div id="inner">x</div>';
+n.getElementById('inner').attachShadow({mode: 'open'}).innerHTML = '<i>deeper</i>';
+customElements.define('x-card', class extends HTMLElement {
+  constructor() { super(); this.attachShadow({mode: 'open'}).innerHTML = '<b>card</b>'; }
+});
+var ok = r.childNodes.length === 2 && document.querySelector('x-card').shadowRoot !== null;
+document.getElementById('out').textContent = (ok ? 'PASS' : 'FAIL') + ' shadow roots attached';
+console.log('shadow-teardown: ' + (ok ? 'PASS' : 'FAIL') + ' shadow roots attached');
+</script>
+</body></html>

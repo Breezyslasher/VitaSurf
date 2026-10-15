@@ -199,3 +199,21 @@
 #   past twenty seconds. PC, LR.
 0x113702
 0x11856f
+# Build 678: prefetch abort (PC 2) on www.bbc.com during the site test,
+#   main thread, as the cache freed reddit.com's page (hlcache_clean,
+#   content_destroy, html_destroy, the document's unref). Tearing the
+#   document's tree down freed an element, the element let go of its
+#   shadow root, and the shadow root leaving the document's pending
+#   list asked for the document to be destroyed again: the tree was
+#   torn down a second time from inside the first, and called a freed
+#   element's destroy through allocator data. Every page with a shadow
+#   root did this when freed (valgrind: 26 invalid reads on
+#   tests/dom/shadow-root.html). Fixed by libdom patch 0424. LR, then
+#   the frames down to html_destroy.
+0x155f3b
+0x1554c9
+0x1603cf
+0x15f829
+0x6cb0f
+0x41e4d
+0x9daed
