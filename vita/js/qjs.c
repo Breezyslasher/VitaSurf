@@ -471,6 +471,7 @@ struct jsthread {
 				   *   JS_UNINITIALIZED before it is looked
 				   *   up and JS_UNDEFINED if there is none */
 	int event_depth;          /**< DOM event dispatches in progress */
+	unsigned slow_style_notes; /**< slow computed style reads logged */
 	unsigned shadow_notes;    /**< shadow root lines logged for this
 				       page, which stop at SHADOW_NOTES */
 	unsigned message_notes;   /**< and postMessage lines */
@@ -13909,7 +13910,9 @@ static const css_select_results *select_without_box(jsthread *thread,
 	bool stale = style_stale(thread);
 	bool have_layout = layout_current(thread) && !stale;
 	css_select_ctx *now = NULL, *kept_ctx = NULL;
-	uint64_t t0;
+	uint64_t t0, t_ctx;
+	unsigned int css0, index0;
+	bool parent_from_box = false;
 
 	/* before conversion html_select_style uses the sheets loaded so
 	 * far */
@@ -13938,6 +13941,7 @@ static const css_select_results *select_without_box(jsthread *thread,
 			struct box *b = have_layout ? box_for_node(n) : NULL;
 
 			if (b != NULL && b->style != NULL) {
+				parent_from_box = true;
 				parent = b->style;
 				/* the root's style, which rem and some
 				 * inheritance read, once box construction
@@ -13976,6 +13980,8 @@ static const css_select_results *select_without_box(jsthread *thread,
 	if (depth == 0)
 		return NULL;
 	t0 = now_ms();
+	css0 = vitasurf_ms_css;
+	index0 = vitasurf_ms_css_index;
 	/* the sheets as they are now, when the page's context is behind
 	 * them; lent to the selections below and put back after */
 	if (stale) {
@@ -13985,6 +13991,7 @@ static const css_select_results *select_without_box(jsthread *thread,
 			htmlc->select_ctx = now;
 		}
 	}
+	t_ctx = now_ms();
 	for (i = depth - 1; i >= 0; i--) {
 		css_select_results *got;
 
@@ -14014,7 +14021,35 @@ static const css_select_results *select_without_box(jsthread *thread,
 	}
 	if (kept_ctx != NULL)
 		htmlc->select_ctx = kept_ctx;
-	thread->style_memo_ms += (uint32_t)(now_ms() - t0);
+	{
+		uint64_t t1 = now_ms();
+
+		thread->style_memo_ms += (uint32_t)(t1 - t0);
+		/*
+		 * Which part of a slow read it was (VitaSurf): reddit.com's
+		 * ten reads before its first layout took 11 s, and nothing
+		 * said whether that was the sheets, their index or the
+		 * selection of every ancestor.
+		 */
+		if (t1 - t0 >= 200 && thread->slow_style_notes < 20) {
+			thread->slow_style_notes++;
+			vita_log("qjs: a computed style read took %u ms: the "
+				 "context %u ms (%s, sheets parsed %u ms, "
+				 "index %u ms), then %d elements selected "
+				 "in %u ms, %s; %u sheets",
+				 (unsigned)(t1 - t0), (unsigned)(t_ctx - t0),
+				 !stale ? "the page's" :
+				 htmlc->layout == NULL ? "an early one" :
+				 "the sheets now",
+				 vitasurf_ms_css - css0,
+				 vitasurf_ms_css_index - index0,
+				 depth, (unsigned)(t1 - t_ctx),
+				 parent_from_box ? "up to an element with a box" :
+				 depth == STYLE_MEMO_CHAIN ? "the most it takes" :
+				 "up to one already selected or the root",
+				 htmlc->stylesheet_count);
+		}
+	}
 out:
 	for (i = 0; i < depth; i++)
 		dom_node_unref(chain[i]);
