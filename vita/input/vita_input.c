@@ -19,8 +19,9 @@
  *   Start        menu: bookmarks, history, settings, quit (vita_menu.c)
  *   Left stick   scroll, speed follows deflection
  *   Right stick  move the pointer (handled in the surface)
- *   Touch        tap to click, drag to scroll, or drag what the page
- *                lets a finger drag (a slider)
+ *   Touch        tap to click, drag to scroll (a box under the finger
+ *                first) with a fling, or drag what the page lets a
+ *                finger drag; hold for contextmenu; pinch to zoom
  *
  * Link focus walks the HTML box tree of the current page, so it needs
  * the html handler's headers; nothing here modifies the tree.
@@ -30,6 +31,7 @@
  */
 
 #include <ctype.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -2276,12 +2278,6 @@ static void check_resume(void)
 #define PRESS_MOVED_PX 6
 
 static struct {
-	unsigned id;		/**< the touch it is for */
-	bool live;		/**< the page has the touch */
-	int x, y;		/**< where it last went, on the page */
-} touch_drag;
-
-static struct {
 	bool live;		/**< Cross is down on the page */
 	bool moved;		/**< and the pointer has gone from where */
 	int x0, y0;		/**< it went down, screen pixels */
@@ -2301,6 +2297,10 @@ static bool screen_to_page(int x, int y, int *px, int *py)
 	ay = fbtk_get_absy(the_gw->browser);
 	if (x < ax || y < ay || x >= ax + fbtk_get_width(the_gw->browser) ||
 	    y >= ay + fbtk_get_height(the_gw->browser)) {
+		return false;
+	}
+	/* and nothing over it there: the on-screen keyboard, a menu */
+	if (fbtk_get_widget_at(the_gw->browser, x, y) != the_gw->browser) {
 		return false;
 	}
 	viewport(&sx, &sy, &vw, &vh);
@@ -2323,63 +2323,395 @@ static bool pointer_at(int *x, int *y)
 	return true;
 }
 
-/** A finger's drag: the page's, or a scroll. Takes the scroll away
- * from st while the page has it. */
-static void touch_drags(struct vita_input_state *st)
-{
-	int x, y, x0, y0;
-	unsigned r, m;
-	bool across;
+/*
+ * The touch screen (VitaSurf), as a phone's browser has it. A finger
+ * going down on the page is sent to it at once (pointerdown, touchstart);
+ * then one of:
+ *
+ *   a tap       pointerup and touchend, then, unless the page cancelled
+ *               touchend, the mouse's events and a click from a finger,
+ *               which follows links and works controls as before;
+ *   a drag      the page's when it cancelled touchstart or the first
+ *               touchmove or touch-action forbids panning that way, and
+ *               otherwise a scroll: of the box under the finger that can
+ *               scroll, innermost first, else of the page, held to that
+ *               one for the whole drag, and carried on after the finger
+ *               lifts at the speed it was going, slowing as a phone's
+ *               does; the page is sent pointercancel and touchcancel;
+ *   a long press contextmenu after half a second still, and no click;
+ *   a pinch     a second finger: the page's touch is cancelled, and the
+ *               page is zoomed by how far the fingers moved apart, about
+ *               the point between them, when they lift (laying a page out
+ *               again takes too long to follow the fingers).
+ *
+ * A tap anywhere else (the toolbar, the on-screen keyboard, the menu) is
+ * the pointer's click there, as before.
+ */
+#define HOLD_US            500000
+#define FLING_MIN_PX_MS    0.15f
+#define FLING_STOP_PX_MS   0.02f
+#define FLING_TAU_MS       325.0f
+#define PINCH_MIN          0.5f
+#define PINCH_MAX          3.0f
 
-	if (touch_drag.live &&
-	    (!st->touching || st->touch_id != touch_drag.id)) {
-		html_page_drag(the_gw->bw, HTML_PAGE_DRAG_UP, true,
-			       touch_drag.x, touch_drag.y);
-		touch_drag.live = false;
-		st->drag_dx = st->drag_dy = 0;
+enum touch_phase {
+	TOUCH_NONE,	/* no finger, or one already dealt with */
+	TOUCH_PRESSED,	/* down on the page, not yet moved or held */
+	TOUCH_PAGE,	/* the page has the drag */
+	TOUCH_SCROLL,	/* the drag scrolls */
+	TOUCH_HOLD,	/* held: contextmenu was sent */
+	TOUCH_PINCH,	/* two fingers */
+	TOUCH_OFF	/* not on the page: drags scroll, taps click */
+};
+
+static struct {
+	unsigned id;		/**< the touch it is for */
+	enum touch_phase phase;
+	unsigned down;		/**< what the press answered */
+	int x, y;		/**< where it last went, on the page */
+	int sx0, sy0;		/**< where it went down, screen pixels */
+	unsigned tap_seq;	/**< the last tap acted on */
+	/* the scroll, held to one box or the page for the gesture */
+	bool latched, inner;
+	float vx, vy;		/**< content pixels per ms */
+	uint64_t last_move_us, last_us;
+	/* the pinch */
+	float d0, s0, s;
+	int cx, cy;		/**< between the fingers, screen pixels */
+} touch;
+
+static struct {
+	bool on;
+	float vx, vy;
+	float ax, ay;		/**< sub-pixel carry */
+	uint64_t last_us;
+} fling;
+
+/** Scroll the gesture's box or the page by dx, dy content pixels; true
+ * if anything moved. */
+static bool touch_scroll(int dx, int dy)
+{
+	int sx, sy, vw, vh, nx, ny, ax, ay;
+	struct rect want;
+
+	if (dx == 0 && dy == 0) {
+		return false;
 	}
-	if (!st->dragging || !st->touching) {
+	ax = fbtk_get_absx(the_gw->browser);
+	ay = fbtk_get_absy(the_gw->browser);
+	viewport(&sx, &sy, &vw, &vh);
+	if (!touch.latched || touch.inner) {
+		/* a box under where the finger went down, in the page's
+		 * scaled coordinates */
+		if (browser_window_scroll_at_point(the_gw->bw,
+				touch.sx0 - ax + sx, touch.sy0 - ay + sy,
+				dx, dy)) {
+			touch.latched = true;
+			touch.inner = true;
+			return true;
+		}
+		if (touch.latched) {
+			return false;	/* the box is at its end */
+		}
+		touch.latched = true;
+		touch.inner = false;
+	}
+	want.x0 = sx + dx;
+	want.y0 = sy + dy;
+	if (want.x0 < 0) want.x0 = 0;
+	if (want.y0 < 0) want.y0 = 0;
+	want.x1 = want.x0;
+	want.y1 = want.y0;
+	guit->window->set_scroll(the_gw, &want);
+	viewport(&nx, &ny, &vw, &vh);
+	return nx != sx || ny != sy;
+}
+
+/** A tap: on the page, the page's and then a click; elsewhere, the
+ * pointer's click there. pressed: the page was sent its press already. */
+static void touch_tap(int x, int y, bool pressed)
+{
+	int px, py;
+	unsigned r;
+
+	if (!vita_menu_is_open() && screen_to_page(x, y, &px, &py)) {
+		if (!pressed) {
+			r = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_DOWN,
+					   true, px, py);
+			pressed = (r & HTML_PAGE_DRAG_STARTED) != 0;
+		}
+		if (pressed) {
+			r = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_UP,
+					   true, px, py);
+			if (r & HTML_PAGE_DRAG_CANCELLED) {
+				vita_log("input: the page cancelled a tap's "
+					 "touchend, so no click");
+				return;
+			}
+			html_page_drag(the_gw->bw, HTML_PAGE_DRAG_TAPPED,
+				       true, px, py);
+		}
+	}
+	fbtk_warp_pointer(fbtk, x, y, false);
+	click_at_pointer();
+}
+
+/** The pinch's end: zoom about the point between the fingers. */
+static void pinch_end(void)
+{
+	int sx, sy, vw, vh, ax, ay;
+	float s0 = touch.s0, s1 = touch.s, px, py;
+	struct rect want;
+
+	if (s1 < PINCH_MIN) s1 = PINCH_MIN;
+	if (s1 > PINCH_MAX) s1 = PINCH_MAX;
+	if (s1 / s0 > 0.95f && s1 / s0 < 1.05f) {
 		return;
 	}
-	if (touch_drag.live) {
+	ax = fbtk_get_absx(the_gw->browser);
+	ay = fbtk_get_absy(the_gw->browser);
+	viewport(&sx, &sy, &vw, &vh);
+	/* the page's point under the fingers stays under them */
+	px = (touch.cx - ax + sx) / s0;
+	py = (touch.cy - ay + sy) / s0;
+	browser_window_set_scale(the_gw->bw, s1, true);
+	want.x0 = (int)(px * s1) - (touch.cx - ax);
+	want.y0 = (int)(py * s1) - (touch.cy - ay);
+	if (want.x0 < 0) want.x0 = 0;
+	if (want.y0 < 0) want.y0 = 0;
+	want.x1 = want.x0;
+	want.y1 = want.y0;
+	guit->window->set_scroll(the_gw, &want);
+	vita_log("input: pinched to %d%%", (int)(s1 * 100.0f + 0.5f));
+}
+
+/** The page's touch ends without a tap: lifted, or taken from it. */
+static void touch_release_page(void)
+{
+	if (touch.phase == TOUCH_PAGE || touch.phase == TOUCH_HOLD ||
+	    touch.phase == TOUCH_PRESSED) {
+		html_page_drag(the_gw->bw, HTML_PAGE_DRAG_UP, true,
+			       touch.x, touch.y);
+	}
+}
+
+static float distance(int x0, int y0, int x1, int y1)
+{
+	float dx = (float)(x1 - x0), dy = (float)(y1 - y0);
+
+	return sqrtf(dx * dx + dy * dy);
+}
+
+/** The touch screen, once a tick. Takes the drag out of st. */
+static void touch_gestures(struct vita_input_state *st)
+{
+	uint64_t now = sceKernelGetProcessTimeWide();
+	bool tapped = st->tap_seq != touch.tap_seq;
+	int x, y, ddx = st->drag_dx, ddy = st->drag_dy;
+	unsigned r, m;
+
+	st->drag_dx = st->drag_dy = 0;
+
+	/* the finger lifted, or another came down since the last tick */
+	if (touch.phase != TOUCH_NONE &&
+	    (!st->touching || st->touch_id != touch.id)) {
+		bool tap = tapped && st->tap_touch_id == touch.id;
+
+		switch (touch.phase) {
+		case TOUCH_PRESSED:
+			if (tap) {
+				touch_tap(st->tap_x, st->tap_y, true);
+			} else {
+				touch_release_page();
+			}
+			break;
+		case TOUCH_OFF:
+			if (tap) {
+				touch_tap(st->tap_x, st->tap_y, false);
+			}
+			break;
+		case TOUCH_PAGE:
+		case TOUCH_HOLD:
+			touch_release_page();
+			break;
+		case TOUCH_SCROLL:
+			touch_scroll(-ddx, -ddy);
+			ddx = ddy = 0;
+			if (now - touch.last_move_us < 100000 &&
+			    (fabsf(touch.vx) > FLING_MIN_PX_MS ||
+			     fabsf(touch.vy) > FLING_MIN_PX_MS)) {
+				fling.on = true;
+				fling.vx = touch.vx;
+				fling.vy = touch.vy;
+				fling.ax = fling.ay = 0;
+				fling.last_us = now;
+			}
+			break;
+		case TOUCH_PINCH:
+			pinch_end();
+			break;
+		default:
+			break;
+		}
+		if (tap) {
+			touch.tap_seq = st->tap_seq;
+			tapped = false;
+		}
+		touch.phase = TOUCH_NONE;
+	}
+
+	/* a tap whose whole touch fell between two ticks */
+	if (tapped) {
+		touch.tap_seq = st->tap_seq;
+		if (st->tap_touch_id != touch.id) {
+			touch_tap(st->tap_x, st->tap_y, false);
+		}
+	}
+
+	/* a new finger */
+	if (st->touching && st->touch_id != touch.id) {
+		touch.id = st->touch_id;
+		touch.phase = TOUCH_OFF;
+		touch.latched = false;
+		touch.vx = touch.vy = 0;
+		touch.last_us = touch.last_move_us = now;
+		touch.sx0 = st->touch_start_x;
+		touch.sy0 = st->touch_start_y;
+		fling.on = false;
+		if (!vita_menu_is_open() &&
+		    screen_to_page(st->touch_start_x, st->touch_start_y,
+				   &x, &y)) {
+			r = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_DOWN,
+					   true, x, y);
+			if (r & HTML_PAGE_DRAG_STARTED) {
+				touch.phase = TOUCH_PRESSED;
+				touch.down = r;
+				touch.x = x;
+				touch.y = y;
+			}
+		}
+	}
+
+	/* a second finger: a pinch, unless the page has the touch */
+	if (st->touching && st->touch2 && touch.phase != TOUCH_PAGE &&
+	    touch.phase != TOUCH_PINCH && touch.phase != TOUCH_NONE) {
+		if (touch.phase == TOUCH_PRESSED || touch.phase == TOUCH_HOLD) {
+			html_page_drag(the_gw->bw, HTML_PAGE_DRAG_CANCEL, true,
+				       touch.x, touch.y);
+		}
+		touch.phase = TOUCH_PINCH;
+		touch.d0 = distance(st->touch_x, st->touch_y,
+				    st->touch2_x, st->touch2_y);
+		if (touch.d0 < 1.0f) touch.d0 = 1.0f;
+		touch.s0 = touch.s = page_scale();
+		fling.on = false;
+	}
+
+	switch (touch.phase) {
+	case TOUCH_PINCH:
+		if (st->touch2) {
+			touch.s = touch.s0 * distance(st->touch_x, st->touch_y,
+					st->touch2_x, st->touch2_y) / touch.d0;
+			touch.cx = (st->touch_x + st->touch2_x) / 2;
+			touch.cy = (st->touch_y + st->touch2_y) / 2;
+		}
+		return;
+	case TOUCH_PRESSED:
+		if (st->dragging &&
+		    screen_to_page(st->touch_x, st->touch_y, &x, &y)) {
+			bool across = abs(st->touch_x - st->touch_start_x) >
+				      abs(st->touch_y - st->touch_start_y);
+
+			m = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_MOVE,
+					   true, x, y);
+			touch.x = x;
+			touch.y = y;
+			if (((touch.down | m) & HTML_PAGE_DRAG_CANCELLED) ||
+			    (touch.down & (across ? HTML_PAGE_DRAG_NO_PAN_X :
+					   HTML_PAGE_DRAG_NO_PAN_Y))) {
+				touch.phase = TOUCH_PAGE;
+				vita_log("input: the page took a drag (%s)",
+					 (touch.down | m) &
+					 HTML_PAGE_DRAG_CANCELLED ?
+					 "it cancelled the touch" :
+					 "touch-action");
+				return;
+			}
+			html_page_drag(the_gw->bw, HTML_PAGE_DRAG_CANCEL, true,
+				       x, y);
+			touch.phase = TOUCH_SCROLL;
+			break;
+		}
+		if (!st->dragging && st->touching &&
+		    now - st->touch_down_us > HOLD_US) {
+			r = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_HOLD,
+					   true, touch.x, touch.y);
+			touch.phase = TOUCH_HOLD;
+			vita_log("input: a long press%s",
+				 r & HTML_PAGE_DRAG_CANCELLED ?
+				 ", which the page took" : "");
+		}
+		return;
+	case TOUCH_PAGE:
+	case TOUCH_HOLD:
 		if (screen_to_page(st->touch_x, st->touch_y, &x, &y) &&
-		    (x != touch_drag.x || y != touch_drag.y)) {
-			touch_drag.x = x;
-			touch_drag.y = y;
+		    (x != touch.x || y != touch.y)) {
+			touch.x = x;
+			touch.y = y;
 			html_page_drag(the_gw->bw, HTML_PAGE_DRAG_MOVE, true,
 				       x, y);
 		}
-		st->drag_dx = st->drag_dy = 0;
+		return;
+	case TOUCH_OFF:
+		if (!st->dragging || vita_menu_is_open()) {
+			return;
+		}
+		touch.phase = TOUCH_SCROLL;
+		break;
+	case TOUCH_SCROLL:
+		break;
+	default:
+		/* no finger: the fling, if one is going */
+		if (fling.on && vita_menu_is_open()) {
+			fling.on = false;
+		}
+		if (fling.on) {
+			float dt = (float)(now - fling.last_us) / 1000.0f;
+			float k = expf(-dt / FLING_TAU_MS);
+			int mx, my;
+
+			fling.last_us = now;
+			fling.ax += fling.vx * dt;
+			fling.ay += fling.vy * dt;
+			mx = (int)fling.ax;
+			my = (int)fling.ay;
+			fling.ax -= mx;
+			fling.ay -= my;
+			fling.vx *= k;
+			fling.vy *= k;
+			if ((mx != 0 || my != 0) && !touch_scroll(mx, my)) {
+				fling.on = false;
+			}
+			if (fabsf(fling.vx) < FLING_STOP_PX_MS &&
+			    fabsf(fling.vy) < FLING_STOP_PX_MS) {
+				fling.on = false;
+			}
+		}
 		return;
 	}
-	if (st->touch_id == touch_drag.id) {
-		return;		/* this touch is a scroll already */
+
+	/* the finger scrolls: follow it, and keep how fast it goes */
+	if (ddx != 0 || ddy != 0) {
+		float dt = (float)(now - touch.last_us) / 1000.0f;
+
+		touch_scroll(-ddx, -ddy);
+		if (dt > 0.5f) {
+			touch.vx = 0.6f * (-ddx / dt) + 0.4f * touch.vx;
+			touch.vy = 0.6f * (-ddy / dt) + 0.4f * touch.vy;
+		}
+		touch.last_move_us = now;
 	}
-	touch_drag.id = st->touch_id;
-	if (!screen_to_page(st->touch_start_x, st->touch_start_y, &x0, &y0) ||
-	    !screen_to_page(st->touch_x, st->touch_y, &x, &y)) {
-		return;
-	}
-	r = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_DOWN, true, x0, y0);
-	if (!(r & HTML_PAGE_DRAG_STARTED)) {
-		return;
-	}
-	m = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_MOVE, true, x, y);
-	across = abs(st->touch_x - st->touch_start_x) >
-		 abs(st->touch_y - st->touch_start_y);
-	if (((r | m) & HTML_PAGE_DRAG_CANCELLED) ||
-	    (r & (across ? HTML_PAGE_DRAG_NO_PAN_X :
-		  HTML_PAGE_DRAG_NO_PAN_Y))) {
-		touch_drag.live = true;
-		touch_drag.x = x;
-		touch_drag.y = y;
-		st->drag_dx = st->drag_dy = 0;
-		vita_log("input: the page took a drag (%s)",
-			 (r | m) & HTML_PAGE_DRAG_CANCELLED ?
-			 "it cancelled the touch" : "touch-action");
-		return;
-	}
-	html_page_drag(the_gw->bw, HTML_PAGE_DRAG_CANCEL, true, x, y);
+	touch.last_us = now;
 }
 
 /** The held button's drag, as the pointer moves. */
@@ -2455,6 +2787,10 @@ static void tick(void *p)
 
 	vita_surface_read_input(&st);
 	check_resume();
+	/* the touch screen: taps reach the menu too (VitaSurf) */
+	if (the_gw->bw != NULL) {
+		touch_gestures(&st);
+	}
 
 	/*
 	 * While the menu is open the page must not move under it: scrolling
@@ -2472,8 +2808,7 @@ static void tick(void *p)
 		st.lx = st.ly = 0;
 		st.drag_dx = st.drag_dy = 0;
 	} else if (the_gw->bw != NULL) {
-		/* a drag the page takes is not a scroll (VitaSurf) */
-		touch_drags(&st);
+		/* the held button (VitaSurf) */
 		press_drags();
 	}
 

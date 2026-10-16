@@ -1,0 +1,269 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 3fb99f0b1..0c6396e47 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -142,9 +142,6 @@ bool fire_generic_dom_event(dom_string *type, dom_node *target,
+ /* exported interface, see private.h (VitaSurf) */
+ struct html_pointer_event html_pointer_current;
+ 
+-static bool fire_dom_pointer_event_as(const char *type, dom_node *target,
+-		int x, int y, int button, int buttons, int detail, bool touch);
+-
+ /* Exported interface, see private.h (VitaSurf) */
+ bool fire_dom_pointer_event(const char *type, dom_node *target,
+ 		int x, int y, int button, int buttons, int detail)
+@@ -161,7 +158,7 @@ bool fire_dom_touch_pointer_event(const char *type, dom_node *target,
+ 			true);
+ }
+ 
+-static bool fire_dom_pointer_event_as(const char *type, dom_node *target,
++bool fire_dom_pointer_event_as(const char *type, dom_node *target,
+ 		int x, int y, int button, int buttons, int detail, bool touch)
+ {
+ 	struct html_pointer_event saved = html_pointer_current;
+@@ -2678,12 +2675,32 @@ html_scroll_at_point(struct content *c, int x, int y, int scrx, int scry)
+ 	struct box *next;
+ 	int box_x = 0, box_y = 0;
+ 	bool handled_scroll = false;
++	/*
++	 * The boxes under the point, and then each tried from the deepest
++	 * out (VitaSurf): the outermost scrolled first, so a finger on a
++	 * scrolling list inside a scrolling panel moved the panel, and a
++	 * carousel inside a page that scrolls moved the page.
++	 */
++#define SCROLL_PATH_MAX 256
++	struct box *path[SCROLL_PATH_MAX];
++	int path_x[SCROLL_PATH_MAX], path_y[SCROLL_PATH_MAX];
++	int depth = 0;
+ 
+-	/* TODO: invert order; visit deepest box first */
+-
+-	while ((next = box_at_point(&html->unit_len_ctx, box, x, y,
++	if (box == NULL)
++		return false;
++	while (depth < SCROLL_PATH_MAX &&
++	       (next = box_at_point(&html->unit_len_ctx, box, x, y,
+ 			&box_x, &box_y)) != NULL) {
+ 		box = next;
++		path[depth] = box;
++		path_x[depth] = box_x;
++		path_y[depth] = box_y;
++		depth++;
++	}
++	while (depth-- > 0) {
++		box = path[depth];
++		box_x = path_x[depth];
++		box_y = path_y[depth];
+ 
+ 		if (box->style && css_computed_visibility(box->style) ==
+ 				CSS_VISIBILITY_HIDDEN)
+@@ -2726,6 +2743,7 @@ html_scroll_at_point(struct content *c, int x, int y, int scrx, int scry)
+ 	}
+ 
+ 	return false;
++#undef SCROLL_PATH_MAX
+ }
+ 
+ /** Helper for file gadgets to store their filename unencoded on the
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index 203c28b4b..edc8638c2 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -314,7 +314,13 @@ enum html_page_drag_phase {
+ 	HTML_PAGE_DRAG_CANCEL,
+ 	/* the pointer's press ended where it began, and NetSurf's own click
+ 	 * sends its release and the click */
+-	HTML_PAGE_DRAG_CLICKED
++	HTML_PAGE_DRAG_CLICKED,
++	/* a finger held still: contextmenu, and no click when it lifts */
++	HTML_PAGE_DRAG_HOLD,
++	/* a finger lifted where it went down, after UP, and the page did not
++	 * cancel touchend: NetSurf's click that follows sends the mouse's
++	 * events and the click, from a finger, as Chrome's tap does */
++	HTML_PAGE_DRAG_TAPPED
+ };
+ #define HTML_PAGE_DRAG_CANCELLED	1u
+ #define HTML_PAGE_DRAG_NO_PAN_X		2u
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 1c8525873..620c7fecd 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1630,11 +1630,22 @@ void html_focus_at_point(struct content *c, int x, int y)
+  */
+ static html_content *pointer_pressed;	/**< the document pressed in */
+ static bool pointer_down_cancelled;	/**< its pointerdown was cancelled */
++/** the click that follows is a finger's tap, whose pointer and touch
++ * events were sent already: the mouse's alone, then the click (VitaSurf) */
++static bool tap_compat;
+ 
+ static void
+ pointer_press(html_content *html, dom_node *node, int x, int y)
+ {
+ 	pointer_pressed = html;
++	if (tap_compat) {
++		/* Chrome's tap: the mouse comes to the point and goes down */
++		pointer_down_cancelled = false;
++		fire_dom_pointer_event("mouseover", node, x, y, 0, 0, 0);
++		fire_dom_pointer_event("mousemove", node, x, y, 0, 0, 0);
++		fire_dom_pointer_event("mousedown", node, x, y, 0, 1, 1);
++		return;
++	}
+ 	pointer_down_cancelled = !fire_dom_pointer_event("pointerdown", node,
+ 							 x, y, 0, 1, 0);
+ 	if (!pointer_down_cancelled) {
+@@ -1743,6 +1754,7 @@ unsigned int html_page_drag(struct browser_window *bw,
+ 		int depth;
+ 
+ 		page_drag_drop();
++		tap_compat = false;
+ 		html = NULL;
+ 		target = NULL;
+ 		/* the document under the point, through any iframes */
+@@ -1812,6 +1824,10 @@ unsigned int html_page_drag(struct browser_window *bw,
+ 		return out;
+ 	}
+ 
++	if (phase == HTML_PAGE_DRAG_TAPPED) {
++		tap_compat = true;
++		return 0;
++	}
+ 	html = page_drag.html;
+ 	if (html == NULL)
+ 		return 0;
+@@ -1848,9 +1864,10 @@ unsigned int html_page_drag(struct browser_window *bw,
+ 		if (page_drag.touch) {
+ 			fire_dom_touch_pointer_event("pointerup", target,
+ 					ix, iy, 0);
+-			if (page_drag.html == html)
+-				fire_dom_touch_pointer_event("touchend",
+-						target, ix, iy, 0);
++			if (page_drag.html == html &&
++			    !fire_dom_touch_pointer_event("touchend",
++						target, ix, iy, 0))
++				out |= HTML_PAGE_DRAG_CANCELLED;
+ 		} else {
+ 			bool down_cancelled = pointer_down_cancelled;
+ 
+@@ -1885,6 +1902,15 @@ unsigned int html_page_drag(struct browser_window *bw,
+ 	case HTML_PAGE_DRAG_CLICKED:
+ 		page_drag_drop();
+ 		break;
++	case HTML_PAGE_DRAG_HOLD:
++		/* a long press: the page may show a menu of its own */
++		target = dom_node_ref(page_drag.node);
++		if (!fire_dom_pointer_event_as("contextmenu", target,
++				page_drag.x, page_drag.y, 2, 0, 0,
++				page_drag.touch))
++			out |= HTML_PAGE_DRAG_CANCELLED;
++		dom_node_unref(target);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -2028,8 +2054,9 @@ mouse_action_drag_none(html_content *html,
+ 			if (pointer_pressed != html) {
+ 				pointer_press(html, mas.node, x, y);
+ 			}
+-			fire_dom_pointer_event("pointerup", mas.node,
+-					       x, y, 0, 0, 0);
++			if (!tap_compat)
++				fire_dom_pointer_event("pointerup", mas.node,
++						       x, y, 0, 0, 0);
+ 			if (!pointer_down_cancelled) {
+ 				fire_dom_pointer_event("mouseup", mas.node,
+ 						       x, y, 0, 0, 1);
+@@ -2037,8 +2064,9 @@ mouse_action_drag_none(html_content *html,
+ 		}
+ 		pointer_pressed = NULL;
+ 		pointer_down_cancelled = false;
+-		clicked = fire_dom_pointer_event("click", mas.node,
+-						 x, y, 0, 0, 1);
++		clicked = fire_dom_pointer_event_as("click", mas.node,
++						 x, y, 0, 0, 1, tap_compat);
++		tap_compat = false;
+ 
+ 		/*
+ 		 * A checkbox or radio the click set (VitaSurf). A click on
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index e195a1c5c..8df17cac9 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -852,6 +852,10 @@ eturn false if a listener cancelled it
+ bool fire_dom_pointer_event(const char *type, dom_node *target,
+ 		int x, int y, int button, int buttons, int detail);
+ 
++/** The same, from a finger when touch (VitaSurf) */
++bool fire_dom_pointer_event_as(const char *type, dom_node *target,
++		int x, int y, int button, int buttons, int detail, bool touch);
++
+ /** Let a drag or press in html go, as html goes (VitaSurf) */
+ void html_page_drag_forget(html_content *html);
+ 
+diff --git a/frontends/monkey/browser.c b/frontends/monkey/browser.c
+index 9424b31cb..54a17e3e1 100644
+--- a/frontends/monkey/browser.c
++++ b/frontends/monkey/browser.c
+@@ -749,8 +749,9 @@ monkey_window_handle_command(int argc, char **argv)
+ 		/* `WINDOW DRAG WIN` _%id%_ _%phase%_ `X` _%num%_ `Y` _%num%_
+ 		 * _%TOUCH|MOUSE%_: a press, move or release the page is told
+ 		 * of, as the Vita's input hands them (VitaSurf); phase is
+-		 * DOWN, MOVE, UP, CANCEL or CLICK, the last a press let go
+-		 * where it went down, which NetSurf's own click then ends */
++		 * DOWN, MOVE, UP, CANCEL, HOLD (a long press), CLICK (a
++		 * press let go where it went down, which NetSurf's own click
++		 * then ends) or TAP (a finger lifted where it went down) */
+ 		struct gui_window *gw;
+ 		enum html_page_drag_phase ph;
+ 		unsigned int r;
+@@ -777,6 +778,24 @@ monkey_window_handle_command(int argc, char **argv)
+ 			ph = HTML_PAGE_DRAG_UP;
+ 		} else if (strcmp(argv[4], "CANCEL") == 0) {
+ 			ph = HTML_PAGE_DRAG_CANCEL;
++		} else if (strcmp(argv[4], "HOLD") == 0) {
++			ph = HTML_PAGE_DRAG_HOLD;
++		} else if (strcmp(argv[4], "TAP") == 0) {
++			/* a finger lifted where it went down: its release,
++			 * and unless the page cancelled touchend, the click
++			 * that is the tap's, as the Vita's touch_tap does */
++			r = html_page_drag(gw->bw, HTML_PAGE_DRAG_UP, true,
++					x, y);
++			if (!(r & HTML_PAGE_DRAG_CANCELLED)) {
++				html_page_drag(gw->bw, HTML_PAGE_DRAG_TAPPED,
++						true, x, y);
++				browser_window_mouse_click(gw->bw,
++						BROWSER_MOUSE_PRESS_1, x, y);
++				browser_window_mouse_click(gw->bw,
++						BROWSER_MOUSE_CLICK_1, x, y);
++			}
++			moutf(MOUT_WINDOW, "DRAG WIN %s RESULT %u", argv[3], r);
++			return;
+ 		} else if (strcmp(argv[4], "CLICK") == 0) {
+ 			html_page_drag(gw->bw, HTML_PAGE_DRAG_CLICKED, touch,
+ 					x, y);
+@@ -792,6 +811,26 @@ monkey_window_handle_command(int argc, char **argv)
+ 		}
+ 		r = html_page_drag(gw->bw, ph, touch, x, y);
+ 		moutf(MOUT_WINDOW, "DRAG WIN %s RESULT %u", argv[3], r);
++	} else if (strcmp(argv[1], "SCROLLAT") == 0) {
++		/* `WINDOW SCROLLAT WIN` _%id%_ `X` _%num%_ `Y` _%num%_ `BY`
++		 * _%dx%_ _%dy%_: scroll what is under the point, as a finger
++		 * dragging there does (VitaSurf) */
++		struct gui_window *gw;
++		bool moved;
++
++		if (argc != 11) {
++			moutf(MOUT_ERROR, "WINDOW SCROLLAT ARGS BAD\n");
++			return;
++		}
++		gw = monkey_find_window_by_num(atoi(argv[3]));
++		if (gw == NULL) {
++			moutf(MOUT_ERROR, "WINDOW NUM BAD");
++			return;
++		}
++		moved = browser_window_scroll_at_point(gw->bw, atoi(argv[5]),
++				atoi(argv[7]), atoi(argv[9]), atoi(argv[10]));
++		moutf(MOUT_WINDOW, "SCROLLAT WIN %s MOVED %d", argv[3],
++				moved ? 1 : 0);
+ 	} else if (strcmp(argv[1], "PINS") == 0) {
+ 		/* `WINDOW PINS WIN` _%id%_: where the pinned boxes were
+ 		 * last drawn (VitaSurf) */

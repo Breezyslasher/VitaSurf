@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<!--
+  Taps, long presses and scrolling boxes from the touch screen (VitaSurf):
+  run by tests/input/drag-test.sh with the harness's WINDOW DRAG and
+  WINDOW SCROLLAT, as the Vita's touch_gestures sends them. Chrome on a
+  phone sends what each case expects.
+-->
+<html><head><meta charset="utf-8"><title>Page touch</title>
+<style>
+body { margin: 0; }
+.box { position: absolute; left: 10px; width: 300px; height: 40px; background: #ddd; }
+#t1 { top: 10px; }
+#t2 { top: 70px; }
+#h { top: 130px; }
+#lk { position: absolute; left: 10px; top: 190px; display: block; width: 300px; height: 40px; }
+#outer { position: absolute; left: 10px; top: 250px; width: 300px; height: 100px; overflow: auto; }
+#inner { margin-top: 0; height: 50px; overflow: auto; background: #eee; }
+.tall { height: 400px; }
+.mid { height: 200px; }
+</style></head>
+<body>
+<div class="box" id="t1"></div>
+<div class="box" id="t2"></div>
+<div class="box" id="h"></div>
+<a id="lk" href="#tapped">link</a>
+<div id="outer"><div id="inner"><div class="mid"></div></div><div class="tall"></div></div>
+<script>
+var log = {};
+var all = ['pointerdown', 'pointerup', 'pointercancel', 'touchstart', 'touchend', 'touchcancel',
+  'mouseover', 'mousemove', 'mousedown', 'mouseup', 'click', 'contextmenu'];
+['t1', 't2', 'h'].forEach(function (id) {
+  all.forEach(function (t) {
+    document.getElementById(id).addEventListener(t, function (e) {
+      (log[id] = log[id] || []).push(e.type + (e.pointerType ? ':' + e.pointerType : ''));
+    });
+  });
+});
+document.getElementById('t2').addEventListener('touchend', function (e) { e.preventDefault(); });
+function ok(name, got, want) {
+  console.log('page-touch: ' + (got === want ? 'PASS ' : 'FAIL ') + name +
+    (got === want ? '' : ': ' + got + ', want ' + want));
+}
+function check() {
+  var j = function (id) { return (log[id] || []).join(' '); };
+  ok('a tap is a finger\'s, then the mouse\'s, then a click', j('t1'),
+    'pointerdown:touch touchstart pointerup:touch touchend mouseover mousemove mousedown mouseup click:touch');
+  ok('a cancelled touchend stops the click', j('t2'),
+    'pointerdown:touch touchstart pointerup:touch touchend');
+  ok('a long press is contextmenu and no click', j('h'),
+    'pointerdown:touch touchstart contextmenu:touch pointerup:touch touchend');
+  ok('a tapped link is followed', location.hash, '#tapped');
+  ok('a drag over a box inside a box scrolls the inner one', document.getElementById('inner').scrollTop, 20);
+  ok('and leaves the outer one', document.getElementById('outer').scrollTop, 30);
+  console.log('page-touch: done');
+}
+</script>
+</body></html>

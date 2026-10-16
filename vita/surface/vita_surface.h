@@ -51,6 +51,16 @@ struct vita_input_state {
 	int touch_y;
 	int touch_start_x; /**< where it went down */
 	int touch_start_y;
+	uint64_t touch_down_us; /**< when it went down */
+	bool touch2;     /**< a second finger is down, for a pinch */
+	int touch2_x;
+	int touch2_y;
+	/* the last tap, which the input layer acts on: the surface only
+	 * notes it (VitaSurf) */
+	unsigned tap_seq; /**< one more for each tap */
+	unsigned tap_touch_id; /**< the touch it was */
+	int tap_x;
+	int tap_y;
 };
 
 /**

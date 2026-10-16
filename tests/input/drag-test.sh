@@ -5,7 +5,8 @@
 # the Vita's touch screen and held Cross do, and prints the page's PASS
 # and FAIL lines and what each press answered: 8 a press that found an
 # element, plus 1 if the page cancelled its touch, 2 and 4 if
-# touch-action forbids panning across and down.
+# touch-action forbids panning across and down. Then page-touch.html:
+# taps, a long press and scrolling a box inside a box (WINDOW SCROLLAT).
 here=$(cd "$(dirname "$0")" && pwd)
 bin=$(cd "$(dirname "${1:?usage: drag-test.sh nsmonkey}")" && pwd)/$(basename "$1")
 # the harness finds its resources from NetSurf's tree
@@ -25,7 +26,18 @@ d() { echo "WINDOW DRAG WIN 0 $1 X $2 Y $3 $4"; sleep 0.3; }
 	d DOWN 30 380 TOUCH; d MOVE 110 380 TOUCH; d UP 110 380 TOUCH
 	echo "WINDOW EXEC WIN 0 check()"
 	sleep 1
+	echo "WINDOW GO 0 file://$here/page-touch.html"
+	sleep 4
+	d DOWN 20 30 TOUCH; d TAP 20 30 TOUCH
+	d DOWN 20 90 TOUCH; d TAP 20 90 TOUCH
+	d DOWN 20 150 TOUCH; d HOLD 20 150 TOUCH; d UP 20 150 TOUCH
+	d DOWN 20 210 TOUCH; d TAP 20 210 TOUCH
+	echo "WINDOW REDRAW 0"; sleep 0.5
+	echo "WINDOW SCROLLAT WIN 0 X 20 Y 270 BY 0 20"; sleep 0.3
+	echo "WINDOW SCROLLAT WIN 0 X 20 Y 330 BY 0 30"; sleep 0.3
+	echo "WINDOW EXEC WIN 0 check()"
+	sleep 1
 	echo QUIT
 } | NO_PROXY='*' MONKEY_WIN_W=960 MONKEY_WIN_H=544 VITASURF_NOCACHE=1 \
 	timeout 60 "$bin" --enable_javascript=1 2>&1 |
-	grep -a "page-drags:\|DRAG WIN"
+	grep -a "page-drags:\|page-touch:\|DRAG WIN\|SCROLLAT WIN"

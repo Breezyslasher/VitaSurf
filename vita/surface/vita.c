@@ -165,6 +165,14 @@ struct vita_surface {
 	int drag_dx;              /**< drag movement since the last read */
 	int drag_dy;
 	unsigned touch_id;        /**< touches so far, for the input layer */
+	SceUInt64 touch_down_us;  /**< when this touch began */
+	bool touch2;              /**< a second finger, and where */
+	int touch2_x;
+	int touch2_y;
+	unsigned tap_seq;         /**< taps so far, and the last one's */
+	unsigned tap_touch_id;
+	int tap_x;
+	int tap_y;
 
 	/* last pointer position handed to NetSurf */
 	int pointer_x;
@@ -531,10 +539,11 @@ static void poll_buttons(struct vita_surface *vs, SceUInt64 now_us)
 }
 
 /*
- * Touch: a tap (press and release without moving) is a click at the
- * touch point; moving the finger is a drag that scrolls the page, which
- * the input layer reads as deltas. Drags never reach NetSurf as mouse
- * movement, so they do not start text selections.
+ * Touch: a tap (press and release without moving) is noted for the
+ * input layer, which clicks or hands it to the page; moving the finger
+ * is a drag the input layer reads as deltas. Drags never reach NetSurf
+ * as mouse movement, so they do not start text selections. A second
+ * finger is reported for a pinch.
  */
 static void poll_touch(struct vita_surface *vs)
 {
@@ -550,9 +559,15 @@ static void poll_touch(struct vita_surface *vs)
 		int x = touch.report[0].x / 2;
 		int y = touch.report[0].y / 2;
 
+		vs->touch2 = touch.reportNum > 1;
+		if (vs->touch2) {
+			vs->touch2_x = touch.report[1].x / 2;
+			vs->touch2_y = touch.report[1].y / 2;
+		}
 		if (!vs->touch_down) {
 			vs->touch_down = true;
 			vs->touch_id++;
+			vs->touch_down_us = sceKernelGetProcessTimeWide();
 			vs->touch_dragging = false;
 			vs->touch_start_x = x;
 			vs->touch_start_y = y;
@@ -575,12 +590,14 @@ static void poll_touch(struct vita_surface *vs)
 		}
 	} else if (vs->touch_down) {
 		vs->touch_down = false;
+		vs->touch2 = false;
 		if (!vs->touch_dragging) {
-			/* a tap: move the pointer there and click */
+			/* a tap, for the input layer to act on */
 			vs->last_tap_us = sceKernelGetProcessTimeWide();
-			queue_move(vs, vs->touch_start_x, vs->touch_start_y);
-			queue_key(vs, NSFB_EVENT_KEY_DOWN, NSFB_KEY_MOUSE_1);
-			queue_key(vs, NSFB_EVENT_KEY_UP, NSFB_KEY_MOUSE_1);
+			vs->tap_seq++;
+			vs->tap_touch_id = vs->touch_id;
+			vs->tap_x = vs->touch_start_x;
+			vs->tap_y = vs->touch_start_y;
 		}
 		vs->touch_dragging = false;
 	}
@@ -1626,6 +1643,14 @@ void vita_surface_read_input(struct vita_input_state *out)
 	out->touch_y = vs->touch_y;
 	out->touch_start_x = vs->touch_start_x;
 	out->touch_start_y = vs->touch_start_y;
+	out->touch_down_us = vs->touch_down_us;
+	out->touch2 = vs->touch2;
+	out->touch2_x = vs->touch2_x;
+	out->touch2_y = vs->touch2_y;
+	out->tap_seq = vs->tap_seq;
+	out->tap_touch_id = vs->tap_touch_id;
+	out->tap_x = vs->tap_x;
+	out->tap_y = vs->tap_y;
 	vs->drag_dx = 0;
 	vs->drag_dy = 0;
 }
