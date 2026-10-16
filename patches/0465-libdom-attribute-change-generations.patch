@@ -1,0 +1,104 @@
+diff --git a/include/dom/core/node.h b/include/dom/core/node.h
+index 02616b0..877891d 100644
+--- a/include/dom/core/node.h
++++ b/include/dom/core/node.h
+@@ -357,6 +357,17 @@ dom_string *dom_node_vita_local_name(struct dom_node *node);
+  */
+ void dom_vita_set_generations(uint32_t *any, uint32_t *tree, uint32_t *id);
+ 
++/*
++ * Which attributes have changed since (VitaSurf): names are hashed,
++ * ASCII case folded, into DOM_VITA_ATTR_BUCKETS buckets, and
++ * dom_vita_attr_changed_at gives the value `any` had just after the last
++ * change to an attribute whose name falls in that bucket, or 0. A change
++ * after `any` read g leaves its bucket past g.
++ */
++#define DOM_VITA_ATTR_BUCKETS 256
++unsigned dom_vita_attr_bucket(const char *name, size_t len);
++uint32_t dom_vita_attr_changed_at(unsigned bucket);
++
+ #define dom_node_get_attributes(n, r) dom_node_get_attributes( \
+ 		(dom_node *) (n), (struct dom_namednodemap **) (r))
+ 
+diff --git a/src/core/node.c b/src/core/node.c
+index c335990..f73eb97 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -1266,6 +1266,49 @@ void dom_vita_set_generations(uint32_t *any, uint32_t *tree, uint32_t *id)
+ 	vita_gen_id = id;
+ }
+ 
++/*
++ * When an attribute of each name last changed (VitaSurf): the value of
++ * `any` just after the change, for the names that hash to each bucket,
++ * case folded. A client keeps an answer that reads only some names
++ * while none of their buckets has moved past it.
++ */
++static uint32_t vita_attr_gens[DOM_VITA_ATTR_BUCKETS];
++static uint32_t vita_attr_local;
++
++unsigned dom_vita_attr_bucket(const char *name, size_t len)
++{
++	uint32_t h = 2166136261u;
++	size_t i;
++
++	for (i = 0; i < len; i++) {
++		unsigned char c = (unsigned char) name[i];
++
++		if (c >= 'A' && c <= 'Z')
++			c = (unsigned char) (c + 32);
++		h = (h ^ c) * 16777619u;
++	}
++	return (h ^ (h >> 16)) & (DOM_VITA_ATTR_BUCKETS - 1);
++}
++
++uint32_t dom_vita_attr_changed_at(unsigned bucket)
++{
++	return vita_attr_gens[bucket & (DOM_VITA_ATTR_BUCKETS - 1)];
++}
++
++void _dom_vita_attr_changed(dom_string *name)
++{
++	uint32_t now = vita_gen_any != NULL ? *vita_gen_any : ++vita_attr_local;
++	unsigned b;
++
++	if (name == NULL) {
++		for (b = 0; b < DOM_VITA_ATTR_BUCKETS; b++)
++			vita_attr_gens[b] = now;
++		return;
++	}
++	vita_attr_gens[dom_vita_attr_bucket(dom_string_data(name),
++			dom_string_byte_length(name))] = now;
++}
++
+ void _dom_vita_changed(bool tree, bool id)
+ {
+ 	if (vita_gen_any != NULL)
+diff --git a/src/core/node.h b/src/core/node.h
+index cabcb5c..0ca4be4 100644
+--- a/src/core/node.h
++++ b/src/core/node.h
+@@ -145,6 +145,7 @@ dom_exception _dom_node_insert_before(dom_node_internal *node,
+ /* Count a change for the client's caches (VitaSurf): tree is true when
+  * nodes went in, out or moved, id when an attribute named id changed. */
+ void _dom_vita_changed(bool tree, bool id);
++void _dom_vita_attr_changed(dom_string *name);
+ 
+ dom_exception _dom_node_replace_child(dom_node_internal *node,
+ 		dom_node_internal *new_child, dom_node_internal *old_child,
+diff --git a/src/events/dispatch.c b/src/events/dispatch.c
+index 72fdeb0..7e62ee4 100644
+--- a/src/events/dispatch.c
++++ b/src/events/dispatch.c
+@@ -173,6 +173,11 @@ dom_exception __dom_dispatch_attr_modified_event(dom_document *doc,
+ 	_dom_vita_changed(false, attr_name != NULL &&
+ 			dom_string_byte_length(attr_name) == 2 &&
+ 			strncasecmp(dom_string_data(attr_name), "id", 2) == 0);
++	/* and which name: an Attr's own value set passes the Attr alone */
++	_dom_vita_attr_changed(attr_name != NULL ? attr_name :
++			(related != NULL && ((dom_node_internal *) related)->type ==
++			 DOM_ATTRIBUTE_NODE) ?
++			((dom_node_internal *) related)->name : NULL);
+ 	dom_exception err;
+ 
+ 	/*

@@ -432,6 +432,16 @@ struct jsthread {
 		const struct sel_compiled *s;
 		uint32_t gen;
 	} sel_miss[16];
+	/** the last answers of queries, kept while the tree has its shape
+	 * and no attribute they read has changed (VitaSurf): see sel_native */
+	struct sel_kept {
+		struct dom_node *root;	/**< a reference */
+		const struct sel_compiled *s;
+		int magic;
+		uint32_t gen, tree_gen;
+		struct dom_node **nodes;	/**< references, in tree order */
+		uint32_t n;
+	} sel_kept[16];
 	unsigned int sel_cache_n;
 	/*
 	 * The selectors last asked for, by the script's string itself
@@ -1158,6 +1168,9 @@ static int walk_cost_cmp(const void *a, const void *b)
 	return x->visits < y->visits ? 1 : x->visits > y->visits ? -1 : 0;
 }
 
+/* queries answered from a kept answer, and the nodes kept (VitaSurf) */
+static unsigned int sel_kept_hits, sel_kept_nodes;
+
 static void walk_cost_report(void)
 {
 	unsigned i;
@@ -1174,6 +1187,13 @@ static void walk_cost_report(void)
 			 walk_costs[i].from_top);
 	}
 	memset(walk_costs, 0, sizeof(walk_costs));
+	if (sel_kept_hits > 0) {
+		vita_log("qjs: %u queries were answered from their last "
+			 "answer, the tree and the attributes they read as "
+			 "they were; %u nodes were kept for them",
+			 sel_kept_hits, sel_kept_nodes);
+	}
+	sel_kept_hits = sel_kept_nodes = 0;
 }
 
 void vita_js_report_profile(void);
@@ -12266,6 +12286,11 @@ struct sel_compiled {
 	struct sel_group *groups;
 	int ngroups;		/**< -1: not one of ours */
 	bool uses_scope;	/**< some compound is :scope */
+	/* the buckets of the attribute names its answer reads, id and
+	   class among them (dom_vita_attr_bucket), once worked out */
+	bool deps_done, deps_many;
+	unsigned char ndeps;
+	unsigned char deps[8];
 };
 
 /*
@@ -12335,6 +12360,82 @@ static void sel_recent_free(jsthread *thread)
 	}
 }
 
+/* Let a kept answer go, with the nodes it holds. */
+static void sel_kept_drop(struct sel_kept *k)
+{
+	uint32_t i;
+
+	for (i = 0; i < k->n; i++) dom_node_unref(k->nodes[i]);
+	free(k->nodes);
+	if (k->root != NULL) dom_node_unref(k->root);
+	memset(k, 0, sizeof(*k));
+}
+
+static void sel_deps_add(struct sel_compiled *s, const char *name, size_t len)
+{
+	unsigned char b = (unsigned char) dom_vita_attr_bucket(name, len);
+	unsigned i;
+
+	for (i = 0; i < s->ndeps; i++) {
+		if (s->deps[i] == b) return;
+	}
+	if (s->ndeps >= sizeof(s->deps)) {
+		s->deps_many = true;
+		return;
+	}
+	s->deps[s->ndeps++] = b;
+}
+
+static void sel_deps_compound(struct sel_compiled *s,
+			      const struct sel_compound *c)
+{
+	int i;
+
+	if (c->id != NULL) sel_deps_add(s, "id", 2);
+	if (c->nclasses > 0) sel_deps_add(s, "class", 5);
+	for (i = 0; i < c->nattrs; i++) {
+		if (c->attrs[i].name == NULL) {
+			s->deps_many = true;
+			continue;
+		}
+		sel_deps_add(s, dom_string_data(c->attrs[i].name),
+			     dom_string_byte_length(c->attrs[i].name));
+	}
+	for (i = 0; i < c->nnots; i++) sel_deps_compound(s, &c->nots[i]);
+}
+
+/*
+ * Whether k's answer still holds (VitaSurf). What sel_native answers
+ * reads the tree, the elements' names and the attributes the selector
+ * names, nothing else: so it holds while nodes have not gone in, out or
+ * moved and no attribute of those names has changed since it was found.
+ */
+static bool sel_kept_holds(const struct sel_kept *k, struct sel_compiled *s)
+{
+	unsigned i;
+
+	if (k->tree_gen != vita_tree_gen) return false;
+	if (k->gen == vita_dom_gen) return true;
+	if (!s->deps_done) {
+		int g, j;
+
+		for (g = 0; g < s->ngroups; g++) {
+			for (j = 0; j < s->groups[g].n; j++) {
+				sel_deps_compound(s, &s->groups[g].parts[j]);
+			}
+		}
+		s->deps_done = true;
+	}
+	if (s->deps_many) return false;
+	for (i = 0; i < s->ndeps; i++) {
+		if ((int32_t) (dom_vita_attr_changed_at(s->deps[i]) -
+			       k->gen) > 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static void sel_cache_free(jsthread *thread)
 {
 	unsigned b;
@@ -12342,6 +12443,10 @@ static void sel_cache_free(jsthread *thread)
 	sel_recent_free(thread);
 	/* a selector freed here could be another's address next */
 	memset(thread->sel_miss, 0, sizeof(thread->sel_miss));
+	for (b = 0; b < sizeof(thread->sel_kept) /
+		     sizeof(thread->sel_kept[0]); b++) {
+		sel_kept_drop(&thread->sel_kept[b]);
+	}
 
 	for (b = 0; b < 128; b++) {
 		while (thread->sel_cache[b] != NULL) {
@@ -13016,6 +13121,10 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	struct sel_compiled *s = NULL;
 	const struct sel_compound *bare;
 	struct sel_miss *miss;
+	struct sel_kept *kept;
+	struct dom_node **keep = NULL;
+	uint32_t keep_n = 0, keep_cap = 0, gen0, tree_gen0;
+	bool keep_ok = true;
 	bool failed = false;
 	JSValue out = JS_NULL;
 	uint32_t out_n = 0, visits0;
@@ -13118,6 +13227,35 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 		vitasurf_js_sel_tag_absent++;
 		return out;
 	}
+	/*
+	 * The last answer to this query of this root, while the tree has
+	 * its shape and no attribute the selector reads has changed since
+	 * (VitaSurf). cnn.com set 9333 attributes of other names between
+	 * its queries, and asked the document 230 times for
+	 * [data-uri*="/container/"], 502,704 elements walked: every write
+	 * had let the answer go.
+	 */
+	kept = &thread->sel_kept[(((uintptr_t) root >> 4) ^
+				  ((uintptr_t) s >> 4) ^ (unsigned) magic) &
+				 (sizeof(thread->sel_kept) /
+				  sizeof(thread->sel_kept[0]) - 1)];
+	if (kept->root == root && kept->s == s && kept->magic == magic &&
+	    sel_kept_holds(kept, s)) {
+		uint32_t i;
+
+		sel_kept_hits++;
+		if (magic == 1) {
+			return kept->n > 0 ? wrap_node(ctx, kept->nodes[0]) :
+				JS_NULL;
+		}
+		for (i = 0; i < kept->n; i++) {
+			JS_SetPropertyUint32(ctx, out, i,
+					     wrap_node(ctx, kept->nodes[i]));
+		}
+		return out;
+	}
+	gen0 = vita_dom_gen;
+	tree_gen0 = vita_tree_gen;
 	visits0 = vitasurf_js_sel_tag_visits;
 	/*
 	 * Tree order, root itself not a candidate, on borrowed nodes:
@@ -13149,6 +13287,22 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 			if (tag == NULL && !sel_matches(n, s)) {
 				continue;
 			}
+			if (keep_ok) {
+				if (keep_n == keep_cap) {
+					uint32_t cap = keep_cap ? keep_cap * 2 : 16;
+					struct dom_node **k2 = cap <= 4096 ?
+						realloc(keep, cap * sizeof(*k2)) :
+						NULL;
+
+					if (k2 == NULL) {
+						keep_ok = false;
+					} else {
+						keep = k2;
+						keep_cap = cap;
+					}
+				}
+				if (keep_ok) keep[keep_n++] = n;
+			}
 			if (magic == 1) {
 				out = wrap_node(ctx, n);
 				break;
@@ -13169,6 +13323,22 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 			miss->s = s;
 			miss->gen = vita_dom_gen;
 		}
+		if (keep_ok) {
+			uint32_t i;
+
+			sel_kept_drop(kept);
+			kept->root = dom_node_ref(root);
+			kept->s = s;
+			kept->magic = magic;
+			kept->gen = gen0;
+			kept->tree_gen = tree_gen0;
+			for (i = 0; i < keep_n; i++) dom_node_ref(keep[i]);
+			kept->nodes = keep;
+			kept->n = keep_n;
+			sel_kept_nodes += keep_n;
+			keep = NULL;
+		}
+		free(keep);
 	}
 	if (s->text != NULL) {
 		walk_cost_note(magic == 2 ? "querySelectorAll" :

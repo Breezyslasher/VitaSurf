@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!--
+  Attribute and class queries over a large document (VitaSurf).
+
+  What cnn.com asks while it loads: a document of some 5000 elements,
+  most with a few classes and attributes, asked for every element whose
+  data-uri holds "/container/" and for a class nothing has, an attribute
+  changed between the queries so no answer can be kept. Logs the time
+  and checks the answers. ?n=5000 elements, ?q=200 queries.
+-->
+<html><head><meta charset="utf-8"><title>Attribute walks</title></head>
+<body>
+<div id="root"></div>
+<pre id="out"></pre>
+<script>
+var q = new URLSearchParams(location.search), N = +(q.get('n') || 5000), Q = +(q.get('q') || 200);
+var root = document.getElementById('root'), parts = [];
+for (var i = 0; i < N / 5; i++) {
+  parts.push('<div class="container container_lead-plus-headlines layout__item" data-uri="cms.cnn.com/_components/' +
+    (i % 4 ? 'card' : 'container') + '/instances/x' + i + '@published" data-component-name="card">' +
+    '<a class="container__link link" href="/a' + i + '" data-link-type="article"><span class="container__headline-text" data-editable="headline">t' + i + '</span></a>' +
+    '<div class="image image__container"><img class="image__dam-img" alt="" data-src="/i' + i + '.jpg"></div></div>');
+}
+root.innerHTML = parts.join('');
+var t0 = performance.now(), found = 0, miss = 0;
+for (var k = 0; k < Q; k++) {
+  root.firstChild.setAttribute('data-k', k);
+  found += document.querySelectorAll('[data-uri*="/container/"]').length;
+  if (document.querySelector('.container_dtc-shelf-carousel__item-media') === null) miss++;
+}
+var ms = performance.now() - t0, want = Math.ceil(N / 5 / 4) * Q;
+var msg = 'attribute-walks: ' + N + ' elements, ' + Q + ' rounds: ' + Math.round(ms) + ' ms; ' +
+  (found === want && miss === Q ? 'PASS' : 'FAIL found ' + found + ' want ' + want + ', missed ' + miss);
+document.getElementById('out').textContent = msg; console.log(msg);
+</script>
+</body></html>

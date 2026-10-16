@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<!--
+  Queries asked again after the document changes (VitaSurf).
+
+  The C selector engine keeps a query's last answer while the tree has
+  its shape and no attribute the selector reads has changed, so a page
+  setting attributes of other names between its queries is not walked
+  again each time. Every way of changing what a query reads must still
+  be seen: each line must say PASS, as Chrome's do.
+-->
+<html><head><meta charset="utf-8"><title>Kept query answers</title></head>
+<body>
+<div id="root">
+  <div class="card" data-uri="a/container/1"><span class="t">1</span></div>
+  <div class="card" data-uri="a/card/2"><span class="t">2</span></div>
+  <div class="card other" data-uri="a/container/3"><span class="t">3</span></div>
+</div>
+<div id="far"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+var root = document.getElementById('root'), far = document.getElementById('far');
+function n(sel, from) { return (from || document).querySelectorAll(sel).length; }
+function first(sel, from) { var e = (from || document).querySelector(sel); return e ? e.textContent : null; }
+var cards = root.querySelectorAll('.card');
+
+ok('a substring query', n('[data-uri*="/container/"]'), 2);
+far.setAttribute('data-other', '1');
+ok('the same after another attribute changed', n('[data-uri*="/container/"]'), 2);
+cards[1].setAttribute('data-uri', 'a/container/2');
+ok('after the attribute it reads changed', n('[data-uri*="/container/"]'), 3);
+cards[1].getAttributeNode('data-uri').value = 'a/card/2';
+ok('after its Attr node was given a value', n('[data-uri*="/container/"]'), 2);
+cards[0].removeAttribute('data-uri');
+ok('after the attribute was removed', n('[data-uri*="/container/"]'), 1);
+cards[0].setAttributeNS(null, 'data-uri', 'b/container/1');
+ok('after it was set with a namespace call', n('[data-uri*="/container/"]'), 2);
+ok('an attribute selector in capitals', n('[DATA-URI*="/container/"]'), 2);
+cards[0].attributes.removeNamedItem('data-uri');
+ok('after removeNamedItem', n('[data-uri*="/container/"]'), 1);
+cards[0].dataset.uri = 'c/container/1';
+ok('after dataset set it', n('[data-uri*="/container/"]'), 2);
+
+ok('a class query', n('.other'), 1);
+far.title = 'x';
+ok('the same after a title changed', n('.other'), 1);
+cards[0].classList.add('other');
+ok('after classList.add', n('.other'), 2);
+cards[0].className = 'card';
+ok('after className was set', n('.other'), 1);
+cards[2].classList.toggle('other');
+ok('after classList.toggle', n('.other'), 0);
+cards[2].setAttribute('class', 'card other');
+ok('after setAttribute class', n('.other'), 1);
+
+ok('an id query', first('#hit'), null);
+cards[1].id = 'hit';
+ok('after an id was given', first('#hit'), '2');
+cards[1].removeAttribute('id');
+cards[2].setAttribute('id', 'hit');
+ok('after the id moved', first('#hit'), '3');
+
+ok('a :not() query', n('.card:not([hidden])'), 3);
+cards[1].toggleAttribute('hidden');
+ok('after the attribute :not() reads was set', n('.card:not([hidden])'), 2);
+cards[1].hidden = false;
+ok('after it was cleared through a property', n('.card:not([hidden])'), 3);
+
+ok('querySelector finds the first', first('.card .t'), '1');
+var extra = document.createElement('div');
+extra.className = 'card';
+extra.innerHTML = '<span class="t">0</span>';
+root.insertBefore(extra, root.firstChild);
+ok('after an earlier match was put in', first('.card .t'), '0');
+ok('and querySelectorAll counts it', n('.card .t'), 4);
+extra.remove();
+ok('after it was taken out', n('.card .t'), 3);
+far.appendChild(cards[2]);
+ok('a query of a subtree after a node moved out', n('.card', root), 2);
+ok('and of where it went', n('.card', far), 1);
+root.appendChild(cards[2]);
+ok('and back', n('.card', root), 3);
+cards[0].firstChild.textContent = 'one';
+ok('text changed under a kept answer', first('.card .t'), 'one');
+
+ok('a :scope query', n(':scope > .card', root), 3);
+cards[0].setAttribute('data-x', '1');
+ok('the same after an unread attribute changed', n(':scope > .card', root), 3);
+root.innerHTML = '<p class="card">p</p>';
+ok('after innerHTML replaced the children', n(':scope > .card', root), 1);
+
+var detached = document.createElement('div');
+detached.innerHTML = '<i data-k="1"></i><i></i>';
+ok('a detached subtree', n('[data-k]', detached), 1);
+detached.lastChild.setAttribute('data-k', '2');
+ok('after an attribute changed in it', n('[data-k]', detached), 2);
+detached = null;
+var again = document.createElement('div');
+ok('a new element asked the same', n('[data-k]', again), 0);
+
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('query-kept-answers: ' + l); });
+console.log('query-kept-answers: done');
+</script>
+</body></html>
