@@ -1,0 +1,92 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index e8c308cc0..f236de301 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -72,6 +72,7 @@
+ #include "html/html_save.h"
+ #include "html/interaction.h"
+ #include "html/box.h"
++#include "netsurf/url_db.h"
+ #include "html/box_construct.h"
+ #include "html/box_inspect.h"
+ #include "html/form_internal.h"
+@@ -4837,6 +4838,65 @@ static enum box_restyle html_restyle_siblings(html_content *c, dom_node *n,
+ /** How many elements one batch of changes may select again. */
+ #define HTML_ATTR_BUDGET 3000
+ 
++/** The boxes from b on that were given a link's address was, given now
++ * instead. */
++static void html_relink_boxes(struct box *b, nsurl *was, nsurl *now)
++{
++	for (; b != NULL; b = b->next) {
++		if (b->href == was) {
++			nsurl_unref(b->href);
++			b->href = nsurl_ref(now);
++		}
++		if (b->list_marker != NULL)
++			html_relink_boxes(b->list_marker, was, now);
++		if (b->children != NULL)
++			html_relink_boxes(b->children, was, now);
++	}
++}
++
++/** Whether an address has been visited, as :visited asks. */
++static bool html_link_visited(nsurl *u)
++{
++	const struct url_data *data = urldb_get_url_data(u);
++
++	return data != NULL && data->visits > 0;
++}
++
++/*
++ * A link's href changed (VitaSurf). Its boxes, and every box inside it,
++ * hold the address the link had, for following it; the rest of what
++ * they are does not depend on it. So the address is changed on them in
++ * place and the element is restyled as for any attribute, where the
++ * whole tree had been built again: a carousel that points its links at
++ * the next items did that at every turn, up to 1.9 s on the Vita. False,
++ * leaving it to a rebuild, when the element becomes or stops being a
++ * link, or :visited would answer differently.
++ */
++static bool html_relink(html_content *c, dom_node *n, struct box *box)
++{
++	dom_string *s = NULL;
++	nsurl *was = box->href, *now = NULL;
++	bool ok;
++
++	if (was == NULL || dom_element_get_attribute(n, corestring_dom_href,
++			&s) != DOM_NO_ERR || s == NULL)
++		return false;
++	ok = box_extract_link(c, s, c->base_url, &now);
++	dom_string_unref(s);
++	if (!ok || now == NULL)
++		return false;
++	if (html_link_visited(was) != html_link_visited(now)) {
++		nsurl_unref(now);
++		return false;
++	}
++	/* held across the walk, which lets go of the boxes' references */
++	nsurl_ref(was);
++	html_relink_boxes(c->layout, was, now);
++	nsurl_unref(was);
++	nsurl_unref(now);
++	return true;
++}
++
+ /* exported interface documented in html/private.h */
+ bool html_restyle_attrs(html_content *c,
+ 		const struct html_attr_change *changes, unsigned n,
+@@ -4894,6 +4954,13 @@ bool html_restyle_attrs(html_content *c,
+ 			}
+ 			is_img = strcasecmp(dom_string_data(tag), "IMG") == 0;
+ 		}
++		/* a link given another address keeps its boxes, which take
++		 * the new one (VitaSurf) */
++		if (box != NULL && tag != NULL &&
++				strcasecmp(name, "href") == 0 &&
++				strcasecmp(dom_string_data(tag), "A") == 0 &&
++				html_relink(c, ch->node, box))
++			special = false;
+ 		if (html_node_is_svg(ch->node) ||
+ 				strcasecmp(name, "slot") == 0 ||
+ 				(special && !html_attr_any(name) &&

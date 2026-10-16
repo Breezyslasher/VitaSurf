@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!--
+  A link given another address goes there, and the page is not built
+  again for it (VitaSurf): its boxes, and the ones inside it, take the
+  new address in place. Tap the word "go" after the address changes; the
+  page must say PASS, and the log must say the change was put on the page
+  "without rebuilding it".
+-->
+<html><head><meta charset="utf-8"><title>Link address change</title>
+<style>
+body { margin: 0; font: 40px sans-serif; }
+#l { display: inline-block; padding: 4px; }
+a[href="#moved"] { color: rgb(0, 128, 0); }
+</style></head>
+<body>
+<div><a id="l" href="#old"><span id="s">go</span></a></div>
+<p><a id="m" href="#a">a block of links</a> <a href="#b">b</a></p>
+<pre id="out" style="font-size: 14px"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function report() {
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('link-href-change: ' + l); });
+  out = [];
+}
+addEventListener('load', function () {
+  setTimeout(function () {
+    document.getElementById('l').setAttribute('href', '#moved');
+    document.getElementById('m').href = '#elsewhere';
+    setTimeout(function () {
+      ok('the attribute changed', document.getElementById('l').getAttribute('href'), '#moved');
+      ok('a rule on the new address applies', getComputedStyle(document.getElementById('l')).color, 'rgb(0, 128, 0)');
+      report();
+      console.log('link-href-change: ready to tap');
+    }, 200);
+  }, 50);
+});
+addEventListener('hashchange', function () {
+  ok('the tap went to the new address', location.hash, '#moved');
+  report();
+  console.log('link-href-change: done');
+});
+</script>
+</body></html>
