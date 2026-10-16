@@ -46,16 +46,22 @@ NV.__vitaIntlNumber = function (W, N, C, install) {
 
 	/* what diff changes in base; neither is modified */
 	function merge(base, diff) {
-		var out = {}, k;
+		var out, keys, k, v, i;
 
 		if (diff === null || typeof diff !== 'object' ||
 		    Array.isArray(diff) || base === null ||
 		    typeof base !== 'object' || Array.isArray(base))
 			return diff;
-		for (k in base)
-			out[k] = base[k];
-		for (k in diff)
-			out[k] = merge(base[k], diff[k]);
+		/* base's own keys copied natively, and a value that is not an
+		 * object taken without a call (VitaSurf) */
+		out = Object.assign({}, base);
+		keys = Object.keys(diff);
+		for (i = 0; i < keys.length; i++) {
+			k = keys[i];
+			v = diff[k];
+			out[k] = v !== null && typeof v === 'object' &&
+				!Array.isArray(v) ? merge(base[k], v) : v;
+		}
 		return out;
 	}
 
