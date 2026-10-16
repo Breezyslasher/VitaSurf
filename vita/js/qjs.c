@@ -20337,6 +20337,14 @@ static void store_index_load(void)
 	fclose(f);
 }
 
+/* what was last written for each origin, see win_vita_store_save */
+#define STORE_LAST_SLOTS 8
+static struct store_last {
+	char origin[128];
+	uint32_t len, h_lo, h_hi;
+} store_last[STORE_LAST_SLOTS];
+static unsigned store_last_next;
+
 static void store_index_save(void)
 {
 	char path[256];
@@ -20390,6 +20398,8 @@ static void store_index_note(const char *name, uint32_t bytes)
 			snprintf(path, sizeof(path), "%s/%s",
 				 VITASURF_STORAGE_DIR, store_index[oldest].name);
 			remove(path);
+			/* a file dropped is no longer what was written */
+			memset(store_last, 0, sizeof(store_last));
 			vita_log("storage: full, dropping %s (%u KB)",
 				 store_index[oldest].name,
 				 (unsigned)(store_index[oldest].bytes / 1024));
@@ -20476,6 +20486,41 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 	return out;
 }
 
+/*
+ * What was last written for an origin, by length and a 64-bit hash of the
+ * text in two halves (VitaSurf). A save writes a new file, renames it over
+ * the old and writes the index again, some 60 ms on a memory card, and a
+ * page saves its whole store a few hundred milliseconds after each change
+ * however little changed: Stack Overflow's nine saves came to 536 ms. One
+ * that would write what is there already is skipped.
+ */
+
+static void store_text_hash(const char *text, size_t len, uint32_t *lo,
+			    uint32_t *hi)
+{
+	uint32_t a = 2166136261u, b = 0x9747b28cu;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		a = (a ^ (unsigned char)text[i]) * 16777619u;
+		b = (b ^ (unsigned char)text[i]) * 0x5bd1e995u;
+		b ^= b >> 15;
+	}
+	*lo = a;
+	*hi = b;
+}
+
+static struct store_last *store_last_find(const char *origin)
+{
+	unsigned i;
+
+	for (i = 0; i < STORE_LAST_SLOTS; i++) {
+		if (strcmp(store_last[i].origin, origin) == 0)
+			return &store_last[i];
+	}
+	return NULL;
+}
+
 /** __vitaStoreSave(text): replace everything this origin has stored. */
 static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 				   int argc, JSValueConst *argv)
@@ -20487,6 +20532,8 @@ static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 	size_t len = 0;
 	FILE *f;
 	bool ok = false;
+	uint32_t h_lo = 0, h_hi = 0;
+	struct store_last *last;
 
 	(void)this_val;
 	if (thread == NULL || thread->htmlc == NULL || argc < 1) {
@@ -20509,8 +20556,17 @@ static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 		free(origin);
 		return JS_FALSE;
 	}
+	store_text_hash(text, len, &h_lo, &h_hi);
+	last = strlen(origin) < sizeof(store_last[0].origin) ?
+			store_last_find(origin) : NULL;
+	if (last != NULL && last->len == (uint32_t)len &&
+	    last->h_lo == h_lo && last->h_hi == h_hi) {
+		/* the file holds this already */
+		JS_FreeCString(ctx, text);
+		free(origin);
+		return JS_TRUE;
+	}
 	store_path(path, sizeof(path), origin);
-	free(origin);
 	/* beside its own name and renamed over it, as for the script cache */
 	snprintf(tmp, sizeof(tmp), "%s.new", path);
 	f = fopen(tmp, "wb");
@@ -20527,7 +20583,23 @@ static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 	}
 	if (ok) {
 		store_index_note(strrchr(path, '/') + 1, (uint32_t)len);
+		if (strlen(origin) < sizeof(store_last[0].origin)) {
+			if (last == NULL) {
+				last = &store_last[store_last_next];
+				store_last_next = (store_last_next + 1) %
+						STORE_LAST_SLOTS;
+				snprintf(last->origin, sizeof(last->origin),
+					 "%s", origin);
+			}
+			last->len = (uint32_t)len;
+			last->h_lo = h_lo;
+			last->h_hi = h_hi;
+		}
+	} else if (last != NULL) {
+		/* what is there now is not known */
+		last->origin[0] = '\0';
 	}
+	free(origin);
 	JS_FreeCString(ctx, text);
 	return ok ? JS_TRUE : JS_FALSE;
 }
