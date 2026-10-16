@@ -1612,9 +1612,12 @@ void vita_input_report_page(struct gui_window *gw, unsigned int ms)
 				 vitasurf_ms_layout, vitasurf_ms_script);
 			vita_log("page: %u style sheets were parsed, %u KB, "
 				 "and %u were taken already parsed from the "
-				 "memory cache, %u from an early style read",
+				 "memory cache, %u from an early style read "
+				 "and %u from another sheet of the same text",
 				 vitasurf_css_parsed, vitasurf_css_parsed_kb,
-				 vitasurf_css_reused, vitasurf_css_adopted);
+				 vitasurf_css_reused,
+				 vitasurf_css_adopted - vitasurf_css_shared,
+				 vitasurf_css_shared);
 			vita_log("page: script %u ms is %u ms in script "
 				 "elements (%u ms compiling or reading them, "
 				 "%u ms running them, %u ms after, of which "

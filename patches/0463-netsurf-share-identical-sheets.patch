@@ -1,0 +1,252 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index 7fbdae732..21450c34b 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -78,6 +78,7 @@ struct content_css_data
+ 	void *pw;			/**< Client data */
+ 	uint32_t root_hints;		/**< Root hints the parse used, or 0 */
+ 	bool adopted;			/**< sheet was parsed already (VitaSurf) */
++	struct nscss_shared *shared;	/**< the parse it shares, or NULL */
+ };
+ 
+ /**
+@@ -105,6 +106,133 @@ static nserror nscss_clone(const struct content *old, struct content **newc);
+ static bool nscss_matches_quirks(const struct content *c, bool quirks);
+ static content_type nscss_content_type(void);
+ 
++/*
++ * Sheets parsed from text, kept by it so that a content with the same
++ * text takes the parse instead of making its own (VitaSurf). As Chrome
++ * shares the parsed contents of identical inline style sheets: BBC's
++ * page put the same 328 KB sheet into seventeen STYLE elements, and
++ * each was parsed afresh, 500 to 760 ms apiece, and old.reddit's login
++ * page the same sheet seven times. A sheet is shared only when its
++ * text, base URL, charset and quirks are the same, it imports nothing,
++ * and any root hints its parse used are the document's now; it is
++ * destroyed when the last content holding it goes.
++ */
++#define NSCSS_SHARE_MIN 2048
++#define NSCSS_SHARE_BUCKETS 64
++
++struct nscss_shared {
++	struct nscss_shared *next;
++	css_stylesheet *sheet;
++	unsigned int refs;
++	uint32_t hash;
++	size_t len;
++	uint8_t *text;
++	char *base;
++	char *charset;
++	bool quirks;
++	uint32_t root_hints;
++};
++
++static struct nscss_shared *nscss_share_table[NSCSS_SHARE_BUCKETS];
++
++
++static uint32_t nscss_share_hash(const uint8_t *d, size_t n)
++{
++	uint32_t h = 2166136261u;
++	size_t i, step = n > 65536 ? n / 16384 : 1;
++
++	/* a sample of a long text, all of a short one; the whole text is
++	 * compared before a match is taken */
++	for (i = 0; i < n; i += step)
++		h = (h ^ d[i]) * 16777619u;
++	return h ^ (uint32_t) n;
++}
++
++static bool nscss_share_same_str(const char *a, const char *b)
++{
++	if (a == NULL || b == NULL)
++		return a == b;
++	return strcmp(a, b) == 0;
++}
++
++/** The kept parse for this text and setting, or NULL. */
++static struct nscss_shared *nscss_share_find(const uint8_t *data,
++		size_t len, const char *base, const char *charset, bool quirks)
++{
++	uint32_t h = nscss_share_hash(data, len);
++	struct nscss_shared *e;
++
++	for (e = nscss_share_table[h % NSCSS_SHARE_BUCKETS]; e != NULL;
++			e = e->next) {
++		if (e->hash != h || e->len != len || e->quirks != quirks ||
++				!nscss_share_same_str(e->base, base) ||
++				!nscss_share_same_str(e->charset, charset))
++			continue;
++		if (e->root_hints != 0 &&
++				e->root_hints != css_root_hints_signature())
++			continue;
++		if (memcmp(e->text, data, len) != 0)
++			continue;
++		return e;
++	}
++	return NULL;
++}
++
++/** Keep a content's parse for others; false if it cannot be kept. */
++static struct nscss_shared *nscss_share_add(css_stylesheet *sheet,
++		const uint8_t *data, size_t len, const char *base,
++		const char *charset, bool quirks, uint32_t root_hints)
++{
++	struct nscss_shared *e = calloc(1, sizeof(*e));
++	uint32_t h;
++
++	if (e == NULL)
++		return NULL;
++	e->text = malloc(len);
++	e->base = base != NULL ? strdup(base) : NULL;
++	e->charset = charset != NULL ? strdup(charset) : NULL;
++	if (e->text == NULL || (base != NULL && e->base == NULL) ||
++			(charset != NULL && e->charset == NULL)) {
++		free(e->text);
++		free(e->base);
++		free(e->charset);
++		free(e);
++		return NULL;
++	}
++	memcpy(e->text, data, len);
++	h = nscss_share_hash(data, len);
++	e->hash = h;
++	e->len = len;
++	e->sheet = sheet;
++	e->refs = 1;
++	e->quirks = quirks;
++	e->root_hints = root_hints;
++	e->next = nscss_share_table[h % NSCSS_SHARE_BUCKETS];
++	nscss_share_table[h % NSCSS_SHARE_BUCKETS] = e;
++	return e;
++}
++
++/** Let go of a content's hold on a kept parse. */
++static void nscss_share_release(struct nscss_shared *e)
++{
++	struct nscss_shared **pp;
++
++	if (--e->refs > 0)
++		return;
++	for (pp = &nscss_share_table[e->hash % NSCSS_SHARE_BUCKETS];
++			*pp != NULL; pp = &(*pp)->next) {
++		if (*pp == e) {
++			*pp = e->next;
++			break;
++		}
++	}
++	css_stylesheet_destroy(e->sheet);
++	free(e->text);
++	free(e->base);
++	free(e->charset);
++	free(e);
++}
++
+ /*
+  * Sheets parsed from a STYLE's text for an early style read, offered to
+  * the CSS content made for the same text (VitaSurf). The content parsed
+@@ -303,6 +431,7 @@ static nserror nscss_create_css_data(struct content_css_data *c,
+ 	c->imports = NULL;
+ 	c->root_hints = 0;
+ 	c->adopted = false;
++	c->shared = NULL;
+ 	if (charset != NULL)
+ 		c->charset = strdup(charset);
+ 	else
+@@ -392,6 +521,27 @@ bool nscss_convert(struct content *c)
+ 		}
+ 	}
+ 
++	/* the same text parsed already, by another content (VitaSurf) */
++	if (!css->data.adopted) {
++		const uint8_t *data = content__get_source_data(c, &size);
++		const char *base = NULL;
++		struct nscss_shared *e = NULL;
++
++		if (data != NULL && size >= NSCSS_SHARE_MIN &&
++				css_stylesheet_get_url(css->data.sheet,
++					&base) == CSS_OK)
++			e = nscss_share_find(data, size, base,
++					css->data.charset, c->quirks);
++		if (e != NULL) {
++			css_stylesheet_destroy(css->data.sheet);
++			css->data.sheet = e->sheet;
++			css->data.shared = e;
++			css->data.adopted = true;
++			e->refs++;
++			vitasurf_css_shared++;
++		}
++	}
++
+ 	/* how much was parsed, for the page log (VitaSurf) */
+ 	(void) content__get_source_data(c, &size);
+ 	if (css->data.adopted) {
+@@ -407,6 +557,22 @@ bool nscss_convert(struct content *c)
+ 		return false;
+ 	}
+ 
++	/* a whole sheet that imports nothing, kept for the next content
++	 * with its text (VitaSurf) */
++	if (css->data.shared == NULL && css->data.import_count == 0 &&
++			size >= NSCSS_SHARE_MIN) {
++		const uint8_t *data = content__get_source_data(c, &size);
++		const char *base = NULL;
++
++		if (data != NULL && css_stylesheet_get_url(css->data.sheet,
++				&base) == CSS_OK &&
++				nscss_share_find(data, size, base,
++					css->data.charset, c->quirks) == NULL)
++			css->data.shared = nscss_share_add(css->data.sheet,
++					data, size, base, css->data.charset,
++					c->quirks, css->data.root_hints);
++	}
++
+ 	return true;
+ }
+ 
+@@ -490,7 +656,12 @@ static void nscss_destroy_css_data(struct content_css_data *c)
+ 
+ 	free(c->imports);
+ 
+-	if (c->sheet != NULL) {
++	if (c->shared != NULL) {
++		/* the parse others may hold too (VitaSurf) */
++		nscss_share_release(c->shared);
++		c->shared = NULL;
++		c->sheet = NULL;
++	} else if (c->sheet != NULL) {
+ 		css_stylesheet_destroy(c->sheet);
+ 		c->sheet = NULL;
+ 	}
+diff --git a/utils/utils.c b/utils/utils.c
+index 93831a557..6155a4733 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -580,6 +580,7 @@ unsigned int vitasurf_css_parsed;
+ unsigned int vitasurf_css_parsed_kb;
+ unsigned int vitasurf_css_reused;
+ unsigned int vitasurf_css_adopted;
++unsigned int vitasurf_css_shared;
+ unsigned int vitasurf_us_compose;
+ 
+ #ifdef __vita__
+@@ -884,6 +885,7 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_css_parsed_kb = 0;
+ 	vitasurf_css_reused = 0;
+ 	vitasurf_css_adopted = 0;
++	vitasurf_css_shared = 0;
+ 	vitasurf_us_compose = 0;
+ 	css_select_us_setup = 0;
+ 	css_select_us_match = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 2b2c45aac..cf048cd62 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -140,6 +140,8 @@ extern unsigned int vitasurf_css_parsed_kb;
+ extern unsigned int vitasurf_css_reused;
+ /** and how many a STYLE's content took from an early style read (VitaSurf) */
+ extern unsigned int vitasurf_css_adopted;
++/** sheets that took another content's parse of the same text (VitaSurf) */
++extern unsigned int vitasurf_css_shared;
+ /** A microsecond clock, for timing work too short for milliseconds. */
+ uint64_t vitasurf_clock_us(void);
+ /*
