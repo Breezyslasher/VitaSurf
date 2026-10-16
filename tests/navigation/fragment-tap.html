@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!--
+  A link to another fragment of the page, followed by the user, moves
+  location and fires hashchange, as when script moves it (VitaSurf).
+  NetSurf followed it, scrolled, and the page heard nothing: location.hash
+  stayed what it was, and a router waiting on hashchange never moved.
+  Tap "two" once the page says it is ready, then "two" again; each line
+  must say PASS. Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Fragment tap</title>
+<style>body { margin: 0; font: 40px sans-serif; } .gap { height: 2000px; }</style></head>
+<body>
+<a id="two" href="#two-target">two</a>
+<pre id="out" style="font-size: 14px"></pre>
+<div class="gap"></div>
+<p id="two-target">two's target</p>
+<script>
+var out = [], events = [], taps = 0;
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function report() {
+  document.getElementById('out').textContent += out.join('\n') + '\n';
+  out.forEach(function (l) { console.log('fragment-tap: ' + l); });
+  out = [];
+}
+addEventListener('hashchange', function (e) {
+  events.push(location.hash + ' from ' + e.oldURL.slice(e.oldURL.indexOf('#')));
+});
+location.hash = '#one';
+setTimeout(function () {
+  ok('script moving the hash fires once', events.length, 1);
+  ok('and location says so', location.hash, '#one');
+  report();
+  console.log('fragment-tap: ready to tap');
+  var seen = 1;
+  (function wait() {
+    if (events.length === seen) { setTimeout(wait, 50); return; }
+    seen = events.length;
+    taps++;
+    if (taps === 1) {
+      ok('the tap moved location', location.hash, '#two-target');
+      ok('and fired hashchange once', events.length, 2);
+      ok('with where it came from', events[1], '#two-target from #one');
+      report();
+      setTimeout(function () {
+        ok('a tap on where it is already fires nothing', events.length, 2);
+        report();
+        console.log('fragment-tap: done');
+      }, 1500);
+    }
+    setTimeout(wait, 50);
+  })();
+}, 100);
+</script>
+</body></html>

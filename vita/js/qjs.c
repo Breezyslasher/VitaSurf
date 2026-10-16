@@ -22964,6 +22964,34 @@ bool js_implicit_submit(jsthread *thread, struct dom_node *form)
 }
 
 /* exported interface documented in js.h (VitaSurf) */
+void js_fragment_navigated(jsthread *thread, const char *href)
+{
+	JSContext *ctx;
+	JSValue global, fn, arg, r;
+
+	if (thread == NULL || thread->closed || thread->ctx == NULL ||
+	    href == NULL) {
+		return;
+	}
+	ctx = thread->ctx;
+	begin_script(thread, SCRIPT_EVENT);
+	global = JS_GetGlobalObject(ctx);
+	fn = natives_get(ctx, "__vitaFragmentNavigated");
+	if (JS_IsFunction(ctx, fn)) {
+		arg = JS_NewString(ctx, shown_url(href));
+		r = JS_Call(ctx, fn, global, 1, &arg);
+		if (JS_IsException(r)) {
+			qjs_report_exception(ctx);
+		}
+		JS_FreeValue(ctx, r);
+		JS_FreeValue(ctx, arg);
+	}
+	JS_FreeValue(ctx, fn);
+	JS_FreeValue(ctx, global);
+	end_script(thread);
+}
+
+/* exported interface documented in js.h (VitaSurf) */
 void js_activate(jsthread *thread, struct dom_node *target, int x, int y)
 {
 	JSContext *ctx;

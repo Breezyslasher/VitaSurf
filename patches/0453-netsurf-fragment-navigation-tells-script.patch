@@ -1,0 +1,102 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index f236de301..fd887d1e0 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -4838,6 +4838,18 @@ static enum box_restyle html_restyle_siblings(html_content *c, dom_node *n,
+ /** How many elements one batch of changes may select again. */
+ #define HTML_ATTR_BUDGET 3000
+ 
++/* exported interface documented in html/html.h */
++void html_fragment_navigated(struct hlcache_handle *h, nsurl *url)
++{
++	struct content *c = hlcache_handle_get_content(h);
++
++	if (c == NULL || url == NULL || content_get_type(h) != CONTENT_HTML)
++		return;
++	if (((html_content *) c)->jsthread != NULL)
++		js_fragment_navigated(((html_content *) c)->jsthread,
++				nsurl_access(url));
++}
++
+ /** The boxes from b on that were given a link's address was, given now
+  * instead. */
+ static void html_relink_boxes(struct box *b, nsurl *was, nsurl *now)
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index d9a920b27..a88cfbe05 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -311,4 +311,10 @@ bool html_get_id_offset(struct hlcache_handle *h, lwc_string *frag_id,
+  */
+ bool html_scroll_anchor_take(struct hlcache_handle *h, int *dy);
+ 
++/**
++ * The window moved to another fragment of this HTML content (VitaSurf);
++ * its script is told. Nothing for any other content.
++ */
++void html_fragment_navigated(struct hlcache_handle *h, struct nsurl *url);
++
+ #endif
+diff --git a/content/handlers/javascript/js.h b/content/handlers/javascript/js.h
+index 4def16b9a..b46580ba9 100644
+--- a/content/handlers/javascript/js.h
++++ b/content/handlers/javascript/js.h
+@@ -144,6 +144,17 @@ bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc,
+  */
+ void js_activate(jsthread *thread, struct dom_node *target, int x, int y);
+ 
++/**
++ * The window moved to another fragment of the document on its own, from a
++ * link the user followed, the address bar or history (VitaSurf): the
++ * page's location reads the new address and hashchange fires, as when a
++ * script moves it.
++ *
++ * \param thread The script thread of the document.
++ * \param href   The new address, with its fragment.
++ */
++void js_fragment_navigated(jsthread *thread, const char *href);
++
+ /**
+  * Submit a form the user submitted with a button, as script submits one
+  * (VitaSurf): the submit event naming the button, the HTML standard's
+diff --git a/content/handlers/javascript/none/none.c b/content/handlers/javascript/none/none.c
+index 4490d4fc8..001bdea84 100644
+--- a/content/handlers/javascript/none/none.c
++++ b/content/handlers/javascript/none/none.c
+@@ -71,6 +71,10 @@ bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc,
+ 	return true;
+ }
+ 
++void js_fragment_navigated(jsthread *thread, const char *href)
++{
++}
++
+ void js_activate(jsthread *thread, struct dom_node *target, int x, int y)
+ {
+ }
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index f732b8c6d..976bbbcd3 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -3830,8 +3830,6 @@ browser_window_navigate_body(struct browser_window *bw,
+ 		if ((same_url) &&
+ 		    (fetch_is_post == false) &&
+ 		    (nsurl_has_component(url, NSURL_QUERY) == false)) {
+-			nsurl_unref(url);
+-
+ 			if (referrer != NULL) {
+ 				nsurl_unref(referrer);
+ 			}
+@@ -3844,6 +3842,13 @@ browser_window_navigate_body(struct browser_window *bw,
+ 
+ 			browser_window_update(bw, false);
+ 
++			/* the page's script sees where it is now
++			 * (VitaSurf) */
++			if (bw->current_content != NULL)
++				html_fragment_navigated(bw->current_content,
++						url);
++			nsurl_unref(url);
++
+ 			if (bw->current_content != NULL) {
+ 				browser_window_refresh_url_bar(bw);
+ 			}

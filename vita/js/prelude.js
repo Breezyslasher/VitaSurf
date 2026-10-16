@@ -1094,6 +1094,24 @@ function goTo(url){
   },0);
   return;}
  setTimeout(function(){try{location.href=abs;}catch(e){}},0);}
+/* The window moved to another fragment by itself (VitaSurf): a link the
+   user followed, the address bar or history, which NetSurf scrolls to.
+   The page's location reads the new address and hashchange fires, as
+   when its script moves it; a hash router waiting on hashchange had
+   seen nothing, and location.hash had stayed what it was. Where script
+   moved it there already, nothing more. */
+NV.__vitaFragmentNavigated=function(abs){
+ var here;
+ try{here=location.href;}catch(e){return;}
+ abs=String(abs);
+ if(abs===here||!sameDocFragment(here,abs))return;
+ NV.__vitaHref=abs;
+ setTimeout(function(){
+  var ev=uaEvent(new W.HashChangeEvent('hashchange',
+   {bubbles:false,cancelable:false}));
+  ev.oldURL=here;ev.newURL=abs;
+  try{W.dispatchEvent?W.dispatchEvent(ev):NV.__vitaDispatch(null,ev);}catch(e){}
+ },0);};
 /* location.href reads back what a same-document navigation left. */
 (function(){
  var d=Object.getOwnPropertyDescriptor(location,'href');
