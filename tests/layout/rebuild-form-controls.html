@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<!--
+  A block with form controls in it, built again or hidden on its own
+  (VitaSurf). Text changed beside the controls, and the block hidden and
+  shown, must keep what the controls hold, their places and their
+  submission, without the whole page being built again: the log must
+  not say "need the layout rebuilt". Each line must say PASS; Chrome
+  passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Rebuilding around controls</title>
+<style>#panel { width: 400px; } input, select { display: block; }</style>
+</head><body>
+<form id="fm" action="about:blank">
+<div id="panel">
+  <p id="msg">first</p>
+  <input id="t" name="t" value="typed">
+  <input id="c" type="checkbox" name="c" checked>
+  <select id="s" name="s"><option>a</option><option selected>b</option></select>
+</div>
+</form>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('rebuild-form-controls: ' + l); }
+addEventListener('load', function () {
+  var t = document.getElementById('t'), p = document.getElementById('panel');
+  t.value = 'changed';
+  var y0 = t.getBoundingClientRect().top;
+  document.getElementById('msg').textContent = 'second, a longer message';
+  setTimeout(function () {
+    ok('the text field keeps its value', t.value, 'changed');
+    ok('the checkbox stays checked', document.getElementById('c').checked, true);
+    ok('the select keeps its choice', document.getElementById('s').value, 'b');
+    ok('the field keeps its place', Math.round(t.getBoundingClientRect().top), Math.round(y0));
+    p.style.display = 'none';
+    setTimeout(function () {
+      ok('a hidden field has no box', t.getBoundingClientRect().height, 0);
+      p.style.display = '';
+      setTimeout(function () {
+        ok('a shown field has its box again', t.getBoundingClientRect().height > 0, true);
+        ok('and its value', t.value, 'changed');
+        var fd = new FormData(document.getElementById('fm'));
+        ok('the form submits what they hold', fd.get('t') + ',' + fd.get('c') + ',' + fd.get('s'), 'changed,on,b');
+        document.getElementById('out').textContent = out.join('\n');
+        console.log('rebuild-form-controls: done');
+      }, 300);
+    }, 300);
+  }, 300);
+});
+</script>
+</body></html>
