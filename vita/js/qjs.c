@@ -4859,6 +4859,36 @@ static JSValue node_clone_node(JSContext *ctx, JSValueConst this_val,
 
 }
 
+/*
+ * getElementsByTagName for a name, walked inside libdom (VitaSurf): the
+ * DOM's own rule, an HTML element's name in any ASCII case and any other
+ * element's exactly, compared as interned strings, where the general
+ * walk took a reference to every node and a copy of every name.
+ * nytimes.com read the document's <base>, <link> and <template> elements
+ * 550 times, 6 ms each. Undefined when the name could not be interned,
+ * and the general walk answers.
+ */
+static JSValue tag_walk(JSContext *ctx, struct dom_node *root,
+			const char *name, size_t len)
+{
+	lwc_string *tag = NULL;
+	struct dom_node *n = NULL;
+	uint32_t out_n = 0, seen = 0;
+	JSValue out;
+
+	if (lwc_intern_string(name, len, &tag) != lwc_error_ok) {
+		return JS_UNDEFINED;
+	}
+	out = JS_NewArray(ctx);
+	/* borrowed nodes: wrapping runs no script and changes nothing */
+	while ((n = dom_node_vita_find_tag(root, n, tag, &seen)) != NULL) {
+		JS_SetPropertyUint32(ctx, out, out_n++, wrap_node(ctx, n));
+	}
+	lwc_string_unref(tag);
+	find_visits += seen;
+	return out;
+}
+
 static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_val,
 					     int argc, JSValueConst *argv)
 {
@@ -4878,6 +4908,7 @@ static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_v
 		JSValue out;
 
 		memset(&k, 0, sizeof(k));
+		out = JS_UNDEFINED;
 		if (strcmp(name, "*") != 0) {
 			k.tag = malloc(len + 1);
 			if (k.tag == NULL) {
@@ -4889,9 +4920,15 @@ static JSValue node_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_v
 			}
 			k.tag[len] = 0;
 		}
+		i = find_visits;
+		if (k.tag != NULL) {
+			out = tag_walk(ctx, node, name, len);
+		}
 		JS_FreeCString(ctx, name);
-		len = find_visits;
-		out = find_in_subtree(ctx, node, &k, 1);
+		len = i;
+		if (JS_IsUndefined(out)) {
+			out = find_in_subtree(ctx, node, &k, 1);
+		}
 		walk_cost_note("el.getElementsByTagName",
 			       k.tag != NULL ? k.tag : "*",
 			       strlen(k.tag != NULL ? k.tag : "*"),
@@ -6708,6 +6745,7 @@ static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_va
 	/* Walked, never read out of a libdom NodeList: see childNodes. */
 	memset(&k, 0, sizeof(k));
 	len = strlen(name);
+	out = JS_UNDEFINED;
 	if (strcmp(name, "*") != 0) {
 		k.tag = malloc(len + 1);
 		if (k.tag == NULL) {
@@ -6719,9 +6757,15 @@ static JSValue doc_get_elements_by_tag_name(JSContext *ctx, JSValueConst this_va
 		}
 		k.tag[len] = 0;
 	}
+	i = find_visits;
+	if (k.tag != NULL) {
+		out = tag_walk(ctx, (struct dom_node *)doc, name, len);
+	}
 	JS_FreeCString(ctx, name);
-	len = find_visits;
-	out = find_in_subtree(ctx, (struct dom_node *)doc, &k, 1);
+	len = i;
+	if (JS_IsUndefined(out)) {
+		out = find_in_subtree(ctx, (struct dom_node *)doc, &k, 1);
+	}
 	walk_cost_note("document.getElementsByTagName",
 		       k.tag != NULL ? k.tag : "*",
 		       strlen(k.tag != NULL ? k.tag : "*"),
@@ -12098,6 +12142,9 @@ struct sel_compound {
 	char *id;
 	size_t id_len;
 	char **classes;
+	/* the same, interned, as the element keeps its class list, or NULL
+	 * if they could not be (VitaSurf) */
+	lwc_string **class_lwc;
 	int nclasses;
 	struct sel_attr *attrs;
 	int nattrs;
@@ -12129,6 +12176,13 @@ static void sel_free_compound(struct sel_compound *c)
 	free(c->id);
 	for (i = 0; i < c->nclasses; i++) free(c->classes[i]);
 	free(c->classes);
+	if (c->class_lwc != NULL) {
+		for (i = 0; i < c->nclasses; i++) {
+			if (c->class_lwc[i] != NULL)
+				lwc_string_unref(c->class_lwc[i]);
+		}
+		free(c->class_lwc);
+	}
 	for (i = 0; i < c->nattrs; i++) {
 		if (c->attrs[i].name != NULL) dom_string_unref(c->attrs[i].name);
 		free(c->attrs[i].val);
@@ -12260,6 +12314,21 @@ static bool sel_parse_compound(const char **pp, const char *end,
 		c->classes = grown;
 		c->classes[c->nclasses] = sel_dup(p + 1, n);
 		if (c->classes[c->nclasses] == NULL) return false;
+		{
+			lwc_string **kept = realloc(c->class_lwc,
+					(size_t)(c->nclasses + 1) *
+					sizeof(*kept));
+
+			if (kept == NULL) {
+				free(c->classes[c->nclasses]);
+				return false;
+			}
+			c->class_lwc = kept;
+			if (lwc_intern_string(c->classes[c->nclasses], n,
+					&kept[c->nclasses]) != lwc_error_ok) {
+				kept[c->nclasses] = NULL;
+			}
+		}
 		c->nclasses++;
 		p += 1 + n;
 	}
@@ -12525,6 +12594,18 @@ static bool sel_is_element(struct dom_node *n)
 }
 
 /* The prelude's matchSimple, for the parts this side handles. */
+/* Whether every class of a compound has its interned name. */
+static bool sel_classes_interned(const struct sel_compound *c)
+{
+	int i;
+
+	if (c->class_lwc == NULL) return false;
+	for (i = 0; i < c->nclasses; i++) {
+		if (c->class_lwc[i] == NULL) return false;
+	}
+	return true;
+}
+
 static bool sel_match_compound(struct dom_node *n, const struct sel_compound *c)
 {
 	int i;
@@ -12547,7 +12628,35 @@ static bool sel_match_compound(struct dom_node *n, const struct sel_compound *c)
 		if (v != NULL) dom_string_unref(v);
 		if (!hit) return false;
 	}
-	if (c->nclasses > 0) {
+	if (c->nclasses > 0 && sel_classes_interned(c)) {
+		/*
+		 * Against the element's own class list, by the interned
+		 * names' addresses (VitaSurf): reading the attribute made a
+		 * lower-case copy of its name and searched the value a
+		 * character at a time for every element of a walk, and
+		 * cnn.com's class queries of the whole document were most
+		 * of 10 s.
+		 */
+		lwc_string **cl = NULL;
+		uint32_t ncl = 0, j;
+		bool hit = true;
+
+		if (dom_element_get_classes((struct dom_element *) n, &cl,
+					    &ncl) != DOM_NO_ERR) {
+			return false;
+		}
+		for (i = 0; i < c->nclasses && hit; i++) {
+			hit = false;
+			for (j = 0; j < ncl; j++) {
+				if (cl[j] == c->class_lwc[i]) {
+					hit = true;
+					break;
+				}
+			}
+		}
+		for (j = 0; j < ncl; j++) lwc_string_unref(cl[j]);
+		if (!hit) return false;
+	} else if (c->nclasses > 0) {
 		dom_string *v = NULL;
 		bool hit = true;
 

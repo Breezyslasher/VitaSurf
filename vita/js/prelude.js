@@ -1448,9 +1448,16 @@ D.createTreeWalker=function(root,what,filter){
  * compares each module with every <link>'s href walked a document of
  * 6,400 elements 39,459 times on nytimes.com, four minutes of script. */
 (function(){
- var gen=-1,here=null,val='';
+ var gen=-1,here=null,val='',bgen=-1,bases=null;
+ /* the <base> elements are kept while the tree keeps its shape, and
+    their href read again: a page writing attributes between reads had
+    the document walked for them every time (VitaSurf) */
+ function baseEls(){
+  var t=treeGen();
+  if(t<0||t!==bgen||!bases){bases=[].slice.call(D.getElementsByTagName('base'));bgen=t;}
+  return bases;}
  function find(){
-  var b=D.getElementsByTagName('base');
+  var b=baseEls();
   for(var i=0;i<b.length;i++){var h=b[i].getAttribute('href');
    if(h){try{return new URL(h,location.href).href;}catch(e){}}}
   /* the document's own base: a srcdoc or blank frame's is its parent's */
@@ -5362,12 +5369,18 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
     frames now: when the page loads, before each script runs, when
     window.length is read and when a frame's window is made or asked for;
     a tree that has not changed since is not looked through again. */
- function frameEls(){return D.querySelectorAll('iframe,frame');}
+ /* the frames change only with the tree's shape (VitaSurf): kept while
+    it keeps it, where any attribute write had them looked for again */
+ var fgen=-1,frames=null;
+ function frameEls(){
+  var t=treeGen();
+  if(t<0||t!==fgen||!frames){frames=D.querySelectorAll('iframe,frame');fgen=t;}
+  return frames;}
  var indexed=0,syncedAt=-2;
  function indexGetter(n){return function(){
   var e=frameEls()[n];return e?e.contentWindow:undefined;};}
  function syncIndexes(){
-  var g=domGen(),count,n;
+  var g=treeGen(),count,n;
   if(g>=0&&g===syncedAt)return indexed;
   syncedAt=g;
   count=frameEls().length;

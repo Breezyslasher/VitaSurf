@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+  getElementsByTagName and baseURI over a document of 6000 elements,
+  with a node added or an attribute written between reads (VitaSurf).
+  nytimes.com read the document's <base>, <link> and <template> elements
+  550 times during its load, 6 ms each on the Vita, the tree changing in
+  between. Logs the times.
+-->
+<html><head><meta charset="utf-8"><title>Tag lookups</title></head><body><script>
+var h = '';
+for (var i = 0; i < 2000; i++) h += '<div class="c' + (i % 50) + '"><span>s</span><a href="x' + i + '">a</a></div>';
+document.body.insertAdjacentHTML('beforeend', h);
+var t0 = performance.now(), n = 0;
+for (i = 0; i < 300; i++) {
+  document.body.appendChild(document.createElement('i'));
+  n += document.getElementsByTagName('link').length + document.getElementsByTagName('base').length;
+}
+var t1 = performance.now(), last = document.body.lastChild;
+for (i = 0; i < 300; i++) {
+  last.setAttribute('data-n', i);
+  n += document.baseURI.length + window.length;
+}
+var t2 = performance.now();
+console.log('tag-lookups: 600 tag queries with the tree changing ' + Math.round(t1 - t0) +
+            ' ms; 300 baseURI and window.length reads after attribute writes ' + Math.round(t2 - t1) + ' ms (' + n + ')');
+</script></body></html>

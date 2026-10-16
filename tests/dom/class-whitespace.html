@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!--
+  A class attribute with tabs and line breaks between its classes
+  (VitaSurf). The class list is the attribute split on ASCII whitespace;
+  libdom split it on spaces alone, so a class written on the next line
+  kept the line break, and neither a CSS rule nor querySelector found the
+  element by it. querySelector now matches against that list. Each line
+  must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Class whitespace</title>
+<style>.first { color: rgb(1, 0, 0) } .second { margin-left: 3px } .third { padding-left: 4px }</style></head>
+<body>
+<div id="t" class="first
+	second
+  third">t</div>
+<div id="u" class="Upper">u</div>
+<pre id="out"></pre>
+<script>
+var out = [], t = document.getElementById("t");
+function ok(name, got, want) { out.push((got === want ? "PASS " : "FAIL ") + name + (got === want ? "" : ": " + got + ", want " + want)); }
+var cs = getComputedStyle(t);
+ok("a CSS rule for the first class", cs.color, "rgb(1, 0, 0)");
+ok("for the one after a line break and a tab", cs.marginLeft, "3px");
+ok("for the last, on its own line", cs.paddingLeft, "4px");
+ok("querySelector by the second", document.querySelector(".second"), t);
+ok("and by all three", document.querySelector(".first.second.third"), t);
+ok("matches", t.matches("div.third"), true);
+ok("closest", t.closest(".second"), t);
+ok("classList", t.classList.length + " " + t.classList.contains("second"), "3 true");
+ok("getElementsByClassName", document.getElementsByClassName("third").length, 1);
+ok("a class in another case does not match", document.querySelector(".upper"), null);
+ok("in its own case it does", document.querySelector(".Upper"), document.getElementById("u"));
+t.className = "x\ny";
+ok("set again with a line break", document.querySelector(".y"), t);
+ok("and the old classes are gone", document.querySelector(".second"), null);
+document.getElementById("out").textContent = out.join("\n");
+out.forEach(function (l) { console.log("class-whitespace: " + l); });
+console.log("class-whitespace: done");
+</script>
+</body></html>
