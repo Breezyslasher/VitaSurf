@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!--
+  An iframe given a name, or what its page may do, after load (VitaSurf).
+  Nothing it draws changes, so the page is not laid out again, and the
+  frame is not loaded again; a link the user follows aimed at the new
+  name opens in it (tap "go" after load). The log must not say "need the layout rebuilt ... name on <IFRAME>".
+  Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Iframe name change</title></head>
+<body>
+<iframe id="f" srcdoc="<p id=p>frame</p><script>parent.loads=(parent.loads||0)+1;</script>" style="width:200px;height:60px"></iframe>
+<a id="l" href="data:text/html,<p>linked</p>" target="later" style="display:block;width:100px;height:30px">go</a>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('iframe-name-change: ' + l); }
+addEventListener('load', function () {
+  var f = document.getElementById('f');
+  var w0 = document.body.offsetWidth;
+  f.name = 'later';
+  f.setAttribute('allow', 'fullscreen');
+  f.setAttribute('referrerpolicy', 'no-referrer');
+  setTimeout(function () {
+    ok('the frame was loaded once', window.loads, 1);
+    ok('its name is the new one', f.name, 'later');
+    ok('the page kept its width', document.body.offsetWidth, w0);
+    document.getElementById('out').textContent = out.join('\n');
+    console.log('iframe-name-change: done');
+  }, 300);
+});
+</script>
+</body></html>

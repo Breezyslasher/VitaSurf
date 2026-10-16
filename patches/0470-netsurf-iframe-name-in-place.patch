@@ -1,0 +1,107 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 0c6396e47..3e04bd7a7 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -4911,6 +4911,23 @@ static bool html_attr_any(const char *name)
+ 	return false;
+ }
+ 
++/** An iframe's attributes that change nothing drawn (VitaSurf): its
++ * name, and what its page may do, which counts from its next load. */
++static bool html_iframe_attr_quiet(const char *name)
++{
++	static const char *const names[] = {
++		"name", "allow", "allowfullscreen", "allowpaymentrequest",
++		"referrerpolicy", "credentialless", "sandbox",
++	};
++	size_t i;
++
++	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (strcasecmp(name, names[i]) == 0)
++			return true;
++	}
++	return false;
++}
++
+ /** Whether an element is in the SVG namespace. */
+ static bool html_node_is_svg(dom_node *n)
+ {
+@@ -5087,6 +5104,36 @@ bool html_restyle_attrs(html_content *c,
+ 			is_source = strcasecmp(dom_string_data(tag),
+ 					"SOURCE") == 0;
+ 		}
++		/* What an iframe's element says that draws nothing: its
++		 * browsing context's name, which takes the new one in place,
++		 * and what it lets its page do. The whole page had been built
++		 * again for it: cnn.com's log gave "name on <IFRAME>" as why
++		 * its page was rebuilt, and its rebuilds after load took 2.4
++		 * to 3.1 s each (VitaSurf). */
++		if (box != NULL && tag != NULL && box->iframe != NULL &&
++				strcasecmp(dom_string_data(tag), "IFRAME") == 0 &&
++				html_iframe_attr_quiet(name)) {
++			if (strcasecmp(name, "name") == 0) {
++				struct content_html_iframe *f;
++				dom_string *v = NULL;
++				const char *nv;
++
++				if (dom_element_get_attribute(ch->node,
++						ch->name, &v) != DOM_NO_ERR)
++					v = NULL;
++				nv = v != NULL ? dom_string_data(v) : NULL;
++				browser_window_iframe_rename(box->iframe, nv);
++				for (f = c->iframe; f != NULL; f = f->next) {
++					if (f->box == box)
++						f->name = nv != NULL ?
++							talloc_strdup(c->bctx,
++								nv) : NULL;
++				}
++				if (v != NULL)
++					dom_string_unref(v);
++			}
++			special = false;
++		}
+ 		/* a link given another address keeps its boxes, which take
+ 		 * the new one (VitaSurf) */
+ 		if (box != NULL && tag != NULL &&
+diff --git a/desktop/frames.c b/desktop/frames.c
+index dd4ca1681..0bba994fb 100644
+--- a/desktop/frames.c
++++ b/desktop/frames.c
+@@ -1455,3 +1455,20 @@ bool browser_window_frame_resize_start(struct browser_window *bw,
+ 	return browser_window_resize_frames(root, mouse,
+ 			x + offx, y + offy, pointer);
+ }
++
++
++/* exported interface documented in desktop/frames.h */
++void browser_window_iframe_rename(struct browser_window *bw, const char *name)
++{
++	char *copy = NULL;
++
++	if (bw == NULL)
++		return;
++	if (name != NULL) {
++		copy = strdup(name);
++		if (copy == NULL)
++			return;
++	}
++	free(bw->name);
++	bw->name = copy;
++}
+diff --git a/desktop/frames.h b/desktop/frames.h
+index 949507a8c..cb379f231 100644
+--- a/desktop/frames.h
++++ b/desktop/frames.h
+@@ -78,6 +78,12 @@ void browser_window_detach_iframes(struct browser_window *bw);
+  */
+ nserror browser_window_rebuild_iframes(struct browser_window *bw);
+ 
++/**
++ * Give an iframe's browsing context the name its element now has, or
++ * none (VitaSurf): what a link's target finds it by.
++ */
++void browser_window_iframe_rename(struct browser_window *bw, const char *name);
++
+ /**
+  * The window of an iframe element, made now if it has none yet
+  * (VitaSurf). Script can reach a frame's window as soon as its element
