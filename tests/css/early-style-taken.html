@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<!--
+  A STYLE read early is parsed once (VitaSurf).
+
+  A script that reads a style before the boxes are built has its STYLEs
+  parsed there and then, and their CSS contents parsed the same text
+  again when they were converted: cnn.com's took 3 s each time. The
+  content now takes the early parse when its text, base and the root's
+  attributes are as they were, and parses for itself otherwise. Whichever
+  it does, the page must not be able to tell: the rules apply, an
+  @import is fetched, a STYLE a script changed has its new text, and a
+  later read sees the same. Each line must say PASS; Chrome passes them
+  all.
+-->
+<html><head><meta charset="utf-8"><title>Early style taken</title>
+<style id="s1">
+.a { width: 123px; height: 10px; background: rgb(1, 2, 3); }
+.a .b { margin-left: 17px; }
+:root { --gap: 9px; }
+.c { padding-top: var(--gap); }
+</style>
+<style id="s2">@import url("early-style-taken/imported.css"); #imp { color: rgb(4, 5, 6); }</style>
+<style id="s3">.d { width: 50px; }</style>
+</head>
+<body>
+<div class="a" id="a"><span class="b" id="b">b</span></div>
+<div class="c" id="c">c</div>
+<div id="imp">imp</div>
+<div class="d" id="d">d</div>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+var early = { w: cs('a').width, bg: cs('a').backgroundColor, ml: cs('b').marginLeft, pt: cs('c').paddingTop, d: cs('d').width };
+document.getElementById('s3').textContent = '.d { width: 80px; }';
+addEventListener('load', function () {
+  ok('an early read sees the first STYLE', early.w, '123px');
+  ok('and its colour', early.bg, 'rgb(1, 2, 3)');
+  ok('and a descendant rule', early.ml, '17px');
+  ok('and a variable from it', early.pt, '9px');
+  ok('after load the width holds', cs('a').width, '123px');
+  ok('and lays the box out', document.getElementById('a').getBoundingClientRect().width, 123);
+  ok('the descendant rule holds', cs('b').marginLeft, '17px');
+  ok('the variable holds', cs('c').paddingTop, '9px');
+  ok('a STYLE with an import has its own rule', cs('imp').color, 'rgb(4, 5, 6)');
+  ok('and the imported one', cs('imp').borderLeftWidth, '7px');
+  ok('a STYLE read before a script changed it', early.d, '50px');
+  ok('has the new text after', cs('d').width, '80px');
+  document.getElementById('s1').textContent += '.a { width: 140px; }';
+  setTimeout(function () {
+    ok('and a STYLE changed after load is read again', cs('a').width, '140px');
+    document.title = out.join('\n');
+    out.forEach(function (l) { console.log('early-style-taken: ' + l); });
+    console.log('early-style-taken: done');
+  }, 300);
+});
+</script>
+</body></html>

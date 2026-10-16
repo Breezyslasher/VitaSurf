@@ -1,0 +1,340 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index 6483e41e7..7fbdae732 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -77,6 +77,7 @@ struct content_css_data
+ 	nscss_done_callback done;	/**< Completion callback */
+ 	void *pw;			/**< Client data */
+ 	uint32_t root_hints;		/**< Root hints the parse used, or 0 */
++	bool adopted;			/**< sheet was parsed already (VitaSurf) */
+ };
+ 
+ /**
+@@ -104,6 +105,84 @@ static nserror nscss_clone(const struct content *old, struct content **newc);
+ static bool nscss_matches_quirks(const struct content *c, bool quirks);
+ static content_type nscss_content_type(void);
+ 
++/*
++ * Sheets parsed from a STYLE's text for an early style read, offered to
++ * the CSS content made for the same text (VitaSurf). The content parsed
++ * the text again: cnn.com's STYLEs took 3 s for its first style read and
++ * as long again when they were converted.
++ */
++#define NSCSS_OFFERS 64
++
++static struct nscss_offer {
++	nsurl *url;
++	nscss_parsed_fn take;
++	void *owner;
++	void *key;
++} nscss_offers[NSCSS_OFFERS];
++static unsigned int nscss_n_offers;
++
++/* exported interface documented in css/css.h */
++bool nscss_offer_parsed(nsurl *url, nscss_parsed_fn take, void *owner,
++		void *key)
++{
++	struct nscss_offer *o;
++
++	if (nscss_n_offers == NSCSS_OFFERS || url == NULL || take == NULL)
++		return false;
++	o = &nscss_offers[nscss_n_offers++];
++	o->url = nsurl_ref(url);
++	o->take = take;
++	o->owner = owner;
++	o->key = dom_node_ref((dom_node *) key);
++	return true;
++}
++
++static void nscss_offer_drop(unsigned int k)
++{
++	nsurl_unref(nscss_offers[k].url);
++	dom_node_unref((dom_node *) nscss_offers[k].key);
++	nscss_offers[k] = nscss_offers[--nscss_n_offers];
++}
++
++/* exported interface documented in css/css.h */
++void nscss_withdraw_offers(const void *owner)
++{
++	unsigned int k = 0;
++
++	while (k < nscss_n_offers) {
++		if (nscss_offers[k].owner == owner)
++			nscss_offer_drop(k);
++		else
++			k++;
++	}
++}
++
++/** The sheet parsed already for this content's text, or NULL. */
++static css_stylesheet *nscss_take_offer(struct content *c)
++{
++	nsurl *url = content_get_url(c);
++	unsigned int k;
++
++	for (k = 0; k < nscss_n_offers; k++) {
++		struct nscss_offer *o = &nscss_offers[k];
++		css_stylesheet *sheet = NULL;
++		const uint8_t *data;
++		const char *base = NULL;
++		size_t size = 0;
++
++		if (!nsurl_compare(o->url, url, NSURL_COMPLETE))
++			continue;
++		data = content__get_source_data(c, &size);
++		if (data != NULL && css_stylesheet_get_url(
++				((nscss_content *) c)->data.sheet, &base) ==
++				CSS_OK && base != NULL)
++			sheet = o->take(o->owner, o->key, data, size, base);
++		nscss_offer_drop(k);
++		return sheet;
++	}
++	return NULL;
++}
++
+ static nserror nscss_create_css_data(struct content_css_data *c,
+ 		const char *url, const char *charset, bool quirks,
+ 		nscss_done_callback done, void *pw);
+@@ -223,6 +302,7 @@ static nserror nscss_create_css_data(struct content_css_data *c,
+ 	c->import_count = 0;
+ 	c->imports = NULL;
+ 	c->root_hints = 0;
++	c->adopted = false;
+ 	if (charset != NULL)
+ 		c->charset = strdup(charset);
+ 	else
+@@ -301,10 +381,25 @@ bool nscss_convert(struct content *c)
+ 	css_error error;
+ 	size_t size = 0;
+ 
++	/* a STYLE's text an early style read parsed already (VitaSurf) */
++	if (nscss_n_offers > 0) {
++		css_stylesheet *taken = nscss_take_offer(c);
++
++		if (taken != NULL) {
++			css_stylesheet_destroy(css->data.sheet);
++			css->data.sheet = taken;
++			css->data.adopted = true;
++		}
++	}
++
+ 	/* how much was parsed, for the page log (VitaSurf) */
+ 	(void) content__get_source_data(c, &size);
+-	vitasurf_css_parsed++;
+-	vitasurf_css_parsed_kb += (unsigned int) (size / 1024);
++	if (css->data.adopted) {
++		vitasurf_css_adopted++;
++	} else {
++		vitasurf_css_parsed++;
++		vitasurf_css_parsed_kb += (unsigned int) (size / 1024);
++	}
+ 
+ 	error = nscss_convert_css_data(&css->data);
+ 	if (error != CSS_OK) {
+@@ -325,7 +420,8 @@ static css_error nscss_convert_css_data(struct content_css_data *c)
+ {
+ 	css_error error;
+ 
+-	error = css_stylesheet_data_done(c->sheet);
++	/* parsed and finished already, without imports (VitaSurf) */
++	error = c->adopted ? CSS_OK : css_stylesheet_data_done(c->sheet);
+ 
+ 	/*
+ 	 * A sheet that resolved its custom properties against the root
+diff --git a/content/handlers/css/css.h b/content/handlers/css/css.h
+index 5e2b64a38..c8567652d 100644
+--- a/content/handlers/css/css.h
++++ b/content/handlers/css/css.h
+@@ -47,8 +47,32 @@ nserror nscss_init(void);
+  * \param h Stylesheet content
+  * \return Pointer to stylesheet object
+  */
++struct nsurl;
++
+ css_stylesheet *nscss_get_stylesheet(struct hlcache_handle *h);
+ 
++/**
++ * Where to ask for a sheet already parsed from a STYLE's text (VitaSurf).
++ * An early style read parses a STYLE whose CSS content is not converted
++ * yet, and the content parsed the same text again when it was. take is
++ * called as the content made from url is converted, with its text and
++ * the base URL its sheet has; it gives back a sheet parsed as the content
++ * would parse that text against that base, with no imports, now the
++ * content's, or NULL for the content to parse it.
++ */
++typedef css_stylesheet *(*nscss_parsed_fn)(void *owner, void *key,
++		const uint8_t *data, size_t len, const char *base);
++
++/**
++ * Say where the content to be made from url can find its sheet parsed.
++ * key is a DOM node, referenced until the offer is taken or withdrawn.
++ */
++bool nscss_offer_parsed(struct nsurl *url, nscss_parsed_fn take,
++		void *owner, void *key);
++
++/** Let go of owner's offers, as it is going (VitaSurf). */
++void nscss_withdraw_offers(const void *owner);
++
+ /**
+  * Retrieve imported stylesheets
+  *
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index f43c545bb..f61d96af5 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -575,6 +575,9 @@ void html_css_link_changed(html_content *c, dom_node *node, dom_string *name,
+ }
+ 
+ 
++static css_stylesheet *early_sheet_take(void *owner, void *key,
++		const uint8_t *data, size_t len, const char *base);
++
+ static nserror
+ html_stylesheet_from_domnode(html_content *c,
+ 			     dom_node *node,
+@@ -610,15 +613,19 @@ html_stylesheet_from_domnode(html_content *c,
+ 		return error;
+ 	}
+ 
+-	dom_string_unref(style);
+-
+ 	snprintf(urlbuf, sizeof(urlbuf), "x-ns-css:%"PRIu32"", key);
+ 
+ 	error = nsurl_create(urlbuf, &url);
+ 	if (error != NSERROR_OK) {
++		dom_string_unref(style);
+ 		return error;
+ 	}
+ 
++	dom_string_unref(style);
++	/* where its content can find the text parsed, if an early style
++	   read parses it before the content is converted (VitaSurf) */
++	nscss_offer_parsed(url, early_sheet_take, c, node);
++
+ 	error = hlcache_handle_retrieve(url, 0,
+ 			content_get_url(&c->base), NULL,
+ 			html_convert_css_callback, c, &child, CONTENT_CSS,
+@@ -1524,6 +1531,7 @@ struct html_early_sheet {
+ 	char *text;
+ 	size_t len;
+ 	css_stylesheet *sheet;
++	nsurl *base;		/**< the base it was parsed against */
+ 	bool used;
+ };
+ 
+@@ -1532,6 +1540,7 @@ static void early_sheet_free(struct html_early_sheet *e)
+ 	css_stylesheet_destroy(e->sheet);
+ 	free(e->text);
+ 	dom_node_unref(e->node);
++	nsurl_unref(e->base);
+ }
+ 
+ /** The element's sheet parsed from this text, kept or parsed now. */
+@@ -1546,7 +1555,9 @@ static css_stylesheet *early_sheet(html_content *c, struct dom_node *node,
+ 		e = &c->early_cache[k];
+ 		if (e->node != node)
+ 			continue;
+-		if (e->len == len && memcmp(e->text, data, len) == 0) {
++		if (e->len == len && memcmp(e->text, data, len) == 0 &&
++				nsurl_compare(e->base, c->base_url,
++				NSURL_COMPLETE)) {
+ 			e->used = true;
+ 			return e->sheet;
+ 		}
+@@ -1583,16 +1594,63 @@ static css_stylesheet *early_sheet(html_content *c, struct dom_node *node,
+ 	e->len = len;
+ 	e->node = dom_node_ref(node);
+ 	e->sheet = sheet;
++	e->base = nsurl_ref(c->base_url);
+ 	e->used = true;
+ 	c->early_cache_n++;
+ 	return sheet;
+ }
+ 
++/**
++ * A STYLE's early parse, for the CSS content made from its text, which
++ * would parse it again (VitaSurf; see nscss_offer_parsed). Only a sheet
++ * parsed from the same text, without imports, which an early parse does
++ * not fetch, and against the root's attributes as they are now.
++ */
++static css_stylesheet *early_sheet_take(void *owner, void *key,
++		const uint8_t *data, size_t len, const char *base)
++{
++	html_content *c = owner;
++	unsigned int k;
++
++	for (k = 0; k < c->early_cache_n; k++) {
++		struct html_early_sheet *e = &c->early_cache[k];
++		css_stylesheet *sheet = e->sheet;
++		lwc_string *import = NULL;
++		uint32_t hints = 0;
++
++		if (e->node != (dom_node *) key)
++			continue;
++		if (e->len != len || memcmp(e->text, data, len) != 0 ||
++				strcmp(nsurl_access(e->base), base) != 0)
++			return NULL;
++		if (css_stylesheet_next_pending_import(sheet, &import) ==
++				CSS_OK) {
++			lwc_string_unref(import);
++			return NULL;
++		}
++		if (css_stylesheet_used_root_hints(sheet, &hints) != CSS_OK ||
++				(hints != 0 &&
++				 hints != css_root_hints_signature()))
++			return NULL;
++		/* the content's now; an early context holding it holds
++		   the content's sheet, as it would once the content is
++		   done */
++		free(e->text);
++		dom_node_unref(e->node);
++		nsurl_unref(e->base);
++		c->early_cache[k] = c->early_cache[--c->early_cache_n];
++		return sheet;
++	}
++	return NULL;
++}
++
+ /* exported function documented in html/css.h */
+ void html_css_early_cache_free(struct html_content *c)
+ {
+ 	unsigned int k;
+ 
++	nscss_withdraw_offers(c);
++
+ 	for (k = 0; k < c->early_cache_n; k++)
+ 		early_sheet_free(&c->early_cache[k]);
+ 	free(c->early_cache);
+diff --git a/utils/utils.c b/utils/utils.c
+index 48fba1812..93831a557 100644
+--- a/utils/utils.c
++++ b/utils/utils.c
+@@ -579,6 +579,7 @@ unsigned int vitasurf_ms_css;
+ unsigned int vitasurf_css_parsed;
+ unsigned int vitasurf_css_parsed_kb;
+ unsigned int vitasurf_css_reused;
++unsigned int vitasurf_css_adopted;
+ unsigned int vitasurf_us_compose;
+ 
+ #ifdef __vita__
+@@ -882,6 +883,7 @@ void vitasurf_profile_reset(void)
+ 	vitasurf_css_parsed = 0;
+ 	vitasurf_css_parsed_kb = 0;
+ 	vitasurf_css_reused = 0;
++	vitasurf_css_adopted = 0;
+ 	vitasurf_us_compose = 0;
+ 	css_select_us_setup = 0;
+ 	css_select_us_match = 0;
+diff --git a/utils/utils.h b/utils/utils.h
+index 641eae9fe..2b2c45aac 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -138,6 +138,8 @@ extern unsigned int vitasurf_ms_css;
+ extern unsigned int vitasurf_css_parsed;
+ extern unsigned int vitasurf_css_parsed_kb;
+ extern unsigned int vitasurf_css_reused;
++/** and how many a STYLE's content took from an early style read (VitaSurf) */
++extern unsigned int vitasurf_css_adopted;
+ /** A microsecond clock, for timing work too short for milliseconds. */
+ uint64_t vitasurf_clock_us(void);
+ /*
