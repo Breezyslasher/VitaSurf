@@ -1162,7 +1162,42 @@ function runActivation(a){
    else if(!shown&&how!=='hide')a.target.showPopover();}
   catch(err){if(NV.__vitaReportError)NV.__vitaReportError(err);}
   return;}
- if(a.kind==='link')goTo(a.el.getAttribute('href'));}
+ if(a.kind==='link')followLink(a.el);}
+/* A link followed from script goes where its target says, as the HTML
+   standard's "follow the hyperlink" has it (VitaSurf): its own target,
+   else the document's <base target>; _self, _parent, _top, or a frame
+   of that name anywhere in the page. Every one had gone to the window
+   the link was in. A target no frame has, or _blank, would open a new
+   window, which the Vita's one window does not have: the link goes
+   where it is, as before. */
+function namedFrame(win,name,depth){
+ var doc,fs,i,f,w,got;
+ if(depth>8)return null;
+ try{doc=win.document;}catch(e){return null;}
+ if(!doc||typeof doc.querySelectorAll!=='function')return null;
+ fs=doc.querySelectorAll('iframe,frame');
+ for(i=0;i<fs.length;i++){
+  f=fs[i];
+  try{w=f.contentWindow;}catch(e){w=null;}
+  if(!w)continue;
+  if(f.getAttribute('name')===name)return w;
+  try{if(w.name===name)return w;}catch(e){}
+  if((got=namedFrame(w,name,depth+1)))return got;}
+ return null;}
+function targetWindow(name){
+ var t=String(name).toLowerCase();
+ if(t===''||t==='_self')return W;
+ if(t==='_parent')return W.parent||W;
+ if(t==='_top')return W.top||W;
+ if(t==='_blank')return W;
+ return namedFrame(W.top||W,String(name),0)||W;}
+function followLink(el){
+ var href=el.getAttribute('href'),t=el.getAttribute('target'),b,win,abs;
+ if(t===null){b=D.querySelector('base[target]');t=b?b.getAttribute('target'):'';}
+ win=targetWindow(t||'');
+ if(win===W||/^\s*javascript:/i.test(String(href))){goTo(href);return;}
+ try{abs=el.href;win.location.href=abs;}
+ catch(e){goTo(href);}}
 function cancelActivate(was){
  var i;
  if(!was)return;

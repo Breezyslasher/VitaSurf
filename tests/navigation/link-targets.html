@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+  Links clicked from script go where their target says (VitaSurf): the
+  document's <base target> when the link has none, or a frame named
+  anywhere in the page, nested ones too, while the page itself stays.
+  Every one had gone to the window the link was in. Each line must say
+  PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Link targets</title>
+<base target="pane"></head>
+<body>
+<iframe name="pane" id="pane" src="link-targets-outer.html" style="width:300px;height:120px"></iframe>
+<a id="byBase" href="link-targets-frame.html?by-base">by base</a>
+<a id="toInner" href="link-targets-frame.html?to-inner" target="inner">to inner</a>
+<a id="toTop" href="#here" target="_top">to top</a>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('link-targets: ' + l); }
+function title(w) { try { return w.document.title; } catch (e) { return 'unreadable'; } }
+addEventListener('load', function () {
+  var pane = document.getElementById('pane').contentWindow;
+  var inner = pane.frames[0];
+  ok('the frames are there', title(pane) + ' ' + (inner ? title(inner) : 'none'), 'outer start-inner');
+  document.getElementById('toInner').click();
+  setTimeout(function () {
+    ok('a link aimed at a nested frame opens there', title(pane.frames[0]), 'to-inner');
+    ok('and the frame around it stays', title(pane), 'outer');
+    document.getElementById('toTop').click();
+    setTimeout(function () {
+      ok('a link aimed at _top opens in the page', location.hash, '#here');
+      document.getElementById('byBase').click();
+      setTimeout(function () {
+        ok('a link with no target goes to <base target>', title(document.getElementById('pane').contentWindow), 'by-base');
+        ok('and the page stays', document.title, 'Link targets');
+        document.getElementById('out').textContent = out.join('\n');
+        console.log('link-targets: done');
+      }, 1500);
+    }, 500);
+  }, 1500);
+});
+</script>
+</body></html>
