@@ -1,0 +1,237 @@
+diff --git a/src/parse/properties/transform.c b/src/parse/properties/transform.c
+index 44b1721..e388f05 100644
+--- a/src/parse/properties/transform.c
++++ b/src/parse/properties/transform.c
+@@ -7,6 +7,7 @@
+ 
+ #include <assert.h>
+ #include <math.h>
++#include <ctype.h>
+ #include <string.h>
+ #include <strings.h>
+ 
+@@ -212,6 +213,22 @@ struct tf_calc {
+ 
+ #define TF_CALC_DEPTH 8
+ 
++/** Whether a token opens calc(), min(), max() or clamp(). */
++static bool tf_is_math(const css_token *token)
++{
++	size_t n;
++	const char *d;
++
++	if (token->type != CSS_TOKEN_FUNCTION)
++		return false;
++	n = lwc_string_length(token->idata);
++	d = lwc_string_data(token->idata);
++	return (n == 4 && strncasecmp(d, "calc", 4) == 0) ||
++			(n == 3 && (strncasecmp(d, "min", 3) == 0 ||
++				    strncasecmp(d, "max", 3) == 0)) ||
++			(n == 5 && strncasecmp(d, "clamp", 5) == 0);
++}
++
+ static css_error tf_calc_sum(css_language *c,
+ 		const parserutils_vector *vector, int32_t *ctx,
+ 		struct tf_calc *out, int depth);
+@@ -250,6 +267,73 @@ static css_error tf_calc_value(css_language *c,
+ 		return tf_calc_closes(vector, ctx) ? CSS_OK : CSS_INVALID;
+ 	}
+ 
++	/* min(), max() and clamp() of the same unit (VitaSurf):
++	 * translate(max(-12px, -20px)) moved by nothing */
++	if (token->type == CSS_TOKEN_FUNCTION &&
++	    ((lwc_string_length(token->idata) == 3 &&
++	      (strncasecmp(lwc_string_data(token->idata), "min", 3) == 0 ||
++	       strncasecmp(lwc_string_data(token->idata), "max", 3) == 0)) ||
++	     (lwc_string_length(token->idata) == 5 &&
++	      strncasecmp(lwc_string_data(token->idata), "clamp", 5) == 0))) {
++		char kind = tolower((unsigned char)
++				lwc_string_data(token->idata)[1]);
++		struct tf_calc arg[3], cur, ref = { 0, UNIT_PX, false };
++		int n = 0;
++
++		parserutils_vector_iterate(vector, ctx);
++		for (;;) {
++			const css_token *sep;
++
++			error = tf_calc_sum(c, vector, ctx, &cur, depth + 1);
++			if (error != CSS_OK)
++				return error;
++			/* every argument of one unit, or zero */
++			if (cur.v != 0) {
++				if (ref.v == 0)
++					ref = cur;
++				else if (cur.number != ref.number ||
++					 cur.unit != ref.unit)
++					return CSS_INVALID;
++			}
++			if (kind == 'l') {
++				/* clamp(min, value, max) */
++				if (n == 3)
++					return CSS_INVALID;
++				arg[n] = cur;
++			} else if (n == 0 ||
++				   (kind == 'i' && cur.v < arg[0].v) ||
++				   (kind == 'a' && cur.v > arg[0].v)) {
++				/* min and max keep the answer so far */
++				arg[0] = cur;
++			}
++			n++;
++			consumeWhitespace(vector, ctx);
++			sep = parserutils_vector_peek(vector, *ctx);
++			if (sep == NULL || !tokenIsChar(sep, ','))
++				break;
++			parserutils_vector_iterate(vector, ctx);
++		}
++		if (!tf_calc_closes(vector, ctx))
++			return CSS_INVALID;
++		if (kind == 'l') {
++			if (n != 3)
++				return CSS_INVALID;
++			*out = arg[1];
++			if (out->v > arg[2].v)
++				out->v = arg[2].v;
++			if (out->v < arg[0].v)
++				out->v = arg[0].v;
++		} else {
++			*out = arg[0];
++		}
++		/* a zero of another unit takes the unit of the others */
++		if (out->v != 0 && ref.v != 0) {
++			out->number = ref.number;
++			out->unit = ref.unit;
++		}
++		return CSS_OK;
++	}
++
+ 	if (token->type == CSS_TOKEN_NUMBER) {
+ 		size_t consumed = 0;
+ 		css_fixed v = css__number_from_lwc_string(token->idata,
+@@ -437,8 +521,8 @@ static css_error parse_translation_arg(css_language *c,
+ /**
+  * Read a plain number, or a percentage as its fraction.
+  */
+-static css_error parse_number_arg(const parserutils_vector *vector,
+-		int32_t *ctx, double *value)
++static css_error parse_number_arg(css_language *c,
++		const parserutils_vector *vector, int32_t *ctx, double *value)
+ {
+ 	const css_token *token;
+ 	size_t consumed = 0;
+@@ -446,6 +530,23 @@ static css_error parse_number_arg(const parserutils_vector *vector,
+ 
+ 	consumeWhitespace(vector, ctx);
+ 	token = parserutils_vector_peek(vector, *ctx);
++	if (token != NULL && tf_is_math(token)) {
++		/* calc(), min(), max() or clamp() of numbers or
++		 * percentages: Tailwind's -scale-x-50 is calc(50% * -1)
++		 * (VitaSurf) */
++		struct tf_calc r;
++		css_error error = tf_calc_value(c, vector, ctx, &r, 0);
++
++		if (error != CSS_OK)
++			return error;
++		if (r.number)
++			*value = r.v;
++		else if (r.unit == UNIT_PCT)
++			*value = r.v / 100.0;
++		else
++			return CSS_INVALID;
++		return CSS_OK;
++	}
+ 	if (token == NULL || (token->type != CSS_TOKEN_NUMBER &&
+ 			token->type != CSS_TOKEN_PERCENTAGE))
+ 		return CSS_INVALID;
+@@ -480,6 +581,25 @@ static css_error parse_angle_arg(css_language *c,
+ 	if (token == NULL)
+ 		return CSS_INVALID;
+ 
++	if (tf_is_math(token)) {
++		/* calc(), min(), max() or clamp() of angles: Tailwind's
++		 * -rotate-45 is calc(45deg * -1) (VitaSurf) */
++		struct tf_calc r;
++		css_error error = tf_calc_value(c, vector, ctx, &r, 0);
++
++		if (error != CSS_OK)
++			return error;
++		if (r.number) {
++			if (r.v != 0)
++				return CSS_INVALID;
++			*radians = 0;
++			return CSS_OK;
++		}
++		v = r.v;
++		unit = r.unit;
++		goto have_angle;
++	}
++
+ 	if (token->type == CSS_TOKEN_NUMBER) {
+ 		parserutils_vector_iterate(vector, ctx);
+ 		v = FIXTOFLT(css__number_from_lwc_string(token->idata, false,
+@@ -502,6 +622,7 @@ static css_error parse_angle_arg(css_language *c,
+ 			&unit) != CSS_OK)
+ 		return CSS_INVALID;
+ 
++have_angle:
+ 	switch (unit) {
+ 	case UNIT_DEG:  *radians = v * TF_PI / 180.0; break;
+ 	case UNIT_GRAD: *radians = v * TF_PI / 200.0; break;
+@@ -603,19 +724,19 @@ static css_error parse_function(css_language *c,
+ 		tf_compose(s, l, NULL, NULL);
+ 		s->angle += r * 180.0 / TF_PI;
+ 	} else if (IS(SCALE_FN) || IS(SCALE_3D)) {
+-		error = parse_number_arg(vector, ctx, &v[0]);
++		error = parse_number_arg(c, vector, ctx, &v[0]);
+ 		if (error != CSS_OK)
+ 			return error;
+ 		v[1] = v[0];
+ 		if (take_comma(vector, ctx)) {
+-			error = parse_number_arg(vector, ctx, &v[1]);
++			error = parse_number_arg(c, vector, ctx, &v[1]);
+ 			if (error != CSS_OK)
+ 				return error;
+ 		}
+ 		l[0] = v[0]; l[3] = v[1];
+ 		tf_compose(s, l, NULL, NULL);
+ 	} else if (IS(SCALE_X) || IS(SCALE_Y)) {
+-		error = parse_number_arg(vector, ctx, &v[0]);
++		error = parse_number_arg(c, vector, ctx, &v[0]);
+ 		if (error != CSS_OK)
+ 			return error;
+ 		if (IS(SCALE_X))
+@@ -653,7 +774,7 @@ static css_error parse_function(css_language *c,
+ 		for (n = 0; n < want; n++) {
+ 			if (n > 0 && take_comma(vector, ctx) == false)
+ 				return CSS_INVALID;
+-			error = parse_number_arg(vector, ctx, &v[n]);
++			error = parse_number_arg(c, vector, ctx, &v[n]);
+ 			if (error != CSS_OK)
+ 				return error;
+ 		}
+@@ -684,7 +805,7 @@ static css_error parse_function(css_language *c,
+ 		for (n = 0; n < 3; n++) {
+ 			if (n > 0 && take_comma(vector, ctx) == false)
+ 				return CSS_INVALID;
+-			error = parse_number_arg(vector, ctx, &v[n]);
++			error = parse_number_arg(c, vector, ctx, &v[n]);
+ 			if (error != CSS_OK)
+ 				return error;
+ 		}
+@@ -937,7 +1058,7 @@ css_error css__parse_rotate(css_language *c,
+ 		int n;
+ 
+ 		for (n = 0; n < 3; n++) {
+-			error = parse_number_arg(vector, ctx, &v[n]);
++			error = parse_number_arg(c, vector, ctx, &v[n]);
+ 			if (error != CSS_OK)
+ 				goto invalid;
+ 		}
+@@ -1012,7 +1133,7 @@ css_error css__parse_scale(css_language *c,
+ 	for (n = 0; n < 3; n++) {
+ 		if (n > 0 && at_end(vector, ctx))
+ 			break;
+-		error = parse_number_arg(vector, ctx, &v[n]);
++		error = parse_number_arg(c, vector, ctx, &v[n]);
+ 		if (error != CSS_OK) {
+ 			*ctx = orig_ctx;
+ 			return error;

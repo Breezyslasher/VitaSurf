@@ -1,0 +1,100 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 8ccfc5473..5c142bd78 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -3821,8 +3821,26 @@ layout_line(struct box *first,
+ 			 * never gave the line its height, so the line was
+ 			 * as tall as its text and whatever followed was
+ 			 * drawn on top of it (VitaSurf) */
++			int place_top = d->margin[TOP];
++
++			/*
++			 * An inline-block whose content is lines of text sits
++			 * on the line by their baseline, and its margins only
++			 * make the line taller or shorter (CSS 2.1 10.8.1), so
++			 * a negative top margin does not lift it (VitaSurf):
++			 * stackoverflow.com's tab counts have -100% margins
++			 * above and below, to take no height from the line,
++			 * and were drawn a tab's width above it. A replaced
++			 * or empty box keeps its place, its baseline being its
++			 * bottom margin edge.
++			 */
++			if (place_top < 0 && d->type == BOX_INLINE_BLOCK &&
++					d->children != NULL &&
++					d->children->type ==
++						BOX_INLINE_CONTAINER)
++				place_top = 0;
+ 			d->x += x0;
+-			d->y = *y + d->border[TOP].width + d->margin[TOP];
++			d->y = *y + d->border[TOP].width + place_top;
+ 			h = d->margin[TOP] + d->border[TOP].width +
+ 					d->padding[TOP] + d->height +
+ 					d->padding[BOTTOM] +
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index bf0f09025..d5a4f705e 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -296,6 +296,29 @@ static inline bool layout_flex__base_and_main_sizes(
+ 	int content_max_width = b->max_width;
+ 	int delta_outer_main = lh__delta_outer_main(ctx->flex, b);
+ 
++	/*
++	 * An item's min and max widths are its content plus its margins,
++	 * borders and padding, and layout_minmax_block counts those as
++	 * nothing when they add up to less than nothing (VitaSurf). The
++	 * item's outer size is then its content plus the real sum, as
++	 * CSS Flexbox has it: stackoverflow.com's sidebar icons sit in a
++	 * 32px circle with -8px margins either side, which came out 2px
++	 * too wide, and 16px with calc() margins.
++	 */
++	if (ctx->horizontal) {
++		int fixed = 0;
++		float frac = 0;
++
++		calculate_mbp_width(ctx->unit_len_ctx, b->style, LEFT,
++				true, true, true, &fixed, &frac);
++		calculate_mbp_width(ctx->unit_len_ctx, b->style, RIGHT,
++				true, true, true, &fixed, &frac);
++		if (fixed < 0) {
++			content_min_width = max(content_min_width + fixed, 0);
++			content_max_width = max(content_max_width + fixed, 0);
++		}
++	}
++
+ 	NSLOG(flex, DEEPDEBUG, "box %p: delta_outer_main: %i",
+ 			b, delta_outer_main);
+ 
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index ca6223bab..9c9659258 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -533,20 +533,15 @@ static inline void calculate_mbp_width(
+ 		enum css_margin_e type;
+ 
+ 		type = margin_funcs[side](style, &value, &unit);
+-		if (type == CSS_MARGIN_SET) {
+-			if (unit == CSS_UNIT_PCT) {
+-				*frac += FIXTOFLT(FDIV(value, F_100));
+-			} else {
+-				*fixed += FIXTOINT(css_unit_len2device_px(
+-						style, unit_len_ctx,
+-						value, unit));
+-			}
+-		} else if (type == CSS_MARGIN_AUTO) {
+-			/* A calc() expression reads as auto here, because the
+-			 * plain accessor has nothing to resolve it against.
+-			 * There is no containing block width at this point,
+-			 * so an expression that needs one contributes
+-			 * nothing; one that does not resolves outright. */
++		if (type == CSS_MARGIN_SET && unit == CSS_UNIT_PCT) {
++			*frac += FIXTOFLT(FDIV(value, F_100));
++		} else if (type == CSS_MARGIN_SET) {
++			/* through the px accessor, which resolves a calc()
++			 * expression (VitaSurf): the plain one reads it as
++			 * 0px, so calc(var(--su8) * -1), stackoverflow.com's
++			 * negative margins, counted nothing here. There is
++			 * no containing block width at this point, so an
++			 * expression that needs one contributes nothing. */
+ 			int px = 0;
+ 
+ 			if (margin_px_funcs[side](style, unit_len_ctx,

@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<!--
+  Negative margins on flex items and on inline-blocks in a line (VitaSurf).
+
+  stackoverflow.com draws its left navigation's icons in a 32px circle
+  with -8px margins on every side, written calc(var(--su8) * -1), as a
+  flex item. Its min and max widths counted the margins as nothing (a
+  calc() margin read as 0px, and a negative sum was clamped at 0), so the
+  circle came out 48px wide, an oval, and 34px with plain -8px margins.
+  Its tab counts are inline-blocks with -100% margins above and below,
+  which keep them from making the line taller; the line layout placed
+  them their top margin above the line, a tab's width up the page. An
+  inline-block of text sits by its text, and its margins only change the
+  line's height. A translation written with min(), max() or clamp() moved
+  by nothing, and a rotation, skew or scale written with calc() or any of
+  them dropped the whole transform (Tailwind writes -rotate-45 as
+  calc(45deg * -1)); geometry sees only the translations, which are
+  checked here.
+  Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Negative margins</title>
+<style>
+:root { --su8: 8px; --su4: 4px; }
+body { margin: 0; font: 16px sans-serif; }
+.row { display: flex; align-items: center; width: 300px; padding: 6px 12px; }
+.circle { display: flex; align-items: center; padding: 4px; border: 3px solid #ccc;
+  border-radius: 100%; background: #a0f; }
+.lit { margin: -8px; }
+.calc { margin-left: calc(var(--su8) * -1); margin-right: calc(var(--su8) * -1);
+  margin-top: calc(var(--su8) * -1); margin-bottom: calc(var(--su8) * -1); }
+.circle svg { width: 18px; height: 18px; display: block; }
+.btn { display: inline-block; padding: 6px 11px; line-height: 1.3; white-space: nowrap; }
+.badge { display: inline-block; padding: 2px 3px; font-size: 12px; line-height: 1.2;
+  background: #06c; color: #fff; }
+.both { margin-top: -100%; margin-bottom: -100%; }
+.up { margin-top: -20px; }
+</style></head>
+<body>
+<div class="row"><div id="lit" class="circle lit"><svg viewBox="0 0 18 18"></svg></div><span id="lit-next">Home</span></div>
+<div class="row"><div id="calc" class="circle calc"><svg viewBox="0 0 18 18"></svg></div><span id="calc-next">Chat</span></div>
+<div style="padding-top: 40px">
+<span class="btn"><span id="t1">Bountied</span> <span id="b1" class="badge both">2</span></span>
+<span class="btn"><span id="t2">Unanswered</span> <span id="b2" class="badge up">5</span></span>
+<span class="btn"><span id="t3">Active</span> <span id="b3" class="badge">7</span></span>
+</div>
+<div style="position: relative; height: 40px">
+<div id="tx0" style="width: 50px; height: 10px; transform: translate(-12px, -5px)"></div>
+<div id="tx1" style="width: 50px; height: 10px; transform: translate(min(-12px, 0px), clamp(-5px, -9px, 0px))"></div>
+<div id="tx2" style="width: 50px; height: 10px; transform: translate(calc(var(--su8) * -1.5), max(-5px, -20px))"></div>
+</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function r(id) { return document.getElementById(id).getBoundingClientRect(); }
+addEventListener('load', function () {
+  ok('a flex item with -8px margins is as wide as its border box', r('lit').width, 32);
+  ok('and starts its margin to the left of the content edge', r('lit').left, 4);
+  ok('the next item starts where its margin box ends', r('lit-next').left, 28);
+  ok('calc() margins count the same', r('calc').width, 32);
+  ok('and place the next item the same', r('calc-next').left, 28);
+  ok('it is as tall as it is wide', r('calc').height, 32);
+  var plain = r('b3').top - r('t3').top;
+  ok('a count with -100% margins above and below stays on its line', r('b1').top - r('t1').top, plain);
+  ok('a negative top margin alone does not lift it', r('b2').top - r('t2').top, plain);
+  var t0 = r('tx0');
+  ok('translate() takes min() and clamp()', r('tx1').left + ',' + (r('tx1').top - 10), t0.left + ',' + t0.top);
+  ok('and max() beside calc()', r('tx2').left + ',' + (r('tx2').top - 20), t0.left + ',' + t0.top);
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('negative-margins: ' + l); });
+  console.log('negative-margins: done');
+});
+</script>
+</body></html>
