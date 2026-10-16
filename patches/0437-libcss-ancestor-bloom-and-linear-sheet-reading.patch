@@ -1,0 +1,432 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 59155bd..d65dd37 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -33,6 +33,9 @@ typedef struct hash_entry {
+ 	 * (VitaSurf) */
+ 	css_attr_bloom needs_attrs;
+ 	struct hash_entry *next;
++	/* in a chain's head, its last entry, or NULL when not known: a
++	 * sheet's rules come in order, so most go at the end (VitaSurf) */
++	struct hash_entry *tail;
+ } hash_entry;
+ 
+ /*
+@@ -1430,6 +1433,7 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ 		head->sel = selector;
+ 		head->seq = 0;
+ 		head->next = NULL;
++		head->tail = head;
+ 		_chain_bloom_generate(selector, head->sel_chain_bloom);
+ 		head->needs_state = _state_needed(selector);
+ 		head->needs_attrs = _attrs_needed(selector);
+@@ -1440,10 +1444,32 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ 	} else {
+ 		hash_entry *search = head;
+ 		hash_entry *prev = NULL;
++		hash_entry *last = head->tail;
+ 		hash_entry *entry = malloc(sizeof(hash_entry));
+ 		if (entry == NULL)
+ 			return CSS_NOMEM;
+ 
++		/*
++		 * At the end when it sorts after the last entry, which is
++		 * every rule of a sheet being read in order (VitaSurf).
++		 * The search from the head made a sheet's rules with one
++		 * key quadratic: 5000 rules ending in "span" spent most
++		 * of their parse here.
++		 */
++		if (last == NULL) {
++			for (last = head; last->next != NULL;
++					last = last->next)
++				;
++			head->tail = last;
++		}
++		if (last->sel->specificity < selector->specificity ||
++				(last->sel->specificity ==
++					selector->specificity &&
++				 last->sel->rule->index <=
++					selector->rule->index)) {
++			prev = last;
++			search = NULL;
++		} else
+ 		/* Find place to insert entry */
+ 		do {
+ 			/* Sort by ascending specificity */
+@@ -1462,12 +1488,19 @@ css_error _insert_into_chain(css_selector_hash *ctx, hash_entry *head,
+ 
+ 		if (prev == NULL) {
+ 			*entry = *head;
++			entry->tail = NULL;
+ 			head->next = entry;
++			/* the old head moved into the new entry */
++			if (head->tail == head)
++				head->tail = entry;
+ 
+ 			entry = head;
+ 		} else {
+ 			entry->next = prev->next;
++			entry->tail = NULL;
+ 			prev->next = entry;
++			if (entry->next == NULL)
++				head->tail = entry;
+ 		}
+ 
+ 		entry->sel = selector;
+@@ -1514,6 +1547,9 @@ css_error _remove_from_chain(css_selector_hash *ctx, hash_entry *head,
+ 	if (search == NULL)
+ 		return CSS_INVALID;
+ 
++	/* the tail is found again by the next insertion (VitaSurf) */
++	head->tail = NULL;
++
+ 	if (prev == NULL) {
+ 		if (search->next != NULL) {
+ 			hash_entry *second = search->next;
+@@ -1528,6 +1564,7 @@ css_error _remove_from_chain(css_selector_hash *ctx, hash_entry *head,
+ 			 * was leaked as well.
+ 			 */
+ 			*head = *second;
++			head->tail = NULL;
+ 			free(second);
+ 			ctx->hash_size -= sizeof(hash_entry);
+ 		} else {
+@@ -1878,6 +1915,7 @@ static css_error _sort_chain(hash_entry *head)
+ 	for (k = 0; k < n; k++) {
+ 		*nodes[k] = vals[k];
+ 		nodes[k]->next = (k + 1 < n) ? nodes[k + 1] : NULL;
++		nodes[k]->tail = NULL;
+ 	}
+ 
+ 	free(nodes);
+@@ -1919,6 +1957,7 @@ static css_error _push_copy(css_selector_hash *ctx, hash_entry *head,
+ 		*head = *from;
+ 		head->seq = seq;
+ 		head->next = NULL;
++		head->tail = NULL;
+ 		return CSS_OK;
+ 	}
+ 
+@@ -1929,7 +1968,9 @@ static css_error _push_copy(css_selector_hash *ctx, hash_entry *head,
+ 	*e = *from;
+ 	e->seq = seq;
+ 	e->next = head->next;
++	e->tail = NULL;
+ 	head->next = e;
++	head->tail = NULL;
+ 	ctx->hash_size += sizeof(hash_entry);
+ 
+ 	return CSS_OK;
+diff --git a/src/select/select.c b/src/select/select.c
+index 118685f..5941e32 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -1386,6 +1386,89 @@ css_error css_select_default_style(css_select_ctx *ctx,
+  *                      own it.
+  * \return CSS_OK on success, appropriate error otherwise.
+  */
++/**
++ * Add a node's name, id and classes to a bloom filter, as
++ * css__create_node_bloom does for the node selected.
++ */
++static css_error css__bloom_add_node(void *node,
++		css_select_handler *handler, void *pw, css_bloom *bloom)
++{
++	css_qname name = { NULL, NULL };
++	lwc_string *id = NULL;
++	lwc_string **classes = NULL;
++	uint32_t n_classes = 0, i;
++	lwc_hash hash;
++	css_error error;
++
++	error = handler->node_name(pw, node, &name);
++	if (error != CSS_OK)
++		return error;
++	if (name.name != NULL && lwc_string_caseless_hash_value(name.name,
++			&hash) == lwc_error_ok)
++		css_bloom_add_hash(bloom, hash);
++	lwc_string_unref(name.ns);
++	lwc_string_unref(name.name);
++
++	error = handler->node_id(pw, node, &id);
++	if (error != CSS_OK)
++		return error;
++	if (id != NULL) {
++		if (lwc_string_caseless_hash_value(id, &hash) ==
++				lwc_error_ok)
++			css_bloom_add_hash(bloom, hash);
++		lwc_string_unref(id);
++	}
++
++	error = handler->node_classes(pw, node, &classes, &n_classes);
++	if (error != CSS_OK)
++		return error;
++	if (classes != NULL) {
++		for (i = 0; i < n_classes; i++) {
++			if (lwc_string_caseless_hash_value(classes[i],
++					&hash) == lwc_error_ok)
++				css_bloom_add_hash(bloom, hash);
++			lwc_string_unref(classes[i]);
++		}
++	}
++	return CSS_OK;
++}
++
++/**
++ * The bloom of a node and its ancestors, made by walking up to the root
++ * (VitaSurf). A node selected outside a full pass -- a script's computed
++ * style read, before the first layout or of an element with no box --
++ * had a saturated filter instead, which rejects nothing: every rule
++ * whose last compound matched walked its combinators, and reddit.com's
++ * reads of three elements took seconds. The walk goes the way the bloom
++ * of a selected node is made, across shadow roots, and reads every
++ * ancestor as it is now: one selected for the boxes keeps a bloom of its
++ * classes then, which a script may have changed since. Any failure
++ * leaves it saturated, which is still valid.
++ */
++static void css__build_ancestor_bloom(void *node,
++		css_select_handler *handler, void *pw, css_bloom *bloom)
++{
++	void *n = node;
++	uint32_t i;
++
++	while (n != NULL) {
++		void *up = NULL;
++
++		if (css__bloom_add_node(n, handler, pw, bloom) != CSS_OK)
++			goto saturate;
++		if ((handler->parent_node_cross != NULL ?
++				handler->parent_node_cross :
++				handler->parent_node)(pw, n, &up) != CSS_OK)
++			goto saturate;
++		n = up;
++	}
++	return;
++
++saturate:
++	for (i = 0; i < CSS_BLOOM_SIZE; i++)
++		bloom[i] = ~0;
++}
++
+ static css_error css__get_parent_bloom(void *parent,
+ 		css_select_handler *handler, void *pw,
+ 		css_bloom **parent_bloom)
+@@ -1396,8 +1479,9 @@ static css_error css__get_parent_bloom(void *parent,
+ 
+ 	/* Get parent node's bloom filter */
+ 	if (parent != NULL) {
+-		/* Get parent bloom filter */
+-		struct css_node_data *node_data;
++		/* Get parent bloom filter; into the node_data above, which
++		 * this had shadowed, so data without a bloom gets one
++		 * rather than being replaced (VitaSurf) */
+ 
+ 		/* Hideous casting to avoid warnings on all platforms
+ 		 * we build for. */
+@@ -1416,23 +1500,20 @@ static css_error css__get_parent_bloom(void *parent,
+ 		/* Need to create parent bloom */
+ 
+ 		if (parent != NULL) {
+-			/* TODO:
+-			 * Build & set the parent node's bloom properly.
+-			 * This will speed up the case where DOM change
+-			 * has caused bloom to get deleted.  For now we
+-			 * fall back to a fully saturated bloom filter,
+-			 * which is slower but perfectly valid.
+-			 */
+-			bloom = malloc(sizeof(css_bloom) * CSS_BLOOM_SIZE);
++			/* the parent's own bloom, from it and its
++			 * ancestors (VitaSurf) */
++			bloom = calloc(CSS_BLOOM_SIZE, sizeof(css_bloom));
+ 			if (bloom == NULL) {
+ 				return CSS_NOMEM;
+ 			}
++			(void) i;
++			css__build_ancestor_bloom(parent, handler, pw, bloom);
+ 
+-			for (i = 0; i < CSS_BLOOM_SIZE; i++) {
+-				bloom[i] = ~0;
+-			}
+-
+-			if (node_data == NULL) {
++			if (node_data != NULL) {
++				/* data without a bloom: it is the parent's
++				   to keep, as a selected node's is */
++				node_data->bloom = bloom;
++			} else {
+ 				error = css__create_node_data(&node_data);
+ 				if (error != CSS_OK) {
+ 					free(bloom);
+diff --git a/src/stylesheet.c b/src/stylesheet.c
+index ee7816c..e8ee746 100644
+--- a/src/stylesheet.c
++++ b/src/stylesheet.c
+@@ -273,6 +273,7 @@ css_error css_stylesheet_destroy(css_stylesheet *sheet)
+ 				lwc_string_unref(
+ 					sheet->dynamic_keys[k].keys[j].name);
+ 			free(sheet->dynamic_keys[k].keys);
++			free(sheet->dynamic_keys[k].slots);
+ 		}
+ 	}
+ 	for (gap = 0; gap < sheet->n_gaps; gap++) {
+@@ -2049,6 +2050,98 @@ static uint32_t dynamic_bits_own(const css_selector *sel)
+ }
+ 
+ /** Note what an element must have to match an ancestor compound. */
++
++/*
++ * Whether a key set has a key, and adding one (VitaSurf). Each test had
++ * read the whole set, so a sheet whose rules name a few thousand
++ * ancestor classes took a quadratic time to read: 5000 such rules spent
++ * two fifths of their parse here. Names are interned, so a key is found
++ * by its name's address and its kind.
++ */
++static uint32_t dyn_key_hash(uint32_t kind, const lwc_string *name)
++{
++	uint32_t h = (uint32_t) ((uintptr_t) name >> 3) ^ (kind * 0x9e3779b9u);
++
++	h ^= h >> 16;
++	h *= 0x85ebca6bu;
++	h ^= h >> 13;
++	return h;
++}
++
++static bool dyn_key_has(css_stylesheet *sheet, int set, uint32_t kind,
++		const lwc_string *name)
++{
++	uint32_t mask, at, j;
++
++	if (sheet->dynamic_keys[set].n_slots == 0) {
++		/* no index: a short set, or no memory for one */
++		for (j = 0; j < sheet->dynamic_keys[set].n; j++) {
++			if (sheet->dynamic_keys[set].keys[j].kind == kind &&
++					sheet->dynamic_keys[set].keys[j].name ==
++					name)
++				return true;
++		}
++		return false;
++	}
++	mask = sheet->dynamic_keys[set].n_slots - 1;
++	for (at = dyn_key_hash(kind, name) & mask;
++			sheet->dynamic_keys[set].slots[at] != 0;
++			at = (at + 1) & mask) {
++		const css_dynamic_key *k = &sheet->dynamic_keys[set].keys[
++				sheet->dynamic_keys[set].slots[at] - 1];
++
++		if (k->kind == kind && k->name == name)
++			return true;
++	}
++	return false;
++}
++
++/** File the set's last key in its index, growing it when half full. */
++static void dyn_key_index_last(css_stylesheet *sheet, int set)
++{
++	uint32_t n = sheet->dynamic_keys[set].n, mask, at, j;
++
++	if (n < 16 && sheet->dynamic_keys[set].n_slots == 0)
++		return;
++	if (n * 2 > sheet->dynamic_keys[set].n_slots) {
++		uint32_t want = sheet->dynamic_keys[set].n_slots ?
++				sheet->dynamic_keys[set].n_slots * 2 : 64;
++		uint32_t *fresh = calloc(want, sizeof(*fresh));
++
++		if (fresh == NULL) {
++			/* the search reads the whole set again */
++			free(sheet->dynamic_keys[set].slots);
++			sheet->dynamic_keys[set].slots = NULL;
++			sheet->dynamic_keys[set].n_slots = 0;
++			return;
++		}
++		free(sheet->dynamic_keys[set].slots);
++		sheet->dynamic_keys[set].slots = fresh;
++		sheet->dynamic_keys[set].n_slots = want;
++		mask = want - 1;
++		for (j = 0; j < n; j++) {
++			const css_dynamic_key *k =
++					&sheet->dynamic_keys[set].keys[j];
++
++			for (at = dyn_key_hash(k->kind, k->name) & mask;
++					fresh[at] != 0; at = (at + 1) & mask)
++				;
++			fresh[at] = j + 1;
++		}
++		return;
++	}
++	mask = sheet->dynamic_keys[set].n_slots - 1;
++	{
++		const css_dynamic_key *k = &sheet->dynamic_keys[set].keys[n - 1];
++
++		for (at = dyn_key_hash(k->kind, k->name) & mask;
++				sheet->dynamic_keys[set].slots[at] != 0;
++				at = (at + 1) & mask)
++			;
++		sheet->dynamic_keys[set].slots[at] = n;
++	}
++}
++
+ static void dynamic_key_add(css_stylesheet *sheet, uint32_t bits,
+ 		const css_selector *sel)
+ {
+@@ -2088,13 +2181,8 @@ static void dynamic_key_add(css_stylesheet *sheet, uint32_t bits,
+ 		kind = d == id ? CSS_DYNAMIC_KEY_ID :
+ 			d == cls ? CSS_DYNAMIC_KEY_CLASS :
+ 			CSS_DYNAMIC_KEY_ELEMENT;
+-		for (j = 0; j < sheet->dynamic_keys[i].n; j++) {
+-			if (sheet->dynamic_keys[i].keys[j].kind == kind &&
+-					sheet->dynamic_keys[i].keys[j].name ==
+-					d->qname.name)
+-				break;
+-		}
+-		if (j < sheet->dynamic_keys[i].n)
++		(void) j;
++		if (dyn_key_has(sheet, i, kind, d->qname.name))
+ 			continue;
+ 		if (sheet->dynamic_keys[i].n == sheet->dynamic_keys[i].alloc) {
+ 			uint32_t want = sheet->dynamic_keys[i].alloc ?
+@@ -2116,6 +2204,7 @@ static void dynamic_key_add(css_stylesheet *sheet, uint32_t bits,
+ 		sheet->dynamic_keys[i].keys[sheet->dynamic_keys[i].n].name =
+ 			lwc_string_ref(d->qname.name);
+ 		sheet->dynamic_keys[i].n++;
++		dyn_key_index_last(sheet, i);
+ 	}
+ }
+ 
+@@ -2154,11 +2243,9 @@ static void reach_key_add(css_stylesheet *sheet, int set, uint32_t kind,
+ 
+ 	if (sheet->dynamic_keys[set].any)
+ 		return;
+-	for (j = 0; j < sheet->dynamic_keys[set].n; j++) {
+-		if (sheet->dynamic_keys[set].keys[j].kind == kind &&
+-				sheet->dynamic_keys[set].keys[j].name == name)
+-			return;
+-	}
++	(void) j;
++	if (dyn_key_has(sheet, set, kind, name))
++		return;
+ 	if (sheet->dynamic_keys[set].n == sheet->dynamic_keys[set].alloc) {
+ 		uint32_t want = sheet->dynamic_keys[set].alloc ?
+ 			sheet->dynamic_keys[set].alloc * 2 : 8;
+@@ -2174,6 +2261,7 @@ static void reach_key_add(css_stylesheet *sheet, int set, uint32_t kind,
+ 	k = &sheet->dynamic_keys[set].keys[sheet->dynamic_keys[set].n++];
+ 	k->kind = kind;
+ 	k->name = lwc_string_ref(name);
++	dyn_key_index_last(sheet, set);
+ }
+ 
+ /** Key an attribute by its name, as a C string. */
+diff --git a/src/stylesheet.h b/src/stylesheet.h
+index 2160df5..ce0351b 100644
+--- a/src/stylesheet.h
++++ b/src/stylesheet.h
+@@ -330,6 +330,10 @@ struct css_stylesheet {
+ 		css_dynamic_key *keys;
+ 		uint32_t n, alloc;
+ 		bool any;
++		/* where each key is, by kind and name: the position + 1,
++		 * open addressing, a power of two or 0 (VitaSurf) */
++		uint32_t *slots;
++		uint32_t n_slots;
+ 	} dynamic_keys[8];	/* 4 to 7: see css_stylesheet_reach_keys */
+ 
+ 	uint32_t rule_count;			/**< Number of rules in sheet */

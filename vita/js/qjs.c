@@ -13990,6 +13990,10 @@ static const css_select_results *select_without_box(jsthread *thread,
 			kept_ctx = htmlc->select_ctx;
 			htmlc->select_ctx = now;
 		}
+	} else if (htmlc->select_ctx == NULL) {
+		/* before conversion each selection lends itself the early
+		 * context; made here, it is timed as the context */
+		(void) html_select_ctx_early(htmlc);
 	}
 	t_ctx = now_ms();
 	for (i = depth - 1; i >= 0; i--) {
@@ -14038,9 +14042,8 @@ static const css_select_results *select_without_box(jsthread *thread,
 				 "index %u ms), then %d elements selected "
 				 "in %u ms, %s; %u sheets",
 				 (unsigned)(t1 - t0), (unsigned)(t_ctx - t0),
-				 !stale ? "the page's" :
 				 htmlc->layout == NULL ? "an early one" :
-				 "the sheets now",
+				 !stale ? "the page's" : "the sheets now",
 				 vitasurf_ms_css - css0,
 				 vitasurf_ms_css_index - index0,
 				 depth, (unsigned)(t1 - t_ctx),

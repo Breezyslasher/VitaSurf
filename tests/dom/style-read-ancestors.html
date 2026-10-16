@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<!--
+  Rules that name an element's ancestors, read through getComputedStyle
+  before the first layout and of elements with no box (VitaSurf).
+
+  Such a read selects the element outside box construction. libcss's
+  filter of the ancestors' names, which lets it skip rules naming an
+  ancestor the element does not have, was saturated there, so it skipped
+  nothing; it is now made by walking the ancestors, across a shadow root
+  to its host as a selected element's is. A filter missing an ancestor
+  would make a rule that should match not match, which this page would
+  show. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Style reads and ancestors</title>
+<style>
+.outer .mid span.x { color: rgb(1, 0, 0) }
+.mid > span.y { color: rgb(2, 0, 0) }
+#anc span.z { color: rgb(3, 0, 0) }
+section span.w { color: rgb(4, 0, 0) }
+.Mixed span.v { color: rgb(5, 0, 0) }
+.outer .nope span.n { color: rgb(6, 0, 0) }
+span.n { color: rgb(7, 0, 0) }
+.outer x-host { color: rgb(8, 0, 0) }
+.outer ~ p.sib { color: rgb(10, 0, 0) }
+.later .mid span.x { color: rgb(11, 0, 0) }
+</style></head>
+<body>
+<div class="outer" id="anc"><section><div class="mid Mixed">
+  <span class="x" id="x">x</span><span class="y" id="y">y</span>
+  <span class="z" id="z">z</span><span class="w" id="w">w</span>
+  <span class="v" id="v">v</span><span class="n" id="n">n</span>
+  <x-host id="h" class="dark"></x-host>
+</div></section></div>
+<p class="sib" id="sib">sib</p>
+<pre id="out"></pre>
+<script>
+var out = [];
+function colour(id) {
+  var e = id === 'in' ? document.getElementById('h').shadowRoot.querySelector('span') :
+          document.getElementById(id);
+  return getComputedStyle(e).color;
+}
+var root = document.getElementById('h').attachShadow({ mode: 'open' });
+root.innerHTML = '<style>:host(.dark) span { color: rgb(9, 0, 0) }</style><div><span>in</span></div>';
+var want = { x: 'rgb(1, 0, 0)', y: 'rgb(2, 0, 0)', z: 'rgb(3, 0, 0)', w: 'rgb(4, 0, 0)',
+             v: 'rgb(5, 0, 0)', n: 'rgb(7, 0, 0)', h: 'rgb(8, 0, 0)', sib: 'rgb(10, 0, 0)',
+             'in': 'rgb(9, 0, 0)' };
+var what = { x: 'descendant of two ancestors', y: 'child', z: 'descendant of an id',
+             w: 'descendant of a tag', v: 'an ancestor class in mixed case',
+             n: 'a rule naming an ancestor it lacks does not match', h: 'a shadow host',
+             sib: 'a sibling of an ancestor\'s', 'in': 'inside a shadow root, by its host' };
+function check(when) {
+  for (var k in want) {
+    var got = colour(k);
+    out.push((got === want[k] ? 'PASS ' : 'FAIL ') + when + ': ' + what[k] +
+             (got === want[k] ? '' : ': ' + got + ', want ' + want[k]));
+  }
+}
+check('before layout');
+addEventListener('load', function () {
+  for (var k in want) {
+    var e = k === 'in' ? root.querySelector('span') : document.getElementById(k);
+    if (k !== 'h') e.style.display = 'none';
+  }
+  setTimeout(function () {
+    check('with no box');
+    document.getElementById('anc').classList.add('later');
+    var got = colour('x');
+    out.push((got === 'rgb(11, 0, 0)' ? 'PASS ' : 'FAIL ') +
+             'with no box: an ancestor\'s class added after layout' +
+             (got === 'rgb(11, 0, 0)' ? '' : ': ' + got));
+    document.getElementById('out').textContent = out.join('\n');
+    out.forEach(function (l) { console.log('style-read-ancestors: ' + l); });
+    console.log('style-read-ancestors: done');
+  }, 0);
+});
+</script>
+</body></html>
