@@ -45,6 +45,10 @@ void vita2d_end_drawing(void) { frames++; }
 void vita2d_swap_buffers(void) {}
 void vita2d_wait_rendering_done(void) {}
 int vita2d_common_dialog_update(void) { return 0; }
+void vita2d_draw_texture_part_scale(const vita2d_texture *t, float x, float y, float tx, float ty, float tw, float th, float sx, float sy) { (void)t; (void)x; (void)y; (void)tx; (void)ty; (void)tw; (void)th; (void)sx; (void)sy; }
+void vita2d_enable_clipping(void) {}
+void vita2d_disable_clipping(void) {}
+void vita2d_set_clip_rectangle(int a, int b, int c, int d) { (void)a; (void)b; (void)c; (void)d; }
 void vita2d_texture_set_alloc_memblock_type(SceKernelMemBlockType t) { (void)t; }
 vita2d_texture *vita2d_create_empty_texture_format(unsigned int w, unsigned int h, SceGxmTextureFormat f)
 { vita2d_texture *t = calloc(1, sizeof(*t)); (void)f; t->w = (int)w; t->h = (int)h; t->stride = (int)((w + 7) & ~7u) + 8; t->data = calloc((size_t)t->stride * h, 4); t->f = SCE_GXM_TEXTURE_FILTER_LINEAR; return t; }

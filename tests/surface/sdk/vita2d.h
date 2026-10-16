@@ -17,5 +17,8 @@ void vita2d_texture_set_filters(vita2d_texture *texture, SceGxmTextureFilter min
 void vita2d_draw_texture(const vita2d_texture *texture, float x, float y);
 void vita2d_draw_texture_part(const vita2d_texture *texture, float x, float y, float tex_x, float tex_y, float tex_w, float tex_h);
 void vita2d_draw_rectangle(float x, float y, float w, float h, unsigned int color);
+void vita2d_draw_texture_part_scale(const vita2d_texture *texture, float x, float y, float tex_x, float tex_y, float tex_w, float tex_h, float x_scale, float y_scale);
+void vita2d_enable_clipping(void); void vita2d_disable_clipping(void);
+void vita2d_set_clip_rectangle(int x_min, int y_min, int x_max, int y_max);
 void vita2d_draw_fill_circle(float x, float y, float radius, unsigned int color);
 #endif

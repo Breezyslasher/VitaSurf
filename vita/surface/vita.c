@@ -165,6 +165,14 @@ struct vita_surface {
 	int drag_dx;              /**< drag movement since the last read */
 	int drag_dy;
 	unsigned touch_id;        /**< touches so far, for the input layer */
+	/* a pinch under way: the page area drawn scaled by zoom about
+	 * zoom_cx, zoom_cy until the page is laid out at its new scale */
+	float zoom;
+	int zoom_cx, zoom_cy;
+	nsfb_bbox_t zoom_area;
+	bool zoom_release;        /**< ends once the page is drawn again */
+	SceUInt64 zoom_release_us;
+	unsigned zoom_redrawn_px; /**< of the page area, since it was asked */
 	SceUInt64 touch_down_us;  /**< when this touch began */
 	bool touch2;              /**< a second finger, and where */
 	int touch2_x;
@@ -926,6 +934,21 @@ static void draw_part(struct vita_surface *vs, const nsfb_bbox_t *part,
 				 (float)(part->y1 - part->y0));
 }
 
+/** part_fn: the same, scaled about the pinch's centre (VitaSurf). */
+static void draw_part_zoomed(struct vita_surface *vs,
+			     const nsfb_bbox_t *part, int tx, int ty, void *pw)
+{
+	float k = vs->zoom;
+
+	(void)pw;
+	vita2d_draw_texture_part_scale(vs->tex,
+			vs->zoom_cx + (part->x0 - vs->zoom_cx) * k,
+			vs->zoom_cy + (part->y0 - vs->zoom_cy) * k,
+			(float)tx, (float)ty,
+			(float)(part->x1 - part->x0),
+			(float)(part->y1 - part->y0), k, k);
+}
+
 /**
  * Draw the page and the focus outline. Between vita2d_start_drawing()
  * and vita2d_end_drawing(), with the GPU lock held.
@@ -939,8 +962,68 @@ static void draw_page(struct vita_surface *vs)
 	all.x1 = SCREEN_WIDTH;
 	all.y1 = SCREEN_HEIGHT;
 	screen_parts(vs, &all, draw_part, NULL);
+	if (vs->zoom != 1.0f) {
+		/* the page area as the fingers have it, over what it was:
+		 * a picture of the page until it is laid out again */
+		const nsfb_bbox_t *a = &vs->zoom_area;
+
+		vita2d_enable_clipping();
+		vita2d_set_clip_rectangle(a->x0, a->y0, a->x1, a->y1);
+		vita2d_draw_rectangle((float)a->x0, (float)a->y0,
+				(float)(a->x1 - a->x0), (float)(a->y1 - a->y0),
+				0xffffffffu);
+		screen_parts(vs, a, draw_part_zoomed, NULL);
+		vita2d_disable_clipping();
+		return;
+	}
 	draw_focus(vs);
 	draw_cursor(vs);
+}
+
+/* exported interface documented in vita_surface.h */
+void vita_surface_preview_zoom_end(bool at_once)
+{
+	struct vita_surface *vs;
+
+	if (the_nsfb == NULL || the_nsfb->surface_priv == NULL) {
+		return;
+	}
+	vs = the_nsfb->surface_priv;
+	if (at_once) {
+		vs->zoom = 1.0f;
+		vs->zoom_release = false;
+		vs->dirty = true;
+		return;
+	}
+	vs->zoom_release = true;
+	vs->zoom_redrawn_px = 0;
+	vs->zoom_release_us = sceKernelGetProcessTimeWide();
+}
+
+/* exported interface documented in vita_surface.h */
+void vita_surface_preview_zoom(float zoom, int cx, int cy,
+			       int x0, int y0, int x1, int y1)
+{
+	struct vita_surface *vs;
+
+	if (the_nsfb == NULL || the_nsfb->surface_priv == NULL) {
+		return;
+	}
+	vs = the_nsfb->surface_priv;
+	if (zoom < 0.25f) zoom = 0.25f;
+	if (zoom > 4.0f) zoom = 4.0f;
+	if (zoom == vs->zoom && cx == vs->zoom_cx && cy == vs->zoom_cy) {
+		return;
+	}
+	vs->zoom = zoom;
+	vs->zoom_release = false;
+	vs->zoom_cx = cx;
+	vs->zoom_cy = cy;
+	vs->zoom_area.x0 = x0;
+	vs->zoom_area.y0 = y0;
+	vs->zoom_area.x1 = x1;
+	vs->zoom_area.y1 = y1;
+	vs->dirty = true;
 }
 
 /** Copy a rectangle of the shadow buffer to the display buffer. */
@@ -980,6 +1063,22 @@ static void blit_box(nsfb_t *nsfb, const nsfb_bbox_t *box)
 				(vs->shadow + area.y0 * nsfb->linelen + area.x0 * 4));
 	} else if (vs->verbose && vs->updates == DIAG_BOXES + 1) {
 		vita_log("surface: further updates not logged");
+	}
+
+	/* the page drawn again at its new scale, in one piece or many:
+	 * the pinch's picture has served (VitaSurf) */
+	if (vs->zoom_release) {
+		nsfb_bbox_t in = area;
+
+		if (nsfb_plot_clip(&vs->zoom_area, &in))
+			vs->zoom_redrawn_px += (unsigned)((in.x1 - in.x0) *
+					(in.y1 - in.y0));
+		if (vs->zoom_redrawn_px * 10u >= 9u * (unsigned)
+		    ((vs->zoom_area.x1 - vs->zoom_area.x0) *
+		     (vs->zoom_area.y1 - vs->zoom_area.y0))) {
+			vs->zoom = 1.0f;
+			vs->zoom_release = false;
+		}
 	}
 
 	gpu_lock(vs);
@@ -1109,6 +1208,12 @@ static bool present(struct vita_surface *vs)
 	}
 	now = sceKernelGetProcessTimeWide();
 	vs->beat_ms = (uint32_t)(now / 1000);
+	/* a pinch's picture given up on after 5 s without a whole redraw */
+	if (vs->zoom_release && now - vs->zoom_release_us > 5000000) {
+		vs->zoom = 1.0f;
+		vs->zoom_release = false;
+		vs->dirty = true;
+	}
 	if (!vs->dirty && !vs->dialog &&
 	    now - vs->last_present_us < FRAME_INTERVAL_US) {
 		return false;
@@ -1516,6 +1621,7 @@ static int vita_initialise(nsfb_t *nsfb)
 	}
 	vs->gpu_lock = -1;
 	vs->busy_thread = -1;
+	vs->zoom = 1.0f;
 
 	/* GPU: libvita2d owns the display, the page lives in a texture */
 	ret = vita2d_init();

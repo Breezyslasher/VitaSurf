@@ -70,6 +70,21 @@ struct vita_input_state {
 void vita_surface_read_input(struct vita_input_state *out);
 
 /**
+ * While a pinch is under way, draw the area x0,y0 to x1,y1 (the page)
+ * scaled by zoom about cx, cy, from the picture already on screen, so
+ * the page follows the fingers before it is laid out again (VitaSurf).
+ * A zoom of 1 draws it as it is.
+ */
+void vita_surface_preview_zoom(float zoom, int cx, int cy,
+			       int x0, int y0, int x1, int y1);
+
+/**
+ * The pinch is over: at once, or once the page area has been drawn
+ * again whole, at its new scale (at most 5 s on).
+ */
+void vita_surface_preview_zoom_end(bool at_once);
+
+/**
  * Tell the surface a system dialog is on screen. While it is, the surface
  * presents every frame (dialogs composite through the GPU) and ignores
  * the controls, which the dialog owns.

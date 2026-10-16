@@ -2466,8 +2466,11 @@ static void pinch_end(void)
 	if (s1 < PINCH_MIN) s1 = PINCH_MIN;
 	if (s1 > PINCH_MAX) s1 = PINCH_MAX;
 	if (s1 / s0 > 0.95f && s1 / s0 < 1.05f) {
+		vita_surface_preview_zoom_end(true);
 		return;
 	}
+	/* the pinch's picture stays until the page is drawn again */
+	vita_surface_preview_zoom_end(false);
 	ax = fbtk_get_absx(the_gw->browser);
 	ay = fbtk_get_absy(the_gw->browser);
 	viewport(&sx, &sy, &vw, &vh);
@@ -2610,10 +2613,23 @@ static void touch_gestures(struct vita_input_state *st)
 	switch (touch.phase) {
 	case TOUCH_PINCH:
 		if (st->touch2) {
+			float s;
+			int ax = fbtk_get_absx(the_gw->browser);
+			int ay = fbtk_get_absy(the_gw->browser);
+
 			touch.s = touch.s0 * distance(st->touch_x, st->touch_y,
 					st->touch2_x, st->touch2_y) / touch.d0;
 			touch.cx = (st->touch_x + st->touch2_x) / 2;
 			touch.cy = (st->touch_y + st->touch2_y) / 2;
+			/* the picture follows the fingers at once; the page
+			 * is laid out at the new scale when they lift */
+			s = touch.s;
+			if (s < PINCH_MIN) s = PINCH_MIN;
+			if (s > PINCH_MAX) s = PINCH_MAX;
+			vita_surface_preview_zoom(s / touch.s0, touch.cx,
+					touch.cy, ax, ay,
+					ax + fbtk_get_width(the_gw->browser),
+					ay + fbtk_get_height(the_gw->browser));
 		}
 		return;
 	case TOUCH_PRESSED:
