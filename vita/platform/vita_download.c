@@ -106,7 +106,7 @@ download_create(download_context *ctx, struct gui_window *parent)
 				 VITASURF_DOWNLOADS_DIR, base, n);
 		}
 	}
-	dw->f = fopen(dw->path, "wb");
+	dw->f = vita_fopen_buffered(dw->path, "wb");
 	if (dw->f == NULL) {
 		vita_log("download: cannot create %s", dw->path);
 		free(dw);

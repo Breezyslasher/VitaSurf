@@ -374,9 +374,21 @@ int vita_platform_poll_resume(void)
 	return resumed;
 }
 
+#define VITA_FILE_BUF (128 * 1024)
+
+FILE *vita_fopen_buffered(const char *path, const char *mode)
+{
+	FILE *f = fopen(path, mode);
+
+	/* before any other call on the stream, or it has no effect */
+	if (f != NULL)
+		setvbuf(f, NULL, _IOFBF, VITA_FILE_BUF);
+	return f;
+}
+
 int vita_read_file(const char *path, char **data, size_t *len)
 {
-	FILE *f = fopen(path, "rb");
+	FILE *f = vita_fopen_buffered(path, "rb");
 	long size;
 	char *buf;
 

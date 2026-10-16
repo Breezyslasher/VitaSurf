@@ -17,6 +17,7 @@ License: NetSurf is GPLv2, so this project is GPLv2. Every added library must be
 - No JIT. Both Duktape and QuickJS are interpreters, so JS performance comes from doing less work, not from engine tricks.
 - Screen: 960x544. Front touch reports coordinates at 1920x1088, so divide by 2.
 - `app0:` is read-only. All writable data goes under `ux0:data/VitaSurf/`.
+- newlib's stdio never asks the system for more than the FILE's buffer holds, a kilobyte unless it is given one, and each request to the memory card costs about a quarter of a millisecond. A file of any size is opened with `vita_fopen_buffered` (`vita_platform.c`, a 128 KB buffer) or given its own with `setvbuf` before the first call, as the script cache does (`BC_IO_BUF`): Wikipedia's 1 MB localStorage took 292 ms to read and 288 ms to write a kilobyte at a time.
 
 ## Repository layout (target, adjust as the port takes shape)
 

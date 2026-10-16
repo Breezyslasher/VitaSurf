@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 /* Screen geometry. The front touch panel reports 1920x1088 and is halved. */
 #ifndef VITASURF_BUILD_ID
@@ -186,6 +187,15 @@ void vita_net_fini(void);
  * not counted in len. Returns 0 on success, -1 on failure.
  */
 int vita_read_file(const char *path, char **data, size_t *len);
+
+/**
+ * fopen() with a buffer big enough to move a file in a few calls
+ * (VitaSurf). newlib's stdio never asks the system for more than the
+ * FILE's buffer holds, a kilobyte unless given one, and each request to
+ * the memory card costs about a quarter of a millisecond: a 1 MB
+ * localStorage file took 292 ms to read that way.
+ */
+FILE *vita_fopen_buffered(const char *path, const char *mode);
 
 /**
  * The CA bundle parsed once and shared by every TLS connection (VitaSurf).

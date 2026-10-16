@@ -58,7 +58,7 @@ static void pak_open(void)
 	int ok = 0;
 
 	pak_tried = 1;
-	f = fopen(VITASURF_INTL_PAK, "rb");
+	f = vita_fopen_buffered(VITASURF_INTL_PAK, "rb");
 	if (f == NULL) {
 		vita_log("intl: no %s", VITASURF_INTL_PAK);
 		return;
@@ -157,7 +157,7 @@ static JSValue js_pak(JSContext *ctx, JSValueConst this_val, int argc,
 		return JS_UNDEFINED;
 	z = malloc(e->zlen);
 	raw = malloc(e->len + 1);
-	f = fopen(VITASURF_INTL_PAK, "rb");
+	f = vita_fopen_buffered(VITASURF_INTL_PAK, "rb");
 	len = e->len;
 	if (z != NULL && raw != NULL && f != NULL &&
 	    fseek(f, (long) e->off, SEEK_SET) == 0 &&

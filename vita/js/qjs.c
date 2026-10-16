@@ -20442,7 +20442,7 @@ static JSValue win_vita_store_load(JSContext *ctx, JSValueConst this_val,
 	}
 	store_path(path, sizeof(path), origin);
 	free(origin);
-	f = fopen(path, "rb");
+	f = vita_fopen_buffered(path, "rb");
 	if (f == NULL) {
 		return JS_NULL;
 	}
@@ -20569,7 +20569,7 @@ static JSValue win_vita_store_save(JSContext *ctx, JSValueConst this_val,
 	store_path(path, sizeof(path), origin);
 	/* beside its own name and renamed over it, as for the script cache */
 	snprintf(tmp, sizeof(tmp), "%s.new", path);
-	f = fopen(tmp, "wb");
+	f = vita_fopen_buffered(tmp, "wb");
 	if (f != NULL) {
 		ok = fwrite(text, 1, len, f) == len;
 		fclose(f);
