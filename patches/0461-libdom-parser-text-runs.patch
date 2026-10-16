@@ -1,0 +1,429 @@
+diff --git a/bindings/hubbub/parser.c b/bindings/hubbub/parser.c
+index ac3bde2..fc78238 100644
+--- a/bindings/hubbub/parser.c
++++ b/bindings/hubbub/parser.c
+@@ -57,8 +57,98 @@ struct dom_hubbub_parser {
+ 	bool fragment;		/**< parsing for innerHTML and the like,
+ 				     which leaves shadow root templates as
+ 				     templates (VitaSurf) */
++
++	/*
++	 * Text the parser has appended and not yet put in the tree
++	 * (VitaSurf). The HTML standard's parser appends characters to
++	 * the Text node already last in their parent; hubbub gives each
++	 * run of characters a node of its own, cut at every '<' and '&',
++	 * so a paragraph with an entity was three nodes and its
++	 * firstChild.data a piece of its text, and a 836 KB inline JSON
++	 * script was 24,000 nodes whose textContent took six billion
++	 * instructions to put back together. Runs for the same parent are
++	 * gathered here and go in as one node, or onto the Text node that
++	 * was last there, before anything else touches the tree.
++	 */
++	bool pending;
++	struct dom_node *pend_parent;	/**< where it goes, a ref */
++	struct dom_node *pend_node;	/**< the first run's node, a ref */
++	struct dom_node *pend_into;	/**< a Text node it extends, a ref */
++	bool pend_grown;		/**< more than the first run */
++	uint8_t *pend_buf;
++	size_t pend_len, pend_cap;
+ };
+ 
++static bool pend_add(dom_hubbub_parser *p, const uint8_t *data, size_t len)
++{
++	if (p->pend_len + len > p->pend_cap) {
++		size_t cap = p->pend_cap == 0 ? 256 : p->pend_cap;
++		uint8_t *b;
++
++		while (cap < p->pend_len + len)
++			cap *= 2;
++		b = realloc(p->pend_buf, cap);
++		if (b == NULL)
++			return false;
++		p->pend_buf = b;
++		p->pend_cap = cap;
++	}
++	memcpy(p->pend_buf + p->pend_len, data, len);
++	p->pend_len += len;
++	return true;
++}
++
++static void pend_drop(dom_hubbub_parser *p)
++{
++	if (p->pend_parent != NULL)
++		dom_node_unref(p->pend_parent);
++	if (p->pend_node != NULL)
++		dom_node_unref(p->pend_node);
++	if (p->pend_into != NULL)
++		dom_node_unref(p->pend_into);
++	p->pend_parent = p->pend_node = p->pend_into = NULL;
++	p->pending = false;
++	p->pend_grown = false;
++	p->pend_len = 0;
++}
++
++/** Put the text gathered so far in the tree. */
++static void pend_flush(dom_hubbub_parser *p)
++{
++	dom_string *str = NULL;
++	struct dom_node *node = NULL, *appended = NULL;
++
++	if (!p->pending)
++		return;
++	p->pending = false;
++
++	if (p->pend_into == NULL && !p->pend_grown) {
++		/* one run alone: its own node goes in */
++		node = p->pend_node;
++		dom_node_ref(node);
++	} else if (dom_string_create(p->pend_buf, p->pend_len, &str) !=
++			DOM_NO_ERR) {
++		p->msg(DOM_MSG_CRITICAL, p->mctx, "Can't create text");
++	} else if (p->pend_into != NULL) {
++		dom_characterdata_set_data(
++				(struct dom_characterdata *) p->pend_into, str);
++	} else if (dom_document_create_text_node(p->doc, str,
++			(struct dom_text **) (void *) &node) != DOM_NO_ERR) {
++		p->msg(DOM_MSG_CRITICAL, p->mctx,
++				"Can't create the DOM text node");
++		node = NULL;
++	}
++	if (node != NULL) {
++		if (dom_node_append_child(p->pend_parent, node, &appended) ==
++				DOM_NO_ERR && appended != NULL)
++			dom_node_unref(appended);
++		dom_node_unref(node);
++	}
++	if (str != NULL)
++		dom_string_unref(str);
++	pend_drop(p);
++}
++
+ /* <template shadowrootmode> elements a document's parser has made
+  * (VitaSurf): the client turns each into its parent's shadow root, as
+  * the HTML standard's parser does, before the next script runs. */
+@@ -397,6 +487,56 @@ static hubbub_error append_child(void *parser, void *parent, void *child,
+ {
+ 	dom_hubbub_parser *dom_parser = (dom_hubbub_parser *) parser;
+ 	dom_exception err;
++	dom_node_type type;
++
++	if (dom_node_get_node_type((struct dom_node *) child, &type) ==
++			DOM_NO_ERR && type == DOM_TEXT_NODE) {
++		dom_node_internal *c = (dom_node_internal *) child;
++		dom_node_internal *last;
++
++		if (dom_parser->pending && dom_parser->pend_parent == parent) {
++			/* more of the same text */
++			if (c->value != NULL && !pend_add(dom_parser,
++					(const uint8_t *) dom_string_data(
++						c->value),
++					dom_string_byte_length(c->value)))
++				return HUBBUB_NOMEM;
++			dom_parser->pend_grown = true;
++			dom_node_ref((struct dom_node *) child);
++			*result = child;
++			return HUBBUB_OK;
++		}
++		pend_flush(dom_parser);
++
++		/* the text starts here, onto the Text node last in the
++		 * parent if there is one */
++		last = ((dom_node_internal *) parent)->last_child;
++		dom_parser->pend_len = 0;
++		if (last != NULL && last->type == DOM_TEXT_NODE) {
++			if (last->value != NULL && !pend_add(dom_parser,
++					(const uint8_t *) dom_string_data(
++						last->value),
++					dom_string_byte_length(last->value)))
++				return HUBBUB_NOMEM;
++			dom_parser->pend_into = (struct dom_node *) last;
++			dom_node_ref(dom_parser->pend_into);
++		}
++		if (c->value != NULL && !pend_add(dom_parser,
++				(const uint8_t *) dom_string_data(c->value),
++				dom_string_byte_length(c->value))) {
++			pend_drop(dom_parser);
++			return HUBBUB_NOMEM;
++		}
++		dom_parser->pend_parent = (struct dom_node *) parent;
++		dom_node_ref(dom_parser->pend_parent);
++		dom_parser->pend_node = (struct dom_node *) child;
++		dom_node_ref(dom_parser->pend_node);
++		dom_parser->pending = true;
++		dom_node_ref((struct dom_node *) child);
++		*result = child;
++		return HUBBUB_OK;
++	}
++	pend_flush(dom_parser);
+ 
+ 	err = dom_node_append_child((struct dom_node *) parent,
+ 				    (struct dom_node *) child,
+@@ -416,6 +556,35 @@ static hubbub_error insert_before(void *parser, void *parent, void *child,
+ {
+ 	dom_hubbub_parser *dom_parser = (dom_hubbub_parser *) parser;
+ 	dom_exception err;
++	dom_node_type type;
++
++	pend_flush((dom_hubbub_parser *) parser);
++
++	/* text moved out of a table joins a Text node before it there,
++	 * as appended text does (VitaSurf); rare and short, so at once */
++	if (ref_child != NULL && dom_node_get_node_type(
++			(struct dom_node *) child, &type) == DOM_NO_ERR &&
++			type == DOM_TEXT_NODE) {
++		dom_node_internal *prev =
++				((dom_node_internal *) ref_child)->previous;
++		dom_node_internal *c = (dom_node_internal *) child;
++
++		if (prev != NULL && prev->type == DOM_TEXT_NODE &&
++				prev->value != NULL && c->value != NULL) {
++			dom_string *joined = NULL;
++
++			if (dom_string_concat(prev->value, c->value,
++					&joined) == DOM_NO_ERR) {
++				dom_characterdata_set_data(
++					(struct dom_characterdata *) prev,
++					joined);
++				dom_string_unref(joined);
++				dom_node_ref((struct dom_node *) prev);
++				*result = prev;
++				return HUBBUB_OK;
++			}
++		}
++	}
+ 
+ 	err = dom_node_insert_before((struct dom_node *) parent,
+ 			(struct dom_node *) child,
+@@ -437,6 +606,8 @@ static hubbub_error remove_child(void *parser, void *parent, void *child,
+ 	dom_hubbub_parser *dom_parser = (dom_hubbub_parser *) parser;
+ 	dom_exception err;
+ 
++	pend_flush((dom_hubbub_parser *) parser);
++
+ 	err = dom_node_remove_child((struct dom_node *) parent,
+ 			(struct dom_node *) child,
+ 			(struct dom_node **) result);
+@@ -455,6 +626,8 @@ static hubbub_error clone_node(void *parser, void *node, bool deep,
+ 	dom_hubbub_parser *dom_parser = (dom_hubbub_parser *) parser;
+ 	dom_exception err;
+ 
++	pend_flush((dom_hubbub_parser *) parser);
++
+ 	err = dom_node_clone_node((struct dom_node *) node, deep,
+ 			(struct dom_node **) result);
+ 	if (err != DOM_NO_ERR) {
+@@ -473,6 +646,8 @@ static hubbub_error reparent_children(void *parser, void *node,
+ 	dom_exception err;
+ 	struct dom_node *child, *result;
+ 
++	pend_flush((dom_hubbub_parser *) parser);
++
+ 	while(true) {
+ 		err = dom_node_get_first_child((struct dom_node *) node,
+ 				&child);
+@@ -518,6 +693,8 @@ static hubbub_error get_parent(void *parser, void *node, bool element_only,
+ 	struct dom_node *parent;
+ 	dom_node_type type = DOM_NODE_TYPE_COUNT;
+ 
++	pend_flush((dom_hubbub_parser *) parser);
++
+ 	err = dom_node_get_parent_node((struct dom_node *) node,
+ 			&parent);
+ 	if (err != DOM_NO_ERR) {
+@@ -556,6 +733,8 @@ static hubbub_error has_children(void *parser, void *node, bool *result)
+ 	dom_hubbub_parser *dom_parser = (dom_hubbub_parser *) parser;
+ 	dom_exception err;
+ 
++	pend_flush((dom_hubbub_parser *) parser);
++
+ 	err = dom_node_has_child_nodes((struct dom_node *) node, result);
+ 	if (err != DOM_NO_ERR) {
+ 		dom_parser->msg(DOM_MSG_CRITICAL, dom_parser->mctx,
+@@ -756,6 +935,8 @@ static hubbub_error complete_script(void *parser, void *script)
+ 	dom_hubbub_parser *dom_parser = (dom_hubbub_parser *) parser;
+ 	dom_hubbub_error err;
+ 
++	pend_flush((dom_hubbub_parser *) parser);
++
+ 	err = dom_parser->script(dom_parser->mctx, (struct dom_node *)script);
+ 
+ 	if (err == DOM_HUBBUB_OK) {
+@@ -858,6 +1039,14 @@ dom_hubbub_parser_create(dom_hubbub_parser_params *params,
+ 	}
+ 
+ 	binding->complete = false;
++	binding->pending = false;
++	binding->pend_parent = NULL;
++	binding->pend_node = NULL;
++	binding->pend_into = NULL;
++	binding->pend_grown = false;
++	binding->pend_buf = NULL;
++	binding->pend_len = 0;
++	binding->pend_cap = 0;
+ 	binding->fragment = false;
+ 
+ 	if (params->msg == NULL) {
+@@ -990,6 +1179,14 @@ dom_hubbub_fragment_parser_create(dom_hubbub_parser_params *params,
+ 	}
+ 
+ 	binding->complete = false;
++	binding->pending = false;
++	binding->pend_parent = NULL;
++	binding->pend_node = NULL;
++	binding->pend_into = NULL;
++	binding->pend_grown = false;
++	binding->pend_buf = NULL;
++	binding->pend_len = 0;
++	binding->pend_cap = 0;
+ 	binding->fragment = true;
+ 
+ 	if (params->msg == NULL) {
+@@ -1061,6 +1258,7 @@ dom_hubbub_parser_insert_chunk(dom_hubbub_parser *parser,
+ 			       size_t length)
+ {
+ 	hubbub_parser_insert_chunk(parser->parser, data, length);
++	pend_flush(parser);
+ 
+ 	return DOM_HUBBUB_OK;
+ }
+@@ -1075,6 +1273,9 @@ void dom_hubbub_parser_destroy(dom_hubbub_parser *parser)
+ {
+ 	hubbub_parser_destroy(parser->parser);
+ 	parser->parser = NULL;
++	pend_drop(parser);
++	free(parser->pend_buf);
++	parser->pend_buf = NULL;
+ 
+ 	if (parser->doc != NULL) {
+ 		dom_node_unref((struct dom_node *) parser->doc);
+@@ -1099,6 +1300,8 @@ dom_hubbub_error dom_hubbub_parser_parse_chunk(dom_hubbub_parser *parser,
+ 	hubbub_error err;
+ 
+ 	err = hubbub_parser_parse_chunk(parser->parser, data, len);
++	/* what a script or a timer reads next is the tree as parsed */
++	pend_flush(parser);
+ 	if (err != HUBBUB_OK)
+ 		return DOM_HUBBUB_HUBBUB_ERR | err;
+ 
+@@ -1118,6 +1321,7 @@ dom_hubbub_error dom_hubbub_parser_completed(dom_hubbub_parser *parser)
+ 	hubbub_error err;
+ 
+ 	err = hubbub_parser_completed(parser->parser);
++	pend_flush(parser);
+ 	if (err != HUBBUB_OK) {
+ 		parser->msg(DOM_MSG_ERROR, parser->mctx,
+ 				"hubbub_parser_completed failed: %d", err);
+@@ -1160,6 +1364,7 @@ dom_hubbub_error dom_hubbub_parser_pause(dom_hubbub_parser *parser, bool pause)
+ 
+ 	params.pause_parse = pause;
+ 	err = hubbub_parser_setopt(parser->parser, HUBBUB_PARSER_PAUSE, &params);
++	pend_flush(parser);
+ 	if (err != HUBBUB_OK)
+ 		return DOM_HUBBUB_HUBBUB_ERR | err;
+ 
+diff --git a/src/core/node.c b/src/core/node.c
+index 103bed6..c335990 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -1684,27 +1684,85 @@ dom_exception _dom_node_get_text_content(dom_node_internal *node,
+ 	dom_exception err;
+ 	dom_node_internal *n;
+ 	dom_string *str = NULL;
+-	dom_string *ret = NULL;
+ 
+ 	assert(node->owner != NULL);
+-	
+-	for (n = node->first_child; n != NULL; n = n->next) {
+-		if (n->type == DOM_COMMENT_NODE ||
+-		    n->type == DOM_PROCESSING_INSTRUCTION_NODE)
+-			continue;
+-		dom_node_get_text_content(n, (str == NULL) ? &str : &ret);
+-		if (ret != NULL) {
+-			dom_string *new_str;
+-			err = dom_string_concat(str, ret, &new_str);
+-			dom_string_unref(str);
+-			dom_string_unref(ret);
+-			if (err != DOM_NO_ERR) {
+-				return err;
++
++	/*
++	 * The text of every Text and CDATA node below, in tree order,
++	 * gathered into one buffer (VitaSurf). Each child's text had been
++	 * joined onto what came before into a new string, so n pieces cost
++	 * n copies of the text so far: CNN's inline scripts, in thousands
++	 * of pieces, were seconds of copying each time their text was
++	 * read. One Text child alone is its own string.
++	 */
++	n = node->first_child;
++	if (n != NULL && n->next == NULL && (n->type == DOM_TEXT_NODE ||
++			n->type == DOM_CDATA_SECTION_NODE)) {
++		if (n->value != NULL)
++			str = dom_string_ref(n->value);
++		*result = str;
++		return DOM_NO_ERR;
++	}
++	{
++		size_t len = 0, at = 0;
++		bool any = false;
++		uint8_t *buf;
++
++		/* once to measure, once to copy */
++		for (n = node->first_child; n != NULL; ) {
++			if (n->type == DOM_TEXT_NODE ||
++					n->type == DOM_CDATA_SECTION_NODE) {
++				any = true;
++				if (n->value != NULL)
++					len += dom_string_byte_length(n->value);
++			} else if (n->type != DOM_COMMENT_NODE &&
++					n->type != DOM_PROCESSING_INSTRUCTION_NODE &&
++					n->first_child != NULL) {
++				n = n->first_child;
++				continue;
+ 			}
+-			str = new_str;
++			while (n != node && n->next == NULL)
++				n = n->parent;
++			if (n == node)
++				break;
++			n = n->next;
++		}
++		if (!any) {
++			*result = NULL;
++			return DOM_NO_ERR;
+ 		}
++		buf = malloc(len + 1);
++		if (buf == NULL)
++			return DOM_NO_MEM_ERR;
++		for (n = node->first_child; n != NULL; ) {
++			if (n->type == DOM_TEXT_NODE ||
++					n->type == DOM_CDATA_SECTION_NODE) {
++				if (n->value != NULL) {
++					size_t l = dom_string_byte_length(
++							n->value);
++
++					memcpy(buf + at, dom_string_data(
++							n->value), l);
++					at += l;
++				}
++			} else if (n->type != DOM_COMMENT_NODE &&
++					n->type != DOM_PROCESSING_INSTRUCTION_NODE &&
++					n->first_child != NULL) {
++				n = n->first_child;
++				continue;
++			}
++			while (n != node && n->next == NULL)
++				n = n->parent;
++			if (n == node)
++				break;
++			n = n->next;
++		}
++		err = dom_string_create(buf, at, &str);
++		free(buf);
++		if (err != DOM_NO_ERR)
++			return err;
+ 	}
+-	
++
+ 	*result = str;
+ 
+ 	return DOM_NO_ERR;
