@@ -1,0 +1,157 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 15cf011b0..783fd9511 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -3414,25 +3414,38 @@ static nserror html_filter_path(const struct redraw_context *ctx,
+ 
+ /**
+  * One box blur pass along the rows and one down the columns of a
+- * premultiplied RGBA buffer, in place, with a row or column of scratch.
+- * Outside the buffer counts as transparent, so an edge softens.
++ * premultiplied RGBA buffer, in place, with a row of scratch. Outside the
++ * buffer counts as transparent, so an edge softens.
++ *
++ * Each sum of the 2r + 1 pixels is divided by multiplying with its
++ * reciprocal, rounded (VitaSurf): the Vita's processor has no divide
++ * instruction, and four divides a pixel each way were most of the 1.35 s
++ * apple.com's frosted curtain took to draw. The pass down goes a row at a
++ * time over running column sums, keeping in a ring the rows it has still
++ * to take away, where it went down each column in turn, a row's width
++ * between reads.
+  */
+ static void html_filter_blur_pass(uint8_t *buf, int w, int h, size_t stride,
+ 		int r, uint8_t *tmp)
+ {
+-	int x, y, c;
+-	int div = 2 * r + 1;
++	int x, y, c, k;
++	uint32_t inv = (65536u + (uint32_t) (2 * r + 1) / 2) /
++			(uint32_t) (2 * r + 1);
++	int32_t *sums;
++	uint8_t *ring;
++	size_t rowbytes = (size_t) w * 4;
+ 
+ 	for (y = 0; y < h; y++) {
+ 		uint8_t *row = buf + y * stride;
+-		int sum[4] = { 0, 0, 0, 0 };
++		uint32_t sum[4] = { 0, 0, 0, 0 };
+ 
+ 		for (x = 0; x <= r && x < w; x++)
+ 			for (c = 0; c < 4; c++)
+ 				sum[c] += row[x * 4 + c];
+ 		for (x = 0; x < w; x++) {
+ 			for (c = 0; c < 4; c++)
+-				tmp[x * 4 + c] = (uint8_t) (sum[c] / div);
++				tmp[x * 4 + c] = (uint8_t)
++					((sum[c] * inv + 32768) >> 16);
+ 			if (x + r + 1 < w)
+ 				for (c = 0; c < 4; c++)
+ 					sum[c] += row[(x + r + 1) * 4 + c];
+@@ -3440,29 +3453,47 @@ static void html_filter_blur_pass(uint8_t *buf, int w, int h, size_t stride,
+ 				for (c = 0; c < 4; c++)
+ 					sum[c] -= row[(x - r) * 4 + c];
+ 		}
+-		memcpy(row, tmp, (size_t) w * 4);
++		memcpy(row, tmp, rowbytes);
+ 	}
+ 
+-	for (x = 0; x < w; x++) {
+-		uint8_t *col = buf + x * 4;
+-		int sum[4] = { 0, 0, 0, 0 };
++	sums = calloc((size_t) w * 4, sizeof(*sums));
++	ring = malloc(rowbytes * (size_t) (r + 1));
++	if (sums == NULL || ring == NULL) {
++		free(sums);
++		free(ring);
++		return;
++	}
++	for (y = 0; y <= r && y < h; y++) {
++		const uint8_t *row = buf + y * stride;
+ 
+-		for (y = 0; y <= r && y < h; y++)
+-			for (c = 0; c < 4; c++)
+-				sum[c] += col[y * stride + c];
+-		for (y = 0; y < h; y++) {
+-			for (c = 0; c < 4; c++)
+-				tmp[y * 4 + c] = (uint8_t) (sum[c] / div);
+-			if (y + r + 1 < h)
+-				for (c = 0; c < 4; c++)
+-					sum[c] += col[(y + r + 1) * stride + c];
+-			if (y - r >= 0)
+-				for (c = 0; c < 4; c++)
+-					sum[c] -= col[(y - r) * stride + c];
++		for (k = 0; k < w * 4; k++)
++			sums[k] += row[k];
++	}
++	for (y = 0; y < h; y++) {
++		uint8_t *row = buf + y * stride;
++
++		/* this row as it was, for taking away r + 1 rows on */
++		memcpy(ring + (size_t) (y % (r + 1)) * rowbytes, row,
++				rowbytes);
++		for (k = 0; k < w * 4; k++)
++			row[k] = (uint8_t) (((uint32_t) sums[k] * inv + 32768)
++					>> 16);
++		if (y + r + 1 < h) {
++			const uint8_t *in = buf + (y + r + 1) * stride;
++
++			for (k = 0; k < w * 4; k++)
++				sums[k] += in[k];
++		}
++		if (y - r >= 0) {
++			const uint8_t *out = ring +
++				(size_t) ((y - r) % (r + 1)) * rowbytes;
++
++			for (k = 0; k < w * 4; k++)
++				sums[k] -= out[k];
+ 		}
+-		for (y = 0; y < h; y++)
+-			memcpy(col + y * stride, tmp + y * 4, 4);
+ 	}
++	free(sums);
++	free(ring);
+ }
+ 
+ static nserror html_filter_bitmap(const struct redraw_context *ctx,
+@@ -5383,6 +5414,29 @@ static void html_border_box_device(const struct box *box, int x_parent,
+ 			box->border[BOTTOM].width) * scale + 0.5f);
+ }
+ 
++/**
++ * Whether a box paints itself at all (VitaSurf): not one that is
++ * transparent or hidden. A backdrop-filter is part of what the box
++ * paints, and apple.com's navigation curtain, hidden and transparent
++ * until a menu opens, blurred the whole page under it at every redraw,
++ * 1.35 s each.
++ */
++static bool html_box_paints(const struct box *box)
++{
++	css_fixed op = INTTOFIX(1);
++
++	if (box->style == NULL)
++		return true;
++	if (css_computed_visibility(box->style) == CSS_VISIBILITY_HIDDEN)
++		return false;
++	if (css_computed_opacity(box->style, &op) == CSS_OPACITY_SET &&
++			op <= 0)
++		return false;
++	if (box->filter != NULL && box->filter->alpha <= 0)
++		return false;
++	return true;
++}
++
+ /**
+  * backdrop-filter (VitaSurf): what is already on the screen behind the
+  * box is read back, blurred and recoloured as the filter says, cut to
+@@ -6677,8 +6731,9 @@ static bool html_redraw_box_work(const html_content *html, struct box *box,
+ 			current_background_color, ctx, &ok))
+ 		return ok;
+ 
+-	/* what is behind the box, filtered, under it (VitaSurf) */
+-	if (box != html_composite_active &&
++	/* what is behind the box, filtered, under it (VitaSurf); not for a
++	 * box that paints nothing, whose backdrop is not seen either */
++	if (box != html_composite_active && html_box_paints(box) &&
+ 			!html_redraw_backdrop(html, box, x_parent, y_parent,
+ 				clip, scale, ctx))
+ 		return false;
