@@ -6529,7 +6529,7 @@ var CSS_KEYS=[],CSS_ARGS=[],CSS_FLAGS=[];
  'outline-style outline-width overflow overflow-wrap overflow-x overflow-y padding '+
  'padding-bottom padding-left padding-right padding-top page-break-after page-break-before '+
  'perspective place-content place-items place-self pointer-events position quotes resize right '+
- 'row-gap scroll-behavior scroll-margin scroll-padding table-layout text-align text-decoration '+
+ 'row-gap scroll-behavior scroll-margin scroll-padding scrollbar-width table-layout text-align text-decoration '+
  'text-decoration-color text-decoration-line text-indent text-overflow text-shadow '+
  'text-transform top touch-action transform transform-origin transition transition-delay '+
  'transition-duration transition-property transition-timing-function unicode-bidi user-select '+

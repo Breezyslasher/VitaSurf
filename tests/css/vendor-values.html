@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<!--
+  Values and properties Chrome takes that libcss had dropped (VitaSurf),
+  found by counting the declarations real sites' sheets lost: the
+  -webkit- sizing keywords, position: -webkit-sticky, float and clear
+  inline-start and inline-end, outline-style auto, cursor -webkit-grab,
+  text-align match-parent, calc() in animation times and counts,
+  background-position's three and four value forms, a font family of
+  several words ending in a generic name, text-decoration-color and the
+  -webkit-margin-start family, appearance and scrollbar-width. Each line
+  must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Vendor values</title>
+<style>
+body { margin: 0; font: 16px sans-serif; }
+#fit { width: -webkit-fit-content; } #fit span { display: inline-block; width: 77px; }
+#maxc { width: -webkit-max-content; } #maxc span { display: inline-block; width: 50px; }
+#sticky { position: -webkit-sticky; }
+#fl { width: 200px; display: flow-root; } #fl div { float: inline-end; width: 30px; height: 10px; }
+#rtl { width: 200px; direction: rtl; display: flow-root; } #rtl div { float: inline-start; width: 30px; height: 10px; }
+#cl { clear: inline-start; }
+#fam { font-family: "Amazon Ember", Arial, san serif; }
+#deco { text-decoration: underline; text-decoration-color: rgb(1, 2, 3); }
+#wdeco { -webkit-text-decoration-color: rgb(4, 5, 6); }
+#ms { -webkit-margin-start: 7px; -webkit-padding-end: 3px; }
+#ap { -webkit-appearance: none; appearance: none; }
+#ap2 { -moz-appearance: none; }
+#sbw { scrollbar-width: none; overflow: auto; width: 200px; height: 40px; }
+#sbw div { height: 200px; }
+</style></head>
+<body>
+<div id="fit"><span></span></div>
+<div id="maxc"><span></span> <span></span></div>
+<div id="sticky"></div>
+<div id="fl"><div id="fl1"></div></div>
+<div id="rtl"><div id="rtl1"></div></div>
+<div id="cl"></div>
+<p id="fam">x</p>
+<p id="deco">x</p><p id="wdeco">x</p>
+<div id="ms">x</div>
+<input id="ap" type="checkbox"><input id="ap2" type="checkbox"><input id="ap3" type="checkbox">
+<div id="sbw"><div id="sbw1"></div></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+function R(id) { return document.getElementById(id).getBoundingClientRect(); }
+var S = [
+  ['width', '-webkit-fit-content', true], ['min-width', '-webkit-min-content', true],
+  ['max-height', '-webkit-max-content', true], ['position', '-webkit-sticky', false],
+  ['float', 'inline-start', true], ['clear', 'inline-end', true],
+  ['outline-style', 'auto', true], ['outline', '2px auto red', true],
+  ['cursor', '-webkit-grab', true], ['cursor', '-webkit-zoom-in', true],
+  ['text-align', 'match-parent', true], ['text-align', '-webkit-match-parent', true],
+  ['animation-duration', 'calc(1s * 0.75)', true], ['animation-duration', '1s', true],
+  ['animation-delay', 'calc(-1 * (3s - 3s / 12))', true],
+  ['animation-iteration-count', 'calc(1 * 3)', true],
+  ['animation-duration', 'calc(1s + 2)', false], ['animation-duration', 'calc(1s * 2s)', false],
+  ['animation-duration', 'calc(1s / 0)', false],
+  ['background-position', 'right 10px bottom 5px', true],
+  ['background-position', 'top -10px center', true],
+  ['background-position', 'top calc(0.375em + 0.1875rem) right calc(0.375em + 0.1875rem)', true],
+  ['background-position', 'center right 20%', true],
+  ['background-position', 'left 10px right 5px', false],
+  ['background-position', 'center 10px top', false],
+  ['background-position', 'left top 10px 5px', false],
+  ['white-space', 'wrap', true], ['unicode-bidi', 'isolate', true],
+  ['background-attachment', 'local', true],
+  ['appearance', 'none', true], ['appearance', 'menulist-button', true],
+  ['appearance', 'bogus', false], ['scrollbar-width', 'thin', true],
+  ['scrollbar-width', '10px', false]
+];
+S.forEach(function (t) { ok('CSS.supports(' + t[0] + ': ' + t[1] + ')', CSS.supports(t[0], t[1]), t[2]); });
+addEventListener('load', function () {
+  ok('-webkit-fit-content is its content\'s width', Math.round(R('fit').width), 77);
+  ok('-webkit-max-content keeps a line whole', Math.round(R('maxc').height) < 30, true);
+  ok('-webkit-sticky is Safari\'s alone', cs('sticky').position, 'static');
+  ok('float: inline-end goes right in left-to-right text', Math.round(R('fl1').left), 170);
+  ok('float: inline-start goes right in right-to-left text', Math.round(R('rtl1').left), 170);
+  ok('a family of several words keeps the list', /Amazon Ember/.test(cs('fam').fontFamily), true);
+  ok('text-decoration-color', cs('deco').textDecorationColor, 'rgb(1, 2, 3)');
+  ok('-webkit-text-decoration-color', cs('wdeco').textDecorationColor, 'rgb(4, 5, 6)');
+  ok('-webkit-margin-start', cs('ms').marginLeft, '7px');
+  ok('-webkit-padding-end', cs('ms').paddingRight, '3px');
+  ok('appearance: none', cs('ap').appearance, 'none');
+  ok('-moz-appearance: none', cs('ap2').appearance, 'none');
+  ok('appearance is auto by default', cs('ap3').appearance, 'auto');
+  ok('scrollbar-width: none', cs('sbw').scrollbarWidth, 'none');
+  ok('a box with hidden scrollbars gives its content its whole width', Math.round(R('sbw1').width), 200);
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('vendor-values: ' + l); });
+  console.log('vendor-values: done');
+});
+</script>
+</body></html>

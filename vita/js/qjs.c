@@ -15115,6 +15115,24 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			c = colour;
 		sm_colour(buf, sizeof(buf), c);
 		sm_set(ctx, obj, "outlineColor", buf);
+		/* the underline's colour, the text's unless given one */
+		c = colour;
+		if (css_computed_text_decoration_color(s, &c) !=
+				CSS_TEXT_DECORATION_COLOR_COLOR)
+			c = colour;
+		sm_colour(buf, sizeof(buf), c);
+		sm_set(ctx, obj, "textDecorationColor", buf);
+	}
+	{
+		const char *ap = css_computed_appearance(s) ==
+				CSS_APPEARANCE_NONE ? "none" : "auto";
+		uint8_t sw = css_computed_scrollbar_width(s);
+
+		sm_set(ctx, obj, "appearance", ap);
+		sm_set(ctx, obj, "webkitAppearance", ap);
+		sm_set(ctx, obj, "scrollbarWidth",
+				sw == CSS_SCROLLBAR_WIDTH_NONE ? "none" :
+				sw == CSS_SCROLLBAR_WIDTH_THIN ? "thin" : "auto");
 	}
 	SM_ENUM("objectFit", sm_object_fit, css_computed_object_fit(s));
 	{

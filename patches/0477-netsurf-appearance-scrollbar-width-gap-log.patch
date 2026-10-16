@@ -1,0 +1,203 @@
+diff --git a/content/handlers/css/css.c b/content/handlers/css/css.c
+index 21450c34b..0764011d3 100644
+--- a/content/handlers/css/css.c
++++ b/content/handlers/css/css.c
+@@ -808,7 +808,7 @@ static void nscss_report_gaps(struct content *c, css_stylesheet *sheet)
+ 			css_stylesheet_get_gap_sample(sheet, i) : NULL;
+ 		n = snprintf(line + at, sizeof(line) - at,
+ 			     "%s%.*s%s%s%s%s x%u",
+-			     at == 0 ? "" : ", ",
++			     at == 0 ? "" : "; ",
+ 			     (int) lwc_string_length(name),
+ 			     lwc_string_data(name),
+ 			     kind == 1 ? " (value" :
+@@ -817,8 +817,19 @@ static void nscss_report_gaps(struct content *c, css_stylesheet *sheet)
+ 			     sample != NULL ? sample : "",
+ 			     kind == 1 ? (sample != NULL ? "')" : ")") : "",
+ 			     (unsigned int) count);
++		if ((n < 0 || (unsigned int) n >= sizeof(line) - at) &&
++				at > 0) {
++			/* a full line is written and the rest go on the
++			 * next (VitaSurf): each sheet's list had stopped
++			 * at the first dozen or so */
++			line[at] = '\0';
++			vita_log("gap: css dropped: %s", line);
++			at = 0;
++			i--;
++			continue;
++		}
+ 		if (n < 0 || (unsigned int) n >= sizeof(line) - at) {
+-			break;
++			continue;
+ 		}
+ 		at += (unsigned int) n;
+ 	}
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index e0795000a..51cc2819e 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -1077,6 +1077,23 @@ box_generated_add_text(dom_node *n,
+ }
+ 
+ 
++/**
++ * Whether an element is a select the page draws itself (VitaSurf):
++ * with appearance: none the browser's arrow, which is this build's
++ * select::after in default.css, goes, and the page's own (a background
++ * image, mostly) is the only one. Both had been drawn. Chrome draws no
++ * ::before or ::after on a select at all.
++ */
++static bool box_select_drawn_by_page(dom_node *n)
++{
++	struct box *b = box_for_node(n);
++
++	return b != NULL && b->gadget != NULL &&
++			b->gadget->type == GADGET_SELECT && b->style != NULL &&
++			css_computed_appearance(b->style) ==
++				CSS_APPEARANCE_NONE;
++}
++
+ /**
+  * Construct the box required for a generated element.
+  *
+@@ -1095,6 +1112,9 @@ box_construct_generate(dom_node *n,
+ 	enum css_display_e computed_display;
+ 	const css_computed_content_item *c_item;
+ 
++	if (box_select_drawn_by_page(n))
++		return;
++
+ 	/* Nothing to generate if the parent box holds block level
+ 	 * children of its own */
+ 	if (box->type != BOX_BLOCK &&
+@@ -1166,6 +1186,7 @@ box_construct_generate_inline(dom_node *n, html_content *content,
+ 	const css_computed_content_item *c_item;
+ 
+ 	if (container == NULL || style == NULL ||
++			box_select_drawn_by_page(n) ||
+ 			css_computed_content(style, &c_item) !=
+ 				CSS_CONTENT_SET ||
+ 			ns_computed_display(style, false) == CSS_DISPLAY_NONE)
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+index 4722e1e29..1e77adc31 100644
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -87,6 +87,18 @@ static inline bool box_contains_layout(const struct box *box)
+ 			(CSS_CONTAIN_LAYOUT | CSS_CONTAIN_PAINT)) != 0;
+ }
+ 
++/**
++ * Whether a box's scrollbars are hidden by scrollbar-width: none
++ * (VitaSurf): it still scrolls, by touch, stick and script, but its
++ * scrollbars take no room, are not drawn and take no taps. Carousels
++ * hide theirs so, and they had been drawn under the slides.
++ */
++static inline bool box_scrollbars_hidden(const struct box *box)
++{
++	return box->style != NULL && css_computed_scrollbar_width(
++			box->style) == CSS_SCROLLBAR_WIDTH_NONE;
++}
++
+ static inline enum css_overflow_e box_overflow_x(const struct box *box)
+ {
+ 	enum css_overflow_e overflow;
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index 42605c635..de65b8076 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -39,6 +39,7 @@
+ #include "html/interaction.h"
+ #include "html/box.h"
+ #include "html/box_manipulate.h"
++#include "html/box_inspect.h"
+ 
+ 
+ /**
+@@ -357,7 +358,8 @@ box_handle_scrollbars(struct content *c,
+ 			data->c = c;
+ 			data->box = box;
+ 			res = scrollbar_create(true,
+-					       visible_width - (right ? SCROLLBAR_WIDTH : 0),
++					       visible_width - (right && !box_scrollbars_hidden(box) ?
++				 SCROLLBAR_WIDTH : 0),
+ 					       full_width,
+ 					       visible_width,
+ 					       data,
+@@ -369,7 +371,8 @@ box_handle_scrollbars(struct content *c,
+ 		} else {
+ 			scrollbar_set_extents(box->scroll_x,
+ 					visible_width -
+-					(right ? SCROLLBAR_WIDTH : 0),
++					(right && !box_scrollbars_hidden(box) ?
++				 SCROLLBAR_WIDTH : 0),
+ 					visible_width, full_width);
+ 		}
+ 	}
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 620c7fecd..1f97ba51d 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -830,6 +830,7 @@ get_mouse_action_node(html_content *html,
+ 				/* mouse inside padding box */
+ 
+ 				if ((box->scroll_y != NULL) &&
++				    !box_scrollbars_hidden(box) &&
+ 				    (x > (padding_right - SCROLLBAR_WIDTH))) {
+ 					/* mouse above vertical box scroll */
+ 
+@@ -839,6 +840,7 @@ get_mouse_action_node(html_content *html,
+ 					break;
+ 
+ 				} else if ((box->scroll_x != NULL) &&
++					   !box_scrollbars_hidden(box) &&
+ 					   (y > (padding_bottom -
+ 							SCROLLBAR_WIDTH))) {
+ 					/* mouse above horizontal box scroll */
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 72a08dcad..175198fd8 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1767,7 +1767,7 @@ static void layout_block_add_scrollbar(struct box *box, int which)
+ 
+ 	assert(box->type == BOX_BLOCK && (which == RIGHT || which == BOTTOM));
+ 
+-	if (box->style == NULL)
++	if (box->style == NULL || box_scrollbars_hidden(box))
+ 		return;
+ 
+ 	overflow_x = box_overflow_x(box);
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 783fd9511..bd73a2efb 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -8068,6 +8068,14 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				x + padding_left,
+ 				y + padding_top, &r, ctx);
+ 
++	} else if (box->gadget && (box->gadget->type == GADGET_CHECKBOX ||
++			box->gadget->type == GADGET_RADIO) && box->style != NULL &&
++			css_computed_appearance(box->style) ==
++				CSS_APPEARANCE_NONE) {
++		/* appearance: none, so the page draws the control with its
++		 * own background and border, and no mark goes over them
++		 * (VitaSurf) */
++
+ 	} else if (box->gadget && box->gadget->type == GADGET_CHECKBOX) {
+ 		colour accent = 0;
+ 		bool has = html_accent(box, &accent);
+@@ -8188,13 +8196,13 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			return false;
+ 		}
+ 
+-		if (box->scroll_x != NULL)
++		if (box->scroll_x != NULL && !box_scrollbars_hidden(box))
+ 			scrollbar_redraw(box->scroll_x,
+ 					x_parent + box->x,
+ 					y_parent + box->y + box->padding[TOP] +
+ 					box->height + box->padding[BOTTOM] -
+ 					SCROLLBAR_WIDTH, clip, scale, ctx);
+-		if (box->scroll_y != NULL)
++		if (box->scroll_y != NULL && !box_scrollbars_hidden(box))
+ 			scrollbar_redraw(box->scroll_y,
+ 					x_parent + box->x + box->padding[LEFT] +
+ 					box->width + box->padding[RIGHT] -
