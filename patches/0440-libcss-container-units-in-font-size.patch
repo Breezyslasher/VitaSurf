@@ -1,0 +1,130 @@
+diff --git a/src/bytecode/bytecode.h b/src/bytecode/bytecode.h
+index 75ad182..030e73d 100644
+--- a/src/bytecode/bytecode.h
++++ b/src/bytecode/bytecode.h
+@@ -80,6 +80,15 @@ typedef enum unit {
+ 	UNIT_VMAX = (1u << 8) + 16,
+ 	UNIT_Q    = (1u << 8) + 17,
+ 	UNIT_RLH  = (1u << 8) + 18,	/* (VitaSurf) */
++	/* container query units (VitaSurf): their viewport counterparts
++	 * wherever a length is resolved without an element, and against
++	 * the element's container where one is known (font-size) */
++	UNIT_CQW  = (1u << 8) + 19,
++	UNIT_CQH  = (1u << 8) + 20,
++	UNIT_CQI  = (1u << 8) + 21,
++	UNIT_CQB  = (1u << 8) + 22,
++	UNIT_CQMIN = (1u << 8) + 23,
++	UNIT_CQMAX = (1u << 8) + 24,
+ 
+ 	UNIT_PCT = (1 << 9),
+ 
+diff --git a/src/parse/properties/utils.c b/src/parse/properties/utils.c
+index c8c37cd..a467b78 100644
+--- a/src/parse/properties/utils.c
++++ b/src/parse/properties/utils.c
+@@ -2664,20 +2664,33 @@ static bool css__parse_viewport_unit(const char *ptr, size_t len,
+ css_error css__parse_unit_keyword(const char *ptr, size_t len, uint32_t *unit)
+ {
+ 	/*
+-	 * Container query units (VitaSurf): a container query is answered
+-	 * against the viewport here, so its units are the viewport's too
+-	 * -- cqw is vw, cqmin vmin, and so on.
++	 * Container query units (VitaSurf): units of their own, which mean
++	 * their viewport counterparts wherever a length is resolved without
++	 * an element, and the element's container's size where it is known
++	 * (font-size: see css__cascade_font_size). cqi had been vi
++	 * everywhere, so Amazon's card titles at 11.8cqi were set at an
++	 * eighth of the screen's width, not the card's.
+ 	 */
+ 	if (len > 2 && (ptr[0] == 'c' || ptr[0] == 'C') &&
+ 			(ptr[1] == 'q' || ptr[1] == 'Q')) {
+ 		char v[5] = { 'v', 0, 0, 0, 0 };
++		uint32_t vu;
+ 
+ 		if (len - 2 > 3)
+ 			return CSS_INVALID;
+ 		memcpy(v + 1, ptr + 2, len - 2);
+-		if (css__parse_viewport_unit(v, len - 1, unit))
+-			return CSS_OK;
+-		return CSS_INVALID;
++		if (!css__parse_viewport_unit(v, len - 1, &vu))
++			return CSS_INVALID;
++		switch (vu) {
++		case UNIT_VW: *unit = UNIT_CQW; break;
++		case UNIT_VH: *unit = UNIT_CQH; break;
++		case UNIT_VI: *unit = UNIT_CQI; break;
++		case UNIT_VB: *unit = UNIT_CQB; break;
++		case UNIT_VMIN: *unit = UNIT_CQMIN; break;
++		case UNIT_VMAX: *unit = UNIT_CQMAX; break;
++		default: return CSS_INVALID;
++		}
++		return CSS_OK;
+ 	}
+ 
+ 	if (len > 2 && (*ptr == 's' || *ptr == 'S' ||
+diff --git a/src/select/helpers.h b/src/select/helpers.h
+index 7c84adc..98f77f8 100644
+--- a/src/select/helpers.h
++++ b/src/select/helpers.h
+@@ -33,6 +33,13 @@ static inline css_unit css__to_css_unit(uint32_t u)
+ 	case UNIT_VMAX: return CSS_UNIT_VMAX;
+ 	case UNIT_Q:    return CSS_UNIT_Q;
+ 	case UNIT_RLH:  return CSS_UNIT_RLH;
++	/* no container here: the viewport's (VitaSurf) */
++	case UNIT_CQW:  return CSS_UNIT_VW;
++	case UNIT_CQH:  return CSS_UNIT_VH;
++	case UNIT_CQI:  return CSS_UNIT_VI;
++	case UNIT_CQB:  return CSS_UNIT_VB;
++	case UNIT_CQMIN: return CSS_UNIT_VMIN;
++	case UNIT_CQMAX: return CSS_UNIT_VMAX;
+ 	case UNIT_PCT:  return CSS_UNIT_PCT;
+ 	case UNIT_DEG:  return CSS_UNIT_DEG;
+ 	case UNIT_GRAD: return CSS_UNIT_GRAD;
+diff --git a/src/select/properties/font_size.c b/src/select/properties/font_size.c
+index c1d2e51..8d69533 100644
+--- a/src/select/properties/font_size.c
++++ b/src/select/properties/font_size.c
+@@ -13,6 +13,28 @@
+ 
+ #include "select/properties/properties.h"
+ #include "select/properties/helpers.h"
++#include "select/mq.h"
++
++/*
++ * A font size in a container's inline-size units, against the element's
++ * nearest container as the last layout left it (VitaSurf): cqw and cqi,
++ * which every kind of container has. The block-size ones need a size
++ * container, which the lookup does not tell apart, and keep their
++ * viewport meaning, as everything does while a container's size is not
++ * known. Asking notes that the page's styles hang on its containers, so
++ * they are chosen again once the layout has measured them.
++ */
++static bool font_size_from_container(uint32_t raw, css_fixed *value)
++{
++	css_fixed width = 0, height = 0;
++
++	if (raw != UNIT_CQW && raw != UNIT_CQI)
++		return false;
++	if (mq__container_size(NULL, &width, &height) != 1 || width <= 0)
++		return false;
++	*value = FDIV(FMUL(*value, width), F_100);
++	return true;
++}
+ 
+ css_error css__cascade_font_size(uint32_t opv, css_style *style,
+ 		css_select_state *state)
+@@ -30,7 +52,13 @@ css_error css__cascade_font_size(uint32_t opv, css_style *style,
+ 			size.value = *((css_fixed *) style->bytecode);
+ 			advance_bytecode(style, sizeof(size.value));
+ 
+-			unit = css__to_css_unit(*((uint32_t *) style->bytecode));
++			if (font_size_from_container(
++					*((uint32_t *) style->bytecode),
++					&size.value))
++				unit = CSS_UNIT_PX;
++			else
++				unit = css__to_css_unit(
++					*((uint32_t *) style->bytecode));
+ 			advance_bytecode(style, sizeof(unit));
+ 			break;
+ 		case FONT_SIZE_XX_SMALL:
