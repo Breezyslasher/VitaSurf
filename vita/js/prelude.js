@@ -506,7 +506,7 @@ function pseudoOk(el,p){
  case 'link':case 'any-link':
   return (el.tagName==='A'||el.tagName==='AREA')&&el.hasAttribute('href');
  case 'defined':return true;
- case 'scope':return true;
+ case 'scope':return el===SCOPE;
  case 'popover-open':return popoverShown(el);
  case 'open':
   return (el.tagName==='DETAILS'||el.tagName==='DIALOG')&&el.hasAttribute('open');
@@ -522,7 +522,15 @@ function pseudoOk(el,p){
  case 'active':case 'visited':case 'target':case 'indeterminate':
   return false;
  default:return true;}}
-function matchSimple(el,q){if(el.nodeType!==1)return false;
+/* What :scope stands for in the query being answered (VitaSurf): the
+   element asked, a document's root element, or a fragment or shadow
+   root, the virtual scope the DOM gives them. It matched every element,
+   so ":scope > p" found every p below. */
+var SCOPE=null;
+function scopeOf(n){return n&&n.nodeType===9?n.documentElement:n;}
+function scopeOnly(q){return !q.tag&&!q.id&&!q.classes.length&&!q.attrs.length&&
+ q.pseudos.length===1&&q.pseudos[0].name==='scope';}
+function matchSimple(el,q){if(el.nodeType!==1)return el===SCOPE&&scopeOnly(q);
  if(q.tag){var ns=el.namespaceURI;
   if(ns===null||ns===undefined||ns===HTML_NS){
    if(el.tagName!==q.tagUpper)return false;
@@ -543,10 +551,10 @@ function matchAt(el,parts,i){
  if(!matchSimple(el,parts[i].sel))return false;
  if(i===0)return true;
  var comb=parts[i].comb,n;
- if(comb==='>'){n=el.parentNode;return !!n&&n.nodeType===1&&matchAt(n,parts,i-1);}
+ if(comb==='>'){n=el.parentNode;return !!n&&(n.nodeType===1||n===SCOPE)&&matchAt(n,parts,i-1);}
  if(comb==='+'){n=prevEl(el);return !!n&&matchAt(n,parts,i-1);}
  if(comb==='~'){for(n=prevEl(el);n;n=prevEl(n))if(matchAt(n,parts,i-1))return true;return false;}
- for(n=el.parentNode;n&&n.nodeType===1;n=n.parentNode)if(matchAt(n,parts,i-1))return true;
+ for(n=el.parentNode;n&&(n.nodeType===1||n===SCOPE);n=n.parentNode)if(matchAt(n,parts,i-1))return true;
  return false;}
 /* A selector becomes a list of groups, each a list of compounds carrying
    the combinator that joins it to the one before. The combinator used to
@@ -653,6 +661,7 @@ function walkElements(root,out){var c=root.childNodes,i;
  return out;}
 function select(root,sel,all){
  var groups=compile(String(sel)),out=[];
+ SCOPE=scopeOf(root);
  if(!groups.length)return out;
  var live=isPageRoot(root)||inDocument(root);
  /* one group ending in an id: ask the document directly */
@@ -682,13 +691,14 @@ function matchesAny(el,groups){
  return false;}
 P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){
  var f=tagFast(this,sel,0);if(f!==undefined)return f;
- selCount(4);return matchesAny(this,compile(String(sel)));};
+ selCount(4);SCOPE=this;return matchesAny(this,compile(String(sel)));};
 /* closest compiles once and walks up in place (VitaSurf); it called
    matches per ancestor, a cache lookup and a crossing into C each. A
    bare tag -- closest('details'), GitHub's components asking for their
    own element -- is walked in C without a wrapper per ancestor. */
 P.closest=function(sel){
  var groups=compile(String(sel)),n=this,steps=0;
+ SCOPE=this;
  if(groups.bare&&typeof NV.__vitaClosestTag==='function')
   return NV.__vitaClosestTag(this,groups.bare.tag,groups.bare.tagUpper);
  while(n&&n.nodeType===1){steps++;if(matchesAny(n,groups)){selCount(5,steps);return n;}n=n.parentNode;}

@@ -12216,6 +12216,8 @@ struct sel_compound {
 	/* :not() of a compound, each of which must not match (VitaSurf) */
 	struct sel_compound *nots;
 	int nnots;
+	/* :scope, the element the query was asked of (VitaSurf) */
+	bool scope;
 	char comb;		/**< joins it to the one before: ' ' > + ~ */
 };
 
@@ -12229,7 +12231,15 @@ struct sel_compiled {
 	char *text;
 	struct sel_group *groups;
 	int ngroups;		/**< -1: not one of ours */
+	bool uses_scope;	/**< some compound is :scope */
 };
+
+/*
+ * The element :scope stands for while a query is being answered
+ * (VitaSurf): the one it was asked of, or a document's root element.
+ * Matching runs no script, so one query is all there is at a time.
+ */
+static struct dom_node *sel_scope_el;
 
 #define SEL_CACHE_MAX 1024
 
@@ -12496,6 +12506,19 @@ static bool sel_parse_compound(const char **pp, const char *end,
 		c->attrs[c->nattrs++] = a;
 	}
 	/*
+	 * :scope (VitaSurf). jQuery from 3.6 asks an element's own find()
+	 * with ":scope " before the selector, and every such query went to
+	 * the prelude's matcher: one of Wikipedia's took 3.6 s there.
+	 */
+	while (end - p >= 6 && strncmp(p, ":scope", 6) == 0 &&
+	       (end - p == 6 || !((p[6] >= 'a' && p[6] <= 'z') ||
+				  (p[6] >= 'A' && p[6] <= 'Z') ||
+				  (p[6] >= '0' && p[6] <= '9') ||
+				  p[6] == '-' || p[6] == '_' || p[6] == '('))) {
+		c->scope = true;
+		p += 6;
+	}
+	/*
 	 * :not() of one compound (VitaSurf). GitHub asks
 	 * '[data-deferred-details-content-url]:not([data-details-no-preload-
 	 * on-hover])' of every element its selector observer sees, over
@@ -12603,6 +12626,22 @@ static struct sel_compiled *sel_parse(const char *text, size_t len)
 		while (p < end && sel_ws(*p)) p++;
 		if (p >= end) goto fail;	/* trailing comma */
 	}
+	{
+		int g, i, k;
+
+		for (g = 0; g < s->ngroups; g++) {
+			for (i = 0; i < s->groups[g].n; i++) {
+				const struct sel_compound *c =
+					&s->groups[g].parts[i];
+
+				if (c->scope) s->uses_scope = true;
+				for (k = 0; k < c->nnots; k++) {
+					if (c->nots[k].scope)
+						s->uses_scope = true;
+				}
+			}
+		}
+	}
 	return s;
 fail:
 	sel_free(s);
@@ -12674,6 +12713,8 @@ static bool sel_classes_interned(const struct sel_compound *c)
 static bool sel_match_compound(struct dom_node *n, const struct sel_compound *c)
 {
 	int i;
+
+	if (c->scope && n != sel_scope_el) return false;
 
 	if (c->tag != NULL) {
 		dom_string *local = NULL;
@@ -12948,6 +12989,32 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	}
 	s = sel_lookup(ctx, thread, argv[0], &failed);
 	if (failed) return JS_EXCEPTION;
+	/* what :scope stands for: the element asked, or a document's root
+	   element; a fragment's or shadow root's virtual scope is the
+	   prelude's to answer */
+	sel_scope_el = NULL;
+	if (s != NULL && s->ngroups >= 0 && s->uses_scope) {
+		dom_node_type type = 0;
+
+		dom_node_get_node_type(root, &type);
+		if (type == DOM_ELEMENT_NODE) {
+			sel_scope_el = root;
+		} else if (type == DOM_DOCUMENT_NODE) {
+			struct dom_element *de = NULL;
+
+			if (dom_document_get_document_element(
+				    (struct dom_document *) root, &de) ==
+			    DOM_NO_ERR && de != NULL) {
+				/* the document holds it while the query
+				   runs, which changes nothing */
+				sel_scope_el = (struct dom_node *) de;
+				dom_node_unref(de);
+			}
+		}
+		if (sel_scope_el == NULL) {
+			s = NULL;
+		}
+	}
 	if (s == NULL || s->ngroups < 0) {
 		uint64_t t0 = bind_now_us();
 		JSValue r = JS_Call(ctx, data[0], this_val, argc, argv);
