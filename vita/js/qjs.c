@@ -14148,6 +14148,53 @@ static bool style_memo_check(jsthread *thread)
 	return true;
 }
 
+/*
+ * The shadow roots whose sheets can style node and the elements above it
+ * (VitaSurf): each shadow tree on its way up to the document, and the
+ * shadow root of each element on that way that is a host, whose :host
+ * and ::slotted rules reach out to the host and its children. Returns
+ * how many, or -1 if there are more than max: then every tree's sheets
+ * are taken.
+ */
+#define STYLE_READ_SCOPES 32
+
+static int style_read_scopes(struct dom_node *node, void **out, int max)
+{
+	struct dom_node *n = dom_node_ref(node);
+	int count = 0, guard = 0;
+
+	while (n != NULL && guard++ < 4096) {
+		struct dom_node *up = NULL, *root, *host;
+
+		root = shadow_root_of(n);
+		if (root != NULL) {
+			dom_node_unref(root);
+			if (count == max) {
+				dom_node_unref(n);
+				return -1;
+			}
+			out[count++] = root;
+		}
+		dom_node_get_parent_node(n, &up);
+		dom_node_unref(n);
+		host = shadow_host_of(up);
+		if (host != NULL) {
+			if (count == max) {
+				dom_node_unref(host);
+				dom_node_unref(up);
+				return -1;
+			}
+			out[count++] = up;
+			dom_node_unref(up);
+			up = host;
+		}
+		n = up;
+	}
+	if (n != NULL)
+		dom_node_unref(n);
+	return count;
+}
+
 static const css_select_results *select_without_box(jsthread *thread,
 		struct dom_node *node)
 {
@@ -14161,6 +14208,7 @@ static const css_select_results *select_without_box(jsthread *thread,
 	bool stale = style_stale(thread);
 	bool have_layout = layout_current(thread) && !stale;
 	css_select_ctx *now = NULL, *kept_ctx = NULL;
+	bool lent = false;
 	uint64_t t0, t_ctx;
 	unsigned int css0, index0;
 	bool parent_from_box = false;
@@ -14235,16 +14283,22 @@ static const css_select_results *select_without_box(jsthread *thread,
 	index0 = vitasurf_ms_css_index;
 	/* the sheets as they are now, when the page's context is behind
 	 * them; lent to the selections below and put back after */
-	if (stale) {
-		now = html_select_ctx_now(htmlc);
+	if (stale || htmlc->select_ctx == NULL) {
+		/* only the trees that can style these elements */
+		void *scopes[STYLE_READ_SCOPES];
+		int n_scopes = style_read_scopes(node, scopes,
+				STYLE_READ_SCOPES);
+
+		now = n_scopes < 0 ? html_select_ctx_now(htmlc) :
+				html_select_ctx_for(htmlc, scopes,
+						(unsigned int) n_scopes);
 		if (now != NULL && now != htmlc->select_ctx) {
+			/* before conversion there is none to keep, and
+			 * html_select_style lends itself this one */
 			kept_ctx = htmlc->select_ctx;
 			htmlc->select_ctx = now;
+			lent = true;
 		}
-	} else if (htmlc->select_ctx == NULL) {
-		/* before conversion each selection lends itself the early
-		 * context; made here, it is timed as the context */
-		(void) html_select_ctx_early(htmlc);
 	}
 	t_ctx = now_ms();
 	for (i = depth - 1; i >= 0; i--) {
@@ -14274,7 +14328,7 @@ static const css_select_results *select_without_box(jsthread *thread,
 		res = got;
 		parent = got->styles[CSS_PSEUDO_ELEMENT_NONE];
 	}
-	if (kept_ctx != NULL)
+	if (lent)
 		htmlc->select_ctx = kept_ctx;
 	{
 		uint64_t t1 = now_ms();

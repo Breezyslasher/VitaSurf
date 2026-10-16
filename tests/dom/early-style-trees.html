@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<!--
+  Computed style before the first layout, in and around shadow trees
+  (VitaSurf).
+
+  A style read before the first layout builds a context from the sheets
+  of the trees that can style the elements it selects: the document's,
+  each shadow tree on the way up, and the shadow root of every host on
+  that way, whose :host and ::slotted rules reach out of it. The sheets
+  of other shadow trees are left out, so reddit.com's early reads no
+  longer parse and index every component's STYLE. Each line must say
+  PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Early style in shadow trees</title>
+<style>
+.doc { color: rgb(1, 0, 0) }
+x-card::part(label) { margin-left: 9px }
+</style></head>
+<body>
+<div id="plain" class="doc">plain</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function cs(el) { return getComputedStyle(el); }
+var hosts = [];
+function card(n, css) {
+  var h = document.createElement('x-card');
+  h.className = 'doc';
+  var r = h.attachShadow({ mode: 'open' });
+  r.innerHTML = '<style>' + css + '</style><span class="in" part="label">in ' + n +
+    '</span><slot></slot>';
+  var kid = document.createElement('b');
+  kid.className = 'kid';
+  kid.textContent = 'kid ' + n;
+  h.appendChild(kid);
+  document.body.appendChild(h);
+  hosts.push(h);
+  return h;
+}
+var a = card(0, '.in { color: rgb(0, 2, 0) } :host { padding-left: 3px } ::slotted(.kid) { margin-top: 4px }');
+var b = card(1, '.in { color: rgb(0, 0, 3) } :host { padding-left: 5px } ::slotted(.kid) { margin-top: 6px }');
+var ina = a.shadowRoot.querySelector('.in'), inb = b.shadowRoot.querySelector('.in');
+ok('a document rule styles a light element', cs(document.getElementById('plain')).color, 'rgb(1, 0, 0)');
+ok('a shadow tree\'s rule styles its own element', cs(ina).color, 'rgb(0, 2, 0)');
+ok('and another tree\'s its own', cs(inb).color, 'rgb(0, 0, 3)');
+ok('a document rule does not reach into a tree', cs(ina).color !== 'rgb(1, 0, 0)', true);
+ok(':host styles the host from inside', cs(a).paddingLeft, '3px');
+ok('each host by its own tree', cs(b).paddingLeft, '5px');
+ok('the host keeps the document\'s rules too', cs(b).color, 'rgb(1, 0, 0)');
+ok('::slotted styles a light child', cs(a.querySelector('.kid')).marginTop, '4px');
+ok('and the other host\'s child by its tree', cs(b.querySelector('.kid')).marginTop, '6px');
+ok('::part reaches in from the document', cs(inb).marginLeft, '9px');
+/* a tree inside a tree: the inner element sees its own tree's rules,
+   and the outer tree's ::part */
+var inner = document.createElement('x-inner');
+var ir = inner.attachShadow({ mode: 'open' });
+ir.innerHTML = '<style>i { color: rgb(0, 7, 7) }</style><i part="deep">deep</i>';
+b.shadowRoot.appendChild(inner);
+var st = document.createElement('style');
+st.textContent = 'x-inner::part(deep) { margin-left: 8px } x-inner { margin-top: 2px }';
+b.shadowRoot.appendChild(st);
+var deep = ir.querySelector('i');
+ok('a nested tree\'s rule styles its element', cs(deep).color, 'rgb(0, 7, 7)');
+ok('the enclosing tree\'s ::part reaches it', cs(deep).marginLeft, '8px');
+ok('the enclosing tree styles the inner host', cs(inner).marginTop, '2px');
+/* many trees, each read in turn after it is added */
+for (var i = 2; i < 40; i++) {
+  var h = card(i, '.in { color: rgb(' + i + ', 1, 1) } :host { padding-left: ' + i + 'px }');
+  if (cs(h.shadowRoot.querySelector('.in')).color !== 'rgb(' + i + ', 1, 1)' ||
+      cs(h).paddingLeft !== i + 'px') break;
+}
+ok('forty trees, each read as it is added', i, 40);
+ok('the first tree still reads its own after them', cs(ina).color, 'rgb(0, 2, 0)');
+ok('and the second', cs(inb).color, 'rgb(0, 0, 3)');
+a.shadowRoot.querySelector('style').textContent = '.in { color: rgb(0, 9, 0) }';
+ok('a tree\'s STYLE whose text changed is read as it is now', cs(ina).color, 'rgb(0, 9, 0)');
+ok('and its :host rule went with the old text', cs(a).paddingLeft, '0px');
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('early-style-trees: ' + l); });
+console.log('early-style-trees: done');
+</script>
+</body></html>
