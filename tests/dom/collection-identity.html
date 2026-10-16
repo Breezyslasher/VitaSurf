@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!--
+  getElementsByTagName and getElementsByClassName give the same live
+  collection for the same root and arguments, as Chrome does (VitaSurf).
+  Each call had made a new one, which walked the document again however
+  little had changed. The one collection must still follow the tree. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Collection identity</title></head>
+<body>
+<div id="a" class="x"><p>one</p></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+var a = document.getElementById('a');
+ok('the same tag twice is one collection', document.getElementsByTagName('p') === document.getElementsByTagName('p'), true);
+ok('the same class twice is one collection', document.getElementsByClassName('x') === document.getElementsByClassName('x'), true);
+ok('on an element too', a.getElementsByTagName('p') === a.getElementsByTagName('p'), true);
+ok('another tag is another', document.getElementsByTagName('p') !== document.getElementsByTagName('div'), true);
+ok('another root is another', document.getElementsByTagName('p') !== a.getElementsByTagName('p'), true);
+ok('a null namespace is not the string null',
+   document.getElementsByTagNameNS(null, 'p') !== document.getElementsByTagNameNS('null', 'p'), true);
+var ps = document.getElementsByTagName('p'), before = ps.length;
+var p = document.createElement('p');
+document.body.appendChild(p);
+ok('the shared collection follows an addition', document.getElementsByTagName('p').length, before + 1);
+ok('through either reference', ps.length, before + 1);
+p.remove();
+ok('and a removal', ps.length, before);
+var xs = document.getElementsByClassName('x'), had = xs.length;
+a.className = 'y';
+ok('a class collection follows an attribute write', xs.length, had - 1);
+a.className = 'x';
+ok('and back', document.getElementsByClassName('x').length, had);
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('collection-identity: ' + l); });
+console.log('collection-identity: done');
+</script>
+</body></html>

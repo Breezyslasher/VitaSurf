@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!--
+  What the parser adds between scripts is seen by the next one (VitaSurf).
+
+  The bindings keep their answers (getElementById's index and its misses,
+  live collections, a tag nothing has, document.baseURI, window.length)
+  until the tree changes. They had been let go at the start of every
+  script, since the parser adds nodes between scripts, and so every timer
+  and event walked the document again for what had not changed. libdom
+  now counts each change as it makes it, the parser's included, and the
+  answers are kept across scripts while nothing changes. A script that
+  asked before the parser added an element, an id, a base or a frame must
+  find it after. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Parser changes seen</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+var ps = document.getElementsByTagName('p');
+var early = {
+  id: document.getElementById('late'),
+  q: document.querySelector('.late'),
+  sec: document.getElementsByTagName('section').length,
+  ps: ps.length,
+  base: document.baseURI,
+  frames: window.length,
+  kids: document.body.children.length,
+  text: document.body.textContent.indexOf('added ' + 'later') >= 0
+};
+</script>
+<p id="late" class="late">added later</p>
+<section><p>two</p></section>
+<base href="https://example.invalid/dir/">
+<iframe srcdoc="<p>frame</p>"></iframe>
+<script>
+ok('an id the parser added after a miss', document.getElementById('late') !== null && early.id === null, true);
+ok('a class the parser added after a miss', document.querySelector('.late') !== null && early.q === null, true);
+ok('a tag nothing had before', document.getElementsByTagName('section').length, early.sec + 1);
+ok('a live collection grows', ps.length, early.ps + 2);
+ok('a base the parser added moves baseURI', document.baseURI, 'https://example.invalid/dir/');
+ok('it was the address before', early.base !== document.baseURI, true);
+ok('a frame the parser added is counted', window.length, early.frames + 1);
+ok('children counted again', document.body.children.length > early.kids, true);
+ok('text the parser added', document.body.textContent.indexOf('added ' + 'later') >= 0 && !early.text, true);
+var seen = { id: document.getElementById('late2'), ps: ps.length };
+setTimeout(function () {
+  ok('a timer sees what the parser added after the script before', document.getElementById('late2') !== null && seen.id === null, true);
+  ok('and the live collection with it', ps.length, seen.ps + 1);
+  var p = document.getElementById('late2');
+  p.id = 'renamed';
+  ok('an id changed from script is seen at once', document.getElementById('late2'), null);
+  setTimeout(function () {
+    ok('and in the next timer', document.getElementById('renamed') === p, true);
+    p.remove();
+    setTimeout(function () {
+      ok('a removal is seen in the next timer', document.getElementById('renamed'), null);
+      ok('and the collection shrinks', ps.length, seen.ps);
+      document.getElementById('out').textContent = out.join('\n');
+      out.forEach(function (l) { console.log('parser-changes-seen: ' + l); });
+      console.log('parser-changes-seen: done');
+    }, 0);
+  }, 0);
+}, 0);
+</script>
+<p id="late2">and later still</p>
+</body></html>

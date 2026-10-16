@@ -461,7 +461,7 @@ struct jsthread {
 	struct style_memo *style_memo;
 	uint16_t *style_memo_slots; /**< open addressing, 0 is empty */
 	uint32_t style_memo_n;
-	uint32_t style_memo_dom_gen, style_memo_css_gen;
+	uint32_t style_memo_dom_gen, style_memo_css_gen, style_memo_entry_gen;
 	uint32_t style_memo_sheets, style_memo_done;
 	const void *style_memo_ctx, *style_memo_layout;
 	uint32_t style_memo_hits, style_memo_selected, style_memo_ms;
@@ -2180,6 +2180,14 @@ static uint32_t vita_gens[2];
  * classes between lookups keeps its id index.
  */
 static uint32_t vita_id_gen;
+
+/*
+ * The script entries so far (VitaSurf). The tree's counters above move
+ * only when the tree does, libdom counting the parser's additions as it
+ * makes them; a selected style can also change with a layout or :hover
+ * between scripts, so the style memo is let go at each entry too.
+ */
+static uint32_t vita_entry_gen;
 
 /*
  * When each element's attributes last changed (VitaSurf). The prelude
@@ -8611,9 +8619,10 @@ static void begin_script(jsthread *thread, enum script_why why)
 			 why == SCRIPT_EVENT ? "script: an event" :
 			 why == SCRIPT_XHR ? "script: a fetch callback" :
 			 "script: a script element";
-	vita_dom_gen++;	/* the parser may have added nodes since */
-	vita_tree_gen++;
-	vita_id_gen++;
+	/* what the parser added since is counted by libdom as it adds
+	   it (dom_vita_set_generations); only what is not the tree, a
+	   layout or :hover, is counted here, for the style memo (VitaSurf) */
+	vita_entry_gen++;
 	script_entered_ms = now_ms();
 	bc_last_activity_ms = script_entered_ms;
 	rearm_deadline(thread);
@@ -14019,8 +14028,8 @@ static void sm_len_prop(JSContext *ctx, JSValue obj, const char *name,
  *
  * What was selected is kept, the element's and each ancestor's, until
  * anything selection reads changes: the tree or an attribute
- * (vita_dom_gen, which the start of every script bumps too, so a
- * layout or a :hover between scripts is seen), the sheets, or the box
+ * (vita_dom_gen), a script entry (vita_entry_gen, so a layout or a
+ * :hover between scripts is seen), the sheets, or the box
  * tree. Home Assistant's cards read theme colours from elements their
  * script has just made, getComputedStyle and then one getPropertyValue
  * per colour, and every read selected the whole chain again from the
@@ -14131,6 +14140,7 @@ static bool style_memo_check(jsthread *thread)
 			done++;
 	}
 	if (thread->style_memo_dom_gen != vita_dom_gen ||
+	    thread->style_memo_entry_gen != vita_entry_gen ||
 	    thread->style_memo_css_gen != htmlc->css_generation ||
 	    thread->style_memo_sheets != htmlc->stylesheet_count ||
 	    thread->style_memo_done != done ||
@@ -14139,6 +14149,7 @@ static bool style_memo_check(jsthread *thread)
 	    thread->style_memo_n + STYLE_MEMO_CHAIN > STYLE_MEMO_MAX) {
 		style_memo_free(thread);
 		thread->style_memo_dom_gen = vita_dom_gen;
+		thread->style_memo_entry_gen = vita_entry_gen;
 		thread->style_memo_css_gen = htmlc->css_generation;
 		thread->style_memo_sheets = htmlc->stylesheet_count;
 		thread->style_memo_done = done;
@@ -15284,6 +15295,22 @@ static JSValue win_vita_shadow_templates(JSContext *ctx,
 	(void)argc;
 	(void)argv;
 	return JS_NewUint32(ctx, dom_hubbub_shadow_templates);
+}
+
+/*
+ * __vitaParsedTemplates(): how many <template> elements the parsers have
+ * made (VitaSurf). The prelude empties every template into its content
+ * before each script the parser runs, and walked the whole document for
+ * them each time: Stack Overflow's 80 scripts walked 118,110 elements.
+ */
+static JSValue win_vita_parsed_templates(JSContext *ctx,
+					 JSValueConst this_val,
+					 int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	(void)argc;
+	(void)argv;
+	return JS_NewUint32(ctx, dom_hubbub_templates);
 }
 
 static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
@@ -18298,6 +18325,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaShadowTemplates",
 			  JS_NewCFunction(ctx, win_vita_shadow_templates,
 					  "__vitaShadowTemplates", 0));
+	JS_SetPropertyStr(ctx, global, "__vitaParsedTemplates",
+			  JS_NewCFunction(ctx, win_vita_parsed_templates,
+					  "__vitaParsedTemplates", 0));
 	JS_SetPropertyStr(ctx, global, "__vitaSetFocus",
 			  JS_NewCFunction(ctx, win_vita_set_focus,
 					  "__vitaSetFocus", 1));
@@ -18636,6 +18666,9 @@ void js_initialise(void)
 	 */
 	dom_event_set_window_hook(window_hook, NULL);
 	vitasurf_composed = composed_hook;
+	/* libdom counts its own changes into the counters the caches are
+	   kept by, the parser's included (VitaSurf) */
+	dom_vita_set_generations(&vita_dom_gen, &vita_tree_gen, &vita_id_gen);
 #ifdef QJS_VERSION_MAJOR
 	vita_log("qjs: QuickJS engine initialised (content handler %s), "
 		 "quickjs-ng %d.%d.%d%s, %s",

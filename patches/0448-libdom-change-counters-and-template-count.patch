@@ -1,0 +1,171 @@
+diff --git a/bindings/hubbub/parser.c b/bindings/hubbub/parser.c
+index 4b6e676..ac3bde2 100644
+--- a/bindings/hubbub/parser.c
++++ b/bindings/hubbub/parser.c
+@@ -63,6 +63,7 @@ struct dom_hubbub_parser {
+  * (VitaSurf): the client turns each into its parent's shadow root, as
+  * the HTML standard's parser does, before the next script runs. */
+ unsigned int dom_hubbub_shadow_templates;
++unsigned int dom_hubbub_templates;
+ 
+ /* Forward declaration to break reference loop */
+ /* prefix + ":" + local, for an attribute the tokeniser split apart */
+@@ -265,6 +266,10 @@ static hubbub_error create_element(void *parser, const hubbub_tag *tag,
+ 			goto clean1;
+ 	}
+ 
++	if (tag->ns == HUBBUB_NS_HTML && tag->name.len == 8 &&
++			memcmp(tag->name.ptr, "template", 8) == 0)
++		dom_hubbub_templates++;
++
+ 	if (!dom_parser->fragment && tag->ns == HUBBUB_NS_HTML &&
+ 			tag->name.len == 8 &&
+ 			memcmp(tag->name.ptr, "template", 8) == 0) {
+diff --git a/bindings/hubbub/parser.h b/bindings/hubbub/parser.h
+index ff42297..68eeff3 100644
+--- a/bindings/hubbub/parser.h
++++ b/bindings/hubbub/parser.h
+@@ -69,6 +69,10 @@ typedef struct dom_hubbub_parser_params {
+ /* <template shadowrootmode> elements document parsers have made, for
+  * the client to turn into shadow roots (VitaSurf) */
+ extern unsigned int dom_hubbub_shadow_templates;
++/* <template> elements of any kind document and fragment parsers have
++ * made, so the client looks for new ones only when there are some
++ * (VitaSurf) */
++extern unsigned int dom_hubbub_templates;
+ 
+ dom_hubbub_error dom_hubbub_parser_create(dom_hubbub_parser_params *params,
+ 		dom_hubbub_parser **parser,
+diff --git a/include/dom/core/node.h b/include/dom/core/node.h
+index 75c851e..02616b0 100644
+--- a/include/dom/core/node.h
++++ b/include/dom/core/node.h
+@@ -346,6 +346,17 @@ struct dom_node *dom_node_vita_find_tag(struct dom_node *root,
+ 		struct dom_node *after, lwc_string *tag, uint32_t *visits);
+ dom_string *dom_node_vita_local_name(struct dom_node *node);
+ 
++/*
++ * Counters a client's caches are kept by (VitaSurf): libdom adds one to
++ * `any` for every change to any tree, an attribute or a text, to `tree`
++ * and `id` as well when nodes go in, out or move, and to `id` when an
++ * attribute named id changes. NULL leaves one alone. The bindings had
++ * counted from the start of every script, since the parser adds nodes
++ * between them, and so every cache was let go at every timer, event and
++ * job whatever had changed.
++ */
++void dom_vita_set_generations(uint32_t *any, uint32_t *tree, uint32_t *id);
++
+ #define dom_node_get_attributes(n, r) dom_node_get_attributes( \
+ 		(dom_node *) (n), (struct dom_namednodemap **) (r))
+ 
+diff --git a/src/core/node.c b/src/core/node.c
+index 9f55986..3d6ff6a 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -1256,6 +1256,26 @@ dom_node *dom_node_vita_next_element(dom_node *root, dom_node *after)
+ 	return NULL;
+ }
+ 
++/* the client's counters, see dom_vita_set_generations (VitaSurf) */
++static uint32_t *vita_gen_any, *vita_gen_tree, *vita_gen_id;
++
++void dom_vita_set_generations(uint32_t *any, uint32_t *tree, uint32_t *id)
++{
++	vita_gen_any = any;
++	vita_gen_tree = tree;
++	vita_gen_id = id;
++}
++
++void _dom_vita_changed(bool tree, bool id)
++{
++	if (vita_gen_any != NULL)
++		(*vita_gen_any)++;
++	if (tree && vita_gen_tree != NULL)
++		(*vita_gen_tree)++;
++	if ((tree || id) && vita_gen_id != NULL)
++		(*vita_gen_id)++;
++}
++
+ dom_string *dom_node_vita_local_name(dom_node *node)
+ {
+ 	dom_node_internal *n = (dom_node_internal *) node;
+@@ -2342,6 +2362,8 @@ dom_exception _dom_node_attach_range(dom_node_internal *first,
+ 	bool success = true;
+ 	dom_node_internal *n;
+ 
++	_dom_vita_changed(true, false);
++
+ 	first->previous = previous;
+ 	last->next = next;
+ 
+@@ -2435,6 +2457,8 @@ dom_exception _dom_node_detach_range(dom_node_internal *first,
+ 	dom_node_internal *n;
+ 	dom_exception err = DOM_NO_ERR;
+ 
++	_dom_vita_changed(true, false);
++
+ 	if (first->previous != NULL)
+ 		first->previous->next = last->next;
+ 	else
+@@ -2482,6 +2506,8 @@ void _dom_node_replace(dom_node_internal *old,
+ 	dom_node_internal *first, *last;
+ 	dom_node_internal *n;
+ 
++	_dom_vita_changed(true, false);
++
+ 	if (replacement->type == DOM_DOCUMENT_FRAGMENT_NODE) {
+ 		first = replacement->first_child;
+ 		last = replacement->last_child;
+diff --git a/src/core/node.h b/src/core/node.h
+index 21629bc..cabcb5c 100644
+--- a/src/core/node.h
++++ b/src/core/node.h
+@@ -142,6 +142,10 @@ dom_exception _dom_node_get_owner_document(dom_node_internal *node,
+ dom_exception _dom_node_insert_before(dom_node_internal *node,
+ 		dom_node_internal *new_child, dom_node_internal *ref_child,
+ 		dom_node_internal **result);
++/* Count a change for the client's caches (VitaSurf): tree is true when
++ * nodes went in, out or moved, id when an attribute named id changed. */
++void _dom_vita_changed(bool tree, bool id);
++
+ dom_exception _dom_node_replace_child(dom_node_internal *node,
+ 		dom_node_internal *new_child, dom_node_internal *old_child,
+ 		dom_node_internal **result);
+diff --git a/src/events/dispatch.c b/src/events/dispatch.c
+index 6cd2dbb..72fdeb0 100644
+--- a/src/events/dispatch.c
++++ b/src/events/dispatch.c
+@@ -6,10 +6,12 @@
+  */
+ 
+ #include <assert.h>
++#include <strings.h>
+ 
+ #include "core/document.h"
+ #include "events/dispatch.h"
+ #include "events/mutation_event.h"
++#include "core/node.h"
+ 
+ #include "utils/utils.h"
+ 
+@@ -166,6 +168,11 @@ dom_exception __dom_dispatch_attr_modified_event(dom_document *doc,
+ {
+ 	struct dom_mutation_event *evt;
+ 	dom_string *type = NULL;
++
++	/* an id moves what getElementById finds (VitaSurf) */
++	_dom_vita_changed(false, attr_name != NULL &&
++			dom_string_byte_length(attr_name) == 2 &&
++			strncasecmp(dom_string_data(attr_name), "id", 2) == 0);
+ 	dom_exception err;
+ 
+ 	/*
+@@ -229,6 +236,8 @@ dom_exception __dom_dispatch_characterdata_modified_event(
+ 		dom_string *prev, dom_string *new, bool *success)
+ {
+ 	struct dom_mutation_event *evt;
++
++	_dom_vita_changed(false, false);
+ 	dom_string *type = NULL;
+ 	dom_exception err;
+ 

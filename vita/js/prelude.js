@@ -3611,6 +3611,9 @@ function sweepTemplates(){
    at only when there are new ones. One that cannot be attached (a host
    with a root already, or an element that takes none) stays a template. */
 var SH_TPL=NV.__vitaShadowTemplates,shTplSeen=0;
+/* every template the parsers have made, so that the sweep before each
+   script walks the document only when there is a new one (VitaSurf) */
+var ALL_TPL=NV.__vitaParsedTemplates,allTplSeen=-1;
 try{delete NV.__vitaShadowTemplates;}catch(e){}
 function declarativeShadows(root){
  var t=root.querySelectorAll('template[shadowrootmode]'),i;
@@ -3637,7 +3640,8 @@ function beforeScript(nested){
  if(!nested&&NV.__vitaSyncFrames)NV.__vitaSyncFrames();
  if(typeof SH_TPL==='function'&&(n=SH_TPL())!==shTplSeen){
   shTplSeen=n;declarativeShadows(D);}
- sweepTemplates();}
+ if(typeof ALL_TPL!=='function'||(n=ALL_TPL())!==allTplSeen){
+  allTplSeen=n;sweepTemplates();}}
 NV.__vitaBeforeScript=beforeScript;
 /* setHTMLUnsafe and parseHTMLUnsafe take declarative shadow roots too;
    innerHTML leaves them as templates */
@@ -9842,18 +9846,38 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
 /* getElementsByTagName and friends, made live. The C side does the tree
    walk; the collection calls it again whenever it is read. */
 (function(){
- function live(get,shapeOnly){
+ /* The same collection for the same root and arguments, as browsers
+    give (VitaSurf): document.getElementsByTagName('a') twice is one
+    object in Chrome. Each call had made a new one, so its answer, kept
+    until the tree changes, was walked for again at every call. */
+ var COLL=typeof WeakMap==='function'&&typeof Map==='function'?new WeakMap():null,
+     COLL_MAX=64;
+ function collKey(m,args){
+  var k=m,i;
+  for(i=0;i<args.length;i++)k+='\u0001'+(args[i]===null?'\u0002':String(args[i]));
+  return k;}
+ function live(get,shapeOnly,m){
   return function(){
-   var self=this,args=[].slice.call(arguments);
-   return liveCollection(function(){
-    return listOf(get.apply(self,args));},null,shapeOnly);};}
+   var self=this,args=[].slice.call(arguments),byRoot=null,key,c;
+   if(COLL!==null&&self!==null&&typeof self==='object'){
+    try{key=collKey(m,args);}catch(e){key=null;}
+    if(key!==null){
+     byRoot=COLL.get(self);
+     if(byRoot!==undefined&&(c=byRoot.get(key))!==undefined)return c;}}
+   c=liveCollection(function(){
+    return listOf(get.apply(self,args));},null,shapeOnly);
+   if(key!=null&&byRoot!==null){
+    if(byRoot===undefined){byRoot=new Map();COLL.set(self,byRoot);}
+    else if(byRoot.size>=COLL_MAX)byRoot.clear();
+    byRoot.set(key,c);}
+   return c;};}
  /* a tag name never changes, so a tag's collection only moves with the
     tree; a class or a name moves with attribute writes too */
  ['getElementsByTagName','getElementsByClassName','getElementsByName',
   'getElementsByTagNameNS'].forEach(function(m){
   var shapeOnly=m.indexOf('TagName')>0;
-  if(typeof P[m]==='function')P[m]=live(P[m],shapeOnly);
-  if(typeof D[m]==='function')D[m]=live(D[m],shapeOnly);});
+  if(typeof P[m]==='function')P[m]=live(P[m],shapeOnly,m);
+  if(typeof D[m]==='function')D[m]=live(D[m],shapeOnly,m);});
  /*
  * A DOM prototype chain with the shapes a framework looks for
  * (VitaSurf).

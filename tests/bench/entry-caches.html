@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+  Lookups repeated from timer to timer with nothing changed between them
+  (VitaSurf): getElementById of an id nothing has, a live collection's
+  length, a tag nothing has, document.baseURI and window.length, over
+  5000 elements, in 200 timers. The answers had been let go at the start
+  of every script, so every timer walked the document again for each.
+  Logs the time spent in the timers.
+-->
+<html><head><meta charset="utf-8"></head><body><script>
+var h = '';
+for (var i = 0; i < 2500; i++) h += '<div class="r' + (i % 40) + '"><span>s</span></div>';
+document.body.insertAdjacentHTML('beforeend', h);
+var spans = document.getElementsByTagName('span'), left = 200, n = 0, spent = 0;
+function step() {
+  var t0 = performance.now();
+  n += document.getElementById('nothing-has-this') ? 1 : 0;
+  n += spans.length;
+  n += document.getElementsByTagName('section').length;
+  n += document.baseURI.length + window.length;
+  spent += performance.now() - t0;
+  if (--left > 0) { setTimeout(step, 0); return; }
+  console.log('entry-caches: 200 timers spent ' + Math.round(spent) + ' ms ' + n);
+}
+setTimeout(step, 0);
+</script></body></html>
