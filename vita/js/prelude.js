@@ -6058,14 +6058,19 @@ function liveCollection(items,proto,shapeOnly){
  return new Proxy(base,{
   get:function(t,k,r){
    var i=indexKey(k),a;
-   if(i>=0){a=t.__vitaItems();return i<a.length?a[i]:undefined;}
+   /* this collection's own items, not looked up through it (VitaSurf):
+      a loop over a collection reads [i] and length at every step */
+   if(i>=0){a=cached();return i<a.length?a[i]:undefined;}
+   /* the length getter on the collection itself, which reads its
+      items there rather than through the proxy a second time */
+   if(k==='length')return Reflect.get(t,k,t);
    if(typeof k==='string'&&!(k in t)&&k!=='__vitaItems'){
     var n=t.namedItem?t.namedItem(k):null;
     if(n)return n;}
    return Reflect.get(t,k,r);},
   has:function(t,k){
    var i=indexKey(k);
-   if(i>=0)return i<t.__vitaItems().length;
+   if(i>=0)return i<cached().length;
    if(typeof k==='string'&&t.namedItem&&t.namedItem(k))return true;
    return Reflect.has(t,k);},
   set:function(t,k,v,r){

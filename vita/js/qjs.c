@@ -260,6 +260,11 @@ struct jsthread {
 	/** what window.location and document.location give (VitaSurf);
 	 * kept here rather than under a property a page could see */
 	JSValue location_obj;
+	/** location.href as last read, and the page address it was made
+	 * from, held (VitaSurf): document.baseURI reads it at every href
+	 * and src a page reads, and each read made the string again */
+	JSValue href_val;
+	nsurl *href_url;
 	/** what each kind of node inherits from, or JS_UNDEFINED */
 	JSValue node_protos[NP_COUNT];
 	struct jsthread *owner;   /**< the page's thread, for a worker */
@@ -7770,7 +7775,19 @@ static JSValue loc_get_href(JSContext *ctx, JSValueConst this_val)
 
 	(void)this_val;
 	if (page != NULL) {
-		return JS_NewString(ctx, shown_url(nsurl_access(page)));
+		/* the same address gives the same string (VitaSurf) */
+		if (page == thread->href_url &&
+		    !JS_IsUndefined(thread->href_val))
+			return JS_DupValue(ctx, thread->href_val);
+		r = JS_NewString(ctx, shown_url(nsurl_access(page)));
+		if (!JS_IsException(r)) {
+			JS_FreeValue(ctx, thread->href_val);
+			if (thread->href_url != NULL)
+				nsurl_unref(thread->href_url);
+			thread->href_val = JS_DupValue(ctx, r);
+			thread->href_url = nsurl_ref(page);
+		}
+		return r;
 	}
 
 	if (thread == NULL || thread->win == NULL) return JS_NewString(ctx, "");
@@ -19046,6 +19063,8 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 	ret->import_map = JS_UNINITIALIZED;
 	ret->natives = JS_UNDEFINED;
 	ret->location_obj = JS_UNDEFINED;
+	ret->href_val = JS_UNDEFINED;
+	ret->href_url = NULL;
 	{
 		int i;
 
@@ -19079,6 +19098,9 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 			 "thrown away");
 		JS_FreeValue(ret->ctx, ret->natives);
 		JS_FreeValue(ret->ctx, ret->location_obj);
+		JS_FreeValue(ret->ctx, ret->href_val);
+		if (ret->href_url != NULL)
+			nsurl_unref(ret->href_url);
 		node_protos_free(ret);
 		JS_FreeContext(ret->ctx);
 		free(ret);
@@ -19245,6 +19267,12 @@ nserror js_closethread(jsthread *thread)
 	JS_FreeValue(thread->ctx, thread->natives);
 	thread->natives = JS_UNDEFINED;
 	JS_FreeValue(thread->ctx, thread->location_obj);
+	JS_FreeValue(thread->ctx, thread->href_val);
+	thread->href_val = JS_UNDEFINED;
+	if (thread->href_url != NULL) {
+		nsurl_unref(thread->href_url);
+		thread->href_url = NULL;
+	}
 	thread->location_obj = JS_UNDEFINED;
 	node_protos_free(thread);
 	/*

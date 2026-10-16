@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+  Vite's module preloader, as nytimes.com runs it (VitaSurf): for each
+  module it scans every <link> the document has, from the last, for one
+  whose href is the module's, and adds a <link rel=modulepreload> when
+  none is. The collection is live, so each added link changes it. A third
+  of nytimes.com's script was this loop. The log line gives the time.
+-->
+<html><head></head><body><script>
+(function () {
+  var i, j, body = document.body, head = document.head;
+  for (i = 0; i < 1500; i++) {
+    var d = document.createElement('div');
+    d.className = 'c' + (i % 13);
+    d.appendChild(document.createElement('span'));
+    d.appendChild(document.createElement('a'));
+    body.appendChild(d);
+  }
+  for (i = 0; i < 120; i++) {
+    var l = document.createElement('link');
+    l.rel = i % 3 ? 'stylesheet' : 'preload';
+    l.href = '/assets/existing-' + i + '.css';
+    head.appendChild(l);
+  }
+  var deps = [];
+  for (i = 0; i < 250; i++) deps.push(new URL('/chunks/mod-' + (i % 180) + '.js', location.href).href);
+  var t0 = performance.now(), added = 0;
+  var links = document.getElementsByTagName('link');
+  deps.forEach(function (dep) {
+    for (var k = links.length - 1; k >= 0; k--) {
+      var link = links[k];
+      if (link.href === dep && (link.rel === 'modulepreload' || link.rel === 'stylesheet')) return;
+    }
+    var n = document.createElement('link');
+    n.rel = 'modulepreload';
+    n.href = dep;
+    head.appendChild(n);
+    added++;
+  });
+  console.log('preload-scan: ' + deps.length + ' modules, ' + added + ' links added, in ' +
+    Math.round(performance.now() - t0) + ' ms');
+})();
+</script></body></html>
