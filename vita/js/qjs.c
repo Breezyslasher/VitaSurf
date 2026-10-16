@@ -1047,6 +1047,70 @@ static void walk_cost_note(const char *kind, const char *what, size_t len,
 	if (from_top) e->from_top++;
 }
 
+/*
+ * Selectors the C engine could not take and the prelude's answered
+ * (VitaSurf), dearest first by time: Wikipedia's profile showed the
+ * prelude's matcher under querySelector and matches, and nothing said
+ * which selectors those were.
+ */
+#define SCRIPT_SEL_SLOTS 16
+static struct script_sel {
+	char what[64];
+	uint32_t calls, us;
+	bool used;
+} script_sels[SCRIPT_SEL_SLOTS];
+
+static void script_sel_note(const char *what, size_t len, uint32_t us)
+{
+	struct script_sel *e = NULL, *least = NULL;
+	unsigned i;
+
+	if (len >= sizeof(e->what)) len = sizeof(e->what) - 1;
+	for (i = 0; i < SCRIPT_SEL_SLOTS; i++) {
+		struct script_sel *c = &script_sels[i];
+
+		if (c->used && strncmp(c->what, what, len) == 0 &&
+		    c->what[len] == '\0') {
+			e = c;
+			break;
+		}
+		if (least == NULL || !c->used ||
+		    (least->used && c->us < least->us)) least = c;
+	}
+	if (e == NULL) {
+		if (least->used && least->us >= us) return;
+		e = least;
+		memcpy(e->what, what, len);
+		e->what[len] = '\0';
+		e->calls = e->us = 0;
+		e->used = true;
+	}
+	e->calls++;
+	e->us += us;
+}
+
+static int script_sel_cmp(const void *a, const void *b)
+{
+	const struct script_sel *x = a, *y = b;
+
+	return x->us < y->us ? 1 : x->us > y->us ? -1 : 0;
+}
+
+static void script_sel_report(void)
+{
+	unsigned i;
+
+	qsort(script_sels, SCRIPT_SEL_SLOTS, sizeof(script_sels[0]),
+	      script_sel_cmp);
+	for (i = 0; i < 6 && script_sels[i].used &&
+		    script_sels[i].us >= 50000; i++) {
+		vita_log("qjs: selector '%s' answered in script, %u calls, "
+			 "%u ms", script_sels[i].what, script_sels[i].calls,
+			 script_sels[i].us / 1000);
+	}
+	memset(script_sels, 0, sizeof(script_sels));
+}
+
 static struct dom_document *thread_document(jsthread *thread);
 static void ws_report(void);
 /* what a frozen page held back, for the log (VitaSurf) */
@@ -1085,6 +1149,7 @@ static void walk_cost_report(void)
 {
 	unsigned i;
 
+	script_sel_report();
 	qsort(walk_costs, WALK_COST_SLOTS, sizeof(walk_costs[0]),
 	      walk_cost_cmp);
 	for (i = 0; i < 8 && walk_costs[i].kind != NULL &&
@@ -12884,7 +12949,17 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	s = sel_lookup(ctx, thread, argv[0], &failed);
 	if (failed) return JS_EXCEPTION;
 	if (s == NULL || s->ngroups < 0) {
-		return JS_Call(ctx, data[0], this_val, argc, argv);
+		uint64_t t0 = bind_now_us();
+		JSValue r = JS_Call(ctx, data[0], this_val, argc, argv);
+		size_t len = 0;
+		const char *text = JS_ToCStringLen(ctx, &len, argv[0]);
+
+		if (text != NULL) {
+			script_sel_note(text, len,
+					(uint32_t) (bind_now_us() - t0));
+			JS_FreeCString(ctx, text);
+		}
+		return r;
 	}
 	vitasurf_js_sel_tag_fast++;
 	switch (magic) {

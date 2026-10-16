@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!--
+  :nth-child and its relatives after the tree changes (VitaSurf).
+
+  The prelude's selector engine keeps each element's place among its
+  siblings while the tree keeps its shape, where it counted the siblings
+  before it for every element it tested. A place kept past a change would
+  answer for the old tree, so each query here follows an insertion, a
+  removal or a move. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>nth-child places</title></head>
+<body>
+<ul id="l"><li id="a">a</li><li id="b">b</li><p id="p">p</p><li id="c">c</li><li id="d">d</li></ul>
+<pre id="out"></pre>
+<script>
+var out = [], l = document.getElementById('l');
+function ids(sel) { return [].map.call(l.querySelectorAll(sel), function (e) { return e.id; }).join(); }
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+ok('nth-child(2)', ids(':scope > :nth-child(2)'), 'b');
+ok('nth-child(odd)', ids(':scope > :nth-child(odd)'), 'a,p,d');
+ok('nth-last-child(1)', ids(':scope > :nth-last-child(1)'), 'd');
+ok('nth-of-type(3)', ids('li:nth-of-type(3)'), 'c');
+ok('nth-last-of-type(2)', ids('li:nth-last-of-type(2)'), 'c');
+var z = document.createElement('li'); z.id = 'z';
+l.insertBefore(z, l.firstChild);
+ok('after one is put first, nth-child(2)', ids(':scope > :nth-child(2)'), 'a');
+ok('and nth-of-type(3)', ids('li:nth-of-type(3)'), 'b');
+ok('and nth-last-child(1) as before', ids(':scope > :nth-last-child(1)'), 'd');
+l.removeChild(document.getElementById('p'));
+ok('after the p is removed, nth-child(odd)', ids(':scope > :nth-child(odd)'), 'z,b,d');
+l.appendChild(document.getElementById('a'));
+ok('after one is moved to the end, nth-last-child(1)', ids(':scope > :nth-last-child(1)'), 'a');
+ok('and nth-child(2)', ids(':scope > :nth-child(2)'), 'b');
+document.getElementById('b').setAttribute('data-x', '1');
+ok('an attribute write changes no place', ids(':scope > :nth-child(2)'), 'b');
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (x) { console.log('nth-child-places: ' + x); });
+console.log('nth-child-places: done');
+</script>
+</body></html>

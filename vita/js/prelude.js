@@ -410,9 +410,30 @@ function classSet(el){
  return cn?String(cn).split(CLASS_WS).filter(function(x){return x!=='';}):[];}
 function prevEl(n){for(n=n.previousSibling;n;n=n.previousSibling)if(n.nodeType===1)return n;return null;}
 function nextEl(n){for(n=n.nextSibling;n;n=n.nextSibling)if(n.nodeType===1)return n;return null;}
-function elIndex(el){var i=1,n=prevEl(el);while(n){i++;n=prevEl(n);}return i;}
-function elIndexEnd(el){var i=1,n=nextEl(el);while(n){i++;n=nextEl(n);}return i;}
-function typeIndex(el,back){var i=1,n=back?nextEl(el):prevEl(el);
+/* An element's place among its siblings, kept while the tree keeps its
+   shape (VitaSurf): each was counted by walking every sibling before it,
+   so :nth-child over a list of 3000 walked four and a half million
+   siblings a query, and a page's querySelectorAll ran out its time. A
+   place is found from the nearest sibling already placed. */
+var IDX={g:-2,c:null,ce:null,t:null,te:null};
+function idxMaps(){var g=treeGen();if(g<0)return null;
+ if(g!==IDX.g){IDX.g=g;IDX.c=new WeakMap();IDX.ce=new WeakMap();IDX.t=new WeakMap();IDX.te=new WeakMap();}
+ return IDX;}
+function anyEl(){return true;}
+function sameType(n,el){return n.tagName===el.tagName;}
+function placeOf(el,map,step,same){
+ var path=[],n=el,i=0,v;
+ while(n){v=map.get(n);if(v!==undefined){i=v;break;}path.push(n);
+  do{n=step(n);}while(n&&!same(n,el));}
+ for(var k=path.length-1;k>=0;k--)map.set(path[k],++i);
+ return i;}
+function elIndex(el){var m=idxMaps();if(m)return placeOf(el,m.c,prevEl,anyEl);
+ var i=1,n=prevEl(el);while(n){i++;n=prevEl(n);}return i;}
+function elIndexEnd(el){var m=idxMaps();if(m)return placeOf(el,m.ce,nextEl,anyEl);
+ var i=1,n=nextEl(el);while(n){i++;n=nextEl(n);}return i;}
+function typeIndex(el,back){var m=idxMaps();
+ if(m)return placeOf(el,back?m.te:m.t,back?nextEl:prevEl,sameType);
+ var i=1,n=back?nextEl(el):prevEl(el);
  while(n){if(n.tagName===el.tagName)i++;n=back?nextEl(n):prevEl(n);}return i;}
 /* an+b, and the odd and even that stand for 2n+1 and 2n. */
 function nthOk(arg,i){
