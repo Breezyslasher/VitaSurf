@@ -1,0 +1,187 @@
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index 7a11c205f..9532fad9c 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -536,6 +536,8 @@ static void fb_aa_segment(float *cov, int w, int h, float ox, float oy,
+ {
+ 	float dx = b.x - a.x, dy = b.y - a.y;
+ 	float l2 = dx * dx + dy * dy, na = 1, nb = 0;
++	/* no pixel whose centre is farther than this is covered */
++	float reach = hw + 1;
+ 	int x0 = (int)floorf((a.x < b.x ? a.x : b.x) - hw - 1 - ox);
+ 	int x1 = (int)ceilf((a.x > b.x ? a.x : b.x) + hw + 1 - ox);
+ 	int y0 = (int)floorf((a.y < b.y ? a.y : b.y) - hw - 1 - oy);
+@@ -561,8 +563,42 @@ static void fb_aa_segment(float *cov, int w, int h, float ox, float oy,
+ 	if (y1 > h) y1 = h;
+ 	for (y = y0; y < y1; y++) {
+ 		float py = oy + y + 0.5f;
++		float ta, tb, xa, xb;
++		int rx0 = x0, rx1 = x1;
+ 
+-		for (x = x0; x < x1; x++) {
++		/*
++		 * Only pixels whose centres lie within reach of a point of
++		 * the segment are covered, so only those near the part of
++		 * it within reach of this row are looked at: a long diagonal
++		 * had every pixel of its bounding box measured.
++		 */
++		if (dy != 0) {
++			ta = (py - reach - a.y) / dy;
++			tb = (py + reach - a.y) / dy;
++			if (ta > tb) {
++				float t = ta;
++
++				ta = tb;
++				tb = t;
++			}
++			if (ta < 0) ta = 0;
++			if (tb > 1) tb = 1;
++			if (ta > tb)
++				continue;
++			xa = a.x + ta * dx;
++			xb = a.x + tb * dx;
++			if (xa > xb) {
++				float t = xa;
++
++				xa = xb;
++				xb = t;
++			}
++			rx0 = (int)ceilf(xa - reach - ox - 0.5f);
++			rx1 = (int)floorf(xb + reach - ox - 0.5f) + 1;
++			if (rx0 < x0) rx0 = x0;
++			if (rx1 > x1) rx1 = x1;
++		}
++		for (x = rx0; x < rx1; x++) {
+ 			float px = ox + x + 0.5f;
+ 			float u = 0, ex, ey, d, c;
+ 
+@@ -611,11 +647,37 @@ static void fb_aa_span(float *row, int w, float xa, float xb, float wt)
+ 		row[i1] += (xb - i1) * wt;
+ }
+ 
+-/** Cover what the path fills, by the nonzero rule. */
++/** An edge of a fill: x at its top, how x moves a unit down, and
++ * which way it runs. It crosses the sub-rows from y0 up to y1. */
++struct fb_aa_edge {
++	float y0, y1, x0, dxdy;
++	int dir;
++};
++static struct fb_aa_edge *fb_aa_edges;
++static int *fb_aa_act;
++static int fb_aa_edges_cap;
++
++static int fb_aa_edge_cmp(const void *a, const void *b)
++{
++	float d = ((const struct fb_aa_edge *)a)->y0 -
++			((const struct fb_aa_edge *)b)->y0;
++
++	return (d > 0) - (d < 0);
++}
++
++/**
++ * Cover what the path fills, by the nonzero rule.
++ *
++ * The edges are sorted by their tops, and each sub-row looks only at
++ * the edges it crosses: every edge had been tried at every sub-row,
++ * and a screen-sized illustration of a few thousand points took a
++ * few hundred milliseconds a redraw on the Vita.
++ */
+ static bool fb_aa_fill(float *cov, int w, int h, float ox, float oy,
+ 		int npts, int nsub)
+ {
+-	int y, k, s;
++	float first = oy + 0.125f, last = oy + h - 0.125f;
++	int y, k, s, ne = 0, next = 0, nact = 0;
+ 
+ 	if (fb_aa_cross_cap < npts + nsub) {
+ 		float *c = realloc(fb_aa_cross,
+@@ -631,29 +693,72 @@ static bool fb_aa_fill(float *cov, int w, int h, float ox, float oy,
+ 		fb_aa_dir = d;
+ 		fb_aa_cross_cap = npts + nsub;
+ 	}
++	if (fb_aa_edges_cap < npts + nsub) {
++		struct fb_aa_edge *e = realloc(fb_aa_edges,
++				(npts + nsub) * sizeof(*e));
++		int *a;
++
++		if (e == NULL)
++			return false;
++		fb_aa_edges = e;
++		a = realloc(fb_aa_act, (npts + nsub) * sizeof(*a));
++		if (a == NULL)
++			return false;
++		fb_aa_act = a;
++		fb_aa_edges_cap = npts + nsub;
++	}
++	for (s = 0; s < nsub; s++) {
++		int a, b, i;
++
++		fb_aa_sub(s, nsub, npts, &a, &b);
++		/* every subpath is filled as closed */
++		for (i = a; i < b; i++) {
++			struct fb_aa_pt p0 = fb_aa_pts[i];
++			struct fb_aa_pt p1 = fb_aa_pts[(i + 1 < b) ? i + 1 : a];
++			struct fb_aa_pt t = p0, u = p1;
++			struct fb_aa_edge *e;
++
++			if (p0.y == p1.y)
++				continue;
++			if (p1.y < p0.y) {
++				t = p1;
++				u = p0;
++			}
++			/* a sub-row at sy crosses it when t.y <= sy < u.y */
++			if (u.y <= first || t.y > last)
++				continue;
++			e = &fb_aa_edges[ne++];
++			e->y0 = t.y;
++			e->y1 = u.y;
++			e->x0 = t.x;
++			e->dxdy = (u.x - t.x) / (u.y - t.y);
++			e->dir = (p1.y > p0.y) ? 1 : -1;
++		}
++	}
++	if (ne == 0)
++		return true;
++	qsort(fb_aa_edges, ne, sizeof(*fb_aa_edges), fb_aa_edge_cmp);
++
+ 	for (y = 0; y < h; y++) {
+ 		for (k = 0; k < 4; k++) {
+ 			float sy = oy + y + (k + 0.5f) / 4;
+ 			int nc = 0, i, j, wind;
+ 
+-			for (s = 0; s < nsub; s++) {
+-				int a, b;
+-
+-				fb_aa_sub(s, nsub, npts, &a, &b);
+-				/* every subpath is filled as closed */
+-				for (i = a; i < b; i++) {
+-					struct fb_aa_pt p0 = fb_aa_pts[i];
+-					struct fb_aa_pt p1 = fb_aa_pts[
+-						(i + 1 < b) ? i + 1 : a];
+-
+-					if ((p0.y <= sy) == (p1.y <= sy))
+-						continue;
+-					fb_aa_cross[nc] = p0.x + (sy - p0.y) *
+-						(p1.x - p0.x) / (p1.y - p0.y);
+-					fb_aa_dir[nc] = (p1.y > p0.y) ? 1 : -1;
+-					nc++;
+-				}
++			while (next < ne && fb_aa_edges[next].y0 <= sy)
++				fb_aa_act[nact++] = next++;
++			/* the edges still crossed, and where */
++			for (i = 0, j = 0; i < nact; i++) {
++				const struct fb_aa_edge *e =
++						&fb_aa_edges[fb_aa_act[i]];
++
++				if (e->y1 <= sy)
++					continue;
++				fb_aa_act[j++] = fb_aa_act[i];
++				fb_aa_cross[nc] = e->x0 + (sy - e->y0) * e->dxdy;
++				fb_aa_dir[nc] = e->dir;
++				nc++;
+ 			}
++			nact = j;
+ 			/* a few crossings a row: insertion sort */
+ 			for (i = 1; i < nc; i++) {
+ 				float cx = fb_aa_cross[i];

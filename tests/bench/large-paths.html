@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!--
+  A screen-sized illustration of many shapes (VitaSurf).
+
+  An SVG of 60 filled and stroked shapes, some 2400 points once its
+  curves are flattened, drawn at 900x440. The log's "draw:" lines give
+  the time its paths take ("paths N in M ms"). Each sub-row of a fill
+  had tried every edge of the path (Reddit's login page spent 440 ms
+  of every redraw on two paths on the Vita); now each looks only at
+  the edges it crosses, and a stroke's segment only at the pixels near
+  it. Natively, with the plotter alone, this picture's fill went from
+  14.7 ms to 2.4 ms.
+-->
+<html><head><meta charset="utf-8"><title>Large paths</title>
+<style>body { margin: 0 } img { display: block; width: 900px; height: 440px }</style>
+</head><body>
+<img id="art" alt="">
+<script>
+var d = [];
+for (var k = 0; k < 60; k++) {
+  var cx = 40 + (k % 10) * 90, cy = 40 + Math.floor(k / 10) * 70, r = 30, c = 0.5523 * r;
+  d.push('<path fill="hsl(' + (k * 37 % 360) + ',60%,55%)" stroke="#203040" stroke-width="2" d="M' + (cx + r) + ' ' + cy +
+    ' C' + (cx + r) + ' ' + (cy + c) + ' ' + (cx + c) + ' ' + (cy + r) + ' ' + cx + ' ' + (cy + r) +
+    ' C' + (cx - c) + ' ' + (cy + r) + ' ' + (cx - r) + ' ' + (cy + c) + ' ' + (cx - r) + ' ' + cy +
+    ' C' + (cx - r) + ' ' + (cy - c) + ' ' + (cx - c) + ' ' + (cy - r) + ' ' + cx + ' ' + (cy - r) +
+    ' C' + (cx + c) + ' ' + (cy - r) + ' ' + (cx + r) + ' ' + (cy - c) + ' ' + (cx + r) + ' ' + cy + ' Z');
+  for (var j = 0; j < 30; j++)
+    d.push((j ? ' L' : ' M') + (cx + 35 + 5 * Math.cos(j * 0.2)).toFixed(2) + ' ' + (cy + 5 * Math.sin(j * 0.2) + j).toFixed(2));
+  d.push(' Z"/>');
+}
+document.getElementById('art').src = 'data:image/svg+xml,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="440" viewBox="0 0 900 440">' + d.join('') + '</svg>');
+</script>
+</body></html>
