@@ -1,0 +1,189 @@
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index cd867c89d..15cf011b0 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -6495,11 +6495,143 @@ static bool html_box_culled(const html_content *html, const struct box *box,
+ 			y1 <= clip->y0 || y0 >= clip->y1;
+ }
+ 
++/*
++ * The boxes a slow redraw spent its time in (VitaSurf). The page's
++ * redraw reports its plot calls, and apple.com spent 1.6 s a redraw of
++ * which they were 35 ms, with nothing to say where the rest went. Each
++ * box's own time, less its children's, is kept for the three that took
++ * longest, and a page redraw over 300 ms names them with what they
++ * paint.
++ */
++#define HTML_SLOW_BOXES 3
++static struct html_slow_box {
++	const struct box *box;
++	uint64_t us;
++} html_slow_boxes[HTML_SLOW_BOXES];
++static uint64_t html_slow_child_us;
++static bool html_slow_timing;
++
++static bool html_redraw_box_work(const html_content *html, struct box *box,
++		int x_parent, int y_parent,
++		const struct rect *clip, const float scale,
++		colour current_background_color,
++		const struct redraw_context *ctx);
++
++/** Keep a box among the slowest of this redraw. */
++static void html_slow_note(const struct box *box, uint64_t us)
++{
++	int i, k = -1;
++
++	for (i = 0; i < HTML_SLOW_BOXES; i++) {
++		if (html_slow_boxes[i].box == box) {
++			html_slow_boxes[i].us += us;
++			return;
++		}
++		if (k < 0 || html_slow_boxes[i].us < html_slow_boxes[k].us)
++			k = i;
++	}
++	if (us > html_slow_boxes[k].us) {
++		html_slow_boxes[k].box = box;
++		html_slow_boxes[k].us = us;
++	}
++}
++
++/** What a box paints, for the log. */
++static void html_slow_describe(const struct box *box, char *buf, size_t len)
++{
++	const css_computed_style *st = box->style;
++	const struct box *named = box;
++	bool anonymous = false;
++	dom_string *name = NULL, *cls = NULL, *id = NULL;
++	lwc_string *spec = NULL;
++	lwc_string *img = NULL;
++	css_fixed op = INTTOFIX(1);
++	size_t at = 0;
++	int n;
++
++	/* a box of no element of its own, text or a line, is named by
++	 * the element it is in */
++	while (named->node == NULL && named->parent != NULL) {
++		named = named->parent;
++		anonymous = true;
++	}
++	if (named->node != NULL) {
++		dom_node_get_node_name(named->node, &name);
++		dom_element_get_attribute(named->node, corestring_dom_id, &id);
++		dom_element_get_attribute(named->node, corestring_dom_class,
++				&cls);
++	}
++	if (anonymous)
++		st = NULL;
++	n = snprintf(buf, len, "%s<%.*s%s%.*s%s%.40s> %dx%d",
++			anonymous ? "text in " : "",
++			name ? (int) dom_string_byte_length(name) : 3,
++			name ? dom_string_data(name) : "box",
++			id ? " #" : "",
++			id ? (int) dom_string_byte_length(id) : 0,
++			id ? dom_string_data(id) : "",
++			cls ? " ." : "",
++			cls ? dom_string_data(cls) : "",
++			box->padding[LEFT] + box->width + box->padding[RIGHT],
++			box->padding[TOP] + box->height + box->padding[BOTTOM]);
++	if (n > 0 && (size_t) n < len)
++		at = (size_t) n;
++	if (name) dom_string_unref(name);
++	if (id) dom_string_unref(id);
++	if (cls) dom_string_unref(cls);
++	if (st == NULL)
++		return;
++#define SLOW_FLAG(cond, word) do { \
++		if ((cond) && at < len) { \
++			n = snprintf(buf + at, len - at, " %s", word); \
++			if (n > 0 && (size_t) n < len - at) at += (size_t) n; \
++		} } while (0)
++	SLOW_FLAG(css_computed_backdrop_filter(st, &spec) ==
++			CSS_BACKDROP_FILTER_SET && spec != NULL,
++			"backdrop-filter");
++	spec = NULL;
++	SLOW_FLAG(css_computed_filter(st, &spec) == CSS_FILTER_SET &&
++			spec != NULL, "filter");
++	SLOW_FLAG(css_computed_mix_blend_mode(st) !=
++			CSS_MIX_BLEND_MODE_NORMAL, "blend");
++	SLOW_FLAG(css_computed_background_image(st, &img) ==
++			CSS_BACKGROUND_IMAGE_IMAGE && img != NULL,
++			"background-image");
++	SLOW_FLAG(box->object != NULL, "object");
++	SLOW_FLAG(css_computed_opacity(st, &op) == CSS_OPACITY_SET &&
++			op < INTTOFIX(1), "opacity");
++#undef SLOW_FLAG
++}
++
+ bool html_redraw_box(const html_content *html, struct box *box,
+ 		int x_parent, int y_parent,
+ 		const struct rect *clip, const float scale,
+ 		colour current_background_color,
+ 		const struct redraw_context *ctx)
++{
++	uint64_t saved, t0, took;
++	bool ok;
++
++	if (!html_slow_timing)
++		return html_redraw_box_work(html, box, x_parent, y_parent,
++				clip, scale, current_background_color, ctx);
++	saved = html_slow_child_us;
++	html_slow_child_us = 0;
++	t0 = vitasurf_clock_us();
++	ok = html_redraw_box_work(html, box, x_parent, y_parent, clip, scale,
++			current_background_color, ctx);
++	took = vitasurf_clock_us() - t0;
++	if (took > html_slow_child_us)
++		html_slow_note(box, took - html_slow_child_us);
++	html_slow_child_us = saved + took;
++	return ok;
++}
++
++static bool html_redraw_box_work(const html_content *html, struct box *box,
++		int x_parent, int y_parent,
++		const struct rect *clip, const float scale,
++		colour current_background_color,
++		const struct redraw_context *ctx)
+ {
+ 	struct redraw_context fctx, tctx;
+ 	struct rect tclip;
+@@ -8177,11 +8309,38 @@ bool html_redraw(struct content *c, struct content_redraw_data *data,
+ 	if (html_redraw_nesting++ == 0) {
+ 		/* how long the page's own redraws take, beside the plot
+ 		 * calls they make (VitaSurf) */
+-		uint64_t t0 = vitasurf_clock_us();
++		uint64_t t0 = vitasurf_clock_us(), took;
+ 
++		memset(html_slow_boxes, 0, sizeof(html_slow_boxes));
++		html_slow_child_us = 0;
++		html_slow_timing = ctx->interactive;
+ 		result = html_redraw_content(c, data, clip, ctx);
+-		vitasurf_us_redraw_html += vitasurf_clock_us() - t0;
++		html_slow_timing = false;
++		took = vitasurf_clock_us() - t0;
++		vitasurf_us_redraw_html += took;
+ 		vitasurf_redraw_calls++;
++		if (ctx->interactive && took >= 300000) {
++			char d[HTML_SLOW_BOXES][200];
++			int i;
++
++			for (i = 0; i < HTML_SLOW_BOXES; i++) {
++				d[i][0] = '\0';
++				if (html_slow_boxes[i].box != NULL)
++					html_slow_describe(
++						html_slow_boxes[i].box,
++						d[i], sizeof(d[i]));
++			}
++			vita_log("draw: a redraw of the page took %u ms; the "
++				 "boxes it spent longest in, their own time: "
++				 "%s %u ms; %s %u ms; %s %u ms",
++				 (unsigned int) (took / 1000),
++				 d[0], (unsigned int)
++				 (html_slow_boxes[0].us / 1000),
++				 d[1], (unsigned int)
++				 (html_slow_boxes[1].us / 1000),
++				 d[2], (unsigned int)
++				 (html_slow_boxes[2].us / 1000));
++		}
+ 	} else {
+ 		result = html_redraw_content(c, data, clip, ctx);
+ 	}

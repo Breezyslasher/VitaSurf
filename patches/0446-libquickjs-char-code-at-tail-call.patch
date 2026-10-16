@@ -1,0 +1,24 @@
+diff --git a/quickjs.c b/quickjs.c
+index 39f0634..389a640 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -18556,7 +18556,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                  * which styled-components, reCAPTCHA and every
+                  * obfuscated decoder do. Anything else takes the call.
+                  */
+-                if (call_argc == 1 && opcode == OP_call_method &&
++                if (call_argc == 1 &&
+                     JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_INT &&
+                     JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                     (JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_STRING ||
+@@ -18586,6 +18586,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                         JS_FreeValue(ctx, call_argv[-1]);
+                         JS_FreeValue(ctx, call_argv[-2]);
+                         sp -= 3;
++                        /* return s.charCodeAt(i), a helper's whole
++                           body, is a tail call (VitaSurf) */
++                        if (opcode == OP_tail_call_method)
++                            goto done;
+                         *sp++ = ret_val;
+                         BREAK;
+                     }

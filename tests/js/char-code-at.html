@@ -2,7 +2,8 @@
 <!--
   str.charCodeAt(i) read in the interpreter (libquickjs patch 0429): the
   built-in itself, called as a method on a flat string, or a rope already
-  flattened, with an integer index. Everything else takes the call. Each
+  flattened, with an integer index, called or returned (a tail call,
+  patch 0446). Everything else takes the call. Each
   line must say PASS; the values are the specification's, as Chrome
   gives them.
 -->
@@ -46,6 +47,17 @@ ok('put back', 'q'.charCodeAt(0), 113);
 var thrown = false;
 try { f.call(null, 0); } catch (e) { thrown = e instanceof TypeError; }
 ok('on null it throws a TypeError', thrown, true);
+function viaHelper(a, b) { return a.charCodeAt(b); }
+function viaStrict(a, b) { 'use strict'; return a.charCodeAt(b); }
+ok('returned from a helper, a tail call', viaHelper('xyz', 1), 121);
+ok('a tail call past the end is NaN', viaHelper('xyz', 3), NaN);
+ok('in strict code too', viaStrict('xyz', 2), 122);
+var hsum = 0; for (i = 0; i < big.length; i++) hsum += viaHelper(big, i);
+ok('a tail call in a loop', hsum, sum);
+var keepCC = String.prototype.charCodeAt;
+String.prototype.charCodeAt = function () { return 9; };
+ok('a replaced method is called from a tail call', viaHelper('xyz', 0), 9);
+String.prototype.charCodeAt = keepCC;
 document.getElementById('out').textContent = out.join('\n');
 out.forEach(function (l) { console.log('char-code-at: ' + l); });
 console.log('char-code-at: done');
