@@ -3985,22 +3985,39 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   if(r===undefined){
    if(css.indexOf(MARK)>=0)r=null;
    else{
-    try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),MARK).split(MARK);}
+    try{r={parts:scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),MARK).split(MARK),
+     tag:null,text:null};}
     catch(x){r=null;}}
-   if(nscoped>=400||scopedChars+css.length>SCOPED_CHARS){
+   if(nscoped>=400||scopedChars+2*css.length>SCOPED_CHARS){
     scoped=Object.create(null);nscoped=0;scopedChars=0;}
-   scoped[css]=r;nscoped++;scopedChars+=css.length;}
+   scoped[css]=r;nscoped++;scopedChars+=2*css.length;}
   if(r===null){
    try{return scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}
    catch(x){return css;}}
-  return r.length===1?r[0]:r.join(tag);}
+  /* The text with the host put in is kept too, and handed out the same
+     string each time (VitaSurf): it is looked up by its text, and a new
+     string of a few hundred kilobytes is hashed whole at each lookup,
+     where the same string keeps what it was found as. */
+  if(r.tag!==tag){r.tag=tag;r.text=r.parts.length===1?r.parts[0]:r.parts.join(tag);}
+  return r.text;}
+ /* The large text the page last gave a style out of a shadow tree, and
+    the tree's generation then (VitaSurf). Lit writes a component's
+    sheet into a new <style> and then puts it in the shadow root, and
+    taking it there read the whole text back, a string made again of a
+    few hundred kilobytes for each component: reddit.com read 1108
+    texts, 3.8 s on the Vita. While nothing in the document has changed
+    since, the text is still what was given. */
+ var setText=new WeakMap();
  function take(host,n){
-  var css=n.textContent,sc;
+  var r=setText.get(n),g=domGen(),css,sc;
+  css=(r&&g>=0&&r.g===g)?r.v:n.textContent;
   if(!css)return;
   sc=scope(css,host,n);
-  if(sc!==css){css=sc;if(rawText)rawText.call(n,css);else n.textContent=css;}
-  if(live(css)){n.textContent='';park(n,css);return;}
-  keep(n,css);}
+  /* a copy already in the document: this one is emptied, without its
+     scoped text written first */
+  if(live(sc)){n.textContent='';park(n,sc);return;}
+  if(sc!==css){if(rawText)rawText.call(n,sc);else n.textContent=sc;}
+  keep(n,sc);}
  /* A <style> deeper in a shadow tree than the host's own children, or
   * one with attributes, an id say (VitaSurf). Neither was scoped, so its
   * rules reached the whole page: Bubble Card writes each card's own
@@ -4146,7 +4163,8 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    t.set.call(this,v);keep(this,v);return;}
   if(typeof v==='string'&&(p=this.parentNode)&&nested(p,this)){
    t.set.call(this,takeNested(owner(p),this,v));return;}
-  t.set.call(this,v);}});
+  t.set.call(this,v);
+  if(typeof v==='string'&&v.length>=4096&&!p)setText.set(this,{v:v,g:domGen()});}});
 })();
 /* Slots (VitaSurf). A host's own children are drawn only through a
  * <slot> in its shadow tree: the first whose name matches their slot
@@ -6728,8 +6746,23 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){
    reads from a <style> that is never put in the document; a shadow
    root's are a <style> inside it, which is scoped as its own are. */
 var adoptedOf=new WeakMap(),adoptEl=new WeakMap();
+/* The text of a list of sheets, the same string while they are the same
+   (VitaSurf): each component adopting a library's sheets had joined them
+   into a new string, which every lookup by text then hashed whole. */
+var adoptTexts=new Map(),adoptIds=new WeakMap(),adoptNext=0;
+function adoptText(list){
+ var key='',i,s,id,t;
+ if(list.length===1)return list[0]._text();
+ for(i=0;i<list.length;i++){s=list[i];id=adoptIds.get(s);
+  if(id===undefined){id=++adoptNext;adoptIds.set(s,id);}
+  key+=id+'.'+(s._ver|0)+(s.disabled?'d':'')+' ';}
+ t=adoptTexts.get(key);
+ if(t===undefined){
+  if(adoptTexts.size>=64)adoptTexts.clear();
+  t=list.map(function(s){return s._text();}).join('\n');adoptTexts.set(key,t);}
+ return t;}
 function adoptWrite(target){
- var list=adoptedOf.get(target)||[],text=list.map(function(s){return s._text();}).join('\n');
+ var list=adoptedOf.get(target)||[],text=adoptText(list);
  var el=adoptEl.get(target);
  if(target===D){
   /* marked so the engine keeps it in the cascade though it is not
@@ -6738,8 +6771,12 @@ function adoptWrite(target){
   if(NV.__vitaSetSheetText)try{NV.__vitaSetSheetText(el,text);}catch(e){}
  }else{
   if(!el){el=D.createElement('style');el.setAttribute('data-adopted','');adoptEl.set(target,el);}
-  el.textContent=text;
-  if(el.parentNode!==target)try{target.appendChild(el);}catch(e){}}}
+  /* in first and then given its text, which is scoped as it is set,
+     where the text written before had been read back and written again */
+  if(el.parentNode!==target){
+   if(el.firstChild)el.textContent='';
+   try{target.appendChild(el);}catch(e){}}
+  el.textContent=text;}}
 function adoptedAccessor(){return {configurable:true,
  get:function(){return (adoptedOf.get(this)||[]).slice();},
  set:function(v){var self=this,list=Array.prototype.slice.call(v||[]);

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<!--
+  Shadow trees' sheets after their text is reused (VitaSurf).
+
+  A shadow root's adopted sheets and its own <style> elements are kept
+  to their host, and the text each is given is now remembered rather
+  than read back: the sheets of a list are joined once while they are
+  the same, the text with its host put in is the same string each
+  time, and a <style> given its text before it goes into a shadow root
+  is taken by that text unless something in the document has changed
+  since. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Adopted text reuse</title></head>
+<body>
+<div id="hosts"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function pad(n) { var r = []; for (var i = 0; i < n; i++) r.push('.unused' + i + ' { margin: ' + (i % 7) + 'px }'); return r.join('\n'); }
+var big = pad(400);
+var a = new CSSStyleSheet(); a.replaceSync(big + '\n.t { color: rgb(200, 0, 0); }');
+var b = new CSSStyleSheet(); b.replaceSync(big + '\n.t { padding-left: 5px; }');
+var hosts = document.getElementById('hosts');
+function host(list, styleText, mutate) {
+  var h = document.createElement('div');
+  var r = h.attachShadow({ mode: 'open' });
+  if (list) r.adoptedStyleSheets = list;
+  if (styleText !== undefined) {
+    var st = document.createElement('style');
+    st.textContent = styleText;
+    if (mutate) mutate(st);
+    r.appendChild(st);
+  }
+  var t = document.createElement('span'); t.className = 't'; t.textContent = 'x';
+  r.appendChild(t);
+  hosts.appendChild(h);
+  return h;
+}
+function cs(h) { return getComputedStyle(h.shadowRoot.querySelector('.t')); }
+var h1 = host([a, b]), h2 = host([a, b]), h3 = host([b, a]);
+var h4 = host(null, big + '\n.t { color: rgb(0, 120, 0); }');
+var h5 = host(null, big + '\n.t { color: rgb(0, 120, 0); }');
+var h6 = host(null, big + '\n.t { color: rgb(0, 120, 0); }', function (st) {
+  st.firstChild.data = big + '\n.t { color: rgb(0, 0, 210); }';
+});
+var h7 = host(null, big + '\n.t { color: rgb(0, 120, 0); }', function (st) {
+  st.appendChild(document.createTextNode('\n.t { font-size: 31px; }'));
+});
+var h8 = host([a]);
+var outside = document.createElement('span'); outside.className = 't'; outside.textContent = 'o';
+document.body.appendChild(outside);
+addEventListener('load', function () {
+  ok('the first host adopting two sheets', cs(h1).color, 'rgb(200, 0, 0)');
+  ok('and both of them', cs(h1).paddingLeft, '5px');
+  ok('the second host adopting the same list', cs(h2).color, 'rgb(200, 0, 0)');
+  ok('a host adopting them the other way round', cs(h3).paddingLeft, '5px');
+  ok('a style given its text before going in', cs(h4).color, 'rgb(0, 120, 0)');
+  ok('a second style with the same text', cs(h5).color, 'rgb(0, 120, 0)');
+  ok('a style whose text node changed before it went in', cs(h6).color, 'rgb(0, 0, 210)');
+  ok('a style given more text before it went in', cs(h7).fontSize, '31px');
+  ok('a host adopting one sheet', cs(h8).color, 'rgb(200, 0, 0)');
+  ok('nothing reaches outside the trees', getComputedStyle(outside).color === 'rgb(200, 0, 0)', false);
+  a.replaceSync(big + '\n.t { color: rgb(10, 20, 30); }');
+  hosts.removeChild(h4);
+  setTimeout(function () {
+    ok('a changed sheet reaches the first host', cs(h1).color, 'rgb(10, 20, 30)');
+    ok('and the second', cs(h2).color, 'rgb(10, 20, 30)');
+    ok('and the host with one sheet', cs(h8).color, 'rgb(10, 20, 30)');
+    ok('the reversed list keeps its other sheet', cs(h3).paddingLeft, '5px');
+    ok('a style whose twin left keeps its rules', cs(h5).color, 'rgb(0, 120, 0)');
+    h2.shadowRoot.adoptedStyleSheets = [b];
+    setTimeout(function () {
+      ok('a host given a shorter list loses the sheet it dropped', cs(h2).color === 'rgb(10, 20, 30)', false);
+      ok('and keeps the one it kept', cs(h2).paddingLeft, '5px');
+      ok('the other hosts keep theirs', cs(h1).color, 'rgb(10, 20, 30)');
+      document.getElementById('out').textContent = out.join('\n');
+      out.forEach(function (l) { console.log('adopted-text-reuse: ' + l); });
+      console.log('adopted-text-reuse: done');
+    }, 700);
+  }, 700);
+});
+</script>
+</body></html>
