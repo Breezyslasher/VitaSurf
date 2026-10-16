@@ -419,6 +419,13 @@ struct jsthread {
 	struct js_deferred *deferred; /**< module scripts waiting on imports */
 	struct mod_deps *mod_deps[64]; /**< each module's imports, by URL */
 	struct sel_compiled *sel_cache[128]; /**< selectors answered in C */
+	/** queries of a root that found nothing, kept while the document is
+	 * as it was (VitaSurf): see sel_native */
+	struct sel_miss {
+		struct dom_node *root;
+		const struct sel_compiled *s;
+		uint32_t gen;
+	} sel_miss[16];
 	unsigned int sel_cache_n;
 	/*
 	 * The selectors last asked for, by the script's string itself
@@ -12315,6 +12322,8 @@ static void sel_cache_free(jsthread *thread)
 	unsigned b;
 
 	sel_recent_free(thread);
+	/* a selector freed here could be another's address next */
+	memset(thread->sel_miss, 0, sizeof(thread->sel_miss));
 
 	for (b = 0; b < 128; b++) {
 		while (thread->sel_cache[b] != NULL) {
@@ -12988,6 +12997,7 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	struct dom_node *root, *n = NULL;
 	struct sel_compiled *s = NULL;
 	const struct sel_compound *bare;
+	struct sel_miss *miss;
 	bool failed = false;
 	JSValue out = JS_NULL;
 	uint32_t out_n = 0, visits0;
@@ -13073,6 +13083,23 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	if (bare != NULL && tags_absent(thread, root, bare->tag_hash)) {
 		return out;
 	}
+	/*
+	 * A query of this root that found nothing, asked again with the
+	 * document as it was (VitaSurf). What is answered here reads only
+	 * the tree, names and attributes, never :hover or a form's state,
+	 * so nothing else can change the answer. cnn.com asked the whole
+	 * document for one class nothing had 132 times, 667,260 elements
+	 * walked, among 4.7 s of queries.
+	 */
+	miss = &thread->sel_miss[(((uintptr_t) root >> 4) ^
+				   ((uintptr_t) s >> 4)) &
+				  (sizeof(thread->sel_miss) /
+				   sizeof(thread->sel_miss[0]) - 1)];
+	if (miss->root == root && miss->s == s &&
+	    miss->gen == vita_dom_gen) {
+		vitasurf_js_sel_tag_absent++;
+		return out;
+	}
 	visits0 = vitasurf_js_sel_tag_visits;
 	/*
 	 * Tree order, root itself not a candidate, on borrowed nodes:
@@ -13118,6 +13145,11 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 		if (bare != NULL && out_n == 0 &&
 		    JS_IsNull(out) == (magic != 2)) {
 			tags_missed(thread, root);
+		}
+		if (out_n == 0 && JS_IsNull(out) == (magic != 2)) {
+			miss->root = root;
+			miss->s = s;
+			miss->gen = vita_dom_gen;
 		}
 	}
 	if (s->text != NULL) {

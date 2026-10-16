@@ -8813,7 +8813,18 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
 /* dataset was an empty object that never saw an attribute, so every
  * el.dataset.foo read undefined and every write went nowhere. It is a
  * live view of the data-* attributes. */
-function dataAttr(k){return 'data-'+String(k).replace(/[A-Z]/g,function(c){return '-'+c.toLowerCase();});}
+/* each name's attribute is worked out once (VitaSurf): every read of
+   el.dataset.x ran a replace with a function per capital, a fifth of
+   cnn.com's profile */
+var DATA_ATTR=Object.create(null),DATA_ATTR_N=0;
+function dataAttr(k){
+ k=String(k);
+ var a=DATA_ATTR[k];
+ if(a!==undefined)return a;
+ a=/[A-Z]/.test(k)?'data-'+k.replace(/[A-Z]/g,function(c){return '-'+c.toLowerCase();}):'data-'+k;
+ if(DATA_ATTR_N>=2000){DATA_ATTR=Object.create(null);DATA_ATTR_N=0;}
+ DATA_ATTR[k]=a;DATA_ATTR_N++;
+ return a;}
 function dataName(n){return n.slice(5).replace(/-([a-z])/g,function(_,c){return c.toUpperCase();});}
 function dataKeys(el){return attrList(el).filter(function(a){
  return a.name.indexOf('data-')===0;}).map(function(a){return dataName(a.name);});}

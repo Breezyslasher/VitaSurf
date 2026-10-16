@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<!--
+  A query that found nothing is answered again from memory while the
+  document is as it was, and found again once anything changes
+  (VitaSurf); and el.dataset's names are worked out once. Every change
+  that could make the query match must be seen: an element added, a class
+  or attribute set, an id changed, an element moved under the root. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Query miss memo</title></head>
+<body>
+<div id="root"><span class="a">a</span></div>
+<div id="other"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+var root = document.getElementById('root'), other = document.getElementById('other');
+function q(sel) { return root.querySelector(sel); }
+function qa(sel) { return root.querySelectorAll(sel).length; }
+ok('nothing at first', q('.b'), null);
+ok('nothing again', q('.b'), null);
+var b = document.createElement('i'); b.className = 'b'; root.appendChild(b);
+ok('an element added with the class is found', q('.b'), b);
+b.remove();
+ok('and gone once removed', q('.b'), null);
+var a = root.querySelector('.a');
+ok('an attribute nothing has', qa('[data-uri*="/c/"]'), 0);
+a.setAttribute('data-uri', '/c/1');
+ok('found once an element has it', qa('[data-uri*="/c/"]'), 1);
+a.setAttribute('data-uri', '/d/1');
+ok('lost when its value changes', qa('[data-uri*="/c/"]'), 0);
+ok('a class nothing has', q('span.x'), null);
+a.classList.add('x');
+ok('found once the class is added', q('span.x'), a);
+ok('an id nothing has', q('#late'), null);
+a.id = 'late';
+ok('found once the id is set', q('#late'), a);
+ok('another root keeps its own answer', other.querySelector('#late'), null);
+var moved = document.createElement('b'); moved.className = 'm'; other.appendChild(moved);
+ok('not under the root', q('.m'), null);
+root.appendChild(moved);
+ok('found once moved under it', q('.m'), moved);
+ok('a selector with :not', q('span:not(.x)'), null);
+a.classList.remove('x');
+ok('found once the class is taken off', q('span:not(.x)'), a);
+var d = document.createElement('div');
+d.setAttribute('data-content-id', '7');
+d.setAttribute('data-x', '1');
+ok('dataset reads a capital as a dash', d.dataset.contentId, '7');
+ok('and a plain name', d.dataset.x, '1');
+d.dataset.zoneLabel = 'z';
+ok('and writes one', d.getAttribute('data-zone-label'), 'z');
+ok('a name read twice', d.dataset.contentId + d.dataset.contentId, '77');
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('query-miss-memo: ' + l); });
+console.log('query-miss-memo: done');
+</script>
+</body></html>
