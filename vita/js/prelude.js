@@ -10000,17 +10000,25 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    get:function(){return p[1];}});}catch(e){}});
 })();
 
+ /* one collection a node, as [SameObject] has it (VitaSurf): each read
+    of el.children made a new one, which walked the children again, and
+    a loop reading root.children[i] walked them at every step */
+ var KIDS=typeof WeakMap==='function'?new WeakMap():null;
  var kids=Object.getOwnPropertyDescriptor(P,'children');
  if(kids&&kids.get)Object.defineProperty(P,'children',{configurable:true,
   get:function(){
-   var self=this;
-   return liveCollection(function(){return listOf(kids.get.call(self));},
-    null,true);}});
- var dkids=Object.getOwnPropertyDescriptor(D,'children');
+   var self=this,c=KIDS!==null&&self!==null&&typeof self==='object'?
+    KIDS.get(self):undefined;
+   if(c!==undefined)return c;
+   c=liveCollection(function(){return listOf(kids.get.call(self));},
+    null,true);
+   if(KIDS!==null&&self!==null&&typeof self==='object')KIDS.set(self,c);
+   return c;}});
+ var dkids=Object.getOwnPropertyDescriptor(D,'children'),dkidsColl=null;
  if(dkids&&dkids.get)Object.defineProperty(D,'children',{configurable:true,
   get:function(){
-   return liveCollection(function(){return listOf(dkids.get.call(D));},
-    null,true);}});
+   return dkidsColl||(dkidsColl=liveCollection(function(){
+    return listOf(dkids.get.call(D));},null,true));}});
 })();
 
 /* The document's interfaces in a browser's order (VitaSurf). The page's

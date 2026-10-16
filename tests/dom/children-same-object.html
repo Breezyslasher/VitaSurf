@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<!--
+  el.children is one collection, as [SameObject] has it, and still live
+  (VitaSurf). Each read made a new collection, which walked the children
+  again, so a loop reading root.children[i] walked them at every step:
+  1500 attribute writes through it took 1.5 s natively. Each line must
+  say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>children is one collection</title></head>
+<body>
+<div id="r"><p>a</p>text<p>b</p></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+var r = document.getElementById('r');
+ok('the same collection twice', r.children === r.children, true);
+ok('the document\'s too', document.children === document.children, true);
+ok('another element has its own', r.children !== document.body.children, true);
+var c = r.children;
+ok('it counts elements only', c.length, 2);
+var p = document.createElement('p');
+r.appendChild(p);
+ok('it follows an addition', c.length, 3);
+ok('through a fresh read too', r.children.length, 3);
+ok('and indexes it', c[2], p);
+r.removeChild(r.firstElementChild);
+ok('and a removal', c.length, 2);
+ok('childElementCount agrees', r.childElementCount, 2);
+p.setAttribute('data-x', '1');
+ok('an attribute write leaves it as it was', c[1], p);
+var f = document.createDocumentFragment();
+f.appendChild(document.createElement('i'));
+ok('a fragment\'s children', f.children.length, 1);
+ok('is one collection too', f.children === f.children, true);
+ok('the document\'s holds the root', document.children[0], document.documentElement);
+var many = document.createElement('div'), i;
+for (i = 0; i < 300; i++) many.appendChild(document.createElement('span'));
+var t0 = performance.now();
+for (i = 0; i < many.children.length; i++) many.children[i].setAttribute('data-i', String(i));
+ok('a loop through it sets them all', many.children[299].getAttribute('data-i'), '299');
+console.log('children-same-object: the loop took ' + Math.round(performance.now() - t0) + ' ms');
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('children-same-object: ' + l); });
+console.log('children-same-object: done');
+</script>
+</body></html>
