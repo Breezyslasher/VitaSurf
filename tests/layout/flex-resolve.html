@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<!--
+  Resolving flexible lengths (VitaSurf). Items share free space by
+  their flex factors from their flex base sizes; the automatic minimum
+  (the content's min-content size, or the item's own width if that is
+  less) bounds the result, not the base; shares add up to the free
+  space; auto margins across the line take its free space; and a
+  percentage flex-basis in a column is of the container's height. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Flexible lengths</title>
+<style>
+body { margin: 0; font: 16px/20px sans-serif; }
+.r { display: flex; width: 300px; }
+.c { display: flex; flex-direction: column; width: 300px; }
+.b { height: 20px; }
+.w { display: inline-block; width: 100px; height: 10px; }
+</style></head>
+<body>
+<div class="r" id="t1"><div style="flex: 1">a</div><div style="flex: 1">bbbbb</div><div style="flex: 1">c</div></div>
+<div class="r" id="t2" style="width: 200px"><div style="flex: 0 1 200px; min-width: 0">a</div><div style="flex: 0 1 100px; min-width: 0">b</div></div>
+<div class="r" id="t3"><div style="flex: 1 1 auto; width: 100px" class="b"></div><div style="flex: 2 1 auto; width: 50px" class="b"></div></div>
+<div class="r" id="t4" style="width: 60px"><div style="width: 50px"><span class="w"></span></div><div style="width: 50px" class="b"></div></div>
+<div class="r" id="t5"><div style="flex: 1; white-space: nowrap"><span class="w"></span><span class="w"></span></div><div style="flex: 1"></div><div style="flex: 1"></div></div>
+<div class="c" id="t6"><div style="margin: 0 auto; width: 100px" class="b"></div><div style="margin-left: auto; width: 100px" class="b"></div></div>
+<div class="r" id="t7" style="height: 100px"><div style="margin: auto 0; height: 20px; width: 10px"></div><div style="margin-top: auto; height: 20px; width: 10px"></div></div>
+<div class="c" id="t8" style="height: 200px"><div style="flex-basis: 25%"></div><div style="flex-basis: 50%"></div></div>
+<div class="c" id="t9"><div style="flex-basis: 50%" class="b"></div></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function R(e) { return e.getBoundingClientRect(); }
+function kids(id, f) {
+  var p = document.getElementById(id), pr = R(p);
+  return Array.prototype.map.call(p.children, function (k) {
+    var r = R(k);
+    return Math.round(f === 'x' ? r.left - pr.left : f === 'y' ? r.top - pr.top : f === 'w' ? r.width : r.height);
+  }).join(',');
+}
+addEventListener('load', function () {
+  ok('flex: 1 items share the line equally whatever their content', kids('t1', 'w'), '100,100,100');
+  ok('shrinking by basis times flex-shrink', kids('t2', 'w'), '133,67');
+  ok('growing by flex-grow from an auto basis', kids('t3', 'w'), '150,150');
+  ok('an item with a width shrinks no further than it', kids('t4', 'w'), '50,10');
+  ok('an item grows past content wider than its share', kids('t5', 'w'), '200,50,50');
+  ok('margin: 0 auto centres across a column', kids('t6', 'x'), '100,200');
+  ok('margin: auto 0 centres across a row', kids('t7', 'y'), '40,80');
+  ok('a percentage basis in a column is of its height', kids('t8', 'h'), '50,100');
+  ok('and of nothing when the height is not known', kids('t9', 'h'), '20');
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('flex-resolve: ' + l); });
+  console.log('flex-resolve: done');
+});
+</script>
+</body></html>

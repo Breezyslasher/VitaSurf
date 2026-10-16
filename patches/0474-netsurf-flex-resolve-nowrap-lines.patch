@@ -1,0 +1,418 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index f7ff60715..72a08dcad 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -595,6 +595,11 @@ layout_minmax_line(struct box *first,
+ 			if (min < b->min_width)
+ 				min = b->min_width;
+ 			max += b->max_width;
++			/* a line that may not wrap is as wide at its least
++			 * as at its most, inline-blocks and all (VitaSurf);
++			 * only its text had counted so */
++			if (no_wrap)
++				min = max;
+ 
+ 			if (b->flags & HAS_HEIGHT)
+ 				*line_has_height = true;
+@@ -842,6 +847,8 @@ layout_minmax_line(struct box *first,
+ 			min = width;
+ 		if (width > 0)
+ 			max += width;
++		if (no_wrap)
++			min = max;
+ 
+ 		*line_has_height = true;
+ 	}
+@@ -3090,6 +3097,110 @@ static void layout__bidi_line(struct box *first, struct box *end, bool rtl)
+ }
+ 
+ 
++/**
++ * Whether a box's white-space keeps its text on one line (VitaSurf).
++ */
++static bool layout_box_nowrap(const struct box *b)
++{
++	const css_computed_style *style = b->style;
++	uint8_t ws;
++
++	if (style == NULL && b->inline_end != NULL)
++		style = b->inline_end->style;
++	if (style == NULL)
++		return false;
++	ws = css_computed_white_space(style);
++	return ws == CSS_WHITE_SPACE_NOWRAP || ws == CSS_WHITE_SPACE_PRE;
++}
++
++/**
++ * Whether a white-space value keeps text on one line (VitaSurf).
++ */
++static bool layout_style_nowrap(const css_computed_style *style)
++{
++	uint8_t ws;
++
++	if (style == NULL)
++		return false;
++	ws = css_computed_white_space(style);
++	return ws == CSS_WHITE_SPACE_NOWRAP || ws == CSS_WHITE_SPACE_PRE;
++}
++
++/**
++ * The style of the element holding both of two boxes of a line, the
++ * second after the first with only the starts and ends of inline
++ * elements between them (VitaSurf): the innermost inline open before
++ * the first and still open at the second, else the block.
++ */
++static const css_computed_style *layout_common_style(const struct box *q,
++		const struct box *n)
++{
++	const struct box *x;
++	int pending = 0, closed = 0, depth = 0;
++
++	/* inlines that end between them hold the first only */
++	for (x = q->next; x != NULL && x != n; x = x->next) {
++		if (x->type == BOX_INLINE && !lh__box_is_replace(x))
++			pending++;
++		else if (x->type == BOX_INLINE_END) {
++			if (pending > 0)
++				pending--;
++			else
++				closed++;
++		}
++	}
++	for (x = q->prev; x != NULL; x = x->prev) {
++		if (x->type == BOX_INLINE_END) {
++			depth++;
++		} else if (x->type == BOX_INLINE && !lh__box_is_replace(x)) {
++			if (depth > 0)
++				depth--;
++			else if (closed > 0)
++				closed--;
++			else
++				return x->style;
++		}
++	}
++	if (n->parent != NULL && n->parent->parent != NULL)
++		return n->parent->parent->style;
++	return NULL;
++}
++
++/**
++ * Whether a line may not break before a box because white-space says so
++ * (VitaSurf). The opportunity at a space is the white-space of the text
++ * the space follows; between two boxes with no space, that of the
++ * element holding both, as CSS Text has it for atomic inlines. An inline's start or end has no width, so the
++ * content after it is asked about. NetSurf had broken a line at every
++ * element's edge, so a nowrap title holding a <b> or two inline-blocks
++ * wrapped all the same.
++ */
++static bool layout_break_forbidden(const struct box *b)
++{
++	const struct box *n = b, *q;
++
++	if (b->type == BOX_BR || lh__box_is_float_box(b))
++		return false;
++	while (n != NULL && ((n->type == BOX_INLINE &&
++			!lh__box_is_replace(n)) ||
++			n->type == BOX_INLINE_END))
++		n = n->next;
++	if (n == NULL || n->type == BOX_BR || lh__box_is_float_box(n))
++		n = b;
++	for (q = n->prev; q != NULL; q = q->prev) {
++		if (q->space != 0)
++			return layout_box_nowrap(q);
++		if ((q->type == BOX_INLINE && !lh__box_is_replace(q)) ||
++				q->type == BOX_INLINE_END)
++			continue;
++		if (q->type == BOX_BR || lh__box_is_float_box(q))
++			return false;
++		return layout_style_nowrap(layout_common_style(q, n));
++	}
++	return false;
++}
++
++
+ /**
+  * Position a line of boxes in inline formatting context.
+  *
+@@ -3179,7 +3290,9 @@ layout_line(struct box *first,
+ 	NSLOG(layout, DEBUG,  "x0 %i, x1 %i, x1 - x0 %i", x0, x1, x1 - x0);
+ 
+ 
+-	for (x = 0, b = first; x <= x1 - x0 && b != 0; b = b->next) {
++	for (x = 0, b = first; b != 0 && (x <= x1 - x0 ||
++			(b != first && layout_break_forbidden(b)));
++			b = b->next) {
+ 		int min_width, max_width, min_height, max_height;
+ 
+ 		assert(lh__box_is_inline_content(b));
+@@ -3407,7 +3520,9 @@ layout_line(struct box *first,
+ 
+ 	NSLOG(layout, DEBUG,  "x0 %i, x1 %i, x1 - x0 %i", x0, x1, x1 - x0);
+ 
+-	for (x = x_previous = 0, b = first; x <= x1 - x0 && b; b = b->next) {
++	for (x = x_previous = 0, b = first; b && (x <= x1 - x0 ||
++			(b != first && layout_break_forbidden(b)));
++			b = b->next) {
+ 
+ 		NSLOG(layout, DEBUG,  "pass 2: b %p, x %i", b, x);
+ 
+@@ -3588,7 +3703,13 @@ layout_line(struct box *first,
+ 		}
+ 	}
+ 
+-	if (x1 - x0 < x && split_box) {
++	if (x1 - x0 < x && split_box && split_box != first &&
++			layout_box_nowrap(split_box) &&
++			layout_break_forbidden(split_box)) {
++		/* it went over the end, but white-space keeps it on this
++		 * line with what is before it (VitaSurf) */
++		move_y = true;
++	} else if (x1 - x0 < x && split_box) {
+ 		/* the last box went over the end */
+ 		size_t split = 0;
+ 		int w;
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index aca4604a7..87b365d63 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -61,6 +61,7 @@ struct flex_item_data {
+ 	int base_size;
+ 	int main_size;
+ 	int content_main;	/**< outer size of its content (VitaSurf) */
++	int auto_min;		/**< outer automatic minimum, or -1 (VitaSurf) */
+ 	size_t line;
+ 
+ 	bool freeze;
+@@ -328,8 +329,31 @@ static inline bool layout_flex__base_and_main_sizes(
+ 
+ 	/* The containing block is only known here, so the basis is read
+ 	 * now: a percentage or a calc() expression needs it. */
+-	item->basis = css_computed_flex_basis_px(b->style, ctx->unit_len_ctx,
+-			available_width, &item->base_size);
++	{
++		/* a percentage is of the container's main size, its height
++		 * in a column, and with that unknown the basis is the
++		 * content's (VitaSurf); it had been taken of the width */
++		int ref = ctx->horizontal ? available_width :
++				ctx->available_main;
++		css_fixed len = 0;
++		css_unit unit = CSS_UNIT_PX;
++		bool unknown = false;
++
++		if (!ctx->horizontal && (ref == AUTO ||
++				ref == UNKNOWN_WIDTH || ref < 0)) {
++			ref = 0;
++			unknown = css_computed_flex_basis(b->style,
++					&len, &unit) == CSS_FLEX_BASIS_SET &&
++					unit == CSS_UNIT_PCT;
++		}
++		if (unknown) {
++			item->basis = CSS_FLEX_BASIS_CONTENT;
++		} else {
++			item->basis = css_computed_flex_basis_px(b->style,
++					ctx->unit_len_ctx, ref,
++					&item->base_size);
++		}
++	}
+ 
+ 	if (item->basis == CSS_FLEX_BASIS_AUTO) {
+ 		item->base_size = ctx->horizontal ? b->width : b->height;
+@@ -388,18 +412,55 @@ static inline bool layout_flex__base_and_main_sizes(
+ 
+ 	if (ctx->horizontal) {
+ 		item->base_size = min(item->base_size, available_width);
+-		/* no smaller than its content only while its minimum width
+-		 * is automatic (VitaSurf): an item with min-width: 0 or
+-		 * overflow: hidden is as wide as its basis says, and
+-		 * yahoo.com's carousel slides, flex: 0 0 100% with min-w-0,
+-		 * were as wide as their picture, 1104px in a 680px row */
+-		if (layout_flex__auto_minimum(ctx, b))
+-			item->base_size = max(item->base_size,
+-					content_min_width);
++	}
++
++	/*
++	 * The automatic minimum (Flexbox 4.5) (VitaSurf): while the item's
++	 * minimum main size is auto and it is not a scroll container, its
++	 * content's min-content size, or its own width if that is less,
++	 * and no more than its max-width. It bounds the hypothetical main
++	 * size and the resolved one, never the base size: the base had
++	 * been floored at the content, so three flex: 1 items of different
++	 * content were 75, 148 and 76 wide in 300 where each is 100, and
++	 * yahoo.com's carousel slides, flex: 0 0 100% with min-w-0, were
++	 * as wide as their picture, 1104px in a 680px row.
++	 */
++	item->auto_min = -1;
++	if (layout_flex__auto_minimum(ctx, b)) {
++		if (ctx->horizontal) {
++			item->auto_min = content_min_width;
++			if (b->width != AUTO) {
++				/* a block's min width is its own width once
++				 * it has one, so its content's is read from
++				 * its children: an empty 50px box shrinks */
++				if (b->type == BOX_BLOCK && b->object == NULL) {
++					int least = 0;
++
++					for (const struct box *c = b->children;
++							c != NULL; c = c->next) {
++						if ((c->style == NULL ||
++						     !lh__box_is_absolute(c)) &&
++							c->min_width > least)
++							least = c->min_width;
++					}
++					item->auto_min = least +
++							delta_outer_main;
++				}
++				item->auto_min = min(item->auto_min,
++						b->width + delta_outer_main);
++			}
++		} else {
++			item->auto_min = item->content_main;
++		}
++		if (item->max_main > 0)
++			item->auto_min = min(item->auto_min,
++					item->max_main + delta_outer_main);
+ 	}
+ 
+ 	item->target_main_size = item->base_size;
+ 	item->main_size = item->base_size;
++	if (item->main_size < item->auto_min)
++		item->main_size = item->auto_min;
+ 
+ 	if (item->max_main > 0 &&
+ 	    item->main_size > item->max_main + delta_outer_main) {
+@@ -748,18 +809,12 @@ static inline int layout_flex__get_min_max_violations(
+ 		 * main axis: its height in a column, where this took the
+ 		 * box's minimum width and made a 50 by 20 item 50 tall
+ 		 * (VitaSurf) */
+-		if (layout_flex__auto_minimum(ctx, item->box)) {
+-			int auto_min = ctx->horizontal ?
+-					item->box->min_width :
+-					item->content_main;
+-
+-			if (target_main_size < auto_min) {
+-				target_main_size = auto_min;
+-				item->min_violation = true;
+-				NSLOG(flex, DEEPDEBUG,
+-						"Violation: automatic minimum: %i",
+-						auto_min);
+-			}
++		if (target_main_size < item->auto_min) {
++			target_main_size = item->auto_min;
++			item->min_violation = true;
++			NSLOG(flex, DEEPDEBUG,
++					"Violation: automatic minimum: %i",
++					item->auto_min);
+ 		}
+ 
+ 		if (target_main_size < 0) {
+@@ -797,28 +852,38 @@ static inline void layout_flex__distribute_free_main(
+ {
+ 	size_t item_count = line->first + line->count;
+ 
++	/*
++	 * Each item's share is the rounded running total less what the
++	 * items before it were given (VitaSurf), so the shares add up to
++	 * the free space and none is a pixel short: three flex: 1 items in
++	 * 300px had been 99, 100 and 100, a third being a little under
++	 * 0.334 in fixed point.
++	 */
+ 	if (grow) {
+-		css_fixed remainder = 0;
++		css_fixed running = 0;
++		int given = 0;
++
+ 		for (size_t i = line->first; i < item_count; i++) {
+ 			struct flex_item_data *item = &ctx->item.data[i];
+-			css_fixed result;
+ 			css_fixed ratio;
++			int upto;
+ 
+ 			if (item->freeze) {
+ 				continue;
+ 			}
+ 
+ 			ratio = FDIV(item->grow, unfrozen_factor_sum);
+-			result = FMUL(INTTOFIX(remaining_free_main), ratio) +
+-					remainder;
++			running += FMUL(INTTOFIX(remaining_free_main), ratio);
++			upto = FIXTOINT(running + F_0_5);
+ 
+ 			item->target_main_size = item->base_size +
+-					FIXTOINT(result);
+-			remainder = FIXFRAC(result);
++					(upto - given);
++			given = upto;
+ 		}
+ 	} else {
+ 		css_fixed scaled_shrink_factor_sum = 0;
+-		css_fixed remainder = 0;
++		css_fixed running = 0;
++		int given = 0;
+ 
+ 		for (size_t i = line->first; i < item_count; i++) {
+ 			struct flex_item_data *item = &ctx->item.data[i];
+@@ -837,8 +902,8 @@ static inline void layout_flex__distribute_free_main(
+ 		for (size_t i = line->first; i < item_count; i++) {
+ 			struct flex_item_data *item = &ctx->item.data[i];
+ 			css_fixed scaled_shrink_factor;
+-			css_fixed result;
+ 			css_fixed ratio;
++			int upto;
+ 
+ 			if (item->freeze) {
+ 				continue;
+@@ -853,12 +918,13 @@ static inline void layout_flex__distribute_free_main(
+ 					INTTOFIX(item->base_size));
+ 			ratio = FDIV(scaled_shrink_factor,
+ 			             scaled_shrink_factor_sum);
+-			result = FMUL(INTTOFIX(abs(remaining_free_main)),
+-			              ratio) + remainder;
++			running += FMUL(INTTOFIX(abs(remaining_free_main)),
++			              ratio);
++			upto = FIXTOINT(running + F_0_5);
+ 
+ 			item->target_main_size = item->base_size -
+-					FIXTOINT(result);
+-			remainder = FIXFRAC(result);
++					(upto - given);
++			given = upto;
+ 		}
+ 	}
+ }
+@@ -1260,6 +1326,7 @@ static void layout_flex__place_line_items_cross(struct flex_ctx *ctx,
+ 		struct flex_line_data *line, int extra)
+ {
+ 	enum box_side cross_start = ctx->horizontal ? TOP : LEFT;
++	enum box_side cross_end = ctx->horizontal ? BOTTOM : RIGHT;
+ 	size_t item_count = line->first + line->count;
+ 
+ 	for (size_t i = line->first; i < item_count; i++) {
+@@ -1275,6 +1342,27 @@ static void layout_flex__place_line_items_cross(struct flex_ctx *ctx,
+ 		cross_free_space = line->cross_size + extra - *box_size_cross -
+ 				lh__delta_outer_cross(ctx->flex, b);
+ 
++		/*
++		 * Auto margins across take the free space before align-self
++		 * does, and the item is not stretched (Flexbox 8.1)
++		 * (VitaSurf): margin: 0 auto in a column and margin: auto 0
++		 * in a row had put the item at the start.
++		 */
++		if (b->margin[cross_start] == AUTO ||
++				b->margin[cross_end] == AUTO) {
++			int space = max(cross_free_space, 0);
++			int before = 0;
++
++			if (b->margin[cross_start] == AUTO)
++				before = b->margin[cross_end] == AUTO ?
++						space / 2 : space;
++			*box_pos_cross = ctx->flex->padding[cross_start] +
++					line->pos + before +
++					lh__non_auto_margin(b, cross_start) +
++					b->border[cross_start].width;
++			continue;
++		}
++
+ 		switch (lh__box_align_self(ctx->flex, b)) {
+ 		default:
+ 		case CSS_ALIGN_SELF_STRETCH:

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<!--
+  white-space: nowrap across elements (VitaSurf). A line may break at a
+  space only if the text the space follows may wrap, and between two
+  boxes with no space only if the element holding both may: a nowrap
+  line holding a <b>, two inline-blocks or two images stays one line,
+  and a line of nowrap buttons in a normal block still wraps between
+  them. Its min-content width is its whole width. NetSurf had broken a
+  line at every element's edge. Each line must say PASS; Chrome passes
+  them all.
+-->
+<html><head><meta charset="utf-8"><title>Nowrap lines</title>
+<style>
+body { margin: 0; font: 16px/20px sans-serif; }
+.ib { display: inline-block; width: 100px; height: 10px; }
+img { width: 100px; height: 10px; }
+</style></head>
+<body>
+<div style="width: 150px; white-space: nowrap"><span class="ib" id="a1"></span><span class="ib" id="a2"></span></div>
+<div style="width: 150px; white-space: nowrap"><img id="b1" alt="" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"><img id="b2" alt="" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"></div>
+<div style="width: 50px; white-space: nowrap"><span id="c0">aaaa</span> <b id="c1">bbbb</b> <i id="c2">cccc</i></div>
+<div style="width: 50px"><span id="d0">aaaa</span> <span id="d1" style="white-space: nowrap">bb bb</span></div>
+<div style="width: 150px"><span class="ib" id="e1" style="white-space: nowrap"></span><span class="ib" id="e2" style="white-space: nowrap"></span></div>
+<div style="width: 60px; white-space: nowrap"><span id="f0">x</span><span style="white-space: normal"> <span class="ib" id="f1"></span></span></div>
+<div id="g" style="width: min-content; white-space: nowrap"><span class="ib"></span><span class="ib"></span></div>
+<div style="display: flex; width: 120px"><div id="h" style="white-space: nowrap"><span class="ib"></span><span class="ib"></span></div></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function R(id) { return document.getElementById(id).getBoundingClientRect(); }
+function same(a, b) { return Math.round(R(a).top) === Math.round(R(b).top); }
+addEventListener('load', function () {
+  ok('two inline-blocks stay on a nowrap line', same('a1', 'a2'), true);
+  ok('the second follows the first', Math.round(R('a2').left - R('a1').left), 100);
+  ok('two images stay on a nowrap line', same('b1', 'b2'), true);
+  ok('a nowrap line keeps its <b>', same('c0', 'c1'), true);
+  ok('and its <i>', same('c0', 'c2'), true);
+  ok('a normal line breaks before a nowrap span', same('d0', 'd1'), false);
+  ok('nowrap inline-blocks in a normal block wrap between them', same('e1', 'e2'), false);
+  ok('a space that may wrap breaks a nowrap line', same('f0', 'f1'), false);
+  ok('a nowrap line of inline-blocks is as wide at its least', Math.round(R('g').width), 200);
+  ok('so a flex item holding one is too', Math.round(R('h').width), 200);
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('nowrap-lines: ' + l); });
+  console.log('nowrap-lines: done');
+});
+</script>
+</body></html>
