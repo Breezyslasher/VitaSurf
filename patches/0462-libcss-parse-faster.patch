@@ -1,0 +1,348 @@
+diff --git a/src/parse/language.c b/src/parse/language.c
+index e08e070..fed6101 100644
+--- a/src/parse/language.c
++++ b/src/parse/language.c
+@@ -5132,6 +5132,91 @@ static void gap_sample(css_language *c, lwc_string *name,
+ 	css__stylesheet_gap_sample(c->sheet, name, buf);
+ }
+ 
++/*
++ * The property a name is (VitaSurf): a table keyed by the interned
++ * caseless form of each property's name, where a declaration had been
++ * compared with every name in turn until one matched, a hundred
++ * comparisons for an average one. The table is rebuilt whenever the
++ * names it was made from are not the ones in use, and a hit is checked
++ * against the name, so it can only ever save the search.
++ */
++#define PROP_TABLE_SIZE 1024
++
++static struct {
++	unsigned int generation;	/**< of the names it was built from,
++					     0 for none */
++	lwc_string *key[PROP_TABLE_SIZE];
++	uint16_t index[PROP_TABLE_SIZE];
++} prop_table;
++
++static inline uint32_t prop_slot(const lwc_string *key)
++{
++	return (((uint32_t) ((uintptr_t) key >> 4)) * 2654435761u >> 8) &
++			(PROP_TABLE_SIZE - 1);
++}
++
++static bool property_table_build(lwc_string *const *strings)
++{
++	int i;
++
++	memset(&prop_table, 0, sizeof(prop_table));
++	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
++		lwc_string *k;
++		uint32_t at;
++
++		if (strings[i]->insensitive == NULL &&
++				lwc__intern_caseless_string(strings[i]) !=
++				lwc_error_ok) {
++			prop_table.generation = 0;
++			return false;
++		}
++		k = strings[i]->insensitive;
++		for (at = prop_slot(k); prop_table.key[at] != NULL &&
++				prop_table.key[at] != k;
++				at = (at + 1) & (PROP_TABLE_SIZE - 1))
++			;
++		if (prop_table.key[at] == NULL) {
++			prop_table.key[at] = k;
++			prop_table.index[at] = (uint16_t) i;
++		}
++	}
++	prop_table.generation = css__propstrings_generation;
++	return true;
++}
++
++static int property_index(css_language *c, lwc_string *name)
++{
++	lwc_string *k;
++	uint32_t at;
++	int i;
++
++	if (name == NULL)
++		return LAST_PROP + 1;
++	if (prop_table.generation != css__propstrings_generation &&
++			!property_table_build(c->strings))
++		goto search;
++	if (name->insensitive == NULL &&
++			lwc__intern_caseless_string(name) != lwc_error_ok)
++		goto search;
++	k = name->insensitive;
++	for (at = prop_slot(k); prop_table.key[at] != NULL;
++			at = (at + 1) & (PROP_TABLE_SIZE - 1)) {
++		if (prop_table.key[at] == k)
++			return prop_table.index[at];
++	}
++	return LAST_PROP + 1;
++
++search:
++	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
++		bool match = false;
++
++		if (lwc_string_caseless_isequal(name, c->strings[i],
++				&match) == lwc_error_ok && match)
++			break;
++	}
++	return i;
++}
++
+ css_error parseProperty(css_language *c, const css_token *property,
+ 		const parserutils_vector *vector, int32_t *ctx, css_rule *rule)
+ {
+@@ -5144,14 +5229,7 @@ css_error parseProperty(css_language *c, const css_token *property,
+ 	int32_t value_at;
+ 
+ 	/* Find property index */
+-	/** \todo improve on this linear search */
+-	for (i = FIRST_PROP; i <= LAST_PROP; i++) {
+-		bool match = false;
+-
+-		if (lwc_string_caseless_isequal(property->idata, c->strings[i],
+-				&match) == lwc_error_ok && match)
+-			break;
+-	}
++	i = property_index(c, property->idata);
+ 	if (i == LAST_PROP + 1) {
+ 		/* a property this build does not know: remembered so the
+ 		 * client can say what the page wanted (VitaSurf) */
+diff --git a/src/parse/nesting.c b/src/parse/nesting.c
+index d4e3fba..7f8a182 100644
+--- a/src/parse/nesting.c
++++ b/src/parse/nesting.c
+@@ -1303,8 +1303,15 @@ css_error css__rewrite_scope(const char *src, size_t len,
+ 
+ 	*out = NULL;
+ 	*outlen = 0;
++	/* from one '@' to the next, which memchr finds a word at a time
++	 * (VitaSurf): this read every byte of every sheet */
+ 	for (j = 0; j + 6 <= len && !any; j++) {
+-		if (src[j] == '@' && strncasecmp(src + j, "@scope", 6) == 0)
++		const char *at = memchr(src + j, '@', len - j);
++
++		if (at == NULL)
++			break;
++		j = (size_t) (at - src);
++		if (j + 6 <= len && strncasecmp(src + j, "@scope", 6) == 0)
+ 			any = true;
+ 	}
+ 	if (!any)
+diff --git a/src/parse/parse.c b/src/parse/parse.c
+index eb1f824..9a75b44 100644
+--- a/src/parse/parse.c
++++ b/src/parse/parse.c
+@@ -629,10 +629,76 @@ css_error expect(css_parser *parser, css_token_type type)
+  * \param token   Pointer to location to receive token
+  * \return CSS_OK on success, appropriate error otherwise
+  */
++/**
++ * Add a token to the parser's vector (VitaSurf): a structure copy where
++ * the vector holds tokens and has room, which it nearly always has,
++ * where it was a call to memcpy with the size read from the vector.
++ */
++static inline css_error appendToken(css_parser *parser, const css_token *t)
++{
++	parserutils_vector *v = parser->tokens;
++	int32_t slot = v->current_item + 1;
++
++	if (v->item_size == sizeof(css_token) && v->current_item >= -1 &&
++			v->current_item < INT32_MAX &&
++			(size_t) slot < v->items_allocated) {
++		((css_token *) v->items)[slot] = *t;
++		v->current_item = slot;
++		return CSS_OK;
++	}
++	return css_error_from_parserutils_error(
++			parserutils_vector_append(v, (void *) t));
++}
++
++/**
++ * Read the next token from the lexer, interned, without adding it to the
++ * token vector (VitaSurf): what getToken and eatWS share.
++ */
++static css_error readToken(css_parser *parser, css_token **token)
++{
++	lwc_error lerror;
++	css_error error;
++	css_token *t;
++
++	error = css__lexer_get_token(parser->lexer, &t);
++	if (error != CSS_OK)
++		return error;
++
++	/* If the last token read was whitespace, keep reading
++	 * tokens until we encounter one that isn't whitespace */
++	while (parser->last_was_ws && t->type == CSS_TOKEN_S) {
++		error = css__lexer_get_token(parser->lexer, &t);
++		if (error != CSS_OK)
++			return error;
++	}
++
++	/* We need only intern for the following token types:
++	 *
++	 * CSS_TOKEN_IDENT, CSS_TOKEN_ATKEYWORD, CSS_TOKEN_STRING,
++	 * CSS_TOKEN_INVALID_STRING, CSS_TOKEN_HASH, CSS_TOKEN_URI,
++	 * CSS_TOKEN_UNICODE_RANGE?, CSS_TOKEN_FUNCTION, CSS_TOKEN_CHAR,
++	 * CSS_TOKEN_NUMBER, CSS_TOKEN_PERCENTAGE, CSS_TOKEN_DIMENSION
++	 *
++	 * These token types all appear before CSS_TOKEN_LAST_INTERN.
++	 * All other token types appear after this magic value.
++	 */
++
++	if (t->type < CSS_TOKEN_LAST_INTERN && t->data.data != NULL) {
++		/* Insert token text into the dictionary */
++		lerror = lwc_intern_string((char *)t->data.data,
++					    t->data.len, &t->idata);
++		if (lerror != lwc_error_ok)
++			return css_error_from_lwc_error(lerror);
++	} else {
++		t->idata = NULL;
++	}
++
++	*token = t;
++	return CSS_OK;
++}
++
+ css_error getToken(css_parser *parser, const css_token **token)
+ {
+-	parserutils_error perror;
+-        lwc_error lerror;
+ 	css_error error;
+ 
+ 	/* Use pushback, if it exists */
+@@ -643,47 +709,16 @@ css_error getToken(css_parser *parser, const css_token **token)
+ 		/* Otherwise, ask the lexer */
+ 		css_token *t;
+ 
+-		error = css__lexer_get_token(parser->lexer, &t);
++		error = readToken(parser, &t);
+ 		if (error != CSS_OK)
+ 			return error;
+-
+-		/* If the last token read was whitespace, keep reading
+-		 * tokens until we encounter one that isn't whitespace */
+-		while (parser->last_was_ws && t->type == CSS_TOKEN_S) {
+-			error = css__lexer_get_token(parser->lexer, &t);
+-			if (error != CSS_OK)
+-				return error;
+-		}
+-
+-		/* We need only intern for the following token types:
+-		 *
+-		 * CSS_TOKEN_IDENT, CSS_TOKEN_ATKEYWORD, CSS_TOKEN_STRING,
+-		 * CSS_TOKEN_INVALID_STRING, CSS_TOKEN_HASH, CSS_TOKEN_URI,
+-		 * CSS_TOKEN_UNICODE_RANGE?, CSS_TOKEN_FUNCTION, CSS_TOKEN_CHAR,
+-		 * CSS_TOKEN_NUMBER, CSS_TOKEN_PERCENTAGE, CSS_TOKEN_DIMENSION
+-		 *
+-		 * These token types all appear before CSS_TOKEN_LAST_INTERN.
+-		 * All other token types appear after this magic value.
+-		 */
+-
+-		if (t->type < CSS_TOKEN_LAST_INTERN && t->data.data != NULL) {
+-			/* Insert token text into the dictionary */
+-                        lerror = lwc_intern_string((char *)t->data.data,
+-                                                    t->data.len, &t->idata);
+-                        if (lerror != lwc_error_ok)
+-                                return css_error_from_lwc_error(lerror);
+-		} else {
+-			t->idata = NULL;
+-		}
+-
+ 		*token = t;
+ 	}
+ 
+ 	/* Append token to vector */
+-	perror = parserutils_vector_append(parser->tokens,
+-			(css_token *) (*token));
+-	if (perror != PARSERUTILS_OK)
+-		return css_error_from_parserutils_error(perror);
++	error = appendToken(parser, *token);
++	if (error != CSS_OK)
++		return error;
+ 
+ 	parser->last_was_ws = ((*token)->type == CSS_TOKEN_S);
+ 
+@@ -722,18 +757,36 @@ css_error pushBack(css_parser *parser, const css_token *token)
+ css_error eatWS(css_parser *parser)
+ {
+ 	const css_token *token;
++	css_token *t;
+ 	css_error error;
+ 
+-	error = getToken(parser, &token);
++	/*
++	 * Look at the next token without adding it to the vector unless it
++	 * is whitespace (VitaSurf). It was added and then taken off again
++	 * to be pushed back, at every eatWS before a token that was not
++	 * whitespace: most of them.
++	 */
++	if (parser->pushback != NULL) {
++		if (parser->pushback->type != CSS_TOKEN_S)
++			return CSS_OK;
++		return getToken(parser, &token);
++	}
++
++	error = readToken(parser, &t);
+ 	if (error != CSS_OK)
+ 		return error;
+ 
+-	if (token->type != CSS_TOKEN_S) {
+-		error = pushBack(parser, token);
+-		if (error != CSS_OK)
+-			return error;
++	if (t->type != CSS_TOKEN_S) {
++		parser->pushback = t;
++		parser->last_was_ws = false;
++		return CSS_OK;
+ 	}
+ 
++	error = appendToken(parser, t);
++	if (error != CSS_OK)
++		return error;
++	parser->last_was_ws = true;
++
+ 	return CSS_OK;
+ }
+ 
+diff --git a/src/parse/propstrings.c b/src/parse/propstrings.c
+index ab6c200..ee8f5f6 100644
+--- a/src/parse/propstrings.c
++++ b/src/parse/propstrings.c
+@@ -1176,6 +1176,8 @@ const stringmap_entry stringmap[LAST_KNOWN] = {
+  * destroyed when it has no more users.  Call css__propstrings_unref() when
+  * finished with the propstring list.
+  */
++unsigned int css__propstrings_generation;
++
+ css_error css__propstrings_get(lwc_string ***strings)
+ {
+ 	if (css__propstrings.count > 0) {
+@@ -1184,7 +1186,9 @@ css_error css__propstrings_get(lwc_string ***strings)
+ 		int i;
+ 		lwc_error lerror;
+ 
+-		/* Intern all known strings */
++		/* Intern all known strings: a new set, which tables keyed
++		 * by them must not mistake for the last (VitaSurf) */
++		css__propstrings_generation++;
+ 		for (i = 0; i < LAST_KNOWN; i++) {
+ 			lerror = lwc_intern_string(stringmap[i].data,
+ 					stringmap[i].len,
+diff --git a/src/parse/propstrings.h b/src/parse/propstrings.h
+index 370d763..4cae38d 100644
+--- a/src/parse/propstrings.h
++++ b/src/parse/propstrings.h
+@@ -420,6 +420,9 @@ enum {
+ };
+ 
+ css_error css__propstrings_get(lwc_string ***strings);
++/** Counts each new set of the strings css__propstrings_get interned
++ * (VitaSurf), so a table keyed by them knows when to start again. */
++extern unsigned int css__propstrings_generation;
+ void css__propstrings_unref(void);
+ 
+ #endif

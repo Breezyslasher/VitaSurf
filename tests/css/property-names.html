@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+  Property names in any case, as CSS has them (VitaSurf).
+
+  A declaration's property is found by its name without regard to
+  case, and a name no property has drops that declaration alone. libcss
+  had compared each name with every property in turn; it keeps a table
+  now. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Property names</title>
+<style>
+#a { COLOR: rgb(200, 0, 0); }
+#b { Background-Color: rgb(0, 150, 0); }
+#c { not-a-property: 1; color: rgb(0, 0, 200); }
+#d { color: rgb(1, 2, 3); colour: rgb(9, 9, 9); }
+#e { -WEBKIT-MASK-IMAGE: none; Text-Align: RIGHT; }
+#f { MARGIN-LEFT: 7px; padding-TOP: 9px; }
+@scope (#g) { span { color: rgb(10, 20, 30); } }
+</style></head>
+<body>
+<p id="a">a</p><p id="b">b</p><p id="c">c</p><p id="d">d</p><p id="e">e</p><p id="f">f</p>
+<div id="g"><span id="gs">g</span></div><span id="ng">not g</span>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+addEventListener('load', function () {
+  ok('an upper case property', cs('a').color, 'rgb(200, 0, 0)');
+  ok('a mixed case property', cs('b').backgroundColor, 'rgb(0, 150, 0)');
+  ok('an unknown property drops itself alone', cs('c').color, 'rgb(0, 0, 200)');
+  ok('a misspelt property is not taken for another', cs('d').color, 'rgb(1, 2, 3)');
+  ok('a property after the first in the table', cs('e').textAlign, 'right');
+  ok('a margin in upper case', cs('f').marginLeft, '7px');
+  ok('a padding in mixed case', cs('f').paddingTop, '9px');
+  ok('@scope still applies', cs('gs').color, 'rgb(10, 20, 30)');
+  ok('and only within its root', cs('ng').color === 'rgb(10, 20, 30)', false);
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('property-names: ' + l); });
+  console.log('property-names: done');
+});
+</script>
+</body></html>
