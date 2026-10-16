@@ -1,0 +1,13 @@
+<!DOCTYPE html><html><body><div id="d" class="card container__item card--media container_lead-plus-headlines__item container_lead-plus-headlines__item--type-section">x</div><div id="e">y</div><script>
+(function(){
+var d=document.getElementById('d'),t0=performance.now(),n=0;
+for(var i=0;i<20000;i++){ if(d.classList.contains('card--media'))n++; if(d.classList.contains('nope'))n--; }
+var t1=performance.now();
+var e=document.getElementById('e');
+for(var j=0;j<300;j++)e.style.setProperty('--v'+j,'rgba('+j+',2,3,0.5)');
+var t2=performance.now();
+for(var k=0;k<300;k++)e.style.setProperty('--v'+(k%300),'calc('+k+'px + 1em)');
+var t3=performance.now();
+console.log('tokens-styles: 40000 contains '+Math.round(t1-t0)+' ms ('+n+'), 300 new vars '+Math.round(t2-t1)+' ms, 300 changed vars '+Math.round(t3-t2)+' ms, length '+e.style.length);
+})();
+</script></body></html>

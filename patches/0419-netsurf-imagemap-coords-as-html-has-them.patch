@@ -1,0 +1,274 @@
+diff --git a/content/handlers/html/imagemap.c b/content/handlers/html/imagemap.c
+index f23be2353..ca5f3454c 100644
+--- a/content/handlers/html/imagemap.c
++++ b/content/handlers/html/imagemap.c
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include <assert.h>
++#include <stdlib.h>
+ #include <stdbool.h>
+ #include <string.h>
+ #include <strings.h>
+@@ -289,6 +290,116 @@ void imagemap_dump(html_content *c)
+ 	}
+ }
+ 
++/** Whether a byte separates the numbers of a coords attribute. */
++static bool imagemap_coords_sep(char ch)
++{
++	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\f' ||
++	       ch == '\r' || ch == ',' || ch == ';';
++}
++
++/**
++ * The numbers in a coords attribute, by HTML's rules for parsing a list
++ * of floating-point numbers (VitaSurf): separated by spaces, commas or
++ * semicolons, garbage before a number passed over, what follows its
++ * digits ignored, and a token with no number in it read as zero.
++ * NetSurf had split the attribute's own text in place with strtok,
++ * writing into libdom's string, and on commas alone, so a polygon
++ * written with spaces had no points and hovering over it asserted.
++ *
++ * \param data   The attribute's text
++ * \param len    Its length in bytes
++ * \param out    Receives a malloc'd array of the numbers, or NULL
++ * eturn how many numbers there are, or -1 on memory exhaustion
++ */
++static int
++imagemap_parse_coords(const char *data, size_t len, float **out)
++{
++	size_t pos = 0;
++	int n = 0, cap = 0;
++	float *nums = NULL;
++
++	*out = NULL;
++	while (pos < len && imagemap_coords_sep(data[pos]))
++		pos++;
++	while (pos < len) {
++		double v = 0, scale;
++		bool neg = false, digits = false;
++		size_t end;
++
++		/* leading garbage */
++		while (pos < len && !imagemap_coords_sep(data[pos]) &&
++		       !(data[pos] >= '0' && data[pos] <= '9') &&
++		       data[pos] != '.' && data[pos] != '-')
++			pos++;
++		end = pos;
++		while (end < len && !imagemap_coords_sep(data[end]))
++			end++;
++		/* the rules for parsing floating-point number values, on
++		 * the token from pos to end */
++		if (pos < end && data[pos] == '-') {
++			neg = true;
++			pos++;
++		}
++		while (pos < end && data[pos] >= '0' && data[pos] <= '9') {
++			v = v * 10 + (data[pos++] - '0');
++			digits = true;
++		}
++		if (pos + 1 < end && data[pos] == '.' &&
++		    data[pos + 1] >= '0' && data[pos + 1] <= '9') {
++			pos++;
++			for (scale = 0.1; pos < end &&
++			     data[pos] >= '0' && data[pos] <= '9'; scale /= 10) {
++				v += (data[pos++] - '0') * scale;
++				digits = true;
++			}
++		}
++		if (digits && pos < end && (data[pos] == 'e' ||
++					    data[pos] == 'E')) {
++			size_t e = pos + 1;
++			bool eneg = false;
++			int exp = 0;
++
++			if (e < end && (data[e] == '-' || data[e] == '+')) {
++				eneg = data[e] == '-';
++				e++;
++			}
++			if (e < end && data[e] >= '0' && data[e] <= '9') {
++				while (e < end && data[e] >= '0' &&
++				       data[e] <= '9') {
++					if (exp < 100)
++						exp = exp * 10 + (data[e] - '0');
++					e++;
++				}
++				while (exp-- > 0)
++					v = eneg ? v / 10 : v * 10;
++			}
++		}
++		if (!digits)
++			v = 0;
++		else if (neg)
++			v = -v;
++
++		if (n == cap) {
++			float *grown;
++
++			cap = cap == 0 ? 8 : cap * 2;
++			grown = realloc(nums, cap * sizeof(float));
++			if (grown == NULL) {
++				free(nums);
++				return -1;
++			}
++			nums = grown;
++		}
++		nums[n++] = (float) v;
++
++		pos = end;
++		while (pos < len && imagemap_coords_sep(data[pos]))
++			pos++;
++	}
++	*out = nums;
++	return n;
++}
++
+ /**
+  * Adds an imagemap entry to the list
+  *
+@@ -390,92 +501,70 @@ imagemap_addtolist(const struct html_content *c,
+ 	}
+ 
+ 	if (new_map->type != IMAGEMAP_DEFAULT) {
+-		int x, y;
+-		float *xcoords, *ycoords;
+-		/* coordinates are a comma-separated list of values */
+-		char *val = strtok((char *)dom_string_data(coords), ",");
+-		int num = 1;
++		float *nums = NULL;
++		int num = imagemap_parse_coords(dom_string_data(coords),
++				dom_string_byte_length(coords), &nums);
++		int i;
+ 
++		if (num < 0)
++			goto bad_out;
++
++		/* HTML's area shapes: too few numbers is an empty shape,
++		 * which the area does not take part in */
+ 		switch (new_map->type) {
+ 		case IMAGEMAP_RECT:
+-			/* (left, top, right, bottom) */
+-			while (val != NULL && num <= 4) {
+-				switch (num) {
+-				case 1:
+-					new_map->bounds.rect.x0 = atoi(val);
+-					break;
+-				case 2:
+-					new_map->bounds.rect.y0 = atoi(val);
+-					break;
+-				case 3:
+-					new_map->bounds.rect.x1 = atoi(val);
+-					break;
+-				case 4:
+-					new_map->bounds.rect.y1 = atoi(val);
+-					break;
+-				}
+-
+-				num++;
+-				val = strtok(NULL, ",");
++			/* (left, top, right, bottom), either way round */
++			if (num < 4) {
++				free(nums);
++				goto ok_free_map_out;
+ 			}
++			new_map->bounds.rect.x0 = (int) (nums[0] < nums[2] ?
++					nums[0] : nums[2]);
++			new_map->bounds.rect.y0 = (int) (nums[1] < nums[3] ?
++					nums[1] : nums[3]);
++			new_map->bounds.rect.x1 = (int) (nums[0] < nums[2] ?
++					nums[2] : nums[0]);
++			new_map->bounds.rect.y1 = (int) (nums[1] < nums[3] ?
++					nums[3] : nums[1]);
++			free(nums);
+ 			break;
+ 		case IMAGEMAP_CIRCLE:
+-			/* (x, y, radius ) */
+-			while (val != NULL && num <= 3) {
+-				switch (num) {
+-				case 1:
+-					new_map->bounds.circle.x = atoi(val);
+-					break;
+-				case 2:
+-					new_map->bounds.circle.y = atoi(val);
+-					break;
+-				case 3:
+-					new_map->bounds.circle.r = atoi(val);
+-					break;
+-				}
+-
+-				num++;
+-				val = strtok(NULL, ",");
++			/* (x, y, radius) */
++			if (num < 3 || nums[2] <= 0) {
++				free(nums);
++				goto ok_free_map_out;
+ 			}
++			new_map->bounds.circle.x = (int) nums[0];
++			new_map->bounds.circle.y = (int) nums[1];
++			new_map->bounds.circle.r = (int) nums[2];
++			free(nums);
+ 			break;
+ 		case IMAGEMAP_POLY:
+-			new_map->bounds.poly.xcoords = NULL;
+-			new_map->bounds.poly.ycoords = NULL;
+-
+-			while (val != NULL) {
+-				x = atoi(val);
+-
+-				val = strtok(NULL, ",");
+-				if (val == NULL)
+-					break;
+-
+-				y = atoi(val);
+-
+-				xcoords = realloc(new_map->bounds.poly.xcoords,
+-						num * sizeof(float));
+-				if (xcoords == NULL) {
+-					goto bad_out;
+-				}
+-				new_map->bounds.poly.xcoords = xcoords;
+-
+-				ycoords = realloc(new_map->bounds.poly.ycoords,
+-					num * sizeof(float));
+-				if (ycoords == NULL) {
+-					goto bad_out;
+-				}
+-				new_map->bounds.poly.ycoords = ycoords;
+-
+-				new_map->bounds.poly.xcoords[num - 1] = x;
+-				new_map->bounds.poly.ycoords[num - 1] = y;
+-
+-				num++;
+-				val = strtok(NULL, ",");
++			/* pairs, at least three of them; an odd number
++			 * leaves the last out */
++			if (num < 6) {
++				free(nums);
++				goto ok_free_map_out;
+ 			}
+-
+-			new_map->bounds.poly.num = num - 1;
+-
++			num /= 2;
++			new_map->bounds.poly.xcoords =
++					malloc(num * sizeof(float));
++			new_map->bounds.poly.ycoords =
++					malloc(num * sizeof(float));
++			if (new_map->bounds.poly.xcoords == NULL ||
++			    new_map->bounds.poly.ycoords == NULL) {
++				free(nums);
++				goto bad_out;
++			}
++			for (i = 0; i < num; i++) {
++				new_map->bounds.poly.xcoords[i] = nums[2 * i];
++				new_map->bounds.poly.ycoords[i] = nums[2 * i + 1];
++			}
++			new_map->bounds.poly.num = num;
++			free(nums);
+ 			break;
+ 		default:
++			free(nums);
+ 			break;
+ 		}
+ 	}

@@ -1,0 +1,89 @@
+diff --git a/src/core/element.c b/src/core/element.c
+index 04b57e1..2aa29e3 100644
+--- a/src/core/element.c
++++ b/src/core/element.c
+@@ -100,14 +100,22 @@ static dom_exception _dom_element_create_classes(struct dom_element *ele,
+ 	/* Any existing cached classes are replaced; destroy them */
+ 	_dom_element_destroy_classes(ele);
+ 
++	/*
++	 * Split on ASCII whitespace, as the DOM's class list is (VitaSurf):
++	 * it was spaces alone, so a class attribute written over several
++	 * lines kept the line break in a class, class="a\n b" giving "a\n"
++	 * and "b", and a rule for .a did not match it.
++	 */
++#define CLASS_WS(c) ((c) == ' ' || (c) == '\t' || (c) == '\n' || \
++		(c) == '\f' || (c) == '\r')
+ 	/* Count number of classes */
+ 	for (pos = value; *pos != '\0'; ) {
+-		if (*pos != ' ') {
+-			while (*pos != ' ' && *pos != '\0')
++		if (!CLASS_WS(*pos)) {
++			while (!CLASS_WS(*pos) && *pos != '\0')
+ 				pos++;
+ 			n_classes++;
+ 		} else {
+-			while (*pos == ' ')
++			while (CLASS_WS(*pos))
+ 				pos++;
+ 		}
+ 	}
+@@ -120,20 +128,21 @@ static dom_exception _dom_element_create_classes(struct dom_element *ele,
+ 
+ 		for (pos = value, n_classes = 0;
+ 				*pos != '\0'; ) {
+-			if (*pos != ' ') {
++			if (!CLASS_WS(*pos)) {
+ 				const char *s = pos;
+-				while (*pos != ' ' && *pos != '\0')
++				while (!CLASS_WS(*pos) && *pos != '\0')
+ 					pos++;
+ 				if (lwc_intern_string(s, pos - s, 
+ 						&classes[n_classes++]) !=
+ 						lwc_error_ok)
+ 					goto error;
+ 			} else {
+-				while (*pos == ' ')
++				while (CLASS_WS(*pos))
+ 					pos++;
+ 			}
+ 		}
+ 	}
++#undef CLASS_WS
+ 
+ 	ele->n_classes = n_classes;
+ 	ele->classes = classes;
+diff --git a/src/core/string.c b/src/core/string.c
+index bd92a71..65b0767 100644
+--- a/src/core/string.c
++++ b/src/core/string.c
+@@ -982,6 +982,29 @@ dom_string_tolower(dom_string *source, bool ascii_only, dom_string **lower)
+ 	if (ascii_only == false)
+ 		return DOM_NOT_SUPPORTED_ERR;
+ 
++	/*
++	 * Already lower case, the usual case: the same string again
++	 * (VitaSurf). An HTML element's getAttribute lowers the name on
++	 * every call, and that copied it into new memory, made a string of
++	 * the copy and freed it, or hashed and looked up a lowered copy of
++	 * an interned one: a quarter of a selector's walk over a document
++	 * was malloc and free.
++	 */
++	{
++		const uint8_t *d = (const uint8_t *) dom_string_data(source);
++		const size_t len = dom_string_byte_length(source);
++		size_t i;
++
++		for (i = 0; i < len; i++) {
++			if (d[i] >= 'A' && d[i] <= 'Z')
++				break;
++		}
++		if (i == len) {
++			*lower = dom_string_ref(source);
++			return DOM_NO_ERR;
++		}
++	}
++
+ 	if (isource->type == DOM_STRING_CDATA) {
+ 		const uint8_t *orig_s = (const uint8_t *)
+ 				dom_string_data(source);

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!--
+  str.charCodeAt(i) read in the interpreter (libquickjs patch 0429): the
+  built-in itself, called as a method on a flat string, or a rope already
+  flattened, with an integer index. Everything else takes the call. Each
+  line must say PASS; the values are the specification's, as Chrome
+  gives them.
+-->
+<html><head><meta charset="utf-8"><title>charCodeAt</title></head><body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) {
+  var same = (want !== want) ? got !== got : got === want;
+  out.push((same ? 'PASS ' : 'FAIL ') + name + (same ? '' : ': got ' + got + ', want ' + want));
+}
+var s = 'abc';
+ok('an index in range', s.charCodeAt(1), 98);
+ok('the first', s.charCodeAt(0), 97);
+ok('the last', s.charCodeAt(2), 99);
+ok('past the end is NaN', s.charCodeAt(3), NaN);
+ok('a negative index is NaN', s.charCodeAt(-1), NaN);
+ok('an empty string is NaN', ''.charCodeAt(0), NaN);
+ok('a fraction is truncated', s.charCodeAt(1.9), 98);
+ok('a string index is converted', s.charCodeAt('2'), 99);
+ok('no argument is index 0', s.charCodeAt(), 97);
+ok('a second argument is ignored', s.charCodeAt(1, 2), 98);
+ok('a wide character', '€'.charCodeAt(0), 8364);
+ok('half a surrogate pair', 'a😀'.charCodeAt(1), 0xd83d);
+ok('the other half', 'a😀'.charCodeAt(2), 0xde00);
+var big = ''; for (var i = 0; i < 3000; i++) big += String.fromCharCode(65 + i % 26);
+var sum = 0; for (i = 0; i < big.length; i++) sum += big.charCodeAt(i);
+ok('a string built by concatenation, read through', sum, (function () {
+  var t = 0; for (var k = 0; k < 3000; k++) t += 65 + k % 26; return t; })());
+var wide = big + '€';
+ok('a rope with a wide character at its end', wide.charCodeAt(3000), 8364);
+ok('and its start', wide.charCodeAt(0), 65);
+var f = String.prototype.charCodeAt;
+ok('called on a number', f.call(123, 0), 49);
+var o = { charCodeAt: f, toString: function () { return 'xyz'; } };
+ok('borrowed by an object', o.charCodeAt(1), 121);
+String.prototype.charCodeAt = function (i) { return 7; };
+ok('replaced by the page', 'q'.charCodeAt(0), 7);
+String.prototype.charCodeAt = f;
+ok('put back', 'q'.charCodeAt(0), 113);
+var thrown = false;
+try { f.call(null, 0); } catch (e) { thrown = e instanceof TypeError; }
+ok('on null it throws a TypeError', thrown, true);
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('char-code-at: ' + l); });
+console.log('char-code-at: done');
+</script>
+</body></html>

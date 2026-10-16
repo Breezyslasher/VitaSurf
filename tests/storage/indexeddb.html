@@ -106,6 +106,22 @@ function step3(db){
   idx.getAllKeys().onsuccess = function(e){
     say('index keys by name order', e.target.result.join(','));
   };
+  var byName = [];
+  var ireq = idx.openCursor();
+  say('index cursor request source is the index', ireq.source === idx);
+  ireq.onsuccess = function(e){
+    var c = e.target.result;
+    if (c) {
+      if (!byName.length) say('index cursor source is the index', c.source === idx);
+      byName.push(c.key + '>' + c.primaryKey); c.continue();
+    } else say('index cursor walked', byName.join(' '));
+  };
+  var ikeys = [];
+  idx.openKeyCursor(null, 'prev').onsuccess = function(e){
+    var c = e.target.result;
+    if (c) { ikeys.push(c.primaryKey); c.continue(); }
+    else say('index key cursor reversed', ikeys.join(','));
+  };
   var seen = [];
   s.openCursor().onsuccess = function(e){
     var c = e.target.result;

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Interfaces as WebIDL makes them</title></head>
+<body><pre id="out"></pre>
+<script>
+/* What a page sees when it looks at an interface rather than through it
+   (VitaSurf: vita/js/interfaces.js), and that nothing of the browser's
+   own is on window (vita/js/natives-open.js). Each line gives the
+   browser's answer in brackets. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function err(f){ try { f(); return 'no throw'; } catch (e) { return e.name + ' ' + e.message; } }
+T("an illegal constructor (TypeError Failed to construct 'MediaQueryList': Illegal constructor)", err(function(){ new MediaQueryList(); }));
+T('a constructor needs its arguments (TypeError)', err(function(){ new Event(); }).split(' ')[0]);
+T('and new (TypeError)', err(function(){ Event('x'); }).split(' ')[0]);
+T('but constructs with them (x)', new Event('x').type);
+T('name and length (Event 1 CustomEvent 1)', [Event.name, Event.length, CustomEvent.name, CustomEvent.length].join(' '));
+T('parent interface objects (true true true)', [Object.getPrototypeOf(CustomEvent) === Event,
+  Object.getPrototypeOf(CSSMediaRule) === CSSConditionRule,
+  Object.getPrototypeOf(CSSConditionRule) === CSSGroupingRule].join(' '));
+T('prototype chain (true true)', [Object.getPrototypeOf(CustomEvent.prototype) === Event.prototype,
+  Object.getPrototypeOf(CSSMediaRule.prototype) === CSSConditionRule.prototype].join(' '));
+T('toStringTag ([object AbortController] [object Event])',
+  Object.prototype.toString.call(new AbortController()) + ' ' + Object.prototype.toString.call(new Event('x')));
+T('prototype.constructor (true false)', [AbortSignal.prototype.constructor === AbortSignal,
+  Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'constructor').enumerable].join(' '));
+T('constants (0 3 false)', [Event.NONE, Event.prototype.BUBBLING_PHASE,
+  Object.getOwnPropertyDescriptor(Event, 'NONE').writable].join(' '));
+T('globals are not enumerable (false false)', [Object.getOwnPropertyDescriptor(window, 'Event').enumerable,
+  Object.getOwnPropertyDescriptor(window, 'HTMLElement').enumerable].join(' '));
+T('nothing of the browser on window (0)', Object.getOwnPropertyNames(window).filter(function(k){ return /^__/.test(k); }).length);
+T('no frames, no window[0] (false undefined 0)', [('0' in window), String(window[0]), window.length].join(' '));
+T('an alias (true)', window.WebKitMutationObserver === MutationObserver);
+T('not on a window that is not isolated (false false)', [('SharedArrayBuffer' in window), ('FileReaderSync' in window)].join(' '));
+</script>
+</body></html>

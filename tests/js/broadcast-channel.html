@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>BroadcastChannel</title></head>
+<body>
+<!--
+ BroadcastChannel as the HTML standard has it. Chrome gives each line
+ below as PASS, then "done".
+-->
+<pre id="out"></pre>
+<script>
+var out=[];
+function check(name,ok,extra){out.push((ok?'PASS ':'FAIL ')+name+(ok?'':' '+(extra||'')));}
+function finish(){
+ out.push('done');
+ document.getElementById('out').textContent=out.join('\n');
+ out.forEach(function(l){console.log('broadcast-channel: '+l);});}
+check('interface',typeof BroadcastChannel==='function'&&BroadcastChannel.length===1&&
+ Object.prototype.toString.call(new BroadcastChannel('x'))==='[object BroadcastChannel]');
+check('is an EventTarget',new BroadcastChannel('y') instanceof EventTarget);
+var threw=false;try{BroadcastChannel('z');}catch(e){threw=e instanceof TypeError;}
+check('needs new',threw);
+var a=new BroadcastChannel('chan'),b=new BroadcastChannel('chan'),
+    c=new BroadcastChannel('chan'),other=new BroadcastChannel('other');
+check('name',a.name==='chan');
+var got=[],selfGot=false,otherGot=false;
+a.onmessage=function(){selfGot=true;};
+other.onmessage=function(){otherGot=true;};
+b.onmessage=function(e){got.push('b:'+e.data.n+':'+(e instanceof MessageEvent)+':'+e.origin);};
+c.addEventListener('message',function(e){got.push('c:'+e.data.n);});
+var sent={n:1};
+a.postMessage(sent);
+sent.n=2; /* the message was cloned when it was posted */
+c.close();
+var sync=got.length;
+setTimeout(function(){
+ check('not delivered at once',sync===0);
+ check('to every other channel of the name, cloned when posted',
+  got.length===1&&got[0]==='b:1:true:'+location.origin,got.join(','));
+ check('not to itself',!selfGot);
+ check('not to another name',!otherGot);
+ check('not to a closed channel',got.join().indexOf('c:')<0);
+ var t=false;try{c.postMessage(1);}catch(e){t=e.name==='InvalidStateError';}
+ check('closed throws InvalidStateError',t);
+ t=false;try{a.postMessage(function(){});}catch(e){t=e.name==='DataCloneError';}
+ check('uncloneable throws DataCloneError',t);
+ check('navigator.webdriver',navigator.webdriver===false&&
+  !Object.prototype.hasOwnProperty.call(navigator,'webdriver'));
+ finish();},50);
+</script>
+</body></html>

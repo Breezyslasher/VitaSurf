@@ -15,8 +15,8 @@
  * (WebAssembly.Tag and Exception) and memory64.
  */
 (function(){
-var W=window,N=W.__vitaWasm;
-delete W.__vitaWasm;
+var W=window,N=NV.__vitaWasm;
+delete NV.__vitaWasm;
 if(!N)return;
 
 /* ---- errors ---- */
@@ -67,6 +67,12 @@ function parse(b){
  function valtype(){var t=u8();return VALTYPE[t]||'?';}
  function limits(){var f=u8(),l={min:leb()};if(f&1)l.max=leb();l.shared=!!(f&2);l.is64=!!(f&4);return l;}
  function table(){var t=valtype(),l=limits();l.elem=t;return l;}
+ /* skip a constant expression, to its end; nothing here needs it */
+ function skipExpr(end){
+  while(p<end&&b[p]!==0x0b){var op=b[p++];
+   if(op===0x41||op===0x42||op===0x23||op===0xd2)leb();
+   else if(op===0x43)p+=4;else if(op===0x44)p+=8;else if(op===0xd0)p++;}
+  p++;}
  while(p<b.length){
   var id=u8(),size=leb(),end=p+size,n,i;
   if(id===0){var cn=name();info.customs.push({name:cn,data:b.slice(p,end).buffer});}
@@ -86,17 +92,16 @@ function parse(b){
    info.imports.push(im);}}
   else if(id===3){n=leb();for(i=0;i<n;i++)info.funcs.push(info.types[leb()]);}
   else if(id===4){n=leb();for(i=0;i<n;i++){
-   if(b[p]===0x40){p+=2;}
-   info.tables.push(table());
-   p=end;break;}}
+   /* every table, in order, as the export section counts them; one
+      written with an initial value (0x40 0x00) has that expression
+      after its type. The loop had stopped after the first, so the
+      export of a module's second table read past the list. */
+   if(b[p]===0x40){p+=2;info.tables.push(table());skipExpr(end);}
+   else info.tables.push(table());}}
   else if(id===5){n=leb();for(i=0;i<n;i++)info.memories.push(limits());}
   else if(id===6){n=leb();for(i=0;i<n;i++){
    info.globals.push({type:valtype(),mutable:u8()===1});
-   /* skip the init expression; nothing here needs it */
-   while(p<end&&b[p]!==0x0b){var op=b[p++];
-    if(op===0x41||op===0x42||op===0x23||op===0xd2)leb();
-    else if(op===0x43)p+=4;else if(op===0x44)p+=8;else if(op===0xd0)p++;}
-   p++;}}
+   skipExpr(end);}}
   else if(id===7){n=leb();for(i=0;i<n;i++)
    info.exports.push({name:name(),kind:KINDS[u8()],index:leb()});}
   p=end;}

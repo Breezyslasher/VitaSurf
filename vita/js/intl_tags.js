@@ -23,9 +23,9 @@
  * and lacked the locale information, so Home Assistant loaded FormatJS's.
  *
  * Runs under Node too, held against ICU with the cases
- * scripts/gen-intl-tags-tests.mjs makes: __vitaIntlTags(W, N, C, X).
+ * scripts/gen-intl-tags-tests.mjs makes: NV.__vitaIntlTags(W, N, C, X).
  */
-var __vitaIntlTags = function (W, N, C, X) {
+NV.__vitaIntlTags = function (W, N, C, X) {
 	'use strict';
 
 	var Intl = W.Intl, DATA = {};
@@ -948,11 +948,11 @@ var __vitaIntlTags = function (W, N, C, X) {
 	});
 };
 
-if (typeof window !== 'undefined' && window.__vitaIntl &&
-    window.__vitaIntl.number && window.__vitaIntl.has &&
-    window.__vitaIntl.has('aliases') && window.__vitaIntlCore)
-	__vitaIntlTags(window, window.__vitaIntl, window.__vitaIntlCore,
-		       window.__vitaIntl.number);
+if (typeof window !== 'undefined' && NV.__vitaIntl &&
+    NV.__vitaIntl.number && NV.__vitaIntl.has &&
+    NV.__vitaIntl.has('aliases') && NV.__vitaIntlCore)
+	NV.__vitaIntlTags(window, NV.__vitaIntl, NV.__vitaIntlCore,
+		       NV.__vitaIntl.number);
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlTags;
+	module.exports = NV.__vitaIntlTags;

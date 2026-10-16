@@ -56,6 +56,7 @@
 #include "netsurf/mouse.h"
 #include "netsurf/window.h"
 #include "desktop/browser_history.h"
+#include "desktop/browser_private.h"
 #include "desktop/gui_internal.h"
 #include "content/handlers/html/box.h"
 #include "content/handlers/html/box_inspect.h"
@@ -73,6 +74,7 @@
 #include "vita_input.h"
 #include "vita_ime.h"
 #include "vita_menu.h"
+#include "vita_sitetest.h"
 
 /* root toolkit widget, defined in the framebuffer frontend's gui.c */
 extern fbtk_widget_t *fbtk;
@@ -930,9 +932,14 @@ void vita_input_caret_removed(struct gui_window *gw)
 
 void vita_input_load_started(struct gui_window *gw)
 {
-	if (gw == the_gw) {
+	/* NetSurf says so again whenever a frame starts loading, and a
+	 * page still loading is one load: starting again there made an
+	 * iframe's start, 35 s into youtube.com, the start of the page,
+	 * which then "loaded in 441 ms" with its figures thrown away */
+	if (gw == the_gw && load_started_us == 0) {
 		load_started_us = sceKernelGetProcessTimeWide();
 		vitasurf_profile_reset();
+		vita_sitetest_load_started();
 	}
 }
 
@@ -1505,6 +1512,17 @@ void vita_input_load_finished(struct gui_window *gw)
 	if (gw != the_gw || load_started_us == 0) {
 		return;
 	}
+	/*
+	 * The page being left stopped, with the next one still loading
+	 * (VitaSurf): its fetches end when the window goes elsewhere, and
+	 * that clears the window's busy flag while the new load runs on. A
+	 * site test took it for the new site's end, and the Guardian
+	 * "loaded in 94 ms" while it was still loading. The new page's
+	 * own end comes as another stop.
+	 */
+	if (gw->bw != NULL && gw->bw->loading_content != NULL) {
+		return;
+	}
 	ms = (unsigned int)((sceKernelGetProcessTimeWide() - load_started_us) / 1000);
 	page_started_us = load_started_us;
 	load_started_us = 0;
@@ -1516,10 +1534,13 @@ void vita_input_load_finished(struct gui_window *gw)
 	vita_menu_autosave(false);
 	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
-		nsurl_unref(url);
-		url = NULL;
 	}
 	vita_input_report_page(gw, ms);
+	/* after the report, so a site test's line follows its figures */
+	vita_sitetest_load_finished(url != NULL ? nsurl_access(url) : NULL, ms);
+	if (url != NULL) {
+		nsurl_unref(url);
+	}
 }
 
 /* The figures for the page as it stands, written when it loads and

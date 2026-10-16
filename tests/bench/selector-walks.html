@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!--
+  querySelector of a class nothing has and querySelectorAll of an
+  attribute substring, from the document, over 6000 elements with a node
+  added between (VitaSurf). cnn.com asked these of its whole document 360
+  times, 10 s on the Vita. Logs the time.
+-->
+var h = '';
+for (var i = 0; i < 2000; i++) h += '<div class="c' + (i % 50) + ' row item"><span class="t">s</span><a href="x' + i + '" data-uri="/a/b' + i + '">a</a></div>';
+document.body.insertAdjacentHTML('beforeend', h);
+var t0 = performance.now(), n = 0;
+for (i = 0; i < 100; i++) { document.body.appendChild(document.createElement('i')); n += document.querySelector('.container_absent-thing') ? 1 : 0; n += document.querySelectorAll('[data-uri*="/container/"]').length; }
+console.log('selector-walks: ' + Math.round(performance.now() - t0) + ' ms ' + n);
+</script></body></html>

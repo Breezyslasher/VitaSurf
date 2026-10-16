@@ -77,6 +77,9 @@ void vita_options_floor(void);
 #define VITASURF_DOWNLOADS_PAGE VITASURF_DATA_DIR "/downloads.html"
 /* The Log screen: the last page load's waterfall, and the log's tail. */
 #define VITASURF_LOG_PAGE       VITASURF_DATA_DIR "/log.html"
+/* The site test (vita/input/vita_sitetest.c): its list and its results. */
+#define VITASURF_SITETEST_LIST  VITASURF_DATA_DIR "/sitetest.txt"
+#define VITASURF_SITETEST_PAGE  VITASURF_DATA_DIR "/sitetest.html"
 /* holds the URL of a FlareSolverr server, e.g. http://192.168.1.20:8191/v1 */
 #define VITASURF_FLARESOLVERR_PATH VITASURF_DATA_DIR "/flaresolverr"
 /* The same files as file: URLs NetSurf can open (the Vita file table maps
@@ -85,6 +88,7 @@ void vita_options_floor(void);
 #define VITASURF_HISTORY_URL   "file:///ux0:/data/VitaSurf/history.html"
 #define VITASURF_DOWNLOADS_URL "file:///ux0:/data/VitaSurf/downloads.html"
 #define VITASURF_LOG_URL       "file:///ux0:/data/VitaSurf/log.html"
+#define VITASURF_SITETEST_URL  "file:///ux0:/data/VitaSurf/sitetest.html"
 
 /**
  * Initialise the platform: create the data directory, open the log,
@@ -277,6 +281,15 @@ void vita_decode_thread_started(int index);
  * page rather than the next run.
  */
 bool vitasurf_cache_disabled(void);
+
+/**
+ * Put UTF-8 text on the console's clipboard as well (vita_clipboard.c),
+ * when the system clipboard module could be loaded.
+ */
+void vita_clipboard_set(const char *text, size_t length);
+
+/* The system language's tags, best first: "fr-FR,fr" (utils/utils.h) */
+const char *vitasurf_languages(void);
 
 /** Turn the caches off or on, and remember which across runs. */
 void vitasurf_set_cache_disabled(bool off);

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+  Computed style reads of an element deep in the tree, against many rules
+  whose last compound it matches (VitaSurf). A read selects the element
+  and its ancestors outside box construction, and libcss had no bloom
+  filter of their names for it, so took one that rejects nothing: every
+  rule ending in "span" walked the element's ancestors looking for its
+  class. reddit.com's reads of three elements took seconds. Run it as it
+  is (reads before the first layout) and with ?late (after load, of an
+  element with no box). Logs the time for the reads.
+-->
+<html><head><meta charset="utf-8"><title>Style reads, many ancestors</title><script>
+var R = [];
+for (var i = 0; i < 5000; i++)
+  R.push('.a' + i + ' .b' + i + ' span { margin-left: ' + (i % 7) + 'px }');
+R.push('.real span.t { color: rgb(9, 8, 7) }');
+var st = document.createElement('style');
+st.textContent = R.join('\n');
+document.head.appendChild(st);
+</script></head>
+<body>
+<script>
+var html = '';
+for (var d = 0; d < 30; d++) html += '<div class="d' + d + (d == 3 ? ' real' : '') + '">';
+html += '<span class="t" id="t">t</span>';
+for (d = 0; d < 30; d++) html += '</div>';
+document.body.insertAdjacentHTML('beforeend', html);
+function run(label) {
+  var t = document.getElementById('t'), t0 = performance.now(), c;
+  for (var n = 0; n < 20; n++) {
+    t.setAttribute('data-n', n);            /* a change, so it is selected again */
+    c = getComputedStyle(t).color;
+  }
+  console.log('style-read-ancestors: ' + label + ' 20 reads in ' +
+              Math.round(performance.now() - t0) + ' ms, colour ' + c);
+}
+if (location.search.indexOf('late') < 0) run('before layout');
+else addEventListener('load', function () {
+  document.getElementById('t').style.display = 'none';
+  setTimeout(function () { run('after load, no box'); }, 0);
+});
+</script>
+</body></html>

@@ -134,8 +134,15 @@ void vita_options_floor(void)
 	if (nsoption_int(max_fetchers_per_host) < 6) {
 		nsoption_set_int(max_fetchers_per_host, 6);
 	}
-	if (nsoption_int(max_fetchers) < 12) {
-		nsoption_set_int(max_fetchers, 12);
+	/*
+	 * Twelve in all was a dozen hosts' worth of a news page's fetches:
+	 * nytimes.com asks fifteen hosts for 414 things, and 346 of them
+	 * waited for one of the twelve, three minutes between them, the
+	 * longest 4.4 s, for answers that are mostly the network's wait for
+	 * a first byte. Browsers run far more at once.
+	 */
+	if (nsoption_int(max_fetchers) < 24) {
+		nsoption_set_int(max_fetchers, 24);
 	}
 	/*
 	 * The memory cache, of which NetSurf gives a quarter to decoded
@@ -250,10 +257,38 @@ unsigned int vita_heap_free_kb(void)
 	return used_kb < size_kb ? size_kb - used_kb : 0;
 }
 
+/*
+ * Raise the clocks to their maximum (VitaSurf). Script, layout and CSS
+ * are CPU bound, and an app runs at 333 MHz unless it asks for 444. The
+ * request was never checked, so say what the clocks are, and ask again
+ * when they are lower: at startup, after a resume, and at every page
+ * load, which logs them.
+ */
+static void set_clocks(const char *what)
+{
+	int arm = scePowerGetArmClockFrequency();
+	int bus = scePowerGetBusClockFrequency();
+
+	if (arm >= 444 && bus >= 222)
+		return;
+	scePowerSetArmClockFrequency(444);
+	scePowerSetBusClockFrequency(222);
+	scePowerSetGpuClockFrequency(222);
+	scePowerSetGpuXbarClockFrequency(166);
+	vita_log("cpu (%s): ARM was %d MHz and bus %d MHz, now %d and %d",
+		 what, arm, bus, scePowerGetArmClockFrequency(),
+		 scePowerGetBusClockFrequency());
+}
+
 void vita_log_memory(const char *what)
 {
 	SceKernelFreeMemorySizeInfo info;
 	struct mallinfo mi;
+
+	vita_log("cpu (%s): ARM %d MHz, bus %d MHz", what,
+		 scePowerGetArmClockFrequency(),
+		 scePowerGetBusClockFrequency());
+	set_clocks(what);
 
 	memset(&info, 0, sizeof(info));
 	info.size = sizeof(info);
@@ -334,6 +369,8 @@ int vita_platform_poll_resume(void)
 			resumed = 1;
 		}
 	}
+	if (resumed)
+		set_clocks("resume");
 	return resumed;
 }
 
@@ -417,6 +454,62 @@ int vita_verbose_requested(void)
  * one can be timed against each other without reinstalling.
  */
 static int cache_off = -1;
+
+/*
+ * The system language, as the languages a browser on this device says
+ * it reads: Accept-Language and navigator.languages, and so the default
+ * locale of Intl. A tag with a region, then the bare language, as a
+ * browser set to it sends.
+ */
+static const char *const system_languages[] = {
+	"ja-JP,ja", "en-US,en", "fr-FR,fr", "es-ES,es", "de-DE,de",
+	"it-IT,it", "nl-NL,nl", "pt-PT,pt", "ru-RU,ru", "ko-KR,ko",
+	"zh-TW,zh", "zh-CN,zh", "fi-FI,fi", "sv-SE,sv", "da-DK,da",
+	"nb-NO,nb", "pl-PL,pl", "pt-BR,pt", "en-GB,en", "tr-TR,tr",
+};
+static const char *languages = "en-US,en";
+
+const char *vitasurf_languages(void)
+{
+	return languages;
+}
+
+/* Called from NetSurf's fetch code (utils/utils.h): the pages the browser
+ * writes for its own menus, and the bundled ones such as the start page,
+ * where following a link is the user's own navigation. */
+bool vitasurf_browser_page(const char *url)
+{
+	static const char *const pages[] = {
+		VITASURF_BOOKMARKS_URL, VITASURF_HISTORY_URL,
+		VITASURF_DOWNLOADS_URL, VITASURF_LOG_URL,
+		VITASURF_SITETEST_URL
+	};
+	size_t i, n;
+
+	if (url == NULL) {
+		return false;
+	}
+	if (strncmp(url, "file:///resources/", 18) == 0) {
+		return true;
+	}
+	for (i = 0; i < sizeof pages / sizeof pages[0]; i++) {
+		n = strlen(pages[i]);
+		if (strncmp(url, pages[i], n) == 0 &&
+		    (url[n] == '\0' || url[n] == '?' || url[n] == '#')) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void set_system_language(int lang)
+{
+	if (lang >= 0 && lang < (int)(sizeof system_languages /
+				      sizeof system_languages[0])) {
+		languages = system_languages[lang];
+	}
+	vita_log("languages: %s (system language %d)", languages, lang);
+}
 
 bool vitasurf_cache_disabled(void)
 {
@@ -931,6 +1024,7 @@ int vita_platform_init(void)
 	sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_LANG, &lang);
 	sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_ENTER_BUTTON, &enter);
 	dialog_config.language = (SceSystemParamLang)lang;
+	set_system_language(lang);
 	dialog_config.enterButtonAssign = (SceSystemParamEnterButtonAssign)enter;
 	ret = sceCommonDialogSetConfigParam(&dialog_config);
 	if (ret < 0) {
@@ -939,10 +1033,7 @@ int vita_platform_init(void)
 	}
 
 	/* Layout and CSS are CPU bound; run at the maximum clocks. */
-	scePowerSetArmClockFrequency(444);
-	scePowerSetBusClockFrequency(222);
-	scePowerSetGpuClockFrequency(222);
-	scePowerSetGpuXbarClockFrequency(166);
+	set_clocks("startup");
 
 	/* Networking must be up before NetSurf registers the curl fetcher. */
 	vita_net_init();

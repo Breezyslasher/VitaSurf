@@ -1,0 +1,326 @@
+diff --git a/content/llcache.c b/content/llcache.c
+index f90d30bdb..43e39f068 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -489,12 +489,28 @@ static nserror llcache_post_data_clone(const llcache_post_data *orig,
+ 
+ 	/* Deep-copy the type-specific data */
+ 	if (orig->type == LLCACHE_POST_URL_ENCODED) {
+-		post_clone->data.urlenc = strdup(orig->data.urlenc);
++		/* every byte of a body given with its length (VitaSurf) */
++		size_t len = orig->length > 0 ? orig->length :
++				strlen(orig->data.urlenc);
++
++		post_clone->length = orig->length;
++		post_clone->data.urlenc = malloc(len + 1);
+ 		if (post_clone->data.urlenc == NULL) {
+ 			free(post_clone);
+ 
+ 			return NSERROR_NOMEM;
+ 		}
++		memcpy(post_clone->data.urlenc, orig->data.urlenc, len);
++		post_clone->data.urlenc[len] = '\0';
++		if (orig->content_type != NULL) {
++			post_clone->content_type = strdup(orig->content_type);
++			if (post_clone->content_type == NULL) {
++				free(post_clone->data.urlenc);
++				free(post_clone);
++
++				return NSERROR_NOMEM;
++			}
++		}
+ 	} else {
+ 		post_clone->data.multipart = fetch_multipart_data_clone(
+ 				orig->data.multipart);
+@@ -898,8 +914,9 @@ static nserror llcache_object_refetch(llcache_object *object)
+ 		}
+ 	}
+ 
+-	/* Generate headers */
+-	headers = malloc(4 * sizeof(char *));
++	/* Generate headers: validators, Referer, and for a POST its
++	 * Content-Type and Origin (VitaSurf) */
++	headers = malloc(6 * sizeof(char *));
+ 	if (headers == NULL) {
+ 		return NSERROR_NOMEM;
+ 	}
+@@ -948,6 +965,48 @@ static nserror llcache_object_refetch(llcache_object *object)
+ 			header_idx++;
+ 		}
+ 	}
++
++	if (object->fetch.post != NULL) {
++		/* a body a script built names its own type; a form's
++		 * urlencoded one is curl's default (VitaSurf) */
++		const char *type = object->fetch.post->type ==
++				LLCACHE_POST_URL_ENCODED ?
++				object->fetch.post->content_type : NULL;
++		char *origin = NULL;
++		size_t olen = 0;
++
++		if (type != NULL) {
++			const size_t len = SLEN("Content-Type: ") +
++					strlen(type) + 1;
++
++			headers[header_idx] = malloc(len);
++			if (headers[header_idx] != NULL) {
++				snprintf(headers[header_idx], len,
++					 "Content-Type: %s", type);
++				header_idx++;
++			}
++		}
++		/* a POST says where it comes from, as browsers send it:
++		 * the page's origin, or null for one that has none */
++		if (object->fetch.referer != NULL &&
++		    (nsurl_get_scheme_type(object->fetch.referer) ==
++				NSURL_SCHEME_HTTP ||
++		     nsurl_get_scheme_type(object->fetch.referer) ==
++				NSURL_SCHEME_HTTPS)) {
++			if (nsurl_get(object->fetch.referer, NSURL_SCHEME |
++				      NSURL_HOST | NSURL_PORT, &origin,
++				      &olen) != NSERROR_OK)
++				origin = NULL;
++		}
++		headers[header_idx] = malloc(SLEN("Origin: ") +
++				(origin != NULL ? olen : 4) + 1);
++		if (headers[header_idx] != NULL) {
++			sprintf(headers[header_idx], "Origin: %s",
++				origin != NULL ? origin : "null");
++			header_idx++;
++		}
++		free(origin);
++	}
+ 	headers[header_idx] = NULL;
+ 
+ 	/* Reset cache control data */
+@@ -971,7 +1030,8 @@ static nserror llcache_object_refetch(llcache_object *object)
+ 			  object,
+ 			  object->fetch.flags & LLCACHE_RETRIEVE_NO_ERROR_PAGES,
+ 			  urlenc,
+-			  0,
++			  object->fetch.post != NULL ?
++				object->fetch.post->length : 0,
+ 			  multipart,
+ 			  object->fetch.flags & LLCACHE_RETRIEVE_VERIFIABLE,
+ 			  object->fetch.tried_with_tls_downgrade,
+@@ -1084,6 +1144,7 @@ static nserror llcache_object_destroy(llcache_object *object)
+ 	if (object->fetch.post != NULL) {
+ 		if (object->fetch.post->type == LLCACHE_POST_URL_ENCODED) {
+ 			free(object->fetch.post->data.urlenc);
++			free(object->fetch.post->content_type);
+ 		} else {
+ 			fetch_multipart_data_destroy(
+ 					object->fetch.post->data.multipart);
+diff --git a/content/llcache.h b/content/llcache.h
+index 0e3f1a5f9..7afedb5de 100644
+--- a/content/llcache.h
++++ b/content/llcache.h
+@@ -46,6 +46,13 @@ typedef struct llcache_post_data {
+ 		char *urlenc;		/**< URL encoded data */
+ 		struct fetch_multipart_data *multipart; /**< Multipart data */
+ 	} data;				/**< POST data content */
++	/** The bytes in urlenc, which may hold any byte, or 0 for a C
++	 * string (VitaSurf) */
++	size_t length;
++	/** urlenc's Content-Type, or NULL for a form's urlencoded body:
++	 * one a page's script built, such as its own multipart
++	 * (VitaSurf) */
++	char *content_type;
+ } llcache_post_data;
+ 
+ /** Flags for low-level cache object retrieval */
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+index 3c23702e3..fe64aded9 100644
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -85,6 +85,8 @@ struct browser_fetch_parameters {
+ 	struct nsurl *referrer;			     /**< Optional refererer */
+ 	enum browser_window_nav_flags flags;	     /**< Navigation flags */
+ 	char *post_urlenc;			     /**< URL encoded post data */
++	size_t post_len;			     /**< its bytes, 0 for a C string (VitaSurf) */
++	char *post_type;			     /**< its Content-Type, NULL for urlencoded (VitaSurf) */
+ 	struct fetch_multipart_data *post_multipart; /**< Multipart post data */
+ 	char *parent_charset;			     /**< Optional parent character set */
+ 	bool parent_quirks;			     /**< Optional parent quirks */
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 1ad045001..cb679af47 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -132,6 +132,11 @@ browser_window__free_fetch_parameters(struct browser_fetch_parameters *params)
+ 		free(params->post_urlenc);
+ 		params->post_urlenc = NULL;
+ 	}
++	params->post_len = 0;
++	if (params->post_type != NULL) {
++		free(params->post_type);
++		params->post_type = NULL;
++	}
+ 	if (params->post_multipart != NULL) {
+ 		fetch_multipart_data_destroy(params->post_multipart);
+ 		params->post_multipart = NULL;
+@@ -3614,15 +3619,21 @@ nserror browser_window_refresh_url_bar(struct browser_window *bw)
+ }
+ 
+ 
+-/* exported interface documented in netsurf/browser_window.h */
+-nserror
+-browser_window_navigate(struct browser_window *bw,
+-			nsurl *url,
+-			nsurl *referrer,
+-			enum browser_window_nav_flags flags,
+-			char *post_urlenc,
+-			struct fetch_multipart_data *post_multipart,
+-			hlcache_handle *parent)
++/**
++ * Navigate, with a POST body of post_len bytes and type post_type when
++ * a script built one (VitaSurf), or NetSurf's urlencoded or multipart
++ * form data.
++ */
++static nserror
++browser_window_navigate_body(struct browser_window *bw,
++			     nsurl *url,
++			     nsurl *referrer,
++			     enum browser_window_nav_flags flags,
++			     char *post_urlenc,
++			     size_t post_len,
++			     const char *post_type,
++			     struct fetch_multipart_data *post_multipart,
++			     hlcache_handle *parent)
+ {
+ 	int depth = 0;
+ 	struct browser_window *cur;
+@@ -3701,12 +3712,15 @@ browser_window_navigate(struct browser_window *bw,
+ 		fetch_flags |= LLCACHE_RETRIEVE_VERIFIABLE;
+ 	}
+ 
++	memset(&post, 0, sizeof(post));
+ 	if (post_multipart != NULL) {
+ 		post.type = LLCACHE_POST_MULTIPART;
+ 		post.data.multipart = post_multipart;
+ 	} else if (post_urlenc != NULL) {
+ 		post.type = LLCACHE_POST_URL_ENCODED;
+ 		post.data.urlenc = post_urlenc;
++		post.length = post_len;
++		post.content_type = (char *)post_type;
+ 	}
+ 
+ 	child.charset = content_get_encoding(parent, CONTENT_ENCODING_NORMAL);
+@@ -3800,7 +3814,18 @@ browser_window_navigate(struct browser_window *bw,
+ 	params.flags = flags;
+ 
+ 	if (post_urlenc != NULL) {
+-		params.post_urlenc = strdup(post_urlenc);
++		/* every byte of a body given with its length (VitaSurf) */
++		size_t len = post_len > 0 ? post_len : strlen(post_urlenc);
++
++		params.post_urlenc = malloc(len + 1);
++		if (params.post_urlenc != NULL) {
++			memcpy(params.post_urlenc, post_urlenc, len);
++			params.post_urlenc[len] = '\0';
++			params.post_len = post_len;
++		}
++		if (post_type != NULL) {
++			params.post_type = strdup(post_type);
++		}
+ 	}
+ 
+ 	if (post_multipart != NULL) {
+@@ -3842,6 +3867,40 @@ browser_window_navigate(struct browser_window *bw,
+ }
+ 
+ 
++/* exported interface documented in netsurf/browser_window.h */
++nserror
++browser_window_navigate(struct browser_window *bw,
++			nsurl *url,
++			nsurl *referrer,
++			enum browser_window_nav_flags flags,
++			char *post_urlenc,
++			struct fetch_multipart_data *post_multipart,
++			hlcache_handle *parent)
++{
++	return browser_window_navigate_body(bw, url, referrer, flags,
++					    post_urlenc, 0, NULL,
++					    post_multipart, parent);
++}
++
++
++/* exported interface documented in netsurf/browser_window.h */
++nserror
++browser_window_navigate_post(struct browser_window *bw,
++			     nsurl *url,
++			     nsurl *referrer,
++			     enum browser_window_nav_flags flags,
++			     const char *body,
++			     size_t len,
++			     const char *content_type)
++{
++	char empty[1] = { '\0' };
++
++	return browser_window_navigate_body(bw, url, referrer, flags,
++					    body != NULL ? (char *)body : empty,
++					    len, content_type, NULL, NULL);
++}
++
++
+ /**
+  * Internal navigation handler for normal fetches
+  */
+@@ -3880,12 +3939,15 @@ navigate_internal_real(struct browser_window *bw,
+ 	if (!(params->flags & (BW_NAVIGATE_UNVERIFIABLE | BW_NAVIGATE_SCRIPT)))
+ 		fetch_flags |= LLCACHE_RETRIEVE_USER;
+ 
++	memset(&post, 0, sizeof(post));
+ 	if (params->post_multipart != NULL) {
+ 		post.type = LLCACHE_POST_MULTIPART;
+ 		post.data.multipart = params->post_multipart;
+ 	} else if (params->post_urlenc != NULL) {
+ 		post.type = LLCACHE_POST_URL_ENCODED;
+ 		post.data.urlenc = params->post_urlenc;
++		post.length = params->post_len;
++		post.content_type = params->post_type;
+ 	}
+ 
+ 	if (params->parent_charset != NULL) {
+@@ -5029,6 +5091,11 @@ browser_window__reload_current_parameters(struct browser_window *bw)
+ 		free(bw->current_parameters.post_urlenc);
+ 		bw->current_parameters.post_urlenc = NULL;
+ 	}
++	bw->current_parameters.post_len = 0;
++	if (bw->current_parameters.post_type != NULL) {
++		free(bw->current_parameters.post_type);
++		bw->current_parameters.post_type = NULL;
++	}
+ 
+ 	if (bw->current_parameters.post_multipart != NULL) {
+ 		fetch_multipart_data_destroy(bw->current_parameters.post_multipart);
+diff --git a/include/netsurf/browser_window.h b/include/netsurf/browser_window.h
+index 85c3334c0..c579470c7 100644
+--- a/include/netsurf/browser_window.h
++++ b/include/netsurf/browser_window.h
+@@ -218,6 +218,25 @@ nserror browser_window_navigate(struct browser_window *bw,
+ 			     struct fetch_multipart_data *post_multipart,
+ 			     struct hlcache_handle *parent);
+ 
++/**
++ * Navigate with a POST body a page's script built (VitaSurf): a form's
++ * multipart, text/plain or urlencoded data, as the HTML standard encodes
++ * it, sent byte for byte with its own Content-Type.
++ *
++ * \param bw The browser window to navigate
++ * \param url The URL to POST to
++ * \param referrer The referring page, or NULL
++ * \param flags BW_NAVIGATE_* flags
++ * \param body The body, any of whose bytes may be zero
++ * \param len Its length
++ * \param content_type Its Content-Type, or NULL for urlencoded
++ * \return NSERROR_OK or an error
++ */
++nserror browser_window_navigate_post(struct browser_window *bw,
++		struct nsurl *url, struct nsurl *referrer,
++		enum browser_window_nav_flags flags, const char *body,
++		size_t len, const char *content_type);
++
+ /**
+  * Return true if a browser window can navigate upwards.
+  *

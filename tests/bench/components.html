@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Many components</title></head>
+<body>
+<!--
+ What a component library does at load, as reddit.com's does: many
+ custom elements, each with a shadow root that adopts the same large
+ constructed sheets and holds a <style> with the same large text, each
+ making an IntersectionObserver with the same thresholds array. Logs
+ how long it took and checks a component is styled as its rules say.
+ ?n=120 elements of 30 kinds; ?rules=800 rules a sheet.
+-->
+<div id="host"></div>
+<pre id="out"></pre>
+<script>
+var q=new URLSearchParams(location.search),N=+(q.get('n')||120),RULES=+(q.get('rules')||800);
+var css=[];
+for(var i=0;i<RULES;i++)css.push('.c'+i+' .x'+(i%37)+', :host([size="'+i+'"]) .y{color:#'+(100000+i)+';margin:'+(i%9)+'px '+(i%5)+'px;padding:1px 2px 3px 4px}');
+css.push('.mark{width:123px}');
+var text=css.join('\n');
+var shared=new CSSStyleSheet();shared.replaceSync(text);
+var shared2=new CSSStyleSheet();shared2.replaceSync(':host{display:block}.z{color:red}');
+var TH=[];for(i=0;i<=100;i++)TH.push(i/100);
+var kinds=30,t0=performance.now();
+for(var k=0;k<kinds;k++){
+ (function(k){
+  customElements.define('bench-c'+k,class extends HTMLElement{
+   constructor(){super();
+    var r=this.attachShadow({mode:'open'});
+    r.adoptedStyleSheets=[shared,shared2];
+    var st=document.createElement('style');st.textContent=text;r.appendChild(st);
+    var d=document.createElement('div');d.className='mark';d.textContent='x';r.appendChild(d);
+    this.io=new IntersectionObserver(function(){}, {threshold:TH});
+    this.io.observe(this);}
+   disconnectedCallback(){this.io.disconnect();}});})(k);}
+var host=document.getElementById('host');
+for(i=0;i<N;i++)host.appendChild(document.createElement('bench-c'+(i%kinds)));
+var t1=performance.now();
+setTimeout(function(){
+ var el=host.firstChild,w=parseFloat(getComputedStyle(el.shadowRoot.querySelector('.mark')).width);
+ var msg='components: '+N+' elements, '+RULES+' rules a sheet: '+Math.round(t1-t0)+' ms to make them; '+
+  (Math.round(w)===123?'PASS':'FAIL')+' styled (width '+w+'); thresholds '+el.io.thresholds.length+
+  (Object.isFrozen(el.io.thresholds)?' frozen':' not frozen');
+ document.getElementById('out').textContent=msg;console.log(msg);},1500);
+</script>
+</body></html>

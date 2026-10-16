@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Image map coords</title>
+<style>body{margin:0}img{display:block}</style></head>
+<body>
+<!--
+ An <area>'s coords are HTML's list of numbers: spaces, commas and
+ semicolons all separate them, and a shape with too few is empty and
+ takes no part. A polygon with one number had no points, and the pointer
+ over the map asserted (weather.gov in the site test, build 666).
+ Move the pointer over the picture, then click at 50,50, 150,50 and
+ 250,50: Chrome goes to #spaces, #semis and #rect, and the polygons with
+ too few numbers are never hit. Chrome also fires hashchange each time;
+ VitaSurf does not yet, since an area is followed by NetSurf rather than
+ as the area's activation in script, so the address is what to check.
+-->
+<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAABkCAIAAACzY5qXAAAA6UlEQVR42u3TAQkAAAgEse+fzBCGMIIxRBgswcGleoBDkQBMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBEwIJgRMCCYETAgmBBOqACYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImBBMCJgQTAiYEEwImhM8WRLoxc7MNglEAAAAASUVORK5CYII=" width="300" height="100" usemap="#m" alt="map">
+<map name="m">
+ <area shape="poly" coords="1" href="#bad-one-number">
+ <area shape="poly" coords="0,0,300" href="#bad-too-few">
+ <area shape="poly" coords="0 0 100 0 100 100 0 100" href="#spaces">
+ <area shape="polygon" coords="100;0;200;0; 200;100 ;100;100;7" href="#semis">
+ <area shape="rect" coords="300,100,200,0" href="#rect">
+</map>
+<p id="out">waiting</p>
+<script>
+var seen=[];
+window.addEventListener('hashchange',function(){
+ seen.push(location.hash);
+ document.getElementById('out').textContent=seen.join(' ');
+ console.log('imagemap-coords: '+location.hash);});
+</script>
+</body></html>

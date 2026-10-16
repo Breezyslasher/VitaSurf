@@ -1,0 +1,55 @@
+diff --git a/content/content.c b/content/content.c
+index d680fce84..ec84ce4cf 100644
+--- a/content/content.c
++++ b/content/content.c
+@@ -1539,6 +1539,7 @@ nserror content_abort(struct content *c)
+ {
+ 	NSLOG(netsurf, INFO, "Aborting %p", c);
+ 
++	c->aborted = true;
+ 	if (c->handler->stop != NULL)
+ 		c->handler->stop(c);
+ 
+diff --git a/content/content_protected.h b/content/content_protected.h
+index fb493a7f1..27bf8e6ee 100644
+--- a/content/content_protected.h
++++ b/content/content_protected.h
+@@ -197,6 +197,10 @@ struct content {
+ 	 * Current status.
+ 	 */
+ 	content_status status;
++	/** Aborted by its last user, so that nothing will finish its
++	 * load: the cache may let it go while it still says loading
++	 * (VitaSurf). */
++	bool aborted;
+ 
+ 	/**
+ 	 * Width dimension, if applicable.
+diff --git a/content/hlcache.c b/content/hlcache.c
+index f14113101..2f3821e61 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -124,10 +124,20 @@ static void hlcache_clean(void *force_clean_flag)
+ 			continue;
+ 
+ 		if (content__get_status(entry->content) == CONTENT_STATUS_LOADING) {
+-			if (force_clean == false)
++			/*
++			 * One aborted by the last page to use it is let go
++			 * too (VitaSurf): with its fetches stopped nothing
++			 * finishes its load, and npr.org, stopped after a
++			 * minute, kept its thirty thousand nodes and its
++			 * script heap to the end of the session.
++			 */
++			if (force_clean == false &&
++			    entry->content->aborted == false)
+ 				continue;
+-			NSLOG(netsurf, DEBUG, "Forcing content cleanup during shutdown");
+-			content_abort(entry->content);
++			NSLOG(netsurf, INFO, "Letting go of %p, aborted while "
++			      "loading", entry->content);
++			if (entry->content->aborted == false)
++				content_abort(entry->content);
+ 			content_set_error(entry->content);
+ 		}
+ 

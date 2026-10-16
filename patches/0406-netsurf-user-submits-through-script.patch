@@ -1,0 +1,141 @@
+diff --git a/content/handlers/html/box_textarea.c b/content/handlers/html/box_textarea.c
+index a2f25d37c..5f082ac25 100644
+--- a/content/handlers/html/box_textarea.c
++++ b/content/handlers/html/box_textarea.c
+@@ -68,6 +68,20 @@ nserror box_textarea_keypress(html_content *html, struct box *box, uint32_t key)
+ 	switch (key) {
+ 	case NS_KEY_NL:
+ 	case NS_KEY_CR:
++		/* implicit submission, as script has it: the default
++		 * button is clicked, or the form submitted with its
++		 * submit event (VitaSurf) */
++		if (form != NULL && form->node != NULL &&
++		    html->jsthread != NULL) {
++			struct form_control *fc;
++
++			for (fc = form->controls; fc != NULL; fc = fc->next) {
++				form_gadget_sync_with_dom(fc);
++			}
++			if (js_implicit_submit(html->jsthread, form->node)) {
++				break;
++			}
++		}
+ 		if (form) {
+ 			res = form_submit(content_get_url(c),
+ 					  html->bw,
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 14ddafc89..b664fab45 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -1663,7 +1663,7 @@ mouse_action_drag_none(html_content *html,
+ 	 */
+ 	struct mouse_action_state mas;
+ 	bool gadget_was;
+-	bool clicked;
++	bool clicked = true;
+ 
+ 	res = get_mouse_action_node(html, x, y, &mas);
+ 	if (res != NSERROR_OK) {
+@@ -1838,6 +1838,42 @@ mouse_action_drag_none(html_content *html,
+ 	 */
+ 	switch (mas.result.action) {
+ 	case ACTION_SUBMIT:
++		/* a click the page cancelled has no activation, so submits
++		 * nothing, as in a browser (VitaSurf) */
++		if (!clicked) {
++			NSLOG(netsurf, INFO, "click: the page cancelled the "
++			      "click, so the form is not submitted");
++			break;
++		}
++		/*
++		 * With script, the form goes as script submits one: the
++		 * submit event names its button, the formdata event and
++		 * form-associated custom elements add to the entries, and
++		 * the body is the HTML standard's encoding (VitaSurf).
++		 */
++		if (mas.gadget.control->form != NULL &&
++		    mas.gadget.control->form->node != NULL &&
++		    html->jsthread != NULL) {
++			struct form_control *fc;
++			int ix = 0, iy = 0;
++
++			/* what the user typed, into the DOM first */
++			for (fc = mas.gadget.control->form->controls;
++			     fc != NULL; fc = fc->next) {
++				form_gadget_sync_with_dom(fc);
++			}
++			if (mas.gadget.control->type == GADGET_IMAGE) {
++				ix = x - mas.gadget.box_x;
++				iy = y - mas.gadget.box_y;
++			}
++			if (js_submit(html->jsthread,
++				      mas.gadget.control->form->node,
++				      mas.gadget.control->node, ix, iy)) {
++				NSLOG(netsurf, INFO, "click: the form's "
++				      "submission went to script");
++				break;
++			}
++		}
+ 		/*
+ 		 * A page is allowed to handle its own submission, and a
+ 		 * great many now do: the form carries no action at all and
+diff --git a/content/handlers/javascript/js.h b/content/handlers/javascript/js.h
+index ce1c554c0..4def16b9a 100644
+--- a/content/handlers/javascript/js.h
++++ b/content/handlers/javascript/js.h
+@@ -144,6 +144,33 @@ bool js_fire_event(jsthread *thread, const char *type, struct dom_document *doc,
+  */
+ void js_activate(jsthread *thread, struct dom_node *target, int x, int y);
+ 
++/**
++ * Submit a form the user submitted with a button, as script submits one
++ * (VitaSurf): the submit event naming the button, the HTML standard's
++ * entry list and formdata event, and the body its method and enctype
++ * give, so a tap sends what requestSubmit() would.
++ *
++ * \param thread The script thread of the form's document.
++ * \param form The form.
++ * \param submitter The button that submitted it.
++ * \param x, y Where an image button was clicked, in its own
++ *             coordinates, or 0.
++ * \return true if script took the submission, false to submit natively.
++ */
++bool js_submit(jsthread *thread, struct dom_node *form,
++	       struct dom_node *submitter, int x, int y);
++
++/**
++ * Submit a form implicitly, as Enter in one of its fields does (VitaSurf):
++ * its default button is clicked, or with none, the form is submitted
++ * when it has only the one field that could take Enter.
++ *
++ * \param thread The script thread of the form's document.
++ * \param form The form.
++ * \return true if script took it, false to submit natively.
++ */
++bool js_implicit_submit(jsthread *thread, struct dom_node *form);
++
+ bool
+ js_dom_event_add_listener(jsthread *thread,
+ 			  struct dom_document *document,
+diff --git a/content/handlers/javascript/none/none.c b/content/handlers/javascript/none/none.c
+index 5db06a4ad..4490d4fc8 100644
+--- a/content/handlers/javascript/none/none.c
++++ b/content/handlers/javascript/none/none.c
+@@ -75,6 +75,17 @@ void js_activate(jsthread *thread, struct dom_node *target, int x, int y)
+ {
+ }
+ 
++bool js_submit(jsthread *thread, struct dom_node *form,
++	       struct dom_node *submitter, int x, int y)
++{
++	return false;
++}
++
++bool js_implicit_submit(jsthread *thread, struct dom_node *form)
++{
++	return false;
++}
++
+ void js_handle_new_element(jsthread *thread, struct dom_element *node)
+ {
+ }

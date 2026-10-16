@@ -1,0 +1,226 @@
+diff --git a/content/urldb.c b/content/urldb.c
+index 7a62131fd..45630acc1 100644
+--- a/content/urldb.c
++++ b/content/urldb.c
+@@ -1728,6 +1728,11 @@ urldb_search_insert(struct search_node *root, const struct host_part *data)
+ /** Whether the cookie being set came from script (document.cookie) */
+ static bool urldb_cookie_script = false;
+ 
++/** What parsing the cookie being set found, for its checks */
++static bool urldb_cookie_max_age = false;
++static bool urldb_cookie_samesite_none = false;
++static bool urldb_cookie_too_long = false;
++
+ /**
+  * Log what became of a cookie a response or a script set: its name and
+  * where it applies, never its value.
+@@ -1768,6 +1773,23 @@ urldb_cookie_note(const char *what,
+ }
+ 
+ 
++/**
++ * Whether a page may set a Secure cookie: https, or this machine, which
++ * browsers trust as they do https.
++ */
++static bool urldb_cookie_secure_origin(lwc_string *scheme, lwc_string *host)
++{
++	bool match;
++	const char *h = lwc_string_data(host);
++
++	if (lwc_string_isequal(scheme, corestring_lwc_https, &match) ==
++	    lwc_error_ok && match)
++		return true;
++	return strcasecmp(h, "localhost") == 0 ||
++	       strncmp(h, "127.", 4) == 0 || strcmp(h, "[::1]") == 0;
++}
++
++
+ /**
+  * Parse a cookie avpair
+  *
+@@ -1839,12 +1861,23 @@ urldb_parse_avpair(struct cookie_internal_data *c,
+ 			memcpy(c->domain + 1, v, dlen + 1);
+ 		}
+ 	} else if (strcasecmp(n, "Max-Age") == 0) {
+-		int temp = atoi(v);
+-		if (temp == 0)
+-			/* Special case - 0 means delete */
++		/* RFC 6265 5.2.2: digits, perhaps after a '-', or the
++		 * attribute is ignored; and it wins over Expires, in
++		 * whichever order they come */
++		const char *d = (v[0] == '-') ? v + 1 : v;
++		int temp;
++
++		if (*d == '\0' || strspn(d, "0123456789") != strlen(d))
++			return true;
++		temp = atoi(v);
++		urldb_cookie_max_age = true;
++		if (temp <= 0)
++			/* Special case - 0 or less means delete */
+ 			c->expires = 0;
+ 		else
+ 			c->expires = time(NULL) + temp;
++	} else if (strcasecmp(n, "SameSite") == 0) {
++		urldb_cookie_samesite_none = (strcasecmp(v, "None") == 0);
+ 	} else if (!c->path && strcasecmp(n, "Path") == 0) {
+ 		c->path_from_set = true;
+ 		c->path = strdup(v);
+@@ -1874,7 +1907,8 @@ urldb_parse_avpair(struct cookie_internal_data *c,
+ 			 * deal with that once we come to it) */
+ 			expires = (time_t)0x7fffffff;
+ 		}
+-		c->expires = expires;
++		if (!urldb_cookie_max_age)
++			c->expires = expires;
+ 	} else if (strcasecmp(n, "Secure") == 0) {
+ 		c->secure = true;
+ 	} else if (strcasecmp(n, "HttpOnly") == 0) {
+@@ -1929,9 +1963,14 @@ urldb_parse_cookie(nsurl *url, const char **cookie)
+ 	bool value_verbatim = false;
+ 	bool quoted = false;
+ 	bool was_quoted = false;
++	size_t pair_len = 0;
+ 
+ 	assert(url && cookie && *cookie);
+ 
++	urldb_cookie_max_age = false;
++	urldb_cookie_samesite_none = false;
++	urldb_cookie_too_long = false;
++
+ 	c = calloc(1, sizeof(struct cookie_internal_data));
+ 	if (c == NULL)
+ 		return NULL;
+@@ -2001,6 +2040,10 @@ urldb_parse_cookie(nsurl *url, const char **cookie)
+ 			*n = '\0';
+ 			*v = '\0';
+ 
++			if (c->name == NULL && pair_len > 4096)
++				urldb_cookie_too_long = true;
++			pair_len = 0;
++
+ 			if (!urldb_parse_avpair(c, name, value, was_quoted)) {
+ 				/* Memory exhausted */
+ 				urldb_free_cookie(c);
+@@ -2024,59 +2067,16 @@ urldb_parse_cookie(nsurl *url, const char **cookie)
+ 			continue;
+ 		}
+ 
+-		/* And now handle commas. These are a pain as they may mean
+-		 * any of the following:
+-		 *
+-		 * + End of cookie
+-		 * + Day separator in Expires avpair
+-		 * + (Invalid) comma in unquoted value
+-		 *
+-		 * Therefore, in order to handle all 3 cases (2 and 3 are
+-		 * identical, the difference being that 2 is in the spec and
+-		 * 3 isn't), we need to determine where the comma actually
+-		 * lies. We use the following heuristic:
+-		 *
+-		 *   Given a comma at the current input position, find the
+-		 *   immediately following semicolon (or end of input if none
+-		 *   found). Then, consider the input characters between
+-		 *   these two positions. If any of these characters is an
+-		 *   '=', we must assume that the comma signified the end of
+-		 *   the current cookie.
+-		 *
+-		 * This holds as the first avpair of any cookie must be
+-		 * NAME=VALUE, so the '=' is guaranteed to appear in the
+-		 * case where the comma marks the end of a cookie.
+-		 *
+-		 * This will fail, however, in the case where '=' appears in
+-		 * the value of the current avpair after the comma or the
+-		 * subsequent cookie does not start with NAME=VALUE. Neither
+-		 * of these is particularly likely and if they do occur, the
+-		 * website is more broken than we can be bothered to handle.
+-		 */
+-		if (!quoted && *cur == ',') {
+-			/* Find semi-colon, if any */
+-			const char *p;
+-			const char *semi = strchr(cur + 1, ';');
+-			if (!semi)
+-				semi = cur + strlen(cur) - 2 /* CRLF */;
+-
+-			/* Look for equals sign between comma and semi */
+-			for (p = cur + 1; p < semi; p++)
+-				if (*p == '=')
+-					break;
++		/* No comma ends a cookie. NetSurf split a header at a comma
++		 * followed by an '=', for servers folding several cookies
++		 * into one header, which RFC 6265 forbids; curl hands each
++		 * Set-Cookie header over on its own, and browsers keep a
++		 * value such as "lang=en,theme=dark" whole. */
+ 
+-			if (p == semi) {
+-				/* none found => comma internal to value */
+-				/* do nothing */
+-			} else {
+-				/* found one => comma marks end of cookie */
+-				cur++;
+-				break;
+-			}
+-		}
+-
+-		/* Accumulate into buffers, always leaving space for a NUL */
+-		/** \todo is silently truncating overlong names/values wise? */
++		/* Accumulate into buffers, always leaving space for a NUL;
++		 * what does not fit is counted, and a cookie whose name and
++		 * value are over 4096 bytes is refused, as browsers do */
++		pair_len++;
+ 		if (!in_value) {
+ 			if (n < name + (sizeof(name) - 1))
+ 				*n++ = *cur;
+@@ -2090,6 +2090,9 @@ urldb_parse_cookie(nsurl *url, const char **cookie)
+ 	*n = '\0';
+ 	*v = '\0';
+ 
++	if (c->name == NULL && pair_len > 4096)
++		urldb_cookie_too_long = true;
++
+ 	if (!urldb_parse_avpair(c, name, value, was_quoted)) {
+ 		/* Memory exhausted */
+ 		urldb_free_cookie(c);
+@@ -4151,6 +4154,43 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 			goto error;
+ 		}
+ 
++		/* RFC 6265bis 5.6, as browsers have it: a name and value
++		 * over 4096 bytes, a Secure cookie from a page that is not
++		 * https (or this machine), SameSite=None without Secure,
++		 * and a __Secure- or __Host- name without what it promises
++		 * are refused */
++		if (urldb_cookie_too_long) {
++			urldb_cookie_note("refused, over 4096 bytes,", c, host);
++			urldb_free_cookie(c);
++			goto error;
++		}
++		if (c->secure && !urldb_cookie_secure_origin(scheme, host)) {
++			urldb_cookie_note("refused, Secure from a page that is "
++					  "not https,", c, host);
++			urldb_free_cookie(c);
++			goto error;
++		}
++		if (urldb_cookie_samesite_none && !c->secure) {
++			urldb_cookie_note("refused, SameSite=None without "
++					  "Secure,", c, host);
++			urldb_free_cookie(c);
++			goto error;
++		}
++		if (strncasecmp(c->name, "__Secure-", 9) == 0 && !c->secure) {
++			urldb_cookie_note("refused, __Secure- without Secure,",
++					  c, host);
++			urldb_free_cookie(c);
++			goto error;
++		}
++		if (strncasecmp(c->name, "__Host-", 7) == 0 &&
++		    (!c->secure || c->domain_from_set ||
++		     !c->path_from_set || strcmp(c->path, "/") != 0)) {
++			urldb_cookie_note("refused, __Host- not Secure, "
++					  "host-only and at /,", c, host);
++			urldb_free_cookie(c);
++			goto error;
++		}
++
+ #ifdef WITH_NSPSL
+ 		/* check domain is not a public suffix */
+ 		dot = c->domain;

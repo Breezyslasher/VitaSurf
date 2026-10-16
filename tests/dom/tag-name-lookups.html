@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<!--
+  getElementsByTagName, document.baseURI and window.length, which the
+  browser looks up for itself as well as for the page (VitaSurf).
+
+  getElementsByTagName is walked inside libdom now, by the DOM's rule: an
+  HTML element's name matches in any ASCII case, any other element's only
+  exactly, so an SVG foreignObject is found as "foreignObject" and not as
+  "foreignobject" (the old walk upper-cased both). The <base> elements
+  and the frames are kept while the tree keeps its shape, so a <base>
+  href changed without the tree changing must still be read again, and a
+  frame added must still count. Each line must say PASS; Chrome passes
+  them all.
+-->
+<html><head><meta charset="utf-8"><title>Tag name lookups</title></head>
+<body>
+<div id="a"><p>one</p><DIV id="b"><P>two</P></DIV></div>
+<svg id="s" width="10" height="10"><foreignObject width="5" height="5"></foreignObject><circle r="1"/></svg>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+ok('an HTML name in any case', document.getElementsByTagName('div').length + ' ' + document.getElementsByTagName('DiV').length, '2 2');
+ok('under an element, itself left out', document.getElementById('a').getElementsByTagName('DIV').length, 1);
+ok('and its descendants in order', [].map.call(document.getElementById('a').getElementsByTagName('p'), function (e) { return e.textContent; }).join(), 'one,two');
+ok('an SVG name exactly', document.getElementsByTagName('foreignObject').length, 1);
+ok('and not in another case', document.getElementsByTagName('foreignobject').length, 0);
+ok('an SVG name in lower case', document.getElementById('s').getElementsByTagName('circle').length, 1);
+ok('a name nothing has', document.getElementsByTagName('nothing-here').length, 0);
+ok('the live list follows the tree', (function () {
+  var l = document.getElementsByTagName('section'), n0 = l.length;
+  document.body.appendChild(document.createElement('section'));
+  return n0 + ' ' + l.length; })(), '0 1');
+
+var start = document.baseURI;
+var base = document.createElement('base');
+base.setAttribute('href', 'http://example.com/x/');
+document.head.appendChild(base);
+ok('a <base> added is the base', document.baseURI, 'http://example.com/x/');
+base.setAttribute('href', 'http://example.com/y/');
+ok('its href changed, the tree not', document.baseURI, 'http://example.com/y/');
+document.getElementById('a').setAttribute('data-x', '1');
+base.removeAttribute('href');
+ok('its href removed', document.baseURI, start);
+base.remove();
+
+var n0 = window.length;
+var f = document.createElement('iframe');
+document.body.appendChild(f);
+ok('a frame added counts', window.length, n0 + 1);
+document.getElementById('a').setAttribute('data-y', '2');
+ok('and still after an attribute write', window.length, n0 + 1);
+ok('window[n] is its window', window[n0] === f.contentWindow, true);
+f.remove();
+ok('a frame removed no longer counts', window.length, n0);
+
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('tag-name-lookups: ' + l); });
+console.log('tag-name-lookups: done');
+</script>
+</body></html>

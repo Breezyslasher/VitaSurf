@@ -1,0 +1,94 @@
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 0289a63da..8ccfc5473 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -1959,10 +1959,7 @@ bool layout_table(
+ 			} else if (table->float_container &&
+ 					css_computed_position(table->style) !=
+ 						CSS_POSITION_ABSOLUTE &&
+-					(css_computed_float(table->style) ==
+-						CSS_FLOAT_LEFT ||
+-					css_computed_float(table->style) ==
+-						CSS_FLOAT_RIGHT)) {
++					lh__box_floats(table)) {
+ 				/* Table is a float */
+ 				assert(table->parent && table->parent->parent &&
+ 						table->parent->parent->parent);
+@@ -1979,7 +1976,8 @@ bool layout_table(
+ 				containing_block = table->parent->parent;
+ 			}
+ 
+-			if (containing_block) {
++			if (containing_block &&
++					containing_block->style != NULL) {
+ 				css_fixed ignored = 0;
+ 
+ 				htype = css_computed_height(
+@@ -2401,9 +2399,7 @@ static bool layout_apply_minmax_height(
+ 		/* Box is absolutely positioned */
+ 		assert(container);
+ 		containing_block = container;
+-	} else if (box->float_container && box->style != NULL &&
+-			(css_computed_float(box->style) == CSS_FLOAT_LEFT ||
+-			 css_computed_float(box->style) == CSS_FLOAT_RIGHT)) {
++	} else if (box->float_container && lh__box_floats(box)) {
+ 		/* Box is a float */
+ 		assert(box->parent && box->parent->parent &&
+ 				box->parent->parent->parent);
+@@ -2423,7 +2419,7 @@ static bool layout_apply_minmax_height(
+ 		css_unit unit = CSS_UNIT_PX;
+ 		int basis = -1;
+ 
+-		if (containing_block) {
++		if (containing_block && containing_block->style != NULL) {
+ 			htype = css_computed_height(containing_block->style,
+ 					&value, &unit);
+ 		}
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index 981c49525..ca6223bab 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -230,6 +230,22 @@ static inline bool lh__box_is_flex_item(const struct box *b)
+ 	return (b->parent != NULL) && lh__box_is_flex_container(b->parent);
+ }
+ 
++/**
++ * Layout helper: whether a box's float takes it out of flow. A flex
++ * item's float does nothing (CSS Flexbox 4), though its computed value
++ * still names a side, and the containing block a float has --
++ * parent->parent->parent, past its float box and inline container --
++ * is not there for it: an item floated right inside a flex container
++ * that was itself a float found an inline container, which has no
++ * style, and the layout read through null (VitaSurf).
++ */
++static inline bool lh__box_floats(const struct box *b)
++{
++	return b->style != NULL && !lh__box_is_flex_item(b) &&
++	       (css_computed_float(b->style) == CSS_FLOAT_LEFT ||
++		css_computed_float(b->style) == CSS_FLOAT_RIGHT);
++}
++
+ /** Layout helper: Check whether a flex item's flex-basis is auto. */
+ static inline bool lh__flex_item_basis_is_auto(const struct box *b)
+ {
+@@ -772,10 +788,7 @@ static inline void layout_find_dimensions(
+ 		} else if (box->float_container &&
+ 			css_computed_position(box->style) !=
+ 				CSS_POSITION_ABSOLUTE &&
+-			(css_computed_float(box->style) ==
+-				CSS_FLOAT_LEFT ||
+-			 css_computed_float(box->style) ==
+-				CSS_FLOAT_RIGHT)) {
++			lh__box_floats(box)) {
+ 			/* Box is a float */
+ 			assert(box->parent &&
+ 				box->parent->parent &&
+@@ -793,7 +806,7 @@ static inline void layout_find_dimensions(
+ 			containing_block = box->parent->parent;
+ 		}
+ 
+-		if (containing_block) {
++		if (containing_block && containing_block->style != NULL) {
+ 			css_fixed f = 0;
+ 			css_unit u = CSS_UNIT_PX;
+ 

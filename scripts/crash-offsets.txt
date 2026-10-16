@@ -153,3 +153,76 @@
 #   check during a rebuild. Fixed by patch 0327: an element with no
 #   containing block is left out with its subtree.
 0x4391a
+
+# Build 662: data abort on www.google.com during the site test, main
+#   thread, css_computed_height(NULL) at its first load, from
+#   layout_find_dimensions for a flex item (layout_flex.c:389). The dump's
+#   memory showed the tree: an inline container, a float box, then the
+#   flex container, whose item named a float. Taken as a float, the item
+#   looked for its containing block at parent->parent->parent, the
+#   inline container, which has no style. Fixed by patch 0417: a flex
+#   item's float does nothing. PC, LR, then the flex layout.
+0x10cdd4
+0x7a027
+0x7a84b
+
+# Build 666: assertion on www.weather.gov during the site test, main
+#   thread: "imagemap.c:711 imagemap_point_in_poly: xpt != NULL", reached
+#   from the pointer tracking over the page's map of the country. A
+#   polygon <area> whose coords gave no pair had no points. Fixed by
+#   patch 0419, which reads coords as HTML does. PC, LR.
+0x48452e
+0x4844fb
+
+# Build 670: assertion on www.espn.com during the site test, main thread:
+#   "box_inspect.c:555 in box_coords: box->float_container". Resolved
+#   against build 670's ELF: a script's setAttribute on a text field
+#   (node_set_attribute, DOMSubtreeModified) updated its text and asked
+#   for a redraw of its box (html_texty_element_update,
+#   html__redraw_a_box, box_bounds), and the box sat in a float that
+#   layout had not placed since the page changed. Fixed by patch 0421:
+#   a float layout has not reached is placed from its parent. PC, then
+#   box_bounds and html__redraw_a_box.
+0x484dde
+0x5a251
+0x6a5bf
+
+# Build 673: data abort on www.bbc.com during the site test, main
+#   thread, in css__selector_hash_find (match_selectors_in_sheet,
+#   css_select_style), reading " mar" -- style sheet text -- as a
+#   pointer. A script had changed a <style>'s text: NetSurf released the
+#   old sheet at once, while the selection context, made again only
+#   when the page had nothing left to fetch, still held it; the cache
+#   freed it eleven seconds later, and the next selection read freed
+#   memory. Fixed by patch 0422: a replaced sheet is kept until the
+#   context is made again, and the rebuild no longer waits for fetches
+#   past twenty seconds. PC, LR.
+0x113702
+0x11856f
+# Build 678: prefetch abort (PC 2) on www.bbc.com during the site test,
+#   main thread, as the cache freed reddit.com's page (hlcache_clean,
+#   content_destroy, html_destroy, the document's unref). Tearing the
+#   document's tree down freed an element, the element let go of its
+#   shadow root, and the shadow root leaving the document's pending
+#   list asked for the document to be destroyed again: the tree was
+#   torn down a second time from inside the first, and called a freed
+#   element's destroy through allocator data. Every page with a shadow
+#   root did this when freed (valgrind: 26 invalid reads on
+#   tests/dom/shadow-root.html). Fixed by libdom patch 0424. LR, then
+#   the frames down to html_destroy.
+0x155f3b
+0x1554c9
+0x1603cf
+0x15f829
+0x6cb0f
+0x41e4d
+0x9daed
+# Build 680: data abort on duckduckgo.com in the second site test run,
+#   main thread, in css_node_connected (css_sheet_unused,
+#   html_convert_css_callback), taking 0x19 for the element of a sheet.
+#   The sheet's load event ran a listener that added sheets, the array
+#   of the page's sheets was reallocated, and the callback read its
+#   entry from the freed copy. Fixed by patch 0425. PC, LR, caller.
+0x60ce8
+0x60ec5
+0x61119

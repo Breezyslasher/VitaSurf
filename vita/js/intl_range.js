@@ -19,12 +19,12 @@
  * in every field the pattern shows, V8 formats the first alone, and so
  * does this.
  *
- * __vitaIntlRange(D) takes what vita/js/intl.js shares of itself (the
+ * NV.__vitaIntlRange(D) takes what vita/js/intl.js shares of itself (the
  * pattern module, generators, formatters, moments and SimpleDateFormat's
  * rendering) and returns { create(slots), format(range, x, y),
  * formatToParts(range, x, y) }.
  */
-var __vitaIntlRange = function (D) {
+NV.__vitaIntlRange = function (D) {
 	'use strict';
 
 	var P = D.P;
@@ -927,4 +927,4 @@ var __vitaIntlRange = function (D) {
 };
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlRange;
+	module.exports = NV.__vitaIntlRange;

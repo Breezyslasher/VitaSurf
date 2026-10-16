@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!--
+  :scope in querySelector, querySelectorAll, matches and closest
+  (VitaSurf). The selectors answered in C take :scope now: the element a
+  query is asked of, or a document's root element; a fragment's, which
+  the DOM gives a virtual scope, is still the prelude's. jQuery from 3.6
+  writes ":scope " before every selector an element's find() asks, and
+  each went to the prelude's slower matcher. Each line must say PASS;
+  Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>:scope</title></head>
+<body>
+<div class="outer"><div id="e"><p id="p1">1</p><section><p id="p2">2</p></section><span class="x" id="s1">s</span></div></div>
+<pre id="out"></pre>
+<script>
+var out = [], e = document.getElementById('e');
+function ids(list) { return [].map.call(list, function (n) { return n.id || n.tagName; }).join(); }
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+ok(':scope > p, children only', ids(e.querySelectorAll(':scope > p')), 'p1');
+ok(':scope p, every descendant', ids(e.querySelectorAll(':scope p')), 'p1,p2');
+ok(':scope alone finds nothing under it', e.querySelector(':scope'), null);
+ok('a list with :scope', ids(e.querySelectorAll(':scope > p, :scope .x')), 'p1,s1');
+ok('an ancestor before :scope', ids(e.querySelectorAll('.outer :scope .x')), 's1');
+ok('and one it does not have', ids(e.querySelectorAll('.nothere :scope .x')), '');
+ok('the document: :scope is the root element', document.querySelector(':scope'), document.documentElement);
+ok('the document: :scope > body', ids(document.querySelectorAll(':scope > body')), 'BODY');
+ok('matches(:scope)', e.matches(':scope'), true);
+ok('matches(:scope > p) of itself', e.matches(':scope > p'), false);
+ok('matches(div:scope)', e.matches('div:scope'), true);
+ok('closest(:scope) is itself', document.getElementById('p2').closest(':scope'), document.getElementById('p2'));
+ok('closest(.outer) still', e.closest('.outer') === e.parentNode, true);
+var f = document.createDocumentFragment();
+f.appendChild(document.createElement('div')).id = 'f1';
+f.firstChild.appendChild(document.createElement('div')).id = 'f2';
+ok('a fragment: :scope > div', ids(f.querySelectorAll(':scope > div')), 'f1');
+ok('a fragment: :scope div', ids(f.querySelectorAll(':scope div')), 'f1,f2');
+ok('a fragment: :scope > div > div', ids(f.querySelectorAll(':scope > div > div')), 'f2');
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (x) { console.log('scope-selector: ' + x); });
+console.log('scope-selector: done');
+</script>
+</body></html>

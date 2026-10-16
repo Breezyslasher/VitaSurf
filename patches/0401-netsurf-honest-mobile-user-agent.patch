@@ -1,0 +1,78 @@
+diff --git a/utils/useragent.c b/utils/useragent.c
+index af24c46a5..2d5720082 100644
+--- a/utils/useragent.c
++++ b/utils/useragent.c
+@@ -54,44 +54,38 @@ user_agent_build_string(void)
+         }
+ #ifdef __vita__
+         /*
+-         * VitaSurf: the string this device's own browser sends.
++         * VitaSurf: what this is, on what, and that it is a mobile device.
+          *
+-         * A site that decides what to serve by reading this had no rule
+-         * for "PlayStation Vita; Mobile", which is a string nobody has
+-         * ever seen, so several of them fell back to their full desktop
+-         * application. Measured against YouTube: the old string was
+-         * served www.youtube.com with 10.8 MB of script files, and this
+-         * one is served m.youtube.com with 1.8 MB. The device spent
+-         * twenty-six seconds compiling the difference. Wikipedia serves
+-         * the same bytes either way, so this is about being recognised,
+-         * not about any one site.
+-         *
+-         * It claims AppleWebKit and Safari, which we are not, as every
+-         * browser's string does; what makes it the right one rather than
+-         * a convenient one is that it is what this hardware sends, so
+-         * the pages it asks for are pages meant for this screen and this
+-         * processor. An old WebKit also means conservative JavaScript,
+-         * which suits an interpreter with no JIT.
+-         *
+-         * The Mobile token is kept from the old string. The device's own
+-         * string does not carry it, and plenty of sites look for exactly
+-         * that word rather than for a device they know; measured across
+-         * six sites, adding it changed nothing that worked without it
+-         * and covers the ones that were never asked.
++         * The string was the Vita's own browser's, a 2012 WebKit (Silk
++         * 3.2), chosen so sites that read it would serve their mobile
++         * pages: with "PlayStation Vita; Mobile" alone YouTube served
++         * www.youtube.com, 10.8 MB of script, and with the Silk string
++         * m.youtube.com, 1.8 MB. But a browser claiming a 2012 WebKit
++         * while running WebAssembly, shadow DOM and every Intl API is a
++         * contradiction a site can see, and Cloudflare's challenges give
++         * browsers more than five years old only limited support; on
++         * claude.ai the check passed and the clearance it set was
++         * refused at once. So the string now names the engine and the
++         * device as they are, and keeps the Mobile token both where
++         * Firefox for Android has it and at the end, where the sites
++         * that look for "Mobi" or "Mobile" find it.
+          */
+-        {
+-                static const char vita_ua[] =
+-                        "Mozilla/5.0 (PlayStation Vita 3.73; Mobile) "
+-                        "AppleWebKit/536.26 (KHTML, like Gecko) "
+-                        "Silk/3.2 Mobile Safari/536.26";
+-                char *copy = strdup(vita_ua);
+-
+-                if (copy != NULL) {
+-                        core_user_agent_string = copy;
+-                        return;
+-                }
+-                /* out of memory: fall through and build the usual one */
++        len = snprintf(NULL, 0,
++                       "Mozilla/5.0 (PlayStation Vita 3.73; Mobile) "
++                       "NetSurf/%d.%d Mobile",
++                       netsurf_version_major, netsurf_version_minor);
++        ua_string = malloc(len + 1);
++        if (ua_string != NULL) {
++                snprintf(ua_string, len + 1,
++                         "Mozilla/5.0 (PlayStation Vita 3.73; Mobile) "
++                         "NetSurf/%d.%d Mobile",
++                         netsurf_version_major, netsurf_version_minor);
++                core_user_agent_string = ua_string;
++                NSLOG(netsurf, INFO, "Built user agent \"%s\"",
++                      core_user_agent_string);
++                return;
+         }
++        /* out of memory: fall through and build the usual one */
+ #endif
+ 
+         len = snprintf(NULL, 0, NETSURF_UA_FORMAT_STRING,

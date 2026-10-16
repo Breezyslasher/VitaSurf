@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Clipboard and permissions</title></head>
+<body>
+<!--
+ navigator.permissions and the Async Clipboard API. Chrome passes every
+ line on the shape of them; what differs is what this browser can do:
+ writing text is allowed and reading is refused, as Chrome does for a
+ page whose user has not agreed to reads, and what VitaSurf cannot do
+ at all (geolocation, the camera) is denied where Chrome would ask.
+ Ends with "done".
+-->
+<pre id="out"></pre>
+<script>
+var out=[],steps=[];
+function check(n,ok,x){out.push((ok?'PASS ':'FAIL ')+n+(ok?'':' '+(x||'')));}
+function finish(){out.push('done');document.getElementById('out').textContent=out.join('\n');
+ out.forEach(function(l){console.log('clipboard-permissions: '+l);});}
+function rejects(p,name){return p.then(function(){return 'resolved';},
+ function(e){return e&&(e.name===name||(name==='TypeError'&&e instanceof TypeError))?true:'rejected '+(e&&e.name);});}
+check('interfaces',navigator.permissions instanceof Permissions&&
+ navigator.clipboard instanceof Clipboard&&navigator.clipboard instanceof EventTarget&&
+ typeof ClipboardItem==='function'&&ClipboardItem.length===1);
+check('illegal constructors',(function(){try{new Permissions();}catch(e){return e instanceof TypeError;}})());
+var item=new ClipboardItem({'text/plain':'plain text','text/html':Promise.resolve('<b>bold</b>')});
+check('ClipboardItem',item.types.join()==='text/plain,text/html'&&item.presentationStyle==='unspecified'&&
+ Object.isFrozen(item.types));
+check('ClipboardItem needs an entry',(function(){try{new ClipboardItem({});}catch(e){return e instanceof TypeError;}})());
+check('supports',ClipboardItem.supports('text/plain')&&!ClipboardItem.supports('image/gif'));
+Promise.all([
+ navigator.permissions.query({name:'clipboard-write'}),
+ navigator.permissions.query({name:'clipboard-read'}),
+ navigator.permissions.query({name:'notifications'}),
+ navigator.permissions.query({name:'geolocation'}),
+ rejects(navigator.permissions.query({name:'bogus'}),'TypeError'),
+ rejects(navigator.permissions.query({}),'TypeError'),
+ rejects(navigator.permissions.query({name:'push'}),'NotSupportedError'),
+ navigator.clipboard.writeText('hello').then(function(){return true;},function(e){return 'rejected '+e.name;}),
+ rejects(navigator.clipboard.readText(),'NotAllowedError'),
+ navigator.clipboard.write([item]).then(function(){return true;},function(e){return 'rejected '+e.name;}),
+ rejects(navigator.clipboard.write([new ClipboardItem({'image/png':new Blob([])})]),'NotAllowedError'),
+ item.getType('text/html').then(function(b){return b.text();}),
+ rejects(item.getType('image/png'),'NotFoundError')
+]).then(function(r){
+ check('PermissionStatus',r[0] instanceof PermissionStatus&&r[0].name==='clipboard-write'&&'onchange' in r[0]);
+ check('clipboard-write granted',r[0].state==='granted',r[0].state);
+ check('clipboard-read denied',r[1].state==='denied',r[1].state);
+ check('notifications as Notification says',r[2].state===(Notification.permission==='default'?'prompt':Notification.permission),r[2].state);
+ check('geolocation denied without it',navigator.geolocation||r[3].state==='denied',r[3].state);
+ check('an unknown name is a TypeError',r[4]===true,r[4]);
+ check('no name is a TypeError',r[5]===true,r[5]);
+ check('push needs userVisibleOnly',r[6]===true,r[6]);
+ check('writeText',r[7]===true,r[7]);
+ check('readText refused',r[8]===true,r[8]);
+ check('write',r[9]===true,r[9]);
+ check('write of an image refused',r[10]===true,r[10]);
+ check('getType',r[11]==='<b>bold</b>',r[11]);
+ check('getType of a type it lacks',r[12]===true,r[12]);
+ finish();
+},function(e){check('no throw',false,String(e));finish();});
+</script>
+</body></html>

@@ -1,0 +1,98 @@
+diff --git a/quickjs.c b/quickjs.c
+index 8dc1858..7a1c5b1 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -651,7 +651,10 @@ struct JSString {
+     uint32_t hash : 28;
+     uint32_t kind : 2;
+     uint32_t atom_type : 2; /* != 0 if atom, JS_ATOM_TYPE_x */
+-    uint32_t hash_next; /* atom_index for JS_ATOM_TYPE_SYMBOL */
++    uint32_t hash_next; /* atom_index for JS_ATOM_TYPE_SYMBOL; for a
++                           string that is not an atom, the atom it was
++                           found as when used as a property key (held),
++                           or 0 */
+     JSWeakRefRecord *first_weak_ref;
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     struct list_head link; /* string list */
+@@ -2400,6 +2403,8 @@ static inline void js_free_string0(JSRuntime *rt, JSString *str)
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+         list_del(&str->link);
+ #endif
++        if (str->hash_next)
++            JS_FreeAtomRT(rt, str->hash_next);
+         switch (str->kind) {
+         case JS_STRING_KIND_SLICE:
+             slice = (void *)&str[1];
+@@ -3317,6 +3322,11 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
+     if (str) {
+         if (str->atom_type == 0) {
+             p = str;
++            if (p->hash_next) {
++                /* its cached atom, for a symbol made from it */
++                JS_FreeAtomRT(rt, p->hash_next);
++                p->hash_next = 0;
++            }
+             p->atom_type = atom_type;
+         } else {
+             p = js_malloc_rt(rt, sizeof(JSString) +
+@@ -3473,15 +3483,33 @@ static void __JS_FreeAtom(JSRuntime *rt, uint32_t i)
+ static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
+ {
+     JSRuntime *rt = ctx->rt;
++    JSAtom atom;
+     uint32_t n;
++    /* A string held elsewhere too (a name a script keeps in a table and
++       uses as a key again and again) keeps the atom it was found as, so
++       that the next time it is not hashed and compared. */
++    if (p->atom_type == 0 && p->hash_next != 0) {
++        atom = JS_DupAtomRT(rt, p->hash_next);
++        js_free_string(rt, p);
++        return atom;
++    }
+     if (is_num_string(&n, p)) {
+         if (n <= JS_ATOM_MAX_INT) {
++            atom = __JS_AtomFromUInt32(n);
++            if (p->atom_type == 0 && p->header.ref_count > 1)
++                p->hash_next = atom;
+             js_free_string(rt, p);
+-            return __JS_AtomFromUInt32(n);
++            return atom;
+         }
+     }
++    if (p->atom_type != 0 || p->header.ref_count == 1)
++        return __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
+     /* XXX: should generate an exception */
+-    return __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
++    atom = __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
++    /* p is still held elsewhere; unless it became the atom itself */
++    if (atom != JS_ATOM_NULL && p->atom_type == 0)
++        p->hash_next = JS_DupAtomRT(rt, atom);
++    return atom;
+ }
+ 
+ /* `str` may be pure ASCII or UTF-8 encoded */
+@@ -5218,6 +5246,11 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
+     if (p1->header.ref_count == 1 && p1->is_wide_char == p2->is_wide_char
+     &&  js_malloc_usable_size(ctx, p1) >= sizeof(*p1) + ((p1->len + p2->len) << p2->is_wide_char) + 1 - p1->is_wide_char) {
+         /* Concatenate in place in available space at the end of p1 */
++        if (p1->atom_type == 0 && p1->hash_next) {
++            /* its cached atom is for what it held before */
++            JS_FreeAtomRT(ctx->rt, p1->hash_next);
++            p1->hash_next = 0;
++        }
+         if (p1->is_wide_char) {
+             memcpy(str16(p1) + p1->len, str16(p2), p2->len << 1);
+             p1->len += p2->len;
+@@ -9755,6 +9788,12 @@ static JSAtom JS_ValueToAtomInternal(JSContext *ctx, JSValueConst val,
+     } else if (tag == JS_TAG_SYMBOL) {
+         JSAtomStruct *p = JS_VALUE_GET_PTR(val);
+         atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, p));
++    } else if (tag == JS_TAG_STRING) {
++        JSString *p = JS_VALUE_GET_STRING(val);
++        if (p->atom_type == 0 && p->hash_next != 0)
++            atom = JS_DupAtom(ctx, p->hash_next);
++        else
++            atom = JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(js_dup(val)));
+     } else {
+         JSValue str;
+         str = JS_ToPropertyKeyInternal(ctx, val, flags);

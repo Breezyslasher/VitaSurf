@@ -19,9 +19,9 @@
  *
  * Runs under Node too, to be held against ICU with the cases
  * scripts/gen-intl-segmenter-tests.mjs makes:
- * __vitaIntlSegmenter(W, N, C, X).
+ * NV.__vitaIntlSegmenter(W, N, C, X).
  */
-var __vitaIntlSegmenter = function (W, N, C, X) {
+NV.__vitaIntlSegmenter = function (W, N, C, X) {
 	'use strict';
 
 	var Intl = W.Intl, getOption = X.getOption, method = X.method;
@@ -1017,11 +1017,11 @@ var __vitaIntlSegmenter = function (W, N, C, X) {
 	Intl.Segmenter = Segmenter;
 };
 
-if (typeof window !== 'undefined' && window.__vitaIntl &&
-    window.__vitaIntl.number && window.__vitaIntl.has &&
-    window.__vitaIntl.has('g:meta') && window.__vitaIntlCore)
-	__vitaIntlSegmenter(window, window.__vitaIntl, window.__vitaIntlCore,
-			    window.__vitaIntl.number);
+if (typeof window !== 'undefined' && NV.__vitaIntl &&
+    NV.__vitaIntl.number && NV.__vitaIntl.has &&
+    NV.__vitaIntl.has('g:meta') && NV.__vitaIntlCore)
+	NV.__vitaIntlSegmenter(window, NV.__vitaIntl, NV.__vitaIntlCore,
+			    NV.__vitaIntl.number);
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlSegmenter;
+	module.exports = NV.__vitaIntlSegmenter;

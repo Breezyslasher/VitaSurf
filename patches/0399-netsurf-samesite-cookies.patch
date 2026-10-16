@@ -1,0 +1,846 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index 6fa9ca6d6..d28def5c7 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -92,6 +92,8 @@ struct fetch {
+ 	nsurl *url;		/**< URL. */
+ 	nsurl *referer;		/**< Referer URL. */
+ 	bool verifiable;	/**< Transaction is verifiable */
++	bool top_level;		/**< navigates a top-level window (VitaSurf) */
++	bool unsafe_method;	/**< not GET or HEAD (VitaSurf) */
+ 	void *p;		/**< Private data for callback. */
+ 	lwc_string *host;	/**< Host part of URL, interned */
+ 	http_response_code http_code;	/**< HTTP response code, or 0. */
+@@ -639,6 +641,7 @@ fetch_start(nsurl *url,
+ 	    const struct fetch_multipart_data *post_multipart,
+ 	    bool verifiable,
+ 	    bool downgrade_tls,
++	    bool top_level,
+ 	    const char *headers[],
+ 	    struct fetch **fetch_out)
+ {
+@@ -669,6 +672,8 @@ fetch_start(nsurl *url,
+ 	fetch->callback = callback;
+ 	fetch->url = nsurl_ref(url);
+ 	fetch->verifiable = verifiable;
++	fetch->top_level = top_level;
++	fetch->unsafe_method = (post_urlenc != NULL || post_multipart != NULL);
+ 	fetch->p = p;
+ 	fetch->host = nsurl_get_component(url, NSURL_HOST);
+ 
+@@ -1006,27 +1011,88 @@ nsurl *fetch_get_referer(struct fetch *fetch)
+ }
+ 
+ 
++/** Where the browser window layer says a document's requests stand */
++static bool (*fetch_cookie_site_cb)(nsurl *referer, char *site, size_t len);
++
++/* exported interface documented in content/fetch.h */
++void fetch_set_cookie_site_handler(bool (*cb)(nsurl *referer, char *site,
++					      size_t len))
++{
++	fetch_cookie_site_cb = cb;
++}
++
++/**
++ * A fetch's SameSite context (RFC 6265bis 5.2): a top-level navigation is
++ * same-site, and may carry Strict cookies when the user or a same-site
++ * page started it; any other request is same-site when its site is the
++ * site for cookies of the document that made it.
++ */
++static void fetch_cookie_context(struct fetch *fetch,
++				 struct urldb_cookie_context *ctx)
++{
++	char site[256], other[256];
++
++	ctx->same_site = true;
++	ctx->top_level = fetch->top_level;
++	ctx->safe_method = !fetch->unsafe_method;
++	ctx->strict_ok = true;
++
++	if (!urldb_site(fetch->url, site, sizeof(site)))
++		return;
++
++	if (fetch->top_level) {
++		if (fetch->referer != NULL &&
++		    urldb_site(fetch->referer, other, sizeof(other)) &&
++		    strcmp(other, site) != 0)
++			ctx->strict_ok = false;
++		return;
++	}
++
++	if (fetch->referer == NULL)
++		/* the browser's own request */
++		return;
++
++	if (fetch_cookie_site_cb != NULL) {
++		if (!fetch_cookie_site_cb(fetch->referer, other,
++					  sizeof(other))) {
++			/* a frame of another site than its top window's */
++			ctx->same_site = false;
++			return;
++		}
++	} else if (!urldb_site(fetch->referer, other, sizeof(other))) {
++		return;
++	}
++	ctx->same_site = (strcmp(other, site) == 0);
++}
++
++/* exported interface documented in content/fetch.h */
++bool fetch_cookie_site(nsurl *doc, char *site, size_t len)
++{
++	if (fetch_cookie_site_cb != NULL)
++		return fetch_cookie_site_cb(doc, site, len);
++	return urldb_site(doc, site, len);
++}
++
++/* exported interface documented in content/fetch.h */
++char *fetch_get_cookie_string(struct fetch *fetch)
++{
++	struct urldb_cookie_context ctx;
++
++	fetch_cookie_context(fetch, &ctx);
++	return urldb_get_cookie_for(fetch->url, true, &ctx);
++}
++
+ /* exported interface documented in content/fetch.h */
+ void fetch_set_cookie(struct fetch *fetch, const char *data)
+ {
++	struct urldb_cookie_context ctx;
++
+ 	assert(fetch && data);
+ 
+-	/* If the fetch is unverifiable err on the side of caution and
+-	 * do not set the cookie */
+-
+-	if (fetch->verifiable) {
+-		/* If the transaction's verifiable, we don't require
+-		 * that the request uri and the parent domain match,
+-		 * so don't pass in any referer/parent in this case. */
+-		urldb_set_cookie(data, fetch->url, NULL);
+-	} else if (fetch->referer != NULL) {
+-		/* Permit the cookie to be set if the fetch is unverifiable
+-		 * and the fetch URI domain matches the referer. */
+-		/** \todo Long-term, this needs to be replaced with a
+-		 * comparison against the origin fetch URI. In the case
+-		 * where a nested object requests a fetch, the origin URI
+-		 * is the nested object's parent URI, whereas the referer
+-		 * for the fetch will be the nested object's URI. */
+-		urldb_set_cookie(data, fetch->url, fetch->referer);
+-	}
++	/* NetSurf took no cookie from an unverifiable fetch of another
++	 * domain than its referer's: a frame's, an image's. Browsers take
++	 * a third party's cookie, and SameSite decides where it goes and
++	 * whether a cross-site response may set it at all (VitaSurf). */
++	fetch_cookie_context(fetch, &ctx);
++	urldb_set_cookie_for(data, fetch->url, NULL, &ctx);
+ }
+diff --git a/content/fetch.h b/content/fetch.h
+index 3090ea199..e2b1f4e2f 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -161,6 +161,7 @@ typedef void (*fetch_callback)(const fetch_msg *msg, void *p);
+  * \param post_multipart
+  * \param verifiable
+  * \param downgrade_tls
++ * \param top_level The fetch navigates a top-level window (VitaSurf)
+  * \param headers
+  * \param fetch_out ponter to recive new fetch object.
+  * \return NSERROR_OK and fetch_out updated else appropriate error code
+@@ -168,9 +169,39 @@ typedef void (*fetch_callback)(const fetch_msg *msg, void *p);
+ nserror fetch_start(nsurl *url, nsurl *referer, fetch_callback callback,
+ 		    void *p, bool only_2xx, const char *post_urlenc,
+ 		    const struct fetch_multipart_data *post_multipart,
+-		    bool verifiable, bool downgrade_tls,
++		    bool verifiable, bool downgrade_tls, bool top_level,
+ 		    const char *headers[], struct fetch **fetch_out);
+ 
++/**
++ * The cookies a fetch carries, as its SameSite context allows
++ * (VitaSurf).
++ *
++ * \param fetch The fetch
++ * \return the Cookie header's value on the heap, or NULL for none
++ */
++char *fetch_get_cookie_string(struct fetch *fetch);
++
++/**
++ * A document's site for cookies (VitaSurf): see
++ * fetch_set_cookie_site_handler.
++ *
++ * \param doc The document's URL
++ * \param site Receives the site
++ * \param len Size of site
++ * \return false for none, as for a frame of another site than its top
++ */
++bool fetch_cookie_site(struct nsurl *doc, char *site, size_t len);
++
++/**
++ * Set how a request from a document finds its site for cookies: the
++ * site of its top-level page when every frame between is of that site,
++ * else none, and the callback returns false (VitaSurf).
++ *
++ * \param cb The callback
++ */
++void fetch_set_cookie_site_handler(bool (*cb)(struct nsurl *referer,
++					      char *site, size_t len));
++
+ /**
+  * Abort a fetch.
+  */
+diff --git a/content/fetchers/curl.c b/content/fetchers/curl.c
+index 3966b9699..345fae69d 100644
+--- a/content/fetchers/curl.c
++++ b/content/fetchers/curl.c
+@@ -1365,7 +1365,7 @@ static CURLcode fetch_curl_set_options(struct curl_fetch_info *f)
+ 		return code;
+ 	}
+ 
+-	f->cookie_string = urldb_get_cookie(f->url, true);
++	f->cookie_string = fetch_get_cookie_string(f->fetch_handle);
+ 	if (f->cookie_string) {
+ 		SETOPT(CURLOPT_COOKIE, f->cookie_string);
+ 	} else {
+diff --git a/content/llcache.c b/content/llcache.c
+index e73b8426c..459b74cc7 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -1026,6 +1026,7 @@ static nserror llcache_object_refetch(llcache_object *object)
+ 			  multipart,
+ 			  object->fetch.flags & LLCACHE_RETRIEVE_VERIFIABLE,
+ 			  object->fetch.tried_with_tls_downgrade,
++			  object->fetch.flags & LLCACHE_RETRIEVE_TOP_LEVEL,
+ 			  (const char **)headers,
+ 			  &object->fetch.fetch);
+ 
+diff --git a/content/llcache.h b/content/llcache.h
+index 593d3ad7e..b2e97e0d9 100644
+--- a/content/llcache.h
++++ b/content/llcache.h
+@@ -67,7 +67,10 @@ enum llcache_retrieve_flag {
+ 	 * cached or not, and one of a URL already being fetched or held
+ 	 * for a user fetches nothing and gives no handle (VitaSurf)
+ 	 */
+-	LLCACHE_RETRIEVE_PRELOAD        = (1 << 4)
++	LLCACHE_RETRIEVE_PRELOAD        = (1 << 4),
++	/** Navigates a top-level window: SameSite cookies treat it as
++	 * same-site (VitaSurf) */
++	LLCACHE_RETRIEVE_TOP_LEVEL      = (1 << 5)
+ };
+ 
+ /** Low-level cache event types */
+diff --git a/content/urldb.c b/content/urldb.c
+index 45630acc1..fc4e6cf95 100644
+--- a/content/urldb.c
++++ b/content/urldb.c
+@@ -141,8 +141,16 @@ struct cookie_internal_data {
+ 	bool no_destroy;	/**< Never destroy this cookie,
+ 				 * unless it's expired */
+ 
++	int same_site;		/**< URLDB_SAMESITE_* (VitaSurf) */
+ };
+ 
++/* A cookie's SameSite attribute; one without is Lax for sending, as in
++ * Chrome, and an unknown value is as none */
++#define URLDB_SAMESITE_DEFAULT 0
++#define URLDB_SAMESITE_NONE    1
++#define URLDB_SAMESITE_LAX     2
++#define URLDB_SAMESITE_STRICT  3
++
+ 
+ /**
+  * A protection space
+@@ -290,7 +298,7 @@ static struct search_node *search_trees[NUM_SEARCH_TREES] = {
+ /** Minimum cookie database file version */
+ #define MIN_COOKIE_FILE_VERSION 100
+ /** Current cookie database file version */
+-#define COOKIE_FILE_VERSION 102
++#define COOKIE_FILE_VERSION 103
+ /** loaded cookie file version */
+ static int loaded_cookie_file_version;
+ 
+@@ -1730,7 +1738,9 @@ static bool urldb_cookie_script = false;
+ 
+ /** What parsing the cookie being set found, for its checks */
+ static bool urldb_cookie_max_age = false;
+-static bool urldb_cookie_samesite_none = false;
++
++/** The SameSite context of the request setting the cookie, if any */
++static const struct urldb_cookie_context *urldb_cookie_ctx = NULL;
+ static bool urldb_cookie_too_long = false;
+ 
+ /**
+@@ -1877,7 +1887,14 @@ urldb_parse_avpair(struct cookie_internal_data *c,
+ 		else
+ 			c->expires = time(NULL) + temp;
+ 	} else if (strcasecmp(n, "SameSite") == 0) {
+-		urldb_cookie_samesite_none = (strcasecmp(v, "None") == 0);
++		if (strcasecmp(v, "None") == 0)
++			c->same_site = URLDB_SAMESITE_NONE;
++		else if (strcasecmp(v, "Lax") == 0)
++			c->same_site = URLDB_SAMESITE_LAX;
++		else if (strcasecmp(v, "Strict") == 0)
++			c->same_site = URLDB_SAMESITE_STRICT;
++		else
++			c->same_site = URLDB_SAMESITE_DEFAULT;
+ 	} else if (!c->path && strcasecmp(n, "Path") == 0) {
+ 		c->path_from_set = true;
+ 		c->path = strdup(v);
+@@ -1968,7 +1985,6 @@ urldb_parse_cookie(nsurl *url, const char **cookie)
+ 	assert(url && cookie && *cookie);
+ 
+ 	urldb_cookie_max_age = false;
+-	urldb_cookie_samesite_none = false;
+ 	urldb_cookie_too_long = false;
+ 
+ 	c = calloc(1, sizeof(struct cookie_internal_data));
+@@ -2909,14 +2925,14 @@ static void urldb_save_cookie_paths(FILE *fp, struct path_data *parent)
+ 
+ 				fprintf(fp,
+ 					"%d\t%s\t%d\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t"
+-					"%s\t%s\t%d\t%s\t%s\t%s\n",
++					"%s\t%s\t%d\t%d\t%s\t%s\t%s\n",
+ 					c->version, c->domain,
+ 					c->domain_from_set, c->path,
+ 					c->path_from_set, c->secure,
+ 					c->http_only,
+ 					(int)c->expires, (int)c->last_used,
+ 					c->no_destroy, c->name, c->value,
+-					c->value_was_quoted,
++					c->value_was_quoted, c->same_site,
+ 					p->scheme ? lwc_string_data(p->scheme) :
+ 					"unused",
+ 					p->url ? nsurl_access(p->url) :
+@@ -4170,7 +4186,7 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 			urldb_free_cookie(c);
+ 			goto error;
+ 		}
+-		if (urldb_cookie_samesite_none && !c->secure) {
++		if (c->same_site == URLDB_SAMESITE_NONE && !c->secure) {
+ 			urldb_cookie_note("refused, SameSite=None without "
+ 					  "Secure,", c, host);
+ 			urldb_free_cookie(c);
+@@ -4190,31 +4206,51 @@ bool urldb_set_cookie(const char *header, nsurl *url, nsurl *referer)
+ 			urldb_free_cookie(c);
+ 			goto error;
+ 		}
+-
+-#ifdef WITH_NSPSL
+-		/* check domain is not a public suffix */
+-		dot = c->domain;
+-		if (*dot == '.') {
+-			dot++;
+-		}
+-		suffix = nspsl_getpublicsuffix(dot);
+-		if (suffix == NULL) {
+-			urldb_cookie_note("refused, a public suffix's,", c,
+-					  host);
++		/* RFC 6265bis 5.6 step 15: a cookie not SameSite=None from
++		 * a cross-site request that is not a top-level navigation
++		 * (Lax by default, as Chrome has it) */
++		if (urldb_cookie_ctx != NULL &&
++		    c->same_site != URLDB_SAMESITE_NONE &&
++		    !urldb_cookie_ctx->same_site &&
++		    !urldb_cookie_ctx->top_level) {
++			urldb_cookie_note("refused, SameSite from a cross-site "
++					  "request,", c, host);
+ 			urldb_free_cookie(c);
+ 			goto error;
+ 		}
++
++		/* RFC 6265 5.3 step 5: only a Domain attribute is held to
++		 * the public suffixes; a host-only cookie is its host's,
++		 * whatever the host (localhost, a LAN name). A Domain that
++		 * is a public suffix and the host itself makes a host-only
++		 * cookie, as browsers have it. */
++		if (c->domain[0] == '.') {
++#ifdef WITH_NSPSL
++			dot = c->domain + 1;
++			suffix = nspsl_getpublicsuffix(dot);
++			if (suffix == NULL) {
++				if (strcasecmp(dot, lwc_string_data(host)) == 0) {
++					memmove(c->domain, dot, strlen(dot) + 1);
++					c->domain_from_set = false;
++				} else {
++					urldb_cookie_note("refused, a public "
++							  "suffix's,", c, host);
++					urldb_free_cookie(c);
++					goto error;
++				}
++			}
+ #else
+-		/* 4.3.2:ii Cookie domain must contain embedded dots */
+-		dot = strchr(c->domain + 1, '.');
+-		if (!dot || *(dot + 1) == '\0') {
+-			/* no embedded dots */
+-			urldb_cookie_note("refused, a top-level domain's,", c,
+-					  host);
+-			urldb_free_cookie(c);
+-			goto error;
+-		}
++			/* 4.3.2:ii Cookie domain must contain embedded dots */
++			dot = strchr(c->domain + 1, '.');
++			if (!dot || *(dot + 1) == '\0') {
++				/* no embedded dots */
++				urldb_cookie_note("refused, a top-level "
++						  "domain's,", c, host);
++				urldb_free_cookie(c);
++				goto error;
++			}
+ #endif
++		}
+ 
+ 		/* Domain match fetch host with cookie domain */
+ 		if (strcasecmp(lwc_string_data(host), c->domain) != 0) {
+@@ -4317,20 +4353,93 @@ error:
+ 
+ 
+ /* exported interface documented in content/urldb.h */
+-bool urldb_set_cookie_from_script(const char *cookie, nsurl *url)
++bool urldb_set_cookie_for(const char *header, nsurl *url, nsurl *referer,
++		const struct urldb_cookie_context *ctx)
++{
++	bool ret;
++
++	urldb_cookie_ctx = ctx;
++	ret = urldb_set_cookie(header, url, referer);
++	urldb_cookie_ctx = NULL;
++
++	return ret;
++}
++
++
++/* exported interface documented in content/urldb.h */
++bool urldb_set_cookie_from_script(const char *cookie, nsurl *url,
++		const struct urldb_cookie_context *ctx)
+ {
+ 	bool ret;
+ 
+ 	urldb_cookie_script = true;
+-	ret = urldb_set_cookie(cookie, url, NULL);
++	ret = urldb_set_cookie_for(cookie, url, NULL, ctx);
+ 	urldb_cookie_script = false;
+ 
+ 	return ret;
+ }
+ 
+ 
++/* exported interface documented in content/urldb.h */
++bool urldb_site(nsurl *url, char *buf, size_t len)
++{
++	lwc_string *scheme, *host;
++	const char *s, *h, *reg;
++	int n;
++
++	host = nsurl_get_component(url, NSURL_HOST);
++	if (host == NULL)
++		return false;
++	scheme = nsurl_get_component(url, NSURL_SCHEME);
++	s = scheme != NULL ? lwc_string_data(scheme) : "";
++	if (strcasecmp(s, "wss") == 0)
++		s = "https";
++	else if (strcasecmp(s, "ws") == 0)
++		s = "http";
++	h = lwc_string_data(host);
++	reg = NULL;
++#ifdef WITH_NSPSL
++	if (!urldb__host_is_ip_address(h))
++		reg = nspsl_getpublicsuffix(h);
++#endif
++	n = snprintf(buf, len, "%s://%s", s, reg != NULL ? reg : h);
++	if (scheme != NULL)
++		lwc_string_unref(scheme);
++	lwc_string_unref(host);
++	return n > 0 && (size_t)n < len;
++}
++
++
++/**
++ * Whether a request in a SameSite context may carry a cookie (RFC 6265bis
++ * 5.8.3, as Chrome has it: a cookie without SameSite is Lax)
++ */
++static bool urldb_cookie_samesite_ok(const struct cookie_internal_data *c,
++		const struct urldb_cookie_context *ctx)
++{
++	if (ctx == NULL || c->same_site == URLDB_SAMESITE_NONE)
++		return true;
++	if (!ctx->same_site) {
++		/* cross-site: Lax goes with a safe top-level navigation */
++		return c->same_site != URLDB_SAMESITE_STRICT &&
++		       ctx->top_level && ctx->safe_method;
++	}
++	if (c->same_site == URLDB_SAMESITE_STRICT && ctx->top_level)
++		return ctx->strict_ok;
++	return true;
++}
++
++
+ /* exported interface documented in content/urldb.h */
+ char *urldb_get_cookie(nsurl *url, bool include_http_only)
++{
++	return urldb_get_cookie_for(url, include_http_only, NULL);
++}
++
++
++/* exported interface documented in content/urldb.h */
++char *urldb_get_cookie_for(nsurl *url, bool include_http_only,
++		const struct urldb_cookie_context *ctx)
+ {
+ 	const struct path_data *p, *q;
+ 	const struct host_part *h;
+@@ -4418,6 +4527,10 @@ char *urldb_get_cookie(nsurl *url, bool include_http_only)
+ 					/* Ignore HttpOnly */
+ 					continue;
+ 
++				if (!urldb_cookie_samesite_ok(c, ctx))
++					/* withheld by its SameSite */
++					continue;
++
+ 				matched_cookies[count++] = c;
+ 
+ 				GROW_MATCHED_COOKIES;
+@@ -4458,6 +4571,10 @@ char *urldb_get_cookie(nsurl *url, bool include_http_only)
+ 					/* Ignore HttpOnly */
+ 					continue;
+ 
++				if (!urldb_cookie_samesite_ok(c, ctx))
++					/* withheld by its SameSite */
++					continue;
++
+ 				matched_cookies[count++] = c;
+ 
+ 				GROW_MATCHED_COOKIES;
+@@ -4506,6 +4623,10 @@ char *urldb_get_cookie(nsurl *url, bool include_http_only)
+ 				/* Ignore HttpOnly */
+ 				continue;
+ 
++			if (!urldb_cookie_samesite_ok(c, ctx))
++				/* withheld by its SameSite */
++				continue;
++
+ 			matched_cookies[count++] = c;
+ 
+ 			GROW_MATCHED_COOKIES;
+@@ -4544,6 +4665,10 @@ char *urldb_get_cookie(nsurl *url, bool include_http_only)
+ 				/* Ignore HttpOnly */
+ 				continue;
+ 
++			if (!urldb_cookie_samesite_ok(c, ctx))
++				/* withheld by its SameSite */
++				continue;
++
+ 			matched_cookies[count++] = c;
+ 
+ 			GROW_MATCHED_COOKIES;
+@@ -4619,7 +4744,8 @@ nserror urldb_load_cookies(const char *filename)
+ 			*domain, *path, *name, *value, *scheme, *url,
+ 			*comment;
+ 		int version, domain_specified, path_specified,
+-			secure, http_only, no_destroy, value_quoted;
++			secure, http_only, no_destroy, value_quoted,
++			same_site;
+ 		time_t expires, last_used;
+ 		struct cookie_internal_data *c;
+ 
+@@ -4675,6 +4801,12 @@ nserror urldb_load_cookies(const char *filename)
+ 		} else {
+ 			value_quoted = 0;
+ 		}
++		if (loaded_cookie_file_version > 102) {
++			/* Introduced in version 1.03 (VitaSurf) */
++			SKIP_T;	same_site = atoi(p); FIND_T;
++		} else {
++			same_site = URLDB_SAMESITE_DEFAULT;
++		}
+ 		SKIP_T; scheme = p; FIND_T;
+ 		SKIP_T; url = p; FIND_T;
+ 
+@@ -4694,6 +4826,7 @@ nserror urldb_load_cookies(const char *filename)
+ 		c->name = strdup(name);
+ 		c->value = strdup(value);
+ 		c->value_was_quoted = value_quoted;
++		c->same_site = same_site;
+ 		c->comment = strdup(comment);
+ 		c->domain_from_set = domain_specified;
+ 		c->domain = strdup(domain);
+diff --git a/content/urldb.h b/content/urldb.h
+index f40de4f1b..fa15e6173 100644
+--- a/content/urldb.h
++++ b/content/urldb.h
+@@ -142,15 +142,68 @@ bool urldb_get_cert_permissions(struct nsurl *url);
+ bool urldb_set_cookie(const char *header, struct nsurl *url, struct nsurl *referrer);
+ 
+ 
++/**
++ * Where a request stands for SameSite (RFC 6265bis 5.2, as Chrome has it)
++ */
++struct urldb_cookie_context {
++	/** the request's site is its site for cookies: the site of the
++	 * top-level page, when every frame between is of it too */
++	bool same_site;
++	/** a navigation of the top-level window */
++	bool top_level;
++	/** GET or HEAD */
++	bool safe_method;
++	/** a top-level navigation the user or a same-site page started,
++	 * which may carry SameSite=Strict cookies */
++	bool strict_ok;
++};
++
++/**
++ * Parse Set-Cookie header and insert cookie(s) into database, for a
++ * request in the given SameSite context
++ *
++ * \param header Header to parse, with Set-Cookie: stripped
++ * \param url URL being fetched
++ * \param referrer Referring resource, or 0 for verifiable transaction
++ * \param ctx The request's SameSite context, NULL for none to apply
++ * \return true on success, false otherwise
++ */
++bool urldb_set_cookie_for(const char *header, struct nsurl *url,
++		struct nsurl *referrer, const struct urldb_cookie_context *ctx);
++
+ /**
+  * Set a cookie from script (document.cookie), which may neither set an
+  * HttpOnly cookie nor replace one.
+  *
+  * \param cookie The string script assigned
+  * \param url URL of the document
++ * \param ctx The document's SameSite context, NULL for none to apply
+  * \return true on success, false otherwise
+  */
+-bool urldb_set_cookie_from_script(const char *cookie, struct nsurl *url);
++bool urldb_set_cookie_from_script(const char *cookie, struct nsurl *url,
++		const struct urldb_cookie_context *ctx);
++
++/**
++ * Retrieve cookies for an URL, for a request in the given SameSite context
++ *
++ * \param url URL being fetched
++ * \param include_http_only Whether to include HTTP(S) only cookies.
++ * \param ctx The request's SameSite context, NULL for none to apply
++ * \return Cookies string for libcurl (on heap), or NULL on error/no cookies
++ */
++char *urldb_get_cookie_for(struct nsurl *url, bool include_http_only,
++		const struct urldb_cookie_context *ctx);
++
++/**
++ * The site of a URL for SameSite: its scheme (ws and wss as http and
++ * https) and its registrable domain, as "https://example.com".
++ *
++ * \param url The URL
++ * \param buf Receives the site
++ * \param len Size of buf
++ * \return true if the URL has a host, so a site
++ */
++bool urldb_site(struct nsurl *url, char *buf, size_t len);
+ 
+ 
+ /**
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index c25455a1a..e11117195 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -47,6 +47,7 @@
+ #include "content/content.h"
+ #include "content/hlcache.h"
+ #include "content/urldb.h"
++#include "content/fetch.h"
+ #include "content/content_debug.h"
+ 
+ #include "html/html.h"
+@@ -3225,6 +3226,162 @@ nserror browser_window_debug(struct browser_window *bw, enum content_debug op)
+ }
+ 
+ 
++/*
++ * The top-level windows, so a request can be judged against the page in
++ * the window its document is in, for SameSite cookies (VitaSurf).
++ */
++#define BW_MAX_ROOTS 16
++static struct browser_window *bw_roots[BW_MAX_ROOTS];
++static int bw_nroots;
++
++static bool browser_window_cookie_site(nsurl *referer, char *site,
++				       size_t len);
++
++static void browser_window_root_add(struct browser_window *bw)
++{
++	if (bw_nroots < BW_MAX_ROOTS) {
++		bw_roots[bw_nroots++] = bw;
++	}
++	fetch_set_cookie_site_handler(browser_window_cookie_site);
++}
++
++static void browser_window_root_remove(struct browser_window *bw)
++{
++	int i;
++
++	for (i = 0; i < bw_nroots; i++) {
++		if (bw_roots[i] == bw) {
++			bw_roots[i] = bw_roots[--bw_nroots];
++			return;
++		}
++	}
++}
++
++/** The URL of the document a window shows, or is loading if none yet */
++static nsurl *browser_window_doc_url(struct browser_window *bw, bool loading)
++{
++	struct hlcache_handle *h = loading ? bw->loading_content :
++		bw->current_content;
++
++	return h != NULL ? hlcache_handle_get_url(h) : NULL;
++}
++
++/** Find the window whose current or loading document is url */
++static struct browser_window *
++browser_window_find_doc(struct browser_window *bw, nsurl *url)
++{
++	struct browser_window *found;
++	nsurl *u;
++	int i;
++
++	u = browser_window_doc_url(bw, false);
++	if (u != NULL && nsurl_compare(u, url, NSURL_COMPLETE))
++		return bw;
++	u = browser_window_doc_url(bw, true);
++	if (u != NULL && nsurl_compare(u, url, NSURL_COMPLETE))
++		return bw;
++	if (bw->children != NULL) {
++		for (i = 0; i < bw->rows * bw->cols; i++) {
++			found = browser_window_find_doc(&bw->children[i], url);
++			if (found != NULL)
++				return found;
++		}
++	}
++	for (i = 0; i < bw->iframe_count; i++) {
++		found = browser_window_find_doc(bw->iframes[i], url);
++		if (found != NULL)
++			return found;
++	}
++	return NULL;
++}
++
++/** A document's site; about: and data: documents are their creator's */
++static bool browser_window_doc_site(nsurl *url, char *site, size_t len)
++{
++	lwc_string *scheme = nsurl_get_component(url, NSURL_SCHEME);
++	bool inherit = false;
++
++	if (scheme != NULL) {
++		const char *s = lwc_string_data(scheme);
++		inherit = (strcmp(s, "about") == 0 || strcmp(s, "data") == 0 ||
++			   strcmp(s, "blob") == 0);
++		lwc_string_unref(scheme);
++	}
++	if (inherit)
++		return false;
++	return urldb_site(url, site, len);
++}
++
++/**
++ * The site for cookies of a request a document makes (RFC 6265bis 5.2.1):
++ * the top-level page's site, when the document and every frame between
++ * are of that site; false for none, as for a frame of another site.
++ */
++static bool browser_window_cookie_site(nsurl *referer, char *site,
++				       size_t len)
++{
++	struct browser_window *bw = NULL, *f;
++	char top[256], here[256];
++	nsurl *u;
++	int i;
++
++	for (i = 0; i < bw_nroots && bw == NULL; i++) {
++		bw = browser_window_find_doc(bw_roots[i], referer);
++	}
++
++	if (bw == NULL) {
++		/* not a document (a style sheet importing another, a
++		 * worker's script): same-site with a top-level page of
++		 * its site, else a frame's */
++		if (!urldb_site(referer, here, sizeof(here)))
++			return false;
++		for (i = 0; i < bw_nroots; i++) {
++			int k;
++			for (k = 0; k < 2; k++) {
++				u = browser_window_doc_url(bw_roots[i], k == 1);
++				if (u != NULL &&
++				    urldb_site(u, top, sizeof(top)) &&
++				    strcmp(top, here) == 0) {
++					snprintf(site, len, "%s", here);
++					return true;
++				}
++			}
++		}
++		return false;
++	}
++
++	if (bw->parent == NULL) {
++		/* the top-level document itself */
++		if (!browser_window_doc_site(referer, site, len))
++			return urldb_site(referer, site, len);
++		return true;
++	}
++
++	/* a frame: its document and each frame above must be of the
++	 * top-level page's site */
++	f = browser_window_get_root(bw);
++	u = browser_window_doc_url(f, false);
++	if (u == NULL)
++		u = browser_window_doc_url(f, true);
++	if (u == NULL || !urldb_site(u, top, sizeof(top)))
++		return false;
++	if (browser_window_doc_site(referer, here, sizeof(here)) &&
++	    strcmp(here, top) != 0)
++		return false;
++	for (f = bw->parent; f != NULL && f->parent != NULL; f = f->parent) {
++		u = browser_window_doc_url(f, false);
++		if (u == NULL)
++			u = browser_window_doc_url(f, true);
++		if (u != NULL &&
++		    browser_window_doc_site(u, here, sizeof(here)) &&
++		    strcmp(here, top) != 0)
++			return false;
++	}
++	snprintf(site, len, "%s", top);
++	return true;
++}
++
++
+ /* exported interface, documented in netsurf/browser_window.h */
+ nserror
+ browser_window_create(enum browser_window_create_flags flags,
+@@ -3297,6 +3454,10 @@ browser_window_create(enum browser_window_create_flags flags,
+ 		return NSERROR_BAD_PARAMETER;
+ 	}
+ 
++
++	/* requests from its documents find their site for cookies */
++	browser_window_root_add(ret);
++
+ 	if (url != NULL) {
+ 		enum browser_window_nav_flags nav_flags;
+ 		nav_flags = BW_NAVIGATE_NO_TERMINAL_HISTORY_UPDATE;
+@@ -3382,6 +3543,8 @@ void browser_window_destroy(struct browser_window *bw)
+ 	/* can't destoy child windows on their own */
+ 	assert(!bw->parent);
+ 
++	browser_window_root_remove(bw);
++
+ 	/* destroy */
+ 	browser_window_destroy_internal(bw);
+ 	free(bw);
+@@ -3705,6 +3868,11 @@ navigate_internal_real(struct browser_window *bw,
+ 	if (!(params->flags & BW_NAVIGATE_UNVERIFIABLE)) {
+ 		fetch_flags |= LLCACHE_RETRIEVE_VERIFIABLE;
+ 	}
++	if (bw->parent == NULL) {
++		/* SameSite cookies count a top-level navigation as
++		 * same-site (VitaSurf) */
++		fetch_flags |= LLCACHE_RETRIEVE_TOP_LEVEL;
++	}
+ 
+ 	if (params->post_multipart != NULL) {
+ 		post.type = LLCACHE_POST_MULTIPART;

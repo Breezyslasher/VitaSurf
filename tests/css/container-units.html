@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<!--
+  Container query units in font-size (VitaSurf).
+
+  cqw and cqi are a hundredth of the nearest container's inline size. They
+  had been read as vw and vi, a hundredth of the window, so Amazon's card
+  titles, 11.8cqi in cards a third of the screen wide, were three times
+  the size they should be and ran out of their cards. A font size in them
+  now follows its container, as the layout measured it; with no container
+  it stays the viewport's. The block-size units, which need a size
+  container, keep their viewport meaning here. Each line must say PASS;
+  Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Container units</title>
+<style>
+body { margin: 0; }
+.c { container-type: inline-size; width: 300px; }
+.c2 { container-type: inline-size; width: 500px; }
+.in { width: 200px; }
+#a { font-size: 10cqi; }
+#b { font-size: 10cqw; }
+#c { font-size: 5cqi; }
+#d { font-size: 10cqi; }
+#e { font-size: 2cqw; }
+</style></head>
+<body>
+<div class="c"><p id="a">a</p><div class="in"><p id="c">c</p></div></div>
+<div class="c2"><p id="b">b</p><div class="c" style="width:100px"><p id="d">d</p></div></div>
+<p id="e">e</p>
+<pre id="out"></pre>
+<script>
+function fs(id) { return getComputedStyle(document.getElementById(id)).fontSize; }
+addEventListener('load', function () {
+  setTimeout(function () {
+    var out = [];
+    function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+    ok('10cqi in a 300px container', fs('a'), '30px');
+    ok('10cqw in a 500px container', fs('b'), '50px');
+    ok('5cqi deeper in the same container', fs('c'), '15px');
+    ok('the nearest of two containers', fs('d'), '10px');
+    ok('no container: the viewport', fs('e'), (innerWidth * 0.02) + 'px');
+    document.getElementById('out').textContent = out.join('\n');
+    out.forEach(function (x) { console.log('container-units: ' + x); });
+    console.log('container-units: done');
+  }, 200);
+});
+</script>
+</body></html>

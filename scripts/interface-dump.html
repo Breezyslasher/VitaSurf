@@ -1,0 +1,39 @@
+<!DOCTYPE html><meta charset="utf-8"><title>Interface dump</title>
+<!--
+  What every interface on the window is: its name, length, whether it
+  constructs, its parent, its toStringTag, how the global is defined, its
+  prototype's members and its constants. Run in Chrome
+    headless_shell --no-sandbox --dump-dom file:///.../interface-dump.html
+  and give the text of <pre id=out> to scripts/gen-interface-tables.py.
+  In VitaSurf's harness it prints the same lines to the console (XX ...),
+  to compare against Chrome's.
+-->
+<pre id=out></pre><script>
+var lines=[];
+function say(s){lines.push(s);}
+var names=Object.getOwnPropertyNames(window).filter(function(n){
+  var d=Object.getOwnPropertyDescriptor(window,n);
+  return d&&typeof d.value==='function'&&/^[A-Z]/.test(n)&&d.value.prototype;}).sort();
+names.forEach(function(n){
+  var C=window[n],P=C.prototype,parent=Object.getPrototypeOf(P),pc=parent&&Object.getOwnPropertyDescriptor(parent,'constructor');
+  var ctor='';
+  try{new C();ctor='constructs';}catch(e){ctor=e instanceof TypeError&&/Illegal constructor/.test(e.message)?'illegal':e.name;}
+  var d=Object.getOwnPropertyDescriptor(window,n);
+  var tag=Object.getOwnPropertyDescriptor(P,Symbol.toStringTag);
+  var cd=Object.getOwnPropertyDescriptor(P,'constructor');
+  var members=Object.getOwnPropertyNames(P).filter(function(k){return k!=='constructor';}).sort().map(function(k){
+    var m=Object.getOwnPropertyDescriptor(P,k);
+    return k+':'+(m.get||m.set?'a'+(m.set?'w':'r')+(m.enumerable?'e':''):typeof m.value==='function'?'m'+(m.enumerable?'e':''):'v');}).join(',');
+  say(['IFACE',n,'name='+C.name,'len='+C.length,'ctor='+ctor,'parent='+(pc&&pc.value&&pc.value.name||(parent===Object.prototype?'Object':String(parent))),
+       'protoOfC='+(Object.getPrototypeOf(C)&&Object.getPrototypeOf(C).name||'?'),'pctor='+(cd?(cd.value===C)+(cd.enumerable?'e':''):'none'),
+       'tag='+(tag?tag.value:'none'),'global='+(d.enumerable?'e':'')+(d.writable?'w':'')+(d.configurable?'c':'')].join(' | '));
+  if(members)members.split(',').forEach(function(m){say('M '+n+' '+m);});
+  Object.getOwnPropertyNames(C).forEach(function(k){var d=Object.getOwnPropertyDescriptor(C,k);
+   if(/^[A-Z][A-Z0-9_]*$/.test(k)&&typeof d.value==='number')say('K '+n+' '+k+' '+d.value+' '+(d.writable?'w':'')+(d.enumerable?'e':'')+(d.configurable?'c':''));
+   else if(typeof d.value==='function'&&k!=='prototype')say('S '+n+' '+k);});
+});
+say('VITA '+Object.getOwnPropertyNames(window).filter(function(n){return /^__vita/.test(n);}).join(','));
+say('GLOBALS '+Object.keys(window).length);
+lines.forEach(function(l){try{console.log('XX '+l);}catch(e){}});
+document.getElementById('out').textContent=lines.join('\n');
+</script>

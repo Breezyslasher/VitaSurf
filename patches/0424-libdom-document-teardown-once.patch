@@ -1,0 +1,53 @@
+diff --git a/src/core/document.c b/src/core/document.c
+index f98224d..509e6c0 100644
+--- a/src/core/document.c
++++ b/src/core/document.c
+@@ -289,6 +289,7 @@ dom_exception _dom_document_initialise(dom_document *doc,
+ 
+ 	doc->dispatching_mutation = 0;
+ 	doc->quiet_mutations = 0;
++	doc->finalising = false;
+ 
+ 	/* We should not pass a NULL when all things hook up */
+ 	return _dom_document_event_internal_initialise(&doc->dei, daf, daf_ctx);
+@@ -299,7 +300,9 @@ dom_exception _dom_document_initialise(dom_document *doc,
+ bool _dom_document_finalise(dom_document *doc)
+ {
+ 	/* Finalise base class, delete the tree in force */
++	doc->finalising = true;
+ 	_dom_node_finalise(&doc->base);
++	doc->finalising = false;
+ 
+ 	/* Now, the first_child and last_child should be null */
+ 	doc->base.first_child = NULL;
+@@ -1528,6 +1531,10 @@ void _dom_document_try_destroy(dom_document *doc)
+ 	if (doc->base.base.refcnt != 0 || doc->base.parent != NULL)
+ 		return;
+ 
++	/* the teardown under way decides once the tree is gone (VitaSurf) */
++	if (doc->finalising)
++		return;
++
+ 	_dom_document_destroy((dom_node_internal *) doc);
+ }
+ 
+diff --git a/src/core/document.h b/src/core/document.h
+index f3f0c1d..a30783f 100644
+--- a/src/core/document.h
++++ b/src/core/document.h
+@@ -90,6 +90,15 @@ struct dom_document {
+ 	 * quiet flag on each of them.
+ 	 */
+ 	uint32_t quiet_mutations;
++
++	/*
++	 * Raised while the document's tree is being torn down
++	 * (VitaSurf). A shadow root its host lets go of then is on the
++	 * pending list, and leaving it asks for the document to be
++	 * destroyed, which tore the same tree down a second time from
++	 * inside the first, over elements already freed.
++	 */
++	bool finalising;
+ };
+ 
+ /* Create a DOM document */

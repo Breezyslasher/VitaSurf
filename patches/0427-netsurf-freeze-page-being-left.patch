@@ -1,0 +1,163 @@
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+index fe64aded9..59d771acd 100644
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -34,6 +34,7 @@ struct gui_window;
+ struct selection;
+ struct nsurl;
+ struct dom_node;
++struct content;
+ 
+ /**
+  * history entry page information
+@@ -125,6 +126,14 @@ struct browser_window {
+ 	 * if no page is being loaded.
+ 	 */
+ 	struct hlcache_handle *loading_content;
++	/**
++	 * The current content when a load committed (VitaSurf): the
++	 * loading content made its script realm, and from then the page
++	 * it replaces stays frozen while any load is under way in this
++	 * window, as it would be gone in a browser, until it stops being
++	 * current or the window stops loading.
++	 */
++	struct hlcache_handle *frozen_current;
+ 
+ 	/**
+ 	 * The fetch parameters for the loading content
+@@ -447,4 +456,21 @@ typedef nserror (*browser_window_query_callback)(bool proceed, void *pw);
+  */
+ nserror browser_window__reload_current_parameters(struct browser_window *bw);
+ 
++/**
++ * Whether a page's script is frozen (VitaSurf): this window, or one it
++ * is a frame of, has a page loading that has committed -- it has made
++ * its script realm -- and the page is not that one. Chrome unloads a
++ * page once the navigation away from it commits, while it may still be
++ * on the screen; NetSurf keeps it current until the next page is ready,
++ * and its timers, sockets and requests went on running through the
++ * whole of that page's load. Frozen, they wait; if the load is given up
++ * and the page stays, they carry on.
++ *
++ * \param bw  the window the page's script belongs to
++ * \param c   the page's content
++ * \return true when the page's script is to wait
++ */
++bool browser_window_scripts_frozen(struct browser_window *bw,
++				   struct content *c);
++
+ #endif
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index cb679af47..461e0b307 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -768,6 +768,7 @@ browser_window_convert_to_download(struct browser_window *bw,
+ 	/* remove content from browser window */
+ 	hlcache_handle_release(bw->loading_content);
+ 	bw->loading_content = NULL;
++	bw->frozen_current = NULL;
+ 
+ 	browser_window_stop_throbber(bw);
+ }
+@@ -931,7 +932,9 @@ static nserror browser_window_content_ready(struct browser_window *bw)
+ 	}
+ 
+ 	bw->current_content = bw->loading_content;
++	bw->frozen_current = NULL;
+ 	bw->loading_content = NULL;
++	bw->frozen_current = NULL;
+ 
+ 	/* a new page has its own address (VitaSurf) */
+ 	if (bw->script_url != NULL) {
+@@ -1515,8 +1518,10 @@ browser_window__handle_error(struct browser_window *bw,
+ 
+ 	if (c == bw->loading_content) {
+ 		bw->loading_content = NULL;
++		bw->frozen_current = NULL;
+ 	} else if (c == bw->current_content) {
+ 		bw->current_content = NULL;
++		bw->frozen_current = NULL;
+ 		browser_window_remove_caret(bw, false);
+ 	}
+ 
+@@ -1606,6 +1611,7 @@ browser_window_callback(hlcache_handle *c, const hlcache_event *event, void *pw)
+ 		if (content_get_type(c) == CONTENT_THEME) {
+ 			theme_install_start(c);
+ 			bw->loading_content = NULL;
++			bw->frozen_current = NULL;
+ 			browser_window_stop_throbber(bw);
+ 		} else
+ #endif
+@@ -1731,6 +1737,10 @@ browser_window_callback(hlcache_handle *c, const hlcache_event *event, void *pw)
+ 			jsthread *thread;
+ 			assert(bw->loading_content == c);
+ 
++			/* the navigation commits: the page it replaces, and
++			 * its frames, are frozen from here (VitaSurf) */
++			bw->frozen_current = bw->current_content;
++
+ 			if (js_newthread(bw->jsheap,
+ 					 bw,
+ 					 hlcache_handle_get_content(c),
+@@ -2005,12 +2015,14 @@ nserror browser_window_destroy_internal(struct browser_window *bw)
+ 		hlcache_handle_abort(bw->loading_content);
+ 		hlcache_handle_release(bw->loading_content);
+ 		bw->loading_content = NULL;
++		bw->frozen_current = NULL;
+ 	}
+ 
+ 	if (bw->current_content != NULL) {
+ 		content_close(bw->current_content);
+ 		hlcache_handle_release(bw->current_content);
+ 		bw->current_content = NULL;
++		bw->frozen_current = NULL;
+ 	}
+ 
+ 	if (bw->script_url != NULL) {
+@@ -3797,7 +3809,15 @@ browser_window_navigate_body(struct browser_window *bw,
+ 		}
+ 	}
+ 
+-	browser_window_stop(bw);
++	{
++		/* a page frozen by a load that committed stays frozen
++		 * through the next one: it would be gone in a browser
++		 * (VitaSurf) */
++		struct hlcache_handle *frozen = bw->frozen_current;
++
++		browser_window_stop(bw);
++		bw->frozen_current = frozen;
++	}
+ 	browser_window_remove_caret(bw, false);
+ 	browser_window_destroy_children(bw);
+ 	browser_window_destroy_iframes(bw);
+@@ -4503,6 +4523,7 @@ void browser_window_stop(struct browser_window *bw)
+ 		hlcache_handle_abort(bw->loading_content);
+ 		hlcache_handle_release(bw->loading_content);
+ 		bw->loading_content = NULL;
++		bw->frozen_current = NULL;
+ 	}
+ 
+ 	if (bw->current_content != NULL &&
+@@ -5256,3 +5277,21 @@ nserror browser_window_show_certificates(struct browser_window *bw)
+ 
+ 	return res;
+ }
++
++
++/* exported interface documented in desktop/browser_private.h */
++bool browser_window_scripts_frozen(struct browser_window *bw,
++				   struct content *c)
++{
++	struct browser_window *w;
++
++	for (w = bw; w != NULL; w = w->parent) {
++		if (w->frozen_current != NULL &&
++		    w->frozen_current == w->current_content &&
++		    w->loading_content != NULL &&
++		    hlcache_handle_get_content(w->loading_content) != c) {
++			return true;
++		}
++	}
++	return false;
++}

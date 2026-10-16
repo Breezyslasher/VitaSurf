@@ -110,9 +110,11 @@ add_executable(${PROJECT_NAME}
     vita/platform/vita_file.c
     # SceNet and SceNetCtl bring-up.
     vita/platform/vita_net.c
+    vita/platform/vita_clipboard.c
     # Host name lookups on threads of their own, for the fetcher and
     # WebSockets, so that no lookup holds the browser up.
     vita/platform/vita_resolve.c
+    vita/platform/vita_dns.c
     # NetSurf download table: files saved under ux0:data/VitaSurf/downloads.
     vita/platform/vita_download.c
     # Optional FlareSolverr client for Cloudflare browser checks.
@@ -121,6 +123,7 @@ add_executable(${PROJECT_NAME}
     vita/input/vita_input.c
     vita/input/vita_ime.c
     vita/input/vita_menu.c
+    vita/input/vita_sitetest.c
 )
 if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     if(NOT EXISTS "${VITASDK}/arm-vita-eabi/include/quickjs.h")
@@ -135,19 +138,27 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
     # 300 KB as one, which is more than anyone can hold in their head; a
     # self-contained area of the platform belongs in its own file. Order
     # matters only where one file runs code at load time that another
-    # defines, so keep prelude.js first.
+    # defines, so keep prelude.js first, inside natives-open.js and
+    # natives-close.js, which make the whole one function (see them).
     set(PRELUDE_PARTS
+        vita/js/natives-open.js
+        vita/js/url.js
         vita/js/prelude.js
-        vita/js/streams.js
+        vita/js/streams-use.js
         vita/js/performance.js
         vita/js/storage.js
         vita/js/subtle.js
-        vita/js/wasm.js
-        vita/js/lazy.js)
+        vita/js/lazy.js
+        vita/js/geometry.js
+        vita/js/nodes.js
+        vita/js/singletons.js
+        vita/js/interfaces.js
+        vita/js/natives-close.js)
     # Intl, the largest part, is a unit of its own that runs the first
     # time a page uses it (vita/js/lazy.js): most pages never do, and it
     # was a fifth of the prelude every page paid for.
     set(PRELUDE_INTL_PARTS
+        vita/js/natives-open.js
         vita/js/intl_core.js
         vita/js/intl_number.js
         vita/js/intl_names.js
@@ -159,8 +170,18 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/intl_zone.js
         vita/js/intl_calendar.js
         vita/js/intl_range.js
-        vita/js/intl.js)
-    foreach(unit PRELUDE PRELUDE_INTL)
+        vita/js/intl.js
+        vita/js/natives-close.js)
+    # Streams, IndexedDB and WebAssembly are units the same way.
+    set(PRELUDE_STREAMS_PARTS vita/js/natives-open.js vita/js/streams.js
+        vita/js/natives-close.js)
+    set(PRELUDE_IDB_PARTS vita/js/natives-open.js vita/js/idb.js
+        vita/js/natives-close.js)
+    set(PRELUDE_WASM_PARTS vita/js/natives-open.js vita/js/wasm.js
+        vita/js/natives-close.js)
+    set(PRELUDE_UNITS PRELUDE PRELUDE_INTL PRELUDE_STREAMS PRELUDE_IDB
+        PRELUDE_WASM)
+    foreach(unit ${PRELUDE_UNITS})
         set(${unit}_BYTES "")
         foreach(part ${${unit}_PARTS})
             set(full "${CMAKE_SOURCE_DIR}/${part}")
@@ -170,19 +191,33 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
             # a newline between parts, so a file that ends in a comment cannot
             # swallow the first line of the next one
             set(${unit}_BYTES "${${unit}_BYTES}${part_bytes}0x0a,")
+            # after each of the prelude's own parts, the time it took, for
+            # the log (__vitaPartDone in vita/js/qjs.c)
+            get_filename_component(stem "${part}" NAME_WE)
+            if(unit STREQUAL "PRELUDE" AND NOT stem MATCHES "^natives-")
+                set(mark "${CMAKE_BINARY_DIR}/generated/mark-${stem}.js")
+                file(WRITE "${mark}" "NV.__vitaPartDone&&NV.__vitaPartDone('${stem}');\n")
+                file(READ "${mark}" mark_hex HEX)
+                string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," mark_bytes "${mark_hex}")
+                set(${unit}_BYTES "${${unit}_BYTES}${mark_bytes}")
+            endif()
         endforeach()
     endforeach()
-    file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h"
-        "/* generated from ${PRELUDE_PARTS} and ${PRELUDE_INTL_PARTS} */\n"
-        "static const unsigned char prelude_js[] = {${PRELUDE_BYTES}0x00};\n"
-        "static const unsigned char prelude_intl_js[] = {${PRELUDE_INTL_BYTES}0x00};\n")
+    set(PRELUDE_H "/* generated from the parts of ${PRELUDE_UNITS} */\n")
+    foreach(unit ${PRELUDE_UNITS})
+        string(TOLOWER "${unit}" array)
+        set(PRELUDE_H "${PRELUDE_H}static const unsigned char ${array}_js[] = {${${unit}_BYTES}0x00};\n")
+    endforeach()
+    file(WRITE "${CMAKE_BINARY_DIR}/generated/prelude_js.h" "${PRELUDE_H}")
     # canvas.c rasterises what a page draws into a <canvas>, which the
     # engine hands over as flattened paths
     # websocket.c runs WebSocket connections on libcurl's ws API
     # intl.c reads the locale data Intl is built on, resources/intl.pak
+    # url.c is the URL Standard's parser, which URL is built on
+    # ifaces.c gives the interfaces their WebIDL shapes for the prelude
     target_sources(${PROJECT_NAME} PRIVATE vita/js/qjs.c vita/js/qjs_alloc.c
         vita/js/canvas.c vita/js/subtle.c vita/js/wasm.c vita/js/websocket.c
-        vita/js/intl.c)
+        vita/js/intl.c vita/js/url.c vita/js/ifaces.c)
     # subtle.c takes Ed25519 and X25519 from Monocypher, which mbedTLS
     # does not have
     target_sources(${PROJECT_NAME} PRIVATE
@@ -354,6 +389,8 @@ target_link_libraries(${PROJECT_NAME}
     SceProcessmgr_stub
     SceSysmem_stub
     SceAppMgr_stub
+    # the system clipboard (vita/platform/vita_clipboard.c)
+    SceClipboard_stub
 )
 
 # ---------------------------------------------------------------------------

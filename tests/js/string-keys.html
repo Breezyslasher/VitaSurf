@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Strings reused as property keys</title></head>
+<body><pre id="out"></pre>
+<script>
+/* A string that is not an atom keeps the atom it was found as when it is
+   used as a property key (VitaSurf, patch 0410), so a name a script keeps
+   in a table is not hashed again at every use. Whatever later happens to
+   the string, a key must still mean what its text says. Each line gives
+   the browser's answer in brackets. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+var tbl = 'charCodeAt,push,fromCharCode,join,newName'.split(',');
+var arr = [];
+for (var i = 0; i < 5; i++) arr[tbl[1]](i);
+T('a table of names (5 01234)', arr.length + ' ' + arr[tbl[3]](''));
+var n = {};
+for (var i = 0; i < 3; i++) n[tbl[4]] = i;
+T('a new name set again (2 newName)', n.newName + ' ' + Object.keys(n).join());
+T('a name used, then appended to (1 2 lengthX)', (function () {
+  var k = { length: 1, lengthX: 2 }, a = [['len', 'gth'].join('')];
+  var first = k[a[0]] + k[a[0]];
+  var t = a.pop() + 'X';
+  return first / 2 + ' ' + k[t] + ' ' + t;
+})());
+T('wide, appended to (4 undefined éxy)', (function () {
+  var k = {}, a = [['é', 'x'].join('')];
+  k[a[0]] = 3; k[a[0]] = 4;
+  var t = a.pop() + 'y';
+  return k['éx'] + ' ' + k[t] + ' ' + t;
+})());
+var d = 'pu'; d += 'sh';
+var before = typeof arr[d], sym = Symbol(d), g = Symbol.for(d);
+T('a key, then a Symbol\'s description (function Symbol(push) push function)',
+  before + ' ' + sym.toString() + ' ' + Symbol.keyFor(g) + ' ' + typeof arr[d]);
+var key = ['ab', 'cd'].join(''), q = {};
+q[key] = 1;
+var had = (key in q) + ' ' + q.hasOwnProperty(key);
+delete q[key];
+var gone = key in q;
+q[key] = 2;
+T('in, delete and set (true true false 2)', had + ' ' + gone + ' ' + q.abcd);
+var nums = [10, 11, 12], k2 = String(2), big = String(4294967295), ob = {};
+ob[big] = 'b';
+T('numeric keys (12 12 b b)', nums[k2] + ' ' + nums[k2] + ' ' + ob[big] + ' ' + ob['4294967295']);
+var t = {}, nm = 'zz'; nm += 'top'; t[nm] = 1; t = null;
+var u = {}; u[nm] = 5;
+T('a name whose property is gone (5)', u.zztop);
+var long = 'abcdefghijklmnopqrstuvwxyz'.repeat(20) + 'tail', sl = long.slice(500), so = {};
+so[sl] = 1;
+T('a slice (1 1)', so[long.slice(500)] + ' ' + so[sl]);
+var f = {};
+for (var i = 0; i < 1000; i++) f['k' + (i % 10)] = i;
+T('keys made fresh each time (10 999)', Object.keys(f).length + ' ' + f.k9);
+/* the shape of an obfuscated decoder: every name through a helper */
+function ak(j) { return tbl[j]; }
+var s = '', t0 = Date.now(), out = [];
+for (var i = 0; i < 4000; i++) s += String.fromCharCode(32 + (i * 7) % 90);
+for (var r = 0; r < 20; r++) {
+  var z = [], c, b = -1;
+  for (; !isNaN(c = s[ak(0)](++b));) z[ak(1)](String[ak(2)]((c - r + 255) % 255));
+  out[ak(1)](z[ak(3)]('').length);
+}
+T('decoder loop (80000)', out.reduce(function (a, b) { return a + b; }, 0));
+T('decoder loop time', (Date.now() - t0) + ' ms');
+</script>
+</body></html>

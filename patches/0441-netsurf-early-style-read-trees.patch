@@ -1,0 +1,316 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index a4afcfe48..f43c545bb 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -1598,6 +1598,12 @@ void html_css_early_cache_free(struct html_content *c)
+ 	free(c->early_cache);
+ 	c->early_cache = NULL;
+ 	c->early_cache_n = c->early_cache_alloc = 0;
++	for (k = 0; k < STYLESHEET_START; k++) {
++		if (c->early_base[k] != NULL) {
++			css_stylesheet_destroy(c->early_base[k]);
++			c->early_base[k] = NULL;
++		}
++	}
+ }
+ 
+ /**
+@@ -1632,13 +1638,26 @@ static css_stylesheet *html_css_sheet_now(html_content *c, uint32_t i,
+ 	} else if (hsheet->node == NULL && i < STYLESHEET_START &&
+ 			hsheet->sheet != NULL) {
+ 		size_t size = 0;
+-		const uint8_t *data = content_get_source_data(hsheet->sheet,
+-				&size);
++		const uint8_t *data;
+ 
++		/* kept for the next context: a built-in sheet's text does
++		 * not change, and each read before its fetch finished
++		 * parsed it again (VitaSurf) */
++		*kept = true;
++		data = content_get_source_data(hsheet->sheet, &size);
++		if (c->early_base[i] != NULL) {
++			/* unless more of its data has come since */
++			if (c->early_base_size[i] == size)
++				return c->early_base[i];
++			css_stylesheet_destroy(c->early_base[i]);
++			c->early_base[i] = NULL;
++		}
+ 		if (data != NULL && size > 0)
+ 			sheet = html_css_parse_now(c, data, size);
+ 		else
+ 			sheet = html_css_resource_now(c, hsheet->sheet);
++		c->early_base[i] = sheet;
++		c->early_base_size[i] = size;
+ 	}
+ 	return sheet;
+ }
+@@ -1650,10 +1669,40 @@ static css_stylesheet *html_css_sheet_now(html_content *c, uint32_t i,
+  * the sheets whose fetches are not done, and hands them back in owned,
+  * to destroy after the context.
+  */
++/* html_content's early_base has a slot for each built-in sheet */
++typedef char html_early_base_fits[STYLESHEET_START == 4 ? 1 : -1];
++
++/** Keep the early cache's sheet for a STYLE left out of this build. */
++static void early_sheet_keep(html_content *c, struct dom_node *node)
++{
++	unsigned int k;
++
++	for (k = 0; k < c->early_cache_n; k++) {
++		if (c->early_cache[k].node == node) {
++			c->early_cache[k].used = true;
++			return;
++		}
++	}
++}
++
++/** Whether scope is one of the n in scopes. */
++static bool early_scope_wanted(void *scope, void *const *scopes,
++		unsigned int n)
++{
++	unsigned int k;
++
++	for (k = 0; k < n; k++) {
++		if (scopes[k] == scope)
++			return true;
++	}
++	return false;
++}
++
+ static nserror
+ html_css_build_selection_context(html_content *c,
+ 		css_select_ctx **ret_select_ctx, bool early,
+-		css_stylesheet ***owned, unsigned int *n_owned)
++		css_stylesheet ***owned, unsigned int *n_owned,
++		void *const *scopes, unsigned int n_scopes)
+ {
+ 	uint32_t i;
+ 	css_error css_ret;
+@@ -1702,6 +1751,27 @@ html_css_build_selection_context(html_content *c,
+ 			origin = CSS_ORIGIN_USER;
+ 		}
+ 
++		/*
++		 * A style read takes only the sheets of the trees that can
++		 * style the elements it selects (VitaSurf): the document's,
++		 * and the shadow roots along their way and of the hosts
++		 * among them. A sheet in any other shadow tree matches
++		 * nothing there, and reddit.com's early reads parsed every
++		 * component's STYLE, some 250, and indexed them all again
++		 * whenever one was added, 11.6 s over fourteen reads. Its
++		 * parse is kept for a read that wants it.
++		 */
++		if (early && scopes != NULL && hsheet->node != NULL &&
++		    origin == CSS_ORIGIN_AUTHOR) {
++			void *scope = nscss_tree_scope(hsheet->node);
++
++			if (scope != NULL &&
++			    !early_scope_wanted(scope, scopes, n_scopes)) {
++				early_sheet_keep(c, hsheet->node);
++				continue;
++			}
++		}
++
+ 		/*
+ 		 * A sheet a script added is still fetching while an
+ 		 * earlier one has finished (VitaSurf): it has no content
+@@ -1809,16 +1879,17 @@ nserror
+ html_css_new_selection_context(html_content *c, css_select_ctx **ret_select_ctx)
+ {
+ 	return html_css_build_selection_context(c, ret_select_ctx, false,
+-			NULL, NULL);
++			NULL, NULL, NULL, 0);
+ }
+ 
+ /* exported function documented in html/css.h */
+ nserror html_css_early_selection_context(html_content *c,
+ 		css_select_ctx **ret_select_ctx, css_stylesheet ***owned,
+-		unsigned int *n_owned)
++		unsigned int *n_owned, void *const *scopes,
++		unsigned int n_scopes)
+ {
+ 	return html_css_build_selection_context(c, ret_select_ctx, true,
+-			owned, n_owned);
++			owned, n_owned, scopes, n_scopes);
+ }
+ 
+ /* exported function documented in html/css.h */
+diff --git a/content/handlers/html/css.h b/content/handlers/html/css.h
+index 586fa8121..1c4b8525a 100644
+--- a/content/handlers/html/css.h
++++ b/content/handlers/html/css.h
+@@ -56,11 +56,15 @@ nserror html_css_new_selection_context(struct html_content *c, css_select_ctx **
+  * \param owned       receives the sheets parsed for it, to destroy with
+  *                    html_css_free_owned after the context
+  * \param n_owned     receives how many
++ * \param scopes      the shadow roots whose sheets to take besides the
++ *                    document's, or NULL for every tree's
++ * \param n_scopes    how many
+  * \return NSERROR_OK on success
+  */
+ nserror html_css_early_selection_context(struct html_content *c,
+ 		css_select_ctx **select_ctx, css_stylesheet ***owned,
+-		unsigned int *n_owned);
++		unsigned int *n_owned, void *const *scopes,
++		unsigned int n_scopes);
+ 
+ /**
+  * Whether a stylesheet the parser met is still loading, which a parser
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 5817aff85..e8c308cc0 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -477,6 +477,10 @@ static void html_drop_early_select_ctx(html_content *c)
+ 		c->early_owned = NULL;
+ 		c->early_n_owned = 0;
+ 	}
++	free(c->early_scopes);
++	c->early_scopes = NULL;
++	c->early_n_scopes = 0;
++	c->early_all_trees = false;
+ }
+ 
+ /* exported function documented in html/private.h */
+@@ -490,7 +494,37 @@ css_select_ctx *html_select_ctx_early(html_content *c)
+ /* exported function documented in html/private.h */
+ css_select_ctx *html_select_ctx_now(html_content *c)
+ {
+-	unsigned int done = 0, i;
++	return html_select_ctx_for(c, NULL, 0);
++}
++
++/** Whether the early context holds the sheets of every scope given. */
++static bool html_early_has_scopes(const html_content *c,
++		void *const *scopes, unsigned int n)
++{
++	unsigned int i, k;
++
++	if (c->early_all_trees)
++		return true;
++	if (scopes == NULL)
++		return false;
++	for (i = 0; i < n; i++) {
++		for (k = 0; k < c->early_n_scopes; k++) {
++			if (c->early_scopes[k] == scopes[i])
++				break;
++		}
++		if (k == c->early_n_scopes)
++			return false;
++	}
++	return true;
++}
++
++/* exported function documented in html/private.h */
++css_select_ctx *html_select_ctx_for(html_content *c, void *const *scopes,
++		unsigned int n_scopes)
++{
++	unsigned int done = 0, i, n_want = 0;
++	void **want = NULL;
++	bool same;
+ 
+ 	/* this also takes out the sheets whose elements have gone */
+ 	if (html_select_ctx_current(c))
+@@ -501,24 +535,52 @@ css_select_ctx *html_select_ctx_now(html_content *c)
+ 				CONTENT_STATUS_DONE)
+ 			done++;
+ 	}
+-	if (c->early_select_ctx != NULL &&
++	same = c->early_select_ctx != NULL &&
+ 	    c->early_select_sheets == c->stylesheet_count &&
+ 	    c->early_select_done == done &&
+-	    c->early_select_gen == c->css_generation)
++	    c->early_select_gen == c->css_generation;
++	if (same && html_early_has_scopes(c, scopes, n_scopes))
+ 		return c->early_select_ctx;
++	/* the trees to take: those asked for, and while the sheets are
++	 * the same those the context already held, so reads moving
++	 * between trees settle on one context (VitaSurf) */
++	if (scopes != NULL) {
++		unsigned int have = same ? c->early_n_scopes : 0;
++
++		want = malloc((have + n_scopes + 1) * sizeof(*want));
++		if (want == NULL)
++			return NULL;
++		for (i = 0; i < have; i++)
++			want[n_want++] = c->early_scopes[i];
++		for (i = 0; i < n_scopes; i++) {
++			unsigned int k;
++
++			for (k = 0; k < n_want; k++) {
++				if (want[k] == scopes[i])
++					break;
++			}
++			if (k == n_want)
++				want[n_want++] = scopes[i];
++		}
++	}
+ 	/* lengths resolve against the viewport and the default font size,
+ 	 * which conversion sets; set them now if it has not */
+ 	if (c->unit_len_ctx.device_dpi == 0)
+ 		html_get_dimensions(c);
+ 	html_drop_early_select_ctx(c);
+ 	if (html_css_early_selection_context(c, &c->early_select_ctx,
+-			&c->early_owned, &c->early_n_owned) != NSERROR_OK) {
++			&c->early_owned, &c->early_n_owned,
++			scopes != NULL ? want : NULL, n_want) != NSERROR_OK) {
+ 		c->early_select_ctx = NULL;
++		free(want);
+ 		return NULL;
+ 	}
+ 	c->early_select_sheets = c->stylesheet_count;
+ 	c->early_select_done = done;
+ 	c->early_select_gen = c->css_generation;
++	c->early_all_trees = scopes == NULL;
++	c->early_scopes = want;
++	c->early_n_scopes = n_want;
+ 	return c->early_select_ctx;
+ }
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 70c980aa8..29dd692c1 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -265,6 +265,11 @@ typedef struct html_content {
+ 	unsigned int early_select_sheets;
+ 	unsigned int early_select_done;
+ 	unsigned int early_select_gen;
++	/** the shadow roots whose sheets it holds besides the document's,
++	 * unless it holds every tree's (VitaSurf) */
++	void **early_scopes;
++	unsigned int early_n_scopes;
++	bool early_all_trees;
+ 	/** bumped whenever a sheet is added or its text changes */
+ 	unsigned int css_generation;
+ 	/** the css_generation select_ctx was built from (VitaSurf) */
+@@ -279,6 +284,10 @@ typedef struct html_content {
+ 	 * from one to the next (VitaSurf); see html_css_sheet_now */
+ 	struct html_early_sheet *early_cache;
+ 	unsigned int early_cache_n, early_cache_alloc;
++	/** the built-in sheets parsed for them before their fetches
++	 * finished, by slot (VitaSurf) */
++	struct css_stylesheet *early_base[4];
++	size_t early_base_size[4];
+ 	/** retries of the rebuild a late stylesheet asks for (VitaSurf) */
+ 	unsigned late_css_retries;
+ 	/**< Style selection media specification */
+@@ -893,6 +902,20 @@ css_select_ctx *html_select_ctx_early(html_content *c);
+  */
+ css_select_ctx *html_select_ctx_now(html_content *c);
+ 
++/**
++ * The same for a style read of elements in the given trees (VitaSurf):
++ * the sheets of the shadow roots not named are left out, as they cannot
++ * style those elements.
++ *
++ * \param c         the document
++ * \param scopes    the shadow roots along the elements' way, and those
++ *                  of hosts among them
++ * \param n_scopes  how many
++ * \return the context, or NULL if there is none yet
++ */
++css_select_ctx *html_select_ctx_for(html_content *c, void *const *scopes,
++		unsigned int n_scopes);
++
+ /**
+  * How far a position: sticky box is shifted down with the viewport at
+  * view_y (VitaSurf), as it is drawn there; see html_sticky_offset().

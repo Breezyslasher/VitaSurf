@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Each node's own interface</title></head>
+<body><pre id="out"></pre><svg><path d="M0 0"/></svg><section></section><blink></blink><x-thing></x-thing>
+<script>
+/* Each node has its own interface's prototype, under its parent's as
+   WebIDL has it, and each member is on the interface that has it
+   (VitaSurf: vita/js/nodes.js and node_proto_for in qjs.c). Every node
+   had shared one prototype carrying every member. Each line gives the
+   browser's answer in brackets. */
+var o = document.getElementById('out');
+function T(n, v){ o.textContent += 'XX ' + n + ': ' + v + '\n';
+  try { console.log('XX ' + n + ': ' + v); } catch (e) {} }
+function chain(x, n){ var r = [], p = Object.getPrototypeOf(x);
+  while (p && p !== Object.prototype && r.length < (n || 9)) { r.push(p.constructor.name); p = Object.getPrototypeOf(p); }
+  return r.join('>'); }
+function tag(x){ return Object.prototype.toString.call(x).slice(8, -1); }
+var a = document.createElement('a'), input = document.createElement('input'), text = document.createTextNode('t'),
+  comment = document.createComment('c'), frag = document.createDocumentFragment(),
+  host = document.createElement('div'), root = host.attachShadow({mode: 'open'});
+T('anchor (HTMLAnchorElement>HTMLElement>Element>Node>EventTarget)', chain(a));
+T('text (Text>CharacterData>Node>EventTarget)', chain(text));
+T('comment (Comment>CharacterData>Node>EventTarget)', chain(comment));
+T('fragment (DocumentFragment>Node>EventTarget)', chain(frag));
+T('shadow root (ShadowRoot>DocumentFragment>Node>EventTarget)', chain(root));
+T('doctype (DocumentType>Node>EventTarget)', chain(document.doctype));
+T('audio (HTMLAudioElement>HTMLMediaElement>HTMLElement)', chain(new Audio(), 3));
+T('svg (SVGSVGElement>SVGGraphicsElement>SVGElement>Element)', chain(document.querySelector('svg'), 4));
+T('section, blink, x-thing (HTMLElement HTMLUnknownElement HTMLElement)',
+  ['section', 'blink', 'x-thing'].map(function (s) { return document.querySelector(s).constructor.name; }).join(' '));
+T('what toString says (HTMLAnchorElement Text Comment DocumentFragment ShadowRoot SVGPathElement)',
+  [a, text, comment, frag, root, document.querySelector('path')].map(tag).join(' '));
+T('path is an SVG graphic (true true)', (document.querySelector('path') instanceof SVGGraphicsElement) + ' ' +
+  (document.querySelector('path') instanceof SVGElement));
+T('instanceof (true false false false)', (a instanceof HTMLAnchorElement) + ' ' + (a instanceof HTMLInputElement) + ' ' +
+  (text instanceof Element) + ' ' + (frag instanceof ShadowRoot));
+T('no instanceof of their own (0 0)', Object.getOwnPropertySymbols(HTMLDivElement).length + ' ' +
+  Object.getOwnPropertySymbols(Text).length);
+T('a member where its interface is (true false false true)', HTMLInputElement.prototype.hasOwnProperty('value') + ' ' +
+  HTMLElement.prototype.hasOwnProperty('value') + ' ' + ('value' in text) + ' ' + ('value' in input));
+T('href on anchors only (true false)', ('href' in a) + ' ' + ('href' in input));
+T('on the levels above (true true true true)', Node.prototype.hasOwnProperty('appendChild') + ' ' +
+  Element.prototype.hasOwnProperty('innerHTML') + ' ' + Element.prototype.hasOwnProperty('getAttribute') + ' ' +
+  HTMLElement.prototype.hasOwnProperty('hidden'));
+T('a fragment is a parent, not an element (true false false)', ('querySelector' in frag) + ' ' +
+  ('getAttribute' in frag) + ' ' + ('innerHTML' in frag));
+T('a shadow root has innerHTML and host (true true)', ('innerHTML' in root) + ' ' + (root.host === host));
+T('text is character data (true false 1)', ('data' in text) + ' ' + ('getAttribute' in text) + ' ' + text.length);
+T('the document\'s members are not an element\'s (false false)', ('createElement' in a) + ' ' + ('body' in a));
+T('members are enumerable (true true)', (Object.keys(HTMLAnchorElement.prototype).indexOf('href') >= 0) + ' ' +
+  Object.getOwnPropertyDescriptor(Node.prototype, 'appendChild').enumerable);
+T('constructor is not (false)', Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype, 'constructor').enumerable);
+HTMLAnchorElement.prototype.vsPatched = 1;
+T('patching one interface (1 undefined)', a.vsPatched + ' ' + document.createElement('div').vsPatched);
+delete HTMLAnchorElement.prototype.vsPatched;
+T('aria (null x x null)', (function () {
+  var r = [a.ariaLabel]; a.ariaLabel = 'x'; r.push(a.ariaLabel, a.getAttribute('aria-label'));
+  a.ariaLabel = null; r.push(a.getAttribute('aria-label')); return r.map(String).join(' '); })());
+T('role and aria-haspopup (button true)', (function () {
+  a.role = 'button'; a.ariaHasPopup = 'true'; return a.getAttribute('role') + ' ' + a.getAttribute('aria-haspopup'); })());
+T('document.doctype is the node (true html)', (document.doctype === document.firstChild) + ' ' + document.doctype.name);
+T('DocumentType is not constructed (TypeError)', (function () { try { new DocumentType(); return 'made'; } catch (e) { return e.name; } })());
+var pd = new DOMParser().parseFromString('<p id=q>x</p>', 'text/html');
+T('a parsed document (true q true)', (pd instanceof Document) + ' ' + pd.querySelector('p').id + ' ' +
+  (pd.querySelector('p') instanceof HTMLParagraphElement));
+customElements.define('vs-thing', class extends HTMLElement {});
+var ce = document.createElement('vs-thing');
+T('a custom element (HTMLElement false false)', Object.getPrototypeOf(Object.getPrototypeOf(ce)).constructor.name + ' ' +
+  ('label' in ce) + ' ' + ('form' in ce));
+T('Image and Option (true true true)', (Image.prototype === HTMLImageElement.prototype) + ' ' +
+  (new Option() instanceof HTMLOptionElement) + ' ' + (new Image().constructor === HTMLImageElement));
+</script>
+</body></html>

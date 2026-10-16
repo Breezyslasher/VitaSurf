@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html><body>
+<iframe id="f" srcdoc="<script>document.addEventListener('ping', function () { parent.pinged++; });</script>"></iframe>
+<script>
+/* A runaway that first runs its frame's listener: the frame's script is
+   entered from C while this one is running, and its return left the
+   interrupt handler with the frame, so the loop after it ran with no
+   budget at all. */
+var pinged = 0;
+document.getElementById('f').addEventListener('load', function () {
+  this.contentDocument.dispatchEvent(new Event('ping'));
+  var start = Date.now(), passes = 0;
+  try {
+    for (;;) {
+      passes++;
+      if ((passes & 1023) === 0 && Date.now() - start > 90000) break;  /* backstop */
+    }
+  } catch (e) {
+    console.log('runaway caught: ' + e);
+  }
+  console.log('runaway left the loop after ' + passes + ' passes, ' +
+              (Date.now() - start) + ' ms, the frame pinged ' + pinged + ' times');
+});
+</script>
+</body></html>

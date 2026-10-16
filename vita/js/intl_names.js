@@ -20,11 +20,11 @@
  * followed.
  *
  * Runs under Node too, to be held against ICU with the cases
- * scripts/gen-intl-names-tests.mjs makes: __vitaIntlNames(W, C, X)
+ * scripts/gen-intl-names-tests.mjs makes: NV.__vitaIntlNames(W, C, X)
  * builds the two constructors onto W.Intl from what
- * __vitaIntlNumber returned.
+ * NV.__vitaIntlNumber returned.
  */
-var __vitaIntlNames = function (W, C, X) {
+NV.__vitaIntlNames = function (W, C, X) {
 	'use strict';
 
 	var Intl = W.Intl, getOption = X.getOption, method = X.method;
@@ -448,9 +448,9 @@ var __vitaIntlNames = function (W, C, X) {
 	Intl.DisplayNames = DisplayNames;
 };
 
-if (typeof window !== 'undefined' && window.__vitaIntl &&
-    window.__vitaIntl.number && window.__vitaIntlCore)
-	__vitaIntlNames(window, window.__vitaIntlCore, window.__vitaIntl.number);
+if (typeof window !== 'undefined' && NV.__vitaIntl &&
+    NV.__vitaIntl.number && NV.__vitaIntlCore)
+	NV.__vitaIntlNames(window, NV.__vitaIntlCore, NV.__vitaIntl.number);
 
 if (typeof module !== 'undefined')
-	module.exports = __vitaIntlNames;
+	module.exports = NV.__vitaIntlNames;

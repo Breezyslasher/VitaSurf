@@ -1,0 +1,209 @@
+diff --git a/content/fetch.c b/content/fetch.c
+index 99b4b3295..c5d433154 100644
+--- a/content/fetch.c
++++ b/content/fetch.c
+@@ -1086,6 +1086,64 @@ char *fetch_get_cookie_string(struct fetch *fetch)
+ 	return urldb_get_cookie_for(fetch->url, true, &ctx);
+ }
+ 
++/* exported interface documented in content/fetch.h */
++char *fetch_referer_header(nsurl *url, nsurl *referer)
++{
++	enum nsurl_scheme_type rs, us;
++	nsurl_component parts;
++	char *ref = NULL, *header;
++	size_t len = 0;
++
++	if (url == NULL || referer == NULL)
++		return NULL;
++	rs = nsurl_get_scheme_type(referer);
++	us = nsurl_get_scheme_type(url);
++	if (rs != NSURL_SCHEME_HTTP && rs != NSURL_SCHEME_HTTPS)
++		return NULL;
++	if (rs == NSURL_SCHEME_HTTPS && us != NSURL_SCHEME_HTTPS)
++		/* no referrer from a secure page to an insecure one */
++		return NULL;
++
++	parts = NSURL_SCHEME | NSURL_HOST | NSURL_PORT;
++	if (nsurl_compare(referer, url, parts))
++		parts |= NSURL_PATH | NSURL_QUERY;
++	if (nsurl_get(referer, parts, &ref, &len) != NSERROR_OK)
++		return NULL;
++	if (len > 4096 && (parts & NSURL_PATH)) {
++		/* a referrer over 4 kB is cut to its origin */
++		free(ref);
++		parts = NSURL_SCHEME | NSURL_HOST | NSURL_PORT;
++		if (nsurl_get(referer, parts, &ref, &len) != NSERROR_OK)
++			return NULL;
++	}
++
++	header = malloc(len + 16);
++	if (header != NULL)
++		snprintf(header, len + 16, "Referer: %s%s", ref,
++			 (parts & NSURL_PATH) ? "" : "/");
++	free(ref);
++	return header;
++}
++
++/** Whether url is one of the browser's own pages */
++static bool fetch_browser_page(nsurl *url)
++{
++	if (nsurl_get_scheme_type(url) == NSURL_SCHEME_OTHER) {
++		lwc_string *scheme = nsurl_get_component(url, NSURL_SCHEME);
++		bool match = false;
++
++		if (scheme != NULL) {
++			(void)lwc_string_caseless_isequal(scheme,
++					corestring_lwc_resource, &match);
++			lwc_string_unref(scheme);
++		}
++		if (match)
++			return true;
++	}
++	return vitasurf_browser_page != NULL &&
++		vitasurf_browser_page(nsurl_access(url));
++}
++
+ /* exported interface documented in content/fetch.h */
+ int fetch_metadata_headers(struct fetch *fetch, char lines[][160], int max,
+ 			   bool want_accept)
+@@ -1127,8 +1185,10 @@ int fetch_metadata_headers(struct fetch *fetch, char lines[][160], int max,
+ 		mode = "no-cors";
+ 
+ 	/* the initiator against the request: the user's own, the same
+-	 * origin, the same site or another */
+-	if (fetch->referer == NULL) {
++	 * origin, the same site or another. A navigation from one of the
++	 * browser's own pages is the user's, as from Chrome's history. */
++	if (fetch->referer == NULL ||
++	    (nav && fetch_browser_page(fetch->referer))) {
+ 		site = "none";
+ 	} else if (nsurl_compare(fetch->referer, fetch->url,
+ 				 NSURL_SCHEME | NSURL_HOST | NSURL_PORT)) {
+diff --git a/content/fetch.h b/content/fetch.h
+index ec6dfb685..4d420e5a4 100644
+--- a/content/fetch.h
++++ b/content/fetch.h
+@@ -203,6 +203,19 @@ nserror fetch_start(nsurl *url, nsurl *referer, fetch_callback callback,
+ int fetch_metadata_headers(struct fetch *fetch, char lines[][160], int max,
+ 			   bool want_accept);
+ 
++/**
++ * The Referer header a request carries under the default referrer policy,
++ * strict-origin-when-cross-origin, as browsers send it (VitaSurf): the
++ * referring URL, without its fragment and credentials, to the same
++ * origin; only its origin to another; nothing from https to http, nor
++ * from a page that is not http or https.
++ *
++ * \param url The URL being fetched
++ * \param referer The referring URL
++ * eturn "Referer: ..." on the heap, or NULL for none
++ */
++char *fetch_referer_header(nsurl *url, nsurl *referer);
++
+ /**
+  * The cookies a fetch carries, as its SameSite context allows
+  * (VitaSurf).
+diff --git a/content/llcache.c b/content/llcache.c
+index 99cfa100e..1439e29ae 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -852,12 +852,6 @@ static nserror llcache_fetch_process_header(llcache_object *object,
+  */
+ static nserror get_referer_header(nsurl *url, nsurl *referer, char **header_out)
+ {
+-	nserror res = NSERROR_INVALID;
+-	lwc_string *ref_scheme;
+-	lwc_string *scheme;
+-	bool match;
+-	bool match1;
+-	bool match2;
+ 	char *header;
+ 
+ 	/* Determine whether to send the Referer header */
+@@ -865,61 +859,15 @@ static nserror get_referer_header(nsurl *url, nsurl *referer, char **header_out)
+ 		return NSERROR_INVALID;
+ 	}
+ 
+-	scheme = nsurl_get_component(url, NSURL_SCHEME);
+-	if (scheme == NULL) {
+-		return NSERROR_BAD_URL;
+-	}
+-
+-	ref_scheme = nsurl_get_component(referer, NSURL_SCHEME);
+-	if (ref_scheme == NULL) {
+-		/* referer has no scheme so no header */
+-		lwc_string_unref(scheme);
++	/* the default referrer policy, strict-origin-when-cross-origin, as
++	 * browsers have it (VitaSurf): NetSurf sent the whole URL to any
++	 * origin over the same scheme */
++	header = fetch_referer_header(url, referer);
++	if (header == NULL) {
+ 		return NSERROR_INVALID;
+ 	}
+-
+-	/* User permits us to send the header
+-	 * Only send it if:
+-	 *    1) The fetch and referer schemes match
+-	 * or 2) The fetch is https and the referer is http
+-	 *
+-	 * This ensures that referer information is only sent
+-	 * across schemes in the special case of an https
+-	 * request from a page served over http. The inverse
+-	 * (https -> http) should not send the referer (15.1.3)
+-	 */
+-	if (lwc_string_isequal(scheme, ref_scheme,
+-			       &match) != lwc_error_ok) {
+-		match = false;
+-	}
+-	if (lwc_string_isequal(scheme, corestring_lwc_https,
+-			       &match1) != lwc_error_ok) {
+-		match1 = false;
+-	}
+-	if (lwc_string_isequal(ref_scheme, corestring_lwc_http,
+-			       &match2) != lwc_error_ok) {
+-		match2 = false;
+-	}
+-	if (match == true || (match1 == true && match2 == true)) {
+-		const size_t len = SLEN("Referer: ") +
+-			nsurl_length(referer) + 1;
+-
+-		header = malloc(len);
+-		if (header == NULL) {
+-			res = NSERROR_NOMEM;
+-		} else {
+-			snprintf(header, len, "Referer: %s",
+-				 nsurl_access(referer));
+-
+-			*header_out = header;
+-			res = NSERROR_OK;
+-		}
+-	}
+-
+-
+-	lwc_string_unref(scheme);
+-	lwc_string_unref(ref_scheme);
+-
+-	return res;
++	*header_out = header;
++	return NSERROR_OK;
+ }
+ 
+ /**
+diff --git a/utils/utils.h b/utils/utils.h
+index 6ecd07975..1e2213fa3 100644
+--- a/utils/utils.h
++++ b/utils/utils.h
+@@ -736,4 +736,12 @@ extern bool vitasurf_cache_disabled(void) __attribute__((weak));
+  */
+ extern const char *vitasurf_languages(void) __attribute__((weak));
+ 
++/**
++ * Whether a URL is one of the browser's own pages, such as its history or
++ * bookmarks, so that following a link there is the user's own navigation
++ * (Sec-Fetch-Site: none), as from Chrome's history page (VitaSurf). Weak,
++ * as vitasurf_cache_disabled.
++ */
++extern bool vitasurf_browser_page(const char *url) __attribute__((weak));
++
+ #endif

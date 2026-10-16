@@ -1,0 +1,31 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index cc001c762..a4afcfe48 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -1403,12 +1403,21 @@ static css_stylesheet *html_css_parse_now(html_content *c, const uint8_t *data,
+ 
+ 	if (css_stylesheet_create(&params, &sheet) != CSS_OK)
+ 		return NULL;
+-	error = css_stylesheet_append_data(sheet, data, len);
+-	if (error != CSS_OK && error != CSS_NEEDDATA) {
+-		css_stylesheet_destroy(sheet);
+-		return NULL;
++	/* counted with the other sheets' parsing (VitaSurf): a script's
++	 * reads before the first layout parse its STYLEs here, and the
++	 * page report put the time nowhere */
++	{
++		uint64_t t0 = 0, t1 = 0;
++
++		nsu_getmonotonic_ms(&t0);
++		error = css_stylesheet_append_data(sheet, data, len);
++		if (error == CSS_OK || error == CSS_NEEDDATA)
++			error = css_stylesheet_data_done(sheet);
++		else
++			error = CSS_INVALID;
++		nsu_getmonotonic_ms(&t1);
++		vitasurf_ms_css += (unsigned int) (t1 - t0);
+ 	}
+-	error = css_stylesheet_data_done(sheet);
+ 	if (error != CSS_OK && error != CSS_IMPORTS_PENDING) {
+ 		css_stylesheet_destroy(sheet);
+ 		return NULL;

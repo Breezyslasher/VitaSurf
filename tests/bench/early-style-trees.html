@@ -1,0 +1,11 @@
+<!DOCTYPE html><html><head><style>.doc{color:rgb(1,2,3)}</style></head><body><div id="t" class="doc">t</div><script>
+/* 80 components, each with a shadow tree whose STYLE has 300 rules of its
+   own, each read before the first layout as it is added (VitaSurf): every
+   read had parsed every tree's sheet and indexed them all again. */
+function sheet(n){var r=[],i;for(i=0;i<300;i++)r.push('.c'+n+'_'+i+' .x'+i+' > a:hover, .k'+i+'{color:rgb('+(i%250)+','+(n%250)+',0);margin:'+(i%9)+'px;padding:1px 2px}');return r.join('');}
+var t0=performance.now(),last;
+for(var n=0;n<80;n++){var h=document.createElement('x-c');var r=h.attachShadow({mode:'open'});
+ r.innerHTML='<style>'+sheet(n)+'</style><span class="k5">in</span>';document.body.appendChild(h);
+ last=getComputedStyle(r.querySelector('span')).color;getComputedStyle(document.getElementById('t')).color;}
+console.log('early-style-trees: 80 trees and reads in '+Math.round(performance.now()-t0)+' ms, last '+last+', document '+getComputedStyle(document.getElementById('t')).color);
+</script></body></html>

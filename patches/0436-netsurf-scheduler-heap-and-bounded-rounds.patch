@@ -1,0 +1,520 @@
+diff --git a/frontends/framebuffer/schedule.c b/frontends/framebuffer/schedule.c
+index 232754ff5..37706f890 100644
+--- a/frontends/framebuffer/schedule.c
++++ b/frontends/framebuffer/schedule.c
+@@ -21,6 +21,7 @@
+ 
+ #include <stdint.h>
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include "utils/sys_time.h"
+ #include "utils/log.h"
+@@ -29,158 +30,250 @@
+ 
+ #include "framebuffer/schedule.h"
+ 
+-/* linked list of scheduled callbacks */
+-static struct nscallback *schedule_list = NULL;
+-
+-/**
+- * scheduled callback.
++/*
++ * The scheduled callbacks (VitaSurf): a binary heap by due time, and of
++ * two due at the same time the one asked for first, with a hash table
++ * on callback and context for the rule that each pair is scheduled at
++ * most once. They had been a linked list, which every schedule walked
++ * twice and every run walked once for each callback it ran: with the
++ * thousands of timers and tasks a page can keep, asking for one task
++ * took 0.7 ms on nytimes.com, and running them all was quadratic.
+  */
+-struct nscallback
+-{
+-        struct nscallback *next;
+-	struct timeval tv;
++struct nscallback {
++	uint64_t due;		/**< when it comes due, microseconds */
++	uint64_t seq;		/**< the order it was asked for */
+ 	void (*callback)(void *p);
+ 	void *p;
++	unsigned int slot;	/**< its place in the heap */
++	struct nscallback *hnext; /**< next in its hash chain */
+ };
+ 
+-/**
+- * Unschedule a callback.
+- *
+- * \param  callback  callback function
+- * \param  p         user parameter, passed to callback function
+- *
+- * All scheduled callbacks matching both callback and p are removed.
++static struct nscallback **heap;
++static unsigned int heap_n, heap_alloc;
++static struct nscallback **hash;
++static unsigned int hash_size;	/**< a power of two, or 0 */
++static uint64_t next_seq;
++
++/*
++ * How long one round of the scheduler may run callbacks before it lets
++ * the main loop read input and draw (VitaSurf). A round ran every
++ * callback due when it began, and while a page's timers took 30 ms each
++ * the next round found more due than the last: rounds of 49, 75 and 118
++ * seconds, with nothing drawn, no button read, not even Circle, in
++ * between. The rest wait for the next round, in the same order.
+  */
+-static nserror schedule_remove(void (*callback)(void *p), void *p)
+-{
+-        struct nscallback *cur_nscb;
+-        struct nscallback *prev_nscb;
+-        struct nscallback *unlnk_nscb;
++#define SCHED_ROUND_US 50000u
+ 
+-	/* check there is something on the list to remove */
+-        if (schedule_list == NULL) {
+-                return NSERROR_OK;
+-	}
++static uint64_t sched_now_us(void)
++{
++	struct timeval tv;
+ 
+-	NSLOG(schedule, DEBUG, "removing %p, %p", callback, p);
++	gettimeofday(&tv, NULL);
++	return (uint64_t)tv.tv_sec * 1000000u + (uint64_t)tv.tv_usec;
++}
+ 
+-        cur_nscb = schedule_list;
+-        prev_nscb = NULL;
++static unsigned int hash_of(void (*callback)(void *p), void *p)
++{
++	uintptr_t h = (uintptr_t)p ^ ((uintptr_t)callback * 31u);
+ 
+-        while (cur_nscb != NULL) {
+-                if ((cur_nscb->callback ==  callback) &&
+-                    (cur_nscb->p ==  p)) {
+-                        /* item to remove */
++	h ^= h >> 15;
++	h *= 2654435761u;
++	h ^= h >> 13;
++	return (unsigned int)h & (hash_size - 1);
++}
+ 
+-                        NSLOG(schedule, DEBUG,
+-			      "callback entry %p removing  %p(%p)",
+-                             cur_nscb, cur_nscb->callback, cur_nscb->p);
++static struct nscallback *hash_find(void (*callback)(void *p), void *p)
++{
++	struct nscallback *cb;
+ 
+-                        /* remove callback */
+-                        unlnk_nscb = cur_nscb;
+-                        cur_nscb = unlnk_nscb->next;
++	if (hash_size == 0) {
++		return NULL;
++	}
++	for (cb = hash[hash_of(callback, p)]; cb != NULL; cb = cb->hnext) {
++		if (cb->callback == callback && cb->p == p) {
++			return cb;
++		}
++	}
++	return NULL;
++}
+ 
+-                        if (prev_nscb == NULL) {
+-                                schedule_list = cur_nscb;
+-                        } else {
+-                                prev_nscb->next = cur_nscb;
+-                        }
+-                        free (unlnk_nscb);
+-                } else {
+-                        /* move to next element */
+-                        prev_nscb = cur_nscb;
+-                        cur_nscb = prev_nscb->next;
+-                }
+-        }
++static void hash_unlink(struct nscallback *cb)
++{
++	struct nscallback **at = &hash[hash_of(cb->callback, cb->p)];
+ 
+-	return NSERROR_OK;
++	while (*at != NULL && *at != cb) {
++		at = &(*at)->hnext;
++	}
++	if (*at == cb) {
++		*at = cb->hnext;
++	}
++	cb->hnext = NULL;
+ }
+ 
+-/* exported function documented in framebuffer/schedule.h */
+-nserror framebuffer_schedule(int tival, void (*callback)(void *p), void *p)
++/** Room for one more in the hash table, kept at most one per bucket. */
++static bool hash_grow(void)
+ {
+-	struct nscallback *nscb;
+-	struct timeval tv;
+-	nserror ret;
++	struct nscallback **fresh, *cb, *next;
++	unsigned int size = hash_size == 0 ? 256 : hash_size * 2, i, old;
+ 
+-	/* ensure uniqueness of the callback and context */
+-	ret = schedule_remove(callback, p);
+-	if ((tival < 0) || (ret != NSERROR_OK)) {
+-		return ret;
++	if (heap_n + 1 <= hash_size) {
++		return true;
++	}
++	fresh = calloc(size, sizeof(*fresh));
++	if (fresh == NULL) {
++		return hash_size != 0;
+ 	}
++	old = hash_size;
++	hash_size = size;
++	for (i = 0; i < old; i++) {
++		for (cb = hash[i]; cb != NULL; cb = next) {
++			unsigned int h = hash_of(cb->callback, cb->p);
++
++			next = cb->hnext;
++			cb->hnext = fresh[h];
++			fresh[h] = cb;
++		}
++	}
++	free(hash);
++	hash = fresh;
++	return true;
++}
+ 
+-	NSLOG(schedule, DEBUG, "Adding %p(%p) in %d", callback, p, tival);
++static bool sooner(const struct nscallback *a, const struct nscallback *b)
++{
++	return a->due < b->due || (a->due == b->due && a->seq < b->seq);
++}
+ 
+-        tv.tv_sec = tival / 1000; /* miliseconds to seconds */
+-        tv.tv_usec = (tival % 1000) * 1000; /* remainder to microseconds */
++static void heap_place(struct nscallback *cb, unsigned int slot)
++{
++	heap[slot] = cb;
++	cb->slot = slot;
++}
+ 
+-	nscb = calloc(1, sizeof(struct nscallback));
++static void sift_up(unsigned int slot)
++{
++	struct nscallback *cb = heap[slot];
+ 
+-	gettimeofday(&nscb->tv, NULL);
+-	timeradd(&nscb->tv, &tv, &nscb->tv);
++	while (slot > 0) {
++		unsigned int parent = (slot - 1) / 2;
+ 
+-	nscb->callback = callback;
+-	nscb->p = p;
++		if (!sooner(cb, heap[parent])) {
++			break;
++		}
++		heap_place(heap[parent], slot);
++		slot = parent;
++	}
++	heap_place(cb, slot);
++}
+ 
+-#ifdef __vita__
+-	/*
+-	 * VitaSurf: add to the back of the list. The runner walks it from
+-	 * the front, so adding at the front ran callbacks that came due
+-	 * together in the reverse of the order they were asked for, and
+-	 * setTimeout is required to keep that order. Schedulers depend on
+-	 * it: posting three messages through a MessageChannel delivered
+-	 * them third, second, first.
+-	 */
+-	{
+-		struct nscallback *tail = schedule_list;
++static void sift_down(unsigned int slot)
++{
++	struct nscallback *cb = heap[slot];
+ 
+-		nscb->next = NULL;
+-		if (tail == NULL) {
+-			schedule_list = nscb;
+-		} else {
+-			while (tail->next != NULL) {
+-				tail = tail->next;
+-			}
+-			tail->next = nscb;
++	for (;;) {
++		unsigned int child = slot * 2 + 1;
++
++		if (child >= heap_n) {
++			break;
++		}
++		if (child + 1 < heap_n && sooner(heap[child + 1], heap[child])) {
++			child++;
+ 		}
++		if (!sooner(heap[child], cb)) {
++			break;
++		}
++		heap_place(heap[child], slot);
++		slot = child;
+ 	}
+-#else
+-        /* add to list front */
+-        nscb->next = schedule_list;
+-        schedule_list = nscb;
+-#endif
++	heap_place(cb, slot);
++}
+ 
+-	return NSERROR_OK;
++/** Take a callback out of the heap and the hash table; not freed. */
++static void heap_take(struct nscallback *cb)
++{
++	unsigned int slot = cb->slot;
++	struct nscallback *last;
++
++	hash_unlink(cb);
++	heap_n--;
++	if (slot == heap_n) {
++		return;
++	}
++	last = heap[heap_n];
++	heap_place(last, slot);
++	if (slot > 0 && sooner(last, heap[(slot - 1) / 2])) {
++		sift_up(slot);
++	} else {
++		sift_down(slot);
++	}
+ }
+ 
+-#ifdef __vita__
+-/*
+- * VitaSurf: the callback that came due first, of those due by now; of
+- * two due at the same time, the one asked for first. The list is in the
+- * order callbacks were asked for, and after the page held the browser
+- * every callback is due at once, so walking it from the front ran them
+- * in that order rather than their times'. Home Assistant pings its
+- * server every 30 s and reconnects if no answer comes within 15 s: the
+- * 15 s timer, asked for after the WebSocket's next look, ran ahead of
+- * that look, with the answer already waiting, and the dashboard
+- * reconnected and loaded again from the start.
+- */
+-static struct nscallback *
+-earliest_due(const struct timeval *now, struct nscallback **prev_out)
++/* exported function documented in framebuffer/schedule.h */
++nserror framebuffer_schedule(int tival, void (*callback)(void *p), void *p)
+ {
+-	struct nscallback *cb, *prev = NULL, *best = NULL, *best_prev = NULL;
++	struct nscallback *cb;
++	uint64_t due;
++
++	/* each callback and context is scheduled at most once */
++	cb = hash_find(callback, p);
++	if (tival < 0) {
++		if (cb != NULL) {
++			NSLOG(schedule, DEBUG, "removing %p, %p", callback, p);
++			heap_take(cb);
++			free(cb);
++		}
++		return NSERROR_OK;
++	}
+ 
+-	for (cb = schedule_list; cb != NULL; prev = cb, cb = cb->next) {
+-		if (timercmp(now, &cb->tv, >) &&
+-		    (best == NULL || timercmp(&cb->tv, &best->tv, <))) {
+-			best = cb;
+-			best_prev = prev;
++	NSLOG(schedule, DEBUG, "Adding %p(%p) in %d", callback, p, tival);
++	due = sched_now_us() + (uint64_t)tival * 1000u;
++
++	if (cb != NULL) {
++		/* asked again: due then, and after those asked for before */
++		cb->due = due;
++		cb->seq = next_seq++;
++		if (cb->slot > 0 && sooner(cb, heap[(cb->slot - 1) / 2])) {
++			sift_up(cb->slot);
++		} else {
++			sift_down(cb->slot);
+ 		}
++		return NSERROR_OK;
+ 	}
+-	*prev_out = best_prev;
+-	return best;
++
++	if (heap_n == heap_alloc) {
++		unsigned int n = heap_alloc == 0 ? 256 : heap_alloc * 2;
++		struct nscallback **grown = realloc(heap, n * sizeof(*grown));
++
++		if (grown == NULL) {
++			return NSERROR_NOMEM;
++		}
++		heap = grown;
++		heap_alloc = n;
++	}
++	if (!hash_grow()) {
++		return NSERROR_NOMEM;
++	}
++	cb = calloc(1, sizeof(*cb));
++	if (cb == NULL) {
++		return NSERROR_NOMEM;
++	}
++	cb->due = due;
++	cb->seq = next_seq++;
++	cb->callback = callback;
++	cb->p = p;
++	{
++		unsigned int h = hash_of(callback, p);
++
++		cb->hnext = hash[h];
++		hash[h] = cb;
++	}
++	heap[heap_n] = cb;
++	cb->slot = heap_n;
++	heap_n++;
++	sift_up(cb->slot);
++
++	return NSERROR_OK;
+ }
+-#endif
+ 
+ #ifdef __vita__
+ /*
+@@ -263,49 +356,22 @@ void schedule_take_top(char *buf, size_t len)
+ /* exported function documented in framebuffer/schedule.h */
+ int schedule_run(void)
+ {
+-	struct timeval tv;
+-	struct timeval nexttime;
+-	struct timeval rettime;
+-        struct nscallback *cur_nscb;
+-        struct nscallback *prev_nscb;
+-        struct nscallback *unlnk_nscb;
+-
+-        if (schedule_list == NULL)
+-                return -1;
++	uint64_t now, start, wait;
++	struct nscallback *unlnk_nscb;
+ 
+-	/* reset enumeration to the start of the list */
+-        cur_nscb = schedule_list;
+-        prev_nscb = NULL;
+-	nexttime = cur_nscb->tv;
+-
+-	gettimeofday(&tv, NULL);
++	if (heap_n == 0) {
++		return -1;
++	}
+ 
+-        while (cur_nscb != NULL) {
+-                if (timercmp(&tv, &cur_nscb->tv, >)) {
+-                        /* scheduled time */
+-#ifdef __vita__
+-                        cur_nscb = earliest_due(&tv, &prev_nscb);
+-#endif
++	/* what was due when the round began; a callback asked for while
++	 * it runs waits for the next */
++	now = sched_now_us();
++	start = now;
+ 
+-                        /* remove callback */
+-                        unlnk_nscb = cur_nscb;
++	while (heap_n > 0 && heap[0]->due < now) {
++		unlnk_nscb = heap[0];
++		heap_take(unlnk_nscb);
+ 
+-                        if (prev_nscb == NULL) {
+-                                schedule_list = unlnk_nscb->next;
+-                        } else {
+-                                prev_nscb->next = unlnk_nscb->next;
+-                        }
+-
+-                        /*
+-                         * Time it (VitaSurf). A GitHub load reports one
+-                         * round of this loop taking 23438 ms with 23405
+-                         * of it in here, so a single callback ran for
+-                         * twenty-three seconds with the browser stopped
+-                         * behind it and nothing said which callback. The
+-                         * address is enough: the Vita build keeps line
+-                         * tables, so it resolves the same way a crash
+-                         * offset does.
+-                         */
+                         {
+                                 struct timeval c0, c1;
+                                 unsigned int took;
+@@ -378,55 +444,38 @@ int schedule_run(void)
+ 
+                         free(unlnk_nscb);
+ 
+-                        /* need to deal with callback modifying the list. */
+-			if (schedule_list == NULL)
+-				return -1; /* no more callbacks scheduled */
+-			
+-                        /* reset enumeration to the start of the list */
+-                        cur_nscb = schedule_list;
+-                        prev_nscb = NULL;
+-			nexttime = cur_nscb->tv;
+-                } else {
+-			/* if the time to the event is sooner than the
+-			 * currently recorded soonest event record it 
+-			 */
+-			if (timercmp(&nexttime, &cur_nscb->tv, >)) {
+-				nexttime = cur_nscb->tv;
+-			}
+-                        /* move to next element */
+-                        prev_nscb = cur_nscb;
+-                        cur_nscb = prev_nscb->next;
+-                }
+-        }
+-
+-	/* make rettime relative to now */
+-	timersub(&nexttime, &tv, &rettime);
++		if (sched_now_us() - start >= SCHED_ROUND_US &&
++		    heap_n > 0 && heap[0]->due < now) {
++			/* the rest after input and drawing */
++			return 0;
++		}
++	}
+ 
+-	NSLOG(schedule, DEBUG,
+-	      "returning time to next event as %ldms",
+-	      (rettime.tv_sec * 1000) + (rettime.tv_usec / 1000)); 
++	if (heap_n == 0) {
++		return -1; /* no more callbacks scheduled */
++	}
+ 
+ 	/* return next event time in milliseconds (24days max wait) */
+-        return (rettime.tv_sec * 1000) + (rettime.tv_usec / 1000);
++	wait = heap[0]->due > now ? heap[0]->due - now : 0;
++	NSLOG(schedule, DEBUG, "returning time to next event as %ums",
++	      (unsigned int)(wait / 1000));
++	if (wait / 1000 > 0x7fffffffu) {
++		return 0x7fffffff;
++	}
++	return (int)(wait / 1000);
+ }
+ 
+ void list_schedule(void)
+ {
+-	struct timeval tv;
+-        struct nscallback *cur_nscb;
+-
+-	gettimeofday(&tv, NULL);
+-
+-        NSLOG(netsurf, INFO, "schedule list at %ld:%ld", tv.tv_sec,
+-              tv.tv_usec);
++	unsigned int i;
+ 
+-        cur_nscb = schedule_list;
++	NSLOG(netsurf, INFO, "schedule list at %llu us",
++	      (unsigned long long)sched_now_us());
+ 
+-        while (cur_nscb != NULL) {
+-                NSLOG(netsurf, INFO, "Schedule %p at %ld:%ld", cur_nscb,
+-                      cur_nscb->tv.tv_sec, cur_nscb->tv.tv_usec);
+-                cur_nscb = cur_nscb->next;
+-        }
++	for (i = 0; i < heap_n; i++) {
++		NSLOG(netsurf, INFO, "Schedule %p at %llu us", heap[i],
++		      (unsigned long long)heap[i]->due);
++	}
+ }
+ 
+ 

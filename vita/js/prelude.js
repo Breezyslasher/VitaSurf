@@ -7,6 +7,14 @@
  * This file is part of VitaSurf, a PS Vita port of NetSurf.
  * Licensed under the GNU General Public License version 2.
  */
+/* URL and URLSearchParams are vita/js/url.js's, on the URL Standard's
+   parser in C; the prelude's own uses reach them here, not through the
+   interface object a page sees */
+var URL=window.URL,URLSearchParams=window.URLSearchParams;
+/* the browser's own timers, which a page that replaces window.setTimeout
+   (a test's fake clock, zone.js) does not see or change (VitaSurf) */
+var setTimeout=window.setTimeout,clearTimeout=window.clearTimeout,
+    setInterval=window.setInterval,clearInterval=window.clearInterval;
 /* BEGIN regexp-split (VitaSurf)
  *
  * String.prototype.split with a regular expression, the way the
@@ -142,12 +150,34 @@ var GLOBAL_ATTRS=(' accessKey autocapitalize autocorrect autofocus contentEditab
    log, so a page that comes out wrong says what it wanted rather than
    leaving it to be guessed at. */
 function GAP(name,fn){return function(){
- try{if(typeof __vitaGap==='function')__vitaGap(name);}catch(e){}
+ try{if(typeof NV.__vitaGap==='function')NV.__vitaGap(name);}catch(e){}
  return fn?fn.apply(this,arguments):undefined;};}
+/* both answers kept by name (VitaSurf): each was a search of a long
+   string, at every read of href or src */
+var REFLECT_PROP=Object.create(null),REFLECT_TAG=Object.create(null);
 function reflectsOn(el,prop){
- if(GLOBAL_ATTRS.indexOf(' '+prop+' ')>=0)return true;
+ var r=REFLECT_PROP[prop];
+ if(r===undefined)r=REFLECT_PROP[prop]=GLOBAL_ATTRS.indexOf(' '+prop+' ')>=0;
+ if(r)return true;
  var t=el.tagName;
- return t!==undefined&&HTML_TAGS.indexOf(' '+t+' ')>=0;}
+ if(t===undefined)return false;
+ r=REFLECT_TAG[t];
+ if(r===undefined)r=REFLECT_TAG[t]=HTML_TAGS.indexOf(' '+t+' ')>=0;
+ return r;}
+/* A URL attribute's value resolved against the base, kept while the base
+ * is the same (VitaSurf). A module preloader compares each module with
+ * every <link>'s href, and each read parsed the URL again: nytimes.com
+ * read hrefs for a fifth of its script. At most 4096 kept. */
+var URL_RESOLVED=new Map(),URL_RESOLVED_BASE=null;
+function resolveURL(v){
+ var b=D.baseURI,r;
+ if(b!==URL_RESOLVED_BASE){URL_RESOLVED.clear();URL_RESOLVED_BASE=b;}
+ r=URL_RESOLVED.get(v);
+ if(r!==undefined)return r;
+ try{r=new URL(v,b).href;}catch(e){r=v;}
+ if(URL_RESOLVED.size>=4096)URL_RESOLVED.clear();
+ URL_RESOLVED.set(v,r);
+ return r;}
 Object.defineProperty(P,'style',{configurable:true,get:function(){return priv(this,'__style',function(){return {getPropertyValue:function(){return '';},setProperty:function(){},removeProperty:function(){},cssText:''};});}});
 Object.defineProperty(P,'dataset',{configurable:true,get:function(){return priv(this,'__dataset',function(){return {};});}});
 Object.defineProperty(P,'classList',{configurable:true,get:function(){var el=this;return {contains:function(c){return (' '+el.className+' ').indexOf(' '+c+' ')>=0;},add:function(){for(var i=0;i<arguments.length;i++){if(!this.contains(arguments[i]))el.className=(el.className?el.className+' ':'')+arguments[i];}},remove:function(){for(var i=0;i<arguments.length;i++){el.className=(' '+el.className+' ').split(' '+arguments[i]+' ').join(' ').trim();}},toggle:function(c,f){var h=this.contains(c);if(f===undefined)f=!h;if(f&&!h)this.add(c);else if(!f&&h)this.remove(c);return f;},get length(){return el.className?el.className.split(/\s+/).length:0;}};}});
@@ -189,31 +219,31 @@ var NUMERIC_SIZE=' CANVAS IMG VIDEO ';
   if(!reflectsOn(this,a))return undefined;
   var v=this.getAttribute(a);
   if(v===null||v==='')return '';
-  try{return new URL(v,D.baseURI).href;}catch(e){return v;}
+  return resolveURL(v);
  },set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);this.setAttribute(a,String(v));}});});
 ['disabled','checked','hidden','readOnly','selected','multiple','required'].forEach(function(a){var attr=a.toLowerCase();Object.defineProperty(P,a,{configurable:true,get:function(){if(!reflectsOn(this,a))return undefined;return this.hasAttribute(attr);},set:function(v){if(isOwnState(v)||!reflectsOn(this,a))return shadowProp(this,a,v);if(v)this.setAttribute(attr,'');else this.removeAttribute(attr);}});});
-/* Layout geometry. __vitaBox(node) (qjs.c) returns the element's laid-out
+/* Layout geometry. NV.__vitaBox(node) (qjs.c) returns the element's laid-out
    box as [x,y,width,height,clientWidth,clientHeight,clientLeft,clientTop,
    scrollWidth,scrollHeight,scrollLeft,scrollTop] in CSS px, document
    coordinates, border box; null when the element has no box. viewport()
    returns [scrollX,scrollY,viewportWidth,viewportHeight]. */
-function boxOf(el){var b=__vitaBox(el);return b||[0,0,0,0,0,0,0,0,0,0,0,0];}
-function viewport(){return __vitaScroll()||[0,0,960,544];}
+function boxOf(el){var b=NV.__vitaBox(el);return b||[0,0,0,0,0,0,0,0,0,0,0,0];}
+function viewport(){return NV.__vitaScroll()||[0,0,960,544];}
 function isViewportEl(el){return el===D.documentElement;}
 var BOXIDX={offsetWidth:2,offsetHeight:3,clientLeft:6,clientTop:7,scrollWidth:8,scrollHeight:9};
 Object.keys(BOXIDX).forEach(function(a){var i=BOXIDX[a];Object.defineProperty(P,a,{configurable:true,get:function(){return boxOf(this)[i];}});});
 ['clientWidth','clientHeight'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){if(isViewportEl(this)){return viewport()[2+n];}return boxOf(this)[4+n];}});});
 Object.defineProperty(P,'offsetParent',{configurable:true,get:function(){var n=this.parentNode;while(n&&n.nodeType===1&&n!==D.body&&n!==D.documentElement)n=n.parentNode;return n&&n.nodeType===1?n:null;}});
-['offsetTop','offsetLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){var b=__vitaBox(this);if(!b)return 0;var p=this.offsetParent,pb=p?__vitaBox(p):null;return b[1-n]-(pb?pb[1-n]:0);}});});
-['scrollTop','scrollLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){if(isViewportEl(this)||this===D.body){return viewport()[1-n];}return boxOf(this)[11-n];},set:function(v){if(isViewportEl(this)||this===D.body){var s=viewport();__vitaScrollTo(n===1?Number(v)||0:s[0],n===1?s[1]:Number(v)||0);}
+['offsetTop','offsetLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){var b=NV.__vitaBox(this);if(!b)return 0;var p=this.offsetParent,pb=p?NV.__vitaBox(p):null;return b[1-n]-(pb?pb[1-n]:0);}});});
+['scrollTop','scrollLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){if(isViewportEl(this)||this===D.body){return viewport()[1-n];}return boxOf(this)[11-n];},set:function(v){if(isViewportEl(this)||this===D.body){var s=viewport();NV.__vitaScrollTo(n===1?Number(v)||0:s[0],n===1?s[1]:Number(v)||0);}
  /* a box that scrolls its own content (VitaSurf) */
- else if(typeof __vitaScrollElement==='function')__vitaScrollElement(this,n===1?Number(v)||0:null,n===1?null:Number(v)||0);}});});
+ else if(typeof NV.__vitaScrollElement==='function')NV.__vitaScrollElement(this,n===1?Number(v)||0:null,n===1?null:Number(v)||0);}});});
 P.tabIndex=0;
 ['onclick','onchange','onsubmit','oninput','onkeydown','onkeyup','onkeypress','onmousedown','onmouseup','onmouseover','onmouseout','onfocus','onblur','onload','onerror','ontouchstart','ontouchend'].forEach(function(h){Object.defineProperty(P,h,{configurable:true,get:function(){return this['__'+h]||null;},set:function(f){this['__'+h]=f;if(typeof f==='function')this.addEventListener(h.slice(2),function(e){return f.call(this,e);});}});});
-P.getBoundingClientRect=function(){var b=__vitaBox(this);if(!b)return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};var s=b[12]?[0,0]:viewport(),x=b[0]-s[0],y=b[1]-s[1];return {x:x,y:y,left:x,top:y,width:b[2],height:b[3],right:x+b[2],bottom:y+b[3]};};
+P.getBoundingClientRect=function(){var b=NV.__vitaBox(this);if(!b)return {top:0,left:0,right:0,bottom:0,width:0,height:0,x:0,y:0};var s=b[12]?[0,0]:viewport(),x=b[0]-s[0],y=b[1]-s[1];return {x:x,y:y,left:x,top:y,width:b[2],height:b[3],right:x+b[2],bottom:y+b[3]};};
 P.getClientRects=function(){var r=this.getBoundingClientRect();return r.width||r.height?[r]:[];};
 P.focus=P.blur=P.select=function(){};
-P.scrollIntoView=function(arg){var b=__vitaBox(this);if(!b)return;var s=viewport(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
+P.scrollIntoView=function(arg){var b=NV.__vitaBox(this);if(!b)return;var s=viewport(),toEnd=(arg===false)||(arg&&(arg.block==='end'||arg.block==='nearest'&&b[1]<s[1]));NV.__vitaScrollTo(s[0],toEnd?b[1]+b[3]-s[3]:b[1]);};
 /* A disabled form control is not clickable: click() on one dispatches
    nothing at all. Dispatching a click at it explicitly still works,
    which is the difference the tests turn on. */
@@ -240,7 +270,7 @@ P.click=function(){
  var e=new MouseEvent('click',{bubbles:true,cancelable:true,composed:true});
  return this.dispatchEvent(e);};
 P.contains=function(n){
- var f=typeof window.__vitaIsAncestor==='function'?window.__vitaIsAncestor(this,n):undefined;
+ var f=typeof NV.__vitaIsAncestor==='function'?NV.__vitaIsAncestor(this,n):undefined;
  if(f!==undefined)return f;
  while(n){if(n===this)return true;n=n.parentNode;}return false;};
 /* jQuery sorts selector results with this, so a missing one takes out
@@ -380,9 +410,30 @@ function classSet(el){
  return cn?String(cn).split(CLASS_WS).filter(function(x){return x!=='';}):[];}
 function prevEl(n){for(n=n.previousSibling;n;n=n.previousSibling)if(n.nodeType===1)return n;return null;}
 function nextEl(n){for(n=n.nextSibling;n;n=n.nextSibling)if(n.nodeType===1)return n;return null;}
-function elIndex(el){var i=1,n=prevEl(el);while(n){i++;n=prevEl(n);}return i;}
-function elIndexEnd(el){var i=1,n=nextEl(el);while(n){i++;n=nextEl(n);}return i;}
-function typeIndex(el,back){var i=1,n=back?nextEl(el):prevEl(el);
+/* An element's place among its siblings, kept while the tree keeps its
+   shape (VitaSurf): each was counted by walking every sibling before it,
+   so :nth-child over a list of 3000 walked four and a half million
+   siblings a query, and a page's querySelectorAll ran out its time. A
+   place is found from the nearest sibling already placed. */
+var IDX={g:-2,c:null,ce:null,t:null,te:null};
+function idxMaps(){var g=treeGen();if(g<0)return null;
+ if(g!==IDX.g){IDX.g=g;IDX.c=new WeakMap();IDX.ce=new WeakMap();IDX.t=new WeakMap();IDX.te=new WeakMap();}
+ return IDX;}
+function anyEl(){return true;}
+function sameType(n,el){return n.tagName===el.tagName;}
+function placeOf(el,map,step,same){
+ var path=[],n=el,i=0,v;
+ while(n){v=map.get(n);if(v!==undefined){i=v;break;}path.push(n);
+  do{n=step(n);}while(n&&!same(n,el));}
+ for(var k=path.length-1;k>=0;k--)map.set(path[k],++i);
+ return i;}
+function elIndex(el){var m=idxMaps();if(m)return placeOf(el,m.c,prevEl,anyEl);
+ var i=1,n=prevEl(el);while(n){i++;n=prevEl(n);}return i;}
+function elIndexEnd(el){var m=idxMaps();if(m)return placeOf(el,m.ce,nextEl,anyEl);
+ var i=1,n=nextEl(el);while(n){i++;n=nextEl(n);}return i;}
+function typeIndex(el,back){var m=idxMaps();
+ if(m)return placeOf(el,back?m.te:m.t,back?nextEl:prevEl,sameType);
+ var i=1,n=back?nextEl(el):prevEl(el);
  while(n){if(n.tagName===el.tagName)i++;n=back?nextEl(n):prevEl(n);}return i;}
 /* an+b, and the odd and even that stand for 2n+1 and 2n. */
 function nthOk(arg,i){
@@ -409,8 +460,8 @@ function hasDescendant(el,groups){
  return false;}
 /* Whether a popover is shown: the element's own state, kept in C where
    :popover-open in the style sheets reads it too (VitaSurf). */
-var POPQ=typeof window!=='undefined'&&typeof window.__vitaPopover==='function'?
- window.__vitaPopover:null;
+var POPQ=typeof window!=='undefined'&&typeof NV.__vitaPopover==='function'?
+ NV.__vitaPopover:null;
 function focusIn(el,within){
  var f=typeof focused!=='undefined'?focused:null,n,p,h;
  if(!f||!ceInDoc(f))return false;
@@ -455,7 +506,7 @@ function pseudoOk(el,p){
  case 'link':case 'any-link':
   return (el.tagName==='A'||el.tagName==='AREA')&&el.hasAttribute('href');
  case 'defined':return true;
- case 'scope':return true;
+ case 'scope':return el===SCOPE;
  case 'popover-open':return popoverShown(el);
  case 'open':
   return (el.tagName==='DETAILS'||el.tagName==='DIALOG')&&el.hasAttribute('open');
@@ -471,7 +522,15 @@ function pseudoOk(el,p){
  case 'active':case 'visited':case 'target':case 'indeterminate':
   return false;
  default:return true;}}
-function matchSimple(el,q){if(el.nodeType!==1)return false;
+/* What :scope stands for in the query being answered (VitaSurf): the
+   element asked, a document's root element, or a fragment or shadow
+   root, the virtual scope the DOM gives them. It matched every element,
+   so ":scope > p" found every p below. */
+var SCOPE=null;
+function scopeOf(n){return n&&n.nodeType===9?n.documentElement:n;}
+function scopeOnly(q){return !q.tag&&!q.id&&!q.classes.length&&!q.attrs.length&&
+ q.pseudos.length===1&&q.pseudos[0].name==='scope';}
+function matchSimple(el,q){if(el.nodeType!==1)return el===SCOPE&&scopeOnly(q);
  if(q.tag){var ns=el.namespaceURI;
   if(ns===null||ns===undefined||ns===HTML_NS){
    if(el.tagName!==q.tagUpper)return false;
@@ -492,10 +551,10 @@ function matchAt(el,parts,i){
  if(!matchSimple(el,parts[i].sel))return false;
  if(i===0)return true;
  var comb=parts[i].comb,n;
- if(comb==='>'){n=el.parentNode;return !!n&&n.nodeType===1&&matchAt(n,parts,i-1);}
+ if(comb==='>'){n=el.parentNode;return !!n&&(n.nodeType===1||n===SCOPE)&&matchAt(n,parts,i-1);}
  if(comb==='+'){n=prevEl(el);return !!n&&matchAt(n,parts,i-1);}
  if(comb==='~'){for(n=prevEl(el);n;n=prevEl(n))if(matchAt(n,parts,i-1))return true;return false;}
- for(n=el.parentNode;n&&n.nodeType===1;n=n.parentNode)if(matchAt(n,parts,i-1))return true;
+ for(n=el.parentNode;n&&(n.nodeType===1||n===SCOPE);n=n.parentNode)if(matchAt(n,parts,i-1))return true;
  return false;}
 /* A selector becomes a list of groups, each a list of compounds carrying
    the combinator that joins it to the one before. The combinator used to
@@ -533,14 +592,14 @@ var compiled={},compiledCount=0,compiledHits=0;
 /* Cache hits are counted here and handed to C in batches: a crossing
    per call was a real share of a call that finds its answer in C. */
 function countHits(){
- if(compiledHits&&typeof __vitaSelector==='function')__vitaSelector(1,compiledHits);
+ if(compiledHits&&typeof NV.__vitaSelector==='function')NV.__vitaSelector(1,compiledHits);
  compiledHits=0;}
 /* A selector the general path keeps being asked for is named in the
    log at 1024 uses and each doubling after, so the next fast path is
    chosen from a log rather than guessed (VitaSurf). */
 function noteSlow(g,text){
  var n=g.slow=(g.slow|0)+1;
- if(n>=1024&&(n&(n-1))===0&&typeof __vitaSelector==='function')__vitaSelector(6,n,text);}
+ if(n>=1024&&(n&(n-1))===0&&typeof NV.__vitaSelector==='function')NV.__vitaSelector(6,n,text);}
 function compile(selector){
  var text=String(selector),hit=compiled[text];
  if(hit!==undefined){
@@ -548,14 +607,14 @@ function compile(selector){
   if(!hit.bare)noteSlow(hit,text);
   return hit;}
  countHits();
- if(typeof __vitaSelector==='function')__vitaSelector(0);
+ if(typeof NV.__vitaSelector==='function')NV.__vitaSelector(0);
  if(compiledCount>=512){compiled={};compiledCount=0;}
  hit=compileUncached(text);
  hit.bare=bareTag(hit);
  compiled[text]=hit;compiledCount++;
  return hit;}
 /* The one simple selector of a selector that is nothing but an ASCII
-   tag name, or null. Those are answered by __vitaTagQuery in C. */
+   tag name, or null. Those are answered by NV.__vitaTagQuery in C. */
 function bareTag(groups){
  if(groups.length!==1||groups[0].length!==1)return null;
  var q=groups[0][0].sel;
@@ -563,7 +622,7 @@ function bareTag(groups){
  return /^[A-Za-z][A-Za-z0-9_-]*$/.test(q.tag)?q:null;}
 /* The C answer for a bare tag selector already compiled, or undefined
    to take the general path: mode 0 matches, 1 first, 2 all. */
-var tagQuery=typeof __vitaTagQuery==='function'?__vitaTagQuery:null;
+var tagQuery=typeof NV.__vitaTagQuery==='function'?NV.__vitaTagQuery:null;
 function tagFast(el,sel,mode){
  if(tagQuery===null)return undefined;
  var g=compiled[typeof sel==='string'?sel:String(sel)];
@@ -591,7 +650,7 @@ function isPageRoot(n){
  return n===D||(!!n&&n.nodeType===9&&n.documentElement===D.documentElement);}
 function inDocument(n){
  /* in C: the climb crossed into C once per ancestor (VitaSurf) */
- if(typeof __vitaConnected==='function')return __vitaConnected(n);
+ if(typeof NV.__vitaConnected==='function')return NV.__vitaConnected(n);
  while(n){
   if(n===D.documentElement)return true;
   if(n.nodeType===9)return isPageRoot(n);
@@ -602,6 +661,7 @@ function walkElements(root,out){var c=root.childNodes,i;
  return out;}
 function select(root,sel,all){
  var groups=compile(String(sel)),out=[];
+ SCOPE=scopeOf(root);
  if(!groups.length)return out;
  var live=isPageRoot(root)||inDocument(root);
  /* one group ending in an id: ask the document directly */
@@ -613,13 +673,13 @@ function select(root,sel,all){
  /* candidates for the right-hand simple selector of every group, found
     in one pass through the tree in C (qjs.c) */
  var keys=groups.map(function(g){return g[g.length-1].sel;});
- var cand=live?__vitaFind(root.nodeType===9?null:root,keys):walkElements(root,[]);
+ var cand=live?NV.__vitaFind(root.nodeType===9?null:root,keys):walkElements(root,[]);
  for(var i=0;i<cand.length;i++){var c=cand[i];
   for(var g=0;g<groups.length;g++){
    if(matchAt(c,groups[g],groups[g].length-1)){out.push(c);break;}}
   if(!all&&out.length)return out;}
  return out;}
-var selCount=typeof __vitaSelector==='function'?__vitaSelector:function(){};
+var selCount=typeof NV.__vitaSelector==='function'?NV.__vitaSelector:function(){};
 P.querySelectorAll=function(sel){
  var f=tagFast(this,sel,2);if(f!==undefined)return f;
  selCount(2);return select(this,sel,true);};
@@ -631,15 +691,16 @@ function matchesAny(el,groups){
  return false;}
 P.matches=P.webkitMatchesSelector=P.msMatchesSelector=function(sel){
  var f=tagFast(this,sel,0);if(f!==undefined)return f;
- selCount(4);return matchesAny(this,compile(String(sel)));};
+ selCount(4);SCOPE=this;return matchesAny(this,compile(String(sel)));};
 /* closest compiles once and walks up in place (VitaSurf); it called
    matches per ancestor, a cache lookup and a crossing into C each. A
    bare tag -- closest('details'), GitHub's components asking for their
    own element -- is walked in C without a wrapper per ancestor. */
 P.closest=function(sel){
  var groups=compile(String(sel)),n=this,steps=0;
- if(groups.bare&&typeof __vitaClosestTag==='function')
-  return __vitaClosestTag(this,groups.bare.tag,groups.bare.tagUpper);
+ SCOPE=this;
+ if(groups.bare&&typeof NV.__vitaClosestTag==='function')
+  return NV.__vitaClosestTag(this,groups.bare.tag,groups.bare.tagUpper);
  while(n&&n.nodeType===1){steps++;if(matchesAny(n,groups)){selCount(5,steps);return n;}n=n.parentNode;}
  selCount(5,steps);
  return null;};
@@ -652,12 +713,12 @@ Object.defineProperty(P,'previousElementSibling',{configurable:true,get:function
 Object.defineProperty(P,'childElementCount',{configurable:true,get:function(){return this.children.length;}});
 /* the four element steps in C when the bindings have them (VitaSurf);
    the getters above stay behind them for anything that is not a node */
-if(typeof __vitaElementStep==='function')
+if(typeof NV.__vitaElementStep==='function')
  ['firstElementChild','lastElementChild','nextElementSibling',
   'previousElementSibling','parentElement'].forEach(function(k,i){
   var d=Object.getOwnPropertyDescriptor(P,k);
   Object.defineProperty(P,k,{configurable:true,
-   get:__vitaElementStep(i,d.get)});});
+   get:NV.__vitaElementStep(i,d.get)});});
 /* localName, prefix and namespaceURI come from libdom now (qjs.c). An
    SVG clipPath keeps its capital P and an element made with a prefix
    keeps it, neither of which can be guessed from the tag name. These
@@ -767,12 +828,12 @@ P.insertAdjacentText=function(where,t){
    scrolls the page, as before (VitaSurf) */
 function elScrollArgs(a,b){if(a&&typeof a==='object')return [a.left,a.top];return [a,b];}
 P.scrollTo=P.scroll=function(a,b){var p=elScrollArgs(a,b);
- if(typeof __vitaScrollElement==='function'&&!isViewportEl(this)&&this!==D.body&&
-  __vitaScrollElement(this,p[0]===undefined?null:Number(p[0])||0,p[1]===undefined?null:Number(p[1])||0))return;
+ if(typeof NV.__vitaScrollElement==='function'&&!isViewportEl(this)&&this!==D.body&&
+  NV.__vitaScrollElement(this,p[0]===undefined?null:Number(p[0])||0,p[1]===undefined?null:Number(p[1])||0))return;
  window.scrollTo(a,b);};
 P.scrollBy=function(a,b){var p=elScrollArgs(a,b);
- if(typeof __vitaScrollElement==='function'&&!isViewportEl(this)&&this!==D.body&&
-  __vitaScrollElement(this,p[0]===undefined?null:this.scrollLeft+(Number(p[0])||0),p[1]===undefined?null:this.scrollTop+(Number(p[1])||0)))return;
+ if(typeof NV.__vitaScrollElement==='function'&&!isViewportEl(this)&&this!==D.body&&
+  NV.__vitaScrollElement(this,p[0]===undefined?null:this.scrollLeft+(Number(p[0])||0),p[1]===undefined?null:this.scrollTop+(Number(p[1])||0)))return;
  window.scrollBy(a,b);};
 P.scrollIntoViewIfNeeded=function(centre){return this.scrollIntoView(centre===false?{block:'nearest'}:true);};
 P.toggleAttribute=function(n,force){
@@ -1004,7 +1065,7 @@ function goTo(url){
   try{src=decodeURIComponent(src);}catch(e){}
   setTimeout(function(){
    try{(0,eval)(src);}catch(err){
-    if(W.__vitaReportError)W.__vitaReportError(err,location.href);}},0);
+    if(NV.__vitaReportError)NV.__vitaReportError(err,location.href);}},0);
   return;}
  try{here=location.href;}catch(e){return;}
  var abs,i;
@@ -1021,7 +1082,7 @@ function goTo(url){
  if(abs===here)return;
  if(sameDocFragment(here,abs)){
   var oldURL=here,hash=abs.slice(abs.indexOf('#'));
-  W.__vitaHref=abs;
+  NV.__vitaHref=abs;
   try{target=hash.length>1?
    (D.getElementById(decodeURIComponent(hash.slice(1)))||null):null;}catch(e){}
   if(target&&target.scrollIntoView)try{target.scrollIntoView();}catch(e){}
@@ -1029,7 +1090,7 @@ function goTo(url){
    var ev=uaEvent(new W.HashChangeEvent('hashchange',
     {bubbles:false,cancelable:false}));
    ev.oldURL=oldURL;ev.newURL=abs;
-   try{W.dispatchEvent?W.dispatchEvent(ev):__vitaDispatch(null,ev);}catch(e){}
+   try{W.dispatchEvent?W.dispatchEvent(ev):NV.__vitaDispatch(null,ev);}catch(e){}
   },0);
   return;}
  setTimeout(function(){try{location.href=abs;}catch(e){}},0);}
@@ -1040,13 +1101,13 @@ function goTo(url){
   Object.getPrototypeOf(location)||{},'href');
  if(!d||!d.get||!d.set)return;
  Object.defineProperty(location,'href',{configurable:true,
-  get:function(){return W.__vitaHref||d.get.call(location);},
+  get:function(){return NV.__vitaHref||d.get.call(location);},
   set:function(v){
    var abs;
-   try{abs=new URL(String(v),W.__vitaHref||d.get.call(location)).href;}
+   try{abs=new URL(String(v),NV.__vitaHref||d.get.call(location)).href;}
    catch(e){abs=String(v);}
-   if(sameDocFragment(W.__vitaHref||d.get.call(location),abs)){goTo(abs);return;}
-   W.__vitaHref=null;d.set.call(location,v);}});
+   if(sameDocFragment(NV.__vitaHref||d.get.call(location),abs)){goTo(abs);return;}
+   NV.__vitaHref=null;d.set.call(location,v);}});
  Object.defineProperty(location,'hash',{configurable:true,
   get:function(){var h=location.href,i=h.indexOf('#');return i<0?'':h.slice(i);},
   set:function(v){
@@ -1081,7 +1142,7 @@ function runActivation(a){
   try{
    if(shown&&how!=='show')a.target.hidePopover();
    else if(!shown&&how!=='hide')a.target.showPopover();}
-  catch(err){if(W.__vitaReportError)W.__vitaReportError(err);}
+  catch(err){if(NV.__vitaReportError)NV.__vitaReportError(err);}
   return;}
  if(a.kind==='link')goTo(a.el.getAttribute('href'));}
 function cancelActivate(was){
@@ -1103,7 +1164,7 @@ P.dispatchEvent=function(e){
  if(e&&String(e.type)==='click'&&!e.__vitaActivated){
   shadowProp(e,'__vitaActivated',true);
   act=activationTarget(this);}
- r=__vitaDispatch(this,e);
+ r=NV.__vitaDispatch(this,e);
  /* dispatchEvent answers false when the event was cancelled, which is
     how requestSubmit and every other caller learns it was. */
  if(e&&e.cancelable&&e.defaultPrevented)r=false;
@@ -1134,7 +1195,7 @@ function pointerPlace(e,x,y){
    button does what a script's click of it does. Home Assistant's "Keep
    me logged in" is a label around a checkbox the page keeps invisible
    and untappable. */
-Object.defineProperty(window,'__vitaActivate',{configurable:true,
+Object.defineProperty(NV,'__vitaActivate',{configurable:true,
  value:function(n,x,y){
   var a=activationTarget(n),c,t,ev;
   if(!a)return;
@@ -1159,7 +1220,7 @@ var NATIVE_MOUSE=' dblclick mousedown mouseup mousemove mouseover mouseout '+
 var NATIVE_KEY=' keydown keyup keypress ';
 var NATIVE_FOCUS=' focus blur focusin focusout ';
 var NATIVE_INPUT=' input beforeinput ';
-Object.defineProperty(window,'__vitaNativeEvent',{configurable:true,
+Object.defineProperty(NV,'__vitaNativeEvent',{configurable:true,
  value:function(p){
   var t=String(p.type),k=' '+t+' ',q=p.__vsPointer,C,init,e,i,f;
   if(q&&(NATIVE_POINTER.indexOf(k)>=0||NATIVE_MOUSE.indexOf(k)>=0)){
@@ -1243,7 +1304,7 @@ D.createEvent=function(t){
  /* an event made this way is uninitialised until initEvent is called */
  ev.type='';ev.target=null;ev.currentTarget=null;ev.eventPhase=0;
  ev.bubbles=false;ev.cancelable=false;ev.defaultPrevented=false;
- return ev;};D.dispatchEvent=function(e){return __vitaDispatch(D,e);};
+ return ev;};D.dispatchEvent=function(e){return NV.__vitaDispatch(D,e);};
 /* window.event: undefined outside a dispatch; the listener call sets it */
 if(!Object.prototype.hasOwnProperty.call(window,'event'))window.event=undefined;
 D.hasFocus=function(){return true;};
@@ -1301,8 +1362,8 @@ D.open=function(){return D;};D.close=function(){};D.writeln=D.writeln||function(
 /* The element hit, as the tree asked sees it: in a shadow tree, its
    host in the document's own tree (VitaSurf). */
 function hitAt(x,y){
- if(!W.__vitaElementFromPoint)return null;
- var s=viewport(),e=W.__vitaElementFromPoint(Math.round(x)+s[0],Math.round(y)+s[1])||null;
+ if(!NV.__vitaElementFromPoint)return null;
+ var s=viewport(),e=NV.__vitaElementFromPoint(Math.round(x)+s[0],Math.round(y)+s[1])||null;
  while(e&&e.nodeType!==1)e=e.parentNode||shadowHost(e);
  return e;}
 function fromPoint(scope,x,y){
@@ -1330,14 +1391,14 @@ window.reportError=function(e){try{console.error(e);}catch(x){}};
 window.postMessage=function(data){
  setTimeout(function(){
   var e=uaEvent(new Event('message'));e.data=data;e.origin=location.origin||'';e.source=window;e.ports=[];
-  __vitaDispatch(null,e);
+  NV.__vitaDispatch(null,e);
  },0);
 };
 D.createAttribute=function(n){return new Attr(null,String(n).toLowerCase(),'');};
 function scratchDocument(title){var html=D.createElement('html'),head=D.createElement('head'),body=D.createElement('body');html.appendChild(head);html.appendChild(body);var doc={nodeType:9,nodeName:'#document',documentElement:html,head:head,body:body,title:title||'',defaultView:null,implementation:D.implementation,createElement:function(t){return D.createElement(t);},createElementNS:function(ns,t){return D.createElement(t);},createTextNode:function(t){return D.createTextNode(t);},createDocumentFragment:function(){return D.createDocumentFragment();},createComment:function(){return D.createTextNode('');},getElementsByTagName:function(t){return html.getElementsByTagName(t);},getElementById:function(id){return html.querySelector('#'+id);},querySelector:function(s){return html.querySelector(s);},querySelectorAll:function(s){return html.querySelectorAll(s);},addEventListener:function(){},removeEventListener:function(){},write:function(){},open:function(){},close:function(){}};return doc;}
 D.implementation={
  createHTMLDocument:function(t){
-  var d=W.__vitaParseDocument?W.__vitaParseDocument(
+  var d=NV.__vitaParseDocument?NV.__vitaParseDocument(
    '<!DOCTYPE html><html><head><title>'+
    String(t===undefined?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;')+
    '</title></head><body></body></html>'):null;
@@ -1346,8 +1407,8 @@ D.implementation={
   if(qname!==undefined&&qname!==null&&String(qname)!==''){
    checkElementName(qname);
    nsExtract(ns,qname,'createDocument');}
-  var d=D.__vitaCreateDocument?
-   D.__vitaCreateDocument(ns,qname,doctype||null):null;
+  var d=NV.__vitaCreateDocument?
+   NV.__vitaCreateDocument.call(D,ns,qname,doctype||null):null;
   return d||scratchDocument('');},
  hasFeature:function(){return true;}};
 D.characterSet=D.charset='UTF-8';D.referrer='';D.domain='';
@@ -1410,15 +1471,35 @@ D.createTreeWalker=function(root,what,filter){
 /* The base every relative URL in the document resolves against: the
  * first <base href>, or the document's own address. Read with
  * getAttribute, never through the href property, which resolves against
- * this and would call straight back into it. */
-Object.defineProperty(D,'baseURI',{configurable:true,get:function(){
- var b=D.getElementsByTagName('base');
- for(var i=0;i<b.length;i++){var h=b[i].getAttribute('href');
-  if(h){try{return new URL(h,location.href).href;}catch(e){}}}
- /* the document's own base: a srcdoc or blank frame's is its parent's */
- var n=W.__vitaDocBase?W.__vitaDocBase():'';
- return n||location.href;
-}});
+ * this and would call straight back into it.
+ *
+ * Kept until the document or its address changes (VitaSurf): every
+ * a.href, link.href and img.src read resolves against it, and finding
+ * the <base> is a walk of the whole document. A module preloader that
+ * compares each module with every <link>'s href walked a document of
+ * 6,400 elements 39,459 times on nytimes.com, four minutes of script. */
+(function(){
+ var gen=-1,here=null,val='',bgen=-1,bases=null;
+ /* the <base> elements are kept while the tree keeps its shape, and
+    their href read again: a page writing attributes between reads had
+    the document walked for them every time (VitaSurf) */
+ function baseEls(){
+  var t=treeGen();
+  if(t<0||t!==bgen||!bases){bases=[].slice.call(D.getElementsByTagName('base'));bgen=t;}
+  return bases;}
+ function find(){
+  var b=baseEls();
+  for(var i=0;i<b.length;i++){var h=b[i].getAttribute('href');
+   if(h){try{return new URL(h,location.href).href;}catch(e){}}}
+  /* the document's own base: a srcdoc or blank frame's is its parent's */
+  var n=NV.__vitaDocBase?NV.__vitaDocBase():'';
+  return n||location.href;}
+ Object.defineProperty(D,'baseURI',{configurable:true,get:function(){
+  var g=domGen(),h=location.href;
+  if(g<0||g!==gen||h!==here){val=find();gen=g;here=h;}
+  return val;
+ }});
+})();
 Object.defineProperty(D,'URL',{configurable:true,get:function(){return location.href;}});Object.defineProperty(D,'documentURI',{configurable:true,get:function(){return location.href;}});
 Object.defineProperty(D,'activeElement',{configurable:true,get:function(){return D.body;}});
 /* createComment is a real comment node from qjs.c now. */D.write=D.writeln=function(){};
@@ -1454,7 +1535,7 @@ Object.defineProperty(D,'activeElement',{configurable:true,get:function(){return
   var src=buf,p;
   buf=null;
   if(src===null)return;
-  p=W.__vitaParseDocument?W.__vitaParseDocument(src):null;
+  p=NV.__vitaParseDocument?NV.__vitaParseDocument(src):null;
   if(!p||!D.documentElement)return;
   attrs(p.documentElement,D.documentElement);
   if(D.head){D.head.innerHTML=p.head?p.head.innerHTML:'';}
@@ -1484,18 +1565,18 @@ D.contains=function(n){var r=D.documentElement;return r?r.contains(n):false;};
 var W=window;
 /* storage.js fires the storage and IndexedDB events, and takes this away
    before any page script runs */
-Object.defineProperty(W,'__vitaUaEvent',{configurable:true,value:uaEvent});
+Object.defineProperty(NV,'__vitaUaEvent',{configurable:true,value:uaEvent});
 /* The tree generation, read straight out of the C counter through a
-   typed array over it (VitaSurf): __vitaDomGen() was a call into C on
+   typed array over it (VitaSurf): NV.__vitaDomGen() was a call into C on
    every read, and the attribute cache reads it once per attribute. */
 var GEN=null;
-try{if(W.__vitaGenBuf)GEN=new Uint32Array(W.__vitaGenBuf);delete W.__vitaGenBuf;}catch(e){}
+try{if(NV.__vitaGenBuf)GEN=new Uint32Array(NV.__vitaGenBuf);delete NV.__vitaGenBuf;}catch(e){}
 /* -1 when there is no counter to read: nothing is then kept */
 function domGen(){return GEN?GEN[0]:-1;}
 /* the tree's shape alone, which attribute writes leave (VitaSurf) */
 function treeGen(){return GEN&&GEN.length>1?GEN[1]:-1;}
 ['onload','onerror','onresize','onscroll','onhashchange','onpopstate','onunload','onbeforeunload','onmessage','onpageshow','onclick','onkeydown','onkeyup','ontouchstart'].forEach(function(h){Object.defineProperty(W,h,{configurable:true,get:function(){return W['__'+h]||null;},set:function(f){W['__'+h]=f;if(typeof f==='function'&&h!=='onerror')W.addEventListener(h.slice(2),f);}});});
-W.dispatchEvent=function(e){return __vitaDispatch(null,e);};
+W.dispatchEvent=function(e){return NV.__vitaDispatch(null,e);};
 /* Viewport and scroll position come from the window itself, so a script
    that measures the page sees what is really on screen. */
 /* Replaceable, as a browser's are: enumerable, configurable, and a
@@ -1511,13 +1592,42 @@ try{Object.defineProperty(W,'length',{configurable:true,get:function(){return D.
 W.screen={width:960,height:544,availWidth:960,availHeight:544,colorDepth:32,pixelDepth:32,orientation:{type:'landscape-primary'}};
 W.focus=W.blur=W.stop=W.print=W.close=function(){};W.open=function(){return null;};
 function scrollArgs(a,b){if(a&&typeof a==='object')return [Number(a.left)||0,Number(a.top)||0];return [Number(a)||0,Number(b)||0];}
-W.scrollTo=W.scroll=function(a,b){var p=scrollArgs(a,b);__vitaScrollTo(p[0],p[1]);};
-W.scrollBy=function(a,b){var p=scrollArgs(a,b),s=viewport();__vitaScrollTo(s[0]+p[0],s[1]+p[1]);};
+W.scrollTo=W.scroll=function(a,b){var p=scrollArgs(a,b);NV.__vitaScrollTo(p[0],p[1]);};
+W.scrollBy=function(a,b){var p=scrollArgs(a,b),s=viewport();NV.__vitaScrollTo(s[0]+p[0],s[1]+p[1]);};
 W.confirm=function(){return false;};W.prompt=function(){return null;};
-W.requestAnimationFrame=function(f){return setTimeout(function(){f(Date.now());},16);};W.cancelAnimationFrame=function(h){clearTimeout(h);};
+/*
+ * requestAnimationFrame as the HTML standard runs it (VitaSurf): the
+ * callbacks asked for before a frame run together, in the order asked,
+ * each given the frame's time on performance.now()'s clock, and one
+ * asked for during a frame waits for the next. Each had been a timer of
+ * its own given Date.now(), so code measuring from performance.now()
+ * found a frame forty years on, and two callbacks of a frame disagreed
+ * on its time. A callback that throws is reported and the rest run.
+ * tests/js/timers.html.
+ */
+(function(){
+ var queue=[],live={},next=1,armed=false;
+ function frame(){
+  var list=queue,i,c,t=typeof NV.__vitaNow==='function'?
+   Math.max(0,Math.round((NV.__vitaNow()-(NV.__vitaHr0||0))*10)/10):Date.now();
+  queue=[];armed=false;
+  for(i=0;i<list.length;i++){
+   c=list[i];
+   if(!live[c.id])continue;
+   delete live[c.id];
+   try{c.f.call(undefined,t);}
+   catch(e){if(NV.__vitaReportError)NV.__vitaReportError(e);}}}
+ W.requestAnimationFrame=function requestAnimationFrame(f){
+  if(typeof f!=='function')throw new TypeError("Failed to execute 'requestAnimationFrame' on 'Window': parameter 1 is not of type 'Function'.");
+  var id=next++;
+  queue.push({id:id,f:f});live[id]=true;
+  if(!armed){armed=true;setTimeout(frame,16);}
+  return id;};
+ W.cancelAnimationFrame=function cancelAnimationFrame(id){delete live[id];};
+})();
 W.requestIdleCallback=function(f){return setTimeout(function(){f({didTimeout:false,timeRemaining:function(){return 10;}});},50);};W.cancelIdleCallback=function(h){clearTimeout(h);};
 /* getComputedStyle. The values are mostly defaults -- there is no style
- * resolution exposed here beyond what __vitaStyle reports and what the
+ * resolution exposed here beyond what NV.__vitaStyle reports and what the
  * box geometry says -- but the shape is the point: a real declaration
  * answers every CSS property with a string, and ours used to answer
  * undefined for all but a handful. Reading one and calling a string
@@ -1578,11 +1688,11 @@ var UA_DISPLAY={SPAN:'inline',A:'inline',B:'inline',I:'inline',EM:'inline',
  HEAD:'none',SCRIPT:'none',STYLE:'none',TITLE:'none',META:'none',
  LINK:'none',TEMPLATE:'none',BASE:'none',PARAM:'none',SOURCE:'none',
  TRACK:'none',AREA:'none',DATALIST:'none',DIALOG:'none'};
-/* A colour from __vitaStyle: the RGB and its alpha arrive apart, because
+/* A colour from NV.__vitaStyle: the RGB and its alpha arrive apart, because
    0xff000000 does not fit the int the binding hands back on a 32-bit
    target. A browser answers rgb() when the colour is opaque and rgba()
    when it is not, and code compares the string it gets. */
-/* Properties __vitaStyle resolves, so the style attribute must not
+/* Properties NV.__vitaStyle resolves, so the style attribute must not
    overwrite them with the author's own spelling. */
 var RESOLVED={fontSize:1,display:1,visibility:1,color:1,backgroundColor:1};
 var BOX_RESOLVED=/^(margin|padding)(Top|Right|Bottom|Left)?$|^border(Top|Right|Bottom|Left)?Width$/;
@@ -1612,7 +1722,7 @@ function computedStyle(el,pseudo){
   for(var k in CS_DEFAULTS)empty[k]='';
   empty.width='';empty.height='';
   return empty;}
- var st=(el&&el.nodeType===1&&typeof __vitaStyle==='function')?__vitaStyle(el):null;
+ var st=(el&&el.nodeType===1&&typeof NV.__vitaStyle==='function')?NV.__vitaStyle(el):null;
  var cs=Object.create(CS_PROTO);
  for(var k in CS_DEFAULTS)cs[k]=CS_DEFAULTS[k];
  if(el&&el.nodeType===1&&UA_DISPLAY[el.tagName])cs.display=UA_DISPLAY[el.tagName];
@@ -1633,8 +1743,8 @@ function computedStyle(el,pseudo){
  /* The rest of the cascade's answers, and a pseudo element's own: what
     the element is positioned and laid out with, its font, borders and
     text, as a browser reports them. */
- var more=(el&&el.nodeType===1&&typeof __vitaStyleMore==='function')?
-  __vitaStyleMore(el,typeof pseudo==='string'&&pseudo?pseudo:null):null;
+ var more=(el&&el.nodeType===1&&typeof NV.__vitaStyleMore==='function')?
+  NV.__vitaStyleMore(el,typeof pseudo==='string'&&pseudo?pseudo:null):null;
  if(more)for(var mk in more){cs[mk]=more[mk];if(!CS_DASHED[mk])csDashed(mk);}
  /* a ::before or ::after that is not there still answers, with no content */
  if(typeof pseudo==='string'&&/^::?(before|after)$/i.test(pseudo)&&
@@ -1680,8 +1790,8 @@ function csNames(cs){
    property, set from the cascade, and answers before these. */
 function csSize(cs,i){
  var el=cs.__vitaEl,b;
- if(!el||el.nodeType!==1||typeof __vitaBox!=='function')return 'auto';
- b=__vitaBox(el);
+ if(!el||el.nodeType!==1||typeof NV.__vitaBox!=='function')return 'auto';
+ b=NV.__vitaBox(el);
  return b?b[i]+'px':'auto';}
 ['width','height'].forEach(function(k,i){
  Object.defineProperty(CS_PROTO,k,{configurable:true,
@@ -1694,8 +1804,8 @@ Object.defineProperties(CS_PROTO,{
   if(n.slice(0,2)==='--'){
    if(Object.prototype.hasOwnProperty.call(this,n))return String(this[n]);
    if(sheetsDirty.length)sheetsWrite();
-   return (el&&el.nodeType===1&&typeof __vitaCustomProp==='function')?
-    __vitaCustomProp(el,n):'';}
+   return (el&&el.nodeType===1&&typeof NV.__vitaCustomProp==='function')?
+    NV.__vitaCustomProp(el,n):'';}
   var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);}},
  getPropertyPriority:{configurable:true,writable:true,value:function(){return '';}},
  setProperty:{configurable:true,writable:true,value:function(n,v){this[dashToCamel(n)]=String(v);delete this.__vitaNames;}},
@@ -1715,12 +1825,12 @@ function mediaFeature(name,value){var s=viewport(),w=s[2],h=s[3],n=parseFloat(va
  case 'height':return h===n;case 'min-height':return h>=n;case 'max-height':return h<=n;
  case 'aspect-ratio':case 'min-aspect-ratio':case 'max-aspect-ratio':{var p=String(value).split('/'),r=parseFloat(p[0])/(parseFloat(p[1])||1),a=w/(h||1);return name==='min-aspect-ratio'?a>=r:name==='max-aspect-ratio'?a<=r:Math.abs(a-r)<0.001;}
  case 'orientation':return value===(w>=h?'landscape':'portrait');
- /* the same answer the stylesheets get: qjs.c sets __vitaDarkMode from
+ /* the same answer the stylesheets get: qjs.c sets NV.__vitaDarkMode from
     the option the Start menu toggles, so matchMedia and the CSS
     cannot disagree about which theme a site should use */
  case 'prefers-color-scheme':
   if(value===''||value===undefined)return true;
-  return W.__vitaDarkMode?value==='dark':
+  return NV.__vitaDarkMode?value==='dark':
    (value==='light'||value==='no-preference');
  /* reduced motion is asked for, as the stylesheets are told: Home
     Assistant's login page animates a particle field on a canvas every
@@ -1788,7 +1898,7 @@ W.matchMedia=function(q){var mql={media:String(q),onchange:null,_l:[],
  dispatchEvent:function(){return true;}};
  Object.defineProperty(mql,'matches',{configurable:true,get:function(){return mediaMatches(q);}});
  return mql;};
-W.__vitaMediaMatches=mediaMatches;
+NV.__vitaMediaMatches=mediaMatches;
 function Storage(){var d={};this.getItem=function(k){return Object.prototype.hasOwnProperty.call(d,k)?d[k]:null;};this.setItem=function(k,v){d[k]=String(v);};this.removeItem=function(k){delete d[k];};this.clear=function(){d={};};this.key=function(i){return Object.keys(d)[i]||null;};Object.defineProperty(this,'length',{configurable:true,get:function(){return Object.keys(d).length;}});}
 W.localStorage=new Storage();W.sessionStorage=new Storage();
 /* --- history ------------------------------------------------------------
@@ -1798,12 +1908,12 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
  * did nothing: a single page app would log you in and then show you the
  * login page again, because that is still what the address said.
  *
- * Nothing here navigates. It moves the same __vitaHref that a fragment
+ * Nothing here navigates. It moves the same NV.__vitaHref that a fragment
  * navigation moves, which is what location.href and every part of it
  * read, and fires popstate when the page walks the stack. */
 (function(){
  function here(){ try{ return location.href; }catch(e){ return ''; } }
- var stack=[{state:null,url:here()}], at=0;
+ var stack=[{state:null,url:here()}], at=0, state=null;
  function resolve(url){
   if(url===undefined||url===null||url==='')return here();
   try{ return new URL(String(url), here()).href; }catch(e){ return here(); }
@@ -1816,15 +1926,15 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
     reloads (VitaSurf). Home Assistant replaces its login callback
     address, code and all, once the code is spent; kept, a reload or
     the History page went back to a code that no longer worked. */
- var SU=typeof W.__vitaScriptURL==='function'?W.__vitaScriptURL:null;
+ var SU=typeof NV.__vitaScriptURL==='function'?NV.__vitaScriptURL:null;
  function tell(replace){
   if(!SU)return;
   try{SU(stack[at].url,replace);}catch(e){}}
  function apply(i,fire){
   var e=stack[i];
   at=i;
-  W.__vitaHref=e.url;
-  H.state=e.state;
+  NV.__vitaHref=e.url;
+  state=e.state;
   if(!fire)return;
   setTimeout(function(){
    var ev;
@@ -1832,12 +1942,12 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
    catch(err){ ev=new Event('popstate'); }
    uaEvent(ev);
    try{ ev.state=e.state; }catch(err){}
-   try{ W.dispatchEvent?W.dispatchEvent(ev):__vitaDispatch(null,ev); }catch(err){}
+   try{ W.dispatchEvent?W.dispatchEvent(ev):NV.__vitaDispatch(null,ev); }catch(err){}
   },0);
  }
  var H={
   get length(){ return stack.length; },
-  state:null,
+  get state(){ return state; },
   scrollRestoration:'auto',
   pushState:function(state,title,url){
    stack.length=at+1;
@@ -1868,8 +1978,9 @@ W.localStorage=new Storage();W.sessionStorage=new Storage();
    var e=new Event(type,init); e.state=(init&&init.state)||null; return e; };
  }
 })();
-var t0=Date.now();var perf=W.performance||{};W.performance=perf;if(!perf.now)perf.now=function(){return Date.now()-t0;};perf.timing={navigationStart:t0,unloadEventStart:0,unloadEventEnd:0,redirectStart:0,redirectEnd:0,secureConnectionStart:0,fetchStart:t0,domainLookupStart:t0,domainLookupEnd:t0,connectStart:t0,connectEnd:t0,requestStart:t0,responseStart:t0,responseEnd:t0,domLoading:t0,domInteractive:t0,domContentLoadedEventStart:t0,domContentLoadedEventEnd:t0,domComplete:t0,loadEventStart:t0,loadEventEnd:t0};perf.navigation={type:0,redirectCount:0};perf.mark=perf.measure=perf.clearMarks=perf.clearMeasures=function(){};perf.getEntries=perf.getEntriesByType=perf.getEntriesByName=function(){return [];};
-navigator.language='en-US';navigator.languages=['en-US','en'];navigator.cookieEnabled=true;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};
+/* performance is made in performance.js; it measures from here */
+var t0=Date.now();NV.__vitaT0=t0;NV.__vitaHr0=typeof NV.__vitaNow==='function'?NV.__vitaNow():0;
+(function(){var l=String(typeof NV.__vitaLanguages==='function'?NV.__vitaLanguages():'en-US,en').split(',').map(function(t){return t.trim();}).filter(Boolean);if(!l.length)l=['en-US','en'];navigator.language=l[0];navigator.languages=Object.freeze(l);})();navigator.cookieEnabled=true;navigator.webdriver=false;navigator.onLine=true;navigator.doNotTrack=null;navigator.maxTouchPoints=1;navigator.vendor='';navigator.hardwareConcurrency=1;navigator.sendBeacon=function(){return false;};navigator.javaEnabled=function(){return false;};
 location.reload=function(){location.href=location.href;};
 ['protocol','host','hostname','port','pathname','search','hash','origin'].forEach(function(k){Object.defineProperty(location,k,{configurable:true,get:function(){var m=location.href.match(/^([a-z][a-z0-9+.-]*:)\/\/(([^\/:?#]*)(?::(\d+))?)([^?#]*)(\?[^#]*)?(#.*)?/i)||[];return {protocol:m[1]||'',host:m[2]||'',hostname:m[3]||'',port:m[4]||'',pathname:m[5]||'/',search:m[6]||'',hash:m[7]||'',origin:m[1]?m[1]+'//'+(m[2]||''):'null'}[k];}});});
 location.toString=function(){return location.href;};
@@ -1929,6 +2040,9 @@ EventTarget.prototype.dispatchEvent=function(e){
  return !(e.cancelable&&e.defaultPrevented);};
 try{Object.setPrototypeOf(P,EventTarget.prototype);}catch(e){}
 W.EventTarget=EventTarget;
+/* what an EventTarget that is not a node does; nodes.js joins it to the
+   node methods EventTarget.prototype ends up with */
+NV.__vitaEventTargetJS=EventTarget.prototype;
 /* The event interfaces. A page names one to say what kind of event a
  * handler takes -- YouTube annotates a wheel handler with WheelEvent --
  * so the name has to exist even where nothing here will ever construct
@@ -1970,14 +2084,14 @@ Object.defineProperty(DocumentProto,'constructor',
 /* Set once the real ones are defined, further down. Anything that runs
    before that sees the array, which is what it used to be. */
 W.NodeList=W.HTMLCollection=Array;
-['CharacterData','Text','Comment','CDATASection','ProcessingInstruction','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});
+['CharacterData','Text','Comment','CDATASection','ProcessingInstruction','Attr','DocumentFragment','DocumentType','ShadowRoot','SVGElement','SVGSVGElement','HTMLUnknownElement','HTMLDirectoryElement','HTMLAnchorElement','HTMLAreaElement','HTMLAudioElement','HTMLBaseElement','HTMLBodyElement','HTMLBRElement','HTMLButtonElement','HTMLCanvasElement','HTMLDataElement','HTMLDataListElement','HTMLDetailsElement','HTMLDialogElement','HTMLDivElement','HTMLDListElement','HTMLEmbedElement','HTMLFieldSetElement','HTMLFontElement','HTMLFormElement','HTMLFrameElement','HTMLFrameSetElement','HTMLHeadElement','HTMLHeadingElement','HTMLHRElement','HTMLHtmlElement','HTMLIFrameElement','HTMLImageElement','HTMLInputElement','HTMLLabelElement','HTMLLegendElement','HTMLLIElement','HTMLLinkElement','HTMLMapElement','HTMLMarqueeElement','HTMLMediaElement','HTMLMenuElement','HTMLMetaElement','HTMLMeterElement','HTMLModElement','HTMLObjectElement','HTMLOListElement','HTMLOptGroupElement','HTMLOptionElement','HTMLOutputElement','HTMLParagraphElement','HTMLParamElement','HTMLPictureElement','HTMLPreElement','HTMLProgressElement','HTMLQuoteElement','HTMLScriptElement','HTMLSelectElement','HTMLSlotElement','HTMLSourceElement','HTMLSpanElement','HTMLStyleElement','HTMLTableCaptionElement','HTMLTableCellElement','HTMLTableColElement','HTMLTableElement','HTMLTableRowElement','HTMLTableSectionElement','HTMLTemplateElement','HTMLTextAreaElement','HTMLTimeElement','HTMLTitleElement','HTMLTrackElement','HTMLUListElement','HTMLVideoElement'].forEach(function(n){W[n]=Element;});
 /* Interfaces that polyfills enumerate and read .prototype from. They
  * carry no behaviour here; what matters is that window[name] exists so a
  * feature-patching loop does not stop the page at its first entry. */
 ['DOMTokenList','NamedNodeMap','NodeIterator','TreeWalker','Range','StaticRange','AbstractRange',
  'StyleSheet','CSSStyleSheet','CSSStyleDeclaration','CSSRule','CSSRuleList','MediaList',
- 'XMLDocument','DOMImplementation','DOMStringMap','MutationRecord','DOMRect','DOMRectReadOnly',
- 'DOMPoint','DOMMatrix','Selection','XPathResult','AnimationEvent','TransitionEvent',
+ 'XMLDocument','DOMImplementation','DOMStringMap','MutationRecord',
+ 'Selection','XPathResult','AnimationEvent','TransitionEvent',
  'HTMLAllCollection','RadioNodeList','ValidityState'].forEach(function(n){if(W[n]===undefined)W[n]=function(){};});
 var WindowProto={};Object.setPrototypeOf(W,WindowProto);
 /* window.constructor.name is Window, which code reads to tell a window
@@ -1995,7 +2109,7 @@ W.Window=Window;
 ['addEventListener','removeEventListener','dispatchEvent'].forEach(function(k){
  if(Object.prototype.hasOwnProperty.call(W,k)){WindowProto[k]=W[k];delete W[k];}
 });
-if(!WindowProto.dispatchEvent)WindowProto.dispatchEvent=function(e){return __vitaDispatch(null,e);};
+if(!WindowProto.dispatchEvent)WindowProto.dispatchEvent=function(e){return NV.__vitaDispatch(null,e);};
 W.Window=function(){};W.Window.prototype=WindowProto;W.Navigator=W.Location=W.History=W.Screen=W.Storage=Storage;
 /* --- event handler properties -------------------------------------------
  * el.onclick = fn is how a great deal of code registers a handler, and
@@ -2023,35 +2137,37 @@ var WINDOW_HANDLERS=('afterprint beforeprint beforeunload hashchange languagecha
 'storage unhandledrejection unload').split(' ');
 var DOCUMENT_HANDLERS=['readystatechange','visibilitychange'];
 var HANDLER_NAMES={};
-function defineHandler(obj,type){
- HANDLER_NAMES['on'+type]=true;
- var prop='on'+type, slot='__on_'+type, wrapped='__onw_'+type;
- /* enumerable, as an IDL attribute is: code walks an element with
-    for..in to find the event surface, and these were invisible to it */
- Object.defineProperty(obj,prop,{configurable:true,enumerable:true,
-  get:function(){return this[slot]||null;},
-  set:function(f){
-   var self=this;
-   if(!Object.prototype.hasOwnProperty.call(this,wrapped)){
-    var w=function(e){
-     var h=self[slot];
-     if(typeof h!=='function')return;
-     var r=h.call(self,e);
-     /* a handler property that returns false cancels the event, the
-        same as an inline handler that does: form.onsubmit = () => false
-        submitted anyway without this */
-     if(r===false&&e&&e.preventDefault)e.preventDefault();
-     return r;};
-    Object.defineProperty(this,wrapped,{value:w,writable:true,enumerable:false,configurable:true});
-    if(typeof this.addEventListener==='function')this.addEventListener(type,w);
-   }
-   Object.defineProperty(this,slot,
-    {value:(typeof f==='function'?f:null),writable:true,enumerable:false,configurable:true});
-  }});
-}
-EVENT_HANDLERS.forEach(function(t){defineHandler(P,t);defineHandler(D,t);defineHandler(W,t);});
-WINDOW_HANDLERS.forEach(function(t){defineHandler(W,t);defineHandler(P,t);});
-DOCUMENT_HANDLERS.forEach(function(t){defineHandler(D,t);});
+/* each property's getter and setter are made in C and pass its type to
+   these (__vitaAccessors, vita/js/ifaces.c): a closure pair for each of
+   three hundred properties was a tenth of the prelude */
+function handlerGet(type){return this['__on_'+type]||null;}
+function handlerSet(type,f){
+ var self=this,slot='__on_'+type,wrapped='__onw_'+type;
+ if(!Object.prototype.hasOwnProperty.call(this,wrapped)){
+  var w=function(e){
+   var h=self[slot];
+   if(typeof h!=='function')return;
+   var r=h.call(self,e);
+   /* a handler property that returns false cancels the event, the
+      same as an inline handler that does: form.onsubmit = () => false
+      submitted anyway without this */
+   if(r===false&&e&&e.preventDefault)e.preventDefault();
+   return r;};
+  Object.defineProperty(this,wrapped,{value:w,writable:true,enumerable:false,configurable:true});
+  if(typeof this.addEventListener==='function')this.addEventListener(type,w);
+ }
+ Object.defineProperty(this,slot,
+  {value:(typeof f==='function'?f:null),writable:true,enumerable:false,configurable:true});}
+/* enumerable, as an IDL attribute is: code walks an element with for..in
+   to find the event surface, and these were invisible to it */
+function defineHandlers(obj,types){
+ var keys=types.map(function(t){HANDLER_NAMES['on'+t]=true;return 'on'+t;});
+ NV.__vitaAccessors(obj,keys,types,handlerGet,handlerSet,5);}
+function defineHandler(obj,type){defineHandlers(obj,[type]);}
+defineHandlers(P,EVENT_HANDLERS);defineHandlers(D,EVENT_HANDLERS);
+defineHandlers(W,EVENT_HANDLERS);
+defineHandlers(W,WINDOW_HANDLERS);defineHandlers(P,WINDOW_HANDLERS);
+defineHandlers(D,DOCUMENT_HANDLERS);
 /* An on-something content attribute set after parsing compiles into a
    handler too. Only the ones present at parse time were wired up, so
    el.setAttribute('onclick', '...') set a string and nothing else, and
@@ -2197,8 +2313,9 @@ Event.prototype.composedPath=function(){
 /* MessageChannel, which schedulers use to get a macrotask: React and
  * YouTube's player both post to a port instead of calling setTimeout(0),
  * because a real browser clamps nested timeouts and does not clamp this.
- * A timer is the honest equivalent here -- delivery stays asynchronous
- * and ordered, which is what the schedulers depend on. */
+ * Each message is a task of its own (NV.__vitaQueueTask), with no
+ * timer's wait: delivery stays asynchronous and ordered, which is what
+ * the schedulers depend on, and each had waited a timer's 10 ms. */
 /* As the HTML standard has them (VitaSurf): what a port is sent waits in
  * its queue until the port is started, which setting onmessage does and
  * addEventListener does not, so a message sent before the other side
@@ -2226,7 +2343,7 @@ function MessagePort(){
 MessagePort.prototype._flush=function(){
  var p=this;
  if(!p._started||!p._q.length)return;
- setTimeout(function(){
+ NV.__vitaQueueTask(function(){
   var m=p._q.shift(),e;
   if(!m)return;
   e={data:m.data,type:'message',target:p,currentTarget:p,source:null,origin:'',
@@ -2235,7 +2352,7 @@ MessagePort.prototype._flush=function(){
   if(typeof p._on==='function'){try{p._on.call(p,e);}catch(x){console.error(x);}}
   p._l.slice().forEach(function(f){
    try{typeof f==='function'?f.call(p,e):f.handleEvent(e);}catch(x){console.error(x);}});
-  p._flush();},0);};
+  p._flush();});};
 MessagePort.prototype.postMessage=function(data,transfer){
  var p=this._peer,ports;
  if(!p)return;
@@ -2286,8 +2403,8 @@ W.PerformanceObserver.prototype=W.ResizeObserver.prototype;
 /* the decoding and encoding are done in C where the natives are there
    (VitaSurf): this loop was a quarter of Cloudflare's challenge script
    on the Vita */
-var ATOB=W.__vitaAtob,BTOA=W.__vitaBtoa;
-try{delete W.__vitaAtob;delete W.__vitaBtoa;}catch(e){}
+var ATOB=NV.__vitaAtob,BTOA=NV.__vitaBtoa;
+try{delete NV.__vitaAtob;delete NV.__vitaBtoa;}catch(e){}
 W.atob=function(s){
  if(arguments.length<1)
   throw new TypeError("Failed to execute 'atob' on 'Window': 1 argument required, but only 0 present.");
@@ -2325,52 +2442,18 @@ function Audio(src){var a=document.createElement('audio');
  if(src!==undefined&&src!==null)a.setAttribute('src',String(src));
  return a;}
 W.Audio=Audio;
-function URLSearchParams(init){this._p=[];if(typeof init==='string'){init.replace(/^\?/,'').split('&').forEach(function(kv){if(!kv)return;var i=kv.indexOf('=');var k=i<0?kv:kv.slice(0,i),v=i<0?'':kv.slice(i+1);this._p.push([decodeURIComponent(k.replace(/\+/g,' ')),decodeURIComponent(v.replace(/\+/g,' '))]);},this);}else if(init&&typeof init==='object'){var self=this;(init._p?init._p:Object.keys(init).map(function(k){return [k,init[k]];})).forEach(function(kv){self._p.push([String(kv[0]),String(kv[1])]);});}}
-URLSearchParams.prototype={get:function(k){for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},has:function(k){return this.get(k)!==null;},set:function(k,v){var d=false;this._p=this._p.filter(function(p){if(p[0]!==k)return true;if(d)return false;p[1]=String(v);d=true;return true;});if(!d)this._p.push([k,String(v)]);},append:function(k,v){this._p.push([k,String(v)]);},'delete':function(k){this._p=this._p.filter(function(p){return p[0]!==k;});},forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},toString:function(){return this._p.map(function(p){return encodeURIComponent(p[0])+'='+encodeURIComponent(p[1]);}).join('&');},sort:function(){this._p.sort(function(a,b){return a[0]<b[0]?-1:a[0]>b[0]?1:0;});}};
-URLSearchParams.prototype[Symbol.iterator]=URLSearchParams.prototype.entries;Object.defineProperty(URLSearchParams.prototype,'size',{get:function(){return this._p.length;}});
-var URL_RE=/^([a-z][a-z0-9+.-]*:)?(?:\/\/(?:([^:@\/?#]*)(?::([^@\/?#]*))?@)?([^:\/?#]*)(?::(\d+))?)?([^?#]*)(\?[^#]*)?(#.*)?$/i;
-function URL(url,base){url=String(url);var m=URL_RE.exec(url);if(!m)throw new TypeError('Invalid URL');if(!m[1]){if(base===undefined)throw new TypeError('Invalid URL');var b=new URL(String(base));var path=m[6];if(url.indexOf('//')===0){m[1]=b.protocol;m=URL_RE.exec(b.protocol+url);}else{m[1]=b.protocol;m[2]=b.username;m[3]=b.password;m[4]=b.hostname;m[5]=b.port;if(path===''){m[6]=b.pathname;if(!m[7])m[7]=b.search;}else if(path.charAt(0)!=='/'){var dir=b.pathname.replace(/[^\/]*$/,'');m[6]=dir+path;}var segs=[];m[6].split('/').forEach(function(sg){if(sg==='..')segs.pop();else if(sg!=='.')segs.push(sg);});m[6]=segs.join('/');if(m[6].charAt(0)!=='/')m[6]='/'+m[6];}}this.protocol=(m[1]||'').toLowerCase();this.username=m[2]||'';this.password=m[3]||'';this.hostname=(m[4]||'').toLowerCase();this.port=m[5]||'';this.pathname=m[6]||(this.hostname?'/':'');this.hash=m[8]&&m[8]!=='#'?m[8]:'';this.searchParams=new URLSearchParams(m[7]&&m[7]!=='?'?m[7]:'');}
-/* search reads through searchParams rather than beside it: they used to
- * be two copies of the same thing, and setting one left the other to be
- * the one href was built from. Setting any part rewrites href. */
-Object.defineProperties(URL.prototype,{
- search:{configurable:true,
-  get:function(){var q=this.searchParams.toString();return q?'?'+q:'';},
-  set:function(v){this.searchParams=new URLSearchParams(String(v));}},
- host:{configurable:true,
-  get:function(){return this.hostname+(this.port?':'+this.port:'');},
-  set:function(v){v=String(v);var i=v.indexOf(':');
-   if(i<0){this.hostname=v.toLowerCase();this.port='';}
-   else{this.hostname=v.slice(0,i).toLowerCase();this.port=v.slice(i+1);}}},
- /* A file URL has no host, and its origin serialises as the scheme
-  * alone rather than as null. */
- origin:{configurable:true,get:function(){
-  /* a blob URL's is the origin of the URL inside it */
-  if(this.protocol==='blob:'){
-   try{var in_=new URL(this.href.slice(5).replace(/#.*$/,''));
-    return /^(https?|file):$/.test(in_.protocol)?in_.origin:'null';}
-   catch(e){return 'null';}}
-  if(this.hostname)return this.protocol+'//'+this.host;
-  return this.protocol==='file:'?'file://':'null';}},
- href:{configurable:true,
-  get:function(){var auth=this.username?this.username+(this.password?':'+this.password:'')+'@':'';
-   return this.protocol+(this.hostname||this.protocol==='file:'?'//':'')+auth+this.host+this.pathname+this.search+this.hash;},
-  set:function(v){var u=new URL(String(v));var self=this;
-   ['protocol','username','password','hostname','port','pathname','hash'].forEach(function(k){self[k]=u[k];});
-   this.searchParams=u.searchParams;}}});
-URL.prototype.toString=URL.prototype.toJSON=function(){return this.href;};URL.createObjectURL=GAP('URL.createObjectURL',function(){return 'blob:';});URL.revokeObjectURL=function(){};URL.canParse=function(u,b){try{new URL(u,b);return true;}catch(e){return false;}};URL.parse=function(u,b){try{return new URL(u,b);}catch(e){return null;}};
-W.URL=URL;W.URLSearchParams=URLSearchParams;
+URL.createObjectURL=GAP('URL.createObjectURL',function(){return 'blob:';});URL.revokeObjectURL=function(){};
 /* A dynamic import() in page code arrives here (qjs.c's import hook
  * passes the importing script's name as base). QuickJS loads modules
  * synchronously and can only compile source that has arrived, so wait
  * for the module first, then import it for real. */
-W.__vitaImport=function(base,spec){
+NV.__vitaImport=function(base,spec){
  return new Promise(function(res,rej){
   var t0=Date.now();
   function waitFor(b,sp,then){
    (function poll(){
     var st;
-    try{st=W.__vitaModuleState(String(b),String(sp));}catch(e){rej(e);return;}
+    try{st=NV.__vitaModuleState(String(b),String(sp));}catch(e){rej(e);return;}
     if(st.state!=='arriving'){then(st.url);return;}
     if(Date.now()-t0>120000){rej(new TypeError('import of '+st.url+' timed out'));return;}
     setTimeout(poll,60);
@@ -2433,21 +2516,40 @@ function dataURL(u){
    else{e=enc.encode(c);for(k=0;k<e.length;k++)bytes.push(e[k]);}}
   out=new Uint8Array(bytes);}
  return {type:meta,bytes:out.buffer};}
-/* --- XMLHttpRequest and fetch over __vitaFetch (qjs.c) --- */
+/* --- XMLHttpRequest and fetch over NV.__vitaFetch (qjs.c) --- */
 function XMLHttpRequest(){this.readyState=0;this.status=0;this.statusText='';this.responseText='';this.response='';this.responseType='';this.responseURL='';this.timeout=0;this.withCredentials=false;this._h={};this._l={};this._id=0;this._rh='';this.upload={addEventListener:function(){},removeEventListener:function(){}};}
 XMLHttpRequest.prototype={
 UNSENT:0,OPENED:1,HEADERS_RECEIVED:2,LOADING:3,DONE:4,
 open:function(m,u){this._m=String(m||'GET').toUpperCase();this._u=String(u);this._h={};this._set(1);},
-setRequestHeader:function(k,v){this._h[String(k)]=String(v);},
+setRequestHeader:function(k,v){k=String(k);v=String(v).trim();var l=k.toLowerCase();
+ /* the browser's own: a page may not set them (the Fetch standard's
+    forbidden request headers), and is not told */
+ if(/^(accept-charset|accept-encoding|access-control-request-headers|access-control-request-method|connection|content-length|cookie|cookie2|date|dnt|expect|host|keep-alive|origin|referer|set-cookie|te|trailer|transfer-encoding|upgrade|via)$/.test(l)||/^(proxy-|sec-)/.test(l))return;
+ for(var o in this._h)if(o.toLowerCase()===l){this._h[o]+=', '+v;return;}this._h[k]=v;},
+_has:function(k){k=k.toLowerCase();for(var o in this._h)if(o.toLowerCase()===k)return true;return false;},
 addEventListener:function(t,f){(this._l[t]=this._l[t]||[]).push(f);},
 removeEventListener:function(t,f){if(this._l[t])this._l[t]=this._l[t].filter(function(g){return g!==f;});},
 dispatchEvent:function(e){this._emit(e.type);return true;},
 _emit:function(t){var e={type:t,target:this,currentTarget:this,lengthComputable:false,loaded:0,total:0,preventDefault:function(){},stopPropagation:function(){}};var f=this['on'+t];if(typeof f==='function')f.call(this,e);(this._l[t]||[]).forEach(function(g){if(typeof g==='function')g.call(this,e);else if(g&&g.handleEvent)g.handleEvent(e);},this);},
 _set:function(s){this.readyState=s;this._emit('readystatechange');},
-_body:function(b){if(b===undefined||b===null)return null;if(typeof b==='string')return b;if(b instanceof URLSearchParams){if(!this._h['Content-Type'])this._h['Content-Type']='application/x-www-form-urlencoded;charset=UTF-8';return b.toString();}
- if(b instanceof FormData){if(!this._h['Content-Type'])this._h['Content-Type']='application/x-www-form-urlencoded;charset=UTF-8';return b._urlencoded();}
- if(b instanceof ArrayBuffer||ArrayBuffer.isView(b)){var v=new Uint8Array(b.buffer||b),s='';for(var i=0;i<v.length;i++)s+=String.fromCharCode(v[i]);return s;}return String(b);},
-send:function(body){var self=this;if(this.readyState!==1)return;var data=this._body(body);var hs=[];for(var k in this._h)hs.push(k+': '+this._h[k]);
+/* the body and the Content-Type it implies, as the Fetch standard
+   extracts a body: text is text/plain, a blob its own type, bytes none;
+   the page's own Content-Type wins */
+_body:function(b){var type=null,data;
+ if(b===undefined||b===null)data=null;
+ else if(b instanceof URLSearchParams){type='application/x-www-form-urlencoded;charset=UTF-8';data=b.toString();}
+ else if(b instanceof FormData){var mp=formMultipart(b._p);type=mp.type;data=mp.body;}
+ /* bytes go to the network layer as an ArrayBuffer, every byte as it
+    is; a string goes as its UTF-8 */
+ else if(W.Blob&&b instanceof W.Blob){if(b.type)type=b.type;var u=b._u;data=u.buffer.slice(u.byteOffset,u.byteOffset+u.length);}
+ else if(b instanceof ArrayBuffer)data=b.slice(0);
+ else if(ArrayBuffer.isView(b))data=b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength);
+ else{type='text/plain;charset=UTF-8';data=String(b);}
+ if(this._m!=='GET'&&this._m!=='HEAD'&&!this._has('Content-Type')){
+  /* an empty value takes the network layer's own default away */
+  this._h['Content-Type']=type||'';}
+ return data;},
+send:function(body){var self=this;if(this.readyState!==1)return;var data=this._body(body);var hs=[];for(var k in this._h)hs.push(this._h[k]===''?k+':':k+': '+this._h[k]);
  this._emit('loadstart');
  /* the body arrives as bytes; text is a decode of them, and a
     response that is not text keeps every byte it was sent */
@@ -2470,9 +2572,9 @@ send:function(body){var self=this;if(this.readyState!==1)return;var data=this._b
    if(!du)done(0,'',new ArrayBuffer(0),'bad data URL',u0);
    else done(200,'content-type: '+du.type,du.bytes,null,u0);},0);
   return;}
- this._id=__vitaFetch(this._u,this._m,hs,data,this.timeout|0,done);
+ this._id=NV.__vitaFetch(this._u,this._m,hs,data,this.timeout|0,done);
  if(!this._id)setTimeout(function(){done(0,'',new ArrayBuffer(0),'request refused','');},0);},
-abort:function(){if(this._id){__vitaFetchAbort(this._id);this._id=0;}if(this.readyState!==0&&this.readyState!==4){this.readyState=4;this.status=0;this._emit('readystatechange');this._emit('abort');this._emit('loadend');}this.readyState=0;},
+abort:function(){if(this._id){NV.__vitaFetchAbort(this._id);this._id=0;}if(this.readyState!==0&&this.readyState!==4){this.readyState=4;this.status=0;this._emit('readystatechange');this._emit('abort');this._emit('loadend');}this.readyState=0;},
 getResponseHeader:function(n){var lines=this._rh.split('\n'),p=String(n).toLowerCase()+':';for(var i=0;i<lines.length;i++){if(lines[i].toLowerCase().indexOf(p)===0)return lines[i].slice(p.length).trim();}return null;},
 getAllResponseHeaders:function(){return this._rh?this._rh.replace(/\n/g,'\r\n'):'';},
 overrideMimeType:function(){}};
@@ -2481,11 +2583,11 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
  * Home Assistant's whole interface talks to its server over one, and
  * the app stopped at "WebSocket is not defined" as soon as the login
  * went through. The connection runs in C; events come back through
- * __vitaWsEvent from the scheduler, never from inside a call here. */
+ * NV.__vitaWsEvent from the scheduler, never from inside a call here. */
 (function(){
- if(typeof __vitaWsOpen!=='function')return;
- var OPEN_=__vitaWsOpen,SEND_=__vitaWsSend,CLOSE_=__vitaWsClose,
-     BUF_=__vitaWsBuffered,socks=Object.create(null),
+ if(typeof NV.__vitaWsOpen!=='function')return;
+ var OPEN_=NV.__vitaWsOpen,SEND_=NV.__vitaWsSend,CLOSE_=NV.__vitaWsClose,
+     BUF_=NV.__vitaWsBuffered,socks=Object.create(null),
      /* the prototype as it is now: a later part replaces
         EventTarget.prototype, and listeners added through this one
         must be dispatched by this one */
@@ -2495,7 +2597,7 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
   var h=ws['on'+e.type];
   try{e.target=ws;e.currentTarget=ws;}catch(x){}
   if(typeof h==='function'){
-   try{h.call(ws,e);}catch(err){if(W.__vitaReportError)W.__vitaReportError(err);}}
+   try{h.call(ws,e);}catch(err){if(NV.__vitaReportError)NV.__vitaReportError(err);}}
   ETP.dispatchEvent.call(ws,e);}
  function utf8len(s){
   var n=0,i,c;
@@ -2578,7 +2680,7 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
   if(s.state>=2)return;
   s.state=2;
   CLOSE_(s.id,code===undefined?(reason?1000:0):code,reason);};
- Object.defineProperty(W,'__vitaWsEvent',{configurable:true,writable:true,enumerable:false,
+ Object.defineProperty(NV,'__vitaWsEvent',{configurable:true,writable:true,enumerable:false,
   value:function(id,kind,data,code){
    var ws=socks[id],s,d;
    if(!ws)return;
@@ -2600,27 +2702,499 @@ W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpReq
     fire(ws,uaEvent(new CloseEvent('close',{wasClean:code!==1006,code:code,reason:data||''})));}}});
  W.WebSocket=WebSocket;
 })();
+/* BroadcastChannel (VitaSurf), as the HTML standard has it: a message
+ * posted on one goes, cloned, to every other open channel of the same
+ * name and origin, each in a task of its own. Pages that keep their tabs
+ * in step use it, and stackoverflow.com stopped at "BroadcastChannel is
+ * not defined". This browser has one tab, so the channels it reaches
+ * are those of this realm: the page's, or a worker's own. */
+(function(){
+ var ETP=EventTarget.prototype,ST=new WeakMap(),open=new Map();
+ function st(c){
+  var s=ST.get(c);
+  if(!s)throw new TypeError('Illegal invocation');
+  return s;}
+ function fire(c,e){
+  var h=st(c)['on'+e.type];
+  try{e.target=c;e.currentTarget=c;}catch(x){}
+  if(typeof h==='function'){
+   try{h.call(c,e);}catch(err){if(NV.__vitaReportError)NV.__vitaReportError(err);}}
+  ETP.dispatchEvent.call(c,e);}
+ function BroadcastChannel(name){
+  if(!(this instanceof BroadcastChannel))throw new TypeError(
+   "Failed to construct 'BroadcastChannel': Please use the 'new' operator, "+
+   'this DOM object constructor cannot be called as a function.');
+  var n=String(name),key=location.origin+' '+n;
+  ST.set(this,{name:n,key:key,closed:false,onmessage:null,onmessageerror:null});
+  if(!open.has(key))open.set(key,[]);
+  open.get(key).push(this);}
+ BroadcastChannel.prototype=Object.create(ETP);
+ BroadcastChannel.prototype.constructor=BroadcastChannel;
+ Object.defineProperty(BroadcastChannel.prototype,'name',{configurable:true,
+  enumerable:true,get:function(){return st(this).name;}});
+ ['onmessage','onmessageerror'].forEach(function(k){
+  Object.defineProperty(BroadcastChannel.prototype,k,{configurable:true,
+   enumerable:true,get:function(){return st(this)[k];},
+   set:function(f){st(this)[k]=typeof f==='function'||(f&&typeof f==='object')?f:null;}});});
+ BroadcastChannel.prototype.postMessage=function(message){
+  var s=st(this),me=this,data,list;
+  if(arguments.length<1)throw new TypeError("Failed to execute 'postMessage' on "+
+   "'BroadcastChannel': 1 argument required, but only 0 present.");
+  if(s.closed)throw new DOMException("Failed to execute 'postMessage' on "+
+   "'BroadcastChannel': Channel is closed",'InvalidStateError');
+  /* cloned now, so what cannot be cloned throws here */
+  data=W.structuredClone(message);
+  list=(open.get(s.key)||[]).filter(function(c){return c!==me;});
+  list.forEach(function(c){
+   setTimeout(function(){
+    var t=ST.get(c),d;
+    if(!t||t.closed)return;
+    try{d=W.structuredClone(data);}
+    catch(e){fire(c,uaEvent(new W.MessageEvent('messageerror',{origin:location.origin})));return;}
+    fire(c,uaEvent(new W.MessageEvent('message',{data:d,origin:location.origin})));},0);});};
+ BroadcastChannel.prototype.close=function(){
+  var s=st(this),me=this,l=open.get(s.key);
+  s.closed=true;
+  if(l){l=l.filter(function(c){return c!==me;});
+   if(l.length)open.set(s.key,l);else open.delete(s.key);}};
+ W.BroadcastChannel=BroadcastChannel;
+})();
+/* EventSource (VitaSurf), server-sent events as the HTML standard has
+ * them: a GET with Accept: text/event-stream whose answer is read as it
+ * comes (__vitaFetch's progress), parsed into events line by line, and
+ * opened again after the server's retry time when the connection ends,
+ * with the last event's id in Last-Event-ID. An answer that is not a
+ * 200 of type text/event-stream fails the connection for good. */
+(function(){
+ var FETCH=NV.__vitaFetch,ABORT=NV.__vitaFetchAbort;
+ if(typeof FETCH!=='function')return;
+ var ETP=EventTarget.prototype,ST=new WeakMap();
+ function st(es){
+  var s=ST.get(es);
+  if(!s)throw new TypeError('Illegal invocation');
+  return s;}
+ function fire(es,e){
+  var h=st(es)['on'+e.type];
+  try{e.target=es;e.currentTarget=es;}catch(x){}
+  if(typeof h==='function'){
+   try{h.call(es,e);}catch(err){if(NV.__vitaReportError)NV.__vitaReportError(err);}}
+  ETP.dispatchEvent.call(es,e);}
+ /* where an incomplete UTF-8 sequence starts at the end of u, which the
+    next bytes will finish, or u.length */
+ function utf8Cut(u){
+  var n=u.length,i,c,need;
+  for(i=n-1;i>=0&&i>=n-3;i--){
+   c=u[i];
+   if(c<0x80)return n;
+   if(c>=0xc0){
+    need=c>=0xf0?4:c>=0xe0?3:2;
+    return n-i<need?i:n;}}
+  return n;}
+ function header(text,name){
+  var lines=String(text||'').split('\n'),p=name+':',i;
+  for(i=0;i<lines.length;i++)
+   if(lines[i].toLowerCase().indexOf(p)===0)return lines[i].slice(p.length).trim();
+  return null;}
+ function EventSource(url,init){
+  if(!(this instanceof EventSource))throw new TypeError(
+   "Failed to construct 'EventSource': Please use the 'new' operator, this "+
+   'DOM object constructor cannot be called as a function.');
+  if(arguments.length<1)throw new TypeError("Failed to construct "+
+   "'EventSource': 1 argument required, but only 0 present.");
+  var abs;
+  try{abs=new URL(String(url),D.baseURI).href;}
+  catch(e){throw new DOMException("Failed to construct 'EventSource': Cannot "+
+   "open an EventSource to '"+url+"'. The URL is invalid.",'SyntaxError');}
+  ST.set(this,{url:abs,cred:!!(init&&typeof init==='object'&&init.withCredentials),
+   state:0,id:0,timer:0,retry:3000,lastId:'',origin:new URL(abs).origin,
+   onopen:null,onmessage:null,onerror:null});
+  connect(this);}
+ EventSource.prototype=Object.create(ETP);
+ EventSource.prototype.constructor=EventSource;
+ ['CONNECTING','OPEN','CLOSED'].forEach(function(k,i){
+  Object.defineProperty(EventSource,k,{value:i,enumerable:true});
+  Object.defineProperty(EventSource.prototype,k,{value:i,enumerable:true});});
+ Object.defineProperties(EventSource.prototype,{
+  url:{configurable:true,enumerable:true,get:function(){return st(this).url;}},
+  withCredentials:{configurable:true,enumerable:true,get:function(){return st(this).cred;}},
+  readyState:{configurable:true,enumerable:true,get:function(){return st(this).state;}}});
+ ['onopen','onmessage','onerror'].forEach(function(k){
+  Object.defineProperty(EventSource.prototype,k,{configurable:true,enumerable:true,
+   get:function(){return st(this)[k];},
+   set:function(f){st(this)[k]=typeof f==='function'||(f&&typeof f==='object')?f:null;}});});
+ EventSource.prototype.close=function(){
+  var s=st(this);
+  s.state=2;
+  if(s.timer){clearTimeout(s.timer);s.timer=0;}
+  if(s.id){ABORT(s.id);s.id=0;}};
 
-function FormData(form){this._p=[];if(form&&form.getElementsByTagName){['input','select','textarea'].forEach(function(t){var els=form.getElementsByTagName(t);for(var i=0;i<els.length;i++){var e=els[i],n=e.getAttribute('name');if(!n||e.disabled)continue;var ty=(e.getAttribute('type')||'').toLowerCase();if(ty==='checkbox'||ty==='radio'){if(e.checked)this._p.push([n,e.value||'on']);}else if(ty!=='submit'&&ty!=='button'&&ty!=='file')this._p.push([n,e.value]);}},this);
- if(W.__vitaFaceSeen)faceEntries(form).forEach(function(p){this._p.push(p);},this);}}
+ function connect(es){
+  var s=st(es),hs=['Accept: text/event-stream','Cache-Control: no-cache'],
+   p={es:es,opened:false,failed:false,rest:null,text:'',bom:true,cr:false,
+      data:'',type:'',idBuf:s.lastId};
+  if(s.lastId!=='')hs.push('Last-Event-ID: '+s.lastId);
+  function open(status,headers){
+   if(p.opened||p.failed||s.state===2)return p.opened;
+   var type=header(headers,'content-type');
+   type=type?type.split(';')[0].trim().toLowerCase():'';
+   if(status!==200||type!=='text/event-stream'){fail();return false;}
+   p.opened=true;s.state=1;
+   fire(es,uaEvent(new Event('open')));
+   return true;}
+  function fail(){
+   p.failed=true;
+   if(s.id){ABORT(s.id);s.id=0;}
+   if(s.state===2)return;
+   s.state=2;
+   fire(es,uaEvent(new Event('error')));}
+  function dispatch(){
+   s.lastId=p.idBuf;
+   if(p.data===''){p.type='';return;}
+   var d=p.data.charAt(p.data.length-1)==='\n'?p.data.slice(0,-1):p.data,
+    ev=uaEvent(new W.MessageEvent(p.type||'message',
+     {data:d,origin:s.origin,lastEventId:s.lastId}));
+   p.data='';p.type='';
+   if(s.state!==2)fire(es,ev);}
+  function line(l){
+   if(l===''){dispatch();return;}
+   if(l.charAt(0)===':')return;
+   var i=l.indexOf(':'),f,v;
+   if(i<0){f=l;v='';}
+   else{f=l.slice(0,i);v=l.slice(i+1);if(v.charAt(0)===' ')v=v.slice(1);}
+   if(f==='event')p.type=v;
+   else if(f==='data')p.data+=v+'\n';
+   else if(f==='id'){if(v.indexOf('\0')<0)p.idBuf=v;}
+   else if(f==='retry'){if(/^[0-9]+$/.test(v))s.retry=parseInt(v,10);}}
+  function feed(bytes){
+   var u=new Uint8Array(bytes),cut,t,i,c,start;
+   if(p.rest){var m=new Uint8Array(p.rest.length+u.length);
+    m.set(p.rest);m.set(u,p.rest.length);u=m;p.rest=null;}
+   cut=utf8Cut(u);
+   if(cut<u.length){p.rest=u.slice(cut);u=u.subarray(0,cut);}
+   if(!u.length)return;
+   t=new TextDecoder().decode(u);
+   /* a leading byte order mark is the stream's, not its text's */
+   if(p.bom){p.bom=false;if(t.charCodeAt(0)===0xfeff)t=t.slice(1);}
+   /* lines end at CRLF, LF or CR; a CR at the end of one piece may
+      have its LF at the start of the next */
+   if(p.cr&&t.charAt(0)==='\n')t=t.slice(1);
+   p.cr=false;
+   t=p.text+t;start=0;
+   for(i=0;i<t.length&&s.state!==2;i++){
+    c=t.charCodeAt(i);
+    if(c===10||c===13){
+     line(t.slice(start,i));
+     if(c===13){
+      if(i+1<t.length){if(t.charCodeAt(i+1)===10)i++;}
+      else p.cr=true;}
+     start=i+1;}}
+   p.text=s.state===2?'':t.slice(start);}
+  function progress(status,headers,bytes){
+   if(s.state===2||p.failed)return;
+   if(!open(status,headers))return;
+   if(bytes&&bytes.byteLength)feed(bytes);}
+  function done(status,headers,bytes,err){
+   s.id=0;
+   if(s.state===2||p.failed)return;
+   if(!err){
+    if(!open(status,headers))return;
+    if(bytes&&bytes.byteLength)feed(bytes);}
+   else if(!p.opened&&/cross-origin/.test(String(err))){fail();return;}
+   if(s.state===2)return;
+   /* the connection ended: announce it and open it again, after the
+      retry time, unless the page closes it first */
+   s.state=0;
+   fire(es,uaEvent(new Event('error')));
+   if(s.state!==0)return;
+   s.timer=setTimeout(function(){
+    s.timer=0;
+    if(s.state===0)connect(es);},s.retry);}
+  s.id=FETCH(s.url,'GET',hs,null,0,done,progress);
+  if(!s.id)setTimeout(function(){done(0,'',null,'request refused');},0);}
+ W.EventSource=EventSource;
+})();
+/* Trusted Types (VitaSurf), as the W3C specification and Chrome have
+ * them: window.trustedTypes makes policies, and a policy turns a string
+ * through its own callbacks into a TrustedHTML, TrustedScript or
+ * TrustedScriptURL, which stands for that string anywhere one goes.
+ * Nothing here enforces them -- that is for a Content-Security-Policy's
+ * require-trusted-types-for, which this browser does not apply -- so a
+ * sink takes a plain string as well. Pages ask for a policy before
+ * using one, and youtube.com's embed script threw reading createPolicy
+ * of undefined. */
+(function(){
+ var VAL=new WeakMap(),KIND=new WeakMap(),POL=new WeakMap(),
+  FACTORY=null,defaultPolicy=null,empty={};
+ function illegal(){throw new TypeError('Illegal constructor');}
+ function TrustedHTML(){illegal();}
+ function TrustedScript(){illegal();}
+ function TrustedScriptURL(){illegal();}
+ function TrustedTypePolicy(){illegal();}
+ function TrustedTypePolicyFactory(){illegal();}
+ var TYPES={TrustedHTML:TrustedHTML,TrustedScript:TrustedScript,
+  TrustedScriptURL:TrustedScriptURL};
+ function make(kind,v){
+  var o=Object.create(TYPES[kind].prototype);
+  VAL.set(o,v);KIND.set(o,kind);
+  return o;}
+ Object.keys(TYPES).forEach(function(kind){
+  var C=TYPES[kind];
+  ['toString','toJSON'].forEach(function(m){
+   Object.defineProperty(C.prototype,m,{configurable:true,writable:true,
+    value:function(){
+     if(KIND.get(this)!==kind)throw new TypeError('Illegal invocation');
+     return VAL.get(this);}});});});
+ var MEMBER={TrustedHTML:'createHTML',TrustedScript:'createScript',
+  TrustedScriptURL:'createScriptURL'};
+ Object.keys(MEMBER).forEach(function(kind){
+  var m=MEMBER[kind];
+  Object.defineProperty(TrustedTypePolicy.prototype,m,{configurable:true,
+   writable:true,enumerable:true,value:function(input){
+    var p=POL.get(this);
+    if(!p)throw new TypeError('Illegal invocation');
+    var f=p.options[m];
+    if(typeof f!=='function')throw new TypeError("Failed to execute '"+m+
+     "' on 'TrustedTypePolicy': Policy "+p.name+"'s TrustedTypePolicyOptions "+
+     "did not specify a '"+m+"' member.");
+    var args=[String(input)].concat(Array.prototype.slice.call(arguments,1)),
+     v=f.apply(undefined,args);
+    return make(kind,v===null||v===undefined?'':String(v));}});});
+ Object.defineProperty(TrustedTypePolicy.prototype,'name',{configurable:true,
+  enumerable:true,get:function(){
+   var p=POL.get(this);
+   if(!p)throw new TypeError('Illegal invocation');
+   return p.name;}});
+ function factory(o){if(o!==FACTORY)throw new TypeError('Illegal invocation');}
+ var FP=TrustedTypePolicyFactory.prototype;
+ FP.createPolicy=function(name,options){
+  factory(this);
+  if(arguments.length<1)throw new TypeError("Failed to execute 'createPolicy' "+
+   "on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present.");
+  name=String(name);
+  if(name==='default'&&defaultPolicy)throw new TypeError("Failed to execute "+
+   "'createPolicy' on 'TrustedTypePolicyFactory': Policy with name \"default\" "+
+   "already exists.");
+  var o={};
+  if(options!==undefined&&options!==null){
+   if(typeof options!=='object'&&typeof options!=='function')throw new TypeError(
+    "Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': The "+
+    "provided value is not of type 'TrustedTypePolicyOptions'.");
+   ['createHTML','createScript','createScriptURL'].forEach(function(m){
+    var f=options[m];
+    if(f!==undefined&&f!==null){
+     if(typeof f!=='function')throw new TypeError("Failed to execute "+
+      "'createPolicy' on 'TrustedTypePolicyFactory': Failed to read the '"+m+
+      "' property from 'TrustedTypePolicyOptions': The provided value is not "+
+      "a function.");
+     o[m]=f;}});}
+  var pol=Object.create(TrustedTypePolicy.prototype);
+  POL.set(pol,{name:name,options:o});
+  if(name==='default')defaultPolicy=pol;
+  return pol;};
+ FP.isHTML=function(v){factory(this);return KIND.get(v)==='TrustedHTML';};
+ FP.isScript=function(v){factory(this);return KIND.get(v)==='TrustedScript';};
+ FP.isScriptURL=function(v){factory(this);return KIND.get(v)==='TrustedScriptURL';};
+ Object.defineProperties(FP,{
+  emptyHTML:{configurable:true,enumerable:true,get:function(){factory(this);
+   return empty.h||(empty.h=make('TrustedHTML',''));}},
+  emptyScript:{configurable:true,enumerable:true,get:function(){factory(this);
+   return empty.s||(empty.s=make('TrustedScript',''));}},
+  defaultPolicy:{configurable:true,enumerable:true,get:function(){factory(this);
+   return defaultPolicy;}}});
+ var HTML_NS='http://www.w3.org/1999/xhtml',SVG_NS='http://www.w3.org/2000/svg';
+ function handlerName(a){
+  if(a.slice(0,2)!=='on')return false;
+  var t=a.slice(2),lists=[EVENT_HANDLERS,WINDOW_HANDLERS,DOCUMENT_HANDLERS],i;
+  for(i=0;i<lists.length;i++)if(lists[i]&&lists[i].indexOf(t)>=0)return true;
+  return false;}
+ /* the sinks Chrome names, by element and attribute or property */
+ FP.getAttributeType=function(tag,attr,elNs,attrNs){
+  factory(this);
+  tag=String(tag).toLowerCase();attr=String(attr).toLowerCase();
+  elNs=elNs===undefined||elNs===null||elNs===''?HTML_NS:String(elNs);
+  attrNs=attrNs===undefined||attrNs===null||attrNs===''?null:String(attrNs);
+  if(attrNs===null&&handlerName(attr))return 'TrustedScript';
+  if(attrNs!==null)return null;
+  if(elNs===HTML_NS){
+   if(tag==='iframe'&&attr==='srcdoc')return 'TrustedHTML';
+   if(tag==='script'&&attr==='src')return 'TrustedScriptURL';}
+  if(elNs===SVG_NS&&tag==='script'&&attr==='href')return 'TrustedScriptURL';
+  return null;};
+ FP.getPropertyType=function(tag,prop,elNs){
+  factory(this);
+  tag=String(tag).toLowerCase();prop=String(prop);
+  elNs=elNs===undefined||elNs===null||elNs===''?HTML_NS:String(elNs);
+  if(prop==='innerHTML'||prop==='outerHTML')return 'TrustedHTML';
+  if(elNs!==HTML_NS)return null;
+  if(tag==='iframe'&&prop==='srcdoc')return 'TrustedHTML';
+  if(tag==='script'){
+   if(prop==='innerText'||prop==='textContent'||prop==='text')return 'TrustedScript';
+   if(prop==='src')return 'TrustedScriptURL';}
+  return null;};
+ FACTORY=Object.create(FP);
+ Object.keys(TYPES).forEach(function(k){W[k]=TYPES[k];});
+ W.TrustedTypePolicy=TrustedTypePolicy;
+ W.TrustedTypePolicyFactory=TrustedTypePolicyFactory;
+ Object.defineProperty(W,'trustedTypes',{configurable:true,enumerable:true,
+  get:function(){return FACTORY;}});
+})();
+
 /* the entries form-associated custom elements give their form: a string,
    a File, or a FormData of their own (VitaSurf) */
 function faceEntries(form){
  var out=[];
  listOf(form.getElementsByTagName('*')).forEach(function(e){
   if(e.localName.indexOf('-')<0)return;
-  var v=W.__vitaFaceValue(e),n=e.getAttribute('name');
+  var v=NV.__vitaFaceValue(e),n=e.getAttribute('name');
   if(v===undefined||v===null||e.hasAttribute('disabled'))return;
   if(v&&typeof v==='object'&&typeof v.forEach==='function'&&v._p){
    v.forEach(function(val,k){out.push([k,val]);});return;}
   if(n)out.push([n,typeof v==='object'?v:String(v)]);});
  return out;}
-FormData.prototype={append:function(k,v){this._p.push([String(k),String(v)]);},set:function(k,v){this['delete'](k);this.append(k,v);},get:function(k){for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},
-getAll:function(k){return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},has:function(k){return this.get(k)!==null;},'delete':function(k){this._p=this._p.filter(function(p){return p[0]!==k;});},
-forEach:function(f,t){this._p.forEach(function(p){f.call(t,p[1],p[0]);});},entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},
-_urlencoded:function(){return this._p.map(function(p){return encodeURIComponent(p[0])+'='+encodeURIComponent(p[1]);}).join('&');}};
-FormData.prototype[Symbol.iterator]=FormData.prototype.entries;W.FormData=FormData;
-function Headers(init){this._m={};if(init){if(init instanceof Headers)init.forEach(function(v,k){this.append(k,v);},this);else if(Array.isArray(init))init.forEach(function(p){this.append(p[0],p[1]);},this);else for(var k in init)this.append(k,init[k]);}}
+/* --- forms: the entry list and its encodings, as the HTML standard has
+   them (VitaSurf). FormData holds strings and Files; a form's entries are
+   its controls in tree order, the submitter alone of its buttons, and
+   what the formdata event's listeners add. */
+function FormData(form,submitter){
+ this._p=[];
+ if(form===undefined||form===null)return;
+ if(!form||form.tagName!=='FORM')throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+ if(submitter!==undefined&&submitter!==null){
+  if(!isSubmitButton(submitter))throw new TypeError("Failed to construct 'FormData': The specified element is not a submit button.");
+  if(submitter.form!==form)throw new DOMException("The specified element is not owned by this form element.",'NotFoundError');}
+ var list=formEntryList(form,submitter||null);
+ if(list===null)throw new DOMException('The form is already building its entry list.','InvalidStateError');
+ this._p=list;}
+function isSubmitButton(e){
+ if(!e||!e.tagName)return false;
+ var t=String(e.getAttribute('type')||'').toLowerCase();
+ if(e.tagName==='BUTTON')return t===''||t==='submit'||(t!=='reset'&&t!=='button');
+ return e.tagName==='INPUT'&&(t==='submit'||t==='image');}
+/* a Blob is held as a File: its own name, the one given, or "blob" */
+function formValue(v,filename){
+ if(W.Blob&&v instanceof W.Blob){
+  if(v instanceof W.File&&filename===undefined)return v;
+  return new W.File([v],filename!==undefined?String(filename):
+   (v instanceof W.File?v.name:'blob'),{type:v.type,lastModified:v.lastModified});}
+ return String(v);}
+FormData.prototype={
+ append:function(k,v,filename){this._p.push([String(k),formValue(v,filename)]);},
+ set:function(k,v,filename){k=String(k);var e=[k,formValue(v,filename)],at=-1;
+  this._p=this._p.filter(function(p,i){if(p[0]!==k)return true;if(at<0){at=i;return true;}return false;});
+  if(at<0)this._p.push(e);else this._p[at]=e;},
+ get:function(k){k=String(k);for(var i=0;i<this._p.length;i++)if(this._p[i][0]===k)return this._p[i][1];return null;},
+ getAll:function(k){k=String(k);return this._p.filter(function(p){return p[0]===k;}).map(function(p){return p[1];});},
+ has:function(k){k=String(k);return this._p.some(function(p){return p[0]===k;});},
+ 'delete':function(k){k=String(k);this._p=this._p.filter(function(p){return p[0]!==k;});},
+ forEach:function(f,t){this._p.slice().forEach(function(p){f.call(t,p[1],p[0],this);},this);},
+ entries:function(){return this._p.map(function(p){return [p[0],p[1]];})[Symbol.iterator]();},
+ keys:function(){return this._p.map(function(p){return p[0];})[Symbol.iterator]();},
+ values:function(){return this._p.map(function(p){return p[1];})[Symbol.iterator]();},
+ _urlencoded:function(){return formUrlencoded(this._p,false);}};
+FormData.prototype[Symbol.iterator]=FormData.prototype.entries;
+Object.defineProperty(FormData.prototype,Symbol.toStringTag,{configurable:true,value:'FormData'});
+W.FormData=FormData;
+function closestTag(e,tag){for(e=e.parentNode;e&&e.tagName;e=e.parentNode)if(e.tagName===tag)return e;return null;}
+/* disabled itself, or in a disabled fieldset other than in its first
+   legend */
+function controlDisabled(e){
+ if(e.hasAttribute('disabled'))return true;
+ for(var c=e,f=e.parentNode;f&&f.tagName;c=f,f=f.parentNode){
+  if(f.tagName==='FIELDSET'&&f.hasAttribute('disabled')){
+   var lg=null,k;for(k=f.firstElementChild;k;k=k.nextElementSibling)if(k.tagName==='LEGEND'){lg=k;break;}
+   if(!(lg&&(c===lg||lg.contains(c))))return true;}}
+ return false;}
+/* constructing the entry list: null while the form is already building
+   one (a formdata listener that asks again) */
+function formEntryList(form,submitter){
+ if(form.__vsBuilding)return null;
+ var out=[];
+ listOf(form.elements).forEach(function(e){
+  var tag=e.tagName,t=String(e.getAttribute('type')||'').toLowerCase(),n;
+  if(!tag||tag==='FIELDSET'||tag==='OUTPUT'||tag==='OBJECT')return;
+  if(e.localName.indexOf('-')>0)return;   /* form-associated custom elements: below */
+  if(closestTag(e,'DATALIST')||controlDisabled(e))return;
+  if(tag==='BUTTON'||(tag==='INPUT'&&(t==='submit'||t==='image'||t==='reset'||t==='button'))){
+   if(e!==submitter||!isSubmitButton(e))return;}
+  if(tag==='INPUT'&&(t==='checkbox'||t==='radio')&&!e.checked)return;
+  if(tag==='INPUT'&&t==='image'){
+   n=e.getAttribute('name')||'';var pre=n?n+'.':'',xy=e.__vsImageXY||[0,0];
+   out.push([pre+'x',String(xy[0])],[pre+'y',String(xy[1])]);return;}
+  n=e.getAttribute('name');
+  if(n===null||n==='')return;
+  if(tag==='SELECT'){listOf(e.options).forEach(function(o){
+    if(o.selected&&!o.disabled)out.push([n,o.value]);});return;}
+  if(tag==='INPUT'&&(t==='checkbox'||t==='radio')){
+   out.push([n,e.hasAttribute('value')?e.getAttribute('value'):'on']);return;}
+  if(tag==='INPUT'&&t==='file'){
+   var fl=listOf(e.files);
+   if(!fl.length)out.push([n,new W.File([],'',{type:'application/octet-stream'})]);
+   else fl.forEach(function(f){out.push([n,f]);});
+   return;}
+  if(tag==='INPUT'&&t==='hidden'&&n.toLowerCase()==='_charset_'){out.push([n,'UTF-8']);return;}
+  out.push([n,String(e.value)]);
+  var dn=e.getAttribute('dirname');
+  if(dn&&(tag==='TEXTAREA'||(tag==='INPUT'&&/^(|text|search|tel|url|email|password)$/.test(t))))
+   out.push([dn,'ltr']);});
+ if(NV.__vitaFaceSeen)faceEntries(form).forEach(function(p){
+  out.push([p[0],formValue(p[1])]);});
+ /* the formdata event: its listeners may add to what is sent */
+ var fd=new FormData();fd._p=out;
+ form.__vsBuilding=true;
+ try{form.dispatchEvent(uaEvent(new W.FormDataEvent('formdata',{bubbles:true,formData:fd})));}
+ finally{form.__vsBuilding=false;}
+ return fd._p;}
+/* newlines as CRLF, as each encoding has a form's names and values */
+function formCRLF(s){return String(s).replace(/\r\n|\r|\n/g,'\r\n');}
+/* application/x-www-form-urlencoded: UTF-8, spaces as +, and every byte
+   but letters, digits and *-._ escaped; a File is its name */
+function formUrlencoded(list,crlf){
+ var enc=new TextEncoder(),hex='0123456789ABCDEF';
+ function one(s){var b=enc.encode(crlf?formCRLF(s):s),o='',i,c;
+  for(i=0;i<b.length;i++){c=b[i];
+   if(c===0x20)o+='+';
+   else if((c>=0x30&&c<=0x39)||(c>=0x41&&c<=0x5a)||(c>=0x61&&c<=0x7a)||c===0x2a||c===0x2d||c===0x2e||c===0x5f)o+=String.fromCharCode(c);
+   else o+='%'+hex[c>>4]+hex[c&15];}
+  return o;}
+ return list.map(function(p){var v=p[1];
+  return one(p[0])+'='+one(W.File&&v instanceof W.File?v.name:v);}).join('&');}
+/* multipart/form-data, with a boundary as Chrome makes one */
+function formMultipart(list){
+ var chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB',
+  r=new Uint8Array(16),bd='----WebKitFormBoundary',i,enc=new TextEncoder(),parts=[],total=0;
+ try{W.crypto.getRandomValues(r);}catch(e){for(i=0;i<16;i++)r[i]=Math.random()*256|0;}
+ for(i=0;i<16;i++)bd+=chars[r[i]&63];
+ function esc(s){return s.replace(/\n/g,'%0A').replace(/\r/g,'%0D').replace(/"/g,'%22');}
+ function add(u){parts.push(u);total+=u.length;}
+ list.forEach(function(p){
+  var v=p[1],h='--'+bd+'\r\nContent-Disposition: form-data; name="'+esc(formCRLF(p[0]))+'"';
+  if(W.File&&v instanceof W.File){
+   add(enc.encode(h+'; filename="'+esc(v.name)+'"\r\nContent-Type: '+
+    (v.type||'application/octet-stream')+'\r\n\r\n'));
+   add(v._u);add(enc.encode('\r\n'));}
+  else add(enc.encode(h+'\r\n\r\n'+formCRLF(v)+'\r\n'));});
+ add(enc.encode('--'+bd+'--\r\n'));
+ var all=new Uint8Array(total),at=0;
+ parts.forEach(function(u){all.set(u,at);at+=u.length;});
+ return {body:all.buffer,type:'multipart/form-data; boundary='+bd};}
+/* text/plain: name=value lines; a File is its name */
+function formTextPlain(list){
+ return list.map(function(p){var v=p[1];
+  return formCRLF(p[0])+'='+formCRLF(W.File&&v instanceof W.File?v.name:v)+'\r\n';}).join('');}
+
+/* HeadersInit as the Fetch standard reads it: anything iterable (an array,
+   our Headers, another library's) is a list of name and value pairs, and
+   any other object a record of its own keys, so a polyfill's methods and
+   fields are not sent as headers */
+function Headers(init){this._m={};if(init===undefined||init===null)return;
+ if(typeof init!=='object'&&typeof init!=='function')throw new TypeError("Failed to construct 'Headers': The provided value is not of type 'HeadersInit'.");
+ if(typeof init[Symbol.iterator]==='function'){
+  for(var it=init[Symbol.iterator](),r=it.next();!r.done;r=it.next()){
+   var p=r.value;if(p===null||typeof p!=='object'||typeof p[Symbol.iterator]!=='function')throw new TypeError("Failed to construct 'Headers': The provided value cannot be converted to a sequence.");
+   p=Array.prototype.slice.call(Array.from(p));
+   if(p.length!==2)throw new TypeError("Failed to construct 'Headers': Invalid value");
+   this.append(p[0],p[1]);}}
+ else Object.keys(init).forEach(function(k){this.append(k,init[k]);},this);}
 Headers.prototype={append:function(k,v){k=String(k).toLowerCase();this._m[k]=(k in this._m)?this._m[k]+', '+String(v):String(v);},set:function(k,v){this._m[String(k).toLowerCase()]=String(v);},get:function(k){k=String(k).toLowerCase();return k in this._m?this._m[k]:null;},
 has:function(k){return String(k).toLowerCase() in this._m;},'delete':function(k){delete this._m[String(k).toLowerCase()];},forEach:function(f,t){for(var k in this._m)f.call(t,this._m[k],k,this);},
 keys:function(){return Object.keys(this._m)[Symbol.iterator]();},values:function(){var m=this._m;return Object.keys(m).map(function(k){return m[k];})[Symbol.iterator]();},entries:function(){var m=this._m;return Object.keys(m).map(function(k){return [k,m[k]];})[Symbol.iterator]();}};
@@ -2709,8 +3283,8 @@ W.TextDecoder.prototype.decode=function(b){
   return joinCodes(out);}
  /* valid utf-8 is decoded in C in one go (VitaSurf); anything else
     comes back undefined and is decoded here */
- if(typeof __vitaUtf8Decode==='function'&&v instanceof Uint8Array){
-  var fast=__vitaUtf8Decode(v);if(fast!==undefined)return fast;}
+ if(typeof NV.__vitaUtf8Decode==='function'&&v instanceof Uint8Array){
+  var fast=NV.__vitaUtf8Decode(v);if(fast!==undefined)return fast;}
  /* utf-8, with a leading byte order mark dropped */
  if(n>=3&&v[0]===0xef&&v[1]===0xbb&&v[2]===0xbf)i=3;
  /* One U+FFFD per maximal subpart, as the encoding standard puts it:
@@ -2814,7 +3388,7 @@ function ceCall(el,name,args){var f=el[name];if(typeof f!=='function')return;try
 var ceConn=null;
 function ceInDoc(n){
  if(!n||n===D)return false;
- if(ceConn===null)ceConn=typeof W.__vitaConnected==='function'?W.__vitaConnected:false;
+ if(ceConn===null)ceConn=typeof NV.__vitaConnected==='function'?NV.__vitaConnected:false;
  if(ceConn&&n.nodeType!==undefined)return ceConn(n);
  var r=D.documentElement;while(n){if(n===r)return true;n=n.parentNode;}return false;}
 
@@ -2868,8 +3442,8 @@ function ceConnectTree(n,inDoc,skipSelf){
     node of the subtree (VitaSurf). A callback that moves the tree about
     can take a later one out from under n; that one is passed over, as
     the walk would never have reached it. */
- if(typeof __vitaCECandidates==='function'){
-  var l=__vitaCECandidates(n,!skipSelf),g=domGen(),k,e,up;
+ if(typeof NV.__vitaCECandidates==='function'){
+  var l=NV.__vitaCECandidates(n,!skipSelf),g=domGen(),k,e,up;
   for(k=0;k<l.length;k++){
    e=l[k];
    if(domGen()!==g){
@@ -2892,8 +3466,8 @@ function ceDisconnectTree(n,skipSelf){
     does: the walk built a child list for every node of each subtree
     taken out, text included, and Home Assistant takes out thousands
     (VitaSurf) */
- if(typeof __vitaCECandidates==='function'){
-  var l=__vitaCECandidates(n,!skipSelf),k,e;
+ if(typeof NV.__vitaCECandidates==='function'){
+  var l=NV.__vitaCECandidates(n,!skipSelf),k,e;
   for(k=0;k<l.length;k++){
    e=l[k];
    if(e.__ceConn){ceSet(e,'__ceConn',false);ceCall(e,'disconnectedCallback');}}
@@ -3036,8 +3610,8 @@ function sweepTemplates(){
    it. libdom's parser counts the ones it makes, so the page is looked
    at only when there are new ones. One that cannot be attached (a host
    with a root already, or an element that takes none) stays a template. */
-var SH_TPL=W.__vitaShadowTemplates,shTplSeen=0;
-try{delete W.__vitaShadowTemplates;}catch(e){}
+var SH_TPL=NV.__vitaShadowTemplates,shTplSeen=0;
+try{delete NV.__vitaShadowTemplates;}catch(e){}
 function declarativeShadows(root){
  var t=root.querySelectorAll('template[shadowrootmode]'),i;
  for(i=0;i<t.length;i++)declarativeShadow(t[i]);}
@@ -3055,12 +3629,16 @@ function declarativeShadow(t){
  host.removeChild(t);
  r.appendChild(f);
  declarativeShadows(r);}
-function beforeScript(){
+function beforeScript(nested){
  var n;
+ /* a frame the parser has made is window[n] to the script after it; a
+    script another script inserted runs inside that insertion, while the
+    tree is part way through it, which is no time to look through it */
+ if(!nested&&NV.__vitaSyncFrames)NV.__vitaSyncFrames();
  if(typeof SH_TPL==='function'&&(n=SH_TPL())!==shTplSeen){
   shTplSeen=n;declarativeShadows(D);}
  sweepTemplates();}
-W.__vitaBeforeScript=beforeScript;
+NV.__vitaBeforeScript=beforeScript;
 /* setHTMLUnsafe and parseHTMLUnsafe take declarative shadow roots too;
    innerHTML leaves them as templates */
 if(W.DOMParser&&W.Document&&!W.Document.parseHTMLUnsafe)
@@ -3099,10 +3677,10 @@ W.addEventListener('load',namedAccess);
  * be the host itself, so shadow content was the host's own children and
  * a root was no ShadowRoot: claude.ai's Turnstile checks that the root
  * it was given is one before every heartbeat, and dropped its widget. */
-var SH_ATTACH=W.__vitaAttachShadow,SH_ROOT=W.__vitaShadowRoot,
- SH_HOST=W.__vitaShadowHost;
-try{delete W.__vitaAttachShadow;delete W.__vitaShadowRoot;
- delete W.__vitaShadowHost;}catch(e){}
+var SH_ATTACH=NV.__vitaAttachShadow,SH_ROOT=NV.__vitaShadowRoot,
+ SH_HOST=NV.__vitaShadowHost;
+try{delete NV.__vitaAttachShadow;delete NV.__vitaShadowRoot;
+ delete NV.__vitaShadowHost;}catch(e){}
 /* the host of a shadow root, or null for anything else */
 function shadowHost(n){return n&&n.nodeType===11&&SH_HOST?SH_HOST(n):null;}
 /* a node's parent, or for a shadow root its host */
@@ -3115,8 +3693,8 @@ var CE_RESERVED=' annotation-xml color-profile font-face font-face-src '+
 function ceValidName(n){
  return /^[a-z][a-z0-9._\u00b7\u00c0-\uffff-]*-[a-z0-9._\u00b7\u00c0-\uffff-]*$/.test(n)&&
   CE_RESERVED.indexOf(' '+n+' ')<0;}
-var SH_NOTE=W.__vitaShadowNote;
-try{delete W.__vitaShadowNote;}catch(e){}
+var SH_NOTE=NV.__vitaShadowNote;
+try{delete NV.__vitaShadowNote;}catch(e){}
 function shNote(t){if(typeof SH_NOTE==='function')try{SH_NOTE(t);}catch(e){}}
 P.attachShadow=function(init){
  if(this.nodeType!==1)throw new TypeError("Illegal invocation");
@@ -3235,32 +3813,49 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   * the same way; @keyframes, @font-face and the like are left as
   * they are. The tag, not the host, so every copy of a component
   * gets the same text and the folding below still works. */
- var scoped=Object.create(null),nscoped=0;
+ var scoped=Object.create(null),nscoped=0,scopedChars=0,
+  /* a character no style sheet holds, where the host goes */
+  MARK='\u0000',SCOPED_CHARS=4194304;
+ /* The scanners jump from one character that matters to the next with
+    a global regular expression, which runs in C, where they had looked
+    at every character in script: a component library's shared sheet
+    of a few hundred kilobytes took seconds to rewrite on the Vita, and
+    old.reddit's login page rewrote two dozen (VitaSurf). */
+ var RE_DQ=/["\\]/g,RE_SQ=/['\\]/g,RE_CB=/["'{}]/g,RE_PA=/["'()]/g,
+  RE_LIST=/["'\\()[\],]/g,RE_HEAD=/["'{;]/g,RE_NOWS=/\S/g;
+ function skipStr(t,i){
+  /* the index of the quote closing the one at i, or the end */
+  var re=t.charAt(i)==='"'?RE_DQ:RE_SQ,m;
+  re.lastIndex=i+1;
+  while((m=re.exec(t))!==null){
+   if(m[0]==='\\'){re.lastIndex=m.index+2;continue;}
+   return m.index;}
+  return t.length;}
  function closeAt(t,i,open,close){
   /* index of the bracket closing the one at i, strings skipped */
-  var d=0,c,q;
-  for(;i<t.length;i++){
-   c=t.charAt(i);
-   if(c==='"'||c==="'"){q=c;for(i++;i<t.length&&t.charAt(i)!==q;i++)
-    if(t.charAt(i)==='\\')i++;continue;}
+  var re=open==='{'?RE_CB:RE_PA,d=0,m,c,at;
+  re.lastIndex=i;
+  while((m=re.exec(t))!==null){
+   c=m[0];at=m.index;
+   if(c==='"'||c==="'"){re.lastIndex=skipStr(t,at)+1;continue;}
    if(c===open)d++;
-   else if(c===close&&--d===0)return i;}
+   else if(--d===0)return at;}
   return -1;}
  function splitList(t){
-  var out=[],d=0,st=0,i,c,q;
-  for(i=0;i<t.length;i++){
-   c=t.charAt(i);
-   if(c==='"'||c==="'"){q=c;for(i++;i<t.length&&t.charAt(i)!==q;i++)
-    if(t.charAt(i)==='\\')i++;continue;}
-   if(c==='\\'){i++;continue;}
+  var out=[],d=0,st=0,m,c,at;
+  RE_LIST.lastIndex=0;
+  while((m=RE_LIST.exec(t))!==null){
+   c=m[0];at=m.index;
+   if(c==='"'||c==="'"){RE_LIST.lastIndex=skipStr(t,at)+1;continue;}
+   if(c==='\\'){RE_LIST.lastIndex=at+2;continue;}
    if(c==='('||c==='[')d++;
    else if(c===')'||c===']')d--;
-   else if(c===','&&d===0){out.push(t.slice(st,i));st=i+1;}}
+   else if(d===0){out.push(t.slice(st,at));st=at+1;}}
   out.push(t.slice(st));
   return out;}
  function scopeSel(s,tag){
   var m,e,x;
-  s=s.replace(/^\s+|\s+$/g,'');
+  s=s.trim();
   if(!s)return s;
   /* slot[name=a]::slotted(X): an X the page put in slot a, which is a
      child of the host with slot="a". Read as any X inside the tag, Home
@@ -3274,12 +3869,14 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
     var hp=/^:host(\([^)]*\))?/.exec(s),arg=s.slice(x+10,e).replace(/^\s+|\s+$/g,'')||'*';
     s=(hp?hp[0]:'')+' > '+arg+'[slot="'+m[1]+'"]'+s.slice(e+1);
     if(!hp)return tag+s;}}
-  s=s.replace(/[^\s>+~]*::slotted\(/g,function(){return ' ::slotted(';});
+  if(s.indexOf('::slotted(')>=0)
+   s=s.replace(/[^\s>+~]*::slotted\(/g,function(){return ' ::slotted(';});
   while((x=s.indexOf('::slotted('))>=0){
    e=closeAt(s,x+9,'(',')');
    if(e<0)break;
    s=s.slice(0,x)+s.slice(x+10,e)+s.slice(e+1);}
-  s=s.replace(/^\s+/,'');
+  s=s.trimStart();
+  if(s.charAt(0)!==':')return tag+' '+s;
   if((m=/^:host-context\(/.exec(s))){
    e=closeAt(s,m[0].length-1,'(',')');
    if(e>0)return s.slice(m[0].length,e)+' '+tag+s.slice(e+1);}
@@ -3291,56 +3888,87 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   if(/^:host(?![\w-])/.test(s))return tag+s.slice(5);
   return tag+' '+s;}
  function scopeRules(t,tag){
-  var out='',i=0,b,e,pre,at;
-  while(i<t.length){
+  var out=[],i=0,b,e,pre,at,m,n=t.length;
+  while(i<n){
    b=-1;
-   while(i<t.length&&/\s/.test(t.charAt(i)))out+=t.charAt(i++);
-   for(e=i;e<t.length;e++){
-    var c=t.charAt(e);
-    if(c==='"'||c==="'"){var q=c;for(e++;e<t.length&&t.charAt(e)!==q;e++)
-     if(t.charAt(e)==='\\')e++;continue;}
-    if(c==='{'){b=e;break;}
-    if(c===';'&&t.charAt(i)==='@'){break;}}
-   if(b<0){out+=t.slice(i,e+1);i=e+1;continue;}
+   RE_NOWS.lastIndex=i;
+   m=RE_NOWS.exec(t);
+   e=m!==null?m.index:n;
+   if(e>i){out.push(t.slice(i,e));i=e;}
+   if(i>=n)break;
+   RE_HEAD.lastIndex=i;
+   e=n;
+   while((m=RE_HEAD.exec(t))!==null){
+    if(m[0]==='"'||m[0]==="'"){RE_HEAD.lastIndex=skipStr(t,m.index)+1;continue;}
+    if(m[0]==='{'){b=e=m.index;break;}
+    if(t.charAt(i)==='@'){e=m.index;break;}}
+   if(b<0){out.push(t.slice(i,e+1));i=e+1;continue;}
    e=closeAt(t,b,'{','}');
-   if(e<0){out+=t.slice(i);break;}
+   if(e<0){out.push(t.slice(i));break;}
    pre=t.slice(i,b);at=/^\s*@([\w-]+)/.exec(pre);
    if(at){
     if(/^(media|supports|container|layer|document|-moz-document)$/i.test(at[1]))
-     out+=pre+'{'+scopeRules(t.slice(b+1,e),tag)+'}';
-    else out+=t.slice(i,e+1);}
-   else out+=splitList(pre).map(function(x){return scopeSel(x,tag);}).join(',')+
-    t.slice(b,e+1);
+     out.push(pre+'{'+scopeRules(t.slice(b+1,e),tag)+'}');
+    else out.push(t.slice(i,e+1));}
+   else out.push(splitList(pre).map(function(x){return scopeSel(x,tag);}).join(',')+
+    t.slice(b,e+1));
    i=e+1;}
-  return out;}
- function scope(css,host){
+  return out.join('');}
+ /* The key a shadow root's <style> holds its host to, counted on the
+    host (VitaSurf): a style given other text, or replaced, gives its
+    old key up, so its host is not held to rules it no longer has. */
+ function holdKey(host,n,kk){
+  var old=n?n.__vsHeld:undefined;
+  if(old===kk)return;
+  if(old&&n.__vsHost)hostTokens(n.__vsHost,old,-1);
+  if(n){
+   Object.defineProperty(n,'__vsHeld',{configurable:true,value:kk,
+    writable:true,enumerable:false});
+   Object.defineProperty(n,'__vsHost',{configurable:true,value:kk?host:undefined,
+    writable:true,enumerable:false});}
+  if(kk)hostTokens(host,kk,1);}
+ function scope(css,host,n){
   var tag=host&&host.localName,k,r,kk;
   if(!css||!tag||tag==='html'||tag==='body')return css;
   /* the host as its shadow tree names it: only a rule naming one may
      reach from inside the tree to it, where a page's rules stop at
-     the shadow root as in a browser. A custom element's tag is its
-     component, every copy of which shares the sheet; a <div> or a
-     <span> can host anything, so it is named by a key for the text
-     instead, which the hosts holding that text carry (VitaSurf). */
-  if(ceValidName(tag))tag+=':-vita-host';
-  else{
-   kk=keyOf[css];
-   if(!kk){
-    if(nkeys>=2000){keyOf=Object.create(null);nkeys=0;}
-    kk=keyOf[css]='k'+(++nkey);nkeys++;}
-   if(!(host.__vsKeys&&host.__vsKeys[kk]))hostTokens(host,kk,1);
-   tag='[data-vs-s~="'+kk+'"]:-vita-host';}
-  k=tag+'\n'+css;r=scoped[k];
-  if(r!==undefined)return r;
-  try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}
-  catch(x){r=css;}
-  if(nscoped>=400){scoped=Object.create(null);nscoped=0;}
-  scoped[k]=r;nscoped++;
-  return r;}
+     the shadow root as in a browser. It is named by a key for the
+     text, which the hosts holding that text carry, so every host with
+     the same sheet shares one parse of it (VitaSurf). A custom
+     element's tag had named it, which shared the sheet among copies
+     of one component only: old.reddit.com's login page gave the same
+     250 KB sheet to fourteen kinds of component, and parsed it for
+     each, 41347 rules in the index from 24 sheets. */
+  kk=keyOf[css];
+  if(!kk){
+   if(nkeys>=2000){keyOf=Object.create(null);nkeys=0;}
+   kk=keyOf[css]='k'+(++nkey);nkeys++;}
+  if(n)holdKey(host,n,kk);
+  else if(n!==false&&!(host.__vsKeys&&host.__vsKeys[kk]))hostTokens(host,kk,1);
+  tag='[data-vs-s~="'+kk+'"]:-vita-host';
+  /* The rules are rewritten once for a text, with a mark where the
+     host goes, and each host's tag is put in its place (VitaSurf): the
+     rewriting runs a character at a time, and a component library
+     that gives the same large sheet to a hundred components rewrote
+     it once for each of their tags, a fifth of reddit.com's two
+     minutes of script. */
+  r=scoped[css];
+  if(r===undefined){
+   if(css.indexOf(MARK)>=0)r=null;
+   else{
+    try{r=scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),MARK).split(MARK);}
+    catch(x){r=null;}}
+   if(nscoped>=400||scopedChars+css.length>SCOPED_CHARS){
+    scoped=Object.create(null);nscoped=0;scopedChars=0;}
+   scoped[css]=r;nscoped++;scopedChars+=css.length;}
+  if(r===null){
+   try{return scopeRules(css.replace(/\/\*[\s\S]*?\*\//g,''),tag);}
+   catch(x){return css;}}
+  return r.length===1?r[0]:r.join(tag);}
  function take(host,n){
   var css=n.textContent,sc;
   if(!css)return;
-  sc=scope(css,host);
+  sc=scope(css,host,n);
   if(sc!==css){css=sc;if(rawText)rawText.call(n,css);else n.textContent=css;}
   if(live(css)){n.textContent='';park(n,css);return;}
   keep(n,css);}
@@ -3370,8 +3998,8 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   m[k]=(m[k]||0)+d;
   if(m[k]<=0)delete m[k];
   for(x in m)out.push(x);
-  if(typeof __vitaQuietAttr==='function')
-   __vitaQuietAttr(h,'data-vs-s',out.length?out.join(' '):null);}
+  if(typeof NV.__vitaQuietAttr==='function')
+   NV.__vitaQuietAttr(h,'data-vs-s',out.length?out.join(' '):null);}
  function hostFirst(sel,at){
   /* the selector with at put on its first compound, so it can match
      the host itself */
@@ -3434,26 +4062,38 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  var d=Object.getOwnPropertyDescriptor(P,'innerHTML');
  if(!d||!d.set)return;
  Object.defineProperty(P,'innerHTML',{configurable:true,get:d.get,set:function(v){
-  var fresh=[],emptied=[];
-  if(shadowHost(this)&&typeof v==='string'&&v.indexOf('<style')>=0)
-   {var host=shadowHost(this);
+  var fresh=[],emptied=[],keys=null,host=shadowHost(this),old,o;
+  /* the styles it replaces give their keys up */
+  if(host){
+   old=this.querySelectorAll('style');
+   for(o=0;o<old.length;o++)if(old[o].__vsHeld)holdKey(host,old[o],undefined);}
+  if(host&&typeof v==='string'&&v.indexOf('<style')>=0)
+   {keys=[];
    v=v.replace(/<style>([\s\S]*?)<\/style>/gi,function(m,css){
-    var sc=scope(css,host);
+    var sc=scope(css,host,false);
+    keys.push(css&&keyOf[css]);
     if(sc!==css){css=sc;m='<style>'+sc+'</style>';}
     if(css&&live(css)){emptied.push(css);return '<style></style>';}
     if(css)fresh.push(css);
     return m;});}
   var r=d.set.call(this,v);
+  /* and the ones it made take theirs, each style its own, or the host
+     all of them when the styles cannot be told apart */
+  if(keys&&keys.length){
+   var ns=this.querySelectorAll('style'),q;
+   for(q=0;q<keys.length;q++)if(keys[q]){
+    if(ns.length===keys.length)holdKey(host,ns[q],keys[q]);
+    else if(!(host.__vsKeys&&host.__vsKeys[keys[q]]))hostTokens(host,keys[q],1);}}
   /* the empty ones it made, in order, when they can be told from any
      the page wrote empty itself */
   if(emptied.length){
-   var es=this.getElementsByTagName('style'),k,e=[];
+   var es=this.querySelectorAll('style'),k,e=[];
    for(k=0;k<es.length;k++)
     if(styleNode(es[k])&&es[k].textContent==='')e.push(es[k]);
    if(e.length===emptied.length)
     for(k=0;k<e.length;k++)park(e[k],emptied[k]);}
   if(fresh.length){
-   var st=this.getElementsByTagName('style'),i,j;
+   var st=this.querySelectorAll('style'),i,j;
    for(i=0;i<st.length;i++)for(j=0;j<fresh.length;j++)
     if(!canon[fresh[j]]||!live(fresh[j]))
      if(st[i].textContent===fresh[j])keep(st[i],fresh[j]);}
@@ -3470,7 +4110,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   var p;
   given.delete(this);
   if(typeof v==='string'&&v&&(p=this.parentNode)&&shadowHost(p)&&styleNode(this)){
-   v=scope(v,shadowHost(p));
+   v=scope(v,shadowHost(p),this);
    if(live(v)){
     if(canon[v]!==this){t.set.call(this,'');park(this,v);}
     return;}
@@ -3483,8 +4123,8 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
  * <slot> in its shadow tree: the first whose name matches their slot
  * attribute, or the first unnamed one for a child without one; a child
  * no slot takes is not drawn. Before boxes are built the engine calls
- * __vitaSlotPass, which works out where each goes and hands that to
- * __vitaSlots; box construction then walks the composed tree, the
+ * NV.__vitaSlotPass, which works out where each goes and hands that to
+ * NV.__vitaSlots; box construction then walks the composed tree, the
  * host's shadow tree in its place and each slot's children in it. */
 (function(){
  var HOSTS=[],last=-1,lastLen=-1,had=false,prev=[];
@@ -3524,10 +4164,10 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
    for(i=0;i<prev.length;i++)
     if(!now.has(prev[i])&&prev[i].__vsSlot)prev[i].__vsSlot=null;}
   prev=nodes;
-  if(nodes.length||had)__vitaSlots(nodes,slots);
+  if(nodes.length||had)NV.__vitaSlots(nodes,slots);
   had=nodes.length>0;}
- if(typeof __vitaSlots==='function')
-  Object.defineProperty(W,'__vitaSlotPass',{configurable:true,writable:true,
+ if(typeof NV.__vitaSlots==='function')
+  Object.defineProperty(NV,'__vitaSlotPass',{configurable:true,writable:true,
    enumerable:false,value:function(){try{pass();}catch(e){}}});
  function manual(r){return !!(r&&r.__vsInit&&r.__vsInit.slotAssignment==='manual');}
  /* the slot a child of a host in manual mode was assigned to, if that
@@ -3611,7 +4251,7 @@ Object.defineProperty(P,'isConnected',{configurable:true,get:function(){return c
   Object.defineProperty(this,'__vsManual',{configurable:true,writable:true,
    enumerable:false,value:list});
   touch(this);};
- W.__vsManualSlot=manualSlot;W.__vsManualRoot=manual;
+ NV.__vsManualSlot=manualSlot;NV.__vsManualRoot=manual;
  /* the iframes in shadow trees, for the log: where each is and whether
     it has a box, a few seconds after a page makes shadow roots */
  var ifSeen=0,ifScans=0,ifPending=false;
@@ -3809,8 +4449,29 @@ Object.defineProperty(P,'isContentEditable',{configurable:true,get:function(){
   if(v==='true'||v==='plaintext-only')return true;if(v==='false')return false;}
  return D.designMode==='on';}});
 Object.defineProperty(P,'accessKeyLabel',{configurable:true,get:function(){return '';}});
+/* outerText replaces the element with its text, a line break as a <br>,
+   and joins the text that ends up beside another text node, as the HTML
+   standard has it; it set innerText, keeping the element */
 Object.defineProperty(P,'outerText',{configurable:true,
- get:function(){return this.innerText;},set:function(v){this.innerText=v;}});
+ get:function(){return this.innerText;},
+ set:function(v){
+  var parent=this.parentNode,doc=this.ownerDocument||D,next,prev,frag,s;
+  if(!parent)throw new W.DOMException("Failed to set the 'outerText' property on 'HTMLElement': The element has no parent.",
+   'NoModificationAllowedError');
+  next=this.nextSibling;prev=this.previousSibling;
+  s=v===null?'':String(v);
+  frag=doc.createDocumentFragment();
+  if(s==='')frag.appendChild(doc.createTextNode(''));
+  else s.split(/\r\n|\r|\n/).forEach(function(part,i){
+   if(i)frag.appendChild(doc.createElement('br'));
+   if(part)frag.appendChild(doc.createTextNode(part));});
+  parent.replaceChild(frag,this);
+  function merge(t){
+   var n=t&&t.nextSibling;
+   if(!t||t.nodeType!==3||!n||n.nodeType!==3)return;
+   t.data+=n.data;parent.removeChild(n);}
+  if(next&&next.previousSibling)merge(next.previousSibling);
+  if(prev)merge(prev);}});
 Object.defineProperty(P,'attributeStyleMap',{configurable:true,get:function(){return this.computedStyleMap();}});
 Object.defineProperty(P,'currentCSSZoom',{configurable:true,get:function(){return 1;}});
 Object.defineProperty(P,'scrollParent',{configurable:true,get:function(){return D.scrollingElement;}});
@@ -3942,11 +4603,11 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
   var s={flags:{},message:'',anchor:null,value:null,state:null,aria:{},
    states:new CustomStateSet()};
   INTERNALS.set(el,s);INTERNALS.set(i,s);
-  if(formAssociated(el))W.__vitaFaceSeen=true;
+  if(formAssociated(el))NV.__vitaFaceSeen=true;
   return i;};
  /* what a form-associated custom element gives its form's data:
     undefined for any other element */
- W.__vitaFaceValue=function(el){
+ NV.__vitaFaceValue=function(el){
   var s=INTERNALS.get(el);
   return s&&formAssociated(el)?s.value:undefined;};
 })();
@@ -3959,8 +4620,8 @@ Object.defineProperty(P,'formAction',{configurable:true,get:function(){
  * showing, and a toggle event queued after, merged with one still
  * pending (which fires even when it comes back to where it started, as
  * HTML has it and Chrome does). Light dismiss of popover=auto is not done. */
-var POPN=typeof W.__vitaPopover==='function'?W.__vitaPopover:null;
-try{delete W.__vitaPopover;}catch(e){}
+var POPN=typeof NV.__vitaPopover==='function'?NV.__vitaPopover:null;
+try{delete NV.__vitaPopover;}catch(e){}
 function popShown(el){return !!POPN&&POPN(el)===true;}
 function popValid(el,showing){
  if(!el.hasAttribute('popover'))
@@ -4103,15 +4764,23 @@ function splitWS(v){
   return v.split(' ');
  return v.split(/[ \t\r\n\f]+/);}
 /* The attribute as an ordered set: split on whitespace, first occurrence
-   of each token wins. */
-TokenList.prototype._t=function(){
+   of each token wins. Kept with the text it came from (VitaSurf): every
+   contains(), add() and remove() read the attribute and split it again,
+   and that was a fifth of cnn.com's script. _tok() is the kept list,
+   not to be changed; _t() a copy the caller may change. */
+TokenList.prototype._tok=function(){
  if(!this._e)return this._own||(this._own=[]);
  var v=this._e.getAttribute(this._a);
- var out=[],seen={},parts=v?splitWS(String(v)):[],i;
+ if(this._ks===v&&this._kt)return this._kt;
+ var out=[],seen=new Set(),parts=v?splitWS(String(v)):[],i;
  for(i=0;i<parts.length;i++){
-  if(parts[i]===''||Object.prototype.hasOwnProperty.call(seen,parts[i]))continue;
-  seen[parts[i]]=1;out.push(parts[i]);}
+  if(parts[i]===''||seen.has(parts[i]))continue;
+  seen.add(parts[i]);out.push(parts[i]);}
+ if(this._kt===undefined){hide(this,'_ks',v);hide(this,'_kt',out);}
+ else{this._ks=v;this._kt=out;}
  return out;};
+TokenList.prototype._t=function(){
+ var t=this._tok();return this._e?t.slice():t;};
 /* The update steps write the attribute whether or not the set changed,
    and an observer sees a record for each write. The one case that
    writes nothing is an element that has no such attribute and no tokens
@@ -4129,8 +4798,8 @@ TokenList.prototype._w=function(t){
   if(i<t.length)this[i]=t[i];else delete this[i];}
  this.length=t.length;};
 TokenList.prototype.item=function(i){
- var t=this._t();i=Number(i)||0;return t[i]===undefined?null:t[i];};
-TokenList.prototype.contains=function(c){return this._t().indexOf(String(c))>=0;};
+ var t=this._tok();i=Number(i)||0;return t[i]===undefined?null:t[i];};
+TokenList.prototype.contains=function(c){return this._tok().indexOf(String(c))>=0;};
 TokenList.prototype.add=function(){
  var i,t;
  for(i=0;i<arguments.length;i++)tokenCheck(arguments[i]);
@@ -4196,6 +4865,7 @@ TokenList.prototype.entries=function(){return this._t().map(function(v,i){return
 TokenList.prototype[Symbol.iterator]=TokenList.prototype.values;
 TokenList.prototype.toString=function(){return this.value;};
 hide(TokenList.prototype,'_t',TokenList.prototype._t);
+hide(TokenList.prototype,'_tok',TokenList.prototype._tok);
 hide(TokenList.prototype,'_w',TokenList.prototype._w);
 Object.defineProperty(TokenList.prototype,'value',{configurable:true,
  get:function(){return this._e?(this._e.getAttribute(this._a)||''):this._t().join(' ');},
@@ -4368,11 +5038,11 @@ Object.defineProperty(P,'elements',{configurable:true,get:function(){
  var self=this;
  return liveCollection(function(){
   var sel='input,select,textarea,button,fieldset,object,output';
-  if(!W.__vitaFaceSeen)return listOf(self.querySelectorAll(sel));
+  if(!NV.__vitaFaceSeen)return listOf(self.querySelectorAll(sel));
   /* and the form-associated custom elements, once a page has one */
   return listOf(self.getElementsByTagName('*')).filter(function(e){
    return e.matches(sel)||(e.localName.indexOf('-')>0&&
-    W.__vitaFaceValue(e)!==undefined);});},
+    NV.__vitaFaceValue(e)!==undefined);});},
   FormControls.prototype,true);}});
 Object.defineProperty(P,'length',{configurable:true,get:function(){
  /* On character data it is the number of characters, which is what code
@@ -4434,10 +5104,24 @@ Object.defineProperty(P,'index',{configurable:true,get:function(){
   set:function(v){var t=this.tagName;
    if(t==='SELECT'){var o=this.options;for(var i=0;i<o.length;i++)o[i].selected=(o[i].value===String(v));return;}
    if(t==='TEXTAREA'){this.textContent=String(v);return;}
+   if(t==='INPUT'){
+    /* value sanitization: a one-line field holds no line breaks, and an
+       address none around it either (HTML standard) */
+    var ty=String(this.getAttribute('type')||'text').toLowerCase();
+    if(/^(text|search|tel|password|url|email)$/.test(ty)||
+       !/^(hidden|checkbox|radio|file|submit|image|reset|button|number|range|color|date|month|week|time|datetime-local)$/.test(ty)){
+     v=String(v).replace(/[\r\n]/g,'');
+     if(ty==='url'||ty==='email')v=v.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'');}}
    d.set.call(this,v);}});})();
+/* requestSubmit fires submit (a SubmitEvent naming its submitter) and
+   goes on unless it is cancelled; submit() does neither */
 P.requestSubmit=function(submitter){
- if(!this.dispatchEvent(uaEvent(new Event('submit',{bubbles:true,cancelable:true}))))return;
- this.submit(submitter);};
+ if(this.tagName!=='FORM')return;
+ if(submitter!==undefined&&submitter!==null){
+  if(!isSubmitButton(submitter))throw new TypeError("Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not a submit button.");
+  if(submitter.form!==this)throw new DOMException("Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not owned by this form element.",'NotFoundError');}
+ else submitter=null;
+ formSubmit(this,submitter,false);};
 /* The window a form or link target names (VitaSurf): _self, _parent,
    _top, or a frame by name, looked for here, then in the frames around
    this one. A name found nowhere, and _blank, stay here: there is one
@@ -4460,31 +5144,80 @@ function targetWindow(name){
   var r=find(w);if(r)return r;
   if(w===w.parent)break;w=w.parent;}
  return W;}
-P.submit=function(submitter){
- if(this.tagName!=='FORM')return;
- var target=(submitter&&submitter.getAttribute&&submitter.getAttribute('formtarget'))||
-  this.getAttribute('target');
+P.submit=function(){if(this.tagName==='FORM')formSubmit(this,null,true);};
+/* A form the user submitted, with a tap on a button or Enter in a field,
+   goes the same way (js_submit, js_implicit_submit in qjs.c): an image
+   button brings where it was clicked. */
+NV.__vitaSubmit=function(form,submitter,x,y){
+ if(!form||form.tagName!=='FORM')return false;
+ if(submitter&&!isSubmitButton(submitter))submitter=null;
+ if(submitter&&submitter.tagName==='INPUT')submitter.__vsImageXY=[x|0,y|0];
+ formSubmit(form,submitter,false);
+ return true;};
+/* implicit submission: the default button is clicked, if it is not
+   disabled; with none, the form goes when only one field could take
+   Enter */
+NV.__vitaImplicitSubmit=function(form){
+ if(!form||form.tagName!=='FORM')return false;
+ var els=listOf(form.elements),def=null,blocking=0,i,e;
+ for(i=0;i<els.length;i++){e=els[i];
+  if(!def&&isSubmitButton(e))def=e;
+  if(e.tagName==='INPUT'&&/^(text|search|url|tel|email|password|date|month|week|time|datetime-local|number)$/.test(String(e.getAttribute('type')||'text').toLowerCase()))blocking++;}
+ if(def){if(!controlDisabled(def))def.click();return true;}
+ if(blocking<=1)formSubmit(form,null,false);
+ return true;};
+/* The HTML standard's form submission (VitaSurf): the method, action,
+   enctype and target, the submitter's own formmethod and the rest first;
+   a GET puts the entries in the query, a POST to http or https sends
+   them as the body its enctype names, and a dialog form closes its
+   dialog. */
+function formSubmit(form,submitter,fromMethod){
+ if(!inDocument(form)||form.__vsBuilding)return;
+ if(!fromMethod){
+  if(form.__vsFiring)return;
+  var go;form.__vsFiring=true;
+  try{go=form.dispatchEvent(uaEvent(new W.SubmitEvent('submit',
+   {bubbles:true,cancelable:true,submitter:submitter})));}
+  finally{form.__vsFiring=false;}
+  if(!go)return;}
+ function attr(n,sn){return submitter&&submitter.hasAttribute(sn)?
+  submitter.getAttribute(sn):form.getAttribute(n);}
+ var method=String(attr('method','formmethod')||'').toLowerCase();
+ if(method!=='post'&&method!=='dialog')method='get';
+ if(method==='dialog'){
+  var dlg=closestTag(form,'DIALOG');
+  if(!dlg||typeof dlg.close!=='function')return;
+  if(submitter&&!(submitter.tagName==='INPUT'&&
+     String(submitter.getAttribute('type')).toLowerCase()==='image'))
+   dlg.close(String(submitter.value));
+  else dlg.close();
+  return;}
+ var list=formEntryList(form,submitter);
+ if(list===null||!inDocument(form))return;
+ var action=attr('action','formaction'),u;
+ try{u=new URL(action===null||action===''?D.URL:action,D.baseURI);}catch(e){return;}
+ var enctype=String(attr('enctype','formenctype')||'').toLowerCase();
+ if(enctype!=='multipart/form-data'&&enctype!=='text/plain')
+  enctype='application/x-www-form-urlencoded';
+ var target=attr('target','formtarget');
  if(target===null||target===''){var bt=D.querySelector('base[target]');
   target=bt?bt.getAttribute('target'):'';}
- var method=String(this.getAttribute('method')||'get').toLowerCase();
- var action=this.action||D.baseURI;
- if(method!=='get')return;   /* a navigation cannot carry a body here */
- var q=new URLSearchParams('');
- listOf(this.elements).forEach(function(c){
-  if(c.localName&&c.localName.indexOf('-')>0)return;
-  var n=c.name;if(!n||c.disabled)return;
-  var t=String(c.type||'').toLowerCase();
-  if(t==='submit'||t==='button'||t==='reset'||t==='file')return;
-  if((t==='checkbox'||t==='radio')&&!c.checked)return;
-  q.append(n,c.value===undefined?'':c.value);});
- if(W.__vitaFaceSeen)faceEntries(this).forEach(function(p){
-  if(typeof p[1]==='string')q.append(p[0],p[1]);});
+ var win=targetWindow(target),scheme=u.protocol,href=u.href,body=null,type=null;
+ if(method==='post'&&(scheme==='http:'||scheme==='https:')){
+  if(enctype==='multipart/form-data'){var mp=formMultipart(list);body=mp.body;type=mp.type;}
+  else if(enctype==='text/plain'){body=formTextPlain(list);type='text/plain';}
+  else{body=formUrlencoded(list,true);type='application/x-www-form-urlencoded';}}
+ else if(method==='get'&&/^(https?|ftp|data|file):$/.test(scheme)){
+  /* the entries replace the action's query, whatever the enctype */
+  var pre=href.split('#')[0],q=pre.indexOf('?');
+  if(q>=0)pre=pre.slice(0,q);
+  href=pre+'?'+formUrlencoded(list,true)+u.hash;}
  /* Navigating in the middle of a dispatch tears down the page the
     dispatch is walking; let the current task finish first. */
- try{var u=new URL(action,D.baseURI);u.search=q.toString();
-  var href=u.href,win=targetWindow(target);
-  setTimeout(function(){try{win.location.href=href;}catch(e){}},0);
- }catch(e){}};
+ setTimeout(function(){try{
+  if(body!==null){var wn=NV.__vitaNativesOf(win);
+   if(wn)wn.__vitaNavigatePost(href,body,type);}
+  else win.location.href=href;}catch(e){}},0);}
 P.reset=function(){
  if(this.tagName!=='FORM')return;
  if(!this.dispatchEvent(uaEvent(new Event('reset',{bubbles:true,cancelable:true}))))return;
@@ -4499,12 +5232,12 @@ P.reset=function(){
  * laid out reports its box.
  */
 Object.defineProperty(P,'complete',{configurable:true,get:function(){
- return this.tagName!=='IMG'||!!__vitaBox(this);}});
+ return this.tagName!=='IMG'||!!NV.__vitaBox(this);}});
 ['naturalWidth','naturalHeight'].forEach(function(k,n){Object.defineProperty(P,k,{configurable:true,
- get:function(){var b=__vitaBox(this);return b?b[2+n]:0;}});});
+ get:function(){var b=NV.__vitaBox(this);return b?b[2+n]:0;}});});
 Object.defineProperty(P,'currentSrc',{configurable:true,get:function(){return this.src||'';}});
 ['x','y'].forEach(function(k,n){Object.defineProperty(P,k,{configurable:true,
- get:function(){var b=__vitaBox(this);return b?b[n]:0;}});});
+ get:function(){var b=NV.__vitaBox(this);return b?b[n]:0;}});});
 P.decode=function(){return Promise.resolve();};
 Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}});
 /* --- frames -------------------------------------------------------------
@@ -4526,20 +5259,22 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
  * read when both were null.
  */
 (function(){
- var NF=W.__vitaFrameGlobal,NP=W.__vitaParentGlobal,NT=W.__vitaTopGlobal,
-  NE=W.__vitaFrameElement,NX=W.__vitaEntryGlobal,NS=W.__vitaFrameStart,
-  NO=W.__vitaFrameOf;
+ var NF=NV.__vitaFrameGlobal,NP=NV.__vitaParentGlobal,NT=NV.__vitaTopGlobal,
+  NE=NV.__vitaFrameElement,NX=NV.__vitaEntryGlobal,NS=NV.__vitaFrameStart,
+  NO=NV.__vitaFrameOf;
  ['__vitaFrameGlobal','__vitaParentGlobal','__vitaTopGlobal',
   '__vitaFrameElement','__vitaEntryGlobal','__vitaFrameStart',
   '__vitaFrameOf'].forEach(
-  function(k){delete W[k];});
+  function(k){delete NV[k];});
  function call(f,a){try{return f?f(a):null;}catch(e){return null;}}
  /* an iframe's page, its window made now if layout has not made it: a
     blank or srcdoc-less frame has its document at once, as in a browser,
     and anything else starts loading sooner */
  function frameGlobal(el){
   var g=call(NF,el);
-  return g||el.tagName!=='IFRAME'?g:call(NS,el);}
+  if(!g&&el.tagName==='IFRAME')g=call(NS,el);
+  if(g&&NV.__vitaSyncFrames)NV.__vitaSyncFrames();
+  return g;}
  /* a new src or srcdoc navigates the frame at once, as in a browser */
  Object.defineProperty(P,'srcdoc',{configurable:true,
   get:function(){
@@ -4659,11 +5394,38 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
    var p=call(NP);
    if(!p||keyOf(p)!==myKey())return null;
    return call(NE);},set:function(){}}});
- /* window[n] is the nth frame's window */
- function frameEls(){return D.querySelectorAll('iframe,frame');}
- for(var n=0;n<10;n++)(function(n){
-  Object.defineProperty(W,n,{configurable:true,get:function(){
-   var e=frameEls()[n];return e?e.contentWindow:undefined;}});})(n);
+ /* window[n] is the nth frame's window. A browser's window has as many
+    of these as it has frames, and none when it has none; ten were made
+    for every page, which Object.keys(window) showed. They follow the
+    frames now: when the page loads, before each script runs, when
+    window.length is read and when a frame's window is made or asked for;
+    a tree that has not changed since is not looked through again. */
+ /* the frames change only with the tree's shape (VitaSurf): kept while
+    it keeps it, where any attribute write had them looked for again */
+ var fgen=-1,frames=null;
+ function frameEls(){
+  var t=treeGen();
+  if(t<0||t!==fgen||!frames){frames=D.querySelectorAll('iframe,frame');fgen=t;}
+  return frames;}
+ var indexed=0,syncedAt=-2;
+ function indexGetter(n){return function(){
+  var e=frameEls()[n];return e?e.contentWindow:undefined;};}
+ function syncIndexes(){
+  var g=treeGen(),count,n;
+  if(g>=0&&g===syncedAt)return indexed;
+  syncedAt=g;
+  count=frameEls().length;
+  if(count>100)count=100;
+  for(n=indexed;n<count;n++)
+   Object.defineProperty(W,n,{configurable:true,get:indexGetter(n)});
+  for(n=count;n<indexed;n++)delete W[n];
+  indexed=count;
+  return count;}
+ NV.__vitaSyncFrames=syncIndexes;
+ Object.defineProperty(W,'length',{configurable:true,
+  get:function(){return syncIndexes();},set:function(){}});
+ D.addEventListener('DOMContentLoaded',syncIndexes);
+ W.addEventListener('load',syncIndexes);
  /*
   * postMessage from whichever window called it: the page whose script
   * the runtime entered is the sender, the data is copied here, into the
@@ -4690,11 +5452,11 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
   if(ports.length)ports=portMove(ports,W.MessagePort);
   ev=uaEvent(new W.MessageEvent('message',{data:data,origin:src===W?originOf(W):originOf(src),
    source:view(src),ports:ports}));
-  setTimeout(function(){
+  NV.__vitaQueueTask(function(){
    var tr=msgTraceStart(src,ev,data,ports);
    msgNote(src,message,'delivered'+(to==='*'?' (to any origin)':''));
-   __vitaDispatch(null,ev);
-   if(tr)setTimeout(function(){msgTraceEnd(tr);},50);},0);};
+   NV.__vitaDispatch(null,ev);
+   if(tr)setTimeout(function(){msgTraceEnd(tr);},50);});};
  /* What a page did with the first few messages another window sent it
     (VitaSurf): which of the event's fields and which of the data's keys
     it read, and what it sent on in the next moment. Names only. The
@@ -4739,8 +5501,8 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){return null;}}
  /* the log's line for a message: where from, and its kind when the data
     names one with a short word, as {event: "ready"} does; nothing else
     of the data is written */
- var MN=W.__vitaMessageNote;
- try{delete W.__vitaMessageNote;}catch(e){}
+ var MN=NV.__vitaMessageNote;
+ try{delete NV.__vitaMessageNote;}catch(e){}
  function msgNote(src,m,what){
   var k='',w;
   if(typeof MN!=='function')return;
@@ -5005,12 +5767,12 @@ Object.defineProperty(D,'doctype',{configurable:true,get:function(){
  return {name:'html',publicId:'',systemId:'',nodeType:10};}});
 Object.defineProperty(D,'scrollingElement',{configurable:true,get:function(){return D.documentElement;}});
 Object.defineProperty(D,'lastModified',{configurable:true,get:function(){return new Date().toString();}});
-/* The document's encoding, as the parser settled it. __vitaEncoding is
+/* The document's encoding, as the parser settled it. NV.__vitaEncoding is
    the one NetSurf actually decoded with; a page with no declaration is
    not UTF-8 just because we would like it to be. */
 ['characterSet','charset','inputEncoding'].forEach(function(k){
  Object.defineProperty(D,k,{configurable:true,get:function(){
-  return (typeof __vitaEncoding==='function'&&__vitaEncoding())||'UTF-8';}});});
+  return (typeof NV.__vitaEncoding==='function'&&NV.__vitaEncoding())||'UTF-8';}});});
 D.designMode='off';
 D.dir='';
 ['anchors','applets','embeds','plugins','scripts','forms','images','links'].forEach(function(k){
@@ -5255,12 +6017,19 @@ HTMLCollection.prototype[Symbol.iterator]=function(){
 /* Only these tags answer to their name attribute in a collection. */
 var NAMED_TAGS=(' A APPLET AREA EMBED FORM FRAME FRAMESET IFRAME IMG '+
  'OBJECT ');
+/* an array index, by its characters (VitaSurf): a regular expression
+   at every read of a collection's item was a good part of a loop over
+   one */
 function indexKey(k){
  if(typeof k!=='string')return -1;
- if(k==='0')return 0;
- if(!/^[1-9][0-9]*$/.test(k))return -1;
- var n=+k;
- return n<=0xfffffffe?n:-1;}
+ var n=k.length,c,i;
+ if(n===0||n>10)return -1;
+ c=k.charCodeAt(0);
+ if(c===48)return n===1?0:-1;
+ if(c<49||c>57)return -1;
+ for(i=1;i<n;i++){c=k.charCodeAt(i);if(c<48||c>57)return -1;}
+ c=+k;
+ return c<=0xfffffffe?c:-1;}
 /* The collection is a proxy so that an index or a name is resolved when
    it is read, which is what makes it live. */
 function liveCollection(items,proto,shapeOnly){
@@ -5391,7 +6160,7 @@ Object.defineProperty(W.HTMLOptionsCollection.prototype,'selectedIndex',{
  configurable:true,
  get:function(){var o=this.__vitaOwner;return o?o.selectedIndex:-1;},
  set:function(v){var o=this.__vitaOwner;if(o)o.selectedIndex=v;}});
-W.HTMLFormControlsCollection=HTMLCollection;W.HTMLAllCollection=HTMLCollection;
+W.HTMLFormControlsCollection=FormControls;W.HTMLAllCollection=HTMLCollection;
 
 W.closed=false;
 W.name=W.name||'';
@@ -5545,8 +6314,15 @@ function styleOf(e){
  var l=parseDecl(s),ix=new Map(),i;
  for(i=0;i<l.length;i++)ix.set(l[i][0],i);
  c={s:s,l:l,ix:ix};STYLE_PARSED.set(e,c);return c;}
-function declText(d){var v=closeValue(d[1]);
- return d[0]+': '+(v===null?d[1]:v)+(d[2]?' !'+d[2]:'')+';';}
+/* A declaration's text, kept on it (VitaSurf): a value changed in place
+   writes the attribute out again, every declaration of it, and each was
+   read a character at a time to close what it left open; an element
+   holding a theme's hundreds of variables did that for every one set.
+   A declaration is replaced, not changed, so what is kept stays true. */
+function declText(d){
+ if(d[3]!==undefined)return d[3];
+ var v=closeValue(d[1]);
+ return d[3]=d[0]+': '+(v===null?d[1]:v)+(d[2]?' !'+d[2]:'')+';';}
 CSSStyleDeclaration.prototype._d=function(){
  return this._e?styleOf(this._e).l:(this._own||(this._own=[]));};
 CSSStyleDeclaration.prototype._w=function(list){
@@ -5604,6 +6380,7 @@ CSSStyleDeclaration.prototype.toString=function(){return this.cssText;};
 /* The camel-cased property names. Anything outside this list still works
  * through setProperty, which is what libraries that set unusual
  * properties use anyway. */
+var CSS_KEYS=[],CSS_ARGS=[],CSS_FLAGS=[];
 ('align-content align-items align-self all animation animation-delay animation-direction '+
  'animation-duration animation-fill-mode animation-iteration-count animation-name '+
  'animation-play-state animation-timing-function appearance aspect-ratio backdrop-filter '+
@@ -5635,12 +6412,14 @@ CSSStyleDeclaration.prototype.toString=function(){return this.cssText;};
  'vertical-align visibility white-space width will-change word-break word-spacing word-wrap '+
  'writing-mode z-index zoom').split(' ').forEach(function(n){
  var camel=n.replace(/-([a-z])/g,function(_,c){return c.toUpperCase();});
- Object.defineProperty(CSSStyleDeclaration.prototype,camel,{configurable:true,enumerable:true,
-  get:function(){return this.getPropertyValue(n);},
-  set:function(v){this.setProperty(n,v);}});
- if(camel!==n)Object.defineProperty(CSSStyleDeclaration.prototype,n,{configurable:true,
-  get:function(){return this.getPropertyValue(n);},
-  set:function(v){this.setProperty(n,v);}});});
+ CSS_KEYS.push(camel);CSS_ARGS.push(n);CSS_FLAGS.push(5);
+ if(camel!==n){CSS_KEYS.push(n);CSS_ARGS.push(n);CSS_FLAGS.push(1);}});
+/* each a getter and setter made in C that pass the property's name to
+   these (__vitaAccessors, vita/js/ifaces.c): a closure pair for each of
+   four hundred names was a tenth of the prelude */
+NV.__vitaAccessors(CSSStyleDeclaration.prototype,CSS_KEYS,CSS_ARGS,
+ function(n){return this.getPropertyValue(n);},
+ function(n,v){this.setProperty(n,v);},CSS_FLAGS);
 Object.defineProperty(CSSStyleDeclaration.prototype,'cssFloat',{configurable:true,
  get:function(){return this.getPropertyValue('float');},
  set:function(v){this.setProperty('float',v);}});
@@ -5711,7 +6490,7 @@ RuleStyle.prototype.setProperty=function(p,v,pri){p=String(p);if(p.slice(0,2)!==
  v=v==null?'':String(v);
  if(v===''){this.removeProperty(p);return;}
  var imp=String(pri||'').toLowerCase()==='important';
- for(var i=0;i<this._d.length;i++)if(this._d[i][0]===p){this._d[i][1]=v;this._d[i][2]=imp;sheetDirty(this._rule);return;}
+ for(var i=0;i<this._d.length;i++)if(this._d[i][0]===p){this._d[i][1]=v;this._d[i][2]=imp;this._d[i][3]=undefined;sheetDirty(this._rule);return;}
  this._d.push([p,v,imp]);sheetDirty(this._rule);};
 RuleStyle.prototype.removeProperty=function(p){p=String(p);var old=this.getPropertyValue(p);
  var before=this._d.length;this._d=this._d.filter(function(d){return d[0]!==p;});
@@ -5737,6 +6516,11 @@ CSSStyleRule.prototype=Object.create(CSSRule.prototype);CSSStyleRule.prototype.c
 CSSStyleRule.prototype.type=1;
 Object.defineProperty(CSSStyleRule.prototype,'cssText',{configurable:true,get:function(){
  var b=this.style.cssText;return this.selectorText+' {'+(b?' '+b+' ':' ')+'}';}});
+/* an accessor, as a browser's is, so that setting it marks the sheet
+   changed like every other change to a rule */
+Object.defineProperty(CSSStyleRule.prototype,'selectorText',{configurable:true,
+ get:function(){return this._sel===undefined?'':this._sel;},
+ set:function(v){this._sel=String(v);sheetDirty(this);}});
 function CSSGroupingRule(){CSSRule.call(this);}
 CSSGroupingRule.prototype=Object.create(CSSRule.prototype);CSSGroupingRule.prototype.constructor=CSSGroupingRule;
 CSSGroupingRule.prototype.insertRule=function(text,index){return rulesInsert(this.cssRules,this.parentStyleSheet,this,text,index);};
@@ -5781,7 +6565,7 @@ function makeRule(text,sheet,parent){
   else{r=new CSSOtherRule();r.type=0;}
   r._text=t;r.parentStyleSheet=sheet;r.parentRule=parent;return r;}
  r=new CSSStyleRule();r.parentStyleSheet=sheet;r.parentRule=parent;
- r.selectorText=brace<0?t:t.slice(0,brace).trim();
+ r._sel=brace<0?t:t.slice(0,brace).trim();
  r.style=ruleStyleProxy(new RuleStyle(r,brace<0?'':t.slice(brace+1,t.lastIndexOf('}'))));
  return r;}
 function rulesInsert(list,sheet,parent,text,index){
@@ -5814,7 +6598,8 @@ function CSSStyleSheet(opts){
  this.disabled=false;this.type='text/css';
  this.href=owner&&owner.tagName==='LINK'?owner.href:null;this.title=owner?owner.title||null:null;
  this.media=new MediaList(owner?owner.getAttribute('media'):(opts&&opts.media)||'');
- this._constructed=!owner;this._rules=owner?null:[];this._src=null;this._adopters=[];}
+ this._constructed=!owner;this._rules=owner?null:[];this._src=null;this._adopters=[];
+ this._ver=0;this._tv=-1;this._tc='';}
 Object.defineProperty(CSSStyleSheet.prototype,'cssRules',{configurable:true,get:function(){
  var o=this.ownerNode;
  if(o&&o.tagName==='STYLE'){var t=o.textContent||'';
@@ -5840,20 +6625,30 @@ CSSStyleSheet.prototype.replace=function(text){var s=this;
  try{s.replaceSync(text);}catch(e){return Promise.reject(e);}
  return Promise.resolve(s);};
 CSSStyleSheet.prototype._text=function(){
- return this.disabled?'':this.cssRules.map(function(r){return r.cssText;}).join('\n');};
+ /* A constructed sheet's text is kept until it changes (VitaSurf): every
+    shadow root that adopts the sheet writes it out, and a component
+    library adopts the same large sheet in each of hundreds of
+    components, which had made the text again from every rule each
+    time. Every change goes through sheetDirty, which moves _ver on. */
+ if(this.disabled)return '';
+ if(this._constructed&&this._tv===this._ver)return this._tc;
+ var t=this.cssRules.map(function(r){return r.cssText;}).join('\n');
+ if(this._constructed){this._tv=this._ver;this._tc=t;}
+ return t;};
 var sheetsDirty=[],sheetsFlush=false;
 function sheetDirty(r){
  /* a rule or a sheet: find the sheet and write it back soon */
  var s=r;while(s&&!(s instanceof CSSStyleSheet))s=s.parentStyleSheet||null;
  if(!s)return;
+ s._ver=(s._ver|0)+1;
  if(s.ownerNode&&s.ownerNode.tagName==='STYLE')s._src=s.ownerNode.textContent||'';
  if(sheetsDirty.indexOf(s)<0)sheetsDirty.push(s);
  if(!sheetsFlush){sheetsFlush=true;Promise.resolve().then(sheetsWrite);}}
 function sheetsWrite(){
  var list=sheetsDirty,seen=[];sheetsDirty=[];sheetsFlush=false;
  list.forEach(function(s){
-  if(s.ownerNode&&s.ownerNode.tagName==='STYLE'&&W.__vitaSetSheetText)
-   try{W.__vitaSetSheetText(s.ownerNode,s._text());}catch(e){}
+  if(s.ownerNode&&s.ownerNode.tagName==='STYLE'&&NV.__vitaSetSheetText)
+   try{NV.__vitaSetSheetText(s.ownerNode,s._text());}catch(e){}
   s._adopters.forEach(function(a){if(seen.indexOf(a)<0){seen.push(a);adoptWrite(a);}});});}
 var sheetOf=new WeakMap();
 function elementSheet(el){
@@ -5887,7 +6682,7 @@ function adoptWrite(target){
   /* marked so the engine keeps it in the cascade though it is not
      in the document, as no other <style> out of it is */
   if(!el){el=D.createElement('style');el.setAttribute('data-adopted','document');adoptEl.set(target,el);}
-  if(W.__vitaSetSheetText)try{W.__vitaSetSheetText(el,text);}catch(e){}
+  if(NV.__vitaSetSheetText)try{NV.__vitaSetSheetText(el,text);}catch(e){}
  }else{
   if(!el){el=D.createElement('style');el.setAttribute('data-adopted','');adoptEl.set(target,el);}
   el.textContent=text;
@@ -5944,7 +6739,7 @@ W.NamedNodeMap=NamedNodeMap;
  rawAttrs=d.get;
  Object.defineProperty(P,'attributes',{configurable:true,get:function(){
   var el=this,g=domGen(),c=el.__vitaAttrMap,
-      st=el.__vitaAttrStamp?el.__vitaAttrStamp():-1,
+      st=NV.__vitaAttrStamp?NV.__vitaAttrStamp.call(el):-1,
       raw,map,i,a;
   /* The same map while nothing has written this element's attributes
      since (VitaSurf): el.attributes===el.attributes, as in a browser,
@@ -6149,7 +6944,7 @@ W.DOMImplementation=function(){};
  * DOMParser handed back a div with the markup inside it, so
  * documentElement, head, body and every document method were missing
  * from something a page had every reason to treat as a document.
- * __vitaParseDocument parses into a real libdom document with the same
+ * NV.__vitaParseDocument parses into a real libdom document with the same
  * parser the browser uses for a page; what is left is the part of the
  * Document interface that a node does not already answer to, added to
  * the shared prototype and guarded on being a document. */
@@ -6210,16 +7005,16 @@ docOverride('title',function(){
    JavaScript frame, and anything else is handed to the function each
    replaces. GitHub made 400,000 of these calls in one load, and the
    frames around each, not the matching, filled a 20 s timer. */
-if(typeof __vitaSelectorNative==='function'){
+if(typeof NV.__vitaSelectorNative==='function'){
  P.matches=P.webkitMatchesSelector=P.msMatchesSelector=
-  __vitaSelectorNative(0,P.matches);
- P.querySelector=__vitaSelectorNative(1,P.querySelector);
- P.querySelectorAll=__vitaSelectorNative(2,P.querySelectorAll);
- P.closest=__vitaSelectorNative(3,P.closest);}
+  NV.__vitaSelectorNative(0,P.matches);
+ P.querySelector=NV.__vitaSelectorNative(1,P.querySelector);
+ P.querySelectorAll=NV.__vitaSelectorNative(2,P.querySelectorAll);
+ P.closest=NV.__vitaSelectorNative(3,P.closest);}
 function docById(root,id){
  /* in C where it can be: a walk in script read childNodes at every
     element (VitaSurf) */
- if(typeof __vitaFindById==='function')return __vitaFindById(root,String(id));
+ if(typeof NV.__vitaFindById==='function')return NV.__vitaFindById(root,String(id));
  var want=String(id),found=null;
  (function walk(n){
   var c=n.childNodes,i;
@@ -6235,7 +7030,7 @@ var DOC_MAKE={createElement:1,createTextNode:3,createComment:8,
 Object.keys(DOC_MAKE).forEach(function(m){
  P[m]=function(a){
   if(!isDoc(this))throw new TypeError(m+' is not a function');
-  var n=W.__vitaCreateIn?W.__vitaCreateIn(this,DOC_MAKE[m],
+  var n=NV.__vitaCreateIn?NV.__vitaCreateIn(this,DOC_MAKE[m],
    a===undefined?'':String(a)):null;
   return n||D[m](a);};});
 P.createElementNS=function(ns,t){return this.createElement(t);};
@@ -6352,7 +7147,7 @@ Object.defineProperty(P,'doctype',{configurable:true,
 
 W.DOMParser=W.DOMParser||function(){};
 W.DOMParser.prototype.parseFromString=function(str,type){
- var d=W.__vitaParseDocument?W.__vitaParseDocument(String(str)):null;
+ var d=NV.__vitaParseDocument?NV.__vitaParseDocument(String(str)):null;
  if(d)return d;
  /* the parser is not there: at least give back something with a body */
  var f=D.createElement('div');f.innerHTML=String(str);return f;};
@@ -6449,9 +7244,9 @@ function slotAssigned(slot){
  var name=slot.getAttribute('name')||'',root=slot.getRootNode(),
   host=shadowHost(root),first;
  if(!host)return [];
- if(W.__vsManualRoot&&W.__vsManualRoot(root))
+ if(NV.__vsManualRoot&&NV.__vsManualRoot(root))
   return (slot.__vsManual||[]).filter(function(n){
-   return n.parentNode===host&&W.__vsManualSlot(n,root)===slot;});
+   return n.parentNode===host&&NV.__vsManualSlot(n,root)===slot;});
  /* only the first slot of a name takes what has that name */
  first=root.querySelectorAll('slot').filter(function(s){
   return (s.getAttribute('name')||'')===name;})[0];
@@ -6573,12 +7368,12 @@ function moveFocus(el,caret){
  if(prev===el)return;
  focused=el;
  /* :focus, :focus-within and :focus-visible in the style sheets */
- if(W.__vitaSetFocus)try{W.__vitaSetFocus(el||null);}catch(x){}
+ if(NV.__vitaSetFocus)try{NV.__vitaSetFocus(el||null);}catch(x){}
  if(prev&&ceInDoc(prev)){
   focusEvent(prev,'blur',false,el);focusEvent(prev,'focusout',true,el);}
  if(el){
-  if(caret&&W.__vitaFocusControl&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'))
-   try{W.__vitaFocusControl(el);}catch(x){}
+  if(caret&&NV.__vitaFocusControl&&(el.tagName==='INPUT'||el.tagName==='TEXTAREA'))
+   try{NV.__vitaFocusControl(el);}catch(x){}
   focusEvent(el,'focus',false,prev);focusEvent(el,'focusin',true,prev);}}
 P.focus=function(){
  var el=this;
@@ -6645,8 +7440,8 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
     rendering update, and not from the layout before a change (VitaSurf).
     It reported a new target as zero sized and out of view, from before
     its first layout, and again once laid out. */
- var LS=W.__vitaLayoutState;
- try{delete W.__vitaLayoutState;}catch(e){}
+ var LS=NV.__vitaLayoutState;
+ try{delete NV.__vitaLayoutState;}catch(e){}
  function layoutState(){try{return LS?LS():[false,0];}catch(e){return [false,0];}}
  /* how long a first report waits for layout: a page whose rebuild waits
     for its loading to finish still hears, from the layout it has */
@@ -6668,14 +7463,14 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
  function rootRect(o){
   var s=viewport();
   if(o.root&&o.root.nodeType===1){
-   var b=__vitaBox(o.root,true);
+   var b=NV.__vitaBox(o.root,true);
    if(b)return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
   return {left:0,top:0,width:s[2],height:s[3]};}
 
  function rectOf(el){
   /* the layout as it is: the observer is told after layout, never
      the cause of one */
-  var b=__vitaBox(el,true);
+  var b=NV.__vitaBox(el,true);
   if(!b)return null;
   var s=viewport();
   return {left:b[0]-s[0],top:b[1]-s[1],width:b[2],height:b[3]};}
@@ -6752,12 +7547,7 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   if(typeof cb!=='function')
    throw new TypeError('IntersectionObserver needs a callback');
   opts=opts||{};
-  var th=opts.threshold;
-  if(th==null)th=[0];
-  if(typeof th==='number')th=[th];
-  th=Array.prototype.slice.call(th).map(Number).filter(function(n){
-   return n>=0&&n<=1;}).sort(function(a,b){return a-b;});
-  if(th.length===0)th=[0];
+  var th=thresholds(opts.threshold);
   this.root=opts.root||null;
   this.rootMargin=String(opts.rootMargin==null?'0px':opts.rootMargin);
   this.scrollMargin=String(opts.scrollMargin==null?'0px':opts.scrollMargin);
@@ -6766,13 +7556,39 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   this.trackVisibility=!!opts.trackVisibility;
   this.__cb=cb;this.__targets=[];this.__queue=[];
   this.__margin=parseMargin(this.rootMargin);
-  observers.push(this);}
+  this.__listed=false;}
+ /* the observers that watch something, which the checks walk; one that
+    watches nothing is not kept, so a page that makes one for every
+    component and drops it does not leave them all to be walked and
+    held for good (VitaSurf) */
+ function list(o){if(!o.__listed){o.__listed=true;observers.push(o);}}
+ function unlist(o){
+  if(!o.__listed||o.__targets.length)return;
+  var i=observers.indexOf(o);
+  if(i>=0)observers.splice(i,1);
+  o.__listed=false;}
+ /* the thresholds, sorted and in range, as a frozen array; worked out
+    once for each array a page passes, which a component library
+    passes to every observer it makes (VitaSurf) */
+ var TH=new WeakMap(),ZERO=Object.freeze([0]);
+ function thresholds(th){
+  var c,v;
+  if(th==null)return ZERO;
+  if(typeof th==='object'){
+   c=TH.get(th);
+   if(c&&c.n===th.length&&c.a===th[0]&&c.z===th[th.length-1])return c.v;}
+  v=(typeof th==='number'?[th]:Array.prototype.slice.call(th)).map(Number)
+   .filter(function(n){return n>=0&&n<=1;}).sort(function(a,b){return a-b;});
+  v=v.length?Object.freeze(v):ZERO;
+  if(typeof th==='object')TH.set(th,{n:th.length,a:th[0],z:th[th.length-1],v:v});
+  return v;}
 
  IntersectionObserver.prototype.observe=function(el){
   if(!el||el.nodeType!==1)return;
   for(var i=0;i<this.__targets.length;i++)
    if(this.__targets[i].el===el)return;
   this.__targets.push({el:el,step:-1,hit:null});
+  list(this);
   wake();
   /* the specification delivers a first record for a new target without
      waiting for anything to move, and a page that builds its list from
@@ -6786,10 +7602,10 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
 
  IntersectionObserver.prototype.unobserve=function(el){
   for(var i=0;i<this.__targets.length;i++){
-   if(this.__targets[i].el===el){this.__targets.splice(i,1);return;}}};
+   if(this.__targets[i].el===el){this.__targets.splice(i,1);unlist(this);return;}}};
 
  IntersectionObserver.prototype.disconnect=function(){
-  this.__targets.length=0;};
+  this.__targets.length=0;unlist(this);};
 
  IntersectionObserver.prototype.takeRecords=function(){
   var q=this.__queue;this.__queue=[];return q;};
@@ -6821,7 +7637,7 @@ Object.defineProperty(P,'shadowRootCustomElementRegistry',{configurable:true,
   /* body and textStream used to be defined here as getters returning
      null, which is worse than leaving them out: a page that tests for
      response.body stops taking its fallback and then calls getReader()
-     on null. streams.js gives Response a real ReadableStream. */});
+     on null. streams-use.js gives Response a real ReadableStream. */});
  if(W.Request){var rp=W.Request.prototype;
   ['destination','referrer','referrerPolicy','integrity','duplex'].forEach(function(k){
    if(!(k in rp))rp[k]='';});
@@ -6865,7 +7681,7 @@ function Path2D(){}
  'ellipse','rect','roundRect'].forEach(function(k){Path2D.prototype[k]=function(){};});
 /* The 2D context draws for real: it keeps the state a page sets, turns
    curves into line segments, applies its own transform, and hands the
-   points to the rasteriser behind __vitaCanvasPath, which fills the
+   points to the rasteriser behind NV.__vitaCanvasPath, which fills the
    bitmap the renderer paints for the element. Text, images and clipping
    are not drawn yet. */
 var CANVAS_NAMES={black:0x000000,silver:0xc0c0c0,gray:0x808080,grey:0x808080,
@@ -7027,17 +7843,17 @@ function CanvasRenderingContext2D(canvas){
    out.push(style.__stops[i][0],canvasColour(style.__stops[i][1],alpha));}
   return out;}
  function draw(c,mode){
-  if(!c.canvas||typeof __vitaCanvasPath!=='function')return;
+  if(!c.canvas||typeof NV.__vitaCanvasPath!=='function')return;
   var f=flatten(c);if(!f)return;
   var paint=paintOf(c,mode===2?c.strokeStyle:c.fillStyle,c.globalAlpha);
-  __vitaCanvasPath(c.canvas,f.pts,f.counts,paint,mode,
+  NV.__vitaCanvasPath(c.canvas,f.pts,f.counts,paint,mode,
    mode===2?Math.abs(c.lineWidth*scaleOf(c)):0);}
  C.fill=function(rule){draw(this,String(rule)==='evenodd'?1:0);};
  C.stroke=function(){draw(this,2);};
  C.clearRect=function(x,y,w,h){
-  if(!this.canvas||typeof __vitaCanvasClear!=='function')return;
+  if(!this.canvas||typeof NV.__vitaCanvasClear!=='function')return;
   var a=tx(this,x,y),b=tx(this,x+w,y+h);
-  __vitaCanvasClear(this.canvas,Math.min(a[0],b[0]),Math.min(a[1],b[1]),
+  NV.__vitaCanvasClear(this.canvas,Math.min(a[0],b[0]),Math.min(a[1],b[1]),
    Math.abs(b[0]-a[0]),Math.abs(b[1]-a[1]));};
  C.fillRect=function(x,y,w,h){var keep=this.__subs,kc=this.__cur,ks=this.__start;
   this.__subs=[];this.__cur=null;this.rect(x,y,w,h);draw(this,0);
@@ -7046,8 +7862,8 @@ function CanvasRenderingContext2D(canvas){
   this.__subs=[];this.__cur=null;this.rect(x,y,w,h);draw(this,2);
   this.__subs=keep;this.__cur=kc;this.__start=ks;};
  C.reset=function(){this.__m=[1,0,0,1,0,0];this.beginPath();
-  if(this.canvas&&typeof __vitaCanvasClear==='function')
-   __vitaCanvasClear(this.canvas,0,0,this.canvas.width||300,this.canvas.height||150);};
+  if(this.canvas&&typeof NV.__vitaCanvasClear==='function')
+   NV.__vitaCanvasClear(this.canvas,0,0,this.canvas.width||300,this.canvas.height||150);};
  /* the font shorthand, as much of it as a chart uses: an optional
     style and weight, then the size, then the families */
  function fontOf(c){
@@ -7074,9 +7890,9 @@ function CanvasRenderingContext2D(canvas){
   if(b==='bottom'||b==='ideographic')return 3;
   return 0;}
  function text(c,str,x,y,colour){
-  if(!c.canvas||typeof __vitaCanvasText!=='function')return;
+  if(!c.canvas||typeof NV.__vitaCanvasText!=='function')return;
   var f=fontOf(c),p=tx(c,x,y),sc=scaleOf(c);
-  __vitaCanvasText(c.canvas,p[0],p[1],String(str),colour,f.size*sc,
+  NV.__vitaCanvasText(c.canvas,p[0],p[1],String(str),colour,f.size*sc,
    f.family,f.weight,f.italic?1:0,alignOf(c),baselineOf(c));}
  C.fillText=function(str,x,y){text(this,str,x,y,
   paintOf(this,this.fillStyle,this.globalAlpha));};
@@ -7091,9 +7907,9 @@ function CanvasRenderingContext2D(canvas){
     square of the destination is handed over as one matrix, so a
     rotated or scaled context draws a rotated or scaled image. */
  C.drawImage=function(src,a,b,c,d,e,f,g,h){
-  if(!this.canvas||!src||typeof __vitaCanvasImage!=='function')return;
-  if(typeof __vitaCanvasImageSize!=='function')return;
-  var size=__vitaCanvasImageSize(src);
+  if(!this.canvas||!src||typeof NV.__vitaCanvasImage!=='function')return;
+  if(typeof NV.__vitaCanvasImageSize!=='function')return;
+  var size=NV.__vitaCanvasImageSize(src);
   if(!size)return;
   var sx=0,sy=0,sw=size[0],sh=size[1],dx,dy,dw,dh;
   if(arguments.length>=9){sx=+a;sy=+b;sw=+c;sh=+d;dx=+e;dy=+f;dw=+g;dh=+h;}
@@ -7105,33 +7921,33 @@ function CanvasRenderingContext2D(canvas){
      folded in, which is exactly the unit square the rasteriser wants */
   var mm=[m[0]*dw,m[1]*dw,m[2]*dh,m[3]*dh,
           m[0]*dx+m[2]*dy+m[4],m[1]*dx+m[3]*dy+m[5]];
-  __vitaCanvasImage(this.canvas,src,sx,sy,sw,sh,mm,this.globalAlpha,
+  NV.__vitaCanvasImage(this.canvas,src,sx,sy,sw,sh,mm,this.globalAlpha,
    this.imageSmoothingEnabled?1:0);};
  C.getImageData=function(x,y,w,h){
   x=Math.floor(+x||0);y=Math.floor(+y||0);
   w=Math.floor(+w||0);h=Math.floor(+h||0);
   if(w<0){x+=w;w=-w;} if(h<0){y+=h;h=-h;}
   var d=new ImageData(w,h);
-  if(!this.canvas||w===0||h===0||typeof __vitaCanvasRead!=='function')return d;
-  var buf=__vitaCanvasRead(this.canvas,x,y,w,h);
+  if(!this.canvas||w===0||h===0||typeof NV.__vitaCanvasRead!=='function')return d;
+  var buf=NV.__vitaCanvasRead(this.canvas,x,y,w,h);
   if(buf)d.data=new Uint8ClampedArray(buf);
   return d;};
  C.putImageData=function(d,dx,dy,sx,sy,sw,sh){
-  if(!this.canvas||!d||!d.data||typeof __vitaCanvasWrite!=='function')return;
+  if(!this.canvas||!d||!d.data||typeof NV.__vitaCanvasWrite!=='function')return;
   dx=Math.floor(+dx||0);dy=Math.floor(+dy||0);
   if(arguments.length<7){sx=0;sy=0;sw=d.width;sh=d.height;}
   else{sx=Math.floor(+sx||0);sy=Math.floor(+sy||0);
    sw=Math.floor(+sw||0);sh=Math.floor(+sh||0);
    if(sw<0){sx+=sw;sw=-sw;} if(sh<0){sy+=sh;sh=-sh;}}
-  __vitaCanvasWrite(this.canvas,d.data,d.width,d.height,
+  NV.__vitaCanvasWrite(this.canvas,d.data,d.width,d.height,
    sx,sy,sw,sh,dx+sx,dy+sy);};
  C.isPointInPath=C.isPointInStroke=function(){return false;};
  C.getLineDash=function(){return [];};
  /* the width the glyphs actually take, so text a page centres or
     boxes it sizes by measuring lands where it should */
  C.measureText=function(t){var f=fontOf(this);
-  if(typeof __vitaCanvasMeasure==='function'){
-   return new TextMetrics(__vitaCanvasMeasure(String(t),f.size,f.family,
+  if(typeof NV.__vitaCanvasMeasure==='function'){
+   return new TextMetrics(NV.__vitaCanvasMeasure(String(t),f.size,f.family,
     f.weight,f.italic?1:0));}
   return new TextMetrics(String(t).length*f.size*0.5);};
  C.createLinearGradient=function(x0,y0,x1,y1){
@@ -7155,12 +7971,12 @@ W.ImageBitmapRenderingContext=function(){this.transferFromImageBitmap=function()
 P.getContext=function(kind){
  if(this.tagName!=='CANVAS')return null;
  kind=String(kind||'2d');
- if(kind==='bitmaprenderer')return new W.ImageBitmapRenderingContext();
+ if(kind==='bitmaprenderer')return new (NV.__vitaOrig.ImageBitmapRenderingContext||W.ImageBitmapRenderingContext)();
  /* No WebGL: a page that asks for it must take its fallback path, and a
     context that answers every call while drawing nothing would keep it
     from ever doing that. */
  if(kind.indexOf('webgl')===0||kind==='webgpu'){
-  if(typeof __vitaGap==='function')__vitaGap('canvas.getContext('+kind+')');
+  if(typeof NV.__vitaGap==='function')NV.__vitaGap('canvas.getContext('+kind+')');
   return null;}
  if(!this.__ctx2d)Object.defineProperty(this,'__ctx2d',
   {configurable:true,writable:true,value:new CanvasRenderingContext2D(this)});
@@ -7176,7 +7992,7 @@ P.getSVGDocument=function(){return null;};
 W.OffscreenCanvas=function(w,h){this.width=w|0;this.height=h|0;
  this.getContext=function(k){return String(k)==='2d'?new CanvasRenderingContext2D(this):null;};
  this.convertToBlob=function(){return Promise.resolve(null);};
- this.transferToImageBitmap=function(){return new W.ImageBitmap();};};
+ this.transferToImageBitmap=function(){return new (NV.__vitaOrig.ImageBitmap||W.ImageBitmap)();};};
 
 /* --- files --------------------------------------------------------------
  * A blob holds its text, so FileReader reads it back and fetch resolves
@@ -7191,12 +8007,12 @@ var blobURLs={},blobSeq=0;
  * makes its worker's object URL with one window's URL and starts it with
  * another's Worker, was told "Failed to load the worker's script". The
  * table is the topmost same-origin window's. */
-try{Object.defineProperty(W,'__vitaBlobURLs',{value:blobURLs});}catch(e){}
+try{Object.defineProperty(NV,'__vitaBlobURLs',{value:blobURLs});}catch(e){}
 function blobTable(){
  var w=W,p,t;
  try{
   for(;;){p=w.parent;if(!p||p===w||p.origin!==W.origin)break;w=p;}
-  t=w.__vitaBlobURLs;}catch(e){}
+  t=(NV.__vitaNativesOf(w)||{}).__vitaBlobURLs;}catch(e){}
  return t||blobURLs;}
 /* A blob holds bytes. It used to hold a string, so a blob made from a
    buffer was decoded as text on the way in and re-encoded on the way
@@ -7230,7 +8046,7 @@ Blob.prototype.slice=function(a,b,type){
  a=a===undefined?0:(a<0?Math.max(n+a,0):Math.min(a,n));
  b=b===undefined?n:(b<0?Math.max(n+b,0):Math.min(b,n));
  return new Blob([u.subarray(a,Math.max(a,b))],{type:type||''});};
-/* Blob.prototype.stream is a real ReadableStream; see streams.js. */
+/* Blob.prototype.stream is a real ReadableStream; see streams-use.js. */
 Object.defineProperty(Blob.prototype,Symbol.toStringTag,{configurable:true,value:'Blob'});
 W.Blob=Blob;
 function File(parts,name,opts){Blob.call(this,parts,opts);
@@ -7287,7 +8103,7 @@ URL.createObjectURL=function(o){
 URL.revokeObjectURL=function(u){delete blobTable()[String(u)];};
 /* A module imported from an object URL or a data: URL has nothing to
    fetch: qjs.c asks here for its text, or null if there is none. */
-W.__vitaLocalModule=function(u){
+NV.__vitaLocalModule=function(u){
  u=String(u);
  if(u.indexOf('blob:')===0){
   var b=blobTable()[u];
@@ -7339,7 +8155,7 @@ Object.defineProperty(P,'control',{configurable:true,get:function(){
 Object.defineProperty(P,'areas',{configurable:true,get:function(){
  return this.tagName==='MAP'?this.getElementsByTagName('area'):undefined;}});
 ['videoWidth','videoHeight'].forEach(function(k,n){Object.defineProperty(P,k,{configurable:true,
- get:function(){var b=__vitaBox(this);return b?b[2+n]:0;}});});
+ get:function(){var b=NV.__vitaBox(this);return b?b[2+n]:0;}});});
 Object.defineProperty(P,'track',{configurable:true,get:function(){
  if(this.tagName!=='TRACK')return undefined;
  return {kind:this.kind,label:this.label,language:this.srclang,mode:'disabled',
@@ -7384,7 +8200,7 @@ W.CSSStyleRule.prototype.styleMap=null;
  'TextTrackList','AudioTrack','AudioTrackList','VideoTrack','VideoTrackList','AnimationEffect',
  'KeyframeEffect','DocumentTimeline','ElementInternals','CustomElementRegistry', 'IntersectionObserverEntry','ResizeObserverEntry','ResizeObserverSize','CaretPosition',
  'CSSGroupingRule','CSSImportRule','CSSPageRule','CSSNamespaceRule','StylePropertyMap',
- 'StylePropertyMapReadOnly','PerformanceNavigation','PerformanceTiming','XPathExpression',
+ 'StylePropertyMapReadOnly','XPathExpression',
  'XPathNSResolver','DataTransferItem','DataTransferItemList','NavigationHistoryEntry']
  .forEach(function(n){if(W[n]===undefined)W[n]=function(){};});
 ['CommandEvent','PageRevealEvent','PageSwapEvent','TrackEvent','TextEvent'].forEach(function(n){
@@ -7408,16 +8224,9 @@ W.TextEncoder.prototype.encodeInto=function(s,dest){
 Object.defineProperty(W.XMLHttpRequest.prototype,'responseXML',{configurable:true,
  get:function(){if(!this.responseText)return null;
   var d=D.createElement('div');d.innerHTML=this.responseText;return d;}});
-if(W.performance&&!W.performance.toJSON)W.performance.toJSON=function(){
- return {timeOrigin:0,timing:this.timing,navigation:this.navigation};};
 W.RadioNodeList=function(){};
 Object.defineProperty(W.RadioNodeList.prototype,'value',{configurable:true,
  get:function(){return '';},set:function(){}});
-W.DocumentType=function(){this.name='html';this.publicId='';this.systemId='';
- this.nodeType=10;this.nodeName='html';};
-['before','after','replaceWith','remove'].forEach(function(k){
- W.DocumentType.prototype[k]=function(){};});
-Object.defineProperty(D,'doctype',{configurable:true,get:function(){return new W.DocumentType();}});
 if(!W.CSS)W.CSS={};
 W.CSS.escape=W.CSS.escape||function(s){return String(s).replace(/([^\w-])/g,'\\$1');};
 /* CSS.supports(property, value) and CSS.supports(condition), answered
@@ -7426,14 +8235,14 @@ W.CSS.escape=W.CSS.escape||function(s){return String(s).replace(/([^\w-])/g,'\\$
    spec says, so "display: grid" works as well as "(display: grid)". */
 W.CSS.supports=function(a,b){
  if(arguments.length===0)throw new TypeError("CSS.supports: at least 1 argument required");
- if(typeof __vitaCSSSupports!=='function')return false;
+ if(typeof NV.__vitaCSSSupports!=='function')return false;
  if(arguments.length>=2){
   var p=String(a),v=String(b);
   /* a custom property takes any value that is not empty */
   if(/^--/.test(p))return /\S/.test(v);
-  return __vitaCSSSupports('('+p+':'+v+')');}
+  return NV.__vitaCSSSupports('('+p+':'+v+')');}
  var c=String(a);
- return __vitaCSSSupports(c)||__vitaCSSSupports('('+c+')');};
+ return NV.__vitaCSSSupports(c)||NV.__vitaCSSSupports('('+c+')');};
 /* fetch of an object URL comes from the table, not from the network. */
 (function(){var real=W.fetch;
  W.fetch=function(input,init){
@@ -7450,8 +8259,8 @@ W.CSS.supports=function(a,b){
  * has one from a callback or a collection. They carry the members the
  * specification lists and the values this port can honestly give.
  */
-['webkitanimationstart','webkitanimationend','webkitanimationiteration','webkittransitionend']
- .forEach(function(t){defineHandler(P,t);defineHandler(D,t);defineHandler(W,t);});
+(function(t){defineHandlers(P,t);defineHandlers(D,t);defineHandlers(W,t);})(
+ ['webkitanimationstart','webkitanimationend','webkitanimationiteration','webkittransitionend']);
 reflectLong([['headingReset','headingreset',0]]);
 function iface(name,proto){
  var C=W[name];
@@ -7527,15 +8336,6 @@ W.NodeFilter.acceptNode=function(){return 1;};
 W.CustomElementRegistry=function(){};
 if(W.customElements&&!W.customElements.initialize)W.customElements.initialize=function(){};
 if(W.customElements)Object.setPrototypeOf(W.customElements,W.CustomElementRegistry.prototype);
-/* The timing objects performance already hands out. */
-W.PerformanceTiming=function(){};
-if(W.performance&&W.performance.timing){
- W.performance.timing.toJSON=function(){var o={},k;for(k in this)if(typeof this[k]!=='function')o[k]=this[k];return o;};
- Object.setPrototypeOf(W.performance.timing,W.PerformanceTiming.prototype);}
-W.PerformanceNavigation=function(){};
-if(W.performance&&W.performance.navigation){
- W.performance.navigation.toJSON=function(){return {type:this.type,redirectCount:this.redirectCount};};
- Object.setPrototypeOf(W.performance.navigation,W.PerformanceNavigation.prototype);}
 /* The navigation object gains the rest of its surface. */
 (function(){var n=W.navigation;if(!n)return;
  n.activation=null;n.transition=null;
@@ -7552,7 +8352,7 @@ if(W.OffscreenCanvas){W.OffscreenCanvas.prototype.oncontextlost=null;
 CanvasRenderingContext2D.prototype.lang='inherit';
 CanvasRenderingContext2D.prototype.isContextLost=function(){return false;};
 ImageData.prototype.pixelFormat='rgba-unorm8';
-/* Blob.prototype.textStream is a real ReadableStream; see streams.js. */
+/* Blob.prototype.textStream is a real ReadableStream; see streams-use.js. */
 /* The rest of the console. Only log, warn, error, info and debug came
  * from the bindings, and a page that calls one of the others got
  * "not a function" -- claude.ai opens its entry chunk with
@@ -7562,90 +8362,34 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
 (function(){
  var C=W.console;
  if(!C)return;
- /* What an argument says, rather than what String() makes of it.
-    An object goes to the log as "[object Object]", which is how
-    claude.ai's "IndexedDB state read rejected [object Object]" told us
-    nothing at all about which error it had caught. A browser shows the
-    contents; this shows enough of them to name the fault. */
- function describe(v,depth){
-  var t=typeof v;
-  if(v===null||v===undefined||t==='string'||t==='number'||t==='boolean')
-   return String(v);
-  if(t==='function')return 'function '+(v.name||'');
-  if(t==='symbol')return String(v);
-  try{
-   if(v instanceof Error||
-      (v.name!==undefined&&v.message!==undefined&&typeof v.stack==='string')){
-    var head=(v.name||'Error')+': '+(v.message||'');
-    if(v.stack){var f=String(v.stack).split('\n')[1];
-     if(f)head+=' | at'+f.replace(/^\s*at/,'');}
-    return head;}
-   if(v.name!==undefined&&v.message!==undefined)
-    return String(v.name)+': '+String(v.message);
-  }catch(e){}
-  if(depth>2)return Array.isArray(v)?'[...]':'{...}';
-  try{
-   if(Array.isArray(v)){
-    var parts=v.slice(0,8).map(function(x){return describe(x,depth+1);});
-    if(v.length>8)parts.push('... '+v.length+' in all');
-    return '['+parts.join(', ')+']';}
-   if(v instanceof Date)return v.toISOString();
-   var keys=Object.keys(v),body=keys.slice(0,8).map(function(k){
-    return k+': '+describe(v[k],depth+1);});
-   if(keys.length>8)body.push('... '+keys.length+' keys');
-   var str=String(v);
-   if(str!=='[object Object]'&&body.length===0)return str;
-   return '{'+body.join(', ')+'}';
-  }catch(e){return '[object]';}
- }
- ['log','warn','error','info','debug'].forEach(function(k){
-  var real=C[k];
-  if(typeof real!=='function')return;
-  C[k]=function(){
-   var a=Array.prototype.map.call(arguments,function(v){
-    return typeof v==='string'?v:describe(v,0);});
-   return real.apply(C,a);};});
- function out(kind,args){
-  try{(C[kind]||C.log).apply(C,args);}catch(e){}}
+ /* log, info, debug, warn, error, assert, trace, group, dir and table
+    are native (qjs.c): a browser with its developer tools closed never
+    looks at what is logged, and a page that logs an object with a
+    toString, a getter or a proxy of its own and sees it called takes
+    the tools to be open. These kept a description in JavaScript that
+    called String(), Object.keys, v.message and v.stack for every
+    argument. What is left here touches nothing of the page's but the
+    label, which the console standard converts as a browser does. */
+ var log=C.log,now=Date.now;
  function def(n,f){if(typeof C[n]!=='function')C[n]=f;}
- def('assert',function(ok){
-  if(ok)return;
-  var a=Array.prototype.slice.call(arguments,1);
-  a.unshift('Assertion failed:');
-  out('error',a);});
- def('trace',function(){
-  var a=Array.prototype.slice.call(arguments);
-  a.unshift('console.trace');
-  try{a.push('\n'+(new Error()).stack);}catch(e){}
-  out('log',a);});
- var groups=0;
- function group(){
-  out('log',Array.prototype.slice.call(arguments));
-  groups++;}
- def('group',group);
- def('groupCollapsed',group);
- def('groupEnd',function(){if(groups>0)groups--;});
- def('dir',function(v){out('log',[v]);});
- def('dirxml',function(v){out('log',[v]);});
- def('table',function(v){out('log',[v]);});
- var timers={};
- def('time',function(label){timers[String(label===undefined?'default':label)]=Date.now();});
+ def('groupEnd',function(){});
+ var timers=Object.create(null),counts=Object.create(null);
+ function key(label){return label===undefined?'default':`${label}`;}
+ def('time',function(label){timers[key(label)]=now();});
  def('timeLog',function(label){
-  var k=String(label===undefined?'default':label);
+  var k=key(label);
   if(!(k in timers))return;
-  out('log',[k+': '+(Date.now()-timers[k])+'ms']);});
+  log(k+': '+(now()-timers[k])+'ms');});
  def('timeEnd',function(label){
-  var k=String(label===undefined?'default':label);
+  var k=key(label);
   if(!(k in timers))return;
-  out('log',[k+': '+(Date.now()-timers[k])+'ms']);
+  log(k+': '+(now()-timers[k])+'ms');
   delete timers[k];});
- var counts={};
  def('count',function(label){
-  var k=String(label===undefined?'default':label);
+  var k=key(label);
   counts[k]=(counts[k]||0)+1;
-  out('log',[k+': '+counts[k]]);});
- def('countReset',function(label){
-  delete counts[String(label===undefined?'default':label)];});
+  log(k+': '+counts[k]);});
+ def('countReset',function(label){delete counts[key(label)];});
  def('clear',function(){});
  def('timeStamp',function(){});
  def('profile',function(){});
@@ -7722,41 +8466,6 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
 })();
 
 (function(){
- /* IndexedDB. There is no store behind this, so every request fails --
-    but it fails the way a request fails, asynchronously and through
-    onerror, so a page that opens a database and waits is told no
-    instead of waiting for ever. Pages that keep their state here fall
-    back to memory, which is what claude.ai already reports doing. */
- function Request(){
-  this.readyState='pending';this.result=undefined;
-  this.error=new DOMException('IndexedDB is not available here.',
-   'UnknownError');
-  this.source=null;this.transaction=null;
-  this.onsuccess=null;this.onerror=null;this.onblocked=null;
-  this.onupgradeneeded=null;
-  var self=this;
-  setTimeout(function(){
-   self.readyState='done';
-   var e={type:'error',target:self,currentTarget:self,
-    preventDefault:function(){},stopPropagation:function(){}};
-   if(typeof self.onerror==='function'){try{self.onerror(e);}catch(x){}}
-  },0);}
- Request.prototype.addEventListener=function(t,f){
-  if(t==='error')this.onerror=f;
-  else if(t==='success')this.onsuccess=f;};
- Request.prototype.removeEventListener=function(){};
- Request.prototype.dispatchEvent=function(){return true;};
- function IDBFactory(){}
- IDBFactory.prototype.open=function(){return new Request();};
- IDBFactory.prototype.deleteDatabase=function(){return new Request();};
- IDBFactory.prototype.databases=function(){return Promise.resolve([]);};
- IDBFactory.prototype.cmp=function(a,b){return a<b?-1:a>b?1:0;};
- W.IDBFactory=IDBFactory;
- W.IDBRequest=Request;
- W.indexedDB=new IDBFactory();
-})();
-
-(function(){
  var n=W.navigator;
  if(!n)return;
  /* StorageManager: an estimate a page can read, and no persistence. */
@@ -7767,19 +8476,184 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
   persisted:function(){return Promise.resolve(false);},
   getDirectory:function(){return Promise.reject(new DOMException(
    'No origin private file system here.','SecurityError'));}};
- /* Clipboard: there is no clipboard to reach, so it refuses rather
-    than pretending to have copied something. */
- if(!n.clipboard)n.clipboard={
-  read:function(){return Promise.reject(new DOMException(
-   'The clipboard is not available.','NotAllowedError'));},
-  readText:function(){return Promise.reject(new DOMException(
-   'The clipboard is not available.','NotAllowedError'));},
-  write:function(){return Promise.reject(new DOMException(
-   'The clipboard is not available.','NotAllowedError'));},
-  writeText:function(){return Promise.reject(new DOMException(
-   'The clipboard is not available.','NotAllowedError'));},
-  addEventListener:function(){},removeEventListener:function(){},
-  dispatchEvent:function(){return true;}};
+})();
+/* --- the clipboard and permissions (VitaSurf) ---------------------------
+ * The Async Clipboard API over the browser's clipboard, which copying a
+ * selection uses and the console's own clipboard mirrors (vita/platform/
+ * vita_clipboard.c): a page may write text to it, as a focused page may
+ * in Chrome, and a ClipboardItem's text/plain, or the text of its
+ * text/html, is what goes. Reading it is asked of the user in a browser,
+ * and there is no asking here, so a read is refused, and the permission
+ * says so. The Permissions API answers from what this browser has:
+ * clipboard-write is granted, notifications are what Notification says,
+ * and what it cannot do at all is denied. */
+(function(){
+ var n=W.navigator,WRITE=NV.__vitaClipboardWrite,ETP=EventTarget.prototype;
+ if(!n)return;
+ function illegal(){throw new TypeError('Illegal constructor');}
+ function rejectWith(e){return Promise.reject(e);}
+ function failed(op,iface,msg,name){
+  var text="Failed to execute '"+op+"' on '"+iface+"': "+msg;
+  return name?new DOMException(text,name):new TypeError(text);}
+ function handlerProp(proto,ST,k){
+  Object.defineProperty(proto,k,{configurable:true,enumerable:true,
+   get:function(){var s=ST.get(this);if(!s)throw new TypeError('Illegal invocation');return s[k];},
+   set:function(f){var s=ST.get(this);if(!s)throw new TypeError('Illegal invocation');
+    s[k]=typeof f==='function'||(f&&typeof f==='object')?f:null;}});}
+
+ /* Permissions */
+ var NAMES=('accelerometer ambient-light-sensor background-fetch background-sync '+
+  'camera captured-surface-control clipboard-read clipboard-write display-capture '+
+  'fullscreen geolocation gyroscope idle-detection keyboard-lock local-fonts '+
+  'magnetometer microphone midi nfc notifications payment-handler '+
+  'periodic-background-sync persistent-storage pointer-lock push screen-wake-lock '+
+  'speaker-selection storage-access system-wake-lock top-level-storage-access '+
+  'window-management').split(' ');
+ function stateOf(name){
+  switch(name){
+  case 'clipboard-write':return typeof WRITE==='function'?'granted':'denied';
+  case 'notifications':case 'push':
+   var p=W.Notification&&W.Notification.permission;
+   return p==='granted'?'granted':p==='default'?'prompt':'denied';
+  case 'geolocation':return n.geolocation?'prompt':'denied';
+  default:return 'denied';}}
+ var PS=new WeakMap();
+ function PermissionStatus(){illegal();}
+ PermissionStatus.prototype=Object.create(ETP);
+ PermissionStatus.prototype.constructor=PermissionStatus;
+ ['state','name'].forEach(function(k){
+  Object.defineProperty(PermissionStatus.prototype,k,{configurable:true,enumerable:true,
+   get:function(){var s=PS.get(this);if(!s)throw new TypeError('Illegal invocation');return s[k];}});});
+ handlerProp(PermissionStatus.prototype,PS,'onchange');
+ var PERMS;
+ function Permissions(){illegal();}
+ Permissions.prototype.query=function(desc){
+  if(this!==PERMS)return rejectWith(new TypeError('Illegal invocation'));
+  if(arguments.length<1)return rejectWith(failed('query','Permissions',
+   '1 argument required, but only 0 present.'));
+  if(desc===null||(typeof desc!=='object'&&typeof desc!=='function'))
+   return rejectWith(failed('query','Permissions',
+    "The provided value is not of type 'PermissionDescriptor'."));
+  var name=desc.name;
+  if(name===undefined)return rejectWith(failed('query','Permissions',
+   "Failed to read the 'name' property from 'PermissionDescriptor': Required "+
+   'member is undefined.'));
+  name=String(name);
+  if(NAMES.indexOf(name)<0)return rejectWith(failed('query','Permissions',
+   "Failed to read the 'name' property from 'PermissionDescriptor': The "+
+   "provided value '"+name+"' is not a valid enum value of type PermissionName."));
+  if(name==='push'&&!desc.userVisibleOnly)return rejectWith(failed('query',
+   'Permissions',"Push Permission without userVisibleOnly:true isn't supported yet.",
+   'NotSupportedError'));
+  var st=Object.create(PermissionStatus.prototype);
+  PS.set(st,{name:name,state:stateOf(name),onchange:null});
+  return Promise.resolve(st);};
+ PERMS=Object.create(Permissions.prototype);
+ W.Permissions=Permissions;W.PermissionStatus=PermissionStatus;
+ n.permissions=PERMS;
+
+ /* ClipboardItem */
+ var CI=new WeakMap(),STYLES=['unspecified','inline','attachment'];
+ function ClipboardItem(items,options){
+  if(!(this instanceof ClipboardItem))throw new TypeError(
+   "Failed to construct 'ClipboardItem': Please use the 'new' operator, this "+
+   'DOM object constructor cannot be called as a function.');
+  if(arguments.length<1)throw new TypeError("Failed to construct "+
+   "'ClipboardItem': 1 argument required, but only 0 present.");
+  if(items===null||(typeof items!=='object'&&typeof items!=='function'))
+   throw new TypeError("Failed to construct 'ClipboardItem': The provided "+
+    "value is not of type 'record<DOMString, (Blob or DOMString or "+
+    "Promise<(Blob or DOMString)>)>'.");
+  var types=Object.keys(items),data={},style='unspecified';
+  if(!types.length)throw new TypeError("Failed to construct 'ClipboardItem': "+
+   'Empty dictionary argument');
+  types.forEach(function(t){data[t]=items[t];});
+  if(options!==undefined&&options!==null&&options.presentationStyle!==undefined){
+   style=String(options.presentationStyle);
+   if(STYLES.indexOf(style)<0)throw new TypeError("Failed to construct "+
+    "'ClipboardItem': Failed to read the 'presentationStyle' property from "+
+    "'ClipboardItemOptions': The provided value '"+style+"' is not a valid "+
+    "enum value of type PresentationStyle.");}
+  CI.set(this,{types:Object.freeze(types.slice()),data:data,style:style});}
+ function ci(o){var s=CI.get(o);if(!s)throw new TypeError('Illegal invocation');return s;}
+ Object.defineProperties(ClipboardItem.prototype,{
+  types:{configurable:true,enumerable:true,get:function(){return ci(this).types;}},
+  presentationStyle:{configurable:true,enumerable:true,get:function(){return ci(this).style;}}});
+ ClipboardItem.prototype.getType=function(type){
+  var s;
+  try{s=ci(this);}catch(e){return rejectWith(e);}
+  type=String(type);
+  if(s.types.indexOf(type)<0)return rejectWith(failed('getType','ClipboardItem',
+   'The type was not found','NotFoundError'));
+  return Promise.resolve(s.data[type]).then(function(v){
+   return v instanceof W.Blob?v:new W.Blob([String(v)],{type:type});});};
+ /* what can be written: this clipboard holds text */
+ ClipboardItem.supports=function(type){
+  if(arguments.length<1)throw new TypeError("Failed to execute 'supports' on "+
+   "'ClipboardItem': 1 argument required, but only 0 present.");
+  type=String(type);
+  return type==='text/plain'||type==='text/html';};
+ W.ClipboardItem=ClipboardItem;
+
+ /* Clipboard */
+ var CLIP;
+ function Clipboard(){illegal();}
+ Clipboard.prototype=Object.create(ETP);
+ Clipboard.prototype.constructor=Clipboard;
+ function mine(o,op){
+  if(o!==CLIP)throw new TypeError('Illegal invocation');
+  if(typeof WRITE!=='function')throw failed(op,'Clipboard',
+   'Write permission denied.','NotAllowedError');}
+ function put(text){
+  if(!WRITE(String(text)))throw new DOMException('Write permission denied.',
+   'NotAllowedError');}
+ Clipboard.prototype.readText=function(){
+  if(this!==CLIP)return rejectWith(new TypeError('Illegal invocation'));
+  return rejectWith(failed('readText','Clipboard','Read permission denied.',
+   'NotAllowedError'));};
+ Clipboard.prototype.read=function(){
+  if(this!==CLIP)return rejectWith(new TypeError('Illegal invocation'));
+  return rejectWith(failed('read','Clipboard','Read permission denied.',
+   'NotAllowedError'));};
+ Clipboard.prototype.writeText=function(data){
+  try{
+   mine(this,'writeText');
+   if(arguments.length<1)throw failed('writeText','Clipboard',
+    '1 argument required, but only 0 present.');
+   put(String(data));
+  }catch(e){return rejectWith(e);}
+  return Promise.resolve();};
+ function textOfHTML(html){
+  var t=D.createElement('template');
+  t.innerHTML=html;
+  return t.content?t.content.textContent:t.textContent;}
+ Clipboard.prototype.write=function(items){
+  var list,item,s,i;
+  try{
+   mine(this,'write');
+   if(arguments.length<1)throw failed('write','Clipboard',
+    '1 argument required, but only 0 present.');
+   if(items===null||typeof items!=='object'||typeof items[Symbol.iterator]!=='function')
+    throw failed('write','Clipboard',
+     'The provided value cannot be converted to a sequence.');
+   list=Array.from(items);
+   for(i=0;i<list.length;i++)if(!CI.get(list[i]))throw failed('write','Clipboard',
+    "Failed to convert value to 'ClipboardItem'.");
+   if(list.length>1)throw failed('write','Clipboard',
+    'Support for multiple ClipboardItems is not implemented.','NotAllowedError');
+   if(!list.length){put('');return Promise.resolve();}
+   item=list[0];s=CI.get(item);
+   for(i=0;i<s.types.length;i++)if(!ClipboardItem.supports(s.types[i]))
+    throw failed('write','Clipboard','Type '+s.types[i]+' not supported on write.',
+     'NotAllowedError');
+  }catch(e){return rejectWith(e);}
+  var plain=s.types.indexOf('text/plain')>=0;
+  return item.getType(plain?'text/plain':'text/html').then(function(b){
+   return b.text();}).then(function(text){
+   put(plain?text:textOfHTML(text));});};
+ CLIP=Object.create(Clipboard.prototype);
+ W.Clipboard=Clipboard;
+ n.clipboard=CLIP;
 })();
 /* --- gamepads, battery, vibration, entry types (VitaSurf) ---------------
  * The second batch. The Vita has buttons and a battery, but neither is
@@ -7924,12 +8798,9 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
  var KEEP=' isConnected children parentElement firstElementChild '+
   'lastElementChild childNodes parentNode firstChild lastChild nextSibling '+
   'previousSibling nodeType nodeName tagName attributes classList ownerDocument ';
- Object.getOwnPropertyNames(P).forEach(function(k){
-  if(KEEP.indexOf(' '+k+' ')>=0)return;
-  var d=Object.getOwnPropertyDescriptor(P,k);
-  if(!d||!d.get||d.set||!d.configurable)return;
-  Object.defineProperty(P,k,{configurable:true,enumerable:d.enumerable,get:d.get,
-   set:function(v){shadowProp(this,k,v);}});});
+ /* each setter is made in C and passes its name to this
+    (__vitaAddSetters, vita/js/ifaces.c) */
+ NV.__vitaAddSetters(P,KEEP,function(k,v){shadowProp(this,k,v);});
 })();
 
 /* --- what the browser comparison found ---------------------------------
@@ -8081,14 +8952,14 @@ function describeThrown(v){
 }
 /* kept here and not left on window, where no browser has it */
 var SRC_EXCERPT=null;
-try{SRC_EXCERPT=W.__vitaSourceExcerpt||null;delete W.__vitaSourceExcerpt;}catch(e){}
+try{SRC_EXCERPT=NV.__vitaSourceExcerpt||null;delete NV.__vitaSourceExcerpt;}catch(e){}
 /* The properties a page read on window, navigator, document, screen,
    location, history and performance that are not here (VitaSurf): an
    uncaught error's report lists the last of them, which is how a log
    says what a page wanted that this browser lacks. */
 var MISSES=null;
 try{
- MISSES=W.__vitaMisses||null;
+ MISSES=NV.__vitaMisses||null;
  (function(watch){
   if(!watch)return;
   try{watch(W,'window');}catch(e){}
@@ -8097,11 +8968,12 @@ try{
   try{watch(W.screen,'screen');}catch(e){}
   try{watch(W.location,'location');}catch(e){}
   try{watch(W.history,'history');}catch(e){}
-  try{watch(W.performance,'performance');}catch(e){}
- })(W.__vitaWatchMisses);
- delete W.__vitaMisses;delete W.__vitaWatchMisses;
+  /* performance is made later, in performance.js */
+  NV.__vitaWatchPerformance=function(o){try{watch(o,'performance');}catch(e){}};
+ })(NV.__vitaWatchMisses);
+ delete NV.__vitaMisses;delete NV.__vitaWatchMisses;
 }catch(e){}
-W.__vitaReportError=function(err,where){
+NV.__vitaReportError=function(err,where){
  var msg='';
  try{msg=(err&&err.message)?String(err.message):String(err);}catch(e){msg='Script error.';}
  var file=where?String(where):String(location.href),line=0,col=0;
@@ -8124,7 +8996,7 @@ W.__vitaReportError=function(err,where){
       the page has dealt with it. */
    if(W.onerror(msg,file,line,col,err)===true)handled=true;}
  }catch(e4){}
- try{__vitaDispatch(null,ev);}catch(e5){}
+ try{NV.__vitaDispatch(null,ev);}catch(e5){}
  if(!handled&&!ev.defaultPrevented){
   /* Where the caller said it came from, when that is a description
      rather than a URL. The stack frame below overwrites `file', so a
@@ -8156,7 +9028,7 @@ W.__vitaReportError=function(err,where){
  * is not an unhandled rejection, it is a promise whose .catch() has not
  * been attached. Frameworks reject first and attach in the same tick all
  * the time, and reporting on the spot called every one of them an error.
- * qjs.c calls __vitaRejectionHandled() when a handler does turn up,
+ * qjs.c calls NV.__vitaRejectionHandled() when a handler does turn up,
  * which takes it off the list before the list is read. */
 var vitaPendingRejections=[];
 function flushRejections(){
@@ -8170,7 +9042,7 @@ function flushRejections(){
    defaultPrevented:false,preventDefault:function(){this.defaultPrevented=true;}};}
   uaEvent(ev);
   try{if(typeof W.onunhandledrejection==='function')W.onunhandledrejection(ev);}catch(e2){}
-  try{__vitaDispatch(null,ev);}catch(e3){}
+  try{NV.__vitaDispatch(null,ev);}catch(e3){}
   /* Say so, as a browser does. A page whose async work fails and whose
      framework swallows the rejection into an error boundary showed
      nothing at all in the log: the screen said something went wrong and
@@ -8179,11 +9051,11 @@ function flushRejections(){
    try{console.error('unhandled rejection: '+describeThrown(entry.r));}catch(e4){}}
  });
 }
-W.__vitaReportRejection=function(reason,promise){
+NV.__vitaReportRejection=function(reason,promise){
  vitaPendingRejections.push({p:promise,r:reason});
  if(vitaPendingRejections.length===1)setTimeout(flushRejections,0);
  return false;};
-W.__vitaRejectionHandled=function(promise){
+NV.__vitaRejectionHandled=function(promise){
  for(var i=0;i<vitaPendingRejections.length;i++){
   if(vitaPendingRejections[i].p===promise){
    vitaPendingRejections.splice(i,1);
@@ -8209,7 +9081,7 @@ function MutationRecord(type,target){
 W.MutationRecord=MutationRecord;
 
 var MOlist=[],MOqueued=false,MOid=0;
-/* watch id -> [observer, watch], for the ids qjs.c hands __vitaMutation */
+/* watch id -> [observer, watch], for the ids qjs.c hands NV.__vitaMutation */
 var MOby=new Map();
 function MutationObserver(cb){
  if(typeof cb!=='function')throw new TypeError(
@@ -8221,7 +9093,7 @@ function MutationObserver(cb){
    to the root once for each watch entry of each observer, on every
    mutation. A GitHub load makes 2198 setAttribute calls at a depth of
    about thirty, which cost 1.13 ms each against Wikipedia's 0.093 ms
-   for the same call on the same machine. __vitaMutation now walks it
+   for the same call on the same machine. NV.__vitaMutation now walks it
    once and hands it here, so the chain is a plain array and finding a
    watched node in it is an array scan.
 
@@ -8281,27 +9153,27 @@ MutationObserver.prototype.observe=function(target,options){
  /* observing the same node twice replaces the first */
  this._watch=this._watch.filter(function(o){
   if(o.target!==target)return true;
-  if(typeof __vitaMOUnwatch==='function')__vitaMOUnwatch(o.id);
+  if(typeof NV.__vitaMOUnwatch==='function')NV.__vitaMOUnwatch(o.id);
   MOby.delete(o.id);
   return false;});
  /* and C keeps a copy, so a change no observer wants never reaches
     this file (VitaSurf); see mo_wanted in qjs.c */
  w.id=++MOid;
- if(typeof __vitaMOWatch==='function')
-  __vitaMOWatch(w.id,target,(w.subtree?1:0)|(w.attributes?2:0)|
+ if(typeof NV.__vitaMOWatch==='function')
+  NV.__vitaMOWatch(w.id,target,(w.subtree?1:0)|(w.attributes?2:0)|
    (w.childList?4:0)|(w.characterData?8:0),w.filter);
  this._watch.push(w);
  MOby.set(w.id,[this,w]);
  if(MOlist.indexOf(this)<0)MOlist.push(this);
- if(typeof __vitaWatchMutations==='function')__vitaWatchMutations(true);};
+ if(typeof NV.__vitaWatchMutations==='function')NV.__vitaWatchMutations(true);};
 MutationObserver.prototype.disconnect=function(){
  for(var i=0;i<this._watch.length;i++){
-  if(typeof __vitaMOUnwatch==='function')__vitaMOUnwatch(this._watch[i].id);
+  if(typeof NV.__vitaMOUnwatch==='function')NV.__vitaMOUnwatch(this._watch[i].id);
   MOby.delete(this._watch[i].id);}
  this._watch=[];this._records=[];
  MOlist=MOlist.filter(function(o){return o!==this;},this);
- if(!MOlist.length&&typeof __vitaWatchMutations==='function')
-  __vitaWatchMutations(false);};
+ if(!MOlist.length&&typeof NV.__vitaWatchMutations==='function')
+  NV.__vitaWatchMutations(false);};
 MutationObserver.prototype.takeRecords=function(){
  var r=this._records;this._records=[];return r;};
 W.MutationObserver=MutationObserver;
@@ -8316,7 +9188,7 @@ function MOdeliver(){
   if(!o._records.length)continue;
   recs=o._records;o._records=[];
   try{o._cb(recs,o);}catch(e){
-   if(typeof W.__vitaReportError==='function')W.__vitaReportError(e);}}}
+   if(typeof NV.__vitaReportError==='function')NV.__vitaReportError(e);}}}
 function MOqueue(o,rec){
  o._records.push(rec);
  if(!MOqueued){MOqueued=true;
@@ -8395,7 +9267,7 @@ function MOinterested(kind,target,a,matches){
   out.push(o,kind==='attributes'?w.attributeOldValue:
    kind==='characterData'?w.characterDataOldValue:false);}
  return out;}
-W.__vitaMutation=function(kind,target,a,b,ns,matches){
+NV.__vitaMutation=function(kind,target,a,b,ns,matches){
  if(!MOlist.length||!target)return;
  var i,o,old,rec,list=MOinterested(kind,target,a,matches);
  for(i=0;i<list.length;i+=2){
@@ -8434,7 +9306,7 @@ function byClassName(root,names){
  if(!want.length)return [];
  /* matched in C: the walk in JavaScript over a live '*' collection was
     two whole-document walks per element */
- return W.__vitaFind(root,[{classes:want}]);}
+ return NV.__vitaFind(root,[{classes:want}]);}
 P.getElementsByClassName=function(n){return byClassName(this,n);};
 D.getElementsByClassName=function(n){
  var r=D.documentElement;return r?byClassName(r,n):[];};
@@ -8505,31 +9377,36 @@ D.textContent=null;
  * everything a doctype is asked for -- nodeName, nodeType, its owner --
  * was undefined.
  */
+/* The parser's doctypes are node wrappers, and DocumentType.prototype is
+ * theirs (vita/js/nodes.js puts Node under it): one made here, when the
+ * bindings cannot make a node, has what it answers as its own, which
+ * the node accessors it inherits would refuse. */
 function DocumentType(name,publicId,systemId){
- this.name=String(name);
- this.publicId=publicId===undefined?'':String(publicId);
- this.systemId=systemId===undefined?'':String(systemId);
- this.nodeName=this.name;
- this.nodeType=10;
- this.nodeValue=null;
- this.textContent=null;
- this.childNodes=[];
- this.parentNode=null;
- this.ownerDocument=D;}
-DocumentType.prototype.before=DocumentType.prototype.after=
- DocumentType.prototype.replaceWith=DocumentType.prototype.remove=function(){};
-DocumentType.prototype.cloneNode=function(){
- return new DocumentType(this.name,this.publicId,this.systemId);};
-DocumentType.prototype.isEqualNode=function(o){
- return !!o&&o.nodeType===10&&o.name===this.name&&
-  o.publicId===this.publicId&&o.systemId===this.systemId;};
+ var self=this;
+ name=String(name);
+ [['name',name],
+  ['publicId',publicId===undefined?'':String(publicId)],
+  ['systemId',systemId===undefined?'':String(systemId)],
+  ['nodeName',name],['nodeType',10],['nodeValue',null],['textContent',null],
+  ['childNodes',[]],['parentNode',null],['ownerDocument',D],
+  ['before',noop],['after',noop],['replaceWith',noop],['remove',noop],
+  ['cloneNode',function(){
+   return new DocumentType(self.name,self.publicId,self.systemId);}],
+  ['isEqualNode',function(o){
+   return !!o&&o.nodeType===10&&o.name===self.name&&
+    o.publicId===self.publicId&&o.systemId===self.systemId;}]
+ ].forEach(function(p){shadowProp(self,p[0],p[1]);});}
+function noop(){}
 W.DocumentType=DocumentType;
 /* a doctype the parser made is a node wrapper, not one of these */
 try{Object.defineProperty(DocumentType,Symbol.hasInstance,{configurable:true,
  value:function(o){return !!o&&typeof o==='object'&&o.nodeType===10;}});}catch(e){}
+/* the document's doctype node, or null when it has none, as a browser
+   answers: it was always a made-up html doctype */
 Object.defineProperty(D,'doctype',{configurable:true,
- get:function(){return priv(D,'__doctype',function(){
-  return new DocumentType('html','','');});}});
+ get:function(){
+  for(var n=D.firstChild;n;n=n.nextSibling)if(n.nodeType===10)return n;
+  return null;}});
 /* What the name may contain. Browsers are far looser here than the XML
    Name production reads: 1foo, @foo, ~ and } are all accepted, and only
    a character that could never appear in markup -- a space, an angle
@@ -8546,7 +9423,7 @@ D.implementation.createDocumentType=function(qualifiedName,publicId,systemId){
   throw new DOMException(
    'The qualified name provided has an invalid prefix.','NamespaceError');
  /* a real node, so a document can hold it and the tree methods work */
- var d=D.__vitaCreateDoctype?D.__vitaCreateDoctype(n,publicId,systemId):null;
+ var d=NV.__vitaCreateDoctype?NV.__vitaCreateDoctype.call(D,n,publicId,systemId):null;
  if(!d)return new DocumentType(n,publicId,systemId);
  /* it belongs to the document whose implementation made it; libdom's
     maker takes no document, so say so on the node itself */
@@ -8624,12 +9501,12 @@ function needNode(v,fn,which){
   "Failed to execute '"+fn+"': parameter "+which+
   " is not of type 'Node'. Got "+describe(v)+".");}
 /* A node cannot contain itself or anything it is inside. The climb is
-   made in C where it can be (__vitaIsAncestor): in JavaScript it took a
+   made in C where it can be (NV.__vitaIsAncestor): in JavaScript it took a
    wrapper per ancestor on every insertion. */
 var nativeAncestor=null;
 function isAncestor(a,n){
  if(nativeAncestor===null)nativeAncestor=
-  typeof W.__vitaIsAncestor==='function'?W.__vitaIsAncestor:false;
+  typeof NV.__vitaIsAncestor==='function'?NV.__vitaIsAncestor:false;
  if(nativeAncestor){var r=nativeAncestor(a,n);if(r!==undefined)return r;}
  for(;n;n=n.parentNode)if(n===a)return true;
  return false;}
@@ -8794,7 +9671,7 @@ stampConsts(P);
   CDATASection:function(d){return D.createTextNode(d===undefined?'':String(d));},
   DocumentFragment:function(){return D.createDocumentFragment();},
   Document:function(){
-   var d=W.__vitaParseDocument?W.__vitaParseDocument(''):null;
+   var d=NV.__vitaParseDocument?NV.__vitaParseDocument(''):null;
    if(d){var de=d.documentElement;if(de)d.removeChild(de);return d;}
    return D.createDocumentFragment();}};
  /* What every interface built from one old constructor carries: its
@@ -8817,6 +9694,10 @@ stampConsts(P);
    var was=d[k];
    d[k]={configurable:true,enumerable:true,value:NODE_CONSTS[k]};
    if(was&&'value' in was)d[k].writable=was.writable;});
+  /* as an object that has them, which C copies onto each interface
+     (__vitaCopyProps, vita/js/ifaces.c) without reading a descriptor
+     object for each */
+  d=Object.defineProperties({},d);
   CARRIED.push([from,d]);
   return d;}
  function iface(name,test,from,make){
@@ -8829,7 +9710,7 @@ stampConsts(P);
   /* keep whatever the old constructor carried -- Node.ELEMENT_NODE and
      the rest of the node type constants live there, and code reads
      them by name */
-  try{Object.defineProperties(F,carried(from));}
+  try{NV.__vitaCopyProps(F,carried(from));}
   catch(e){
    if(from)Object.getOwnPropertyNames(from).forEach(function(k){
     if(k==='prototype'||k==='length'||k==='name'||k==='caller'||
@@ -8842,9 +9723,9 @@ stampConsts(P);
   return F;}
  function ofType(types){
   /* in C when the bindings have it (VitaSurf) */
-  if(typeof __vitaNodeTypeTest==='function'){
+  if(typeof NV.__vitaNodeTypeTest==='function'){
    var mask=0;types.forEach(function(t){mask|=1<<t;});
-   return __vitaNodeTypeTest(mask);}
+   return NV.__vitaNodeTypeTest(mask);}
   return function(v){
    return !!v&&typeof v==='object'&&types.indexOf(v.nodeType)>=0;};}
  function ofTag(tags){
@@ -8865,7 +9746,8 @@ stampConsts(P);
   HTMLBaseElement:'BASE',HTMLBodyElement:'BODY',HTMLBRElement:'BR',
   HTMLButtonElement:'BUTTON',HTMLCanvasElement:'CANVAS',HTMLDataElement:'DATA',
   HTMLDataListElement:'DATALIST',HTMLDetailsElement:'DETAILS',
-  HTMLDialogElement:'DIALOG',HTMLDivElement:'DIV',HTMLDListElement:'DL',
+  HTMLDialogElement:'DIALOG',HTMLDirectoryElement:'DIR',HTMLDivElement:'DIV',
+  HTMLDListElement:'DL',
   HTMLEmbedElement:'EMBED',HTMLFieldSetElement:'FIELDSET',
   HTMLFontElement:'FONT',HTMLFormElement:'FORM',HTMLFrameElement:'FRAME',
   HTMLFrameSetElement:'FRAMESET',HTMLHeadElement:'HEAD',
@@ -8889,6 +9771,8 @@ stampConsts(P);
   HTMLTimeElement:'TIME',HTMLTitleElement:'TITLE',HTMLTrackElement:'TRACK',
   HTMLUListElement:'UL',HTMLVideoElement:'VIDEO'};
  stampConsts(CEBase);
+ /* for nodes.js, which gives each of these its own prototype */
+ NV.__vitaByTag=byTag;NV.__vitaHtmlTags=HTML_TAGS;
  /* Document keeps its own prototype, which polyfills patch, so it is
     not replaced -- but it can still answer instanceof honestly. */
  try{Object.defineProperty(W.Document,Symbol.hasInstance,
@@ -9107,15 +9991,15 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
  * A worker is a realm of its own on the page's runtime, run by the same
  * scheduler as the page: messages cross between the two as clones, and
  * the worker has no document. The page's side is Worker below; the
- * worker's side is made by __vitaBecomeWorker, which the page calls in
+ * worker's side is made by NV.__vitaBecomeWorker, which the page calls in
  * the new realm's own copy of this prelude, so everything it defines is
- * the worker's. qjs.c makes the realm (__vitaWorkerNew), ends it
- * (__vitaWorkerClose) and fetches for importScripts (__vitaFetchSync).
+ * the worker's. qjs.c makes the realm (NV.__vitaWorkerNew), ends it
+ * (NV.__vitaWorkerClose) and fetches for importScripts (NV.__vitaFetchSync).
  */
 (function(){
- var NW=W.__vitaWorkerNew,NC=W.__vitaWorkerClose,FS=W.__vitaFetchSync;
+ var NW=NV.__vitaWorkerNew,NC=NV.__vitaWorkerClose,FS=NV.__vitaFetchSync;
  ['__vitaWorkerNew','__vitaWorkerClose','__vitaFetchSync'].forEach(
-  function(k){delete W[k];});
+  function(k){delete NV[k];});
  var geval=eval;
  /* listeners in script, for objects the DOM does not own */
  function listens(obj,onerr){
@@ -9170,7 +10054,7 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
       (theirs.protocol!=='file:'&&theirs.origin!==mine.origin))
     throw new DOMException("Failed to construct 'Worker': Script at '"+abs+
      "' cannot be accessed from origin '"+location.origin+"'.",'SecurityError');}
-  listens(this,function(e){W.__vitaReportError(e);});
+  listens(this,function(e){NV.__vitaReportError(e);});
   this.onmessage=this.onmessageerror=this.onerror=null;
   st={dead:false,port:null,g:null};
   Object.defineProperty(this,'__vitaWorker',{value:st});
@@ -9183,10 +10067,12 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
     var ev=uaEvent(new ErrorEvent('error',{message:message,filename:abs,cancelable:true}));
     if(me.dispatchEvent(ev))console.error('Worker '+abs+': '+message);},0);}
   try{g=NW?NW():null;}catch(e){g=null;}
-  if(!g||typeof g.__vitaBecomeWorker!=='function'){
+  /* the worker realm's own natives, which its page cannot see */
+  var gn=g?NV.__vitaNativesOf(g):null;
+  if(!gn||typeof gn.__vitaBecomeWorker!=='function'){
    fail('The worker could not be started');return;}
   st.g=g;
-  st.port=g.__vitaBecomeWorker(abs,name,type,{
+  st.port=gn.__vitaBecomeWorker(abs,name,type,{
    message:function(data){
     if(st.dead)return;
     var d;
@@ -9236,11 +10122,11 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
  W.Worker=Worker;
 
  /* the worker's side, called by the page in this realm */
- W.__vitaBecomeWorker=function(url,name,type,owner){
-  delete W.__vitaBecomeWorker;
+ NV.__vitaBecomeWorker=function(url,name,type,owner){
+  delete NV.__vitaBecomeWorker;
   /* the page's object URLs are in the page's table, not this realm's */
-  var ownLocal=W.__vitaLocalModule;
-  W.__vitaLocalModule=function(m){
+  var ownLocal=NV.__vitaLocalModule;
+  NV.__vitaLocalModule=function(m){
    var t=ownLocal(m);
    if(t===null&&String(m).indexOf('blob:')===0)t=owner.blobText(String(m));
    return t===undefined?null:t;};
@@ -9263,8 +10149,12 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
    Object.defineProperty(loc,k,{enumerable:true,value:u[k]});});
   WorkerLocation.prototype.toString=function(){return this.href;};
   W.WorkerLocation=WorkerLocation;
+  /* a worker's own, which a window does not have (interfaces.js) */
+  if(NV.__vitaOrig&&NV.__vitaOrig.FileReaderSync)
+   Object.defineProperty(W,'FileReaderSync',{value:NV.__vitaOrig.FileReaderSync,
+    writable:true,enumerable:false,configurable:true});
   /* window.location cannot be redefined; what its getter hands back can */
-  W.__vitaLocation=loc;
+  NV.__vitaSetLocation(loc);
   Object.defineProperty(D,'baseURI',{configurable:true,
    get:function(){return url;}});
   W.name=name;
@@ -9289,7 +10179,7 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
   Object.defineProperty(W,Symbol.toStringTag,{configurable:true,
    value:'DedicatedWorkerGlobalScope'});
   /* its events: an error it does not handle goes to its Worker */
-  W.__vitaReportError=function(err,where){
+  NV.__vitaReportError=function(err,where){
    var f=errorFields(err,where||url),ev;
    if(reporting){console.error(f.message);return;}
    reporting=true;
@@ -9298,7 +10188,7 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
      lineno:f.lineno,colno:f.colno,error:err,cancelable:true}));
     if(W.dispatchEvent(ev))owner.error(f);}
    finally{reporting=false;}};
-  listens(W,function(e){W.__vitaReportError(e);});
+  listens(W,function(e){NV.__vitaReportError(e);});
   /* plain handler properties: the window's also add a listener, and
      the handler then ran twice */
   ['onmessage','onmessageerror','onerror'].forEach(function(k){
@@ -9339,13 +10229,13 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
     if(started)deliver(message);else queue.push(message);},
    run:function(src){
     setTimeout(function(){
-     try{geval(src);}catch(e){W.__vitaReportError(e,url);}
+     try{geval(src);}catch(e){NV.__vitaReportError(e,url);}
      begin();},0);},
    runModule:function(){
     setTimeout(function(){
      /* through the helper that waits for a module to arrive, as a
         page's own import() does */
-     W.__vitaImport(url,url).then(begin,function(e){
-      W.__vitaReportError(e,url);begin();});},0);}};};
+     NV.__vitaImport(url,url).then(begin,function(e){
+      NV.__vitaReportError(e,url);begin();});},0);}};};
 })();
 })();

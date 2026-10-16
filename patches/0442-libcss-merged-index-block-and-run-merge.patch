@@ -1,0 +1,541 @@
+diff --git a/src/select/hash.c b/src/select/hash.c
+index d65dd37..2d46939 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -109,6 +109,10 @@ struct css_selector_hash {
+ 	/* built by css__selector_hash_merge: sized once, never grown
+ 	 * (VitaSurf) */
+ 	bool merged;
++	/* a merged hash's chain entries after the first in each slot,
++	 * allocated as one (VitaSurf) */
++	hash_entry *block;
++	size_t block_used;
+ };
+ 
+ static hash_entry empty_slot;
+@@ -455,6 +459,17 @@ css_error css__selector_hash_destroy(css_selector_hash *hash)
+ 	if (hash == NULL)
+ 		return CSS_BADPARM;
+ 
++	/* a merged hash's entries are one block (VitaSurf) */
++	if (hash->block != NULL) {
++		free(hash->block);
++		free(hash->elements.slots);
++		free(hash->classes.slots);
++		free(hash->ids.slots);
++		free(hash->attrs.slots);
++		free(hash);
++		return CSS_OK;
++	}
++
+ 	/* Element hash */
+ 	for (i = 0; i < hash->elements.n_slots; i++) {
+ 		for (d = hash->elements.slots[i].next; d != NULL; d = e) {
+@@ -1864,194 +1879,256 @@ uint32_t css__selector_hash_tables(const css_selector_hash *hash)
+  * Merging several hashes into one (VitaSurf). See hash.h.
+  */
+ 
+-/** Cascade order: specificity, then sheet, then rule. */
+-static int _entry_order(const void *a, const void *b)
++/*
++ * A rule on its way into a merged hash: the entry it is copied from,
++ * the sheet it came from and the slot it goes in.
++ */
++typedef struct merge_item {
++	const hash_entry *src;
++	uint32_t seq;
++	uint32_t slot;
++	/* the selector's specificity and its rule's place, copied here
++	 * so that ordering does not chase the pointers */
++	uint32_t specificity;
++	uint32_t index;
++} merge_item;
++
++static void _item_set(merge_item *it, const hash_entry *e, uint32_t seq,
++		uint32_t slot)
+ {
+-	const hash_entry *x = a, *y = b;
++	it->src = e;
++	it->seq = seq;
++	it->slot = slot;
++	it->specificity = e->sel->specificity;
++	it->index = e->sel->rule->index;
++}
+ 
+-	if (x->sel->specificity != y->sel->specificity)
+-		return x->sel->specificity < y->sel->specificity ? -1 : 1;
++/** Cascade order: specificity, then sheet, then rule. */
++static int _item_order(const merge_item *x, const merge_item *y)
++{
++	if (x->specificity != y->specificity)
++		return x->specificity < y->specificity ? -1 : 1;
+ 	if (x->seq != y->seq)
+ 		return x->seq < y->seq ? -1 : 1;
+-	if (x->sel->rule->index != y->sel->rule->index)
+-		return x->sel->rule->index < y->sel->rule->index ? -1 : 1;
++	if (x->index != y->index)
++		return x->index < y->index ? -1 : 1;
+ 	return 0;
+ }
+ 
++/** The end of the run in order that starts at it[i]. */
++static size_t _run_end(const merge_item *it, size_t i, size_t n)
++{
++	for (i++; i < n && _item_order(&it[i - 1], &it[i]) <= 0; i++)
++		;
++	return i;
++}
++
+ /**
+- * Put a chain in cascade order.
+- *
+- * The entries were pushed on unordered because inserting each in its
+- * place is a walk of the chain, and the chain of :host rules on a
+- * GitHub page is 5611 long. The nodes stay where they are and only
+- * their contents move, so the slot at the head stays the head.
++ * Put rules in cascade order by merging the runs already in order, as
++ * each sheet's are: a chain shared by r sheets takes log r passes.
+  */
+-static css_error _sort_chain(hash_entry *head)
++static void _sort_items(merge_item *it, size_t n, merge_item *tmp)
+ {
+-	hash_entry **nodes, *vals, *e;
+-	size_t n = 0, k;
++	for (;;) {
++		size_t i = 0, out = 0;
+ 
+-	if (head->sel == NULL || head->next == NULL)
+-		return CSS_OK;
+-
+-	for (e = head; e != NULL; e = e->next)
+-		n++;
++		if (_run_end(it, 0, n) == n)
++			return;
++		while (i < n) {
++			size_t m = _run_end(it, i, n), e, a, b;
+ 
+-	nodes = malloc(n * sizeof(*nodes));
+-	vals = malloc(n * sizeof(*vals));
+-	if (nodes == NULL || vals == NULL) {
+-		free(nodes);
+-		free(vals);
+-		return CSS_NOMEM;
++			if (m == n) {
++				memcpy(&tmp[out], &it[i], (n - i) * sizeof(*it));
++				out = n;
++				break;
++			}
++			e = _run_end(it, m, n);
++			a = i;
++			b = m;
++			while (a < m && b < e) {
++				if (_item_order(&it[b], &it[a]) < 0)
++					tmp[out++] = it[b++];
++				else
++					tmp[out++] = it[a++];
++			}
++			while (a < m)
++				tmp[out++] = it[a++];
++			while (b < e)
++				tmp[out++] = it[b++];
++			i = e;
++		}
++		memcpy(it, tmp, n * sizeof(*it));
+ 	}
++}
+ 
+-	for (k = 0, e = head; e != NULL; e = e->next, k++) {
+-		nodes[k] = e;
+-		vals[k] = *e;
+-	}
++/**
++ * Lay a chain's rules down in cascade order, the first in the slot and
++ * the rest in the hash's block.
++ *
++ * Each sheet's chains are in order already, and most keys are used by
++ * one sheet, so a chain is sorted only when it is not in order as it
++ * came (VitaSurf): sorting every chain, and allocating each entry, was
++ * two thirds of building the index, 345 ms each time on reddit.com.
++ */
++static void _lay_chain(css_selector_hash *h, hash_entry *head,
++		merge_item *it, size_t n, merge_item *tmp)
++{
++	hash_entry *prev = NULL;
++	size_t k;
+ 
+-	qsort(vals, n, sizeof(*vals), _entry_order);
++	_sort_items(it, n, tmp);
+ 
+ 	for (k = 0; k < n; k++) {
+-		*nodes[k] = vals[k];
+-		nodes[k]->next = (k + 1 < n) ? nodes[k + 1] : NULL;
+-		nodes[k]->tail = NULL;
++		hash_entry *e = (k == 0) ? head : &h->block[h->block_used++];
++
++		*e = *it[k].src;
++		e->seq = it[k].seq;
++		e->next = NULL;
++		e->tail = NULL;
++		if (prev != NULL)
++			prev->next = e;
++		prev = e;
+ 	}
+-
+-	free(nodes);
+-	free(vals);
+-
+-	return CSS_OK;
++	if (n > 1)
++		h->hash_size += (n - 1) * sizeof(hash_entry);
+ }
+ 
+-/** Size an empty table for the entries about to be filed in it. */
+-static css_error _size_table(css_selector_hash *ctx, hash_t *h, size_t total)
++/** How many entries a chain holds. */
++static size_t _chain_length(const hash_entry *head)
+ {
+-	size_t want = DEFAULT_SLOTS;
+-	hash_entry *fresh;
+-
+-	while (want * HASH_MAX_PER_SLOT < total)
+-		want *= 2;
+-	if (want == h->n_slots)
+-		return CSS_OK;
+-
+-	fresh = calloc(want, sizeof(hash_entry));
+-	if (fresh == NULL)
+-		return CSS_NOMEM;
+-
+-	free(h->slots);
+-	ctx->hash_size += (want - h->n_slots) * sizeof(hash_entry);
+-	h->slots = fresh;
+-	h->n_slots = want;
++	size_t n = 0;
+ 
+-	return CSS_OK;
++	if (head->sel == NULL)
++		return 0;
++	for (; head != NULL; head = head->next)
++		n++;
++	return n;
+ }
+ 
+-/** Put a copy of an entry on a chain, in no particular order yet. */
+-static css_error _push_copy(css_selector_hash *ctx, hash_entry *head,
+-		const hash_entry *from, uint32_t seq)
++/** One of a hash's tables: 0 elements, 1 classes, 2 ids, 3 attributes. */
++static const hash_t *_table_of(const css_selector_hash *h, int t)
+ {
+-	hash_entry *e;
+-
+-	if (head->sel == NULL) {
+-		*head = *from;
+-		head->seq = seq;
+-		head->next = NULL;
+-		head->tail = NULL;
+-		return CSS_OK;
++	switch (t) {
++	case 0: return &h->elements;
++	case 1: return &h->classes;
++	case 2: return &h->ids;
++	default: return &h->attrs;
+ 	}
+-
+-	e = malloc(sizeof(*e));
+-	if (e == NULL)
+-		return CSS_NOMEM;
+-
+-	*e = *from;
+-	e->seq = seq;
+-	e->next = head->next;
+-	e->tail = NULL;
+-	head->next = e;
+-	head->tail = NULL;
+-	ctx->hash_size += sizeof(hash_entry);
+-
+-	return CSS_OK;
+ }
+ 
+ /**
+- * Copy one table's entries into another.
++ * Merge one table of every part into a table sized for them.
+  *
+- * The attribute table is fixed at CSS_SELECTOR_HASH_SLOTS in every
+- * hash and select.c works out the slot itself, so its entries keep
+- * their slot; the others are refiled by key, since the tables grow.
++ * The rules are gathered in sheet order and put in slot order by
++ * counting, which keeps each slot's rules in the order they came.
+  */
+-static css_error _merge_table(css_selector_hash *ctx, hash_t *to,
+-		const hash_t *from, uint32_t seq, bool same_slot)
++static css_error _merge_tables(css_selector_hash *h, hash_t *to, int t,
++		const css_selector_hash *const *parts, const uint32_t *seqs,
++		uint32_t n, merge_item *items, merge_item *by_slot)
+ {
+-	size_t i;
+-
+-	for (i = 0; i < from->n_slots; i++) {
+-		const hash_entry *e = &from->slots[i];
+-
+-		if (e->sel == NULL)
+-			continue;
+-
+-		for (; e != NULL; e = e->next) {
+-			uint32_t slot = same_slot ? (uint32_t) i :
+-					(_entry_key(to->kind, e->sel) &
+-					 (uint32_t) (to->n_slots - 1));
+-			css_error error = _push_copy(ctx, &to->slots[slot],
+-					e, seq);
+-
+-			if (error != CSS_OK)
+-				return error;
+-			to->n_entries++;
++	uint32_t *start;
++	size_t total = 0, i, k;
++	uint32_t p;
++
++	for (p = 0; p < n; p++) {
++		const hash_t *from = _table_of(parts[p], t);
++
++		for (i = 0; i < from->n_slots; i++) {
++			const hash_entry *e = &from->slots[i];
++
++			if (e->sel == NULL)
++				continue;
++			for (; e != NULL; e = e->next) {
++				/* the attribute table is fixed at
++				 * CSS_SELECTOR_HASH_SLOTS in every hash and
++				 * select.c works out the slot itself */
++				_item_set(&items[total++], e, seqs[p],
++						(t == 3) ? (uint32_t) i :
++						(_entry_key(to->kind, e->sel) &
++						 (uint32_t) (to->n_slots - 1)));
++			}
+ 		}
+ 	}
++	if (total == 0)
++		return CSS_OK;
++
++	start = calloc(to->n_slots + 1, sizeof(*start));
++	if (start == NULL)
++		return CSS_NOMEM;
++	for (k = 0; k < total; k++)
++		start[items[k].slot + 1]++;
++	for (i = 0; i < to->n_slots; i++)
++		start[i + 1] += start[i];
++	for (k = 0; k < total; k++)
++		by_slot[start[items[k].slot]++] = items[k];
++	/* each start is now where the next slot's rules begin */
++	for (i = 0, k = 0; i < to->n_slots; i++) {
++		size_t end = start[i];
++
++		if (end > k)
++			_lay_chain(h, &to->slots[i], &by_slot[k], end - k,
++					&items[k]);
++		k = end;
++	}
++	free(start);
++	to->n_entries = total;
+ 
+ 	return CSS_OK;
+ }
+ 
+-/** Copy one chain onto another. */
+-static css_error _merge_chain(css_selector_hash *ctx, hash_entry *to,
+-		const hash_entry *from, uint32_t seq)
++/** Merge one chain of every part. */
++static void _merge_chains(css_selector_hash *h, hash_entry *to,
++		const hash_entry *const *from, const uint32_t *seqs,
++		uint32_t n, merge_item *items, merge_item *tmp)
+ {
+-	const hash_entry *e;
+-
+-	if (from->sel == NULL)
+-		return CSS_OK;
++	size_t total = 0;
++	uint32_t p;
+ 
+-	for (e = from; e != NULL; e = e->next) {
+-		css_error error = _push_copy(ctx, to, e, seq);
++	for (p = 0; p < n; p++) {
++		const hash_entry *e = from[p];
+ 
+-		if (error != CSS_OK)
+-			return error;
++		if (e->sel == NULL)
++			continue;
++		for (; e != NULL; e = e->next)
++			_item_set(&items[total++], e, seqs[p], 0);
+ 	}
+-
+-	return CSS_OK;
++	if (total > 0)
++		_lay_chain(h, to, items, total, tmp);
+ }
+ 
+-/** Put every chain of a table in order. */
+-static css_error _sort_table(hash_t *h)
++/** Size an empty table for the entries about to be filed in it. */
++static css_error _size_table(css_selector_hash *ctx, hash_t *h, size_t total)
+ {
+-	size_t i;
++	size_t want = DEFAULT_SLOTS;
++	hash_entry *fresh;
+ 
+-	for (i = 0; i < h->n_slots; i++) {
+-		css_error error = _sort_chain(&h->slots[i]);
++	while (want * HASH_MAX_PER_SLOT < total)
++		want *= 2;
++	if (want == h->n_slots)
++		return CSS_OK;
+ 
+-		if (error != CSS_OK)
+-			return error;
+-	}
++	fresh = calloc(want, sizeof(hash_entry));
++	if (fresh == NULL)
++		return CSS_NOMEM;
++
++	free(h->slots);
++	ctx->hash_size += (want - h->n_slots) * sizeof(hash_entry);
++	h->slots = fresh;
++	h->n_slots = want;
+ 
+ 	return CSS_OK;
+ }
+ 
+-/* exported: see select/hash.h (VitaSurf) */
+ css_error css__selector_hash_merge(css_selector_hash **out,
+ 		const css_selector_hash *const *parts, const uint32_t *seqs,
+ 		uint32_t n)
+ {
+ 	css_selector_hash *h;
+-	size_t te = 0, tc = 0, ti = 0;
++	size_t te = 0, tc = 0, ti = 0, most = 0, all = 0;
++	merge_item *items = NULL, *by_slot = NULL;
++	const hash_entry **chains = NULL;
+ 	uint32_t i;
++	int t;
+ 	css_error error;
+ 
+ 	if (out == NULL || (n > 0 && (parts == NULL || seqs == NULL)))
+@@ -2062,10 +2139,33 @@ css_error css__selector_hash_merge(css_selector_hash **out,
+ 		return error;
+ 	h->merged = true;
+ 
+-	for (i = 0; i < n; i++) {
+-		te += parts[i]->elements.n_entries;
+-		tc += parts[i]->classes.n_entries;
+-		ti += parts[i]->ids.n_entries;
++	/* how many rules each table and chain takes, for the room to
++	 * gather them and the block that holds them */
++	for (t = 0; t < 6; t++) {
++		size_t sum = 0;
++
++		for (i = 0; i < n; i++) {
++			if (t < 4) {
++				const hash_t *from = _table_of(parts[i], t);
++				size_t s;
++
++				for (s = 0; s < from->n_slots; s++)
++					sum += _chain_length(&from->slots[s]);
++			} else {
++				sum += _chain_length(t == 4 ?
++						&parts[i]->universal :
++						&parts[i]->universal_state);
++			}
++		}
++		if (t == 0)
++			te = sum;
++		else if (t == 1)
++			tc = sum;
++		else if (t == 2)
++			ti = sum;
++		if (sum > most)
++			most = sum;
++		all += sum;
+ 	}
+ 
+ 	error = _size_table(h, &h->elements, te);
+@@ -2076,48 +2176,52 @@ css_error css__selector_hash_merge(css_selector_hash **out,
+ 	if (error != CSS_OK)
+ 		goto fail;
+ 
+-	for (i = 0; i < n; i++) {
+-		const css_selector_hash *p = parts[i];
+-
+-		error = _merge_table(h, &h->elements, &p->elements,
+-				seqs[i], false);
+-		if (error == CSS_OK)
+-			error = _merge_table(h, &h->classes, &p->classes,
+-					seqs[i], false);
+-		if (error == CSS_OK)
+-			error = _merge_table(h, &h->ids, &p->ids,
+-					seqs[i], false);
+-		if (error == CSS_OK)
+-			error = _merge_table(h, &h->attrs, &p->attrs,
+-					seqs[i], true);
+-		if (error == CSS_OK)
+-			error = _merge_chain(h, &h->universal,
+-					&p->universal, seqs[i]);
+-		if (error == CSS_OK)
+-			error = _merge_chain(h, &h->universal_state,
+-					&p->universal_state, seqs[i]);
+-		if (error != CSS_OK)
++	if (all > 0) {
++		h->block = malloc(all * sizeof(*h->block));
++		items = malloc(most * sizeof(*items));
++		by_slot = malloc(most * sizeof(*by_slot));
++		chains = malloc(n * sizeof(*chains));
++		if (h->block == NULL || items == NULL || by_slot == NULL ||
++				chains == NULL) {
++			error = CSS_NOMEM;
+ 			goto fail;
++		}
+ 	}
+ 
+-	error = _sort_table(&h->elements);
++	error = _merge_tables(h, &h->elements, 0, parts, seqs, n,
++			items, by_slot);
+ 	if (error == CSS_OK)
+-		error = _sort_table(&h->classes);
++		error = _merge_tables(h, &h->classes, 1, parts, seqs, n,
++				items, by_slot);
+ 	if (error == CSS_OK)
+-		error = _sort_table(&h->ids);
++		error = _merge_tables(h, &h->ids, 2, parts, seqs, n,
++				items, by_slot);
+ 	if (error == CSS_OK)
+-		error = _sort_table(&h->attrs);
+-	if (error == CSS_OK)
+-		error = _sort_chain(&h->universal);
+-	if (error == CSS_OK)
+-		error = _sort_chain(&h->universal_state);
++		error = _merge_tables(h, &h->attrs, 3, parts, seqs, n,
++				items, by_slot);
+ 	if (error != CSS_OK)
+ 		goto fail;
++	if (all > 0) {
++		for (i = 0; i < n; i++)
++			chains[i] = &parts[i]->universal;
++		_merge_chains(h, &h->universal, chains, seqs, n, items,
++				by_slot);
++		for (i = 0; i < n; i++)
++			chains[i] = &parts[i]->universal_state;
++		_merge_chains(h, &h->universal_state, chains, seqs, n,
++				items, by_slot);
++	}
+ 
++	free(items);
++	free(by_slot);
++	free(chains);
+ 	*out = h;
+ 	return CSS_OK;
+ 
+ fail:
++	free(items);
++	free(by_slot);
++	free(chains);
+ 	css__selector_hash_destroy(h);
+ 	return error;
+ }

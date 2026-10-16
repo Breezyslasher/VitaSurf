@@ -1,0 +1,125 @@
+diff --git a/content/handlers/html/css.c b/content/handlers/html/css.c
+index 7929eb161..3533b9c81 100644
+--- a/content/handlers/html/css.c
++++ b/content/handlers/html/css.c
+@@ -304,6 +304,46 @@ static bool html_css_sheet_unused(const struct html_stylesheet *s)
+ /**
+  * Callback for fetchcache() for stylesheets.
+  */
++/**
++ * Let go of the sheets kept for a selection context that has now been
++ * made again, or for a page that is going (VitaSurf).
++ */
++static void html_css_release_retired(html_content *c)
++{
++	unsigned int i;
++
++	for (i = 0; i < c->retired_count; i++) {
++		hlcache_handle_release(c->retired_sheets[i]);
++	}
++	free(c->retired_sheets);
++	c->retired_sheets = NULL;
++	c->retired_count = 0;
++}
++
++/**
++ * A sheet a <style>'s new text has replaced: kept while a selection
++ * context may hold it, since one is only made again when the page has
++ * nothing left to fetch, and released otherwise (VitaSurf).
++ */
++static void html_css_retire(html_content *c, hlcache_handle *sheet)
++{
++	hlcache_handle **grown;
++
++	if (c->select_ctx == NULL) {
++		hlcache_handle_release(sheet);
++		return;
++	}
++	grown = realloc(c->retired_sheets,
++			sizeof(*grown) * (c->retired_count + 1));
++	if (grown == NULL) {
++		/* better kept for good than freed under the context */
++		NSLOG(netsurf, INFO, "no room to keep a replaced sheet");
++		return;
++	}
++	c->retired_sheets = grown;
++	c->retired_sheets[c->retired_count++] = sheet;
++}
++
+ /**
+  * Rebuild the selection context and the boxes after a stylesheet that
+  * arrived once the page was already converted (VitaSurf).
+@@ -322,12 +362,14 @@ static void html_css_late_rebuild(void *pw)
+ 	 * schedules this again, so one rebuild serves them all. A sheet
+ 	 * that left with the tree has nothing to arrive, and what is
+ 	 * active may be an image, so look again later (VitaSurf). */
+-	if (c->base.active != 0) {
+-		if (c->late_css_retries++ < 100) {
+-			guit->misc->schedule(200, html_css_late_rebuild, c);
+-		}
++	if (c->base.active != 0 && c->late_css_retries++ < 100) {
++		guit->misc->schedule(200, html_css_late_rebuild, c);
+ 		return;
+ 	}
++	/* twenty seconds on, with something still loading -- bbc.com
++	 * was still fetching images -- the page is styled with what it
++	 * has, rather than never: the context stayed as it was, and
++	 * held the sheets it was made from (VitaSurf) */
+ 	/* a box conversion in progress reads the context it started with */
+ 	if (c->box_conversion_context != NULL) {
+ 		if (c->late_css_retries++ < 30) {
+@@ -342,6 +384,8 @@ static void html_css_late_rebuild(void *pw)
+ 	css_select_ctx_destroy(c->select_ctx);
+ 	c->select_ctx = fresh;
+ 	c->select_ctx_gen = gen;
++	/* nothing holds the sheets the old context did now */
++	html_css_release_retired(c);
+ 
+ 	err = html_relayout(c);
+ 	if (err == NSERROR_INVALID && c->late_css_retries++ < 30) {
+@@ -766,14 +810,16 @@ html_css_process_modified_style(html_content *c, struct html_stylesheet *s)
+ 		if (s->sheet != NULL) {
+ 			switch (content_get_status(s->sheet)) {
+ 			case CONTENT_STATUS_DONE:
++				/* the selection context may hold it */
++				html_css_retire(c, s->sheet);
+ 				break;
+ 			default:
+ 				hlcache_handle_abort(s->sheet);
+ 				c->base.active--;
+ 				NSLOG(netsurf, INFO, "%d fetches active",
+ 				      c->base.active);
++				hlcache_handle_release(s->sheet);
+ 			}
+-			hlcache_handle_release(s->sheet);
+ 		}
+ 		s->sheet = sheet;
+ 	}
+@@ -1155,6 +1201,7 @@ nserror html_css_free_stylesheets(html_content *html)
+ 		free(html->stylesheets[i].override);
+ 	}
+ 	free(html->stylesheets);
++	html_css_release_retired(html);
+ 
+ 	return NSERROR_OK;
+ }
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 06c2457f7..7c056674b 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -230,6 +230,15 @@ typedef struct html_content {
+ 	unsigned int stylesheet_count;
+ 	/** Stylesheets. Each may be NULL. */
+ 	struct html_stylesheet *stylesheets;
++	/**
++	 * Sheets a <style>'s new text has replaced, kept until the
++	 * selection context that may still hold them is made again
++	 * (VitaSurf): released at once, a sheet was freed while the
++	 * context waited to be rebuilt, and the next style selection
++	 * read it (bbc.com).
++	 */
++	struct hlcache_handle **retired_sheets;
++	unsigned int retired_count;
+ 	/**< Style selection context */
+ 	css_select_ctx *select_ctx;
+ 	/** A selection context from the sheets loaded so far, for a script

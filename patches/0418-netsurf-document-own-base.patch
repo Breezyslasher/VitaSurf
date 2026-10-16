@@ -1,0 +1,73 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index ec64cbafc..1653353c3 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -727,9 +727,11 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 	{
+ 		nsurl *inherit = html_frame_doc_base(c->base_url);
+ 
++		c->inherited_base = NULL;
+ 		if (inherit != NULL) {
+ 			nsurl_unref(c->base_url);
+ 			c->base_url = nsurl_ref(inherit);
++			c->inherited_base = nsurl_ref(inherit);
+ 		}
+ 	}
+ 	c->base_target = NULL;
+@@ -838,6 +840,10 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 	if (error != DOM_HUBBUB_OK) {
+ 		nsurl_unref(c->base_url);
+ 		c->base_url = NULL;
++		if (c->inherited_base != NULL) {
++			nsurl_unref(c->inherited_base);
++			c->inherited_base = NULL;
++		}
+ 
+ 		lwc_string_unref(c->universal);
+ 		c->universal = NULL;
+@@ -856,6 +862,10 @@ html_create_html_data(html_content *c, const http_parameter *params)
+ 		c->parser = NULL;
+ 		nsurl_unref(c->base_url);
+ 		c->base_url = NULL;
++		if (c->inherited_base != NULL) {
++			nsurl_unref(c->inherited_base);
++			c->inherited_base = NULL;
++		}
+ 
+ 		lwc_string_unref(c->universal);
+ 		c->universal = NULL;
+@@ -2106,6 +2116,8 @@ static void html_destroy(struct content *c)
+ 
+ 	if (html->base_url)
+ 		nsurl_unref(html->base_url);
++	if (html->inherited_base != NULL)
++		nsurl_unref(html->inherited_base);
+ 
+ 	/* At this point we can be moderately confident the JS is offline
+ 	 * so we destroy the JS thread.
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 81a683a69..06c2457f7 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -114,6 +114,11 @@ typedef struct html_content {
+ 
+ 	/** Base URL (may be a copy of content->url). */
+ 	struct nsurl *base_url;
++	/** The parent's base, for an iframe's srcdoc or blank document,
++	 * which a <base> element replaces in base_url and removing it
++	 * gives back; NULL for any other document, whose own base is its
++	 * address (VitaSurf). */
++	struct nsurl *inherited_base;
+ 	/** Base target */
+ 	char *base_target;
+ 
+@@ -780,7 +785,8 @@ extern struct html_pointer_event html_pointer_current;
+  * It bubbles, can be cancelled and leaves shadow trees, as every one a
+  * browser sends from its pointer does.
+  *
+- * eturn false if a listener cancelled it
++ * 
++eturn false if a listener cancelled it
+  */
+ bool fire_dom_pointer_event(const char *type, dom_node *target,
+ 		int x, int y, int button, int buttons, int detail);

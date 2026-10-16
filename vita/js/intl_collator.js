@@ -24,11 +24,11 @@
  * 32-bit primary, 16-bit secondary and tertiary) and a second unit that
  * orders what a tailoring put between two of ICU's weights.
  *
- * __vitaCollationCore(data) is the engine on its own, which the
- * generator uses to build tailorings; __vitaIntlCollator(W, N, C, X)
+ * NV.__vitaCollationCore(data) is the engine on its own, which the
+ * generator uses to build tailorings; NV.__vitaIntlCollator(W, N, C, X)
  * installs the API.
  */
-var __vitaCollationCore = function (data) {
+NV.__vitaCollationCore = function (data) {
 	'use strict';
 
 	var META = data('k:meta');
@@ -566,7 +566,7 @@ var __vitaCollationCore = function (data) {
 	};
 };
 
-var __vitaIntlCollator = function (W, N, C, X) {
+NV.__vitaIntlCollator = function (W, N, C, X) {
 	'use strict';
 
 	var Intl = W.Intl, getOption = X.getOption, method = X.method;
@@ -578,7 +578,7 @@ var __vitaIntlCollator = function (W, N, C, X) {
 		return DATA[name];
 	}
 
-	var core = __vitaCollationCore(data), META = core.meta;
+	var core = NV.__vitaCollationCore(data), META = core.meta;
 
 	/* ---- a locale's collations ---- */
 
@@ -890,12 +890,12 @@ var __vitaIntlCollator = function (W, N, C, X) {
 	Intl.Collator = Collator;
 };
 
-if (typeof window !== 'undefined' && window.__vitaIntl &&
-    window.__vitaIntl.number && window.__vitaIntl.has &&
-    window.__vitaIntl.has('k:meta') && window.__vitaIntlCore)
-	__vitaIntlCollator(window, window.__vitaIntl, window.__vitaIntlCore,
-			   window.__vitaIntl.number);
+if (typeof window !== 'undefined' && NV.__vitaIntl &&
+    NV.__vitaIntl.number && NV.__vitaIntl.has &&
+    NV.__vitaIntl.has('k:meta') && NV.__vitaIntlCore)
+	NV.__vitaIntlCollator(window, NV.__vitaIntl, NV.__vitaIntlCore,
+			   NV.__vitaIntl.number);
 
 if (typeof module !== 'undefined')
-	module.exports = { install: __vitaIntlCollator,
-		core: __vitaCollationCore };
+	module.exports = { install: NV.__vitaIntlCollator,
+		core: NV.__vitaCollationCore };
