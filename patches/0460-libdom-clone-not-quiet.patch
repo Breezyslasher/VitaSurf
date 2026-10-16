@@ -1,0 +1,16 @@
+diff --git a/src/core/node.c b/src/core/node.c
+index 3d6ff6a..103bed6 100644
+--- a/src/core/node.c
++++ b/src/core/node.c
+@@ -2152,6 +2152,11 @@ dom_exception _dom_node_copy_internal(dom_node_internal *old,
+ 		new->prefix = NULL;
+ 
+ 	new->user_data = NULL;
++	/* a copy is attached as any new node is (VitaSurf): it came from
++	 * malloc(), and whether it was quiet was garbage, so a cloned
++	 * subtree inserted by script could be processed twice or not at
++	 * all (valgrind, Stack Overflow) */
++	new->quiet = false;
+ 	new->base.refcnt = 1;
+ 
+ 	list_init(&new->pending_list);

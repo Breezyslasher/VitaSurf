@@ -1,0 +1,208 @@
+diff --git a/src/select/arena_hash.h b/src/select/arena_hash.h
+index 449284f..68b438a 100644
+--- a/src/select/arena_hash.h
++++ b/src/select/arena_hash.h
+@@ -10,6 +10,7 @@
+ #define css_select_arena_hash_h_
+ 
+ #include <stdint.h>
++#include <string.h>
+ 
+ /**
+  * Currently 32-bit MurmurHash2.
+@@ -30,13 +31,20 @@ static inline uint32_t css__arena_hash(const uint8_t *data, size_t len)
+ 
+ 	/* Hash four bytes at a time */
+ 	while (len >= 4) {
+-		/* If we could ensure 4-byte alignment of the input, this
+-		 * could be faster. */
+-		uint32_t k =
+-				(((uint32_t) data[0])      ) |
++		/* A word at a time where it is a word (VitaSurf): the
++		 * styles hashed are aligned, and four byte loads and their
++		 * shifts were most of the hash of every element's 1 KB
++		 * style. Little-endian, so the value is the same. */
++		uint32_t k;
++
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++		memcpy(&k, data, 4);
++#else
++		k =		(((uint32_t) data[0])      ) |
+ 				(((uint32_t) data[1]) <<  8) |
+ 				(((uint32_t) data[2]) << 16) |
+ 				(((uint32_t) data[3]) << 24);
++#endif
+ 
+ 		k *= m;
+ 		k ^= k >> r;
+diff --git a/src/select/custom.c b/src/select/custom.c
+index 699ff6c..9502cb2 100644
+--- a/src/select/custom.c
++++ b/src/select/custom.c
+@@ -141,6 +141,35 @@ static void _drop_tokens(css_custom_entry *e)
+ 	e->key = 0;
+ }
+ 
++/*
++ * The maps elements were given (VitaSurf), one of each, by signature.
++ * Elements that set the same variables each built a map of their own,
++ * and interning their styles compared those maps a variable at a time,
++ * and then their parents' maps the same way: half of Stack Overflow's
++ * style interning. The table holds no references; a map leaves it as
++ * it is freed.
++ */
++#define CUSTOM_CANON_BUCKETS 1024
++
++static css_custom_map *_canon[CUSTOM_CANON_BUCKETS];
++
++unsigned int css_custom_interned;
++unsigned int css_custom_intern_hits;
++
++static void _canon_remove(css_custom_map *map)
++{
++	css_custom_map **pp;
++
++	for (pp = &_canon[map->sig & (CUSTOM_CANON_BUCKETS - 1)];
++			*pp != NULL; pp = &(*pp)->canon_next) {
++		if (*pp == map) {
++			*pp = map->canon_next;
++			break;
++		}
++	}
++	map->interned = false;
++}
++
+ css_custom_map *css__custom_map_ref(css_custom_map *map)
+ {
+ 	if (map != NULL) {
+@@ -155,6 +184,8 @@ void css__custom_map_unref(css_custom_map *map)
+ 		css_custom_map *parent = map->parent;
+ 		uint32_t i;
+ 
++		if (map->interned)
++			_canon_remove(map);
+ 		for (i = 0; i < map->n_slots; i++) {
+ 			if (map->slots[i].name != NULL) {
+ 				lwc_string_unref(map->slots[i].name);
+@@ -236,7 +267,9 @@ css_error css__custom_map_own(css_custom_map **map)
+ 		return CSS_BADPARM;
+ 	}
+ 
+-	if (*map != NULL && (*map)->refcount == 1) {
++	/* an interned map is shared by what it stands for, however few
++	 * hold it now, and is never written */
++	if (*map != NULL && (*map)->refcount == 1 && !(*map)->interned) {
+ 		return CSS_OK;	/* already ours alone */
+ 	}
+ 
+@@ -396,11 +429,35 @@ bool css__custom_map_equal(css_custom_map *a, css_custom_map *b)
+ 		return true;
+ 	if (a == NULL || b == NULL)
+ 		return false;
++	/* no two interned maps are equal */
++	if (a->interned && b->interned)
++		return false;
+ 	if (a->count != b->count ||
+ 			css__custom_map_sig(a) != css__custom_map_sig(b))
+ 		return false;
+ 	if (!css__custom_map_equal(a->parent, b->parent))
+ 		return false;
++	/*
++	 * Maps made from the same declarations in the same order have
++	 * their entries in the same slots (VitaSurf), so a walk of both
++	 * tables side by side settles it without a lookup per entry; only
++	 * maps laid out differently take the lookups. Stack Overflow's
++	 * elements that set the same variables compared their maps a
++	 * name at a time, half of interning their styles.
++	 */
++	if (a->n_slots == b->n_slots) {
++		for (i = 0; i < a->n_slots; i++) {
++			const css_custom_entry *e = &a->slots[i];
++			const css_custom_entry *f = &b->slots[i];
++
++			if (e->name != f->name || e->tokens != f->tokens ||
++					e->n_tokens != f->n_tokens ||
++					e->important != f->important)
++				break;
++		}
++		if (i == a->n_slots)
++			return true;
++	}
+ 	for (i = 0; i < a->n_slots; i++) {
+ 		const css_custom_entry *e = &a->slots[i];
+ 		const css_custom_entry *f;
+@@ -442,3 +499,28 @@ css_error css__custom_map_reserve(css_custom_map **map, uint32_t n)
+ 		want *= 2;
+ 	return _grow_to(*map, want);
+ }
++
++css_custom_map *css__custom_map_intern(css_custom_map *map)
++{
++	css_custom_map *m;
++	uint32_t sig;
++
++	if (map == NULL || map->interned)
++		return map;
++
++	sig = css__custom_map_sig(map);
++	for (m = _canon[sig & (CUSTOM_CANON_BUCKETS - 1)]; m != NULL;
++			m = m->canon_next) {
++		if (m->sig == sig && css__custom_map_equal(m, map)) {
++			css__custom_map_ref(m);
++			css__custom_map_unref(map);
++			css_custom_intern_hits++;
++			return m;
++		}
++	}
++	map->interned = true;
++	map->canon_next = _canon[sig & (CUSTOM_CANON_BUCKETS - 1)];
++	_canon[sig & (CUSTOM_CANON_BUCKETS - 1)] = map;
++	css_custom_interned++;
++	return map;
++}
+diff --git a/src/select/custom.h b/src/select/custom.h
+index 7e4de32..0c1f621 100644
+--- a/src/select/custom.h
++++ b/src/select/custom.h
+@@ -50,6 +50,10 @@ typedef struct css_custom_map {
+ 	struct css_custom_map *parent;	/**< the inherited map, a ref */
+ 	uint32_t sig;			/**< css__custom_map_sig(), once known */
+ 	bool sig_valid;
++	/** In the table of maps elements were given (VitaSurf): no other
++	 * map there is equal to it, and it is never written again. */
++	bool interned;
++	struct css_custom_map *canon_next;
+ } css_custom_map;
+ 
+ css_custom_map *css__custom_map_ref(css_custom_map *map);
+@@ -116,4 +120,14 @@ uint32_t css__custom_map_sig(css_custom_map *map);
+  */
+ bool css__custom_map_equal(css_custom_map *a, css_custom_map *b);
+ 
++/**
++ * The one map equal to this, given in its place (VitaSurf): takes the
++ * caller's reference to \a map and returns a reference to the map
++ * kept for every element given the same variables. A selection gives
++ * its element's styles their map through this, so two of them hold
++ * the same map exactly when they would read the same variables, and
++ * comparing the maps of two styles is comparing their addresses.
++ */
++css_custom_map *css__custom_map_intern(css_custom_map *map);
++
+ #endif
+diff --git a/src/select/select.c b/src/select/select.c
+index e62a768..d564939 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -3312,7 +3312,10 @@ static css_error select_style(css_select_ctx *ctx, void *node,
+ 		goto cleanup;
+ 	}
+ 
+-	/* and hand them on, so this element's children inherit them */
++	/* and hand them on, so this element's children inherit them: the
++	 * one map kept for these variables, so styles that read the same
++	 * hold the same (VitaSurf) */
++	state.custom = css__custom_map_intern(state.custom);
+ 	for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
+ 		if (state.results->styles[i] != NULL) {
+ 			state.results->styles[i]->custom =

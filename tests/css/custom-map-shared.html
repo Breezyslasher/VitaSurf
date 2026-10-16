@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<!--
+  Elements given the same variables share one map (VitaSurf).
+
+  libcss keeps one map for each set of variables an element can be
+  given, and every element whose variables are the same holds it.
+  Changing one element's variables must give it a map of its own and
+  leave the others as they were, and an element whose rules reach the
+  same values another way still reads them. Each line must say PASS;
+  Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Shared variable maps</title>
+<style>
+:root { --base: rgb(10, 20, 30); }
+.card { --fg: rgb(200, 0, 0); --pad: 3px; }
+.card.alt { --fg: rgb(0, 150, 0); }
+.card .t { color: var(--fg); padding-left: var(--pad); }
+.other { --fg: rgb(200, 0, 0); --pad: 3px; }
+.other .t { color: var(--fg); padding-left: var(--pad); }
+.inherit .t { color: var(--base); }
+.important { --fg: rgb(0, 0, 220) !important; }
+.important.card { --fg: rgb(1, 1, 1); }
+</style></head>
+<body>
+<div id="list"></div>
+<div class="other" id="o"><span class="t">o</span></div>
+<div class="inherit" id="i"><span class="t">i</span></div>
+<div class="card important" id="imp"><span class="t">imp</span></div>
+<pre id="out"></pre>
+<script>
+var list = document.getElementById('list');
+for (var n = 0; n < 40; n++) {
+  var d = document.createElement('div');
+  d.className = 'card';
+  d.id = 'c' + n;
+  d.innerHTML = '<span class="t">' + n + '</span>';
+  list.appendChild(d);
+}
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function color(id) { return getComputedStyle(document.querySelector('#' + id + ' .t')).color; }
+addEventListener('load', function () {
+  ok('the first card', color('c0'), 'rgb(200, 0, 0)');
+  ok('the last card', color('c39'), 'rgb(200, 0, 0)');
+  ok('another class with the same values', color('o'), 'rgb(200, 0, 0)');
+  ok('a variable from the root', color('i'), 'rgb(10, 20, 30)');
+  ok('an important variable beats a later one', color('imp'), 'rgb(0, 0, 220)');
+  document.getElementById('c5').classList.add('alt');
+  setTimeout(function () {
+    ok('a card given another value', color('c5'), 'rgb(0, 150, 0)');
+    ok('the card before it is unchanged', color('c4'), 'rgb(200, 0, 0)');
+    ok('the card after it is unchanged', color('c6'), 'rgb(200, 0, 0)');
+    ok('the other class is unchanged', color('o'), 'rgb(200, 0, 0)');
+    document.getElementById('c5').classList.remove('alt');
+    setTimeout(function () {
+      ok('the card given its value back', color('c5'), 'rgb(200, 0, 0)');
+      ok('a padding read through a shared map',
+         getComputedStyle(document.querySelector('#c7 .t')).paddingLeft, '3px');
+      document.getElementById('out').textContent = out.join('\n');
+      out.forEach(function (l) { console.log('custom-map-shared: ' + l); });
+      console.log('custom-map-shared: done');
+    }, 50);
+  }, 50);
+});
+</script>
+</body></html>
