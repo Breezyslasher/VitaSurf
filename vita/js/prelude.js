@@ -5264,7 +5264,11 @@ Object.defineProperty(P,'complete',{configurable:true,get:function(){
  return this.tagName!=='IMG'||!!NV.__vitaBox(this);}});
 ['naturalWidth','naturalHeight'].forEach(function(k,n){Object.defineProperty(P,k,{configurable:true,
  get:function(){var b=NV.__vitaBox(this);return b?b[2+n]:0;}});});
-Object.defineProperty(P,'currentSrc',{configurable:true,get:function(){return this.src||'';}});
+/* the image srcset, sizes and a <picture> chose (VitaSurf); a media
+   element, or a node of another document, keeps its src */
+Object.defineProperty(P,'currentSrc',{configurable:true,get:function(){
+ var u=this.tagName==='IMG'?NV.__vitaCurrentSrc(this):null;
+ return u!==null?u:(this.src||'');}});
 ['x','y'].forEach(function(k,n){Object.defineProperty(P,k,{configurable:true,
  get:function(){var b=NV.__vitaBox(this);return b?b[n]:0;}});});
 P.decode=function(){return Promise.resolve();};

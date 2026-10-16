@@ -1,0 +1,90 @@
+diff --git a/include/libcss/select.h b/include/libcss/select.h
+index 00eb41a..450581d 100644
+--- a/include/libcss/select.h
++++ b/include/libcss/select.h
+@@ -358,6 +358,14 @@ css_error css_select_ctx_remove_sheet(css_select_ctx *ctx,
+ 
+ css_error css_select_ctx_count_sheets(css_select_ctx *ctx, uint32_t *count);
+ 
++/**
++ * Whether a media query list matches \a media (VitaSurf), parsed and
++ * matched as a sheet's media are; an empty list matches.
++ */
++css_error css_media_query_matches(const char *mq, size_t len,
++		const css_unit_ctx *unit_ctx, const css_media *media,
++		bool *match);
++
+ /**
+  * Build the context's merged selector index now (VitaSurf).
+  *
+diff --git a/src/select/select.c b/src/select/select.c
+index 21aab95..e62a768 100644
+--- a/src/select/select.c
++++ b/src/select/select.c
+@@ -31,6 +31,8 @@
+ #include "select/font_face.h"
+ #include "select/select.h"
+ #include "parse/language.h"
++#include "parse/mq.h"
++#include "parse/propstrings.h"
+ #include "select/strings.h"
+ #include "select/unit.h"
+ #include "utils/parserutilserror.h"
+@@ -1279,6 +1281,57 @@ css_error css_select_ctx_remove_sheet(css_select_ctx *ctx,
+ 
+ }
+ 
++/*
++ * Whether a media query list matches the media given (VitaSurf): the
++ * same parse and match an @media rule or a sheet's media attribute
++ * gets, for a client that has a media query outside any sheet, as the
++ * HTML standard's <source media> and sizes attribute are. An empty
++ * list matches; one that does not parse does not.
++ */
++css_error css_media_query_matches(const char *mq, size_t len,
++		const css_unit_ctx *unit_ctx, const css_media *media,
++		bool *match)
++{
++	css_select_strings str;
++	lwc_string **strings;
++	css_mq_query *q = NULL;
++	css_error error;
++
++	if (mq == NULL || unit_ctx == NULL || media == NULL || match == NULL)
++		return CSS_BADPARM;
++
++	*match = false;
++	while (len > 0 && (*mq == ' ' || *mq == '\t' || *mq == '\n' ||
++			*mq == '\r' || *mq == '\f')) {
++		mq++;
++		len--;
++	}
++	if (len == 0) {
++		*match = true;
++		return CSS_OK;
++	}
++
++	error = css__propstrings_get(&strings);
++	if (error != CSS_OK)
++		return error;
++
++	error = css_parse_media_query(strings, (const uint8_t *) mq, len, &q);
++	if (error == CSS_OK && q != NULL) {
++		memset(&str, 0, sizeof(str));
++		error = css_select_strings_intern(&str);
++		if (error == CSS_OK) {
++			*match = mq__list_match(q, unit_ctx, media, &str);
++			css_select_strings_unref(&str);
++		}
++		css__mq_query_destroy(q);
++	} else if (error != CSS_NOMEM) {
++		error = CSS_OK;
++	}
++
++	css__propstrings_unref();
++	return error;
++}
++
+ /**
+  * Count the number of top-level sheets in a selection context
+  *

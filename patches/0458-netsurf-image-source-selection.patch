@@ -1,0 +1,1170 @@
+diff --git a/content/handlers/html/Makefile b/content/handlers/html/Makefile
+index 5c3bcada6..72b7d0354 100644
+--- a/content/handlers/html/Makefile
++++ b/content/handlers/html/Makefile
+@@ -16,6 +16,7 @@ S_HTML := box_construct.c	\
+ 	forms.c			\
+ 	html.c			\
+ 	imagemap.c		\
++	image_source.c		\
+ 	interaction.c		\
+ 	layout.c		\
+ 	layout_flex.c		\
+diff --git a/content/handlers/html/box_special.c b/content/handlers/html/box_special.c
+index 60c0acdf2..80b953e1b 100644
+--- a/content/handlers/html/box_special.c
++++ b/content/handlers/html/box_special.c
+@@ -56,6 +56,7 @@
+ #include "html/box_manipulate.h"
+ #include "html/box_construct.h"
+ #include "html/box_special.h"
++#include "html/image_source.h"
+ #include "html/box_textarea.h"
+ #include "html/frame_doc.h"
+ #include "html/form_internal.h"
+@@ -1217,18 +1218,25 @@ box_image(dom_node *n,
+ 	if (box->usemap && box->usemap[0] == '#')
+ 		box->usemap++;
+ 
+-	/* get image URL */
+-	err = dom_element_get_attribute(n, corestring_dom_src, &s);
+-	if (err != DOM_NO_ERR || s == NULL)
+-		return true;
++	/* get image URL: from srcset and a <picture>'s sources where it
++	 * has them (VitaSurf), else src */
++	if (html_image_has_choice(n)) {
++		if (html_image_source(content, n, &url) != NSERROR_OK)
++			return false;
++	} else {
++		err = dom_element_get_attribute(n, corestring_dom_src, &s);
++		if (err != DOM_NO_ERR || s == NULL)
++			return true;
++
++		if (box_extract_link(content, s, content->base_url,
++				&url) == false) {
++			dom_string_unref(s);
++			return false;
++		}
+ 
+-	if (box_extract_link(content, s, content->base_url, &url) == false) {
+ 		dom_string_unref(s);
+-		return false;
+ 	}
+ 
+-	dom_string_unref(s);
+-
+ 	if (url == NULL)
+ 		return true;
+ 
+diff --git a/content/handlers/html/dom_event.c b/content/handlers/html/dom_event.c
+index d06acbdcc..b1e9574d9 100644
+--- a/content/handlers/html/dom_event.c
++++ b/content/handlers/html/dom_event.c
+@@ -48,6 +48,7 @@
+ #include "html/form_internal.h"
+ #include "html/dom_event.h"
+ #include "html/frame_doc.h"
++#include "html/image_source.h"
+ 
+ 
+ /**
+@@ -146,17 +147,27 @@ static bool html_process_inserted_img(html_content *htmlc, dom_node *node)
+ 		}
+ 	}
+ 
+-	exc = dom_element_get_attribute(node, corestring_dom_src, &src);
+-	if (exc != DOM_NO_ERR || src == NULL) {
+-		return true;
+-	}
++	if (html_image_has_choice((dom_node *)node)) {
++		/* the source its srcset and <picture> choose (VitaSurf) */
++		if (html_image_source(htmlc, (dom_node *)node, &url) !=
++				NSERROR_OK)
++			return false;
++		if (url == NULL)
++			return true;
++	} else {
++		exc = dom_element_get_attribute(node, corestring_dom_src,
++				&src);
++		if (exc != DOM_NO_ERR || src == NULL) {
++			return true;
++		}
+ 
+-	err = nsurl_join(htmlc->base_url, dom_string_data(src), &url);
+-	if (err != NSERROR_OK) {
++		err = nsurl_join(htmlc->base_url, dom_string_data(src), &url);
++		if (err != NSERROR_OK) {
++			dom_string_unref(src);
++			return false;
++		}
+ 		dom_string_unref(src);
+-		return false;
+ 	}
+-	dom_string_unref(src);
+ 
+ 	/* Speculatively fetch the image */
+ 	success = html_fetch_object(htmlc, url, NULL, CONTENT_IMAGE, false);
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index fd887d1e0..37380770a 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -80,6 +80,7 @@
+ #include "html/layout.h"
+ #include "html/textselection.h"
+ #include "html/frame_doc.h"
++#include "html/image_source.h"
+ 
+ #define CHUNK 4096
+ 
+@@ -466,6 +467,13 @@ static void html_get_dimensions(html_content *htmlc)
+ 	htmlc->unit_len_ctx.font_size_minimum = f_min;
+ }
+ 
++/* exported interface documented in html/private.h */
++void html_media_ready(html_content *c)
++{
++	if (c->unit_len_ctx.device_dpi == 0)
++		html_get_dimensions(c);
++}
++
+ /** Drop the early selection context and the sheets parsed for it. */
+ static void html_drop_early_select_ctx(html_content *c)
+ {
+@@ -4770,6 +4778,76 @@ static const char *const html_attr_special_tags[] = {
+ 	"VIDEO", "NOSCRIPT", "PRE", "TEMPLATE", "SVG",
+ };
+ 
++/**
++ * Fetch what an <img> shows now that its src, srcset or sizes, or a
++ * source of its <picture>, has changed (VitaSurf): 1 if it changed, 0
++ * if it is the same, -1 if it has no image to replace.
++ */
++static int html_img_reselect(html_content *c, dom_node *img,
++		struct box *box)
++{
++	nsurl *url = NULL;
++	int got = -1;
++
++	if (html_image_has_choice(img)) {
++		if (html_image_source(c, img, &url) != NSERROR_OK)
++			url = NULL;
++	} else {
++		dom_string *src = NULL;
++
++		if (dom_element_get_attribute(img, corestring_dom_src,
++				&src) == DOM_NO_ERR && src != NULL) {
++			if (!box_extract_link(c, src, c->base_url, &url))
++				url = NULL;
++			dom_string_unref(src);
++		}
++	}
++	if (url != NULL) {
++		got = html_object_set_src(c, box, url);
++		nsurl_unref(url);
++	}
++	return got;
++}
++
++/** The <img> a <source> is for: the one after it in its <picture>. */
++static dom_node *html_picture_img(dom_node *source)
++{
++	dom_node *parent = NULL, *n = NULL;
++	dom_string *name = NULL;
++	bool picture = false;
++
++	if (dom_node_get_parent_node(source, &parent) != DOM_NO_ERR ||
++			parent == NULL)
++		return NULL;
++	if (dom_node_get_node_name(parent, &name) == DOM_NO_ERR &&
++			name != NULL) {
++		picture = strcasecmp(dom_string_data(name), "PICTURE") == 0;
++		dom_string_unref(name);
++	}
++	dom_node_unref(parent);
++	if (!picture || dom_node_get_next_sibling(source, &n) != DOM_NO_ERR)
++		return NULL;
++	while (n != NULL) {
++		dom_node *next = NULL;
++
++		name = NULL;
++		if (dom_node_get_node_name(n, &name) == DOM_NO_ERR &&
++				name != NULL) {
++			bool img = strcasecmp(dom_string_data(name),
++					"IMG") == 0;
++
++			dom_string_unref(name);
++			if (img)
++				return n;
++		}
++		if (dom_node_get_next_sibling(n, &next) != DOM_NO_ERR)
++			next = NULL;
++		dom_node_unref(n);
++		n = next;
++	}
++	return NULL;
++}
++
+ /* attributes nothing reads but selectors and the code below */
+ static bool html_attr_any(const char *name)
+ {
+@@ -4938,7 +5016,8 @@ bool html_restyle_attrs(html_content *c,
+ 		const char *name;
+ 		dom_string *tag = NULL, *now = NULL;
+ 		struct box *box;
+-		bool special = false, is_img = false, subtree, sibs, deep;
++		bool special = false, is_img = false, is_source = false;
++		bool subtree, sibs, deep;
+ 		size_t t;
+ 
+ 		if (ch->name == NULL) {
+@@ -4965,6 +5044,8 @@ bool html_restyle_attrs(html_content *c,
+ 				}
+ 			}
+ 			is_img = strcasecmp(dom_string_data(tag), "IMG") == 0;
++			is_source = strcasecmp(dom_string_data(tag),
++					"SOURCE") == 0;
+ 		}
+ 		/* a link given another address keeps its boxes, which take
+ 		 * the new one (VitaSurf) */
+@@ -5079,22 +5160,41 @@ bool html_restyle_attrs(html_content *c,
+ 				talloc_strdup(c->bctx, sq) : NULL;
+ 			free(sq);
+ 		} else if (box != NULL && is_img &&
+-				strcasecmp(name, "src") == 0) {
+-			nsurl *url = NULL;
+-			int got = -1;
+-
+-			if (now != NULL && box_extract_link(c, now,
+-					c->base_url, &url) && url != NULL) {
+-				got = html_object_set_src(c, box, url);
+-				nsurl_unref(url);
+-			}
++				(strcasecmp(name, "src") == 0 ||
++				 strcasecmp(name, "srcset") == 0 ||
++				 strcasecmp(name, "sizes") == 0)) {
++			int got = html_img_reselect(c, ch->node, box);
++
+ 			if (got < 0) {
+-				ATTR_WHY("src on an <img> with no image "
+-						"to replace");
++				ATTR_WHY("%s on an <img> with no image "
++						"to replace", name);
+ 				res = BOX_RESTYLE_LAYOUT;
+ 			} else if (got > 0 && res < BOX_RESTYLE_PAINT) {
+ 				res = BOX_RESTYLE_PAINT;
+ 			}
++		} else if (is_source &&
++				(strcasecmp(name, "srcset") == 0 ||
++				 strcasecmp(name, "sizes") == 0)) {
++			/* a <picture>'s source: its img chooses again */
++			dom_node *img = html_picture_img(ch->node);
++			struct box *ib = img != NULL ? box_for_node(img) :
++				NULL;
++
++			if (ib != NULL) {
++				int got = html_img_reselect(c, img, ib);
++
++				if (got < 0) {
++					ATTR_WHY("%s on a <source> whose img "
++							"has no image to "
++							"replace", name);
++					res = BOX_RESTYLE_LAYOUT;
++				} else if (got > 0 &&
++						res < BOX_RESTYLE_PAINT) {
++					res = BOX_RESTYLE_PAINT;
++				}
++			}
++			if (img != NULL)
++				dom_node_unref(img);
+ 		}
+ 		if (now != NULL)
+ 			dom_string_unref(now);
+diff --git a/content/handlers/html/image_source.c b/content/handlers/html/image_source.c
+new file mode 100644
+index 000000000..85f13ad8b
+--- /dev/null
++++ b/content/handlers/html/image_source.c
+@@ -0,0 +1,782 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Which image an <img> shows (VitaSurf): the HTML standard's selection
++ * of an image source from the srcset and sizes of the element, or of
++ * the first <source> of its <picture> whose media and type fit, with
++ * src as the 1x candidate where the standard adds it.
++ *
++ * NetSurf fetched src alone. A site that gives src its largest image
++ * and srcset the rest, as Next.js's images and Apple's pictures do,
++ * had the largest fetched and decoded for a 960 pixel screen, and an
++ * <img> with srcset and no src showed nothing.
++ */
++
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++#include <dom/dom.h>
++#include <libcss/libcss.h>
++
++#include "utils/corestrings.h"
++#include "utils/log.h"
++#include "utils/nsurl.h"
++#include "content/content_factory.h"
++
++#include "html/private.h"
++#include "html/image_source.h"
++
++/** The device pixel ratio script is told (prelude.js) */
++#define IMAGE_SOURCE_DPR 1.0
++
++/** One candidate of a srcset */
++struct candidate {
++	const char *url;
++	size_t url_len;
++	double density;		/**< 0 until known */
++	int width;		/**< a w descriptor, or 0 */
++};
++
++#define MAX_CANDIDATES 64
++
++static bool is_space(char ch)
++{
++	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' ||
++		ch == '\f';
++}
++
++/**
++ * Read one descriptor (HTML's "parse a srcset attribute", the
++ * descriptor parser) into a candidate; false if it is in error.
++ */
++static bool descriptor(struct candidate *cand, const char *d, size_t len,
++		       bool *has_h)
++{
++	char last, buf[64];
++	char *end;
++
++	if (len < 2 || len >= sizeof(buf))
++		return false;
++	last = d[len - 1];
++	memcpy(buf, d, len - 1);
++	buf[len - 1] = '\0';
++
++	if (last == 'w') {
++		long w;
++		size_t i;
++
++		if (cand->width != 0 || cand->density != 0)
++			return false;
++		for (i = 0; i < len - 1; i++) {
++			if (buf[i] < '0' || buf[i] > '9')
++				return false;
++		}
++		w = strtol(buf, NULL, 10);
++		if (w <= 0 || w > 1000000)
++			return false;
++		cand->width = (int) w;
++		return true;
++	} else if (last == 'x') {
++		double x;
++
++		if (cand->width != 0 || cand->density != 0 || *has_h)
++			return false;
++		x = strtod(buf, &end);
++		if (end == buf || *end != '\0' || !(x >= 0))
++			return false;
++		/* a density of 0 is valid, and the least wanted */
++		cand->density = x > 0 ? x : 1e-9;
++		return true;
++	} else if (last == 'h') {
++		size_t i;
++
++		if (*has_h || cand->density != 0)
++			return false;
++		for (i = 0; i < len - 1; i++) {
++			if (buf[i] < '0' || buf[i] > '9')
++				return false;
++		}
++		*has_h = true;
++		return true;
++	}
++	return false;
++}
++
++/**
++ * Parse a srcset attribute as the HTML standard does, into at most
++ * \a max candidates; returns how many.
++ */
++static int parse_srcset(const char *s, size_t len, struct candidate *out,
++			int max)
++{
++	size_t pos = 0;
++	int n = 0;
++
++	while (pos < len && n < max) {
++		struct candidate cand;
++		size_t start;
++		bool error = false, has_h = false;
++
++		/* splitting loop: whitespace and commas */
++		while (pos < len && (is_space(s[pos]) || s[pos] == ','))
++			pos++;
++		if (pos >= len)
++			break;
++
++		start = pos;
++		while (pos < len && !is_space(s[pos]))
++			pos++;
++		memset(&cand, 0, sizeof(cand));
++		cand.url = s + start;
++		cand.url_len = pos - start;
++
++		if (s[pos - 1] == ',') {
++			/* a URL ending in commas has no descriptors */
++			while (cand.url_len > 0 &&
++			       cand.url[cand.url_len - 1] == ',')
++				cand.url_len--;
++		} else {
++			/* tokenize the descriptors, to a comma outside
++			 * parentheses */
++			size_t d0 = 0;
++			bool in_desc = false, in_parens = false;
++
++			while (pos < len) {
++				char ch = s[pos];
++
++				if (in_parens) {
++					if (ch == ')')
++						in_parens = false;
++					pos++;
++					continue;
++				}
++				if (is_space(ch) || ch == ',') {
++					if (in_desc && !error &&
++					    !descriptor(&cand, s + d0,
++							pos - d0, &has_h))
++						error = true;
++					in_desc = false;
++					pos++;
++					if (ch == ',')
++						break;
++					continue;
++				}
++				if (!in_desc) {
++					in_desc = true;
++					d0 = pos;
++				}
++				if (ch == '(')
++					in_parens = true;
++				pos++;
++			}
++			if (in_desc && !error &&
++			    !descriptor(&cand, s + d0, pos - d0, &has_h))
++				error = true;
++		}
++		/* a height without a width is an error */
++		if (has_h && cand.width == 0)
++			error = true;
++		if (!error && cand.url_len > 0)
++			out[n++] = cand;
++	}
++	return n;
++}
++
++/* --- lengths, for the sizes attribute -------------------------------- */
++
++struct len_ctx {
++	const char *p, *end;
++	double vw, vh, em;
++	bool ok;
++};
++
++static void len_skip(struct len_ctx *x)
++{
++	while (x->p < x->end && is_space(*x->p))
++		x->p++;
++}
++
++static bool len_word(struct len_ctx *x, const char *w)
++{
++	size_t n = strlen(w);
++
++	if ((size_t)(x->end - x->p) >= n && strncasecmp(x->p, w, n) == 0) {
++		x->p += n;
++		return true;
++	}
++	return false;
++}
++
++static double len_sum(struct len_ctx *x);
++
++/** One value: a number with its unit, a bracket or a math function */
++static double len_value(struct len_ctx *x)
++{
++	double v;
++	char *e;
++	char num[48];
++	char kind = 0;
++	size_t n = 0;
++
++	len_skip(x);
++	if (x->p >= x->end) {
++		x->ok = false;
++		return 0;
++	}
++	if (*x->p == '(') {
++		x->p++;
++		v = len_sum(x);
++		len_skip(x);
++		if (x->p < x->end && *x->p == ')')
++			x->p++;
++		else
++			x->ok = false;
++		return v;
++	}
++	if (len_word(x, "calc(")) {
++		v = len_sum(x);
++		len_skip(x);
++		if (x->p < x->end && *x->p == ')')
++			x->p++;
++		else
++			x->ok = false;
++		return v;
++	}
++	if (len_word(x, "min("))
++		kind = 'i';
++	else if (len_word(x, "max("))
++		kind = 'a';
++	else if (len_word(x, "clamp("))
++		kind = 'c';
++	if (kind != 0) {
++		double vals[8];
++		int k = 0, i;
++
++		for (;;) {
++			double one = len_sum(x);
++
++			if (k < 8)
++				vals[k++] = one;
++			len_skip(x);
++			if (x->p < x->end && *x->p == ',') {
++				x->p++;
++				continue;
++			}
++			break;
++		}
++		if (x->p < x->end && *x->p == ')')
++			x->p++;
++		else
++			x->ok = false;
++		if (k == 0) {
++			x->ok = false;
++			return 0;
++		}
++		if (kind == 'c') {
++			if (k != 3) {
++				x->ok = false;
++				return 0;
++			}
++			/* max(MIN, min(VAL, MAX)) */
++			v = vals[1] > vals[2] ? vals[2] : vals[1];
++			return v < vals[0] ? vals[0] : v;
++		}
++		v = vals[0];
++		for (i = 1; i < k; i++) {
++			if (kind == 'i' ? vals[i] < v : vals[i] > v)
++				v = vals[i];
++		}
++		return v;
++	}
++
++	while (x->p + n < x->end && n < sizeof(num) - 1 &&
++	       ((x->p[n] >= '0' && x->p[n] <= '9') || x->p[n] == '.' ||
++		((x->p[n] == '-' || x->p[n] == '+') && n == 0) ||
++		((x->p[n] == 'e' || x->p[n] == 'E') && n > 0 &&
++		 x->p + n + 1 < x->end &&
++		 ((x->p[n + 1] >= '0' && x->p[n + 1] <= '9') ||
++		  x->p[n + 1] == '-' || x->p[n + 1] == '+')))) {
++		num[n] = x->p[n];
++		if ((x->p[n] == 'e' || x->p[n] == 'E') &&
++		    (x->p[n + 1] == '-' || x->p[n + 1] == '+')) {
++			n++;
++			num[n] = x->p[n];
++		}
++		n++;
++	}
++	num[n] = '\0';
++	v = strtod(num, &e);
++	if (n == 0 || e == num) {
++		x->ok = false;
++		return 0;
++	}
++	x->p += n;
++
++	if (len_word(x, "px")) return v;
++	if (len_word(x, "rem")) return v * 16;
++	if (len_word(x, "em")) return v * x->em;
++	if (len_word(x, "ex")) return v * x->em / 2;
++	if (len_word(x, "ch")) return v * x->em / 2;
++	if (len_word(x, "vmin")) return v * (x->vw < x->vh ? x->vw : x->vh) / 100;
++	if (len_word(x, "vmax")) return v * (x->vw > x->vh ? x->vw : x->vh) / 100;
++	if (len_word(x, "svw") || len_word(x, "lvw") || len_word(x, "dvw") ||
++	    len_word(x, "vw") || len_word(x, "vi"))
++		return v * x->vw / 100;
++	if (len_word(x, "svh") || len_word(x, "lvh") || len_word(x, "dvh") ||
++	    len_word(x, "vh") || len_word(x, "vb"))
++		return v * x->vh / 100;
++	if (len_word(x, "in")) return v * 96;
++	if (len_word(x, "cm")) return v * 96 / 2.54;
++	if (len_word(x, "mm")) return v * 96 / 25.4;
++	if (len_word(x, "q")) return v * 96 / 101.6;
++	if (len_word(x, "pt")) return v * 96 / 72;
++	if (len_word(x, "pc")) return v * 16;
++	/* a bare number: a factor in calc() */
++	if (x->p < x->end && ((*x->p >= 'a' && *x->p <= 'z') ||
++			      (*x->p >= 'A' && *x->p <= 'Z') || *x->p == '%'))
++		x->ok = false;
++	return v;
++}
++
++static double len_product(struct len_ctx *x)
++{
++	double v = len_value(x);
++
++	for (;;) {
++		len_skip(x);
++		if (x->p < x->end && *x->p == '*') {
++			x->p++;
++			v *= len_value(x);
++		} else if (x->p < x->end && *x->p == '/') {
++			double d;
++
++			x->p++;
++			d = len_value(x);
++			if (d == 0) {
++				x->ok = false;
++				return 0;
++			}
++			v /= d;
++		} else {
++			return v;
++		}
++	}
++}
++
++static double len_sum(struct len_ctx *x)
++{
++	double v = len_product(x);
++
++	for (;;) {
++		len_skip(x);
++		if (x->p < x->end && *x->p == '+') {
++			x->p++;
++			v += len_product(x);
++		} else if (x->p < x->end && *x->p == '-' &&
++			   x->p + 1 < x->end && is_space(x->p[1])) {
++			x->p++;
++			v -= len_product(x);
++		} else {
++			return v;
++		}
++	}
++}
++
++/**
++ * A source size value: a length, not negative; false if \a s is not
++ * one.
++ */
++static bool size_value(const char *s, size_t len, const html_content *c,
++		       double *px)
++{
++	struct len_ctx x;
++	double v;
++
++	x.p = s;
++	x.end = s + len;
++	x.vw = FIXTOFLT(c->media.width);
++	x.vh = FIXTOFLT(c->media.height);
++	x.em = c->unit_len_ctx.font_size_default != 0 ?
++		FIXTOFLT(c->unit_len_ctx.font_size_default) : 16;
++	x.ok = true;
++	v = len_sum(&x);
++	len_skip(&x);
++	if (!x.ok || x.p != x.end || v < 0)
++		return false;
++	*px = v;
++	return true;
++}
++
++static bool media_matches(const html_content *c, const char *mq, size_t len)
++{
++	bool match = false;
++
++	if (css_media_query_matches(mq, len, &c->unit_len_ctx, &c->media,
++			&match) != CSS_OK)
++		return false;
++	return match;
++}
++
++/**
++ * Parse a sizes attribute and give the size it chooses now, in CSS
++ * pixels: the first entry whose media condition matches, or 100vw.
++ */
++static double parse_sizes(const html_content *c, const char *s, size_t len)
++{
++	size_t pos = 0;
++
++	while (s != NULL && pos < len) {
++		size_t start = pos, end, v0;
++		int depth = 0;
++		double px;
++
++		/* one entry, to a comma outside brackets */
++		while (pos < len) {
++			if (s[pos] == '(')
++				depth++;
++			else if (s[pos] == ')' && depth > 0)
++				depth--;
++			else if (s[pos] == ',' && depth == 0)
++				break;
++			pos++;
++		}
++		end = pos;
++		if (pos < len)
++			pos++;
++
++		while (start < end && is_space(s[start]))
++			start++;
++		while (end > start && is_space(s[end - 1]))
++			end--;
++		if (start == end)
++			continue;
++
++		/* its last component value is the size */
++		v0 = end;
++		if (s[end - 1] == ')') {
++			depth = 0;
++			while (v0 > start) {
++				v0--;
++				if (s[v0] == ')')
++					depth++;
++				else if (s[v0] == '(' && --depth == 0)
++					break;
++			}
++			while (v0 > start && !is_space(s[v0 - 1]) &&
++			       s[v0 - 1] != ')' && s[v0 - 1] != '(')
++				v0--;
++		} else {
++			while (v0 > start && !is_space(s[v0 - 1]) &&
++			       s[v0 - 1] != ')')
++				v0--;
++		}
++		if (end - v0 == 4 && strncasecmp(s + v0, "auto", 4) == 0)
++			continue;
++		if (!size_value(s + v0, end - v0, c, &px))
++			continue;
++
++		/* what comes before it is the media condition */
++		while (v0 > start && is_space(s[v0 - 1]))
++			v0--;
++		if (v0 == start || media_matches(c, s + start, v0 - start))
++			return px;
++	}
++	return FIXTOFLT(c->media.width);
++}
++
++/* --- choosing -------------------------------------------------------- */
++
++static dom_string *attr(dom_node *n, dom_string *name)
++{
++	dom_string *v = NULL;
++
++	if (dom_element_get_attribute(n, name, &v) != DOM_NO_ERR)
++		return NULL;
++	return v;
++}
++
++/** Whether a <source> type attribute names an image this build shows */
++static bool type_supported(dom_string *type)
++{
++	const char *t = dom_string_data(type);
++	size_t len = dom_string_byte_length(type);
++	lwc_string *mime;
++	content_type ct;
++
++	while (len > 0 && is_space(*t)) {
++		t++;
++		len--;
++	}
++	while (len > 0 && is_space(t[len - 1]))
++		len--;
++	if (len == 0)
++		return true;
++	/* the type alone, not its parameters */
++	{
++		size_t i;
++
++		for (i = 0; i < len; i++) {
++			if (t[i] == ';' || is_space(t[i])) {
++				len = i;
++				break;
++			}
++		}
++	}
++	if (lwc_intern_string(t, len, &mime) != lwc_error_ok)
++		return false;
++	ct = content_factory_type_from_mime_type(mime);
++	lwc_string_unref(mime);
++	return (ct & CONTENT_IMAGE) != 0;
++}
++
++/**
++ * Choose among a source set: each width made a density by the size,
++ * then the least density that is at least the device's, or failing
++ * that the greatest.
++ */
++static int choose(struct candidate *cand, int n, double size)
++{
++	int i, best = -1;
++
++	if (size <= 0)
++		size = 1;
++	for (i = 0; i < n; i++) {
++		if (cand[i].width != 0)
++			cand[i].density = cand[i].width / size;
++		else if (cand[i].density == 0)
++			cand[i].density = 1;
++	}
++	for (i = 0; i < n; i++) {
++		if (cand[i].density < IMAGE_SOURCE_DPR)
++			continue;
++		if (best < 0 || cand[i].density < cand[best].density)
++			best = i;
++	}
++	if (best >= 0)
++		return best;
++	for (i = 0; i < n; i++) {
++		if (best < 0 || cand[i].density > cand[best].density)
++			best = i;
++	}
++	return best;
++}
++
++static nserror make_url(const html_content *c, const char *s, size_t len,
++			nsurl **url)
++{
++	char *text;
++	nserror err;
++
++	/* leading and trailing whitespace are not part of a URL */
++	while (len > 0 && is_space(*s)) {
++		s++;
++		len--;
++	}
++	while (len > 0 && is_space(s[len - 1]))
++		len--;
++	if (len == 0) {
++		*url = NULL;
++		return NSERROR_OK;
++	}
++	text = malloc(len + 1);
++	if (text == NULL)
++		return NSERROR_NOMEM;
++	memcpy(text, s, len);
++	text[len] = '\0';
++	err = nsurl_join(c->base_url, text, url);
++	free(text);
++	if (err != NSERROR_OK) {
++		*url = NULL;
++		/* an address that does not parse shows nothing */
++		return err == NSERROR_NOMEM ? err : NSERROR_OK;
++	}
++	return NSERROR_OK;
++}
++
++/** Choose from one srcset and sizes; false if the set is empty. */
++static bool from_set(const html_content *c, dom_string *srcset,
++		     dom_string *sizes, dom_string *src, nsurl **url,
++		     nserror *err)
++{
++	struct candidate cand[MAX_CANDIDATES];
++	int n, i, k;
++	bool has_w = false, has_1x = false;
++	double size;
++
++	n = parse_srcset(dom_string_data(srcset),
++			dom_string_byte_length(srcset), cand,
++			MAX_CANDIDATES - 1);
++	for (i = 0; i < n; i++) {
++		if (cand[i].width != 0)
++			has_w = true;
++		else if (cand[i].density == 0 || cand[i].density == 1)
++			has_1x = true;
++	}
++	/* src is the 1x candidate unless the set has one or widths */
++	if (src != NULL && dom_string_byte_length(src) > 0 && !has_w &&
++	    !has_1x) {
++		memset(&cand[n], 0, sizeof(cand[n]));
++		cand[n].url = dom_string_data(src);
++		cand[n].url_len = dom_string_byte_length(src);
++		cand[n].density = 1;
++		n++;
++	}
++	if (n == 0)
++		return false;
++
++	size = has_w ? parse_sizes(c, sizes != NULL ?
++			dom_string_data(sizes) : NULL, sizes != NULL ?
++			dom_string_byte_length(sizes) : 0) : 1;
++	k = choose(cand, n, size);
++	*err = make_url(c, cand[k].url, cand[k].url_len, url);
++	return true;
++}
++
++/* exported interface documented in html/image_source.h */
++bool html_image_has_choice(dom_node *img)
++{
++	dom_node *parent = NULL;
++	dom_string *name = NULL;
++	bool has = false;
++
++	if (dom_element_has_attribute(img, corestring_dom_srcset, &has) ==
++			DOM_NO_ERR && has)
++		return true;
++	if (dom_node_get_parent_node(img, &parent) != DOM_NO_ERR ||
++			parent == NULL)
++		return false;
++	if (dom_node_get_node_name(parent, &name) == DOM_NO_ERR &&
++	    name != NULL) {
++		has = dom_string_caseless_lwc_isequal(name,
++				corestring_lwc_picture);
++		dom_string_unref(name);
++	}
++	dom_node_unref(parent);
++	return has;
++}
++
++/* exported interface documented in html/image_source.h */
++nserror html_image_source(html_content *c, dom_node *img, nsurl **url)
++{
++	dom_node *parent = NULL, *child = NULL;
++	dom_string *src, *srcset, *sizes, *name = NULL;
++	nserror err = NSERROR_OK;
++	bool picture = false;
++
++	*url = NULL;
++	html_media_ready(c);
++
++	/* a <picture>'s sources before the img, in order */
++	if (dom_node_get_parent_node(img, &parent) == DOM_NO_ERR &&
++	    parent != NULL &&
++	    dom_node_get_node_name(parent, &name) == DOM_NO_ERR &&
++	    name != NULL) {
++		picture = dom_string_caseless_lwc_isequal(name,
++				corestring_lwc_picture);
++		dom_string_unref(name);
++	}
++	if (picture &&
++	    dom_node_get_first_child(parent, &child) == DOM_NO_ERR) {
++		while (child != NULL && child != img) {
++			dom_node *next = NULL;
++			dom_node_type type;
++			bool done = false;
++
++			if (dom_node_get_node_type(child, &type) ==
++					DOM_NO_ERR &&
++			    type == DOM_ELEMENT_NODE &&
++			    dom_node_get_node_name(child, &name) ==
++					DOM_NO_ERR && name != NULL) {
++				bool is_source = dom_string_caseless_lwc_isequal(
++						name, corestring_lwc_source);
++
++				dom_string_unref(name);
++				srcset = is_source ? attr(child,
++						corestring_dom_srcset) : NULL;
++				if (srcset != NULL) {
++					dom_string *media = attr(child,
++							corestring_dom_media);
++					dom_string *type_a = attr(child,
++							corestring_dom_type);
++					bool fits = true;
++
++					if (media != NULL) {
++						fits = media_matches(c,
++							dom_string_data(media),
++							dom_string_byte_length(
++								media));
++						dom_string_unref(media);
++					}
++					if (fits && type_a != NULL)
++						fits = type_supported(type_a);
++					if (type_a != NULL)
++						dom_string_unref(type_a);
++					if (fits) {
++						sizes = attr(child,
++							corestring_dom_sizes);
++						done = from_set(c, srcset,
++								sizes, NULL,
++								url, &err);
++						if (sizes != NULL)
++							dom_string_unref(
++								sizes);
++					}
++					dom_string_unref(srcset);
++				}
++			}
++			if (done) {
++				dom_node_unref(child);
++				dom_node_unref(parent);
++				return err;
++			}
++			if (dom_node_get_next_sibling(child, &next) !=
++					DOM_NO_ERR)
++				next = NULL;
++			dom_node_unref(child);
++			child = next;
++		}
++		if (child != NULL)
++			dom_node_unref(child);
++	}
++	if (parent != NULL)
++		dom_node_unref(parent);
++
++	/* then the img itself */
++	src = attr(img, corestring_dom_src);
++	srcset = attr(img, corestring_dom_srcset);
++	if (srcset != NULL) {
++		sizes = attr(img, corestring_dom_sizes);
++		if (!from_set(c, srcset, sizes, src, url, &err) &&
++		    src != NULL)
++			err = make_url(c, dom_string_data(src),
++					dom_string_byte_length(src), url);
++		if (sizes != NULL)
++			dom_string_unref(sizes);
++		dom_string_unref(srcset);
++	} else if (src != NULL) {
++		err = make_url(c, dom_string_data(src),
++				dom_string_byte_length(src), url);
++	}
++	if (src != NULL)
++		dom_string_unref(src);
++	return err;
++}
+diff --git a/content/handlers/html/image_source.h b/content/handlers/html/image_source.h
+new file mode 100644
+index 000000000..29677f8da
+--- /dev/null
++++ b/content/handlers/html/image_source.h
+@@ -0,0 +1,49 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * Which image an <img> shows: srcset, sizes and <picture> (VitaSurf).
++ */
++
++#ifndef NETSURF_HTML_IMAGE_SOURCE_H
++#define NETSURF_HTML_IMAGE_SOURCE_H
++
++struct html_content;
++struct dom_node;
++struct nsurl;
++
++/**
++ * Whether an <img> has a choice to make: a srcset, or a <picture> as
++ * its parent. One without shows its src, as it always has.
++ */
++bool html_image_has_choice(struct dom_node *img);
++
++/**
++ * The address an <img> shows now, chosen as the HTML standard selects
++ * an image source.
++ *
++ * \param c    The document's content
++ * \param img  The <img> element
++ * \param url  Set to the address, or NULL when it has none
++ * \return NSERROR_OK, or NSERROR_NOMEM
++ */
++nserror html_image_source(struct html_content *c, struct dom_node *img,
++		struct nsurl **url);
++
++#endif
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 29dd692c1..18e1b9e0a 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -732,6 +732,13 @@ struct box *html_topmost_box_at(html_content *html, int x, int y);
+ /** Let go of a document's elements in any state, as it goes. */
+ void html_drop_dynamic(html_content *c);
+ 
++/**
++ * Make sure the media and lengths are set for the viewport (VitaSurf):
++ * conversion sets them, and a media query or a length read before it
++ * needs them too.
++ */
++void html_media_ready(html_content *c);
++
+ /** Log what changes of :hover and the like cost since the last call
+  * (VitaSurf). */
+ void html_dynamic_report(void);
+diff --git a/utils/corestringlist.h b/utils/corestringlist.h
+index ec840e9d4..cc542cf37 100644
+--- a/utils/corestringlist.h
++++ b/utils/corestringlist.h
+@@ -104,6 +104,7 @@ CORESTRING_LWC_STRING(optgroup);
+ CORESTRING_LWC_STRING(option);
+ CORESTRING_LWC_STRING(p);
+ CORESTRING_LWC_STRING(param);
++CORESTRING_LWC_STRING(picture);
+ CORESTRING_LWC_STRING(password);
+ CORESTRING_LWC_STRING(poly);
+ CORESTRING_LWC_STRING(polygon);
+@@ -117,6 +118,7 @@ CORESTRING_LWC_STRING(resource);
+ CORESTRING_LWC_STRING(right);
+ CORESTRING_LWC_STRING(search);
+ CORESTRING_LWC_STRING(select);
++CORESTRING_LWC_STRING(source);
+ CORESTRING_LWC_STRING(src);
+ CORESTRING_LWC_STRING(style);
+ CORESTRING_LWC_STRING(svg);
+@@ -325,6 +327,7 @@ CORESTRING_DOM_STRING(show);
+ CORESTRING_DOM_STRING(size);
+ CORESTRING_DOM_STRING(sizes);
+ CORESTRING_DOM_STRING(src);
++CORESTRING_DOM_STRING(srcset);
+ CORESTRING_DOM_STRING(stalled);
+ CORESTRING_DOM_STRING(start);
+ CORESTRING_DOM_STRING(storage);

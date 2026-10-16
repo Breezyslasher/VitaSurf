@@ -91,6 +91,7 @@
 #include "content/handlers/html/box_manipulate.h"
 #include "content/handlers/html/css.h"
 #include "content/handlers/html/frame_doc.h"
+#include "content/handlers/html/image_source.h"
 #include "desktop/browser_private.h"
 #include "desktop/scrollbar.h"
 
@@ -17594,6 +17595,47 @@ static JSValue win_vita_canvas_write(JSContext *ctx, JSValueConst this_val,
 }
 
 
+/*
+ * The address an <img> shows (VitaSurf), as its srcset, sizes and
+ * <picture> choose it, for currentSrc; null for an element of another
+ * document than the window's.
+ */
+static JSValue win_vita_current_src(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node;
+	struct dom_document *doc = NULL;
+	nsurl *url = NULL;
+	JSValue r;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL || thread->htmlc == NULL) {
+		return JS_NULL;
+	}
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL) {
+		return JS_NULL;
+	}
+	if (dom_node_get_owner_document(node, &doc) != DOM_NO_ERR ||
+	    doc == NULL) {
+		return JS_NULL;
+	}
+	dom_node_unref(doc);
+	if ((struct dom_node *)doc != (struct dom_node *)thread->htmlc->document) {
+		return JS_NULL;
+	}
+	if (html_image_source(thread->htmlc, node, &url) != NSERROR_OK ||
+	    url == NULL) {
+		return JS_NewString(ctx, "");
+	}
+	r = JS_NewStringLen(ctx, nsurl_access(url), nsurl_length(url));
+	nsurl_unref(url);
+	return r;
+}
+
+
 static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 			    int argc, JSValueConst *argv)
 {
@@ -18400,6 +18442,9 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaPopover", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaCurrentSrc",
+			  JS_NewCFunction(ctx, win_vita_current_src,
+					  "__vitaCurrentSrc", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaCanvasPath",
 			  JS_NewCFunction(ctx, win_vita_canvas_path,
 					  "__vitaCanvasPath", 6));
