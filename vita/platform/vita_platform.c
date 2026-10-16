@@ -134,8 +134,15 @@ void vita_options_floor(void)
 	if (nsoption_int(max_fetchers_per_host) < 6) {
 		nsoption_set_int(max_fetchers_per_host, 6);
 	}
-	if (nsoption_int(max_fetchers) < 12) {
-		nsoption_set_int(max_fetchers, 12);
+	/*
+	 * Twelve in all was a dozen hosts' worth of a news page's fetches:
+	 * nytimes.com asks fifteen hosts for 414 things, and 346 of them
+	 * waited for one of the twelve, three minutes between them, the
+	 * longest 4.4 s, for answers that are mostly the network's wait for
+	 * a first byte. Browsers run far more at once.
+	 */
+	if (nsoption_int(max_fetchers) < 24) {
+		nsoption_set_int(max_fetchers, 24);
 	}
 	/*
 	 * The memory cache, of which NetSurf gives a quarter to decoded
