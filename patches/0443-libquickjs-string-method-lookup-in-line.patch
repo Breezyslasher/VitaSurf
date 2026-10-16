@@ -1,0 +1,39 @@
+diff --git a/quickjs.c b/quickjs.c
+index fd2491b..39f0634 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -19534,6 +19534,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                             break;
+                         }
+                     }
++                } else if ((JS_VALUE_GET_TAG(obj) == JS_TAG_STRING ||
++                            JS_VALUE_GET_TAG(obj) == JS_TAG_STRING_ROPE) &&
++                           atom != JS_ATOM_length &&
++                           !__JS_AtomIsTaggedInt(atom)) {
++                    /*
++                     * A string's method, str.charCodeAt or str.slice
++                     * (VitaSurf): a string's own properties are its
++                     * length and its indices, so any other name is
++                     * String.prototype's, looked for as an object's
++                     * is. Through JS_GetPropertyInternal the lookup
++                     * was a fifth of a loop hashing a string a
++                     * character at a time, as styled-components does
++                     * for every rule. A getter, an exotic object on
++                     * the chain or a miss takes the general path.
++                     */
++                    p = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_STRING]);
++                    for(;;) {
++                        prs = find_own_property(&pr, p, atom);
++                        if (prs) {
++                            if (unlikely(prs->flags & JS_PROP_TMASK))
++                                goto get_field2_slow_path;
++                            val = js_dup(pr->u.value);
++                            break;
++                        }
++                        p = p->shape->proto;
++                        if (!p || unlikely(p->is_exotic))
++                            goto get_field2_slow_path;
++                    }
+                 } else {
+                 get_field2_slow_path:
+                     sf->cur_pc = pc;

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<!--
+  A string primitive's methods, looked up in line (VitaSurf).
+
+  str.method(...) finds the method on String.prototype without the
+  general property lookup, since a string's own properties are its length
+  and its indices (patch 0443). A page must not be able to tell: a getter
+  on String.prototype still runs with the string as this, a method added
+  or replaced is the one called, the chain above String.prototype is
+  followed, a Proxy on it is asked, and a miss is undefined. Each line must
+  say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>String method lookup</title></head>
+<body><pre id="out"></pre>
+<script>
+"use strict";
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+var s = 'hello', r = 'he' + String(Date.now() > 0 ? 'llo' : '');
+ok('a built-in method', s.toUpperCase(), 'HELLO');
+ok('on a string made by concatenation', r.slice(1, 3), 'el');
+ok('charCodeAt', s.charCodeAt(1), 101);
+ok('length is the string\'s own', s.length, 5);
+ok('an index is the string\'s own', s[1], 'e');
+ok('a method from Object.prototype', s.hasOwnProperty('length'), true);
+ok('a miss is undefined', s.noSuchMethod, undefined);
+ok('a miss called throws', (function () { try { s.noSuchMethod(); return 'no'; } catch (e) { return e instanceof TypeError; } })(), true);
+String.prototype.shout = function () { return this + '!'; };
+ok('a method added to String.prototype', s.shout(), 'hello!');
+var oldSlice = String.prototype.slice;
+String.prototype.slice = function () { return 'replaced'; };
+ok('a replaced built-in is the one called', s.slice(1), 'replaced');
+String.prototype.slice = oldSlice;
+ok('and the original again once put back', s.slice(1), 'ello');
+Object.defineProperty(String.prototype, 'who', { configurable: true, get: function () { return typeof this + ':' + this; } });
+ok('a getter runs with the string as this', s.who, 'string:hello');
+delete String.prototype.who;
+Object.prototype.fromObject = function () { return 'object ' + this.length; };
+ok('the chain above String.prototype is followed', s.fromObject(), 'object 5');
+delete Object.prototype.fromObject;
+var asked = [];
+var proxy = new Proxy({}, { get: function (t, k, rcv) { asked.push(k); return k === 'viaProxy' ? function () { return 'proxy ' + this; } : undefined; } });
+var objProto = Object.getPrototypeOf(String.prototype);
+Object.setPrototypeOf(String.prototype, proxy);
+var got = s.viaProxy();
+Object.setPrototypeOf(String.prototype, objProto);
+ok('a Proxy on the chain is asked', got, 'proxy hello');
+ok('with the name looked for', asked.indexOf('viaProxy') >= 0, true);
+ok('the chain is back as it was', s.hasOwnProperty('length'), true);
+ok('a method of a string made from a number', String(12345).indexOf('3'), 2);
+ok('a two-byte string', '中文字'.charCodeAt(2), 0x5b57);
+function hash(e, t) { for (var i = t.length; i;) e = 33 * e ^ t.charCodeAt(--i); return e; }
+ok('a hash a character at a time', hash(5381, 'styled-components'), hash(5381, ['styled', 'components'].join('-')));
+document.getElementById('out').textContent = out.join('\n');
+out.forEach(function (l) { console.log('string-method-lookup: ' + l); });
+console.log('string-method-lookup: done');
+</script>
+</body></html>
