@@ -6610,6 +6610,7 @@ function CSSStyleSheet(opts){
  this.href=owner&&owner.tagName==='LINK'?owner.href:null;this.title=owner?owner.title||null:null;
  this.media=new MediaList(owner?owner.getAttribute('media'):(opts&&opts.media)||'');
  this._constructed=!owner;this._rules=owner?null:[];this._src=null;this._adopters=[];
+ this._pending=null;
  this._ver=0;this._tv=-1;this._tc='';}
 Object.defineProperty(CSSStyleSheet.prototype,'cssRules',{configurable:true,get:function(){
  var o=this.ownerNode;
@@ -6618,7 +6619,12 @@ Object.defineProperty(CSSStyleSheet.prototype,'cssRules',{configurable:true,get:
      was last read, and then only until the text itself changes */
   if(this._rules===null||t!==this._src){this._src=t;
    this._rules=cssSplit(cssStrip(t)).map(function(x){return makeRule(x,this,null);},this);}}
- else if(this._rules===null)this._rules=[];
+ else if(this._rules===null){
+  /* a constructed sheet's text, read into rules once they are asked
+     for (VitaSurf) */
+  this._rules=this._pending!==null?cssSplit(cssStrip(this._pending))
+   .map(function(x){return makeRule(x,this,null);},this):[];
+  this._pending=null;}
  return this._rules;}});
 Object.defineProperty(CSSStyleSheet.prototype,'rules',{configurable:true,get:function(){return this.cssRules;}});
 CSSStyleSheet.prototype.insertRule=function(text,index){return rulesInsert(this.cssRules,this,null,text,index);};
@@ -6628,8 +6634,16 @@ CSSStyleSheet.prototype.addRule=function(sel,style,index){
 CSSStyleSheet.prototype.removeRule=function(index){this.deleteRule(index===undefined?0:index);};
 CSSStyleSheet.prototype.replaceSync=function(text){
  if(!this._constructed)throw new DOMException("Failed to execute 'replaceSync' on 'CSSStyleSheet': Can't call replaceSync on non-constructed CSSStyleSheets.",'NotAllowedError');
+ var t=String(text);
+ /* The text is kept and read into rules only when cssRules is asked
+    for (VitaSurf): a component library makes a sheet for each kind of
+    component, and nearly all are only adopted, which needs the text.
+    Every one had been split into rules and declarations in script, 15%
+    of old.reddit.com's login page. */
+ if(!/@import/i.test(t)){this._rules=null;this._pending=t;sheetDirty(this);return;}
  /* @import is not allowed in a constructed sheet and is dropped */
- this._rules=cssSplit(cssStrip(String(text))).filter(function(x){return !/^@import\b/i.test(x);})
+ this._pending=null;
+ this._rules=cssSplit(cssStrip(t)).filter(function(x){return !/^@import\b/i.test(x);})
   .map(function(x){return makeRule(x,this,null);},this);
  sheetDirty(this);};
 CSSStyleSheet.prototype.replace=function(text){var s=this;
@@ -6643,7 +6657,8 @@ CSSStyleSheet.prototype._text=function(){
     time. Every change goes through sheetDirty, which moves _ver on. */
  if(this.disabled)return '';
  if(this._constructed&&this._tv===this._ver)return this._tc;
- var t=this.cssRules.map(function(r){return r.cssText;}).join('\n');
+ var t=this._constructed&&this._rules===null&&this._pending!==null?this._pending:
+  this.cssRules.map(function(r){return r.cssText;}).join('\n');
  if(this._constructed){this._tv=this._ver;this._tc=t;}
  return t;};
 var sheetsDirty=[],sheetsFlush=false;

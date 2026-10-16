@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!--
+  A constructed sheet keeps the text replaceSync() gives it and reads it
+  into rules only when cssRules is asked for (VitaSurf). A page must not
+  be able to tell: the rules, their order and media, insertRule after
+  replaceSync, @import dropped, and the sheet adopted by a shadow root
+  styling it. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Constructed sheet</title></head>
+<body>
+<x-a id="h"></x-a>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+var s = new CSSStyleSheet();
+s.replaceSync('p { color: rgb(1, 2, 3) } @media screen { p { margin-left: 3px } }');
+ok('two rules', s.cssRules.length, 2);
+ok('the first is a style rule', s.cssRules[0].selectorText, 'p');
+ok('the second a media rule', s.cssRules[1].media.mediaText, 'screen');
+s.insertRule('b { color: blue }', 0);
+ok('a rule inserted after replaceSync goes first', s.cssRules[0].selectorText, 'b');
+ok('and the count follows', s.cssRules.length, 3);
+s.replaceSync('i { color: green }');
+ok('replaceSync again replaces them all', s.cssRules.length + ' ' + s.cssRules[0].selectorText, '1 i');
+var s2 = new CSSStyleSheet();
+s2.replaceSync('@import url(x.css); p { color: red }');
+ok('an @import is dropped', s2.cssRules.length, 1);
+var s3 = new CSSStyleSheet();
+s3.replaceSync('.k { color: rgb(0, 7, 0) }');
+var r = document.getElementById('h').attachShadow({ mode: 'open' });
+r.innerHTML = '<p class="k">t</p>';
+r.adoptedStyleSheets = [s3];
+s3.replace('.k { color: rgb(0, 8, 0) }').then(function () {
+  setTimeout(function () {
+    ok('an adopted sheet never read as rules styles its tree', getComputedStyle(r.querySelector('p')).color, 'rgb(0, 8, 0)');
+    ok('and is read when asked', s3.cssRules[0].style.color, 'rgb(0, 8, 0)');
+    document.getElementById('out').textContent = out.join('\n');
+    out.forEach(function (l) { console.log('constructed-sheet-lazy: ' + l); });
+    console.log('constructed-sheet-lazy: done');
+  }, 50);
+});
+</script>
+</body></html>
