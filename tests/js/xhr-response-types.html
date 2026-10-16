@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<!--
+  An XMLHttpRequest's response by responseType (VitaSurf). The body is
+  decoded as text only when responseText or a text or json response is
+  read; an arraybuffer's bytes are never decoded, and responseText
+  throws for any type but '' and text, as the XHR standard has it. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>XHR response types</title></head>
+<body><pre id="out"></pre>
+<script>
+var out = [], pending = 0;
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function finish() {
+  if (--pending) return;
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('xhr-response-types: ' + l); });
+  console.log('xhr-response-types: done');
+}
+function get(url, type, check) {
+  pending++;
+  var x = new XMLHttpRequest();
+  x.open('GET', url);
+  if (type !== null) x.responseType = type;
+  x.onload = function () { try { check(x); } catch (e) { ok(type + ' threw', String(e), ''); } finish(); };
+  x.onerror = function () { ok(type + ' loaded', false, true); finish(); };
+  x.send();
+}
+var x0 = new XMLHttpRequest();
+ok('nothing before a request', x0.responseText, '');
+ok('and no response', x0.response, '');
+x0.responseType = 'arraybuffer';
+ok('an unsent arraybuffer request has no response', x0.response, null);
+get('data:text/plain;charset=utf-8,h%C3%A9llo', null, function (x) {
+  ok('text by default', x.responseText, 'héllo');
+  ok('and its response', x.response, 'héllo');
+  ok('the same string each read', x.responseText === x.responseText, true);
+});
+get('data:text/plain,abc', 'text', function (x) {
+  ok('text when asked', x.response, 'abc');
+});
+get('data:application/json,%7B%22a%22%3A%5B1%2C2%5D%7D', 'json', function (x) {
+  ok('json is parsed', JSON.stringify(x.response), '{"a":[1,2]}');
+  ok('and kept', x.response === x.response, true);
+  var threw = '';
+  try { x.responseText; } catch (e) { threw = e.name; }
+  ok('responseText throws for json', threw, 'InvalidStateError');
+});
+get('data:application/json,%7Bbad', 'json', function (x) {
+  ok('bad json is null', x.response, null);
+});
+get('data:application/octet-stream;base64,AP/+gIGCw8TFxsc=', 'arraybuffer', function (x) {
+  var b = new Uint8Array(x.response);
+  ok('an arraybuffer has every byte', b.length + ':' + b[0] + ',' + b[1] + ',' + b[10], '11:0,255,199');
+  ok('and is the same buffer each read', x.response === x.response, true);
+  var threw = '';
+  try { x.responseText; } catch (e) { threw = e.name; }
+  ok('responseText throws for an arraybuffer', threw, 'InvalidStateError');
+});
+get('data:image/svg+xml,%3Csvg%2F%3E', 'blob', function (x) {
+  ok('a blob', x.response instanceof Blob, true);
+  ok('of the response\'s type', x.response.type, 'image/svg+xml');
+  ok('and size', x.response.size, 6);
+});
+pending++;
+fetch('data:text/plain,fetched').then(function (r) { return r.text(); }).then(function (t) {
+  ok('fetch text', t, 'fetched'); finish();
+}, function (e) { ok('fetch text', String(e), 'fetched'); finish(); });
+pending++;
+fetch('data:application/octet-stream;base64,/wD+').then(function (r) { return r.arrayBuffer(); }).then(function (b) {
+  var v = new Uint8Array(b);
+  ok('fetch bytes', v.length + ':' + v[0] + ',' + v[1] + ',' + v[2], '3:255,0,254'); finish();
+}, function (e) { ok('fetch bytes', String(e), ''); finish(); });
+</script>
+</body></html>

@@ -2594,10 +2594,10 @@ function dataURL(u){
   out=new Uint8Array(bytes);}
  return {type:meta,bytes:out.buffer};}
 /* --- XMLHttpRequest and fetch over NV.__vitaFetch (qjs.c) --- */
-function XMLHttpRequest(){this.readyState=0;this.status=0;this.statusText='';this.responseText='';this.response='';this.responseType='';this.responseURL='';this.timeout=0;this.withCredentials=false;this._h={};this._l={};this._id=0;this._rh='';this.upload={addEventListener:function(){},removeEventListener:function(){}};}
+function XMLHttpRequest(){this.readyState=0;this.status=0;this.statusText='';this._bytes=null;this._tx=undefined;this._rv=undefined;this.responseType='';this.responseURL='';this.timeout=0;this.withCredentials=false;this._h={};this._l={};this._id=0;this._rh='';this.upload={addEventListener:function(){},removeEventListener:function(){}};}
 XMLHttpRequest.prototype={
 UNSENT:0,OPENED:1,HEADERS_RECEIVED:2,LOADING:3,DONE:4,
-open:function(m,u){this._m=String(m||'GET').toUpperCase();this._u=String(u);this._h={};this._set(1);},
+open:function(m,u){this._m=String(m||'GET').toUpperCase();this._u=String(u);this._h={};this._bytes=null;this._tx=undefined;this._rv=undefined;this._set(1);},
 setRequestHeader:function(k,v){k=String(k);v=String(v).trim();var l=k.toLowerCase();
  /* the browser's own: a page may not set them (the Fetch standard's
     forbidden request headers), and is not told */
@@ -2631,15 +2631,10 @@ send:function(body){var self=this;if(this.readyState!==1)return;var data=this._b
  /* the body arrives as bytes; text is a decode of them, and a
     response that is not text keeps every byte it was sent */
  var done=function(status,headers,bytes,err,url){self._id=0;self._rh=headers||'';self.responseURL=url||self._u;
-  if(err){self.status=0;self.statusText='';self.responseText='';self.response=null;self._bytes=null;self._set(4);self._emit(err==='timeout'?'timeout':'error');self._emit('loadend');return;}
+  if(err){self.status=0;self.statusText='';self._bytes=null;self._tx=undefined;self._rv=undefined;self._set(4);self._emit(err==='timeout'?'timeout':'error');self._emit('loadend');return;}
   self.status=status;self.statusText=status===200?'OK':status===204?'No Content':status===404?'Not Found':'';self._set(2);self._set(3);
   self._bytes=bytes instanceof ArrayBuffer?bytes:new ArrayBuffer(0);
-  var text=new TextDecoder().decode(self._bytes);
-  self.responseText=text;
-  var rt=self.responseType;if(rt==='json'){try{self.response=JSON.parse(text);}catch(e){self.response=null;}}
-  else if(rt==='arraybuffer'){self.response=self._bytes;}
-  else if(rt==='blob'){self.response=new Blob([self._bytes]);}
-  else if(rt==='document'){self.response=null;}else self.response=text;
+  self._tx=undefined;self._rv=undefined;
   self._set(4);self._emit('load');self._emit('loadend');};
  /* a data: URL is its own response (VitaSurf): Web Awesome's icons
     fetch their SVG from one, and the network layer refused them */
@@ -2655,6 +2650,27 @@ abort:function(){if(this._id){NV.__vitaFetchAbort(this._id);this._id=0;}if(this.
 getResponseHeader:function(n){var lines=this._rh.split('\n'),p=String(n).toLowerCase()+':';for(var i=0;i<lines.length;i++){if(lines[i].toLowerCase().indexOf(p)===0)return lines[i].slice(p.length).trim();}return null;},
 getAllResponseHeaders:function(){return this._rh?this._rh.replace(/\n/g,'\r\n'):'';},
 overrideMimeType:function(){}};
+/* responseText and response are read from the bytes when first asked
+   for, and kept (VitaSurf): every response had been decoded as text on
+   arrival, an arraybuffer's and every fetch()'s too, and Twitch's
+   WebAssembly binary, which is not UTF-8, went through the decoder's
+   script loop a byte at a time, a seventh of its page's script */
+Object.defineProperty(XMLHttpRequest.prototype,'responseText',{configurable:true,enumerable:true,
+ get:function(){var rt=this.responseType;
+  if(rt!==''&&rt!=='text')throw new W.DOMException("Failed to read the 'responseText' property from 'XMLHttpRequest': The value is only accessible if the object's 'responseType' is '' or 'text' (was '"+rt+"').",'InvalidStateError');
+  if(this._bytes==null)return '';
+  if(this._tx===undefined)this._tx=new TextDecoder().decode(this._bytes);
+  return this._tx;}});
+Object.defineProperty(XMLHttpRequest.prototype,'response',{configurable:true,enumerable:true,
+ get:function(){var rt=this.responseType;
+  if(rt===''||rt==='text')return this.responseText;
+  if(this.readyState!==4||this._bytes==null)return null;
+  if(rt==='arraybuffer')return this._bytes;
+  if(this._rv===undefined){
+   if(rt==='json'){try{this._rv=JSON.parse(new TextDecoder().decode(this._bytes));}catch(e){this._rv=null;}}
+   else if(rt==='blob')this._rv=new Blob([this._bytes],{type:this.getResponseHeader('content-type')||''});
+   else this._rv=null;}
+  return this._rv;}});
 W.XMLHttpRequest=XMLHttpRequest;W.XMLHttpRequestUpload=function(){};W.XMLHttpRequestEventTarget=function(){};
 /* WebSocket (VitaSurf), over curl's ws API in vita/js/websocket.c.
  * Home Assistant's whole interface talks to its server over one, and
