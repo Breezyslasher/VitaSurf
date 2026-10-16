@@ -6501,7 +6501,7 @@ var CSS_KEYS=[],CSS_ARGS=[],CSS_FLAGS=[];
  'border-spacing border-style border-top border-top-color border-top-left-radius '+
  'border-top-right-radius border-top-style border-top-width border-width bottom box-shadow '+
  'box-sizing caption-side caret-color clear clip clip-path color column-count column-gap '+
- 'columns content cursor direction display empty-cells filter flex flex-basis flex-direction '+
+ 'columns contain content content-visibility cursor direction display empty-cells filter flex flex-basis flex-direction '+
  'flex-flow flex-grow flex-shrink flex-wrap float font font-family font-size font-style '+
  'font-variant font-weight gap grid grid-area grid-auto-columns grid-auto-flow grid-auto-rows '+
  'grid-column grid-column-end grid-column-start grid-gap grid-row grid-row-end grid-row-start '+

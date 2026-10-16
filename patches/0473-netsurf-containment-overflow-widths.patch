@@ -1,0 +1,287 @@
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 10da2f992..6da78d195 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -602,7 +602,8 @@ static bool box_descendants_hold_point(const struct box *box, int x, int y)
+ {
+ 	if (box->style != NULL &&
+ 	    (css_computed_overflow_x(box->style) != CSS_OVERFLOW_VISIBLE ||
+-	     css_computed_overflow_y(box->style) != CSS_OVERFLOW_VISIBLE)) {
++	     css_computed_overflow_y(box->style) != CSS_OVERFLOW_VISIBLE ||
++	     (box_containment(box) & CSS_CONTAIN_PAINT) != 0)) {
+ 		return false;
+ 	}
+ 	if (box->children == NULL && box->float_children == NULL) {
+diff --git a/content/handlers/html/box_inspect.h b/content/handlers/html/box_inspect.h
+index 2af41350d..4722e1e29 100644
+--- a/content/handlers/html/box_inspect.h
++++ b/content/handlers/html/box_inspect.h
+@@ -34,20 +34,86 @@
+  * visible (CSS 2.1 section 11.1.1). NetSurf's viewport always scrolls,
+  * so those boxes just report visible here.
+  */
++/**
++ * The containment a box has (VitaSurf), a mask of css_contain_e kinds:
++ * those its contain property names, and those content-visibility auto
++ * and hidden imply (layout, style and paint, and size for hidden). A
++ * non-atomic inline box, a table's row or row group, and a box with no
++ * style of its own have none, as CSS Containment says.
++ */
++static inline unsigned box_containment(const struct box *box)
++{
++	unsigned kinds;
++
++	if (box->style == NULL)
++		return 0;
++	switch (box->type) {
++	case BOX_INLINE:
++	case BOX_INLINE_END:
++	case BOX_INLINE_CONTAINER:
++	case BOX_TEXT:
++	case BOX_BR:
++	case BOX_TABLE_ROW:
++	case BOX_TABLE_ROW_GROUP:
++	case BOX_NONE:
++		return 0;
++	default:
++		break;
++	}
++	kinds = css_computed_contain(box->style) & ~CSS_CONTAIN_NONE;
++	switch (css_computed_content_visibility(box->style)) {
++	case CSS_CONTENT_VISIBILITY_HIDDEN:
++		kinds |= CSS_CONTAIN_SIZE | CSS_CONTAIN_LAYOUT |
++				CSS_CONTAIN_STYLE | CSS_CONTAIN_PAINT;
++		break;
++	case CSS_CONTENT_VISIBILITY_AUTO:
++		kinds |= CSS_CONTAIN_LAYOUT | CSS_CONTAIN_STYLE |
++				CSS_CONTAIN_PAINT;
++		break;
++	default:
++		break;
++	}
++	return kinds;
++}
++
++/**
++ * Whether a box is a containing block for its absolutely positioned
++ * descendants and its own formatting context because of containment,
++ * as layout and paint containment make it (VitaSurf).
++ */
++static inline bool box_contains_layout(const struct box *box)
++{
++	return (box_containment(box) &
++			(CSS_CONTAIN_LAYOUT | CSS_CONTAIN_PAINT)) != 0;
++}
++
+ static inline enum css_overflow_e box_overflow_x(const struct box *box)
+ {
++	enum css_overflow_e overflow;
++
+ 	if (box->flags & OVERFLOW_VIEWPORT) {
+ 		return CSS_OVERFLOW_VISIBLE;
+ 	}
+-	return css_computed_overflow_x(box->style);
++	overflow = css_computed_overflow_x(box->style);
++	/* paint containment clips what overflows, as clip does */
++	if (overflow == CSS_OVERFLOW_VISIBLE &&
++			(box_containment(box) & CSS_CONTAIN_PAINT) != 0)
++		return CSS_OVERFLOW_CLIP;
++	return overflow;
+ }
+ 
+ static inline enum css_overflow_e box_overflow_y(const struct box *box)
+ {
++	enum css_overflow_e overflow;
++
+ 	if (box->flags & OVERFLOW_VIEWPORT) {
+ 		return CSS_OVERFLOW_VISIBLE;
+ 	}
+-	return css_computed_overflow_y(box->style);
++	overflow = css_computed_overflow_y(box->style);
++	if (overflow == CSS_OVERFLOW_VISIBLE &&
++			(box_containment(box) & CSS_CONTAIN_PAINT) != 0)
++		return CSS_OVERFLOW_CLIP;
++	return overflow;
+ }
+ 
+ /**
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 5c142bd78..f7ff60715 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -5437,8 +5437,12 @@ layout_position_absolute(struct box *box,
+ 				return false;
+ 			if (!layout_position_absolute(c, c, 0, 0, content))
+ 				return false;
+-		} else if (c->style && css_computed_position(c->style) ==
+-				CSS_POSITION_RELATIVE) {
++		} else if (c->style && (css_computed_position(c->style) ==
++				CSS_POSITION_RELATIVE ||
++				box_contains_layout(c))) {
++			/* layout and paint containment make a box the
++			 * containing block of what is absolutely positioned
++			 * inside it, as a position does (VitaSurf) */
+ 			if (!layout_position_absolute(c, c, 0, 0, content))
+ 				return false;
+ 		} else {
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index d5a4f705e..aca4604a7 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -278,6 +278,10 @@ static bool layout_flex_item(
+ 	return success;
+ }
+ 
++static inline bool layout_flex__auto_minimum(
++		const struct flex_ctx *ctx,
++		const struct box *b);
++
+ /**
+  * Calculate an item's base and target main sizes.
+  *
+@@ -334,7 +338,29 @@ static inline bool layout_flex__base_and_main_sizes(
+ 	}
+ 
+ 	if (ctx->horizontal == false) {
+-		if (b->width == AUTO) {
++		if (b->width == AUTO &&
++		    lh__box_align_self(ctx->flex, b) ==
++				CSS_ALIGN_SELF_STRETCH &&
++		    b->margin[LEFT] != AUTO && b->margin[RIGHT] != AUTO &&
++		    ctx->wrap == CSS_FLEX_WRAP_NOWRAP) {
++			/*
++			 * Stretched across a single line, which is the
++			 * container's own width: the item is that wide
++			 * whatever its content, which overflows it, as
++			 * CSS Flexbox has it (VitaSurf). It had been given
++			 * its content's width at least, so yahoo.com's
++			 * main column, holding a carousel of 600px slides,
++			 * was twice the screen's width and every picture
++			 * in it drawn at that size.
++			 */
++			b->width = available_width - lh__delta_outer_width(b);
++			if (item->max_cross >= 0 && b->width > item->max_cross)
++				b->width = item->max_cross;
++			if (b->width < item->min_cross)
++				b->width = item->min_cross;
++			if (b->width < 0)
++				b->width = 0;
++		} else if (b->width == AUTO) {
+ 			b->width = min(max(content_min_width, available_width),
+ 					content_max_width);
+ 			b->width -= lh__delta_outer_width(b);
+@@ -362,7 +388,14 @@ static inline bool layout_flex__base_and_main_sizes(
+ 
+ 	if (ctx->horizontal) {
+ 		item->base_size = min(item->base_size, available_width);
+-		item->base_size = max(item->base_size, content_min_width);
++		/* no smaller than its content only while its minimum width
++		 * is automatic (VitaSurf): an item with min-width: 0 or
++		 * overflow: hidden is as wide as its basis says, and
++		 * yahoo.com's carousel slides, flex: 0 0 100% with min-w-0,
++		 * were as wide as their picture, 1104px in a 680px row */
++		if (layout_flex__auto_minimum(ctx, b))
++			item->base_size = max(item->base_size,
++					content_min_width);
+ 	}
+ 
+ 	item->target_main_size = item->base_size;
+@@ -1249,6 +1282,13 @@ static void layout_flex__place_line_items_cross(struct flex_ctx *ctx,
+ 				bool ok;
+ 
+ 				*box_size_cross += cross_free_space;
++				/* still within its min and max cross sizes,
++				 * as CSS Flexbox stretches (VitaSurf) */
++				if (item->max_cross >= 0 &&
++						*box_size_cross > item->max_cross)
++					*box_size_cross = item->max_cross;
++				if (*box_size_cross < item->min_cross)
++					*box_size_cross = item->min_cross;
+ 
+ 				/*
+ 				 * Relayout children for stretch. A flex
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index 3fa471dae..f661e2f0d 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -1024,6 +1024,41 @@ static void grid_item_contribution(const struct grid_item *it,
+ 	}
+ }
+ 
++/**
++ * An item's minimum contribution across, which an auto minimum track
++ * takes (CSS Grid 6.6, 12.5) (VitaSurf). While its width is auto or a
++ * percentage it is the item at its minimum width: its min-width when it
++ * has one, nothing of its content when it is a scroll container, else
++ * its content's min-content width. The min-content width alone had been
++ * taken, so a "1fr" column could not be narrower than its longest
++ * headline whatever the item said: yahoo.com's story cards, min-w-0 in
++ * a 130px and 1fr grid, laid their headlines out 1501px wide in 680.
++ */
++static int grid_item_min_contribution(const struct grid_item *it,
++		bool horizontal, int minc)
++{
++	const struct box *b = it->box;
++	css_fixed len = 0;
++	css_unit unit = CSS_UNIT_PX;
++	int outer;
++
++	if (!horizontal || b->style == NULL)
++		return minc;
++	if (css_computed_width(b->style, &len, &unit) != CSS_WIDTH_AUTO &&
++			unit != CSS_UNIT_PCT)
++		return minc;
++	if (!css_computed_min_width_is_auto(b->style)) {
++		outer = (it->min_width > 0 ? it->min_width : 0) +
++				lh__delta_outer_width(b);
++		return outer < 0 ? 0 : outer;
++	}
++	if (box_overflow_contains(css_computed_overflow_x(b->style))) {
++		outer = lh__delta_outer_width(b);
++		return outer < minc ? (outer < 0 ? 0 : outer) : minc;
++	}
++	return minc;
++}
++
+ static inline int grid_gap_count(const struct grid_track *tracks, unsigned n)
+ {
+ 	int visible = 0;
+@@ -1134,7 +1169,14 @@ static bool grid_size_axis(struct grid_ctx *ctx, bool horizontal)
+ 		}
+ 		grid_item_contribution(it, horizontal, &minc, &maxc);
+ 
+-		if (t->min_type == GS_AUTO || t->min_type == GS_MIN_CONTENT) {
++		if (t->min_type == GS_AUTO) {
++			int least = grid_item_min_contribution(it, horizontal,
++					minc);
++
++			if (t->base < least) {
++				t->base = least;
++			}
++		} else if (t->min_type == GS_MIN_CONTENT) {
+ 			if (t->base < minc) {
+ 				t->base = minc;
+ 			}
+diff --git a/content/handlers/html/layout_internal.h b/content/handlers/html/layout_internal.h
+index 9c9659258..ec604365b 100644
+--- a/content/handlers/html/layout_internal.h
++++ b/content/handlers/html/layout_internal.h
+@@ -280,13 +280,15 @@ static inline bool lh__box_is_multicol(const struct box *b)
+  * Layout helper: whether a block is display: flow-root (VitaSurf), a
+  * block that is its own formatting context, as overflow other than
+  * visible makes one: it holds its floats, and its children's margins do
+- * not collapse through it. It replaced the clearfix hack.
++ * not collapse through it. It replaced the clearfix hack. Layout and
++ * paint containment make a block one too.
+  */
+ static inline bool lh__box_is_flow_root(const struct box *b)
+ {
+ 	return b->type == BOX_BLOCK && b->style != NULL &&
+-			css_computed_display_static(b->style) ==
+-			CSS_DISPLAY_FLOW_ROOT;
++			(css_computed_display_static(b->style) ==
++			 CSS_DISPLAY_FLOW_ROOT ||
++			 box_contains_layout(b));
+ }
+ 
+ /** Layout helper: Check whether box is a grid container (VitaSurf). */

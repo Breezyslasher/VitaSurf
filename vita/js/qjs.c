@@ -15149,6 +15149,42 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 		SM_ENUM("contentVisibility", cv,
 				css_computed_content_visibility(s));
 	}
+	{
+		/* contain, as Chrome writes it: strict and content by
+		 * name, any other set of kinds in this order */
+		static const struct {
+			uint8_t bit;
+			const char *name;
+		} ck[] = {
+			{ CSS_CONTAIN_SIZE, "size" },
+			{ CSS_CONTAIN_INLINE_SIZE, "inline-size" },
+			{ CSS_CONTAIN_LAYOUT, "layout" },
+			{ CSS_CONTAIN_STYLE, "style" },
+			{ CSS_CONTAIN_PAINT, "paint" },
+		};
+		uint8_t cm = css_computed_contain(s) & ~CSS_CONTAIN_NONE;
+		const uint8_t lps = CSS_CONTAIN_LAYOUT | CSS_CONTAIN_PAINT |
+				CSS_CONTAIN_STYLE;
+		size_t ci;
+
+		if (cm == (lps | CSS_CONTAIN_SIZE)) {
+			sm_set(ctx, obj, "contain", "strict");
+		} else if (cm == lps) {
+			sm_set(ctx, obj, "contain", "content");
+		} else if (cm == 0) {
+			sm_set(ctx, obj, "contain", "none");
+		} else {
+			buf[0] = '\0';
+			for (ci = 0; ci < sizeof(ck) / sizeof(ck[0]); ci++) {
+				if ((cm & ck[ci].bit) == 0)
+					continue;
+				if (buf[0] != '\0')
+					strcat(buf, " ");
+				strcat(buf, ck[ci].name);
+			}
+			sm_set(ctx, obj, "contain", buf);
+		}
+	}
 	SM_ENUM("pointerEvents", sm_pointer_events,
 			css_computed_pointer_events(s));
 	{

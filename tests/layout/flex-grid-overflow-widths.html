@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<!--
+  Widths of flex and grid items whose content is wider than their room
+  (VitaSurf). A stretched item in a single-line column container is the
+  container's width whatever its content; a row item with min-width: 0
+  is as wide as its basis; a grid item with min-width: 0 or overflow
+  other than visible does not widen an auto track. yahoo.com's main
+  column, its carousel slides and its story cards were each as wide as
+  their widest content, a page twice the screen's width. Each line must
+  say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Flex and grid overflow widths</title>
+<style>
+body { margin: 0; font: 16px sans-serif; }
+.wide { display: inline-block; width: 600px; height: 10px; }
+.col { display: flex; flex-direction: column; width: 300px; }
+.row { display: flex; width: 300px; }
+.grid { display: grid; grid-template-columns: 100px 1fr; width: 300px; }
+</style></head>
+<body>
+<div class="col"><div id="s1"><span class="wide"></span></div></div>
+<div class="col"><div id="s2" style="margin: 0 10px"><span class="wide"></span></div></div>
+<div class="col" style="align-items: flex-start"><div id="s3"><span class="wide"></span></div></div>
+<div class="col"><div id="s4" style="align-self: center"><span class="wide"></span></div></div>
+<div class="col"><div id="s5" style="max-width: 120px"><span class="wide"></span></div></div>
+<div class="col"><div id="s6" style="min-width: 450px"><span class="wide"></span></div></div>
+<div class="row" style="height: 100px"><div id="r0" style="max-height: 40px">x</div><div id="r00" style="min-height: 140px">y</div></div>
+<div class="row"><div id="r1" style="flex: 0 0 100%; min-width: 0"><span class="wide"></span></div></div>
+<div class="row"><div id="r2" style="flex: 0 0 100%"><span class="wide"></span></div></div>
+<div class="row"><div id="r3" style="flex: 0 0 100%; overflow: hidden"><span class="wide"></span></div></div>
+<div class="row"><div id="r4" style="flex: 0 0 50%"><span>short</span></div></div>
+<div class="grid"><div>a</div><div id="g1" style="min-width: 0"><span class="wide"></span></div></div>
+<div class="grid"><div>a</div><div id="g2"><span class="wide"></span></div></div>
+<div class="grid"><div>a</div><div id="g3" style="overflow: hidden"><span class="wide"></span></div></div>
+<div class="grid"><div>a</div><div id="g4" style="min-width: 150px"><span class="wide"></span></div></div>
+<div class="grid" style="grid-template-columns: 100px 1fr 20px"><div>a</div><div style="min-width: 260px">b</div><div id="g6">c</div></div>
+<div class="grid"><div>a</div><div id="g7" style="width: 50px; min-width: 0"><span class="wide"></span></div></div>
+<div class="grid" style="grid-template-columns: 100px minmax(min-content, 1fr)"><div>a</div><div id="g5" style="min-width: 0"><span class="wide"></span></div></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function w(id) { return Math.round(document.getElementById(id).getBoundingClientRect().width); }
+addEventListener('load', function () {
+  ok('a stretched column item is the container\'s width', w('s1'), 300);
+  ok('less its margins', w('s2'), 280);
+  ok('an item aligned to the start is its content\'s width', w('s3'), 600);
+  ok('and one centred', w('s4'), 600);
+  ok('a stretched item keeps to its max-width', w('s5'), 120);
+  ok('and to its min-width', w('s6'), 450);
+  ok('a stretched row item keeps to its max-height', Math.round(document.getElementById('r0').getBoundingClientRect().height), 40);
+  ok('and to its min-height', Math.round(document.getElementById('r00').getBoundingClientRect().height), 140);
+  ok('a row item with min-width: 0 is its basis', w('r1'), 300);
+  ok('one with an automatic minimum is its content', w('r2'), 600);
+  ok('one that hides its overflow is its basis', w('r3'), 300);
+  ok('a short item is its basis', w('r4'), 150);
+  ok('a grid item with min-width: 0 leaves 1fr its share', w('g1'), 200);
+  ok('one with an automatic minimum widens it', w('g2'), 600);
+  ok('one that hides its overflow leaves it', w('g3'), 200);
+  ok('one with a min-width widens it that far', w('g4'), 200);
+  ok('a min-width wider than the content widens it to the min-width', Math.round(document.getElementById('g6').getBoundingClientRect().left), 360);
+  ok('an item with a width of its own gives its content', w('g7'), 50);
+  ok('a min-content track still takes the content', w('g5'), 600);
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('flex-grid-overflow-widths: ' + l); });
+  console.log('flex-grid-overflow-widths: done');
+});
+</script>
+</body></html>

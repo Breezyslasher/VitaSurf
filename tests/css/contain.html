@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<!--
+  CSS Containment (VitaSurf): the contain property, and the containment
+  content-visibility: auto and hidden imply. Paint containment clips
+  what overflows, which then neither widens the page nor takes a tap;
+  layout and paint containment make a box the containing block of what
+  is absolutely positioned inside it and a formatting context of its
+  own. yahoo.com's story cards are content-visibility: auto, and their
+  headlines, written with non-breaking spaces, had made the page twice
+  the screen's width. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Containment</title>
+<style>
+body { margin: 0; font: 16px sans-serif; }
+.box { width: 200px; height: 40px; }
+.wide { width: 1500px; height: 20px; background: rgb(0, 128, 0); }
+.ab { position: absolute; top: 5px; left: 7px; width: 10px; height: 10px; }
+.fl { float: left; width: 50px; height: 60px; }
+</style></head>
+<body>
+<div id="p1" class="box" style="contain: paint"><div id="w1" class="wide"></div></div>
+<div id="p2" class="box" style="content-visibility: auto"><div id="w2" class="wide"></div></div>
+<div style="margin-left: 30px; margin-top: 10px; contain: layout" id="c1"><div id="a1" class="ab"></div>x</div>
+<div style="margin-left: 30px; contain: none" id="c2"><div id="a2" class="ab"></div>x</div>
+<div id="f1" style="contain: content"><div class="fl"></div></div>
+<div id="f2"><div class="fl"></div></div>
+<div style="clear: both"></div>
+<div id="v" style="width: 100px"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function r(id) { return document.getElementById(id).getBoundingClientRect(); }
+var v = document.getElementById('v');
+function contain(text) { v.style.contain = 'none'; v.style.contain = text; return getComputedStyle(v).contain; }
+ok('none', contain('none'), 'none');
+ok('strict', contain('strict'), 'strict');
+ok('content', contain('content'), 'content');
+ok('paint', contain('paint'), 'paint');
+ok('kinds in their order', contain('paint layout'), 'layout paint');
+ok('style and layout', contain('style layout'), 'layout style');
+ok('every kind is strict', contain('paint style size layout'), 'strict');
+ok('three kinds are content', contain('style paint layout'), 'content');
+ok('inline-size', contain('inline-size'), 'inline-size');
+ok('size and inline-size together are invalid', contain('size inline-size'), 'none');
+ok('a kind twice is invalid', contain('paint paint'), 'none');
+ok('none with a kind is invalid', contain('none paint'), 'none');
+ok('not inherited', getComputedStyle(document.getElementById('w1')).contain, 'none');
+addEventListener('load', function () {
+  var w = document.documentElement.scrollWidth;
+  ok('what paint containment clips does not widen the page', w <= window.innerWidth, true);
+  ok('the clipped child keeps its own width', Math.round(r('w1').width), 1500);
+  var hit = document.elementFromPoint(400, Math.round(r('p1').top) + 5);
+  ok('a point past the clip does not find the child', hit === document.getElementById('w1'), false);
+  hit = document.elementFromPoint(400, Math.round(r('p2').top) + 5);
+  ok('nor with content-visibility: auto', hit === document.getElementById('w2'), false);
+  hit = document.elementFromPoint(100, Math.round(r('p1').top) + 5);
+  ok('a point inside does', hit === document.getElementById('w1'), true);
+  ok('layout containment holds what is absolute', Math.round(r('a1').left), 37);
+  ok('from its top', Math.round(r('a1').top), Math.round(r('c1').top) + 5);
+  ok('without it the page does', Math.round(r('a2').left), 7);
+  ok('content containment holds floats', Math.round(r('f1').height), 60);
+  ok('and an ordinary block does not', Math.round(r('f2').height), 0);
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('contain: ' + l); });
+  console.log('contain: done');
+});
+</script>
+</body></html>
