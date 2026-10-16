@@ -1,0 +1,45 @@
+diff --git a/content/handlers/html/layout_flex.c b/content/handlers/html/layout_flex.c
+index 87b365d63..5a62b7a45 100644
+--- a/content/handlers/html/layout_flex.c
++++ b/content/handlers/html/layout_flex.c
+@@ -1595,6 +1595,40 @@ bool layout_flex(struct box *flex, int available_width,
+ 		goto cleanup;
+ 	}
+ 
++	/*
++	 * A single line is as big across as the container when the
++	 * container's size that way is definite, else as its biggest item
++	 * within the container's min and max (Flexbox 9.4, steps 8 and 15)
++	 * (VitaSurf). It had always been its biggest item at least, so an
++	 * item taller than its row did not overflow it evenly when centred
++	 * but hung below: yahoo.com's search field, 46px in a 20px row,
++	 * stood out under its search bar.
++	 */
++	if (ctx->wrap == CSS_FLEX_WRAP_NOWRAP && ctx->line.count == 1) {
++		struct flex_line_data *line = &ctx->line.data[0];
++		int cs = line->cross_size;
++
++		if (!ctx->horizontal) {
++			if (ctx->available_cross != AUTO &&
++					ctx->available_cross != UNKNOWN_WIDTH &&
++					ctx->available_cross >= 0)
++				cs = ctx->available_cross;
++		} else if (flex->height != AUTO) {
++			cs = flex->height;
++			if (max_height >= 0 && cs > max_height)
++				cs = max_height;
++			if (min_height > 0 && cs < min_height)
++				cs = min_height;
++		} else {
++			if (max_height >= 0 && cs > max_height)
++				cs = max_height;
++			if (min_height > 0 && cs < min_height)
++				cs = min_height;
++		}
++		ctx->cross_size += cs - line->cross_size;
++		line->cross_size = cs;
++	}
++
+ 	layout_flex__place_lines(ctx);
+ 
+ 	if (flex->height == AUTO) {
