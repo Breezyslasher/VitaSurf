@@ -136,8 +136,10 @@ developer.mozilla.org, news.ycombinator.com, www.weather.gov,
 www.imdb.com and www.craigslist.org. Eleven new sites take their places,
 for frameworks and page shapes the run did not cover; none could be
 checked from where the list was made, so any that shows a login wall or a
-bot check should be swapped for another. The next run's
-`ux0:data/VitaSurf/sitetest.txt`:
+bot check should be swapped for another. They are the built-in list from
+build 747, which is written to `ux0:data/VitaSurf/sitetest.txt` only when
+that file is missing, so a console with the old file needs this one copied
+over it (or the old file deleted):
 
 ```
 https://en.m.wikipedia.org/wiki/PlayStation_Vita

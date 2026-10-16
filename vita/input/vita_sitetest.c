@@ -57,35 +57,39 @@
 #define SITE_SETTLE_MS  8000
 
 /* a spread of what people open: light and heavy, news, search, shops,
- * video, reference, apps; each public and without a sign-in */
+ * video, reference, apps; each public and without a sign-in. The eleven
+ * that loaded inside 10 s in build 739's run (lite.cnn.com, w3.org,
+ * archive.org, bing.com, wikipedia.org, google.com, MDN, Hacker News,
+ * weather.gov, IMDb, craigslist) gave their places to sites the run did
+ * not cover; their last figures are in docs/benchmarks.md */
 static const char *const default_sites[] = {
 	"https://en.m.wikipedia.org/wiki/PlayStation_Vita",
-	"https://www.wikipedia.org/",
-	"https://www.google.com/",
 	"https://duckduckgo.com/",
-	"https://www.bing.com/",
-	"https://news.ycombinator.com/",
 	"https://old.reddit.com/r/vita/",
 	"https://www.reddit.com/r/vita/",
 	"https://www.bbc.com/news",
-	"https://lite.cnn.com/",
 	"https://www.cnn.com/",
 	"https://www.theguardian.com/international",
 	"https://www.nytimes.com/",
 	"https://www.npr.org/",
 	"https://github.com/vitasdk",
 	"https://stackoverflow.com/questions",
-	"https://developer.mozilla.org/en-US/",
 	"https://www.amazon.com/",
 	"https://www.ebay.com/",
-	"https://www.imdb.com/",
 	"https://www.youtube.com/",
-	"https://archive.org/",
-	"https://www.weather.gov/",
 	"https://www.espn.com/",
 	"https://www.apple.com/",
-	"https://www.craigslist.org/",
-	"https://www.w3.org/",
+	"https://www.yahoo.com/",
+	"https://www.theverge.com/",
+	"https://www.washingtonpost.com/",
+	"https://medium.com/",
+	"https://www.twitch.tv/",
+	"https://x.com/",
+	"https://www.target.com/",
+	"https://weather.com/",
+	"https://www.fandom.com/",
+	"https://www.pinterest.com/",
+	"https://open.spotify.com/",
 };
 
 struct site {
