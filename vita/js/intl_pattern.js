@@ -1307,7 +1307,30 @@ NV.__vitaIntlPattern = function (N) {
 		return out;
 	};
 
+	/* getBestPattern, kept by skeleton and options for each generator
+	 * (VitaSurf): its patterns never change once it is built, and a
+	 * page formatting each date with toLocaleDateString(locale,
+	 * options) made a format, and so this search, every time; The
+	 * Verge's profile had it most often in the search's distance() */
 	Generator.prototype.bestPattern = function (form, options) {
+		var key = form + '|' + (options || 0), memo = this.memo, hit;
+
+		if (memo === undefined) {
+			memo = this.memo = Object.create(null);
+			this.memoCount = 0;
+		}
+		hit = memo[key];
+		if (hit !== undefined)
+			return hit;
+		hit = this.bestPatternFresh(form, options);
+		if (this.memoCount < 256) {
+			memo[key] = hit;
+			this.memoCount++;
+		}
+		return hit;
+	};
+
+	Generator.prototype.bestPatternFresh = function (form, options) {
 		var state = { flags: 0 }, info = { missing: 0, extra: 0 };
 		var req = skeletonOf(this.mapMeta(form, state)), best, dp, tp;
 		var DATE_MASK = (1 << DAYPERIOD) - 1,
