@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<!--
+  'revert' where it wins and where it does not (VitaSurf).
+
+  A sheet that says 'revert' anywhere had every element keep a copy of
+  what the browser's own styles gave it, in case one of its declarations
+  reverted. Now only an element where an author 'revert' wins is
+  selected again with them kept. Each line must say PASS; Chrome passes
+  them all.
+-->
+<html><head><meta charset="utf-8"><title>Revert, only where it wins</title>
+<style>
+div, span, li, p { display: flex; }
+.back { display: revert; }
+.lost { display: revert; }
+.lost.later { display: grid; }
+#ul2 li.back { display: revert; }
+.par { color: rgb(200, 0, 0); }
+.par span { color: rgb(0, 0, 200); }
+.par span.back { color: revert; }
+p.pseudo::before { content: "x"; display: flex; }
+p.pseudo.back::before { display: revert; }
+p.after::after { content: "y"; display: revert; }
+a { outline: 3px solid rgb(0, 128, 0); }
+a:focus { outline: revert; }
+.imp { display: revert !important; }
+.imp { display: grid; }
+</style></head>
+<body>
+<div id="d1" class="back">a</div>
+<span id="s1" class="back">b</span>
+<div id="d2">c</div>
+<div id="d3" class="lost later">d</div>
+<ul id="ul2"><li id="l1" class="back">e</li><li id="l2">f</li></ul>
+<div class="par"><span id="c1">g</span><span id="c2" class="back">h</span></div>
+<p id="p1" class="pseudo back">i</p>
+<p id="p2" class="pseudo">j</p>
+<p id="p3" class="after">k</p>
+<a id="a1" href="#">link</a>
+<div id="i1" class="imp">l</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function cs(id, pseudo) { return getComputedStyle(document.getElementById(id), pseudo || null); }
+addEventListener('load', function () {
+  ok('a div reverts to block', cs('d1').display, 'block');
+  ok('a span reverts to inline', cs('s1').display, 'inline');
+  ok('a div without it keeps the author value', cs('d2').display, 'flex');
+  ok('a revert that a later rule beats', cs('d3').display, 'grid');
+  ok('a list item reverts to list-item', cs('l1').display, 'list-item');
+  ok('its sibling keeps the author value', cs('l2').display, 'flex');
+  ok('an inherited property without it', cs('c1').color, 'rgb(0, 0, 200)');
+  ok('an inherited property reverts to inheriting', cs('c2').color, 'rgb(200, 0, 0)');
+  ok('a pseudo-element reverts to inline', cs('p1', '::before').display, 'inline');
+  ok('a pseudo-element without it', cs('p2', '::before').display, 'flex');
+  ok('a pseudo-element whose only display is revert', cs('p3', '::after').display, 'inline');
+  ok('a link that is not focused keeps the author outline', cs('a1').outlineWidth, '3px');
+  ok('an important revert beats a later rule', cs('i1').display, 'block');
+  ok('a reverted div is laid out as a block', document.getElementById('d1').getBoundingClientRect().width > 100, true);
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('revert-lazy: ' + l); });
+  console.log('revert-lazy: done');
+});
+</script>
+</body></html>
