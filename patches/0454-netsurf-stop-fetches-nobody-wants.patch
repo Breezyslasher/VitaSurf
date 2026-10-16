@@ -1,0 +1,147 @@
+diff --git a/content/hlcache.c b/content/hlcache.c
+index 2f3821e61..94eae8eb2 100644
+--- a/content/hlcache.c
++++ b/content/hlcache.c
+@@ -114,6 +114,7 @@ static void hlcache_clean(void *force_clean_flag)
+ 	hlcache_entry *entry, *next;
+ 	bool force_clean = (force_clean_flag != NULL);
+ 
++again:
+ 	for (entry = hlcache->content_list; entry != NULL; entry = next) {
+ 		next = entry->next;
+ 
+@@ -131,8 +132,15 @@ static void hlcache_clean(void *force_clean_flag)
+ 			 * minute, kept its thirty thousand nodes and its
+ 			 * script heap to the end of the session.
+ 			 */
++			/* and a sheet, an image or a script no page uses
++			 * any more, whose fetch would otherwise run on to
++			 * the end and its data be converted for nothing:
++			 * youtube.com's 3.7 MB sheet, 4.9 s, while the
++			 * site after the next one loaded */
+ 			if (force_clean == false &&
+-			    entry->content->aborted == false)
++			    entry->content->aborted == false &&
++			    entry->content->handler->type() ==
++					CONTENT_HTML)
+ 				continue;
+ 			NSLOG(netsurf, INFO, "Letting go of %p, aborted while "
+ 			      "loading", entry->content);
+@@ -162,6 +170,10 @@ static void hlcache_clean(void *force_clean_flag)
+ 
+ 		/* Destroy entry */
+ 		free(entry);
++
++		/* a page let go lets go of what it was loading: those are
++		 * looked at again now, not at the next clean (VitaSurf) */
++		goto again;
+ 	}
+ 
+ 	/* Attempt to clean the llcache */
+@@ -805,8 +817,15 @@ hlcache_handle_retrieve(nsurl *url,
+ nserror hlcache_handle_release(hlcache_handle *handle)
+ {
+ 	if (handle->entry != NULL) {
+-		content_remove_user(handle->entry->content,
+-				hlcache_content_callback, handle);
++		struct content *c = handle->entry->content;
++
++		content_remove_user(c, hlcache_content_callback, handle);
++		/* nothing uses it and it is still loading: let it go in a
++		 * second rather than at the next clean, up to 20 s on, its
++		 * fetch running all the while (VitaSurf) */
++		if (content_count_users(c) == 0 &&
++		    content__get_status(c) == CONTENT_STATUS_LOADING)
++			guit->misc->schedule(1000, hlcache_clean, NULL);
+ 	} else {
+ 		RING_ITERATE_START(struct hlcache_retrieval_ctx,
+ 				   hlcache->retrieval_ctx_ring,
+diff --git a/content/llcache.c b/content/llcache.c
+index 22fa6c3be..d989f4c46 100644
+--- a/content/llcache.c
++++ b/content/llcache.c
+@@ -358,6 +358,25 @@ static nserror llcache_object_user_destroy(llcache_object_user *user)
+  * \param user	  User to remove
+  * \return NSERROR_OK.
+  */
++/*
++ * A fetch nobody wants any more (VitaSurf). An object whose last user
++ * has let go, when the page that asked for it was left or stopped, went
++ * on fetching to the end so that it could be cached: youtube.com's
++ * preloaded 3.7 MB style sheet and 10.6 MB script went on for three
++ * minutes at 50 KB/s through the next five sites the site test loaded,
++ * and the sheet was then converted, 4.9 s, for nothing. A browser cancels
++ * loads no document wants; so are these. Not a POST, which may be a
++ * beacon meant to arrive whoever is listening, and not an object
++ * another is being checked against.
++ */
++static bool llcache_object_orphaned(const llcache_object *object)
++{
++	return object->users == NULL && object->fetch.fetch != NULL &&
++		object->fetch.post == NULL && object->candidate_count == 0;
++}
++
++static void llcache_orphans_stop(void *p);
++
+ static nserror llcache_object_remove_user(llcache_object *object,
+ 		llcache_object_user *user)
+ {
+@@ -380,6 +399,10 @@ static nserror llcache_object_remove_user(llcache_object *object,
+ 	/* record the time the last user was removed from the object */
+ 	if (object->users == NULL) {
+ 		object->last_used = time(NULL);
++		/* still fetching what nobody wants: stopped from the
++		 * scheduler, outside whatever let it go (VitaSurf) */
++		if (llcache_object_orphaned(object))
++			guit->misc->schedule(0, llcache_orphans_stop, NULL);
+ 	}
+ 
+ 	NSLOG(llcache, DEBUG, "Removing user %p from %p", user, object);
+@@ -3954,6 +3977,37 @@ void llcache_memory(uint32_t *bytes, uint32_t *objects)
+ 	*objects = n;
+ }
+ 
++
++/** Stop the fetches nobody wants any more; see llcache_object_orphaned. */
++static void llcache_orphans_stop(void *p)
++{
++	llcache_object *lists[2], *object;
++	unsigned int n = 0, i;
++	size_t had = 0;
++
++	(void) p;
++	if (llcache == NULL)
++		return;
++	lists[0] = llcache->uncached_objects;
++	lists[1] = llcache->cached_objects;
++	for (i = 0; i < 2; i++) {
++		for (object = lists[i]; object != NULL; object = object->next) {
++			if (!llcache_object_orphaned(object))
++				continue;
++			had += object->source_len;
++			fetch_abort(object->fetch.fetch);
++			object->fetch.fetch = NULL;
++			llcache_object_failed(object);
++			object->fetch.state = LLCACHE_FETCH_COMPLETE;
++			llcache_invalidate_cache_control_data(object);
++			n++;
++		}
++	}
++	if (n > 0)
++		NSLOG(llcache, INFO, "stopped %u fetches nobody wanted any "
++		      "more, %u KB in", n, (unsigned int) (had / 1024));
++}
++
+ /*
+  * Attempt to clean the cache
+  *
+@@ -4157,6 +4211,9 @@ void llcache_finalise(void)
+ 	llcache_object *object, *next;
+ 	uint64_t total_bandwidth = 0; /* total bandwidth */
+ 
++	/* the fetches nobody wanted go with the rest (VitaSurf) */
++	guit->misc->schedule(-1, llcache_orphans_stop, NULL);
++
+ 	/* Attempt to persist anything we have left lying around */
+ 	llcache_persist(NULL);
+ 	/* Now clear the persistence callback */
