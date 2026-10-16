@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<!--
+  Drags the page is told of (VitaSurf): run by tests/input/drag-test.sh,
+  which presses, moves and lets go with the harness's WINDOW DRAG, as the
+  Vita's touch screen and held Cross do, then asks check() for a PASS or
+  FAIL line per case. Chrome on a phone sends what each case expects.
+-->
+<html><head><meta charset="utf-8"><title>Page drags</title>
+<style>
+body { margin: 0; }
+div.box { position: absolute; left: 10px; width: 300px; height: 40px; background: #ddd; }
+#s1 { top: 10px; touch-action: none; }
+#s2 { top: 70px; }
+#plain { top: 130px; }
+#m { top: 190px; }
+#panx { top: 250px; touch-action: pan-x; }
+button { position: absolute; left: 10px; top: 310px; width: 100px; height: 30px; }
+iframe { position: absolute; left: 10px; top: 360px; width: 300px; height: 60px; border: 0; }
+</style></head>
+<body>
+<div class="box" id="s1"></div>
+<div class="box" id="s2"></div>
+<div class="box" id="plain"></div>
+<div class="box" id="m"></div>
+<div class="box" id="panx"></div>
+<button id="b">b</button>
+<iframe id="f" srcdoc="<body style='margin:0'><div id=k style='height:60px;background:#ccc'></div><script>var got=[];['pointerdown','pointermove','pointerup'].forEach(function(t){document.getElementById('k').addEventListener(t,function(e){got.push(t+':'+e.pointerType+':'+e.clientX)})});</script>"></iframe>
+<script>
+var log = {};
+function rec(id, e) {
+  (log[id] = log[id] || []).push(e.type + (e.pointerType ? ':' + e.pointerType : '') +
+    (e.type.indexOf('touch') === 0 ? ':' + e.touches.length + '/' + e.changedTouches.length +
+      ':' + Math.round(e.changedTouches[0].clientX) : ':' + Math.round(e.clientX)) +
+    (e.buttons !== undefined && e.type.indexOf('touch') < 0 ? ':' + e.buttons : ''));
+}
+var all = ['pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchmove',
+  'touchend', 'touchcancel', 'mousedown', 'mousemove', 'mouseup', 'click'];
+['s1', 's2', 'plain', 'm', 'panx', 'b'].forEach(function (id) {
+  all.forEach(function (t) {
+    document.getElementById(id).addEventListener(t, function (e) { rec(id, e); });
+  });
+});
+document.getElementById('s2').addEventListener('touchstart', function (e) { e.preventDefault(); });
+var knob = 0;
+document.getElementById('s1').addEventListener('pointermove', function (e) { knob = e.clientX; });
+function ok(name, got, want) {
+  console.log('page-drags: ' + (got === want ? 'PASS ' : 'FAIL ') + name +
+    (got === want ? '' : ': ' + got + ', want ' + want));
+}
+function check() {
+  var j = function (id) { return (log[id] || []).join(' '); };
+  ok('a touch-action: none slider gets the finger', j('s1'),
+    'pointerdown:touch:20:1 touchstart:1/1:20 pointermove:touch:200:1 touchmove:1/1:200 ' +
+    'pointermove:touch:250:1 touchmove:1/1:250 pointerup:touch:250:0 touchend:0/1:250');
+  ok('and moves with it', knob, 250);
+  ok('a slider that cancels touchstart', j('s2'),
+    'pointerdown:touch:20:1 touchstart:1/1:20 pointermove:touch:120:1 touchmove:1/1:120 ' +
+    'pointerup:touch:120:0 touchend:0/1:120');
+  ok('a drag the page leaves scrolls and is cancelled', j('plain'),
+    'pointerdown:touch:20:1 touchstart:1/1:20 pointermove:touch:20:1 touchmove:1/1:20 ' +
+    'pointercancel:touch:20:0 touchcancel:0/1:20');
+  ok('the held button drags', j('m'),
+    'pointerdown:mouse:20:1 mousedown:20:1 pointermove:mouse:150:1 mousemove:150:1 ' +
+    'pointerup:mouse:150:0 mouseup:150:0');
+  ok('pan-x lets a sideways drag scroll', j('panx'),
+    'pointerdown:touch:20:1 touchstart:1/1:20 pointermove:touch:200:1 touchmove:1/1:200 ' +
+    'pointercancel:touch:200:0 touchcancel:0/1:200');
+  ok('a press let go where it went down is one click', j('b'),
+    'pointerdown:mouse:30:1 mousedown:30:1 pointerup:mouse:30:0 mouseup:30:0 click:mouse:30:0');
+  var fw = document.getElementById('f').contentWindow;
+  ok('a drag in a frame reaches the frame', fw && fw.got ? fw.got.join(' ') : 'none',
+    'pointerdown:touch:20 pointermove:touch:100 pointerup:touch:100');
+  console.log('page-drags: done');
+}
+</script>
+</body></html>

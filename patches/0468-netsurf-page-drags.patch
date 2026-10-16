@@ -1,0 +1,449 @@
+diff --git a/content/handlers/html/html.c b/content/handlers/html/html.c
+index 37380770a..3fb99f0b1 100644
+--- a/content/handlers/html/html.c
++++ b/content/handlers/html/html.c
+@@ -142,9 +142,27 @@ bool fire_generic_dom_event(dom_string *type, dom_node *target,
+ /* exported interface, see private.h (VitaSurf) */
+ struct html_pointer_event html_pointer_current;
+ 
++static bool fire_dom_pointer_event_as(const char *type, dom_node *target,
++		int x, int y, int button, int buttons, int detail, bool touch);
++
+ /* Exported interface, see private.h (VitaSurf) */
+ bool fire_dom_pointer_event(const char *type, dom_node *target,
+ 		int x, int y, int button, int buttons, int detail)
++{
++	return fire_dom_pointer_event_as(type, target, x, y, button, buttons,
++			detail, false);
++}
++
++/* Exported interface, see private.h (VitaSurf) */
++bool fire_dom_touch_pointer_event(const char *type, dom_node *target,
++		int x, int y, int buttons)
++{
++	return fire_dom_pointer_event_as(type, target, x, y, 0, buttons, 0,
++			true);
++}
++
++static bool fire_dom_pointer_event_as(const char *type, dom_node *target,
++		int x, int y, int button, int buttons, int detail, bool touch)
+ {
+ 	struct html_pointer_event saved = html_pointer_current;
+ 	dom_string *t = NULL;
+@@ -167,6 +185,7 @@ bool fire_dom_pointer_event(const char *type, dom_node *target,
+ 		html_pointer_current.button = button;
+ 		html_pointer_current.buttons = buttons;
+ 		html_pointer_current.detail = detail;
++		html_pointer_current.touch = touch;
+ 		result = fire_dom_event(evt, target);
+ 		/* a listener may have made one of its own meanwhile */
+ 		html_pointer_current = saved;
+@@ -2282,6 +2301,9 @@ static void html_destroy(struct content *c)
+ 	/* a web font still on its way must not lay this content out */
+ 	html_webfont_forget(html);
+ 
++	/* a drag the page was being told of, or a press (VitaSurf) */
++	html_page_drag_forget(html);
++
+ 	/* its elements under the pointer or with the focus (VitaSurf) */
+ 	html_drop_dynamic(html);
+ 
+diff --git a/content/handlers/html/html.h b/content/handlers/html/html.h
+index a88cfbe05..203c28b4b 100644
+--- a/content/handlers/html/html.h
++++ b/content/handlers/html/html.h
+@@ -298,6 +298,32 @@ struct content_html_object *html_get_objects(struct hlcache_handle *h,
+  */
+ void html_focus_at_point(struct content *c, int x, int y);
+ 
++/*
++ * A drag the page is told of (VitaSurf): the press, each move and the
++ * release of the pointer's button or a finger, at x, y in the top
++ * document of bw (its coordinates divided by its scale). The press finds
++ * the document and element under it, through iframes; the rest go to
++ * that document. CANCEL ends a finger's drag the browser took to scroll.
++ * The press answers which ways touch-action lets a finger pan, and the
++ * press and each move whether the page cancelled its touch event.
++ */
++enum html_page_drag_phase {
++	HTML_PAGE_DRAG_DOWN,
++	HTML_PAGE_DRAG_MOVE,
++	HTML_PAGE_DRAG_UP,
++	HTML_PAGE_DRAG_CANCEL,
++	/* the pointer's press ended where it began, and NetSurf's own click
++	 * sends its release and the click */
++	HTML_PAGE_DRAG_CLICKED
++};
++#define HTML_PAGE_DRAG_CANCELLED	1u
++#define HTML_PAGE_DRAG_NO_PAN_X		2u
++#define HTML_PAGE_DRAG_NO_PAN_Y		4u
++#define HTML_PAGE_DRAG_STARTED		8u	/**< the press found an element */
++struct browser_window;
++unsigned int html_page_drag(struct browser_window *bw,
++		enum html_page_drag_phase phase, bool touch, int x, int y);
++
+ bool html_get_id_offset(struct hlcache_handle *h, lwc_string *frag_id,
+ 		int *x, int *y);
+ 
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index b664fab45..1c8525873 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -62,6 +62,7 @@
+ #include "html/layout_internal.h"
+ #include "html/imagemap.h"
+ #include "html/interaction.h"
++#include "html/box_construct.h"
+ 
+ /**
+  * Get pointer shape for given box
+@@ -1641,6 +1642,255 @@ pointer_press(html_content *html, dom_node *node, int x, int y)
+ 	}
+ }
+ 
++/*
++ * A drag the page is told of (VitaSurf). NetSurf's own drags select text
++ * or move a scrollbar and the page heard nothing of them, so a slider a
++ * page draws itself -- a range control, a carousel, a bot check's
++ * "slide to continue" -- could not be moved. The input layer hands the
++ * press, each move and the release here, and the page gets what Chrome
++ * sends: pointerdown, pointermove and pointerup, and with them mousedown,
++ * mousemove and mouseup from the pointer, or touchstart, touchmove and
++ * touchend from a finger. A finger's events go to the element it went
++ * down on, as a touch is captured; the pointer's to whatever is under
++ * it, in the document it was pressed in.
++ */
++static struct {
++	html_content *html;	/**< the document pressed in, or NULL */
++	dom_node *node;		/**< what was pressed, a reference */
++	bool touch;
++	float mul, sub_x, sub_y; /**< inner = outer * mul - sub */
++	int x, y;		/**< the last place, in that document */
++} page_drag;
++
++static void page_drag_drop(void)
++{
++	if (page_drag.node != NULL)
++		dom_node_unref(page_drag.node);
++	memset(&page_drag, 0, sizeof(page_drag));
++}
++
++/* exported interface documented in html/private.h */
++void html_page_drag_forget(html_content *html)
++{
++	if (page_drag.html == html)
++		page_drag_drop();
++	if (pointer_pressed == html) {
++		pointer_pressed = NULL;
++		pointer_down_cancelled = false;
++	}
++}
++
++/** Which ways a touch on node may pan the page, by touch-action on it
++ * and every element above it: bit 0 across, bit 1 down. */
++static unsigned int page_touch_pans(dom_node *node)
++{
++	unsigned int pan = 3;
++	dom_node *n = dom_node_ref(node);
++
++	while (n != NULL && pan != 0) {
++		struct box *b = box_for_node(n);
++		dom_node *p = NULL;
++
++		if (b != NULL && b->style != NULL) {
++			switch (css_computed_touch_action(b->style)) {
++			case CSS_TOUCH_ACTION_NONE:
++				pan = 0;
++				break;
++			case CSS_TOUCH_ACTION_PAN_X:
++				pan &= 1;
++				break;
++			case CSS_TOUCH_ACTION_PAN_Y:
++				pan &= 2;
++				break;
++			default:
++				break;
++			}
++		}
++		if (dom_node_get_parent_node(n, &p) != DOM_NO_ERR)
++			p = NULL;
++		dom_node_unref(n);
++		n = p;
++	}
++	if (n != NULL)
++		dom_node_unref(n);
++	return pan;
++}
++
++/** What is under x, y of the pressed document, or what was pressed. */
++static dom_node *page_drag_target(int x, int y)
++{
++	struct mouse_action_state mas;
++
++	if (page_drag.touch || page_drag.html->layout == NULL ||
++	    get_mouse_action_node(page_drag.html, x, y, &mas) != NSERROR_OK ||
++	    mas.node == NULL)
++		return page_drag.node;
++	return mas.node;
++}
++
++/* exported interface documented in html/html.h */
++unsigned int html_page_drag(struct browser_window *bw,
++		enum html_page_drag_phase phase, bool touch, int x, int y)
++{
++	unsigned int out = 0;
++	int ix, iy;
++	dom_node *target;
++	html_content *html;
++
++	if (phase == HTML_PAGE_DRAG_DOWN) {
++		struct hlcache_handle *h;
++		float mul = 1, sub_x = 0, sub_y = 0;
++		int depth;
++
++		page_drag_drop();
++		html = NULL;
++		target = NULL;
++		/* the document under the point, through any iframes */
++		for (depth = 0; bw != NULL && depth < 8; depth++) {
++			struct mouse_action_state mas;
++			float s_out, s_in;
++			int pos_x, pos_y;
++
++			h = browser_window_get_content(bw);
++			if (h == NULL || content_get_type(h) != CONTENT_HTML)
++				return 0;
++			html = (html_content *) hlcache_handle_get_content(h);
++			if (html == NULL || html->layout == NULL)
++				return 0;
++			ix = (int) (x * mul - sub_x);
++			iy = (int) (y * mul - sub_y);
++			if (get_mouse_action_node(html, ix, iy, &mas) !=
++			    NSERROR_OK)
++				return 0;
++			if (mas.iframe == NULL) {
++				target = mas.node;
++				break;
++			}
++			/* as iframe_mouse_action passes a click on */
++			s_out = browser_window_get_scale(bw);
++			s_in = browser_window_get_scale(mas.iframe);
++			if (s_in <= 0)
++				s_in = 1;
++			browser_window_get_position(mas.iframe, false,
++					&pos_x, &pos_y);
++			mul = mul * s_out / s_in;
++			sub_x = (sub_x * s_out + pos_x) / s_in;
++			sub_y = (sub_y * s_out + pos_y) / s_in;
++			bw = mas.iframe;
++		}
++		if (html == NULL || target == NULL)
++			return 0;
++		ix = (int) (x * mul - sub_x);
++		iy = (int) (y * mul - sub_y);
++		page_drag.html = html;
++		page_drag.node = dom_node_ref(target);
++		page_drag.touch = touch;
++		page_drag.mul = mul;
++		page_drag.sub_x = sub_x;
++		page_drag.sub_y = sub_y;
++		page_drag.x = ix;
++		page_drag.y = iy;
++		out |= HTML_PAGE_DRAG_STARTED;
++		if (touch) {
++			unsigned int pans = page_touch_pans(target);
++
++			if (!(pans & 1))
++				out |= HTML_PAGE_DRAG_NO_PAN_X;
++			if (!(pans & 2))
++				out |= HTML_PAGE_DRAG_NO_PAN_Y;
++			fire_dom_touch_pointer_event("pointerdown", target,
++					ix, iy, 1);
++			if (page_drag.html == html &&
++			    !fire_dom_touch_pointer_event("touchstart",
++					target, ix, iy, 1))
++				out |= HTML_PAGE_DRAG_CANCELLED;
++		} else {
++			/* as a press NetSurf takes is, so the click that
++			 * may follow does not send it again */
++			pointer_press(html, target, ix, iy);
++		}
++		return out;
++	}
++
++	html = page_drag.html;
++	if (html == NULL)
++		return 0;
++	ix = (int) (x * page_drag.mul - page_drag.sub_x);
++	iy = (int) (y * page_drag.mul - page_drag.sub_y);
++	switch (phase) {
++	case HTML_PAGE_DRAG_MOVE:
++		if (ix == page_drag.x && iy == page_drag.y)
++			return 0;
++		page_drag.x = ix;
++		page_drag.y = iy;
++		target = page_drag_target(ix, iy);
++		dom_node_ref(target);
++		if (page_drag.touch) {
++			fire_dom_touch_pointer_event("pointermove", target,
++					ix, iy, 1);
++			if (page_drag.html == html &&
++			    !fire_dom_touch_pointer_event("touchmove", target,
++					ix, iy, 1))
++				out |= HTML_PAGE_DRAG_CANCELLED;
++		} else {
++			bool down_cancelled = pointer_down_cancelled;
++
++			fire_dom_pointer_event("pointermove", target, ix, iy,
++					-1, 1, 0);
++			if (page_drag.html == html && !down_cancelled)
++				fire_dom_pointer_event("mousemove", target,
++						ix, iy, 0, 1, 0);
++		}
++		dom_node_unref(target);
++		break;
++	case HTML_PAGE_DRAG_UP:
++		target = dom_node_ref(page_drag_target(ix, iy));
++		if (page_drag.touch) {
++			fire_dom_touch_pointer_event("pointerup", target,
++					ix, iy, 0);
++			if (page_drag.html == html)
++				fire_dom_touch_pointer_event("touchend",
++						target, ix, iy, 0);
++		} else {
++			bool down_cancelled = pointer_down_cancelled;
++
++			fire_dom_pointer_event("pointerup", target, ix, iy,
++					0, 0, 0);
++			if (page_drag.html == html && !down_cancelled)
++				fire_dom_pointer_event("mouseup", target,
++						ix, iy, 0, 0, 1);
++		}
++		dom_node_unref(target);
++		if (pointer_pressed == html) {
++			pointer_pressed = NULL;
++			pointer_down_cancelled = false;
++		}
++		page_drag_drop();
++		break;
++	case HTML_PAGE_DRAG_CANCEL:
++		/* the browser took the touch to scroll */
++		target = dom_node_ref(page_drag.node);
++		fire_dom_touch_pointer_event("pointercancel", target,
++				page_drag.x, page_drag.y, 0);
++		if (page_drag.html == html && page_drag.touch)
++			fire_dom_touch_pointer_event("touchcancel", target,
++					page_drag.x, page_drag.y, 0);
++		dom_node_unref(target);
++		if (pointer_pressed == html) {
++			pointer_pressed = NULL;
++			pointer_down_cancelled = false;
++		}
++		page_drag_drop();
++		break;
++	case HTML_PAGE_DRAG_CLICKED:
++		page_drag_drop();
++		break;
++	default:
++		break;
++	}
++	return out;
++}
++
+ static nserror
+ mouse_action_drag_none(html_content *html,
+ 		       struct browser_window *bw,
+@@ -1735,7 +1985,7 @@ mouse_action_drag_none(html_content *html,
+ 	/* the button going down, in the document it went down in; one in a
+ 	 * frame is the frame document's to send (VitaSurf) */
+ 	if ((mouse & BROWSER_MOUSE_PRESS_1) && mas.iframe == NULL &&
+-	    mas.node != NULL) {
++	    mas.node != NULL && pointer_pressed != html) {
+ 		pointer_press(html, mas.node, x, y);
+ 	}
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 18e1b9e0a..e195a1c5c 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -837,6 +837,7 @@ struct html_pointer_event {
+ 	int button;	/**< which button changed: 0 the main one */
+ 	int buttons;	/**< which are down: 1 the main one */
+ 	int detail;	/**< the click count; 0 for pointer events */
++	bool touch;	/**< from a finger, not the pointer (VitaSurf) */
+ };
+ extern struct html_pointer_event html_pointer_current;
+ 
+@@ -851,6 +852,14 @@ eturn false if a listener cancelled it
+ bool fire_dom_pointer_event(const char *type, dom_node *target,
+ 		int x, int y, int button, int buttons, int detail);
+ 
++/** Let a drag or press in html go, as html goes (VitaSurf) */
++void html_page_drag_forget(html_content *html);
++
++/** The same from a finger: pointerType "touch", and touch events
++ * (VitaSurf) */
++bool fire_dom_touch_pointer_event(const char *type, dom_node *target,
++		int x, int y, int buttons);
++
+ /* Useful dom_string pointers */
+ struct dom_string;
+ 
+diff --git a/frontends/monkey/browser.c b/frontends/monkey/browser.c
+index 4ca0836b9..9424b31cb 100644
+--- a/frontends/monkey/browser.c
++++ b/frontends/monkey/browser.c
+@@ -745,6 +745,53 @@ monkey_window_handle_command(int argc, char **argv)
+ 		}
+ 		browser_window_mouse_track(gw->bw, 0, atoi(argv[5]),
+ 				atoi(argv[7]));
++	} else if (strcmp(argv[1], "DRAG") == 0) {
++		/* `WINDOW DRAG WIN` _%id%_ _%phase%_ `X` _%num%_ `Y` _%num%_
++		 * _%TOUCH|MOUSE%_: a press, move or release the page is told
++		 * of, as the Vita's input hands them (VitaSurf); phase is
++		 * DOWN, MOVE, UP, CANCEL or CLICK, the last a press let go
++		 * where it went down, which NetSurf's own click then ends */
++		struct gui_window *gw;
++		enum html_page_drag_phase ph;
++		unsigned int r;
++		bool touch;
++		int x, y;
++
++		if (argc != 10) {
++			moutf(MOUT_ERROR, "WINDOW DRAG ARGS BAD\n");
++			return;
++		}
++		gw = monkey_find_window_by_num(atoi(argv[3]));
++		if (gw == NULL) {
++			moutf(MOUT_ERROR, "WINDOW NUM BAD");
++			return;
++		}
++		x = atoi(argv[6]);
++		y = atoi(argv[8]);
++		touch = strcmp(argv[9], "TOUCH") == 0;
++		if (strcmp(argv[4], "DOWN") == 0) {
++			ph = HTML_PAGE_DRAG_DOWN;
++		} else if (strcmp(argv[4], "MOVE") == 0) {
++			ph = HTML_PAGE_DRAG_MOVE;
++		} else if (strcmp(argv[4], "UP") == 0) {
++			ph = HTML_PAGE_DRAG_UP;
++		} else if (strcmp(argv[4], "CANCEL") == 0) {
++			ph = HTML_PAGE_DRAG_CANCEL;
++		} else if (strcmp(argv[4], "CLICK") == 0) {
++			html_page_drag(gw->bw, HTML_PAGE_DRAG_CLICKED, touch,
++					x, y);
++			browser_window_mouse_click(gw->bw,
++					BROWSER_MOUSE_PRESS_1, x, y);
++			browser_window_mouse_click(gw->bw,
++					BROWSER_MOUSE_CLICK_1, x, y);
++			moutf(MOUT_WINDOW, "DRAG WIN %s RESULT 0", argv[3]);
++			return;
++		} else {
++			moutf(MOUT_ERROR, "WINDOW DRAG PHASE BAD");
++			return;
++		}
++		r = html_page_drag(gw->bw, ph, touch, x, y);
++		moutf(MOUT_WINDOW, "DRAG WIN %s RESULT %u", argv[3], r);
+ 	} else if (strcmp(argv[1], "PINS") == 0) {
+ 		/* `WINDOW PINS WIN` _%id%_: where the pinned boxes were
+ 		 * last drawn (VitaSurf) */

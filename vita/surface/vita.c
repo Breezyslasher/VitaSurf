@@ -164,6 +164,7 @@ struct vita_surface {
 	int touch_y;
 	int drag_dx;              /**< drag movement since the last read */
 	int drag_dy;
+	unsigned touch_id;        /**< touches so far, for the input layer */
 
 	/* last pointer position handed to NetSurf */
 	int pointer_x;
@@ -551,6 +552,7 @@ static void poll_touch(struct vita_surface *vs)
 
 		if (!vs->touch_down) {
 			vs->touch_down = true;
+			vs->touch_id++;
 			vs->touch_dragging = false;
 			vs->touch_start_x = x;
 			vs->touch_start_y = y;
@@ -1618,6 +1620,12 @@ void vita_surface_read_input(struct vita_input_state *out)
 	out->drag_dy = vs->drag_dy;
 	out->dragging = vs->touch_dragging;
 	out->last_tap_us = vs->last_tap_us;
+	out->touching = vs->touch_down;
+	out->touch_id = vs->touch_id;
+	out->touch_x = vs->touch_x;
+	out->touch_y = vs->touch_y;
+	out->touch_start_x = vs->touch_start_x;
+	out->touch_start_y = vs->touch_start_y;
 	vs->drag_dx = 0;
 	vs->drag_dy = 0;
 }

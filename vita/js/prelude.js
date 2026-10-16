@@ -1238,11 +1238,27 @@ var NATIVE_MOUSE=' dblclick mousedown mouseup mousemove mouseover mouseout '+
 var NATIVE_KEY=' keydown keyup keypress ';
 var NATIVE_FOCUS=' focus blur focusin focusout ';
 var NATIVE_INPUT=' input beforeinput ';
+/* A finger's drag, as Chrome sends it (VitaSurf): one Touch, which the
+   lists hold until it lifts. */
+var NATIVE_TOUCH=' touchstart touchmove touchend touchcancel ';
+function touchList(a){a.item=function(i){return this[i]||null;};return a;}
 Object.defineProperty(NV,'__vitaNativeEvent',{configurable:true,
  value:function(p){
   var t=String(p.type),k=' '+t+' ',q=p.__vsPointer,C,init,e,i,f;
+  if(q&&NATIVE_TOUCH.indexOf(k)>=0&&W.TouchEvent&&W.Touch){
+   var sx=W.scrollX||W.pageXOffset||0,sy=W.scrollY||W.pageYOffset||0,
+    one=new W.Touch({identifier:0,target:p.target||null,clientX:q.x-sx,
+     clientY:q.y-sy,pageX:q.x,pageY:q.y,screenX:q.x-sx,screenY:q.y-sy}),
+    held=t==='touchend'||t==='touchcancel'?[]:[one];
+   e=new W.TouchEvent(t,{bubbles:true,cancelable:t!=='touchcancel',
+    composed:true,view:W,detail:0,touches:touchList(held),
+    targetTouches:touchList(held.slice()),changedTouches:touchList([one])});
+   if(p.target)e.target=p.target;
+   return uaEvent(e);}
   if(q&&(NATIVE_POINTER.indexOf(k)>=0||NATIVE_MOUSE.indexOf(k)>=0)){
    init=pointerInit(q.x,q.y,q.button,q.buttons,q.detail);
+   if(q.touch){init.pointerType='touch';init.width=init.height=23;}
+   if(t==='pointercancel')init.cancelable=false;
    C=NATIVE_POINTER.indexOf(k)>=0&&W.PointerEvent?W.PointerEvent:W.MouseEvent;
   }else{
    init={bubbles:!!p.bubbles,cancelable:!!p.cancelable,

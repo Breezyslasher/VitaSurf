@@ -6,7 +6,8 @@
  *
  *   D-pad        move a focus rectangle between links and form fields,
  *                or nudge the pointer in pointer mode
- *   Cross        activate the focused element, or click at the pointer
+ *   Cross        activate the focused element, or press at the pointer:
+ *                held, the right stick drags what it pressed
  *   Circle       stop loading, drop focus, return input to the page
  *   L / R        history back / forward
  *   Triangle     enter a URL or search terms (system IME, or NetSurf's
@@ -18,7 +19,8 @@
  *   Start        menu: bookmarks, history, settings, quit (vita_menu.c)
  *   Left stick   scroll, speed follows deflection
  *   Right stick  move the pointer (handled in the surface)
- *   Touch        tap to click, drag to scroll
+ *   Touch        tap to click, drag to scroll, or drag what the page
+ *                lets a finger drag (a slider)
  *
  * Link focus walks the HTML box tree of the current page, so it needs
  * the html handler's headers; nothing here modifies the tree.
@@ -2254,6 +2256,189 @@ static void check_resume(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Drags the page is told of (VitaSurf)                                     */
+
+/*
+ * A press, its moves and its release, handed to the page as Chrome
+ * hands them (html_page_drag): a slider the page draws itself follows
+ * a finger or the held button, where the finger had only scrolled and
+ * Cross had pressed and released at once.
+ *
+ * A finger's drag is the page's when it cancels touchstart or its first
+ * touchmove, or touch-action on the element forbids panning the way the
+ * finger went; otherwise the page scrolls and is sent pointercancel and
+ * touchcancel. A tap is still a tap.
+ *
+ * In pointer mode, or with nothing focused, Cross is the pointer's
+ * button: held, the right stick drags whatever it pressed; let go where
+ * it went down, it is a click as before.
+ */
+#define PRESS_MOVED_PX 6
+
+static struct {
+	unsigned id;		/**< the touch it is for */
+	bool live;		/**< the page has the touch */
+	int x, y;		/**< where it last went, on the page */
+} touch_drag;
+
+static struct {
+	bool live;		/**< Cross is down on the page */
+	bool moved;		/**< and the pointer has gone from where */
+	int x0, y0;		/**< it went down, screen pixels */
+	int x, y;		/**< where it last went, on the page */
+} press_drag;
+
+/** Screen pixels to the page's own; false if not over the page. */
+static bool screen_to_page(int x, int y, int *px, int *py)
+{
+	int ax, ay, sx, sy, vw, vh;
+	float scale;
+
+	if (the_gw == NULL || the_gw->browser == NULL) {
+		return false;
+	}
+	ax = fbtk_get_absx(the_gw->browser);
+	ay = fbtk_get_absy(the_gw->browser);
+	if (x < ax || y < ay || x >= ax + fbtk_get_width(the_gw->browser) ||
+	    y >= ay + fbtk_get_height(the_gw->browser)) {
+		return false;
+	}
+	viewport(&sx, &sy, &vw, &vh);
+	scale = page_scale();
+	*px = (int)((x - ax + sx) / scale);
+	*py = (int)((y - ay + sy) / scale);
+	return true;
+}
+
+static bool pointer_at(int *x, int *y)
+{
+	nsfb_bbox_t loc;
+
+	if (the_gw == NULL ||
+	    !nsfb_cursor_loc_get(fbtk_get_nsfb(the_gw->browser), &loc)) {
+		return false;
+	}
+	*x = loc.x0;
+	*y = loc.y0;
+	return true;
+}
+
+/** A finger's drag: the page's, or a scroll. Takes the scroll away
+ * from st while the page has it. */
+static void touch_drags(struct vita_input_state *st)
+{
+	int x, y, x0, y0;
+	unsigned r, m;
+	bool across;
+
+	if (touch_drag.live &&
+	    (!st->touching || st->touch_id != touch_drag.id)) {
+		html_page_drag(the_gw->bw, HTML_PAGE_DRAG_UP, true,
+			       touch_drag.x, touch_drag.y);
+		touch_drag.live = false;
+		st->drag_dx = st->drag_dy = 0;
+	}
+	if (!st->dragging || !st->touching) {
+		return;
+	}
+	if (touch_drag.live) {
+		if (screen_to_page(st->touch_x, st->touch_y, &x, &y) &&
+		    (x != touch_drag.x || y != touch_drag.y)) {
+			touch_drag.x = x;
+			touch_drag.y = y;
+			html_page_drag(the_gw->bw, HTML_PAGE_DRAG_MOVE, true,
+				       x, y);
+		}
+		st->drag_dx = st->drag_dy = 0;
+		return;
+	}
+	if (st->touch_id == touch_drag.id) {
+		return;		/* this touch is a scroll already */
+	}
+	touch_drag.id = st->touch_id;
+	if (!screen_to_page(st->touch_start_x, st->touch_start_y, &x0, &y0) ||
+	    !screen_to_page(st->touch_x, st->touch_y, &x, &y)) {
+		return;
+	}
+	r = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_DOWN, true, x0, y0);
+	if (!(r & HTML_PAGE_DRAG_STARTED)) {
+		return;
+	}
+	m = html_page_drag(the_gw->bw, HTML_PAGE_DRAG_MOVE, true, x, y);
+	across = abs(st->touch_x - st->touch_start_x) >
+		 abs(st->touch_y - st->touch_start_y);
+	if (((r | m) & HTML_PAGE_DRAG_CANCELLED) ||
+	    (r & (across ? HTML_PAGE_DRAG_NO_PAN_X :
+		  HTML_PAGE_DRAG_NO_PAN_Y))) {
+		touch_drag.live = true;
+		touch_drag.x = x;
+		touch_drag.y = y;
+		st->drag_dx = st->drag_dy = 0;
+		vita_log("input: the page took a drag (%s)",
+			 (r | m) & HTML_PAGE_DRAG_CANCELLED ?
+			 "it cancelled the touch" : "touch-action");
+		return;
+	}
+	html_page_drag(the_gw->bw, HTML_PAGE_DRAG_CANCEL, true, x, y);
+}
+
+/** The held button's drag, as the pointer moves. */
+static void press_drags(void)
+{
+	int sx, sy, x, y;
+
+	if (!press_drag.live || !pointer_at(&sx, &sy)) {
+		return;
+	}
+	if (abs(sx - press_drag.x0) > PRESS_MOVED_PX ||
+	    abs(sy - press_drag.y0) > PRESS_MOVED_PX) {
+		press_drag.moved = true;
+	}
+	if (screen_to_page(sx, sy, &x, &y) &&
+	    (x != press_drag.x || y != press_drag.y)) {
+		press_drag.x = x;
+		press_drag.y = y;
+		html_page_drag(the_gw->bw, HTML_PAGE_DRAG_MOVE, false, x, y);
+	}
+}
+
+/** Cross going down or up as the pointer's button. */
+static void pointer_button(bool down)
+{
+	int sx, sy, x, y;
+
+	if (down) {
+		press_drag.live = false;
+		if (pointer_at(&sx, &sy) && screen_to_page(sx, sy, &x, &y) &&
+		    (html_page_drag(the_gw->bw, HTML_PAGE_DRAG_DOWN, false,
+				    x, y) & HTML_PAGE_DRAG_STARTED)) {
+			press_drag.live = true;
+			press_drag.moved = false;
+			press_drag.x0 = sx;
+			press_drag.y0 = sy;
+			press_drag.x = x;
+			press_drag.y = y;
+			return;
+		}
+		/* the toolbar, or nothing to press: a click, as before */
+		click_at_pointer();
+		return;
+	}
+	if (!press_drag.live) {
+		return;
+	}
+	press_drag.live = false;
+	press_drags();
+	if (press_drag.moved) {
+		html_page_drag(the_gw->bw, HTML_PAGE_DRAG_UP, false,
+			       press_drag.x, press_drag.y);
+		return;
+	}
+	html_page_drag(the_gw->bw, HTML_PAGE_DRAG_CLICKED, false, 0, 0);
+	click_at_pointer();
+}
+
+/* ------------------------------------------------------------------------ */
 /* Timer                                                                    */
 
 static void tick(void *p)
@@ -2286,6 +2471,10 @@ static void tick(void *p)
 		}
 		st.lx = st.ly = 0;
 		st.drag_dx = st.drag_dy = 0;
+	} else if (the_gw->bw != NULL) {
+		/* a drag the page takes is not a scroll (VitaSurf) */
+		touch_drags(&st);
+		press_drags();
 	}
 
 	/*
@@ -2454,12 +2643,13 @@ bool vita_input_key(struct gui_window *gw, const nsfb_event_t *event)
 
 	case VITA_KEY_CROSS:
 		if (event->type != NSFB_EVENT_KEY_DOWN) {
+			pointer_button(false);
 			return true;
 		}
 		if (focus.valid && !pointer_mode) {
 			activate_focus();
 		} else {
-			click_at_pointer();
+			pointer_button(true);
 		}
 		return true;
 

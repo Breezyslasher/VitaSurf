@@ -44,6 +44,13 @@ struct vita_input_state {
 	int drag_dy;
 	bool dragging;   /**< a touch drag is in progress */
 	uint64_t last_tap_us; /**< process time of the last touch tap, 0 if none */
+	/* the finger itself, for a page that takes the drag (VitaSurf) */
+	bool touching;   /**< a finger is on the screen */
+	unsigned touch_id; /**< counts the touches, one more each time down */
+	int touch_x;     /**< where the finger is, screen pixels */
+	int touch_y;
+	int touch_start_x; /**< where it went down */
+	int touch_start_y;
 };
 
 /**

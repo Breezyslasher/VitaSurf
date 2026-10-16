@@ -11487,6 +11487,8 @@ static JSValue wrap_event(JSContext *ctx, struct dom_event *evt)
 				  JS_NewInt32(ctx, html_pointer_current.buttons));
 		JS_SetPropertyStr(ctx, p, "detail",
 				  JS_NewInt32(ctx, html_pointer_current.detail));
+		JS_SetPropertyStr(ctx, p, "touch",
+				  JS_NewBool(ctx, html_pointer_current.touch));
 		JS_SetPropertyStr(ctx, obj, "__vsPointer", p);
 	}
 	JS_SetPropertyStr(ctx, obj, "defaultPrevented", JS_NewBool(ctx, false));
