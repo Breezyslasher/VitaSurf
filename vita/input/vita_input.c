@@ -134,6 +134,14 @@ static struct target *targets;
 static int ntargets;
 
 static uint64_t load_started_us;   /**< when the current load began, 0 if idle */
+/*
+ * What the window showed when the load began, and the address it set out
+ * for: a load stopped before its page was shown leaves the window on the
+ * page before, whose address the report had given to the figures of the
+ * one that never showed (ESPN's, under weather.gov's name).
+ */
+static struct hlcache_handle *load_from_content;
+static nsurl *load_url;
 
 static enum ime_target ime_for = IME_NONE;
 static bool ime_field_multiline;
@@ -940,6 +948,16 @@ void vita_input_load_started(struct gui_window *gw)
 		load_started_us = sceKernelGetProcessTimeWide();
 		vitasurf_profile_reset();
 		vita_sitetest_load_started();
+		if (load_url != NULL) {
+			nsurl_unref(load_url);
+			load_url = NULL;
+		}
+		load_from_content = gw->bw != NULL ?
+			gw->bw->current_content : NULL;
+		if (gw->bw != NULL && gw->bw->loading_content != NULL) {
+			load_url = nsurl_ref(hlcache_handle_get_url(
+					gw->bw->loading_content));
+		}
 	}
 }
 
@@ -1532,8 +1550,18 @@ void vita_input_load_finished(struct gui_window *gw)
 	settle_reports = 0;
 	/* a LiveArea close never reaches gui_quit, so save as we go */
 	vita_menu_autosave(false);
-	if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK && url != NULL) {
+	if (load_url != NULL && gw->bw->current_content == load_from_content) {
+		/* stopped before it was shown: the figures are its own */
+		vita_log("page: %s was stopped after %u ms, before it was "
+			 "shown; the figures are its own", nsurl_access(load_url),
+			 ms);
+	} else if (browser_window_get_url(gw->bw, false, &url) == NSERROR_OK &&
+		   url != NULL) {
 		vita_log("page: %s loaded in %u ms", nsurl_access(url), ms);
+	}
+	if (load_url != NULL) {
+		nsurl_unref(load_url);
+		load_url = NULL;
 	}
 	vita_input_report_page(gw, ms);
 	/* after the report, so a site test's line follows its figures */
