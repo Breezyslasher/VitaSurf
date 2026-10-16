@@ -13230,10 +13230,9 @@ static JSValue sel_native(JSContext *ctx, JSValueConst this_val, int argc,
 	/*
 	 * The last answer to this query of this root, while the tree has
 	 * its shape and no attribute the selector reads has changed since
-	 * (VitaSurf). cnn.com set 9333 attributes of other names between
-	 * its queries, and asked the document 230 times for
-	 * [data-uri*="/container/"], 502,704 elements walked: every write
-	 * had let the answer go.
+	 * (VitaSurf). cnn.com set 9333 attributes while it loaded and asked
+	 * the document 230 times for [data-uri*="/container/"], 502,704
+	 * elements walked: every write of any name had let the answer go.
 	 */
 	kept = &thread->sel_kept[(((uintptr_t) root >> 4) ^
 				  ((uintptr_t) s >> 4) ^ (unsigned) magic) &
