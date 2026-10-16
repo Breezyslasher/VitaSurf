@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!--
+  A change inside a block that holds its own list or counters builds that
+  block again, not the whole page, and the numbers come out as they did
+  (VitaSurf). The log says which: a whole-tree rebuild logs "need the
+  layout rebuilt". Look at the page after the change: the first list
+  reads 3, 4, 5; the second section's headings read 2.1 and 2.2; the list
+  after the changed block reads 1, 2, as before; and the headings whose
+  counter is made outside the second changed block, which has the whole
+  page built again, read k1, k2, k3. Every line below must
+  say PASS (the text and the geometry; the numbers are read off the
+  screen).
+-->
+<html><head><meta charset="utf-8"><title>Rebuild with counters</title>
+<style>
+body { font: 16px sans-serif; }
+.sec { counter-reset: h; }
+.sec h3::before { counter-increment: h; content: "2." counter(h) " "; }
+.outer { counter-reset: k; }
+.outer h4::before { counter-increment: k; content: "k" counter(k) " "; }
+</style></head>
+<body>
+<div id="block">
+  <span id="host">host</span>
+  <p id="t">before</p>
+  <ol start="3"><li>three</li><li>four</li><li>five</li></ol>
+  <div class="sec"><h3>alpha</h3><h3>beta</h3></div>
+</div>
+<ol><li>one</li><li>two</li></ol>
+<div class="outer"><h4>x</h4><div id="block2"><span id="host2">h</span><h4>y</h4></div><h4>z</h4></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+addEventListener('load', function () {
+  var h = document.getElementById('block').getBoundingClientRect().height;
+  setTimeout(function () {
+    document.getElementById('host').innerHTML = 'host <b id="added">added</b>';
+    document.getElementById('t').textContent = 'after';
+    setTimeout(function () {
+     document.getElementById('host2').innerHTML = 'h <i>more</i>';
+     setTimeout(function () {
+      ok('the text changed', document.getElementById('t').textContent, 'after');
+      ok('the block kept its height', document.getElementById('block').getBoundingClientRect().height, h);
+      ok('the added text is in the block', document.getElementById('added').getBoundingClientRect().height > 0, true);
+      document.getElementById('out').textContent = out.join('\n');
+      out.forEach(function (l) { console.log('rebuild-counters: ' + l); });
+      console.log('rebuild-counters: done');
+     }, 300);
+    }, 300);
+  }, 100);
+});
+</script>
+</body></html>

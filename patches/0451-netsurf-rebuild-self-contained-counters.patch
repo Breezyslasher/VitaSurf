@@ -1,0 +1,160 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index f8beea298..0ecaf5d6f 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -3549,21 +3549,149 @@ static bool rebuild_results_count(const css_select_results *r)
+ 	return false;
+ }
+ 
+-/** The same for a box subtree, and whether it numbers list items. */
+-static bool rebuild_subtree_counts(const struct box *b, unsigned *count)
++/*
++ * Whether a box subtree counts in a way it cannot settle by itself
++ * (VitaSurf). Built on its own, a subtree starts from no counters, so it
++ * comes out as it would in place only if every counter it counts on or
++ * shows was made inside it, by one of its own elements whose scope (the
++ * element, what follows it and their children) holds the use; and then
++ * what it counts stays inside too. A list counts its items on list-item,
++ * which the list makes, so a list wholly inside the subtree is its own
++ * business: a Wikipedia article's reference list had every change near
++ * it build the whole page again, 2.9 s on the Vita. Quotes nest across
++ * the whole document, and counters() reads the counters around the
++ * subtree, so either still means the whole tree.
++ */
++#define REBUILD_NAMES_MAX 32
++
++struct rebuild_names {
++	lwc_string *name[REBUILD_NAMES_MAX];
++	unsigned n;
++};
++
++static bool rebuild_name_made(const struct rebuild_names *k,
++		lwc_string *name)
++{
++	unsigned i;
++	bool match;
++
++	for (i = k->n; i-- > 0; ) {
++		if (lwc_string_caseless_isequal(k->name[i], name, &match) ==
++				lwc_error_ok && match)
++			return true;
++	}
++	return false;
++}
++
++/** Whether one style counts on what the subtree did not make; its
++ * resets join k when it may make them. */
++static bool rebuild_style_unsettled(const css_computed_style *s,
++		struct rebuild_names *k, bool may_reset)
+ {
++	const css_computed_counter *c = NULL;
++	const css_computed_content_item *item = NULL;
++	bool counts_list_item = false, match;
++
++	if (css_computed_counter_reset(s, &c) == CSS_COUNTER_RESET_NAMED &&
++			c != NULL && c->name != NULL) {
++		if (!may_reset)
++			return true;
++		for (; c->name != NULL; c++) {
++			if (k->n == REBUILD_NAMES_MAX)
++				return true;
++			k->name[k->n++] = c->name;
++		}
++	}
++	c = NULL;
++	if (css_computed_counter_increment(s, &c) ==
++			CSS_COUNTER_INCREMENT_NAMED && c != NULL) {
++		for (; c->name != NULL; c++) {
++			if (!rebuild_name_made(k, c->name))
++				return true;
++			if (lwc_string_isequal(c->name,
++					corestring_lwc_list_item, &match) ==
++					lwc_error_ok && match)
++				counts_list_item = true;
++		}
++	}
++	/* a list item counts list-item unless it says what it counts */
++	if (!counts_list_item &&
++			ns_computed_display(s, false) == CSS_DISPLAY_LIST_ITEM &&
++			!rebuild_name_made(k, corestring_lwc_list_item))
++		return true;
++	c = NULL;
++	if (css_computed_counter_set(s, &c) == CSS_COUNTER_SET_NAMED &&
++			c != NULL) {
++		for (; c->name != NULL; c++) {
++			if (!rebuild_name_made(k, c->name))
++				return true;
++		}
++	}
++	if (css_computed_content(s, &item) != CSS_CONTENT_SET || item == NULL)
++		return false;
++	for (; item->type != CSS_COMPUTED_CONTENT_NONE; item++) {
++		switch (item->type) {
++		case CSS_COMPUTED_CONTENT_COUNTER:
++			if (!rebuild_name_made(k, item->data.counter.name))
++				return true;
++			break;
++		case CSS_COMPUTED_CONTENT_COUNTERS:
++		case CSS_COMPUTED_CONTENT_OPEN_QUOTE:
++		case CSS_COMPUTED_CONTENT_CLOSE_QUOTE:
++		case CSS_COMPUTED_CONTENT_NO_OPEN_QUOTE:
++		case CSS_COMPUTED_CONTENT_NO_CLOSE_QUOTE:
++			return true;
++		default:
++			break;
++		}
++	}
++	return false;
++}
++
++/** The same for a box subtree: siblings from b on, under one parent,
++ * with the counters made around them in k. */
++static bool rebuild_subtree_unsettled(const struct box *b, unsigned *count,
++		struct rebuild_names *k)
++{
++	/* what these siblings make is theirs and their followers' */
++	unsigned base = k->n;
++	int i;
++
+ 	for (; b != NULL; b = b->next) {
+-		if (++*count > 4000 || b->list_marker != NULL ||
+-				(b->styles != NULL &&
+-				 rebuild_results_count(b->styles)))
++		if (++*count > 4000)
++			return true;
++		if (b->styles != NULL) {
++			for (i = 0; i < CSS_PSEUDO_ELEMENT_COUNT; i++) {
++				const css_computed_style *s =
++						b->styles->styles[i];
++
++				/* a pseudo element's counters are its
++				 * element's alone: not worth following */
++				if (s != NULL && rebuild_style_unsettled(s, k,
++						i == CSS_PSEUDO_ELEMENT_NONE))
++					return true;
++			}
++		} else if (b->list_marker != NULL) {
+ 			return true;
++		}
+ 		if (b->children != NULL &&
+-				rebuild_subtree_counts(b->children, count))
++				rebuild_subtree_unsettled(b->children, count, k))
+ 			return true;
+ 	}
++	k->n = base;
+ 	return false;
+ }
+ 
++/** Whether a box subtree counts or quotes in a way that needs the rest of
++ * the document: see rebuild_subtree_unsettled. */
++static bool rebuild_subtree_counts(const struct box *b, unsigned *count)
++{
++	struct rebuild_names k;
++
++	k.n = 0;
++	return rebuild_subtree_unsettled(b, count, &k);
++}
++
+ /** Elements whose text is more than boxes: a sheet, a script, a title,
+  * a form control's value or options, markup parsed elsewhere. */
+ static bool rebuild_text_special(dom_node *n)
