@@ -1316,12 +1316,19 @@ D.hasFocus=function(){return true;};
 function badName(){
  return new DOMException('The string contains invalid characters.',
                          'InvalidCharacterError');}
+/* names already found good (VitaSurf): pages make thousands of elements
+   of a few names, and each was read a character at a time, 7% of
+   github.com's profile */
+var NAME_OK=Object.create(null),NAME_OK_N=0;
 function checkLocalName(q){
  q=String(q);
+ if(NAME_OK[q]===true)return;
  if(q===''||!(nameStartOk(q.charCodeAt(0))||q.charCodeAt(0)===0x3a))
   throw badName();
  for(var i=1;i<q.length;i++)
-  if(!(namePartOk(q.charCodeAt(i))||q.charCodeAt(i)===0x3a))throw badName();}
+  if(!(namePartOk(q.charCodeAt(i))||q.charCodeAt(i)===0x3a))throw badName();
+ if(NAME_OK_N>=512){NAME_OK=Object.create(null);NAME_OK_N=0;}
+ NAME_OK[q]=true;NAME_OK_N++;}
 function checkElementName(q){
  var parts=String(q).split(':');
  if(parts.length===1){

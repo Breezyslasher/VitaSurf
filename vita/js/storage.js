@@ -245,7 +245,14 @@ var CLONE_REFUSED = ['Node', 'Event', 'EventTarget', 'URL', 'URLSearchParams',
  'Request', 'Response', 'Headers', 'AbortSignal', 'AbortController', 'FormData',
  'CSSStyleSheet', 'MediaQueryList', 'Worker', 'WebSocket', 'XMLHttpRequest'];
 function platformBrand(v, b){
- var i;
+ var i, p;
+ /* a plain object or one with no prototype is no platform object, and
+    is nearly every object a clone copies: each had been tested against
+    every interface below, a tenth of youtube.com's profile (VitaSurf) */
+ if (b === 'Object') {
+  try { p = Object.getPrototypeOf(v); } catch (e) { p = undefined; }
+  if (p === Object.prototype || p === null) return b;
+ }
  if (typeof W.DOMException === 'function' && v instanceof W.DOMException)
   return 'DOMException';
  if (typeof W.ImageData === 'function' && v instanceof W.ImageData)
