@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<!--
+  Variables a pseudo-element declares are its own (VitaSurf).
+
+  A custom property set in a ::before or ::after rule applies to that
+  pseudo-element and nothing else: not to its element, not to the
+  element's children. libcss had put them into the element's own
+  variables. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Pseudo-element variables</title>
+<style>
+.a::before { --c: rgb(1, 2, 3); content: 'x'; }
+.a { color: var(--c, rgb(9, 9, 9)); }
+.b { --d: rgb(200, 0, 0); }
+.b::before { --d: rgb(0, 0, 200); content: 'y'; color: var(--d); }
+.b span { color: var(--d); }
+*, ::before, ::after { --tw: rgb(0, 100, 0); }
+.c { color: var(--tw); }
+.c::after { content: 'z'; color: var(--tw); }
+.d::after { --tw: rgb(5, 6, 7); content: 'w'; color: var(--tw); }
+.d { color: var(--tw); }
+.d i { color: var(--tw); }
+.e::before { content: 'v'; color: var(--d); }
+</style></head>
+<body>
+<p class="a" id="a">a</p>
+<p class="b" id="b">b<span id="bs">s</span></p>
+<p class="c" id="c">c</p>
+<p class="d" id="d">d<i id="di">i</i></p>
+<div class="b"><p class="e" id="e">e</p></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want)); }
+function cs(id, p) { return getComputedStyle(document.getElementById(id), p || null); }
+addEventListener('load', function () {
+  ok('an element does not see its ::before\'s variable', cs('a').color, 'rgb(9, 9, 9)');
+  ok('the ::before sees it', cs('a', '::before').getPropertyValue('--c').trim(), 'rgb(1, 2, 3)');
+  ok('a ::before\'s own value wins in it', cs('b', '::before').color, 'rgb(0, 0, 200)');
+  ok('the element\'s children keep the element\'s', cs('bs').color, 'rgb(200, 0, 0)');
+  ok('a variable set on everything and its pseudo-elements', cs('c').color, 'rgb(0, 100, 0)');
+  ok('and in an ::after', cs('c', '::after').color, 'rgb(0, 100, 0)');
+  ok('a more specific ::after value', cs('d', '::after').color, 'rgb(5, 6, 7)');
+  ok('leaves its element alone', cs('d').color, 'rgb(0, 100, 0)');
+  ok('and the element\'s children', cs('di').color, 'rgb(0, 100, 0)');
+  ok('a ::before inherits its element\'s variables', cs('e', '::before').color, 'rgb(200, 0, 0)');
+  document.getElementById('out').textContent = out.join('\n');
+  out.forEach(function (l) { console.log('pseudo-variables: ' + l); });
+  console.log('pseudo-variables: done');
+});
+</script>
+</body></html>

@@ -15350,6 +15350,38 @@ static JSValue win_vita_custom_prop(JSContext *ctx, JSValueConst this_val,
 			goto out;
 		style = owned->styles[CSS_PSEUDO_ELEMENT_NONE];
 	}
+	/* a pseudo-element's, which may declare its own (VitaSurf) */
+	if (argc > 2 && JS_IsString(argv[2])) {
+		const char *p = JS_ToCString(ctx, argv[2]);
+		int which = -1;
+
+		if (p != NULL) {
+			const char *q = p;
+
+			while (*q == ':')
+				q++;
+			if (strcasecmp(q, "before") == 0)
+				which = CSS_PSEUDO_ELEMENT_BEFORE;
+			else if (strcasecmp(q, "after") == 0)
+				which = CSS_PSEUDO_ELEMENT_AFTER;
+			else if (strcasecmp(q, "marker") == 0)
+				which = CSS_PSEUDO_ELEMENT_MARKER;
+			else if (strcasecmp(q, "first-line") == 0)
+				which = CSS_PSEUDO_ELEMENT_FIRST_LINE;
+			else if (strcasecmp(q, "first-letter") == 0)
+				which = CSS_PSEUDO_ELEMENT_FIRST_LETTER;
+			else if (strcasecmp(q, "placeholder") == 0)
+				which = CSS_PSEUDO_ELEMENT_PLACEHOLDER;
+			JS_FreeCString(ctx, p);
+		}
+		if (which >= 0) {
+			const css_select_results *r = owned != NULL ? owned :
+					box != NULL ? box->styles : NULL;
+
+			if (r != NULL && r->styles[which] != NULL)
+				style = r->styles[which];
+		}
+	}
 	if (css_computed_custom_property(style, lname, buf,
 			sizeof(small), &len) == CSS_OK) {
 		if (len >= sizeof(small)) {

@@ -1798,6 +1798,7 @@ function computedStyle(el,pseudo){
     nine tenths of a call, and lazysizes asks for an element's
     visibility for each image near the view on every scroll check */
  Object.defineProperty(cs,'__vitaEl',{value:el});
+ if(typeof pseudo==='string'&&pseudo)Object.defineProperty(cs,'__vitaPseudo',{value:pseudo});
  return cs;
 }
 function csNames(cs){
@@ -1830,7 +1831,7 @@ Object.defineProperties(CS_PROTO,{
    if(Object.prototype.hasOwnProperty.call(this,n))return String(this[n]);
    if(sheetsDirty.length)sheetsWrite();
    return (el&&el.nodeType===1&&typeof NV.__vitaCustomProp==='function')?
-    NV.__vitaCustomProp(el,n):'';}
+    NV.__vitaCustomProp(el,n,this.__vitaPseudo):'';}
   var v=this[dashToCamel(n)];return v===undefined||typeof v==='function'?'':String(v);}},
  getPropertyPriority:{configurable:true,writable:true,value:function(){return '';}},
  setProperty:{configurable:true,writable:true,value:function(n,v){this[dashToCamel(n)]=String(v);delete this.__vitaNames;}},
