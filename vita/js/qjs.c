@@ -19170,14 +19170,19 @@ static nserror heap_start(jsheap *ret)
 		 * left, from 256 KB: script that makes cyclic garbage fast,
 		 * as an obfuscated virtual machine does, paid for a walk of
 		 * the whole heap every few megabytes (VitaSurf). Three times
-		 * what is left, at least 8 MB more and at most 32 MB more,
-		 * and short of the limit, which also keeps at least the old
-		 * half: tests/bench/gc-churn.html?live=30000 ran 9
+		 * what is left, at least 8 MB more and at most 32 MB more
+		 * as first set, and short of the limit, which also keeps at
+		 * least the old half: tests/bench/gc-churn.html?live=30000 ran 9
 		 * collections in 210 ms where it ran 28 in 330, and with
 		 * 150000 objects live 9 where it ran 14, in the same time.
+		 * At least 24 MB more and at most 48 MB: a collection took
+		 * 0.5 to 1.3 s on the Vita over script heaps of 7 to 35 MB,
+		 * and in build 751's site test most pages ran two while
+		 * loading, the first with nearly everything still live
+		 * (GitHub 1.8 s of 14.7, Apple 1.6 s of 12.3, CNN 2.2 s).
 		 */
-		JS_SetGCGrowth(ret->rt, 200, (size_t)8 * 1024 * 1024,
-			       (size_t)32 * 1024 * 1024);		vita_log("qjs: script memory limit %u MB of a %u MB heap",
+		JS_SetGCGrowth(ret->rt, 200, (size_t)24 * 1024 * 1024,
+			       (size_t)48 * 1024 * 1024);		vita_log("qjs: script memory limit %u MB of a %u MB heap",
 			 (unsigned int)(limit / (1024 * 1024)),
 			 vita_heap_size_kb() / 1024);
 	}
