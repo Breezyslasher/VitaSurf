@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Adopted sheet lists</title></head>
+<body>
+<!--
+ What Lit components do when each kind's styles are a shared library
+ sheet and one of its own (static styles = [shared, css`...`]): every
+ shadow root adopts [shared, own], a list no two kinds have alike, as on
+ reddit.com's login page, whose seven 325 KB sheets were each parsed.
+ Logs how long making the components and styling one took, and checks
+ that each kind has the shared rules and its own, in order.
+ ?kinds=14 kinds; ?rules=800 rules in the shared sheet.
+-->
+<div id="host"></div>
+<pre id="out"></pre>
+<script>
+var q=new URLSearchParams(location.search),KINDS=+(q.get('kinds')||14),RULES=+(q.get('rules')||800);
+var css=[],i;
+for(i=0;i<RULES;i++)css.push('.c'+i+' .x'+(i%37)+', :host([size="'+i+'"]) .y{color:#'+(100000+i)+';margin:'+(i%9)+'px '+(i%5)+'px;padding:1px 2px 3px 4px}');
+css.push('.mark{width:123px;height:7px}');
+var shared=new CSSStyleSheet();shared.replaceSync(css.join('\n'));
+var t0=performance.now();
+for(var k=0;k<KINDS;k++){
+ (function(k){
+  var own=new CSSStyleSheet();own.replaceSync(':host{display:block}.mark{height:'+(10+k)+'px}');
+  customElements.define('adopt-c'+k,class extends HTMLElement{
+   constructor(){super();
+    var r=this.attachShadow({mode:'open'});
+    r.adoptedStyleSheets=[shared,own];
+    var d=document.createElement('div');d.className='mark';d.textContent='x';r.appendChild(d);}});})(k);}
+var host=document.getElementById('host');
+for(i=0;i<KINDS*2;i++)host.appendChild(document.createElement('adopt-c'+(i%KINDS)));
+var t1=performance.now();
+setTimeout(function(){
+ var bad=[],t2=performance.now();
+ for(var j=0;j<KINDS;j++){
+  var cs=getComputedStyle(host.children[j].shadowRoot.querySelector('.mark'));
+  if(Math.round(parseFloat(cs.width))!==123||Math.round(parseFloat(cs.height))!==10+j)bad.push(j+':'+cs.width+'/'+cs.height);}
+ var msg='adopted-lists: '+KINDS+' kinds, '+RULES+' shared rules: '+Math.round(t1-t0)+' ms to make them, '+
+  Math.round(performance.now()-t2)+' ms to read them; '+(bad.length?'FAIL '+bad.join(' '):'PASS');
+ document.getElementById('out').textContent=msg;console.log(msg);},1500);
+</script>
+</body></html>

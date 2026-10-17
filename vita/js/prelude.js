@@ -6929,11 +6929,11 @@ Object.defineProperty(P,'sheet',{configurable:true,get:function(){
  return inDoc(this)?elementSheet(this):null;}});
 /* adoptedStyleSheets (VitaSurf): the document's are one sheet the engine
    reads from a <style> that is never put in the document; a shadow
-   root's are a <style> inside it, which is scoped as its own are. */
+   root's are <style> elements inside it, scoped as its own are. */
 var adoptedOf=new WeakMap(),adoptEl=new WeakMap();
 /* The text of a list of sheets, the same string while they are the same
-   (VitaSurf): each component adopting a library's sheets had joined them
-   into a new string, which every lookup by text then hashed whole. */
+   (VitaSurf): the document's list was joined into a new string at each
+   write, which every lookup by text then hashed whole. */
 var adoptTexts=new Map(),adoptIds=new WeakMap(),adoptNext=0;
 function adoptText(list){
  var key='',i,s,id,t;
@@ -6947,21 +6947,38 @@ function adoptText(list){
   t=list.map(function(s){return s._text();}).join('\n');adoptTexts.set(key,t);}
  return t;}
 function adoptWrite(target){
- var list=adoptedOf.get(target)||[],text=adoptText(list);
- var el=adoptEl.get(target);
+ var list=adoptedOf.get(target)||[],text,el;
  if(target===D){
+  text=adoptText(list);el=adoptEl.get(target);
   /* marked so the engine keeps it in the cascade though it is not
      in the document, as no other <style> out of it is */
   if(!el){el=D.createElement('style');el.setAttribute('data-adopted','document');adoptEl.set(target,el);}
   if(NV.__vitaSetSheetText)try{NV.__vitaSetSheetText(el,text);}catch(e){}
- }else{
-  if(!el){el=D.createElement('style');el.setAttribute('data-adopted','');adoptEl.set(target,el);}
+ }else adoptWriteShadow(target,list);}
+/* A shadow root's sheets each go in a <style> of their own (VitaSurf):
+   joined into one, a library sheet that every kind of component adopts
+   with one of its own was a different text in each kind, and so a
+   different sheet to parse and index, where on its own it is the same
+   text and parsed once. reddit.com's login page parsed seven 325 KB
+   sheets so, 500 to 750 ms each. */
+var adoptSet=new WeakMap();
+function adoptWriteShadow(target,list){
+ var texts=[],els=adoptEl.get(target),i,t,el;
+ for(i=0;i<list.length;i++){t=list[i]._text();if(t!=='')texts.push(t);}
+ if(!els){els=[];adoptEl.set(target,els);}
+ for(i=0;i<texts.length;i++){
+  el=els[i];
+  if(!el){el=D.createElement('style');el.setAttribute('data-adopted','');els[i]=el;}
   /* in first and then given its text, which is scoped as it is set,
      where the text written before had been read back and written again */
   if(el.parentNode!==target){
    if(el.firstChild)el.textContent='';
+   adoptSet.delete(el);
    try{target.appendChild(el);}catch(e){}}
-  el.textContent=text;}}
+  if(adoptSet.get(el)!==texts[i]){el.textContent=texts[i];adoptSet.set(el,texts[i]);}}
+ while(els.length>texts.length){
+  el=els.pop();adoptSet.delete(el);
+  if(el.parentNode)try{el.parentNode.removeChild(el);}catch(e){}}}
 function adoptedAccessor(){return {configurable:true,
  get:function(){return (adoptedOf.get(this)||[]).slice();},
  set:function(v){var self=this,list=Array.prototype.slice.call(v||[]);
