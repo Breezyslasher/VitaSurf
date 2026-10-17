@@ -1805,6 +1805,7 @@ function computedStyle(el,pseudo){
   for(var k in CS_DEFAULTS)empty[k]='';
   empty.width='';empty.height='';
   return empty;}
+ if(!csReady)csInstall();
  var cs=Object.create(CS_PROTO),ps=typeof pseudo==='string'&&pseudo?pseudo:null,c,i,k;
  /* the methods are the prototype's and the names are listed when
     asked for (VitaSurf): made for every call, with every property's
@@ -2022,13 +2023,40 @@ Object.defineProperties(CS_PROTO,{
  cssText:{configurable:true,writable:true,value:''},
  length:{configurable:true,get:function(){return csNames(this).length;}}
 });
-(function(){var k;
- for(k in CS_MORE)csDefine(k);
- for(k in CS_DEFAULTS)if(!CS_GOT[k])csDefine(k);
+/* every name at once, as csDefine and csDashed make one, but with the
+   getters and setters made in C (__vitaAccessors, vita/js/ifaces.c)
+   passing the name to one function each: four closures a name, for
+   some 250 names, were a tenth of the prelude in every realm, a frame's
+   included (VitaSurf). Made by the first getComputedStyle, as nothing
+   else reaches CS_PROTO: most of a page's frames are an ad's, and never
+   ask. */
+var csReady=false;
+function csInstall(){var keys=[],dk=[],da=[],seen=Object.create(null),k;
+ csReady=true;
+ function add(k){if(seen[k]||CS_GOT[k])return;seen[k]=1;keys.push(k);}
+ for(k in CS_MORE)add(k);
+ for(k in CS_DEFAULTS)add(k);
  ['margin','padding','border'].forEach(function(b){
   var w=b==='border'?'Width':'';
-  if(!CS_GOT[b+w])csDefine(b+w);
-  CS_SIDES.forEach(function(e){if(!CS_GOT[b+e+w])csDefine(b+e+w);});});})();
+  add(b+w);CS_SIDES.forEach(function(e){add(b+e+w);});});
+ /* the dashed name a character at a time: the regular expressions
+    csDashed uses were most of this loop's time */
+ keys.forEach(function(k){var d='',i,c,last=0;
+  CS_GOT[k]=1;CS_GOT_N++;CS_DASHED[k]=1;
+  for(i=0;i<k.length;i++){c=k.charCodeAt(i);
+   if(c>=65&&c<=90){d+=k.slice(last,i)+'-'+String.fromCharCode(c+32);last=i+1;}}
+  if(k==='cssFloat')d='float';
+  else if(last===0)return;
+  else{d+=k.slice(last);
+   if(d.slice(0,7)==='webkit-'||d.slice(0,4)==='moz-'||d.slice(0,3)==='ms-')d='-'+d;}
+  if(seen[d]||Object.prototype.hasOwnProperty.call(CS_PROTO,d))return;
+  seen[d]=1;dk.push(d);da.push(k);});
+ NV.__vitaAccessors(CS_PROTO,keys,null,
+  function(k){return this[CS_SLOT]?csGet(this,k):undefined;},
+  function(k,v){Object.defineProperty(this,k,{configurable:true,
+   enumerable:true,writable:true,value:v});},5);
+ NV.__vitaAccessors(CS_PROTO,dk,da,function(k){return this[k];},
+  function(k,v){this[k]=v;},1);}
 W.getComputedStyle=function(el,pseudo){return computedStyle(el,pseudo);};
 /* A media query evaluator over the real viewport. Handles the features
    responsive sites actually branch on; anything else is false. */
