@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!--
+  Object.prototype.toString as the spec has it (VitaSurf, libquickjs patch
+  0495): its answer for a built-in tag is now the same string each time,
+  an atom, so a library's "[object Object]" === toString.call(v) compares
+  by address; one with a Symbol.toStringTag is made as before. Video.js's
+  option merge on Amazon tests every value so (46% of its script in build
+  765's log). Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Object.prototype.toString</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [], T = Object.prototype.toString;
+function ok(name, got, want) { out.push((got === want ? "PASS " : "FAIL ") + name + (got === want ? "" : ": " + got + ", want " + want)); }
+ok("null", T.call(null), "[object Null]");
+ok("undefined", T.call(undefined), "[object Undefined]");
+ok("object", T.call({}), "[object Object]");
+ok("array", T.call([]), "[object Array]");
+ok("function", T.call(function () {}), "[object Function]");
+ok("string", T.call("s"), "[object String]");
+ok("number", T.call(1), "[object Number]");
+ok("boolean", T.call(true), "[object Boolean]");
+ok("date", T.call(new Date(0)), "[object Date]");
+ok("regexp", T.call(/x/), "[object RegExp]");
+ok("error", T.call(new Error()), "[object Error]");
+ok("arguments", (function () { return T.call(arguments); })(), "[object Arguments]");
+ok("map", T.call(new Map()), "[object Map]");
+ok("symbol", T.call(Symbol()), "[object Symbol]");
+ok("bigint", T.call(1n), "[object BigInt]");
+ok("promise", T.call(Promise.resolve()), "[object Promise]");
+ok("an element", T.call(document.body), "[object HTMLBodyElement]");
+var o = {}; o[Symbol.toStringTag] = "Custom";
+ok("an own Symbol.toStringTag", T.call(o), "[object Custom]");
+var a = []; a[Symbol.toStringTag] = "Z";
+ok("an array's own tag", T.call(a), "[object Z]");
+ok("a proxy of an array", T.call(new Proxy([], {})), "[object Array]");
+ok("String({})", String({}), "[object Object]");
+ok("'' + {}", "" + {}, "[object Object]");
+ok("the same text from two objects", T.call({}) === T.call({ x: 1 }), true);
+ok("and its length", T.call({}).length, 15);
+document.getElementById("out").textContent = out.join("\n");
+out.forEach(function (l) { console.log("object-tostring: " + l); });
+console.log("object-tostring: done");
+</script>
+</body></html>

@@ -1,0 +1,92 @@
+diff --git a/quickjs.c b/quickjs.c
+index 0874ba3..968d80e 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -316,6 +316,11 @@ struct JSRuntime {
+     /* the strings of one Latin-1 character, made on first use and kept
+        for the runtime's life (VitaSurf) */
+     JSString *char_strings[256];
++    /* Object.prototype.toString's answer for each built-in tag, an atom
++       made on first use (VitaSurf; js_object_tostring_atom) */
++    JSAtom tostring_key[16];
++    JSAtom tostring_val[16];
++    int tostring_count;
+     /* true if inside an out of memory error, to avoid recursing */
+     bool in_out_of_memory;
+     /* true if inside build_backtrace, to avoid recursing */
+@@ -2484,6 +2489,9 @@ void JS_FreeRuntime(JSRuntime *rt)
+             rt->char_strings[i] = NULL;
+         }
+     }
++    for(i = 0; i < rt->tostring_count; i++)
++        JS_FreeAtomRT(rt, rt->tostring_val[i]);
++    rt->tostring_count = 0;
+ 
+     list_for_each_safe(el, el1, &rt->job_list) {
+         JSJobEntry *e = list_entry(el, JSJobEntry, link);
+@@ -43808,6 +43816,44 @@ static JSValue js_object_valueOf(JSContext *ctx, JSValueConst this_val,
+     return JS_ToObject(ctx, this_val);
+ }
+ 
++/*
++ * "[object X]" for a built-in tag X (VitaSurf), the same atom each time:
++ * Object.prototype.toString.call(v) is how libraries test a value's kind
++ * (video.js's merge on Amazon, lodash, jQuery), and each call made the
++ * string afresh to compare it with a literal; as an atom it is the
++ * literal's own string, which compares by address. key is a predefined
++ * atom, never freed.
++ */
++static JSValue js_object_tostring_atom(JSContext *ctx, JSAtom key,
++                                       const char *name)
++{
++    JSRuntime *rt = ctx->rt;
++    char buf[64], tmp[ATOM_GET_STR_BUF_SIZE];
++    JSAtom a;
++    int i;
++
++    for (i = 0; i < rt->tostring_count; i++) {
++        if (rt->tostring_key[i] == key)
++            return JS_AtomToString(ctx, rt->tostring_val[i]);
++    }
++    if (!name)
++        name = JS_AtomGetStr(ctx, tmp, sizeof(tmp), key);
++    snprintf(buf, sizeof(buf), "[object %s]", name);
++    a = JS_NewAtom(ctx, buf);
++    if (a == JS_ATOM_NULL)
++        return JS_EXCEPTION;
++    if (rt->tostring_count < countof(rt->tostring_key)) {
++        rt->tostring_key[rt->tostring_count] = key;
++        rt->tostring_val[rt->tostring_count++] = a;
++        return JS_AtomToString(ctx, a);
++    }
++    {
++        JSValue v = JS_AtomToString(ctx, a);
++        JS_FreeAtom(ctx, a);
++        return v;
++    }
++}
++
+ static JSValue js_object_toString(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+ {
+@@ -43817,9 +43863,9 @@ static JSValue js_object_toString(JSContext *ctx, JSValueConst this_val,
+     JSObject *p;
+ 
+     if (JS_IsNull(this_val)) {
+-        tag = js_new_string8(ctx, "Null");
++        return js_object_tostring_atom(ctx, JS_ATOM_null, "Null");
+     } else if (JS_IsUndefined(this_val)) {
+-        tag = js_new_string8(ctx, "Undefined");
++        return js_object_tostring_atom(ctx, JS_ATOM_undefined, "Undefined");
+     } else {
+         obj = JS_ToObject(ctx, this_val);
+         if (JS_IsException(obj))
+@@ -43857,7 +43903,7 @@ static JSValue js_object_toString(JSContext *ctx, JSValueConst this_val,
+             return JS_EXCEPTION;
+         if (!JS_IsString(tag)) {
+             JS_FreeValue(ctx, tag);
+-            tag = JS_AtomToString(ctx, atom);
++            return js_object_tostring_atom(ctx, atom, NULL);
+         }
+     }
+     return JS_ConcatString3(ctx, "[object ", tag, "]");
