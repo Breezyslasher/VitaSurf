@@ -1,0 +1,89 @@
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index 8b125a468..5740324c8 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -286,6 +286,47 @@ static void fb_redraw(fbtk_widget_t *widget,
+ 		      struct browser_widget_s *bwidget,
+ 		      struct browser_window *bw);
+ 
++static long fb_area(const struct rect *r)
++{
++	return (long)(r->x1 - r->x0) * (long)(r->y1 - r->y0);
++}
++
++/**
++ * Merge areas that touch or overlap into their unions, where a union
++ * covers no more than the two areas apart (VitaSurf): a header and a
++ * sidebar that meet at a corner stay two, since their union would be
++ * most of the screen. Returns how many areas are left.
++ */
++static int fb_merge_areas(struct rect *a, int n)
++{
++	bool merged = true;
++	int i, j;
++
++	while (merged) {
++		merged = false;
++		for (i = 0; i < n && !merged; i++) {
++			for (j = i + 1; j < n && !merged; j++) {
++				struct rect u;
++
++				if (a[i].x0 > a[j].x1 || a[j].x0 > a[i].x1 ||
++				    a[i].y0 > a[j].y1 || a[j].y0 > a[i].y1)
++					continue;
++				u.x0 = a[i].x0 < a[j].x0 ? a[i].x0 : a[j].x0;
++				u.y0 = a[i].y0 < a[j].y0 ? a[i].y0 : a[j].y0;
++				u.x1 = a[i].x1 > a[j].x1 ? a[i].x1 : a[j].x1;
++				u.y1 = a[i].y1 > a[j].y1 ? a[i].y1 : a[j].y1;
++				if (fb_area(&u) > fb_area(&a[i]) +
++						fb_area(&a[j]))
++					continue;
++				a[i] = u;
++				a[j] = a[--n];
++				merged = true;
++			}
++		}
++	}
++	return n;
++}
++
+ /** Add a waiting image's place, once (VitaSurf). */
+ static void
+ fb_images_add(struct browser_widget_s *bwidget, const struct rect *d,
+@@ -679,6 +720,8 @@ fb_pan(fbtk_widget_t *widget,
+ 	if (pinned_n > 0) {
+ 		nsfb_bbox_t queued = bwidget->redraw_box;
+ 		bool queued_required = bwidget->redraw_required;
++		struct rect areas[FB_PINNED_MAX];
++		int n_areas = 0;
+ #ifdef __vita__
+ 		unsigned long long pinned_t0 = vita_now_us();
+ #endif
+@@ -731,10 +774,23 @@ fb_pan(fbtk_widget_t *widget,
+ 			if (x1 <= x0 || y1 <= y0) {
+ 				continue;
+ 			}
+-			bwidget->redraw_box.x0 = x0;
+-			bwidget->redraw_box.y0 = y0;
+-			bwidget->redraw_box.x1 = x1;
+-			bwidget->redraw_box.y1 = y1;
++			areas[n_areas].x0 = x0;
++			areas[n_areas].y0 = y0;
++			areas[n_areas].x1 = x1;
++			areas[n_areas].y1 = y1;
++			n_areas++;
++		}
++		/* areas that overlap are drawn once as their union, where
++		 * that is no more than drawing them apart (VitaSurf): CNN's
++		 * header is five pinned boxes, nested sticky and fixed ones,
++		 * and each step of a scroll drew the same rows five times,
++		 * some 75 ms a step on the Vita */
++		n_areas = fb_merge_areas(areas, n_areas);
++		for (i = 0; i < n_areas; i++) {
++			bwidget->redraw_box.x0 = areas[i].x0;
++			bwidget->redraw_box.y0 = areas[i].y0;
++			bwidget->redraw_box.x1 = areas[i].x1;
++			bwidget->redraw_box.y1 = areas[i].y1;
+ 			fb_redraw(widget, bwidget, bw);
+ #ifdef __vita__
+ 			fb_pan_pinned_redraws++;
