@@ -553,7 +553,11 @@ static void shape_row(struct shape_state *s, int ri)
 				ak = JS_NewAtom(ctx, key);
 				define_value(ctx, F, ak, JS_NewFloat64(ctx, v),
 					     JS_PROP_ENUMERABLE);
-				if (!fp_node) {
+				/* a node prototype has the ones nodes.js
+				 * placed there; the rest (HTMLMediaElement's
+				 * readyState values, HTMLTrackElement's)
+				 * go there too (VitaSurf) */
+				if (!fp_node || !has_own(ctx, FP, ak)) {
 					define_value(ctx, FP, ak,
 						     JS_NewFloat64(ctx, v),
 						     JS_PROP_ENUMERABLE);

@@ -4645,7 +4645,9 @@ reflectBool(['autofocus','inert','reversed','open','loop','controls','muted','de
  ['noValidate','novalidate'],['formNoValidate','formnovalidate'],['noModule','nomodule'],
  ['isMap','ismap'],['noHref','nohref'],['itemScope','itemscope'],['noWrap','nowrap'],['noShade','noshade'],
  ['playsInline','playsinline'],['allowFullscreen','allowfullscreen'],['typeMustMatch','typemustmatch'],
- ['defaultChecked','checked'],['defaultSelected','selected'],'async','defer','seamless']);
+ ['defaultChecked','checked'],['defaultSelected','selected'],'async','defer','seamless',
+ 'webkitdirectory','incremental',['disablePictureInPicture','disablepictureinpicture'],
+ ['disableRemotePlayback','disableremoteplayback']]);
 
 reflectLong([['tabIndex','tabindex',0],['maxLength','maxlength',-1],['minLength','minlength',-1],
  ['size','size',0],['cols','cols',20],['rows','rows',2],['span','span',1],['colSpan','colspan',1],
@@ -7155,6 +7157,42 @@ Object.keys(EVENT_FIELDS).forEach(function(n){
   this.touchType=init.touchType||'direct';};
  W.Touch.prototype=old.prototype;})();
 
+/* The older names browsers still answer to, which pages written for
+   them read (VitaSurf): IE's and WebKit's spellings of what the
+   standards named otherwise, as Chrome gives them. */
+(function(){
+ function get(o,n,f){if(o&&!Object.prototype.hasOwnProperty.call(o,n))
+  Object.defineProperty(o,n,{configurable:true,enumerable:true,get:f});}
+ var ME=W.MouseEvent&&W.MouseEvent.prototype,WE=W.WheelEvent&&W.WheelEvent.prototype;
+ /* where the pointer went and came from, as Blink answers them */
+ function leaving(t){return t==='mouseout'||t==='mouseleave';}
+ get(ME,'toElement',function(){
+  return leaving(this.type)?this.relatedTarget||null:this.target||null;});
+ get(ME,'fromElement',function(){
+  return leaving(this.type)?this.target||null:this.relatedTarget||null;});
+ /* a wheel's turn in whole units, as Chrome gives it for an event a
+    page makes (the browser makes none here) */
+ get(WE,'wheelDeltaX',function(){return (+this.deltaX||0)|0;});
+ get(WE,'wheelDeltaY',function(){return (+this.deltaY||0)|0;});
+ get(WE,'wheelDelta',function(){return this.wheelDeltaY||this.wheelDeltaX;});
+ var SP=W.Selection&&W.Selection.prototype;
+ [['baseNode','anchorNode'],['baseOffset','anchorOffset'],
+  ['extentNode','focusNode'],['extentOffset','focusOffset']].forEach(function(a){
+  get(SP,a[0],function(){return this[a[1]];});});
+ var IP=W.InputEvent&&W.InputEvent.prototype;
+ if(IP){
+  get(IP,'dataTransfer',function(){return null;});
+  if(!IP.getTargetRanges)IP.getTargetRanges=function(){return [];};}
+ /* what a video that plays nothing has shown */
+ if(!P.getVideoPlaybackQuality)P.getVideoPlaybackQuality=function(){
+  return {creationTime:W.performance.now(),droppedVideoFrames:0,
+   totalVideoFrames:0,corruptedVideoFrames:0};};
+ ['webkitDecodedFrameCount','webkitDroppedFrameCount',
+  'webkitAudioDecodedByteCount','webkitVideoDecodedByteCount'].forEach(function(n){
+  get(P,n,function(){return /^(VIDEO|AUDIO)$/.test(this.tagName)?0:undefined;});});
+ get(P,'webkitEntries',function(){return this.tagName==='INPUT'?[]:undefined;});
+})();
+
 /* --- tree walking, XPath and the document odds and ends ------------------ */
 (function(){
  var make=D.createTreeWalker;
@@ -8364,6 +8402,9 @@ function File(parts,name,opts){Blob.call(this,parts,opts);
  this.webkitRelativePath='';}
 File.prototype=Object.create(Blob.prototype);File.prototype.constructor=File;
 Object.defineProperty(File.prototype,Symbol.toStringTag,{configurable:true,value:'File'});
+/* WebKit's name for it, which Chrome still answers */
+Object.defineProperty(File.prototype,'lastModifiedDate',{configurable:true,enumerable:true,
+ get:function(){return new Date(this.lastModified);}});
 W.File=File;
 W.FileList=function(){Object.defineProperty(this,'length',{configurable:true,value:0});};
 W.FileList.prototype.item=function(i){return this[i]||null;};
@@ -8778,6 +8819,20 @@ ImageData.prototype.pixelFormat='rgba-unorm8';
  D.onfullscreenchange=null;D.onfullscreenerror=null;
  if(!('onfullscreenchange' in P))P.onfullscreenchange=null;
  if(!('onfullscreenerror' in P))P.onfullscreenerror=null;
+ /* WebKit's spellings, which pages written for Safari still use: the
+    request answers nothing, as WebKit's did */
+ P.webkitRequestFullscreen=P.webkitRequestFullScreen=function(){
+  var r=this.requestFullscreen();
+  if(r&&typeof r.catch==='function')r.catch(function(){});};
+ [['webkitFullscreenElement',null],['webkitCurrentFullScreenElement',null],
+  ['webkitIsFullScreen',false],['webkitFullscreenEnabled',false]].forEach(function(k){
+  if(!(k[0] in D))Object.defineProperty(D,k[0],{configurable:true,
+   get:function(){return k[1];}});});
+ ['webkitExitFullscreen','webkitCancelFullScreen'].forEach(function(k){
+  if(typeof D[k]!=='function')D[k]=function(){};});
+ D.onwebkitfullscreenchange=null;D.onwebkitfullscreenerror=null;
+ if(!('onwebkitfullscreenchange' in P))P.onwebkitfullscreenchange=null;
+ if(!('onwebkitfullscreenerror' in P))P.onwebkitfullscreenerror=null;
  if(W.ShadowRoot&&W.ShadowRoot.prototype&&
     !('fullscreenElement' in W.ShadowRoot.prototype)){
   try{Object.defineProperty(W.ShadowRoot.prototype,'fullscreenElement',

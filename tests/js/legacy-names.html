@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<!--
+  The constants and older names browsers still answer to (VitaSurf):
+  HTMLMediaElement's readyState and networkState values and
+  HTMLTrackElement's on their prototypes, IE's fromElement, toElement and
+  wheelDelta, WebKit's Selection names, fullscreen spellings and input
+  members, File.lastModifiedDate, and the video members a page asks of
+  a player. Every expected value is what Chrome gives. Each line must
+  say PASS.
+-->
+<html><head><meta charset="utf-8"><title>Legacy names</title></head><body>
+<p id="a">abc</p><p id="b">b</p>
+<pre id="out"></pre>
+<script>
+var a=document.getElementById('a'),b=document.getElementById('b');
+var CASES=[
+['HAVE_METADATA on the interface',function(){return HTMLMediaElement.HAVE_METADATA;}],
+['HAVE_ENOUGH_DATA on a video',function(){return document.createElement('video').HAVE_ENOUGH_DATA;}],
+['NETWORK_NO_SOURCE on an audio',function(){return document.createElement('audio').NETWORK_NO_SOURCE;}],
+['a constant is the prototype\'s',function(){return Object.prototype.hasOwnProperty.call(HTMLMediaElement.prototype,'HAVE_NOTHING');}],
+['HTMLTrackElement.LOADED',function(){return document.createElement('track').LOADED;}],
+['toElement of a mouseout',function(){var e=new MouseEvent('mouseout',{relatedTarget:b});a.addEventListener('mouseout',function f(ev){e=ev;a.removeEventListener('mouseout',f);});a.dispatchEvent(e);return e.toElement===b&&e.fromElement===a;}],
+['fromElement of a mouseover',function(){var e=new MouseEvent('mouseover',{relatedTarget:b});a.dispatchEvent(e);return e.fromElement===b&&e.toElement===a;}],
+['wheelDelta',function(){var e=new WheelEvent('wheel',{deltaX:30,deltaY:-120});return e.wheelDeltaX+' '+e.wheelDeltaY+' '+e.wheelDelta;}],
+['wheelDelta from the x alone',function(){return new WheelEvent('wheel',{deltaX:40}).wheelDelta;}],
+['Selection base and extent',function(){var s=getSelection(),r=document.createRange();r.setStart(a.firstChild,1);r.setEnd(a.firstChild,2);s.removeAllRanges();s.addRange(r);return (s.baseNode===a.firstChild)+' '+s.baseOffset+' '+(s.extentNode===a.firstChild)+' '+s.extentOffset;}],
+['File.lastModifiedDate',function(){var f=new File(['x'],'f',{lastModified:86400000});return f.lastModifiedDate instanceof Date&&f.lastModifiedDate.getTime();}],
+['webkitRequestFullscreen',function(){return typeof a.webkitRequestFullscreen+' '+typeof a.webkitRequestFullScreen;}],
+['webkitRequestFullscreen answers nothing',function(){return a.webkitRequestFullscreen();}],
+['document.webkitFullscreenElement',function(){return document.webkitFullscreenElement;}],
+['document.webkitIsFullScreen',function(){return document.webkitIsFullScreen;}],
+['onwebkitfullscreenchange',function(){return 'onwebkitfullscreenchange' in document&&'onwebkitfullscreenchange' in a;}],
+['webkitdirectory reflects',function(){var i=document.createElement('input');i.webkitdirectory=true;return i.getAttribute('webkitdirectory')+' '+i.webkitdirectory;}],
+['webkitEntries',function(){return JSON.stringify(document.createElement('input').webkitEntries);}],
+['incremental reflects',function(){var i=document.createElement('input');i.setAttribute('incremental','');return i.incremental;}],
+['disablePictureInPicture reflects',function(){var v=document.createElement('video');v.disablePictureInPicture=true;return v.hasAttribute('disablepictureinpicture');}],
+['disableRemotePlayback reflects',function(){var v=document.createElement('audio');v.setAttribute('disableremoteplayback','');return v.disableRemotePlayback;}],
+['getVideoPlaybackQuality',function(){var q=document.createElement('video').getVideoPlaybackQuality();return q.droppedVideoFrames+' '+q.totalVideoFrames+' '+(typeof q.creationTime);}],
+['webkitDecodedFrameCount',function(){return document.createElement('video').webkitDecodedFrameCount;}],
+['InputEvent.dataTransfer',function(){return new InputEvent('input').dataTransfer;}],
+['InputEvent.getTargetRanges',function(){return JSON.stringify(new InputEvent('beforeinput').getTargetRanges());}],
+['a div has no video members',function(){return 'getVideoPlaybackQuality' in a;}]
+];
+var WANT={
+"HAVE_METADATA on the interface": 1,
+"HAVE_ENOUGH_DATA on a video": 4,
+"NETWORK_NO_SOURCE on an audio": 3,
+"a constant is the prototype's": true,
+"HTMLTrackElement.LOADED": 2,
+"toElement of a mouseout": true,
+"fromElement of a mouseover": true,
+"wheelDelta": "30 -120 -120",
+"wheelDelta from the x alone": 40,
+"Selection base and extent": "true 1 true 2",
+"File.lastModifiedDate": 86400000,
+"webkitRequestFullscreen": "function function",
+"webkitRequestFullscreen answers nothing": "undefined",
+"document.webkitFullscreenElement": null,
+"document.webkitIsFullScreen": false,
+"onwebkitfullscreenchange": true,
+"webkitdirectory reflects": " true",
+"webkitEntries": "[]",
+"incremental reflects": true,
+"disablePictureInPicture reflects": true,
+"disableRemotePlayback reflects": true,
+"getVideoPlaybackQuality": "0 0 number",
+"webkitDecodedFrameCount": 0,
+"InputEvent.dataTransfer": null,
+"InputEvent.getTargetRanges": "[]",
+"a div has no video members": false
+};
+var out=[];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('legacy-names: ' + l); }
+CASES.forEach(function (c) {
+  var v;
+  try { v = c[1](); } catch (e) { v = 'threw ' + e.name; }
+  ok(c[0], JSON.stringify(v === undefined ? 'undefined' : v), JSON.stringify(WANT[c[0]]));
+});
+document.getElementById('out').textContent = out.join('\n');
+console.log('legacy-names: done');
+</script></body></html>

@@ -96,8 +96,15 @@ def main():
     names = [r[0] for r in new_rows
              if (r[0] == 'EventTarget' or is_node(r[0])) and r[0] not in NOT_NODES]
     place = collections.OrderedDict()
+    html = set(members.get('HTMLElement', []))
     for i, n in enumerate(names):
         for k in sorted(members.get(n, [])):
+            # an SVG interface takes from the shared prototype only
+            # what it shares with HTMLElement (the mixins): its own
+            # members are vita/js/svg.js's, and a name both have (width,
+            # href) is another thing on each
+            if n.startswith('SVG') and k not in html:
+                continue
             place.setdefault(k, []).append(i)
     rows_js = ' '.join('%s<%s' % (n, parent[n]) for n in names)
     lines, cur = [], ''

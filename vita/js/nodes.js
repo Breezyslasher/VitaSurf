@@ -27,7 +27,7 @@
 (function(){
 'use strict';
 var W=window;
-var ROWS='EventTarget<Object Node<EventTarget Element<Node HTMLElement<Element HTMLMediaElement<HTMLElement CharacterData<Node Text<CharacterData CDATASection<Text Comment<CharacterData Document<Node DocumentFragment<Node DocumentType<Node HTMLAnchorElement<HTMLElement HTMLAreaElement<HTMLElement HTMLAudioElement<HTMLMediaElement HTMLBRElement<HTMLElement HTMLBaseElement<HTMLElement HTMLBodyElement<HTMLElement HTMLButtonElement<HTMLElement HTMLCanvasElement<HTMLElement HTMLDListElement<HTMLElement HTMLDataElement<HTMLElement HTMLDataListElement<HTMLElement HTMLDetailsElement<HTMLElement HTMLDialogElement<HTMLElement HTMLDirectoryElement<HTMLElement HTMLDivElement<HTMLElement HTMLEmbedElement<HTMLElement HTMLFieldSetElement<HTMLElement HTMLFontElement<HTMLElement HTMLFormElement<HTMLElement HTMLFrameElement<HTMLElement HTMLFrameSetElement<HTMLElement HTMLHRElement<HTMLElement HTMLHeadElement<HTMLElement HTMLHeadingElement<HTMLElement HTMLHtmlElement<HTMLElement HTMLIFrameElement<HTMLElement HTMLImageElement<HTMLElement HTMLInputElement<HTMLElement HTMLLIElement<HTMLElement HTMLLabelElement<HTMLElement HTMLLegendElement<HTMLElement HTMLLinkElement<HTMLElement HTMLMapElement<HTMLElement HTMLMarqueeElement<HTMLElement HTMLMenuElement<HTMLElement HTMLMetaElement<HTMLElement HTMLMeterElement<HTMLElement HTMLModElement<HTMLElement HTMLOListElement<HTMLElement HTMLObjectElement<HTMLElement HTMLOptGroupElement<HTMLElement HTMLOptionElement<HTMLElement HTMLOutputElement<HTMLElement HTMLParagraphElement<HTMLElement HTMLParamElement<HTMLElement HTMLPictureElement<HTMLElement HTMLPreElement<HTMLElement HTMLProgressElement<HTMLElement HTMLQuoteElement<HTMLElement HTMLScriptElement<HTMLElement HTMLSelectElement<HTMLElement HTMLSlotElement<HTMLElement HTMLSourceElement<HTMLElement HTMLSpanElement<HTMLElement HTMLStyleElement<HTMLElement HTMLTableCaptionElement<HTMLElement HTMLTableCellElement<HTMLElement HTMLTableColElement<HTMLElement HTMLTableElement<HTMLElement HTMLTableRowElement<HTMLElement HTMLTableSectionElement<HTMLElement HTMLTemplateElement<HTMLElement HTMLTextAreaElement<HTMLElement HTMLTimeElement<HTMLElement HTMLTitleElement<HTMLElement HTMLTrackElement<HTMLElement HTMLUListElement<HTMLElement HTMLUnknownElement<HTMLElement HTMLVideoElement<HTMLMediaElement ProcessingInstruction<CharacterData SVGElement<Element SVGGraphicsElement<SVGElement SVGSVGElement<SVGGraphicsElement ShadowRoot<DocumentFragment'.split(' ').map(function(r){return r.split('<');});
+var ROWS='EventTarget<Object Node<EventTarget Element<Node HTMLElement<Element HTMLMediaElement<HTMLElement CharacterData<Node Text<CharacterData CDATASection<Text Comment<CharacterData Document<Node DocumentFragment<Node DocumentType<Node HTMLAnchorElement<HTMLElement HTMLAreaElement<HTMLElement HTMLAudioElement<HTMLMediaElement HTMLBRElement<HTMLElement HTMLBaseElement<HTMLElement HTMLBodyElement<HTMLElement HTMLButtonElement<HTMLElement HTMLCanvasElement<HTMLElement HTMLDListElement<HTMLElement HTMLDataElement<HTMLElement HTMLDataListElement<HTMLElement HTMLDetailsElement<HTMLElement HTMLDialogElement<HTMLElement HTMLDirectoryElement<HTMLElement HTMLDivElement<HTMLElement HTMLEmbedElement<HTMLElement HTMLFieldSetElement<HTMLElement HTMLFontElement<HTMLElement HTMLFormElement<HTMLElement HTMLFrameElement<HTMLElement HTMLFrameSetElement<HTMLElement HTMLHRElement<HTMLElement HTMLHeadElement<HTMLElement HTMLHeadingElement<HTMLElement HTMLHtmlElement<HTMLElement HTMLIFrameElement<HTMLElement HTMLImageElement<HTMLElement HTMLInputElement<HTMLElement HTMLLIElement<HTMLElement HTMLLabelElement<HTMLElement HTMLLegendElement<HTMLElement HTMLLinkElement<HTMLElement HTMLMapElement<HTMLElement HTMLMarqueeElement<HTMLElement HTMLMenuElement<HTMLElement HTMLMetaElement<HTMLElement HTMLMeterElement<HTMLElement HTMLModElement<HTMLElement HTMLOListElement<HTMLElement HTMLObjectElement<HTMLElement HTMLOptGroupElement<HTMLElement HTMLOptionElement<HTMLElement HTMLOutputElement<HTMLElement HTMLParagraphElement<HTMLElement HTMLParamElement<HTMLElement HTMLPictureElement<HTMLElement HTMLPreElement<HTMLElement HTMLProgressElement<HTMLElement HTMLQuoteElement<HTMLElement HTMLScriptElement<HTMLElement HTMLSelectElement<HTMLElement HTMLSlotElement<HTMLElement HTMLSourceElement<HTMLElement HTMLSpanElement<HTMLElement HTMLStyleElement<HTMLElement HTMLTableCaptionElement<HTMLElement HTMLTableCellElement<HTMLElement HTMLTableColElement<HTMLElement HTMLTableElement<HTMLElement HTMLTableRowElement<HTMLElement HTMLTableSectionElement<HTMLElement HTMLTemplateElement<HTMLElement HTMLTextAreaElement<HTMLElement HTMLTimeElement<HTMLElement HTMLTitleElement<HTMLElement HTMLTrackElement<HTMLElement HTMLUListElement<HTMLElement HTMLUnknownElement<HTMLElement HTMLVideoElement<HTMLMediaElement ProcessingInstruction<CharacterData SVGElement<Element SVGGraphicsElement<SVGElement SVGSVGElement<SVGGraphicsElement SVGAElement<SVGGraphicsElement SVGAnimationElement<SVGElement SVGClipPathElement<SVGElement SVGComponentTransferFunctionElement<SVGElement SVGDefsElement<SVGGraphicsElement SVGDescElement<SVGElement SVGFEBlendElement<SVGElement SVGFEColorMatrixElement<SVGElement SVGFEComponentTransferElement<SVGElement SVGFECompositeElement<SVGElement SVGFEConvolveMatrixElement<SVGElement SVGFEDiffuseLightingElement<SVGElement SVGFEDisplacementMapElement<SVGElement SVGFEDistantLightElement<SVGElement SVGFEDropShadowElement<SVGElement SVGFEFloodElement<SVGElement SVGFEFuncAElement<SVGComponentTransferFunctionElement SVGFEFuncBElement<SVGComponentTransferFunctionElement SVGFEFuncGElement<SVGComponentTransferFunctionElement SVGFEFuncRElement<SVGComponentTransferFunctionElement SVGFEGaussianBlurElement<SVGElement SVGFEImageElement<SVGElement SVGFEMergeElement<SVGElement SVGFEMergeNodeElement<SVGElement SVGFEMorphologyElement<SVGElement SVGFEOffsetElement<SVGElement SVGFEPointLightElement<SVGElement SVGFESpecularLightingElement<SVGElement SVGFESpotLightElement<SVGElement SVGFETileElement<SVGElement SVGFETurbulenceElement<SVGElement SVGFilterElement<SVGElement SVGForeignObjectElement<SVGGraphicsElement SVGGElement<SVGGraphicsElement SVGGeometryElement<SVGGraphicsElement SVGGradientElement<SVGElement SVGImageElement<SVGGraphicsElement SVGLineElement<SVGGeometryElement SVGLinearGradientElement<SVGGradientElement SVGMPathElement<SVGElement SVGMarkerElement<SVGElement SVGMaskElement<SVGElement SVGMetadataElement<SVGElement SVGPathElement<SVGGeometryElement SVGPatternElement<SVGElement SVGPolygonElement<SVGGeometryElement SVGPolylineElement<SVGGeometryElement SVGRadialGradientElement<SVGGradientElement SVGRectElement<SVGGeometryElement SVGScriptElement<SVGElement SVGSetElement<SVGAnimationElement SVGStopElement<SVGElement SVGStyleElement<SVGElement SVGSwitchElement<SVGGraphicsElement SVGSymbolElement<SVGElement SVGTextContentElement<SVGGraphicsElement SVGTextPathElement<SVGTextContentElement SVGTextPositioningElement<SVGTextContentElement SVGTitleElement<SVGElement SVGUseElement<SVGGraphicsElement SVGViewElement<SVGElement SVGAnimateElement<SVGAnimationElement SVGAnimateMotionElement<SVGAnimationElement SVGAnimateTransformElement<SVGAnimationElement SVGCircleElement<SVGGeometryElement SVGEllipseElement<SVGGeometryElement SVGTSpanElement<SVGTextPositioningElement SVGTextElement<SVGTextPositioningElement ShadowRoot<DocumentFragment'.split(' ').map(function(r){return r.split('<');});
 /* each member's interfaces, as indexes into ROWS, which C reads
    (__vitaPlaceMembers, vita/js/ifaces.c) */
 var PLACE=`{
@@ -70,16 +70,16 @@ var PLACE=`{
 "ariaValueText":[2],"assignedSlot":[2,6],"attachShadow":[2],
 "attributes":[2],"before":[2,5,11],"checkVisibility":[2],
 "childElementCount":[2,9,10],"children":[2,9,10],"classList":[2],
-"className":[2,82],"clientHeight":[2],"clientLeft":[2],"clientTop":[2],
+"className":[2],"clientHeight":[2],"clientLeft":[2],"clientTop":[2],
 "clientWidth":[2],"closest":[2],"computedStyleMap":[2],
 "currentCSSZoom":[2],"elementTiming":[2],"firstElementChild":[2,9,10],
-"getAnimations":[2,9,85],"getAttribute":[2],"getAttributeNS":[2],
+"getAnimations":[2,9,153],"getAttribute":[2],"getAttributeNS":[2],
 "getAttributeNames":[2],"getAttributeNode":[2],"getAttributeNodeNS":[2],
 "getBoundingClientRect":[2],"getClientRects":[2],
 "getElementsByClassName":[2,9],"getElementsByTagName":[2,9],
-"getElementsByTagNameNS":[2,9],"getHTML":[2,85],"hasAttribute":[2],
+"getElementsByTagNameNS":[2,9],"getHTML":[2,153],"hasAttribute":[2],
 "hasAttributeNS":[2],"hasAttributes":[2],"hasPointerCapture":[2],"id":[2],
-"innerHTML":[2,85],"insertAdjacentElement":[2],"insertAdjacentHTML":[2],
+"innerHTML":[2,153],"insertAdjacentElement":[2],"insertAdjacentHTML":[2],
 "insertAdjacentText":[2],"lastElementChild":[2,9,10],"localName":[2],
 "matches":[2],"moveBefore":[2,9,10],"namespaceURI":[2],
 "nextElementSibling":[2,5],"onbeforecopy":[2,9],"onbeforecut":[2,9],
@@ -96,7 +96,7 @@ var PLACE=`{
 "scrollIntoView":[2],"scrollIntoViewIfNeeded":[2],"scrollLeft":[2],
 "scrollTo":[2],"scrollTop":[2],"scrollWidth":[2],"setAttribute":[2],
 "setAttributeNS":[2],"setAttributeNode":[2],"setAttributeNodeNS":[2],
-"setHTMLUnsafe":[2,85],"setPointerCapture":[2],"shadowRoot":[2],
+"setHTMLUnsafe":[2,153],"setPointerCapture":[2],"shadowRoot":[2],
 "slot":[2],"tagName":[2],"toggleAttribute":[2],
 "webkitMatchesSelector":[2],"webkitRequestFullScreen":[2],
 "webkitRequestFullscreen":[2],"accessKey":[3],"attachInternals":[3],
@@ -140,7 +140,7 @@ var PLACE=`{
 "onscrollsnapchanging":[3,9,82],"onsecuritypolicyviolation":[3,9,82],
 "onseeked":[3,9,82],"onseeking":[3,9,82],"onselect":[3,9,82],
 "onselectionchange":[3,9,82],"onselectstart":[3,9,82],
-"onslotchange":[3,9,82,85],"onstalled":[3,9,82],"onsubmit":[3,9,82],
+"onslotchange":[3,9,82,153],"onstalled":[3,9,82],"onsubmit":[3,9,82],
 "onsuspend":[3,9,82],"ontimeupdate":[3,9,82],"ontoggle":[3,9,82],
 "ontransitioncancel":[3,9,82],"ontransitionend":[3,9,82],
 "ontransitionrun":[3,9,82],"ontransitionstart":[3,9,82],
@@ -148,7 +148,7 @@ var PLACE=`{
 "onwebkitanimationend":[3,9,82],"onwebkitanimationiteration":[3,9,82],
 "onwebkitanimationstart":[3,9,82],"onwebkittransitionend":[3,9,82],
 "onwheel":[3,9,82],"outerText":[3],"popover":[3],"showPopover":[3],
-"spellcheck":[3],"style":[3,82],"tabIndex":[3,82],"title":[3,9],
+"spellcheck":[3],"style":[3,82],"tabIndex":[3,82],"title":[3,9,137],
 "togglePopover":[3],"translate":[3],"virtualKeyboardPolicy":[3],
 "writingSuggestions":[3],"HAVE_CURRENT_DATA":[4],"HAVE_ENOUGH_DATA":[4],
 "HAVE_FUTURE_DATA":[4],"HAVE_METADATA":[4],"HAVE_NOTHING":[4],
@@ -168,7 +168,7 @@ var PLACE=`{
 "webkitVideoDecodedByteCount":[4],"appendData":[5],"data":[5,51],
 "deleteData":[5],"insertData":[5],"length":[5,30,62],"replaceData":[5],
 "substringData":[5],"splitText":[6],"wholeText":[6],"URL":[9],
-"activeElement":[9,85],"adoptNode":[9],"adoptedStyleSheets":[9,85],
+"activeElement":[9,153],"adoptNode":[9],"adoptedStyleSheets":[9,153],
 "alinkColor":[9],"all":[9],"anchors":[9],"applets":[9],
 "bgColor":[9,17,45,68,70,71],"body":[9],"browsingTopics":[9,37,38],
 "captureEvents":[9],"caretPositionFromPoint":[9],
@@ -181,12 +181,12 @@ var PLACE=`{
 "createProcessingInstruction":[9],"createRange":[9],"createTextNode":[9],
 "createTreeWalker":[9],"currentScript":[9],"defaultView":[9],
 "designMode":[9],"doctype":[9],"documentElement":[9],"documentURI":[9],
-"domain":[9],"elementFromPoint":[9,85],"elementsFromPoint":[9,85],
+"domain":[9],"elementFromPoint":[9,153],"elementsFromPoint":[9,153],
 "embeds":[9],"evaluate":[9],"execCommand":[9],"exitFullscreen":[9],
 "exitPictureInPicture":[9],"exitPointerLock":[9],"featurePolicy":[9,37],
 "fgColor":[9],"fonts":[9],"forms":[9],"fragmentDirective":[9],
-"fullscreen":[9],"fullscreenElement":[9,85],"fullscreenEnabled":[9],
-"getElementById":[9,10,84],"getElementsByName":[9],"getSelection":[9,85],
+"fullscreen":[9],"fullscreenElement":[9,153],"fullscreenEnabled":[9],
+"getElementById":[9,10],"getElementsByName":[9],"getSelection":[9,153],
 "hasFocus":[9],"hasPrivateToken":[9],"hasRedemptionRecord":[9],
 "hasStorageAccess":[9],"hasUnpartitionedCookieAccess":[9],"head":[9],
 "images":[9],"implementation":[9],"importNode":[9],"inputEncoding":[9],
@@ -194,14 +194,14 @@ var PLACE=`{
 "onpointerlockchange":[9],"onpointerlockerror":[9],
 "onprerenderingchange":[9],"onreadystatechange":[9],"onresume":[9],
 "onvisibilitychange":[9],"open":[9,23,24],
-"pictureInPictureElement":[9,85],"pictureInPictureEnabled":[9],
-"plugins":[9],"pointerLockElement":[9,85],"prerendering":[9],
+"pictureInPictureElement":[9,153],"pictureInPictureEnabled":[9],
+"plugins":[9],"pointerLockElement":[9,153],"prerendering":[9],
 "queryCommandEnabled":[9],"queryCommandIndeterm":[9],
 "queryCommandState":[9],"queryCommandSupported":[9],
 "queryCommandValue":[9],"referrer":[9],"releaseEvents":[9],
 "requestStorageAccess":[9],"requestStorageAccessFor":[9],
 "rootElement":[9],"scripts":[9],"scrollingElement":[9],
-"startViewTransition":[9],"styleSheets":[9,85],"timeline":[9],
+"startViewTransition":[9],"styleSheets":[9,153],"timeline":[9],
 "visibilityState":[9],"vlinkColor":[9],"wasDiscarded":[9],
 "webkitCancelFullScreen":[9],"webkitCurrentFullScreenElement":[9],
 "webkitExitFullscreen":[9],"webkitFullscreenElement":[9],
@@ -210,7 +210,7 @@ var PLACE=`{
 "xmlStandalone":[9],"xmlVersion":[9],
 "name":[11,12,18,23,27,28,30,31,37,38,39,44,47,51,54,56,62,63,74],
 "publicId":[11],"systemId":[11],"attributionSrc":[12,13,38,61],
-"coords":[12,13],"download":[12,13],"hash":[12,13],"host":[12,13,85],
+"coords":[12,13],"download":[12,13],"hash":[12,13],"host":[12,13,153],
 "hostname":[12,13],"href":[12,13,16,43],"hreflang":[12,43],
 "origin":[12,13],"password":[12,13],"pathname":[12,13],"ping":[12,13],
 "port":[12,13],"protocol":[12,13],"referrerPolicy":[12,13,37,38,43,61],
@@ -237,9 +237,9 @@ var PLACE=`{
 "validity":[18,28,39,51,54,62,74],
 "value":[18,21,39,40,48,53,54,56,59,62,74],
 "willValidate":[18,28,39,51,54,62,74],"getContext":[19],
-"height":[19,27,37,38,39,45,51,64,68,80,84],"toBlob":[19],
-"toDataURL":[19],"transferControlToOffscreen":[19],
-"width":[19,27,33,37,38,39,45,51,58,64,68,69,70,80,84],
+"height":[19,27,37,38,39,45,51,64,68,80],"toBlob":[19],"toDataURL":[19],
+"transferControlToOffscreen":[19],
+"width":[19,27,33,37,38,39,45,51,58,64,68,69,70,80],
 "compact":[20,25,46,50,78],"options":[22,62],"closedBy":[24],
 "requestClose":[24],"returnValue":[24],"show":[24],"showModal":[24],
 "align":[26,27,33,35,37,38,39,42,51,55,67,68,69,70,71,72],
@@ -258,14 +258,14 @@ var PLACE=`{
 "complete":[38],"decode":[38],"decoding":[38],"fetchPriority":[38,43,61],
 "hspace":[38,45,51],"isMap":[38],"lowsrc":[38],"naturalHeight":[38],
 "naturalWidth":[38],"sizes":[38,43,64],"srcset":[38,64],
-"useMap":[38,39,51],"vspace":[38,45,51],"x":[38,84],"y":[38,84],
-"accept":[39],"checked":[39],"defaultChecked":[39],
-"defaultValue":[39,54,74],"dirName":[39,74],"files":[39],
-"incremental":[39],"indeterminate":[39],"list":[39],"max":[39,48,59],
-"maxLength":[39,74],"min":[39,48],"minLength":[39,74],"multiple":[39,62],
-"pattern":[39],"placeholder":[39,74],"readOnly":[39,74],
-"required":[39,62,74],"select":[39,74],"selectionDirection":[39,74],
-"selectionEnd":[39,74],"selectionStart":[39,74],"setRangeText":[39,74],
+"useMap":[38,39,51],"vspace":[38,45,51],"x":[38],"y":[38],"accept":[39],
+"checked":[39],"defaultChecked":[39],"defaultValue":[39,54,74],
+"dirName":[39,74],"files":[39],"incremental":[39],"indeterminate":[39],
+"list":[39],"max":[39,48,59],"maxLength":[39,74],"min":[39,48],
+"minLength":[39,74],"multiple":[39,62],"pattern":[39],
+"placeholder":[39,74],"readOnly":[39,74],"required":[39,62,74],
+"select":[39,74],"selectionDirection":[39,74],"selectionEnd":[39,74],
+"selectionStart":[39,74],"setRangeText":[39,74],
 "setSelectionRange":[39,74],"showPicker":[39,62],"step":[39],
 "stepDown":[39],"stepUp":[39],"valueAsDate":[39],"valueAsNumber":[39],
 "webkitEntries":[39],"webkitdirectory":[39],"control":[41],
@@ -300,23 +300,8 @@ var PLACE=`{
 "playsInline":[80],"poster":[80],"requestPictureInPicture":[80],
 "requestVideoFrameCallback":[80],"videoHeight":[80],"videoWidth":[80],
 "webkitDecodedFrameCount":[80],"webkitDroppedFrameCount":[80],
-"ownerSVGElement":[82],"viewportElement":[82],
-"farthestViewportElement":[83],"getBBox":[83],"getCTM":[83],
-"getScreenCTM":[83],"nearestViewportElement":[83],
-"requiredExtensions":[83],"systemLanguage":[83],"transform":[83],
-"SVG_ZOOMANDPAN_DISABLE":[84],"SVG_ZOOMANDPAN_MAGNIFY":[84],
-"SVG_ZOOMANDPAN_UNKNOWN":[84],"animationsPaused":[84],
-"checkEnclosure":[84],"checkIntersection":[84],"createSVGAngle":[84],
-"createSVGLength":[84],"createSVGMatrix":[84],"createSVGNumber":[84],
-"createSVGPoint":[84],"createSVGRect":[84],"createSVGTransform":[84],
-"createSVGTransformFromMatrix":[84],"currentScale":[84],
-"currentTranslate":[84],"deselectAll":[84],"forceRedraw":[84],
-"getCurrentTime":[84],"getEnclosureList":[84],"getIntersectionList":[84],
-"pauseAnimations":[84],"preserveAspectRatio":[84],"setCurrentTime":[84],
-"suspendRedraw":[84],"unpauseAnimations":[84],"unsuspendRedraw":[84],
-"unsuspendRedrawAll":[84],"viewBox":[84],"zoomAndPan":[84],
-"clonable":[85],"delegatesFocus":[85],"mode":[85],"serializable":[85],
-"slotAssignment":[85]
+"clonable":[153],"delegatesFocus":[153],"mode":[153],"serializable":[153],
+"slotAssignment":[153]
 }`;
 var T=W.EventTarget&&W.EventTarget.prototype,N=W.Node&&W.Node.prototype,
  E=W.Element&&W.Element.prototype,P=W.HTMLElement&&W.HTMLElement.prototype,
@@ -449,10 +434,28 @@ HTML_TAGS.split(' ').forEach(function(t){if(t)byName[t]=P;});
 for(k in byTag){
  if(k.indexOf('HTML')!==0||k==='HTMLMediaElement'||!PROTO[k])continue;
  byTag[k].split(/\s+/).forEach(function(t){if(t)byName[t]=PROTO[k];});}
-byName['svg:svg']=PROTO.SVGSVGElement;
-('a circle ellipse foreignObject g image line path polygon polyline rect '+
- 'switch text textPath tspan use').split(' ').forEach(function(t){
- byName['svg:'+t]=PROTO.SVGGraphicsElement;});
+/* each SVG element's interface, by its name as SVG writes it; one SVG
+   does not name is an SVGElement */
+('svg:SVG a:A animate:Animate animateMotion:AnimateMotion '+
+ 'animateTransform:AnimateTransform circle:Circle clipPath:ClipPath '+
+ 'defs:Defs desc:Desc ellipse:Ellipse feBlend:FEBlend '+
+ 'feColorMatrix:FEColorMatrix feComponentTransfer:FEComponentTransfer '+
+ 'feComposite:FEComposite feConvolveMatrix:FEConvolveMatrix '+
+ 'feDiffuseLighting:FEDiffuseLighting feDisplacementMap:FEDisplacementMap '+
+ 'feDistantLight:FEDistantLight feDropShadow:FEDropShadow feFlood:FEFlood '+
+ 'feFuncA:FEFuncA feFuncB:FEFuncB feFuncG:FEFuncG feFuncR:FEFuncR '+
+ 'feGaussianBlur:FEGaussianBlur feImage:FEImage feMerge:FEMerge '+
+ 'feMergeNode:FEMergeNode feMorphology:FEMorphology feOffset:FEOffset '+
+ 'fePointLight:FEPointLight feSpecularLighting:FESpecularLighting '+
+ 'feSpotLight:FESpotLight feTile:FETile feTurbulence:FETurbulence '+
+ 'filter:Filter foreignObject:ForeignObject g:G image:Image line:Line '+
+ 'linearGradient:LinearGradient marker:Marker mask:Mask metadata:Metadata '+
+ 'mpath:MPath path:Path pattern:Pattern polygon:Polygon polyline:Polyline '+
+ 'radialGradient:RadialGradient rect:Rect script:Script set:Set stop:Stop '+
+ 'style:Style switch:Switch symbol:Symbol text:Text textPath:TextPath '+
+ 'title:Title tspan:TSpan use:Use view:View').split(' ').forEach(function(p){
+ var t=p.split(':'),o=PROTO['SVG'+t[1]+'Element'];
+ if(o)byName['svg:'+t[0]]=o;});
 setProtos({element:E,html:P,unknown:PROTO.HTMLUnknownElement,
  svg:PROTO.SVGElement,text:PROTO.Text,cdata:PROTO.CDATASection,
  comment:PROTO.Comment,pi:PROTO.ProcessingInstruction,

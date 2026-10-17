@@ -18508,7 +18508,53 @@ static JSValue win_vita_dispatch(JSContext *ctx, JSValueConst this_val,
 	thread->dispatches = &d;
 	thread->js_dispatch_depth++;
 	if (node != NULL) {
+		struct dom_node *at = dom_node_ref(node), *root, *up, *host;
+		bool cleared = false;
+
 		dom_event_target_dispatch_event(node, evt, &success);
+		/* afterwards the event names its target, which only a
+		 * listener's call had set: for a target in a shadow tree,
+		 * the host it was retargeted to when it left the tree
+		 * (composed), or nothing when it stayed in, as the DOM
+		 * standard's clearTargets has it (VitaSurf) */
+		for (;;) {
+			root = dom_node_ref(at);
+			up = NULL;
+			while (dom_node_get_parent_node(root, &up) ==
+			       DOM_NO_ERR && up != NULL) {
+				dom_node_unref(root);
+				root = up;
+				up = NULL;
+			}
+			host = shadow_host_of(root);
+			dom_node_unref(root);
+			if (host == NULL) {
+				break;
+			}
+			if (!composed) {
+				dom_node_unref(host);
+				cleared = true;
+				break;
+			}
+			dom_node_unref(at);
+			at = host;
+		}
+		if (cleared) {
+			JSAtom rel = JS_NewAtom(ctx, "relatedTarget");
+
+			JS_SetPropertyStr(ctx, argv[1], "target", JS_NULL);
+			if (JS_HasProperty(ctx, argv[1], rel) > 0) {
+				JS_SetProperty(ctx, argv[1], rel, JS_NULL);
+			}
+			JS_FreeAtom(ctx, rel);
+		} else if (at == node) {
+			JS_SetPropertyStr(ctx, argv[1], "target",
+					  JS_DupValue(ctx, argv[0]));
+		} else {
+			JS_SetPropertyStr(ctx, argv[1], "target",
+					  wrap_node(ctx, at));
+		}
+		dom_node_unref(at);
 	} else {
 		/* the window is the target: its listeners only (VitaSurf),
 		 * where the document's used to hear it as well */

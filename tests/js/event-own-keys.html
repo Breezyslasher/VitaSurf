@@ -4,7 +4,8 @@
   only own property is isTrusted, as WebIDL has it (VitaSurf): the other
   platform objects keep what they hold out of sight the same way, so
   Object.keys, for-in and JSON.stringify find what they find in Chrome.
-  Each line must say PASS; Chrome passes them all.
+  After a dispatch an event names its target: the host for one that
+  left a shadow tree, or nothing for one that stayed in it. Each line must say PASS; Chrome passes them all.
 -->
 <html><head><meta charset="utf-8"><title>Event own keys</title>
 <style>.x { color: red }</style></head><body>
@@ -46,6 +47,19 @@ ok('Headers', keys(new Headers({ a: '1' })), '');
 ok('a Blob', keys(new Blob(['xy'])), '');
 ok('a Blob\'s size', new Blob(['xy']).size, 2);
 ok('a style rule', keys(document.styleSheets[0].cssRules[0]), '');
+var quiet = new CustomEvent('nobody-listens');
+a.dispatchEvent(quiet);
+ok('the target stays after a dispatch nothing heard', quiet.target === a, true);
+ok('and currentTarget is gone', quiet.currentTarget, null);
+var host = document.createElement('div'), inner = document.createElement('span');
+document.body.appendChild(host);
+host.attachShadow({ mode: 'open' }).appendChild(inner);
+var deep = new CustomEvent('deep');
+inner.dispatchEvent(deep);
+ok('a target in a shadow tree is cleared after', deep.target, null);
+var out2 = new CustomEvent('out', { composed: true, bubbles: true });
+inner.dispatchEvent(out2);
+ok('one that left the tree names its host', out2.target === host, true);
 var mo = new MutationObserver(function () {});
 ok('a MutationObserver', keys(mo), '');
 document.getElementById('out').textContent = out.join('\n');

@@ -151,6 +151,7 @@ if(VITASURF_JS_ENGINE STREQUAL "quickjs")
         vita/js/lazy.js
         vita/js/geometry.js
         vita/js/nodes.js
+        vita/js/svg.js
         vita/js/singletons.js
         vita/js/interfaces.js
         vita/js/natives-close.js)
