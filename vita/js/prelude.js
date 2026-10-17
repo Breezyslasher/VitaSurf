@@ -6520,9 +6520,9 @@ var CSS_KEYS=[],CSS_ARGS=[],CSS_FLAGS=[];
  'box-sizing caption-side caret-color clear clip clip-path color column-count column-gap '+
  'columns contain content content-visibility cursor direction display empty-cells filter flex flex-basis flex-direction '+
  'flex-flow flex-grow flex-shrink flex-wrap float font font-family font-size font-style '+
- 'font-variant font-variant-caps font-variant-numeric font-weight gap grid grid-area grid-auto-columns grid-auto-flow grid-auto-rows '+
+ 'font-feature-settings font-size-adjust font-variant font-variant-caps font-variant-numeric font-weight gap grid grid-area grid-auto-columns grid-auto-flow grid-auto-rows '+
  'grid-column grid-column-end grid-column-start grid-gap grid-row grid-row-end grid-row-start '+
- 'grid-template grid-template-areas grid-template-columns grid-template-rows height inline-size '+
+ 'grid-template grid-template-areas grid-template-columns grid-template-rows height image-rendering initial-letter inline-size '+
  'inset isolation justify-content justify-items justify-self left letter-spacing line-height '+
  'list-style list-style-image list-style-position list-style-type margin margin-bottom '+
  'margin-left margin-right margin-top mask max-height max-width min-height min-width '+
@@ -6530,8 +6530,8 @@ var CSS_KEYS=[],CSS_ARGS=[],CSS_FLAGS=[];
  'outline-style outline-width overflow overflow-wrap overflow-x overflow-y padding '+
  'padding-bottom padding-left padding-right padding-top page-break-after page-break-before '+
  'perspective perspective-origin place-content place-items place-self pointer-events position quotes resize right '+
- 'row-gap scroll-behavior scroll-margin scroll-padding scrollbar-width tab-size table-layout text-align text-decoration '+
- 'text-decoration-color text-decoration-line text-indent text-orientation text-overflow text-shadow '+
+ 'row-gap scroll-behavior scroll-margin scroll-padding scrollbar-width shape-margin shape-outside tab-size table-layout text-align text-decoration '+
+ 'text-decoration-color text-decoration-line text-emphasis text-emphasis-color text-emphasis-position text-emphasis-style text-indent text-orientation text-overflow text-shadow '+
  'text-transform top touch-action transform transform-origin transition transition-delay '+
  'transition-duration transition-property transition-timing-function unicode-bidi user-select '+
  'vertical-align visibility white-space width will-change word-break word-spacing word-wrap '+

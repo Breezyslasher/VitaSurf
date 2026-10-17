@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!--
+  font-size-adjust sets the glyphs at the size that gives the font's
+  chosen metric that fraction of the font size (VitaSurf), and leaves
+  the font size itself, and so em lengths, as they were. Run in the
+  native harness, whose one font is an em wide a character with an x
+  height of half the em and capitals of 0.7; on the Vita the widths
+  follow the face's own metrics. Each line must say PASS.
+-->
+<html><head><meta charset="utf-8"><title>font-size-adjust</title>
+<style>
+span { display: inline-block; font-size: 32px; }
+#b { font-size-adjust: 0.25; }
+#c { font-size-adjust: cap-height 0.35; }
+#d { font-size-adjust: from-font; }
+#e { font-size-adjust: 1; }
+#f { font-size-adjust: 0.25; width: 2em; }
+</style></head>
+<body>
+<span id="a">abcd</span><br>
+<span id="b">abcd</span><br>
+<span id="c">abcd</span><br>
+<span id="d">abcd</span><br>
+<span id="e">abcd</span><br>
+<span id="f">abcd</span>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('font-size-adjust: ' + l); }
+function w(id) { return document.getElementById(id).offsetWidth; }
+addEventListener('load', function () {
+  var a = w('a');
+  ok('half the x height asked for is half the size', w('b'), a / 2);
+  /* 0.35 is held to 1/1024, so the size may round a pixel short */
+  ok('a cap height asked for', Math.abs(w('c') - a / 2) <= 1, true);
+  ok('from-font is the font as it is', w('d'), a);
+  ok('twice the x height is twice the size', w('e'), a * 2);
+  ok('an em is still the font size', w('f'), 64);
+  ok('the font size reads back unchanged', getComputedStyle(document.getElementById('b')).fontSize, '32px');
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('font-size-adjust: done');
+});
+</script>
+</body></html>

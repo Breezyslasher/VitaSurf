@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!--
+  text-emphasis (VitaSurf): a mark over each character but a space, in
+  text-emphasis-color, half the text's size, or under it with
+  text-emphasis-position: under. To look at: "ab c" has three red dots
+  above it and none above the space; the second line has open circles
+  under it; the third has a "*" over each character in the text's own
+  colour; the fourth has none.
+-->
+<html><head><meta charset="utf-8"><title>text-emphasis</title>
+<style>
+p { font-size: 24px; line-height: 2; }
+#a { text-emphasis: dot red; }
+#b { text-emphasis: open circle; text-emphasis-position: under; color: #060; }
+#c { text-emphasis-style: "*"; color: #00c; }
+</style></head>
+<body>
+<p id="a">ab c</p>
+<p id="b">emphasis</p>
+<p id="c">star</p>
+<p id="d">none</p>
+</body></html>

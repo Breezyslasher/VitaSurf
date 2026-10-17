@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<!--
+  text-indent's hanging and each-line (VitaSurf): hanging indents every
+  line but the first, each-line indents the lines after a forced break
+  as well as the first, and both together indent the lines that wrap.
+  The lines are read from the inline elements each starts with. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>text-indent modes</title>
+<style>
+div { width: 300px; font: 16px monospace; margin-bottom: 8px; }
+i { font-style: normal; }
+#plain { text-indent: 40px; }
+#hang { text-indent: 40px hanging; }
+#each { text-indent: 40px each-line; }
+#both { text-indent: 40px hanging each-line; }
+#fit { text-indent: 40px hanging; width: max-content; }
+</style></head>
+<body>
+<div id="plain"><i>a</i><br><i>b</i></div>
+<div id="hang"><i>a</i><br><i>b</i></div>
+<div id="each"><i>a</i><br><i>b</i></div>
+<div id="both"><i>a</i><br><i>b</i></div>
+<div id="fit"><i>a</i><br><i>bb</i></div>
+<div id="wrap" style="width: 100px; text-indent: 40px hanging"><i>aaaa</i> <i>bbbb</i></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('text-indent-modes: ' + l); }
+function x(id, n) { var d = document.getElementById(id); return d.getElementsByTagName('i')[n].getBoundingClientRect().left - d.getBoundingClientRect().left; }
+addEventListener('load', function () {
+  ok('plain: the first line', x('plain', 0), 40);
+  ok('plain: after a break', x('plain', 1), 0);
+  ok('hanging: the first line', x('hang', 0), 0);
+  ok('hanging: after a break', x('hang', 1), 40);
+  ok('each-line: the first line', x('each', 0), 40);
+  ok('each-line: after a break', x('each', 1), 40);
+  ok('both: the first line', x('both', 0), 0);
+  ok('both: after a break', x('both', 1), 0);
+  ok('hanging: a wrapped line', x('wrap', 1), 40);
+  ok('hanging: the line it wrapped from', x('wrap', 0), 0);
+  var w = document.getElementById('fit').getBoundingClientRect().width;
+  ok('a hanging indent counts in the line it is on', w, 40 + document.getElementById('fit').getElementsByTagName('i')[1].getBoundingClientRect().width);
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('text-indent-modes: done');
+});
+</script>
+</body></html>

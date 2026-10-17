@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!--
+  color-mix() of currentColor with transparent (VitaSurf), as pages fade
+  the text's own colour: in color it is the parent's colour, anywhere
+  else the element's own, and a shadow's is resolved where it is drawn.
+  An inherited colour inherits the mix as written, as CSS Color 5 has
+  currentColor inherited, and is resolved against the child's colour.
+  Each line must say PASS. Look too: d's 4px ring is black at 45%.
+-->
+<html><head><meta charset="utf-8"><title>color-mix with currentColor</title>
+<style>
+#p { color: rgb(255, 0, 0); }
+#a { border: 2px solid color-mix(in srgb, currentColor 50%, transparent); color: rgb(0, 0, 255); }
+#b { color: color-mix(in srgb, currentColor 40%, transparent); }
+#c { color: rgb(0, 128, 0); background-color: color-mix(in srgb, transparent, currentColor 25%); }
+#d { color: rgb(0, 0, 0); outline: 1px solid color-mix(in srgb, currentColor, transparent); box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 45%, transparent); }
+#e { color: rgb(0, 0, 255); caret-color: color-mix(in srgb, currentColor 20%, transparent); }
+#e span { color: rgb(255, 0, 0); }
+</style></head>
+<body>
+<div id="p">
+<div id="a">a</div>
+<div id="b">b</div>
+<div id="c">c</div>
+<div id="d">d</div>
+<div id="e">e <span id="f">f</span></div>
+</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('color-mix-current: ' + l); }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+addEventListener('load', function () {
+  ok('CSS.supports', CSS.supports('color', 'color-mix(in srgb, currentColor 45%, transparent)'), true);
+  ok('a border of its own colour', cs('a').borderTopColor, 'rgba(0, 0, 255, 0.5)');
+  ok('color mixes its parent\'s colour', cs('b').color, 'rgba(255, 0, 0, 0.4)');
+  ok('either order', cs('c').backgroundColor, 'rgba(0, 128, 0, 0.25)');
+  ok('no weight is half', cs('d').outlineColor, 'rgba(0, 0, 0, 0.5)');
+  ok('an inherited mix takes the child\'s colour', cs('f').caretColor, 'rgba(255, 0, 0, 0.2)');
+  ok('and the parent keeps its own', cs('e').caretColor, 'rgba(0, 0, 255, 0.2)');
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('color-mix-current: done');
+});
+</script>
+</body></html>

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<!--
+  The last of what the census found dropped (VitaSurf): font-feature-
+  settings, font-size-adjust, text-emphasis, text-indent's hanging and
+  each-line, image-rendering, shape-outside and shape-margin, and
+  initial-letter, each taken as the specifications have it and read
+  back. Each line must say PASS. The readings follow each grammar's
+  order and leave out what is the default, as CSSOM serialises them;
+  Chrome's may order or spell a few differently.
+-->
+<html><head><meta charset="utf-8"><title>Last CSS gaps</title>
+<style>
+#a { font-feature-settings: "tnum", 'liga' 0, "ss01" on, "kern" off; }
+#b { font-size-adjust: 0.52; }
+#c { font-size-adjust: cap-height 0.7; }
+#d { font-size-adjust: from-font; }
+#e { text-emphasis: open triangle red; }
+#f { text-emphasis-style: "*"; text-emphasis-position: under left; }
+#g { text-indent: 2em hanging; }
+#h { text-indent: each-line 10px; }
+#i { image-rendering: pixelated; }
+#j { shape-outside: circle(50% at 50% 50%) margin-box; shape-margin: 10px; }
+#k { shape-outside: polygon(0 0, 100% 0, 50% 100%); }
+#l { initial-letter: 3; }
+#m { initial-letter: 3 2; }
+#n { initial-letter: 2 raise; }
+#o { -webkit-text-emphasis: dot; }
+#p { text-emphasis-style: filled; }
+#q { text-indent: 5px; }
+#q2 { text-indent: inherit; }
+</style></head>
+<body>
+<div id="a"></div><div id="b"></div><div id="c"></div><div id="d"></div>
+<div id="e"></div><div id="f"></div><div id="g"></div><div id="h"><span id="h2"></span></div>
+<div id="i"></div><div id="j"></div><div id="k"></div><div id="l"></div>
+<div id="m"></div><div id="n"></div><div id="o"></div><div id="p"></div>
+<div id="g2" style="text-indent: 1px"></div>
+<div id="q"><span id="q2"></span></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('last-gaps: ' + l); }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+function sup(p, v) { return CSS.supports(p, v); }
+addEventListener('load', function () {
+  ok('font-feature-settings', cs('a').fontFeatureSettings, '"tnum", "liga" 0, "ss01", "kern" 0');
+  ok('font-feature-settings initial', cs('b').fontFeatureSettings, 'normal');
+  ok('font-feature-settings tags are four characters', sup('font-feature-settings', '"tnu"'), false);
+  ok('font-feature-settings refuses a negative', sup('font-feature-settings', '"tnum" -1'), false);
+  ok('font-size-adjust number', cs('b').fontSizeAdjust, '0.52');
+  ok('font-size-adjust metric', cs('c').fontSizeAdjust, 'cap-height 0.7');
+  ok('font-size-adjust from-font', cs('d').fontSizeAdjust, 'from-font');
+  ok('font-size-adjust inherited', cs('out').fontSizeAdjust, 'none');
+  ok('font-size-adjust refuses a negative', sup('font-size-adjust', '-1'), false);
+  ok('text-emphasis style', cs('e').textEmphasisStyle, 'open triangle');
+  ok('text-emphasis color', cs('e').textEmphasisColor, 'rgb(255, 0, 0)');
+  ok('text-emphasis string', cs('f').textEmphasisStyle, '"*"');
+  ok('text-emphasis-position', cs('f').textEmphasisPosition, 'under left');
+  ok('text-emphasis-color is currentColor', cs('f').textEmphasisColor, cs('f').color);
+  ok('-webkit-text-emphasis', cs('o').textEmphasisStyle, 'filled dot');
+  ok('a fill alone is a circle', cs('p').textEmphasisStyle, 'filled circle');
+  ok('text-emphasis refuses two shapes', sup('text-emphasis-style', 'dot circle'), false);
+  ok('text-indent hanging', cs('g').textIndent, '32px hanging');
+  ok('text-indent each-line first', cs('h').textIndent, '10px each-line');
+  ok('text-indent is inherited with its keywords', cs('h2').textIndent, '10px each-line');
+  ok('a plain text-indent has none', cs('g2').textIndent, '1px');
+  ok('text-indent inherit takes both', cs('q2').textIndent, '5px');
+  ok('text-indent needs a length', sup('text-indent', 'hanging'), false);
+  ok('text-indent twice is not', sup('text-indent', '1px hanging hanging'), false);
+  ok('image-rendering', cs('i').imageRendering, 'pixelated');
+  ok('image-rendering legacy alias', sup('image-rendering', 'optimizeSpeed'), true);
+  ok('image-rendering Chrome\'s', sup('image-rendering', '-webkit-optimize-contrast'), true);
+  ok('shape-outside', cs('j').shapeOutside, 'circle(50% at 50% 50%) margin-box');
+  ok('shape-margin', cs('j').shapeMargin, '10px');
+  ok('shape-outside polygon', cs('k').shapeOutside, 'polygon(0 0, 100% 0, 50% 100%)');
+  ok('shape-outside a box', sup('shape-outside', 'content-box'), true);
+  ok('shape-outside an image', sup('shape-outside', 'url(a.png)'), true);
+  ok('shape-outside a gradient', sup('shape-outside', 'linear-gradient(red, blue)'), true);
+  ok('shape-outside inset round', sup('shape-outside', 'inset(10px 5% round 4px / 2px)'), true);
+  ok('shape-outside refuses a negative radius', sup('shape-outside', 'circle(-5px)'), false);
+  ok('shape-outside refuses an odd polygon', sup('shape-outside', 'polygon(0 0, 10px)'), false);
+  ok('shape-outside refuses two boxes', sup('shape-outside', 'margin-box content-box'), false);
+  ok('shape-margin refuses a negative', sup('shape-margin', '-1px'), false);
+  ok('shape-image-threshold', sup('shape-image-threshold', '0.5'), true);
+  ok('initial-letter', cs('l').initialLetter, '3');
+  ok('initial-letter with a sink', cs('m').initialLetter, '3 2');
+  ok('initial-letter raise', cs('n').initialLetter, '2 raise');
+  ok('initial-letter initial', cs('a').initialLetter, 'normal');
+  ok('initial-letter refuses less than one', sup('initial-letter', '0.5'), false);
+  ok('-webkit-initial-letter', sup('-webkit-initial-letter', '2 1'), true);
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('last-gaps: done');
+});
+</script>
+</body></html>

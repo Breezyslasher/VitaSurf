@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!--
+  background-repeat with a different way along each axis (VitaSurf),
+  kept as written and read back as Chrome writes it, and drawn so: the
+  boxes below are 100px by 40px over a 20px square, which space spreads
+  along x as five tiles and round fits along y as two. Each line must
+  say PASS; Chrome passes them all. Look too: the first box's tiles are
+  one row, spread across it; the second's are one column of two, 20px
+  wide and stretched to 20px each down its height; the third tiles its
+  whole width with one spread row only where it fits whole.
+-->
+<html><head><meta charset="utf-8"><title>background-repeat axes</title>
+<style>
+div.t { width: 100px; height: 40px; margin: 4px; border: 1px solid #888;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Crect width='20' height='20' fill='%2300f'/%3E%3C/svg%3E"); }
+#a { background-repeat: space no-repeat; }
+#b { background-repeat: no-repeat round; }
+#c { background-repeat: repeat space; height: 50px; }
+#d { background-repeat: round repeat; }
+#e { background-repeat: repeat no-repeat; }
+#f { background-repeat: no-repeat repeat; }
+#g { background-repeat: space space; }
+#h { background: url(x.png) round no-repeat; }
+</style></head>
+<body>
+<div class="t" id="a"></div>
+<div class="t" id="b"></div>
+<div class="t" id="c"></div>
+<div class="t" id="d"></div>
+<div class="t" id="e"></div>
+<div class="t" id="f"></div>
+<div class="t" id="g"></div>
+<div class="t" id="h"></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('background-repeat-axes: ' + l); }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+addEventListener('load', function () {
+  ok('space no-repeat', cs('a').backgroundRepeat, 'space no-repeat');
+  ok('no-repeat round', cs('b').backgroundRepeat, 'no-repeat round');
+  ok('repeat space', cs('c').backgroundRepeat, 'repeat space');
+  ok('round repeat', cs('d').backgroundRepeat, 'round repeat');
+  ok('repeat no-repeat is repeat-x', cs('e').backgroundRepeat, 'repeat-x');
+  ok('no-repeat repeat is repeat-y', cs('f').backgroundRepeat, 'repeat-y');
+  ok('the same twice is one word', cs('g').backgroundRepeat, 'space');
+  ok('in the shorthand', cs('h').backgroundRepeat, 'round no-repeat');
+  ok('CSS.supports', CSS.supports('background-repeat', 'space round'), true);
+  ok('three words are not', CSS.supports('background-repeat', 'space round repeat'), false);
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('background-repeat-axes: done');
+});
+</script>
+</body></html>

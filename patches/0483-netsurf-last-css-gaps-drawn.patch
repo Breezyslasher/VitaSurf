@@ -1,0 +1,2107 @@
+diff --git a/content/content.h b/content/content.h
+index 1bae813b2..8d012abe3 100644
+--- a/content/content.h
++++ b/content/content.h
+@@ -213,6 +213,10 @@ union content_msg_data {
+ 			int y;				/**< Carret y-coord */
+ 			int height;			/**< Carret height */
+ 			const struct rect *clip;	/**< Carret clip rect */
++			/** caret-color, as a NetSurf colour, when
++			 *  has_colour (VitaSurf) */
++			uint32_t colour;
++			bool has_colour;
+ 		} pos;			/**< With CONTENT_CARET_SET_POS */
+ 	} caret;
+ 
+diff --git a/content/handlers/css/select.c b/content/handlers/css/select.c
+index b68accc78..7270ac6c8 100644
+--- a/content/handlers/css/select.c
++++ b/content/handlers/css/select.c
+@@ -428,11 +428,18 @@ css_select_results *nscss_get_style(nscss_select_ctx *ctx, dom_node *n,
+ 			continue;
+ 
+ 		/* Complete the pseudo element's computed style, by composing
+-		 * with the base element's style */
+-		error = css_computed_style_compose(
+-				styles->styles[CSS_PSEUDO_ELEMENT_NONE],
+-				styles->styles[pseudo_element],
+-				unit_len_ctx, &composed);
++		 * with the base element's style; an initial-letter sizes and
++		 * floats a ::first-letter (VitaSurf) */
++		if (pseudo_element == CSS_PSEUDO_ELEMENT_FIRST_LETTER)
++			error = css_computed_style_compose_first_letter(
++					styles->styles[CSS_PSEUDO_ELEMENT_NONE],
++					styles->styles[pseudo_element],
++					unit_len_ctx, &composed);
++		else
++			error = css_computed_style_compose(
++					styles->styles[CSS_PSEUDO_ELEMENT_NONE],
++					styles->styles[pseudo_element],
++					unit_len_ctx, &composed);
+ 		if (error != CSS_OK) {
+ 			/* TODO: perhaps this shouldn't be quite so
+ 			 * catastrophic? */
+diff --git a/content/handlers/html/Makefile b/content/handlers/html/Makefile
+index 72b7d0354..ded890924 100644
+--- a/content/handlers/html/Makefile
++++ b/content/handlers/html/Makefile
+@@ -19,6 +19,7 @@ S_HTML := box_construct.c	\
+ 	image_source.c		\
+ 	interaction.c		\
+ 	layout.c		\
++	layout_shape.c		\
+ 	layout_flex.c		\
+ 	layout_grid.c		\
+ 	layout_multicol.c	\
+diff --git a/content/handlers/html/box.h b/content/handlers/html/box.h
+index d8c78ab10..842b382ba 100644
+--- a/content/handlers/html/box.h
++++ b/content/handlers/html/box.h
+@@ -290,6 +290,12 @@ struct box {
+ 	 */
+ 	struct box *next_float;
+ 
++	/**
++	 * A float box's shape-outside, read when it is sized (VitaSurf);
++	 * NULL for its margin box. A talloc child of the box.
++	 */
++	struct box_float_shape *float_shape;
++
+ 	/**
+ 	 * If box is a float, points to box's containing block
+ 	 */
+diff --git a/content/handlers/html/box_manipulate.c b/content/handlers/html/box_manipulate.c
+index de65b8076..47346afd7 100644
+--- a/content/handlers/html/box_manipulate.c
++++ b/content/handlers/html/box_manipulate.c
+@@ -167,6 +167,7 @@ box_create(css_select_results *styles,
+ 	box->float_children = NULL;
+ 	box->float_container = NULL;
+ 	box->next_float = NULL;
++	box->float_shape = NULL;
+ 	box->cached_place_below_level = 0;
+ 	box->list_value = 1;
+ 	box->list_marker = NULL;
+diff --git a/content/handlers/html/font.c b/content/handlers/html/font.c
+index bd38b501b..07b75627d 100644
+--- a/content/handlers/html/font.c
++++ b/content/handlers/html/font.c
+@@ -24,6 +24,8 @@
+ 
+ #include "utils/nsoption.h"
+ #include "netsurf/plot_style.h"
++#include "netsurf/layout.h"
++#include "desktop/gui_internal.h"
+ #include "css/utils.h"
+ 
+ #include "html/font.h"
+@@ -161,6 +163,49 @@ void font_plot_style_from_css(
+ 	if (css_computed_font_variant_numeric(css) ==
+ 			CSS_FONT_VARIANT_NUMERIC_TABULAR)
+ 		fstyle->flags |= FONTF_TABULAR;
++	{
++		/* the features of font-feature-settings this renderer
++		 * draws, after font-variant as the standard orders them
++		 * (VitaSurf) */
++		uint8_t features = 0;
++		lwc_string *text = NULL;
++
++		if (css_computed_font_feature_settings(css, &features,
++				&text) == CSS_FONT_FEATURE_SETTINGS_SET) {
++			if (features & CSS_FONT_FEATURE_TNUM_ON)
++				fstyle->flags |= FONTF_TABULAR;
++			if (features & CSS_FONT_FEATURE_TNUM_OFF)
++				fstyle->flags &= ~FONTF_TABULAR;
++			if (features & CSS_FONT_FEATURE_SMCP_ON)
++				fstyle->flags |= FONTF_SMALLCAPS;
++			if (features & CSS_FONT_FEATURE_SMCP_OFF)
++				fstyle->flags &= ~FONTF_SMALLCAPS;
++		}
++	}
++	{
++		/* font-size-adjust (VitaSurf): the glyphs set at the size
++		 * that gives the font's chosen metric that fraction of the
++		 * font size; from-font asks for the first font's own, and
++		 * a run here is set in that one font */
++		css_fixed n = 0;
++		uint8_t metric = 0;
++		bool from_font = false;
++		float aspect = 0;
++
++		if (css_computed_font_size_adjust(css, &n, &metric,
++				&from_font) == CSS_FONT_SIZE_ADJUST_SET &&
++				!from_font && guit->layout->aspect != NULL &&
++				guit->layout->aspect(fstyle, metric,
++					&aspect) == NSERROR_OK &&
++				aspect > 0) {
++			fstyle->size = (int) (fstyle->size * FIXTOFLT(n) /
++					aspect + 0.5f);
++			if (fstyle->size < (nsoption_int(font_min_size) *
++					PLOT_STYLE_SCALE) / 10)
++				fstyle->size = (nsoption_int(font_min_size) *
++						PLOT_STYLE_SCALE) / 10;
++		}
++	}
+ 
+ 	css_computed_color(css, &col);
+ 	fstyle->foreground = nscss_color_to_ns(col);
+diff --git a/content/handlers/html/interaction.c b/content/handlers/html/interaction.c
+index 1f97ba51d..7b9fad5d8 100644
+--- a/content/handlers/html/interaction.c
++++ b/content/handlers/html/interaction.c
+@@ -2681,6 +2681,20 @@ void html_set_focus(html_content *html, html_focus_type focus_type,
+ 		msg_data.caret.pos.y = y + y_off;
+ 		msg_data.caret.pos.height = height;
+ 		msg_data.caret.pos.clip = (clip == NULL) ? NULL : &cr;
++		/* the field's caret-color, auto being its text's colour
++		 * (VitaSurf) */
++		msg_data.caret.pos.has_colour = false;
++		msg_data.caret.pos.colour = 0;
++		if (focus_type == HTML_FOCUS_TEXTAREA &&
++				focus_owner.textarea != NULL &&
++				focus_owner.textarea->style != NULL) {
++			css_color cc = 0;
++
++			css_computed_caret_color(focus_owner.textarea->style,
++					&cc);
++			msg_data.caret.pos.colour = nscss_color_to_ns(cc);
++			msg_data.caret.pos.has_colour = true;
++		}
+ 	}
+ 
+ 	/* Inform of the content's drag status change */
+diff --git a/content/handlers/html/layout.c b/content/handlers/html/layout.c
+index 175198fd8..f32d742e9 100644
+--- a/content/handlers/html/layout.c
++++ b/content/handlers/html/layout.c
+@@ -69,6 +69,7 @@
+ #include "html/font.h"
+ #include "html/form_internal.h"
+ #include "html/layout.h"
++#include "html/layout_shape.h"
+ #include "html/layout_internal.h"
+ #include "html/table.h"
+ #include "html/bidi.h"
+@@ -314,6 +315,28 @@ static int layout_text_indent(
+ }
+ 
+ 
++/**
++ * Whether a line is indented by text-indent (VitaSurf): the first line,
++ * and with each-line any line after a forced break; hanging indents
++ * every other line instead.
++ *
++ * \param  style        style of block
++ * \param  first_line   the line is the first
++ * \param  after_break  the line follows a forced break
++ * \return  true if the line is indented
++ */
++static bool layout_line_indented(const css_computed_style *style,
++		bool first_line, bool after_break)
++{
++	uint8_t mode = style != NULL ?
++			css_computed_text_indent_mode(style) : 0;
++	bool on = first_line ||
++			((mode & CSS_TEXT_INDENT_EACH_LINE) && after_break);
++
++	return (mode & CSS_TEXT_INDENT_HANGING) ? !on : on;
++}
++
++
+ /**
+  * Calculate minimum and maximum width of a table.
+  *
+@@ -853,13 +876,26 @@ layout_minmax_line(struct box *first,
+ 		*line_has_height = true;
+ 	}
+ 
+-	if (first_line) {
++	{
+ 		/* todo: handle percentage values properly */
+ 		/* todo: handle text-indent interaction with floats */
+-		int text_indent = layout_text_indent(&content->unit_len_ctx,
+-				first->parent->parent->style, 100);
+-		min = (min + text_indent < 0) ? 0 : min + text_indent;
+-		max = (max + text_indent < 0) ? 0 : max + text_indent;
++		/* a line after the first follows a forced break, and with
++		 * hanging the lines it wraps into are indented, so its
++		 * narrowest is too (VitaSurf) */
++		const css_computed_style *bs = first->parent->parent->style;
++		bool ind_max = layout_line_indented(bs, first_line,
++				!first_line);
++		bool ind_min = ind_max || (css_computed_text_indent_mode(bs) &
++				CSS_TEXT_INDENT_HANGING);
++		int text_indent = (ind_max || ind_min) ? layout_text_indent(
++				&content->unit_len_ctx, bs, 100) : 0;
++
++		if (ind_min)
++			min = (min + text_indent < 0) ? 0 : min + text_indent;
++		if (ind_max)
++			max = (max + text_indent < 0) ? 0 : max + text_indent;
++		if (max < min)
++			max = min;
+ 	}
+ 
+ 	*line_min = min;
+@@ -1507,11 +1543,12 @@ static int layout_clear(struct box *fl, enum css_clear_e clear)
+  * \param  right  returns float on right if present
+  */
+ static void
+-find_sides(struct box *fl,
++find_sides_shaped(struct box *fl,
+ 	   int y0, int y1,
+ 	   int *x0, int *x1,
+ 	   struct box **left,
+-	   struct box **right)
++	   struct box **right,
++	   bool shaped)
+ {
+ 	int fy0, fy1, fx0, fx1;
+ 
+@@ -1528,14 +1565,26 @@ find_sides(struct box *fl,
+ 		}
+ 		fy0 = fl->y;
+ 		if (y0 < fy1 && fy0 <= y1) {
++			int edge = 0;
++
++			/* a line wraps the float's shape-outside, where
++			 * it reaches into the line at all (VitaSurf) */
++			if (shaped && fl->float_shape != NULL &&
++					!layout_float_shape_edge(fl, y0, y1,
++						&edge))
++				continue;
+ 			if (fl->type == BOX_FLOAT_LEFT) {
+ 				fx1 = fl->x + fl->width;
++				if (shaped && fl->float_shape != NULL)
++					fx1 = edge;
+ 				if (*x0 < fx1) {
+ 					*x0 = fx1;
+ 					*left = fl;
+ 				}
+ 			} else {
+ 				fx0 = fl->x;
++				if (shaped && fl->float_shape != NULL)
++					fx0 = edge;
+ 				if (fx0 < *x1) {
+ 					*x1 = fx0;
+ 					*right = fl;
+@@ -1548,6 +1597,18 @@ find_sides(struct box *fl,
+ 	      *left, *right);
+ }
+ 
++/** Edges by the floats' margin boxes, as everything but a line box
++ * finds them. */
++static void
++find_sides(struct box *fl,
++	   int y0, int y1,
++	   int *x0, int *x1,
++	   struct box **left,
++	   struct box **right)
++{
++	find_sides_shaped(fl, y0, y1, x0, x1, left, right, false);
++}
++
+ 
+ 
+ 
+@@ -3261,7 +3322,8 @@ layout_line(struct box *first,
+ 	/* find sides at top of line */
+ 	x0 += cx;
+ 	x1 += cx;
+-	find_sides(cont->float_children, cy, cy, &x0, &x1, &left, &right);
++	find_sides_shaped(cont->float_children, cy, cy, &x0, &x1, &left,
++			&right, true);
+ 	x0 -= cx;
+ 	x1 -= cx;
+ 
+@@ -3502,8 +3564,8 @@ layout_line(struct box *first,
+ 	/* find new sides using this height */
+ 	x0 = cx;
+ 	x1 = cx + *width;
+-	find_sides(cont->float_children, cy, cy + height, &x0, &x1,
+-			&left, &right);
++	find_sides_shaped(cont->float_children, cy, cy + height, &x0, &x1,
++			&left, &right, true);
+ 	x0 -= cx;
+ 	x1 -= cx;
+ 
+@@ -3620,6 +3682,7 @@ layout_line(struct box *first,
+ 					d->padding[BOTTOM] +
+ 					d->border[BOTTOM].width +
+ 					d->margin[BOTTOM];
++			layout_float_shape(b, d, &content->unit_len_ctx);
+ 
+ 			if (b->width > (x1 - x0) - x)
+ 				place_below = true;
+@@ -3656,6 +3719,28 @@ layout_line(struct box *first,
+ 					right = b;
+ 				}
+ 				b->y = cy;
++				if (b->float_shape != NULL) {
++					/* the rest of this line wraps its
++					 * shape, as the lines after do
++					 * (VitaSurf) */
++					int edge;
++
++					if (b->width > 0 &&
++						b->type == BOX_FLOAT_LEFT)
++						x0 -= b->width;
++					else if (b->width > 0)
++						x1 += b->width;
++					if (layout_float_shape_edge(b, cy,
++							cy + height, &edge)) {
++						if (b->type == BOX_FLOAT_LEFT &&
++							edge - cx > x0)
++							x0 = edge - cx;
++						else if (b->type ==
++							BOX_FLOAT_RIGHT &&
++							edge - cx < x1)
++							x1 = edge - cx;
++					}
++				}
+ 			} else {
+ 				/* cleared or doesn't fit on line */
+ 				/* place below into next available space */
+@@ -4112,6 +4197,7 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ 		struct box *cont, int cx, int cy, html_content *content)
+ {
+ 	bool first_line = true;
++	bool indent;
+ 	bool has_text_children;
+ 	struct box *c, *next;
+ 	int y = 0;
+@@ -4192,7 +4278,10 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ 		NSLOG(layout, DEBUG, "c %p", c);
+ 
+ 		curwidth = inline_container->width;
+-		if (!layout_line(c, &curwidth, &y, cx, cy + y, cont, first_line,
++		indent = layout_line_indented(inline_container->parent->style,
++				first_line, c->prev != NULL &&
++				c->prev->type == BOX_BR);
++		if (!layout_line(c, &curwidth, &y, cx, cy + y, cont, indent,
+ 				has_text_children, content, &next))
+ 			return false;
+ 
+@@ -4226,7 +4315,7 @@ static bool layout_inline_container(struct box *inline_container, int width,
+ 			}
+ 			curwidth = inline_container->width;
+ 			if (!layout_line(c, &curwidth, &y0, cx, cy, cont,
+-					true, has_text_children, content,
++					indent, has_text_children, content,
+ 					&next))
+ 				return false;
+ 			y = y0;
+diff --git a/content/handlers/html/layout_shape.c b/content/handlers/html/layout_shape.c
+new file mode 100644
+index 000000000..c4b3dcbf1
+--- /dev/null
++++ b/content/handlers/html/layout_shape.c
+@@ -0,0 +1,622 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * shape-outside (VitaSurf): the float area a line box wraps around.
++ *
++ * libcss keeps the value as text, "<basic shape>|<box>". It is read
++ * once, when the float is sized, into a shape in the float box's own
++ * pixels, kept on the float box; a line asks it how far the float
++ * reaches across a band of rows. circle(), ellipse(), inset(), xywh(),
++ * rect() and polygon() are shaped, a box alone is its rectangle, and
++ * an image is the margin box: its picture is not read. Rounded corners
++ * of inset() and of a box are not followed. As the standard has it,
++ * the shape is clipped to the margin box and only line boxes see it:
++ * other floats and block formatting contexts still avoid the margin
++ * box.
++ */
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++#include "utils/talloc.h"
++#include "css/utils.h"
++
++#include "html/box.h"
++#include "html/layout_shape.h"
++
++#define SHAPE_POINTS_MAX 64
++
++/** A shape, in the float box's pixels. */
++struct box_float_shape {
++	enum { SHAPE_RECT, SHAPE_ELLIPSE, SHAPE_POLYGON } kind;
++	float x0, y0, x1, y1;	/**< a rectangle, or an ellipse's bounds */
++	float margin;		/**< shape-margin */
++	int n;			/**< a polygon's points */
++	float pts[2 * SHAPE_POINTS_MAX];
++	float width, height;	/**< the margin box it is clipped to */
++};
++
++/** One value of the shape's text: a length or a percentage, or a
++ * word, or a comma. */
++struct shape_tok {
++	enum { TOK_LEN, TOK_PCT, TOK_WORD, TOK_COMMA, TOK_SLASH } kind;
++	float v;
++	css_unit unit;
++	char word[16];
++};
++
++#define SHAPE_TOKS_MAX (2 * SHAPE_POINTS_MAX + 16)
++
++/** A unit's text, as libcss takes it for a length. */
++static bool shape_unit(const char *u, size_t len, css_unit *unit)
++{
++	static const struct {
++		const char *name;
++		css_unit unit;
++	} units[] = {
++		{ "px", CSS_UNIT_PX }, { "em", CSS_UNIT_EM },
++		{ "rem", CSS_UNIT_REM }, { "ex", CSS_UNIT_EX },
++		{ "ch", CSS_UNIT_CH }, { "in", CSS_UNIT_IN },
++		{ "cm", CSS_UNIT_CM }, { "mm", CSS_UNIT_MM },
++		{ "pt", CSS_UNIT_PT }, { "pc", CSS_UNIT_PC },
++		{ "q", CSS_UNIT_Q }, { "lh", CSS_UNIT_LH },
++		{ "rlh", CSS_UNIT_RLH }, { "vh", CSS_UNIT_VH },
++		{ "vw", CSS_UNIT_VW }, { "vi", CSS_UNIT_VI },
++		{ "vb", CSS_UNIT_VB }, { "vmin", CSS_UNIT_VMIN },
++		{ "vmax", CSS_UNIT_VMAX }, { "dvh", CSS_UNIT_VH },
++		{ "svh", CSS_UNIT_VH }, { "lvh", CSS_UNIT_VH },
++		{ "dvw", CSS_UNIT_VW }, { "svw", CSS_UNIT_VW },
++		{ "lvw", CSS_UNIT_VW },
++	};
++	size_t i;
++
++	for (i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
++		if (strlen(units[i].name) == len &&
++				strncasecmp(units[i].name, u, len) == 0) {
++			*unit = units[i].unit;
++			return true;
++		}
++	}
++	return false;
++}
++
++/** The arguments between the brackets, as tokens. */
++static int shape_tokens(const char *s, const char *end,
++		struct shape_tok *t, int max)
++{
++	int n = 0;
++
++	while (s < end && n < max) {
++		if (*s == ' ') {
++			s++;
++		} else if (*s == ',') {
++			t[n++].kind = TOK_COMMA;
++			s++;
++		} else if (*s == '/') {
++			t[n++].kind = TOK_SLASH;
++			s++;
++		} else if ((*s >= '0' && *s <= '9') || *s == '.' ||
++				*s == '-' || *s == '+') {
++			char *e;
++			const char *u;
++
++			t[n].v = strtof(s, &e);
++			if (e == s)
++				return -1;
++			u = e;
++			while (e < end && *e != ' ' && *e != ',' && *e != '/')
++				e++;
++			if (u == e) {
++				t[n].kind = TOK_LEN;	/* a zero */
++				t[n].unit = CSS_UNIT_PX;
++			} else if (*u == '%' && e == u + 1) {
++				t[n].kind = TOK_PCT;
++			} else if (shape_unit(u, (size_t) (e - u),
++					&t[n].unit)) {
++				t[n].kind = TOK_LEN;
++			} else {
++				return -1;
++			}
++			n++;
++			s = e;
++		} else {
++			size_t l = 0;
++
++			while (s < end && *s != ' ' && *s != ',' &&
++					*s != '/') {
++				if (l + 1 < sizeof(t[n].word))
++					t[n].word[l++] = *s;
++				s++;
++			}
++			t[n].word[l] = '\0';
++			t[n++].kind = TOK_WORD;
++		}
++	}
++	return n;
++}
++
++/** What to resolve lengths with. */
++struct shape_ctx {
++	const css_computed_style *style;
++	const css_unit_ctx *unit_ctx;
++};
++
++/** A length or percentage in pixels, a percentage of basis. */
++static bool shape_px(const struct shape_ctx *c, const struct shape_tok *t,
++		float basis, float *px)
++{
++	if (t->kind == TOK_PCT) {
++		*px = basis * t->v / 100;
++		return true;
++	}
++	if (t->kind != TOK_LEN)
++		return false;
++	*px = FIXTOFLT(css_unit_len2device_px(c->style, c->unit_ctx,
++			FLTTOFIX(t->v), t->unit));
++	return true;
++}
++
++static bool shape_word(const struct shape_tok *t, const char *w)
++{
++	return t->kind == TOK_WORD && strcasecmp(t->word, w) == 0;
++}
++
++/** Which way a position keyword points: 'x', 'y', 'c' for center. */
++static char shape_side(const struct shape_tok *t, bool *far)
++{
++	*far = shape_word(t, "right") || shape_word(t, "bottom");
++	if (shape_word(t, "left") || shape_word(t, "right"))
++		return 'x';
++	if (shape_word(t, "top") || shape_word(t, "bottom"))
++		return 'y';
++	if (shape_word(t, "center"))
++		return 'c';
++	return 0;
++}
++
++/**
++ * A <position>, the tokens from *i to the end, within a w by h box:
++ * one or two values, keywords in either order; or three or four, each
++ * keyword with an offset from its side.
++ */
++static bool shape_position(const struct shape_ctx *c,
++		const struct shape_tok *t, int n, int *i, float w, float h,
++		float *x, float *y)
++{
++	const struct shape_tok *v = &t[*i];
++	int count = n - *i, k;
++	bool far;
++
++	*x = w / 2;
++	*y = h / 2;
++	if (count < 1 || count > 4)
++		return false;
++	if (count <= 2) {
++		const struct shape_tok *a = &v[0];
++		const struct shape_tok *b = count == 2 ? &v[1] : NULL;
++		char sa = shape_side(a, &far);
++
++		/* a vertical keyword first, or a horizontal one second,
++		 * is the other way round */
++		if (b != NULL) {
++			char sb = shape_side(b, &far);
++
++			if (sa == 'y' || sb == 'x') {
++				const struct shape_tok *tmp = a;
++
++				a = b;
++				b = tmp;
++			}
++		} else if (sa == 'y') {
++			b = a;
++			a = NULL;
++		}
++		if (a != NULL) {
++			sa = shape_side(a, &far);
++			if (sa == 'x')
++				*x = far ? w : 0;
++			else if (sa != 'c' && !shape_px(c, a, w, x))
++				return false;
++		}
++		if (b != NULL) {
++			char sb = shape_side(b, &far);
++
++			if (sb == 'y')
++				*y = far ? h : 0;
++			else if (sb != 'c' && !shape_px(c, b, h, y))
++				return false;
++		}
++		*i = n;
++		return true;
++	}
++	for (k = 0; k < count; k++) {
++		char side = shape_side(&v[k], &far);
++		float off = 0;
++
++		if (side == 0)
++			return false;
++		if (k + 1 < count && (v[k + 1].kind == TOK_LEN ||
++				v[k + 1].kind == TOK_PCT)) {
++			if (!shape_px(c, &v[k + 1], side == 'y' ? h : w, &off))
++				return false;
++			k++;
++		}
++		if (side == 'x')
++			*x = far ? w - off : off;
++		else if (side == 'y')
++			*y = far ? h - off : off;
++	}
++	*i = n;
++	return true;
++}
++
++/** One radius of circle() or ellipse(), from the centre to the sides. */
++static bool shape_radius(const struct shape_ctx *c, const struct shape_tok *t,
++		float basis, float near, float far, float *r)
++{
++	if (shape_word(t, "closest-side")) {
++		*r = near;
++		return true;
++	}
++	if (shape_word(t, "farthest-side")) {
++		*r = far;
++		return true;
++	}
++	return shape_px(c, t, basis, r);
++}
++
++/** Four lengths, as margin's shorthand gives them. */
++static int shape_four(const struct shape_ctx *c, const struct shape_tok *t,
++		int n, int i, float w, float h, float v[4])
++{
++	float got[4];
++	int k = 0;
++
++	while (k < 4 && i + k < n && (t[i + k].kind == TOK_LEN ||
++			t[i + k].kind == TOK_PCT)) {
++		shape_px(c, &t[i + k], (k % 2) ? w : h, &got[k]);
++		k++;
++	}
++	if (k == 0)
++		return 0;
++	v[0] = got[0];
++	v[1] = k > 1 ? got[1] : got[0];
++	v[2] = k > 2 ? got[2] : got[0];
++	v[3] = k > 3 ? got[3] : v[1];
++	return k;
++}
++
++/** The basic shape's text in rx0..ry1, the reference box. */
++static bool shape_read(struct box_float_shape *s, const struct shape_ctx *c,
++		const char *text, size_t len, float rx0, float ry0, float rx1,
++		float ry1)
++{
++	struct shape_tok t[SHAPE_TOKS_MAX];
++	const char *open = memchr(text, '(', len);
++	float w = rx1 - rx0, h = ry1 - ry0;
++	int n, i = 0;
++
++	if (open == NULL || text[len - 1] != ')')
++		return false;
++	n = shape_tokens(open + 1, text + len - 1, t, SHAPE_TOKS_MAX);
++	if (n < 0)
++		return false;
++
++	if (strncmp(text, "circle(", 7) == 0 ||
++			strncmp(text, "ellipse(", 8) == 0) {
++		bool circle = text[0] == 'c';
++		const struct shape_tok *r[2] = { NULL, NULL };
++		float cx = w / 2, cy = h / 2, rx, ry;
++
++		while (i < n && i < (circle ? 1 : 2) &&
++				!shape_word(&t[i], "at")) {
++			r[i] = &t[i];
++			i++;
++		}
++		if (i < n && shape_word(&t[i], "at")) {
++			i++;
++			if (!shape_position(c, t, n, &i, w, h, &cx, &cy))
++				return false;
++		}
++		if (circle) {
++			float near = fminf(fminf(cx, w - cx), fminf(cy, h - cy));
++			float far = fmaxf(fmaxf(cx, w - cx), fmaxf(cy, h - cy));
++
++			rx = near;
++			if (r[0] != NULL && !shape_radius(c, r[0],
++					sqrtf(w * w + h * h) / sqrtf(2),
++					near, far, &rx))
++				return false;
++			ry = rx;
++		} else {
++			rx = fminf(cx, w - cx);
++			ry = fminf(cy, h - cy);
++			if (r[0] != NULL && !shape_radius(c, r[0], w,
++					fminf(cx, w - cx), fmaxf(cx, w - cx),
++					&rx))
++				return false;
++			if (r[1] != NULL && !shape_radius(c, r[1], h,
++					fminf(cy, h - cy), fmaxf(cy, h - cy),
++					&ry))
++				return false;
++		}
++		s->kind = SHAPE_ELLIPSE;
++		s->x0 = rx0 + cx - rx;
++		s->x1 = rx0 + cx + rx;
++		s->y0 = ry0 + cy - ry;
++		s->y1 = ry0 + cy + ry;
++		return rx >= 0 && ry >= 0;
++	}
++	if (strncmp(text, "inset(", 6) == 0) {
++		float v[4];
++
++		if (shape_four(c, t, n, 0, w, h, v) == 0)
++			return false;
++		s->kind = SHAPE_RECT;
++		s->x0 = rx0 + v[3];
++		s->y0 = ry0 + v[0];
++		s->x1 = rx1 - v[1];
++		s->y1 = ry1 - v[2];
++		return true;
++	}
++	if (strncmp(text, "xywh(", 5) == 0) {
++		float v[4];
++
++		if (n < 4 || !shape_px(c, &t[0], w, &v[0]) ||
++				!shape_px(c, &t[1], h, &v[1]) ||
++				!shape_px(c, &t[2], w, &v[2]) ||
++				!shape_px(c, &t[3], h, &v[3]))
++			return false;
++		s->kind = SHAPE_RECT;
++		s->x0 = rx0 + v[0];
++		s->y0 = ry0 + v[1];
++		s->x1 = s->x0 + v[2];
++		s->y1 = s->y0 + v[3];
++		return true;
++	}
++	if (strncmp(text, "rect(", 5) == 0) {
++		float v[4] = { 0, w, h, 0 };
++		int k;
++
++		for (k = 0; k < 4 && k < n; k++) {
++			if (!shape_word(&t[k], "auto") &&
++					!shape_px(c, &t[k], (k % 2) ? w : h,
++						&v[k]))
++				return false;
++		}
++		s->kind = SHAPE_RECT;
++		s->x0 = rx0 + v[3];
++		s->y0 = ry0 + v[0];
++		s->x1 = rx0 + v[1];
++		s->y1 = ry0 + v[2];
++		return true;
++	}
++	if (strncmp(text, "polygon(", 8) == 0) {
++		if (i < n && (shape_word(&t[i], "nonzero") ||
++				shape_word(&t[i], "evenodd")))
++			i += 2;
++		s->kind = SHAPE_POLYGON;
++		s->n = 0;
++		while (i + 1 < n && s->n < SHAPE_POINTS_MAX) {
++			float px, py;
++
++			if (!shape_px(c, &t[i], w, &px) ||
++					!shape_px(c, &t[i + 1], h, &py))
++				return false;
++			s->pts[2 * s->n] = rx0 + px;
++			s->pts[2 * s->n + 1] = ry0 + py;
++			s->n++;
++			i += 2;
++			if (i < n && t[i].kind == TOK_COMMA)
++				i++;
++		}
++		return s->n >= 3;
++	}
++	return false;
++}
++
++/* exported interface documented in html/layout_shape.h */
++void layout_float_shape(struct box *fl, const struct box *d,
++		const css_unit_ctx *unit_ctx)
++{
++	struct box_float_shape *s;
++	struct shape_ctx c;
++	lwc_string *str = NULL;
++	css_fixed margin = 0;
++	css_unit munit = CSS_UNIT_PX;
++	const char *text, *bar;
++	size_t len;
++	float rx0, ry0, rx1, ry1;
++
++	talloc_free(fl->float_shape);
++	fl->float_shape = NULL;
++	if (d == NULL || d->style == NULL ||
++			css_computed_shape_outside(d->style, &str) !=
++			CSS_SHAPE_OUTSIDE_SET || str == NULL)
++		return;
++	text = lwc_string_data(str);
++	len = lwc_string_length(str);
++	bar = memchr(text, '|', len);
++	if (bar == NULL || strncmp(text, "image|", 6) == 0 ||
++			strncmp(text, "url(", 4) == 0)
++		return;
++
++	/* the reference box: margin-box unless the value says */
++	rx0 = 0;
++	ry0 = 0;
++	rx1 = fl->width;
++	ry1 = fl->height;
++	if (strcmp(bar + 1, "margin-box") != 0 && bar[1] != '\0') {
++		rx0 += d->margin[LEFT];
++		ry0 += d->margin[TOP];
++		rx1 -= d->margin[RIGHT];
++		ry1 -= d->margin[BOTTOM];
++		if (strcmp(bar + 1, "border-box") != 0) {
++			rx0 += d->border[LEFT].width;
++			ry0 += d->border[TOP].width;
++			rx1 -= d->border[RIGHT].width;
++			ry1 -= d->border[BOTTOM].width;
++		}
++		if (strcmp(bar + 1, "content-box") == 0) {
++			rx0 += d->padding[LEFT];
++			ry0 += d->padding[TOP];
++			rx1 -= d->padding[RIGHT];
++			ry1 -= d->padding[BOTTOM];
++		}
++	}
++
++	s = talloc_zero(fl, struct box_float_shape);
++	if (s == NULL)
++		return;
++	c.style = d->style;
++	c.unit_ctx = unit_ctx;
++	if (bar == text) {
++		/* a box alone */
++		s->kind = SHAPE_RECT;
++		s->x0 = rx0;
++		s->y0 = ry0;
++		s->x1 = rx1;
++		s->y1 = ry1;
++	} else if (!shape_read(s, &c, text, (size_t) (bar - text),
++			rx0, ry0, rx1, ry1)) {
++		talloc_free(s);
++		return;
++	}
++	if (css_computed_shape_margin(d->style, &margin, &munit) ==
++			CSS_SHAPE_MARGIN_SET) {
++		if (munit == CSS_UNIT_PCT)
++			s->margin = (rx1 - rx0) * FIXTOFLT(margin) / 100;
++		else
++			s->margin = FIXTOFLT(css_unit_len2device_px(d->style,
++					unit_ctx, margin, munit));
++		if (s->margin < 0)
++			s->margin = 0;
++	}
++	s->width = fl->width;
++	s->height = fl->height;
++	fl->float_shape = s;
++}
++
++/** How far right (or left) an ellipse reaches between rows a and b. */
++static bool ellipse_reach(const struct box_float_shape *s, float a, float b,
++		bool right, float *edge)
++{
++	float cx = (s->x0 + s->x1) / 2, cy = (s->y0 + s->y1) / 2;
++	float rx = (s->x1 - s->x0) / 2 + s->margin;
++	float ry = (s->y1 - s->y0) / 2 + s->margin;
++	float d, f;
++
++	if (rx <= 0 || ry <= 0 || b < cy - ry || a > cy + ry)
++		return false;
++	d = (cy >= a && cy <= b) ? 0 : fminf(fabsf(cy - a), fabsf(cy - b));
++	f = 1 - (d / ry) * (d / ry);
++	f = f > 0 ? sqrtf(f) : 0;
++	*edge = right ? cx + rx * f : cx - rx * f;
++	return true;
++}
++
++/** How far right (or left) a polygon reaches between rows a and b. */
++static bool polygon_reach(const struct box_float_shape *s, float a, float b,
++		bool right, float *edge)
++{
++	bool any = false;
++	float best = 0;
++	int i;
++
++	a -= s->margin;
++	b += s->margin;
++	for (i = 0; i < s->n; i++) {
++		float x0 = s->pts[2 * i], y0 = s->pts[2 * i + 1];
++		float x1 = s->pts[2 * ((i + 1) % s->n)];
++		float y1 = s->pts[2 * ((i + 1) % s->n) + 1];
++		float lo = fmaxf(fminf(y0, y1), a), hi = fminf(fmaxf(y0, y1), b);
++		float xa, xb;
++
++		if (lo > hi)
++			continue;
++		if (y1 == y0) {
++			xa = x0;
++			xb = x1;
++		} else {
++			xa = x0 + (x1 - x0) * (lo - y0) / (y1 - y0);
++			xb = x0 + (x1 - x0) * (hi - y0) / (y1 - y0);
++		}
++		if (right) {
++			float m = fmaxf(xa, xb);
++
++			if (!any || m > best)
++				best = m;
++		} else {
++			float m = fminf(xa, xb);
++
++			if (!any || m < best)
++				best = m;
++		}
++		any = true;
++	}
++	if (!any)
++		return false;
++	*edge = right ? best + s->margin : best - s->margin;
++	return true;
++}
++
++/* exported interface documented in html/layout_shape.h */
++bool layout_float_shape_edge(const struct box *fl, int y0, int y1, int *edge)
++{
++	const struct box_float_shape *s = fl->float_shape;
++	bool right = fl->type == BOX_FLOAT_LEFT;
++	float a = (float) (y0 - fl->y), b = (float) (y1 - fl->y), e = 0;
++	bool hit;
++
++	if (s == NULL) {
++		*edge = right ? fl->x + fl->width : fl->x;
++		return true;
++	}
++	if (b < a)
++		b = a;
++	switch (s->kind) {
++	case SHAPE_ELLIPSE:
++		hit = ellipse_reach(s, a, b, right, &e);
++		break;
++	case SHAPE_POLYGON:
++		hit = polygon_reach(s, a, b, right, &e);
++		break;
++	default:
++		hit = b >= s->y0 - s->margin && a <= s->y1 + s->margin &&
++				s->x1 > s->x0;
++		e = right ? s->x1 + s->margin : s->x0 - s->margin;
++		break;
++	}
++	if (!hit)
++		return false;
++	/* clipped to the margin box */
++	if (e < 0)
++		e = 0;
++	if (e > s->width)
++		e = s->width;
++	if (right && e <= 0)
++		return false;
++	if (!right && e >= s->width)
++		return false;
++	*edge = fl->x + (int) (right ? ceilf(e) : floorf(e));
++	return true;
++}
+diff --git a/content/handlers/html/layout_shape.h b/content/handlers/html/layout_shape.h
+new file mode 100644
+index 000000000..a736cdd68
+--- /dev/null
++++ b/content/handlers/html/layout_shape.h
+@@ -0,0 +1,58 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * shape-outside (VitaSurf): the float area a line box wraps around.
++ */
++
++#ifndef NETSURF_HTML_LAYOUT_SHAPE_H
++#define NETSURF_HTML_LAYOUT_SHAPE_H
++
++#include <stdbool.h>
++
++#include <libcss/libcss.h>
++
++struct box;
++
++/**
++ * Read a float's shape-outside, once the float box is sized, and keep
++ * it on the float box; a float without one keeps none.
++ *
++ * \param fl        the float box, BOX_FLOAT_LEFT or BOX_FLOAT_RIGHT
++ * \param d         the block it holds, whose style gives the shape
++ * \param unit_ctx  what lengths are resolved with
++ */
++void layout_float_shape(struct box *fl, const struct box *d,
++		const css_unit_ctx *unit_ctx);
++
++/**
++ * How far a float reaches into a band of rows, for a line box.
++ *
++ * \param fl    the float box
++ * \param y0    the band's top, in the coordinates fl->y is in
++ * \param y1    its bottom
++ * \param edge  updated to the float area's far edge across the band,
++ *              its right for a left float and its left for a right
++ *              float, in the coordinates fl->x is in
++ * \return false if the float area does not reach into the band.
++ */
++bool layout_float_shape_edge(const struct box *fl, int y0, int y1,
++		int *edge);
++
++#endif
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 22421c523..1a792a682 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -64,6 +64,7 @@
+ #include "html/box_inspect.h"
+ #include "html/box_manipulate.h"
+ #include "html/font.h"
++#include "utils/utf8.h"
+ #include "html/form_internal.h"
+ #include "html/private.h"
+ #include "html/object.h"
+@@ -1136,6 +1137,43 @@ static void html_background_size(const struct box *box,
+ 	}
+ }
+ 
++/**
++ * Whether background-size leaves an axis auto (VitaSurf), as round on
++ * the other axis alone then scales it to keep the picture's shape.
++ */
++static bool html_background_size_auto(const struct box *box, bool x)
++{
++	css_fixed hl = 0, vl = 0;
++	css_unit hu = CSS_UNIT_PX, vu = CSS_UNIT_PX;
++	uint8_t type;
++
++	if (box->style == NULL)
++		return true;
++	type = css_computed_background_size(box->style, &hl, &hu, &vl, &vu);
++	if (type == CSS_BACKGROUND_SIZE_COVER ||
++			type == CSS_BACKGROUND_SIZE_CONTAIN)
++		return false;
++	if (type != CSS_BACKGROUND_SIZE_SET)
++		return true;
++	return (x ? hl : vl) == 0;
++}
++
++/**
++ * Whether image-rendering asks for an image scaled by nearest pixel
++ * (VitaSurf): pixelated and crisp-edges; auto, smooth and high-quality
++ * are scaled smooth.
++ */
++static bool html_pixelated(const css_computed_style *style)
++{
++	uint8_t r;
++
++	if (style == NULL)
++		return false;
++	r = css_computed_image_rendering(style);
++	return r == CSS_IMAGE_RENDERING_PIXELATED ||
++			r == CSS_IMAGE_RENDERING_CRISP_EDGES;
++}
++
+ 
+ /**
+  * Add the lengths in a gradient's stops to their positions, now that the
+@@ -1514,8 +1552,8 @@ static bool html_redraw_bg_image(struct box *background,
+ 		const struct redraw_context *ctx);
+ static bool html_redraw_background_spaced(struct box *background,
+ 		const struct rect *r, int x, int y, int ax, int ay, int aw,
+-		int ah, int iw, int ih, bool sx, bool sy, float scale,
+-		colour bg, const struct redraw_context *ctx);
++		int ah, int iw, int ih, bool sx, bool sy, bool rx, bool ry,
++		float scale, colour bg, const struct redraw_context *ctx);
+ 
+ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 		const struct rect *clip, colour *background_colour,
+@@ -1555,6 +1593,8 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 	int img_w = 0, img_h = 0, area_x = x, area_y = y;
+ 	int area_w = 0, area_h = 0;
+ 	bool space_x = false, space_y = false;
++	uint8_t rep_x = CSS_BACKGROUND_REPEAT_AXIS_REPEAT;
++	uint8_t rep_y = CSS_BACKGROUND_REPEAT_AXIS_REPEAT;
+ 	css_fixed hpos = 0, vpos = 0;
+ 	css_unit hunit = CSS_UNIT_PX, vunit = CSS_UNIT_PX;
+ 	struct box *parent;
+@@ -1666,54 +1706,54 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 					background->padding[BOTTOM],
+ 				&img_w, &img_h);
+ 
+-		/* handle background-repeat */
+-		switch (css_computed_background_repeat(background->style)) {
+-		case CSS_BACKGROUND_REPEAT_REPEAT:
+-			repeat_x = repeat_y = true;
+-			/* optimisation: only plot the colour if
+-			 * bitmap is not opaque */
+-			plot_colour = !content_get_opaque(background->background);
+-			break;
+-
+-		case CSS_BACKGROUND_REPEAT_REPEAT_X:
+-			repeat_x = true;
+-			break;
+-
+-		case CSS_BACKGROUND_REPEAT_REPEAT_Y:
+-			repeat_y = true;
+-			break;
+-
+-		case CSS_BACKGROUND_REPEAT_ROUND:
+-			/* scaled so a whole number of tiles fills the box
+-			 * (VitaSurf) */
+-			if (img_w > 0 && img_h > 0 && width > 0 &&
+-					height > 0) {
+-				int nx = (int) floorf((float) width / img_w +
+-						0.5f);
+-				int ny = (int) floorf((float) height / img_h +
++		/* handle background-repeat, each axis its own way
++		 * (VitaSurf) */
++		css_computed_background_repeat_axes(background->style,
++				&rep_x, &rep_y);
++		if ((rep_x == CSS_BACKGROUND_REPEAT_AXIS_ROUND ||
++				rep_y == CSS_BACKGROUND_REPEAT_AXIS_ROUND) &&
++				img_w > 0 && img_h > 0 && width > 0 &&
++				height > 0) {
++			/* scaled so a whole number of tiles fills the
++			 * box along a round axis; the other, if its size
++			 * is auto, follows to keep the picture's shape */
++			int ow = img_w, oh = img_h;
++
++			if (rep_x == CSS_BACKGROUND_REPEAT_AXIS_ROUND) {
++				int nx = (int) floorf((float) width / ow +
+ 						0.5f);
+ 
+ 				img_w = width / (nx < 1 ? 1 : nx);
+-				img_h = height / (ny < 1 ? 1 : ny);
+ 			}
+-			repeat_x = repeat_y = true;
+-			plot_colour = !content_get_opaque(background->background);
+-			break;
+-
+-		case CSS_BACKGROUND_REPEAT_SPACE:
+-			/* as many whole tiles as fit, the space shared
+-			 * between them; one alone is placed as positioned
+-			 * (VitaSurf) */
+-			space_x = img_w > 0 && width >= 2 * img_w;
+-			space_y = img_h > 0 && height >= 2 * img_h;
+-			break;
+-
+-		case CSS_BACKGROUND_REPEAT_NO_REPEAT:
+-			break;
++			if (rep_y == CSS_BACKGROUND_REPEAT_AXIS_ROUND) {
++				int ny = (int) floorf((float) height / oh +
++						0.5f);
+ 
+-		default:
+-			break;
+-		}
++				img_h = height / (ny < 1 ? 1 : ny);
++			} else if (html_background_size_auto(background,
++					false)) {
++				img_h = (int) ((float) oh * img_w / ow);
++			}
++			if (rep_x != CSS_BACKGROUND_REPEAT_AXIS_ROUND &&
++					html_background_size_auto(background,
++						true))
++				img_w = (int) ((float) ow * img_h / oh);
++		}
++		repeat_x = rep_x == CSS_BACKGROUND_REPEAT_AXIS_REPEAT ||
++				rep_x == CSS_BACKGROUND_REPEAT_AXIS_ROUND;
++		repeat_y = rep_y == CSS_BACKGROUND_REPEAT_AXIS_REPEAT ||
++				rep_y == CSS_BACKGROUND_REPEAT_AXIS_ROUND;
++		/* space: as many whole tiles as fit, the room shared
++		 * between them; one alone is placed as positioned */
++		space_x = rep_x == CSS_BACKGROUND_REPEAT_AXIS_SPACE &&
++				img_w > 0 && width >= 2 * img_w;
++		space_y = rep_y == CSS_BACKGROUND_REPEAT_AXIS_SPACE &&
++				img_h > 0 && height >= 2 * img_h;
++		/* optimisation: only plot the colour if bitmap is not
++		 * opaque */
++		if (repeat_x && repeat_y)
++			plot_colour = !content_get_opaque(
++					background->background);
+ 		area_x = x;
+ 		area_y = y;
+ 		area_w = width;
+@@ -1865,7 +1905,8 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 		if (plot_content && (space_x || space_y)) {
+ 			if (!html_redraw_background_spaced(background, &r,
+ 					x, y, area_x, area_y, area_w, area_h,
+-					img_w, img_h, space_x, space_y, scale,
++					img_w, img_h, space_x, space_y,
++					repeat_x, repeat_y, scale,
+ 					*background_colour, ctx))
+ 				return false;
+ 		} else if (plot_content) {
+@@ -1902,6 +1943,8 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 				bg_data.scale = scale;
+ 				bg_data.repeat_x = repeat_x;
+ 				bg_data.repeat_y = repeat_y;
++				bg_data.pixelated = html_pixelated(
++						background->style);
+ 				bg_data.mask = false;
+ 				bg_data.mask_colour = 0;
+ 
+@@ -2079,6 +2122,7 @@ static bool html_redraw_inline_background(int x, int y, struct box *box,
+ 			bg_data.scale = scale;
+ 			bg_data.repeat_x = repeat_x;
+ 			bg_data.repeat_y = repeat_y;
++			bg_data.pixelated = html_pixelated(box->style);
+ 
+ 			/* We just continue if redraw fails */
+ 			content_redraw(box->background, &bg_data, &r, ctx);
+@@ -2340,6 +2384,10 @@ static bool html_redraw_text_box_runs(const html_content *html,
+ 		float scale, colour current_background_color,
+ 		const struct redraw_context *ctx, bool excluded,
+ 		plot_font_style_t *fstyle_in);
++static bool html_redraw_emphasis(const html_content *html,
++		const struct box *box, const css_computed_style *style,
++		const plot_font_style_t *text_style, int x, int y,
++		float scale, const struct redraw_context *ctx);
+ 
+ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 		int x, int y, const struct rect *clip, float scale,
+@@ -2386,10 +2434,101 @@ static bool html_redraw_text_box(const html_content *html, struct box *box,
+ 			current_background_color, ctx, excluded, &fstyle);
+ 	text_redraw_rtl = false;
+ 	text_redraw_override = false;
++	if (ok && box_text_style(box) != NULL)
++		ok = html_redraw_emphasis(html, box, box_text_style(box),
++				&fstyle, x, y, scale, ctx);
+ 	return ok;
+ }
+ 
+ 
++/**
++ * text-emphasis (VitaSurf): a mark over or under each character but a
++ * space or a control, half the text's size, centred on the character,
++ * in text-emphasis-color.
++ */
++static bool html_redraw_emphasis(const html_content *html,
++		const struct box *box, const css_computed_style *style,
++		const plot_font_style_t *text_style, int x, int y,
++		float scale, const struct redraw_context *ctx)
++{
++	static const char *const marks[5][2] = {
++		{ "\xe2\x80\xa2", "\xe2\x97\xa6" },	/* dot */
++		{ "\xe2\x97\x8f", "\xe2\x97\x8b" },	/* circle */
++		{ "\xe2\x97\x89", "\xe2\x97\x8e" },	/* double-circle */
++		{ "\xe2\x96\xb2", "\xe2\x96\xb3" },	/* triangle */
++		{ "\xef\xb9\x85", "\xef\xb9\x86" },	/* sesame */
++	};
++	plot_font_style_t mstyle = *text_style;
++	lwc_string *str = NULL;
++	const char *mark;
++	size_t mark_len, i;
++	bool open = false, under;
++	uint8_t shape = 0, kind;
++	css_color colour = 0;
++	int mw = 0, mark_y, cx = 0;
++
++	kind = css_computed_text_emphasis_style(style, &str, &open, &shape);
++	if (kind == CSS_TEXT_EMPHASIS_STYLE_NONE || box->length == 0 ||
++			html->font_func == NULL)
++		return true;
++	if (kind == CSS_TEXT_EMPHASIS_STYLE_STRING) {
++		if (str == NULL || lwc_string_length(str) == 0)
++			return true;
++		mark = lwc_string_data(str);
++		/* its first character */
++		mark_len = utf8_next(mark, lwc_string_length(str), 0);
++	} else {
++		mark = marks[shape < 5 ? shape : 1][open ? 1 : 0];
++		mark_len = strlen(mark);
++	}
++
++	css_computed_text_emphasis_color(style, &colour);
++	if (nscss_color_is_transparent(colour))
++		return true;
++	mstyle.foreground = nscss_color_to_ns(colour);
++	mstyle.size = text_style->size / 2;
++	if (mstyle.size < 1)
++		mstyle.size = 1;
++	mstyle.flags &= ~FONTF_SMALLCAPS;
++	html->font_func->width(&mstyle, mark, mark_len, &mw);
++
++	under = css_computed_text_emphasis_position(style) >=
++			CSS_TEXT_EMPHASIS_POSITION_UNDER_RIGHT;
++	{
++		/* from the text's baseline, where text_redraw puts it, and
++		 * its size in px: over, the mark's baseline just above the
++		 * tallest glyphs; under, its top just below the descenders,
++		 * the mark's glyph rising 0.8 of its size */
++		float px = (float) text_style->size * 4 / 3 /
++				PLOT_STYLE_SCALE;
++		float base = box->height * 0.75f;
++
++		mark_y = y + (int) ((under ? base + 0.6f * px :
++				base - 0.8f * px) * scale);
++	}
++
++	for (i = 0; i < box->length; ) {
++		size_t next = utf8_next(box->text, box->length, i);
++		uint32_t ch = utf8_to_ucs4(box->text + i, next - i);
++		int cw = 0;
++
++		html->font_func->width(text_style, box->text + i, next - i,
++				&cw);
++		if (ch > 0x20 && ch != 0x7f && !(ch >= 0x80 && ch < 0xa0) &&
++				ch != 0xa0 && ch != 0x3000 &&
++				!(ch >= 0x2000 && ch <= 0x200a)) {
++			int mx = x + (int) ((cx + (cw - mw) / 2) * scale);
++
++			if (ctx->plot->text(ctx, &mstyle, mx, mark_y, mark,
++					mark_len) != NSERROR_OK)
++				return false;
++		}
++		cx += cw;
++		i = next;
++	}
++	return true;
++}
++
+ /** The text box's runs, drawn by html_redraw_text_box. */
+ static bool html_redraw_text_box_runs(const html_content *html,
+ 		struct box *box, int x, int y, const struct rect *clip,
+@@ -2429,6 +2568,13 @@ static bool html_redraw_text_box_runs(const html_content *html,
+ 			if (scol == 0x00000001) {
+ 				c = fstyle.foreground;
+ 				a = 0xff;
++			} else if (CSS_COLOR_IS_CURRENT_MIX(scol)) {
++				css_color cur = 0;
++
++				css_computed_color(box->style, &cur);
++				scol = css_color_resolve_current(scol, cur);
++				c = nscss_color_to_ns(scol) & 0x00ffffff;
++				a = scol >> 24;
+ 			} else {
+ 				c = nscss_color_to_ns(scol) & 0x00ffffff;
+ 				a = scol >> 24;
+@@ -2847,8 +2993,14 @@ static bool html_redraw_inset_shadow_one(const html_content *html,
+ 	if (type != CSS_BOX_SHADOW_INSET)
+ 		return true;
+ 
+-	if (colour == 0x00000001)
++	if (colour == 0x00000001) {
+ 		css_computed_color(box->style, &colour);
++	} else if (CSS_COLOR_IS_CURRENT_MIX(colour)) {
++		css_color cur = 0;
++
++		css_computed_color(box->style, &cur);
++		colour = css_color_resolve_current(colour, cur);
++	}
+ 	alpha = colour >> 24;
+ 	if (alpha == 0)
+ 		return true;
+@@ -2954,6 +3106,11 @@ static bool html_redraw_box_shadow_one(const html_content *html,
+ 	if (colour == 0x00000001) {
+ 		/* no colour written: the element's own */
+ 		css_computed_color(box->style, &colour);
++	} else if (CSS_COLOR_IS_CURRENT_MIX(colour)) {
++		css_color cur = 0;
++
++		css_computed_color(box->style, &cur);
++		colour = css_color_resolve_current(colour, cur);
+ 	}
+ 	alpha = colour >> 24;
+ 	if (alpha == 0) {
+@@ -5901,43 +6058,73 @@ static bool html_redraw_bg_image(struct box *background,
+ 	return html_plot_made(ctx, back, r->x0, r->y0);
+ }
+ 
++/** One axis of a spaced background: where its first tile is, how far
++ * apart they are and how many. */
++struct html_bg_axis {
++	float first, step;
++	int n;
++};
++
++static void html_bg_axis(struct html_bg_axis *a, bool spaced, bool repeat,
++		int pos, int area, int size, int c0, int c1, float scale)
++{
++	if (spaced) {
++		/* the first and the last at the edges, the rest of the
++		 * room shared between them */
++		int n = area / size;
++		float gap = n > 1 ? (float) (area - n * size) / (n - 1) : 0;
++
++		a->first = pos;
++		a->step = (size + gap) * scale;
++		a->n = n;
++	} else if (repeat) {
++		/* tiled from where background-position put one, back to
++		 * the clip's start and on to its end */
++		float step = size * scale;
++		float first = pos - ceilf((pos - c0) / step) * step;
++
++		a->first = first;
++		a->step = step;
++		a->n = (int) ceilf((c1 - first) / step);
++	} else {
++		a->first = pos;
++		a->step = 0;
++		a->n = 1;
++	}
++}
++
+ /**
+- * background-repeat: space (VitaSurf): as many whole tiles as fit along
+- * a spaced axis, the first and the last at its edges and the rest of
+- * the room shared between them; along an axis that is not, the one
+- * tile where background-position put it.
++ * background-repeat: space along one axis or both (VitaSurf): as many
++ * whole tiles as fit along a spaced axis, the first and the last at
++ * its edges and the rest of the room shared between them; along one
++ * that is not, tiles across the clip if it repeats, else the one tile
++ * where background-position put it.
+  */
+ static bool html_redraw_background_spaced(struct box *background,
+ 		const struct rect *r, int x, int y, int ax, int ay, int aw,
+-		int ah, int iw, int ih, bool sx, bool sy, float scale,
+-		colour bg, const struct redraw_context *ctx)
++		int ah, int iw, int ih, bool sx, bool sy, bool rx, bool ry,
++		float scale, colour bg, const struct redraw_context *ctx)
+ {
+-	int nx = 1, ny = 1, i, j;
+-	float gx = 0, gy = 0;
++	struct html_bg_axis hx, hy;
++	int i, j;
+ 
+ 	if (iw <= 0 || ih <= 0)
+ 		return true;
+-	if (sx) {
+-		nx = aw / iw;
+-		gx = nx > 1 ? (float) (aw - nx * iw) / (nx - 1) : 0;
+-	}
+-	if (sy) {
+-		ny = ah / ih;
+-		gy = ny > 1 ? (float) (ah - ny * ih) / (ny - 1) : 0;
+-	}
+-	if (nx < 1 || ny < 1 || nx * ny > 4096)
++	html_bg_axis(&hx, sx, rx, sx ? ax : x, aw, iw, r->x0, r->x1, scale);
++	html_bg_axis(&hy, sy, ry, sy ? ay : y, ah, ih, r->y0, r->y1, scale);
++	if (hx.n < 1 || hy.n < 1 || hx.n * hy.n > 4096)
+ 		return true;
+ 	if (ctx->plot->clip(ctx, r) != NSERROR_OK)
+ 		return false;
+-	for (j = 0; j < ny; j++) {
+-		int ty = sy ? ay + (int) ((j * (ih + gy)) * scale) : y;
++	for (j = 0; j < hy.n; j++) {
++		int ty = (int) (hy.first + j * hy.step);
+ 
+ 		if (ty >= r->y1 || ty + ih * scale <= r->y0)
+ 			continue;
+-		for (i = 0; i < nx; i++) {
++		for (i = 0; i < hx.n; i++) {
+ 			struct content_redraw_data d = { 0 };
+ 			struct rect tr;
+-			int tx = sx ? ax + (int) ((i * (iw + gx)) * scale) : x;
++			int tx = (int) (hx.first + i * hx.step);
+ 
+ 			if (tx >= r->x1 || tx + iw * scale <= r->x0)
+ 				continue;
+@@ -5946,6 +6133,7 @@ static bool html_redraw_background_spaced(struct box *background,
+ 			d.width = ceilf(iw * scale);
+ 			d.height = ceilf(ih * scale);
+ 			d.background_colour = bg;
++			d.pixelated = html_pixelated(background->style);
+ 			d.scale = scale;
+ 			tr.x0 = tx < r->x0 ? r->x0 : tx;
+ 			tr.y0 = ty < r->y0 ? r->y0 : ty;
+@@ -8138,6 +8326,7 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 		obj_data.scale = scale;
+ 		obj_data.repeat_x = false;
+ 		obj_data.repeat_y = false;
++		obj_data.pixelated = html_pixelated(box->style);
+ 
+ 		if (content_get_type(box->object) == CONTENT_HTML) {
+ 			obj_data.x /= scale;
+diff --git a/content/handlers/image/image.c b/content/handlers/image/image.c
+index 38354a2b7..475d51866 100644
+--- a/content/handlers/image/image.c
++++ b/content/handlers/image/image.c
+@@ -231,6 +231,8 @@ bool image_bitmap_plot(struct bitmap *bitmap,
+ 		flags |= BITMAPF_REPEAT_X;
+ 	if (data->repeat_y)
+ 		flags |= BITMAPF_REPEAT_Y;
++	if (data->pixelated)
++		flags |= BITMAPF_PIXELATED;
+ 
+ 	return (ctx->plot->bitmap(ctx,
+ 				  bitmap,
+diff --git a/desktop/browser_private.h b/desktop/browser_private.h
+index 5f492d28b..79c28008d 100644
+--- a/desktop/browser_private.h
++++ b/desktop/browser_private.h
+@@ -293,6 +293,10 @@ struct browser_window {
+ 		bool read_only;
+ 	} selection;
+ 	bool can_edit;
++	/** caret-color of the field the caret is in, when caret_coloured
++	 *  (VitaSurf) */
++	colour caret_colour;
++	bool caret_coloured;
+ 
+ 	/** current javascript context */
+ 	struct jsheap *jsheap;
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 976bbbcd3..04ecb9587 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -1913,6 +1913,14 @@ browser_window_callback(hlcache_handle *c, const hlcache_event *event, void *pw)
+ 			browser_window_remove_caret(bw, true);
+ 			break;
+ 		case CONTENT_CARET_SET_POS:
++		{
++			struct browser_window *root =
++					browser_window_get_root(bw);
++
++			root->caret_colour = event->data.caret.pos.colour;
++			root->caret_coloured =
++					event->data.caret.pos.has_colour;
++		}
+ 			browser_window_place_caret(bw,
+ 						   event->data.caret.pos.x,
+ 						   event->data.caret.pos.y,
+@@ -4446,6 +4454,16 @@ struct history * browser_window_get_history(struct browser_window *bw)
+ }
+ 
+ 
++/* Exported interface, documented in netsurf/browser_window.h */
++bool browser_window_caret_colour(struct browser_window *bw, colour *c)
++{
++	if (bw == NULL || !bw->caret_coloured)
++		return false;
++	*c = bw->caret_colour;
++	return true;
++}
++
++
+ /* Exported interface, documented in netsurf/browser_window.h */
+ bool browser_window_has_content(struct browser_window *bw)
+ {
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index c63beb123..2780c8793 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -131,6 +131,10 @@ typedef struct fb_faceid_s {
+ 	 * without this every space in a paragraph went looking.
+ 	 */
+ 	uint8_t liga_start_char[128 / 8];
++	/* font-size-adjust's metrics over the em, as they are read
++	 * (VitaSurf): a bit in aspect_known for each */
++	float aspect[5];
++	uint8_t aspect_known;
+ 	/*
+ 	 * A variable font (VitaSurf): whether the face has a weight axis,
+ 	 * and the weight this one is set to, or 0 for the font's own
+@@ -1627,6 +1631,76 @@ static int fb_digit_width(const plot_font_style_t *fstyle,
+ 	return w;
+ }
+ 
++/**
++ * A glyph's height above the baseline or its advance, in font units
++ * (VitaSurf), for a metric the font's tables do not give.
++ */
++static int fb_glyph_units(FT_Face face, uint32_t ucs4, bool advance)
++{
++	FT_UInt g = FT_Get_Char_Index(face, ucs4);
++
++	if (g == 0 || FT_Load_Glyph(face, g, FT_LOAD_NO_SCALE) != 0)
++		return 0;
++	return (int) (advance ? face->glyph->metrics.horiAdvance :
++			face->glyph->metrics.horiBearingY);
++}
++
++/**
++ * One of font-size-adjust's metrics over the em (VitaSurf): the x
++ * height and cap height from the OS/2 table, or else measured from
++ * "x" and "H"; the advance of "0"; and the advance and height of the
++ * water ideograph, else the em.
++ */
++static nserror fb_font_aspect(const plot_font_style_t *fstyle, int metric,
++		float *aspect)
++{
++	FTC_ScalerRec srec;
++	fb_faceid_t *fb_face;
++	FT_Face face;
++	TT_OS2 *os2;
++	int units = 0;
++
++	if (metric < 0 || metric > 4)
++		return NSERROR_BAD_PARAMETER;
++	fb_fill_scalar(fstyle, &srec);
++	fb_face = (fb_faceid_t *) srec.face_id;
++	if (fb_face->aspect_known & (1 << metric)) {
++		*aspect = fb_face->aspect[metric];
++		return *aspect > 0 ? NSERROR_OK : NSERROR_NOT_FOUND;
++	}
++	if (FTC_Manager_LookupFace(ft_cmanager, srec.face_id, &face) != 0 ||
++			face->units_per_EM == 0)
++		return NSERROR_NOT_FOUND;
++	os2 = (TT_OS2 *) FT_Get_Sfnt_Table(face, FT_SFNT_OS2);
++	switch (metric) {
++	case 0:
++		if (os2 != NULL && os2->version >= 2 && os2->sxHeight > 0)
++			units = os2->sxHeight;
++		else
++			units = fb_glyph_units(face, 'x', false);
++		break;
++	case 1:
++		if (os2 != NULL && os2->version >= 2 && os2->sCapHeight > 0)
++			units = os2->sCapHeight;
++		else
++			units = fb_glyph_units(face, 'H', false);
++		break;
++	case 2:
++		units = fb_glyph_units(face, '0', true);
++		break;
++	default:
++		units = fb_glyph_units(face, 0x6c34, metric == 3);
++		if (units <= 0)
++			units = face->units_per_EM;
++		break;
++	}
++	fb_face->aspect[metric] = units > 0 ?
++			(float) units / face->units_per_EM : 0;
++	fb_face->aspect_known |= (uint8_t) (1 << metric);
++	*aspect = fb_face->aspect[metric];
++	return *aspect > 0 ? NSERROR_OK : NSERROR_NOT_FOUND;
++}
++
+ /* exported interface documented in framebuffer/font_freetype.h */
+ int fb_font_digit_width(const plot_font_style_t *fstyle)
+ {
+@@ -1867,6 +1941,7 @@ static struct gui_layout_table layout_table = {
+ 	.position = fb_font_position,
+ 	.split = fb_font_split,
+ 	.add_face = fb_font_add_face,
++	.aspect = fb_font_aspect,
+ };
+ 
+ struct gui_layout_table *framebuffer_layout_table = &layout_table;
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index ff0c5ba25..f4619d65c 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -42,6 +42,7 @@
+ #include "framebuffer/framebuffer.h"
+ #include "framebuffer/font.h"
+ #include "framebuffer/bitmap.h"
++#include "framebuffer/scale_smooth.h"
+ 
+ /* netsurf framebuffer library handle */
+ static nsfb_t *nsfb;
+@@ -1011,11 +1012,13 @@ framebuffer_plot_path(const struct redraw_context *ctx,
+  * Scaled copies of bitmaps (VitaSurf). A scaled plot stepped through the
+  * source for every pixel of every redraw, and a page of posters shown
+  * smaller than they were decoded spent up to 290 ms of each second of
+- * scrolling Yamtrack doing it again. The copy is made with the same
+- * nearest-pixel stepping libnsfb uses, so plotting it unscaled gives the
+- * pixels the scaled plot gave, clipped or not. Entries go least recently
+- * used first, within a bound, and a bitmap's go when it is modified or
+- * destroyed.
++ * scrolling Yamtrack doing it again. The copy is smooth, as browsers
++ * draw an image whose image-rendering is auto: bilinear where it grows,
++ * and up to four samples of its footprint each way, averaged with their
++ * alpha, where it shrinks (scale_smooth). Pixelated and crisp-edges ask
++ * for the nearest-pixel stepping libnsfb uses, which a plot too large
++ * to copy still gets. Entries go least recently used first, within a
++ * bound, and a bitmap's go when it is modified or destroyed.
+  */
+ #define SCALED_SLOTS 64
+ #define SCALED_MAX_BYTES (6 * 1024 * 1024)
+@@ -1024,6 +1027,7 @@ framebuffer_plot_path(const struct redraw_context *ctx,
+ static struct fb_scaled {
+ 	nsfb_t *src;
+ 	int w, h;
++	bool smooth;
+ 	nsfb_t *copy;
+ 	size_t bytes;
+ 	unsigned int used;
+@@ -1050,7 +1054,7 @@ void framebuffer_scaled_forget(nsfb_t *src)
+ 	}
+ }
+ 
+-static nsfb_t *scaled_copy(nsfb_t *bm, int w, int h)
++static nsfb_t *scaled_copy(nsfb_t *bm, int w, int h, bool smooth)
+ {
+ 	struct fb_scaled *e, *free_slot;
+ 	enum nsfb_format_e fmt;
+@@ -1070,7 +1074,8 @@ static nsfb_t *scaled_copy(nsfb_t *bm, int w, int h)
+ 	}
+ 	for (i = 0; i < SCALED_SLOTS; i++) {
+ 		e = &fb_scaled[i];
+-		if (e->src == bm && e->w == w && e->h == h) {
++		if (e->src == bm && e->w == w && e->h == h &&
++		    e->smooth == smooth) {
+ 			e->used = ++fb_scaled_clock;
+ 			fb_scaled_hits++;
+ 			return e->copy;
+@@ -1109,6 +1114,11 @@ static nsfb_t *scaled_copy(nsfb_t *bm, int w, int h)
+ 	}
+ 	nsfb_get_buffer(bm, &bptr, &bstride);
+ 	nsfb_get_buffer(copy, &dptr, &dstride);
++	if (smooth && !scale_smooth(bptr, bw, bh, bstride, dptr, w, h,
++			dstride, fmt == NSFB_FMT_ABGR8888)) {
++		nsfb_free(copy);
++		return NULL;
++	}
+ 	/* libnsfb's bitmap_scaled stepping, over the whole target */
+ 	dx = bw / w;
+ 	dxr = bw % w;
+@@ -1116,7 +1126,7 @@ static nsfb_t *scaled_copy(nsfb_t *bm, int w, int h)
+ 	dyr = bh % h;
+ 	row = 0;
+ 	ry = 0;
+-	for (y = 0; y < h; y++) {
++	for (y = 0; y < (smooth ? 0 : h); y++) {
+ 		const uint32_t *sp = (const uint32_t *)(void *)
+ 			(bptr + (size_t)row * (size_t)bstride);
+ 		uint32_t *dp = (uint32_t *)(void *)
+@@ -1142,6 +1152,7 @@ static nsfb_t *scaled_copy(nsfb_t *bm, int w, int h)
+ 	free_slot->src = bm;
+ 	free_slot->w = w;
+ 	free_slot->h = h;
++	free_slot->smooth = smooth;
+ 	free_slot->copy = copy;
+ 	free_slot->bytes = bytes;
+ 	free_slot->used = ++fb_scaled_clock;
+@@ -1181,7 +1192,8 @@ framebuffer_plot_bitmap(const struct redraw_context *ctx,
+ 		 * once where the size differs (VitaSurf) */
+ 		nsfb_get_geometry(bm, &bmwidth, &bmheight, &bmformat);
+ 		if (width != bmwidth || height != bmheight) {
+-			nsfb_t *scaled = scaled_copy(bm, width, height);
++			nsfb_t *scaled = scaled_copy(bm, width, height,
++					(flags & BITMAPF_PIXELATED) == 0);
+ 
+ 			if (scaled != NULL) {
+ 				bm = scaled;
+diff --git a/frontends/framebuffer/gui.c b/frontends/framebuffer/gui.c
+index d7d2e5722..8b125a468 100644
+--- a/frontends/framebuffer/gui.c
++++ b/frontends/framebuffer/gui.c
+@@ -863,6 +863,17 @@ fb_redraw(fbtk_widget_t *widget,
+ 		pen.stroke_type = NFSB_PLOT_OPTYPE_SOLID;
+ 		pen.stroke_width = 1;
+ 		pen.stroke_colour = 0xFF0000FF;
++		{
++			/* the field's caret-color (VitaSurf); NetSurf's
++			 * colour keeps 255 less the alpha where libnsfb
++			 * keeps the alpha */
++			colour cc;
++
++			if (browser_window_caret_colour(bwidget->bw, &cc) &&
++					((~cc) & 0xff000000) != 0)
++				pen.stroke_colour = (cc & 0x00ffffff) |
++						((~cc) & 0xff000000);
++		}
+ 
+ #ifdef __vita__
+ 		/* within the piece aimed at */
+diff --git a/frontends/framebuffer/scale_smooth.h b/frontends/framebuffer/scale_smooth.h
+new file mode 100644
+index 000000000..290d48336
+--- /dev/null
++++ b/frontends/framebuffer/scale_smooth.h
+@@ -0,0 +1,153 @@
++/*
++ * Copyright 2026 VitaSurf contributors
++ *
++ * This file is part of NetSurf, http://www.netsurf-browser.org/
++ *
++ * NetSurf is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; version 2 of the License.
++ *
++ * NetSurf is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/**
++ * \file
++ * A bitmap scaled smooth (VitaSurf), for image-rendering: auto. Kept
++ * apart from the plotters so tests/images/scale-test.c can hold it to
++ * its sums natively.
++ */
++
++#ifndef NETSURF_FB_SCALE_SMOOTH_H
++#define NETSURF_FB_SCALE_SMOOTH_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++
++/** One output pixel's source pixels along an axis, and their weights
++ * in 256ths. */
++struct scale_taps {
++	int at[4];
++	uint16_t weight[4];
++	int n;
++};
++
++static void scale_axis(struct scale_taps *t, int i, int dst, int src)
++{
++	if (src > dst) {
++		/* shrinking: samples spread over the footprint */
++		int n = (src + dst - 1) / dst, k;
++
++		if (n > 4)
++			n = 4;
++		t->n = n;
++		for (k = 0; k < n; k++) {
++			int64_t num = (int64_t) (2 * i * n + 2 * k + 1) * src;
++			int at = (int) (num / (2 * (int64_t) dst * n));
++
++			t->at[k] = at < src ? at : src - 1;
++			t->weight[k] = (uint16_t) (256 / n +
++					(k < 256 % n ? 1 : 0));
++		}
++	} else {
++		/* growing: the two nearest, by distance */
++		int64_t c = ((int64_t) (2 * i + 1) * src * 256) /
++				(2 * (int64_t) dst) - 128;
++		int at, f;
++
++		if (c < 0)
++			c = 0;
++		at = (int) (c >> 8);
++		f = (int) (c & 255);
++		if (at >= src - 1) {
++			at = src - 1;
++			f = 0;
++		}
++		t->at[0] = at;
++		t->weight[0] = (uint16_t) (256 - f);
++		t->at[1] = at + 1 < src ? at + 1 : at;
++		t->weight[1] = (uint16_t) f;
++		t->n = f ? 2 : 1;
++		if (f == 0)
++			t->weight[0] = 256;
++	}
++}
++
++/**
++ * A bitmap drawn smooth at w by h (VitaSurf). With alpha the colours
++ * are averaged by it, so a transparent pixel's colour does not bleed
++ * into the edge of what is next to it.
++ */
++static bool scale_smooth(const uint8_t *bptr, int bw, int bh, int bstride,
++		uint8_t *dptr, int w, int h, int dstride, bool alpha)
++{
++	struct scale_taps *xt = malloc(sizeof(*xt) * (size_t) w);
++	struct scale_taps yt;
++	int x, y;
++
++	if (xt == NULL)
++		return false;
++	for (x = 0; x < w; x++)
++		scale_axis(&xt[x], x, w, bw);
++	for (y = 0; y < h; y++) {
++		uint32_t *dp = (uint32_t *)(void *)
++			(dptr + (size_t) y * (size_t) dstride);
++
++		scale_axis(&yt, y, h, bh);
++		for (x = 0; x < w; x++) {
++			const struct scale_taps *t = &xt[x];
++			uint32_t sa = 0, sr = 0, sg = 0, sb = 0;
++			int j, k;
++
++			for (j = 0; j < yt.n; j++) {
++				const uint32_t *sp = (const uint32_t *)(const
++					void *) (bptr + (size_t) yt.at[j] *
++						(size_t) bstride);
++
++				for (k = 0; k < t->n; k++) {
++					uint32_t p = sp[t->at[k]];
++					uint32_t wt = (uint32_t) yt.weight[j] *
++							t->weight[k];
++					uint32_t a = alpha ? p >> 24 : 255;
++
++					/* premultiplied to 8 bits, so the
++					 * sums stay within 32 */
++					sa += a * wt;
++					sr += ((p & 0xff) * a / 255) * wt;
++					sg += (((p >> 8) & 0xff) * a / 255) *
++							wt;
++					sb += (((p >> 16) & 0xff) * a / 255) *
++							wt;
++				}
++			}
++			if (sa == 0) {
++				dp[x] = 0;
++			} else {
++				uint32_t r = (uint32_t) (((uint64_t) sr * 255 +
++						sa / 2) / sa);
++				uint32_t g = (uint32_t) (((uint64_t) sg * 255 +
++						sa / 2) / sa);
++				uint32_t b = (uint32_t) (((uint64_t) sb * 255 +
++						sa / 2) / sa);
++				uint32_t a = (sa + 32768) >> 16;
++
++				if (r > 255) r = 255;
++				if (g > 255) g = 255;
++				if (b > 255) b = 255;
++				if (a > 255) a = 255;
++				dp[x] = r | (g << 8) | (b << 16) |
++						((alpha ? a : 255u) << 24);
++			}
++		}
++	}
++	free(xt);
++	return true;
++}
++
++#endif
+diff --git a/frontends/monkey/layout.c b/frontends/monkey/layout.c
+index 0d6a3b4dc..8c8db9161 100644
+--- a/frontends/monkey/layout.c
++++ b/frontends/monkey/layout.c
+@@ -108,10 +108,27 @@ static nserror nsfont_split(const plot_font_style_t *fstyle,
+ 	return NSERROR_OK;
+ }
+ 
++/**
++ * The monkey's one font's metrics over its em (VitaSurf): every
++ * character an em wide, its x height half of it and its capitals 0.7.
++ */
++static nserror nsfont_aspect(const plot_font_style_t *fstyle, int metric,
++			     float *aspect)
++{
++	static const float aspects[] = { 0.5f, 0.7f, 1.0f, 1.0f, 1.0f };
++
++	(void) fstyle;
++	if (metric < 0 || metric > 4)
++		return NSERROR_BAD_PARAMETER;
++	*aspect = aspects[metric];
++	return NSERROR_OK;
++}
++
+ static struct gui_layout_table layout_table = {
+ 	.width = nsfont_width,
+ 	.position = nsfont_position_in_string,
+ 	.split = nsfont_split,
++	.aspect = nsfont_aspect,
+ };
+ 
+ struct gui_layout_table *monkey_layout_table = &layout_table;
+diff --git a/include/netsurf/browser_window.h b/include/netsurf/browser_window.h
+index c579470c7..ebb082aa0 100644
+--- a/include/netsurf/browser_window.h
++++ b/include/netsurf/browser_window.h
+@@ -31,6 +31,7 @@
+ #include "utils/errors.h"
+ #include "netsurf/mouse.h"
+ #include "netsurf/console.h"
++#include "netsurf/types.h"
+ 
+ struct browser_window;
+ struct hlcache_handle;
+@@ -313,6 +314,15 @@ nserror browser_window_get_extents(struct browser_window *bw, bool scaled,
+  */
+ bool browser_window_has_content(struct browser_window *bw);
+ 
++/**
++ * The caret-color of the field the caret is in (VitaSurf).
++ *
++ * \param bw	  the top level browser window
++ * \param c	  updated to the colour, a NetSurf colour
++ * \return true if the field gave one, false to draw the frontend's own.
++ */
++bool browser_window_caret_colour(struct browser_window *bw, colour *c);
++
+ /**
+  * Get a cache handle for the content within a browser window.
+  */
+diff --git a/include/netsurf/content.h b/include/netsurf/content.h
+index 413997f2e..621262c4d 100644
+--- a/include/netsurf/content.h
++++ b/include/netsurf/content.h
+@@ -68,6 +68,9 @@ struct content_redraw_data {
+ 	bool repeat_x; /**< whether content is tiled in x direction */
+ 	bool repeat_y; /**< whether content is tiled in y direction */
+ 
++	/** image-rendering asks for nearest-pixel scaling (VitaSurf) */
++	bool pixelated;
++
+ 	/**
+ 	 * Draw the content as a CSS mask: every opaque part is painted in
+ 	 * mask_colour and its own colours are ignored (VitaSurf).
+diff --git a/include/netsurf/layout.h b/include/netsurf/layout.h
+index cc6429d20..ae3842665 100644
+--- a/include/netsurf/layout.h
++++ b/include/netsurf/layout.h
+@@ -103,6 +103,20 @@ struct gui_layout_table
+ 	 */
+ 	nserror (*add_face)(const char *family, int weight, bool italic,
+ 			uint8_t *data, size_t len);
++
++	/**
++	 * One of a font's metrics over its em (VitaSurf), for
++	 * font-size-adjust. Optional.
++	 *
++	 * \param[in] fstyle  the style whose font is asked about
++	 * \param[in] metric  a css_font_metric_e: the x height, cap
++	 *                    height, the advance of "0", or an
++	 *                    ideograph's advance or height
++	 * \param[out] aspect the metric over the em
++	 * \return NSERROR_OK if the font says.
++	 */
++	nserror (*aspect)(const struct plot_font_style *fstyle, int metric,
++			float *aspect);
+ };
+ 
+ #endif
+diff --git a/include/netsurf/plotters.h b/include/netsurf/plotters.h
+index b481d468a..b9a59061f 100644
+--- a/include/netsurf/plotters.h
++++ b/include/netsurf/plotters.h
+@@ -37,6 +37,9 @@ typedef unsigned long bitmap_flags_t;
+ #define BITMAPF_NONE 0
+ #define BITMAPF_REPEAT_X 1
+ #define BITMAPF_REPEAT_Y 2
++/** image-rendering: pixelated or crisp-edges, scaled by nearest pixel
++ *  where a frontend would scale smooth (VitaSurf) */
++#define BITMAPF_PIXELATED 4
+ 
+ enum path_command {
+ 	PLOTTER_PATH_MOVE,

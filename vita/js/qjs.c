@@ -14192,8 +14192,6 @@ static const char *const sm_justify_content[] = { NULL, "flex-start",
 static const char *const sm_align_items[] = { NULL, "stretch",
 	"flex-start", "flex-end", "center", "baseline", "auto",
 	"anchor-center" };
-static const char *const sm_background_repeat[] = { NULL, "repeat-x",
-	"repeat-y", "repeat", "no-repeat", "space", "round" };
 static const char *const sm_background_box[] = { NULL, "padding-box",
 	"border-box", "content-box" };
 static const char *const sm_background_clip[] = { NULL, "border-box",
@@ -14922,6 +14920,24 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			css_computed_word_spacing, CSS_WORD_SPACING_SET, "0px");
 	sm_len_prop(ctx, obj, "textIndent", s, uctx, css_computed_text_indent,
 			CSS_TEXT_INDENT_SET, "0px");
+	{
+		/* its hanging and each-line, after the length */
+		uint8_t mode = css_computed_text_indent_mode(s);
+
+		if (mode != 0) {
+			JSValue ti = JS_GetPropertyStr(ctx, obj, "textIndent");
+			const char *t = JS_ToCString(ctx, ti);
+
+			snprintf(buf, sizeof(buf), "%s%s%s", t ? t : "0px",
+					(mode & CSS_TEXT_INDENT_HANGING) ?
+					" hanging" : "",
+					(mode & CSS_TEXT_INDENT_EACH_LINE) ?
+					" each-line" : "");
+			JS_FreeCString(ctx, t);
+			JS_FreeValue(ctx, ti);
+			sm_set(ctx, obj, "textIndent", buf);
+		}
+	}
 	t = css_computed_vertical_align(s, &v, &u);
 	if (t == CSS_VERTICAL_ALIGN_SET) {
 		sm_length(buf, sizeof(buf), s, uctx, v, u);
@@ -14957,8 +14973,27 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			css_computed_list_style_type(s));
 
 	/* the box's paint */
-	SM_ENUM("backgroundRepeat", sm_background_repeat,
-			css_computed_background_repeat(s));
+	{
+		/* one word when the axes say it in one, as Chrome writes
+		 * it: repeat-x, repeat-y, or both the same */
+		static const char *const axis[] = { "repeat", "no-repeat",
+			"space", "round" };
+		uint8_t rx = 0, ry = 0;
+
+		css_computed_background_repeat_axes(s, &rx, &ry);
+		if (rx > 3 || ry > 3)
+			rx = ry = 0;
+		if (rx == ry)
+			snprintf(buf, sizeof(buf), "%s", axis[rx]);
+		else if (rx == 0 && ry == 1)
+			snprintf(buf, sizeof(buf), "repeat-x");
+		else if (rx == 1 && ry == 0)
+			snprintf(buf, sizeof(buf), "repeat-y");
+		else
+			snprintf(buf, sizeof(buf), "%s %s", axis[rx],
+					axis[ry]);
+		sm_set(ctx, obj, "backgroundRepeat", buf);
+	}
 	SM_ENUM("backgroundOrigin", sm_background_box,
 			css_computed_background_origin(s));
 	SM_ENUM("backgroundClip", sm_background_clip,
@@ -14971,6 +15006,120 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	css_computed_caret_color(s, &c);
 	sm_colour(buf, sizeof(buf), c);
 	sm_set(ctx, obj, "caretColor", buf);
+	{
+		/* the last of what the census found dropped */
+		static const char *const metric[] = { "ex-height",
+			"cap-height", "ch-width", "ic-width", "ic-height" };
+		static const char *const mark[] = { "dot", "circle",
+			"double-circle", "triangle", "sesame" };
+		static const char *const position[] = { "over", "over",
+			"over left", "under", "under left" };
+		static const char *const rendering[] = { "auto", "auto",
+			"smooth", "high-quality", "pixelated",
+			"crisp-edges" };
+		lwc_string *str = NULL;
+		uint8_t features = 0, m = 0;
+		bool flag = false;
+		css_fixed n = 0, n2 = 0;
+		css_unit un = CSS_UNIT_PX;
+		uint8_t k;
+
+		if (css_computed_font_feature_settings(s, &features, &str) ==
+				CSS_FONT_FEATURE_SETTINGS_SET && str != NULL)
+			snprintf(buf, sizeof(buf), "%.*s",
+					(int) lwc_string_length(str),
+					lwc_string_data(str));
+		else
+			snprintf(buf, sizeof(buf), "normal");
+		sm_set(ctx, obj, "fontFeatureSettings", buf);
+
+		if (css_computed_font_size_adjust(s, &n, &m, &flag) ==
+				CSS_FONT_SIZE_ADJUST_SET && m < 5) {
+			char num[32];
+
+			if (flag)
+				snprintf(num, sizeof(num), "from-font");
+			else
+				sm_number(num, sizeof(num), n);
+			snprintf(buf, sizeof(buf), "%s%s%s",
+					m ? metric[m] : "", m ? " " : "", num);
+		} else {
+			snprintf(buf, sizeof(buf), "none");
+		}
+		sm_set(ctx, obj, "fontSizeAdjust", buf);
+
+		str = NULL;
+		k = css_computed_text_emphasis_style(s, &str, &flag, &m);
+		if (k == CSS_TEXT_EMPHASIS_STYLE_STRING && str != NULL)
+			snprintf(buf, sizeof(buf), "\"%.*s\"",
+					(int) lwc_string_length(str),
+					lwc_string_data(str));
+		else if (k == CSS_TEXT_EMPHASIS_STYLE_MARK && m < 5)
+			snprintf(buf, sizeof(buf), "%s %s",
+					flag ? "open" : "filled", mark[m]);
+		else
+			snprintf(buf, sizeof(buf), "none");
+		sm_set(ctx, obj, "textEmphasisStyle", buf);
+		c = 0;
+		css_computed_text_emphasis_color(s, &c);
+		sm_colour(buf, sizeof(buf), c);
+		sm_set(ctx, obj, "textEmphasisColor", buf);
+		k = css_computed_text_emphasis_position(s);
+		sm_set(ctx, obj, "textEmphasisPosition",
+				position[k < 5 ? k : 0]);
+
+		k = css_computed_image_rendering(s);
+		sm_set(ctx, obj, "imageRendering", rendering[k < 6 ? k : 0]);
+
+		str = NULL;
+		if (css_computed_shape_outside(s, &str) ==
+				CSS_SHAPE_OUTSIDE_SET && str != NULL) {
+			const char *d = lwc_string_data(str);
+			size_t l = lwc_string_length(str), bar = 0;
+
+			while (bar < l && d[bar] != '|')
+				bar++;
+			if (strncmp(d, "image|", 6) == 0)
+				snprintf(buf, sizeof(buf), "none");
+			else if (bar == 0)
+				snprintf(buf, sizeof(buf), "%.*s",
+						(int) (l - 1), d + 1);
+			else if (bar + 1 >= l)
+				snprintf(buf, sizeof(buf), "%.*s",
+						(int) bar, d);
+			else
+				snprintf(buf, sizeof(buf), "%.*s %.*s",
+						(int) bar, d,
+						(int) (l - bar - 1),
+						d + bar + 1);
+		} else {
+			snprintf(buf, sizeof(buf), "none");
+		}
+		sm_set(ctx, obj, "shapeOutside", buf);
+		n = 0;
+		un = CSS_UNIT_PX;
+		css_computed_shape_margin(s, &n, &un);
+		sm_length(buf, sizeof(buf), s, uctx, n, un);
+		sm_set(ctx, obj, "shapeMargin", buf);
+
+		if (css_computed_initial_letter(s, &n, &n2) ==
+				CSS_INITIAL_LETTER_SET) {
+			char num[32];
+
+			sm_number(num, sizeof(num), n);
+			if (FIXTOINT(n2) == (FIXTOINT(n) < 1 ? 1 :
+					FIXTOINT(n)))
+				snprintf(buf, sizeof(buf), "%s", num);
+			else if (FIXTOINT(n2) == 1)
+				snprintf(buf, sizeof(buf), "%s raise", num);
+			else
+				snprintf(buf, sizeof(buf), "%s %d", num,
+						(int) FIXTOINT(n2));
+		} else {
+			snprintf(buf, sizeof(buf), "normal");
+		}
+		sm_set(ctx, obj, "initialLetter", buf);
+	}
 	c = 0;
 	if (css_computed_background_color(s, &c) ==
 			CSS_BACKGROUND_COLOR_COLOR) {

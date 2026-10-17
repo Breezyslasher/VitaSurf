@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!--
+  initial-letter (VitaSurf): a ::first-letter with initial-letter: 3 is
+  floated and sized to span three lines, so the first three lines of
+  the paragraph start after it and the fourth starts at the left; with
+  "3 2" it sinks two lines and the third line starts at the left; with
+  "2 raise" it sinks one. Each line must say PASS. Look too: the
+  letter's capital reaches from the top of the first line's capitals
+  to the last line's baseline.
+-->
+<html><head><meta charset="utf-8"><title>initial-letter</title>
+<style>
+p { width: 300px; font: 16px/20px monospace; margin: 0 0 20px; }
+#a::first-letter { initial-letter: 3; }
+#b::first-letter { initial-letter: 3 2; }
+#c::first-letter { initial-letter: 2 raise; }
+b { display: inline-block; width: 4px; height: 20px; vertical-align: top; }
+</style></head>
+<body>
+<p id="a">Xa<br><b></b>b<br><b></b>c<br><b></b>d</p>
+<p id="b">Xa<br><b></b>b<br><b></b>c</p>
+<p id="c">Xa<br><b></b>b</p>
+<p id="d">Xa<br><b></b>b</p>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('initial-letter: ' + l); }
+function m(id, n) { var p = document.getElementById(id); return p.getElementsByTagName('b')[n].getBoundingClientRect().left - p.getBoundingClientRect().left; }
+addEventListener('load', function () {
+  ok('three lines: the second line is beside the letter', m('a', 0) > 20, true);
+  ok('three lines: the third too', m('a', 1) > 20, true);
+  ok('three lines: the fourth is at the left', m('a', 2), 0);
+  ok('sinking two: the second line is beside it', m('b', 0) > 20, true);
+  ok('sinking two: the third is at the left', m('b', 1), 0);
+  ok('raised: the second line is at the left', m('c', 0), 0);
+  ok('none: the second line is at the left', m('d', 0), 0);
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('initial-letter: done');
+});
+</script>
+</body></html>
