@@ -8321,6 +8321,23 @@ static JSValue win_vita_url_form_string(JSContext *ctx, JSValueConst this_val,
 	return r;
 }
 
+/*
+ * __vitaHTMLDDA(obj): marks obj as document.all is (VitaSurf): typeof
+ * gives "undefined", it is false as a condition and == null, as the HTML
+ * standard's [[IsHTMLDDA]] has it, so a page's "if (document.all)" does
+ * not take a path written for Internet Explorer. Returns obj.
+ */
+static JSValue win_vita_html_dda(JSContext *ctx, JSValueConst this_val,
+				 int argc, JSValueConst *argv)
+{
+	(void)this_val;
+	if (argc < 1 || !JS_IsObject(argv[0])) {
+		return JS_UNDEFINED;
+	}
+	JS_SetIsHTMLDDA(ctx, argv[0]);
+	return JS_DupValue(ctx, argv[0]);
+}
+
 /* __vitaIsNode(v): whether v is a node wrapper (VitaSurf) */
 static JSValue win_vita_is_node(JSContext *ctx, JSValueConst this_val,
 				int argc, JSValueConst *argv)
@@ -19283,6 +19300,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaIsNode",
 			  JS_NewCFunction(ctx, win_vita_is_node,
 					  "__vitaIsNode", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaHTMLDDA",
+			  JS_NewCFunction(ctx, win_vita_html_dda,
+					  "__vitaHTMLDDA", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaNodeProtos",
 			  JS_NewCFunction(ctx, win_vita_node_protos,
 					  "__vitaNodeProtos", 1));

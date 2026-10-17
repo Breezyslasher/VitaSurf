@@ -6080,7 +6080,15 @@ D.dir='';
   case 'forms':return D.getElementsByTagName('form');
   case 'images':return D.getElementsByTagName('img');
   default:return D.querySelectorAll('a[href],area[href]');}}});});
-Object.defineProperty(D,'all',{configurable:true,get:function(){return D.getElementsByTagName('*');}});
+/* document.all is every element, one object, and [[IsHTMLDDA]]: typeof
+   "undefined", false as a condition, == null (VitaSurf), so a page's
+   "if (document.all)" does not take its Internet Explorer path. A proxy
+   over the '*' collection, which getElementsByTagName('*') gives as an
+   ordinary object */
+(function(){var all=null;
+Object.defineProperty(D,'all',{configurable:true,get:function(){
+ if(all===null)all=NV.__vitaHTMLDDA(new Proxy(D.getElementsByTagName('*'),{}));
+ return all;}});})();
 Object.defineProperty(D,'styleSheets',{configurable:true,get:function(){
  var l=[];l.item=function(i){return this[i]||null;};return l;}});
 D.timeline={currentTime:0};

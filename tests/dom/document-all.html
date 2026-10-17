@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<!--
+  document.all as the HTML standard has it (VitaSurf): every element of
+  the document, one object each time, and [[IsHTMLDDA]], so typeof gives
+  "undefined", it is false as a condition and it is loosely equal to null
+  and undefined. It had been an ordinary collection, so a page testing
+  "if (document.all)" took a path written for Internet Explorer. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>document.all</title></head>
+<body>
+<p id="first">p</p>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? "PASS " : "FAIL ") + name + (got === want ? "" : ": " + String(got) + ", want " + String(want))); }
+var all = document.all;
+ok("typeof", typeof all, "undefined");
+ok("false as a condition", all ? "true" : "false", "false");
+ok("!document.all", !all, true);
+ok("== null", all == null, true);
+ok("== undefined", all == undefined, true);
+ok("null ==", null == all, true);
+ok("!= null", all != null, false);
+ok("=== undefined", all === undefined, false);
+ok("=== null", all === null, false);
+ok("the same object each time", document.all === document.all, true);
+ok("every element", all.length, document.getElementsByTagName("*").length);
+ok("first is the root", all[0], document.documentElement);
+ok("item", all.item(0), document.documentElement);
+ok("live", (function () { var n = all.length; document.body.appendChild(document.createElement("i")); return all.length - n; })(), 1);
+ok("getElementsByTagName('*') is still a plain object", typeof document.getElementsByTagName("*"), "object");
+ok("and true as a condition", document.getElementsByTagName("*") ? 1 : 0, 1);
+ok("?? takes it as present", (all ?? "absent") === all, true);
+ok("?. reaches it", document.all?.length > 0, true);
+document.getElementById("out").textContent = out.join("\n");
+out.forEach(function (l) { console.log("document-all: " + l); });
+console.log("document-all: done");
+</script>
+</body></html>
