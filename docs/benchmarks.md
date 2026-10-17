@@ -171,6 +171,104 @@ https://www.pinterest.com/
 https://open.spotify.com/
 ```
 
+## The site test, build 762 (hardware, 2026-10-17)
+
+The same run on the list above, the cache off and JavaScript on. 19 of 27
+loaded, with a median of 23.5 s, and 6 inside the 20 s goal; 8 did not
+finish in 60 s; none crashed. The eleven new sites are slower than the
+eleven they replaced, which is why the median rose from 13.0 s.
+
+| Site | Load (s) | Script | Layout | Styles | HTML parse | CSS | Images | Drawing |
+|---|---|---|---|---|---|---|---|---|
+| x.com | 7.2 | 86 | 2606 | 1617 | 54 | 646 | 27 | 276 |
+| weather.com | 12.2 | 4251 | 332 | 963 | 206 | 869 | 59 | 206 |
+| www.apple.com | 12.9 | 7444 | 577 | 1008 | 93 | 972 | 266 | 358 |
+| en.m.wikipedia.org/wiki/PlayStation_Vita | 14.3 | 8904 | 1226 | 2957 | 1571 | 460 | 89 | 95 |
+| github.com/vitasdk | 15.2 | 4567 | 1305 | 2301 | 58 | 2919 | 24 | 26 |
+| duckduckgo.com | 17.9 | 12515 | 476 | 1140 | 49 | 668 | 16 | 26 |
+| www.nytimes.com | 21.6 | 15340 | 9 | 103 | 55 | 44 | 0 | 12 |
+| www.yahoo.com | 22.6 | 10383 | 1298 | 747 | 133 | 1832 | 40 | 103 |
+| www.theguardian.com/international | 23.4 | 2587 | 1013 | 3958 | 76 | 758 | 29 | 4299 |
+| www.pinterest.com | 23.5 | 16452 | 1 | 15 | 287 | 767 | 0 | 188 |
+| www.amazon.com | 29.3 | 18830 | 452 | 950 | 44 | 2811 | 72 | 88 |
+| open.spotify.com | 29.8 | 21084 | 1684 | 1123 | 88 | 902 | 713 | 212 |
+| old.reddit.com/r/vita/ | 30.2 | 17659 | 27 | 271 | 84 | 4926 | 93 | 275 |
+| stackoverflow.com/questions | 38.6 | 19622 | 596 | 1598 | 62 | 1627 | 176 | 199 |
+| www.fandom.com | 39.7 | 21144 | 374 | 1042 | 199 | 2018 | 699 | 978 |
+| www.youtube.com | 40.4 | 16955 | 119 | 795 | 126 | 4154 | 1 | 88 |
+| www.cnn.com | 40.9 | 25780 | 3862 | 5069 | 399 | 3232 | 49 | 155 |
+| www.espn.com | 46.7 | 32047 | 450 | 693 | 108 | 2715 | 196 | 537 |
+| www.target.com | 56.7 | 35985 | 513 | 958 | 265 | 1874 | 316 | 101 |
+| www.reddit.com/r/vita/ | over 60 | | | | | | | |
+| www.bbc.com/news | over 60 | | | | | | | |
+| www.npr.org | over 60 | | | | | | | |
+| www.ebay.com | over 60 | | | | | | | |
+| www.theverge.com | over 60 | | | | | | | |
+| www.washingtonpost.com | over 60 | | | | | | | |
+| medium.com | over 60 | | | | | | | |
+| www.twitch.tv | over 60 | | | | | | | |
+
+The parts are in milliseconds.
+
+Notes on the run:
+
+- x.com's 7.2 s is not a load of its app: it served nine scripts of 7 KB
+  in all, the page it gives a browser it does not run its app in.
+- old.reddit.com ended at its login page (`/login/?reason=lor2`), so its
+  figures are the login page's.
+- The Guardian's 4.3 s of drawing is redraws while it loaded, 60 to 130
+  in each of the log's draw reports, each a small part of the screen.
+- Wikipedia's script figure holds a 4 s timer whose geometry reads
+  (`win_vita_box`, 3987 ms in 8) waited on the layout they need: that is
+  box and layout time counted as script.
+- The Verge, the Washington Post, Target, Pinterest and Spotify logged
+  React's hydration errors (#418, #423, #425), where React gives up on the
+  server's HTML and renders the page again in script; the Washington
+  Post's timer that did so ran 49 s.
+- ESPN's handlers for a socket message and a fetch ran 71 s and 160 s
+  after its load, and held the next site; build 763 keeps an event's
+  fields off its own keys, which those handlers searched through.
+
+### Sites retired from the run
+
+x.com is the one site under 10 s, and it leaves the run with the figures
+above as its last measurement, since what it served was not its app.
+www.msn.com takes its place: its front page is built from web components
+(Microsoft's FAST), a kind of page the run did not cover. As before, the
+built-in list is written to `ux0:data/VitaSurf/sitetest.txt` only when
+that file is missing, so a console with the old file needs this one copied
+over it (or the old file deleted):
+
+```
+https://en.m.wikipedia.org/wiki/PlayStation_Vita
+https://duckduckgo.com/
+https://old.reddit.com/r/vita/
+https://www.reddit.com/r/vita/
+https://www.bbc.com/news
+https://www.cnn.com/
+https://www.theguardian.com/international
+https://www.nytimes.com/
+https://www.npr.org/
+https://github.com/vitasdk
+https://stackoverflow.com/questions
+https://www.amazon.com/
+https://www.ebay.com/
+https://www.youtube.com/
+https://www.espn.com/
+https://www.apple.com/
+https://www.yahoo.com/
+https://www.theverge.com/
+https://www.washingtonpost.com/
+https://medium.com/
+https://www.twitch.tv/
+https://www.msn.com/
+https://www.target.com/
+https://weather.com/
+https://www.fandom.com/
+https://www.pinterest.com/
+https://open.spotify.com/
+```
+
 ## What a load reports
 
 A finished page logs its total, then where the time went:

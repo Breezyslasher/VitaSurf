@@ -61,7 +61,9 @@
  * that loaded inside 10 s in build 739's run (lite.cnn.com, w3.org,
  * archive.org, bing.com, wikipedia.org, google.com, MDN, Hacker News,
  * weather.gov, IMDb, craigslist) gave their places to sites the run did
- * not cover; their last figures are in docs/benchmarks.md */
+ * not cover, and x.com, which served build 762's run a page without its
+ * app, gave its place to msn.com; their last figures are in
+ * docs/benchmarks.md */
 static const char *const default_sites[] = {
 	"https://en.m.wikipedia.org/wiki/PlayStation_Vita",
 	"https://duckduckgo.com/",
@@ -84,7 +86,7 @@ static const char *const default_sites[] = {
 	"https://www.washingtonpost.com/",
 	"https://medium.com/",
 	"https://www.twitch.tv/",
-	"https://x.com/",
+	"https://www.msn.com/",
 	"https://www.target.com/",
 	"https://weather.com/",
 	"https://www.fandom.com/",
