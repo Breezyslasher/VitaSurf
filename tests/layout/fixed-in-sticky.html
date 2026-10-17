@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+  A fixed box inside a sticky one stays where the viewport puts it
+  (VitaSurf): the shift the sticky box gets as the page scrolls is not
+  added to it again. CNN's header ad is a fixed box inside its sticky
+  header, and slid down the page as it was scrolled. To look at: scroll,
+  and the red bar must stay at the top. Each line must say PASS; Chrome
+  passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Fixed in sticky</title>
+<style>
+body { margin: 0; font: 16px sans-serif; }
+header { position: sticky; top: 0; height: 40px; background: #fc0; }
+#wrap { clip-path: inset(0); height: 116px; }
+#ad { position: fixed; top: 0; left: 0; width: 100%; height: 116px; background: red; }
+.row { height: 100px; border-bottom: 2px solid #888; }
+</style></head><body>
+<header id="head"><div id="wrap"><div id="ad"></div></div></header>
+<div id="rows"></div>
+<pre id="out"></pre>
+<script>
+var out = [], rows = document.getElementById('rows');
+for (var i = 0; i < 40; i++) { var r = document.createElement('div'); r.className = 'row'; r.id = 'r' + i; r.textContent = 'row ' + i; rows.appendChild(r); }
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('fixed-in-sticky: ' + l); }
+function at(y) { var e = document.elementFromPoint(10, y); return e ? e.id : 'nothing'; }
+addEventListener('load', function () {
+  ok('the ad at the top', at(50), 'ad');
+  ok('a row below it', at(200), 'r1');
+  /* after the load has ended, which puts a page's scroll back */
+  setTimeout(function () {
+    window.scrollTo(0, 300);
+    setTimeout(function () {
+      ok('scrolled', window.scrollY, 300);
+      ok('scrolled, the ad is still at the top', at(50), 'ad');
+      ok('scrolled, the rows move under it', at(200), 'r4');
+      ok('the ad\'s box is at the top', document.getElementById('ad').getBoundingClientRect().top, 0);
+      document.getElementById('out').textContent = out.join('\n');
+      window.scrollTo(0, 0);
+      console.log('fixed-in-sticky: done');
+    }, 100);
+  }, 500);
+});
+</script></body></html>

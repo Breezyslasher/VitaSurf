@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<!--
+  A fixed box is cut by its ancestors' clip-path (VitaSurf): CSS Masking
+  clips every descendant, so a fixed child of a wrapper with
+  clip-path: inset(0) shows only through the wrapper's box, which
+  scrolls away with the page. CNN's header ad is built so, and was drawn
+  over the top of the page whatever the scroll. To look at: scroll, and
+  the red bar under the blue line must slide away with the wrapper and
+  never cover the text below it. Each line must say PASS; Chrome passes
+  them all.
+-->
+<html><head><meta charset="utf-8"><title>clip-path and fixed</title>
+<style>
+body { margin: 0; font: 16px sans-serif; }
+#wrap { clip-path: inset(0); height: 60px; border-top: 4px solid blue; }
+#ad { position: fixed; top: 0; left: 0; width: 100%; height: 60px; background: red; }
+#none { clip-path: inset(0); height: 0; }
+#gone { position: fixed; top: 100px; left: 0; width: 100%; height: 40px; background: red; }
+#tall { height: 3000px; }
+</style></head><body>
+<div id="wrap"><div id="ad"></div></div>
+<div id="none"><div id="gone"></div></div>
+<p id="text">Text under the wrapper.</p>
+<pre id="out"></pre>
+<div id="tall"></div>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('clip-path-fixed: ' + l); }
+addEventListener('load', function () {
+  ok('the ad shows through the wrapper', document.elementFromPoint(10, 30) === document.getElementById('ad'), true);
+  ok('a wrapper of no height shows nothing', document.elementFromPoint(10, 110) === document.getElementById('gone'), false);
+  /* after the load has ended, which puts a page's scroll back */
+  setTimeout(function () {
+    window.scrollTo(0, 200);
+    setTimeout(function () {
+      ok('scrolled', window.scrollY, 200);
+      ok('scrolled, the ad is not over the page', document.elementFromPoint(10, 30) === document.getElementById('ad'), false);
+      ok('scrolled, the text takes the point', document.elementFromPoint(10, 30) === document.getElementById('tall'), true);
+      document.getElementById('out').textContent = out.join('\n');
+      window.scrollTo(0, 0);
+      console.log('clip-path-fixed: done');
+    }, 100);
+  }, 500);
+});
+</script></body></html>

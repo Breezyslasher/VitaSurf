@@ -1,0 +1,340 @@
+diff --git a/content/handlers/html/box_inspect.c b/content/handlers/html/box_inspect.c
+index 6da78d195..3c33bd668 100644
+--- a/content/handlers/html/box_inspect.c
++++ b/content/handlers/html/box_inspect.c
+@@ -614,6 +614,33 @@ static bool box_descendants_hold_point(const struct box *box, int x, int y)
+ }
+ 
+ 
++/**
++ * Whether a box's clip-path keeps all it and its descendants paint
++ * inside its border box (VitaSurf): an inset() of no negative length.
++ * A fixed descendant is cut by it too, though it leaves the box's
++ * overflow clip, so a point outside the box reaches none of them: CNN's
++ * header ad, a fixed box shown through such a wrapper, took the taps
++ * meant for the page under it once the wrapper had scrolled away.
++ */
++static bool box_clip_path_inside(const struct box *box)
++{
++	css_fixed v[4];
++	css_unit u[4];
++	int i;
++
++	if (box->style == NULL ||
++	    css_computed_clip_path(box->style, &v[0], &u[0], &v[1], &u[1],
++			&v[2], &u[2], &v[3], &u[3]) != CSS_CLIP_PATH_INSET) {
++		return false;
++	}
++	for (i = 0; i < 4; i++) {
++		if (u[i] == CSS_UNIT_EXPR || v[i] < 0)
++			return false;
++	}
++	return true;
++}
++
++
+ struct box *
+ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 	     struct box *box,
+@@ -692,7 +719,8 @@ box_at_point(const css_unit_ctx *unit_len_ctx,
+ 			 * mis-measures, took no taps at all (VitaSurf).
+ 			 */
+ 			skip_children = !box_descendants_hold_point(box,
+-					x - *box_x, y - *box_y);
++					x - *box_x, y - *box_y) ||
++					box_clip_path_inside(box);
+ 		}
+ 	}
+ 
+diff --git a/content/handlers/html/private.h b/content/handlers/html/private.h
+index 2993b11c1..7bb9c87c7 100644
+--- a/content/handlers/html/private.h
++++ b/content/handlers/html/private.h
+@@ -334,6 +334,11 @@ typedef struct html_content {
+ 	struct box *fixed_box[HTML_FIXED_DEFER_MAX];
+ 	int fixed_x[HTML_FIXED_DEFER_MAX];
+ 	int fixed_y[HTML_FIXED_DEFER_MAX];
++	/* the clip-path insets of its ancestors, where it was met: a
++	 * fixed box is cut by them though it leaves their overflow
++	 * clips (VitaSurf) */
++	struct rect fixed_cp[HTML_FIXED_DEFER_MAX];
++	bool fixed_cp_set[HTML_FIXED_DEFER_MAX];
+ 	int n_fixed;
+ 	bool drawing_fixed;
+ 	/**< Universal selector */
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 0a27f22b3..a042cbeac 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -4041,6 +4041,14 @@ struct html_transform_level {
+ 
+ static struct html_transform_level html_transform_stack[HTML_TRANSFORM_DEPTH];
+ static int html_transform_depth;
++/* the clip-path insets of the boxes being drawn, intersected, in the
++ * redraw's coordinates (VitaSurf): a fixed box set aside to be drawn
++ * last keeps them, as CSS Masking clips every descendant; CNN's header
++ * ad is a fixed box shown through its wrapper's clip-path: inset(0),
++ * and drawn over the whole top of the page as the wrapper scrolled
++ * away */
++static struct rect html_cp_rect;
++static bool html_cp_set;
+ 
+ /** The level html_redraw_box pushed for the box about to be painted. */
+ static struct html_transform_level *html_transform_box_level;
+@@ -7109,11 +7117,17 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 		const struct redraw_context *ctx)
+ {
+ 	uint64_t saved, t0, took;
++	struct rect cp = html_cp_rect;
++	bool cps = html_cp_set;
+ 	bool ok;
+ 
+-	if (!html_slow_timing)
+-		return html_redraw_box_work(html, box, x_parent, y_parent,
++	if (!html_slow_timing) {
++		ok = html_redraw_box_work(html, box, x_parent, y_parent,
+ 				clip, scale, current_background_color, ctx);
++		html_cp_rect = cp;
++		html_cp_set = cps;
++		return ok;
++	}
+ 	saved = html_slow_child_us;
+ 	html_slow_child_us = 0;
+ 	t0 = vitasurf_clock_us();
+@@ -7123,6 +7137,8 @@ bool html_redraw_box(const html_content *html, struct box *box,
+ 	if (took > html_slow_child_us)
+ 		html_slow_note(box, took - html_slow_child_us);
+ 	html_slow_child_us = saved + took;
++	html_cp_rect = cp;
++	html_cp_set = cps;
+ 	return ok;
+ }
+ 
+@@ -7467,11 +7483,28 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				mh->fixed_box[mh->n_fixed] = box;
+ 				mh->fixed_x[mh->n_fixed] = x_parent;
+ 				mh->fixed_y[mh->n_fixed] = y_parent;
++				mh->fixed_cp[mh->n_fixed] = html_cp_rect;
++				mh->fixed_cp_set[mh->n_fixed] = html_cp_set &&
++						html_transform_depth == 0;
+ 				mh->n_fixed++;
+ 				return true;
+ 			}
+-			box->sticky_dy = html->view_y;
+-			box->sticky_dx = html->view_x;
++			/* against the viewport: what a sticky ancestor was
++			 * moved by is in y_parent already, and comes off
++			 * (VitaSurf); CNN's header ad, fixed inside the
++			 * sticky header, was drawn lower by the scroll at
++			 * every step and slid down the page */
++			{
++				const struct box *a;
++				int ady = 0, adx = 0;
++
++				for (a = box->parent; a != NULL; a = a->parent) {
++					ady += a->sticky_dy;
++					adx += a->sticky_dx;
++				}
++				box->sticky_dy = html->view_y - ady;
++				box->sticky_dx = html->view_x - adx;
++			}
+ 		}
+ 	}
+ 	y_parent += box->sticky_dy;
+@@ -7798,6 +7831,29 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 				r.x1 = x + padding_width + border_right - px[1];
+ 			if (r.y1 > y + padding_height + border_bottom - px[2])
+ 				r.y1 = y + padding_height + border_bottom - px[2];
++			/* kept for the fixed boxes inside it, which leave
++			 * the clip it was given; not through a transform,
++			 * whose coordinates are its own */
++			if (html_transform_depth == 0) {
++				struct rect in_r;
++
++				in_r.x0 = x - border_left + px[3];
++				in_r.y0 = y - border_top + px[0];
++				in_r.x1 = x + padding_width + border_right - px[1];
++				in_r.y1 = y + padding_height + border_bottom - px[2];
++				if (html_cp_set) {
++					if (in_r.x0 < html_cp_rect.x0)
++						in_r.x0 = html_cp_rect.x0;
++					if (in_r.y0 < html_cp_rect.y0)
++						in_r.y0 = html_cp_rect.y0;
++					if (in_r.x1 > html_cp_rect.x1)
++						in_r.x1 = html_cp_rect.x1;
++					if (in_r.y1 > html_cp_rect.y1)
++						in_r.y1 = html_cp_rect.y1;
++				}
++				html_cp_rect = in_r;
++				html_cp_set = true;
++			}
+ 			if (r.x0 >= r.x1 || r.y0 >= r.y1)
+ 				return ((!ctx->plot->group_end) ||
+ 					(ctx->plot->group_end(ctx) ==
+@@ -8794,6 +8850,35 @@ static const struct plotter_table html_probe_plotters = {
+ 	.option_knockout = false,
+ };
+ 
++/**
++ * Draw the i-th fixed box set aside in this redraw, cut to the
++ * clip-path insets of the ancestors it was met in (VitaSurf).
++ */
++static bool html_redraw_fixed(const html_content *html, int i,
++		const struct rect *clip, float scale, colour bg,
++		const struct redraw_context *ctx)
++{
++	struct rect c = *clip;
++	bool ok;
++
++	if (html->fixed_cp_set[i]) {
++		const struct rect *cp = &html->fixed_cp[i];
++
++		if (c.x0 < cp->x0) c.x0 = cp->x0;
++		if (c.y0 < cp->y0) c.y0 = cp->y0;
++		if (c.x1 > cp->x1) c.x1 = cp->x1;
++		if (c.y1 > cp->y1) c.y1 = cp->y1;
++		if (c.x0 >= c.x1 || c.y0 >= c.y1)
++			return true;
++	}
++	html_cp_rect = html->fixed_cp[i];
++	html_cp_set = html->fixed_cp_set[i];
++	ok = html_redraw_box(html, html->fixed_box[i], html->fixed_x[i],
++			html->fixed_y[i], &c, scale, bg, ctx);
++	html_cp_set = false;
++	return ok;
++}
++
+ /* exported interface documented in html/private.h */
+ uint32_t html_redraw_rank(html_content *html, int x, int y)
+ {
+@@ -8804,6 +8889,8 @@ uint32_t html_redraw_rank(html_content *html, int x, int y)
+ 		.priv = NULL,
+ 	};
+ 	struct rect clip = { x, y, x + 1, y + 1 };
++	int saved_view[6];
++	int vx, vy, vw, vh;
+ 	int i;
+ 
+ 	if (html->layout == NULL || html_z_top != NULL)
+@@ -8814,18 +8901,46 @@ uint32_t html_redraw_rank(html_content *html, int x, int y)
+ 	html_probe_count = 0;
+ 	html_probe_active = true;
+ 
++	/* the viewport as it is now, the probe's origin at the content's
++	 * own (VitaSurf): a script that scrolls and then asks what is at
++	 * a point had sticky and fixed boxes where the last redraw put
++	 * them, for the scroll before */
++	saved_view[0] = html->view_x;
++	saved_view[1] = html->view_y;
++	saved_view[2] = html->view_w;
++	saved_view[3] = html->view_h;
++	saved_view[4] = html->view_origin_x;
++	saved_view[5] = html->view_origin_y;
++	if (html->bw != NULL && browser_window_viewport(html->bw, &vx, &vy,
++			&vw, &vh)) {
++		html->view_x = vx;
++		html->view_y = vy;
++		if (vw > 0 && vh > 0) {
++			html->view_w = vw;
++			html->view_h = vh;
++		}
++		html->view_origin_x = 0;
++		html->view_origin_y = 0;
++	}
++
+ 	html->n_fixed = 0;
+ 	html->drawing_fixed = false;
++	html_cp_set = false;
+ 	html_redraw_box(html, html->layout, 0, 0, &clip, 1.0, 0xffffff,
+ 			&ctx);
+ 	html->drawing_fixed = true;
+ 	for (i = 0; i < html->n_fixed; i++) {
+-		html_redraw_box(html, html->fixed_box[i], html->fixed_x[i],
+-				html->fixed_y[i], &clip, 1.0, 0xffffff, &ctx);
++		html_redraw_fixed(html, i, &clip, 1.0, 0xffffff, &ctx);
+ 	}
+ 	html->drawing_fixed = false;
+ 	html->n_fixed = 0;
+ 
++	html->view_x = saved_view[0];
++	html->view_y = saved_view[1];
++	html->view_w = saved_view[2];
++	html->view_h = saved_view[3];
++	html->view_origin_x = saved_view[4];
++	html->view_origin_y = saved_view[5];
+ 	html_probe_active = false;
+ 	return html_probe_gen;
+ }
+@@ -8982,6 +9097,7 @@ static bool html_redraw_content(struct content *c,
+ 
+ 		html->n_fixed = 0;
+ 		html->drawing_fixed = false;
++		html_cp_set = false;
+ 		result &= html_redraw_box(html, box, data->x, data->y, clip,
+ 				data->scale, pstyle_fill_bg.fill_colour, ctx);
+ 
+@@ -8992,10 +9108,7 @@ static bool html_redraw_content(struct content *c,
+ 			int i;
+ 
+ 			for (i = 0; i < html->n_fixed; i++) {
+-				result &= html_redraw_box(html,
+-						html->fixed_box[i],
+-						html->fixed_x[i],
+-						html->fixed_y[i], clip,
++				result &= html_redraw_fixed(html, i, clip,
+ 						data->scale,
+ 						pstyle_fill_bg.fill_colour,
+ 						ctx);
+diff --git a/desktop/browser_window.c b/desktop/browser_window.c
+index 04ecb9587..b6487766d 100644
+--- a/desktop/browser_window.c
++++ b/desktop/browser_window.c
+@@ -278,6 +278,29 @@ browser_window_scroll_offsets(struct browser_window *bw, int *sx, int *sy)
+ }
+ 
+ 
++/* exported interface documented in netsurf/browser_window.h */
++bool
++browser_window_viewport(struct browser_window *bw, int *x, int *y,
++		int *w, int *h)
++{
++	int sx = 0, sy = 0;
++
++	if (bw == NULL || !browser_window_scroll_offsets(bw, &sx, &sy))
++		return false;
++	*x = sx / bw->scale;
++	*y = sy / bw->scale;
++	*w = bw->width;
++	*h = bw->height;
++	/* a window not reformatted yet has its size with the frontend */
++	if ((*w <= 0 || *h <= 0) && bw->window != NULL &&
++	    guit->window->get_dimensions != NULL &&
++	    guit->window->get_dimensions(bw->window, w, h) != NSERROR_OK) {
++		*w = *h = 0;
++	}
++	return true;
++}
++
++
+ /* exported interface documented in desktop/frames.h */
+ bool browser_window_view_rect(struct browser_window *bw,
+ 		struct content *c, int *x, int *y, int *w, int *h)
+diff --git a/include/netsurf/browser_window.h b/include/netsurf/browser_window.h
+index ebb082aa0..7d00b51a5 100644
+--- a/include/netsurf/browser_window.h
++++ b/include/netsurf/browser_window.h
+@@ -867,4 +867,14 @@ nserror browser_window_show_cookies(
+ nserror browser_window_show_certificates(
+ 		struct browser_window *bw);
+ 
++/**
++ * Where a browser window's viewport is on its content, in content px,
++ * and its size, as now (VitaSurf): a hit test between redraws places
++ * sticky and fixed boxes for the scroll as it is, not as last drawn.
++ *
++ * \return false if it cannot be told
++ */
++bool browser_window_viewport(struct browser_window *bw, int *x, int *y,
++		int *w, int *h);
++
+ #endif

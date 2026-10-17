@@ -18209,6 +18209,25 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 		return JS_NULL;
 	}
 	box_coords(box, &x, &y);
+	/* in a fixed box, where layout put it against the viewport: the
+	 * shifts the last redraw gave the fixed box and the sticky boxes
+	 * above it are not the page's to see (VitaSurf); CNN's header
+	 * ad, fixed inside a sticky header, read as far down as the page
+	 * had scrolled */
+	{
+		const struct box *f, *a;
+
+		for (f = box; f != NULL; f = f->parent) {
+			if (f->style != NULL && !(f->flags & ANCHORED) &&
+			    css_computed_position(f->style) ==
+					CSS_POSITION_FIXED)
+				break;
+		}
+		for (a = f; a != NULL; a = a->parent) {
+			x -= a->sticky_dx;
+			y -= a->sticky_dy;
+		}
+	}
 	cw = box->padding[LEFT] + box->width + box->padding[RIGHT];
 	ch = box->padding[TOP] + box->height + box->padding[BOTTOM];
 	sw = box->descendant_x1 > cw ? box->descendant_x1 : cw;
