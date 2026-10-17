@@ -1,0 +1,58 @@
+diff --git a/content/content.c b/content/content.c
+index ec84ce4cf..e520c0790 100644
+--- a/content/content.c
++++ b/content/content.c
+@@ -91,9 +91,23 @@ static void content_convert(struct content *c)
+ 		 * so it ran the scripts, built the boxes and laid the page
+ 		 * out. Measured as elapsed, a 16 KB stylesheet came out at
+ 		 * seventeen seconds, which said nothing about the
+-		 * stylesheet. Each conversion hands its total up to the one
+-		 * that contains it, which subtracts it.
++		 * stylesheet. Each conversion hands what was its own up to
++		 * the one that contains it, which subtracts it.
+ 		 */
++		/*
++		 * Nor is what a finished content sets off its own: a sheet's
++		 * load event, a parser script that was waiting on sheets, an
++		 * image's onload, the boxes and layout once the last sheet is
++		 * in. They are counted in their own figures, and counted here
++		 * too they made a 1x1 GIF take 1435 ms to convert and put a
++		 * page's scripts into its css total.
++		 */
++		unsigned int run0 = vitasurf_ms_script + vitasurf_ms_js_jobs +
++			vitasurf_ms_prelude + vitasurf_ms_teardown +
++			vitasurf_ms_html_parse;
++		unsigned int lay0 = vitasurf_ms_boxes + vitasurf_ms_layout;
++		unsigned int ran, laid, other, inner;
++
+ 		outer = vitasurf_ms_nested;
+ 		vitasurf_ms_nested = 0;
+ 
+@@ -114,9 +128,24 @@ static void content_convert(struct content *c)
+ 		nsu_getmonotonic_ms(&t1);
+ 
+ 		total = t1 - t0;
+-		self = total > vitasurf_ms_nested ?
+-			total - vitasurf_ms_nested : 0;
+-		vitasurf_ms_nested = outer + total;
++		inner = vitasurf_ms_nested;
++		/* (the figures start again with a new page, which a script
++		   inside may have begun) */
++		ran = vitasurf_ms_script + vitasurf_ms_js_jobs +
++			vitasurf_ms_prelude + vitasurf_ms_teardown +
++			vitasurf_ms_html_parse;
++		ran = ran >= run0 ? ran - run0 : 0;
++		/* boxes and layout a script forced are in its time already */
++		laid = vitasurf_ms_boxes + vitasurf_ms_layout;
++		laid = laid >= lay0 ? laid - lay0 : 0;
++		other = ran + (laid > ran ? laid - ran : 0);
++		/* what the one containing this takes off: not other, which
++		   it finds in the same figures itself */
++		vitasurf_ms_nested = outer + (total > other ? total - other : 0);
++		/* a script's own time is its compile and run (below) */
++		if (type == CONTENT_JS)
++			other = 0;
++		self = total > inner + other ? total - inner - other : 0;
+ 
+ 		/* where the time went, for the load profile (VitaSurf) */
+ 		if (type == CONTENT_CSS) {

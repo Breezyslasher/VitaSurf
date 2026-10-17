@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Convert own time</title>
+<!--
+A sheet and a 1x1 image whose load handlers each spin for 600 ms. The
+page report's "slow convert" lines must not name either: their handlers
+are script time, and so is the parser script after the sheet, which waits
+for it and spins 600 ms more. Native harness:
+  bash run.sh file://.../tests/bench/convert-own-time.html 6 | grep -E "slow|page: of that"
+Before: "slow convert: 1200 ms for 0 KB" of the sheet, css about 1200 ms;
+after: no slow convert line, and css a few ms.
+-->
+<script>
+function spin(ms) { var t = Date.now(); while (Date.now() - t < ms) {} }
+</script>
+<link rel="stylesheet" href="convert-own-time/sheet.css" onload="spin(600)">
+<script>spin(600);</script>
+</head>
+<body>
+<p class="a">Text</p>
+<img src="data:image/gif;base64,R0lGODlhAQABAHAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==" onload="spin(600)">
+</body>
+</html>
