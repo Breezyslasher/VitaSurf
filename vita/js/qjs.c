@@ -5184,6 +5184,203 @@ static JSValue node_remove_child(JSContext *ctx, JSValueConst this_val,
 }
 
 /* Replace the element's children with parsed HTML (innerHTML setter). */
+/*
+ * How the HTML standard's fragment parser reads markup set on an element
+ * (VitaSurf): with an HTML script, style, xmp, iframe, noembed, noframes,
+ * noscript (script being on) or plaintext as its context, the whole
+ * string is one text, as written; with a title or textarea, the same with
+ * its character references decoded. No tag is made in either.
+ */
+enum { INNER_MARKUP, INNER_RAWTEXT, INNER_RCDATA };
+
+static int inner_html_kind(struct dom_node *node)
+{
+	static const char html_ns[] = "http://www.w3.org/1999/xhtml";
+	static const char *const raw[] = { "script", "style", "xmp", "iframe",
+		"noembed", "noframes", "noscript", "plaintext" };
+	dom_string *ns = NULL, *local = NULL;
+	char name[16];
+	int kind = INNER_MARKUP;
+	unsigned int i;
+
+	if (!node_is_element(node)) {
+		return INNER_MARKUP;
+	}
+	dom_node_get_namespace(node, &ns);
+	if (ns == NULL || dom_string_is(ns, html_ns, sizeof(html_ns) - 1)) {
+		dom_node_get_local_name(node, &local);
+		if (name_copy(local, name, sizeof(name), false)) {
+			for (i = 0; i < sizeof(raw) / sizeof(raw[0]); i++) {
+				if (strcasecmp(name, raw[i]) == 0) {
+					kind = INNER_RAWTEXT;
+				}
+			}
+			if (strcasecmp(name, "title") == 0 ||
+			    strcasecmp(name, "textarea") == 0) {
+				kind = INNER_RCDATA;
+			}
+		}
+	}
+	if (ns != NULL) dom_string_unref(ns);
+	if (local != NULL) dom_string_unref(local);
+	return kind;
+}
+
+/*
+ * RCDATA's text: hubbub's own tokenizer decodes the references inside a
+ * textarea, given every "<" as "&lt;" so nothing can end it, and a line
+ * feed first for the one the tree builder drops after a textarea's tag.
+ * Returns a buffer to free, or NULL.
+ */
+static char *inner_rcdata_decode(struct dom_document *doc, const char *html,
+				 size_t len, size_t *out_len)
+{
+	dom_hubbub_parser_params params;
+	dom_hubbub_parser *parser = NULL;
+	struct dom_document_fragment *fragment = NULL;
+	struct dom_node *n = NULL, *next = NULL;
+	dom_string *text = NULL;
+	char *buf, *out = NULL;
+	size_t i, j = 0, lt = 0;
+	int depth;
+
+	for (i = 0; i < len; i++) {
+		if (html[i] == '<') lt++;
+	}
+	buf = malloc(len + lt * 3 + 1);
+	if (buf == NULL) {
+		return NULL;
+	}
+	for (i = 0; i < len; i++) {
+		if (html[i] == '<') {
+			memcpy(buf + j, "&lt;", 4);
+			j += 4;
+		} else {
+			buf[j++] = html[i];
+		}
+	}
+	memset(&params, 0, sizeof(params));
+	params.enc = "UTF-8";
+	params.fix_enc = true;
+	params.enable_script = false;
+	dom_document_quiet_mutations(doc, +1);
+	if (dom_hubbub_fragment_parser_create(&params, doc, &parser,
+					      &fragment) != DOM_HUBBUB_OK ||
+	    dom_hubbub_parser_parse_chunk(parser,
+			(const uint8_t *)"<body><textarea>\n", 17) !=
+	    DOM_HUBBUB_OK ||
+	    dom_hubbub_parser_parse_chunk(parser, (const uint8_t *)buf, j) !=
+	    DOM_HUBBUB_OK ||
+	    dom_hubbub_parser_completed(parser) != DOM_HUBBUB_OK) {
+		goto done;
+	}
+	/* the fragment's html, its body, the textarea */
+	dom_node_get_first_child(fragment, &n);
+	for (depth = 0; depth < 3 && n != NULL; depth++) {
+		next = NULL;
+		if (depth == 1) {
+			/* past the head */
+			while (n != NULL && !node_is_element(n)) {
+				dom_node_get_next_sibling(n, &next);
+				dom_node_unref(n);
+				n = next;
+				next = NULL;
+			}
+			if (n == NULL) break;
+			dom_node_get_next_sibling(n, &next);
+			dom_node_unref(n);
+			n = next;
+			next = NULL;
+			if (n == NULL) break;
+		}
+		if (depth < 2) {
+			dom_node_get_first_child(n, &next);
+			dom_node_unref(n);
+			n = next;
+		}
+	}
+	if (n != NULL && dom_node_get_text_content(n, &text) == DOM_NO_ERR) {
+		size_t tl = text != NULL ? dom_string_byte_length(text) : 0;
+
+		out = malloc(tl + 1);
+		if (out != NULL) {
+			if (tl > 0) memcpy(out, dom_string_data(text), tl);
+			out[tl] = '\0';
+			*out_len = tl;
+		}
+	}
+done:
+	dom_document_quiet_mutations(doc, -1);
+	if (text != NULL) dom_string_unref(text);
+	if (n != NULL) dom_node_unref(n);
+	if (parser != NULL) dom_hubbub_parser_destroy(parser);
+	if (fragment != NULL) dom_node_unref(fragment);
+	free(buf);
+	return out;
+}
+
+/* innerHTML on a raw text or RCDATA element: its children become the one
+   text, newlines normalised and a NUL the replacement character as the
+   parser's input stream has them */
+static void set_inner_text(struct dom_node *node, struct dom_document *doc,
+			   const char *html, size_t len, int kind)
+{
+	struct dom_node *child = NULL, *cref = NULL;
+	struct dom_text *text = NULL;
+	char *decoded = NULL, *buf;
+	const char *src = html;
+	size_t n = len, i, j = 0;
+	dom_string *d;
+
+	if (kind == INNER_RCDATA && len > 0) {
+		decoded = inner_rcdata_decode(doc, html, len, &n);
+		if (decoded == NULL) {
+			return;
+		}
+		src = decoded;
+	}
+	buf = malloc(n * 3 + 1);
+	if (buf == NULL) {
+		free(decoded);
+		return;
+	}
+	for (i = 0; i < n; i++) {
+		if (src[i] == '\r') {
+			buf[j++] = '\n';
+			if (i + 1 < n && src[i + 1] == '\n') i++;
+		} else if (src[i] == '\0') {
+			memcpy(buf + j, "\xef\xbf\xbd", 3);
+			j += 3;
+		} else {
+			buf[j++] = src[i];
+		}
+	}
+	free(decoded);
+	dom_node_get_first_child(node, &child);
+	while (child != NULL) {
+		cref = NULL;
+		dom_node_remove_child(node, child, &cref);
+		dom_node_unref(child);
+		if (cref) dom_node_unref(cref);
+		child = NULL;
+		dom_node_get_first_child(node, &child);
+	}
+	if (j > 0) {
+		d = to_dom_string_len(buf, j);
+		if (d != NULL &&
+		    dom_document_create_text_node(doc, d, &text) == DOM_NO_ERR &&
+		    text != NULL) {
+			cref = NULL;
+			dom_node_append_child(node, (struct dom_node *)text,
+					      &cref);
+			if (cref) dom_node_unref(cref);
+			dom_node_unref((struct dom_node *)text);
+		}
+		if (d != NULL) dom_string_unref(d);
+	}
+	free(buf);
+}
+
 static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 {
 	dom_hubbub_parser_params params;
@@ -5213,6 +5410,19 @@ static void set_inner_html(struct dom_node *node, const char *html, size_t len)
 		}
 		doc = (struct dom_document *)node;
 		dom_node_ref(node);
+	}
+	/*
+	 * A script built with innerHTML lost what followed each "<" in its
+	 * code, parsed as the inside of a body: BBC's and Yahoo's consent
+	 * stubs ("for(...;r<t;r++)") would not compile (VitaSurf).
+	 */
+	{
+		int kind = inner_html_kind(node);
+
+		if (kind != INNER_MARKUP) {
+			set_inner_text(node, doc, html, len, kind);
+			goto out;
+		}
 	}
 	memset(&params, 0, sizeof(params));
 	params.enc = "UTF-8";

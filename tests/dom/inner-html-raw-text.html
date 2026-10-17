@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<!--
+  innerHTML on an element whose content the HTML parser reads as text
+  (VitaSurf). The fragment parser takes the element as its context: a
+  script, style, xmp, iframe, noembed, noframes, noscript (script on) or
+  plaintext gets the whole string as one text node, and a title or
+  textarea the same with its character references decoded. Our setter
+  parsed every string as the inside of a body, so a script a page built
+  with innerHTML lost the code after each "<" ("for(...;r<t;r++)"), and
+  BBC's, Yahoo's and the Washington Post's inserted scripts would not
+  compile. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>innerHTML raw text</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? "PASS " : "FAIL ") + name + (got === want ? "" : ": " + JSON.stringify(got) + ", want " + JSON.stringify(want))); }
+function one(tag, html) {
+  var el = document.createElement(tag);
+  el.innerHTML = html;
+  return el.childNodes.length + " " + (el.firstChild ? el.firstChild.nodeName + " " + el.firstChild.data : "");
+}
+var code = 'for(var t=3,n=new Array(t),r=0;r<t;r++)n[r]=r;window.ran=n.join("-");var x="</div><b>";';
+var s = document.createElement("script");
+s.innerHTML = code;
+ok("a script's markup is its text", s.text, code);
+ok("in one text node", s.childNodes.length, 1);
+ok("and reads back as written", s.innerHTML, code);
+document.body.appendChild(s);
+ok("and it runs", window.ran, "0-1-2");
+ok("style", one("style", "a > b { color: red } /* <i> & </i> */"), "1 #text a > b { color: red } /* <i> & </i> */");
+ok("xmp", one("xmp", "<b>x</b> &amp;"), "1 #text <b>x</b> &amp;");
+ok("noscript, script being on", one("noscript", "<b>n</b>"), "1 #text <b>n</b>");
+ok("iframe", one("iframe", "<p>i</p>"), "1 #text <p>i</p>");
+ok("noembed", one("noembed", "<p>e</p>"), "1 #text <p>e</p>");
+ok("plaintext", one("plaintext", "<p>p</p>"), "1 #text <p>p</p>");
+ok("textarea decodes references", one("textarea", "<b>x</b> &amp; y &lt;"), "1 #text <b>x</b> & y <");
+ok("and keeps its end tag as text", one("textarea", "a</textarea>b"), "1 #text a</textarea>b");
+ok("and a leading line feed", one("textarea", "\nz"), "1 #text \nz");
+ok("title", one("title", "<b>t</b> &amp;"), "1 #text <b>t</b> &");
+ok("a script's end tag stays text", one("script", "a<\/script>b"), "1 #text a<\/script>b");
+ok("CR LF becomes LF", one("script", "a\r\nb\rc"), "1 #text a\nb\nc");
+ok("empty leaves no child", one("script", ""), "0 ");
+ok("a div still parses markup", one("div", "<b>x</b>"), "1 B undefined");
+var svg = document.createElementNS("http://www.w3.org/2000/svg", "style");
+svg.innerHTML = "<b>x</b>";
+ok("an SVG style is not HTML's", svg.firstChild && svg.firstChild.nodeType, 1);
+var t = document.createElement("textarea");
+t.innerHTML = "&lt;q&gt;";
+ok("a textarea's value follows", t.value, "<q>");
+document.getElementById("out").textContent = out.join("\n");
+out.forEach(function (l) { console.log("inner-html-raw-text: " + l); });
+console.log("inner-html-raw-text: done");
+</script>
+</body></html>
