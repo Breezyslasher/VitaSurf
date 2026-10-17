@@ -115,6 +115,12 @@ struct jsheap {
 	/* pages closed since the runtime was last collected (VitaSurf):
 	 * heap_collect_cb runs once for all of them */
 	unsigned int closed_uncollected;
+	/* when the first of them closed, and how many collections the
+	 * runtime had run then (VitaSurf) */
+	uint64_t closed_at;
+	uint32_t closed_gc_runs;
+	/* the runtime's memory limit, in KB */
+	unsigned int limit_kb;
 };
 
 struct js_listener;
@@ -1146,6 +1152,7 @@ static const char *thread_url(jsthread *thread);
 static JSRuntime *qjs_memory_rt;
 static unsigned runtime_kb(JSRuntime *rt);
 static void heap_collect_cb(void *p);
+static void heap_collect_now(jsheap *heap, const char *why);
 
 /** Whether a walk began at the document or its root element. */
 static bool walk_from_top(jsthread *thread, struct dom_node *root)
@@ -15952,6 +15959,19 @@ static JSValue win_vita_set_focus(JSContext *ctx, JSValueConst this_val,
 #define MISS_WATCH 48
 #define MISS_RING 24
 static void *miss_watch_obj[MISS_WATCH];
+/* a bit for each watched object's hash, so a miss on any other object,
+   nearly every one, is told so without reading the list: the list was
+   read twice for every miss, some 650 instructions each, 4% of an
+   Apollo cache write in the harness (VitaSurf) */
+#define MISS_WATCH_BITS 1024u
+static uint32_t miss_watch_map[MISS_WATCH_BITS / 32];
+
+static unsigned miss_watch_hash(const void *p)
+{
+	uintptr_t v = (uintptr_t)p;
+
+	return (unsigned)((v >> 4) ^ (v >> 14)) & (MISS_WATCH_BITS - 1);
+}
 static char miss_watch_label[MISS_WATCH][16];
 static unsigned miss_watch_next;
 static char miss_ring[MISS_RING][64];
@@ -16727,18 +16747,23 @@ static void qjs_miss_hook(JSContext *ctx, JSValueConst obj, JSAtom prop)
 		return;
 	}
 	p = JS_VALUE_GET_PTR(obj);
-	for (i = 0; i < MISS_WATCH; i++) {
-		if (miss_watch_obj[i] == p && p != NULL)
-			break;
+	i = MISS_WATCH;
+	if (p != NULL) {
+		unsigned h = miss_watch_hash(p);
+
+		if ((miss_watch_map[h / 32] >> (h % 32)) & 1u) {
+			for (i = 0; i < MISS_WATCH; i++) {
+				if (miss_watch_obj[i] == p)
+					break;
+			}
+		}
 	}
 	qjs_miss_any_add(ctx, obj, prop, i < MISS_WATCH ? (int)i : -1);
 
-	for (i = 0; i < MISS_WATCH; i++) {
+	if (i < MISS_WATCH) {
 		const char *name;
 		char entry[64];
 
-		if (miss_watch_obj[i] != p || p == NULL)
-			continue;
 		name = JS_AtomToCString(ctx, prop);
 		if (name == NULL)
 			return;
@@ -16767,7 +16792,7 @@ static JSValue win_vita_watch_misses(JSContext *ctx, JSValueConst this_val,
 				     int argc, JSValueConst *argv)
 {
 	const char *label;
-	unsigned slot;
+	unsigned slot, j;
 
 	(void)this_val;
 	if (argc < 2 || !JS_IsObject(argv[0])) {
@@ -16779,6 +16804,15 @@ static JSValue win_vita_watch_misses(JSContext *ctx, JSValueConst this_val,
 	}
 	slot = miss_watch_next++ % MISS_WATCH;
 	miss_watch_obj[slot] = JS_VALUE_GET_PTR(argv[0]);
+	/* the oldest may have given way: the bits are made again */
+	memset(miss_watch_map, 0, sizeof(miss_watch_map));
+	for (j = 0; j < MISS_WATCH; j++) {
+		if (miss_watch_obj[j] != NULL) {
+			unsigned h = miss_watch_hash(miss_watch_obj[j]);
+
+			miss_watch_map[h / 32] |= 1u << (h % 32);
+		}
+	}
 	snprintf(miss_watch_label[slot], sizeof(miss_watch_label[slot]),
 		 "%s", label);
 	JS_FreeCString(ctx, label);
@@ -19641,6 +19675,7 @@ static nserror heap_start(jsheap *ret)
 			limit = (size_t)96 * 1024 * 1024;
 		}
 		JS_SetMemoryLimit(ret->rt, limit);
+		ret->limit_kb = (unsigned int)(limit / 1024);
 		/*
 		 * A cycle collection walks everything live, and QuickJS
 		 * ran the next once the heap was half again what the last
@@ -19815,7 +19850,26 @@ static jsthread *thread_make(jsheap *heap, void *win_priv, void *doc_priv,
 	if (ret == NULL) {
 		return NULL;
 	}
+	/*
+	 * What closed pages left is collected after the next page has
+	 * loaded (heap_collect_cb), but not when it would crowd the new
+	 * page out (VitaSurf): past three quarters of the runtime's limit
+	 * it goes now, and a context that cannot be made for want of
+	 * memory is made again after it. A page left at the limit had
+	 * left the next with no room for its context, and the context
+	 * QuickJS gave up on stayed on its collector's list (patch 0490).
+	 * Below that QuickJS collects by itself before 7/8 of the limit.
+	 */
+	if (heap->closed_uncollected > 0 &&
+	    runtime_kb(heap->rt) > heap->limit_kb / 4 * 3) {
+		heap_collect_now(heap, "before a new page, past three "
+				 "quarters of the runtime's limit");
+	}
 	ret->ctx = JS_NewContext(heap->rt);
+	if (ret->ctx == NULL && heap->closed_uncollected > 0) {
+		heap_collect_now(heap, "a new page's context did not fit");
+		ret->ctx = JS_NewContext(heap->rt);
+	}
 	JS_GetLazyCompileStats(heap->rt, &ret->lazy_count0, &ret->lazy_ms0);
 	if (ret->ctx == NULL) {
 		free(ret);
@@ -19926,19 +19980,79 @@ nserror js_newthread(jsheap *heap, void *win_priv, void *doc_priv,
  * page's scripts can hold tens of MB and the runtime's memory limit is
  * shared by every page in the window.
  */
-/** Collect what the pages closed since the last collection left. */
+/* How long the collection of closed pages waits for the next page */
+#define HEAP_COLLECT_WAIT_MS 20000u
+
+/** Whether a page with script in this runtime is still loading. */
+static bool heap_page_loading(jsheap *heap)
+{
+	jsthread *t;
+
+	for (t = all_threads; t != NULL; t = t->all_next) {
+		if (t->heap == heap && !t->closed && t->htmlc != NULL &&
+		    t->htmlc->base.status != CONTENT_STATUS_DONE) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Collect what the pages closed since the last collection left.
+ *
+ * Not while the page that replaced them is loading (VitaSurf): the
+ * collection is mostly freeing the closed page's objects, one at a
+ * time, and it held the main loop just as the next page's fetches and
+ * parse began, 54 s over build 765's 27 sites, Medium's 3.5 s for
+ * 88 MB. It waits until that page is done or 20 s have passed, and is
+ * not run at all if QuickJS has collected meanwhile, as it does by
+ * itself when the heap grows (JS_SetGCGrowth), which frees the same.
+ */
+static void heap_collect_now(jsheap *heap, const char *why)
+{
+	uint64_t t0 = now_ms();
+	unsigned int before = runtime_kb(heap->rt), ms;
+
+	guit->misc->schedule(-1, heap_collect_cb, heap);
+	JS_RunGC(heap->rt);
+	ms = (unsigned int)(now_ms() - t0);
+	vitasurf_ms_teardown += ms;
+	vita_log("qjs: collected what %u closed pages left in %u ms, "
+		 "runtime memory %u KB, was %u KB; %s",
+		 heap->closed_uncollected, ms, runtime_kb(heap->rt), before,
+		 why);
+	heap->closed_uncollected = 0;
+}
+
 static void heap_collect_cb(void *p)
 {
 	jsheap *heap = p;
 	uint64_t t0 = now_ms();
 	unsigned int before = runtime_kb(heap->rt), ms;
+	uint32_t runs = 0;
+	uint64_t gc_ns = 0;
 
+	JS_GetGCStats(heap->rt, &runs, &gc_ns);
+	if (runs != heap->closed_gc_runs) {
+		vita_log("qjs: what %u closed pages left was collected with "
+			 "the runtime's own collection, %u ms after they "
+			 "closed", heap->closed_uncollected,
+			 (unsigned int)(t0 - heap->closed_at));
+		heap->closed_uncollected = 0;
+		return;
+	}
+	if (t0 - heap->closed_at < HEAP_COLLECT_WAIT_MS &&
+	    heap_page_loading(heap)) {
+		guit->misc->schedule(250, heap_collect_cb, heap);
+		return;
+	}
 	JS_RunGC(heap->rt);
 	ms = (unsigned int)(now_ms() - t0);
 	vitasurf_ms_teardown += ms;
 	vita_log("qjs: collected what %u closed pages left in %u ms, "
-		 "runtime memory %u KB, was %u KB",
-		 heap->closed_uncollected, ms, runtime_kb(heap->rt), before);
+		 "runtime memory %u KB, was %u KB; %u ms after they closed",
+		 heap->closed_uncollected, ms, runtime_kb(heap->rt), before,
+		 (unsigned int)(t0 - heap->closed_at));
 	heap->closed_uncollected = 0;
 }
 
@@ -20061,6 +20175,11 @@ nserror js_closethread(jsthread *thread)
 	 * collections, 2761 ms, the first three freeing almost nothing.
 	 */
 	if (thread->heap->closed_uncollected++ == 0) {
+		uint64_t gc_ns = 0;
+
+		thread->heap->closed_at = now_ms();
+		JS_GetGCStats(thread->heap->rt, &thread->heap->closed_gc_runs,
+			      &gc_ns);
 		guit->misc->schedule(0, heap_collect_cb, thread->heap);
 	}
 	t1 = now_ms();

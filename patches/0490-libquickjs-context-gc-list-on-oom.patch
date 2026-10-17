@@ -1,0 +1,16 @@
+diff --git a/quickjs.c b/quickjs.c
+index 389a640..7af9b5b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2687,6 +2687,11 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
+     ctx->class_proto = js_malloc_rt(rt, sizeof(ctx->class_proto[0]) *
+                                     rt->class_count);
+     if (!ctx->class_proto) {
++        /* off the GC's list before it goes (VitaSurf): a context made
++           with the runtime at its memory limit was freed while still
++           on it, and the next collection read the freed memory as a
++           context and crashed */
++        remove_gc_object(&ctx->header);
+         js_free_rt(rt, ctx);
+         return NULL;
+     }
