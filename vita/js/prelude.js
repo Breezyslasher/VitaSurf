@@ -1903,8 +1903,39 @@ function csFromSt(st,k){
  v=[];for(i=0;i<4;i++)v.push(st[g[0]+i]+'px');
  return v[0]===v[1]&&v[0]===v[2]&&v[0]===v[3]?v[0]:
   v[1]===v[3]?(v[0]===v[2]?v[0]+' '+v[1]:v[0]+' '+v[1]+' '+v[2]):v.join(' ');}
+/* A positioned element's offsets are the used ones (VitaSurf), as CSSOM
+   resolves them: absolute and fixed from the laid-out box against its
+   containing block's padding box, relative and sticky the other side
+   negated when one is auto, 0px when both are. The cascade's auto, and
+   a calc() it could not write, had been given back as they were. */
+var CS_OFFSET={top:'bottom',bottom:'top',left:'right',right:'left'};
+function csOffset(cs,s,k){
+ var el=s.el,pos,a,o,r,cb,cr,x0,y0,w,h,m,v;
+ if(s.pb||!el||el.nodeType!==1)return undefined;
+ pos=csGet(cs,'position');
+ if(pos==='relative'||pos==='sticky'){
+  a=csMore(s,k);o=csMore(s,CS_OFFSET[k]);
+  if(a!=='auto')return undefined;
+  if(o==='auto')return '0px';
+  return /^-?[\d.]+px$/.test(o)?(-parseFloat(o))+'px':undefined;}
+ if((pos!=='absolute'&&pos!=='fixed')||csGet(cs,'display')==='none'||!el.isConnected)return undefined;
+ r=el.getBoundingClientRect();
+ m=function(n){return parseFloat(csGet(cs,'margin'+n))||0;};
+ cb=pos==='fixed'?null:el.offsetParent;
+ if(cb&&cb===D.body&&computedStyle(cb).position==='static')cb=null;
+ if(cb){cr=cb.getBoundingClientRect();x0=cr.left+cb.clientLeft;y0=cr.top+cb.clientTop;w=cb.clientWidth;h=cb.clientHeight;}
+ else{x0=pos==='fixed'?0:-(W.scrollX||0);y0=pos==='fixed'?0:-(W.scrollY||0);
+  w=D.documentElement.clientWidth;h=D.documentElement.clientHeight;}
+ switch(k){
+ case 'left':v=r.left-m('Left')-x0;break;
+ case 'top':v=r.top-m('Top')-y0;break;
+ case 'right':v=w-(r.left-m('Left')-x0)-(m('Left')+r.width+m('Right'));break;
+ default:v=h-(r.top-m('Top')-y0)-(m('Top')+r.height+m('Bottom'));}
+ return (Math.round(v*1000)/1000)+'px';}
 function csCompute(cs,s,k){
- var v=csMore(s,k),st,inl,el=s.el;
+ var v,st,inl,el=s.el;
+ if(CS_OFFSET[k]&&(v=csOffset(cs,s,k))!==undefined)return v;
+ v=csMore(s,k);
  if(typeof v==='string')return v;
  /* a ::before or ::after that is not there still answers, with no content */
  if(k==='content'&&s.pb)return 'none';

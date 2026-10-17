@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Positioned offsets</title></head>
+<body style="margin:8px">
+<!--
+ getComputedStyle's top, right, bottom and left for a positioned element
+ are the used values, as CSSOM resolves them and Chrome gives them:
+ absolute and fixed from the box against the containing block's padding
+ box, calc() included; relative the other side negated, or 0px; static
+ the cascade's auto. They had been auto for auto and for any calc().
+ The expected values are Chrome's; the ones that depend on the viewport
+ are worked out from it.
+-->
+<div style="position:relative;width:500px;height:44px;border:3px solid;padding:5px;margin-top:20px">
+<div id=a style="position:absolute;right:111px;width:38px;height:10px"></div>
+<div id=b style="position:absolute;right:calc(51px + 60px);width:38px;height:10px;margin:2px 4px"></div>
+<div id=c style="position:absolute;right:calc(50% + 6px);width:38px;height:10px"></div>
+<div id=e style="position:absolute;top:calc(1px + 2px);left:min(6px,1ch);width:38px;height:10px"></div>
+<div id=f style="position:relative;left:7px;width:38px;height:10px"></div>
+<div id=g style="position:relative;width:38px;height:10px"></div>
+<div id=h style="position:static;width:38px;height:10px"></div>
+</div>
+<div id=i style="position:absolute;left:30px;top:40px;width:10px;height:10px"></div>
+<div id=j style="position:fixed;right:20px;bottom:10px;width:10px;height:10px"></div>
+<script>
+setTimeout(function () {
+  var W = document.documentElement.clientWidth, H = document.documentElement.clientHeight;
+  var want = {
+    a: '5px 111px 39px 361px', b: '5px 111px 35px 353px', c: '5px 261px 39px 211px',
+    e: '3px 466px 41px 6px', f: '0px -7px 0px 7px', g: '0px 0px 0px 0px',
+    h: 'auto auto auto auto',
+    i: '40px ' + (W - 40) + 'px ' + (H - 50) + 'px 30px',
+    j: (H - 20) + 'px 20px 10px ' + (W - 30) + 'px'
+  };
+  var bad = 0;
+  Object.keys(want).forEach(function (id) {
+    var c = getComputedStyle(document.getElementById(id));
+    var got = [c.top, c.right, c.bottom, c.left].join(' ');
+    if (got !== want[id]) { bad++; console.log('positioned-offsets: FAIL ' + id + ' ' + got + ', want ' + want[id]); }
+  });
+  console.log('positioned-offsets: ' + (bad ? 'FAIL' : 'PASS') + ' ' + (Object.keys(want).length - bad) + ' of ' + Object.keys(want).length);
+}, 300);
+</script>
+</body></html>
