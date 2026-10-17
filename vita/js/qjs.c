@@ -13429,6 +13429,43 @@ static JSValue win_vita_utf8_decode(JSContext *ctx, JSValueConst this_val,
 }
 
 /*
+ * __vitaUtf8Encode(str): TextEncoder's encode, the string's UTF-8 in a
+ * Uint8Array (VitaSurf). QuickJS writes a lone surrogate as its own three
+ * bytes, ED A0..BF xx, where the Encoding standard writes the
+ * replacement character, EF BF BD, also three; a pair it has already
+ * joined into one code point. The prelude had made the bytes with
+ * encodeURIComponent and copied them a byte at a time in script: half
+ * of the Washington Post's script profile, its request bodies.
+ */
+static JSValue win_vita_utf8_encode(JSContext *ctx, JSValueConst this_val,
+				    int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	size_t len = 0, n = 0, i;
+	const char *str;
+	JSValue out;
+	uint8_t *p;
+
+	(void)this_val;
+	if (argc < 1) return JS_NewUint8ArrayCopy(ctx, NULL, 0);
+	str = JS_ToCStringLen2(ctx, &len, argv[0], false);
+	if (str == NULL) return JS_EXCEPTION;
+	out = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)str, len);
+	JS_FreeCString(ctx, str);
+	if (JS_IsException(out)) return out;
+	p = JS_GetUint8Array(ctx, &n, out);
+	for (i = 0; p != NULL && i + 2 < n; i++) {
+		if (p[i] == 0xED && p[i + 1] >= 0xA0 && p[i + 1] <= 0xBF) {
+			p[i] = 0xEF;
+			p[i + 1] = 0xBF;
+			p[i + 2] = 0xBD;
+			i += 2;
+		}
+	}
+	return out;
+}
+
+/*
  * The Symbol.hasInstance of Node, Element, Text and the other types
  * told apart by nodeType: bit t of the mask is set for each type t
  * that counts (VitaSurf). A node wrapper's type comes straight from
@@ -14136,9 +14173,26 @@ static void sm_colour(char *buf, size_t len, css_color c)
 	snprintf(buf, len, "rgba(%u, %u, %u, %s)", r, g, b, fs);
 }
 
+/*
+ * One property wanted of __vitaStyleMore (VitaSurf): getComputedStyle
+ * reads a property at a time, and each read had every property written
+ * out as a string into an object of its own, 70 us a call natively,
+ * where Amazon's script spent a fifth of its time. With a name wanted,
+ * only its value is made, the last written winning as in the object.
+ */
+static const char *sm_want;
+static JSValue sm_got;
+
 static void sm_set(JSContext *ctx, JSValue obj, const char *name,
 		const char *value)
 {
+	if (sm_want != NULL) {
+		if (strcmp(name, sm_want) == 0) {
+			JS_FreeValue(ctx, sm_got);
+			sm_got = JS_NewString(ctx, value);
+		}
+		return;
+	}
 	JS_SetPropertyStr(ctx, obj, name, JS_NewString(ctx, value));
 }
 
@@ -14666,6 +14720,7 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	uint8_t t;
 	const css_select_results *owned = NULL;
 	css_unit_ctx local_uctx;
+	const char *want = NULL;
 
 	(void)this_val;
 	if (argc < 1 || thread == NULL || thread->htmlc == NULL)
@@ -14725,7 +14780,16 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	}
 	uctx = owned != NULL ? fresh_uctx(thread, node, &local_uctx) :
 			&thread->htmlc->unit_len_ctx;
-	obj = JS_NewObject(ctx);
+	if (argc > 2 && JS_IsString(argv[2])) {
+		want = JS_ToCString(ctx, argv[2]);
+	}
+	if (want != NULL) {
+		sm_want = want;
+		sm_got = JS_UNDEFINED;
+		obj = JS_UNDEFINED;
+	} else {
+		obj = JS_NewObject(ctx);
+	}
 
 	/* the font, which em and line-height resolve against */
 	css_computed_font_size(s, &v, &u);
@@ -14918,25 +14982,23 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			"normal");
 	sm_len_prop(ctx, obj, "wordSpacing", s, uctx,
 			css_computed_word_spacing, CSS_WORD_SPACING_SET, "0px");
-	sm_len_prop(ctx, obj, "textIndent", s, uctx, css_computed_text_indent,
-			CSS_TEXT_INDENT_SET, "0px");
 	{
-		/* its hanging and each-line, after the length */
+		/* the length, then its hanging and each-line */
 		uint8_t mode = css_computed_text_indent_mode(s);
+		size_t n;
 
-		if (mode != 0) {
-			JSValue ti = JS_GetPropertyStr(ctx, obj, "textIndent");
-			const char *t = JS_ToCString(ctx, ti);
-
-			snprintf(buf, sizeof(buf), "%s%s%s", t ? t : "0px",
-					(mode & CSS_TEXT_INDENT_HANGING) ?
-					" hanging" : "",
-					(mode & CSS_TEXT_INDENT_EACH_LINE) ?
-					" each-line" : "");
-			JS_FreeCString(ctx, t);
-			JS_FreeValue(ctx, ti);
-			sm_set(ctx, obj, "textIndent", buf);
-		}
+		if (css_computed_text_indent(s, &v, &u) ==
+				CSS_TEXT_INDENT_SET)
+			sm_length(buf, sizeof(buf), s, uctx, v, u);
+		else
+			snprintf(buf, sizeof(buf), "0px");
+		n = strlen(buf);
+		snprintf(buf + n, sizeof(buf) - n, "%s%s",
+				(mode & CSS_TEXT_INDENT_HANGING) ?
+				" hanging" : "",
+				(mode & CSS_TEXT_INDENT_EACH_LINE) ?
+				" each-line" : "");
+		sm_set(ctx, obj, "textIndent", buf);
 	}
 	t = css_computed_vertical_align(s, &v, &u);
 	if (t == CSS_VERTICAL_ALIGN_SET) {
@@ -15500,6 +15562,14 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			}
 			sm_set(ctx, obj, "content", buf);
 		}
+	}
+	if (want != NULL) {
+		JSValue got = sm_got;
+
+		sm_want = NULL;
+		sm_got = JS_UNDEFINED;
+		JS_FreeCString(ctx, want);
+		return got;
 	}
 	return obj;
 }
@@ -18186,6 +18256,110 @@ static JSValue win_vita_box(JSContext *ctx, JSValueConst this_val,
 	return arr;
 }
 
+/** Which of the names offsetParent cares about an element has: 1 body,
+ * 2 html, 3 td, th or table, 0 another. */
+static int offset_kind(struct dom_node *n)
+{
+	dom_string *name = NULL;
+	const char *d;
+	int kind = 0;
+
+	if (dom_node_get_node_name(n, &name) != DOM_NO_ERR || name == NULL)
+		return 0;
+	d = dom_string_data(name);
+	if (strcmp(d, "BODY") == 0) kind = 1;
+	else if (strcmp(d, "HTML") == 0) kind = 2;
+	else if (strcmp(d, "TD") == 0 || strcmp(d, "TH") == 0 ||
+		 strcmp(d, "TABLE") == 0) kind = 3;
+	dom_string_unref(name);
+	return kind;
+}
+
+/*
+ * __vitaOffset(el): [offsetParent, offsetTop, offsetLeft] as CSSOM View
+ * has them, or null for an element with no box (VitaSurf). The parent
+ * is the nearest ancestor that is positioned, or a td, th or table
+ * while the element itself is not, or the body; none for the root, the
+ * body, or a fixed element. The offsets are from its padding edge, or
+ * from the document's origin when it is the body or there is none. The
+ * prelude had taken the body as every element's offsetParent and read
+ * two boxes in script for each offset: Apple's gallery measured its
+ * items so, a quarter of its script.
+ */
+static JSValue win_vita_offset(JSContext *ctx, JSValueConst this_val,
+			       int argc, JSValueConst *argv)
+{
+	C_WHERE;
+	jsthread *thread = JS_GetContextOpaque(ctx);
+	struct dom_node *node, *cur, *up, *parent = NULL;
+	struct box *box, *pbox = NULL;
+	uint8_t pos;
+	int x, y, ex, ey, px = 0, py = 0, kind;
+	JSValue arr;
+
+	(void)this_val;
+	if (argc < 1 || thread == NULL)
+		return JS_NULL;
+	node = JS_GetOpaque(argv[0], node_class_id);
+	if (node == NULL)
+		return JS_NULL;
+	layout_flush(thread);
+	if (!layout_current(thread))
+		return JS_NULL;
+	box = box_for_node(node);
+	if (box == NULL || box->style == NULL ||
+	    (box->flags & DISPLAY_CONTENTS))
+		return JS_NULL;
+
+	if (box->type == BOX_INLINE && box->inline_end != NULL) {
+		int iw, ih;
+
+		inline_border_box(box, &ex, &ey, &iw, &ih);
+	} else {
+		box_coords(box, &x, &y);
+		ex = x - box->border[LEFT].width;
+		ey = y - box->border[TOP].width;
+	}
+
+	pos = css_computed_position(box->style);
+	kind = offset_kind(node);
+	if (kind != 1 && kind != 2 && pos != CSS_POSITION_FIXED) {
+		/* each step's node is referenced, and let go once past */
+		for (up = tree_up(node); up != NULL; up = cur) {
+			struct box *ab;
+			int ak = offset_kind(up);
+
+			if (ak == 1) {
+				parent = up;
+				break;
+			}
+			ab = box_for_node(up);
+			if ((ab != NULL && ab->style != NULL &&
+			     css_computed_position(ab->style) !=
+					CSS_POSITION_STATIC) ||
+			    (ak == 3 && pos == CSS_POSITION_STATIC)) {
+				parent = up;
+				pbox = ab;
+				break;
+			}
+			cur = tree_up(up);
+			dom_node_unref(up);
+		}
+	}
+
+	if (pbox != NULL) {
+		box_coords(pbox, &px, &py);
+	}
+	arr = JS_NewArray(ctx);
+	JS_SetPropertyUint32(ctx, arr, 0, parent != NULL ?
+			     wrap_node(ctx, parent) : JS_NULL);
+	set_index(ctx, arr, 1, ey - py);
+	set_index(ctx, arr, 2, ex - px);
+	if (parent != NULL)
+		dom_node_unref(parent);
+	return arr;
+}
+
 static struct gui_window *thread_gui_window(jsthread *thread)
 {
 	if (thread == NULL || thread->win == NULL) {
@@ -18830,6 +19004,9 @@ static bool setup_globals(jsthread *thread)
 	JS_SetPropertyStr(ctx, global, "__vitaMOUnwatch",
 			  JS_NewCFunction(ctx, win_vita_mo_unwatch,
 					  "__vitaMOUnwatch", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaUtf8Encode",
+			  JS_NewCFunction(ctx, win_vita_utf8_encode,
+					  "__vitaUtf8Encode", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaUtf8Decode",
 			  JS_NewCFunction(ctx, win_vita_utf8_decode,
 					  "__vitaUtf8Decode", 1));
@@ -18913,6 +19090,9 @@ static bool setup_globals(jsthread *thread)
 					  "__vitaPopover", 2));
 	JS_SetPropertyStr(ctx, global, "__vitaBox",
 			  JS_NewCFunction(ctx, win_vita_box, "__vitaBox", 1));
+	JS_SetPropertyStr(ctx, global, "__vitaOffset",
+			  JS_NewCFunction(ctx, win_vita_offset,
+					  "__vitaOffset", 1));
 	JS_SetPropertyStr(ctx, global, "__vitaCurrentSrc",
 			  JS_NewCFunction(ctx, win_vita_current_src,
 					  "__vitaCurrentSrc", 1));

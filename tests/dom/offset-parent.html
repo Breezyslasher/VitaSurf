@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<!--
+  offsetParent, offsetTop and offsetLeft as CSSOM View has them
+  (VitaSurf): the nearest positioned ancestor, or a td, th or table
+  for a static element, or the body; offsets from that ancestor's
+  padding edge, or from the document's origin when it is the body.
+  Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>offsetParent</title>
+<style>
+body { margin: 8px; }
+#rel { position: relative; margin: 20px; border: 5px solid; padding: 10px; }
+#abs { position: absolute; left: 30px; top: 40px; }
+#fix { position: fixed; top: 3px; left: 4px; }
+td { padding: 6px; }
+</style></head>
+<body>
+<div id="plain" style="margin-top:10px">plain</div>
+<div id="rel"><div id="inner" style="margin-left:7px">inner</div><div id="abs">abs</div></div>
+<div id="fix">fix</div>
+<table id="t" style="border-spacing:0"><tr><td id="cell"><span id="cs" style="display:block">in a cell</span></td></tr></table>
+<div id="none" style="display:none"><span id="hid">x</span></div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('offset-parent: ' + l); }
+function $(id) { return document.getElementById(id); }
+function id(e) { return e === null ? 'null' : (e.id || e.tagName); }
+addEventListener('load', function () {
+  ok('a static element in the body has the body', id($('plain').offsetParent), 'BODY');
+  ok('its top is from the document, its margin collapsed with the body\'s', $('plain').offsetTop, 10);
+  ok('inside a positioned element', id($('inner').offsetParent), 'rel');
+  ok('from its padding edge', $('inner').offsetTop + ',' + $('inner').offsetLeft, '10,17');
+  ok('absolute in it', $('abs').offsetTop + ',' + $('abs').offsetLeft, '40,30');
+  ok('fixed has none', $('fix').offsetParent, null);
+  ok('fixed is from the document', $('fix').offsetTop + ',' + $('fix').offsetLeft, '3,4');
+  ok('a static element in a cell has the cell', id($('cs').offsetParent), 'cell');
+  ok('from the cell padding edge', $('cs').offsetTop, 6);
+  ok('the body has none', document.body.offsetParent, null);
+  ok('the root has none', document.documentElement.offsetParent, null);
+  ok('an element with no box has none', $('hid').offsetParent, null);
+  ok('and offsets of nothing', $('hid').offsetTop, 0);
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('offset-parent: done');
+});
+</script></body></html>

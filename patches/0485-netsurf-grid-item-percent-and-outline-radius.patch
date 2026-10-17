@@ -1,0 +1,80 @@
+diff --git a/content/handlers/html/layout_grid.c b/content/handlers/html/layout_grid.c
+index f661e2f0d..d08dea50b 100644
+--- a/content/handlers/html/layout_grid.c
++++ b/content/handlers/html/layout_grid.c
+@@ -1564,6 +1564,20 @@ static bool grid_layout_item(struct grid_ctx *ctx, struct grid_item *it,
+ 	struct box *b = it->box;
+ 	bool success;
+ 
++	/* an item's percentages are of its grid area, which is known only
++	 * now its tracks are sized: they had been of the whole grid, so
++	 * CNN's picture beside a headline, width: 100% in the second of
++	 * two columns, was as wide as both and ran off the page (VitaSurf) */
++	if (area_w >= 0 && area_w != ctx->avail_w) {
++		b->float_container = b->parent;
++		layout_find_dimensions(ctx->unit_len_ctx, area_w, -1,
++				b, b->style, &b->width, &b->height,
++				&it->max_width, &it->min_width,
++				&it->max_height, &it->min_height,
++				b->margin, b->padding, b->border);
++		b->float_container = NULL;
++	}
++
+ 	if (b->width == AUTO) {
+ 		enum css_justify_self_e j = lh__box_justify_self(ctx->grid, b);
+ 
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index 1a792a682..0a27f22b3 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -8001,6 +8001,42 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			oy0 = y - border_top - ow - off;
+ 			ox1 = x + padding_width + border_right + ow + off;
+ 			oy1 = y + padding_height + border_bottom + ow + off;
++			{
++				/* a rounded box's outline follows its
++				 * corners, each radius grown by the offset
++				 * and the outline's width, as browsers draw
++				 * it since CSS UI 4 said so: Yahoo's search
++				 * pill, an outline at -2px, was a rectangle
++				 * (VitaSurf) */
++				struct rect bb = {
++					x - border_left, y - border_top,
++					x + padding_width + border_right,
++					y + padding_height + border_bottom };
++				struct html_corner_radii rr;
++
++				if (html_box_corner_radii(box, &bb,
++						&html->unit_len_ctx, scale,
++						&rr)) {
++					struct rect outer = {
++						ox0, oy0, ox1, oy1 };
++					int grow = off + ow;
++#define GROW(v) do { if ((v) > 0) { (v) += grow; \
++		if ((v) < 0) (v) = 0; } } while (0)
++					GROW(rr.tl_h); GROW(rr.tl_v);
++					GROW(rr.tr_h); GROW(rr.tr_v);
++					GROW(rr.br_h); GROW(rr.br_v);
++					GROW(rr.bl_h); GROW(rr.bl_v);
++#undef GROW
++					if (outer.x1 > outer.x0 &&
++							outer.y1 > outer.y0 &&
++							html_plot_rounded_ring(
++							ctx, ostyle.fill_colour,
++							&outer, &rr, ow) !=
++							NSERROR_OK)
++						return false;
++					goto outline_done;
++				}
++			}
+ 			struct rect ring[4] = {
+ 				{ ox0, oy0, ox1, oy0 + ow },
+ 				{ ox0, oy1 - ow, ox1, oy1 },
+@@ -8016,6 +8052,7 @@ static bool html_redraw_box_inner(const html_content *html, struct box *box,
+ 			}
+ 		}
+ 	}
++outline_done:
+ 
+ 	/*
+ 	 * Column rules (VitaSurf): a line in the middle of each gap of a

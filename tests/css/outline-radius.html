@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<!--
+  An outline follows a rounded box's corners (VitaSurf), as browsers
+  draw it: each radius grown by outline-offset and the outline's width.
+  To look at: the first box is a purple pill drawn by its outline at
+  -2px, as Yahoo's search field is; the second has a rounded ring 4px
+  outside its rounded border; the third, square, keeps a square
+  outline.
+-->
+<html><head><meta charset="utf-8"><title>Outline radius</title>
+<style>
+div { width: 300px; height: 46px; margin: 20px; }
+#a { border-radius: 100px; outline: 2px solid rgb(70 31 140 / 60%); outline-offset: -2px; background: #f5f0ff; }
+#b { border-radius: 12px; border: 1px solid #888; outline: 2px solid #06c; outline-offset: 4px; }
+#c { outline: 2px solid #c00; }
+</style></head>
+<body><div id="a"></div><div id="b"></div><div id="c"></div></body></html>

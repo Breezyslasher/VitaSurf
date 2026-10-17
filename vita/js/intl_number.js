@@ -75,9 +75,54 @@ NV.__vitaIntlNumber = function (W, N, C, install) {
 		d = JSON.parse(N.pak(kind + ':' + tag) || '{}');
 		p = index().parents[tag];
 		if (p)
-			d = merge(entry(kind, p), d);
+			d = mergeTop(entry(kind, p), d);
 		cache[tag] = d;
 		return d;
+	}
+
+	/* merge(base, diff) for a locale's entry, each of its tables merged
+	 * when first read (VitaSurf): a format reads one or two of them,
+	 * and merging the units, compact forms and names it never reads
+	 * was most of a locale's first NumberFormat. The keys are base's in
+	 * base's order and then diff's, as merge gives them. */
+	function mergeTop(base, diff) {
+		var out = {}, keys = Object.keys(base), i, k;
+
+		for (i = 0; i < keys.length; i++) {
+			k = keys[i];
+			if (Object.prototype.hasOwnProperty.call(diff, k))
+				put(out, k, base, diff[k]);
+			else
+				Object.defineProperty(out, k,
+					Object.getOwnPropertyDescriptor(base, k));
+		}
+		keys = Object.keys(diff);
+		for (i = 0; i < keys.length; i++) {
+			k = keys[i];
+			if (!Object.prototype.hasOwnProperty.call(base, k))
+				out[k] = diff[k];
+		}
+		return out;
+	}
+
+	function put(out, k, base, v) {
+		if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+			out[k] = v;
+			return;
+		}
+		Object.defineProperty(out, k, { configurable: true,
+			enumerable: true,
+			get: function () {
+				var m = merge(base[k], v);
+
+				Object.defineProperty(this, k, { configurable: true,
+					enumerable: true, writable: true, value: m });
+				return m;
+			},
+			set: function (x) {
+				Object.defineProperty(this, k, { configurable: true,
+					enumerable: true, writable: true, value: x });
+			} });
 	}
 
 	/* the CLDR locale an available locale takes its data from */

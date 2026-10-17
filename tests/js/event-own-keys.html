@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!--
+  An event's attributes are its interface's, on the prototype, and its
+  only own property is isTrusted, as WebIDL has it (VitaSurf): the other
+  platform objects keep what they hold out of sight the same way, so
+  Object.keys, for-in and JSON.stringify find what they find in Chrome.
+  Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Event own keys</title>
+<style>.x { color: red }</style></head><body>
+<div id="a">a</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('event-own-keys: ' + l); }
+function keys(o) { return Object.keys(o).join(','); }
+var a = document.getElementById('a'), seen = {};
+a.addEventListener('click', function (e) {
+  seen.click = keys(e);
+  seen.json = JSON.stringify(e);
+  seen.target = e.target === a;
+  seen.view = e.view === window;
+  seen.bubbles = e.bubbles;
+  seen.phase = e.eventPhase;
+  seen.forin = (function () { var n = 0; for (var k in e) if (k === 'view' || k === 'target') n++; return n; })();
+});
+a.click();
+ok('a click has isTrusted alone', seen.click, 'isTrusted');
+ok('JSON of a click', seen.json, '{"isTrusted":false}');
+ok('its target reads', seen.target, true);
+ok('its view reads', seen.view, true);
+ok('bubbles reads', seen.bubbles, true);
+ok('eventPhase while at its target', seen.phase, 2);
+ok('for-in finds target and view on the prototype', seen.forin, 2);
+var ce = new CustomEvent('z', { detail: 7 });
+ok('a CustomEvent', keys(ce), 'isTrusted');
+ok('its detail', ce.detail, 7);
+ok('detail is CustomEvent.prototype\'s', Object.prototype.hasOwnProperty.call(CustomEvent.prototype, 'detail'), true);
+ok('type is Event.prototype\'s', Object.prototype.hasOwnProperty.call(Event.prototype, 'type'), true);
+var me = new MouseEvent('mousedown', { clientX: 3, clientY: 4 });
+ok('a MouseEvent', keys(me), 'isTrusted');
+ok('its clientX', me.clientX, 3);
+ok('its pageY', me.pageY, 4);
+ok('an XMLHttpRequest', keys(new XMLHttpRequest()), '');
+ok('Headers', keys(new Headers({ a: '1' })), '');
+ok('a Blob', keys(new Blob(['xy'])), '');
+ok('a Blob\'s size', new Blob(['xy']).size, 2);
+ok('a style rule', keys(document.styleSheets[0].cssRules[0]), '');
+var mo = new MutationObserver(function () {});
+ok('a MutationObserver', keys(mo), '');
+document.getElementById('out').textContent = out.join('\n');
+console.log('event-own-keys: done');
+</script></body></html>

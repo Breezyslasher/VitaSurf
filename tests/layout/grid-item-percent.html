@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!--
+  A grid item's percentages are of its grid area (VitaSurf): a picture
+  beside a headline with width: 100% in the second of two columns (CNN's
+  side-by-side feature) is that column's width, not the grid's. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Grid item percentages</title></head>
+<body style="margin:0">
+<div id="g" style="display:grid;grid-template-columns:1fr 2fr;gap:24px;width:768px">
+ <a id="m" href="#" style="display:block;width:100%;grid-row-start:1;grid-column-start:2">media</a>
+ <a id="h" href="#" style="display:block;grid-row-start:1;grid-column-start:1">headline</a>
+ <div id="p" style="width:50%;padding-left:25%;grid-column-start:2">half</div>
+</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('grid-item-percent: ' + l); }
+function r(id) { return document.getElementById(id).getBoundingClientRect(); }
+addEventListener('load', function () {
+  ok('the second column starts after the first and the gap', r('m').left, 272);
+  ok('100% is the column', r('m').width, 496);
+  ok('the headline keeps the first column', r('h').width, 248);
+  ok('50% and padding are of the column', r('p').width, 248 + 124);
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('grid-item-percent: done');
+});
+</script>
+</body></html>

@@ -233,8 +233,12 @@ function isViewportEl(el){return el===D.documentElement;}
 var BOXIDX={offsetWidth:2,offsetHeight:3,clientLeft:6,clientTop:7,scrollWidth:8,scrollHeight:9};
 Object.keys(BOXIDX).forEach(function(a){var i=BOXIDX[a];Object.defineProperty(P,a,{configurable:true,get:function(){return boxOf(this)[i];}});});
 ['clientWidth','clientHeight'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){if(isViewportEl(this)){return viewport()[2+n];}return boxOf(this)[4+n];}});});
-Object.defineProperty(P,'offsetParent',{configurable:true,get:function(){var n=this.parentNode;while(n&&n.nodeType===1&&n!==D.body&&n!==D.documentElement)n=n.parentNode;return n&&n.nodeType===1?n:null;}});
-['offsetTop','offsetLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){var b=NV.__vitaBox(this);if(!b)return 0;var p=this.offsetParent,pb=p?NV.__vitaBox(p):null;return b[1-n]-(pb?pb[1-n]:0);}});});
+/* offsetParent and the offsets from it, as CSSOM View has them, worked
+   out natively: the nearest positioned ancestor, or a td, th or table
+   for a static element, or the body (VitaSurf; it had been the body for
+   every element, and each offset read two boxes in script) */
+Object.defineProperty(P,'offsetParent',{configurable:true,get:function(){var o=NV.__vitaOffset(this);return o?o[0]:null;}});
+['offsetTop','offsetLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){var o=NV.__vitaOffset(this);return o?o[1+n]:0;}});});
 ['scrollTop','scrollLeft'].forEach(function(a,n){Object.defineProperty(P,a,{configurable:true,get:function(){if(isViewportEl(this)||this===D.body){return viewport()[1-n];}return boxOf(this)[11-n];},set:function(v){if(isViewportEl(this)||this===D.body){var s=viewport();NV.__vitaScrollTo(n===1?Number(v)||0:s[0],n===1?s[1]:Number(v)||0);}
  /* a box that scrolls its own content (VitaSurf) */
  else if(typeof NV.__vitaScrollElement==='function')NV.__vitaScrollElement(this,n===1?Number(v)||0:null,n===1?null:Number(v)||0);}});});
@@ -267,7 +271,10 @@ function isDisabledControl(el){
   FORM_CONTROLS.indexOf(' '+el.tagName+' ')>=0&&!!el.disabled;}
 P.click=function(){
  if(isDisabledControl(this))return true;
- var e=new MouseEvent('click',{bubbles:true,cancelable:true,composed:true});
+ /* the HTML standard's synthetic pointer event, whose view is the
+    node document's window */
+ var d=this.ownerDocument,e=new MouseEvent('click',{bubbles:true,
+  cancelable:true,composed:true,view:d&&d.defaultView||null});
  return this.dispatchEvent(e);};
 P.contains=function(n){
  var f=typeof NV.__vitaIsAncestor==='function'?NV.__vitaIsAncestor(this,n):undefined;
@@ -1215,7 +1222,7 @@ function fireSimple(el,type){
 P.dispatchEvent=function(e){
  var act=null,r;
  if(e&&String(e.type)==='click'&&!e.__vitaActivated){
-  shadowProp(e,'__vitaActivated',true);
+  e.__vitaActivated=true;
   act=activationTarget(this);}
  r=NV.__vitaDispatch(this,e);
  /* dispatchEvent answers false when the event was cancelled, which is
@@ -1798,33 +1805,110 @@ function computedStyle(el,pseudo){
   for(var k in CS_DEFAULTS)empty[k]='';
   empty.width='';empty.height='';
   return empty;}
- var st=(el&&el.nodeType===1&&typeof NV.__vitaStyle==='function')?NV.__vitaStyle(el):null;
- var cs=Object.create(CS_PROTO);
- for(var k in CS_DEFAULTS)cs[k]=CS_DEFAULTS[k];
- if(el&&el.nodeType===1&&UA_DISPLAY[el.tagName])cs.display=UA_DISPLAY[el.tagName];
- if(st){
-  cs.fontSize=st[0]+'px';
-  if(CS_DISPLAY[st[1]])cs.display=CS_DISPLAY[st[1]];
-  if(CS_VIS[st[2]])cs.visibility=CS_VIS[st[2]];
-  var c=cssColour(st[3],st[5]);if(c)cs.color=c;
-  var b=cssColour(st[4],st[6]);if(b)cs.backgroundColor=b;
-  /* the margins, padding and border widths layout used */
-  if(st.length>18)[['margin',7,''],['padding',11,''],['border',15,'Width']].forEach(function(g){
-   var v=[];
-   ['Top','Right','Bottom','Left'].forEach(function(e,i){
-    v.push(cs[g[0]+e+g[2]]=st[g[1]+i]+'px');});
-   cs[g[0]+g[2]]=v[0]===v[1]&&v[0]===v[2]&&v[0]===v[3]?v[0]:
-    v[1]===v[3]?(v[0]===v[2]?v[0]+' '+v[1]:v[0]+' '+v[1]+' '+v[2]):v.join(' ');});
- }
- /* The rest of the cascade's answers, and a pseudo element's own: what
-    the element is positioned and laid out with, its font, borders and
-    text, as a browser reports them. */
- var more=(el&&el.nodeType===1&&typeof NV.__vitaStyleMore==='function')?
-  NV.__vitaStyleMore(el,typeof pseudo==='string'&&pseudo?pseudo:null):null;
- if(more)for(var mk in more){cs[mk]=more[mk];if(!CS_DASHED[mk])csDashed(mk);}
+ var cs=Object.create(CS_PROTO),ps=typeof pseudo==='string'&&pseudo?pseudo:null,c,i,k;
+ /* the methods are the prototype's and the names are listed when
+    asked for (VitaSurf): made for every call, with every property's
+    name turned to its dashed form by a regular expression, they were
+    nine tenths of a call, and lazysizes asks for an element's
+    visibility for each image near the view on every scroll check */
+ Object.defineProperty(cs,'__vitaEl',{value:el});
+ if(ps)Object.defineProperty(cs,'__vitaPseudo',{value:ps});
+ Object.defineProperty(cs,CS_SLOT,{value:{el:el,ps:ps,gen:NaN,
+  pb:!!ps&&/^::?(before|after)$/i.test(ps)}});
+ /* a name the element says inline that no getter answers yet gets one */
+ if(el&&el.nodeType===1&&typeof el.getAttribute==='function'&&el.getAttribute('style')){
+  c=styleOf(el).l;
+  for(i=0;i<c.length;i++){k=dashToCamel(c[i][0]);
+   if(!CS_GOT[k]&&!(k in CS_PROTO))csDefine(k);}}
+ return cs;
+}
+/* The declaration answers each property when it is read (VitaSurf):
+   the cascade's answer for that one name from NV.__vitaStyleMore, then
+   what the element says inline, then the box layout used, then the
+   default. Every call had built all of them, some 150 strings, and
+   Amazon's script, which asks for one or two at a time, spent a fifth
+   of itself there. What was found is kept while the document is as it
+   was (domGen), so the declaration is live, as a browser's is. */
+var CS_SLOT=Symbol('computed');
+/* every name NV.__vitaStyleMore can give */
+var CS_MORE={};
+('alignContent alignItems alignSelf anchorName appearance backfaceVisibility '+
+ 'backgroundBlendMode backgroundClip backgroundColor backgroundImage backgroundOrigin '+
+ 'backgroundPosition backgroundPositionX backgroundPositionY backgroundRepeat '+
+ 'borderBottomColor borderBottomLeftRadius borderBottomRightRadius borderBottomStyle '+
+ 'borderCollapse borderColor borderLeftColor borderLeftStyle borderRadius '+
+ 'borderRightColor borderRightStyle borderSpacing borderStyle borderTopColor '+
+ 'borderTopLeftRadius borderTopRightRadius borderTopStyle bottom boxSizing captionSide '+
+ 'caretColor clear color columnGap contain content contentVisibility cssFloat cursor '+
+ 'direction display emptyCells flexBasis flexDirection flexGrow flexShrink flexWrap '+
+ 'float fontFamily fontFeatureSettings fontSize fontSizeAdjust fontStyle fontVariant '+
+ 'fontVariantNumeric fontWeight gridAutoFlow height imageRendering initialLetter '+
+ 'justifyContent justifySelf left letterSpacing lineHeight listStyleType maxHeight '+
+ 'maxWidth minHeight minWidth objectFit objectPosition opacity order outlineColor '+
+ 'outlineOffset outlineStyle outlineWidth overflow overflowWrap overflowX overflowY '+
+ 'pointerEvents position positionAnchor positionArea right rowGap scrollbarWidth '+
+ 'shapeMargin shapeOutside strokeDashoffset strokeWidth tabSize tableLayout textAlign '+
+ 'textDecoration textDecorationColor textDecorationLine textDecorationThickness '+
+ 'textEmphasisColor textEmphasisPosition textEmphasisStyle textIndent textOverflow '+
+ 'textTransform textUnderlineOffset top unicodeBidi verticalAlign visibility '+
+ 'webkitAppearance whiteSpace width wordBreak wordSpacing wordWrap writingMode zIndex'
+).split(' ').forEach(function(k){CS_MORE[k]=1;});
+var CS_GOT={},CS_GOT_N=0;
+function csState(cs){
+ var s=cs[CS_SLOT],g;
+ if(sheetsDirty.length)sheetsWrite();
+ g=domGen();
+ if(s.gen!==g){s.gen=g;s.v=Object.create(null);s.st=undefined;s.inl=undefined;
+  s.full=undefined;s.more=true;}
+ return s;}
+function csMore(s,k){
+ var el=s.el,m;
+ if(!s.more||!CS_MORE[k])return undefined;
+ if(s.full!==undefined)return s.full?s.full[k]:undefined;
+ if(!el||el.nodeType!==1||typeof NV.__vitaStyleMore!=='function'){s.more=false;return undefined;}
+ m=NV.__vitaStyleMore(el,s.ps,k);
+ /* null: the element, or the pseudo element, has no style at all */
+ if(m===null){s.more=false;return undefined;}
+ return m;}
+function csSt(s){
+ var el=s.el;
+ if(s.st===undefined)s.st=(el&&el.nodeType===1&&typeof NV.__vitaStyle==='function')?NV.__vitaStyle(el)||null:null;
+ return s.st;}
+function csInline(s){
+ var el=s.el,l,i,o;
+ if(s.inl===undefined){
+  o=null;
+  if(el&&el.nodeType===1&&typeof el.getAttribute==='function'&&el.getAttribute('style')){
+   l=styleOf(el).l;o=Object.create(null);
+   for(i=0;i<l.length;i++)o[dashToCamel(l[i][0])]=l[i][1];}
+  s.inl=o;}
+ return s.inl;}
+var CS_BOX={margin:[7,''],padding:[11,''],border:[15,'Width']};
+var CS_SIDES=['Top','Right','Bottom','Left'];
+/* what NV.__vitaStyle says of k: the font size, display, visibility,
+   colours, and the margins, padding and border widths layout used */
+function csFromSt(st,k){
+ var m,g,i,v;
+ switch(k){
+ case 'fontSize':return st[0]+'px';
+ case 'display':return CS_DISPLAY[st[1]]||undefined;
+ case 'visibility':return CS_VIS[st[2]]||undefined;
+ case 'color':return cssColour(st[3],st[5])||undefined;
+ case 'backgroundColor':return cssColour(st[4],st[6])||undefined;}
+ if(st.length<=18)return undefined;
+ m=/^(margin|padding|border)(Top|Right|Bottom|Left)?(Width)?$/.exec(k);
+ if(!m||(m[1]==='border')!==(m[3]==='Width'))return undefined;
+ g=CS_BOX[m[1]];
+ if(m[2])return st[g[0]+CS_SIDES.indexOf(m[2])]+'px';
+ v=[];for(i=0;i<4;i++)v.push(st[g[0]+i]+'px');
+ return v[0]===v[1]&&v[0]===v[2]&&v[0]===v[3]?v[0]:
+  v[1]===v[3]?(v[0]===v[2]?v[0]+' '+v[1]:v[0]+' '+v[1]+' '+v[2]):v.join(' ');}
+function csCompute(cs,s,k){
+ var v=csMore(s,k),st,inl,el=s.el;
+ if(typeof v==='string')return v;
  /* a ::before or ::after that is not there still answers, with no content */
- if(typeof pseudo==='string'&&/^::?(before|after)$/i.test(pseudo)&&
-  (!more||more.content===undefined))cs.content='none';
+ if(k==='content'&&s.pb)return 'none';
+ st=csSt(s);
  /* Whatever the element says inline wins over the defaults, for the
     properties nothing else here can answer: a declaration the page
     wrote on the element itself is the one value that is certain, and
@@ -1832,49 +1916,65 @@ function computedStyle(el,pseudo){
     used to get the default instead of what it had just written.
     Properties libcss did answer are left alone -- the cascade has
     already taken the inline declaration into account, and it reports a
-    resolved value where the attribute is whatever the author typed. */
- if(el&&el.nodeType===1&&typeof el.getAttribute==='function'){
-  var inline=el.getAttribute('style');
-  if(inline)parseDecl(inline).forEach(function(d){
-   var k=dashToCamel(d[0]);
-   if(st&&(RESOLVED[k]||(st.length>18&&BOX_RESOLVED.test(k))))return;
-   if(more&&more[k]!==undefined)return;
-   /* the used size is layout's, which the getters below ask for */
-   if(k==='width'||k==='height')return;
-   cs[k]=d[1];if(!CS_DASHED[k])csDashed(k);});
- }
- /* the methods are the prototype's and the names are listed when
-    asked for (VitaSurf): made for every call, with every property's
-    name turned to its dashed form by a regular expression, they were
-    nine tenths of a call, and lazysizes asks for an element's
-    visibility for each image near the view on every scroll check */
- Object.defineProperty(cs,'__vitaEl',{value:el});
- if(typeof pseudo==='string'&&pseudo)Object.defineProperty(cs,'__vitaPseudo',{value:pseudo});
- return cs;
-}
+    resolved value where the attribute is whatever the author typed.
+    The used size is layout's, which csSize asks for. */
+ if(k!=='width'&&k!=='height'&&!(st&&(RESOLVED[k]||(st.length>18&&BOX_RESOLVED.test(k))))){
+  inl=csInline(s);
+  if(inl&&inl[k]!==undefined)return inl[k];}
+ if(st&&(v=csFromSt(st,k))!==undefined)return v;
+ if(k==='display'&&el&&el.nodeType===1&&UA_DISPLAY[el.tagName])return UA_DISPLAY[el.tagName];
+ if(Object.prototype.hasOwnProperty.call(CS_DEFAULTS,k))return CS_DEFAULTS[k];
+ /* width and height are the used sizes layout gives, asked for only
+    when read: a read lays the page out first when it has changed, as
+    a browser's does. A length the element has with no box to measure
+    is the cascade's, and answered above. */
+ if(k==='width')return csSize(cs,4);
+ if(k==='height')return csSize(cs,5);
+ return undefined;}
+function csGet(cs,k){
+ var s=csState(cs),v=s.v[k];
+ if(v===undefined){v=csCompute(cs,s,k);s.v[k]=v===undefined?null:v;}
+ return v===null?undefined:v;}
+function csDefine(k){
+ CS_GOT[k]=1;CS_GOT_N++;
+ Object.defineProperty(CS_PROTO,k,{configurable:true,enumerable:true,
+  get:function(){return this[CS_SLOT]?csGet(this,k):undefined;},
+  /* the page may write over one, as it always could */
+  set:function(v){Object.defineProperty(this,k,{configurable:true,
+   enumerable:true,writable:true,value:v});}});
+ if(!CS_DASHED[k])csDashed(k);}
+/* every name the declaration answers, for its length and item(): one
+   call for all the cascade has, kept for the names read after */
 function csNames(cs){
- if(!Object.prototype.hasOwnProperty.call(cs,'__vitaNames'))
-  Object.defineProperty(cs,'__vitaNames',{configurable:true,value:
-   Object.keys(cs).concat(['width','height'].filter(function(k){
-    return !Object.prototype.hasOwnProperty.call(cs,k);})).filter(function(k){return typeof cs[k]==='string';}).map(function(k){
-    return k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();});})});
- return cs.__vitaNames;
+ var s,names,seen,k,i,inl,st,add;
+ if(Object.prototype.hasOwnProperty.call(cs,'__vitaNames'))return cs.__vitaNames;
+ names=[];seen=Object.create(null);
+ add=function(k){if(seen[k])return;seen[k]=1;if(typeof cs[k]==='string')
+  names.push(k==='cssFloat'?'float':k.replace(/[A-Z]/g,function(m){return '-'+m.toLowerCase();}));};
+ if(cs[CS_SLOT]){
+  s=csState(cs);
+  if(s.full===undefined){
+   s.full=s.more&&s.el&&s.el.nodeType===1&&typeof NV.__vitaStyleMore==='function'?
+    NV.__vitaStyleMore(s.el,s.ps)||null:null;
+   if(s.full===null)s.more=false;}
+  if(s.full)for(k in s.full){
+   /* a name the list above does not have: answer it from now on */
+   if(!CS_GOT[k]&&!(k in CS_PROTO)){csDefine(k);NV.__vitaGap&&NV.__vitaGap('computed style '+k);}
+   if(!CS_MORE[k])CS_MORE[k]=1;}
+  for(k in CS_DEFAULTS)add(k);
+  if(s.full)for(k in s.full)add(k);
+  inl=csInline(s);if(inl)for(k in inl)add(k);
+  if(s.pb)add('content');}
+ for(k in cs)if(Object.prototype.hasOwnProperty.call(cs,k))add(k);
+ add('width');add('height');
+ Object.defineProperty(cs,'__vitaNames',{configurable:true,value:names});
+ return names;
 }
-/* width and height are the used sizes layout gives, asked for only when
-   read (VitaSurf): a read lays the page out first when it has changed,
-   as a browser's does, and a style read that never looks at them does
-   not. A length the element has with no box to measure is its own
-   property, set from the cascade, and answers before these. */
 function csSize(cs,i){
  var el=cs.__vitaEl,b;
  if(!el||el.nodeType!==1||typeof NV.__vitaBox!=='function')return 'auto';
  b=NV.__vitaBox(el);
  return b?b[i]+'px':'auto';}
-['width','height'].forEach(function(k,i){
- Object.defineProperty(CS_PROTO,k,{configurable:true,
-  get:function(){return csSize(this,4+i);},
-  set:function(v){Object.defineProperty(this,k,{configurable:true,
-   enumerable:true,writable:true,value:v});}});});
 Object.defineProperties(CS_PROTO,{
  getPropertyValue:{configurable:true,writable:true,value:function(n){n=String(n);var el=this.__vitaEl;
   /* a custom property is the cascade's, read as the page wrote it */
@@ -1891,7 +1991,13 @@ Object.defineProperties(CS_PROTO,{
  cssText:{configurable:true,writable:true,value:''},
  length:{configurable:true,get:function(){return csNames(this).length;}}
 });
-for(var csk in CS_DEFAULTS)csDashed(csk);csDashed('width');csDashed('height');
+(function(){var k;
+ for(k in CS_MORE)csDefine(k);
+ for(k in CS_DEFAULTS)if(!CS_GOT[k])csDefine(k);
+ ['margin','padding','border'].forEach(function(b){
+  var w=b==='border'?'Width':'';
+  if(!CS_GOT[b+w])csDefine(b+w);
+  CS_SIDES.forEach(function(e){if(!CS_GOT[b+e+w])csDefine(b+e+w);});});})();
 W.getComputedStyle=function(el,pseudo){return computedStyle(el,pseudo);};
 /* A media query evaluator over the real viewport. Handles the features
    responsive sites actually branch on; anything else is false. */
@@ -2351,9 +2457,9 @@ KeyboardEventC.prototype.initKeyboardEvent=function(t,b,c){this.initEvent(t,b,c)
 /* Event itself: the members a handler reads that were not there. */
 /* NONE until a dispatch puts the event in a phase. It used to read
    AT_TARGET always, so an untouched event claimed to be mid-dispatch. */
-Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,
+Object.defineProperty(Event.prototype,'eventPhase',{configurable:true,enumerable:true,
  get:function(){return this._phase===undefined?0:this._phase;},
- set:function(v){shadowProp(this,'_phase',v|0);}});
+ set:function(v){this._phase=v|0;}});
 Object.defineProperty(Event.prototype,'isTrusted',{configurable:true,
  get:function(){return TRUSTED.has(this);}});
 /* one a script made says what it was made with; the browser's own
@@ -2423,9 +2529,10 @@ MessagePort.prototype._flush=function(){
  NV.__vitaQueueTask(function(){
   var m=p._q.shift(),e;
   if(!m)return;
-  e={data:m.data,type:'message',target:p,currentTarget:p,source:null,origin:'',
-   ports:m.ports,lastEventId:'',isTrusted:true,preventDefault:function(){},
-   stopPropagation:function(){},stopImmediatePropagation:function(){}};
+  /* a MessageEvent, as the browser's is: it had been an object made
+     up for it, every field its own (VitaSurf) */
+  e=uaEvent(new W.MessageEvent('message',{data:m.data,ports:m.ports}));
+  e.target=p;e.currentTarget=p;
   if(typeof p._on==='function'){try{p._on.call(p,e);}catch(x){console.error(x);}}
   p._l.slice().forEach(function(f){
    try{typeof f==='function'?f.call(p,e):f.handleEvent(e);}catch(x){console.error(x);}});
@@ -3344,7 +3451,14 @@ AbortSignal.timeout=function(ms){var c=new AbortController();setTimeout(function
 function AbortController(){this.signal=new AbortSignal();}
 AbortController.prototype.abort=function(reason){var s=this.signal;if(s.aborted)return;s.aborted=true;s.reason=reason===undefined?new Error('aborted'):reason;var e={type:'abort',target:s};s._l.forEach(function(f){f(e);});if(typeof s.onabort==='function')s.onabort(e);};
 W.AbortController=AbortController;W.AbortSignal=AbortSignal;
-W.TextEncoder=function(){this.encoding='utf-8';};W.TextEncoder.prototype.encode=function(s){s=unescape(encodeURIComponent(String(s)));var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;};
+/* encode is native (VitaSurf): it had been encodeURIComponent and a
+   copy a byte at a time in script, which also threw on a lone
+   surrogate where the standard writes the replacement character */
+W.TextEncoder=function(){};
+Object.defineProperty(W.TextEncoder.prototype,'encoding',{configurable:true,
+ enumerable:true,get:function(){return 'utf-8';}});
+W.TextEncoder.prototype.encode=function(s){
+ return NV.__vitaUtf8Encode(s===undefined?'':String(s));};
 /* A real UTF-8 decoder. The old one built the string a character at a
  * time, wrapped the whole buffer whenever it was handed anything but a
  * Uint8Array -- a DataView or an Int8Array lost its byteOffset and
@@ -6995,6 +7109,43 @@ eventClass('PointerEvent',{pointerId:1,width:1,height:1,pressure:0,tangentialPre
  isPrimary:true,persistentDeviceId:0},W.MouseEvent)
  .prototype.getCoalescedEvents=function(){return [this];};
 W.PointerEvent.prototype.getPredictedEvents=function(){return [];};
+/* An event's attributes are its interface's, on the prototype, as
+ * WebIDL puts them, and its own properties are isTrusted alone
+ * (VitaSurf). Each had been a data property of the event itself, so
+ * Object.keys and JSON.stringify of an event found its target and its
+ * view, the window, where a browser's find isTrusted. ESPN's handlers
+ * for a socket message and a fetch, which search what they are given
+ * a key at a time, ran 71 s and 160 s in build 762's log; an event
+ * whose own keys lead to the window hands such a search the whole
+ * page. The value is kept under a symbol of the attribute's, which
+ * the constructors above and the C side reach through the setter.
+ * The browser's own flags are kept the same way, out of sight. */
+var SLOTTED=new Map();
+function eventSlots(proto,names,shown){
+ names.forEach(function(n){
+  var p,seen=SLOTTED.get(n);
+  if(Object.prototype.hasOwnProperty.call(proto,n))return;
+  /* one inherited from a parent's slot is the parent's */
+  for(p=Object.getPrototypeOf(proto);p&&seen;p=Object.getPrototypeOf(p))
+   if(seen.indexOf(p)>=0)return;
+  if(!seen)SLOTTED.set(n,seen=[]);
+  seen.push(proto);
+  var k=Symbol(n);
+  Object.defineProperty(proto,n,{configurable:true,enumerable:shown,
+   get:function(){return this[k];},set:function(v){this[k]=v;}});});}
+eventSlots(Event.prototype,['type','bubbles','cancelable','defaultPrevented',
+ 'target','currentTarget','timeStamp'],true);
+eventSlots(Event.prototype,['_phase','__vsOrigin','__vitaPassive','__stopNow','__vitaActivated',
+ '__cancelBubble'],false);
+eventSlots(CustomEvent.prototype,['detail'],true);
+[UIEventC,MouseEventC,KeyboardEventC].forEach(function(C){
+ eventSlots(C.prototype,Object.keys(C.__vitaFields),true);});
+eventSlots(MouseEventC.prototype,['pageX','pageY','offsetX','offsetY',
+ 'layerX','layerY','x','y'],true);
+Object.keys(EVENT_FIELDS).forEach(function(n){
+ var C=W[n];
+ if(typeof C==='function'&&C.prototype)
+  eventSlots(C.prototype,Object.keys(EVENT_FIELDS[n]),true);});
 /* Touch itself gains the fields a handler reads off one. */
 (function(){var T=W.Touch;if(!T)return;
  var old=T;W.Touch=function(init){old.call(this,init);init=init||{};
@@ -8375,10 +8526,19 @@ if(W.AbortSignal&&!W.AbortSignal.abort)W.AbortSignal.abort=function(reason){
  var c=new AbortController();c.abort(reason);return c.signal;};
 if(W.Headers&&!W.Headers.prototype.getSetCookie)
  W.Headers.prototype.getSetCookie=function(){return [];};
+/* as many whole characters as fit, and how many UTF-16 units they were */
 W.TextEncoder.prototype.encodeInto=function(s,dest){
- var a=this.encode(s),n=Math.min(a.length,dest.length);
- for(var i=0;i<n;i++)dest[i]=a[i];
- return {read:s.length,written:n};};
+ s=String(s);
+ var a=this.encode(s),i,read=0,w=0,c;
+ if(a.length<=dest.length){dest.set(a);return {read:s.length,written:a.length};}
+ for(i=0;i<s.length;i++){
+  c=s.charCodeAt(i);
+  var u=c<0x80?1:c<0x800?2:(c>=0xd800&&c<0xdc00&&i+1<s.length&&
+   (s.charCodeAt(i+1)&0xfc00)===0xdc00)?4:3;
+  if(w+u>dest.length)break;
+  w+=u;read+=u===4?2:1;if(u===4)i++;}
+ dest.set(a.subarray(0,w));
+ return {read:read,written:w};};
 
 Object.defineProperty(W.XMLHttpRequest.prototype,'responseXML',{configurable:true,
  get:function(){if(!this.responseText)return null;
@@ -10435,5 +10595,38 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
         page's own import() does */
      NV.__vitaImport(url,url).then(begin,function(e){
       NV.__vitaReportError(e,url);begin();});},0);}};};
+})();
+/* The platform's other objects keep what they hold the same way
+ * (VitaSurf): their attributes are their interface's, on the prototype,
+ * and the prelude's own fields are out of sight, as a browser's
+ * internal slots are, so Object.keys, for-in and JSON.stringify of
+ * one find what they find in Chrome. */
+(function(){
+ function slots(C,shown,hidden){
+  if(typeof C!=='function'||!C.prototype)return;
+  if(shown)eventSlots(C.prototype,shown,true);
+  if(hidden)eventSlots(C.prototype,hidden,false);}
+ slots(W.XMLHttpRequest,['readyState','status','statusText','responseType',
+  'responseURL','timeout','withCredentials','upload'],['_body','_bytes','_h',
+  '_id','_l','_m','_rh','_rv','_tx','_u']);
+ slots(W.Headers,null,['_m']);
+ slots(W.Response,['status','ok','statusText','headers','url','type',
+  'redirected','bodyUsed'],['_ab','_b','_buffer','_text']);
+ slots(W.Request,['url','method','headers','credentials','mode','cache',
+  'redirect','signal','bodyUsed'],['_body']);
+ slots(W.Attr,['name','localName','prefix','namespaceURI','specified',
+  'nodeType','nodeName'],['_e','_g','_v']);
+ slots(W.CSSStyleDeclaration,null,['_d','_e']);
+ slots(W.CSSRule,['parentRule','parentStyleSheet'],['_head','_sel']);
+ slots(W.CSSStyleRule,['style'],null);
+ slots(W.MediaList,null,['_m']);
+ slots(W.CSSStyleSheet,['ownerNode','ownerRule','parentStyleSheet','disabled',
+  'type','href','title','media'],['_adopters','_constructed','_pending',
+  '_rules','_src','_tc','_tv','_ver']);
+ slots(W.MutationRecord,['type','target','addedNodes','removedNodes',
+  'previousSibling','nextSibling','attributeName','attributeNamespace',
+  'oldValue'],null);
+ slots(W.MutationObserver,null,['_cb','_records','_watch']);
+ slots(W.Blob,['type'],['_u']);
 })();
 })();

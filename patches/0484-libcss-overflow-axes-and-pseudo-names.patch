@@ -1,0 +1,55 @@
+diff --git a/src/select/computed.c b/src/select/computed.c
+index 879853c..a4a3245 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -2297,14 +2297,33 @@ uint8_t css_computed_padding_left(const css_computed_style *style,
+ 	return get_padding_left_fixed(style, length, unit);
+ }
+ 
++/**
++ * One axis's overflow as computed (VitaSurf): where the other axis's is
++ * neither visible nor clip, visible is auto and clip is hidden, as CSS
++ * Overflow has it. CNN's link ribbon, a nowrap flex row with
++ * overflow-y: hidden, had widened its page to twice the screen.
++ */
++static uint8_t overflow_with(uint8_t mine, uint8_t other)
++{
++	bool mine_open = mine == CSS_OVERFLOW_VISIBLE ||
++			mine == CSS_OVERFLOW_CLIP;
++	bool other_open = other == CSS_OVERFLOW_VISIBLE ||
++			other == CSS_OVERFLOW_CLIP;
++
++	if (mine_open && !other_open)
++		return mine == CSS_OVERFLOW_VISIBLE ?
++				CSS_OVERFLOW_AUTO : CSS_OVERFLOW_HIDDEN;
++	return mine;
++}
++
+ uint8_t css_computed_overflow_x(const css_computed_style *style)
+ {
+-	return get_overflow_x(style);
++	return overflow_with(get_overflow_x(style), get_overflow_y(style));
+ }
+ 
+ uint8_t css_computed_overflow_y(const css_computed_style *style)
+ {
+-	return get_overflow_y(style);
++	return overflow_with(get_overflow_y(style), get_overflow_x(style));
+ }
+ 
+ uint8_t css_computed_position(const css_computed_style *style)
+diff --git a/src/select/hash.c b/src/select/hash.c
+index 2d46939..c808976 100644
+--- a/src/select/hash.c
++++ b/src/select/hash.c
+@@ -576,7 +576,9 @@ static void _uni_pseudo_named(lwc_string *name)
+ 	}
+ 	for (k = 0; k < CSS_HASH_UNI_NAME_SLOTS; k++) {
+ 		if (css_hash_uni_names[k].name == NULL) {
+-			css_hash_uni_names[k].name = name;
++			/* held, so the page report reads a name that is
++			 * still there after its sheet has gone */
++			css_hash_uni_names[k].name = lwc_string_ref(name);
+ 			css_hash_uni_names[k].count = 1;
+ 			return;
+ 		}

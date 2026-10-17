@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!--
+  overflow on one axis only (VitaSurf): where one axis is neither
+  visible nor clip, the other's visible computes to auto and clip to
+  hidden, as CSS Overflow has it, so a nowrap row with overflow-y:
+  hidden scrolls sideways instead of widening the page (CNN's link
+  ribbon had made its page twice the screen's width). Each line must
+  say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Overflow axis pairs</title></head>
+<body style="margin:0">
+<div id="a" style="width:200px;overflow-y:hidden;display:flex;white-space:nowrap"><span style="width:2000px;flex:none;display:block">x</span></div>
+<div id="b" style="width:200px;overflow-x:clip"><div style="width:500px">y</div></div>
+<div id="c" style="overflow-x:scroll;overflow-y:clip">z</div>
+<div id="d" style="overflow-x:hidden">w</div>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('overflow-axis-pairs: ' + l); }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+addEventListener('load', function () {
+  ok('visible beside hidden is auto', cs('a').overflowX, 'auto');
+  ok('and hidden stays', cs('a').overflowY, 'hidden');
+  ok('clip beside visible stays clip', cs('b').overflowX, 'clip');
+  ok('visible beside clip stays visible', cs('b').overflowY, 'visible');
+  ok('clip beside scroll is hidden', cs('c').overflowY, 'hidden');
+  ok('visible beside hidden, the other way', cs('d').overflowY, 'auto');
+  ok('the row does not widen the page', document.documentElement.scrollWidth, document.documentElement.clientWidth);
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('overflow-axis-pairs: done');
+});
+</script>
+</body></html>

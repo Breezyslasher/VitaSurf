@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<!--
+  getComputedStyle answers each property when it is read (VitaSurf):
+  the declaration is live, as a browser's is, so a value read after the
+  element changes is the new one; its length and item() list every
+  name; a property set inline that nothing else answers reads as the
+  page wrote it; a ::before that is not there has content none. Each
+  line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Computed style reads</title>
+<style>
+#a { color: rgb(255, 0, 0); padding: 3px 4px; display: flex; }
+#a.big { padding-left: 9px; }
+#b::before { content: "x"; }
+</style></head><body>
+<div id="a" style="opacity: 0.5"></div><p id="b">b</p><span id="c"></span>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('computed-style-reads: ' + l); }
+addEventListener('load', function () {
+  var a = document.getElementById('a'), b = document.getElementById('b');
+  var cs = getComputedStyle(a);
+  ok('color', cs.color, 'rgb(255, 0, 0)');
+  ok('display', cs.display, 'flex');
+  ok('padding-left by name', cs.getPropertyValue('padding-left'), '4px');
+  ok('dashed name', cs['padding-top'], '3px');
+  ok('opacity', cs.opacity, '0.5');
+  ok('a span is inline', getComputedStyle(document.getElementById('c')).display, 'inline');
+  a.className = 'big';
+  ok('live after a class change', cs.paddingLeft, '9px');
+  a.style.color = 'rgb(0, 0, 255)';
+  ok('live after a style change', cs.color, 'rgb(0, 0, 255)');
+  ok('length counts names', cs.length > 50, true);
+  var names = [];
+  for (var i = 0; i < cs.length; i++) names.push(cs.item(i));
+  ok('item lists color', names.indexOf('color') >= 0, true);
+  ok('item lists padding-left', names.indexOf('padding-left') >= 0, true);
+  ok('in finds a property', 'fontSize' in cs, true);
+  ok('::before content', getComputedStyle(b, '::before').content, '"x"');
+  ok('::after that is not there', getComputedStyle(b, '::after').content, 'none');
+  ok('width is a length', /px$/.test(cs.width), true);
+  ok('unset custom property', cs.getPropertyValue('--nothing'), '');
+  ok('an unknown name', cs.getPropertyValue('not-a-property'), '');
+  document.getElementById('out').textContent = out.join('\n');
+  console.log('computed-style-reads: done');
+});
+</script></body></html>

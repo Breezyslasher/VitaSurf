@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<!--
+  TextEncoder as the Encoding standard has it (VitaSurf), now native:
+  UTF-8 of every character, a lone surrogate as the replacement
+  character, and encodeInto stopping before a character that does not
+  fit whole. Each line must say PASS; Chrome passes them all.
+-->
+<html><head><meta charset="utf-8"><title>TextEncoder</title></head><body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('text-encoder: ' + l); }
+function hex(a) { return Array.prototype.map.call(a, function (b) { return (b < 16 ? '0' : '') + b.toString(16); }).join(' '); }
+var e = new TextEncoder();
+ok('encoding', e.encoding, 'utf-8');
+ok('ascii', hex(e.encode('Ab')), '41 62');
+ok('two bytes', hex(e.encode('é')), 'c3 a9');
+ok('three bytes', hex(e.encode('€')), 'e2 82 ac');
+ok('a pair is four', hex(e.encode('😀')), 'f0 9f 98 80');
+ok('a lone high surrogate', hex(e.encode('a\ud800b')), '61 ef bf bd 62');
+ok('a lone low surrogate', hex(e.encode('\udc00')), 'ef bf bd');
+ok('nothing', e.encode().length, 0);
+ok('a zero byte is kept', hex(e.encode('a\u0000b')), '61 00 62');
+ok('a Uint8Array', e.encode('x') instanceof Uint8Array, true);
+ok('round trip', new TextDecoder().decode(e.encode('héllo € 😀')), 'héllo € 😀');
+var d = new Uint8Array(4), r = e.encodeInto('a€b', d);
+ok('encodeInto read', r.read, 2);
+ok('encodeInto written', r.written, 4);
+ok('encodeInto bytes', hex(d), '61 e2 82 ac');
+r = e.encodeInto('😀😀', new Uint8Array(6));
+ok('encodeInto stops before a pair that does not fit', r.read + '/' + r.written, '2/4');
+var big = new Array(20001).join('é');
+ok('a long string', e.encode(big).length, 40000);
+document.getElementById('out').textContent = out.join('\n');
+console.log('text-encoder: done');
+</script></body></html>

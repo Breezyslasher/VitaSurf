@@ -710,6 +710,11 @@ NV.__vitaIntlPattern = function (N) {
 		['x', 15, NARROW - DELTA, 1], ['x', 15, SHORT - DELTA, 2],
 		['x', 15, LONG - DELTA, 4]
 	];
+	/* each letter's first row of TYPES */
+	var TYPES_FROM = Object.create(null);
+
+	for (var tf = TYPES.length - 1; tf >= 0; tf--)
+		TYPES_FROM[TYPES[tf][0]] = tf;
 	var CANONICAL = 'GyQMwWEDFdaHmsSv';
 	var APPEND_DEFAULT = '{0} ├{2}: {1}┤';
 
@@ -746,7 +751,11 @@ NV.__vitaIntlPattern = function (N) {
 			if (s.charAt(i) !== ch)
 				return -1;
 		}
-		for (i = 0; i < TYPES.length; i++) {
+		/* from the letter's first row (VitaSurf) */
+		i = TYPES_FROM[ch];
+		if (i === undefined)
+			return -1;
+		for (; i < TYPES.length; i++) {
 			if (TYPES[i][0] !== ch)
 				continue;
 			best = i;
@@ -802,17 +811,22 @@ NV.__vitaIntlPattern = function (N) {
 
 	/* PtnSkeleton: the fields as asked (original), as their base
 	 * letters (baseOriginal), and their types */
+	/* copied natively from these (VitaSurf): filled a field at a time,
+	 * the skeleton made for each pattern a generator adds was a fifth
+	 * of a locale's first DateTimeFormat */
+	var NO_CHARS = [], NO_COUNTS = [];
+
+	for (var nf = 0; nf < FIELD_COUNT; nf++) {
+		NO_CHARS[nf] = '';
+		NO_COUNTS[nf] = 0;
+	}
 	function Skeleton() {
-		this.ch = [];
-		this.len = [];
-		this.bch = [];
-		this.blen = [];
-		this.type = [];
+		this.ch = NO_CHARS.slice();
+		this.len = NO_COUNTS.slice();
+		this.bch = NO_CHARS.slice();
+		this.blen = NO_COUNTS.slice();
+		this.type = NO_COUNTS.slice();
 		this.added = false;
-		for (var i = 0; i < FIELD_COUNT; i++) {
-			this.ch[i] = this.bch[i] = '';
-			this.len[i] = this.blen[i] = this.type[i] = 0;
-		}
 	}
 	Skeleton.prototype.original = function () {
 		var s = '', i;
