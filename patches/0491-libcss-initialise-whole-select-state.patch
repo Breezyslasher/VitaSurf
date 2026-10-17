@@ -1,0 +1,16 @@
+diff --git a/src/select/computed.c b/src/select/computed.c
+index a4a3245..bf4bc69 100644
+--- a/src/select/computed.c
++++ b/src/select/computed.c
+@@ -264,6 +264,11 @@ css_error css__computed_style_initialise(css_computed_style *style,
+ 	if (style == NULL)
+ 		return CSS_BADPARM;
+ 
++	/* the whole state, not the fields this function sets (VitaSurf):
++	 * the initial background-position reads which halves a rule set,
++	 * and read them here from the stack as it was, a pseudo-element
++	 * index out of range among them, which crashed the browser */
++	memset(&state, 0, sizeof(state));
+ 	state.node = NULL;
+ 	state.media = NULL;
+ 	state.results = NULL;

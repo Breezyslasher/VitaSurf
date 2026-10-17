@@ -226,3 +226,12 @@
 0x60ce8
 0x60ec5
 0x61119
+# Build 773: data abort on old.reddit.com's login page during the site
+#   test, main thread, redrawing (html_redraw_fixed, html_redraw_background,
+#   rounded_fill_smooth, the knockout plotters). css__computed_style_initialise
+#   called the initial background-position with a selection state it had
+#   not filled in, which read props[][current_pseudo] with a pseudo-element
+#   index from the stack. The text segment was at 0x81002000. Fixed by
+#   libcss patch 0491. PC, LR.
+0x13418c
+0x11fb54

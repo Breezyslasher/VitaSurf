@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Blank styles</title></head>
+<body>
+<!--
+ Run under valgrind (the harness with "valgrind --track-origins=yes"): it
+ must report nothing in css__initial_background_position. Anonymous flex
+ and table boxes take a blank style, which libcss makes with
+ css__computed_style_initialise, and the initial background-position
+ read which of its halves a rule had set from a selection state that
+ function had not filled in. A pseudo-element index from the stack as it
+ was crashed build 773 on old.reddit.com's login page (patch 0491).
+-->
+<div style="display:flex">loose text <span>a</span> more text<b>b</b></div>
+<div style="display:inline-flex">x<i>y</i>z</div>
+<table><tr><td>cell</td></tr></table><div style="display:table-cell">anon</div>
+</body></html>
