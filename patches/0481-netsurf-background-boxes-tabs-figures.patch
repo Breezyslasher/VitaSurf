@@ -1,0 +1,807 @@
+diff --git a/content/handlers/html/box_construct.c b/content/handlers/html/box_construct.c
+index 0d5a79a17..b8cb34cba 100644
+--- a/content/handlers/html/box_construct.c
++++ b/content/handlers/html/box_construct.c
+@@ -2564,19 +2564,73 @@ static bool box_construct_text(struct box_construct_ctx *ctx)
+ 				white_space == CSS_WHITE_SPACE_PRE_LINE ||
+ 				white_space == CSS_WHITE_SPACE_PRE_WRAP);
+ 
+-		text = malloc(text_len + 1);
+-		dom_string_unref(content);
+-
+-		if (text == NULL)
+-			return false;
++		/* A tab goes to the next tab stop, tab-size columns apart
++		 * (VitaSurf): each had been one space, so code in a <pre>
++		 * lost its indentation. Columns are counted in characters
++		 * from the start of the text's line, which places the
++		 * stops exactly in the monospace text tabs are written in;
++		 * a length is taken as spaces of half an em. */
++		{
++			const char *src = dom_string_data(content);
++			css_fixed tl = INTTOFIX(8);
++			css_unit tu = CSS_UNIT_PX;
++			size_t tabs = 0, at = 0, col = 0;
++			int stop = 8;
++
++			if (css_computed_tab_size(props.parent_style, &tl,
++					&tu) == CSS_TAB_SIZE_SET) {
++				css_fixed fs = 0;
++				css_unit fu = CSS_UNIT_PX;
++				int px = FIXTOINT(css_unit_len2device_px(
++						props.parent_style,
++						&ctx->content->unit_len_ctx, tl, tu));
++
++				css_computed_font_size(props.parent_style,
++						&fs, &fu);
++				fs = css_unit_len2device_px(props.parent_style,
++						&ctx->content->unit_len_ctx, fs, fu);
++				stop = FIXTOINT(fs) > 0 ? (px * 2 +
++						FIXTOINT(fs) / 2) / FIXTOINT(fs) :
++						8;
++			} else {
++				stop = FIXTOINT(tl + INTTOFIX(1) / 2);
++			}
++			if (stop < 0)
++				stop = 0;
++			if (stop > 64)
++				stop = 64;
++			for (i = 0; i < text_len; i++)
++				if (src[i] == '\t')
++					tabs++;
++
++			text = malloc(text_len + tabs * stop + 1);
++			if (text == NULL) {
++				dom_string_unref(content);
++				return false;
++			}
++			for (i = 0; i < text_len; i++) {
++				char ch = src[i];
+ 
+-		memcpy(text, dom_string_data(content), text_len);
+-		text[text_len] = '\0';
++				if (ch == '\t') {
++					size_t k = stop > 0 ?
++						stop - col % stop : 0;
+ 
+-		/* TODO: Handle tabs properly */
+-		for (i = 0; i < text_len; i++)
+-			if (text[i] == '\t')
+-				text[i] = ' ';
++					while (k-- > 0) {
++						text[at++] = ' ';
++						col++;
++					}
++					continue;
++				}
++				text[at++] = ch;
++				if (ch == '\n' || ch == '\r')
++					col = 0;
++				else if (((unsigned char) ch & 0xc0) != 0x80)
++					col++;
++			}
++			text[at] = '\0';
++			text_len = at;
++			dom_string_unref(content);
++		}
+ 
+ 		if (css_computed_text_transform(props.parent_style) !=
+ 				CSS_TEXT_TRANSFORM_NONE)
+diff --git a/content/handlers/html/font.c b/content/handlers/html/font.c
+index 4a64759d7..bd38b501b 100644
+--- a/content/handlers/html/font.c
++++ b/content/handlers/html/font.c
+@@ -158,6 +158,9 @@ void font_plot_style_from_css(
+ 	fstyle->weight = plot_font_weight(css_computed_font_weight(css));
+ 	fstyle->flags = plot_font_flags(css_computed_font_style(css),
+ 			css_computed_font_variant(css));
++	if (css_computed_font_variant_numeric(css) ==
++			CSS_FONT_VARIANT_NUMERIC_TABULAR)
++		fstyle->flags |= FONTF_TABULAR;
+ 
+ 	css_computed_color(css, &col);
+ 	fstyle->foreground = nscss_color_to_ns(col);
+diff --git a/content/handlers/html/redraw.c b/content/handlers/html/redraw.c
+index bd73a2efb..22421c523 100644
+--- a/content/handlers/html/redraw.c
++++ b/content/handlers/html/redraw.c
+@@ -1509,6 +1509,14 @@ static bool html_redraw_gradient_shaped(const char *spec,
+ 	return true;
+ }
+ 
++static bool html_redraw_bg_image(struct box *background,
++		struct content_redraw_data *data, const struct rect *r,
++		const struct redraw_context *ctx);
++static bool html_redraw_background_spaced(struct box *background,
++		const struct rect *r, int x, int y, int ax, int ay, int aw,
++		int ah, int iw, int ih, bool sx, bool sy, float scale,
++		colour bg, const struct redraw_context *ctx);
++
+ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 		const struct rect *clip, colour *background_colour,
+ 		struct box *background,
+@@ -1542,6 +1550,11 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 	struct box *clip_box = box;
+ 	int ox = x, oy = y;
+ 	int width, height;
++	/* the picture's drawn size, and the box it is placed in, and for
++	 * repeat: space whether each axis is spaced (VitaSurf) */
++	int img_w = 0, img_h = 0, area_x = x, area_y = y;
++	int area_w = 0, area_h = 0;
++	bool space_x = false, space_y = false;
+ 	css_fixed hpos = 0, vpos = 0;
+ 	css_unit hunit = CSS_UNIT_PX, vunit = CSS_UNIT_PX;
+ 	struct box *parent;
+@@ -1558,7 +1571,47 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 
+ 	plot_content = (background->background != NULL);
+ 
++	/* background-clip (VitaSurf): the colour and the image stop at the
++	 * padding or the content edge when it says so; only text had been
++	 * read */
++	if (box->parent != NULL && background->style != NULL) {
++		uint8_t bclip = css_computed_background_clip(
++				background->style);
++
++		if (bclip == CSS_BACKGROUND_CLIP_PADDING_BOX ||
++				bclip == CSS_BACKGROUND_CLIP_CONTENT_BOX) {
++			struct rect edge;
++
++			edge.x0 = x;
++			edge.y0 = y;
++			edge.x1 = x + (box->padding[LEFT] + box->width +
++					box->padding[RIGHT]) * scale;
++			edge.y1 = y + (box->padding[TOP] + box->height +
++					box->padding[BOTTOM]) * scale;
++			if (bclip == CSS_BACKGROUND_CLIP_CONTENT_BOX) {
++				edge.x0 += box->padding[LEFT] * scale;
++				edge.y0 += box->padding[TOP] * scale;
++				edge.x1 -= box->padding[RIGHT] * scale;
++				edge.y1 -= box->padding[BOTTOM] * scale;
++			}
++			if (r.x0 < edge.x0) r.x0 = edge.x0;
++			if (r.y0 < edge.y0) r.y0 = edge.y0;
++			if (r.x1 > edge.x1) r.x1 = edge.x1;
++			if (r.y1 > edge.y1) r.y1 = edge.y1;
++			if (r.x0 >= r.x1 || r.y0 >= r.y1)
++				return true;
++			/* the rounded shape is the border box's */
++			rounded = false;
++			ringed = false;
++			shape.radii = NULL;
++			shape.hole = NULL;
++		}
++	}
++
+ 	if (plot_content) {
++		uint8_t origin = css_computed_background_origin(
++				background->style);
++
+ 		if (!box->parent) {
+ 			/* Root element, special case:
+ 			 * background origin calc. is based on margin box */
+@@ -1575,7 +1628,44 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 					box->padding[RIGHT];
+ 			height = box->padding[TOP] + box->height +
+ 					box->padding[BOTTOM];
++			/* the box it is placed in: background-origin
++			 * (VitaSurf) */
++			if (origin == CSS_BACKGROUND_ORIGIN_BORDER_BOX) {
++				x -= box->border[LEFT].width * scale;
++				y -= box->border[TOP].width * scale;
++				width += box->border[LEFT].width +
++						box->border[RIGHT].width;
++				height += box->border[TOP].width +
++						box->border[BOTTOM].width;
++			} else if (origin ==
++					CSS_BACKGROUND_ORIGIN_CONTENT_BOX) {
++				x += box->padding[LEFT] * scale;
++				y += box->padding[TOP] * scale;
++				width -= box->padding[LEFT] +
++						box->padding[RIGHT];
++				height -= box->padding[TOP] +
++						box->padding[BOTTOM];
++			}
+ 		}
++
++		/* the size it is drawn at, from the box it is placed in;
++		 * a percentage position is a fraction of what that leaves
++		 * over, where the picture's own size had been taken, so a
++		 * picture set to cover a box and centred in it was drawn
++		 * off to one side (VitaSurf) */
++		img_w = content_get_width(background->background);
++		img_h = content_get_height(background->background);
++		if (box == background && box->parent != NULL)
++			html_background_size(background, unit_len_ctx,
++					width, height, &img_w, &img_h);
++		else
++			html_background_size(background, unit_len_ctx,
++				background->padding[LEFT] + background->width +
++					background->padding[RIGHT],
++				background->padding[TOP] + background->height +
++					background->padding[BOTTOM],
++				&img_w, &img_h);
++
+ 		/* handle background-repeat */
+ 		switch (css_computed_background_repeat(background->style)) {
+ 		case CSS_BACKGROUND_REPEAT_REPEAT:
+@@ -1593,26 +1683,51 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 			repeat_y = true;
+ 			break;
+ 
++		case CSS_BACKGROUND_REPEAT_ROUND:
++			/* scaled so a whole number of tiles fills the box
++			 * (VitaSurf) */
++			if (img_w > 0 && img_h > 0 && width > 0 &&
++					height > 0) {
++				int nx = (int) floorf((float) width / img_w +
++						0.5f);
++				int ny = (int) floorf((float) height / img_h +
++						0.5f);
++
++				img_w = width / (nx < 1 ? 1 : nx);
++				img_h = height / (ny < 1 ? 1 : ny);
++			}
++			repeat_x = repeat_y = true;
++			plot_colour = !content_get_opaque(background->background);
++			break;
++
++		case CSS_BACKGROUND_REPEAT_SPACE:
++			/* as many whole tiles as fit, the space shared
++			 * between them; one alone is placed as positioned
++			 * (VitaSurf) */
++			space_x = img_w > 0 && width >= 2 * img_w;
++			space_y = img_h > 0 && height >= 2 * img_h;
++			break;
++
+ 		case CSS_BACKGROUND_REPEAT_NO_REPEAT:
+ 			break;
+ 
+ 		default:
+ 			break;
+ 		}
++		area_x = x;
++		area_y = y;
++		area_w = width;
++		area_h = height;
+ 
+ 		/* handle background-position */
+ 		css_computed_background_position(background->style,
+ 				&hpos, &hunit, &vpos, &vunit);
+ 		if (hunit == CSS_UNIT_PCT) {
+-			x += (width -
+-				content_get_width(background->background)) *
+-				scale * FIXTOFLT(hpos) / 100.;
++			x += (width - img_w) * scale * FIXTOFLT(hpos) / 100.;
+ 		} else if (hunit == CSS_UNIT_EXPR) {
+ 			x += ns_expr_device_px(background->style,
+ 					unit_len_ctx, hpos, (int) ((width -
+-					content_get_width(
+-					background->background)) * scale),
+-					scale);
++					img_w) * scale), scale);
+ 		} else {
+ 			x += (int) (FIXTOFLT(css_unit_len2device_px(
+ 					background->style, unit_len_ctx,
+@@ -1620,15 +1735,11 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 		}
+ 
+ 		if (vunit == CSS_UNIT_PCT) {
+-			y += (height -
+-				content_get_height(background->background)) *
+-				scale * FIXTOFLT(vpos) / 100.;
++			y += (height - img_h) * scale * FIXTOFLT(vpos) / 100.;
+ 		} else if (vunit == CSS_UNIT_EXPR) {
+ 			y += ns_expr_device_px(background->style,
+ 					unit_len_ctx, vpos, (int) ((height -
+-					content_get_height(
+-					background->background)) * scale),
+-					scale);
++					img_h) * scale), scale);
+ 		} else {
+ 			y += (int) (FIXTOFLT(css_unit_len2device_px(
+ 					background->style, unit_len_ctx,
+@@ -1751,16 +1862,15 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 		}
+ 
+ 		/* and plot the image */
+-		if (plot_content) {
+-			width = content_get_width(background->background);
+-			height = content_get_height(background->background);
+-
+-			html_background_size(background, unit_len_ctx,
+-				background->padding[LEFT] + background->width +
+-					background->padding[RIGHT],
+-				background->padding[TOP] + background->height +
+-					background->padding[BOTTOM],
+-				&width, &height);
++		if (plot_content && (space_x || space_y)) {
++			if (!html_redraw_background_spaced(background, &r,
++					x, y, area_x, area_y, area_w, area_h,
++					img_w, img_h, space_x, space_y, scale,
++					*background_colour, ctx))
++				return false;
++		} else if (plot_content) {
++			width = img_w;
++			height = img_h;
+ 
+ 			/* ensure clip area only as large as required */
+ 			if (!repeat_x) {
+@@ -1795,9 +1905,9 @@ static bool html_redraw_background(int x, int y, struct box *box, float scale,
+ 				bg_data.mask = false;
+ 				bg_data.mask_colour = 0;
+ 
+-				/* We just continue if redraw fails */
+-				content_redraw(background->background,
+-						&bg_data, &r, ctx);
++				if (!html_redraw_bg_image(background,
++						&bg_data, &r, ctx))
++					return false;
+ 			}
+ 		}
+ 
+@@ -5587,6 +5697,63 @@ static void html_blend_set_lum(int c[3], int lum)
+ 		c[i] = html_filter_clamp(c[i] + d);
+ }
+ 
++/**
++ * Mix a layer painted aside into what is behind it (VitaSurf), pixel by
++ * pixel as a blend mode says, the layer's alpha deciding how much of
++ * the mix shows: mix-blend-mode's and background-blend-mode's.
++ */
++static void html_blend_pixels(struct bitmap *src, struct bitmap *back,
++		uint8_t mode, int w, int h)
++{
++	uint8_t *sb, *bb_buf;
++	size_t ss, bs;
++	int x, y;
++
++	sb = guit->bitmap->get_buffer(src);
++	bb_buf = guit->bitmap->get_buffer(back);
++	ss = guit->bitmap->get_rowstride(src);
++	bs = guit->bitmap->get_rowstride(back);
++	for (y = 0; y < h && sb != NULL && bb_buf != NULL; y++) {
++		uint8_t *sp = sb + y * ss;
++		uint8_t *bp = bb_buf + y * bs;
++
++		for (x = 0; x < w; x++, sp += 4, bp += 4) {
++			int a = sp[bitmap_layout.a];
++			int s3[3], b3[3], m3[3], i;
++
++			if (a == 0)
++				continue;
++			s3[0] = sp[bitmap_layout.r];
++			s3[1] = sp[bitmap_layout.g];
++			s3[2] = sp[bitmap_layout.b];
++			b3[0] = bp[bitmap_layout.r];
++			b3[1] = bp[bitmap_layout.g];
++			b3[2] = bp[bitmap_layout.b];
++			if (mode == CSS_MIX_BLEND_MODE_LUMINOSITY) {
++				memcpy(m3, b3, sizeof(m3));
++				html_blend_set_lum(m3, (30 * s3[0] +
++						59 * s3[1] + 11 * s3[2]) / 100);
++			} else if (mode == CSS_MIX_BLEND_MODE_COLOR ||
++					mode == CSS_MIX_BLEND_MODE_HUE ||
++					mode == CSS_MIX_BLEND_MODE_SATURATION) {
++				memcpy(m3, s3, sizeof(m3));
++				html_blend_set_lum(m3, (30 * b3[0] +
++						59 * b3[1] + 11 * b3[2]) / 100);
++			} else {
++				for (i = 0; i < 3; i++)
++					m3[i] = html_blend_channel(mode, s3[i],
++							b3[i]);
++			}
++			bp[bitmap_layout.r] = (uint8_t) ((b3[0] * (255 - a) +
++					m3[0] * a) / 255);
++			bp[bitmap_layout.g] = (uint8_t) ((b3[1] * (255 - a) +
++					m3[1] * a) / 255);
++			bp[bitmap_layout.b] = (uint8_t) ((b3[2] * (255 - a) +
++					m3[2] * a) / 255);
++		}
++	}
++}
++
+ /**
+  * mix-blend-mode (VitaSurf): the box is painted aside, what is on the
+  * screen behind it is read back, and the two are mixed pixel by pixel
+@@ -5604,9 +5771,8 @@ static bool html_redraw_blend(const html_content *html, struct box *box,
+ 	const struct box *outer;
+ 	struct rect bb, area;
+ 	struct bitmap *src = NULL, *back = NULL;
+-	uint8_t mode, *sb, *bb_buf;
+-	size_t ss, bs;
+-	int ox = 0, oy = 0, w, h, x, y;
++	uint8_t mode;
++	int ox = 0, oy = 0, w, h;
+ 
+ 	if (box->style == NULL || vitasurf_raster == NULL ||
+ 			vitasurf_backdrop == NULL ||
+@@ -5655,55 +5821,146 @@ static bool html_redraw_blend(const html_content *html, struct box *box,
+ 		return true;
+ 	}
+ 
+-	sb = guit->bitmap->get_buffer(src);
+-	bb_buf = guit->bitmap->get_buffer(back);
+-	ss = guit->bitmap->get_rowstride(src);
+-	bs = guit->bitmap->get_rowstride(back);
+-	for (y = 0; y < h && sb != NULL && bb_buf != NULL; y++) {
+-		uint8_t *sp = sb + y * ss;
+-		uint8_t *bp = bb_buf + y * bs;
++	html_blend_pixels(src, back, mode, w, h);
++	guit->bitmap->destroy(src);
++	guit->bitmap->modified(back);
++	*ok = html_plot_made(ctx, back, ox, oy);
++	return true;
++}
+ 
+-		for (x = 0; x < w; x++, sp += 4, bp += 4) {
+-			int a = sp[bitmap_layout.a];
+-			int s3[3], b3[3], m3[3], i;
+ 
+-			if (a == 0)
+-				continue;
+-			s3[0] = sp[bitmap_layout.r];
+-			s3[1] = sp[bitmap_layout.g];
+-			s3[2] = sp[bitmap_layout.b];
+-			b3[0] = bp[bitmap_layout.r];
+-			b3[1] = bp[bitmap_layout.g];
+-			b3[2] = bp[bitmap_layout.b];
+-			if (mode == CSS_MIX_BLEND_MODE_LUMINOSITY) {
+-				memcpy(m3, b3, sizeof(m3));
+-				html_blend_set_lum(m3, (30 * s3[0] +
+-						59 * s3[1] + 11 * s3[2]) / 100);
+-			} else if (mode == CSS_MIX_BLEND_MODE_COLOR ||
+-					mode == CSS_MIX_BLEND_MODE_HUE ||
+-					mode == CSS_MIX_BLEND_MODE_SATURATION) {
+-				memcpy(m3, s3, sizeof(m3));
+-				html_blend_set_lum(m3, (30 * b3[0] +
+-						59 * b3[1] + 11 * b3[2]) / 100);
+-			} else {
+-				for (i = 0; i < 3; i++)
+-					m3[i] = html_blend_channel(mode, s3[i],
+-							b3[i]);
+-			}
+-			bp[bitmap_layout.r] = (uint8_t) ((b3[0] * (255 - a) +
+-					m3[0] * a) / 255);
+-			bp[bitmap_layout.g] = (uint8_t) ((b3[1] * (255 - a) +
+-					m3[1] * a) / 255);
+-			bp[bitmap_layout.b] = (uint8_t) ((b3[2] * (255 - a) +
+-					m3[2] * a) / 255);
+-		}
++/** A background image drawn aside, for background-blend-mode. */
++struct html_bg_job {
++	struct hlcache_handle *image;
++	struct content_redraw_data data;
++	struct rect clip;
++};
++
++static bool html_bg_job_draw(const struct redraw_context *ctx, void *pw)
++{
++	struct html_bg_job *j = pw;
++
++	return content_redraw(j->image, &j->data, &j->clip, ctx);
++}
++
++/**
++ * Draw a box's background image over its colour (VitaSurf), mixed with
++ * the colour as its background-blend-mode says: the image is drawn
++ * aside, the colour already on the screen is read back, and the two
++ * are blended. Only over a colour: the layers mix with each other, not
++ * with what is behind the element, and with no colour the image is
++ * drawn as it is. tailwind's bg-blend-* and the tinted photographs of
++ * themes write it.
++ */
++static bool html_redraw_bg_image(struct box *background,
++		struct content_redraw_data *data, const struct rect *r,
++		const struct redraw_context *ctx)
++{
++	struct html_bg_job job;
++	struct bitmap *src = NULL, *back = NULL;
++	css_color bgcol = 0;
++	uint8_t mode = css_computed_background_blend_mode(background->style);
++	int w = r->x1 - r->x0, h = r->y1 - r->y0;
++
++	css_computed_background_color(background->style, &bgcol);
++	if (mode == CSS_MIX_BLEND_MODE_INHERIT ||
++			mode == CSS_MIX_BLEND_MODE_NORMAL ||
++			nscss_color_is_transparent(bgcol) ||
++			vitasurf_raster == NULL || vitasurf_backdrop == NULL ||
++			w <= 0 || h <= 0 || w * h > HTML_COMPOSITE_MAX) {
++		/* We just continue if redraw fails */
++		content_redraw(background->background, data, r, ctx);
++		return true;
++	}
++
++	job.image = background->background;
++	job.data = *data;
++	job.data.x -= r->x0;
++	job.data.y -= r->y0;
++	job.clip.x0 = 0;
++	job.clip.y0 = 0;
++	job.clip.x1 = w;
++	job.clip.y1 = h;
++	if (vitasurf_raster(w, h, html_bg_job_draw, &job, &src) !=
++			NSERROR_OK || src == NULL) {
++		content_redraw(background->background, data, r, ctx);
++		return true;
++	}
++	if (ctx->plot->flush != NULL)
++		ctx->plot->flush(ctx);
++	if (vitasurf_backdrop(r, &back) != NSERROR_OK || back == NULL ||
++			guit->bitmap->get_width(back) != w ||
++			guit->bitmap->get_height(back) != h) {
++		if (back != NULL)
++			guit->bitmap->destroy(back);
++		return html_plot_made(ctx, src, r->x0, r->y0);
+ 	}
++	html_blend_pixels(src, back, mode, w, h);
+ 	guit->bitmap->destroy(src);
+ 	guit->bitmap->modified(back);
+-	*ok = html_plot_made(ctx, back, ox, oy);
+-	return true;
++	return html_plot_made(ctx, back, r->x0, r->y0);
+ }
+ 
++/**
++ * background-repeat: space (VitaSurf): as many whole tiles as fit along
++ * a spaced axis, the first and the last at its edges and the rest of
++ * the room shared between them; along an axis that is not, the one
++ * tile where background-position put it.
++ */
++static bool html_redraw_background_spaced(struct box *background,
++		const struct rect *r, int x, int y, int ax, int ay, int aw,
++		int ah, int iw, int ih, bool sx, bool sy, float scale,
++		colour bg, const struct redraw_context *ctx)
++{
++	int nx = 1, ny = 1, i, j;
++	float gx = 0, gy = 0;
++
++	if (iw <= 0 || ih <= 0)
++		return true;
++	if (sx) {
++		nx = aw / iw;
++		gx = nx > 1 ? (float) (aw - nx * iw) / (nx - 1) : 0;
++	}
++	if (sy) {
++		ny = ah / ih;
++		gy = ny > 1 ? (float) (ah - ny * ih) / (ny - 1) : 0;
++	}
++	if (nx < 1 || ny < 1 || nx * ny > 4096)
++		return true;
++	if (ctx->plot->clip(ctx, r) != NSERROR_OK)
++		return false;
++	for (j = 0; j < ny; j++) {
++		int ty = sy ? ay + (int) ((j * (ih + gy)) * scale) : y;
++
++		if (ty >= r->y1 || ty + ih * scale <= r->y0)
++			continue;
++		for (i = 0; i < nx; i++) {
++			struct content_redraw_data d = { 0 };
++			struct rect tr;
++			int tx = sx ? ax + (int) ((i * (iw + gx)) * scale) : x;
++
++			if (tx >= r->x1 || tx + iw * scale <= r->x0)
++				continue;
++			d.x = tx;
++			d.y = ty;
++			d.width = ceilf(iw * scale);
++			d.height = ceilf(ih * scale);
++			d.background_colour = bg;
++			d.scale = scale;
++			tr.x0 = tx < r->x0 ? r->x0 : tx;
++			tr.y0 = ty < r->y0 ? r->y0 : ty;
++			tr.x1 = tx + d.width > r->x1 ? r->x1 : tx + d.width;
++			tr.y1 = ty + d.height > r->y1 ? r->y1 : ty + d.height;
++			if (tr.x0 >= tr.x1 || tr.y0 >= tr.y1)
++				continue;
++			if (ctx->plot->clip(ctx, &tr) != NSERROR_OK ||
++					!html_redraw_bg_image(background, &d,
++						&tr, ctx))
++				return false;
++		}
++	}
++	return true;
++}
+ 
+ /** The mask drawn aside, white where it lets the box through. */
+ struct html_mask_job {
+diff --git a/frontends/framebuffer/font_freetype.c b/frontends/framebuffer/font_freetype.c
+index 61e482a68..c63beb123 100644
+--- a/frontends/framebuffer/font_freetype.c
++++ b/frontends/framebuffer/font_freetype.c
+@@ -1605,6 +1605,40 @@ FT_Glyph fb_getglyph_run(const plot_font_style_t *fstyle, const char *text,
+ }
+ 
+ 
++/**
++ * The advance every digit takes in tabular-nums (VitaSurf): the widest
++ * of the ten, or 0 when the style does not ask for tabular figures.
++ */
++static int fb_digit_width(const plot_font_style_t *fstyle,
++		fb_faceid_t *fb_face, struct adv_style *slot,
++		FTC_ScalerRec *srec)
++{
++	int w = 0, a;
++	uint32_t d;
++
++	if ((fstyle->flags & FONTF_TABULAR) == 0)
++		return 0;
++	for (d = '0'; d <= '9'; d++) {
++		a = fb_advance(slot, srec, fb_glyph_for(fb_face, srec->face_id,
++				d), d);
++		if (a > w)
++			w = a;
++	}
++	return w;
++}
++
++/* exported interface documented in framebuffer/font_freetype.h */
++int fb_font_digit_width(const plot_font_style_t *fstyle)
++{
++	FTC_ScalerRec srec;
++
++	if ((fstyle->flags & FONTF_TABULAR) == 0)
++		return 0;
++	fb_fill_scalar(fstyle, &srec);
++	return fb_digit_width(fstyle, (fb_faceid_t *) srec.face_id,
++			fb_adv_slot(&srec), &srec);
++}
++
+ /* exported interface documented in framebuffer/freetype_font.h */
+ nserror
+ fb_font_width(const plot_font_style_t *fstyle,
+@@ -1616,7 +1650,7 @@ fb_font_width(const plot_font_style_t *fstyle,
+         FTC_ScalerRec srec;
+         struct adv_style *slot;
+         fb_faceid_t *fb_face;
+-        int advance;
++        int advance, digit_w;
+ 
+         unsigned int vs_us0 = fb_now_us();
+ 
+@@ -1627,11 +1661,17 @@ fb_font_width(const plot_font_style_t *fstyle,
+         vitasurf_font_calls++;
+         vitasurf_font_chars += (unsigned int) length;
+ 
++        digit_w = fb_digit_width(fstyle, fb_face, slot, &srec);
+         *width = 0;
+         while (nxtchr < length) {
+                 unsigned char c = (unsigned char) string[nxtchr];
+                 FT_UInt glyph;
+ 
++                if (digit_w > 0 && c >= '0' && c <= '9') {
++                        nxtchr++;
++                        *width += digit_w;
++                        continue;
++                }
+                 if (fb_plain_char(fb_face, slot, c)) {
+                         nxtchr++;
+                         if (slot->adv[c] >= 0) {
+@@ -1665,7 +1705,7 @@ fb_font_position(const plot_font_style_t *fstyle,
+         FTC_ScalerRec srec;
+         struct adv_style *slot;
+         fb_faceid_t *fb_face;
+-        int advance;
++        int advance, digit_w;
+         int prev_x = 0;
+ 
+         unsigned int vs_us0 = fb_now_us();
+@@ -1677,13 +1717,18 @@ fb_font_position(const plot_font_style_t *fstyle,
+         vitasurf_font_calls++;
+         vitasurf_font_chars += (unsigned int) length;
+ 
++        digit_w = fb_digit_width(fstyle, fb_face, slot, &srec);
+         *actual_x = 0;
+         while (nxtchr < length) {
+                 size_t after = nxtchr;
+                 unsigned char c = (unsigned char) string[nxtchr];
+                 FT_UInt glyph;
+ 
+-                if (fb_plain_char(fb_face, slot, c)) {
++                if (digit_w > 0 && c >= '0' && c <= '9') {
++                        ucs4 = c;
++                        after = nxtchr + 1;
++                        advance = digit_w;
++                } else if (fb_plain_char(fb_face, slot, c)) {
+                         ucs4 = c;
+                         after = nxtchr + 1;
+                         advance = slot->adv[c];
+@@ -1756,7 +1801,7 @@ fb_font_split(const plot_font_style_t *fstyle,
+         FTC_ScalerRec srec;
+         struct adv_style *slot;
+         fb_faceid_t *fb_face;
+-        int advance;
++        int advance, digit_w;
+ 
+         unsigned int vs_us0 = fb_now_us();
+ 
+@@ -1767,13 +1812,18 @@ fb_font_split(const plot_font_style_t *fstyle,
+         vitasurf_font_calls++;
+         vitasurf_font_chars += (unsigned int) length;
+ 
++        digit_w = fb_digit_width(fstyle, fb_face, slot, &srec);
+         *actual_x = 0;
+         while (nxtchr < length) {
+                 size_t after = nxtchr;
+                 unsigned char c = (unsigned char) string[nxtchr];
+                 FT_UInt glyph;
+ 
+-                if (fb_plain_char(fb_face, slot, c)) {
++                if (digit_w > 0 && c >= '0' && c <= '9') {
++                        ucs4 = c;
++                        after = nxtchr + 1;
++                        advance = digit_w;
++                } else if (fb_plain_char(fb_face, slot, c)) {
+                         ucs4 = c;
+                         after = nxtchr + 1;
+                         advance = slot->adv[c];
+diff --git a/frontends/framebuffer/font_freetype.h b/frontends/framebuffer/font_freetype.h
+index 4026e8bd9..43838221c 100644
+--- a/frontends/framebuffer/font_freetype.h
++++ b/frontends/framebuffer/font_freetype.h
+@@ -35,6 +35,12 @@ FT_Glyph fb_getglyph(const plot_font_style_t *fstyle, uint32_t ucs4);
+  * draws its icon from the icon's name spelt out as text. \a off moves
+  * past whatever the run covered.
+  */
++/**
++ * The advance each digit takes when the style asks for tabular figures
++ * (VitaSurf), or 0.
++ */
++int fb_font_digit_width(const plot_font_style_t *fstyle);
++
+ FT_Glyph fb_getglyph_run(const plot_font_style_t *fstyle, const char *text,
+ 			 size_t len, size_t *off);
+ 
+diff --git a/frontends/framebuffer/framebuffer.c b/frontends/framebuffer/framebuffer.c
+index 9532fad9c..ff0c5ba25 100644
+--- a/frontends/framebuffer/framebuffer.c
++++ b/frontends/framebuffer/framebuffer.c
+@@ -1280,8 +1280,15 @@ framebuffer_plot_text(const struct redraw_context *ctx,
+ 	FT_Glyph glyph;
+ 	FT_BitmapGlyph bglyph;
+ 	nsfb_bbox_t loc;
++	/* tabular-nums: each digit centred in the widest one's advance,
++	 * as fb_font_width measured it (VitaSurf) */
++	int digit_w = fb_font_digit_width(fstyle);
+ 
+ 	while (nxtchr < length) {
++		size_t start = nxtchr;
++		int gx = x;
++		bool digit;
++
+ 		/*
+ 		 * By run rather than by character, so that a ligature
+ 		 * draws as the one glyph it stands for and measuring
+@@ -1290,6 +1297,10 @@ framebuffer_plot_text(const struct redraw_context *ctx,
+ 		glyph = fb_getglyph_run(fstyle, text, length, &nxtchr);
+ 		if (glyph == NULL)
+ 			continue;
++		digit = digit_w > 0 && nxtchr == start + 1 &&
++				text[start] >= '0' && text[start] <= '9';
++		if (digit)
++			x += (digit_w - (int) (glyph->advance.x >> 16)) / 2;
+ 
+ 		if (glyph->format == FT_GLYPH_FORMAT_BITMAP) {
+ 			bglyph = (FT_BitmapGlyph)glyph;
+@@ -1314,7 +1325,7 @@ framebuffer_plot_text(const struct redraw_context *ctx,
+ 					     fstyle->foreground);
+ 			}
+ 		}
+-		x += glyph->advance.x >> 16;
++		x = digit ? gx + digit_w : x + (glyph->advance.x >> 16);
+ 
+ 	}
+ 	return NSERROR_OK;
+diff --git a/include/netsurf/plot_style.h b/include/netsurf/plot_style.h
+index 875020cd8..c9d43d875 100644
+--- a/include/netsurf/plot_style.h
++++ b/include/netsurf/plot_style.h
+@@ -103,6 +103,8 @@ typedef enum {
+ 	FONTF_ITALIC = 1,
+ 	FONTF_OBLIQUE = 2,
+ 	FONTF_SMALLCAPS = 4,
++	/* every digit as wide as the widest: tabular-nums (VitaSurf) */
++	FONTF_TABULAR = 8,
+ } plot_font_flags_t;
+ 
+ /**

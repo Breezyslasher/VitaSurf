@@ -14192,6 +14192,20 @@ static const char *const sm_justify_content[] = { NULL, "flex-start",
 static const char *const sm_align_items[] = { NULL, "stretch",
 	"flex-start", "flex-end", "center", "baseline", "auto",
 	"anchor-center" };
+static const char *const sm_background_repeat[] = { NULL, "repeat-x",
+	"repeat-y", "repeat", "no-repeat", "space", "round" };
+static const char *const sm_background_box[] = { NULL, "padding-box",
+	"border-box", "content-box" };
+static const char *const sm_background_clip[] = { NULL, "border-box",
+	"padding-box", "content-box", "text" };
+static const char *const sm_blend_mode[] = { NULL, "normal", "multiply",
+	"screen", "overlay", "darken", "lighten", "color-dodge",
+	"color-burn", "hard-light", "soft-light", "difference", "exclusion",
+	"hue", "saturation", "color", "luminosity", "plus-lighter" };
+static const char *const sm_variant_numeric[] = { NULL, "normal",
+	"tabular-nums" };
+static const char *const sm_grid_auto_flow[] = { NULL, "row", "column",
+	"row dense", "column dense" };
 static const char *const sm_align_content[] = { NULL, "stretch",
 	"flex-start", "flex-end", "center", "space-between",
 	"space-around", "space-evenly" };
@@ -14858,6 +14872,8 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 	SM_ENUM("alignItems", sm_align_items, css_computed_align_items(s));
 	SM_ENUM("alignSelf", sm_align_items, css_computed_align_self(s));
 	SM_ENUM("justifySelf", sm_align_items, css_computed_justify_self(s));
+	SM_ENUM("gridAutoFlow", sm_grid_auto_flow,
+			css_computed_grid_auto_flow(s));
 	SM_ENUM("alignContent", sm_align_content,
 			css_computed_align_content(s));
 	v = 0;
@@ -14941,6 +14957,20 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 			css_computed_list_style_type(s));
 
 	/* the box's paint */
+	SM_ENUM("backgroundRepeat", sm_background_repeat,
+			css_computed_background_repeat(s));
+	SM_ENUM("backgroundOrigin", sm_background_box,
+			css_computed_background_origin(s));
+	SM_ENUM("backgroundClip", sm_background_clip,
+			css_computed_background_clip(s));
+	SM_ENUM("backgroundBlendMode", sm_blend_mode,
+			css_computed_background_blend_mode(s));
+	SM_ENUM("fontVariantNumeric", sm_variant_numeric,
+			css_computed_font_variant_numeric(s));
+	c = 0;
+	css_computed_caret_color(s, &c);
+	sm_colour(buf, sizeof(buf), c);
+	sm_set(ctx, obj, "caretColor", buf);
 	c = 0;
 	if (css_computed_background_color(s, &c) ==
 			CSS_BACKGROUND_COLOR_COLOR) {
@@ -15072,6 +15102,17 @@ static JSValue win_vita_style_more(JSContext *ctx, JSValueConst this_val,
 		sm_length(vb, sizeof(vb), s, uctx, vv, vu);
 		snprintf(buf, sizeof(buf), "%s %s", hb, vb);
 		sm_set(ctx, obj, "backgroundPosition", buf);
+		sm_set(ctx, obj, "backgroundPositionX", hb);
+		sm_set(ctx, obj, "backgroundPositionY", vb);
+
+		/* tab-size: a number of spaces or a length (VitaSurf) */
+		h = INTTOFIX(8);
+		hu = CSS_UNIT_PX;
+		if (css_computed_tab_size(s, &h, &hu) == CSS_TAB_SIZE_SET)
+			sm_length(hb, sizeof(hb), s, uctx, h, hu);
+		else
+			sm_number(hb, sizeof(hb), h);
+		sm_set(ctx, obj, "tabSize", hb);
 
 		h = vv = 0;
 		hu = vu = CSS_UNIT_PX;

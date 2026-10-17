@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<!--
+  The small gaps of the CSS census (VitaSurf): what real sheets wrote
+  that Chrome takes and libcss had dropped. calc(), min(), max() and
+  clamp() in the channels of rgb(), hsl() and hwb(), which are rounded
+  as Chrome rounds them; @supports and CSS.supports for properties whose
+  parser reads to the end of the value (touch-action, scale); the
+  background shorthand with a size and boxes (center/cover); the
+  background longhands background-origin, -blend-mode, -position-x and
+  -y, which cascade each on its own against background-position, and
+  background-repeat's space and round; grid's auto-flow forms;
+  justify-items: legacy, and first and last baseline; font-variant,
+  font-variant-caps and font-variant-numeric; tab-size, and tabs in a
+  <pre> that go to the next tab stop. Each line must say PASS; Chrome
+  passes them all.
+-->
+<html><head><meta charset="utf-8"><title>Small CSS gaps</title>
+<style>
+#c1 { color: hsl(221deg, 14%, calc(100% + -5%)); }
+#c2 { color: rgb(calc(255 - 10), min(300, 20), clamp(0, 500, 255)); }
+#c3 { color: hsla(221, 14%, 50%, calc(0.5 + 0.1)); }
+#c4 { color: hsl(180 50% 50%); }
+#c5 { color: hwb(calc(60deg * 2) 10% 10%); }
+#p1 { background-position: 10px 20px; }
+#p1.x { background-position-x: right 5px; }
+#p2 { background-position-y: 30%; }
+#p2 { background-position: left 7px top 9px; }
+#p3 { background-position-x: 40px; }
+div#p3 { background-position: 1px 2px; }
+#p4 { background-position-x: 40px !important; background-position: 3px 4px; }
+#s1 { background: #f00 url(none.png) center/cover no-repeat; }
+#s2 { background: #0f0 padding-box content-box; }
+#s3 { background: #00f content-box; }
+#r1 { background-repeat: round; }
+#r2 { background-repeat: space; }
+#r3 { background-repeat: repeat no-repeat; }
+#o1 { background-origin: content-box, border-box; background-blend-mode: multiply, normal; }
+#g1 { display: grid; grid: auto-flow dense 40px / 100px 100px; }
+#g2 { display: grid; grid: 50px / auto-flow; }
+#v1 { font-variant: small-caps tabular-nums; }
+#v2 { font-variant-caps: all-small-caps; }
+#v3 { font-variant-numeric: lining-nums tabular-nums slashed-zero; }
+#t1 { tab-size: 4; }
+pre { font-family: monospace; font-size: 16px; margin: 0; }
+.w { display: inline-block; }
+@supports (touch-action: pan-y) { #sup { width: 77px; } }
+</style></head>
+<body>
+<div id="c1">c</div><div id="c2">c</div><div id="c3">c</div><div id="c4">c</div><div id="c5">c</div>
+<div id="p1" class="x"></div><div id="p2"></div><div id="p3"></div><div id="p4"></div>
+<div id="s1"></div><div id="s2"></div><div id="s3"></div>
+<div id="r1"></div><div id="r2"></div><div id="r3"></div><div id="o1"></div>
+<div id="g1"></div><div id="g2"></div>
+<div id="v1"></div><div id="v2"></div><div id="v3"></div><div id="t1"></div>
+<div id="sup">s</div>
+<pre><span class="w" id="tab8">a	b</span>
+<span class="w" id="sp8">a       b</span>
+<span class="w" id="tab4" style="tab-size: 4">ab	c</span>
+<span class="w" id="sp4">ab  c</span></pre>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { var l = (got === want ? 'PASS ' : 'FAIL ') + name + (got === want ? '' : ': ' + got + ', want ' + want); out.push(l); console.log('small-gaps: ' + l); }
+function cs(id) { return getComputedStyle(document.getElementById(id)); }
+addEventListener('load', function () {
+ok('calc() in hsl()', cs('c1').color, 'rgb(240, 242, 244)');
+ok('calc(), min() and clamp() in rgb()', cs('c2').color, 'rgb(245, 20, 255)');
+ok('calc() in the alpha', cs('c3').color, 'rgba(110, 121, 145, 0.6)');
+ok('hsl() rounded', cs('c4').color, 'rgb(64, 191, 191)');
+ok('calc() in hwb()', cs('c5').color, 'rgb(26, 230, 26)');
+ok('calc(10px) is not a colour channel', CSS.supports('color', 'rgb(calc(10px) 0 0)'), false);
+ok('@supports reads a value to its end', document.getElementById('sup').offsetWidth, 77);
+['touch-action: pan-y', 'scale: 1.2', 'user-select: none'].forEach(function (d) {
+  var i = d.indexOf(':');
+  ok('CSS.supports(' + d + ')', CSS.supports(d.slice(0, i), d.slice(i + 2)), true);
+});
+ok('a weightier x keeps the shorthand\'s y', cs('p1').backgroundPosition, 'calc(100% - 5px) 20px');
+ok('a later shorthand overrides y', cs('p2').backgroundPosition, '7px 9px');
+ok('a weightier shorthand overrides x', cs('p3').backgroundPosition, '1px 2px');
+ok('an important x beats a later shorthand', cs('p4').backgroundPosition, '40px 4px');
+ok('background-position-x reads its half', cs('p1').backgroundPositionX, 'calc(100% - 5px)');
+ok('background: center/cover keeps its colour', cs('s1').backgroundColor, 'rgb(255, 0, 0)');
+ok('background with two boxes: the origin', cs('s2').backgroundOrigin, 'padding-box');
+ok('background with two boxes: the clip', cs('s2').backgroundClip, 'content-box');
+ok('background with one box is both', cs('s3').backgroundOrigin + ' ' + cs('s3').backgroundClip, 'content-box content-box');
+ok('the shorthand resets the boxes', cs('s1').backgroundOrigin + ' ' + cs('s1').backgroundClip, 'padding-box border-box');
+ok('background-repeat: round', cs('r1').backgroundRepeat, 'round');
+ok('background-repeat: space', cs('r2').backgroundRepeat, 'space');
+ok('background-repeat: repeat no-repeat', cs('r3').backgroundRepeat, 'repeat-x');
+ok('background-origin takes the first layer', cs('o1').backgroundOrigin, 'content-box');
+ok('background-blend-mode takes the first layer', cs('o1').backgroundBlendMode, 'multiply');
+ok('grid: auto-flow dense', cs('g1').gridAutoFlow, 'row dense');
+ok('grid: rows / auto-flow', cs('g2').gridAutoFlow, 'column');
+ok('grid: auto-flow alone is invalid', CSS.supports('grid', 'auto-flow 1fr'), false);
+['legacy', 'legacy center', 'right legacy'].forEach(function (v) {
+  ok('justify-items: ' + v, CSS.supports('justify-items', v), true);
+});
+ok('justify-items: auto is invalid', CSS.supports('justify-items', 'auto'), false);
+ok('align-items: first baseline', CSS.supports('align-items', 'first baseline'), true);
+ok('font-variant: small-caps tabular-nums', cs('v1').fontVariant + ' ' + cs('v1').fontVariantNumeric, 'small-caps tabular-nums');
+ok('font-variant-caps', cs('v2').fontVariant, 'small-caps');
+ok('font-variant-numeric', cs('v3').fontVariantNumeric, 'tabular-nums');
+ok('font-variant-numeric: a group twice is invalid', CSS.supports('font-variant-numeric', 'lining-nums oldstyle-nums'), false);
+ok('tab-size', cs('t1').tabSize, '4');
+ok('tab-size initial', cs('v1').tabSize, '8');
+ok('a tab goes to the next stop', document.getElementById('tab8').offsetWidth, document.getElementById('sp8').offsetWidth);
+ok('tab-size: 4', document.getElementById('tab4').offsetWidth, document.getElementById('sp4').offsetWidth);
+['perspective: 500px', 'perspective-origin: 50% 50%', 'text-orientation: upright', 'background-origin: content-box', 'background-blend-mode: luminosity'].forEach(function (d) {
+  var i = d.indexOf(':');
+  ok('CSS.supports(' + d + ')', CSS.supports(d.slice(0, i), d.slice(i + 2)), true);
+});
+ok('perspective: -1px is invalid', CSS.supports('perspective', '-1px'), false);
+ok('the tabs are as wide as the spaces they stand for', document.getElementById('tab8').offsetWidth > 0, true);
+document.getElementById('out').textContent = out.join('\n');
+console.log('small-gaps: done');
+});
+</script>
+</body></html>

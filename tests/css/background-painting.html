@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!--
+  How background images are placed and cut (VitaSurf), to look at: the
+  page cannot measure what is painted. Each box says what it should
+  show. The tile is a 40x30 red rectangle. Natively the monkey's plot
+  log gives the same (a BITMAP at each place said).
+-->
+<html><head><meta charset="utf-8"><title>Background painting</title>
+<style>
+body { font: 12px sans-serif; }
+.b { display: inline-block; vertical-align: top; margin: 8px; width: 200px; height: 100px;
+  padding: 10px; border: 5px dashed #888; }
+.t { background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACgAAAAeCAIAAADRv8uKAAAAK0lEQVR4nO3NMQ0AAAgDsCmZfynIQgYcTfo3056IWCwWi8VisVgsFov/xgvk2cL9h1Oh3gAAAABJRU5ErkJggg==); }
+#cover { background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACgAAAAeCAIAAADRv8uKAAAAK0lEQVR4nO3NMQ0AAAgDsCmZfynIQgYcTfo3056IWCwWi8VisVgsFov/xgvk2cL9h1Oh3gAAAABJRU5ErkJggg==) no-repeat center/cover; }
+#origin { background-color: #ff0; background-repeat: no-repeat; background-origin: content-box; }
+#border { background-color: #ff0; background-repeat: no-repeat; background-origin: border-box; }
+#clip { background-color: #0c0; background-clip: content-box; }
+#pclip { background-color: #0c0; background-clip: padding-box; }
+#round { width: 100px; height: 100px; background-repeat: round; }
+#space { width: 100px; height: 70px; background-repeat: space; }
+#blend { background-color: #00f; background-repeat: no-repeat; background-blend-mode: multiply; }
+#px { background-repeat: no-repeat; background-position: 0 0; background-position-x: right; }
+</style></head>
+<body>
+<div class="b" id="cover">Filled edge to edge, cut top and bottom evenly</div>
+<div class="b t" id="origin">Yellow; the tile at the text's top left, inside the padding</div>
+<div class="b t" id="border">Yellow; the tile at the outer edge of the dashed border</div>
+<div class="b" id="clip">Green only inside the padding</div>
+<div class="b" id="pclip">Green inside the border, not under it</div>
+<div class="b t" id="round">Three by three tiles, squeezed, no gaps</div>
+<div class="b t" id="space">Two by two tiles in the corners, gaps between</div>
+<div class="b t" id="blend">Blue; the tile black where it lies (red times blue)</div>
+<div class="b t" id="px">The tile at the top right</div>
+</body></html>
