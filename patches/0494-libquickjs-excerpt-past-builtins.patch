@@ -1,0 +1,22 @@
+diff --git a/quickjs.c b/quickjs.c
+index d3d0e7b..0874ba3 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7989,11 +7989,14 @@ int JS_GetSourceExcerpt(JSContext *ctx, char *buf, int buf_len, int before)
+     if (!sf || !buf || buf_len < 2)
+         return 0;
+     buf[0] = '\0';
+-    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++    /* a built-in on top (a RegExp's test) shows where it was called */
++    while (sf && (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT ||
++                  !js_class_has_bytecode(
++                      JS_VALUE_GET_OBJ(sf->cur_func)->class_id)))
++        sf = sf->prev_frame;
++    if (!sf)
+         return 0;
+     p = JS_VALUE_GET_OBJ(sf->cur_func);
+-    if (!js_class_has_bytecode(p->class_id))
+-        return 0;
+     b = p->u.func.function_bytecode;
+     if (!b || b->lazy || !b->source || b->source_len <= 0 || !sf->cur_pc)
+         return 0;
