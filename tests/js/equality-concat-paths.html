@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!--
+  The interpreter's own answers for == and === with null, undefined, a
+  boolean or two strings, Array.prototype.concat copying dense arrays at
+  once, and an Array species of this realm's own Array made without a
+  constructor call (VitaSurf, libquickjs patch 0493). Each must give what
+  the slow paths gave: the first block compares every pair of awkward
+  values against a table worked out without those operators. Each line
+  must say PASS; Chrome passes them all. (document.all, the one object
+  that is loosely equal to null, has its own test.)
+-->
+<html><head><meta charset="utf-8"><title>Equality and concat paths</title></head>
+<body>
+<pre id="out"></pre>
+<script>
+var out = [];
+function ok(name, got, want) { out.push((got === want ? "PASS " : "FAIL ") + name + (got === want ? "" : ": " + String(got) + ", want " + String(want))); }
+var vals = [null, undefined, true, false, 0, 1, -0, NaN, "", "0", "a", {}, [], function () {}, Symbol.iterator, 1.5, Infinity, new String(""), new Number(0), new Boolean(false)];
+/* strict equality from Object.is, typeof and the two zeros */
+function strictModel(a, b) {
+  if (typeof a !== typeof b) return false;
+  if (typeof a === "number") return !Number.isNaN(a) && !Number.isNaN(b) && (Object.is(a, b) || (a === 0 && b === 0 && 1 / a !== 1 / b) || Object.is(a + 0, b + 0));
+  return Object.is(a, b);
+}
+var bad = 0, badLoose = 0;
+for (var i = 0; i < vals.length; i++) for (var j = 0; j < vals.length; j++) {
+  var a = vals[i], b = vals[j];
+  if ((a === b) !== strictModel(a, b) || (a !== b) === (a === b)) bad++;
+  if ((a == b) === (a != b)) badLoose++;
+  var nullish = function (v) { return v === null || v === undefined; };
+  if ((nullish(a) || nullish(b)) && (a == b) !== (nullish(a) && nullish(b))) badLoose++;
+}
+ok("=== over every pair of awkward values", bad, 0);
+ok("== with null or undefined over every pair", badLoose, 0);
+ok("no valueOf is called for == null", ({ valueOf: function () { throw new Error("called"); } }) == null, false);
+ok("false == 0 still converts", false == 0, true);
+ok("'' == 0 still converts", "" == 0, true);
+ok("'object' == typeof {}", "object" == typeof {}, true);
+ok("two equal strings made apart", "ab" + String(1) === "a" + "b1", true);
+ok("an atom and a built string", "length" === ["len", "gth"].join(""), true);
+var h = [1, 2]; h.length = 4;
+var c = [0].concat(h, [5], [[6]], 7);
+ok("concat keeps holes and length", c.length + " " + (3 in c) + " " + c.join(), "8 false 0,1,2,,,5,6,7");
+ok("concat through apply", [].concat.apply([], [[1], [2, 3], [], 4]).join(), "1,2,3,4");
+var ns = [1, 2]; ns[Symbol.isConcatSpreadable] = false;
+ok("isConcatSpreadable false on an array", [0].concat(ns).length, 2);
+var al = { length: 2, 0: "x", 1: "y" }; al[Symbol.isConcatSpreadable] = true;
+ok("an array-like made spreadable", [0].concat(al).join(), "0,x,y");
+class MyArray extends Array {}
+var m = new MyArray(); m.push(1);
+ok("a subclass's species", m.concat([2]) instanceof MyArray, true);
+ok("a frozen source", [0].concat(Object.freeze([1, 2])).join(), "0,1,2");
+Object.defineProperty(Array.prototype, 3, { get: function () { return "P"; }, configurable: true });
+var g = [1, 2]; g.length = 5;
+ok("a hole read through the prototype", [].concat(g)[3], "P");
+delete Array.prototype[3];
+var saved = Object.getOwnPropertyDescriptor(Array, Symbol.species);
+Object.defineProperty(Array, Symbol.species, { get: function () { return function () { this.made = true; }; }, configurable: true });
+ok("a replaced species is used", [1].concat([2]).made, true);
+Object.defineProperty(Array, Symbol.species, saved);
+ok("and the original again", [1].concat([2]).made, undefined);
+ok("map", [1, 2, 3].map(function (x) { return x * 2; }).join(), "2,4,6");
+ok("map of nothing", [].map(function () {}).length, 0);
+document.getElementById("out").textContent = out.join("\n");
+out.forEach(function (l) { console.log("equality-concat-paths: " + l); });
+console.log("equality-concat-paths: done");
+</script>
+</body></html>

@@ -1,0 +1,213 @@
+diff --git a/quickjs.c b/quickjs.c
+index 7af9b5b..d3d0e7b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -4907,8 +4907,15 @@ static int js_string_memcmp(JSString *p1, JSString *p2, int len)
+ }
+ 
+ static bool js_string_eq(JSString *p1, JSString *p2) {
++    if (p1 == p2)
++        return true;
+     if (p1->len != p2->len)
+         return false;
++    /* two atoms of the string kind are two texts (VitaSurf): typeof's
++       answers and the literals they are compared with are atoms */
++    if (p1->atom_type == JS_ATOM_TYPE_STRING &&
++        p2->atom_type == JS_ATOM_TYPE_STRING)
++        return false;
+     return js_string_memcmp(p1, p2, p1->len) == 0;
+ }
+ 
+@@ -18011,6 +18018,24 @@ static bool needs_backtrace(JSValue exc)
+ static JSValue js_string_charCodeAt(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv);
+ 
++/*
++ * (VitaSurf) The interpreter drops a reference at nearly every opcode,
++ * and JS_FreeValue is an exported function that gcc does not inline into
++ * this one: 53 million calls of some twenty instructions each in a run of
++ * styled-components' flatten, a tenth of it. Here it is the count, and a
++ * call only when that reaches zero.
++ */
++static inline __attribute__((always_inline))
++void js_free_value_inl(JSContext *ctx, JSValue v)
++{
++    if (JS_VALUE_HAS_REF_COUNT(v)) {
++        JSRefCountHeader *p = (JSRefCountHeader *)JS_VALUE_GET_PTR(v);
++        if (--p->ref_count <= 0)
++            js_free_value_rt(ctx->rt, v);
++    }
++}
++#define JS_FreeValue(ctx, v) js_free_value_inl(ctx, v)
++
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+@@ -20530,10 +20555,94 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode));
+             OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, opcode));
+             OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, opcode));
+-            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0));
+-            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1));
+-            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
+-            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
++            /*
++             * (VitaSurf) A comparison with null or undefined, or a strict
++             * one with a boolean, is answered here by the tags: minified
++             * code writes null==e, !1===e and ""===e at every turn, as
++             * styled-components' flatten does for each value it meets
++             * (BBC's render), and each went through a call to the slow
++             * path; so did two strings ("object"==typeof e). Loose equality with null is still true for an
++             * object with [[IsHTMLDDA]] (document.all).
++             */
++#define OP_EQ_NULLISH(t) ((t) == JS_TAG_NULL || (t) == JS_TAG_UNDEFINED)
++#define OP_EQ_LOOSE(opcode, is_neq)                                     \
++            CASE(opcode):                                               \
++                {                                                       \
++                JSValue op1, op2;                                       \
++                int t1, t2;                                              \
++                op1 = sp[-2];                                           \
++                op2 = sp[-1];                                           \
++                t1 = JS_VALUE_GET_NORM_TAG(op1);                        \
++                t2 = JS_VALUE_GET_NORM_TAG(op2);                        \
++                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
++                    sp[-2] = js_bool((JS_VALUE_GET_INT(op1) ==          \
++                                      JS_VALUE_GET_INT(op2)) ^ is_neq); \
++                    sp--;                                               \
++                } else if (OP_EQ_NULLISH(t1) || OP_EQ_NULLISH(t2)) {    \
++                    JSValueConst o = OP_EQ_NULLISH(t1) ? op2 : op1;     \
++                    int to = OP_EQ_NULLISH(t1) ? t2 : t1;               \
++                    bool r = OP_EQ_NULLISH(to) ||                       \
++                        (to == JS_TAG_OBJECT &&                         \
++                         JS_VALUE_GET_OBJ(o)->is_HTMLDDA);              \
++                    JS_FreeValue(ctx, op1);                             \
++                    JS_FreeValue(ctx, op2);                             \
++                    sp[-2] = js_bool(r ^ is_neq);                       \
++                    sp--;                                               \
++                } else if (t1 == JS_TAG_STRING && t2 == JS_TAG_STRING) { \
++                    bool r = js_string_eq(JS_VALUE_GET_STRING(op1),     \
++                                          JS_VALUE_GET_STRING(op2));    \
++                    JS_FreeValue(ctx, op1);                             \
++                    JS_FreeValue(ctx, op2);                             \
++                    sp[-2] = js_bool(r ^ is_neq);                       \
++                    sp--;                                               \
++                } else {                                                \
++                    sf->cur_pc = pc;                                    \
++                    if (js_eq_slow(ctx, sp, is_neq))                    \
++                        goto exception;                                 \
++                    sp--;                                               \
++                }                                                       \
++                }                                                       \
++            BREAK
++#define OP_EQ_SIMPLE(t) (OP_EQ_NULLISH(t) || (t) == JS_TAG_BOOL)
++#define OP_EQ_STRICT(opcode, is_neq)                                    \
++            CASE(opcode):                                               \
++                {                                                       \
++                JSValue op1, op2;                                       \
++                int t1, t2;                                              \
++                op1 = sp[-2];                                           \
++                op2 = sp[-1];                                           \
++                t1 = JS_VALUE_GET_NORM_TAG(op1);                        \
++                t2 = JS_VALUE_GET_NORM_TAG(op2);                        \
++                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
++                    sp[-2] = js_bool((JS_VALUE_GET_INT(op1) ==          \
++                                      JS_VALUE_GET_INT(op2)) ^ is_neq); \
++                    sp--;                                               \
++                } else if (OP_EQ_SIMPLE(t1) || OP_EQ_SIMPLE(t2)) {      \
++                    bool r = t1 == t2 && (t1 != JS_TAG_BOOL ||          \
++                        JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2)); \
++                    JS_FreeValue(ctx, op1);                             \
++                    JS_FreeValue(ctx, op2);                             \
++                    sp[-2] = js_bool(r ^ is_neq);                       \
++                    sp--;                                               \
++                } else if (t1 == JS_TAG_STRING && t2 == JS_TAG_STRING) { \
++                    bool r = js_string_eq(JS_VALUE_GET_STRING(op1),     \
++                                          JS_VALUE_GET_STRING(op2));    \
++                    JS_FreeValue(ctx, op1);                             \
++                    JS_FreeValue(ctx, op2);                             \
++                    sp[-2] = js_bool(r ^ is_neq);                       \
++                    sp--;                                               \
++                } else {                                                \
++                    sf->cur_pc = pc;                                    \
++                    if (js_strict_eq_slow(ctx, sp, is_neq))             \
++                        goto exception;                                 \
++                    sp--;                                               \
++                }                                                       \
++                }                                                       \
++            BREAK
++            OP_EQ_LOOSE(OP_eq, 0);
++            OP_EQ_LOOSE(OP_neq, 1);
++            OP_EQ_STRICT(OP_strict_eq, 0);
++            OP_EQ_STRICT(OP_strict_neq, 1);
+ 
+         CASE(OP_in):
+             sf->cur_pc = pc;
+@@ -20839,6 +20948,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+     rt->current_stack_frame = sf->prev_frame;
+     return ret_val;
+ }
++#undef JS_FreeValue
+ 
+ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
+                 int argc, JSValueConst *argv)
+@@ -45093,7 +45203,18 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
+         if (JS_IsNull(ctor))
+             ctor = JS_UNDEFINED;
+     }
++    /* this realm's own Array (VitaSurf): what calling it as a
++       constructor makes, without the call; its prototype property is
++       neither writable nor configurable, so reading it has no effect */
++    if (JS_IsObject(ctor) && JS_IsObject(ctx->array_ctor) &&
++        JS_VALUE_GET_OBJ(ctor) == JS_VALUE_GET_OBJ(ctx->array_ctor)) {
++        JS_FreeValue(ctx, ctor);
++        ctor = JS_UNDEFINED;
++    }
+     if (JS_IsUndefined(ctor)) {
++        if (JS_VALUE_GET_TAG(len_val) == JS_TAG_INT &&
++            JS_VALUE_GET_INT(len_val) == 0)
++            return JS_NewArray(ctx);
+         return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
+     } else {
+         ret = JS_CallConstructor(ctx, ctor, 1, &len_val);
+@@ -45230,6 +45351,8 @@ static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
+ {
+     JSValue obj, arr, val;
+     JSValueConst e;
++    JSValue *vals;
++    uint32_t count32;
+     int64_t len, k, n;
+     int i, res;
+ 
+@@ -45251,6 +45374,32 @@ static JSValue js_array_concat(JSContext *ctx, JSValueConst this_val,
+         res = JS_isConcatSpreadable(ctx, e);
+         if (res < 0)
+             goto exception;
++        /* a dense array onto a dense array (VitaSurf): its values at
++           once, where each was read and defined as a property;
++           styled-components' flatten concatenates every level so */
++        if (res && js_get_fast_array(ctx, e, &vals, &count32) &&
++            js_is_fast_array(ctx, arr)) {
++            JSObject *pa = JS_VALUE_GET_OBJ(arr);
++            JSValue elen = JS_VALUE_GET_OBJ(e)->prop[0].u.value;
++
++            /* (a dense array may still be longer than its values) */
++            if (JS_VALUE_GET_TAG(elen) == JS_TAG_INT &&
++                (uint32_t)JS_VALUE_GET_INT(elen) == count32 &&
++                pa->extensible && pa->u.array.count == n &&
++                n + count32 <= INT32_MAX) {
++                uint32_t k32;
++
++                if (n + count32 > pa->u.array.u1.size &&
++                    expand_fast_array(ctx, pa, n + count32) < 0)
++                    goto exception;
++                for (k32 = 0; k32 < count32; k32++)
++                    pa->u.array.u.values[n + k32] = js_dup(vals[k32]);
++                n += count32;
++                pa->u.array.count = n;
++                set_value(ctx, &pa->prop[0].u.value, js_int32(n));
++                continue;
++            }
++        }
+         if (res) {
+             if (js_get_length64(ctx, &len, e))
+                 goto exception;
