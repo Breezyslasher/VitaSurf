@@ -10707,11 +10707,44 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
      var c=abs.indexOf(','),head=abs.slice(5,c),body=abs.slice(c+1);
      src=/;base64$/i.test(head)?atob(decodeURIComponent(body)):
       decodeURIComponent(body);}
+    else if(typeof pre[abs]==='string'){src=pre[abs];delete pre[abs];}
     else{r=FS?FS(abs):null;src=r&&r[0]>=200&&r[0]<300?r[1]:null;}
     if(src===null||src===undefined)throw new DOMException(
      "Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '"+
      abs+"' failed to load.",'NetworkError');
     geval(src);}};
+  /*
+   * importScripts waits for its scripts, and here a worker runs on the
+   * page's own thread, so its fetch held the whole browser for a round
+   * trip: Twitch's worker 966 ms and Pinterest's 2202 ms in build 765's
+   * log. The scripts a worker's code names in a string are fetched
+   * before it starts, as are those they name in turn, and the worker
+   * runs once they are in; the call finds them waiting. One named any
+   * other way is still fetched when it is called.
+   */
+  var pre={};
+  function named(src){
+   var out=[],m,a,re=/\bimportScripts\s*\(([^)]*)\)/g,
+    lit=/(['"])((?:\\.|(?!\1)[^\\\r\n])*)\1/g;
+   while((m=re.exec(src))!==null){
+    lit.lastIndex=0;
+    while((a=lit.exec(m[1]))!==null){
+     try{out.push(new URL(a[2].replace(/\\(.)/g,'$1'),url).href);}catch(e){}}}
+   return out;}
+  function prefetch(src,depth,done){
+   var list=depth>3?[]:named(src).filter(function(u,i,l){
+    return /^https?:/i.test(u)&&!(u in pre)&&l.indexOf(u)===i;}),left=list.length;
+   function fin(){if(--left===0)done();}
+   if(!left){done();return;}
+   list.forEach(function(u){
+    pre[u]=null;
+    var id=NV.__vitaFetch(u,'GET',[],null,0,function(status,h,bytes,err){
+     var t=null;
+     if(!err&&status>=200&&status<300)
+      try{t=new TextDecoder().decode(bytes);}catch(e){t=null;}
+     if(t===null){delete pre[u];fin();return;}
+     pre[u]=t;prefetch(t,depth+1,fin);});
+    if(!id){delete pre[u];fin();}});}
   function deliver(message){
    var d;
    try{d=structuredClone(message);}
@@ -10725,9 +10758,10 @@ W.HTMLCollection=HTMLCollection;W.NodeList=NodeList;
     if(closing)return;
     if(started)deliver(message);else queue.push(message);},
    run:function(src){
-    setTimeout(function(){
-     try{geval(src);}catch(e){NV.__vitaReportError(e,url);}
-     begin();},0);},
+    prefetch(src,0,function(){
+     setTimeout(function(){
+      try{geval(src);}catch(e){NV.__vitaReportError(e,url);}
+      begin();},0);});},
    runModule:function(){
     setTimeout(function(){
      /* through the helper that waits for a module to arrive, as a
